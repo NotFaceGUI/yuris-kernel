@@ -154,8 +154,30 @@ fn swap2_swaps_textures_only() {
     let mut gfx = state();
     gfx.consume_events(&[
         frame_start(1),
-        create(&table, "A", "a", 1, 128),
-        create(&table, "B", "b", 2, 64),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "FILE", s("a")),
+                arg(&table, "CG", "Z", i(1)),
+                arg(&table, "CG", "A", i(128)),
+                arg(&table, "CG", "X", i(11)),
+                arg(&table, "CG", "Y", i(22)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("B")),
+                arg(&table, "CG", "FILE", s("b")),
+                arg(&table, "CG", "Z", i(2)),
+                arg(&table, "CG", "A", i(64)),
+                arg(&table, "CG", "X", i(33)),
+                arg(&table, "CG", "Y", i(44)),
+            ],
+        ),
         call(
             1,
             "CGACT",
@@ -180,6 +202,10 @@ fn swap2_swaps_textures_only() {
         .unwrap();
     assert_eq!(a.texture, TextureRef::Asset(b"b".to_vec()));
     assert_eq!(b.texture, TextureRef::Asset(b"a".to_vec()));
+    // FUN_0042f57d:SWAP/SWAP2 都交换 +0x68/+0x70(X/Y)。
+    assert_eq!((a.transform.x, a.transform.y), (33, 44));
+    assert_eq!((b.transform.x, b.transform.y), (11, 22));
+    // SWAP2 只换图像(+坐标),不换 A。
     assert_eq!(a.alpha, 128);
     assert_eq!(b.alpha, 64);
 }

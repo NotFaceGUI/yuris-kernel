@@ -117,6 +117,9 @@ pub enum CopyTiming {
 }
 
 /// 一次渲染到纹理复制。
+///
+/// TODO(DIV-GFX-007):时序(上一帧已渲染目标)与区域 `X/Y/X2/Y2` 语义未
+/// 逐项取证;所有 `CopyOp.status` 恒为 `Unimplemented`,后端必须跳过。
 #[derive(Clone, Debug, PartialEq)]
 pub struct CopyOp {
     /// 快照 ID(目标层的 `TextureRef::Snapshot` 引用它)。
@@ -140,6 +143,8 @@ pub enum ImageAction {
     SizeNearest,
     SizeBilinear,
     Rotation,
+    Resize,
+    Trim,
     Merge,
     Merge2,
     Other(&'static str),
@@ -155,6 +160,8 @@ impl ImageAction {
             Self::SizeNearest => "size",
             Self::SizeBilinear => "size2",
             Self::Rotation => "rotation",
+            Self::Resize => "resize",
+            Self::Trim => "trim",
             Self::Merge => "merge",
             Self::Merge2 => "merge2",
             Self::Other(s) => s,
@@ -163,6 +170,9 @@ impl ImageAction {
 }
 
 /// 一次图像加工操作。
+///
+/// TODO(DIV-GFX-013):像素算法(RECTPAINT/SIZE/ROTATION/RESIZE/TRIM/
+/// MONO/BLUR/...)未实现;`status` 恒为 `Unimplemented`,后端跳过。
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImageOp {
     /// 源图层(`ID`;`ID2` 存在时加工结果写入目标层)。
@@ -176,6 +186,10 @@ pub struct ImageOp {
     pub set2: Option<EngineValue>,
     /// `SETSTR` 原文(CP932 字节)。
     pub set_str: Option<Vec<u8>>,
+    /// `SIZE/SIZE2` 的目标宽(手册 `cg/cgact.html` 例 3/4)。
+    pub sx: Option<i64>,
+    /// `SIZE/SIZE2` 的目标高。
+    pub sy: Option<i64>,
     pub x: Option<i64>,
     pub y: Option<i64>,
     pub x2: Option<i64>,

@@ -30,8 +30,10 @@ use yu_rt::{BootConfig, Vm};
 use yu_vfs::{Codec, DataSource};
 
 use crate::error;
-use crate::event::{header_from_vm, input_summary, input_summary_range, EventRecorder};
-use crate::record::{HeaderPayload, InputSummary, TraceLog};
+use crate::event::{
+    header_from_vm_with_clock, input_summary, input_summary_range, EventRecorder,
+};
+use crate::record::{ClockSummary, HeaderPayload, InputSummary, TraceLog};
 use crate::source::{BoxedSource, FrameHandle, TracingSource};
 
 /// 录制会话的事件队列不设丢弃阈值。
@@ -86,6 +88,22 @@ pub fn verify_input_range(
     Ok(())
 }
 
+/// 校验回放时钟序列与 header 一致。
+///
+/// `ticks[i]` = `Some(now_ms)` 表示第 i 次调用 `tick_at(now_ms, ..)`,
+/// `None` 表示调用 `tick()`。录制的 header 必须与这条序列逐项一致;
+/// 不一致 ⇒ `trace.replay`(Fatal),不做"时间差不多"的容差。
+pub fn verify_clock(header: &HeaderPayload, ticks: &[Option<u32>]) -> Result<(), Diag> {
+    let actual = ClockSummary::from_ticks(ticks);
+    if actual != header.clock {
+        return Err(Diag::fatal(error::code::REPLAY, Boundary::Domain).with_detail(format!(
+            "replay clock mismatch: recorded mode {:?} now_ms {:?}, supplied mode {:?} now_ms {:?}",
+            header.clock.mode, header.clock.now_ms, actual.mode, actual.now_ms
+        )));
+    }
+    Ok(())
+}
+
 /// 离线:把事件序列录制为日志(header + 事件)。
 pub fn record_events(header: HeaderPayload, events: &[VmEvent]) -> TraceLog {
     let recorder = EventRecorder::with_header(header);
@@ -102,6 +120,8 @@ pub struct VmTrace {
     cfg: BootConfig,
     /// 下一次 tick 的首个逻辑帧号(`Scheduler::frame() + 1`)。
     next_frame: u64,
+    /// 每次 tick 的时钟:`Some` = `tick_at`, `None` = `tick`。
+    clock: Vec<Option<u32>>,
 }
 
 impl VmTrace {
@@ -114,6 +134,16 @@ impl VmTrace {
         Self::boot_with_aux(source, None, cfg, codec)
     }
 
+    /// 单根启动,并校验数据源声明的编码与 `codec` 一致。
+    pub fn boot_checked(
+        source: Box<dyn DataSource>,
+        source_codec: Codec,
+        cfg: BootConfig,
+        codec: Codec,
+    ) -> Result<Self, Diag> {
+        Self::boot_with_aux_checked(source, None, cfg, codec, Some(source_codec), None)
+    }
+
     /// 双根启动:编译产物在 `source`,`YSCom.ycd` 可回退到 `aux`。
     pub fn boot_with_aux(
         source: Box<dyn DataSource>,
@@ -121,11 +151,59 @@ impl VmTrace {
         cfg: BootConfig,
         codec: Codec,
     ) -> Result<Self, Diag> {
+        Self::boot_with_aux_checked(source, aux, cfg, codec, None, None)
+    }
+
+    /// 双根启动,并校验数据源编码。
+    ///
+    /// `source_codec` / `aux_codec` 由调用方从具体数据源(`YpfSource::codec`
+    /// 等)取得;本 crate 的 `DataSource` 抽象不携带编码,因此不能自动推断。
+    pub fn boot_with_aux_checked(
+        source: Box<dyn DataSource>,
+        aux: Option<Box<dyn DataSource>>,
+        cfg: BootConfig,
+        codec: Codec,
+        source_codec: Option<Codec>,
+        aux_codec: Option<Codec>,
+    ) -> Result<Self, Diag> {
+        if let Some(source_codec) = source_codec {
+            if source_codec != codec {
+                return Err(Diag::fatal(error::code::REPLAY, Boundary::Data).with_detail(
+                    format!(
+                        "source codec {} does not match trace codec {}",
+                        source_codec.as_str(),
+                        codec.as_str()
+                    ),
+                ));
+            }
+        }
+        if let Some(aux_codec) = aux_codec {
+            if aux.is_none() {
+                return Err(Diag::fatal(error::code::REPLAY, Boundary::Data)
+                    .with_detail("aux codec was supplied but aux source is absent"));
+            }
+            if aux_codec != codec {
+                return Err(Diag::fatal(error::code::REPLAY, Boundary::Data).with_detail(
+                    format!(
+                        "aux source codec {} does not match trace codec {}",
+                        aux_codec.as_str(),
+                        codec.as_str()
+                    ),
+                ));
+            }
+        }
+
         let recorder = EventRecorder::new(crate::event::shared_log());
         let traced = TracingSource::from_recorder(BoxedSource::new(source), recorder.clone());
         let frame = traced.frame_handle();
         let traced_aux = aux.map(|aux| {
-            TracingSource::from_recorder(BoxedSource::new(aux), recorder.clone())
+            // aux 源必须与主源共享同一个帧号句柄,否则 aux 读取会被记到
+            // `frame = null`(启动链)而主源读取在帧内 ⇒ 逻辑键错位。
+            TracingSource::from_recorder_with_frame(
+                BoxedSource::new(aux),
+                recorder.clone(),
+                frame.clone(),
+            )
         });
 
         let vm = match traced_aux {
@@ -147,6 +225,7 @@ impl VmTrace {
             codec,
             cfg,
             next_frame: 1,
+            clock: Vec::new(),
         };
         // 启动链事件(表装载期间的 vfs 读取已在日志里,帧号为 null)。
         session.drain_events();
@@ -171,27 +250,58 @@ impl VmTrace {
     ) -> Result<Self, Diag> {
         let codec = codec_from_name(&header.codec)?;
         let cfg = header.boot.to_config(argv, paths)?;
-        Self::boot_with_aux(source, aux, cfg, codec)
+        Self::boot_with_aux_checked(source, aux, cfg, codec, None, None)
+    }
+
+    /// 同 [`Self::from_header`],并校验数据源编码与 header 一致。
+    ///
+    /// 这是"回放应用 header.codec 并校验数据源编码"的闭合入口:header 的
+    /// `codec` 决定解码器,`source_codec`/`aux_codec` 是数据源声明的编码,
+    /// 二者不一致 ⇒ `trace.replay`。
+    pub fn from_header_checked(
+        header: &HeaderPayload,
+        source: Box<dyn DataSource>,
+        source_codec: Codec,
+        aux: Option<Box<dyn DataSource>>,
+        aux_codec: Option<Codec>,
+        argv: Vec<Vec<u8>>,
+        paths: yu_rt::vm::HostPaths,
+    ) -> Result<Self, Diag> {
+        let codec = codec_from_name(&header.codec)?;
+        let cfg = header.boot.to_config(argv, paths)?;
+        Self::boot_with_aux_checked(
+            source,
+            aux,
+            cfg,
+            codec,
+            Some(source_codec),
+            aux_codec,
+        )
     }
 
     /// 推进一帧(时钟注入为 `now_ms`)。
     ///
     /// vfs 读取的帧标注见模块文档的已知限制。
     pub fn tick_at(&mut self, now_ms: u32, timeline: &InputTimeline) -> ChainReport {
-        self.tick_with(|vm| vm.tick_at(now_ms, timeline))
+        self.tick_with(Some(now_ms), |vm| vm.tick_at(now_ms, timeline))
     }
 
     /// 推进一帧(时钟由 `yu-rt` 的 fps/frame_ms 推进)。
     pub fn tick(&mut self, timeline: &InputTimeline) -> ChainReport {
-        self.tick_with(|vm| vm.tick(timeline))
+        self.tick_with(None, |vm| vm.tick(timeline))
     }
 
-    fn tick_with(&mut self, run: impl FnOnce(&mut Vm) -> ChainReport) -> ChainReport {
+    fn tick_with(
+        &mut self,
+        now_ms: Option<u32>,
+        run: impl FnOnce(&mut Vm) -> ChainReport,
+    ) -> ChainReport {
         let first = self.vm.scheduler().frame().saturating_add(1);
         self.frame.set(Some(first));
         let report = run(&mut self.vm);
         self.frame.set(None);
         self.next_frame = first.saturating_add(report.logical_frames as u64);
+        self.clock.push(now_ms);
         self.drain_events();
         report
     }
@@ -205,6 +315,21 @@ impl VmTrace {
     /// 已完成的逻辑帧数(下一次 tick 的首帧号 - 1)。
     pub fn frames(&self) -> u64 {
         self.next_frame.saturating_sub(1)
+    }
+
+    /// 与 [`Self::frames`] 同义;输入摘要只允许覆盖这些帧。
+    pub fn consumed_frames(&self) -> u64 {
+        self.frames()
+    }
+
+    /// 只覆盖 VM 实际消费的逻辑帧 `[1, 1 + consumed_frames)` 的输入摘要。
+    pub fn consumed_input_summary(&self, timeline: &InputTimeline) -> InputSummary {
+        input_summary(timeline, self.consumed_frames())
+    }
+
+    /// 已录制的逐 tick 时钟(`Some` = tick_at,`None` = tick)。
+    pub fn clock(&self) -> &[Option<u32>] {
+        &self.clock
     }
 
     pub fn vm(&self) -> &Vm {
@@ -232,7 +357,8 @@ impl VmTrace {
     /// 头部必须最后补:表装载期的 vfs 记录先入流,而 `table_provenance`
     /// 要等 `Vm::boot` 成功后才存在。
     pub fn finish(self, input: InputSummary) -> TraceLog {
-        let header = header_from_vm(&self.vm, &self.cfg, self.codec, input);
+        let clock = ClockSummary::from_ticks(&self.clock);
+        let header = header_from_vm_with_clock(&self.vm, &self.cfg, self.codec, input, clock);
         let log = self.recorder.shared_log();
         let mut log = log.borrow_mut();
         log.prepend_header(header);
@@ -241,8 +367,8 @@ impl VmTrace {
 
     /// 用本次会话实际推进的帧数,从输入时间线生成摘要后收尾。
     pub fn finish_with_timeline(self, timeline: &InputTimeline) -> TraceLog {
-        let frames = self.frames();
-        self.finish(input_summary(timeline, frames))
+        let input = self.consumed_input_summary(timeline);
+        self.finish(input)
     }
 
     /// 需要继续使用 `Vm` 时取回它(不补 header,调用方可自行

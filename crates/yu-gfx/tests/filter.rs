@@ -59,13 +59,39 @@ fn probe_order_from_eris_yscfg() {
             ImageFormat::Bmp,
             ImageFormat::Jpg,
             ImageFormat::Gif,
-            ImageFormat::Other(5)
+            ImageFormat::Psb
         ]
     );
     assert_eq!(ImageFormat::Png.extension(), Some(".png"));
     assert_eq!(ImageFormat::Bmp.extension(), Some(".bmp"));
     assert_eq!(ImageFormat::Jpg.extension(), Some(".jpg"));
     assert_eq!(ImageFormat::Gif.extension(), Some(".gif"));
+    assert_eq!(ImageFormat::Psb.extension(), Some(".psb"));
+}
+
+#[test]
+fn probe_order_matches_real_eris_yscfg() {
+    let Some(ysbin) = std::env::var("YURIS_SAMPLE_ERIS_YSBIN").ok() else {
+        if std::env::var("YURIS_REQUIRE_SAMPLES").ok().as_deref() == Some("1") {
+            panic!("YURIS_REQUIRE_SAMPLES=1 but YURIS_SAMPLE_ERIS_YSBIN is missing");
+        }
+        eprintln!("SKIP probe_order_matches_real_eris_yscfg: no YURIS_SAMPLE_ERIS_YSBIN");
+        return;
+    };
+    let path = std::path::Path::new(&ysbin).join("yscfg.ybn");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let cfg = yu_format::yscf::Yscf::parse(&bytes, b"yscfg.ybn").expect("parse yscfg");
+    assert_eq!((cfg.width, cfg.height), (800, 600));
+    assert_eq!(
+        probe_order_from_codes(&cfg.image_ext_order),
+        vec![
+            ImageFormat::Png,
+            ImageFormat::Bmp,
+            ImageFormat::Jpg,
+            ImageFormat::Gif,
+            ImageFormat::Psb
+        ]
+    );
 }
 
 #[test]

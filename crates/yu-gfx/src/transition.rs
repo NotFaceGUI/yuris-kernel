@@ -8,6 +8,9 @@
 //! **未取证**:`TID` 配对层缺失时的第二纹理来源、掩码 `MID` 的取值通道、
 //! 进度推进由 `T`/`+0x1e8` 谁驱动。这些在 `docs/render-parity.md` 挂号;
 //! 本契约只输出已计算出的 `fade` 与原始 `T/TA`。
+//!
+//! TODO(DIV-GFX-006):配对缺失时的双 pass 行为与 `T` 推进者未取证;
+//! 空 `TID` 已确认=无配对,按普通层输出。
 
 pub use crate::layer::Transition;
 

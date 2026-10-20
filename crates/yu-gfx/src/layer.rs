@@ -133,7 +133,9 @@ pub enum ImageFormat {
     Bmp,
     Jpg,
     Gif,
-    /// 引擎码 5(ERIS `yscfg` 出现;扩展名未在手册/样本中定名)。
+    /// 引擎码 5:`FUN_0040c9b4` 行 383 明写 `.psb`。
+    Psb,
+    /// 表内其他未定义码(原样保留)。
     Other(u8),
 }
 
@@ -144,6 +146,7 @@ impl ImageFormat {
             2 => Self::Bmp,
             3 => Self::Jpg,
             4 => Self::Gif,
+            5 => Self::Psb,
             other => Self::Other(other),
         }
     }
@@ -154,6 +157,7 @@ impl ImageFormat {
             Self::Bmp => Some(".bmp"),
             Self::Jpg => Some(".jpg"),
             Self::Gif => Some(".gif"),
+            Self::Psb => Some(".psb"),
             Self::Other(_) => None,
         }
     }
@@ -164,6 +168,7 @@ impl ImageFormat {
             Self::Bmp => "bmp",
             Self::Jpg => "jpg",
             Self::Gif => "gif",
+            Self::Psb => "psb",
             Self::Other(_) => "other",
         }
     }
@@ -318,6 +323,10 @@ impl BlendMode {
     ///
     /// 状态序列逐条取自 `FUN_00414ba4`(`0x414ba4`)对应分支;数值是
     /// D3D9 原始枚举,见 `docs/render-parity.md` §3。
+    ///
+    /// TODO(DIV-GFX-001/002):MODE 3/5/6/7/9 的辅助纹理内容、MODE
+    /// 4/8/10..18 的着色器本体未取证;`fixed_state()` 返回 `None` 或
+    /// `confidence()` 标 Unverified,后端不得执行。
     pub fn fixed_state(self) -> Option<FixedPipelineState> {
         use BlendFactor as B;
         use BlendOp as O;
@@ -817,14 +826,30 @@ pub struct Transform {
 }
 
 /// 过渡状态(`CG[T=... TA=... TID=...]`)。
-#[derive(Clone, Debug, Default, PartialEq)]
+///
+/// 默认值来自引擎层构造 `FUN_00465730`:`+0x82(T)=0x100`,
+/// `+0x84(TA)` 由零初始化保持 0。`TID` 默认空 = 不配对。
+#[derive(Clone, Debug, PartialEq)]
 pub struct Transition {
     /// `T` 原值(手册 0..256)。
     pub t: i16,
     /// `TA` 原值(手册 0..256;`<1` 时引擎不走过渡 pass)。
     pub ta: i16,
-    /// `TID` 配对图层(规范化后的路径)。
+    /// `TID` 配对图层(规范化后的路径;空串 = 无配对)。
     pub tid: Option<LayerId>,
+    /// 脚本原样给的 `TID` 字符串(引擎 `+0x4c` 保存原文,CGINFO 查询返回它)。
+    pub tid_raw: Option<Vec<u8>>,
+}
+
+impl Default for Transition {
+    fn default() -> Self {
+        Self {
+            t: 256,
+            ta: 0,
+            tid: None,
+            tid_raw: None,
+        }
+    }
 }
 
 impl Transition {
@@ -875,11 +900,23 @@ pub struct Part {
 }
 
 /// 图层种类。
+///
+/// 图像层的 `size` 是引擎层矩形的 `+0x78/+0x7c`:
+/// - 手册 `cg/cg.html` 说 `SX/SY` 只对图层组有效;
+/// - 但真实 ERIS 用 `CG[FILE="" SX=800 SY=600]` 画全屏黑幕
+///   (`es_ERIS.yst:579/600`),引擎层结构确实保存独立宽高
+///   (`FUN_00465730` 默认 1,`FUN_0043772c` 按 SX/SY 写回)。
+///
+/// 因此 `FILE=""` + `SX/SY` 按该尺寸绘制;资源图的 SX/SY 缩放语义未取证,
+/// 由 `LayerStatus::Unimplemented` 挡住。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayerKind {
-    Image,
+    Image {
+        /// 显式绘制尺寸(像素;`None` = 纹理自然尺寸)。
+        size: Option<SizeU32>,
+    },
     Group {
-        /// `SX/SY`(手册:仅对图层组有效;`None` = 未指定)。
+        /// `SX/SY`(手册:图层组尺寸;`None` = 未指定)。
         size: Option<SizeU32>,
     },
 }
@@ -917,7 +954,12 @@ pub struct Layer {
     pub transition: Option<Transition>,
     /// 范围裁剪(目前只由显式数据填充;组尺寸由离屏 RT 天然裁剪)。
     pub clip: Option<RectI>,
+    /// 有效状态(= `texture_status` 优先,否则 `param_status`)。
     pub status: LayerStatus,
+    /// 纹理级状态(`CGACT` 复制/图像加工留下)。
+    pub(crate) texture_status: LayerStatus,
+    /// 属性级状态(`MODE`/`MID`/滤镜/部件等参数留下)。
+    pub(crate) param_status: LayerStatus,
     /// 已识别但未解释/非视觉的参数(`LINT`/`LINT2`/`TEX`/...),原样保留。
     pub extra: BTreeMap<String, EngineValue>,
 }
@@ -930,7 +972,35 @@ impl Layer {
     pub fn group_size(&self) -> Option<SizeU32> {
         match self.kind {
             LayerKind::Group { size } => size,
-            LayerKind::Image => None,
+            LayerKind::Image { .. } => None,
         }
+    }
+
+    pub fn image_size(&self) -> Option<SizeU32> {
+        match self.kind {
+            LayerKind::Image { size } => size,
+            LayerKind::Group { .. } => None,
+        }
+    }
+
+    /// 属性更新后重算有效状态。纹理级 Unimplemented 优先(后端不能跳过纹理
+    /// 却执行属性)。
+    pub(crate) fn refresh_status(&mut self) {
+        self.status = match self.texture_status {
+            LayerStatus::Executable => self.param_status,
+            other => other,
+        };
+    }
+
+    pub(crate) fn set_texture_status(&mut self, status: LayerStatus) {
+        self.texture_status = status;
+        self.refresh_status();
+    }
+
+    /// 换图/新建:纹理与属性都回到可执行基线。
+    pub(crate) fn reset_status(&mut self) {
+        self.texture_status = LayerStatus::Executable;
+        self.param_status = LayerStatus::Executable;
+        self.refresh_status();
     }
 }

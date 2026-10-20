@@ -1582,3 +1582,440 @@ $ grep -rn "HashMap" crates/yu-gfx/src                          # 0(全部 BTree
 - 决策规则:Confirmed+可见影响才修;Refuted 只勘误;Uncertain 保持 Unimplemented+DIV;
   手册与引擎冲突以引擎为准并留手册勘误。
 - 仅文档改动;未执行 git 操作。
+
+## 成果 21 (2026-10-20) · 字体会话任务书 `yu-font`(可并行)
+
+- 新增 `docs/tasks/task-g-font.md`:新建独立 crate `crates/yu-font`,与 gfx/后端会话并行。
+- 边界:`yu-font` 只做字体来源解析、字形栅格化、合成粗体/斜体、描边/阴影字形、
+  glyph cache/atlas;排版/换行/对齐/ruby/颜色/渐变仍归 `yu-gfx/text` 与后端。
+- **Phase 0 取证优先**:先确认官方字体来源(自带 TTF/系统字体/位图字体)、
+  官方栅格化路径(GDI/自绘/ClearType)、`FONT` 参数语义、描边/阴影/旋转算法;
+  产出 `docs/font-provenance.md`,未取证不写字体选择/样式公式。
+- 技术默认:`swash` + `fontdb` + 可选 `rustybuzz` + `tiny-skia` 描边/阴影;
+  `fontdue` 作为简化备选;Windows `GdiRasterizer` 仅作参考/可选 feature。
+- 验收:确定性 coverage、字形/样式 golden、缺失字体/字形诊断、
+  wasm32/Android 编译、示例 PNG 与官方文本截图并排;视觉相似为底线,
+  逐像素差异必须归因(字体/AA/描边/取整)并留 DIV。
+- 仅文档改动;未执行 git 操作。
+
+## 成果 22 (2026-10-20) · 字体会话改为一次性完整实现(参考游戏配置直出)
+
+- 重写 `docs/tasks/task-g-font.md`:取消“第一版/最小版”式分阶段,
+  一次性实现完整字体 + 文本样式管线,并用 ERIS 真实 FONT 配置直接渲染
+  PNG contact sheet 供对比;桥接留给后续会话。
+- 范围:字体来源解析、字形栅格化、粗体/斜体/AA/颜色/双色/渐变/描边/阴影/旋转/
+  DRAWMODE,全部按取证结果实现;排版(换行/对齐/ruby/逐字节奏)只定义接口。
+- 硬门禁:Phase 0 必须先完成字体来源/引擎栅格路径/FONT 参数/官方截图取证,
+  产出 `docs/font-provenance.md`;未取证项显式 Unimplemented,禁止猜测。
+- 参考渲染器 `examples/render_reference.rs`:读取参考游戏 FONT 配置(编译产物扫描,
+  宏展开后才有),生成单字/整行/描边/阴影/渐变/旋转/粗体样例,输出 PNG + JSON,
+  与官方截图并排并给出 diff 统计。
+- 并行:`yu-font` 为新 crate,不改 yu-gfx/yu-rt/后端;REA 单会话。
+- 仅文档改动;未执行 git 操作。
+
+## 成果 F1 (2026-10-20) · yu-gfx 复核修复:验证台账 + 14 项 Confirmed 修复
+
+> 会话 F。**先复核、后修复**:先产出 `docs/gfx-verification-ledger.md`,
+> 每条审查主张重新取证(A/B/C 共 28 条:C=19 / R=7 / U=2),未进台账不改代码。
+> 零 git 写操作;旧线工作区未动。会话 G(`yu-font`)并行,本会话未触碰其文件。
+
+### 1. 台账结论(详见 `docs/gfx-verification-ledger.md`)
+
+- **Confirmed 19**:修复 14(A1–A4/A6/A7/B11/B12/B13/C1–C5),
+  证据成立但保持现状 5(A5 CGINFO LET、A9 MODE 3/5/6/7/9、B6 辅助纹理、
+  B9 清屏、B10 颜色空间)。
+- **Refuted 7**(审查读错):
+  - B1“每帧按 Z 重排是错的”:引擎链表确实不排序,但可见顺序=Z 升序;
+    同 Z 创建序是 DIV-GFX-014 的确定性决策。
+  - B2“E 可能是 +0xa4”:`+0x89`=E、`+0xa4`=层种类(1 图像/2 组/0 死),
+    由 `0x413e34/0x413e47`、`0x42c400`、`0x40a38c`、`0x40e02c`、`0x43d4bc` 确认。
+  - B3“+0x61c/+0x90 可能不是 RT/纹理”:`0x413f6f-0x413fab` 明确
+    `SetRenderTarget(+0x61c)`/`GetSurfaceLevel(+0x21c)`。
+  - B4“TFACTOR 只在 0/3/7”:实际集合 `{0,1,2,3,5,6,7,9,100,98}`
+    (`FUN_00414ba4` 行 144-154);3/7 只是分支内覆盖为白。
+  - B7“A 被 `in_stack_00000010==0` 清零”:调用点 `0x413f29` 恒传 1,
+    清零分支不属于图层遍历。
+  - B8“X/Y 可能 /100/16.16”:ERIS 的 X/Y 是像素值;`/100` 只作用于
+    `+0x1b0..+0x1d8` 滤镜字段。
+  - C6“域分类用前缀”:属路由启发式,不是可见语义错误。
+- **Uncertain 2**:A8(`CG` 无 FILE 的 get-or-create 未重新锚定,保持
+  DIV-GFX-016)、B5(顶点 DIFFUSE RGB 未还原,新增 DIV-GFX-019)。
+- **B12 地址失效**:`0x42c4a4/0x43d334/0x43d4a4` 在本地反编译树不存在;
+  改用 `0x413dc8`(遍历/TID/MID)、`0x4141e4`(路径规范化)、
+  `0x414559`(哈希查表)、`0x43d4bc`(析构)、`0x42f57d`(SWAP)、
+  `0x42f809`(CGACT 动作分派)。
+
+### 2. Confirmed 修复(证据 → 代码 → 回归)
+
+| 项 | 证据 | 代码 | 回归 |
+|---|---|---|---|
+| A1/B13 `TID=""` | `es_Button.yst:4526/4540`;`FUN_00413dc8 0x413e7b`:空串跳过配对 | `state.rs` TID 分支:空串清 `tid=None`;`op_for_layer` 无 TID 输出普通层 | `parity_fixes::empty_tid_clears_pairing_instead_of_w0` |
+| A2 图像 SX/SY | 手册称仅组有效,但 `es_ERIS.yst:579/600` 用 `FILE="" SX/SY` 画黑幕;`FUN_00465730/0043772c/00408724` | `LayerKind::Image{size}`;`SolidBlack1x1` 按尺寸可执行,资源图+尺寸标 `gfx.image.size.unsupported` | `parity_fixes::solid_black_with_sx_sy_draws_at_that_size`、`asset_with_sx_sy_stays_unimplemented`;ERIS 首屏断言 `:/W1/DBG` 260×600、`:/W0/FONTL2` 233×27 |
+| A3/C2 WINDOW | `window/window.html`;`es_First.yst:97/98/140`、`es_ERIS.yst:22` | 消费 `Domain::Window`;`CompositorFrame.windows`;Screen 用 `WINDOW[NO=0].CGID/E/A`;`WINDOWEND NO=0` 拒绝;子窗口归 host | `parity_fixes::window_cgid_selects_main_layer_set_and_e_zero_hides_screen`、`screen.rs` |
+| A4 TEXT | `text/text.html` ID/CLEAR;`es_Text.yst:154` | `yu-rt` 保存 `text_layer_id`;`WORD`/`_` 事件带 ID;`CLEAR=1` 清文本缓冲 | `yu-rt fixture::text_id_sets_following_run_id_and_clear_empties_buffer` |
+| A5 CGINFO/FONTINFO/WINDOWINFO LET | 手册三页 + 125 处真实使用 | **不修**:需脚本执行期同步查询 ABI;保持 Unimplemented | 新增 DIV-GFX-020 |
+| A6 CGACT | `cg/cgact.html` 例 3/4/21/22;真实 ysc 表 70 参数 | `ImageOp.sx/sy`;动作表补 `RESIZE/TRIM/ROTATION2/TRANSITION2/XOR/AND/BLUR2..6`;像素仍 Unimplemented | `parity_fixes::cgact_size_keeps_sx_sy_and_resize_trim_are_recognized` |
+| A7 FONT NO/BNO | 手册 `font/font.html` NO;脚本 `FONT[BNO=1]` | `TextStyle.font_no/font_bno`;BNO 值保留并挂 DIV | `parity_fixes::font_no_and_bno_are_recorded` |
+| C1 视口 | `yscfg` 800×600 | `from_tables` 在宽高非 0 时覆盖配置 | `eris_first_screen` 以 1×1 占位构造后断言 800×600 |
+| C4 T 默认 | `FUN_00465730 +0x82=0x100` | `Transition::default().t=256` | `parity_fixes::transition_defaults_to_t_256` |
+| C5 psb | `FUN_0040c9b4` 行 383 `.psb` | `ImageFormat::Psb` | `filter::probe_order_from_eris_yscfg`、真实 yscfg 测试 |
+| D15/D16 主组/图像子层 | `FUN_00413dc8 0x413e1a` 任意节点先递归子层 | 主组缺失不再猜所有顶层;图像层子层按后序扁平输出 | `parity_fixes::image_children_are_drawn_before_the_parent` |
+| E1/E3/E9 | 诊断无界/粘滞/非法 JSON | 每帧清空+`count`;`texture_status`/`param_status` 重算;`128.0`/`null`/`-0.0` | `diagnostics_are_per_frame_and_count_duplicates`、`mode_update_recovers_executable_status`、`persistent_unsupported_attributes_keep_layer_unimplemented`、json 单测 |
+| E2/E6/E7/E8/E10/E5 | 日志无界/递归/丢层/缺表/O(n²)/比较器分配 | 日志上限 16,384+`dropped_ops()`;显式栈;图像子层;必需命令 fail-fast;动作集合一次扫描;排序去分配 | `deep_path_and_deep_group_nesting_do_not_recurse`、`missing_required_graphics_command_fails_validation`、全量测试 |
+
+### 3. 修复前后原始证据
+
+**A1 旧行为**(`git show HEAD:...state.rs:1531`):
+
+```text
+"TID" => match value.as_bytes() {
+    Some(b) => {
+        let p = path::normalize(b, None, false).path;
+        layer.transition.get_or_insert_with(Transition::default).tid = Some(p);
+```
+
+`normalize(b"")` = `:/W0`,因此旧代码把 `TID=""` 变成整屏 W0 过渡;
+新回归断言此时**不得**出现 `Op::Transition`,`tid=None`(测试通过)。
+
+**E9 旧/新**:
+
+```text
+旧: fmt_f64(128.0) == "1.3e2"(非法精度);NaN → "NaN"(非法 JSON)
+新: fmt_f64(128.0) == "128.0";NaN/±Inf → null;-0.0 → "-0.0"
+```
+
+**Golden 前后**(ERIS 首屏):
+
+```text
+旧:"name":"other","code":5           新:"name":"psb","code":5
+旧:"kind":{"kind":"image"}           新:"kind":{"kind":"image","size":{"width":260,"height":600}}
+旧:无 windows 字段                    新:"windows":[{"number":0,"layer_set":":/W0",...}]
+旧:20620 B(跨帧累计诊断)             新:19822 B(本帧诊断;帧 3 diag=0)
+```
+
+### 4. 测试真实性补强(F 类)
+
+- ERIS 首屏从 `>100/>10/>=2` 改为精确 census:272 层 / 34 visible /
+  15 pass / 44 op / 12 texture pass / W0 30 op / W1 1 op / screen 1 op;
+  断言真实 `MODE=2` 层 `:/W0/SPLDST2`(A=0、E=0、SolidBlack1x1)、
+  E=0 共 238 层、主窗口 `:/W0`、帧内诊断为空。
+- golden 新增 `tests/golden/README.md`:样本 `ysc.ybn` sha256
+  `741d4caf…`、`yscfg.ybn` sha256 `f451d3a7…`、生成命令。
+- blend JSON 与 `fixed_state()` 逐 stage/arg/op/blend 字段交叉验证。
+- filter 测试读取真实 `yscfg.ybn`(500 样本 gate);`Other(5)` 改为 `Psb`。
+- SWAP2 增加 X/Y 断言;COPY2/属性不复制继续执行断言。
+- 深路径 600 级 / 深组嵌套不递归爆栈。
+
+### 5. 未完成 / blocked
+
+- A5 `CGINFO/FONTINFO/WINDOWINFO` 的 `LET`:保持 Unimplemented + DIV-GFX-020。
+  原因:必须脚本执行期同步写 VM 变量,而 gfx 事件是 tick 后异步消费;
+  需要 VM↔gfx 同步查询 ABI,不是 gfx 单层可修。
+- A8 `CG` 无 FILE:未重新锚定 CG 处理体,保持 DIV-GFX-016。
+- A9 MODE 3/5/6/7/9、4/8/10..18:DIV-GFX-001/002 不变。
+- B5 顶点 DIFFUSE RGB:DIV-GFX-019;可执行模式 0/1 的 DIFFUSE 只进 alpha
+  stage,不影响可见 RGB。
+- E4 每命令分配优化:记录为后续项,本会话未改(不改变语义)。
+- 像素/官方截图对拍:属后端会话;本会话只到显示列表层。
+
+### 6. 给后端的契约变化(只列已确认)
+
+1. `LayerKind::Image { size }`:`SolidBlack1x1` + `size` 必须铺满该矩形;
+   资源图 + size 的图层 `status.executable=false`。
+2. `Op::Image` 新增 `sx/sy`;新增动作名 `resize/trim/rotation2/transition2/
+   xor/and/blur2..blur6`;所有 ImageOp 仍 Unimplemented。
+3. `CompositorFrame.windows`(按 NO):`NO=0` 的 `layer_set/visible/
+   alpha/x/y/size/z`;Screen ops 为空表示主窗口隐藏。
+4. `FrameDiag.count`:同键诊断合并计数;诊断**每帧重置**。
+5. `ImageFormat::Psb`(code 5,`.psb`)。
+6. `TextStyle.font_no/font_bno`;`VmEvent::Text.id` 现在可能非空
+   (`TEXT[ID]`)。
+7. `LayerStatus` 由纹理级/属性级重算;MODE/FX/MID 持久字段不会因一次
+   无参数更新被洗白。
+8. `GfxState::dropped_ops()`:日志上限丢弃计数;`gfx.log.truncated`。
+
+### 7. 验收原始输出
+
+```text
+$ export YURIS_REQUIRE_SAMPLES=1 YURIS_SAMPLE_ERIS_YSBIN=.../save/data/ysbin
+$ cargo test -p yu-gfx
+10 lib + 5 alpha + 10 blend_table + 1 display_list_golden + 1 eris_first_screen
++ 7 filter + 6 group + 11 layer_order + 15 parity_fixes + 2 screen
++ 6 transform + 4 transition + 1 doc = 79 passed; 0 failed
+
+$ cargo test --workspace --no-fail-fast      # 同一套样本 env
+352 passed; 0 failed(exit=0)
+
+$ cargo clippy -p yu-gfx --all-targets
+yu-gfx: 0 warning(yu-rt 既有 5 条基线 warning 不变)
+
+$ grep -rEn "winit|wgpu|web-sys|wasm-bindgen" crates/yu-gfx/src   # 0
+$ grep -rEn "println!|eprintln!|dbg!" crates/yu-gfx/src           # 0
+$ grep -rEn "HashMap" crates/yu-gfx/src                          # 0
+```
+
+- `cargo fmt -p yu-gfx -- --check` 通过。
+- 确定性:`json::to_display_json` 两次逐字节一致(既有测试 + golden)。
+
+### 8. 并行纪律
+
+- 会话 G 期间新增 `crates/yu-font`、`docs/tasks/task-g-font.md` 并改
+  `PROGRESS.md`/`Cargo.lock`;本会话只追加本节,未改其文件。
+- 本会话未执行任何 git 写操作。
+
+## 成果 23 (2026-10-20) · 并行任务书:官方 trace 对拍(H)
+
+- 新增 `docs/tasks/task-h-trace-oracle.md`。
+- 目标:把 `yu-trace` 从“内核自证”推进到“官方 trace 对拍”。
+- 范围:边界①vfs/②vm;③帧描述/④平台命令留给后端会话。
+- 关键:producer-neutral schema(v3)、按 sub/kind/frame 投影对齐、官方采集器
+  (WOW64/调试器/屏幕级 fallback,注明等级)、tick_at 时钟/codec/aux 回放闭合。
+- 不改 yu-rt/yu-gfx;采集器放 tools/ 或仓库外;语料/截图不入库。
+
+## 成果 24 (2026-10-20) · 并行任务书:渲染后端(I)
+
+- 新增 `docs/tasks/task-i-backend.md`。
+- 新建 `yu-assets` + `yu-backend-soft` + `yu-backend-wgpu`;不改 gfx/rt/font。
+- 顺序:纹理管线(YPF/Dir、扩展名探测、解码、缓存)→ 软后端确定性 PNG →
+  headless 首帧 → wgpu 同帧对比。
+- 文本由 G-FONT 并行提供;本会话遇到 TextRun 跳过并诊断,不阻塞第一帧。
+- 验收:first_frame.png、soft vs wgpu diff、缺失资产/跳过项清单、无硬编码屏幕尺寸。
+- 未执行 git 操作。
+
+## 成果 25 (2026-10-20) · 复审并修正 trace/backend 任务书范围
+
+- 复核 `yu-trace` 实际实现:①vfs、②vm、roundtrip/diff/replay 已完成;
+  ③`frame_description`、④`platform_call` 只是 schema 2 占位,写入/解析均显式拒绝;
+  官方 producer 不存在。此前提示词把①/②也当成待做,范围不准,已修正。
+- `task-h-trace-oracle.md`:明确“不重写①②;本会话补③帧描述 + 官方 producer +
+  producer-neutral schema/投影 + 回放闭合;④保持拒绝”。
+- 复核后端:仓库尚无 `yu-assets`/`yu-backend-*`,是从零新建;gfx(F)与字体(G-FONT)
+  正在并行写。`task-i-backend.md`:改为只消费 gfx 公开类型/最小适配层,
+  第一帧输出 `target/tmp/first_frame.display.json` 供 trace③ 文件协作。
+- 仅文档改动;未执行 git 操作。
+
+## 成果 F2 (2026-10-20) · INFO/LET 同步查询闭环 + 未实现模块 TODO
+
+> 会话 F 续。目标:推进上一轮最大的 1:1 缺口
+> `CGINFO/FONTINFO/WINDOWINFO` 的 `LET`(A5/D2),并给所有未实现模块
+> 落可检索的 TODO;不猜未取证语义。
+
+### 1. 架构:同步 GraphicsHost
+
+- `yu-rt` 新增 `event::GraphicsHost`:
+  - `apply_event(&VmEvent)`:FrameStart/FrameEnd/Text/Graphics|Window DomainCall
+    在**产生时**同步送入宿主;
+  - `query(command, args) -> Result<Value, Diag>`:脚本执行期查询。
+- `Vm::set_graphics_host/take_graphics_host`。安装后:
+  - `emit` 同步转发图形事件(Command 热路径不转发);
+  - Graphics/Window 域命令不再重复挂 `rt.cmd.unimplemented`;
+  - **调用方不得再把同一批事件 drain 后喂给同一 GfxState**(已写进文档)。
+- `yu-rt` 新增 `HandlerKind::Cginfo/Fontinfo/Windowinfo` 与 `op_info`:
+  - 参数名按工程 ysc 表(opcode→参数表)解析,不写死槽号;
+  - `LET` 用 `eval_lvalue` 求值;查询结果用 `write_target` 写回;
+  - 无宿主/字段未取证 ⇒ 只诊断,不写 LET(不猜 0)。
+
+### 2. yu-gfx 查询实现
+
+- 新增 `GfxHost`(`Rc<RefCell<GfxState>>`),与调用方共享状态:
+  tick 后 `state.borrow().frame()`;tick 期间 VM 同步 `apply_event`。
+- `GfxState::query_info`:
+  - **CGINFO**:EXIST / E / A / X / Y / Z / MODE / T / TA / TID;
+    SX/SY 对组(含 W0 视口)、显式尺寸层、`SolidBlack1x1` 可答。
+  - **FONTINFO**:当前 TextStyle 的 COLOR / COLOR2(已设置)/
+    SX / SY / BOLD / ANTIALIASING / DRAWMODE / NAME(无 NO 索引)。
+  - **WINDOWINFO**:EXIST / E / X / Y / SX / SY(主窗口默认 yscfg 尺寸)。
+  - 多字段同时置位:顺序未取证 ⇒ `gfx.info.multi`,不写 LET。
+  - 资源图尺寸:需要资产元数据 provider ⇒ `gfx.info.asset_size`,
+    不写 LET(DIV-GFX-024)。
+  - COLOR/ONMOUSE*/CAPTION/ACTIVE/FULLSCREEN 等 ⇒
+    `gfx.info.unsupported`(DIV-GFX-026)。
+- `Transition` 新增 `tid_raw`:引擎 `+0x4c` 保存脚本原文,
+  `CGINFO[TID]` 返回原文而不是规范化路径;JSON 同步输出 `tid_raw`。
+
+### 3. 回归(原始结果)
+
+```text
+$ cargo test -p yu-gfx --test info_query
+7 passed; 0 failed
+  - cginfo_answers_documented_attributes
+  - cginfo_group_and_solid_black_sizes_are_known
+  - cginfo_missing_layer_only_answers_exist
+  - cginfo_multiple_fields_are_rejected_not_guessed
+  - fontinfo_answers_current_style_fields
+  - fontinfo_unset_fields_are_not_fabricated
+  - windowinfo_answers_main_geometry
+
+$ cargo test -p yu-rt --test fixture info_query_writes_let_with_synchronously_applied_state
+1 passed; 0 failed
+  - 宿主先看到 CG DomainCall,再收到 CGINFO 查询;
+  - 查询值 42 写回 @v;LET 自身不进入查询参数。
+
+$ cargo test -p yu-gfx --test eris_first_screen
+2 passed; 0 failed(约 25s,两次真实 ERIS boot)
+  - 旧模式 census:272 层 / 34 visible / 15 pass / 44 op
+  - 同步宿主模式 census:**完全一致**;查询日志出现 CGINFO + WINDOWINFO
+```
+
+### 4. 未实现模块 TODO
+
+- 新增 `docs/gfx-unimplemented-todo.md`:DIV-GFX-001..040 的状态、
+  当前行为、解除条件、代码标记位置、推进顺序。
+- 代码内新增 `TODO(DIV-GFX-xxx)`:
+  - `layer.rs`:MODE 3/5/6/7/9、4/8/10..18;
+  - `state.rs`:MID、滤镜、COPY、图像加工、资源图尺寸、组 RT 清屏;
+  - `op.rs`:CopyOp/ImageOp 恒 Unimplemented;
+  - `frame.rs`:清屏/颜色空间;
+  - `text.rs`:字形栅格化/排版;
+  - `transition.rs`:配对缺失/推进者;
+  - `path.rs`:IDNO 后缀;
+  - `yu-rt handlers.rs`:TEXT 显示节奏属性。
+- 新增 DIV-GFX-024(资源图 `CGINFO SX/SY` 需资产元数据)、
+  DIV-GFX-025(多字段写回顺序)、DIV-GFX-026(像素/鼠标/窗口 host 字段)、
+  DIV-GFX-027(IDNO)、DIV-GFX-028(图像子层目标 RT)、
+  DIV-GFX-029(pass 交错序)、DIV-GFX-030(`TIDNO`)、
+  DIV-GFX-031(`CGACT ID3/ID4/Z2/BNO`)、DIV-GFX-032(SWAP 模式对应)、
+  DIV-GFX-033(TEXT 节奏/OUTPUTMODE)、DIV-GFX-034(文本跨帧持久/CLEAR)、
+  DIV-GFX-035(FONT NO/BNO/字体解析)、DIV-GFX-036(FONTINFO 字体列表)、
+  DIV-GFX-037(WINDOW host 属性/主窗口 A/SX-SY)、DIV-GFX-038(INFO 缺层语义)、
+  DIV-GFX-039(CGACT RASTER1/FSX/...)、DIV-GFX-040(TEXTINFO)。
+- 复查后确认:**上一版 TODO 不是全部**;补入上述 030..040 后仍不能保证
+  “宇宙级完整”,但 gfx 已知缺口已全部有编号/状态/解除条件。
+
+### 5. 验收
+
+```text
+$ cargo test -p yu-gfx
+10 lib + 5 alpha + 10 blend_table + 1 display_list_golden + 2 eris_first_screen
++ 7 filter + 6 group + 7 info_query + 11 layer_order + 15 parity_fixes
++ 2 screen + 6 transform + 4 transition + 2 doc = 88 passed; 0 failed
+
+$ cargo test --workspace --exclude yu-trace --exclude yu-backend-soft --no-fail-fast
+328 passed; 0 failed
+
+$ cargo test -p yu-rt
+98 passed; 0 failed
+
+$ cargo clippy -p yu-gfx --all-targets
+yu-gfx: 0 warning(yu-rt 既有 5 条基线 warning 不变)
+
+$ cargo fmt -p yu-gfx -- --check     # 通过
+$ grep -rEn "winit|wgpu|web-sys|wasm-bindgen" crates/yu-gfx/src   # 0
+$ grep -rEn "println!|eprintln!|dbg!" crates/yu-gfx/src           # 0
+$ grep -rEn "HashMap" crates/yu-gfx/src                          # 0
+```
+
+- **全 workspace 当前被并行会话的中间态阻塞**(本会话未改这些 crate):
+  - `yu-trace`:golden schema 2 vs 3(`synthetic_trace_matches_golden`);
+  - `yu-backend-soft`:`render.rs`/`texture.rs` 编译错误(借用/移动)。
+  按“活跃写者只读”纪律等待其完成。`--exclude yu-trace --exclude
+  yu-backend-soft` 下 328 项全绿。
+
+### 6. 契约变化
+
+1. `yu_rt::event::GraphicsHost` + `Vm::set_graphics_host`;安装后事件同步消费,
+   不得重复喂。
+2. `yu_gfx::GfxHost`(Rc<RefCell<GfxState>>)供宿主/测试使用。
+3. `Transition.tid_raw`(JSON `tid_raw`):原始 TID 字符串。
+4. INFO 查询失败时的诊断码:`gfx.info.multi/missing/unsupported/asset_size`;
+   失败时 VM 不写 LET。
+5. 资源图 `CGINFO SX/SY` 仍不可用,需资产元数据 provider(DIV-GFX-024)。
+
+### 7. 仍未 1:1(按优先级)
+
+1. 资产元数据 provider → `CGINFO SX/SY`(ERIS 按钮布局最大缺口)。
+2. 官方引擎受控脚本/截图 → 过渡无配对、COPY 时序、组 RT 清屏/尺寸、
+   MODE 0/1/2 像素对拍。
+3. MODE 3/5/6/7/9 辅助纹理;4/8/10..18 着色器。
+4. 图像加工/多部件/MID/顶点 DIFFUSE。
+5. 文本栅格化(与 `yu-font` 会话合流)。
+
+## 成果 G1 (2026-10-20) · yu-font:字体 + 完整文本样式 + ERIS 配置直出
+
+> 会话 G-FONT。范围:新建 `crates/yu-font`、`docs/font-*`、示例与测试;
+> 未改 `yu-gfx` / `yu-rt` / 后端 / 根 `Cargo.toml`。
+
+### 1. 取证(硬门禁)
+
+- `docs/font-provenance.md`:字体来源/栅格路径/FONT 参数/参考图证据表。
+- 参考工程 `data.ypf` 1,407 条,0 个字体扩展;唯一 `.psb` 是 E-mote 模型 →
+  **无自带字体**。
+- 引擎启动 `FUN_00403afc` @ `0x403afc` 用 `EnumFontFamiliesExA`
+  (`lfCharSet=SHIFTJIS_CHARSET`) 枚举,回退表 `0x807008..0x807044`:
+  `ＭＳ ゴシック` → `標準ゴシック` → `ＭＳ Ｐゴシック` → `ＭＳ 明朝` → `標準明朝`。
+- 栅格路径:GDI `CreateFontIndirectA` + `TextOutA` 到 8-bit DIB
+  (`FUN_00445421` @ `0x445421`、`FUN_004450c0` @ `0x4450c0`);无
+  `GetGlyphOutline`/`ExtTextOut`/`DrawText`/`AddFontResource`/`ID3DXFont`,
+  非 ClearType,非自绘 outline。
+- FONT 参数存储/clamp 由 `0x444428..0x444b1c` 逐条钉死;默认值由
+  `FUN_00464fac` @ `0x464fac` 钉死(SX/SY=20,AA=1,COLOR=COLOR2=0xffffff,
+  GRADATION=1,ROTATION=0,DRAWMODE=0,BOLD=0)。
+- 42 个编译后 FONT 组;参考配置:es_text g1517 `12×12/0x999999/AA=0`,
+  g1698 `BOLD=1/AA=1`,g1606 `COLOR=#ffffff COLOR2=#ffff00`,
+  es_system g132 `14×15/BOLD/DRAWMODE=1`。
+- 官方参考图:用户提供 `official_title_user.png`(1200×900);`スタート`
+  墨迹框 54×16;不启动引擎自动截图(用户指示)。
+
+### 2. 实现
+
+- `FontSource`:fontdb + 自带字节优先;引擎默认 family 回退;`NAME`/`NO`
+  解析;缺失显式 `font.missing`,无静默 fallback;wasm 禁止系统枚举。
+- 栅格:swash/skrifa outline → 8-bit coverage;SX/SY 非等比用 transform;
+  bold 优先 bold face,否则固定 `embolden`;italic face 优先,否则 shear;
+  AA 灰度/阈值 128;ClearType 显式 Unimplemented。
+- 样式:COLOR/COLOR2/GRADATION、DRAWMODE、outline(round 膨胀)、shadow
+  (整数偏移,无模糊)、ROTATION(octant×45°)、kerning(legacy kern)、
+  `StylePolicy::Strict/Reference` 证据门禁。
+- 固定合成顺序:base → bold/italic → outline → shadow → color/gradient →
+  rotation → 调用方 DRAWMODE 合成。
+- 有界确定性 LRU cache(条目+像素双上限)。
+- 排版只定义 `TextLayout` 接口;`render_run` 是参考单行 helper,拒绝换行。
+
+### 3. 验收
+
+```text
+$ cargo test -p yu-font
+14 lib + 1 eris_config + 5 glyphs + 7 source_config + 1 style_golden
++ 12 styles + 1 doc = 41 passed; 0 failed
+
+$ cargo check -p yu-font --target wasm32-unknown-unknown     # pass
+$ cargo check -p yu-font --target aarch64-linux-android     # pass
+$ cargo clippy -p yu-font --all-targets                     # 0 warning
+$ grep -rn "println!\|eprintln!\|dbg!" crates/yu-font/src   # 0
+```
+
+- 确定性:同 `(font,char,style)` 两次 coverage/RGBA hash 逐字节一致。
+- 字形 golden:ASCII/假名/汉字/标点 coverage hash + metrics
+  (`crates/yu-font/tests/golden/glyphs.txt`)。
+- 样式 golden:粗体/斜体/AA off/描边 1,3/阴影/渐变/旋转/非等比
+  (`crates/yu-font/tests/golden/styles.txt`)。
+- 缺失字体/缺字形/坏字体 → `font.bad_face`/`font.glyph_missing`,不 panic。
+
+### 4. 参考渲染器
+
+```text
+$ cargo run -p yu-font --example render_reference
+== samples: 19 written to target/tmp/font-ref/samples.json
+== contact sheet: target/tmp/font-ref/contact_sheet.png
+== official diff: iou=0.537 max_channel=178 mean=73.88
+```
+
+- contact sheet 真读 ERIS 编译产物;运行时打印 42 个 FONT 组与 5 个
+  参考槽位(见 `target/tmp/font-ref/render.log`)。
+- 官方 diff:best size=15 bold MS Gothic;official ink 227,ours 211,
+  intersection 153,fp 58,fn 74,max channel 178,mean 73.88;归因 GDI vs
+  swash outline/AA + 未建模的浅色 rim。
+- 性能(release):1000 个可渲染 CJK × 2 字号 × 1px outline
+  - 12px:first 1799.87 ms (1.800 ms/glyph),cache hit 0.38 ms
+    (0.0004 ms/glyph),848 KiB
+  - 24px:first 2054.27 ms (2.054 ms/glyph),cache hit 0.42 ms
+    (0.0004 ms/glyph),2393 KiB
+  - 命中 1000/1000,miss 0;cache entries=1000。
+
+### 5. 未解决/需 REA 复核
+
+- `GRADATION` 方向映射未取证(默认 1 解释为竖直上→下;Strict 只允许纯色)。
+- `ROTATION` 0..8 的渲染语义未观察到(octant×45°,Reference only)。
+- `BNO` 字体列表分支 `0x444ce7` 未解析(仅保存值)。
+- GDI `lfHeight` 与 SX/SY 的精确映射、合成粗体像素量未完全取证。
+- `FONT[NAME]` 找不到时引擎的回退/报错行为未取证(本 crate 显式失败)。

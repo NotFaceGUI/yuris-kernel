@@ -51,6 +51,21 @@ impl<D: DataSource> TracingSource<D> {
         }
     }
 
+    /// 与另一个录制源共享同一个帧号句柄(主源与 aux 源必须一致)。
+    pub fn from_recorder_with_frame(
+        inner: D,
+        recorder: EventRecorder,
+        frame: FrameHandle,
+    ) -> Self {
+        let source_name = inner.source_name().to_string();
+        Self {
+            inner,
+            recorder,
+            source_name,
+            frame,
+        }
+    }
+
     /// 设定后续读取的逻辑帧号(`None` = 帧外)。
     ///
     /// 启动链读取应保持 `None`;帧内读取由宿主在推进前设置。

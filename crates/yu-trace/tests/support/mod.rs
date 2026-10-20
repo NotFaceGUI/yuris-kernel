@@ -11,18 +11,20 @@ mod raw;
 
 pub use raw::*;
 
-pub use yu_trace::{BootSummary, HeaderPayload, InputSummary};
+pub use yu_trace::{BootSummary, ClockSummary, HeaderPayload, InputSummary, ProducerInfo};
 
 /// 与真实录制一致形状的确定性头部(不读环境、不含墙钟/绝对路径)。
 pub fn header_for(tables: Vec<String>) -> HeaderPayload {
     HeaderPayload {
         codec: "cp932".to_string(),
+        producer: ProducerInfo::kernel(),
         tables,
         boot: BootSummary::from_config(&yu_rt::BootConfig::default()),
         input: InputSummary {
             events: 0,
             sha256: "0".repeat(64),
         },
+        clock: ClockSummary::none(),
         kernel: yu_trace::kernel_version().to_string(),
     }
 }

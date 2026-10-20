@@ -262,6 +262,8 @@ pub struct Vm {
     exec: BTreeMap<String, ExecState>,
     input: InputState,
     binding: InputBinding,
+    /// 图形域同步宿主(可选;安装后负责 INFO 查询与状态同步)。
+    graphics_host: Option<Box<dyn crate::event::GraphicsHost>>,
     events: Vec<VmEvent>,
     diags: MemorySink,
     pending_effects: Vec<Effect>,
@@ -293,6 +295,9 @@ pub struct Vm {
     texts: BTreeMap<String, Vec<u8>>,
     /// 显示文本缓冲(`$_TEXT`;`WORD`/`_` 追加,脚本可写)。
     text_buffer: Vec<u8>,
+    /// `TEXT[ID=...]`:后续文本事件的目标文本层 ID(手册 `text/text.html`)。
+    /// 事件字段是 `String`;非 UTF-8 的 CP932 ID 会显式报告并保持为空。
+    text_layer_id: String,
     /// `@_MENUCODE`(手册:最後に選択されたメニュー項目の CODE 値;○ 可赋值)。
     menu_code: i64,
     /// `@_WINDOW_EXEC_MAX`/`_WINDOW_EXEC_CLOSE`(手册:最大化/閉じるボタン
@@ -393,6 +398,7 @@ impl Vm {
             exec: BTreeMap::new(),
             input: InputState::new(),
             binding,
+            graphics_host: None,
             events: Vec::new(),
             diags: MemorySink::new(),
             pending_effects: Vec::new(),
@@ -419,6 +425,7 @@ impl Vm {
             decode_scratch: Vec::new(),
             texts: BTreeMap::new(),
             text_buffer: Vec::new(),
+            text_layer_id: String::new(),
             menu_code: 0,
             window_exec_max: 0,
             window_exec_close: 0,
@@ -549,6 +556,20 @@ impl Vm {
         self.event_capacity = cap.max(1);
         self.events.truncate(self.event_capacity);
         self
+    }
+
+    /// 安装图形域同步宿主。
+    ///
+    /// 安装后,图形/窗口/文本/帧事件在产生时同步送给宿主;INFO 命令通过
+    /// [`crate::event::GraphicsHost::query`] 在脚本执行期取状态并写 `LET`。
+    /// **调用方不得再把同一批事件 drain 后喂给同一个宿主**(会重复应用)。
+    pub fn set_graphics_host(&mut self, host: Box<dyn crate::event::GraphicsHost>) {
+        self.graphics_host = Some(host);
+    }
+
+    /// 取走图形宿主(便于宿主自己持有 `Rc` 状态)。
+    pub fn take_graphics_host(&mut self) -> Option<Box<dyn crate::event::GraphicsHost>> {
+        self.graphics_host.take()
     }
 
     /// 因容量上限被丢弃的最旧事件数。
@@ -774,6 +795,23 @@ impl Vm {
     /// 事件入队。事件流是**有界**的(任务书 E R10):超过容量时丢最旧事件并
     /// 记账,长跑不会无界增长。容量可通过 [`Vm::with_event_capacity`] 调整。
     pub(crate) fn emit(&mut self, ev: VmEvent) {
+        // 图形宿主必须**同步**看到状态事件:同一帧 `CG[...]` 之后的 `CGINFO`
+        // 才能读到最新图层。仅转发宿主关心的类别,避免 Command 热路径开销。
+        let host_relevant = matches!(
+            &ev,
+            VmEvent::FrameStart { .. }
+                | VmEvent::FrameEnd { .. }
+                | VmEvent::Text { .. }
+                | VmEvent::DomainCall {
+                    domain: crate::event::Domain::Graphics | crate::event::Domain::Window,
+                    ..
+                }
+        );
+        if host_relevant {
+            if let Some(host) = self.graphics_host.as_mut() {
+                host.apply_event(&ev);
+            }
+        }
         if self.events.len() >= self.event_capacity {
             // 批量丢弃最旧的四分之一:`Vec::remove(0)` 是 O(len),队满后逐条
             // 搬移会退化成 O(n²)(ERIS 首帧 130 万条事件实测卡死)。批量 drain

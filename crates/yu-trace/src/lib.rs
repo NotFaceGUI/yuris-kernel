@@ -10,9 +10,10 @@
 //! 2. [`EventRecorder`] 拉取 [`yu_rt::Vm::take_events`],把 [`yu_rt::VmEvent`]
 //!    映射为稳定记录(边界②,穷尽 match,新增变体即编译失败)。
 //!
-//! ③帧描述 / ④平台命令只保留 [`record::Sub::Frame`] / [`record::Sub::Platform`]
-//! 与 [`record::Kind::FrameDescription`] / [`record::Kind::PlatformCall`] 占位,
-//! 本版本拒绝其记录(等 M3)。
+//! ③帧描述([`record::Sub::Frame`] / [`record::Kind::FrameDescription`])已实现:
+//! 调用方(gfx/后端/官方采集器)传入规范化 display JSON 或摘要,本 crate 只做
+//! 协议层校验/内容寻址,不硬绑 `yu-gfx` 字段。④平台命令仍保留
+//! [`record::Sub::Platform`] / [`record::Kind::PlatformCall`] 占位并显式拒绝。
 //!
 //! # 确定性
 //!
@@ -39,20 +40,25 @@ pub mod record;
 pub mod replay;
 pub mod source;
 
-pub use diff::{diff_logs, diff_text, DiffFailure, DiffReport};
+pub use diff::{
+    diff_aligned, diff_aligned_logs, diff_logs, diff_text, AlignedDiffOptions, AlignedDiffReport,
+    DiffFailure, DiffReport, HeaderCompare, Projection, RecordKey,
+};
 pub use error::code;
 pub use error::sample_missing;
 pub use event::{
-    domain_name, header_from_vm, input_summary, input_summary_range, jump_kind, map_event,
-    shared_log, trace_value, EventRecorder, SharedLog,
+    domain_name, header_from_vm, header_from_vm_with_clock, input_summary, input_summary_range,
+    jump_kind, map_event, shared_log, trace_value, EventRecorder, SharedLog,
 };
 pub use hash::sha256_hex;
 pub use record::{
-    argv_summary, paths_summary, BootSummary, HeaderPayload, HostSummary, InputSummary, Kind,
-    ListEntry, Payload, Record, Sub, TraceArg, TraceLog, TraceValue, SCHEMA_VERSION,
+    argv_summary, paths_summary, BootSummary, ClockMode, ClockSummary, FrameDescriptionInput,
+    FrameDisplay, FrameLevel, FrameSummary, HeaderPayload, HostSummary, InputSummary, Kind,
+    ListEntry, Payload, ProducerInfo, ProducerKind, Record, Sub, TraceArg, TraceLog, TraceValue,
+    SCHEMA_VERSION,
 };
 pub use replay::{
-    codec_from_name, record_events, verify_input, verify_input_range, VmTrace,
+    codec_from_name, record_events, verify_clock, verify_input, verify_input_range, VmTrace,
 };
 pub use source::{BoxedSource, FrameHandle, TracingSource};
 

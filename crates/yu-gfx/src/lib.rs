@@ -43,6 +43,7 @@
 pub mod error;
 pub mod frame;
 pub mod group;
+pub mod host;
 pub mod json;
 pub mod layer;
 pub mod op;
@@ -56,9 +57,10 @@ pub mod transition;
 pub use error::FrameDiag;
 pub use frame::{
     probe_order_from_codes, Clear, ColorSpace, CompositorFrame, FilterMode, FilterSource,
-    MipFilter, TextureFilter, Viewport,
+    MipFilter, TextureFilter, Viewport, WindowState,
 };
 pub use group::GroupDraw;
+pub use host::GfxHost;
 pub use layer::{
     fixed_pipeline_alpha, shader_alpha, BlendConfidence, BlendFactor, BlendMode, BlendOp, CopyId,
     EngineValue, FilterParam, FilterTransform, FixedPipelineState, ImageFormat, Layer, LayerId,

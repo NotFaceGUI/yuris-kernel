@@ -18,7 +18,8 @@ use yu_rt::event::{Domain, JumpKind, VmEvent};
 
 use crate::hash::sha256_hex;
 use crate::record::{
-    BootSummary, HeaderPayload, InputSummary, Payload, TraceArg, TraceLog, TraceValue,
+    BootSummary, ClockSummary, FrameDescriptionInput, HeaderPayload, InputSummary, Payload,
+    ProducerInfo, TraceArg, TraceLog, TraceValue,
 };
 
 /// 共享日志句柄(单线程;`Vm` 本身也不跨线程)。
@@ -39,11 +40,24 @@ pub fn header_from_vm(
     codec: yu_vfs::Codec,
     input: InputSummary,
 ) -> HeaderPayload {
+    header_from_vm_with_clock(vm, cfg, codec, input, ClockSummary::none())
+}
+
+/// 同 [`header_from_vm`],并写入录制时钟序列(回放闭包)。
+pub fn header_from_vm_with_clock(
+    vm: &yu_rt::Vm,
+    cfg: &yu_rt::BootConfig,
+    codec: yu_vfs::Codec,
+    input: InputSummary,
+    clock: ClockSummary,
+) -> HeaderPayload {
     HeaderPayload {
         codec: codec.as_str().to_string(),
+        producer: ProducerInfo::kernel(),
         tables: vm.table_provenance(),
         boot: BootSummary::from_config(cfg),
         input,
+        clock,
         kernel: format!("yu-trace {}", env!("CARGO_PKG_VERSION")),
     }
 }
@@ -113,6 +127,11 @@ impl EventRecorder {
     pub fn record(&self, event: &VmEvent) -> u64 {
         let (frame, payload) = map_event(event);
         self.log.borrow_mut().push(frame, payload)
+    }
+
+    /// 记录一条帧描述;校验失败原样返回 `trace.*`(不写半条记录)。
+    pub fn record_frame(&self, input: FrameDescriptionInput) -> Result<u64, yu_log::Diag> {
+        self.log.borrow_mut().push_frame_input(input)
     }
 
     /// 按给定顺序记录一批事件;返回新增条数。
@@ -408,12 +427,14 @@ mod tests {
     fn every_vm_event_variant_records_a_distinct_kind() {
         let recorder = EventRecorder::with_header(HeaderPayload {
             codec: "cp932".to_string(),
+            producer: ProducerInfo::kernel(),
             tables: vec![],
             boot: BootSummary::from_config(&yu_rt::BootConfig::default()),
             input: InputSummary {
                 events: 0,
                 sha256: "0".repeat(64),
             },
+            clock: ClockSummary::none(),
             kernel: "test".to_string(),
         });
         let events = sample_events();

@@ -9,7 +9,7 @@
 //! 证据与后端执行细节见 `docs/render-parity.md`。
 
 use crate::error::FrameDiag;
-use crate::layer::{ImageFormat, Layer};
+use crate::layer::{ImageFormat, Layer, LayerId, SizeU32};
 use crate::pass::Pass;
 use crate::text::TextRun;
 
@@ -37,6 +37,9 @@ pub struct Clear {
 impl Clear {
     /// 引擎未逐帧显式清屏;D3D9 设备初始化后可见背景为不透明黑。
     /// 这是 Let-likely 决策,写入 `docs/render-parity.md` 的 divergence。
+    ///
+    /// TODO(DIV-GFX-010):引擎帧入口无 `Clear` 证据;官方截图/设备状态
+    /// 未采集前保持 Likely。
     pub const fn default_black() -> Self {
         Self {
             rgba: [0, 0, 0, 255],
@@ -65,6 +68,8 @@ pub enum ClearSource {
 /// 引擎是 D3D9 固定管线/HLSL,渲染路径未设置 `D3DRS_SRGBWRITEENABLE`
 /// (反编译全树无 state 194 调用),因此混合发生在**存储值空间**(sRGB 编码值
 /// 直接参与算术),不是线性空间。见 `docs/render-parity.md` §10。
+///
+/// TODO(DIV-GFX-009):未用官方截图逐像素验证;保持 Likely。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorSpace {
     /// 8-bit sRGB 编码存储,gamma 空间混合(D3D9 默认)。
@@ -191,6 +196,44 @@ impl TextureFilter {
     }
 }
 
+/// 一个窗口的状态(手册 `window/window.html`;`NO=0` = 主窗口)。
+///
+/// gfx 只对**主窗口**执行 Screen 合成;`1..3` 的状态原样输出给
+/// window/host 会话(DIV-GFX-018)。`X/Y/SX/SY` 是窗口几何,不是图层偏移。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowState {
+    /// `NO`(0..3)。
+    pub number: u8,
+    /// `CGID` 指定的显示图层组;`None` = 未指定(主窗口回退到
+    /// `GfxConfig::main_layer_set`)。
+    pub layer_set: Option<LayerId>,
+    /// `E`/`A`(β4 的 `A` 只表示显示/非显示)。
+    pub visible: bool,
+    /// `A` 原值 0..256。
+    pub alpha: i16,
+    pub x: i64,
+    pub y: i64,
+    /// `SX/SY`。
+    pub size: Option<SizeU32>,
+    /// `Z` 窗口叠放(0 前面 / 1 常前 / 2 最背 / 3 主窗口后);gfx 只记录。
+    pub z: i64,
+}
+
+impl WindowState {
+    pub fn new(number: u8, layer_set: Option<LayerId>) -> Self {
+        Self {
+            number,
+            layer_set,
+            visible: true,
+            alpha: 256,
+            x: 0,
+            y: 0,
+            size: None,
+            z: 0,
+        }
+    }
+}
+
 /// 一帧的合成契约。
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompositorFrame {
@@ -202,6 +245,8 @@ pub struct CompositorFrame {
     pub filter: TextureFilter,
     /// 图像扩展名探测顺序(来自 `yscfg` 的 8 字节;`Other` 保留原码)。
     pub image_probe_order: Vec<ImageFormat>,
+    /// 窗口状态(按 `NO` 升序;`NO=0` 主窗口)。
+    pub windows: Vec<WindowState>,
     /// 完整图层状态(含不可见层),按 `(z, seq, id)` 稳定排序。
     pub layers: Vec<Layer>,
     /// 绘制列表(只含可见/需要执行的 op)。
@@ -221,6 +266,7 @@ impl CompositorFrame {
             color_space: ColorSpace::GammaEncodedSrgb8,
             filter: TextureFilter::unknown(),
             image_probe_order: default_probe_order(),
+            windows: Vec::new(),
             layers: Vec::new(),
             passes: Vec::new(),
             text: Vec::new(),

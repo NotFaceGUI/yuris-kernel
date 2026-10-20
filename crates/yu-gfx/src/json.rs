@@ -46,19 +46,25 @@ fn esc_bytes(out: &mut String, b: &[u8]) {
     out.push('"');
 }
 
+/// 稳定、合法 JSON 的浮点格式。
+///
+/// - `NaN/±Inf` 不是合法 JSON → 输出 `null`(值不可表示,不做数字谎报);
+/// - 整数值 `128.0` 输出 `128.0`(不是 `1.3e2`);
+/// - `-0.0` 保留符号;
+/// - 其余用 Rust 的最短往返格式。
 fn fmt_f64(v: f64) -> String {
-    if v.is_nan() {
-        "NaN".to_string()
-    } else if v.is_infinite() {
-        if v > 0.0 {
-            "Infinity".to_string()
+    if !v.is_finite() {
+        return "null".to_string();
+    }
+    if v == 0.0 {
+        return if v.is_sign_negative() {
+            "-0.0".to_string()
         } else {
-            "-Infinity".to_string()
-        }
-    } else if v == 0.0 {
-        "0.0".to_string()
-    } else if v == v.trunc() && v.abs() < 1e16 {
-        format!("{v:.1e}")
+            "0.0".to_string()
+        };
+    }
+    if v.fract() == 0.0 && v.abs() < 1e16 {
+        format!("{v:.1}")
     } else {
         format!("{v:?}")
     }
@@ -137,6 +143,7 @@ fn image_format(out: &mut String, f: ImageFormat) {
             ImageFormat::Bmp => 2,
             ImageFormat::Jpg => 3,
             ImageFormat::Gif => 4,
+            ImageFormat::Psb => 5,
             ImageFormat::Other(c) => c,
         }
         .to_string(),
@@ -215,6 +222,11 @@ fn transition(out: &mut String, t: &Transition) {
         Some(id) => wid(out, id),
         None => out.push_str("null"),
     }
+    out.push_str(",\"tid_raw\":");
+    match &t.tid_raw {
+        Some(b) => esc_bytes(out, b),
+        None => out.push_str("null"),
+    }
     out.push_str(",\"fade\":");
     match t.fade_value() {
         Some(v) => out.push_str(&fmt_f64(v)),
@@ -261,7 +273,14 @@ pub fn layer(out: &mut String, l: &Layer) {
     out.push_str(if l.visible { "true" } else { "false" });
     out.push_str(",\"kind\":");
     match &l.kind {
-        LayerKind::Image => out.push_str("{\"kind\":\"image\"}"),
+        LayerKind::Image { size: image_size } => {
+            out.push_str("{\"kind\":\"image\",\"size\":");
+            match image_size {
+                Some(s) => size(out, *s),
+                None => out.push_str("null"),
+            }
+            out.push('}');
+        }
         LayerKind::Group { size: group_size } => {
             out.push_str("{\"kind\":\"group\",\"size\":");
             match group_size {
@@ -459,6 +478,10 @@ pub fn op(out: &mut String, o: &Op) {
                 Some(v) => esc_bytes(out, v),
                 None => out.push_str("null"),
             }
+            out.push_str(",\"sx\":");
+            opt_i64(out, i.sx);
+            out.push_str(",\"sy\":");
+            opt_i64(out, i.sy);
             out.push_str(",\"x\":");
             opt_i64(out, i.x);
             out.push_str(",\"y\":");
@@ -516,6 +539,16 @@ fn text(out: &mut String, t: &crate::text::TextRun) {
     out.push_str(",\"style\":{\"name\":");
     match &t.style.name {
         Some(n) => esc_bytes(out, n),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"font_no\":");
+    match t.style.font_no {
+        Some(v) => out.push_str(&v.to_string()),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"font_bno\":");
+    match t.style.font_bno {
+        Some(v) => out.push_str(&v.to_string()),
         None => out.push_str("null"),
     }
     out.push_str(",\"color\":");
@@ -592,9 +625,37 @@ fn diagnostics(out: &mut String, ds: &[crate::error::FrameDiag]) {
         esc_str(out, &d.command);
         out.push_str(",\"detail\":");
         esc_str(out, &d.detail);
+        out.push_str(",\"count\":");
+        out.push_str(&d.count.to_string());
         out.push('}');
     }
     out.push(']');
+}
+
+fn window_state(out: &mut String, w: &crate::frame::WindowState) {
+    out.push_str("{\"number\":");
+    out.push_str(&w.number.to_string());
+    out.push_str(",\"layer_set\":");
+    match &w.layer_set {
+        Some(id) => wid(out, id),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"visible\":");
+    out.push_str(if w.visible { "true" } else { "false" });
+    out.push_str(",\"alpha\":");
+    out.push_str(&w.alpha.to_string());
+    out.push_str(",\"x\":");
+    out.push_str(&w.x.to_string());
+    out.push_str(",\"y\":");
+    out.push_str(&w.y.to_string());
+    out.push_str(",\"size\":");
+    match w.size {
+        Some(s) => size(out, s),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"z\":");
+    out.push_str(&w.z.to_string());
+    out.push('}');
 }
 
 fn header(out: &mut String, f: &CompositorFrame) {
@@ -614,6 +675,13 @@ fn header(out: &mut String, f: &CompositorFrame) {
             out.push(',');
         }
         image_format(out, *fmt);
+    }
+    out.push_str("],\"windows\":[");
+    for (i, w) in f.windows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        window_state(out, w);
     }
     out.push(']');
 }
@@ -837,7 +905,7 @@ mod tests {
             alpha: 256,
             blend: BlendMode::Normal,
             visible: true,
-            kind: LayerKind::Image,
+            kind: LayerKind::Image { size: None },
             texture: TextureRef::Asset(b"cg/bg".to_vec()),
             parts: Vec::new(),
             transform: Transform::default(),
@@ -845,6 +913,8 @@ mod tests {
             transition: None,
             clip: None,
             status: LayerStatus::Executable,
+            texture_status: LayerStatus::Executable,
+            param_status: LayerStatus::Executable,
             extra: Default::default(),
         });
         f
@@ -865,5 +935,18 @@ mod tests {
         let s = blend_table_json();
         assert_eq!(s, blend_table_json());
         assert!(s.matches("\"code\":").count() >= 19);
+    }
+
+    #[test]
+    fn float_format_is_valid_json_and_keeps_integer_values() {
+        assert_eq!(fmt_f64(128.0), "128.0");
+        assert_eq!(fmt_f64(0.0), "0.0");
+        assert_eq!(fmt_f64(-0.0), "-0.0");
+        assert_eq!(fmt_f64(1.5), "1.5");
+        // NaN/Inf 不是合法 JSON 数字 ⇒ 显式 null,不写 "NaN"/"Infinity"。
+        assert_eq!(fmt_f64(f64::NAN), "null");
+        assert_eq!(fmt_f64(f64::INFINITY), "null");
+        assert_eq!(fmt_f64(f64::NEG_INFINITY), "null");
+        assert_eq!(fmt_f64(1e20), "1e20");
     }
 }

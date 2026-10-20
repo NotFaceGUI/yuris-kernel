@@ -107,6 +107,10 @@ pub enum HandlerKind {
     Taskend,
     Taskinfo,
     Systeminfo,
+    /// 图形/字体/窗口只读查询(`LET` 同步写回,需 `GraphicsHost`)。
+    Cginfo,
+    Fontinfo,
+    Windowinfo,
     Text,
     TextOut,
     Word,
@@ -149,6 +153,9 @@ pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> 
             "TASKEND" => HandlerKind::Taskend,
             "TASKINFO" => HandlerKind::Taskinfo,
             "SYSTEMINFO" => HandlerKind::Systeminfo,
+            "CGINFO" => HandlerKind::Cginfo,
+            "FONTINFO" => HandlerKind::Fontinfo,
+            "WINDOWINFO" => HandlerKind::Windowinfo,
             "TEXT" => HandlerKind::Text,
             "_" => HandlerKind::TextOut,
             "WORD" => HandlerKind::Word,
@@ -237,6 +244,9 @@ impl Vm {
             HandlerKind::Taskend => self.op_taskend(st, task, cmd),
             HandlerKind::Taskinfo => self.op_taskinfo(st, task, cmd),
             HandlerKind::Systeminfo => self.op_systeminfo(st, cmd),
+            HandlerKind::Cginfo => self.op_info(st, cmd, "CGINFO"),
+            HandlerKind::Fontinfo => self.op_info(st, cmd, "FONTINFO"),
+            HandlerKind::Windowinfo => self.op_info(st, cmd, "WINDOWINFO"),
             HandlerKind::Text => self.op_text(st, cmd),
             HandlerKind::TextOut => self.op_text_out(st, cmd),
             HandlerKind::Word => self.op_word(st, cmd),
@@ -253,10 +263,15 @@ impl Vm {
                     name: cmd.name.clone(),
                     args,
                 });
-                self.report_unimplemented(
-                    &cmd.name,
-                    "域命令未接线:语义属宿主域状态机(见任务书 A 的域边界)".to_string(),
-                );
+                // Graphics/Window 已由同步宿主消费时不再挂号;其他域仍归宿主。
+                let handled = self.graphics_host.is_some()
+                    && matches!(domain, Domain::Graphics | Domain::Window);
+                if !handled {
+                    self.report_unimplemented(
+                        &cmd.name,
+                        "域命令未接线:语义属宿主域状态机(见任务书 A 的域边界)".to_string(),
+                    );
+                }
                 Ok(StepOutcome::Continue)
             }
             HandlerKind::Unknown => {
@@ -1970,17 +1985,140 @@ impl Vm {
         Ok(StepOutcome::Continue)
     }
 
-    // ---------------------------------------------------------- 文本 / 其它
-
-    /// `TEXT`:手册 `text/text.html`(属性设置;可见文本由 `_` 输出)。
-    fn op_text(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        // 参数全部是配置项;手册页逐项给出语义。运行核只记录事件,
-        // 不实现显示(显示层归宿主域)。
+    /// `CGINFO/FONTINFO/WINDOWINFO`:只读查询,结果写入 `LET`。
+    ///
+    /// 三层来源:①手册 `cg/cginfo.html`、`font/fontinfo.html`、
+    /// `window/windowinfo.html`;②ERIS 125+ 处真实使用;③查询值由
+    /// [`crate::event::GraphicsHost`] 在**脚本执行期**同步提供(宿主已按
+    /// 同一帧的 DomainCall 更新状态)。未安装宿主/字段未取证 ⇒ 只诊断、
+    /// 不写 `LET`(不猜 0)。
+    fn op_info(
+        &mut self,
+        st: &mut ExecState,
+        cmd: &Cmd,
+        name: &str,
+    ) -> Result<StepOutcome, VmError> {
+        // 参数名来自工程 ysc 表(opcode → 命令声明),不写死槽号。
+        let params: Vec<String> = self
+            .tables()
+            .boot
+            .yscm
+            .command(cmd.opcode)
+            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+        let mut targets: Vec<crate::expr::LValue> = Vec::new();
+        let mut args: Vec<ArgValue> = Vec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
             }
-            let _ = self.eval_value(st, &w.payload);
+            let pname = params
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or("");
+            if pname == "LET" {
+                targets.push(self.eval_lvalue(st, &w.payload)?);
+                continue;
+            }
+            if let Ok(v) = self.eval_value(st, &w.payload) {
+                args.push(ArgValue::new(w.rec.kind, v));
+            }
+        }
+        // 事件流仍记录命令事实(trace/golden 需要);宿主会忽略 INFO 本身,
+        // 真正的读取走下面的 query。
+        let domain = if name == "WINDOWINFO" {
+            Domain::Window
+        } else {
+            Domain::Graphics
+        };
+        self.emit(VmEvent::DomainCall {
+            frame: self.frame(),
+            domain,
+            name: name.to_string(),
+            args: args.clone(),
+        });
+        if targets.is_empty() {
+            self.report(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                format!("{name} 缺 LET 目标"),
+            ));
+            return Ok(StepOutcome::Continue);
+        }
+        let Some(mut host) = self.graphics_host.take() else {
+            self.report_unimplemented(
+                name,
+                "未安装 GraphicsHost:INFO 查询无法在脚本执行期读取图形状态".to_string(),
+            );
+            return Ok(StepOutcome::Continue);
+        };
+        let result = host.query(name, &args);
+        self.graphics_host = Some(host);
+        match result {
+            Ok(v) => {
+                for t in &targets {
+                    self.write_target(st, t, &v)?;
+                }
+            }
+            Err(d) => self.report(d),
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    // ---------------------------------------------------------- 文本 / 其它
+
+    /// `TEXT`:手册 `text/text.html`(属性设置;可见文本由 `_`/`WORD` 输出)。
+    ///
+    /// 本实现只消费影响**文本事件身份/缓冲**的两项(手册有页):
+    /// - `ID` = 后续文本自动输出的目标文本层 ID;
+    /// - `CLEAR=1` = 完全清空系统内部文本缓冲。
+    ///
+    /// `WAIT/RETURN/PAGE/CLICK/AUTO*/…BUTTON` 属显示节奏/宿主输入,运行核
+    /// 不在这里伪造;事件仍记录命令事实。
+    ///
+    /// TODO(DIV-GFX-026/RT):显示节奏与点击/跳过按钮的宿主 ABI 未实现。
+    fn op_text(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        // 参数名来自工程 ysc 表(opcode → 命令声明),不写死槽号。
+        let names: Vec<String> = self
+            .tables()
+            .boot
+            .yscm
+            .command(cmd.opcode)
+            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+        let mut clear = false;
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let name = names
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or("");
+            let v = self.eval_value(st, &w.payload)?;
+            match name {
+                "ID" => {
+                    if let Value::Str(b) = v {
+                        match std::str::from_utf8(&b) {
+                            Ok(s) => self.text_layer_id = s.to_string(),
+                            Err(_) => {
+                                // 事件字段是 String;CP932 非 UTF-8 ID 不做有损替换。
+                                self.text_layer_id.clear();
+                                self.report_unimplemented(
+                                    "TEXT",
+                                    "TEXT[ID] 为非 UTF-8 CP932 ID:事件字符串无法承载,保持空"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+                "CLEAR" => clear = v.as_int().unwrap_or(0) != 0,
+                _ => {}
+            }
+        }
+        if clear {
+            self.text_buffer.clear();
         }
         self.emit(VmEvent::SystemCall {
             frame: self.frame(),
@@ -2008,7 +2146,11 @@ impl Vm {
                 _ => Vec::new(),
             };
             self.append_text(&bytes);
-            self.emit(VmEvent::Text { frame: self.frame(), id: String::new(), bytes });
+            self.emit(VmEvent::Text {
+                frame: self.frame(),
+                id: self.text_layer_id.clone(),
+                bytes,
+            });
         }
         Ok(StepOutcome::Continue)
     }
@@ -2034,7 +2176,7 @@ impl Vm {
         self.append_text(&w.payload);
         self.emit(VmEvent::Text {
             frame: self.frame(),
-            id: String::new(),
+            id: self.text_layer_id.clone(),
             bytes: w.payload.clone(),
         });
         Ok(StepOutcome::Continue)

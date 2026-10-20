@@ -59,11 +59,21 @@ impl ParamTable {
             .collect()
     }
 
-    /// 命令表自身健全性检查:命令名必须非空。
+    /// 命令表自身健全性检查:必需图形命令必须存在,命令名必须非空。
     ///
+    /// `CG/CGACT/CGEND` 是 `GfxState` 的状态生产入口;缺任一条就说明拿错了
+    /// 工程表(或表不完整),必须 fail-fast,而不是运行期逐条静默跳过。
     /// 参数名可以为空:0.495 ERIS 的 `PLUG` 等命令存在空参数槽(引擎表原样),
     /// 这类槽在解析时按“名字缺失”处理,不拒绝整张表。
     pub fn validate(&self) -> Result<(), yu_log::Diag> {
+        for required in ["CG", "CGACT", "CGEND"] {
+            if !self.known(required) {
+                return Err(error::fatal(
+                    error::code::TABLE_MISSING,
+                    format!("ysc.ybn 缺少图形域必需命令 `{required}`"),
+                ));
+            }
+        }
         for i in 0..self.inner.len() {
             let Some(cmd) = u8::try_from(i).ok().and_then(|i| self.inner.command(i)) else {
                 continue;

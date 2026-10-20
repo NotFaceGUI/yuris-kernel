@@ -50,7 +50,28 @@ fn string_cmd(name: &str, params: &[&str]) -> FmtCommand {
 
 /// 与 ERIS 0.495 同序的图形域命令表。
 pub fn table() -> ParamTable {
-    let commands = vec![
+    build_table(command_list())
+}
+
+/// 缺一条命令的变体(用于 fail-fast 回归)。
+pub fn table_without(name: &str) -> ParamTable {
+    let mut commands = command_list();
+    commands.retain(|c| c.name.as_ref() != name);
+    build_table(commands)
+}
+
+fn build_table(commands: Vec<FmtCommand>) -> ParamTable {
+    let fmt = CommandTable {
+        version: 495,
+        commands,
+        messages: Vec::new(),
+        key_table: Box::new([0u8; 256]),
+    };
+    ParamTable::new(YscmTable::from_format(fmt).expect("synthetic yscm"))
+}
+
+fn command_list() -> Vec<FmtCommand> {
+    vec![
         string_cmd(
             "CG",
             &[
@@ -137,6 +158,49 @@ pub fn table() -> ParamTable {
         ),
         string_cmd("CGEND", &["ID", "IDNO"]),
         string_cmd(
+            "WINDOW",
+            &[
+                "NO",
+                "CAPTION",
+                "A",
+                "E",
+                "X",
+                "Y",
+                "Z",
+                "SX",
+                "SY",
+                "ACTIVE",
+                "FULLSCREEN",
+                "FULLSCREENBUTTON",
+                "MINIMIZE",
+                "CLOSEMODE",
+                "CGID",
+                "MENUID",
+                "REGIONID",
+                "DRAGID",
+            ],
+        ),
+        string_cmd(
+            "WINDOWINFO",
+            &[
+                "NO",
+                "LET",
+                "EXIST",
+                "E",
+                "ACTIVE",
+                "CAPTION",
+                "X",
+                "Y",
+                "SX",
+                "SY",
+                "FULLSCREEN",
+                "FULLSCREENBUTTON",
+                "MINIMIZE",
+                "CLOSEMODE",
+            ],
+        ),
+        string_cmd("WINDOWEND", &["NO"]),
+        string_cmd(
             "FONT",
             &[
                 "BNO",
@@ -186,14 +250,7 @@ pub fn table() -> ParamTable {
             ],
         ),
         cmd("TEXT", &["ID", "OUTPUTMODE"]),
-    ];
-    let fmt = CommandTable {
-        version: 495,
-        commands,
-        messages: Vec::new(),
-        key_table: Box::new([0u8; 256]),
-    };
-    ParamTable::new(YscmTable::from_format(fmt).expect("synthetic yscm"))
+    ]
 }
 
 pub fn state() -> GfxState {
@@ -230,6 +287,15 @@ pub fn call(frame: u64, name: &str, args: Vec<ArgValue>) -> VmEvent {
     VmEvent::DomainCall {
         frame,
         domain: Domain::Graphics,
+        name: name.to_string(),
+        args,
+    }
+}
+
+pub fn window_call(frame: u64, name: &str, args: Vec<ArgValue>) -> VmEvent {
+    VmEvent::DomainCall {
+        frame,
+        domain: Domain::Window,
         name: name.to_string(),
         args,
     }

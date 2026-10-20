@@ -7,6 +7,9 @@
 //!
 //! 字形栅格化、字体回退、行距/描边/窗口定位全部留给字体/后端会话;
 //! 本模块只给它们一个稳定的输入契约。
+//!
+//! TODO(DIV-GFX-012):字形栅格化/行距/描边/窗口定位未实现;`TextRun`
+//! 的 `origin/atlas` 由后端/字体会话填充。
 
 use crate::layer::LayerId;
 
@@ -15,6 +18,10 @@ use crate::layer::LayerId;
 pub struct TextStyle {
     /// `NAME`(CP932 原始字节;`None` = 未设置)。
     pub name: Option<Vec<u8>>,
+    /// `NO`(字体列表序号;手册 `font/font.html` 例 2)。
+    pub font_no: Option<i64>,
+    /// `BNO`(手册无页;真实脚本 `FONT[BNO=1]` 用作调试字体槽)。
+    pub font_bno: Option<i64>,
     /// `COLOR` 0xRRGGBB。
     pub color: u32,
     /// `COLOR2`(渐变终点;`None` = 无渐变)。
@@ -48,6 +55,8 @@ impl Default for TextStyle {
     fn default() -> Self {
         Self {
             name: None,
+            font_no: None,
+            font_bno: None,
             color: 0x00FF_FFFF,
             color2: None,
             size_x: 0,

@@ -260,3 +260,25 @@ fn shared_log_can_carry_a_header_and_parse_back() {
     assert_eq!(parsed.len(), 2);
     assert_eq!(text, parsed.to_jsonl());
 }
+
+#[test]
+fn aux_source_shares_the_primary_frame_handle() {
+    let recorder = EventRecorder::new(shared_log());
+    let primary = TracingSource::from_recorder(build_source(), recorder.clone());
+    let frame = primary.frame_handle();
+    let aux = TracingSource::from_recorder_with_frame(
+        MemSource::new(Codec::Cp932),
+        recorder.clone(),
+        frame.clone(),
+    );
+
+    frame.set(Some(42));
+    let key = LookupKey::new(b"ysbin/ysc.ybn", Codec::Cp932).unwrap();
+    primary.exists(&key);
+    aux.exists(&key);
+    frame.set(None);
+
+    let log = recorder.snapshot();
+    let frames: Vec<Option<u64>> = log.records().iter().map(|record| record.frame()).collect();
+    assert_eq!(frames, vec![Some(42), Some(42)]);
+}

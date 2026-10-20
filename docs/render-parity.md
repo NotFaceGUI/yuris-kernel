@@ -41,12 +41,14 @@
 | 3 | `MODE=0..18` | `cg/cg.html` 全表(0=通常…18=ピンライト);「4=除算…13=焼き込みリニア」 | ERIS 首屏 `MODE=0`(1015 次)+`MODE=2`(1 次);源 `MODE=@bl` | `FUN_00414ba4` 行 144-154(分派/TFACTOR)、391-462(M0)、463-509(M1)、510-560(M2)、561-633(M3)、634-701(M5)、702-752(M6)、753-820(M7)、824-874(M9)、881-971(HLSL) | 0 Likely;1/2 Confirmed;3/5/6/7/9 Unverified(状态表已取证);4/8/10..18 Unimplemented |
 | 4 | 纹理过滤 MAG/MIN/MIP | 无手册页;引擎设定工具写入 | ERIS `yscfg` 无过滤字段(全局设置) | `FUN_0043cd6c` 行 46-117:stage 0/1 各下发 `D3DSAMP_MAG/MIN/MIPFILTER`;值来自 `DAT_005b4804/4808/80131c`;0=POINT/1=LINEAR/2=ANISOTROPIC,MIP=-1=NONE | Confirmed 全局,非逐层;旧线“固定 Linear”❌ |
 | 5 | 变换 X/Y/FX… | `cg/cg.html` 只文档化 X/Y;`basic/layer.html` 无 FX 说明 | ERIS `es_Sprite.yst` `FX=@fx*100 ... FRZ=@frz FCX=@fcx`;`FBX=10000`/`FCX=5000` | `FUN_00414ba4` 行 117-125(+0x1b0/1b8/1c0/1c8/1d0/1d8 `/100`,+0x1f8/1fc/200 f32 `/100`)、220-275(16.16 `ROUND(v*65536)`)、322-336(旋转矩阵,`π/180` 常量 0x58ebf8);半像素 `-0.5` 常量 0x58ebd0 | X/Y Confirmed;FX 家族槽位→偏移 Unimplemented(DIV-GFX-003) |
-| 6 | 多部件层 / `FILE` 探测 / 1×1 黑 | `cg/cg.html`:「FILE="" で1x1サイズの黒画像生成」「拡張子…「.PNG」「.BMP」「.JPG」「.GIF」の順」 | ERIS 首屏 552 次 `FILE`(`FILE=""` 与 `cgsys/...` 资产);源 `CG[FILE=...]` | `FUN_0040c9b4`(`0x40c9b4`)按 `yscfg+0x1c` 码探测:`1→.png,2→.bmp,3→.jpg,4→.gif`;多部件 `+0xa6/+0xa7` 计数、`+0xb0/+0x130` 两表(`FUN_00414ba4` 155-156/200/219/985) | `FILE`/扩展名 Confirmed;多部件几何 Unimplemented(DIV-GFX-004) |
+| 6 | 多部件层 / `FILE` 探测 / 1×1 黑 | `cg/cg.html`:「FILE="" で1x1サイズの黒画像生成」「拡張子…「.PNG」「.BMP」「.JPG」「.GIF」の順」 | ERIS 首屏 552 次 `FILE`(`FILE=""` 与 `cgsys/...` 资产);源 `CG[FILE=...]` | `FUN_0040c9b4`(`0x40c9b4`)按 `yscfg+0x1c` 码探测:`1→.png,2→.bmp,3→.jpg,4→.gif,5→.psb`;多部件 `+0xa6/+0xa7` 计数、`+0xb0/+0x130` 两表(`FUN_00414ba4` 155-156/200/219/985) | `FILE`/扩展名 Confirmed;多部件几何 Unimplemented(DIV-GFX-004) |
 | 7 | 组/离屏/COPY | `cg/cg.html`:「レイヤセット…レイヤ合成したもの」「COPY キーワード…複製（スクリーンショット機能）」;`basic/layer.html`:`CG[ID=ABC/ ...]`、`CGACT[COPY2=1 ID=:/W0/ ID2=TMP]` | ERIS 首屏 `CG[ID=":/W3/" SX=..]`、`CGACT[COPY2=1 ID=:/W0/ ID2=CGS100]` | `FUN_00413dc8` 行 34-36(递归)、51-102(调试 RT/`+0x61c`);`FUN_00462e40`(离屏创建族);`FUN_0043cd6c` 行 118-169(帧末读回) | 机制 Confirmed;离屏尺寸/清屏 Likely;COPY 时序 Unimplemented(DIV-GFX-007/008) |
-| 8 | 过渡 T/TA/TID | `cg/cg.html`:「T=トランジション進行度」「TA=精度」「TID=トランジションレイヤID」 | ERIS 源 `T/TID/TA` 少量(首屏 0 次);`es_Sprite` 过渡用法 | `FUN_00414ba4` 行 166-188(TA<1 门控)、881-971(`YS_Texture1/2`、`YS_FadeVal` 公式 905-909、`YS_FadeVal2`) | 公式 Confirmed;TID 配对/推进者 Likely(DIV-GFX-006) |
-| 9 | 文本 | `font/font.html`:NAME/NO/COLOR/COLOR2/SX/SY/BOLD/ANTIALIASING/DRAWMODE;`text/*` | ERIS 首屏 `FONT` 3 次;`TEXT[OUTPUTMODE=0]` 在 `es_First.yst` | 文本为引擎内部绘制种类 98/100(旧线 03 §1,REA 复用绘制函数) | 属性模型 Confirmed;字形栅格化/定位 Unimplemented(DIV-GFX-012) |
+| 8 | 过渡 T/TA/TID | `cg/cg.html`:「T=トランジション進行度」「TA=精度」「TID=トランジションレイヤID」 | ERIS 源 `T/TID/TA` 少量(首屏 0 次);`TID=""` 用于结束过渡(`es_Button.yst:4526/4540`、`es_Sprite.yst:4238`) | `FUN_00414ba4` 行 166-188(TA<1 门控)、881-971(`YS_Texture1/2`、`YS_FadeVal` 公式 905-909、`YS_FadeVal2`);`FUN_00413dc8` `0x413e7b`:TID 空串直接跳过配对查询,非空才 `FUN_004141e4`+`FUN_00414559` | 公式 Confirmed;**TID 空串=无配对 Confirmed**;推进者仍未定位(DIV-GFX-006) |
+| 9 | 文本 | `font/font.html`:NAME/NO/COLOR/COLOR2/SX/SY/BOLD/ANTIALIASING/DRAWMODE;`text/text.html`:ID/OUTPUTMODE/CLEAR/…;`font/fontinfo.html` | ERIS 首屏 `FONT` 3 次;`TEXT[OUTPUTMODE=0]`(`es_First.yst:22`)、`TEXT[CLEAR=1]`(`es_Text.yst:154`)、`FONT[NO/BNO]` | 文本为引擎内部绘制种类 98/100(旧线 03 §1,REA 复用绘制函数);`TextStyle` 现保存 NO/BNO,`TEXT[ID]` 进入后续 `VmEvent::Text.id`,`CLEAR` 清 VM 文本缓冲 | 属性模型 Confirmed;字形栅格化/定位 Unimplemented(DIV-GFX-012);非 UTF-8 TEXT ID 见 DIV-GFX-021 |
 | 10 | 颜色空间 | 无手册页 | 官方截图未采集 | 反编译全树无 `D3DRS_SRGBWRITEENABLE`(state 194)调用;D3D9 默认在存储值空间混合 | Likely:8-bit sRGB 编码存储、gamma 空间混合(DIV-GFX-009) |
-| 11 | `CGACT` 图像加工 | `cg/cgact.html`:SIZE/SIZE2/ROTATION/SAIDO/MEIDO/AKARUSA/MONO/REVERSE/MOSAIC/BLUR/DIFFUSION/RASTER*/RECTPAINT* | ERIS 首屏 `RECTPAINT*` + `SET/SET2`;源 `CGACT[SIZE/ROTATION/...]` | 命令处理体 `0x42c4a4`(70 参数;本会话只读旁线事实,未逐项 REA);像素算法未定位 | 参数/命令 Confirmed;像素 Unimplemented(DIV-GFX-013) |
+| 11 | `CGACT` 图像加工 | `cg/cgact.html`:SIZE/SIZE2/ROTATION/TRIM/RESIZE/SAIDO/MEIDO/AKARUSA/MONO/REVERSE/MOSAIC/BLUR/DIFFUSION/RASTER*/RECTPAINT* | ERIS 首屏 `RECTPAINT*` + `SET/SET2`;源 `CGACT[SIZE/ROTATION/RESIZE/...]` | 动作分派 `FUN_0042f809`(`0x42f809`,按 AL=动作码;`0x42d5fb` 等 25 个调用点);RESIZE 几何 `FUN_0043c971`(`w+X+X2-1`,`h+Y+Y2-1`);像素算法未定位 | 参数/命令 Confirmed;`SX/SY` 已进契约;像素 Unimplemented(DIV-GFX-013) |
+| 12 | `WINDOW` 域 | `window/window.html`:NO=0 主窗口/CGID 显示图层组/E 显示隐藏/A(β4 仅显隐)/X/Y/SX/SY;`windowend.html`:不能删主窗口 | `es_First.yst:97/98/140`、`es_ERIS.yst:22`(子窗口 CGID) | `yu-rt` 发 `Domain::Window`;gfx 消费主窗口状态,Screen pass 用 `CGID` 与 `E/A`;子窗口状态输出给 host | Confirmed;主窗口 gfx 消费,叠放归 host(DIV-GFX-018) |
+| 13 | 图像层显式尺寸 | 手册称 `SX/SY` 仅图层组有效,与真实脚本冲突 | `es_ERIS.yst:579/600`(全屏黑幕)、`es_First.yst:170`、`es_Font.yst:220/231` | `FUN_00465730` 层默认 `+0x78/+0x7c=1`;`FUN_0043772c` 按 SX/SY 重采样并写回;`FUN_00408724` 用层矩形 | Confirmed(引擎/脚本优先);`FILE=""` 黑图按尺寸绘制,资源图缩放挂 Unimplemented(DIV-GFX-022) |
 
 ---
 
@@ -73,10 +75,16 @@ X 1023 | Y 1023 | A 36 | SX 13 | SY 13
 - 首屏没有任何 `T/TA/TID/MID/FX/...`;这些在后续帧/商业语料才出现。
 - `LINT` 出现 29,068 次,视觉语义未分类(DIV-GFX-011),原样留档。
 - 首个有可见层的逻辑帧(测试取 frame 0+1 之后):272 个图层、
-  34 个 visible、15 个 pass(1 个可执行复制 + 11 个图像加工 +
-  2 个组离屏 + screen;其中 W0 离屏 30 ops、W1 离屏 1 op、screen 1 op(W0 组))。
+  34 个 visible、15 个 pass / 44 个 op:12 个 `Texture` pass(11 个图像加工 +
+  1 个复制;复制当前**全部** `Unimplemented`)、2 个组离屏(W0 30 ops、
+  W1 1 op)+ screen 1 op(W0 组)。真实 `MODE=2` 图层是 `:/W0/SPLDST2`
+  (A=0、E=0);`E=0` 图层共 238 个。
+  `FILE="" + SX/SY` 的黑幕保存显式尺寸(例 `:/W1/DBG` 260×600、
+  `:/W0/FONTL2` 233×27)。
   另有 68 个按钮快照的复制源是已删除的临时层,无法在渲染期重放,
   对应图层标 `Unimplemented`;完整复制历史在 `GfxState::copies()`。
+  **注意**:`docs/tasks` 审查把这里读成“1 个可执行复制”,与代码不符;
+  已按代码/状态修正(见 §13)。
 
 ---
 
@@ -90,9 +98,11 @@ X 1023 | Y 1023 | A 36 | SX 13 | SY 13
   - 相对 ID → `:/W0/<id>`;绝对 `:/...` → 从根开始;
   - `.` 忽略,`..` 弹一级,根处 `..` 夹紧;
   - 末尾 `/` = 图层组标记;
-  - `IDNO` 按引擎约定拼成 `ID + "." + 十进制`(`CGEND` 处理体 0x43d334,
-    `CGINFO` 0x43d4a4;`CG` 共用同一 `(ID, IDNO)` 定位,见
-    `<side-repo>/docs/status.md` §3.23)。
+  - `IDNO` 按引擎约定拼成 `ID + "." + 十进制`。**旧引用 `0x43d334/0x43d4a4`
+    在本地反编译树不存在**(会话 F 复核),已移除;`IDNO` 拼接方式保持
+    **Uncertain**(无新的一手证据)。路径规范化/查表的实证函数是
+    `FUN_004141e4`(基准+ID → 规范路径)与 `FUN_00414559`(哈希查层表);
+    `FUN_00413dc8` 用它解析 `TID`/`MID`。
 - 路径比较是**字节级、大小写敏感**(CP932 原始字节)。gfx 不做编码转换。
 
 ### 3.2 Z 与同 Z
@@ -109,11 +119,13 @@ X 1023 | Y 1023 | A 36 | SX 13 | SY 13
   绘制;组的 `A/MODE/E/Z` 作用于**合成结果**,不下推到子层(手册 + REA
   `FUN_00413dc8` 行 34-36)。
 - **主窗口与子窗口**(手册 `window/window.html`):`NO=0` 是主窗口,
-  `1..3` 是子窗口;`CGID` 指定该窗口显示的图层组。`CompositorFrame` 的
-  `Screen` pass 只合成主窗口图层组(默认 `:/W0`,可用
-  `GfxConfig::main_layer_set` 改)。其余根组(`:/W1`…`)仍产出
-  `Offscreen` pass,交给后续 window/host 会话组合;gfx 不做窗口叠放/位置
-  (DIV-GFX-018)。
+  `1..3` 是子窗口;`CGID` 指定该窗口显示的图层组。gfx 消费
+  `Domain::Window`:`WINDOW[NO=0 CGID=...]` 更新主窗口图层组,
+  `E`/`A`(β4 仅显隐)更新可见性,`X/Y/SX/SY/Z` 作为窗口几何记录。
+  `CompositorFrame.windows` 输出全部窗口状态(按 `NO` 升序);
+  `Screen` pass 只合成主窗口图层组(默认 `GfxConfig::main_layer_set`,
+  初始 `:/W0`)。子窗口只产出 `Offscreen` pass,叠放/位置归 window/host
+  (DIV-GFX-018)。`WINDOWEND NO=0` 被拒绝(手册:主窗口不可消去)。
 - `E=0`:组不合成到父层,但子层仍渲染进组离屏(引擎遍历先递归子层、
   后检查本层 `+0xa4`);`CGACT[COPY2]` 仍可取该组内容。gfx 保留组离屏 pass,
   只在父层省略 `Op::Group`。
@@ -123,7 +135,12 @@ X 1023 | Y 1023 | A 36 | SX 13 | SY 13
 ### 3.4 创建 / 更新 / 删除
 
 - `CG[ID=... FILE=...]`:不存在则建层;存在则**只换图**,保留 A/Z/X/Y/MODE/
-  T/TA 等属性(手册 `cg/cg.html` 例 1 原文 + `FUN_0042f809` 属性块)。
+  T/TA/SX/SY 等属性(手册 `cg/cg.html` 例 1 原文 + `FUN_0042f809` 属性块)。
+- `CG[ID=... SX=... SY=...]`:
+  - 图层组 → 离屏尺寸(手册原文);
+  - **图像层** → 引擎层矩形 `+0x78/+0x7c`。`FILE=""` 的 1×1 黑图按该尺寸
+    铺满(真实 ERIS 黑幕,`es_ERIS.yst:579`);资源图的缩放/裁剪未取证,
+    图层标 `Unimplemented`(DIV-GFX-022)。只给 SX/SY 之一保持未实现。
 - `CG[ID=...]` 无 FILE:
   - 已存在 → 更新属性;
   - 不存在 → 引擎处理体是“取/建节点”(`<side-repo>` §3.24),建无纹理层,
@@ -240,7 +257,7 @@ alpha_arg2}`;D3D9 原始值。`TF` = `D3DRS_TEXTUREFACTOR`。
   (`GfxState::set_filter` → `filter.source=engine_settings`)。后端在
   `placeholder` 时不得声称过滤语义已对齐。
 - 扩展名探测序来自 `yscfg +0x1c` 8 字节;`FUN_0040c9b4` 映射
-  `1→.png, 2→.bmp, 3→.jpg, 4→.gif`;ERIS = `01 02 03 04 05`。
+  `1→.png, 2→.bmp, 3→.jpg, 4→.gif, 5→.psb`;ERIS = `01 02 03 04 05`。
 
 ---
 
@@ -263,8 +280,12 @@ alpha_arg2}`;D3D9 原始值。`TF` = `D3DRS_TEXTUREFACTOR`。
 
 ## 8. 组 / 离屏 / COPY
 
-- 组 = 离屏 pass + 一个 `Op::Group`。pass 顺序:所有 `Texture` 复制/图像加工 →
-  组离屏(后序:子组先于父组)→ 屏幕。
+- 组 = 离屏 pass + 一个 `Op::Group`。pass 顺序:所有 `Texture` 复制/图像加工
+  (**按各自日志顺序分组,不是脚本命令交错序**;因全部复制/加工当前
+  `Unimplemented`,不可执行)→ 组离屏(后序:子组先于父组)→ 屏幕。
+- 图像层的子层:引擎遍历对任意节点**先递归子层再画本层**
+  (`FUN_00413dc8 0x413e1a`);gfx 把图像层的非组后代按同一后序扁平输出到
+  父目标,不再静默丢层。
 - 组离屏清屏 = 透明黑(`[0,0,0,0]`),组自身 `A/MODE` 作用于合成结果;
   未给 `SX/SY` 的组尺寸未取证(DIV-GFX-008)。
 - `CGACT[COPY/COPY2]`:
@@ -274,9 +295,10 @@ alpha_arg2}`;D3D9 原始值。`TF` = `D3DRS_TEXTUREFACTOR`。
   - 现状:`Op::Copy` + `CopyTiming::LastRenderedFrame` + `Unimplemented`
     (DIV-GFX-007)。目标层纹理 = `TextureRef::Snapshot(CopyId)`,后端在
     语义关闭前跳过。
-  - `CompositorFrame.passes` 只含**可执行**复制(目标仍引用该快照且源图层
-    仍存在);源已被 `CGEND` 删除的快照无法在渲染期重放,完整历史留在
-    `GfxState::copies()` 审计日志里,对应图层标 `Unimplemented`。
+  - `CompositorFrame.passes` 只含**目标仍引用该快照且源图层仍存在**的复制;
+    但复制的 `status` 目前恒为 `Unimplemented`(时序/区域未逐项取证),
+    后端必须跳过。源已被 `CGEND` 删除的快照无法在渲染期重放,完整历史
+    留在 `GfxState::copies()` 审计日志里。
 - `SWAP/SWAP2`:`FUN_0042f57d` 行 61-112 交换纹理与 `+0x68/+0x70`(X/Y);
   模式 2 额外交换 `E/A/T/TA/MODE`。gfx 按此实现,SWAP/SWAP2 与模式 1/2 的
   精确对应为 Likely。
@@ -301,11 +323,29 @@ alpha_arg2}`;D3D9 原始值。`TF` = `D3DRS_TEXTUREFACTOR`。
 
 ## 10. 文本
 
-- 只定义模型:`TextStyle`(NAME/COLOR/COLOR2/SX/SY/BOLD/ANTIALIASING/
-  DRAWMODE,另留 `line_spacing`/`stroke` 占位)+ `TextRun`(ID/CP932 字节/
-  样式/原点/字形图集引用/帧号)。
-- `FONT` 属性来自手册 `font/font.html`;`FONTINFO` 是只读查询,归 VM,
-  gfx 不实现(诊断挂号)。
+- 只定义模型:`TextStyle`(NAME/NO/BNO/COLOR/COLOR2/SX/SY/BOLD/
+  ANTIALIASING/DRAWMODE,另留 `line_spacing`/`stroke` 占位)+ `TextRun`
+  (ID/CP932 字节/样式/原点/字形图集引用/帧号)。
+- `FONT` 属性来自手册 `font/font.html`;`NO` 保存字体列表序号;
+  `BNO` 无手册页(真实脚本只用于调试槽),保存原值并挂
+  `gfx.text.unsupported`。
+- `TEXT[ID]` 由 `yu-rt` 保存并写入后续 `WORD`/`_` 的
+  `VmEvent::Text.id`;`TEXT[CLEAR=1]` 清空 VM 文本缓冲。WAIT/RETURN/
+  PAGE/CLICK/AUTO*/BUTTON 属显示节奏/宿主输入,不伪造。
+- 事件 `id` 是 `String`;非 UTF-8 的 CP932 ID 不做有损替换,清空并显式
+  报告(DIV-GFX-021)。
+- `FONTINFO`/`CGINFO`/`WINDOWINFO` 的 `LET`:已实现
+  `yu_rt::event::GraphicsHost` + `yu_gfx::GfxHost` 同步链路。`Vm` 在产生
+  图形/窗口/文本/帧事件时**同步**送入 `GfxState`,`INFO` 命令在脚本执行期
+  查询并写 `LET`。
+  - `CGINFO`:EXIST/E/A/X/Y/Z/MODE/T/TA/TID;组/显式尺寸/1×1 黑图的 SX/SY。
+  - `FONTINFO`:当前样式的 COLOR/COLOR2/SX/SY/BOLD/ANTIALIASING/DRAWMODE/
+    NAME(无 `NO` 索引)。
+  - `WINDOWINFO`:EXIST/E/X/Y/SX/SY(主窗口默认 yscfg 尺寸)。
+  - **未取证**:资源图纹理尺寸(需资产元数据,DIV-GFX-024)、多字段
+    写回顺序(DIV-GFX-025)、COLOR/ONMOUSE/CAPTION 等需要像素/鼠标/窗口
+    host 的字段(DIV-GFX-026);返回 `Unimplemented`,VM **不写** LET。
+  - 安装宿主后,调用方不得再把同一批事件 drain 后喂给同一 `GfxState`。
 - 字形栅格化、行距、描边、窗口定位、文本层与 CG 图层的坐标关系
   留给字体/后端会话(DIV-GFX-012)。
 
@@ -328,12 +368,16 @@ alpha_arg2}`;D3D9 原始值。`TF` = `D3DRS_TEXTUREFACTOR`。
 
 1. `PassTarget::Texture(id)`:按帧内顺序执行 `Op::Copy` / `Op::Image`。
    未实现的操作必须跳过(看 `status.executable=false`),不得近似。
+   日志顺序 = 状态生产顺序;copy/image 分两组输出(命令交错序未取证)。
 2. `PassTarget::Offscreen(id)`:组的离屏合成。顺序 = 子组先于父组。
-   清屏 = 该 pass 的 `clear`(透明黑)。组内 ops 按 `(z, seq, id)`。
+   清屏 = 该 pass 的 `clear`(透明黑)。组内 ops 按 `(z, seq, id)`;
+   图像层子层按后序(子先父后)扁平输出。
 3. `PassTarget::Screen`:最后执行;`clear` = `CompositorFrame.clear`;
-   ops = **主窗口图层组**(默认 `:/W0`)的合成 op。子窗口/其他根组只以
-   `Offscreen` pass 出现,由 window/host 会话负责窗口叠放与位置
-   (手册 `window/window.html`;DIV-GFX-018)。
+   ops = **主窗口图层组**(`WINDOW[NO=0].CGID`,未指定时
+   `GfxConfig::main_layer_set`,初始 `:/W0`)的合成 op;主窗口
+   `E=0`/`A=0` 时 ops 为空。子窗口/其他根组只以 `Offscreen` pass 出现,
+   由 window/host 会话负责窗口叠放与位置(手册 `window/window.html`;
+   DIV-GFX-018)。
 
 后端可以合并/缓存 pass,但不得改变顺序与可见结果。
 
@@ -370,9 +414,19 @@ alpha_arg2}`;D3D9 原始值。`TF` = `D3DRS_TEXTUREFACTOR`。
   当纹理,按 `layer.alpha/blend` 合成。
 - Transition:`from`/`to` 两个纹理,`fade` 已按公式算好;`to=None` 时跳过。
 - Copy:`status` 为 Unimplemented 时**不要执行**;`Snapshot` 纹理在
-  语义关闭前无效。`frame.passes` 里的复制是可执行的;`GfxState::copies()`
-  是完整审计日志(含源已删除的历史项),**不是**帧执行清单。
+  语义关闭前无效。`frame.passes` 里的复制只是“仍可达”的复制,
+  **不是可执行**;`GfxState::copies()` 是完整审计日志(含源已删除的
+  历史项),也不是帧执行清单。
 - Mask:`Op::Mask.status` 为 Unimplemented;不要用 α 或亮度猜。
+- Image size:`LayerKind::Image{size}` 是绘制矩形。`FILE=""` 的
+  `SolidBlack1x1` 必须铺满 `size`;资源图 + `size` 的图层是
+  Unimplemented,后端跳过。
+- Window:`frame.windows` 是窗口状态(含子窗口);Screen 只执行主窗口
+  选择,不要自行改变窗口叠放。
+- Diagnostics:`frame.diagnostics` 是**本帧**诊断,同键合并并带 `count`;
+  不是累计日志。
+- 日志上限:`GfxState` 的复制/图像日志各上限 16,384 条,超限丢弃最旧
+  一半并计数(`dropped_ops()`),同时发 `gfx.log.truncated` 诊断。
 
 ### 12.6 Unimplemented 清单(后端必须跳过)
 
@@ -380,9 +434,16 @@ alpha_arg2}`;D3D9 原始值。`TF` = `D3DRS_TEXTUREFACTOR`。
 - `MID` 掩码。
 - `FX/FR/FC/FEX/...` 滤镜/仿射。
 - 多部件层(非空 `parts`)。
-- `CGACT[COPY/COPY2/TEXCOPY/TEXSSCOPY]` 与 `RECTPAINT*`/`SIZE*`/`ROTATION`/
-  `MONO`/`BLUR*`/... 图像加工。
-- `TID` 缺失的过渡。
+- `CGACT[COPY/COPY2/TEXCOPY/TEXSSCOPY]` 与 `RECTPAINT*`/`SIZE*`/
+  `ROTATION`/`RESIZE`/`TRIM`/`MONO`/`BLUR*`/... 图像加工(参数已进契约,
+  像素算法未实现)。
+- 资源图 + `SX/SY` 的显式尺寸(仅 `FILE=""` 黑图可执行)。
+- TID 非空但配对层缺失的过渡。
+- `CGINFO/FONTINFO/WINDOWINFO` 的未取证字段:资源图 `SX/SY`(DIV-GFX-024)、
+  多字段顺序(DIV-GFX-025)、`COLOR/ONMOUSE*/CAPTION/...`(DIV-GFX-026)。
+  已取证字段由 `GfxHost` 同步回答。
+- `FONT[BNO]` 的字体槽语义(值已保存)。
+- `TEXT` 的 WAIT/RETURN/PAGE/CLICK/AUTO*/BUTTON 显示节奏。
 - 文本字形(需字体/后端会话)。
 
 ---
@@ -398,6 +459,12 @@ alpha_arg2}`;D3D9 原始值。`TF` = `D3DRS_TEXTUREFACTOR`。
 | “A 只有 `/256` 一条路径” | 固定管线 `min(A,255)/255`,着色器 `A/256` | 行 135-154 / 910-913 |
 | “同 Z 按创建序” | 手册称不確定;内核取创建序是**确定性决策**,不是引擎承诺 | `basic/layer.html` |
 | `A=256` 固定管线等于 255 | 正确,但只在固定管线;着色器 A=256=1.0 | 同上 |
+| 审查 B4:“TFACTOR 只在 MODE 0/3/7” | **错**:集合是 `{0,1,2,3,5,6,7,9,100,98}`;3/7 只是分支内覆盖为白 | `FUN_00414ba4` 行 144-154/567/754 |
+| 审查 B7:“`in_stack_00000010==0 → A=0` 未建模” | **错**:图层遍历调用点恒传 1(`0x413f29`),清零分支不属于本路径 | `FUN_00413dc8` 汇编 |
+| 审查 B2:“E 可能写 +0xa4” | **错**:E=`+0x89`,层种类=`+0xa4`(1 图像/2 组/0 死) | `0x413e34/0x413e47`、`0x42c400`、`0x40a38c`、`0x40e02c`、`0x43d4bc` |
+| 审查 B12:旧地址 `0x42c4a4/0x43d334/0x43d4a4` | 本地反编译树不存在;改用 `0x413dc8/0x4141e4/0x414559/0x43d4bc` | 会话 F 台账 B12 |
+| 审查 B11/§2“1 个可执行复制” | **错**:所有 `CopyOp.status` 恒为 `Unimplemented`;passes 只表示“仍可达” | `state.rs` `cgact_copy` |
+| 手册“SX/SY 仅图层组有效” | **与引擎/真实脚本冲突**:图像层同样保存层矩形;`FILE=""+SX/SY` 是黑幕标准写法 | `FUN_00465730/0043772c/00408724`;`es_ERIS.yst:579` |
 
 ---
 

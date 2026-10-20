@@ -124,3 +124,127 @@ fn blend_table_json_is_stable_and_complete() {
     assert_eq!(a.matches("\"fixed\":{").count(), 8);
     assert_eq!(a.matches("\"fixed\":null").count(), 11);
 }
+
+fn arg_frag(a: Option<yu_gfx::StageArg>) -> String {
+    match a {
+        Some(a) => format!(
+            "{{\"code\":{},\"name\":\"{}\"}}",
+            a.d3d_code(),
+            match a {
+                yu_gfx::StageArg::Diffuse => "diffuse",
+                yu_gfx::StageArg::Current => "current",
+                yu_gfx::StageArg::Texture => "texture",
+                yu_gfx::StageArg::TFactor => "tfactor",
+            }
+        ),
+        None => "null".to_string(),
+    }
+}
+
+/// JSON 必须逐字段反映 `fixed_state()`(不是只数 `fixed` 出现次数)。
+#[test]
+fn blend_table_json_matches_fixed_state_field_by_field() {
+    let s = json::blend_table_json();
+    for mode in BlendMode::ALL {
+        // 顶层条目以 `code,name,confidence` 开头;嵌套 arg 同形但名字不同。
+        let start = s
+            .find(&format!(
+                "{{\"code\":{},\"name\":\"{}\",\"confidence\"",
+                mode.code(),
+                mode.name()
+            ))
+            .unwrap_or_else(|| panic!("mode {} missing", mode.code()));
+        let end = s[start + 1..]
+            .find("},{\"code\":")
+            .map(|i| start + 1 + i)
+            .unwrap_or(s.len());
+        let frag = &s[start..end];
+        let Some(st) = mode.fixed_state() else {
+            assert!(frag.contains("\"fixed\":null"), "mode {}", mode.code());
+            continue;
+        };
+        assert!(frag.contains("\"fixed\":{"), "mode {}", mode.code());
+        let markers: Vec<usize> = frag
+            .match_indices("\"color_op\":{\"code\":")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(markers.len(), 2, "mode {} stage count", mode.code());
+        for (i, stage) in st.stages.iter().enumerate() {
+            let begin = markers[i];
+            let end = markers
+                .get(i + 1)
+                .copied()
+                .unwrap_or_else(|| frag.find("],\"texture_factor\"").unwrap());
+            let part = &frag[begin..end];
+            assert!(
+                part.contains(&format!(
+                    "\"color_op\":{{\"code\":{}",
+                    stage.color_op.d3d_code()
+                )),
+                "mode {} stage {i} color_op",
+                mode.code()
+            );
+            assert!(
+                part.contains(&format!("\"color_arg1\":{}", arg_frag(stage.color_arg1))),
+                "mode {} stage {i} color_arg1",
+                mode.code()
+            );
+            assert!(
+                part.contains(&format!("\"color_arg2\":{}", arg_frag(stage.color_arg2))),
+                "mode {} stage {i} color_arg2",
+                mode.code()
+            );
+            assert!(
+                part.contains(&format!(
+                    "\"alpha_op\":{{\"code\":{}",
+                    stage.alpha_op.d3d_code()
+                )),
+                "mode {} stage {i} alpha_op",
+                mode.code()
+            );
+            assert!(
+                part.contains(&format!("\"alpha_arg1\":{}", arg_frag(stage.alpha_arg1))),
+                "mode {} stage {i} alpha_arg1",
+                mode.code()
+            );
+            assert!(
+                part.contains(&format!("\"alpha_arg2\":{}", arg_frag(stage.alpha_arg2))),
+                "mode {} stage {i} alpha_arg2",
+                mode.code()
+            );
+        }
+        let tf = match st.texture_factor {
+            TextureFactorRule::AlphaGray => "alpha_gray",
+            TextureFactorRule::OpaqueWhite => "opaque_white",
+        };
+        assert!(
+            frag.contains(&format!("\"texture_factor\":\"{tf}\"")),
+            "mode {} texture_factor",
+            mode.code()
+        );
+        assert!(
+            frag.contains(&format!(
+                "\"src_blend\":{{\"code\":{}",
+                st.src_blend.d3d_code()
+            )),
+            "mode {} src_blend",
+            mode.code()
+        );
+        assert!(
+            frag.contains(&format!(
+                "\"dst_blend\":{{\"code\":{}",
+                st.dst_blend.d3d_code()
+            )),
+            "mode {} dst_blend",
+            mode.code()
+        );
+        assert!(
+            frag.contains(&format!(
+                "\"blend_op\":{{\"code\":{}",
+                st.blend_op.d3d_code()
+            )),
+            "mode {} blend_op",
+            mode.code()
+        );
+    }
+}

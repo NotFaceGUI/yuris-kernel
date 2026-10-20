@@ -1102,6 +1102,7 @@ fn var_add_macro_chain_appends() {
 
 /// 0.495 `ysc.ybn` 实测序号(dump_ycd):79 RETURNCODE / 106 WORD / 110 `_`。
 const OP_RETURNCODE: u8 = 79;
+const OP_TEXT: u8 = 96;
 const OP_WORD: u8 = 106;
 const OP_TEXT_OUT: u8 = 110;
 
@@ -1166,6 +1167,116 @@ fn word_text_out_and_returncode_form_the_text_stream() {
         })
         .collect();
     assert_eq!(rc, vec![7], "RETURNCODE 窗口 kind = 编译器写入的行计数");
+}
+
+#[derive(Default)]
+struct MockHostState {
+    events: Vec<String>,
+    queries: Vec<(String, Vec<u8>)>,
+}
+
+struct MockHost {
+    state: std::rc::Rc<std::cell::RefCell<MockHostState>>,
+}
+
+impl yu_rt::event::GraphicsHost for MockHost {
+    fn apply_event(&mut self, ev: &yu_rt::VmEvent) {
+        if let yu_rt::VmEvent::DomainCall { name, .. } = ev {
+            self.state.borrow_mut().events.push(name.clone());
+        }
+    }
+
+    fn query(
+        &mut self,
+        command: &str,
+        args: &[yu_rt::event::ArgValue],
+    ) -> Result<yu_rt::Value, yu_rt::Diag> {
+        self.state
+            .borrow_mut()
+            .queries
+            .push((command.to_string(), args.iter().map(|a| a.slot).collect()));
+        Ok(yu_rt::Value::Int(42))
+    }
+}
+
+#[test]
+fn info_query_writes_let_with_synchronously_applied_state() {
+    // CGINFO[ID=L A=1 LET=@v]:宿主必须在 CG 之后、CGINFO 之前看到 DomainCall,
+    // 查询结果 42 写回 @v;未安装宿主时则只报 Unimplemented、不写。
+    let mut b = ProjectBuilder::new();
+    let v = with_int_var(&mut b, 0, 0);
+    // 夹具默认 CGINFO 无参数;本测试需要 ID/A/LET 三个槽。
+    if let Some((_, params)) = b.commands.iter_mut().find(|(n, _)| *n == "CGINFO") {
+        *params = vec![("ID", 1, 0), ("A", 0, 3), ("LET", 0, 3)];
+    }
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    const OP_CG: u8 = 1;
+    const OP_CGINFO: u8 = 4;
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_CG).window(0, ex::s("L")),
+        GroupSpec::new(OP_CGINFO)
+            .window(0, ex::s("L"))
+            .window(1, ex::i8_(1))
+            .window(2, ex::r#ref(0x40, v.id)),
+        GroupSpec::new(OP_END),
+    ]];
+
+    let shared = std::rc::Rc::new(std::cell::RefCell::new(MockHostState::default()));
+    let mut vm = boot(b);
+    vm.set_graphics_host(Box::new(MockHost {
+        state: shared.clone(),
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    assert_eq!(
+        vm.store().read(v, &[]).unwrap(),
+        yu_rt::Value::Int(42),
+        "LET 必须写入查询结果"
+    );
+    let st = shared.borrow();
+    assert_eq!(
+        st.events,
+        vec!["CG".to_string(), "CGINFO".to_string()],
+        "宿主同步看到 CG 与 CGINFO 事件事实"
+    );
+    assert_eq!(st.queries.len(), 1);
+    assert_eq!(st.queries[0].0, "CGINFO");
+    // ID / A 两个参数窗口;LET 不进入查询参数。
+    assert_eq!(st.queries[0].1, vec![0, 1]);
+}
+
+#[test]
+fn text_id_sets_following_run_id_and_clear_empties_buffer() {
+    // 手册 text/text.html:ID = 自动输出模式的目标文本层 ID;
+    // CLEAR=1 = 完全清空系统内部文本缓冲。
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let text = |slot: u8, payload: Vec<u8>| GroupSpec::new(OP_TEXT).window(slot, payload);
+    b.scripts = vec![vec![
+        text(0, ex::s("MSG")),      // TEXT[ID="MSG"]
+        GroupSpec::new(OP_WORD).window(0, b"A".to_vec()),
+        text(16, ex::i32_(1)),      // TEXT[CLEAR=1](0.495 slot 16)
+        GroupSpec::new(OP_WORD).window(0, b"B".to_vec()),
+        GroupSpec::new(OP_END),
+    ]];
+
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let texts: Vec<String> = vm
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            yu_rt::VmEvent::Text { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["MSG".to_string(), "MSG".to_string()]);
+    assert_eq!(vm.current_text(), b"B", "CLEAR 清掉前面的 A");
 }
 
 // ---------------------------------------------------------------- 按钮码 _CODE_* / _INP

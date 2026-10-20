@@ -30,6 +30,7 @@ use yu_rt::value::Value;
 use crate::error;
 use crate::frame::{
     probe_order_from_codes, Clear, ColorSpace, CompositorFrame, TextureFilter, Viewport,
+    WindowState,
 };
 use crate::layer::{
     BlendConfidence, BlendMode, CopyId, EngineValue, FilterParam, ImageFormat, Layer, LayerId,
@@ -77,6 +78,10 @@ impl GfxConfig {
     }
 }
 
+/// 状态生产日志的硬上限。`image_log` 可能因同一层反复加工而增长;
+/// 超限时丢弃最旧项并计数,避免内存无界(行为在诊断里显式可见)。
+const MAX_OP_LOG: usize = 16_384;
+
 struct Node {
     layer: Layer,
     parent: Option<LayerId>,
@@ -95,12 +100,20 @@ pub struct GfxState {
     text: Vec<TextRun>,
     copy_log: Vec<CopyOp>,
     image_log: Vec<ImageOp>,
-    diags: Vec<error::FrameDiag>,
-    seen_diags: BTreeSet<(String, String, String)>,
+    /// 被上限丢弃的最旧操作数(审计用)。
+    copy_log_dropped: u64,
+    image_log_dropped: u64,
+    /// 本帧诊断(按 `(code, command, detail)` 有序去重;`FrameStart` 清空)。
+    diags: BTreeMap<(String, String, String), error::FrameDiag>,
+    /// 窗口状态(按 `NO`;0 = 主窗口)。
+    windows: BTreeMap<u8, WindowState>,
 }
 
 impl GfxState {
     /// 从工程表构造(命令表 = 参数名唯一来源)。
+    ///
+    /// 视口优先取工程 `yscfg` 的宽高(手册/引擎设定工具写入);`0` 表示
+    /// 引擎未设置,此时保留调用方 `GfxConfig` 的值。
     pub fn from_tables(tables: &TableSet, mut config: GfxConfig) -> Result<Self, Diag> {
         let params = ParamTable::from_tables(tables);
         params.validate()?;
@@ -108,10 +121,16 @@ impl GfxState {
         if !order.is_empty() {
             config.image_probe_order = order;
         }
+        let cfg = &tables.boot.config;
+        if cfg.width != 0 && cfg.height != 0 {
+            config.viewport = Viewport::new(cfg.width, cfg.height);
+        }
         Ok(Self::new(params, config))
     }
 
     pub fn new(params: ParamTable, config: GfxConfig) -> Self {
+        let mut windows = BTreeMap::new();
+        windows.insert(0, WindowState::new(0, Some(config.main_layer_set.clone())));
         let mut s = Self {
             params,
             config,
@@ -123,8 +142,10 @@ impl GfxState {
             text: Vec::new(),
             copy_log: Vec::new(),
             image_log: Vec::new(),
-            diags: Vec::new(),
-            seen_diags: BTreeSet::new(),
+            copy_log_dropped: 0,
+            image_log_dropped: 0,
+            diags: BTreeMap::new(),
+            windows,
         };
         s.ensure_w0();
         s
@@ -151,8 +172,14 @@ impl GfxState {
         self.nodes.get(id).map(|n| &n.layer)
     }
 
-    pub fn diagnostics(&self) -> &[error::FrameDiag] {
-        &self.diags
+    /// 本帧诊断(按 `(code, command, detail)` 升序;重复项合并为 `count`)。
+    pub fn diagnostics(&self) -> Vec<error::FrameDiag> {
+        self.diags.values().cloned().collect()
+    }
+
+    /// 被硬上限丢弃的最旧复制/图像操作数(审计;正常游戏为 0)。
+    pub fn dropped_ops(&self) -> (u64, u64) {
+        (self.copy_log_dropped, self.image_log_dropped)
     }
 
     /// 纹理复制日志(状态生产;`frame()` 只输出仍被现存图层引用的项)。
@@ -176,7 +203,11 @@ impl GfxState {
         match ev {
             VmEvent::FrameStart { frame } => {
                 self.frame = *frame;
+                // TODO(DIV-GFX-034):文本窗口应跨帧持久,`TEXT[CLEAR]` 应清空
+                // gfx 文本;当前每帧清空是“本帧文本流”模型,未做窗口状态机。
                 self.text.clear();
+                // 诊断是“本帧”诊断:每帧清空,防止跨帧无界增长。
+                self.diags.clear();
                 // 复制/图像操作是**状态生产**(快照/纹理修改),不是逐帧易失;
                 // 保留日志,frame() 只输出仍被现存图层引用的项。
             }
@@ -196,12 +227,16 @@ impl GfxState {
             }
             VmEvent::DomainCall {
                 frame,
-                domain: Domain::Graphics,
+                domain,
                 name,
                 args,
             } => {
                 self.frame = *frame;
-                self.dispatch(name, args);
+                match domain {
+                    Domain::Graphics => self.dispatch(name, args),
+                    Domain::Window => self.dispatch_window(name, args),
+                    _ => {}
+                }
             }
             _ => {}
         }
@@ -217,11 +252,13 @@ impl GfxState {
 
         let mut passes = Vec::new();
 
-        // 1. 纹理复制/图像加工(命令顺序)。
+        // 1. 纹理复制/图像加工(各自状态生产顺序;copy/image 分组输出,
+        //    不是脚本命令交错序——交错序未取证)。
         //
-        // 只输出**可执行**的项:目标仍引用该快照,且复制源在帧内仍存在。
-        // 源已被 CGEND 删除的快照无法在渲染期重放,对应图层已在状态里标
-        // `Unimplemented`;完整历史留在 `GfxState::copies()` 供审计。
+        // 只输出仍然可达的项:目标仍引用该快照,且复制源在帧内仍存在。
+        // 复制当前全部 `Unimplemented`(时序/区域未取证),后端必须跳过;
+        // 源已被 CGEND 删除的快照无法在渲染期重放,完整历史留在
+        // `GfxState::copies()` 供审计。
         for c in &self.copy_log {
             let dest_live = self
                 .nodes
@@ -253,29 +290,24 @@ impl GfxState {
             });
         }
 
-        // 2. 组离屏 pass(后序;子组先于父组)。
-        for child in self.sorted_children(None) {
-            if self.nodes.get(&child).is_some_and(|n| n.layer.is_group()) {
-                self.build_group_pass(&child, &mut passes);
-            }
-        }
+        // 2. 组离屏 pass(后序;子组先于父组;显式栈,深树不爆栈)。
+        let mut emitted_groups = BTreeSet::new();
+        self.build_group_passes(&mut passes, &mut emitted_groups);
 
         // 3. 屏幕 pass(最后)。
         //
         // 手册 window/window.html:NO=0 是主窗口,CGID 指定其显示的图层组;
-        // 1..3 是子窗口。gfx 只把**主窗口图层组**(默认 :/W0)合成到屏幕;
-        // 其余根组仍产出离屏 pass,交给后续 window/host 会话组合。
+        // 1..3 是子窗口。gfx 只把**主窗口图层组**合成到屏幕;其余根组仍产出
+        // 离屏 pass,交给后续 window/host 会话组合。
         let mut screen_ops = Vec::new();
-        let main = self.config.main_layer_set.clone();
-        if let Some(op) = self.screen_op(&main) {
-            screen_ops.push(op);
-        } else if !self.nodes.contains_key(&main) {
-            // 合成配置没有主组(测试夹具/特殊宿主):退回所有顶层节点。
-            for child in self.sorted_children(None) {
-                if let Some(op) = self.screen_op(&child) {
-                    screen_ops.push(op);
-                }
-            }
+        if self.windows.get(&0).is_none_or(|w| w.visible) {
+            let main = self
+                .windows
+                .get(&0)
+                .and_then(|w| w.layer_set.clone())
+                .unwrap_or_else(|| self.config.main_layer_set.clone());
+            // 显式主组缺失时不做“合成所有顶层”的猜测(D15)。
+            self.emit_node_ops(&main, &mut screen_ops, &emitted_groups);
         }
         passes.push(Pass {
             target: PassTarget::Screen,
@@ -284,18 +316,296 @@ impl GfxState {
         });
 
         f.passes = passes;
+        f.windows = self.windows.values().cloned().collect();
         f.layers = self
             .nodes
             .values()
             .map(|n| n.layer.clone())
             .collect::<Vec<_>>();
-        f.layers.sort_by_key(|a| (a.z, a.seq, a.id.clone()));
+        // 比较期不分配:直接比较借用字段。
+        f.layers
+            .sort_by(|a, b| (a.z, a.seq, &a.id).cmp(&(b.z, b.seq, &b.id)));
         f.text = self.text.clone();
-        f.diagnostics = self.diags.clone();
-        f.diagnostics.sort_by(|a, b| {
-            (&a.code, &a.command, &a.detail).cmp(&(&b.code, &b.command, &b.detail))
-        });
+        f.diagnostics = self.diags.values().cloned().collect();
         f
+    }
+
+    // ------------------------------------------------------------ INFO 查询
+
+    /// 回答 `CGINFO/FONTINFO/WINDOWINFO` 的只读查询(供 `GraphicsHost` 同步调用)。
+    ///
+    /// 只实现手册明确、且当前状态足以回答的字段;需要像素/鼠标/字体列表/
+    /// 资产元数据的字段返回 `Unimplemented`,由 VM **不写** `LET`(不猜 0)。
+    /// 多字段同时置位时顺序未取证,返回 `gfx.info.multi`。
+    pub fn query_info(&self, command: &str, args: &[ArgValue]) -> Result<Value, Diag> {
+        match command {
+            "CGINFO" => self.query_cginfo(args),
+            "FONTINFO" => self.query_fontinfo(args),
+            "WINDOWINFO" => self.query_windowinfo(args),
+            other => Err(error::unimplemented(
+                error::code::INFO_UNSUPPORTED,
+                format!("未知 INFO 命令 `{other}`"),
+            )),
+        }
+    }
+
+    fn query_cginfo(&self, args: &[ArgValue]) -> Result<Value, Diag> {
+        let resolved = self.params.resolve("CGINFO", args);
+        let mut id: Option<Vec<u8>> = None;
+        let mut idno: Option<i64> = None;
+        let mut flags: BTreeMap<&str, i64> = BTreeMap::new();
+        for r in resolved {
+            match r.name {
+                Some("ID") => match r.value {
+                    Value::Str(b) => id = Some(b.clone()),
+                    _ => return Err(arg_type_diag("CGINFO", "ID", "字符串")),
+                },
+                Some("IDNO") => match int_arg(r.value) {
+                    Some(n) => idno = Some(n),
+                    None => return Err(arg_type_diag("CGINFO", "IDNO", "整数")),
+                },
+                Some("LET") => {}
+                Some(name) => {
+                    let Some(v) = int_arg(r.value) else {
+                        return Err(arg_type_diag("CGINFO", name, "整数"));
+                    };
+                    if v != 0 {
+                        flags.insert(name, v);
+                    }
+                }
+                None => {
+                    return Err(error::unimplemented(
+                        error::code::ARG_MISSING,
+                        format!("CGINFO 槽 {} 不在 ysc 参数表内", r.slot),
+                    ));
+                }
+            }
+        }
+        let Some((flag, _)) = single_flag(&flags, "CGINFO")? else {
+            return Err(error::unimplemented(
+                error::code::INFO_MULTI,
+                "CGINFO 未给出查询字段",
+            ));
+        };
+        let Some(id) = id else {
+            return Err(error::recoverable(error::code::ARG_MISSING, "CGINFO 缺 ID"));
+        };
+        let parsed = path::normalize(&id, idno, id.ends_with(b"/"));
+        if flag == "EXIST" {
+            return Ok(Value::Int(i64::from(self.nodes.contains_key(&parsed.path))));
+        }
+        let Some(node) = self.nodes.get(&parsed.path) else {
+            return Err(error::unimplemented(
+                error::code::INFO_MISSING,
+                format!("CGINFO[{}] 目标 `{}` 不存在", flag, parsed.path.display()),
+            ));
+        };
+        let layer = &node.layer;
+        Ok(match flag {
+            "E" => Value::Int(i64::from(layer.visible)),
+            "A" => Value::Int(i64::from(layer.alpha)),
+            "X" => Value::Int(layer.transform.x),
+            "Y" => Value::Int(layer.transform.y),
+            "Z" => Value::Int(layer.z),
+            "MODE" => Value::Int(i64::from(layer.blend.code())),
+            "T" => Value::Int(i64::from(layer.transition.as_ref().map_or(256, |t| t.t))),
+            "TA" => Value::Int(i64::from(layer.transition.as_ref().map_or(0, |t| t.ta))),
+            "TID" => Value::Str(
+                layer
+                    .transition
+                    .as_ref()
+                    .and_then(|t| t.tid_raw.clone())
+                    .unwrap_or_default(),
+            ),
+            "SX" => Value::Int(self.query_layer_size(layer, true)?),
+            "SY" => Value::Int(self.query_layer_size(layer, false)?),
+            other => {
+                // COLOR/ONMOUSE* 需要像素/鼠标;MFILE/TEX/LINT 等无手册语义。
+                return Err(error::unimplemented(
+                    error::code::INFO_UNSUPPORTED,
+                    format!("CGINFO[{other}] 需要像素/鼠标/未分类语义,未取证"),
+                ));
+            }
+        })
+    }
+
+    fn query_layer_size(&self, layer: &Layer, width: bool) -> Result<i64, Diag> {
+        if let Some(s) = layer.group_size().or_else(|| layer.image_size()) {
+            return Ok(i64::from(if width { s.width } else { s.height }));
+        }
+        match &layer.texture {
+            TextureRef::SolidBlack1x1 => Ok(1),
+            TextureRef::None => Err(error::unimplemented(
+                error::code::INFO_UNSUPPORTED,
+                "无纹理层的尺寸未知",
+            )),
+            // TODO(DIV-GFX-024):需要资产元数据 provider(图像头/解码器)。
+            TextureRef::Asset(_) => Err(error::unimplemented(
+                error::code::INFO_ASSET_SIZE,
+                "资源图尺寸需要资产元数据提供者(TODO DIV-GFX-024);gfx 不读图像文件",
+            )),
+            TextureRef::Snapshot(_) => Err(error::unimplemented(
+                error::code::INFO_UNSUPPORTED,
+                "快照纹理尺寸未取证",
+            )),
+            TextureRef::Offscreen(id) => {
+                let Some(n) = self.nodes.get(id) else {
+                    return Err(error::unimplemented(
+                        error::code::INFO_MISSING,
+                        format!("离屏组 `{}` 不存在", id.display()),
+                    ));
+                };
+                let Some(s) = n.layer.group_size() else {
+                    return Err(error::unimplemented(
+                        error::code::INFO_UNSUPPORTED,
+                        "离屏组尺寸未指定",
+                    ));
+                };
+                Ok(i64::from(if width { s.width } else { s.height }))
+            }
+        }
+    }
+
+    fn query_fontinfo(&self, args: &[ArgValue]) -> Result<Value, Diag> {
+        let resolved = self.params.resolve("FONTINFO", args);
+        let mut flags: BTreeMap<&str, i64> = BTreeMap::new();
+        let mut no: Option<i64> = None;
+        for r in resolved {
+            match r.name {
+                Some("LET") => {}
+                Some("NO") => no = int_arg(r.value),
+                Some(name) => {
+                    let Some(v) = int_arg(r.value) else {
+                        return Err(arg_type_diag("FONTINFO", name, "整数"));
+                    };
+                    if v != 0 {
+                        flags.insert(name, v);
+                    }
+                }
+                None => {
+                    return Err(error::unimplemented(
+                        error::code::ARG_MISSING,
+                        format!("FONTINFO 槽 {} 不在 ysc 参数表内", r.slot),
+                    ));
+                }
+            }
+        }
+        let Some((flag, _)) = single_flag(&flags, "FONTINFO")? else {
+            return Err(error::unimplemented(
+                error::code::INFO_MULTI,
+                "FONTINFO 未给出查询字段",
+            ));
+        };
+        Ok(match flag {
+            "COLOR" => Value::Int(i64::from(self.style.color)),
+            "COLOR2" => match self.style.color2 {
+                Some(c) => Value::Int(i64::from(c)),
+                None => {
+                    return Err(error::unimplemented(
+                        error::code::INFO_UNSUPPORTED,
+                        "FONTINFO[COLOR2] 未设置:引擎默认值未取证",
+                    ));
+                }
+            },
+            "SX" => Value::Int(self.style.size_x),
+            "SY" => Value::Int(self.style.size_y),
+            "BOLD" => Value::Int(i64::from(self.style.bold)),
+            "ANTIALIASING" => Value::Int(i64::from(self.style.antialias)),
+            "DRAWMODE" => Value::Int(self.style.draw_mode),
+            "NAME" => {
+                if no.is_some() {
+                    return Err(error::unimplemented(
+                        error::code::INFO_UNSUPPORTED,
+                        "FONTINFO[NAME] NO=... 需要安装字体列表",
+                    ));
+                }
+                match &self.style.name {
+                    Some(n) => Value::Str(n.clone()),
+                    None => {
+                        return Err(error::unimplemented(
+                            error::code::INFO_UNSUPPORTED,
+                            "FONTINFO[NAME] 当前未设置字体名;系统默认名未取证",
+                        ));
+                    }
+                }
+            }
+            other => {
+                // TODO(DIV-GFX-036):NUM/LANG/GRADATION/ROTATION/PITCH/X/Y
+                // 需要字体列表或未取证语义。
+                return Err(error::unimplemented(
+                    error::code::INFO_UNSUPPORTED,
+                    format!("FONTINFO[{other}] 需要字体列表/未取证语义"),
+                ));
+            }
+        })
+    }
+
+    fn query_windowinfo(&self, args: &[ArgValue]) -> Result<Value, Diag> {
+        let resolved = self.params.resolve("WINDOWINFO", args);
+        let mut flags: BTreeMap<&str, i64> = BTreeMap::new();
+        let mut no: Option<i64> = None;
+        for r in resolved {
+            match r.name {
+                Some("LET") => {}
+                Some("NO") => no = int_arg(r.value),
+                Some(name) => {
+                    let Some(v) = int_arg(r.value) else {
+                        return Err(arg_type_diag("WINDOWINFO", name, "整数"));
+                    };
+                    if v != 0 {
+                        flags.insert(name, v);
+                    }
+                }
+                None => {
+                    return Err(error::unimplemented(
+                        error::code::ARG_MISSING,
+                        format!("WINDOWINFO 槽 {} 不在 ysc 参数表内", r.slot),
+                    ));
+                }
+            }
+        }
+        let Some((flag, _)) = single_flag(&flags, "WINDOWINFO")? else {
+            return Err(error::unimplemented(
+                error::code::INFO_MULTI,
+                "WINDOWINFO 未给出查询字段",
+            ));
+        };
+        let no = no.unwrap_or(0);
+        if !(0..=3).contains(&no) {
+            return Err(error::unimplemented(
+                error::code::INFO_UNSUPPORTED,
+                format!("WINDOWINFO[NO={no}] 超出手册 0..3"),
+            ));
+        }
+        let window = self.windows.get(&(no as u8));
+        if flag == "EXIST" {
+            return Ok(Value::Int(i64::from(window.is_some())));
+        }
+        let Some(window) = window else {
+            return Err(error::unimplemented(
+                error::code::INFO_MISSING,
+                format!("WINDOWINFO[NO={no}] 窗口不存在"),
+            ));
+        };
+        Ok(match flag {
+            "E" => Value::Int(i64::from(window.visible)),
+            "X" => Value::Int(window.x),
+            "Y" => Value::Int(window.y),
+            "SX" => Value::Int(i64::from(
+                window.size.map_or(self.config.viewport.width, |s| s.width),
+            )),
+            "SY" => Value::Int(i64::from(
+                window
+                    .size
+                    .map_or(self.config.viewport.height, |s| s.height),
+            )),
+            other => {
+                return Err(error::unimplemented(
+                    error::code::INFO_UNSUPPORTED,
+                    format!("WINDOWINFO[{other}] 属窗口 host(标题/激活/全屏/关闭模式)"),
+                ));
+            }
+        })
     }
 
     // ------------------------------------------------------------ 命令分派
@@ -316,20 +626,9 @@ impl GfxState {
             "CGACT" => self.apply_cgact(args),
             "CGEND" => self.apply_cgend(args),
             "FONT" => self.apply_font(args),
-            "CGINFO" => self.push_diag(
-                name,
-                error::unimplemented(
-                    error::code::COMMAND_UNIMPLEMENTED,
-                    "CGINFO 是只读查询(写 LET 变量),归 VM;gfx 不实现",
-                ),
-            ),
-            "FONTINFO" => self.push_diag(
-                name,
-                error::unimplemented(
-                    error::code::COMMAND_UNIMPLEMENTED,
-                    "FONTINFO 是只读查询(写 LET 变量),归 VM;gfx 不实现",
-                ),
-            ),
+            // INFO 查询由 VM 的 op_info 在脚本执行期通过 GraphicsHost 读取;
+            // 事件只是事实记录,不应在这里再挂“未实现”诊断。
+            "CGINFO" | "FONTINFO" => {}
             other => self.push_diag(
                 other,
                 error::unimplemented(
@@ -338,6 +637,207 @@ impl GfxState {
                 ),
             ),
         }
+    }
+
+    // ------------------------------------------------------------ WINDOW
+
+    fn dispatch_window(&mut self, name: &str, args: &[ArgValue]) {
+        if !self.params.known(name) {
+            self.push_diag(
+                name,
+                error::unimplemented(
+                    error::code::COMMAND_UNKNOWN,
+                    format!("窗口域命令 `{name}` 不在工程 ysc 表中"),
+                ),
+            );
+            return;
+        }
+        match name {
+            "WINDOW" => self.apply_window(args),
+            "WINDOWEND" => self.apply_windowend(args),
+            // 同 CGINFO/FONTINFO:由 VM 的 op_info 同步查询。
+            "WINDOWINFO" => {}
+            other => self.push_diag(
+                other,
+                error::unimplemented(error::code::COMMAND_UNIMPLEMENTED, "窗口域命令未接线"),
+            ),
+        }
+    }
+
+    fn apply_window(&mut self, args: &[ArgValue]) {
+        let resolved = self.resolved_owned("WINDOW", args);
+        let mut no: Option<i64> = None;
+        let mut cgid: Option<Vec<u8>> = None;
+        let mut e: Option<i64> = None;
+        let mut a: Option<i64> = None;
+        let mut x: Option<i64> = None;
+        let mut y: Option<i64> = None;
+        let mut sx: Option<i64> = None;
+        let mut sy: Option<i64> = None;
+        let mut z: Option<i64> = None;
+        let mut unknown: Vec<String> = Vec::new();
+        for r in resolved {
+            let Some(name) = r.name.as_deref() else {
+                self.arg_slot_missing("WINDOW", r.slot);
+                continue;
+            };
+            match name {
+                "NO" => match int_arg(&r.value) {
+                    Some(n) => no = Some(n),
+                    None => self.arg_type("WINDOW", name, "整数", &r.value),
+                },
+                "CGID" => match &r.value {
+                    Value::Str(b) => cgid = Some(b.clone()),
+                    _ => self.arg_type("WINDOW", name, "字符串", &r.value),
+                },
+                "E" => match int_arg(&r.value) {
+                    Some(n) => e = Some(n),
+                    None => self.arg_type("WINDOW", name, "整数", &r.value),
+                },
+                "A" => match int_arg(&r.value) {
+                    Some(n) => a = Some(n),
+                    None => self.arg_type("WINDOW", name, "整数", &r.value),
+                },
+                "X" => x = int_arg(&r.value),
+                "Y" => y = int_arg(&r.value),
+                "SX" => sx = int_arg(&r.value),
+                "SY" => sy = int_arg(&r.value),
+                "Z" => z = int_arg(&r.value),
+                // TODO(DIV-GFX-037):窗口标题/激活/全屏/菜单/拖拽/关闭模式
+                // 属 host;主窗口 A 透明度(β4 仅显隐)与 SX/SY 是否改视口
+                // 未取证,gfx 只记录几何。
+                "CAPTION" | "MENUID" | "REGIONID" | "DRAGID" | "ACTIVE" | "FULLSCREEN"
+                | "FULLSCREENBUTTON" | "MINIMIZE" | "CLOSEMODE" | "RESIZE" | "MAXIMIZE" | "WSX"
+                | "WSY" => {}
+                other => unknown.push(other.to_string()),
+            }
+        }
+        let no = no.unwrap_or(0);
+        if !(0..=3).contains(&no) {
+            self.push_diag(
+                "WINDOW",
+                error::recoverable(
+                    error::code::WINDOW_UNSUPPORTED,
+                    format!("WINDOW[NO={no}] 超出手册 0..3"),
+                ),
+            );
+            return;
+        }
+        if !unknown.is_empty() {
+            let detail = format!("窗口参数未分类: {}", unknown.join(","));
+            self.push_diag(
+                "WINDOW",
+                error::unimplemented(error::code::WINDOW_UNSUPPORTED, detail),
+            );
+        }
+        let mut pending: Option<Diag> = None;
+        let alpha = match a {
+            Some(v) => match i16::try_from(v) {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    pending = Some(error::recoverable(
+                        error::code::ARG_TYPE,
+                        format!("WINDOW[A={v}] 超出 s16 存储范围"),
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+        let size = match (sx, sy) {
+            (Some(w), Some(h)) => match (u32::try_from(w), u32::try_from(h)) {
+                (Ok(w), Ok(h)) => Some(SizeU32 {
+                    width: w,
+                    height: h,
+                }),
+                _ => {
+                    pending = Some(error::recoverable(
+                        error::code::ARG_TYPE,
+                        format!("WINDOW[SX={w} SY={h}] 超出 u32 范围"),
+                    ));
+                    None
+                }
+            },
+            (Some(_), None) | (None, Some(_)) => {
+                pending = Some(error::unimplemented(
+                    error::code::WINDOW_UNSUPPORTED,
+                    "WINDOW 只给 SX/SY 之一:窗口尺寸部分更新未取证",
+                ));
+                None
+            }
+            (None, None) => None,
+        };
+        let entry = self
+            .windows
+            .entry(no as u8)
+            .or_insert_with(|| WindowState::new(no as u8, None));
+        if let Some(b) = cgid {
+            // CGID = 显示对象图层组;空串 = 未指定(主窗口回退到配置默认)。
+            entry.layer_set = if b.is_empty() {
+                None
+            } else {
+                Some(path::normalize(&b, None, b.ends_with(b"/")).path)
+            };
+        }
+        if let Some(v) = alpha {
+            entry.alpha = v;
+            // 手册 window/window.html:A 在 β4 只表示显示/非显示。
+            entry.visible = v != 0;
+        }
+        if let Some(v) = e {
+            entry.visible = v != 0;
+        }
+        if let Some(v) = x {
+            entry.x = v;
+        }
+        if let Some(v) = y {
+            entry.y = v;
+        }
+        if let Some(v) = z {
+            entry.z = v;
+        }
+        if let Some(s) = size {
+            entry.size = Some(s);
+        }
+        if let Some(d) = pending {
+            self.push_diag("WINDOW", d);
+        }
+    }
+
+    fn apply_windowend(&mut self, args: &[ArgValue]) {
+        let resolved = self.resolved_owned("WINDOWEND", args);
+        let mut no: Option<i64> = None;
+        for r in resolved {
+            let Some(name) = r.name.as_deref() else {
+                self.arg_slot_missing("WINDOWEND", r.slot);
+                continue;
+            };
+            if name == "NO" {
+                no = int_arg(&r.value);
+            }
+        }
+        let no = no.unwrap_or(0);
+        if no == 0 {
+            self.push_diag(
+                "WINDOWEND",
+                error::recoverable(
+                    error::code::WINDOW_UNSUPPORTED,
+                    "WINDOWEND 不能删除主窗口(手册 window/windowend.html)",
+                ),
+            );
+            return;
+        }
+        if !(1..=3).contains(&no) {
+            self.push_diag(
+                "WINDOWEND",
+                error::recoverable(
+                    error::code::WINDOW_UNSUPPORTED,
+                    format!("WINDOWEND[NO={no}] 超出手册 1..3"),
+                ),
+            );
+            return;
+        }
+        self.windows.remove(&(no as u8));
     }
 
     // ------------------------------------------------------------ CG
@@ -434,7 +934,7 @@ impl GfxState {
             // 绘制遍历按 `+0x90 == 0` 跳过。手册例 4 称“图层不存在 = 错误”,
             // 这里按引擎实际 get-or-create 处理(留档,不改变可见结果)。
             let texture = file.clone().unwrap_or(TextureRef::None);
-            self.create_image(&parsed.path, texture);
+            self.create_image(&parsed.path, texture, None);
             if file.is_none() {
                 self.push_diag(
                     "CG",
@@ -448,6 +948,8 @@ impl GfxState {
             // 手册:FILE 替换只换图,不重置 A/位置等属性。
             if let Some(node) = self.nodes.get_mut(&parsed.path) {
                 node.layer.texture = texture;
+                // 新纹理没有旧快照/图像加工的状态;属性随后重算。
+                node.layer.reset_status();
             }
             // 旧快照/图像加工随旧纹理作废。
             self.copy_log.retain(|c| c.dest != parsed.path);
@@ -581,6 +1083,7 @@ impl GfxState {
             return;
         };
         let dest = paths[1].clone().unwrap_or_else(|| source.clone());
+        // TODO(DIV-GFX-031):ID3/ID4 多图层运算、Z2/BNO 修饰语义未取证。
         if paths[2].is_some() || paths[3].is_some() {
             self.push_diag(
                 "CGACT",
@@ -608,6 +1111,9 @@ impl GfxState {
         let y = find_int(&params, "Y");
         let x2 = find_int(&params, "X2");
         let y2 = find_int(&params, "Y2");
+        // SIZE/SIZE2 的目标尺寸(手册 cg/cgact.html 例 3/4)。
+        let sx = find_int(&params, "SX");
+        let sy = find_int(&params, "SY");
 
         let copy_action = ["COPY", "COPY2", "TEXCOPY", "TEXSSCOPY"]
             .iter()
@@ -652,6 +1158,8 @@ impl GfxState {
                 set,
                 set2,
                 set_str,
+                sx,
+                sy,
                 x,
                 y,
                 x2,
@@ -696,7 +1204,7 @@ impl GfxState {
         let source_is_group = self.nodes[source].layer.is_group();
         if !self.nodes.contains_key(dest) {
             // 手册 cg/cgact.html 例 30:目标层可作为复制结果出现。
-            self.create_image(dest, TextureRef::None);
+            self.create_image(dest, TextureRef::None, None);
         }
         if self.nodes.get(dest).is_some_and(|n| n.layer.is_group()) {
             self.push_diag(
@@ -722,7 +1230,9 @@ impl GfxState {
         self.copy_log.retain(|c| c.dest != *dest);
         self.image_log
             .retain(|i| i.target.as_ref().is_none_or(|t| t != dest));
-        self.copy_log.push(CopyOp {
+        // TODO(DIV-GFX-007):复制时序(上一帧已渲染)与区域语义未取证;
+        // 恒标 Unimplemented,后端必须跳过。
+        self.push_copy_log(CopyOp {
             id: copy_id,
             kind,
             source: if source_is_group {
@@ -743,7 +1253,8 @@ impl GfxState {
         }
         if let Some(node) = self.nodes.get_mut(dest) {
             node.layer.texture = TextureRef::Snapshot(copy_id);
-            mark_unimplemented(&mut node.layer, "gfx.copy.unsupported");
+            node.layer
+                .set_texture_status(LayerStatus::Unimplemented("gfx.copy.unsupported"));
         }
         self.push_diag(
             "CGACT",
@@ -782,6 +1293,8 @@ impl GfxState {
             );
             return;
         }
+        // TODO(DIV-GFX-032):SWAP/SWAP2 与引擎模式 1/2 的精确对应仍是
+        // Likely,需 `FUN_0042f57d` 调用点确认。
         // 引擎 FUN_0042f57d:
         // - 总是交换纹理/图像名与 +0x68/+0x70(X/Y);
         // - 模式 2 额外交换 +0x89(E)/+0x80(A)/+0x82(T)/+0x84(TA)/+0x87(MODE)。
@@ -792,14 +1305,18 @@ impl GfxState {
         {
             let s = self.nodes.get_mut(source).expect("checked");
             s.layer.texture = dst.texture.clone();
+            s.layer.texture_status = dst.texture_status;
             s.layer.transform.x = dst.transform.x;
             s.layer.transform.y = dst.transform.y;
+            s.layer.refresh_status();
         }
         {
             let d = self.nodes.get_mut(dest).expect("checked");
             d.layer.texture = src.texture.clone();
+            d.layer.texture_status = src.texture_status;
             d.layer.transform.x = src.transform.x;
             d.layer.transform.y = src.transform.y;
+            d.layer.refresh_status();
         }
         if !image_only {
             let swap_attrs = |a: &mut Layer, b: &Layer| {
@@ -825,6 +1342,8 @@ impl GfxState {
         set: Option<EngineValue>,
         set2: Option<EngineValue>,
         set_str: Option<Vec<u8>>,
+        sx: Option<i64>,
+        sy: Option<i64>,
         x: Option<i64>,
         y: Option<i64>,
         x2: Option<i64>,
@@ -843,7 +1362,7 @@ impl GfxState {
         let target = target.or_else(|| Some(source.clone()));
         if let Some(t) = &target {
             if !self.nodes.contains_key(t) {
-                self.create_image(t, TextureRef::None);
+                self.create_image(t, TextureRef::None, None);
             }
             if self.nodes.get(t).is_some_and(|n| n.layer.is_group()) {
                 self.push_diag(
@@ -856,13 +1375,16 @@ impl GfxState {
                 return;
             }
         }
-        self.image_log.push(ImageOp {
+        // TODO(DIV-GFX-013):图像加工像素算法未实现;只记录参数。
+        self.push_image_log(ImageOp {
             source: source.clone(),
             target: target.clone(),
             action,
             set,
             set2,
             set_str,
+            sx,
+            sy,
             x,
             y,
             x2,
@@ -870,11 +1392,13 @@ impl GfxState {
             status: OpStatus::Unimplemented("gfx.imageop.unsupported"),
         });
         if let Some(node) = self.nodes.get_mut(source) {
-            mark_unimplemented(&mut node.layer, "gfx.imageop.unsupported");
+            node.layer
+                .set_texture_status(LayerStatus::Unimplemented("gfx.imageop.unsupported"));
         }
         if let Some(t) = target {
             if let Some(node) = self.nodes.get_mut(&t) {
-                mark_unimplemented(&mut node.layer, "gfx.imageop.unsupported");
+                node.layer
+                    .set_texture_status(LayerStatus::Unimplemented("gfx.imageop.unsupported"));
             }
         }
         self.push_diag(
@@ -922,13 +1446,23 @@ impl GfxState {
                     Some(n) => self.style.draw_mode = n,
                     None => self.arg_type("FONT", name, "整数", &r.value),
                 },
-                "NO" | "BNO" => self.push_diag(
-                    "FONT",
-                    error::unimplemented(
-                        error::code::TEXT_UNSUPPORTED,
-                        format!("FONT[{name}] 字体列表序号未取证;保留当前字体"),
-                    ),
-                ),
+                // TODO(DIV-GFX-035):NO 只是字体列表序号,解析到真实字体
+                // 归 `yu-font`;BNO/GRADATION/ROTATION/PITCH/LANG 同样未取证。
+                "NO" => match int_arg(&r.value) {
+                    Some(n) => self.style.font_no = Some(n),
+                    None => self.arg_type("FONT", name, "整数", &r.value),
+                },
+                "BNO" => {
+                    // 手册 font/font.html 无 BNO;真实脚本只用它做调试字体槽。
+                    self.style.font_bno = int_arg(&r.value);
+                    self.push_diag(
+                        "FONT",
+                        error::unimplemented(
+                            error::code::TEXT_UNSUPPORTED,
+                            "FONT[BNO] 无手册页/字体列表语义未取证;值已保留",
+                        ),
+                    );
+                }
                 _ => self.push_diag(
                     "FONT",
                     error::unimplemented(
@@ -992,6 +1526,8 @@ impl GfxState {
             transition: None,
             clip: None,
             status: LayerStatus::Executable,
+            texture_status: LayerStatus::Executable,
+            param_status: LayerStatus::Executable,
             extra: BTreeMap::new(),
         };
         self.nodes.insert(
@@ -1024,12 +1560,14 @@ impl GfxState {
             transition: None,
             clip: None,
             status: LayerStatus::Executable,
+            texture_status: LayerStatus::Executable,
+            param_status: LayerStatus::Executable,
             extra: BTreeMap::new(),
         };
         self.insert_node(path, layer);
     }
 
-    fn create_image(&mut self, path: &LayerId, texture: TextureRef) {
+    fn create_image(&mut self, path: &LayerId, texture: TextureRef, size: Option<SizeU32>) {
         if self.nodes.contains_key(path) {
             return;
         }
@@ -1041,7 +1579,7 @@ impl GfxState {
             alpha: 256,
             blend: BlendMode::Normal,
             visible: true,
-            kind: LayerKind::Image,
+            kind: LayerKind::Image { size },
             texture,
             parts: Vec::new(),
             transform: Default::default(),
@@ -1049,21 +1587,26 @@ impl GfxState {
             transition: None,
             clip: None,
             status: LayerStatus::Executable,
+            texture_status: LayerStatus::Executable,
+            param_status: LayerStatus::Executable,
             extra: BTreeMap::new(),
         };
         self.insert_node(path, layer);
     }
 
+    /// 补齐父路径。迭代向上收集缺失祖先后从上往下建,避免深路径递归爆栈。
     fn ensure_parents(&mut self, path: &LayerId) {
-        let Some(parent) = path::parent(path) else {
-            return;
-        };
-        if path::is_root(&parent) {
-            return;
+        let mut missing = Vec::new();
+        let mut cur = path::parent(path);
+        while let Some(p) = cur {
+            if path::is_root(&p) || self.nodes.contains_key(&p) {
+                break;
+            }
+            missing.push(p.clone());
+            cur = path::parent(&p);
         }
-        if !self.nodes.contains_key(&parent) {
-            self.ensure_parents(&parent);
-            self.create_group(&parent);
+        for p in missing.into_iter().rev() {
+            self.create_group(&p);
         }
     }
 
@@ -1110,7 +1653,7 @@ impl GfxState {
     }
 
     fn sorted_children(&self, parent: Option<&LayerId>) -> Vec<LayerId> {
-        let mut ids: Vec<LayerId> = if let Some(parent) = parent {
+        let ids: Vec<LayerId> = if let Some(parent) = parent {
             self.nodes
                 .get(parent)
                 .map(|n| n.children.iter().cloned().collect())
@@ -1122,109 +1665,190 @@ impl GfxState {
                 .map(|n| n.layer.id.clone())
                 .collect()
         };
-        ids.sort_by(|a, b| {
-            let la = &self.nodes[a].layer;
-            let lb = &self.nodes[b].layer;
-            (la.z, la.seq, a.clone()).cmp(&(lb.z, lb.seq, b.clone()))
-        });
-        ids
+        // 预先取 (z,seq,id) 键,排序比较期不再查 BTreeMap / 分配。
+        let mut keyed: Vec<(i64, u64, LayerId)> = ids
+            .into_iter()
+            .map(|id| {
+                let layer = &self.nodes[&id].layer;
+                (layer.z, layer.seq, id)
+            })
+            .collect();
+        keyed.sort();
+        keyed.into_iter().map(|(_, _, id)| id).collect()
     }
 
+    /// 组是否有可见内容(显式栈;深树不递归)。
     fn group_has_visible_content(&self, id: &LayerId) -> bool {
         let Some(node) = self.nodes.get(id) else {
             return false;
         };
-        node.children.iter().any(|c| {
-            self.nodes.get(c).is_some_and(|n| {
-                if !n.layer.visible {
-                    return false;
-                }
-                if n.layer.is_group() {
-                    self.group_has_visible_content(c)
-                } else {
-                    !matches!(n.layer.texture, TextureRef::None)
-                }
-            })
-        })
-    }
-
-    /// 生成组的离屏 pass(后序)。返回是否生成了非空 pass。
-    fn build_group_pass(&self, id: &LayerId, out: &mut Vec<Pass>) -> bool {
-        let Some(node) = self.nodes.get(id) else {
-            return false;
-        };
-        let children = self.sorted_children(Some(id));
-        let mut ops = Vec::new();
-        for child in children {
-            let Some(cnode) = self.nodes.get(&child) else {
+        let mut stack: Vec<LayerId> = node.children.iter().cloned().collect();
+        let mut seen = BTreeSet::new();
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c.clone()) {
+                continue;
+            }
+            let Some(n) = self.nodes.get(&c) else {
                 continue;
             };
-            if cnode.layer.is_group() {
-                let emitted = self.build_group_pass(&child, out);
-                if emitted && cnode.layer.visible {
-                    ops.push(Op::Group(crate::group::GroupDraw {
-                        layer: cnode.layer.clone(),
-                        offscreen: child,
-                    }));
+            if n.layer.is_group() {
+                // 组内容不直接进父目标;E=0 的组不合成,跳过其子树。
+                if n.layer.visible {
+                    stack.extend(n.children.iter().cloned());
                 }
-            } else if cnode.layer.visible && !matches!(cnode.layer.texture, TextureRef::None) {
-                ops.push(self.op_for_layer(&cnode.layer));
+            } else {
+                if n.layer.visible && !matches!(n.layer.texture, TextureRef::None) {
+                    return true;
+                }
+                // 引擎先递归子层再判本层 E:隐藏图像层的子层仍可能可见。
+                stack.extend(n.children.iter().cloned());
             }
         }
-        if ops.is_empty() {
-            return false;
-        }
-        let _ = node;
-        out.push(Pass {
-            target: PassTarget::Offscreen(id.clone()),
-            ops,
-            // 组离屏背景 = 透明黑;组自身 A/MODE 作用于合成结果。
-            clear: Some(Clear::explicit([0, 0, 0, 0])),
-        });
-        true
+        false
     }
 
-    /// 一个顶层节点在屏幕 pass 里的 op(不可见/空组返回 `None`)。
-    fn screen_op(&self, id: &LayerId) -> Option<Op> {
-        let node = self.nodes.get(id)?;
-        if !node.layer.visible {
-            return None;
+    /// 所有组离屏 pass,后序(子组先于父组)。显式栈遍历全树,包括
+    /// 挂在图像层下面的组。
+    fn build_group_passes(&self, out: &mut Vec<Pass>, emitted: &mut BTreeSet<LayerId>) {
+        // 后序:进入节点时先压“展开”标记,再压子节点;展开时记录组。
+        let mut order: Vec<LayerId> = Vec::new();
+        let mut stack: Vec<(LayerId, bool)> = self
+            .sorted_children(None)
+            .into_iter()
+            .rev()
+            .map(|id| (id, false))
+            .collect();
+        while let Some((id, expanded)) = stack.pop() {
+            let Some(node) = self.nodes.get(&id) else {
+                continue;
+            };
+            if expanded {
+                if node.layer.is_group() {
+                    order.push(id);
+                }
+                continue;
+            }
+            if node.layer.is_group() {
+                stack.push((id.clone(), true));
+            }
+            for child in self.sorted_children(Some(&id)).into_iter().rev() {
+                stack.push((child, false));
+            }
         }
+
+        for id in order {
+            let mut ops = Vec::new();
+            self.emit_children_ops(&id, &mut ops, emitted);
+            if ops.is_empty() {
+                continue;
+            }
+            out.push(Pass {
+                target: PassTarget::Offscreen(id.clone()),
+                ops,
+                // TODO(DIV-GFX-008):引擎非调试路径的组 RT 清屏/尺寸未取证;
+                // 当前按透明黑 + 视口由后端收紧。
+                clear: Some(Clear::explicit([0, 0, 0, 0])),
+            });
+            emitted.insert(id);
+        }
+    }
+
+    /// 把一个子节点写进当前目标:组 → 已生成的离屏纹理;
+    /// 图像 → 自身子树(引擎先递归子层,再画本层)。
+    fn emit_node_ops(&self, id: &LayerId, out: &mut Vec<Op>, emitted: &BTreeSet<LayerId>) {
+        let Some(node) = self.nodes.get(id) else {
+            return;
+        };
         if node.layer.is_group() {
-            if self.group_has_visible_content(id) {
-                Some(Op::Group(crate::group::GroupDraw {
+            if node.layer.visible && emitted.contains(id) && self.group_has_visible_content(id) {
+                out.push(Op::Group(crate::group::GroupDraw {
                     layer: node.layer.clone(),
                     offscreen: id.clone(),
-                }))
-            } else {
-                None
+                }));
             }
-        } else if matches!(node.layer.texture, TextureRef::None) {
-            None
-        } else {
-            Some(self.op_for_layer(&node.layer))
+            return;
+        }
+        self.emit_image_subtree(id, out, emitted);
+    }
+
+    fn emit_children_ops(&self, parent: &LayerId, out: &mut Vec<Op>, emitted: &BTreeSet<LayerId>) {
+        for child in self.sorted_children(Some(parent)) {
+            self.emit_node_ops(&child, out, emitted);
+        }
+    }
+
+    /// 图像节点及其非组后代的绘制顺序 = 引擎后序:子层全部先于本层。
+    /// 组子节点只输出 `Op::Group`(其内部在本组的 Offscreen pass)。
+    fn emit_image_subtree(&self, id: &LayerId, out: &mut Vec<Op>, emitted: &BTreeSet<LayerId>) {
+        enum Frame {
+            Enter(LayerId),
+            Group(LayerId),
+            Emit(LayerId),
+        }
+        let mut stack = vec![Frame::Enter(id.clone())];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Enter(id) => {
+                    let Some(node) = self.nodes.get(&id) else {
+                        continue;
+                    };
+                    stack.push(Frame::Emit(id.clone()));
+                    for child in self.sorted_children(Some(&id)).into_iter().rev() {
+                        if self.nodes.get(&child).is_some_and(|n| n.layer.is_group()) {
+                            stack.push(Frame::Group(child));
+                        } else {
+                            stack.push(Frame::Enter(child));
+                        }
+                    }
+                    let _ = node;
+                }
+                Frame::Group(id) => {
+                    let Some(node) = self.nodes.get(&id) else {
+                        continue;
+                    };
+                    if node.layer.visible
+                        && emitted.contains(&id)
+                        && self.group_has_visible_content(&id)
+                    {
+                        out.push(Op::Group(crate::group::GroupDraw {
+                            layer: node.layer.clone(),
+                            offscreen: id,
+                        }));
+                    }
+                }
+                Frame::Emit(id) => {
+                    let Some(node) = self.nodes.get(&id) else {
+                        continue;
+                    };
+                    if node.layer.visible && !matches!(node.layer.texture, TextureRef::None) {
+                        out.push(self.op_for_layer(&node.layer));
+                    }
+                }
+            }
         }
     }
 
     fn op_for_layer(&self, layer: &Layer) -> Op {
         if !layer.parts.is_empty() {
             let mut l = layer.clone();
-            mark_unimplemented(&mut l, "gfx.parts.unsupported");
+            l.set_texture_status(LayerStatus::Unimplemented("gfx.parts.unsupported"));
             return Op::Layer(l);
         }
+        // 空 TID = 引擎不查配对(`0x413e7b` 空串直接跳过);
+        // 脚本把它当“结束过渡/初始化”,因此这里按普通层输出。
         if let Some(t) = &layer.transition {
-            if let Some(fade) = t.fade_value() {
-                let to = t.tid.as_ref().and_then(|tid| {
-                    let n = self.nodes.get(tid)?;
-                    Some(if n.layer.is_group() {
+            if let (Some(fade), Some(tid)) = (t.fade_value(), t.tid.as_ref()) {
+                let to = self.nodes.get(tid).map(|n| {
+                    if n.layer.is_group() {
                         TextureRef::Offscreen(tid.clone())
                     } else {
                         n.layer.texture.clone()
-                    })
+                    }
                 });
                 let mut l = layer.clone();
                 if to.is_none() {
-                    mark_unimplemented(&mut l, "gfx.transition.unsupported");
+                    // TID 非空但查不到配对层:引擎行为未取证,保持 Unimplemented。
+                    l.set_texture_status(LayerStatus::Unimplemented("gfx.transition.unsupported"));
                 }
                 return Op::Transition(TransitionDraw {
                     from: l.texture.clone(),
@@ -1246,14 +1870,47 @@ impl GfxState {
 
     fn push_diag(&mut self, command: &str, d: Diag) {
         let key = (d.code.to_string(), command.to_string(), d.detail.clone());
-        if self.seen_diags.insert(key) {
-            self.diags.push(error::FrameDiag::new(
-                d.code.to_string(),
-                d.severity,
-                command,
-                d.detail,
-            ));
+        match self.diags.get_mut(&key) {
+            Some(existing) => existing.count = existing.count.saturating_add(1),
+            None => {
+                self.diags.insert(
+                    key,
+                    error::FrameDiag::new(d.code.to_string(), d.severity, command, d.detail),
+                );
+            }
         }
+    }
+
+    fn push_copy_log(&mut self, op: CopyOp) {
+        if self.copy_log.len() >= MAX_OP_LOG {
+            let drop = self.copy_log.len() / 2;
+            self.copy_log.drain(..drop);
+            self.copy_log_dropped += drop as u64;
+            self.push_diag(
+                "CGACT",
+                error::unimplemented(
+                    error::code::LOG_TRUNCATED,
+                    format!("复制日志达到上限 {MAX_OP_LOG},最旧项被丢弃"),
+                ),
+            );
+        }
+        self.copy_log.push(op);
+    }
+
+    fn push_image_log(&mut self, op: ImageOp) {
+        if self.image_log.len() >= MAX_OP_LOG {
+            let drop = self.image_log.len() / 2;
+            self.image_log.drain(..drop);
+            self.image_log_dropped += drop as u64;
+            self.push_diag(
+                "CGACT",
+                error::unimplemented(
+                    error::code::LOG_TRUNCATED,
+                    format!("图像日志达到上限 {MAX_OP_LOG},最旧项被丢弃"),
+                ),
+            );
+        }
+        self.image_log.push(op);
     }
 
     fn arg_slot_missing(&mut self, command: &str, slot: u8) {
@@ -1292,6 +1949,30 @@ fn int_arg(v: &Value) -> Option<i64> {
         Value::Float(f) if f.fract() == 0.0 && f.is_finite() => Some(*f as i64),
         _ => None,
     }
+}
+
+/// INFO 查询必须只置位一个字段;多字段写回顺序未取证。
+fn single_flag<'a>(
+    flags: &BTreeMap<&'a str, i64>,
+    command: &str,
+) -> Result<Option<(&'a str, i64)>, Diag> {
+    if flags.len() > 1 {
+        return Err(error::unimplemented(
+            error::code::INFO_MULTI,
+            format!(
+                "{command} 同时置位 {} 个查询字段;多字段 LET 写回顺序未取证",
+                flags.len()
+            ),
+        ));
+    }
+    Ok(flags.iter().next().map(|(k, v)| (*k, *v)))
+}
+
+fn arg_type_diag(command: &str, name: &str, expected: &str) -> Diag {
+    error::recoverable(
+        error::code::ARG_TYPE,
+        format!("{command}[{name}] 期望 {expected}"),
+    )
 }
 
 fn flag_value(v: &Value) -> bool {
@@ -1345,9 +2026,10 @@ fn take_file(params: &[(String, EngineValue)], diags: &mut Vec<Diag>) -> Option<
     None
 }
 
-fn mark_unimplemented(layer: &mut Layer, reason: &'static str) {
-    if matches!(layer.status, LayerStatus::Executable) {
-        layer.status = LayerStatus::Unimplemented(reason);
+fn mark_param_unimplemented(layer: &mut Layer, reason: &'static str) {
+    if matches!(layer.param_status, LayerStatus::Executable) {
+        layer.param_status = LayerStatus::Unimplemented(reason);
+        layer.refresh_status();
     }
 }
 
@@ -1362,9 +2044,12 @@ fn copy_attributes(src: &Layer, dst: &mut Layer) {
     dst.transition = src.transition.clone();
     dst.clip = src.clip;
     dst.extra = src.extra.clone();
-    dst.status = src.status;
+    dst.texture_status = src.texture_status;
+    dst.param_status = src.param_status;
+    dst.refresh_status();
 }
 
+/// 真实 ysc 表(0.495 ERIS)的全部图像动作参数。
 static IMAGE_ACTIONS: &[(&str, ImageAction)] = &[
     ("RECTPAINT", ImageAction::RectPaint),
     ("RECTPAINT2", ImageAction::RectPaint2),
@@ -1372,12 +2057,19 @@ static IMAGE_ACTIONS: &[(&str, ImageAction)] = &[
     ("TEXT", ImageAction::Text),
     ("SIZE", ImageAction::SizeNearest),
     ("SIZE2", ImageAction::SizeBilinear),
-    ("ROTATION", ImageAction::Rotation),
-    ("MERGE", ImageAction::Merge),
-    ("MERGE2", ImageAction::Merge2),
     ("SIZE3", ImageAction::Other("size3")),
     ("SIZE4", ImageAction::Other("size4")),
     ("SIZE5", ImageAction::Other("size5")),
+    ("ROTATION", ImageAction::Rotation),
+    ("ROTATION2", ImageAction::Other("rotation2")),
+    ("RESIZE", ImageAction::Resize),
+    ("TRIM", ImageAction::Trim),
+    ("MERGE", ImageAction::Merge),
+    ("MERGE2", ImageAction::Merge2),
+    ("TRANSITION", ImageAction::Other("transition")),
+    ("TRANSITION2", ImageAction::Other("transition2")),
+    ("XOR", ImageAction::Other("xor")),
+    ("AND", ImageAction::Other("and")),
     ("SAIDO", ImageAction::Other("saido")),
     ("MEIDO", ImageAction::Other("meido")),
     ("SEPIA", ImageAction::Other("sepia")),
@@ -1387,27 +2079,54 @@ static IMAGE_ACTIONS: &[(&str, ImageAction)] = &[
     ("HORIZONTAL", ImageAction::Other("horizontal")),
     ("MOSAIC", ImageAction::Other("mosaic")),
     ("BLUR", ImageAction::Other("blur")),
+    ("BLUR2", ImageAction::Other("blur2")),
+    ("BLUR3", ImageAction::Other("blur3")),
+    ("BLUR4", ImageAction::Other("blur4")),
+    ("BLUR5", ImageAction::Other("blur5")),
+    ("BLUR6", ImageAction::Other("blur6")),
     ("DIFFUSION", ImageAction::Other("diffusion")),
     ("REVERSE", ImageAction::Other("reverse")),
     ("WHIRLPOOL", ImageAction::Other("whirlpool")),
     ("RASTER", ImageAction::Other("raster")),
+    ("RASTER1", ImageAction::Other("raster1")),
     ("RASTER2", ImageAction::Other("raster2")),
     ("RASTER3", ImageAction::Other("raster3")),
-    ("TRANSITION", ImageAction::Other("transition")),
 ];
 
+fn value_truthy(v: &EngineValue) -> bool {
+    match v {
+        EngineValue::Int(i) => *i != 0,
+        EngineValue::Float(f) => *f != 0.0,
+        EngineValue::Str(b) => !b.is_empty(),
+    }
+}
+
+/// 一次扫描得到“被置位的参数名”,避免每个动作重复全表查找。
+fn active_params(params: &[(String, EngineValue)]) -> BTreeSet<&str> {
+    params
+        .iter()
+        .filter(|(_, v)| value_truthy(v))
+        .map(|(n, _)| n.as_str())
+        .collect()
+}
+
 fn count_image_actions(params: &[(String, EngineValue)]) -> usize {
+    let active = active_params(params);
     IMAGE_ACTIONS
         .iter()
-        .filter(|(candidate, _)| flag(params, candidate))
+        .filter(|(candidate, _)| active.contains(candidate))
         .count()
 }
 
 fn first_image_action(params: &[(String, EngineValue)]) -> Option<(&'static str, ImageAction)> {
+    let active = active_params(params);
     // 参数顺序即编译器窗口顺序;取第一个出现的动作。
     for (name, _) in params {
+        if !active.contains(name.as_str()) {
+            continue;
+        }
         for (candidate, action) in IMAGE_ACTIONS {
-            if name == candidate && flag(params, candidate) {
+            if name == candidate {
                 return Some((candidate, action.clone()));
             }
         }
@@ -1422,6 +2141,8 @@ fn apply_layer_params(
     is_group: bool,
 ) -> Vec<Diag> {
     let mut diags = Vec::new();
+    // 每次属性更新都从“本组参数”重新判定;纹理级状态保留(CGACT 之后仍有效)。
+    layer.param_status = LayerStatus::Executable;
     let mut sx: Option<i64> = None;
     let mut sy: Option<i64> = None;
     for (name, value) in params {
@@ -1477,14 +2198,14 @@ fn apply_layer_params(
                         match m.confidence() {
                             BlendConfidence::Confirmed | BlendConfidence::Likely => {}
                             BlendConfidence::Unverified => {
-                                mark_unimplemented(layer, "gfx.blend.unverified");
+                                mark_param_unimplemented(layer, "gfx.blend.unverified");
                                 diags.push(error::unimplemented(
                                     error::code::BLEND_UNVERIFIED,
                                     format!("MODE={n}({}) 固定管线状态已取证,语义未对拍", m.name()),
                                 ));
                             }
                             BlendConfidence::Unimplemented => {
-                                mark_unimplemented(layer, "gfx.blend.unsupported");
+                                mark_param_unimplemented(layer, "gfx.blend.unsupported");
                                 diags.push(error::unimplemented(
                                     error::code::BLEND_UNSUPPORTED,
                                     format!("MODE={n}({}) 着色器路径未取证", m.name()),
@@ -1494,7 +2215,7 @@ fn apply_layer_params(
                     }
                     None => {
                         layer.extra.insert("MODE".to_string(), EngineValue::Int(n));
-                        mark_unimplemented(layer, "gfx.blend.unsupported");
+                        mark_param_unimplemented(layer, "gfx.blend.unsupported");
                         diags.push(error::unimplemented(
                             error::code::BLEND_UNSUPPORTED,
                             format!("MODE={n} 超出手册 0..18"),
@@ -1528,10 +2249,28 @@ fn apply_layer_params(
                     t.ta = v;
                 }
             }
+            // TODO(DIV-GFX-030):引擎可能按 `TID + "." + N` 解析 TIDNO;
+            // 未重新锚定前只留档,不当作 TID 使用。
+            "TIDNO" => {
+                layer.extra.insert("TIDNO".to_string(), value.clone());
+                diags.push(error::unimplemented(
+                    error::code::PARAM_NONVISUAL,
+                    "CG[TIDNO] 的 IDNO 变体未取证;已原样保留",
+                ));
+            }
             "TID" => match value.as_bytes() {
+                // 引擎 `FUN_00413dc8` 0x413e7b:空串直接跳过配对查询。
+                // 脚本 `TID=""` 的意图是“结束过渡/初始化”(es_Button.yst:4526)。
+                Some([]) => {
+                    let t = layer.transition.get_or_insert_with(Transition::default);
+                    t.tid = None;
+                    t.tid_raw = Some(Vec::new());
+                }
                 Some(b) => {
                     let p = path::normalize(b, None, false).path;
-                    layer.transition.get_or_insert_with(Transition::default).tid = Some(p);
+                    let t = layer.transition.get_or_insert_with(Transition::default);
+                    t.tid = Some(p);
+                    t.tid_raw = Some(b.to_vec());
                 }
                 None => diags.push(error::recoverable(
                     error::code::ARG_TYPE,
@@ -1539,9 +2278,12 @@ fn apply_layer_params(
                 )),
             },
             "MID" => match value.as_bytes() {
+                // 与 TID 同法:空串 = 不设置外部掩码(+0x210 空串跳过)。
+                Some([]) => layer.mask = None,
                 Some(b) => {
+                    // TODO(DIV-GFX-005):MID 取值通道(α/亮度)/尺寸未取证。
                     layer.mask = Some(path::normalize(b, None, false).path);
-                    mark_unimplemented(layer, "gfx.mask.unsupported");
+                    mark_param_unimplemented(layer, "gfx.mask.unsupported");
                     diags.push(error::unimplemented(
                         error::code::MASK_UNSUPPORTED,
                         "外部掩码 MID 的取值通道(α/亮度)未取证",
@@ -1554,8 +2296,9 @@ fn apply_layer_params(
             },
             other => {
                 if let Some(fp) = FilterParam::from_name(other) {
+                    // TODO(DIV-GFX-003):槽位→+0x1b0..+0x200 绑定/变换公式未取证。
                     layer.transform.filter.set(fp, value.clone());
-                    mark_unimplemented(layer, "gfx.filter.unsupported");
+                    mark_param_unimplemented(layer, "gfx.filter.unsupported");
                     diags.push(error::unimplemented(
                         error::code::FILTER_UNSUPPORTED,
                         format!("滤镜/仿射参数 `{other}` 的槽位→偏移绑定未取证"),
@@ -1569,6 +2312,26 @@ fn apply_layer_params(
                 }
             }
         }
+    }
+
+    // 持久字段重算:本命令没重复给 FX/MID/MODE 时,旧值仍可能让本层不可执行。
+    // (诊断只在参数出现时发,避免每帧重复计数。)
+    if layer.extra.contains_key("MODE") {
+        mark_param_unimplemented(layer, "gfx.blend.unsupported");
+    } else {
+        match layer.blend.confidence() {
+            BlendConfidence::Unverified => mark_param_unimplemented(layer, "gfx.blend.unverified"),
+            BlendConfidence::Unimplemented => {
+                mark_param_unimplemented(layer, "gfx.blend.unsupported")
+            }
+            _ => {}
+        }
+    }
+    if !layer.transform.filter.is_empty() {
+        mark_param_unimplemented(layer, "gfx.filter.unsupported");
+    }
+    if layer.mask.is_some() {
+        mark_param_unimplemented(layer, "gfx.mask.unsupported");
     }
 
     if is_group {
@@ -1591,19 +2354,50 @@ fn apply_layer_params(
                 )),
             }
         }
-    } else if sx.is_some() || sy.is_some() {
-        // 手册:CG SX/SY 只对图层组有效。图像层的尺寸来自纹理;
-        // 这里只留档,不改变合成几何。
+    } else {
+        let size_params_present = sx.is_some() || sy.is_some();
         if let Some(v) = sx {
             layer.extra.insert("SX".to_string(), EngineValue::Int(v));
         }
         if let Some(v) = sy {
             layer.extra.insert("SY".to_string(), EngineValue::Int(v));
         }
-        diags.push(error::info(
-            error::code::PARAM_NONVISUAL,
-            "CG SX/SY 对图像层只留档(手册:仅图层组有效)",
-        ));
+        match (sx, sy) {
+            (Some(w), Some(h)) => match (u32::try_from(w), u32::try_from(h)) {
+                (Ok(w), Ok(h)) => {
+                    layer.kind = LayerKind::Image {
+                        size: Some(SizeU32 {
+                            width: w,
+                            height: h,
+                        }),
+                    };
+                }
+                _ => diags.push(error::recoverable(
+                    error::code::ARG_TYPE,
+                    format!("图像层 SX={w} SY={h} 超出 u32 范围"),
+                )),
+            },
+            (Some(_), None) | (None, Some(_)) => diags.push(error::unimplemented(
+                error::code::IMAGE_SIZE_UNSUPPORTED,
+                "图像层只给 SX/SY 之一:部分尺寸更新未取证",
+            )),
+            (None, None) => {}
+        }
+        // 引擎层矩形(+0x78/+0x7c)独立于纹理。`FILE=""` 的 1×1 黑图
+        // 按 SX/SY 铺满(真实脚本 es_ERIS.yst:579);资源图的缩放/裁剪
+        // 没有真实样本,保持 Unimplemented。
+        if let Some(_size) = layer.image_size() {
+            if !matches!(&layer.texture, TextureRef::SolidBlack1x1 | TextureRef::None) {
+                mark_param_unimplemented(layer, "gfx.image.size.unsupported");
+                if size_params_present {
+                    diags.push(error::unimplemented(
+                        error::code::IMAGE_SIZE_UNSUPPORTED,
+                        "资源图 + SX/SY 的缩放/裁剪语义未取证;仅 FILE=\"\" 黑图按尺寸绘制",
+                    ));
+                }
+            }
+        }
     }
+    layer.refresh_status();
     diags
 }

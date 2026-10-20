@@ -15,6 +15,7 @@
 //! 内部量一律不出现在事件里。
 
 use crate::value::Value;
+use yu_log::Diag;
 
 /// 事件流中的一条记录。
 #[derive(Clone, Debug, PartialEq)]
@@ -230,4 +231,26 @@ impl VmEvent {
             | VmEvent::Diag { frame, .. } => *frame,
         }
     }
+}
+
+/// 图形域同步宿主。
+///
+/// 为什么需要它:`CGINFO/FONTINFO/WINDOWINFO` 的 `LET` 必须在**脚本执行期**
+/// 读取图形状态。`VmEvent::DomainCall` 只是异步事件流,宿主 tick 后才消费,
+/// 同一帧里 `CG[...]` 后紧跟的 `CGINFO` 会读到旧状态。安装本接口后:
+///
+/// 1. `Vm` 在**产生**图形/窗口/文本/帧事件时同步调用 [`apply_event`];
+/// 2. INFO 命令通过 [`query`] 同步取当前状态并写回 `LET`;
+/// 3. 调用方**不得**再把已同步喂过的事件重复喂给同一个宿主。
+///
+/// 未安装宿主时,INFO 命令保持 `Unimplemented` 诊断(不猜)。
+pub trait GraphicsHost {
+    /// 同步应用一条事件(仅 FrameStart/FrameEnd/Text/Graphics|Window DomainCall)。
+    fn apply_event(&mut self, ev: &VmEvent);
+
+    /// 回答一条 INFO 查询;返回写入 `LET` 的值。
+    ///
+    /// 单值返回:查询方必须只请求一个字段;多字段顺序未取证时返回错误,
+    /// 由 VM 报 `Unimplemented` 并**不写** `LET`。
+    fn query(&mut self, command: &str, args: &[ArgValue]) -> Result<Value, Diag>;
 }

@@ -24,10 +24,13 @@ use crate::json::{self, FieldError, Fields, Json};
 /// - v1:2026-10-19 初版(边界①②)。
 /// - v2:2026-10-19 审查修订 —— header 补全启动配置(script_key/debug_mode/argv 摘要),
 ///   否则"用 header 重跑"无法闭合;`trace.length` 单列记录数不等。
-pub const SCHEMA_VERSION: u32 = 2;
+/// - v3:2026-10-20 producer-neutral —— header 增加 `producer`(kernel/official/
+///   采集器版本/样本 hash)与 `clock`(tick_at 的 now_ms 序列);③
+///   `frame/frame_description` 成为真实记录;④ `platform/platform_call` 继续拒绝。
+pub const SCHEMA_VERSION: u32 = 3;
 
-/// 子系统。③(`frame`)与 ④(`platform`)是 M3 的占位,本版本拒绝其记录。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// 子系统。③(`frame`)已实现;④(`platform`)仍为占位,本版本拒绝其记录。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Sub {
     Meta,
     Vfs,
@@ -62,7 +65,7 @@ impl Sub {
 }
 
 /// 记录种类。变体与 `sub` 的对应关系由 [`Kind::sub`] 固定,解析时强制校验。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
     Header,
     VfsOpen,
@@ -82,7 +85,7 @@ pub enum Kind {
     VmDomainCall,
     VmEnd,
     VmDiag,
-    /// ③ 帧描述(M3,未实现):本版本无法写出也无法解析。
+    /// ③ 帧描述:与 `yu-gfx` 的字段解耦,由调用方传入规范化 display JSON 或摘要。
     FrameDescription,
     /// ④ 平台命令(M3,未实现):本版本无法写出也无法解析。
     PlatformCall,
@@ -162,6 +165,374 @@ impl Kind {
             _ => None,
         }
     }
+}
+
+/// 记录生产者。跨 producer diff 只比较语义字段,不比较 producer 身份字符串。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProducerKind {
+    /// 本仓库内核(`yu-trace` 录制)。
+    Kernel,
+    /// 官方引擎(事件级或屏幕级采集器)。
+    Official,
+}
+
+impl ProducerKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ProducerKind::Kernel => "kernel",
+            ProducerKind::Official => "official",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "kernel" => Some(ProducerKind::Kernel),
+            "official" => Some(ProducerKind::Official),
+            _ => None,
+        }
+    }
+}
+
+/// header 中的 producer 元数据。
+///
+/// `version` 在 kernel 侧是内核版本,在 official 侧是**采集器版本**。
+/// `sample_sha256` 是两边必须能对齐的样本身份(官方数据包/脚本集合的摘要);
+/// 它不参与"内核版本/prose/表来源"的整行比较,但在两边都存在时参与
+/// producer-neutral 的 header 投影比较。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProducerInfo {
+    pub kind: ProducerKind,
+    pub name: String,
+    pub version: String,
+    pub sample_sha256: Option<String>,
+}
+
+impl ProducerInfo {
+    /// 内核 producer(`yu-trace` 版本)。
+    pub fn kernel() -> Self {
+        Self {
+            kind: ProducerKind::Kernel,
+            name: "yu-trace".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            sample_sha256: None,
+        }
+    }
+
+    /// 官方 producer(采集器名称/版本)。
+    pub fn official(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            kind: ProducerKind::Official,
+            name: name.into(),
+            version: version.into(),
+            sample_sha256: None,
+        }
+    }
+
+    /// 附加/覆盖样本摘要。
+    pub fn with_sample_sha256(mut self, sha256: impl Into<String>) -> Self {
+        self.sample_sha256 = Some(sha256.into());
+        self
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.name.is_empty() {
+            return Err("producer name must not be empty".to_string());
+        }
+        if self.version.is_empty() {
+            return Err("producer version must not be empty".to_string());
+        }
+        if let Some(hash) = &self.sample_sha256 {
+            validate_sha256(hash).map_err(|detail| format!("producer sample_sha256: {detail}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// 录制时钟模式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ClockMode {
+    /// 没有推进过任何 tick(只有启动链)。
+    None,
+    /// 只使用了 [`yu_rt::Vm::tick`](内部时钟)。
+    Tick,
+    /// 只使用了 `tick_at`(显式 now_ms)。
+    TickAt,
+    /// 两种混用:逐 tick 的 `now_ms` 列表用 `null` 表示内部时钟。
+    Mixed,
+}
+
+impl ClockMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ClockMode::None => "none",
+            ClockMode::Tick => "tick",
+            ClockMode::TickAt => "tick_at",
+            ClockMode::Mixed => "mixed",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "none" => Some(ClockMode::None),
+            "tick" => Some(ClockMode::Tick),
+            "tick_at" => Some(ClockMode::TickAt),
+            "mixed" => Some(ClockMode::Mixed),
+            _ => None,
+        }
+    }
+}
+
+/// `tick_at` 的 now_ms 序列(回放闭包)。
+///
+/// - `None` / `Tick`:不携带逐 tick 列表(`now_ms` 为空);
+/// - `TickAt`:`now_ms` 每项都是 `Some`;
+/// - `Mixed`:按调用顺序,`None` = 该次使用 `tick()`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClockSummary {
+    pub mode: ClockMode,
+    pub now_ms: Vec<Option<u32>>,
+}
+
+impl ClockSummary {
+    pub fn none() -> Self {
+        Self {
+            mode: ClockMode::None,
+            now_ms: Vec::new(),
+        }
+    }
+
+    /// 从逐 tick 的 `now_ms` 序列推导模式(空序列 = `none`)。
+    pub fn from_ticks(ticks: &[Option<u32>]) -> Self {
+        if ticks.is_empty() {
+            return Self::none();
+        }
+        let explicit = ticks.iter().filter(|tick| tick.is_some()).count();
+        if explicit == 0 {
+            Self {
+                mode: ClockMode::Tick,
+                now_ms: Vec::new(),
+            }
+        } else if explicit == ticks.len() {
+            Self {
+                mode: ClockMode::TickAt,
+                now_ms: ticks.to_vec(),
+            }
+        } else {
+            Self {
+                mode: ClockMode::Mixed,
+                now_ms: ticks.to_vec(),
+            }
+        }
+    }
+
+    /// 第 `index` 次 tick 的时钟:`Some(None)` = 内部时钟;`None` = 没有逐 tick 列表。
+    pub fn now_ms_at(&self, index: usize) -> Option<Option<u32>> {
+        self.now_ms.get(index).copied()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        match self.mode {
+            ClockMode::None | ClockMode::Tick => {
+                if !self.now_ms.is_empty() {
+                    return Err(format!(
+                        "clock mode `{}` must not carry a now_ms list",
+                        self.mode.as_str()
+                    ));
+                }
+            }
+            ClockMode::TickAt => {
+                if self.now_ms.is_empty() {
+                    return Err("clock mode `tick_at` requires a now_ms list".to_string());
+                }
+                if self.now_ms.iter().any(Option::is_none) {
+                    return Err("clock mode `tick_at` requires every now_ms to be an integer".to_string());
+                }
+            }
+            ClockMode::Mixed => {
+                if self.now_ms.is_empty() {
+                    return Err("clock mode `mixed` requires a now_ms list".to_string());
+                }
+                if !self.now_ms.iter().any(Option::is_none)
+                    || !self.now_ms.iter().any(Option::is_some)
+                {
+                    return Err(
+                        "clock mode `mixed` requires both implicit (null) and explicit now_ms"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 帧描述的等级。屏幕级记录只证明"画面像",不等价于事件级 L1。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FrameLevel {
+    /// 事件级:调用方从帧语义层规范化出的 display JSON。
+    Event,
+    /// 屏幕级:官方截图的摘要(无 display JSON)。
+    Screen,
+}
+
+impl FrameLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            FrameLevel::Event => "event",
+            FrameLevel::Screen => "screen",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "event" => Some(FrameLevel::Event),
+            "screen" => Some(FrameLevel::Screen),
+            _ => None,
+        }
+    }
+}
+
+/// 规范化后的完整 display JSON。
+///
+/// 本 crate **不硬绑** `yu-gfx` 的字段:调用方传入任意合法 JSON,本类型只负责
+/// 解析、规范序列化(键序/数组序保持调用方顺序,去掉空白)与内容寻址。
+/// 写出与读回使用同一规范文本,因此同一输入两次写入逐字节一致。
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameDisplay {
+    value: crate::json::Json,
+}
+
+impl FrameDisplay {
+    /// 从 UTF-8 JSON 字节构造(必须是单个 JSON 值)。
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, Diag> {
+        let text = std::str::from_utf8(bytes).map_err(|e| {
+            Diag::fatal(crate::error::code::PARSE, Boundary::Format)
+                .with_detail(format!("display JSON is not valid UTF-8: {e}"))
+        })?;
+        Self::from_json_text(text)
+    }
+
+    /// 从 JSON 文本构造。
+    pub fn from_json_text(text: &str) -> Result<Self, Diag> {
+        let value = json::parse(text).map_err(|detail| {
+            Diag::fatal(crate::error::code::PARSE, Boundary::Format)
+                .with_detail(format!("invalid display JSON: {detail}"))
+        })?;
+        Ok(Self { value })
+    }
+
+    /// 规范文本(无多余空白;对象键序与数组序保持调用方顺序)。
+    pub fn canonical(&self) -> String {
+        json::to_text(&self.value)
+    }
+
+    /// 规范文本的 SHA-256。
+    pub fn sha256(&self) -> String {
+        crate::hash::sha256_hex(self.canonical().as_bytes())
+    }
+
+    /// 解析后的 JSON 值(只读)。
+    pub(crate) fn as_json(&self) -> &crate::json::Json {
+        &self.value
+    }
+}
+
+/// ③ 帧描述记录的内容。
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameSummary {
+    pub frame: u64,
+    pub level: FrameLevel,
+    /// 规范化 display JSON 的 SHA-256;摘要级记录时由调用方提供。
+    pub display_sha256: String,
+    pub pass_count: u32,
+    pub op_count: u64,
+    pub executable_ops: u64,
+    pub skipped_ops: u64,
+    /// 完整 display JSON;摘要级记录为 `None`。
+    pub display: Option<FrameDisplay>,
+}
+
+/// 调用方(gfx/后端/官方采集器)交给 `yu-trace` 的帧描述输入。
+///
+/// `display` 是**规范化后的** frame JSON 字节;本 crate 会再次解析并规范
+/// 序列化(空白被去掉,键序/数组序保留)。`display_sha256` 可选:
+/// - 给了 `display`:不传则自动计算;传了则必须等于规范文本的摘要;
+/// - 没给 `display`:必须传 `display_sha256`(摘要级记录)。
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameDescriptionInput {
+    pub frame: u64,
+    pub level: FrameLevel,
+    pub pass_count: u32,
+    pub op_count: u64,
+    pub executable_ops: u64,
+    pub skipped_ops: u64,
+    pub display: Option<Vec<u8>>,
+    pub display_sha256: Option<String>,
+}
+
+impl FrameSummary {
+    /// 校验并构造帧描述。失败返回 `trace.parse` / `trace.schema`。
+    pub fn from_input(input: FrameDescriptionInput) -> Result<Self, Diag> {
+        let (display, display_sha256) = match (input.display, input.display_sha256) {
+            (Some(bytes), provided) => {
+                let display = FrameDisplay::from_json_bytes(&bytes)?;
+                let computed = display.sha256();
+                if let Some(provided) = provided {
+                    validate_sha256(&provided).map_err(|detail| {
+                        Diag::fatal(crate::error::code::PARSE, Boundary::Format)
+                            .with_detail(format!("display_sha256: {detail}"))
+                    })?;
+                    if provided != computed {
+                        return Err(Diag::fatal(
+                            crate::error::code::SCHEMA,
+                            Boundary::Format,
+                        )
+                        .with_detail(format!(
+                            "display_sha256 {provided} does not match canonical display JSON {computed}"
+                        )));
+                    }
+                }
+                (Some(display), computed)
+            }
+            (None, Some(hash)) => {
+                validate_sha256(&hash).map_err(|detail| {
+                    Diag::fatal(crate::error::code::PARSE, Boundary::Format)
+                        .with_detail(format!("display_sha256: {detail}"))
+                })?;
+                (None, hash)
+            }
+            (None, None) => {
+                return Err(Diag::fatal(
+                    crate::error::code::PARSE,
+                    Boundary::Format,
+                )
+                .with_detail(
+                    "frame description requires display JSON or display_sha256".to_string(),
+                ))
+            }
+        };
+        Ok(Self {
+            frame: input.frame,
+            level: input.level,
+            display_sha256,
+            pass_count: input.pass_count,
+            op_count: input.op_count,
+            executable_ops: input.executable_ops,
+            skipped_ops: input.skipped_ops,
+            display,
+        })
+    }
+}
+
+/// 64 位小写十六进制 SHA-256 的校验。
+fn validate_sha256(text: &str) -> Result<(), String> {
+    if text.len() != 64 {
+        return Err(format!("expected 64 lowercase hex digits, got {} chars", text.len()));
+    }
+    if !text.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        return Err(format!("expected 64 lowercase hex digits, got {text:?}"));
+    }
+    Ok(())
 }
 
 /// 一次 vfs 调用的结果身份。
@@ -334,12 +705,19 @@ pub struct InputSummary {
 }
 
 /// 头部载荷。`tables` 来自 [`yu_rt::Vm::table_provenance`],只含相对路径。
+///
+/// v3 起 `producer` 与 `clock` 是必填字段。跨 producer diff 只投影
+/// `codec` + `boot` + `input` + 双方都存在的 `producer.sample_sha256`;
+/// `kernel` / `tables` / producer 名称版本不参与语义对齐(见 `diff` 模块)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeaderPayload {
     pub codec: String,
+    pub producer: ProducerInfo,
     pub tables: Vec<String>,
     pub boot: BootSummary,
     pub input: InputSummary,
+    pub clock: ClockSummary,
+    /// 人类可读的内核标识;不参与跨 producer diff。
     pub kernel: String,
 }
 
@@ -460,6 +838,8 @@ pub enum Payload {
         code: String,
         detail: String,
     },
+    /// ③ 帧描述(`sub = "frame"`)。
+    FrameDescription(FrameSummary),
 }
 
 impl Payload {
@@ -485,6 +865,7 @@ impl Payload {
             } => Kind::VmDomainCall,
             Payload::VmEnd { .. } => Kind::VmEnd,
             Payload::VmDiag { .. } => Kind::VmDiag,
+            Payload::FrameDescription(_) => Kind::FrameDescription,
         }
     }
 }
@@ -519,7 +900,7 @@ impl Record {
         &self.payload
     }
 
-    fn to_json(&self) -> Json {
+    pub(crate) fn to_json(&self) -> Json {
         Json::Obj(vec![
             ("schema".to_string(), Json::UInt(SCHEMA_VERSION as u64)),
             ("seq".to_string(), Json::UInt(self.seq)),
@@ -576,11 +957,11 @@ impl Record {
         let kind_text = take_str(&mut fields, line, "kind")?.to_string();
         let kind = Kind::parse(&kind_text)
             .ok_or_else(|| error::schema(line, format!("unknown kind `{kind_text}`")))?;
-        if matches!(kind, Kind::FrameDescription | Kind::PlatformCall) {
+        if kind == Kind::PlatformCall {
             return Err(error::schema(
                 line,
                 format!(
-                    "kind `{}` is reserved for M3 and not defined by schema {SCHEMA_VERSION}",
+                    "kind `{}` is reserved for M3 platform backend and not defined by schema {SCHEMA_VERSION}",
                     kind.as_str()
                 ),
             ));
@@ -599,8 +980,9 @@ impl Record {
         if kind == Kind::Header && frame.is_some() {
             return Err(error::schema(line, "header record must have frame = null"));
         }
-        // 边界①(vfs)可发生在帧外 ⇒ frame = null;边界②(事件流)必属于某逻辑帧。
-        if kind.sub() == Sub::Vm && frame.is_none() {
+        // 边界①(vfs)可发生在帧外 ⇒ frame = null;边界②(事件流)与 ③(帧描述)
+        // 必属于某逻辑帧。
+        if matches!(kind.sub(), Sub::Vm | Sub::Frame) && frame.is_none() {
             return Err(error::schema(
                 line,
                 format!("kind `{}` requires a frame", kind.as_str()),
@@ -610,7 +992,7 @@ impl Record {
         let payload_value = fields
             .take("payload")
             .map_err(|e| field_error(line, e))?;
-        let payload = parse_payload(line, kind, payload_value)?;
+        let payload = parse_payload(line, kind, frame, payload_value)?;
         fields.finish().map_err(|e| field_error(line, e))?;
 
         Ok(Self {
@@ -692,6 +1074,18 @@ impl TraceLog {
 
     pub fn records(&self) -> &[Record] {
         &self.records
+    }
+
+    /// 推入一条帧描述;封套 `frame` 取自 `summary.frame`。
+    pub fn push_frame(&mut self, summary: FrameSummary) -> u64 {
+        let frame = Some(summary.frame);
+        self.push(frame, Payload::FrameDescription(summary))
+    }
+
+    /// 校验并推入调用方输入。
+    pub fn push_frame_input(&mut self, input: FrameDescriptionInput) -> Result<u64, Diag> {
+        let summary = FrameSummary::from_input(input)?;
+        Ok(self.push_frame(summary))
     }
 
     pub fn len(&self) -> usize {
@@ -882,10 +1276,15 @@ fn parse_trace_value(line: u64, value: &Json) -> Result<TraceValue, Diag> {
     Ok(parsed)
 }
 
-fn parse_payload(line: u64, kind: Kind, value: &Json) -> Result<Payload, Diag> {
+fn parse_payload(line: u64, kind: Kind, frame: Option<u64>, value: &Json) -> Result<Payload, Diag> {
     let obj = json::as_obj(value).map_err(|detail| error::parse(line, detail))?;
     if kind == Kind::Header {
         return Ok(Payload::Header(parse_header(line, obj)?));
+    }
+    if kind == Kind::FrameDescription {
+        return Ok(Payload::FrameDescription(parse_frame_description(
+            line, frame, obj,
+        )?));
     }
     let mut fields = Fields::new(obj);
     let payload = match kind {
@@ -1118,13 +1517,14 @@ fn parse_payload(line: u64, kind: Kind, value: &Json) -> Result<Payload, Diag> {
             let detail = take_str(&mut fields, line, "detail")?.to_string();
             Payload::VmDiag { code, detail }
         }
-        Kind::FrameDescription | Kind::PlatformCall => {
+        Kind::FrameDescription => {
+            // 上方已提前返回;此处保留显式分支,不给 match 留通配兜底。
+            unreachable!("frame_description payload is parsed before field cursor setup")
+        }
+        Kind::PlatformCall => {
             return Err(error::schema(
                 line,
-                format!(
-                    "kind `{}` is reserved for M3",
-                    kind.as_str()
-                ),
+                format!("kind `{}` is reserved for M3 platform backend", kind.as_str()),
             ))
         }
     };
@@ -1143,6 +1543,72 @@ fn parse_payload(line: u64, kind: Kind, value: &Json) -> Result<Payload, Diag> {
     Ok(payload)
 }
 
+fn parse_frame_description(
+    line: u64,
+    envelope_frame: Option<u64>,
+    obj: &[(String, Json)],
+) -> Result<FrameSummary, Diag> {
+    let mut fields = Fields::new(obj);
+    let frame = take_u64(&mut fields, line, "frame")?;
+    match envelope_frame {
+        Some(envelope) if envelope == frame => {}
+        Some(envelope) => {
+            return Err(error::schema(
+                line,
+                format!("payload frame {frame} does not match envelope frame {envelope}"),
+            ))
+        }
+        None => {
+            return Err(error::schema(
+                line,
+                "frame_description requires an integer envelope frame",
+            ))
+        }
+    }
+    let level_text = take_str(&mut fields, line, "level")?.to_string();
+    let level = FrameLevel::parse(&level_text).ok_or_else(|| {
+        error::schema(line, format!("unknown frame level `{level_text}`"))
+    })?;
+    let display_sha256 = take_str(&mut fields, line, "display_sha256")?.to_string();
+    validate_sha256(&display_sha256).map_err(|detail| error::parse(line, detail))?;
+    let pass_count = take_u32(&mut fields, line, "pass_count")?;
+    let op_count = take_u64(&mut fields, line, "op_count")?;
+    let executable_ops = take_u64(&mut fields, line, "executable_ops")?;
+    let skipped_ops = take_u64(&mut fields, line, "skipped_ops")?;
+    let display_value = fields
+        .take("display")
+        .map_err(|e| field_error(line, e))?;
+    let display = match display_value {
+        Json::Null => None,
+        other => {
+            let canonical = json::to_text(other);
+            let computed = crate::hash::sha256_hex(canonical.as_bytes());
+            if computed != display_sha256 {
+                return Err(error::schema(
+                    line,
+                    format!(
+                        "display_sha256 {display_sha256} does not match canonical display JSON {computed}"
+                    ),
+                ));
+            }
+            Some(FrameDisplay {
+                value: other.clone(),
+            })
+        }
+    };
+    fields.finish().map_err(|e| field_error(line, e))?;
+    Ok(FrameSummary {
+        frame,
+        level,
+        display_sha256,
+        pass_count,
+        op_count,
+        executable_ops,
+        skipped_ops,
+        display,
+    })
+}
+
 fn take_opt_code(fields: &mut Fields<'_>, line: u64, key: &str) -> Result<Option<String>, Diag> {
     match fields.take(key).map_err(|e| field_error(line, e))? {
         Json::Null => Ok(None),
@@ -1157,6 +1623,8 @@ fn take_opt_code(fields: &mut Fields<'_>, line: u64, key: &str) -> Result<Option
 fn parse_header(line: u64, obj: &[(String, Json)]) -> Result<HeaderPayload, Diag> {
     let mut fields = Fields::new(obj);
     let codec = take_str(&mut fields, line, "codec")?.to_string();
+    let producer_value = fields.take("producer").map_err(|e| field_error(line, e))?;
+    let producer = parse_producer(line, producer_value)?;
     let tables_value = fields
         .take("tables")
         .map_err(|e| field_error(line, e))?;
@@ -1217,11 +1685,15 @@ fn parse_header(line: u64, obj: &[(String, Json)]) -> Result<HeaderPayload, Diag
     let sha256 = take_str(&mut input_fields, line, "sha256")?.to_string();
     input_fields.finish().map_err(|e| field_error(line, e))?;
 
+    let clock_value = fields.take("clock").map_err(|e| field_error(line, e))?;
+    let clock = parse_clock(line, clock_value)?;
+
     let kernel = take_str(&mut fields, line, "kernel")?.to_string();
     fields.finish().map_err(|e| field_error(line, e))?;
 
     Ok(HeaderPayload {
         codec,
+        producer,
         tables,
         boot: BootSummary {
             entry,
@@ -1242,8 +1714,69 @@ fn parse_header(line: u64, obj: &[(String, Json)]) -> Result<HeaderPayload, Diag
             },
         },
         input: InputSummary { events, sha256 },
+        clock,
         kernel,
     })
+}
+
+fn parse_producer(line: u64, value: &Json) -> Result<ProducerInfo, Diag> {
+    let obj = json::as_obj(value).map_err(|detail| error::parse(line, detail))?;
+    let mut fields = Fields::new(obj);
+    let kind_text = take_str(&mut fields, line, "kind")?.to_string();
+    let kind = ProducerKind::parse(&kind_text)
+        .ok_or_else(|| error::schema(line, format!("unknown producer kind `{kind_text}`")))?;
+    let name = take_str(&mut fields, line, "name")?.to_string();
+    let version = take_str(&mut fields, line, "version")?.to_string();
+    let sample_sha256 = match fields
+        .take("sample_sha256")
+        .map_err(|e| field_error(line, e))?
+    {
+        Json::Null => None,
+        other => {
+            let hash = json::as_str(other)
+                .map_err(|detail| error::parse(line, detail))?
+                .to_string();
+            validate_sha256(&hash).map_err(|detail| error::parse(line, detail))?;
+            Some(hash)
+        }
+    };
+    fields.finish().map_err(|e| field_error(line, e))?;
+    let producer = ProducerInfo {
+        kind,
+        name,
+        version,
+        sample_sha256,
+    };
+    producer
+        .validate()
+        .map_err(|detail| error::parse(line, detail))?;
+    Ok(producer)
+}
+
+fn parse_clock(line: u64, value: &Json) -> Result<ClockSummary, Diag> {
+    let obj = json::as_obj(value).map_err(|detail| error::parse(line, detail))?;
+    let mut fields = Fields::new(obj);
+    let mode_text = take_str(&mut fields, line, "mode")?.to_string();
+    let mode = ClockMode::parse(&mode_text)
+        .ok_or_else(|| error::schema(line, format!("unknown clock mode `{mode_text}`")))?;
+    let items_value = fields.take("now_ms").map_err(|e| field_error(line, e))?;
+    let items = json::as_arr(items_value).map_err(|detail| error::parse(line, detail))?;
+    let mut now_ms = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Json::Null => now_ms.push(None),
+            other => {
+                let n = json::as_u64(other).map_err(|detail| error::parse(line, detail))?;
+                let n = u32::try_from(n)
+                    .map_err(|_| error::parse(line, format!("now_ms out of u32 range: {n}")))?;
+                now_ms.push(Some(n));
+            }
+        }
+    }
+    fields.finish().map_err(|e| field_error(line, e))?;
+    let clock = ClockSummary { mode, now_ms };
+    clock.validate().map_err(|detail| error::schema(line, detail))?;
+    Ok(clock)
 }
 
 /// 4 字节密钥 → 8 位小写十六进制(字节序即数组顺序)。
@@ -1278,10 +1811,34 @@ fn is_known_domain(text: &str) -> bool {
     crate::event::DOMAIN_NAMES.contains(&text)
 }
 
-fn payload_to_json(payload: &Payload) -> Json {
+pub(crate) fn payload_to_json(payload: &Payload) -> Json {
     match payload {
         Payload::Header(header) => Json::Obj(vec![
             ("codec".to_string(), Json::Str(header.codec.clone())),
+            (
+                "producer".to_string(),
+                Json::Obj(vec![
+                    (
+                        "kind".to_string(),
+                        Json::Str(header.producer.kind.as_str().to_string()),
+                    ),
+                    (
+                        "name".to_string(),
+                        Json::Str(header.producer.name.clone()),
+                    ),
+                    (
+                        "version".to_string(),
+                        Json::Str(header.producer.version.clone()),
+                    ),
+                    (
+                        "sample_sha256".to_string(),
+                        match &header.producer.sample_sha256 {
+                            Some(hash) => Json::Str(hash.clone()),
+                            None => Json::Null,
+                        },
+                    ),
+                ]),
+            ),
             (
                 "tables".to_string(),
                 Json::Arr(
@@ -1366,6 +1923,29 @@ fn payload_to_json(payload: &Payload) -> Json {
                     (
                         "sha256".to_string(),
                         Json::Str(header.input.sha256.clone()),
+                    ),
+                ]),
+            ),
+            (
+                "clock".to_string(),
+                Json::Obj(vec![
+                    (
+                        "mode".to_string(),
+                        Json::Str(header.clock.mode.as_str().to_string()),
+                    ),
+                    (
+                        "now_ms".to_string(),
+                        Json::Arr(
+                            header
+                                .clock
+                                .now_ms
+                                .iter()
+                                .map(|value| match value {
+                                    Some(now) => Json::UInt(*now as u64),
+                                    None => Json::Null,
+                                })
+                                .collect(),
+                        ),
                     ),
                 ]),
             ),
@@ -1544,6 +2124,34 @@ fn payload_to_json(payload: &Payload) -> Json {
             ("code".to_string(), Json::Str(code.clone())),
             ("detail".to_string(), Json::Str(detail.clone())),
         ]),
+        Payload::FrameDescription(summary) => Json::Obj(vec![
+            ("frame".to_string(), Json::UInt(summary.frame)),
+            (
+                "level".to_string(),
+                Json::Str(summary.level.as_str().to_string()),
+            ),
+            (
+                "display_sha256".to_string(),
+                Json::Str(summary.display_sha256.clone()),
+            ),
+            (
+                "pass_count".to_string(),
+                Json::UInt(summary.pass_count as u64),
+            ),
+            ("op_count".to_string(), Json::UInt(summary.op_count)),
+            (
+                "executable_ops".to_string(),
+                Json::UInt(summary.executable_ops),
+            ),
+            ("skipped_ops".to_string(), Json::UInt(summary.skipped_ops)),
+            (
+                "display".to_string(),
+                match &summary.display {
+                    Some(display) => display.as_json().clone(),
+                    None => Json::Null,
+                },
+            ),
+        ]),
     }
 }
 
@@ -1603,12 +2211,14 @@ mod tests {
     fn header() -> HeaderPayload {
         HeaderPayload {
             codec: "cp932".to_string(),
+            producer: ProducerInfo::kernel(),
             tables: vec!["ysc: v495 (105 命令)".to_string()],
             boot: BootSummary::from_config(&yu_rt::BootConfig::default()),
             input: InputSummary {
                 events: 0,
                 sha256: "0".repeat(64),
             },
+            clock: ClockSummary::none(),
             kernel: "yu-trace 0.1.0".to_string(),
         }
     }
@@ -1699,10 +2309,171 @@ mod tests {
     }
 
     #[test]
-    fn reserved_kinds_are_refused() {
-        let text = "{\"schema\":2,\"seq\":0,\"frame\":null,\"sub\":\"frame\",\"kind\":\"frame_description\",\"payload\":{}}\n";
-        let err = TraceLog::parse(text).unwrap_err();
+    fn platform_kind_is_refused_but_frame_is_defined() {
+        let platform = format!(
+            "{{\"schema\":{SCHEMA_VERSION},\"seq\":0,\"frame\":null,\"sub\":\"platform\",\"kind\":\"platform_call\",\"payload\":{{}}}}\n"
+        );
+        let err = TraceLog::parse(&platform).unwrap_err();
         assert_eq!(err.code, crate::error::code::SCHEMA);
+
+        // ③ 不再是保留 kind:合法的 frame_description 必须能被解析。
+        let mut log = TraceLog::new();
+        log.push_header(header());
+        log.push_frame(
+            FrameSummary::from_input(FrameDescriptionInput {
+                frame: 7,
+                level: FrameLevel::Event,
+                pass_count: 1,
+                op_count: 3,
+                executable_ops: 2,
+                skipped_ops: 1,
+                display: Some(br#"{"ops":[1,2,3]}"#.to_vec()),
+                display_sha256: None,
+            })
+            .unwrap(),
+        );
+        let text = log.to_jsonl();
+        let parsed = TraceLog::parse(&text).unwrap();
+        assert_eq!(parsed.to_jsonl(), text);
+    }
+
+    fn frame_input(display: Option<&[u8]>, hash: Option<&str>) -> FrameDescriptionInput {
+        FrameDescriptionInput {
+            frame: 7,
+            level: FrameLevel::Event,
+            pass_count: 1,
+            op_count: 10,
+            executable_ops: 9,
+            skipped_ops: 1,
+            display: display.map(|bytes| bytes.to_vec()),
+            display_sha256: hash.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn frame_description_roundtrip_and_determinism() {
+        let summary = FrameSummary::from_input(frame_input(
+            Some(br#"{"b":2, "a":[true,null,"x"]}"#),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            summary.display.as_ref().unwrap().canonical(),
+            r#"{"b":2,"a":[true,null,"x"]}"#
+        );
+        let hash = summary.display_sha256.clone();
+        assert_eq!(hash.len(), 64);
+
+        let mut first = TraceLog::new();
+        first.push_header(header());
+        first.push_frame(summary.clone());
+        let mut second = TraceLog::new();
+        second.push_header(header());
+        second.push_frame(summary);
+        // 同一帧写入两次(两本日志)逐字节一致。
+        assert_eq!(first.to_jsonl(), second.to_jsonl());
+
+        let text = first.to_jsonl();
+        let parsed = TraceLog::parse(&text).unwrap();
+        assert_eq!(parsed.to_jsonl(), text);
+        match parsed.records()[1].payload() {
+            Payload::FrameDescription(summary) => {
+                assert_eq!(summary.frame, 7);
+                assert_eq!(summary.display_sha256, hash);
+                assert_eq!(summary.skipped_ops, 1);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_description_requires_digest_and_rejects_bad_hash() {
+        let err = FrameSummary::from_input(frame_input(None, None)).unwrap_err();
+        assert_eq!(err.code, crate::error::code::PARSE);
+
+        let err = FrameSummary::from_input(frame_input(None, Some("ABC"))).unwrap_err();
+        assert_eq!(err.code, crate::error::code::PARSE);
+
+        // 摘要与 display 内容不一致:显式拒绝,不做"取其一"的猜测。
+        let err = FrameSummary::from_input(frame_input(
+            Some(br#"{"a":1}"#),
+            Some(&"0".repeat(64)),
+        ))
+        .unwrap_err();
+        assert_eq!(err.code, crate::error::code::SCHEMA);
+
+        // 摘要级记录(无 display)是合法的。
+        let summary = FrameSummary::from_input(frame_input(None, Some(&"a".repeat(64)))).unwrap();
+        assert!(summary.display.is_none());
+    }
+
+    #[test]
+    fn frame_description_envelope_and_field_validation() {
+        let summary = FrameSummary::from_input(frame_input(Some(b"{}"), None)).unwrap();
+        let mut log = TraceLog::new();
+        log.push_header(header());
+        log.push_frame(summary);
+        let text = log.to_jsonl();
+
+        // 封套 frame 与 payload frame 必须一致。
+        let mismatch = text.replacen("\"frame\":7,\"sub\":\"frame\"", "\"frame\":8,\"sub\":\"frame\"", 1);
+        let err = TraceLog::parse(&mismatch).unwrap_err();
+        assert_eq!(err.code, crate::error::code::SCHEMA);
+
+        // 缺 display 字段 = parse;未知字段 = schema。
+        let missing = text.replace(",\"display\":{}", "");
+        let err = TraceLog::parse(&missing).unwrap_err();
+        assert_eq!(err.code, crate::error::code::PARSE);
+        let unknown = text.replacen("\"display\":{}", "\"display\":{},\"extra\":1", 1);
+        let err = TraceLog::parse(&unknown).unwrap_err();
+        assert_eq!(err.code, crate::error::code::SCHEMA);
+
+        // 篡改 display 内容但保留旧摘要 = schema(内容寻址失败)。
+        let tampered = text.replacen("\"display\":{}", "\"display\":{\"x\":1}", 1);
+        let err = TraceLog::parse(&tampered).unwrap_err();
+        assert_eq!(err.code, crate::error::code::SCHEMA);
+    }
+
+    #[test]
+    fn header_clock_roundtrip_and_validation() {
+        let mut log = TraceLog::new();
+        let mut h = header();
+        h.clock = ClockSummary::from_ticks(&[Some(0), None, Some(32)]);
+        assert_eq!(h.clock.mode, ClockMode::Mixed);
+        log.push_header(h);
+        let text = log.to_jsonl();
+        let parsed = TraceLog::parse(&text).unwrap();
+        assert_eq!(parsed.to_jsonl(), text);
+        assert_eq!(parsed.header().unwrap().clock.mode, ClockMode::Mixed);
+
+        // 非法的 mode/list 组合必须显式拒绝。
+        for (mode, now_ms) in [
+            ("tick_at", vec![]),
+            ("tick", vec![Some(1)]),
+            ("none", vec![None]),
+            ("mixed", vec![Some(1), Some(2)]),
+        ] {
+            let clock = ClockSummary {
+                mode: ClockMode::parse(mode).unwrap(),
+                now_ms,
+            };
+            let invalid = HeaderPayload {
+                clock,
+                ..parsed.header().unwrap().clone()
+            };
+            let line = Record {
+                seq: 0,
+                frame: None,
+                kind: Kind::Header,
+                payload: Payload::Header(invalid),
+            };
+            let err = TraceLog::parse(&format!("{}\n", line.to_line())).unwrap_err();
+            assert_eq!(
+                err.code,
+                crate::error::code::SCHEMA,
+                "clock mode {mode} with invalid list must be schema"
+            );
+        }
     }
 
     #[test]

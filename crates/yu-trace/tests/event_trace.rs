@@ -342,11 +342,16 @@ fn header_replays_to_a_byte_identical_trace() {
     assert_eq!(header.boot.script_key, yu_rt::tables::DEFAULT_SCRIPT_KEY);
     assert!(!header.boot.debug_mode);
     assert_eq!(header.boot.argv_len, 0);
+    // 两次 `tick_at` 的 now_ms 序列必须进入 header。
+    assert_eq!(header.clock.mode, yu_trace::ClockMode::TickAt);
+    assert_eq!(header.clock.now_ms, vec![Some(0), Some(16)]);
 
     let timeline = timeline();
-    let mut replayed = VmTrace::from_header(
+    let mut replayed = VmTrace::from_header_checked(
         &header,
         Box::new(project().build()),
+        Codec::Cp932,
+        None,
         None,
         Vec::new(),
         yu_rt::vm::HostPaths::default(),
@@ -354,6 +359,12 @@ fn header_replays_to_a_byte_identical_trace() {
     .expect("boot from header");
     replayed.tick_at(0, &timeline);
     replayed.tick_at(16, &timeline);
+    // 回放时钟序列必须与 header 一致。
+    assert_eq!(
+        yu_trace::verify_clock(&header, replayed.clock()),
+        Ok(()),
+        "replay clock must match header"
+    );
     let replayed = replayed.finish_with_timeline(&timeline);
 
     assert_eq!(
@@ -413,4 +424,46 @@ fn input_summary_window_matches_consumed_frames() {
         yu_trace::input_summary(&late, 2).sha256,
         yu_trace::input_summary(&other, 2).sha256
     );
+}
+
+#[test]
+fn replay_rejects_clock_mismatch_and_source_codec_mismatch() {
+    let recorded = record_two_frames();
+    let header = recorded.header().expect("header").clone();
+
+    // 时钟序列不同(用 tick 而不是 tick_at)⇒ trace.replay。
+    let err = yu_trace::verify_clock(&header, &[None, None]).expect_err("clock must differ");
+    assert_eq!(err.code, yu_trace::code::REPLAY);
+    let err = yu_trace::verify_clock(&header, &[Some(0), Some(17)]).expect_err("clock must differ");
+    assert_eq!(err.code, yu_trace::code::REPLAY);
+
+    // 数据源编码与 header.codec 不一致 ⇒ trace.replay。
+    let err = VmTrace::from_header_checked(
+        &header,
+        Box::new(project().build()),
+        Codec::Gbk,
+        None,
+        None,
+        Vec::new(),
+        yu_rt::vm::HostPaths::default(),
+    )
+    .err()
+    .expect("codec mismatch must fail");
+    assert_eq!(err.code, yu_trace::code::REPLAY);
+}
+
+#[test]
+fn mixed_clock_modes_are_recorded_per_tick() {
+    let timeline = timeline();
+    let mut trace =
+        VmTrace::boot(Box::new(project().build()), config(), Codec::Cp932).expect("boot");
+    trace.tick(&timeline);
+    trace.tick_at(64, &timeline);
+    assert_eq!(trace.clock(), &[None, Some(64)]);
+    let log = trace.finish_with_timeline(&timeline);
+    let header = log.header().expect("header");
+    assert_eq!(header.clock.mode, yu_trace::ClockMode::Mixed);
+    assert_eq!(header.clock.now_ms, vec![None, Some(64)]);
+    let text = log.to_jsonl();
+    assert_eq!(TraceLog::parse(&text).unwrap().to_jsonl(), text);
 }
