@@ -1762,3 +1762,84 @@ fn task_without_tint_does_not_inherit_caller_registers() {
         "B 未传 TINT ⇒ 读 0(不是继承 A 的 7)"
     );
 }
+
+// ---------------------------------------------------------------- 回归:初值与调用层栈
+
+/// YSVR 字符串初值是 YSTB 字面量形态(`M` + u16 + 引号串),
+/// 必须在装载时解码;否则 `$es.STARTLABEL` 会带着 `M\x10\x00"` 前缀。
+#[test]
+fn ysvr_string_initial_value_is_decoded() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 1,
+        script_id: 0,
+        var_id: sys,
+        value_type: 3,
+        dims: vec![],
+        init: Init::Str(&b"M\x10\x00\"SCENARIO_START\""[..]),
+    }];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![GroupSpec::new(OP_END)]];
+
+    let vm = boot(b);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::Dollar, sys), &[])
+            .unwrap(),
+        Value::Str(b"SCENARIO_START".to_vec()),
+        "字符串初值必须去掉 YSTB 字面量封装"
+    );
+}
+
+/// 被调层未闭合的 `LOOP` 不能泄漏到调用方。
+///
+/// 引擎 RETURN 处理器 `0x44b418` 用帧里记录的深度 truncate IF/循环栈
+/// (旧线逆向成果 51.5);否则调用方 `LOOPEND` 会弹出被调层的帧,
+/// 跳到被调脚本的 `body_pc`(跨脚本越界)。
+#[test]
+fn callee_loop_frame_does_not_leak_into_caller() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(0),
+    }];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("SUB", 10, 1, 0)];
+    b.entry(0, 0);
+
+    let let_zero = || {
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, sys))
+            .window(0, ex::i8_(0))
+    };
+    // 调用方(脚本 0,共 6 组):LOOP → GOSUB → 两条 LET → LOOPEND → END。
+    let caller = vec![
+        GroupSpec::new(OP_LOOP).window(0, ex::i8_(1)).jump(4),
+        GroupSpec::new(OP_GOSUB).window(0, ex::s("SUB")),
+        let_zero(),
+        let_zero(),
+        GroupSpec::new(OP_LOOPEND),
+        GroupSpec::new(OP_END),
+    ];
+    // 被调方(脚本 1):填充 10 组后 **无限 LOOP** → RETURN(循环未闭合)
+    // → LOOPEND → END。无限循环才能让调用方 LOOPEND 走到回跳分支。
+    let mut callee: Vec<GroupSpec> = (0..10).map(|_| let_zero()).collect();
+    callee.push(GroupSpec::new(OP_LOOP).window(0, Vec::new()).jump(12));
+    callee.push(GroupSpec::new(OP_RETURN));
+    callee.push(GroupSpec::new(OP_LOOPEND));
+    callee.push(GroupSpec::new(OP_END));
+    b.scripts = vec![caller, callee];
+
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(report.main_finished, "调用方应正常结束");
+}

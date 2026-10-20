@@ -155,6 +155,16 @@ pub struct GosubFrame {
     /// `RETURN` 填回的 `RINT/RFLT/RSTR`。
     pub ret: [Option<Value>; 16],
     pub ret_flags: [bool; 16],
+    /// `GOSUB` 进入时的块/循环栈深度;`RETURN` 截断回该深度。
+    ///
+    /// 证据:引擎 RETURN 处理器 `0x44b418` 用帧里记录的深度 truncate
+    /// IF/循环栈(旧线逆向成果 51.5);块结构按调用层独立,被调脚本里
+    /// 未闭合的 `IF`/`LOOP` 不得留在栈上被调用方的 `IFEND`/`LOOPEND`
+    /// 弹出。ERIS 启动链实测:被调脚本遗留的 `LOOP` 帧让调用方
+    /// `LOOPEND` 跳到被调脚本的 `body_pc`(953),而调用方脚本只有 554 组
+    /// ⇒ 主任务 Fatal。
+    pub if_depth: usize,
+    pub loop_depth: usize,
 }
 
 impl GosubFrame {

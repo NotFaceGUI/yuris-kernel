@@ -322,6 +322,9 @@ impl Vm {
             )
             .into());
         }
+        // 块/循环栈按调用层隔离:RETURN 时截断回进入前的深度。
+        frame.if_depth = st.if_stack.len();
+        frame.loop_depth = st.loops.len();
         st.frames.push(frame);
         let from_pc = cmd.pc;
         self.jump_to(st, label.script_id as u32, label.pc, label.base_a, JumpKind::Gosub, from_pc)?;
@@ -350,6 +353,9 @@ impl Vm {
             flags[idx - 1] = true;
         }
         let frame = st.frames.pop().expect("帧数 > 1");
+        // 被调层未闭合的 IF/LOOP 不得泄漏给调用方(块结构按调用层独立)。
+        st.if_stack.truncate(frame.if_depth);
+        st.loops.truncate(frame.loop_depth);
         // 返回值写进**调用方**那一层(弹出后 `last_mut()`)。
         if let Some(caller) = st.frames.last_mut() {
             caller.ret = ret;

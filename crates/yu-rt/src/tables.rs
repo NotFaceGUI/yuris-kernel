@@ -359,10 +359,31 @@ impl VarRecord {
         match &self.init {
             VarInit::Int(v) => Some(crate::value::Value::Int(*v)),
             VarInit::Float(v) => Some(crate::value::Value::Float(*v)),
-            VarInit::Str(v) => Some(crate::value::Value::Str(v.clone())),
+            VarInit::Str(v) => Some(crate::value::Value::Str(decode_str_init(v))),
             VarInit::None => None,
         }
     }
+}
+
+/// `YSVR` 字符串初值 → 运行值。
+///
+/// 格式层按契约保留原始字节(`yu-format/src/ysvr.rs`:解释归运行核);其形态是
+/// **一条 YSTB 表达式指令**:`0x4d('M') + u16 长度 + "文本"`。这里直接复用
+/// 表达式层的字面量解码,统一处理引号、`\\`/`\n`/`\t` 转义与 CP932 前导字节,
+/// 避免在表投影层另写一套不完整的字符串解析。
+///
+/// 非该形态(或损坏)的记录原样返回:YSVR 只有这一种已取证形态,其余不猜测。
+fn decode_str_init(raw: &[u8]) -> Vec<u8> {
+    let Ok(instrs) = crate::expr::decode(raw) else {
+        return raw.to_vec();
+    };
+    let [ins] = instrs.as_slice() else {
+        return raw.to_vec();
+    };
+    if ins.op != 0x4d {
+        return raw.to_vec();
+    }
+    crate::expr::decode_string_literal(&ins.payload).unwrap_or_else(|_| raw.to_vec())
 }
 
 // ---------------------------------------------------------------- YSTL
@@ -835,5 +856,28 @@ mod tests {
         assert_eq!(sf.window_payload(&w), Some(payload.as_slice()));
         assert_eq!(sf.part4(), line_no.as_slice());
         assert_eq!(sf.source_position(0), Some(9));
+    }
+
+    /// 真实形态:`M` + u16 长度(含引号)+ 引号串。
+    #[test]
+    fn ysvr_string_init_decodes_ystb_literal() {
+        assert_eq!(decode_str_init(b"M\x10\x00\"SCENARIO_START\""), b"SCENARIO_START");
+        assert_eq!(decode_str_init(b"M\x13\x00\"es.ScenarioScript\""), b"es.ScenarioScript");
+        // 空串:`M` + len=2 + `""`
+        assert_eq!(decode_str_init(b"M\x02\x00\"\""), b"");
+    }
+
+    /// 字面量转义走表达式层同一套规则(`\n` / `\\` / `\t`)。
+    #[test]
+    fn ysvr_string_init_keeps_escapes() {
+        assert_eq!(decode_str_init(b"M\x06\x00\"a\\nb\""), b"a\nb");
+        assert_eq!(decode_str_init(b"M\x06\x00\"a\\\\b\""), b"a\\b");
+    }
+
+    /// 非 YSTB 字面量形态:原样保留,不猜测。
+    #[test]
+    fn ysvr_string_init_non_literal_is_verbatim() {
+        assert_eq!(decode_str_init(b"plain"), b"plain");
+        assert_eq!(decode_str_init(b"M\x00\x00"), b"M\x00\x00");
     }
 }
