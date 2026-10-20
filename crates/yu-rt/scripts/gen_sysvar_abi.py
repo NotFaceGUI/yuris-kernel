@@ -13,9 +13,11 @@
     逐项校验 (kind=1、type、dims)。任一项不符 ⇒ `table.version` 拒绝启动。
     这条校验把"表是引擎 ABI"从说法变成可复核的事实。
 
-用法:
+用法(每个已知 ABI 族各生成一份):
   python crates/yu-rt/scripts/gen_sysvar_abi.py <YSCom.ycd> \
-      > crates/yu-rt/data/sysvar-abi-0495.tsv
+      > crates/yu-rt/data/sysvar-abi-0495.tsv   # 0.495
+  # 同法生成 sysvar-abi-0479/0466/0292.tsv(0.479/0.466/0.292 SDK 的 ycd)。
+  运行核按游戏 ysv 指纹选族,不看版本号(见 sysvar_abi.rs 模块文档)。
 """
 import hashlib
 import os

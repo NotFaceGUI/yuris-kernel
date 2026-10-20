@@ -1413,3 +1413,32 @@ $ cargo clippy -p yu-rt -p yu-format --all-targets
   按**族**覆盖(四份 SDK 恰是四个族:Beta3 / ≤0.469 / 0.470–0.479 /
   ≥0.480),游戏用自身 ysv 指纹选族;指纹不匹配 = 未知构建,拒绝启动后
   再针对该构建取 ABI(自带 ycd 或逆向其 exe),不做版本号对齐。
+
+### E3 附:系统变量 ABI 指纹选族(2026-10-20,主人指示"加入指纹实现")
+
+- 新增三份官方 ABI 数据表(由 `scripts/gen_sysvar_abi.py` 从官方 SDK 的
+  `YSCom.ycd` 生成,带来源版本/SHA-256):
+  `data/sysvar-abi-0292.tsv`(482)、`sysvar-abi-0466.tsv`(513)、
+  `sysvar-abi-0479.tsv`(526);原 `sysvar-abi-0495.tsv`(548)经同一脚本
+  复现校验(仅首行注释差异)。
+- `sysvar_abi.rs`:`known_profiles()` 四族(选择顺序新→旧)+
+  `select_for(&VarImage)`——**按游戏自带 `ysv.ybn` 指纹**(var_id<表长 的
+  kind=1 镜像恰好覆盖 0..表长,且 type/dims 逐项相等)选族,不看版本号;
+  全不匹配 ⇒ `table.version` Fatal 并逐族列出失配原因(未知构建拒绝启动)。
+  `builtin_abi()` 保留为 0495 兼容入口。
+- `tables.rs`:无 ycd 时的路径由"内置 0495"改为"指纹选族";ycd 路径不变。
+  `vm.rs` 兜底日志改为报告所选族(如 `engine ABI profile sysvar-abi-0495.tsv`),
+  仍为 sink-only(不进事件流)。
+- 测试:`fingerprint_selects_each_known_family`(四族指纹各自选中,长度
+  548/526/513/482)、`fingerprint_rejects_unknown_and_lists_reasons`
+  (改一个维数 ⇒ 四族全拒、错误含族名)、`trailing_extra_records_keep_newest_family`
+  (v555 形态:548 前缀 + 尾部追加 ⇒ 归 0495 族,Likely);
+  真实数据:`fallback_abi_logs_notice_on_real_data` 断言 ERIS 选中
+  `sysvar-abi-0495.tsv` 且日志含族名。
+- 测试基建:散盘语料被移到 `project-eris/save/data` 后,三个测试文件的
+  "工程根 = ysbin 上两级"假设失效 → 改为**向上查找**
+  `system/YSCom/YSCom.ycd`(`find_project_root`,最多 4 层)。
+- 验证:corpus E2E 与上一轮**逐字节一致**
+  (`frames=[1290326, 274466, 3315, 1302412, 15340, 15320, 15331, 15320]`,
+  total 2,931,830, loose/packed 哈希 `18a94a71…`);全工作区套件见
+  `target/abi-workspace.log`;clippy 无新增。

@@ -38,6 +38,21 @@ fn corpus_dir(name: &str, skips: &mut Skips) -> PathBuf {
     }
 }
 
+/// 工程根 = 向上最近一个含 `system/YSCom/YSCom.ycd` 的祖先目录。
+///
+/// 语料目录可能被整体挪动(如 `save/data/ysbin`),不能假设固定层级。
+fn find_project_root(dir: &std::path::Path) -> Option<PathBuf> {
+    let mut cur = dir.parent();
+    for _ in 0..4 {
+        let d = cur?;
+        if d.join("system/YSCom/YSCom.ycd").is_file() {
+            return Some(d.to_path_buf());
+        }
+        cur = d.parent();
+    }
+    None
+}
+
 fn read(dir: &std::path::Path, name: &str) -> Vec<u8> {
     std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("读 {name} 失败: {e}"))
 }
@@ -280,12 +295,9 @@ fn tableset_matches_direct_decoding() {
     let Some(data_root) = dir.parent().map(PathBuf::from) else {
         skips.skip("tableset", "ysbin 无上级目录");
     };
-    let Some(project_root) = data_root.parent().map(PathBuf::from) else {
-        skips.skip("tableset", "data 无上级目录");
+    let Some(project_root) = find_project_root(&dir) else {
+        skips.skip("tableset", "向上找不到工程根(含 system/YSCom/YSCom.ycd)");
     };
-    if !project_root.join("system/YSCom/YSCom.ycd").is_file() {
-        skips.skip("tableset", "工程根无 YSCom.ycd");
-    }
     let src = DirSource::open(&data_root, Codec::Cp932).expect("DirSource(data)");
     let aux = DirSource::open(&project_root, Codec::Cp932).expect("DirSource(project)");
     let mut tables = TableSet::load_from(&src, Some(&aux), DEFAULT_SCRIPT_KEY).expect("装载七表");
@@ -357,6 +369,12 @@ fn fallback_abi_logs_notice_on_real_data() {
     // 兜底确实生效:ycd 缺席、系统变量 = 内嵌 ABI(548,已过 ysv 逐项校验)。
     assert!(vm.tables().boot.ycd.is_none(), "ycd 应为 None");
     assert_eq!(vm.sysvars().len(), 548, "系统变量 = 内嵌 ABI 表");
+    // 指纹选族:ERIS 的 ysv 应选中 0495 族(不是按版本号)。
+    assert_eq!(
+        vm.sysvars().source_name(),
+        "sysvar-abi-0495.tsv",
+        "ERIS ysv 指纹应选中 0495 族"
+    );
     // 命令表仍来自工程数据。
     assert_eq!(vm.tables().boot.yscm.len(), 119, "命令表来自工程 ysc.ybn");
 
@@ -367,8 +385,10 @@ fn fallback_abi_logs_notice_on_real_data() {
         .find(|d| d.code == "table.fallback")
         .expect("兜底必须有日志提示(table.fallback)");
     assert!(
-        notice.detail.contains("ysv.ybn") && notice.detail.contains("ysc.ybn"),
-        "日志应说明兜底已校验且命令表来自工程数据: {}",
+        notice.detail.contains("ysv.ybn")
+            && notice.detail.contains("ysc.ybn")
+            && notice.detail.contains("sysvar-abi-0495"),
+        "日志应说明所选 ABI 族、校验来源与命令表来源: {}",
         notice.detail
     );
     // 日志只进诊断汇,不进事件流(事件流是对齐对象,golden 不因此变化)。

@@ -450,18 +450,21 @@ impl Vm {
         // 兜底日志(非 Fatal,进诊断汇不进事件流——事件流是对齐对象,
         // 宿主经 `Vm::diags`/`take_diags` 可见;表来源另见
         // `table_provenance` 的 `sysvars: … <- …` 行):
-        // 商业发行版不带编译器定义,系统变量名启用内嵌引擎 ABI 表兜底,
-        // 但已用**工程自己的 ysv.ybn 逐项校验**(DIV-RT-016);命令表/
+        // 商业发行版不带编译器定义,系统变量按工程 ysv 指纹选 ABI 族,
+        // 已用**工程自己的 ysv.ybn 逐项校验**(DIV-RT-016);命令表/
         // 参数名始终来自工程 ysc.ybn(数据驱动,无版本兜底)。
         if vm.tables.boot.ycd.is_none() {
             vm.emit_diag(
                 diag::info(
                     code::table::FALLBACK,
                     Boundary::Table,
-                    "工程无 system/YSCom/YSCom.ycd(商业发行版常态):系统变量名/类型/维数 \
-                     使用内嵌引擎 ABI 表兜底(0.495 ABI,已用工程 ysv.ybn 逐项校验通过,\
-                     DIV-RT-016)。命令表/参数名仍来自工程 ysbin/ysc.ybn,无版本兜底。"
-                        .to_string(),
+                    format!(
+                        "工程无 system/YSCom/YSCom.ycd(商业发行版常态):按工程 ysv.ybn 指纹\
+                         选择系统变量 ABI 族 {} (已逐项校验通过,DIV-RT-016;已知族 \
+                         0292/0466/0479/0495)。命令表/参数名仍来自工程 ysbin/ysc.ybn,\
+                         无版本兜底。",
+                        vm.tables.boot.sysvars.source.describe()
+                    ),
                 )
                 .at_table("YSCom.ycd"),
             );

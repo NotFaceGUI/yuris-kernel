@@ -34,13 +34,17 @@ fn corpus_root() -> Option<PathBuf> {
         return None;
     }
     let data = ysbin.parent()?.to_path_buf();
-    let project = data.parent()?;
     // 编译器表在工程根;语料 A5 要求它存在(缺则跳过而不是假通过)。
-    if project.join("system/YSCom/YSCom.ycd").is_file() {
-        Some(data)
-    } else {
-        None
+    // 工程根向上找(语料目录可能被整体挪动)。
+    let mut cur = ysbin.parent();
+    for _ in 0..4 {
+        let d = cur?;
+        if d.join("system/YSCom/YSCom.ycd").is_file() {
+            return Some(data);
+        }
+        cur = d.parent();
     }
+    None
 }
 
 fn golden_path(name: &str) -> PathBuf {
@@ -72,8 +76,19 @@ fn assert_golden(name: &str, actual: &str) {
 /// dims=[128,128], init=0)` —— id 来自工程表,不是常量。
 fn run_entry(label: &str) -> Option<Vm> {
     let data = corpus_root()?;
-    // 语料根 = <project>/data(编译产物 ysbin/*);辅助根 = <project>(system/YSCom)。
-    let project = data.parent()?;
+    // 语料根 = <project>/data(编译产物 ysbin/*);辅助根 = 向上找到的工程根。
+    let ysbun = data.join("ysbin");
+    let mut project = ysbun.parent();
+    let mut found = None;
+    for _ in 0..4 {
+        let d = match project { Some(d) => d, None => break };
+        if d.join("system/YSCom/YSCom.ycd").is_file() {
+            found = Some(d.to_path_buf());
+            break;
+        }
+        project = d.parent();
+    }
+    let project = found?;
     let src = DirSource::open(&data, Codec::Cp932).expect("DirSource(data)");
     let aux = DirSource::open(project, Codec::Cp932).expect("DirSource(project)");
     let cfg = BootConfig {

@@ -704,7 +704,9 @@ impl TableSet {
                     crate::sysvar_abi::SysVarTable::from_ycd(&table, path, sha);
                 (Some(table), sysvars)
             }
-            None => (None, crate::sysvar_abi::SysVarTable::builtin_abi()),
+            // 商业发行版无编译器定义:按工程 ysv.ybn 指纹从已知 ABI 族中
+            // 选表(数据驱动,不看版本号;全不匹配 ⇒ 拒绝启动)。
+            None => (None, crate::sysvar_abi::SysVarTable::select_for(&vars)?),
         };
 
         // 系统变量 ABI 校验(两条独立来源交叉一致才放行):

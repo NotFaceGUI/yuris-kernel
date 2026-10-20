@@ -18,10 +18,29 @@
 //! # 装载顺序
 //!
 //! 1. 工程带 `system/YSCom/YSCom.ycd` → 直接用它(开发工程/SDK);
-//! 2. 否则用本 crate 的 `data/sysvar-abi-0495.tsv`(由脚本从官方 ycd 生成,
-//!    带来源 SHA-256),**并用工程自己的 `ysv.ybn` 逐项校验**;
-//! 3. 校验失败 ⇒ `table.version` Fatal(拒绝启动)。这条校验保证"表是引擎
-//!    ABI"不是口头声明,而是每次启动都可复核。
+//! 2. 否则用 `data/sysvar-abi-*.tsv` 里的**已知 ABI profile 族**,按
+//!    **游戏自己 `ysv.ybn` 的指纹**(前 N 条 kind=1 的 id/类型/维数)逐族
+//!    校验,选第一个通过的族([`SysVarTable::select_for`]);
+//! 3. 无一通过 ⇒ `table.version` Fatal,并列出每个族的失配原因(拒绝启动)。
+//!
+//! # 为什么按指纹选族,而不是按版本号
+//!
+//! 官方履历与四份 SDK 的 ycd 实测(见 PROGRESS 成果 E3 附):
+//! 系统变量表**在小版本里也会增长**(如 ver0.480/0.01 一次性追加
+//! `_PINT/_PFLT/_PSTR/_PFLG 11..16` 等),插入后所有后续 id 平移;
+//! 官方不归档小版本 SDK。因此版本号不可用于选表,唯一可靠判据是游戏
+//! 自带 `ysv` 的 (id, type, dims) 指纹。已知族:
+//!
+//! | profile | 变量数 | 覆盖构建 |
+//! |---|---|---|
+//! | `sysvar-abi-0292.tsv` | 482 | Beta3 线(0.29x) |
+//! | `sysvar-abi-0466.tsv` | 513 | 4.x ≤0.469 |
+//! | `sysvar-abi-0479.tsv` | 526 | 0.470–0.479 |
+//! | `sysvar-abi-0495.tsv` | 548 | ≥0.480(含 v494/v495;v555 若仅尾部追加亦可,见下) |
+//!
+//! v555 样本(Tyn 旁线实证 `@_SCREEN_SIZE_X`=115、`@_KEY_A`=167)提示
+//! 5xx 保留 548 前缀、只在尾部追加:指纹校验只看 `var_id < 表长` 的镜像,
+//! 尾部追加不影响 0495 族的匹配(结果按 Likely 记录,待 v555 样本钉死)。
 
 use yu_log::Boundary;
 
@@ -67,7 +86,10 @@ pub struct SysVarTable {
     pub source: SysVarSource,
 }
 
-const ABI_TSV: &str = include_str!("../data/sysvar-abi-0495.tsv");
+const ABI_TSV_0495: &str = include_str!("../data/sysvar-abi-0495.tsv");
+const ABI_TSV_0479: &str = include_str!("../data/sysvar-abi-0479.tsv");
+const ABI_TSV_0466: &str = include_str!("../data/sysvar-abi-0466.tsv");
+const ABI_TSV_0292: &str = include_str!("../data/sysvar-abi-0292.tsv");
 
 impl SysVarTable {
     /// 从工程 `YSCom.ycd` 的解析结果构造。
@@ -89,11 +111,68 @@ impl SysVarTable {
         }
     }
 
-    /// 内嵌引擎 ABI 数据表。
+    /// 内嵌 0.495 引擎 ABI 数据表(兼容入口;装载路径用
+    /// [`Self::select_for`] 按指纹选族)。
     pub fn builtin_abi() -> Self {
+        Self::from_tsv(ABI_TSV_0495, "sysvar-abi-0495.tsv")
+    }
+
+    /// 已知 ABI 族(选择优先级:**新→旧**)。
+    ///
+    /// 新表在前:若某 5xx 构建只在 548 前缀之后追加变量,其指纹会同时
+    /// 通过 0495 族(只看 `var_id < 表长` 的镜像),应当归入 0495。
+    pub fn known_profiles() -> Vec<Self> {
+        vec![
+            Self::from_tsv(ABI_TSV_0495, "sysvar-abi-0495.tsv"),
+            Self::from_tsv(ABI_TSV_0479, "sysvar-abi-0479.tsv"),
+            Self::from_tsv(ABI_TSV_0466, "sysvar-abi-0466.tsv"),
+            Self::from_tsv(ABI_TSV_0292, "sysvar-abi-0292.tsv"),
+        ]
+    }
+
+    /// **按游戏自带 `ysv.ybn` 的指纹选族**(数据驱动,不看版本号)。
+    ///
+    /// 判据 = [`Self::verify_against_ysvr`]:`var_id < 表长` 的 kind=1 镜像
+    /// 必须恰好覆盖 `0..表长`,且 (type, dims) 逐项相等。全部族都不通过 ⇒
+    /// `table.version` Fatal,并逐族列出失配原因(未知引擎构建,拒绝启动;
+    /// 需要该构建自带 ycd 或从其 exe 取的 ABI 表)。
+    pub fn select_for(vars: &VarImage) -> Result<Self, yu_log::Diag> {
+        let mut failures = Vec::new();
+        for table in Self::known_profiles() {
+            match table.verify_against_ysvr(vars) {
+                Ok(()) => return Ok(table),
+                Err(d) => failures.push(format!(
+                    "{}: {}",
+                    table.source_name(),
+                    d.detail.trim_start_matches("系统变量 ABI 校验失败:")
+                )),
+            }
+        }
+        Err(diag::fatal(
+            code::table::VERSION,
+            Boundary::Table,
+            format!(
+                "工程 ysv.ybn 的系统变量指纹与所有已知 ABI 族都不符(未知引擎构建);\
+                 需要该构建的 ABI 表(自带 YSCom.ycd 或从其引擎 exe 提取)。逐族失配:{}(A5:拒绝启动,不猜)",
+                failures.join(" | ")
+            ),
+        )
+        .at_table("ysv.ybn"))
+    }
+
+    /// 表名(诊断用)。
+    pub fn source_name(&self) -> &str {
+        match &self.source {
+            SysVarSource::Ycd { .. } => "project YSCom.ycd",
+            SysVarSource::AbiProfile { name, .. } => name,
+        }
+    }
+
+    /// 解析一份内嵌 TSV(`# source_ycd_sha256` + `id/name/type/dims` 行)。
+    fn from_tsv(text: &str, name: &'static str) -> Self {
         let mut decls = Vec::new();
         let mut sha = String::new();
-        for line in ABI_TSV.lines() {
+        for line in text.lines() {
             if let Some(rest) = line.strip_prefix("# source_ycd_sha256\t") {
                 sha = rest.trim().to_string();
                 continue;
@@ -120,10 +199,7 @@ impl SysVarTable {
         }
         Self {
             decls,
-            source: SysVarSource::AbiProfile {
-                name: "sysvar-abi-0495.tsv",
-                sha256: sha,
-            },
+            source: SysVarSource::AbiProfile { name, sha256: sha },
         }
     }
 
@@ -284,5 +360,76 @@ mod tests {
         assert_eq!(t.id("_KEY_ANY"), Some(275));
         assert_eq!(t.get(48).unwrap().value_type, 1);
         assert!(matches!(t.source, SysVarSource::AbiProfile { .. }));
+    }
+
+    /// 用某 ABI 族自身生成"游戏 ysv 指纹"(kind=1,var_id=id,type/dims 同表)。
+    fn image_from(table: &SysVarTable) -> VarImage {
+        let records = table
+            .decls
+            .iter()
+            .enumerate()
+            .map(|(i, d)| crate::tables::VarRecord {
+                kind: 1,
+                group: 0,
+                script_id: 0,
+                var_id: i as u16,
+                value_type: d.value_type,
+                dims: d.dims.clone(),
+                init: crate::tables::VarInit::None,
+            })
+            .collect();
+        VarImage {
+            version: 495,
+            records,
+        }
+    }
+
+    /// 四个已知族的指纹各自选中自己(顺序无歧义)。
+    #[test]
+    fn fingerprint_selects_each_known_family() {
+        let profiles = SysVarTable::known_profiles();
+        assert_eq!(profiles.len(), 4, "0292/0466/0479/0495 四族");
+        for p in &profiles {
+            let vars = image_from(p);
+            let sel = SysVarTable::select_for(&vars)
+                .unwrap_or_else(|e| panic!("{} 指纹应自选中: {e}", p.source_name()));
+            assert_eq!(sel.source_name(), p.source_name());
+            assert_eq!(sel.len(), p.len());
+        }
+        // 变量数依次递增(与官方 ycd 实测一致)。
+        let lens: Vec<usize> = profiles.iter().map(|p| p.len()).collect();
+        assert_eq!(lens, vec![548, 526, 513, 482], "profile 长度");
+    }
+
+    /// 任一项失配(改一个维数)⇒ 全部族拒绝,错误列出逐族原因。
+    #[test]
+    fn fingerprint_rejects_unknown_and_lists_reasons() {
+        let mut vars = image_from(&SysVarTable::builtin_abi());
+        vars.records[10].dims = vec![99];
+        let e = SysVarTable::select_for(&vars).expect_err("失配必须拒绝");
+        assert_eq!(e.code, "table.version");
+        for name in ["0292", "0466", "0479", "0495"] {
+            assert!(e.detail.contains(name), "失配原因应含族名 {name}: {}", e.detail);
+        }
+    }
+
+    /// v555 形态(Likely):548 前缀 + 尾部追加项 ⇒ 仍归 0495 族
+    /// (校验只看 `var_id < 表长` 的镜像,追加项不影响)。
+    #[test]
+    fn trailing_extra_records_keep_newest_family() {
+        let mut vars = image_from(&SysVarTable::builtin_abi());
+        for extra in 0..3u16 {
+            vars.records.push(crate::tables::VarRecord {
+                kind: 1,
+                group: 0,
+                script_id: 0,
+                var_id: 548 + extra,
+                value_type: 1,
+                dims: Vec::new(),
+                init: crate::tables::VarInit::None,
+            });
+        }
+        let sel = SysVarTable::select_for(&vars).expect("前缀匹配应通过");
+        assert_eq!(sel.source_name(), "sysvar-abi-0495.tsv");
     }
 }

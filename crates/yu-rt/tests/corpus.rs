@@ -21,6 +21,21 @@ use yu_rt::ycd::YcdTable;
 use yu_rt::{BootConfig, Vm};
 use yu_vfs::{Codec, DataSource, DirSource, YpfSource};
 
+/// 工程根 = 向上最近一个含 `system/YSCom/YSCom.ycd` 的祖先目录。
+///
+/// 语料目录可能被整体挪动(如 `save/data/ysbin`),不能假设固定层级。
+fn find_project_root(dir: &std::path::Path) -> Option<PathBuf> {
+    let mut cur = dir.parent();
+    for _ in 0..4 {
+        let d = cur?;
+        if d.join("system/YSCom/YSCom.ycd").is_file() {
+            return Some(d.to_path_buf());
+        }
+        cur = d.parent();
+    }
+    None
+}
+
 fn corpus_dir() -> Option<PathBuf> {
     let p = std::env::var_os("YURIS_SAMPLE_ERIS_YSBIN")?;
     let path = PathBuf::from(p);
@@ -153,7 +168,7 @@ fn metadata_tables_parse_and_close() {
     assert_eq!((cfg.width, cfg.height), (800, 600), "工程 SX/SY");
 
     // 编译器表在工程根(见 TableSet::load_from);语料目录只是 data/ysbin。
-    let project = dir.parent().and_then(|p| p.parent());
+    let project = find_project_root(&dir);
     let ycd_path = project
         .map(|p| p.join("system/YSCom/YSCom.ycd"))
         .filter(|p| p.is_file())
@@ -387,7 +402,7 @@ fn table_set_loads_from_dir_source() {
         skip.0 += 1;
         return;
     };
-    let Some(project_root) = data_root.parent().map(|p| p.to_path_buf()) else {
+    let Some(project_root) = find_project_root(&dir) else {
         skip.0 += 1;
         return;
     };
@@ -581,11 +596,10 @@ fn eris_entry_chain_runs_end_to_end() {
     let mut skip = SkipCounter(0);
     let dir = require_corpus!(skip);
     let data_root = dir.parent().expect("data").to_path_buf();
-    let project_root = data_root.parent().expect("project").to_path_buf();
-    if !project_root.join("system/YSCom/YSCom.ycd").is_file() {
+    let Some(project_root) = find_project_root(&dir) else {
         skip.0 += 1;
         return;
-    }
+    };
     let src = DirSource::open(&data_root, Codec::Cp932).expect("data");
     let aux = DirSource::open(&project_root, Codec::Cp932).expect("project");
     let mut vm = Vm::boot_with_aux(
@@ -643,7 +657,10 @@ fn loose_and_packed_eris_are_execution_equivalent() {
     let mut skip = SkipCounter(0);
     let dir = require_corpus!(skip);
     let data_root = dir.parent().expect("data").to_path_buf();
-    let project_root = data_root.parent().expect("project").to_path_buf();
+    let Some(project_root) = find_project_root(&dir) else {
+        skip.0 += 1;
+        return;
+    };
     let ypf = project_root.join("data.ypf");
     if !ypf.is_file() || !project_root.join("system/YSCom/YSCom.ycd").is_file() {
         skip.0 += 1;
