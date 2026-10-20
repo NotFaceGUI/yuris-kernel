@@ -2200,3 +2200,123 @@ $ cargo test -p yu-backend-soft
 - DIV-GFX-013 `RECTPAINT*`/`SIZE*`/`RESIZE` 等图像加工像素;
 - DIV-GFX-012 文本栅格化/排版(与 `yu-font` 合流);
 - DIV-GFX-009 颜色空间、DIV-GFX-008 组 RT 尺寸/清屏。
+
+## 成果 M3-WGPU (2026-10-20) · wgpu 主后端与首帧对账
+
+> 范围 `crates/yu-backend-wgpu`(+ 根 `Cargo.lock`)。语义唯一来源 =
+> `yu-gfx::CompositorFrame`;`yu-backend-soft` 是整数参考执行器。未改
+> yu-gfx / yu-rt / yu-font / yu-backend-soft / yu-trace,零 git 写操作。
+
+### 1. 实现
+
+- `device.rs`:instance/adapter/device/queue;`DeviceOptions` 支持后端与
+  适配器名称子串覆盖;新增 `platform.gpu.*` 诊断码(不改 yu-log)。
+- `textures.rs`:复用 `yu_backend_soft::TextureStore` 的 RGBA8 字节;
+  资产按 key 上传一次,1×1 黑图单独缓存;资产/离屏目标共用进程级纹理
+  身份,避免 bind group 键碰撞。
+- `pipelines.rs`:MODE 0/1/2 × `Rgba8Unorm` 管线缓存;bind group 按
+  `(texture_id, sampler)` 缓存;无 mip;`Point`=nearest,
+  `Linear/Anisotropic`=linear。
+- `passes.rs`:严格按 `frame.passes` 规划;Texture 只记账,Offscreen 用
+  组 `SX/SY`/`pass.clear`,Screen 用 `viewport`/`frame.clear`;跳过原因与
+  软后端逐项一致。
+- `readback.rs`:GPU 纹理 → 256 字节行对齐 buffer → 紧凑 RGBA8;缓冲按
+  尺寸复用。
+- `lib.rs`:`WgpuRenderer::new` / `new_with_options` / `render_frame`;
+  返回 `Surface + RenderReport + GpuStats`;`#![forbid(unsafe_code)]`;
+  库内不碰 `std::fs`/`std::env`/路径。
+- `examples/first_frame.rs`:GfxHost 同步路径 boot ERIS → wgpu 渲染 →
+  PNG + 报告 + 与 `first_frame.display.json` 计数对账。
+
+### 2. 首帧实测(默认选项,Vulkan)
+
+```text
+frame: 3 viewport: 800x600
+gpu: backend=vulkan adapter=NVIDIA GeForce RTX 5070 type=discrete_gpu
+layers: 272 (visible 34), passes: 15, offscreen passes: 2
+ops: 44 total, 15 drawn, 29 skipped
+missing assets: 0; skipped text: 0
+filter: mag=point min=point mip=none source=placeholder
+textures: decoded=13 cache_entries=13
+gpu counters: draws=15 uploads=14 upload_bytes=1161036
+              pipelines=1 (created 1) bind_groups=15 (created 15)
+frame bytes: vertices=1800 readback=1920000
+elapsed=32.237 ms deterministic=true
+display check: OK (passes 15 ops 44 executable 15 skipped 29)
+png: target/tmp/wgpu_first_frame.png (794572 bytes)
+report: target/tmp/wgpu_first_frame.report.json
+```
+
+- 29 个 skipped = 1 个 `copy` + 11 个 `image` + 16 个 `copy` 纹理层
+  + 1 个 `imageop` 纹理层,与软后端/`first_frame.display.json` 完全一致。
+- 同帧渲染两次像素逐字节一致。
+- 与软后端首帧的 PNG 不再逐字节相同(794572 vs 785127 字节):差异全部
+  落在 9,451 个半透明像素上,最大 RGB 差 61;wgpu 保留这些像素的 alpha,
+  soft 输出 alpha 恒 255。归因见下一条 alpha 决策与 README 差异账本;
+  计数/不透明像素一致,**不做逐像素门禁**。
+- DX12 覆盖实测:`YURIS_WGPU_BACKEND=dx12 YURIS_WGPU_ADAPTER=5070`
+  → `backend=dx12 adapter=NVIDIA GeForce RTX 5070`,计数相同,
+  `elapsed=38.334 ms`。
+
+### 3. 验证(原始结果)
+
+```text
+$ cargo test -p yu-backend-wgpu
+6 lib + 7 integration + 1 doc = 14 passed; 0 failed
+  - device_initializes_or_skips / missing_adapter_is_explicit_error
+  - blend_state 表(仅 0/1/2,D3D9 同因子 alpha `a²`)
+  - clear_only_frame / 3x2 readback 行对齐 / 纹理缓存跨帧
+  - unsupported_blend 计数与软后端逐项一致(不做像素门禁)
+  - group_alpha 只在组合成时作用一次(断言 As² 链)
+
+$ cargo test -p yu-backend-soft
+10 lib + 5 render + 1 doc = 16 passed; 0 failed
+
+$ cargo clippy -p yu-backend-wgpu --all-targets
+yu-backend-wgpu 自身 0 告警(输出中的 warning 均来自依赖 yu-rt)
+
+$ grep -rn "println!\|eprintln!\|dbg!" crates/yu-backend-wgpu/src
+0
+
+$ grep -rn "kotoneiro\|AnimalTrail\|C:\\\\Users\|D:\\\\Art" crates/yu-backend-wgpu/src
+0
+
+$ cargo check -p yu-backend-wgpu --target wasm32-unknown-unknown --lib
+Finished `dev` profile [unoptimized + debuginfo]
+```
+
+### 4. 决策与差异
+
+- wgpu 30.0.1(2026-10-20 配置索引最新稳定版);默认 features,无
+  experimental;目标格式固定 `Rgba8Unorm`,禁用 sRGB 格式。
+- alpha 通道按 D3D9 未开 `SEPARATEALPHABLENDENABLE` 的同因子语义执行:
+  MODE 0/1/2 的 alpha 源项是 `a²`(gfx §5.2/§12.3 的 SRCBLEND/DESTBLEND)。
+  soft 当前写的是 `a`(独立审查的 P1);本后端不复制该偏离,差异账本留档,
+  首帧只在半透明像素上分叉,计数不变。
+- 差异账本在 `crates/yu-backend-wgpu/README.md`:
+  u8/f32 舍入、sRGB、`filter.source=placeholder`、适配器差异、
+  双线性实现、alpha 语义、组 RT alpha 存储未取证、零尺寸组
+  `ops_total` 修正、`draw_calls` vs `ops_drawn`、i64→f32 坐标。
+- 任务书 §3 的硬检查已自动化:示例在计数不一致时退出非零。
+
+### 5. 未完成
+
+- 全部是 gfx 挂账(COPY 时序、图像加工、文本、MODE 3+ 等),本后端按
+  契约跳过并计数,未近似。
+- surface 呈现/窗口/wasm 事件循环留给宿主会话;wasm 仅留编译证据。
+
+## 勘误 (2026-10-20) · 数据入口:清除 save/data 回退,封包/散盘二选一
+
+- 旧结论(成果 F1/F2 环境节、示例代码):语料"迁移"到 `<project-eris>/save/data`,
+  示例/测试增加 save/data 回退分支。**该回退是错的**:`save/data` 是官方 exe
+  的解包产物(本机为让 exe 读 data.ypf 的布局),不是工程数据入口。
+- 更正:工程数据入口 = 封包 `<project>/data.ypf`(优先)或散盘 `<project>/data/`,
+  哪个存在用哪个;两者都是合法形态,`Mount` 后挂覆盖语义不变。
+- 清理范围:soft/wgpu `first_frame`、`eris_dump`、`gfx_census`、
+  `eris_first_screen`(两处 boot)删除 save/data 分支,boot 主源改为
+  `YpfSource(data.ypf)` 优先;`first_frame` 纹理挂载栈在 `data/` 不存在时
+  只挂封包;发现方式 = 用户指出 save/data 的来历。
+- 验证(`YURIS_SAMPLE_ERIS_ROOT=<project-eris>`,soft `first_frame` 从封包启动):
+  `loose_files=0 / ypf=true`;frame 3 census 不变(272 层 / 15 pass / 44 op);
+  13 张纹理全部从包内解码;PNG 785,127 字节,二次渲染 `deterministic=true`;
+  `events drained=578426 dropped=0`。

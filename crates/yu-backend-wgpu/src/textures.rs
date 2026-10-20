@@ -1,0 +1,321 @@
+//! GPU 纹理与渲染目标缓存。
+//!
+//! 像素字节**只**来自 [`yu_backend_soft::TextureStore`]:同一套 vfs 探测/
+//! 解码/缓存,保证软硬后端吃到的是同一份 RGBA8。本模块负责:
+//!
+//! - 按资产 key 上传一次,之后只复用 `wgpu::TextureView`/bind group;
+//! - `SolidBlack1x1` 与资产分开缓存(它由引擎语义生成,不经过 vfs);
+//! - 离屏/屏幕目标按 `LayerId`/视图尺寸复用,尺寸变化才重建。
+//!
+//! 所有纹理格式固定 [`wgpu::TextureFormat::Rgba8Unorm`],不做 sRGB 解码。
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use bytemuck::Pod;
+use yu_backend_soft::TextureStore;
+use yu_gfx::LayerId;
+use yu_log::Diag;
+
+use crate::device::{code, GpuContext};
+use crate::pipelines::TARGET_FORMAT;
+
+/// 纹理身份必须跨“资产缓存”和“渲染目标缓存”唯一,否则 bind group 缓存
+/// 会用 `(id, filter)` 把两个不同的 view 混在一起。用进程级单调计数器
+/// 统一分配;id 不进入任何报告/像素输出,因此不影响确定性。
+static NEXT_TEXTURE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_texture_id() -> u64 {
+    NEXT_TEXTURE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 纹理用途:既能被采样,也能作为渲染目标。
+const TARGET_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::RENDER_ATTACHMENT
+    .union(wgpu::TextureUsages::TEXTURE_BINDING)
+    .union(wgpu::TextureUsages::COPY_SRC);
+
+/// 一张已上传的纹理 + 稳定身份。
+pub struct GpuTexture {
+    /// 本进程内单调递增;bind group 缓存键的一部分。
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+}
+
+/// 资产 key → GPU 纹理 + 1×1 黑图;按身份缓存,不逐帧重传。
+pub struct TextureCache {
+    textures: BTreeMap<u64, GpuTexture>,
+    asset_ids: BTreeMap<Vec<u8>, u64>,
+    solid_id: Option<u64>,
+    /// 累计上传字节(解码后的 RGBA8 字节数,不含 wgpu 内部行填充)。
+    pub total_upload_bytes: u64,
+    /// 累计上传纹理数。
+    pub total_uploads: u64,
+}
+
+impl TextureCache {
+    pub fn new() -> Self {
+        Self {
+            textures: BTreeMap::new(),
+            asset_ids: BTreeMap::new(),
+            solid_id: None,
+            total_upload_bytes: 0,
+            total_uploads: 0,
+        }
+    }
+
+    pub fn cached_textures(&self) -> usize {
+        self.textures.len()
+    }
+
+    pub fn get(&self, id: u64) -> Option<&GpuTexture> {
+        self.textures.get(&id)
+    }
+
+    pub fn asset_id(&self, key: &[u8]) -> Option<u64> {
+        self.asset_ids.get(key).copied()
+    }
+
+    /// 解析并上传一个资产;已上传时直接返回 id。
+    ///
+    /// `resolve` 的成功结果由 [`TextureStore`] 缓存,失败也缓存(不重复探测)。
+    pub fn ensure_asset(
+        &mut self,
+        ctx: &GpuContext,
+        store: &mut TextureStore,
+        key: &[u8],
+    ) -> Result<u64, Diag> {
+        if let Some(id) = self.asset_ids.get(key) {
+            return Ok(*id);
+        }
+        let texture = store.resolve(key)?;
+        let uploaded = self.upload(
+            ctx,
+            texture.width,
+            texture.height,
+            &texture.rgba,
+            "asset texture",
+        )?;
+        self.asset_ids.insert(key.to_vec(), uploaded);
+        Ok(uploaded)
+    }
+
+    /// `FILE=""` 的 1×1 不透明黑图;首次使用时上传。
+    pub fn ensure_solid_black(&mut self, ctx: &GpuContext) -> Result<u64, Diag> {
+        if let Some(id) = self.solid_id {
+            return Ok(id);
+        }
+        let id = self.upload(ctx, 1, 1, &[0, 0, 0, 255], "solid black 1x1")?;
+        self.solid_id = Some(id);
+        Ok(id)
+    }
+
+    fn upload(
+        &mut self,
+        ctx: &GpuContext,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        label: &str,
+    ) -> Result<u64, Diag> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| {
+                Diag::fatal(code::LIMIT, yu_log::Boundary::Platform)
+                    .with_detail(format!("{label} 尺寸 {width}x{height} 溢出 usize"))
+            })?;
+        if rgba.len() != expected {
+            return Err(
+                Diag::fatal(code::TARGET, yu_log::Boundary::Platform).with_detail(format!(
+                    "{label} 字节数 {} 与 {width}x{height}x4={expected} 不符",
+                    rgba.len()
+                )),
+            );
+        }
+        ctx.check_dimensions(width, height, label)?;
+
+        let descriptor = wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TARGET_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+        let texture = ctx.checked(code::TARGET, label, || {
+            use wgpu::util::DeviceExt as _;
+            ctx.device.create_texture_with_data(
+                &ctx.queue,
+                &descriptor,
+                wgpu::util::TextureDataOrder::LayerMajor,
+                rgba,
+            )
+        })?;
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let id = allocate_texture_id();
+        self.textures.insert(
+            id,
+            GpuTexture {
+                id,
+                width,
+                height,
+                texture,
+                view,
+            },
+        );
+        self.total_upload_bytes += rgba.len() as u64;
+        self.total_uploads += 1;
+        Ok(id)
+    }
+}
+
+impl Default for TextureCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 一个可渲染的 RGBA8 目标(屏幕或组离屏)。
+pub struct RenderTarget {
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+}
+
+/// 屏幕目标 + 按 `LayerId` 的离屏目标集合。
+pub struct TargetSet {
+    screen: Option<RenderTarget>,
+    offscreen: BTreeMap<LayerId, RenderTarget>,
+}
+
+impl TargetSet {
+    pub fn new() -> Self {
+        Self {
+            screen: None,
+            offscreen: BTreeMap::new(),
+        }
+    }
+
+    pub fn screen(&self) -> Option<&RenderTarget> {
+        self.screen.as_ref()
+    }
+
+    pub fn offscreen(&self, id: &LayerId) -> Option<&RenderTarget> {
+        self.offscreen.get(id)
+    }
+
+    pub fn offscreen_count(&self) -> usize {
+        self.offscreen.len()
+    }
+
+    /// 屏幕目标:尺寸不变则复用。重建时把旧 id 的 bind group 一并作废。
+    pub fn ensure_screen(
+        &mut self,
+        ctx: &GpuContext,
+        width: u32,
+        height: u32,
+        pipelines: &mut crate::pipelines::PipelineCache,
+    ) -> Result<&RenderTarget, Diag> {
+        let reusable = self
+            .screen
+            .as_ref()
+            .is_some_and(|t| t.width == width && t.height == height);
+        if !reusable {
+            if let Some(old) = self.screen.take() {
+                pipelines.forget_texture(old.id);
+            }
+            let target = create_target(ctx, width, height, "screen")?;
+            self.screen = Some(target);
+        }
+        Ok(self.screen.as_ref().expect("screen target set above"))
+    }
+
+    /// 组离屏目标:尺寸不变则复用(`SX/SY` 未给时调用方已回退视口)。
+    pub fn ensure_offscreen(
+        &mut self,
+        ctx: &GpuContext,
+        id: &LayerId,
+        width: u32,
+        height: u32,
+        pipelines: &mut crate::pipelines::PipelineCache,
+    ) -> Result<&RenderTarget, Diag> {
+        let reusable = self
+            .offscreen
+            .get(id)
+            .is_some_and(|t| t.width == width && t.height == height);
+        if !reusable {
+            if let Some(old) = self.offscreen.remove(id) {
+                pipelines.forget_texture(old.id);
+            }
+            let target = create_target(ctx, width, height, "offscreen group")?;
+            self.offscreen.insert(id.clone(), target);
+        }
+        Ok(self.offscreen.get(id).expect("offscreen target set above"))
+    }
+}
+
+impl Default for TargetSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn create_target(
+    ctx: &GpuContext,
+    width: u32,
+    height: u32,
+    what: &'static str,
+) -> Result<RenderTarget, Diag> {
+    ctx.check_dimensions(width, height, what)?;
+    let descriptor = wgpu::TextureDescriptor {
+        label: Some(what),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: TARGET_FORMAT,
+        usage: TARGET_USAGE,
+        view_formats: &[],
+    };
+    let texture = ctx.checked(code::TARGET, what, || {
+        ctx.device.create_texture(&descriptor)
+    })?;
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let id = allocate_texture_id();
+    Ok(RenderTarget {
+        id,
+        width,
+        height,
+        texture,
+        view,
+    })
+}
+
+/// 顶点:位置(NDC)、UV、层 alpha(已 clamp 到 0..1)。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, bytemuck::Zeroable)]
+pub struct Vertex {
+    pub position: [f32; 2],
+    pub uv: [f32; 2],
+    pub alpha: f32,
+}
+
+impl Vertex {
+    pub const SIZE: u64 = std::mem::size_of::<Self>() as u64;
+}

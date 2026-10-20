@@ -13,18 +13,22 @@ YU-RIS 引擎的净室兼容内核，GPL-3.0-or-later。**唯一目标：与官�
 
 ## 当前状态（2026-10-20）
 
-M3 渲染链路已打通到“确定性软后端首帧”：
+M3 渲染链路已打通到“软/硬双后端首帧 + 计数对账”：
 
 | 阶段 | 状态 |
 |---|---|
 | M3a 语义显示列表 `CompositorFrame` | 完成 |
 | M3b `yu-backend-soft` 首帧 PNG | 完成（部分语义挂账，见下） |
-| M3c `yu-backend-wgpu` 同帧逐像素对拍 | 未开始 |
+| M3c `yu-backend-wgpu` 主后端首帧 | 完成（离屏 RGBA8 + 读回；surface 呈现留宿主；alpha 语义与 soft 分叉，见 crate README） |
 | M3d 桌面 / wasm / Android 宿主闭环 | 未开始 |
 
-首帧实测：800×600、272 图层、15 pass、44 op（15 executable / 29 skipped），输出
-`target/tmp/first_frame.png` 与 `first_frame.display.json`。当前已能画出系统文本框；
-文字栅格化、COPY、RECTPAINT、部分 MODE 仍是显式挂账项，见
+首帧实测（同一 ERIS 帧）：800×600、272 图层、15 pass、44 op（15 executable /
+29 skipped）。soft 输出 `target/tmp/first_frame.png`；wgpu 输出
+`target/tmp/wgpu_first_frame.png` + `wgpu_first_frame.report.json`，pass/op/
+executable/skipped 计数与 `first_frame.display.json` 完全一致。两者在 9,451 个
+半透明像素上不同：wgpu 按 D3D9 同因子 alpha（`As²`）执行，soft 当前为 `As`
+（已知 soft P1）；不做逐像素门禁，差异记入 `crates/yu-backend-wgpu/README.md`
+账本。文字栅格化、COPY、RECTPAINT、部分 MODE 仍是显式挂账项，见
 `docs/gfx-unimplemented-todo.md`。
 
 ## 布局
@@ -38,11 +42,12 @@ M3 渲染链路已打通到“确定性软后端首帧”：
 | `yu-gfx` | 渲染语义层：`CompositorFrame`、图层 / 组 / 窗口 / 过渡 / 文本模型、GfxHost 查询 |
 | `yu-font` | 字体发现 / 加载、字形栅格化、完整文本样式；不含换行 / 对齐 |
 | `yu-backend-soft` | `CompositorFrame` 的确定性软件参考后端：纹理管线 + RGBA8 合成 + PNG |
+| `yu-backend-wgpu` | `CompositorFrame` 的 wgpu 主后端：`Rgba8Unorm` 离屏合成 + 读回；纹理/管线/bind group 缓存 |
 | `yu-trace` | 边界录制 / 回放 / diff；schema v3（producer-neutral、frame_description） |
 
-未开始：`yu-backend-wgpu`、桌面 / wasm / Android 宿主、`yu-sound` / `yu-save`、
-scenario 解释器与 CLI。**没有 `yu-assets` 兄弟 crate**：纹理解析在装配 / 后端层，
-第一个实现是 `yu-backend-soft::TextureStore`。
+未开始：桌面 / wasm / Android 宿主、`yu-sound` / `yu-save`、scenario 解释器与 CLI。
+**没有 `yu-assets` 兄弟 crate**：纹理解析在装配 / 后端层，第一个实现是
+`yu-backend-soft::TextureStore`；wgpu 后端复用同一 `TextureStore` 的 RGBA8 字节。
 
 ### 渲染链路
 
@@ -54,8 +59,8 @@ yu-vfs → yu-format → yu-rt
                          │
              ┌───────────┴───────────┐
              ▼                       ▼
-   yu-backend-soft             yu-backend-wgpu（未开始）
-   确定性参考 / PNG / golden    主后端，同帧逐像素对拍
+   yu-backend-soft             yu-backend-wgpu
+   确定性参考 / PNG / golden    主后端，同帧计数对账 / 差异账本
              │                       │
              └───────────┬───────────┘
                          ▼
@@ -75,6 +80,10 @@ export YURIS_SAMPLE_ERIS_YPF="<project-eris>/data.ypf"
 # headless 首帧
 cargo run -p yu-backend-soft --example first_frame
 # → target/tmp/first_frame.png / first_frame.display.json
+
+cargo run -p yu-backend-wgpu --example first_frame
+# → target/tmp/wgpu_first_frame.png / wgpu_first_frame.report.json
+# 可选：YURIS_WGPU_BACKEND=dx12 YURIS_WGPU_ADAPTER=5070
 ```
 
 本机沙箱、样本路径与占位符约定见 `AGENTS.md`（本机文件，不入库）。

@@ -1,0 +1,27 @@
+[package]
+name = "yu-backend-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+pollster = "0.4"
+wgpu = "30.0.1"
+yu-backend-soft = { path = "../yu-backend-soft" }
+yu-gfx = { path = "../yu-gfx" }
+yu-log = { path = "../yu-log" }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+yu-format = { path = "../yu-format" }
+yu-rt = { path = "../yu-rt" }
+yu-vfs = { path = "../yu-vfs" }
+
+[[example]]
+name = "first_frame"
+path = "examples/first_frame.rs"
+
+[lib]
+name = "yu_backend_wgpu"
+path = "src/lib.rs"
