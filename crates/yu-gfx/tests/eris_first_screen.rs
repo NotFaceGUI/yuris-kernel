@@ -13,35 +13,21 @@ use std::path::PathBuf;
 use yu_gfx::{json, GfxConfig, GfxState, Viewport};
 use yu_rt::input::InputTimeline;
 use yu_rt::{BootConfig, Vm};
-use yu_vfs::{Codec, DirSource};
+use yu_vfs::{Codec, DirSource, YpfSource};
 
 fn eris_root() -> Option<String> {
-    let root = if let Ok(root) = std::env::var("YURIS_SAMPLE_ERIS_ROOT") {
-        root
-    } else {
-        std::env::var("YURIS_SAMPLE_ERIS_YSBIN").ok().map(|p| {
-            std::path::Path::new(&p)
-                .ancestors()
-                .nth(2)
-                .expect("ysbin/../..")
-                .display()
-                .to_string()
-        })?
-    };
-    resolve_project_root(root)
-}
-
-/// 语料从 `<project>/data` 迁到 `<project>/save/data` 后,两种工程根都接受。
-fn resolve_project_root(root: String) -> Option<String> {
-    let base = std::path::Path::new(&root);
-    if base.join("data").join("ysbin").join("ysc.ybn").exists() {
+    // 唯一约定:工程数据入口是 <工程根>/data;ysbin 位于 <工程根>/data/ysbin。
+    if let Ok(root) = std::env::var("YURIS_SAMPLE_ERIS_ROOT") {
         return Some(root);
     }
-    let save = base.join("save");
-    if save.join("data").join("ysbin").join("ysc.ybn").exists() {
-        return Some(save.display().to_string());
-    }
-    Some(root)
+    std::env::var("YURIS_SAMPLE_ERIS_YSBIN").ok().map(|p| {
+        std::path::Path::new(&p)
+            .ancestors()
+            .nth(2)
+            .expect("ysbin/../..")
+            .display()
+            .to_string()
+    })
 }
 
 fn write_or_compare_golden(actual: &str) {
@@ -75,7 +61,13 @@ fn eris_first_screen_display_list() {
         eprintln!("SKIP eris_first_screen_display_list: set YURIS_SAMPLE_ERIS_YSBIN/ROOT");
         return;
     };
-    let src = DirSource::open(format!("{root}/data"), Codec::Cp932).expect("data");
+    // 数据入口两种合法形态:封包 data.ypf 优先,散盘 data/ 为备。
+    let ypf = std::path::PathBuf::from(&root).join("data.ypf");
+    let src: Box<dyn yu_vfs::DataSource> = if ypf.is_file() {
+        Box::new(YpfSource::open(&ypf, Codec::Cp932).expect("data.ypf"))
+    } else {
+        Box::new(DirSource::open(format!("{root}/data"), Codec::Cp932).expect("data"))
+    };
     let aux = DirSource::open(&root, Codec::Cp932).expect("project");
     let cfg = BootConfig {
         entry_label: "SYSTEM_START".to_string(),
@@ -84,7 +76,7 @@ fn eris_first_screen_display_list() {
         record_events: false,
         ..BootConfig::default()
     };
-    let mut vm = Vm::boot_with_aux(Box::new(src), Some(Box::new(aux)), cfg).expect("boot");
+    let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).expect("boot");
     let viewport = Viewport::new(
         vm.tables().boot.config.width,
         vm.tables().boot.config.height,
@@ -249,7 +241,13 @@ fn eris_first_screen_with_synchronous_info_queries() {
         eprintln!("SKIP eris_first_screen_with_synchronous_info_queries");
         return;
     };
-    let src = DirSource::open(format!("{root}/data"), Codec::Cp932).expect("data");
+    // 数据入口两种合法形态:封包 data.ypf 优先,散盘 data/ 为备。
+    let ypf = std::path::PathBuf::from(&root).join("data.ypf");
+    let src: Box<dyn yu_vfs::DataSource> = if ypf.is_file() {
+        Box::new(YpfSource::open(&ypf, Codec::Cp932).expect("data.ypf"))
+    } else {
+        Box::new(DirSource::open(format!("{root}/data"), Codec::Cp932).expect("data"))
+    };
     let aux = DirSource::open(&root, Codec::Cp932).expect("project");
     let cfg = BootConfig {
         entry_label: "SYSTEM_START".to_string(),
@@ -257,7 +255,7 @@ fn eris_first_screen_with_synchronous_info_queries() {
         record_events: false,
         ..BootConfig::default()
     };
-    let mut vm = Vm::boot_with_aux(Box::new(src), Some(Box::new(aux)), cfg).expect("boot");
+    let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).expect("boot");
     let viewport = Viewport::new(
         vm.tables().boot.config.width,
         vm.tables().boot.config.height,

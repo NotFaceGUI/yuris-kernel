@@ -472,7 +472,7 @@ alpha_arg2}`;D3D9 原始值。`TF` = `D3DRS_TEXTUREFACTOR`。
 
 ```bash
 export TEMP="<side-repo>/workbench/tmp"; TMP="$TEMP"
-export YURIS_SAMPLE_ERIS_YSBIN="<side-repo>/workbench/project-eris/save/data/ysbin"
+export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"   # 数据入口:data.ypf 优先,data/ 为备
 export YURIS_REQUIRE_SAMPLES=1
 
 cargo run -p yu-rt --example gfx_census -- 2 8     # 命令/参数 census

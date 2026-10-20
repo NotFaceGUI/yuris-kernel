@@ -333,7 +333,7 @@ release 的 1.0–1.2 倍（受 CPU/热状态影响）。
 ```bash
 export TEMP="<side-repo>/workbench/tmp"; TMP="$TEMP"
 export YURIS_REQUIRE_SAMPLES=1
-export YURIS_SAMPLE_ERIS_YSBIN="<side-repo>/workbench/project-eris/save/data/ysbin"
+export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"   # 数据入口:data.ypf 优先,data/ 为备
 export YURIS_SAMPLE_ERIS_YPF="<side-repo>/workbench/project-eris/data.ypf"
 cargo test -p yu-font
 cargo check -p yu-font --target wasm32-unknown-unknown

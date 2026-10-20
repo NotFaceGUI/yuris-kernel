@@ -30,8 +30,9 @@
 
 - **手册**:`<side-repo>/target/sdk/0.495/yu-ris_0495_032/マニュアル/YU-RIS/html/`
   用 CP932 解码读取相关页;记录页面路径+原文句子。
-- **真实脚本**:`<side-repo>/workbench/project-eris/save/data/script/ERIS/`
-  与编译产物 `.../save/data/ysbin/`;记录文件:行号、命令、参数、上下文注释。
+- **真实脚本**:`<side-repo>/workbench/project-eris`(数据入口 = `data.ypf` 优先,
+  散盘 `data/` 为备;脚本在包内 `script/ERIS/`,编译产物在 `ysbin/`)。
+  记录文件:行号、命令、参数、上下文注释。
 - **REA**:官方 `yu-ris.exe`(sha256 `4f5eefa3…`)。
   - 可调用 `mcp__rea__open_binary` → `procedure_pseudo_code`/`analyze_function` → `close_binary`。
   - **不要相信旧笔记的地址**:`0x4506f4/0x4521dc/0x4567c0/0x42c4a4/0x43d334/0x43d4a4`
@@ -173,7 +174,7 @@ WINDOW 域;CGINFO/FONTINFO/WINDOWINFO;TEXT 管线;图像层 SX/SY;SIZE/RESIZE/TR
 export TEMP="D:/Art/ai/projects/YurisDroid/workbench/tmp"; TMP="$TEMP"
 export YURIS_TEST_TMP="D:/Art/ai/projects/yuris-kernel/target/test-tmp"
 export YURIS_REQUIRE_SAMPLES=1
-export YURIS_SAMPLE_ERIS_YSBIN="D:/Art/ai/projects/YurisDroid/workbench/project-eris/save/data/ysbin"
+export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"   # 数据入口:data.ypf 优先,data/ 为备
 export YURIS_SAMPLE_ERIS_YPF="D:/Art/ai/projects/YurisDroid/workbench/project-eris/data.ypf"
 export YURIS_SAMPLE_SDK0495="D:/Art/ai/projects/YurisDroid/target/sdk/0.495/yu-ris_0495_032"
 ```

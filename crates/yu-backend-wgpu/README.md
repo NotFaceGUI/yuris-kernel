@@ -52,7 +52,7 @@ let mut backend = WgpuRenderer::new_with_options(store, &options)?;
 | `YURIS_WGPU_BACKEND` | `dx12` / `vulkan` / `gl` / `primary` / `all` |
 
 ```bash
-export YURIS_SAMPLE_ERIS_YSBIN=<project-eris>/save/data/ysbin
+export YURIS_SAMPLE_ERIS_ROOT=<project-eris>   # 数据入口:data.ypf 优先,散盘 data/ 为备
 cargo run -p yu-backend-wgpu --example first_frame
 # 输出 target/tmp/wgpu_first_frame.png
 #      target/tmp/wgpu_first_frame.report.json

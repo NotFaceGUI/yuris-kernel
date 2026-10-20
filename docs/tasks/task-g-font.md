@@ -182,7 +182,7 @@ base coverage → bold/italic → outline → shadow → color/gradient → rota
 export TEMP="D:/Art/ai/projects/YurisDroid/workbench/tmp"; TMP="$TEMP"
 export YURIS_TEST_TMP="D:/Art/ai/projects/yuris-kernel/target/test-tmp"
 export YURIS_REQUIRE_SAMPLES=1
-export YURIS_SAMPLE_ERIS_YSBIN="D:/Art/ai/projects/YurisDroid/workbench/project-eris/save/data/ysbin"
+export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"   # 数据入口:data.ypf 优先,data/ 为备
 export YURIS_SAMPLE_ERIS_YPF="D:/Art/ai/projects/YurisDroid/workbench/project-eris/data.ypf"
 export YURIS_SAMPLE_SDK0495="D:/Art/ai/projects/YurisDroid/target/sdk/0.495/yu-ris_0495_032"
 ```

@@ -7,7 +7,7 @@
 //! 用法:
 //!
 //! ```text
-//! set YURIS_SAMPLE_ERIS_YSBIN=<project-eris>/save/data/ysbin
+//! set YURIS_SAMPLE_ERIS_YSBIN=<project-eris>/data/ysbin
 //! set YURIS_SAMPLE_ERIS_YPF=<project-eris>/data.ypf      (可选)
 //! cargo run -p yu-backend-soft --example first_frame
 //! ```
@@ -42,8 +42,18 @@ fn run() -> Result<(), String> {
     let root_path = PathBuf::from(&root);
     let data_dir = root_path.join("data");
 
-    let src = DirSource::open(&data_dir, Codec::Cp932)
-        .map_err(|d| format!("打开 {} 失败: {}", data_dir.display(), d.detail))?;
+    // 数据入口两种合法形态:封包 data.ypf 优先,散盘 data/ 为备;哪个存在用哪个。
+    let src: Box<dyn yu_vfs::DataSource> = match ypf_path(&root_path) {
+        Some(ypf) => Box::new(
+            YpfSource::open(&ypf, Codec::Cp932)
+                .map_err(|d| format!("打开 {} 失败: {}", ypf.display(), d.detail))?,
+        ),
+        None => Box::new(
+            DirSource::open(&data_dir, Codec::Cp932).map_err(|d| {
+                format!("打开 {} 失败(且无 data.ypf): {}", data_dir.display(), d.detail)
+            })?,
+        ),
+    };
     let aux = DirSource::open(&root_path, Codec::Cp932)
         .map_err(|d| format!("打开 {} 失败: {}", root_path.display(), d.detail))?;
     let boot = BootConfig {
@@ -52,7 +62,7 @@ fn run() -> Result<(), String> {
         record_events: false,
         ..BootConfig::default()
     };
-    let mut vm = Vm::boot_with_aux(Box::new(src), Some(Box::new(aux)), boot)
+    let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), boot)
         .map_err(|d| format!("boot 失败: {}", d.detail))?;
     let viewport = Viewport::new(
         vm.tables().boot.config.width,
@@ -109,17 +119,22 @@ fn run() -> Result<(), String> {
         );
     }
 
-    // 纹理源:YPF(可选)在下,散盘 data(上层)覆盖。
+    // 纹理源:存在的形态入挂载栈;散盘在上,可覆盖封包同名资源。
     let mut mount = Mount::new(Codec::Cp932);
     if let Some(ypf) = ypf_path(&root_path) {
         let source = YpfSource::open(&ypf, Codec::Cp932)
             .map_err(|d| format!("打开 {} 失败: {}", ypf.display(), d.detail))?;
         mount.push(Box::new(source));
     }
-    let loose = DirSource::open(&data_dir, Codec::Cp932)
-        .map_err(|d| format!("打开 {} 失败: {}", data_dir.display(), d.detail))?;
-    let loose_files = loose.file_count();
-    mount.push(Box::new(loose));
+    let loose_files = if data_dir.is_dir() {
+        let loose = DirSource::open(&data_dir, Codec::Cp932)
+            .map_err(|d| format!("打开 {} 失败: {}", data_dir.display(), d.detail))?;
+        let count = loose.file_count();
+        mount.push(Box::new(loose));
+        count
+    } else {
+        0
+    };
 
     let store = TextureStore::new(
         Box::new(mount),
@@ -233,28 +248,11 @@ fn run() -> Result<(), String> {
 
 fn eris_root() -> Option<String> {
     if let Ok(root) = env::var("YURIS_SAMPLE_ERIS_ROOT") {
-        return Some(normalize_root(root));
+        return Some(root);
     }
     let ysbin = env::var("YURIS_SAMPLE_ERIS_YSBIN").ok()?;
-    let root = Path::new(&ysbin).ancestors().nth(2)?.display().to_string();
-    Some(normalize_root(root))
-}
-
-fn normalize_root(root: String) -> String {
-    let base = Path::new(&root);
-    if base.join("data").join("ysbin").join("ysc.ybn").exists() {
-        root
-    } else if base
-        .join("save")
-        .join("data")
-        .join("ysbin")
-        .join("ysc.ybn")
-        .exists()
-    {
-        base.join("save").display().to_string()
-    } else {
-        root
-    }
+    // 唯一约定:工程数据入口是 <工程根>/data;ysbin 位于 <工程根>/data/ysbin。
+    Some(Path::new(&ysbin).ancestors().nth(2)?.display().to_string())
 }
 
 fn ypf_path(root: &Path) -> Option<PathBuf> {

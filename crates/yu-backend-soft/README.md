@@ -9,7 +9,7 @@
 cargo test -p yu-backend-soft
 cargo clippy -p yu-backend-soft --all-targets
 
-export YURIS_SAMPLE_ERIS_YSBIN=<project-eris>/save/data/ysbin
+export YURIS_SAMPLE_ERIS_ROOT=<project-eris>   # 数据入口:data.ypf 优先,散盘 data/ 为备
 export YURIS_SAMPLE_ERIS_YPF=<project-eris>/data.ypf   # 可选
 cargo run -p yu-backend-soft --example first_frame
 ```

@@ -40,7 +40,7 @@ fn corpus_dir(name: &str, skips: &mut Skips) -> PathBuf {
 
 /// 工程根 = 向上最近一个含 `system/YSCom/YSCom.ycd` 的祖先目录。
 ///
-/// 语料目录可能被整体挪动(如 `save/data/ysbin`),不能假设固定层级。
+/// ysbin 与工程根之间不假定固定层级;以工程根标记定位,不认任何中间目录名。
 fn find_project_root(dir: &std::path::Path) -> Option<PathBuf> {
     let mut cur = dir.parent();
     for _ in 0..4 {

@@ -73,9 +73,10 @@ yu-vfs → yu-format → yu-rt
 cargo test --workspace
 
 # 真样本（仓库不附带游戏数据；缺失时测试显式失败 / 跳过并计数）
+# 数据入口：封包 <project>/data.ypf 优先，散盘 <project>/data/ 为备，哪个存在用哪个。
+# 勘误（2026-10-20）：save/data 是官方 exe 的解包产物，不是数据入口；代码不识别该回退。
 export YURIS_REQUIRE_SAMPLES=1
-export YURIS_SAMPLE_ERIS_YSBIN="<project-eris>/save/data/ysbin"
-export YURIS_SAMPLE_ERIS_YPF="<project-eris>/data.ypf"
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
 
 # headless 首帧
 cargo run -p yu-backend-soft --example first_frame

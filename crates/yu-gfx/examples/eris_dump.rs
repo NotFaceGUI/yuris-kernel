@@ -1,16 +1,17 @@
 //! 把 ERIS 首屏事件流喂给 `GfxState`,打印合成契约摘要。
 //!
 //! 用法:
-//!   YURIS_SAMPLE_ERIS_ROOT=<project-eris>/save cargo run -p yu-gfx --example eris_dump -- 1
+//!   YURIS_SAMPLE_ERIS_ROOT=<project-eris> cargo run -p yu-gfx --example eris_dump -- 1
 use std::collections::BTreeMap;
 
 use yu_gfx::{json, GfxConfig, GfxState, Viewport};
 use yu_rt::input::InputTimeline;
 use yu_rt::{BootConfig, Vm};
-use yu_vfs::{Codec, DirSource};
+use yu_vfs::{Codec, DirSource, YpfSource};
 
 fn eris_root() -> String {
-    let root = std::env::var("YURIS_SAMPLE_ERIS_ROOT")
+    // 唯一约定:工程数据入口是 <工程根>/data;ysbin 位于 <工程根>/data/ysbin。
+    std::env::var("YURIS_SAMPLE_ERIS_ROOT")
         .or_else(|_| {
             std::env::var("YURIS_SAMPLE_ERIS_YSBIN").map(|p| {
                 std::path::Path::new(&p)
@@ -21,22 +22,7 @@ fn eris_root() -> String {
                     .to_string()
             })
         })
-        .expect("set YURIS_SAMPLE_ERIS_ROOT or YURIS_SAMPLE_ERIS_YSBIN");
-    // 语料从 <project>/data 迁到 <project>/save/data;两种根都接受。
-    let base = std::path::Path::new(&root);
-    if base.join("data").join("ysbin").join("ysc.ybn").exists() {
-        root
-    } else if base
-        .join("save")
-        .join("data")
-        .join("ysbin")
-        .join("ysc.ybn")
-        .exists()
-    {
-        base.join("save").display().to_string()
-    } else {
-        root
-    }
+        .expect("set YURIS_SAMPLE_ERIS_ROOT or YURIS_SAMPLE_ERIS_YSBIN")
 }
 
 fn checksum(s: &str) -> u64 {
@@ -54,7 +40,13 @@ fn main() {
         .nth(1)
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
-    let src = DirSource::open(format!("{root}/data"), Codec::Cp932).expect("data");
+    // 数据入口两种合法形态:封包 data.ypf 优先,散盘 data/ 为备。
+    let ypf = std::path::PathBuf::from(&root).join("data.ypf");
+    let src: Box<dyn yu_vfs::DataSource> = if ypf.is_file() {
+        Box::new(YpfSource::open(&ypf, Codec::Cp932).expect("data.ypf"))
+    } else {
+        Box::new(DirSource::open(format!("{root}/data"), Codec::Cp932).expect("data"))
+    };
     let aux = DirSource::open(&root, Codec::Cp932).expect("project");
     let cfg = BootConfig {
         entry_label: "SYSTEM_START".to_string(),
@@ -62,7 +54,7 @@ fn main() {
         record_events: false,
         ..BootConfig::default()
     };
-    let mut vm = Vm::boot_with_aux(Box::new(src), Some(Box::new(aux)), cfg).expect("boot");
+    let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).expect("boot");
     let viewport = Viewport::new(
         vm.tables().boot.config.width,
         vm.tables().boot.config.height,
