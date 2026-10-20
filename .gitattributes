@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.sd binary
+*.ypf binary
+*.ymv binary
+*.ybn binary
+*.png binary
+*.ttf binary
+*.ttc binary

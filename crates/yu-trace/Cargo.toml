@@ -1,0 +1,14 @@
+[package]
+name = "yu-trace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yu-log = { path = "../yu-log" }
+yu-vfs = { path = "../yu-vfs" }
+yu-rt = { path = "../yu-rt" }
+
+[lib]
+name = "yu_trace"
+path = "src/lib.rs"

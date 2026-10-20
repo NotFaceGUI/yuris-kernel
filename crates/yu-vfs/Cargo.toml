@@ -1,0 +1,9 @@
+[package]
+name = "yu-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yu-log = { path = "../yu-log" }
+flate2.workspace = true

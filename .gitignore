@@ -1,0 +1,15 @@
+# 工作须知含真名对照表,永不入库
+AGENTS.md
+
+/target
+
+# 机器相关配置(含本机路径)
+.cargo/
+
+# 游戏数据、封包与产物不入库
+*.ypf
+*.ymv
+save/
+shots_*/
+dump_tex/
+docs/reverse/

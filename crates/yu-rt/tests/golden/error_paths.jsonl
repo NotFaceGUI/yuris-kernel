@@ -1,0 +1,6 @@
+{"frame":0,"sub":"task","kind":"task_spawn","id":"SYSTEM","script":0,"pc":0,"enabled":true,"main":true}
+{"frame":1,"sub":"frame","kind":"frame_start"}
+{"frame":1,"sub":"vm","kind":"command","script":0,"pc":0,"name":"GO","args":[{"slot":0,"value":{"t":"str","v":"NO.SUCH.LABEL"}}]}
+{"frame":1,"sub":"diag","kind":"diag","code":"rt.label","detail":"标签不存在:NO.SUCH.LABEL"}
+{"frame":1,"sub":"task","kind":"task_finish","id":"SYSTEM"}
+{"frame":1,"sub":"frame","kind":"frame_end"}

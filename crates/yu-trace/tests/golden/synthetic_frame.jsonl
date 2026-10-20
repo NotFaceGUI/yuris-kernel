@@ -1,0 +1,24 @@
+{"schema":2,"seq":0,"frame":null,"sub":"meta","kind":"header","payload":{"codec":"cp932","tables":["ysc: v495 (119 命令)","ysl: v495 (1 标签)","ysv: v495 (123 记录)","yst_list: v495 (1 条)","yscfg: v495 (640x480)","sysvars: 122 项 <- project YSCom.ycd (system/YSCom/YSCom.ycd, sha256 93fc200ae92b35b6a9224110169909ab87338d4d8cdea703e171b1fce4f2fc8f)","ycd: v495 (119 命令)"],"boot":{"entry":"SYSTEM_START","fps":60,"start_ms":0,"frame_ms":16,"script_key":"d36fac96","debug_mode":false,"argv":{"len":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"host":{"screen_color":32,"media_readonly":false,"os_sound":true,"dx_mode":0,"paths":{"len":0,"sha256":"092977d86764722166958b9307b445c3054aab39bd8f9dddc80363777cecc197"}}},"input":{"events":1,"sha256":"7e96156ba8cd4d8904710f8becad1eba98e34981f6079a91f079fd9c641798c4"},"kernel":"yu-trace 0.1.0"}}
+{"schema":2,"seq":1,"frame":null,"sub":"vfs","kind":"open","payload":{"source":"mem","key":"ysbin/ysc.ybn","bytes":3434,"sha256":"32a28cef33916e98c4b6c60e43ba39980b92c17b57d8651652f70fc068b75fa9","diag":null}}
+{"schema":2,"seq":2,"frame":null,"sub":"vfs","kind":"open","payload":{"source":"mem","key":"ysbin/ysl.ybn","bytes":1061,"sha256":"4c0fea1779dff837c83cd5c8be81a6e0bb12aeb1ca33b160cb6377b32433fcf7","diag":null}}
+{"schema":2,"seq":3,"frame":null,"sub":"vfs","kind":"open","payload":{"source":"mem","key":"ysbin/ysv.ybn","bytes":1978,"sha256":"b7567a06fd5506860b8487510ace847c0e2232b7fd269102f8d21eff9ab82f8f","diag":null}}
+{"schema":2,"seq":4,"frame":null,"sub":"vfs","kind":"open","payload":{"source":"mem","key":"ysbin/yst_list.ybn","bytes":67,"sha256":"69bb5f1fdaac5309f3665df5e3dc0b3b90078de850c673c2ac133f4322149d6e","diag":null}}
+{"schema":2,"seq":5,"frame":null,"sub":"vfs","kind":"open","payload":{"source":"mem","key":"ysbin/yscfg.ybn","bytes":85,"sha256":"96a038740846d22f6c131071dba2032217c391cf348acd17e31afa0f8e85aa67","diag":null}}
+{"schema":2,"seq":6,"frame":null,"sub":"vfs","kind":"open","payload":{"source":"mem","key":"system/yscom/yscom.ycd","bytes":5132,"sha256":"93fc200ae92b35b6a9224110169909ab87338d4d8cdea703e171b1fce4f2fc8f","diag":null}}
+{"schema":2,"seq":7,"frame":null,"sub":"vfs","kind":"open","payload":{"source":"mem","key":"ysbin/yst00000.ybn","bytes":211,"sha256":"fbfad154aff4e4165eae1d272bdabc0ec73083e5733e2c593017849f1032eed0","diag":null}}
+{"schema":2,"seq":8,"frame":0,"sub":"vm","kind":"task_spawn","payload":{"id":"SYSTEM","script":0,"pc":0,"enabled":true,"main":true}}
+{"schema":2,"seq":9,"frame":1,"sub":"vm","kind":"frame_start","payload":{}}
+{"schema":2,"seq":10,"frame":1,"sub":"vm","kind":"command","payload":{"script":0,"pc":0,"name":"INT","args":[{"slot":0,"value":{"t":"int","v":7}}]}}
+{"schema":2,"seq":11,"frame":1,"sub":"vm","kind":"command","payload":{"script":0,"pc":1,"name":"LET","args":[{"slot":0,"value":{"t":"int","v":14}}]}}
+{"schema":2,"seq":12,"frame":1,"sub":"vm","kind":"command","payload":{"script":0,"pc":2,"name":"FPS","args":[{"slot":0,"value":{"t":"int","v":30}}]}}
+{"schema":2,"seq":13,"frame":1,"sub":"vm","kind":"fps","payload":{"fps":30,"skip":false}}
+{"schema":2,"seq":14,"frame":1,"sub":"vm","kind":"command","payload":{"script":0,"pc":3,"name":"TEXT","args":[{"slot":0,"value":{"t":"str","v":"hello"}}]}}
+{"schema":2,"seq":15,"frame":1,"sub":"vm","kind":"system_call","payload":{"name":"TEXT","args":[]}}
+{"schema":2,"seq":16,"frame":1,"sub":"vm","kind":"command","payload":{"script":0,"pc":4,"name":"WAIT","args":[{"slot":0,"value":{"t":"int","v":1}}]}}
+{"schema":2,"seq":17,"frame":1,"sub":"vm","kind":"wait","payload":{"task":"SYSTEM","frames":1,"time_ms":null}}
+{"schema":2,"seq":18,"frame":1,"sub":"vm","kind":"frame_end","payload":{}}
+{"schema":2,"seq":19,"frame":2,"sub":"vm","kind":"frame_start","payload":{}}
+{"schema":2,"seq":20,"frame":2,"sub":"vm","kind":"command","payload":{"script":0,"pc":5,"name":"END","args":[]}}
+{"schema":2,"seq":21,"frame":2,"sub":"vm","kind":"end","payload":{"restart":false}}
+{"schema":2,"seq":22,"frame":2,"sub":"vm","kind":"task_finish","payload":{"id":"SYSTEM"}}
+{"schema":2,"seq":23,"frame":2,"sub":"vm","kind":"frame_end","payload":{}}

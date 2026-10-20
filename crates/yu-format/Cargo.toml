@@ -1,0 +1,8 @@
+[package]
+name = "yu-format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yu-log = { path = "../yu-log" }

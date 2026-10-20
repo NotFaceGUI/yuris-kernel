@@ -1,0 +1,6 @@
+{"frame":0,"sub":"task","kind":"task_spawn","id":"SYSTEM","script":76,"pc":0,"enabled":true,"main":true}
+{"frame":1,"sub":"frame","kind":"frame_start"}
+{"frame":1,"sub":"vm","kind":"command","script":76,"pc":0,"name":"LET","args":[{"slot":0,"value":{"t":"int","v":0}},{"slot":0,"value":{"t":"int","v":800}}]}
+{"frame":1,"sub":"vm","kind":"command","script":76,"pc":1,"name":"RETURN","args":[]}
+{"frame":1,"sub":"task","kind":"task_finish","id":"SYSTEM"}
+{"frame":1,"sub":"frame","kind":"frame_end"}
