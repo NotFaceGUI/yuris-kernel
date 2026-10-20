@@ -31,7 +31,11 @@ impl DiffReport {
         Diag::fatal(error::code::DIFF, Boundary::Format).with_detail(format!(
             "first divergence at line {} ({}) expected {} actual {}",
             self.line,
-            if self.path.is_empty() { "/" } else { &self.path },
+            if self.path.is_empty() {
+                "/"
+            } else {
+                &self.path
+            },
             self.expected,
             self.actual
         ))
@@ -171,9 +175,7 @@ impl Projection {
                 true
             }
             None => {
-                self.include_null_frames
-                    && self.frame_first.is_none()
-                    && self.frame_last.is_none()
+                self.include_null_frames && self.frame_first.is_none() && self.frame_last.is_none()
             }
         }
     }
@@ -358,8 +360,10 @@ pub fn diff_aligned_logs(
     actual: &TraceLog,
     options: &AlignedDiffOptions,
 ) -> Result<(), DiffFailure> {
-    if let (Some(first), Some(last)) = (options.projection.frame_first, options.projection.frame_last)
-    {
+    if let (Some(first), Some(last)) = (
+        options.projection.frame_first,
+        options.projection.frame_last,
+    ) {
         if first > last {
             return Err(projection_failure(format!(
                 "projection frame_first {first} is greater than frame_last {last}"
@@ -378,15 +382,18 @@ pub fn diff_aligned_logs(
         .enumerate()
         .map(|(index, entry)| (entry.key.clone(), index))
         .collect();
-    let expected_keys: BTreeSet<RecordKey> =
-        expected_entries.iter().map(|entry| entry.key.clone()).collect();
+    let expected_keys: BTreeSet<RecordKey> = expected_entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect();
 
     for (position, entry) in expected_entries.iter().enumerate() {
         match actual_index.get(&entry.key) {
             Some(&actual_position) => {
                 let actual_entry = &actual_entries[actual_position];
                 let expected_payload = project_payload(&entry.payload, &options.payload_fields);
-                let actual_payload = project_payload(&actual_entry.payload, &options.payload_fields);
+                let actual_payload =
+                    project_payload(&actual_entry.payload, &options.payload_fields);
                 if let Some(site) = compare(&expected_payload, &actual_payload, "/payload") {
                     let report = AlignedDiffReport {
                         key: entry.key.clone(),
@@ -412,7 +419,10 @@ pub fn diff_aligned_logs(
                     expected_line: Some(entry.line),
                     actual_line: None,
                     path: String::new(),
-                    expected: json::to_text(&project_payload(&entry.payload, &options.payload_fields)),
+                    expected: json::to_text(&project_payload(
+                        &entry.payload,
+                        &options.payload_fields,
+                    )),
                     actual: "null".to_string(),
                     context: context_for(
                         &expected_entries,
@@ -494,8 +504,7 @@ fn context_for(
     let start = position.saturating_sub(context);
     let end = (position + context + 1).min(expected.len());
     let mut out = Vec::with_capacity(end - start);
-    for index in start..end {
-        let entry = &expected[index];
+    for (index, entry) in expected.iter().enumerate().take(end).skip(start) {
         let marker = if index == position { ">>" } else { "  " };
         let actual = actual_index
             .get(&entry.key)
@@ -743,8 +752,10 @@ fn compare(expected: &Json, actual: &Json, path: &str) -> Option<Site> {
                 }
             }
             // 字段集合相同但顺序不同:协议要求固定顺序,直接报整对象。
-            let expected_order: Vec<&str> =
-                expected_fields.iter().map(|(key, _)| key.as_str()).collect();
+            let expected_order: Vec<&str> = expected_fields
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect();
             let actual_order: Vec<&str> =
                 actual_fields.iter().map(|(key, _)| key.as_str()).collect();
             if expected_order != actual_order {
@@ -769,7 +780,8 @@ fn compare(expected: &Json, actual: &Json, path: &str) -> Option<Site> {
             let common = expected_items.len().min(actual_items.len());
             for index in 0..common {
                 let item_path = child_index(path, index);
-                if let Some(site) = compare(&expected_items[index], &actual_items[index], &item_path)
+                if let Some(site) =
+                    compare(&expected_items[index], &actual_items[index], &item_path)
                 {
                     return Some(site);
                 }
@@ -824,7 +836,9 @@ fn child_index(parent: &str, index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{BootSummary, ClockSummary, HeaderPayload, InputSummary, Payload, ProducerInfo};
+    use crate::record::{
+        BootSummary, ClockSummary, HeaderPayload, InputSummary, Payload, ProducerInfo,
+    };
 
     fn header() -> HeaderPayload {
         HeaderPayload {
@@ -881,14 +895,19 @@ mod tests {
         assert_eq!(report.actual, "61");
     }
 
-        #[test]
+    #[test]
     fn shortened_actual_has_length_code() {
         let text = log().to_jsonl();
         let mut lines: Vec<&str> = text.lines().collect();
         lines.pop();
-        let shortened = format!("{}
-", lines.join("
-"));
+        let shortened = format!(
+            "{}
+",
+            lines.join(
+                "
+"
+            )
+        );
         let failure = diff_text(&text, &shortened).unwrap_err();
         assert_eq!(failure.code(), error::code::LENGTH);
     }
@@ -912,11 +931,7 @@ mod tests {
     #[test]
     fn key_order_change_is_a_divergence() {
         let text = log().to_jsonl();
-        let mutated = text.replacen(
-            "\"fps\":60,\"skip\":false",
-            "\"skip\":false,\"fps\":60",
-            1,
-        );
+        let mutated = text.replacen("\"fps\":60,\"skip\":false", "\"skip\":false,\"fps\":60", 1);
         let failure = diff_text(&text, &mutated).unwrap_err();
         assert_eq!(failure.code(), error::code::DIFF);
         assert_eq!(failure.report().unwrap().line, 3);
@@ -926,11 +941,7 @@ mod tests {
     fn whitespace_change_is_a_divergence() {
         // 不做任何归一化:纯空白差异也是分歧,报告整条记录。
         let text = log().to_jsonl();
-        let mutated = text.replacen(
-            "\"fps\":60,\"skip\":false",
-            "\"fps\": 60,\"skip\":false",
-            1,
-        );
+        let mutated = text.replacen("\"fps\":60,\"skip\":false", "\"fps\": 60,\"skip\":false", 1);
         let failure = diff_text(&text, &mutated).unwrap_err();
         assert_eq!(failure.code(), error::code::DIFF);
         let report = failure.report().unwrap();
@@ -984,7 +995,12 @@ mod tests {
         log
     }
 
-    fn frame_summary(frame: u64, op_count: u64, executable_ops: u64, skipped_ops: u64) -> FrameSummary {
+    fn frame_summary(
+        frame: u64,
+        op_count: u64,
+        executable_ops: u64,
+        skipped_ops: u64,
+    ) -> FrameSummary {
         FrameSummary::from_input(FrameDescriptionInput {
             frame,
             level: FrameLevel::Event,
@@ -1015,17 +1031,13 @@ mod tests {
         let actual = command_log(official_header, &["A", "B"]);
 
         // 跨 producer:kernel/tables/producer 名称版本不参与比较。
-        assert!(diff_aligned_logs(
-            &expected,
-            &actual,
-            &AlignedDiffOptions::cross_producer()
-        )
-        .is_ok());
+        assert!(
+            diff_aligned_logs(&expected, &actual, &AlignedDiffOptions::cross_producer()).is_ok()
+        );
 
         // 同 producer 严格模式会报 header 差异。
-        let failure =
-            diff_aligned_logs(&expected, &actual, &AlignedDiffOptions::same_producer())
-                .unwrap_err();
+        let failure = diff_aligned_logs(&expected, &actual, &AlignedDiffOptions::same_producer())
+            .unwrap_err();
         assert_eq!(failure.code(), error::code::DIFF);
         let report = failure.aligned_report().unwrap();
         assert_eq!(report.key.kind, Kind::Header);
@@ -1033,18 +1045,13 @@ mod tests {
 
         // 样本摘要不同:即使跨 producer 也必须报出来(当两侧都存在时)。
         let different_sample = header_with(
-            ProducerInfo::official("official-eris", "0.1")
-                .with_sample_sha256("b".repeat(64)),
+            ProducerInfo::official("official-eris", "0.1").with_sample_sha256("b".repeat(64)),
             "official engine trace",
             &[],
         );
         let actual = command_log(different_sample, &["A", "B"]);
-        let failure = diff_aligned_logs(
-            &expected,
-            &actual,
-            &AlignedDiffOptions::cross_producer(),
-        )
-        .unwrap_err();
+        let failure = diff_aligned_logs(&expected, &actual, &AlignedDiffOptions::cross_producer())
+            .unwrap_err();
         assert_eq!(
             failure.aligned_report().unwrap().path,
             "/header/sample_sha256"
@@ -1058,12 +1065,8 @@ mod tests {
         );
         wrong_codec.codec = "gbk".to_string();
         let actual = command_log(wrong_codec, &["A", "B"]);
-        let failure = diff_aligned_logs(
-            &expected,
-            &actual,
-            &AlignedDiffOptions::cross_producer(),
-        )
-        .unwrap_err();
+        let failure = diff_aligned_logs(&expected, &actual, &AlignedDiffOptions::cross_producer())
+            .unwrap_err();
         assert_eq!(failure.aligned_report().unwrap().path, "/header/codec");
     }
 

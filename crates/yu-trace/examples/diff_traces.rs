@@ -159,7 +159,14 @@ fn print_failure(failure: &DiffFailure) {
                 .map(|line| line.to_string())
                 .unwrap_or_else(|| "missing".to_string())
         );
-        println!("path={}", if report.path.is_empty() { "/" } else { &report.path });
+        println!(
+            "path={}",
+            if report.path.is_empty() {
+                "/"
+            } else {
+                &report.path
+            }
+        );
         println!("expected={}", report.expected);
         println!("actual={}", report.actual);
         for line in &report.context {
@@ -167,7 +174,14 @@ fn print_failure(failure: &DiffFailure) {
         }
     } else if let Some(report) = failure.report() {
         println!("line={}", report.line);
-        println!("path={}", if report.path.is_empty() { "/" } else { &report.path });
+        println!(
+            "path={}",
+            if report.path.is_empty() {
+                "/"
+            } else {
+                &report.path
+            }
+        );
         println!("expected={}", report.expected);
         println!("actual={}", report.actual);
     } else {

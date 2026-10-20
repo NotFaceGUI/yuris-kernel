@@ -52,11 +52,7 @@ impl<D: DataSource> TracingSource<D> {
     }
 
     /// 与另一个录制源共享同一个帧号句柄(主源与 aux 源必须一致)。
-    pub fn from_recorder_with_frame(
-        inner: D,
-        recorder: EventRecorder,
-        frame: FrameHandle,
-    ) -> Self {
+    pub fn from_recorder_with_frame(inner: D, recorder: EventRecorder, frame: FrameHandle) -> Self {
         let source_name = inner.source_name().to_string();
         Self {
             inner,
@@ -92,7 +88,8 @@ impl<D: DataSource> TracingSource<D> {
 }
 
 impl<D: DataSource> DataSource for TracingSource<D> {
-    fn open(&self, path: &LookupKey) -> Result<Vec<u8>, Diag> {        match self.inner.open(path) {
+    fn open(&self, path: &LookupKey) -> Result<Vec<u8>, Diag> {
+        match self.inner.open(path) {
             Ok(bytes) => {
                 self.recorder.shared_log().borrow_mut().push(
                     self.frame.get(),
@@ -138,8 +135,7 @@ impl<D: DataSource> DataSource for TracingSource<D> {
     fn list(&self, path: &LookupKey) -> Result<Vec<Entry>, Diag> {
         match self.inner.list(path) {
             Ok(entries) => {
-                let recorded: Vec<ListEntry> =
-                    entries.iter().map(ListEntry::from_entry).collect();
+                let recorded: Vec<ListEntry> = entries.iter().map(ListEntry::from_entry).collect();
                 self.recorder.shared_log().borrow_mut().push(
                     self.frame.get(),
                     Payload::VfsList {

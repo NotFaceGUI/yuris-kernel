@@ -16,7 +16,8 @@ use yu_vfs::{Codec, DataSource, Entry, LookupKey, MemSource};
 fn build_source() -> MemSource {
     let mut src = MemSource::new(Codec::Cp932);
     src.insert(br"ysbin\ysc.ybn", vec![1, 2, 3, 4, 5]).unwrap();
-    src.insert(b"ysbin/ysl.ybn", vec![0x83, 0x5c, 0xff]).unwrap();
+    src.insert(b"ysbin/ysl.ybn", vec![0x83, 0x5c, 0xff])
+        .unwrap();
     src.insert(b"data/cg/ev/a.png", (0..255).collect()).unwrap();
     src.insert_dir(b"empty").unwrap();
     src
@@ -202,8 +203,7 @@ fn frame_annotation_is_recorded_verbatim() {
             assert_eq!(source, "mem");
             assert_eq!(recorded_key.as_slice(), b"ysbin");
             assert!(diag.is_none());
-            let expected: Vec<ListEntry> =
-                entries.iter().map(ListEntry::from_entry).collect();
+            let expected: Vec<ListEntry> = entries.iter().map(ListEntry::from_entry).collect();
             assert_eq!(recorded_entries, &expected);
             // 目录项保持数据源给出的顺序(名字升序)。
             assert!(recorded_entries.len() >= 2);
@@ -225,7 +225,9 @@ fn error_payloads_keep_the_stable_code_not_the_message() {
     let records = log.borrow();
     match records.records()[0].payload() {
         Payload::VfsList {
-            entries, diag: recorded, ..
+            entries,
+            diag: recorded,
+            ..
         } => {
             assert!(entries.is_empty());
             assert_eq!(recorded.as_deref(), Some(yu_log::code::vfs::NOT_DIR));

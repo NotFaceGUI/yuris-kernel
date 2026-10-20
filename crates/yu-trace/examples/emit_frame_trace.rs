@@ -56,8 +56,7 @@ fn main() -> ExitCode {
     let producer = match producer_kind.as_str() {
         "official" => {
             let name = arg(&args, "--producer-name").unwrap_or_else(|| "official".to_string());
-            let version =
-                arg(&args, "--producer-version").unwrap_or_else(|| "0.0.0".to_string());
+            let version = arg(&args, "--producer-version").unwrap_or_else(|| "0.0.0".to_string());
             let mut producer = ProducerInfo::official(name, version);
             if let Some(sample) = arg(&args, "--sample-sha256") {
                 producer = producer.with_sample_sha256(sample);

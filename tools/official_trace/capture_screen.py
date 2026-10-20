@@ -36,14 +36,38 @@ import subprocess
 import sys
 import time
 
-from PIL import ImageGrab
+from PIL import Image, ImageGrab
 
 user32 = ctypes.windll.user32
+gdi32 = ctypes.windll.gdi32
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wt.DWORD),
+        ("biWidth", wt.LONG),
+        ("biHeight", wt.LONG),
+        ("biPlanes", wt.WORD),
+        ("biBitCount", wt.WORD),
+        ("biCompression", wt.DWORD),
+        ("biSizeImage", wt.DWORD),
+        ("biXPelsPerMeter", wt.LONG),
+        ("biYPelsPerMeter", wt.LONG),
+        ("biClrUsed", wt.DWORD),
+        ("biClrImportant", wt.DWORD),
+    ]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wt.DWORD * 3)]
+
+
 user32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM), wt.LPARAM]
 user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
 user32.IsWindowVisible.argtypes = [wt.HWND]
 user32.IsWindowVisible.restype = wt.BOOL
 user32.GetClientRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
 user32.ClientToScreen.argtypes = [wt.HWND, ctypes.POINTER(wt.POINT)]
 user32.SetForegroundWindow.argtypes = [wt.HWND]
 user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
@@ -82,15 +106,46 @@ def find_engine_window(pid, timeout=15.0):
 
 
 def grab_client(hwnd, width, height):
-    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-    user32.SetForegroundWindow(hwnd)
-    time.sleep(0.08)
+    """PrintWindow 整个窗口后按客户区偏移裁剪;失败再前台截图。"""
+    window_rect = wt.RECT()
+    client_rect = wt.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(window_rect))
+    user32.GetClientRect(hwnd, ctypes.byref(client_rect))
     origin = wt.POINT(0, 0)
     user32.ClientToScreen(hwnd, ctypes.byref(origin))
-    image = ImageGrab.grab(
+    full_width = window_rect.right - window_rect.left
+    full_height = window_rect.bottom - window_rect.top
+    crop_x = max(0, origin.x - window_rect.left)
+    crop_y = max(0, origin.y - window_rect.top)
+    hdc = user32.GetDC(hwnd)
+    mem = gdi32.CreateCompatibleDC(hdc)
+    bmp = gdi32.CreateCompatibleBitmap(hdc, full_width, full_height)
+    old = gdi32.SelectObject(mem, bmp)
+    ok = user32.PrintWindow(hwnd, mem, 2)
+    info = BITMAPINFO()
+    info.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    info.bmiHeader.biWidth = full_width
+    info.bmiHeader.biHeight = -full_height
+    info.bmiHeader.biPlanes = 1
+    info.bmiHeader.biBitCount = 32
+    info.bmiHeader.biCompression = 0
+    buffer = ctypes.create_string_buffer(full_width * full_height * 4)
+    lines = gdi32.GetDIBits(mem, bmp, 0, full_height, buffer, ctypes.byref(info), 0)
+    gdi32.SelectObject(mem, old)
+    gdi32.DeleteObject(bmp)
+    gdi32.DeleteDC(mem)
+    user32.ReleaseDC(hwnd, hdc)
+    if ok and lines:
+        data = bytearray(buffer.raw)
+        data[0::4], data[2::4] = data[2::4], data[0::4]
+        image = Image.frombytes("RGBA", (full_width, full_height), bytes(data))
+        return image.crop((crop_x, crop_y, crop_x + width, crop_y + height))
+    user32.ShowWindow(hwnd, 9)
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(0.6)
+    return ImageGrab.grab(
         bbox=(origin.x, origin.y, origin.x + width, origin.y + height)
-    )
-    return image.convert("RGBA")
+    ).convert("RGBA")
 
 
 def empty_paths_digest():
@@ -109,6 +164,7 @@ def main():
     parser.add_argument("--producer-name", default="official-eris-screen")
     parser.add_argument("--producer-version", default="0.1.0")
     parser.add_argument("--no-send-input", action="store_true")
+    parser.add_argument("--warmup", type=float, default=5.0)
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -129,6 +185,8 @@ def main():
             return 2
         hwnd, width, height = window
         print(f"window pid={process.pid} hwnd={hwnd} client={width}x{height}")
+        if args.warmup > 0:
+            time.sleep(args.warmup)
         frames = []
         timeline = []
         for index in range(1, args.frames + 1):

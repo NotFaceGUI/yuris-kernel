@@ -251,7 +251,10 @@ fn bytes_and_floats_survive_text_encoding() {
         .expect("command record");
     match command.payload() {
         Payload::VmCommand { args, .. } => {
-            assert_eq!(args[2].value, TraceValue::Str(vec![0x83, 0x5c, 0x83, 0x41, 0xff, 0x00]));
+            assert_eq!(
+                args[2].value,
+                TraceValue::Str(vec![0x83, 0x5c, 0x83, 0x41, 0xff, 0x00])
+            );
         }
         other => panic!("unexpected payload: {other:?}"),
     }
@@ -274,7 +277,16 @@ fn write_trace_rejects_path_injection() {
     let log = sample_log();
     let err = yu_trace::write_trace(&log, "../escape.jsonl").unwrap_err();
     assert_eq!(err.code, yu_trace::code::IO);
-    assert_eq!(yu_trace::write_trace(&log, "a/b.jsonl").unwrap_err().code, yu_trace::code::IO);
-    assert_eq!(yu_trace::write_trace(&log, "..").unwrap_err().code, yu_trace::code::IO);
-    assert_eq!(yu_trace::write_trace(&log, ".").unwrap_err().code, yu_trace::code::IO);
+    assert_eq!(
+        yu_trace::write_trace(&log, "a/b.jsonl").unwrap_err().code,
+        yu_trace::code::IO
+    );
+    assert_eq!(
+        yu_trace::write_trace(&log, "..").unwrap_err().code,
+        yu_trace::code::IO
+    );
+    assert_eq!(
+        yu_trace::write_trace(&log, ".").unwrap_err().code,
+        yu_trace::code::IO
+    );
 }

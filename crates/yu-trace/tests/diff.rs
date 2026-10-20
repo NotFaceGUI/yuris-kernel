@@ -13,13 +13,16 @@ use yu_trace::{diff_logs, diff_text, error, DiffFailure};
 fn log() -> TraceLog {
     let mut log = TraceLog::new();
     log.push_header(header_for(vec!["ysc: v495 (105 命令)".to_string()]));
-    log.push(None, Payload::VfsOpen {
-        source: "ypf".to_string(),
-        key: b"ysbin/ysc.ybn".to_vec(),
-        bytes: Some(11156),
-        sha256: Some("aa".repeat(32)),
-        diag: None,
-    });
+    log.push(
+        None,
+        Payload::VfsOpen {
+            source: "ypf".to_string(),
+            key: b"ysbin/ysc.ybn".to_vec(),
+            bytes: Some(11156),
+            sha256: Some("aa".repeat(32)),
+            diag: None,
+        },
+    );
     log.push(
         Some(1),
         Payload::VmCommand {

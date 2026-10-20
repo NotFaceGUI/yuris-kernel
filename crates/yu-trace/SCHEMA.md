@@ -268,13 +268,13 @@
 | 字段 | 类型 | 含义 |
 |---|---|---|
 | `frame` | u64 | 必须等于封套 `frame` |
-| `level` | `"event"` \| `"screen"` | 事件级(帧语义层)或屏幕级(官方截图摘要) |
+| `level` | `"event"` \| `"screen"` | 事件级(帧语义层)或屏幕级(截图摘要) |
 | `display_sha256` | string | **规范 display JSON 文本**的 SHA-256(无 display 时由调用方提供) |
 | `pass_count` | u32 | 渲染 pass 数 |
 | `op_count` | u64 | 总操作数 |
 | `executable_ops` | u64 | 可执行操作数 |
 | `skipped_ops` | u64 | 跳过操作数 |
-| `display` | JSON \| null | 完整规范化 frame JSON;`null` = 摘要级记录 |
+| `display` | JSON \| null | 事件级:完整规范化 frame JSON;屏幕级:可选的 screen descriptor `{"width":W,"height":H,"pixels_sha256":...}`;`null` = 纯摘要级记录 |
 
 规则:
 
@@ -284,7 +284,13 @@
 3. 规范化只去掉 JSON 空白,**保持对象键序与数组顺序**;同一调用方输入两次写入
    逐字节一致。
 4. 本 crate 不解释 display 的内部结构;与 `yu-gfx` 的字段解耦,由调用方传入。
-5. 屏幕级记录(`level = "screen"`)只证明"画面摘要",不能替代事件级 L1。
+5. 屏幕级记录(`level = "screen"`)只证明"画面摘要",不能替代事件级 L1:
+   - 推荐 `display` 写 screen descriptor:
+     `{"width":W,"height":H,"pixels_sha256":SHA-256(b"RGBA8"+W:u32 LE+H:u32 LE+pixels)}`;
+   - `pass_count/op_count/executable_ops/skipped_ops` 在引擎外部不可观测时写 0,
+     但必须同时用 `level = "screen"` 与采集器 manifest 声明"不是实测 0";
+   - 屏幕级 header 的 `boot`/`tables` 也可能是占位值,跨 producer 比较时用
+     `HeaderCompare::CodecSample` 或 `Ignore`,不得声称 boot 已对齐。
 
 ### 4.5 保留(M3,仍拒绝)
 

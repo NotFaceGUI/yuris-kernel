@@ -164,7 +164,10 @@ pub(crate) fn as_bool(value: &Json) -> Result<bool, String> {
 pub(crate) fn as_u64(value: &Json) -> Result<u64, String> {
     match value {
         Json::UInt(n) => Ok(*n),
-        other => Err(format!("expected unsigned integer, got {}", type_name(other))),
+        other => Err(format!(
+            "expected unsigned integer, got {}",
+            type_name(other)
+        )),
     }
 }
 
@@ -258,10 +261,7 @@ struct Parser<'a> {
 
 impl Parser<'_> {
     fn ws(&mut self) {
-        while matches!(
-            self.bytes.get(self.pos),
-            Some(b' ' | b'\t' | b'\n' | b'\r')
-        ) {
+        while matches!(self.bytes.get(self.pos), Some(b' ' | b'\t' | b'\n' | b'\r')) {
             self.pos += 1;
         }
     }

@@ -3,21 +3,56 @@
 > 唯一进度真相。每项改动追加"成果 N"(日期、内容、证据、验证命令与原始结果)。
 > 勘误必须留痕: 旧结论、更正内容、发现方式。
 
-## 结论汇总
+## 结论汇总(2026-10-20 按实际落地重写)
 
 | 子系统 | 状态 | oracle | 备注 |
 |---|---|---|---|
 | yu-log | **已实现** | 结构化码/JSONL 往返 | 成果 A |
 | yu-vfs | **已实现** | 等价性 + 真包索引闭合 | 成果 A;两种方言,一种待真样本 |
-| yu-trace | 骨架 | — | 第 0 步,先于一切语义层 |
-| yu-format | 未实现 | 字节一致 | ypf → ybn → yssd |
-| yu-script | 未实现 | 译码/求值轨迹一致 | |
-| yu-macro | 未实现 | 展开序列一致 | scope 待旁线笔记落实 |
-| yu-vm | 未实现 | 事件流逐事件一致 | |
-| yu-graphics / yu-sound / yu-input | 未实现 | 各域命令序列一致 | |
-| yu-save | 未实现 | .sd 回写字节一致 | |
-| yu-scenario | 未实现 | 同文本同锚点一致 | |
-| yu-player / yu-cli | 骨架 | 编排次序一致 | |
+| yu-format | **已实现** | 真实 ERIS/SDK 语料 + 字节一致 | 成果 B1/B2、E3 |
+| yu-rt | **已实现** | 事件流/任务/帧边界 + 真语料 | 成果 C/E2;脚本/VM/任务/`InputTimeline` 均在此 |
+| yu-gfx | **已实现(语义层)** | `CompositorFrame` + ERIS 首屏 golden | M3-GFX/F1/F2;COPY/图像加工/部分 MODE 挂账 |
+| yu-font | **已实现** | 字形/样式 golden + ERIS 配置直出 | 成果 G1 |
+| yu-backend-soft | **已实现(确定性参考)** | 同帧 PNG 逐字节确定 + 首帧已产出 | 成果 M3-SOFT;可执行子集,skipped 可审计 |
+| yu-trace | **已实现(schema v3)** | 内核自回放 + 官方屏幕级 producer | 成果 H1;官方事件级 L1 未达成 |
+| yu-backend-wgpu | 未开始 | soft 同帧逐像素 diff | 语义稳定后开工 |
+| 桌面 / wasm / Android 宿主 | 未开始 | 同帧呈现 + 输入时间线 | wasm 仍是 M3 最终呈现目标 |
+| yu-sound / yu-save | 未开始 | 各域命令 / 字节一致 | 尚无 crate |
+| scenario 解释器 / yu-cli | 未开始 | 同文本同锚点 | CLI 是否保留待定 |
+
+> **勘误(2026-10-20,架构与实现对账)**:本表替换 2026-10-19 的旧汇总。
+> 旧结论是 12/9-crate 设计,列有 `yu-script`/`yu-macro`/`yu-vm`/`yu-graphics`/
+> `yu-input`/`yu-player` 等;实际落地把脚本/VM/任务/帧/输入时间线收敛进
+> `yu-rt`,渲染语义独立为 `yu-gfx`,字体独立为 `yu-font`,软后端为
+> `yu-backend-soft`,**没有 `yu-assets` 兄弟 crate**(纹理解析在后端/装配层)。
+> 旧表述“M3 = wasm 呈现闭环”保留为最终目标,但 M3 已拆成
+> M3a 语义层 → M3b 软后端首帧 → M3c wgpu 对拍 → M3d wasm 宿主闭环。
+> 发现方式 = `cargo metadata` + `git log` + 实际首帧产物;历史成果 1–7 不回改。
+> `docs/architecture.md` 仍是 v1.2 设计稿,与本节冲突时以本节与代码为准。
+
+## 架构现状(2026-10-20)
+
+```text
+yu-vfs → yu-format → yu-rt(脚本/VM/任务/帧/InputTimeline)
+                         │ VmEvent::DomainCall / Text
+                         ▼
+                  yu-gfx(语义显示列表 CompositorFrame + GfxHost)
+                         │
+             ┌───────────┴───────────┐
+             ▼                       ▼
+   yu-backend-soft             yu-backend-wgpu(未开始)
+   确定性参考 / PNG / golden    主后端,同帧逐像素对拍
+             │                       │
+             └───────────┬───────────┘
+                         ▼
+              hosts: 桌面 / wasm / Android(未开始)
+yu-font: 字体发现/栅格/样式,供 gfx 文本与后端使用
+yu-trace: vfs/vm/frame 边界录制、回放、跨 producer diff
+```
+
+- 纹理解析不在独立 crate:第一个实现是 `yu-backend-soft::TextureStore`
+  (`yu-vfs` 取字节 + `frame.image_probe_order` + image 解码 + 缓存)。
+- 文字链路: `yu-font` 已独立完成,尚未桥接进 `yu-gfx`/后端(DIV-GFX-012)。
 
 ## 成果 1 (2026-10-19) · 仓库脚手架
 
@@ -2019,3 +2054,149 @@ $ cargo run -p yu-font --example render_reference
 - `BNO` 字体列表分支 `0x444ce7` 未解析(仅保存值)。
 - GDI `lfHeight` 与 SX/SY 的精确映射、合成粗体像素量未完全取证。
 - `FONT[NAME]` 找不到时引擎的回退/报错行为未取证(本 crate 显式失败)。
+
+## 成果 H1 (2026-10-20) · yu-trace schema v3 + 帧描述 + producer-neutral 对齐 + 官方屏幕级 oracle
+
+> 任务书 `docs/tasks/task-h-trace-oracle.md`。只改 `crates/yu-trace` 与 `tools/`;
+> 未改 `yu-rt`/`yu-gfx`/字体/后端;无 git 写操作。
+
+### 1. schema v3(producer-neutral)
+
+- `SCHEMA_VERSION = 3`;v2 文件不迁移、直接 `trace.schema`。
+- header 新增:
+  - `producer`: `kind`(kernel/official)、`name`、`version`(official 侧是采集器版本)、
+    `sample_sha256`;
+  - `clock`: `mode`(none/tick/tick_at/mixed) + 逐 tick `now_ms` 序列。
+- 跨 producer 语义比较只投影 `codec` + `boot` + `input` + 双方都存在的
+  `producer.sample_sha256`;`kernel`/`tables`/producer 名称版本/`clock` 不参与
+  跨 producer 整行比较(见 `HeaderCompare`)。
+- `seq` 仍为同一 producer 内唯一序;跨 producer 对齐改用
+  `(sub, kind, frame, ordinal)`。
+
+### 2. ③ frame_description(真实记录)
+
+- `sub=frame` / `kind=frame_description` 从占位变为真实记录,payload:
+  `frame, level(event|screen), display_sha256, pass_count, op_count,
+  executable_ops, skipped_ops, display`。
+- 调用方输入结构 `FrameDescriptionInput`;本 crate 不硬绑 `yu-gfx` 字段:
+  - 传 `display` JSON → 解析、规范序列化、计算/校验内容寻址;
+  - 只传摘要 → `display=null` 的摘要级记录;
+  - 坏 hash 格式 = `trace.parse`,display 与摘要不一致 = `trace.schema`;
+  - 同一输入两次写入逐字节一致。
+- ④ `platform/platform_call` 仍显式拒绝。
+
+### 3. 投影/对齐 diff
+
+- 新增 `diff_aligned`/`diff_aligned_logs` 与 `diff_traces` example:
+  - 逻辑键 `(sub, kind, frame, ordinal)`;
+  - `Projection` 按 sub/kind/frame 过滤;
+  - `HeaderCompare::{Ignore, CodecSample, Semantic, Strict}`;
+  - `payload_fields` 显式选择可比 payload 顶层键(用于 official 没有 args 的场景);
+  - 首分歧报告 `key / expected_line / actual_line / path / expected / actual / context`。
+- 原有 `diff_text` 逐行字节严格 diff 保持不变。
+
+### 4. 回放闭合
+
+- `VmTrace` 记录逐 tick 时钟,`finish` 写入 header;`verify_clock` 回放校验。
+- `from_header_checked` / `boot_checked` 校验数据源编码与 `header.codec` 一致。
+- aux 源与主源共享同一个 `FrameHandle`(`from_recorder_with_frame`)。
+- `consumed_input_summary` 只覆盖 VM 实际消费的逻辑帧;`finish_with_timeline`
+  使用它。
+
+### 5. 官方 producer
+
+- `tools/official_trace/capture_screen.py`:官方 0.495 `yu-ris.exe` + ERIS
+  `data.ypf`,PrintWindow 截取 800×600 客户区,写 schema v3
+  `frame/frame_description`(`level=screen`),另写 input timeline 与 manifest。
+  **已验证**:启动、截图、trace 解析、与内核屏幕 trace 对齐 diff 均可跑通。
+- `tools/official_trace/probe_dispatch.py`:事件级 L1 探针(WOW64 只读调试,
+  0.495 分派点 `0x4044db`,任务全局 `0x80171c`,脚本 ID `task+0x3c`)。
+  **未打通**:标题画面/点击后 25 s 内 0 命中;延迟布防后
+  `ReadProcessMemory(0x400000/0x401000/0x4044db)` 仍返回 error 299
+  (ERROR_PARTIAL_COPY)。**未伪造事件级 trace,L1 明确未达成**。
+- 屏幕级对齐尝试已按用户裁决撤回:官方标题画面与内核 `first_frame` 不是同一
+  逻辑锚点,不能作为渲染分歧证据。见 `docs/divergences/DIV-H-001`
+  (status=withdrawn)。
+
+### 6. 验证(原始结果)
+
+```text
+$ cargo test -p yu-trace   # YURIS_REQUIRE_SAMPLES=1, 真样本 data.ypf
+lib 43 passed; diff 13; equivalence 7; event_trace 14; golden 2;
+real_sample 2 (146.85s); roundtrip 7; doc-tests 0; 0 failed
+```
+
+```text
+$ cargo clippy -p yu-trace --all-targets
+yu-trace 自身 0 告警(输出中的 warning 均来自依赖 yu-rt)
+```
+
+官方屏幕级采集(原始输出摘录):
+
+```text
+$ python tools/official_trace/capture_screen.py --exe <官方 exe> --cwd <工程根> \
+    --out target/test-tmp/official/eris_screen --frames 6 --interval 0.4 --warmup 8
+window pid=... hwnd=... client=800x600
+wrote target/test-tmp/official/eris_screen/official_screen.jsonl (6 frames)
+```
+
+事件级探针(原始输出摘录,证明未达成而非静默):
+
+```text
+$ python tools/official_trace/probe_dispatch.py --exe <官方 exe> --cwd <工程根> \
+    --out target/test-tmp/official/dispatch_hits.jsonl --seconds 15 --click-after 5
+base 0x400000 reloc 0x0 hide True
+defer breakpoint for 3s
+probe 0x44db None err 299
+probe 0x400000 4d err 299
+probe 0x401000 53 err 299
+arm still failing err 299
+done timeout hits 0
+```
+
+### 7. 未完成/挂账
+
+- ④ `platform_call`:等平台后端,继续显式拒绝。
+- 官方事件级 L1:分派探针 read error 299 未解决;下一步先在任务泵入口
+  `0x404398` 验证泵是否运行,再处理 WOW64 读内存权限/反调试。
+- 官方首屏 vs 内核首帧:**暂停**,锚点不成立,不作一致性结论。
+
+## 成果 M3-SOFT (2026-10-20) · 软后端与首帧 PNG
+
+> 提交 771cf79(`feat(gfx): 修正渲染语义并新增软件后端`)。范围
+> `crates/yu-backend-soft`;只消费 `yu-gfx` 公开契约,不改语义层。
+
+### 1. 实现
+
+- `TextureStore`:`yu-vfs::DataSource` 取字节,按 `frame.image_probe_order`
+  探测扩展名,`image` crate 解码为 RGBA8;按资产 key 缓存;`SolidBlack1x1`
+  内建;`Snapshot`/`Offscreen` 跳过并计数;缺失/坏图产生 `asset.*` 诊断。
+- `SoftRenderer`:严格按 pass 顺序;Offscreen 用组 `SX/SY`(未给时视口)+
+  `pass.clear`;Screen 用 `frame.viewport` + `frame.clear`;MODE 0/1/2;
+  固定管线 alpha `min(A,255)/255`;Point/Linear 采样;gamma 存储值混合;
+  `TextRun` 只计数,不栅格化。
+- `first_frame` 示例:GfxHost 同步路径 boot ERIS;`take_events()` 只做计数/
+  drain,不把同一批事件重复喂给 `GfxState`;输出
+  `target/tmp/first_frame.png` + `first_frame.display.json`。
+
+### 2. 首帧实测
+
+- frame 3,800×600,272 层,15 pass,44 op(15 executable / 29 skipped),
+  `text=[]`。
+- 17 个 `snapshot` 层因 `Op::Copy` 未实现不可渲染;11 个 `Op::Image`
+  (`RECTPAINT` 族)+ 1 个 `Op::Copy` 被跳过;`filter.source=placeholder`。
+- PNG 已产出;同帧连续两次编码逐字节一致(测试覆盖)。
+
+### 3. 验证
+
+```text
+$ cargo test -p yu-backend-soft
+10 lib + 5 render + 1 doc = 16 passed; 0 failed
+```
+
+### 4. 未完成(全部是 gfx 挂账,不是后端近似)
+
+- DIV-GFX-007 COPY/COPY2 时序与区域;
+- DIV-GFX-013 `RECTPAINT*`/`SIZE*`/`RESIZE` 等图像加工像素;
+- DIV-GFX-012 文本栅格化/排版(与 `yu-font` 合流);
+- DIV-GFX-009 颜色空间、DIV-GFX-008 组 RT 尺寸/清屏。

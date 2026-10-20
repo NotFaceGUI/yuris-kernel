@@ -35,7 +35,8 @@ fn skip_if_missing(sample: &str, env: &str) -> bool {
         panic!("YURIS_REQUIRE_SAMPLES=1 but sample unavailable: {sample} ({env})");
     }
     let mut sink = MemorySink::new();
-    sink.emit(&sample_missing(sample, env)).expect("memory sink");
+    sink.emit(&sample_missing(sample, env))
+        .expect("memory sink");
     assert_eq!(sink.len(), 1, "skip must emit exactly one diag");
     assert_eq!(
         sink.records()[0].code.as_ref(),

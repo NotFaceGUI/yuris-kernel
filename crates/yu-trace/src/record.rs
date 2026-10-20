@@ -345,7 +345,9 @@ impl ClockSummary {
                     return Err("clock mode `tick_at` requires a now_ms list".to_string());
                 }
                 if self.now_ms.iter().any(Option::is_none) {
-                    return Err("clock mode `tick_at` requires every now_ms to be an integer".to_string());
+                    return Err(
+                        "clock mode `tick_at` requires every now_ms to be an integer".to_string(),
+                    );
                 }
             }
             ClockMode::Mixed => {
@@ -502,13 +504,11 @@ impl FrameSummary {
                 (None, hash)
             }
             (None, None) => {
-                return Err(Diag::fatal(
-                    crate::error::code::PARSE,
-                    Boundary::Format,
+                return Err(
+                    Diag::fatal(crate::error::code::PARSE, Boundary::Format).with_detail(
+                        "frame description requires display JSON or display_sha256".to_string(),
+                    ),
                 )
-                .with_detail(
-                    "frame description requires display JSON or display_sha256".to_string(),
-                ))
             }
         };
         Ok(Self {
@@ -527,9 +527,15 @@ impl FrameSummary {
 /// 64 位小写十六进制 SHA-256 的校验。
 fn validate_sha256(text: &str) -> Result<(), String> {
     if text.len() != 64 {
-        return Err(format!("expected 64 lowercase hex digits, got {} chars", text.len()));
+        return Err(format!(
+            "expected 64 lowercase hex digits, got {} chars",
+            text.len()
+        ));
     }
-    if !text.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+    if !text
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err(format!("expected 64 lowercase hex digits, got {text:?}"));
     }
     Ok(())
@@ -623,11 +629,12 @@ impl BootSummary {
     ) -> Result<yu_rt::BootConfig, Diag> {
         let (len, sha256) = argv_summary(&argv);
         if len != self.argv_len || sha256 != self.argv_sha256 {
-            return Err(Diag::fatal(crate::error::code::REPLAY, Boundary::Script)
-                .with_detail(format!(
+            return Err(
+                Diag::fatal(crate::error::code::REPLAY, Boundary::Script).with_detail(format!(
                     "replay argv mismatch: recorded {} args sha256 {}, supplied {} args sha256 {}",
                     self.argv_len, self.argv_sha256, len, sha256
-                )));
+                )),
+            );
         }
         let (paths_len, paths_sha256) = paths_summary(&paths);
         if paths_len != self.host.paths_len || paths_sha256 != self.host.paths_sha256 {
@@ -757,6 +764,10 @@ impl TraceArg {
 }
 
 /// 载荷。每个变体与 [`Kind`] 一一对应(空载荷用 [`Payload::Empty`])。
+///
+/// header 是最大的变体;它是协议层的一次性载荷,箱化会改变公开 API,
+/// 因此这里显式保留并关闭 clippy 的大小警告。
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Payload {
     Header(HeaderPayload),
@@ -911,8 +922,14 @@ impl Record {
                     None => Json::Null,
                 },
             ),
-            ("sub".to_string(), Json::Str(self.sub().as_str().to_string())),
-            ("kind".to_string(), Json::Str(self.kind.as_str().to_string())),
+            (
+                "sub".to_string(),
+                Json::Str(self.sub().as_str().to_string()),
+            ),
+            (
+                "kind".to_string(),
+                Json::Str(self.kind.as_str().to_string()),
+            ),
             ("payload".to_string(), payload_to_json(&self.payload)),
         ])
     }
@@ -938,16 +955,16 @@ impl Record {
             ));
         }
         let seq = take_u64(&mut fields, line, "seq")?;
-        let frame = match fields
-            .take("frame")
-            .map_err(|e| field_error(line, e))?
-        {
+        let frame = match fields.take("frame").map_err(|e| field_error(line, e))? {
             Json::Null => None,
             Json::UInt(frame) => Some(*frame),
             other => {
                 return Err(error::parse(
                     line,
-                    format!("frame must be null or unsigned integer, got {}", json_type(other)),
+                    format!(
+                        "frame must be null or unsigned integer, got {}",
+                        json_type(other)
+                    ),
                 ))
             }
         };
@@ -989,9 +1006,7 @@ impl Record {
             ));
         }
 
-        let payload_value = fields
-            .take("payload")
-            .map_err(|e| field_error(line, e))?;
+        let payload_value = fields.take("payload").map_err(|e| field_error(line, e))?;
         let payload = parse_payload(line, kind, frame, payload_value)?;
         fields.finish().map_err(|e| field_error(line, e))?;
 
@@ -1033,7 +1048,10 @@ impl TraceLog {
     /// `table_provenance`;启动完成后补头,保证 `header` 永远是 `seq = 0`。
     pub fn prepend_header(&mut self, header: HeaderPayload) {
         assert!(
-            !self.records.iter().any(|record| record.kind == Kind::Header),
+            !self
+                .records
+                .iter()
+                .any(|record| record.kind == Kind::Header),
             "trace already has a header"
         );
         self.records.insert(
@@ -1097,10 +1115,12 @@ impl TraceLog {
     }
 
     pub fn header(&self) -> Option<&HeaderPayload> {
-        self.records.first().and_then(|record| match &record.payload {
-            Payload::Header(header) => Some(header),
-            _ => None,
-        })
+        self.records
+            .first()
+            .and_then(|record| match &record.payload {
+                Payload::Header(header) => Some(header),
+                _ => None,
+            })
     }
 
     /// 确定性 JSONL(每条记录一行,末尾换行)。
@@ -1158,11 +1178,10 @@ impl TraceLog {
 
     pub fn read_from(path: impl AsRef<Path>) -> Result<Self, Diag> {
         let path = path.as_ref();
-        let bytes = fs::read(path)
-            .map_err(|e| error::io(format!("read {}: {e}", path.display())))?;
-        let text = String::from_utf8(bytes).map_err(|e| {
-            error::parse(0, format!("trace is not valid UTF-8: {e}"))
-        })?;
+        let bytes =
+            fs::read(path).map_err(|e| error::io(format!("read {}: {e}", path.display())))?;
+        let text = String::from_utf8(bytes)
+            .map_err(|e| error::parse(0, format!("trace is not valid UTF-8: {e}")))?;
         Self::parse(&text)
     }
 
@@ -1170,9 +1189,8 @@ impl TraceLog {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    error::io(format!("create {}: {e}", parent.display()))
-                })?;
+                fs::create_dir_all(parent)
+                    .map_err(|e| error::io(format!("create {}: {e}", parent.display())))?;
             }
         }
         fs::write(path, self.to_jsonl())
@@ -1237,9 +1255,7 @@ fn take_args(fields: &mut Fields<'_>, line: u64, key: &str) -> Result<Vec<TraceA
         let slot = take_u64(&mut arg_fields, line, "slot")?;
         let slot = u8::try_from(slot)
             .map_err(|_| error::parse(line, format!("slot out of u8 range: {slot}")))?;
-        let value = arg_fields
-            .take("value")
-            .map_err(|e| field_error(line, e))?;
+        let value = arg_fields.take("value").map_err(|e| field_error(line, e))?;
         let value = parse_trace_value(line, value)?;
         arg_fields.finish().map_err(|e| field_error(line, e))?;
         args.push(TraceArg { slot, value });
@@ -1253,12 +1269,8 @@ fn parse_trace_value(line: u64, value: &Json) -> Result<TraceValue, Diag> {
     let tag = take_str(&mut fields, line, "t")?.to_string();
     let raw = fields.take("v").map_err(|e| field_error(line, e))?;
     let parsed = match tag.as_str() {
-        "int" => TraceValue::Int(
-            json::as_i64(raw).map_err(|detail| error::parse(line, detail))?,
-        ),
-        "flt" => TraceValue::Float(
-            json::as_f64(raw).map_err(|detail| error::parse(line, detail))?,
-        ),
+        "int" => TraceValue::Int(json::as_i64(raw).map_err(|detail| error::parse(line, detail))?),
+        "flt" => TraceValue::Float(json::as_f64(raw).map_err(|detail| error::parse(line, detail))?),
         "str" => TraceValue::Str(
             json::bytes_from_string(
                 json::as_str(raw).map_err(|detail| error::parse(line, detail))?,
@@ -1297,14 +1309,9 @@ fn parse_payload(line: u64, kind: Kind, frame: Option<u64>, value: &Json) -> Res
             let key = take_bytes(&mut fields, line, "key")?;
             let bytes = match fields.take("bytes").map_err(|e| field_error(line, e))? {
                 Json::Null => None,
-                other => Some(
-                    json::as_u64(other).map_err(|detail| error::parse(line, detail))?,
-                ),
+                other => Some(json::as_u64(other).map_err(|detail| error::parse(line, detail))?),
             };
-            let sha256 = match fields
-                .take("sha256")
-                .map_err(|e| field_error(line, e))?
-            {
+            let sha256 = match fields.take("sha256").map_err(|e| field_error(line, e))? {
                 Json::Null => None,
                 other => Some(
                     json::as_str(other)
@@ -1346,15 +1353,11 @@ fn parse_payload(line: u64, kind: Kind, frame: Option<u64>, value: &Json) -> Res
         Kind::VfsList => {
             let source = take_str(&mut fields, line, "source")?.to_string();
             let key = take_bytes(&mut fields, line, "key")?;
-            let entries_value = fields
-                .take("entries")
-                .map_err(|e| field_error(line, e))?;
-            let items = json::as_arr(entries_value)
-                .map_err(|detail| error::parse(line, detail))?;
+            let entries_value = fields.take("entries").map_err(|e| field_error(line, e))?;
+            let items = json::as_arr(entries_value).map_err(|detail| error::parse(line, detail))?;
             let mut entries = Vec::with_capacity(items.len());
             for item in items {
-                let entry_obj =
-                    json::as_obj(item).map_err(|detail| error::parse(line, detail))?;
+                let entry_obj = json::as_obj(item).map_err(|detail| error::parse(line, detail))?;
                 let mut entry_fields = Fields::new(entry_obj);
                 let name = take_bytes(&mut entry_fields, line, "name")?;
                 let kind_text = take_str(&mut entry_fields, line, "kind")?.to_string();
@@ -1362,10 +1365,7 @@ fn parse_payload(line: u64, kind: Kind, frame: Option<u64>, value: &Json) -> Res
                     "file" => EntryKind::File,
                     "dir" => EntryKind::Dir,
                     other => {
-                        return Err(error::schema(
-                            line,
-                            format!("unknown entry kind `{other}`"),
-                        ))
+                        return Err(error::schema(line, format!("unknown entry kind `{other}`")))
                     }
                 };
                 let size = match entry_fields
@@ -1373,10 +1373,9 @@ fn parse_payload(line: u64, kind: Kind, frame: Option<u64>, value: &Json) -> Res
                     .map_err(|e| field_error(line, e))?
                 {
                     Json::Null => None,
-                    other => Some(
-                        json::as_u64(other)
-                            .map_err(|detail| error::parse(line, detail))?,
-                    ),
+                    other => {
+                        Some(json::as_u64(other).map_err(|detail| error::parse(line, detail))?)
+                    }
                 };
                 if kind == EntryKind::File && size.is_none() {
                     return Err(error::parse(
@@ -1495,10 +1494,7 @@ fn parse_payload(line: u64, kind: Kind, frame: Option<u64>, value: &Json) -> Res
         Kind::VmDomainCall => {
             let domain = take_str(&mut fields, line, "domain")?.to_string();
             if !is_known_domain(&domain) {
-                return Err(error::schema(
-                    line,
-                    format!("unknown domain `{domain}`"),
-                ));
+                return Err(error::schema(line, format!("unknown domain `{domain}`")));
             }
             let name = take_str(&mut fields, line, "name")?.to_string();
             let args = take_args(&mut fields, line, "args")?;
@@ -1524,7 +1520,10 @@ fn parse_payload(line: u64, kind: Kind, frame: Option<u64>, value: &Json) -> Res
         Kind::PlatformCall => {
             return Err(error::schema(
                 line,
-                format!("kind `{}` is reserved for M3 platform backend", kind.as_str()),
+                format!(
+                    "kind `{}` is reserved for M3 platform backend",
+                    kind.as_str()
+                ),
             ))
         }
     };
@@ -1566,18 +1565,15 @@ fn parse_frame_description(
         }
     }
     let level_text = take_str(&mut fields, line, "level")?.to_string();
-    let level = FrameLevel::parse(&level_text).ok_or_else(|| {
-        error::schema(line, format!("unknown frame level `{level_text}`"))
-    })?;
+    let level = FrameLevel::parse(&level_text)
+        .ok_or_else(|| error::schema(line, format!("unknown frame level `{level_text}`")))?;
     let display_sha256 = take_str(&mut fields, line, "display_sha256")?.to_string();
     validate_sha256(&display_sha256).map_err(|detail| error::parse(line, detail))?;
     let pass_count = take_u32(&mut fields, line, "pass_count")?;
     let op_count = take_u64(&mut fields, line, "op_count")?;
     let executable_ops = take_u64(&mut fields, line, "executable_ops")?;
     let skipped_ops = take_u64(&mut fields, line, "skipped_ops")?;
-    let display_value = fields
-        .take("display")
-        .map_err(|e| field_error(line, e))?;
+    let display_value = fields.take("display").map_err(|e| field_error(line, e))?;
     let display = match display_value {
         Json::Null => None,
         other => {
@@ -1625,11 +1621,8 @@ fn parse_header(line: u64, obj: &[(String, Json)]) -> Result<HeaderPayload, Diag
     let codec = take_str(&mut fields, line, "codec")?.to_string();
     let producer_value = fields.take("producer").map_err(|e| field_error(line, e))?;
     let producer = parse_producer(line, producer_value)?;
-    let tables_value = fields
-        .take("tables")
-        .map_err(|e| field_error(line, e))?;
-    let table_items =
-        json::as_arr(tables_value).map_err(|detail| error::parse(line, detail))?;
+    let tables_value = fields.take("tables").map_err(|e| field_error(line, e))?;
+    let table_items = json::as_arr(tables_value).map_err(|detail| error::parse(line, detail))?;
     let mut tables = Vec::with_capacity(table_items.len());
     for item in table_items {
         tables.push(
@@ -1639,8 +1632,7 @@ fn parse_header(line: u64, obj: &[(String, Json)]) -> Result<HeaderPayload, Diag
         );
     }
     let boot_value = fields.take("boot").map_err(|e| field_error(line, e))?;
-    let boot_obj =
-        json::as_obj(boot_value).map_err(|detail| error::parse(line, detail))?;
+    let boot_obj = json::as_obj(boot_value).map_err(|detail| error::parse(line, detail))?;
     let mut boot_fields = Fields::new(boot_obj);
     let entry = take_str(&mut boot_fields, line, "entry")?.to_string();
     let fps = take_u32(&mut boot_fields, line, "fps")?;
@@ -1648,18 +1640,14 @@ fn parse_header(line: u64, obj: &[(String, Json)]) -> Result<HeaderPayload, Diag
     let frame_ms = take_u32(&mut boot_fields, line, "frame_ms")?;
     let script_key = parse_hex_key(line, take_str(&mut boot_fields, line, "script_key")?)?;
     let debug_mode = take_bool(&mut boot_fields, line, "debug_mode")?;
-    let argv_value = boot_fields
-        .take("argv")
-        .map_err(|e| field_error(line, e))?;
+    let argv_value = boot_fields.take("argv").map_err(|e| field_error(line, e))?;
     let argv_obj = json::as_obj(argv_value).map_err(|detail| error::parse(line, detail))?;
     let mut argv_fields = Fields::new(argv_obj);
     let argv_len = take_u64(&mut argv_fields, line, "len")?;
     let argv_sha256 = take_str(&mut argv_fields, line, "sha256")?.to_string();
     argv_fields.finish().map_err(|e| field_error(line, e))?;
 
-    let host_value = boot_fields
-        .take("host")
-        .map_err(|e| field_error(line, e))?;
+    let host_value = boot_fields.take("host").map_err(|e| field_error(line, e))?;
     let host_obj = json::as_obj(host_value).map_err(|detail| error::parse(line, detail))?;
     let mut host_fields = Fields::new(host_obj);
     let screen_color = take_u32(&mut host_fields, line, "screen_color")?;
@@ -1678,8 +1666,7 @@ fn parse_header(line: u64, obj: &[(String, Json)]) -> Result<HeaderPayload, Diag
     boot_fields.finish().map_err(|e| field_error(line, e))?;
 
     let input_value = fields.take("input").map_err(|e| field_error(line, e))?;
-    let input_obj =
-        json::as_obj(input_value).map_err(|detail| error::parse(line, detail))?;
+    let input_obj = json::as_obj(input_value).map_err(|detail| error::parse(line, detail))?;
     let mut input_fields = Fields::new(input_obj);
     let events = take_u64(&mut input_fields, line, "events")?;
     let sha256 = take_str(&mut input_fields, line, "sha256")?.to_string();
@@ -1775,7 +1762,9 @@ fn parse_clock(line: u64, value: &Json) -> Result<ClockSummary, Diag> {
     }
     fields.finish().map_err(|e| field_error(line, e))?;
     let clock = ClockSummary { mode, now_ms };
-    clock.validate().map_err(|detail| error::schema(line, detail))?;
+    clock
+        .validate()
+        .map_err(|detail| error::schema(line, detail))?;
     Ok(clock)
 }
 
@@ -1822,10 +1811,7 @@ pub(crate) fn payload_to_json(payload: &Payload) -> Json {
                         "kind".to_string(),
                         Json::Str(header.producer.kind.as_str().to_string()),
                     ),
-                    (
-                        "name".to_string(),
-                        Json::Str(header.producer.name.clone()),
-                    ),
+                    ("name".to_string(), Json::Str(header.producer.name.clone())),
                     (
                         "version".to_string(),
                         Json::Str(header.producer.version.clone()),
@@ -1866,10 +1852,7 @@ pub(crate) fn payload_to_json(payload: &Payload) -> Json {
                         "script_key".to_string(),
                         Json::Str(hex_key(&header.boot.script_key)),
                     ),
-                    (
-                        "debug_mode".to_string(),
-                        Json::Bool(header.boot.debug_mode),
-                    ),
+                    ("debug_mode".to_string(), Json::Bool(header.boot.debug_mode)),
                     (
                         "argv".to_string(),
                         Json::Obj(vec![
@@ -1902,10 +1885,7 @@ pub(crate) fn payload_to_json(payload: &Payload) -> Json {
                             (
                                 "paths".to_string(),
                                 Json::Obj(vec![
-                                    (
-                                        "len".to_string(),
-                                        Json::UInt(header.boot.host.paths_len),
-                                    ),
+                                    ("len".to_string(), Json::UInt(header.boot.host.paths_len)),
                                     (
                                         "sha256".to_string(),
                                         Json::Str(header.boot.host.paths_sha256.clone()),
@@ -1920,10 +1900,7 @@ pub(crate) fn payload_to_json(payload: &Payload) -> Json {
                 "input".to_string(),
                 Json::Obj(vec![
                     ("events".to_string(), Json::UInt(header.input.events)),
-                    (
-                        "sha256".to_string(),
-                        Json::Str(header.input.sha256.clone()),
-                    ),
+                    ("sha256".to_string(), Json::Str(header.input.sha256.clone())),
                 ]),
             ),
             (
@@ -2069,9 +2046,7 @@ pub(crate) fn payload_to_json(payload: &Payload) -> Json {
             ("enabled".to_string(), Json::Bool(*enabled)),
             ("main".to_string(), Json::Bool(*main)),
         ]),
-        Payload::VmTaskFinish { id } => {
-            Json::Obj(vec![("id".to_string(), Json::Str(id.clone()))])
-        }
+        Payload::VmTaskFinish { id } => Json::Obj(vec![("id".to_string(), Json::Str(id.clone()))]),
         Payload::VmWait {
             task,
             frames,
@@ -2104,11 +2079,7 @@ pub(crate) fn payload_to_json(payload: &Payload) -> Json {
             ("fps".to_string(), Json::UInt(*fps as u64)),
             ("skip".to_string(), Json::Bool(*skip)),
         ]),
-        Payload::VmCall {
-            domain,
-            name,
-            args,
-        } => {
+        Payload::VmCall { domain, name, args } => {
             let mut fields = Vec::new();
             if let Some(domain) = domain {
                 fields.push(("domain".to_string(), Json::Str(domain.clone())));
@@ -2352,11 +2323,9 @@ mod tests {
 
     #[test]
     fn frame_description_roundtrip_and_determinism() {
-        let summary = FrameSummary::from_input(frame_input(
-            Some(br#"{"b":2, "a":[true,null,"x"]}"#),
-            None,
-        ))
-        .unwrap();
+        let summary =
+            FrameSummary::from_input(frame_input(Some(br#"{"b":2, "a":[true,null,"x"]}"#), None))
+                .unwrap();
         assert_eq!(
             summary.display.as_ref().unwrap().canonical(),
             r#"{"b":2,"a":[true,null,"x"]}"#
@@ -2395,11 +2364,8 @@ mod tests {
         assert_eq!(err.code, crate::error::code::PARSE);
 
         // 摘要与 display 内容不一致:显式拒绝,不做"取其一"的猜测。
-        let err = FrameSummary::from_input(frame_input(
-            Some(br#"{"a":1}"#),
-            Some(&"0".repeat(64)),
-        ))
-        .unwrap_err();
+        let err = FrameSummary::from_input(frame_input(Some(br#"{"a":1}"#), Some(&"0".repeat(64))))
+            .unwrap_err();
         assert_eq!(err.code, crate::error::code::SCHEMA);
 
         // 摘要级记录(无 display)是合法的。
@@ -2416,7 +2382,11 @@ mod tests {
         let text = log.to_jsonl();
 
         // 封套 frame 与 payload frame 必须一致。
-        let mismatch = text.replacen("\"frame\":7,\"sub\":\"frame\"", "\"frame\":8,\"sub\":\"frame\"", 1);
+        let mismatch = text.replacen(
+            "\"frame\":7,\"sub\":\"frame\"",
+            "\"frame\":8,\"sub\":\"frame\"",
+            1,
+        );
         let err = TraceLog::parse(&mismatch).unwrap_err();
         assert_eq!(err.code, crate::error::code::SCHEMA);
 

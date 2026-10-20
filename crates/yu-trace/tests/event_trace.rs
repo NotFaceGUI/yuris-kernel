@@ -156,10 +156,7 @@ fn header_records_boot_input_and_table_provenance() {
         assert!(!table.contains("D:\\"), "absolute path leaked: {table}");
         assert!(!table.contains("D:/"), "absolute path leaked: {table}");
     }
-    assert!(header
-        .tables
-        .iter()
-        .any(|table| table.starts_with("ysc:")));
+    assert!(header.tables.iter().any(|table| table.starts_with("ysc:")));
     assert!(header.kernel.starts_with("yu-trace "));
 }
 
@@ -248,9 +245,14 @@ fn omitting_a_trailing_record_is_length_not_a_pass() {
     let text = log.to_jsonl();
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     lines.pop();
-    let shortened = format!("{}
-", lines.join("
-"));
+    let shortened = format!(
+        "{}
+",
+        lines.join(
+            "
+"
+        )
+    );
     let failure = diff_text(&text, &shortened).expect_err("must not pass");
     assert_eq!(failure.code(), error::code::LENGTH);
     assert!(failure.report().is_none(), "count mismatch has no pointer");
@@ -270,7 +272,13 @@ fn event_shape(log: &TraceLog) -> Vec<(Option<u64>, &'static str, Payload)> {
     log.records()
         .iter()
         .filter(|record| record.sub() == yu_trace::Sub::Vm)
-        .map(|record| (record.frame(), record.kind().as_str(), record.payload().clone()))
+        .map(|record| {
+            (
+                record.frame(),
+                record.kind().as_str(),
+                record.payload().clone(),
+            )
+        })
         .collect()
 }
 

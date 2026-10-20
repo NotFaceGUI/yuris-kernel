@@ -89,8 +89,11 @@ pub fn write_trace(log: &TraceLog, name: &str) -> Result<std::path::PathBuf, yu_
         || name.contains('\\')
         || name.contains(':')
     {
-        return Err(yu_log::Diag::fatal(error::code::IO, yu_log::Boundary::Data)
-            .with_detail(format!("trace name must be a plain file name, got {name:?}")));
+        return Err(
+            yu_log::Diag::fatal(error::code::IO, yu_log::Boundary::Data).with_detail(format!(
+                "trace name must be a plain file name, got {name:?}"
+            )),
+        );
     }
     let path = trace_dir().join(name);
     log.write_to(&path)?;

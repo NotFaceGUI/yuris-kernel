@@ -30,9 +30,7 @@ use yu_rt::{BootConfig, Vm};
 use yu_vfs::{Codec, DataSource};
 
 use crate::error;
-use crate::event::{
-    header_from_vm_with_clock, input_summary, input_summary_range, EventRecorder,
-};
+use crate::event::{header_from_vm_with_clock, input_summary, input_summary_range, EventRecorder};
 use crate::record::{ClockSummary, HeaderPayload, InputSummary, TraceLog};
 use crate::source::{BoxedSource, FrameHandle, TracingSource};
 
@@ -96,10 +94,12 @@ pub fn verify_input_range(
 pub fn verify_clock(header: &HeaderPayload, ticks: &[Option<u32>]) -> Result<(), Diag> {
     let actual = ClockSummary::from_ticks(ticks);
     if actual != header.clock {
-        return Err(Diag::fatal(error::code::REPLAY, Boundary::Domain).with_detail(format!(
+        return Err(
+            Diag::fatal(error::code::REPLAY, Boundary::Domain).with_detail(format!(
             "replay clock mismatch: recorded mode {:?} now_ms {:?}, supplied mode {:?} now_ms {:?}",
             header.clock.mode, header.clock.now_ms, actual.mode, actual.now_ms
-        )));
+        )),
+        );
     }
     Ok(())
 }
@@ -126,11 +126,7 @@ pub struct VmTrace {
 
 impl VmTrace {
     /// 单根启动(数据与编译器表同根)。
-    pub fn boot(
-        source: Box<dyn DataSource>,
-        cfg: BootConfig,
-        codec: Codec,
-    ) -> Result<Self, Diag> {
+    pub fn boot(source: Box<dyn DataSource>, cfg: BootConfig, codec: Codec) -> Result<Self, Diag> {
         Self::boot_with_aux(source, None, cfg, codec)
     }
 
@@ -168,13 +164,13 @@ impl VmTrace {
     ) -> Result<Self, Diag> {
         if let Some(source_codec) = source_codec {
             if source_codec != codec {
-                return Err(Diag::fatal(error::code::REPLAY, Boundary::Data).with_detail(
-                    format!(
+                return Err(
+                    Diag::fatal(error::code::REPLAY, Boundary::Data).with_detail(format!(
                         "source codec {} does not match trace codec {}",
                         source_codec.as_str(),
                         codec.as_str()
-                    ),
-                ));
+                    )),
+                );
             }
         }
         if let Some(aux_codec) = aux_codec {
@@ -183,13 +179,13 @@ impl VmTrace {
                     .with_detail("aux codec was supplied but aux source is absent"));
             }
             if aux_codec != codec {
-                return Err(Diag::fatal(error::code::REPLAY, Boundary::Data).with_detail(
-                    format!(
+                return Err(
+                    Diag::fatal(error::code::REPLAY, Boundary::Data).with_detail(format!(
                         "aux source codec {} does not match trace codec {}",
                         aux_codec.as_str(),
                         codec.as_str()
-                    ),
-                ));
+                    )),
+                );
             }
         }
 
@@ -207,11 +203,9 @@ impl VmTrace {
         });
 
         let vm = match traced_aux {
-            Some(traced_aux) => Vm::boot_with_aux(
-                Box::new(traced),
-                Some(Box::new(traced_aux)),
-                cfg.clone(),
-            )?,
+            Some(traced_aux) => {
+                Vm::boot_with_aux(Box::new(traced), Some(Box::new(traced_aux)), cfg.clone())?
+            }
             None => Vm::boot(Box::new(traced), cfg.clone())?,
         };
         // 录制路径不丢事件:默认 1<<20 的丢弃阈值对 ERIS 首帧(约 130 万命令)
@@ -269,14 +263,7 @@ impl VmTrace {
     ) -> Result<Self, Diag> {
         let codec = codec_from_name(&header.codec)?;
         let cfg = header.boot.to_config(argv, paths)?;
-        Self::boot_with_aux_checked(
-            source,
-            aux,
-            cfg,
-            codec,
-            Some(source_codec),
-            aux_codec,
-        )
+        Self::boot_with_aux_checked(source, aux, cfg, codec, Some(source_codec), aux_codec)
     }
 
     /// 推进一帧(时钟注入为 `now_ms`)。

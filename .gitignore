@@ -13,3 +13,7 @@ save/
 shots_*/
 dump_tex/
 docs/reverse/
+
+# Python 采集器缓存
+__pycache__/
+*.pyc
