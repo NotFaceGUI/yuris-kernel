@@ -1,42 +1,94 @@
 # yuris-kernel
 
-YU-RIS 引擎的净室兼容内核。**唯一目标: 与官方引擎 1:1 对齐** —— 相同游戏数据与相同
-输入时间线下,封包解析、宏展开、脚本执行、存档读写等一切可观测行为逐位一致。
+YU-RIS 引擎的净室兼容内核，GPL-3.0-or-later。**唯一目标：与官方引擎 1:1 对齐** ——
+相同游戏数据与相同输入时间线下，封包解析、脚本执行、渲染语义、存档读写等一切可观测行为
+逐位一致。
 
-## 立场(与旧接手线 <repo-old> 的区别)
+## 立场
 
-- **唯一真值 = 官方引擎可观测行为**(官方 trace / SDK 二进制逆向事实 / 原版数据自证)。
-- 旧接手线 <repo-old> 定位为**参考实现**: 只读对照,不搬运任何代码;
-  它的 golden 快照仅作回归参考,**不是真值**。
-- 无证据的行为显式 `Error::Unimplemented`,禁止"看起来应该是这样"。
+- **唯一真值 = 官方引擎可观测行为**（官方 trace / SDK 二进制逆向事实 / 原版数据自证）。
+- 旧接手线 `<repo-old>` 只读参考，不搬运代码；其 golden 只作回归参考，**不是真值**。
+- 无证据的行为显式 `Unimplemented`，禁止“看起来应该是这样”。
+- 通用运行时零硬编码（A5）：命令表/变量表/设置全部运行期从游戏工程装载，缺表拒绝启动。
+
+## 当前状态（2026-10-20）
+
+M3 渲染链路已打通到“确定性软后端首帧”：
+
+| 阶段 | 状态 |
+|---|---|
+| M3a 语义显示列表 `CompositorFrame` | 完成 |
+| M3b `yu-backend-soft` 首帧 PNG | 完成（部分语义挂账，见下） |
+| M3c `yu-backend-wgpu` 同帧逐像素对拍 | 未开始 |
+| M3d 桌面 / wasm / Android 宿主闭环 | 未开始 |
+
+首帧实测：800×600、272 图层、15 pass、44 op（15 executable / 29 skipped），输出
+`target/tmp/first_frame.png` 与 `first_frame.display.json`。当前已能画出系统文本框；
+文字栅格化、COPY、RECTPAINT、部分 MODE 仍是显式挂账项，见
+`docs/gfx-unimplemented-todo.md`。
 
 ## 布局
 
-架构基线见 `docs/architecture.md`。要点:**散盘项目与 .ypf 封包游戏是同一程序**——
-差异全部收敛在 `yu-vfs` 的 DataSource 抽象(DirSource / YpfSource / MemSource + 叠加挂载)之后,
-并有永久等价性测试自证。
-
 | crate | 职责 |
 |---|---|
-| `yu-vfs` | 数据源抽象与归一(散盘/封包/内存三实现 + 挂载栈) |
-| `yu-format` | 容器解码(ybn/yssd/ymv/yscfg),纯字节进出 |
-| `yu-rt` | 运行核:任务调度/按名分派/表达式/16 槽寄存器/变量域 |
-| `yu-gfx` / `yu-snd` / `yu-inp` | 官方 graph/sound/input 子系统状态机 |
-| `yu-save` | 存档链(只写真实 SaveDir) |
-| `yu-trace` | 对拍基建:四条边界记录/回放/diff |
-| `yu-cli` | 装配与帧循环薄壳 |
+| `yu-log` | 结构化诊断 + 日志；所有 crate 的错误唯一出口 |
+| `yu-vfs` | 数据源抽象：DirSource / YpfSource / MemSource + 叠加挂载 + 归一路径 |
+| `yu-format` | ybn 家族 / yssd / yscfg 等容器与元数据解码，纯字节进出 |
+| `yu-rt` | 运行核：脚本 / VM / 任务 / 帧边界 / 16 槽寄存器 / 变量域 / 系统变量 ABI / InputTimeline |
+| `yu-gfx` | 渲染语义层：`CompositorFrame`、图层 / 组 / 窗口 / 过渡 / 文本模型、GfxHost 查询 |
+| `yu-font` | 字体发现 / 加载、字形栅格化、完整文本样式；不含换行 / 对齐 |
+| `yu-backend-soft` | `CompositorFrame` 的确定性软件参考后端：纹理管线 + RGBA8 合成 + PNG |
+| `yu-trace` | 边界录制 / 回放 / diff；schema v3（producer-neutral、frame_description） |
 
-`docs/oracle.md` — 对拍方法论;`docs/divergences/` — 不一致档案;`docs/sdk-eris-analysis.md` — SDK 脚本系统一手分析;
-`docs/eris-corpus.md` — 官方 ERIS 测试工程(编译/打包/发布启动全流程);`docs/formats/ypf.md` — YPF 布局实证。
+未开始：`yu-backend-wgpu`、桌面 / wasm / Android 宿主、`yu-sound` / `yu-save`、
+scenario 解释器与 CLI。**没有 `yu-assets` 兄弟 crate**：纹理解析在装配 / 后端层，
+第一个实现是 `yu-backend-soft::TextureStore`。
+
+### 渲染链路
+
+```text
+yu-vfs → yu-format → yu-rt
+                         │ VmEvent::DomainCall / Text
+                         ▼
+                  yu-gfx（CompositorFrame）
+                         │
+             ┌───────────┴───────────┐
+             ▼                       ▼
+   yu-backend-soft             yu-backend-wgpu（未开始）
+   确定性参考 / PNG / golden    主后端，同帧逐像素对拍
+             │                       │
+             └───────────┬───────────┘
+                         ▼
+              hosts：桌面 / wasm / Android（未开始）
+```
 
 ## 快速开始
 
 ```bash
 cargo test --workspace
+
+# 真样本（仓库不附带游戏数据；缺失时测试显式失败 / 跳过并计数）
+export YURIS_REQUIRE_SAMPLES=1
+export YURIS_SAMPLE_ERIS_YSBIN="<project-eris>/save/data/ysbin"
+export YURIS_SAMPLE_ERIS_YPF="<project-eris>/data.ypf"
+
+# headless 首帧
+cargo run -p yu-backend-soft --example first_frame
+# → target/tmp/first_frame.png / first_frame.display.json
 ```
 
-样本游戏与环境变量约定见 `AGENTS.md`(本机文件,不入库)。
+本机沙箱、样本路径与占位符约定见 `AGENTS.md`（本机文件，不入库）。
 
-## 状态
+## 文档
 
-一切子系统**未实现**。进度真相见 `PROGRESS.md`。
+- `PROGRESS.md` — **唯一进度真相**（成果、勘误、验证命令与原始结果）
+- `docs/architecture.md` — 设计稿（v1.2；与 `PROGRESS.md` 架构现状冲突时以后者为准）
+- `docs/render-parity.md` — 渲染语义证据表与后端执行契约
+- `docs/gfx-verification-ledger.md` — gfx 复核台账（Confirmed / Refuted / Uncertain）
+- `docs/gfx-unimplemented-todo.md` — 未实现模块 DIV 清单与解除条件
+- `docs/font-contract.md` / `docs/font-provenance.md` — 字体接口与取证
+- `docs/oracle.md` — 对拍方法论；`docs/divergences/` — 不一致档案
+
+## 许可
+
+GPL-3.0-or-later。净室实现；不包含原引擎代码或游戏数据。
