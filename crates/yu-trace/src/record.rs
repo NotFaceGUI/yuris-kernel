@@ -52,7 +52,7 @@ impl Sub {
         }
     }
 
-    fn parse(text: &str) -> Option<Self> {
+    pub fn parse(text: &str) -> Option<Self> {
         match text {
             "meta" => Some(Sub::Meta),
             "vfs" => Some(Sub::Vfs),
@@ -140,7 +140,7 @@ impl Kind {
         }
     }
 
-    fn parse(text: &str) -> Option<Self> {
+    pub fn parse(text: &str) -> Option<Self> {
         match text {
             "header" => Some(Kind::Header),
             "open" => Some(Kind::VfsOpen),
