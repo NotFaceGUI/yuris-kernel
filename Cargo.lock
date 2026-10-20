@@ -58,6 +58,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "yu-gfx"
+version = "0.1.0"
+dependencies = [
+ "yu-format",
+ "yu-log",
+ "yu-rt",
+ "yu-vfs",
+]
+
+[[package]]
 name = "yu-log"
 version = "0.1.0"
 

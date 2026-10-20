@@ -1,0 +1,105 @@
+//! `gfx.*` 诊断码与构造助手。
+//!
+//! 所有错误/未实现都走 `yu-log::Diag`(唯一日志出口);`CompositorFrame`
+//! 里只保留扁平化的 [`FrameDiag`],便于稳定序列化与 golden 比对。
+
+use yu_log::{Boundary, Diag, Loc, Severity};
+
+/// 稳定错误码表(`gfx.*` 命名空间;可计数、可进 golden、可直链 divergences)。
+pub mod code {
+    /// 图形域命令未实现/未取证。
+    pub const COMMAND_UNIMPLEMENTED: &str = "gfx.command.unimplemented";
+    /// 图形域命令名不在工程 ysc 表里。
+    pub const COMMAND_UNKNOWN: &str = "gfx.command.unknown";
+    /// 参数槽缺失(命令窗口不存在)。
+    pub const ARG_MISSING: &str = "gfx.arg.missing";
+    /// 参数类型不符(数值/字符串)。
+    pub const ARG_TYPE: &str = "gfx.arg.type";
+    /// 目标图层不存在(更新型命令)。
+    pub const LAYER_MISSING: &str = "gfx.layer.missing";
+    /// 图层 ID/路径非法。
+    pub const LAYER_INVALID_ID: &str = "gfx.layer.invalid_id";
+    /// 图层/图层组种类冲突(同一路径先建为组、后当图层用等)。
+    pub const LAYER_KIND: &str = "gfx.layer.kind";
+    /// 纹理/资源引用缺失或非法。
+    pub const TEXTURE_MISSING: &str = "gfx.texture.missing";
+    /// 混合模式未取证/无实现(4/8/10..18 的着色器路径)。
+    pub const BLEND_UNSUPPORTED: &str = "gfx.blend.unsupported";
+    /// 混合模式有状态表但语义未逐像素对拍(3/5/6/7/9)。
+    pub const BLEND_UNVERIFIED: &str = "gfx.blend.unverified";
+    /// 过渡语义缺项(TID 配对/双纹理取样等)。
+    pub const TRANSITION_UNSUPPORTED: &str = "gfx.transition.unsupported";
+    /// 外部掩码(`MID`)的取值通道未取证。
+    pub const MASK_UNSUPPORTED: &str = "gfx.mask.unsupported";
+    /// 滤镜/变换参数(`FX/FY/FRX/FCX/FEX/...`)写侧绑定未取证。
+    pub const FILTER_UNSUPPORTED: &str = "gfx.filter.unsupported";
+    /// 图层组/离屏语义缺项。
+    pub const GROUP_UNSUPPORTED: &str = "gfx.group.unsupported";
+    /// `CGACT[COPY/COPY2/SWAP...]` 的时序/区域语义缺项。
+    pub const COPY_UNSUPPORTED: &str = "gfx.copy.unsupported";
+    /// 多部件层几何/部件纹理语义未取证。
+    pub const PARTS_UNSUPPORTED: &str = "gfx.parts.unsupported";
+    /// `CGACT` 图像加工类操作(滤波/旋转/涂色/文字烘焙)。
+    pub const IMAGEOP_UNSUPPORTED: &str = "gfx.imageop.unsupported";
+    /// 文本模型缺项(字形栅格化/窗口定位/描边)。
+    pub const TEXT_UNSUPPORTED: &str = "gfx.text.unsupported";
+    /// 非视觉参数(如 `LINT`)已原样保留但未解释。
+    pub const PARAM_NONVISUAL: &str = "gfx.param.nonvisual";
+    /// 内部不变量被破坏(应为不可能)。
+    pub const INTERNAL: &str = "gfx.internal";
+    /// 工程命令表缺失/不可用。
+    pub const TABLE_MISSING: &str = "gfx.table.missing";
+}
+
+pub fn fatal(code: &'static str, detail: impl Into<String>) -> Diag {
+    Diag::new(code, Severity::Fatal, Boundary::Domain).with_detail(detail)
+}
+
+pub fn recoverable(code: &'static str, detail: impl Into<String>) -> Diag {
+    Diag::new(code, Severity::Recoverable, Boundary::Domain).with_detail(detail)
+}
+
+pub fn unimplemented(code: &'static str, detail: impl Into<String>) -> Diag {
+    Diag::new(code, Severity::Unimplemented, Boundary::Domain).with_detail(detail)
+}
+
+pub fn info(code: &'static str, detail: impl Into<String>) -> Diag {
+    Diag::new(code, Severity::Info, Boundary::Domain).with_detail(detail)
+}
+
+/// 给诊断补脚本位置(命令名/帧号)。图形域只拿得到事件帧号,
+/// 因此 `where_` 用 `Loc::Script{file:"", label:None, pc:0, cmd}` 记录命令名。
+pub fn at_command(mut diag: Diag, frame: u64, command: &str) -> Diag {
+    diag.where_ = Loc::script(
+        format!("gfx@frame{frame}"),
+        None,
+        0,
+        Some(command.to_string()),
+    );
+    diag
+}
+
+/// 可稳定序列化的诊断快照(字段顺序固定;不含 `Loc` 的路径细节)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameDiag {
+    pub code: String,
+    pub severity: &'static str,
+    pub command: String,
+    pub detail: String,
+}
+
+impl FrameDiag {
+    pub fn new(
+        code: impl Into<String>,
+        severity: Severity,
+        command: &str,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            severity: severity.as_str(),
+            command: command.to_string(),
+            detail: detail.into(),
+        }
+    }
+}

@@ -1,0 +1,251 @@
+//! `CompositorFrame`:后端唯一需要执行的“画什么”契约。
+//!
+//! 设计约束:
+//! - 字段顺序固定、无散列表迭代序、无墙钟/线程/绝对路径;
+//! - 纹理是资产 key/离屏句柄,不是字节;
+//! - alpha/颜色/几何保留引擎单位(`A` 0..256、`X/Y` i64、滤镜参数原值);
+//! - `layers` 是完整状态快照(含不可见层),`passes` 是绘制列表。
+//!
+//! 证据与后端执行细节见 `docs/render-parity.md`。
+
+use crate::error::FrameDiag;
+use crate::layer::{ImageFormat, Layer};
+use crate::pass::Pass;
+use crate::text::TextRun;
+
+/// 视口(引擎像素;来自工程 `yscfg` 或宿主注入)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Viewport {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Viewport {
+    pub const fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+}
+
+/// 清屏颜色与来源。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Clear {
+    /// RGBA8,按存储值(不做线性化)。
+    pub rgba: [u8; 4],
+    pub source: ClearSource,
+}
+
+impl Clear {
+    /// 引擎未逐帧显式清屏;D3D9 设备初始化后可见背景为不透明黑。
+    /// 这是 Let-likely 决策,写入 `docs/render-parity.md` 的 divergence。
+    pub const fn default_black() -> Self {
+        Self {
+            rgba: [0, 0, 0, 255],
+            source: ClearSource::EngineDefaultBlack,
+        }
+    }
+
+    pub const fn explicit(rgba: [u8; 4]) -> Self {
+        Self {
+            rgba,
+            source: ClearSource::Explicit,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClearSource {
+    /// 引擎默认背景(未在帧入口显式 Clear;旧线 01 §3 指出 Clear 只在调试分支)。
+    EngineDefaultBlack,
+    /// 调用方显式设定。
+    Explicit,
+}
+
+/// 颜色空间。
+///
+/// 引擎是 D3D9 固定管线/HLSL,渲染路径未设置 `D3DRS_SRGBWRITEENABLE`
+/// (反编译全树无 state 194 调用),因此混合发生在**存储值空间**(sRGB 编码值
+/// 直接参与算术),不是线性空间。见 `docs/render-parity.md` §10。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorSpace {
+    /// 8-bit sRGB 编码存储,gamma 空间混合(D3D9 默认)。
+    GammaEncodedSrgb8,
+}
+
+impl ColorSpace {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GammaEncodedSrgb8 => "gamma_encoded_srgb8",
+        }
+    }
+}
+
+/// 引擎纹理过滤设置(`0=POINT / 1=LINEAR / 2=ANISOTROPIC`;MIP 另有 `-1=NONE`)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterMode {
+    Point,
+    Linear,
+    Anisotropic,
+}
+
+impl FilterMode {
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::Point,
+            1 => Self::Linear,
+            2 => Self::Anisotropic,
+            _ => return None,
+        })
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Point => "point",
+            Self::Linear => "linear",
+            Self::Anisotropic => "anisotropic",
+        }
+    }
+}
+
+/// MIP 过滤(引擎 `-1 = NONE`)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MipFilter {
+    None,
+    Point,
+    Linear,
+    Anisotropic,
+}
+
+impl MipFilter {
+    pub fn from_code(code: i8) -> Option<Self> {
+        Some(match code {
+            -1 => Self::None,
+            0 => Self::Point,
+            1 => Self::Linear,
+            2 => Self::Anisotropic,
+            _ => return None,
+        })
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Point => "point",
+            Self::Linear => "linear",
+            Self::Anisotropic => "anisotropic",
+        }
+    }
+}
+
+/// 过滤设置来源。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterSource {
+    /// 宿主从引擎设置注入。
+    EngineSettings,
+    /// 占位值(`GfxConfig::new` 默认);后端不得把它当成已取证设置。
+    Placeholder,
+}
+
+impl FilterSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EngineSettings => "engine_settings",
+            Self::Placeholder => "placeholder",
+        }
+    }
+}
+
+/// 全局纹理过滤(来自引擎设置,逐帧下发到 stage 0/1;不是逐层属性)。
+///
+/// 证据:`FUN_0043cd6c`(`0x43cd6c`)帧入口对 stage 0/1 各下发
+/// `D3DSAMP_MAGFILTER/MINFILTER/MIPFILTER`,值来自
+/// `DAT_005b4804`(MAG)/`DAT_005b4808`(MIN)/`DAT_0080131c`(MIP)。
+/// 旧线“固定 Linear”是已知 ❌,不继承。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextureFilter {
+    pub mag: FilterMode,
+    pub min: FilterMode,
+    pub mip: MipFilter,
+    pub source: FilterSource,
+}
+
+impl TextureFilter {
+    /// 宿主注入的引擎设置。
+    pub const fn engine_settings(mag: FilterMode, min: FilterMode, mip: MipFilter) -> Self {
+        Self {
+            mag,
+            min,
+            mip,
+            source: FilterSource::EngineSettings,
+        }
+    }
+
+    /// 默认值未知(引擎设置工具写入);用显式“未设置”占位。
+    /// 后端看到 `source=placeholder` 时不得声称已对齐过滤语义。
+    pub const fn unknown() -> Self {
+        Self {
+            mag: FilterMode::Point,
+            min: FilterMode::Point,
+            mip: MipFilter::None,
+            source: FilterSource::Placeholder,
+        }
+    }
+}
+
+/// 一帧的合成契约。
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompositorFrame {
+    /// 逻辑帧号(来自 `VmEvent` 的 frame)。
+    pub frame: u64,
+    pub viewport: Viewport,
+    pub clear: Clear,
+    pub color_space: ColorSpace,
+    pub filter: TextureFilter,
+    /// 图像扩展名探测顺序(来自 `yscfg` 的 8 字节;`Other` 保留原码)。
+    pub image_probe_order: Vec<ImageFormat>,
+    /// 完整图层状态(含不可见层),按 `(z, seq, id)` 稳定排序。
+    pub layers: Vec<Layer>,
+    /// 绘制列表(只含可见/需要执行的 op)。
+    pub passes: Vec<Pass>,
+    /// 本帧待显示文本。
+    pub text: Vec<TextRun>,
+    /// 本帧诊断(按 `(code, command, detail)` 稳定排序)。
+    pub diagnostics: Vec<FrameDiag>,
+}
+
+impl CompositorFrame {
+    pub fn new(frame: u64, viewport: Viewport) -> Self {
+        Self {
+            frame,
+            viewport,
+            clear: Clear::default_black(),
+            color_space: ColorSpace::GammaEncodedSrgb8,
+            filter: TextureFilter::unknown(),
+            image_probe_order: default_probe_order(),
+            layers: Vec::new(),
+            passes: Vec::new(),
+            text: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+/// 手册 `cg/cg.html` 的默认扩展名顺序 `.PNG .BMP .JPG .GIF`;
+/// 真实 `yscfg` 可能覆盖(ERIS = `01 02 03 04 05`)。
+pub fn default_probe_order() -> Vec<ImageFormat> {
+    vec![
+        ImageFormat::from_code(1),
+        ImageFormat::from_code(2),
+        ImageFormat::from_code(3),
+        ImageFormat::from_code(4),
+    ]
+}
+
+/// `yscfg` 的 8 字节 → 探测顺序。尾部 0 不计入;未知码保留为 `Other`。
+pub fn probe_order_from_codes(codes: &[u8; 8]) -> Vec<ImageFormat> {
+    codes
+        .iter()
+        .copied()
+        .take_while(|&c| c != 0)
+        .map(ImageFormat::from_code)
+        .collect()
+}

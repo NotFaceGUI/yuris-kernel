@@ -1442,3 +1442,143 @@ $ cargo clippy -p yu-rt -p yu-format --all-targets
   (`frames=[1290326, 274466, 3315, 1302412, 15340, 15320, 15331, 15320]`,
   total 2,931,830, loose/packed 哈希 `18a94a71…`);全工作区套件见
   `target/abi-workspace.log`;clippy 无新增。
+
+## 成果 M3-GFX (2026-10-20) · yu-gfx 渲染语义层 + CompositorFrame + 证据表
+
+> 会话 M3-GFX。范围 = `yu-gfx`(语义层/可序列化显示列表/证据表/回归);
+> 不含 wgpu/wasm/窗口。零 git 写操作。
+
+### 1. 交付物
+
+- 新 crate `crates/yu-gfx/`:
+  - `frame.rs`(`CompositorFrame`/`Viewport`/`Clear`/`ColorSpace`/`TextureFilter`)
+  - `pass.rs`(`Pass`/`PassTarget`)、`op.rs`(`Op`/`CopyOp`/`ImageOp`)
+  - `layer.rs`(Layer/Part/BlendMode 0..18 状态表/Transition/Filter)
+  - `group.rs`、`transition.rs`、`text.rs`(文本模型)
+  - `state.rs`(`GfxState`:消费 `VmEvent::DomainCall`,维护图层树/组/复制)
+  - `table.rs`(槽号→参数名,唯一来源 = 工程 `ysc.ybn`)
+  - `path.rs`(ID/IDNO 路径规范化:`W0`/`:`/`.`/`..`/尾 `/`)
+  - `json.rs`(固定字段顺序;`to_json`/`to_display_json`/`blend_table_json`)
+  - `error.rs`(`gfx.*` 诊断码)
+- 文档:`docs/render-parity.md`(证据表 + 后端执行契约 + 旧线勘误);
+  `crates/yu-gfx/docs/divergences/README.md`(DIV-GFX-001..018)。
+- 取证工具:`crates/yu-rt/examples/gfx_census.rs`、`crates/yu-gfx/examples/eris_dump.rs`。
+- 必要 plumbing(非 gfx 语义):`yu-rt` 的 `DomainCall` 以前 `args: Vec::new()`,
+  宿主域拿不到参数;现按窗口求值并填充(`handlers.rs` 新增
+  `eval_arg_windows`,域分支不再空参)。通用 `Command` 事件路径不变。
+- 首屏 golden:
+  - `crates/yu-gfx/tests/golden/eris_first_screen_display.json`(20,620 B)
+  - `crates/yu-gfx/tests/golden/synthetic_group_layers_display.json`
+
+### 2. 证据表(详见 `docs/render-parity.md` §1)
+
+| 语义 | 手册 | 真实语料 | 引擎证据 | 结论 |
+|---|---|---|---|---|
+| 图层/ID/路径/Z/组 | `basic/layer.html`、`cg/cg.html` | ERIS 660 `CG`/307 `CGACT`/103 `CGEND` | `FUN_00413dc8` 34-49;`FUN_00414ba4` 115-156 | Confirmed;同 Z 取创建序(手册称不確定) |
+| `A` 0..256 | `cg/cg.html` `A=0～256` | 首屏 A=0/256 | `FUN_00414ba4` 116/135-154/910-913 | Confirmed;固定 `min(A,255)/255`,着色器 `A/256` |
+| `MODE=0..18` | `cg/cg.html` 全表 | 首屏 MODE=0/2 | `FUN_00414ba4` 391-874 | 0 Likely;1/2 Confirmed;3/5/6/7/9 Unverified;4/8/10..18 Unimplemented |
+| 纹理过滤 MAG/MIN/MIP | 无手册页(引擎设定) | 全局 | `FUN_0043cd6c` 46-117 | Confirmed 全局;旧线固定 Linear ❌ |
+| X/Y/FX/FR/FC/FEX | 手册只文档化 X/Y | ERIS `FX=@fx*100` 等 | `FUN_00414ba4` 117-125/220-336 | X/Y Confirmed;FX 家族槽位绑定 Unimplemented |
+| 多部件层 | 无直接页 | 首屏未出现 | `FUN_00414ba4` 155-156/200/219/985 | 结构 Confirmed;几何 Unimplemented |
+| 组/离屏/COPY | `cg/cg.html`/`basic/layer.html` | W0/W3、`COPY2=1 ID=:/W0/` | `FUN_00413dc8` 34-36/51-102;`FUN_00462e40` | 机制 Confirmed;COPY 时序 Unimplemented |
+| T/TA/TID | `cg/cg.html` | 源有 `T/TID/TA` | `FUN_00414ba4` 905-909 | 公式 Confirmed;TID 配对 Likely |
+| 文本 | `font/font.html` | FONT 3 次 | 内部绘制种类 98/100 | 模型 Confirmed;栅格化 Unimplemented |
+| 颜色空间 | 无 | 未采集截图 | 全树无 `D3DRS_SRGBWRITEENABLE` | Likely:gamma 空间混合 |
+
+### 3. ERIS 首屏 census(实测)
+
+- frame 0(初始化):1,290,326 命令;`CG` 30,668、`CGACT` 280、
+  `CGEND` 1,183、`CGINFO` 606、`FONT` 3、`FONTINFO` 1。
+- `CG` 参数:`ID` 30,668、`LINT` 29,068、`E` 1,058、`FILE` 552、
+  `Z` 553、`MODE` 1,016、`X/Y` 1,023、`A` 36、`SX/SY` 13。
+- 取值:`A` 256×34/0×2;`E` 0×1025/1×33;`MODE` 0×1015/2×1。
+- 首个有可见层的逻辑帧:272 图层、34 visible、15 pass
+  (1 可执行复制 + 11 图像加工 + 2 组离屏 + screen;screen 只含主窗口 W0)。
+- 68 个按钮快照的复制源是已删除临时层 → 帧内不可重放,图层标
+  `Unimplemented`;完整复制历史在 `GfxState::copies()`。
+
+### 4. 回归(原始结果)
+
+```text
+$ cargo test -q -p yu-gfx          # YURIS_REQUIRE_SAMPLES=1,样本=save/data/ysbin
+8 passed (lib) / 5 alpha / 9 blend_table / 1 eris_first_screen (12.8s)
+6 filter / 6 group / 11 layer_order / 2 screen / 6 transform / 4 transition
+1 display_list_golden — 全部 ok,0 failed
+
+$ cargo test -q -p yu-rt --lib --test fixture --test golden
+38 + 38 + 3 passed,0 failed
+
+$ cargo test -q -p yu-rt --release --test corpus --test corpus_golden
+9 + 4 passed,0 failed(21.8s + 0.2s;DomainCall 带参不改变 VM 状态)
+
+$ cargo test -q -p yu-trace        # 带 YURIS_SAMPLE_ERIS_YPF
+2 + 7 passed,0 failed(real_sample 116.8s)
+
+$ cargo clippy -q -p yu-gfx --all-targets
+yu-gfx: 0 warning;yu-rt 仍是既有 5 条基线 warning(无新增)
+
+$ grep -rn "winit|wgpu|web-sys|wasm-bindgen" crates/yu-gfx/src   # 0
+$ grep -rn "println!|eprintln!|dbg!" crates/yu-gfx/src           # 0
+$ grep -rn "HashMap" crates/yu-gfx/src                          # 0(全部 BTree)
+```
+
+- 确定性:同一输入连续两次 `to_json`/`to_display_json` 逐字节一致;
+  `eris_dump` 连跑两次输出 diff 为空。
+- 首屏 golden 使用 `UPDATE_GFX_GOLDEN=1` 生成,默认测试比对字节。
+
+### 5. 未实现/挂账(全部有 DIV 编号)
+
+- MODE 3/5/6/7/9(状态有、辅助纹理/运算未取证);MODE 4/8/10..18
+  (着色器本体未定位)。
+- `MID` 掩码;`FX/FY/FBX/FBY/FRX/FRY/FRZ/FCX/FCY/FEX/FEY/FEZ/FSD/FMD/
+  FQU/FID/F` 的槽位→偏移;多部件层几何。
+- `CGACT[COPY/COPY2]` 的上一帧时序/区域;`RECTPAINT*`/`SIZE*`/`ROTATION`/
+  `MONO`/`BLUR*`/... 图像加工。
+- 文本字形栅格化/行距/描边/窗口定位。
+- 子窗口(`WINDOW[NO=1..3] CGID`)的叠放/位置/可见性:Screen 只合成主窗口
+  `:/W0`,子窗口只出 Offscreen pass(交 window/host 会话)。
+- 颜色空间/默认清屏/组无 SX/SY 时的离屏尺寸:均为 Likely/Open。
+
+### 6. 给后端的契约摘要
+
+- **只执行 `CompositorFrame.passes`**;`status.executable=false` 的 op
+  必须跳过,不得近似。pass 顺序 = 纹理复制/加工 → 组离屏(子先父后)
+  → screen。
+- **Alpha**:`Layer.alpha` 原值 0..256;固定管线 `min(A,255)/255`,
+  着色器 `A/256`;不要在线性空间混合(`color_space=gamma_encoded_srgb8`)。
+- **Blend**:`json::blend_table_json()` 给出 19 模式的 D3D9 状态;
+  0/1/2 可执行,3/5/6/7/9 状态可下发但默认跳过,4/8/10..18 跳过。
+- **Filter**:`frame.filter.mag/min/mip` 是全局采样器设置,不是逐层。
+- **Group**:先 `Offscreen` pass,再把组纹理按 `layer.alpha/blend` 合成;
+  组 `E=0` 只影响父层合成,不影响组内渲染/COPY。
+- **窗口**:Screen pass 只合成主窗口 `:/W0`(手册 `WINDOW[NO=0] CGID`);
+  子窗口 `:/W1..W3` 只产出 `Offscreen` pass,窗口叠放/位置归 host(后续)。
+- **Transition**:`from/to` 双纹理 + 已算好的 `fade`;`to=None` 跳过。
+- **Transform**:X/Y 是引擎 i64;FX 家族原值在 `transform.filter`,
+  当前 Unimplemented;后端不得自行解释槽位。
+- **Copy/Image**:帧内只含可执行项;`GfxState::copies()/images()` 是审计
+  历史,不是执行清单;`Snapshot` 纹理在 COPY 语义关闭前无效。
+
+### 7. 环境勘误
+
+任务书给的 `YURIS_SAMPLE_ERIS_YSBIN=<side-repo>/workbench/project-eris/data/ysbin`
+已不存在(E3 已记语料迁到 `project-eris/save/data`)。本次用
+`<side-repo>/workbench/project-eris/save/data/ysbin`;`data.ypf` 仍在
+`<side-repo>/workbench/project-eris/data.ypf`。测试缺样本时:
+`YURIS_REQUIRE_SAMPLES=1` 显式失败,否则打印 `SKIP` 可见跳过。
+
+## 成果 20 (2026-10-20) · gfx 复核修复任务书(验证优先)
+
+- 新增 `docs/tasks/task-f-gfx-repair.md`。
+- **文件开头明确警示**:审查报告中的问题可能误读手册/反编译/代码,全部默认“不一定正确”;
+  必须先产出 `gfx-verification-ledger.md`(Confirmed/Refuted/Uncertain + 决策),禁止照单修改。
+- 核心目标:完美渲染。判定顺序 = 语义(层/顺序/可见性/Alpha/混合/变换/窗口/文本)
+  → 显示列表 → 软参考像素 → 官方截图有据容差;本会话只做前两层。
+- 审查主张按 A(手册/真实脚本)、B(REA/引擎)、C(硬编码/A5)、D(缺失)、
+  E(健壮性/性能)、F(测试真实性)分组,每条附先看哪里;特别标注:
+  - 手册“SX/SY 仅组有效”与 ERIS 图像层用法冲突,必须以引擎为准;
+  - Z 重排/E 偏移/组 RT/TFACTOR/DIFFUSE 等只有审查主张,需直接 REA 复核;
+  - 旧地址 0x42c4a4/0x43d334/0x43d4a4 不可复核,必须重新锚定。
+- 决策规则:Confirmed+可见影响才修;Refuted 只勘误;Uncertain 保持 Unimplemented+DIV;
+  手册与引擎冲突以引擎为准并留手册勘误。
+- 仅文档改动;未执行 git 操作。

@@ -169,6 +169,25 @@ pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> 
 }
 
 impl Vm {
+    /// 把命令窗口逐条求值成 `(槽号, 值)`。跳转窗口与空窗口跳过;
+    /// 求值失败省略该窗口(处理器/诊断会给出真正的失败原因)。
+    fn eval_arg_windows(
+        &mut self,
+        st: &mut ExecState,
+        cmd: &Cmd,
+    ) -> Vec<ArgValue> {
+        let mut args = Vec::new();
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            if let Ok(v) = self.eval_value(st, &w.payload) {
+                args.push(ArgValue::new(w.rec.kind, v));
+            }
+        }
+        args
+    }
+
     pub(crate) fn dispatch(
         &mut self,
         st: &mut ExecState,
@@ -179,17 +198,11 @@ impl Vm {
         // 真正的失败会在处理器里以 Diag 报出)。控制流窗口(跳转目标)是
         // 「length 字段 = 组号」而不是表达式,所以只记录成功求值者。
         // `record_events=false` 时跳过(热路径最大开销;Diag 不受影响)。
-        let mut args = Vec::new();
-        if self.record_events {
-            for w in &cmd.windows {
-                if w.rec.length == 0 {
-                    continue;
-                }
-                if let Ok(v) = self.eval_value(st, &w.payload) {
-                    args.push(ArgValue::new(w.rec.kind, v));
-                }
-            }
-        }
+        let args = if self.record_events {
+            self.eval_arg_windows(st, cmd)
+        } else {
+            Vec::new()
+        };
         self.record_command(st, cmd, args);
 
         // 启动期解析的 opcode → 处理器表(见 `build_handler_table`)。
@@ -230,11 +243,15 @@ impl Vm {
             HandlerKind::ReturnCode => self.op_returncode(st, cmd),
             HandlerKind::Labelinfo => self.op_labelinfo(st, cmd),
             HandlerKind::Domain(domain) => {
+                // 域命令的参数是宿主域状态机唯一能看到的输入;必须带上
+                // 求值结果(槽号 = 工程 ysc 表的参数序号)。`record_events`
+                // 只控制通用 Command 事件,不影响域事件。
+                let args = self.eval_arg_windows(st, cmd);
                 self.emit(VmEvent::DomainCall {
                     frame: self.frame(),
                     domain,
                     name: cmd.name.clone(),
-                    args: Vec::new(),
+                    args,
                 });
                 self.report_unimplemented(
                     &cmd.name,
