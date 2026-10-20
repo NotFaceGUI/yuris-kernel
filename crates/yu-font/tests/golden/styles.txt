@@ -1,0 +1,10 @@
+solid_white_20 size=17x19 left=2 top=-17 adv=5120 hash=18bbfd3d2d00a36a mass=28110
+bold_20 size=19x20 left=2 top=-18 adv=5120 hash=f81d234a69171c6d mass=53649
+italic_shear12_20 size=10x17 left=0 top=-17 adv=2560 hash=0299d8dc2ff1ab58 mass=14265
+aa_off_20 size=17x19 left=2 top=-17 adv=5120 hash=f6dfd5e73d0a20ed mass=27540
+outline1_red_20 size=19x21 left=1 top=-18 adv=5120 hash=45ca556058394b24 mass=37732
+outline3_red_20 size=23x25 left=-1 top=-20 adv=5120 hash=97fa8a1df0d20804 mass=75977
+shadow_m3m4_20 size=13x20 left=-3 top=-20 adv=2560 hash=30b0b4706d5d1de5 mass=25768
+gradient_red_blue_20 size=14x14 left=3 top=-14 adv=5120 hash=8f84eba776d99a56 mass=21206
+rotation45_20 size=19x20 left=0 top=-12 adv=2560 hash=cade4bc1aa7fd2ba mass=14402
+sx16_sy24 size=13x23 left=2 top=-20 adv=4096 hash=1e19d2814a37596e mass=26978

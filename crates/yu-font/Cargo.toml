@@ -1,0 +1,28 @@
+[package]
+name = "yu-font"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "YU-RIS font loading, glyph rasterization and text style composition"
+
+[dependencies]
+yu-log = { path = "../yu-log" }
+# Pure-Rust outline/coverage rasterizer (wasm32 + Android clean).
+swash = { version = "0.2.10", default-features = false, features = ["std", "scale", "render"] }
+# Face table + bytes. `std` only on wasm (no filesystem enumeration).
+fontdb = { version = "0.24", default-features = false, features = ["std"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# System font discovery on desktop/Android. memmap/fontconfig stay off.
+fontdb = { version = "0.24", default-features = false, features = ["std", "fs"] }
+
+[dev-dependencies]
+yu-format = { path = "../yu-format" }
+yu-vfs = { path = "../yu-vfs" }
+png = "0.17"
+
+[features]
+default = []
+# Windows-only reference rasterizer through GDI. Never enabled by default and
+# never part of the wasm/Android build.
+gdi-reference = []

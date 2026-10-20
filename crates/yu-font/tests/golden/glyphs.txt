@@ -1,0 +1,5 @@
+U+0041 px=20 size=10x16 left=0 top=-16 adv=2560 hash=bc9d63d581b258b1 mass=14267
+U+3042 px=20 size=17x19 left=2 top=-17 adv=5120 hash=18bbfd3d2d00a36a mass=28110
+U+6F22 px=20 size=18x19 left=1 top=-17 adv=5120 hash=2e82dd83510fa095 mass=34609
+U+3002 px=20 size=7x6 left=1 top=-4 adv=5120 hash=93f45948d1821975 mass=3425
+U+3001 px=12 size=4x4 left=1 top=-2 adv=3072 hash=7685136450d275fd mass=1003
