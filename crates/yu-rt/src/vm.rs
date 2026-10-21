@@ -37,6 +37,7 @@ use crate::task::{ChainReport, Effect, Scheduler, StepOutcome, TaskExecutor, Tas
 use crate::value::{Value, VarRef, VarSpace, VariableStore};
 
 pub(crate) mod handlers;
+pub use handlers::HandlerKind;
 
 /// 事件队列默认容量(任务书 E R10)。按每帧数千事件的量级留足余量,
 /// 同时保证长跑有界;需要完整全量事件流的调用方用 [`Vm::take_events`]/
@@ -303,8 +304,9 @@ pub struct Vm {
     /// 表达式解码复用缓冲(热路径零分配)。
     decode_scratch: Vec<crate::expr::RawInstr>,
     texts: BTreeMap<String, Vec<u8>>,
-    /// 显示文本缓冲(`$_TEXT`;`WORD`/`_` 追加,脚本可写)。
-    text_buffer: Vec<u8>,
+    /// 显示文本层状态(`$_TEXT`/`$_TEXT_FLAG`/`TEXTINFO` 的数据源;
+    /// 引擎 `[0x801800]` 的已取证字段,见 [`crate::text`])。
+    text: crate::text::TextState,
     /// `TEXT[ID=...]`:后续文本事件的目标文本层 ID(手册 `text/text.html`)。
     /// 事件字段是 `String`;非 UTF-8 的 CP932 ID 会显式报告并保持为空。
     text_layer_id: String,
@@ -315,6 +317,10 @@ pub struct Vm {
     window_exec_max: i64,
     window_exec_close: i64,
     executed: u64,
+    /// 每条命令(opcode)的执行次数。**不受 `record_events` 影响**:
+    /// 覆盖普查要在关闭事件流的热路径上拿到逐命令频度(任务书 M-1)。
+    /// 下标 = 工程 `ysc.ybn` 的命令序号;长度在启动期固定。
+    command_hits: Vec<u64>,
     unimplemented_cmds: BTreeMap<String, u64>,
     unimplemented_reported: std::collections::BTreeSet<String>,
     /// 事件队列容量上限(任务书 E R10:长跑不得无界增长)。
@@ -398,6 +404,8 @@ impl Vm {
         let sys_count = tables.boot.sysvars.len() as u16;
         let screen = (tables.boot.config.width, tables.boot.config.height);
         let binding = InputBinding::from_sysvars(&tables.boot.sysvars);
+        // 逐命令命中计数按工程 yscm 的命令数开表(下标 = opcode)。
+        let command_hits = vec![0u64; handler_of.len()];
 
         let mut vm = Vm {
             src,
@@ -434,12 +442,13 @@ impl Vm {
             eval_scratch: Vec::new(),
             decode_scratch: Vec::new(),
             texts: BTreeMap::new(),
-            text_buffer: Vec::new(),
+            text: crate::text::TextState::default(),
             text_layer_id: String::new(),
             menu_code: 0,
             window_exec_max: 0,
             window_exec_close: 0,
             executed: 0,
+            command_hits,
             unimplemented_cmds: BTreeMap::new(),
             unimplemented_reported: std::collections::BTreeSet::new(),
             event_capacity: DEFAULT_EVENT_CAPACITY,
@@ -726,18 +735,42 @@ impl Vm {
 
     /// 当前显示文本(默认层;`WORD`/`_` 追加,`$_TEXT` 写入替换)。
     pub fn current_text(&self) -> Vec<u8> {
-        self.text_buffer.clone()
+        self.text.bytes.clone()
+    }
+
+    /// `$_TEXT_FLAG` 控制字节流(引擎 `[state+0x3c]`;见 [`crate::text::flag`])。
+    pub fn text_flags(&self) -> Vec<u8> {
+        self.text.flags.clone()
+    }
+
+    /// 文本层状态快照(宿主/gfx 桥读取;加法式 API,不改事件字段)。
+    pub fn text_state(&self) -> crate::text::TextSnapshot {
+        crate::text::TextSnapshot::from(&self.text)
+    }
+
+    /// 宿主渲染器推进文本光标后推入(`TEXTINFO[CX/CY]` 的数据源)。
+    /// 引擎里 `+0x14/+0x18` 由显示例程更新;yu-rt 不绘制,故由宿主注入。
+    pub fn set_text_cursor(&mut self, x: i64, y: i64) {
+        self.text.cursor_x = x;
+        self.text.cursor_y = y;
+    }
+
+    /// 宿主渲染器到达点击等待标志后推入(`TEXTINFO[CLICK]` 的数据源)。
+    pub fn set_text_click(&mut self, click: bool) {
+        self.text.click = click;
     }
 
     /// 追加显示文本(`WORD` 文本段 / `_` 式值;手册 `basic/svariable.html`:
-    /// `$_TEXT` = 現在表示されているテキストの内容)。
+    /// `$_TEXT` = 現在表示されているテキストの内容)。同时按字符写
+    /// `$_TEXT_FLAG` 的 `'1'`/`'2'`(REA `0x458d44`)。
     pub(crate) fn append_text(&mut self, bytes: &[u8]) {
-        self.text_buffer.extend_from_slice(bytes);
+        self.text.append_text(bytes);
     }
 
     /// 替换显示文本(`$_TEXT` 写入;手册 ○ 可赋值 = 覆盖当前内容)。
+    /// 标志流不在此重建:引擎写入路径未取证(`DIV-RT-032` 仍挂写入)。
     pub(crate) fn set_text(&mut self, bytes: Vec<u8>) {
-        self.text_buffer = bytes;
+        self.text.bytes = bytes;
     }
 
     /// `@_MENUCODE` 读取(菜单域宿主选中项后应经 [`Vm::set_menu_code`] 推入)。
@@ -771,6 +804,19 @@ impl Vm {
 
     pub fn executed_commands(&self) -> u64 {
         self.executed
+    }
+
+    /// 每条命令(opcode 下标)的**执行次数**。与 [`Vm::executed_commands`]
+    /// 不同,本计数不依赖 `record_events`,可在 `record_events=false` 的
+    /// 热路径上用于覆盖普查(任务书 M-1)。下标对应工程 `ysc.ybn` 序号。
+    pub fn command_hits(&self) -> &[u64] {
+        &self.command_hits
+    }
+
+    /// opcode 对应的处理器类别(启动期按工程 `ysc.ybn` 解析;覆盖普查
+    /// 用它区分「已实现 / 域事件 / 无处理器」,不靠名字猜测)。
+    pub fn handler_kind(&self, opcode: u8) -> Option<HandlerKind> {
+        self.handler_of.get(opcode as usize).copied()
     }
 
     // ---------------------------------------------------------- 帧推进
@@ -1061,6 +1107,11 @@ impl Vm {
     }
 
     pub(crate) fn record_command(&mut self, st: &ExecState, cmd: &Cmd, args: Vec<crate::event::ArgValue>) {
+        // 频度计数先行(与 `record_events` 无关):覆盖普查必须能在关闭
+        // 事件流时拿到逐命令触发次数(任务书 M-1)。
+        if let Some(hit) = self.command_hits.get_mut(cmd.opcode as usize) {
+            *hit += 1;
+        }
         if !self.record_events {
             return;
         }

@@ -309,9 +309,12 @@ pub struct Counter {
 
 /// 输入运行状态:每逻辑帧推进计数器。
 ///
-/// 语义严格按手册:`pressed` → `+1`(首次)或继续 `+1`;`released` → `-1` 并
-/// **逐帧继续递减**;`==1` 恰为「本帧按下」(所以**第一帧按下必须是 1**,
-/// 而不是 2)。
+/// 语义严格按手册:`pressed` 的按下沿 → `1`,持续按住逐帧 `+1`;
+/// `released` → `-1` 并**逐帧继续递减**;`==1` 恰为「本帧按下」。
+///
+/// 重新按下时从 `1` 重新起算(手册「押された瞬間から 1 → 2 → 3」),
+/// 不是从上次松开后的负数继续加 —— 否则长期未按后的一次短按永远到不了
+/// 正值,文本推进/`==1` 判定会失效。
 #[derive(Clone, Debug, Default)]
 pub struct InputState {
     counters: BTreeMap<ButtonName, Counter>,
@@ -351,7 +354,11 @@ impl InputState {
                         self.keylast = code;
                     }
                 }
-                counter.value += 1;
+                counter.value = if counter.value > 0 {
+                    counter.value + 1
+                } else {
+                    1
+                };
                 self.counts.entry(button.clone()).or_insert(0);
                 let n = self.counts.get_mut(button).expect("刚刚插入");
                 if *n == 0 {
@@ -445,7 +452,8 @@ impl InputState {
     /// `0x5b48ac..0x5b48b8` = MOUSE_L / ENTER / PAD / PAD,`0x5b48bc` = CTRL;
     /// 任一计数器为正即视为点击推进)。
     pub fn text_advance_requested(&self) -> bool {
-        const ADVANCE_BUTTONS: [&str; 3] = ["MOUSE_L", "ENTER", "CTRL"];
+        // 计数器键 = `MOUSE_L` / `KEY_ENTER` / `KEY_CTRL`(绑定表命名)。
+        const ADVANCE_BUTTONS: [&str; 3] = ["MOUSE_L", "KEY_ENTER", "KEY_CTRL"];
         ADVANCE_BUTTONS
             .iter()
             .any(|b| self.counter(b) > 0)
@@ -529,11 +537,40 @@ mod tests {
     }
 
     #[test]
+    fn repress_after_release_restarts_at_one() {
+        let mut tl = InputTimeline::new();
+        tl.set(0, InputFrame::new(["KEY_Z"]));
+        tl.set(1, InputFrame::new(std::iter::empty::<&str>()));
+        tl.set(11, InputFrame::new(["KEY_Z"]));
+        let mut st = InputState::new();
+        for f in 0..=10 {
+            st.advance(f, &tl);
+        }
+        assert_eq!(st.counter("KEY_Z"), -10, "松开 10 帧后 = -10");
+        st.advance(11, &tl);
+        assert_eq!(st.counter("KEY_Z"), 1, "重新按下的瞬间从 1 起算");
+        st.advance(12, &tl);
+        assert_eq!(st.counter("KEY_Z"), 2, "继续按住 = 2");
+    }
+
+    #[test]
     fn any_counter_positive_while_held() {
         let mut tl = InputTimeline::new();
         tl.set(0, InputFrame::new(["KEY_A", "KEY_B"]));
         let mut st = InputState::new();
         st.advance(0, &tl);
         assert!(st.any_counter() > 0);
+    }
+
+    #[test]
+    fn text_advance_buttons_use_binding_names() {
+        let mut tl = InputTimeline::new();
+        tl.set(0, InputFrame::new(["KEY_ENTER"]));
+        let mut st = InputState::new();
+        st.advance(0, &tl);
+        assert!(st.text_advance_requested(), "ENTER 必须能推进文本");
+        tl.set(1, InputFrame::new(std::iter::empty::<&str>()));
+        st.advance(1, &tl);
+        assert!(!st.text_advance_requested(), "松开后不再推进");
     }
 }

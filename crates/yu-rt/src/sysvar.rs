@@ -308,14 +308,18 @@ pub fn read(
         // 手册 `basic/svariable.html`:`$_TEXT` = 現在表示されているテキストの内容。
         // 缓冲由 `WORD`/`_` 追加、`$_TEXT` 写入替换(见 handlers)。
         "_TEXT" => Ok(Value::Str(vm.current_text())),
-        // 手册:`$_TEXT_FLAG` = 半角全角情報や改行改頁クリック待ち情報(有页!)
-        // ——但**逐字符标志的位布局手册未给**(每字符 1 字节?位定义?)⇒
-        // 位语义无证据,不臆造(DIV-RT-007)。`_TEXT_NUM` 手册无页。
-        "_TEXT_FLAG" | "_TEXT_NUM" => Err(diag::unimplemented(
+        // 手册:`$_TEXT_FLAG` = 半角全角情報や改行改頁クリック待ち情報(有页)。
+        // 三层已齐(REA 0.495 `0x446b93` id 0x7b → `[state+0x3c]`;字节表见
+        // `crate::text::flag`),返回与 `$_TEXT` 并行的控制字节流。
+        // 台账:`COV-M-01`。
+        "_TEXT_FLAG" => Ok(Value::Str(vm.text_flags())),
+        // `_TEXT_NUM`:手册无页;引擎 int getter `0x4276e3` 读的是装载期全局
+        // `0x80174c`(不是文本缓冲计数),语义未取证 ⇒ 保持挂号。
+        "_TEXT_NUM" => Err(diag::unimplemented(
             code::rt::SYSVAR_UNIMPLEMENTED,
             Boundary::Script,
             format!(
-                "{name}:手册有页但标志位布局未取证(三层缺③)⇒ 不实现(DIV-RT-007)"
+                "{name}:手册无页且引擎取值来自装载期全局 0x80174c,语义未取证 ⇒ 不实现(DIV-RT-007)"
             ),
         )),
         // 手册:`○@_MENUCODE` = 最後に選択されたメニュー項目の CODE 値。

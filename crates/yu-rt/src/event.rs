@@ -106,6 +106,19 @@ impl ArgValue {
     }
 }
 
+/// 域事件参数的数据驱动视图:槽号 + 工程 ysc 参数名 + 求值结果。
+#[derive(Clone, Debug, PartialEq)]
+pub struct DomainArg<'a> {
+    /// 工程 `ysc.ybn` 中该命令的参数名(查不到时为 `@<slot>`)。
+    pub name: std::borrow::Cow<'a, str>,
+    /// 参数序号(= 事件里的 `ArgValue::slot`)。
+    pub slot: u8,
+    /// 求值结果。**注意**:`SAVE/LOAD/FILEINFO/SOUNDINFO` 的
+    /// `SET`/`LET` 在引擎里是变量引用,本视图仍只能看到求值结果;
+    /// 变量身份未进入 `DomainCall`(契约缺口见 DIV-RT-042)。
+    pub value: &'a Value,
+}
+
 /// 跳转类型(与旧线 `JumpKind` 同构,便于人工比对)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JumpKind {
@@ -177,6 +190,38 @@ impl Domain {
 }
 
 impl VmEvent {
+    /// 把 `DomainCall` 的参数槽号按工程 `ysc.ybn` 映射成参数名。
+    ///
+    /// 非 `DomainCall` 返回 `None`。命令名不在工程表时仍返回全部参数,
+    /// 名字用 `@<slot>`(不猜)。这是宿主域状态机消费事件的推荐入口:
+    /// 槽号不是跨版本稳定的数字,参数名 + 顺序才是。
+    ///
+    /// 台账:`COV-M-04`;契约与缺口见 `docs/domain-event-contracts.md`。
+    pub fn domain_args<'a>(
+        &'a self,
+        yscm: &'a crate::tables::YscmTable,
+    ) -> Option<Vec<DomainArg<'a>>> {
+        let VmEvent::DomainCall { name, args, .. } = self else {
+            return None;
+        };
+        let opcode = yscm.index_of(name);
+        Some(
+            args.iter()
+                .map(|a| {
+                    let pname = opcode
+                        .and_then(|i| yscm.param(i as u8, a.slot))
+                        .map(|p| std::borrow::Cow::Borrowed(p.name.as_str()))
+                        .unwrap_or_else(|| std::borrow::Cow::Owned(format!("@{}", a.slot)));
+                    DomainArg {
+                        name: pname,
+                        slot: a.slot,
+                        value: &a.value,
+                    }
+                })
+                .collect(),
+        )
+    }
+
     /// `sub` 字段:与 `docs/oracle.md` 的子系统命名一致。
     pub fn sub(&self) -> &'static str {
         match self {

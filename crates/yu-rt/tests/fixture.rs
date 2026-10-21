@@ -1103,6 +1103,7 @@ fn var_add_macro_chain_appends() {
 /// 0.495 `ysc.ybn` 实测序号(dump_ycd):79 RETURNCODE / 106 WORD / 110 `_`。
 const OP_RETURNCODE: u8 = 79;
 const OP_TEXT: u8 = 96;
+const OP_TEXTINFO: u8 = 97;
 const OP_WORD: u8 = 106;
 const OP_TEXT_OUT: u8 = 110;
 
@@ -1277,6 +1278,188 @@ fn text_id_sets_following_run_id_and_clear_empties_buffer() {
         .collect();
     assert_eq!(texts, vec!["MSG".to_string(), "MSG".to_string()]);
     assert_eq!(vm.current_text(), b"B", "CLEAR 清掉前面的 A");
+    assert_eq!(vm.text_flags(), b"1", "CLEAR 同时清标志流(只剩 B)");
+}
+
+#[test]
+fn text_flags_track_cp932_width_and_returncode_auto_defaults() {
+    // REA 0x458d44:每字符一个 '1'(半角)/ '2'(全角);
+    // REA 0x44c390:自动模式 RETURNCODE 追加 AUTOCLICK 'C'/AUTORETURN 'R'/
+    // AUTOPAGE 'P',最后恒追加 'E'。默认 OUTPUTMODE/AUTO* 都是 1。
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_WORD).window(0, b"A\x82\xB1".to_vec()), // A + こ
+        GroupSpec::new(OP_RETURNCODE).window(1, Vec::new()),
+        GroupSpec::new(OP_END),
+    ]];
+
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(vm.current_text(), b"A\x82\xB1");
+    assert_eq!(vm.text_flags(), b"12CRPE");
+}
+
+#[test]
+fn text_outputmode_manual_click_continues_and_auto_click_yields() {
+    // REA 0x45383f..0x45388b:CLICK=1 先写 'C';自动模式返回 -1(本帧让出),
+    // 手动模式继续处理同一条 TEXT 的 RETURN 并执行后续命令。
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let text = |slot: u8, payload: Vec<u8>| GroupSpec::new(OP_TEXT).window(slot, payload);
+    b.scripts = vec![vec![
+        text(1, ex::i32_(0)), // OUTPUTMODE=0 手动
+        text(15, ex::i32_(1)), // CLICK=1:手动模式不 yield
+        text(11, ex::i32_(1)), // RETURN=1
+        GroupSpec::new(OP_END),
+    ]];
+
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    // 引擎次序:CLICK 'C' 先于 RETURN 'R'。
+    assert_eq!(vm.text_flags(), b"CR", "手动模式 CLICK 继续并处理 RETURN");
+
+    // 自动模式:CLICK=1 让出,后续 RETURN 与后续命令都要等下一次 tick。
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        text(1, ex::i32_(1)),  // OUTPUTMODE=1 自动(默认亦为 1)
+        text(15, ex::i32_(1)), // CLICK=1 → yield
+        text(11, ex::i32_(1)), // 本次 TEXT 里 RETURN 被跳过
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r1 = vm.tick_at(0, &no_input());
+    assert!(r1.errors.is_empty(), "{:?}", r1.errors);
+    assert_eq!(vm.text_flags(), b"C", "自动模式 CLICK 后立即让出");
+    let r2 = vm.tick_at(16, &no_input());
+    assert!(r2.errors.is_empty(), "{:?}", r2.errors);
+    assert_eq!(vm.text_flags(), b"CR", "下一帧继续执行被跳过的后续命令");
+}
+
+#[test]
+fn textinfo_queries_text_state_by_parameter_presence() {
+    // 手册 text/textinfo.html;REA 0x4538cc:查询判据是参数**出现**,
+    // 不是值是否为 1;次序 OUTPUTMODE/CX/CY/CLICK/AUTO*。
+    let mut b = ProjectBuilder::new();
+    if let Some((_, params)) = b.commands.iter_mut().find(|(n, _)| *n == "TEXTINFO") {
+        *params = vec![
+            ("ID", 1, 0),
+            ("OUTPUTMODE", 0, 3),
+            ("CX", 0, 3),
+            ("CY", 0, 3),
+            ("CLICK", 0, 3),
+            ("AUTORETURN", 0, 3),
+            ("AUTOPAGE", 0, 3),
+            ("AUTOCLICK", 0, 3),
+            ("LET", 0, 3),
+            ("SET", 0, 3),
+        ];
+    }
+    let v1 = with_int_var(&mut b, 0, -1);
+    let v2 = with_int_var(&mut b, 1, -1);
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let text = |slot: u8, payload: Vec<u8>| GroupSpec::new(OP_TEXT).window(slot, payload);
+    let info = |slot: u8, target: VarRef| {
+        GroupSpec::new(OP_TEXTINFO)
+            .window(slot, ex::i32_(1))
+            .window(8, ex::r#ref(0x40, target.id))
+    };
+    b.scripts = vec![vec![
+        text(1, ex::i32_(0)),  // OUTPUTMODE=0
+        text(17, ex::i32_(0)), // AUTORETURN=0
+        info(1, v1),           // TEXTINFO[OUTPUTMODE=1 LET=@v1]
+        info(5, v2),           // TEXTINFO[AUTORETURN=1 LET=@v2]
+        GroupSpec::new(OP_END),
+    ]];
+
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(vm.store().read(v1, &[]).unwrap(), Value::Int(0));
+    assert_eq!(vm.store().read(v2, &[]).unwrap(), Value::Int(0));
+}
+
+#[test]
+fn text_flag_sysvar_reads_the_control_stream() {
+    // REA 0x446b93:id 0x7b(_TEXT_FLAG)→ [state+0x3c]。WORD 写入后,
+    // 脚本用 LET[$v = $_TEXT_FLAG] 必须拿到同一字节流。
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    let flag_id = b
+        .sysvars
+        .iter()
+        .position(|(n, _, _)| *n == "_TEXT_FLAG")
+        .expect("fixture 系统变量含 _TEXT_FLAG") as u16;
+    b.vars.push(VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 3,
+        dims: vec![],
+        init: Init::Str(b""),
+    });
+    let v = VarRef::new(VarSpace::Dollar, sys);
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_WORD).window(0, b"A\x82\xB1".to_vec()),
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x24, v.id))
+            .window(1, ex::get(0x40, flag_id)),
+        GroupSpec::new(OP_END),
+    ]];
+
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.store().read(v, &[]).unwrap(),
+        Value::Str(b"12".to_vec()),
+        "$_TEXT_FLAG = 半角/全角控制流"
+    );
+}
+
+#[test]
+fn domain_args_map_slots_through_project_yscm() {
+    // 域事件只带槽号;宿主应按工程 ysc.ybn 的名字消费(槽号不跨版本稳定)。
+    // 手册 sound/sound.html:ID / VOLUME(0..256)/ E(0/1)。
+    let mut b = ProjectBuilder::new();
+    if let Some((_, params)) = b.commands.iter_mut().find(|(n, _)| *n == "SOUND") {
+        *params = vec![("ID", 1, 0), ("VOLUME", 0, 3), ("E", 0, 3)];
+    }
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    const OP_SOUND: u8 = 87;
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_SOUND)
+            .window(0, ex::s("BGM"))
+            .window(1, ex::i32_(256))
+            .window(2, ex::i32_(1)),
+        GroupSpec::new(OP_END),
+    ]];
+
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let call = vm
+        .events()
+        .iter()
+        .find(|e| matches!(e, yu_rt::VmEvent::DomainCall { name, .. } if name == "SOUND"))
+        .expect("SOUND DomainCall");
+    let named = call.domain_args(&vm.tables().boot.yscm).expect("DomainCall");
+    let names: Vec<&str> = named.iter().map(|a| a.name.as_ref()).collect();
+    assert_eq!(names, vec!["ID", "VOLUME", "E"]);
+    assert_eq!(named[0].value, &Value::Str(b"BGM".to_vec()));
+    assert_eq!(named[1].value, &Value::Int(256));
+    assert_eq!(named[2].value, &Value::Int(1));
 }
 
 // ---------------------------------------------------------------- 按钮码 _CODE_* / _INP
@@ -1468,6 +1651,8 @@ fn one_text_line_per_frame_until_advance_input() {
         GroupSpec::new(OP_RETURNCODE).window(1, Vec::new()),
         word("B"),
         GroupSpec::new(OP_RETURNCODE).window(2, Vec::new()),
+        word("C"),
+        GroupSpec::new(OP_RETURNCODE).window(3, Vec::new()),
         GroupSpec::new(OP_END),
     ]];
     let mut vm = boot(b);
@@ -1502,6 +1687,20 @@ fn one_text_line_per_frame_until_advance_input() {
         "推进输入后进入下一行(且一次只一行)"
     );
     assert_eq!(rc_count(&vm), 2);
+
+    // 松开若干帧后再次点击(计数器已为负数):按手册「押された瞬間から 1」
+    // 必须从 1 重新起算,否则第二次点击永远到不了正值,第三行不出现。
+    let mut tl = InputTimeline::new();
+    tl.set(10, InputFrame::new(["MOUSE_L"]));
+    for f in 5..=10 {
+        vm.tick_at(f * 16, &tl);
+    }
+    assert_eq!(
+        texts(&vm),
+        vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
+        "长期松开后的第二次点击仍能推进"
+    );
+    assert_eq!(rc_count(&vm), 3);
 }
 
 /// R9 回归:GOSUB 允许 64 次嵌套,第 65 次 Fatal。

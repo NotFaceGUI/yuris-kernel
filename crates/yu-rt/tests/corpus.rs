@@ -638,13 +638,90 @@ fn eris_entry_chain_runs_end_to_end() {
     // NO=1..n]` 逐脚本查询循环拿到**真实文本条数**(旧实现错读成 var_count),
     // 该帧命令数随之修正:332,550 → 274,466(主人裁决钉入;证据链见
     // PROGRESS 成果 E3)。它同时钉住 TEXTNUM 语义本身:回退旧错值会在此爆掉。
-    assert_eq!(counts[1], 274_466, "TEXTNUM 修正后的第 2 帧命令数(回归金丝雀)");
+    //
+    // 2026-10-21(M-2):274,466 → 272,296。两处**按 REA 证据**实现的文本语义
+    // 改变了启动第 2 帧的分支:
+    //   1. `_TEXT_FLAG` 读取不再 Unimplemented(REA 0x446b93 id 0x7b →
+    //      `[state+0x3c]`),es_text 的 LET 拿到真实控制流;
+    //   2. `TEXT[CLICK=1]` 在自动模式返回 -1(REA 0x45383f..0x45388b),
+    //      与引擎一样让出本任务的本 vsync,后续命令推迟到下一帧。
+    // 新的钉值来自同一语料的实测;若回退这两条语义会在此爆掉。
+    assert_eq!(counts[1], 272_296, "文本语义修正后的第 2 帧命令数(回归金丝雀)");
     assert!(
         counts.iter().all(|c| *c > 0),
         "每帧都有命令推进: {counts:?}"
     );
     // 主线仍在跑(未 finish),且有任务在等待。
     assert!(!vm.scheduler().nodes().is_empty());
+}
+
+/// **P0 真实文本路径**:直接以语料标签 `RP_101` 启动(绕过标题/宿主 UI),
+/// 周期点击推进 10 行,核对 `Text` 字节、`ReturnCode` 与 `_TEXT_FLAG`。
+///
+/// 三层:①手册 `text/text.html`/`basic/svariable.html`;②语料
+/// `userscript/jp_0051.txt`(10 行);③REA `0x458d44`/`0x44c390`。
+#[test]
+fn eris_real_scenario_text_path_emits_expected_flags() {
+    use yu_rt::event::VmEvent;
+    use yu_rt::input::{InputFrame, InputTimeline};
+
+    let mut skip = SkipCounter(0);
+    let dir = require_corpus!(skip);
+    let data_root = dir.parent().expect("data").to_path_buf();
+    let project_root = find_project_root(&dir).expect("project root");
+    let src = DirSource::open(&data_root, Codec::Cp932).expect("data");
+    let aux = DirSource::open(&project_root, Codec::Cp932).expect("project");
+    let mut vm = Vm::boot_with_aux(
+        Box::new(src),
+        Some(Box::new(aux)),
+        BootConfig {
+            entry_label: "RP_101".to_string(),
+            fps: 60,
+            // 只需 Text/ReturnCode;Command 事件对本测试无用。
+            record_events: false,
+            ..BootConfig::default()
+        },
+    )
+    .expect("boot RP_101");
+
+    let mut tl = InputTimeline::new();
+    let mut f = 10;
+    while f <= 120 {
+        tl.set(f, InputFrame::new(["MOUSE_L"]));
+        tl.set(f + 1, InputFrame::new(std::iter::empty::<&str>()));
+        f += 10;
+    }
+    let mut texts: Vec<Vec<u8>> = Vec::new();
+    let mut returncodes = 0usize;
+    let mut finished = None;
+    for frame in 0..120u32 {
+        let r = vm.tick_at(frame * 16, &tl);
+        for e in vm.take_events() {
+            match e {
+                VmEvent::Text { bytes, .. } => texts.push(bytes),
+                VmEvent::ReturnCode { .. } => returncodes += 1,
+                _ => {}
+            }
+        }
+        if r.main_finished {
+            finished = Some(frame);
+            break;
+        }
+    }
+    assert_eq!(texts.len(), 10, "RP_101 共 10 行文本");
+    assert_eq!(returncodes, 10, "每行一个 RETURNCODE");
+    assert_eq!(
+        texts[0],
+        vec![0x89, 0xf1, 0x91, 0x7a, 0x83, 0x56, 0x81, 0x5b, 0x83, 0x93, 0x82, 0x50,
+             0x83, 0x58, 0x83, 0x5e, 0x81, 0x5b, 0x83, 0x67],
+        "首行 CP932 原样透传"
+    );
+    let flags = vm.text_flags();
+    assert_eq!(flags.len(), 106, "66 个全角字 + 10 行 × C/R/P/E");
+    assert!(flags[..10].iter().all(|b| *b == b'2'), "首行 10 个全角标志");
+    assert_eq!(&flags[10..14], b"CRPE", "自动行尾 C/R/P/E");
+    assert_eq!(&flags[flags.len() - 4..], b"CRPE", "末行同样 C/R/P/E");
+    assert!(finished.is_some(), "RP_101 应在 120 帧内结束");
 }
 
 /// **A1 运行核级等价性**:同一 ERIS 工程,散盘 `data/` 与官方 `data.ypf`

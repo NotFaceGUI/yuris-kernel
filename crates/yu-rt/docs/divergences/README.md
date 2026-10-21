@@ -38,7 +38,7 @@
 | DIV-RT-029 | `_CODE_*` 的码值来源 | fixed | 引擎 BSS 字节表(REA)+ VK 规范;数据文件 button-code-abi.tsv |
 | DIV-RT-030 | 手册检索的二进制误判 | fixed | 手册 html 含非文本字节,普通 grep 误报"无页";字节级 grep 重审全表 |
 | DIV-RT-031 | `_TEXT`/`_MENUCODE`/`_WINDOW_EXEC_*` 状态系统变量 | fixed | 手册有页;内核状态 + 宿主 setter |
-| DIV-RT-032 | `_TEXT_FLAG` 的标志位布局 | open | 手册有页但位定义未取证;不臆造 |
+| DIV-RT-032 | `_TEXT_FLAG` 的控制字节流 | open | 读取 + `WORD`/`_`/`TEXT`/`RETURNCODE` 写入已按 REA 实现;脚本写入 `_TEXT_FLAG` 仍挂号 |
 | DIV-RT-033 | `_KEYLAST`/`_MOUSELAST` 读取 | open | 手册无页(两版核对);InputState 内部照常记录 |
 | DIV-RT-034 | panic 收口(任务书 E R7) | fixed | IFBREAK LV=0 / GOSUB·RETURN 参数名越界 / DIMSIZE·维长乘积防御上限 |
 | DIV-RT-035 | 文本让出点是 `RETURNCODE`,不是 `WORD`/`_` | fixed | 任务书 E R3;REA 实证(见下) |
@@ -48,6 +48,7 @@
 | DIV-RT-039 | GOSUB 允许 64 次嵌套 | fixed | 手册 64 回 + REA 0x4459e6(`depth+1 == 0x40` 才报错) |
 | DIV-RT-040 | 帧边界事件(`FrameStart`/`FrameEnd`)与有界事件队列 | fixed | 内部可观测契约(architecture §3/A3),非官方语义 |
 | DIV-RT-041 | `Diag` 的脚本定位(task/script/pc/cmd) | fixed | architecture §8;`Loc::Script.label` 承载任务 ID |
+| DIV-RT-042 | `DomainCall` 的变量引用身份丢失 | blocked | `SAVE[SET]`/`LOAD[LET]`/`FILEINFO[LET]` 只带求值结果;跨 crate 契约变更 |
 
 ---
 
@@ -122,6 +123,12 @@
   真实码值是引擎运行期填的 —— 无一手证据说明具体数值。
 - **处置**:`_KEY_*`/`_MOUSE_L..D` 全部按 `ycd` 名字绑定并实现计数器;
   `_INP`/`_KEYLAST`/`_MOUSELAST`/`_PAD*` 一律 `Unimplemented`(不猜码表)。
+- **2026-10-21(P0)修正**:按下沿必须从 `1` 重新起算(手册「押された瞬間から
+  1 → 2 → 3」)。旧实现 `+= 1` 使长期松开后的短按从负数往上加,第二次点击
+  永远到不了正值;已改为按下沿 `value = 1`,并修正
+  `text_advance_requested` 的键名(`KEY_ENTER`/`KEY_CTRL`,不是
+  `ENTER`/`CTRL`)。复核:`input::tests::repress_after_release_restarts_at_one`、
+  `fixture::one_text_line_per_frame_until_advance_input`。
 - **复核**:`crates/yu-rt/src/input.rs` 单测(手册三个例子的形态)+
   `sysvar.rs::read_button`。
 
@@ -134,7 +141,25 @@
   HTML 里 0 命中(`grep -arl` 全目录验证)。
 - **处置**:`Unimplemented`,即使语料高频使用(`_CHR` 560 次、`_DXMODE` 1,333 次)。
   语料频度只决定**优先级**,不构成语义证据(任务书 C §1)。
-- **复核**:`crates/yu-rt/src/sysvar.rs::undoc`。
+- **2026-10-21(M-1 普查)**:`_WINDOW_EXEC_CAPTION`(id 120)在 600 帧里
+  被 `es_scenario.yst:231` 每帧 `IF` 轮询 **600 次**,是当前运行期最大的
+  单点缺口;手册仍无页,故继续保持挂号,不凭 ycd 名字猜“窗口标题按钮状态”。
+  引擎 int getter case 0x78(`0x427704` → `[0x801924]`) 只证明“读一个全局”，
+  不足以定义写入/宿主事件语义。
+- **2026-10-21(P1)有界取证**:
+  - 0.479/0.495 全部手册 HTML 字节级搜索无 `_WINDOW_EXEC_CAPTION`
+    (older 0.292/0.466 也无);三层仍缺①。
+  - 语料语义(`es_Scenario.yst`):与 `@_MENUCODE==30001` 并列的
+    `IF[@_WINDOW_EXEC_CAPTION==1]` → 写回 0 → `WINDOW[NO=0 WSX=… WSY=…]`;
+    注释掉的旧路径是 `WINDOW[NO=0 MAXIMIZE=1]`。即「窗口尺寸再初始化」
+    的一次性宿主事件标志。
+  - REA:脚本写 `0x446f70`(`MOV byte [0x801924], DL`);引擎写在
+    `WM_SYSCOMMAND(0xA3)` 路径 `FUN_0045a9d0`(`0x45a9d0`),`0x45a9e7`
+    把 `*ecx + 1` 写进 `[0x801924]`(条件 `[0x801338]==1` 且
+    `[0x8015e0]==0`)。`*ecx` 的来源与两个条件全局仍未取证。
+  - 结论:它是宿主窗口事件标志,不是 VM 可计算语义;保持 `Unimplemented`,
+    若放宽门禁应做宿主 setter(同 `_WINDOW_EXEC_MAX/CLOSE` 形态)。
+- **复核**:`crates/yu-rt/src/sysvar.rs::undoc`;频度见 `docs/coverage-matrix.md` §3。
 
 ---
 
@@ -446,10 +471,26 @@ packed = ([1290322, 329227, 26, 249, 8765, 8765], 0, "cd1790…4bd2e")  ... ok
   经 `Vm::set_menu_code` 推入)、`○@_WINDOW_EXEC_MAX/CLOSE`(窗口域;
   `window_exec` 状态)——手册有页,内核持有状态,宿主可推入。
 
-## DIV-RT-032 · `_TEXT_FLAG` 位布局(2026-10-19)
+## DIV-RT-032 · `_TEXT_FLAG` 控制字节流(2026-10-19,2026-10-21 更新)
 
-- 手册有页(半角全角/改行/改页/点击信息)但逐字符标志位定义未取证 ⇒
-  读取/写入均挂号,不臆造。语料 8 帧 5 读 1 写。
+- **旧状态**:手册有页但逐字符标志定义未取证 ⇒ 读取/写入均挂号。
+- **2026-10-21(M-2)取证**(0.495 `yu-ris.exe` sha256 `4f5eefa3…`):
+  - 字符串系统变量取值 `0x446b93`:id `0x7a`(`_TEXT`)→ `[state+0x38]`,
+    id `0x7b`(`_TEXT_FLAG`)→ `[state+0x3c]`;
+  - `WORD` 处理体 `0x458d44`:文本字节进 `+0x38`,每字符一个标志进
+    `+0x3c`;CP932 首字节(`0x5b40c0[byte]=1`)写 `'2'`,否则 `'1'`;
+  - `_` 处理体 `0x4567c0` 同样写 `'1'`/`'2'`(0x456999/0x456a9e);
+  - `TEXT` 处理体 `0x453448`:RETURN `'R'`、PAGE `'P'`、CLICKRETURN `'r'`、
+    CLICKPAGE `'p'`、CLICK `'C'`;
+  - `RETURNCODE` 处理体 `0x44c390`:自动模式按 AUTOCLICK/AUTORETURN/
+    AUTOPAGE 追加 `C/R/P`,最后恒追加 `'E'`(0x45)。
+- **已实现**:读取(120 次/600 帧的 LET 不再挂号)、`WORD`/`_`/`TEXT`/
+  `RETURNCODE` 的写入点、`TEXTINFO` 查询。
+- **仍挂账**:脚本**写入** `$_TEXT_FLAG`(语料 1 次)的语义未取证 ——
+  引擎写路径未定位,且“写标志是否重建文本/光标”无证据。当前写入保持
+  `Unimplemented` + 无副作用。
+- **复核**:`cargo test -p yu-rt --test fixture text_flag_sysvar_reads_the_control_stream`、
+  `text_flags_track_cp932_width_and_returncode_auto_defaults`。
 
 ## DIV-RT-033 · `_KEYLAST`/`_MOUSELAST`(2026-10-19)
 
@@ -581,3 +622,19 @@ packed = ([1290322, 329227, 26, 249, 8765, 8765], 0, "cd1790…4bd2e")  ... ok
   `Unimplemented` 也计入 `unimplemented_cmds` 挂号表。
 - **未取证**:引擎自己的错误文案/位置格式(不可比);此处只保证内核可用性。
 - **复核**:`cargo test -p yu-rt --test fixture script_diag_carries_task_script_and_pc`。
+
+---
+
+## DIV-RT-042 · `DomainCall` 的变量引用身份丢失(2026-10-21,M-2)
+
+- **事实**:`SAVE[SET=@X]`、`LOAD[LET=@Y]`、`FILEINFO[LET=@Z]`、
+  `SOUNDINFO[LET=@W]` 在引擎里把 `SET`/`LET` 当**变量引用**执行;yu-rt 的
+  `eval_arg_windows` 对所有窗口调用 `eval_value`,事件里只剩**求值结果**。
+- **影响**:宿主能按参数名知道“要保存/写回哪个槽位语义”,但拿不到目标变量;
+  把 `SET=2` 当字面量会错误地写坏存档。
+- **为什么不本轮修**:给 `ArgValue` 加引用字段会破坏既有结构体字面量;
+  新增事件变体会让 `yu-trace` 的穷举匹配编译失败(该 crate 故意没有 `_` 分支)。
+  两者都是跨 crate 契约变更,超出任务书 M 的独占范围。
+- **缓解**:`VmEvent::domain_args(&yscm)` 提供数据驱动的参数名视图;
+  `docs/domain-event-contracts.md` §6 明确标注“事件是事实记录,不是可重放命令”。
+- **复核**:`cargo test -p yu-rt --test fixture domain_args_map_slots_through_project_yscm`。

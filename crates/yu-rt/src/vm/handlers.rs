@@ -15,8 +15,8 @@
 //! | `S_INT` | 767 | ✅ | 手册 `variable/s_int.html` |
 //! | `LOOP` | 522 | ✅ | 手册 `control/loop.html`;引擎 §3.13 |
 //! | `STR` | 431 | ✅ | 手册 `variable/str.html` |
-//! | `RETURNCODE` | 396 | ✅ | 行尾改行标记(见 `op_returncode`;三层齐) |
-//! | `WORD` | 464 | ✅ | 文本段输出(见 `op_word`;三层齐) |
+//! | `RETURNCODE` | 396 | ✅ | 行尾改行标记 + 自动 `C/R/P/E` 标志(REA `0x44c390`) |
+//! | `WORD` | 464 | ✅ | 文本段 + 每字符 `'1'/'2'` 标志(REA `0x458d44`) |
 //! | `F_INT` | 337 | ⛔ | **手册无页** ⇒ 不实现(DIV-RT-011) |
 //! | `VARACT` | 310 | ✅部分 | 手册 `variable/varact.html`;引擎 §3.26 |
 //! | `SAVE`/`LOAD` | 290/289 | ⛔ | 手册有页,存档容器未取证 ⇒ 交宿主(DIV-RT-012) |
@@ -32,7 +32,7 @@
 //! | `END` | 205 | ✅ | 手册 `control/end.html` |
 //! | `TASK`/`TASKEND`/`TASKINFO` | 10/2/19 | ✅部分 | 手册 `control/task*.html` |
 //! | `MATH` | 21 | ✅部分 | 手册 `math/math.html`;引擎 §3.20 |
-//! | `TEXT`/`_` | 2/33 | ✅ | 手册 `text/text.html`+`basic/basic.html ●テキスト表示` |
+//! | `TEXT`/`_`/`TEXTINFO` | 2/33/0 | ✅ | 手册 `text/text.html`+`basic/basic.html ●テキスト表示`+`text/textinfo.html`;REA `0x453448/0x4567c0/0x4538cc` |
 //!
 //! ⛔ = 按任务书军规「无手册页不实现 / 无引擎证据不猜」显式挂号。
 
@@ -116,6 +116,8 @@ pub enum HandlerKind {
     Word,
     ReturnCode,
     Labelinfo,
+    /// `TEXTINFO`:文本属性查询(VM 侧状态;REA `0x4538cc`)。
+    Textinfo,
     /// 手册有页的域命令(CG/SOUND/WINDOW/…)→ DomainCall 事件。
     Domain(Domain),
     /// 无处理器(手册无页且非域)。
@@ -160,6 +162,7 @@ pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> 
             "_" => HandlerKind::TextOut,
             "WORD" => HandlerKind::Word,
             "RETURNCODE" => HandlerKind::ReturnCode,
+            "TEXTINFO" => HandlerKind::Textinfo,
             "LABELINFO" => HandlerKind::Labelinfo,
             other => {
                 let domain = domain_of(other);
@@ -251,6 +254,7 @@ impl Vm {
             HandlerKind::TextOut => self.op_text_out(st, cmd),
             HandlerKind::Word => self.op_word(st, cmd),
             HandlerKind::ReturnCode => self.op_returncode(st, cmd),
+            HandlerKind::Textinfo => self.op_textinfo(st, cmd),
             HandlerKind::Labelinfo => self.op_labelinfo(st, cmd),
             HandlerKind::Domain(domain) => {
                 // 域命令的参数是宿主域状态机唯一能看到的输入;必须带上
@@ -2075,15 +2079,24 @@ impl Vm {
 
     /// `TEXT`:手册 `text/text.html`(属性设置;可见文本由 `_`/`WORD` 输出)。
     ///
-    /// 本实现只消费影响**文本事件身份/缓冲**的两项(手册有页):
+    /// 三层出处(REA 0.495 `0x453448`,处理次序与写入点逐条对过):
     /// - `ID` = 后续文本自动输出的目标文本层 ID;
-    /// - `CLEAR=1` = 完全清空系统内部文本缓冲。
+    /// - `OUTPUTMODE` = 输出模式字节(`0=手动 / 非 0=自动`,默认 1);
+    /// - `CLICKBUTTON1..4` / `SKIPBUTTON1..4` = 按钮码,`0` 写入哨兵 `0x3ff`;
+    /// - `WAIT` = 每字符等待毫秒(引擎 `[state+4]`);
+    /// - `CLICK=1`:追加 `'C'`;**自动模式返回 -1(本帧让出)**,手动模式继续;
+    /// - `RETURN=1` / `PAGE=1` / `CLICKRETURN=1` / `CLICKPAGE=1`:追加
+    ///   `'R'` / `'P'` / `'r'` / `'p'`;
+    /// - `CLEAR=1`:清空文本与标志;
+    /// - `AUTORETURN/AUTOPAGE/AUTOCLICK` = 默认 1 的自动行尾行为。
     ///
-    /// `WAIT/RETURN/PAGE/CLICK/AUTO*/…BUTTON` 属显示节奏/宿主输入,运行核
-    /// 不在这里伪造;事件仍记录命令事实。
+    /// 处理次序照引擎:`CLICK` 先于 `RETURN/PAGE/CLICKRETURN/CLICKPAGE` 与
+    /// `CLEAR`;自动模式下 `CLICK` 的 -1 会跳过后者(同一条 TEXT 命令里
+    /// 同时给 CLICK 与 CLEAR 时,引擎确实不执行 CLEAR)。
     ///
-    /// TODO(DIV-GFX-026/RT):显示节奏与点击/跳过按钮的宿主 ABI 未实现。
+    /// 台账:`COV-M-02`(见 `docs/coverage-matrix.md`)。
     fn op_text(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        use crate::text::flag as tflag;
         // 参数名来自工程 ysc 表(opcode → 命令声明),不写死槽号。
         let names: Vec<String> = self
             .tables()
@@ -2092,45 +2105,171 @@ impl Vm {
             .command(cmd.opcode)
             .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
             .unwrap_or_default();
-        let mut clear = false;
+        let mut vals: Vec<(String, Value)> = Vec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
             }
             let name = names
                 .get(usize::from(w.rec.kind))
-                .map(String::as_str)
-                .unwrap_or("");
+                .cloned()
+                .unwrap_or_default();
             let v = self.eval_value(st, &w.payload)?;
-            match name {
-                "ID" => {
-                    if let Value::Str(b) = v {
-                        match std::str::from_utf8(&b) {
-                            Ok(s) => self.text_layer_id = s.to_string(),
-                            Err(_) => {
-                                // 事件字段是 String;CP932 非 UTF-8 ID 不做有损替换。
-                                self.text_layer_id.clear();
-                                self.report_unimplemented(
-                                    "TEXT",
-                                    "TEXT[ID] 为非 UTF-8 CP932 ID:事件字符串无法承载,保持空"
-                                        .to_string(),
-                                );
-                            }
-                        }
-                    }
+            vals.push((name, v));
+        }
+        let get = |n: &str| {
+            vals.iter()
+                .rev()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| v.clone())
+        };
+
+        // p0 ID:目标文本层(事件字段是 String;非 UTF-8 保持空并挂号)。
+        if let Some(Value::Str(b)) = get("ID") {
+            match std::str::from_utf8(&b) {
+                Ok(s) => self.text_layer_id = s.to_string(),
+                Err(_) => {
+                    self.text_layer_id.clear();
+                    self.report_unimplemented(
+                        "TEXT",
+                        "TEXT[ID] 为非 UTF-8 CP932 ID:事件字符串无法承载,保持空"
+                            .to_string(),
+                    );
                 }
-                "CLEAR" => clear = v.as_int().unwrap_or(0) != 0,
-                _ => {}
             }
         }
-        if clear {
-            self.text_buffer.clear();
+        // p1 OUTPUTMODE(引擎只存 AL)。
+        if let Some(v) = get("OUTPUTMODE") {
+            self.text.set_output_mode(v.as_int().unwrap_or(0));
+        }
+        // p2..p9 CLICKBUTTON1..4 / SKIPBUTTON1..4。
+        const CLICK_BUTTONS: [&str; 4] =
+            ["CLICKBUTTON", "CLICKBUTTON2", "CLICKBUTTON3", "CLICKBUTTON4"];
+        const SKIP_BUTTONS: [&str; 4] =
+            ["SKIPBUTTON", "SKIPBUTTON2", "SKIPBUTTON3", "SKIPBUTTON4"];
+        for (i, name) in CLICK_BUTTONS.iter().enumerate() {
+            if let Some(v) = get(name) {
+                crate::text::TextState::set_button(
+                    &mut self.text.click_buttons[i],
+                    v.as_int().unwrap_or(0),
+                );
+            }
+        }
+        for (i, name) in SKIP_BUTTONS.iter().enumerate() {
+            if let Some(v) = get(name) {
+                crate::text::TextState::set_button(
+                    &mut self.text.skip_buttons[i],
+                    v.as_int().unwrap_or(0),
+                );
+            }
+        }
+        // p10 WAIT。
+        if let Some(v) = get("WAIT") {
+            self.text.wait_ms = v.as_int().unwrap_or(0);
+        }
+        // p15 CLICK:先写 'C';自动模式返回 -1 = 本帧让出(REA 0x45383f..0x45388b)。
+        if get("CLICK").and_then(|v| v.as_int()) == Some(1) {
+            self.text.push_flag(tflag::CLICK);
+            if self.text.output_mode != 0 {
+                self.emit(VmEvent::SystemCall {
+                    frame: self.frame(),
+                    name: "TEXT".to_string(),
+                    args: Vec::new(),
+                });
+                return Ok(StepOutcome::Yield);
+            }
+        }
+        // p11..p14 控制标志(值必须恰为 1)。
+        for (name, flag) in [
+            ("RETURN", tflag::RETURN),
+            ("PAGE", tflag::PAGE),
+            ("CLICKRETURN", tflag::CLICK_RETURN),
+            ("CLICKPAGE", tflag::CLICK_PAGE),
+        ] {
+            if get(name).and_then(|v| v.as_int()) == Some(1) {
+                self.text.push_flag(flag);
+            }
+        }
+        // p16 CLEAR=1:清空文本与标志(REA 0x453894 → 0x4638e4)。
+        if get("CLEAR").and_then(|v| v.as_int()) == Some(1) {
+            self.text.clear();
+        }
+        // p17..p19 AUTO*(任意值原样保存)。
+        for name in ["AUTORETURN", "AUTOPAGE", "AUTOCLICK"] {
+            if let Some(v) = get(name) {
+                let n = v.as_int().unwrap_or(0);
+                match name {
+                    "AUTORETURN" => self.text.autoreturn = n,
+                    "AUTOPAGE" => self.text.autopage = n,
+                    _ => self.text.autoclick = n,
+                }
+            }
         }
         self.emit(VmEvent::SystemCall {
             frame: self.frame(),
             name: "TEXT".to_string(),
             args: Vec::new(),
         });
+        Ok(StepOutcome::Continue)
+    }
+
+    /// `TEXTINFO`:文本属性查询(手册 `text/textinfo.html`;REA `0x4538cc`)。
+    ///
+    /// 查询判据是**参数是否出现**(不是值是否为 1);出现多个时按引擎次序
+    /// `OUTPUTMODE → CX → CY → CLICK → AUTORETURN → AUTOPAGE → AUTOCLICK`
+    /// 取第一个。结果写入 `LET` 目标。`ID`/`SET` 槽引擎不读。
+    ///
+    /// 台账:`COV-M-02`。
+    fn op_textinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let names: Vec<String> = self
+            .tables()
+            .boot
+            .yscm
+            .command(cmd.opcode)
+            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+        let mut target: Option<crate::expr::LValue> = None;
+        let mut present: Vec<String> = Vec::new();
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let name = names
+                .get(usize::from(w.rec.kind))
+                .cloned()
+                .unwrap_or_default();
+            if name == "LET" {
+                target = Some(self.eval_lvalue(st, &w.payload)?);
+            } else if !name.is_empty() {
+                // 引擎只检查槽位是否存在(0x4538fa..),不求值查询标志本身。
+                present.push(name);
+            }
+        }
+        let Some(target) = target else {
+            self.report(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                "TEXTINFO 缺 LET 目标",
+            ));
+            return Ok(StepOutcome::Continue);
+        };
+        for name in ["OUTPUTMODE", "CX", "CY", "CLICK", "AUTORETURN", "AUTOPAGE", "AUTOCLICK"]
+        {
+            if !present.iter().any(|n| n == name) {
+                continue;
+            }
+            let v = match name {
+                "OUTPUTMODE" => i64::from(self.text.output_mode),
+                "CX" => self.text.cursor_x,
+                "CY" => self.text.cursor_y,
+                "CLICK" => i64::from(self.text.click),
+                "AUTORETURN" => self.text.autoreturn,
+                "AUTOPAGE" => self.text.autopage,
+                _ => self.text.autoclick,
+            };
+            self.write_target(st, &target, &Value::Int(v))?;
+            return Ok(StepOutcome::Continue);
+        }
         Ok(StepOutcome::Continue)
     }
 
@@ -2141,6 +2280,8 @@ impl Vm {
     /// `\r` 展开成的 `_[ $_TEXT(239)+$_TEXT(240) ]`(userscript 演示实测);
     /// `$_TEXT` = 引擎自管显示缓冲(手册 `basic/svariable.html`),运行核
     /// 照常求值即可。撤销 DIV-RT-008 挂账(三层已齐)。
+    ///
+    /// 台账:`COV-M-03`(每字符写 `'1'/'2'` 到 `_TEXT_FLAG`,REA `0x4567c0`)。
     fn op_text_out(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         for w in &cmd.windows {
             if w.rec.length == 0 {
@@ -2169,6 +2310,8 @@ impl Vm {
     /// ③RxYuris `src/YSTB_TextEditor_V5.cpp` 以 WORD 为文本提取单元、按
     /// YSCM 名字动态取 opcode,且 YSTL `text_count` == 每脚本 WORD 数
     /// (全部 YU-RIS 5.x 商业作品实测通过)。
+    ///
+    /// 台账:`COV-M-03`(每字符写 `'1'/'2'` 到 `_TEXT_FLAG`,REA `0x458d44`)。
     fn op_word(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         let _ = st;
         let Some(w) = cmd.windows.first() else {
@@ -2207,9 +2350,32 @@ impl Vm {
     /// 只有 `RETURNCODE` 置标志并返回 -1。故一行 = `WORD…_[…]…WORD` 全部
     /// 在同一次泵内执行完,行尾才让出(与手册 `basic/task.html`
     /// 「表示テキスト…が来ると…一旦休憩」的行级粒度一致:一行文本执行完才休憩)。
+    ///
+    /// **行尾标志**(REA `0x44c390`,此前只实现了让出):
+    /// - 自动模式(`[state+0x1c] != 0`):`AUTOCLICK` 非 0 → `'C'`,
+    ///   `AUTORETURN` 非 0 → `'R'`,`AUTOPAGE` 非 0 → `'P'`;
+    /// - 手动模式:`[state+0x36] = 1`(请求清屏);
+    /// - 两种模式最后都追加 `'E'`(0x45),再置 `task+9` 让出。
+    ///
+    /// 台账:`COV-M-02`。
     fn op_returncode(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        use crate::text::flag as tflag;
         let _ = st;
         let line = cmd.windows.first().map(|w| w.rec.kind as u32).unwrap_or(0);
+        if self.text.output_mode != 0 {
+            if self.text.autoclick != 0 {
+                self.text.push_flag(tflag::CLICK);
+            }
+            if self.text.autoreturn != 0 {
+                self.text.push_flag(tflag::RETURN);
+            }
+            if self.text.autopage != 0 {
+                self.text.push_flag(tflag::PAGE);
+            }
+        } else {
+            self.text.clear_pending = true;
+        }
+        self.text.push_flag(tflag::END);
         self.emit(VmEvent::ReturnCode { frame: self.frame(), line });
         Ok(StepOutcome::TextYield)
     }
