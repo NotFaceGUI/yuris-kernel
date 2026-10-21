@@ -40,10 +40,13 @@ yu-rt 事件流(VmEvent::DomainCall / Text)
 
 ## 当前未实现(全部有编号与解除条件)
 
-`docs/gfx-unimplemented-todo.md`(DIV-GFX-001..040):MODE 3/5/6/7/9 辅助纹理、
-着色器模式、FX 仿射族、多部件、MID、COPY 时序、图像加工像素、文本栅格化、
-颜色空间、组 RT 尺寸/清屏等。首屏 golden:
-`tests/golden/eris_first_screen_display.json`(272 层 / 15 pass / 44 op)。
+`docs/gfx-unimplemented-todo.md`(DIV-GFX-001..042):MODE 3/5/6/7/9 辅助纹理、
+着色器模式、FX 仿射族、多部件、MID、COPY 时序、`RECTPAINT` 之外的图像加工
+像素、文本栅格化、颜色空间、组 RT 尺寸/清屏与 RT alpha 等。
+`RECTPAINT/RECTPAINT2/RECTPAINT3` 已实现(EVID-J-02..05)。
+首屏 golden:`tests/golden/eris_first_screen_display.json`(历史 272 层 /
+15 pass / 44 op;当前 HEAD 的 boot 链为 8 visible / 18 op,见 PROGRESS J1;
+未用 UPDATE 掩盖)。
 
 ## 验证
 

@@ -197,3 +197,20 @@ D6/D7/D10/D11/D12/D13 外,其余按“Confirmed → 修复/保持”处理
 
 **结论**:原 TODO 不是全部;补齐后仍有 001..039 与 3 个无编号决策/开放项。
 这些均已显式标记,不把“未实现”伪装成 1:1。
+
+---
+
+## 10. 任务 J 后续(2026-10-21)
+
+- **EVID-J-01**:soft 的 alpha 源项从 `a` 改为 `a²`;soft/wgpu 半透明
+  像素逐通道差 0。B5 的“MODE 2 diffuse=白”仍是独立未取证项。
+- **EVID-J-02..05**:`RECTPAINT/RECTPAINT2/RECTPAINT3` 已实现;DIV-GFX-013
+  从 unimplemented 改为 partial。首屏 10/11 image op 可执行。
+- **EVID-J-08**:新增 DIV-GFX-008/041:主组 `W0` 官方直绘、子组 RT alpha
+  不参与合成;内核仍用 `Offscreen(W0)`+RGBA8,半透明层与官方不同。
+- **EVID-J-11**:旧线 `COPY` = 上一帧已渲染目标的结论 **Refuted**(至少
+  group 源;命令执行时当前状态)。COPY 仍未实现,契约变更待主人确认。
+- **DIV-GFX-042**:1px 半像素/quad 边界差异;RECTPAINT 区域内部已逐像素
+  一致。
+- 阻塞:当前 HEAD 的 `yu-rt` boot 链只到 8 visible / 18 op,未到 title;
+  两条 golden 测试失败,未用 UPDATE 掩盖。详见 `PROGRESS.md` 成果 J1。

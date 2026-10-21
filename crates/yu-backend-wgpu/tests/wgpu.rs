@@ -46,7 +46,19 @@ fn table() -> ParamTable {
                 "CG",
                 &["ID", "FILE", "E", "A", "X", "Y", "Z", "SX", "SY", "MODE"],
             ),
-            command("CGACT", &["ID", "ID2", "COPY2"]),
+            command("CGACT", &[
+                "ID",
+                "ID2",
+                "COPY2",
+                "SET",
+                "X",
+                "Y",
+                "X2",
+                "Y2",
+                "RECTPAINT",
+                "RECTPAINT2",
+                "RECTPAINT3",
+            ]),
         ],
         messages: Vec::new(),
         key_table: Box::new([0u8; 256]),
@@ -373,4 +385,176 @@ fn group_alpha_is_applied_once() {
     // 组 A 只在“组 → 父目标”合成时作用一次,没有下推到子层。
     assert_close(pixel(&out, 0, 0), [223, 191, 191, 207], 2, "group alpha");
     assert_close(pixel(&out, 3, 3), [223, 191, 191, 207], 2, "group alpha");
+}
+
+/// Phase B 验收(EVID-J-02..05):RECTPAINT/2/3 在 soft 与 wgpu 上逐像素一致。
+///
+/// 同一帧:不透明红(RECTPAINT)、绿+alpha 0x80(RECTPAINT + RECTPAINT2);
+/// 16 个像素中一半是半透明。填充是精确的 u8 运算,两后端应逐字节一致。
+#[test]
+fn rectpaint_family_matches_soft_backend() {
+    let table = table();
+    let mut gfx = state(Viewport::new(8, 4), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"R".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(4)),
+                arg(&table, "CG", "SY", Value::Int(4)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"R".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0x00FF0000)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"G".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "X", Value::Int(4)),
+                arg(&table, "CG", "SX", Value::Int(4)),
+                arg(&table, "CG", "SY", Value::Int(4)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"G".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0x0000FF00)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"G".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT2", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0x80)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+
+    let Some(mut gpu) = renderer_or_skip(store(&[])) else {
+        return;
+    };
+    let gpu_out = gpu.render_frame(&frame).expect("gpu render");
+    let mut soft = SoftRenderer::new(store(&[]));
+    let soft_out = soft.render_frame(&frame);
+
+    let mut diff_pixels = 0usize;
+    let mut max_diff = 0u8;
+    for (gpu_px, soft_px) in gpu_out
+        .surface
+        .rgba
+        .chunks_exact(4)
+        .zip(soft_out.surface.rgba.chunks_exact(4))
+    {
+        let d = (0..4)
+            .map(|i| gpu_px[i].abs_diff(soft_px[i]))
+            .max()
+            .unwrap();
+        if d > 0 {
+            diff_pixels += 1;
+        }
+        max_diff = max_diff.max(d);
+    }
+    println!(
+        "rectpaint parity: diff_pixels={diff_pixels}/{} max_channel_diff={max_diff}",
+        gpu_out.surface.rgba.len() / 4
+    );
+    assert_eq!(max_diff, 0, "RECTPAINT 像素应逐字节一致");
+    assert_eq!(
+        gpu_out.report, soft_out.report,
+        "双后端 RenderReport 必须逐字段一致"
+    );
+}
+
+/// Phase A 验收(EVID-J-01):同一半透明帧,soft 与 wgpu 逐通道差 ≤1。
+///
+/// 组 A=128 的 4×4 红层覆盖整屏,最终屏幕 alpha=207(<255),所以每个像素
+/// 都是“半透明像素”;不是拿全不透明帧做 0 差冒烟。
+#[test]
+fn semi_transparent_pixels_match_soft_within_one() {
+    let table = table();
+    let mut gfx = state(Viewport::new(4, 4), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b":/W0/G/".to_vec())),
+                arg(&table, "CG", "A", Value::Int(128)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b":/W0/G/L".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"red".to_vec())),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let fixture = [(
+        b"red.png".as_slice(),
+        png_bytes_for(4, 4, Rgba([255, 0, 0, 255])),
+    )];
+    let Some(mut gpu) = renderer_or_skip(store(&fixture)) else {
+        return;
+    };
+    let gpu_out = gpu.render_frame(&frame).expect("gpu render");
+    let mut soft = SoftRenderer::new(store(&fixture));
+    let soft_out = soft.render_frame(&frame);
+
+    let mut diff_pixels = 0usize;
+    let mut max_diff = 0u8;
+    for (gpu_px, soft_px) in gpu_out
+        .surface
+        .rgba
+        .chunks_exact(4)
+        .zip(soft_out.surface.rgba.chunks_exact(4))
+    {
+        let d = (0..4)
+            .map(|i| gpu_px[i].abs_diff(soft_px[i]))
+            .max()
+            .unwrap();
+        if d > 0 {
+            diff_pixels += 1;
+        }
+        max_diff = max_diff.max(d);
+    }
+    println!(
+        "semi-transparent parity: diff_pixels={diff_pixels}/{} max_channel_diff={max_diff}",
+        gpu_out.surface.rgba.len() / 4
+    );
+    assert!(
+        soft_out.surface.rgba.chunks_exact(4).any(|p| p[3] < 255),
+        "controle: 必须有半透明像素,否则测试无意义"
+    );
+    assert!(
+        max_diff <= 1,
+        "soft/wgpu 半透明像素逐通道差 {max_diff} > 1 (diff_pixels={diff_pixels})"
+    );
+    assert_eq!(
+        gpu_out.report, soft_out.report,
+        "双后端 RenderReport 必须逐字段一致"
+    );
 }

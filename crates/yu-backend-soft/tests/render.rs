@@ -42,7 +42,19 @@ fn table() -> ParamTable {
                 "CG",
                 &["ID", "FILE", "E", "A", "X", "Y", "Z", "SX", "SY", "MODE"],
             ),
-            command("CGACT", &["ID", "ID2", "COPY2"]),
+            command("CGACT", &[
+                "ID",
+                "ID2",
+                "COPY2",
+                "SET",
+                "X",
+                "Y",
+                "X2",
+                "Y2",
+                "RECTPAINT",
+                "RECTPAINT2",
+                "RECTPAINT3",
+            ]),
         ],
         messages: Vec::new(),
         key_table: Box::new([0u8; 256]),
@@ -240,6 +252,140 @@ fn text_runs_are_counted_but_not_rasterized() {
     assert_eq!(out.report.skipped_text, 1);
     // 文本不参与像素:唯一可见内容仍是 1×1 黑图。
     assert_eq!(out.surface.pixel(0, 0), Some([0, 0, 0, 255]));
+}
+
+#[test]
+fn rectpaint_family_executes_and_matches_evidence_semantics() {
+    let table = table();
+    let mut gfx = state(Viewport::new(8, 4), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        // R: RECTPAINT -> opaque red (alpha forced 255).
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"R".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(4)),
+                arg(&table, "CG", "SY", Value::Int(4)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"R".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0x00FF0000)),
+            ],
+        ),
+        // G: RECTPAINT green then RECTPAINT2 alpha 0x80.
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"G".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "X", Value::Int(4)),
+                arg(&table, "CG", "SX", Value::Int(4)),
+                arg(&table, "CG", "SY", Value::Int(4)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"G".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0x0000FF00)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"G".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT2", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0x80)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    assert_eq!(
+        frame
+            .passes
+            .iter()
+            .filter(|p| matches!(p.target, yu_gfx::PassTarget::Texture(_)))
+            .count(),
+        3,
+        "three executable image passes"
+    );
+    assert!(frame.passes.iter().all(|p| p
+        .ops
+        .iter()
+        .all(|op| op.status() == yu_gfx::OpStatus::Executable)));
+
+    let mut backend = SoftRenderer::new(texture_store(&[]));
+    let out = backend.render_frame(&frame);
+    // R: W0 离屏里不透明红 -> 屏幕红。
+    assert_eq!(out.surface.pixel(0, 0), Some([255, 0, 0, 255]));
+    // G: A=128 的绿在透明 W0 里成为 (0,128,0,64),再以 a=64 合成到白屏:
+    //   R = 255·(1−64/255) = 191
+    //   G = 128·64/255 + 255·(1−64/255) = 223
+    //   A = 64²/255 + 255·(1−64/255) = 207
+    assert_eq!(out.surface.pixel(4, 0), Some([191, 223, 191, 207]));
+    assert_eq!(out.report.ops_drawn, 3 + 3, "3 image ops + W0 group + 2 layers");
+    assert_eq!(out.report.skipped_ops_total, 0);
+}
+
+#[test]
+fn rectpaint_region_fills_only_requested_texture_area() {
+    let table = table();
+    let mut gfx = state(Viewport::new(4, 4), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"IMG".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"img".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"IMG".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0xFF00FF00)),
+                arg(&table, "CGACT", "X", Value::Int(1)),
+                arg(&table, "CGACT", "Y", Value::Int(1)),
+                arg(&table, "CGACT", "X2", Value::Int(2)),
+                arg(&table, "CGACT", "Y2", Value::Int(2)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let mut backend = SoftRenderer::new(texture_store(&[(
+        b"img.png",
+        {
+            let image = RgbaImage::from_pixel(4, 4, Rgba([10, 20, 30, 255]));
+            let mut out = Vec::new();
+            PngEncoder::new(&mut out)
+                .write_image(image.as_raw(), 4, 4, ExtendedColorType::Rgba8)
+                .expect("encode fixture");
+            out
+        },
+    )]));
+    let out = backend.render_frame(&frame);
+    assert_eq!(out.surface.pixel(0, 0), Some([10, 20, 30, 255]));
+    assert_eq!(out.surface.pixel(1, 1), Some([0, 255, 0, 255]));
+    assert_eq!(out.surface.pixel(2, 2), Some([0, 255, 0, 255]));
+    assert_eq!(out.surface.pixel(3, 3), Some([10, 20, 30, 255]));
 }
 
 #[test]

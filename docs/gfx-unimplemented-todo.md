@@ -2,7 +2,7 @@
 
 > 会话 F 续。原则:**未取证 = 不实现 + 显式 `Unimplemented` + 本清单/DIV**。
 > 本清单与 `crates/yu-gfx/docs/divergences/README.md`、`docs/render-parity.md`
-> 同步;当前覆盖 DIV-GFX-001..040(含 decision/note 项)。代码中以
+> 同步;当前覆盖 DIV-GFX-001..042(含 decision/note 项)。代码中以
 > `TODO(DIV-GFX-xxx)` 标记。
 >
 > 状态:
@@ -19,15 +19,15 @@
 | DIV-GFX-004 | 多部件层 | unimplemented | `Part.raw` 原样保存 | `+0xa6/+0xa7/+0xb0/+0x130` 几何语义 |
 | DIV-GFX-005 | `MID` 外部掩码 | unimplemented | 层标 Unimplemented | 掩码取值通道(α/亮度)/尺寸/采样 |
 | DIV-GFX-006 | 过渡配对缺失/推进者 | open | 空 TID=普通层;非空缺失=Unimplemented | 受控脚本确认双 pass/无配对行为;`+0x1e8` 推进者 |
-| DIV-GFX-007 | `CGACT[COPY/COPY2/TEXCOPY/TEXSSCOPY]` | unimplemented | `Op::Copy` 恒 Unimplemented | 受控实验确认上一帧时序 + 区域语义 |
-| DIV-GFX-008 | 组离屏尺寸/清屏 | open | `size=None`;后端用视口/透明黑 | 引擎非调试路径 RT 创建/清屏取证 |
+| DIV-GFX-007 | `CGACT[COPY/COPY2/TEXCOPY/TEXSSCOPY]` | open | `Op::Copy` 恒 Unimplemented;旧线“上一帧已渲染”被 EVID-J-11 Refuted(至少 group 源) | layer 源时序 + 区域语义受控实验;契约需主人确认 |
+| DIV-GFX-008 | 组离屏尺寸/清屏/RT alpha | open | 主组 `W0` 官方直绘、子组 RT alpha 不参与合成(EVID-J-08);`size=None` 仍用视口/透明黑 | 生产路径 RT 格式/alpha 写掩码 + 主人确认主组直绘契约 |
 | DIV-GFX-009 | 颜色空间 | open | `gamma_encoded_srgb8` | 官方截图逐像素对拍 |
 | DIV-GFX-010 | 帧清屏 | open | `default_black` | 引擎帧入口/设备初始化观测 |
 | DIV-GFX-011 | `LINT/LINT2/TSX/TSY/MIPMAP/TEX/DXBUF/...` | unimplemented | 原样进 `extra` | 手册/引擎逐项分类 |
 | DIV-GFX-012 | 文本字形栅格化/排版 | unimplemented | 只输出 `TextRun`/`TextStyle` | 字体会话(`yu-font`) |
-| DIV-GFX-013 | `CGACT` 图像加工像素 | unimplemented | `Op::Image` 记录原值 | 像素算法定位 + 对拍 |
+| DIV-GFX-013 | `CGACT` 图像加工像素 | partial | RECTPAINT/2/3 已实现(EVID-J-02..05);SIZE/ROTATION/MONO/BLUR/... 仍 Unimplemented | 逐动作定位像素算法 + 官微场景对拍 |
 | DIV-GFX-016 | `CG` 无 `FILE` 的 get-or-create | open | 建无纹理层(不绘制) | 重新锚定 CG 处理体 |
-| DIV-GFX-017 | COPY 属性复制范围 | open | 复制 A/E/MODE/T/TA/坐标/滤镜/Z | `FUN_0042f809` 属性块逐项确认 |
+| DIV-GFX-017 | COPY 属性复制范围 | open | REA 块明确 A/E/MODE/T/TA/X/Y/尺寸/TID/MID/滤镜;**未见 Z**,gfx 仍复制 Z(Likely 偏差) | 重新锚定 Z 字段/调用点后再改 |
 | DIV-GFX-018 | 子窗口叠放/位置 | unimplemented | 只输出窗口状态/离屏 pass | window/host 会话 |
 | DIV-GFX-019 | 顶点 DIFFUSE RGB | open | 未建模 | 还原 `0x414ba4` 顶点色构造 |
 | DIV-GFX-020 | INFO `LET` 同步查询 | partial | `GfxHost` 已接通已取证字段 | — |
@@ -51,6 +51,8 @@
 | DIV-GFX-038 | INFO 缺失目标非 EXIST / 未分类字段 | unimplemented | 不写 LET | 引擎缺失返回语义 |
 | DIV-GFX-039 | `CGACT RASTER1/FSX/FSY/FX2/FY2/Z2` | unimplemented | RASTER1 已识别;其余留存 | 参数语义取证 |
 | DIV-GFX-040 | `TEXTINFO` 只读文本状态 | unimplemented | VM 归 Unknown;ERIS 未使用 | 文本状态机/`text/textinfo.html` |
+| DIV-GFX-041 | 主组/子组 RT alpha | open | 主组 `W0` 直绘、子组 RT alpha 不参与合成(EVID-J-08);内核仍用 `Offscreen(W0)` + RGBA8 | 生产路径 RT 格式/写掩码 + 主人确认契约 |
+| DIV-GFX-042 | 半像素/quad 相位 | open | 矩形内部逐通道一致;1px 顶/边与官方不同 | D3D9 half-pixel 偏移逐行取证 |
 | DIV-GFX-014 | 同 Z 顺序 | decision | 创建序 `(z,seq,id)` | 手册称不確定;保持确定性 |
 | DIV-GFX-015 | 首屏逻辑帧号 | note | golden 取首个有可见层的帧 | VM 事件帧号;非语义缺口 |
 
@@ -60,9 +62,11 @@
   TID 分支旁)、`CGACT ID3/ID4/Z2/BNO`(apply_cgact)、TEXT 持久缺失。
 - `crates/yu-gfx/src/layer.rs`:`BlendMode::fixed_state()` / `confidence()` 的
   Unverified/Unimplemented 分支。
-- `crates/yu-gfx/src/state.rs`:`MID`、滤镜、图像加工、COPY、资源图尺寸、
-  组尺寸、图像子层。
-- `crates/yu-gfx/src/op.rs`:`CopyOp`/`ImageOp` 的 status。
+- `crates/yu-gfx/src/state.rs`:`MID`、滤镜、`RECTPAINT` 之外的图像加工、COPY、
+  资源图尺寸、组尺寸、图像子层。`RECTPAINT/2/3` 的 `Executable` 前置检查在
+  `rect_paint_precheck`。
+- `crates/yu-gfx/src/op.rs`:`CopyOp` 恒 Unimplemented;`ImageOp` 的
+  `RECTPAINT/2/3` 可 Executable,其余动作/ID2/快照源仍 Unimplemented。
 - `crates/yu-gfx/src/frame.rs`:清屏/颜色空间。
 - `crates/yu-gfx/src/text.rs`:字形栅格化/排版。
 - `crates/yu-gfx/src/transition.rs`:推进者/配对缺失。

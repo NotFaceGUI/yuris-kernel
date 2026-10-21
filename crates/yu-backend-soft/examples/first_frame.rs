@@ -87,6 +87,13 @@ fn run() -> Result<(), String> {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(120)
         .max(1);
+    // 取证用:强制渲染指定 tick(不改变默认的“首个可绘制帧”语义)。
+    // 官方 title 是 boot 链跑完后的画面,不是首个结构可绘制帧;用它在同一
+    // 锚点上比较 soft/wgpu/官方截图。
+    let forced_tick = env::var("YURIS_FIRST_FRAME_TICK")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
+    let limit = forced_tick.map_or(limit, |t| limit.max(t.saturating_add(1)));
     let timeline = InputTimeline::new();
     let mut drained_events = 0usize;
     let mut ticks = 0u32;
@@ -102,7 +109,7 @@ fn run() -> Result<(), String> {
         let frame = state.borrow().frame();
         let drawable = frame_has_drawable_output(&frame);
         last = Some(frame.clone());
-        if drawable {
+        if forced_tick == Some(tick) || (forced_tick.is_none() && drawable) {
             selected_tick = Some(tick);
             selected = Some(frame);
             break;
@@ -176,8 +183,11 @@ fn run() -> Result<(), String> {
     println!("entry: SYSTEM_START; record_events=false");
     println!("frames ticked: {} (selected tick {tick})", ticks);
     println!(
-        "stop rule: first frame with a drawable screen op (limit {limit}); \
-         frame_has_drawable_output is structural, no pixel work"
+        "stop rule: {} (limit {limit}); frame_has_drawable_output is structural, no pixel work",
+        match forced_tick {
+            Some(t) => format!("forced tick {t} (YURIS_FIRST_FRAME_TICK)"),
+            None => "first frame with a drawable screen op".to_string(),
+        }
     );
     println!(
         "frame: {} viewport: {}x{}",

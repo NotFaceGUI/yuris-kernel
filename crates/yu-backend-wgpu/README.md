@@ -61,7 +61,8 @@ cargo run -p yu-backend-wgpu --example first_frame
 示例会:
 - 与软后端 `first_frame` 相同的 `GfxHost` 同步事件路径 boot ERIS;
 - 渲染首个可绘制帧;
-- 硬校验输出尺寸 = `viewport`、非全黑;
+- 硬校验输出尺寸 = `viewport`;全黑时警告并写 `all_black=true`
+  (当前 ERIS boot 锚点尚未到 title,不作为 1:1 证据);
 - 同帧渲染两次校验像素确定性;
 - 若 `target/tmp/first_frame.display.json` 存在,逐项对账
   `passes / ops / executable / skipped / layers`(不一致则退出非零)。
@@ -101,12 +102,13 @@ examples/first_frame.rs
 | 契约 | 本后端 |
 |---|---|
 | pass 顺序 | 严格 `frame.passes`:Texture(只记账)→ Offscreen(子先父后)→ Screen;不重排、不合并 |
-| Texture pass | `Op::Copy`/`Op::Image` 全部跳过;`status` 原因或 `texture_pass.not_executed` |
+| Texture pass | `RECTPAINT/RECTPAINT2/RECTPAINT3` 在 CPU 侧预执行并上传覆盖纹理(EVID-J-02..05);`Op::Copy` 与其余 `Op::Image` 跳过 |
 | Offscreen | 尺寸 = 组 `SX/SY`,未给用视口;`clear` = `pass.clear`,缺省透明黑;ops 按帧内顺序 |
 | Screen | 尺寸 = `frame.viewport`;`clear` = `frame.clear`;只画 gfx 给出的主窗口组 ops |
-| `Op::Layer` | `Asset`(无显式尺寸)/`SolidBlack1x1`/`Offscreen`;`Snapshot`/`None` 跳过 |
+| `Op::Layer` | `Asset`(无显式尺寸)/`SolidBlack1x1`/`Offscreen`;`Snapshot`/`None` 跳过;有 RECTPAINT 覆盖时优先覆盖纹理 |
 | `Op::Group` | 取已渲染的离屏纹理;组的 `A/MODE/E` 只在画进父目标时作用一次 |
-| `Op::Transition/Mask/Copy/Image` | 跳过并计数 |
+| `Op::Transition/Mask/Copy` | 跳过并计数 |
+| `Op::Image` | 只有 RECTPAINT/2/3 执行;其余跳过并计数 |
 | Alpha | 固定管线 `min(max(A,0),255)/255`;着色器输出 `texture.a × layer_alpha`,只乘一次;RGB 不预乘 |
 | Blend | MODE 0/1/2;RGB 与 alpha 都按 D3D9 固定管线同因子:0=`src·a+dst·(1−a)` / `a²+dst·(1−a)`,1=`src·a+dst` / `a²+dst`,2=`dst−src·a` / `dst−a²`;其余跳过并计数 |
 | Filter | `frame.filter` 全局;Point=nearest,Linear/Anisotropic=linear;mip 固定 LOD 0 |
@@ -144,7 +146,7 @@ examples/first_frame.rs
 | 适配器/驱动差异 | 环境 | 报告记录 backend/adapter/device_type/driver;不做跨卡 golden |
 | 双线性采样实现 | 舍入 | 软后端用 16.16 定点,GPU 用固定功能线性;预期 ≤1–2 LSB。当前可执行路径只有 1×1 纯色黑图,尚未在缩放资源图上验证 |
 | 最近邻采样映射 | 舍入 | 四边形按像素边界映射、采样在像素中心;1:1 绘制实测一致 |
-| alpha 通道的 soft 偏离 | 语义差(soft P1) | wgpu 按 D3D9 同因子执行(alpha 源项 `a²`);`yu-backend-soft` 当前写的是 `a`(`a+dst·(1−a)`),与 gfx 的 SRCBLEND/DESTBLEND 状态表不一致。ERIS 首帧有 9,451 个半透明像素因此不同(最大 RGB 差 61);wgpu 输出保留这些像素的 alpha,soft 输出 alpha 恒 255。计数不受影响;待 soft 修复或引擎 trace 再统一 |
+| alpha 通道的 soft 偏离 | **已修复(EVID-J-01)** | 两个后端都按 D3D9 同因子执行,alpha 源项 `a²`。soft 原先把源项写成 `a`;任务 J Phase A 改为 `mul255(a,a)` 并同步单测。修复前 ERIS 首帧有 9,451 个半透明像素不同(最大 RGB 差 61);修复后同帧逐通道差见 §首帧实测 |
 | 组离屏 RT 的 alpha 存储 | 未取证 | 本后端与 soft 都用 RGBA8 直通 alpha;引擎 RT 是否为 A8/X8、是否写 alpha 位未取证(DIV-GFX-008 扩展)。若后续证据表明是 X8,组半透明合成语义需整体重做 |
 | MODE 0 stage1 / MODE 2 diffuse | 未取证(gfx 契约) | gfx 没有携带逐层 diffuse/stage1 辅助纹理;与 soft 一样把 RGB 视为纹理直通、MODE 2 的 diffuse 按白处理。引擎像素未对拍 |
 | 零尺寸组 pass 的 `ops_total` | 计数修正 | soft 在该分支只加 `skipped` 不加 `ops_total`(会破坏 `total=drawn+skipped`);本后端仍计总数。ERIS 首帧无此情况,计数一致 |
@@ -156,7 +158,8 @@ examples/first_frame.rs
 **唯一硬性检查**(不是逐像素对拍):
 - `passes / ops_total / ops_drawn / skipped_ops_total` 与
   `first_frame.display.json` 完全一致;
-- 输出尺寸 = `viewport`,且非全黑(clear 生效的冒烟断言)。
+- 输出尺寸 = `viewport`;全黑时警告并记录 `all_black=true`(当前 boot 锚点未到
+  title,不能当作 1:1 证据;`YURIS_FIRST_FRAME_TICK` 可固定非黑微场景帧)。
 
 ## 错误码
 
@@ -201,19 +204,33 @@ wasm 证据只覆盖**编译**:库内无 `std::fs`/`std::env`/路径拼接;运�
 
 ### 首帧实测(RTX 5070 / Vulkan,默认选项)
 
+**当前 HEAD(任务 J 后,ERIS tick 1):**
+
 ```text
-frame 3, 800x600, 272 层, 15 pass, 2 个组离屏
-44 op: 15 executable / 29 skipped
+frame 3, 800x600, 272 层(visible 8), 15 pass, 2 个组离屏
+18 op: 13 executable / 5 skipped
 文本 0, 缺失资产 0,filter.source=placeholder
-draws=15 uploads=14 upload_bytes=1161036 pipelines=1 bind_groups=15
-vertices=1800 readback=1920000 elapsed≈32.2 ms deterministic=true
-display_check: OK (passes 15 ops 44 executable 15 skipped 29)
-png: 794572 bytes (soft: 785127 bytes)
+draws=3 uploads=2 upload_bytes=26660 pipelines=1 bind_groups=3
+vertices=360 readback=1920000 elapsed≈18.1 ms deterministic=true all_black=true
+display_check: OK (passes 15 ops 18 executable 13 skipped 5)
+png: 540267 bytes (soft: 540267)
+warning: 首帧全黑(当前 boot 锚点未到 title/仅清屏);不是 1:1 证据
 ```
 
-同机 DX12 + `YURIS_WGPU_ADAPTER=5070` 也通过(≈38.3 ms,计数相同)。
-两张 PNG 的差异全部落在 9,451 个半透明像素上,归因于 README 差异账本的
-alpha 语义行;计数与不透明像素一致,**不做逐像素门禁**。
+**历史锚点(`771cf79`,44 op):** 15 executable / 29 skipped,9,451 个半透明
+像素不同(最大 RGB 差 61)。该差异由 EVID-J-01 修复:soft alpha 源项改为
+`a²`;当前同帧 soft/wgpu 半透明像素逐通道差 **0**。
+
+**非黑微场景(`fidelity-micro4`,RECTPAINT/2/3):**
+
+```text
+frame 6, 8 层(visible 8), 11 pass, 17 op, 17 executable / 0 skipped
+all_black=false, display_check OK (passes 11 ops 17 executable 17 skipped 0)
+png: 1920813 bytes (soft: 1920813)
+soft vs wgpu: diff_pixels=0/480000 max_channel_diff=0
+```
+
+同机 DX12 + `YURIS_WGPU_ADAPTER=5070` 也通过(计数相同)。
 
 ## 已知未实现
 
@@ -221,8 +238,9 @@ alpha 语义行;计数与不透明像素一致,**不做逐像素门禁**。
 
 - MODE 4/8/10..18;MODE 3/5/6/7/9;
 - `MID` 掩码、多部件层、`FX/FR/...` 仿射/滤镜;
-- `COPY/COPY2/TEXCOPY/TEXSSCOPY`、`RECTPAINT*`/`SIZE*`/`ROTATION`/`RESIZE`/
-  `TRIM`/`MONO`/`BLUR*` 等图像加工;
+- `COPY/COPY2/TEXCOPY/TEXSSCOPY`、`SIZE*`/`ROTATION`/`RESIZE`/`TRIM`/
+  `MONO`/`BLUR*` 等图像加工;`RECTPAINT/2/3` 已实现(EVID-J-02..05),
+  `ID2`/快照源/部分区域仍挂账;
 - 资源图 + `SX/SY` 的缩放/裁剪;
 - 文本字形栅格化/排版;
 - 组 `SX/SY` 缺失时的引擎真实尺寸/清屏(DIV-GFX-008);

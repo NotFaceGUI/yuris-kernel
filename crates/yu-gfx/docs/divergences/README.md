@@ -12,17 +12,17 @@
 | DIV-GFX-004 | 多部件层(`+0xa6/+0xa7/+0xb0/+0x130`)几何语义未取证 | unimplemented | 契约保留 `Part` 位置,首屏未出现 |
 | DIV-GFX-005 | 外部掩码 `MID` 的取值通道(α/亮度)/尺寸要求未取证 | unimplemented | 带 `MID` 图层标 Unimplemented |
 | DIV-GFX-006 | 过渡 `TID` 配对层缺失时的第二纹理来源、`T` 的推进者(`+0x82` vs `+0x1e8`)未取证 | open | 空 `TID` 已确认=无配对(普通层,会话 F 修复);非空但查不到配对层仍 Unimplemented;公式已按 REA 实现 |
-| DIV-GFX-007 | `CGACT[COPY/COPY2]` 的时序=`上一帧已渲染目标`(旧线实测),区域 `X/Y/X2/Y2` 语义未逐项取证 | unimplemented | 复制目标层纹理=`Snapshot`,`Op::Copy` 恒标 Unimplemented |
-| DIV-GFX-008 | 图层组未给 `SX/SY` 时的离屏尺寸/清屏未取证 | open | 组 `size=None`;后端暂用视口/透明黑(Likely) |
+| DIV-GFX-007 | `CGACT[COPY/COPY2]`:旧线“上一帧已渲染目标”被 EVID-J-11 微场景 Refuted(至少 group 源 = 命令执行时当前状态);区域 `X/Y/X2/Y2` 与 layer 源时序未测 | open | 复制目标层纹理=`Snapshot`,`Op::Copy` 恒标 Unimplemented;契约变更需主人确认 |
+| DIV-GFX-008 | 图层组离屏尺寸/清屏/RT alpha 语义:主组 `W0` 官方直接画到屏幕,子组离屏 alpha 不参与父级合成(EVID-J-08) | open | 组 `size=None` 时后端暂用视口/透明黑;内核当前把 `W0` 当 Offscreen,半透明层因此与官方不同;修正需主人确认契约 |
 | DIV-GFX-009 | 颜色空间:引擎未设 `D3DRS_SRGBWRITEENABLE`,按 gamma 空间混合;未用官方截图逐像素验证 | open | 帧输出 `gamma_encoded_srgb8` |
 | DIV-GFX-010 | 帧入口无显式 `Clear`;可见背景黑来自 D3D9 默认/设备初始化 | open | `Clear::default_black()`(Likely) |
 | DIV-GFX-011 | `LINT/LINT2/TSX/TSY/MIPMAP/TEX/DXBUF/DXDRAW/RID/MFILE/CASH/...` 的视觉语义未分类 | unimplemented | 原样进 `Layer.extra`,每参数一条诊断 |
 | DIV-GFX-012 | 文本字形栅格化/行距/描边/窗口定位未实现 | unimplemented | 只输出 `TextRun`/`TextStyle` 模型 |
-| DIV-GFX-013 | `CGACT` 图像加工(`RECTPAINT*`/`SIZE`/`ROTATION`/`MONO`/...)的像素算法未实现 | unimplemented | `Op::Image` 记录原值,后端跳过 |
+| DIV-GFX-013 | `CGACT` 图像加工: `RECTPAINT/2/3` 已按 EVID-J-02..05 实现;`SIZE`/`ROTATION`/`MONO`/`BLUR`/... 像素算法仍未实现 | partial | `Op::Image` 对 `RECTPAINT/2/3` 可在原地、整层或完整矩形、Asset/1×1 黑图时标 Executable;ID2/快照源/其余动作仍 Unimplemented,后端跳过 |
 | DIV-GFX-014 | 同 Z 顺序:手册称「不確定」;内核取创建序 | fixed(decision) | `(z, seq)` 稳定排序 |
 | DIV-GFX-015 | 首屏逻辑帧号由 VM 事件决定;`frame 0` 是初始化,首个可见画面在后续逻辑帧 | note | golden 取“首个有可见层的逻辑帧” |
 | DIV-GFX-016 | `CG` 无 `FILE` 时按引擎 get-or-create 建无纹理节点;手册例 4 称“图层不存在=错误” | open | 无纹理节点不产生绘制,只保留状态;会话 F 未能重新锚定 CG 处理体,保持现状 |
-| DIV-GFX-017 | `COPY` 的属性复制范围(是否含 Z)未逐项取证 | open | 当前按手册“图像+属性”复制 A/E/MODE/T/TA/坐标/滤镜/Z;REA 块未逐项确认 Z |
+| DIV-GFX-017 | `COPY` 属性复制范围:`FUN_0042f809` 行 365-447 明确复制 A/E/MODE/T/TA/X/Y/尺寸/TID/MID/滤镜;该块**未见 Z**,当前 gfx `copy_attributes` 复制 Z | open | Z 未在块中出现 ⇒ 当前复制 Z 是 Likely 偏差;等 `FUN_0042f809` 调用点/Z 字段偏移确认后再改 |
 | DIV-GFX-018 | 子窗口(`WINDOW[NO=1..3] CGID`)的叠放/位置/可见性不在 gfx | unimplemented | gfx 输出全部窗口状态;Screen 只合成主窗口(CGID/E/A),子窗口组只产出 Offscreen pass,交 window/host 会话 |
 | DIV-GFX-019 | 顶点 DIFFUSE RGB 未建模(引擎顶点色构造与反编译局部变量重叠,未能可靠还原) | open | 可执行模式 0/1 的 DIFFUSE 只进 alpha stage;MODE 2/3/5/6/7/9 已 Unverified,后端不得自行假定顶点色 |
 | DIV-GFX-020 | `CGINFO/FONTINFO/WINDOWINFO` 的 `LET` 查询需要脚本执行期同步读图形状态 | partial | `yu-rt::GraphicsHost` + `yu_gfx::GfxHost` 已实现同步查询与 LET 写回;`EXIST/E/A/X/Y/Z/MODE/T/TA/TID`、组/黑图尺寸、FONTINFO 当前样式、WINDOWINFO 主窗口几何可用 |
@@ -46,3 +46,5 @@
 | DIV-GFX-038 | INFO 对“缺失图层/窗口”的非 EXIST 字段、以及 `MFILE/TEX/FX/TRIM/...` 未取证 | unimplemented | 返回 `gfx.info.missing/unsupported`;VM 不写 LET |
 | DIV-GFX-039 | `CGACT` 未分类参数:`RASTER1`(手册有、ERIS 表无)、`FSX/FSY/FX2/FY2`、`Z2` | unimplemented | `RASTER1` 已识别为图像动作;其余原样留存 |
 | DIV-GFX-040 | `TEXTINFO` 只读文本状态查询未接线(`text/textinfo.html`) | unimplemented | VM 目前归 Unknown;ERIS 未使用;需与 TEXT 状态机一起做 |
+| DIV-GFX-041 | 主组/子组 RT 的结构与 alpha 格式:主组 `W0` 官方直绘到屏幕;子组 RT alpha 不参与合成(行为已由 EVID-J-08 微场景确认),生产路径的 `D3DFMT`/alpha 写掩码未定位 | open | 内核当前 `Offscreen(:/W0)` + RGBA8 直通 alpha,半透明层与官方不同;**契约改动需主人确认** |
+| DIV-GFX-042 | D3D9 半像素/quad 采样相位:官方矩形顶行与背景混合(1px 边缘),内核整数矩形全填充 | open | `RECTPAINT` 区域内部已逐通道一致;1px 边缘差异单独挂账,不纳入 Phase B 门禁 |

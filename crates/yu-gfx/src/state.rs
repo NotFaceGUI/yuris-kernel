@@ -1375,7 +1375,42 @@ impl GfxState {
                 return;
             }
         }
-        // TODO(DIV-GFX-013):图像加工像素算法未实现;只记录参数。
+        // TODO(DIV-GFX-013):其余图像加工像素算法未实现;只记录参数。
+        //
+        // RECTPAINT/2/3 的像素语义已在 EVID-J-02..05 取证:
+        // `FUN_0042f809`(0x42f809) 行 334-342 把动作 0x18/0x19/0x1a
+        // 分派到 `FUN_0043185c`(0x43185c),后者按模式 1/2/3 填充
+        // RGB / alpha / ARGB。这里只放行**原地、无 ID2、整层或完整矩形、
+        // 基图为 Asset/SolidBlack1x1** 的情形;其余保持 Unimplemented。
+        let explicit_target = target.is_some();
+        let target = target.or_else(|| Some(source.clone()));
+        let status = if matches!(
+            action,
+            ImageAction::RectPaint | ImageAction::RectPaint2 | ImageAction::RectPaint3
+        ) {
+            if explicit_target && target.as_ref() != Some(source) {
+                OpStatus::Unimplemented("gfx.imageop.id2.unsupported")
+            } else {
+                match rect_paint_precheck(
+                    self.nodes.get(source),
+                    &set,
+                    &set2,
+                    &set_str,
+                    sx,
+                    sy,
+                    x,
+                    y,
+                    x2,
+                    y2,
+                ) {
+                    Ok(()) => OpStatus::Executable,
+                    Err(reason) => OpStatus::Unimplemented(reason),
+                }
+            }
+        } else {
+            OpStatus::Unimplemented("gfx.imageop.unsupported")
+        };
+        let executable = status == OpStatus::Executable;
         self.push_image_log(ImageOp {
             source: source.clone(),
             target: target.clone(),
@@ -1389,25 +1424,30 @@ impl GfxState {
             y,
             x2,
             y2,
-            status: OpStatus::Unimplemented("gfx.imageop.unsupported"),
+            status,
         });
-        if let Some(node) = self.nodes.get_mut(source) {
-            node.layer
-                .set_texture_status(LayerStatus::Unimplemented("gfx.imageop.unsupported"));
-        }
-        if let Some(t) = target {
-            if let Some(node) = self.nodes.get_mut(&t) {
-                node.layer
-                    .set_texture_status(LayerStatus::Unimplemented("gfx.imageop.unsupported"));
+        if !executable {
+            let reason = match status {
+                OpStatus::Unimplemented(reason) => reason,
+                OpStatus::Executable => unreachable!(),
+            };
+            if let Some(node) = self.nodes.get_mut(source) {
+                node.layer.set_texture_status(LayerStatus::Unimplemented(reason));
             }
+            if let Some(t) = target {
+                if let Some(node) = self.nodes.get_mut(&t) {
+                    node.layer
+                        .set_texture_status(LayerStatus::Unimplemented(reason));
+                }
+            }
+            self.push_diag(
+                "CGACT",
+                error::unimplemented(
+                    error::code::IMAGEOP_UNSUPPORTED,
+                    format!("图像加工 `{name}` 未执行: {reason};只记录原始参数"),
+                ),
+            );
         }
-        self.push_diag(
-            "CGACT",
-            error::unimplemented(
-                error::code::IMAGEOP_UNSUPPORTED,
-                format!("图像加工 `{name}` 的像素算法未取证;只记录原始参数"),
-            ),
-        );
     }
 
     // ------------------------------------------------------------ FONT / TEXT
@@ -2047,6 +2087,62 @@ fn copy_attributes(src: &Layer, dst: &mut Layer) {
     dst.texture_status = src.texture_status;
     dst.param_status = src.param_status;
     dst.refresh_status();
+}
+
+/// RECTPAINT/2/3 的可执行前置条件(EVID-J-02..05)。
+///
+/// 只放行已取证的组合:原地加工、SET 为整数、无 SET2/SETSTR/SX/SY、
+/// 区域要么全省略(整张纹理)要么四个坐标齐全、基图为 Asset 或 1×1 黑图。
+/// ID2、快照源、部分区域等没有像素级证据的组合返回具体 reason,保持挂账。
+#[allow(clippy::too_many_arguments)]
+fn rect_paint_precheck(
+    node: Option<&Node>,
+    set: &Option<EngineValue>,
+    set2: &Option<EngineValue>,
+    set_str: &Option<Vec<u8>>,
+    sx: Option<i64>,
+    sy: Option<i64>,
+    x: Option<i64>,
+    y: Option<i64>,
+    x2: Option<i64>,
+    y2: Option<i64>,
+) -> Result<(), &'static str> {
+    if set.as_ref().and_then(EngineValue::as_int).is_none() {
+        return Err("gfx.imageop.set.missing");
+    }
+    if set2.is_some() {
+        return Err("gfx.imageop.set2.unsupported");
+    }
+    if set_str.is_some() {
+        return Err("gfx.imageop.setstr.unsupported");
+    }
+    if sx.is_some() || sy.is_some() {
+        return Err("gfx.imageop.sx.unsupported");
+    }
+    let region_fields = [x.is_some(), y.is_some(), x2.is_some(), y2.is_some()]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    if region_fields != 0 && region_fields != 4 {
+        return Err("gfx.imageop.region.partial");
+    }
+    if let (Some(x), Some(y), Some(x2), Some(y2)) = (x, y, x2, y2) {
+        if x2 < x || y2 < y {
+            return Err("gfx.imageop.region.invalid");
+        }
+    }
+    let node = node.ok_or("gfx.imageop.target.unsupported")?;
+    match &node.layer.texture {
+        TextureRef::Asset(_) | TextureRef::SolidBlack1x1 => {}
+        TextureRef::Snapshot(_) => return Err("gfx.imageop.copy_source.unsupported"),
+        TextureRef::Offscreen(_) => return Err("gfx.imageop.target.group"),
+        TextureRef::None => return Err("gfx.imageop.texture.none"),
+    }
+    // 先前的未实现加工/复制已经让基图不可信;不在其上叠加填充。
+    if node.layer.texture_status != LayerStatus::Executable {
+        return Err("gfx.imageop.target.unsupported");
+    }
+    Ok(())
 }
 
 /// 真实 ysc 表(0.495 ERIS)的全部图像动作参数。

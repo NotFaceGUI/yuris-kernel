@@ -19,17 +19,25 @@ M3 渲染链路已打通到“软/硬双后端首帧 + 计数对账”：
 |---|---|
 | M3a 语义显示列表 `CompositorFrame` | 完成 |
 | M3b `yu-backend-soft` 首帧 PNG | 完成（部分语义挂账，见下） |
-| M3c `yu-backend-wgpu` 主后端首帧 | 完成（离屏 RGBA8 + 读回；surface 呈现留宿主；alpha 语义与 soft 分叉，见 crate README） |
+| M3c `yu-backend-wgpu` 主后端首帧 | 完成（离屏 RGBA8 + 读回；surface 呈现留宿主；alpha 语义与 soft 已统一为 `a²`） |
 | M3d 桌面 / wasm / Android 宿主闭环 | 未开始 |
 
-首帧实测（同一 ERIS 帧）：800×600、272 图层、15 pass、44 op（15 executable /
-29 skipped）。soft 输出 `target/tmp/first_frame.png`；wgpu 输出
+首帧实测（同一 ERIS 帧）：800×600、272 图层、15 pass、44 op（历史锚点；
+当前 HEAD 的 boot 链在 tick 1 为 8 visible / 18 op，见下）。soft 输出
+`target/tmp/first_frame.png`；wgpu 输出
 `target/tmp/wgpu_first_frame.png` + `wgpu_first_frame.report.json`，pass/op/
-executable/skipped 计数与 `first_frame.display.json` 完全一致。两者在 9,451 个
-半透明像素上不同：wgpu 按 D3D9 同因子 alpha（`As²`）执行，soft 当前为 `As`
-（已知 soft P1）；不做逐像素门禁，差异记入 `crates/yu-backend-wgpu/README.md`
-账本。文字栅格化、COPY、RECTPAINT、部分 MODE 仍是显式挂账项，见
-`docs/gfx-unimplemented-todo.md`。
+executable/skipped 计数与 `first_frame.display.json` 完全一致。任务 J 已把
+soft 的 alpha 源项修为 `a²`（与 wgpu 同帧半透明像素逐通道差 0），并实现
+`RECTPAINT/2/3`（首屏 11 个 image op 中 10 个可执行；`CGS100` 等 COPY）。
+文字栅格化、COPY、组 RT alpha 语义、部分 MODE 仍是显式挂账项，见
+`docs/fidelity-ledger-j.md`、`docs/gfx-unimplemented-todo.md`。
+
+> **首帧锚点说明（2026-10-21）**：ERIS 的 first 是 boot 跑到 title。当前
+> 内核的 boot 链尚未恢复到 title：`first_frame` 选中的 tick 1 是启动期
+> 显示状态（8 visible / 18 op，屏幕全黑），历史 golden 的 34 visible /
+> 44 op 来自 `771cf79`。该差异在 `yu-rt`（任务 J 不允许修改），因此
+> 官方 title 与内核的逐像素对拍暂不可做；`cargo test -p yu-gfx` 的两条
+> golden 保持失败、未用 `UPDATE_GFX_GOLDEN` 掩盖。
 
 ## 布局
 
@@ -74,7 +82,6 @@ cargo test --workspace
 
 # 真样本（仓库不附带游戏数据；缺失时测试显式失败 / 跳过并计数）
 # 数据入口：封包 <project>/data.ypf 优先，散盘 <project>/data/ 为备，哪个存在用哪个。
-# 勘误（2026-10-20）：save/data 是官方 exe 的解包产物，不是数据入口；代码不识别该回退。
 export YURIS_REQUIRE_SAMPLES=1
 export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
 
@@ -94,6 +101,7 @@ cargo run -p yu-backend-wgpu --example first_frame
 - `PROGRESS.md` — **唯一进度真相**（成果、勘误、验证命令与原始结果）
 - `docs/architecture.md` — 设计稿（v1.2；与 `PROGRESS.md` 架构现状冲突时以后者为准）
 - `docs/render-parity.md` — 渲染语义证据表与后端执行契约
+- `docs/fidelity-ledger-j.md` — 任务 J 首帧保真台账（RECTPAINT/alpha/COPY 证据与阈值）
 - `docs/gfx-verification-ledger.md` — gfx 复核台账（Confirmed / Refuted / Uncertain）
 - `docs/gfx-unimplemented-todo.md` — 未实现模块 DIV 清单与解除条件
 - `docs/font-contract.md` / `docs/font-provenance.md` — 字体接口与取证

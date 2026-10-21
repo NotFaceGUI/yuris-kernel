@@ -112,7 +112,8 @@ impl TextureCache {
         Ok(id)
     }
 
-    fn upload(
+    /// 上传一帧内生成的 RGBA8(图像加工结果)。调用方负责缓存生命周期。
+    pub(crate) fn upload(
         &mut self,
         ctx: &GpuContext,
         width: u32,

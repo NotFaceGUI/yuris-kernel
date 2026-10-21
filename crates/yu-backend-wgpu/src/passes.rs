@@ -11,10 +11,12 @@
 
 use std::collections::BTreeMap;
 
-use yu_backend_soft::{AssetIssue, RenderReport, SkippedOp, TextureStore};
+use yu_backend_soft::{
+    apply_rect_paint, AssetIssue, RenderReport, SkippedOp, Texture, TextureStore,
+};
 use yu_gfx::{
-    fixed_pipeline_alpha, BlendMode, Clear, CompositorFrame, Layer, LayerId, Op, OpStatus,
-    PassTarget, TextureRef,
+    fixed_pipeline_alpha, BlendMode, Clear, CompositorFrame, ImageAction, ImageOp, Layer, LayerId,
+    Op, OpStatus, PassTarget, TextureRef,
 };
 use yu_log::Diag;
 
@@ -74,12 +76,24 @@ pub(crate) fn plan(
     let mut passes: Vec<PlannedPass> = Vec::new();
     let mut screen_planned = false;
 
+    // RECTPAINT 族(EVID-J-02..05):先在 CPU 上对图层基图做填充,得到本帧
+    // 的覆盖纹理;绘制阶段按需上传一次。Texture pass 的计数在这里完成,
+    // 主循环只保留 pass 计数,避免重复计 op。
+    let mut overrides: BTreeMap<LayerId, Texture> = BTreeMap::new();
     for pass in &frame.passes {
-        acc.passes += 1;
-        match &pass.target {
-            PassTarget::Texture(_) => {
-                for op in &pass.ops {
-                    acc.ops_total += 1;
+        let PassTarget::Texture(target) = &pass.target else {
+            continue;
+        };
+        for op in &pass.ops {
+            acc.ops_total += 1;
+            match op {
+                Op::Image(image) if op.status() == OpStatus::Executable => {
+                    match apply_image_to_override(frame, textures, target, image, &mut overrides) {
+                        Ok(()) => acc.ops_drawn += 1,
+                        Err(reason) => acc.skip(op, reason),
+                    }
+                }
+                _ => {
                     let reason = match op.status() {
                         OpStatus::Unimplemented(why) => why.to_string(),
                         OpStatus::Executable => "texture_pass.not_executed".to_string(),
@@ -87,6 +101,14 @@ pub(crate) fn plan(
                     acc.skip(op, reason);
                 }
             }
+        }
+    }
+    let mut uploaded_overrides: BTreeMap<LayerId, (u64, u32, u32)> = BTreeMap::new();
+
+    for pass in &frame.passes {
+        acc.passes += 1;
+        match &pass.target {
+            PassTarget::Texture(_) => {} // op 计数已在覆盖纹理预执行中完成
             PassTarget::Offscreen(id) => {
                 let (width, height) = group_surface_size(frame, id);
                 if width == 0 || height == 0 {
@@ -113,6 +135,8 @@ pub(crate) fn plan(
                         targets,
                         vertices: &mut vertices,
                         acc: &mut acc,
+                        overrides: &overrides,
+                        uploaded_overrides: &mut uploaded_overrides,
                         dst_width: width,
                         dst_height: height,
                     };
@@ -142,6 +166,8 @@ pub(crate) fn plan(
                         targets,
                         vertices: &mut vertices,
                         acc: &mut acc,
+                        overrides: &overrides,
+                        uploaded_overrides: &mut uploaded_overrides,
                         dst_width: width,
                         dst_height: height,
                     };
@@ -180,6 +206,10 @@ struct Planner<'a> {
     targets: &'a TargetSet,
     vertices: &'a mut Vec<Vertex>,
     acc: &'a mut Accum,
+    /// 本帧 RECTPAINT 后的图层纹理(CPU 侧)。
+    overrides: &'a BTreeMap<LayerId, Texture>,
+    /// 已上传的覆盖纹理 `(gpu id, width, height)`;跨 pass 复用。
+    uploaded_overrides: &'a mut BTreeMap<LayerId, (u64, u32, u32)>,
     dst_width: u32,
     dst_height: u32,
 }
@@ -264,6 +294,38 @@ impl Planner<'_> {
         let explicit_size = layer.image_size();
         let (x, y) = (layer.transform.x, layer.transform.y);
         let alpha = fixed_pipeline_alpha(layer.alpha) as f32;
+
+        if let Some(tex) = self.overrides.get(&layer.id).cloned() {
+            let gpu_tex = match self.uploaded_overrides.get(&layer.id).copied() {
+                Some(uploaded) => uploaded,
+                None => {
+                    let id = self.gpu.upload(
+                        self.ctx,
+                        tex.width,
+                        tex.height,
+                        &tex.rgba,
+                        "imageop layer",
+                    )?;
+                    self.uploaded_overrides
+                        .insert(layer.id.clone(), (id, tex.width, tex.height));
+                    (id, tex.width, tex.height)
+                }
+            };
+            let texture = self
+                .gpu
+                .get(gpu_tex.0)
+                .expect("imageop override uploaded above");
+            let view = texture.view.clone();
+            let (width, height) = match explicit_size {
+                Some(size) => (size.width, size.height),
+                None => (gpu_tex.1, gpu_tex.2),
+            };
+            let filter = pick_filter(self.frame, gpu_tex.1, gpu_tex.2, width, height);
+            self.draw(
+                out, blend, gpu_tex.0, &view, filter, x, y, width, height, alpha,
+            )?;
+            return Ok(());
+        }
 
         match &layer.texture {
             TextureRef::Asset(key) => {
@@ -424,6 +486,64 @@ fn clear_color(clear: Clear) -> wgpu::Color {
     }
 }
 
+fn apply_image_to_override(
+    frame: &CompositorFrame,
+    textures: &mut TextureStore,
+    pass_target: &LayerId,
+    image: &ImageOp,
+    overrides: &mut BTreeMap<LayerId, Texture>,
+) -> Result<(), String> {
+    let target = image.target.as_ref().unwrap_or(&image.source);
+    if target != pass_target {
+        return Err("gfx.imageop.target.mismatch".to_string());
+    }
+    let Some(set) = image.set.as_ref().and_then(|v| v.as_int()) else {
+        return Err("gfx.imageop.set.missing".to_string());
+    };
+    let region = match (image.x, image.y, image.x2, image.y2) {
+        (Some(x), Some(y), Some(x2), Some(y2)) => Some((x, y, x2, y2)),
+        (None, None, None, None) => None,
+        _ => return Err("gfx.imageop.region.partial".to_string()),
+    };
+    if !matches!(
+        image.action,
+        ImageAction::RectPaint | ImageAction::RectPaint2 | ImageAction::RectPaint3
+    ) {
+        return Err("gfx.imageop.unsupported".to_string());
+    }
+    let mut texture = match overrides.remove(target) {
+        Some(texture) => texture,
+        None => resolve_base_texture(frame, textures, target)?,
+    };
+    apply_rect_paint(&mut texture, image.action.clone(), set, region)?;
+    overrides.insert(target.clone(), texture);
+    Ok(())
+}
+
+fn resolve_base_texture(
+    frame: &CompositorFrame,
+    textures: &mut TextureStore,
+    target: &LayerId,
+) -> Result<Texture, String> {
+    let Some(layer) = frame.layers.iter().find(|layer| &layer.id == target) else {
+        return Err("gfx.imageop.target.unsupported".to_string());
+    };
+    match &layer.texture {
+        TextureRef::Asset(key) => textures
+            .resolve(key)
+            .map(|texture| Texture {
+                width: texture.width,
+                height: texture.height,
+                rgba: texture.rgba.clone(),
+            })
+            .map_err(|diag| diag.code.to_string()),
+        TextureRef::SolidBlack1x1 => Ok(Texture::solid_black_1x1()),
+        TextureRef::Snapshot(_) => Err("gfx.imageop.copy_source.unsupported".to_string()),
+        TextureRef::Offscreen(_) => Err("gfx.imageop.target.group".to_string()),
+        TextureRef::None => Err("gfx.imageop.texture.none".to_string()),
+    }
+}
+
 fn group_surface_size(frame: &CompositorFrame, id: &LayerId) -> (u32, u32) {
     frame
         .layers
@@ -482,7 +602,11 @@ fn op_target(op: &Op) -> String {
         Op::Transition(transition) => transition.layer.id.display(),
         Op::Mask(mask) => mask.layer.id.display(),
         Op::Copy(copy) => copy.dest.display(),
-        Op::Image(image) => image.source.display(),
+        Op::Image(image) => image
+            .target
+            .as_ref()
+            .unwrap_or(&image.source)
+            .display(),
     }
 }
 

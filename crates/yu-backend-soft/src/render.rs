@@ -7,8 +7,12 @@
 //!
 //! - 固定管线 alpha = `min(max(A,0),255)/255`;纹理 alpha 与层 alpha 在混合
 //!   方程里相乘,纹理保持直通 alpha(不预乘);
-//! - `MODE 0`: `src·a + dst·(1−a)`;`MODE 1`: `src·a + dst`;
-//!   `MODE 2`: `dst − src·a`;alpha 通道使用同一组 D3D9 blend 因子;
+//! - `MODE 0`: RGB `src·a + dst·(1−a)` / alpha `a² + dst·(1−a)`;
+//!   `MODE 1`: RGB `src·a + dst` / alpha `a² + dst`;
+//!   `MODE 2`: RGB `dst − src·a` / alpha `dst − a²`。
+//!   alpha 源项是 `a²` 而不是 `a`:D3D9 未启用 `SEPARATEALPHABLENDENABLE`
+//!   时 alpha 通道复用同一组因子(`SRCALPHA` 因子为 `(As,As,As,As)`)。
+//!   证据:`EVID-J-01`(`docs/fidelity-ledger-j.md`)。
 //! - `Point` 最近邻,`Linear/Anisotropic` 双线性;缩放采样全部用整数
 //!   16.16 定点,避免浮点跨平台差异;
 //! - 颜色空间按存储值直接混合,不做 sRGB↔线性转换。
@@ -16,10 +20,11 @@
 use std::collections::BTreeMap;
 
 use yu_gfx::{
-    BlendMode, Clear, CompositorFrame, FilterMode, Layer, LayerId, Op, OpStatus, PassTarget,
-    TextureRef,
+    BlendMode, Clear, CompositorFrame, FilterMode, ImageAction, ImageOp, Layer, LayerId, Op,
+    OpStatus, PassTarget, TextureRef,
 };
 
+use crate::imageop::apply_rect_paint;
 use crate::texture::{AssetIssue, Texture, TextureStore};
 
 /// RGBA8 表面(行优先,直通 alpha)。
@@ -141,14 +146,26 @@ impl SoftRenderer {
         for pass in &frame.passes {
             st.report.passes += 1;
             match &pass.target {
-                PassTarget::Texture(_) => {
+                PassTarget::Texture(target) => {
                     for op in &pass.ops {
                         st.report.ops_total += 1;
-                        let reason = match op.status() {
-                            OpStatus::Unimplemented(why) => why.to_string(),
-                            OpStatus::Executable => "texture_pass.not_executed".to_string(),
-                        };
-                        st.skip_op(op, reason);
+                        match op {
+                            Op::Image(image) if op.status() == OpStatus::Executable => {
+                                match self.apply_image_op(frame, target, image, &mut st) {
+                                    Ok(()) => st.report.ops_drawn += 1,
+                                    Err(reason) => st.skip_op(op, reason),
+                                }
+                            }
+                            _ => {
+                                let reason = match op.status() {
+                                    OpStatus::Unimplemented(why) => why.to_string(),
+                                    OpStatus::Executable => {
+                                        "texture_pass.not_executed".to_string()
+                                    }
+                                };
+                                st.skip_op(op, reason);
+                            }
+                        }
                     }
                 }
                 PassTarget::Offscreen(id) => {
@@ -197,6 +214,70 @@ impl SoftRenderer {
         RenderOutput {
             surface,
             report: st.finish(),
+        }
+    }
+
+    /// 执行一个可执行的 `Op::Image`(当前只有 RECTPAINT/2/3,EVID-J-02..05)。
+    ///
+    /// 目标图层的基图在帧内第一次被加工时拷贝出可变副本;后续加工继续
+    /// 作用在同一副本上。图层绘制阶段优先使用该副本。
+    fn apply_image_op(
+        &mut self,
+        frame: &CompositorFrame,
+        pass_target: &LayerId,
+        image: &ImageOp,
+        st: &mut RenderState,
+    ) -> Result<(), String> {
+        let target = image.target.as_ref().unwrap_or(&image.source);
+        if target != pass_target {
+            return Err("gfx.imageop.target.mismatch".to_string());
+        }
+        let Some(set) = image.set.as_ref().and_then(|v| v.as_int()) else {
+            return Err("gfx.imageop.set.missing".to_string());
+        };
+        let region = match (image.x, image.y, image.x2, image.y2) {
+            (Some(x), Some(y), Some(x2), Some(y2)) => Some((x, y, x2, y2)),
+            (None, None, None, None) => None,
+            _ => return Err("gfx.imageop.region.partial".to_string()),
+        };
+        if !matches!(
+            image.action,
+            ImageAction::RectPaint | ImageAction::RectPaint2 | ImageAction::RectPaint3
+        ) {
+            return Err("gfx.imageop.unsupported".to_string());
+        }
+        let mut texture = match st.texture_overrides.remove(target) {
+            Some(texture) => texture,
+            None => self.base_texture(frame, target)?,
+        };
+        apply_rect_paint(&mut texture, image.action.clone(), set, region)?;
+        st.texture_overrides.insert(target.clone(), texture);
+        Ok(())
+    }
+
+    /// 取目标图层的基图副本。快照/离屏/无纹理的语义未取证,显式失败。
+    fn base_texture(
+        &mut self,
+        frame: &CompositorFrame,
+        target: &LayerId,
+    ) -> Result<Texture, String> {
+        let Some(layer) = frame.layers.iter().find(|layer| &layer.id == target) else {
+            return Err("gfx.imageop.target.unsupported".to_string());
+        };
+        match &layer.texture {
+            TextureRef::Asset(key) => self
+                .textures
+                .resolve(key)
+                .map(|texture| Texture {
+                    width: texture.width,
+                    height: texture.height,
+                    rgba: texture.rgba.clone(),
+                })
+                .map_err(|diag| diag.code.to_string()),
+            TextureRef::SolidBlack1x1 => Ok(Texture::solid_black_1x1()),
+            TextureRef::Snapshot(_) => Err("gfx.imageop.copy_source.unsupported".to_string()),
+            TextureRef::Offscreen(_) => Err("gfx.imageop.target.group".to_string()),
+            TextureRef::None => Err("gfx.imageop.texture.none".to_string()),
         }
     }
 
@@ -284,6 +365,30 @@ impl SoftRenderer {
             st.skip_op(op, format!("blend.{}", layer.blend.name()));
             return;
         };
+        if let Some(texture) = st.texture_overrides.get(&layer.id) {
+            let (width, height) = match layer.image_size() {
+                Some(size) => (size.width, size.height),
+                None => (texture.width, texture.height),
+            };
+            let filter = pick_filter(frame, texture.width, texture.height, width, height);
+            let (x, y) = (layer.transform.x, layer.transform.y);
+            {
+                let image = ImageRef::from_texture(texture);
+                draw_image(
+                    dst,
+                    image,
+                    x,
+                    y,
+                    width,
+                    height,
+                    layer_alpha(layer.alpha),
+                    mode,
+                    filter,
+                );
+            }
+            st.report.ops_drawn += 1;
+            return;
+        }
         let (explicit_width, explicit_height) = match layer.image_size() {
             Some(size) => (Some(size.width), Some(size.height)),
             None => (None, None),
@@ -377,6 +482,8 @@ impl SoftRenderer {
 
 struct RenderState {
     offscreens: BTreeMap<LayerId, Surface>,
+    /// 帧内 RECTPAINT 族加工后的图层纹理(基图副本);只影响本帧。
+    texture_overrides: BTreeMap<LayerId, Texture>,
     skipped: BTreeMap<(&'static str, String, String), u32>,
     report: RenderReport,
 }
@@ -386,6 +493,7 @@ impl RenderState {
         let visible_layers = frame.layers.iter().filter(|l| l.visible).count();
         Self {
             offscreens: BTreeMap::new(),
+            texture_overrides: BTreeMap::new(),
             skipped: BTreeMap::new(),
             report: RenderReport {
                 frame: frame.frame,
@@ -553,7 +661,11 @@ fn op_target(op: &Op) -> String {
         Op::Transition(transition) => transition.layer.id.display(),
         Op::Mask(mask) => mask.layer.id.display(),
         Op::Copy(copy) => copy.dest.display(),
-        Op::Image(image) => image.source.display(),
+        Op::Image(image) => image
+            .target
+            .as_ref()
+            .unwrap_or(&image.source)
+            .display(),
     }
 }
 
@@ -726,29 +838,35 @@ fn mul255(value: u8, alpha: u8) -> u8 {
 /// 状态来源:官方 0.495 `yu-ris.exe`(sha256 `4f5eefa3…`)`FUN_00414ba4`
 /// (`0x414ba4`,REA/Ghidra 12.1.4):MODE 0 设 SRCBLEND=5(SRCALPHA)/
 /// DESTBLEND=6(INVSRCALPHA)/BLENDOP=1(ADD),MODE 1 为 5/2(ONE)/1,
-/// MODE 2 为 5/2/3(REVSUBTRACT);只设置 `D3DRS_ALPHABLENDENABLE`(0xAB),
-/// 未设置 `SEPARATEALPHABLENDENABLE`,所以 alpha 通道与 RGB 使用同一组因子。
+/// MODE 2 为 5/2/3(REVSUBTRACT);`FUN_00462e40` 只设置
+/// `D3DRS_ALPHABLENDENABLE`(0x1B);反编译全树没有
+/// `D3DRS_SEPARATEALPHABLENDENABLE`(0xCE)写入,所以 alpha 通道与 RGB
+/// 使用同一组因子,alpha 源项是 `a²`(不是 `a`)。
+///
+/// 证据:`EVID-J-01`(`docs/fidelity-ledger-j.md`);D3D9 头
+/// `D3DBLEND_SRCALPHA=5` / `D3DRS_SEPARATEALPHABLENDENABLE=206`。
 fn blend_pixel(dst: [u8; 4], src: [u8; 4], src_alpha: u8, mode: BlendMode) -> [u8; 4] {
     let a = u32::from(src_alpha);
+    let a2 = u32::from(mul255(src_alpha, src_alpha));
     let inv = 255 - a;
     match mode {
         BlendMode::Normal => [
             ((u32::from(src[0]) * a + u32::from(dst[0]) * inv + 127) / 255) as u8,
             ((u32::from(src[1]) * a + u32::from(dst[1]) * inv + 127) / 255) as u8,
             ((u32::from(src[2]) * a + u32::from(dst[2]) * inv + 127) / 255) as u8,
-            (a + (u32::from(dst[3]) * inv + 127) / 255).min(255) as u8,
+            (a2 + (u32::from(dst[3]) * inv + 127) / 255).min(255) as u8,
         ],
         BlendMode::Add => [
             (u32::from(mul255(src[0], src_alpha)) + u32::from(dst[0])).min(255) as u8,
             (u32::from(mul255(src[1], src_alpha)) + u32::from(dst[1])).min(255) as u8,
             (u32::from(mul255(src[2], src_alpha)) + u32::from(dst[2])).min(255) as u8,
-            (a + u32::from(dst[3])).min(255) as u8,
+            (a2 + u32::from(dst[3])).min(255) as u8,
         ],
         BlendMode::Subtract => [
             dst[0].saturating_sub(mul255(src[0], src_alpha)),
             dst[1].saturating_sub(mul255(src[1], src_alpha)),
             dst[2].saturating_sub(mul255(src[2], src_alpha)),
-            dst[3].saturating_sub(src_alpha),
+            dst[3].saturating_sub(a2 as u8),
         ],
         _ => dst,
     }
@@ -759,9 +877,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blend_normal_uses_source_alpha() {
+    fn blend_normal_uses_source_alpha_squared_for_alpha_channel() {
+        // RGB 用 As;alpha 同因子 => As² + Ad·(1−As)。
         let out = blend_pixel([0, 0, 0, 255], [255, 255, 255, 255], 128, BlendMode::Normal);
-        assert_eq!(out, [128, 128, 128, 255]);
+        assert_eq!(out, [128, 128, 128, 191]);
+        let over_transparent = blend_pixel([0, 0, 0, 0], [255, 255, 255, 255], 128, BlendMode::Normal);
+        assert_eq!(over_transparent, [128, 128, 128, 64]);
     }
 
     #[test]
@@ -777,8 +898,8 @@ mod tests {
                 128,
                 BlendMode::Subtract
             ),
-            // RevSubtract 同时作用于 alpha: 255 - 128 = 127。
-            [0, 0, 0, 127]
+            // RevSubtract 同时作用于 alpha: 255 - As² = 255 - 64 = 191。
+            [0, 0, 0, 191]
         );
     }
 

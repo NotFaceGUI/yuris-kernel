@@ -211,7 +211,7 @@ fn swap2_swaps_textures_only() {
 }
 
 #[test]
-fn rectpaint_is_recorded_as_unimplemented_image_op() {
+fn rectpaint_family_is_executable() {
     let table = table();
     let mut gfx = state();
     gfx.consume_events(&[
@@ -222,35 +222,101 @@ fn rectpaint_is_recorded_as_unimplemented_image_op() {
             "CGACT",
             vec![
                 arg(&table, "CGACT", "ID", s("L")),
+                arg(&table, "CGACT", "RECTPAINT", i(1)),
+                arg(&table, "CGACT", "SET", i(0x112233)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("L")),
                 arg(&table, "CGACT", "RECTPAINT2", i(1)),
-                arg(&table, "CGACT", "SET", i(255)),
+                arg(&table, "CGACT", "SET", i(128)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("L")),
+                arg(&table, "CGACT", "RECTPAINT3", i(1)),
+                arg(&table, "CGACT", "SET", i(0x80AABBCC)),
             ],
         ),
         frame_end(1),
     ]);
     let f = gfx.frame();
-    let image_pass = f
+    let image_passes: Vec<_> = f
         .passes
         .iter()
-        .find(|p| matches!(&p.target, PassTarget::Texture(id) if id.display() == ":/W0/L"))
-        .expect("image pass");
-    match &image_pass.ops[0] {
-        Op::Image(i) => {
-            assert_eq!(i.source.display(), ":/W0/L");
-            assert_eq!(i.set.as_ref().and_then(|v| v.as_int()), Some(255));
-            assert_eq!(i.status, OpStatus::Unimplemented("gfx.imageop.unsupported"));
+        .filter(|p| matches!(&p.target, PassTarget::Texture(id) if id.display() == ":/W0/L"))
+        .collect();
+    assert_eq!(image_passes.len(), 3, "three RECTPAINT passes");
+    for pass in image_passes {
+        match &pass.ops[0] {
+            Op::Image(i) => {
+                assert_eq!(i.source.display(), ":/W0/L");
+                assert_eq!(i.status, OpStatus::Executable);
+            }
+            other => panic!("expected image op, got {other:?}"),
         }
-        other => panic!("expected image op, got {other:?}"),
     }
     let l = f
         .layers
         .iter()
         .find(|l| l.id.display() == ":/W0/L")
         .unwrap();
-    assert!(matches!(
-        l.status,
-        LayerStatus::Unimplemented("gfx.imageop.unsupported")
-    ));
+    // 可执行加工不改写图层状态;基图仍可绘制。
+    assert_eq!(l.status, LayerStatus::Executable);
+}
+
+#[test]
+fn rectpaint_with_id2_or_partial_region_stays_unimplemented() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        create(&table, "L", "l", 1, 256),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("L")),
+                arg(&table, "CGACT", "ID2", s("L2")),
+                arg(&table, "CGACT", "RECTPAINT", i(1)),
+                arg(&table, "CGACT", "SET", i(0x112233)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("L")),
+                arg(&table, "CGACT", "RECTPAINT", i(1)),
+                arg(&table, "CGACT", "SET", i(0x112233)),
+                arg(&table, "CGACT", "X", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let statuses: Vec<_> = f
+        .passes
+        .iter()
+        .filter(|p| matches!(&p.target, PassTarget::Texture(_)))
+        .filter_map(|p| match &p.ops[0] {
+            Op::Image(i) => Some(i.status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![
+            OpStatus::Unimplemented("gfx.imageop.id2.unsupported"),
+            OpStatus::Unimplemented("gfx.imageop.region.partial"),
+        ]
+    );
 }
 
 #[test]

@@ -97,6 +97,12 @@ fn run() -> Result<(), String> {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(120)
         .max(1);
+    // 取证用:强制渲染指定 tick(与 soft 示例同义;官方 title 不是首个
+    // 结构可绘制帧,像素对照必须固定在同一 boot 锚点)。
+    let forced_tick = env::var("YURIS_FIRST_FRAME_TICK")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
+    let limit = forced_tick.map_or(limit, |t| limit.max(t.saturating_add(1)));
     let timeline = InputTimeline::new();
     let mut drained_events = 0usize;
     let mut ticks = 0u32;
@@ -111,7 +117,7 @@ fn run() -> Result<(), String> {
         let frame = state.borrow().frame();
         let drawable = frame_has_drawable_output(&frame);
         last = Some(frame.clone());
-        if drawable {
+        if forced_tick == Some(tick) || (forced_tick.is_none() && drawable) {
             selected_tick = Some(tick);
             selected = Some(frame);
             break;
@@ -171,8 +177,12 @@ fn run() -> Result<(), String> {
             first.surface.width, first.surface.height, frame.viewport.width, frame.viewport.height
         ));
     }
-    if !has_non_black_pixel(&first.surface) {
-        return Err("首帧输出全黑(clear/绘制均未生效?)".to_string());
+    let all_black = !has_non_black_pixel(&first.surface);
+    if all_black {
+        eprintln!(
+            "warning: 首帧全黑(当前 boot 锚点未到 title/仅清屏);这不是 1:1 证据,\
+             报告里记 all_black=true。用 YURIS_FIRST_FRAME_TICK 选非黑帧再对拍。"
+        );
     }
 
     // 第二次渲染:缓存命中路径;GPU 结果应与首帧逐字节一致。
@@ -205,6 +215,13 @@ fn run() -> Result<(), String> {
     println!("event path: GfxHost sync (Vm::take_events drained for stats only)");
     println!("entry: SYSTEM_START; record_events=false");
     println!("frames ticked: {} (selected tick {tick})", ticks);
+    println!(
+        "stop rule: {} (limit {limit})",
+        match forced_tick {
+            Some(t) => format!("forced tick {t} (YURIS_FIRST_FRAME_TICK)"),
+            None => "first frame with a drawable screen op".to_string(),
+        }
+    );
     println!(
         "frame: {} viewport: {}x{}",
         frame.frame, frame.viewport.width, frame.viewport.height
@@ -271,8 +288,8 @@ fn run() -> Result<(), String> {
         stats.bind_groups_created
     );
     println!(
-        "frame bytes: vertices={} readback={} elapsed={:.3} ms deterministic={}",
-        stats.vertex_bytes, stats.readback_bytes, elapsed_ms, deterministic
+        "frame bytes: vertices={} readback={} elapsed={:.3} ms deterministic={} all_black={}",
+        stats.vertex_bytes, stats.readback_bytes, elapsed_ms, deterministic, all_black
     );
     println!(
         "events: drained={} dropped={}",
@@ -298,6 +315,7 @@ fn run() -> Result<(), String> {
         stats,
         elapsed_ms,
         deterministic,
+        all_black,
         &png_path,
         check.as_ref(),
     )?;
@@ -419,6 +437,7 @@ fn write_report(
     stats: &yu_backend_wgpu::GpuStats,
     elapsed_ms: f64,
     deterministic: bool,
+    all_black: bool,
     png_path: &Path,
     check: Option<&DisplayCheck>,
 ) -> Result<(), String> {
@@ -438,6 +457,7 @@ fn write_report(
     ));
     out.push_str(&format!("  \"elapsed_ms\": {:.3},\n", elapsed_ms));
     out.push_str(&format!("  \"deterministic\": {},\n", deterministic));
+    out.push_str(&format!("  \"all_black\": {},\n", all_black));
     out.push_str(&format!(
         "  \"counts\": {{\"passes\": {}, \"layers\": {}, \"ops_total\": {}, \"ops_drawn\": {}, \"skipped\": {}, \"offscreen_passes\": {}}},\n",
         report.passes,

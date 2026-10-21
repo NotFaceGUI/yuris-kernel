@@ -54,10 +54,12 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::result_large_err)]
 
+pub mod imageop;
 pub mod png;
 pub mod render;
 pub mod texture;
 
+pub use imageop::apply_rect_paint;
 pub use render::{
     frame_has_drawable_output, RenderOutput, RenderReport, SkippedOp, SoftRenderer, Surface,
 };
