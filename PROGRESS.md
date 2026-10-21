@@ -2320,3 +2320,508 @@ Finished `dev` profile [unoptimized + debuginfo]
   `loose_files=0 / ypf=true`;frame 3 census 不变(272 层 / 15 pass / 44 op);
   13 张纹理全部从包内解码;PNG 785,127 字节,二次渲染 `deterministic=true`;
   `events drained=578426 dropped=0`。
+
+## 成果 M1 (2026-10-21) · 覆盖普查(600 固定时钟帧)与台账矩阵
+
+> 范围 `crates/yu-rt/**`。零 git 写操作;未改 yu-gfx / yu-backend-* /
+> yu-font / yu-trace / yu-vfs / yu-format / tools。
+
+### 1. 新增普查工具
+
+- `examples/coverage_census.rs`:
+  - 数据入口 `data.ypf` 优先、散盘 `data/` 为备;语料指纹 FNV-1a64;
+  - `SYSTEM_START` boot 后 `tick_at(f*16)` 跑 600 次 = **602 逻辑帧**;
+  - 逐命令触发数、处理器类别、域事件参数组合样本(≤16/命令)、
+    诊断按 `(code, 命令, 脚本:pc)` 归因、事件种类、每帧命令数;
+  - `record_events=false`(频度不依赖事件流,避免 130 万事件帧挤爆队列)。
+- `Vm::command_hits()` / `Vm::handler_kind()`(加法式 API):逐 opcode 命中
+  计数**不受 `record_events` 影响**;`HandlerKind` 从 `vm` 再导出。
+- `examples/extract_ypf.rs`:把 `data.ypf` 的 `ysbin/` 导出成散盘,供只认
+  `YURIS_SAMPLE_ERIS_YSBIN` 的真实语料测试使用(测试输入仍来自封包)。
+- `dump_yscm.rs` 的数据入口改为 `data.ypf` 优先(与 AGENTS §2 对齐)。
+
+### 2. 普查结果(可复现)
+
+```text
+corpus: data.ypf (31,501,753 bytes), FNV-1a64 = 64d15de36b4fff30
+static: 136 个 yst / 36,974 组 / 80,102 窗口
+run:    tick 0..600, 602 逻辑帧, 首个可见帧 tick 0, 命令 7,046,350 次, 事件丢弃 0
+text:   0 条 / 0 字节(600 帧内未进入文本事件路径)
+```
+
+- 运行期 Top(命令/次数):`LET` 1,725,119、`IF` 1,394,044、`IFEND`
+  1,388,986、`LOOPEND` 1,075,308、`INT` 533,337、`GOSUB`/`RETURN`
+  171,624、`CG` 80,620、`VARACT` 63,105、`STR` 36,342、`VARINFO` 36,152。
+- 运行期未实现 Top:`CG` 80,620、`SOUNDINFO` 7,200、`CGEND` 5,713、
+  `CGINFO` 1,598、`FILEINFO` 1,136、`CGACT` 631、`SOUND` 531、
+  `WINDOWINFO` 129、`SAVE` 16、`EMOTE` 12、`WINDOW` 9、
+  `SYSTEM` 6、`FONT` 5、`FILEACT`/`SAVEEND`/`FONTINFO` 3、`LET` 2。
+- 最大单点缺口:`es_scenario.yst:231` 每帧 `IF[@_WINDOW_EXEC_CAPTION]`
+  = 600 次;手册无页(三层缺①)⇒ 保持挂号。
+- 复现:数据段在四次运行(含最终冻结代码)中逐字节一致;加入“首个可见帧”
+  指标后的最终版本再跑两次,输出逐字节一致,sha256
+  `4b58dba7f1e56ee539ff03477aec4598f5780b186e13d505c1451aa306b27450`。
+
+### 3. 台账
+
+- 新建 `crates/yu-rt/docs/coverage-matrix.md`(220 行):119 条命令全量矩阵,
+  固定列 `命令名 | 域 | 语料频度 | 手册页 | REA 锚点 | 状态 | 决策`;
+  手册页由 0.495 HTML 索引机械提取;REA 锚点 = `DAT_007ace20[opcode]`
+  (0.495 `FUN_0045cf90` 的逐槽写入,92 个覆盖 + 默认 `0x459e90`)。
+- 与 `docs/command-provenance.md` 交叉核对并回写 TEXT / TEXTINFO / `_` /
+  WORD / RETURNCODE / `_TEXT_FLAG` 六行;勘误与静态/运行频度口径写进矩阵 §4。
+
+## 成果 M2 (2026-10-21) · 按证据实现文本语义 top 项
+
+> 台账:`COV-M-01..04`(矩阵 §6)。所有语义先有三层出处再写代码;
+> 未取证路径继续保持 `Unimplemented`。
+
+### 1. COV-M-01 · `_TEXT_FLAG` 读取(控制字节流)
+
+- 证据:REA 0.495 `0x446b93`(字符串系统变量取值):id `0x7a` `_TEXT`
+  → `[state+0x38]`,id `0x7b` `_TEXT_FLAG` → `[state+0x3c]`。
+- 实现:`src/text.rs::TextState`;`sysvar.rs` 的 `_TEXT_FLAG` 返回与
+  `_TEXT` 并行的控制字节流。
+- 字节表(已取证):`'1'` 半角、`'2'` 全角、`'R'` 改行、`'P'` 改页、
+  `'r'` 点击+改行、`'p'` 点击+改页、`'C'` 点击、`'E'` 行尾。
+- 效果:600 帧里 LET 的运行时未实现从 **122 次降到 2 次**(剩
+  `_SAVE_PATH` 宿主注入 1 次 + `_TEXT_FLAG` 写入 1 次)。
+
+### 2. COV-M-02 · `TEXT` 属性 / 输出模式 / 行尾节奏 + `TEXTINFO`
+
+- `TEXT`(REA `0x453448`):`OUTPUTMODE`(0=手动/非 0=自动,默认 1)、
+  `WAIT`、`CLICKBUTTON1..4` / `SKIPBUTTON1..4`(`0`→哨兵 `0x3ff`)、
+  `RETURN/PAGE/CLICKRETURN/CLICKPAGE/CLICK` 的控制标志、`CLEAR=1` 清空、
+  `AUTORETURN/AUTOPAGE/AUTOCLICK`;**处理次序照引擎**:`CLICK` 先处理,
+  自动模式下追加 `'C'` 后返回 -1 = 本任务本 vsync 让出,手动模式继续。
+- `RETURNCODE`(REA `0x44c390`):自动模式按 AUTOCLICK/AUTORETURN/AUTOPAGE
+  追加 `C/R/P`,最后恒追加 `E`;手动模式置清屏请求后追加 `E`;仍为
+  `TextYield`。
+- `TEXTINFO`(REA `0x4538cc`):按**参数是否出现**查询
+  OUTPUTMODE/CX/CY/CLICK/AUTORETURN/AUTOPAGE/AUTOCLICK,写 `LET` 目标;
+  `ID`/`SET` 槽引擎不读。
+- 契约(加法式):`Vm::text_flags()`、`Vm::text_state() -> TextSnapshot`、
+  `Vm::set_text_cursor()`、`Vm::set_text_click()`(CX/CY/CLICK 在引擎里由
+  显示例程更新,内核不绘制,故由宿主推入)。**未改任何 VmEvent 字段含义,
+  未新增事件变体**。
+
+### 3. COV-M-03 · `WORD`/`_` 的逐字符宽度标志
+
+- 证据:REA `0x458d44`(`WORD`)与 `0x4567c0`(`_`):文本字节进 `+0x38`,
+  每字符一个标志进 `+0x3c`;CP932 首字节写 `'2'`,否则 `'1'`。
+- 实现:`TextState::append_text`;`WORD`/`_` 的 `VmEvent::Text` 字段不变。
+
+### 4. COV-M-04 · 域事件参数名视图 + 接口文档
+
+- `VmEvent::domain_args(&yscm)` + `DomainArg`:把 `DomainCall` 的槽号按工程
+  `ysc.ybn` 映射成参数名(槽号不跨版本稳定)。SOUND/SAVE/FILE 的槽名、
+  手册值域、语料实测样本写入 `docs/domain-event-contracts.md`。
+- 仍挂:变量引用身份(`SAVE[SET]/LOAD[LET]/FILEINFO[LET]`)未进事件,
+  `DomainCall` 无 script/pc;两者需跨 crate 契约变更(DIV-RT-042)。
+
+### 5. 回归(原始结果)
+
+```text
+$ cargo test -p yu-rt --lib
+44 passed; 0 failed
+
+$ cargo test -p yu-rt --test fixture
+47 passed; 0 failed
+  (+ text_flags_track_cp932_width_and_returncode_auto_defaults
+   + text_outputmode_manual_click_continues_and_auto_click_yields
+   + textinfo_queries_text_state_by_parameter_presence
+   + text_flag_sysvar_reads_the_control_stream
+   + domain_args_map_slots_through_project_yscm)
+
+$ YURIS_REQUIRE_SAMPLES=1 \
+  YURIS_SAMPLE_ERIS_YSBIN=$TEMP/eris-loose/data/ysbin \
+  cargo test -p yu-rt --test corpus --test corpus_golden --test consistency
+consistency: 4 passed
+corpus:      9 passed (87.28s; loose vs packed 等价仍通过)
+corpus_golden: 4 passed
+
+$ cargo clippy -p yu-rt --lib
+5 warnings(与基线一致;M-2 新增文件 0 条)
+$ cargo clippy -p yu-rt --all-targets
+17 warnings(全部为既有 examples/tests 告警;M-2 文件 0 条)
+$ grep -rn "println!\|eprintln!\|dbg!" crates/yu-rt/src
+0
+```
+
+- 语料测试的散盘输入由 `extract_ypf` 从同一 `data.ypf` 导出,不是第二份语料。
+- 回归金丝雀 `corpus::eris_entry_chain_runs_end_to_end` 第 2 帧:
+  `274,466 → 272,296`。原因写在该测试注释里:①`_TEXT_FLAG` 读取不再挂号;
+  ②`TEXT[CLICK=1]` 自动模式按引擎返回 -1 让出,后续命令推迟到下一帧。
+  两次修正都有 REA 地址级证据,不是漂移。
+
+### 6. 未完成 / 挂账
+
+- `_WINDOW_EXEC_CAPTION` 600/600:手册无页,继续保持 `Unimplemented`
+  (DIV-RT-007 已补频度与 REA 读点)。
+- `_TEXT_FLAG` **写入**(语料 1 次):写路径未定位,保持挂号(DIV-RT-032)。
+- `_TEXT_NUM`:手册无页;引擎读装载期全局 `0x80174c`,不是文本计数。
+- `DomainCall` 的变量引用身份 + script/pc(DIV-RT-042)。
+- `VmEvent::Text.id` 非 UTF-8 CP932(DIV-GFX-021):需改事件字段类型,
+  跨 crate 契约变更,本轮不动。
+
+---
+
+## 成果 J1 · 首帧保真 Phase 0/A/B + COPY 取证(任务 J)
+
+> 2026-10-21。范围:**取证 + soft alpha + RECTPAINT 族**。COPY/COPY2 只做到
+> 证据与设计提案,**未改契约、未实现**。台账 = `docs/fidelity-ledger-j.md`
+> (EVID-J-01..14);每个语义点四件套见台账原文。
+
+### 1. 交付物
+
+| 项 | 文件/产物 |
+|---|---|
+| 台账 | `docs/fidelity-ledger-j.md`(四件套 + 阈值 + 统计) |
+| Phase 0 官方 title | `target/tmp/fidelity-ref/frame_0001..0006.png`、`official_screen.jsonl`、`manifest.json`(6 帧逐像素相同,800×600) |
+| Phase 0 微场景 | `target/tmp/fidelity-micro4/`(RECTPAINT/2/3/区域/alpha)、`micro5`(组 RT)、`micro6h`(COPY2 时序);源 `data/script/micro.yst` + YSCom 0.495 编译 |
+| Phase A | `crates/yu-backend-soft/src/render.rs` alpha 源项 `a²`;单测;soft README;wgpu README 差异账本 |
+| Phase B | `crates/yu-gfx/src/state.rs` RECTPAINT 前置检查;`crates/yu-backend-soft/src/imageop.rs`;soft/wgpu 执行路径;gfx/soft/wgpu 测试 |
+| Phase C | 证据:`fidelity-micro6h`;设计提案:`docs/render-parity.md` §8 + 台账 §3.1;**未动 `Op::Copy`/契约** |
+| 文档 | `docs/render-parity.md`、`docs/gfx-unimplemented-todo.md`、`crates/yu-gfx/docs/divergences/README.md`(DIV-GFX-008/013/041/042)、两份后端 README |
+
+### 2. 台账统计
+
+| 范围 | Confirmed | Refuted | Uncertain |
+|---|---:|---:|---:|
+| A(alpha) | 2 | 0 | 0 |
+| B(RECTPAINT 族) | 6 | 0 | 1(EVID-J-06 `+0x86`) |
+| C(COPY/COPY2) | 2 | 1(EVID-J-11 旧线时序) | 2(EVID-J-12/13 机制) |
+
+关键结论:
+- **EVID-J-01**:D3D9 未开 `SEPARATEALPHABLENDENABLE` 时 alpha 源项 = `a²`;
+  `FUN_00414ba4` 0x13/0x14/0xab 状态序列 + `d3d9types.h` + 微场景。
+- **EVID-J-02..05**:RECTPAINT 填 RGB 并把 alpha 置 0xFF;RECTPAINT2 只填
+  alpha;RECTPAINT3 填 `0xAARRGGBB`;区域含端点。处理体
+  `FUN_0043185c` 模式 1/2/3。
+- **EVID-J-08**(新增):官方主组 `W0` 子层直接画到屏幕;子组离屏 alpha
+  不参与父级合成(K1 `(16,160,48)` vs G/K2 `(0,128,0)`)。挂
+  DIV-GFX-008/041,**未改契约**。
+- **EVID-J-11**(勘误):旧线 `last_rendered_frame` 被受控微场景 **Refuted**
+  (group 源 `COPY2` 取命令执行时当前状态);`Op::Copy` 暂不动。
+
+### 3. skipped 前后对照(ERIS 首个可绘制显示状态)
+
+当前 HEAD 的该帧(tick 1)是 18 op;历史 golden(`771cf79`)是 44 op。两者
+都列出,不把历史值当现状。
+
+| 计数 | 历史 44-op 锚点 | 当前 18-op 锚点 |
+|---|---:|---:|
+| ops_total | 44 | 18 |
+| executable/drawn 前 | 15 | 3 |
+| executable/drawn 后 | **25** | **13** |
+| skipped 前 | 29 | 15 |
+| skipped 后 | **19** | **5** |
+
+当前帧的 5 个跳过:`copy :/W0/CGS100` ×1、`image :/W0/CGS100` ×1、
+`layer copy` ×2、`layer image(CGS100)` ×1。10 个 RECTPAINT 从
+`gfx.imageop.unsupported` 转为 `Executable`;`CGS100` 因目标是 `Snapshot(271)`
+保持 `gfx.imageop.copy_source.unsupported`(等 COPY)。
+
+### 4. 量化验收
+
+**Phase A(soft vs wgpu,同帧半透明):**
+
+```text
+semi-transparent parity: diff_pixels=0/16 max_channel_diff=0
+```
+
+**Phase B(官方 micro4 vs 内核 micro4,按台账 §2.4 区域):**
+
+| 区域 | 最大通道差 | >4 像素 | 结论 |
+|---|---:|---:|---|
+| R1 内部 | 0 | 0 | PASS |
+| R3 内部 | 0 | 0 | PASS |
+| R5 内部 | 0 | 0 | PASS |
+| R6 填充内部 | 0 | 0 | PASS |
+| R2/R4(排除) | 48 | 10000/10000 | 归 EVID-J-08 |
+| 1px 顶边(排除) | 74/53/74/85 | 每矩形 100 | 归 DIV-GFX-042 |
+
+**Phase B 双后端(同一 micro4 CompositorFrame):**
+
+```text
+rectpaint parity: diff_pixels=0/32 max_channel_diff=0
+soft vs wgpu(micro4 full frame): diff_pixels=0/480000 max_channel_diff=0
+micro4 counts(两后端): 11 passes, 17 ops, 17 drawn, 0 skipped
+RenderReport: 逐字段相等(wgpu 测试 assert_eq!(report, report))
+```
+
+**首屏 image op:** executable 0 → 10(SPLDST/SPLDST2/FONTL2..9);
+`CGS100` 仍挂账。
+
+### 5. 验证命令与原始输出
+
+```text
+$ cargo test -p yu-backend-soft
+14 passed; 7 passed; 1 passed; 0 failed
+
+$ cargo test -p yu-backend-wgpu
+6 passed; 9 passed; 1 passed; 0 failed
+rectpaint parity: diff_pixels=0/32 max_channel_diff=0
+semi-transparent parity: diff_pixels=0/16 max_channel_diff=0
+
+$ cargo test -p yu-gfx
+10 passed; 5 passed; 10 passed; 1 passed
+eris_first_screen_display_list FAILED: visible left=8 right=34
+eris_first_screen_with_synchronous_info_queries FAILED: visible left=8 right=34
+```
+
+```text
+$ YURIS_SAMPLE_ERIS_ROOT=<project-eris> cargo run -p yu-backend-soft --example first_frame
+frame: 3 viewport: 800x600
+layers: 272 (visible 8), passes: 15, offscreen passes: 2
+ops: 18 total, 13 drawn, 5 skipped
+png: target/tmp/first_frame.png (540267 bytes) deterministic=true
+
+$ YURIS_SAMPLE_ERIS_ROOT=<project-eris> cargo run -p yu-backend-wgpu --example first_frame
+ops: 18 total, 13 drawn, 5 skipped
+display check: OK (passes 15 ops 18 executable 13 skipped 5)
+frame bytes: ... deterministic=true all_black=true
+warning: 首帧全黑(当前 boot 锚点未到 title/仅清屏);这不是 1:1 证据
+```
+
+```text
+$ YURIS_SAMPLE_ERIS_ROOT=target/tmp/fidelity-micro4 \
+  YURIS_FIRST_FRAME_TICK=5 cargo run -p yu-backend-soft --example first_frame
+frame: 6, layers 8 (visible 8), passes 11, ops 17, 17 drawn, 0 skipped
+png: target/tmp/fidelity-micro4-kernel-soft.png (1920813 bytes)
+
+同参数 wgpu: display check OK (passes 11 ops 17 executable 17 skipped 0),
+all_black=false, png 1920813 bytes;
+soft vs wgpu: diff_pixels=0/480000 max_channel_diff=0。
+```
+
+```text
+$ cargo clippy -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu --all-targets
+本三项 0 新增告警(yu-rt 5 条既有 warning)
+
+$ grep -rn "println!\|eprintln!\|dbg!" crates/yu-gfx/src crates/yu-backend-soft/src crates/yu-backend-wgpu/src
+0
+```
+
+> **命令陷阱**:soft 与 wgpu 的示例都叫 `first_frame`,Cargo 的
+> `target/debug/examples/first_frame.exe` 会互相覆盖;按 `-p` 运行前
+> 需 `touch` 目标 crate 的示例源(或给两个包用不同 `CARGO_TARGET_DIR`)。
+> 本次验证用 `touch` 强制重建各自二进制。
+
+### 6. 遗留挂账 / 阻塞
+
+1. **ERIS boot→title 未达成(跨 crate 阻塞,未修)**:当前 HEAD 在 tick 1
+   只有 8 visible / 18 op,屏幕全黑;历史 golden 的 34 visible / 44 op 来自
+   `771cf79`,最新 `yu-rt` 的 YSVR/GOSUB 修复改变了启动路径。
+   `cargo test -p yu-gfx` 的两条 golden 因 `visible 8 vs 34` 失败。
+   任务 J 禁止修改 `yu-rt`;未用 `UPDATE_GFX_GOLDEN=1` 掩盖,保留失败并
+   在此报告。**在 yu-rt boot 恢复到 title 前,官方 title 与内核的逐像素
+   对拍无法进行**。
+2. **COPY/COPY2**:EVID-J-10/11/14 已取证(含旧线时序 Refuted),
+   EVID-J-12/13 仍 Uncertain;`Op::Copy`/`TextureRef::Snapshot`/后端表面
+   缓存未改。设计提案见 `docs/render-parity.md` §8;契约改动需主人确认。
+3. **组 RT**:EVID-J-08 行为已确认(主组直绘、子组 RT alpha 不参与合成),
+   修正会改变所有半透明层;挂 DIV-GFX-008/041,需主人确认契约。
+4. **1px 半像素边界**:DIV-GFX-042;RECTPAINT 区域内部已一致。
+5. `+0x86`(RECTPAINT2/3 的 alpha 标志)未建模(EVID-J-06)。
+6. `SIZE/SIZE2/ROTATION/RESIZE/TRIM/MONO/BLUR/...` 仍 Unimplemented;
+   `CGS100` 的 RECTPAINT2 等 COPY。
+7. 示例二进制同名覆盖问题(见上),未改 Cargo 结构。
+
+## 成果 L1 (2026-10-21) · 官方事件级 L1：error 299 根因、泵验证、事件 trace 与对拍
+
+> 任务书 `L`。只改 `tools/official_trace/**` 与 `crates/yu-trace` 的加法式扩展
+> （新增 example + 顺序投影 API/单测）；未改 `yu-rt`/`yu-gfx`/`yu-backend-*`/字体；
+> 无 git 写操作。本节取代 H1 中“官方事件级 L1 未达成”的挂账；顶部总表未改，
+> 以本节为准。
+
+### 1. error 299 根因（Phase L-1，GL-1）
+
+先复核任务书给定事实：官方 exe sha256 `4f5eefa3…`、PE32、ImageBase `0x400000`、
+无重定位目录、`DllCharacteristics=0`；REA 复核 `0x4044db` 确为
+`ff 14 b9`（`call dword ptr [ecx+edi*4]`，位于 `0x404398`），`0x404398` 为任务
+步进函数入口。
+
+假设表与最小实验结果（原始 JSON 在 `target/tmp/l1-probe/l1_experiments_*.json`）：
+
+| 假设 | 实验 | 终态 |
+|---|---|---|
+| H1 句柄权限 | 调试句柄 / `VM_READ` / `VM_READ|VM_WRITE|VM_OPERATION` / `ALL_ACCESS` 各读 `0x4044db` | **证伪**：四种句柄都成功读到 `ff14b9`；只有写需要 `VM_WRITE` |
+| H2 时机 | 创建瞬间 / +1s / +3s / +6s 各读 | **证伪**：正确地址全阶段可读；`0x0/0x1000` 的 299 只是未映射 |
+| H3 附加方式 | `DEBUG_ONLY_THIS_PROCESS` / 普通启动外部读 / `DebugActiveProcess` | **证伪**：三种方式都读成功 |
+| H4 反调试 | REA 查 `IsDebuggerPresent`/`CheckRemoteDebuggerPresent`/`NtQueryInformationProcess`；运行时读 32 位 PEB / DebugPort / DebugObjectHandle | **无证据**：无相关导入；debugged 时 `BeingDebugged=1` 但引擎正常运行；未做任何绕过 |
+| H5 地址/重定位 | PE 头 + 实际模块基址 | **成立**：base=`0x400000`，无重定位/ASLR |
+
+**根因**：旧探针把 `--bp-rva 0x44db` 直接当绝对地址，实际落在 `0x44db`（未映射）；
+正确地址是 `base + RVA = 0x4044db`。`ReadProcessMemory(0x44db)` → error 299，
+`WriteProcessMemory(0x44db)` → 998，断点从未落下。旧日志里成功读之后的
+`err 299` 是**未清零的陈旧 GetLastError**。修复：统一 `base + RVA`，每次 API
+调用前 `SetLastError(0)`、`use_last_error=True`；并按任务书删除了旧版本的
+PEB 反调试清零（不做绕过）。
+
+### 2. 泵验证（Phase L-2，GL-2）
+
+在 `0x404398` 下断点：标题启动后 **t≈0.68 s 首次命中**，`EAX` 为任务对象；
+命中覆盖 script 8/10/12/20（随后 0/5/20/52/60/66/70/71/72）。泵在跑。
+
+分派实测走 `0x404547`（`0x8015b0 != 0` 的分支），`0x4044db` 是另一条分支；
+探针同时挂两点。命中记录：`EDI`=pc、`[0x80171c]`=当前任务、
+`task+0x3c`=script、`[ECX+EDI*4]`=handler。
+
+### 3. 事件级采集（Phase L-3）
+
+工具 `tools/official_trace/probe_dispatch.py` 现支持：
+
+- 两个分派点（`0x44db`/`0x4547`）与全局 handler 表 `0x7ace20`（119 项，
+  运行时 87 unique；共享组 `0x459e90`=27 槽、`0x4634d8`=7 槽）；
+- handler→opcode→`ysc.ybn` 命令名；共享 handler 的 `cmd/name` **显式留空**；
+- 引擎 tick `[0x801268]` 写入 trace 的 `frame`；
+- 自动输入（`sendinput`，前台校验/按住到 tick 前进再松开）与**手动触发**
+  `--trigger-rva 0x5ab63`（有效 UI 点击后才挂分派断点，标题不卡）；
+- schema v3 `sub=vm/kind=command`，`args=[]`（官方参数不可观测，不伪造）。
+
+采集样本（`target/tmp/l1-probe/`，不入库）：
+
+| 项 | 值 |
+|---|---|
+| 语料 | `<project-eris>/data.ypf`，sha256 `5744a7be…` |
+| `ysc.ybn` | 11156 B，sha256 `741d4caf…`，119 命令；与官方解包副本逐字节一致 |
+| 点击后官方事件 trace | 101,580 条命中，tick 299–308；`run_click2/official_events_debug.jsonl`（header 的 `debug_mode=true` 由窗口标题证据重生成） |
+| 内核同语料 trace | `kernel_events_debug12.jsonl`：876,096 条记录 / 632,805 条命令，frame 4–11（`--debug-mode true`） |
+
+**debug_mode 事实**：官方窗口标题 `GetWindowTextA` 原始字节
+`81 79 83 66 83 6f 83 62 83 4f …`，CP932 解码 = **【デバッグモード】**；
+`save/data/config/projectconfig.txt` 的 `DEBUGMODE=0` 不是运行期实际值。
+探针默认 `--debug-mode true` 并记录证据。
+
+### 4. 对拍（`diff_aligned` 顺序投影）
+
+`crates/yu-trace` 加法扩展：
+
+- `TraceLog::sequence_projection` / `TraceLog::command_sequence_projection`
+  （header 保留，指定 script 的 `vm/command` 保留，`frame=0`、`seq` 重编号；
+  显式比较投影，不改原日志/schema）；
+- `diff_traces --order-only --script 60`：默认只比较 `script/pc/name`；
+- 单测 `sequence_projection_collapses_frame_and_filters_script`。
+
+对拍命令与原始结果：
+
+```text
+$ cargo run -q -p yu-trace --example diff_traces -- \
+    --expected target/tmp/l1-probe/run_click2/official_events_debug.jsonl \
+    --actual target/tmp/l1-probe/kernel_events_debug12.jsonl \
+    --mode cross --header codec-sample --order-only --script 60 --context 5
+
+order-only projection: expected 4681 commands, actual 1932 commands (script=Some(60))
+DIVERGENCE code=trace.diff
+key=vm/command frame=0 ordinal=966
+path=/payload/pc
+expected=1414
+actual=820
+```
+
+- **script 60 前 966 条 `(script,pc,name)` 与官方逐条一致**；
+- 首个分歧在 script 60 `RETURN`(pc975) 之后的**调用点**：官方为 script 58 的
+  场景调用（入口 pc1414），内核为 script 20 的菜单调用（入口 pc820）；
+  两边处于不同任务相位，不是 script 60 体内命令差异 → `DIV-L-002`（open）。
+- `debug_mode=false` 时首分歧更早（ordinal 643），根因是内核启动配置：
+  script 20 pc237 `IF[@11 >= @2240]` 官方为真（`GOSUB es.DebugTask`），
+  内核默认 release 为假；`debug_mode=true` 后内核同样为真并走 pc238
+  → `DIV-L-001`（fixed，运行期注入配置，不改内核代码）。
+
+### 5. 验证
+
+```text
+$ cargo test -p yu-trace   # YURIS_REQUIRE_SAMPLES=1 + YURIS_SAMPLE_ERIS_YPF
+lib 测试(含新增顺序投影单测)全绿; diff 13; equivalence 7; event_trace 14;
+golden 2; real_sample 2 (136.44s); roundtrip 7; 0 failed
+```
+
+```text
+$ python tools/official_trace/probe_dispatch.py --exe <官方 exe> --cwd <工程根> \
+    --ysc <ysc.ybn> --out-dir target/tmp/official/events \
+    --seconds 20 --arm-after 6.5 --trace-out .../official_events.jsonl
+armed 0x4044db ff / armed 0x404547 ff
+dispatch table 0x7ace20 unique 87
+hit 0 tick 286 s 5 pc 33 cmd 49 IFEND
+...
+wrote .../official_events.jsonl
+```
+
+### 6. 挂账/限制
+
+1. 官方 `args` 不可观测，trace 里为 `[]`；共享 handler 名称留空。
+2. 官方任务/`WAIT`/跳转事件尚未采集；`DIV-L-002` 需要任务级对齐才能继续。
+3. 官方 tick 与内核逻辑帧未证明同钟；当前只做命令顺序对拍。
+4. 点击转场起点依赖手动触发或前台可控的自动输入；`run_click2` 已错过转场开头
+   约 15 tick（`DIV-L-002`）。
+5. 断点会话内不能安全截图（PrintWindow 等待被挂起 UI 线程而死锁）；屏幕级仍用
+   `capture_screen.py`。
+6. `DIV-H-001` 的“官方首屏 vs 内核首帧”仍按撤回处理，不作结论。
+
+## 成果 P0 (2026-10-21) · 真实文本路径验证与输入计数器修正
+
+> 范围 `crates/yu-rt/**`。零 git 写操作;未改其他 crate。
+
+### 1. 工具
+
+- 新增 `examples/text_scenario.rs`:输入时间线(周期点击/释放)+ 文本事件统计;
+  支持 `YURIS_ENTRY_LABEL` 直接以真实语料标签 boot,可 dump 指定帧的
+  脚本/命令/参数/任务/诊断。
+- 全量 `SYSTEM_START` 600 tick + 每 20 tick 点击:**0 条 Text**;
+  `es.ScenarioScript` 在 tick 126 被 `TASK[E=0]` 暂停,标题/UI 依赖
+  `GraphicsHost`/`WINDOW`/`MOUSE`,未进入文本。这是宿主缺口(P2),不是
+  文本语义缺口。
+- 直接以真实语料标签 boot(绕过标题/宿主 UI)验证文本:
+  - `SCENARIO_EPILOGUE`(s129,30 tick):`Text` 1 条 / 12 字节,
+    `ReturnCode` 1 条,`_TEXT_FLAG` = `222222CRPE`(6 个全角 + 自动行尾);
+  - `RP_101`(s133,120 tick,每 10 tick 点击):`Text` 10 条 / 132 字节,
+    `ReturnCode` 10 条,flags 106 字节;10 行逐行推进,第 99 tick 主线正常结束;
+    每行标志 = `'2'*n + C/R/P/E`;输出模式 1,AUTORETURN/AUTOPAGE/AUTOCLICK=1。
+  - 文本内容(CP932)逐行核对:`回想シーン１スタート`、`あいうえお`、
+    `かきくけこ`、`さしすせそ`、`回想シーン１終了`、`回想シーン２スタート`、
+    `ＡＢＣＤＥ`、`ＦＧＨＩＪ`、`ＫＬＭＮＯ`、`回想シーン２終了`。
+
+### 2. 发现并修复的输入 bug(COV-P0-01)
+
+- 松开后计数器逐帧递减;重新按下时旧实现 `+= 1`,长期未按后一次短按
+  从 `-N` 加到 `-N+1`,永远到不了正值 ⇒ 第二次点击无法推进文本。
+  手册「押された瞬間から 1 → 2 → 3」⇒ 按下沿重置为 1。
+- `text_advance_requested` 原检查 `ENTER`/`CTRL`,计数器键名却是
+  `KEY_ENTER`/`KEY_CTRL` ⇒ ENTER/CTRL 从未生效(只有 MOUSE_L 生效)。
+- 回归:`input::tests::repress_after_release_restarts_at_one`、
+  `text_advance_buttons_use_binding_names`;fixture 的文本推进测试
+  增加到第三行,验证长期松开后的第二次点击。
+
+### 3. P0 验收
+
+```text
+cargo test -p yu-rt --lib --test fixture
+lib:     47 passed
+fixture: 47 passed
+cargo test -p yu-rt --test corpus   10 passed(新增真实文本回归)
+  - eris_real_scenario_text_path_emits_expected_flags:
+    RP_101 → 10 Text / 10 ReturnCode / flags 106;首行 CP932 原样;
+    首行 10 个 '2' + CRPE,末行 CRPE;120 帧内结束
+cargo clippy -p yu-rt --lib   5 warnings(基线不变)
+```
+
+## 成果 P1 (2026-10-21) · `_WINDOW_EXEC_CAPTION` 有界取证(仍挂账)
+
+- **手册**:0.479/0.495 全部 HTML 按字节搜索无 `_WINDOW_EXEC_CAPTION`;
+  older SDK 0.292/0.466 也无。只有 `_WINDOW_EXEC_MAX/CLOSE` 有页 ⇒ 三层缺①。
+- **语料语义**(`es_Scenario.yst`):与 `@_MENUCODE==30001` 并列的
+  `IF[@_WINDOW_EXEC_CAPTION==1]` → 写回 0 → `WINDOW[NO=0 WSX=… WSY=…]`;
+  注释掉的旧路径是 `WINDOW[NO=0 MAXIMIZE=1]`。即「窗口尺寸再初始化」的
+  一次性宿主事件标志,不是 VM 可计算状态。
+- **REA**(0.495,sha256 `4f5eefa3…`):
+  - 读 `0x427704`(int getter case 0x78 → `[0x801924]`);
+  - 脚本写 `0x446f70`(`MOV byte [0x801924], DL`);
+  - 引擎写 `WM_SYSCOMMAND(0xA3)` 路径 `FUN_0045a9d0`(`0x45a9d0`);
+    `0x45a9e7` 写 `[0x801924] = (char)*ecx + 1`,条件
+    `[0x801338]==1` 且 `[0x8015e0]==0`;否则置 `[0x801504]=1` 返回 0。
+  - `*ecx` 来源与两个条件全局仍未取证,不足以定义完整行为。
+- **决策**:保持 `Unimplemented`(DIV-RT-007 已补);若放宽门禁,正确形态是
+  宿主 setter(同 `_WINDOW_EXEC_MAX/CLOSE`),不在 VM 猜 0/1 状态机。
+- 矩阵 §3/§7 与 DIV-RT-007 已同步。
+

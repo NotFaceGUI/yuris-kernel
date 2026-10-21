@@ -14,7 +14,8 @@
 use std::process::ExitCode;
 
 use yu_trace::{
-    diff_aligned, error, AlignedDiffOptions, DiffFailure, HeaderCompare, Kind, Projection, Sub,
+    diff_aligned, diff_aligned_logs, error, AlignedDiffOptions, DiffFailure, HeaderCompare, Kind,
+    Projection, Sub, TraceLog,
 };
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -124,8 +125,47 @@ fn main() -> ExitCode {
     if let Some(context) = arg(&args, "--context") {
         options.context = context.parse::<usize>().expect("--context must be usize");
     }
+    let order_only = args.iter().any(|item| item == "--order-only");
+    let script = arg(&args, "--script").map(|text| {
+        text.parse::<u32>()
+            .unwrap_or_else(|_| panic!("--script must be u32, got {text:?}"))
+    });
+    if order_only && options.payload_fields.is_empty() {
+        // 官方 args 不可观测、内核 args 有值;顺序对拍只比较三字段。
+        options.payload_fields = ["script", "pc", "name"]
+            .iter()
+            .map(|field| field.to_string())
+            .collect();
+    }
+    let result = if order_only {
+        let expected_log = match TraceLog::parse(&expected_text) {
+            Ok(log) => log,
+            Err(diag) => {
+                eprintln!("expected trace rejected: {diag}");
+                return ExitCode::from(2);
+            }
+        };
+        let actual_log = match TraceLog::parse(&actual_text) {
+            Ok(log) => log,
+            Err(diag) => {
+                eprintln!("actual trace rejected: {diag}");
+                return ExitCode::from(2);
+            }
+        };
+        let expected_seq = expected_log.command_sequence_projection(script);
+        let actual_seq = actual_log.command_sequence_projection(script);
+        println!(
+            "order-only projection: expected {} commands, actual {} commands (script={:?})",
+            expected_seq.len().saturating_sub(1),
+            actual_seq.len().saturating_sub(1),
+            script
+        );
+        diff_aligned_logs(&expected_seq, &actual_seq, &options)
+    } else {
+        diff_aligned(&expected_text, &actual_text, &options)
+    };
 
-    match diff_aligned(&expected_text, &actual_text, &options) {
+    match result {
         Ok(()) => {
             println!("OK: zero divergence");
             ExitCode::SUCCESS

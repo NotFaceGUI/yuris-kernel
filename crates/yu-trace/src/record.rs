@@ -1123,6 +1123,43 @@ impl TraceLog {
             })
     }
 
+    /// 顺序投影:保留 header,只保留 `keep` 为真的记录,并把 `frame` 置 0、
+    /// `seq` 重编号。用于跨 producer 的**命令顺序**对拍:官方 tick 与内核
+    /// 逻辑帧不是同一时钟,帧号不能直接对齐。
+    ///
+    /// 这是显式的比较投影,不修改原日志,也不改变 schema/记录语义;
+    /// 投影后的 `frame=0` 只表示"顺序容器",不是观测到的帧号。
+    pub fn sequence_projection<F>(&self, keep: F) -> TraceLog
+    where
+        F: Fn(&Record) -> bool,
+    {
+        let mut out = TraceLog::new();
+        if let Some(header) = self.header() {
+            out.push_header(header.clone());
+        }
+        for record in &self.records {
+            if keep(record) {
+                out.push(Some(0), record.payload().clone());
+            }
+        }
+        out
+    }
+
+    /// `vm/command` 的顺序投影;`script = Some(id)` 时只保留该脚本。
+    ///
+    /// 官方事件记录与内核事件记录都使用 `sub=vm, kind=command`;官方侧
+    /// `args` 为空(参数不可观测),因此对拍时还应配合
+    /// [`crate::AlignedDiffOptions::payload_fields`] 只比较 `script/pc/name`。
+    pub fn command_sequence_projection(&self, script: Option<u32>) -> TraceLog {
+        self.sequence_projection(|record| match record.payload() {
+            Payload::VmCommand { script: s, .. } => {
+                record.kind() == Kind::VmCommand
+                    && script.is_none_or(|want| *s == want)
+            }
+            _ => false,
+        })
+    }
+
     /// 确定性 JSONL(每条记录一行,末尾换行)。
     pub fn to_jsonl(&self) -> String {
         let mut out = String::new();
@@ -2232,6 +2269,47 @@ mod tests {
         let second = parsed.to_jsonl();
         assert_eq!(first, second);
         assert_eq!(log, parsed);
+    }
+
+    #[test]
+    fn sequence_projection_collapses_frame_and_filters_script() {
+        let mut log = TraceLog::new();
+        log.push_header(header());
+        for (frame, script, pc, name) in [(3, 7u32, 1u32, "A"), (3, 8, 2, "B"), (4, 7, 3, "C")] {
+            log.push(
+                Some(frame),
+                Payload::VmCommand {
+                    script,
+                    pc,
+                    name: name.to_string(),
+                    args: Vec::new(),
+                },
+            );
+        }
+        let projected = log.command_sequence_projection(Some(7));
+        let commands: Vec<&Record> = projected
+            .records()
+            .iter()
+            .filter(|record| record.kind() == Kind::VmCommand)
+            .collect();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].seq(), 1);
+        assert_eq!(commands[0].frame(), Some(0));
+        assert_eq!(commands[1].seq(), 2);
+        match commands[0].payload() {
+            Payload::VmCommand {
+                script, pc, name, ..
+            } => {
+                assert_eq!(*script, 7);
+                assert_eq!(*pc, 1);
+                assert_eq!(name, "A");
+            }
+            other => panic!("unexpected payload {other:?}"),
+        }
+        // 原日志不被修改;投影结果本身必须仍可解析(header 在 seq 0、frame=null)。
+        assert_eq!(log.records()[1].frame(), Some(3));
+        let reparsed = TraceLog::parse(&projected.to_jsonl()).expect("projection parses");
+        assert_eq!(reparsed.len(), 3);
     }
 
     #[test]
