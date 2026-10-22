@@ -275,6 +275,8 @@ pub struct Vm {
     binding: InputBinding,
     /// 图形域同步宿主(可选;安装后负责 INFO 查询与状态同步)。
     graphics_host: Option<Box<dyn crate::event::GraphicsHost>>,
+    /// 声音域同步宿主(可选;SOUND/SOUNDEND 消费 + SOUNDINFO 查询)。
+    sound_host: Option<Box<dyn crate::event::SoundHost>>,
     events: Vec<VmEvent>,
     diags: MemorySink,
     pending_effects: Vec<Effect>,
@@ -419,6 +421,7 @@ impl Vm {
             input: InputState::new(),
             binding,
             graphics_host: None,
+            sound_host: None,
             events: Vec::new(),
             diags: MemorySink::new(),
             pending_effects: Vec::new(),
@@ -592,6 +595,18 @@ impl Vm {
     /// 取走图形宿主(便于宿主自己持有 `Rc` 状态)。
     pub fn take_graphics_host(&mut self) -> Option<Box<dyn crate::event::GraphicsHost>> {
         self.graphics_host.take()
+    }
+
+    /// 安装声音域同步宿主。安装后 `Domain::Sound` 事件同步进入宿主；
+    /// `SOUNDINFO` 通过 [`crate::event::SoundHost::query`] 取状态并写 `LET`。
+    /// **调用方不得再把同一批事件 drain 后喂给同一个宿主**。
+    pub fn set_sound_host(&mut self, host: Box<dyn crate::event::SoundHost>) {
+        self.sound_host = Some(host);
+    }
+
+    /// 取走声音宿主(便于宿主自己持有 `Rc` 状态)。
+    pub fn take_sound_host(&mut self) -> Option<Box<dyn crate::event::SoundHost>> {
+        self.sound_host.take()
     }
 
     /// 因容量上限被丢弃的最旧事件数。
@@ -830,6 +845,9 @@ impl Vm {
         self.input.advance(next_frame, timeline);
         self.frame = next_frame;
         let now = self.now_ms;
+        if let Some(host) = self.sound_host.as_mut() {
+            host.advance(now);
+        }
         let mut sched = std::mem::take(&mut self.scheduler);
         let report = sched.tick_frame(self, now);
         self.scheduler = sched;
@@ -843,6 +861,9 @@ impl Vm {
         let next_frame = self.scheduler.frame().wrapping_add(1);
         self.input.advance(next_frame, timeline);
         self.now_ms = now_ms;
+        if let Some(host) = self.sound_host.as_mut() {
+            host.advance(now_ms);
+        }
         let mut sched = std::mem::take(&mut self.scheduler);
         let report = sched.tick_frame(self, now_ms);
         self.scheduler = sched;
@@ -856,7 +877,7 @@ impl Vm {
     pub(crate) fn emit(&mut self, ev: VmEvent) {
         // 图形宿主必须**同步**看到状态事件:同一帧 `CG[...]` 之后的 `CGINFO`
         // 才能读到最新图层。仅转发宿主关心的类别,避免 Command 热路径开销。
-        let host_relevant = matches!(
+        let graphics_relevant = matches!(
             &ev,
             VmEvent::FrameStart { .. }
                 | VmEvent::FrameEnd { .. }
@@ -866,8 +887,19 @@ impl Vm {
                     ..
                 }
         );
-        if host_relevant {
+        if graphics_relevant {
             if let Some(host) = self.graphics_host.as_mut() {
+                host.apply_event(&ev);
+            }
+        }
+        let sound_relevant = matches!(
+            &ev,
+            VmEvent::FrameStart { .. }
+                | VmEvent::FrameEnd { .. }
+                | VmEvent::DomainCall { domain: crate::event::Domain::Sound, .. }
+        );
+        if sound_relevant {
+            if let Some(host) = self.sound_host.as_mut() {
                 host.apply_event(&ev);
             }
         }

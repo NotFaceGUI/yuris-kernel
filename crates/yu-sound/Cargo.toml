@@ -1,0 +1,12 @@
+[package]
+name = "yu-sound"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "YU-RIS sound domain host: SOUND / SOUNDINFO / SOUNDEND state machine"
+
+[dependencies]
+yu-rt = { path = "../yu-rt" }
+yu-log = { path = "../yu-log" }
+hound = "3"
+lewton = "0.10"

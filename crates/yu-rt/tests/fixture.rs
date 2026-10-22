@@ -2143,3 +2143,76 @@ fn callee_loop_frame_does_not_leak_into_caller() {
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert!(report.main_finished, "调用方应正常结束");
 }
+
+// ---------------------------------------------------------------- 声音域接线
+
+/// `SOUNDINFO[ID=... TIME=1 LET=@x]`：VM 持 LET 左值 → `SoundHost::query`
+/// → `write_target`。用 mock 宿主验证接线本身（不依赖 `yu-sound`）。
+#[test]
+fn soundinfo_query_writes_let_through_host() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use yu_rt::event::{ArgValue, SoundHost, VmEvent};
+
+    struct Mock {
+        seen: Rc<Cell<bool>>,
+    }
+    impl SoundHost for Mock {
+        fn apply_event(&mut self, _ev: &VmEvent) {}
+        fn query(&mut self, command: &str, args: &[ArgValue]) -> Result<Value, yu_log::Diag> {
+            assert_eq!(command, "SOUNDINFO");
+            let names: Vec<u8> = args.iter().map(|a| a.slot).collect();
+            assert_eq!(names, vec![0, 1], "ID/TIME 槽");
+            self.seen.set(true);
+            Ok(Value::Int(1234))
+        }
+    }
+
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(-1),
+    }];
+    // 保留完整默认命令表（boot 要求 GOSUB 等必需命令），只给 SOUNDINFO
+    // 补上参数声明；opcode 仍取工程表里的实际序号。
+    let op_soundinfo = b
+        .commands
+        .iter()
+        .position(|(name, _)| *name == "SOUNDINFO")
+        .expect("SOUNDINFO in fixture table") as u8;
+    let op_end = b
+        .commands
+        .iter()
+        .position(|(name, _)| *name == "END")
+        .expect("END in fixture table") as u8;
+    for (name, params) in b.commands.iter_mut() {
+        if *name == "SOUNDINFO" {
+            *params = vec![("ID", 1, 0), ("TIME", 0, 3), ("LET", 0, 0)];
+        }
+    }
+    let groups = vec![
+        GroupSpec::new(op_soundinfo)
+            .window(0, ex::s("BGM"))
+            .window(1, ex::i8_(1))
+            .window(2, ex::r#ref(0x40, sys)),
+        GroupSpec::new(op_end),
+    ];
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let mut vm = boot(b);
+    let seen = Rc::new(Cell::new(false));
+    vm.set_sound_host(Box::new(Mock { seen: seen.clone() }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(seen.get(), "SoundHost::query 未被调用");
+    let v = vm.store().read(user_var(&vm, 0), &[]).unwrap();
+    assert_eq!(v, Value::Int(1234));
+}

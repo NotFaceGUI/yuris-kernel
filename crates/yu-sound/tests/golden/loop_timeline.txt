@@ -1,0 +1,9 @@
+ms=0 time=0 loop=2 count=0 play=1 volume=256
+ms=250 time=250 loop=2 count=0 play=1 volume=256
+ms=500 time=500 loop=2 count=0 play=1 volume=256
+ms=750 time=750 loop=2 count=0 play=1 volume=256
+ms=1000 time=0 loop=2 count=1 play=1 volume=256
+ms=1250 time=250 loop=2 count=1 play=1 volume=256
+ms=1500 time=500 loop=2 count=1 play=1 volume=256
+ms=2000 time=0 loop=0 count=0 play=0 volume=256
+render ms=250 frames=256 fnv1a32=0xa0793b35

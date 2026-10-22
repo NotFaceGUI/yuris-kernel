@@ -60,11 +60,11 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `F_STR` | vm | 64 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
 | `FONT` | graphics | 42 | `font/font.html` | `0x444428` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `LOOPCONTINUE` | vm | 40 | `control/loopcontinue.html` | `0x448144` | ✅ 实现 | 保持 |
-| `SOUND` | sound | 34 | `sound/sound.html` | `0x44e1e8` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
+| `SOUND` | sound | 34 | `sound/sound.html` | `0x44e1e8` | ✅ 宿主 | `yu-sound` 已接线(§8);不装宿主时仍只发 `DomainCall` |
 | `_` | vm | 33 | `basic/basic.html` | `0x4567c0` | ✅ 实现 | 本 600 帧未触发;静态语料有 33 处;COV-M-03 M-2:式值追加文本并按字符写 '1'/'2'(REA 0x4567c0) |
 | `WINDOWINFO` | window | 31 | `window/windowinfo.html` | `0x4586ec` | 🔁 部分(129 次未实现) | 主路径实现;未实现路径见 §2 |
 | `WINDOW` | window | 31 | `window/window.html` | `0x456b70` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `SOUNDINFO` | sound | 25 | `sound/soundinfo.html` | `0x44f4bc` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
+| `SOUNDINFO` | sound | 25 | `sound/soundinfo.html` | `0x44f4bc` | ✅ 宿主 | 装宿主时 `op_soundinfo` → `SoundHost::query` → LET;未装时保持 M-2 |
 | `FILEINFO` | file | 22 | `file/fileinfo.html` | `0x44286c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `MATH` | vm | 21 | `math/math.html` | `0x4482c4` | ✅ 实现 | 保持 |
 | `FILEACT` | file | 20 | `file/fileact.html` | `0x441370` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
@@ -88,7 +88,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `SYSTEM` | system | 2 | — | `0x45023c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `FPS` | system | 2 | `system/fps.html` | `0x4457a8` | ✅ 实现 | 保持 |
 | `INPUT` | system | 2 | `system/input.html` | `0x446564` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `SOUNDEND` | sound | 2 | `sound/soundend.html` | `0x44f308` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
+| `SOUNDEND` | sound | 2 | `sound/soundend.html` | `0x44f308` | ✅ 宿主 | `yu-sound` 删层(§8) |
 | `TEXT` | vm | 2 | `text/text.html` | `0x453448` | ✅ 实现 | COV-M-02 M-2 重写:OUTPUTMODE/WAIT/CLICK/RETURN/PAGE/CLICKRETURN/CLICKPAGE/CLEAR/AUTO*;CLICK 自动模式让出(REA 0x453448) |
 | `MOVIEEND` | movie | 2 | `movie/movieend.html` | `0x44b9d8` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `TASKEND` | vm | 2 | `control/taskend.html` | `0x4521dc` | ✅ 实现 | 本 600 帧未触发;静态语料有 2 处 |
@@ -272,3 +272,21 @@ cargo run -p yu-rt --example coverage_census -- 600 8
   正确形态是**宿主窗口事件 setter**(像 `_WINDOW_EXEC_MAX/CLOSE`),不是
   VM 里猜一个 0/1 状态机。
 
+
+## 8. 声音域接线（任务 N,2026-10-22）
+
+> 台账：`docs/sound-ledger.md`。REA 锚点仍是 0.495 处理体地址；
+> 状态列区分「事件层」与「宿主实现」。
+
+| 命令 | opcode | 运行触发 | 处理器 | 宿主/状态 | 说明 |
+|---|---:|---:|---|---|---|
+| `SOUND` | 87 | 531 | `0x44e1e8` | ✅ `yu-sound` | 层表/装载/参数写回；MIDI/CDDA 除外 |
+| `SOUNDINFO` | 89 | 7,200 | `0x44f4bc` | ✅ `yu-sound` | 装宿主时走 `op_soundinfo` → `SoundHost::query` → `LET`；未装宿主保持 M-2 通用域路径 |
+| `SOUNDEND` | 88 | 1 | `0x44f308` | ✅ `yu-sound` | 删层；随后 `SOUNDINFO[EXIST]=0` |
+| `MIDI` | 67 | 0 | `0x44aa40` | ⛔ Unimplemented | 处理体为空桩；无手册页 |
+| `MIDIEND` | 68 | 0 | `0x44aa60` | ⛔ Unimplemented | 同上 |
+| `MIDIINFO` | 69 | 0 | `0x44aa80` | ⛔ Unimplemented | 同上 |
+| `CDDA` | 0 | 0 | `0x429fb0` | ⛔ Unimplemented | 空桩；无手册页 |
+
+回归：不装宿主时 `coverage_census 600 8` 的三条计数与 M-2 一致
+（531 / 7,200 / 1），诊断文案不变。

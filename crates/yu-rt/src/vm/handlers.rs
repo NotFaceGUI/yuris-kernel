@@ -265,6 +265,15 @@ impl Vm {
             HandlerKind::Textinfo => self.op_textinfo(st, cmd),
             HandlerKind::Labelinfo => self.op_labelinfo(st, cmd),
             HandlerKind::Domain(domain) => {
+                // 只在宿主已安装时走新的 LET 写回路径；未安装时保持
+                // M-2 的既有行为（通用域事件 + rt.cmd.unimplemented），
+                // 保证 600 帧普查逐位不变。
+                if domain == Domain::Sound
+                    && cmd.name == "SOUNDINFO"
+                    && self.sound_host.is_some()
+                {
+                    return self.op_soundinfo(st, cmd);
+                }
                 // 域命令的参数是宿主域状态机唯一能看到的输入;必须带上
                 // 求值结果(槽号 = 工程 ysc 表的参数序号)。`record_events`
                 // 只控制通用 Command 事件,不影响域事件。
@@ -275,9 +284,12 @@ impl Vm {
                     name: cmd.name.clone(),
                     args,
                 });
-                // Graphics/Window 已由同步宿主消费时不再挂号;其他域仍归宿主。
-                let handled = self.graphics_host.is_some()
-                    && matches!(domain, Domain::Graphics | Domain::Window);
+                // Graphics/Window 已由同步宿主消费时不再挂号;声音域同理。
+                let handled = (self.graphics_host.is_some()
+                    && matches!(domain, Domain::Graphics | Domain::Window))
+                    || (self.sound_host.is_some()
+                        && domain == Domain::Sound
+                        && matches!(cmd.name.as_str(), "SOUND" | "SOUNDEND"));
                 if !handled {
                     self.report_unimplemented(
                         &cmd.name,
@@ -2364,6 +2376,73 @@ impl Vm {
             for t in &targets {
                 self.write_target(st, t, &v)?;
             }
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    /// `SOUNDINFO`:只读查询,结果写入 `LET`。
+    ///
+    /// 证据(0.495 `0x44f4bc` 原始汇编):
+    /// - `LET` 目标由 VM 持左值 → [`crate::event::SoundHost::query`] → 写回;
+    /// - `EXIST..PITCH`(槽 1..7)各带独立 `ret`,按固定顺序**首个命中即返回**;
+    /// - 这 7 个都不在请求里时,其余字段连续执行、最后写入者胜出;
+    /// - 缺层时引擎把 LET 清零(字符串目标写空)。
+    fn op_soundinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let params: Vec<String> = self
+            .tables()
+            .boot
+            .yscm
+            .command(cmd.opcode)
+            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+        let mut targets: Vec<crate::expr::LValue> = Vec::new();
+        let mut args: Vec<ArgValue> = Vec::new();
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let pname = params
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or("");
+            if pname == "LET" {
+                targets.push(self.eval_lvalue(st, &w.payload)?);
+                continue;
+            }
+            if let Ok(v) = self.eval_value(st, &w.payload) {
+                args.push(ArgValue::new(w.rec.kind, v));
+            }
+        }
+        self.emit(VmEvent::DomainCall {
+            frame: self.frame(),
+            domain: Domain::Sound,
+            name: "SOUNDINFO".to_string(),
+            args: args.clone(),
+        });
+        if targets.is_empty() {
+            self.report(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                "SOUNDINFO 缺 LET 目标".to_string(),
+            ));
+            return Ok(StepOutcome::Continue);
+        }
+        let Some(mut host) = self.sound_host.take() else {
+            self.report_unimplemented(
+                "SOUNDINFO",
+                "未安装 SoundHost:声音查询无法在脚本执行期读取层状态".to_string(),
+            );
+            return Ok(StepOutcome::Continue);
+        };
+        let result = host.query("SOUNDINFO", &args);
+        self.sound_host = Some(host);
+        match result {
+            Ok(v) => {
+                for t in &targets {
+                    self.write_target(st, t, &v)?;
+                }
+            }
+            Err(d) => self.report(d),
         }
         Ok(StepOutcome::Continue)
     }

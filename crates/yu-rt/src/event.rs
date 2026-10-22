@@ -301,8 +301,28 @@ pub trait GraphicsHost {
 
     /// VM 解析出资产像素尺寸后回填宿主(默认忽略)。
     ///
+    ///
     /// `CGINFO[SX/SY]` 在引擎里读的是**已装载纹理**的尺寸;本内核的 gfx
     /// 不做文件 I/O,因此由持有数据源的 VM 解析图像头并在此回填,
     /// 供后续同键查询与 COPY 快照继承(DIV-GFX-024 / EVID-J3-03)。
     fn note_asset_size(&mut self, _key: &[u8], _width: u32, _height: u32) {}
+}
+
+/// 声音域同步宿主（SOUND / SOUNDEND 消费 + SOUNDINFO 查询）。
+///
+/// 与 [`GraphicsHost`] 同契约：
+/// - 事件在**产生时**同步进入状态机（调用方不得重复消费）；
+/// - `query` 单值返回，由 VM 写回 `LET`；
+/// - [`SoundHost::advance`] 由帧循环注入时钟，状态机只依赖该时钟推进
+///   （实测：引擎 TIME 来自 DirectSound 播放游标；headless 用注入帧时钟
+///   的等价推进，见 `docs/sound-ledger.md` N0-2）。
+pub trait SoundHost {
+    /// 同步应用一条事件（FrameStart/FrameEnd 与 `Domain::Sound` 的 DomainCall）。
+    fn apply_event(&mut self, ev: &VmEvent);
+
+    /// 注入帧时钟（毫秒）。重复同一时刻无副作用。
+    fn advance(&mut self, _now_ms: u32) {}
+
+    /// 回答一条 SOUNDINFO 查询；返回写入 `LET` 的值。
+    fn query(&mut self, command: &str, args: &[ArgValue]) -> Result<Value, Diag>;
 }

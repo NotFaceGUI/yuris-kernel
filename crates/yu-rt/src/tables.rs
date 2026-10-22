@@ -637,6 +637,10 @@ pub struct BootTables {
 }
 
 /// 表集合 + 已解码脚本。缺表即拒绝启动(A5)。
+///
+/// `Clone` 供测试构造“字段被清零”的内存快照(如 A5 的探测序拒绝用例);
+/// 生产路径只持有一份。
+#[derive(Clone)]
 pub struct TableSet {
     pub boot: BootTables,
     pub scripts: BTreeMap<u32, ScriptFile>,
