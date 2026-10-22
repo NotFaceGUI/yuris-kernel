@@ -2,7 +2,7 @@
 //! 比对前 N 帧的命令数、事件流摘要与变量终值。A1(数据源不可见)的运行核级证明。
 use yu_rt::input::InputTimeline;
 use yu_rt::{BootConfig, Vm};
-use yu_vfs::{Codec, DataSource, DirSource, YpfSource};
+use yu_vfs::{Codec, DirSource, YpfSource};
 
 fn cfg() -> BootConfig {
     BootConfig {

@@ -1,7 +1,7 @@
 //! 追踪:打印进入指定 (script, pc) 前后的命令序列(定位调用方)。
 use yu_rt::input::InputTimeline;
 use yu_rt::{BootConfig, Vm};
-use yu_vfs::{Codec, DataSource, DirSource, LookupKey, YpfSource};
+use yu_vfs::{Codec, DirSource, LookupKey, YpfSource};
 
 fn main() {
     let root = std::env::args().nth(1).expect("project root");

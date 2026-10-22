@@ -1,7 +1,7 @@
 //! 逐步复现 VAR.ADD 宏链,在 WAIT 处分帧观察。
 use yu_rt::input::InputTimeline;
-use yu_rt::value::{Value, VarRef, VarSpace};
-use yu_vfs::{Codec, MemSource};
+use yu_rt::value::{VarRef, VarSpace};
+use yu_vfs::MemSource;
 use yu_rt::{BootConfig, Vm};
 #[path = "../tests/support/mod.rs"]
 mod support;

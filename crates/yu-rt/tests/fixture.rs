@@ -1033,7 +1033,7 @@ fn higher_z_task_runs_before_lower_z() {
     b.entry(0, 0);
     const OP_TASK: u8 = 93;
     // 体 = LET + WAIT(50) + END:任务跑完第一行后长期休眠,便于事后查 Z。
-    let mut body = |pc_value: i8| {
+    let body = |pc_value: i8| {
         vec![
             GroupSpec::new(OP_LET)
                 .window(0, ex::r#ref(0x40, v.id))
