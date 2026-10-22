@@ -4,6 +4,13 @@ YU-RIS 引擎的净室兼容内核，GPL-3.0-or-later。**唯一目标：与官�
 相同游戏数据与相同输入时间线下，封包解析、脚本执行、渲染语义、存档读写等一切可观测行为
 逐位一致。
 
+## 当前进度
+
+![yuris-kernel 当前进度：ERIS 启动 → title](docs/assets/demo.gif)
+
+> 当前演示：ERIS 启动 → boot 转场 → title。
+> 由 `yu-cli serve --backend wgpu` 驱动
+
 ## 立场
 
 - **唯一真值 = 官方引擎可观测行为**（官方 trace / SDK 二进制逆向事实 / 原版数据自证）。
@@ -11,33 +18,29 @@ YU-RIS 引擎的净室兼容内核，GPL-3.0-or-later。**唯一目标：与官�
 - 无证据的行为显式 `Unimplemented`，禁止“看起来应该是这样”。
 - 通用运行时零硬编码（A5）：命令表/变量表/设置全部运行期从游戏工程装载，缺表拒绝启动。
 
-## 当前状态（2026-10-20）
+## 当前状态（2026-10-21）
 
-M3 渲染链路已打通到“软/硬双后端首帧 + 计数对账”：
+Title 链路已跑通（ERIS，`_DXMODE=0` 固定管线路径）：
 
 | 阶段 | 状态 |
 |---|---|
 | M3a 语义显示列表 `CompositorFrame` | 完成 |
-| M3b `yu-backend-soft` 首帧 PNG | 完成（部分语义挂账，见下） |
-| M3c `yu-backend-wgpu` 主后端首帧 | 完成（离屏 RGBA8 + 读回；surface 呈现留宿主；alpha 语义与 soft 已统一为 `a²`） |
-| M3d 桌面 / wasm / Android 宿主闭环 | 未开始 |
+| M3b `yu-backend-soft` 确定性参考 | 完成（600 帧与 wgpu 逐帧一致） |
+| M3c `yu-backend-wgpu` 主后端 | 完成（title/转场/COPY/按钮；WebGPU 与 native 同帧一致） |
+| M3d 桌面 / wasm / Android 宿主 | 桌面 + wasm 进行中（K2）；Android 未开始 |
 
-首帧实测（同一 ERIS 帧）：800×600、272 图层、15 pass、44 op（历史锚点；
-当前 HEAD 的 boot 链在 tick 1 为 8 visible / 18 op，见下）。soft 输出
-`target/tmp/first_frame.png`；wgpu 输出
-`target/tmp/wgpu_first_frame.png` + `wgpu_first_frame.report.json`，pass/op/
-executable/skipped 计数与 `first_frame.display.json` 完全一致。任务 J 已把
-soft 的 alpha 源项修为 `a²`（与 wgpu 同帧半透明像素逐通道差 0），并实现
-`RECTPAINT/2/3`（首屏 11 个 image op 中 10 个可执行；`CGS100` 等 COPY）。
-文字栅格化、COPY、组 RT alpha 语义、部分 MODE 仍是显式挂账项，见
-`docs/fidelity-ledger-j.md`、`docs/gfx-unimplemented-todo.md`。
+实测（tick 300，title 稳定帧）：800×600、445 层、27 op、27 drawn、0 skipped；
+10 个按钮 `_off/_on/_over/_na` 全部解析；soft/wgpu PNG 逐字节相同；
+浏览器 canvas 与 native wgpu 同帧哈希相同；600 帧 soft/wgpu 0 差异。
 
-> **首帧锚点说明（2026-10-21）**：ERIS 的 first 是 boot 跑到 title。当前
-> 内核的 boot 链尚未恢复到 title：`first_frame` 选中的 tick 1 是启动期
-> 显示状态（8 visible / 18 op，屏幕全黑），历史 golden 的 34 visible /
-> 44 op 来自 `771cf79`。该差异在 `yu-rt`（任务 J 不允许修改），因此
-> 官方 title 与内核的逐像素对拍暂不可做；`cargo test -p yu-gfx` 的两条
-> golden 保持失败、未用 `UPDATE_GFX_GOLDEN` 掩盖。
+**尚未 1:1 的部分**：引擎着色器路径（内核用 `dx_mode` 做 A/B，引擎本身没有这个
+渲染开关，见 `docs/architecture.md` §5.1）；MODE 4/8/10..18 共 11 个着色器模式
+未实现（MODE 3/5/6/7/9 已由状态表实现，两端可执行，仅缺官方像素对拍）；顶点
+DIFFUSE 已按 A 灰度定案；MIP/各向异性、组 RT 子组 alpha、文本栅格化、MID/
+多部件仍在挂账；主组直绘后首帧 `COPY ID=:/W0/` 无源（DIV-GFX-051）、
+`image_probe_order` 空值兜底违反 A5（DIV-GFX-049）、重启不清渲染器状态
+（DIV-HOST-001）。
+详见 `docs/audit-2026-10-22.md`、`docs/todo-inventory.md`。
 
 ## 布局
 
@@ -51,9 +54,27 @@ soft 的 alpha 源项修为 `a²`（与 wgpu 同帧半透明像素逐通道差 0
 | `yu-font` | 字体发现 / 加载、字形栅格化、完整文本样式；不含换行 / 对齐 |
 | `yu-backend-soft` | `CompositorFrame` 的确定性软件参考后端：纹理管线 + RGBA8 合成 + PNG |
 | `yu-backend-wgpu` | `CompositorFrame` 的 wgpu 主后端：`Rgba8Unorm` 离屏合成 + 读回；纹理/管线/bind group 缓存 |
+| `yu-cli` | 原生引擎宿主 + 本地 HTTP/WS 服务 + HMR 监督 + 用例执行器（`run`/`serve`/`dev`/`case`/`bench`） |
+| `yu-host-wasm` | 浏览器**呈现端**（wasm-bindgen）：WebGPU shim 优先，Canvas2D 回退；不读游戏数据 |
 | `yu-trace` | 边界录制 / 回放 / diff；schema v3（producer-neutral、frame_description） |
 
-未开始：桌面 / wasm / Android 宿主、`yu-sound` / `yu-save`、scenario 解释器与 CLI。
+### 模块进度（2026-10-21）
+
+| 模块 | 状态 | 说明 / 主要缺口 |
+|---|---|---|
+| `yu-log` | 完成 | Diag / 码表 / JSONL sink |
+| `yu-vfs` | 完成 | 散盘 / YPF / 内存源 + Mount；NUL-XOR 方言无真样本（DIV-002） |
+| `yu-format` | 完成 | ybn 家族 / yssd / yscfg；YSTB v2 未实现；GBK 码表 partial |
+| `yu-rt` | 主线完成 | 119 命令普查；TEXT 族、FILEINFO、系统变量 ABI；16 open + 3 blocked DIV、27 条未取证命令 |
+| `yu-gfx` | 核心完成 | 转场 / COPY / RECTPAINT / REVERSE / HORIZONTAL / SIZE；MODE 3/5/6/7/9 状态表已实现；11 个 shader 模式、文本 / MID / 多部件 / 组 RT 子组 alpha 挂账 |
+| `yu-font` | 完成 | 字体源 / 栅格 / 样式；GRADATION、ROTATION、BNO 等 Unverified |
+| `yu-backend-soft` | 完成（参考） | 确定性 RGBA8 / PNG；600 帧与 wgpu 逐帧一致 |
+| `yu-backend-wgpu` | 固定管线 title 完成 | 离屏 RGBA8 + 读回；MODE 0..9 可执行；psC/psD 转场独立 WGSL（`dx_mode` 为内核 A/B 契约，非引擎开关）；MODE 4/8/10..18 仍 Unimplemented |
+| `yu-trace` | 完成（schema v3） | vfs/vm/frame 边界、回放、diff；官方 L1 已打通；DIV-L-002 open、官方 args 不可观测 |
+| `yu-cli` / `yu-host-wasm` | 进行中（K2） | 桌面 / wasm 宿主、HMR、用例；Android 未开始 |
+| `yu-sound` / `yu-save` | 未开始 | 音频与存档 |
+| scenario 解释器 | 未开始 | 顺序脚本 / 分支 |
+
 **没有 `yu-assets` 兄弟 crate**：纹理解析在装配 / 后端层，第一个实现是
 `yu-backend-soft::TextureStore`；wgpu 后端复用同一 `TextureStore` 的 RGBA8 字节。
 
@@ -72,7 +93,7 @@ yu-vfs → yu-format → yu-rt
              │                       │
              └───────────┬───────────┘
                          ▼
-              hosts：桌面 / wasm / Android（未开始）
+              hosts：桌面 / wasm（K2 进行中）；Android 未开始
 ```
 
 ## 快速开始
@@ -89,9 +110,22 @@ export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
 cargo run -p yu-backend-soft --example first_frame
 # → target/tmp/first_frame.png / first_frame.display.json
 
-cargo run -p yu-backend-wgpu --example first_frame
+cargo run -p yu-backend-wgpu --example wgpu_first_frame
 # → target/tmp/wgpu_first_frame.png / wgpu_first_frame.report.json
 # 可选：YURIS_WGPU_BACKEND=dx12 YURIS_WGPU_ADAPTER=5070
+
+# 逐帧走查（600 帧哈希/计数/耗时）
+cargo run -p yu-backend-soft --example frame_walk -- 600
+cargo run -p yu-backend-wgpu --example wgpu_frame_walk -- 600
+
+# 浏览器呈现（本地服务 + wasm 呈现端；浏览器只收 RGBA，不下载整包）
+cargo build -p yu-cli --release
+./target/release/yu-cli serve "<project-eris>" --backend wgpu --port 4173 --pause-at 303
+# 打开 http://127.0.0.1:4173/  （--pause-at 暂停在指定帧，便于截图/对拍）
+# Windows: .\target\release\yu-cli.exe serve "<project-eris>" --backend wgpu --port 4173
+
+# 开发热重启（改 Rust 自动重建/重启，浏览器 WebSocket 自动重连）
+./target/release/yu-cli dev "<project-eris>" --backend wgpu --port 4173
 ```
 
 本机沙箱、样本路径与占位符约定见 `AGENTS.md`（本机文件，不入库）。
@@ -99,13 +133,42 @@ cargo run -p yu-backend-wgpu --example first_frame
 ## 文档
 
 - `PROGRESS.md` — **唯一进度真相**（成果、勘误、验证命令与原始结果）
-- `docs/architecture.md` — 设计稿（v1.2；与 `PROGRESS.md` 架构现状冲突时以后者为准）
+- `docs/audit-2026-10-22.md` — **2026-10-22 改动审查**（确定错误/文档失真/工程回归）
+- `docs/architecture.md` — 实现现状 v1.3（与 `PROGRESS.md` 冲突时以后者为准）
 - `docs/render-parity.md` — 渲染语义证据表与后端执行契约
 - `docs/fidelity-ledger-j.md` — 任务 J 首帧保真台账（RECTPAINT/alpha/COPY 证据与阈值）
+- `docs/title-motion-ledger.md` — title 链路台账（转场/COPY/按钮，EVID-T-01..22）
+- `docs/todo-inventory.md` — 100+ 条 DIV + 命令级缺口总账（随台账增长）
+- `docs/wgpu-shader-parity-review.md` — wgpu 着色器 / 通用性 / 1:1 审查报告
+- `docs/tasks/task-j4-shader-parity.md` — 着色器 1:1 修复任务书
 - `docs/gfx-verification-ledger.md` — gfx 复核台账（Confirmed / Refuted / Uncertain）
 - `docs/gfx-unimplemented-todo.md` — 未实现模块 DIV 清单与解除条件
 - `docs/font-contract.md` / `docs/font-provenance.md` — 字体接口与取证
 - `docs/oracle.md` — 对拍方法论；`docs/divergences/` — 不一致档案
+
+## TODO 总览
+
+> 完整 100+ 条 DIV 与命令级缺口见 `docs/todo-inventory.md`；这里只列子系统级下一步。
+
+| 子系统 | 下一步 | 依赖 / 阻塞 |
+|---|---|---|
+| **主组 COPY 首帧源** | 裁决“回退本帧子层自合成”或“显式 `no_backbuffer` 挂账” | **P0**：首帧 golden/case 全依赖（DIV-GFX-051） |
+| **重启渲染器状态** | `reset()` 或 `CopyId` 代际隔离 | **P0**：重启后像素错（DIV-HOST-001） |
+| **用例门禁** | `case --all --update` 后把 `case --all` 写进 CI | 当前三条 case 全过期（`ops 17 vs 18`） |
+| **A5 兜底** | `image_probe_order` 空值拒绝启动或全层 Unimplemented | DIV-GFX-049 open |
+| 引擎 shader | MODE 4/8/10..18 的公式/调用点取证 | 无 blob；证据在 `target/tmp/j4-shaders/` |
+| 固定管线 3/5/6/7/9 | 官方微场景像素对拍（状态表已实现） | YSCom attach 阻塞 |
+| 组 RT / 子组 alpha | 生产路径 RT 格式/写掩码取证 | DIV-GFX-041 partial |
+| 文本链路 | gfx 文本布局 + 后端字形路径（yu-font 已就绪） | 依赖 M2 的 TEXT 状态 |
+| 资产元数据 | 完整 provider（图像头已由 J3 覆盖 PNG/BMP/GIF/JPEG） | DIV-GFX-024 partial |
+| 其它图像加工 | ROTATION / TRIM / MONO / BLUR 像素证据 | 逐动作取证 |
+| MID / 多部件 / FX | 掩码 / 几何 / 仿射公式取证 | REA + 微场景 |
+| 颜色空间 / 半像素 / 过滤 | 官方截图逐像素 + 引擎设置 | 需 oracle |
+| `yu-rt` 剩余 | 16 个 open DIV、27 条未取证命令、系统变量缺口 | 手册 / REA 取证 |
+| `yu-trace` | DIV-L-002 任务相位；官方 args 级 L1 | 探针扩展 |
+| 宿主 | 桌面 / wasm 收尾（K2）；Android | K2 |
+| `yu-sound` / `yu-save` | 新 crate + 证据 | 未开始 |
+| 格式兼容 | YSTB v2、NUL-XOR 方言 | 仅按目标游戏需要 |
 
 ## 许可
 

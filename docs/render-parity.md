@@ -38,7 +38,7 @@
 |---|---|---|---|---|---|
 | 1 | 图层模型:ID/路径/Z/组 | `basic/layer.html`:「レイヤには優先度…値が大きいほど、手前に表示」「同じ優先度（Ｚ値）…不確定」「ＩＤの最後に「／」…レイヤセット」「ルートに「W0」…カレントパスもその場所」;`cg/cg.html`:「レイヤセット…不透明度を128…それ以下の全レイヤを“レイヤ合成したもの”が不透明度128」 | ERIS 源 660 处 `CG[`/307 `CGACT[`/103 `CGEND[`;首屏 `ID/IDNO/E/A/X/Y/Z/SX/SY/FILE/MODE` | `FUN_00413dc8` 行 34-49(先递归子层;`+0xa4/+0x89/+0x90` 判空跳过);`FUN_00414ba4` 行 115-156;`FUN_0042f57d` 行 61-112(SWAP 属性);`FUN_0042f809` 行 378-446(COPY 属性块) | Confirmed;同 Z 次序 = 内核取创建序(DIV-GFX-014) |
 | 2 | `A` 0..256 | `cg/cg.html`:「A = 値(0～256)」 | ERIS 首屏 `A=256`/`A=0`,后续 `A=@_PINT(1)`;源 `CG[... A=@mA]` | `FUN_00414ba4` 行 116(`(short)+0x80`)、135-140(clamp 0..255)、149-154(TFACTOR=A 灰度)、910-913(`YS_AlphaVal=A/256`) | Confirmed;固定管线 `min(A,255)/255`,着色器 `A/256` |
-| 3 | `MODE=0..18` | `cg/cg.html` 全表(0=通常…18=ピンライト);「4=除算…13=焼き込みリニア」 | ERIS 首屏 `MODE=0`(1015 次)+`MODE=2`(1 次);源 `MODE=@bl` | `FUN_00414ba4` 行 144-154(分派/TFACTOR)、391-462(M0)、463-509(M1)、510-560(M2)、561-633(M3)、634-701(M5)、702-752(M6)、753-820(M7)、824-874(M9)、881-971(HLSL) | 0 Likely;1/2 Confirmed;3/5/6/7/9 Unverified(状态表已取证);4/8/10..18 Unimplemented |
+| 3 | `MODE=0..18` | `cg/cg.html` 全表(0=通常…18=ピンライト);「4=除算…13=焼き込みリニア」 | ERIS 首屏 `MODE=0`(1015 次)+`MODE=2`(1 次);源 `MODE=@bl` | `FUN_00414ba4` 行 144-154(分派/TFACTOR)、391-462(M0)、463-509(M1)、510-560(M2)、561-633(M3)、634-701(M5)、702-752(M6)、753-820(M7)、824-874(M9)、881-971(HLSL) | 0 Likely;1/2 Confirmed;**3/5/6/7/9 状态表已实现(soft/wgpu 全部),官方像素待 YSCom 工具恢复**;4/8/10..18 Unimplemented |
 | 4 | 纹理过滤 MAG/MIN/MIP | 无手册页;引擎设定工具写入 | ERIS `yscfg` 无过滤字段(全局设置) | `FUN_0043cd6c` 行 46-117:stage 0/1 各下发 `D3DSAMP_MAG/MIN/MIPFILTER`;值来自 `DAT_005b4804/4808/80131c`;0=POINT/1=LINEAR/2=ANISOTROPIC,MIP=-1=NONE | Confirmed 全局,非逐层;旧线“固定 Linear”❌ |
 | 5 | 变换 X/Y/FX… | `cg/cg.html` 只文档化 X/Y;`basic/layer.html` 无 FX 说明 | ERIS `es_Sprite.yst` `FX=@fx*100 ... FRZ=@frz FCX=@fcx`;`FBX=10000`/`FCX=5000` | `FUN_00414ba4` 行 117-125(+0x1b0/1b8/1c0/1c8/1d0/1d8 `/100`,+0x1f8/1fc/200 f32 `/100`)、220-275(16.16 `ROUND(v*65536)`)、322-336(旋转矩阵,`π/180` 常量 0x58ebf8);半像素 `-0.5` 常量 0x58ebd0 | X/Y Confirmed;FX 家族槽位→偏移 Unimplemented(DIV-GFX-003) |
 | 6 | 多部件层 / `FILE` 探测 / 1×1 黑 | `cg/cg.html`:「FILE="" で1x1サイズの黒画像生成」「拡張子…「.PNG」「.BMP」「.JPG」「.GIF」の順」 | ERIS 首屏 552 次 `FILE`(`FILE=""` 与 `cgsys/...` 资产);源 `CG[FILE=...]` | `FUN_0040c9b4`(`0x40c9b4`)按 `yscfg+0x1c` 码探测:`1→.png,2→.bmp,3→.jpg,4→.gif,5→.psb`;多部件 `+0xa6/+0xa7` 计数、`+0xb0/+0x130` 两表(`FUN_00414ba4` 155-156/200/219/985) | `FILE`/扩展名 Confirmed;多部件几何 Unimplemented(DIV-GFX-004) |
@@ -89,8 +89,13 @@ X 1023 | Y 1023 | A 36 | SX 13 | SY 13
   **任务 J**:11 个 image op 中 10 个 `RECTPAINT*` 现在 `Executable`
   (SPLDST/SPLDST2/FONTL2..9,EVID-J-02..05);`CGS100` 的目标是
   `Snapshot(271)`,保持 `gfx.imageop.copy_source.unsupported`,等 COPY。
-  **注意**:`docs/tasks` 审查把这里读成“1 个可执行复制”,与代码不符;
-  已按代码/状态修正(见 §13)。
+  **任务 J2**:title 稳定帧(tick 300)为 16 pass / 27 op / 17 drawn /
+  10 skipped(按钮基名 `asset.missing`)。**任务 J3**:`yu-rt` 实现
+  `FILEINFO[EXIST]→LET` 后换成 **27 op / 27 drawn / 0 skipped**,
+  `asset.missing=0`;三端同帧 RGBA `6280eac4…b198`,600 帧逐帧哈希 0 差异
+  (`docs/title-motion-ledger.md` §9)。
+  `docs/tasks` 早先的“1 个可执行复制”在 J2 已更新为 COPY/COPY2 全部可执行
+  (TEXCOPY/TEXSSCOPY 除外)。
 
 ---
 
@@ -189,22 +194,38 @@ X 1023 | Y 1023 | A 36 | SX 13 | SY 13
 记法:`stage[i] = {color_op, color_arg1, color_arg2, alpha_op, alpha_arg1,
 alpha_arg2}`;D3D9 原始值。`TF` = `D3DRS_TEXTUREFACTOR`。
 `DIS` = `D3DTOP_DISABLE`;`SEL1` = `SELECTARG1`;`MOD` = `MODULATE`;
-`MAA` = `MODULATEALPHA_ADDCOLOR`。`D/T/C/F` = `DIFFUSE/TEXTURE/CURRENT/TFACTOR`。
+`BCA` = `BLENDCURRENTALPHA`(值 16,`Arg1 + Arg2*(1−C.a)`);`W/B/F` =
+白纹理/黑纹理/TFACTOR。`D/T/C/F` = `DIFFUSE/TEXTURE/CURRENT/TFACTOR`。
 
 | MODE | stage0 | stage1 | TF | SRCBLEND | DESTBLEND | BLENDOP | 等级 |
 |---|---|---|---|---|---|---|---|
 | 0 通常 | color SEL1(T); alpha MOD(T,F) | color SEL1(T); alpha DIS | A 灰度 | SRCALPHA | INVSRCALPHA | ADD | Likely |
 | 1 加算 | color SEL1(T); alpha MOD(T,D) | DIS | A 灰度 | SRCALPHA | ONE | ADD | Confirmed |
 | 2 減算 | color MOD(D,T); alpha MOD(D,T) | DIS | A 灰度 | SRCALPHA | ONE | REVSUBTRACT | Confirmed |
-| 3 乗算 | color MOD(D,T); alpha MOD(D,T) | color MAA(C,T); alpha SEL1(C) | 0xFFFFFFFF | ZERO | SRCCOLOR | ADD | Unverified |
-| 5 スクリーン | color MOD(T,D); alpha MOD(T,D) | color MAA(C,T); alpha SEL1(C) | A 灰度 | INVDESTCOLOR | ONE | ADD | Unverified |
-| 6 比較(明) | color MOD(T,D); alpha MOD(T,D) | DIS | A 灰度 | ONE | ONE | MAX | Unverified |
-| 7 比較(暗) | color MOD(T,D); alpha MOD(T,D) | color MAA(C,F); alpha SEL1(C) | 0xFFFFFFFF | ONE | ONE | MIN | Unverified |
-| 9 除外 | color MOD(T,D); alpha MOD(T,D) | DIS | A 灰度 | INVDESTCOLOR | INVSRCCOLOR | ADD | Unverified |
+| 3 乗算 | color MOD(D,T); alpha MOD(D,T) | color BCA(C,W); alpha SEL1(C) | 0xFFFFFFFF | ZERO | SRCCOLOR | ADD | 可执行(soft+wgpu) |
+| 5 スクリーン | color MOD(T,D); alpha MOD(T,D) | color BCA(C,B); alpha SEL1(C) | A 灰度 | INVDESTCOLOR | ONE | ADD | 可执行(soft+wgpu) |
+| 6 比較(明) | color MOD(T,D); alpha MOD(T,D) | DIS | A 灰度 | ONE | ONE | MAX | Confirmed |
+| 7 比較(暗) | color MOD(T,D); alpha MOD(T,D) | color BCA(C,F); alpha SEL1(C) | 0xFFFFFFFF | ONE | ONE | MIN | Confirmed |
+| 9 除外 | color MOD(T,D); alpha MOD(T,D) | DIS | A 灰度 | INVDESTCOLOR | INVSRCCOLOR | ADD | 可执行(soft+wgpu) |
 
-- 引擎在公共前缀 `SetTexture(2,NULL) → SetTexture(0,层纹理) → SetTexture(1,配对)`,
-  以及 `SetPixelShader` 复位(行 162-165)。MODE 3/5 的 stage1 辅助纹理是
-  `DAT_00801d98/d9c`(内容未知,DIV-GFX-001)。
+- `BCA` = `D3DTOP_BLENDCURRENTALPHA`(d3d9types.h 值 **16**):
+  `Arg1 + Arg2*(1−C.a)`。旧表把它记成 `MAA`(MODULATEALPHA_ADDCOLOR,
+  值 18)是错的;按 16 重读后,stage1 的作用是“向辅助色中性点淡化”。
+- 引擎公共前缀:`SetTexture(2,NULL) → SetTexture(0,层纹理) →
+  SetTexture(1,配对)`;MODE 3 把 stage1 绑白纹理(`DAT_00801d98`),
+  MODE 5 绑黑纹理(`DAT_00801d9c`),MODE 7 的 `BCA` arg2 是白 TFACTOR。
+- aux 纹理已定案:`DAT_00801d98` = **白**(失败串 `WHITETEXBUF ERROR.`),
+  `DAT_00801d9c` = **黑**(`BLACKTEXBUF ERROR.`),见 `FUN_00462e40`
+  行 282-310。于是源色归约为:
+  - MODE 0/1:`T`
+  - MODE 2/5/6/9:`T·A`(顶点 DIFFUSE 是 A 灰度,`FUN_00414ba4` asm
+    `0x414d09..0x414d21`)
+  - MODE 3/7:`T·A + (1−C.a)`
+- 因此 MODE 3/5/6/7/9 的可见公式与手册名一致(乘/屏/max/min/除外),
+  但 **MODE 2/3/5/6/7/9 的 RGB 会先乘 A**(旧实现漏了这一层,本次修正)。
+- WebGPU 的 `BlendFactor::Src`/`OneMinusDst`/`OneMinusSrc` 是 D3D9
+  `SRCCOLOR`/`INVDESTCOLOR`/`INVSRCCOLOR` 的逐通道等价物,所以 MODE
+  3/5/9 用固定功能即可 1:1;MODE 6/7 用 MAX/MIN。两端均执行。
 
 **手册可见公式(只作名称对应,不是实现依据)**:
 
@@ -213,17 +234,19 @@ alpha_arg2}`;D3D9 原始值。`TF` = `D3DRS_TEXTUREFACTOR`。
 | 0 | 通常 | `src·a + dst·(1−a)` | Likely;按此实现 |
 | 1 | 加算 | `src·a + dst` | Confirmed |
 | 2 | 減算 | `dst − src·a` | Confirmed |
-| 3 | 乗算 | `dst · src` | 状态已取证,公式未对拍 |
+| 3 | 乗算 | `dst · src` | 可执行(状态表归约,§5.2) |
 | 4 | 除算 | 手册名;公式未定位 | Unimplemented |
-| 5 | スクリーン | `src + dst − src·dst` | 状态已取证,公式未对拍 |
-| 6 | 比較(明) | `max(src, dst)` | 状态已取证,公式未对拍 |
-| 7 | 比較(暗) | `min(src, dst)` | 状态已取证,公式未对拍 |
+| 5 | スクリーン | `src + dst − src·dst` | 可执行(状态表归约,§5.2) |
+| 6 | 比較(明) | `max(src, dst)` | 可执行(MAX) |
+| 7 | 比較(暗) | `min(src, dst)` | 可执行(MIN) |
 | 8 | 差分 | 手册名;公式未定位 | Unimplemented |
-| 9 | 除外 | `src + dst − 2·src·dst` | 状态已取证,公式未对拍 |
+| 9 | 除外 | `src + dst − 2·src·dst` | 可执行(状态表归约,§5.2) |
 | 10..18 | Overlay..PinLight | 手册名;着色器本体未定位 | Unimplemented |
 
-- **MODE 3/5/6/7/9 的公式列只来自手册/Photoshop 家族命名,不作为实现依据**;
-  后端只能下发状态表并等待像素对拍,或跳过。
+- **MODE 3/5/6/7/9 的实现依据是 §5.2 的 D3D9 状态表**(aux 白/黑 +
+  `BLENDCURRENTALPHA` + DIFFUSE A 灰度),手册公式只作名称对照。
+  官方微场景因 YSCom 编译器无法 attach 暂缺(见 `docs/shader-parity.md`
+  §6);soft/wgpu 单元向量覆盖 stage 归约与最终 blend。
 - **旧线 03 文档的 D3DTA 映射错位**:它把 `0=TFACTOR,1=CURRENT,2=DIFFUSE,
   3=TEXTURE`;D3D9 实际是 `0=DIFFUSE,1=CURRENT,2=TEXTURE,3=TFACTOR`。
   因此旧线对 MODE 0“顶点色直通”的结论作废。本文按 `d3d9types.h` 重新解读。
@@ -233,18 +256,34 @@ alpha_arg2}`;D3D9 原始值。`TF` = `D3DRS_TEXTUREFACTOR`。
 
 ### 5.3 着色器路径
 
-`MODE 4/8/10..18` 在固定管线分支中没有 case;引擎持有 `ID3DXEffect`
-(`DAT_00801e7c`)与 `SetPixelShader` 封装。着色器源/字节码落点未定位
-(旧线 G7/G11),因此这些模式**一律 Unimplemented**;gfx 只保留 `MODE` 原值
-与图层状态,不猜 Photoshop 公式。
+`MODE 4/8/10..18` 在固定管线分支中没有 case;这些模式的 Photoshop 公式本体
+仍**未定位**(没有对应 blob)。引擎的 shader 集合已完整取证(任务 J4):
+4 个 ps_2_0 blob 在同一个编译 effect(FXO,VA `0x58d420`,`0x1540` 字节)里,
+pass 映射为:
+
+| pass | blob | 参数 | 功能 | 触发 |
+|---|---|---|---|---|
+| 0 | `0x18d3d0` | `Samp1/2`,`YS_AlphaVal`,`YS_FadeVal` | 交叉淡化 `mix(tex1,tex2,FadeVal)` | HLSL 分支(存在配对) |
+| 1 | `0x18d1cc` | `Samp1/2`,`YS_AlphaVal`,`YS_FadeVal`,`YS_FadeVal2` | mask 转场(R 通道) | HLSL 分支(`TA>=1`+多部件) |
+| 2 | `0x18cf58` | `Samp3`,`YS_TexSize`,`SharpN` | 4-tap 锐利缩放 | 显示缩放档 `DAT_00801334=2` |
+| 3 | `0x18c9a8` | `Samp3`,`YS_TexSize`,`YS_TexDiffU` | 16-tap 双三次缩放 | 显示缩放档 `DAT_00801334=3` |
+
+- 创建链:`FUN_00462d28` 把 FXO 复制到栈上 → `D3DXCreateEffect`
+  (`0x4cd434`,检查 magic `0xFEFF0901`)→ `SetTechnique("YS_ShaderTest1")`。
+  `CreatePixelShader` 在静态链接的 D3DX9 内部调用,所以 exe 字符串里没有它。
+- 本语料 `_DXMODE=0` 走固定管线;`_DXMODE≠0` 的脚本分支才会产生 HLSL
+  转场。内核把 `dx_mode` 作为显式宿主契约(默认 0),非 0 时后端用
+  psC/psD 独立 WGSL;详见 `docs/shader-parity.md`。
+- **MODE 4/8/10..18 仍 `Unimplemented`**:这 4 个 pass 不是 Photoshop
+  混合模式;不得拿它们冒充除算/差分/Overlay 等。
 
 ### 5.4 实现状态
 
 | MODE | `fixed_state()` | 后端 |
 |---|---|---|
 | 0 | 有 | 可执行;先按手册 α 混合,像素对拍后再转正 |
-| 1/2 | 有 | 可执行 |
-| 3/5/6/7/9 | 有 | 状态已取证;辅助纹理/运算本体未取证 ⇒ 后端应跳过 |
+| 1/2 | 有 | 可执行(MODE 2 的 RGB 已按 `T·A` 修正) |
+| 3/5/6/7/9 | 有 | soft 与 wgpu 全部可执行(源色归约 + D3D9 因子;wgpu 用 `Src/OneMinusDst/OneMinusSrc` 对应颜色因子) |
 | 4/8/10..18 | 无 | 后端必须跳过 |
 
 `yu-gfx` 的 `BlendMode::confidence()` 与 `docs/render-parity.md` 本表一一对应;
@@ -261,13 +300,16 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 - 全局设置,逐帧对 stage 0/1 下发(`FUN_0043cd6c` 行 46-117):
   MAG/MIN = `DAT_005b4804/4808`(0=POINT,1=LINEAR,2=ANISOTROPIC);
   MIP = `DAT_0080131c`(-1=NONE,0=POINT,1=LINEAR,2=ANISOTROPIC)。
+- **值来源(2026-10-21 复核)**:`FUN_00460924` 读完 `yscfg.dat` 后
+  **无条件**写 `MAG=1`、`MIN=1`、`MIP=0`、aniso=0
+  (`DAT_005b4804/4808/80131c/801320`),不从设置文件读取 MIP/aniso;
+  引擎不生成 mip 链。因此“引擎真值”= `LINEAR/LINEAR/POINT`、无各向异性。
 - 不是逐层属性;`CG[MIPMAP=...]` 是另一条未取证路径,原样留档(DIV-GFX-011)。
-- 旧线“固定 Linear”是已知 ❌;gfx 默认值明确为 POINT/POINT/NONE 占位
-  (`filter.source=placeholder`),由宿主从引擎设置注入真实值
-  (`GfxState::set_filter` → `filter.source=engine_settings`)。后端在
-  `placeholder` 时不得声称过滤语义已对齐。
+- gfx 默认值仍是 POINT/POINT/NONE 占位(`filter.source=placeholder`),
+  由宿主注入引擎真值(`GfxState::set_filter` → `filter.source=engine_settings`);
+  后端在 `placeholder` 时不得声称过滤语义已对齐。
 - 扩展名探测序来自 `yscfg +0x1c` 8 字节;`FUN_0040c9b4` 映射
-  `1→.png, 2→.bmp, 3→.jpg, 4→.gif, 5→.psb`;ERIS = `01 02 03 04 05`。
+  `1→.png, 2→.bmp, 3→.jpg, 4→.gif, 5→.psb`;样本工程 = `01 02 03 04 05`。
 
 ---
 
@@ -291,8 +333,8 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 ## 8. 组 / 离屏 / COPY
 
 - 组 = 离屏 pass + 一个 `Op::Group`。pass 顺序:所有 `Texture` 复制/图像加工
-  (按各自日志顺序分组,不是脚本命令交错序;RECTPAINT 族可执行,复制/其余
-  加工仍跳过)→ 组离屏(后序:子组先于父组)→ 屏幕。
+  (按命令交错序;J2 起 copy/image 共用一个 `seq`,RECTPAINT 族与 COPY 均可
+  执行)→ 组离屏(后序:子组先于父组)→ 屏幕。
 - 图像层的子层:引擎遍历对任意节点**先递归子层再画本层**
   (`FUN_00413dc8 0x413e1a`);gfx 把图像层的非组后代按同一后序扁平输出到
   父目标,不再静默丢层。
@@ -305,17 +347,19 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
   (DIV-GFX-008/041)。
 - `CGACT[COPY/COPY2]`:
   - 手册:COPY=图像+属性,COPY2=仅图像;
-  - 引擎时序(任务 J 受控微场景 `fidelity-micro6h`):group 源 `COPY2`
-    取**命令执行时的当前状态**,不是上一帧已渲染结果。旧线
-    `last_rendered_frame` 结论被 Refuted(EVID-J-11);layer 源未单独测。
-  - 区域 `X/Y/X2/Y2` 原样保留(语义待微场景,EVID-J-12);
-  - 现状:`Op::Copy` + `CopyTiming::LastRenderedFrame` + `Unimplemented`
-    (DIV-GFX-007);`CopyTiming` 的命名待契约确认后改为命令当前语义。
-    目标层纹理 = `TextureRef::Snapshot(CopyId)`,后端在语义关闭前跳过。
+  - 引擎时序(任务 J 受控微场景 `fidelity-micro6h` + 任务 J2 `j2-micro-copy2`):
+    group/layer 源都取**命令执行时的当前状态**;旧线 `last_rendered_frame`
+    被 Refuted(EVID-J-11);
+  - 区域 `X/Y/X2/Y2` = **源纹理坐标、含端点**;裁剪块写到目标 `(0,0)`,
+    其余区域清空;无区域 = 整图(EVID-T-11,`j2-micro-copy`);
+  - 命令交错序:COPY 与图像加工按脚本命令序立即执行;`frame()` 用
+    `CopyOp::seq`/`ImageOp::seq` 交错输出纹理 pass(DIV-GFX-029 fixed);
+  - 现状:`Op::Copy` 可执行;目标层纹理 = `TextureRef::Snapshot(CopyId)`;
+    快照在后端按 `CopyId` **冻结一次**(目标层存活期间保持,EVID-T-12);
+    `TEXCOPY/TEXSSCOPY` 仍 `Unimplemented`。
   - `CompositorFrame.passes` 只含**目标仍引用该快照且源图层仍存在**的复制;
-    但复制的 `status` 目前恒为 `Unimplemented`(时序/区域未逐项取证),
-    后端必须跳过。源已被 `CGEND` 删除的快照无法在渲染期重放,完整历史
-    留在 `GfxState::copies()` 审计日志里。
+    源已被 `CGEND` 删除的快照无法在渲染期重放,完整历史在
+    `GfxState::copies()` 审计日志里。
 - `SWAP/SWAP2`:`FUN_0042f57d` 行 61-112 交换纹理与 `+0x68/+0x70`(X/Y);
   模式 2 额外交换 `E/A/T/TA/MODE`。gfx 按此实现,SWAP/SWAP2 与模式 1/2 的
   精确对应为 Likely。
@@ -324,17 +368,29 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 
 ## 9. 过渡 `T/TA/TID`
 
-- 门控(`FUN_00414ba4` 行 166-188):部件计数 0 或 `TA < 1` ⇒ 无过渡 pass
-  (单纹理);否则 `BeginPass(1)` 双纹理。
+- 门控(`FUN_00414ba4` asm `0x415558-0x415577`):配对层指针为空 **或**
+  `TA < 1` ⇒ 单纹理普通层(无过渡)。`TID` 为空 = 不查配对
+  (`0x413e7b`);非空但查不到层同样回退普通层(EVID-T-03/06)。
 - uniform:
   - `YS_Texture1` = 本层纹理;`YS_Texture2` = 配对纹理(TID 对侧);
   - `YS_AlphaVal = A/256`;
   - `YS_FadeVal = T / (256/(256/TA + 128)) * (1/256)`(行 905-909);
-  - `YS_FadeVal2` 来源未取证。
-- `Transition::fade_value()` 实现该公式;**不 clamp**;`TA<1` 返回 `None`。
-  例:`T=256,TA=256 → 129/256`;`T=256,TA=1 → 1.5`。
-- `TID` 配对层缺失/推进者(`+0x82` vs `+0x1e8`)未取证(DIV-GFX-006);
-  gfx 在 `to=None` 时把层标 Unimplemented。
+  - `YS_FadeVal2` 来源未取证(HLSL 路径;本语料不走)。
+- **像素语义(J2 修正)**:配对纹理的 **G 通道**是 mask(微场景
+  `j2-micro-transA`:`FF0000/0000FF→0`、`00FF00→255`、`808000/008080→127`);
+  不是 cross-fade。覆盖度:
+  - `T >= 256` ⇒ 1(过渡完成);
+  - 否则 `clamp((30+70*fade) * (mask - (1-2*fade)), 0, 1)`。
+  证据:`j2-micro-trans6/8` 的 T×TA×mask 测量;TA=128 下残差 ≤8/255,
+  TA≠128 的残差见 DIV-GFX-045。J3 起 wgpu shader 使用同一公式与 u8 量化链。
+- `T` 由**脚本**推进(`es_Sprite.yst` `@TP`);`+0x1e8` 只在调试组 RT
+  分支使用,不是过渡推进者(EVID-T-04)。
+- `Transition::fade_value()` 实现公式,不 clamp;`TA<1` 返回 `None`。
+- 本语料 `_DXMODE=0` 走固定管线双纹理路径;HLSL `ps_2_0` 的公式
+  (`oC0.rgb=tex1.rgb`;`oC0.a=tex1.a*sat((FadeVal-0.5*tex2.r)*FadeVal2)*AlphaVal`)
+  在台账 EVID-T-09 备档,不实现。
+- 后端:`Op::Transition` 可执行;soft 用整数 mask 采样,wgpu 用独立
+  transition pipeline;两端同帧像素一致(见 §14)。
 
 ---
 
@@ -383,13 +439,13 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 
 ### 12.1 Pass 顺序
 
-1. `PassTarget::Texture(id)`:按帧内顺序执行 `Op::Copy` / `Op::Image`。
+1. `PassTarget::Texture(id)`:按**命令交错序**执行 `Op::Copy` / `Op::Image`
+   (J2:copy/image 共用一个 `seq`,不再按类型分组;EVID-T-15)。
    未实现的操作必须跳过(看 `status.executable=false`),不得近似。
-   当前可执行的 `Op::Image` 只有 `RECTPAINT/RECTPAINT2/RECTPAINT3`
-   (原地、整层或完整矩形、基图为 Asset/1×1 黑图;EVID-J-02..05);
-   后端在绘制目标层前把填充作用到该层的纹理副本。`Op::Copy` 与其余
-   图像加工仍跳过。日志顺序 = 状态生产顺序;copy/image 分两组输出
-   (命令交错序未取证)。
+   可执行的 `Op::Image`:`RECTPAINT/RECTPAINT2/RECTPAINT3`(EVID-J-02..05)
+   与 `REVERSE`/`HORIZONTAL`(EVID-T-13),目标基图可为 Asset / 1×1 黑 /
+   可执行 COPY 的快照。`Op::Copy` 可执行;后端按 `CopyId` 冻结快照并
+   在图层绘制阶段用 `TextureRef::Snapshot` 取样。
 2. `PassTarget::Offscreen(id)`:组的离屏合成。顺序 = 子组先于父组。
    清屏 = 该 pass 的 `clear`(透明黑)。组内 ops 按 `(z, seq, id)`;
    图像层子层按后序(子先父后)扁平输出。
@@ -417,8 +473,7 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 
 - 用 `BlendMode` + `json::blend_table_json()` 的 `fixed` 状态;数值是 D3D9
   原始枚举,后端映射到自己的 pipeline。
-- 0/1/2 可执行;3/5/6/7/9 状态可下发但可见结果未对拍,默认应跳过;
-  4/8/10..18 无状态,必须跳过。
+- 0/1/2/3/5/6/7/9 可执行(状态表 + D3D9 因子);4/8/10..18 无状态,必须跳过。
 - TFACTOR 规则:`AlphaGray` = `(a<<24)|(a<<16)|(a<<8)|a`,`a=min(max(A,0),255)`;
   `OpaqueWhite` = `0xFFFFFFFF`。
 
@@ -427,17 +482,33 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 - `frame.filter.mag/min/mip` → 两个采样器(stage 0/1)的 MAG/MIN/MIP。
 - `frame.filter.source=placeholder` 表示宿主未注入引擎设置;后端不得声称
   过滤语义已对齐。`engine_settings` 才是已取证值。
-- 不做逐层过滤;`CG[MIPMAP]` 原样留档,不影响全局设置。
+- **引擎真值(2026-10-21 复核)**:`FUN_00460924` 在读完 `yscfg.dat` 后
+  **无条件**写入 `MAG=1(LINEAR)`、`MIN=1(LINEAR)`、`MIP=0(POINT)`、
+  aniso=0(`DAT_005b4804/4808/80131c/801320`),不从设置文件读取 MIP/aniso;
+  引擎也不生成 mip 链。因此后端固定 LOD0 + anisotropy=1 + `mipmap_filter`
+  最近点与引擎等价(不是“静默忽略”:引擎没有可注入的 MIP/aniso 值)。
+  `CG[MIPMAP]` 仍是未取证的另一条路径(DIV-GFX-011)。
+- 不做逐层过滤;`frame.filter` 是全局设置。
 
 ### 12.5 Group / Transition / Copy
 
 - Group:先执行 `Offscreen` pass,再在父 pass 中把 `Op::Group.offscreen`
   当纹理,按 `layer.alpha/blend` 合成。
-- Transition:`from`/`to` 两个纹理,`fade` 已按公式算好;`to=None` 时跳过。
-- Copy:`status` 为 Unimplemented 时**不要执行**;`Snapshot` 纹理在
-  语义关闭前无效。`frame.passes` 里的复制只是“仍可达”的复制,
-  **不是可执行**;`GfxState::copies()` 是完整审计日志(含源已删除的
-  历史项),也不是帧执行清单。
+- Transition:`from`/`to` 两个纹理 + 已算好的 `fade`;`to=None` 不会到达
+  (gfx 已回退普通层)。`dx_mode=0`:像素 RGB 取 `from`;alpha = 纹理 α ×
+  覆盖度 × 层 A;覆盖度用 `to` 的 **G 通道**与 `fade`/`T` 计算
+  (`yu_gfx::transition_coverage`,EVID-T-05)。`dx_mode≠0`:psC(mask = 配对
+  纹理 **R**,`saturate((FadeVal-0.5*mask.r)*TA)*A/256`)或 psD(交叉淡化)。
+  `to` 纹理与 `from` 同尺寸(引擎要求,尺寸不符会报调试错误,EVID-T-07)。
+- 组上的 `TID`:gfx 输出 `Op::Transition { from: Offscreen(组), to: 配对 }`,
+  不再当普通组画掉;配对可以是图像层或组。引擎按层表统一解析 TID,
+  官方微场景因 YSCom 编译器 attach 失败暂缺(标 Likely)。
+- Copy:`status` 为 Executable 时执行;快照按 `CopyId` **只捕获一次**
+  (目标层存活期间冻结);区域是源坐标含端点,裁剪块写目标 `(0,0)`;
+  目标表面尺寸 = 目标层显式尺寸,否则源尺寸。后端可以对组源按需重绘
+  (`group` 的当前子层状态)以取得复制源。`frame.passes` 里的复制是
+  “仍可达”的复制;`GfxState::copies()` 是完整审计日志(含源已删除的
+  历史项),不是帧执行清单。
 - Mask:`Op::Mask.status` 为 Unimplemented;不要用 α 或亮度猜。
 - Image size:`LayerKind::Image{size}` 是绘制矩形。`FILE=""` 的
   `SolidBlack1x1` 必须铺满 `size`;资源图 + `size` 的图层是
@@ -451,18 +522,21 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 
 ### 12.6 Unimplemented 清单(后端必须跳过)
 
-- MODE 4/8/10..18;MODE 3/5/6/7/9(状态可下发,结果未对证)。
+- MODE 4/8/10..18(公式本体未定位)。MODE 3/5/6/7/9 已由状态表实现:
+  soft 与 wgpu 全部执行(`Src/OneMinusDst/OneMinusSrc` 对应颜色因子)。
 - `MID` 掩码。
 - `FX/FR/FC/FEX/...` 滤镜/仿射。
 - 多部件层(非空 `parts`)。
-- `CGACT[COPY/COPY2/TEXCOPY/TEXSSCOPY]`(含 `ID2`、快照源、区域复制)
-  与 `SIZE*`/`ROTATION`/`RESIZE`/`TRIM`/`MONO`/`BLUR*`/... 图像加工
-  (参数已进契约,像素算法/时序未实现)。
-  **例外**:`RECTPAINT/RECTPAINT2/RECTPAINT3` 已在原地、整层或完整矩形、
-  基图为 Asset/1×1 黑图时标 `Executable`,后端必须执行(EVID-J-02..05);
-  `ID2`、快照源、部分区域仍 Unimplemented。
-- 资源图 + `SX/SY` 的显式尺寸(仅 `FILE=""` 黑图可执行)。
-- TID 非空但配对层缺失的过渡。
+- `CGACT[COPY/COPY2/TEXCOPY/TEXSSCOPY]`:COPY/COPY2 已可执行(DIV-GFX-007);
+  `TEXCOPY/TEXSSCOPY`、组目标复制仍 `Unimplemented`。
+  `SIZE*`/`ROTATION`/`RESIZE`/`TRIM`/`MONO`/`BLUR*`/... 图像加工参数已进契约,
+  像素算法未实现(参数已进契约,像素算法/时序未实现)。
+  **例外**:`RECTPAINT/RECTPAINT2/RECTPAINT3` 与 `REVERSE`/`HORIZONTAL`
+  在整层、Asset/1×1 黑/快照基图时标 `Executable`,后端必须执行
+  (EVID-J-02..05、EVID-T-13)。
+- TID 非空但配对层缺失的过渡:不再 Unimplemented,gfx 回退单纹理普通层
+  (EVID-T-03)。
+- 资源图 + `SX/SY` 的显式缩放/裁剪(仅 `FILE=""` 黑图可执行;DIV-GFX-022)。
 - `CGINFO/FONTINFO/WINDOWINFO` 的未取证字段:资源图 `SX/SY`(DIV-GFX-024)、
   多字段顺序(DIV-GFX-025)、`COLOR/ONMOUSE*/CAPTION/...`(DIV-GFX-026)。
   已取证字段由 `GfxHost` 同步回答。
@@ -487,7 +561,7 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 | 审查 B7:“`in_stack_00000010==0 → A=0` 未建模” | **错**:图层遍历调用点恒传 1(`0x413f29`),清零分支不属于本路径 | `FUN_00413dc8` 汇编 |
 | 审查 B2:“E 可能写 +0xa4” | **错**:E=`+0x89`,层种类=`+0xa4`(1 图像/2 组/0 死) | `0x413e34/0x413e47`、`0x42c400`、`0x40a38c`、`0x40e02c`、`0x43d4bc` |
 | 审查 B12:旧地址 `0x42c4a4/0x43d334/0x43d4a4` | 本地反编译树不存在;改用 `0x413dc8/0x4141e4/0x414559/0x43d4bc` | 会话 F 台账 B12 |
-| 审查 B11/§2“1 个可执行复制” | **错**:所有 `CopyOp.status` 恒为 `Unimplemented`;passes 只表示“仍可达” | `state.rs` `cgact_copy` |
+| 审查 B11/§2“1 个可执行复制” | **J2 已更新**:`Op::Copy`(COPY/COPY2)现在全部可执行;`TEXCOPY/TEXSSCOPY` 仍 Unimplemented | `state.rs::cgact_copy`;EVID-T-11/12 |
 | 手册“SX/SY 仅图层组有效” | **与引擎/真实脚本冲突**:图像层同样保存层矩形;`FILE=""+SX/SY` 是黑幕标准写法 | `FUN_00465730/0043772c/00408724`;`es_ERIS.yst:579` |
 | 旧线“COPY 复制上一帧已渲染目标” | **Refuted(至少 group 源)**:受控微场景显示 `COPY2 ID=":/W0/"` 取命令执行时的当前状态;命令后再改图层不影响快照 | `target/tmp/fidelity-micro6h-ref/frame_0005.png`;EVID-J-11 |
 | “主组 W0 按普通组离屏合成” | **错**:官方主组 W0 的子层直接画到屏幕;子组离屏 alpha 不参与父级合成 | `target/tmp/fidelity-micro5-ref/frame_0004.png`;EVID-J-08 |

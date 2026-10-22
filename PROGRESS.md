@@ -2825,3 +2825,935 @@ cargo clippy -p yu-rt --lib   5 warnings(基线不变)
   宿主 setter(同 `_WINDOW_EXEC_MAX/CLOSE`),不在 VM 猜 0/1 状态机。
 - 矩阵 §3/§7 与 DIV-RT-007 已同步。
 
+
+
+---
+
+## 成果 K1 (2026-10-21) · hosts 层:原生引擎服务 + wasm 呈现端(架构 B)
+
+> 任务书 `docs/tasks/task-k2-hosts.md`。**2026-10-21 主人决定把架构从
+> 「wasm 跑内核」改为 B:Rust 读本机数据 + 跑内核,wasm/JS 只做呈现**;
+> 浏览器不下载整包,服务端按需读文件。本成果按 B 交付,任务书里被替代的
+> 条目在 §7 逐条挂账。零 git 写操作;`yu-rt` / `yu-gfx` / `yu-backend-*` /
+> `yu-font` / `yu-trace` **未改**;`yu-vfs` 最终 **零改动**(B 下不需要
+> `from_bytes`,切架构后已撤销)。
+
+### 1. 交付物
+
+| 路径 | 内容 |
+|---|---|
+| `crates/yu-cli` | 原生宿主 + 本地服务 + HMR 监督 + 用例执行器。lib + 两个 bin:`yu-cli`(产品)、`yu-engine`(HMR 子进程) |
+| `crates/yu-host-wasm` | 浏览器**呈现端**(wasm-bindgen):WebGPU shim 优先,Canvas2D 回退。不依赖 rt/gfx/后端/vfs |
+| `www/` | `index.html` + `app.js` + `styles.css`:canvas、状态浮层、Restart/Pause、鼠标/键盘输入、WebSocket |
+| `cases/` | `first-screen` / `until-visible` / `record-events-off` |
+| `crates/yu-cli/tests/hmr.rs` | HMR 冒烟(10 次重建,默认 `#[ignore]`,显式跑) |
+| `.gitignore` | `www/pkg/`、`www/node_modules/`(产物不入库) |
+
+命令:`run`(headless)/`serve`(产品入口)/`dev`(HMR)/`case`/`bench`。
+
+### 2. 架构与协议
+
+```text
+浏览器 www/index.html + app.js + yu-host-wasm(只呈现)
+  │ WebSocket /ws:YUF1 二进制帧 + 输入/控制 JSON
+  ▼
+yu-cli serve(或 yu-engine serve)
+  │ 同一份 native 读取:data.ypf 优先、data/ 为备
+  ▼
+yu-rt → yu-gfx(CompositorFrame) → yu-backend-soft / yu-backend-wgpu
+```
+
+- 服务端主线程按 `--fps` 推进引擎;帧只编码一次(`Arc<Vec<u8>>`)广播。
+  慢客户端丢旧帧并计数;无客户端时不推进(不烧 CPU)。
+- 帧头 56 字节:`YUF1` + w/h/frame/ops/skipped/executed/passes/layers/
+  visible/ms + backend + flags(drawable/rendered/paused)+ rgba_len + RGBA8。
+- 新连接先收 `/api/status` 文本 hello,再补发**最近一帧**(暂停/重连不空白)。
+- `--pause-at N` 用于截图/验收:到达帧即停;Restart 会清暂停并重新跑。
+- 重启单元 = `Vm` + `GfxState`;数据源母本、纹理缓存、渲染器实例保留。
+- 浏览器 WebGPU:**呈现**走页面 shim(web-sys WebGPU 绑定需要
+  `web_sys_unstable_apis`,会污染构建前提);合成器始终是 native 后端。
+  两条呈现路径(2D/WebGPU)与 native 像素逐字节一致(见 §5)。
+
+### 3. P0 阈值与实测
+
+阈值在 `crates/yu-cli/README.md` **先声明后测量**;正式测量前把
+「boot + 首个可绘制帧 <1s」这条自加口径改回任务书原文「re-boot 后可 tick
+<1s」,理由与时间点写在 README。机器:RTX 5070 / Vulkan / Rust 1.96;
+语料 `data.ypf` 31,501,753 B。
+
+```text
+$ ./target/release/yu-cli.exe bench <project-eris> --frames 300
+boot(off): 104.43 ms; first tick 2439.77 ms; first drawable at frame 3 after 2841.95 ms
+  frame 1: tick 2439.77 ms render 4.94 ms
+  frame 3: tick 284.62 ms render 5.13 ms
+boot(on): 54.45 ms; first tick 4570.21 ms; first drawable at frame 3 after 5441.08 ms
+on/off 守恒: display_sha256 一致 (off 1729689580a5 / on 1729689580a5)
+reboot: boot 74.94 ms; first tick 3220.34 ms; ready in 3300.67 ms
+steady: 300 frames in 7245 ms -> 41.5 fps (avg 24.09 ms, engine avg 23.79 ms, p95 16.46 ms)
+steady slowest 5: frame 6: 2816.2 ms, frame 3: 309.9 ms, frame 227: 153.1 ms, frame 142: 22.9 ms, frame 13: 21.7 ms
+wgpu: 444.10 ms adapter=NVIDIA GeForce RTX 5070 backend=vulkan
+wasm: no-op 171 ms; incremental 575 ms; bindgen 96 ms
+server: first frame 2589 ms; 60.4 fps; input p95 32.3 ms; dropped 0
+gate boot(off) < 500 ms: 104.43 <= 500.00 -> PASS
+gate re-boot 后可 tick < 1000 ms: 3300.67 <= 1000.00 -> FAIL
+gate 稳态 >= 30 fps: 41.51 >= 30.00 -> PASS
+gates: FAIL(记录实况,不改阈值)
+```
+
+**两条 FAIL 的同一个根因**:ERIS 启动链第一个大帧 129 万命令,release
+2.4–3.2 s(debug ~14 s)。boot 本身 44–104 ms;这个帧是 `yu-rt` 派发/表达式
+热路径,本任务只读消费、未改。按纪律保留 FAIL,未调阈值、未换口径。
+
+### 4. HMR 冒烟(原始输出)
+
+```text
+$ YURIS_SAMPLE_ERIS_ROOT=<project-eris>     cargo test -p yu-cli --test hmr -- --ignored --nocapture
+baseline: marker=k2-engine-0 pid=... (supervisor pid ...)
+change 8/10: marker=k2-engine-hmr-8 pid=48444 e2e=3548 ms
+change 9/10: marker=k2-engine-hmr-9 pid=11092 e2e=4066 ms
+change 10/10: marker=k2-engine-hmr-10 pid=41172 e2e=3855 ms
+leak check: supervisor rss 11329536 -> 11329536 (+0 bytes), handles 150 -> 150 (+0)
+restore: marker=k2-engine-0
+HMR smoke: 10 changes, avg 3640 ms, max 4242 ms (limit 15000 ms)
+test hmr_rebuilds_child_and_keeps_service_alive ... ok
+```
+
+监督进程 `yu-cli` 不重建(Windows 运行中 exe 不可覆盖),反复重建的是
+`yu-engine` 子进程;浏览器 WebSocket 自动重连并重新出首帧。改 `www/` 走
+`reload` 控制行 + SSE。**系统 TEMP 不可写**会让链接器 `LNK1104`;监督进程
+给 cargo 显式设 `TEMP/TMP=<workspace>/target/tmp/cargo-temp`。
+
+### 5. 浏览器验收(自动化,headless Chrome 149 + CDP)
+
+```text
+服务: yu-cli serve <project-eris> --no-open --port 4205 --pause-at 302
+native: yu-cli run <project-eris> --until-frame 302
+  frame: 302 viewport: 800x600
+  layers: 272 (visible 8), passes: 15
+  ops: 27 total, 15 drawn, 12 skipped
+  rgba sha256: 6d183527625c64f0eb12831a59f2ccd37a86cc39c20d62466d38bf133ed5df39
+
+浏览器 ?present=2d:
+  overlay: frame=302 ops=27 skipped=12 executed=15 present=2d
+  canvas sha256: 6d183527...ed5df39       ← 与 native 逐字节一致
+浏览器默认(WebGPU):
+  overlay: frame=302 ops=27 skipped=12 present=webgpu
+  canvas sha256: 6d183527...ed5df39       ← WebGPU 呈现同样逐字节一致
+Restart: 状态回到 frame 1 → 再次跑到 302 并停住,浮层 302/27/12/15 不变
+```
+
+截图 `target/tmp/browser-webgpu-paused.png` 是 title 画面(frame 302,
+「Ku-ris B4 for Windows 98/Me/2000/XP/2003/Vista/7/8/10/11」)。
+
+### 6. 途中发现并修正(都有证据)
+
+1. **宿主注入字段会改启动分支**:`@_OS_SOUND=0` + `@_MEDIA_READONLY=1` 时
+   ERIS 首帧只剩 2 层/4 op;改回参考环境(`os_sound=true`、
+   `media_readonly=false`)后与 `first_frame` 完全一致(frame 3 / 272 层 /
+   18 op / 13 drawn / 5 skipped / PNG 540267 B)。README 与 `--help` 已写明
+   「宿主不播放声音 ≠ 引擎认为声音不可用」。
+2. **WebSocket 读写锁死锁**:读线程持 writer 锁阻塞读,发送循环永远拿不到
+   锁(hello 之后无帧)。改为读不持锁,ping 以消息返回、由调用方回 pong。
+3. **Windows 系统 TEMP 不可写** → cargo 链接 `LNK1104`;监督进程/bench 的
+   cargo 子进程显式 `TEMP/TMP`。
+4. **Restart 后仍保持暂停**:`--pause-at` 的暂停标志没有随 Restart 清零。
+5. **wasm 导出用法**:`module.default()` 返回 wasm exports,不是 JS 命名空间;
+   `new wasm.Presenter` → `new module.Presenter`。
+6. **暂停/重连新连接无帧**:补「最近一帧」缓存,连接时立即补发。
+
+### 7. 与任务书的差异 / 挂账
+
+| 任务书 | 实际(B) | 理由 |
+|---|---|---|
+| P2 wasm HMR(改 Rust→重建 wasm→浏览器) | native HMR(重建 `yu-engine`→WS 重连) | 内核在 native;wasm 只是呈现端。presenter 构建实测 575 ms |
+| P3 `Host::new(ypf_bytes)` 跑内核 | `Presenter`(呈现端) | 读取/执行在服务端,浏览器不持有包 |
+| `--vite` 可选 | **取消** | 页面由引擎同源提供,HMR 用 WS 重连,不需要 Node |
+| P4 用例带输入 | 输入时间线已实现并单测;3 条必做用例无输入 | `CLICK` = `MOUSE_L`,按下 frame、frame+1 松开 |
+| `yu-vfs` 加 `from_bytes` | **无改动** | B 下不需要;已撤销,保持零跨 crate 改动 |
+| 浏览器首帧 ≤5 s(含 31.5 MB fetch) | 不再下载整包;首帧 2.59 s | 初始化帧占 2.4 s;与上表同一根因 |
+
+仍挂账:
+
+- 两条性能门禁(首帧/重启后可 tick)受 `yu-rt` 初始化帧限制;若要做,属于
+  M 线的派发热路径优化(本任务禁止改 `yu-rt`)。
+- `clients` 计数在页面反复导航时可能短暂包含正在关闭的 socket(写失败即
+  注销,不影响帧);未做主动心跳清理。
+- 浏览器生产装载的 file picker/OPFS 不需要(B:服务端读本机);
+  多 GB 包由 `YpfSource::open` 惰性随机读,浏览器只收帧。
+
+### 8. 验证命令与原始结果
+
+```text
+$ cargo test -p yu-cli --all-targets
+10 passed (lib);0 failed;hmr ignored(显式跑时 1 passed)
+
+$ YURIS_SAMPLE_ERIS_ROOT=<project-eris>   cargo test -p yu-cli --test hmr -- --ignored --nocapture
+1 passed(10 次重建,见 §4)
+
+$ cargo clippy -p yu-cli -p yu-host-wasm --all-targets
+yu-cli / yu-host-wasm 0 告警(输出中的 5 条 warning 均来自 yu-rt)
+
+$ cargo clippy -p yu-host-wasm --target wasm32-unknown-unknown
+Finished(0 告警)
+
+$ cargo check -p yu-host-wasm --target wasm32-unknown-unknown
+Finished
+
+$ cargo test -p yu-cli --lib
+10 passed; 0 failed
+
+$ cargo test -p yu-vfs
+(未改 yu-vfs;全量 workspace 跑法见下)
+```
+
+全量 `cargo test --workspace --no-fail-fast`(带 AGENTS §2 样本):
+
+```text
+yu-format corpus_eris 1 passed;yu-rt consistency 4 passed;yu-rt corpus 10 passed
+(以上三项在首次跑时因 SDK 路径/散盘根布局失败,修正
+ YURIS_SAMPLE_SDK0495=…/yu-ris_0495_032(不带 システム)并把
+ system/YSCom/YSCom.ycd 放进散盘根后全绿)
+yu-gfx tests/eris_first_screen:2 failed(visible left=8 right=34)
+  ← 既有问题,成果 J1 §6 已报告(golden 34 visible 来自 771cf79);不在本任务
+    允许改动的 crate 范围,未用 UPDATE_GFX_GOLDEN 掩盖。
+其余包全绿。
+```
+
+### 9. 改动文件
+
+新增:`crates/yu-cli/**`、`crates/yu-host-wasm/**`、`www/{index.html,app.js,styles.css}`、
+`cases/*.json`;修改:`.gitignore`、`Cargo.lock`(新 crate 的依赖)。
+未改:`yu-rt` / `yu-gfx` / `yu-backend-*` / `yu-font` / `yu-trace` / `yu-vfs`。
+
+
+### K1 补充(2026-10-21)· 页面日志模块与 boot 链诊断
+
+- 新增 `GET /api/report`(最近一帧的完整后端报告:skipped 原因/缺失资产/
+  文本计数)与页面日志面板(`Log` 按钮,`?log=1` 自动打开;环形 300 行):
+  连接/hello/每 0.5 s 帧摘要/输入/错误 + 每 2 s 的 skipped/missing 摘要。
+- **boot 链没有动画的原因**(日志与 `/api/report` 实证,frame 20/60/180):
+  `transition.unsupported`(`:/W0/SPL101`、`SPL401`)与
+  `gfx.imageop.unsupported`(`:/W0/SPLTRBUF101/401`)被 gfx/后端跳过,
+  boot 动画的可见内容就在这些 op 上;302 帧后的 title 是静态的。
+- **title 按钮不显示的原因**:gfx 发出的资产名是
+  `cgsys/title/btn_bgmmode` 等基名,包里实际是状态后缀文件
+  (`_na/_off/_on/_over`,共 69 个 `cgsys/title/*`);状态后缀选择尚未实现,
+  所以 `asset.missing` ×10。
+- 以上两项都属 gfx/资产保真线(不在 K2 可改 crate 范围),本任务只提供
+  可观测性与证据,不改语义。
+
+## 成果 J2 · Title 链路 TODO 清理:转场双纹理、COPY、图像加工与按钮取证
+
+> 2026-10-21。范围:`crates/yu-gfx`、`crates/yu-backend-soft`、
+> `crates/yu-backend-wgpu` 及其文档。未改 `yu-rt` / `yu-vfs` / `yu-cli` /
+> `yu-host-wasm`;零 git 写操作。台账 = `docs/title-motion-ledger.md`
+> (EVID-T-01..15;P0 三张清单 + P3 区域对拍)。
+
+### 1. 交付物
+
+| 项 | 文件/产物 |
+|---|---|
+| P0 探针 | `crates/yu-backend-soft/examples/title_probe.rs`(逐 tick transition/copy/image 计数、跳过原因、资产解析) |
+| P0 原始数据 | `target/tmp/j2-title-probe-600.tsv`(J2 前) / `target/tmp/j2-title-probe-600-after.tsv`(J2 后) |
+| 台账 | `docs/title-motion-ledger.md`(EVID-T-01..15 + 关闭表 + P3 结果) |
+| 官方微场景 | `target/tmp/j2-micro-{trans1..transA, rev, copy, copy2}/`(YSCom 0.495 编译 + `capture_screen.py`) |
+| 官方编译 shader | `target/tmp/j2-shaders/`(`fxc /dumpbin` 反汇编;ps_2_0 转场公式备档) |
+| 转场实现 | `yu-gfx::transition_coverage`(G 通道 mask + fade 模型);soft `draw_transition`;wgpu transition pipeline(`pipelines.rs` 双纹理 WGSL) |
+| COPY 实现 | `Op::Copy` 可执行;soft 持久快照 + 区域 blit;wgpu `copy_texture_to_texture` + 快照目标 + 快照 RECTPAINT pipeline |
+| 图像加工 | `apply_reverse`(RGB 取反)/`apply_horizontal`(水平镜像) |
+| 交错序 | `CopyOp::seq` / `ImageOp::seq`;`frame()` 按命令序交错输出纹理 pass(DIV-GFX-029) |
+
+### 2. 关闭/挂账(DIV-GFX)
+
+| 条目 | 终态 | 证据 |
+|---|---|---|
+| 006 过渡配对/推进者 | **fixed** | EVID-T-01..09;配对缺失/TA<1 = 普通层;T 由脚本推进;mask=配对 G |
+| 007 COPY/COPY2 | **fixed**(TexCopy/TexSsCopy 仍 open) | EVID-T-11/12/15 |
+| 013 图像加工 | **partial**(新增 REVERSE/HORIZONTAL;SIZE/MONO/... 仍 open) | EVID-T-13/14 |
+| 017 COPY 的 Z | **fixed(决策保持)** | EVID-J-10;调用点未定位前不改行为 |
+| 029 copy/image 交错序 | **fixed** | EVID-T-15;`j2-micro-copy2` 三方向量一致 |
+| 044 SPLTRBUF/分屏 | **withdrawn** | EVID-T-10(脚本图层名,不是命令) |
+| 043 按钮后缀 | **blocked(跨 crate)** | EVID-T-20/21/22;需 `yu-rt FILEINFO[EXIST]→LET` |
+| 045 TA 残差 | **open(低风险)** | TA=128 校准,残差 ≤8/255;TA≠128 在 T≈255 偏差 ~0.12 |
+| 008/041 组 RT | **blocked(契约裁决)** | title 稳定帧 W0 A=256 不依赖;EVID-J-08 |
+
+### 3. P0 → P3 数量变化(title)
+
+```text
+J2 前(tick 300):ops 19, drawn 15, skipped 4
+  skip image SPLTRBUF101 / transition SPL101 / layer copy ×2
+J2 后(tick 300):ops 27, drawn 17, skipped 10
+  skip layer ×10 = asset.missing(cgsys/title/btn_* 基名;跨 crate 阻塞)
+600 tick 累计:image executable 7238 → 7781;copy executable 0 → 56;
+              transition 全部 Executable(SPL101/SPL401)
+```
+
+### 4. 验收命令与原始结果
+
+```text
+$ YURIS_FIRST_FRAME_TICK=300 cargo run -p yu-backend-soft --example first_frame
+layers: 445 (visible 115), passes: 16, offscreen passes: 2
+ops: 27 total, 17 drawn, 10 skipped
+missing assets: 10   (全部 cgsys/title/btn_* 基名)
+png: target/tmp/j2-title-soft-t300.png (1920813 bytes)
+
+$ YURIS_FIRST_FRAME_TICK=300 cargo run -p yu-backend-wgpu --example first_frame
+layers: 445 (visible 115), passes: 16, offscreen passes: 2
+ops: 27 total, 17 drawn, 10 skipped
+display check: OK (passes 16 ops 27 executable 27 skipped 0)
+all_black=false deterministic=true
+png: target/tmp/j2-title-wgpu-t300.png (1920813 bytes)
+
+$ sha256sum j2-title-soft-t300.png j2-title-wgpu-t300.png
+6b03238a93bd4fa90e699864ad15b7ba793daab082ae87814decbd6898dcbae5  (两文件相同)
+
+$ cargo run -p yu-backend-soft --example title_probe -- 600
+IMAGE_ACTION rectpaint 1200 / rectpaint2 29 / rectpaint3 6038 / reverse 514
+IMAGE_STATUS executable 7781 (无 unsupported)
+COPY_STATUS executable 56 (无 gfx.copy.unsupported)
+ASSET: 10 个 cgsys/title/btn_* asset.missing
+
+$ cargo test -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu
+yu-backend-soft: 16 + 7 passed; yu-backend-wgpu: 6 + 9 passed;
+yu-gfx: 10 + 5 + 10 + 1 + 15 + 4 + ... passed;
+eris_first_screen_display_list / ..._with_synchronous_info_queries FAILED
+  (既有跨 crate boot 漂移 visible 8 vs 34,见成果 J1 §6;本任务未改 golden)
+
+$ cargo clippy -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu --all-targets
+三个 crate 0 新增告警(yu-rt 既有 5 条)
+```
+
+### 5. 区域对拍(阈值先声明:平坦区 max ≤4、diff>4=0)
+
+```text
+官方 target/tmp/fidelity-ref/frame_0006.png
+内核 target/tmp/j2-title-soft-t300.png
+平坦区域(官方 3×3 每通道极差 ≤2):
+  按钮列以外(上/左) 106,127 px  max 3  diff>4 0  PASS
+  按钮列右侧          62,102 px  max 3  diff>4 0  PASS
+  LOGO 区域           14,552 px  max 3  diff>4 0  PASS
+按钮列:缺失 10 个按钮(blocked:yu-rt FILEINFO)
+1px 边缘:归 DIV-GFX-042(不在 J2 范围)
+```
+
+### 6. 证据要点
+
+- **EVID-T-03/06**:asm `0x415558-0x415577` 双纹理门控;配对缺失/
+  `TA<1`→`0x416f8d` 单纹理;`TID=""` = 不查配对;`j2-micro-trans1` TR7。
+- **EVID-T-04**:`T` 由脚本 `@TP` 推进;`+0x1e8` 只在调试组 RT 分支。
+- **EVID-T-05**:mask = 配对纹理 **G 通道**(`FF0000/0000FF→0`,
+  `00FF00→255`);覆盖度 `clamp((30+70*fade)*(mask-(1-2*fade)),0,1)`,
+  `T>=256` 为满;TA=128 测量残差 ≤8/255。
+- **EVID-T-08/09**:本语料 `_DXMODE=0` 走固定管线;HLSL `ps_2_0`
+  (`oC0.rgb=tex1; oC0.a=tex1.a*sat((FadeVal-0.5*tex2.r)*FadeVal2)*AlphaVal`,
+  `FadeVal2=TA`)从 exe 提取并 `fxc /dumpbin` 反汇编,备档不实现。
+- **EVID-T-10**:`SPLTRBUF/SPL/SPLTR` 是脚本图层名 → DIV-GFX-044 withdrawn。
+- **EVID-T-11/12/15**:COPY 区域/时序/生存期/命令交错序;`j2-micro-copy`
+  + `j2-micro-copy2`;软/硬后端与官方采样点逐值一致。
+- **EVID-T-13**:REVERSE=RGB 取反、HORIZONTAL=水平镜像(`j2-micro-rev`)。
+- **EVID-T-20/21/22**:按钮后缀由脚本 `FILEINFO[EXIST=1]` 探测;内核缺的是
+  `yu-rt` 的 LET 写回,交接规格见台账 §6。
+
+### 7. 遗留 / 阻塞
+
+1. **按钮 10 个 asset.missing = 跨 crate**:需 `yu-rt` 实现
+   `FILEINFO[EXIST=1]→LET`;J2 任务书禁止改 `yu-rt`。交接台账 §6。
+2. **DIV-GFX-045**:转场覆盖度的 TA 依赖未完全收敛(TA=128 校准);
+   需固定管线 mask 纹理生成路径的 REA 取证。
+3. **DIV-GFX-042**:1px 边缘与官方仍不同(既有)。
+4. **DIV-GFX-008/041**:组 RT/主组直绘契约未裁决(title 不依赖)。
+5. **快照捕获时机**:后端在“首次渲染该 `CopyId` 的帧”捕获;若只渲染
+   复制之后的某一帧(不逐帧播放),快照内容是渲染帧的源状态而非复制命令
+   所在帧的状态。title 稳定帧无 COPY,不影响验收;逐帧播放时与官方一致。
+6. `yu-gfx` 的两条首屏 golden 仍因既有 boot 漂移失败(`visible 8 vs 34`),
+   未更新 golden(沿用成果 J1 的处理)。
+
+## 成果 J3 (2026-10-21) · Title 跑通:FILEINFO、boot 锚点与 WebGPU 一等公民
+
+> 任务书 `docs/tasks/task-j3-title-webgpu.md`。范围:`crates/yu-gfx`、
+> `crates/yu-backend-soft`、`crates/yu-backend-wgpu`,以及对 `yu-rt` 的
+> **唯一加法** `FILEINFO[EXIST]→LET`。未改 `yu-cli`/`yu-host-wasm`/`www`;
+> 零 git 写操作。台账 = `docs/title-motion-ledger.md` §8/§9(EVID-J3-01)。
+
+### 1. 交付物
+
+| 项 | 文件/产物 |
+|---|---|
+| FILEINFO | `crates/yu-rt/src/vm/handlers.rs::op_fileinfo`;fixture 两条 |
+| 逐帧基线 | `yu-backend-soft/examples/frame_walk.rs`、`yu-backend-wgpu/examples/wgpu_frame_walk.rs`(同列 TSV,含 RGBA sha256/耗时/上传计数) |
+| 示例重命名 | wgpu 端改为 `wgpu_first_frame`/`wgpu_frame_walk`,消除 Cargo 输出文件名冲突 |
+| WebGPU 修复 | 转场 shader 公式+量化、命令段/按需组 pass、覆盖纹理跨帧缓存、屏幕 alpha 归一 |
+| soft 修复 | `compose_group` 报告回滚、D3D9 浮点混合模型 |
+| golden | `crates/yu-gfx/tests/golden/eris_first_screen_display.json` 按复核后的 census 重生成 |
+| 文档 | `docs/title-motion-ledger.md` §8/§9、`docs/gfx-unimplemented-todo.md`、`crates/yu-gfx/docs/divergences/README.md`、`docs/render-parity.md`、两份后端 README |
+
+### 2. P1 · 按钮列(FILEINFO)
+
+证据四件套:手册 `file/fileinfo.html`(EXIST/LET、0.276 起可查包内文件)、
+REA opcode 22 `0x44286c`(EXIST 分支、四种存在性策略、`0x443222/0x4432dc`
+写 1/0)、真实脚本 `es_Button.yst:1759-1765`、官方 title 截图。
+
+实现只覆盖 `FILE+EXIST+LET`(其它 FILEINFO 查询仍挂号);路径经
+`yu_vfs::LookupKey` 归一,存在性查封包/散盘与工程根。
+
+结果(tick 300):`asset.missing 0`,`ops 27 / drawn 27 / skipped 0`;
+10 个按钮纹理为 `cgsys/title/btn_*_off|_on|_over|_na`。
+对官方 flat-region 阈值(先声明 `max≤4`、`diff>4=0`):
+按钮列 27,763 平坦像素 max 2 / diff>4 0;其余 191,215 像素 max 3 / 0。
+
+### 3. P2 · boot/title 锚点
+
+- 运行配置取 `@_DEBUGMODE=0`(工程 `projectconfig.txt` DEBUGMODE=0);
+  窗口标题【デバッグモード】只作旁证(可能是构建标签),以 title 像素与
+  debug=true 的行为对照为准。
+- A/B:`debug_mode=false` 在 tick 224 进入 title;`debug_mode=true` 在
+  1200 tick 内不进 title(debug UI/黑帧,script 58 `es_Title` 未执行)。
+- 旧 golden(visible 34/ops 44)来自 `771cf79`,早于 `1365918`;当前
+  census 为 272 layers / 8 visible / 15 passes / 18 ops / W0 4 ops /
+  264 invisible。先审 census 与 title 像素对照,再重生成 golden:
+  `cargo test -p yu-gfx --test eris_first_screen`(带样本)两条绿。
+- **挂账**:`debug_mode=true` 的 title 缺失属 rt debug 分支,超出 J3 允许的
+  `FILEINFO` 加法;需后续用官方 L1 trace 继续二分(台账 §9.2)。
+
+### 4. P3 · 三端一致性与性能
+
+原始结果:
+
+```text
+$ cargo test -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu
+  全部 test result: ok(20 个测试二进制;含 eris_first_screen 两条,12.8s)
+$ cargo test -p yu-rt
+  47 + 4 + 10 + 4 + 49 + 3 passed; 0 failed
+
+$ ./target/release/examples/frame_walk 600 / wgpu_frame_walk 600
+  600 帧: hash 不一致 0;ops/drawn/skipped/transition/copy/image 不一致 0
+  wgpu 上传帧: tick 0(4 B)、1(26,656 B)、62(2 个)、224(11 个);225..599 = 0
+
+$ yu-cli run <project-eris> --backend soft|wgpu --until-frame 303
+  soft: 27/27/0 rgba sha256 6280eac4…b198
+  wgpu: 27/27/0 同 hash;reconcile OK(逐项一致)
+  png 文件 sha256 两端相同 6271f89d…
+
+浏览器(Chrome 155 headless,WebGPU 呈现):
+  gfx frame 303:canvas == 服务端 RGBA == native wgpu,`diff 0`,hash 6280eac4…b198
+  锚点 frame 16/53/227/233:canvas == WS == native walk,全部 diff 0
+  Restart:frame 归零后重回 title,hash 仍 6280eac4…b198,/api/report missing=0
+  hover:未验证。K2 宿主只在 pointerdown/按住拖动时发送 cursor
+    (`www/app.js` 的 pointermove 需 `buttons&1`);纯悬停不改状态,
+    属 K2 输入语义,写交接不抢改。按钮四种后缀的探测已由 FILEINFO 验证。
+```
+
+性能(release,RTX 5070 / DX12,600 帧):
+
+| 指标 | soft | wgpu |
+|---|---:|---:|
+| p50 | 15.43 ms | 1.21 ms |
+| p95 | 23.19 ms | **1.83 ms** |
+| 稳态 225..599 p95 | 27.32 ms | **1.79 ms** |
+
+阈值(声明):wgpu p95 ≤ 16.67 ms ⇒ PASS;稳态 0 逐帧重传 ⇒ PASS。
+
+### 5. 途中发现并修复(均有复现)
+
+1. **J2 的 soft==wgpu 是假象**:两个 crate 的 example 同名,
+   `target/debug/examples/first_frame.exe` 互相覆盖;J2 两次都在跑 soft。
+   已重命名 wgpu 示例并写入 README/台账。
+2. **wgpu 转场 shader 旧公式**:`mask+4f-1` vs gfx 的
+   `(30+70f)(mask-(1-2f))`,48 帧差;改为同公式+u8 量化链。
+3. **wgpu 命令段顺序**:COPY 原在组离屏 pass 之后 → 快照层被跳过,
+   `serve --backend wgpu` 首帧对账 exit 2;改为按 gfx pass 序 + 组源按需
+   pass(不计报告)。
+4. **soft 组源 COPY 重复计数**;报告回滚。
+5. **覆盖纹理逐帧重传**(127 帧 × 4 B);跨帧 FNV 缓存。
+6. **淡入淡出 ±1 LSB**:soft 分项整数取整 vs GPU 先求和;soft 改浮点
+   模型后 0 差异。
+7. **屏幕 alpha**:组 RT alpha 留在读回里,浏览器 opaque canvas 归一 255;
+   `render_frame` 两端都归一,三端哈希一致。
+
+### 6. 仍然 blocked / 未做
+
+- `debug_mode=true` 的 title 缺失(P2 挂账;需 rt debug 分支专门取证)。
+- DIV-GFX-045(TA≠128 覆盖度残差):title 用 T=256/TA=128,不触发;
+  模型/量化链已在 soft+wgpu 统一,残差仍需 mask 生成路径 REA 取证。
+- DIV-GFX-042(1px 半像素):按钮/文字边缘仍与官方有 ≤ 通道差,平坦区
+  已 PASS。
+- DIV-GFX-008/041(主组直绘/组 RT alpha):契约未裁决;title 平坦区
+  不依赖,按钮阴影边缘仍归此/042。
+- K2 宿主未暴露 `debug_mode` 开关;当前默认 false 与 J3 的 title 锚点
+  一致,无需改动;如需 A/B,由 K2 会话加宿主参数(交接,不抢文件)。
+
+### 成果 J3 勘误(2026-10-21 追加)· boot logo 动画与启动时间锚点
+
+用户实测指出“启动没有 logo 动画、卡顿严重”。复核成立:上面的 J3
+验收只覆盖 **title 稳定态与已有层的转场**,没有覆盖 boot 的
+Firstia logo 动画。追加记录:
+
+1. **官方 boot 基准**:`capture_screen.py --warmup 0 --frames 20 --interval 0.1`
+   显示 0.2–0.7s 菱形 wipe 揭开 `cg/bg/logo`(Firstia),保持到 ~1.3s,
+   1.3–2.0s 反向 wipe 到黑,~2.0s 后 title 淡入。
+2. **根因(EVID-J3-02)**:`SCENARIO_START` → `MAC.BG(logo)` 创建
+   `SPLBUF401=cg/bg/logo`(隐藏)、`SPLTRBUF401=cg/tr/ysr023`(隐藏)、
+   `SPL401/SPLTR401`(1×1 黑占位)。旧 gfx 用占位层自身做 from/mask,
+   整段黑屏。`es_Sprite.yst` 的 `$LID/$LIDBUF/$LIDTR/$LIDTRBUF` 是
+   sprite 系统的缓冲命名约定。
+3. **已修**:`op_for_layer` 在 `SPLnnn` 自身为空/1×1 黑时改用
+   `SPLBUFnnn`;`TID=SPLTRnnn` 占位时改用 `SPLTRBUFnnn`。新增单测
+   `transition::sprite_transition_uses_hidden_buffer_layers`。
+   结果:tick 13–59 显示 logo wipe;tick 61 与官方 frame_0008 的
+   4×4 采样平均通道差 0.13;title 稳定帧仍 `6280eac4…b198`;
+   soft/wgpu 250 帧 0 差异;全量测试仍绿。
+4. **仍未解决(新挂账 DIV-GFX-046)**:tick 63 起 `CGEND` 删除
+   SPLBUF401/SPL401/SPLTR401,屏幕黑到 tick 224;官方在 wipe 后
+   保持 1.2s + 800ms FOUT。该 BG 提升/保持不在现有 CG/CGACT 命令里,
+   需要 sprite renderer 的 REA 取证与契约裁决。title 首次出现 3.7s
+   vs 官方 ~2.2–2.5s,差距主要来自此。
+5. **卡顿归因**:无 pause 时浏览器 + 服务端实测 **60.2 fps**、
+   `dropped=0`、tick 4.57ms / render 1.48ms;启动首帧 ~2.4s 是既有
+   rt 热路径。用户感到的“卡顿”来自首帧冻结 + tick 63–223 黑屏段,
+   不是 WebGPU 呈现链路。
+
+结论:**boot logo 的可见 wipe 已恢复;hold/fade 与 title 时间锚点仍未
+1:1**。在 DIV-GFX-046 关闭前,不得把这一段黑屏当作验收通过。
+
+## 成果 J4 (2026-10-21) · 引擎着色器 1:1:4 个真实 blob、dx_mode 双路径与固定管线补全
+
+> 任务书 `docs/tasks/task-j4-shader-parity.md`。范围:`crates/yu-gfx`、
+> `crates/yu-backend-soft`、`crates/yu-backend-wgpu`;`yu-rt` 未改。
+> 零 git 写操作。台账 = `docs/shader-parity.md`(唯一 shader 映射);
+> 证据产物在 `target/tmp/j4-shaders/` 与 `target/tmp/j4-walk/`(不入库)。
+
+### 1. 交付物
+
+| 项 | 文件/产物 |
+|---|---|
+| shader 台账 | `docs/shader-parity.md`(全 exe 扫描、4 blob、FXO/pass 映射、调用链、阈值、15 项结论) |
+| 扫描器/反汇编 | `target/tmp/j4-shaders/scan_shaders.py`、`psA..psD.{cso,asm}`、`effect.fxo` |
+| 契约 | `CompositorFrame.dx_mode`(默认 0)、`GfxConfig::with_dx_mode`、`GfxState::set_dx_mode` |
+| 独立 WGSL | `crates/yu-backend-wgpu/src/shaders/{mod.rs,quad.wgsl,transition_fixed.wgsl,transition_psc.wgsl,transition_psd.wgsl,paint.wgsl}` |
+| 管线 | `PipelineCache` 新增 psC/psD 变体、`SRC_MODE` 常量、MAX/MIN blend、paint bind group 缓存 |
+| soft | MODE 3/5/6/7/9 stage 归约 + blend;psC/psD 转场;MODE 2 RGB 修正 |
+| 测试 | soft blend 向量 4 条;gfx 组 TID 1 条;wgpu dx_mode psC 端到端 1 条;filter gate 改为 ROOT 优先 |
+| 文档 | `render-parity` §5.2/5.3/5.4/12.4/12.6、`title-motion-ledger` §9.3 勘误、DIV-GFX-001/019/047/048/049/050、TODO 总账 |
+
+### 2. P0 · 全 exe 扫描与真实 blob(推翻“8 个/13 个候选”)
+
+对官方 0.495 exe(sha256 `4f5eefa3…`)按 D3D9 version token 全量扫描,
+按注释/指令长度走到 `END=0x0000FFFF` 过滤:
+
+```text
+version-token occurrences: 76
+VALID stream + exact size prefix: 4
+  ps_2_0  off=0x18c9a8 size=1432 end=0x18cf40
+  ps_2_0  off=0x18cf58 size= 604 end=0x18d1b4
+  ps_2_0  off=0x18d1cc size= 492 end=0x18d3b8
+  ps_2_0  off=0x18d3d0 size= 792 end=0x18d6e8
+```
+
+- 其余 72 处是代码 `cmp reg, 0xFFFFxxxx` 立即数、四个 blob 的 CTAB
+  `Version` 字段、D3DX9 版本字符串/ps_1_x opcode 表、以及 `0x1cb...`
+  元数据表;均无法走完 token 流。
+- **没有 `ps_1_1/ps_1_4/ps_3_0` 字节码,也没有 `vs_1_1` 顶点着色器**。
+  审查报告 §1.4 的 “13 个真实候选” 全部是上述误报(逐条见台账 §1)。
+- J2 的 `ps1/ps3/ps5/ps7` 是 CTAB 内嵌字段;`ps6` 只截了 656 B
+  (真实 792 B),所以反汇编为空。按正确长度重提后 4/4 完整反汇编。
+
+四个 blob 在同一个 D3DX9 编译 effect 容器(VA `0x58d420`,`0x1540` B,
+magic `0xFEFF0901`)里;按 Wine `d3dx9_36/effect.c` 字段顺序解析出:
+
+```text
+technique "YS_ShaderTest1" passes=4
+pass0 -> object 7  (792 B)  psD 交叉淡化: mix(tex1,tex2,FadeVal)*AlphaVal
+pass1 -> object 8  (492 B)  psC mask 转场: a=tex1.a*sat((FadeVal-0.5*tex2.r)*FadeVal2)*AlphaVal
+pass2 -> object 9  (604 B)  psB 4-tap 锐利缩放
+pass3 -> object 10 (1432 B) psA 16-tap 双三次缩放
+```
+
+调用链(REA):`FUN_00462d28` → `memcpy(0x58d420,0x1540)` →
+`D3DXCreateEffect`(`0x4cd434`,检查 magic)→ `SetTechnique`;
+`FUN_00414ba4` 按层结构 `BeginPass(0/1)`(0=配对/交叉淡化,1=`TA>=1`
+mask),`FUN_004195ec` 按 `DAT_00801334` 选 `BeginPass(2/3)` 做显示缩放。
+`CreatePixelShader` 由静态链接的 D3DX9 在 `D3DXCreateEffect` 内调用,
+exe 只导入 `Direct3DCreate9`,所以字符串里没有它。
+
+### 3. 15 项必查结论
+
+| # | 结论 | 证据 |
+|---|---|---|
+| 1 | 全 exe 只有 4 个真实 ps_2_0;无 ps_1_x/ps_3_0/vs_1_1 | 台账 §1;扫描器 |
+| 2 | ps1/3/5/7 是 CTAB、ps6 截断;按 792 B 重提后全部可反汇编 | `fxc /dumpbin` 4/4 |
+| 3 | 创建=`D3DXCreateEffect`+FXO;`SetPixelShader` 只在 `0x414dfa/0x4198cd` 复位 0 | 台账 §3;REA |
+| 4 | 不存在 ps_1_4↔MONO/BLUR 映射;`CGACT` 是 CPU 像素路径,不引用 effect | `0x801e7c` 的 34 个 xref 无 `0x42f809` |
+| 5 | 无顶点着色器;顶点 CPU 生成 + 固定 FVF(`XYZRHW|DIFFUSE|TEX1/4/8`) | `0x41a308`、`0x462e40` |
+| 6 | MODE 3/5/6/7/9 状态可达:soft 与 wgpu 全部执行(颜色因子映射) | §4/§5;DIV-GFX-047 fixed |
+| 7 | 顶点 DIFFUSE=`A` 灰度(asm `0x414d09..0x414d21`),不补顶点 RGB | DIV-GFX-019 fixed |
+| 8 | 引擎硬编码 MAG/MIN=LINEAR、MIP=POINT、aniso=0,无 mip 链;后端 LOD0/aniso=1 等价 | `FUN_00460924` 尾部 |
+| 9 | paint bind group 按 `(alpha_only,color)` 跨帧缓存;transition 仍按 draw(fade/目标逐帧变) | `PipelineCache::paint_groups` |
+| 10 | J3 基线复跑:soft/wgpu 600 帧 **0 差异**;浏览器 227/233/303 与 native 同哈希;16/53 是服务端连接时机导致的瞬态帧(canvas==WS) | §5 |
+| 11 | 样本 gate 统一:ROOT(data.ypf/data)优先、YSBIN 备选;只设 ROOT 时 `REQUIRE_SAMPLES=1` 通过 | `tests/filter.rs` |
+| 12 | `render-parity` §5.3 重写;ledger §9.3 “仍是旧公式”改为“修复前”;无矛盾 | 文档 diff |
+| 13 | `image_ext_order` 为空:保留宿主/默认顺序 + 每帧 `gfx.config.probe_order_fallback` 诊断(A5 显式记录) | `state.rs::frame()`;DIV-GFX-049 |
+| 14 | `_DXMODE` 是**脚本变量**,不是引擎渲染开关;内核以加法契约 `dx_mode` 映射,默认 0;宿主交接 | 台账 §6;`CompositorFrame.dx_mode` |
+| 15 | 组 TID:gfx 输出 `Op::Transition{from:Offscreen(组)}`,配对可为图像/组;官方微场景待编译器恢复 | `group_transition_op`;DIV-GFX-048 |
+
+### 4. P1 · dx_mode 双路径(**内核 A/B 契约,非引擎开关**)
+
+> 2026-10-22 审查勘误:本节“双路径”指**内核实现的两条转场路径**
+> (固定管线 G-mask 拟合 / psC/psD 移植),不是引擎的两条路径。官方引擎
+> effect 始终创建;psC 触发 = 有配对且 `TA>=1`,psD = 有配对且 `TA<1`;
+> `@_DXMODE` 只决定脚本走 `CGACT[TRANSITION]`/`TID` 还是 `DXBUF`
+> (`docs/shader-parity.md` §3、`docs/audit-2026-10-22.md` §B1)。
+> 第 14 项的结论(脚本变量)仍正确。
+
+```text
+$ YURIS_DX_MODE=1 cargo run --release -p yu-backend-soft --example frame_walk -- 600
+$ YURIS_DX_MODE=1 cargo run --release -p yu-backend-wgpu --example wgpu_frame_walk -- 600
+soft vs wgpu: hash 差异 1 帧(tick 35),ops/drawn/skipped/transition 0 差异
+  tick 35 逐像素:max 3/255,0 像素 >4(量化残差;声明阈值 ≤4)
+稳态帧:soft=wgpu=6280eac4…b198;dx0 与 dx1 稳态同哈希
+dx0 vs dx1:47 帧不同(过渡区间),符合两条引擎路径
+```
+
+wgpu 端新增 `shaders/transition_psc.wgsl` / `transition_psd.wgsl` 与
+`DrawKind::TransitionPsc/Psd`;soft 端 `TransitionMask` 增加
+`hlsl_mask/crossfade/fade2`。psC 的 mask 取 **R**(固定管线取 G),
+`FadeVal2=TA`、`AlphaVal=A/256`。
+
+### 5. 固定管线补全(MODE 2/3/5/6/7/9、DIFFUSE、filter、bind group)
+
+- **MODE 2 修正**:stage0 `MOD(D,T)` 使 RGB 先乘 `A`;旧实现 `dst−T·a`
+  改为 `dst−T·a²`(soft 单测向量 `[50,50,50,191]`)。
+- **MODE 3/5/6/7/9**:`BCA`(BLENDCURRENTALPHA,值 16)+ 白/黑 aux
+  把源色归约为 `T·A` / `T·A+(1−C.a)`,再由 D3D9 因子混合:
+  - soft:全部执行(乘/屏/max/min/除外);
+  - wgpu:同样全部执行:`BlendFactor::Src/OneMinusDst/OneMinusSrc` 就是
+    D3D9 的 `SRCCOLOR/INVDESTCOLOR/INVSRCCOLOR`;6/7 用 MAX/MIN。
+    单元/端到端测试 `fixed_pipeline_modes_3_5_6_7_9_match_soft` 逐像素一致。
+- **DIFFUSE**:顶点色=`A` 灰度(shader 模式 `0xFF000000`),不新增顶点属性。
+- **filter**:引擎硬编码 `1/1/0`;后端固定 LOD0/aniso=1 与引擎等价,
+  `render-parity` §12.4 记录(不再称“静默忽略”)。
+- **bind group**:paint 缓存实测 title 首帧 `bind_groups=13(created 14)`;
+  600 帧稳态上传 0;wgpu p95 2.01ms(J3 1.83ms,阈值 16.67ms)。
+
+### 6. 复跑与验收
+
+```text
+$ cargo test -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu
+  全部测试二进制 139 passed / 0 failed(ROOT-only gate)
+
+$ cargo clippy -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu --all-targets
+  三个 crate 0 新增告警(yu-rt 既有 5 条)
+
+$ grep -rn "println!\|eprintln!\|dbg!" crates/yu-{gfx,backend-soft,backend-wgpu}/src
+  0
+
+$ cargo run --release -p yu-backend-soft  --example frame_walk -- 600
+$ cargo run --release -p yu-backend-wgpu  --example wgpu_frame_walk -- 600
+  hash 差异 0;ops/drawn/skipped/transition/copy/image 差异 0
+  steady 6280eac4…b198;tick 249..599 恒定;稳态上传 0
+  wgpu p50 1.36 / p95 2.01 / p99 2.60 ms
+
+浏览器(Chrome headless + CDP,服务端 `yu-cli serve --backend wgpu --pause-at N`):
+  anchor 303:canvas==WS==native 6280eac4…b198
+  anchor 227/233:canvas==WS==native(walk 同帧)
+  anchor 16/53:canvas==WS(0 差异);与 walk 同号帧不同 = 服务端连接时机导致
+    的逻辑时间差(非渲染差异);J3 的“16/53 与 native 同帧”表述据此修正
+```
+
+### 7. 遗留 / 阻塞
+
+1. **MODE 4/8/10..18**:4 个 shader 都不实现 Photoshop 公式;没有对应
+   blob/调用点,保持 `Unimplemented`(不猜公式)。
+2. **WebGPU 3/5/9 已复核可实现**:初版误以为 WebGPU 无颜色因子;
+   `BlendFactor::Src/OneMinusDst/OneMinusSrc` 就是 D3D9 的
+   `SRCCOLOR/INVDESTCOLOR/INVSRCCOLOR`,已修正并测试(DIV-GFX-047 fixed)。
+3. **官方微场景编译器阻塞**:`yscom_harvest` 启动的 YSCom 在
+   `state0 != 1` 不 attach(120s 超时;LE/非 LE 均复现,
+   `target/tmp/j4-micro-modes2/harvest.log`)。MODE 3/5/6/7/9 与组 TID 的
+   官方像素对拍待工具恢复;当前证据 = D3D9 状态表 + soft 单元向量 +
+   两端端到端。
+4. **DIV-GFX-045**:TA≠128 的固定管线覆盖度残差仍 open(title 用 TA=128,
+   不触发)。
+5. **组 TID**:标 Likely;等官方微场景确认后转正。
+6. **宿主交接**:CLI/wasm 需把 `BootConfig.dx_mode` 传给
+   `GfxConfig.dx_mode`(一行);当前示例用 `YURIS_DX_MODE` 做 A/B。
+7. **psA/psB**:仅反汇编/触发条件记录;当前 1:1 视口不触发显示缩放,
+   未接入 `CompositorFrame`。
+
+## 成果 J5 (2026-10-21) · wasm 前端 UX:log 滚动/拖动与 restart 加载遮罩
+
+> 范围:仅 `www/`(`index.html`、`styles.css`、`app.js`);Rust/wasm 零改动。
+> 动机:用户反馈 log 每条新日志都强制刷到底部、面板不可移动;Restart 后
+> 画面停留在旧帧无任何加载反馈。
+
+### 1. 交付物
+
+| 项 | 实现 |
+|---|---|
+| log 贴底才跟随 | `app.js` `log()`:追加前计算"距底 < 24px"才 `scrollTop=scrollHeight`;上翻阅读不再被打断 |
+| log 面板可拖动 | header 按住拖动(pointer capture)移位,右下角 CSS `resize` 缩放;位置/尺寸存 `localStorage(yu-log-layout)`,重开/刷新恢复并夹回视口 |
+| restart/启动 loading | 新增 `#loading` 遮罩(黑底盖住 canvas + 转圈动画):点 Restart 立即黑屏显示 "restarting…",启动期显示 "loading…";首帧到达(`handleBinary`)自动撤掉;窗口缩放重定位 |
+
+### 2. 验证(Chrome + IAB,`yu-cli dev` @4173,soft 后端,ERIS 语料)
+
+```
+$ node --check www/app.js                      → 语法 OK
+贴底跟随:滚到顶后等 1.6s,新增 8 行(56→64),scrollTop 稳定 0(不拉底);
+         滚回底部后等 1.2s,scrollTop+clientHeight==scrollHeight(仍跟随)✓
+拖动:cua.drag header (700,481)→(250,150),面板 rect (653,464)→(204,133),
+     localStorage 写入 {"left":204,"top":133,"w":614,"h":280}✓
+刷新:面板恢复 (204,133,614×280) ✓
+restart:点击后帧号 1125→复位(重启后 205→233 连续推进),遮罩 hidden=false
+        (text=restarting…)→ 首帧到达后 hidden=true 自动撤掉 ✓
+```
+
+注:黑屏+转圈瞬间的截图取证两次因截图表面 3s 超时未捕获;流程以上述
+DOM 状态断言为准(遮罩 DOM/动画为纯 CSS 声明式)。
+
+### 3. 途中发现(未修,已报告用户)
+
+**ws 每 ~11s 断开根因 = HTTP 读超时泄漏进 WebSocket**:
+`crates/yu-cli/src/server.rs` `read_request()` 对请求 socket
+`set_read_timeout(10s)` 后从未清除,升级 ws 后同一内核 socket 带
+SO_RVTIMEO;页面空闲(无鼠标/键盘 ws 消息)时读线程恰 10s 超时 → 注销
+客户端 → 写循环 channel Disconnected → 连接关闭。实测三次连接存活
+10.012/10.015/10.015s;活跃输入(拖动)期间连接存活 >70s 佐证"有消息就续命"。
+次因:dev 监督者以 mtime+size 指纹监视 `crates/**/*.rs`,本机并发改动
+(含 0 重编译的纯 touch)即杀引擎重建 → 帧号复位级断开(真实编辑的
+HMR 预期行为,纯 touch 为误报)。
+
+## 成果 J6 (2026-10-21) · 修复 ws 读超时泄漏 + yu-host-wasm README(最小示例)
+
+### 1. 修复:ws 每 ~11s 断开(承接 J5 §3 的发现)
+
+`crates/yu-cli/src/ws.rs` `accept()`:升级 ws 前清除 `read_request()` 为解析
+HTTP 头设的 10s 读超时(SO_RCVTIMEO 留在内核 socket 上,try_clone 共享)。
+修复前:页面空闲(无输入消息)时读线程恰 10s 超时 → 注销客户端 → 写循环
+channel Disconnected → 连接关闭,实测连接存活 10.012/10.015/10.015s;
+活跃输入期间存活 >70s(有消息就续命)佐证。
+
+### 2. 验证
+
+```
+$ cargo build -p yu-cli --bin yu-engine --release          → 6.9s ✓
+$ cargo test -p yu-cli                                      → 10 passed / 0 failed
+  (含 ws::tests::handshake_and_echo_text,覆盖修改后的 accept())
+$ cargo clippy -p yu-cli --all-targets                      → 0 新增(yu-rt 既有 5 条)
+$ yu-engine serve project-eris --port 4174 --backend soft --no-open
+浏览器(无 dev 监督者,直连):布防 WebSocket 构造器记录器 + log 行基线,
+零交互空闲 54s:
+  __wsEvents = [](零重连);ws closed/connecting/error 日志行 = 基线值 1(首连);
+  frame 持续推进至 1148,ms≈39-49。
+  对照修复前:同环境连接每 10.0s 死一次,54s 窗口内会断 ~5 次。
+```
+
+### 3. 文档:crates/yu-host-wasm/README.md(新增)
+
+架构 B 呈现端职责与边界(不依赖 yu-rt/gfx/backend-*,语义留在 native)、
+确切构建命令(`cargo build --target wasm32-unknown-unknown` +
+`wasm-bindgen --target web`,与 `yu-cli bench` 第 6 步一致)、**最小示例**
+(`www/mini.html` 形态:shim 契约 + init + `Presenter.present()` 呈现一帧
+合成渐变,零服务依赖)、契约表、.wasm 是什么(魔数/沙箱/路线图 wasm 宿主
+接入缝)。验证:
+
+```
+$ cargo check -p yu-host-wasm --target wasm32-unknown-unknown → ✓
+$ cargo clippy -p yu-host-wasm --all-targets                  → 0 新告警
+```
+
+### 4. 追加(同日):wasm 定位说明(用户要求)
+
+`crates/yu-host-wasm` 的 `lib.rs` 头注释与 `README.md` 开头均补"当前定位"
+段:现在的 wasm 只是 dev 热重启调试期的呈现胶水(native 引擎推帧、页面画
+帧),**后期的 wasm 包才是真正的编译产物**(rt+gfx+soft 整体编入 wasm32
+的 wasm 宿主),届时 `present()` 即帧生产端替换的接入缝。
+`cargo check -p yu-host-wasm --target wasm32-unknown-unknown` ✓。
+
+## 2026-10-22 — 成果 J3 收口:`MATH3D` / `CGINFO[SX/SY]` / `CGACT[SIZE]` / 主组直绘(boot logo 与 title 淡入淡出修复)
+
+用户实测指出两个仍未对的点:①boot logo 只有淡入没有淡出(旧线同 bug);
+②title 出现时“突然显示→变暗→再亮”。两者都已定位到具体命令语义并修复。
+
+### 1. 新增/修改的语义(全部带官方证据)
+
+| 项 | 证据 | 实现 |
+|---|---|---|
+| `MATH3D` | REA `FUN_00448900`(`0x448900`,sha256 `4f5eefa3…`) | `yu-rt::vm::handlers::op_math3d` + `math3d_project`;透视比 `2^((camZ+DEFZ−layerZ)/100)` |
+| `CGINFO[SX/SY]` | 引擎语义 = 已装载纹理尺寸 | `yu-rt::image::pixel_size`(PNG/BMP/GIF/JPEG 头)+ `GraphicsHost::note_asset_size` 回填 |
+| `CGACT[SIZE/SIZE2]` | 手册 `cg/cgact.html` 例 3/4 + `es.CGACT_SIZE` | `yu-backend-soft::imageop::scale_region`,两端共用,跨帧缓存 |
+| 过渡取样 | `es_Sprite.LOADTR` 对 `SPLTRBUF` 做 `CGACT[REVERSE=1]` | `TransitionDraw.from_layer/to_layer`,取样优先用加工后纹理 |
+| `COPY ID=:/W0/` | 引擎读当前后缓冲 | soft/wgpu 均改读上一帧呈现结果 |
+| wgpu 快照冻结 | EVID-T-12 | `plan_copy` 补 `snapshot.is_some() → Ok(())` 早退 |
+| 主组直绘 | DIV-GFX-008/041(EVID-J-08) | `build_group_passes` 跳过主组;屏幕 pass 直接含子层 |
+
+### 2. 复测(原始输出)
+
+```text
+# soft vs wgpu 600 帧逐帧对拍(target/tmp/soft600d.txt / wgpu600d.txt)
+rows 600 600
+mismatches 0 []
+
+tick  hash(soft)==hash(wgpu)          ops/drawn/skipped/tr/copy/img
+ 20   7f60f61f9fa5a491…             33/29/4/2/0/0
+ 30   b25087b66b8e17c0…             43/39/4/2/0/0
+ 63   9cb4dbcb62a6a7c9…             23/19/4/0/0/0
+150   771f37f95712f1bc…             39/35/4/2/0/0
+224   a7aff0f8e3f44663…             96/96/0/2/2/0
+249   a5a618d067bb20ea…             96/96/0/2/2/0
+303   a5a618d067bb20ea…             89/89/0/2/0/0
+599   a5a618d067bb20ea…             89/89/0/2/0/0
+```
+
+boot 时间线(soft,左/右半屏亮度;方向 = mask 暗区先动):
+
+```text
+tick  L      R
+  13    0.4    0.0     wipe 开始(黑)
+  30  197.1   63.3     左先显
+  63  253.5  253.8     logo 保持
+ 150  189.1  249.5     反向 wipe:左先黑
+ 170    1.7   65.3
+ 190–223  0/0          黑场
+ 230   45.7   39.4     title 从黑平滑淡入
+ 249  193.3  167.0     title 稳定
+```
+
+### 3. 回归
+
+```text
+cargo test -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu   → 20 个测试二进制全 ok
+cargo test -p yu-rt(含 corpus 金丝雀)                       → 全 ok
+```
+
+首帧命令数金丝雀由 1,290,326 → **1,292,091**(MATH3D 实装改变首帧分支);
+corpus 测试内已注明原因。
+
+### 4. 台账
+
+- `docs/divergences/DIV-GFX-046-sprite-bg-hold.md`:**fixed**,补根因与四条语义;
+- `docs/title-motion-ledger.md` §9.7:EVID-J3-03..07 + 复测表;
+- `docs/gfx-unimplemented-todo.md`:008 fixed / 046 fixed / 041 partial;
+- `crates/yu-gfx/docs/divergences/README.md`:同步。
+
+### 6. 性能勘误(EVID-J3-08):release 帧时间回退已修
+
+用户实测 release 帧时间从个位数涨到 1x ms;复查确认是 J3 引入的回归,
+与浏览器宿主无关。三处原因与修法:
+
+| 原因 | 量级 | 修法 |
+|---|---|---|
+| 同帧重复深拷贝覆盖纹理(脚本每帧重发 51 条 `CGACT[SIZE]`) | ≈98 MB memcpy/帧 | `Rc<Texture>` 共享 |
+| 缓存命中仍重算 FNV 指纹(整幅 RGBA × 51) | ≈100 MB 哈希/帧 | `Override { tex, hash }`,指纹随纹理缓存 |
+| 无区域 `SIZE` 做整幅 CPU 重采样 | ~14 ms/条 | 直接透传源纹理(绘制期按 `SX×SY` 拉伸) |
+| `REVERSE` 每帧重算 | ~2 ms/帧 | 并入 `ImageCacheKey { source, op, region }` |
+
+release 600 帧实测:
+
+```text
+native wgpu  p50 15.48 → 3.25 ms   p95 18.96 → 6.13 ms
+native soft  p50 25.12 → 29.7 ms   (CPU 光栅化固有量级)
+soft/wgpu 600 帧逐帧 hash/ops/drawn/skipped 仍 0 差异
+title 稳定帧 a5a618d0…2483 不变
+```
+
+### 7. 复查:撤回固定实现(通用实现对齐引擎)
+
+1. **删除 `SPL/SPLBUF/SPLTR/SPLTRBUF` 名字特判**(EVID-T-10:那是脚本命名,
+   不是引擎语义)。转场只按 `YS_Texture1 = 本层纹理` / `YS_Texture2 = TID 层
+   纹理` 取像素;缓冲层内容由脚本自己的 `CGACT[SIZE]` 写入。
+   `yu-gfx/tests/transition.rs` 的 SPL 专项测试换成
+   `transition_uses_layer_state_not_layer_names`(换名后行为相同)。
+2. **`CGACT[SIZE/SIZE2]` 成功后更新目标层绘制尺寸为 `SX×SY`**
+   (手册 `cg/cgact.html`),`CGINFO[SX/SY]` 因此完全由层状态回答,
+   不再需要任何命名约定。
+3. **`CGINFO` 资产尺寸回退按工程 ysc 参数名取槽号**(原硬编码
+   `unwrap_or(8)` / `slot <= 1`)。
+4. **wgpu `layer_image` 补“组 → 离屏 RT”分支**(与 soft `layer_surface` 同义)。
+
+---
+
+## 成果 AU1 (2026-10-22) · 全量改动审查:4 项确定错误、4 项文档失真、3 项工程回归
+
+> 范围:工作区未提交改动(`git diff --stat` ≈ 6000 行 / 49 文件),覆盖
+> `yu-gfx`、`yu-backend-soft`、`yu-backend-wgpu`、`yu-rt`、`yu-cli`、
+> `yu-host-wasm`、`www/`、`cases/`。方法:逐文件读实现 + 对照 REA 反编译/
+> 手册/真实脚本/官方截图;所有“实测”都在 `<project-eris>` 上复跑。
+> 完整报告:`docs/audit-2026-10-22.md`(含复现命令与证据缺口)。
+> 零 git 写操作。
+
+### 1. 结论
+
+| 等级 | 数量 | 条目 |
+|---|---:|---|
+| 确定错误 | 4 | 主组首帧 COPY 无源、`image_probe_order` A5 兜底、重启不清渲染器、REVERSE 组合分支未对拍 |
+| 文档失真 | 4 | `dx_mode` 被写成引擎开关、README 能力落后、`render-parity §12.6` 过期、过期审查/台账段落 |
+| 工程回归 | 3 | `cases/*.json` 全过期、`src/` 有 `eprintln!`、示例未注入 HostPaths |
+
+### 2. 实测原始输出
+
+```text
+$ cargo test --tests -p yu-gfx -p yu-backend-soft
+  全部测试二进制通过(0 failed)
+
+$ cargo run -p yu-backend-soft --example first_frame
+frame: 3  layers: 272 (visible 8)  passes: 14  offscreen passes: 1
+ops: 17 total, 12 drawn, 5 skipped
+  skip copy  x1  gfx.copy.source.offscreen_missing      :/W0/CGS100
+  skip image x1  gfx.imageop.copy_source.unsupported    :/W0/CGS100
+missing assets: 0
+
+$ cargo run -p yu-cli --bin yu-cli -- case <project-eris> --case first-screen
+case first-screen: frame=3 ticks=2 ops=17 skipped=2
+  display_json_sha256: expected=1729689580a5… actual=48af8a1f6fde…
+  ops_total: expected=18 actual=17
+  skipped_ops_total: expected=5 actual=2
+case first-screen: FAIL
+```
+
+> 注:`cargo test`(含 examples 链接)在本机会因
+> `target/debug/examples/frame_walk.exe` 被残留进程占用而 `LNK1104`;
+> 杀进程即可,不是代码错误。
+
+### 3. 关键证据(逐条)
+
+1. **A1 主组 COPY**:J3 让 `build_group_passes` 跳过主组
+   (`state.rs` 的 `if id == main { continue; }`),但 soft `compose_group` /
+   wgpu `plan_group_compose` 仍要求组有 Offscreen pass;首帧无 `last_screen`
+   /`backbuffer` ⇒ `offscreen_missing`。归档 `DIV-GFX-051`。
+2. **A3 重启**:`engine.rs::restart` 只重置 `Vm`/`GfxState`,渲染器的
+   `last_screen`/`backbuffer`/`snapshots` 保留;`copy_seq` 归零后新 `CopyId`
+   与旧快照同 id ⇒ 冻结早退命中旧像素。归档 `DIV-HOST-001`。
+3. **A2 A5**:`state.rs::from_tables` 在 `image_ext_order` 为空时保留默认
+   `[png,bmp,jpg,gif,psb]` + 一条 Info;A5 原文要求缺表 = 拒绝启动或
+   `Unimplemented`。DIV-GFX-049 从 `fixed(J4)` 回退为 `open`。
+4. **B1 `dx_mode`**:代码注释已写明“官方引擎没有该渲染开关”,但
+   README/PROGRESS/shader-parity 仍按“引擎双路径”叙述。已改三处措辞 +
+   `architecture.md` §5.1 新增范围说明。
+5. **D3 MATH3D 复核**:逐段对照
+   `<side-repo>/workbench/analysis/decomp/00448900_FUN_00448900.c`;
+   `lVar21==0` 主分支、`lVar18!=lVar19`/`lVar20==0` 子分支、
+   `pow(2,(cam+defz-z)/100)`、尾部 `(100-BX)*z/100` 均一致;
+   常量 `0.0/100.0/2.0/0.5` 从 PE `.rdata`(`0x58ee00..0x58ee18`)直接读出。
+   **结论:公式正确**,不是错误项。
+6. **D2 状态表**:`d3d9types.h` 确认 `D3DTOP_BLENDCURRENTALPHA=16`、
+   `D3DTA_DIFFUSE=0/TEXTURE=2/TFACTOR=3`;`render-parity §5.2` 的
+   MAA=18 勘误正确。
+
+### 4. 本次文档改动
+
+| 文件 | 改动 |
+|---|---|
+| `docs/audit-2026-10-22.md` | **新增**:完整审查报告(§0..§7) |
+| `docs/divergences/DIV-GFX-051-main-group-copy-first-frame.md` | **新增**:A1 档案(现象/根因/二分/两种修法/回归) |
+| `docs/divergences/DIV-HOST-001-restart-renderer-state.md` | **新增**:A3 档案 |
+| `docs/todo-inventory.md` | 新增 §2.0(P0)、更新 §5 顺序与 §6 文档失真清单 |
+| `docs/gfx-unimplemented-todo.md` | DIV-GFX-049 回退为 open;新增 051/052;修复 047..050 脱离表格的格式错误;更新推进顺序 |
+| `crates/yu-gfx/docs/divergences/README.md` | 同步 049/050/051/052 |
+| `docs/architecture.md` | v1.3:crate 数与依赖图按实现重写;删除不存在的 `RenderBackend` trait,改为 `CompositorFrame` 数据契约;新增 §5.1 `dx_mode` 范围、§5.2 已知未对齐、§10 审查入口 |
+| `README.md` | 能力声明与实现对齐(crate 表补 `yu-cli`/`yu-host-wasm`;wgpu 不再写“待 J4”;新增 P0 待办) |
+
+### 5. 未完成/待裁决
+
+- A1 的修法二选一(回退自合成 / 显式 `no_backbuffer`)需主人裁决;
+- A3 的修法二选一(`reset()` / `CopyId` 代际);
+- `cases/*.json` 的重生成依赖 A1 结论(先定契约再 update);
+- `image_probe_order` 的 A5 处置需裁决(拒绝启动 / 全层 Unimplemented)。

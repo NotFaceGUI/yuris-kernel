@@ -1,7 +1,19 @@
 # yuris-kernel 架构
 
-> 状态:设计基线 v1(2026-10-19)。上位文档:`README.md`(目标)、`docs/sdk-eris-analysis.md`(语义一手分析)、
-> `docs/oracle.md`(对拍方法)、`CONTEXT.md`(术语)。
+> 状态:实现现状 v1.3(2026-10-22 审查后修订)。上位文档:`README.md`(目标)、
+> `docs/sdk-eris-analysis.md`(语义一手分析)、`docs/oracle.md`(对拍方法)、
+> `CONTEXT.md`(术语)。
+>
+> **v1.3 修订**(以 `PROGRESS.md` 成果 K1/J3 与 `docs/audit-2026-10-22.md` 为准):
+> - 实际 crate 数为 **11**(新增 `yu-cli`、`yu-host-wasm`);不再有“wasm 跑内核”的
+>   `yu-backend-wasm` 规划——**架构 B(2026-10-21 主人决定)**:Rust 原生读本机数据
+>   并跑内核,wasm/JS 只做呈现端。
+> - **`RenderBackend` trait 不存在**:两个后端(`yu-backend-soft`、
+>   `yu-backend-wgpu`)消费同一个可序列化 `CompositorFrame`,各自实现一帧渲染;
+>   契约是**数据**(`CompositorFrame`),不是 trait。§5 已按此改写。
+> - `yu-snd`/`yu-inp`/`yu-save` 尚未建 crate;输入时间线目前在 `yu-rt::input`。
+> - 帧契约字段以 `crates/yu-gfx/src/frame.rs` 为准(含 `dx_mode`,
+>   见 §5.1 的范围说明)。
 
 ## 0. 不变式
 
@@ -41,38 +53,35 @@ Mount(叠加栈, 后挂者覆盖先挂者):
 
 ## 2. 核心决策 B:分层与 crate 划分
 
-9 个 crate,依赖严格向下,边界=契约:
+**11 个 crate,依赖严格向下,边界=契约**(2026-10-22 实测现状):
 
 ```mermaid
 flowchart TD
-    BWASM["yu-backend-wasm ★先实现<br/>wasm-bindgen + Canvas/WebGL<br/>rAF 帧循环 · 截图差分"]
-    BWIN["yu-backend-win(后)"]
-    BAR["yu-backend-android(后)"]
-    CLI["yu-cli 装配与帧循环(平台无关)"]
-    TRC["yu-trace oracle<br/>边界记录/回放/diff"]
-    GFX["yu-gfx 图层/CG 状态机<br/>+ FrameDescription + RenderBackend trait"]
-    SND["yu-snd 声层状态机"]
-    INP["yu-inp 输入状态机<br/>带符号帧计数器"]
-    SAV["yu-save 存档链<br/>SaveDir 真实目录"]
+    HOSTWASM["yu-host-wasm<br/>浏览器呈现端(仅 present RGBA)"]
+    CLI["yu-cli<br/>原生引擎宿主 + 本地服务 + HMR + 用例"]
+    GFX["yu-gfx 图层/CG 状态机<br/>+ CompositorFrame"]
+    SOFT["yu-backend-soft<br/>确定性参考后端 + PNG"]
+    WGPU["yu-backend-wgpu<br/>主后端(wgpu)"]
     RT["yu-rt 运行核<br/>任务调度·命令分派·表达式·16槽寄存器·变量域<br/>(A5: 零硬编码,全表来自游戏数据)"]
     FMT["yu-format 容器解码<br/>ybn·yssd·ymv·yscfg · 纯字节进出"]
     VFS["yu-vfs 数据源<br/>DirSource · YpfSource · MemSource · Mount · 归一"]
+    FONT["yu-font 字体发现/栅格/样式"]
+    TRC["yu-trace oracle<br/>边界记录/回放/diff"]
+    LOG["yu-log Diag/错误码/LogSink"]
 
-    BWASM --> GFX
-    BWIN -.-> GFX
-    BAR -.-> GFX
-    CLI --> BWASM
+    HOSTWASM -.->|WebSocket 帧| CLI
+    CLI --> SOFT
+    CLI --> WGPU
     CLI --> RT
-    CLI --> SND
-    CLI --> INP
-    CLI --> SAV
+    CLI --> GFX
+    SOFT --> GFX
+    WGPU --> GFX
+    WGPU --> SOFT
     GFX --> RT
-    SND --> RT
-    INP --> RT
-    SAV --> RT
     RT --> FMT
     RT --> VFS
-    TRC -.->|挂 4 条边界| CLI
+    FONT --> TRC
+    TRC -.->|旁挂| CLI
     TRC -.-> GFX
     TRC -.-> RT
     TRC -.-> FMT
@@ -83,26 +92,31 @@ flowchart TD
 | `yu-log` | **错误+日志一体包**:Diag/错误码/LogSink/JSONL;所有 crate 的错误与日志唯一出口 | 无 | 成为旁挂(trace 从它消费,不是反向) |
 | `yu-vfs` | DataSource 三实现 + Mount 叠加 + 路径归一;ypf 懒索引偏移直读 | log | 读真实文件系统之外的一切语义 |
 | `yu-format` | ybn 家族容器与结构解码(YSCM/YSLB/YSVR/YSTD/YSTL、YSTB 脚本组/窗口)+ CP932/GBK 编解码器;bytes 进 structs 出 | log(纯) | 碰 IO;碰执行语义;**不碰 ypf(包布局归 yu-vfs)** |
-| `yu-rt` | 命令组 VM:任务调度(让出=WAIT/显示文本)、按名分派、表达式求值(i64/f64/串)、16 槽 P/R 寄存器、变量域 | vfs, format, log | 渲染、音频、平台调用;**任何游戏/版本常量(A5)** |
-| `yu-gfx` | 图层树/Z/混合的**语义状态机**;产出可序列化 **FrameDescription**;定义 **RenderBackend trait**(后端只负责把它画出来) | rt, log | 绕过 rt 直接读数据;含平台代码 |
-| `yu-snd` / `yu-inp` | sound/input 子系统状态机(输入=带符号帧计数器) | rt, log | 同上 |
-| `yu-save` | 存档链:变量域+任务+脚本位置快照,save/*.sd 字节级读写 | rt, log | 写任何非 SaveDir 路径 |
-| `yu-backend-wasm` | **wasm 渲染后端(当前实现)**:Canvas/WebGL 呈现 FrameDescription + wasm-bindgen 宿主入口(rAF 帧循环、浏览器输入→InputTimeline、OPFS 存档) | gfx | 含游戏语义 |
-| `yu-backend-win` / `yu-backend-android` | 同一 trait 的桌面/安卓实现(后续) | gfx | 同上 |
-| `yu-trace` | 四条边界(①vfs 读 ②事件流 ③帧描述 ④平台命令)JSONL 记录/回放/diff;消费 yu-log 事件入流 | 全部(旁挂) | 成为运行时依赖 |
-| `yu-cli` | 平台无关装配:输入时间线 → rt 泵 → 事件分流 → 域推进 → 交后端呈现 | 全部 | 含游戏语义;选后端是装配参数 |
+| `yu-rt` | 命令组 VM:任务调度(让出=WAIT/显示文本)、按名分派、表达式求值(i64/f64/串)、16 槽 P/R 寄存器、变量域、输入时间线 | vfs, format, log | 渲染、音频、平台调用;**任何游戏/版本常量(A5)** |
+| `yu-gfx` | 图层树/Z/混合的**语义状态机**;产出可序列化 **`CompositorFrame`**(图层清单 + passes + 诊断);`GfxHost` 回答 INFO 同步查询 | rt, log | 绕过 rt 直接读数据;含平台代码 |
+| `yu-font` | 字体发现/加载、字形栅格化、文本样式;不含换行/对齐 | log | 平台窗口 |
+| `yu-backend-soft` | `CompositorFrame` 的**确定性参考后端**:纹理解析 + RGBA8 合成 + 快照 + 图像加工 + PNG | gfx, log, vfs | 含游戏语义;读 rt 内部 |
+| `yu-backend-wgpu` | 同一 `CompositorFrame` 的 **wgpu 主后端**:离屏 RGBA8 + 读回;纹理/管线/bind group/快照缓存;独立 WGSL 文件 | gfx, soft(复用像素算法与报告类型), log | 含游戏语义 |
+| `yu-host-wasm` | 浏览器**呈现端**(wasm-bindgen):WebGPU shim 优先、Canvas2D 回退;不读游戏数据、不解释渲染语义 | 仅 web-sys/wasm-bindgen | 依赖 rt/gfx/后端/vfs |
+| `yu-cli` | 原生装配:输入时间线 → rt 泵 → 事件分流 → gfx → 后端呈现;本地 HTTP/WS 服务、HMR 监督、用例执行器 | 全部 | 含游戏语义 |
+| `yu-trace` | 四条边界(①vfs 读 ②事件流 ③帧描述 ④平台命令)JSONL 记录/回放/diff;schema v3 | 全部(旁挂) | 成为运行时依赖 |
 
-## 3. 一帧数据流
+## 3. 一帧数据流(实现现状,架构 B)
 
 ```text
-输入时间线(录制/回放/真实输入)
-  → yu-inp 推进(@_KEY_* 符号计数器、@_MOUSE_*)
+输入时间线(录制/回放/真实输入;`yu_rt::input::InputTimeline`)
   → yu-rt: 泵所有任务至让出(WAIT/显示文本);任务全让出 = 帧边界
-  → 事件流(VmEvent: cg/sound/text/save/scriptpos…)
-  → 域状态机: gfx(图层树/Z)、snd(声层)、save(落盘意图)
-  → 帧描述(可序列化) → 平台呈现(yu-cli)
-  → yu-trace 在 ①②③④ 落 JSONL
+  → 事件流(VmEvent: cg/window/text/save/scriptpos…)
+  → yu-gfx: GfxHost 同步消费 → 图层树/Z/passes → CompositorFrame
+  → yu-backend-soft | yu-backend-wgpu: 执行 passes → RGBA8 屏幕
+  → yu-cli: PNG / 本地 WS(YUF1 帧头 + RGBA8) / 用例比对
+  → yu-host-wasm + www: canvas 呈现(WebGPU shim 优先,Canvas2D 回退)
+  → yu-trace 在 ①②③④ 落 JSONL(旁挂)
 ```
+
+注意:**事件只消费一次**。`yu-cli` 里 `GfxHost` 在 `Vm::tick_at` 期间同步
+消费事件;`take_events()` 的 drain 只用于统计(见 `engine.rs::tick` 注释),
+不是第二路消费。
 
 ## 4. 对齐要点(细节见 sdk-eris-analysis §7)
 
@@ -112,31 +126,49 @@ flowchart TD
 - 调用约定=PINT/PFLT/PSTR×16 + RINT/RFLT/RSTR×16 + PFLG/RFLG + 任务局部 T*;GOSUB 嵌套 64。
 - 输入=带符号帧计数器;`TASK[SCRIPTPOS]`=剧本推进锚点,存档围绕它。
 
-## 5. 渲染层与平台后端(wasm 先行)
+## 5. 渲染层与平台后端(契约是数据,不是 trait)
 
-**渲染后端 = 独立契约模块**,不是某个平台的附件:`yu-gfx` 产出可序列化的 `FrameDescription`
-(图层清单:rid/变换/Z/混合模式/遮罩/文本串),`RenderBackend` trait 只有一份(定义在 `yu-gfx`),
-平台实现各自一 crate:
+**渲染契约 = 可序列化的 `CompositorFrame`**,不是 trait。`yu-gfx` 产出:
 
-```rust
-pub trait RenderBackend {
-    fn resize(&mut self, w: u32, h: u32);
-    fn upload(&mut self, rid: ResourceId, rgba: &[u8], w: u32, h: u32);   // 纹理上传
-    fn present(&mut self, frame: &FrameDescription);                      // 画一帧
-    fn snapshot(&mut self) -> Rgba;                                       // 截图(对拍/差分用)
+```text
+CompositorFrame {
+    frame, viewport, dx_mode, clear, color_space, filter,
+    image_probe_order, windows, layers[], passes[], text[], diagnostics[]
 }
+Pass { target: Screen | Offscreen(LayerId) | Texture(LayerId), ops[] }
+Op   { Layer | Group | Transition | Mask | Copy | Image }
 ```
 
-- **`yu-backend-wasm` 当前实现**(用户决策):`wasm32-unknown-unknown` + wasm-bindgen,
-  Canvas/WebGL 呈现;宿主入口也在该 crate(rAF 帧循环、浏览器鼠标/键盘事件 → InputTimeline、
-  存档落 OPFS)。wasm 先行的理由 = 调试回路最短:改完刷新即看、`snapshot()` 直接 toDataURL
-  做逐帧像素差分、无安装成本。
-- `yu-backend-win` / `yu-backend-android` 后续实现同一 trait;内核与 cli 装配层零改动,
-  换后端只是换装配参数(A1 的平台版)。
-- wasm 对架构的反向验证:浏览器无文件系统 ⇒ **一切读取只能走 DataSource**——散盘 DirSource
-  在 wasm 上天然不可用,MemSource/OPFS 顶上,恰好证明 A1 抽象不是过度设计。
-- 渲染语义的对齐责任划分:混合公式/Z 序/半像素偏移等**语义**在 `yu-gfx`(状态机决定每层怎么画),
-  后端只做"把 FrameDescription 忠实搬到像素";像素级对拍用 `snapshot()` 差分。
+后端各自实现“把 passes 忠实搬到像素”,共享的是**数据与像素算法**,不是接口:
+
+- `yu-backend-soft`:CPU RGBA8,确定性参考;`apply_rect_paint`/`scale_region`/
+  `apply_reverse`/`apply_horizontal` 与 `Surface`/`RenderReport` 被 wgpu 复用。
+- `yu-backend-wgpu`:GPU 执行;管线按 `BlendMode` 缓存,过渡用独立 WGSL
+  (`shaders/transition_fixed|psc|psd.wgsl`),快照用 `copy_texture_to_texture`。
+- 两个后端必须输出**逐字段相同**的 `RenderReport`(ops/drawn/skipped/
+  passes/offscreen/missing_assets);`yu-cli --reconcile` 首帧对账,
+  `frame_walk`/`wgpu_frame_walk` 逐帧比对。
+- 浏览器侧:`yu-host-wasm` 只做 `present(rgba, w, h)`;合成仍在 native。
+  页面 shim 用 `alphaMode:'opaque'`,与 native 的屏幕 alpha 归一一一致。
+
+### 5.1 `dx_mode` 的范围(重要)
+
+`CompositorFrame.dx_mode` **不是引擎的渲染开关**:
+
+- 官方引擎的 effect 始终创建;psC 的触发条件是“有配对且 `TA>=1`”,psD 是
+  “有配对且 `TA<1`”(`docs/shader-parity.md` §3)。
+- `@_DXMODE` 只是脚本变量(`es_first.yst` 分支决定走 `CGACT[TRANSITION]`/
+  `TID` 还是 `DXBUF`)。
+- 因此 `dx_mode → psC/psD` 是**内核扩展契约**(默认 0 不改变现有行为),
+  用于 A/B 两条内核转场实现;它不声称与引擎某条路径 1:1。
+  文档旧称“引擎双路径”作废(见 `docs/audit-2026-10-22.md` §B1)。
+
+### 5.2 已知未对齐(2026-10-22)
+
+- 主组直绘后首帧 `COPY ID=:/W0/` 无源(DIV-GFX-051);
+- `image_probe_order` 空值兜底违反 A5(DIV-GFX-049,open);
+- 重启不清渲染器状态(DIV-HOST-001);
+- 1px 半像素(DIV-GFX-042)、组 RT 子组 alpha(DIV-GFX-041)仍挂账。
 
 ## 6. 里程碑(每步退出条件可验证)
 
@@ -145,9 +177,12 @@ pub trait RenderBackend {
 | M0 | yu-vfs:Mem/Dir/合成 Ypf + Mount + 归一 | **等价性测试**(§1)通过 |
 | M1 | yu-format:ybn 家族解码 + 编解码器表(cp932/gbk) | 商业游戏真实 .ybn 语料解析成功且结构自洽 |
 | M2 | yu-rt 泵核:任务/让出/分派/寄存器/变量域(零硬编码,全表装载) | 真实脚本事件流 golden 化;时钟注入可回放;**缺表拒绝启动**可测 |
-| M3 | yu-gfx 最小闭环 + **yu-backend-wasm** | 浏览器里跑通 ERIS 首屏;snapshot 像素差分 golden |
+| M3a | yu-gfx `CompositorFrame` 语义显示列表 | 首屏 census 稳定 |
+| M3b | `yu-backend-soft` 确定性参考 | 600 帧与 wgpu 逐帧一致 |
+| M3c | `yu-backend-wgpu` 主后端 | title/转场/COPY/按钮;与 native 同帧一致 |
+| M3d | hosts(K1):`yu-cli` 原生宿主 + `yu-host-wasm` 呈现端 | 浏览器 canvas 与 native 同 hash;HMR |
 | M4 | yu-save + 编解码器写回 | 官方 .sd 读→写回字节一致 |
-| M5 | 真封包游戏端到端 | 同一内核二进制,换挂载栈即跑商业游戏;win/android 后端按需启动 |
+| M5 | 真封包游戏端到端 | 同一内核二进制,换挂载栈即跑商业游戏 |
 
 ## 7. 文本编码策略(统一编解码器)
 
@@ -206,6 +241,9 @@ pub struct Diag {
   (带帧号/域标),回放 golden 时错误序列一并比对——错误行为本身就是对齐对象。
 - **日志**:统一走 `yu-log::LogSink`;CLI 端渲染人读行。**禁止散落 `println!`/`eprintln!`/`dbg!`**,
   CI grep 守卫(与 A5 守卫同族)。
+  - 现状例外(2026-10-22 审查,待清):`yu-backend-wgpu` 的 `passes.rs`/`lib.rs`
+    仍有受环境变量门控的 `eprintln!`(统计/`YURIS_DBG_SIZEMISS`)。见
+    `docs/audit-2026-10-22.md` §C2。
 - 排查路径:错误码 → divergences 档案/trace 上下文 → 边界二分。每个 Fatal 报告自带
   "哪条边界、哪个表、哪个脚本位置",不需要人再猜。
 
@@ -215,3 +253,12 @@ pub struct Diag {
 - E-mote/Flash 按目标游戏需要再定。
 - 硬编码审计(A5 的执行手段):CI 级 grep 守卫禁止运行核/域状态机出现版本序号、内置命令表、
   内置资源路径常量;表装载事件全部进 trace,可审计"每一张表来自哪个游戏文件"。
+
+## 10. 审查与待办入口
+
+- `docs/audit-2026-10-22.md`:本次改动的逐项审查(确定错误/文档失真/工程回归/已复核正确)。
+- `docs/todo-inventory.md`:待办总账(状态快照,真相在各台账)。
+- `docs/gfx-unimplemented-todo.md` + `crates/yu-gfx/docs/divergences/README.md`:
+  渲染侧 DIV-GFX-001..052。
+- `docs/divergences/DIV-GFX-051-main-group-copy-first-frame.md`、
+  `docs/divergences/DIV-HOST-001-restart-renderer-state.md`:本次审查新增的两个 P0 档案。
