@@ -107,6 +107,10 @@ pub enum HandlerKind {
     Taskend,
     Taskinfo,
     Systeminfo,
+    /// `FILEINFO`:文件域查询(`EXIST` 写回 LET;EVID-J3-01)。
+    Fileinfo,
+    /// `MATH3D`:ERIS 专用 3D 投影(精灵坐标/缩放);REA `0x448900`。
+    Math3d,
     /// 图形/字体/窗口只读查询(`LET` 同步写回,需 `GraphicsHost`)。
     Cginfo,
     Fontinfo,
@@ -155,6 +159,8 @@ pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> 
             "TASKEND" => HandlerKind::Taskend,
             "TASKINFO" => HandlerKind::Taskinfo,
             "SYSTEMINFO" => HandlerKind::Systeminfo,
+            "FILEINFO" => HandlerKind::Fileinfo,
+            "MATH3D" => HandlerKind::Math3d,
             "CGINFO" => HandlerKind::Cginfo,
             "FONTINFO" => HandlerKind::Fontinfo,
             "WINDOWINFO" => HandlerKind::Windowinfo,
@@ -247,6 +253,8 @@ impl Vm {
             HandlerKind::Taskend => self.op_taskend(st, task, cmd),
             HandlerKind::Taskinfo => self.op_taskinfo(st, task, cmd),
             HandlerKind::Systeminfo => self.op_systeminfo(st, cmd),
+            HandlerKind::Fileinfo => self.op_fileinfo(st, cmd),
+            HandlerKind::Math3d => self.op_math3d(st, cmd),
             HandlerKind::Cginfo => self.op_info(st, cmd, "CGINFO"),
             HandlerKind::Fontinfo => self.op_info(st, cmd, "FONTINFO"),
             HandlerKind::Windowinfo => self.op_info(st, cmd, "WINDOWINFO"),
@@ -1995,6 +2003,237 @@ impl Vm {
         Ok(StepOutcome::Continue)
     }
 
+    /// `FILEINFO`:文件域查询。**只实现 `EXIST=1 FILE=... LET=...`**。
+    ///
+    /// 证据(EVID-J3-01):
+    /// - 手册 `file/fileinfo.html`:`EXIST = 値(0/1)` 查询文件/文件夹是否存在,
+    ///   `LET = 変数名` 接收结果;ver0.276 起可检查封包内文件。
+    /// - 官方 0.495 opcode 22 handler `0x44286c`(REA 反汇编):
+    ///   `0x44296d` 读 `EXIST` 标志;文件分支 `0x44316c` 依次尝试
+    ///   包内/散盘四种存在性策略;`0x443222` 把结果归一为 1/0,
+    ///   `0x4432dc` 在不存在时同样写 0;`LET` 目标按整数/浮点槽写回。
+    /// - 真实脚本 `es_Button.yst:1761-1765` 用五次 `FILEINFO[EXIST=1]`
+    ///   探测 `_off/_over/_on/_onover/_na.png`,再拼不带扩展名的 `CG[FILE=]`。
+    ///
+    /// 其它查询(FOLDER/SIZE/RELATION/CGFILE/SOUNDFILE)语义未取证,
+    /// 保持挂号并只发 `DomainCall`(不猜 0)。
+    fn op_fileinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let names: Vec<String> = self
+            .tables()
+            .boot
+            .yscm
+            .command(cmd.opcode)
+            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+        let mut file: Option<Vec<u8>> = None;
+        let mut folder: Option<Vec<u8>> = None;
+        let mut exist = false;
+        let mut target: Option<crate::expr::LValue> = None;
+        let mut args: Vec<ArgValue> = Vec::new();
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let name = names
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or("");
+            match name {
+                "LET" => target = Some(self.eval_lvalue(st, &w.payload)?),
+                "FILE" | "FOLDER" => {
+                    if let Ok(v) = self.eval_value(st, &w.payload) {
+                        if let Value::Str(bytes) = &v {
+                            if name == "FILE" {
+                                file = Some(bytes.clone());
+                            } else {
+                                folder = Some(bytes.clone());
+                            }
+                        }
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                "EXIST" => {
+                    if let Ok(v) = self.eval_value(st, &w.payload) {
+                        exist = v.as_f64().map(|n| n != 0.0).unwrap_or(false);
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                _ => {
+                    if let Ok(v) = self.eval_value(st, &w.payload) {
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+            }
+        }
+        // 事件流保持与实现前一致(File 域;宿主忽略 FILEINFO 本身)。
+        self.emit(VmEvent::DomainCall {
+            frame: self.frame(),
+            domain: Domain::File,
+            name: "FILEINFO".to_string(),
+            args,
+        });
+        if !exist || target.is_none() || folder.is_some() {
+            self.report_unimplemented(
+                "FILEINFO",
+                "只实现 FILE+EXIST+LET(file/fileinfo.html;REA 0x44286c)".to_string(),
+            );
+            return Ok(StepOutcome::Continue);
+        }
+        let Some(bytes) = file else {
+            self.report_unimplemented(
+                "FILEINFO",
+                "EXIST=1 缺 FILE(FOLDER 查询未取证)".to_string(),
+            );
+            return Ok(StepOutcome::Continue);
+        };
+        let present = match yu_vfs::LookupKey::new(&bytes, yu_vfs::Codec::Cp932) {
+            Ok(key) => {
+                self.src.exists(&key)
+                    || self
+                        .aux
+                        .as_ref()
+                        .is_some_and(|aux| aux.exists(&key))
+            }
+            Err(diag) => {
+                self.report(diag);
+                false
+            }
+        };
+        if let Some(target) = target {
+            let value = Value::Int(if present { 1 } else { 0 });
+            self.write_target(st, &target, &value)?;
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    /// 解析 `CG[FILE]` 的像素尺寸:按工程 `yscfg` 扩展名序尝试 `.png/.bmp/
+    /// .jpg/.gif`,只读图像头。结果(含失败)缓存,避免每帧重读。
+    ///
+    /// 这是 [`crate::image`] 的唯一调用点;尺寸语义来自引擎 `CGINFO[SX/SY]`
+    /// = 已装载纹理尺寸,证据与分层说明见 DIV-GFX-024 / EVID-J3-03。
+    fn resolve_asset_size(&mut self, key: &[u8]) -> Option<(u32, u32)> {
+        if let Some(hit) = self.asset_size_cache.get(key) {
+            return *hit;
+        }
+        let mut found = None;
+        let ext_order = self.tables.boot.config.image_ext_order;
+        'probe: for &code in ext_order.iter() {
+            let ext: &[u8] = match code {
+                0 => break,
+                1 => b".png",
+                2 => b".bmp",
+                3 => b".jpg",
+                4 => b".gif",
+                // 5 = .psb(E-mote 专用包);本内核不解其头。
+                _ => continue,
+            };
+            let mut path = key.to_vec();
+            path.extend_from_slice(ext);
+            let Ok(lookup) = yu_vfs::LookupKey::new(&path, yu_vfs::Codec::Cp932) else {
+                continue;
+            };
+            let bytes = match self.src.open(&lookup) {
+                Ok(b) => Some(b),
+                Err(_) => self.aux.as_ref().and_then(|aux| aux.open(&lookup).ok()),
+            };
+            if let Some(bytes) = bytes {
+                if let Some(size) = crate::image::pixel_size(&bytes) {
+                    found = Some(size);
+                    break 'probe;
+                }
+            }
+        }
+        self.asset_size_cache.insert(key.to_vec(), found);
+        found
+    }
+
+    /// `MATH3D[INT=@...I() FLT=@...F()]`:ERIS 专用 3D→屏幕投影。
+    ///
+    /// 证据:官方 0.495 `FUN_00448900`(`0x448900`,sha256 `4f5eefa3…`)。
+    /// 输入 `I(1..7)` 与 `F(3..30)`,输出写回 `F(31..34)`:
+    /// - `I1` 图层号、`I2` 背景层号、`I4` 父层号、`I5/I6` 视口宽高、`I7` TIP;
+    /// - `F3..F5` 相机 XYZ、`F6..F8` 背景 XYZ、`F9/F10` 背景中心、`F11/F12`
+    ///   背景 CL、`F13/F14` 本层 XY、`F15` 本层 Z、`F16/F17` 缩放 BX/BY、
+    ///   `F18/F19` 本层中心、`F20/F21` MX/MY(百分比)、`F22..F26` 父层、
+    ///   `F27` `@DEFZ`、`F28` 相机附加 X;
+    /// - 输出 `F31/F32` 屏幕 XY、`F33/F34` 缩放 X/Y。
+    ///
+    /// 公式按反编译逐项转写(`docs/divergences/DIV-GFX-046` 附录);
+    /// 缩放是 `es_SPExec` 判 `SIZE<1` 的唯一来源,未实现时恒为 0,
+    /// 全部精灵层会被 `es.CGACT_SIZE` 判为屏幕外(EVID-J3-03)。
+    fn op_math3d(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        if cmd.windows.len() < 2 {
+            return Err(diag::fatal(
+                code::rt::CMD_WINDOWS,
+                Boundary::Script,
+                format!("MATH3D 需要 INT+FLT 两个数组窗口,得到 {}", cmd.windows.len()),
+            )
+            .into());
+        }
+        let mut int_var = None;
+        let mut flt_var = None;
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let name = self
+                .param_name(cmd.opcode, w.rec.kind)
+                .unwrap_or_default();
+            let var = self.eval_lvalue(st, &w.payload)?.var;
+            match name.as_str() {
+                "INT" => int_var = Some(var),
+                "FLT" => flt_var = Some(var),
+                _ => {}
+            }
+        }
+        let (Some(int_var), Some(flt_var)) = (int_var, flt_var) else {
+            return Err(diag::fatal(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                "MATH3D 缺 INT/FLT 数组参数",
+            )
+            .into());
+        };
+        // 越界读取按官方 `FUN_00449b98` 语义取 0(数组元素不存在 = 0.0)。
+        let rd_i = |store: &crate::value::VariableStore, i: i64| -> i64 {
+            store
+                .read(int_var, &[i])
+                .ok()
+                .and_then(|v| v.as_int())
+                .unwrap_or(0)
+        };
+        let rd_f = |store: &crate::value::VariableStore, i: i64| -> f64 {
+            store
+                .read(flt_var, &[i])
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+        };
+        let i1 = rd_i(&self.store, 1);
+        let i2 = rd_i(&self.store, 2);
+        let i4 = rd_i(&self.store, 4);
+        let wsx = rd_i(&self.store, 5) as f64;
+        let wsy = rd_i(&self.store, 6) as f64;
+        let tip = rd_i(&self.store, 7);
+        let (x, y, zx, zy) =
+            math3d_project(i1, i2, i4, wsx, wsy, tip, &|n| rd_f(&self.store, n));
+        let out_ty = self
+            .store
+            .shape(flt_var)
+            .map(|(t, _)| t)
+            .unwrap_or(crate::value::ElemType::Float);
+        for (idx, value) in [(31i64, x), (32, y), (33, zx), (34, zy)] {
+            let stored = if out_ty == crate::value::ElemType::Int {
+                Value::Int(value.round() as i64)
+            } else {
+                Value::Float(value)
+            };
+            // 官方仅在输出元素存在时写;越界静默(同 `FUN_00448900` 尾部)。
+            let _ = self.store.write(flt_var, &[idx], &stored);
+        }
+        Ok(StepOutcome::Continue)
+    }
+
     /// `CGINFO/FONTINFO/WINDOWINFO`:只读查询,结果写入 `LET`。
     ///
     /// 三层来源:①手册 `cg/cginfo.html`、`font/fontinfo.html`、
@@ -2062,15 +2301,69 @@ impl Vm {
             );
             return Ok(StepOutcome::Continue);
         };
+        // 请求的字段名(SX/SY 才走资产元数据回退;其余字段保持原样)。
+        let wanted = args.iter().find_map(|a| {
+            params
+                .get(usize::from(a.slot))
+                .map(String::as_str)
+                .filter(|n| matches!(*n, "SX" | "SY"))
+        });
         let result = host.query(name, &args);
-        self.graphics_host = Some(host);
-        match result {
-            Ok(v) => {
-                for t in &targets {
-                    self.write_target(st, t, &v)?;
+        let mut value = match result {
+            Ok(v) => Some(v),
+            Err(d) => {
+                // `CGINFO[SX/SY]` 的资源尺寸:gfx 不读文件 ⇒ 向宿主取
+                // `MFILE` 键,由本 VM 解析图像头后回填(DIV-GFX-024)。
+                //
+                // 槽号一律按工程 ysc 参数名解析:该工程表里没有 `MFILE`/`ID`
+                // 时不猜序号,按“尺寸不可得”继续(仍走原诊断)。
+                let mut resolved = None;
+                if name == "CGINFO" && wanted.is_some() {
+                    let slot_of = |want: &str| {
+                        params
+                            .iter()
+                            .position(|p| p == want)
+                            .map(|i| i as u8)
+                    };
+                    if let (Some(mfile_slot), Some(id_slot)) =
+                        (slot_of("MFILE"), slot_of("ID"))
+                    {
+                        let idno_slot = slot_of("IDNO");
+                        let mut ask: Vec<ArgValue> = args
+                            .iter()
+                            .filter(|a| {
+                                a.slot == id_slot || Some(a.slot) == idno_slot
+                            })
+                            .cloned()
+                            .collect();
+                        ask.push(ArgValue::new(mfile_slot, Value::Int(1)));
+                        if let Ok(Value::Str(key)) = host.query("CGINFO", &ask) {
+                        if !key.is_empty() {
+                            if let Some((w, h)) = self.resolve_asset_size(&key) {
+                                host.note_asset_size(&key, w, h);
+                                resolved = Some(Value::Int(i64::from(
+                                    if wanted == Some("SX") { w } else { h },
+                                )));
+                            }
+                        }
+                        }
+                    }
+                }
+                match resolved {
+                    Some(v) => Some(v),
+                    None => {
+                        self.graphics_host = Some(host);
+                        self.report(d);
+                        return Ok(StepOutcome::Continue);
+                    }
                 }
             }
-            Err(d) => self.report(d),
+        };
+        self.graphics_host = Some(host);
+        if let Some(v) = value.take() {
+            for t in &targets {
+                self.write_target(st, t, &v)?;
+            }
         }
         Ok(StepOutcome::Continue)
     }
@@ -2763,5 +3056,123 @@ fn domain_of(name: &str) -> Domain {
         Domain::Graphics
     } else {
         Domain::Other
+    }
+}
+
+/// `MATH3D` 的投影核心(纯函数,便于单测)。
+///
+/// 直接转写官方 `FUN_00448900`(`0x448900`)的 TIP==0/!=0 两个分支:
+/// 官方用 x87 double 计算,输出 F31/F32 在写回 INT 目标时取整、写回 FLT
+/// 目标时保留原值;此处保留 double,由调用方按目标类型处理。
+fn math3d_project(
+    lno: i64,
+    lbg: i64,
+    parent: i64,
+    wsx: f64,
+    wsy: f64,
+    tip: i64,
+    f: &dyn Fn(i64) -> f64,
+) -> (f64, f64, f64, f64) {
+    let cam_x = f(3) + f(28);
+    let cam_y = f(4) + f(29);
+    let cam_z = f(5) + f(30);
+    let def_z = f(27);
+    let mx = f(20) / 100.0;
+    let my = f(21) / 100.0;
+    if tip != 0 {
+        // 官方 else 分支:TIP 非 0 时不做透视,只保留图层内偏移/缩放。
+        let x = f(13) - f(18) * f(16) / 100.0;
+        let y = f(14) - f(19) * f(17) / 100.0;
+        return (x, y, f(16), f(17));
+    }
+    // 背景与父层的透视比例(官方:fVar15/fVar16 = `pow(2.0, (…)/100)`)。
+    // `FUN_00469779` 的 9 字节外壳后紧跟 pow 主体(0x469782 `fyl2x`),
+    // 两个 4 字节实参 0/0x40000000 = double 2.0,第三个实参是指数。
+    let z_bg = ((cam_z + def_z - f(8)) / 100.0).exp2();
+    let mut z_layer = ((cam_z + def_z - f(15)) / 100.0).exp2();
+    let mut x = ((f(6) - f(9)) - cam_x * mx) * z_bg + f(11) * mx + wsx * 0.5;
+    let mut y = f(12) * my + wsy * 0.5 + ((f(7) - f(10)) - cam_y * my) * z_bg;
+    if lno != lbg {
+        let bx = f(9) * z_bg + x;
+        let by = y + f(10) * z_bg;
+        if parent == 0 {
+            x = bx + (f(13) * mx - f(18)) * z_layer;
+            y = by + (f(14) * my - f(19)) * z_layer;
+        } else {
+            // 父层存在时比例改用父层 Z(官方在同一局部变量上覆写 fVar16)。
+            z_layer = ((cam_z + def_z - f(24)) / 100.0).exp2();
+            x = bx + (((f(13) + f(22)) * mx - f(18)) - f(25)) * z_layer;
+            y = by + (((f(14) + f(23)) * my - f(19)) - f(26)) * z_layer;
+        }
+    }
+    x += f(18) * (100.0 - f(16)) * z_layer / 100.0;
+    y += f(19) * (100.0 - f(17)) * z_layer / 100.0;
+    (x, y, f(16) * z_layer, f(17) * z_layer)
+}
+
+#[cfg(test)]
+mod math3d_tests {
+    use super::math3d_project;
+
+    fn sample(fill: impl Fn(&mut [f64])) -> Vec<f64> {
+        let mut f = vec![0.0; 40];
+        f[3] = 0.0;
+        f[4] = 0.0;
+        f[5] = 0.0;
+        f[6] = 0.0;
+        f[7] = 0.0;
+        f[8] = 200.0;
+        f[9] = 400.0;
+        f[10] = 300.0;
+        f[13] = 0.0;
+        f[14] = 0.0;
+        f[15] = 200.0;
+        f[16] = 100.0;
+        f[17] = 100.0;
+        f[18] = 0.0;
+        f[19] = 0.0;
+        f[20] = 100.0;
+        f[21] = 100.0;
+        f[27] = 200.0;
+        fill(&mut f);
+        f
+    }
+
+    #[test]
+    fn background_is_centered_and_unscaled() {
+        let f = sample(|_| {});
+        let (x, y, zx, zy) =
+            math3d_project(2, 2, 0, 800.0, 600.0, 0, &|n| f[n as usize]);
+        assert_eq!((x, y), (0.0, 0.0));
+        assert_eq!((zx, zy), (100.0, 100.0));
+    }
+
+    #[test]
+    fn sprite_uses_layer_offset_center_and_zoom() {
+        let f = sample(|f| {
+            f[13] = 100.0; // layer X
+            f[14] = 50.0; // layer Y
+            f[18] = 200.0; // center X
+            f[19] = 150.0; // center Y
+        });
+        let (x, y, zx, zy) =
+            math3d_project(6, 2, 0, 800.0, 600.0, 0, &|n| f[n as usize]);
+        // 背景中心 (400,300) + (图层XY - 图层中心)
+        assert_eq!((x, y), (300.0, 200.0));
+        assert_eq!((zx, zy), (100.0, 100.0));
+    }
+
+    #[test]
+    fn tip_branch_skips_perspective() {
+        let f = sample(|f| {
+            f[13] = 10.0;
+            f[14] = 20.0;
+            f[18] = 200.0;
+            f[19] = 150.0;
+        });
+        let (x, y, zx, zy) =
+            math3d_project(6, 2, 0, 800.0, 600.0, 1, &|n| f[n as usize]);
+        assert_eq!((x, y), (10.0 - 200.0, 20.0 - 150.0));
+        assert_eq!((zx, zy), (100.0, 100.0));
     }
 }

@@ -336,6 +336,8 @@ pub struct Vm {
     cur_task: String,
     /// 本步可见的任务链投影(`TASKINFO` 的数据源;泵期间调度器被借出)。
     task_view: Vec<TaskView>,
+    /// 资产像素尺寸缓存(键 = `CG[FILE]`;`None` = 探测失败也缓存)。
+    asset_size_cache: BTreeMap<Vec<u8>, Option<(u32, u32)>>,
 }
 
 impl Vm {
@@ -458,6 +460,7 @@ impl Vm {
             cur_cmd: String::new(),
             cur_task: MAIN_TASK_ID.to_string(),
             task_view: Vec::new(),
+            asset_size_cache: BTreeMap::new(),
         };
         vm.apply_global_initial_values();
         vm.apply_script_locals(script_id);

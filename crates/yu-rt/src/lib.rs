@@ -47,6 +47,7 @@ pub mod event;
 pub mod expr;
 pub mod input;
 pub mod json;
+mod image;
 pub mod tables;
 pub mod sysvar;
 pub mod sysvar_abi;

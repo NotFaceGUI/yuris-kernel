@@ -298,4 +298,11 @@ pub trait GraphicsHost {
     /// 单值返回:查询方必须只请求一个字段;多字段顺序未取证时返回错误,
     /// 由 VM 报 `Unimplemented` 并**不写** `LET`。
     fn query(&mut self, command: &str, args: &[ArgValue]) -> Result<Value, Diag>;
+
+    /// VM 解析出资产像素尺寸后回填宿主(默认忽略)。
+    ///
+    /// `CGINFO[SX/SY]` 在引擎里读的是**已装载纹理**的尺寸;本内核的 gfx
+    /// 不做文件 I/O,因此由持有数据源的 VM 解析图像头并在此回填,
+    /// 供后续同键查询与 COPY 快照继承(DIV-GFX-024 / EVID-J3-03)。
+    fn note_asset_size(&mut self, _key: &[u8], _width: u32, _height: u32) {}
 }

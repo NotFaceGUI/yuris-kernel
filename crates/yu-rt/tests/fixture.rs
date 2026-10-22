@@ -14,6 +14,7 @@ use yu_rt::{BootConfig, Vm};
 
 /// 与 0.495 `ysc.ybn` 一致的 opcode(夹具命令表同序)。
 const OP_END: u8 = 14;
+const OP_FILEINFO: u8 = 22;
 const OP_FPS: u8 = 29;
 const OP_GO: u8 = 43;
 const OP_GOSUB: u8 = 44;
@@ -97,6 +98,106 @@ fn declare_and_let_scalar() {
     assert_eq!(
         vm.events().iter().filter(|e| e.kind() == "end").count(),
         1
+    );
+}
+
+// ---------------------------------------------------------------- FILEINFO
+
+/// 在合成工程上再插入数据文件(封包/散盘等价;`MemSource` 是同一 VFS 接口)。
+fn boot_with_files(builder: ProjectBuilder, files: &[(&[u8], &[u8])]) -> Vm {
+    let mut src = builder.build();
+    for (path, bytes) in files {
+        src.insert(path, bytes.to_vec()).expect("insert fixture file");
+    }
+    Vm::boot(Box::new(src), BootConfig::default()).expect("boot")
+}
+
+/// `FILEINFO[EXIST=1 FILE=... LET=@x]`:
+/// 存在写 1、不存在写 0(EVID-J3-01;REA `0x443222/0x4432dc`)。
+/// 路径按引擎习惯归一(反斜杠/大小写不影响命中)。
+#[test]
+fn fileinfo_exist_writes_one_and_zero_to_let() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(-1),
+        },
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(-1),
+        },
+    ];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        // FILEINFO[FILE="DATA\\BG.PNG" EXIST=1 LET=@a]
+        // 脚本字面量里的 `\\` 是转义后的单个反斜杠(expr 0x4d 规则)。
+        GroupSpec::new(OP_FILEINFO)
+            .window(0, ex::s("DATA\\\\BG.PNG"))
+            .window(1, ex::i8_(1))
+            .window(2, ex::r#ref(0x40, sys)),
+        // FILEINFO[FILE="data/missing.png" EXIST=1 LET=@b]
+        GroupSpec::new(OP_FILEINFO)
+            .window(0, ex::s("data/missing.png"))
+            .window(1, ex::i8_(1))
+            .window(2, ex::r#ref(0x40, sys + 1)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot_with_files(b, &[(b"data/bg.png", b"\x89PNG")]);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(),
+        Value::Int(1)
+    );
+    assert_eq!(
+        vm.store().read(VarRef::new(VarSpace::At, sys + 1), &[]).unwrap(),
+        Value::Int(0),
+        "不存在的文件也必须写 0(引擎 0x4432dc),不能跳过 LET"
+    );
+}
+
+/// LET 目标是浮点槽时,结果按槽类型写 1.0/0.0(引擎 `0x443290` 分支)。
+#[test]
+fn fileinfo_exist_writes_float_target() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 2,
+        dims: vec![],
+        init: Init::Float(0.0),
+    }];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_FILEINFO)
+            .window(0, ex::s("save/save_001.sd"))
+            .window(1, ex::i8_(1))
+            .window(2, ex::r#ref(0x40, sys)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot_with_files(b, &[(b"save/save_001.sd", b"SD")]);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(),
+        Value::Float(1.0)
     );
 }
 
