@@ -20,7 +20,15 @@ path = "src/main.rs"
 name = "yu-engine"
 path = "src/engine_main.rs"
 
+[features]
+# 设备输出默认开启：正常 `yu-cli run/serve` 直接出声。
+# headless/纯 golden 构建用 `--no-default-features` 关闭（不依赖声卡）。
+default = ["device"]
+# 把 `SoundState::render` 的 PCM 推给默认输出设备；不反哺状态机。
+device = ["dep:cpal"]
+
 [dependencies]
+cpal = { version = "0.15", optional = true }
 sha1 = "0.10"
 sha2 = "0.10"
 wgpu = "30.0.1"
@@ -29,4 +37,5 @@ yu-backend-wgpu = { path = "../yu-backend-wgpu" }
 yu-gfx = { path = "../yu-gfx" }
 yu-log = { path = "../yu-log" }
 yu-rt = { path = "../yu-rt" }
+yu-sound = { path = "../yu-sound" }
 yu-vfs = { path = "../yu-vfs" }

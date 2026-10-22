@@ -86,8 +86,11 @@ fn hmr_rebuilds_child_and_keeps_service_alive() {
     for index in 1..=CHANGES {
         let marker = format!("k2-engine-hmr-{index}");
         let text = String::from_utf8(original.clone()).expect("build_info.rs utf8");
-        std::fs::write(&build_info, text.replace(build_info::ENGINE_MARKER, &marker))
-            .expect("write marker");
+        std::fs::write(
+            &build_info,
+            text.replace(build_info::ENGINE_MARKER, &marker),
+        )
+        .expect("write marker");
         let started = Instant::now();
         let mut last = baseline.clone();
         let mut found = false;
@@ -154,7 +157,11 @@ fn hmr_rebuilds_child_and_keeps_service_alive() {
     std::fs::write(&build_info, text).expect("restore marker");
     wait_marker(port, build_info::ENGINE_MARKER, Duration::from_secs(60));
     let restored = status(port).expect("restored status");
-    assert_eq!(restored.marker, build_info::ENGINE_MARKER, "restored marker");
+    assert_eq!(
+        restored.marker,
+        build_info::ENGINE_MARKER,
+        "restored marker"
+    );
 
     // 关掉监督进程;子进程必须随 stdin EOF 退出。
     drop(_keep_stdin);

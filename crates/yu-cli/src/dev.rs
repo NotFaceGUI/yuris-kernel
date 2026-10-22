@@ -213,7 +213,10 @@ impl Supervisor {
     fn rebuild_and_restart(&mut self) -> CliResult<()> {
         let detected = Instant::now();
         self.builds += 1;
-        output::line(format!("dev: change detected (#{}) -> rebuild", self.builds));
+        output::line(format!(
+            "dev: change detected (#{}) -> rebuild",
+            self.builds
+        ));
         self.stop_child();
         let build_started = Instant::now();
         let temp = self.workspace.join("target").join("tmp").join("cargo-temp");
@@ -316,8 +319,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, rust_only: bool) -> CliResult<()> {
             walk(&path, out, rust_only)?;
         } else if path.is_file() {
             let take = if rust_only {
-                path.extension().and_then(|e| e.to_str()) == Some("rs")
-                    || name == "Cargo.toml"
+                path.extension().and_then(|e| e.to_str()) == Some("rs") || name == "Cargo.toml"
             } else {
                 true
             };
@@ -357,9 +359,7 @@ fn http_ok(port: u16, path: &str) -> bool {
         return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-    );
+    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
     }
@@ -406,4 +406,3 @@ pub fn watch_summary(workspace: &Path) -> BTreeMap<String, u64> {
     }
     out
 }
-

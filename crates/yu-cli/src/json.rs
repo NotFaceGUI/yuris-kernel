@@ -81,7 +81,10 @@ pub fn parse(text: &str) -> Result<Value, String> {
     let value = parser.value()?;
     parser.skip_ws();
     if parser.at != parser.bytes.len() {
-        return Err(format!("json: {} trailing bytes", parser.bytes.len() - parser.at));
+        return Err(format!(
+            "json: {} trailing bytes",
+            parser.bytes.len() - parser.at
+        ));
     }
     Ok(value)
 }
@@ -127,7 +130,10 @@ impl<'a> Parser<'a> {
             Some(b'f') => self.literal(b"false", Value::Bool(false)),
             Some(b'n') => self.literal(b"null", Value::Null),
             Some(byte) if byte == b'-' || byte.is_ascii_digit() => self.number(),
-            other => Err(format!("json: unexpected {:?} at offset {}", other, self.at)),
+            other => Err(format!(
+                "json: unexpected {:?} at offset {}",
+                other, self.at
+            )),
         }
     }
 
@@ -231,9 +237,7 @@ impl<'a> Parser<'a> {
                                         let combined = 0x10000
                                             + (((code as u32 - 0xD800) << 10)
                                                 | (low as u32 - 0xDC00));
-                                        out.push(
-                                            char::from_u32(combined).unwrap_or('\u{FFFD}'),
-                                        );
+                                        out.push(char::from_u32(combined).unwrap_or('\u{FFFD}'));
                                     } else {
                                         out.push('\u{FFFD}');
                                     }
@@ -244,9 +248,7 @@ impl<'a> Parser<'a> {
                                 out.push(char::from_u32(code as u32).unwrap_or('\u{FFFD}'));
                             }
                         }
-                        other => {
-                            return Err(format!("json: bad escape `\\{}`", other as char))
-                        }
+                        other => return Err(format!("json: bad escape `\\{}`", other as char)),
                     }
                 }
                 byte if byte < 0x20 => {
@@ -272,8 +274,8 @@ impl<'a> Parser<'a> {
         }
         let text = std::str::from_utf8(&self.bytes[self.at..self.at + 4])
             .map_err(|_| "json: bad \\u escape".to_string())?;
-        let value = u16::from_str_radix(text, 16)
-            .map_err(|_| "json: bad \\u escape".to_string())?;
+        let value =
+            u16::from_str_radix(text, 16).map_err(|_| "json: bad \\u escape".to_string())?;
         self.at += 4;
         Ok(value)
     }

@@ -64,7 +64,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             }
             Err(failure) => {
                 failed += 1;
-                output::error(format!("case {}: ERROR {}", case_name(path), failure.message));
+                output::error(format!(
+                    "case {}: ERROR {}",
+                    case_name(path),
+                    failure.message
+                ));
             }
         }
     }
@@ -321,8 +325,8 @@ fn run_case(project: &Project, path: &Path, update: bool) -> CliResult<bool> {
     let surface = engine
         .last_surface()
         .ok_or_else(|| Failure::runtime("用例没有产出像素"))?;
-    let png_bytes = png::png_bytes(surface)
-        .map_err(|e| Failure::runtime(format!("PNG 编码失败: {e}")))?;
+    let png_bytes =
+        png::png_bytes(surface).map_err(|e| Failure::runtime(format!("PNG 编码失败: {e}")))?;
 
     let actual = Expect {
         display_json_sha256: Some(sha256_hex(display_json.as_bytes())),
@@ -368,7 +372,10 @@ fn run_case(project: &Project, path: &Path, update: bool) -> CliResult<bool> {
     );
     compare(
         "skipped_ops_total",
-        spec.expect.skipped_ops_total.map(|v| v.to_string()).as_deref(),
+        spec.expect
+            .skipped_ops_total
+            .map(|v| v.to_string())
+            .as_deref(),
         actual.skipped_ops_total.map(|v| v.to_string()).as_deref(),
         &mut diffs,
     );

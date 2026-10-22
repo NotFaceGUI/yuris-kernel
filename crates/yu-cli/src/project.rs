@@ -137,23 +137,24 @@ impl Project {
     /// 打开主数据源(每次 boot 独立打开;文件句柄不复用)。
     pub fn open_source(&self) -> Result<Box<dyn DataSource>, Failure> {
         match &self.entry {
-            DataEntry::Packed(path) => Ok(Box::new(YpfSource::open(path, CODEC).map_err(
-                |d| Failure::runtime(format!("打开 {} 失败: {d}", path.display())),
-            )?)),
-            DataEntry::Loose(dir) => Ok(Box::new(
-                DirSource::open(dir, CODEC)
-                    .map_err(|d| Failure::runtime(format!("打开 {} 失败: {d}", dir.display())))?,
-            )),
+            DataEntry::Packed(path) => {
+                Ok(Box::new(YpfSource::open(path, CODEC).map_err(|d| {
+                    Failure::runtime(format!("打开 {} 失败: {d}", path.display()))
+                })?))
+            }
+            DataEntry::Loose(dir) => {
+                Ok(Box::new(DirSource::open(dir, CODEC).map_err(|d| {
+                    Failure::runtime(format!("打开 {} 失败: {d}", dir.display()))
+                })?))
+            }
         }
     }
 
     /// 辅助源:工程根(`system/YSCom/YSCom.ycd` 可能在这里;缺失不是错误)。
     pub fn open_aux(&self) -> Result<Box<dyn DataSource>, Failure> {
-        Ok(Box::new(
-            DirSource::open(&self.aux_root, CODEC).map_err(|d| {
-                Failure::runtime(format!("打开 {} 失败: {d}", self.aux_root.display()))
-            })?,
-        ))
+        Ok(Box::new(DirSource::open(&self.aux_root, CODEC).map_err(
+            |d| Failure::runtime(format!("打开 {} 失败: {d}", self.aux_root.display())),
+        )?))
     }
 
     /// 纹理挂载栈:封包在下、散盘在上(散盘同名覆盖)。

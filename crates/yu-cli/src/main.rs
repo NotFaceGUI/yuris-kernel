@@ -68,9 +68,14 @@ yu-cli · 原生引擎宿主 + 本地服务 + wasm 呈现端
 宿主注入(BootConfig,全部显式给值):
   screen_color=32   @_SCREEN_COLOR(浏览器/桌面 32bpp)
   dx_mode=0         @_DXMODE(无 DX 分支)
-  os_sound=true     @_OS_SOUND(引擎认为音频可用;宿主只是不播放)
+  os_sound=true     @_OS_SOUND(引擎认为音频可用;默认设备输出见下)
   media_readonly=0  @_MEDIA_READONLY(只读介质语义,不是内核只读数据 A2)
   record_events=off 默认关闭(首帧 129 万命令;对拍时 --record-events on)
+
+声音:
+  默认构建含 device 特性:run/serve 把 PCM 输出到本机默认设备。
+  `--no-default-features` 构建为纯 headless(不依赖声卡/不输出)。
+  www 浏览器侧不实现音频(当前不是真 wasm 目标)。
 
 serve:
   启动后打印 http://127.0.0.1:<port>/,默认打开浏览器。

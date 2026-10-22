@@ -8,11 +8,18 @@ use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::time::Instant;
 
-use yu_backend_soft::{frame_has_drawable_output, png, RenderReport, SoftRenderer, Surface, TextureStore};
+use yu_backend_soft::{
+    frame_has_drawable_output, png, RenderReport, SoftRenderer, Surface, TextureStore,
+};
 use yu_backend_wgpu::{DeviceOptions, WgpuRenderer};
-use yu_gfx::{json, probe_order_from_codes, CompositorFrame, GfxConfig, GfxHost, GfxState, Viewport};
+use yu_gfx::{
+    json, probe_order_from_codes, CompositorFrame, GfxConfig, GfxHost, GfxState, Viewport,
+};
 use yu_rt::input::{InputFrame, InputTimeline};
 use yu_rt::{BootConfig, Vm};
+#[cfg(feature = "device")]
+mod sound_device;
+use yu_sound::{SoundHost, SoundLoader, SoundState};
 
 use crate::project::{Project, CODEC};
 use crate::{CliResult, Failure};
@@ -152,13 +159,33 @@ impl Renderer {
         }
     }
 
+    /// 丢弃跨帧渲染状态(重启用;DIV-HOST-001)。
+    ///
+    /// 只清与运行代际绑定的部分:后缓冲、快照、离屏目标、图像加工缓存。
+    /// 纹理解析缓存与 GPU 管线保留(只依赖游戏数据)。
+    fn reset(&mut self) {
+        match self {
+            Renderer::Soft(renderer) => renderer.reset(),
+            Renderer::Wgpu {
+                renderer, check, ..
+            } => {
+                renderer.reset();
+                if let Some(soft) = check.as_mut() {
+                    soft.reset();
+                }
+            }
+        }
+    }
+
     fn render(&mut self, frame: &CompositorFrame) -> Result<(Surface, RenderReport), Failure> {
         match self {
             Renderer::Soft(renderer) => {
                 let out = renderer.render_frame(frame);
                 Ok((out.surface, out.report))
             }
-            Renderer::Wgpu { renderer, check, .. } => {
+            Renderer::Wgpu {
+                renderer, check, ..
+            } => {
                 let out = renderer
                     .render_frame(frame)
                     .map_err(|d| Failure::runtime(format!("wgpu 渲染失败: {d}")))?;
@@ -179,6 +206,17 @@ pub struct Engine {
     opts: EngineOptions,
     vm: Option<Vm>,
     state: Option<Rc<RefCell<GfxState>>>,
+    /// 声音域状态（与 `SoundHost` 共享；用于取走 `snd.*` 诊断）。
+    sound: Option<Rc<RefCell<SoundState>>>,
+    /// 已从声音宿主取走的诊断（`take_sound_diags` 的暂存）。
+    sound_diags: Vec<yu_log::Diag>,
+    /// 设备输出（默认 `device` feature；`--no-default-features` 时无此字段）。
+    #[cfg(feature = "device")]
+    sound_sink: Option<sound_device::SoundSink>,
+    /// 实时墙钟：`serve` 的 `tick_realtime` 用它推进逻辑/声音时间。
+    realtime_last: Instant,
+    realtime_us: u64,
+    realtime_last_ms: u32,
     renderer: Renderer,
     viewport: Viewport,
     frame: u64,
@@ -198,7 +236,19 @@ pub struct Engine {
 impl Engine {
     pub fn new(project: Project, opts: EngineOptions) -> CliResult<Self> {
         let boot_started = Instant::now();
-        let (vm, state, viewport, probe_order) = boot(&project, &opts)?;
+        let (vm, state, sound, viewport, probe_order) = boot(&project, &opts)?;
+        #[cfg(feature = "device")]
+        let sound_sink = if sound.is_some() {
+            match sound_device::SoundSink::open() {
+                Ok(sink) => Some(sink),
+                Err(e) => {
+                    eprintln!("[sound] 设备输出未启用: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let boot_ms = boot_started.elapsed().as_secs_f64() * 1000.0;
 
         let store = TextureStore::new(Box::new(project.mount()?), CODEC, probe_order.clone());
@@ -213,8 +263,7 @@ impl Engine {
                 })?;
                 let configured = opts.reconcile;
                 let check = if opts.reconcile {
-                    let store =
-                        TextureStore::new(Box::new(project.mount()?), CODEC, probe_order);
+                    let store = TextureStore::new(Box::new(project.mount()?), CODEC, probe_order);
                     Some(SoftRenderer::new(store))
                 } else {
                     None
@@ -232,6 +281,13 @@ impl Engine {
             opts,
             vm: Some(vm),
             state: Some(state),
+            sound,
+            sound_diags: Vec::new(),
+            #[cfg(feature = "device")]
+            sound_sink,
+            realtime_last: Instant::now(),
+            realtime_us: 0,
+            realtime_last_ms: 0,
             renderer,
             viewport,
             frame: 0,
@@ -338,14 +394,61 @@ impl Engine {
     }
 
     /// 推进一个逻辑帧并渲染。`Instant` 只用于报告,不进语义。
+    ///
+    /// 该路径是 headless/用例/基准用的“尽快跑完”模式：**不向设备推音频**。
+    /// 实时出声走 [`Engine::tick_realtime`]（`serve`）。
     pub fn tick(&mut self) -> CliResult<RenderedFrame> {
+        let now_ms = (self.frame as u32).saturating_mul(self.opts.frame_ms());
+        self.tick_inner(now_ms, 0)
+    }
+
+    /// 实时推进（`serve` 用）：逻辑时钟按**真实墙钟**走，声音状态与设备
+    /// 输出使用同一毫秒增量，避免 1000/fps 取整造成的系统性欠载。
+    ///
+    /// 墙钟按微秒累计后再取整，60Hz 下得到 16/17ms 交替的增量，
+    /// 长期平均与设备消费一致；暂停/断点造成的长间隔最多补 500ms。
+    pub fn tick_realtime(&mut self) -> CliResult<RenderedFrame> {
+        let now = Instant::now();
+        let mut delta_us = now.duration_since(self.realtime_last).as_micros() as u64;
+        self.realtime_last = now;
+        if delta_us > 500_000 {
+            delta_us = 500_000;
+        }
+        self.realtime_us = self.realtime_us.saturating_add(delta_us);
+        let now_ms = (self.realtime_us / 1000) as u32;
+        let delta_ms = now_ms.saturating_sub(self.realtime_last_ms);
+        self.realtime_last_ms = now_ms;
+        self.tick_inner(now_ms, delta_ms)
+    }
+
+    /// 暂停/无客户端时调用：丢弃暂停期间的真实时间，恢复时不快进。
+    pub fn reset_realtime_clock(&mut self) {
+        self.realtime_last = Instant::now();
+        #[cfg(feature = "device")]
+        if let Some(sink) = &self.sound_sink {
+            sink.prime();
+        }
+    }
+
+    fn tick_inner(&mut self, now_ms: u32, audio_delta_ms: u32) -> CliResult<RenderedFrame> {
         let vm = self
             .vm
             .as_mut()
             .ok_or_else(|| Failure::runtime("engine 未启动"))?;
-        let now_ms = (self.frame as u32).saturating_mul(self.opts.frame_ms());
         let tick_started = Instant::now();
         vm.tick_at(now_ms, &self.timeline);
+        if let Some(sound) = &self.sound {
+            let mut fresh = sound.borrow_mut().take_diags();
+            self.sound_diags.append(&mut fresh);
+            if self.sound_diags.len() > 8192 {
+                let drop = self.sound_diags.len() / 2;
+                self.sound_diags.drain(..drop);
+            }
+            #[cfg(feature = "device")]
+            if let Some(sink) = &self.sound_sink {
+                sink.pump(sound, audio_delta_ms);
+            }
+        }
         self.frame = self.frame.saturating_add(1);
         // 事件只做统计/drain:GfxHost 已同步消费同一批事件。
         self.events_drained += vm.take_events().len() as u64;
@@ -419,7 +522,33 @@ impl Engine {
         self.timeline.set(next, frame);
     }
 
-    /// 重启:丢 `Vm` + `GfxState`;保留渲染器与纹理缓存。
+    /// 重启:丢 `Vm` + `GfxState`;保留渲染器实例与纹理缓存,但**清空
+    /// 取走声音域诊断（`snd.*`）。宿主在脚本执行期产生，调用方负责消费；
+    /// 未安装声音宿主时为空。
+    pub fn take_sound_diags(&mut self) -> Vec<yu_log::Diag> {
+        std::mem::take(&mut self.sound_diags)
+    }
+
+    /// 当前声音层快照（真实语料验证/诊断用）。
+    pub fn sound_snapshot(&self) -> Vec<yu_sound::state::SoundSnapshot> {
+        self.sound
+            .as_ref()
+            .map(|state| state.borrow().snapshot())
+            .unwrap_or_default()
+    }
+
+    /// 当前声音层数（测试/诊断用）。
+    pub fn sound_layers(&self) -> usize {
+        self.sound
+            .as_ref()
+            .map(|state| state.borrow().layers_len())
+            .unwrap_or(0)
+    }
+
+    /// 跨帧渲染状态**(后缓冲/快照/离屏目标/加工缓存;DIV-HOST-001)。
+    ///
+    /// 新 `GfxState` 的 `CopyId` 从 0 重新分配,旧快照若残留会让新复制命中
+    /// 同 id 的旧纹理(冻结早退)而拿到重启前的像素。
     pub fn restart(&mut self) -> CliResult<()> {
         self.vm = None;
         self.state = None;
@@ -434,12 +563,22 @@ impl Engine {
         self.tick_history.clear();
         self.render_history.clear();
         self.events_drained = 0;
+        self.sound_diags.clear();
+        self.realtime_last = Instant::now();
+        self.realtime_us = 0;
+        self.realtime_last_ms = 0;
+        #[cfg(feature = "device")]
+        if let Some(sink) = &self.sound_sink {
+            sink.clear();
+        }
         let started = Instant::now();
-        let (vm, state, viewport, _) = boot(&self.project, &self.opts)?;
+        let (vm, state, sound, viewport, _) = boot(&self.project, &self.opts)?;
         self.boot_ms = started.elapsed().as_secs_f64() * 1000.0;
         self.vm = Some(vm);
         self.state = Some(state);
+        self.sound = sound;
         self.viewport = viewport;
+        self.renderer.reset();
         Ok(())
     }
 
@@ -449,20 +588,53 @@ impl Engine {
             .as_ref()
             .ok_or_else(|| Failure::runtime("没有可写的帧"))?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                Failure::runtime(format!("创建 {} 失败: {e}", parent.display()))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Failure::runtime(format!("创建 {} 失败: {e}", parent.display())))?;
         }
-        let bytes = png::png_bytes(surface)
-            .map_err(|e| Failure::runtime(format!("PNG 编码失败: {e}")))?;
+        let bytes =
+            png::png_bytes(surface).map_err(|e| Failure::runtime(format!("PNG 编码失败: {e}")))?;
         std::fs::write(path, &bytes)
             .map_err(|e| Failure::runtime(format!("写 {} 失败: {e}", path.display())))?;
         Ok(bytes.len())
     }
 }
 
+/// 声音装载器：把工程数据源（data.ypf 或散盘 data/）接到 `yu-sound`。
+///
+/// 扩展名探测序由 `yu-sound` 驱动（(无扩展名)→.OGG→.WAV）；本适配器只回答
+/// “存在/读取”，不认识 ypf。
+struct VfsSoundLoader {
+    source: Box<dyn yu_vfs::DataSource>,
+}
+
+impl SoundLoader for VfsSoundLoader {
+    fn load(&self, name: &[u8]) -> Result<Option<Vec<u8>>, yu_log::Diag> {
+        let key = yu_vfs::LookupKey::new(name, CODEC).map_err(|d| {
+            yu_sound::error::recoverable(
+                yu_sound::error::code::FILE_READ,
+                format!("声音路径非法: {d}"),
+            )
+        })?;
+        if !self.source.exists(&key) {
+            return Ok(None);
+        }
+        self.source.open(&key).map(Some).map_err(|d| {
+            yu_sound::error::recoverable(
+                yu_sound::error::code::FILE_READ,
+                format!("读取声音文件失败: {d}"),
+            )
+        })
+    }
+}
+
 /// boot 产物:`Vm` + 共享 `GfxState` + 视口 + 纹理探测顺序。
-type BootBundle = (Vm, Rc<RefCell<GfxState>>, Viewport, Vec<yu_gfx::ImageFormat>);
+type BootBundle = (
+    Vm,
+    Rc<RefCell<GfxState>>,
+    Option<Rc<RefCell<SoundState>>>,
+    Viewport,
+    Vec<yu_gfx::ImageFormat>,
+);
 
 fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     let source = project.open_source()?;
@@ -477,6 +649,9 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         os_sound: opts.os_sound,
         media_readonly: opts.media_readonly,
         frame_ms: opts.frame_ms(),
+        // 路径类系统变量由宿主注入(手册 `basic/svariable.html`)。
+        // 缺失会让 `es_First.yst` 的 `$_SAVE_PATH` 走 Unimplemented(DIV-RT-010)。
+        paths: host_paths(project.root()),
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(source, Some(aux), boot)
@@ -496,6 +671,18 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
             .map_err(|d| Failure::runtime(format!("GfxState 构造失败: {d}")))?,
     ));
     vm.set_graphics_host(Box::new(GfxHost::new(state.clone())));
+    let sound_state = if opts.os_sound {
+        // 声音初始化跟随 `@_OS_SOUND` 开关：关时不装宿主（行为与 M-2 一致）。
+        let loader = VfsSoundLoader {
+            source: project.open_source()?,
+        };
+        let sound_state = Rc::new(RefCell::new(SoundState::new(Box::new(loader))));
+        let yscm = vm.tables().boot.yscm.clone();
+        vm.set_sound_host(Box::new(SoundHost::new(sound_state.clone(), yscm)));
+        Some(sound_state)
+    } else {
+        None
+    };
     let probe_order = {
         let from_config = probe_order_from_codes(&vm.tables().boot.config.image_ext_order);
         if from_config.is_empty() {
@@ -504,7 +691,7 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
             from_config
         }
     };
-    Ok((vm, state, viewport, probe_order))
+    Ok((vm, state, sound_state, viewport, probe_order))
 }
 
 fn compare_reports(soft: &RenderReport, wgpu: &RenderReport) -> Result<(), Failure> {
@@ -582,4 +769,29 @@ fn device_options_from_env() -> DeviceOptions {
     options
 }
 
-
+/// 宿主注入的路径系统变量(手册 `basic/svariable.html`)。
+///
+/// - `$_SYSTEM_PATH` = YU-RIS 起動パス → 工程根(官方 exe 所在目录);
+/// - `$_SAVE_PATH` = YU-RIS セーブデータパス → 工程根下官方引擎实际写入的
+///   `save/`(原版数据自证:`save/*.sd`、`save/data/` 由官方 exe 生成);
+/// - `$_APPDATA_PATH` = ユーザのホームディレクトリパス;
+/// - `$_PERSONAL_PATH` = マイドキュメントのパス;
+/// - `$_PROJECT_PATH` 手册无页(DIV-RT-010),不猜值 ⇒ `None`。
+fn host_paths(root: &std::path::Path) -> yu_rt::vm::HostPaths {
+    const BS: char = '\\';
+    let mut sys = root.to_string_lossy().replace(BS, "/");
+    if !sys.ends_with('/') {
+        sys.push('/');
+    }
+    let save = format!("{sys}save/");
+    let home = std::env::var("USERPROFILE").ok();
+    yu_rt::vm::HostPaths {
+        system_path: Some(sys.into_bytes()),
+        save_path: Some(save.into_bytes()),
+        appdata_path: home.as_ref().map(|h| h.clone().into_bytes()),
+        personal_path: home
+            .as_ref()
+            .map(|h| format!("{h}{BS}Documents").into_bytes()),
+        project_path: None,
+    }
+}

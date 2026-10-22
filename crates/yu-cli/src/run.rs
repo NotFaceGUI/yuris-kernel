@@ -26,14 +26,13 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         None => None,
     };
     let until_visible = args.switch("until-visible");
-    let until_frame = match args.flag("until-frame") {
-        Some(value) => Some(
-            value
-                .parse::<u64>()
-                .map_err(|_| Failure::usage(format!("--until-frame 需要非负整数,收到 `{value}`")))?,
-        ),
-        None => None,
-    };
+    let until_frame =
+        match args.flag("until-frame") {
+            Some(value) => Some(value.parse::<u64>().map_err(|_| {
+                Failure::usage(format!("--until-frame 需要非负整数,收到 `{value}`"))
+            })?),
+            None => None,
+        };
     let data = args.flag("data").map(PathBuf::from);
     let shot = args.flag("shot").map(PathBuf::from);
     let json_path = args.flag("json").map(PathBuf::from);
@@ -71,9 +70,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         }
     }
     if until_visible && !engine.last_report().drawable {
-        output::line(format!(
-            "warning: {limit} 帧内没有可绘制屏幕;渲染最后一帧"
-        ));
+        output::line(format!("warning: {limit} 帧内没有可绘制屏幕;渲染最后一帧"));
     }
 
     let report = engine.last_report().clone();

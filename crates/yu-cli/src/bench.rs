@@ -40,7 +40,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let project = Project::discover(Path::new(&root), None)?;
     let workspace = workspace_root();
     let mut rows: Vec<Row> = Vec::new();
-    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
     output::line(format!(
         "yu-cli bench · profile={profile} marker={} data={}:{} ({} bytes)",
         build_info::ENGINE_MARKER,
@@ -87,7 +91,12 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let restart_ms = restart_started.elapsed().as_secs_f64() * 1000.0;
     let first = engine.tick()?;
     let reboot_ready_ms = restart_started.elapsed().as_secs_f64() * 1000.0;
-    rows.push(Row::new("reboot_ms", restart_ms, "ms", "丢 Vm+GfxState 后重新 boot"));
+    rows.push(Row::new(
+        "reboot_ms",
+        restart_ms,
+        "ms",
+        "丢 Vm+GfxState 后重新 boot",
+    ));
     rows.push(Row::new(
         "reboot_first_tick_ms",
         first.report.tick_ms,
@@ -122,10 +131,24 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let avg_wall = wall.iter().sum::<f64>() / wall.len() as f64;
     let avg_engine = engine_samples.iter().sum::<f64>() / engine_samples.len() as f64;
     let p95 = percentile(&mut engine_samples, 95.0);
-    let fps = if avg_wall > 0.0 { 1000.0 / avg_wall } else { 0.0 };
-    rows.push(Row::new("steady_frames", steady_frames as f64, "frames", "稳态样本数"));
+    let fps = if avg_wall > 0.0 {
+        1000.0 / avg_wall
+    } else {
+        0.0
+    };
+    rows.push(Row::new(
+        "steady_frames",
+        steady_frames as f64,
+        "frames",
+        "稳态样本数",
+    ));
     rows.push(Row::new("steady_avg_ms", avg_wall, "ms", "tick+合成挂钟"));
-    rows.push(Row::new("steady_engine_ms", avg_engine, "ms", "引擎报告 tick+render"));
+    rows.push(Row::new(
+        "steady_engine_ms",
+        avg_engine,
+        "ms",
+        "引擎报告 tick+render",
+    ));
     rows.push(Row::new("steady_p95_ms", p95, "ms", "引擎报告 p95"));
     rows.push(Row::new("steady_fps", fps, "fps", "1000/平均挂钟"));
     slow.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -144,7 +167,9 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     match measure_wgpu() {
         Ok((ms, adapter, backend)) => {
             rows.push(Row::new("wgpu_init_ms", ms, "ms", "GpuContext::new"));
-            output::line(format!("wgpu: {ms:.2} ms adapter={adapter} backend={backend}"));
+            output::line(format!(
+                "wgpu: {ms:.2} ms adapter={adapter} backend={backend}"
+            ));
         }
         Err(message) => {
             rows.push(Row::new("wgpu_init_ms", f64::NAN, "ms", &message));
@@ -158,7 +183,12 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     } else {
         match measure_wasm(&workspace) {
             Ok(stats) => {
-                rows.push(Row::new("wasm_noop_ms", stats.noop_ms, "ms", "cargo build 无改动"));
+                rows.push(Row::new(
+                    "wasm_noop_ms",
+                    stats.noop_ms,
+                    "ms",
+                    "cargo build 无改动",
+                ));
                 rows.push(Row::new(
                     "wasm_incremental_ms",
                     stats.incremental_ms,
@@ -280,7 +310,12 @@ struct BootStats {
 impl BootStats {
     fn rows(&self, tag: &str) -> Vec<Row> {
         vec![
-            Row::new(&format!("boot_ms[{tag}]"), self.boot_ms, "ms", "表+入口脚本"),
+            Row::new(
+                &format!("boot_ms[{tag}]"),
+                self.boot_ms,
+                "ms",
+                "表+入口脚本",
+            ),
             Row::new(
                 &format!("first_tick_ms[{tag}]"),
                 self.first_tick_ms,
@@ -445,11 +480,16 @@ struct ServerStats {
 fn measure_server(root: &Path) -> Result<ServerStats, String> {
     let engine_bin = sibling_engine_binary()?;
     let port = free_port();
-    let log_path = workspace_root().join("target").join("tmp").join("bench-engine.log");
+    let log_path = workspace_root()
+        .join("target")
+        .join("tmp")
+        .join("bench-engine.log");
     let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(Path::new(".")));
     let log = std::fs::File::create(&log_path)
         .map_err(|e| format!("创建 {} 失败: {e}", log_path.display()))?;
-    let log_err = log.try_clone().map_err(|e| format!("复制日志句柄失败: {e}"))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| format!("复制日志句柄失败: {e}"))?;
     let mut child = Command::new(&engine_bin)
         .arg("serve")
         .arg(root)

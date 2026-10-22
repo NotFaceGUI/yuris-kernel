@@ -79,12 +79,13 @@ impl ServeOptions {
             .map(PathBuf::from)
             .unwrap_or_else(default_www);
         let supervised = args.switch("supervised");
-        let pause_at = match args.flag("pause-at") {
-            Some(value) => Some(value.parse::<u64>().map_err(|_| {
-                Failure::usage(format!("--pause-at 需要非负整数,收到 `{value}`"))
-            })?),
-            None => None,
-        };
+        let pause_at =
+            match args.flag("pause-at") {
+                Some(value) => Some(value.parse::<u64>().map_err(|_| {
+                    Failure::usage(format!("--pause-at 需要非负整数,收到 `{value}`"))
+                })?),
+                None => None,
+            };
         args.finish()?;
         Ok(Self {
             root: PathBuf::from(root),
@@ -185,7 +186,10 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         dataset.bytes,
         boot_ms
     ));
-    output::line(format!("marker={} (HMR 可观测点)", build_info::ENGINE_MARKER));
+    output::line(format!(
+        "marker={} (HMR 可观测点)",
+        build_info::ENGINE_MARKER
+    ));
     if !opts.no_open {
         open_browser(&url);
     }
@@ -270,8 +274,14 @@ struct Shared {
 }
 
 enum Control {
-    Input { button: String, pressed: bool },
-    Cursor { x: i64, y: i64 },
+    Input {
+        button: String,
+        pressed: bool,
+    },
+    Cursor {
+        x: i64,
+        y: i64,
+    },
     Restart,
     /// 从当前状态步进 N 帧后暂停。
     Step(u64),
@@ -363,12 +373,14 @@ fn engine_loop(
             .unwrap_or(false);
         // 没有观众时不推进:游戏状态只在有人看时前进(输入也只会来自客户端)。
         if paused || !has_clients {
+            // 暂停/无人观看：丢弃这段时间，恢复时不快进逻辑/声音时钟。
+            engine.reset_realtime_clock();
             thread::sleep(Duration::from_millis(15));
             next = Instant::now();
             continue;
         }
 
-        let rendered = engine.tick()?;
+        let rendered = engine.tick_realtime()?;
         if let Some(left) = step_left.as_mut() {
             *left = left.saturating_sub(1);
             if *left == 0 {
@@ -556,19 +568,25 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>, www: PathBuf) {
     }
 }
 
-fn handle_connection(
-    mut stream: TcpStream,
-    shared: Arc<Shared>,
-    www: &Path,
-) -> Result<(), String> {
+fn handle_connection(mut stream: TcpStream, shared: Arc<Shared>, www: &Path) -> Result<(), String> {
     let request = read_request(&mut stream)?;
-    let path = request.path.split('?').next().unwrap_or(&request.path).to_string();
+    let path = request
+        .path
+        .split('?')
+        .next()
+        .unwrap_or(&request.path)
+        .to_string();
     match (request.method.as_str(), path.as_str()) {
         ("GET", "/ws") => handle_ws(stream, &request.headers, shared),
         ("GET", "/events") => handle_sse(stream, shared),
         ("GET", "/api/status") => {
             let body = status_json(&shared);
-            respond(stream, "200 OK", "application/json; charset=utf-8", body.as_bytes())
+            respond(
+                stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                body.as_bytes(),
+            )
         }
         ("GET", "/api/report") => {
             let body = shared
@@ -576,7 +594,12 @@ fn handle_connection(
                 .lock()
                 .map(|status| status.report_json.clone())
                 .unwrap_or_else(|_| "{\"ok\":false}".to_string());
-            respond(stream, "200 OK", "application/json; charset=utf-8", body.as_bytes())
+            respond(
+                stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                body.as_bytes(),
+            )
         }
         ("GET", "/healthz") => respond(stream, "200 OK", "text/plain; charset=utf-8", b"ok"),
         ("GET", _) => serve_static(stream, www, &path),
@@ -796,7 +819,9 @@ fn parse_control(text: &str) -> Option<Control> {
         }),
         "restart" => Some(Control::Restart),
         "step" => Some(Control::Step((value.get("n")?.as_f64()? as u64).max(1))),
-        "back" => Some(Control::Replay((value.get("target")?.as_f64()? as u64).max(1))),
+        "back" => Some(Control::Replay(
+            (value.get("target")?.as_f64()? as u64).max(1),
+        )),
         "pause" => Some(Control::Pause(true)),
         "resume" => Some(Control::Pause(false)),
         _ => None,
@@ -823,7 +848,11 @@ fn handle_sse(mut stream: TcpStream, shared: Arc<Shared>) -> Result<(), String> 
         match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(event) => {
                 let line = format!("data: {event}\n\n");
-                if stream.write_all(line.as_bytes()).and_then(|_| stream.flush()).is_err() {
+                if stream
+                    .write_all(line.as_bytes())
+                    .and_then(|_| stream.flush())
+                    .is_err()
+                {
                     break;
                 }
             }

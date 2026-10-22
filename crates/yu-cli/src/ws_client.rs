@@ -112,11 +112,7 @@ impl WsClient {
                 }
             }
             match opcode {
-                0x1 => {
-                    return Ok(Message::Text(
-                        String::from_utf8_lossy(&payload).to_string(),
-                    ))
-                }
+                0x1 => return Ok(Message::Text(String::from_utf8_lossy(&payload).to_string())),
                 0x2 => return Ok(Message::Binary(payload)),
                 0x8 => return Ok(Message::Close),
                 0x9 => {
@@ -133,7 +129,10 @@ impl WsClient {
     }
 
     fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), String> {
-        self.mask_seed = self.mask_seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        self.mask_seed = self
+            .mask_seed
+            .wrapping_mul(1664525)
+            .wrapping_add(1013904223);
         let mask = self.mask_seed.to_be_bytes();
         let mut frame = Vec::with_capacity(payload.len() + 14);
         frame.push(0x80 | opcode);
