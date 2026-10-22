@@ -3757,3 +3757,720 @@ case first-screen: FAIL
 - A3 的修法二选一(`reset()` / `CopyId` 代际);
 - `cases/*.json` 的重生成依赖 A1 结论(先定契约再 update);
 - `image_probe_order` 的 A5 处置需裁决(拒绝启动 / 全层 Unimplemented)。
+
+## 成果 J4 续 (2026-10-22) · 补齐 effect Pass2/Pass3:psB 4-tap 锐利缩放 + psA 16-tap 双三次
+
+> J4 遗留:4 个真实 ps_2_0 blob 中 pass0/1(交叉淡化/mask 转场)已有 WGSL,
+> pass2/3(显示缩放滤镜)只有反汇编,`docs/shader-parity.md` §5 标
+> “未接入”。本次补齐两个 shader、接线、像素对拍,并用 REA 复核了
+> `FUN_004195ec` / `FUN_0041a308` / `FUN_0043cd6c`。
+
+### 1. 新增证据(官方 exe `4f5eefa3…`)
+
+| 地址 | 事实 |
+|---|---|
+| `0x41a308` | UV 生成:mode2 → t0=(u,v) t1=(u+1/W,v) t2=(u,v+1/H) t3=(u+1/W,v+1/H);mode3 → t0..t3=(u-1/W, v-1/H..v+2/H),t4..t7=(u, v-1/H..v+2/H) |
+| `0x419f72` | `YS_TexDiffU = (2/W, 0)`(仅 psA) |
+| `0x419dbe..0x419e13` | `YS_Texture3` + `YS_TexSize=(W,H)`;`SharpN` 全函数无 SetValue |
+| FXO 参数初值 | `SharpN = 0x3FA00000 = 1.25` |
+| `0x419832..0x41988d` | 缩放 pass 硬编码 `SetSamplerState(0, 5/6/7, 1)` = D3DTEXF_POINT |
+| `0x43cd6c` | 全局帧采样把配置枚举 0/1/2 映射为 D3DTEXF 1/2/3;配置 1/1/0 ⇒ LINEAR/LINEAR/POINT |
+
+### 2. 实现
+
+- `shaders/scale_psb.wgsl`:2×2 tap、`w=sat((frac-0.5)*1.25+0.5)`、`lrp_sat`;
+- `shaders/scale_psa.wgsl`:4×4 tap、三次权重 `-f³+2f²-f / f³-2f²+1 /
+  -f³+f²+f / f³-f²`,累加序与 ps_2_0 一致,无最终 saturate;
+- 两者用 `floor(u*W)` + `textureLoad` + clamp 复刻 D3D9 POINT 的 texel
+  选择(避免 WebGPU nearest 在整 texel 边界的 tie-break 差异);
+- `pipelines.rs`:独立 bind layout(纹理/point 采样器/uniform)、
+  按 `(源纹理 id, 变体, uniform)` 缓存 bind group;
+- `lib.rs`:`ScaleFilter{Sharp,Bicubic}` + 加法 API
+  `render_frame_scaled(frame, output, filter)`;`render_frame` 行为不变;
+  缩放前屏幕画面仍作为 `:/W0/` 后缓冲;
+- 文档:`shader-parity.md` §3.3/§5/§6、`render-parity.md` §5.3、
+  `gfx-unimplemented-todo.md` 050、crate README。
+
+### 3. 验证(原始输出)
+
+```text
+$ cargo test -p yu-backend-wgpu --test wgpu display_scale -- --nocapture
+running 3 tests
+test display_scale_1to1_reproduces_composited_screen ... ok
+test display_scale_psa_matches_reference_upscale_and_downscale ... ok
+test display_scale_psb_matches_reference_upscale_and_downscale ... ok
+test result: ok. 3 passed; 0 failed
+
+$ cargo test -p yu-backend-wgpu
+unittests: 9 passed
+wgpu.rs:   14 passed
+doc-tests: 1 passed
+```
+
+对拍阈值:GPU 与同式 CPU 参考(8×6 → 16×12 与 8×6 → 5×4)逐通道
+`abs_diff ≤ 1`;1:1 与 `render_frame` 逐通道 `≤ 1`。
+
+### 4. 仍 Unimplemented(不猜)
+
+- `MODE 4/8/10..18` 的 Photoshop 公式:引擎只有 4 个 effect pass,
+  没有任何除算/差分/Overlay 像素体;`fixed_state()` 仍返回 `None`,
+  后端继续显式跳过并计数(DIV-GFX-002)。
+
+## 成果 J4 续 2 (2026-10-22) · 补查 SDK/语料:E-mote 是独立插件运行时
+
+> 回应“不能只看 exe”:查了 SDK 全树、手冊、游戏 `yscfg.dat`/语料与
+> E-mote DLL。结论:主引擎 shader 集仍是 4 个(psA/psB 已实现);
+> E-mote 不在 exe 内,是可选插件,自带 58 个 shader。
+
+### 1. 主引擎没有外部/自定义 shader 入口
+
+- `yu-ris.exe` 无 `D3DXCreateEffectFromFile`/`CompileShader`/
+  `CreatePixelShader`/`.fxo`/`.fx`/`.hlsl`/`.cso` 字符串;
+  所有 shader 相关串都是静态链接 D3DX9 的错误文本 + 引擎
+  `HLSL BeginPass0..3/SetTexture/SetValue` 诊断。
+- 语料 `project-eris/save/data` 与 `unpack/` 无 `.fx/.fxo/.cso/.hlsl`;
+  扩展名只有 png/jpg/ybn/yst/txt/ogg/sd/ymv/psb/mpg。
+- 手冊(CP932 搜索)`YU-RIS` 部分无“シェーダ/フィルタ”页;
+  `エンジン設定.exe` 只有“拡大(外接)/(内接)”,没有 shader 画质选项。
+- 脚本命令表无 shader/effect 命令;`EMOTE` 是唯一的图形扩展入口。
+
+### 2. 显示缩放滤镜真的会被语料使用
+
+`project-eris/yscfg.dat`(128 B i32 数组)index 8 = **1**;
+`FUN_00460924` 映射 `1 → DAT_00801334=2 → effect Pass2(psB)`。
+所以窗口缩放时本语料走 4-tap 锐利缩放,`render_frame_scaled(Sharp)` 对应。
+
+### 3. E-mote(新发现,独立子系统)
+
+- `FUN_004661ec`:`LoadLibraryA("emotedriver.dll")` 探测 →
+  `LoadLibraryA("YSEmote.dll")` → `GetProcAddress` ordinal `0x1..0x3`、
+  `0x65..0x100`;`DAT_00801750=1`。DLL 缺失时引擎照常启动。
+- `YSEmote.dll`:256 个无名导出,导入 `emotedriver.dll` 的
+  `EmoteCreate`/`EmoteFilterTexture`;`emotedriver.dll` 导入 `d3dx9_43`.
+- `emotedriver.dll` 自带 **58 个 unique shader**:27 ps_2_0 + 27 ps_3_0
+  (13 plain / 13 alpha-mask / 1 pixelate)+ 3 vs_2_0 + 1 vs_3_0。
+- 数据:`cg/stand/emote_test.psb`(`PSB\0` v2,8.8 MB);
+  手冊 `E-moteERIS命令マニュアル.txt` 定义
+  `\SP.ST/\SP.EM.VAR/PLAY/DPLAY/STOP/DSTOP/VO`.
+- 语料 120 帧 census:`EMOTE` 8 次(`BUST/HAIR/PARTS=128`, `SMOOTH=1`)、
+  `EMOTEINFO` 0 次;首 120 帧未加载 `emote_test.psb`。
+  当前内核只发 `Domain::Emote`,不渲染角色。
+
+### 4. 交付
+
+- `docs/emote-parity.md`(证据/架构/58 shader 清单/现状/里程碑);
+- `docs/tasks/task-emote-runtime.md`(M0 契约 → M1 PSB → M2 动画 →
+  M3 渲染 → M4 对拍);
+- `docs/shader-parity.md` 范围声明:引擎 4 个 ≠ E-mote 58 个;
+- `docs/todo-inventory.md`:EMOTE 渲染语义为独立子系统例外;
+- `docs/emote-parity.md` §5:wasm 与开源生态对照
+  (`emote-psb-rs` MIT 解析器、`eluna` Rust+wgpu 预览、`amadeus-emote-loader`
+  显式 wasm32、FreeMote/WebGL 非商业且非 1:1);结论:官方 DLL 不能进 wasm,
+  干净 Rust 实现可 wasm;当前 presenter 架构不需要内核 wasm。
+
+---
+
+## 成果 AU2 (2026-10-22) · 修复审查项:P0/P1 全部落地(含 2 个新发现)
+
+> 承接 `docs/audit-2026-10-22.md`。范围:`yu-gfx`、`yu-backend-soft`、
+> `yu-backend-wgpu`、`yu-rt`(仅 `TableSet: Clone`)、`yu-cli`;
+> `cases/*.json` 重生成。零 git 写操作。
+> 纪律:每一项都先定证据来源再写代码;缺子系统的补齐(不是跳过)。
+
+### 1. 修复清单
+
+| 项 | 状态 | 做法与证据 |
+|---|---|---|
+| A1 首帧主组 COPY 无源(DIV-GFX-051) | **fixed** | 首帧无 `last_screen`/`backbuffer` 时用 `frame.clear` 合成视口大小的后缓冲初值。依据:D3D9 设备创建后后缓冲即存在,内容为初始化清屏色(DIV-GFX-010);主组已直绘无离屏 RT(EVID-J3-07) |
+| A3 重启不清渲染器(DIV-HOST-001) | **fixed** | soft/wgpu 各加 `reset()`(清 `last_screen`/`backbuffer`/`snapshots`/离屏目标/`image_cache`/`uploaded_overrides`);`Engine::restart` 调用。纹理缓存与管线保留(只依赖游戏数据) |
+| A2 探测序内置兜底(DIV-GFX-049) | **fixed** | `GfxConfig::new` 不再填默认序;`from_tables` 在 yscfg 空且宿主未显式注入时返回 `gfx.config.probe_order_missing` |
+| A4 REVERSE/HORIZONTAL 组合(DIV-GFX-052) | **fixed** | wgpu 补上与 soft 逐字对齐的“源已加工则现算 / 否则按 `(源身份,操作)` 缓存”分支 |
+| C1 cases 过期 | **fixed** | `case --all --update`:18→85 ops、5→0 skipped;三条用例 PASS |
+| C2 `src/` 的 `eprintln!` | **已清** | 复核时已无命中(并发会话已移除);`grep` 守卫仍为 0 |
+| C3 HostPaths 未注入 | **fixed** | 7 个示例 + `yu-cli::boot()` 注入 4 个手册有页的路径;`$_PROJECT_PATH` 手册无页保持 `None` |
+| **DIV-GFX-053(新)** 复制源同帧被 CGEND 删除 | **fixed** | `CopyOp.source_texture` 在命令时刻固定源基础纹理(EVID-T-15:官方命令处理器立即执行) |
+| **DIV-GFX-054(新)** COPY 区域缺省坐标 | **fixed** | `CopyRegion::Partial` 坐标改 `Option`,`resolve()` 缺省 = 整幅。证据:ERIS `COPY2=1 X=0 X2=@sx-1` 无 `Y/Y2`,官方是整高切片 |
+
+### 2. 新发现(DIV-GFX-053 的实证过程)
+
+`gfx_dump` 的 copy log 有 69 条复制,但 `frame()` 只输出 1 条:
+
+```text
+copy log (69):
+  copy 271 -> :/W0/CGS100
+  copy 272 -> :/W0/BT.OFFES.GAMEMAIN.TIP.CLICK=0=1
+  ...
+  copy 339 -> :/W0/BT.OFFES.GAMEMAIN.BTN.MENU=0=1
+
+frame 1: passes=14 ops=17     ← 68 条被丢弃
+```
+
+根因:`frame()` 的 `source_live` 检查用 `nodes.contains_key(源)`;ERIS 按钮流程是
+`CG[ID="BT.OFF.TMP" FILE=…]` → 逐按钮 `COPY2` 切片 → **全部按钮建完后
+`CGEND[BT.OFF.TMP]`**,纹理 pass 在帧末回放时源节点已删。
+
+同时暴露 `DIV-GFX-054`:dump 里的区域是 `{"x":0,"y":0,"x2":-1,"y2":0}`——
+旧实现把未指定的 `Y/Y2` 填 0,只复制首行。真实脚本是
+`CGACT[ID="BT.OFF.TMP" ID2=$off COPY2=1 X=0 X2=@sx-1]`(整高切片)。
+
+修复后首屏 census:
+
+```text
+passes 14 → 82(texture pass 12 → 80 = 69 copy + 11 image)
+ops    17 → 85(drawn 85, skipped 0)
+```
+
+### 3. 验收原始输出
+
+```text
+$ cargo test --workspace --no-fail-fast        (带 AGENTS §2 样本)
+61 个测试目标 test result: ok;0 个 FAILED
+
+$ cargo test -p yu-gfx --test eris_first_screen
+3 passed(含新增 A5 拒绝用例 empty_image_ext_order_is_rejected_not_defaulted)
+
+$ cargo test -p yu-backend-soft --test render
+10 passed(含 A1/A3/区域 3 条新用例)
+
+$ cargo test -p yu-backend-wgpu --test wgpu
+15 passed(含 reverse_after_rectpaint_matches_soft)
+
+$ cargo test -p yu-cli --test restart -- --ignored
+1 passed(先跑到 title 再 restart,同帧 RGBA SHA 一致)
+
+$ frame_walk 600 / wgpu_frame_walk 600
+hash 差异 0;ops/drawn/skipped/transition/copy/image 差异 0
+title 稳定帧 a5a618d0…2483(两端相同)
+
+$ case --all
+3 passed; 0 failed
+
+$ cargo clippy --workspace --all-targets
+0 error;yu-rt 5 条既有 warning(与本线无关);yu-gfx / yu-backend-soft /
+yu-backend-wgpu / yu-cli 全部 0 告警
+
+$ grep -rn "println!|eprintln!|dbg!" crates/*/src
+唯一命中是 yu-cli/output.rs 的纪律注释本身;src/ 无 stdout 宏
+```
+
+### 4. 回归验证(证明测试是真门禁)
+
+| 手法 | 结果 |
+|---|---|
+| 临时注释掉 `SoftRenderer::reset()` 的 `snapshots.clear()` | `reset_drops_snapshots_so_new_copy_ids_do_not_alias` **FAILED**(旧像素 `[255,0,0]` 冻结) |
+| 临时注释掉 `Engine::restart` 的 `renderer.reset()` | 单元级测试仍通过(3 帧黑屏前后缓冲相同)⇒ 已把 restart 用例改成**先跑到 title 再重启**;这是该用例第一版不敏感的原因,记录在测试注释里 |
+
+### 5. 验证首帧像素
+
+`first_frame`(tick 1,含 COPY)现在为纯黑 `(0,0,0,255)`,与
+“官方首帧 = 设备初始化黑屏”一致;title(tick 300)与官方 `frame_0006.png`
+平坦区域逐通道 max 2 / diff>4 = 0。
+
+### 6. 未闭合
+
+- 官方首帧(启动瞬间)截图缺失 ⇒ DIV-GFX-051 的锚点是“设备初始化黑屏”推断,
+  非逐像素取证;
+- `bt` 快照按钮的实际像素未与官方 title 按钮列逐像素对拍(需要 hover 态输入
+  与官方同状态采集);
+- 重启语义仍为“重启 = 新设备”的决策(A3),没有引擎 trace 证据。
+
+## 成果 E1-M1 (2026-10-22) · yu-emote 独立仓库:PSB 解析/body 解密/key 搜索 + YU-RIS 适配骨架
+
+> 用户要求:不能只看 exe;把可复用的开源实现拉下来,建立独立仓库并在当前
+> 工程回链。仓库(已公开):<https://github.com/NotFaceGUI/yu-emote>,
+> 以 **git submodule** 挂在 `<repo>/yu-emote`(gitlink `2cb7261`)。
+
+### 1. 参考项目(本地 `<projects>/emote-refs/`)
+
+| 项目 | 许可 | 用途 |
+|---|---|---|
+| storycraft/emote-psb-rs | MIT | `yu-emote` 的 PSB/MDF 二进制层(直接依赖 `emote-psb = 0.8`) |
+| Mieluoxxx/amadeus-emote-loader | Apache-2.0 | 规范化/部件/显式 wasm32 的行为参考(未复制) |
+| xmoezzz/eluna | 未声明 | PSB/动画结构行为参考;**不复制代码** |
+| UlyssesWu/FreeMote | CC BY-NC-SA 4.0 | PSB body cipher/key 事实与 oracle;不复制 |
+
+### 2. 实现
+
+- PSB/MDF 解析;body-only 解密(6 词流,每游戏 key);
+- `psb-key-search`:单 DWORD key 搜索(数组头 + root 0x21 过滤);
+- `psb-info`:确定性摘要(version/资源/top-level/节点计数/深度);
+- `yuris`:`EMOTE` 参数按名记录、`EMOTEINFO` 未取证字段显式拒绝、
+  capability(`SYSTEMINFO[EMOTE]` 保持 0 直到渲染可用)、`suspend/resume`、
+  dirty 帧标记;
+- 许可:MIT OR Apache-2.0;`NOTICE` 记录 emote-psb/amadeus/eluna/FreeMote 边界。
+
+### 3. 验证(原始输出)
+
+```text
+$ cargo test                      # 无样本:全部通过(样本测试显式 SKIP)
+$ YURIS_EMOTE_SAMPLE=<emote_test.psb> YURIS_EMOTE_KEY=0x175058c9 cargo test
+test emote_test_sample_parses ... ok
+{
+  "version": 2, "resources": 2, "root_kind": "object",
+  "top_level": { "easing":"list", "id":"string", "label":"string",
+                 "metadata":"object", "object":"object", "screenSize":"object",
+                 "source":"object", "spec":"string",
+                 "stereovisionProfile":"object", "version":"float" },
+  "counts": { "objects": 5863, ... }, "max_depth": 36
+}
+$ cargo run --release --bin psb-key-search -- emote_test.psb
+found key: 0x175058c9
+```
+
+`eluna psb_extract` 对同一解密文件报 `names=405 strings=388 resources=2`,
+与 `yu-emote` 一致。key 是**每游戏**数据,只从 `YURIS_EMOTE_KEY` 读取,
+不入库、不硬编码。
+
+### 4. 回链
+
+- `docs/emote-parity.md` §0/§3.1:实现仓库与当前状态;
+- `docs/tasks/task-emote-runtime.md` §0.1:M0 partial / M1 partial;
+- `docs/references/open-source-tools.md`:五个 E-mote 项目的许可与用途;
+- 当前内核:公开仓库以 **git submodule** 挂在 `yu-emote/`
+  (`.gitmodules` + gitlink `2cb7261`);已 staged,**未提交**(按 AGENTS
+  零 git 写操作,待主人 commit)。未加 Cargo 依赖;M1 稳定后由适配 crate
+  用子模块内 path 依赖。
+
+### 5. 未完成
+
+M1 剩余(规范化/部件表)、M2(时间线)、M3(wgpu 渲染 58 变体)、
+M4(官方 DLL 对拍)。
+
+## 成果 AU3 (2026-10-22) · AU2 产出独立复验 + P2-8 blend 状态表交叉检查 + 台账/README 收口
+
+> 与 AU2 分会话并行推进后接手(本会话最初按 todo-inventory §5 顺序做 P0,
+> 发现 AU2 同批落地后转做独立复验与剩余 P1)。零 git 写操作。
+
+### 1. AU2 产出独立复验(不看结论,重跑命令)
+
+```text
+$ export TEMP=<side-repo>/workbench/tmp  YURIS_SAMPLE_ERIS_YSBIN / ERIS_ROOT=…
+$ cargo test --tests -p yu-gfx -p yu-backend-soft -p yu-cli
+  yu-gfx 10 目标 + soft 22+10 + yu-cli 10 全部 ok;0 FAILED
+$ cargo test -p yu-cli --test restart -- --ignored
+  restart_is_deterministic_at_same_frame … ok(120.7s,真语料跑 title 后重启)
+$ cargo test --tests -p yu-backend-wgpu
+  9 + 15 passed
+$ cargo run -q -p yu-cli --bin yu-cli -- case <project-eris> --all
+  first-screen / record-events-off / until-visible:3 passed; 0 failed
+```
+
+关键路径代码审读(逐 diff):A1 首帧 `frame.clear` 后缓冲合成(soft/wgpu 同因)、
+A3 `reset()` 清单(soft 三项 + wgpu 六项,`TargetSet` 清理连带
+`pipelines.forget_texture`,屏幕目标按尺寸复用故保留——正确)、A2 拒绝构造
+(允许宿主显式注入,优于只拒 yscfg)、053 `source_texture` 命令时刻固定、
+054 `CopyRegion::resolve` 缺省整幅。另核实:游离在 `mod tests` 外的
+`shader_transition_bypasses_fixed_stage_reduction` 用例仍在文件尾
+(编译/收集不受影响,纯卫生问题,AU3 已归位)。
+
+### 2. P2-8:blend 公式与状态表交叉检查(`yu-backend-soft`)
+
+- `blend_pixel_with_stage` 的 stage 归约提取为 `stage_reduce()`
+  (纯抽取,零行为变化);psC/psD 直通分支保留在函数内。
+- 新增测试 `blend_pixel_matches_generic_d3d9_equation_from_state_table`:
+  - 通用 D3D9 方程求值器只读 `fixed_state()` 的 `src_blend`/`dst_blend`/
+    `blend_op`(因子语义按 D3D9 头:**绝对**——`SRC*` 恒读 oC0、`DEST*`
+    恒读目标像素;首个版本把因子按“所在操作数”解释,网格立即抓出
+    MODE 0 alpha 错,修正后全过——这正是该测试存在的意义);
+  - stage 归约复用 `stage_reduce`,对 8 个可执行模式 × 12 点网格
+    (全 0/全满/半透明/奇数低位/白混敏感点)逐通道对拍;
+  - 同断言“可执行集 == `fixed_state()` 非空集合”,执行门也由状态表驱动。
+- 效果:状态表(`yu-gfx`)与公式(`yu-backend-soft`)任何一侧单独改动
+  都在测试失败,不再漂移到像素。
+
+```text
+$ cargo test -p yu-backend-soft --lib
+  22 passed(21 → 22);clippy -p yu-backend-soft --all-targets 本体 0 告警
+  (仅 yu-rt 5 条既有 warning,AU1 已注明)
+```
+
+### 3. 复核/收口(无代码)
+
+- **P2-2**:soft 零尺寸分支与 wgpu 规划期都逐 op 计入 `ops_total` +
+  `group.size.zero`,不变量两端成立 → 关闭。
+- **P2-9**:A2 后探测序只在 `from_tables`/宿主注入确定,`GfxState` 无
+  setter,“帧内变化不刷新”失去前提 → 作废。
+- **example 重名**:wgpu 侧已是 `wgpu_first_frame`/`wgpu_frame_walk`
+  (目录实测无重名)→ 关闭。
+- **README**:TODO 总览 4 行过期(A1/A3/A2 标 open、case 标全过期)
+  → 按现状校正。
+- **todo-inventory**:§2.1 第 2/4/5/6/10 项、§5 前 6 行、§6 第 5 条按
+  AU1/AU2/本线结果更新;未动各台账真值。
+
+### 4. 验证原始输出(本成果全部命令)
+
+见 §1/§2;另 `case --all` 于 AU3 复跑通过(3 passed; 0 failed)。
+
+## 成果 N (2026-10-22) · 声音域宿主 `yu-sound`:N0 取证 + 状态机 + yu-rt/CLI 接线
+
+> 任务书 `docs/tasks/task-n-sound.md`。净室实现(未复制旧线代码);零 git 写操作。
+> 逐条证据/地址/公式见 `docs/sound-ledger.md`;分歧见 `DIV-SND-001..004`。
+
+### 1. N0 取证(静态 REA,0.495 `4f5eefa3…`)
+
+| 处理体 | 事实 |
+|---|---|
+| SOUND `0x44e1e8` | 层表=名字哈希表(MurmurHash2);新层 0x38 字节;`+0x34`=声音对象;参数块 E/FILE/PLAY/PAUSE/VOLUME/PAN/PITCH/LOOP/END/START/RESTART |
+| SOUNDINFO `0x44f4bc` | 22 字段按固定顺序逐个写 LET(最后者胜出);缺层清 0;TIME=`pos*1000/bytes_per_sec`;TOTALTIME=解码器 `+0x120` |
+| SOUNDEND `0x44f308` | 按 ID 查表→删层 |
+| 位置/循环 `0x464960` | `TIME>=END` ⇒ LOOPCOUNT(+0x110)+1;`LOOPCOUNT==LOOP(+0x10c)` ⇒ 清零/停止;否则回 RESTART |
+| 淡变 `0x423718` | 线性、ms、固定点 1/1024;暂停顺延淡变时钟;淡出完成重置音量 256 |
+| 映射 | DSBVOLUME=`clamp(round(4000*log10(v/256)),-10000,0)`;DSBPAN 同式(0..512);PITCH=`base*(pitch+256)/512` |
+| 空桩 | MIDI/MIDIEND/MIDIINFO `0x44aa40/60/80`、CDDA `0x429fb0` 只守卫后 return 0 |
+
+导入表:DirectSoundCreate / winmm(mci,mmio,waveOut…) / MSACM32(acmStream*) /
+静态 `vorbis` 字符串 @`0x5b8e5c`;`fmod*` 仅为 CRT DOMAIN error 文案。
+工程 yscm 实测:SOUND 14 槽(多 SPEED)、SOUNDINFO 24 槽(多 FILETYPE/
+SAMPLING/DATALEFT/DATARIGHT)——与手册 19 字段不同,已立 DIV-SND-001,
+宿主按名消费。
+
+动态曲线:YSCom 0.495 探针编译成功,但探针工程在 LE 下未进脚本;运行中的
+ERIS 工程断点 0x44e1e8 命中 1 次、0x44f4bc 命中 0 次。故 LOOPCOUNT/TIME
+逐帧曲线**未取得动态样本**,台账标 `Confirmed(静态 REA)` 并立 DIV-SND-003。
+
+### 2. 实现
+
+- 新 crate `crates/yu-sound`:`state.rs` 层状态机、`decode.rs`(lewton OGG +
+  hound WAVE)、`mixer.rs` headless 确定性混音、`query.rs`(并入 state)、
+  `error.rs`(`snd.*` 码表+唯一性单测)、`loader.rs`(`SoundLoader` 注入)、
+  `host.rs`(`SoundHost`);`#![forbid(unsafe_code)]`;src 零 println/eprintln/dbg。
+- `yu-rt` 加法式:`event::SoundHost` trait;`Vm.sound_host` + `set/take`;
+  `emit` 同步路由 `Domain::Sound`;`tick/tick_at` 注入 `advance(now_ms)`;
+  `SOUNDINFO` 仅在宿主已安装时走 `op_soundinfo`(LET 左值→query→write_target),
+  未装宿主保持 M-2 路径逐位不变。
+- `yu-cli` 加法式:`boot()` 在 `os_sound=true` 时用工程 `DataSource` 构造
+  `VfsSoundLoader` 并安装 `SoundHost`;不碰文件系统布局。
+- 手册示例 1..12 的值断言单测;WAV 合成夹具 + 环境门控 OGG(bgm03)。
+
+### 3. 验证原始输出
+
+```text
+$ cargo test --workspace
+（全部 target ok;yu-sound: 1+17 passed;yu-rt: 54 passed;yu-vfs/format/cli 全绿）
+
+$ cargo test -p yu-sound
+running 1 test  ... ok
+running 17 tests ... ok (17 passed)
+
+$ cargo clippy -p yu-sound --all-targets
+（yu-sound 0 warning;yu-rt 仅既有 5 条 warning）
+
+$ YURIS_SAMPLE_ERIS_ROOT=<project-eris> \
+  cargo run -q -p yu-rt --example coverage_census -- 600 8
+- 合计: 命令 7735670 次,事件丢弃 0
+| `SOUND` | 87 | 34 | 531 | 域事件:sound |
+| `SOUNDINFO` | 89 | 25 | 7200 | 域事件:sound |
+| `SOUNDEND` | 88 | 2 | 1 | 域事件:sound |
+
+$ cargo run -q -p yu-cli --bin yu-cli -- case <project-eris> --case first-screen
+case first-screen: PASS
+```
+
+### 4. Unimplemented(挂账,不猜)
+
+- 负 START/RESTART 延迟(DIV-SND-002)、ACM WAVE(DIV-SND-004)、
+  MIDI/MIDIEND/MIDIINFO/CDDA、DATALEFT/DATARIGHT、SOUND[SPEED=]。
+- 设备输出(cpal)未接入;headless 混音与 golden 不依赖设备。
+
+### 5. 文档
+
+`docs/sound-ledger.md`、`DIV-SND-001..004`、`crates/yu-sound/README.md`、
+`coverage-matrix.md` §8、`todo-inventory.md` §4(域事件 34→31)、
+`architecture.md`(12 crate + 依赖图)、`README.md` 模块表。
+
+## 成果 N 续 (2026-10-22) · 按 REA 二次校正 + 诊断出口 + golden
+
+> 复核 `0x40c9b4` / `0x45f348` / `0x4251d8` / `0x425238` / `0x425298` /
+> `0x424e4c` 的汇编后修正。仍为零 git 写操作。
+
+### 1. 修正（均为引擎语义）
+
+1. **文件名**：`0x45f348` 整条 ASCII 小写；`0x45a064` 检查尾部
+   `.wav/.ogg`，已带后缀不再追加，否则追加小写 `.ogg`/`.wav`；
+   `SOUNDINFO[FILE]` 返回最终候选名（含扩展名），不是原始参数。
+2. **装载失败**：`+0x000` 保留最后一个候选名，旧 PCM 卸载，层保留但
+   `EXIST=0/PLAY=0/TOTALTIME=0`；解码失败同样清空。
+3. **START/RESTART/END**：`>= total` 的 START/RESTART 写 0；END 只
+   `> total` 才钳到 total；三者都只写字段，单独 START 不移动 TIME。
+4. **PAUSE/PLAY**：处理体顺序 PLAY→PAUSE；PLAY 不清 `+0x109`，
+   `PLAY=1 PAUSE=1` 结果为“播放后暂停”。
+5. **音量**：`DSBVOLUME=4000*log10(v/256)` ⇒ 振幅 `(v/256)^2`；
+   mixer 由线性改为平方。
+6. **END 边界**：每帧只检查一次（对应引擎每个音频回调一次），去掉
+   1024 次 while 保护；跨边界余量不携带。
+7. **空 ID**：不再拒绝；引擎直接以空键建层。
+8. **WAV**：`fmt ` chunk 走 RIFF 链查找（JUNK/LIST 前置也成立），
+   hound `Unsupported` 映射到 `snd.codec.unsupported`。
+9. **诊断出口**：`Engine` 保留 `SoundState` 的 `Rc`，每帧 drain
+   `snd.*` 到 `Engine::take_sound_diags()`（上限 8192）。
+
+### 2. 新增测试
+
+- `SOUNDINFO` VM→宿主→LET 端到端（mock `SoundHost`，不依赖 yu-sound）。
+- 文件名解析/小写/失败清空、单独 START 不改 TIME、PLAY+PAUSE 同命令、
+  START/RESTART/END 边界、音量平方曲线。
+- `tests/golden/loop_timeline.txt`：循环时间线 + render FNV-1a 哈希。
+
+### 3. 验证原始输出
+
+```text
+$ cargo test -p yu-sound
+unittests: 1 passed
+state.rs:  24 passed
+doc-tests: 0 passed
+
+$ cargo test --workspace --no-fail-fast
+（无 FAILED；含 fixture 新增 soundinfo_query_writes_let_through_host）
+
+$ cargo clippy -p yu-sound --all-targets
+（yu-sound 0 warning）
+
+$ coverage_census 600 8
+SOUND 531 / SOUNDINFO 7200 / SOUNDEND 1
+（未装宿主，诊断文案仍为“域命令未接线”）
+```
+
+### 4. 仍未完成
+
+- 负 START/RESTART 延迟（DIV-SND-002）、ACM（DIV-SND-004）、
+  MIDI/CDDA、DATALEFT/RIGHT、SPEED。
+- 动态逐帧曲线（DIV-SND-003）。
+- `www` 音频通道：仍无。原生设备输出已补 `yu-cli --features device`
+  （cpal 0.15，主线程 render → 环形缓冲 → 回调；不进 golden）。
+- 新增依赖许可：`hound` Apache-2.0（WAV）、`lewton` MIT/Apache-2.0（OGG）、
+  `cpal` 0.15 MIT/Apache-2.0（可选设备输出，仅 `device` feature）。
+
+## 成果 N 续 2 (2026-10-22) · 装载/VOLUME/LOOPCOUNT/SOUNDINFO 多字段按原始汇编校正
+
+> 复核 `0x44e1e8`（SOUND 处理体参数分派）、`0x424614`（type 1 load）、
+> `0x42511c`（type 5 volume）、`0x425164`（type 6 volume target）、
+> `0x424950`（type 2 play）、`0x42519c`（type 7 loop）、`0x464960`
+> （循环边界）、`0x44f4bc` 原始汇编（多字段短路）。仍为零 git 写操作。
+
+### 1. 修正（均为引擎语义）
+
+1. **VOLUME 无 PLAY**：type 5 立即写 `+0x148/+0x154/+0x150` 并 SetVolume；
+   旧实现只在“未播放”时改当前音量，播放中 `SOUND[VOLUME=x]` 不生效。
+2. **VOLUME 有 PLAY**：type 6 只更新目标 `+0x150`，由 type 2 的 FADE
+   从当前音量淡到新目标（手册例 12）。补 `fade_to_new_target` 单测。
+3. **装载重置**：type 1 在重装时把 PAN/PITCH 回 256、START/RESTART/END/位置
+   清零；E/VOLUME/LOOP/LOOPCOUNT 保留。旧实现保留旧 PAN/PITCH/START。
+4. **PLAY 起始**：type 2 state 0 分支 `if (END <= START) START = 0` 后 seek。
+5. **LOOPCOUNT 生命周期**：`+0x110` 只由 `0x464960` 的循环边界写；type 1/2/14
+   都不清零。旧实现在装载/PLAY 时清零；改为保留（LOOP=N 正常结束时仍清零）。
+6. **LOOP 停止条件**：引擎是 `count+1 == LOOP`，不是 `>=`；改为相等。
+7. **淡出中 PLAY**：type 2 的 state 4 分支交换淡变当前/目标后立即停止；
+   旧实现会重新淡入。
+8. **SOUNDINFO 多字段**：`EXIST..PITCH`（槽 1..7）各带独立 `ret`，按固定
+   顺序首个命中即返回；不含这 7 个时其余字段连续写 LET、最后者胜出。
+   旧实现一律“最后者胜出”。
+9. **DATALEFT/DATARIGHT**：`0x44fe3c/0x44ff58` 已逐行读完（播放光标处读
+   一帧、16-bit 取 abs、8-bit `|byte-0x80|`、单声道右值 -1）。手册无这
+   两个字段 ⇒ 三层缺手册层，按任务书 §0.1 **保持 Unimplemented**；
+   只更新诊断文案与台账 N0-12。
+10. **文件缺失**：`FUN_0040c9b4()==1` 时 SOUND 处理体直接返回，后续
+    PLAY/VOLUME/START 等参数不应用；若此前 state != 0，先执行 type 0xe
+    （清 `+0x000`、Stop、释放 PCM、清 START/RESTART、state=0），但保留
+    `+0x105/+0x107/+0x120/+0x118/PAN/PITCH/LOOP/LOOPCOUNT`。旧实现清空
+    元数据、把最后候选名写进 FILE，均与汇编不符。
+11. **元数据存活**：新增 `SoundMeta`（file_type/codec/channels/bits/rate），
+    卸载后 `EXIST/CODEC/CHANNEL/BIT/SAMPLING` 仍返回旧值；`TOTAL/TIME`
+    也保留（`0x423940` 只清 START/RESTART）。
+12. **LOOP=N 结束**：`0x464960` 停止分支调用 `0x423940`，额外清
+    START/RESTART；已同步。
+
+### 2. 新增测试（9 条）
+
+- `volume_without_play_applies_immediately`
+- `volume_with_play_fades_to_new_target`
+- `load_resets_pan_pitch_start_restart_but_keeps_volume_and_loop`
+- `play_resets_start_when_end_is_not_after_start`
+- `loop_count_survives_stop_and_play`
+- `play_during_fade_out_stops_like_engine_state4_branch`
+- `multi_field_query_short_circuits_early_fields`
+- `missing_file_unloads_clears_name_but_keeps_metadata`
+- `missing_file_on_stopped_layer_changes_nothing`
+
+### 3. 验证原始输出
+
+```text
+$ cargo test -p yu-sound
+unittests: 1 passed
+state.rs:  33 passed; 0 failed
+doc-tests: 0 passed
+
+$ cargo test --workspace --no-fail-fast
+（全部 test result: ok，无 FAILED；YURIS_SAMPLE_ERIS_YSBIN 指向
+ project-eris/save/data/ysbin，YURIS_TEST_TMP 单独 export）
+
+$ cargo clippy -p yu-sound --all-targets
+（yu-sound 0 warning；yu-rt 的 5 条为既有告警）
+
+$ sound_census 600
+frames=600 layers=167
+id=BGM/B1 file=bgm/bgm01.ogg state=Playing time=6000 total=90802
+loop=0 count=0 vol=256 pan=256 pitch=256 e=true pause=false
+snd_diags=0
+
+$ sound_loop_census
+t=90144ms time=88176 count=0
+t=95152ms time=2368 count=1
+FINAL t=96000ms time=3200 count=1
+snd_diags=0
+```
+
+### 4. 仍未完成
+
+- 负 START/RESTART 延迟（DIV-SND-002）、ACM（DIV-SND-004）、
+  MIDI/CDDA、DATALEFT/RIGHT（缺手册层）、SPEED。
+- 动态逐帧曲线（DIV-SND-003）。
+- `www` 声音：按用户 2026-10-22 决定**不实现**（不是真 wasm，只是胶水）；
+  设备输出终点为 `yu-cli`（默认 `device` feature）。
+
+## 成果 N 续 3 (2026-10-22) · CLI 默认设备输出 + i16/u16 声卡格式
+
+> 用户反馈“启动游戏没有声音”。原因是 `yu-cli` 的 `device` feature 默认关闭：
+> 状态机/查询都在跑，但 PCM 没有推给声卡。改为默认开启，并补非 f32 输出格式。
+
+### 1. 改动
+
+1. `crates/yu-cli/Cargo.toml`：`default = ["device"]`；纯 headless 用
+   `--no-default-features`（golden/CI 不依赖声卡）。
+2. `sound_device.rs`：除 f32 外支持 i16/u16 默认输出格式（WASAPI 设备
+   不一定是 f32）；不支持的格式仍显式报错并继续无声运行，不 panic。
+3. `main.rs` 帮助：删除“宿主只是不播放”的旧说明，写明默认设备输出与
+   `www` 不实现音频的边界。
+4. `docs/architecture.md`、`docs/sound-ledger.md`、`yu-sound/README.md`
+   同步“默认 device、可 `--no-default-features`”的口径。
+
+### 2. 验证原始输出
+
+```text
+$ cargo check -p yu-cli --all-targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.37s
+
+$ YURIS_SAMPLE_ERIS_ROOT=… cargo run -q -p yu-cli --example sound_census -- 30
+frames=30 layers=166
+snd_diags=0
+（stderr 无 “[sound] 设备输出未启用”，说明默认设备流已打开）
+```
+
+### 3. 说明
+
+- `yu-cli run` 默认只 tick 1 帧（`--frames/--until-*` 控制），不是实时游戏循环；
+  实时出声入口是 `yu-cli serve`（按 `--fps` 节拍持续 tick 并 pump）。
+- `www` 浏览器端仍无音频（用户决定，见台账 §7）。
+
+## 成果 E1-M2 (2026-10-22) · E-mote 数据/动画/渲染 core + 官方 ABI/纹理/shader 取证
+
+> 接续 E1-M1。目标:把 `yu-emote` 从“能解析”推进到“schema/atlas 确定、
+> 时间线可求值、58 个 shader 有 WGSL 映射”,并把官方 DLL 的事实写进台账。
+> 零 git 写操作;证据产物只在 `<side-repo>/workbench/tmp/`。
+
+### 1. 官方二进制取证(REA + 离线 capstone)
+
+- `EmoteCreate` → `PEmoteDevice`(vftable `0x100716CC`,22 槽);
+  `+0x48 CreatePlayer` → `PEmotePlayer`(vftable `0x1007172C`,56 槽);
+  `psb-key` = `strtol("391141577")` @ `0x10071350`,即 `0x175058C9`;
+- `YSEmote.dll` 80 个跳板:序号 1/2/3 + 101..121(device)+ 201..256(player);
+  引擎加载器把指针存到 `yu-ris.exe 0x801384..0x8014C0`;
+- `EMOTE`/`EMOTEINFO` 处理体:按名应用字符串/标志/数值变量,数值 fade
+  `×0.06`;`EMOTEINFO` 调 player 槽 45;
+- 纹理:`RGBA4444` → `D3DFMT_A4R4G4B4`;转换器 `0x10054BA0`,nibble 顺序
+  `A(15..12) R(11..8) G(7..4) B(3..0)`,×17;
+- 58 个 shader 从指针表 `0x100866C0..0x100867AC` 重新提取
+  (27 ps2 + 27 ps3 + 3 vs2 + 1 vs3),逐个 `fxc /dumpbin` 归类为
+  13 plain / 13 masked / 1 pixelate(+4 顶点)。
+
+### 2. `yu-emote` 实现
+
+- `schema`:screen/metadata/sources(objects/motions/layers/frames)/
+  variables/timelines/controllers;全部 `Serialize`,对象键排序;
+- `texture`:RGBA4444 解码 + atlas 页读取;
+- `anim`:按名变量、fade、PLAY/DPLAY/STOP、循环、固定 tick、线性采样
+  (`easing==0`),未支持 easing 记录并保持;
+- `render`:`PIXEL_PROGRAMS` 27 项特征表;58 个官方变体落成
+  `shaders/ps_2_0/*.wgsl`、`shaders/ps_3_0/*.wgsl`、`shaders/vs_2_0/*.wgsl`、
+  `shaders/vs_3_0/00.wgsl`(`gen-shaders` 生成,测试防漂移);
+  `MeshPatch`(4×4 cubic Bezier,identity `(col/3,row/3)`)+ `MeshGrid`
+  按 `meshDivision` 细分;
+- `psb-dump`:确定性 JSON、`--raw`、`--resources`、`--decode`;
+- `PsbDocument.resource_data`:保留资源字节。
+
+### 3. 验证(原始输出)
+
+```text
+$ export YURIS_EMOTE_SAMPLE=…/emote_test.psb YURIS_EMOTE_KEY=0x175058c9 YURIS_REQUIRE_SAMPLES=1
+$ cargo test
+   schema 5 passed; sample 1 passed; roundtrip 2; yuris 5; doc 1; 0 failed
+$ cargo clippy --all-targets
+  Finished (0 warnings)
+$ cargo run --bin psb-dump -- <psb> --key 0x175058c9
+  container: v2, resources=2, key_used=true
+  model: id=motion label=template spec=win version=3.03
+  sources: tex#0 2048x2048 RGBA4444 icons=97 resource=1
+           tex#1  512x256  RGBA4444 icons=13 resource=0
+  stats: objects=6 motions=21 layers=234 frames=888 variables=24 timelines=11
+  resources: 0=262144 B sha256 44819f5b…; 1=8388608 B sha256 b73e697e…
+$ cargo run --bin psb-dump -- <psb> --resources out --decode
+  page-tex_0.rgba8 sha256 55b0d647…; page-tex_1.rgba8 sha256 89e9dd77…
+```
+
+两次 `Model` JSON 序列化逐字节一致(测试 `dump_is_deterministic`)。
+
+### 4. 未完成 / 挂账
+
+- 物理控制器(bust/hair/parts)的数值积分、差分淡入曲线、官方帧率;
+- wgpu 管线与运行时 shader 变体选择(当前只有 WGSL 文本与几何生成);
+- 官方 DLL 像素对拍(M4),Bezier 网格的官方确认;
+- 内核适配层(把 `EMOTE` 事件接到 `yu-emote`)尚未接线。
+
+## 成果 E1-M2 续 (2026-10-22) · pose/plan/soft 渲染链 + priority 顺序
+
+> 接续 E1-M2。目标:把数据层推进到“能按 motion 求值并画出角色”,同时把
+> 官方 player 的 ABI/渲染入口继续写进台账。
+
+### 1. 新增实现(`yu-emote`)
+
+- `pose`:frameList 求值(type 0 hold / type 3 插值 / `ti` 量化)、
+  `inheritMask` 0x4..0x400、`transformOrder` [0,3,2,1]、coordinate XY/XZ、
+  type-3 嵌套 motion、motion `priority` 绘制顺序;
+- `plan`:atlas 矩形/枢轴/UV、corner color(0xAARRGGBB)、4×4 Bezier 网格、
+  blank 白色填充页、view fit 变换;
+- `soft`:确定性 CPU 光栅(bilinear/clamp、source-over)、PNG 输出;
+- CLI:`psb-pose`、`psb-plan`、`psb-render`。
+
+### 2. 验证(原始输出)
+
+```text
+$ export YURIS_EMOTE_SAMPLE=…/emote_test.psb YURIS_EMOTE_KEY=0x175058c9
+$ cargo test
+  lib 16 passed; pose 6 passed; sample/schema/roundtrip/yuris/doc 全绿
+$ cargo run --bin psb-render -- <psb> --key 0x175058c9 --time 0 --out out.png
+  covered_pixels=335774 bbox=(126,55,703,1045)
+  stats: items=145(textured=30, blank/mask=115) triangles=76718
+         masked_items=121 unsupported_blend=0
+  输出:完整角色(头发/眼/眉/身体/裙/腿),见临时目录 out.png
+```
+
+`psb-pose` time 0:229 个节点、145 个可见 drawable;model 空间 bbox
+`x -643..429, y -971..767`。当前视觉缺口 = stencil/alpha-mask 合成:
+脸部内层(白色皮肤)被头发覆盖;这不是 z 顺序问题(priority 已排序),
+而是官方 type-12/mask 合成未实现。
+
+### 3. 官方 player 继续取证
+
+- `InitParam = { IDirect3DDevice9*, malloc, free }`;
+- `CreatePlayer(device, psb_bytes_ptr, psb_size, out**)`(实测参数顺序;
+  传反会崩在 `0x100014e0` 的 crypt filter);
+- player wrapper:`+0xc` AEmotePlayer、`+0x10` impl、`impl+8` MMotionPlayer
+  (vtable `0x10072248`);
+- 渲染候选入口 `emotedriver+0x3c50`(MMotionRenderer::Render,仅 this 参数);
+- oracle 宿主已能创建官方 player、枚举 23 个变量、推进/渲染,但仍为空白帧:
+  缺 motion 激活/屏幕参数与 stencil;持续挂账,不把空白帧当对齐结果。
+
+### 4. 未完成
+
+- stencil/alpha-mask/pixelate 合成;wgpu 管线与 shader 变体选择;
+- 物理控制器、差分淡入曲线、官方帧率;
+- M4 官方像素对拍;kernel 适配层接线。

@@ -22,7 +22,7 @@
 | 来源 | 条目 | 分布 |
 |---|---:|---|
 | `docs/gfx-unimplemented-todo.md` | 50 | fixed 11(001/006/007/017/019/029/043/047/049/050 + 013 子项) / unimplemented 19 / open 15 / partial 2 / note 2 / blocked 3 / decision 1 / withdrawn 1 |
-| `coverage-matrix.md`(命令) | 119 | 已实现 35 / 域事件 34 / 未取证 27 / 未实现 7 / 部分 4 / 声明类 12 |
+| `coverage-matrix.md`(命令) | 119 | 已实现 35 / 域事件 31(另 3 条声音命令由 `yu-sound` 接线) / 未取证 27 / 未实现 7 / 部分 4 / 声明类 12 |
 | `docs/divergences/`(跨 crate) | 12 + 2 索引 | fixed 5(含 1 带保留)/ partial 1 / explained 2 / **open 3** / withdrawn 1 |
 | `crates/yu-rt/docs/divergences/` | 42(DIV-RT-001..042) | 状态行格式不统一,无法机读(见 §6) |
 | `crates/yu-gfx/docs/divergences/` | 42(DIV-GFX 镜像) | 与 gfx TODO 同表 |
@@ -31,43 +31,58 @@
 
 ## 2. 可立即修(证据已够,或已知 bug)
 
-### 2.0 2026-10-22 审查新增(P0)
+### 2.0 2026-10-22 审查项(AU1 已修)
 
-1. **A1 首帧 `COPY ID=:/W0/` 失去源**(实测 `first_frame`:
-   `skip copy gfx.copy.source.offscreen_missing :/W0/CGS100`)。
-   主组直绘(DIV-GFX-008)后主组没有离屏 pass,而 COPY 仍按 Offscreen 找源。
-   需在“回退本帧子层自合成”与“显式 `gfx.copy.source.no_backbuffer` + 挂账”
-   之间裁决。见 `audit-2026-10-22.md` §A1。
-2. **A3 `Engine::restart` 不清渲染器状态**:`last_screen`/`backbuffer`/
-   `snapshots` 跨重启保留;`GfxState.copy_seq` 归零后新 `CopyId` 与旧快照
-   冲突 ⇒ 冻结早退命中旧像素。需 `reset()` 或 `CopyId` 代际隔离。
-3. **A2 `image_probe_order` 空值仍内置兜底**(默认 `[png,bmp,jpg,gif,psb]`
-   + 一条 Info),违反 A5“缺表 = 拒绝启动/Unimplemented”。DIV-GFX-049
-   标 `fixed` 属结论高于实现,应改回 `open` 或按 A5 实装。
-4. **C1 `cases/*.json` 全部过期**:`case first-screen` 实测 17 ops vs 期望 18
-   ⇒ FAIL。需 `case --all --update` 并把 `case --all` 列为门禁。
+1. **A1 首帧 `COPY ID=:/W0/` 失去源**(`DIV-GFX-051`)**→ fixed(AU1)**:
+   首帧无后缓冲时用 `frame.clear` 合成后缓冲初值(设备初始化清屏色)。
+2. **A3 `Engine::restart` 不清渲染器状态**(`DIV-HOST-001`)**→ fixed(AU1)**:
+   两后端加 `reset()`(清 `last_screen`/`backbuffer`/`snapshots`/`image_cache`/
+   `uploaded_overrides`),`Engine::restart` 调用;
+   `crates/yu-cli/tests/restart.rs` 回归(先跑到 title 再重启,同帧 SHA 必须一致)。
+3. **A2 `image_probe_order` 空值内置兜底**(`DIV-GFX-049`)**→ fixed(AU1)**:
+   改为拒绝构造,宿主显式注入才允许。
+4. **A4 `REVERSE`/`HORIZONTAL` 组合分支**(`DIV-GFX-052`)**→ fixed(AU1)**。
+5. **C1 `cases/*.json` 过期** **→ fixed(AU1)**:`case --all --update` 重生成
+   (85 ops / 0 skipped),三条用例全绿。
+6. **C2 `src/` 的 `eprintln!`** **→ 已清**(AU1 复核时已无命中)。
+7. **C3 示例/CLI 未注入 HostPaths** **→ fixed(AU1)**:7 个示例 + `yu-cli`
+   的 `boot()` 注入 `$_SYSTEM_PATH/$_SAVE_PATH/$_APPDATA_PATH/$_PERSONAL_PATH`
+   (`$_PROJECT_PATH` 手册无页,保持 `None`)。
+8. **新增发现并修复**:
+   - `DIV-GFX-053`:复制源层同帧被 `CGEND` 删除 → 命令时刻固定源纹理;
+   - `DIV-GFX-054`:COPY 区域缺省坐标应为整幅(不是 0)。
 
 ### 2.1 既有条目
 
 1. **后端 P1-2:MODE 2 的 DIFFUSE RGB** — **J4 已修**:顶点色=层 A 灰度
    (asm `0x414d09..0x414d21`),MODE 2/3/5/6/7/9 先按 `T·A` 归约再 blend。
-2. **后端 P2-2:零尺寸 Offscreen pass** 未累加 `ops_total`,破坏
-   `ops_total == drawn + skipped` 不变量(当前代码有断言,需复核触发路径)。
+2. **后端 P2-2:零尺寸 Offscreen pass** 未累加 `ops_total` — **已复核关闭
+   (AU2)**:soft(`render.rs` 零尺寸分支)与 wgpu(`passes.rs` 规划期)
+   都逐 op 计入 `ops_total` + `group.size.zero` 跳过,不变量两端成立。
 3. **后端 P2-3/P2-4:Group transition 静默忽略 / Transition 一律跳过** —
    **J2 已修**:两端执行 `Op::Transition`;配对缺失回退普通层。
 4. **后端 P2-5:`first_frame` 未注入 HostPaths**、丢弃 `tick_at` report、
-   名字误导为“官方首帧” — 注入路径、检查 errors、改名/注明。
+   名字误导为“官方首帧” — **AU1 已修**(C3):7 个示例 + `yu-cli boot()`
+   注入宿主路径。
 5. **后端 P2-8:后端未消费 `fixed_state()`/`blend_table_json()`** —
-   用状态表驱动/交叉检查 blend,避免第二套手写公式。
-6. **后端 P2-9:`image_probe_order` 只在构造时生效** — frame 内变化不刷新。
+   **AU2 已修**:soft `blend_pixel` 的 stage 归约提取为 `stage_reduce`
+   (单一事实来源),新增交叉检查测试
+   `blend_pixel_matches_generic_d3d9_equation_from_state_table`:用
+   `fixed_state()` 的因子/运算做通用 D3D9 方程求值,12 点网格 × 8 模式
+   逐通道对拍;可执行集 = 状态表集合也一并断言。公式与状态表任何一侧
+   单独改动都会在测试失败,不再漂移到像素。
+6. **后端 P2-9:`image_probe_order` 只在构造时生效** — **已作废(AU2)**:
+   A2 修复后探测序只在 `GfxState::from_tables` 装载或宿主显式注入,
+   `GfxState` 无 setter,帧内不存在变更口。
 7. **J-10:COPY/COPY2 已按 EVID-T-11/12/15 实现**(区域/时序/生存期/交错序);
    软/硬后端执行,`j2-micro-copy2` 三方向量一致。`TEXCOPY/TEXSSCOPY` 仍 open。
 8. **J-08:主组直绘/子组 RT alpha 行为已 Confirmed**,卡契约裁决(DIV-GFX-008/041);
    title 稳定帧不依赖该差异(J2 报告)。
 9. **按钮状态后缀**:**J3 已修**。`yu-rt` 实现 `FILEINFO[EXIST]→LET`
    (EVID-J3-01),title `asset.missing=0`;DIV-GFX-043 fixed。
-10. **`first_frame` 同名 example 互相覆盖**(soft/wgpu 都叫 `first_frame`) —
-    改 example 名或分 target dir,J1 已实测到该坑(J2 验收用 `touch` 规避)。
+10. **`first_frame` 同名 example 互相覆盖**(soft/wgpu 都叫 `first_frame`)—
+    **已修**:wgpu 侧已改名 `wgpu_first_frame` / `wgpu_frame_walk`
+    (examples 目录实测无重名)。
 
 ## 3. 需先取证/裁决(禁止直接实现)
 
@@ -99,8 +114,14 @@
 
 ## 4. 非缺口(不要修)
 
-- 34 个域事件命令(CG/WINDOW/SOUND/SAVE/FILE/MENU/EMOTE/MOVIE/FLASH/INPUT…):
-  VM 只发事件,语义归宿主/子会话。
+- 31 个域事件命令(CG/WINDOW/SAVE/FILE/MENU/EMOTE/MOVIE/FLASH/INPUT…):
+  VM 只发事件,语义归宿主/子会话。`SOUND`/`SOUNDINFO`/`SOUNDEND` 已由
+  `yu-sound` 宿主接线(见 `docs/sound-ledger.md`),不再计入域事件缺口。
+  `MIDI`/`MIDIEND`/`MIDIINFO`/`CDDA` 保持 Unimplemented(0.495 处理体为空桩,
+  手册无页;见 `docs/sound-ledger.md` N0-10)。
+  **例外**:`EMOTE` 的**渲染语义**是独立子系统(E-mote 运行时/PSB/自带
+  58 个 shader),不是 VM 域事件本身的缺口;见 `docs/emote-parity.md` 与
+  `docs/tasks/task-emote-runtime.md`。
 - 12 个声明类(G_INT/G_STR/…):不按命令执行,初值走 `VARACT[INIT]`。
 - DIV-GFX-014(同 Z 顺序,decision)、DIV-H-001(withdrawn)、
   DIV-006/008(explained)。
@@ -109,14 +130,15 @@
 
 | 顺序 | 动作 | 阻塞关系 |
 |---|---|---|
-| P0 | **A1 主组 COPY 无后缓冲源**:回退本帧子层自合成,或显式 `no_backbuffer` 挂账 | 首帧 golden/case 全依赖 |
-| P0 | **A3 渲染器 `reset()` / `CopyId` 代际隔离** | 重启后像素错 |
-| P0 | 解 boot/golden 回归:给 gfx/后端示例与测试注入 `debug_mode=true`(语料是 debug 构建,DIV-L-001 证据),重跑 census;不回再二分 `1365918` | 不解决则所有像素验收失真 |
-| P1 | **C1 `case --all --update` + 把 `case --all` 写进门禁** | 当前用例等于无门禁 |
-| P1 | **A2 `image_probe_order` 按 A5 拒绝启动/全层 Unimplemented** | 违反 A5 原文 |
-| P1 | 后端 P1-2 / P2-2/3/4/5/8/9 + example 重名 | 影响报告不变量与可诊断性 |
+| ~~P0~~ | ~~A1 主组 COPY 无后缓冲源~~ **AU1 已修**:`frame.clear` 合成后缓冲初值(DIV-GFX-051 fixed;官方启动瞬间截图仍待采集) | ~~首帧 golden/case 全依赖~~ |
+| ~~P0~~ | ~~A3 渲染器 `reset()`~~ **AU1 已修**:两后端 reset + restart 接线 + `yu-cli/tests/restart.rs` 真语料回归(DIV-HOST-001 fixed) | ~~重启后像素错~~ |
+| P0 | 解 boot/golden 回归:给 gfx/后端示例与测试注入 `debug_mode=true`(语料是 debug 构建,DIV-L-001 证据),重跑 census;不回再二分 `1365918`。**AU2 复核注**:title 对拍(600 帧两端 0 差异 + 官方平坦区域 max 2)当前不受此阻塞;该 P0 只影响 census 口径是否与官方 debug 构建一致,保留待办 | 不解决则 census 口径存疑 |
+| ~~P1~~ | ~~C1 `case --all --update`~~ **AU1 已修**(85 ops / 0 skipped,3/3 PASS);门禁保持提交前手跑,CI 挂接待宿主 | ~~当前用例等于无门禁~~ |
+| ~~P1~~ | ~~A2 `image_probe_order`~~ **AU1 已修**:空表在 `from_tables` 拒绝构造(DIV-GFX-049 fixed) | ~~违反 A5 原文~~ |
+| P1 | ~~后端 P1-2 / P2-2/3/4/5/8/9 + example 重名~~ **全部关闭**(P1-2=J4,P2-3/4=J2,P2-5=AU1 C3,P2-2/P2-8 复核与交叉检查=AU2,P2-9 作废=AU2,重名已改) | — |
 | P1 | 组 RT 子组 alpha(DIV-GFX-041,契约裁决后) | 依赖裁决 |
 | P2 | 文字桥:DIV-GFX-012/033/034/035/040(`yu-font` 已就绪) | 依赖 M2 的 TEXT 状态 |
+| P2 | **E1 E-mote 运行时(M0→M4)** | M0/M1 完成;M2 pose/priority、M3 plan/soft 渲染链完成(2026-10-22);剩余 stencil/mask、wgpu 管线、物理控制器/M4 对拍 + 内核接线 |
 | P2 | 资产元数据 provider(DIV-GFX-024)→ CGINFO SX/SY | 已部分由 J3 落地(图像头),完整 provider 仍缺 |
 | P2 | **A4 `REVERSE`+`RECTPAINT` 组合补两端测试或删分支** | 未对拍 |
 | P2 | **C2 `eprintln!` 移出 `src/`;C3 示例注入 HostPaths** | 纪律/环境等价 |
@@ -139,8 +161,9 @@
    - `render-parity §12.6` 仍说“组目标复制 Unimplemented”,实际已实现;
    - `backend-soft-review.md` 的 P1/P2 结论多数已修但文件无状态头;
    - `title-motion-ledger §9.6` 的 blocked 结论已被 §9.7 推翻,两节并列。
-5. **代码 `eprintln!` 仍在 `src/`**(wgpu `passes.rs`/`lib.rs` 的
-   `YURIS_DBG_SIZEMISS` 分支与统计输出),违反“`src/` 零 stdout”纪律。
+5. ~~**代码 `eprintln!` 仍在 `src/`**~~ **已清(AU1 复核)**:AU2 复跑
+   `grep -rn "println!|eprintln!|dbg!" crates/*/src` 仅命中
+   `yu-cli/output.rs` 的纪律注释本身,`src/` 无 stdout 宏。
 
 ## 7. 复现扫描
 

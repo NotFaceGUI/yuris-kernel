@@ -51,6 +51,7 @@ DIFFUSE 已按 A 灰度定案；MIP/各向异性、组 RT 子组 alpha、文本�
 | `yu-format` | ybn 家族 / yssd / yscfg 等容器与元数据解码，纯字节进出 |
 | `yu-rt` | 运行核：脚本 / VM / 任务 / 帧边界 / 16 槽寄存器 / 变量域 / 系统变量 ABI / InputTimeline |
 | `yu-gfx` | 渲染语义层：`CompositorFrame`、图层 / 组 / 窗口 / 过渡 / 文本模型、GfxHost 查询 |
+| `yu-sound` | 声音域宿主：`SOUND/INFO/END` 层状态机、OGG/WAVE 解码、headless 确定性混音；`SoundHost` 查询 |
 | `yu-font` | 字体发现 / 加载、字形栅格化、完整文本样式；不含换行 / 对齐 |
 | `yu-backend-soft` | `CompositorFrame` 的确定性软件参考后端：纹理管线 + RGBA8 合成 + PNG |
 | `yu-backend-wgpu` | `CompositorFrame` 的 wgpu 主后端：`Rgba8Unorm` 离屏合成 + 读回；纹理/管线/bind group 缓存 |
@@ -72,7 +73,8 @@ DIFFUSE 已按 A 灰度定案；MIP/各向异性、组 RT 子组 alpha、文本�
 | `yu-backend-wgpu` | 固定管线 title 完成 | 离屏 RGBA8 + 读回；MODE 0..9 可执行；psC/psD 转场独立 WGSL（`dx_mode` 为内核 A/B 契约，非引擎开关）；MODE 4/8/10..18 仍 Unimplemented |
 | `yu-trace` | 完成（schema v3） | vfs/vm/frame 边界、回放、diff；官方 L1 已打通；DIV-L-002 open、官方 args 不可观测 |
 | `yu-cli` / `yu-host-wasm` | 进行中（K2） | 桌面 / wasm 宿主、HMR、用例；Android 未开始 |
-| `yu-sound` / `yu-save` | 未开始 | 音频与存档 |
+| `yu-sound` | 完成（N） | 层状态机 / 循环 / 淡变 / PAN / PITCH / OGG+WAVE；负 START 延迟、ACM WAVE、DATALEFT/RIGHT 挂账（DIV-SND-002/004） |
+| `yu-save` | 未开始 | 存档 |
 | scenario 解释器 | 未开始 | 顺序脚本 / 分支 |
 
 **没有 `yu-assets` 兄弟 crate**：纹理解析在装配 / 后端层，第一个实现是
@@ -152,10 +154,10 @@ cargo build -p yu-cli --release
 
 | 子系统 | 下一步 | 依赖 / 阻塞 |
 |---|---|---|
-| **主组 COPY 首帧源** | 裁决“回退本帧子层自合成”或“显式 `no_backbuffer` 挂账” | **P0**：首帧 golden/case 全依赖（DIV-GFX-051） |
-| **重启渲染器状态** | `reset()` 或 `CopyId` 代际隔离 | **P0**：重启后像素错（DIV-HOST-001） |
-| **用例门禁** | `case --all --update` 后把 `case --all` 写进 CI | 当前三条 case 全过期（`ops 17 vs 18`） |
-| **A5 兜底** | `image_probe_order` 空值拒绝启动或全层 Unimplemented | DIV-GFX-049 open |
+| ~~主组 COPY 首帧源~~ | ✅ 已修（AU1）：首帧用 `frame.clear` 合成后缓冲初值 | DIV-GFX-051 fixed；官方启动瞬间截图仍待采集 |
+| ~~重启渲染器状态~~ | ✅ 已修（AU1）：两后端 `reset()` + `restart` 调用 + 真语料回归 | DIV-HOST-001 fixed |
+| **用例门禁** | `case --all` 已重生成并通过（3/3）；保持为每次改动的提交前门禁 | CI 挂接待宿主 |
+| ~~A5 兜底~~ | ✅ 已修（AU1）：探测序空值在 `GfxState::from_tables` 拒绝构造 | DIV-GFX-049 fixed |
 | 引擎 shader | MODE 4/8/10..18 的公式/调用点取证 | 无 blob；证据在 `target/tmp/j4-shaders/` |
 | 固定管线 3/5/6/7/9 | 官方微场景像素对拍（状态表已实现） | YSCom attach 阻塞 |
 | 组 RT / 子组 alpha | 生产路径 RT 格式/写掩码取证 | DIV-GFX-041 partial |
@@ -169,6 +171,13 @@ cargo build -p yu-cli --release
 | 宿主 | 桌面 / wasm 收尾（K2）；Android | K2 |
 | `yu-sound` / `yu-save` | 新 crate + 证据 | 未开始 |
 | 格式兼容 | YSTB v2、NUL-XOR 方言 | 仅按目标游戏需要 |
+
+## 相关仓库
+
+- [NotFaceGUI/yu-emote](https://github.com/NotFaceGUI/yu-emote) — E-mote
+  (PSB/EMT) 数据层与运行时,以 **git submodule** 挂在 `yu-emote/`
+  (公开仓库;M1 数据层已完成,台账见 `docs/emote-parity.md`,任务书见
+  `docs/tasks/task-emote-runtime.md`)。
 
 ## 许可
 

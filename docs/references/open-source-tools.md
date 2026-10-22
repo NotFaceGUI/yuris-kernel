@@ -19,6 +19,11 @@
 | [dreamsavior/ypf-repacker](https://github.com/dreamsavior/ypf-repacker) | 见仓库 | YPF 重打包 | 同族对照 |
 | [MishaIac/YurisKeyFinder](https://github.com/MishaIac/YurisKeyFinder) | 见仓库 | `.ybn` 密钥查找 | 换密钥作品(.ybn 家族)的 key 恢复思路 |
 | [morkt/GARbro](https://github.com/morkt/GARbro) | C#/MIT(见仓库) | 通用 galgame 资源浏览器,含 YPF 解密 | YPF 解密的第三种独立实现;Script-Editor 鸣谢其 YPF 解密算法 |
+| [storycraft/emote-psb-rs](https://github.com/storycraft/emote-psb-rs) | Rust/MIT | PSB/MDF 读写、serde、二进制资源流;**不渲染** | `yu-emote` 的 PSB 二进制层依赖;E-mote M1 基线 |
+| [Mieluoxxx/amadeus-emote-loader](https://github.com/Mieluoxxx/amadeus-emote-loader) | Rust/Apache-2.0 | PSB/JSON 规范化、部件查表、**显式 wasm32**;不渲染;已归档 | M1 规范化/部件语义参考;wasm 证据 |
+| [xmoezzz/eluna](https://github.com/xmoezzz/eluna) | Rust/**未声明许可** | PSB 解析、motion/layer/timeline 提取、wgpu 预览播放器 | 行为参考;**无许可,不复制代码** |
+| [UlyssesWu/FreeMote](https://github.com/UlyssesWu/FreeMote) | C#/CC BY-NC-SA 4.0 | PSB/EMT 工具 + 桌面 Viewer;PSB body cipher 文档 | 只作 oracle/事实参考;非商业许可 |
+| [**NotFaceGUI/yu-emote**](https://github.com/NotFaceGUI/yu-emote) | Rust/MIT OR Apache-2.0 | **本线实现仓库**:PSB 解析/body 解密/key 搜索、YU-RIS 适配骨架 | E1 数据层(M1 起);以 **git submodule** 挂在 `yu-emote/` |
 
 > **解密算法代际对照**(来自 Script-Editor 鸣谢,均为二手说法,使用前自行核实):
 > `YURIS_TOOLS` = 新版引擎解密;`RxYuris` = 旧版引擎解密;`GARbro` = YPF 解密。
@@ -36,6 +41,9 @@
 
 > 各项目许可证以仓库当前文件为准,表中未写明的需先核实;未声明许可证的项目
 > (如 Script-Editor)**按"仅事实参考"处理**。
+> E-mote 相关项目与许可边界见 `docs/emote-parity.md` §5:FreeMote/FreeMote
+> WebGL 为非商业许可(仅 oracle),`eluna` 无许可(仅行为参考),`yu-emote`
+> 是本线独立实现(MIT OR Apache-2.0)。
 > 部分工具宣称支持通过自检测密钥处理换密钥的商业作品(含 Whirlpool 系等发行商作品)——
 > 这与我们的 `<game-a>`(Whirlpool 系,换密钥情形)场景直接相关,可用于**验证 key 恢复策略**,
 > 但其结论仍需落到官方引擎/真实数据上。

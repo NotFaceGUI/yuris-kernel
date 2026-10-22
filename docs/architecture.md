@@ -5,13 +5,14 @@
 > `CONTEXT.md`(术语)。
 >
 > **v1.3 修订**(以 `PROGRESS.md` 成果 K1/J3 与 `docs/audit-2026-10-22.md` 为准):
-> - 实际 crate 数为 **11**(新增 `yu-cli`、`yu-host-wasm`);不再有“wasm 跑内核”的
+> - 实际 crate 数为 **12**(新增 `yu-cli`、`yu-host-wasm`、`yu-sound`);不再有“wasm 跑内核”的
 >   `yu-backend-wasm` 规划——**架构 B(2026-10-21 主人决定)**:Rust 原生读本机数据
 >   并跑内核,wasm/JS 只做呈现端。
 > - **`RenderBackend` trait 不存在**:两个后端(`yu-backend-soft`、
 >   `yu-backend-wgpu`)消费同一个可序列化 `CompositorFrame`,各自实现一帧渲染;
 >   契约是**数据**(`CompositorFrame`),不是 trait。§5 已按此改写。
-> - `yu-snd`/`yu-inp`/`yu-save` 尚未建 crate;输入时间线目前在 `yu-rt::input`。
+> - `yu-snd` 已以 `yu-sound` 落地(N 任务);`yu-inp`/`yu-save` 尚未建 crate;
+>   输入时间线目前在 `yu-rt::input`。
 > - 帧契约字段以 `crates/yu-gfx/src/frame.rs` 为准(含 `dx_mode`,
 >   见 §5.1 的范围说明)。
 
@@ -53,13 +54,14 @@ Mount(叠加栈, 后挂者覆盖先挂者):
 
 ## 2. 核心决策 B:分层与 crate 划分
 
-**11 个 crate,依赖严格向下,边界=契约**(2026-10-22 实测现状):
+**12 个 crate,依赖严格向下,边界=契约**(2026-10-22 实测现状):
 
 ```mermaid
 flowchart TD
     HOSTWASM["yu-host-wasm<br/>浏览器呈现端(仅 present RGBA)"]
     CLI["yu-cli<br/>原生引擎宿主 + 本地服务 + HMR + 用例"]
     GFX["yu-gfx 图层/CG 状态机<br/>+ CompositorFrame"]
+    SND["yu-sound 声音域宿主<br/>SOUND/INFO/END 层状态机 + headless mixer"]
     SOFT["yu-backend-soft<br/>确定性参考后端 + PNG"]
     WGPU["yu-backend-wgpu<br/>主后端(wgpu)"]
     RT["yu-rt 运行核<br/>任务调度·命令分派·表达式·16槽寄存器·变量域<br/>(A5: 零硬编码,全表来自游戏数据)"]
@@ -74,6 +76,8 @@ flowchart TD
     CLI --> WGPU
     CLI --> RT
     CLI --> GFX
+    CLI --> SND
+    SND --> RT
     SOFT --> GFX
     WGPU --> GFX
     WGPU --> SOFT
@@ -85,6 +89,7 @@ flowchart TD
     TRC -.-> RT
     TRC -.-> FMT
     GFX -.-> LOG
+    SND -.-> LOG
     SOFT -.-> LOG
     WGPU -.-> LOG
     RT -.-> LOG
@@ -100,11 +105,12 @@ flowchart TD
 | `yu-format` | ybn 家族容器与结构解码(YSCM/YSLB/YSVR/YSTD/YSTL、YSTB 脚本组/窗口)+ CP932/GBK 编解码器;bytes 进 structs 出 | log(纯) | 碰 IO;碰执行语义;**不碰 ypf(包布局归 yu-vfs)** |
 | `yu-rt` | 命令组 VM:任务调度(让出=WAIT/显示文本)、按名分派、表达式求值(i64/f64/串)、16 槽 P/R 寄存器、变量域、输入时间线 | vfs, format, log | 渲染、音频、平台调用;**任何游戏/版本常量(A5)** |
 | `yu-gfx` | 图层树/Z/混合的**语义状态机**;产出可序列化 **`CompositorFrame`**(图层清单 + passes + 诊断);`GfxHost` 回答 INFO 同步查询 | rt, log | 绕过 rt 直接读数据;含平台代码 |
+| `yu-sound` | 声音域宿主:层表/循环/淡变/PAN/PITCH 状态机、OGG/WAVE 解码、headless 确定性混音;`SoundHost` 回答 SOUNDINFO | rt, log(以及 hound/lewton) | 碰文件系统/ypf;平台设备输出进 golden |
 | `yu-font` | 字体发现/加载、字形栅格化、文本样式;不含换行/对齐 | log | 平台窗口 |
 | `yu-backend-soft` | `CompositorFrame` 的**确定性参考后端**:纹理解析 + RGBA8 合成 + 快照 + 图像加工 + PNG | gfx, log, vfs | 含游戏语义;读 rt 内部 |
 | `yu-backend-wgpu` | 同一 `CompositorFrame` 的 **wgpu 主后端**:离屏 RGBA8 + 读回;纹理/管线/bind group/快照缓存;独立 WGSL 文件 | gfx, soft(复用像素算法与报告类型), log | 含游戏语义 |
 | `yu-host-wasm` | 浏览器**呈现端**(wasm-bindgen):WebGPU shim 优先、Canvas2D 回退;不读游戏数据、不解释渲染语义 | 仅 web-sys/wasm-bindgen | 依赖 rt/gfx/后端/vfs |
-| `yu-cli` | 原生装配:输入时间线 → rt 泵 → 事件分流 → gfx → 后端呈现;本地 HTTP/WS 服务、HMR 监督、用例执行器 | 全部 | 含游戏语义 |
+| `yu-cli` | 原生装配:输入时间线 → rt 泵 → 事件分流 → gfx → 后端呈现;本地 HTTP/WS 服务、HMR 监督、用例执行器;默认 `device` feature 接入 cpal 声音输出(`--no-default-features` 为纯 headless) | 全部 | 含游戏语义 |
 | `yu-trace` | 四条边界(①vfs 读 ②事件流 ③帧描述 ④平台命令)JSONL 记录/回放/diff;schema v3 | 全部(旁挂) | 成为运行时依赖 |
 
 ## 3. 一帧数据流(实现现状,架构 B)
