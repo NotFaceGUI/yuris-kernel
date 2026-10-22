@@ -1,0 +1,3 @@
+[submodule "yu-emote"]
+	path = yu-emote
+	url = https://github.com/NotFaceGUI/yu-emote.git
