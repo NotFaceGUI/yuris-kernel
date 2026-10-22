@@ -1,0 +1,14 @@
+{
+  "entry": "SYSTEM_START",
+  "expect": {
+    "display_json_sha256": "1729689580a5c0323992696d1db70ba6a319ca197719866f8634e399fcade905",
+    "ops_total": 18,
+    "png_sha256": "052951c4e84a429a7e8e5dc527c74c20c60ca30611adecd78ea01f690168715d",
+    "skipped_ops_total": 5
+  },
+  "frames": 3,
+  "inputs": [],
+  "name": "record-events-off",
+  "record_events": false,
+  "until_visible": true
+}

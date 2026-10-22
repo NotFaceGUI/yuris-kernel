@@ -1,0 +1,237 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0d10;
+  --panel: rgba(12, 16, 22, 0.78);
+  --line: #24303c;
+  --text: #d8e0ea;
+  --muted: #7c8b9b;
+  --accent: #5cc8ff;
+  --ok: #54d68a;
+  --warn: #ffb454;
+  --bad: #ff6b6b;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+#stage {
+  position: relative;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px;
+}
+
+#screen {
+  width: auto;
+  height: auto;
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 96px);
+  background: #000;
+  /* 游戏原生 800×600;默认让浏览器平滑放大(视觉小说观感)。
+     需要看原始像素时用 ?pixel=1(见 app.js)。 */
+  image-rendering: auto;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
+  touch-action: none;
+  cursor: default;
+}
+
+/* restart/启动加载遮罩:盖住 canvas,黑底 + 转圈;
+   首帧到达后由 app.js 撤掉。z-index 压过 canvas 但低于 log。 */
+#loading {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: #000;
+  border-radius: 4px;
+  z-index: 4;
+}
+
+#loading[hidden] { display: none; }
+
+#loading .spinner {
+  width: 30px;
+  height: 30px;
+  border: 3px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: yu-spin 0.8s linear infinite;
+}
+
+#loading span {
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0.05em;
+}
+
+@keyframes yu-spin {
+  to { transform: rotate(360deg); }
+}
+
+#overlay {
+  position: absolute;
+  top: 18px;
+  left: 18px;
+  min-width: 320px;
+  max-width: min(560px, 60vw);
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  backdrop-filter: blur(6px);
+  pointer-events: none;
+}
+
+#overlay .row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  align-items: baseline;
+  margin-top: 4px;
+}
+
+#overlay .row.title { margin-top: 0; }
+
+#overlay .k {
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
+#overlay .row > span:not(.k) {
+  margin-right: 8px;
+  color: var(--text);
+}
+
+#overlay .muted, .muted { color: var(--muted); }
+
+.pill {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid var(--line);
+}
+
+.pill.connecting { color: var(--warn); border-color: #6b4d1f; }
+.pill.connected { color: var(--ok); border-color: #1f6b44; }
+.pill.closed { color: var(--bad); border-color: #6b1f1f; }
+
+#toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+button {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: #151b23;
+  color: var(--text);
+  padding: 6px 14px;
+  border-radius: 4px;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover { border-color: var(--accent); color: var(--accent); }
+button:active { transform: translateY(1px); }
+button.active { border-color: var(--warn); color: var(--warn); }
+
+#log {
+  position: fixed;
+  right: 12px;
+  bottom: 56px;
+  width: min(620px, 48vw);
+  height: 280px;
+  min-width: 280px;
+  min-height: 140px;
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 80px);
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  backdrop-filter: blur(6px);
+  z-index: 20;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+  /* 右下角原生缩放;位置由 app.js 拖动 header 改变 */
+  resize: both;
+  overflow: hidden;
+}
+
+#log[hidden] { display: none; }
+
+#log header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+
+#log header.dragging { cursor: grabbing; }
+
+#log header strong {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+#log header .spacer { flex: 1; }
+
+#log-lines {
+  flex: 1;
+  overflow: auto;
+  padding: 6px 10px;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-line { color: var(--text); }
+.log-line.dim { color: var(--muted); }
+.log-line.ok { color: var(--ok); }
+.log-line.warn { color: var(--warn); }
+.log-line.err { color: var(--bad); }
+
+#log button {
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.error {
+  position: absolute;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  max-width: min(90vw, 900px);
+  padding: 10px 14px;
+  background: rgba(60, 12, 12, 0.92);
+  border: 1px solid #7d2a2a;
+  border-radius: 6px;
+  color: #ffd7d7;
+  white-space: pre-wrap;
+}

@@ -1,0 +1,32 @@
+[package]
+name = "yu-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native engine host + local service + wasm presenter bridge + case runner"
+
+[lib]
+name = "yu_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "yu-cli"
+path = "src/main.rs"
+
+# HMR 监督进程用的引擎子进程(只暴露 serve)。
+# 单独 bin 的原因:Windows 上正在运行的 exe 不能被覆盖;监督进程必须
+# 与它反复重建的子进程分开,否则 `cargo build` 永远写不进 yu-cli.exe。
+[[bin]]
+name = "yu-engine"
+path = "src/engine_main.rs"
+
+[dependencies]
+sha1 = "0.10"
+sha2 = "0.10"
+wgpu = "30.0.1"
+yu-backend-soft = { path = "../yu-backend-soft" }
+yu-backend-wgpu = { path = "../yu-backend-wgpu" }
+yu-gfx = { path = "../yu-gfx" }
+yu-log = { path = "../yu-log" }
+yu-rt = { path = "../yu-rt" }
+yu-vfs = { path = "../yu-vfs" }

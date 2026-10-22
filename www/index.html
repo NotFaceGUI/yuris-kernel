@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>yuris-kernel</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main id="stage">
+    <canvas id="screen" width="800" height="600" aria-label="game screen"></canvas>
+
+    <div id="loading" hidden>
+      <div class="spinner" aria-hidden="true"></div>
+      <span id="loading-text">loading…</span>
+    </div>
+
+    <section id="overlay" aria-live="off">
+      <div class="row title">
+        <strong>yuris-kernel</strong>
+        <span id="conn" class="pill connecting">connecting…</span>
+      </div>
+      <div class="row">
+        <span class="k">frame</span><span id="frame">–</span>
+        <span class="k">ops</span><span id="ops">–</span>
+        <span class="k">skipped</span><span id="skipped">–</span>
+        <span class="k">executed</span><span id="executed">–</span>
+        <span class="k">ms</span><span id="ms">–</span>
+      </div>
+      <div class="row">
+        <span class="k">present</span><span id="present">–</span>
+        <span class="k">engine</span><span id="engine">–</span>
+        <span class="k">viewport</span><span id="viewport">–</span>
+      </div>
+      <div class="row">
+        <span class="k">entry</span><span id="entry">–</span>
+        <span class="k">marker</span><span id="marker">–</span>
+      </div>
+      <div class="row muted" id="hint"></div>
+    </section>
+
+    <nav id="toolbar">
+      <button id="restart" type="button">Restart</button>
+      <button id="step-back" type="button" title="回退到上一帧(确定性重放,大帧号会慢)">◀ 1f</button>
+      <button id="step-fwd" type="button" title="步进一帧并暂停">1f ▶</button>
+      <button id="pause" type="button">Pause</button>
+      <button id="log-toggle" type="button">Log</button>
+      <span id="status-line" class="muted"></span>
+    </nav>
+
+    <div id="error" class="error" hidden></div>
+
+    <section id="log" hidden>
+      <header>
+        <strong>log</strong>
+        <span id="log-count" class="muted">0</span>
+        <span class="spacer"></span>
+        <button id="log-report" type="button">Report</button>
+        <button id="log-clear" type="button">Clear</button>
+      </header>
+      <div id="log-lines" role="log" aria-live="polite"></div>
+    </section>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

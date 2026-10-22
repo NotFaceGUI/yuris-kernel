@@ -17,3 +17,9 @@ docs/reverse/
 # Python 采集器缓存
 __pycache__/
 *.pyc
+
+# K2 产物:wasm-bindgen 输出与前端依赖(不入库)
+www/pkg/
+www/node_modules/
+
+.VsCodeCounter/
