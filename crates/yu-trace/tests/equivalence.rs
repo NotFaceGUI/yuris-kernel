@@ -121,7 +121,7 @@ fn open_exists_list_are_byte_identical_through_the_wrapper() {
         calls += 1;
     }
 
-    assert_eq!(log.borrow().len(), calls, "every call must be recorded");
+    assert_eq!(log.lock().unwrap().len(), calls, "every call must be recorded");
     assert_eq!(traced.source_name(), bare.source_name());
     assert_eq!(traced.source_name(), "mem");
 }
@@ -138,7 +138,7 @@ fn records_describe_the_call_and_its_identity() {
 
     let expected_sha = yu_trace::sha256_hex(&bytes);
     let log = traced.recorder().shared_log();
-    let records = log.borrow();
+    let records = log.lock().unwrap();
     assert_eq!(records.len(), 2);
 
     assert_eq!(records.records()[0].frame(), None, "启动链读取在帧外");
@@ -191,7 +191,7 @@ fn frame_annotation_is_recorded_verbatim() {
     assert!(traced.exists(&file));
 
     let log = traced.recorder().shared_log();
-    let records = log.borrow();
+    let records = log.lock().unwrap();
     assert_eq!(records.records()[0].frame(), Some(42));
     match records.records()[0].payload() {
         Payload::VfsList {
@@ -222,7 +222,7 @@ fn error_payloads_keep_the_stable_code_not_the_message() {
     assert_eq!(diag.code, yu_log::code::vfs::NOT_DIR);
 
     let log = traced.recorder().shared_log();
-    let records = log.borrow();
+    let records = log.lock().unwrap();
     match records.records()[0].payload() {
         Payload::VfsList {
             entries,
@@ -244,7 +244,7 @@ fn wrapper_does_not_change_source_identity_or_codec_paths() {
     let raw = LookupKey::new(br"YSBIN\YSC.YBN", Codec::Cp932).unwrap();
     traced.open(&raw).unwrap();
     let log = traced.recorder().shared_log();
-    let records = log.borrow();
+    let records = log.lock().unwrap();
     match records.records()[0].payload() {
         Payload::VfsOpen { key, .. } => assert_eq!(key.as_slice(), b"ysbin/ysc.ybn"),
         other => panic!("unexpected payload: {other:?}"),
@@ -274,11 +274,11 @@ fn aux_source_shares_the_primary_frame_handle() {
         frame.clone(),
     );
 
-    frame.set(Some(42));
+    *frame.lock().unwrap() = Some(42);
     let key = LookupKey::new(b"ysbin/ysc.ybn", Codec::Cp932).unwrap();
     primary.exists(&key);
     aux.exists(&key);
-    frame.set(None);
+    *frame.lock().unwrap() = None;
 
     let log = recorder.snapshot();
     let frames: Vec<Option<u64>> = log.records().iter().map(|record| record.frame()).collect();

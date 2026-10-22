@@ -4,8 +4,7 @@
 //! `SOUNDINFO` 在脚本执行期查询同一帧的最新状态；调用方**不得**再把同一批
 //! 事件 drain 后喂给该状态。
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use yu_log::Diag;
 use yu_rt::event::{ArgValue, Domain, SoundHost as SoundHostTrait, VmEvent};
@@ -18,16 +17,16 @@ use crate::state::{QueryField, SoundCommand, SoundState};
 /// `SoundState` 的共享句柄。
 #[derive(Clone)]
 pub struct SoundHost {
-    state: Rc<RefCell<SoundState>>,
+    state: Arc<Mutex<SoundState>>,
     yscm: YscmTable,
 }
 
 impl SoundHost {
-    pub fn new(state: Rc<RefCell<SoundState>>, yscm: YscmTable) -> Self {
+    pub fn new(state: Arc<Mutex<SoundState>>, yscm: YscmTable) -> Self {
         Self { state, yscm }
     }
 
-    pub fn state(&self) -> Rc<RefCell<SoundState>> {
+    pub fn state(&self) -> Arc<Mutex<SoundState>> {
         self.state.clone()
     }
 
@@ -46,7 +45,7 @@ impl SoundHostTrait for SoundHost {
     fn apply_event(&mut self, ev: &VmEvent) {
         match ev {
             VmEvent::FrameStart { frame } => {
-                self.state.borrow_mut().set_frame(*frame);
+                self.state.lock().unwrap().set_frame(*frame);
             }
             VmEvent::DomainCall {
                 domain: Domain::Sound,
@@ -82,7 +81,7 @@ impl SoundHostTrait for SoundHost {
                                 _ => {}
                             }
                         }
-                        self.state.borrow_mut().apply_sound(&cmd);
+                        self.state.lock().unwrap().apply_sound(&cmd);
                     }
                     "SOUNDEND" => {
                         let id = args
@@ -93,7 +92,7 @@ impl SoundHostTrait for SoundHost {
                                 _ => None,
                             });
                         if let Some(id) = id {
-                            self.state.borrow_mut().remove_layer(&id);
+                            self.state.lock().unwrap().remove_layer(&id);
                         }
                     }
                     // 查询由 `query` 处理；MIDI/CDDA/未知命令由 yu-rt 的
@@ -106,7 +105,7 @@ impl SoundHostTrait for SoundHost {
     }
 
     fn advance(&mut self, now_ms: u32) {
-        self.state.borrow_mut().advance(now_ms);
+        self.state.lock().unwrap().advance(now_ms);
     }
 
     fn query(&mut self, command: &str, args: &[ArgValue]) -> Result<Value, Diag> {
@@ -150,7 +149,7 @@ impl SoundHostTrait for SoundHost {
         let Some(id) = id else {
             return Err(error::recoverable(code::ARG_MISSING, "SOUNDINFO 缺 ID"));
         };
-        self.state.borrow_mut().query(&id, &fields)
+        self.state.lock().unwrap().query(&id, &fields)
     }
 }
 
@@ -158,6 +157,6 @@ fn number(v: &Value) -> Option<i64> {
     v.as_f64().map(|n| n.round() as i64)
 }
 
-fn arg_type(state: &Rc<RefCell<SoundState>>, name: &str, v: &Value) {
-    state.borrow_mut().report_arg_type(name, v);
+fn arg_type(state: &Arc<Mutex<SoundState>>, name: &str, v: &Value) {
+    state.lock().unwrap().report_arg_type(name, v);
 }

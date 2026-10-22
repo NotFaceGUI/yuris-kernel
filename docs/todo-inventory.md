@@ -138,7 +138,7 @@
 | P1 | ~~后端 P1-2 / P2-2/3/4/5/8/9 + example 重名~~ **全部关闭**(P1-2=J4,P2-3/4=J2,P2-5=AU1 C3,P2-2/P2-8 复核与交叉检查=AU2,P2-9 作废=AU2,重名已改) | — |
 | P1 | 组 RT 子组 alpha(DIV-GFX-041,契约裁决后) | 依赖裁决 |
 | P2 | 文字桥:DIV-GFX-012/033/034/035/040(`yu-font` 已就绪) | 依赖 M2 的 TEXT 状态 |
-| P2 | **E1 E-mote 运行时(M0→M4)** | M0/M1 完成;M2 pose/priority、M3 plan/soft 渲染链完成(2026-10-22);剩余 stencil/mask、wgpu 管线、物理控制器/M4 对拍 + 内核接线 |
+| P2 | **E1 E-mote 运行时(M0→M4)** | M0/M1 完成;M2 pose/参数表/Z 顺序、M3 plan/soft/composite mask 完成(2026-10-22);剩余参数化 deformer mesh、wgpu 管线、物理控制器/M4 对拍 + 内核接线 |
 | P2 | 资产元数据 provider(DIV-GFX-024)→ CGINFO SX/SY | 已部分由 J3 落地(图像头),完整 provider 仍缺 |
 | P2 | **A4 `REVERSE`+`RECTPAINT` 组合补两端测试或删分支** | 未对拍 |
 | P2 | **C2 `eprintln!` 移出 `src/`;C3 示例注入 HostPaths** | 纪律/环境等价 |

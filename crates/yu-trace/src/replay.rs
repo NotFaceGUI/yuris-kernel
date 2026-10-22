@@ -284,9 +284,9 @@ impl VmTrace {
         run: impl FnOnce(&mut Vm) -> ChainReport,
     ) -> ChainReport {
         let first = self.vm.scheduler().frame().saturating_add(1);
-        self.frame.set(Some(first));
+        *self.frame.lock().unwrap() = Some(first);
         let report = run(&mut self.vm);
-        self.frame.set(None);
+        *self.frame.lock().unwrap() = None;
         self.next_frame = first.saturating_add(report.logical_frames as u64);
         self.clock.push(now_ms);
         self.drain_events();
@@ -347,7 +347,7 @@ impl VmTrace {
         let clock = ClockSummary::from_ticks(&self.clock);
         let header = header_from_vm_with_clock(&self.vm, &self.cfg, self.codec, input, clock);
         let log = self.recorder.shared_log();
-        let mut log = log.borrow_mut();
+        let mut log = log.lock().unwrap();
         log.prepend_header(header);
         log.clone()
     }

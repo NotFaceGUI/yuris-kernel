@@ -5,7 +5,7 @@
 > `CONTEXT.md`(术语)。
 >
 > **v1.3 修订**(以 `PROGRESS.md` 成果 K1/J3 与 `docs/audit-2026-10-22.md` 为准):
-> - 实际 crate 数为 **12**(新增 `yu-cli`、`yu-host-wasm`、`yu-sound`);不再有“wasm 跑内核”的
+> - 实际 crate 数为 **13**(新增 `yu-cli`、`yu-host-desktop`、`yu-host-wasm`、`yu-sound`);不再有“wasm 跑内核”的
 >   `yu-backend-wasm` 规划——**架构 B(2026-10-21 主人决定)**:Rust 原生读本机数据
 >   并跑内核,wasm/JS 只做呈现端。
 > - **`RenderBackend` trait 不存在**:两个后端(`yu-backend-soft`、
@@ -13,6 +13,8 @@
 >   契约是**数据**(`CompositorFrame`),不是 trait。§5 已按此改写。
 > - `yu-snd` 已以 `yu-sound` 落地(N 任务);`yu-inp`/`yu-save` 尚未建 crate;
 >   输入时间线目前在 `yu-rt::input`。
+> - 目录分层:`crates/yu-render/{soft,wgpu}` 放渲染后端,`crates/yu-platform/{host-desktop,host-wasm}`
+>   放宿主;其余 crate 在 `crates/` 下。**包名不变**,`cargo -p` 命令不用改。
 > - 帧契约字段以 `crates/yu-gfx/src/frame.rs` 为准(含 `dx_mode`,
 >   见 §5.1 的范围说明)。
 
@@ -54,16 +56,21 @@ Mount(叠加栈, 后挂者覆盖先挂者):
 
 ## 2. 核心决策 B:分层与 crate 划分
 
-**12 个 crate,依赖严格向下,边界=契约**(2026-10-22 实测现状):
+**13 个 crate,依赖严格向下,边界=契约**(2026-10-22 实测现状):
 
 ```mermaid
 flowchart TD
-    HOSTWASM["yu-host-wasm<br/>浏览器呈现端(仅 present RGBA)"]
+    subgraph PLATFORM["yu-platform 宿主层"]
+        HOSTWASM["yu-platform/host-wasm<br/>浏览器呈现端(仅 present RGBA)"]
+        HOSTDESKTOP["yu-platform/host-desktop<br/>Windows 窗口 + wgpu 上屏 + egui"]
+    end
     CLI["yu-cli<br/>原生引擎宿主 + 本地服务 + HMR + 用例"]
     GFX["yu-gfx 图层/CG 状态机<br/>+ CompositorFrame"]
     SND["yu-sound 声音域宿主<br/>SOUND/INFO/END 层状态机 + headless mixer"]
-    SOFT["yu-backend-soft<br/>确定性参考后端 + PNG"]
-    WGPU["yu-backend-wgpu<br/>主后端(wgpu)"]
+    subgraph RENDER["yu-render 渲染后端"]
+        SOFT["yu-render/soft · yu-backend-soft<br/>确定性参考后端 + PNG"]
+        WGPU["yu-render/wgpu · yu-backend-wgpu<br/>主后端(wgpu)"]
+    end
     RT["yu-rt 运行核<br/>任务调度·命令分派·表达式·16槽寄存器·变量域<br/>(A5: 零硬编码,全表来自游戏数据)"]
     FMT["yu-format 容器解码<br/>ybn·yssd·ymv·yscfg · 纯字节进出"]
     VFS["yu-vfs 数据源<br/>DirSource · YpfSource · MemSource · Mount · 归一"]
@@ -72,6 +79,8 @@ flowchart TD
     LOG["yu-log Diag/错误码/LogSink"]
 
     HOSTWASM -.->|WebSocket 帧| CLI
+    HOSTDESKTOP --> CLI
+    HOSTDESKTOP -.->|窗口上屏| WGPU
     CLI --> SOFT
     CLI --> WGPU
     CLI --> RT
@@ -107,9 +116,10 @@ flowchart TD
 | `yu-gfx` | 图层树/Z/混合的**语义状态机**;产出可序列化 **`CompositorFrame`**(图层清单 + passes + 诊断);`GfxHost` 回答 INFO 同步查询 | rt, log | 绕过 rt 直接读数据;含平台代码 |
 | `yu-sound` | 声音域宿主:层表/循环/淡变/PAN/PITCH 状态机、OGG/WAVE 解码、headless 确定性混音;`SoundHost` 回答 SOUNDINFO | rt, log(以及 hound/lewton) | 碰文件系统/ypf;平台设备输出进 golden |
 | `yu-font` | 字体发现/加载、字形栅格化、文本样式;不含换行/对齐 | log | 平台窗口 |
-| `yu-backend-soft` | `CompositorFrame` 的**确定性参考后端**:纹理解析 + RGBA8 合成 + 快照 + 图像加工 + PNG | gfx, log, vfs | 含游戏语义;读 rt 内部 |
-| `yu-backend-wgpu` | 同一 `CompositorFrame` 的 **wgpu 主后端**:离屏 RGBA8 + 读回;纹理/管线/bind group/快照缓存;独立 WGSL 文件 | gfx, soft(复用像素算法与报告类型), log | 含游戏语义 |
-| `yu-host-wasm` | 浏览器**呈现端**(wasm-bindgen):WebGPU shim 优先、Canvas2D 回退;不读游戏数据、不解释渲染语义 | 仅 web-sys/wasm-bindgen | 依赖 rt/gfx/后端/vfs |
+| `yu-render/soft` · `yu-backend-soft` | `CompositorFrame` 的**确定性参考后端**:纹理解析 + RGBA8 合成 + 快照 + 图像加工 + PNG | gfx, log, vfs | 含游戏语义;读 rt 内部 |
+| `yu-render/wgpu` · `yu-backend-wgpu` | 同一 `CompositorFrame` 的 **wgpu 主后端**:离屏 RGBA8 + 读回;纹理/管线/bind group/快照缓存;独立 WGSL 文件 | gfx, soft(复用像素算法与报告类型), log | 含游戏语义 |
+| `yu-platform/host-wasm` · `yu-host-wasm` | 浏览器**呈现端**(wasm-bindgen):WebGPU shim 优先、Canvas2D 回退;不读游戏数据、不解释渲染语义 | 仅 web-sys/wasm-bindgen | 依赖 rt/gfx/后端/vfs |
+| `yu-platform/host-desktop` · `yu-host-desktop` | **原生桌面宿主**(Windows 首版):winit 窗口 + wgpu 上屏 + egui 调试面板;复用 `yu-cli::Engine`,不复制引擎语义 | cli, render/wgpu, egui/winit | 含游戏语义;直接读数据 |
 | `yu-cli` | 原生装配:输入时间线 → rt 泵 → 事件分流 → gfx → 后端呈现;本地 HTTP/WS 服务、HMR 监督、用例执行器;默认 `device` feature 接入 cpal 声音输出(`--no-default-features` 为纯 headless) | 全部 | 含游戏语义 |
 | `yu-trace` | 四条边界(①vfs 读 ②事件流 ③帧描述 ④平台命令)JSONL 记录/回放/diff;schema v3 | 全部(旁挂) | 成为运行时依赖 |
 
@@ -122,7 +132,8 @@ flowchart TD
   → yu-gfx: GfxHost 同步消费 → 图层树/Z/passes → CompositorFrame
   → yu-backend-soft | yu-backend-wgpu: 执行 passes → RGBA8 屏幕
   → yu-cli: PNG / 本地 WS(YUF1 帧头 + RGBA8) / 用例比对
-  → yu-host-wasm + www: canvas 呈现(WebGPU shim 优先,Canvas2D 回退)
+  → yu-platform/host-desktop: winit 窗口上屏(复用 yu-cli::Engine)
+  → yu-platform/host-wasm + www: canvas 呈现(WebGPU shim 优先,Canvas2D 回退)
   → yu-trace 在 ①②③④ 落 JSONL(旁挂)
 ```
 
@@ -192,7 +203,7 @@ Op   { Layer | Group | Transition | Mask | Copy | Image }
 | M3a | yu-gfx `CompositorFrame` 语义显示列表 | 首屏 census 稳定 |
 | M3b | `yu-backend-soft` 确定性参考 | 600 帧与 wgpu 逐帧一致 |
 | M3c | `yu-backend-wgpu` 主后端 | title/转场/COPY/按钮;与 native 同帧一致 |
-| M3d | hosts(K1):`yu-cli` 原生宿主 + `yu-host-wasm` 呈现端 | 浏览器 canvas 与 native 同 hash;HMR |
+| M3d | hosts(K1/K3):`yu-cli` 原生宿主 + `yu-host-desktop` Windows 窗口 + `yu-host-wasm` 呈现端 | 窗口与 native 同帧;浏览器 canvas 与 native 同 hash;HMR |
 | M4 | yu-save + 编解码器写回 | 官方 .sd 读→写回字节一致 |
 | M5 | 真封包游戏端到端 | 同一内核二进制,换挂载栈即跑商业游戏 |
 

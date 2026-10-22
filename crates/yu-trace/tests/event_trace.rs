@@ -96,7 +96,7 @@ fn record_frame() -> TraceLog {
         Codec::Cp932,
         yu_trace::input_summary(&timeline(), frames),
     );
-    let mut log = log.borrow_mut();
+    let mut log = log.lock().unwrap();
     log.prepend_header(header);
     log.clone()
 }

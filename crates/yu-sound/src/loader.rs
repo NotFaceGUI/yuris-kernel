@@ -6,7 +6,7 @@
 use yu_log::Diag;
 
 /// 按工程内相对路径读取文件；`Ok(None)` = 不存在。
-pub trait SoundLoader {
+pub trait SoundLoader: Send {
     fn load(&self, name: &[u8]) -> Result<Option<Vec<u8>>, Diag>;
 }
 

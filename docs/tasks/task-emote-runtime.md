@@ -30,9 +30,10 @@
 | 阶段 | 状态 | 说明 |
 |---|---|---|
 | M0 契约 | **done** | `EMOTE`/`EMOTEINFO` 证据级契约写入 `domain-event-contracts.md` §7;`.psb` 表达裁决为“RGBA 纹理 + 图层变换” |
-| M1 数据 | **done(除规范化)** | `yu-emote`:PSB/MDF 解析、body 解密、`psb-info`/`psb-dump`;schema/atlas/objects/motions/layers/variables/timelines/controllers 全覆盖;样本逐字节确定性。部件显隐/规范化规则仍待取证 |
-| M2 动画 | **core done** | `Animator` + `pose`:帧选择/type 0/3/ti、inheritMask、transformOrder、嵌套 motion、priority 顺序;mask/stencil、差分淡入曲线、官方帧率、物理控制器待做 |
-| M3 渲染 | **baseline done** | 58 个 WGSL 文件、`plan` 绘制列表、`soft` 确定性 CPU 光栅/PNG;wgpu 管线、mask/stencil、变体选择待做 |
+| M1 数据 | **done(除规范化)** | `yu-emote`:PSB/MDF 解析、body 解密、`psb-info`/`psb-dump`;schema/atlas(v2 RGBA4444 + v4 ems RGBA8)/objects/motions/layers/variables/timelines/controllers 全覆盖;样本逐字节确定性。部件显隐/规范化规则仍待取证 |
+| M2 动画 | **core done** | `Animator` + `pose`:帧选择/type 0/3/ti、inheritMask、transformOrder、嵌套 motion、motion 级 parameter 表与 parameterize、解析 Z 绘制顺序;参数化 deformer mesh 继承、差分淡入曲线、官方帧率、物理控制器待做 |
+| M3 渲染 | **baseline done** | 58 个 WGSL 文件、`plan` 绘制列表、`soft` 确定性 CPU 光栅/PNG、composite alpha mask(CPU);wgpu 管线、pixelate、变体选择待做 |
+| M4 对拍 | pending | oracle 宿主已能 CreatePlayer/Update/Render,但 draw list 仍为空;官方像素对比待打通 |
 | M4 对拍 | pending | — |
 
 样本验证(2026-10-22):PSB v2、2 resources(`tex#0` 2048²/97 icons,

@@ -1,0 +1,27 @@
+[package]
+name = "yu-host-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native desktop host: winit window + wgpu presenter + egui debug UI"
+
+[lib]
+name = "yu_host_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "yu-desktop"
+path = "src/main.rs"
+
+[dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+egui = { version = "0.37", features = ["default_fonts"] }
+egui-wgpu = "0.37"
+egui-winit = "0.37"
+pollster = "0.4"
+wgpu = "30.0.1"
+winit = "0.30"
+yu-backend-soft = { path = "../../yu-render/soft" }
+yu-backend-wgpu = { path = "../../yu-render/wgpu" }
+yu-cli = { path = "../../yu-cli" }
+yu-rt = { path = "../../yu-rt" }

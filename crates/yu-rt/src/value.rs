@@ -23,8 +23,6 @@
 //! §3.11:先看 `0x` 前缀走十六进制,否则扫十进制/浮点;扫描后仍有剩余字符
 //! 报错。这里实现为 [`Value::cast_to_int`],非法输入返回 `Unimplemented`。
 
-use std::collections::BTreeMap;
-
 use yu_log::Boundary;
 
 use crate::code;
@@ -375,14 +373,14 @@ impl Value {
             Value::Str(bytes) => {
                 let text = String::from_utf8_lossy(bytes);
                 let t = text.trim();
-                let parsed = if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))
-                {
-                    i64::from_str_radix(hex, 16).ok()
-                } else if t.contains('.') {
-                    t.parse::<f64>().ok().map(|v| v as i64)
-                } else {
-                    t.parse::<i64>().ok()
-                };
+                let parsed =
+                    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                        i64::from_str_radix(hex, 16).ok()
+                    } else if t.contains('.') {
+                        t.parse::<f64>().ok().map(|v| v as i64)
+                    } else {
+                        t.parse::<i64>().ok()
+                    };
                 match parsed {
                     Some(v) => Ok(Value::Int(v)),
                     None => Err(diag::unimplemented(
@@ -503,9 +501,7 @@ pub fn linear_offset_for(
     dims: &[usize],
     indices: &[i64],
 ) -> Result<usize, yu_log::Diag> {
-    let who = var
-        .map(|v| format!("{} ", v.display()))
-        .unwrap_or_default();
+    let who = var.map(|v| format!("{} ", v.display())).unwrap_or_default();
     if indices.len() != dims.len() {
         return Err(diag::fatal(
             code::rt::VAR_SHAPE,
@@ -553,7 +549,9 @@ pub fn linear_offset_for(
 /// 变量域:声明、读、写。键 = `(space,id)`;`BTreeMap` 保证事件/诊断顺序确定。
 #[derive(Clone, Debug, Default)]
 pub struct VariableStore {
-    slots: BTreeMap<(VarSpace, u16), VarSlot>,
+    /// 热路径是逐命令读写,用 FxHashMap 代替 BTreeMap;需要稳定顺序的
+    /// [`VariableStore::iter`] 单独排序键。
+    slots: rustc_hash::FxHashMap<(VarSpace, u16), VarSlot>,
 }
 
 impl VariableStore {
@@ -570,7 +568,8 @@ impl VariableStore {
     }
 
     pub fn declare(&mut self, r: VarRef, ty: ElemType, dims: &[usize], init: &Value) {
-        self.slots.insert((r.space, r.id), VarSlot::new(ty, dims, init));
+        self.slots
+            .insert((r.space, r.id), VarSlot::new(ty, dims, init));
     }
 
     /// 改变一维数组长度,**保留已有元素**(新增元素取类型零值)。
@@ -578,11 +577,7 @@ impl VariableStore {
     /// 手册 `variable/varact.html` 例 9/10:`DIMSIZE` 只改「数组大小」;
     /// ERIS 的 `VAR.ADD` 宏依赖它做追加(`DIMSIZE+=1` → 写末元素),
     /// 若重填整个数组会把先前追加的元素抹掉(实测:13 次追加只剩最后 1 个)。
-    pub fn resize_1d(
-        &mut self,
-        r: VarRef,
-        new_len: usize,
-    ) -> Result<(), yu_log::Diag> {
+    pub fn resize_1d(&mut self, r: VarRef, new_len: usize) -> Result<(), yu_log::Diag> {
         // 防御上限:脚本给的 DIMSIZE 值超出 2^26 ⇒ 拒绝(畸形脚本,任务书 E
         // R7;真实声明最大 .TX.MAX=4096)。不是引擎语义,是内核自保。
         const MAX_ELEMS: usize = 1 << 26;
@@ -646,13 +641,13 @@ impl VariableStore {
         if slot.is_scalar() && indices.is_empty() {
             return Ok(slot.data[0].clone());
         }
-        let idx = if indices.is_empty() {
+        let flat = if indices.is_empty() {
             // 引擎 opcode 0x48:数组变量不带下标时读 0 号元素(§3.10)。
-            vec![0i64; slot.dims.len()]
+            let zeros: smallvec::SmallVec<[i64; 4]> = smallvec::smallvec![0i64; slot.dims.len()];
+            linear_offset_for(Some(r), &slot.dims, &zeros)?
         } else {
-            indices.to_vec()
+            linear_offset_for(Some(r), &slot.dims, indices)?
         };
-        let flat = linear_offset_for(Some(r), &slot.dims, &idx)?;
         Ok(slot.data[flat].clone())
     }
 
@@ -680,31 +675,31 @@ impl VariableStore {
             slot.data[0] = stored.clone();
             return Ok(stored);
         }
-        let idx = if indices.is_empty() {
-            vec![0i64; slot.dims.len()]
+        let flat = if indices.is_empty() {
+            let zeros: smallvec::SmallVec<[i64; 4]> = smallvec::smallvec![0i64; slot.dims.len()];
+            linear_offset_for(Some(r), &slot.dims, &zeros)?
         } else {
-            indices.to_vec()
+            linear_offset_for(Some(r), &slot.dims, indices)?
         };
-        let flat = linear_offset_for(Some(r), &slot.dims, &idx)?;
         slot.data[flat] = stored.clone();
         Ok(stored)
     }
 
     /// 槽位类型/维数(诊断与 `VARINFO` 用)。
     pub fn shape(&self, r: VarRef) -> Option<(ElemType, &[usize])> {
-        self.slots.get(&(r.space, r.id)).map(|s| (s.ty, s.dims.as_slice()))
+        self.slots
+            .get(&(r.space, r.id))
+            .map(|s| (s.ty, s.dims.as_slice()))
     }
 
     /// 键的确定顺序遍历(存档/事件用)。
     pub fn iter(&self) -> impl Iterator<Item = (VarRef, &VarSlot)> {
-        self.slots.iter().map(|((space, id), slot)| {
-            (
-                VarRef {
-                    space: *space,
-                    id: *id,
-                },
-                slot,
-            )
+        let mut keys: Vec<(VarSpace, u16)> = self.slots.keys().copied().collect();
+        keys.sort_unstable();
+        keys.into_iter().filter_map(|(space, id)| {
+            self.slots
+                .get(&(space, id))
+                .map(|slot| (VarRef { space, id }, slot))
         })
     }
 

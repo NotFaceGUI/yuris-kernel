@@ -78,7 +78,8 @@ pub enum Slot {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LValue {
     pub var: VarRef,
-    pub indices: Vec<i64>,
+    /// 数组下标。绝大多数是 0–2 维;用 SmallVec 避免每次 LET 的堆分配。
+    pub indices: smallvec::SmallVec<[i64; 4]>,
 }
 
 /// 求值期变量访问。由 VM 实现(变量域 + 系统变量 + 输入快照)。
@@ -103,8 +104,17 @@ impl<'a> Evaluator<'a> {
         stack: &mut Vec<Slot>,
         instrs: &mut Vec<RawInstr>,
     ) -> Result<(), yu_log::Diag> {
-        stack.clear();
         decode_pooled(window, instrs)?;
+        self.eval_instrs(instrs, stack)
+    }
+
+    /// 已解码窗口的执行入口(VM 解码缓存命中路径)。
+    pub fn eval_instrs(
+        &mut self,
+        instrs: &[RawInstr],
+        stack: &mut Vec<Slot>,
+    ) -> Result<(), yu_log::Diag> {
+        stack.clear();
         for (n, ins) in instrs.iter().enumerate() {
             self.step(ins, stack, n + 1 == instrs.len())?;
         }
@@ -128,7 +138,17 @@ impl<'a> Evaluator<'a> {
         stack: &mut Vec<Slot>,
         instrs: &mut Vec<RawInstr>,
     ) -> Result<Value, yu_log::Diag> {
-        self.eval_pooled(window, stack, instrs)?;
+        decode_pooled(window, instrs)?;
+        self.eval_value_instrs(instrs, stack)
+    }
+
+    /// 已解码窗口的求值入口(VM 解码缓存命中路径)。
+    pub fn eval_value_instrs(
+        &mut self,
+        instrs: &[RawInstr],
+        stack: &mut Vec<Slot>,
+    ) -> Result<Value, yu_log::Diag> {
+        self.eval_instrs(instrs, stack)?;
         match stack.pop() {
             Some(Slot::Val(v)) => Ok(v),
             Some(Slot::Ref(r)) => Err(diag::fatal(
@@ -174,6 +194,22 @@ impl<'a> Evaluator<'a> {
     /// `$arr[@cnt(0)-1]` —— 若把两条 aload 都跳过,左值会错解析成 `@cnt[-1]`。
     pub fn eval_lvalue(&mut self, window: &[u8]) -> Result<LValue, yu_log::Diag> {
         let instrs = decode(window)?;
+        self.eval_lvalue_instrs(&instrs)
+    }
+
+    /// 已解码窗口的左值解析(VM 解码缓存命中路径)。
+    pub fn eval_lvalue_instrs(&mut self, instrs: &[RawInstr]) -> Result<LValue, yu_log::Diag> {
+        let mut stack = Vec::new();
+        self.eval_lvalue_instrs_with(instrs, &mut stack)
+    }
+
+    /// 已解码窗口的左值解析(复用调用方栈;VM 热路径零分配)。
+    pub fn eval_lvalue_instrs_with(
+        &mut self,
+        instrs: &[RawInstr],
+        stack: &mut Vec<Slot>,
+    ) -> Result<LValue, yu_log::Diag> {
+        stack.clear();
         if instrs.is_empty() {
             return Err(diag::fatal(
                 code::rt::EXPR_MALFORMED,
@@ -186,7 +222,7 @@ impl<'a> Evaluator<'a> {
             if let Some(r) = var_of(&instrs[0]) {
                 return Ok(LValue {
                     var: r,
-                    indices: Vec::new(),
+                    indices: smallvec::SmallVec::new(),
                 });
             }
         }
@@ -195,20 +231,20 @@ impl<'a> Evaluator<'a> {
             Some(last) if last.op == 0x29 => &instrs[..instrs.len() - 1],
             _ => &instrs[..],
         };
-        let mut stack: Vec<Slot> = Vec::new();
         for ins in body {
             if matches!(ins.op, 0x56 | 0x76) {
                 // 引用指令原样压栈(0x48 取值语义交给 step)。
-                let r = var_of(ins)
-                    .ok_or_else(|| diag::fatal(
+                let r = var_of(ins).ok_or_else(|| {
+                    diag::fatal(
                         code::rt::EXPR_MALFORMED,
                         Boundary::Script,
                         "变量引用载荷不是 3 字节",
-                    ))?;
+                    )
+                })?;
                 stack.push(Slot::Ref(r));
                 continue;
             }
-            self.step(ins, &mut stack, false)?;
+            self.step(ins, stack, false)?;
         }
         let at = stack
             .iter()
@@ -220,7 +256,7 @@ impl<'a> Evaluator<'a> {
                     "左值窗口不含变量引用",
                 )
             })?;
-        let mut indices = Vec::new();
+        let mut indices = smallvec::SmallVec::<[i64; 4]>::new();
         for slot in stack.iter().skip(at + 1) {
             match slot {
                 Slot::Val(Value::Int(v)) => indices.push(*v),
@@ -260,19 +296,21 @@ impl<'a> Evaluator<'a> {
             0x57 if ins.payload.len() == 2 => stack.push(Slot::Val(Value::Int(
                 i16::from_le_bytes([ins.payload[0], ins.payload[1]]) as i64,
             ))),
-            0x49 if ins.payload.len() == 4 => stack.push(Slot::Val(Value::Int(
-                i32::from_le_bytes([ins.payload[0], ins.payload[1], ins.payload[2], ins.payload[3]])
-                    as i64,
-            ))),
-            0x4c if ins.payload.len() == 8 => stack.push(Slot::Val(Value::Int(
-                read_i64(&ins.payload)?,
-            ))),
-            0x46 if ins.payload.len() == 8 => stack.push(Slot::Val(Value::Float(
-                f64::from_bits(read_i64(&ins.payload)? as u64),
-            ))),
-            0x4d => stack.push(Slot::Val(Value::Str(decode_string_literal(
-                &ins.payload,
-            )?))),
+            0x49 if ins.payload.len() == 4 => {
+                stack.push(Slot::Val(Value::Int(i32::from_le_bytes([
+                    ins.payload[0],
+                    ins.payload[1],
+                    ins.payload[2],
+                    ins.payload[3],
+                ]) as i64)))
+            }
+            0x4c if ins.payload.len() == 8 => {
+                stack.push(Slot::Val(Value::Int(read_i64(&ins.payload)?)))
+            }
+            0x46 if ins.payload.len() == 8 => stack.push(Slot::Val(Value::Float(f64::from_bits(
+                read_i64(&ins.payload)? as u64,
+            )))),
+            0x4d => stack.push(Slot::Val(Value::Str(decode_string_literal(&ins.payload)?))),
             0x48 | 0x56 | 0x76 => {
                 let r = var_of(ins).ok_or_else(|| malformed(ins, "变量引用载荷不是 3 字节"))?;
                 if ins.op == 0x48 {
@@ -322,8 +360,8 @@ impl<'a> Evaluator<'a> {
                 stack.push(Slot::Val(v));
             }
             0x2c => {}
-            0x21 | 0x25 | 0x26 | 0x2a | 0x2b | 0x2d | 0x2f | 0x3c | 0x3d | 0x3e | 0x41
-            | 0x4f | 0x53 | 0x5a | 0x5e | 0x7c => {
+            0x21 | 0x25 | 0x26 | 0x2a | 0x2b | 0x2d | 0x2f | 0x3c | 0x3d | 0x3e | 0x41 | 0x4f
+            | 0x53 | 0x5a | 0x5e | 0x7c => {
                 let rhs = match stack.pop() {
                     Some(Slot::Val(v)) => v,
                     Some(Slot::Ref(r)) => {
@@ -602,7 +640,11 @@ mod tests {
                 let _ = var;
                 Ok(self.scalar.clone())
             } else {
-                Ok(self.array.get(idx[0] as usize).cloned().unwrap_or(Value::Int(0)))
+                Ok(self
+                    .array
+                    .get(idx[0] as usize)
+                    .cloned()
+                    .unwrap_or(Value::Int(0)))
             }
         }
     }

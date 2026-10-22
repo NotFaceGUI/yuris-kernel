@@ -264,19 +264,52 @@ tex#1  512x256  RGBA4444 icons=13  resource=0 (   262,144 B, sha256 44819f5b…)
 - `yu-emote::pose`:frameList 选择、type 0/2/3 语义、`ti` 量化、角度最短路径、
   `inheritMask` 通道继承、`transformOrder` 四阶段、coordinate 平面(XY/XZ)、
   type-3 嵌套 motion(子时间 = parent - frame_start + timeOffset)、
-  motion `priority` 绘制顺序;
+  motion `priority` 发射顺序;
 - `yu-emote::plan` + `soft`:atlas 矩形/枢轴、4×4 Bezier 网格、corner color、
   确定性 CPU 光栅与 PNG;
-- 样本 time 0:229 个 pose 节点、145 个可见 drawable、30 个带纹理 +
-  115 个 blank/mask draw item、76718 三角形;`psb-render` 输出完整角色
-  (头发/眼/眉/身体/裙/腿),人物在
+- 样本 time 0:229 个 pose 节点、145 个可见 drawable;跳过 115 个 blank
+  proxy 后实际 30 个彩色 draw item、3960 三角形、2 个 composite mask
+  source;`psb-render` 输出完整角色(头发/眼/眉/身体/裙/腿),人物在
   model 空间的 bbox 约 `x -643..429, y -971..767`,预览需宿主/工具做
   fit 变换(官方引擎由 CG 图层变换提供)。
-- 仍缺:stencil/alpha-mask 合成(脸部内层被头发覆盖)、pixelate、wgpu 管线、
-  物理控制器、官方像素对拍。
 
-**未做**:物理控制器(bust/hair/parts)的数值求值、差分淡入曲线、wgpu 管线、
-官方像素对拍。
+2026-10-22 M2/M3 正确性修复(像素输出已验证):
+
+- **绘制顺序以解析 Z 为准**:native `MMotionManager` 先按 `priority` 发射,
+  再按 `DrawFrameInfo +36`(=`LayerInfo +620`,累积坐标 Z)升序 `std::sort`。
+  样本 Z:後髪 -10、胴体 0、輪郭 3、前髪 4、瞳 5..6;仅用 priority 会让
+  後髪盖住脸。`priority` 只作同 Z 的确定性 tie-break。
+- **motion 级参数表**:`parameterize` 索引的是**所属 motion** 的
+  `parameter` 数组,不是根表。`Motion` 现保存 `parameters` 与 motion 级
+  `parameterize`;眼睛/嘴/眉/泪/頬 motion 由 `face_eye_open`/`face_talk`/
+  `face_eyebrow`/`face_tears`/`face_cheek` 驱动其时间线。
+- **type-0 保持**:终帧 type 0 必须回退到同 frameList 内最近一个有 content 的
+  关键帧;嵌套眼部 motion 在 type-0 间隙后仍应可见。
+- **corner color 字节序为 `0xRRGGBBAA`**(低字节 alpha);眼皮层
+  `0x000000FF` 是"不透明黑",不是透明。
+- **composite alpha mask**:type-12 且 `stencilType & 4` 且有
+  `stencilCompositeMaskLayerList` 的 owner,其子孙按同 motion scope 内
+  所列 source 图层的 alpha 并集裁剪;opacity 0 的 `add_mask` 不参与
+  (与 native 可见 sprite 过滤一致)。CPU 路径按 coverage buffer 实现。
+- **YSEmote 导出为 stdcall**(`RET imm`);按 cdecl 声明会在数次 Update 后
+  破坏栈。ordinal 254 = `Update(seconds)`,255 = render,内部转发到
+  `[impl+8]` 的 device render loop。
+- 新增 `--only/--skip` 调试过滤与 `demo/make_demo.py`(多角色 × 4 表情,
+  单文件 HTML,含真实 PSB 渲染帧;WebP 内嵌)。
+- **PSB v4 `ems` 支持**:Nekopara 系列为 `spec: ems`、`source.tex` 单页
+  4096² `RGBA8`、icon 键为四位字符串(`"0020"`),不是 v2 的
+  `tex#0/tex#1` + `RGBA4444`。已用 `NekoWebShow` 镜像的
+  chocola/vanilla/azuki/coconut maid 模型验证:
+  87 icons、21 objects / 48 motions、base motion `タイムライン構造`;
+  time 0 每个角色 34 个 draw item、25472 三角形、2 个 mask source。
+  Coconut 有 32 个非默认 blend item,CPU 路径按普通 alpha 输出(待 M4 修正)。
+  这些游戏资产只在本地测试,不入库、不随 demo 分发。
+
+- 仍缺:参数化 deformer mesh 对子层的继承(头 `head_UD/head_LR` 的
+  网格变形)、pixelate、wgpu 管线、物理控制器、官方像素对拍。
+
+**未做**:物理控制器(bust/hair/parts)的数值求值、差分淡入曲线、参数化
+deformer mesh 继承、wgpu 管线、官方像素对拍。
 
 ## 4. 支持分层(建议)
 

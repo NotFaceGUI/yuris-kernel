@@ -8,8 +8,7 @@
 //! 返回值与错误对象与内层数据源**完全相同**(错误 `Diag` 逐字段克隆),
 //! 这是 D2 等价性测试的契约。
 
-use std::cell::Cell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use yu_log::Diag;
 use yu_vfs::{DataSource, Entry, LookupKey};
@@ -19,7 +18,7 @@ use crate::hash::sha256_hex;
 use crate::record::{ListEntry, Payload};
 
 /// 帧号句柄。包装器被装箱后,宿主仍可通过它标注当前逻辑帧。
-pub type FrameHandle = Rc<Cell<Option<u64>>>;
+pub type FrameHandle = Arc<Mutex<Option<u64>>>;
 
 /// 录制包装器。持有内层数据源,日志通过 [`SharedLog`] 共享。
 pub struct TracingSource<D: DataSource> {
@@ -37,7 +36,7 @@ impl<D: DataSource> TracingSource<D> {
             inner,
             recorder: EventRecorder::new(log),
             source_name,
-            frame: Rc::new(Cell::new(None)),
+            frame: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -47,7 +46,7 @@ impl<D: DataSource> TracingSource<D> {
             inner,
             recorder,
             source_name,
-            frame: Rc::new(Cell::new(None)),
+            frame: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -66,12 +65,12 @@ impl<D: DataSource> TracingSource<D> {
     ///
     /// 启动链读取应保持 `None`;帧内读取由宿主在推进前设置。
     pub fn set_frame(&self, frame: Option<u64>) {
-        self.frame.set(frame);
+        *self.frame.lock().unwrap() = frame;
     }
 
     /// 可跨装箱持有的帧号句柄。
     pub fn frame_handle(&self) -> FrameHandle {
-        Rc::clone(&self.frame)
+        Arc::clone(&self.frame)
     }
 
     pub fn inner(&self) -> &D {
@@ -91,8 +90,8 @@ impl<D: DataSource> DataSource for TracingSource<D> {
     fn open(&self, path: &LookupKey) -> Result<Vec<u8>, Diag> {
         match self.inner.open(path) {
             Ok(bytes) => {
-                self.recorder.shared_log().borrow_mut().push(
-                    self.frame.get(),
+                self.recorder.shared_log().lock().unwrap().push(
+                    *self.frame.lock().unwrap(),
                     Payload::VfsOpen {
                         source: self.source_name.clone(),
                         key: path.as_bytes().to_vec(),
@@ -104,8 +103,8 @@ impl<D: DataSource> DataSource for TracingSource<D> {
                 Ok(bytes)
             }
             Err(diag) => {
-                self.recorder.shared_log().borrow_mut().push(
-                    self.frame.get(),
+                self.recorder.shared_log().lock().unwrap().push(
+                    *self.frame.lock().unwrap(),
                     Payload::VfsOpen {
                         source: self.source_name.clone(),
                         key: path.as_bytes().to_vec(),
@@ -121,8 +120,8 @@ impl<D: DataSource> DataSource for TracingSource<D> {
 
     fn exists(&self, path: &LookupKey) -> bool {
         let exists = self.inner.exists(path);
-        self.recorder.shared_log().borrow_mut().push(
-            self.frame.get(),
+        self.recorder.shared_log().lock().unwrap().push(
+            *self.frame.lock().unwrap(),
             Payload::VfsExists {
                 source: self.source_name.clone(),
                 key: path.as_bytes().to_vec(),
@@ -136,8 +135,8 @@ impl<D: DataSource> DataSource for TracingSource<D> {
         match self.inner.list(path) {
             Ok(entries) => {
                 let recorded: Vec<ListEntry> = entries.iter().map(ListEntry::from_entry).collect();
-                self.recorder.shared_log().borrow_mut().push(
-                    self.frame.get(),
+                self.recorder.shared_log().lock().unwrap().push(
+                    *self.frame.lock().unwrap(),
                     Payload::VfsList {
                         source: self.source_name.clone(),
                         key: path.as_bytes().to_vec(),
@@ -148,8 +147,8 @@ impl<D: DataSource> DataSource for TracingSource<D> {
                 Ok(entries)
             }
             Err(diag) => {
-                self.recorder.shared_log().borrow_mut().push(
-                    self.frame.get(),
+                self.recorder.shared_log().lock().unwrap().push(
+                    *self.frame.lock().unwrap(),
                     Payload::VfsList {
                         source: self.source_name.clone(),
                         key: path.as_bytes().to_vec(),

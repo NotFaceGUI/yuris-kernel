@@ -1,6 +1,20 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = [
+    "crates/yu-cli",
+    "crates/yu-font",
+    "crates/yu-format",
+    "crates/yu-gfx",
+    "crates/yu-log",
+    "crates/yu-rt",
+    "crates/yu-sound",
+    "crates/yu-trace",
+    "crates/yu-vfs",
+    "crates/yu-platform/host-desktop",
+    "crates/yu-platform/host-wasm",
+    "crates/yu-render/soft",
+    "crates/yu-render/wgpu",
+]
 
 [workspace.package]
 version = "0.1.0"

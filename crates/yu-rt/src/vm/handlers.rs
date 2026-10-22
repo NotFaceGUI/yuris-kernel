@@ -1049,13 +1049,13 @@ impl Vm {
 
     /// 声明命令的变量窗口:引用 + 可选各维长度。
     fn decl_target(
-        &self,
+        &mut self,
         st: &ExecState,
         w: &CmdWindow,
     ) -> Result<Vec<i64>, VmError> {
         // 单条变量指令 = 标量;含 `0x29` = 数组(前导值 = 各维长度)。
         let lv = self.eval_lvalue(st, &w.payload)?;
-        Ok(lv.indices)
+        Ok(lv.indices.into_vec())
     }
 
     /// `VARINFO`:手册 `variable/varinfo.html`;引擎 §3.21。
@@ -1136,7 +1136,7 @@ impl Vm {
                 let idx: Vec<i64> = if set.indices.is_empty() {
                     vec![0; shape.1.len()]
                 } else {
-                    set.indices.clone()
+                    set.indices.to_vec()
                 };
                 let v = self.read_var(st, set_var, &idx)?;
                 match v {
@@ -1254,7 +1254,7 @@ impl Vm {
         let set_missing = set.is_none();
         let set = set.unwrap_or(crate::expr::LValue {
             var: VarRef::new(VarSpace::At, 0),
-            indices: Vec::new(),
+            indices: smallvec::SmallVec::new(),
         });
         let set_var = set.var;
         // `SET` 为系统变量是合法用法:ERIS `stdlib/ystdlib.yst` 的

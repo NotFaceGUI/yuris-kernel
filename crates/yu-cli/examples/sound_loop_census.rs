@@ -8,8 +8,7 @@
 //!   cargo run -p yu-cli --example sound_loop_census -- 6000
 //! ```
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use yu_cli::project::Project;
 use yu_log::Diag;
@@ -51,7 +50,7 @@ fn main() {
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(src, Some(aux), cfg).expect("boot");
-    let sound = Rc::new(RefCell::new(SoundState::new(Box::new(Loader(
+    let sound = Arc::new(Mutex::new(SoundState::new(Box::new(Loader(
         project.open_source().expect("sound source"),
     )))));
     let yscm = vm.tables().boot.yscm.clone();
@@ -64,7 +63,7 @@ fn main() {
         vm.tick_at(now, &timeline);
         if now.saturating_sub(last_log) >= 5000 {
             last_log = now;
-            let s = sound.borrow();
+            let s = sound.lock().unwrap();
             if let Some(l) = s.layer(b"BGM/B1") {
                 println!(
                     "t={}ms state={:?} time={} total={} loop={} count={}",
@@ -79,7 +78,7 @@ fn main() {
         }
     }
     {
-        let s = sound.borrow();
+        let s = sound.lock().unwrap();
         if let Some(l) = s.layer(b"BGM/B1") {
             println!(
                 "FINAL t={}ms state={:?} time={} total={} loop={} count={}",
@@ -94,7 +93,7 @@ fn main() {
             println!("BGM/B1 layer not found");
         }
     }
-    let d = sound.borrow_mut().take_diags();
+    let d = sound.lock().unwrap().take_diags();
     println!("snd_diags={}", d.len());
     for x in d.iter().take(10) {
         println!("diag {} {}", x.code, x.detail);

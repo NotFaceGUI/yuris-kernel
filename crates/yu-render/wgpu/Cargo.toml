@@ -8,16 +8,16 @@ license.workspace = true
 bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "0.4"
 wgpu = "30.0.1"
-yu-backend-soft = { path = "../yu-backend-soft" }
-yu-gfx = { path = "../yu-gfx" }
-yu-log = { path = "../yu-log" }
+yu-backend-soft = { path = "../soft" }
+yu-gfx = { path = "../../yu-gfx" }
+yu-log = { path = "../../yu-log" }
 
 [dev-dependencies]
 sha2 = "0.10"
 image = { version = "0.25", default-features = false, features = ["png"] }
-yu-format = { path = "../yu-format" }
-yu-rt = { path = "../yu-rt" }
-yu-vfs = { path = "../yu-vfs" }
+yu-format = { path = "../../yu-format" }
+yu-rt = { path = "../../yu-rt" }
+yu-vfs = { path = "../../yu-vfs" }
 
 [[example]]
 name = "wgpu_first_frame"

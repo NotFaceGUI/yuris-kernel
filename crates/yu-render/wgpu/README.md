@@ -13,8 +13,8 @@
 
 ```toml
 [dependencies]
-yu-backend-wgpu = { path = "../yu-backend-wgpu" }
-yu-backend-soft = { path = "../yu-backend-soft" }
+yu-backend-wgpu = { path = "crates/yu-render/wgpu" }
+yu-backend-soft = { path = "crates/yu-render/soft" }
 yu-gfx = { path = "../yu-gfx" }
 yu-vfs = { path = "../yu-vfs" }
 ```
@@ -222,10 +222,10 @@ $ cargo test -p yu-backend-soft
 $ cargo clippy -p yu-backend-wgpu --all-targets
 yu-backend-wgpu 自身 0 告警(输出中的 warning 来自依赖 yu-rt)
 
-$ grep -rn "println!\|eprintln!\|dbg!" crates/yu-backend-wgpu/src
+$ grep -rn "println!\|eprintln!\|dbg!" crates/yu-render/wgpu/src
 0
 
-$ grep -rn "kotoneiro\|AnimalTrail\|C:\\\\Users\|D:\\\\Art" crates/yu-backend-wgpu/src
+$ grep -rn "kotoneiro\|AnimalTrail\|C:\\\\Users\|D:\\\\Art" crates/yu-render/wgpu/src
 0
 
 $ cargo check -p yu-backend-wgpu --target wasm32-unknown-unknown --lib

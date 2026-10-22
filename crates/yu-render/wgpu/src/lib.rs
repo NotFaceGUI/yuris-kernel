@@ -192,6 +192,12 @@ impl WgpuRenderer {
         &self.ctx.adapter_info
     }
 
+    /// 底层 GPU 上下文。宿主窗口/上屏层必须复用同一个 instance/device/queue,
+    /// 否则纹理不能跨设备共享。
+    pub fn gpu(&self) -> &GpuContext {
+        &self.ctx
+    }
+
     pub fn backend(&self) -> &'static str {
         backend_name(self.ctx.backend)
     }

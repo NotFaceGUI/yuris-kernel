@@ -4474,3 +4474,59 @@ $ cargo run --bin psb-render -- <psb> --key 0x175058c9 --time 0 --out out.png
 - stencil/alpha-mask/pixelate 合成;wgpu 管线与 shader 变体选择;
 - 物理控制器、差分淡入曲线、官方帧率;
 - M4 官方像素对拍;kernel 适配层接线。
+
+## 成果 E1-M2 续 2 (2026-10-22) · 绘制顺序/参数表/composite mask + 实机 demo
+
+> 接续 E1-M2 续。修复“脸被头发盖住”的根因,打通变量表情,并用真实游戏
+> `emote_test.psb` 生成可交互演示页。
+
+### 1. 根因与修复
+
+- **绘制顺序不是 priority**:native 先按 `priority` 发射 DrawFrameInfo,再按
+  解析 Z(`DFI+36 = LayerInfo+620`)升序排序。样本 Z:後髪 -10、胴体 0、
+  輪郭 3、前髪 4、瞳 5..6;只按 priority 会把後髪放在脸前。`priority` 现仅
+  作同 Z tie-break。
+- **motion 级 parameter 表**:`parameterize` 索引所属 motion 的 `parameter`
+  数组,不是根表;`Motion` 现保存 `parameters` + motion 级 `parameterize`。
+  眼睛/嘴/眉/泪/頬 motion 由 `face_eye_open`/`face_talk`/`face_eyebrow`/
+  `face_tears`/`face_cheek` 驱动;默认变量值 0 再经 range→division 映射。
+- **type-0 保持**回退到同 frameList 最近一个有 content 的关键帧(嵌套眼部
+  motion 在 type-0 间隙后仍可见)。
+- **corner color = 0xRRGGBBAA**(低字节 alpha);眼皮 `0x000000FF` 是
+  不透明黑。
+- **composite alpha mask**:type-12 + `stencilType & 4` +
+  `stencilCompositeMaskLayerList` 的 owner,其子孙按同 scope source 图层
+  的 alpha 并集裁剪;opacity 0 的 `add_mask` 不参与。CPU coverage buffer 已
+  实现。
+- **blank proxy 不再画白色**:`src=="blank"` 的 115 个 deformer/mask 节点
+  只参与结构,不产生彩色 draw item。
+
+### 2. 验证
+
+```text
+$ cargo test
+  lib 16 + pose 6 + sample 1 + schema 5 + roundtrip 2 + yuris 5 + doc 1 全绿
+$ cargo clippy --all-targets   # 0 warnings
+$ cargo fmt --check            # clean
+$ psb-render … --time 0
+  items=30 triangles=3960 mask_sources=2 bbox=(95,20,704,1059)
+  输出完整角色,脸/眼/眉/嘴/发层级正确
+$ psb-render … --var face_mouth=30 --var face_eyebrow=40 --var face_eye_open=20
+  笑顔;--var face_eye_open=10 半目;--var face_tears=2 泪;均逐像素变化
+```
+
+### 3. 实机 demo
+
+- `yu-emote/demo/make_demo.py` 用 CPU 渲染 11 个姿态/表情,裁剪并内嵌为
+  单文件 `target/emote-demo/index.html`(约 1.9 MB,含真实 PSB 渲染帧);
+- 页面含表情按钮、←/→ 键切换、draw item/三角形/atlas/mask 统计与来源说明;
+- 已在本地 IAB 打开验证:页面加载、按钮切换、图像与统计均正常。
+
+### 4. 仍挂账
+
+- 参数化 deformer mesh 对子层的继承(`head_UD/head_LR` 的网格变形);
+- pixelate、wgpu 管线、shader 变体选择;
+- 物理控制器、差分淡入曲线、官方帧率;
+- M4 官方像素对拍(oracle 宿主已能 CreatePlayer/Update/Render,但 draw
+  list 仍为空;YSEmote 导出是 stdcall,已修正 oracle 的调用约定);
+- 内核适配层接线。

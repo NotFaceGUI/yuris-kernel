@@ -53,11 +53,15 @@ DIFFUSE 已按 A 灰度定案；MIP/各向异性、组 RT 子组 alpha、文本�
 | `yu-gfx` | 渲染语义层：`CompositorFrame`、图层 / 组 / 窗口 / 过渡 / 文本模型、GfxHost 查询 |
 | `yu-sound` | 声音域宿主：`SOUND/INFO/END` 层状态机、OGG/WAVE 解码、headless 确定性混音；`SoundHost` 查询 |
 | `yu-font` | 字体发现 / 加载、字形栅格化、完整文本样式；不含换行 / 对齐 |
-| `yu-backend-soft` | `CompositorFrame` 的确定性软件参考后端：纹理管线 + RGBA8 合成 + PNG |
-| `yu-backend-wgpu` | `CompositorFrame` 的 wgpu 主后端：`Rgba8Unorm` 离屏合成 + 读回；纹理/管线/bind group 缓存 |
+| `yu-render/soft` · `yu-backend-soft` | `CompositorFrame` 的确定性软件参考后端：纹理管线 + RGBA8 合成 + PNG |
+| `yu-render/wgpu` · `yu-backend-wgpu` | `CompositorFrame` 的 wgpu 主后端：`Rgba8Unorm` 离屏合成 + 读回；纹理/管线/bind group 缓存 |
 | `yu-cli` | 原生引擎宿主 + 本地 HTTP/WS 服务 + HMR 监督 + 用例执行器（`run`/`serve`/`dev`/`case`/`bench`） |
-| `yu-host-wasm` | 浏览器**呈现端**（wasm-bindgen）：WebGPU shim 优先，Canvas2D 回退；不读游戏数据 |
+| `yu-platform/host-desktop` · `yu-host-desktop` | Windows 原生窗口宿主：winit 0.30 + wgpu 30 上屏 + egui 调试面板；复用 `yu-cli::Engine`，不复制引擎语义 |
+| `yu-platform/host-wasm` · `yu-host-wasm` | 浏览器**呈现端**（wasm-bindgen）：WebGPU shim 优先，Canvas2D 回退；不读游戏数据 |
 | `yu-trace` | 边界录制 / 回放 / diff；schema v3（producer-neutral、frame_description） |
+
+> **目录分层**：`crates/yu-render/` 放渲染后端（soft/wgpu），`crates/yu-platform/` 放宿主
+> （desktop/wasm）；其余 crate 直接在 `crates/` 下。**包名不变**，`cargo -p` 命令不用改。
 
 ### 模块进度（2026-10-21）
 
@@ -73,6 +77,7 @@ DIFFUSE 已按 A 灰度定案；MIP/各向异性、组 RT 子组 alpha、文本�
 | `yu-backend-wgpu` | 固定管线 title 完成 | 离屏 RGBA8 + 读回；MODE 0..9 可执行；psC/psD 转场独立 WGSL（`dx_mode` 为内核 A/B 契约，非引擎开关）；MODE 4/8/10..18 仍 Unimplemented |
 | `yu-trace` | 完成（schema v3） | vfs/vm/frame 边界、回放、diff；官方 L1 已打通；DIV-L-002 open、官方 args 不可观测 |
 | `yu-cli` / `yu-host-wasm` | 进行中（K2） | 桌面 / wasm 宿主、HMR、用例；Android 未开始 |
+| `yu-host-desktop` | 完成（Windows 首版） | winit + wgpu 上屏；4:3 letterbox + 光标换算；egui 调试面板（F1）；音频回调拉取 |
 | `yu-sound` | 完成（N） | 层状态机 / 循环 / 淡变 / PAN / PITCH / OGG+WAVE；负 START 延迟、ACM WAVE、DATALEFT/RIGHT 挂账（DIV-SND-002/004） |
 | `yu-save` | 未开始 | 存档 |
 | scenario 解释器 | 未开始 | 顺序脚本 / 分支 |
@@ -95,7 +100,7 @@ yu-vfs → yu-format → yu-rt
              │                       │
              └───────────┬───────────┘
                          ▼
-              hosts：桌面 / wasm（K2 进行中）；Android 未开始
+     hosts：yu-platform/host-desktop（Windows）/ yu-platform/host-wasm（浏览器）；Android 未开始
 ```
 
 ## 快速开始
@@ -128,6 +133,10 @@ cargo build -p yu-cli --release
 
 # 开发热重启（改 Rust 自动重建/重启，浏览器 WebSocket 自动重连）
 ./target/release/yu-cli dev "<project-eris>" --backend wgpu --port 4173
+
+# Windows 原生窗口（winit + wgpu 上屏 + egui 调试面板）
+cargo build --release -p yu-host-desktop
+target/release/yu-desktop.exe "<project-eris>" --backend wgpu --debug-ui
 ```
 
 本机沙箱、样本路径与占位符约定见 `AGENTS.md`（本机文件，不入库）。

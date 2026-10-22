@@ -91,7 +91,7 @@ fn mix_layer(layer: &Layer, out: &mut [f32], frames: usize, out_rate: u32, chann
     }
     let end_ms = layer.end_ms().max(0) as f64;
     let restart_ms = layer.restart_ms().max(0) as f64;
-    let mut pos_ms = layer.position_ms() as f64;
+    let mut pos_ms = layer.playhead_ms();
     let step_ms = 1000.0 / out_rate as f64;
 
     for f in 0..frames {

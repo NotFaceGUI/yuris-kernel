@@ -11,8 +11,7 @@
 //! 只拉取 [`yu_rt::Vm::take_events`],不在 `yu-rt` 内写任何 trace 代码。
 //! 事件按 `take_events` 返回顺序入流,`seq` 是唯一序。
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use yu_rt::event::{Domain, JumpKind, VmEvent};
 
@@ -22,12 +21,13 @@ use crate::record::{
     ProducerInfo, TraceArg, TraceLog, TraceValue,
 };
 
-/// 共享日志句柄(单线程;`Vm` 本身也不跨线程)。
-pub type SharedLog = Rc<RefCell<TraceLog>>;
+/// 共享日志句柄。`DataSource: Send`(音频线程需要),录制源也必须可跨线程
+/// 传递;内部用 Mutex 保护日志。
+pub type SharedLog = Arc<Mutex<TraceLog>>;
 
 /// 新建共享日志。
 pub fn shared_log() -> SharedLog {
-    Rc::new(RefCell::new(TraceLog::new()))
+    Arc::new(Mutex::new(TraceLog::new()))
 }
 
 /// 从 [`yu_rt::BootConfig`] 与 [`yu_rt::Vm`] 构造头部。
@@ -115,23 +115,23 @@ impl EventRecorder {
     /// 新建日志并写入头部。
     pub fn with_header(header: HeaderPayload) -> Self {
         let log = shared_log();
-        log.borrow_mut().push_header(header);
+        log.lock().unwrap().push_header(header);
         Self { log }
     }
 
     pub fn shared(&self) -> SharedLog {
-        Rc::clone(&self.log)
+        Arc::clone(&self.log)
     }
 
     /// 记录一条事件;返回分配到的 `seq`。
     pub fn record(&self, event: &VmEvent) -> u64 {
         let (frame, payload) = map_event(event);
-        self.log.borrow_mut().push(frame, payload)
+        self.log.lock().unwrap().push(frame, payload)
     }
 
     /// 记录一条帧描述;校验失败原样返回 `trace.*`(不写半条记录)。
     pub fn record_frame(&self, input: FrameDescriptionInput) -> Result<u64, yu_log::Diag> {
-        self.log.borrow_mut().push_frame_input(input)
+        self.log.lock().unwrap().push_frame_input(input)
     }
 
     /// 按给定顺序记录一批事件;返回新增条数。
@@ -152,11 +152,11 @@ impl EventRecorder {
 
     /// 当前日志快照(克隆)。
     pub fn snapshot(&self) -> TraceLog {
-        self.log.borrow().clone()
+        self.log.lock().unwrap().clone()
     }
 
     pub fn shared_log(&self) -> SharedLog {
-        Rc::clone(&self.log)
+        Arc::clone(&self.log)
     }
 }
 

@@ -24,6 +24,7 @@
 //! `<repo-old>/crates/yuris-vm/src/driver.rs` 的 `swap_exec`),不影响可观测语义。
 
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use yu_log::{Boundary, Diag, LogSink, MemorySink};
 
@@ -299,12 +300,15 @@ pub struct Vm {
     record_events: bool,
     /// opcode → 处理器类别表(启动期按工程 yscm 名字解析)。
     handler_of: Vec<crate::vm::handlers::HandlerKind>,
-    /// 命令视图复用缓冲(热路径零分配;见 `fill_cmd`)。
-    cmd_scratch: Cmd,
+    /// 命令视图缓存:键 = `(script_id, pc)`。脚本装载后命令字节不变,
+    /// 每条命令的窗口载荷只在首次执行时复制一次(Tyn 同思路优化)。
+    cmd_cache: rustc_hash::FxHashMap<(u32, u32), Rc<Cmd>>,
     /// 表达式求值复用栈(热路径零分配)。
     eval_scratch: Vec<crate::expr::Slot>,
-    /// 表达式解码复用缓冲(热路径零分配)。
-    decode_scratch: Vec<crate::expr::RawInstr>,
+    /// 命令窗口解码缓存(键 = FNV-1a(payload);碰撞用原始字节二次比较)。
+    /// 脚本装载后窗口字节不变,缓存跨帧有效。
+    decode_cache: rustc_hash::FxHashMap<u64, Vec<DecodedWindow>>,
+    decode_cache_entries: usize,
     texts: BTreeMap<String, Vec<u8>>,
     /// 显示文本层状态(`$_TEXT`/`$_TEXT_FLAG`/`TEXTINFO` 的数据源;
     /// 引擎 `[0x801800]` 的已取证字段,见 [`crate::text`])。
@@ -340,6 +344,23 @@ pub struct Vm {
     task_view: Vec<TaskView>,
     /// 资产像素尺寸缓存(键 = `CG[FILE]`;`None` = 探测失败也缓存)。
     asset_size_cache: BTreeMap<Vec<u8>, Option<(u32, u32)>>,
+}
+
+/// 一个已解码的命令窗口(表达式解码缓存的值)。
+struct DecodedWindow {
+    payload: Vec<u8>,
+    instrs: Rc<[crate::expr::RawInstr]>,
+}
+
+fn window_hash(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    h ^= bytes.len() as u64;
+    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 impl Vm {
@@ -443,9 +464,10 @@ impl Vm {
             dx_mode: cfg.dx_mode,
             record_events: cfg.record_events,
             handler_of,
-            cmd_scratch: Cmd::default(),
+            cmd_cache: rustc_hash::FxHashMap::default(),
             eval_scratch: Vec::new(),
-            decode_scratch: Vec::new(),
+            decode_cache: rustc_hash::FxHashMap::default(),
+            decode_cache_entries: 0,
             texts: BTreeMap::new(),
             text: crate::text::TextState::default(),
             text_layer_id: String::new(),
@@ -831,6 +853,27 @@ impl Vm {
         &self.command_hits
     }
 
+    /// 按执行次数排序的命令名(启动/卡顿诊断用)。
+    pub fn top_commands(&self, limit: usize) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = self
+            .command_hits
+            .iter()
+            .enumerate()
+            .filter(|(_, hits)| **hits > 0)
+            .map(|(index, hits)| {
+                let name = u8::try_from(index)
+                    .ok()
+                    .and_then(|index| self.tables.boot.yscm.command(index))
+                    .map(|decl| decl.name.clone())
+                    .unwrap_or_else(|| format!("#{index}"));
+                (name, *hits)
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out.truncate(limit);
+        out
+    }
+
     /// opcode 对应的处理器类别(启动期按工程 `ysc.ybn` 解析;覆盖普查
     /// 用它区分「已实现 / 域事件 / 无处理器」,不靠名字猜测)。
     pub fn handler_kind(&self, opcode: u8) -> Option<HandlerKind> {
@@ -1094,27 +1137,57 @@ impl Vm {
             .map(|(ty, dims)| (ty, dims.to_vec()))
     }
 
+    /// 解码一个命令窗口;同一窗口字节只解码一次。
+    ///
+    /// 这是 Tyn `decode_cached_slot` 的同思路优化:脚本装载后窗口字节不变,
+    /// 启动链/标题热路径每帧成千上万次求值命中缓存后不再分配/解码。
+    fn decoded_window(&mut self, payload: &[u8]) -> Result<Rc<[crate::expr::RawInstr]>, Diag> {
+        let key = window_hash(payload);
+        if let Some(bucket) = self.decode_cache.get(&key) {
+            if let Some(hit) = bucket.iter().find(|entry| entry.payload == payload) {
+                return Ok(Rc::clone(&hit.instrs));
+            }
+        }
+        let decoded: Rc<[crate::expr::RawInstr]> = crate::expr::decode(payload)?.into();
+        if self.decode_cache_entries >= 200_000 {
+            self.decode_cache.clear();
+            self.decode_cache_entries = 0;
+        }
+        self.decode_cache
+            .entry(key)
+            .or_default()
+            .push(DecodedWindow {
+                payload: payload.to_vec(),
+                instrs: Rc::clone(&decoded),
+            });
+        self.decode_cache_entries += 1;
+        Ok(decoded)
+    }
+
     pub(crate) fn eval_value(
         &mut self,
         st: &ExecState,
         payload: &[u8],
     ) -> Result<Value, Diag> {
+        let instrs = self.decoded_window(payload)?;
         let mut stack = std::mem::take(&mut self.eval_scratch);
-        let mut instrs = std::mem::take(&mut self.decode_scratch);
         let mut access = VmAccess { vm: self, st };
-        let r = Evaluator::new(&mut access).eval_value_pooled(payload, &mut stack, &mut instrs);
-        self.decode_scratch = instrs;
+        let r = Evaluator::new(&mut access).eval_value_instrs(&instrs, &mut stack);
         self.eval_scratch = stack;
         r
     }
 
     pub(crate) fn eval_lvalue(
-        &self,
+        &mut self,
         st: &ExecState,
         payload: &[u8],
     ) -> Result<LValue, Diag> {
+        let instrs = self.decoded_window(payload)?;
+        let mut stack = std::mem::take(&mut self.eval_scratch);
         let mut access = VmAccess { vm: self, st };
-        Evaluator::new(&mut access).eval_lvalue(payload)
+        let r = Evaluator::new(&mut access).eval_lvalue_instrs_with(&instrs, &mut stack);
+        self.eval_scratch = stack;
+        r
     }
 
     /// 参数声明名(工程 ysc;`None` = 该序号未声明)。
@@ -1309,16 +1382,11 @@ impl Vm {
         task: &mut TaskNode,
     ) -> Result<StepOutcome, VmError> {
         // pc 越界 = 脚本尾(引擎:任务体走完)。
-        let mut cmd = std::mem::take(&mut self.cmd_scratch);
-        let filled = self.fill_cmd(st, &mut cmd);
-        match filled {
-            Ok(()) => {}
-            Err(d) => {
-                self.cmd_scratch = cmd;
-                return Err(d.into());
-            }
-        }
-        // 诊断定位:记住「当前正在执行的命令」(R11)。复用缓冲,零分配。
+        let cmd = match self.cached_cmd(st) {
+            Ok(cmd) => cmd,
+            Err(d) => return Err(d.into()),
+        };
+        // 诊断定位:记住「当前正在执行的命令」(R11)。
         self.cur_script = st.script_id;
         self.cur_pc = cmd.pc;
         self.cur_cmd.clear();
@@ -1327,9 +1395,21 @@ impl Vm {
         self.cur_task.push_str(&task.id);
         // 取指后先自增(引擎 §3.2b:先取后加;处理体写 pc 即跳转)。
         st.pc = st.pc.wrapping_add(1);
-        let outcome = self.dispatch(st, task, &cmd);
-        self.cmd_scratch = cmd;
-        outcome
+        self.dispatch(st, task, &cmd)
+    }
+
+    /// 取一条命令的缓存视图。脚本装载后 `(script_id, pc)` 的命令字节不变,
+    /// 窗口载荷只复制一次;之后每次执行只做一次 `Rc` 克隆。
+    fn cached_cmd(&mut self, st: &ExecState) -> Result<Rc<Cmd>, Diag> {
+        let key = (st.script_id, st.pc);
+        if let Some(hit) = self.cmd_cache.get(&key) {
+            return Ok(Rc::clone(hit));
+        }
+        let mut cmd = Cmd::default();
+        self.fill_cmd(st, &mut cmd)?;
+        let cmd = Rc::new(cmd);
+        self.cmd_cache.insert(key, Rc::clone(&cmd));
+        Ok(cmd)
     }
 }
 

@@ -58,7 +58,7 @@ pub struct Entry {
 ///
 /// 各实现只做**精确匹配**: 输入必须是 [`LookupKey`]。归一在边界之外完成,
 /// 避免同一路径在不同层被重复解释。
-pub trait DataSource {
+pub trait DataSource: Send {
     /// 按归一键读取完整字节。
     fn open(&self, path: &LookupKey) -> Result<Vec<u8>, Diag>;
 

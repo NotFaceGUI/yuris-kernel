@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rustc-hash = "2"
+smallvec = "1"
 yu-log = { path = "../yu-log" }
 yu-vfs = { path = "../yu-vfs" }
 yu-format = { path = "../yu-format" }

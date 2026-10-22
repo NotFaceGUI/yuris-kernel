@@ -130,6 +130,9 @@ pub struct Layer {
     volume_target: i64,
     pcm: Option<Pcm>,
     position_ms: i64,
+    /// 块间连续播放头(毫秒,浮点)。`position_ms` 是它的整数投影。
+    /// 旧实现每个音频块都从整数毫秒重开,块边界最多 1ms 相位跳变。
+    playhead_ms: f64,
     total_ms: i64,
     fade: Fade,
     /// 负 START/RESTART 的延迟剩余（0 = 无延迟）。
@@ -159,6 +162,7 @@ impl Layer {
             volume_target: 256,
             pcm: None,
             position_ms: 0,
+            playhead_ms: 0.0,
             total_ms: 0,
             fade: Fade::none(),
             delay_ms: 0,
@@ -182,6 +186,16 @@ impl Layer {
 
     pub fn position_ms(&self) -> i64 {
         self.position_ms
+    }
+
+    /// 块间连续播放头(毫秒,浮点);混音从它开始,不再每块取整。
+    pub(crate) fn playhead_ms(&self) -> f64 {
+        self.playhead_ms
+    }
+
+    fn set_position(&mut self, ms: i64) {
+        self.position_ms = ms;
+        self.playhead_ms = ms as f64;
     }
 
     pub fn total_ms(&self) -> i64 {
@@ -354,6 +368,8 @@ pub struct SoundState {
     layers: BTreeMap<Vec<u8>, Layer>,
     loader: Box<dyn SoundLoader>,
     clock_ms: i64,
+    /// 设备回调驱动位置时,`advance(now_ms)` 只更新时钟,不推进层。
+    external_clock: bool,
     diags: Vec<Diag>,
     frame: u64,
 }
@@ -366,6 +382,7 @@ impl SoundState {
             layers: BTreeMap::new(),
             loader,
             clock_ms: 0,
+            external_clock: false,
             diags: Vec::new(),
             frame: 0,
         }
@@ -456,7 +473,44 @@ impl SoundState {
         }
         let delta = now - self.clock_ms;
         self.clock_ms = now;
+        if self.external_clock {
+            return;
+        }
         self.advance_delta(delta);
+    }
+
+    /// 设备回调/环形缓冲用:按实际渲染的输出帧数推进播放头。
+    ///
+    /// 与 [`SoundState::advance_delta`] 同一套换行/淡变规则,但时间单位是
+    /// 输出帧而不是整数毫秒 —— 块边界不丢相位,长期不漂移。
+    pub fn advance_samples(&mut self, frames: usize, out_rate: u32) {
+        if frames == 0 || out_rate == 0 {
+            return;
+        }
+        let delta_ms = frames as f64 * 1000.0 / f64::from(out_rate);
+        for layer in self.layers.values_mut() {
+            advance_layer(layer, delta_ms);
+        }
+    }
+
+    /// 设备回调入口:渲染一个输出块,并按**实际帧数**推进播放头。
+    ///
+    /// 这是音频线程唯一的写入口;渲染与推进在同一把锁内完成,
+    /// 不会出现“块渲染了但位置没走/位置走了但块没渲染”的漂移。
+    pub fn render_and_advance(&mut self, out: &mut [f32], out_rate: u32, channels: usize) {
+        self.render(out, out_rate, channels);
+        if channels > 0 {
+            self.advance_samples(out.len() / channels, out_rate);
+        }
+    }
+
+    /// 切换为外部时钟(设备回调驱动位置);`advance(now_ms)` 只更新时钟。
+    pub fn set_external_clock(&mut self, on: bool) {
+        self.external_clock = on;
+    }
+
+    pub fn external_clock(&self) -> bool {
+        self.external_clock
     }
 
     /// 按毫秒差值推进（单测/离线回放；与 [`SoundState::advance`] 同语义）。
@@ -470,7 +524,7 @@ impl SoundState {
             return;
         }
         for layer in self.layers.values_mut() {
-            advance_layer(layer, delta);
+            advance_layer(layer, delta as f64);
         }
     }
 
@@ -678,7 +732,7 @@ impl SoundState {
             Ok(pcm) => {
                 layer.total_ms = pcm.total_ms();
                 layer.end_ms = layer.total_ms;
-                layer.position_ms = 0;
+                layer.set_position(0);
                 layer.state = PlayState::Loaded;
                 layer.meta = Some(SoundMeta::from_pcm(&pcm));
                 layer.pcm = Some(pcm);
@@ -688,7 +742,7 @@ impl SoundState {
                 // `+0x105/+0x107/+0x120`，元数据与 TOTALTIME 保留旧值。
                 layer.pcm = None;
                 layer.end_ms = 0;
-                layer.position_ms = 0;
+                layer.set_position(0);
                 layer.state = PlayState::Stopped;
                 self.report(d);
             }
@@ -810,7 +864,7 @@ fn reset_for_load(layer: &mut Layer) {
     layer.start_ms = 0;
     layer.restart_ms = 0;
     layer.end_ms = 0;
-    layer.position_ms = 0;
+    layer.set_position(0);
     layer.delay_ms = 0;
     layer.fade = Fade::none();
 }
@@ -827,7 +881,7 @@ fn start_play(layer: &mut Layer, fade_ms: i64) {
             if layer.end_ms <= layer.start_ms {
                 layer.start_ms = 0;
             }
-            layer.position_ms = layer.start_ms.max(0).min(layer.total_ms.max(0));
+            layer.set_position(layer.start_ms.max(0).min(layer.total_ms.max(0)));
             // type 2 不写 `+0x110`（LOOPCOUNT 只由循环边界 0x464960 清零）。
             layer.state = PlayState::Playing;
             if fade_ms > 0 {
@@ -888,13 +942,13 @@ fn stop_play(layer: &mut Layer, fade_ms: i64) {
     }
 }
 
-fn advance_layer(layer: &mut Layer, delta_ms: i64) {
+fn advance_layer(layer: &mut Layer, delta_ms: f64) {
     if !layer.state.audible() || layer.paused {
         return;
     }
     // 淡变（引擎 FUN_00423718：线性、单位 ms、固定点 1/1024）。
     if layer.fade.active {
-        layer.fade.start_ms += delta_ms;
+        layer.fade.start_ms += delta_ms.round() as i64;
         if layer.fade.start_ms >= layer.fade.duration_ms {
             layer.volume_current = layer.fade.to;
             layer.fade.active = false;
@@ -915,24 +969,24 @@ fn advance_layer(layer: &mut Layer, delta_ms: i64) {
 
     // 位置推进：PITCH 512=1.5x / 0=0.5x（REA 0x423614）。
     if layer.delay_ms > 0 {
-        let step = delta_ms.min(layer.delay_ms);
+        let step = delta_ms.min(layer.delay_ms as f64).round() as i64;
         layer.delay_ms -= step;
         return;
     }
     // 引擎 SetFrequency：base*(pitch+256)/512（0→0.5x, 256→1x, 512→1.5x）。
     let speed = layer.pitch.clamp(0, 512);
-    let advance = div_round(delta_ms * (speed + 256), 512);
-    layer.position_ms = layer.position_ms.saturating_add(advance);
+    let advance = delta_ms * (speed + 256) as f64 / 512.0;
+    layer.playhead_ms += advance;
+    layer.position_ms = layer.playhead_ms.round() as i64;
 
-    // END 边界：每次时钟推进检查一次（引擎在每个音频缓冲回调里检查一次，
-    // 不是无限 while；跨边界的余量不携带，直接置 RESTART）。
+    // END 边界：每个音频块检查一次（与引擎的回调检查同频）。
     if layer.position_ms >= layer.end_ms {
         let next = layer.loop_count.saturating_add(1);
         // 引擎是 `count+1 == LOOP`，不是 `>=`（REA 0x464960）。
         if layer.loop_setting != 0 && next == layer.loop_setting {
             layer.loop_setting = 0;
             layer.loop_count = 0;
-            layer.position_ms = 0;
+            layer.set_position(0);
             // 0x464960 在这条分支调用 FUN_00423940：释放缓冲并清
             // START(+0x128)/RESTART(+0x12c)。
             layer.start_ms = 0;
@@ -940,7 +994,7 @@ fn advance_layer(layer: &mut Layer, delta_ms: i64) {
             layer.state = PlayState::Stopped;
         } else {
             layer.loop_count = next;
-            layer.position_ms = layer.restart_ms;
+            layer.set_position(layer.restart_ms);
         }
     }
 }

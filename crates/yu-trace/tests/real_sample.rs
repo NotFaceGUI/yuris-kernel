@@ -88,7 +88,7 @@ fn official_data_ypf_smoke() {
 
     let log = traced.recorder().shared_log();
     {
-        let records = log.borrow();
+        let records = log.lock().unwrap();
         assert_eq!(records.len(), 1, "one call = one record");
         match records.records()[0].payload() {
             Payload::VfsOpen {
@@ -100,7 +100,7 @@ fn official_data_ypf_smoke() {
             } => {
                 assert_eq!(source, "ypf");
                 assert_eq!(key.as_slice(), b"ysbin/ysc.ybn");
-                assert_eq!(*bytes, Some(expected.len() as u64));
+                assert_eq!(bytes, &Some(expected.len() as u64));
                 assert_eq!(
                     sha256.as_deref(),
                     Some(yu_trace::sha256_hex(&expected).as_str())

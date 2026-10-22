@@ -6,14 +6,14 @@ license.workspace = true
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }
-yu-gfx = { path = "../yu-gfx" }
-yu-log = { path = "../yu-log" }
-yu-vfs = { path = "../yu-vfs" }
+yu-gfx = { path = "../../yu-gfx" }
+yu-log = { path = "../../yu-log" }
+yu-vfs = { path = "../../yu-vfs" }
 
 [dev-dependencies]
 sha2 = "0.10"
-yu-format = { path = "../yu-format" }
-yu-rt = { path = "../yu-rt" }
+yu-format = { path = "../../yu-format" }
+yu-rt = { path = "../../yu-rt" }
 
 [lib]
 name = "yu_backend_soft"

@@ -6,6 +6,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use yu_backend_soft::{
@@ -207,7 +208,7 @@ pub struct Engine {
     vm: Option<Vm>,
     state: Option<Rc<RefCell<GfxState>>>,
     /// 声音域状态（与 `SoundHost` 共享；用于取走 `snd.*` 诊断）。
-    sound: Option<Rc<RefCell<SoundState>>>,
+    sound: Option<Arc<Mutex<SoundState>>>,
     /// 已从声音宿主取走的诊断（`take_sound_diags` 的暂存）。
     sound_diags: Vec<yu_log::Diag>,
     /// 设备输出（默认 `device` feature；`--no-default-features` 时无此字段）。
@@ -215,6 +216,9 @@ pub struct Engine {
     sound_sink: Option<sound_device::SoundSink>,
     /// 实时墙钟：`serve` 的 `tick_realtime` 用它推进逻辑/声音时间。
     realtime_last: Instant,
+    /// 单次 `tick_realtime` 允许推进的逻辑毫秒上限(默认 500)。
+    /// 桌面宿主降到 2 帧,避免长帧后一次性跑完整段脚本造成卡死。
+    max_step_ms: u32,
     realtime_us: u64,
     realtime_last_ms: u32,
     renderer: Renderer,
@@ -249,6 +253,10 @@ impl Engine {
         } else {
             None
         };
+        #[cfg(feature = "device")]
+        if let (Some(sink), Some(sound)) = (&sound_sink, &sound) {
+            sink.attach(Arc::clone(sound));
+        }
         let boot_ms = boot_started.elapsed().as_secs_f64() * 1000.0;
 
         let store = TextureStore::new(Box::new(project.mount()?), CODEC, probe_order.clone());
@@ -286,6 +294,7 @@ impl Engine {
             #[cfg(feature = "device")]
             sound_sink,
             realtime_last: Instant::now(),
+            max_step_ms: 500,
             realtime_us: 0,
             realtime_last_ms: 0,
             renderer,
@@ -315,6 +324,22 @@ impl Engine {
 
     pub fn backend(&self) -> &'static str {
         self.renderer.backend_name()
+    }
+
+    /// wgpu 渲染器(仅 `--backend wgpu`)。桌面宿主用它复用同一个
+    /// instance/device/queue 创建窗口 surface,避免第二个 GPU 设备。
+    pub fn wgpu_renderer(&self) -> Option<&WgpuRenderer> {
+        match &self.renderer {
+            Renderer::Wgpu { renderer, .. } => Some(renderer),
+            Renderer::Soft(_) => None,
+        }
+    }
+
+    pub fn wgpu_renderer_mut(&mut self) -> Option<&mut WgpuRenderer> {
+        match &mut self.renderer {
+            Renderer::Wgpu { renderer, .. } => Some(renderer),
+            Renderer::Soft(_) => None,
+        }
     }
 
     pub fn project(&self) -> &Project {
@@ -411,8 +436,9 @@ impl Engine {
         let now = Instant::now();
         let mut delta_us = now.duration_since(self.realtime_last).as_micros() as u64;
         self.realtime_last = now;
-        if delta_us > 500_000 {
-            delta_us = 500_000;
+        let max_us = u64::from(self.max_step_ms.max(1)) * 1000;
+        if delta_us > max_us {
+            delta_us = max_us;
         }
         self.realtime_us = self.realtime_us.saturating_add(delta_us);
         let now_ms = (self.realtime_us / 1000) as u32;
@@ -424,13 +450,19 @@ impl Engine {
     /// 暂停/无客户端时调用：丢弃暂停期间的真实时间，恢复时不快进。
     pub fn reset_realtime_clock(&mut self) {
         self.realtime_last = Instant::now();
-        #[cfg(feature = "device")]
-        if let Some(sink) = &self.sound_sink {
-            sink.prime();
-        }
     }
 
-    fn tick_inner(&mut self, now_ms: u32, audio_delta_ms: u32) -> CliResult<RenderedFrame> {
+    /// 设置单次实时 tick 的逻辑步进上限(毫秒)。默认 500;
+    /// 桌面宿主用 2 帧,避免长帧后一次性执行整段脚本。
+    pub fn set_max_step_ms(&mut self, ms: u32) {
+        self.max_step_ms = ms.max(1);
+    }
+
+    pub fn max_step_ms(&self) -> u32 {
+        self.max_step_ms
+    }
+
+    fn tick_inner(&mut self, now_ms: u32, _audio_delta_ms: u32) -> CliResult<RenderedFrame> {
         let vm = self
             .vm
             .as_mut()
@@ -438,15 +470,12 @@ impl Engine {
         let tick_started = Instant::now();
         vm.tick_at(now_ms, &self.timeline);
         if let Some(sound) = &self.sound {
-            let mut fresh = sound.borrow_mut().take_diags();
+            // 音频线程是时钟:这里只取诊断,不生产 PCM。
+            let mut fresh = sound.lock().unwrap().take_diags();
             self.sound_diags.append(&mut fresh);
             if self.sound_diags.len() > 8192 {
                 let drop = self.sound_diags.len() / 2;
                 self.sound_diags.drain(..drop);
-            }
-            #[cfg(feature = "device")]
-            if let Some(sink) = &self.sound_sink {
-                sink.pump(sound, audio_delta_ms);
             }
         }
         self.frame = self.frame.saturating_add(1);
@@ -533,15 +562,23 @@ impl Engine {
     pub fn sound_snapshot(&self) -> Vec<yu_sound::state::SoundSnapshot> {
         self.sound
             .as_ref()
-            .map(|state| state.borrow().snapshot())
+            .map(|state| state.lock().unwrap().snapshot())
             .unwrap_or_default()
     }
 
     /// 当前声音层数（测试/诊断用）。
+    /// 按执行次数排序的命令名(宿主诊断用)。
+    pub fn top_commands(&self, limit: usize) -> Vec<(String, u64)> {
+        self.vm
+            .as_ref()
+            .map(|vm| vm.top_commands(limit))
+            .unwrap_or_default()
+    }
+
     pub fn sound_layers(&self) -> usize {
         self.sound
             .as_ref()
-            .map(|state| state.borrow().layers_len())
+            .map(|state| state.lock().unwrap().layers_len())
             .unwrap_or(0)
     }
 
@@ -569,7 +606,7 @@ impl Engine {
         self.realtime_last_ms = 0;
         #[cfg(feature = "device")]
         if let Some(sink) = &self.sound_sink {
-            sink.clear();
+            sink.detach();
         }
         let started = Instant::now();
         let (vm, state, sound, viewport, _) = boot(&self.project, &self.opts)?;
@@ -577,6 +614,10 @@ impl Engine {
         self.vm = Some(vm);
         self.state = Some(state);
         self.sound = sound;
+        #[cfg(feature = "device")]
+        if let (Some(sink), Some(sound)) = (&self.sound_sink, &self.sound) {
+            sink.attach(Arc::clone(sound));
+        }
         self.viewport = viewport;
         self.renderer.reset();
         Ok(())
@@ -631,7 +672,7 @@ impl SoundLoader for VfsSoundLoader {
 type BootBundle = (
     Vm,
     Rc<RefCell<GfxState>>,
-    Option<Rc<RefCell<SoundState>>>,
+    Option<Arc<Mutex<SoundState>>>,
     Viewport,
     Vec<yu_gfx::ImageFormat>,
 );
@@ -676,7 +717,7 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         let loader = VfsSoundLoader {
             source: project.open_source()?,
         };
-        let sound_state = Rc::new(RefCell::new(SoundState::new(Box::new(loader))));
+        let sound_state = Arc::new(Mutex::new(SoundState::new(Box::new(loader))));
         let yscm = vm.tables().boot.yscm.clone();
         vm.set_sound_host(Box::new(SoundHost::new(sound_state.clone(), yscm)));
         Some(sound_state)
