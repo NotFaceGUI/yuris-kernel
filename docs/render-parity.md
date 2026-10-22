@@ -42,11 +42,11 @@
 | 4 | 纹理过滤 MAG/MIN/MIP | 无手册页;引擎设定工具写入 | ERIS `yscfg` 无过滤字段(全局设置) | `FUN_0043cd6c` 行 46-117:stage 0/1 各下发 `D3DSAMP_MAG/MIN/MIPFILTER`;值来自 `DAT_005b4804/4808/80131c`;0=POINT/1=LINEAR/2=ANISOTROPIC,MIP=-1=NONE | Confirmed 全局,非逐层;旧线“固定 Linear”❌ |
 | 5 | 变换 X/Y/FX… | `cg/cg.html` 只文档化 X/Y;`basic/layer.html` 无 FX 说明 | ERIS `es_Sprite.yst` `FX=@fx*100 ... FRZ=@frz FCX=@fcx`;`FBX=10000`/`FCX=5000` | `FUN_00414ba4` 行 117-125(+0x1b0/1b8/1c0/1c8/1d0/1d8 `/100`,+0x1f8/1fc/200 f32 `/100`)、220-275(16.16 `ROUND(v*65536)`)、322-336(旋转矩阵,`π/180` 常量 0x58ebf8);半像素 `-0.5` 常量 0x58ebd0 | X/Y Confirmed;FX 家族槽位→偏移 Unimplemented(DIV-GFX-003) |
 | 6 | 多部件层 / `FILE` 探测 / 1×1 黑 | `cg/cg.html`:「FILE="" で1x1サイズの黒画像生成」「拡張子…「.PNG」「.BMP」「.JPG」「.GIF」の順」 | ERIS 首屏 552 次 `FILE`(`FILE=""` 与 `cgsys/...` 资产);源 `CG[FILE=...]` | `FUN_0040c9b4`(`0x40c9b4`)按 `yscfg+0x1c` 码探测:`1→.png,2→.bmp,3→.jpg,4→.gif,5→.psb`;多部件 `+0xa6/+0xa7` 计数、`+0xb0/+0x130` 两表(`FUN_00414ba4` 155-156/200/219/985) | `FILE`/扩展名 Confirmed;多部件几何 Unimplemented(DIV-GFX-004) |
-| 7 | 组/离屏/COPY | `cg/cg.html`:「レイヤセット…レイヤ合成したもの」「COPY キーワード…複製（スクリーンショット機能）」;`basic/layer.html`:`CG[ID=ABC/ ...]`、`CGACT[COPY2=1 ID=:/W0/ ID2=TMP]` | ERIS 首屏 `CG[ID=":/W3/" SX=..]`、`CGACT[COPY2=1 ID=:/W0/ ID2=CGS100]` | `FUN_00413dc8` 行 34-36(递归)、51-102(调试 RT/`+0x61c`);`FUN_00462e40`(离屏创建族);`FUN_0043cd6c` 行 118-169(帧末读回) | 机制 Confirmed;离屏尺寸/清屏 Likely;COPY 时序 Unimplemented(DIV-GFX-007/008) |
+| 7 | 组/离屏/COPY | `cg/cg.html`:「レイヤセット…レイヤ合成したもの」「COPY キーワード…複製（スクリーンショット機能）」;`basic/layer.html`:`CG[ID=ABC/ ...]`、`CGACT[COPY2=1 ID=:/W0/ ID2=TMP]` | ERIS 首屏 `CG[ID=":/W3/" SX=..]`、`CGACT[COPY2=1 ID=:/W0/ ID2=CGS100]` | `FUN_00413dc8` 行 34-36(递归)、51-102(调试 RT/`+0x61c`);`FUN_00462e40`(离屏创建族);`FUN_0043cd6c` 行 118-169(帧末读回) | 机制 Confirmed;主组直绘已实现(DIV-GFX-008);COPY 时序/区域/冻结已实现(DIV-GFX-007);**首帧主组 COPY 无后缓冲源仍 open(DIV-GFX-051)** |
 | 8 | 过渡 T/TA/TID | `cg/cg.html`:「T=トランジション進行度」「TA=精度」「TID=トランジションレイヤID」 | ERIS 源 `T/TID/TA` 少量(首屏 0 次);`TID=""` 用于结束过渡(`es_Button.yst:4526/4540`、`es_Sprite.yst:4238`) | `FUN_00414ba4` 行 166-188(TA<1 门控)、881-971(`YS_Texture1/2`、`YS_FadeVal` 公式 905-909、`YS_FadeVal2`);`FUN_00413dc8` `0x413e7b`:TID 空串直接跳过配对查询,非空才 `FUN_004141e4`+`FUN_00414559` | 公式 Confirmed;**TID 空串=无配对 Confirmed**;推进者仍未定位(DIV-GFX-006) |
 | 9 | 文本 | `font/font.html`:NAME/NO/COLOR/COLOR2/SX/SY/BOLD/ANTIALIASING/DRAWMODE;`text/text.html`:ID/OUTPUTMODE/CLEAR/…;`font/fontinfo.html` | ERIS 首屏 `FONT` 3 次;`TEXT[OUTPUTMODE=0]`(`es_First.yst:22`)、`TEXT[CLEAR=1]`(`es_Text.yst:154`)、`FONT[NO/BNO]` | 文本为引擎内部绘制种类 98/100(旧线 03 §1,REA 复用绘制函数);`TextStyle` 现保存 NO/BNO,`TEXT[ID]` 进入后续 `VmEvent::Text.id`,`CLEAR` 清 VM 文本缓冲 | 属性模型 Confirmed;字形栅格化/定位 Unimplemented(DIV-GFX-012);非 UTF-8 TEXT ID 见 DIV-GFX-021 |
 | 10 | 颜色空间 | 无手册页 | 官方截图未采集 | 反编译全树无 `D3DRS_SRGBWRITEENABLE`(state 194)调用;D3D9 默认在存储值空间混合 | Likely:8-bit sRGB 编码存储、gamma 空间混合(DIV-GFX-009) |
-| 11 | `CGACT` 图像加工 | `cg/cgact.html`:SIZE/SIZE2/ROTATION/TRIM/RESIZE/SAIDO/MEIDO/AKARUSA/MONO/REVERSE/MOSAIC/BLUR/DIFFUSION/RASTER*/RECTPAINT* | ERIS 首屏 `RECTPAINT*` + `SET/SET2`;源 `CGACT[SIZE/ROTATION/RESIZE/...]` | 动作分派 `FUN_0042f809`(`0x42f809`,按 AL=动作码;`0x42d5fb` 等 25 个调用点);RECTPAINT/2/3 处理体 `FUN_0043185c`(`0x43185c`)模式 1/2/3;RESIZE 几何 `FUN_0043c971`(`w+X+X2-1`,`h+Y+Y2-1`);其余像素算法未定位 | 参数/命令 Confirmed;RECTPAINT/2/3 已实现并逐像素对拍(EVID-J-02..05);其余像素 Unimplemented(DIV-GFX-013) |
+| 11 | `CGACT` 图像加工 | `cg/cgact.html`:SIZE/SIZE2/ROTATION/TRIM/RESIZE/SAIDO/MEIDO/AKARUSA/MONO/REVERSE/MOSAIC/BLUR/DIFFUSION/RASTER*/RECTPAINT* | ERIS 首屏 `RECTPAINT*` + `SET/SET2`;源 `CGACT[SIZE/REVERSE/HORIZONTAL]` | 动作分派 `FUN_0042f809`(`0x42f809`,按 AL=动作码;`0x42d5fb` 等 25 个调用点);RECTPAINT/2/3 处理体 `FUN_0043185c`(`0x43185c`)模式 1/2/3;RESIZE 几何 `FUN_0043c971`(`w+X+X2-1`,`h+Y+Y2-1`);其余像素算法未定位 | 参数/命令 Confirmed;`RECTPAINT/2/3`(EVID-J-02..05)、`REVERSE`/`HORIZONTAL`(EVID-T-13)、`SIZE`/`SIZE2`(EVID-J3-04)已实现并逐像素对拍;`ROTATION/TRIM/RESIZE/MONO/BLUR*` 仍 Unimplemented(DIV-GFX-013) |
 | 12 | `WINDOW` 域 | `window/window.html`:NO=0 主窗口/CGID 显示图层组/E 显示隐藏/A(β4 仅显隐)/X/Y/SX/SY;`windowend.html`:不能删主窗口 | `es_First.yst:97/98/140`、`es_ERIS.yst:22`(子窗口 CGID) | `yu-rt` 发 `Domain::Window`;gfx 消费主窗口状态,Screen pass 用 `CGID` 与 `E/A`;子窗口状态输出给 host | Confirmed;主窗口 gfx 消费,叠放归 host(DIV-GFX-018) |
 | 13 | 图像层显式尺寸 | 手册称 `SX/SY` 仅图层组有效,与真实脚本冲突 | `es_ERIS.yst:579/600`(全屏黑幕)、`es_First.yst:170`、`es_Font.yst:220/231` | `FUN_00465730` 层默认 `+0x78/+0x7c=1`;`FUN_0043772c` 按 SX/SY 重采样并写回;`FUN_00408724` 用层矩形 | Confirmed(引擎/脚本优先);`FILE=""` 黑图按尺寸绘制,资源图缩放挂 Unimplemented(DIV-GFX-022) |
 
@@ -528,10 +528,12 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 - `FX/FR/FC/FEX/...` 滤镜/仿射。
 - 多部件层(非空 `parts`)。
 - `CGACT[COPY/COPY2/TEXCOPY/TEXSSCOPY]`:COPY/COPY2 已可执行(DIV-GFX-007);
-  `TEXCOPY/TEXSSCOPY`、组目标复制仍 `Unimplemented`。
-  `SIZE*`/`ROTATION`/`RESIZE`/`TRIM`/`MONO`/`BLUR*`/... 图像加工参数已进契约,
-  像素算法未实现(参数已进契约,像素算法/时序未实现)。
-  **例外**:`RECTPAINT/RECTPAINT2/RECTPAINT3` 与 `REVERSE`/`HORIZONTAL`
+  **组目标复制也已实现**(soft `compose_group` / wgpu `plan_group_compose`);
+  仅 `TEXCOPY/TEXSSCOPY` 仍 `Unimplemented`(`gfx.copy.texcopy.unsupported`)。
+  **例外**:`SIZE`/`SIZE2` 已实现(`scale_region`,两端共用;
+  无区域时按 StretchRect 透传,EVID-J3-04);`ROTATION`/`RESIZE`/`TRIM`/
+  `MONO`/`BLUR*` 等仍只有参数、无像素算法。
+  **另一例外**:`RECTPAINT/RECTPAINT2/RECTPAINT3` 与 `REVERSE`/`HORIZONTAL`
   在整层、Asset/1×1 黑/快照基图时标 `Executable`,后端必须执行
   (EVID-J-02..05、EVID-T-13)。
 - TID 非空但配对层缺失的过渡:不再 Unimplemented,gfx 回退单纹理普通层
