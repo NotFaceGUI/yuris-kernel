@@ -4,7 +4,7 @@
 //! 不允许后端“猜”公式或静默跳过。
 
 use crate::group::GroupDraw;
-use crate::layer::{CopyId, EngineValue, Layer, LayerId};
+use crate::layer::{CopyId, EngineValue, Layer, LayerId, TextureRef};
 use crate::transition::TransitionDraw;
 
 /// 一条绘制/复制/图像操作。
@@ -99,13 +99,43 @@ pub enum CopySource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CopyRegion {
     Full,
-    /// `x/y` = 起点,`x2/y2` = 终点或相对值(引擎语义未逐项取证)。
+    /// 源纹理坐标矩形(含端点)。
+    ///
+    /// 未指定的字段 = **源整幅范围**,不是 0。证据:
+    /// - 手册 `cg/cgact.html` 例 29/30 只给部分坐标时仍是整层截图;
+    /// - ERIS 按钮切片 `CGACT[ID="BT.OFF.TMP" ID2=$off COPY2=1 X=0 X2=@sx-1]`
+    ///   不带 `Y/Y2`,官方 title 按钮是整高切片(不是 1px 高);
+    /// - `j2-micro-copy` 显式给全四个坐标,行为不变(EVID-T-11)。
+    ///
+    /// 旧实现把缺省值填 0,导致只复制首行(`DIV-GFX-054`)。
     Partial {
-        x: i64,
-        y: i64,
-        x2: i64,
-        y2: i64,
+        x: Option<i64>,
+        y: Option<i64>,
+        x2: Option<i64>,
+        y2: Option<i64>,
     },
+}
+
+impl CopyRegion {
+    /// 解析为源纹理上的闭区间 `(x0, y0, x1, y1)`。
+    ///
+    /// 缺省:x0/y0 = 0,x1 = 宽−1,y1 = 高−1。显式负值/越界由调用方裁剪。
+    pub fn resolve(&self, width: u32, height: u32) -> (i64, i64, i64, i64) {
+        match *self {
+            CopyRegion::Full => (
+                0,
+                0,
+                i64::from(width).saturating_sub(1),
+                i64::from(height).saturating_sub(1),
+            ),
+            CopyRegion::Partial { x, y, x2, y2 } => (
+                x.unwrap_or(0),
+                y.unwrap_or(0),
+                x2.unwrap_or_else(|| i64::from(width).saturating_sub(1)),
+                y2.unwrap_or_else(|| i64::from(height).saturating_sub(1)),
+            ),
+        }
+    }
 }
 
 /// 复制时序。
@@ -131,6 +161,14 @@ pub struct CopyOp {
     pub id: CopyId,
     pub kind: CopyKind,
     pub source: CopySource,
+    /// **命令执行时**源图像层的基础纹理(`CopySource::Layer` 才有)。
+    ///
+    /// 官方 COPY 在命令到达时立即取像素(EVID-T-15);源层可能在同一帧稍后
+    /// 被 `CGEND` 删除(ERIS 按钮快照:`CG[ID="BT.OFF.TMP" FILE=…]` → 切片
+    /// `COPY2` → 全部按钮建完后 `CGEND[BT.OFF.TMP]`)。本内核的纹理 pass 在
+    /// 帧末回放,那时源节点已不存在;因此必须在命令时刻把基础纹理固定下来
+    /// (`DIV-GFX-053`)。
+    pub source_texture: Option<TextureRef>,
     /// 复制目标图层路径。
     pub dest: LayerId,
     pub region: CopyRegion,

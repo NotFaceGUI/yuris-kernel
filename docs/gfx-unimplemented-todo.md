@@ -20,7 +20,7 @@
 | ID | 模块 | 状态 | 当前行为 | 解除条件 |
 |---|---|---|---|---|
 | DIV-GFX-001 | MODE 3/5/6/7/9 固定管线 | **fixed(J4)** | 辅助纹理=白/黑;stage1=BLENDCURRENTALPHA;soft/wgpu 全部执行(颜色因子见 047) | 状态表 + 单元向量;官方微场景待 YSCom 恢复 |
-| DIV-GFX-002 | MODE 4/8/10..18 着色器 | unimplemented | shader 集合已定位(4 个 ps_2_0:交叉淡化/mask/两种缩放),但 MODE 4/8/10..18 的 Photoshop 公式无对应 blob;层标 Unimplemented | 找到 MODE 公式的调用点/blob + 像素对拍 |
+| DIV-GFX-002 | MODE 4/8/10..18 着色器 | unimplemented | shader 集合已定位(4 个 ps_2_0:交叉淡化/mask/两种缩放),4 个 pass 均已移植 WGSL;MODE 4/8/10..18 的 Photoshop 公式仍无对应 blob/调用点;层标 Unimplemented | 找到 MODE 公式的调用点/blob + 像素对拍 |
 | DIV-GFX-003 | `FX/FY/FBX/.../F` 仿射/滤镜 | unimplemented | 原值进 `transform.filter` | 槽位→`+0x1b0..+0x200` 逐项绑定 + 变换公式 |
 | DIV-GFX-004 | 多部件层 | unimplemented | `Part.raw` 原样保存 | `+0xa6/+0xa7/+0xb0/+0x130` 几何语义 |
 | DIV-GFX-005 | `MID` 外部掩码 | unimplemented | 层标 Unimplemented | 掩码取值通道(α/亮度)/尺寸/采样 |
@@ -68,10 +68,12 @@
 
 | DIV-GFX-047 | WebGPU 颜色混合因子 | **fixed(J4 复核)** | `BlendFactor::Src/OneMinusDst/OneMinusSrc` 就是 D3D9 `SRCCOLOR/INVDESTCOLOR/INVSRCCOLOR`;MODE 3/5/9 两端执行,soft/wgpu 逐像素一致 | — |
 | DIV-GFX-048 | 组(layer set)上的 TID 转场 | open(Likely) | gfx 输出 `Op::Transition{from:Offscreen}`;不再静默当普通组 | 官方微场景(YSCom attach 阻塞) |
-| DIV-GFX-049 | `image_ext_order` 空值兜底(A5) | **open(2026-10-22 审查回退)** | J4 曾标 fixed,但实现仍是“保留默认顺序 `[png,bmp,jpg,gif,psb]` + 一条 Info 诊断”;A5 原文要求缺表 = 拒绝启动或 `Unimplemented`,记录不等于允许。见 `docs/audit-2026-10-22.md` §A2 | 二选一:拒绝启动,或所有依赖探测序的层标 Unimplemented |
-| DIV-GFX-050 | 引擎 shader 集合 | **fixed(J4)** | 4 个真实 blob、FXO/pass 映射、`D3DXCreateEffect` 链、`CreatePixelShader` 虚表事实 | 见 `docs/shader-parity.md` |
-| DIV-GFX-051 | 主组直绘后 `COPY ID=:/W0/` 的首帧源 | **open(2026-10-22 审查新增)** | 主组不再产出 Offscreen pass,首帧无后缓冲时 COPY 报 `gfx.copy.source.offscreen_missing`;实测 `first_frame` tick 1 的 `CGS100` 被跳过 | 裁决“回退本帧子层自合成”或“显式 `no_backbuffer` 挂账”;见 `docs/audit-2026-10-22.md` §A1 |
-| DIV-GFX-052 | `REVERSE`/`HORIZONTAL` 与同层先加工的组合 | **open(2026-10-22 审查新增)** | soft 有“源已在覆盖表则基于当前像素再加工”分支,wgpu 无对应分支;无官方微场景 | 补两端一致测试,或删分支并标 Unimplemented |
+| DIV-GFX-049 | `image_ext_order` 空值兜底(A5) | **fixed(AU1)** | 移除内置默认序:`GfxConfig::new` 探测序为空;`from_tables` 在 `yscfg` 为空且宿主未显式注入时拒绝构造(`gfx.config.probe_order_missing`)。显式注入仍允许(不是兜底)。用例 `empty_image_ext_order_is_rejected_not_defaulted` | — |
+| DIV-GFX-050 | 引擎 shader 集合 | **fixed(J4)** | 4 个真实 blob、FXO/pass 映射、`D3DXCreateEffect` 链、`CreatePixelShader` 虚表事实;pass0..3 全部有独立 WGSL(含 psA/psB 缩放),`render_frame_scaled` 可执行 | 见 `docs/shader-parity.md` |
+| DIV-GFX-051 | 主组直绘后 `COPY ID=:/W0/` 的首帧源 | **fixed(AU1)** | 首帧没有后缓冲时用 `frame.clear` 合成视口大小的后缓冲初值(D3D9 设备创建后后缓冲即存在,内容为初始化清屏色;DIV-GFX-010)。两端一致,不再报 `offscreen_missing`。用例 `main_group_copy_on_first_frame_uses_device_clear` | 仍需官方首帧截图逐像素确认(现锚点为“启动黑屏”) |
+| DIV-GFX-052 | `REVERSE`/`HORIZONTAL` 与同层先加工的组合 | **fixed(AU1)** | wgpu 补上与 soft 逐字对齐的分支(源已加工则基于当前像素算一次;否则按 `(源身份, 操作)` 跨帧缓存)。跨后端用例 `reverse_after_rectpaint_matches_soft` 逐像素一致 | — |
+| DIV-GFX-053 | 复制源层同帧被 `CGEND` 删除 | **fixed(AU1)** | `CopyOp.source_texture` 在**命令时刻**固定源基础纹理(官方 COPY 在命令处理器立即执行,EVID-T-15);`frame()` 不再因源节点消失丢弃复制。ERIS 按钮快照 68 条 `COPY2` 恢复(首屏 texture pass 12 → 80) | — |
+| DIV-GFX-054 | COPY 区域缺省坐标 = 整幅,不是 0 | **fixed(AU1)** | `CopyRegion::Partial` 四个坐标改为 `Option`;`resolve()` 缺省取 `0/0/宽-1/高-1`。证据:ERIS `CGACT[... COPY2=1 X=0 X2=@sx-1]`(无 `Y/Y2`)是整高切片 | — |
 
 ## 代码标记
 
@@ -94,11 +96,10 @@
 
 ## 推进顺序建议
 
-1. **DIV-GFX-051**(主组 COPY 首帧源):首帧 golden/case 全依赖;先裁决回退
-   自合成还是显式 `no_backbuffer`。
-2. **DIV-GFX-049**(A5 兜底):与 051 同为 P0 级契约项。
-3. 资产元数据 provider → 解锁 `CGINFO SX/SY`(ERIS 按钮布局的最大缺口;
-   图像头部分已由 J3 落地)。
+1. **官方首帧截图**:DIV-GFX-051 现以“D3D9 设备初始化的黑屏”为锚点;
+   需要官方首帧(启动瞬间)`capture_screen.py --warmup 0` 逐像素确认。
+2. 资产元数据 provider → 解锁 `CGINFO SX/SY` 的完整 provider(图像头部分
+   已由 J3 落地;PSB/E-mote 仍缺)。
 4. 官方引擎受控脚本/截图 → 过渡无配对、COPY 时序、组 RT 清屏/尺寸、像素对拍。
 5. `MODE 3/5/6/7/9` 辅助纹理已实现;`4/8/10..18` 着色器。
 6. 图像加工/多部件/MID。

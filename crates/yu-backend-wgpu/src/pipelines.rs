@@ -28,6 +28,7 @@ use yu_log::Diag;
 
 use crate::device::{code, GpuContext};
 use crate::textures::Vertex;
+use crate::ScaleFilter;
 /// 全 crate 唯一的目标格式。管线键里的 format 维度因此是常量;
 /// 若未来引入第二个格式,把 `pipelines` 的键改成 `(BlendMode, TextureFormat)`。
 pub const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -127,6 +128,38 @@ const TRANSITION_SHADER: &str = crate::shaders::TRANSITION_FIXED;
 /// 已含 alpha 规则)。混合为替换,不做 blend。
 const PAINT_SHADER: &str = crate::shaders::PAINT;
 
+/// 引擎显示缩放滤镜变体(effect Pass2/Pass3)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ScaleVariant {
+    /// Pass2 (psB):4-tap 锐利双线性。
+    PsB,
+    /// Pass3 (psA):16-tap 双三次。
+    PsA,
+}
+
+impl ScaleVariant {
+    pub(crate) const fn from_filter(filter: ScaleFilter) -> Self {
+        match filter {
+            ScaleFilter::Sharp => Self::PsB,
+            ScaleFilter::Bicubic => Self::PsA,
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::PsB => 0,
+            Self::PsA => 1,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::PsB => "scale psB",
+            Self::PsA => "scale psA",
+        }
+    }
+}
+
 /// 管线 + bind group 缓存。
 pub struct PipelineCache {
     bind_group_layout: wgpu::BindGroupLayout,
@@ -146,6 +179,13 @@ pub struct PipelineCache {
     /// 引擎 effect Pass0(psD,交叉淡化;`_DXMODE≠0` 且 TA<1)。
     transition_psd_shader: wgpu::ShaderModule,
     transition_psd_pipelines: BTreeMap<BlendMode, wgpu::RenderPipeline>,
+    /// 引擎显示缩放 effect Pass2/Pass3(`DAT_00801334` 2/3)。
+    scale_layout: wgpu::BindGroupLayout,
+    scale_pipeline_layout: wgpu::PipelineLayout,
+    scale_shaders: [wgpu::ShaderModule; 2],
+    scale_pipelines: [Option<wgpu::RenderPipeline>; 2],
+    /// 缩放 bind group:按 `(源纹理 id, 变体, uniform)` 缓存。
+    scale_groups: BTreeMap<(u64, ScaleVariant, [u32; 4]), wgpu::BindGroup>,
     /// 快照上的 RECTPAINT 族:`[整像素, 只写 alpha]`。
     paint_layout: wgpu::BindGroupLayout,
     paint_pipeline_layout: wgpu::PipelineLayout,
@@ -281,6 +321,44 @@ impl PipelineCache {
             make_sampler(ctx, FilterKind::Point),
             make_sampler(ctx, FilterKind::Linear),
         ];
+        let scale_psb_shader =
+            ctx.device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("yu-backend-wgpu scale psB"),
+                    source: wgpu::ShaderSource::Wgsl(crate::shaders::SCALE_PSB.into()),
+                });
+        let scale_psa_shader =
+            ctx.device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("yu-backend-wgpu scale psA"),
+                    source: wgpu::ShaderSource::Wgsl(crate::shaders::SCALE_PSA.into()),
+                });
+        let scale_layout = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("yu-backend-wgpu scale layout"),
+                entries: &[
+                    texture_entry(0),
+                    sampler_entry(1),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let scale_pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("yu-backend-wgpu scale pipeline layout"),
+                    bind_group_layouts: &[Some(&scale_layout)],
+                    immediate_size: 0,
+                });
         Ok(Self {
             bind_group_layout,
             layout,
@@ -296,6 +374,11 @@ impl PipelineCache {
             transition_psc_pipelines: BTreeMap::new(),
             transition_psd_shader,
             transition_psd_pipelines: BTreeMap::new(),
+            scale_layout,
+            scale_pipeline_layout,
+            scale_shaders: [scale_psb_shader, scale_psa_shader],
+            scale_pipelines: [None, None],
+            scale_groups: BTreeMap::new(),
             paint_layout,
             paint_pipeline_layout,
             paint_shader,
@@ -506,6 +589,135 @@ impl PipelineCache {
         self.transition_psd_pipelines.get(&mode)
     }
 
+    /// 为显示缩放变体建管线(替换写,无 blend;全屏顶点由 shader 生成)。
+    pub fn ensure_scale_pipeline(
+        &mut self,
+        ctx: &GpuContext,
+        filter: ScaleFilter,
+    ) -> Result<(), Diag> {
+        let variant = ScaleVariant::from_filter(filter);
+        if self.scale_pipelines[variant.index()].is_some() {
+            return Ok(());
+        }
+        let label = format!("yu-backend-wgpu {}", variant.label());
+        let shader = &self.scale_shaders[variant.index()];
+        let pipeline = ctx.checked(code::TARGET, "显示缩放管线", || {
+            ctx.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(&label),
+                    layout: Some(&self.scale_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: shader,
+                        entry_point: Some("vs_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[],
+                    },
+                    primitive: primitive_state(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: shader,
+                        entry_point: Some("fs_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: TARGET_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+        })?;
+        self.scale_pipelines[variant.index()] = Some(pipeline);
+        self.total_pipelines_created += 1;
+        Ok(())
+    }
+
+    pub fn scale_pipeline(&self, filter: ScaleFilter) -> Option<&wgpu::RenderPipeline> {
+        let variant = ScaleVariant::from_filter(filter);
+        self.scale_pipelines[variant.index()].as_ref()
+    }
+
+    /// 为缩放 pass 建/复用 bind group。
+    ///
+    /// `tex_size` 是源纹理尺寸(引擎 `YS_TexSize`);`param` 对 psB 是
+    /// `SharpN`(引擎恒为 1.25),对 psA 是 `YS_TexDiffU`(引擎恒为 2/W)。
+    /// 采样器固定 point(D3DTEXF_POINT,`FUN_004195ec` 硬编码)。
+    pub fn ensure_scale_bind_group(
+        &mut self,
+        ctx: &GpuContext,
+        texture_id: u64,
+        view: &wgpu::TextureView,
+        filter: ScaleFilter,
+        tex_size: [f32; 2],
+        param: [f32; 2],
+    ) -> Result<(), Diag> {
+        let uniform = [tex_size[0], tex_size[1], param[0], param[1]];
+        let key = (
+            texture_id,
+            ScaleVariant::from_filter(filter),
+            uniform.map(f32::to_bits),
+        );
+        if self.scale_groups.contains_key(&key) {
+            return Ok(());
+        }
+        let buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &ctx.device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("yu-backend-wgpu scale uniform"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            },
+        );
+        let group = ctx.checked(code::TARGET, "缩放 bind group", || {
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("yu-backend-wgpu scale bind group"),
+                layout: &self.scale_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.samplers[FilterKind::Point as usize]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buffer.as_entire_binding(),
+                    },
+                ],
+            })
+        })?;
+        // buffer 必须活到 bind group 销毁:wgpu 的 BindGroup 持有资源引用,
+        // 但为了明确生命周期,把 buffer 存进 group 缓存不现实;wgpu 内部
+        // 引用计数保证存活,这里可以释放 Rust 句柄。
+        self.scale_groups.insert(key, group);
+        self.total_bind_groups_created += 1;
+        Ok(())
+    }
+
+    pub fn scale_bind_group(
+        &self,
+        texture_id: u64,
+        filter: ScaleFilter,
+        tex_size: [f32; 2],
+        param: [f32; 2],
+    ) -> Option<&wgpu::BindGroup> {
+        let uniform = [
+            tex_size[0],
+            tex_size[1],
+            param[0],
+            param[1],
+        ];
+        self.scale_groups.get(&(
+            texture_id,
+            ScaleVariant::from_filter(filter),
+            uniform.map(f32::to_bits),
+        ))
+    }
+
     /// 为一次过渡建 bind group(纹理 + mask + fade uniform)。
     pub fn create_transition_bind_group(
         &mut self,
@@ -677,6 +889,7 @@ impl PipelineCache {
     /// 目标纹理被重建时作废旧 bind group,避免持有已废弃的 view。
     pub fn forget_texture(&mut self, texture_id: u64) {
         self.bind_groups.retain(|(id, _), _| *id != texture_id);
+        self.scale_groups.retain(|(id, _, _), _| *id != texture_id);
     }
 }
 

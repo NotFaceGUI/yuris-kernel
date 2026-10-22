@@ -1,6 +1,6 @@
 # DIV-GFX-051 · 主组直绘后 `COPY ID=:/W0/` 的首帧源缺失
 
-- 状态: open
+- 状态: **fixed(AU1,2026-10-22)**
 - 优先级: 高(首帧 golden 与全部 `cases/` 依赖)
 - 发现日期 / 方式: 2026-10-22 / 代码审查 + `first_frame` 实测
 
@@ -55,19 +55,34 @@ EVID-T-11/12/15 微场景);错的是两者的组合:**主组现在是“没有�
 - [x] L3 帧层状态一致(层树/可见数一致,仅这条 op 被跳过)
 - [ ] L4 帧间编排:首帧与后续帧的源不同,未取证官方首帧语义
 
-## 修法(二选一,需裁决)
+## 修法(AU1 已落地)
 
-1. **回退本帧子层自合成**:`frame()` 为主组 COPY 额外产出一个
-   `PassTarget::Texture(main)` 的自合成项(或让后端对“主组 + 无后缓冲”
-   按 `emit_children_ops` 临摹一块表面)。语义与 J2 的 `compose_group` 等价。
-2. **显式挂账**:把原因码改成 `gfx.copy.source.no_backbuffer`,状态保持
-   `Unimplemented`,并在报告里计数。这样“未取证”不会被伪装成实现缺陷。
+**用设备初始化后缓冲**:首帧没有 `last_screen` 时,用 `frame.clear` 合成一张
+视口大小的表面作为后缓冲初值。
 
-倾向 2 先落地(不改像素、不猜),再用 regtest 微场景补证据后转 1。
+依据链:
+- D3D9 设备创建后后缓冲即存在,内容为初始化清屏色(DIV-GFX-010 已记录
+  `Clear::default_black` 的来源);
+- 主组已直绘、没有离屏 RT(EVID-J3-07),因此不存在“本帧子层自合成”这一
+  官方等价物(那会把尚未完成的子层截进去,与 EVID-J3-06 的后缓冲语义冲突);
+- 官方首帧截图就是纯黑启动屏(用户实测与 title 前黑屏段一致)。
+
+实现:
+- soft `apply_copy_op`:`CopySource::Group(主组)` + `last_screen == None`
+  → `Surface::new(viewport, clear.rgba)`;
+- wgpu `backbuffer_image`:同上,上传一张 `frame.clear` 的视口大小纹理。
+
+## 残留
+
+官方**启动瞬间**首帧截图尚未采集(`capture_screen.py --warmup 0` 只到
+boot 后),所以“设备初始化 = frame.clear”仍是推断;需补一张官方首帧做逐像素
+确认。数值上它只影响首帧 `CGS100` 快照的背景底色。
 
 ## 回归
 
-- 对拍用例:`cases/first-screen.json`(当前期望 `ops_total=18`,实测 17);
+- 对拍用例:`cases/first-screen.json`(**AU1 已重生成**:85 ops / 0 skipped);
+- 单元回归:`main_group_copy_on_first_frame_uses_device_clear`
+  (`crates/yu-backend-soft/tests/render.rs`);
 - 验证命令:
   `cargo run -p yu-backend-soft --example first_frame`;
-- 修好后需同时重生成 `eris_first_screen_display.json` 与三条 case。
+- golden 已按新 census(82 passes / 85 ops)重生成。

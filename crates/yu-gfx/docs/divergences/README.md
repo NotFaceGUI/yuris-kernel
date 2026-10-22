@@ -54,7 +54,9 @@
 | DIV-GFX-042 | D3D9 半像素/quad 采样相位:官方矩形顶行与背景混合(1px 边缘),内核整数矩形全填充 | open | `RECTPAINT` 区域内部已逐通道一致;1px 边缘差异单独挂账,不纳入 Phase B 门禁 |
 | DIV-GFX-047 | WebGPU 颜色混合因子 | **fixed(J4 复核)** | WebGPU `BlendFactor::Src/OneMinusDst/OneMinusSrc` 是 D3D9 `SRCCOLOR/INVDESTCOLOR/INVSRCCOLOR` 的逐通道等价物;MODE 3/5/9 两端执行,`fixed_pipeline_modes_3_5_6_7_9_match_soft` 逐像素验证 |
 | DIV-GFX-048 | 组(layer set)上的 `TID` 转场 | open(Likely) | gfx 已输出 `Op::Transition { from: Offscreen(组), to: 配对 }`,不再当普通组画掉;引擎按层表统一解析 TID。官方微场景因 YSCom 编译器无法 attach(`state0 != 1`)暂缺,见 `docs/shader-parity.md` §6 |
-| DIV-GFX-049 | `yscfg.image_ext_order` 为空时的探测序兜底(A5) | **open(2026-10-22 审查回退)** | J4 曾标 fixed,但实现仍是“保留默认顺序 `[png,bmp,jpg,gif,psb]` + 一条 Info 诊断”;A5 原文要求缺表 = 拒绝启动或 `Unimplemented`,记录不等于允许。见 `docs/audit-2026-10-22.md` §A2 | 二选一:拒绝启动,或所有依赖探测序的层标 Unimplemented |
+| DIV-GFX-049 | `yscfg.image_ext_order` 为空时的探测序兜底(A5) | **fixed(AU1)** | 移除内置默认序;`from_tables` 在 `yscfg` 空且宿主未显式注入时拒绝构造(`gfx.config.probe_order_missing`)。显式注入允许(不是兜底)。用例 `empty_image_ext_order_is_rejected_not_defaulted` | — |
 | DIV-GFX-050 | 引擎 shader 集合与 MODE 4/8/10..18 | partially fixed | 全 exe 扫描只有 4 个真实 ps_2_0 blob(FXO VA `0x58d420`),pass0/1=交叉淡化/mask 转场,pass2/3=显示缩放滤镜;`CreatePixelShader` 由静态 D3DX9 在 `D3DXCreateEffect` 内调用。MODE 4/8/10..18 的 Photoshop 公式仍无 blob,保持 Unimplemented。详见 `docs/shader-parity.md` |
-| DIV-GFX-051 | 主组直绘后 `COPY ID=:/W0/` 的首帧源 | **open(2026-10-22 审查新增)** | 主组不再产出 Offscreen pass,首帧无后缓冲时 COPY 报 `gfx.copy.source.offscreen_missing`(`first_frame` 实测 `CGS100` 被跳过);golden/用例仍标 executable。见 `docs/audit-2026-10-22.md` §A1 |
-| DIV-GFX-052 | `REVERSE`/`HORIZONTAL` 与同层先加工的组合 | **open(2026-10-22 审查新增)** | soft 有“源已在覆盖表则基于当前像素再加工”分支,wgpu 无对应分支;无官方微场景。见 `docs/audit-2026-10-22.md` §A4 |
+| DIV-GFX-051 | 主组直绘后 `COPY ID=:/W0/` 的首帧源 | **fixed(AU1)** | 首帧无后缓冲时用 `frame.clear` 合成视口大小的后缓冲初值(D3D9 设备创建后后缓冲即为初始化清屏色,DIV-GFX-010);两端一致 |
+| DIV-GFX-052 | `REVERSE`/`HORIZONTAL` 与同层先加工的组合 | **fixed(AU1)** | wgpu 补上与 soft 逐字对齐的分支;跨后端用例 `reverse_after_rectpaint_matches_soft` 逐像素一致 |
+| DIV-GFX-053 | 复制源层同帧被 `CGEND` 删除 | **fixed(AU1)** | `CopyOp.source_texture` 在命令时刻固定源纹理(EVID-T-15);按钮快照 68 条 `COPY2` 恢复 |
+| DIV-GFX-054 | COPY 区域缺省坐标 = 整幅 | **fixed(AU1)** | `CopyRegion::Partial` 坐标改 `Option` + `resolve()`;ERIS `X/X2` 无 `Y/Y2` = 整高切片 |

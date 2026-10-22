@@ -65,6 +65,7 @@ fn run() -> Result<(), String> {
         // debug_mode=true 在本语料会走 debug UI,1200 tick 内不进 title(黑帧)。
         // 证据与对照见 docs/title-motion-ledger.md §9。
         debug_mode: false,
+        paths: host_paths(&root_path),
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), boot)
@@ -284,4 +285,31 @@ fn workspace_root() -> PathBuf {
         .nth(2)
         .expect("crates/yu-backend-soft -> workspace root")
         .to_path_buf()
+}
+
+/// 宿主注入的路径系统变量(手册 `basic/svariable.html`)。
+///
+/// - `$_SYSTEM_PATH` = YU-RIS 起動パス → 工程根(官方 `yu-ris.exe` 所在目录);
+/// - `$_SAVE_PATH` = YU-RIS セーブデータパス → 官方引擎在本工程**实际生成**
+///   的存档目录 `<root>/save/`(原版数据自证:`save/*.sd` 由官方 exe 写入);
+/// - `$_APPDATA_PATH` = ユーザのホームディレクトリパス → `USERPROFILE`;
+/// - `$_PERSONAL_PATH` = マイドキュメントのパス → `USERPROFILE\Documents`。
+///
+/// `$_PROJECT_PATH` 手册无页(DIV-RT-010),不猜值 ⇒ `None`(仅 debug 脚本读)。
+fn host_paths(root: &std::path::Path) -> yu_rt::vm::HostPaths {
+    let mut sys = root.to_string_lossy().replace('\\', "/");
+    if !sys.ends_with('/') {
+        sys.push('/');
+    }
+    let save = format!("{sys}save/");
+    let home = std::env::var("USERPROFILE").ok();
+    yu_rt::vm::HostPaths {
+        system_path: Some(sys.clone().into_bytes()),
+        save_path: Some(save.into_bytes()),
+        appdata_path: home.as_ref().map(|h| h.clone().into_bytes()),
+        personal_path: home
+            .as_ref()
+            .map(|h| format!("{h}\\Documents").into_bytes()),
+        project_path: None,
+    }
 }

@@ -271,6 +271,11 @@ pass 映射为:
 - 创建链:`FUN_00462d28` 把 FXO 复制到栈上 → `D3DXCreateEffect`
   (`0x4cd434`,检查 magic `0xFEFF0901`)→ `SetTechnique("YS_ShaderTest1")`。
   `CreatePixelShader` 在静态链接的 D3DX9 内部调用,所以 exe 字符串里没有它。
+- 4 个 pass 全部有独立 WGSL:`transition_psd/psc.wgsl`(pass0/1)、
+  `scale_psb/psa.wgsl`(pass2/3)。缩放 pass 通过加法 API
+  `WgpuRenderer::render_frame_scaled(frame, output, ScaleFilter)` 接入,
+  `render_frame` 仍按 1:1 读回;UV/参数/采样器证据见
+  `docs/shader-parity.md` §3.3。
 - 本语料 `_DXMODE=0` 走固定管线;`_DXMODE≠0` 的脚本分支才会产生 HLSL
   转场。内核把 `dx_mode` 作为显式宿主契约(默认 0),非 0 时后端用
   psC/psD 独立 WGSL;详见 `docs/shader-parity.md`。

@@ -115,19 +115,22 @@ fn eris_first_screen_display_list() {
     // 因此按当前实现更新 golden,而不是用 UPDATE_GFX_GOLDEN 掩盖回归。
     //
     // J3 追加(DIV-GFX-008/041,主组直绘):主窗口组不再产出离屏 pass,
-    // 子层直接进屏幕 pass。因此 passes 15 → 14、total ops 18 → 4、
-    // texture passes 12 → 12(不变),W0 离屏从 4 op 降为 0(该 pass 消失)。
+    // 子层直接进屏幕 pass(passes 15 → 14,total ops 18 → 17)。
+    //
+    // AU1 追加(DIV-GFX-053):按钮状态快照的源层 `BT.OFF.TMP` 在同一帧末尾
+    // 被 `CGEND` 删除;命令时刻捕获源纹理后,68 条 `COPY2` 不再被丢弃。
+    // 因此 texture passes 12 → 80(69 copy + 11 image)、total ops 17 → 85。
     assert_eq!(f.layers.len(), 272, "layers");
     assert_eq!(f.layers.iter().filter(|l| l.visible).count(), 8, "visible");
-    assert_eq!(f.passes.len(), 14, "passes");
+    assert_eq!(f.passes.len(), 82, "passes");
     let total_ops: usize = f.passes.iter().map(|p| p.ops.len()).sum();
-    assert_eq!(total_ops, 17, "total ops");
+    assert_eq!(total_ops, 85, "total ops");
     let texture_passes = f
         .passes
         .iter()
         .filter(|p| matches!(p.target, yu_gfx::PassTarget::Texture(_)))
         .count();
-    assert_eq!(texture_passes, 12, "texture passes");
+    assert_eq!(texture_passes, 80, "texture passes");
     let ops_of = |target: &str| {
         f.passes
             .iter()
@@ -302,11 +305,22 @@ fn eris_first_screen_with_synchronous_info_queries() {
     let f = state.borrow().frame();
     assert_eq!(f.layers.len(), 272, "layers");
     assert_eq!(f.layers.iter().filter(|l| l.visible).count(), 8, "visible");
-    assert_eq!(f.passes.len(), 14, "passes");
-    // 主组直绘后 W0 不再有离屏 pass(15 → 14 passes;18 → 17 ops)。
+    // 1 屏 + 1 组离屏 + 80 纹理 pass(69 copy + 11 image)。
+    //
+    // 69 条 copy = 1 条主组 `CGS100` + 68 条按钮状态快照;后者的源
+    // `BT.OFF.TMP` 在同一帧末尾被 `CGEND` 删除,靠 `CopyOp.source_texture`
+    // 在命令时刻捕获(DIV-GFX-053)。旧实现在这里丢掉了 68 条。
+    assert_eq!(f.passes.len(), 82, "passes");
+    let texture_passes = f
+        .passes
+        .iter()
+        .filter(|p| matches!(p.target, yu_gfx::PassTarget::Texture(_)))
+        .count();
+    assert_eq!(texture_passes, 80, "texture passes (copies + images)");
+    // 80 纹理 op + 4 屏幕 op(主组直绘)+ 1 离屏 DBG 层。
     assert_eq!(
         f.passes.iter().map(|p| p.ops.len()).sum::<usize>(),
-        17,
+        85,
         "total ops"
     );
     let screen = f
@@ -327,4 +341,56 @@ fn eris_first_screen_with_synchronous_info_queries() {
         q.iter().any(|c| c == "WINDOWINFO"),
         "ERIS must query WINDOWINFO at boot"
     );
+}
+
+/// A5:工程 `yscfg` 的 `image_ext_order` 全 0、宿主也没显式注入时,
+/// `GfxState::from_tables` **必须拒绝构造**,不得内置兜底表。
+///
+/// 证据:`docs/architecture.md` A5「缺表 = 显式拒绝启动或 Unimplemented」;
+/// `yscfg` 字段布局见 `crates/yu-format/src/yscf.rs`。本用例在真实表上把
+/// 该字段清零后重放同一构造函数(不修改游戏文件,只改内存快照)。
+#[test]
+fn empty_image_ext_order_is_rejected_not_defaulted() {
+    let Some(root) = eris_root() else {
+        if std::env::var("YURIS_REQUIRE_SAMPLES").ok().as_deref() == Some("1") {
+            panic!("YURIS_REQUIRE_SAMPLES=1 but sample root is missing");
+        }
+        eprintln!("SKIP empty_image_ext_order_is_rejected_not_defaulted: no sample");
+        return;
+    };
+    let ypf = std::path::PathBuf::from(&root).join("data.ypf");
+    let src: Box<dyn yu_vfs::DataSource> = if ypf.is_file() {
+        Box::new(YpfSource::open(&ypf, Codec::Cp932).expect("data.ypf"))
+    } else {
+        Box::new(DirSource::open(format!("{root}/data"), Codec::Cp932).expect("data"))
+    };
+    let aux = DirSource::open(&root, Codec::Cp932).expect("project");
+    let cfg = BootConfig {
+        entry_label: "SYSTEM_START".to_string(),
+        fps: 60,
+        record_events: false,
+        debug_mode: false,
+        ..BootConfig::default()
+    };
+    let vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).expect("boot");
+    let viewport = Viewport::new(
+        vm.tables().boot.config.width,
+        vm.tables().boot.config.height,
+    );
+
+    let mut tables = vm.tables().clone();
+    tables.boot.config.image_ext_order = [0; 8];
+    let config = GfxConfig::new(viewport);
+    assert!(config.image_probe_order.is_empty(), "GfxConfig 不得内置探测序");
+    let err = match GfxState::from_tables(&tables, config) {
+        Ok(_) => panic!("yscfg 空序 + 宿主未注入 必须拒绝构造"),
+        Err(diag) => diag,
+    };
+    assert_eq!(err.code, yu_gfx::error::code::CONFIG_PROBE_ORDER_MISSING);
+
+    // 宿主显式注入(不是兜底)后允许构造。
+    let mut injected = GfxConfig::new(viewport);
+    injected.image_probe_order = vec![yu_gfx::ImageFormat::Png];
+    let state = GfxState::from_tables(&tables, injected).expect("显式注入应允许构造");
+    assert_eq!(state.frame().image_probe_order.len(), 1);
 }

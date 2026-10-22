@@ -90,13 +90,35 @@ instance/device 创建与一次性读回。
 ```text
 src/device.rs     instance/adapter/device/queue;platform.gpu.* 诊断码
 src/textures.rs   TextureStore RGBA8 → GPU 上传;资产/目标身份与缓存
-src/pipelines.rs  blend 管线(0/1/2/6/7 + psC/psD);bind group/sampler/paint 缓存
-src/shaders/      引擎 shader 的独立 WGSL + registry(quad/fixed/psC/psD/paint)
+src/pipelines.rs  blend 管线(0/1/2/6/7 + psC/psD + psA/psB);bind group/sampler/paint 缓存
+src/shaders/      引擎 shader 的独立 WGSL + registry(quad/fixed/psC/psD/psA/psB/paint)
 src/passes.rs     按 passes 顺序规划:跳过记账、纹理解析、顶点生成
 src/readback.rs   texture → 256 字节行对齐 buffer → 紧凑 RGBA8
-src/lib.rs        WgpuRenderer::new / render_frame;GpuStats
+src/lib.rs        WgpuRenderer::new / render_frame / render_frame_scaled;GpuStats
 examples/wgpu_first_frame.rs
 ```
+
+## 显示缩放(effect Pass2/Pass3)
+
+引擎把内部画面呈现到窗口时按 `DAT_00801334` 选 effect pass:
+`2 → psB`(4-tap 锐利双线性)、否则 `3 → psA`(16-tap 双三次)。
+后端提供**加法 API**,不改变 `render_frame` 的 1:1 行为:
+
+```rust
+use yu_backend_wgpu::ScaleFilter;
+
+let out = backend.render_frame_scaled(
+    &frame,
+    Viewport::new(window_w, window_h),
+    ScaleFilter::Bicubic,       // 或 ScaleFilter::Sharp
+)?;
+```
+
+- 合成仍在 `frame.viewport`(引擎逻辑分辨率)完成,缩放只作用于呈现;
+- `:/W0/` 后缓冲保留缩放前的画面,COPY 语义不变;
+- 逐指令复刻:`SharpN = 1.25`(FXO 初值,引擎不写)、
+  `YS_TexDiffU = (2/W, 0)`、D3D9 POINT 的 `floor(u*W)` tap 规则;
+- 测试:`tests/wgpu.rs::display_scale_*`(1:1、2×、0.625× 与 CPU 参考 ≤1)。
 
 模块边界与任务书建议略有调整:bind group 需要 bind group layout/sampler,
 放在 `pipelines.rs`;`passes.rs` 产出有序计划,`lib.rs` 按该计划录制命令。

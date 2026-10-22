@@ -1,6 +1,6 @@
 # DIV-HOST-001 · `Engine::restart` 不重置渲染器状态,跨重启快照/后缓冲泄漏
 
-- 状态: open
+- 状态: **fixed(AU1,2026-10-22)**
 - 优先级: 高(Restart 后首帧含 COPY 时像素直接错)
 - 发现日期 / 方式: 2026-10-22 / 代码审查(`yu-cli` + 两个后端)
 
@@ -44,18 +44,34 @@ K1 的 Restart 验收只比对了 title 稳定帧哈希(`gfx frame 303`),该帧�
 COPY 已结束、快照已稳定;没有覆盖“重启后首帧含 COPY”的路径。因此
 现有验收通过不代表重启正确。
 
-## 修法(二选一,需裁决)
+## 修法(AU1 已落地)
 
-1. **`reset()`**:两个后端各加 `fn reset(&mut self)`,清 `last_screen`/
-   `backbuffer`/`snapshots`/`image_cache`/`uploaded_overrides`;
-   `Engine::restart` 在 `boot()` 之后调用。假设:引擎重启 = 新设备。
-2. **代际隔离**:`CopyId` 带上重启代际(`CopyId { epoch, seq }`),后端
-   按代际丢弃旧快照。改动更大,但不需要假设“重启 = 新设备”。
+采用方案 1(`reset()`),与 `restart` 现有的“重建 `Vm`/`GfxState`”语义一致:
 
-倾向 1(与 `restart` 现有的“重建 `Vm`/`GfxState`”语义一致)。
+- `SoftRenderer::reset()`:清 `snapshots`、`last_screen`、`image_cache`;
+- `WgpuRenderer::reset()`:清 `backbuffer`/`backbuffer_gpu`/
+  `uploaded_overrides`/`image_cache`,并 `TargetSet::clear_snapshots` +
+  `clear_offscreen`(同时 `forget_texture` 作废旧 bind group);
+- `Engine::restart` 在 `boot()` 成功后调用 `renderer.reset()`;
+- 纹理解析缓存(`TextureStore`)与 GPU 管线保留:只依赖游戏数据,与运行代际无关。
 
-## 回归
+假设写明:**引擎重启 = 新设备**(快照不跨进程保留)。这条没有引擎 trace 证据,
+但 `restart` 本来就在重建 `Vm`/`GfxState`,保留旧快照没有任何语义依据。
 
-- 需要一条用例:跑到含 COPY 的帧 → Restart → 再跑到同帧 → 两帧哈希相同;
-- 现有可能覆盖不到:`cases/until-visible.json` 只跑到首个可见帧(首个
-  可见帧的 COPY 恰好是 A1 的失败路径)。
+## 回归(AU1 已补)
+
+`crates/yu-cli/tests/restart.rs`(`#[ignore]`,需真实语料):
+
+```text
+参照组(全新 Engine):跑到 3 tick,记录 (frame, RGBA sha256, display sha256)
+重启组:先跑到 300 tick(title),restart,再跑 3 tick,记录同一组值
+断言:frame / RGBA sha256 / display sha256 全部相等
+```
+
+**为什么必须先跑到 title**:只跑 3 帧时重启前后后缓冲都是黑的,泄漏不可见
+(第一版用例就是这样,去掉 `reset()` 仍然通过)。改到 title 后,旧 `last_screen`
+里有 title 画面,泄漏会让首帧 `COPY ID=:/W0/` 截到它。
+
+另有一条纯单元回归(不依赖样本):
+`crates/yu-backend-soft/tests/render.rs::reset_drops_snapshots_so_new_copy_ids_do_not_alias`
+—— 去掉 `snapshots.clear()` 立即失败(旧快照 `[255,0,0]` 冻结)。

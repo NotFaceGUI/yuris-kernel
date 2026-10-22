@@ -63,8 +63,12 @@ pub mod code {
     pub const INTERNAL: &str = "gfx.internal";
     /// 工程命令表缺失/不可用。
     pub const TABLE_MISSING: &str = "gfx.table.missing";
-    /// `yscfg` 的扩展名探测序为空,使用宿主/默认顺序(A5 显式记录)。
-    pub const CONFIG_PROBE_ORDER: &str = "gfx.config.probe_order_fallback";
+    /// `yscfg` 的扩展名探测序缺失(A5:缺表必须拒绝/显式挂号,不得兜底)。
+    pub const CONFIG_PROBE_ORDER_MISSING: &str = "gfx.config.probe_order_missing";
+    /// 主组 COPY 在首帧没有后缓冲源(DIV-GFX-051)。
+    pub const COPY_NO_BACKBUFFER: &str = "gfx.copy.source.no_backbuffer";
+    /// 复制源层已删除且没有命令时刻纹理快照(DIV-GFX-053)。
+    pub const COPY_SOURCE_GONE: &str = "gfx.copy.source.gone";
 }
 
 pub fn fatal(code: &'static str, detail: impl Into<String>) -> Diag {

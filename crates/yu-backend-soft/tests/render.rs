@@ -42,6 +42,7 @@ fn table() -> ParamTable {
                 "CG",
                 &["ID", "FILE", "E", "A", "X", "Y", "Z", "SX", "SY", "MODE"],
             ),
+            command("CGEND", &["ID"]),
             command("CGACT", &[
                 "ID",
                 "ID2",
@@ -437,4 +438,181 @@ fn copy_texture_pass_executes_and_draws_snapshot() {
         out.report.skipped
     );
     assert_eq!(out.surface.pixel(0, 0), Some([0, 0, 255, 255]));
+}
+
+/// `DIV-GFX-051`:主组 `COPY ID=:/W0/` 在**首帧**(没有上一帧屏幕)必须
+/// 复制设备初始化的后缓冲(= `frame.clear`),而不是报 `offscreen_missing`。
+///
+/// 证据:D3D9 设备创建后后缓冲即存在,内容为初始化清屏色(DIV-GFX-010);
+/// 主组已直绘、没有离屏 RT(EVID-J3-07),所以首帧唯一可用的源就是它。
+#[test]
+fn main_group_copy_on_first_frame_uses_device_clear() {
+    let table = table();
+    let mut gfx = state(Viewport::new(4, 4), [10, 20, 30, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"CGS".to_vec())),
+                arg(&table, "CG", "E", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b":/W0/".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"CGS".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    assert!(
+        frame
+            .passes
+            .iter()
+            .any(|p| matches!(p.target, yu_gfx::PassTarget::Texture(_))),
+        "主组 COPY 应输出纹理 pass"
+    );
+
+    // 首帧:渲染器没有 last_screen。
+    let mut backend = SoftRenderer::new(texture_store(&[]));
+    let out = backend.render_frame(&frame);
+    assert!(
+        !out.report.skipped.iter().any(|s| s.kind == "copy"),
+        "首帧主组 COPY 不应被跳过: {:?}",
+        out.report.skipped
+    );
+    // 快照内容 = 设备清屏色。
+    assert_eq!(out.surface.pixel(0, 0), Some([10, 20, 30, 255]));
+}
+
+/// `DIV-GFX-053` + `DIV-GFX-054`:源层在同一帧被 `CGEND` 删除,且区域只给
+/// `X/X2`(无 `Y/Y2`)。官方在命令时刻已完成复制(切片是整高),所以
+/// 快照必须按命令时刻的源纹理 + 整高区域生成。
+#[test]
+fn copy_slices_full_height_after_source_layer_is_gone() {
+    let table = table();
+    let mut gfx = state(Viewport::new(8, 4), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"TMP".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"red".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"DST".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"TMP".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"DST".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+                arg(&table, "CGACT", "X", Value::Int(0)),
+                arg(&table, "CGACT", "X2", Value::Int(1)),
+            ],
+        ),
+        // 源层在本帧稍后被删(ERIS 按钮快照的真实序列)。
+        call(
+            1,
+            "CGEND",
+            vec![arg(&table, "CGEND", "ID", Value::Str(b"TMP".to_vec()))],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let mut backend = SoftRenderer::new(texture_store(&[(
+        b"red.png",
+        png_bytes_for_wh(4, 4, Rgba([255, 0, 0, 255])),
+    )]));
+    let out = backend.render_frame(&frame);
+    assert!(
+        !out.report.skipped.iter().any(|s| s.kind == "copy"),
+        "源层删除后 COPY 应仍可重放: {:?}",
+        out.report.skipped
+    );
+}
+
+/// `DIV-HOST-001`:渲染器 `reset()` 必须清掉快照;否则重启后新 `CopyId`
+/// (从 0 重新分配)会命中旧快照并冻结早退。
+#[test]
+fn reset_drops_snapshots_so_new_copy_ids_do_not_alias() {
+    let table = table();
+    let mut backend = SoftRenderer::new(texture_store(&[
+        (b"red.png", png_bytes_for_wh(2, 2, Rgba([255, 0, 0, 255]))),
+        (b"blue.png", png_bytes_for_wh(2, 2, Rgba([0, 0, 255, 255]))),
+    ]));
+    let build = |color_file: &[u8], frame_no: u64| {
+        let mut gfx = state(Viewport::new(4, 4), [0, 0, 0, 255]);
+        gfx.consume_events(&[
+            VmEvent::FrameStart { frame: frame_no },
+            call(
+                frame_no,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"SRC".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(color_file.to_vec())),
+                ],
+            ),
+            call(
+                frame_no,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"DST".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"".to_vec())),
+                ],
+            ),
+            call(
+                frame_no,
+                "CGACT",
+                vec![
+                    arg(&table, "CGACT", "ID", Value::Str(b"SRC".to_vec())),
+                    arg(&table, "CGACT", "ID2", Value::Str(b"DST".to_vec())),
+                    arg(&table, "CGACT", "COPY2", Value::Int(1)),
+                ],
+            ),
+            VmEvent::FrameEnd { frame: frame_no },
+        ]);
+        gfx.frame()
+    };
+
+    let first = build(b"red", 1);
+    let out = backend.render_frame(&first);
+    assert_eq!(out.surface.pixel(0, 0), Some([255, 0, 0, 255]));
+
+    // “重启”:GfxState 重建 ⇒ CopyId 从 0 重新分配。
+    backend.reset();
+    backend.textures_mut().begin_frame();
+
+    let second = build(b"blue", 1);
+    let out = backend.render_frame(&second);
+    assert_eq!(
+        out.surface.pixel(0, 0),
+        Some([0, 0, 255, 255]),
+        "reset 后同 id 的快照必须重新捕获(不能冻结在旧像素)"
+    );
+}
+
+fn png_bytes_for_wh(width: u32, height: u32, color: Rgba<u8>) -> Vec<u8> {
+    let image = RgbaImage::from_pixel(width, height, color);
+    let mut out = Vec::new();
+    PngEncoder::new(&mut out)
+        .write_image(image.as_raw(), width, height, ExtendedColorType::Rgba8)
+        .expect("encode fixture");
+    out
 }

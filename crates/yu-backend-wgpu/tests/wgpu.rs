@@ -9,7 +9,7 @@ use image::codecs::png::PngEncoder;
 use image::{ExtendedColorType, ImageEncoder, Rgba, RgbaImage};
 use yu_backend_soft::{SoftRenderer, TextureStore};
 use yu_backend_wgpu::device::code;
-use yu_backend_wgpu::{DeviceOptions, WgpuRenderOutput, WgpuRenderer};
+use yu_backend_wgpu::{DeviceOptions, ScaleFilter, WgpuRenderOutput, WgpuRenderer};
 use yu_format::yscm::{Arg as FmtArg, Command as FmtCommand, CommandTable};
 use yu_gfx::{Clear, GfxConfig, GfxState, ImageFormat, ParamTable, Viewport};
 use yu_rt::event::{ArgValue, Domain, VmEvent};
@@ -60,6 +60,8 @@ fn table() -> ParamTable {
                 "RECTPAINT",
                 "RECTPAINT2",
                 "RECTPAINT3",
+                "REVERSE",
+                "HORIZONTAL",
             ]),
         ],
         messages: Vec::new(),
@@ -709,4 +711,314 @@ fn fixed_pipeline_modes_3_5_6_7_9_match_soft() {
         let center = pixel(&gpu, 1, 1);
         assert_eq!(&center[..3], &rgb[..], "MODE {mode} center {center:?}");
     }
+}
+
+// ---- 引擎显示缩放 effect Pass2/Pass3 -------------------------------------
+
+/// 确定性 RGB 图案(alpha 全 255,避免层 alpha 干扰滤镜对拍)。
+fn pattern_png(width: u32, height: u32) -> Vec<u8> {
+    let image = RgbaImage::from_fn(width, height, |x, y| {
+        Rgba([
+            ((x * 37 + y * 11) % 251) as u8,
+            ((x * 13 + y * 47) % 241) as u8,
+            ((x * 71 + y * 29) % 239) as u8,
+            255,
+        ])
+    });
+    let mut out = Vec::new();
+    PngEncoder::new(&mut out)
+        .write_image(image.as_raw(), width, height, ExtendedColorType::Rgba8)
+        .expect("encode pattern");
+    out
+}
+
+fn fullscreen_pattern_frame(
+    table: &ParamTable,
+    width: u32,
+    height: u32,
+) -> yu_gfx::CompositorFrame {
+    let mut gfx = state(Viewport::new(width, height), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(table, "CG", "ID", Value::Str(b"A".to_vec())),
+                arg(table, "CG", "FILE", Value::Str(b"pat".to_vec())),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    gfx.frame()
+}
+
+fn ref_texel(src: &[u8], width: u32, height: u32, x: i64, y: i64) -> [f32; 4] {
+    let x = x.clamp(0, i64::from(width) - 1) as u32;
+    let y = y.clamp(0, i64::from(height) - 1) as u32;
+    let i = ((y as usize) * (width as usize) + x as usize) * 4;
+    [
+        f32::from(src[i]) / 255.0,
+        f32::from(src[i + 1]) / 255.0,
+        f32::from(src[i + 2]) / 255.0,
+        f32::from(src[i + 3]) / 255.0,
+    ]
+}
+
+fn ref_mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    let mut out = [0.0; 4];
+    for i in 0..4 {
+        out[i] = a[i] * (1.0 - t) + b[i] * t;
+    }
+    out
+}
+
+fn ref_encode(color: [f32; 4]) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for i in 0..4 {
+        out[i] = (color[i].clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    out
+}
+
+/// psA 的三次权重(与 ps_2_0 常量 c2..c5 同式)。
+fn cubic_weights(f: f32) -> [f32; 4] {
+    let f2 = f * f;
+    let f3 = f2 * f;
+    [
+        -f3 + 2.0 * f2 - f,
+        f3 - 2.0 * f2 + 1.0,
+        -f3 + f2 + f,
+        f3 - f2,
+    ]
+}
+
+/// 与 WGSL 同式的 CPU 参考:输出像素中心减半 texel → point tap → u8。
+fn reference_scale(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    output_width: u32,
+    output_height: u32,
+    filter: ScaleFilter,
+) -> Vec<u8> {
+    let mut out = vec![0u8; (output_width as usize) * (output_height as usize) * 4];
+    for y in 0..output_height {
+        for x in 0..output_width {
+            let qx = (f64::from(x) + 0.5) * f64::from(width) / f64::from(output_width) - 0.5;
+            let qy = (f64::from(y) + 0.5) * f64::from(height) / f64::from(output_height) - 0.5;
+            let fx = (qx - qx.floor()) as f32;
+            let fy = (qy - qy.floor()) as f32;
+            let ix = qx.floor() as i64;
+            let iy = qy.floor() as i64;
+            let color = match filter {
+                ScaleFilter::Sharp => {
+                    let wx = ((fx - 0.5) * 1.25 + 0.5).clamp(0.0, 1.0);
+                    let wy = ((fy - 0.5) * 1.25 + 0.5).clamp(0.0, 1.0);
+                    let top = ref_mix(
+                        ref_texel(src, width, height, ix, iy),
+                        ref_texel(src, width, height, ix + 1, iy),
+                        wx,
+                    );
+                    let bottom = ref_mix(
+                        ref_texel(src, width, height, ix, iy + 1),
+                        ref_texel(src, width, height, ix + 1, iy + 1),
+                        wx,
+                    );
+                    ref_mix(top, bottom, wy)
+                }
+                ScaleFilter::Bicubic => {
+                    let wx = cubic_weights(fx);
+                    let wy = cubic_weights(fy);
+                    let mut sum = [0.0f32; 4];
+                    for (r, wy_r) in wy.iter().enumerate() {
+                        for (c, wx_c) in wx.iter().enumerate() {
+                            let tap = ref_texel(
+                                src,
+                                width,
+                                height,
+                                ix - 1 + c as i64,
+                                iy - 1 + r as i64,
+                            );
+                            let weight = wx_c * wy_r;
+                            for ch in 0..4 {
+                                sum[ch] += tap[ch] * weight;
+                            }
+                        }
+                    }
+                    sum
+                }
+            };
+            let encoded = ref_encode(color);
+            let i = ((y as usize) * (output_width as usize) + x as usize) * 4;
+            out[i..i + 4].copy_from_slice(&encoded);
+        }
+    }
+    out
+}
+
+fn assert_scale_matches_reference(
+    filter: ScaleFilter,
+    output_width: u32,
+    output_height: u32,
+) {
+    let table = table();
+    let (width, height) = (8u32, 6u32);
+    let frame = fullscreen_pattern_frame(&table, width, height);
+    let assets = [(b"pat.png".as_slice(), pattern_png(width, height))];
+    let Some(mut renderer) = renderer_or_skip(store(&assets)) else {
+        return;
+    };
+    // 屏幕纹理 = 1:1 合成结果,作为滤镜参考的输入。
+    let screen = renderer.render_frame(&frame).expect("screen render");
+    let expected = reference_scale(
+        &screen.surface.rgba,
+        width,
+        height,
+        output_width,
+        output_height,
+        filter,
+    );
+    let out = renderer
+        .render_frame_scaled(
+            &frame,
+            Viewport::new(output_width, output_height),
+            filter,
+        )
+        .expect("scaled render");
+    assert_eq!(
+        (out.surface.width, out.surface.height),
+        (output_width, output_height)
+    );
+    assert_eq!(out.surface.rgba.len(), expected.len());
+    for (index, (actual, want)) in out
+        .surface
+        .rgba
+        .chunks_exact(4)
+        .zip(expected.chunks_exact(4))
+        .enumerate()
+    {
+        for channel in 0..4 {
+            assert!(
+                actual[channel].abs_diff(want[channel]) <= 1,
+                "{filter:?} {output_width}x{output_height} pixel {index} \
+                 actual={actual:?} expected={want:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn display_scale_1to1_reproduces_composited_screen() {
+    // 8×6(2 的幂)与 7×5(非 2 的幂;覆盖 base*W 的 f32 舍入)。
+    for (width, height) in [(8u32, 6u32), (7, 5)] {
+        let table = table();
+        let frame = fullscreen_pattern_frame(&table, width, height);
+        let assets = [(b"pat.png".as_slice(), pattern_png(width, height))];
+        let Some(mut renderer) = renderer_or_skip(store(&assets)) else {
+            return;
+        };
+        let base = renderer.render_frame(&frame).expect("base render");
+        assert_eq!(base.stats.draw_calls, 1);
+        for filter in [ScaleFilter::Sharp, ScaleFilter::Bicubic] {
+            let scaled = renderer
+                .render_frame_scaled(&frame, Viewport::new(width, height), filter)
+                .expect("scaled render");
+            for (actual, want) in scaled
+                .surface
+                .rgba
+                .chunks_exact(4)
+                .zip(base.surface.rgba.chunks_exact(4))
+            {
+                for channel in 0..4 {
+                    assert!(
+                        actual[channel].abs_diff(want[channel]) <= 1,
+                        "{width}x{height} {filter:?} 1:1 actual={actual:?} expected={want:?}"
+                    );
+                }
+            }
+            // 合成 1 次 draw + 缩放 1 次内部 draw。
+            assert_eq!(scaled.stats.draw_calls, 2, "{filter:?}");
+        }
+    }
+}
+
+#[test]
+fn display_scale_psb_matches_reference_upscale_and_downscale() {
+    assert_scale_matches_reference(ScaleFilter::Sharp, 16, 12);
+    assert_scale_matches_reference(ScaleFilter::Sharp, 5, 4);
+}
+
+#[test]
+fn display_scale_psa_matches_reference_upscale_and_downscale() {
+    assert_scale_matches_reference(ScaleFilter::Bicubic, 16, 12);
+    assert_scale_matches_reference(ScaleFilter::Bicubic, 5, 4);
+}
+
+/// `DIV-GFX-052`:同层先 `RECTPAINT3` 再 `REVERSE`,两端必须逐像素一致。
+///
+/// 证据:脚本对 `SPLTRBUF` 先涂色再反色(`es_Sprite.yst:4233/6106` 的
+/// `CGACT[REVERSE=1]`);引擎按命令顺序立即作用在同一纹理上(EVID-T-15)。
+#[test]
+fn reverse_after_rectpaint_matches_soft() {
+    let table = table();
+    let mut gfx = state(Viewport::new(2, 2), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"T".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"".to_vec())),
+                arg(&table, "CG", "SX", Value::Int(2)),
+                arg(&table, "CG", "SY", Value::Int(2)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"T".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0xFF102030)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"T".to_vec())),
+                arg(&table, "CGACT", "REVERSE", Value::Int(1)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+
+    let Some(mut gpu) = renderer_or_skip(store(&[])) else {
+        return;
+    };
+    let gpu_out = gpu.render_frame(&frame).expect("render");
+    let mut soft = SoftRenderer::new(store(&[]));
+    let soft_out = soft.render_frame(&frame);
+
+    assert_eq!(gpu_out.report.ops_total, soft_out.report.ops_total);
+    assert_eq!(gpu_out.report.ops_drawn, soft_out.report.ops_drawn);
+    assert_eq!(gpu_out.report.skipped, soft_out.report.skipped);
+    let soft_surface = soft_out_surface(&soft_out);
+    assert_eq!(
+        pixel(&gpu_out, 0, 0),
+        pixel_of_surface(&soft_surface, 0, 0)
+    );
+    // 0x10,0x20,0x30 反色 = 0xEF,0xDF,0xCF;alpha 保持 0xFF。
+    assert_eq!(pixel(&gpu_out, 0, 0), [0xEF, 0xDF, 0xCF, 0xFF]);
+}
+
+fn soft_out_surface(out: &yu_backend_soft::RenderOutput) -> yu_backend_soft::Surface {
+    out.surface.clone()
+}
+
+fn pixel_of_surface(surface: &yu_backend_soft::Surface, x: u32, y: u32) -> [u8; 4] {
+    surface.pixel(x, y).expect("pixel inside surface")
 }

@@ -253,8 +253,16 @@ fn command_list() -> Vec<FmtCommand> {
     ]
 }
 
+/// 测试夹具:**显式**注入探测序(不是内置兜底;A5 只禁止“缺表时猜”)。
 pub fn state() -> GfxState {
-    GfxState::new(table(), GfxConfig::new(Viewport::new(800, 600)))
+    let mut config = GfxConfig::new(Viewport::new(800, 600));
+    config.image_probe_order = vec![
+        yu_gfx::ImageFormat::Png,
+        yu_gfx::ImageFormat::Bmp,
+        yu_gfx::ImageFormat::Jpg,
+        yu_gfx::ImageFormat::Gif,
+    ];
+    GfxState::new(table(), config)
 }
 
 pub fn slot(table: &ParamTable, cmd: &str, name: &str) -> u8 {

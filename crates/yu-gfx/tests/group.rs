@@ -110,10 +110,10 @@ fn copy_with_region_keeps_raw_bounds() {
     assert_eq!(
         copy.region,
         CopyRegion::Partial {
-            x: 10,
-            y: 20,
-            x2: -30,
-            y2: -40
+            x: Some(10),
+            y: Some(20),
+            x2: Some(-30),
+            y2: Some(-40)
         }
     );
 }

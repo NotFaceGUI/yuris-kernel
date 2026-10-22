@@ -125,11 +125,15 @@ fn probe_order_matches_real_eris_yscfg() {
     );
 }
 
+/// A5:没有内置默认序。`GfxConfig::new` 的探测序为空,只有工程 `yscfg`
+/// 或宿主**显式注入**才非空(`GfxState::from_tables` 对两者都空时拒绝构造)。
 #[test]
-fn default_probe_order_is_manual_order() {
-    let f = state().frame();
+fn probe_order_has_no_builtin_default() {
+    let config = GfxConfig::new(Viewport::new(800, 600));
+    assert!(config.image_probe_order.is_empty());
+    // 夹具显式注入后才有值(见 support::state)。
     assert_eq!(
-        f.image_probe_order,
+        state().frame().image_probe_order,
         vec![
             ImageFormat::Png,
             ImageFormat::Bmp,

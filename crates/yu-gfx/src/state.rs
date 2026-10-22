@@ -59,6 +59,11 @@ pub struct GfxConfig {
     pub viewport: Viewport,
     pub clear: Clear,
     pub filter: TextureFilter,
+    /// 资产扩展名探测序。
+    ///
+    /// **A5**:不设内置默认值。`GfxState::from_tables` 从工程 `yscfg` 装载;
+    /// `yscfg` 为空且这里也为空时**拒绝构造**(`gfx.config.probe_order_missing`)。
+    /// 宿主若确有独立证据,可显式填本字段(显式注入不是兜底)。
     pub image_probe_order: Vec<ImageFormat>,
     /// 引擎 `@_DXMODE` 的宿主注入值(0 = 固定管线)。见
     /// [`crate::CompositorFrame::dx_mode`] 的范围说明。
@@ -75,7 +80,8 @@ impl GfxConfig {
             viewport,
             clear: Clear::default_black(),
             filter: TextureFilter::unknown(),
-            image_probe_order: crate::frame::default_probe_order(),
+            // A5:未装载前为空;`from_tables` 负责从 `yscfg` 填充并校验。
+            image_probe_order: Vec::new(),
             dx_mode: 0,
             main_layer_set: LayerId::new(b":/W0".to_vec()),
         }
@@ -117,8 +123,6 @@ pub struct GfxState {
     image_log_dropped: u64,
     /// 本帧诊断(按 `(code, command, detail)` 有序去重;`FrameStart` 清空)。
     diags: BTreeMap<(String, String, String), error::FrameDiag>,
-    /// `yscfg.image_ext_order` 为空,帧内显式记录一次回退(A5)。
-    probe_order_defaulted: bool,
     /// 窗口状态(按 `NO`;0 = 主窗口)。
     windows: BTreeMap<u8, WindowState>,
     /// 资产像素尺寸缓存(键 = `CG[FILE]` 原始字节)。
@@ -142,20 +146,25 @@ impl GfxState {
         let params = ParamTable::from_tables(tables);
         params.validate()?;
         let order = probe_order_from_codes(&tables.boot.config.image_ext_order);
-        // A5:缺表不得静默兜底。工程 yscfg 总是存在(TableSet 已装载),
-        // 这里只处理“字段全 0”的合法数据:保留宿主/默认顺序,但在帧诊断里
-        // 显式记录 `gfx.config.probe_order_fallback`。
-        let probe_order_defaulted = order.is_empty();
+        // A5:缺表不得静默兜底。
+        // - `yscfg` 给出非空序 → 用它(引擎设置优先);
+        // - `yscfg` 为空、宿主显式注入了序 → 用宿主的(显式注入,不是内置表);
+        // - 两者都为空 → 拒绝构造,让宿主显式给值。
         if !order.is_empty() {
             config.image_probe_order = order;
+        }
+        if config.image_probe_order.is_empty() {
+            return Err(error::fatal(
+                error::code::CONFIG_PROBE_ORDER_MISSING,
+                "工程 yscfg 的 image_ext_order 为空,且宿主未显式注入探测序;按 A5 拒绝启动(禁止内置兜底表)",
+            )
+            .at_table("yscfg"));
         }
         let cfg = &tables.boot.config;
         if cfg.width != 0 && cfg.height != 0 {
             config.viewport = Viewport::new(cfg.width, cfg.height);
         }
-        let mut state = Self::new(params, config);
-        state.probe_order_defaulted = probe_order_defaulted;
-        Ok(state)
+        Ok(Self::new(params, config))
     }
 
     pub fn new(params: ParamTable, config: GfxConfig) -> Self {
@@ -176,7 +185,6 @@ impl GfxState {
             copy_log_dropped: 0,
             image_log_dropped: 0,
             diags: BTreeMap::new(),
-            probe_order_defaulted: false,
             windows,
             asset_sizes: BTreeMap::new(),
             snapshot_sizes: BTreeMap::new(),
@@ -306,21 +314,31 @@ impl GfxState {
         // 1. 纹理复制/图像加工:按**命令执行序**交错输出(EVID-T-15;
         //    官方处理器在命令到达时立即执行,COPY 看到的是此前加工后的纹理)。
         //
-        // 只输出仍然可达的项:目标仍引用该快照,且复制源在帧内仍存在。
-        // 源已被 CGEND 删除的快照无法在渲染期重放,完整历史留在
-        // `GfxState::copies()` 供审计。
+        // 可达性:
+        // - 复制目标必须仍引用该快照(否则快照无人可见);
+        // - 源层仍存在 → 按层自合成;源层已被 `CGEND` 删除 → 用命令时刻
+        //   记录的 `source_texture` 重放(`DIV-GFX-053`:ERIS 按钮快照的
+        //   源 `BT.OFF.TMP` 在同一批命令末尾被删,官方复制已经完成)。
+        //   两者都不可得才丢弃,完整历史留在 `GfxState::copies()` 供审计。
         let mut texture_ops: Vec<(u64, Op)> = Vec::new();
         for c in &self.copy_log {
             let dest_live = self
                 .nodes
                 .get(&c.dest)
                 .is_some_and(|n| matches!(n.layer.texture, TextureRef::Snapshot(id) if id == c.id));
+            if !dest_live {
+                continue;
+            }
             let source_live = match &c.source {
                 CopySource::Layer(id) | CopySource::Group(id) => self.nodes.contains_key(id),
             };
-            if dest_live && source_live {
-                texture_ops.push((c.seq, Op::Copy(c.clone())));
+            if c.status == OpStatus::Executable
+                && !source_live
+                && c.source_texture.is_none()
+            {
+                continue;
             }
+            texture_ops.push((c.seq, Op::Copy(c.clone())));
         }
         for i in &self.image_log {
             let source_live = self.nodes.contains_key(&i.source);
@@ -391,18 +409,6 @@ impl GfxState {
             .sort_by(|a, b| (a.z, a.seq, &a.id).cmp(&(b.z, b.seq, &b.id)));
         f.text = self.text.clone();
         f.diagnostics = self.diags.values().cloned().collect();
-        if self.probe_order_defaulted {
-            // A5:缺省兜底必须显式可见;合并计数,不静默。
-            f.diagnostics.push(error::FrameDiag::new(
-                error::code::CONFIG_PROBE_ORDER,
-                yu_log::Severity::Info,
-                "yscfg",
-                "image_ext_order 为空,采用宿主/默认探测顺序",
-            ));
-            // 保持帧诊断的稳定排序(code, command, detail)。
-            f.diagnostics
-                .sort_by(|a, b| (&a.code, &a.command, &a.detail).cmp(&(&b.code, &b.command, &b.detail)));
-        }
         f
     }
 
@@ -1309,14 +1315,24 @@ impl GfxState {
         let copy_id = CopyId(self.next_copy());
         let seq = self.next_texture_seq();
         let region = if x.is_some() || y.is_some() || x2.is_some() || y2.is_some() {
-            CopyRegion::Partial {
-                x: x.unwrap_or(0),
-                y: y.unwrap_or(0),
-                x2: x2.unwrap_or(0),
-                y2: y2.unwrap_or(0),
-            }
+            CopyRegion::Partial { x, y, x2, y2 }
         } else {
             CopyRegion::Full
+        };
+        // 命令时刻的源基础纹理(`DIV-GFX-053`)。
+        //
+        // 官方 COPY 在命令处理器里**立即**执行(EVID-T-15);源层可能在同帧
+        // 稍后被 `CGEND` 删除(ERIS 按钮快照:建 `BT.OFF.TMP` → 逐按钮
+        // `COPY2` 切片 → 全部按钮建完后 `CGEND[BT.OFF.TMP]`)。本内核的纹理
+        // pass 在帧末回放,那时源节点已不存在;记录当时的 `TextureRef` 才能
+        // 按官方语义重放。组源不需要(它按组 id 自合成)。
+        let source_texture = if source_is_group {
+            None
+        } else {
+            self.nodes
+                .get(source)
+                .map(|n| n.layer.texture.clone())
+                .filter(|t| !matches!(t, TextureRef::None))
         };
         self.copy_log.retain(|c| c.dest != *dest);
         self.image_log
@@ -1339,6 +1355,7 @@ impl GfxState {
             } else {
                 CopySource::Layer(source.clone())
             },
+            source_texture,
             dest: dest.clone(),
             region,
             timing: CopyTiming::CommandCurrent,

@@ -24,7 +24,7 @@ use yu_backend_soft::{
 };
 use yu_gfx::{
     fixed_pipeline_alpha, shader_alpha, BlendMode, Clear, CompositorFrame, CopyId, CopyOp,
-    CopyRegion, CopySource, ImageAction, ImageOp, Layer, LayerId, Op, OpStatus, PassTarget,
+    CopySource, ImageAction, ImageOp, Layer, LayerId, Op, OpStatus, PassTarget,
     TextureRef,
 };
 use yu_log::Diag;
@@ -577,7 +577,7 @@ impl Planner<'_> {
         // 引擎取样图层**当前像素**(EVID-T-05);脚本可能先加工配对层,
         // 因此优先用该层的图像加工覆盖纹理。
         let from = match transition.from_layer.as_ref() {
-            Some(id) => self.layer_image(id),
+            Some(id) => self.layer_image(id, None),
             None => self.image_ref(&transition.from),
         };
         let from = match from {
@@ -588,7 +588,7 @@ impl Planner<'_> {
             }
         };
         let mask = match transition.to_layer.as_ref() {
-            Some(id) => self.layer_image(id),
+            Some(id) => self.layer_image(id, None),
             None => self.image_ref(to),
         };
         let mask = match mask {
@@ -902,7 +902,7 @@ impl Planner<'_> {
         let source = match &copy.source {
             CopySource::Group(id) if Some(id) == main_group => self.backbuffer_image()?,
             CopySource::Group(id) => self.group_image(id)?,
-            CopySource::Layer(id) => self.layer_image(id)?,
+            CopySource::Layer(id) => self.layer_image(id, Some(copy))?,
         };
         // 已捕获的快照**冻结**(EVID-T-12,与 soft 的 `snapshots.contains_key`
         // 早退同义):命令段每帧都会重放这条 CopyOp,若再推一次 GPU 复制,
@@ -925,15 +925,7 @@ impl Planner<'_> {
         self.targets
             .ensure_snapshot(self.ctx, copy.id, width, height, self.pipelines)
             .map_err(|diag| diag.code.to_string())?;
-        let (x0, y0, x1, y1) = match copy.region {
-            CopyRegion::Full => (
-                0,
-                0,
-                i64::from(source.1) - 1,
-                i64::from(source.2) - 1,
-            ),
-            CopyRegion::Partial { x, y, x2, y2 } => (x, y, x2, y2),
-        };
+        let (x0, y0, x1, y1) = copy.region.resolve(source.1, source.2);
         if x1 < x0 || y1 < y0 {
             return Ok(());
         }
@@ -1057,15 +1049,25 @@ impl Planner<'_> {
     /// 内容未变时复用同一 GPU 纹理,避免逐帧重传。
     fn backbuffer_image(&mut self) -> Result<(u64, u32, u32), String> {
         let Some(buffer) = self.backbuffer else {
-            // 首帧没有后缓冲:回退到本帧组内容(引擎此时内容即为黑/上一呈现)。
-            let main = self
+            // 首帧没有后缓冲(DIV-GFX-051):D3D9 设备创建后后缓冲即存在,
+            // 内容是初始化清屏色(DIV-GFX-010)。主组已直绘、没有离屏 RT,
+            // 所以这里上传一张 `frame.clear` 的视口大小表面作为后缓冲初值,
+            // 与官方“首帧截图 = 启动黑屏”一致。
+            let (width, height) = (self.frame.viewport.width, self.frame.viewport.height);
+            let rgba = self
                 .frame
-                .windows
+                .clear
+                .rgba
                 .iter()
-                .find(|w| w.number == 0)
-                .and_then(|w| w.layer_set.clone())
-                .ok_or_else(|| "gfx.copy.source.missing".to_string())?;
-            return self.group_image(&main);
+                .copied()
+                .cycle()
+                .take(width as usize * height as usize * 4)
+                .collect::<Vec<u8>>();
+            let id = self
+                .gpu
+                .upload(self.ctx, width, height, &rgba, "backbuffer initial clear")
+                .map_err(|diag| diag.code.to_string())?;
+            return Ok((id, width, height));
         };
         let hash = hash_rgba(buffer.width, buffer.height, &buffer.rgba);
         if let Some((cached, id)) = *self.backbuffer_gpu {
@@ -1088,7 +1090,14 @@ impl Planner<'_> {
     }
 
     /// 图层源的当前图像。
-    fn layer_image(&mut self, id: &LayerId) -> Result<(u64, u32, u32), String> {
+    ///
+    /// 源层可能已被 `CGEND` 删除(`DIV-GFX-053`):此时回退到 `CopyOp` 在命令
+    /// 时刻记录的 `source_texture` 重放。
+    fn layer_image(
+        &mut self,
+        id: &LayerId,
+        fallback: Option<&CopyOp>,
+    ) -> Result<(u64, u32, u32), String> {
         if let Some(ov) = self.overrides.get(id) {
             // 加工后的图层:内容未变时复用跨帧 GPU 纹理,避免逐帧重传。
             let texture = &ov.tex;
@@ -1106,18 +1115,18 @@ impl Planner<'_> {
                 .insert(id.clone(), (gpu_id, texture.width, texture.height, hash));
             return Ok((gpu_id, texture.width, texture.height));
         }
-        let layer = self
-            .frame
-            .layers
-            .iter()
-            .find(|layer| &layer.id == id)
-            .ok_or_else(|| "gfx.copy.source.missing".to_string())?;
+        let layer = self.frame.layers.iter().find(|layer| &layer.id == id);
         // 组没有自身纹理:它的“当前图像”就是离屏 RT(与 soft 的
         // `layer_surface` 对 `TextureRef::Offscreen` 的处理同义)。
-        if layer.is_group() {
+        if layer.is_some_and(|layer| layer.is_group()) {
             return self.group_image(id);
         }
-        match &layer.texture {
+        let fallback_texture = fallback.and_then(|copy| copy.source_texture.as_ref());
+        let texture = match layer {
+            Some(layer) => &layer.texture,
+            None => fallback_texture.ok_or_else(|| "gfx.copy.source.gone".to_string())?,
+        };
+        match texture {
             TextureRef::Asset(key) => {
                 let gpu = &mut *self.gpu;
                 let textures = &mut *self.textures;
@@ -1389,6 +1398,59 @@ fn apply_image_to_override(
         overrides.insert(target.clone(), shared);
         return Ok(());
     }
+    // `REVERSE`/`HORIZONTAL`:整层像素变换,按“源身份 + 操作”跨帧缓存。
+    // 与 soft 的同名分支逐字对齐(`DIV-GFX-052`):源已在本帧加工过时基于
+    // 当前像素算一次(不缓存);否则按源身份查缓存。
+    if matches!(image.action, ImageAction::Reverse | ImageAction::Horizontal) {
+        if let Some(src) = overrides.get(&image.source) {
+            let mut texture = (*src.tex).clone();
+            match image.action {
+                ImageAction::Reverse => apply_reverse(&mut texture),
+                _ => apply_horizontal(&mut texture),
+            }
+            overrides.insert(target.clone(), Override::new(Rc::new(texture)));
+            return Ok(());
+        }
+        if let Some(layer) = frame.layers.iter().find(|l| l.id == image.source) {
+            let sig = if image.action == ImageAction::Reverse {
+                yu_backend_soft::ImageOpSig::Reverse
+            } else {
+                yu_backend_soft::ImageOpSig::Horizontal
+            };
+            let source_id = match &layer.texture {
+                TextureRef::Asset(key) => {
+                    Some(yu_backend_soft::ImageSource::Asset(key.clone()))
+                }
+                TextureRef::SolidBlack1x1 => Some(yu_backend_soft::ImageSource::Solid),
+                TextureRef::Snapshot(id) => {
+                    Some(yu_backend_soft::ImageSource::Snapshot(id.0))
+                }
+                _ => None,
+            };
+            let key = source_id.map(|source| yu_backend_soft::ImageCacheKey {
+                source,
+                op: sig,
+                region: None,
+            });
+            if let Some(key) = &key {
+                if let Some(hit) = image_cache.get(key) {
+                    overrides.insert(target.clone(), hit.clone());
+                    return Ok(());
+                }
+            }
+            let mut texture = (*resolve_base_texture(frame, textures, target)?).clone();
+            match image.action {
+                ImageAction::Reverse => apply_reverse(&mut texture),
+                _ => apply_horizontal(&mut texture),
+            }
+            let shared = Override::new(Rc::new(texture));
+            if let Some(key) = key {
+                image_cache.insert(key, shared.clone());
+            }
+            overrides.insert(target.clone(), shared);
+            return Ok(());
+        }
+    }
     let mut texture = match overrides.remove(target) {
         Some(ov) => Rc::try_unwrap(ov.tex).unwrap_or_else(|rc| (*rc).clone()),
         None => (*resolve_base_texture(frame, textures, target)?).clone(),
@@ -1467,23 +1529,14 @@ fn resolve_cpu_source(
                             return Err("gfx.imageop.source.group".to_string())
                         }
                     };
-                    let region = match copy.region {
-                        CopyRegion::Full => None,
-                        CopyRegion::Partial { x, y, x2, y2 } => Some((x, y, x2, y2)),
-                    };
-                    let (x0, y0, x1, y1) = region.unwrap_or((
-                        0,
-                        0,
-                        i64::from(source.width) - 1,
-                        i64::from(source.height) - 1,
-                    ));
+                    let (x0, y0, x1, y1) = copy.region.resolve(source.width, source.height);
                     let cw = (x1 - x0 + 1).max(1) as u32;
                     let ch = (y1 - y0 + 1).max(1) as u32;
                     return Ok(Rc::new(yu_backend_soft::scale_region(
                         &source,
                         cw,
                         ch,
-                        region,
+                        Some((x0, y0, x1, y1)),
                         false,
                     )));
                 }

@@ -214,8 +214,8 @@ pub fn scale_region(
             i64::from(src.height) - 1,
         ),
     };
-    let cw = (x1 - x0 + 1).max(1) as i64;
-    let ch = (y1 - y0 + 1).max(1) as i64;
+    let cw = (x1 - x0 + 1).max(1);
+    let ch = (y1 - y0 + 1).max(1);
     let mut out = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
     let sw = i64::from(src.width);
     let sh = i64::from(src.height);

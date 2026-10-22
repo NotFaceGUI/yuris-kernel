@@ -357,13 +357,13 @@ fn copy_region(out: &mut String, r: &CopyRegion) {
         CopyRegion::Full => out.push_str("{\"kind\":\"full\"}"),
         CopyRegion::Partial { x, y, x2, y2 } => {
             out.push_str("{\"kind\":\"partial\",\"x\":");
-            out.push_str(&x.to_string());
+            opt_i64(out, *x);
             out.push_str(",\"y\":");
-            out.push_str(&y.to_string());
+            opt_i64(out, *y);
             out.push_str(",\"x2\":");
-            out.push_str(&x2.to_string());
+            opt_i64(out, *x2);
             out.push_str(",\"y2\":");
-            out.push_str(&y2.to_string());
+            opt_i64(out, *y2);
             out.push('}');
         }
     }

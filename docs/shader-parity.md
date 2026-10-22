@@ -7,6 +7,10 @@
 > 真值层级:官方 exe 可观测行为/字节码 > SDK 0.495 逆向事实 > 真实语料 >
 > 旧接手线。引用地址 = PE 文件偏移(同时给 VA);反汇编工具 =
 > `fxc /dumpbin`(Windows SDK 10.0.22621 fxc,可正确解 ps_2_0)。
+>
+> **范围**:本台账只覆盖引擎主体 `yu-ris.exe` 的 FXO。E-mote 是可选第三方
+> 插件运行时(`YSEmote.dll` → `emotedriver.dll`),自带 58 个 shader,
+> 单独记在 `docs/emote-parity.md`;不计入“引擎内置 shader”的 4 个。
 
 ## 0. 证据源
 
@@ -38,7 +42,8 @@
 
 **结论(推翻审查报告 §1.4 的“13 个真实候选”)**:
 
-1. 引擎只有 **4 个 PS_2_0 着色器**,全部在同一个编译后 effect 容器里;
+1. 引擎主体只有 **4 个 PS_2_0 着色器**,全部在同一个编译后 effect 容器里;
+   (E-mote 插件的 58 个 shader 属于独立运行时,见 `docs/emote-parity.md`。)
 2. **没有 `ps_1_1`/`ps_1_4`/`ps_3_0` 字节码**;对应命中均为版本常量或元数据表;
 3. **没有 `vs_1_1` 顶点着色器**;`0x15598c` 是 `cmp edx, 0xFFFE0101`,位于
    D3DX9 静态库的版本校验代码;引擎顶点处理是固定管线 FVF
@@ -119,11 +124,43 @@ HLSL 参数设置(REA 地址,均在 `0x416a..0x416e`):
 
 `DAT_00801334` 在 `0x460924` 由配置字段 `piVar2[8]` 映射:
 `0→3, 1→2, 2→1, 3→0`;`FUN_0041a308` 按 2/3 生成 4/8 组 UV。
-`0x460924` 同时**无条件**写入采样器全局:
-`MAG=1(LINEAR)`、`MIN=1(LINEAR)`、`MIP=0(POINT)`、aniso=0
-(`DAT_005b4804/4808/80131c/801320`),不读取任何 MIP/aniso 设置。
-=> 审查 SH-13 的“MIP/aniso 被静默忽略”在引擎侧没有对应设置:
-引擎本身就是 LINEAR/LINEAR/POINT 且无 mip 链。
+
+**采样器(2026-10-22 复核)**:
+- **全局帧采样**走 `FUN_0043cd6c`:配置枚举 `0/1/2` 分别映射到 D3D9
+  `D3DTEXF_POINT/LINEAR/ANISOTROPIC`(值 1/2/3)。`DAT_005b4804/4808/80131c`
+  = 1/1/0,所以全局是 **LINEAR/LINEAR/POINT**(D3DTEXF 2/2/1),无 mip 链。
+  旧文写的 “MAG=1(LINEAR)” 用的是**引擎配置枚举**,结论正确。
+- **显示缩放 pass** 在 `FUN_004195ec` 的 `0x419832..0x41988d` 直接
+  `SetSamplerState(0, 5/6/7, 1)`;D3D9 `D3DTEXTUREFILTERTYPE` 是
+  `NONE=0 / POINT=1 / LINEAR=2 / ANISOTROPIC=3`,所以这里是
+  **POINT/POINT/POINT**,与全局设置无关。
+- psA/psB 的 16/4 个 tap 因此是**逐 texel POINT 取值**,不是线性采样;
+  本仓库用显式 `floor(u*W)` + `textureLoad` 复刻 D3D9 的 floor 规则,避免
+  WebGPU nearest 在整 texel 边界上的 tie-break 差异(1:1 必须逐像素一致)。
+
+**UV 与参数(`FUN_0041a308`,`0x41a308`,已逐行复核)**:
+
+```text
+W = DAT_00801304,H = DAT_00801308(源纹理尺寸;同时作为 YS_TexSize)
+u,v = 输出像素对应的源 texel-center 坐标(q)归一化值
+
+DAT_00801334 == 2(psB,4 组 UV):
+  t0=(u,     v    )  t1=(u+1/W, v    )
+  t2=(u,     v+1/H)  t3=(u+1/W, v+1/H)
+
+DAT_00801334 == 3(psA,8 组 UV):
+  t0=(u-1/W, v-1/H)  t1=(u-1/W, v    )  t2=(u-1/W, v+1/H)  t3=(u-1/W, v+2/H)
+  t4=(u,     v-1/H)  t5=(u,     v    )  t6=(u,     v+1/H)  t7=(u,     v+2/H)
+
+0x419f72..0x419faa:`YS_TexDiffU = (2/W, 0)`(仅 psA)
+0x419dbe..0x419e13:`YS_Texture3` + `YS_TexSize = (W, H)`
+SharpN:反汇编只在 FXO 参数初值出现(`0x3FA00000 = 1.25`),引擎从不 SetValue。
+```
+
+psA 的像素 shader 把 `YS_TexDiffU` 加到 t0..t7,等价于把 4 组行 UV 扩展成
+`origin=(u-1/W, v-1/H)` 起、步长 `(1/W,1/H)` 的 4×4 网格;psB 是 2×2 网格。
+顶点在 CPU 侧按 `FUN_0041a308` 生成后用 `DrawPrimitiveUP(stride=0x54)`
+绘制,无顶点着色器。
 
 ## 4. 与模式/图像加工的映射结论
 
@@ -145,10 +182,11 @@ HLSL 参数设置(REA 地址,均在 `0x416a..0x416e`):
 | 固定管线 MODE 3/5/6/7/9 | **已实现**:soft 与 wgpu 全部执行;wgpu 用 `Src/OneMinusDst/OneMinusSrc` 对应 D3D9 颜色因子,MAX/MIN 对应 6/7 |
 | psC(TID HLSL) | **独立 WGSL** `shaders/transition_psc.wgsl`;`dx_mode≠0 && TA>=1` 启用 |
 | psD(交叉淡化) | **独立 WGSL** `shaders/transition_psd.wgsl`;`dx_mode≠0 && TA<1` 启用 |
-| psA/psB(缩放滤镜) | 反汇编/参数/触发条件已记录;当前窗口 1:1,未接入显示缩放 pass(不伪造触发) |
+| psA/psB(缩放滤镜) | **独立 WGSL**:`shaders/scale_psa.wgsl`(Pass3)/`shaders/scale_psb.wgsl`(Pass2),逐指令等价(含 `SharpN=1.25`、`YS_TexDiffU=2/W`、显式 floor tap)。接入点为加法 API `WgpuRenderer::render_frame_scaled(frame, output, ScaleFilter)`;`render_frame` 仍 1:1 不变;缩放是呈现步骤,不进 `CompositorFrame` |
+| psA/psB 对拍 | 单测 `display_scale_psa/psb_matches_reference_{upscale_and_downscale}`:GPU 与同式 CPU 参考在 2×/0.625× 逐通道 ≤1;`display_scale_1to1_reproduces_composited_screen`:1:1 与 `render_frame` ≤1 |
 | 顶点 DIFFUSE | **已定案**:`FUN_00414ba4` asm `0x414d09..0x414d21` 写 `A` 灰度;shader 模式写 `0xFF000000`。以 `T·A`/`T·A+(1−C.a)` 建模,不新增顶点 RGB 属性 |
-| MIP/aniso | **引擎硬编码** `LINEAR/LINEAR/POINT`、aniso=0、无 mip 链(`FUN_00460924` 尾部);后端 LOD0/aniso=1 等价,不是静默忽略 |
-| 采样器过滤来源 | `GfxConfig.filter` 仍为宿主注入契约;引擎真值 = 1/1/0 |
+| MIP/aniso | **引擎硬编码**配置值 1/1/0 → D3DTEXF `LINEAR/LINEAR/POINT`(2/2/1)、aniso=0、无 mip 链(`FUN_00460924` 尾部);后端 LOD0/aniso=1 等价,不是静默忽略 |
+| 采样器过滤来源 | `GfxConfig.filter` 仍为宿主注入契约;引擎配置真值 = 1/1/0(LINEAR/LINEAR/NONE) |
 | bind group | paint 按 `(alpha_only, color)` 跨帧缓存;transition 仍按 draw 新建(fade/目标纹理逐帧变化,不能无成本复用) |
 
 ## 6. 待门禁/需要主人确认
@@ -164,8 +202,10 @@ HLSL 参数设置(REA 地址,均在 `0x416a..0x416e`):
    `Unimplemented`,不猜公式。
 3. **组(layer set)上的 TID**:gfx 已输出 `Op::Transition { from: Offscreen }`,
    配对可为图像/组;引擎按层表统一解析。标 `Likely`,待官方微场景。
-4. psA/psB 是否接入最终缩放路径:当前 native 1:1 视口不触发;若宿主缩放
-   窗口,需要按 `DAT_00801334` 的配置字段复刻三档滤镜。
+4. psA/psB 已按 `DAT_00801334` 的 pass2/pass3 接线(`render_frame_scaled`);
+   非 effect 档(引擎值 0/1)的固定管线缩放路径仍无像素证据,调用方传
+   `ScaleFilter` 之外不伪造。宿主若要把窗口缩放交给后端,只需在
+   `render_frame`/`render_frame_scaled` 之间选择,并传窗口尺寸。
 5. **官方微场景工具阻塞**:`yscom_harvest` 启动的 YSCom 在
    `state0 != 1` 处不 attach(120s 超时;LE 与非 LE 均复现,
    `target/tmp/j4-micro-modes2/harvest.log`)。MODE 3/5/6/7/9 的官方像素

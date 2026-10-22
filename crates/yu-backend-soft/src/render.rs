@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use yu_gfx::{
-    transition_coverage, BlendMode, Clear, CompositorFrame, CopyId, CopyOp, CopyRegion,
+    transition_coverage, BlendMode, Clear, CompositorFrame, CopyId, CopyOp,
     CopySource, FilterMode, ImageAction, ImageOp, Layer, LayerId, Op, OpStatus, PassTarget,
     TextureRef,
 };
@@ -202,6 +202,19 @@ impl SoftRenderer {
             last_screen: None,
             image_cache: BTreeMap::new(),
         }
+    }
+
+    /// 丢弃跨帧状态(重启用;DIV-HOST-001)。
+    ///
+    /// 引擎重启 = 新设备:后缓冲、快照、图像加工缓存都属于上一轮
+    /// `GfxState`。`CopyId` 在新 `GfxState` 里从 0 重新分配,若不清理,
+    /// 新复制会命中同 id 的旧快照(冻结早退)而拿到重启前的像素。
+    ///
+    /// 纹理解析缓存(`TextureStore`)保留 —— 它只依赖游戏数据。
+    pub fn reset(&mut self) {
+        self.snapshots.clear();
+        self.last_screen = None;
+        self.image_cache.clear();
     }
 
     pub fn textures(&self) -> &TextureStore {
@@ -422,7 +435,7 @@ fn apply_image_op(
                 return Ok(());
             }
         }
-        let source = layer_surface(textures, snapshots, frame, &image.source, st)?;
+        let source = layer_surface(textures, snapshots, frame, &image.source, st, None)?;
         if region.is_none() {
             // 无区域 = 整幅源缩放到目标尺寸。绘制目标层时纹理会按
             // `layer.image_size()`(= `SX×SY`)拉伸,因此**像素无需重采样**:
@@ -564,19 +577,28 @@ fn apply_copy_op(
     // (`es_Scenario`/`es_ERIS` 的 CGS1/CGS100 截屏盖屏机制)。若按“命令执行
     // 时已消费过本帧事件”的组内容重绘,会把本帧新出现的 title 层也截进去,
     // 导致 fade 起点错位(EVID-J3-06)。
+    //
+    // **首帧没有后缓冲**(DIV-GFX-051):D3D9 设备创建后后缓冲即存在,内容
+    // 是初始化清屏色(DIV-GFX-010:`Clear::default_black` 的来源)。主组已
+    // 直绘、不再有离屏 RT,因此这里用 `frame.clear` 合成一张视口大小的
+    // 后缓冲初值——与“官方首帧截图 = 启动黑屏”一致,而不是报
+    // `offscreen_missing` 跳过。
     let main_group = frame
         .windows
         .iter()
         .find(|w| w.number == 0)
         .and_then(|w| w.layer_set.as_ref());
     let source = match &copy.source {
-        CopySource::Group(id)
-            if Some(id) == main_group && last_screen.is_some() =>
-        {
-            last_screen.expect("checked is_some").clone()
-        }
+        CopySource::Group(id) if Some(id) == main_group => match last_screen {
+            Some(surface) => surface.clone(),
+            None => Surface::new(
+                frame.viewport.width,
+                frame.viewport.height,
+                frame.clear.rgba,
+            ),
+        },
         CopySource::Group(id) => compose_group(textures, snapshots, frame, id, st)?,
-        CopySource::Layer(id) => layer_surface(textures, snapshots, frame, id, st)?,
+        CopySource::Layer(id) => layer_surface(textures, snapshots, frame, id, st, Some(copy))?,
     };
     let dest_size = frame
         .layers
@@ -586,10 +608,7 @@ fn apply_copy_op(
         .map(|size| (size.width, size.height));
     let (width, height) = dest_size.unwrap_or((source.width, source.height));
     let mut surface = Surface::new(width, height, [0, 0, 0, 0]);
-    let (x0, y0, x1, y1) = match copy.region {
-        CopyRegion::Full => (0, 0, i64::from(source.width) - 1, i64::from(source.height) - 1),
-        CopyRegion::Partial { x, y, x2, y2 } => (x, y, x2, y2),
-    };
+    let (x0, y0, x1, y1) = copy.region.resolve(source.width, source.height);
     blit(&source, &mut surface, x0, y0, x1, y1);
     snapshots.insert(copy.id, surface);
     Ok(())
@@ -662,26 +681,33 @@ fn compose_group(
 }
 
 /// 图层源:当前基图(帧内加工副本优先)。
+///
+/// 源层可能已被 `CGEND` 删除(`DIV-GFX-053`):此时回退到 `CopyOp` 在命令
+/// 时刻记录的 `source_texture` 重放。
 fn layer_surface(
     textures: &mut TextureStore,
     snapshots: &Snapshots,
     frame: &CompositorFrame,
     id: &LayerId,
     st: &mut RenderState,
+    fallback: Option<&CopyOp>,
 ) -> Result<Surface, String> {
     if let Some(texture) = st.texture_overrides.get(id) {
         return Ok(Surface::from_texture(texture));
     }
-    let layer = frame
-        .layers
-        .iter()
-        .find(|layer| &layer.id == id)
-        .ok_or_else(|| "gfx.copy.source.missing".to_string())?;
-    match &layer.texture {
-        TextureRef::Asset(_) | TextureRef::SolidBlack1x1 => {
-            let texture = base_texture(textures, snapshots, frame, id)?;
-            Ok(Surface::from_texture(&texture))
-        }
+    let layer = frame.layers.iter().find(|layer| &layer.id == id);
+    let texture = match layer {
+        Some(layer) => &layer.texture,
+        None => fallback
+            .and_then(|copy| copy.source_texture.as_ref())
+            .ok_or_else(|| "gfx.copy.source.gone".to_string())?,
+    };
+    match texture {
+        TextureRef::Asset(key) => textures
+            .resolve(key)
+            .map(Surface::from_texture)
+            .map_err(|diag| diag.code.to_string()),
+        TextureRef::SolidBlack1x1 => Ok(Surface::from_texture(&Texture::solid_black_1x1())),
         TextureRef::Snapshot(copy_id) => snapshots
             .get(copy_id)
             .cloned()
@@ -1619,6 +1645,38 @@ fn blend_pixel_shader(
     blend_pixel_with_stage(dst, src, layer_alpha, src_alpha, mode, true)
 }
 
+/// 固定管线的两阶段纹理归约(render-parity §5.2):返回 0..1 的源 RGB。
+///
+/// - `MODE 0/1`:stage0 `SELECTARG1(T)` = `T`;
+/// - `MODE 2/5/6/9`:stage0 `MOD(D,T)` = `T·A`(顶点 DIFFUSE 的 A 灰度);
+/// - `MODE 3/7`:stage1 `BLENDCURRENTALPHA` 白/黑纹理再混一次
+///   `T·A + (1 − C.a)`;
+/// - `shader_stage`(psC/psD)由像素着色器直接给出源色,不再归约。
+///
+/// 单独成函数是因为交叉检查测试(`blend_pixel_matches_generic_d3d9_equation`)
+/// 要与 `blend_pixel` 复用同一份归约,避免“第二套手写公式”。
+fn stage_reduce(
+    src: [u8; 4],
+    layer: f64,
+    a: f64,
+    mode: BlendMode,
+    shader_stage: bool,
+) -> (f64, f64, f64) {
+    let tex = |i: usize| f64::from(src[i]) / 255.0;
+    if shader_stage {
+        return (tex(0), tex(1), tex(2));
+    }
+    match mode {
+        BlendMode::Normal | BlendMode::Add => (tex(0), tex(1), tex(2)),
+        BlendMode::Multiply | BlendMode::Darken => (
+            tex(0) * layer + (1.0 - a),
+            tex(1) * layer + (1.0 - a),
+            tex(2) * layer + (1.0 - a),
+        ),
+        _ => (tex(0) * layer, tex(1) * layer, tex(2) * layer),
+    }
+}
+
 fn blend_pixel_with_stage(
     dst: [u8; 4],
     src: [u8; 4],
@@ -1638,22 +1696,8 @@ fn blend_pixel_with_stage(
     let a = f64::from(src_alpha) / 255.0;
     let inv = 1.0 - a;
     let layer = f64::from(layer_alpha) / 255.0;
-    let tex = |i: usize| f64::from(src[i]) / 255.0;
-    // stage0/stage1 归约后的源色(0..1)。HLSL 路径由像素着色器直接给出
-    // 源色(参考 psC/psD),固定管线才做两阶段归约。
-    let (s0, s1, s2) = if shader_stage {
-        (tex(0), tex(1), tex(2))
-    } else {
-        match mode {
-            BlendMode::Normal | BlendMode::Add => (tex(0), tex(1), tex(2)),
-            BlendMode::Multiply | BlendMode::Darken => (
-                tex(0) * layer + (1.0 - a),
-                tex(1) * layer + (1.0 - a),
-                tex(2) * layer + (1.0 - a),
-            ),
-            _ => (tex(0) * layer, tex(1) * layer, tex(2) * layer),
-        }
-    };
+    // stage0/stage1 归约后的源色(0..1)。
+    let (s0, s1, s2) = stage_reduce(src, layer, a, mode, shader_stage);
     // 先量化 stage 源色(与 GPU shader 的 `round(...*255)/255` 对齐)。
     let s = [
         f64::from(q(s0 * 255.0)),
@@ -1855,7 +1899,7 @@ mod tests {
         assert_eq!(dst.pixel(1, 0), Some([2, 0, 0, 255]));
         assert_eq!(dst.pixel(2, 0), Some([0, 0, 0, 0]));
     }
-}
+
     #[test]
     fn shader_transition_bypasses_fixed_stage_reduction() {
         // psC/psD 的像素着色器直接给出源色;固定管线的 MOD(D,T) 不再生效。
@@ -1876,3 +1920,106 @@ mod tests {
             [0, 0, 0, 191]
         );
     }
+
+    /// 网格输入:(dst, src, layer A)。覆盖全 0 / 全满 / 半透明 / 奇数低位,
+    /// 以及 `Multiply` 白混、`Exclusion` 同因子 alpha 等分支的敏感点。
+    const BLEND_GRID: &[([u8; 4], [u8; 4], u8)] = &[
+        ([0, 0, 0, 0], [0, 0, 0, 0], 0),
+        ([0, 0, 0, 0], [0, 0, 0, 0], 255),
+        ([255, 255, 255, 255], [255, 255, 255, 255], 255),
+        ([255, 255, 255, 255], [255, 255, 255, 255], 128),
+        ([0, 0, 0, 255], [255, 255, 255, 255], 128),
+        ([10, 20, 30, 40], [50, 60, 70, 80], 0),
+        ([10, 20, 30, 40], [50, 60, 70, 80], 128),
+        ([10, 20, 30, 40], [50, 60, 70, 80], 255),
+        ([100, 150, 200, 255], [200, 100, 50, 255], 128),
+        ([100, 150, 200, 255], [200, 100, 50, 255], 64),
+        ([37, 41, 43, 211], [13, 244, 99, 7], 192),
+        ([128, 128, 128, 128], [200, 200, 200, 255], 128),
+    ];
+
+    /// 测试用的通用 D3D9 混合方程:因子/运算全部读自
+    /// [`yu_gfx::FixedPipelineState`](即 `fixed_state()` 的状态表),
+    /// 不含任何按模式手写的公式。源操作数 = stage 归约后的 RGB + 片元
+    /// alpha(EVID-J-01:oC0.a = `纹理α × 层A`,无 SEPARATEALPHA)。
+    fn d3d9_equation_from_state(
+        dst: [u8; 4],
+        reduced_src: [u8; 3],
+        src_alpha: u8,
+        state: &yu_gfx::FixedPipelineState,
+    ) -> [u8; 4] {
+        let q = |v: f64| v.round().clamp(0.0, 255.0) as u8;
+        let s: [f64; 4] = [
+            f64::from(reduced_src[0]),
+            f64::from(reduced_src[1]),
+            f64::from(reduced_src[2]),
+            f64::from(src_alpha),
+        ];
+        let d: [f64; 4] = dst.map(f64::from);
+        // D3D9 的因子是**绝对的**:`SRC*` 永远读源操作数(oC0)、`DEST*`
+        // 永远读目标像素,与因子写在 SRCBLEND 还是 DESTBLEND 无关
+        // (`d3d9types.h` `D3DBLEND` 语义;MODE 0 的 `a²` 正是 DESTBLEND=
+        // INVSRCALPHA 读回同一个源 alpha 的结果)。
+        let factor = |kind: yu_gfx::BlendFactor| -> [f64; 4] {
+            match kind {
+                yu_gfx::BlendFactor::Zero => [0.0; 4],
+                yu_gfx::BlendFactor::One => [1.0; 4],
+                yu_gfx::BlendFactor::SrcColor => s.map(|c| c / 255.0),
+                yu_gfx::BlendFactor::InvSrcColor => s.map(|c| 1.0 - c / 255.0),
+                yu_gfx::BlendFactor::SrcAlpha => [s[3] / 255.0; 4],
+                yu_gfx::BlendFactor::InvSrcAlpha => [1.0 - s[3] / 255.0; 4],
+                yu_gfx::BlendFactor::DestColor => d.map(|c| c / 255.0),
+                yu_gfx::BlendFactor::InvDestColor => d.map(|c| 1.0 - c / 255.0),
+            }
+        };
+        let fs = factor(state.src_blend);
+        let fd = factor(state.dst_blend);
+        let mut out = [0u8; 4];
+        for i in 0..4 {
+            let v = match state.blend_op {
+                yu_gfx::BlendOp::Add => s[i] * fs[i] + d[i] * fd[i],
+                yu_gfx::BlendOp::Subtract => s[i] * fs[i] - d[i] * fd[i],
+                yu_gfx::BlendOp::RevSubtract => d[i] * fd[i] - s[i] * fs[i],
+                yu_gfx::BlendOp::Min => s[i].min(d[i]),
+                yu_gfx::BlendOp::Max => s[i].max(d[i]),
+            };
+            out[i] = q(v);
+        }
+        out
+    }
+
+    /// P2-8(backend-soft-review):手写 blend 公式必须能从 `fixed_state()`
+    /// 的 D3D9 状态**机械推出**——状态表与公式任何一侧单独改动都会在此失败,
+    /// 而不是漂移到像素里。stage 归约复用 [`stage_reduce`](单一事实来源),
+    /// 方程因子/运算由状态表通用求值。
+    #[test]
+    fn blend_pixel_matches_generic_d3d9_equation_from_state_table() {
+        for mode in BlendMode::ALL {
+            // 可执行集 = 有状态表的集合:执行门也由状态表驱动。
+            assert_eq!(
+                supported_blend(mode).is_some(),
+                mode.fixed_state().is_some(),
+                "mode {} 的可执行集与状态表不一致",
+                mode.code()
+            );
+            let Some(state) = mode.fixed_state() else {
+                continue;
+            };
+            for &(dst, src, layer_alpha) in BLEND_GRID {
+                let src_alpha = mul255(src[3], layer_alpha);
+                let got = blend_pixel(dst, src, layer_alpha, src_alpha, mode);
+                let a = f64::from(src_alpha) / 255.0;
+                let layer = f64::from(layer_alpha) / 255.0;
+                let q = |v: f64| v.round().clamp(0.0, 255.0) as u8;
+                let (s0, s1, s2) = stage_reduce(src, layer, a, mode, false);
+                let reduced = [q(s0 * 255.0), q(s1 * 255.0), q(s2 * 255.0)];
+                let expected = d3d9_equation_from_state(dst, reduced, src_alpha, &state);
+                assert_eq!(
+                    got, expected,
+                    "mode {} dst={dst:?} src={src:?} A={layer_alpha}",
+                    mode.code()
+                );
+            }
+        }
+    }
+}

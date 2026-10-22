@@ -7,6 +7,8 @@
 //! - `transition_fixed.wgsl`:固定管线双纹理过渡(mask G,`_DXMODE=0`)
 //! - `transition_psc.wgsl`:引擎 effect Pass1(psC,mask R)
 //! - `transition_psd.wgsl`:引擎 effect Pass0(psD,交叉淡化)
+//! - `scale_psb.wgsl`:引擎 effect Pass2(4-tap 锐利双线性缩放)
+//! - `scale_psa.wgsl`:引擎 effect Pass3(16-tap 双三次缩放)
 //! - `paint.wgsl`:快照 RECTPAINT 族
 
 /// 普通纹理 quad;`SRC_MODE` 由管线常量选择:
@@ -22,6 +24,12 @@ pub const TRANSITION_PSC: &str = include_str!("transition_psc.wgsl");
 
 /// 引擎 effect Pass0:`mix(tex1, tex2, FadeVal)` × `YS_AlphaVal`。
 pub const TRANSITION_PSD: &str = include_str!("transition_psd.wgsl");
+
+/// 引擎 effect Pass2:4-tap 锐利双线性缩放(`DAT_00801334 == 2`)。
+pub const SCALE_PSB: &str = include_str!("scale_psb.wgsl");
+
+/// 引擎 effect Pass3:16-tap 双三次缩放(`DAT_00801334 == 3`)。
+pub const SCALE_PSA: &str = include_str!("scale_psa.wgsl");
 
 /// 快照上的 RECTPAINT 族(整像素 / 只写 alpha)。
 pub const PAINT: &str = include_str!("paint.wgsl");

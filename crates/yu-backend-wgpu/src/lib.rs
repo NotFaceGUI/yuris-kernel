@@ -70,7 +70,7 @@ pub use textures::{GpuTexture, RenderTarget, TextureCache};
 
 pub use yu_backend_soft::{AssetIssue, RenderReport, SkippedOp, Surface, TextureStore};
 
-use yu_gfx::{BlendMode, CompositorFrame};
+use yu_gfx::{BlendMode, CompositorFrame, Viewport};
 use yu_log::Diag;
 
 use crate::device::backend_name;
@@ -117,6 +117,20 @@ pub struct WgpuRenderOutput {
     /// 与 `yu-backend-soft::RenderReport` 同一结构/字段语义。
     pub report: RenderReport,
     pub stats: GpuStats,
+}
+
+/// 引擎显示缩放滤镜(effect Pass2/Pass3)。
+///
+/// 证据:`FUN_004195ec`(`0x4195ec`)按 `DAT_00801334` 选 pass:
+/// `2 → BeginPass(2)`(psB),否则 `BeginPass(3)`(psA);采样器被硬编码为
+/// `D3DTEXF_POINT`(1/1/1)。4/8 组 texel UV 由 `FUN_0041a308` 生成,
+/// 详见 `docs/shader-parity.md` §3.3。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScaleFilter {
+    /// Pass2 (psB):4-tap 锐利双线性;`SharpN = 1.25`(FXO 初值,引擎不写)。
+    Sharp,
+    /// Pass3 (psA):16-tap 双三次;`YS_TexDiffU = (2/W, 0)`。
+    Bicubic,
 }
 
 struct VertexBufferSlot {
@@ -182,6 +196,24 @@ impl WgpuRenderer {
         backend_name(self.ctx.backend)
     }
 
+    /// 丢弃跨帧状态(重启用;DIV-HOST-001)。
+    ///
+    /// 引擎重启 = 新设备:后缓冲、快照、离屏组目标、图像加工缓存都属于上一
+    /// 轮 `GfxState`。`CopyId` 在新 `GfxState` 里从 0 重新分配,若不清理,
+    /// 新复制会命中同 id 的旧快照(冻结早退)而拿到重启前的像素。
+    ///
+    /// 纹理解析缓存(`TextureStore`)与管线缓存保留 —— 它们只依赖游戏数据,
+    /// 与运行代际无关。
+    pub fn reset(&mut self) {
+        self.backbuffer = None;
+        self.backbuffer_gpu = None;
+        self.uploaded_overrides.clear();
+        self.image_cache.clear();
+        self.targets.clear_snapshots(&mut self.pipelines);
+        self.targets.clear_offscreen(&mut self.pipelines);
+        self.readback = ReadbackCache::new();
+    }
+
     pub fn textures(&self) -> &TextureStore {
         &self.textures
     }
@@ -197,6 +229,31 @@ impl WgpuRenderer {
 
     /// 执行一帧并读回 `frame.viewport` 尺寸的 RGBA8。
     pub fn render_frame(&mut self, frame: &CompositorFrame) -> Result<WgpuRenderOutput, Diag> {
+        self.render_frame_inner(frame, None)
+    }
+
+    /// 执行一帧,并在读回前跑引擎的显示缩放 pass(effect Pass2/Pass3)。
+    ///
+    /// 合成仍在 `frame.viewport`(引擎内部游戏画面)完成;缩放 pass 把屏幕
+    /// 纹理按 `output` 尺寸重采样后读回。`output == frame.viewport` 时仍执行
+    /// 同一 pass(对应引擎的 1:1 缩放路径)。
+    ///
+    /// 这是加法 API:`render_frame` 行为不变;需要窗口缩放/滤镜的宿主显式
+    /// 调用本方法。`frame.viewport` 仍是引擎逻辑分辨率。
+    pub fn render_frame_scaled(
+        &mut self,
+        frame: &CompositorFrame,
+        output: Viewport,
+        filter: ScaleFilter,
+    ) -> Result<WgpuRenderOutput, Diag> {
+        self.render_frame_inner(frame, Some((output, filter)))
+    }
+
+    fn render_frame_inner(
+        &mut self,
+        frame: &CompositorFrame,
+        scale: Option<(Viewport, ScaleFilter)>,
+    ) -> Result<WgpuRenderOutput, Diag> {
         self.textures.begin_frame();
         let uploads_before = self.gpu_textures.total_uploads;
         let bytes_before = self.gpu_textures.total_upload_bytes;
@@ -218,17 +275,70 @@ impl WgpuRenderer {
         if !plan.vertices.is_empty() {
             self.upload_vertices(vertex_bytes)?;
         }
-        let draw_calls = plan.draw_calls() as u64;
+        let draw_calls = plan.draw_calls() as u64 + u64::from(scale.is_some());
         self.total_draw_calls += draw_calls;
 
-        let mut surface = self.execute(frame, &plan)?;
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("yu-backend-wgpu frame"),
+            });
+        self.encode_passes(&plan, &mut encoder)?;
+
+        // 屏幕读回:即使随后缩放也要保留缩放前的游戏画面作为 `:/W0/`
+        // 后缓冲(引擎的 COPY 读内部画面,不读窗口缩放结果)。
+        let screen_width = frame.viewport.width;
+        let screen_height = frame.viewport.height;
+        let mut screen_surface = {
+            let screen = self.targets.screen().ok_or_else(|| {
+                Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                    .with_detail("帧结束时没有屏幕目标")
+            })?;
+            self.readback.read(
+                &self.ctx,
+                &screen.texture,
+                screen_width,
+                screen_height,
+                encoder,
+            )?
+        };
         // 屏幕是 opaque 窗口(与 soft 的最终屏幕归一、浏览器 canvas 的
         // alphaMode=opaque 一致);组 RT alpha 不进入呈现读回。
-        for px in surface.rgba.chunks_exact_mut(4) {
-            px[3] = 255;
-        }
+        force_opaque(&mut screen_surface);
 
-        self.backbuffer = Some(surface.clone());
+        let readback_bytes;
+        let surface = match scale {
+            Some((output, filter)) => {
+                let mut encoder =
+                    self.ctx
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("yu-backend-wgpu display scale"),
+                        });
+                self.encode_scale(filter, output, &mut encoder)?;
+                let target = self.targets.scale().ok_or_else(|| {
+                    Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                        .with_detail("缺少显示缩放目标")
+                })?;
+                let mut surface = self.readback.read(
+                    &self.ctx,
+                    &target.texture,
+                    output.width,
+                    output.height,
+                    encoder,
+                )?;
+                force_opaque(&mut surface);
+                readback_bytes = screen_surface.rgba.len() as u64 + surface.rgba.len() as u64;
+                surface
+            }
+            None => {
+                readback_bytes = screen_surface.rgba.len() as u64;
+                screen_surface.clone()
+            }
+        };
+
+        self.backbuffer = Some(screen_surface);
         let stats = GpuStats {
             adapter: self.ctx.adapter_info.clone(),
             draw_calls,
@@ -243,7 +353,7 @@ impl WgpuRenderer {
             cached_textures: self.gpu_textures.cached_textures(),
             offscreen_targets: self.targets.offscreen_count(),
             vertex_bytes: vertex_bytes.len() as u64,
-            readback_bytes: surface.rgba.len() as u64,
+            readback_bytes,
         };
 
         Ok(WgpuRenderOutput {
@@ -277,20 +387,11 @@ impl WgpuRenderer {
         Ok(())
     }
 
-    fn execute(
+    fn encode_passes(
         &mut self,
-        frame: &CompositorFrame,
         plan: &passes::FramePlan,
-    ) -> Result<Surface, Diag> {
-        let width = frame.viewport.width;
-        let height = frame.viewport.height;
-        let mut encoder = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("yu-backend-wgpu frame"),
-            });
-
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(), Diag> {
         {
             let pipelines = &self.pipelines;
             let targets = &self.targets;
@@ -497,13 +598,93 @@ impl WgpuRenderer {
                 }
             }
         }
+        Ok(())
+    }
 
+    /// 引擎显示缩放 pass:全屏输出 `output` 尺寸,point 采样屏幕纹理。
+    ///
+    /// 管线/绑定按 `(源纹理 id, 变体, uniform)` 缓存;屏幕纹理重建时由
+    /// `forget_texture` 作废旧绑定。blend 关闭(替换写),alpha 直通。
+    fn encode_scale(
+        &mut self,
+        filter: ScaleFilter,
+        output: Viewport,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(), Diag> {
         let screen = self.targets.screen().ok_or_else(|| {
             Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                .with_detail("帧结束时没有屏幕目标")
+                .with_detail("显示缩放缺少屏幕源纹理")
         })?;
-        self.readback
-            .read(&self.ctx, &screen.texture, width, height, encoder)
+        let source_id = screen.id;
+        let source_width = screen.width;
+        let source_height = screen.height;
+        let source_view = screen.view.clone();
+
+        self.pipelines.ensure_scale_pipeline(&self.ctx, filter)?;
+        // psB 的 SharpN 取 FXO 初值;psA 的 YS_TexDiffU 取 (2/W, 0)。
+        let param = match filter {
+            ScaleFilter::Sharp => [1.25, 1.25],
+            ScaleFilter::Bicubic => [2.0 / source_width as f32, 0.0],
+        };
+        self.pipelines.ensure_scale_bind_group(
+            &self.ctx,
+            source_id,
+            &source_view,
+            filter,
+            [source_width as f32, source_height as f32],
+            param,
+        )?;
+        self.targets
+            .ensure_scale(&self.ctx, output.width, output.height, &mut self.pipelines)?;
+
+        let pipeline = self.pipelines.scale_pipeline(filter).ok_or_else(|| {
+            Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                .with_detail("缺少显示缩放管线")
+        })?;
+        let bind = self
+            .pipelines
+            .scale_bind_group(
+                source_id,
+                filter,
+                [source_width as f32, source_height as f32],
+                param,
+            )
+            .ok_or_else(|| {
+                Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                    .with_detail("缺少显示缩放 bind group")
+            })?;
+        let target = self.targets.scale().ok_or_else(|| {
+            Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                .with_detail("缺少显示缩放目标")
+        })?;
+
+        let attachments = [Some(wgpu::RenderPassColorAttachment {
+            view: &target.view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })];
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("yu-backend-wgpu display scale"),
+            color_attachments: &attachments,
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        render_pass.set_pipeline(pipeline);
+        render_pass.set_bind_group(0, bind, &[]);
+        render_pass.draw(0..6, 0..1);
+        Ok(())
+    }
+}
+
+fn force_opaque(surface: &mut Surface) {
+    for px in surface.rgba.chunks_exact_mut(4) {
+        px[3] = 255;
     }
 }
 

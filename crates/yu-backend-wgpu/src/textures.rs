@@ -198,11 +198,13 @@ pub struct RenderTarget {
     pub view: wgpu::TextureView,
 }
 
-/// 屏幕目标 + 按 `LayerId` 的离屏目标集合 + 按 `CopyId` 的快照集合。
+/// 屏幕目标 + 按 `LayerId` 的离屏目标集合 + 按 `CopyId` 的快照集合
+/// + 显示缩放输出目标。
 pub struct TargetSet {
     screen: Option<RenderTarget>,
     offscreen: BTreeMap<LayerId, RenderTarget>,
     snapshots: BTreeMap<CopyId, RenderTarget>,
+    scale: Option<RenderTarget>,
 }
 
 impl TargetSet {
@@ -211,11 +213,17 @@ impl TargetSet {
             screen: None,
             offscreen: BTreeMap::new(),
             snapshots: BTreeMap::new(),
+            scale: None,
         }
     }
 
     pub fn screen(&self) -> Option<&RenderTarget> {
         self.screen.as_ref()
+    }
+
+    /// 显示缩放输出目标(引擎 effect Pass2/Pass3 的渲染目标)。
+    pub fn scale(&self) -> Option<&RenderTarget> {
+        self.scale.as_ref()
     }
 
     pub fn offscreen(&self, id: &LayerId) -> Option<&RenderTarget> {
@@ -294,6 +302,27 @@ impl TargetSet {
         self.snapshots.retain(|id, _| live.contains(id));
     }
 
+    /// 丢弃全部快照纹理(渲染器 `reset()` 用;DIV-HOST-001)。
+    ///
+    /// 引擎重启 = 新设备 ⇒ 快照不再有效;`CopyId` 在新 `GfxState` 里从头
+    /// 分配,旧纹理若保留会与同 id 的新快照冲突。
+    pub fn clear_snapshots(&mut self, pipelines: &mut crate::pipelines::PipelineCache) -> usize {
+        let removed = self.snapshots.len();
+        for (_, target) in std::mem::take(&mut self.snapshots) {
+            pipelines.forget_texture(target.id);
+        }
+        removed
+    }
+
+    /// 丢弃全部离屏组目标(尺寸/内容都是上一轮 `GfxState` 的)。
+    pub fn clear_offscreen(&mut self, pipelines: &mut crate::pipelines::PipelineCache) -> usize {
+        let removed = self.offscreen.len();
+        for (_, target) in std::mem::take(&mut self.offscreen) {
+            pipelines.forget_texture(target.id);
+        }
+        removed
+    }
+
     /// 屏幕目标:尺寸不变则复用。重建时把旧 id 的 bind group 一并作废。
     pub fn ensure_screen(
         &mut self,
@@ -316,9 +345,30 @@ impl TargetSet {
         Ok(self.screen.as_ref().expect("screen target set above"))
     }
 
-    /// 组离屏目标:尺寸不变则复用(`SX/SY` 未给时调用方已回退视口)。
-    pub fn ensure_offscreen(
+    /// 显示缩放输出目标:尺寸不变则复用(只有宿主请求缩放时才创建)。
+    pub fn ensure_scale(
         &mut self,
+        ctx: &GpuContext,
+        width: u32,
+        height: u32,
+        pipelines: &mut crate::pipelines::PipelineCache,
+    ) -> Result<&RenderTarget, Diag> {
+        let reusable = self
+            .scale
+            .as_ref()
+            .is_some_and(|t| t.width == width && t.height == height);
+        if !reusable {
+            if let Some(old) = self.scale.take() {
+                pipelines.forget_texture(old.id);
+            }
+            let target = create_target(ctx, width, height, "display scale")?;
+            self.scale = Some(target);
+        }
+        Ok(self.scale.as_ref().expect("scale target set above"))
+    }
+
+    /// 组离屏目标:尺寸不变则复用(`SX/SY` 未给时调用方已回退视口)。
+    pub fn ensure_offscreen(        &mut self,
         ctx: &GpuContext,
         id: &LayerId,
         width: u32,
