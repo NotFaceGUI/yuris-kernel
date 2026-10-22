@@ -1,5 +1,22 @@
 # yu-backend-soft 独立审查报告
 
+> **⚠ 历史快照(HEAD `b2a5737`,早于 J2/J3/J4)。2026-10-22 复核:**
+> 本报告的 P1/P2 绝大多数已关闭或改写,阅读时**不要**把下面的结论当现状。
+>
+> | 本报告条目 | 2026-10-22 状态 |
+> |---|---|
+> | P1-1 alpha `As` → `As²` | **已修**(EVID-J-01,`blend_pixel` 单测钉死 `[128,128,128,191]`) |
+> | P1-2 MODE 2 DIFFUSE RGB | **已修**(J4:顶点色 = A 灰度,`T·A` 归约) |
+> | P2-2 零尺寸 Offscreen 不计 `ops_total` | **已修**(`group.size.zero` 路径先 `ops_total += 1`) |
+> | P2-3 Group transition 静默忽略 | **已修**(J2:`group_transition_op`) |
+> | P2-4 Transition 一律跳过 | **已修**(J2:两端执行) |
+> | P2-5 `first_frame` HostPaths / report | **部分**:示例仍用 `BootConfig::default()`(见 `audit-2026-10-22.md` §C3) |
+> | P2-8 未消费 `fixed_state()` | **部分**:状态表与后端公式仍各写一份,但有 `blend_table` 逐字段测试 |
+> | P2-9 `image_probe_order` 只在构造时生效 | **已修**(每帧从 `frame.image_probe_order` 取) |
+> | “只是烟雾测试”的整体判断 | **已过时**:title 稳定帧 600 帧 soft/wgpu 0 差异、浏览器同哈希 |
+>
+> 现状入口:`docs/audit-2026-10-22.md`、`docs/todo-inventory.md`。
+
 - 审查对象:`crates/yu-backend-soft`(HEAD `b2a5737`;`src/lib.rs`、`src/render.rs`、`src/texture.rs`、`src/png.rs`、`tests/render.rs`、`examples/first_frame.rs`)
 - 消费契约:`yu-gfx` 的 `CompositorFrame` / `Op` / `Layer` / `Pass`,以及 `yu-vfs` 的 `DataSource` / `Mount` / `LookupKey`
 - 性质:**只读审查**。未修改被审源码,未执行 git 写操作,未启动/注入官方引擎,未改动 `<repo-old>`。本报告是本次审查唯一新增的仓库文本文件;运行示例会重写 `target/tmp` 下的生成物。
