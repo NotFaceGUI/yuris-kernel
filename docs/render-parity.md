@@ -499,6 +499,8 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
   覆盖度 × 层 A;覆盖度用 `to` 的 **G 通道**与 `fade`/`T` 计算
   (`yu_gfx::transition_coverage`,EVID-T-05)。`dx_mode≠0`:psC(mask = 配对
   纹理 **R**,`saturate((FadeVal-0.5*mask.r)*TA)*A/256`)或 psD(交叉淡化)。
+  **注意**:`dx_mode` 是内核 A/B 契约,不是引擎开关;引擎 effect 始终创建,
+  psC/psD 的触发条件是“有配对 + TA”。见 `docs/architecture.md` §5.1。
   `to` 纹理与 `from` 同尺寸(引擎要求,尺寸不符会报调试错误,EVID-T-07)。
 - 组上的 `TID`:gfx 输出 `Op::Transition { from: Offscreen(组), to: 配对 }`,
   不再当普通组画掉;配对可以是图像层或组。引擎按层表统一解析 TID,
@@ -506,7 +508,9 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 - Copy:`status` 为 Executable 时执行;快照按 `CopyId` **只捕获一次**
   (目标层存活期间冻结);区域是源坐标含端点,裁剪块写目标 `(0,0)`;
   目标表面尺寸 = 目标层显式尺寸,否则源尺寸。后端可以对组源按需重绘
-  (`group` 的当前子层状态)以取得复制源。`frame.passes` 里的复制是
+  (`group` 的当前子层状态)以取得复制源。**主组例外**:主组已直绘到屏幕、
+  没有 Offscreen pass;首帧无后缓冲时的源仍未裁决(DIV-GFX-051)。
+  `frame.passes` 里的复制是
   “仍可达”的复制;`GfxState::copies()` 是完整审计日志(含源已删除的
   历史项),不是帧执行清单。
 - Mask:`Op::Mask.status` 为 Unimplemented;不要用 α 或亮度猜。

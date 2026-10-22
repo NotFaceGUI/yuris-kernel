@@ -65,7 +65,7 @@ flowchart TD
     RT["yu-rt 运行核<br/>任务调度·命令分派·表达式·16槽寄存器·变量域<br/>(A5: 零硬编码,全表来自游戏数据)"]
     FMT["yu-format 容器解码<br/>ybn·yssd·ymv·yscfg · 纯字节进出"]
     VFS["yu-vfs 数据源<br/>DirSource · YpfSource · MemSource · Mount · 归一"]
-    FONT["yu-font 字体发现/栅格/样式"]
+    FONT["yu-font 字体发现/栅格/样式<br/>(独立;尚未接入 gfx 主线)"]
     TRC["yu-trace oracle<br/>边界记录/回放/diff"]
     LOG["yu-log Diag/错误码/LogSink"]
 
@@ -80,11 +80,17 @@ flowchart TD
     GFX --> RT
     RT --> FMT
     RT --> VFS
-    FONT --> TRC
     TRC -.->|旁挂| CLI
     TRC -.-> GFX
     TRC -.-> RT
     TRC -.-> FMT
+    GFX -.-> LOG
+    SOFT -.-> LOG
+    WGPU -.-> LOG
+    RT -.-> LOG
+    FMT -.-> LOG
+    VFS -.-> LOG
+    TRC -.-> LOG
 ```
 
 | crate | 职责 | 依赖 | 不许做 |
