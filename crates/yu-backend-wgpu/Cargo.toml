@@ -13,14 +13,19 @@ yu-gfx = { path = "../yu-gfx" }
 yu-log = { path = "../yu-log" }
 
 [dev-dependencies]
+sha2 = "0.10"
 image = { version = "0.25", default-features = false, features = ["png"] }
 yu-format = { path = "../yu-format" }
 yu-rt = { path = "../yu-rt" }
 yu-vfs = { path = "../yu-vfs" }
 
 [[example]]
-name = "first_frame"
-path = "examples/first_frame.rs"
+name = "wgpu_first_frame"
+path = "examples/wgpu_first_frame.rs"
+
+[[example]]
+name = "wgpu_frame_walk"
+path = "examples/wgpu_frame_walk.rs"
 
 [lib]
 name = "yu_backend_wgpu"

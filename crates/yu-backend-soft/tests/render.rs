@@ -142,7 +142,8 @@ fn asset_layer_composites_to_screen() {
     assert_eq!(out.surface.pixel(1, 1), Some([255, 0, 0, 255]));
     assert_eq!(out.surface.pixel(2, 2), Some([255, 0, 0, 255]));
     assert_eq!(out.surface.pixel(0, 0), Some([255, 255, 255, 255]));
-    assert_eq!(out.report.ops_drawn, 2, "group + asset layer");
+    // 主组直绘(DIV-GFX-008/041):只有图层 op,组不单独计数。
+    assert_eq!(out.report.ops_drawn, 1, "asset layer drawn directly");
     assert_eq!(out.report.skipped_ops_total, 0);
     assert_eq!(
         out.report.ops_total,
@@ -187,7 +188,8 @@ fn solid_black_1x1_is_stretched_to_sx_sy() {
     assert_eq!(out.surface.pixel(0, 0), Some([0, 0, 0, 255]));
     assert_eq!(out.surface.pixel(3, 3), Some([0, 0, 0, 255]));
     assert_eq!(out.surface.pixel(4, 0), Some([255, 255, 255, 255]));
-    assert_eq!(out.report.ops_drawn, 2);
+    // 主组直绘:只有那一层 op(组不再单独计数)。
+    assert_eq!(out.report.ops_drawn, 1);
 }
 
 #[test]
@@ -211,7 +213,9 @@ fn missing_asset_is_reported_and_layer_skipped() {
     let out = backend.render_frame(&frame);
 
     assert_eq!(out.surface.pixel(0, 0), Some([255, 255, 255, 255]));
-    assert_eq!(out.report.ops_drawn, 1, "only the W0 group remains");
+    // DIV-GFX-008/041(主组直绘):主窗口组不占一个 group op,子层直接
+    // 合成到屏幕;缺失资产的那一层被跳过,因此本帧没有可绘制 op。
+    assert_eq!(out.report.ops_drawn, 0, "main group is drawn directly");
     assert_eq!(out.report.skipped_ops_total, 1);
     assert!(out
         .report
@@ -331,12 +335,11 @@ fn rectpaint_family_executes_and_matches_evidence_semantics() {
     let out = backend.render_frame(&frame);
     // R: W0 离屏里不透明红 -> 屏幕红。
     assert_eq!(out.surface.pixel(0, 0), Some([255, 0, 0, 255]));
-    // G: A=128 的绿在透明 W0 里成为 (0,128,0,64),再以 a=64 合成到白屏:
-    //   R = 255·(1−64/255) = 191
-    //   G = 128·64/255 + 255·(1−64/255) = 223
-    //   A = 64²/255 + 255·(1−64/255) = 207
-    assert_eq!(out.surface.pixel(4, 0), Some([191, 223, 191, 207]));
-    assert_eq!(out.report.ops_drawn, 3 + 3, "3 image ops + W0 group + 2 layers");
+    // G: A=128 的绿**直接**合成到白屏(主组直绘,不经过组 RT 的 alpha):
+    //   a = 128/255;R = 255·(1−a) = 127;G = 255·a + 255·(1−a) = 255。
+    // 屏幕是 opaque 窗口,读回 alpha 归一 255。
+    assert_eq!(out.surface.pixel(4, 0), Some([127, 255, 127, 255]));
+    assert_eq!(out.report.ops_drawn, 3 + 2, "3 image ops + 2 direct layers");
     assert_eq!(out.report.skipped_ops_total, 0);
 }
 
@@ -389,7 +392,7 @@ fn rectpaint_region_fills_only_requested_texture_area() {
 }
 
 #[test]
-fn copy_texture_pass_is_skipped_and_counted() {
+fn copy_texture_pass_executes_and_draws_snapshot() {
     let table = table();
     let mut gfx = state(Viewport::new(8, 8), [255, 255, 255, 255]);
     gfx.consume_events(&[
@@ -424,16 +427,14 @@ fn copy_texture_pass_is_skipped_and_counted() {
         png_bytes_for(Rgba([0, 0, 255, 255])),
     )]));
     let out = backend.render_frame(&frame);
-    assert!(out
-        .report
-        .skipped
-        .iter()
-        .any(|skip| skip.kind == "copy" && skip.reason == "gfx.copy.unsupported"));
-    assert!(out
-        .report
-        .skipped
-        .iter()
-        .any(|skip| skip.kind == "layer" && skip.reason == "gfx.copy.unsupported"));
-    // SRC 仍然正常绘制;DST 的快照纹理被跳过。
+    // EVID-T-11/T-12:COPY2 可执行,DST 从快照纹理绘制。
+    assert!(
+        !out.report
+            .skipped
+            .iter()
+            .any(|skip| skip.kind == "copy" || skip.kind == "layer"),
+        "COPY2 不应再被跳过: {:?}",
+        out.report.skipped
+    );
     assert_eq!(out.surface.pixel(0, 0), Some([0, 0, 255, 255]));
 }

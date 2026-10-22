@@ -25,13 +25,15 @@ fn cg(
     call(1, "CG", args)
 }
 
+/// 主窗口组直绘(DIV-GFX-008/041):W0 的子层/子组现在出现在屏幕 pass,
+/// 没有自己的离屏 pass。
 fn w0_ops(frame: &yu_gfx::CompositorFrame) -> &[Op] {
     frame
         .passes
         .iter()
-        .find(|p| matches!(&p.target, PassTarget::Offscreen(id) if id.display() == ":/W0"))
+        .find(|p| matches!(p.target, PassTarget::Screen))
         .map(|p| p.ops.as_slice())
-        .expect("W0 offscreen pass")
+        .expect("screen pass")
 }
 
 fn layer_index(frame: &yu_gfx::CompositorFrame, id: &str) -> usize {
@@ -129,12 +131,13 @@ fn group_offscreen_pass_precedes_parent_and_alpha_is_on_group() {
         .iter()
         .position(|p| matches!(&p.target, PassTarget::Offscreen(id) if id.display() == ":/W0/G"))
         .expect("group pass");
+    // 主组直绘:W0 不再有离屏 pass,子组 pass 必须早于屏幕 pass。
     let w0_pass = f
         .passes
         .iter()
-        .position(|p| matches!(&p.target, PassTarget::Offscreen(id) if id.display() == ":/W0"))
-        .expect("w0 pass");
-    assert!(g_pass < w0_pass, "child group pass must precede parent");
+        .position(|p| matches!(p.target, PassTarget::Screen))
+        .expect("screen pass");
+    assert!(g_pass < w0_pass, "child group pass must precede screen");
 
     let w0 = &f.passes[w0_pass];
     let g = w0

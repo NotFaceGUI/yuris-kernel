@@ -51,10 +51,10 @@ fn copy2_records_snapshot_and_texture_pass() {
         .find(|l| l.id.display() == ":/W0/DST")
         .unwrap();
     assert!(matches!(dst.texture, TextureRef::Snapshot(_)));
-    assert!(matches!(
-        dst.status,
-        LayerStatus::Unimplemented("gfx.copy.unsupported")
-    ));
+    assert!(
+        matches!(dst.status, LayerStatus::Executable),
+        "COPY2 目标层应可执行(EVID-T-11/T-12)"
+    );
     assert_eq!(dst.alpha, 256, "COPY2 只复制图像,不复制属性");
 
     let copy_pass = f
@@ -68,8 +68,8 @@ fn copy2_records_snapshot_and_texture_pass() {
             assert_eq!(c.kind, CopyKind::Copy2);
             assert_eq!(c.source, CopySource::Layer(id(":/W0/SRC")));
             assert_eq!(c.region, CopyRegion::Full);
-            assert_eq!(c.timing, CopyTiming::LastRenderedFrame);
-            assert_eq!(c.status, OpStatus::Unimplemented("gfx.copy.unsupported"));
+            assert_eq!(c.timing, CopyTiming::CommandCurrent);
+            assert_eq!(c.status, OpStatus::Executable);
         }
         other => panic!("expected copy, got {other:?}"),
     }

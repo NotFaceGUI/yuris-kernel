@@ -11,6 +11,7 @@ yu-log = { path = "../yu-log" }
 yu-vfs = { path = "../yu-vfs" }
 
 [dev-dependencies]
+sha2 = "0.10"
 yu-format = { path = "../yu-format" }
 yu-rt = { path = "../yu-rt" }
 

@@ -74,6 +74,12 @@ fn eris_first_screen_display_list() {
         fps: 60,
         // 首帧 130 万 Command 事件会挤爆有界队列;gfx 只需要 DomainCall。
         record_events: false,
+        // 标题锚点用工程配置的运行值 `@_DEBUGMODE=0`
+        // (`<project-eris>/save/data/config/projectconfig.txt` DEBUGMODE=0)。
+        // 对照:debug_mode=true 时内核在 1200 tick 内不进 title(黑帧,debug UI),
+        // 而官方 title 截图可见 ⇒ 本测试锚点取 0;窗口标题证据只作旁证。
+        // 见 docs/title-motion-ledger.md §9.2。
+        debug_mode: false,
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).expect("boot");
@@ -101,11 +107,21 @@ fn eris_first_screen_display_list() {
     }
     let f = gfx.frame();
     // 精确 census(会话 F;与 docs/render-parity.md §2 同步)。
+    //
+    // J3 复核:旧值(visible 34 / ops 44 / W0 30 / invisible 238)来自
+    // `771cf79`,早于 `1365918` 的 YSVR 初值/GOSUB 块栈修正;现在的启动
+    // 路径生成的可见集更小(272 层不变、8 可见、18 op、W0 4 op、264 不可见)。
+    // 该 census 与 title 稳定帧对官方的像素对照同时成立(见任务 J3 台账 §9),
+    // 因此按当前实现更新 golden,而不是用 UPDATE_GFX_GOLDEN 掩盖回归。
+    //
+    // J3 追加(DIV-GFX-008/041,主组直绘):主窗口组不再产出离屏 pass,
+    // 子层直接进屏幕 pass。因此 passes 15 → 14、total ops 18 → 4、
+    // texture passes 12 → 12(不变),W0 离屏从 4 op 降为 0(该 pass 消失)。
     assert_eq!(f.layers.len(), 272, "layers");
-    assert_eq!(f.layers.iter().filter(|l| l.visible).count(), 34, "visible");
-    assert_eq!(f.passes.len(), 15, "passes");
+    assert_eq!(f.layers.iter().filter(|l| l.visible).count(), 8, "visible");
+    assert_eq!(f.passes.len(), 14, "passes");
     let total_ops: usize = f.passes.iter().map(|p| p.ops.len()).sum();
-    assert_eq!(total_ops, 44, "total ops");
+    assert_eq!(total_ops, 17, "total ops");
     let texture_passes = f
         .passes
         .iter()
@@ -121,18 +137,22 @@ fn eris_first_screen_display_list() {
             })
             .map(|p| p.ops.len())
     };
-    assert_eq!(ops_of(":/W0"), Some(30), "W0 offscreen ops");
+    assert_eq!(ops_of(":/W0"), None, "main group is drawn directly");
     assert_eq!(ops_of(":/W1"), Some(1), "W1 offscreen ops");
     let screen = f
         .passes
         .iter()
         .find(|p| matches!(p.target, yu_gfx::PassTarget::Screen))
         .expect("screen pass");
-    assert_eq!(screen.ops.len(), 1);
-    match &screen.ops[0] {
-        yu_gfx::Op::Group(g) => assert_eq!(g.offscreen.display(), ":/W0"),
-        other => panic!("screen must compose W0 group, got {other:?}"),
-    }
+    // 主组直绘:屏幕 pass 直接含 W0 的子层(首屏为 4 个 op)。
+    assert_eq!(screen.ops.len(), 4);
+    assert!(
+        screen
+            .ops
+            .iter()
+            .all(|op| !matches!(op, yu_gfx::Op::Group(_))),
+        "main group must not be composed through an offscreen RT"
+    );
     assert!(
         !f.diagnostics.iter().any(|d| d.severity == "Fatal"),
         "unexpected fatal diag: {:?}",
@@ -164,7 +184,7 @@ fn eris_first_screen_display_list() {
     assert_eq!(mode2.texture, yu_gfx::TextureRef::SolidBlack1x1);
     assert_eq!(
         f.layers.iter().filter(|l| !l.visible).count(),
-        238,
+        264,
         "E=0 count"
     );
 
@@ -253,6 +273,7 @@ fn eris_first_screen_with_synchronous_info_queries() {
         entry_label: "SYSTEM_START".to_string(),
         fps: 60,
         record_events: false,
+        debug_mode: false,
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).expect("boot");
@@ -280,11 +301,12 @@ fn eris_first_screen_with_synchronous_info_queries() {
     }
     let f = state.borrow().frame();
     assert_eq!(f.layers.len(), 272, "layers");
-    assert_eq!(f.layers.iter().filter(|l| l.visible).count(), 34, "visible");
-    assert_eq!(f.passes.len(), 15, "passes");
+    assert_eq!(f.layers.iter().filter(|l| l.visible).count(), 8, "visible");
+    assert_eq!(f.passes.len(), 14, "passes");
+    // 主组直绘后 W0 不再有离屏 pass(15 → 14 passes;18 → 17 ops)。
     assert_eq!(
         f.passes.iter().map(|p| p.ops.len()).sum::<usize>(),
-        44,
+        17,
         "total ops"
     );
     let screen = f
@@ -292,7 +314,12 @@ fn eris_first_screen_with_synchronous_info_queries() {
         .iter()
         .find(|p| matches!(p.target, yu_gfx::PassTarget::Screen))
         .expect("screen pass");
-    assert!(matches!(&screen.ops[0], yu_gfx::Op::Group(g) if g.offscreen.display() == ":/W0"));
+    // 主组直绘:屏幕 pass 直接含 W0 子层,不再是单个 Group op。
+    assert_eq!(screen.ops.len(), 4, "W0 children drawn directly");
+    assert!(screen
+        .ops
+        .iter()
+        .all(|op| !matches!(op, yu_gfx::Op::Group(_))));
 
     let q = queries.borrow();
     assert!(q.iter().any(|c| c == "CGINFO"), "ERIS must query CGINFO");

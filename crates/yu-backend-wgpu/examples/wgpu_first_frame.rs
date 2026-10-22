@@ -9,15 +9,16 @@
 //! set YURIS_SAMPLE_ERIS_YSBIN=<project-eris>/data/ysbin
 //! set YURIS_WGPU_ADAPTER=5070        # 可选:适配器名称子串
 //! set YURIS_WGPU_BACKEND=dx12        # 可选:dx12/vulkan/gl/primary/all
-//! cargo run -p yu-backend-wgpu --example first_frame
+//! cargo run -p yu-backend-wgpu --example wgpu_first_frame
 //! ```
 //!
 //! 输出:
 //! - `target/tmp/wgpu_first_frame.png`
 //! - `target/tmp/wgpu_first_frame.report.json`
 //!
-//! 硬性对账:pass/op/executable/skipped 必须与 `target/tmp/first_frame.display.json`
-//! 完全一致(文件存在时);输出尺寸 = viewport,且不是全黑。
+//! 硬性对账:pass/op/layer 与 `target/tmp/first_frame.display.json` 一致;
+//! 每个 op 恰好被绘制或跳过;后端执行数 ≤ gfx 可执行数(资产缺失由后端
+//! 追加跳过)。输出尺寸 = viewport,且不是全黑。
 
 use std::cell::RefCell;
 use std::env;
@@ -70,6 +71,11 @@ fn run() -> Result<(), String> {
         entry_label: "SYSTEM_START".to_string(),
         fps: 60,
         record_events: false,
+        // 标题锚点用工程配置运行值 @_DEBUGMODE=0
+        // (<project-eris>/save/data/config/projectconfig.txt DEBUGMODE=0);
+        // debug_mode=true 在本语料会走 debug UI,1200 tick 内不进 title(黑帧)。
+        // 证据与对照见 docs/title-motion-ledger.md §9。
+        debug_mode: false,
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), boot)
@@ -398,14 +404,18 @@ fn check_display(
     let skipped = count_occurrences(json, "\"executable\":false");
 
     let report = &output.report;
+    // 对账口径(J2 修正):display JSON 的 `executable` 是 **gfx 语义状态**;
+    // 后端还会因资产缺失等自身原因跳过可执行 op(`asset.missing`)。
+    // 严格不变量:passes/ops/layers 一致;每个 op 恰好被绘制或跳过;
+    // 后端执行数不超过 gfx 可执行数。
     let matches = frame == *expected_frame
         && width == u64::from(output.surface.width)
         && height == u64::from(output.surface.height)
         && layers as usize == report.layers
         && passes == report.passes
         && ops == report.ops_total
-        && executable == report.ops_drawn
-        && skipped as u32 == report.skipped_ops_total;
+        && report.ops_drawn + report.skipped_ops_total as usize == ops
+        && report.ops_drawn <= executable;
     Ok(DisplayCheck {
         matches,
         passes,

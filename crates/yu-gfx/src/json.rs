@@ -446,7 +446,7 @@ pub fn op(out: &mut String, o: &Op) {
             esc_str(
                 out,
                 match c.timing {
-                    CopyTiming::LastRenderedFrame => "last_rendered_frame",
+                    CopyTiming::CommandCurrent => "command_current",
                 },
             );
             out.push_str(",\"status\":");
@@ -663,6 +663,8 @@ fn header(out: &mut String, f: &CompositorFrame) {
     out.push_str(&f.frame.to_string());
     out.push_str(",\"viewport\":");
     viewport(out, f.viewport);
+    out.push_str(",\"dx_mode\":");
+    out.push_str(&f.dx_mode.to_string());
     out.push_str(",\"clear\":");
     clear(out, &f.clear);
     out.push_str(",\"color_space\":");

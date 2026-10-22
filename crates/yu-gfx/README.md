@@ -21,7 +21,10 @@ yu-rt 事件流(VmEvent::DomainCall / Text)
 - `A` 保留引擎单位 0..256:固定管线 `min(A,255)/255`,着色器 `A/256`;
   坐标 i64 像素,gamma 空间混合(不线性化);
 - blend 19 模式的 D3D9 状态表见 `json::blend_table_json()`;
-  0/1/2 可执行,3/5/6/7/9 状态有、辅助纹理未取证,4/8/10..18 未实现;
+  0/1/2/3/5/6/7/9 可执行(两阶段源色归约,见 `docs/render-parity.md` §5.2),
+  4/8/10..18 未实现;
+- `CompositorFrame.dx_mode`(默认 0)是宿主注入的脚本 `_DXMODE` 映射;
+  非 0 时后端选择引擎 psC/psD 转场(独立 WGSL),见 `docs/shader-parity.md`;
 - `filter` 是全局采样器设置,非逐层;
 - screen 只合成主窗口 `:/W0`,子窗口 `W1..W3` 只出 offscreen pass;
 - 槽号 → 参数名一律查工程 `ysc.ybn`(`table::ParamTable`),无内置表。
@@ -40,10 +43,11 @@ yu-rt 事件流(VmEvent::DomainCall / Text)
 
 ## 当前未实现(全部有编号与解除条件)
 
-`docs/gfx-unimplemented-todo.md`(DIV-GFX-001..042):MODE 3/5/6/7/9 辅助纹理、
-着色器模式、FX 仿射族、多部件、MID、COPY 时序、`RECTPAINT` 之外的图像加工
+`docs/gfx-unimplemented-todo.md`(DIV-GFX-001..050):MODE 4/8/10..18 公式、
+FX 仿射族、多部件、MID、COPY 时序、`RECTPAINT` 之外的图像加工
 像素、文本栅格化、颜色空间、组 RT 尺寸/清屏与 RT alpha 等。
-`RECTPAINT/RECTPAINT2/RECTPAINT3` 已实现(EVID-J-02..05)。
+`RECTPAINT/RECTPAINT2/RECTPAINT3` 已实现(EVID-J-02..05);
+`docs/shader-parity.md` 是引擎 4 个 shader blob 的完整台账。
 首屏 golden:`tests/golden/eris_first_screen_display.json`(历史 272 层 /
 15 pass / 44 op;当前 HEAD 的 boot 链为 8 visible / 18 op,见 PROGRESS J1;
 未用 UPDATE 掩盖)。

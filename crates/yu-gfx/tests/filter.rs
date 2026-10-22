@@ -69,17 +69,48 @@ fn probe_order_from_eris_yscfg() {
     assert_eq!(ImageFormat::Psb.extension(), Some(".psb"));
 }
 
+/// 读取工程 `ysbin/yscfg.ybn`。
+///
+/// 样本 gate 与 `eris_first_screen.rs` 统一:优先 `YURIS_SAMPLE_ERIS_ROOT`
+/// (data.ypf 优先、data/ 为备),其次 `YURIS_SAMPLE_ERIS_YSBIN`。只设 ROOT 时
+/// `YURIS_REQUIRE_SAMPLES=1` 不再失败。
+fn read_yscfg() -> Option<Vec<u8>> {
+    use yu_vfs::{Codec, DataSource, DirSource, LookupKey, YpfSource};
+    let key = LookupKey::new(b"ysbin/yscfg.ybn", Codec::Cp932).ok()?;
+    if let Ok(root) = std::env::var("YURIS_SAMPLE_ERIS_ROOT") {
+        let root = std::path::Path::new(&root);
+        let ypf = root.join("data.ypf");
+        if ypf.is_file() {
+            let src = YpfSource::open(&ypf, Codec::Cp932).ok()?;
+            if let Ok(bytes) = src.open(&key) {
+                return Some(bytes);
+            }
+        }
+        let data = root.join("data");
+        if data.is_dir() {
+            let src = DirSource::open(&data, Codec::Cp932).ok()?;
+            if let Ok(bytes) = src.open(&key) {
+                return Some(bytes);
+            }
+        }
+    }
+    let ysbin = std::env::var("YURIS_SAMPLE_ERIS_YSBIN").ok()?;
+    std::fs::read(std::path::Path::new(&ysbin).join("yscfg.ybn")).ok()
+}
+
 #[test]
 fn probe_order_matches_real_eris_yscfg() {
-    let Some(ysbin) = std::env::var("YURIS_SAMPLE_ERIS_YSBIN").ok() else {
+    let Some(bytes) = read_yscfg() else {
         if std::env::var("YURIS_REQUIRE_SAMPLES").ok().as_deref() == Some("1") {
-            panic!("YURIS_REQUIRE_SAMPLES=1 but YURIS_SAMPLE_ERIS_YSBIN is missing");
+            panic!(
+                "YURIS_REQUIRE_SAMPLES=1 but YURIS_SAMPLE_ERIS_ROOT/YSBIN cannot read yscfg.ybn"
+            );
         }
-        eprintln!("SKIP probe_order_matches_real_eris_yscfg: no YURIS_SAMPLE_ERIS_YSBIN");
+        eprintln!(
+            "SKIP probe_order_matches_real_eris_yscfg: set YURIS_SAMPLE_ERIS_ROOT or YURIS_SAMPLE_ERIS_YSBIN"
+        );
         return;
     };
-    let path = std::path::Path::new(&ysbin).join("yscfg.ybn");
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let cfg = yu_format::yscf::Yscf::parse(&bytes, b"yscfg.ybn").expect("parse yscfg");
     assert_eq!((cfg.width, cfg.height), (800, 600));
     assert_eq!(

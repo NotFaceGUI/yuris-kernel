@@ -109,19 +109,24 @@ pub enum CopyRegion {
 }
 
 /// 复制时序。
+///
+/// 任务 J2(EVID-T-12 / EVID-J-11):官方在**命令执行时**取源层的当前状态
+/// (组源 = 立刻重绘组的当前内容),旧接手线的 `last_rendered_frame` 已被
+/// 受控微场景 Refuted。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CopyTiming {
-    /// 引擎在脚本执行期复制**上一帧已渲染**的目标(旧线实测:
-    /// `CGACT ":/W0/" COPY2` 截到的是此刻已经黑掉的屏幕)。
-    LastRenderedFrame,
+    /// 命令执行时当前状态;快照在目标层存活期间保持(后端按 `CopyId` 缓存)。
+    CommandCurrent,
 }
 
 /// 一次渲染到纹理复制。
-///
-/// TODO(DIV-GFX-007):时序(上一帧已渲染目标)与区域 `X/Y/X2/Y2` 语义未
-/// 逐项取证;所有 `CopyOp.status` 恒为 `Unimplemented`,后端必须跳过。
 #[derive(Clone, Debug, PartialEq)]
 pub struct CopyOp {
+    /// 命令执行序(COPY 与图像加工共用一个单调序号)。
+    ///
+    /// 证据:官方在命令处理器里**立即**执行(EVID-T-15);`frame()` 按本序号
+    /// 交错输出 copy/image 纹理 pass,而不是按类型分组(DIV-GFX-029)。
+    pub seq: u64,
     /// 快照 ID(目标层的 `TextureRef::Snapshot` 引用它)。
     pub id: CopyId,
     pub kind: CopyKind,
@@ -147,6 +152,10 @@ pub enum ImageAction {
     Trim,
     Merge,
     Merge2,
+    /// `REVERSE=1`:RGB 逐通道取反(`255-x`),alpha 不变。
+    Reverse,
+    /// `HORIZONTAL=1`:水平镜像。
+    Horizontal,
     Other(&'static str),
 }
 
@@ -164,6 +173,8 @@ impl ImageAction {
             Self::Trim => "trim",
             Self::Merge => "merge",
             Self::Merge2 => "merge2",
+            Self::Reverse => "reverse",
+            Self::Horizontal => "horizontal",
             Self::Other(s) => s,
         }
     }
@@ -171,10 +182,12 @@ impl ImageAction {
 
 /// 一次图像加工操作。
 ///
-/// TODO(DIV-GFX-013):像素算法(RECTPAINT/SIZE/ROTATION/RESIZE/TRIM/
-/// MONO/BLUR/...)未实现;`status` 恒为 `Unimplemented`,后端跳过。
+/// J2 放行的动作:`RECTPAINT/2/3`(EVID-J-02..05)、`REVERSE`/`HORIZONTAL`
+/// (EVID-T-13);其余像素算法仍未取证,`status` 为 `Unimplemented`。
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImageOp {
+    /// 命令执行序(与 [`CopyOp::seq`] 同一序列,用于交错输出)。
+    pub seq: u64,
     /// 源图层(`ID`;`ID2` 存在时加工结果写入目标层)。
     pub source: LayerId,
     /// `ID2`(复制/加工结果目标;`None` = 原地加工)。

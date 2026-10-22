@@ -240,6 +240,13 @@ pub struct CompositorFrame {
     /// 逻辑帧号(来自 `VmEvent` 的 frame)。
     pub frame: u64,
     pub viewport: Viewport,
+    /// 引擎 `@_DXMODE` 的宿主注入值(0 = 固定管线路径)。
+    ///
+    /// 注意:官方引擎没有名为 `_DXMODE` 的渲染开关;该变量只改脚本分支
+    /// (`CGACT[TRANSITION]`/`TID` 与 `DXBUF`)。本字段是内核把脚本开关
+    /// 映射为“请求 HLSL 转场路径”的显式契约,默认 0 不改变现有工程行为。
+    /// 证据与范围见 `docs/shader-parity.md` §3/§6。
+    pub dx_mode: u32,
     pub clear: Clear,
     pub color_space: ColorSpace,
     pub filter: TextureFilter,
@@ -262,6 +269,7 @@ impl CompositorFrame {
         Self {
             frame,
             viewport,
+            dx_mode: 0,
             clear: Clear::default_black(),
             color_space: ColorSpace::GammaEncodedSrgb8,
             filter: TextureFilter::unknown(),

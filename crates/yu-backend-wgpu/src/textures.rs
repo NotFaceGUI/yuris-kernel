@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::Pod;
 use yu_backend_soft::TextureStore;
-use yu_gfx::LayerId;
+use yu_gfx::{CopyId, LayerId};
 use yu_log::Diag;
 
 use crate::device::{code, GpuContext};
@@ -29,10 +29,11 @@ fn allocate_texture_id() -> u64 {
     NEXT_TEXTURE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// 纹理用途:既能被采样,也能作为渲染目标。
+/// 纹理用途:既能被采样,也能作为渲染目标/COPY 源/COPY 目标。
 const TARGET_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::RENDER_ATTACHMENT
     .union(wgpu::TextureUsages::TEXTURE_BINDING)
-    .union(wgpu::TextureUsages::COPY_SRC);
+    .union(wgpu::TextureUsages::COPY_SRC)
+    .union(wgpu::TextureUsages::COPY_DST);
 
 /// 一张已上传的纹理 + 稳定身份。
 pub struct GpuTexture {
@@ -149,7 +150,9 @@ impl TextureCache {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: TARGET_FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         };
         let texture = ctx.checked(code::TARGET, label, || {
@@ -195,10 +198,11 @@ pub struct RenderTarget {
     pub view: wgpu::TextureView,
 }
 
-/// 屏幕目标 + 按 `LayerId` 的离屏目标集合。
+/// 屏幕目标 + 按 `LayerId` 的离屏目标集合 + 按 `CopyId` 的快照集合。
 pub struct TargetSet {
     screen: Option<RenderTarget>,
     offscreen: BTreeMap<LayerId, RenderTarget>,
+    snapshots: BTreeMap<CopyId, RenderTarget>,
 }
 
 impl TargetSet {
@@ -206,6 +210,7 @@ impl TargetSet {
         Self {
             screen: None,
             offscreen: BTreeMap::new(),
+            snapshots: BTreeMap::new(),
         }
     }
 
@@ -217,8 +222,76 @@ impl TargetSet {
         self.offscreen.get(id)
     }
 
+    pub fn snapshot(&self, id: CopyId) -> Option<&RenderTarget> {
+        self.snapshots.get(&id)
+    }
+
     pub fn offscreen_count(&self) -> usize {
         self.offscreen.len()
+    }
+
+    pub fn snapshot_count(&self) -> usize {
+        self.snapshots.len()
+    }
+
+    /// 按稳定的纹理 id 找 view(过渡/复制执行期用)。
+    pub fn view_by_id(&self, id: u64) -> Option<&wgpu::TextureView> {
+        if let Some(target) = &self.screen {
+            if target.id == id {
+                return Some(&target.view);
+            }
+        }
+        for target in self.offscreen.values().chain(self.snapshots.values()) {
+            if target.id == id {
+                return Some(&target.view);
+            }
+        }
+        None
+    }
+
+    /// 按稳定的纹理 id 找纹理(COPY 源用)。
+    pub fn texture_by_id(&self, id: u64) -> Option<&wgpu::Texture> {
+        if let Some(target) = &self.screen {
+            if target.id == id {
+                return Some(&target.texture);
+            }
+        }
+        for target in self.offscreen.values().chain(self.snapshots.values()) {
+            if target.id == id {
+                return Some(&target.texture);
+            }
+        }
+        None
+    }
+
+    /// COPY 目标的快照纹理(EVID-T-12:按 `CopyId` 冻结;已存在则复用)。
+    ///
+    /// 快照同时可被采样、被 COPY 写入、被 RECTPAINT 族渲染。
+    pub fn ensure_snapshot(
+        &mut self,
+        ctx: &GpuContext,
+        id: CopyId,
+        width: u32,
+        height: u32,
+        pipelines: &mut crate::pipelines::PipelineCache,
+    ) -> Result<&RenderTarget, Diag> {
+        let reusable = self
+            .snapshots
+            .get(&id)
+            .is_some_and(|t| t.width == width && t.height == height);
+        if !reusable {
+            if let Some(old) = self.snapshots.remove(&id) {
+                pipelines.forget_texture(old.id);
+            }
+            let target = create_target(ctx, width, height, "copy snapshot")?;
+            self.snapshots.insert(id, target);
+        }
+        Ok(self.snapshots.get(&id).expect("snapshot target set above"))
+    }
+
+    /// 只保留本帧仍被引用的快照(`CopyId` 由目标层或本帧复制引用)。
+    pub fn prune_snapshots(&mut self, live: &std::collections::BTreeSet<CopyId>) {
+        self.snapshots.retain(|id, _| live.contains(id));
     }
 
     /// 屏幕目标:尺寸不变则复用。重建时把旧 id 的 bind group 一并作废。

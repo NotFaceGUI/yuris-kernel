@@ -60,6 +60,11 @@ fn run() -> Result<(), String> {
         entry_label: "SYSTEM_START".to_string(),
         fps: 60,
         record_events: false,
+        // 标题锚点用工程配置运行值 @_DEBUGMODE=0
+        // (<project-eris>/save/data/config/projectconfig.txt DEBUGMODE=0);
+        // debug_mode=true 在本语料会走 debug UI,1200 tick 内不进 title(黑帧)。
+        // 证据与对照见 docs/title-motion-ledger.md §9。
+        debug_mode: false,
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), boot)

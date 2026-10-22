@@ -12,31 +12,45 @@ cargo clippy -p yu-backend-soft --all-targets
 export YURIS_SAMPLE_ERIS_ROOT=<project-eris>   # 数据入口:data.ypf 优先,散盘 data/ 为备
 export YURIS_SAMPLE_ERIS_YPF=<project-eris>/data.ypf   # 可选
 cargo run -p yu-backend-soft --example first_frame
+cargo run -p yu-backend-soft --example frame_walk -- 600   # 逐帧基线 TSV
 ```
 
 `first_frame` 用 **`GfxHost` 同步事件路径** boot ERIS,每 tick 后用
 `Vm::take_events()` 只做事件计数/drain,**不**再把同一批事件喂给 `GfxState`。
 输出 `target/tmp/first_frame.png` 与 `target/tmp/first_frame.display.json`。
+`frame_walk` 输出每 tick 的 ops/drawn/skipped、transition/copy/image 计数、
+原始 RGBA sha256 与渲染耗时,供三端逐帧对拍(J3)。
+
+屏幕输出是 **opaque** 窗口:组 RT 的 alpha 只参与组合成到屏幕,最终
+`render_frame` 返回前 alpha 归一 255。混合按 D3D9 浮点模型(先求和再
+u8 取整),与 wgpu 固定管线/本后端共用同一舍入,淡入淡出区间 0 差异。
 
 ## 执行契约
 
 | 输入 | 行为 |
 |---|---|
-| `PassTarget::Texture` | `RECTPAINT/RECTPAINT2/RECTPAINT3` 可执行(EVID-J-02..05);`Copy`/其余 `Image` 跳过并计数 |
+| `PassTarget::Texture` | `Op::Copy`(COPY/COPY2)与已取证的 `Op::Image`(`RECTPAINT/2/3`、`REVERSE`、`HORIZONTAL`)执行;其余跳过并计数。纹理操作按 `seq` 命令交错序,不按类型分组 |
 | `PassTarget::Offscreen` | 组尺寸 = `SX/SY`,未给时用视口;clear = pass.clear(透明黑) |
 | `PassTarget::Screen` | 输出尺寸 = `frame.viewport`;clear = pass.clear / frame.clear |
-| `Op::Layer` | `Asset` / `SolidBlack1x1`;`Snapshot` / `None` 跳过 |
+| `Op::Layer` | `Asset` / `SolidBlack1x1` / `Snapshot`(按 `CopyId` 的冻结表面) |
 | `Op::Group` | 取已渲染的 offscreen 表面,组的 `A/MODE` 只在此时作用一次 |
-| `Op::Transition/Mask/Copy` | 跳过并计数 |
-| `Op::Image` | 只有 RECTPAINT/2/3 执行;填充作用于目标层的纹理副本,绘制该层时优先使用副本 |
+| `Op::Transition` | 双纹理 mask pass:RGB=本层纹理;alpha=纹理 α × 覆盖度 × 层 A;mask=配对纹理 G 通道(EVID-T-05) |
+| `Op::Mask` | 跳过并计数 |
+| `Op::Copy` | 源=命令执行时当前状态(组按需重绘);区域=源坐标含端点,裁剪块写目标 (0,0);快照按 `CopyId` 只捕获一次 |
+| `Op::Image` | `RECTPAINT/2/3`、`REVERSE`(RGB 取反)、`HORIZONTAL`(水平镜像);作用于目标层纹理副本,绘制该层时优先使用副本 |
 | `TextRun` | 不栅格化,只计入 `skipped_text` |
 
 - Alpha:固定管线 `min(max(A,0),255)/255`;纹理 alpha 与层 alpha 在混合
   方程里相乘,不预乘。D3D9 未启用 `SEPARATEALPHABLENDENABLE` 时 alpha 与
-  RGB 复用同一组因子,因此 `MODE 0/1/2` 的 alpha 源项是 `a²`(不是 `a`)。
-- `MODE 0`: RGB `src·a + dst·(1−a)`, alpha `a² + dst·(1−a)`;
-  `MODE 1`: RGB `src·a + dst`, alpha `a² + dst`;
-  `MODE 2`: RGB `dst − src·a`, alpha `dst − a²`。其余模式跳过。
+  RGB 复用同一组因子,因此 alpha 源项是 `a²`(不是 `a`)。
+- 固定管线模式全集:`0/1/2/3/5/6/7/9`。源色先按引擎两阶段状态归约
+  (`T`=纹理,`A`=层 alpha,`a`=纹理α×层A):
+  `0/1=T`、`2/5/6/9=T·A`、`3/7=T·A+(1−a)`;然后:
+  `0`: `src·a+dst·(1−a)`;`1`: `src·a+dst`;`2`: `dst−src·a`;
+  `3`: `dst·src`;`5`: `src+dst−src·dst`;`6`: `max`;`7`: `min`;
+  `9`: `src+dst−2·src·dst`。alpha 与 RGB 同因子。
+- MODE 3/5/9 在 wgpu 端用 `Src/OneMinusDst/OneMinusSrc` 因子实现同一公式;
+  `fixed_pipeline_modes_3_5_6_7_9_match_soft` 逐像素验证两端一致。
 - 证据:`EVID-J-01`(`docs/fidelity-ledger-j.md`);规则来自 Microsoft
   `d3d9types.h` 的 `D3DBLEND_SRCALPHA=5` 与
   `D3DRS_SEPARATEALPHABLENDENABLE=206`(默认 FALSE),并由引擎反编译
@@ -53,7 +67,7 @@ cargo run -p yu-backend-soft --example first_frame
 
 ## 证据与已知 Likely 决策
 
-- **MODE 0/1/2 状态**:官方 0.495 `yu-ris.exe`(sha256
+- **MODE 0/1/2/3/5/6/7/9 状态**:官方 0.495 `yu-ris.exe`(sha256
   `4f5eefa3544c7244a907477d89ccee97286f559df5e38b1b1fa674206981138f`)
   `FUN_00414ba4`(`0x414ba4`,REA/Ghidra 12.1.4):
   - `A` 先 clamp 到 `0..255`;

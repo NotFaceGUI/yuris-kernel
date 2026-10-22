@@ -104,7 +104,8 @@ fn confidence_reflects_evidence_level() {
         BlendMode::Darken,
         BlendMode::Exclusion,
     ] {
-        assert_eq!(mode.confidence(), BlendConfidence::Unverified, "{mode:?}");
+        // J4:状态表 + aux/DIFFUSE 已闭合,官方像素待 YSCom 工具恢复。
+        assert_eq!(mode.confidence(), BlendConfidence::Likely, "{mode:?}");
     }
     for code in [4, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18] {
         let mode = BlendMode::from_code(code).unwrap();

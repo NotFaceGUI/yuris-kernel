@@ -27,7 +27,7 @@ fn command(name: &str, params: &[&str]) -> FmtCommand {
             .iter()
             .map(|param| FmtArg {
                 name: (*param).into(),
-                flag: if matches!(*param, "ID" | "ID2" | "FILE") {
+                flag: if matches!(*param, "ID" | "ID2" | "FILE" | "TID") {
                     1
                 } else {
                     0
@@ -44,7 +44,9 @@ fn table() -> ParamTable {
         commands: vec![
             command(
                 "CG",
-                &["ID", "FILE", "E", "A", "X", "Y", "Z", "SX", "SY", "MODE"],
+                &[
+                    "ID", "FILE", "E", "A", "X", "Y", "Z", "SX", "SY", "MODE", "T", "TA", "TID",
+                ],
             ),
             command("CGACT", &[
                 "ID",
@@ -240,9 +242,9 @@ fn asset_layer_composites_with_padded_rows() {
         1,
         "uncovered clear",
     );
-    // group op + asset layer op。
-    assert_eq!(out.report.ops_drawn, 2);
-    assert_eq!(out.stats.draw_calls, 2);
+    // 主组直绘:只有 asset 图层 op 与 1 次 draw(DIV-GFX-008/041)。
+    assert_eq!(out.report.ops_drawn, 1);
+    assert_eq!(out.stats.draw_calls, 1);
     assert_eq!(out.stats.readback_bytes, 3 * 2 * 4);
 }
 
@@ -279,11 +281,11 @@ fn repeated_asset_uploads_once_and_cache_survives_frames() {
         return;
     };
     let first = renderer.render_frame(&frame).expect("render");
-    // 同一资产被两层引用:只上传一次;draw = group + 2 layers。
+    // 同一资产被两层引用:只上传一次;draw = 2 个直绘图层。
     assert_eq!(first.stats.texture_uploads, 1);
     assert_eq!(first.stats.upload_bytes, 2 * 2 * 4);
-    assert_eq!(first.report.ops_drawn, 3);
-    assert_eq!(first.stats.draw_calls, 3);
+    assert_eq!(first.report.ops_drawn, 2);
+    assert_eq!(first.stats.draw_calls, 2);
 
     let second = renderer.render_frame(&frame).expect("render again");
     assert_eq!(second.stats.texture_uploads, 0, "second frame must reuse");
@@ -304,7 +306,7 @@ fn unsupported_blend_counts_match_soft_backend() {
             vec![
                 arg(&table, "CG", "ID", Value::Str(b"M".to_vec())),
                 arg(&table, "CG", "FILE", Value::Str(b"red".to_vec())),
-                arg(&table, "CG", "MODE", Value::Int(3)),
+                arg(&table, "CG", "MODE", Value::Int(4)),
             ],
         ),
         VmEvent::FrameEnd { frame: 1 },
@@ -376,15 +378,14 @@ fn group_alpha_is_applied_once() {
         return;
     };
     let out = renderer.render_frame(&frame).expect("render");
-    // gfx 每帧都会把主组 W0 再包一层离屏。D3D9 同因子 alpha(源项 a²):
-    // 子层在 G 的透明离屏里先成为 (255,0,0,255);G 以 A=128 合成进透明的
-    // W0 离屏,得到 (128,0,0,64);W0 再以 A=256 合成到白屏:
-    //   R = 128/255·64/255 + 255/255·(1−64/255) ≈ 223
-    //   G/B = 255/255·(1−64/255) = 191
-    //   A = (64/255)² + 1·(1−64/255) ≈ 207
-    // 组 A 只在“组 → 父目标”合成时作用一次,没有下推到子层。
-    assert_close(pixel(&out, 0, 0), [223, 191, 191, 207], 2, "group alpha");
-    assert_close(pixel(&out, 3, 3), [223, 191, 191, 207], 2, "group alpha");
+    // 主组 G 的离屏内容是不透明红 (255,0,0);G 以 A=128 直接合成到白屏
+    // (DIV-GFX-008/041 主组直绘:主窗口组没有自己的 RT,不存在“再乘一次
+    // 组 alpha”):
+    //   R = 255·a + 255·(1−a) = 255(a=128/255)
+    //   G/B = 0·a + 255·(1−a) = 127
+    // 屏幕是 opaque 窗口,最终读回 alpha 归一为 255(见 render_frame)。
+    assert_close(pixel(&out, 0, 0), [255, 127, 127, 255], 2, "group alpha");
+    assert_close(pixel(&out, 3, 3), [255, 127, 127, 255], 2, "group alpha");
 }
 
 /// Phase B 验收(EVID-J-02..05):RECTPAINT/2/3 在 soft 与 wgpu 上逐像素一致。
@@ -394,7 +395,7 @@ fn group_alpha_is_applied_once() {
 #[test]
 fn rectpaint_family_matches_soft_backend() {
     let table = table();
-    let mut gfx = state(Viewport::new(8, 4), [255, 255, 255, 255]);
+    let mut gfx = state(Viewport::new(8, 4), [255, 255, 255, 255]);  
     gfx.consume_events(&[
         VmEvent::FrameStart { frame: 1 },
         call(
@@ -486,8 +487,9 @@ fn rectpaint_family_matches_soft_backend() {
 
 /// Phase A 验收(EVID-J-01):同一半透明帧,soft 与 wgpu 逐通道差 ≤1。
 ///
-/// 组 A=128 的 4×4 红层覆盖整屏,最终屏幕 alpha=207(<255),所以每个像素
-/// 都是“半透明像素”;不是拿全不透明帧做 0 差冒烟。
+/// 组 A=128 的 4×4 红层覆盖整屏(内部合成半透明);最终屏幕是 opaque,
+/// 读回 alpha 归一 255。控制断言改为检查帧里确实有 A<256 的组,避免拿
+/// 全不透明帧做 0 差冒烟。
 #[test]
 fn semi_transparent_pixels_match_soft_within_one() {
     let table = table();
@@ -546,8 +548,8 @@ fn semi_transparent_pixels_match_soft_within_one() {
         gpu_out.surface.rgba.len() / 4
     );
     assert!(
-        soft_out.surface.rgba.chunks_exact(4).any(|p| p[3] < 255),
-        "controle: 必须有半透明像素,否则测试无意义"
+        frame.layers.iter().any(|layer| layer.is_group() && layer.alpha < 256),
+        "controle: 必须有半透明组,否则测试无意义"
     );
     assert!(
         max_diff <= 1,
@@ -557,4 +559,154 @@ fn semi_transparent_pixels_match_soft_within_one() {
         gpu_out.report, soft_out.report,
         "双后端 RenderReport 必须逐字段一致"
     );
+}
+
+/// `_DXMODE` 双路径:psC(mask R)与固定管线 G-mask 产生不同覆盖度。
+#[test]
+fn dx_mode_selects_engine_psc_transition() {
+    let build = |dx_mode: u32| {
+        let table = table();
+        let mut config = GfxConfig::new(Viewport::new(4, 4));
+        config.clear = Clear::explicit([0, 0, 0, 255]);
+        config.image_probe_order = vec![ImageFormat::Png];
+        config.dx_mode = dx_mode;
+        // 主窗口直接指向图像层,避免 W0 组离屏对 alpha 再做一次合成
+        // (DIV-GFX-008/041 的已知契约差异);本测试只验证转场模型。
+        config.main_layer_set = yu_gfx::LayerId::new(b":/W0/A".to_vec());
+        let mut gfx = GfxState::new(table.clone(), config);
+        gfx.consume_events(&[
+            VmEvent::FrameStart { frame: 1 },
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"A".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"from".to_vec())),
+                    arg(&table, "CG", "Z", Value::Int(10)),
+                    arg(&table, "CG", "T", Value::Int(128)),
+                    arg(&table, "CG", "TA", Value::Int(256)),
+                    arg(&table, "CG", "TID", Value::Str(b"B".to_vec())),
+                ],
+            ),
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"B".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"mask".to_vec())),
+                    arg(&table, "CG", "E", Value::Int(0)),
+                ],
+            ),
+            VmEvent::FrameEnd { frame: 1 },
+        ]);
+        gfx.frame()
+    };
+    let assets = [
+        (
+            b"from.png".as_slice(),
+            png_bytes_for(4, 4, Rgba([200, 100, 50, 255])),
+        ),
+        (
+            b"mask.png".as_slice(),
+            png_bytes_for(4, 4, Rgba([127, 0, 0, 255])),
+        ),
+    ];
+    let Some(mut wgpu) = renderer_or_skip(store(&assets)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&assets));
+
+    let frame1 = build(1);
+    let gpu1 = wgpu.render_frame(&frame1).expect("render dx1");
+    let soft1 = soft.render_frame(&frame1);
+    for (gpu_px, soft_px) in gpu1
+        .surface
+        .rgba
+        .chunks_exact(4)
+        .zip(soft1.surface.rgba.chunks_exact(4))
+    {
+        for i in 0..4 {
+            assert!(
+                gpu_px[i].abs_diff(soft_px[i]) <= 2,
+                "dx1 soft/wgpu mismatch: {gpu_px:?} vs {soft_px:?}"
+            );
+        }
+    }
+    // psC 公式(TA=256,A=256,mask.r=127/255):
+    // fade=128/(256/(256/256+128))/256 ≈ 0.25195;
+    // coverage=(0.25195-0.5*127/255)*256 ≈ 0.751。
+    // 源色 = from * 0.751 => [150,75,38]。
+    let center = pixel(&gpu1, 2, 2);
+    assert!(
+        (145..=155).contains(&center[0])
+            && (70..=80).contains(&center[1])
+            && (33..=43).contains(&center[2]),
+        "psC center {center:?} not in expected band"
+    );
+
+    let frame0 = build(0);
+    let gpu0 = wgpu.render_frame(&frame0).expect("render dx0");
+    // 固定管线 G 通道 = 0,fade<1 => 覆盖度 0,图层不可见。
+    assert_eq!(pixel(&gpu0, 2, 2), [0, 0, 0, 255]);
+}
+
+/// MODE 3/5/6/7/9:soft 与 wgpu 的 blend 因子/两阶段归约逐像素一致。
+/// 主窗口直接指向图像层,避免 W0 组离屏的二次 alpha 合成(DIV-GFX-008/041)。
+#[test]
+fn fixed_pipeline_modes_3_5_6_7_9_match_soft() {
+    let expected: [(u32, [u8; 3]); 5] = [
+        (3, [31, 24, 16]),
+        (5, [209, 136, 114]),
+        (6, [200, 100, 80]),
+        (7, [40, 60, 50]),
+        (9, [177, 113, 99]),
+    ];
+    let assets = [(
+        b"src.png".as_slice(),
+        png_bytes_for(2, 2, Rgba([200, 100, 50, 255])),
+    )];
+    let Some(mut wgpu) = renderer_or_skip(store(&assets)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&assets));
+    for (mode, rgb) in expected {
+        let table = table();
+        let mut config = GfxConfig::new(Viewport::new(2, 2));
+        config.clear = Clear::explicit([40, 60, 80, 255]);
+        config.image_probe_order = vec![ImageFormat::Png];
+        config.main_layer_set = yu_gfx::LayerId::new(b":/W0/A".to_vec());
+        let mut gfx = GfxState::new(table.clone(), config);
+        gfx.consume_events(&[
+            VmEvent::FrameStart { frame: 1 },
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"A".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"src".to_vec())),
+                    arg(&table, "CG", "A", Value::Int(256)),
+                    arg(&table, "CG", "MODE", Value::Int(i64::from(mode))),
+                ],
+            ),
+            VmEvent::FrameEnd { frame: 1 },
+        ]);
+        let frame = gfx.frame();
+        let gpu = wgpu.render_frame(&frame).expect("render mode");
+        let soft_out = soft.render_frame(&frame);
+        for (gpu_px, soft_px) in gpu
+            .surface
+            .rgba
+            .chunks_exact(4)
+            .zip(soft_out.surface.rgba.chunks_exact(4))
+        {
+            for i in 0..4 {
+                assert!(
+                    gpu_px[i].abs_diff(soft_px[i]) <= 1,
+                    "MODE {mode}: {gpu_px:?} vs {soft_px:?}"
+                );
+            }
+        }
+        let center = pixel(&gpu, 1, 1);
+        assert_eq!(&center[..3], &rgb[..], "MODE {mode} center {center:?}");
+    }
 }

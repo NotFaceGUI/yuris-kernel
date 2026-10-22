@@ -60,6 +60,9 @@ pub struct GfxConfig {
     pub clear: Clear,
     pub filter: TextureFilter,
     pub image_probe_order: Vec<ImageFormat>,
+    /// 引擎 `@_DXMODE` 的宿主注入值(0 = 固定管线)。见
+    /// [`crate::CompositorFrame::dx_mode`] 的范围说明。
+    pub dx_mode: u32,
     /// 主窗口(`WINDOW[NO=0]`)显示的图层组。手册 `window/window.html`:
     /// 「NO=0 がメインウィンドウ、１～３がサブウィンドウ」「CGID=表示対象の
     /// レイヤセット」。默认 `:/W0`。
@@ -73,8 +76,15 @@ impl GfxConfig {
             clear: Clear::default_black(),
             filter: TextureFilter::unknown(),
             image_probe_order: crate::frame::default_probe_order(),
+            dx_mode: 0,
             main_layer_set: LayerId::new(b":/W0".to_vec()),
         }
+    }
+
+    /// 宿主注入 `_DXMODE`(链式构造)。
+    pub fn with_dx_mode(mut self, dx_mode: u32) -> Self {
+        self.dx_mode = dx_mode;
+        self
     }
 }
 
@@ -95,6 +105,8 @@ pub struct GfxState {
     nodes: BTreeMap<LayerId, Node>,
     seq: u64,
     copy_seq: u64,
+    /// COPY + 图像加工的共同命令序(EVID-T-15;`frame()` 交错输出)。
+    texture_seq: u64,
     frame: u64,
     style: TextStyle,
     text: Vec<TextRun>,
@@ -105,8 +117,20 @@ pub struct GfxState {
     image_log_dropped: u64,
     /// 本帧诊断(按 `(code, command, detail)` 有序去重;`FrameStart` 清空)。
     diags: BTreeMap<(String, String, String), error::FrameDiag>,
+    /// `yscfg.image_ext_order` 为空,帧内显式记录一次回退(A5)。
+    probe_order_defaulted: bool,
     /// 窗口状态(按 `NO`;0 = 主窗口)。
     windows: BTreeMap<u8, WindowState>,
+    /// 资产像素尺寸缓存(键 = `CG[FILE]` 原始字节)。
+    ///
+    /// 由 VM 在 `CGINFO[SX/SY]` 回退路径解析图像头后注入(DIV-GFX-024):
+    /// gfx 自己不做文件 I/O,但 `CGINFO` 必须与引擎一样在**脚本执行期**
+    /// 回答尺寸,否则精灵脚本的 `SX/SY` 布局全为 0(EVID-J3-03)。
+    asset_sizes: BTreeMap<Vec<u8>, SizeU32>,
+    /// `COPY/COPY2` 生成的快照纹理尺寸(创建时从源层继承)。
+    snapshot_sizes: BTreeMap<CopyId, SizeU32>,
+    /// 快照对应的源资产键(`CGINFO[MFILE]` 透传)。
+    snapshot_files: BTreeMap<CopyId, Vec<u8>>,
 }
 
 impl GfxState {
@@ -118,6 +142,10 @@ impl GfxState {
         let params = ParamTable::from_tables(tables);
         params.validate()?;
         let order = probe_order_from_codes(&tables.boot.config.image_ext_order);
+        // A5:缺表不得静默兜底。工程 yscfg 总是存在(TableSet 已装载),
+        // 这里只处理“字段全 0”的合法数据:保留宿主/默认顺序,但在帧诊断里
+        // 显式记录 `gfx.config.probe_order_fallback`。
+        let probe_order_defaulted = order.is_empty();
         if !order.is_empty() {
             config.image_probe_order = order;
         }
@@ -125,7 +153,9 @@ impl GfxState {
         if cfg.width != 0 && cfg.height != 0 {
             config.viewport = Viewport::new(cfg.width, cfg.height);
         }
-        Ok(Self::new(params, config))
+        let mut state = Self::new(params, config);
+        state.probe_order_defaulted = probe_order_defaulted;
+        Ok(state)
     }
 
     pub fn new(params: ParamTable, config: GfxConfig) -> Self {
@@ -137,6 +167,7 @@ impl GfxState {
             nodes: BTreeMap::new(),
             seq: 0,
             copy_seq: 0,
+            texture_seq: 0,
             frame: 0,
             style: TextStyle::default(),
             text: Vec::new(),
@@ -145,7 +176,11 @@ impl GfxState {
             copy_log_dropped: 0,
             image_log_dropped: 0,
             diags: BTreeMap::new(),
+            probe_order_defaulted: false,
             windows,
+            asset_sizes: BTreeMap::new(),
+            snapshot_sizes: BTreeMap::new(),
+            snapshot_files: BTreeMap::new(),
         };
         s.ensure_w0();
         s
@@ -166,6 +201,21 @@ impl GfxState {
 
     pub fn set_filter(&mut self, filter: TextureFilter) {
         self.config.filter = filter;
+    }
+
+    /// 宿主注入 `@_DXMODE`(0 = 固定管线;非 0 = 引擎 HLSL 转场路径)。
+    pub fn set_dx_mode(&mut self, dx_mode: u32) {
+        self.config.dx_mode = dx_mode;
+    }
+
+    /// 注入资产像素尺寸(VM 解析图像头后调用;键为 `CG[FILE]` 原字节)。
+    pub fn set_asset_size(&mut self, key: &[u8], size: SizeU32) {
+        self.asset_sizes.insert(key.to_vec(), size);
+    }
+
+    /// 查询已注入的资产尺寸。
+    pub fn asset_size(&self, key: &[u8]) -> Option<SizeU32> {
+        self.asset_sizes.get(key).copied()
     }
 
     pub fn layer(&self, id: &LayerId) -> Option<&Layer> {
@@ -245,6 +295,7 @@ impl GfxState {
     /// 构建当前帧的合成契约(只读;可重复调用,字节稳定)。
     pub fn frame(&self) -> CompositorFrame {
         let mut f = CompositorFrame::new(self.frame, self.config.viewport);
+        f.dx_mode = self.config.dx_mode;
         f.clear = self.config.clear;
         f.filter = self.config.filter;
         f.image_probe_order = self.config.image_probe_order.clone();
@@ -252,13 +303,13 @@ impl GfxState {
 
         let mut passes = Vec::new();
 
-        // 1. 纹理复制/图像加工(各自状态生产顺序;copy/image 分组输出,
-        //    不是脚本命令交错序——交错序未取证)。
+        // 1. 纹理复制/图像加工:按**命令执行序**交错输出(EVID-T-15;
+        //    官方处理器在命令到达时立即执行,COPY 看到的是此前加工后的纹理)。
         //
         // 只输出仍然可达的项:目标仍引用该快照,且复制源在帧内仍存在。
-        // 复制当前全部 `Unimplemented`(时序/区域未取证),后端必须跳过;
         // 源已被 CGEND 删除的快照无法在渲染期重放,完整历史留在
         // `GfxState::copies()` 供审计。
+        let mut texture_ops: Vec<(u64, Op)> = Vec::new();
         for c in &self.copy_log {
             let dest_live = self
                 .nodes
@@ -267,25 +318,27 @@ impl GfxState {
             let source_live = match &c.source {
                 CopySource::Layer(id) | CopySource::Group(id) => self.nodes.contains_key(id),
             };
-            if !dest_live || !source_live {
-                continue;
+            if dest_live && source_live {
+                texture_ops.push((c.seq, Op::Copy(c.clone())));
             }
-            passes.push(Pass {
-                target: PassTarget::Texture(c.dest.clone()),
-                ops: vec![Op::Copy(c.clone())],
-                clear: None,
-            });
         }
         for i in &self.image_log {
             let source_live = self.nodes.contains_key(&i.source);
             let target_live = i.target.as_ref().is_none_or(|t| self.nodes.contains_key(t));
-            if !source_live || !target_live {
-                continue;
+            if source_live && target_live {
+                texture_ops.push((i.seq, Op::Image(i.clone())));
             }
-            let target = i.target.clone().unwrap_or_else(|| i.source.clone());
+        }
+        texture_ops.sort_by_key(|(seq, _)| *seq);
+        for (_, op) in texture_ops {
+            let target = match &op {
+                Op::Copy(c) => c.dest.clone(),
+                Op::Image(i) => i.target.clone().unwrap_or_else(|| i.source.clone()),
+                _ => unreachable!("texture ops are copy/image"),
+            };
             passes.push(Pass {
                 target: PassTarget::Texture(target),
-                ops: vec![Op::Image(i.clone())],
+                ops: vec![op],
                 clear: None,
             });
         }
@@ -307,7 +360,18 @@ impl GfxState {
                 .and_then(|w| w.layer_set.clone())
                 .unwrap_or_else(|| self.config.main_layer_set.clone());
             // 显式主组缺失时不做“合成所有顶层”的猜测(D15)。
-            self.emit_node_ops(&main, &mut screen_ops, &emitted_groups);
+            //
+            // 主组**直绘**(DIV-GFX-008/041,Confirmed):引擎主窗口没有离屏
+            // RT,组的合成结果直接写后缓冲;组的 `A` 不会作为整幅 alpha 再乘
+            // 一次。若先合成到 RT 再按 RT alpha 贴回,淡入淡出类效果会被
+            // 额外压暗(实测 CGS100 淡出 100→77,EVID-J3-07)。
+            // 主组是图层组 → 子层直绘;主组被显式指定为单个图像层 →
+            // 直接画该层(手册 `WINDOW[CGID]` 允许指定任意图层)。
+            if self.nodes.get(&main).is_some_and(|n| n.layer.is_group()) {
+                self.emit_children_ops(&main, &mut screen_ops, &emitted_groups);
+            } else {
+                self.emit_node_ops(&main, &mut screen_ops, &emitted_groups);
+            }
         }
         passes.push(Pass {
             target: PassTarget::Screen,
@@ -327,6 +391,18 @@ impl GfxState {
             .sort_by(|a, b| (a.z, a.seq, &a.id).cmp(&(b.z, b.seq, &b.id)));
         f.text = self.text.clone();
         f.diagnostics = self.diags.values().cloned().collect();
+        if self.probe_order_defaulted {
+            // A5:缺省兜底必须显式可见;合并计数,不静默。
+            f.diagnostics.push(error::FrameDiag::new(
+                error::code::CONFIG_PROBE_ORDER,
+                yu_log::Severity::Info,
+                "yscfg",
+                "image_ext_order 为空,采用宿主/默认探测顺序",
+            ));
+            // 保持帧诊断的稳定排序(code, command, detail)。
+            f.diagnostics
+                .sort_by(|a, b| (&a.code, &a.command, &a.detail).cmp(&(&b.code, &b.command, &b.detail)));
+        }
         f
     }
 
@@ -417,6 +493,13 @@ impl GfxState {
                     .and_then(|t| t.tid_raw.clone())
                     .unwrap_or_default(),
             ),
+            "MFILE" => Value::Str(match &layer.texture {
+                TextureRef::Asset(key) => key.clone(),
+                TextureRef::Snapshot(id) => {
+                    self.snapshot_files.get(id).cloned().unwrap_or_default()
+                }
+                _ => Vec::new(),
+            }),
             "SX" => Value::Int(self.query_layer_size(layer, true)?),
             "SY" => Value::Int(self.query_layer_size(layer, false)?),
             other => {
@@ -439,15 +522,22 @@ impl GfxState {
                 error::code::INFO_UNSUPPORTED,
                 "无纹理层的尺寸未知",
             )),
-            // TODO(DIV-GFX-024):需要资产元数据 provider(图像头/解码器)。
-            TextureRef::Asset(_) => Err(error::unimplemented(
-                error::code::INFO_ASSET_SIZE,
-                "资源图尺寸需要资产元数据提供者(TODO DIV-GFX-024);gfx 不读图像文件",
-            )),
-            TextureRef::Snapshot(_) => Err(error::unimplemented(
-                error::code::INFO_UNSUPPORTED,
-                "快照纹理尺寸未取证",
-            )),
+            // 尺寸由 VM 解析资产头后注入(见 `set_asset_size`);未注入时
+            // 仍返回专用错误码,让 VM 走回退路径(DIV-GFX-024)。
+            TextureRef::Asset(key) => match self.asset_sizes.get(key) {
+                Some(size) => Ok(i64::from(if width { size.width } else { size.height })),
+                None => Err(error::unimplemented(
+                    error::code::INFO_ASSET_SIZE,
+                    "资源图尺寸尚未由资产元数据提供者注入(TODO DIV-GFX-024)",
+                )),
+            },
+            TextureRef::Snapshot(id) => match self.snapshot_sizes.get(id) {
+                Some(size) => Ok(i64::from(if width { size.width } else { size.height })),
+                None => Err(error::unimplemented(
+                    error::code::INFO_UNSUPPORTED,
+                    format!("快照纹理 {} 尺寸未记录(源层无尺寸元数据)", id.0),
+                )),
+            },
             TextureRef::Offscreen(id) => {
                 let Some(n) = self.nodes.get(id) else {
                     return Err(error::unimplemented(
@@ -1217,6 +1307,7 @@ impl GfxState {
             return;
         }
         let copy_id = CopyId(self.next_copy());
+        let seq = self.next_texture_seq();
         let region = if x.is_some() || y.is_some() || x2.is_some() || y2.is_some() {
             CopyRegion::Partial {
                 x: x.unwrap_or(0),
@@ -1230,9 +1321,17 @@ impl GfxState {
         self.copy_log.retain(|c| c.dest != *dest);
         self.image_log
             .retain(|i| i.target.as_ref().is_none_or(|t| t != dest));
-        // TODO(DIV-GFX-007):复制时序(上一帧已渲染)与区域语义未取证;
-        // 恒标 Unimplemented,后端必须跳过。
+        // EVID-T-11/T-12:COPY/COPY2 在命令执行时取源层当前状态;区域是源
+        // 纹理坐标(含端点),裁剪块写到目标 (0,0),无区域 = 整图复制。
+        // TEXCOPY/TEXSSCOPY 是纹理句柄级操作,本内核没有对应证据,保持跳过。
+        let status = match kind {
+            CopyKind::Copy | CopyKind::Copy2 => OpStatus::Executable,
+            CopyKind::TexCopy | CopyKind::TexSsCopy => {
+                OpStatus::Unimplemented("gfx.copy.texcopy.unsupported")
+            }
+        };
         self.push_copy_log(CopyOp {
+            seq,
             id: copy_id,
             kind,
             source: if source_is_group {
@@ -1242,8 +1341,8 @@ impl GfxState {
             },
             dest: dest.clone(),
             region,
-            timing: CopyTiming::LastRenderedFrame,
-            status: OpStatus::Unimplemented("gfx.copy.unsupported"),
+            timing: CopyTiming::CommandCurrent,
+            status,
         });
         if kind == CopyKind::Copy {
             let attrs = self.nodes[source].layer.clone();
@@ -1251,21 +1350,50 @@ impl GfxState {
                 copy_attributes(&attrs, &mut node.layer);
             }
         }
+        // 快照继承源层的尺寸/资产键(COPY2 后脚本会查询目标层的 SX/SY;
+        // 源层尺寸来自 VM 注入的资产元数据,见 `asset_sizes`)。
+        let mut snap_size = None;
+        let mut snap_file = None;
+        if let Some(src_node) = self.nodes.get(source) {
+            snap_size = match &src_node.layer.texture {
+                TextureRef::Asset(key) => {
+                    snap_file = Some(key.clone());
+                    self.asset_sizes.get(key).copied()
+                }
+                TextureRef::Snapshot(id) => self.snapshot_sizes.get(id).copied(),
+                TextureRef::Offscreen(id) => self
+                    .nodes
+                    .get(id)
+                    .and_then(|n| n.layer.group_size()),
+                TextureRef::None | TextureRef::SolidBlack1x1 => src_node.layer.image_size(),
+            };
+        }
+        if let Some(size) = snap_size {
+            self.snapshot_sizes.insert(copy_id, size);
+        }
+        if let Some(file) = snap_file {
+            self.snapshot_files.insert(copy_id, file);
+        }
         if let Some(node) = self.nodes.get_mut(dest) {
             node.layer.texture = TextureRef::Snapshot(copy_id);
-            node.layer
-                .set_texture_status(LayerStatus::Unimplemented("gfx.copy.unsupported"));
+            node.layer.set_texture_status(match status {
+                OpStatus::Executable => LayerStatus::Executable,
+                OpStatus::Unimplemented(why) => LayerStatus::Unimplemented(why),
+            });
         }
-        self.push_diag(
-            "CGACT",
-            error::unimplemented(
-                error::code::COPY_UNSUPPORTED,
-                format!(
-                    "{} 的时序=上一帧已渲染目标;区域/目标纹理语义未逐项取证",
-                    kind.name()
+        if status != OpStatus::Executable {
+            let why = match status {
+                OpStatus::Unimplemented(why) => why,
+                OpStatus::Executable => unreachable!(),
+            };
+            self.push_diag(
+                "CGACT",
+                error::unimplemented(
+                    error::code::COPY_UNSUPPORTED,
+                    format!("{} 不执行: {why}", kind.name()),
                 ),
-            ),
-        );
+            );
+        }
     }
 
     fn cgact_swap(&mut self, source: &LayerId, dest: &LayerId, image_only: bool) {
@@ -1407,11 +1535,54 @@ impl GfxState {
                     Err(reason) => OpStatus::Unimplemented(reason),
                 }
             }
+        } else if matches!(action, ImageAction::Reverse | ImageAction::Horizontal) {
+            // EVID-T-13:REVERSE = RGB 取反,HORIZONTAL = 水平镜像;两者都
+            // 只对可解析的基图(资产/1×1 黑)放行。ID2 与区域变体未测,
+            // 保持显式跳过。
+            if explicit_target && target.as_ref() != Some(source) {
+                OpStatus::Unimplemented("gfx.imageop.id2.unsupported")
+            } else if x.is_some() || y.is_some() || x2.is_some() || y2.is_some() {
+                OpStatus::Unimplemented("gfx.imageop.region.unsupported")
+            } else {
+                match self.nodes.get(source) {
+                    Some(n)
+                        if matches!(
+                            n.layer.texture,
+                            TextureRef::Asset(_) | TextureRef::SolidBlack1x1
+                        ) && n.layer.texture_status == LayerStatus::Executable =>
+                    {
+                        OpStatus::Executable
+                    }
+                    _ => OpStatus::Unimplemented("gfx.imageop.copy_source.unsupported"),
+                }
+            }
+        } else if matches!(action, ImageAction::SizeNearest | ImageAction::SizeBilinear) {
+            // `CGACT[SIZE/SIZE2]`:源区域缩放后写入目标层(ID2 或原地)。
+            // 源可以是资产/快照/1×1 黑;区域可选(缺省整图)。
+            match (sx, sy) {
+                (Some(w), Some(h)) if w > 0 && h > 0 => match self.nodes.get(source) {
+                    Some(n)
+                        if matches!(
+                            n.layer.texture,
+                            TextureRef::Asset(_)
+                                | TextureRef::Snapshot(_)
+                                | TextureRef::SolidBlack1x1
+                        ) && n.layer.texture_status == LayerStatus::Executable =>
+                    {
+                        OpStatus::Executable
+                    }
+                    _ => OpStatus::Unimplemented("gfx.imageop.copy_source.unsupported"),
+                },
+                _ => OpStatus::Unimplemented("gfx.imageop.size.missing"),
+            }
         } else {
             OpStatus::Unimplemented("gfx.imageop.unsupported")
         };
         let executable = status == OpStatus::Executable;
+        let seq = self.next_texture_seq();
+        let image_action = action.clone();
         self.push_image_log(ImageOp {
+            seq,
             source: source.clone(),
             target: target.clone(),
             action,
@@ -1426,6 +1597,31 @@ impl GfxState {
             y2,
             status,
         });
+        // `CGACT[SIZE/SIZE2]` 把源区域缩放到目标层 ⇒ 目标层的绘制尺寸随之
+        // 变为 `SX×SY`(手册 `cg/cgact.html` 例 3/4;`es.CGACT_SIZE` 之后脚本
+        // 会用 `CGINFO[SX/SY]` 读这个新尺寸)。尺寸记录在层上,`CGINFO` 因此
+        // 是通用查询,不需要任何命名约定。
+        if executable
+            && matches!(
+                image_action,
+                ImageAction::SizeNearest | ImageAction::SizeBilinear
+            )
+        {
+            if let (Some(w), Some(h)) = (sx, sy) {
+                if w > 0 && h > 0 {
+                    if let Some(t) = target.as_ref() {
+                        if let Some(node) = self.nodes.get_mut(t) {
+                            node.layer.kind = LayerKind::Image {
+                                size: Some(SizeU32 {
+                                    width: w as u32,
+                                    height: h as u32,
+                                }),
+                            };
+                        }
+                    }
+                }
+            }
+        }
         if !executable {
             let reason = match status {
                 OpStatus::Unimplemented(reason) => reason,
@@ -1542,6 +1738,12 @@ impl GfxState {
         let c = self.copy_seq;
         self.copy_seq += 1;
         c
+    }
+
+    fn next_texture_seq(&mut self) -> u64 {
+        let s = self.texture_seq;
+        self.texture_seq += 1;
+        s
     }
 
     fn ensure_w0(&mut self) {
@@ -1776,7 +1978,17 @@ impl GfxState {
             }
         }
 
+        // 主窗口组**直绘**到后缓冲(DIV-GFX-008/041),不再产出离屏 pass:
+        // 否则子层会被画两遍(先组 RT、再屏幕),报告计数与像素都不对。
+        let main = self
+            .windows
+            .get(&0)
+            .and_then(|w| w.layer_set.clone())
+            .unwrap_or_else(|| self.config.main_layer_set.clone());
         for id in order {
+            if id == main {
+                continue;
+            }
             let mut ops = Vec::new();
             self.emit_children_ops(&id, &mut ops, emitted);
             if ops.is_empty() {
@@ -1801,14 +2013,42 @@ impl GfxState {
         };
         if node.layer.is_group() {
             if node.layer.visible && emitted.contains(id) && self.group_has_visible_content(id) {
-                out.push(Op::Group(crate::group::GroupDraw {
-                    layer: node.layer.clone(),
-                    offscreen: id.clone(),
-                }));
+                if let Some(op) = self.group_transition_op(id, &node.layer) {
+                    out.push(op);
+                } else {
+                    out.push(Op::Group(crate::group::GroupDraw {
+                        layer: node.layer.clone(),
+                        offscreen: id.clone(),
+                    }));
+                }
             }
             return;
         }
         self.emit_image_subtree(id, out, emitted);
+    }
+
+    /// 组(layer set)上的 `T/TA/TID`:引擎按层表统一解析配对(组也是层),
+    /// 把组离屏纹理当作 `YS_Texture1`;配对可以是图像层或组。
+    /// 未取证到独立微场景前标 `Likely`,但不再静默当普通组画掉。
+    fn group_transition_op(&self, id: &LayerId, layer: &Layer) -> Option<Op> {
+        let t = layer.transition.as_ref()?;
+        let fade = t.fade_value()?;
+        let tid = t.tid.as_ref()?;
+        let to = self.transition_pair(tid)?;
+        let mut l = layer.clone();
+        l.set_texture_status(LayerStatus::Executable);
+        Some(Op::Transition(TransitionDraw {
+            from: TextureRef::Offscreen(id.clone()),
+            to: Some(to),
+            fade,
+            t: t.t,
+            ta: t.ta,
+            tid: t.tid.clone(),
+            from_layer: Some(id.clone()),
+            // 组过渡的 `from` 是组离屏纹理,配对层即 TID 本身。
+            to_layer: Some(tid.clone()),
+            layer: l,
+        }))
     }
 
     fn emit_children_ops(&self, parent: &LayerId, out: &mut Vec<Op>, emitted: &BTreeSet<LayerId>) {
@@ -1850,10 +2090,14 @@ impl GfxState {
                         && emitted.contains(&id)
                         && self.group_has_visible_content(&id)
                     {
-                        out.push(Op::Group(crate::group::GroupDraw {
-                            layer: node.layer.clone(),
-                            offscreen: id,
-                        }));
+                        if let Some(op) = self.group_transition_op(&id, &node.layer) {
+                            out.push(op);
+                        } else {
+                            out.push(Op::Group(crate::group::GroupDraw {
+                                layer: node.layer.clone(),
+                                offscreen: id,
+                            }));
+                        }
                     }
                 }
                 Frame::Emit(id) => {
@@ -1876,27 +2120,33 @@ impl GfxState {
         }
         // 空 TID = 引擎不查配对(`0x413e7b` 空串直接跳过);
         // 脚本把它当“结束过渡/初始化”,因此这里按普通层输出。
+        //
+        // EVID-T-03:配对层存在且纹理可绘制 + TA>=1 才走双纹理;
+        // 任一不满足都回退单纹理普通层(asm 0x415558-0x415577 → 0x416f8d)。
         if let Some(t) = &layer.transition {
             if let (Some(fade), Some(tid)) = (t.fade_value(), t.tid.as_ref()) {
-                let to = self.nodes.get(tid).map(|n| {
-                    if n.layer.is_group() {
-                        TextureRef::Offscreen(tid.clone())
-                    } else {
-                        n.layer.texture.clone()
-                    }
-                });
-                let mut l = layer.clone();
-                if to.is_none() {
-                    // TID 非空但查不到配对层:引擎行为未取证,保持 Unimplemented。
-                    l.set_texture_status(LayerStatus::Unimplemented("gfx.transition.unsupported"));
+                // 引擎语义(asm `0x415558-0x415577` → 双纹理 pass):
+                // `YS_Texture1` = **本层当前纹理**,`YS_Texture2` = `TID` 解析出的
+                // 配对层纹理。脚本先把真实像素做进本层、把 mask 做进配对层
+                // (boot logo 用 `CGACT[SIZE]`/`CGACT[REVERSE]`),因此这里只按
+                // 层状态取纹理,不含任何图层命名约定(EVID-T-10)。
+                let from = layer.texture.clone();
+                let to = self.transition_pair(tid);
+                if let Some(to) = to {
+                    let mut l = layer.clone();
+                    l.set_texture_status(LayerStatus::Executable);
+                    return Op::Transition(TransitionDraw {
+                        from,
+                        to: Some(to),
+                        fade,
+                        t: t.t,
+                        ta: t.ta,
+                        tid: t.tid.clone(),
+                        from_layer: Some(layer.id.clone()),
+                        to_layer: Some(tid.clone()),
+                        layer: l,
+                    });
                 }
-                return Op::Transition(TransitionDraw {
-                    from: l.texture.clone(),
-                    to,
-                    fade,
-                    tid: t.tid.clone(),
-                    layer: l,
-                });
             }
         }
         if let Some(mask) = &layer.mask {
@@ -1906,6 +2156,28 @@ impl GfxState {
             });
         }
         Op::Layer(layer.clone())
+    }
+
+    /// `TID` 配对层 → 可取样纹理(引擎 `YS_Texture2`)。
+    ///
+    /// 组 → 离屏纹理;图像层 → 该层当前纹理。空纹理(= 层不存在内容)或
+    /// 无可见内容的组视为“配对不可用”,由调用方回退单纹理普通层
+    /// (asm `0x415558-0x415577` 同族判定)。
+    fn transition_pair(&self, tid: &LayerId) -> Option<TextureRef> {
+        self.nodes.get(tid).and_then(|n| {
+            if n.layer.is_group() {
+                if self.group_has_visible_content(tid) {
+                    Some(TextureRef::Offscreen(tid.clone()))
+                } else {
+                    None
+                }
+            } else {
+                match &n.layer.texture {
+                    TextureRef::None => None,
+                    texture => Some(texture.clone()),
+                }
+            }
+        })
     }
 
     fn push_diag(&mut self, command: &str, d: Diag) {
@@ -2089,11 +2361,12 @@ fn copy_attributes(src: &Layer, dst: &mut Layer) {
     dst.refresh_status();
 }
 
-/// RECTPAINT/2/3 的可执行前置条件(EVID-J-02..05)。
+/// RECTPAINT/2/3 的可执行前置条件(EVID-J-02..05 / EVID-T-11)。
 ///
 /// 只放行已取证的组合:原地加工、SET 为整数、无 SET2/SETSTR/SX/SY、
-/// 区域要么全省略(整张纹理)要么四个坐标齐全、基图为 Asset 或 1×1 黑图。
-/// ID2、快照源、部分区域等没有像素级证据的组合返回具体 reason,保持挂账。
+/// 区域要么全省略(整张纹理)要么四个坐标齐全、基图为 Asset / 1×1 黑图 /
+/// 可执行 COPY 产生的快照(后端的快照表面)。ID2、部分区域、组目标等
+/// 没有像素级证据的组合返回具体 reason,保持挂账。
 #[allow(clippy::too_many_arguments)]
 fn rect_paint_precheck(
     node: Option<&Node>,
@@ -2133,8 +2406,7 @@ fn rect_paint_precheck(
     }
     let node = node.ok_or("gfx.imageop.target.unsupported")?;
     match &node.layer.texture {
-        TextureRef::Asset(_) | TextureRef::SolidBlack1x1 => {}
-        TextureRef::Snapshot(_) => return Err("gfx.imageop.copy_source.unsupported"),
+        TextureRef::Asset(_) | TextureRef::SolidBlack1x1 | TextureRef::Snapshot(_) => {}
         TextureRef::Offscreen(_) => return Err("gfx.imageop.target.group"),
         TextureRef::None => return Err("gfx.imageop.texture.none"),
     }
@@ -2172,7 +2444,7 @@ static IMAGE_ACTIONS: &[(&str, ImageAction)] = &[
     ("AKARUSA", ImageAction::Other("akarusa")),
     ("MONO", ImageAction::Other("mono")),
     ("VERTICAL", ImageAction::Other("vertical")),
-    ("HORIZONTAL", ImageAction::Other("horizontal")),
+    ("HORIZONTAL", ImageAction::Horizontal),
     ("MOSAIC", ImageAction::Other("mosaic")),
     ("BLUR", ImageAction::Other("blur")),
     ("BLUR2", ImageAction::Other("blur2")),
@@ -2181,7 +2453,7 @@ static IMAGE_ACTIONS: &[(&str, ImageAction)] = &[
     ("BLUR5", ImageAction::Other("blur5")),
     ("BLUR6", ImageAction::Other("blur6")),
     ("DIFFUSION", ImageAction::Other("diffusion")),
-    ("REVERSE", ImageAction::Other("reverse")),
+    ("REVERSE", ImageAction::Reverse),
     ("WHIRLPOOL", ImageAction::Other("whirlpool")),
     ("RASTER", ImageAction::Other("raster")),
     ("RASTER1", ImageAction::Other("raster1")),

@@ -509,8 +509,10 @@ impl BlendMode {
         match self {
             Self::Normal => BlendConfidence::Likely,
             Self::Add | Self::Subtract => BlendConfidence::Confirmed,
+            // 手册 + 引擎状态表(aux 白/黑、BCA、DIFFUSE A 灰度)一致;
+            // 官方逐像素微场景因 YSCom 工具 attach 失败暂缺 ⇒ Likely。
             Self::Multiply | Self::Screen | Self::Lighten | Self::Darken | Self::Exclusion => {
-                BlendConfidence::Unverified
+                BlendConfidence::Likely
             }
             Self::Divide
             | Self::Difference
@@ -864,6 +866,45 @@ impl Transition {
         let ta = f64::from(self.ta);
         let denom = 256.0 / (256.0 / ta + 128.0);
         Some(f64::from(self.t) / denom * (1.0 / 256.0))
+    }
+
+    /// 过渡完成(`T >= 256`)。官方微场景 `j2-micro-trans6`:T=256 时
+    /// mask=0 也完全可见;该分支优先于 fade 公式(EVID-T-05 §2.1)。
+    pub fn is_complete(&self) -> bool {
+        self.t >= 256
+    }
+}
+
+/// 过渡覆盖度:配对纹理的 **G 通道**是 mask,`fade` 是推进量。
+///
+/// 证据(`docs/title-motion-ledger.md` EVID-T-05 / §2.1):官方 0.495 固定管线
+/// 双纹理路径的 4×9 微场景测量(T∈{64,128,192,256} × mask 9 级,
+/// TA∈{2,64,128,192} × T 网格)。拟合形式:
+///
+/// ```text
+/// threshold = 1 - 2*fade
+/// K         = 30 + 70*fade           (边缘斜率随推进变陡)
+/// coverage  = clamp(K * (mask - threshold), 0, 1)
+/// T >= 256  => 255
+/// ```
+///
+/// 在 TA=128(本语料 title 的取值)下,三个中点(T=64/128/192)的
+/// 官方测量与模型差 ≤ 8/255;`TA!=128` 与 `T≈255` 的残差见 DIV-GFX-045。
+///
+/// 返回 0..255 的覆盖度(未乘图层 A / 纹理 α)。`mask` 是配对纹理 G 通道。
+pub fn transition_coverage(mask: u8, fade: f64, complete: bool) -> u8 {
+    if complete {
+        return 255;
+    }
+    let threshold = 1.0 - 2.0 * fade;
+    let slope = 30.0 + 70.0 * fade;
+    let value = slope * (f64::from(mask) / 255.0 - threshold);
+    if value <= 0.0 {
+        0
+    } else if value >= 1.0 {
+        255
+    } else {
+        (value * 255.0).round().clamp(0.0, 255.0) as u8
     }
 }
 

@@ -272,14 +272,14 @@ fn mode_update_recovers_executable_status() {
             vec![
                 arg(&table, "CG", "ID", s("L")),
                 arg(&table, "CG", "FILE", s("l")),
-                arg(&table, "CG", "MODE", i(3)),
+                arg(&table, "CG", "MODE", i(4)),
             ],
         ),
         frame_end(1),
     ]);
     assert!(matches!(
         layer(&gfx.frame(), ":/W0/L").status,
-        LayerStatus::Unimplemented("gfx.blend.unverified")
+        LayerStatus::Unimplemented("gfx.blend.unsupported")
     ));
 
     gfx.consume_events(&[
@@ -358,7 +358,11 @@ fn file_replacement_clears_old_copy_status() {
     ]);
     assert!(matches!(
         layer(&gfx.frame(), ":/W0/DST").status,
-        LayerStatus::Unimplemented("gfx.copy.unsupported")
+        LayerStatus::Executable
+    ));
+    assert!(matches!(
+        layer(&gfx.frame(), ":/W0/DST").texture,
+        TextureRef::Snapshot(_)
     ));
     gfx.consume_events(&[
         frame_start(2),
@@ -420,7 +424,22 @@ fn window_cgid_selects_main_layer_set_and_e_zero_hides_screen() {
     assert_eq!(win.layer_set.as_ref().unwrap().display(), ":/W1");
     assert_eq!((win.x, win.y), (11, 22));
     assert_eq!(win.size.unwrap().width, 640);
-    assert!(matches!(&screen(&f).ops[0], Op::Group(g) if g.offscreen.display() == ":/W1"));
+    // 主组直绘(DIV-GFX-008/041):CGID 指定的主组不再包成 Group op,
+    // 它的子层直接进屏幕 pass。
+    assert!(
+        screen(&f)
+            .ops
+            .iter()
+            .all(|op| !matches!(op, Op::Group(_))),
+        "main layer set must be drawn directly"
+    );
+    assert!(
+        screen(&f)
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Layer(l) if l.id.display() == ":/W1/X")),
+        "CGID 指定的组子层必须在屏幕 pass 里"
+    );
 
     gfx.consume_events(&[
         frame_start(2),
@@ -467,11 +486,12 @@ fn image_children_are_drawn_before_the_parent() {
         frame_end(1),
     ]);
     let f = gfx.frame();
+    // 主组直绘:W0 的子层在屏幕 pass 里(不再有 W0 离屏 pass)。
     let w0 = f
         .passes
         .iter()
-        .find(|p| matches!(&p.target, PassTarget::Offscreen(id) if id.display() == ":/W0"))
-        .expect("W0 pass");
+        .find(|p| matches!(p.target, PassTarget::Screen))
+        .expect("screen pass");
     let pos = |name: &str| {
         w0.ops
             .iter()

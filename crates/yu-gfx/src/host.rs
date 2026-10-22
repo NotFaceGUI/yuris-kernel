@@ -56,4 +56,10 @@ impl GraphicsHost for GfxHost {
     fn query(&mut self, command: &str, args: &[ArgValue]) -> Result<Value, Diag> {
         self.state.borrow().query_info(command, args)
     }
+
+    fn note_asset_size(&mut self, key: &[u8], width: u32, height: u32) {
+        self.state
+            .borrow_mut()
+            .set_asset_size(key, crate::layer::SizeU32 { width, height });
+    }
 }

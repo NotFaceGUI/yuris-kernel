@@ -52,6 +52,9 @@ fn main() {
         entry_label: "SYSTEM_START".to_string(),
         fps: 60,
         record_events: false,
+        // 标题锚点用 @_DEBUGMODE=0(projectconfig.txt);
+        // YURIS_DEBUG_MODE=1 用于 debug 分支 A/B 对照(见台账 §9)。
+        debug_mode: std::env::var("YURIS_DEBUG_MODE").map(|v| v == "1").unwrap_or(false),
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).expect("boot");

@@ -1,7 +1,7 @@
 # yu-backend-wgpu
 
 `yu_gfx::CompositorFrame` 的 wgpu 后端。语义唯一来源是 **`yu-gfx`**；
-`yu-backend-soft` 是同一契约的整数参考执行器。本 crate 与软后端
+`yu-backend-soft` 是同一契约的参考执行器(浮点混合模型 + u8 量化)。本 crate 与软后端
 **互为实现,不互为真值**:像素允许舍入差,但 pass 顺序、可执行/跳过计数、
 跳过原因必须逐项对齐。
 
@@ -43,7 +43,7 @@ let mut backend = WgpuRenderer::new_with_options(store, &options)?;
 
 ### 环境变量覆盖(示例)
 
-库内**不读环境变量**(任务书 §5);`examples/first_frame.rs` 负责把环境变量
+库内**不读环境变量**(任务书 §5);`examples/wgpu_first_frame.rs` 负责把环境变量
 映射到 `DeviceOptions`:
 
 | 环境变量 | 作用 |
@@ -53,10 +53,14 @@ let mut backend = WgpuRenderer::new_with_options(store, &options)?;
 
 ```bash
 export YURIS_SAMPLE_ERIS_ROOT=<project-eris>   # 数据入口:data.ypf 优先,散盘 data/ 为备
-cargo run -p yu-backend-wgpu --example first_frame
+cargo run -p yu-backend-wgpu --example wgpu_first_frame
 # 输出 target/tmp/wgpu_first_frame.png
 #      target/tmp/wgpu_first_frame.report.json
+cargo run -p yu-backend-wgpu --example wgpu_frame_walk -- 600   # 逐帧基线 + GPU 上传计数
 ```
+
+示例名与 soft 端**不同名**(`wgpu_first_frame`/`wgpu_frame_walk`),避免
+Cargo 共享 `target/debug/examples/<name>.exe` 时互相覆盖(J1/J2 的实测坑)。
 
 示例会:
 - 与软后端 `first_frame` 相同的 `GfxHost` 同步事件路径 boot ERIS;
@@ -86,11 +90,12 @@ instance/device 创建与一次性读回。
 ```text
 src/device.rs     instance/adapter/device/queue;platform.gpu.* 诊断码
 src/textures.rs   TextureStore RGBA8 → GPU 上传;资产/目标身份与缓存
-src/pipelines.rs  blend 0/1/2 × Rgba8Unorm 管线;bind group/sampler 缓存
+src/pipelines.rs  blend 管线(0/1/2/6/7 + psC/psD);bind group/sampler/paint 缓存
+src/shaders/      引擎 shader 的独立 WGSL + registry(quad/fixed/psC/psD/paint)
 src/passes.rs     按 passes 顺序规划:跳过记账、纹理解析、顶点生成
 src/readback.rs   texture → 256 字节行对齐 buffer → 紧凑 RGBA8
 src/lib.rs        WgpuRenderer::new / render_frame;GpuStats
-examples/first_frame.rs
+examples/wgpu_first_frame.rs
 ```
 
 模块边界与任务书建议略有调整:bind group 需要 bind group layout/sampler,
@@ -101,17 +106,19 @@ examples/first_frame.rs
 
 | 契约 | 本后端 |
 |---|---|
-| pass 顺序 | 严格 `frame.passes`:Texture(只记账)→ Offscreen(子先父后)→ Screen;不重排、不合并 |
-| Texture pass | `RECTPAINT/RECTPAINT2/RECTPAINT3` 在 CPU 侧预执行并上传覆盖纹理(EVID-J-02..05);`Op::Copy` 与其余 `Op::Image` 跳过 |
+| pass 顺序 | 严格 `frame.passes`:Texture(CPU 预执行/命令段)→ Offscreen(子先父后)→ Screen;COPY/快照填充在离屏之后、屏幕之前执行(可见结果不变) |
+| Texture pass | `RECTPAINT/2/3`、`REVERSE`、`HORIZONTAL` 在 CPU 侧预执行并上传覆盖纹理(EVID-J-02..05、EVID-T-13);目标是快照的 RECTPAINT 走 GPU 快照填充管线 |
 | Offscreen | 尺寸 = 组 `SX/SY`,未给用视口;`clear` = `pass.clear`,缺省透明黑;ops 按帧内顺序 |
 | Screen | 尺寸 = `frame.viewport`;`clear` = `frame.clear`;只画 gfx 给出的主窗口组 ops |
-| `Op::Layer` | `Asset`(无显式尺寸)/`SolidBlack1x1`/`Offscreen`;`Snapshot`/`None` 跳过;有 RECTPAINT 覆盖时优先覆盖纹理 |
+| `Op::Layer` | `Asset`(无显式尺寸)/`SolidBlack1x1`/`Offscreen`/`Snapshot`;有 RECTPAINT 覆盖时优先覆盖纹理 |
 | `Op::Group` | 取已渲染的离屏纹理;组的 `A/MODE/E` 只在画进父目标时作用一次 |
-| `Op::Transition/Mask/Copy` | 跳过并计数 |
-| `Op::Image` | 只有 RECTPAINT/2/3 执行;其余跳过并计数 |
+| `Op::Transition` | 独立双纹理 pipeline(配对 G 通道 mask + fade uniform);`T>=256` 覆盖度为满 |
+| `Op::Mask` | 跳过并计数 |
+| `Op::Copy` | GPU `copy_texture_to_texture` 到按 `CopyId` 复用的快照纹理;区域=源坐标含端点;同一 `CopyId` 只捕获一次 |
+| `Op::Image` | `RECTPAINT/2/3`(快照目标走 GPU 填充)、`REVERSE`、`HORIZONTAL`;其余跳过并计数 |
 | Alpha | 固定管线 `min(max(A,0),255)/255`;着色器输出 `texture.a × layer_alpha`,只乘一次;RGB 不预乘 |
-| Blend | MODE 0/1/2;RGB 与 alpha 都按 D3D9 固定管线同因子:0=`src·a+dst·(1−a)` / `a²+dst·(1−a)`,1=`src·a+dst` / `a²+dst`,2=`dst−src·a` / `dst−a²`;其余跳过并计数 |
-| Filter | `frame.filter` 全局;Point=nearest,Linear/Anisotropic=linear;mip 固定 LOD 0 |
+| Blend | MODE 0/1/2/3/5/6/7/9;RGB 与 alpha 都按 D3D9 固定管线同因子。源色先按 stage 归约:`0/1=T`、`2/5/6/9=T·A`、`3/7=T·A+(1−a)`;颜色因子用 `Src/OneMinusDst/OneMinusSrc` 对应 `SRCCOLOR/INVDESTCOLOR/INVSRCCOLOR` |
+| Filter | `frame.filter` 全局;Point=nearest,Linear/Anisotropic=linear;引擎硬编码 MIP=POINT 且无 mip 链,故固定 LOD 0 等价 |
 | 颜色空间 | 存储值直接算术,不线性化 |
 | 文本 | 不栅格化,`skipped_text` 计数 |
 
@@ -121,6 +128,8 @@ examples/first_frame.rs
 ## 性能与资源
 
 - **资产纹理**按原始 key 上传一次;同一帧/跨帧重复引用零重传。
+- **图像加工覆盖纹理**按 `(层, w, h, FNV-1a64(rgba))` 跨帧缓存;内容不变
+  时复用 GPU 纹理。600 帧实测仅 4 帧上传(资产/覆盖内容首次出现)。
 - **纹理身份**由进程级单调计数器分配,资产和目标共用,避免
   `(texture_id, sampler)` bind group 键跨缓存碰撞。
 - **bind group** 按 `(texture_id, FilterKind)` 缓存;目标尺寸变化时只作废
@@ -136,11 +145,13 @@ examples/first_frame.rs
 - 不使用 `HashMap`;跳过记账/缓存都用 `BTreeMap`,迭代序稳定。
 - 每帧仍会分配显示列表/顶点 `Vec`(计划产物),但 GPU 资源不逐帧重建。
 
-## 差异账本(相对整数参考)
+## 差异账本(相对 soft 参考)
 
 | 差异 | 类别 | 处理 |
 |---|---|---|
-| u8 整数混合 vs f32 GPU 混合 | 舍入 | 预期 ≤1/通道;ERIS 首帧不透明区域实测 0 差异;半透明区域的差异归因于下一行 alpha 语义,不是 GPU 舍入 |
+| soft 混合模型 | 已消除 | J3 起 soft 也按 D3D9 浮点模型(先求和再 u8 取整),两边共用 u8 alpha 量化链;600 帧 0 差异 |
+| 转场覆盖度 | 已对齐 | shader 与 `yu_gfx::transition_coverage` 同公式/同量化;title 与转场帧 0 差异 |
+| 屏幕 alpha | 已对齐 | 最终屏幕按 opaque 窗口归一 alpha=255,与浏览器 `alphaMode=opaque` 读回一致 |
 | sRGB 禁用方式 | 语义对齐 | `Rgba8Unorm` 直写;采样/清屏/混合均在存储值空间,等价于 D3D9 未开 sRGB 写 |
 | `filter.source=placeholder` | 未取证 | 报告原样输出 `placeholder`;执行 point/linear,但不声称已与引擎采样器对齐 |
 | 适配器/驱动差异 | 环境 | 报告记录 backend/adapter/device_type/driver;不做跨卡 golden |
@@ -149,7 +160,7 @@ examples/first_frame.rs
 | alpha 通道的 soft 偏离 | **已修复(EVID-J-01)** | 两个后端都按 D3D9 同因子执行,alpha 源项 `a²`。soft 原先把源项写成 `a`;任务 J Phase A 改为 `mul255(a,a)` 并同步单测。修复前 ERIS 首帧有 9,451 个半透明像素不同(最大 RGB 差 61);修复后同帧逐通道差见 §首帧实测 |
 | 组离屏 RT 的 alpha 存储 | 未取证 | 本后端与 soft 都用 RGBA8 直通 alpha;引擎 RT 是否为 A8/X8、是否写 alpha 位未取证(DIV-GFX-008 扩展)。若后续证据表明是 X8,组半透明合成语义需整体重做 |
 | MODE 0 stage1 / MODE 2 diffuse | 未取证(gfx 契约) | gfx 没有携带逐层 diffuse/stage1 辅助纹理;与 soft 一样把 RGB 视为纹理直通、MODE 2 的 diffuse 按白处理。引擎像素未对拍 |
-| 零尺寸组 pass 的 `ops_total` | 计数修正 | soft 在该分支只加 `skipped` 不加 `ops_total`(会破坏 `total=drawn+skipped`);本后端仍计总数。ERIS 首帧无此情况,计数一致 |
+| 零尺寸组 pass 的 `ops_total` | 计数修正 | J2 起两端都计总数(soft 也已修正);`total=drawn+skipped` 不变量在两端成立 |
 | `draw_calls` vs `ops_drawn` | 记账 | 目标尺寸为 0 时 op 算“已执行”但不产生 GPU draw;报告分别给出两个数 |
 | i64 坐标 → f32 NDC | 舍入 | 极端坐标在 f32 下损失精度;这些四边形本来就在视口外,可见区域实测一致 |
 | 组尺寸未给时回退视口 | 未取证 | 继承 gfx/soft 的 Likely 决策(DIV-GFX-008) |
@@ -236,7 +247,7 @@ soft vs wgpu: diff_pixels=0/480000 max_channel_diff=0
 
 全部继承 `yu-gfx` 的挂账,不是本后端的近似:
 
-- MODE 4/8/10..18;MODE 3/5/6/7/9;
+- MODE 4/8/10..18(公式无 blob);
 - `MID` 掩码、多部件层、`FX/FR/...` 仿射/滤镜;
 - `COPY/COPY2/TEXCOPY/TEXSSCOPY`、`SIZE*`/`ROTATION`/`RESIZE`/`TRIM`/
   `MONO`/`BLUR*` 等图像加工;`RECTPAINT/2/3` 已实现(EVID-J-02..05),

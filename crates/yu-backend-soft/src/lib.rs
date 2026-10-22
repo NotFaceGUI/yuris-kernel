@@ -6,8 +6,8 @@
 //! # 执行契约(与 `docs/render-parity.md` §12 一致)
 //!
 //! 1. 严格按 `CompositorFrame.passes` 顺序执行,不重排、不合并;
-//! 2. `PassTarget::Texture`:复制/图像加工当前全部 `Unimplemented`,只计数并
-//!    记录跳过原因,不猜测像素算法;
+//! 2. `PassTarget::Texture`:执行 `Op::Copy`(快照)与已取证的图像加工
+//!    (`RECTPAINT/2/3`、`REVERSE`、`HORIZONTAL`);其余按 `OpStatus` 跳过并计数;
 //! 3. `PassTarget::Offscreen`:分配组离屏表面(组 `SX/SY`,未给时用视口),
 //!    用 pass 的 `clear`(透明黑)清屏,再按 pass 内顺序绘制;
 //! 4. `PassTarget::Screen`:用 `frame.clear` 清屏,ops = 主窗口组;
@@ -16,9 +16,11 @@
 //!    方程里完成,不预乘;
 //! 7. 只执行 `MODE 0/1/2`;其余模式或 `OpStatus::Unimplemented` 的操作跳过并
 //!    计数,不近似;
-//! 8. 文本(`TextRun`)不栅格化:只统计跳过数量;
-//! 9. 颜色空间按存储值混合(`gamma_encoded_srgb8`),不做线性化;
-//! 10. 过滤用 `frame.filter`:`Point` 最近邻,`Linear/Anisotropic` 双线性;
+//! 8. 双纹理过渡:配对纹理的 G 通道为 mask,覆盖度见
+//!    `yu_gfx::transition_coverage`(EVID-T-05);
+//! 9. 文本(`TextRun`)不栅格化:只统计跳过数量;
+//! 10. 颜色空间按存储值混合(`gamma_encoded_srgb8`),不做线性化;
+//! 11. 过滤用 `frame.filter`:`Point` 最近邻,`Linear/Anisotropic` 双线性;
 //!     `source=placeholder` 时报告里明确标注未取证。
 //!
 //! # 纹理
@@ -59,8 +61,9 @@ pub mod png;
 pub mod render;
 pub mod texture;
 
-pub use imageop::apply_rect_paint;
+pub use imageop::{apply_horizontal, apply_rect_paint, apply_reverse, scale_region};
 pub use render::{
+    ImageCacheKey, ImageOpSig, ImageSource, SizeKey, SizeSource,
     frame_has_drawable_output, RenderOutput, RenderReport, SkippedOp, SoftRenderer, Surface,
 };
 pub use texture::{AssetIssue, Texture, TextureStore};

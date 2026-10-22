@@ -74,9 +74,10 @@ fn main_window_set_is_composited_as_group() {
         .iter()
         .find(|p| matches!(p.target, PassTarget::Screen))
         .expect("screen pass");
+    // 主组直绘(DIV-GFX-008/041):主窗口组没有离屏 RT,子层直接进屏幕。
     assert_eq!(screen.ops.len(), 1);
     match &screen.ops[0] {
-        Op::Group(g) => assert_eq!(g.offscreen.display(), ":/W0"),
-        other => panic!("expected W0 group, got {other:?}"),
+        Op::Layer(l) => assert_eq!(l.id.display(), ":/W0/MAIN"),
+        other => panic!("expected W0 child layer drawn directly, got {other:?}"),
     }
 }

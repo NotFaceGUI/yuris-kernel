@@ -63,6 +63,8 @@ pub mod code {
     pub const INTERNAL: &str = "gfx.internal";
     /// 工程命令表缺失/不可用。
     pub const TABLE_MISSING: &str = "gfx.table.missing";
+    /// `yscfg` 的扩展名探测序为空,使用宿主/默认顺序(A5 显式记录)。
+    pub const CONFIG_PROBE_ORDER: &str = "gfx.config.probe_order_fallback";
 }
 
 pub fn fatal(code: &'static str, detail: impl Into<String>) -> Diag {
