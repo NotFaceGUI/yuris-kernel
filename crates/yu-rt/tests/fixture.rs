@@ -23,6 +23,7 @@ const OP_IFBLEND: u8 = 46;
 const OP_IFEND: u8 = 49;
 const OP_INT: u8 = 51;
 const OP_LET: u8 = 54;
+const OP_LABELINFO: u8 = 53;
 const OP_LOOP: u8 = 56;
 const OP_LOOPEND: u8 = 59;
 const OP_RETURN: u8 = 77;
@@ -2770,6 +2771,83 @@ fn math_rnd_uses_injected_mt19937_seed() {
     assert_eq!(vm2.store().read(v2, &[]).unwrap(), Value::Int(3));
 }
 
+/// `MATH[LET=@A(i)]` 写**带下标的元素**(es_First.yst:145 的 2 的幂表填充形态;
+/// DIV-RT-003 回归:曾把 LET 下标丢弃,63 次写全落 [0],`@es.POW2[k≥1]` 恒 0,
+/// 消费行 `x / @es.POW2[@_LC]` 整数除零 Fatal)。
+#[test]
+fn math_let_writes_indexed_array_element() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    let arr = VarRef::new(VarSpace::At, sys);
+    b.vars.push(VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![8],
+        init: Init::Int(0),
+    });
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    // MATH[POW=1 SET=2 SET2=<e> LET=@arr(<e>)] — 同 `es_First.yst:145`。
+    let math = |e: i8| {
+        GroupSpec::new(OP_MATH)
+            .window(
+                0,
+                ex::cat(&[ex::r#ref(0x40, arr.id), ex::i8_(e), ex::aload()]),
+            )
+            .window(1, ex::i8_(2))
+            .window(2, ex::i8_(e))
+            .window(19, ex::i8_(1))
+    };
+    b.scripts = vec![vec![math(0), math(1), math(2), GroupSpec::new(OP_END)]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let get = |i: i64| vm.store().read(arr, &[i]).unwrap();
+    assert_eq!(get(0), Value::Int(1));
+    assert_eq!(get(1), Value::Int(2));
+    assert_eq!(get(2), Value::Int(4));
+    assert_eq!(get(3), Value::Int(0), "未写的元素保持初值");
+}
+
+/// `VARACT[SET=$arr PUSH=0]`(**无 LET、旗标值为 0**)是语料合法形态:
+/// `es_logset.yst` 的 LOG 记录入栈(s33 pc46..49,`PUSH(kind14, i8 0)`)。
+/// 回归:曾按「旗标值 ≠ 0」判定,`PUSH=0` 被当成无参 ⇒ 掉进字符串加工
+/// 分支报 `VARACT 缺 LET`。官方语义 = **参数存在性**(DIV-RT-024「不在场
+/// 才不做」同族;DIV-RT-044 DIALOG「存在性判定不看值」)。
+#[test]
+fn varact_push_zero_is_presence_not_value() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    let arr = VarRef::new(VarSpace::Dollar, sys);
+    b.vars.push(VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 3,
+        dims: vec![4],
+        init: Init::Str(b""),
+    });
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_VARACT)
+            .window(0, ex::r#ref(0x24, arr.id))
+            .window(14, ex::i8_(0)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let slot = vm.store().slot(arr).expect("数组在变量域");
+    // shift_1d = 原位旋转(既有对齐语义),不扩容;本回归只锁「PUSH=0 被
+    // 当成参数在场的分支分发」,不再掉进要求 LET 的字符串加工分支。
+    assert_eq!(slot.dims, vec![4]);
+}
+
 /// `_WINDOW_INIT_POS` 由宿主注入(`yscfg.dat` 第 10 项;DIV-RT-047)。
 #[test]
 fn window_init_pos_is_host_injected() {
@@ -2969,5 +3047,144 @@ fn window_exec_caption_is_a_host_setter_round_trip() {
         vm.store().read(v2, &[]).unwrap(),
         Value::Int(0),
         "脚本写回 0"
+    );
+}
+
+/// `MATH[ABS=0 …]`:旗标**值为 0** 仍按「参数在场」选中函数
+/// (官方判定链测窗口在场,旁线 §3.20;曾按「值 ≠ 0」丢参 ⇒ 落到
+/// 无旗标分支写出 SET 原值)。同时锁 ABS 的整数路:
+/// SET 整数 ⇒ 整数绝对值 + 整数写(`0x448412 → 0x455540`)。
+#[test]
+fn math_flag_zero_value_still_selects_function() {
+    let mut b = ProjectBuilder::new();
+    let v = with_int_var(&mut b, 0, 0);
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_MATH)
+            .window(0, ex::r#ref(0x40, v.id))
+            .window(1, ex::i8_(-5)) // SET = -5
+            .window(15, ex::i8_(0)), // ABS = 0(值为 0 的在场旗标)
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(vm.store().read(v, &[]).unwrap(), Value::Int(5));
+}
+
+/// `VARACT[INIT=0 G_INT=1]`:INIT **在场但值为 0** ⇒ 仍恢复
+/// (官方判据 = 载入器「参数在场字节表」`0x684160+序号`,旁线 §3.26 ③;
+/// 曾按「INIT 值 == 0 ⇒ 不做」把该形态吞掉)。语料当前全为 `INIT=1`,
+/// 本用例防的就是潜伏形态回归。
+#[test]
+fn varact_init_zero_value_still_restores() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    let g = VarRef::new(VarSpace::At, sys);
+    b.vars.push(VarSpec {
+        kind: 1,
+        group: 1,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(7),
+    });
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        // LET[@g = 9]
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, g.id))
+            .window(1, ex::i8_(9)),
+        // VARACT[INIT=0 G_INT=1] ⇒ 恢复为 ysv 初值 7
+        GroupSpec::new(OP_VARACT)
+            .window(16, ex::i8_(0))
+            .window(17, ex::i8_(1)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(vm.store().read(g, &[]).unwrap(), Value::Int(7));
+}
+
+/// `LABELINFO[#… LET=@arr(i) EXIST=1]`:LET 目标带下标 ⇒ 写 `arr[i]`
+/// (曾丢下标标量化,与 MATH 同族病根)。
+#[test]
+fn labelinfo_let_writes_indexed_element() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    let arr = VarRef::new(VarSpace::At, sys + 1);
+    b.vars.push(VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(0),
+    });
+    b.vars.push(VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys + 1,
+        value_type: 1,
+        dims: vec![4],
+        init: Init::Int(-1),
+    });
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_LABELINFO)
+            .window(0, ex::s("SYSTEM_START"))
+            .window(
+                1,
+                ex::cat(&[ex::r#ref(0x40, arr.id), ex::i8_(2), ex::aload()]),
+            )
+            .window(2, ex::i8_(1)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let get = |i: i64| vm.store().read(arr, &[i]).unwrap();
+    assert_eq!(get(2), Value::Int(1), "SYSTEM_START 在场 ⇒ [2] = 1");
+    assert_eq!(get(0), Value::Int(-1), "未写的元素保持初值");
+}
+
+/// 裸 `WAIT[]` ⇒ 让出一帧(手册 `basic/task.html`:「ウェイト命令…タスクは
+/// それを実行したあと、一旦休憩します(約0.016秒)」;`control/wait.html`
+/// 只定义 TIME/FRAME,无参时长未定义 —— 取 1 帧,Likely)。
+/// 语料 95 处 WAIT 全带参(FRAME×81/TIME×14),本用例防潜伏回归。
+#[test]
+fn bare_wait_yields_one_frame() {
+    let mut b = ProjectBuilder::new();
+    let v = with_int_var(&mut b, 0, 0);
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_WAIT),
+        // 第二帧才执行的赋值:证明任务停了一帧而不是继续。
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, v.id))
+            .window(1, ex::i8_(9)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let tl = no_input();
+    let _ = vm.tick_at(0, &tl);
+    assert_eq!(
+        vm.store().read(v, &[]).unwrap(),
+        Value::Int(0),
+        "WAIT 当帧不得执行后续命令"
+    );
+    let _ = vm.tick_at(1, &tl);
+    assert_eq!(
+        vm.store().read(v, &[]).unwrap(),
+        Value::Int(9),
+        "次帧恢复执行"
     );
 }

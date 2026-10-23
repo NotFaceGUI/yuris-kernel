@@ -47,6 +47,7 @@ pub mod diag;
 pub mod dialog;
 pub mod event;
 pub mod expr;
+pub mod hash;
 mod image;
 pub mod input;
 pub mod json;

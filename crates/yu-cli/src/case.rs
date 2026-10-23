@@ -147,6 +147,11 @@ struct Expect {
     skipped_ops_total: Option<u64>,
     /// 存档域快照摘要(`SaveSnapshot` 的确定性文本;P4 M-C)。
     save_state_sha256: Option<String>,
+    /// **Fatal 诊断码断言**(2026-10-23 审查 H1:门禁曾对 Fatal 全盲 ——
+    /// 主任务被 Fatal 冻结后像素不变照样 PASS)。在场的期望 = 实际发生的
+    /// Fatal 码集合(去重升序)必须逐项相等;`[]` = 断言无 Fatal。
+    /// 数据源 = `Engine::take_diag_report()`(P1 H-P1-02)。
+    fatal_codes: Option<Vec<String>>,
 }
 
 impl Expect {
@@ -173,6 +178,13 @@ impl Expect {
         if let Some(v) = object.get("save_state_sha256").and_then(|v| v.as_str()) {
             expect.save_state_sha256 = Some(v.to_string());
         }
+        if let Some(v) = object.get("fatal_codes").and_then(|v| v.as_array()) {
+            expect.fatal_codes = Some(
+                v.iter()
+                    .filter_map(|c| c.as_str().map(str::to_string))
+                    .collect::<Vec<_>>(),
+            );
+        }
         expect
     }
 
@@ -193,6 +205,12 @@ impl Expect {
         if let Some(v) = &self.save_state_sha256 {
             map.insert("save_state_sha256".to_string(), Value::String(v.clone()));
         }
+        if let Some(v) = &self.fatal_codes {
+            map.insert(
+                "fatal_codes".to_string(),
+                Value::Array(v.iter().map(|c| Value::String(c.clone())).collect()),
+            );
+        }
         Value::Object(map)
     }
 
@@ -202,6 +220,7 @@ impl Expect {
             && self.ops_total.is_none()
             && self.skipped_ops_total.is_none()
             && self.save_state_sha256.is_none()
+            && self.fatal_codes.is_none()
     }
 }
 
@@ -387,12 +406,30 @@ fn run_case(project: &Project, path: &Path, update: bool) -> CliResult<bool> {
         None => None,
     };
 
+    // Fatal 诊断码集合(去重升序;severity = Fatal 的内核+域宿主诊断)。
+    let diag_report = engine.take_diag_report();
+    let fatal_codes: Vec<String> = {
+        let mut set: BTreeSet<String> = diag_report
+            .diags
+            .iter()
+            .filter(|d| matches!(d.severity, yu_log::Severity::Fatal))
+            .map(|d| d.code.as_ref().to_string())
+            .collect();
+        // 执行器结束任务留下的脚本错误同样是 Fatal 级事实(任务终止)。
+        set.extend(diag_report.script_errors.iter().map(|e| {
+            let code = e.split(':').next().unwrap_or(e).trim();
+            code.to_string()
+        }));
+        set.into_iter().collect()
+    };
+
     let actual = Expect {
         display_json_sha256: Some(sha256_hex(display_json.as_bytes())),
         png_sha256: Some(sha256_hex(&png_bytes)),
         ops_total: Some(report.ops as u64),
         skipped_ops_total: Some(report.skipped as u64),
         save_state_sha256: save_state,
+        fatal_codes: Some(fatal_codes),
     };
 
     if update {
@@ -445,6 +482,22 @@ fn run_case(project: &Project, path: &Path, update: bool) -> CliResult<bool> {
         actual.save_state_sha256.as_deref(),
         &mut diffs,
     );
+    if let Some(expected_codes) = &spec.expect.fatal_codes {
+        // 两侧同为「去重升序」;期望在场才断言(旧用例缺字段 = 不检查)。
+        compare(
+            "fatal_codes",
+            Some(expected_codes.join(",").as_str()),
+            Some(
+                actual
+                    .fatal_codes
+                    .clone()
+                    .unwrap_or_default()
+                    .join(",")
+                    .as_str(),
+            ),
+            &mut diffs,
+        );
+    }
     if diffs.is_empty() {
         Ok(true)
     } else {

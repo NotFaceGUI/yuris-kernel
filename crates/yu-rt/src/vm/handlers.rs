@@ -41,6 +41,7 @@ use yu_log::Boundary;
 use crate::code;
 use crate::diag;
 use crate::event::{ArgValue, Domain, JumpKind, VmEvent};
+use crate::expr::LValue;
 use crate::task::{Effect, StepOutcome, TaskSeed};
 use crate::value::{ElemType, Value, VarRef, VarSpace};
 use crate::vm::{Cmd, CmdWindow, ExecState, GosubFrame, IfFrame, LoopFrame, Vm, VmError};
@@ -942,7 +943,18 @@ impl Vm {
             }
         }
         if frames.is_none() && time.is_none() {
-            return Ok(StepOutcome::Continue);
+            // 裸 `WAIT[]`:手册 `basic/task.html`「ウェイト命令…タスクは
+            // それを実行したあと、一旦休憩します(約0.016秒)」⇒ 让出一帧
+            // (`control/wait.html` 只定义 TIME/FRAME,无参时长未定义 ——
+            // 取 1 帧,Likely;语料 95/95 全带参,零行为差)。
+            task.wait_frames = 1;
+            self.emit(VmEvent::Wait {
+                frame: self.frame(),
+                task: task.id.clone(),
+                frames: Some(1),
+                time_ms: None,
+            });
+            return Ok(StepOutcome::Yield);
         }
         task.wait_frames = frames.unwrap_or(0);
         task.deadline_ms = time.map(|ms| self.now_ms().wrapping_add(ms));
@@ -1449,7 +1461,7 @@ impl Vm {
                 .map(|(_, v)| *v)
                 .unwrap_or(0)
         };
-        if flag(6).unwrap_or(0) != 0 {
+        if flag(6).is_some() {
             self.varact_type_calls = self.varact_type_calls.saturating_add(1);
             // TYPE:按目标类型转换(手册例 1/2;§3.22)。
             let target = letv.ok_or_else(|| {
@@ -1488,13 +1500,17 @@ impl Vm {
         // `VARACT[INIT=1 G_*]` 把全局表恢复成初值)。
         if flag(16).is_some() || (17..=28).any(|s| flag(s).is_some()) {
             self.varact_init_calls = self.varact_init_calls.saturating_add(1);
-            if flag(16).unwrap_or(0) == 0 {
-                // 无 INIT:引擎同位置 `je` 到函数尾 —— 什么都不做。
+            if flag(16).is_none() {
+                // INIT **不在场**:引擎判定链 `je 0x454e05`(函数尾)——
+                // 什么都不做(旁线 §3.26 ③)。判据是在场,与值无关。
                 return Ok(StepOutcome::Continue);
             }
             let mut masks = [0u8; 3]; // INT / FLT / STR 三族的 4 位掩码
             for slot in 17..=28u8 {
-                if flag(slot).unwrap_or(0) == 0 {
+                // 掩码位 = 载入器预写的「参数在场字节」(`0x454d3d
+                // movzx eax,byte ptr [0x684171]  ; G_INT 在场?` +
+                // `test/je`;旁线 §3.26 ③)—— 同样与值无关。
+                if flag(slot).is_none() {
                     continue;
                 }
                 let (family, bit) = match slot {
@@ -1518,7 +1534,7 @@ impl Vm {
         // 手册 `variable/varact.html` 例 9/10:`VARACT[DIMSIZE=500 SET=@A()]`
         // 与 `VARACT[DIMSIZE+=1 SET=@A()]` —— **没有 LET**,原地改数组。
         // 同理 PUSH/POP(例未给,但参数表无 LET 语义需求)。
-        if flag(13).unwrap_or(0) != 0 {
+        if flag(13).is_some() {
             // 手册例 9/10:`DIMSIZE=500`(绝对值)/ `DIMSIZE+=1`(相对值)。
             // 语料实测 **104/104 都是 `+=`**,复合码在窗口 `slot` 高字节
             // (与 `LET` 同一编码:0== 1+= 2-= …)。
@@ -1573,8 +1589,8 @@ impl Vm {
             self.resize_1d(set_var, ty, new_len.max(0) as usize)?;
             return Ok(StepOutcome::Continue);
         }
-        if flag(14).unwrap_or(0) != 0 || flag(15).unwrap_or(0) != 0 {
-            let push = flag(14).unwrap_or(0) != 0;
+        if flag(14).is_some() || flag(15).is_some() {
+            let push = flag(14).is_some();
             let pos = num(if push { 14 } else { 15 }).max(0) as usize;
             self.shift_1d(set_var, pos, push)?;
             return Ok(StepOutcome::Continue);
@@ -1597,33 +1613,33 @@ impl Vm {
         };
         let out;
         self.varact_bytes = self.varact_bytes.saturating_add(bytes.len() as u64);
-        if flag(3).unwrap_or(0) != 0 || flag(2).unwrap_or(0) != 0 {
+        if flag(3).is_some() || flag(2).is_some() {
             let pos = num(4).max(1) as usize;
             let len = num(5).max(0) as usize;
-            out = if flag(3).unwrap_or(0) != 0 {
+            out = if flag(3).is_some() {
                 self.varact_ops[0] = self.varact_ops[0].saturating_add(1);
                 copy_chars(&bytes, pos, len)
             } else {
                 self.varact_ops[1] = self.varact_ops[1].saturating_add(1);
                 cut_chars(&bytes, pos, len)
             };
-        } else if flag(7).unwrap_or(0) != 0 {
+        } else if flag(7).is_some() {
             self.varact_ops[2] = self.varact_ops[2].saturating_add(1);
             out = ascii_case(&bytes, true);
-        } else if flag(8).unwrap_or(0) != 0 {
+        } else if flag(8).is_some() {
             self.varact_ops[3] = self.varact_ops[3].saturating_add(1);
             out = fullwidth_case(&bytes, true);
-        } else if flag(9).unwrap_or(0) != 0 {
+        } else if flag(9).is_some() {
             self.varact_ops[4] = self.varact_ops[4].saturating_add(1);
             out = ascii_case(&bytes, false);
-        } else if flag(10).unwrap_or(0) != 0 {
+        } else if flag(10).is_some() {
             self.varact_ops[5] = self.varact_ops[5].saturating_add(1);
             out = fullwidth_case(&bytes, false);
-        } else if flag(11).unwrap_or(0) != 0 {
+        } else if flag(11).is_some() {
             self.varact_ops[6] = self.varact_ops[6].saturating_add(1);
             // 半角→全角:表/算法逐条见 `crate::case_tables`(0x4546aa..)。
             out = crate::case_tables::hantozen(&bytes);
-        } else if flag(12).unwrap_or(0) != 0 {
+        } else if flag(12).is_some() {
             self.varact_ops[7] = self.varact_ops[7].saturating_add(1);
             // 全角→半角:0x4548cf.. / 0x46b395。
             out = crate::case_tables::zentohan(&bytes);
@@ -1709,29 +1725,40 @@ impl Vm {
 
     /// `MATH`:手册 `math/math.html`;引擎 §3.20。
     fn op_math(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        let mut target: Option<VarRef> = None;
+        // LET 目标保留下标:`MATH[… LET=@A(i)]` 写 `A[i]`。语料实况 =
+        // `es_First.yst:145` 用 `LOOP[SET=63] MATH[POW=1 … LET=@es.POW2(@_LC-1)]`
+        // 填 2 的幂表(DIV-RT-003 除零根因;丢下标会把 63 次写全落在 [0])。
+        let mut target: Option<LValue> = None;
+        let mut set_raw: Option<Value> = None;
         let mut set: f64 = 0.0;
         let mut set2: f64 = 0.0;
+        let mut setstr: Option<Vec<u8>> = None;
         let mut flags: Vec<u8> = Vec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
             }
             match w.rec.kind {
-                0 => target = Some(self.eval_lvalue_window(st, w)?.var),
-                1 => set = self.eval_window(st, w)?.as_f64().unwrap_or(0.0),
+                0 => target = Some(self.eval_lvalue_window(st, w)?),
+                1 => {
+                    let v = self.eval_window(st, w)?;
+                    set = v.as_f64().unwrap_or(0.0);
+                    set_raw = Some(v);
+                }
                 2 => set2 = self.eval_window(st, w)?.as_f64().unwrap_or(0.0),
                 3 => {
-                    return Err(diag::unimplemented(
-                        code::rt::CMD_UNIMPLEMENTED,
-                        Boundary::Script,
-                        "MATH[SETSTR] 字符串运算未取证(手册页只列数值函数;DIV-RT-011)",
-                    )
-                    .into())
+                    if let Value::Str(b) = self.eval_window(st, w)? {
+                        // SETSTR = HASH 的字符串输入(旁线 §3.20:`HASH` 对序号 3
+                        // 的字符串求 CRC-32);其余数值函数不消费它。
+                        setstr = Some(b);
+                    }
                 }
                 slot => {
+                    // 旗标按**存在**记:官方判定链测的是窗口在场(每分支形状
+                    // = 直接读 SET 载荷,不读旗标值;旁线 §3.20)。此前按
+                    // 「值 ≠ 0」会让 `MATH[ABS=0 …]` 之类被静默丢参。
                     let v = self.eval_window(st, w)?;
-                    if v.as_int().unwrap_or(0) != 0 {
+                    if v.as_int().is_some() {
                         flags.push(slot);
                     }
                 }
@@ -1739,29 +1766,43 @@ impl Vm {
         }
         let target = target
             .ok_or_else(|| diag::fatal(code::rt::CMD_SLOT, Boundary::Script, "MATH 缺 LET"))?;
-        let Some(slot) = flags.first().copied() else {
-            self.store.write(target, &[], &Value::Float(set))?;
+        // 官方判定链原序(旁线 §3.20;**与槽位序不同**)—— 首个在场的旗标生效。
+        const MATH_CHAIN: [u8; 18] = [
+            4, 7, 10, 5, 8, 6, 9, 13, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21,
+        ];
+        let Some(slot) = MATH_CHAIN.into_iter().find(|s| flags.contains(s)) else {
+            // 无函数旗标:官方行为未取证(判定链全部落空);保留内核缺省
+            // (写出 SET 值)并留此注释,不另造语义。
+            self.store
+                .write(target.var, &target.indices, &Value::Float(set))?;
             return Ok(StepOutcome::Continue);
         };
         // 参数名→函数由工程 ysc 给出(参数表顺序即手册函数表)。
         let fname = self.param_name(cmd.opcode, slot).unwrap_or_default();
-        let r = match fname.as_str() {
-            "SIN" => set.sin(),
-            "ASIN" => set.asin(),
-            "SINH" => set.sinh(),
-            "COS" => set.cos(),
-            "ACOS" => set.acos(),
-            "COSH" => set.cosh(),
-            "TAN" => set.tan(),
-            "ATAN" => set.atan(),
-            "ATAN2" => set.atan2(set2),
-            "TANH" => set.tanh(),
-            "SQRT" => set.sqrt(),
-            "ABS" => set.abs(),
-            "EXP" => set.exp(),
-            "LOG" => set.ln(),
-            "LOG10" => set.log10(),
-            "POW" => set.powf(set2),
+        // 结果带类型:官方 ABS(整数入)/RND/HASH 走**整数写**
+        // (`0x455540` 族),其余走浮点写(`0x4555e4`;旁线 §3.20)。
+        let r: Value = match fname.as_str() {
+            "SIN" => Value::Float(set.sin()),
+            "ASIN" => Value::Float(set.asin()),
+            "SINH" => Value::Float(set.sinh()),
+            "COS" => Value::Float(set.cos()),
+            "ACOS" => Value::Float(set.acos()),
+            "COSH" => Value::Float(set.cosh()),
+            "TAN" => Value::Float(set.tan()),
+            "ATAN" => Value::Float(set.atan()),
+            "ATAN2" => Value::Float(set.atan2(set2)),
+            "TANH" => Value::Float(set.tanh()),
+            "SQRT" => Value::Float(set.sqrt()),
+            "ABS" => match set_raw {
+                // 旁线 §3.20 `0x448412`:SET 类型为整数 ⇒ 整数解析 +
+                // 取绝对值 + 整数写;否则浮点路 + `fabs`。
+                Some(Value::Int(i)) => Value::Int(i.abs()),
+                _ => Value::Float(set.abs()),
+            },
+            "EXP" => Value::Float(set.exp()),
+            "LOG" => Value::Float(set.ln()),
+            "LOG10" => Value::Float(set.log10()),
+            "POW" => Value::Float(set.powf(set2)),
             "RND" => {
                 // REA `0x448571..0x4485b7`:SET/SET2 取 64 位整数,反向时交换,
                 // `rand32 % (max-min+1)` 再加 min;手册例 17 `SET=1 SET2=9`。
@@ -1770,11 +1811,18 @@ impl Vm {
                 let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
                 let span = (hi as i128 - lo as i128 + 1) as u128;
                 let r = if span == 0 {
-                    0
+                    0i128
                 } else {
-                    u128::from(self.rng.next_u32()) % span
+                    i128::from(self.rng.next_u32()) % i128::try_from(span).unwrap_or(i128::MAX)
                 };
-                (lo as i128 + r as i128) as f64
+                Value::Int((lo as i128 + r) as i64)
+            }
+            "HASH" => {
+                // 旁线 §3.20 `0x4484f1 → 0x43fad8`:对 SETSTR 字符串求
+                // CRC-32(引擎表 `0x5b41c0` = 标准表)→ 写整数。
+                Value::Int(i64::from(crate::hash::crc32(
+                    setstr.as_deref().unwrap_or_default(),
+                )))
             }
             other => {
                 return Err(diag::fatal(
@@ -1785,7 +1833,7 @@ impl Vm {
                 .into())
             }
         };
-        self.store.write(target, &[], &Value::Float(r))?;
+        self.store.write(target.var, &target.indices, &r)?;
         Ok(StepOutcome::Continue)
     }
 
@@ -3382,7 +3430,7 @@ impl Vm {
 
     /// `LABELINFO[# LET EXIST]`:手册 `other/labelinfo.html`。
     fn op_labelinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        let mut target: Option<VarRef> = None;
+        let mut target: Option<LValue> = None;
         let mut name: Option<Vec<u8>> = None;
         let mut exist = false;
         for w in &cmd.windows {
@@ -3395,7 +3443,8 @@ impl Vm {
                         name = Some(b);
                     }
                 }
-                1 => target = Some(self.eval_lvalue_window(st, w)?.var),
+                // LET 保留下标:与 LET/FILEINFO 同口径(曾丢下标标量化)。
+                1 => target = Some(self.eval_lvalue_window(st, w)?),
                 2 => exist = self.eval_window(st, w)?.as_int().unwrap_or(0) != 0,
                 _ => {}
             }
@@ -3403,7 +3452,7 @@ impl Vm {
         if exist {
             if let (Some(name), Some(t)) = (name, target) {
                 let found = self.find_label(&name).is_some();
-                self.store.write(t, &[], &Value::Int(found as i64))?;
+                self.write_target(st, &t, &Value::Int(found as i64))?;
             }
         }
         Ok(StepOutcome::Continue)

@@ -1,15 +1,8 @@
 # yuris-kernel
 
-YU-RIS 引擎的净室兼容内核，GPL-3.0-or-later。**唯一目标：与官方引擎 1:1 对齐** ——
+YU-RIS 引擎的兼容内核，GPL-3.0-or-later。
 相同游戏数据与相同输入时间线下，封包解析、脚本执行、渲染语义、存档读写等一切可观测行为
 逐位一致。
-
-## 当前进度
-
-![yuris-kernel 当前进度：ERIS 启动 → title](docs/assets/demo.gif)
-
-> 当前演示：ERIS 启动 → boot 转场 → title。
-> 由 `yu-cli serve --backend wgpu` 驱动
 
 ## 立场
 

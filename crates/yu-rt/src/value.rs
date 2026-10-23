@@ -248,7 +248,9 @@ impl Value {
             )),
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_div(*b))),
             _ => match (self.as_f64(), rhs.as_f64()) {
-                (Some(_), Some(0.0)) => Ok(Value::Float(0.0)),
+                // 官方浮点走 x87(除零异常默认掩蔽):x/0 = ±Inf(符号随
+                // 被除数)、0/0 = NaN(IEEE-754;DIV-RT-002 族)。曾错误地
+                // 返回 0.0,2026-10-23 勘误。
                 (Some(a), Some(b)) => Ok(Value::Float(a / b)),
                 _ => Err(type_mix("/", self, rhs)),
             },
@@ -853,6 +855,18 @@ mod tests {
         store.declare(r, ElemType::Int, &[2, 2], &Value::Int(0));
         let d = store.write(r, &[2, 0], &Value::Int(1)).unwrap_err();
         assert_eq!(d.code.as_ref(), code::rt::VAR_SHAPE);
+    }
+
+    #[test]
+    fn float_div_zero_follows_ieee754() {
+        // 官方浮点走 x87(除零异常默认掩蔽):x/0 = ±Inf、0/0 = NaN。
+        // 曾错误地返回 0.0(2026-10-23 勘误;DIV-RT-002 族)。
+        let inf = Value::Float(5.0).div(&Value::Float(0.0)).unwrap();
+        assert!(matches!(inf, Value::Float(x) if x.is_infinite() && x > 0.0));
+        let neg_inf = Value::Float(-5.0).div(&Value::Float(0.0)).unwrap();
+        assert!(matches!(neg_inf, Value::Float(x) if x.is_infinite() && x < 0.0));
+        let nan = Value::Float(0.0).div(&Value::Float(0.0)).unwrap();
+        assert!(matches!(nan, Value::Float(x) if x.is_nan()));
     }
 
     #[test]

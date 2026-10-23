@@ -1,9 +1,10 @@
 {
   "entry": "SYSTEM_START",
   "expect": {
-    "display_json_sha256": "4ad4994ed2618bf34feb39e9f758d7df46519db821584e5577bb0d5439df1b1c",
-    "ops_total": 196,
-    "png_sha256": "396e23c64752645007346eb35930ab78a5e134074a75b92d5ece79f84bb5d23c",
+    "display_json_sha256": "79c188c487d010c7c3b774f2ea3f0d7e2450f1796c19e9f734429abba3159c75",
+    "fatal_codes": [],
+    "ops_total": 206,
+    "png_sha256": "2273b6ffa8ea5ac8ca5048045dc2b4b3103412a6d7aece0f0e6f6c1774d867b2",
     "skipped_ops_total": 1
   },
   "frames": 560,

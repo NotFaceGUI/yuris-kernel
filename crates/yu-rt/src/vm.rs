@@ -631,7 +631,7 @@ impl Vm {
                     format!(
                         "工程无 system/YSCom/YSCom.ycd(商业发行版常态):按工程 ysv.ybn 指纹\
                          选择系统变量 ABI 族 {} (已逐项校验通过,DIV-RT-016;已知族 \
-                         0292/0466/0479/0495)。命令表/参数名仍来自工程 ysbin/ysc.ybn,\
+                         0292/0466/0479/0495)。命令表/参数名仍来自工程的 ysc.ybn,\
                          无版本兜底。",
                         vm.tables.boot.sysvars.source.describe()
                     ),

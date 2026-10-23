@@ -58,6 +58,7 @@
 | DIV-RT-046 | `ERROR` 的逐命令启用表 | open | 表已按 REA 写入,消费者未定位 |
 | DIV-RT-047 | `_WINDOW_INIT_POS` / `_WINDOW_EXEC_CAPTION` 的宿主注入面 | fixed | 两个宿主 setter/注入值;手册仍无页 |
 | DIV-RT-048 | `_TEXT_NUM` 的数据源 | fixed | `yst.ybn` 头部 text_total == `yst_list` 求和(ERIS 396) |
+| DIV-RT-049 | 旗标/目标形态判定族(MATH 捕获、INIT 守卫、LABELINFO 下标)——P7 续审查轮的三个同族潜伏点 | fixed | 旁线 §3.20/§3.26 反汇编判据 + 语料形态扫描(scanmath:21 处 MATH 旗标全 =1、无 INIT=0);回归 ×3 |
 
 ---
 
@@ -90,6 +91,11 @@
   `-0.0` 等边界。**处置**:`docs/divergences` 挂账;逐位对拍需官方 trace。
 - **复核**:`crates/yu-rt/tests/fixture.rs::arithmetic_*`、
   `crates/yu-rt/src/value.rs` 单测。
+- **2026-10-23 附记(P7 续 3 审查轮)**:浮点除法除零曾返回 `0.0`
+  (`value.rs` 旧 `(Some(_), Some(0.0)) => Float(0.0)` 分支)——x87 除零
+  异常默认掩蔽,IEEE-754 结果 = **±Inf(符号随被除数)**、`0/0 = NaN`;
+  已按 IEEE 勘误并加 `float_div_zero_follows_ieee754` 单测。取模
+  `fmod(x,0)=NaN` 原本即对。整数路径(除零 Fatal)不变。
 
 ---
 
@@ -127,6 +133,47 @@
        不是 0 除数,故不是本现场的直接原因。
   - **禁止**:把 Fatal 改成“跳过该 LET”或伪造非 0 除数;必须等
     `LOAD`/ysv 两条取证路径有结论后再动。
+- **2026-10-23 续取证(三条残余线两条已排除)**:
+  1. **官方 `ysv.ybn`**:`dump_ysv_one 1118` → `id=1118 kind=1 group=1
+     script=0 type=1 dims=[63] init=int 0` ⇒ 假设 2 排除(官方初值就是 0,
+     不存在投影/组号映射错误;且它在 int 组 1,不在 `es_GSD.yst:1258`
+     恢复的组 3)。
+  2. **官方存档**:新工具 `yu-format/examples/dump_yssd_var.rs` 扫官方
+     5 个 `.sd` 共 269 块,**var 1118 零命中**(gsd.sd 只带 1113/1112,
+     save50001.sd 无 1118)⇒ 假设 1 的「存档里带非 0 值」排除。
+  3. **语料全量引用**:`find_var_ref` 19 处全部为读操作数(无 0x76 写编码);
+     读取形态 = `@1118[@_LC]` / `@1118[@_LC-1]`(`_LC`=LOOP 轮计数),
+     常与 `@1119[@_LC-1]`、守卫 `@1113[91]` 并现,语义上像 2 的幂/位掩码表。
+  - **新结论**:除数在内核与官方数据中都恒为 0 ⇒ 官方引擎不可能在这行
+    成功执行「除以 0」(硬件异常会崩进程,与商业发行可玩矛盾)。故官方
+    流程要么不执行该行(上游分支分歧),要么执行时 `_LC` ≥ 63 先触发
+    数组越界 `0x1a202` 并按脚本执行错误路径吞掉(DIV-RT-043:报一次 +
+    让出 + 继续)。本 Fatal 是**上游状态分歧的绊线**:内核在 `_LC < 63`
+    的状态下成功读到 0 并做了除法。
+  - **下一步**(替代原残余线):①采集官方 trace 在 `es_select.yst:153`
+    的 `_LC` 值与是否执行;②内核 trace 里记录 Fatal 时 `_LC` 与该 LOOP 的
+    轮数,对比上游哪一步分叉。
+  - **现场补充(用户桌面实跑)**:`engine_frame=508` 的 Fatal 诊断显示
+    **被除数与除数同为 0**(`@2264[@2284]=0 / @1118[@_LC]=0`)⇒ 该表达式
+    是对全 0 状态做位提取,连被除数数组也未写入;进一步支持「上游分歧
+    绊线」结论。内核侧证据已闭合,只剩官方 trace 一条路(任务归属
+    P4/P3 取证)。
+- **2026-10-23 收口(根因修复;推翻「上游分歧」假设 —— 勘误留痕)**:
+  明文源码(`save/data/script/ERIS/`)定位:
+  - 除数 `@1118` = **`@es.POW2`**(`global.yst:208` `G_INT[@es.POW2(63)]`,
+    2 的幂表);写入者 = `es_First.yst:145`
+    `LOOP[SET=63] MATH[POW=1 SET=2 SET2=@_LC-1 LET=@es.POW2(@_LC-1)] LOOPEND[]`
+    —— 走 MATH 命令 LET 窗口,故表达式级扫描无写者;
+  - **内核 bug**:`op_math` 把 LET 目标的数组下标丢弃,63 次写全落 `[0]`
+    (实测 tick3 后 `POW2[0]=2^62`、其余全 0)⇒ 官方表填得对、除法正常,
+    「官方不可能成功执行该除法」的前提不成立;
+  - 修复:`op_math` 保留 `LValue.indices` 写回;表实证填满
+    `[1,2,4,…,2^62]`;回归 `fixture::math_let_writes_indexed_array_element`;
+  - 被除数 `@2264` = `@es.SELD`(選択履歴,经 `SAVE/LOAD seld.sd` 持久化,
+    官方 `seld.sd` 块值 `[1]=6`;工具 `yu-format/examples/dump_yssd_var.rs`);
+  - 同判 S4 的 `es_number.yst:56` 除零:同为 MATH 填表消费行,随本修复一并
+    恢复(待用户桌面复验)。取证工具:`yu-rt/examples/dump_var_int.rs`、
+    `dump_label_cmds.rs`(标签反汇编 / `scan:<sid>` 全脚本命令扫描)。
 
 ---
 
@@ -416,6 +463,15 @@
   —— **没有 `LET`**,直接改 `SET` 指向的数组。
 - **实测**:商业 v494 出现无 `LET` 的 `VARACT`(`DIMSIZE=104` 次中多数无 LET)。
 - **处置**:DIMSIZE/PUSH/POP 分支在要求 `LET` **之前**处理,目标 = `SET`。
+- **2026-10-23 续(存在性判定收口)**:上述分支虽已前置,但守卫用的是
+  **「旗标值 ≠ 0」**——ERIS 语料 s33(`es_logset.yst`)pc46..49 的
+  `VARACT[SET=$… PUSH=0]`(`PUSH` 位置 0)被误判为无参,掉进字符串加工
+  分支报 `rt.cmd.slot 缺 LET`(用户桌面 Fatal,`es.ScenarioScript@46`)。
+  官方语义 = **参数存在性判定不看值**(DIV-RT-024 INIT「不在场才不做」、
+  DIV-RT-044 DIALOG「`OKCANCEL=0` 也算存在」同族)。已把 `op_varact` 全部
+  旗标分支(TYPE/COPY/CUT/UPPER/LOWER/HANTOZEN/ZENTOHAN/DIMSIZE/PUSH/POP)
+  统一改为 `is_some()` 存在性判定。回归:
+  `fixture::varact_push_zero_is_presence_not_value`(s33 pc46 形态)。
 
 ## DIV-RT-020 · 数组负下标 / 越界访问
 
@@ -893,3 +949,34 @@ packed = ([1290322, 329227, 26, 249, 8765, 8765], 0, "cd1790…4bd2e")  ... ok
   `yst.ybn`;两者在其它工程若分歧,以 `yst.ybn` 为准的接入留待
   `yu-format` 提供 YSTD 解码后再改。
 - **复核**:`corpus::text_num_matches_yst_header_total`。
+
+
+---
+
+## DIV-RT-049 · 旗标/目标形态判定族收口(2026-10-23,审查轮)
+
+> P7 续的审查(三类病根 × 全处理器 + 真实 yscm 全表 + 语料形态扫描)发现
+> 三个与 DIV-RT-019/003 同族的潜伏点;本轮按旁线反汇编判据一次对齐。
+
+- **A1 `op_math` 旗标捕获**(曾按「值 ≠ 0」记参):官方判定链测**窗口在场**
+  (每分支形状 = 直接读 SET 载荷,不读旗标值;旁线 §3.20),且**判定链原序
+  与槽位序不同**(`4,7,10,5,8,6,9,13,11,12,14..21`)⇒ 捕获改 `as_int().is_some()`,
+  选择改按官方链序首个在场旗标;补齐 `HASH`(引擎表 `0x5b41c0` = 标准
+  CRC-32 表,检查值 `"123456789"→0xCBF43926`,新增 `src/hash.rs`)、
+  `ABS` 整数路(`0x448412`:SET 整数 ⇒ 整数写)与 `SETSTR`=HASH 输入
+  (旧 `Unimplemented` 作废;语料实测 SETSTR 窗口 0 处,零回归风险)。
+  语料 21 处 MATH 旗标全为 1 ⇒ 本修复对现语料零行为差,纯潜伏收口。
+- **A2 `VARACT[INIT=0 …]` 守卫**(曾按「值 == 0 ⇒ 不做」):官方判据 =
+  载入器预写的**参数在场字节表**(`0x454d3d movzx eax,byte ptr [0x684171]
+  ; G_INT 在场?` + `test/je`;`0x684160+序号`;INIT 缺席 = `je 0x454e05`
+  函数尾)⇒ INIT 与 G_* 掩码构造全部改 `is_some()`。语料无 INIT=0/G_*=0,
+  潜伏收口。
+- **A3 `op_labelinfo` LET 写回丢下标**(曾 `store.write(t, &[], …)` 标量化)
+  ⇒ 改保留 `LValue` + `write_target`(与 LET/FILEINFO/MATH 同口径)。
+- **无旗标 MATH 的缺省行为**(写出 SET 值)官方未取证,保留原内核缺省并
+  在源码注释标明,不另造语义。
+- **复核**:`fixture::math_flag_zero_value_still_selects_function`、
+  `varact_init_zero_value_still_restores`、`labelinfo_let_writes_indexed_element`;
+  `cargo test -p yu-rt` 全绿(65 lib + 11 corpus + 68 fixture + 3 golden)。
+  审查工具:`examples/dump_label_cmds.rs`(标签反汇编 / `scan:<sid>` /
+  `scanmath` 全语料 MATH/VARACT 旗标形态统计)。
