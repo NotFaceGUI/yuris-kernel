@@ -4,7 +4,8 @@ mod support;
 
 use support::*;
 use yu_gfx::{
-    CopyKind, CopyRegion, CopySource, CopyTiming, LayerStatus, Op, OpStatus, PassTarget, TextureRef,
+    CopyKind, CopyRegion, CopySource, CopyTiming, GfxState, LayerStatus, Op, OpStatus, PassTarget,
+    TextDraw, TextureRef,
 };
 
 fn create(
@@ -357,4 +358,160 @@ fn group_copy_source_is_group_and_destination_created() {
         .unwrap();
     assert_eq!(copy.source, CopySource::Group(id(":/W0/G")));
     assert!(f.layers.iter().any(|l| l.id.display() == ":/W0/SHOT"));
+}
+
+// ---------------------------------------------------------------- DIV-GFX-058
+// `CGACT[TEXT]` 持久化与 COPY/加工/交换的文本语义。
+
+fn text_on(table: &yu_gfx::ParamTable, id: &str, text: &str, x: i64) -> yu_rt::event::VmEvent {
+    call(
+        1,
+        "CGACT",
+        vec![
+            arg(table, "CGACT", "ID", s(id)),
+            arg(table, "CGACT", "TEXT", i(1)),
+            arg(table, "CGACT", "SET", i(0)),
+            arg(table, "CGACT", "SETSTR", s(text)),
+            arg(table, "CGACT", "X", i(x)),
+            arg(table, "CGACT", "Y", i(0)),
+        ],
+    )
+}
+
+fn frame_copy_texts(gfx: &mut GfxState) -> Vec<TextDraw> {
+    gfx.frame()
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|o| match o {
+            Op::Copy(c) => Some(c.texts.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn copy_freezes_source_texts_at_command_time() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        create(&table, "SRC", "src", 1, 256),
+        text_on(&table, "SRC", "AB", 0),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "ID2", s("DST")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        // COPY 之后再画:不得进入已冻结的快照(DIV-GFX-053 同门)。
+        text_on(&table, "SRC", "C", 20),
+        frame_end(1),
+    ]);
+    let texts = frame_copy_texts(&mut gfx);
+    assert_eq!(texts.len(), 1, "快照只携带命令时刻的文本");
+    assert_eq!(texts[0].bytes, b"AB");
+    // 源层自身的绘制项是持久的全集(先 AB 后 C)。
+    let src_draws = gfx
+        .frame()
+        .text_draws
+        .iter()
+        .filter(|d| d.target.display() == ":/W0/SRC")
+        .count();
+    assert_eq!(src_draws, 2);
+}
+
+#[test]
+fn executable_copy_clears_dest_texts() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        create(&table, "SRC", "src", 1, 256),
+        // 目标层先存在并已有文本(例如上一次刷新的旧标签)。
+        create(&table, "DST", "", 2, 256),
+        text_on(&table, "DST", "OLD", 0),
+        frame_end(1),
+        frame_start(2),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "ID2", s("DST")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        frame_end(2),
+    ]);
+    assert!(
+        gfx.frame().text_draws.is_empty(),
+        "COPY 覆写目标面 ⇒ 目标层旧文本作废"
+    );
+}
+
+#[test]
+fn executable_image_op_clears_target_texts() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        create(&table, "LBL", "", 1, 256),
+        text_on(&table, "LBL", "LABEL", 0),
+        // BT.CGCLEAR 的真实路径:RECTPAINT3 SET=0 清标签面(es_Button.yst:4547)。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("LBL")),
+                arg(&table, "CGACT", "RECTPAINT3", i(1)),
+                arg(&table, "CGACT", "SET", i(0)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    assert!(
+        gfx.frame().text_draws.is_empty(),
+        "已执行的像素加工重写表面 ⇒ 烘焙文本作废"
+    );
+}
+
+#[test]
+fn swap_exchanges_layer_texts() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        create(&table, "A", "a", 1, 256),
+        create(&table, "B", "b", 1, 256),
+        text_on(&table, "A", "ON-A", 0),
+        text_on(&table, "B", "ON-B", 0),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("A")),
+                arg(&table, "CGACT", "ID2", s("B")),
+                arg(&table, "CGACT", "SWAP", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let moved: Vec<(String, Vec<u8>)> = gfx
+        .frame()
+        .text_draws
+        .iter()
+        .map(|d| (d.target.display(), d.bytes.clone()))
+        .collect();
+    assert!(
+        moved.contains(&(":/W0/A".to_string(), b"ON-B".to_vec())),
+        "{moved:?}"
+    );
+    assert!(
+        moved.contains(&(":/W0/B".to_string(), b"ON-A".to_vec())),
+        "{moved:?}"
+    );
 }

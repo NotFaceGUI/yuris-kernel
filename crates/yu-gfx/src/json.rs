@@ -800,8 +800,11 @@ pub fn to_json(f: &CompositorFrame) -> String {
         }
         text(&mut out, t);
     }
+    out.push(']');
+    // `text_layout`/`text_draws` 是帧级兄弟成员(每个 extra 自带前导逗号);
+    // 在 `"text":[...]` 数组**闭合之后**追加,空 text + 非空 extras 也合法。
     text_frame_extras(&mut out, f);
-    out.push_str("],\"diagnostics\":");
+    out.push_str(",\"diagnostics\":");
     diagnostics(&mut out, &f.diagnostics);
     out.push('}');
     out
@@ -827,8 +830,11 @@ pub fn to_display_json(f: &CompositorFrame) -> String {
         }
         text(&mut out, t);
     }
+    out.push(']');
+    // 与 `to_json` 同口径:`text_layout`/`text_draws` 是帧级兄弟成员,
+    // 不在 `"text"` 数组内部(旧写法在空 text 时产出非法 JSON)。
     text_frame_extras(&mut out, f);
-    out.push_str("],\"diagnostics\":");
+    out.push_str(",\"diagnostics\":");
     diagnostics(&mut out, &f.diagnostics);
     out.push('}');
     out

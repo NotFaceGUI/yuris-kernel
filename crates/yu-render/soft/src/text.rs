@@ -18,12 +18,13 @@
 //! - 基线 = 单元顶边 + 字体 ascent(近似 GDI 的 `lfHeight` 单元,DIV-GFX-056)。
 
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::time::Instant;
 
 use yu_font::cache::CacheLimits;
 use yu_font::{cp932, AaMode, DrawMode, FontRenderer, FontSource, Gradation, Rgb, Rotation};
 use yu_font::{StylePolicy, TextStyle as FontStyle};
-use yu_gfx::{TextDraw, TextFontRequest, TextLayoutFrame};
+use yu_gfx::{LayerId, TextDraw, TextFontRequest, TextLayoutFrame, TextureRef};
 
 use crate::texture::Texture;
 
@@ -64,10 +65,76 @@ pub struct TextComposer {
     /// 首次初始化失败原因(`None` = 尚未尝试)。
     failure: Option<String>,
     /// 字体身份 → face 解析缓存(键是请求的稳定显示形式)。
-    faces: BTreeMap<String, Option<yu_font::FaceId>>,
+    faces: BTreeMap<String, Option<(yu_font::FaceId, FaceFallback)>>,
     /// 首次系统字体枚举耗时(毫秒)。只在加载后的第一帧报告一次
     /// (`text.font_init`),用于解释“第一次打开テキスト页签”的尖峰。
     load_ms: Option<u128>,
+    /// 「基图 + 文本」合成结果缓存:`CGACT[TEXT]` 是跨帧持久的烘焙
+    /// (DIV-GFX-058),内容没变就不该每帧重烤。键 = 层 + 文本修订号 +
+    /// 基面身份;自动文本层(布局每帧变化)不进缓存。
+    compose_cache: BTreeMap<LayerId, ComposeCacheEntry>,
+}
+
+/// 一条合成缓存(见 [`TextComposer::compose_cache`])。
+#[derive(Clone)]
+struct ComposeCacheEntry {
+    revision: u64,
+    base_key: u64,
+    texture: Rc<Texture>,
+}
+
+/// 纹理内容哈希(FNV-1a;仅用于帧内图像加工覆盖纹理的缓存键)。
+pub fn texture_content_hash(texture: &Texture) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    for &b in &texture.rgba {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// 文本合成基面的身份哈希(资产 key / 1×1 黑 / 快照 id / 无纹理尺寸 +
+/// 帧内图像加工覆盖哈希)。与 `TextDraw` 的层修订号一起做缓存键。
+pub fn text_base_key(texture: &TextureRef, override_hash: Option<u64>) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64; // FNV-1a
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    };
+    match texture {
+        TextureRef::Asset(key) => {
+            feed(b"A");
+            feed(key);
+        }
+        TextureRef::SolidBlack1x1 => feed(b"B"),
+        TextureRef::Snapshot(id) => {
+            feed(b"S");
+            feed(&id.0.to_le_bytes());
+        }
+        TextureRef::Offscreen(id) => {
+            feed(b"O");
+            feed(id.as_bytes());
+        }
+        TextureRef::None => feed(b"E"),
+    }
+    if let Some(hash) = override_hash {
+        feed(b"X");
+        feed(&hash.to_le_bytes());
+    }
+    h
+}
+
+/// 字体身份解析的回落种类(`font_style` 第三项;进 `text_diags`)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FaceFallback {
+    /// 正常解析。
+    None,
+    /// `BNO` 调试槽未取证,按默认字体绘制(DIV-FONT-007)。
+    Bno,
+    /// 字体名在本机不存在(或为空):按引擎回退表默认 family(DIV-GFX-059)。
+    Name(Vec<u8>),
 }
 
 impl Default for TextComposer {
@@ -85,6 +152,7 @@ impl TextComposer {
             failure: None,
             faces: BTreeMap::new(),
             load_ms: None,
+            compose_cache: BTreeMap::new(),
         }
     }
 
@@ -96,6 +164,7 @@ impl TextComposer {
             failure: None,
             faces: BTreeMap::new(),
             load_ms: None,
+            compose_cache: BTreeMap::new(),
         }
     }
 
@@ -146,10 +215,13 @@ impl TextComposer {
     }
 
     /// 解析 `FONT` 字体身份请求(`NAME` → `NO` → `BNO` → 引擎默认回退表)。
-    fn resolve_face(&mut self, request: &TextFontRequest) -> Option<yu_font::FaceId> {
+    fn resolve_face(
+        &mut self,
+        request: &TextFontRequest,
+    ) -> Option<(yu_font::FaceId, FaceFallback)> {
         let key = format!("{request:?}");
         if let Some(hit) = self.faces.get(&key) {
-            return *hit;
+            return hit.clone();
         }
         if !self.ensure() {
             return None;
@@ -159,20 +231,36 @@ impl TextComposer {
         let face = match request {
             TextFontRequest::Name(bytes) => {
                 let text: String = cp932::decode(bytes).chars.into_iter().collect();
-                source.find_family(&text)
+                match source.find_family(&text) {
+                    Some(face) => Some((face, FaceFallback::None)),
+                    // 名字查不到(空串/本机未装):引擎按默认 family 回退表
+                    // 选第一个已安装 family(`0x403b8e..0x403bdc`),不是错误。
+                    None => source
+                        .default_face()
+                        .ok()
+                        .map(|face| (face, FaceFallback::Name(bytes.clone()))),
+                }
             }
             TextFontRequest::No(no) => {
                 if *no >= 0 {
-                    source.face_by_no(*no as usize)
+                    source
+                        .face_by_no(*no as usize)
+                        .map(|face| (face, FaceFallback::None))
                 } else {
                     None
                 }
             }
             // BNO 的字体列表语义未取证(DIV-FONT-007):不解析,退回默认。
-            TextFontRequest::Bno(_) => source.default_face().ok(),
-            TextFontRequest::Default => source.default_face().ok(),
+            TextFontRequest::Bno(_) => source
+                .default_face()
+                .ok()
+                .map(|face| (face, FaceFallback::Bno)),
+            TextFontRequest::Default => source
+                .default_face()
+                .ok()
+                .map(|face| (face, FaceFallback::None)),
         };
-        self.faces.insert(key, face);
+        self.faces.insert(key, face.clone());
         face
     }
 
@@ -180,10 +268,9 @@ impl TextComposer {
     ///
     /// 返回值第三项 = 是否走了 `BNO` 的“默认字体”回退(DIV-FONT-007
     /// 未取证);调用方据此发一次性报告,不静默回退。
-    fn font_style(&mut self, style: &yu_gfx::TextStyle) -> Option<(FontStyle, u16, bool)> {
+    fn font_style(&mut self, style: &yu_gfx::TextStyle) -> Option<(FontStyle, u16, FaceFallback)> {
         let request = style.font_request();
-        let bno_fallback = matches!(request, TextFontRequest::Bno(_));
-        let face = self.resolve_face(&request)?;
+        let (face, fallback) = self.resolve_face(&request)?;
         // SX/SY=0 → 20:引擎默认样式(`FUN_00464fac`;见
         // `docs/font-contract.md` §3.3“引擎默认 SX=SY=20”)。
         let sx = style.size_x.clamp(0, 0x100) as u16;
@@ -213,7 +300,7 @@ impl TextComposer {
         } else {
             DrawMode::Replace
         };
-        Some((s, sy, bno_fallback))
+        Some((s, sy, fallback))
     }
 
     /// 在 `dst`(RGBA8,`w×h`)上绘制一个 `CGACT[TEXT]` 项。
@@ -235,15 +322,20 @@ impl TextComposer {
         if let Some(ms) = self.load_ms.take() {
             stats.note(&format!("text.font_init: {ms}ms"));
         }
-        let Some((font_style, sy, bno_fallback)) = self.font_style(&draw.style) else {
+        let Some((font_style, sy, fallback)) = self.font_style(&draw.style) else {
             stats.draws += 1;
             stats.note("text.font_missing");
             return;
         };
-        if bno_fallback {
-            stats.note(
+        match &fallback {
+            FaceFallback::None => {}
+            FaceFallback::Bno => stats.note(
                 "text.font.bno_fallback: BNO 字体列表语义未取证(DIV-FONT-007),按默认字体绘制",
-            );
+            ),
+            FaceFallback::Name(bytes) => stats.note(&format!(
+                "text.font.name_fallback: {}",
+                String::from_utf8_lossy(bytes)
+            )),
         }
         let ascent = {
             let renderer = self.renderer.as_ref().expect("ensured above");
@@ -267,14 +359,21 @@ impl TextComposer {
         let baseline = draw.y as i32 + ascent;
         let renderer = self.renderer.as_mut().expect("ensured above");
         let mut drew_any = false;
+        let mut dbg_glyph_ns: u128 = 0;
+        let mut dbg_draw_ns: u128 = 0;
         for ch in &decoded.chars {
-            match renderer.render_glyph(*ch, &font_style, StylePolicy::Reference) {
+            let tg = std::time::Instant::now();
+            let rendered = renderer.render_glyph(*ch, &font_style, StylePolicy::Reference);
+            dbg_glyph_ns += tg.elapsed().as_nanos();
+            match rendered {
                 Ok(image) => {
                     let gx = pen_x + image.left;
                     let gy = baseline + image.top;
+                    let td = std::time::Instant::now();
                     for _ in 0..passes {
                         image.draw_onto(dst, w, h, gx, gy, blended);
                     }
+                    dbg_draw_ns += td.elapsed().as_nanos();
                     let step = ((image.advance as f32) / 256.0).round() as i32;
                     pen_x += step.max(0);
                     stats.glyphs += 1;
@@ -287,6 +386,15 @@ impl TextComposer {
             }
         }
         let _ = drew_any;
+        if std::env::var("YU_P8_TIMING").is_ok() && dbg_glyph_ns + dbg_draw_ns > 500_000 {
+            eprintln!(
+                "[p8] draw chars={} glyph={}us onto={}us passes={}",
+                decoded.chars.len(),
+                dbg_glyph_ns / 1000,
+                dbg_draw_ns / 1000,
+                passes
+            );
+        }
         stats.draws += 1;
     }
 
@@ -346,14 +454,19 @@ impl TextComposer {
             stats.note(&format!("text.font_init: {ms}ms"));
         }
         let style = &layout.style;
-        let Some((font_style, sy, bno_fallback)) = self.font_style(style) else {
+        let Some((font_style, sy, fallback)) = self.font_style(style) else {
             stats.note("text.font_missing");
             return stats;
         };
-        if bno_fallback {
-            stats.note(
+        match &fallback {
+            FaceFallback::None => {}
+            FaceFallback::Bno => stats.note(
                 "text.font.bno_fallback: BNO 字体列表语义未取证(DIV-FONT-007),按默认字体绘制",
-            );
+            ),
+            FaceFallback::Name(bytes) => stats.note(&format!(
+                "text.font.name_fallback: {}",
+                String::from_utf8_lossy(bytes)
+            )),
         }
         let ascent = {
             let renderer = self.renderer.as_ref().expect("ensured above");
@@ -413,14 +526,73 @@ impl TextComposer {
         }
         (Some(out), stats)
     }
+
+    /// 同 [`TextComposer::compose_layer`],但按「层 + 文本修订号 + 基面身份」
+    /// 缓存结果(P8:持久文本是烘焙语义,内容不变不重合成)。
+    ///
+    /// 只在 `layout.is_none()`(纯 `CGACT[TEXT]`)时缓存:自动文本层的布局
+    /// 每帧变化,缓存会读到旧内容。缓存命中返回同一 `Rc`(wgpu 侧内容哈希
+    /// 不变 ⇒ 上传缓存也命中),统计按 0 字形报告(两端一致)。
+    pub fn compose_layer_cached(
+        &mut self,
+        layer: &LayerId,
+        revision: u64,
+        base_key: u64,
+        base: &Texture,
+        draws: &[TextDraw],
+        layout: Option<&TextLayoutFrame>,
+    ) -> (Option<Rc<Texture>>, TextPaintStats) {
+        if layout.is_some() {
+            let (out, stats) = self.compose_layer(base, draws, layout);
+            return (out.map(Rc::new), stats);
+        }
+        if draws.is_empty() {
+            return (None, TextPaintStats::default());
+        }
+        if let Some(hit) = self.compose_cache.get(layer) {
+            if hit.revision == revision
+                && hit.base_key == base_key
+                && hit.texture.width == base.width
+                && hit.texture.height == base.height
+            {
+                return (Some(hit.texture.clone()), TextPaintStats::default());
+            }
+        }
+        let (out, stats) = self.compose_layer(base, draws, None);
+        let Some(texture) = out else {
+            return (None, stats);
+        };
+        let texture = Rc::new(texture);
+        if self.compose_cache.len() >= 256 && !self.compose_cache.contains_key(layer) {
+            // 上限保护:文本层数量远小于此;极端语料下整体清空(一次性重烤),
+            // 不引入跨帧无界内存。
+            self.compose_cache.clear();
+        }
+        self.compose_cache.insert(
+            layer.clone(),
+            ComposeCacheEntry {
+                revision,
+                base_key,
+                texture: texture.clone(),
+            },
+        );
+        (Some(texture), stats)
+    }
+
+    /// 丢弃一个层的合成分缓存(层删除后调用;保守清理由上限保护兜底)。
+    pub fn forget_compose_cache(&mut self, layer: &LayerId) {
+        self.compose_cache.remove(layer);
+    }
 }
 
 /// 解析图层的基图(文本合成的输入)。
 ///
-/// 只支持资产/1×1 黑/无纹理(透明):快照与离屏组需要渲染器的像素面,
-/// 由调用方显式拒绝(不猜)。
+/// 支持资产/1×1 黑/无纹理(透明)/快照(DIV-GFX-058:按钮标签等
+/// `CGACT[TEXT]` 直接画在 COPY2 产生的快照精灵层上,基面 = 快照像素);
+/// 离屏组仍显式拒绝(组合成的 CPU 面归渲染器,未接线,不猜)。
 pub fn layer_base(
     textures: &mut crate::texture::TextureStore,
+    snapshots: &crate::render::Snapshots,
     layer: &yu_gfx::Layer,
 ) -> Result<Texture, String> {
     match &layer.texture {
@@ -439,8 +611,14 @@ pub fn layer_base(
                 rgba: vec![0; (size.width as usize) * (size.height as usize) * 4],
             })
         }
-        yu_gfx::TextureRef::Snapshot(_) | yu_gfx::TextureRef::Offscreen(_) => {
-            Err("text.layer_source_unsupported".to_string())
-        }
+        yu_gfx::TextureRef::Snapshot(copy_id) => snapshots
+            .get(copy_id)
+            .map(|surface| Texture {
+                width: surface.width,
+                height: surface.height,
+                rgba: surface.rgba.clone(),
+            })
+            .ok_or_else(|| "text.layer_snapshot_missing".to_string()),
+        yu_gfx::TextureRef::Offscreen(_) => Err("text.layer_source_unsupported".to_string()),
     }
 }

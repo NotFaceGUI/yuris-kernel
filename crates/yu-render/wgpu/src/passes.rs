@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use yu_backend_soft::{
-    apply_horizontal, apply_rect_paint, apply_reverse, layer_base, AssetIssue, RenderReport,
-    SkippedOp, TextComposer, TextPaintStats, Texture, TextureStore,
+    apply_horizontal, apply_rect_paint, apply_reverse, blit, text_base_key, AssetIssue,
+    RenderReport, SkippedOp, Surface, TextComposer, TextPaintStats, Texture, TextureStore,
 };
 use yu_gfx::{
     fixed_pipeline_alpha, shader_alpha, BlendMode, Clear, CompositorFrame, CopyId, CopyOp,
@@ -144,9 +144,35 @@ pub(crate) fn plan(
     let mut transition_bind_groups: Vec<wgpu::BindGroup> = Vec::new();
     let mut transition_buffers: Vec<wgpu::Buffer> = Vec::new();
 
+    // 1.4 快照 CPU 镜像预捕获(DIV-GFX-058,按命令序):1.5 的文本基面解析
+    // 需要快照像素,而 GPU 快照在命令段才捕获;这里先把 CPU 可得源(资产/
+    // 1×1 黑/另一快照镜像)按 soft `apply_copy_op` 的同一构造(目标尺寸 +
+    // 区域裁剪)落成镜像。带冻结文本的 COPY 在 1.6 段连文本一起落。
+    for pass in &frame.passes {
+        let PassTarget::Texture(_) = &pass.target else {
+            continue;
+        };
+        for op in &pass.ops {
+            let Op::Copy(copy) = op else { continue };
+            if copy.status != OpStatus::Executable
+                || !copy.texts.is_empty()
+                || targets.snapshot(copy.id).is_some()
+                || targets.snapshot_cpu(copy.id).is_some()
+            {
+                continue;
+            }
+            capture_copy_mirror(frame, textures, targets, copy);
+        }
+    }
+
     // 1. RECTPAINT/REVERSE/HORIZONTAL:CPU 预执行到图层覆盖纹理。
     //    目标是快照的 RECTPAINT 族推迟到命令段(GPU 直接在快照纹理上画)。
     let mut overrides: BTreeMap<LayerId, Override> = BTreeMap::new();
+    // 文本合成产生的覆盖层(DIV-GFX-058):COPY 取源面时跳过(快照只带
+    // 命令时刻冻结的 `copy.texts`)。
+    let mut text_override_ids: BTreeSet<LayerId> = BTreeSet::new();
+    // COPY 冻结文本的源面(1.6 段合成;plan_copy 直接上传为 GPU 源)。
+    let mut copy_text_sources: BTreeMap<CopyId, Rc<Texture>> = BTreeMap::new();
     let mut deferred: BTreeSet<(usize, usize)> = BTreeSet::new();
     for (pass_index, pass) in frame.passes.iter().enumerate() {
         let PassTarget::Texture(target) = &pass.target else {
@@ -219,7 +245,7 @@ pub(crate) fn plan(
                 .filter(|l| l.target.as_ref() == Some(&id));
             let base: Rc<Texture> = match overrides.get(&id) {
                 Some(hit) => hit.tex.clone(),
-                None => match layer_base(textures, layer) {
+                None => match layer_base_cpu(textures, targets, layer) {
                     Ok(base) => Rc::new(base),
                     Err(reason) => {
                         note_text_diag(&mut acc, format!("text.layer_base: {reason}"));
@@ -227,11 +253,103 @@ pub(crate) fn plan(
                     }
                 },
             };
-            let (composed, stats) = text.compose_layer(&base, &draws, layout);
+            let revision = frame.text_revisions.get(&id).copied().unwrap_or(0);
+            let override_hash = overrides.get(&id).map(|o| o.hash);
+            let base_key = text_base_key(&layer.texture, override_hash);
+            let (composed, stats) =
+                text.compose_layer_cached(&id, revision, base_key, &base, &draws, layout);
             merge_text_stats(&mut acc, stats);
             if let Some(composed) = composed {
-                overrides.insert(id, Override::new(Rc::new(composed)));
+                overrides.insert(id.clone(), Override::new(composed));
+                text_override_ids.insert(id);
             }
+        }
+    }
+
+    // 1.6 COPY 冻结文本的源面(DIV-GFX-058):命令时刻已画文本进入快照,
+    // 命令之后画的文本不得进入(与 soft 的 `compose_copy_texts` 同一语义;
+    // 每帧只在快照未捕获时合成一次,冻结帧零成本)。
+    for pass in &frame.passes {
+        let PassTarget::Texture(_) = &pass.target else {
+            continue;
+        };
+        for op in &pass.ops {
+            let Op::Copy(copy) = op else { continue };
+            if copy.status != OpStatus::Executable
+                || copy.texts.is_empty()
+                || !matches!(copy.source, CopySource::Layer(_))
+                || copy_text_sources.contains_key(&copy.id)
+                || targets.snapshot(copy.id).is_some()
+            {
+                continue;
+            }
+            let source_layer = match &copy.source {
+                CopySource::Layer(id) => id,
+                CopySource::Group(_) => continue,
+            };
+            // 基面优先级与 soft 的 layer_surface 同序:图像加工覆盖纹理 >
+            // 层基图(文本覆盖纹理跳过 —— 只合成冻结的 `copy.texts`);
+            // 源层已被 CGEND 删除时回退命令时刻的 `source_texture`。
+            let base: Option<Result<Rc<Texture>, String>> =
+                if let Some(hit) = overrides.get(source_layer) {
+                    if text_override_ids.contains(source_layer) {
+                        None
+                    } else {
+                        Some(Ok(hit.tex.clone()))
+                    }
+                } else {
+                    match copy_source_base_cpu(frame, textures, targets, copy, source_layer) {
+                        Ok(tex) => Some(Ok(Rc::new(tex))),
+                        Err(reason) if reason == "gfx.copy.source.gone" => None,
+                        Err(reason) => Some(Err(reason)),
+                    }
+                };
+            let base = match base {
+                Some(Ok(tex)) => tex,
+                Some(Err(reason)) => {
+                    note_text_diag(&mut acc, format!("text.copy_base: {reason}"));
+                    continue;
+                }
+                None => continue,
+            };
+            let (composed, stats) = text.compose_layer(&base, &copy.texts, None);
+            merge_text_stats(&mut acc, stats);
+            let Some(source) = composed else {
+                continue;
+            };
+            copy_text_sources.insert(copy.id, Rc::new(source.clone()));
+            // 镜像 = 快照面(目标尺寸 + 区域裁剪;与 soft 的 apply_copy_op
+            // 同一构造),不是整个源面。
+            let (sw, sh) = (source.width, source.height);
+            let (width, height) = frame
+                .layers
+                .iter()
+                .find(|layer| layer.id == copy.dest)
+                .and_then(|layer| layer.image_size())
+                .map(|size| (size.width, size.height))
+                .unwrap_or((sw, sh));
+            let mut surface = Surface::new(width, height, [0, 0, 0, 0]);
+            let (x0, y0, x1, y1) = copy.region.resolve(sw, sh);
+            blit(
+                &Surface {
+                    width: source.width,
+                    height: source.height,
+                    rgba: source.rgba.clone(),
+                },
+                &mut surface,
+                x0,
+                y0,
+                x1,
+                y1,
+            );
+            targets.insert_snapshot_cpu(
+                copy.id,
+                Texture {
+                    width: surface.width,
+                    height: surface.height,
+                    rgba: surface.rgba,
+                },
+            );
         }
     }
 
@@ -262,6 +380,8 @@ pub(crate) fn plan(
                             &mut vertices,
                             &mut acc,
                             &overrides,
+                            &text_override_ids,
+                            &copy_text_sources,
                             uploaded_overrides,
                             &mut transition_bind_groups,
                             &mut transition_buffers,
@@ -285,6 +405,8 @@ pub(crate) fn plan(
                             vertices: &mut vertices,
                             acc: &mut acc,
                             overrides: &overrides,
+                            text_override_ids: &text_override_ids,
+                            copy_text_sources: &copy_text_sources,
                             uploaded_overrides,
                             counted: true,
                             backbuffer,
@@ -320,6 +442,8 @@ pub(crate) fn plan(
                             vertices: &mut vertices,
                             acc: &mut acc,
                             overrides: &overrides,
+                            text_override_ids: &text_override_ids,
+                            copy_text_sources: &copy_text_sources,
                             uploaded_overrides,
                             counted: true,
                             backbuffer,
@@ -376,6 +500,8 @@ pub(crate) fn plan(
                 vertices: &mut vertices,
                 acc: &mut acc,
                 overrides: &overrides,
+                text_override_ids: &text_override_ids,
+                copy_text_sources: &copy_text_sources,
                 uploaded_overrides,
                 counted: true,
                 backbuffer,
@@ -419,6 +545,8 @@ pub(crate) fn plan(
                 vertices: &mut vertices,
                 acc: &mut acc,
                 overrides: &overrides,
+                text_override_ids: &text_override_ids,
+                copy_text_sources: &copy_text_sources,
                 uploaded_overrides,
                 counted: true,
                 backbuffer,
@@ -526,6 +654,140 @@ fn live_snapshots(frame: &CompositorFrame) -> BTreeSet<CopyId> {
     live
 }
 
+/// 快照 CPU 镜像预捕获(1.4 段;DIV-GFX-058)。
+///
+/// 与 soft `apply_copy_op` 同一构造:目标尺寸(目标层显式尺寸,否则源面
+/// 尺寸)+ 源区域裁剪写 (0,0)。只覆盖 CPU 可得源;组/后缓冲源与命令后
+/// 才可用的镜像组合不在此列(需要时显式报缺,不猜)。
+fn capture_copy_mirror(
+    frame: &CompositorFrame,
+    textures: &mut TextureStore,
+    targets: &mut TargetSet,
+    copy: &CopyOp,
+) {
+    let CopySource::Layer(source_layer) = &copy.source else {
+        return;
+    };
+    let source: Texture = {
+        let texture_ref = frame
+            .layers
+            .iter()
+            .find(|layer| layer.id == *source_layer)
+            .map(|layer| &layer.texture)
+            .filter(|t| !matches!(t, TextureRef::None))
+            .or(copy.source_texture.as_ref());
+        let Some(texture_ref) = texture_ref else {
+            return;
+        };
+        match texture_ref {
+            TextureRef::Asset(key) => match textures.resolve(key) {
+                Ok(texture) => texture.clone(),
+                Err(_) => return,
+            },
+            TextureRef::SolidBlack1x1 => Texture::solid_black_1x1(),
+            TextureRef::Snapshot(pid) => match targets.snapshot_cpu(*pid) {
+                Some(texture) => texture.clone(),
+                None => return,
+            },
+            TextureRef::None | TextureRef::Offscreen(_) => return,
+        }
+    };
+    let (sw, sh) = (source.width, source.height);
+    let (width, height) = frame
+        .layers
+        .iter()
+        .find(|layer| layer.id == copy.dest)
+        .and_then(|layer| layer.image_size())
+        .map(|size| (size.width, size.height))
+        .unwrap_or((sw, sh));
+    let mut surface = Surface::new(width, height, [0, 0, 0, 0]);
+    let (x0, y0, x1, y1) = copy.region.resolve(sw, sh);
+    blit(
+        &Surface {
+            width: source.width,
+            height: source.height,
+            rgba: source.rgba.clone(),
+        },
+        &mut surface,
+        x0,
+        y0,
+        x1,
+        y1,
+    );
+    targets.insert_snapshot_cpu(
+        copy.id,
+        Texture {
+            width: surface.width,
+            height: surface.height,
+            rgba: surface.rgba,
+        },
+    );
+}
+
+/// 图层文本合成的 CPU 基面(wgpu 版;与 soft 的 `layer_base` 同一支持范围:
+/// 资产/1×1 黑/无纹理/快照镜像;离屏组显式拒绝)。
+fn layer_base_cpu(
+    textures: &mut TextureStore,
+    targets: &TargetSet,
+    layer: &Layer,
+) -> Result<Texture, String> {
+    match &layer.texture {
+        TextureRef::Asset(key) => textures
+            .resolve(key)
+            .map_err(|d| d.code.to_string())
+            .cloned(),
+        TextureRef::SolidBlack1x1 => Ok(Texture::solid_black_1x1()),
+        TextureRef::None => {
+            let size = layer
+                .image_size()
+                .ok_or_else(|| "text.layer_size_unknown".to_string())?;
+            Ok(Texture {
+                width: size.width,
+                height: size.height,
+                rgba: vec![0; (size.width as usize) * (size.height as usize) * 4],
+            })
+        }
+        TextureRef::Snapshot(copy_id) => targets
+            .snapshot_cpu(*copy_id)
+            .cloned()
+            .ok_or_else(|| "snapshot.cpu_mirror_missing".to_string()),
+        TextureRef::Offscreen(_) => Err("text.layer_source_unsupported".to_string()),
+    }
+}
+
+/// COPY 冻结文本的基面(源层可能已被 `CGEND` 删除,回退命令时刻的
+/// `source_texture`;DIV-GFX-058)。
+fn copy_source_base_cpu(
+    frame: &CompositorFrame,
+    textures: &mut TextureStore,
+    targets: &TargetSet,
+    copy: &CopyOp,
+    source_layer: &LayerId,
+) -> Result<Texture, String> {
+    let texture_ref = frame
+        .layers
+        .iter()
+        .find(|layer| layer.id == *source_layer)
+        .map(|layer| &layer.texture)
+        .filter(|t| !matches!(t, TextureRef::None))
+        .or(copy.source_texture.as_ref())
+        .ok_or_else(|| "gfx.copy.source.gone".to_string())?;
+    match texture_ref {
+        TextureRef::Asset(key) => textures
+            .resolve(key)
+            .map_err(|d| d.code.to_string())
+            .cloned(),
+        TextureRef::SolidBlack1x1 => Ok(Texture::solid_black_1x1()),
+        TextureRef::Snapshot(copy_id) => targets
+            .snapshot_cpu(*copy_id)
+            .cloned()
+            .ok_or_else(|| "snapshot.cpu_mirror_missing".to_string()),
+        TextureRef::None | TextureRef::Offscreen(_) => {
+            Err("text.copy_base.unsupported".to_string())
+        }
+    }
+}
+
 fn snapshot_of(frame: &CompositorFrame, id: &LayerId) -> Option<CopyId> {
     frame
         .layers
@@ -565,6 +827,10 @@ struct Planner<'a> {
     vertices: &'a mut Vec<Vertex>,
     acc: &'a mut Accum,
     overrides: &'a BTreeMap<LayerId, Override>,
+    /// 文本覆盖层集合(COPY 取源面时跳过;DIV-GFX-058)。
+    text_override_ids: &'a BTreeSet<LayerId>,
+    /// COPY 冻结文本源面(1.6 段合成;plan_copy 上传使用)。
+    copy_text_sources: &'a BTreeMap<CopyId, Rc<Texture>>,
     uploaded_overrides: &'a mut BTreeMap<LayerId, (u64, u32, u32, u64)>,
     transition_bind_groups: &'a mut Vec<wgpu::BindGroup>,
     transition_buffers: &'a mut Vec<wgpu::Buffer>,
@@ -1005,7 +1271,23 @@ impl Planner<'_> {
         let source = match &copy.source {
             CopySource::Group(id) if Some(id) == main_group => self.backbuffer_image()?,
             CopySource::Group(id) => self.group_image(id)?,
-            CopySource::Layer(id) => self.layer_image(id, Some(copy))?,
+            CopySource::Layer(id) => match self.copy_text_sources.get(&copy.id) {
+                // 冻结文本已合成(1.6 段):直接上传为 COPY 源。
+                Some(texture) => {
+                    let gpu_id = self
+                        .gpu
+                        .upload(
+                            self.ctx,
+                            texture.width,
+                            texture.height,
+                            &texture.rgba,
+                            "copy frozen texts",
+                        )
+                        .map_err(|diag| diag.code.to_string())?;
+                    (gpu_id, texture.width, texture.height)
+                }
+                None => self.layer_image(id, Some(copy))?,
+            },
         };
         // 已捕获的快照**冻结**(EVID-T-12,与 soft 的 `snapshots.contains_key`
         // 早退同义):命令段每帧都会重放这条 CopyOp,若再推一次 GPU 复制,
@@ -1137,6 +1419,9 @@ impl Planner<'_> {
             first_vertex,
             color: color.map(f32::to_bits),
         });
+        // GPU 原地加工后 CPU 镜像已过时:删除而不是保留旧像素(DIV-GFX-058;
+        // gfx 侧已执行加工同时清掉该层文本,正常不会再用镜像,防呆)。
+        self.targets.invalidate_snapshot_cpu(copy_id);
         Ok(())
     }
 
@@ -1203,7 +1488,14 @@ impl Planner<'_> {
         id: &LayerId,
         fallback: Option<&CopyOp>,
     ) -> Result<(u64, u32, u32), String> {
-        if let Some(ov) = self.overrides.get(id) {
+        // 文本覆盖纹理不作为 COPY 源(DIV-GFX-058):快照面 = 基图(+图像
+        // 加工)+ 命令时刻冻结的 `copy.texts`,不带帧末实时文本。转场取样
+        // (`plan_transition`)不受此限制 —— 引擎取样当前像素,含已画文本。
+        if let Some(ov) = self
+            .overrides
+            .get(id)
+            .filter(|_| !self.text_override_ids.contains(id))
+        {
             // 加工后的图层:内容未变时复用跨帧 GPU 纹理,避免逐帧重传。
             let texture = &ov.tex;
             let hash = ov.hash;
@@ -1691,6 +1983,8 @@ fn plan_group_compose(
     vertices: &mut Vec<Vertex>,
     acc: &mut Accum,
     overrides: &BTreeMap<LayerId, Override>,
+    text_override_ids: &BTreeSet<LayerId>,
+    copy_text_sources: &BTreeMap<CopyId, Rc<Texture>>,
     uploaded_overrides: &mut BTreeMap<LayerId, (u64, u32, u32, u64)>,
     transition_bind_groups: &mut Vec<wgpu::BindGroup>,
     transition_buffers: &mut Vec<wgpu::Buffer>,
@@ -1727,6 +2021,8 @@ fn plan_group_compose(
             vertices,
             acc,
             overrides,
+            text_override_ids,
+            copy_text_sources,
             uploaded_overrides,
             counted: false,
             backbuffer,

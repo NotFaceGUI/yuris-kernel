@@ -213,8 +213,27 @@ fn cgact_text_becomes_a_layer_draw() {
     assert_eq!(draw.style.color, 0x00_FF00);
     assert_eq!(draw.composite_passes(), 9, "REA FUN_004056b8: SET=1 → 9 次");
 
-    // 每帧重建(ERIS 每帧重发全部字符)。
+    // 跨帧持久(DIV-GFX-058:官方写层表面,画一次即常驻)。
     gfx.on_event(&frame_start(1));
+    assert_eq!(gfx.frame().text_draws.len(), 1);
+
+    // 同层同参重发 = 精确去重(对话逐字路径每帧重发,可见结果不变)。
+    gfx.on_event(&call(
+        0,
+        "CGACT",
+        vec![
+            arg(&t, "CGACT", "ID", s("TX")),
+            arg(&t, "CGACT", "TEXT", i(1)),
+            arg(&t, "CGACT", "SET", i(1)),
+            arg(&t, "CGACT", "SETSTR", s("A")),
+            arg(&t, "CGACT", "X", i(2)),
+            arg(&t, "CGACT", "Y", i(3)),
+        ],
+    ));
+    assert_eq!(gfx.frame().text_draws.len(), 1, "重复命令去重");
+
+    // 层删除清除(CGEND)。
+    gfx.on_event(&call(0, "CGEND", vec![arg(&t, "CGEND", "ID", s("TX"))]));
     assert!(gfx.frame().text_draws.is_empty());
 }
 

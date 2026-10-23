@@ -22,7 +22,7 @@ use crate::layer::LayerId;
 ///
 /// 默认值来自 REA `FUN_00464fac`:SX=SY=20、COLOR=COLOR2=0xffffff、
 /// ANTIALIASING=1、GRADATION=1、ROTATION=0、DRAWMODE=0、BOLD=0。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TextStyle {
     /// `NAME`(CP932 原始字节;`None` = 未设置)。
     pub name: Option<Vec<u8>>,
@@ -59,7 +59,7 @@ pub struct TextStyle {
 }
 
 /// 描边样式(模型占位;像素语义归字体/后端会话)。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TextStroke {
     /// 0xRRGGBB。
     pub color: u32,
@@ -286,7 +286,41 @@ impl TextDraw {
             3
         }
     }
+
+    /// 命令时刻去重键(不含 `target`:键控按目标层分桶)。
+    ///
+    /// 官方 `CGACT[TEXT]` 即时写层表面;同层同参的重复命令在像素上**不是**
+    /// 幂等的(`FONT[DRAWMODE=1]` 下重复合成会加深),因此跨帧持久的绘制项
+    /// 必须按本键精确去重(DIV-GFX-055 预登记;P8 取证 es_Text.yst 每帧
+    /// 重发同集合,去重后逐像素等价)。
+    pub fn dedup_key(&self) -> TextDrawKey {
+        TextDrawKey {
+            bytes: self.bytes.clone(),
+            x: self.x,
+            y: self.y,
+            set: self.set,
+            bno: self.bno,
+            style: self.style.clone(),
+        }
+    }
 }
+
+/// [`TextDraw::dedup_key`] 的键型(精确相等 = 同层同参重复命令)。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TextDrawKey {
+    bytes: Vec<u8>,
+    x: i64,
+    y: i64,
+    set: i64,
+    bno: Option<i64>,
+    style: TextStyle,
+}
+
+/// 单层持久文本绘制项的硬上限(DIV-GFX-055 预登记“加去重/上限”)。
+///
+/// 语料规模参考:对话一页 ~ 数千(逐字 + 影/轮廓/填色),存读档 8 板 ×
+/// 16 行 × ≤6 条 ≈ 768。超限丢最旧并在诊断里显式计数,不静默无界。
+pub const MAX_TEXT_DRAWS_PER_LAYER: usize = 16_384;
 
 /// 按 `_TEXT_FLAG` 逐字排版(等价于引擎逐字标志流)。
 ///

@@ -58,6 +58,8 @@ fn split_at(value: &str) -> Result<(u64, PathBuf), String> {
 }
 
 struct Probe {
+    /// 后端选择(P8 起为 GPU 诊断保留;默认 soft)。
+    backend: Backend,
     frames: u32,
     clicks: Vec<(u64, i64, i64)>,
     shots: Vec<(u64, PathBuf)>,
@@ -100,6 +102,10 @@ impl Probe {
         let root = args.positional(0).ok_or_else(|| {
             "用法: input_probe <project-root> [--frames N] [--click F,X,Y]".to_string()
         })?;
+        let backend = match args.flag("backend") {
+            Some(value) => Backend::parse(&value).map_err(|error| error.to_string())?,
+            None => Backend::Soft,
+        };
         let frames = match args.flag("frames") {
             Some(value) => to_u64(&value, "frames")? as u32,
             None => 400,
@@ -108,6 +114,7 @@ impl Probe {
         Ok((
             PathBuf::from(root),
             Probe {
+                backend,
                 frames: frames.max(1),
                 clicks,
                 shots,
@@ -148,7 +155,7 @@ fn run() -> Result<(), String> {
     let mut engine = Engine::new(
         project,
         EngineOptions {
-            backend: Backend::Soft,
+            backend: probe.backend,
             record_events: false,
             ..EngineOptions::default()
         },

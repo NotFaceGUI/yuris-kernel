@@ -5601,3 +5601,246 @@ open ×8:002(表达式逐位)、003(除零上游取证)、005(官方错误继续
 011(`STRTYPE/SJISCODE/UTF8CODE`、`VAR`)、015(`TEXTPOS/RESTART`)、
 046(`ERROR` 表消费者);blocked ×1:042(`DomainCall` 引用身份);
 fixed/partial ×1:045(`REGINFO`/`YMVINFO` 需宿主)。
+
+## 成果 P7 续 (2026-10-23) · 运行期 Fatal 双根因修复:MATH[LET] 下标丢失 + VARACT 旗标存在性
+
+> 承 P7 台账对账;用户桌面实跑驱动取证。净室;零 git 写操作。
+> 明文源码在 `<project-eris>/save/data/script/ERIS/`(官方 demo 自带)。
+
+### 1. `rt.expr.div_zero` @ es_select.yst:153(S2/S3 上游;DIV-RT-003 收口)
+
+- 链条:`@1118` = `@es.POW2`(`global.yst:208`,int[63] 2 的幂表);填充 =
+  `es_First.yst:145` 的 `LOOP[SET=63] MATH[POW=1 SET=2 SET2=@_LC-1
+  LET=@es.POW2(@_LC-1)]`(MATH 命令 LET 窗口写,表达式级扫描无写者)。
+- 根因:`op_math` 丢弃 LET 目标下标 ⇒ 63 次写全落 `[0]`(探针实证
+  `POW2[0]=2^62`、其余 0)。修复:保留 `LValue.indices` 写回。
+- 勘误:前一轮「上游分歧绊线/只剩官方 trace」结论作废——官方表填得对。
+- 附属取证:`@2264` = `@es.SELD`(選択履歴,`seld.sd` 块值 `[1]=6`)。
+- 回归:`fixture::math_let_writes_indexed_array_element`。
+
+### 2. `rt.cmd.slot VARACT 缺 LET` @ es_logset.yst(DIV-RT-019 续收口)
+
+- 现场:s33 `pc46..49` = `VARACT[SET=$… PUSH=0]`(LOG 记录入栈,位置 0);
+  旧守卫「旗标值 ≠ 0」把 `PUSH=0` 误判为无参 ⇒ 掉进字符串加工分支。
+- 修复(统一对齐,非逐点补丁):`op_varact` 全部旗标分支
+  (TYPE/COPY/CUT/UPPER/LOWER/HANTOZEN/ZENTOHAN/DIMSIZE/PUSH/POP)改为
+  **参数存在性判定**(与 DIV-RT-024 INIT、DIV-RT-044 DIALOG 同族语义)。
+- 回归:`fixture::varact_push_zero_is_presence_not_value`。
+
+### 3. 取证工具(留工作树供审阅)
+
+`yu-format/examples/dump_yssd_var.rs`(官方 .sd 按变量 id 扫块)、
+`yu-rt/examples/dump_var_int.rs`(变量元素倾倒)、
+`yu-rt/examples/dump_label_cmds.rs`(标签反汇编 + `scan:<sid>` 全脚本命令扫描,
+封包优先口径)。
+
+### 4. 门禁(原始输出)
+
+```text
+$ cargo test -p yu-rt
+64 lib + 4 + 11 corpus(真实语料) + 4 + 65 fixture + 3 golden —— 全 ok
+
+$ cargo build --release -p yu-host-desktop   # 含双修复的桌面宿主
+```
+
+### 5. 挂账
+
+- **DIV-GFX-058(新档案)**:COPY/按钮快照不携带源层文本覆盖 —— S4 存读档
+  界面行文本空白的机制(官方 CGACT[TEXT] 即时写表面、COPY 天然携带;本核
+  文本是渲染期覆盖层,`copy_attributes` 不带文本)。归 H-P2-05 gfx 子项。
+- 台账未更新面:`crates/yu-gfx/docs/divergences/README.md` 的 DIV-GFX-012
+  (P2 已落地字形执行,状态仍 unimplemented)等 gfx 侧对账另行一轮。
+
+## 成果 P7 续 2 (2026-10-23) · 审查轮收口:旗标存在性族(MATH 捕获 / INIT 守卫 / LABELINFO 下标)
+
+> 承 P7 续审查;按旁线 `format-vm-opcodes.md` §3.20/§3.26 反汇编判据对齐。
+> 新档案 `DIV-RT-049`(细节见该条目)。
+
+1. **A1 `op_math`**:旗标捕获改存在性;函数选择改**官方判定链原序**
+   (`4,7,10,5,8,6,9,13,11,12,14..21`,与槽位序不同);补 `HASH`
+   (标准 CRC-32,新增 `src/hash.rs`,检查值 0xCBF43926 单测钉住)、
+   `ABS` 整数路、`SETSTR`=HASH 输入(旧 Unimplemented 作废);
+   结果带类型(ABS 整数/RND/HASH = 整数写,余浮点写)。
+2. **A2 `op_varact`**:INIT 守卫与 G_* 掩码构造改**在场字节**口径
+   (`0x454d3d movzx eax,byte ptr [0x684171]`;INIT 缺席 = `je` 函数尾)。
+3. **A3 `op_labelinfo`**:LET 保留 `LValue` 下标,`write_target` 写回
+   (原 `store.write(t,&[],…)` 标量化)。
+4. 语料级核对:`scanmath` 扫封包全 137 脚本 —— MATH 21 处旗标全 =1、
+   SETSTR 窗口 0、无 INIT=0/G_*=0 ⇒ 三处均潜伏,修复对现语料零行为差。
+5. 门禁:`cargo test -p yu-rt` 全绿(65 lib + 4 + 11 corpus + 4 + 68 fixture
+   + 3 golden,含新回归 `math_flag_zero_value_still_selects_function` /
+   `varact_init_zero_value_still_restores` / `labelinfo_let_writes_indexed_element`);
+   release `yu-desktop` 已重编。
+
+## 成果 P7 续 3 (2026-10-23) · 全项目审查第二轮:宿主门禁 Fatal 断言 + 浮点除零勘误 + 裸 WAIT + gfx 台账对账
+
+> 范围:yu-cli(case 门禁)、yu-rt(value/wait)、文档。取证先行;零 git 操作。
+
+### 1. H1 · case 门禁 Fatal 盲区(宿主基础设施)
+
+- 审查实锤:`case.rs`(590 行)零引用 diag/fatal —— 主任务被 Fatal 冻结后
+  像素不变照样 PASS(S2 除零即如此存活数周)。
+- 修复:expect 新增 **`fatal_codes`**(字符串数组)= 实际 Fatal 诊断码集合
+  (去重升序;`Engine::take_diag_report()`,含 `script_errors`)逐项相等;
+  `[]` = 断言无 Fatal。8 个既有用例全部加 `"fatal_codes": []`。
+- 首轮实战:`case --all` 5 过 3 陈旧(symptom-* 因 Fatal 修复后流程前进,
+  ops 158→173 / 450→455 / 196→206)——**新断言同时证明三条流的 Fatal 集合
+  已为空**;按用例自带说明 `--update` 重生成后 **8/8 PASS**。
+
+### 2. H2 · 浮点除零勘误(DIV-RT-002 族)
+
+- `value.rs` 曾把 `x/0.0` 返回 `0.0`;x87 除零异常默认掩蔽 ⇒ IEEE-754
+  结果 = ±Inf(符号随被除数)、0/0=NaN。已按 IEEE 修正 + 单测
+  `float_div_zero_follows_ieee754`(±Inf 符号与 NaN 各断言)。
+
+### 3. M1 · 裸 `WAIT[]` ⇒ 让出一帧(Likely)
+
+- 手册 `control/wait.html` 只定义 TIME/FRAME;`basic/task.html` 明文
+  「ウェイト命令…一旦休憩します(約0.016秒)」⇒ 无参取 1 帧;
+  语料 95 处全带参(FRAME×81/TIME×14),零行为差。
+  回归:`fixture::bare_wait_yields_one_frame`。
+
+### 4. L1/L2 · 卫生与台账
+
+- hardcode 审计唯一违规(vm.rs 诊断文案含 `ysbin/ysc.ybn`)改写归零;
+- gfx 台账对账:012/034/040 翻 fixed(P2 落地)、035 → partial、
+  补建 P2 声称的 056(行距/基线 Likely)/057(屏幕级文本叠加 Likely)。
+
+### 5. 门禁(原始输出)
+
+```text
+$ cargo test -p yu-rt
+66 lib + 4 + 11 corpus + 4 + 69 fixture + 3 golden —— 全 ok
+$ cargo test -p yu-cli         —— 10 passed(yu-cli lib)
+$ cargo clippy -p yu-rt -p yu-cli --all-targets --no-deps  —— 0 warning
+$ cargo fmt -p yu-rt -p yu-cli -- --check   —— clean
+$ python crates/yu-rt/scripts/audit_hardcode.py —— violations=0
+$ yu-cli case <project-eris> --all —— 8 passed; 0 failed
+$ cargo build --release -p yu-host-desktop   —— 含本轮全部修复
+```
+
+### 6. 未闭合(审查移交)
+
+- M2:`audit_hardcode.py` 仅护 yu-rt;其余 crate 的 unwrap/stdout 卫生
+  需模块感知审计脚本(计数 vfs 69/trace 67/yu-cli 43,含测试块);
+- DIV-RT-042(引用身份)、DIV-GFX-058(按钮文本,P8 任务书已就绪)、
+  DIV-RT-002 其余逐位项(x87 路径判据/舍入)照旧挂账。
+
+## 成果 P8 (2026-10-23) · 按钮/对话字体不显示:三层根因修复 + 文本烘焙性能契约
+
+> 任务书 `docs/tasks/task-p8-button-text-copy.md`;但执行中主人桌面实测(官方截图对比)
+> 证明现象不止 DIV-GFX-058 一条,追加取证后修了三层根因(058 + 059 + 合成缓存)。
+> 文件:只动 `yu-gfx` / `yu-render/{soft,wgpu}`(+ `yu-font` 未改);
+> `yu-rt`/`yu-cli`/`yu-save` 未改(临时加在 `yu-cli/examples/input_probe.rs` 的
+> 诊断字段已还原)。零 git 写操作;证据产物在 `target/tmp/p8/`。
+
+### 1. 结论(先看这里)
+
+- **按钮/选项文字恢复**:根因不是 COPY 丢字,而是 `FONT[NAME=""]`(空字体名)被当作
+  “名字为空字符串的字体” → `find_family("")=None` → `text.font_missing` → **零字形**。
+  官方 FONT 处理器对 NAME 做名字查找,查不到落**槽默认 family**(回退表
+  `0x403b8e..0x403bdc`)。修复后选项菜单/设定界面全部文字可见(soft/wgpu 同帧一致)。
+- **影子“画了两遍”**:REA 复核 FONT 颜色 clamp 为 `clamp(v,0,0xFFFFFF)`(负数→0,
+  `0x444620..0x44464a` 的 SBB/JL + `MOV EAX,0xFFFFFF`);`es._txcolor` 的
+  `FONT[COLOR2=-1]` 哨兵官方结果是**纯黑**。旧位掩码 `&0xFFFFFF` 把 -1 变白,
+  影子成了黑→白渐变亮重影。改为带符号 clamp 后影子为实色黑,与官方一致。
+- **持久文本的性能契约**:`CGACT[TEXT]` 按官方“烘焙进层表面”语义改为跨帧持久后,
+  逐帧重烤让菜单帧 render 48-65ms(soft 59-79ms)。新增 `compose_layer_cached`
+  (层 + `text_revisions` + 基面身份)+ 失效规则后 **wgpu 1.6-2.0ms**、soft 回到
+  既有底噪(约 25ms,94 passes 的 CPU 光栅,属既有开销)。
+- **修订号必须全局单调**:首版按层从 0 计数,文本项被 `BT.CGCLEAR`/COPY 清除后重建会
+  复用旧号 → 缓存撞键(二级菜单文字/点击换色停在旧合成);改为全局发号器,清除即换
+  新号,层重建也不复用。修复后父菜单→子菜单文字正确更新。
+- **title 600 帧红线保持**:soft/wgpu 与 P8 前基线逐帧 0 差异(600/600),双端互为 0 差异。
+- **S4 存档界面**:板/锁图标/底栏正常;板内浅色文字是开界面前一帧的**后缓冲截图**
+  50% 暗化的背景(`COPY2 :/W0 -> SLTEMP/CGS1`,EVID-J3-06),与官方截图背景机制一致;
+  空槽无描述文本 ⇒ 板内标签为空正确。**既读色**(点过变蓝)依赖 `es.SELD` 经
+  `SAVE/LOAD[FILE="seld.sd"]` 持久化 = SAVE 域(DIV-RT-042),未在 P8 动。
+
+### 2. 改动
+
+`crates/yu-gfx`
+- `state.rs`:`text_draws` 改为 `LayerTexts{draws,seen,revision}` 跨帧持久 +
+  命令时刻精确去重 + 每层上限 16384;失效 = `CGEND`/`CG(FILE)`/Executable
+  `CGACT[COPY]` 目标/Executable 图像加工目标(`BT.CGCLEAR`)/`SWAP`(交换并改写
+  `TextDraw.target`);`CopyOp.texts` 命令时刻冻结源层文本。`FONT[NAME=""]` →
+  `name/font_no/font_bno` 清空(默认 family);`COLOR/COLOR2` 带符号 `clamp_color`
+  (REA 证据见 DIV-GFX-059)。
+- `text.rs`:`TextStyle/TextStroke` 加 `Hash`;`TextDraw::dedup_key`(`TextDrawKey`);
+  `MAX_TEXT_DRAWS_PER_LAYER`。
+- `op.rs`:`CopyOp.texts: Vec<TextDraw>`(内部字段,不进 JSON,沿用
+  `source_texture` 先例)。
+- `frame.rs`:`CompositorFrame.text_revisions`(缓存键,不进 JSON)。
+- `json.rs`:`to_json`/`to_display_json` 的 `text_layout`/`text_draws` 改为
+  `"text":[...]` 闭合后的帧级兄弟成员(旧写法在空 text 时产出非法 JSON)。
+
+`crates/yu-render/soft`
+- `text.rs`:`layer_base` 支持 `TextureRef::Snapshot`(快照层文本基面);
+  `resolve_face` 名字查找失败回落默认 family(`FaceFallback::Name`,
+  `text.font.name_fallback` 诊断);`compose_layer_cached` + `text_base_key` +
+  `texture_content_hash`。
+- `render.rs`:COPY 源面合成 `copy.texts`;`text_override_ids`(COPY 源跳过文本
+  覆盖,沿用图像加工覆盖);同一层每帧只合成一次;`blit` 导出供 wgpu 复用。
+
+`crates/yu-render/wgpu`
+- `textures.rs`:`TargetSet.snapshot_cpu` 快照 CPU 镜像(捕获时按目标尺寸+区域
+  裁剪构造;GPU 原地加工后失效;prune/clear 同步)。
+- `passes.rs`:1.4 段按命令序预捕获镜像;1.5 段文本基面读镜像 + `compose_layer_cached`;
+  1.6 段合成 `copy.texts` 为 COPY 源并落镜像;`layer_image` 跳过文本覆盖;
+  `plan_paint` 失效镜像。
+
+`crates/yu-render/soft/examples/frame_walk.rs`
+- 新增 `YURIS_WALK_CLICKS="frame:x:y,..."`(与 `yu-cli case` 的 inputs 同语义)与
+  dump 时写 display JSON;修正 `workspace_root` 的既有层数 bug(原先写到
+  `crates/target/tmp`)。
+
+### 3. 证据
+
+| 事实 | 证据 | 等级 |
+|---|---|---|
+| 空白文字的直接原因 `text.font_missing`/`glyphs=0` | 真实回放报告(`input_probe --full`,frame 500:draws=25/glyphs=0) | Confirmed |
+| `FONT[NAME=""]` 空名 | gfx 帧快照 `name=Some("")`;修后 `name=None, glyphs=175` | Confirmed |
+| NAME 查找失败 → 槽默认 family | REA FONT 表 `docs/font-provenance.md` §4.2(默认值=槽默认 family;回退表 `0x403b8e..0x403bdc`) | Confirmed(表)/Likely(空名路径) |
+| COLOR/COLOR2 = clamp(v,0,0xFFFFFF) | REA `0x444620..0x44464a` 指令(`SBB/JL/XOR` 负→0;`MOV EAX,0xFFFFFF` 封顶;`MOV [EDX*4+0x5d1708],EAX`) | Confirmed |
+| `es._txcolor` 发 `COLOR2=-1` 哨兵 | `stdlib/ystdlib.yst:706`(guard `>=-1`、`FONT[COLOR2=-1]`) | Confirmed |
+| 文本“烘焙进表面、画一次常驻” | 手册 `cg/cgact.html`;REA `0x404398→0x4046fc→0x404914→0x4056b8`(1/9/3 次表面合成);`'P'` 页断整面清零 | Confirmed |
+| COPY 携带已画文本 | 官方桌面截图(选项菜单/存档界面);EVID-T-15 命令时刻像素 | Confirmed |
+| 后端不需要逐帧重烤 | 实测 A/B:无缓存 48-65ms → 缓存 1.7-2.1ms(同画面同用例) | Confirmed |
+
+### 4. 验证原始输出
+
+```text
+$ cargo test -p yu-rt -p yu-gfx -p yu-font -p yu-backend-soft -p yu-backend-wgpu
+passed=380 failed=0(含新用例:soft render +3 微场景, wgpu +2 跨端微场景,
+group.rs +4 文本语义, text_pipeline 去重/持久断言)
+$ cargo clippy -p yu-gfx -p yu-font -p yu-backend-soft -p yu-backend-wgpu --all-targets
+0 warning(改动文件 rustfmt clean;既有 examples 的 fmt 欠账未动)
+600 帧 title(frame_walk / wgpu_frame_walk,与 target/tmp/p8/baseline-*.tsv 对比):
+soft 600/600 相同;wgpu 600/600 相同;soft vs wgpu 0 差异
+真实回放(input_probe,symptom-ingame-save 同时间线):
+修前 frame 500: TEXT draws=25 glyphs=0 diags=["text.font_missing"]
+修后 frame 500: TEXT draws=25 glyphs=175 diags=[]
+wgpu 菜单帧 render:修前 48-65ms → 修后 1.7-2.1ms
+```
+
+新画面(待主人批准后 `--update`):
+`target/tmp/p8/case-enter-story-f472.png`、`case-config-f542.png`、
+`case-save-f562.png`;官方对照:`target/tmp/p8/official-800x600.png`
+(用户截图 `image-623b6f05…png` 缩放)。
+
+### 5. 挂账 / 交接
+
+- **S4/设定/正文三个用例 expect 未更新**:按任务书硬门禁,新 display/PNG 已出图
+  待主人过目批准;`cases/symptom-{enter-story,ingame-config,ingame-save}.json`
+  expect 差异已实测(三个用例仅 hash/ops 像素变化,无 Fatal)。
+- **既读色(点过变蓝)**:`es.SELD` 由 `SAVE/LOAD[FILE="seld.sd" DNO=1]` 持久化;
+  `SAVE` 目前 `sv.write.refused`(DIV-RT-042 引用身份门禁)。需主人裁决跨 crate
+  契约,不在 P8 范围。
+- **`FONTINFO[NUM/LANG/NAME]`**(设置界面字体选择器)仍 Unimplemented:需要宿主
+  注入系统字体清单(引擎 `EnumFontFamiliesExA` 语义),属跨宿主接线。
+- **soft 菜单帧 24ms 底噪**属既有开销(94 passes/475 层的 CPU 光栅),与本次文本
+  无关;wgpu 为目标后端(1.7-2.1ms)。
+- **弹窗/存档背景透出上一屏**(主人桌面实测):场景 CGS 截图栈未清 —— `es.CGSSS`
+  的 `CGS1` 仍 visible/A=256 且内容为上一亮帧,官方背景为黑。已立
+  **DIV-RT-050**(`docs/divergences/DIV-RT-050-cgs-scene-screenshot-stack.md`),
+  待官方事件级 trace 定论;不在 P8 文本范围,未改代码。

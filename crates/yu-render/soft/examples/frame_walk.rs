@@ -44,11 +44,13 @@ fn run() -> Result<(), String> {
             YpfSource::open(&ypf, Codec::Cp932)
                 .map_err(|d| format!("打开 {} 失败: {}", ypf.display(), d.detail))?,
         ),
-        None => Box::new(
-            DirSource::open(&data_dir, Codec::Cp932).map_err(|d| {
-                format!("打开 {} 失败(且无 data.ypf): {}", data_dir.display(), d.detail)
-            })?,
-        ),
+        None => Box::new(DirSource::open(&data_dir, Codec::Cp932).map_err(|d| {
+            format!(
+                "打开 {} 失败(且无 data.ypf): {}",
+                data_dir.display(),
+                d.detail
+            )
+        })?),
     };
     let aux = DirSource::open(&root_path, Codec::Cp932)
         .map_err(|d| format!("打开 {} 失败: {}", root_path.display(), d.detail))?;
@@ -71,23 +73,24 @@ fn run() -> Result<(), String> {
         vm.tables().boot.config.height,
     );
     let state = Rc::new(RefCell::new(
-        GfxState::from_tables(vm.tables(), GfxConfig::new(viewport).with_dx_mode(dx_mode()))
-            .map_err(|d| format!("GfxState 构造失败: {}", d.detail))?,
+        GfxState::from_tables(
+            vm.tables(),
+            GfxConfig::new(viewport).with_dx_mode(dx_mode()),
+        )
+        .map_err(|d| format!("GfxState 构造失败: {}", d.detail))?,
     ));
     vm.set_graphics_host(Box::new(GfxHost::new(state.clone())));
 
     let mut mount = Mount::new(Codec::Cp932);
     if let Some(ypf) = ypf_path(&root_path) {
-        mount.push(Box::new(
-            YpfSource::open(&ypf, Codec::Cp932)
-                .map_err(|d| format!("打开 {} 失败: {}", ypf.display(), d.detail))?,
-        ));
+        mount.push(Box::new(YpfSource::open(&ypf, Codec::Cp932).map_err(
+            |d| format!("打开 {} 失败: {}", ypf.display(), d.detail),
+        )?));
     }
     if data_dir.is_dir() {
-        mount.push(Box::new(
-            DirSource::open(&data_dir, Codec::Cp932)
-                .map_err(|d| format!("打开 {} 失败: {}", data_dir.display(), d.detail))?,
-        ));
+        mount.push(Box::new(DirSource::open(&data_dir, Codec::Cp932).map_err(
+            |d| format!("打开 {} 失败: {}", data_dir.display(), d.detail),
+        )?));
     }
     let mut renderer = SoftRenderer::new(TextureStore::new(
         Box::new(mount),
@@ -101,10 +104,12 @@ fn run() -> Result<(), String> {
         .or_else(|| env::args().nth(1).and_then(|v| v.parse().ok()))
         .unwrap_or(600)
         .max(1);
-    let timeline = InputTimeline::new();
+    let timeline = walk_timeline();
     let dumps = dump_ticks();
 
-    println!("tick\tframe\tops\tdrawn\tskipped\ttransition\tcopy\timage\thash\tms\tvisible\tlayers");
+    println!(
+        "tick\tframe\tops\tdrawn\tskipped\ttransition\tcopy\timage\thash\tms\tvisible\tlayers"
+    );
     for tick in 0..ticks {
         let _ = vm.tick_at(tick.saturating_mul(16), &timeline);
         let _ = vm.take_events();
@@ -135,6 +140,9 @@ fn run() -> Result<(), String> {
             }
             let path = dir.join(format!("walk-soft-t{tick}.report.txt"));
             std::fs::write(&path, text).map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
+            let json = yu_gfx::json::to_display_json(&frame);
+            let path = dir.join(format!("walk-soft-t{tick}.json"));
+            std::fs::write(&path, &json).map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
         }
         println!(
             "{tick}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}",
@@ -207,11 +215,68 @@ fn dump_ticks() -> Vec<u32> {
         .unwrap_or_default()
 }
 
+/// 可选的点击时间线:`YURIS_WALK_CLICKS="frame:x:y,frame:x:y"`。
+///
+/// 与 `cases/*.json` 的 inputs 同语义(`yu-cli case` 的 build_timeline):
+/// 按下发生在 frame、frame+1 松开;光标从该帧起保持
+/// (`InputTimeline::effective`)。缺省 = 无输入(600 帧基线)。
+fn walk_timeline() -> InputTimeline {
+    use yu_rt::input::InputFrame;
+    let spec = env::var("YURIS_WALK_CLICKS").unwrap_or_default();
+    if spec.trim().is_empty() {
+        return InputTimeline::new();
+    }
+    // frame → 按下集合;frame+1 → 松开(显式空集)。
+    let mut presses: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
+    let mut cursors: std::collections::BTreeMap<u64, (i64, i64)> = Default::default();
+    for item in spec.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = item.split(':').collect();
+        let (Some(frame), Some(x), Some(y)) = (
+            parts.first().and_then(|v| v.parse::<u64>().ok()),
+            parts.get(1).and_then(|v| v.parse::<i64>().ok()),
+            parts.get(2).and_then(|v| v.parse::<i64>().ok()),
+        ) else {
+            panic!("YURIS_WALK_CLICKS 项 `{item}` 应为 frame:x:y");
+        };
+        presses
+            .entry(frame)
+            .or_default()
+            .push("MOUSE_L".to_string());
+        presses.entry(frame + 1).or_default();
+        cursors.insert(frame, (x, y));
+    }
+    let mut frames: std::collections::BTreeSet<u64> = presses.keys().copied().collect();
+    frames.extend(cursors.keys().copied());
+    let mut timeline = InputTimeline::new();
+    let mut held: Vec<String> = Vec::new();
+    let mut cursor = (0i64, 0i64);
+    for frame in frames {
+        if let Some(set) = presses.get(&frame) {
+            held = set.clone();
+        }
+        if let Some(&(x, y)) = cursors.get(&frame) {
+            cursor = (x, y);
+        }
+        timeline.set(
+            frame,
+            InputFrame::new(held.iter().cloned()).with_cursor(cursor.0, cursor.1),
+        );
+    }
+    timeline
+}
+
 fn workspace_root() -> PathBuf {
+    // 含 Cargo.toml 的**严格祖先** = workspace 根(包目录自身也有
+    // Cargo.toml,要跳过;固定层数会在嵌套路径下停错)。
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
-        .nth(2)
-        .expect("crates -> workspace root")
+        .skip(1)
+        .find(|dir| dir.join("Cargo.toml").is_file())
+        .expect("workspace root with Cargo.toml")
         .to_path_buf()
 }
 

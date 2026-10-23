@@ -8,6 +8,8 @@
 //!
 //! 证据与后端执行细节见 `docs/render-parity.md`。
 
+use std::collections::BTreeMap;
+
 use crate::error::FrameDiag;
 use crate::layer::{ImageFormat, Layer, LayerId, SizeU32};
 use crate::pass::Pass;
@@ -264,6 +266,11 @@ pub struct CompositorFrame {
     pub text_layout: Option<TextLayoutFrame>,
     /// `CGACT[TEXT=1]` 绘制项(按目标层 ID 稳定排序;层内保持命令序)。
     pub text_draws: Vec<TextDraw>,
+    /// 每层 `text_draws` 修订号(`CGACT[TEXT]` 内容每次实际改动 +1)。
+    ///
+    /// 后端用「层 + 修订号 + 基面身份」缓存文本合成结果:官方文本烘焙
+    /// 后不随帧变化(P8/DIV-GFX-058),逐帧重烤是纯浪费。
+    pub text_revisions: BTreeMap<LayerId, u64>,
     /// 本帧诊断(按 `(code, command, detail)` 稳定排序)。
     pub diagnostics: Vec<FrameDiag>,
 }
@@ -284,6 +291,7 @@ impl CompositorFrame {
             text: Vec::new(),
             text_layout: None,
             text_draws: Vec::new(),
+            text_revisions: BTreeMap::new(),
             diagnostics: Vec::new(),
         }
     }

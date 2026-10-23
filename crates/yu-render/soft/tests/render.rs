@@ -393,11 +393,15 @@ fn cgact_text_draws_into_layer() {
     let out = backend.render_frame(&frame);
     assert_eq!(out.report.text_draws, 1);
     assert_eq!(out.report.text_glyphs, 1);
-    assert!(
-        out.report.text_diags.is_empty(),
-        "{:?}",
-        out.report.text_diags
-    );
+    // `text.font_init` 是首刷必发的一次性信息诊断(P6 字体预热;非慢机也发
+    // `0ms`),不是错误;其余诊断(缺字/字体不可用)仍然失败。
+    let unexpected: Vec<&String> = out
+        .report
+        .text_diags
+        .iter()
+        .filter(|d| !d.starts_with("text.font_init: "))
+        .collect();
+    assert!(unexpected.is_empty(), "{:?}", out.report.text_diags);
     // 绿色字画进黑色图层:出现绿色通道占优的像素。
     let green = out
         .surface
@@ -761,4 +765,213 @@ fn png_bytes_for_wh(width: u32, height: u32, color: Rgba<u8>) -> Vec<u8> {
         .write_image(image.as_raw(), width, height, ExtendedColorType::Rgba8)
         .expect("encode fixture");
     out
+}
+
+// ---------------------------------------------------------------- DIV-GFX-058
+// 按钮快照与文本的时序微场景(官方:CGACT[TEXT] 写层表面,COPY 天然携带)。
+
+fn green_pixel_count(surface: &yu_backend_soft::Surface) -> usize {
+    surface
+        .rgba
+        .chunks_exact(4)
+        .filter(|px| px[1] > 0 && px[1] >= px[0] && px[1] >= px[2])
+        .count()
+}
+
+fn text_draw_event(table: &ParamTable, id: &[u8], x: i64) -> VmEvent {
+    call(
+        1,
+        "CGACT",
+        vec![
+            arg(table, "CGACT", "ID", Value::Str(id.to_vec())),
+            arg(table, "CGACT", "TEXT", Value::Int(1)),
+            arg(table, "CGACT", "SET", Value::Int(0)),
+            arg(table, "CGACT", "SETSTR", Value::Str(b"A".to_vec())),
+            arg(table, "CGACT", "X", Value::Int(x)),
+            arg(table, "CGACT", "Y", Value::Int(0)),
+        ],
+    )
+}
+
+fn copy2_event(table: &ParamTable, src: &[u8], dst: &[u8]) -> VmEvent {
+    call(
+        1,
+        "CGACT",
+        vec![
+            arg(table, "CGACT", "ID", Value::Str(src.to_vec())),
+            arg(table, "CGACT", "ID2", Value::Str(dst.to_vec())),
+            arg(table, "CGACT", "COPY2", Value::Int(1)),
+        ],
+    )
+}
+
+/// 微场景 1(先文本后 COPY):快照携带命令时刻已画的文本,且跨帧保留。
+#[test]
+fn snapshot_after_text_carries_frozen_glyphs() {
+    let table = table();
+    let mut gfx = state(Viewport::new(16, 16), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"SRC".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"dark".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+                arg(&table, "CG", "SX", Value::Int(16)),
+                arg(&table, "CG", "SY", Value::Int(16)),
+            ],
+        ),
+        call(
+            1,
+            "FONT",
+            vec![
+                arg(&table, "FONT", "SX", Value::Int(16)),
+                arg(&table, "FONT", "SY", Value::Int(16)),
+                arg(&table, "FONT", "COLOR", Value::Int(0x00_FF00)),
+            ],
+        ),
+        text_draw_event(&table, b"SRC", 0),
+        copy2_event(&table, b"SRC", b"DST"),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+
+    let mut backend = SoftRenderer::new(texture_store(&[(
+        b"dark.png",
+        png_bytes_for_wh(16, 16, Rgba([0, 0, 0, 255])),
+    )]));
+    if !backend.text_composer().available() {
+        println!("SKIP snapshot_after_text_carries_frozen_glyphs: no system font");
+        return;
+    }
+    let out = backend.render_frame(&gfx.frame());
+    assert!(
+        green_pixel_count(&out.surface) > 0,
+        "快照必须携带命令时刻已画的文本(源层不可见 ⇒ 绿字只能来自快照面)"
+    );
+
+    // 跨帧:快照冻结(EVID-T-12),不随后续帧变化;帧 2 无命令重放同帧。
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 2 },
+        VmEvent::FrameEnd { frame: 2 },
+    ]);
+    let out2 = backend.render_frame(&gfx.frame());
+    assert!(green_pixel_count(&out2.surface) > 0, "快照跨帧保留文本");
+}
+
+/// 微场景 2(先 COPY 后文本):命令之后才画的文本不得进入快照
+/// (DIV-GFX-053 同门:命令时刻冻结)。
+#[test]
+fn text_after_copy_does_not_enter_snapshot() {
+    let table = table();
+    let mut gfx = state(Viewport::new(16, 16), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"SRC".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"dark".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+                arg(&table, "CG", "SX", Value::Int(16)),
+                arg(&table, "CG", "SY", Value::Int(16)),
+            ],
+        ),
+        call(
+            1,
+            "FONT",
+            vec![
+                arg(&table, "FONT", "SX", Value::Int(16)),
+                arg(&table, "FONT", "SY", Value::Int(16)),
+                arg(&table, "FONT", "COLOR", Value::Int(0x00_FF00)),
+            ],
+        ),
+        copy2_event(&table, b"SRC", b"DST"),
+        text_draw_event(&table, b"SRC", 0),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+
+    let mut backend = SoftRenderer::new(texture_store(&[(
+        b"dark.png",
+        png_bytes_for_wh(16, 16, Rgba([0, 0, 0, 255])),
+    )]));
+    if !backend.text_composer().available() {
+        println!("SKIP text_after_copy_does_not_enter_snapshot: no system font");
+        return;
+    }
+    let out = backend.render_frame(&gfx.frame());
+    assert_eq!(
+        green_pixel_count(&out.surface),
+        0,
+        "COPY 之后才画的文本不得进入快照;源层不可见 ⇒ 屏幕不应出现绿字"
+    );
+
+    // 跨帧:文本持久(DIV-GFX-058)但快照仍冻结在命令时刻。
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 2 },
+        VmEvent::FrameEnd { frame: 2 },
+    ]);
+    let out2 = backend.render_frame(&gfx.frame());
+    assert_eq!(green_pixel_count(&out2.surface), 0);
+    assert_eq!(gfx.frame().text_draws.len(), 1, "源层文本跨帧保留");
+}
+
+/// 微场景 3(S4 按钮标签形状):文本直接画在快照精灵层上,画一次、
+/// 跨帧常驻(官方烘焙语义;P8 修复的直接验收路径)。
+#[test]
+fn text_on_snapshot_layer_persists_across_frames() {
+    let table = table();
+    let mut gfx = state(Viewport::new(16, 16), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"BTN".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"dark".to_vec())),
+                arg(&table, "CG", "SX", Value::Int(16)),
+                arg(&table, "CG", "SY", Value::Int(16)),
+            ],
+        ),
+        copy2_event(&table, b"BTN", b"LBL"),
+        call(
+            1,
+            "FONT",
+            vec![
+                arg(&table, "FONT", "SX", Value::Int(16)),
+                arg(&table, "FONT", "SY", Value::Int(16)),
+                arg(&table, "FONT", "COLOR", Value::Int(0x00_FF00)),
+            ],
+        ),
+        text_draw_event(&table, b"LBL", 0),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+
+    let mut backend = SoftRenderer::new(texture_store(&[(
+        b"dark.png",
+        png_bytes_for_wh(16, 16, Rgba([0, 0, 0, 255])),
+    )]));
+    if !backend.text_composer().available() {
+        println!("SKIP text_on_snapshot_layer_persists_across_frames: no system font");
+        return;
+    }
+    let out = backend.render_frame(&gfx.frame());
+    assert!(
+        green_pixel_count(&out.surface) > 0,
+        "快照精灵层上的标签文本必须显示(P8 修复前 layer_base 拒绝 Snapshot 源)"
+    );
+
+    // 帧 2(无任何命令):官方标签画一次即常驻。
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 2 },
+        VmEvent::FrameEnd { frame: 2 },
+    ]);
+    let out2 = backend.render_frame(&gfx.frame());
+    assert!(
+        green_pixel_count(&out2.surface) > 0,
+        "标签文本跨帧常驻(不再逐帧清空)"
+    );
 }

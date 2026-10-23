@@ -5,6 +5,7 @@
 
 use crate::group::GroupDraw;
 use crate::layer::{CopyId, EngineValue, Layer, LayerId, TextureRef};
+use crate::text::TextDraw;
 use crate::transition::TransitionDraw;
 
 /// 一条绘制/复制/图像操作。
@@ -169,6 +170,14 @@ pub struct CopyOp {
     /// 帧末回放,那时源节点已不存在;因此必须在命令时刻把基础纹理固定下来
     /// (`DIV-GFX-053`)。
     pub source_texture: Option<TextureRef>,
+    /// **命令执行时**源图层已登记的文本绘制项(`CopySource::Layer` 才冻结;
+    /// 组源为空 —— 组内层文本由后端按组当前状态合成)。
+    ///
+    /// 官方 `CGACT[TEXT]` 即时写层表面(DIV-GFX-058),COPY 天然携带已画
+    /// 文本;命令之后再画的文本不得进入快照(与 [`Self::source_texture`]
+    /// 同一命令时刻语义,EVID-T-15/DIV-GFX-053)。内部字段,不进 JSON
+    /// (与 `source_texture` 同先例)。
+    pub texts: Vec<TextDraw>,
     /// 复制目标图层路径。
     pub dest: LayerId,
     pub region: CopyRegion,

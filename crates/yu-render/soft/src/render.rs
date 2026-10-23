@@ -20,7 +20,7 @@
 //!   16.16 定点,避免浮点跨平台差异;
 //! - 颜色空间按存储值直接混合,不做 sRGB↔线性转换。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -30,7 +30,7 @@ use yu_gfx::{
 };
 
 use crate::imageop::{apply_horizontal, apply_rect_paint, apply_reverse};
-use crate::text::{layer_base, TextComposer, TextPaintStats};
+use crate::text::{layer_base, text_base_key, texture_content_hash, TextComposer, TextPaintStats};
 use crate::texture::{AssetIssue, Texture, TextureStore};
 
 /// RGBA8 表面(行优先,直通 alpha)。
@@ -149,7 +149,7 @@ pub struct RenderOutput {
 ///
 /// EVID-T-12:官方 COPY 在**命令执行时**取源层当前状态,快照在目标层存活
 /// 期间保持。因此同一 `CopyId` 只捕获一次;新的 COPY 命令由 gfx 分配新 id。
-type Snapshots = BTreeMap<CopyId, Surface>;
+pub(crate) type Snapshots = BTreeMap<CopyId, Surface>;
 
 /// 软件渲染器:持有纹理解析缓存、帧内离屏表面与持久快照。
 pub struct SoftRenderer {
@@ -674,7 +674,13 @@ fn apply_copy_op(
             ),
         },
         CopySource::Group(id) => compose_group(textures, snapshots, frame, id, st)?,
-        CopySource::Layer(id) => layer_surface(textures, snapshots, frame, id, st, Some(copy))?,
+        CopySource::Layer(id) => {
+            let mut surface = layer_surface(textures, snapshots, frame, id, st, Some(copy))?;
+            if !copy.texts.is_empty() {
+                compose_copy_texts(&mut surface, copy, st);
+            }
+            surface
+        }
     };
     let dest_size = frame
         .layers
@@ -690,8 +696,29 @@ fn apply_copy_op(
     Ok(())
 }
 
+/// 在 COPY 源面上合成命令时刻冻结的文本(DIV-GFX-058:官方 `CGACT[TEXT]`
+/// 写层表面,COPY 天然携带已画文本)。
+fn compose_copy_texts(surface: &mut Surface, copy: &CopyOp, st: &mut RenderState) {
+    let base = Texture {
+        width: surface.width,
+        height: surface.height,
+        rgba: std::mem::take(&mut surface.rgba),
+    };
+    let (composed, stats) = st.text.compose_layer(&base, &copy.texts, None);
+    merge_text_stats(&mut st.report, stats);
+    if let Some(texture) = composed {
+        surface.width = texture.width;
+        surface.height = texture.height;
+        surface.rgba = texture.rgba;
+    } else {
+        surface.rgba = base.rgba;
+    }
+}
+
 /// 把 `src` 的矩形(含端点)写到 `dst` 的 `(0,0)`;越界裁剪。
-fn blit(src: &Surface, dst: &mut Surface, x0: i64, y0: i64, x1: i64, y1: i64) {
+///
+/// 快照 CPU 镜像的构造(wgpu 端 DIV-GFX-058)复用同一裁剪规则。
+pub fn blit(src: &Surface, dst: &mut Surface, x0: i64, y0: i64, x1: i64, y1: i64) {
     if x1 < x0 || y1 < y0 || src.width == 0 || src.height == 0 {
         return;
     }
@@ -768,7 +795,13 @@ fn layer_surface(
     st: &mut RenderState,
     fallback: Option<&CopyOp>,
 ) -> Result<Surface, String> {
-    if let Some(texture) = st.texture_overrides.get(id) {
+    // 文本覆盖纹理不作为 COPY 源(DIV-GFX-058):快照面 = 基图(+图像加工)
+    // + `copy.texts` 在命令时刻冻结的文本,不带帧末实时文本。
+    if let Some(texture) = st
+        .texture_overrides
+        .get(id)
+        .filter(|_| !st.text_override_ids.contains(id))
+    {
         return Ok(Surface::from_texture(texture));
     }
     let layer = frame.layers.iter().find(|layer| &layer.id == id);
@@ -837,7 +870,7 @@ fn draw_op(
     st.report.ops_total += 1;
     match op {
         Op::Layer(layer) => {
-            apply_layer_text(textures, frame, layer, st);
+            apply_layer_text(textures, snapshots, frame, layer, st);
             draw_layer(textures, snapshots, frame, op, layer, dst, st)
         }
         Op::Group(group) => {
@@ -896,6 +929,7 @@ fn draw_op(
 /// `docs/divergences/gfx-text.md` DIV-GFX-055)。
 fn apply_layer_text(
     textures: &mut TextureStore,
+    snapshots: &Snapshots,
     frame: &CompositorFrame,
     layer: &Layer,
     st: &mut RenderState,
@@ -916,9 +950,14 @@ fn apply_layer_text(
     if !layer.visible {
         return;
     }
+    // 同一层一帧内可能被绘制多次(COPY 的按需组重绘 + 自身 pass);
+    // 覆盖纹理已含文本,重复合成会在 DRAWMODE=1 下加深。
+    if !st.text_composed.insert(layer.id.clone()) {
+        return;
+    }
     let base = match st.texture_overrides.get(&layer.id) {
         Some(base) => base.clone(),
-        None => match layer_base(textures, layer) {
+        None => match layer_base(textures, snapshots, layer) {
             Ok(t) => Rc::new(t),
             Err(reason) => {
                 let why = format!("text.layer_base: {reason}");
@@ -930,11 +969,21 @@ fn apply_layer_text(
             }
         },
     };
-    let (composed, stats) = st.text.compose_layer(&base, &draws, layout);
+    // 持久文本是烘焙语义:内容(revision)与基面都没变 ⇒ 直接复用上次合成
+    // 结果,不再逐帧重烤(P8 性能;wgpu 的上传缓存随内容哈希一起命中)。
+    let revision = frame.text_revisions.get(&layer.id).copied().unwrap_or(0);
+    let override_hash = st
+        .texture_overrides
+        .get(&layer.id)
+        .map(|t| texture_content_hash(t));
+    let base_key = text_base_key(&layer.texture, override_hash);
+    let (composed, stats) = st
+        .text
+        .compose_layer_cached(&layer.id, revision, base_key, &base, &draws, layout);
     merge_text_stats(&mut st.report, stats);
     if let Some(composed) = composed {
-        st.texture_overrides
-            .insert(layer.id.clone(), Rc::new(composed));
+        st.texture_overrides.insert(layer.id.clone(), composed);
+        st.text_override_ids.insert(layer.id.clone());
     }
 }
 
@@ -1309,6 +1358,13 @@ struct RenderState<'a> {
     offscreens: BTreeMap<LayerId, Surface>,
     /// 帧内图像加工后的图层纹理(基图副本);只影响本帧。
     texture_overrides: BTreeMap<LayerId, Rc<Texture>>,
+    /// `texture_overrides` 中由文本合成产生的层(DIV-GFX-058):COPY 取源面
+    /// 时必须跳过 —— 快照只携带命令时刻冻结的 `copy.texts`,不带帧末实时文本。
+    text_override_ids: BTreeSet<LayerId>,
+    /// 本帧已做过文本合成的层。同一层可能在一帧内被绘制多次(COPY 的按需
+    /// 组重绘 + 它自己的离屏/屏幕 pass);文本只合成一次,避免 `DRAWMODE=1`
+    /// 的重复合成加深。
+    text_composed: BTreeSet<LayerId>,
     skipped: BTreeMap<(&'static str, String, String), u32>,
     report: RenderReport,
     /// 文本栅格化/合成(两条文本路径共用)。
@@ -1321,6 +1377,8 @@ impl<'a> RenderState<'a> {
         Self {
             offscreens: BTreeMap::new(),
             texture_overrides: BTreeMap::new(),
+            text_override_ids: BTreeSet::new(),
+            text_composed: BTreeSet::new(),
             skipped: BTreeMap::new(),
             text,
             report: RenderReport {

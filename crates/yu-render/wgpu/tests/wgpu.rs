@@ -1031,6 +1031,15 @@ fn soft_out_surface(out: &yu_backend_soft::RenderOutput) -> yu_backend_soft::Sur
     (*out.surface).clone()
 }
 
+/// `text.font_init` 是各后端首刷必发的一次性耗时诊断(两后端独立加载,
+/// 毫秒数必然不同):跨端比较时剔除该信息项,其余诊断仍逐字对齐。
+fn comparable_text_diags(diags: &[String]) -> Vec<&String> {
+    diags
+        .iter()
+        .filter(|d| !d.starts_with("text.font_init: "))
+        .collect()
+}
+
 fn pixel_of_surface(surface: &yu_backend_soft::Surface, x: u32, y: u32) -> [u8; 4] {
     surface.pixel(x, y).expect("pixel inside surface")
 }
@@ -1079,7 +1088,10 @@ fn text_layout_frames_match_soft_exactly() {
     assert_eq!(soft_out.report.text_glyphs, 3);
     assert_eq!(gpu_out.report.text_glyphs, 3);
     assert_eq!(soft_out.report.text_draws, gpu_out.report.text_draws);
-    assert_eq!(soft_out.report.text_diags, gpu_out.report.text_diags);
+    assert_eq!(
+        comparable_text_diags(&soft_out.report.text_diags),
+        comparable_text_diags(&gpu_out.report.text_diags)
+    );
     assert_eq!(
         soft_out.surface.rgba, gpu_out.surface.rgba,
         "text frame must be pixel-identical across backends"
@@ -1147,9 +1159,231 @@ fn cgact_text_layer_frames_match_soft_exactly() {
     assert_eq!(gpu_out.report.text_draws, 1);
     assert_eq!(soft_out.report.text_glyphs, 1);
     assert_eq!(gpu_out.report.text_glyphs, 1);
-    assert_eq!(soft_out.report.text_diags, gpu_out.report.text_diags);
+    assert_eq!(
+        comparable_text_diags(&soft_out.report.text_diags),
+        comparable_text_diags(&gpu_out.report.text_diags)
+    );
     assert_eq!(
         soft_out.surface.rgba, gpu_out.surface.rgba,
         "CGACT[TEXT] layer frame must be pixel-identical across backends"
+    );
+}
+
+// ---------------------------------------------------------------- DIV-GFX-058
+// 按钮快照与文本时序的跨端微场景(soft/wgpu 同帧逐像素一致)。
+
+fn micro_green_pixels(surface: &yu_backend_soft::Surface) -> usize {
+    surface
+        .rgba
+        .chunks_exact(4)
+        .filter(|px| px[1] > 0 && px[1] >= px[0] && px[1] >= px[2])
+        .count()
+}
+
+fn micro_events(table: &ParamTable, text_first: bool) -> Vec<VmEvent> {
+    let font = || {
+        call(
+            1,
+            "FONT",
+            vec![
+                arg(table, "FONT", "SX", Value::Int(16)),
+                arg(table, "FONT", "SY", Value::Int(16)),
+                arg(table, "FONT", "COLOR", Value::Int(0x00_FF00)),
+            ],
+        )
+    };
+    let text = || {
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(table, "CGACT", "ID", Value::Str(b"SRC".to_vec())),
+                arg(table, "CGACT", "TEXT", Value::Int(1)),
+                arg(table, "CGACT", "SET", Value::Int(0)),
+                arg(table, "CGACT", "SETSTR", Value::Str(b"A".to_vec())),
+                arg(table, "CGACT", "X", Value::Int(0)),
+                arg(table, "CGACT", "Y", Value::Int(0)),
+            ],
+        )
+    };
+    let copy = || {
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(table, "CGACT", "ID", Value::Str(b"SRC".to_vec())),
+                arg(table, "CGACT", "ID2", Value::Str(b"DST".to_vec())),
+                arg(table, "CGACT", "COPY2", Value::Int(1)),
+            ],
+        )
+    };
+    let mut events = vec![
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(table, "CG", "ID", Value::Str(b"SRC".to_vec())),
+                arg(table, "CG", "FILE", Value::Str(b"dark".to_vec())),
+                arg(table, "CG", "E", Value::Int(0)),
+                arg(table, "CG", "SX", Value::Int(16)),
+                arg(table, "CG", "SY", Value::Int(16)),
+            ],
+        ),
+        font(),
+    ];
+    if text_first {
+        events.extend([text(), copy()]);
+    } else {
+        events.extend([copy(), text()]);
+    }
+    events.push(VmEvent::FrameEnd { frame: 1 });
+    events
+}
+
+#[test]
+fn snapshot_text_timing_matches_soft() {
+    // 两个时序各渲染两帧,soft/wgpu 逐像素一致 + 方向性断言:
+    // 先文本后 COPY ⇒ 快照带字;先 COPY 后文本 ⇒ 快照无字。
+    for (text_first, name) in [(true, "text-then-copy"), (false, "copy-then-text")] {
+        let table = table();
+        let mut gfx = state(Viewport::new(16, 16), [255, 255, 255, 255]);
+        gfx.consume_events(&micro_events(&table, text_first));
+        let Some(mut gpu) = renderer_or_skip(store(&[(
+            b"dark.png",
+            png_bytes_for(16, 16, Rgba([0, 0, 0, 255])),
+        )])) else {
+            return;
+        };
+        let mut soft = SoftRenderer::new(store(&[(
+            b"dark.png",
+            png_bytes_for(16, 16, Rgba([0, 0, 0, 255])),
+        )]));
+        if !soft.text_composer().available() {
+            SKIPPED.fetch_add(1, Ordering::Relaxed);
+            println!("SKIP snapshot_text_timing_matches_soft({name}): no system font");
+            return;
+        }
+        let soft_out = soft.render_frame(&gfx.frame());
+        let gpu_out = gpu.render_frame(&gfx.frame()).expect("render");
+        assert_eq!(
+            soft_out.surface.rgba, gpu_out.surface.rgba,
+            "{name}: frame 1 must be pixel-identical"
+        );
+        gfx.consume_events(&[
+            VmEvent::FrameStart { frame: 2 },
+            VmEvent::FrameEnd { frame: 2 },
+        ]);
+        let soft_out2 = soft.render_frame(&gfx.frame());
+        let gpu_out2 = gpu.render_frame(&gfx.frame()).expect("render");
+        assert_eq!(
+            soft_out2.surface.rgba, gpu_out2.surface.rgba,
+            "{name}: frame 2 must be pixel-identical"
+        );
+        let green = micro_green_pixels(&soft_out.surface);
+        if text_first {
+            assert!(green > 0, "{name}: snapshot must carry frozen glyphs");
+            assert!(
+                micro_green_pixels(&soft_out2.surface) > 0,
+                "{name}: snapshot frozen across frames"
+            );
+        } else {
+            assert_eq!(green, 0, "{name}: post-copy text must not enter snapshot");
+            assert_eq!(
+                micro_green_pixels(&soft_out2.surface),
+                0,
+                "{name}: snapshot stays frozen"
+            );
+        }
+    }
+}
+
+#[test]
+fn text_on_snapshot_layer_matches_soft() {
+    // S4 标签形状:文本画在快照精灵层上,画一次、跨帧常驻;两端逐像素一致。
+    let table = table();
+    let mut gfx = state(Viewport::new(16, 16), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"BTN".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"dark".to_vec())),
+                arg(&table, "CG", "SX", Value::Int(16)),
+                arg(&table, "CG", "SY", Value::Int(16)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"BTN".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"LBL".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "FONT",
+            vec![
+                arg(&table, "FONT", "SX", Value::Int(16)),
+                arg(&table, "FONT", "SY", Value::Int(16)),
+                arg(&table, "FONT", "COLOR", Value::Int(0x00_FF00)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"LBL".to_vec())),
+                arg(&table, "CGACT", "TEXT", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0)),
+                arg(&table, "CGACT", "SETSTR", Value::Str(b"A".to_vec())),
+                arg(&table, "CGACT", "X", Value::Int(0)),
+                arg(&table, "CGACT", "Y", Value::Int(0)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let Some(mut gpu) = renderer_or_skip(store(&[(
+        b"dark.png",
+        png_bytes_for(16, 16, Rgba([0, 0, 0, 255])),
+    )])) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&[(
+        b"dark.png",
+        png_bytes_for(16, 16, Rgba([0, 0, 0, 255])),
+    )]));
+    if !soft.text_composer().available() {
+        SKIPPED.fetch_add(1, Ordering::Relaxed);
+        println!("SKIP text_on_snapshot_layer_matches_soft: no system font");
+        return;
+    }
+    let soft_out = soft.render_frame(&gfx.frame());
+    let gpu_out = gpu.render_frame(&gfx.frame()).expect("render");
+    assert!(
+        micro_green_pixels(&soft_out.surface) > 0,
+        "snapshot-layer label must render"
+    );
+    assert_eq!(
+        soft_out.surface.rgba, gpu_out.surface.rgba,
+        "frame 1 must be pixel-identical"
+    );
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 2 },
+        VmEvent::FrameEnd { frame: 2 },
+    ]);
+    let soft_out2 = soft.render_frame(&gfx.frame());
+    let gpu_out2 = gpu.render_frame(&gfx.frame()).expect("render");
+    assert!(
+        micro_green_pixels(&soft_out2.surface) > 0,
+        "label persists across frames"
+    );
+    assert_eq!(
+        soft_out2.surface.rgba, gpu_out2.surface.rgba,
+        "frame 2 must be pixel-identical"
     );
 }

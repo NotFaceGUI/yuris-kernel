@@ -20,7 +20,7 @@
 //! 对单条命令失败采用 `Recoverable` 诊断 + 跳过该命令,不终止整帧;依赖
 //! 未取证语义的图层用 `LayerStatus::Unimplemented` 标记,由后端跳过。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use yu_log::Diag;
 use yu_rt::event::{ArgValue, Domain, VmEvent};
@@ -43,7 +43,10 @@ use crate::op::{
 use crate::pass::{Pass, PassTarget};
 use crate::path;
 use crate::table::ParamTable;
-use crate::text::{layout_text, TextDraw, TextFlagsSource, TextLayoutFrame, TextRun, TextStyle};
+use crate::text::{
+    layout_text, TextDraw, TextDrawKey, TextFlagsSource, TextLayoutFrame, TextRun, TextStyle,
+    MAX_TEXT_DRAWS_PER_LAYER,
+};
 use crate::transition::TransitionDraw;
 
 /// 已解析参数(名字/值都取自 `self.params`,先复制出来以释放不可变借用)。
@@ -104,6 +107,40 @@ struct Node {
     children: BTreeSet<LayerId>,
 }
 
+/// 一个图层的持久 `CGACT[TEXT]` 绘制项(DIV-GFX-058)。
+///
+/// `seen` 是命令时刻的精确去重集:官方引擎重复命令会重复合成
+/// (`FONT[DRAWMODE=1]` 下逐次加深),而脚本(对话逐字路径)每帧重发
+/// 同一集合,重放时必须只保留一次。超限丢最旧并显式计数。
+#[derive(Clone, Debug, Default)]
+struct LayerTexts {
+    draws: Vec<TextDraw>,
+    seen: HashSet<TextDrawKey>,
+    dropped: u64,
+    /// 文本内容修订号:每次**实际**改动 `draws`(新绘制项/上限丢弃/交换)
+    /// 递增。后端据此缓存「基图 + 文本」合成结果,内容不变不重合成
+    /// (P8 性能契约:持久文本不能变成每帧全量重烤)。
+    revision: u64,
+}
+
+impl LayerTexts {
+    /// 追加一条绘制项;重复项按 [`TextDraw::dedup_key`] 丢弃。
+    /// 超限时丢最旧一条并把 `dropped` 加一(诊断由调用方汇总)。
+    fn push(&mut self, draw: TextDraw) -> bool {
+        let key = draw.dedup_key();
+        if !self.seen.insert(key) {
+            return false;
+        }
+        if self.draws.len() >= MAX_TEXT_DRAWS_PER_LAYER {
+            let oldest = self.draws.remove(0);
+            self.seen.remove(&oldest.dedup_key());
+            self.dropped += 1;
+        }
+        self.draws.push(draw);
+        true
+    }
+}
+
 /// 图形域状态机。
 pub struct GfxState {
     params: ParamTable,
@@ -123,8 +160,17 @@ pub struct GfxState {
     text_layers: BTreeMap<LayerId, TextBuffer>,
     /// 最近一次 `TEXT[ID]`(文本事件落点)。
     current_text: LayerId,
-    /// 本帧 `CGACT[TEXT=1]` 绘制(按目标图层;每帧清空)。
-    text_draws: BTreeMap<LayerId, Vec<TextDraw>>,
+    /// 文本修订号发号器(全局单调;后端合成缓存键必须全局唯一,
+    /// 不能因层重建/内容清除而复用旧号)。
+    text_revision_seq: u64,
+    /// `CGACT[TEXT=1]` 绘制项(按目标图层,**跨帧持久**)。
+    ///
+    /// DIV-GFX-058(P8):官方把字符即时写进图层表面,画一次即常驻
+    /// (按钮标签/存读档行文本/ES.SCREENSHOT 均只画一次);对话逐字路径
+    /// 每帧重发同集合,经 [`LayerTexts`] 精确去重后可见结果不变
+    /// (DIV-GFX-055 预登记的演进)。清除只发生在层像素被重写时:
+    /// `CGEND`/`CG(FILE)`/`CGACT[COPY]` 目标/Executable 图像加工/`SWAP`。
+    text_draws: BTreeMap<LayerId, LayerTexts>,
     copy_log: Vec<CopyOp>,
     image_log: Vec<ImageOp>,
     /// 被上限丢弃的最旧操作数(审计用)。
@@ -222,6 +268,7 @@ impl GfxState {
             style: TextStyle::default(),
             text_layers: BTreeMap::new(),
             current_text: LayerId::new(Vec::new()),
+            text_revision_seq: 0,
             text_draws: BTreeMap::new(),
             copy_log: Vec::new(),
             image_log: Vec::new(),
@@ -384,8 +431,8 @@ impl GfxState {
                 // DIV-GFX-034:文本缓冲**跨帧持久**。清空只发生在
                 // `TEXT[CLEAR]`(宿主经 `sync_text_state` 同步)、
                 // `clear_text()` 或目标层被 CGEND/CG 重建时。
-                // `CGACT[TEXT]` 是"本帧把文本画到图层上"的绘制项,逐帧重建。
-                self.text_draws.clear();
+                // DIV-GFX-058:`CGACT[TEXT]` 绘制项同样跨帧持久(官方写层
+                // 表面,画一次即常驻);`FrameStart` 不再清空。
                 // 诊断是“本帧”诊断:每帧清空,防止跨帧无界增长。
                 self.diags.clear();
                 // 复制/图像操作是**状态生产**(快照/纹理修改),不是逐帧易失;
@@ -570,11 +617,18 @@ impl GfxState {
                 flags_source: TextFlagsSource::TextFlag,
             })
         });
-        // `CGACT[TEXT]` 绘制项(按目标层 ID 稳定排序;层内保持命令序)。
+        // `CGACT[TEXT]` 绘制项(按目标层 ID 稳定排序;层内保持命令序;
+        // 跨帧持久,DIV-GFX-058)。
         f.text_draws = self
             .text_draws
             .values()
-            .flat_map(|v| v.iter().cloned())
+            .flat_map(|t| t.draws.iter().cloned())
+            .collect();
+        // 每层文本修订号(后端合成缓存键;内容不变不重烤)。
+        f.text_revisions = self
+            .text_draws
+            .iter()
+            .map(|(id, t)| (id.clone(), t.revision))
             .collect();
         f.diagnostics = self.diags.values().cloned().collect();
         f
@@ -1341,7 +1395,7 @@ impl GfxState {
             self.image_log
                 .retain(|i| i.source != parsed.path && i.target.as_ref() != Some(&parsed.path));
             // 新纹理 = 干净像素面:之前 `CGACT[TEXT]` 的绘制项随之作废。
-            self.text_draws.remove(&parsed.path);
+            self.clear_layer_texts(&parsed.path);
         }
 
         let diags = {
@@ -1636,6 +1690,17 @@ impl GfxState {
                 .map(|n| n.layer.texture.clone())
                 .filter(|t| !matches!(t, TextureRef::None))
         };
+        // 命令时刻的源层已画文本(DIV-GFX-058:官方写表面,COPY 天然携带;
+        // 命令之后再画的文本不进快照)。组源为空(组内层文本由后端按组当前
+        // 状态合成)。
+        let texts = if source_is_group {
+            Vec::new()
+        } else {
+            self.text_draws
+                .get(source)
+                .map(|t| t.draws.clone())
+                .unwrap_or_default()
+        };
         self.copy_log.retain(|c| c.dest != *dest);
         self.image_log
             .retain(|i| i.target.as_ref().is_none_or(|t| t != dest));
@@ -1658,6 +1723,7 @@ impl GfxState {
                 CopySource::Layer(source.clone())
             },
             source_texture,
+            texts,
             dest: dest.clone(),
             region,
             timing: CopyTiming::CommandCurrent,
@@ -1668,6 +1734,11 @@ impl GfxState {
             if let Some(node) = self.nodes.get_mut(dest) {
                 copy_attributes(&attrs, &mut node.layer);
             }
+        }
+        // DIV-GFX-058:可执行 COPY 整面覆写目标层像素 ⇒ 目标层已画文本随之
+        // 作废(引擎烘焙语义)。源 = 目标的自复制不覆写,保持原文本。
+        if status == OpStatus::Executable && dest != source {
+            self.clear_layer_texts(dest);
         }
         // 快照继承源层的尺寸/资产键(COPY2 后脚本会查询目标层的 SX/SY;
         // 源层尺寸来自 VM 注入的资产元数据,见 `asset_sizes`)。
@@ -1810,14 +1881,38 @@ impl GfxState {
             };
             swap_attrs(&mut d.layer, &src);
         }
+        // DIV-GFX-058:SWAP/SWAP2 都交换纹理 ⇒ 烘焙文本随表面走。
+        // (TODO DIV-GFX-032 的模式 1/2 归属为 Likely,但“面互换”两种模式
+        // 一致,这里不做模式区分。)
+        let src_texts = self.text_draws.remove(source);
+        let dst_texts = self.text_draws.remove(dest);
+        if let Some(mut t) = src_texts {
+            for d in &mut t.draws {
+                d.target = dest.clone();
+            }
+            self.text_revision_seq = self.text_revision_seq.wrapping_add(1);
+            t.revision = self.text_revision_seq;
+            self.text_draws.insert(dest.clone(), t);
+        }
+        if let Some(mut t) = dst_texts {
+            for d in &mut t.draws {
+                d.target = source.clone();
+            }
+            self.text_revision_seq = self.text_revision_seq.wrapping_add(1);
+            t.revision = self.text_revision_seq;
+            self.text_draws.insert(source.clone(), t);
+        }
     }
 
-    /// `CGACT[TEXT=1]`:把一段字符串登记为图层的绘制项。
+    /// `CGACT[TEXT=1]`:把一段字符串登记为图层的**持久**绘制项。
     ///
     /// 引擎在命令处理器里把字画进图层像素(手册「操作を行うと元のイメージ
-    /// には戻せません」),但 ERIS 每帧重建文本图层并重发全部字符
-    /// (`Text/es_Text.yst`)。gfx 因此输出**本帧**绘制项,由后端在合成该
-    /// 图层时叠加(等价性论证见 `docs/divergences/gfx-text.md` DIV-GFX-055)。
+    /// には戻せません」;REA `0x404398 → 0x4046fc → 0x404914 → 0x4056b8`
+    /// 按 SET 1/9/3 次合成进表面字节),画一次即常驻。ERIS 的对话逐字路径
+    /// (`es_Text.yst:1031`)每帧重发同一集合,同层同参的重复命令按
+    /// [`TextDraw::dedup_key`] 精确去重(可见结果不变,且规避
+    /// `FONT[DRAWMODE=1]` 的重复合成加深);按钮标签等一次性绘制则跨帧保留
+    /// (DIV-GFX-058)。
     fn cgact_text(
         &mut self,
         target: &LayerId,
@@ -1858,19 +1953,40 @@ impl GfxState {
             return;
         };
         let set = set.as_ref().and_then(EngineValue::as_int).unwrap_or(0);
-        self.text_draws
-            .entry(target.clone())
-            .or_default()
-            .push(TextDraw {
-                target: target.clone(),
-                bytes,
-                x: x.unwrap_or(0),
-                y: y.unwrap_or(0),
-                // 引擎按命令到达时的 FONT 状态绘制(REA 0x404a1b 读 +0x28/+0x33/+0x34)。
-                style: self.style.clone(),
-                set,
-                bno,
-            });
+        let draw = TextDraw {
+            target: target.clone(),
+            bytes,
+            x: x.unwrap_or(0),
+            y: y.unwrap_or(0),
+            // 引擎按命令到达时的 FONT 状态绘制(REA 0x404a1b 读 +0x28/+0x33/+0x34)。
+            style: self.style.clone(),
+            set,
+            bno,
+        };
+        let (dropped, changed) = {
+            let texts = self.text_draws.entry(target.clone()).or_default();
+            let before = texts.dropped;
+            let changed = texts.push(draw);
+            (texts.dropped - before, changed)
+        };
+        if changed {
+            self.text_revision_seq = self.text_revision_seq.wrapping_add(1);
+            let seq = self.text_revision_seq;
+            if let Some(texts) = self.text_draws.get_mut(target) {
+                texts.revision = seq;
+            }
+        }
+        if dropped > 0 {
+            self.push_diag(
+                "CGACT",
+                error::recoverable(
+                    error::code::TEXT_UNSUPPORTED,
+                    format!(
+                        "单层文本绘制项达到上限 {MAX_TEXT_DRAWS_PER_LAYER},丢弃最旧 {dropped} 项",
+                    ),
+                ),
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2057,6 +2173,13 @@ impl GfxState {
                     format!("图像加工 `{name}` 未执行: {reason};只记录原始参数"),
                 ),
             );
+        } else {
+            // DIV-GFX-058:已执行的图像加工重写目标层像素(引擎命令处理器
+            // 立即执行)⇒ 目标层已画文本作废(`BT.CGCLEAR` 的
+            // `RECTPAINT3 SET=0` 清标签面正是这条路径,es_Button.yst:4547)。
+            if let Some(t) = target {
+                self.clear_layer_texts(&t);
+            }
         }
     }
 
@@ -2071,15 +2194,31 @@ impl GfxState {
             };
             match name {
                 "NAME" => match &r.value {
+                    Value::Str(b) if b.is_empty() => {
+                        // 空 `FONT[NAME=""]`:官方 FONT 处理器对 NAME 做名字查找
+                        // ,查不到(pin 空串必然查不到)落到**槽默认 family**
+                        // (REA FONT 表:NAME 默认值 = 槽默认 family;回退表
+                        // `0x403b8e..0x403bdc`,docs/font-provenance.md §6)。
+                        // 名字槽一旦出现就覆盖全局字体索引 ⇒ 同时清 NO/BNO
+                        // (DIV-GFX-059)。
+                        self.style.name = None;
+                        self.style.font_no = None;
+                        self.style.font_bno = None;
+                    }
                     Value::Str(b) => self.style.name = Some(b.clone()),
                     _ => self.arg_type("FONT", name, "字符串", &r.value),
                 },
                 "COLOR" => match int_arg(&r.value) {
-                    Some(n) => self.style.color = n as u32,
+                    // 引擎 clamp(REA FONT 处理体 `0x444620..0x44464a`:
+                    // 负值 → 0,超过 0xFFFFFF → 0xFFFFFF;**不是位掩码**)。
+                    Some(n) => self.style.color = clamp_color(n),
                     None => self.arg_type("FONT", name, "整数", &r.value),
                 },
                 "COLOR2" => match int_arg(&r.value) {
-                    Some(n) => self.style.color2 = Some(n as u32),
+                    // `es._txcolor` 以 -1 为“未给 COLOR2”的哨兵并**照发**
+                    // `FONT[COLOR2=-1]`(stdlib/ystdlib.yst:706);官方 clamp
+                    // 把 -1 变成 0x000000(纯黑),不是 0xFFFFFF。
+                    Some(n) => self.style.color2 = Some(clamp_color(n)),
                     None => self.arg_type("FONT", name, "整数", &r.value),
                 },
                 "SX" => match int_arg(&r.value) {
@@ -2138,10 +2277,29 @@ impl GfxState {
             }
         }
         // 引擎 clamp(REA 0x444428..0x444b1c);负值/越界不报错。
+        // 颜色已在解析时按带符号 clamp 处理(COLOR/COLOR2);这里的其余
+        // 字段 clamp 与官方一致(见 [`TextStyle::clamp`])。
         self.style.clamp();
     }
 
     // ------------------------------------------------------------ 内部
+
+    /// 层像素被重写:清空该层文本内容并发全局新修订号(后端缓存随之失效)。
+    /// 不删条目 —— 删除后重建会让修订号从头开始,和旧缓存撞键。
+    fn clear_layer_texts(&mut self, id: &LayerId) {
+        let has = self.text_draws.get(id).is_some_and(|t| !t.draws.is_empty());
+        if !has {
+            return;
+        }
+        self.text_revision_seq = self.text_revision_seq.wrapping_add(1);
+        let seq = self.text_revision_seq;
+        if let Some(texts) = self.text_draws.get_mut(id) {
+            texts.draws.clear();
+            texts.seen.clear();
+            texts.dropped = 0;
+            texts.revision = seq;
+        }
+    }
 
     fn w0() -> LayerId {
         LayerId::new(b":/W0".to_vec())
@@ -2684,6 +2842,13 @@ fn viewport_to_size(v: Viewport) -> SizeU32 {
         width: v.width,
         height: v.height,
     }
+}
+
+/// 引擎颜色 clamp:带符号,负值 → 0,超过 0xFFFFFF → 0xFFFFFF
+/// (REA FONT 处理体 `0x444620..0x44464a` 的 `SBB/JL/XOR` 与
+/// `MOV EAX,0xFFFFFF` 分支;`FONT[COLOR2=-1]` 因此落到纯黑)。
+fn clamp_color(n: i64) -> u32 {
+    n.clamp(0, 0x00FF_FFFF) as u32
 }
 
 fn int_arg(v: &Value) -> Option<i64> {

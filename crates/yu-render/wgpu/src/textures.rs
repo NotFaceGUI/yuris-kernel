@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::Pod;
-use yu_backend_soft::TextureStore;
+use yu_backend_soft::{Texture, TextureStore};
 use yu_gfx::{CopyId, LayerId};
 use yu_log::Diag;
 
@@ -204,6 +204,12 @@ pub struct TargetSet {
     screen: Option<RenderTarget>,
     offscreen: BTreeMap<LayerId, RenderTarget>,
     snapshots: BTreeMap<CopyId, RenderTarget>,
+    /// 快照的 CPU 镜像(DIV-GFX-058):`CGACT[TEXT]` 直接画在快照精灵层上
+    /// 时,文本合成的基面 = 快照像素;GPU 侧没有可读像素,捕获时从 CPU
+    /// 可得的源(资产/1×1 黑/另一快照镜像/冻结文本合成)留一份。组/后缓冲
+    /// 源无法廉价取得 CPU 像素 ⇒ 不留镜像,后续需要时显式报缺(不猜)。
+    /// 与 GPU 快照同键同生命周期(prune/clear 同步)。
+    snapshot_cpu: BTreeMap<CopyId, Texture>,
     scale: Option<RenderTarget>,
 }
 
@@ -213,6 +219,7 @@ impl TargetSet {
             screen: None,
             offscreen: BTreeMap::new(),
             snapshots: BTreeMap::new(),
+            snapshot_cpu: BTreeMap::new(),
             scale: None,
         }
     }
@@ -288,8 +295,11 @@ impl TargetSet {
             .get(&id)
             .is_some_and(|t| t.width == width && t.height == height);
         if !reusable {
+            // 仅在**替换**已有 GPU 目标时失效 CPU 镜像(旧内容不再对应);
+            // 首建时 1.4/1.6 段预写的镜像恰好就是本快照的内容,保留。
             if let Some(old) = self.snapshots.remove(&id) {
                 pipelines.forget_texture(old.id);
+                self.snapshot_cpu.remove(&id);
             }
             let target = create_target(ctx, width, height, "copy snapshot")?;
             self.snapshots.insert(id, target);
@@ -297,9 +307,26 @@ impl TargetSet {
         Ok(self.snapshots.get(&id).expect("snapshot target set above"))
     }
 
+    /// 快照的 CPU 镜像(捕获时写入;与 GPU 快照同键)。
+    pub fn snapshot_cpu(&self, id: CopyId) -> Option<&Texture> {
+        self.snapshot_cpu.get(&id)
+    }
+
+    /// 写入/替换快照 CPU 镜像(捕获/重捕获时)。
+    pub fn insert_snapshot_cpu(&mut self, id: CopyId, texture: Texture) {
+        self.snapshot_cpu.insert(id, texture);
+    }
+
+    /// 快照被 GPU 原地加工(RECTPAINT 族)后 CPU 镜像失效:删除而不是
+    /// 保留旧像素(后续需要时显式报缺,不用脏数据)。
+    pub fn invalidate_snapshot_cpu(&mut self, id: CopyId) {
+        self.snapshot_cpu.remove(&id);
+    }
+
     /// 只保留本帧仍被引用的快照(`CopyId` 由目标层或本帧复制引用)。
     pub fn prune_snapshots(&mut self, live: &std::collections::BTreeSet<CopyId>) {
         self.snapshots.retain(|id, _| live.contains(id));
+        self.snapshot_cpu.retain(|id, _| live.contains(id));
     }
 
     /// 丢弃全部快照纹理(渲染器 `reset()` 用;DIV-HOST-001)。
@@ -311,6 +338,7 @@ impl TargetSet {
         for (_, target) in std::mem::take(&mut self.snapshots) {
             pipelines.forget_texture(target.id);
         }
+        self.snapshot_cpu.clear();
         removed
     }
 

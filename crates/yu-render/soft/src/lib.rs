@@ -65,9 +65,10 @@ pub mod text;
 pub mod texture;
 
 pub use imageop::{apply_horizontal, apply_rect_paint, apply_reverse, scale_region};
+pub use render::blit;
 pub use render::{
     frame_has_drawable_output, ImageCacheKey, ImageOpSig, ImageSource, RenderOutput, RenderReport,
     SizeKey, SizeSource, SkippedOp, SoftRenderer, Surface,
 };
-pub use text::{layer_base, TextComposer, TextPaintStats};
+pub use text::{layer_base, text_base_key, texture_content_hash, TextComposer, TextPaintStats};
 pub use texture::{AssetIssue, Texture, TextureStore};
