@@ -14,7 +14,8 @@ use yu_backend_soft::{
 };
 use yu_backend_wgpu::{DeviceOptions, WgpuRenderer};
 use yu_gfx::{
-    json, probe_order_from_codes, CompositorFrame, GfxConfig, GfxHost, GfxState, Viewport,
+    json, probe_order_from_codes, CompositorFrame, GfxConfig, GfxHost, GfxState, SizeU32,
+    TextureRef, TextureSampler, Viewport,
 };
 use yu_rt::input::{InputFrame, InputTimeline};
 use yu_rt::{BootConfig, Vm};
@@ -226,6 +227,12 @@ pub struct Engine {
     frame: u64,
     timeline: InputTimeline,
     held: BTreeSet<String>,
+    /// 每个按钮“按下将被哪个逻辑帧看到”(防同帧按下+抬起被折叠)。
+    pressed_for: std::collections::BTreeMap<String, u64>,
+    /// 按下尚未被 tick 消费就收到抬起:延到该 tick 之后再抬。
+    deferred_release: BTreeSet<String>,
+    /// 单帧脉冲(滚轮一格):只在下一次 tick 的帧上按下。
+    pulses: BTreeSet<String>,
     cursor: (i64, i64),
     last_frame: Option<CompositorFrame>,
     last_surface: Option<Surface>,
@@ -235,6 +242,8 @@ pub struct Engine {
     render_history: VecDeque<f64>,
     boot_ms: f64,
     events_drained: u64,
+    /// 主任务已 `END`/走完(宿主据此退出窗口)。
+    main_finished: bool,
 }
 
 impl Engine {
@@ -246,7 +255,7 @@ impl Engine {
             match sound_device::SoundSink::open() {
                 Ok(sink) => Some(sink),
                 Err(e) => {
-                    eprintln!("[sound] 设备输出未启用: {e}");
+                    crate::output::error(format!("[sound] 设备输出未启用: {e}"));
                     None
                 }
             }
@@ -302,6 +311,9 @@ impl Engine {
             frame: 0,
             timeline: InputTimeline::new(),
             held: BTreeSet::new(),
+            pressed_for: std::collections::BTreeMap::new(),
+            deferred_release: BTreeSet::new(),
+            pulses: BTreeSet::new(),
             cursor: (0, 0),
             last_frame: None,
             last_surface: None,
@@ -311,6 +323,7 @@ impl Engine {
             render_history: VecDeque::with_capacity(120),
             boot_ms,
             events_drained: 0,
+            main_finished: false,
         })
     }
 
@@ -468,7 +481,8 @@ impl Engine {
             .as_mut()
             .ok_or_else(|| Failure::runtime("engine 未启动"))?;
         let tick_started = Instant::now();
-        vm.tick_at(now_ms, &self.timeline);
+        let chain = vm.tick_at(now_ms, &self.timeline);
+        self.main_finished |= chain.main_finished;
         if let Some(sound) = &self.sound {
             // 音频线程是时钟:这里只取诊断,不生产 PCM。
             let mut fresh = sound.lock().unwrap().take_diags();
@@ -481,6 +495,26 @@ impl Engine {
         self.frame = self.frame.saturating_add(1);
         // 事件只做统计/drain:GfxHost 已同步消费同一批事件。
         self.events_drained += vm.take_events().len() as u64;
+        // `MOUSE[X/Y]`:内核已改脚本可见坐标;宿主同步到时间线,下一帧
+        // 的光标与脚本看到的一致(引擎同时 SetCursorPos)。
+        // `MOUSE[X/Y]`:内核已改脚本可见坐标;宿主时间线同步到同一位置。
+        let warp = vm.input_state_mut().take_cursor_warp();
+        let (cursor_x, cursor_y) = vm.input().cursor();
+        if let Some((x, y)) = warp {
+            self.cursor = (x.unwrap_or(cursor_x), y.unwrap_or(cursor_y));
+            self.sync_input();
+        }
+        // 脉冲已在本次 tick 消费(InputTimeline 只在该精确帧读 pulses)。
+        self.pulses.clear();
+        // 极短点击:按下已被本次 tick 看到,现在补上延迟的抬起。
+        if !self.deferred_release.is_empty() {
+            let releases = std::mem::take(&mut self.deferred_release);
+            for name in releases {
+                self.held.remove(&name);
+                self.pressed_for.remove(&name);
+            }
+            self.sync_input();
+        }
         let frame = self
             .state
             .as_ref()
@@ -523,12 +557,30 @@ impl Engine {
     pub fn set_timeline(&mut self, timeline: InputTimeline) {
         self.timeline = timeline;
         self.held.clear();
+        self.pressed_for.clear();
+        self.deferred_release.clear();
+        self.pulses.clear();
     }
 
     /// 按钮按下/松开;作用于下一个逻辑帧。
+    ///
+    /// 一次极快的点击(按下与抬起都发生在两次 tick 之间)不能丢:按下会
+    /// 记录“将被哪个帧看到”;若抬起早于该帧,抬起延到该帧之后。
     pub fn set_input(&mut self, button: &str, pressed: bool) {
         if pressed {
-            self.held.insert(button.to_string());
+            self.deferred_release.remove(button);
+            if self.held.insert(button.to_string()) {
+                self.pressed_for
+                    .insert(button.to_string(), self.frame.saturating_add(1));
+            }
+        } else if let Some(at) = self.pressed_for.get(button).copied() {
+            if at >= self.frame.saturating_add(1) {
+                // 按下还没被任何 tick 消费 → 至少保证一帧按下。
+                self.deferred_release.insert(button.to_string());
+                return;
+            }
+            self.held.remove(button);
+            self.pressed_for.remove(button);
         } else {
             self.held.remove(button);
         }
@@ -540,14 +592,72 @@ impl Engine {
         self.sync_input();
     }
 
+    /// 当前脚本可见的光标逻辑坐标(宿主用于把 OS 光标对齐)。
+    pub fn cursor(&self) -> (i64, i64) {
+        self.cursor
+    }
+
+
+    /// 单帧脉冲(滚轮/单帧点击):只在下一次 tick 生效,随后自动抬起。
+    pub fn pulse_input(&mut self, button: &str) {
+        self.pulses.insert(button.to_string());
+        self.sync_input();
+    }
+
+    /// 立即释放所有按钮(窗口失焦/关闭时用;不走“至少一帧”延迟)。
+    pub fn release_all_inputs(&mut self) {
+        self.held.clear();
+        self.pressed_for.clear();
+        self.deferred_release.clear();
+        self.pulses.clear();
+        self.sync_input();
+    }
+
+    /// 当前脚本可见的输入设置(MOUSE 光标模式/形状;宿主表现层消费)。
+    pub fn input_settings(&self) -> Option<&yu_rt::input::InputSettings> {
+        self.vm.as_ref().map(|vm| vm.input_settings())
+    }
+
+    /// 主任务已结束(脚本 `END` 或主脚本走完);宿主据此关闭窗口。
+    pub fn main_finished(&self) -> bool {
+        self.main_finished
+    }
+
+    /// 脚本执行错误(执行器结束的任务;诊断用)。
+    pub fn script_errors(&self) -> Vec<String> {
+        self.vm
+            .as_ref()
+            .map(|vm| vm.script_errors().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// 取走内核诊断(含 `rt.cmd.unimplemented` 等)。
+    pub fn take_diags(&mut self) -> Vec<yu_log::Diag> {
+        self.vm
+            .as_mut()
+            .map(|vm| vm.take_diags())
+            .unwrap_or_default()
+    }
+
+    /// 宿主窗口的关闭按钮被按下:推 `@_WINDOW_EXEC_CLOSE=1` 给脚本,
+    /// 由脚本决定是否 `END`(引擎语义;不直接退出进程)。
+    pub fn request_window_close(&mut self) {
+        if let Some(vm) = self.vm.as_mut() {
+            vm.request_window_close();
+        }
+    }
+
     pub fn held_buttons(&self) -> Vec<String> {
         self.held.iter().cloned().collect()
     }
 
     fn sync_input(&mut self) {
         let next = self.frame.saturating_add(1);
-        let frame =
+        let mut frame =
             InputFrame::new(self.held.iter().cloned()).with_cursor(self.cursor.0, self.cursor.1);
+        for button in &self.pulses {
+            frame.pulses.insert(button.clone());
+        }
         self.timeline.set(next, frame);
     }
 
@@ -591,8 +701,12 @@ impl Engine {
         self.state = None;
         self.timeline = InputTimeline::new();
         self.held.clear();
+        self.pressed_for.clear();
+        self.deferred_release.clear();
+        self.pulses.clear();
         self.cursor = (0, 0);
         self.frame = 0;
+        self.main_finished = false;
         self.last_frame = None;
         self.last_surface = None;
         self.last_report = FrameReport::empty(0);
@@ -677,6 +791,41 @@ type BootBundle = (
     Vec<yu_gfx::ImageFormat>,
 );
 
+/// `CGINFO[ONMOUSE*]` 的像素采样面。
+///
+/// 与渲染器各自持有一份 `TextureStore`:渲染器的缓存是私有的,而 INFO 查询
+/// 发生在脚本执行期、渲染之前。两份缓存使用同一 `DataSource` 语义与探测序,
+/// 因此像素一致;代价是资产首次解码可能出现两份(命中后各自缓存)。
+struct StoreSampler {
+    store: TextureStore,
+}
+
+impl StoreSampler {
+    fn resolve_size(&mut self, texture: &TextureRef) -> Option<(u32, u32)> {
+        let texture = self.store.resolve_ref(texture).ok()?;
+        Some((texture.width, texture.height))
+    }
+
+    fn resolve_pixel(&mut self, texture: &TextureRef, x: i64, y: i64) -> Option<[u8; 4]> {
+        if x < 0 || y < 0 {
+            return None;
+        }
+        let texture = self.store.resolve_ref(texture).ok()?;
+        texture.pixel(x as u32, y as u32)
+    }
+}
+
+impl TextureSampler for StoreSampler {
+    fn size(&mut self, texture: &TextureRef) -> Option<SizeU32> {
+        let (width, height) = self.resolve_size(texture)?;
+        Some(SizeU32 { width, height })
+    }
+
+    fn sample(&mut self, texture: &TextureRef, x: i64, y: i64) -> Option<[u8; 4]> {
+        self.resolve_pixel(texture, x, y)
+    }
+}
+
 fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     let source = project.open_source()?;
     let aux = project.open_aux()?;
@@ -707,11 +856,27 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
             viewport.width, viewport.height
         )));
     }
+    let probe_order = {
+        let from_config = probe_order_from_codes(&vm.tables().boot.config.image_ext_order);
+        if from_config.is_empty() {
+            yu_gfx::frame::default_probe_order()
+        } else {
+            from_config
+        }
+    };
     let state = Rc::new(RefCell::new(
         GfxState::from_tables(vm.tables(), GfxConfig::new(viewport))
             .map_err(|d| Failure::runtime(format!("GfxState 构造失败: {d}")))?,
     ));
-    vm.set_graphics_host(Box::new(GfxHost::new(state.clone())));
+    let mut gfx_host = GfxHost::new(state.clone());
+    // `CGINFO[ONMOUSE*]` 需要像素;宿主用独立 `TextureStore` 提供采样面。
+    // 打开数据源失败时保持 None,查询按 Unimplemented 挂号(不猜 0)。
+    if let Ok(source) = project.open_source() {
+        gfx_host.set_texture_sampler(Box::new(StoreSampler {
+            store: TextureStore::new(source, CODEC, probe_order.clone()),
+        }));
+    }
+    vm.set_graphics_host(Box::new(gfx_host));
     let sound_state = if opts.os_sound {
         // 声音初始化跟随 `@_OS_SOUND` 开关：关时不装宿主（行为与 M-2 一致）。
         let loader = VfsSoundLoader {
@@ -723,14 +888,6 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         Some(sound_state)
     } else {
         None
-    };
-    let probe_order = {
-        let from_config = probe_order_from_codes(&vm.tables().boot.config.image_ext_order);
-        if from_config.is_empty() {
-            yu_gfx::frame::default_probe_order()
-        } else {
-            from_config
-        }
     };
     Ok((vm, state, sound_state, viewport, probe_order))
 }

@@ -58,10 +58,11 @@ DIFFUSE 已按 A 灰度定案；MIP/各向异性、组 RT 子组 alpha、文本�
 | `yu-cli` | 原生引擎宿主 + 本地 HTTP/WS 服务 + HMR 监督 + 用例执行器（`run`/`serve`/`dev`/`case`/`bench`） |
 | `yu-platform/host-desktop` · `yu-host-desktop` | Windows 原生窗口宿主：winit 0.30 + wgpu 30 上屏 + egui 调试面板；复用 `yu-cli::Engine`，不复制引擎语义 |
 | `yu-platform/host-wasm` · `yu-host-wasm` | 浏览器**呈现端**（wasm-bindgen）：WebGPU shim 优先，Canvas2D 回退；不读游戏数据 |
+| `yu-platform/input` · `yu-platform-input` | 宿主侧输入翻译：物理键码 / 指针 / 滚轮 → 引擎按钮名，`MOUSE[CURSOR]` → 中性形状，光标可见性策略；桌面与 Web 共用 |
 | `yu-trace` | 边界录制 / 回放 / diff；schema v3（producer-neutral、frame_description） |
 
 > **目录分层**：`crates/yu-render/` 放渲染后端（soft/wgpu），`crates/yu-platform/` 放宿主
-> （desktop/wasm）；其余 crate 直接在 `crates/` 下。**包名不变**，`cargo -p` 命令不用改。
+> 与平台输入（desktop/wasm/input）；其余 crate 直接在 `crates/` 下。**包名不变**，`cargo -p` 命令不用改。
 
 ### 模块进度（2026-10-21）
 

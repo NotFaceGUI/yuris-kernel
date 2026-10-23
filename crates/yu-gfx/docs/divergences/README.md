@@ -35,7 +35,7 @@
 | DIV-GFX-023 | 复制/图像日志上限 16,384 条,超限丢弃最旧一半 | note | 记录 `dropped_ops()` + `gfx.log.truncated`;正常首屏为 0 |
 | DIV-GFX-024 | `CGINFO[SX/SY]` 对资源图返回真实纹理尺寸需要资产元数据(图像文件头/解码器);gfx 不读文件 | blocked | 有显式 `SX/SY` 的层、组、`SolidBlack1x1` 可答;资源图无显式尺寸时 Unimplemented,不猜 0 |
 | DIV-GFX-025 | INFO 多字段同时置位时 `LET` 写回顺序未取证 | unimplemented | `gfx.info.multi`;VM 不写 LET,避免猜顺序 |
-| DIV-GFX-026 | INFO 的 `COLOR/ONMOUSE*/CAPTION/ACTIVE/FULLSCREEN/...` 需要像素/鼠标/窗口 host | unimplemented | `gfx.info.unsupported`;不伪造 |
+| DIV-GFX-026 | INFO 的 `COLOR/ONMOUSE*/CAPTION/ACTIVE/FULLSCREEN/...` 需要像素/鼠标/窗口 host | partial | `ONMOUSE/ONMOUSE2/ONMOUSE3` 已实现(REA `0x43d664`/`0x43de01`;宿主注入 `TextureSampler`;快照按 `snapshot_files` 源资产采样);`COLOR`/组/离屏像素仍 `gfx.info.unsupported` |
 | DIV-GFX-027 | `IDNO` 的 `ID + "." + 十进制` 拼接未重新锚定(旧地址失效) | open | 路径按现规则;若引擎不同则需改 |
 | DIV-GFX-028 | 图像层下挂子层的目标 RT(同一目标 vs 组 RT)只有遍历汇编证据,无真实样本 | open | 当前按后序扁平绘制到父目标;需官方合成脚本确认 |
 | DIV-GFX-029 | pass 的 copy/image 分组顺序与脚本命令交错序不同 | fixed(J2) | EVID-T-15:官方命令处理器立即执行;`frame()` 按 `CopyOp::seq`/`ImageOp::seq` 交错输出纹理 pass(微场景 `j2-micro-copy2` 软/硬/官方一致) |
@@ -60,3 +60,4 @@
 | DIV-GFX-052 | `REVERSE`/`HORIZONTAL` 与同层先加工的组合 | **fixed(AU1)** | wgpu 补上与 soft 逐字对齐的分支;跨后端用例 `reverse_after_rectpaint_matches_soft` 逐像素一致 |
 | DIV-GFX-053 | 复制源层同帧被 `CGEND` 删除 | **fixed(AU1)** | `CopyOp.source_texture` 在命令时刻固定源纹理(EVID-T-15);按钮快照 68 条 `COPY2` 恢复 |
 | DIV-GFX-054 | COPY 区域缺省坐标 = 整幅 | **fixed(AU1)** | `CopyRegion::Partial` 坐标改 `Option` + `resolve()`;ERIS `X/X2` 无 `Y/Y2` = 整高切片 |
+| DIV-GFX-055 | `CGINFO[ONMOUSE*]` 的快照/组像素面 | partial | 快照层按 `snapshot_files` 的源资产采样(按钮 `BT.OFF` 即此路径);组/离屏快照无独立 CPU 像素面 ⇒ `INFO_UNSUPPORTED`;`COLOR` 仍未实现 |

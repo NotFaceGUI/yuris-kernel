@@ -256,15 +256,14 @@ pub fn read(
             let idx = indices.first().copied().unwrap_or(0);
             vm.input().inp(idx).map(Value::Int)
         }
-        // **手册无页**(字节级核对 0.479/0.495,2026-10-19;旧注释误引手册,
-        // 已勘误)。语义「最后按下的按钮码」仅从名字自明,引擎取值时机
-        // (按下沿/松开沿)无证据 ⇒ 不实现。InputState 内部照常记录
-        // (`keylast()/mouselast()`),供宿主/后续取证使用。
-        "_KEYLAST" | "_MOUSELAST" => Err(diag::unimplemented(
-            code::rt::SYSVAR_UNIMPLEMENTED,
-            Boundary::Script,
-            format!("{name}:手册无页,引擎取值时机未取证 ⇒ 不实现(DIV-RT-006)"),
-        )),
+        // `_KEYLAST` / `_MOUSELAST`:最近一次按下的按钮码。
+        //
+        // REA 0.495 `FUN_00427350` case 0x91 读 `DAT_00801908`、case 0x92 读
+        // `DAT_0080190c`;写入点是窗口过程 `FUN_0045a3b4`(WM_KEYDOWN →
+        // `DAT_00801908`;WM_LBUTTONDOWN/RBUTTONDOWN/MBUTTONDOWN →
+        // `DAT_0080190c` = 1/2/4)。脚本用写 0 取消 skip(ERIS `es_Text` 实证)。
+        "_KEYLAST" => Ok(Value::Int(vm.input().keylast())),
+        "_MOUSELAST" => Ok(Value::Int(vm.input().mouselast())),
         // 手册 `basic/svariable.html`:@_CODE_〜 = 各键的按钮码。
         // 键盘/鼠标段 = 引擎按钮码 ABI(REA:`FUN_00427350` case 0x19f..0x21e
         // 经运行期字节表 → VK 计数表下标;值层证据见 `input` 模块文档);

@@ -544,17 +544,27 @@ function setConn(text, kind) {
 // ---------------------------------------------------------------- input
 
 function bindInput() {
+  // 页面只上报**平台原始事件**;键位/按钮名映射统一在 native 的
+  // `yu-platform-input`,页面不复制 ABI 键表。
+  // PointerEvent.button: 0=左 1=中 2=右。
+  const held = new Map();
+
   const press = (event) => {
+    if (event.button < 0 || event.button > 2) return;
     canvas.setPointerCapture?.(event.pointerId);
+    held.set(event.pointerId, event.button);
     sendCursor(event);
-    send({ t: 'input', button: 'MOUSE_L', pressed: true });
-    log('dim', 'input MOUSE_L down');
+    send({ t: 'pointer', button: event.button, pressed: true });
+    log('dim', `pointer ${event.button} down`);
     event.preventDefault();
   };
   const release = (event) => {
+    const button = held.get(event.pointerId) ?? event.button;
+    held.delete(event.pointerId);
+    if (button < 0 || button > 2) return;
     sendCursor(event);
-    send({ t: 'input', button: 'MOUSE_L', pressed: false });
-    log('dim', 'input MOUSE_L up');
+    send({ t: 'pointer', button, pressed: false });
+    log('dim', `pointer ${button} up`);
     event.preventDefault();
   };
   canvas.addEventListener('pointerdown', press);
@@ -565,31 +575,26 @@ function bindInput() {
     sendCursor(event);
   });
   canvas.addEventListener('contextmenu', (event) => event.preventDefault());
+  canvas.addEventListener('wheel', (event) => {
+    // 引擎 WM_MOUSEWHEEL → 一格脉冲;脚本读 `_MOUSE_U/_MOUSE_D`。
+    if (event.deltaY === 0) return;
+    sendCursor(event);
+    send({ t: 'wheel', dy: event.deltaY });
+    log('dim', `wheel ${event.deltaY < 0 ? 'up' : 'down'}`);
+    event.preventDefault();
+  }, { passive: false });
 
-  const KEYMAP = {
-    Enter: 'KEY_ENTER',
-    ' ': 'KEY_SPACE',
-    Escape: 'KEY_ESC',
-    ArrowUp: 'KEY_UP',
-    ArrowDown: 'KEY_DOWN',
-    ArrowLeft: 'KEY_LEFT',
-    ArrowRight: 'KEY_RIGHT',
-    Shift: 'KEY_SHIFT',
-    Control: 'KEY_CTRL',
-    Tab: 'KEY_TAB',
-  };
+  // `event.code` 是布局无关的物理键(winit KeyCode 同名);native 侧
+  // `yu-platform-input::key_button` 负责过滤未声明的键。
   window.addEventListener('keydown', (event) => {
-    const button = KEYMAP[event.key];
-    if (!button) return;
-    send({ t: 'input', button, pressed: true });
-    log('dim', `input ${button} down`);
-    if (event.key !== 'Tab') event.preventDefault();
+    if (event.repeat) return;
+    send({ t: 'key', code: event.code, pressed: true });
+    log('dim', `key ${event.code} down`);
+    if (event.code !== 'Tab') event.preventDefault();
   });
   window.addEventListener('keyup', (event) => {
-    const button = KEYMAP[event.key];
-    if (!button) return;
-    send({ t: 'input', button, pressed: false });
-    log('dim', `input ${button} up`);
+    send({ t: 'key', code: event.code, pressed: false });
+    log('dim', `key ${event.code} up`);
   });
 
   logEl.toggle?.addEventListener('click', () => setLogVisible(logEl.panel.hidden));

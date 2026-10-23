@@ -46,7 +46,7 @@
 | DIV-GFX-023 | 复制/图像日志上限 | note | 16,384 + `dropped_ops()` | — |
 | DIV-GFX-024 | `CGINFO[SX/SY]` 资源图尺寸 | blocked | Unimplemented,不写 LET | 资产元数据 provider(图像头/解码器) |
 | DIV-GFX-025 | INFO 多字段写回顺序 | unimplemented | `gfx.info.multi`,不写 LET | 引擎多字段查询顺序 |
-| DIV-GFX-026 | INFO `COLOR/ONMOUSE*/CAPTION/...` | unimplemented | `gfx.info.unsupported` | 像素/鼠标/窗口 host |
+| DIV-GFX-026 | INFO `COLOR/ONMOUSE*/CAPTION/...` | partial | `ONMOUSE/ONMOUSE2/ONMOUSE3` 已实现(样本/快照源资产);`COLOR` 等仍 `gfx.info.unsupported` | 组/离屏快照真实像素面;COLOR 显式坐标 |
 | DIV-GFX-027 | `IDNO` 十进制后缀拼接 | open | `ID + "." + 十进制` | 重新锚定 CGEND/CGINFO 处理体 |
 | DIV-GFX-028 | 图像层下挂子层目标 | open | 按后序扁平绘制 | 官方引擎合成脚本确认目标 RT |
 | DIV-GFX-029 | pass 复制/图像交错序 | fixed | 按 `CopyOp::seq`/`ImageOp::seq` 交错输出(EVID-T-15) | — |

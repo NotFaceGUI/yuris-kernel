@@ -265,6 +265,15 @@ impl Vm {
             HandlerKind::Textinfo => self.op_textinfo(st, cmd),
             HandlerKind::Labelinfo => self.op_labelinfo(st, cmd),
             HandlerKind::Domain(domain) => {
+                // INPUT/MOUSE 是**输入状态机的一部分**(脚本可读计数器),
+                // 不是纯宿主表现:内核必须自己应用(REA 0x446564/0x44aaa0)。
+                if domain == Domain::System {
+                    match cmd.name.as_str() {
+                        "INPUT" => return self.op_input(st, cmd),
+                        "MOUSE" => return self.op_mouse(st, cmd),
+                        _ => {}
+                    }
+                }
                 // 只在宿主已安装时走新的 LET 写回路径；未安装时保持
                 // M-2 的既有行为（通用域事件 + rt.cmd.unimplemented），
                 // 保证 600 帧普查逐位不变。
@@ -2013,6 +2022,120 @@ impl Vm {
             }
         }
         Ok(StepOutcome::Continue)
+    }
+
+    /// `INPUT[KEY/PAD/MOUSE]`:输入源启用/禁用。
+    ///
+    /// 证据(0.495 REA `0x446564`):
+    /// - `KEY` 槽存在 → `DAT_005b4888 = (byte)value`;
+    /// - `PAD` 槽存在 → `DAT_008015d4 = (byte)value`;
+    /// - `MOUSE` 槽存在 → `DAT_005b488c`,并带一次“重新启用吞掉本次点击”的
+    ///   锁存(`DAT_00801860=1` / `DAT_005b4878=1`)。
+    ///
+    /// 读取侧(`FUN_0041a4b8`)在标志为 0 时**整段跳过**对应源的计数器更新
+    /// (状态冻结),不是把按键当成松开。参数名来自工程 ysc,不写死槽号。
+    fn op_input(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let vals = self.named_command_values(st, cmd)?;
+        let get = |name: &str| {
+            vals.iter()
+                .rev()
+                .find(|(_, n, _)| n == name)
+                .map(|(_, _, v)| v.clone())
+        };
+        let flag = |name: &str| get(name).and_then(|v| v.as_int()).map(|v| v != 0);
+        self.input.apply_input(flag("KEY"), flag("PAD"), flag("MOUSE"));
+        self.emit_domain_from_values("INPUT", Domain::System, &vals);
+        Ok(StepOutcome::Continue)
+    }
+
+    /// `MOUSE[MODE/TIME/MOVE/CLICK/WHEEL/X/Y/CURSOR/HX/HY/ID]`。
+    ///
+    /// 证据(0.495 REA `0x44aaa0`):
+    /// - MODE 0/1/2 写光标显示状态;TIME 写自动隐藏毫秒;
+    /// - MOVE/CLICK/WHEEL 写“自动隐藏后哪些鼠标输入会重新显示光标”的标志;
+    /// - X/Y 写 `app+0x5b8/0x5bc` 并 `SetCursorPos`(内核记录 warp 请求);
+    /// - CURSOR 0..13 选系统光标;HX/HY/ID 是自定义光标热点与图层 ID。
+    ///
+    /// 引擎**不**用 MOVE/CLICK/WHEEL 屏蔽计数器(见 `FUN_0041a4b8`:它们只
+    /// 出现在光标唤醒条件里),所以按钮判定仍读 `_MOUSE_*` 计数器。
+    fn op_mouse(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let vals = self.named_command_values(st, cmd)?;
+        let get = |name: &str| {
+            vals.iter()
+                .rev()
+                .find(|(_, n, _)| n == name)
+                .map(|(_, _, v)| v.clone())
+        };
+        let int = |name: &str| get(name).and_then(|v| v.as_int());
+        let flag = |name: &str| int(name).map(|v| v != 0);
+        let id = match get("ID") {
+            Some(Value::Str(bytes)) => Some(bytes),
+            _ => None,
+        };
+        self.input.apply_mouse(
+            int("MODE"),
+            int("TIME"),
+            flag("MOVE"),
+            flag("CLICK"),
+            flag("WHEEL"),
+            int("CURSOR"),
+            int("X"),
+            int("Y"),
+            int("HX"),
+            int("HY"),
+            id.as_deref(),
+        );
+        self.emit_domain_from_values("MOUSE", Domain::System, &vals);
+        Ok(StepOutcome::Continue)
+    }
+
+    /// 按 ysc 参数名求值全部窗口(空窗口跳过)。
+    ///
+    /// 与 `eval_arg_windows` 的区别:保留参数名,供 INPUT/MOUSE 之类“按名
+    /// 消费、跨版本槽号会漂移”的命令使用(项目范式:不写死槽号)。
+    fn named_command_values(
+        &mut self,
+        st: &mut ExecState,
+        cmd: &Cmd,
+    ) -> Result<Vec<(u8, String, Value)>, VmError> {
+        let names: Vec<String> = self
+            .tables()
+            .boot
+            .yscm
+            .command(cmd.opcode)
+            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let name = names
+                .get(usize::from(w.rec.kind))
+                .cloned()
+                .unwrap_or_default();
+            let value = self.eval_value(st, &w.payload)?;
+            out.push((w.rec.kind, name, value));
+        }
+        Ok(out)
+    }
+
+    fn emit_domain_from_values(
+        &mut self,
+        name: &str,
+        domain: Domain,
+        vals: &[(u8, String, Value)],
+    ) {
+        let args = vals
+            .iter()
+            .map(|(slot, _, value)| ArgValue::new(*slot, value.clone()))
+            .collect();
+        self.emit(VmEvent::DomainCall {
+            frame: self.frame(),
+            domain,
+            name: name.to_string(),
+            args,
+        });
     }
 
     /// `FILEINFO`:文件域查询。**只实现 `EXIST=1 FILE=... LET=...`**。

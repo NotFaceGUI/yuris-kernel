@@ -77,11 +77,16 @@ pub fn input_summary_range(
     let mut bytes = Vec::new();
     for frame in first..first.saturating_add(frames) {
         let state = timeline.effective(frame);
+        // 单帧脉冲(滚轮)只在该精确帧算“按下”;不能沿用 effective 的保持。
+        let mut pressed = state.pressed.clone();
+        if let Some(exact) = timeline.at(frame) {
+            pressed.extend(exact.pulses.iter().cloned());
+        }
         bytes.extend_from_slice(&frame.to_le_bytes());
         bytes.extend_from_slice(&state.cursor.0.to_le_bytes());
         bytes.extend_from_slice(&state.cursor.1.to_le_bytes());
-        bytes.extend_from_slice(&(state.pressed.len() as u64).to_le_bytes());
-        for name in &state.pressed {
+        bytes.extend_from_slice(&(pressed.len() as u64).to_le_bytes());
+        for name in &pressed {
             bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
             bytes.extend_from_slice(name.as_bytes());
         }

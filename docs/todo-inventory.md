@@ -52,6 +52,33 @@
    - `DIV-GFX-053`:复制源层同帧被 `CGEND` 删除 → 命令时刻固定源纹理;
    - `DIV-GFX-054`:COPY 区域缺省坐标应为整幅(不是 0)。
 
+### 2.0a 2026-10-22 输入收口(AU4 已修)
+
+1. **`CGINFO[ONMOUSE*]` 未实现**,导致 `es.BT.MOUSECHECK` 恒不命中、
+   标题/配置/确认弹窗全部点不动 → **fixed(AU4)**:`yu-gfx` 加
+   `TextureSampler`;按 REA `0x43de01/0x43dec8/0x43df7f` 实现
+   `ONMOUSE`(RGB)/`ONMOUSE2`(alpha)/`ONMOUSE3`(alpha+RGB);快照层按
+   `snapshot_files` 源资产采样。组/离屏仍 Unimplemented(`DIV-GFX-055`)。
+2. **`INPUT`/`MOUSE` 只发 DomainCall** → **fixed(AU4)**:内核按
+   `0x446564`/`0x44aaa0` 应用源开关与光标设置;`FUN_0041a4b8` 的整源冻结
+   语义已实现;脚本写回按 `FUN_00447014` 钳制。
+3. **文本推进硬编码 `KEY_ENTER/KEY_CTRL`** → **fixed(AU4)**:改读
+   `TEXT[CLICKBUTTON1..4]`/`SKIPBUTTON1..4]` 的按钮码(`FUN_004046fc`)。
+4. **`_KEYLAST/_MOUSELAST` 读取挂号** → **fixed(AU4)**:REA
+   `FUN_00427350` case 0x91/0x92 + `FUN_0045a3b4`(DIV-RT-033)。
+5. **桌面宿主缺滚轮/右中键/光标模式/关闭路由** → **fixed(AU4)**:
+   `MouseWheel→MOUSE_U/D` 脉冲;`MOUSE[MODE/TIME/MOVE/CLICK/WHEEL/CURSOR]`
+   映射到窗口光标;`CloseRequested` 推 `@_WINDOW_EXEC_CLOSE=1`(二次关闭
+   宿主兜底强制退出)。
+6. **平台键表在桌面/Web 各写一份** → **fixed(AU4)**:新增
+   `yu-platform-input`,键位/光标策略唯一;Web 只送原始 `key/pointer/wheel`
+   事件,由 native 映射。
+7. **极短点击被时间线折叠** → **fixed(AU4)**:`Engine` 记录按下将落在哪个
+   帧;若抬起早于该帧,延后一帧(`deferred_release`)。
+8. **回归**:`cases/title-config-back.json`(标题→設定→戻る→标题);
+   `crates/yu-cli/tests/input_settings.rs`(启动设置);
+   `yu-platform-input` 3 个映射单测。
+
 ### 2.1 既有条目
 
 1. **后端 P1-2:MODE 2 的 DIFFUSE RGB** — **J4 已修**:顶点色=层 A 灰度

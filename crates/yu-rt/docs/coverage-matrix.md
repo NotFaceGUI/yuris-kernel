@@ -54,7 +54,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `S_STR` | vm | 144 | `variable/s_str.html` | `0x4634d8` | ✅ 实现 | 本 600 帧未触发;静态语料有 144 处 |
 | `VARINFO` | vm | 119 | `variable/varinfo.html` | `0x456050` | ✅ 实现 | 保持 |
 | `CGEND` | graphics | 100 | `cg/cgend.html` | `0x43d334` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `CGINFO` | graphics | 100 | `cg/cginfo.html` | `0x43d664` | 🔁 部分(1598 次未实现) | 主路径实现;未实现路径见 §2 |
+| `CGINFO` | graphics | 100 | `cg/cginfo.html` | `0x43d664` | 🔁 部分 | 主路径 + `ONMOUSE/ONMOUSE2/ONMOUSE3` 已实现(需宿主纹理采样器);`COLOR`/多字段顺序仍缺,见 §2 |
 | `WAIT` | vm | 95 | `control/wait.html` | `0x456ae4` | ✅ 实现 | 保持 |
 | `F_FLT` | vm | 72 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
 | `F_STR` | vm | 64 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
@@ -79,7 +79,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `SAVEEND` | save | 5 | `file/saveend.html` | `0x44e1a0` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `DEBUGLIST` | system | 5 | — | `0x4634d8` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
 | `IFBREAK` | vm | 5 | `control/ifbreak.html` | `0x446408` | ✅ 实现 | 本 600 帧未触发;静态语料有 5 处 |
-| `MOUSE` | system | 4 | `system/mouse.html` | `0x44aaa0` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
+| `MOUSE` | system | 4 | `system/mouse.html` | `0x44aaa0` | ✅ 实现 | 内核输入状态(MODE/TIME/MOVE/CLICK/WHEEL/X/Y/CURSOR/HX/HY/ID);光标显示/形状归宿主 |
 | `MENU` | menu | 4 | `menu/menu.html` | `0x449df8` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `MOVIEINFO` | movie | 4 | `movie/movieinfo.html` | `0x44ba2c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `YMVINFO` | vm | 4 | — | `0x459b98` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
@@ -87,7 +87,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `YMV` | vm | 3 | — | `0x458ee0` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
 | `SYSTEM` | system | 2 | — | `0x45023c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `FPS` | system | 2 | `system/fps.html` | `0x4457a8` | ✅ 实现 | 保持 |
-| `INPUT` | system | 2 | `system/input.html` | `0x446564` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
+| `INPUT` | system | 2 | `system/input.html` | `0x446564` | ✅ 实现 | KEY/MOUSE/PAD 源开关;关闭时整源计数器冻结(`FUN_0041a4b8`) |
 | `SOUNDEND` | sound | 2 | `sound/soundend.html` | `0x44f308` | ✅ 宿主 | `yu-sound` 删层(§8) |
 | `TEXT` | vm | 2 | `text/text.html` | `0x453448` | ✅ 实现 | COV-M-02 M-2 重写:OUTPUTMODE/WAIT/CLICK/RETURN/PAGE/CLICKRETURN/CLICKPAGE/CLEAR/AUTO*;CLICK 自动模式让出(REA 0x453448) |
 | `MOVIEEND` | movie | 2 | `movie/movieend.html` | `0x44b9d8` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
@@ -168,10 +168,16 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `FONTINFO` | 3 | 已实现 | 未安装 `GraphicsHost`(宿主查询面;INFO 不是 VM 语义) |
 | `SAVEEND` | 3 | 域事件:save | 域事件已发;查询/写回需宿主状态机 |
 | `LET` | 2 | 已实现 | 2 次:`@_SAVE_PATH` 宿主未注入 1 次 + `_TEXT_FLAG` 写入未取证 1 次 |
-| `MOUSE` | 1 | 域事件:system | 域事件已发;查询/写回需宿主状态机 |
-| `INPUT` | 1 | 域事件:system | 域事件已发;查询/写回需宿主状态机 |
+| `MOUSE` | 1 | 已实现 | 2026-10-22:内核输入状态(REA `0x44aaa0`);本表旧口径为未接线 |
+| `INPUT` | 1 | 已实现 | 2026-10-22:输入源开关(REA `0x446564`);本表旧口径为未接线 |
 | `SOUNDEND` | 1 | 域事件:sound | 域事件已发;查询/写回需宿主状态机 |
 | `ERROR` | 1 | 无处理器 | 手册无页;分发表 opcode 15 走默认处理体 `0x459e90` ⇒ 语义未取证 |
+
+> **2026-10-22 输入收口**:`CGINFO[ONMOUSE/ONMOUSE2/ONMOUSE3]` 已在
+> `yu-gfx` + 宿主 `TextureSampler` 中实现(REA `0x43d664`/`0x43de01`),
+> 按钮系统的 `es.BT.MOUSECHECK` 不再因 `INFO_UNSUPPORTED` 失去命中;
+> 上表 1598 次是“未安装 GraphicsHost”的旧普查口径,不再代表当前缺口。
+> `COLOR`(显式坐标取色)与多字段顺序仍未实现。
 
 ## 3. 系统变量缺口(运行期高频)
 

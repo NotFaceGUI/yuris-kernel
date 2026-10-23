@@ -5,16 +5,16 @@
 > `CONTEXT.md`(术语)。
 >
 > **v1.3 修订**(以 `PROGRESS.md` 成果 K1/J3 与 `docs/audit-2026-10-22.md` 为准):
-> - 实际 crate 数为 **13**(新增 `yu-cli`、`yu-host-desktop`、`yu-host-wasm`、`yu-sound`);不再有“wasm 跑内核”的
+> - 实际 crate 数为 **14**(新增 `yu-cli`、`yu-host-desktop`、`yu-host-wasm`、`yu-sound`、`yu-platform-input`);不再有“wasm 跑内核”的
 >   `yu-backend-wasm` 规划——**架构 B(2026-10-21 主人决定)**:Rust 原生读本机数据
 >   并跑内核,wasm/JS 只做呈现端。
 > - **`RenderBackend` trait 不存在**:两个后端(`yu-backend-soft`、
 >   `yu-backend-wgpu`)消费同一个可序列化 `CompositorFrame`,各自实现一帧渲染;
 >   契约是**数据**(`CompositorFrame`),不是 trait。§5 已按此改写。
 > - `yu-snd` 已以 `yu-sound` 落地(N 任务);`yu-inp`/`yu-save` 尚未建 crate;
->   输入时间线目前在 `yu-rt::input`。
-> - 目录分层:`crates/yu-render/{soft,wgpu}` 放渲染后端,`crates/yu-platform/{host-desktop,host-wasm}`
->   放宿主;其余 crate 在 `crates/` 下。**包名不变**,`cargo -p` 命令不用改。
+>   内核输入语义/时间线在 `yu-rt::input`,宿主侧平台翻译在 `yu-platform-input`。
+> - 目录分层:`crates/yu-render/{soft,wgpu}` 放渲染后端,`crates/yu-platform/{host-desktop,host-wasm,input}`
+>   放宿主与平台输入;其余 crate 在 `crates/` 下。**包名不变**,`cargo -p` 命令不用改。
 > - 帧契约字段以 `crates/yu-gfx/src/frame.rs` 为准(含 `dx_mode`,
 >   见 §5.1 的范围说明)。
 
@@ -119,7 +119,8 @@ flowchart TD
 | `yu-render/soft` · `yu-backend-soft` | `CompositorFrame` 的**确定性参考后端**:纹理解析 + RGBA8 合成 + 快照 + 图像加工 + PNG | gfx, log, vfs | 含游戏语义;读 rt 内部 |
 | `yu-render/wgpu` · `yu-backend-wgpu` | 同一 `CompositorFrame` 的 **wgpu 主后端**:离屏 RGBA8 + 读回;纹理/管线/bind group/快照缓存;独立 WGSL 文件 | gfx, soft(复用像素算法与报告类型), log | 含游戏语义 |
 | `yu-platform/host-wasm` · `yu-host-wasm` | 浏览器**呈现端**(wasm-bindgen):WebGPU shim 优先、Canvas2D 回退;不读游戏数据、不解释渲染语义 | 仅 web-sys/wasm-bindgen | 依赖 rt/gfx/后端/vfs |
-| `yu-platform/host-desktop` · `yu-host-desktop` | **原生桌面宿主**(Windows 首版):winit 窗口 + wgpu 上屏 + egui 调试面板;复用 `yu-cli::Engine`,不复制引擎语义 | cli, render/wgpu, egui/winit | 含游戏语义;直接读数据 |
+| `yu-platform/input` · `yu-platform-input` | 宿主侧输入翻译:**唯一**的物理键码→引擎按钮名、指针/滚轮→按钮、`MOUSE[CURSOR]`→中性形状、光标可见性策略;键表以 `yu-rt` ABI 为准 | rt | 脚本语义;平台窗口/设备 |
+| `yu-platform/host-desktop` · `yu-host-desktop` | **原生桌面宿主**(Windows 首版):winit 窗口 + wgpu 上屏 + egui 调试面板;复用 `yu-cli::Engine`,事件翻译走 `yu-platform-input`,不复制引擎语义 | cli, render/wgpu, platform-input, egui/winit | 含游戏语义;直接读数据 |
 | `yu-cli` | 原生装配:输入时间线 → rt 泵 → 事件分流 → gfx → 后端呈现;本地 HTTP/WS 服务、HMR 监督、用例执行器;默认 `device` feature 接入 cpal 声音输出(`--no-default-features` 为纯 headless) | 全部 | 含游戏语义 |
 | `yu-trace` | 四条边界(①vfs 读 ②事件流 ③帧描述 ④平台命令)JSONL 记录/回放/diff;schema v3 | 全部(旁挂) | 成为运行时依赖 |
 

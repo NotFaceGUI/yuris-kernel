@@ -4029,6 +4029,7 @@ dependencies = [
  "yu-backend-wgpu",
  "yu-gfx",
  "yu-log",
+ "yu-platform-input",
  "yu-rt",
  "yu-sound",
  "yu-vfs",
@@ -4077,6 +4078,7 @@ dependencies = [
  "yu-backend-soft",
  "yu-backend-wgpu",
  "yu-cli",
+ "yu-platform-input",
  "yu-rt",
 ]
 
@@ -4092,6 +4094,13 @@ dependencies = [
 [[package]]
 name = "yu-log"
 version = "0.1.0"
+
+[[package]]
+name = "yu-platform-input"
+version = "0.1.0"
+dependencies = [
+ "yu-rt",
+]
 
 [[package]]
 name = "yu-rt"

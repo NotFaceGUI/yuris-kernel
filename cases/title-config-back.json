@@ -1,0 +1,25 @@
+{
+  "entry": "SYSTEM_START",
+  "expect": {
+    "display_json_sha256": "04b3a79c37027d4583106639904403eddd368a40cfbddad08a72db9ad5ed1bdd",
+    "ops_total": 147,
+    "png_sha256": "a6db617b896dfb8a2f478238c3ef190fe4b0e5e4e825bb19771c8a940d05fc72",
+    "skipped_ops_total": 0
+  },
+  "frames": 470,
+  "inputs": [
+    {
+      "button": "MOUSE_L",
+      "frame": 300,
+      "x": 217,
+      "y": 368
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 390,
+      "x": 750,
+      "y": 565
+    }
+  ],
+  "name": "title-config-back"
+}

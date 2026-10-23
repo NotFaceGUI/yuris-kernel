@@ -36,13 +36,26 @@ use std::time::{Duration, Instant};
 use egui_wgpu::ScreenDescriptor;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
 
 use yu_backend_soft::Surface;
 use yu_cli::engine::Engine;
+use yu_platform_input::{
+    cursor_shape, cursor_visible, key_button, mouse_activity_reactive, wheel_button, CursorClock,
+    CursorShape, MouseActivity, PointerButton,
+};
+
+// 宿主日志与终端输出统一走 `yu-cli::output`(项目纪律:src 内不直接
+// `println!/eprintln!`)。
+macro_rules! host_error {
+    ($($arg:tt)*) => { yu_cli::output::error(format!($($arg)*)) };
+}
+macro_rules! host_line {
+    ($($arg:tt)*) => { yu_cli::output::line(format!($($arg)*)) };
+}
 
 /// 宿主参数(由 `yu-desktop` CLI 填充)。
 #[derive(Clone, Debug)]
@@ -147,7 +160,7 @@ impl Presenter {
             .find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm))
             .unwrap_or(caps.formats[0]);
         if format.is_srgb() {
-            eprintln!(
+            host_error!(
                 "yu-desktop: 警告: surface 只有 sRGB 格式({format:?}),颜色会经过一次 sRGB 编码"
             );
         }
@@ -370,26 +383,52 @@ fn create_target(
 
 // ---------------------------------------------------------------- app
 
-/// 按源画面宽高比计算窗口内的内容矩形(物理像素),其余区域留黑边。
-fn content_rect(win_w: u32, win_h: u32, game_w: u32, game_h: u32) -> (f32, f32, f32, f32) {
+/// 窗口 → 内容矩形等比的**唯一**映射(渲染与输入共用)。
+///
+/// `scale` 是窗口像素/逻辑像素;`(ox, oy)` 是黑边偏移。渲染的
+/// `set_viewport` 与输入的 `logical_from_client` 都从这里取参数,保证
+/// 两者严格互逆 —— 之前两处各写一份公式,`round()` 与浮点路径不同,
+/// hover 会与画面对不上。
+struct FitRect {
+    scale: f64,
+    ox: f64,
+    oy: f64,
+    width: f64,
+    height: f64,
+}
+
+fn fit_rect(win_w: u32, win_h: u32, game_w: u32, game_h: u32) -> FitRect {
     if win_w == 0 || win_h == 0 || game_w == 0 || game_h == 0 {
-        return (0.0, 0.0, win_w as f32, win_h as f32);
+        return FitRect {
+            scale: 1.0,
+            ox: 0.0,
+            oy: 0.0,
+            width: f64::from(win_w),
+            height: f64::from(win_h),
+        };
     }
-    let win_aspect = win_w as f32 / win_h as f32;
-    let game_aspect = game_w as f32 / game_h as f32;
-    if win_aspect > game_aspect {
-        // 窗口更宽 → 左右黑边。
-        let height = win_h as f32;
-        let width = (height * game_aspect).round().clamp(1.0, win_w as f32);
-        let x = ((win_w as f32 - width) * 0.5).max(0.0).round();
-        (x, 0.0, width, height)
-    } else {
-        // 窗口更高 → 上下黑边。
-        let width = win_w as f32;
-        let height = (width / game_aspect).round().clamp(1.0, win_h as f32);
-        let y = ((win_h as f32 - height) * 0.5).max(0.0).round();
-        (0.0, y, width, height)
+    let scale = (f64::from(win_w) / f64::from(game_w))
+        .min(f64::from(win_h) / f64::from(game_h));
+    let width = f64::from(game_w) * scale;
+    let height = f64::from(game_h) * scale;
+    FitRect {
+        scale,
+        ox: (f64::from(win_w) - width) * 0.5,
+        oy: (f64::from(win_h) - height) * 0.5,
+        width,
+        height,
     }
+}
+
+/// 计算游戏画面在窗口内的内容矩形(等比缩放 + 居中黑边)。
+fn content_rect(win_w: u32, win_h: u32, game_w: u32, game_h: u32) -> (f32, f32, f32, f32) {
+    let fit = fit_rect(win_w, win_h, game_w, game_h);
+    (
+        fit.ox as f32,
+        fit.oy as f32,
+        fit.width.max(1.0) as f32,
+        fit.height.max(1.0) as f32,
+    )
 }
 
 /// 调试面板字体。
@@ -418,7 +457,7 @@ fn install_debug_fonts(ctx: &egui::Context) {
                 .or_default()
                 .insert(0, name.clone());
         }
-        eprintln!("yu-desktop: debug UI font: {path}");
+        host_error!("yu-desktop: debug UI font: {path}");
         break;
     }
     ctx.set_fonts(fonts);
@@ -442,6 +481,14 @@ struct App {
     fatal: Option<String>,
     cursor: (i64, i64),
     held: std::collections::BTreeSet<String>,
+    /// 已收到几次关闭请求(第二次强制退出,避免脚本不处理时窗口关不掉)。
+    close_requests: u32,
+    cursor_visible: Option<bool>,
+    cursor_icon: Option<CursorIcon>,
+    /// 最近一次“会唤醒光标”的鼠标输入(毫秒,相对 `started`)。
+    last_mouse_activity_ms: u64,
+    /// 最近一次键盘按下(毫秒,相对 `started`)。
+    last_keyboard_activity_ms: u64,
 }
 
 impl App {
@@ -472,11 +519,16 @@ impl App {
             fatal: None,
             cursor: (0, 0),
             held: Default::default(),
+            close_requests: 0,
+            cursor_visible: None,
+            cursor_icon: None,
+            last_mouse_activity_ms: 0,
+            last_keyboard_activity_ms: 0,
         }
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, message: String) {
-        eprintln!("yu-desktop: {message}");
+        host_error!("yu-desktop: {message}");
         self.fatal = Some(message);
         self.stopping = true;
         event_loop.exit();
@@ -506,24 +558,83 @@ impl App {
     }
 
     fn release_all(&mut self) {
-        let held: Vec<String> = self.held.iter().cloned().collect();
-        for name in held {
-            self.engine.set_input(&name, false);
-        }
+        self.engine.release_all_inputs();
         self.held.clear();
     }
 
-    fn update_cursor_from_position(&mut self, x: f64, y: f64) {
+    /// 窗口客户区像素 → 逻辑坐标(`fit_rect` 的逆映射)。
+    ///
+    /// **不 clamp**:引擎里 `@_MOUSE_X/Y` 在黑边上就是负值/越界值,脚本
+    /// 自己用 `@_MOUSE_X>=0 && <GSX2` 判断“是否在画布内”
+    /// (ERIS `es.BT.MOUSECHECK` / `es_Text`)。夹到边缘会把黑边上的 hover
+    /// 误判成画面边缘。
+    fn logical_from_client(&self, x: f64, y: f64) -> (i64, i64) {
         let (w, h) = self.window_size();
         let (vw, vh) = self.viewport;
-        let (rx, ry, rw, rh) = content_rect(w, h, vw, vh);
-        let gx = ((x - f64::from(rx)) / f64::from(rw.max(1.0)) * f64::from(vw)).round() as i64;
-        let gy = ((y - f64::from(ry)) / f64::from(rh.max(1.0)) * f64::from(vh)).round() as i64;
-        self.cursor = (
-            gx.clamp(0, i64::from(vw.saturating_sub(1))),
-            gy.clamp(0, i64::from(vh.saturating_sub(1))),
+        let fit = fit_rect(w, h, vw, vh);
+        (
+            ((x - fit.ox) / fit.scale) as i64,
+            ((y - fit.oy) / fit.scale) as i64,
+        )
+    }
+
+    fn client_from_logical(&self, x: i64, y: i64) -> (f64, f64) {
+        let (w, h) = self.window_size();
+        let (vw, vh) = self.viewport;
+        let fit = fit_rect(w, h, vw, vh);
+        (x as f64 * fit.scale + fit.ox, y as f64 * fit.scale + fit.oy)
+    }
+
+    fn update_cursor_from_position(&mut self, x: f64, y: f64) {
+        let next = self.logical_from_client(x, y);
+        if next != self.cursor {
+            self.cursor = next;
+            self.sync_cursor();
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// 记录“会唤醒光标”的鼠标输入(`MOUSE[MOVE/CLICK/WHEEL]` 是门控)。
+    fn note_mouse_activity(&mut self, activity: MouseActivity) {
+        let Some(settings) = self.engine.input_settings() else {
+            self.last_mouse_activity_ms = self.now_ms();
+            return;
+        };
+        if mouse_activity_reactive(settings, activity) {
+            self.last_mouse_activity_ms = self.now_ms();
+        }
+    }
+
+    /// 把脚本 `MOUSE[MODE/TIME/CURSOR]` 映射到窗口光标。
+    ///
+    /// 可见性策略在 `yu-platform-input`(与平台无关),这里只做 winit 适配。
+    fn update_cursor_presentation(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let Some(settings) = self.engine.input_settings() else {
+            return;
+        };
+        let visible = cursor_visible(
+            settings,
+            CursorClock {
+                now_ms: self.now_ms(),
+                last_keyboard_ms: self.last_keyboard_activity_ms,
+                last_mouse_ms: self.last_mouse_activity_ms,
+            },
         );
-        self.sync_cursor();
+        if self.cursor_visible != Some(visible) {
+            window.set_cursor_visible(visible);
+            self.cursor_visible = Some(visible);
+        }
+        let icon = winit_cursor_icon(cursor_shape(settings.cursor));
+        if self.cursor_icon != Some(icon) {
+            window.set_cursor(icon);
+            self.cursor_icon = Some(icon);
+        }
     }
 
     fn draw(&mut self, event_loop: &ActiveEventLoop) {
@@ -764,7 +875,7 @@ impl App {
 
         if restart {
             if let Err(error) = self.engine.restart() {
-                eprintln!("yu-desktop: restart 失败: {error}");
+                host_error!("yu-desktop: restart 失败: {error}");
             }
         }
         if hide {
@@ -775,8 +886,8 @@ impl App {
     fn finish(&mut self) {
         if let Some(path) = self.opts.shot.clone() {
             match self.engine.write_png(&path) {
-                Ok(bytes) => println!("shot: {} ({bytes} bytes)", path.display()),
-                Err(error) => eprintln!("yu-desktop: 写截图失败: {error}"),
+                Ok(bytes) => host_line!("shot: {} ({bytes} bytes)", path.display()),
+                Err(error) => host_error!("yu-desktop: 写截图失败: {error}"),
             }
         }
         let elapsed = self.started.elapsed().as_secs_f64();
@@ -785,7 +896,7 @@ impl App {
         } else {
             0.0
         };
-        println!(
+        host_line!(
             "yu-desktop: frames={} elapsed={elapsed:.2}s avg_fps={fps:.1} backend={} viewport={}x{}",
             self.frames,
             self.engine.backend(),
@@ -847,7 +958,7 @@ impl ApplicationHandler for App {
             presenter.format,
             egui_wgpu::RendererOptions::default(),
         );
-        println!(
+        host_line!(
             "yu-desktop: window={}x{} viewport={}x{} gpu={} format={:?}",
             window.inner_size().width,
             window.inner_size().height,
@@ -889,8 +1000,17 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => {
-                self.stopping = true;
-                event_loop.exit();
+                // 引擎语义:WM_CLOSE 只推 `@_WINDOW_EXEC_CLOSE=1`,由脚本
+                // 弹确认框/决定是否 END;宿主不得直接退出。脚本不处理时,
+                // 第二次关闭请求强制退出(宿主兜底,不是引擎语义)。
+                self.close_requests += 1;
+                if self.engine.main_finished() || self.close_requests >= 2 {
+                    self.stopping = true;
+                    event_loop.exit();
+                } else {
+                    self.engine.request_window_close();
+                    host_error!("yu-desktop: close requested → @_WINDOW_EXEC_CLOSE=1");
+                }
             }
             WindowEvent::Resized(size) => {
                 if let Some(presenter) = self.presenter.as_mut() {
@@ -907,6 +1027,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => self.draw(event_loop),
             WindowEvent::CursorMoved { position, .. } => {
                 if !egui_consumed && !self.egui_ctx.egui_wants_pointer_input() {
+                    self.note_mouse_activity(MouseActivity::Move);
                     self.update_cursor_from_position(position.x, position.y);
                 }
             }
@@ -914,14 +1035,26 @@ impl ApplicationHandler for App {
                 if egui_consumed || self.egui_ctx.egui_wants_pointer_input() {
                     return;
                 }
-                let name = match button {
-                    MouseButton::Left => Some("MOUSE_L"),
-                    MouseButton::Right => Some("MOUSE_R"),
-                    MouseButton::Middle => Some("MOUSE_M"),
-                    _ => None,
-                };
-                if let Some(name) = name {
+                if let Some(name) = winit_pointer_button(button).name() {
+                    if state == ElementState::Pressed {
+                        self.note_mouse_activity(MouseActivity::Click);
+                    }
                     self.set_button(name, state == ElementState::Pressed);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if egui_consumed || self.egui_ctx.egui_wants_pointer_input() {
+                    return;
+                }
+                // 引擎 `FUN_0045a3b4` WM_MOUSEWHEEL → 一格脉冲;脚本读
+                // `_MOUSE_U/_MOUSE_D`(ycd 码 5/6)。winit 正 y = 向上。
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+                    MouseScrollDelta::PixelDelta(position) => position.y,
+                };
+                if let Some(name) = wheel_button(dy) {
+                    self.note_mouse_activity(MouseActivity::Wheel);
+                    self.engine.pulse_input(name);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -929,7 +1062,9 @@ impl ApplicationHandler for App {
                     return;
                 };
                 let pressed = event.state == ElementState::Pressed;
-                if code == KeyCode::F1 && pressed && !event.repeat {
+                // F1 只在显式启用调试面板(`--debug-ui`)时归宿主;否则
+                // 透传给游戏(引擎不把 F1 当调试键)。
+                if code == KeyCode::F1 && pressed && !event.repeat && self.opts.debug_ui {
                     self.show_debug = !self.show_debug;
                     return;
                 }
@@ -939,7 +1074,10 @@ impl ApplicationHandler for App {
                 {
                     return;
                 }
-                if let Some(name) = key_name(code) {
+                if pressed && !event.repeat {
+                    self.last_keyboard_activity_ms = self.now_ms();
+                }
+                if let Some(name) = key_button(&format!("{code:?}")) {
                     self.set_button(&name, pressed);
                 }
             }
@@ -957,6 +1095,8 @@ impl ApplicationHandler for App {
             event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
             return;
         }
+        // 脚本在 tick 内读 `@_MOUSE_X/Y`;坐标来源只有 `CursorMoved`
+        // (与 winit/系统一致的普通鼠标路径,不做额外轮询)。
         let tick_started = Instant::now();
         match self.engine.tick_realtime() {
             Ok(rendered) => {
@@ -974,7 +1114,7 @@ impl ApplicationHandler for App {
         let draw_ms = draw_started.elapsed().as_secs_f64() * 1000.0;
         if self.frames <= 8 || self.frames % 60 == 0 {
             let report = self.engine.last_report();
-            eprintln!(
+            host_error!(
                 "frame {}: host_tick={tick_host_ms:.1}ms engine_tick={:.1}ms engine_render={:.1}ms draw={draw_ms:.1}ms",
                 self.frames, report.tick_ms, report.render_ms
             );
@@ -982,13 +1122,20 @@ impl ApplicationHandler for App {
         if self.frames == 1 || self.frames == 4 {
             let top = self.engine.top_commands(10);
             if !top.is_empty() {
-                eprintln!("[profile] top commands (frame {}):", self.frames);
+                host_error!("[profile] top commands (frame {}):", self.frames);
                 for (name, hits) in top {
-                    eprintln!("  {name}: {hits}");
+                    host_error!("  {name}: {hits}");
                 }
             }
         }
         if self.fatal.is_some() {
+            return;
+        }
+        self.update_cursor_presentation();
+        // 脚本 `END`(主任务结束)→ 正常收尾。
+        if self.engine.main_finished() {
+            self.stopping = true;
+            event_loop.exit();
             return;
         }
         if let Some(limit) = self.opts.frames {
@@ -1008,45 +1155,33 @@ impl ApplicationHandler for App {
     }
 }
 
-/// winit `KeyCode` → 引擎按钮名(`crates/yu-rt/data/button-code-abi.tsv`)。
-///
-/// 只返回 ABI 表里存在的键;未知键显式丢弃,不猜。
-fn key_name(code: KeyCode) -> Option<String> {
-    let raw = format!("{code:?}");
-    let suffix: String = if let Some(rest) = raw.strip_prefix("Key") {
-        rest.to_string()
-    } else if let Some(rest) = raw.strip_prefix("Digit") {
-        rest.to_string()
-    } else if let Some(rest) = raw.strip_prefix("Numpad") {
-        format!("NUM{rest}")
-    } else {
-        match raw.as_str() {
-            "ArrowUp" => "UP".to_string(),
-            "ArrowDown" => "DOWN".to_string(),
-            "ArrowLeft" => "LEFT".to_string(),
-            "ArrowRight" => "RIGHT".to_string(),
-            "Enter" => "ENTER".to_string(),
-            "Space" => "SPACE".to_string(),
-            "Escape" => "ESC".to_string(),
-            "Backspace" => "BS".to_string(),
-            "Tab" => "TAB".to_string(),
-            "ShiftLeft" | "ShiftRight" => "SHIFT".to_string(),
-            "ControlLeft" | "ControlRight" => "CTRL".to_string(),
-            "AltLeft" | "AltRight" => "ALT".to_string(),
-            "PageUp" => "PAGEUP".to_string(),
-            "PageDown" => "PAGEDOWN".to_string(),
-            "Home" => "HOME".to_string(),
-            "End" => "END".to_string(),
-            "Insert" => "INSERT".to_string(),
-            "Delete" => "DELETE".to_string(),
-            other if other.starts_with('F') && other[1..].parse::<u8>().is_ok() => {
-                other.to_string()
-            }
-            _ => return None,
-        }
-    };
-    if yu_rt::input::button_code(&suffix).is_none() {
-        return None;
+/// winit 鼠标按钮 → 平台中性的指针按钮(命名与 `event.button` 同源)。
+fn winit_pointer_button(button: MouseButton) -> PointerButton {
+    match button {
+        MouseButton::Left => PointerButton::Left,
+        MouseButton::Middle => PointerButton::Middle,
+        MouseButton::Right => PointerButton::Right,
+        MouseButton::Back => PointerButton::Other(3),
+        MouseButton::Forward => PointerButton::Other(4),
+        MouseButton::Other(n) => PointerButton::Other(u16::from(n)),
     }
-    Some(format!("KEY_{suffix}"))
+}
+
+/// 平台中性光标形状 → winit 光标。
+fn winit_cursor_icon(shape: CursorShape) -> CursorIcon {
+    match shape {
+        CursorShape::Default => CursorIcon::Default,
+        CursorShape::Text => CursorIcon::Text,
+        CursorShape::Wait => CursorIcon::Wait,
+        CursorShape::Crosshair => CursorIcon::Crosshair,
+        CursorShape::VerticalArrows => CursorIcon::NsResize,
+        CursorShape::DiagonalDown => CursorIcon::NwseResize,
+        CursorShape::DiagonalUp => CursorIcon::NeswResize,
+        CursorShape::HorizontalArrows => CursorIcon::EwResize,
+        CursorShape::FourWay => CursorIcon::AllScroll,
+        CursorShape::NotAllowed => CursorIcon::NotAllowed,
+        CursorShape::Hand => CursorIcon::Pointer,
+        CursorShape::Progress => CursorIcon::Progress,
+        CursorShape::Help => CursorIcon::Help,
+    }
 }

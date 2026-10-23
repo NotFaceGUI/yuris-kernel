@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use yu_backend_soft::RenderReport;
+use yu_platform_input::{key_button, wheel_button, PointerButton};
 
 use crate::args::ArgReader;
 use crate::build_info;
@@ -278,6 +279,10 @@ enum Control {
         button: String,
         pressed: bool,
     },
+    /// 单帧脉冲(滚轮一格):下一逻辑帧按下、随后自动抬起。
+    Pulse {
+        button: String,
+    },
     Cursor {
         x: i64,
         y: i64,
@@ -328,6 +333,7 @@ fn engine_loop(
         while let Ok(control) = control_rx.try_recv() {
             match control {
                 Control::Input { button, pressed } => engine.set_input(&button, pressed),
+                Control::Pulse { button } => engine.pulse_input(&button),
                 Control::Cursor { x, y } => engine.set_cursor(x, y),
                 Control::Restart => {
                     output::line("restart: 丢 Vm+GfxState,保留渲染器/纹理缓存");
@@ -809,9 +815,28 @@ fn parse_control(text: &str) -> Option<Control> {
     let value = crate::json::parse(text).ok()?;
     let kind = value.get("t")?.as_str()?;
     match kind {
+        // 兼容旧页面/脚本:直接给引擎按钮名。
         "input" => Some(Control::Input {
             button: value.get("button")?.as_str()?.to_string(),
             pressed: value.get("pressed")?.as_bool()?,
+        }),
+        "pulse" => Some(Control::Pulse {
+            button: value.get("button")?.as_str()?.to_string(),
+        }),
+        // 平台原始事件:映射只在本进程(`yu-platform-input`),页面不复制键表。
+        "key" => Some(Control::Input {
+            button: key_button(value.get("code")?.as_str()?)?,
+            pressed: value.get("pressed")?.as_bool()?,
+        }),
+        "pointer" => {
+            let button = PointerButton::from_index(value.get("button")?.as_f64()? as i64)?;
+            Some(Control::Input {
+                button: button.name()?.to_string(),
+                pressed: value.get("pressed")?.as_bool()?,
+            })
+        }
+        "wheel" => Some(Control::Pulse {
+            button: wheel_button(value.get("dy")?.as_f64()?)?.to_string(),
         }),
         "cursor" => Some(Control::Cursor {
             x: value.get("x")?.as_f64()? as i64,

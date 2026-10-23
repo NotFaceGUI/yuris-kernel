@@ -4530,3 +4530,193 @@ $ psb-render … --var face_mouth=30 --var face_eyebrow=40 --var face_eye_open=2
 - M4 官方像素对拍(oracle 宿主已能 CreatePlayer/Update/Render,但 draw
   list 仍为空;YSEmote 导出是 stdcall,已修正 oracle 的调用约定);
 - 内核适配层接线。
+
+## 成果 E1-M2 续 3 (2026-10-22) · 真实 Nekopara 模型、时间线、sprite mesh 与 mask 底层修复
+
+> 对照公开实现(eluna 所引 native `sub_10353CF0`/`sub_1038B340`/
+> `sub_10337560`,只取事实、未复制代码)修正“眼睛溢出/歪脖子变小”的底层
+> 几何语义,并把 PSB v4 `ems` 的真实游戏模型纳入验证。
+
+### 1. 新增能力(`yu-emote`)
+
+- **PSB v4 `ems`**:Nekopara `*.pure.psb` 为 `spec: ems`、`source.tex` 单页
+  4096² `RGBA8`、四位字符串 icon 键;`texture::decode_page` 按格式分派,
+  `schema` 接受 `source: "tex"`。已渲染 chocola/vanilla/azuki/coconut
+  四个 maid 模型。
+- **时间线播放**:`psb-render --timeline NAME --seconds T [--loop] [--fps N]`
+  用 `Animator` 推进 timeline,再交给 pose;`--view SCALE,X,Y` 固定相机。
+  demo 用 `待機ループ00` 生成 6 帧循环,页面支持实时循环播放。
+- **sprite mesh 继承**(本次核心修复):`mesh.bp` 是归一化到 sprite icon box
+  的 4×4 Bezier patch,不是世界空间 warp。仅
+  `meshTransform == 1 && (meshSyncChildMask & 8)` 的祖先把 patch 折叠给
+  子层;折叠是控制点位移逐点相加(`dst = next + (self - identity)`),绘制
+  时在 sprite 自身 box 内采样。眼部 `UD→LR→hitomi_sp→eye_R`、头/身/口/
+  眉形变链现在都生效;中性帧不再对单位 patch 做无意义细分。
+- **composite mask source 展开**:owner 的 `stencilCompositeMaskLayerList`
+  在 owner 的 motion scope 内解析;type-0 source 贡献自身几何,type-3
+  source 展开为嵌套 player 内所有实际 sprite。修复嵌套眼/泪 source 漏配。
+
+### 2. 验证
+
+```text
+$ cargo test        # lib 21 + pose 7 + sample 1 + schema 5 + roundtrip 2 + yuris 5 + doc 1 全绿
+$ cargo clippy --all-targets   # 0 warnings
+$ cargo fmt --check            # clean
+$ psb-render emote_test.dec.psb --time 0
+  items=30 triangles=60 mask_sources=2 bbox=(95,20,704,1059)
+$ psb-render chocola-maid.pure.psb --time 0
+  items=34 triangles=68 mask_sources=2 bbox=(34,121,779,938)
+$ psb-render … --var face_eye_open=25 --var face_mouth=30 --var face_eyebrow=40
+  triangles=3260;笑颜眼部由 mesh 压缩,composite mask 裁剪,不再溢出
+```
+
+- 固定相机下 neutral/smile/angry 的 bbox 完全一致(34,121,779,938);
+  `head_slant=30` 仅 ±8° 旋转(模型自身幅度),bbox (23,111,796,938),
+  不再出现“歪脖子变小”。
+
+### 3. demo
+
+- `demo/make_demo.py` 支持多模型 `--model LABEL=PATH`,每个模型从 neutral
+  推导固定相机,渲染 4 表情 + 6 帧 `待機ループ00`;单文件
+  `target/emote-demo/index.html`(5 模型,约 6.9 MB,WebP 内嵌)。
+- 页面含角色/表情切换、空格实时循环、帧计数;真实游戏资产只在本地测试,
+  不入库、不随 demo 分发(NOTICE 已声明)。
+
+### 4. 仍挂账
+
+- 参数化 mesh combinator(`rawMeshList` + variable + neutralIndex)与
+  coord/angle/zoom sync(`meshSyncChildMask` bit 0/1/2);
+- type-7 clip rect、非默认 blend(Coconut 32 项)、pixelate、wgpu 管线;
+- 物理控制器、差分淡入曲线、官方帧率;
+- M4 官方像素对拍(oracle 可 CreatePlayer/Update/Render,draw list 仍空);
+- 内核适配层接线(submodule gitlink 待主人提交)。
+
+## 成果 E1-M2 续 4 (2026-10-22) · 继承源 / mesh sync / mesh combinator / blend 对齐
+
+> 继续按 eluna(库 crate 元数据 **MPL-2.0**,player 为 MIT OR Apache-2.0;
+> 仅作行为参考,未复制源码)所引 native 语义对齐。`NOTICE` 已把 eluna 从
+> “无许可”更正为 MPL-2.0。
+
+### 1. 本轮实现(`yu-emote`)
+
+- **native 继承源**:`inheritMask & 0x400000` 的层对继承透明,后代沿用其
+  上方 source;`inherit_source` 单独保存 linear/linear_state/location/
+  coordinate/opacity/mesh_sync。partial inherit 先按 mask 减去 motion root
+  通道,构建相对矩阵,再在外侧乘 root 矩阵;嵌套 type-3 motion 以闭合层
+  复合状态作为新 player 的 synthetic root。
+- **meshSyncChildMask 0x1/0x2/0x4**:子层坐标按 `patch.domain` 映射;
+  角度/缩放用 ±0.0001 差分的轴平均角与三角面积开方(`sub_10335500`)。
+- **meshCombinator**:解析 `combinatorList` + `rawMeshList` 资源,按变量
+  在 `meshCount` 个 patch 间插值,`neutralIndex` 为单位 patch;首条目按
+  `parameterize` key 决定 self patch,其余作为 child patch(identity 位移)。
+- **blend/MODULATE2X**:CPU 光栅实现 `sub_1041A190` 的 0..5 blend 表;
+  MODULATE2X 帧默认 vertex color 改为 `0x808080FF`(×2=白),bm=0 帧仍为白。
+  `unsupported_blend` 统计改为 `non_default_blend`(仅 low nibble 1..5)。
+- **mesh division/domain** 随 patch 传播;unit patch 不再无意义细分。
+
+### 2. 对照证据
+
+- eluna 窗口/dump 对 ERIS 的 **draw order** 可直接读取:32 sprites、30
+  visible,标签序列与本实现 `psb-plan` 输出逐项一致(後髪/下半身/腕/裙/
+  胴/耳/胸/輪郭/横髪/口/頬/目影/眉/前髪/shirome/鼻/eye_L/hi_L/mabuta/
+  eye_R/hi_R/mabuta)。eluna 的预览投影本身有偏移(窗口画面被拉伸),因此
+  只把其 draw list 当顺序证据,不当像素 oracle。
+- Chocola neutral 在继承源修复后仅有轻微像素变化(bbox 不变),smile 帧
+  逐像素不变;说明修复命中的是结构性继承链而非主要可见层。
+- `cargo test`:lib 25 + 其余全绿;clippy/fmt clean。
+
+### 3. 仍挂账
+
+- type-7 clip rect、inner/outer stencil phase、type-9 anchor、type-10
+  feedback、particle、pixelate、wgpu 管线;
+- 物理控制器(bust/hair/parts)、差分淡入曲线、官方帧率;
+- M4 官方像素对拍(oracle 的官方 draw list 仍为空;D3D9 回读全黑);
+- 内核适配层接线(submodule gitlink 待主人提交)。
+
+## 成果 AU4 (2026-10-22) · 输入闭环:INPUT/MOUSE、按钮命中、关闭与平台映射收敛
+
+> 目标:让真实语料的按钮/弹窗“点得动、关得掉”,并把平台差异从内核里
+> 彻底隔离。证据全部来自 0.495 官方 `yu-ris.exe`(sha256 `4f5eefa3…`)
+> 的新一轮 REA 反编译 + 手册 + ERIS 真实脚本。
+
+### 1. 取证(新增,均为 0.495 一手)
+
+| 对象 | 地址/页 | 事实 |
+|---|---|---|
+| `INPUT` 处理体 | `0x446564` | KEY→`0x5b4888`、PAD→`0x8015d4`、MOUSE→`0x5b488c`(带重启用锁存) |
+| `MOUSE` 处理体 | `0x44aaa0` | MODE/TIME/MOVE/CLICK/WHEEL/X/Y/CURSOR/HX/HY/ID;X/Y 写 `app+0x5b8/0x5bc` 并 `SetCursorPos` |
+| 输入轮询 | `FUN_0041a4b8` | 三个源开关分别**整段跳过**鼠标/键盘/手柄计数器更新;MOVE/CLICK/WHEEL 只参与“自动隐藏后唤醒光标”判定 |
+| 四态转移 | `FUN_00461530` + `0x801e84` | `0/0→-1`、`0/1→1`、`1/0→-1`、`1/1→+1` |
+| 脚本写回钳制 | `FUN_00447014` | 未按住:正数/零→0,负数保留;按住:正数保留,零/负→0 |
+| `_KEYLAST/_MOUSELAST` | `FUN_00427350` case 0x91/0x92 | 读 `DAT_00801908` / `DAT_0080190c`;写入点 `FUN_0045a3b4`(L/R/M=1/2/4) |
+| 文本推进 | `FUN_004046fc` | 读 `TEXT[CLICKBUTTON1..4]`/`SKIPBUTTON1..4]` 的**按钮码**计数器,不是硬编码键名 |
+| `CGINFO[ONMOUSE*]` | `0x43d664` → `0x43de01/0x43dec8/0x43df7f` | ONMOUSE=`r|g<<8|b<<16`;ONMOUSE2=`a`;ONMOUSE3=alpha+RGB;不在部件内=-1 |
+| 手册 | `system/input.html` / `system/mouse.html` / `cg/cginfo.html` | 源开关、光标模式/时间/反应开关、ONMOUSE 语义 |
+
+### 2. 实现
+
+- `yu-rt::input`:计数器改为**按引擎按钮码**存储(0=`_KEY_ANY`,1..7=鼠标,
+  8..=键盘,384+=手柄);新增 `InputSettings`(源开关 + MOUSE 字段)、
+  四态 `Counter`、写回钳制、`_KEYLAST/_MOUSELAST`、单帧脉冲。
+- `yu-rt::vm`:新增 `op_input`/`op_mouse`(按 ysc 参数名消费,不写死槽号);
+  `text_advance_requested` 改用 `TextState.click_buttons/skip_buttons`;
+  `GraphicsHost::set_pointer` 每逻辑帧把光标推给 gfx。
+- `yu-gfx`:`GfxState.pointer` + `TextureSampler`;实现
+  `CGINFO[ONMOUSE/ONMOUSE2/ONMOUSE3]`。快照层按 `snapshot_files` 的源资产
+  采样(ERIS 按钮 `BT.OFF...` 正是 `COPY2` 快照),组/离屏显式 Unimplemented。
+- `yu-cli::Engine`:注入 `StoreSampler`(独立 `TextureStore`);极短点击的
+  `pressed_for/deferred_release`(按下至少被一帧看到);`pulse_input`(滚轮);
+  `request_window_close` → `@_WINDOW_EXEC_CLOSE=1`;`input_settings/main_finished`。
+- `yu-platform-input`(新 crate):平台事件 → 引擎按钮名的**唯一**映射;
+  键表以 `button_code` ABI 为准;光标形状/可见性纯函数化。桌面把 winit
+  `KeyCode` 直接交给它;Web 页面只发 `{t:'key',code}` / `{t:'pointer'}` /
+  `{t:'wheel',dy}`,由 native 侧映射。`yu-desktop` 的鼠标右/中键、滚轮、
+  CURSOR/MODE/TIME 全部接线。
+- `yu-cli serve`:`pulse` 控制 + `key/pointer/wheel` 原始事件;Web 不再复制键表。
+
+### 3. 验证(原始输出)
+
+```text
+$ cargo test -p yu-rt --lib input
+running 10 tests ... test result: ok. 10 passed; 0 failed
+
+$ cargo test -p yu-platform-input
+running 3 tests ... test result: ok. 3 passed
+
+$ cargo test -p yu-cli --test input_settings -- --ignored --nocapture
+test startup_input_settings_match_es_first ... ok
+
+$ yu-cli case <project-eris> --all
+case first-screen: PASS
+case record-events-off: PASS
+case until-visible: PASS
+case title-config-back: PASS
+4 passed; 0 failed
+```
+
+`cases/title-config-back.json`:第 300 帧点 `設定(217,368)`,第 390 帧点
+`戻る(750,565)`,第 470 tick 回到标题(147 ops / 0 skipped)。
+
+真实桌面宿主(winit + wgpu,release)人工验收:标题 → 設定 → 戻る → 标题;
+第一次窗口关闭只推 `@_WINDOW_EXEC_CLOSE=1`(标题脚本不处理,窗口保留),
+第二次关闭强制退出。
+
+### 4. 性能口径(回答“为什么卡”)
+
+- `target/release/yu-cli run … --frames 300 --backend wgpu`:
+  `avg tick 5.03ms / avg render 1.44ms`;soft 为 `avg tick 5.59ms /
+  avg render 24.89ms`。
+- `yu-desktop` **debug** 构建:title 首帧 `engine_tick=6778ms`,稳态
+  `tick≈32ms + render≈8ms`;这是未优化构建,不是正常游玩口径。
+  `yu-desktop` 现在在 debug 构建启动时显式提示用 `--release`。
+- 配置画面**首次**打开有一帧约 1.1s(release):该帧执行 ERIS 配置场景的
+  大量脚本(`LET` 百万级),属一次性场景装载;稳态为 4–13ms。
+  `TextureSampler` 实测 10 次调用 / 2 次解码 / 0.2ms,不是热点。
+
+### 5. 仍挂账
+
+- `DIALOG`(原生模态框,手册 `other/dialog.html`;处理体 `0x43fc74`):
+  需要宿主 UI + 任务阻塞/LET 写回;当前保持 Unimplemented。窗口关闭在
+  场景/文本中会走 `DIALOG` 确认,未实现时表现为“第一次关闭被脚本消费但
+  不退出,第二次关闭由宿主强制退出”。
+- `CGINFO[COLOR]`(显式坐标取色)、`ONMOUSE*` 对组/离屏快照的真实像素面。

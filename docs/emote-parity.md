@@ -294,19 +294,51 @@ tex#1  512x256  RGBA4444 icons=13  resource=0 (   262,144 B, sha256 44819f5b…)
 - **YSEmote 导出为 stdcall**(`RET imm`);按 cdecl 声明会在数次 Update 后
   破坏栈。ordinal 254 = `Update(seconds)`,255 = render,内部转发到
   `[impl+8]` 的 device render loop。
-- 新增 `--only/--skip` 调试过滤与 `demo/make_demo.py`(多角色 × 4 表情,
-  单文件 HTML,含真实 PSB 渲染帧;WebP 内嵌)。
+- 新增 `--only/--skip/--limit` 调试过滤与 `demo/make_demo.py`(多角色 ×
+  4 表情 + 待機ループ,单文件 HTML;WebP 内嵌)。
+- **时间线播放**:`psb-render --timeline NAME --seconds T [--loop]` 用
+  `Animator` 推进 timeline 并把求值变量交给 pose;demo 用
+  `待機ループ00` 生成 6 帧循环。`--view SCALE,X,Y` 固定相机,避免
+  `head_slant` 等姿态因 auto-fit 改变大小(此前“歪脖子变小”的根因)。
+- **sprite mesh 继承(2026-10-22 修复,对照 eluna 所引 native
+  `sub_10353CF0`/`sub_1038B340`)**:`mesh.bp` 是归一化到 sprite icon box
+  的 4×4 Bezier patch,**不是世界空间 warp**。native 仅把
+  `meshTransform == 1 && (meshSyncChildMask & 8)` 的祖先 patch 折叠进
+  子层;折叠方式是控制点位移逐点相加(`dst = next + (self - identity)`),
+  不是 Bezier 复合。绘制时每个 sprite 用自己的 icon box 采样累积 patch
+  (`left + p*width`,`top + p*height`)。此前把 `mesh.bp` 当世界 warp 会撕
+  裂角色;现在眼部 `UD/LR/hitomi_sp/eye_pos`、头/身/口/眉的形变链都按此
+  实现,笑颜/闭眼/歪头不再溢出或缩放。
+- **composite mask source 解析(同期修复)**:`stencilCompositeMaskLayerList`
+  的 label 在 owner 所在 motion player 内解析;type-0 source 贡献自身可见
+  几何,type-3 source 是嵌套 player 代理,必须展开为其下所有实际绘制的
+  sprite(`sub_10337560` + `sub_103390C0` second pass)。仅按 label+scope
+  匹配会漏掉嵌套眼/泪的 source。
+- **meshSyncChildMask 0x1/0x2/0x4(2026-10-22 补齐)**:坐标按
+  `patch.domain` 映射;角度/缩放在 ±0.0001 差分上按 `sub_10335500` 的
+  X/Y 轴平均角与三角面积开方计算,并只写入 `inheritMask` 选中的通道。
+- **meshCombinator(2026-10-22 补齐)**:`combinatorList` 按变量在
+  `rawMeshList` 资源的 `meshCount` 个 patch 间插值,`neutralIndex` 取单位
+  patch;首个条目在 key 与层 `parameterize` 匹配(或无 parameterize)时作为
+  self patch,其余作为 child patch(相对 identity 的位移)。
+- **native 继承源(2026-10-22 补齐)**:`inheritMask & 0x400000` 的层对继承
+  透明,后代继续使用其上方的 source;partial inherit 先减去 motion root
+  通道、构建相对矩阵,再在外侧乘 root 矩阵(`sub_10331060`)。
+- **blend/MODULATE2X(2026-10-22 补齐)**:CPU 路径实现 `sub_1041A190`
+  的 0..5 blend 表;MODULATE2X 帧的中性 vertex color 是 `0x808080FF`,
+  ×2 后为白。
 - **PSB v4 `ems` 支持**:Nekopara 系列为 `spec: ems`、`source.tex` 单页
   4096² `RGBA8`、icon 键为四位字符串(`"0020"`),不是 v2 的
   `tex#0/tex#1` + `RGBA4444`。已用 `NekoWebShow` 镜像的
   chocola/vanilla/azuki/coconut maid 模型验证:
   87 icons、21 objects / 48 motions、base motion `タイムライン構造`;
-  time 0 每个角色 34 个 draw item、25472 三角形、2 个 mask source。
+  time 0 每个角色 34 个 draw item、中性帧 68 三角形(仅非单位 mesh 才
+  细分;笑颜帧约 3.3k)、2 个 mask source。
   Coconut 有 32 个非默认 blend item,CPU 路径按普通 alpha 输出(待 M4 修正)。
   这些游戏资产只在本地测试,不入库、不随 demo 分发。
 
-- 仍缺:参数化 deformer mesh 对子层的继承(头 `head_UD/head_LR` 的
-  网格变形)、pixelate、wgpu 管线、物理控制器、官方像素对拍。
+- 仍缺:type-7 clip rect、inner/outer stencil phase、type-9 anchor、
+  type-10 feedback、particle、pixelate、wgpu 管线、物理控制器、官方像素对拍。
 
 **未做**:物理控制器(bust/hair/parts)的数值求值、差分淡入曲线、参数化
 deformer mesh 继承、wgpu 管线、官方像素对拍。

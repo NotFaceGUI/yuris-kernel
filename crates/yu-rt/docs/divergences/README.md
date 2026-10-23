@@ -12,7 +12,7 @@
 | DIV-RT-003 | 整数除零/取模 0 | open | 引擎为硬件异常;内核 Fatal |
 | DIV-RT-004 | 「实参缺席」的运算符缺右操作数形态 | open | 已按语料唯一形态容忍 |
 | DIV-RT-005 | 脚本执行错误后的引擎继续策略 | open | 内核一律「让出+结束+记录」 |
-| DIV-RT-006 | 输入键码 `_CODE_*` / `_INP` / `_PAD` 的码值 | fixed | REA 证结构(VK 计数表)+ 手册不变量定值;`_KEYLAST/_MOUSELAST` 读取仍挂号 |
+| DIV-RT-006 | 输入键码 `_CODE_*` / `_INP` / `_PAD` 的码值 | fixed | REA 证结构(VK 计数表)+ 手册不变量定值;`_KEYLAST/_MOUSELAST` 已另证(DIV-RT-033) |
 | DIV-RT-007 | 工程 ycd 声明但手册无页的系统变量 | open | 一律 `Unimplemented` |
 | DIV-RT-008 | `_`(文本输出)手册无页 | fixed | 手册 basic.html ●テキスト表示有页(`_[式]`);已实现,撤销旧挂账 |
 | DIV-RT-009 | `_TIME`/`_OS_TIME` 的时区与纪元 | open | 注入时钟固定 UTC |
@@ -39,7 +39,7 @@
 | DIV-RT-030 | 手册检索的二进制误判 | fixed | 手册 html 含非文本字节,普通 grep 误报"无页";字节级 grep 重审全表 |
 | DIV-RT-031 | `_TEXT`/`_MENUCODE`/`_WINDOW_EXEC_*` 状态系统变量 | fixed | 手册有页;内核状态 + 宿主 setter |
 | DIV-RT-032 | `_TEXT_FLAG` 的控制字节流 | open | 读取 + `WORD`/`_`/`TEXT`/`RETURNCODE` 写入已按 REA 实现;脚本写入 `_TEXT_FLAG` 仍挂号 |
-| DIV-RT-033 | `_KEYLAST`/`_MOUSELAST` 读取 | open | 手册无页(两版核对);InputState 内部照常记录 |
+| DIV-RT-033 | `_KEYLAST`/`_MOUSELAST` 读取 | fixed | 手册无页,但 REA `FUN_00427350` case 0x91/0x92 直接读 `DAT_00801908`/`DAT_0080190c`;写入点 `FUN_0045a3b4`(WM_KEYDOWN / WM_LBUTTONDOWN=1 / R=2 / M=4) |
 | DIV-RT-034 | panic 收口(任务书 E R7) | fixed | IFBREAK LV=0 / GOSUB·RETURN 参数名越界 / DIMSIZE·维长乘积防御上限 |
 | DIV-RT-035 | 文本让出点是 `RETURNCODE`,不是 `WORD`/`_` | fixed | 任务书 E R3;REA 实证(见下) |
 | DIV-RT-036 | 主任务 ID = 脚本可见 `SYSTEM` | fixed | 手册 + 引擎启动链均按名称 `SYSTEM` 建任务 |
@@ -492,10 +492,15 @@ packed = ([1290322, 329227, 26, 249, 8765, 8765], 0, "cd1790…4bd2e")  ... ok
 - **复核**:`cargo test -p yu-rt --test fixture text_flag_sysvar_reads_the_control_stream`、
   `text_flags_track_cp932_width_and_returncode_auto_defaults`。
 
-## DIV-RT-033 · `_KEYLAST`/`_MOUSELAST`(2026-10-19)
+## DIV-RT-033 · `_KEYLAST`/`_MOUSELAST`(2026-10-19;2026-10-22 fixed)
 
 - 手册无页(0.479/0.495 字节级核对);`InputState` 内部照常记录最近按下
-  按钮码(按下沿,码 = 引擎按钮码),系统变量读取挂号。
+  按钮码(按下沿,码 = 引擎按钮码)。
+- **2026-10-22 取证**:REA 0.495 `FUN_00427350` case 0x91/0x92 直接返回
+  `DAT_00801908` / `DAT_0080190c`;写入点是窗口过程 `FUN_0045a3b4`
+  (WM_KEYDOWN → VK;WM_LBUTTONDOWN/RBUTTONDOWN/MBUTTONDOWN → 1/2/4)。
+  已实现为可读系统变量;ERIS `es_Text` 用写 0 取消 skip。
+- **复核**:`input::tests::last_key_and_mouse_codes_follow_engine`。
 
 ---
 

@@ -24,4 +24,5 @@ winit = "0.30"
 yu-backend-soft = { path = "../../yu-render/soft" }
 yu-backend-wgpu = { path = "../../yu-render/wgpu" }
 yu-cli = { path = "../../yu-cli" }
+yu-platform-input = { path = "../input" }
 yu-rt = { path = "../../yu-rt" }

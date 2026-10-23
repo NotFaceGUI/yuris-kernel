@@ -1,0 +1,13 @@
+[package]
+name = "yu-platform-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host-side platform input translation: physical codes to engine buttons, cursor policy"
+
+[lib]
+name = "yu_platform_input"
+path = "src/lib.rs"
+
+[dependencies]
+yu-rt = { path = "../../yu-rt" }

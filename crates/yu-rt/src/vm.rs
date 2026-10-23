@@ -838,6 +838,24 @@ impl Vm {
         }
     }
 
+    /// 宿主窗口的“关闭”按钮被按下(手册 `○@_WINDOW_EXEC_CLOSE`)。
+    ///
+    /// 引擎窗口过程把 WM_CLOSE 变成脚本可读的 0/1 状态,由脚本决定是否
+    /// `END`;宿主**不得**直接退出进程。重复调用保持为 1。
+    pub fn request_window_close(&mut self) {
+        self.window_exec_close = 1;
+    }
+
+    /// 宿主要求的最大化状态(与 `request_window_close` 同型)。
+    pub fn request_window_maximize(&mut self) {
+        self.window_exec_max = 1;
+    }
+
+    /// 脚本可见的输入设置(宿主用于光标显示/形状)。
+    pub fn input_settings(&self) -> &crate::input::InputSettings {
+        self.input.settings()
+    }
+
     pub fn unimplemented_cmds(&self) -> &BTreeMap<String, u64> {
         &self.unimplemented_cmds
     }
@@ -1281,6 +1299,10 @@ impl VarAccess for VmAccess<'_> {
 impl TaskExecutor for Vm {
     fn begin_logical_frame(&mut self, frame: u64) {
         self.frame = frame;
+        let (x, y) = self.input.cursor();
+        if let Some(host) = self.graphics_host.as_mut() {
+            host.set_pointer(x, y);
+        }
         self.emit(VmEvent::FrameStart { frame });
     }
 
@@ -1366,7 +1388,8 @@ impl TaskExecutor for Vm {
     }
 
     fn text_advance_requested(&self) -> bool {
-        self.input.text_advance_requested()
+        self.input
+            .text_advance_requested(&self.text.click_buttons, &self.text.skip_buttons)
     }
 
     fn sync_task_view(&mut self, view: &[TaskView]) {

@@ -135,6 +135,19 @@ pub struct GfxState {
     snapshot_sizes: BTreeMap<CopyId, SizeU32>,
     /// 快照对应的源资产键(`CGINFO[MFILE]` 透传)。
     snapshot_files: BTreeMap<CopyId, Vec<u8>>,
+    /// 当前光标逻辑坐标(`CGINFO[ONMOUSE*]` 的缺省查询点;VM 每帧推入)。
+    pointer: (i64, i64),
+}
+
+/// `CGINFO[ONMOUSE/ONMOUSE2/ONMOUSE3]` 需要的像素采样面。
+///
+/// 引擎直接读 D3D 表面(`FUN_0043d664`);内核的 gfx 层没有文件/纹理 I/O,
+/// 由持有 `TextureStore` 的宿主注入(soft/wgpu 共用同一解码器)。
+pub trait TextureSampler {
+    /// 纹理自然尺寸(像素)。
+    fn size(&mut self, texture: &TextureRef) -> Option<SizeU32>;
+    /// 取纹理像素(越界/不可采样 → `None`)。
+    fn sample(&mut self, texture: &TextureRef, x: i64, y: i64) -> Option<[u8; 4]>;
 }
 
 impl GfxState {
@@ -189,6 +202,7 @@ impl GfxState {
             asset_sizes: BTreeMap::new(),
             snapshot_sizes: BTreeMap::new(),
             snapshot_files: BTreeMap::new(),
+            pointer: (0, 0),
         };
         s.ensure_w0();
         s
@@ -219,6 +233,15 @@ impl GfxState {
     /// 注入资产像素尺寸(VM 解析图像头后调用;键为 `CG[FILE]` 原字节)。
     pub fn set_asset_size(&mut self, key: &[u8], size: SizeU32) {
         self.asset_sizes.insert(key.to_vec(), size);
+    }
+
+    /// 当前光标逻辑坐标(VM 每帧推入;`CGINFO[ONMOUSE*]` 缺省查询点)。
+    pub fn pointer(&self) -> (i64, i64) {
+        self.pointer
+    }
+
+    pub fn set_pointer(&mut self, x: i64, y: i64) {
+        self.pointer = (x, y);
     }
 
     /// 查询已注入的资产尺寸。
@@ -420,8 +443,18 @@ impl GfxState {
     /// 资产元数据的字段返回 `Unimplemented`,由 VM **不写** `LET`(不猜 0)。
     /// 多字段同时置位时顺序未取证,返回 `gfx.info.multi`。
     pub fn query_info(&self, command: &str, args: &[ArgValue]) -> Result<Value, Diag> {
+        self.query_info_with(command, args, None)
+    }
+
+    /// 同 [`GfxState::query_info`];额外提供纹理采样器(ONMOUSE/COLOR)。
+    pub fn query_info_with(
+        &self,
+        command: &str,
+        args: &[ArgValue],
+        sampler: Option<&mut dyn TextureSampler>,
+    ) -> Result<Value, Diag> {
         match command {
-            "CGINFO" => self.query_cginfo(args),
+            "CGINFO" => self.query_cginfo(args, sampler),
             "FONTINFO" => self.query_fontinfo(args),
             "WINDOWINFO" => self.query_windowinfo(args),
             other => Err(error::unimplemented(
@@ -431,11 +464,18 @@ impl GfxState {
         }
     }
 
-    fn query_cginfo(&self, args: &[ArgValue]) -> Result<Value, Diag> {
+    fn query_cginfo(
+        &self,
+        args: &[ArgValue],
+        mut sampler: Option<&mut dyn TextureSampler>,
+    ) -> Result<Value, Diag> {
         let resolved = self.params.resolve("CGINFO", args);
         let mut id: Option<Vec<u8>> = None;
         let mut idno: Option<i64> = None;
         let mut flags: BTreeMap<&str, i64> = BTreeMap::new();
+        // `SET/SET2` 是查询坐标(COLOR/ONMOUSE*),不是“查询字段”。
+        let mut set: Option<i64> = None;
+        let mut set2: Option<i64> = None;
         for r in resolved {
             match r.name {
                 Some("ID") => match r.value {
@@ -447,6 +487,16 @@ impl GfxState {
                     None => return Err(arg_type_diag("CGINFO", "IDNO", "整数")),
                 },
                 Some("LET") => {}
+                Some("SET") => {
+                    set = Some(int_arg(r.value).ok_or_else(|| {
+                        arg_type_diag("CGINFO", "SET", "整数")
+                    })?);
+                }
+                Some("SET2") => {
+                    set2 = Some(int_arg(r.value).ok_or_else(|| {
+                        arg_type_diag("CGINFO", "SET2", "整数")
+                    })?);
+                }
                 Some(name) => {
                     let Some(v) = int_arg(r.value) else {
                         return Err(arg_type_diag("CGINFO", name, "整数"));
@@ -508,14 +558,108 @@ impl GfxState {
             }),
             "SX" => Value::Int(self.query_layer_size(layer, true)?),
             "SY" => Value::Int(self.query_layer_size(layer, false)?),
+            "ONMOUSE" | "ONMOUSE2" | "ONMOUSE3" => {
+                let sampler = sampler.as_deref_mut().ok_or_else(|| {
+                    error::unimplemented(
+                        error::code::INFO_UNSUPPORTED,
+                        format!("CGINFO[{flag}] 需要纹理采样器(宿主未注入)"),
+                    )
+                })?;
+                self.query_onmouse(layer, flag, set, set2, sampler)?
+            }
             other => {
-                // COLOR/ONMOUSE* 需要像素/鼠标;MFILE/TEX/LINT 等无手册语义。
+                // COLOR/TEX/LINT 等无手册语义或未取证。
                 return Err(error::unimplemented(
                     error::code::INFO_UNSUPPORTED,
-                    format!("CGINFO[{other}] 需要像素/鼠标/未分类语义,未取证"),
+                    format!("CGINFO[{other}] 需要像素/未分类语义,未取证"),
                 ));
             }
         })
+    }
+
+    /// `CGINFO[ONMOUSE/ONMOUSE2/ONMOUSE3]`(REA 0.495 `0x43de01/0x43dec8/0x43df7f`)。
+    ///
+    /// 引擎只比较**已加载表面**的部件矩形与鼠标坐标,然后按行跨读取像素:
+    /// - `ONMOUSE`  → `r | g<<8 | b<<16`(0..0xFFFFFF);
+    /// - `ONMOUSE2` → `a`(0..255);
+    /// - `ONMOUSE3` → `r | g<<8 | b<<16 | a<<24`(32 位结果,按 i32 符号扩展);
+    /// - 不在任何部件内 / 越界 → `-1`。
+    ///
+    /// 本内核没有引擎的“部件链表”,图像层按单部件处理:矩形 =
+    /// `(X, Y, 显示宽, 显示高)`;显示尺寸与纹理尺寸不同时按最近邻反算纹理坐标。
+    fn query_onmouse(
+        &self,
+        layer: &Layer,
+        flag: &str,
+        set: Option<i64>,
+        set2: Option<i64>,
+        sampler: &mut dyn TextureSampler,
+    ) -> Result<Value, Diag> {
+        if matches!(layer.kind, LayerKind::Group { .. }) {
+            return Err(error::unimplemented(
+                error::code::INFO_UNSUPPORTED,
+                "CGINFO[ONMOUSE*] 查询图层组:组无单一表面,未取证",
+            ));
+        }
+        // `COPY/COPY2` 快照层没有独立像素面可采样;若快照源是资产
+        // (`snapshot_files`),按源资产采样——按钮系统正是这样缓存
+        // `BT.OFF...` 图层的(REA:引擎读的是已复制表面,像素同源)。
+        let texture = match &layer.texture {
+            TextureRef::Snapshot(id) => self
+                .snapshot_files
+                .get(id)
+                .map(|key| TextureRef::Asset(key.clone()))
+                .unwrap_or_else(|| layer.texture.clone()),
+            other => other.clone(),
+        };
+        let texture_size = sampler.size(&texture);
+        let display = layer.image_size().or(texture_size);
+        let Some(display) = display else {
+            return Err(error::unimplemented(
+                error::code::INFO_ASSET_SIZE,
+                "CGINFO[ONMOUSE*] 图层尺寸未知(无 SX/SY 且无纹理)",
+            ));
+        };
+        if display.width == 0 || display.height == 0 {
+            return Ok(Value::Int(-1));
+        }
+        let (mut mx, mut my) = self.pointer;
+        if let Some(v) = set {
+            mx = v;
+        }
+        if let Some(v) = set2 {
+            my = v;
+        }
+        let x0 = layer.transform.x;
+        let y0 = layer.transform.y;
+        let lx = mx - x0;
+        let ly = my - y0;
+        if lx < 0
+            || ly < 0
+            || lx >= i64::from(display.width)
+            || ly >= i64::from(display.height)
+        {
+            return Ok(Value::Int(-1));
+        }
+        // 显示尺寸 → 纹理坐标(最近邻,与后端采样口径一致)。
+        let (tx, ty) = match texture_size {
+            Some(size) if size.width > 0 && size.height > 0 => {
+                let tx = lx * i64::from(size.width) / i64::from(display.width);
+                let ty = ly * i64::from(size.height) / i64::from(display.height);
+                (tx, ty)
+            }
+            _ => (lx, ly),
+        };
+        let Some(px) = sampler.sample(&texture, tx, ty) else {
+            return Ok(Value::Int(-1));
+        };
+        let rgb = i64::from(px[0]) | (i64::from(px[1]) << 8) | (i64::from(px[2]) << 16);
+        Ok(Value::Int(match flag {
+            "ONMOUSE2" => i64::from(px[3]),
+            "ONMOUSE3" => i64::from((rgb as i32) | (i64::from(px[3]) as i32) << 24),
+            // `rgb` 是 24 位无符号;引擎的 32 位结果对 ONMOUSE 不会溢出符号位。
+            _ => rgb,
+        }))
     }
 
     fn query_layer_size(&self, layer: &Layer, width: bool) -> Result<i64, Diag> {

@@ -306,6 +306,12 @@ pub trait GraphicsHost {
     /// 不做文件 I/O,因此由持有数据源的 VM 解析图像头并在此回填,
     /// 供后续同键查询与 COPY 快照继承(DIV-GFX-024 / EVID-J3-03)。
     fn note_asset_size(&mut self, _key: &[u8], _width: u32, _height: u32) {}
+
+    /// 每个逻辑帧开始时的光标逻辑坐标(供 `CGINFO[ONMOUSE*]` 命中测试)。
+    ///
+    /// 引擎的 `ONMOUSE*` 直接读窗口的鼠标位置(`app+0x5b8/0x5bc`),不是一个
+    /// 事件;因此这里由 VM 在帧边界同步一次,而不是伪造 DomainCall。
+    fn set_pointer(&mut self, _x: i64, _y: i64) {}
 }
 
 /// 声音域同步宿主（SOUND / SOUNDEND 消费 + SOUNDINFO 查询）。

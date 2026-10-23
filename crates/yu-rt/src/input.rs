@@ -235,11 +235,14 @@ pub fn button_of_code(code: i64) -> Option<String> {
         }
     })
 }
-
 /// 一帧的输入状态(**按下集合**,不是计数器)。
+///
+/// `pulses` 是只在该帧生效的按下(滚轮一格、单帧点击);它不进
+/// [`InputTimeline::effective`] 的“按住保持”,避免滚轮脉冲被后续帧沿用。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InputFrame {
     pub pressed: BTreeSet<ButtonName>,
+    pub pulses: BTreeSet<ButtonName>,
     /// 光标逻辑坐标(鼠标域;`@_MOUSE_X/Y`)。
     pub cursor: (i64, i64),
 }
@@ -248,6 +251,7 @@ impl InputFrame {
     pub fn new(pressed: impl IntoIterator<Item = impl Into<ButtonName>>) -> Self {
         Self {
             pressed: pressed.into_iter().map(Into::into).collect(),
+            pulses: BTreeSet::new(),
             cursor: (0, 0),
         }
     }
@@ -257,8 +261,14 @@ impl InputFrame {
         self
     }
 
+    /// 单帧脉冲(本帧按下、下帧自动抬起)。
+    pub fn with_pulse(mut self, button: impl Into<ButtonName>) -> Self {
+        self.pulses.insert(button.into());
+        self
+    }
+
     pub fn is_pressed(&self, button: &str) -> bool {
-        self.pressed.contains(button)
+        self.pressed.contains(button) || self.pulses.contains(button)
     }
 }
 
@@ -300,92 +310,311 @@ impl InputTimeline {
     }
 }
 
-/// 单个按钮的带符号计数器。
+/// `INPUT[KEY/MOUSE/PAD]` 与 `MOUSE[...]` 的脚本可写状态。
+///
+/// 证据(0.495 REA):
+/// - `INPUT` 处理体 `0x446564`:KEY → `DAT_005b4888`、PAD → `DAT_008015d4`、
+///   MOUSE → `DAT_005b488c`(带一次“重启用吞点击”锁存);
+/// - `MOUSE` 处理体 `0x44aaa0`:MODE/TIME/MOVE/CLICK/WHEEL/X/Y/CURSOR/HX/HY/ID;
+/// - `FUN_0041a4b8`:三个源开关分别整段跳过鼠标/键盘/手柄的计数器更新;
+///   MOVE/CLICK/WHEEL 只参与“自动隐藏后是否重新显示光标”的判定;
+/// - 手册 `system/input.html` / `system/mouse.html`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputSettings {
+    /// `INPUT[KEY]`(缺省启用)。
+    pub keyboard: bool,
+    /// `INPUT[MOUSE]`(缺省启用)。
+    pub mouse: bool,
+    /// `INPUT[PAD]`(缺省启用)。
+    pub pad: bool,
+    /// `MOUSE[MODE]`:0 常隐 / 1 自动隐藏 / 2 常显。
+    pub mouse_mode: u8,
+    /// `MOUSE[TIME]`(毫秒)。
+    pub mouse_time_ms: i64,
+    /// `MOUSE[MOVE]`。
+    pub move_reactive: bool,
+    /// `MOUSE[CLICK]`。
+    pub click_reactive: bool,
+    /// `MOUSE[WHEEL]`。
+    pub wheel_reactive: bool,
+    /// `MOUSE[CURSOR]`(0..13)。
+    pub cursor: i64,
+    /// `MOUSE[HX]/[HY]`:自定义光标热点。
+    pub cursor_hotspot: (i64, i64),
+    /// `MOUSE[ID]`:自定义光标图层 ID。
+    pub cursor_id: Vec<u8>,
+    /// `MOUSE[X/Y]` 的光标 warp 请求(宿主消费;None = 无请求)。
+    pub cursor_warp: Option<(Option<i64>, Option<i64>)>,
+}
+
+impl Default for InputSettings {
+    fn default() -> Self {
+        Self {
+            keyboard: true,
+            mouse: true,
+            pad: true,
+            // 引擎在窗口创建时显示系统光标;ERIS 启动即 `MOUSE[MODE=1 ...]`。
+            // BSS 零值不是脚本可观测缺省,这里取“可见”作为宿主初态。
+            mouse_mode: 2,
+            mouse_time_ms: 2500,
+            move_reactive: true,
+            click_reactive: true,
+            wheel_reactive: true,
+            cursor: 0,
+            cursor_hotspot: (0, 0),
+            cursor_id: Vec::new(),
+            cursor_warp: None,
+        }
+    }
+}
+
+/// 输入源(按按钮码分类,不按名字)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputSource {
+    Keyboard,
+    Mouse,
+    Pad,
+}
+
+/// 引擎计数器表的一段(REA `FUN_0041a4b8`):
+/// 鼠标 1..7、键盘 VK 8..255、手柄 384+;`0` 是 `_KEY_ANY`。
+///
+/// 分类只看码,不看名字:这样脚本重映射 `_CODE_*`、宿主换键名都不影响。
+pub fn source_of_code(code: u16) -> InputSource {
+    if code == 0 {
+        InputSource::Keyboard
+    } else if code <= 7 {
+        InputSource::Mouse
+    } else if code >= PAD_BASE as u16 {
+        InputSource::Pad
+    } else {
+        InputSource::Keyboard
+    }
+}
+
+/// 单个按钮的带符号计数器(引擎 64 位 `value` + 独立 `down` 标志)。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counter {
-    /// 当前值:按下为正、松开为负;从未按过 = 0。
+    /// 当前值:按下为正、松开为负;从未按过 = 逐帧负增长。
     pub value: i64,
+    /// 上一帧的物理按下状态(引擎 `DAT_00685400`)。
+    pub down: bool,
+}
+
+impl Counter {
+    fn step(&mut self, down: bool) {
+        self.value = match (self.down, down) {
+            (false, false) => self.value.wrapping_sub(1),
+            (false, true) => 1,
+            (true, false) => -1,
+            (true, true) => self.value.wrapping_add(1),
+        };
+        self.down = down;
+    }
+
+    /// 引擎 `FUN_00447014` 的脚本写回钳制:
+    /// 未按住时正数/零 → 0,负数保留;按住时正数保留,零/负数 → 0。
+    fn write(&mut self, value: i64) {
+        self.value = if self.down {
+            if value > 0 {
+                value
+            } else {
+                0
+            }
+        } else if value >= 0 {
+            0
+        } else {
+            value
+        };
+    }
 }
 
 /// 输入运行状态:每逻辑帧推进计数器。
 ///
-/// 语义严格按手册:`pressed` 的按下沿 → `1`,持续按住逐帧 `+1`;
-/// `released` → `-1` 并**逐帧继续递减**;`==1` 恰为「本帧按下」。
-///
-/// 重新按下时从 `1` 重新起算(手册「押された瞬間から 1 → 2 → 3」),
-/// 不是从上次松开后的负数继续加 —— 否则长期未按后的一次短按永远到不了
-/// 正值,文本推进/`==1` 判定会失效。
-#[derive(Clone, Debug, Default)]
+/// 语义严格按手册 + REA:
+/// - 四态转移 `(prev_down, down)`:`0/0 → value-1`、`0/1 → 1`、
+///   `1/0 → -1`、`1/1 → value+1`(`FUN_0041a4b8` + `0x801e84` 函数表);
+/// - `INPUT` 关闭某个源时**整段跳过**该源的计数器更新(状态冻结);
+/// - 脚本写输入变量按物理状态钳制(`FUN_00447014`),见 [`Counter::write`]。
+#[derive(Clone, Debug)]
 pub struct InputState {
-    counters: BTreeMap<ButtonName, Counter>,
-    counts: BTreeMap<ButtonName, i64>,
+    counters: BTreeMap<u16, Counter>,
+    counts: BTreeMap<u16, i64>,
+    settings: InputSettings,
     prev: InputFrame,
     /// 本帧快照(供系统变量读取)。
     current: InputFrame,
-    /// `_KEYLAST` / `_MOUSELAST`:最近一次按下/松开的按钮码
-    /// (按钮码 = [`BUTTON_CODE_ABI`] 的 VK;REA:引擎存计数表下标)。
+    /// `_KEYLAST` / `_MOUSELAST`:最近一次按下的按钮码。
     keylast: i64,
     mouselast: i64,
     /// `_CODE_*` 脚本改写覆盖(手册 ○ 可赋值;键位重映射)。
     code_overrides: BTreeMap<u16, i64>,
-    /// 手柄计数器(按引擎按钮码;无宿主注入 ⇒ 恒 0 = 从未按过)。
-    pad_counters: BTreeMap<i64, Counter>,
-    pad_counts: BTreeMap<i64, i64>,
+}
+
+impl Default for InputState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InputState {
     pub fn new() -> Self {
-        Self::default()
+        let mut counters = BTreeMap::new();
+        // `_KEY_ANY` 的专用计数器(引擎下标 0)。
+        counters.insert(0, Counter::default());
+        // 鼠标计数器 1..7(`FUN_0041a4b8` 的定长段)。
+        for code in 1..=7u16 {
+            counters.insert(code, Counter::default());
+        }
+        // 键盘:ABI 表里的每个码都建计数器。名字重复(如 `;`/`:`)按码去重。
+        for (_, code) in BUTTON_CODE_ABI.iter() {
+            counters.entry(*code).or_insert_with(Counter::default);
+        }
+        Self {
+            counters,
+            counts: BTreeMap::new(),
+            settings: InputSettings::default(),
+            prev: InputFrame::default(),
+            current: InputFrame::default(),
+            keylast: 0,
+            mouselast: 0,
+            code_overrides: BTreeMap::new(),
+        }
+    }
+
+    /// 脚本可见的输入设置(宿主用于光标显示/形状)。
+    pub fn settings(&self) -> &InputSettings {
+        &self.settings
+    }
+
+    pub fn settings_mut(&mut self) -> &mut InputSettings {
+        &mut self.settings
+    }
+
+    /// `INPUT[KEY/PAD/MOUSE]`;`None` = 未给出,保持原值。
+    pub fn apply_input(&mut self, key: Option<bool>, pad: Option<bool>, mouse: Option<bool>) {
+        if let Some(v) = key {
+            self.settings.keyboard = v;
+        }
+        if let Some(v) = pad {
+            self.settings.pad = v;
+        }
+        if let Some(v) = mouse {
+            self.settings.mouse = v;
+        }
+    }
+
+    /// `MOUSE[...]` 的已出现字段。数值范围按手册 clamp(MODE 0..2,CURSOR 0..13)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_mouse(
+        &mut self,
+        mode: Option<i64>,
+        time_ms: Option<i64>,
+        move_reactive: Option<bool>,
+        click_reactive: Option<bool>,
+        wheel_reactive: Option<bool>,
+        cursor: Option<i64>,
+        x: Option<i64>,
+        y: Option<i64>,
+        hx: Option<i64>,
+        hy: Option<i64>,
+        id: Option<&[u8]>,
+    ) {
+        if let Some(v) = mode {
+            self.settings.mouse_mode = v.clamp(0, 2) as u8;
+        }
+        if let Some(v) = time_ms {
+            self.settings.mouse_time_ms = v.max(0);
+        }
+        if let Some(v) = move_reactive {
+            self.settings.move_reactive = v;
+        }
+        if let Some(v) = click_reactive {
+            self.settings.click_reactive = v;
+        }
+        if let Some(v) = wheel_reactive {
+            self.settings.wheel_reactive = v;
+        }
+        if let Some(v) = cursor {
+            self.settings.cursor = v.clamp(0, 13);
+        }
+        if let Some(v) = hx {
+            self.settings.cursor_hotspot.0 = v;
+        }
+        if let Some(v) = hy {
+            self.settings.cursor_hotspot.1 = v;
+        }
+        if let Some(v) = id {
+            self.settings.cursor_id = v.to_vec();
+        }
+        if x.is_some() || y.is_some() {
+            self.settings.cursor_warp = Some((x, y));
+            if let Some(v) = x {
+                self.current.cursor.0 = v;
+            }
+            if let Some(v) = y {
+                self.current.cursor.1 = v;
+            }
+        }
+    }
+
+    /// 取走 `MOUSE[X/Y]` 的 warp 请求(宿主消费)。
+    pub fn take_cursor_warp(&mut self) -> Option<(Option<i64>, Option<i64>)> {
+        self.settings.cursor_warp.take()
     }
 
     /// 用时间线的该帧状态推进一帧。
     pub fn advance(&mut self, frame: u64, timeline: &InputTimeline) {
-        let now = timeline.effective(frame);
-        for (button, counter) in self.counters.iter_mut() {
-            if now.is_pressed(button) {
-                if counter.value <= 0 {
-                    // 按下沿:记录「最近按下」的按钮码(_KEYLAST/_MOUSELAST)。
-                    let code = button_code(button.strip_prefix("KEY_").unwrap_or(button))
-                        .or_else(|| button_code(button.strip_prefix("MOUSE_").unwrap_or(button)))
-                        .unwrap_or(0) as i64;
-                    if button.starts_with("MOUSE_") {
-                        self.mouselast = code;
-                    } else {
-                        self.keylast = code;
-                    }
-                }
-                counter.value = if counter.value > 0 {
-                    counter.value + 1
-                } else {
-                    1
-                };
-                self.counts.entry(button.clone()).or_insert(0);
-                let n = self.counts.get_mut(button).expect("刚刚插入");
-                if *n == 0 {
-                    *n = 1;
-                } else {
-                    *n += 1;
-                }
-            } else if counter.value > 0 {
-                counter.value = -1;
-            } else {
-                counter.value -= 1;
+        let mut now = timeline.effective(frame);
+        // 脉冲只在该帧有效(不参与“按住保持”)。
+        if let Some(exact) = timeline.at(frame) {
+            now.pulses = exact.pulses.clone();
+        }
+        let mut down: BTreeSet<u16> = BTreeSet::new();
+        for name in now.pressed.iter().chain(now.pulses.iter()) {
+            if let Some(code) = code_of_button_name(name) {
+                down.insert(code);
             }
         }
-        // 新出现的按钮:本帧按下 → 1,否则 -1(与「从未按过」一致:
-        // 手册的计数器从按下/松开那一刻起算,未出现过的键不参与)。
-        for button in now.pressed.iter() {
-            if !self.counters.contains_key(button) {
-                let code = button_code(button.strip_prefix("KEY_").unwrap_or(button))
-                    .or_else(|| button_code(button.strip_prefix("MOUSE_").unwrap_or(button)))
-                    .unwrap_or(0) as i64;
-                if button.starts_with("MOUSE_") {
-                    self.mouselast = code;
-                } else {
-                    self.keylast = code;
+        // 先算键盘“任意键”本帧状态(只看已存在的键盘计数器)。
+        let any_down = self.counters.iter().any(|(code, _)| {
+            source_of_code(*code) == InputSource::Keyboard
+                && *code != 0
+                && down.contains(code)
+        });
+
+        let keyboard = self.settings.keyboard;
+        let mouse = self.settings.mouse;
+        let pad = self.settings.pad;
+        for (code, counter) in self.counters.iter_mut() {
+            let source = source_of_code(*code);
+            let allowed = match source {
+                InputSource::Keyboard => keyboard,
+                InputSource::Mouse => mouse,
+                InputSource::Pad => pad,
+            };
+            if !allowed {
+                // 引擎整段跳过;down 保持上一次物理状态。
+                continue;
+            }
+            let pressed = if *code == 0 {
+                any_down
+            } else {
+                down.contains(code)
+            };
+            let rising = pressed && !counter.down;
+            counter.step(pressed);
+            if rising {
+                *self.counts.entry(*code).or_insert(0) += 1;
+                match source {
+                    InputSource::Keyboard => self.keylast = i64::from(*code),
+                    // 引擎 `_MOUSELAST` 只由 L/R/M 的 WM_*BUTTONDOWN 写(1/2/4);
+                    // 滚轮不写。
+                    InputSource::Mouse if matches!(*code, 1 | 2 | 4) => {
+                        self.mouselast = i64::from(*code)
+                    }
+                    _ => {}
                 }
-                self.counters.insert(button.clone(), Counter { value: 1 });
-                self.counts.insert(button.clone(), 1);
             }
         }
         self.prev = self.current.clone();
@@ -394,48 +623,40 @@ impl InputState {
 
     /// 按钮计数器值(未出现 = 0)。
     pub fn counter(&self, button: &str) -> i64 {
-        self.counters.get(button).map(|c| c.value).unwrap_or(0)
+        code_of_button_name(button)
+            .and_then(|code| self.counters.get(&code).map(|c| c.value))
+            .unwrap_or(0)
+    }
+
+    /// 按引擎按钮码读计数器(`_INP(code)` / `TEXT[CLICKBUTTON]`)。
+    pub fn counter_code(&self, code: i64) -> i64 {
+        u16::try_from(code)
+            .ok()
+            .and_then(|code| self.counters.get(&code).map(|c| c.value))
+            .unwrap_or(0)
     }
 
     /// 累计次数(未出现 = 0)。
     pub fn count(&self, button: &str) -> i64 {
-        self.counts.get(button).copied().unwrap_or(0)
+        code_of_button_name(button)
+            .and_then(|code| self.counts.get(&code).copied())
+            .unwrap_or(0)
     }
 
-    /// 任意键:任一按钮当前按下 ⇒ 返回该按钮的计数器值,否则 -1(与按下同形)。
+    /// 任意键(`_KEY_ANY`):引擎下标 0,任一键盘键按住时按自己的计数器走。
     pub fn any_counter(&self) -> i64 {
-        let mut best = 0i64;
-        for (button, c) in &self.counters {
-            if !button.starts_with("MOUSE_") && self.current.is_pressed(button) {
-                best = best.max(c.value);
-            }
-        }
-        if best > 0 {
-            best
-        } else {
-            self.counters
-                .values()
-                .map(|c| c.value)
-                .filter(|v| *v < 0)
-                .min()
-                .unwrap_or(0)
-        }
+        self.counters.get(&0).map(|c| c.value).unwrap_or(0)
     }
 
-    /// `_INP(index)` 数组版:下标 = 按钮码,读**同一张**计数表。
+    /// `_INP(index)` 数组版:下标 = 按钮码,读同一张计数器表。
     ///
     /// REA(0.495 `FUN_00427350` case 0x90):`index<=0 → 0`;否则读计数表
-    /// `[index]`。键盘/鼠标码 = [`button_of_code`];手柄码(384..)无宿主
-    /// 注入 → 恒 0(从未按过)。
+    /// `[index]`。未知码(无宿主注入的手柄等)按 0 处理。
     pub fn inp(&self, index: i64) -> Result<i64, yu_log::Diag> {
         if index <= 0 {
             return Ok(0);
         }
-        match button_of_code(index) {
-            Some(name) => Ok(self.counter(&name)),
-            // 手柄/未知码:引擎里是独立计数表下标;内核无手柄注入 ⇒ 恒 0。
-            None => Ok(0),
-        }
+        Ok(self.counter_code(index))
     }
 
     /// `_CODE_*` 读取:脚本改写优先,否则引擎 ABI 缺省值。
@@ -448,53 +669,75 @@ impl InputState {
         self.code_overrides.insert(id, value);
     }
 
-    /// 「推进文本」输入是否出现(引擎 `FUN_004046fc`:运行期按钮表
-    /// `0x5b48ac..0x5b48b8` = MOUSE_L / ENTER / PAD / PAD,`0x5b48bc` = CTRL;
-    /// 任一计数器为正即视为点击推进)。
-    pub fn text_advance_requested(&self) -> bool {
-        // 计数器键 = `MOUSE_L` / `KEY_ENTER` / `KEY_CTRL`(绑定表命名)。
-        const ADVANCE_BUTTONS: [&str; 3] = ["MOUSE_L", "KEY_ENTER", "KEY_CTRL"];
-        ADVANCE_BUTTONS
+    /// 「推进文本」输入是否出现。
+    ///
+    /// 引擎 `FUN_004046fc` 读的是 `TEXT[CLICKBUTTON1..4]` / `SKIPBUTTON1..4`
+    /// 指定的**按钮码**在计数器表里的值:
+    /// - 点击按钮出现按下沿(`==1`)→ 推进;
+    /// - 跳过按钮按住(`>0`)→ 推进;
+    /// - 未分配(`0x3ff`)忽略。
+    pub fn text_advance_requested(&self, click_buttons: &[i64; 4], skip_buttons: &[i64; 4]) -> bool {
+        let click = click_buttons
             .iter()
-            .any(|b| self.counter(b) > 0)
-            || self.pad_counters.values().any(|c| c.value > 0)
+            .any(|code| *code > 0 && *code != 0x3ff && self.counter_code(*code) == 1);
+        let skip = skip_buttons
+            .iter()
+            .any(|code| *code > 0 && *code != 0x3ff && self.counter_code(*code) > 0);
+        click || skip
     }
 
     /// 手柄按钮码的计数器/累计次数(无注入恒 0)。
     pub fn pad_counter(&self, code: i64, is_num: bool) -> i64 {
+        let code = u16::try_from(code).unwrap_or(u16::MAX);
         if is_num {
-            self.pad_counts.get(&code).copied().unwrap_or(0)
+            self.counts.get(&code).copied().unwrap_or(0)
         } else {
-            self.pad_counters.get(&code).map(|c| c.value).unwrap_or(0)
+            self.counters.get(&code).map(|c| c.value).unwrap_or(0)
         }
     }
 
-    /// 手柄按钮码写入(手册 ○ 可赋值)。
+    /// 手柄按钮码写入(手册 ○ 可赋值;按物理状态钳制)。
     pub fn set_pad_counter(&mut self, code: i64, value: i64, is_num: bool) {
+        let Ok(code) = u16::try_from(code) else {
+            return;
+        };
         if is_num {
-            self.pad_counts.insert(code, value);
+            self.counts.insert(code, value);
         } else {
-            self.pad_counters.insert(code, Counter { value });
+            self.counters.entry(code).or_default().write(value);
         }
     }
 
-    /// 直接设定按钮计数器。
+    /// 直接设定按钮计数器(引擎 `FUN_00447014` 钳制)。
     ///
     /// 手册 `basic/svariable.html` 把 `@_KEY_*` / `@_MOUSE_*` 标为 **○ 可赋值**;
     /// ERIS `es_ERIS.yst` 的 `es.S.GO` 用 `@_MOUSE_L=5` / `@_KEY_ENTER=5`
-    /// 注释为「シーン変わるときは入力一旦無効に」(切换场景时让输入一次性失效)
-    /// ——写入即把该按钮的帧计数器置为给定值。见 DIV-RT-021。
+    /// 注释为「シーン変わるときは入力一旦無効に」(切换场景时让输入一次性失效)。
+    /// 引擎按当前物理状态钳制,见 [`Counter::write`]。
     pub fn set_counter(&mut self, button: &str, value: i64) {
-        match self.counters.get_mut(button) {
-            Some(c) => c.value = value,
-            None => {
-                self.counters.insert(button.to_string(), Counter { value });
-            }
+        if let Some(code) = code_of_button_name(button) {
+            self.counters.entry(code).or_default().write(value);
         }
+    }
+
+    /// 按按钮码写计数器(`_INP(code)=v` / 脚本重映射后的码)。
+    pub fn set_counter_code(&mut self, code: i64, value: i64) {
+        let Ok(code) = u16::try_from(code) else {
+            return;
+        };
+        if code == 0 {
+            return;
+        }
+        self.counters.entry(code).or_default().write(value);
     }
 
     pub fn cursor(&self) -> (i64, i64) {
         self.current.cursor
+    }
+
+    /// 宿主/测试直接设定光标(推进前的物理状态)。
+    pub fn set_cursor(&mut self, x: i64, y: i64) {
+        self.current.cursor = (x, y);
     }
 
     pub fn keylast(&self) -> i64 {
@@ -514,6 +757,47 @@ impl InputState {
     pub fn previous(&self) -> &InputFrame {
         &self.prev
     }
+
+    /// 全部已有计数器码(确定顺序;诊断/覆盖普查用)。
+    pub fn counter_codes(&self) -> impl Iterator<Item = u16> + '_ {
+        self.counters.keys().copied()
+    }
+}
+
+/// 按钮名 → 引擎按钮码(名字与 `InputTimeline` / 宿主同构)。
+fn code_of_button_name(name: &str) -> Option<u16> {
+    if let Some(rest) = name.strip_prefix("KEY_") {
+        return button_code(rest);
+    }
+    if let Some(rest) = name.strip_prefix("MOUSE_") {
+        return button_code(&format!("MOUSE_{rest}"));
+    }
+    if let Some(rest) = name.strip_prefix("PAD_") {
+        return pad_code_of_name(rest);
+    }
+    button_code(name)
+}
+
+/// `PAD_UP0` / `PAD_BUTTON0_1` 形态(宿主注入约定)。
+fn pad_code_of_name(rest: &str) -> Option<u16> {
+    let (kind, rest) = rest.split_once(|c: char| c.is_ascii_digit())?;
+    let number = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
+    let pad: i64 = number.parse().ok()?;
+    let code = match kind {
+        "UP" => pad_dir_code(0, pad),
+        "DOWN" => pad_dir_code(1, pad),
+        "LEFT" => pad_dir_code(2, pad),
+        "RIGHT" => pad_dir_code(3, pad),
+        "BUTTON" => {
+            let (_, index) = rest.split_once('_')?;
+            pad_button_code(pad, index.parse().ok()?)
+        }
+        _ => return None,
+    };
+    u16::try_from(code).ok()
 }
 
 #[cfg(test)]
@@ -563,14 +847,99 @@ mod tests {
     }
 
     #[test]
-    fn text_advance_buttons_use_binding_names() {
+    fn text_advance_uses_configured_button_codes() {
         let mut tl = InputTimeline::new();
         tl.set(0, InputFrame::new(["KEY_ENTER"]));
         let mut st = InputState::new();
         st.advance(0, &tl);
-        assert!(st.text_advance_requested(), "ENTER 必须能推进文本");
-        tl.set(1, InputFrame::new(std::iter::empty::<&str>()));
+        let click = [13, 0x3ff, 0x3ff, 0x3ff];
+        let skip = [0x3ff; 4];
+        assert!(st.text_advance_requested(&click, &skip), "ENTER 默认是点击按钮");
+        let click = [1, 0x3ff, 0x3ff, 0x3ff];
+        assert!(!st.text_advance_requested(&click, &skip), "改成鼠标后 ENTER 不再推进");
+    }
+
+    #[test]
+    fn source_disable_freezes_counters() {
+        let mut tl = InputTimeline::new();
+        tl.set(0, InputFrame::new(std::iter::empty::<&str>()));
+        tl.set(1, InputFrame::new(["KEY_Z"]));
+        tl.set(2, InputFrame::new(["KEY_Z"]));
+        let mut st = InputState::new();
+        st.advance(0, &tl);
+        let before = st.counter("KEY_Z");
+        st.apply_input(Some(false), None, None);
         st.advance(1, &tl);
-        assert!(!st.text_advance_requested(), "松开后不再推进");
+        assert_eq!(st.counter("KEY_Z"), before, "KEY 禁用时计数器冻结");
+        st.apply_input(Some(true), None, None);
+        st.advance(2, &tl);
+        assert_eq!(st.counter("KEY_Z"), 1, "重新启用后按物理状态产生按下沿");
+    }
+
+    #[test]
+    fn script_write_is_clamped_by_physical_state() {
+        let mut st = InputState::new();
+        st.set_counter("MOUSE_L", 5);
+        assert_eq!(st.counter("MOUSE_L"), 0, "未按住时正数被清 0");
+        let mut tl = InputTimeline::new();
+        tl.set(0, InputFrame::new(["MOUSE_L"]));
+        st.advance(0, &tl);
+        st.set_counter("MOUSE_L", 5);
+        assert_eq!(st.counter("MOUSE_L"), 5, "按住时正数保留");
+        st.set_counter("MOUSE_L", 0);
+        assert_eq!(st.counter("MOUSE_L"), 0, "按住时写 0 清零");
+    }
+
+    #[test]
+    fn wheel_pulse_is_one_frame() {
+        let mut tl = InputTimeline::new();
+        tl.set(0, InputFrame::new(std::iter::empty::<&str>()).with_pulse("MOUSE_U"));
+        tl.set(1, InputFrame::new(std::iter::empty::<&str>()));
+        let mut st = InputState::new();
+        st.advance(0, &tl);
+        assert_eq!(st.counter("MOUSE_U"), 1, "脉冲帧 = 1");
+        st.advance(1, &tl);
+        assert_eq!(st.counter("MOUSE_U"), -1, "下一帧自动抬起");
+    }
+
+    #[test]
+    fn last_key_and_mouse_codes_follow_engine() {
+        let mut tl = InputTimeline::new();
+        tl.set(0, InputFrame::new(std::iter::empty::<&str>()));
+        tl.set(1, InputFrame::new(["KEY_A"]));
+        tl.set(2, InputFrame::new(std::iter::empty::<&str>()));
+        tl.set(3, InputFrame::new(["MOUSE_L"]));
+        let mut st = InputState::new();
+        for frame in 0..=3 {
+            st.advance(frame, &tl);
+        }
+        assert_eq!(st.keylast(), 65, "_KEYLAST = VK_A");
+        assert_eq!(st.mouselast(), 1, "_MOUSELAST = 左键码 1");
+    }
+
+    #[test]
+    fn inp_write_uses_same_clamp_as_named_buttons() {
+        let mut st = InputState::new();
+        st.set_counter_code(0x5a, 7);
+        assert_eq!(st.inp(0x5a).unwrap(), 0, "未按住时正数写回被清 0");
+        let mut tl = InputTimeline::new();
+        tl.set(0, InputFrame::new(["KEY_Z"]));
+        st.advance(0, &tl);
+        st.set_counter_code(0x5a, 7);
+        assert_eq!(st.inp(0x5a).unwrap(), 7, "按住时正数保留");
+    }
+
+    #[test]
+    fn mouse_settings_are_script_visible() {
+        let mut st = InputState::new();
+        st.apply_mouse(Some(1), Some(1500), Some(false), Some(false), Some(false), Some(11), Some(50), Some(20), None, None, Some(b"ES.MCURSOR"));
+        let s = st.settings();
+        assert_eq!(s.mouse_mode, 1);
+        assert_eq!(s.mouse_time_ms, 1500);
+        assert!(!s.move_reactive && !s.click_reactive && !s.wheel_reactive);
+        assert_eq!(s.cursor, 11);
+        assert_eq!(st.cursor(), (50, 20));
+        assert_eq!(s.cursor_id, b"ES.MCURSOR");
+        assert_eq!(st.take_cursor_warp(), Some((Some(50), Some(20))));
     }
 }

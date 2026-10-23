@@ -72,7 +72,7 @@ pub use op::{
     OpStatus,
 };
 pub use pass::{Pass, PassTarget};
-pub use state::{GfxConfig, GfxState};
+pub use state::{GfxConfig, GfxState, TextureSampler};
 pub use table::{ParamTable, ResolvedArg};
 pub use text::{GlyphAtlasRef, TextRun, TextStroke, TextStyle};
 pub use transition::TransitionDraw;

@@ -18,9 +18,19 @@ use yu_cli::engine::{Backend, Engine, EngineOptions};
 use yu_cli::project::Project;
 use yu_host_desktop::HostOptions;
 
+macro_rules! host_error {
+    ($($arg:tt)*) => { yu_cli::output::error(format!($($arg)*)) };
+}
+
 fn main() {
+    if cfg!(debug_assertions) {
+        host_error!(
+            "yu-desktop: debug build (VM/render 5–10x slower than release); \
+             use `cargo build --release -p yu-host-desktop` for playable fps"
+        );
+    }
     if let Err(error) = run() {
-        eprintln!("yu-desktop: {error}");
+        host_error!("yu-desktop: {error}");
         std::process::exit(2);
     }
 }
@@ -82,7 +92,7 @@ fn run() -> Result<(), String> {
     let engine = match Engine::new(project.clone(), options.clone()) {
         Ok(engine) => engine,
         Err(first) if backend == Backend::Wgpu => {
-            eprintln!("yu-desktop: wgpu 启动失败({first});回退 soft");
+            host_error!("yu-desktop: wgpu 启动失败({first});回退 soft");
             options.backend = Backend::Soft;
             Engine::new(project, options).map_err(|error| error.to_string())?
         }
