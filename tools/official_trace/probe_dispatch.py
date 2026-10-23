@@ -37,7 +37,7 @@ id 显式留空并在 `command_table.json` 记录候选,不猜。
   hits.jsonl             逐命中原始记录(含 handler/ecx/tick/线程)
   command_table.json     运行时 119 项 handler 表与歧义分组
   manifest.json          样本/引擎 hash、参数、计数、失败原因
-  <trace-out>            schema v3 trace(producer=official, vm/command)
+  <trace-out>            schema v4 trace(producer=official, vm/command)
 """
 
 import argparse
@@ -59,6 +59,13 @@ BP_RVA_DEFAULT = (0x44DB, 0x4547)
 TASK_GLOBAL_RVA = 0x40171C      # 0x80171c
 TICK_COUNTER_RVA = 0x401268     # 0x801268: per-tick 64-bit counter
 DISPATCH_TABLE_RVA = 0x3ACE20   # 0x7ace20
+# 任务相位采样(P5/DIV-L-002):
+#   0x4040f8 = tick 函数入口(每 tick 一次,int3 采样开销可接受)
+#   0x801704 = 任务列表对象([obj] = 头节点;节点 +0x0c = next)
+#   0x80157c = "有效 UI 点击" 标志(WM_LBUTTONDOWN 命中非透明像素后置位)
+TICK_FN_RVA = 0x40F8
+TASK_LIST_RVA = 0x401704
+EFFECTIVE_CLICK_RVA = 0x40157C
 DISPATCH_TABLE_LEN = 119        # ysc.ybn 0.495 命令数
 
 DEBUG_ONLY_THIS_PROCESS = 2
@@ -262,6 +269,55 @@ def read_u16(hproc, address):
     return int.from_bytes(got["bytes"], "little") if got["ok"] and got["got"] == 2 else None
 
 
+def read_u8(hproc, address):
+    got = read_mem(hproc, address, 1)
+    return got["bytes"][0] if got["ok"] and got["got"] == 1 else None
+
+
+def walk_task_list(hproc, list_obj, depth=0, seen=None):
+    """只读遍历引擎任务链表(DIV-L-002 的官方任务相位证据)。
+
+    布局来自 `FUN_004046dc` / `FUN_00404398` 反汇编:
+      - `[0x801704]` = 任务列表对象;`[obj]` = 头节点
+      - 节点 `+0x0c` = next;`+0x30 == 1` = 该节点本身是子列表
+      - 节点 `+0x34` = 任务上下文(VM task)
+      - 上下文 `+0x18` = FRAME 等待计数;`+0x1c` = 绝对期限 ms
+      - `+0x20` = pc;`+0x3c` = script id(u16)
+      - `+0x14 & +0x15` = 启用位;`+0x09` = 文本等待/结束标志
+    所有读取都可能失败(对象正在被引擎改写);失败字段写 null,不猜。
+    """
+    if depth > 4:
+        return []
+    if seen is None:
+        seen = set()
+    tasks = []
+    node = read_u32(hproc, list_obj) if list_obj else None
+    while node and node not in seen and len(tasks) < 256:
+        seen.add(node)
+        ctx = read_u32(hproc, node + 0x34)
+        b14 = read_u8(hproc, ctx + 0x14) if ctx else None
+        b15 = read_u8(hproc, ctx + 0x15) if ctx else None
+        item = {
+            "ptr": hex(node),
+            "depth": depth,
+            "nested": read_u8(hproc, node + 0x30) == 1,
+            "ctx": hex(ctx) if ctx else None,
+            "script": read_u16(hproc, ctx + 0x3C) if ctx else None,
+            "pc": read_u32(hproc, ctx + 0x20) if ctx else None,
+            "wait_frames": read_u32(hproc, ctx + 0x18) if ctx else None,
+            "deadline_ms": read_u32(hproc, ctx + 0x1C) if ctx else None,
+            "flag9": read_u8(hproc, ctx + 0x9) if ctx else None,
+            "enabled_bytes": [b14, b15],
+            "enabled": (bool(b14 & b15)
+                        if b14 is not None and b15 is not None else None),
+        }
+        if item["nested"]:
+            item["children"] = walk_task_list(hproc, node, depth + 1, seen)
+        tasks.append(item)
+        node = read_u32(hproc, node + 0x0C)
+    return tasks
+
+
 def read_u64(hproc, address):
     got = read_mem(hproc, address, 8)
     return int.from_bytes(got["bytes"], "little") if got["ok"] and got["got"] == 8 else None
@@ -372,7 +428,7 @@ def send_input(hwnd, mode, x, y, method, force_foreground=True):
         sent.append(f"SENDINPUT:MOUSE_L_DOWN@{x},{y}")
         notes.append(f"cursor_saved={saved.x},{saved.y}")
         pending = {"kind": "click", "saved": (saved.x, saved.y), "x": x, "y": y}
-    if mode == "enter":
+    if mode in ("enter", "both"):
         user32.keybd_event(0x0D, 0, 0, 0)
         time.sleep(0.03)
         user32.keybd_event(0x0D, 0, 0x0002, 0)
@@ -433,7 +489,7 @@ def empty_paths_digest():
 
 
 def build_trace(hits, commands, sample_sha, args, click_tick=None, tick_offset=None):
-    """把命中记录写成 schema v3 trace(producer=official, vm/command)。"""
+    """把命中记录写成 schema v4 trace(producer=official, vm/command)。"""
     names = {index: name for index, name in commands}
     records = []
     for hit in hits:
@@ -449,7 +505,7 @@ def build_trace(hits, commands, sample_sha, args, click_tick=None, tick_offset=N
         if frame is not None and tick_offset is not None:
             frame = max(0, frame - tick_offset) if tick_offset else frame
         records.append({
-            "schema": 3,
+            "schema": 4,
             "seq": len(records) + 1,
             "frame": frame,
             "sub": "vm",
@@ -491,6 +547,8 @@ def build_trace(hits, commands, sample_sha, args, click_tick=None, tick_offset=N
                 "media_readonly": False,
                 "os_sound": True,
                 "dx_mode": 0,
+                "window_init_pos": 0,
+                "rng_seed": 5489,
                 "paths": {"len": 0, "sha256": empty_paths_digest()},
             },
         },
@@ -498,7 +556,7 @@ def build_trace(hits, commands, sample_sha, args, click_tick=None, tick_offset=N
         "clock": {"mode": "tick", "now_ms": []},
         "kernel": "official-0.495 event probe (not the kernel)",
     }
-    lines = [json.dumps({"schema": 3, "seq": 0, "frame": None, "sub": "meta",
+    lines = [json.dumps({"schema": 4, "seq": 0, "frame": None, "sub": "meta",
                          "kind": "header", "payload": header},
                         ensure_ascii=False, separators=(",", ":"))]
     lines.extend(json.dumps(record, ensure_ascii=False, separators=(",", ":"))
@@ -525,6 +583,14 @@ def main():
     parser.add_argument("--arm-after", type=float, default=0.0,
                         help="延迟布防(秒):让引擎先跑完启动,再在稳定态下断点")
     parser.add_argument("--max-hits", type=int, default=200000)
+    parser.add_argument("--mode", choices=["dispatch", "task-phase"], default="dispatch",
+                        help="task-phase: 只在 0x4040f8 采样任务列表,不挂命令分派断点")
+    parser.add_argument("--max-ticks", type=int, default=0,
+                        help="task-phase: 采满 N 个 tick 后停止(0 = 只受 --seconds 限制)")
+    parser.add_argument("--task-out", default=None,
+                        help="task-phase JSONL 输出(默认 <out-dir>/task_phase.jsonl)")
+    parser.add_argument("--force-activate", action="store_true",
+                        help="task-phase: 布防前 minimize/restore 窗口以触发 WM_ACTIVATEAPP")
     parser.add_argument("--input-at", type=float, default=None)
     parser.add_argument("--input", choices=["enter", "click", "both"], default="both")
     parser.add_argument("--input-method", choices=["sendinput", "post"], default="sendinput")
@@ -537,7 +603,8 @@ def main():
     if not args.exe or not args.cwd:
         parser.error("--exe/--cwd required (or set YURIS_OFFICIAL_EXE/YURIS_OFFICIAL_CWD)")
     args.click_xy = tuple(int(part) for part in args.click_xy.split(","))
-    bps = [int(part, 0) for part in args.bp_rva.split(",") if part.strip()]
+    bps = ([int(part, 0) for part in args.bp_rva.split(",") if part.strip()]
+           if args.mode == "dispatch" else [])
     trigger_rva = int(args.trigger_rva, 0) if args.trigger_rva else 0
     trigger_addr = None
     os.makedirs(args.out_dir, exist_ok=True)
@@ -551,8 +618,12 @@ def main():
     sample_path = os.path.join(args.cwd, args.sample)
     sample_sha = sha256_file(sample_path) if os.path.isfile(sample_path) else None
     manifest = {
-        "level": "event-l1",
-        "method": "CreateProcess(DEBUG_ONLY_THIS_PROCESS) + int3 at dispatch sites",
+        "level": "task-phase" if args.mode == "task-phase" else "event-l1",
+        "method": (
+            "CreateProcess(DEBUG_ONLY_THIS_PROCESS) + int3 at tick entry 0x4040f8; "
+            "read-only task list walk (no dispatch breakpoints)"
+            if args.mode == "task-phase" else
+            "CreateProcess(DEBUG_ONLY_THIS_PROCESS) + int3 at dispatch sites"),
         "exe": args.exe,
         "cwd": args.cwd,
         "exe_sha256": sha256_file(args.exe),
@@ -613,11 +684,50 @@ def main():
     started = time.time()
     stop = None
     window = None
+    tick_addr = None
+    sample_count = 0
+    deferred_arm = False
+    task_file = None
+    if args.mode == "task-phase":
+        task_path = args.task_out or os.path.join(args.out_dir, "task_phase.jsonl")
+        task_file = open(task_path, "w", encoding="utf-8")
+        manifest["task_phase_out"] = task_path
+        manifest["task_layout"] = {
+            "list_object_global": hex(IMAGE_BASE_DEFAULT + TASK_LIST_RVA),
+            "node_next": "+0x0c",
+            "node_nested_flag": "+0x30 == 1",
+            "node_task_context": "+0x34",
+            "task_pc": "+0x20",
+            "task_script": "+0x3c (u16)",
+            "task_wait_frames": "+0x18",
+            "task_deadline_ms": "+0x1c",
+            "task_enabled_bytes": "+0x14 & +0x15",
+            "task_text_flag": "+0x09",
+            "evidence": "FUN_004046dc/FUN_00404398 disassembly (side-repo workbench/analysis/asm)",
+            "sampling": "int3 at 0x4040f8 entry; state is the end of the previous tick",
+        }
 
-    def ensure_window():
+    def sample_tick():
+        obj = read_u32(hproc, base + TASK_LIST_RVA)
+        tasks = walk_task_list(hproc, obj) if obj else []
+        row = {
+            "i": sample_count,
+            "t": round(time.time() - started, 3),
+            "tick_counter": read_u64(hproc, base + TICK_COUNTER_RVA),
+            "effective_click": read_u8(hproc, base + EFFECTIVE_CLICK_RVA),
+            "list": hex(obj) if obj else None,
+            "tasks": tasks,
+            "task_count": len(tasks),
+            "trigger": trigger_hit,
+        }
+        task_file.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        task_file.flush()
+        return row
+
+    def ensure_window(timeout=15.0):
         nonlocal window
         if window is None:
-            found = find_engine_window(info.dwProcessId)
+            found = find_engine_window(info.dwProcessId, timeout=timeout)
             if found:
                 window = found
         return window
@@ -656,9 +766,24 @@ def main():
                 print("arm failed", hex(address), last_error(), flush=True)
 
     def arm():
-        read_dispatch_table()
+        if args.mode == "dispatch":
+            read_dispatch_table()
         for rva in bps:
             arm_address(rva)
+
+    def disarm_all():
+        for address in list(armed):
+            if address in originals:
+                write_mem(hproc, address, originals[address])
+        armed.clear()
+
+    def rearm_all():
+        if args.mode == "task-phase":
+            arm_address(TICK_FN_RVA)
+            if trigger_rva:
+                arm_address(trigger_rva)
+        else:
+            arm()
 
     while True:
         elapsed = time.time() - started
@@ -672,7 +797,7 @@ def main():
                 click_tick = read_u64(hproc, base + TICK_COUNTER_RVA)
                 input_sent, input_notes, input_pending = send_input(
                     found[0], args.input, *args.click_xy, args.input_method,
-                    force_foreground=not armed)
+                    force_foreground=(False if args.mode == "task-phase" else not armed))
                 manifest["input_notes"] = input_notes
                 if input_pending:
                     input_down_tick = read_u64(hproc, base + TICK_COUNTER_RVA)
@@ -683,8 +808,10 @@ def main():
         if input_pending is not None:
             current_tick = read_u64(hproc, base + TICK_COUNTER_RVA)
             held = time.time() - input_down_at if input_down_at else 0.0
+            # 至少跨 2 个 engine tick:DirectInput 风格的按键表在 tick 内采样,
+            # 只跨 1 tick 可能落在两次采样之间。
             progressed = (current_tick is not None and input_down_tick is not None
-                          and current_tick > input_down_tick)
+                          and current_tick > input_down_tick + 2)
             if progressed or held > 5.0:
                 released = release_input(input_pending)
                 input_sent.extend(released)
@@ -699,6 +826,28 @@ def main():
             arm()
         event = DEBUG_EVENT()
         if not k.WaitForDebugEvent(ctypes.byref(event), 100):
+            if deferred_arm:
+                # 非阻塞探测:阻塞在 EnumWindows 会停止泵调试事件,引擎可能
+                # 停在某个调试事件上而不创建窗口。
+                found = ensure_window(timeout=0.2)
+                if found is None:
+                    print("task-phase waiting for engine window", flush=True)
+                if found:
+                    ok, fg_notes = ensure_foreground(found[0])
+                    if args.force_activate:
+                        user32.ShowWindow(found[0], 6)  # SW_MINIMIZE
+                        time.sleep(0.2)
+                        user32.ShowWindow(found[0], 9)  # SW_RESTORE
+                        user32.SetForegroundWindow(found[0])
+                        time.sleep(0.2)
+                        fg_notes.append("force_activate=minimize_restore")
+                    manifest["startup_foreground"] = {"ok": ok, "notes": fg_notes}
+                    arm_address(TICK_FN_RVA)
+                    if trigger_rva:
+                        arm_address(trigger_rva)
+                    deferred_arm = False
+                    print("task-phase sampler armed after foreground", hex(tick_addr),
+                          "ok", ok, fg_notes, flush=True)
             if armed:
                 read_dispatch_table()
             continue
@@ -713,7 +862,14 @@ def main():
             wow = wt.BOOL()
             k.IsWow64Process(hproc, ctypes.byref(wow))
             manifest["is_wow64"] = bool(wow.value)
-            if trigger_rva:
+            if args.mode == "task-phase":
+                # 先让引擎自由跑:找到窗口并置前台后再布防。挂断点期间调用
+                # SetForegroundWindow/AttachThreadInput 会等待 UI 线程而死锁。
+                tick_addr = base + TICK_FN_RVA
+                deferred_arm = True
+                print("task-phase sampler pending (foreground first)", hex(tick_addr),
+                      flush=True)
+            elif trigger_rva:
                 arm_address(trigger_rva)
             elif args.arm_after <= 0:
                 arm()
@@ -745,6 +901,20 @@ def main():
                     manifest["trigger"] = trigger_hit
                     print("TRIGGER left-button-down", trigger_hit, flush=True)
                     arm()
+                elif got_ctx and tick_addr is not None and site == tick_addr:
+                    write_mem(hproc, site, originals[site])
+                    ctx.Eip = site
+                    ctx.EFlags |= EFLAGS_TF
+                    k.Wow64SetThreadContext(hthread, ctypes.byref(ctx))
+                    pending[event.dwThreadId] = site
+                    row = sample_tick()
+                    sample_count += 1
+                    if sample_count <= 3 or sample_count % 60 == 0:
+                        print("phase", row["i"], "tick", row["tick_counter"],
+                              "tasks", row["task_count"], flush=True)
+                    if args.max_ticks and sample_count >= args.max_ticks:
+                        stop = "max-ticks"
+                        break
                 elif got_ctx and site in armed:
                     write_mem(hproc, site, originals[site])
                     ctx.Eip = site
@@ -809,6 +979,9 @@ def main():
         if stop:
             break
     hit_file.close()
+    if task_file is not None:
+        task_file.close()
+        manifest["task_samples"] = sample_count
 
     # 收尾:把断点字节恢复(进程随后终止),不把修改留在运行中的引擎里。
     for address in list(armed):
@@ -837,11 +1010,12 @@ def main():
         "scripts": sorted({hit["script"] for hit in hits if hit["script"] is not None}),
         "ticks": {"first": hits[0]["tick"] if hits else None,
                   "last": hits[-1]["tick"] if hits else None},
+        "mode": args.mode,
         "click_tick": click_tick,
         "input_sent": input_sent,
         "finished": time.strftime("%Y-%m-%dT%H:%M:%S"),
     })
-    if args.trace_out:
+    if args.trace_out and args.mode == "dispatch":
         trace = build_trace(hits, commands, sample_sha, args, click_tick=click_tick)
         os.makedirs(os.path.dirname(os.path.abspath(args.trace_out)), exist_ok=True)
         with open(args.trace_out, "w", encoding="utf-8", newline="\n") as h:

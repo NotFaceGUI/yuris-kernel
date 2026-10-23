@@ -43,7 +43,7 @@ use crate::op::{
 use crate::pass::{Pass, PassTarget};
 use crate::path;
 use crate::table::ParamTable;
-use crate::text::{TextRun, TextStyle};
+use crate::text::{layout_text, TextDraw, TextFlagsSource, TextLayoutFrame, TextRun, TextStyle};
 use crate::transition::TransitionDraw;
 
 /// 已解析参数(名字/值都取自 `self.params`,先复制出来以释放不可变借用)。
@@ -115,7 +115,16 @@ pub struct GfxState {
     texture_seq: u64,
     frame: u64,
     style: TextStyle,
-    text: Vec<TextRun>,
+    /// 跨帧文本缓冲(按 `TEXT[ID]`;引擎只有一个文本状态,实际最多一条)。
+    ///
+    /// DIV-GFX-034:不再每帧清空;清空只由 `TEXT[CLEAR]`(经
+    /// [`GfxState::sync_text_state`])、[`GfxState::clear_text`]、目标层被
+    /// `CGEND`/`CG` 重建触发。
+    text_layers: BTreeMap<LayerId, TextBuffer>,
+    /// 最近一次 `TEXT[ID]`(文本事件落点)。
+    current_text: LayerId,
+    /// 本帧 `CGACT[TEXT=1]` 绘制(按目标图层;每帧清空)。
+    text_draws: BTreeMap<LayerId, Vec<TextDraw>>,
     copy_log: Vec<CopyOp>,
     image_log: Vec<ImageOp>,
     /// 被上限丢弃的最旧操作数(审计用)。
@@ -137,6 +146,25 @@ pub struct GfxState {
     snapshot_files: BTreeMap<CopyId, Vec<u8>>,
     /// 当前光标逻辑坐标(`CGINFO[ONMOUSE*]` 的缺省查询点;VM 每帧推入)。
     pointer: (i64, i64),
+}
+
+/// [`GfxState::text_state`] 的返回视图(字节 / `_TEXT_FLAG` / 样式 / 原点)。
+pub type TextView<'a> = (&'a [u8], Option<&'a [u8]>, &'a TextStyle, (i64, i64));
+
+/// 一个文本层的跨帧缓冲(`$_TEXT` / `$_TEXT_FLAG` 的 gfx 镜像)。
+#[derive(Clone, Debug, Default)]
+struct TextBuffer {
+    bytes: Vec<u8>,
+    /// `_TEXT_FLAG` 控制字节流;`None` = 宿主尚未同步(排版不可用)。
+    flags: Option<Vec<u8>>,
+    /// 字体快照(最近一次 `FONT`)。
+    style: TextStyle,
+    /// 文本层局部原点(引擎光标 `+0x14/+0x18`)。
+    origin: (i64, i64),
+    /// 最近写入帧号。
+    frame: u64,
+    /// 当前应显示字符数(`None` = 全部;H-P2-02 前由宿主注入)。
+    reveal: Option<usize>,
 }
 
 /// `CGINFO[ONMOUSE/ONMOUSE2/ONMOUSE3]` 需要的像素采样面。
@@ -192,7 +220,9 @@ impl GfxState {
             texture_seq: 0,
             frame: 0,
             style: TextStyle::default(),
-            text: Vec::new(),
+            text_layers: BTreeMap::new(),
+            current_text: LayerId::new(Vec::new()),
+            text_draws: BTreeMap::new(),
             copy_log: Vec::new(),
             image_log: Vec::new(),
             copy_log_dropped: 0,
@@ -273,6 +303,73 @@ impl GfxState {
         &self.image_log
     }
 
+    /// 用 VM 的文本状态快照**替换**当前文本层(权威字节 + `_TEXT_FLAG`)。
+    ///
+    /// 这是 `_TEXT_FLAG` 逐字 `'1'/'2'` 流进入 gfx 的唯一入口(契约见
+    /// `yu_rt::Vm::text_state` 的“宿主/gfx 桥”注释)。`TEXT[CLEAR]` 在 VM 里
+    /// 没有事件,宿主每帧(或至少在 `TEXT` 命令后)调用本方法即可同步;
+    /// `bytes` 为空即等于 CLEAR(DIV-GFX-034 的传播路径)。
+    ///
+    /// 标志流与字节不对齐时**不猜**:挂 `gfx.text.flag_mismatch` 诊断并把
+    /// 标志置 `None`(后端不排版)。
+    pub fn sync_text_state(&mut self, snapshot: &yu_rt::text::TextSnapshot) {
+        let id = self.current_text.clone();
+        self.write_text_state(&id, &snapshot.bytes, &snapshot.flags);
+        let buf = self.text_layers.entry(id).or_default();
+        buf.origin = (snapshot.cursor_x, snapshot.cursor_y);
+    }
+
+    /// 同上,但显式指定文本层(宿主若自行维护层 ID)。
+    pub fn sync_text_state_for(&mut self, id: &LayerId, snapshot: &yu_rt::text::TextSnapshot) {
+        self.write_text_state(id, &snapshot.bytes, &snapshot.flags);
+        let buf = self.text_layers.entry(id.clone()).or_default();
+        buf.origin = (snapshot.cursor_x, snapshot.cursor_y);
+    }
+
+    fn write_text_state(&mut self, id: &LayerId, bytes: &[u8], flags: &[u8]) {
+        let mismatch = layout_text(bytes, flags, (0, 0), &self.style).is_none();
+        let buf = self.text_layers.entry(id.clone()).or_default();
+        buf.bytes = bytes.to_vec();
+        buf.flags = if mismatch { None } else { Some(flags.to_vec()) };
+        buf.style = self.style.clone();
+        buf.frame = self.frame;
+        if mismatch {
+            self.push_diag(
+                "TEXT",
+                error::unimplemented(
+                    error::code::TEXT_UNSUPPORTED,
+                    "`_TEXT_FLAG` 与文本字节不对齐;按未同步处理(不猜排版)",
+                ),
+            );
+        }
+    }
+
+    /// 清空当前文本层(`TEXT[CLEAR]` 的显式入口;等同 VM 清空后的同步)。
+    pub fn clear_text(&mut self) {
+        let id = self.current_text.clone();
+        if let Some(buf) = self.text_layers.get_mut(&id) {
+            buf.bytes.clear();
+            buf.flags = Some(Vec::new());
+        }
+    }
+
+    /// 设置当前文本层应显示的字符数(`None` = 全部;M-D 的渲染截断入口)。
+    pub fn set_text_reveal(&mut self, chars: Option<usize>) {
+        let id = self.current_text.clone();
+        if let Some(buf) = self.text_layers.get_mut(&id) {
+            buf.reveal = chars;
+        }
+    }
+
+    /// 当前文本层的原始状态(`bytes`, `_TEXT_FLAG`, style, origin)。
+    pub fn text_state(&self) -> TextView<'_> {
+        let buf = self.text_layers.get(&self.current_text);
+        match buf {
+            Some(b) => (&b.bytes, b.flags.as_deref(), &b.style, b.origin),
+            None => (&[], None, &self.style, (0, 0)),
+        }
+    }
+
     /// 消费一批事件。调用方应每帧 `drain_events` 后喂入,避免有界队列丢弃。
     pub fn consume_events(&mut self, events: &[VmEvent]) {
         for ev in events {
@@ -284,9 +381,11 @@ impl GfxState {
         match ev {
             VmEvent::FrameStart { frame } => {
                 self.frame = *frame;
-                // TODO(DIV-GFX-034):文本窗口应跨帧持久,`TEXT[CLEAR]` 应清空
-                // gfx 文本;当前每帧清空是“本帧文本流”模型,未做窗口状态机。
-                self.text.clear();
+                // DIV-GFX-034:文本缓冲**跨帧持久**。清空只发生在
+                // `TEXT[CLEAR]`(宿主经 `sync_text_state` 同步)、
+                // `clear_text()` 或目标层被 CGEND/CG 重建时。
+                // `CGACT[TEXT]` 是"本帧把文本画到图层上"的绘制项,逐帧重建。
+                self.text_draws.clear();
                 // 诊断是“本帧”诊断:每帧清空,防止跨帧无界增长。
                 self.diags.clear();
                 // 复制/图像操作是**状态生产**(快照/纹理修改),不是逐帧易失;
@@ -297,20 +396,23 @@ impl GfxState {
             }
             VmEvent::Text { frame, id, bytes } => {
                 self.frame = *frame;
-                self.text.push(TextRun {
-                    id: LayerId::new(id.as_bytes().to_vec()),
-                    bytes: bytes.clone(),
-                    style: self.style.clone(),
-                    origin: None,
-                    atlas: None,
-                    frame: *frame,
-                });
+                let id = LayerId::new(id.as_bytes().to_vec());
+                self.current_text = id.clone();
+                let buf = self.text_layers.entry(id).or_default();
+                buf.bytes.extend_from_slice(bytes);
+                // 事件只带字节;`_TEXT_FLAG` 必须由宿主用
+                // `Vm::text_state()` 同步(`sync_text_state`)。追加后旧标志流
+                // 不再覆盖新字节 ⇒ 置 None,禁止后端猜宽度。
+                buf.flags = None;
+                buf.style = self.style.clone();
+                buf.frame = *frame;
             }
             VmEvent::DomainCall {
                 frame,
                 domain,
                 name,
                 args,
+                ..
             } => {
                 self.frame = *frame;
                 match domain {
@@ -355,10 +457,7 @@ impl GfxState {
             let source_live = match &c.source {
                 CopySource::Layer(id) | CopySource::Group(id) => self.nodes.contains_key(id),
             };
-            if c.status == OpStatus::Executable
-                && !source_live
-                && c.source_texture.is_none()
-            {
+            if c.status == OpStatus::Executable && !source_live && c.source_texture.is_none() {
                 continue;
             }
             texture_ops.push((c.seq, Op::Copy(c.clone())));
@@ -430,7 +529,53 @@ impl GfxState {
         // 比较期不分配:直接比较借用字段。
         f.layers
             .sort_by(|a, b| (a.z, a.seq, &a.id).cmp(&(b.z, b.seq, &b.id)));
-        f.text = self.text.clone();
+        f.text = self
+            .text_layers
+            .iter()
+            .filter(|(_, b)| !b.bytes.is_empty())
+            .map(|(id, b)| TextRun {
+                id: id.clone(),
+                bytes: b.bytes.clone(),
+                flags: b.flags.clone(),
+                style: b.style.clone(),
+                origin: Some(b.origin),
+                reveal: b.reveal,
+                atlas: None,
+                frame: b.frame,
+            })
+            .collect();
+        // 自动文本层的排版:只接受 `_TEXT_FLAG` 一手证据;缺失 ⇒ 不产出。
+        f.text_layout = self.text_layers.iter().find_map(|(id, b)| {
+            if b.bytes.is_empty() {
+                return None;
+            }
+            let flags = b.flags.as_deref()?;
+            let glyphs = layout_text(&b.bytes, flags, b.origin, &b.style)?;
+            if glyphs.is_empty() {
+                return None;
+            }
+            let target = if !id.0.is_empty() && self.nodes.contains_key(id) {
+                Some(id.clone())
+            } else {
+                None
+            };
+            Some(TextLayoutFrame {
+                target,
+                origin: b.origin,
+                style: b.style.clone(),
+                chars: glyphs.len(),
+                reveal: b.reveal,
+                line_height: b.style.line_height(),
+                glyphs,
+                flags_source: TextFlagsSource::TextFlag,
+            })
+        });
+        // `CGACT[TEXT]` 绘制项(按目标层 ID 稳定排序;层内保持命令序)。
+        f.text_draws = self
+            .text_draws
+            .values()
+            .flat_map(|v| v.iter().cloned())
+            .collect();
         f.diagnostics = self.diags.values().cloned().collect();
         f
     }
@@ -467,7 +612,7 @@ impl GfxState {
     fn query_cginfo(
         &self,
         args: &[ArgValue],
-        mut sampler: Option<&mut dyn TextureSampler>,
+        sampler: Option<&mut dyn TextureSampler>,
     ) -> Result<Value, Diag> {
         let resolved = self.params.resolve("CGINFO", args);
         let mut id: Option<Vec<u8>> = None;
@@ -488,14 +633,14 @@ impl GfxState {
                 },
                 Some("LET") => {}
                 Some("SET") => {
-                    set = Some(int_arg(r.value).ok_or_else(|| {
-                        arg_type_diag("CGINFO", "SET", "整数")
-                    })?);
+                    set = Some(
+                        int_arg(r.value).ok_or_else(|| arg_type_diag("CGINFO", "SET", "整数"))?,
+                    );
                 }
                 Some("SET2") => {
-                    set2 = Some(int_arg(r.value).ok_or_else(|| {
-                        arg_type_diag("CGINFO", "SET2", "整数")
-                    })?);
+                    set2 = Some(
+                        int_arg(r.value).ok_or_else(|| arg_type_diag("CGINFO", "SET2", "整数"))?,
+                    );
                 }
                 Some(name) => {
                     let Some(v) = int_arg(r.value) else {
@@ -559,7 +704,7 @@ impl GfxState {
             "SX" => Value::Int(self.query_layer_size(layer, true)?),
             "SY" => Value::Int(self.query_layer_size(layer, false)?),
             "ONMOUSE" | "ONMOUSE2" | "ONMOUSE3" => {
-                let sampler = sampler.as_deref_mut().ok_or_else(|| {
+                let sampler = sampler.ok_or_else(|| {
                     error::unimplemented(
                         error::code::INFO_UNSUPPORTED,
                         format!("CGINFO[{flag}] 需要纹理采样器(宿主未注入)"),
@@ -634,11 +779,7 @@ impl GfxState {
         let y0 = layer.transform.y;
         let lx = mx - x0;
         let ly = my - y0;
-        if lx < 0
-            || ly < 0
-            || lx >= i64::from(display.width)
-            || ly >= i64::from(display.height)
-        {
+        if lx < 0 || ly < 0 || lx >= i64::from(display.width) || ly >= i64::from(display.height) {
             return Ok(Value::Int(-1));
         }
         // 显示尺寸 → 纹理坐标(最近邻,与后端采样口径一致)。
@@ -752,6 +893,10 @@ impl GfxState {
             "BOLD" => Value::Int(i64::from(self.style.bold)),
             "ANTIALIASING" => Value::Int(i64::from(self.style.antialias)),
             "DRAWMODE" => Value::Int(self.style.draw_mode),
+            // 引擎默认 GRADATION=1 / ROTATION=0(FUN_00464fac);FONT 写入后
+            // 读回原值(DIV-GFX-036 的可解部分)。
+            "GRADATION" => Value::Int(self.style.gradation),
+            "ROTATION" => Value::Int(self.style.rotation),
             "NAME" => {
                 if no.is_some() {
                     return Err(error::unimplemented(
@@ -1195,6 +1340,8 @@ impl GfxState {
             self.copy_log.retain(|c| c.dest != parsed.path);
             self.image_log
                 .retain(|i| i.source != parsed.path && i.target.as_ref() != Some(&parsed.path));
+            // 新纹理 = 干净像素面:之前 `CGACT[TEXT]` 的绘制项随之作废。
+            self.text_draws.remove(&parsed.path);
         }
 
         let diags = {
@@ -1259,6 +1406,9 @@ impl GfxState {
         }
         let removed = self.remove_subtree(&parsed.path);
         self.drop_ops_for(&removed);
+        // 文本层被删除 ⇒ 文本缓冲/本帧绘制项一并清(DIV-GFX-034 的窗口删除路径)。
+        self.text_draws.retain(|id, _| !removed.contains(id));
+        self.text_layers.retain(|id, _| !removed.contains(id));
         if parsed.path == Self::w0() && !self.nodes.contains_key(&Self::w0()) {
             // W0 是相对路径的默认基目录;删掉后立刻重建,保证后续相对 ID 可用。
             self.ensure_w0();
@@ -1347,6 +1497,7 @@ impl GfxState {
         let set = find_value(&params, "SET");
         let set2 = find_value(&params, "SET2");
         let set_str = find_str(&params, "SETSTR");
+        let bno = find_int(&params, "BNO");
         let x = find_int(&params, "X");
         let y = find_int(&params, "Y");
         let x2 = find_int(&params, "X2");
@@ -1386,6 +1537,13 @@ impl GfxState {
         }
         if flag(&params, "SWAP2") {
             self.cgact_swap(&source, &dest, true);
+            return;
+        }
+
+        // `CGACT[TEXT=1]`:手册 cg/cgact.html 例 25/26 在图层上绘制字符串。
+        // 这是 ERIS 对话文本的真实路径(`es_Font.yst` 每字符一次)。
+        if flag(&params, "TEXT") {
+            self.cgact_text(&source, set, set_str, x, y, bno);
             return;
         }
 
@@ -1522,10 +1680,7 @@ impl GfxState {
                     self.asset_sizes.get(key).copied()
                 }
                 TextureRef::Snapshot(id) => self.snapshot_sizes.get(id).copied(),
-                TextureRef::Offscreen(id) => self
-                    .nodes
-                    .get(id)
-                    .and_then(|n| n.layer.group_size()),
+                TextureRef::Offscreen(id) => self.nodes.get(id).and_then(|n| n.layer.group_size()),
                 TextureRef::None | TextureRef::SolidBlack1x1 => src_node.layer.image_size(),
             };
         }
@@ -1592,7 +1747,16 @@ impl GfxState {
         let src = self.nodes[source].layer.clone();
         let dst = self.nodes[dest].layer.clone();
         {
-            let s = self.nodes.get_mut(source).expect("checked");
+            let Some(s) = self.nodes.get_mut(source) else {
+                self.push_diag(
+                    "CGACT",
+                    error::recoverable(
+                        error::code::LAYER_MISSING,
+                        format!("SWAP 源在交换中消失: `{}`", source.display()),
+                    ),
+                );
+                return;
+            };
             s.layer.texture = dst.texture.clone();
             s.layer.texture_status = dst.texture_status;
             s.layer.transform.x = dst.transform.x;
@@ -1600,7 +1764,16 @@ impl GfxState {
             s.layer.refresh_status();
         }
         {
-            let d = self.nodes.get_mut(dest).expect("checked");
+            let Some(d) = self.nodes.get_mut(dest) else {
+                self.push_diag(
+                    "CGACT",
+                    error::recoverable(
+                        error::code::LAYER_MISSING,
+                        format!("SWAP 目标在交换中消失: `{}`", dest.display()),
+                    ),
+                );
+                return;
+            };
             d.layer.texture = src.texture.clone();
             d.layer.texture_status = src.texture_status;
             d.layer.transform.x = src.transform.x;
@@ -1614,11 +1787,90 @@ impl GfxState {
                 a.blend = b.blend;
                 a.transition = b.transition.clone();
             };
-            let s = self.nodes.get_mut(source).expect("checked");
+            let Some(s) = self.nodes.get_mut(source) else {
+                self.push_diag(
+                    "CGACT",
+                    error::recoverable(
+                        error::code::LAYER_MISSING,
+                        format!("SWAP 源在属性交换中消失: `{}`", source.display()),
+                    ),
+                );
+                return;
+            };
             swap_attrs(&mut s.layer, &dst);
-            let d = self.nodes.get_mut(dest).expect("checked");
+            let Some(d) = self.nodes.get_mut(dest) else {
+                self.push_diag(
+                    "CGACT",
+                    error::recoverable(
+                        error::code::LAYER_MISSING,
+                        format!("SWAP 目标在属性交换中消失: `{}`", dest.display()),
+                    ),
+                );
+                return;
+            };
             swap_attrs(&mut d.layer, &src);
         }
+    }
+
+    /// `CGACT[TEXT=1]`:把一段字符串登记为图层的绘制项。
+    ///
+    /// 引擎在命令处理器里把字画进图层像素(手册「操作を行うと元のイメージ
+    /// には戻せません」),但 ERIS 每帧重建文本图层并重发全部字符
+    /// (`Text/es_Text.yst`)。gfx 因此输出**本帧**绘制项,由后端在合成该
+    /// 图层时叠加(等价性论证见 `docs/divergences/gfx-text.md` DIV-GFX-055)。
+    fn cgact_text(
+        &mut self,
+        target: &LayerId,
+        set: Option<EngineValue>,
+        set_str: Option<Vec<u8>>,
+        x: Option<i64>,
+        y: Option<i64>,
+        bno: Option<i64>,
+    ) {
+        if !self.nodes.contains_key(target) {
+            self.push_diag(
+                "CGACT",
+                error::recoverable(
+                    error::code::LAYER_MISSING,
+                    format!("CGACT[TEXT] 目标层 `{}` 不存在", target.display()),
+                ),
+            );
+            return;
+        }
+        if self.nodes.get(target).is_some_and(|n| n.layer.is_group()) {
+            self.push_diag(
+                "CGACT",
+                error::unimplemented(
+                    error::code::IMAGEOP_UNSUPPORTED,
+                    "CGACT[TEXT] 目标为图层组:写入组合成纹理的语义未取证",
+                ),
+            );
+            return;
+        }
+        let Some(bytes) = set_str.filter(|b| !b.is_empty()) else {
+            self.push_diag(
+                "CGACT",
+                error::recoverable(
+                    error::code::ARG_MISSING,
+                    "CGACT[TEXT] 缺 SETSTR:引擎不绘制空字符串,但参数缺失不是同义",
+                ),
+            );
+            return;
+        };
+        let set = set.as_ref().and_then(EngineValue::as_int).unwrap_or(0);
+        self.text_draws
+            .entry(target.clone())
+            .or_default()
+            .push(TextDraw {
+                target: target.clone(),
+                bytes,
+                x: x.unwrap_or(0),
+                y: y.unwrap_or(0),
+                // 引擎按命令到达时的 FONT 状态绘制(REA 0x404a1b 读 +0x28/+0x33/+0x34)。
+                style: self.style.clone(),
+                set,
+                bno,
+            });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1789,7 +2041,8 @@ impl GfxState {
                 OpStatus::Executable => unreachable!(),
             };
             if let Some(node) = self.nodes.get_mut(source) {
-                node.layer.set_texture_status(LayerStatus::Unimplemented(reason));
+                node.layer
+                    .set_texture_status(LayerStatus::Unimplemented(reason));
             }
             if let Some(t) = target {
                 if let Some(node) = self.nodes.get_mut(&t) {
@@ -1843,10 +2096,25 @@ impl GfxState {
                     Some(n) => self.style.draw_mode = n,
                     None => self.arg_type("FONT", name, "整数", &r.value),
                 },
-                // TODO(DIV-GFX-035):NO 只是字体列表序号,解析到真实字体
-                // 归 `yu-font`;BNO/GRADATION/ROTATION/PITCH/LANG 同样未取证。
+                // GRADATION/ROTATION:取值 + clamp(REA 0x444713/0x4447db);
+                // 渲染效果未取证(方向/旋转读取点未观察到),只保存原值,
+                // 由后端以 `Unverified` 处理(DIV-GFX-035 / DIV-FONT-003/004)。
+                "GRADATION" => match int_arg(&r.value) {
+                    Some(n) => self.style.gradation = n,
+                    None => self.arg_type("FONT", name, "整数", &r.value),
+                },
+                "ROTATION" => match int_arg(&r.value) {
+                    Some(n) => self.style.rotation = n,
+                    None => self.arg_type("FONT", name, "整数", &r.value),
+                },
+                // NO:字体列表序号,值保留;真实字体由后端 `yu-font` 发现链
+                // (`face_by_no`)解析(本 crate 无字体 I/O)。
                 "NO" => match int_arg(&r.value) {
-                    Some(n) => self.style.font_no = Some(n),
+                    Some(n) => {
+                        self.style.font_no = Some(n);
+                        // NO 越界是引擎 clamp 到 `< 字体总数`;列表归字体层,
+                        // 这里不判断。
+                    }
                     None => self.arg_type("FONT", name, "整数", &r.value),
                 },
                 "BNO" => {
@@ -1869,6 +2137,8 @@ impl GfxState {
                 ),
             }
         }
+        // 引擎 clamp(REA 0x444428..0x444b1c);负值/越界不报错。
+        self.style.clamp();
     }
 
     // ------------------------------------------------------------ 内部

@@ -70,7 +70,10 @@ fn value_text(v: &Value) -> String {
 }
 
 fn args_text(tables: &BootTables, cmd: &str, args: &[ArgValue]) -> String {
-    let decl = tables.yscm.index_of(cmd).and_then(|i| tables.yscm.command(i as u8));
+    let decl = tables
+        .yscm
+        .index_of(cmd)
+        .and_then(|i| tables.yscm.command(i as u8));
     let mut out = String::new();
     for ArgValue { slot, value } in args {
         let name = decl
@@ -95,17 +98,16 @@ fn script_name(list: &ScriptList, id: u32) -> String {
 
 fn jump_is_cross_script(kind: JumpKind, script: u32, to_script: u32) -> bool {
     // GO/GOSUB/RETURN 跨文件才改变执行中的脚本;循环回边同脚本,忽略。
-    matches!(kind, JumpKind::Go | JumpKind::Gosub | JumpKind::Return | JumpKind::TaskStart)
-        && script != to_script
+    matches!(
+        kind,
+        JumpKind::Go | JumpKind::Gosub | JumpKind::Return | JumpKind::TaskStart
+    ) && script != to_script
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let root = root_arg(&args);
-    let frames = args
-        .get(2)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(120u32);
+    let frames = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(120u32);
     let all_jumps = args.iter().any(|a| a == "--all-jumps");
     let json = args.iter().any(|a| a == "--json");
     let dump_vars = args.iter().any(|a| a == "--vars");
@@ -173,7 +175,9 @@ fn main() {
     if dump_vars {
         println!("== ysv string initial values (non-empty) ==");
         for r in &vm.tables().boot.vars.records {
-            let VarInit::Str(bytes) = &r.init else { continue };
+            let VarInit::Str(bytes) = &r.init else {
+                continue;
+            };
             if bytes.is_empty() {
                 continue;
             }
@@ -200,8 +204,7 @@ fn main() {
         std::collections::BTreeSet::new();
     let mut seen_domains: std::collections::BTreeSet<(String, String)> =
         std::collections::BTreeSet::new();
-    let mut seen_diags: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
+    let mut seen_diags: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     for tick in 0..frames {
         let before_dropped = vm.events_dropped();
         let report = vm.tick_at(tick * 16, &timeline);
@@ -310,13 +313,13 @@ fn main() {
                     println!("  FPS {fps} skip={skip}");
                 }
                 VmEvent::SystemCall { name, args, .. } => {
-                    println!("  SYSTEM {name} {}", args_text(&vm.tables().boot, name, args));
+                    println!(
+                        "  SYSTEM {name} {}",
+                        args_text(&vm.tables().boot, name, args)
+                    );
                 }
                 VmEvent::DomainCall {
-                    domain,
-                    name,
-                    args,
-                    ..
+                    domain, name, args, ..
                 } => {
                     if no_domain {
                         continue;
@@ -364,7 +367,13 @@ fn main() {
                         println!("  DIAG {code}: {detail}");
                     }
                 }
-                VmEvent::Command { name, script, pc, args, .. } => {
+                VmEvent::Command {
+                    name,
+                    script,
+                    pc,
+                    args,
+                    ..
+                } => {
                     println!(
                         "  CMD {name} s{script} pc{pc} {}",
                         args_text(&vm.tables().boot, name, args)
@@ -403,7 +412,7 @@ fn main() {
                     .tables()
                     .boot
                     .scripts
-                    .path_of(l.script_id as u16)
+                    .path_of(l.script_id)
                     .map(decode)
                     .unwrap_or_else(|| "<no script>".to_string());
                 println!(
@@ -430,7 +439,10 @@ fn main() {
                 let mut windows = String::new();
                 for w in sf.group_windows(gi) {
                     let payload = pool
-                        .get(w.offset as usize..(w.offset as usize + w.length as usize).min(pool.len()))
+                        .get(
+                            w.offset as usize
+                                ..(w.offset as usize + w.length as usize).min(pool.len()),
+                        )
                         .unwrap_or(&[]);
                     let preview: String = payload
                         .iter()

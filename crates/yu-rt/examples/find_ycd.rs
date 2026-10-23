@@ -36,7 +36,11 @@ fn main() {
             in_pack.len(),
             file,
             on_disk.len(),
-            if in_pack == on_disk { "逐字节一致" } else { "不一致" }
+            if in_pack == on_disk {
+                "逐字节一致"
+            } else {
+                "不一致"
+            }
         );
     }
 }

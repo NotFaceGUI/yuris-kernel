@@ -1,0 +1,19 @@
+{
+  "frames": 520,
+  "inputs": [
+    {
+      "button": "MOUSE_L",
+      "frame": 300,
+      "x": 217,
+      "y": 368
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 390,
+      "x": 750,
+      "y": 565
+    }
+  ],
+  "name": "symptom-1-title-settings-back",
+  "note": "P1 S1 冒烟:标题 → 設定(217,368) → 戻る(750,565) → 标题。与 cases/title-config-back.json 同轨迹(宿主路径:--script)。"
+}

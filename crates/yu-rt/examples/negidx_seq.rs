@@ -4,10 +4,16 @@ use yu_rt::{BootConfig, Vm};
 use yu_vfs::{Codec, DirSource};
 fn main() {
     let root = std::env::args().nth(1).unwrap();
-    let limit: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(3);
+    let limit: usize = std::env::args()
+        .nth(2)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
     let src = DirSource::open(format!("{root}/data"), Codec::Cp932).unwrap();
     let aux = DirSource::open(&root, Codec::Cp932).unwrap();
-    let cfg = BootConfig { entry_label: "SYSTEM_START".into(), ..BootConfig::default() };
+    let cfg = BootConfig {
+        entry_label: "SYSTEM_START".into(),
+        ..BootConfig::default()
+    };
     let mut vm = Vm::boot_with_aux(Box::new(src), Some(Box::new(aux)), cfg).unwrap();
     vm.tick_at(0, &InputTimeline::new());
     let evs = vm.events();
@@ -18,8 +24,12 @@ fn main() {
                 shown += 1;
                 println!("--- hit {shown} at event {i} ---");
                 let start = i.saturating_sub(6);
-                for x in &evs[start..=i] { println!("{}", yu_rt::json::event_line(x)); }
-                if shown >= limit { break; }
+                for x in &evs[start..=i] {
+                    println!("{}", yu_rt::json::event_line(x));
+                }
+                if shown >= limit {
+                    break;
+                }
             }
         }
     }

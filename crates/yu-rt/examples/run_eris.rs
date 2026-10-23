@@ -5,8 +5,14 @@ use yu_vfs::{Codec, DirSource};
 
 fn main() {
     let root = std::env::args().nth(1).expect("project root");
-    let frames: u32 = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(5);
-    let tail: usize = std::env::args().nth(3).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let frames: u32 = std::env::args()
+        .nth(2)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let tail: usize = std::env::args()
+        .nth(3)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let src = DirSource::open(format!("{root}/data"), Codec::Cp932).expect("data");
     let aux = DirSource::open(&root, Codec::Cp932).expect("project");
     // 宿主注入(色深 + 路径);A3:内核不读真实显示/文件系统布局。
@@ -27,9 +33,18 @@ fn main() {
     let timeline = InputTimeline::new();
     for f in 0..frames {
         let r = vm.tick_at(f * 16, &timeline);
-        println!("frame {f}: cmds={} errors={} main_finished={}", r.commands_pumped, r.errors.len(), r.main_finished);
-        for e in &r.errors { println!("   ERR {e}"); }
-        if r.main_finished { break; }
+        println!(
+            "frame {f}: cmds={} errors={} main_finished={}",
+            r.commands_pumped,
+            r.errors.len(),
+            r.main_finished
+        );
+        for e in &r.errors {
+            println!("   ERR {e}");
+        }
+        if r.main_finished {
+            break;
+        }
     }
     if tail > 0 {
         let evs = vm.events();
@@ -40,5 +55,7 @@ fn main() {
         }
     }
     println!("== unimplemented ==");
-    for (name, n) in vm.unimplemented_cmds() { println!("  {name}: {n}"); }
+    for (name, n) in vm.unimplemented_cmds() {
+        println!("  {name}: {n}");
+    }
 }

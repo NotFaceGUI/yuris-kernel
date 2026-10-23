@@ -236,6 +236,10 @@ pub trait TaskExecutor {
     fn text_advance_requested(&self) -> bool {
         false
     }
+    /// 该任务是否在等待一条 DIALOG 回答(内核模态;DIV-RT-044)。
+    fn dialog_pending(&self, _task: &str) -> bool {
+        false
+    }
 }
 
 /// 逻辑帧驱动器。
@@ -272,6 +276,11 @@ impl Scheduler {
     pub fn with_pump_cap(mut self, cap: Option<usize>) -> Self {
         self.pump_cap = cap;
         self
+    }
+
+    /// 运行期调整泵上限(宿主 `--pump-cap`;`None` = 与引擎同构的无限泵)。
+    pub fn set_pump_cap(&mut self, cap: Option<usize>) {
+        self.pump_cap = cap;
     }
 
     pub fn spawn(&mut self, seed: TaskSeed) -> usize {
@@ -363,12 +372,7 @@ impl Scheduler {
         report
     }
 
-    fn step_frame(
-        &mut self,
-        exec: &mut dyn TaskExecutor,
-        now_ms: u32,
-        report: &mut ChainReport,
-    ) {
+    fn step_frame(&mut self, exec: &mut dyn TaskExecutor, now_ms: u32, report: &mut ChainReport) {
         let stamp = self.frame;
         let mut nodes = std::mem::take(&mut self.nodes);
         // 链长在入口快照(`0x40438d`):步进中新建的节点留给下一逻辑帧
@@ -398,6 +402,11 @@ impl Scheduler {
                     continue;
                 }
                 nodes[i].text_rest = false;
+            }
+            // DIALOG 挂起(模态):宿主回答前不推进该任务。状态由执行器持有
+            // (`Vm::dialogs`),调度器只查询。
+            if exec.dialog_pending(&nodes[i].id) {
+                continue;
             }
             // FRAME 递减(先递减再判到期 ⇒ FRAME=1 当帧即醒)。
             if nodes[i].wait_frames > 0 {
@@ -429,7 +438,8 @@ impl Scheduler {
 }
 
 /// 降序按 Z 插入;等键时插在既有节点之后(创建序)。
-fn insert_sorted(nodes: &mut Vec<TaskNode>, node: TaskNode) -> usize {    let pos = nodes
+fn insert_sorted(nodes: &mut Vec<TaskNode>, node: TaskNode) -> usize {
+    let pos = nodes
         .iter()
         .position(|n| n.priority < node.priority)
         .unwrap_or(nodes.len());
@@ -438,11 +448,7 @@ fn insert_sorted(nodes: &mut Vec<TaskNode>, node: TaskNode) -> usize {    let po
 }
 
 fn sort_nodes(nodes: &mut [TaskNode]) {
-    nodes.sort_by(|a, b| {
-        b.priority
-            .cmp(&a.priority)
-            .then_with(|| a.seq.cmp(&b.seq))
-    });
+    nodes.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.seq.cmp(&b.seq)));
 }
 
 /// 任务链 → 处理器可见投影(帧内新建节点已在链上,引擎语义如此)。
@@ -565,7 +571,9 @@ fn pump_node(
                     nodes[cur].pc,
                     nodes[cur].main,
                 );
-                report.errors.push(format!("task {id} s{script_id} pc{pc}: {e}"));
+                report
+                    .errors
+                    .push(format!("task {id} s{script_id} pc{pc}: {e}"));
                 if main {
                     report.main_finished = true;
                 }
@@ -705,10 +713,12 @@ mod tests {
     fn task_extends_chain_and_new_task_runs_next_logical_frame() {
         let mut s = Scheduler::new();
         s.spawn(seed("a"));
-        let mut exec = MockExec::new().script("a", vec![StepOutcome::Yield]).effects(
-            "a",
-            vec![Effect::RequestExtraFrame, Effect::SpawnTask(seed("b"))],
-        );
+        let mut exec = MockExec::new()
+            .script("a", vec![StepOutcome::Yield])
+            .effects(
+                "a",
+                vec![Effect::RequestExtraFrame, Effect::SpawnTask(seed("b"))],
+            );
         let r = s.tick_frame(&mut exec, 0);
         assert_eq!(r.logical_frames, 2);
         assert_eq!(exec.count("b"), 1);
@@ -742,10 +752,9 @@ mod tests {
         let mut s = Scheduler::new();
         s.spawn(seed("a"));
         s.spawn(seed("b"));
-        let mut exec = MockExec::new().script("a", vec![StepOutcome::Yield]).effects(
-            "a",
-            vec![Effect::FinishTask("b".to_string())],
-        );
+        let mut exec = MockExec::new()
+            .script("a", vec![StepOutcome::Yield])
+            .effects("a", vec![Effect::FinishTask("b".to_string())]);
         s.tick_frame(&mut exec, 0);
         assert!(
             s.find_by_id("b").is_none(),
@@ -771,10 +780,9 @@ mod tests {
         let mut s = Scheduler::new();
         s.spawn(seed("a"));
         s.node_mut("a").unwrap().pc = 99;
-        let mut exec = MockExec::new().script("a", vec![StepOutcome::Yield]).effects(
-            "a",
-            vec![Effect::FinishTask("a".to_string())],
-        );
+        let mut exec = MockExec::new()
+            .script("a", vec![StepOutcome::Yield])
+            .effects("a", vec![Effect::FinishTask("a".to_string())]);
         s.tick_frame(&mut exec, 0);
         assert!(s.find_by_id("a").is_none());
         let mut again = seed("a");

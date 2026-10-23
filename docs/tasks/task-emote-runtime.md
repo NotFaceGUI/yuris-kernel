@@ -31,8 +31,8 @@
 |---|---|---|
 | M0 契约 | **done** | `EMOTE`/`EMOTEINFO` 证据级契约写入 `domain-event-contracts.md` §7;`.psb` 表达裁决为“RGBA 纹理 + 图层变换” |
 | M1 数据 | **done(除规范化)** | `yu-emote`:PSB/MDF 解析、body 解密、`psb-info`/`psb-dump`;schema/atlas(v2 RGBA4444 + v4 ems RGBA8)/objects/motions/layers/variables/timelines/controllers 全覆盖;样本逐字节确定性。部件显隐/规范化规则仍待取证 |
-| M2 动画 | **core done** | `Animator` + `pose`:帧选择/type 0/3/ti、inheritMask、transformOrder、嵌套 motion、motion 级 parameter 表与 parameterize、解析 Z 绘制顺序、sprite mesh 继承(`meshTransform==1 && meshSyncChildMask&8`,控制点位移逐点相加);native 继承源(0x400000/motion root)、mesh combinator、coord/angle/zoom sync 已实现;差分淡入曲线、官方帧率、物理控制器待做 |
-| M3 渲染 | **baseline done** | 58 个 WGSL 文件、`plan` 绘制列表(累积 mesh 采样)、`soft` 确定性 CPU 光栅/PNG、composite alpha mask(CPU,含 type-3 source 展开)、blend 0..5 + MODULATE2X;wgpu 管线、pixelate、type-7 clip、inner/outer stencil phase 待做 |
+| M2 动画 | **core done(2026-10-23 续 2)** | 时间轴按 native 命令流实现(跨越帧边界发命令、`next.time-crossing-1` 过渡、easing 指数、type-0 只移动游标、loopEnd 非包含回 seek),官方 60 Hz;顶层 easing 表与 `ccc/acc/zcc/scc/occ/wcc`、`cp` 贝塞尔路径;空 `mesh.bp` 按 identity 解码(修复参数化头发在中点跳变);`Player` 顺序 timeline→controller→pose→physics;bust/hair/parts 弹簧、clamp、确定性眨眼、type-7 clip、type-9 anchor、差分时间轴(blend ratio + additive delta)已实现;嵌套 motion 深度上限 32→256(修复 39 段眼部高光链被截断,34→36 draw items);type-1/5 物理锚点改用 native mesh-chain 位置(修复 hair/bust 几乎不响应)。剩余:type-4 粒子、type-10 feedback、eyebrow/mouth graph 队列、selector、wind、pixelate |
+| M3 渲染 | **baseline done** | 58 个 WGSL 文件、`plan` 绘制列表(累积 mesh 采样)、`soft` 确定性 CPU 光栅/PNG、composite alpha mask(CPU,含 type-3 source 展开)、blend 0..5 + MODULATE2X、type-7 clip;`psb-anim` 输出整段 PNG 序列,demo 转 30fps alpha WebM;wgpu 管线、inner/outer stencil phase、pixelate 待做 |
 | M4 对拍 | pending | oracle 宿主已能 CreatePlayer/Update/Render,但 draw list 仍为空;官方像素对比待打通 |
 | M4 对拍 | pending | — |
 

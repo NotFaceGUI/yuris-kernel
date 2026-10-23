@@ -29,6 +29,7 @@ device = ["dep:cpal"]
 
 [dependencies]
 cpal = { version = "0.15", optional = true }
+log = "0.4"
 sha1 = "0.10"
 sha2 = "0.10"
 wgpu = "30.0.1"
@@ -38,5 +39,10 @@ yu-gfx = { path = "../yu-gfx" }
 yu-log = { path = "../yu-log" }
 yu-platform-input = { path = "../yu-platform/input" }
 yu-rt = { path = "../yu-rt" }
+yu-save = { path = "../yu-save" }
 yu-sound = { path = "../yu-sound" }
 yu-vfs = { path = "../yu-vfs" }
+
+[dev-dependencies]
+# 仅 examples/fault_dump.rs 使用:yu-trace 仍是旁挂(不进入 yu-cli 运行期依赖)。
+yu-trace = { path = "../yu-trace" }

@@ -1,12 +1,13 @@
 //! 找出 RETURNCODE 非空载荷窗口的形态(kind/len/bytes)。
 use yu_rt::tables::{ScriptFile, DEFAULT_SCRIPT_KEY};
 fn main() {
-    let dir = std::env::var("YURIS_SAMPLE_ERIS_YSBIN")
-        .expect("set YURIS_SAMPLE_ERIS_YSBIN");
+    let dir = std::env::var("YURIS_SAMPLE_ERIS_YSBIN").expect("set YURIS_SAMPLE_ERIS_YSBIN");
     let mut n = 0;
     for e in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
         let name = e.file_name().to_string_lossy().into_owned();
-        if !(name.len() == 12 && name.starts_with("yst") && name.ends_with(".ybn")
+        if !(name.len() == 12
+            && name.starts_with("yst")
+            && name.ends_with(".ybn")
             && name[3..8].bytes().all(|b| b.is_ascii_digit()))
         {
             continue;
@@ -22,7 +23,10 @@ fn main() {
             for w in sf.group_windows(pc) {
                 if let Some(p) = sf.window_payload(w) {
                     if !p.is_empty() {
-                        println!("{name} pc={pc} kind={} flag={} slot={} len={} bytes={p:02x?}", w.kind, w.flag, w.slot, w.length);
+                        println!(
+                            "{name} pc={pc} kind={} flag={} slot={} len={} bytes={p:02x?}",
+                            w.kind, w.flag, w.slot, w.length
+                        );
                         n += 1;
                     }
                 }

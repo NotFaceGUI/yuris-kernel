@@ -95,10 +95,7 @@ fn declare_and_let_scalar() {
     // 事件流:声明 + LET + END(END 结束主线)
     let kinds: Vec<&str> = vm.events().iter().map(|e| e.kind()).collect();
     assert!(kinds.contains(&"command"));
-    assert_eq!(
-        vm.events().iter().filter(|e| e.kind() == "end").count(),
-        1
-    );
+    assert_eq!(vm.events().iter().filter(|e| e.kind() == "end").count(), 1);
 }
 
 // ---------------------------------------------------------------- FILEINFO
@@ -107,7 +104,8 @@ fn declare_and_let_scalar() {
 fn boot_with_files(builder: ProjectBuilder, files: &[(&[u8], &[u8])]) -> Vm {
     let mut src = builder.build();
     for (path, bytes) in files {
-        src.insert(path, bytes.to_vec()).expect("insert fixture file");
+        src.insert(path, bytes.to_vec())
+            .expect("insert fixture file");
     }
     Vm::boot(Box::new(src), BootConfig::default()).expect("boot")
 }
@@ -159,11 +157,15 @@ fn fileinfo_exist_writes_one_and_zero_to_let() {
     let report = vm.tick_at(0, &no_input());
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(
-        vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(),
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
         Value::Int(1)
     );
     assert_eq!(
-        vm.store().read(VarRef::new(VarSpace::At, sys + 1), &[]).unwrap(),
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 1), &[])
+            .unwrap(),
         Value::Int(0),
         "不存在的文件也必须写 0(引擎 0x4432dc),不能跳过 LET"
     );
@@ -196,7 +198,9 @@ fn fileinfo_exist_writes_float_target() {
     let report = vm.tick_at(0, &no_input());
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(
-        vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(),
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
         Value::Float(1.0)
     );
 }
@@ -246,14 +250,20 @@ fn if_fixture(cond: i64) -> ProjectBuilder {
 fn if_true_takes_then_branch() {
     let mut vm = boot(if_fixture(1));
     vm.tick_at(0, &no_input());
-    assert_eq!(vm.store().read(user_var(&vm, 0), &[]).unwrap(), Value::Int(1));
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(1)
+    );
 }
 
 #[test]
 fn if_false_takes_else_branch() {
     let mut vm = boot(if_fixture(0));
     vm.tick_at(0, &no_input());
-    assert_eq!(vm.store().read(user_var(&vm, 0), &[]).unwrap(), Value::Int(2));
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(2)
+    );
 }
 
 #[test]
@@ -308,10 +318,7 @@ fn loop_fixture(count: i64) -> ProjectBuilder {
         // 1: LET[@n = @n + 1]
         GroupSpec::new(OP_LET)
             .window(0, ex::r#ref(0x40, sys))
-            .window(
-                0,
-                ex::cat(&[ex::get(0x40, sys), ex::i8_(1), ex::op(0x2b)]),
-            ),
+            .window(0, ex::cat(&[ex::get(0x40, sys), ex::i8_(1), ex::op(0x2b)])),
         // 2: LET[@lc = @_LC]  (系统变量 id 由表解析)
         GroupSpec::new(OP_LET)
             .window(0, ex::r#ref(0x40, sys + 1))
@@ -343,12 +350,16 @@ fn loop_counts_and_lc_is_visible() {
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     let sys = vm.sysvars().len() as u16;
     assert_eq!(
-        vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(),
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
         Value::Int(5),
         "循环体执行 5 次"
     );
     assert_eq!(
-        vm.store().read(VarRef::new(VarSpace::At, sys + 1), &[]).unwrap(),
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 1), &[])
+            .unwrap(),
         Value::Int(5),
         "_LC 在最后一轮 = 5(手册 1..5)"
     );
@@ -396,10 +407,7 @@ fn gosub_passes_pint_and_return_brings_rint() {
         // 3: SUB: LET[@a = @_PINT(1) * 2]; RETURN[RINT=@a]
         GroupSpec::new(OP_LET)
             .window(0, ex::r#ref(0x40, sys))
-            .window(
-                0,
-                ex::cat(&[ex::get(0x40, 0), ex::i8_(2), ex::op(0x2a)]),
-            ),
+            .window(0, ex::cat(&[ex::get(0x40, 0), ex::i8_(2), ex::op(0x2a)])),
         GroupSpec::new(OP_RETURN).window(0, ex::get(0x40, sys)),
     ]];
     // 填入 @_PINT(1) / @_RINT(1) 的真实 id。
@@ -408,16 +416,11 @@ fn gosub_passes_pint_and_return_brings_rint() {
         p.sysvars = b.sysvars.clone();
         p.build()
     };
-    let tables =
-        yu_rt::TableSet::load(&probe_src, yu_rt::tables::DEFAULT_SCRIPT_KEY).unwrap();
+    let tables = yu_rt::TableSet::load(&probe_src, yu_rt::tables::DEFAULT_SCRIPT_KEY).unwrap();
     let pint = tables.boot.sysvars.id("_PINT").unwrap();
     let rint = tables.boot.sysvars.id("_RINT").unwrap();
     // 组 1 第二窗口 @_RINT(1):索引 1 → 数组取值
-    b.scripts[0][1].windows[1].4 = ex::cat(&[
-        ex::r#ref(0x40, rint),
-        ex::i8_(1),
-        ex::aload(),
-    ]);
+    b.scripts[0][1].windows[1].4 = ex::cat(&[ex::r#ref(0x40, rint), ex::i8_(1), ex::aload()]);
     // 组 3 第一窗口 @_PINT(1)
     // 被调方:LET[@a = @_PINT(1) * 2]
     // 窗口 0 = 左值引用;窗口 1 = 表达式(数组取值需 引用+下标+aload)。
@@ -433,12 +436,16 @@ fn gosub_passes_pint_and_return_brings_rint() {
     let report = vm.tick_at(0, &no_input());
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(
-        vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(),
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
         Value::Int(42),
         "被调方读到 PINT(1)=21 并乘 2"
     );
     assert_eq!(
-        vm.store().read(VarRef::new(VarSpace::At, sys + 1), &[]).unwrap(),
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 1), &[])
+            .unwrap(),
         Value::Int(42),
         "调用方读到 RINT(1)=42"
     );
@@ -478,12 +485,27 @@ fn wait_frame_yields_and_wakes() {
     // 第 1 帧:执行到 WAIT 让出(n=1)
     let r = vm.tick_at(0, &no_input());
     assert!(r.errors.is_empty(), "{:?}", r.errors);
-    assert_eq!(vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(), Value::Int(1));
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(1)
+    );
     // FRAME=2:再等两帧后继续
     vm.tick_at(16, &no_input());
-    assert_eq!(vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(), Value::Int(1));
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(1)
+    );
     vm.tick_at(32, &no_input());
-    assert_eq!(vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(), Value::Int(11));
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(11)
+    );
     let waits = vm.events().iter().filter(|e| e.kind() == "wait").count();
     assert_eq!(waits, 1);
 }
@@ -512,11 +534,26 @@ fn wait_time_uses_injected_clock_only() {
     ]];
     let mut vm = boot(b);
     vm.tick_at(1000, &no_input());
-    assert_eq!(vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(), Value::Int(0));
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(0)
+    );
     vm.tick_at(1099, &no_input());
-    assert_eq!(vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(), Value::Int(0));
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(0)
+    );
     vm.tick_at(1100, &no_input());
-    assert_eq!(vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(), Value::Int(1));
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(1)
+    );
 }
 
 // ---------------------------------------------------------------- 输入
@@ -561,10 +598,20 @@ fn key_counter_is_signed_frame_counter() {
     let mut vm = boot(b);
     // 第 1 帧按下 → 1
     vm.tick_at(0, &timeline);
-    assert_eq!(vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(), Value::Int(1));
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(1)
+    );
     // 第 2 帧持续 → 2
     vm.tick_at(16, &timeline);
-    assert_eq!(vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(), Value::Int(1));
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(1)
+    );
 }
 
 // ---------------------------------------------------------------- 字符串 / VARACT
@@ -599,10 +646,7 @@ fn string_declare_concat_and_varact_copy() {
         // STR[$dst = "ABC" + ".BMP"]
         GroupSpec::new(OP_STR)
             .window(0, ex::r#ref(0x24, sys + 1))
-            .window(
-                0,
-                ex::cat(&[ex::s("ABC"), ex::s(".BMP"), ex::op(0x2b)]),
-            ),
+            .window(0, ex::cat(&[ex::s("ABC"), ex::s(".BMP"), ex::op(0x2b)])),
         // VARACT[COPY=1 SET=$src LET=$dst POS=2 LENGTH=3] → "BCD"
         GroupSpec::new(OP_VARACT)
             .window(0, ex::r#ref(0x24, sys))
@@ -616,11 +660,15 @@ fn string_declare_concat_and_varact_copy() {
     let report = vm.tick_at(0, &no_input());
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(
-        vm.store().read(VarRef::new(VarSpace::Dollar, sys), &[]).unwrap(),
+        vm.store()
+            .read(VarRef::new(VarSpace::Dollar, sys), &[])
+            .unwrap(),
         Value::Str(b"ABCDEF".to_vec())
     );
     assert_eq!(
-        vm.store().read(VarRef::new(VarSpace::Dollar, sys + 1), &[]).unwrap(),
+        vm.store()
+            .read(VarRef::new(VarSpace::Dollar, sys + 1), &[])
+            .unwrap(),
         Value::Str(b"BCD".to_vec()),
         "VARACT COPY:2 字符起 3 个字符(手册例 5)"
     );
@@ -650,7 +698,9 @@ fn string_concat_assignment() {
     let mut vm = boot(b);
     vm.tick_at(0, &no_input());
     assert_eq!(
-        vm.store().read(VarRef::new(VarSpace::Dollar, sys), &[]).unwrap(),
+        vm.store()
+            .read(VarRef::new(VarSpace::Dollar, sys), &[])
+            .unwrap(),
         Value::Str(b"ABC.BMP".to_vec())
     );
 }
@@ -683,7 +733,11 @@ fn math_sqrt_and_abs() {
     let mut vm = boot(b);
     let report = vm.tick_at(0, &no_input());
     assert!(report.errors.is_empty(), "{:?}", report.errors);
-    match vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap() {
+    match vm
+        .store()
+        .read(VarRef::new(VarSpace::At, sys), &[])
+        .unwrap()
+    {
         Value::Float(f) => assert!((f - 3.0).abs() < 1e-12),
         other => panic!("期望浮点,得到 {other:?}"),
     }
@@ -697,7 +751,9 @@ fn fps_sets_engine_rate() {
     b.labels = vec![("SYSTEM_START", 0, 0, 0)];
     b.entry(0, 0);
     b.scripts = vec![vec![
-        GroupSpec::new(OP_FPS).window(0, ex::i8_(30)).window(1, ex::i8_(0)),
+        GroupSpec::new(OP_FPS)
+            .window(0, ex::i8_(30))
+            .window(1, ex::i8_(0)),
         GroupSpec::new(OP_END),
     ]];
     let mut vm = boot(b);
@@ -766,15 +822,16 @@ fn unimplemented_command_is_recorded_once_and_execution_continues() {
     }];
     b.labels = vec![("SYSTEM_START", 0, 0, 0)];
     b.entry(0, 0);
-    // F_INT(手册无页 ⇒ 军规不实现)的 0.495 序号;先查夹具表。
-    let op_f_int = b
+    // `VAR`:官方有独立处理体(0x453f88),本内核尚无处理器 ⇒ Unknown/
+    // Unimplemented。F_INT 在 P0-A 后归默认槽(脚本错误),不再走此路径。
+    let op_var = b
         .commands
         .iter()
-        .position(|(n, _)| *n == "F_INT")
-        .expect("夹具命令表应有 F_INT") as u8;
+        .position(|(n, _)| *n == "VAR")
+        .expect("夹具命令表应有 VAR") as u8;
     b.scripts = vec![vec![
-        GroupSpec::new(op_f_int),
-        GroupSpec::new(op_f_int),
+        GroupSpec::new(op_var),
+        GroupSpec::new(op_var),
         GroupSpec::new(OP_LET)
             .window(0, ex::r#ref(0x40, sys))
             .window(0, ex::i8_(7)),
@@ -784,20 +841,24 @@ fn unimplemented_command_is_recorded_once_and_execution_continues() {
     let r = vm.tick_at(0, &no_input());
     assert!(r.errors.is_empty(), "Unimplemented 不致命");
     assert_eq!(
-        vm.unimplemented_cmds().get("F_INT").copied(),
+        vm.unimplemented_cmds().get("VAR").copied(),
         Some(2),
         "计数 2 次"
     );
     assert_eq!(
         vm.events()
             .iter()
-            .filter(|e| matches!(e, yu_rt::VmEvent::Diag { code, .. } if code == "rt.cmd.unimplemented"))
+            .filter(
+                |e| matches!(e, yu_rt::VmEvent::Diag { code, .. } if code == "rt.cmd.unimplemented")
+            )
             .count(),
         1,
         "事件流只挂一次"
     );
     assert_eq!(
-        vm.store().read(VarRef::new(VarSpace::At, sys), &[]).unwrap(),
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
         Value::Int(7),
         "执行继续"
     );
@@ -826,8 +887,8 @@ fn missing_table_refuses_boot() {
     b.scripts = vec![vec![GroupSpec::new(OP_END)]];
     b.omit = vec!["ycd"];
     b.sysvars_abi = true;
-    let vm = Vm::boot(Box::new(b.build()), BootConfig::default())
-        .expect("商业形态(无 ycd)必须可启动");
+    let vm =
+        Vm::boot(Box::new(b.build()), BootConfig::default()).expect("商业形态(无 ycd)必须可启动");
     assert!(vm.tables().boot.ycd.is_none());
     assert_eq!(vm.sysvars().len(), 548, "回退到引擎 ABI 表");
     assert_eq!(vm.sysvars().id("_LC"), Some(48));
@@ -898,10 +959,7 @@ fn main_task_id_is_system_and_script_visible() {
 fn taskend_without_id_ends_only_self_and_main_continues() {
     let mut b = ProjectBuilder::new();
     let v = with_int_var(&mut b, 0, 0);
-    b.labels = vec![
-        ("SYSTEM_START", 0, 0, 0),
-        ("SUB.BODY", 4, 0, 0),
-    ];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("SUB.BODY", 4, 0, 0)];
     b.entry(0, 0);
     const OP_TASK: u8 = 93;
     const OP_TASKEND: u8 = 94;
@@ -1054,7 +1112,7 @@ fn higher_z_task_runs_before_lower_z() {
         GroupSpec::new(OP_END),
     ];
     groups.extend(body(1)); // 3..5
-    // 6..8 = B 体(与标签 B.BODY=6 对齐)
+                            // 6..8 = B 体(与标签 B.BODY=6 对齐)
     groups.extend(body(2));
     b.scripts = vec![groups];
     let mut vm = boot(b);
@@ -1066,9 +1124,9 @@ fn higher_z_task_runs_before_lower_z() {
         .events()
         .iter()
         .filter_map(|e| match e {
-            yu_rt::VmEvent::Command { frame: 2, pc, name, .. } if name == "LET" && (*pc == 3 || *pc == 6) => {
-                Some(*pc)
-            }
+            yu_rt::VmEvent::Command {
+                frame: 2, pc, name, ..
+            } if name == "LET" && (*pc == 3 || *pc == 6) => Some(*pc),
             _ => None,
         })
         .collect();
@@ -1180,7 +1238,9 @@ fn var_add_macro_chain_appends() {
         .events()
         .iter()
         .filter_map(|e| match e {
-            yu_rt::VmEvent::Diag { detail, .. } if detail.contains("为负") => Some(detail.clone()),
+            yu_rt::VmEvent::Diag { detail, .. } if detail.contains("为负") => {
+                Some(detail.clone())
+            }
             _ => None,
         })
         .collect();
@@ -1193,7 +1253,9 @@ fn var_add_macro_chain_appends() {
         "元素写入 @cnt(0)-1 = 0"
     );
     assert_eq!(
-        vm.store().read(VarRef::new(VarSpace::At, sys + 1), &[0]).unwrap(),
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 1), &[0])
+            .unwrap(),
         Value::Int(1),
         "VARINFO DIMSIZE 读出 1"
     );
@@ -1358,9 +1420,9 @@ fn text_id_sets_following_run_id_and_clear_empties_buffer() {
     b.entry(0, 0);
     let text = |slot: u8, payload: Vec<u8>| GroupSpec::new(OP_TEXT).window(slot, payload);
     b.scripts = vec![vec![
-        text(0, ex::s("MSG")),      // TEXT[ID="MSG"]
+        text(0, ex::s("MSG")), // TEXT[ID="MSG"]
         GroupSpec::new(OP_WORD).window(0, b"A".to_vec()),
-        text(16, ex::i32_(1)),      // TEXT[CLEAR=1](0.495 slot 16)
+        text(16, ex::i32_(1)), // TEXT[CLEAR=1](0.495 slot 16)
         GroupSpec::new(OP_WORD).window(0, b"B".to_vec()),
         GroupSpec::new(OP_END),
     ]];
@@ -1412,7 +1474,7 @@ fn text_outputmode_manual_click_continues_and_auto_click_yields() {
     b.entry(0, 0);
     let text = |slot: u8, payload: Vec<u8>| GroupSpec::new(OP_TEXT).window(slot, payload);
     b.scripts = vec![vec![
-        text(1, ex::i32_(0)), // OUTPUTMODE=0 手动
+        text(1, ex::i32_(0)),  // OUTPUTMODE=0 手动
         text(15, ex::i32_(1)), // CLICK=1:手动模式不 yield
         text(11, ex::i32_(1)), // RETURN=1
         GroupSpec::new(OP_END),
@@ -1555,7 +1617,14 @@ fn domain_args_map_slots_through_project_yscm() {
         .iter()
         .find(|e| matches!(e, yu_rt::VmEvent::DomainCall { name, .. } if name == "SOUND"))
         .expect("SOUND DomainCall");
-    let named = call.domain_args(&vm.tables().boot.yscm).expect("DomainCall");
+    let named = call
+        .domain_args(&vm.tables().boot.yscm)
+        .expect("DomainCall");
+    // P4:域事件带可选脚本坐标(内核发出的总是 Some)。
+    if let yu_rt::VmEvent::DomainCall { script, pc, .. } = call {
+        assert_eq!(*script, Some(0));
+        assert_eq!(*pc, Some(0));
+    }
     let names: Vec<&str> = named.iter().map(|a| a.name.as_ref()).collect();
     assert_eq!(names, vec!["ID", "VOLUME", "E"]);
     assert_eq!(named[0].value, &Value::Str(b"BGM".to_vec()));
@@ -1621,11 +1690,7 @@ fn inp_and_code_constants_share_the_engine_counter_table() {
             .window(0, ex::r#ref(0x40, sys + 3))
             .window(
                 0,
-                ex::cat(&[
-                    ex::r#ref(0x40, inp),
-                    ex::i16_(0x5A),
-                    ex::aload(),
-                ]),
+                ex::cat(&[ex::r#ref(0x40, inp), ex::i16_(0x5A), ex::aload()]),
             ),
         GroupSpec::new(OP_END),
     ]];
@@ -1654,7 +1719,6 @@ fn inp_and_code_constants_share_the_engine_counter_table() {
     vm.input_state_mut().set_code(code_enter, 0x5A);
     assert_eq!(vm.input().code_value(code_enter, 0x0D), 0x5A);
 }
-
 
 // ---------------------------------------------------------------- panic 收口(任务书 E R7)
 
@@ -1694,7 +1758,12 @@ fn gosub_param_name_out_of_range_is_fatal_not_a_panic() {
     ]];
     let mut vm = boot(b);
     let r = vm.tick_at(0, &no_input());
-    assert_eq!(r.errors.len(), 1, "PINT0 应报 Fatal 而非 panic: {:?}", r.errors);
+    assert_eq!(
+        r.errors.len(),
+        1,
+        "PINT0 应报 Fatal 而非 panic: {:?}",
+        r.errors
+    );
     assert!(r.errors[0].contains("超出 1..16"), "{:?}", r.errors);
 }
 
@@ -1725,7 +1794,12 @@ fn dimsize_huge_is_fatal_not_an_abort() {
     ]];
     let mut vm = boot(b);
     let r = vm.tick_at(0, &no_input());
-    assert_eq!(r.errors.len(), 1, "巨型 DIMSIZE 应报 Fatal 而非 abort: {:?}", r.errors);
+    assert_eq!(
+        r.errors.len(),
+        1,
+        "巨型 DIMSIZE 应报 Fatal 而非 abort: {:?}",
+        r.errors
+    );
     assert!(r.errors[0].contains("防御上限"), "{:?}", r.errors);
 }
 
@@ -1769,7 +1843,12 @@ fn one_text_line_per_frame_until_advance_input() {
             .collect()
     };
     assert_eq!(texts(&vm), vec![b"A".to_vec()], "一帧只推进一行");
-    let rc_count = |vm: &Vm| vm.events().iter().filter(|e| e.kind() == "return_code").count();
+    let rc_count = |vm: &Vm| {
+        vm.events()
+            .iter()
+            .filter(|e| e.kind() == "return_code")
+            .count()
+    };
     assert_eq!(rc_count(&vm), 1);
 
     // 帧 2/3:无输入 ⇒ 仍停在第一行。
@@ -1907,7 +1986,11 @@ fn ifcontinue_does_not_accumulate_if_frames() {
     ]];
     let mut vm = boot(b);
     let r = vm.tick_at(0, &no_input());
-    assert!(r.errors.is_empty(), "IFCONTINUE 不应撞嵌套上限: {:?}", r.errors);
+    assert!(
+        r.errors.is_empty(),
+        "IFCONTINUE 不应撞嵌套上限: {:?}",
+        r.errors
+    );
     assert_eq!(
         vm.store().read(user_var(&vm, 1), &[]).unwrap(),
         Value::Int(1),
@@ -1939,8 +2022,16 @@ fn frame_events_are_bounded_by_start_and_end() {
             .filter(|e| e.frame() == frame)
             .map(|e| e.kind())
             .collect();
-        assert_eq!(kinds.first(), Some(&"frame_start"), "帧 {frame} 以 FrameStart 开始");
-        assert_eq!(kinds.last(), Some(&"frame_end"), "帧 {frame} 以 FrameEnd 结束");
+        assert_eq!(
+            kinds.first(),
+            Some(&"frame_start"),
+            "帧 {frame} 以 FrameStart 开始"
+        );
+        assert_eq!(
+            kinds.last(),
+            Some(&"frame_end"),
+            "帧 {frame} 以 FrameEnd 结束"
+        );
     }
 }
 
@@ -1991,8 +2082,14 @@ fn script_diag_carries_task_script_and_pc() {
         .map(|d| d.to_json_line())
         .expect("应有 rt.label 诊断");
     assert!(line.contains("\"kind\":\"script\""), "{line}");
-    assert!(line.contains("fixture0000.yst"), "脚本文件名进 Diag: {line}");
-    assert!(line.contains("\"label\":\"SYSTEM\""), "任务标识进 label: {line}");
+    assert!(
+        line.contains("fixture0000.yst"),
+        "脚本文件名进 Diag: {line}"
+    );
+    assert!(
+        line.contains("\"label\":\"SYSTEM\""),
+        "任务标识进 label: {line}"
+    );
     assert!(line.contains("\"pc\":0"), "{line}");
     assert!(line.contains("\"cmd\":\"GO\""), "{line}");
 }
@@ -2049,7 +2146,10 @@ fn task_without_tint_does_not_inherit_caller_registers() {
         // 6: B.BODY —— 读 @_TINT(1)
         GroupSpec::new(OP_LET)
             .window(0, ex::r#ref(0x40, v.id))
-            .window(0, ex::cat(&[ex::r#ref(0x40, tint), ex::i8_(1), ex::aload()])),
+            .window(
+                0,
+                ex::cat(&[ex::r#ref(0x40, tint), ex::i8_(1), ex::aload()]),
+            ),
         GroupSpec::new(OP_TASKEND),
     ]];
     let mut vm = boot(b);
@@ -2215,4 +2315,659 @@ fn soundinfo_query_writes_let_through_host() {
     assert!(seen.get(), "SoundHost::query 未被调用");
     let v = vm.store().read(user_var(&vm, 0), &[]).unwrap();
     assert_eq!(v, Value::Int(1234));
+}
+
+// ---------------------------------------------------------------- 官方分发表槽(P0-A/DIV-RT-043)
+
+const OP_DEBUGLIST: u8 = 9;
+const OP_DIALOG: u8 = 10;
+const OP_F_INT: u8 = 18;
+const OP_LABEL: u8 = 52;
+const OP_PREP: u8 = 75;
+const OP_RETURNBREAK: u8 = 78;
+const OP_S_INT: u8 = 81;
+
+/// 官方默认槽 `0x459e90`(F_INT 等):报一次「スクリプト実行エラー」+
+/// 返回 -1 ⇒ 本帧让出、pc 已前进、任务继续(DIV-RT-043)。
+#[test]
+fn default_slot_reports_once_and_yields_without_terminating() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(0),
+    }];
+    let groups = vec![
+        GroupSpec::new(OP_F_INT),
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, sys))
+            .window(1, ex::i8_(1)),
+        GroupSpec::new(OP_F_INT),
+        GroupSpec::new(OP_END),
+    ];
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let mut vm = boot(b);
+    // 第一帧:F_INT 返回 -1(让出)⇒ 后面的 LET 本帧不执行。
+    let r0 = vm.tick_at(0, &no_input());
+    assert!(
+        r0.errors.is_empty(),
+        "默认槽不是内核 Fatal: {:?}",
+        r0.errors
+    );
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(0)
+    );
+    assert_eq!(vm.script_slot_hits(), 1);
+    let diag0 = vm
+        .events()
+        .iter()
+        .filter(|e| matches!(e, yu_rt::VmEvent::Diag { code, .. } if code == "rt.script.error"))
+        .count();
+    assert_eq!(diag0, 1, "官方只弹一次全局错误(0x5e4f84)");
+    assert!(
+        vm.unimplemented_cmds().is_empty(),
+        "默认槽不是 Unimplemented"
+    );
+
+    // 第二帧:LET 继续,第二条 F_INT 再让出;诊断不重复。
+    let r1 = vm.tick_at(16, &no_input());
+    assert!(r1.errors.is_empty(), "{:?}", r1.errors);
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(1)
+    );
+    assert_eq!(vm.script_slot_hits(), 2);
+    let diag1 = vm
+        .events()
+        .iter()
+        .filter(|e| matches!(e, yu_rt::VmEvent::Diag { code, .. } if code == "rt.script.error"))
+        .count();
+    assert_eq!(diag1, 1, "第二次命中仍只保留首条诊断");
+
+    // 第三帧:END 正常结束主线。
+    let r2 = vm.tick_at(32, &no_input());
+    assert!(r2.main_finished);
+}
+
+/// 官方 `0x4634d8`(xor eax,eax; ret)= 真 no-op:同帧继续,无诊断。
+#[test]
+fn noop_slots_continue_in_the_same_pump() {
+    let groups = vec![
+        GroupSpec::new(OP_DEBUGLIST),
+        GroupSpec::new(OP_LABEL),
+        GroupSpec::new(OP_PREP),
+        GroupSpec::new(OP_RETURNBREAK),
+        GroupSpec::new(OP_S_INT),
+        GroupSpec::new(OP_END),
+    ];
+    let mut b = ProjectBuilder::new();
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.commands_pumped, 6, "no-op 不得让出");
+    assert!(vm.unimplemented_cmds().is_empty());
+    assert!(vm.script_slot_hits() == 0);
+    assert!(!vm
+        .events()
+        .iter()
+        .any(|e| matches!(e, yu_rt::VmEvent::Diag { .. })));
+}
+
+// ---------------------------------------------------------------- DIALOG(P0-B/DIV-RT-044)
+
+/// DIALOG 挂起任务;宿主回答后写 `LET`(1 基按钮序号),下一帧继续。
+#[test]
+fn dialog_blocks_task_until_answered_and_writes_let() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(0),
+    }];
+    let groups = vec![
+        // DIALOG[STR="q" CAPTION="c" YESNO=1 LET=@v]
+        GroupSpec::new(OP_DIALOG)
+            .window(0, ex::s("c"))
+            .window(1, ex::s("q"))
+            .window(14, ex::i8_(1))
+            .window(11, ex::r#ref(0x40, sys)),
+        // 回答后才会执行:LET[@v = 99]
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, sys))
+            .window(1, ex::i8_(99)),
+        GroupSpec::new(OP_END),
+    ];
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let mut vm = boot(b);
+    let r0 = vm.tick_at(0, &no_input());
+    assert!(r0.errors.is_empty(), "{:?}", r0.errors);
+    let pending = vm.pending_dialogs().to_vec();
+    assert_eq!(pending.len(), 1);
+    let req = &pending[0];
+    assert_eq!(req.text, b"q");
+    assert_eq!(req.caption, b"c");
+    assert_eq!(req.buttons, yu_rt::dialog::DialogButtons::YesNo);
+    assert!(req.accepts_button(1) && req.accepts_button(2) && !req.accepts_button(3));
+    assert_eq!(vm.dialog_of_task(MAIN_TASK_ID), Some(req.id));
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(0),
+        "未回答前任务必须挂起,后续 LET 不得执行"
+    );
+
+    // 第二帧仍挂起。
+    vm.tick_at(16, &no_input());
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(0)
+    );
+
+    // 越界按钮被拒绝;选「いいえ」= 2。
+    let id = req.id;
+    assert!(vm.answer_dialog(id, 3, None).is_err());
+    vm.answer_dialog(id, 2, None).expect("answer");
+    assert!(vm.pending_dialogs().is_empty());
+    assert_eq!(vm.dialog_of_task(MAIN_TASK_ID), None);
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(2),
+        "LET = 左起第 2 个按钮"
+    );
+
+    // 下一帧继续 DIALOG 之后的指令。
+    let r1 = vm.tick_at(32, &no_input());
+    assert!(r1.errors.is_empty(), "{:?}", r1.errors);
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(99),
+        "pc 已前进,回答后执行下一条"
+    );
+    assert!(r1.main_finished);
+}
+
+/// INPUT=1:按钮固定 OK(LET=1),文本写回 LETSTR;缺文本的回答被拒绝。
+#[test]
+fn dialog_input_writes_letstr_and_let() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(0),
+        },
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b""),
+        },
+    ];
+    let groups = vec![
+        // DIALOG[CAPTION="c" STR="name?" INPUT=1 DEFSTR="abc" LETSTR=$s LET=@v]
+        GroupSpec::new(OP_DIALOG)
+            .window(0, ex::s("c"))
+            .window(1, ex::s("name?"))
+            .window(9, ex::s("abc"))
+            .window(10, ex::r#ref(0x24, sys + 1))
+            .window(11, ex::r#ref(0x40, sys))
+            .window(16, ex::i8_(1)),
+        GroupSpec::new(OP_END),
+    ];
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let mut vm = boot(b);
+    vm.tick_at(0, &no_input());
+    let req = vm.pending_dialogs()[0].clone();
+    assert!(req.input);
+    assert_eq!(req.default_input, b"abc");
+    assert_eq!(req.buttons, yu_rt::dialog::DialogButtons::Ok);
+    assert!(
+        vm.answer_dialog(req.id, 1, None).is_err(),
+        "INPUT 必须带文本"
+    );
+    vm.answer_dialog(req.id, 1, Some(b"Alice")).expect("answer");
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::Dollar, sys + 1), &[])
+            .map(|v| match v {
+                Value::Str(b) => b,
+                _ => panic!("LETSTR 目标类型"),
+            })
+            .unwrap(),
+        b"Alice".to_vec()
+    );
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(1)
+    );
+    let r = vm.tick_at(16, &no_input());
+    assert!(r.main_finished);
+}
+
+/// 未取证参数(NOWAIT 等)⇒ Unimplemented,不弹窗、不写回。
+#[test]
+fn dialog_unsupported_param_is_unimplemented() {
+    let groups = vec![
+        GroupSpec::new(OP_DIALOG)
+            .window(1, ex::s("q"))
+            .window(49, ex::i8_(1)),
+        GroupSpec::new(OP_END),
+    ];
+    let mut b = ProjectBuilder::new();
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert!(vm.pending_dialogs().is_empty());
+    assert_eq!(
+        vm.unimplemented_cmds().get("DIALOG").copied(),
+        Some(1),
+        "未取证参数按命令挂号"
+    );
+    // 事件流仍记录 DomainCall 事实,但不产生待回答请求。
+    assert!(vm.events().iter().any(|e| matches!(
+        e,
+        yu_rt::VmEvent::DomainCall { name, .. } if name == "DIALOG"
+    )));
+    assert!(r.main_finished, "未取证参数不阻塞,END 同帧执行");
+}
+
+// ---------------------------------------------------------------- P3 系统变量收口
+
+/// `$_TEXT_FLAG` 写入 = 替换控制字节流,不重建文本(REA 0x446b98..)。
+#[test]
+fn text_flag_write_replaces_stream_without_rebuilding_text() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b""),
+        },
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b""),
+        },
+    ];
+    let flag_id = b
+        .sysvars
+        .iter()
+        .position(|(n, _, _)| *n == "_TEXT_FLAG")
+        .expect("_TEXT_FLAG") as u16;
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_WORD).window(0, b"A\x82\xB1".to_vec()),
+        // LET[$_TEXT_FLAG = "9"]
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x24, flag_id))
+            .window(1, ex::s("9")),
+        // LET[$v = $_TEXT_FLAG]
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x24, sys))
+            .window(1, ex::get(0x24, flag_id)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(vm.current_text(), b"A\x82\xB1", "写标志不得改文本");
+    assert_eq!(vm.text_flags(), b"9", "写入替换整个控制流");
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::Dollar, sys), &[])
+            .unwrap(),
+        Value::Str(b"9".to_vec())
+    );
+}
+
+/// `VARACT[HANTOZEN/ZENTOHAN]` 使用官方 0.495 表(DIV-RT-013)。
+#[test]
+fn varact_hantozen_and_zentohan_use_official_tables() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b"A\xb1"),
+        },
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b""),
+        },
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + 2,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b""),
+        },
+    ];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let src = VarRef::new(VarSpace::Dollar, sys);
+    let wide = VarRef::new(VarSpace::Dollar, sys + 1);
+    let back = VarRef::new(VarSpace::Dollar, sys + 2);
+    b.scripts = vec![vec![
+        // VARACT[SET=$src LET=$wide HANTOZEN=1]
+        GroupSpec::new(OP_VARACT)
+            .window(0, ex::r#ref(0x24, src.id))
+            .window(1, ex::r#ref(0x24, wide.id))
+            .window(11, ex::i8_(1)),
+        // VARACT[SET=$wide LET=$back ZENTOHAN=1]
+        GroupSpec::new(OP_VARACT)
+            .window(0, ex::r#ref(0x24, wide.id))
+            .window(1, ex::r#ref(0x24, back.id))
+            .window(12, ex::i8_(1)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    // A → Ａ(0x82 0x60);ｱ(0xb1) → ア(0x83 0x41)
+    assert_eq!(
+        vm.store().read(wide, &[]).unwrap(),
+        Value::Str(vec![0x82, 0x60, 0x83, 0x41])
+    );
+    assert_eq!(
+        vm.store().read(back, &[]).unwrap(),
+        Value::Str(vec![b'A', 0xb1])
+    );
+}
+
+/// `MATH[RND]` 用注入的 MT19937 种子;缺省 5489,首个输出对 1..=9 取模得 3。
+#[test]
+fn math_rnd_uses_injected_mt19937_seed() {
+    let mut b = ProjectBuilder::new();
+    let v = with_int_var(&mut b, 0, 0);
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_MATH)
+            .window(0, ex::r#ref(0x40, v.id))
+            .window(1, ex::i8_(1))
+            .window(2, ex::i8_(9))
+            .window(20, ex::i8_(1)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    // 3499211612 % 9 = 2 ⇒ 1 + 2 = 3。
+    assert_eq!(vm.store().read(v, &[]).unwrap(), Value::Int(3));
+
+    // 同种子第二个 VM 结果一致(确定性)。
+    let mut b = ProjectBuilder::new();
+    let v2 = with_int_var(&mut b, 0, 0);
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_MATH)
+            .window(0, ex::r#ref(0x40, v2.id))
+            .window(1, ex::i8_(1))
+            .window(2, ex::i8_(9))
+            .window(20, ex::i8_(1)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm2 = boot(b);
+    vm2.tick_at(0, &no_input());
+    assert_eq!(vm2.store().read(v2, &[]).unwrap(), Value::Int(3));
+}
+
+/// `_WINDOW_INIT_POS` 由宿主注入(`yscfg.dat` 第 10 项;DIV-RT-047)。
+#[test]
+fn window_init_pos_is_host_injected() {
+    let mut b = ProjectBuilder::new();
+    let v = with_int_var(&mut b, 0, 0);
+    let pos_id = b
+        .sysvars
+        .iter()
+        .position(|(n, _, _)| *n == "_WINDOW_INIT_POS")
+        .expect("_WINDOW_INIT_POS") as u16;
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, v.id))
+            .window(1, ex::get(0x40, pos_id)),
+        GroupSpec::new(OP_END),
+    ]];
+    let src = b.build();
+    let mut vm = Vm::boot(
+        Box::new(src),
+        BootConfig {
+            window_init_pos: 1,
+            ..BootConfig::default()
+        },
+    )
+    .expect("boot");
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(vm.store().read(v, &[]).unwrap(), Value::Int(1));
+}
+
+// ---------------------------------------------------------------- P1/P2 域与 no-op
+
+/// `CLIPACT`/`CLIPINFO` 内核镜像:写后读回;`<0x20` 字节按官方过滤。
+#[test]
+fn clipact_and_clipinfo_round_trip_with_control_filtering() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 3,
+        dims: vec![],
+        init: Init::Str(b""),
+    }];
+    for (name, params) in b.commands.iter_mut() {
+        if *name == "CLIPACT" {
+            *params = vec![("TEXT", 0, 3), ("SET", 1, 0)];
+        }
+        if *name == "CLIPINFO" {
+            *params = vec![("TEXT", 0, 3), ("LET", 0, 0)];
+        }
+    }
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let op_clipact = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "CLIPACT")
+        .unwrap() as u8;
+    let op_clipinfo = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "CLIPINFO")
+        .unwrap() as u8;
+    b.scripts = vec![vec![
+        // CLIPACT[TEXT=1 SET="A\x01B"]:0x01 在读取时被官方过滤
+        GroupSpec::new(op_clipact)
+            .window(0, ex::i8_(1))
+            .window(1, ex::s("A\x01B")),
+        // CLIPINFO[TEXT=1 LET=$s]
+        GroupSpec::new(op_clipinfo)
+            .window(0, ex::i8_(1))
+            .window(1, ex::r#ref(0x24, sys)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(vm.clipboard(), b"A\x01B", "内核镜像保存原始字节");
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::Dollar, sys), &[])
+            .unwrap(),
+        Value::Str(b"AB".to_vec()),
+        "CLIPINFO 丢弃 < 0x20 的字节(REA 0x43e4d2)"
+    );
+    // 事件带脚本坐标(P4)。
+    let clip = vm
+        .events()
+        .iter()
+        .find(|e| matches!(e, yu_rt::VmEvent::DomainCall { name, .. } if name == "CLIPACT"))
+        .expect("CLIPACT event");
+    if let yu_rt::VmEvent::DomainCall { script, pc, .. } = clip {
+        assert_eq!(*script, Some(0));
+        assert_eq!(*pc, Some(0));
+    }
+}
+
+/// `ERROR[COM_CG=0]` 写逐命令启用表(默认全 1;消费者未定位,DIV-RT-046)。
+#[test]
+fn error_sets_the_per_command_enable_table() {
+    let mut b = ProjectBuilder::new();
+    for (name, params) in b.commands.iter_mut() {
+        if *name == "ERROR" {
+            *params = vec![("NO", 0, 3), ("SET", 0, 3), ("COM_CG", 0, 3)];
+        }
+    }
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let op_error = b.commands.iter().position(|(n, _)| *n == "ERROR").unwrap() as u8;
+    b.scripts = vec![vec![
+        GroupSpec::new(op_error).window(2, ex::i8_(0)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(vm.command_enable()[1], 0, "COM_CG → opcode 1");
+    assert_eq!(vm.command_enable()[0], 1, "未触碰的命令保持 1");
+    assert_eq!(vm.command_enable()[14], 1);
+}
+
+/// `TRAY` 归宿主域(托盘图标):只发事件,不改 VM 状态。
+#[test]
+fn tray_is_a_domain_event() {
+    let mut b = ProjectBuilder::new();
+    for (name, params) in b.commands.iter_mut() {
+        if *name == "TRAY" {
+            *params = vec![("E", 0, 3), ("NAME", 1, 0), ("ID", 1, 0), ("MENUID", 1, 0)];
+        }
+    }
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let op_tray = b.commands.iter().position(|(n, _)| *n == "TRAY").unwrap() as u8;
+    b.scripts = vec![vec![
+        GroupSpec::new(op_tray)
+            .window(0, ex::i8_(1))
+            .window(1, ex::s("app")),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert!(vm.events().iter().any(|e| matches!(
+        e,
+        yu_rt::VmEvent::DomainCall { domain: yu_rt::event::Domain::System, name, .. } if name == "TRAY"
+    )));
+    assert_eq!(
+        vm.unimplemented_cmds().get("TRAY").copied(),
+        Some(1),
+        "未安装系统域宿主 ⇒ 事件已发但挂号"
+    );
+}
+
+/// `@_WINDOW_EXEC_CAPTION`:宿主 setter 置 1,脚本读 1 后写回 0(DIV-RT-007)。
+#[test]
+fn window_exec_caption_is_a_host_setter_round_trip() {
+    let mut b = ProjectBuilder::new();
+    let v = with_int_var(&mut b, 0, -1);
+    let v2 = with_int_var(&mut b, 1, -1);
+    let cap_id = b
+        .sysvars
+        .iter()
+        .position(|(n, _, _)| *n == "_WINDOW_EXEC_CAPTION")
+        .expect("_WINDOW_EXEC_CAPTION") as u16;
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        // LET[@v = @_WINDOW_EXEC_CAPTION]
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, v.id))
+            .window(1, ex::get(0x40, cap_id)),
+        // LET[@_WINDOW_EXEC_CAPTION = 0](脚本写回 0)
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, cap_id))
+            .window(1, ex::i8_(0)),
+        // LET[@v2 = @_WINDOW_EXEC_CAPTION](再读应为 0)
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, v2.id))
+            .window(1, ex::get(0x40, cap_id)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    vm.request_window_caption();
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        vm.store().read(v, &[]).unwrap(),
+        Value::Int(1),
+        "宿主 setter 置 1"
+    );
+    assert_eq!(
+        vm.store().read(v2, &[]).unwrap(),
+        Value::Int(0),
+        "脚本写回 0"
+    );
 }

@@ -127,7 +127,9 @@ fn main() {
     // ④ 工程设置:分辨率/标题(数据自证)。
     if let Ok(bytes) = src.open(&key(b"ysbin/yscfg.ybn")) {
         if let Ok(cfg) = yu_format::yscf::Yscf::parse(&bytes, b"ysbin/yscfg.ybn") {
-            let title = TextCodec::Cp932.decode(&cfg.title, b"yscfg").unwrap_or_default();
+            let title = TextCodec::Cp932
+                .decode(&cfg.title, b"yscfg")
+                .unwrap_or_default();
             println!(
                 "  ysbin/yscfg.ybn        画面 {}x{},标题 {:?}",
                 cfg.width, cfg.height, title
@@ -140,12 +142,15 @@ fn main() {
     let ycd = key(b"system/YSCom/YSCom.ycd");
     println!(
         "  system/YSCom/YSCom.ycd {}",
-        if src.exists(&ycd) { "存在" } else { "缺失(系统变量走内嵌 ABI 兜底,已用 ysv 校验)" }
+        if src.exists(&ycd) {
+            "存在"
+        } else {
+            "缺失(系统变量走内嵌 ABI 兜底,已用 ysv 校验)"
+        }
     );
 
     // ⑥ 判别:七表交叉一致的版本即引擎版本。
-    let distinct: std::collections::BTreeSet<u32> =
-        versions.iter().map(|(_, v)| *v).collect();
+    let distinct: std::collections::BTreeSet<u32> = versions.iter().map(|(_, v)| *v).collect();
     if distinct.len() == 1 {
         println!(
             "判别:七表版本交叉一致 = {},即 YU-RIS 引擎 0.{}(数据自证,与 exe 名无关)",

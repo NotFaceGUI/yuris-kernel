@@ -24,12 +24,7 @@ pub fn info(code: &'static str, boundary: Boundary, detail: impl Into<String>) -
 }
 
 /// 脚本位置的诊断构造。
-pub fn at_script(
-    mut diag: Diag,
-    file: impl Into<String>,
-    pc: u32,
-    cmd: Option<String>,
-) -> Diag {
+pub fn at_script(mut diag: Diag, file: impl Into<String>, pc: u32, cmd: Option<String>) -> Diag {
     diag.where_ = Loc::script(file, None, pc, cmd);
     diag
 }

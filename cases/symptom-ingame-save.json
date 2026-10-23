@@ -1,0 +1,26 @@
+{
+  "entry": "SYSTEM_START",
+  "expect": {
+    "display_json_sha256": "4ad4994ed2618bf34feb39e9f758d7df46519db821584e5577bb0d5439df1b1c",
+    "ops_total": 196,
+    "png_sha256": "396e23c64752645007346eb35930ab78a5e134074a75b92d5ece79f84bb5d23c",
+    "skipped_ops_total": 1
+  },
+  "frames": 560,
+  "inputs": [
+    {
+      "button": "MOUSE_L",
+      "frame": 300,
+      "x": 217,
+      "y": 281
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 440,
+      "x": 45,
+      "y": 585
+    }
+  ],
+  "name": "symptom-ingame-save",
+  "note": "P1 症状回归:标题 スタート → 本篇菜单栏 セーブ(45,585)。点击后 ops 158→196(新增 CGS100/SLTEMP rectpaint2 + 8 个按钮拷贝),但像素与点击前完全相同 ⇒ 存档界面合成结果不可见(docs/symptom-ledger.md S4)。底层修复后需 --update。"
+}

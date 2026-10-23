@@ -30,7 +30,7 @@
 | DIV-GFX-009 | 颜色空间 | open | `gamma_encoded_srgb8` | 官方截图逐像素对拍 |
 | DIV-GFX-010 | 帧清屏 | open | `default_black` | 引擎帧入口/设备初始化观测 |
 | DIV-GFX-011 | `LINT/LINT2/TSX/TSY/MIPMAP/TEX/DXBUF/...` | unimplemented | 原样进 `extra` | 手册/引擎逐项分类 |
-| DIV-GFX-012 | 文本字形栅格化/排版 | unimplemented | 只输出 `TextRun`/`TextStyle` | 字体会话(`yu-font`) |
+| DIV-GFX-012 | 文本字形栅格化/排版 | **fixed(P2)** | 两条路径都执行:①`CGACT[TEXT]`→`TextDraw`→图层基图合成(ERIS 正文);②`TEXT[ID]` 自动层→`_TEXT_FLAG` 逐字 `'1'/'2'` 排版(`layout_text`)→屏幕/图层覆盖。字形用 `yu-font`;soft/wgpu 同帧逐像素一致 | 行距/基线/GDI 栅格差异见 DIV-GFX-056、DIV-FONT-002 |
 | DIV-GFX-013 | `CGACT` 图像加工像素 | partial | RECTPAINT/2/3(EVID-J-02..05)+ REVERSE/HORIZONTAL(EVID-T-13)已实现;SIZE/ROTATION/MONO/BLUR/... 仍 Unimplemented | 逐动作定位像素算法 + 官微场景对拍 |
 | DIV-GFX-016 | `CG` 无 `FILE` 的 get-or-create | open | 建无纹理层(不绘制) | 重新锚定 CG 处理体 |
 | DIV-GFX-017 | COPY 属性复制范围 | fixed | REA 块明确 A/E/MODE/T/TA/X/Y/尺寸/TID/MID/滤镜,未见 Z;当前保持复制 Z(Likely),调用点未定位前不改 | 重新锚定 Z 字段/调用点 |
@@ -53,14 +53,14 @@
 | DIV-GFX-030 | `CG[TIDNO]` | open | 忽略并留档 | 确认是否 `TID + "." + N` |
 | DIV-GFX-031 | `CGACT ID3/ID4` 多图层、`Z2/BNO` 修饰 | unimplemented | ID3/ID4 诊断;Z2/BNO 留存 | 引擎多图层运算/修饰语义 |
 | DIV-GFX-032 | `SWAP/SWAP2` 与引擎模式 1/2 对应 | open | 当前按手册实现 | `FUN_0042f57d` 调用点确认 |
-| DIV-GFX-033 | `TEXT` 显示节奏/OUTPUTMODE/按钮 | unimplemented | VM 只记录命令事实 | 文本窗口 host ABI |
-| DIV-GFX-034 | 文本跨帧持久 + CLEAR 传播到 gfx | unimplemented | gfx 每帧清空 text | 文本窗口状态机/事件 |
-| DIV-GFX-035 | `FONT NO/BNO` 解析、GRADATION/ROTATION/PITCH/LANG、默认字体 | unimplemented | 保存原值 | `yu-font` + 引擎默认值取证 |
-| DIV-GFX-036 | FONTINFO 字体列表字段/未设置默认值 | unimplemented | 不写 LET | 字体列表 provider |
+| DIV-GFX-033 | `TEXT` 显示节奏/OUTPUTMODE/按钮 | partial(P2) | VM 记录命令事实与 `_TEXT_FLAG`(M-2);gfx 已有 `set_text_reveal` + 后端截断入口;VM reveal 查询待 H-P2-02(WAIT/CLICK 计时未取证,不用墙钟猜) | H-P2-02 |
+| DIV-GFX-034 | 文本跨帧持久 + CLEAR 传播到 gfx | **fixed(P2)** | `GfxState` 持跨帧文本缓冲;`FrameStart` 不再清空;CLEAR = 宿主同步空 `TextSnapshot`(VM `TEXT[CLEAR]` 无事件)或 `clear_text()`;`CGEND`/`CG(FILE)` 重建清目标层 | `tests/text_pipeline.rs` |
+| DIV-GFX-035 | `FONT NO/BNO` 解析、GRADATION/ROTATION/PITCH/LANG、默认字体 | partial(P2) | `GRADATION/ROTATION/COLOR/COLOR2/SX/SY/BOLD/AA/DRAWMODE` 全量保存 + clamp;默认值按 `FUN_00464fac`;字体身份经 `TextStyle::font_request()` 交 `yu-font`(`NAME`>`NO`>`BNO`→默认回退表);BNO/PITCH/LANG 只留值 | DIV-FONT-007;H-P2-03 |
+| DIV-GFX-036 | FONTINFO 字体列表字段/未设置默认值 | partial(P2) | `COLOR/COLOR2/SX/SY/BOLD/AA/DRAWMODE/GRADATION/ROTATION` 经 `GfxHost` 写回 LET;`NAME`(未设置)/`NO` 列表/`NUM/PITCH/LANG` 仍 Unimplemented(需要系统字体列表) | `tests/info_query.rs` |
 | DIV-GFX-037 | WINDOW host 属性/主窗口 A 透明度/SX-SY 视口 | open | gfx 只消费 CGID/E/A 显隐 | 窗口 host + 0.495 A 语义 |
 | DIV-GFX-038 | INFO 缺失目标非 EXIST / 未分类字段 | unimplemented | 不写 LET | 引擎缺失返回语义 |
 | DIV-GFX-039 | `CGACT RASTER1/FSX/FSY/FX2/FY2/Z2` | unimplemented | RASTER1 已识别;其余留存 | 参数语义取证 |
-| DIV-GFX-040 | `TEXTINFO` 只读文本状态 | unimplemented | VM 归 Unknown;ERIS 未使用 | 文本状态机/`text/textinfo.html` |
+| DIV-GFX-040 | `TEXTINFO` 只读文本状态 | **fixed(M-2,P2 复核)** | `yu-rt` `op_textinfo` 按参数存在性回答 OUTPUTMODE/CX/CY/CLICK/AUTO*(手册 + REA `0x4538cc`);gfx 文本模型已消费同源 `_TEXT_FLAG` | `fixture::textinfo_*` |
 | DIV-GFX-041 | 主组/子组 RT alpha | partial | 主组直绘已实现(DIV-GFX-008 fixed);子组 RT alpha 不参与合成仍按 RGBA8 直通,生产格式/写掩码未定位 | 生产路径 RT 格式/写掩码取证 |
 | DIV-GFX-042 | 半像素/quad 相位 | open | 矩形内部逐通道一致;1px 顶/边与官方不同 | D3D9 half-pixel 偏移逐行取证 |
 | DIV-GFX-014 | 同 Z 顺序 | decision | 创建序 `(z,seq,id)` | 手册称不確定;保持确定性 |
@@ -74,6 +74,9 @@
 | DIV-GFX-052 | `REVERSE`/`HORIZONTAL` 与同层先加工的组合 | **fixed(AU1)** | wgpu 补上与 soft 逐字对齐的分支(源已加工则基于当前像素算一次;否则按 `(源身份, 操作)` 跨帧缓存)。跨后端用例 `reverse_after_rectpaint_matches_soft` 逐像素一致 | — |
 | DIV-GFX-053 | 复制源层同帧被 `CGEND` 删除 | **fixed(AU1)** | `CopyOp.source_texture` 在**命令时刻**固定源基础纹理(官方 COPY 在命令处理器立即执行,EVID-T-15);`frame()` 不再因源节点消失丢弃复制。ERIS 按钮快照 68 条 `COPY2` 恢复(首屏 texture pass 12 → 80) | — |
 | DIV-GFX-054 | COPY 区域缺省坐标 = 整幅,不是 0 | **fixed(AU1)** | `CopyRegion::Partial` 四个坐标改为 `Option`;`resolve()` 缺省取 `0/0/宽-1/高-1`。证据:ERIS `CGACT[... COPY2=1 X=0 X2=@sx-1]`(无 `Y/Y2`)是整高切片 | — |
+| DIV-GFX-055 | `CGACT[TEXT]` 图层合成模型 / `SET` | **fixed(P2,Likely)** | 每帧绘制项合成到图层基图副本;`SET 0→1`、`1..=10→9`、`>=11→3` 次合成(REA `FUN_004056b8`);ERIS 正文路径 | `docs/divergences/DIV-GFX-055-cgact-text-layer-compose.md` |
+| DIV-GFX-056 | 自动文本换行/行高/基线 | open(Likely) | 换行只在本行有字符时推进;行高=`SY`;基线=单元顶+ascent | 官方文本截图(H-P2-03) |
+| DIV-GFX-057 | 无文本图层时的屏幕叠加 | open(Likely) | 目标层缺失 ⇒ 屏幕覆盖层 + 强制合成 | 官方最小脚本(H-P2-03) |
 
 ## 代码标记
 

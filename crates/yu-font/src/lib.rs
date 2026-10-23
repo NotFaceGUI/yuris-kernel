@@ -49,6 +49,7 @@ pub mod cache;
 pub mod code;
 pub mod color;
 pub mod config;
+pub mod cp932;
 pub mod image;
 pub mod layout;
 pub mod raster;

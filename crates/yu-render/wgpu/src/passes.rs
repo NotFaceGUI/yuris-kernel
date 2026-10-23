@@ -19,12 +19,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use yu_backend_soft::{
-    apply_horizontal, apply_rect_paint, apply_reverse, AssetIssue, RenderReport, SkippedOp,
-    Texture, TextureStore,
+    apply_horizontal, apply_rect_paint, apply_reverse, layer_base, AssetIssue, RenderReport,
+    SkippedOp, TextComposer, TextPaintStats, Texture, TextureStore,
 };
 use yu_gfx::{
     fixed_pipeline_alpha, shader_alpha, BlendMode, Clear, CompositorFrame, CopyId, CopyOp,
-    CopySource, ImageAction, ImageOp, Layer, LayerId, Op, OpStatus, PassTarget,
+    CopySource, ImageAction, ImageOp, Layer, LayerId, Op, OpStatus, PassTarget, TextDraw,
     TextureRef,
 };
 use yu_log::Diag;
@@ -47,11 +47,17 @@ pub(crate) enum PlannedTarget {
 pub(crate) enum DrawKind {
     Quad,
     /// 固定管线双纹理过渡:`transition_bind_groups[bind_index]`。
-    Transition { bind_index: u32 },
+    Transition {
+        bind_index: u32,
+    },
     /// 引擎 psC(mask R)过渡;`_DXMODE≠0`。
-    TransitionPsc { bind_index: u32 },
+    TransitionPsc {
+        bind_index: u32,
+    },
     /// 引擎 psD(交叉淡化)过渡;`_DXMODE≠0` 且 TA<1。
-    TransitionPsd { bind_index: u32 },
+    TransitionPsd {
+        bind_index: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +133,7 @@ pub(crate) fn plan(
     image_cache: &mut BTreeMap<yu_backend_soft::ImageCacheKey, Override>,
     backbuffer: Option<&yu_backend_soft::Surface>,
     backbuffer_gpu: &mut Option<(u64, u64)>,
+    text: &mut TextComposer,
 ) -> Result<(FramePlan, RenderReport), Diag> {
     targets.prune_snapshots(&live_snapshots(frame));
     // 覆盖纹理缓存只保留本帧仍存在的层,防止临时层累积。
@@ -177,6 +184,53 @@ pub(crate) fn plan(
                     };
                     acc.skip(op, reason);
                 }
+            }
+        }
+    }
+
+    // 1.5 文本:图层基图(或已加工的覆盖纹理)副本上合成,再按图层
+    //     `A/MODE/尺寸` 走常规 quad。与 soft 同一 `TextComposer`(字节/字体
+    //     /栅格一致 ⇒ 同帧像素一致)。
+    {
+        let mut text_ids: BTreeSet<LayerId> =
+            frame.text_draws.iter().map(|d| d.target.clone()).collect();
+        if let Some(layout) = &frame.text_layout {
+            if let Some(target) = &layout.target {
+                text_ids.insert(target.clone());
+            }
+        }
+        for id in text_ids {
+            let Some(layer) = frame.layers.iter().find(|l| l.id == id) else {
+                note_text_diag(&mut acc, format!("text.layer_missing: {}", id.display()));
+                continue;
+            };
+            if !layer.visible {
+                continue;
+            }
+            let draws: Vec<TextDraw> = frame
+                .text_draws
+                .iter()
+                .filter(|d| d.target == id)
+                .cloned()
+                .collect();
+            let layout = frame
+                .text_layout
+                .as_ref()
+                .filter(|l| l.target.as_ref() == Some(&id));
+            let base: Rc<Texture> = match overrides.get(&id) {
+                Some(hit) => hit.tex.clone(),
+                None => match layer_base(textures, layer) {
+                    Ok(base) => Rc::new(base),
+                    Err(reason) => {
+                        note_text_diag(&mut acc, format!("text.layer_base: {reason}"));
+                        continue;
+                    }
+                },
+            };
+            let (composed, stats) = text.compose_layer(&base, &draws, layout);
+            merge_text_stats(&mut acc, stats);
+            if let Some(composed) = composed {
+                overrides.insert(id, Override::new(Rc::new(composed)));
             }
         }
     }
@@ -394,6 +448,55 @@ pub(crate) fn plan(
         });
     }
 
+    // 5. 屏幕级自动文本(`target=None`):全视口透明覆盖 + 一次合成 quad。
+    //
+    // 没有文本图层承载基图 ⇒ 必须合成(不能 Replace 清屏);与 soft 的
+    // `paint_layout_with(.., Some(true))` 同规则。
+    if let Some(layout) = frame.text_layout.as_ref().filter(|l| l.target.is_none()) {
+        if let Some(screen) = passes
+            .iter_mut()
+            .rev()
+            .find(|p| matches!(p.target, Some(PlannedTarget::Screen)))
+        {
+            let (width, height) = (frame.viewport.width, frame.viewport.height);
+            let mut overlay = Texture {
+                width,
+                height,
+                rgba: vec![0; (width as usize) * (height as usize) * 4],
+            };
+            let stats =
+                text.paint_layout_with(&mut overlay.rgba, width, height, layout, Some(true));
+            let painted = stats.glyphs;
+            merge_text_stats(&mut acc, stats);
+            if painted > 0 {
+                let id = gpu.upload(ctx, width, height, &overlay.rgba, "text screen overlay")?;
+                pipelines.ensure_pipeline(ctx, BlendMode::Normal)?;
+                let view = gpu
+                    .get(id)
+                    .ok_or_else(|| {
+                        Diag::fatal(code::TARGET, yu_log::Boundary::Platform)
+                            .with_detail("文本覆盖纹理上传后缺失")
+                    })?
+                    .view
+                    .clone();
+                pipelines.ensure_bind_group(ctx, id, &view, FilterKind::Point)?;
+                // 屏幕 pass 是最后规划的 pass:顶点必须位于缓冲末尾才能整段追加。
+                let expected = screen.first_vertex as usize + screen.draws.len() * 6;
+                if expected == vertices.len() {
+                    push_quad(&mut vertices, width, height, 0, 0, width, height, 1.0);
+                    screen.draws.push(Draw {
+                        blend: BlendMode::Normal,
+                        texture_id: id,
+                        filter: FilterKind::Point,
+                        kind: DrawKind::Quad,
+                    });
+                } else {
+                    note_text_diag(&mut acc, "text.screen_overlay_not_last_pass".to_string());
+                }
+            }
+        }
+    }
+
     let missing_assets = textures.issues();
     Ok((
         FramePlan {
@@ -424,12 +527,14 @@ fn live_snapshots(frame: &CompositorFrame) -> BTreeSet<CopyId> {
 }
 
 fn snapshot_of(frame: &CompositorFrame, id: &LayerId) -> Option<CopyId> {
-    frame.layers.iter().find(|layer| &layer.id == id).and_then(|layer| {
-        match &layer.texture {
+    frame
+        .layers
+        .iter()
+        .find(|layer| &layer.id == id)
+        .and_then(|layer| match &layer.texture {
             TextureRef::Snapshot(copy) => Some(*copy),
             _ => None,
-        }
-    })
+        })
 }
 
 /// 帧内图像加工结果 + **一次性**内容指纹。
@@ -491,7 +596,8 @@ impl Planner<'_> {
             self.acc.ops_total += 1;
         }
         match op {
-            Op::Layer(layer) => self.plan_layer(op, layer, out),            Op::Group(group) => {
+            Op::Layer(layer) => self.plan_layer(op, layer, out),
+            Op::Group(group) => {
                 if !group.layer.visible {
                     self.skip(op, "invisible");
                     return Ok(());
@@ -549,7 +655,6 @@ impl Planner<'_> {
             }
         }
     }
-
 
     /// 双纹理过渡:本层纹理 + 配对 mask 的独立 pipeline。
     fn plan_transition(
@@ -650,12 +755,10 @@ impl Planner<'_> {
             },
         );
         let from_texture = view_by_id(self.gpu, self.targets, from.0).ok_or_else(|| {
-            Diag::fatal(code::TARGET, yu_log::Boundary::Platform)
-                .with_detail("过渡源纹理缺失")
+            Diag::fatal(code::TARGET, yu_log::Boundary::Platform).with_detail("过渡源纹理缺失")
         })?;
         let mask_texture = view_by_id(self.gpu, self.targets, mask.0).ok_or_else(|| {
-            Diag::fatal(code::TARGET, yu_log::Boundary::Platform)
-                .with_detail("过渡 mask 纹理缺失")
+            Diag::fatal(code::TARGET, yu_log::Boundary::Platform).with_detail("过渡 mask 纹理缺失")
         })?;
         let group = self.pipelines.create_transition_bind_group(
             self.ctx,
@@ -933,7 +1036,10 @@ impl Planner<'_> {
         let y0 = y0.max(0) as u32;
         let run = (x1 - i64::from(x0) + 1).max(0) as u32;
         let rows = (y1 - i64::from(y0) + 1).max(0) as u32;
-        let extent = (run.min(source.1.saturating_sub(x0)), rows.min(source.2.saturating_sub(y0)));
+        let extent = (
+            run.min(source.1.saturating_sub(x0)),
+            rows.min(source.2.saturating_sub(y0)),
+        );
         let extent = (extent.0.min(width), extent.1.min(height));
         if extent.0 == 0 || extent.1 == 0 {
             return Ok(());
@@ -979,10 +1085,9 @@ impl Planner<'_> {
                     1.0,
                 ],
             ),
-            ImageAction::RectPaint2 => (
-                true,
-                [0.0, 0.0, 0.0, f32::from((set & 0xFF) as u8) / 255.0],
-            ),
+            ImageAction::RectPaint2 => {
+                (true, [0.0, 0.0, 0.0, f32::from((set & 0xFF) as u8) / 255.0])
+            }
             ImageAction::RectPaint3 => (
                 false,
                 [
@@ -1109,7 +1214,13 @@ impl Planner<'_> {
             }
             let gpu_id = self
                 .gpu
-                .upload(self.ctx, texture.width, texture.height, &texture.rgba, "copy source")
+                .upload(
+                    self.ctx,
+                    texture.width,
+                    texture.height,
+                    &texture.rgba,
+                    "copy source",
+                )
                 .map_err(|diag| diag.code.to_string())?;
             self.uploaded_overrides
                 .insert(id.clone(), (gpu_id, texture.width, texture.height, hash));
@@ -1337,13 +1448,9 @@ fn apply_image_to_override(
                 .iter()
                 .find(|layer| layer.id == image.source)
                 .and_then(|layer| match &layer.texture {
-                    TextureRef::Asset(key) => {
-                        Some(yu_backend_soft::SizeSource::Asset(key.clone()))
-                    }
+                    TextureRef::Asset(key) => Some(yu_backend_soft::SizeSource::Asset(key.clone())),
                     TextureRef::SolidBlack1x1 => Some(yu_backend_soft::SizeSource::Solid),
-                    TextureRef::Snapshot(id) => {
-                        Some(yu_backend_soft::SizeSource::Snapshot(id.0))
-                    }
+                    TextureRef::Snapshot(id) => Some(yu_backend_soft::SizeSource::Snapshot(id.0)),
                     _ => None,
                 })
         };
@@ -1418,13 +1525,9 @@ fn apply_image_to_override(
                 yu_backend_soft::ImageOpSig::Horizontal
             };
             let source_id = match &layer.texture {
-                TextureRef::Asset(key) => {
-                    Some(yu_backend_soft::ImageSource::Asset(key.clone()))
-                }
+                TextureRef::Asset(key) => Some(yu_backend_soft::ImageSource::Asset(key.clone())),
                 TextureRef::SolidBlack1x1 => Some(yu_backend_soft::ImageSource::Solid),
-                TextureRef::Snapshot(id) => {
-                    Some(yu_backend_soft::ImageSource::Snapshot(id.0))
-                }
+                TextureRef::Snapshot(id) => Some(yu_backend_soft::ImageSource::Snapshot(id.0)),
                 _ => None,
             };
             let key = source_id.map(|source| yu_backend_soft::ImageCacheKey {
@@ -1525,9 +1628,7 @@ fn resolve_cpu_source(
                         CopySource::Layer(src) => {
                             resolve_cpu_source(frame, textures, overrides, src, depth + 1)?
                         }
-                        CopySource::Group(_) => {
-                            return Err("gfx.imageop.source.group".to_string())
-                        }
+                        CopySource::Group(_) => return Err("gfx.imageop.source.group".to_string()),
                     };
                     let (x0, y0, x1, y1) = copy.region.resolve(source.width, source.height);
                     let cw = (x1 - x0 + 1).max(1) as u32;
@@ -1661,6 +1762,22 @@ fn hash_rgba(width: u32, height: u32, rgba: &[u8]) -> u64 {
     hash
 }
 
+fn note_text_diag(acc: &mut Accum, why: String) {
+    if !acc.text_diags.contains(&why) {
+        acc.text_diags.push(why);
+        acc.text_diags.sort();
+    }
+}
+
+fn merge_text_stats(acc: &mut Accum, stats: TextPaintStats) {
+    acc.text_draws += stats.draws;
+    acc.text_glyphs += stats.glyphs;
+    acc.text_missing += stats.missing;
+    for why in stats.diags {
+        note_text_diag(acc, why);
+    }
+}
+
 fn group_surface_size(frame: &CompositorFrame, id: &LayerId) -> (u32, u32) {
     frame
         .layers
@@ -1726,11 +1843,7 @@ fn op_target(op: &Op) -> String {
         Op::Transition(transition) => transition.layer.id.display(),
         Op::Mask(mask) => mask.layer.id.display(),
         Op::Copy(copy) => copy.dest.display(),
-        Op::Image(image) => image
-            .target
-            .as_ref()
-            .unwrap_or(&image.source)
-            .display(),
+        Op::Image(image) => image.target.as_ref().unwrap_or(&image.source).display(),
     }
 }
 
@@ -1747,6 +1860,10 @@ struct Accum {
     skipped_ops_total: u32,
     skipped: BTreeMap<(&'static str, String, String), u32>,
     skipped_text: usize,
+    text_draws: usize,
+    text_glyphs: usize,
+    text_missing: usize,
+    text_diags: Vec<String>,
     filter_mag: &'static str,
     filter_min: &'static str,
     filter_mip: &'static str,
@@ -1768,7 +1885,11 @@ impl Accum {
             ops_drawn: 0,
             skipped_ops_total: 0,
             skipped: BTreeMap::new(),
-            skipped_text: frame.text.len(),
+            skipped_text: frame.text.iter().filter(|t| t.flags.is_none()).count(),
+            text_draws: 0,
+            text_glyphs: 0,
+            text_missing: 0,
+            text_diags: Vec::new(),
             filter_mag: frame.filter.mag.as_str(),
             filter_min: frame.filter.min.as_str(),
             filter_mip: frame.filter.mip.as_str(),
@@ -1812,6 +1933,10 @@ impl Accum {
                 .collect(),
             missing_assets,
             skipped_text: self.skipped_text,
+            text_draws: self.text_draws,
+            text_glyphs: self.text_glyphs,
+            text_missing: self.text_missing,
+            text_diags: self.text_diags,
             filter_mag: self.filter_mag,
             filter_min: self.filter_min,
             filter_mip: self.filter_mip,
@@ -1820,4 +1945,3 @@ impl Accum {
         }
     }
 }
-

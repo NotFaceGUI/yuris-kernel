@@ -1,0 +1,15 @@
+{
+  "actions": [
+    {
+      "action": "close",
+      "frame": 400
+    },
+    {
+      "action": "close",
+      "frame": 430
+    }
+  ],
+  "frames": 480,
+  "name": "symptom-5-close-twice",
+  "note": "P1 S5:窗口关闭两次。第一次 → @_WINDOW_EXEC_CLOSE=1(脚本弹 DIALOG,无宿主呈现 ⇒ 画面变暗停住);第二次 → 宿主强制退出。"
+}

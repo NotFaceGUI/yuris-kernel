@@ -40,13 +40,16 @@ pub struct VarSpec {
     pub init: Init,
 }
 
+/// 一个窗口声明:`(kind, flag, slot, length, payload)`。
+pub type WindowSpec = (u8, u8, u16, Option<u32>, Vec<u8>);
+
 /// 合成一条命令组 + 其窗口。
 #[derive(Clone, Debug)]
 pub struct GroupSpec {
     pub opcode: u8,
     /// `(kind, flag, slot, length, payload)`。`length` 由 payload 长度自动算,
     /// 但**跳转窗口**要用 `jump_len` 显式给组号。
-    pub windows: Vec<(u8, u8, u16, Option<u32>, Vec<u8>)>,
+    pub windows: Vec<WindowSpec>,
 }
 
 impl GroupSpec {
@@ -256,7 +259,8 @@ impl ProjectBuilder {
                 .unwrap();
         }
         if !omit("ysl") {
-            src.insert(b"ysbin/ysl.ybn", build_yslb(&self.labels)).unwrap();
+            src.insert(b"ysbin/ysl.ybn", build_yslb(&self.labels))
+                .unwrap();
         }
         if !omit("ysv") {
             src.insert(b"ysbin/ysv.ybn", build_ysvr(&self.all_vars()))
@@ -307,7 +311,61 @@ pub fn default_commands() -> Vec<CommandSpec> {
         ("CSV", vec![]),
         ("CSVINFO", vec![]),
         ("DEBUGLIST", vec![]),
-        ("DIALOG", vec![("CAPTION", 1, 0), ("STR", 1, 0)]),
+        (
+            "DIALOG",
+            vec![
+                ("CAPTION", 1, 0),
+                ("STR", 1, 0),
+                ("STR2", 1, 0),
+                ("STR3", 1, 0),
+                ("STR4", 1, 0),
+                ("STR5", 1, 0),
+                ("STR6", 1, 0),
+                ("STR7", 1, 0),
+                ("STR8", 1, 0),
+                ("DEFSTR", 1, 0),
+                ("LETSTR", 0, 0),
+                ("LET", 0, 0),
+                ("OK", 0, 0),
+                ("OKCANCEL", 0, 0),
+                ("YESNO", 0, 0),
+                ("YESNOCANCEL", 0, 0),
+                ("INPUT", 0, 0),
+                ("INPUTLIMIT", 0, 0),
+                ("DEFBUTTON", 0, 0),
+                ("ICON", 0, 0),
+                ("FILEOPEN", 1, 0),
+                ("FILEEXT", 1, 0),
+                ("FOLDER", 1, 0),
+                ("CHECKBOX", 0, 0),
+                ("SLIDER", 0, 0),
+                ("A", 0, 0),
+                ("A2", 0, 0),
+                ("A3", 0, 0),
+                ("A4", 0, 0),
+                ("A5", 0, 0),
+                ("A6", 0, 0),
+                ("A7", 0, 0),
+                ("A8", 0, 0),
+                ("E", 0, 0),
+                ("E2", 0, 0),
+                ("E3", 0, 0),
+                ("E4", 0, 0),
+                ("E5", 0, 0),
+                ("E6", 0, 0),
+                ("E7", 0, 0),
+                ("E8", 0, 0),
+                ("CHECK", 0, 0),
+                ("CHECK2", 0, 0),
+                ("CHECK3", 0, 0),
+                ("CHECK4", 0, 0),
+                ("CHECK5", 0, 0),
+                ("CHECK6", 0, 0),
+                ("CHECK7", 0, 0),
+                ("CHECK8", 0, 0),
+                ("NOWAIT", 0, 0),
+            ],
+        ),
         ("ELSE", vec![]),
         ("EMOTE", vec![]),
         ("EMOTEINFO", vec![]),
@@ -319,7 +377,10 @@ pub fn default_commands() -> Vec<CommandSpec> {
         ("F_STR", vec![]),
         ("F_VAR", vec![]),
         ("FILEACT", vec![("FILE", 1, 0)]),
-        ("FILEINFO", vec![("FILE", 1, 0), ("EXIST", 0, 3), ("LET", 0, 0)]),
+        (
+            "FILEINFO",
+            vec![("FILE", 1, 0), ("EXIST", 0, 3), ("LET", 0, 0)],
+        ),
         ("FLASH", vec![]),
         ("FLASHEND", vec![]),
         ("FLASHINFO", vec![]),
@@ -350,7 +411,10 @@ pub fn default_commands() -> Vec<CommandSpec> {
         ("INPUT", vec![]),
         ("INT", vec![("SET", 3, 0)]),
         ("LABEL", vec![("#", 0, 0)]),
-        ("LABELINFO", vec![("#", 1, 0), ("LET", 0, 0), ("EXIST", 0, 3)]),
+        (
+            "LABELINFO",
+            vec![("#", 1, 0), ("LET", 0, 0), ("EXIST", 0, 3)],
+        ),
         ("LET", vec![]),
         ("LOAD", vec![]),
         ("LOOP", vec![("SET", 3, 0)]),
@@ -392,7 +456,10 @@ pub fn default_commands() -> Vec<CommandSpec> {
         ("SYSTEMINFO", vec![("LET", 0, 0)]),
         ("TASK", task_params()),
         ("TASKEND", vec![("ID", 1, 0)]),
-        ("TASKINFO", vec![("ID", 1, 0), ("LET", 0, 0), ("EXIST", 0, 3)]),
+        (
+            "TASKINFO",
+            vec![("ID", 1, 0), ("LET", 0, 0), ("EXIST", 0, 3)],
+        ),
         ("TEXT", text_params()),
         ("TEXTINFO", vec![]),
         ("TRAY", vec![]),

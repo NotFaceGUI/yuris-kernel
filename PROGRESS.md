@@ -2278,7 +2278,7 @@ yu-backend-wgpu 自身 0 告警(输出中的 warning 均来自依赖 yu-rt)
 $ grep -rn "println!\|eprintln!\|dbg!" crates/yu-backend-wgpu/src
 0
 
-$ grep -rn "kotoneiro\|AnimalTrail\|C:\\\\Users\|D:\\\\Art" crates/yu-backend-wgpu/src
+$ grep -rn "<game-b>\|<game-a>\|C:\\\\Users\|D:\\\\Art" crates/yu-backend-wgpu/src
 0
 
 $ cargo check -p yu-backend-wgpu --target wasm32-unknown-unknown --lib
@@ -4720,3 +4720,884 @@ case title-config-back: PASS
   场景/文本中会走 `DIALOG` 确认,未实现时表现为“第一次关闭被脚本消费但
   不退出,第二次关闭由宿主强制退出”。
 - `CGINFO[COLOR]`(显式坐标取色)、`ONMOUSE*` 对组/离屏快照的真实像素面。
+
+
+### 2026-10-23 · E1-M2 续 5(时间轴/物理/动画)
+
+- `yu-emote::anim` 改为 native 命令流时间轴(60 Hz、过渡时长、easing
+  指数、type-0 游标、loop seek、差分 DPLAY delta×ratio)。
+- `Player` 串联 timeline → clamp/eye → pose → physics;新增
+  bust/hair/parts 弹簧、clamp、确定性眨眼;`psb-render --no-*` 可诊断。
+- 修复空 `mesh.bp` 被当作“无 mesh”的底层错误(Nekopara hair 参数在
+  中点跳变);逐帧像素差 ~7.6→~0.1。
+- `pose` 支持顶层 easing 表、`cp` 贝塞尔、native 颜色 lane 插值、
+  type-7 clip、type-9 anchor。
+- `psb-anim` 整段渲染;demo 改为 30fps alpha WebM + 表情交叉淡入。
+- 许可口径改为明确参考 eluna(MPL-2.0),README/NOTICE 已更新;
+  `LICENSE-MPL-2.0` 入库。
+- 仍挂账:粒子/feedback/内外 stencil/图控制器/selector/wind/pixelate/
+  wgpu/M4。
+
+
+### 2026-10-23 · E1-M2 续 6(眼睛高光/物理锚点)
+
+- 嵌套 motion 深度 32→256:恢复 `hi_L/hi_R` 眼部高光(34→36 draw items)。
+- type-1/5 物理锚点改走 native mesh-chain 位置;hair/bust 输出恢复,
+  待机有真实二次运动。
+- `psb-anim --no-loop`;demo 增加 1.5s 挨拶一次性片段。
+- 仍挂账:粒子/feedback/内外 stencil/图控制器/selector/wind/pixelate/
+  wgpu/M4。
+
+
+## 成果 P5 · yu-trace 排障闭环(帧描述投影 / 故障快照 / 官方任务相位)
+
+**日期**: 2026-10-23 · **任务书**: `docs/tasks/task-p5-trace-triage.md` ·
+**交接件**: `docs/tasks/handoff-p5.md`(H-P5-01 panic hook 接线、H-P5-02 `case --trace`)
+
+### 1. M-A · 帧描述轨道(record/replay/diff 闭环)
+
+- 任务书写的 `record.rs:579/1121` 占位拒绝在 schema v3(成果 H)已解除;
+  v4 这里补的是**投影规则**:新增 `FrameFieldPolicy::{Full, Screen}`
+  (`crates/yu-trace/src/diff.rs`),`AlignedDiffOptions.frame_fields`。
+  - `Full`:全部字段精确比较(同 producer / 事件级);
+  - `Screen`:只比较 `frame/level/display`;`display` 非 null 时省略派生
+    `display_sha256`;`display = null` 时摘要就是唯一内容,仍比较;
+    `pass_count/op_count/executable_ops/skipped_ops` 在引擎外部不可观测,
+    屏幕级跨 producer 明确省略(不声称相等)。
+  - `display` 内部的 volatile 键由调用方录制前剔除;diff 不做自动过滤。
+- `diff_traces --frame-fields full|screen`;`SCHEMA.md` §6.3 记录字段分类。
+- 单测:`screen_frame_policy_compares_pixels_not_placeholder_counts`
+  (占位计数不同 = 0 分歧;像素不同必须报 `/payload/display/pixels_sha256`;
+  纯摘要记录必须比较 `display_sha256`)。
+
+### 2. M-B · 故障快照(ring buffer + dump_on_fault + 离线重演)
+
+新增 `crates/yu-trace/src/fault.rs`(约 1.5k 行,含测试):
+
+- **ring buffer**:`RingConfig` 默认 300 tick / 单 tick 8 MiB / 总 64 MiB;
+  每 tick 保留 {命令流摘要(增量 SHA-256 + 事件种类计数)、Diag(含
+  `unimplemented` 标记)、显式输入帧、frame_description、失败的 vfs 读取};
+  命令本体不入 ring。超预算先丢 display(退化为摘要),再截断 Diag detail;
+  单 tick 超总预算保留**占位摘要** `retained=false`;淘汰/丢弃全部有计数
+  (`evicted_ticks` / `diags_dropped` / `inputs_dropped` /
+  `displays_dropped` / `timeline_truncated` / `clock_truncated`),不静默丢帧。
+- **增量 SHA-256**:`hash::Sha256`(`update/finish`),与 `sha256_hex`
+  同一测试向量;避免为百万级事件拼大 buffer。
+- **dump**:`EventRecorder::dump_on_fault(path, FaultInfo)` 原子写两份文件:
+  - `<path>`:schema v4 trace(header + 启动链 vfs + 保留 tick 的
+    Diag/frame_description/vfs 失败记录);header 的 `input` 摘要与 `clock`
+    按故障帧重算,`producer.sample_sha256` 由宿主写入;
+  - `<path>.timeline.json`:工具级伴生文件,含故障类别/原因、每 tick 摘要、
+    原始输入时间线、clock。schema 4 没有原始输入字段,时间线不塞进记录协议。
+  - 先写伴生文件、最后 rename JSONL(提交标记);`FaultDump::read` 校验
+    `trace_sha256` + producer + header input 摘要,不符 = `trace.schema`。
+- **回放**:`FaultDump::replay(source, aux, argv, paths)` 用 header 重建
+  `VmTrace`,按 clock 序列推进到故障 tick,逐 tick 精确比较
+  `first_frame/frames/now_ms`、命令数/摘要、事件摘要/种类计数、Diag、输入;
+  任何差异 = `trace.replay`。`frame_description` 是呈现层观测,离线 VM
+  不重建画面,不参与逐 tick 比较(仍保留在 dump),不是容差。
+  mid-run 挂 ring / tick 被淘汰 / 时间线或时钟截断 ⇒ `replayable=false`,
+  replay 显式拒绝。
+- **接线**:`TracingSource` 的 vfs 记录改走 `EventRecorder::record_payload`
+  (ring 模式成功只计数、失败留记录);`VmTrace::tick_with` 自动
+  `begin_tick` / `record_timeline_entry`(含 frame 0)/ `record_tick_input` /
+  `note_tick_frames`;`VmTrace::enable_fault_ring` 必须在第一 tick 前调用。
+- **示例**:`crates/yu-cli/examples/fault_dump.rs`(真实 `data.ypf` + 合成
+  panic + `FaultDump::read` + 离线 replay)。`yu-cli` 仅新增 **dev-dependency**
+  `yu-trace`,不改变 “yu-trace 旁挂、非运行期依赖”。
+- **测试** `crates/yu-trace/tests/fault.rs`(8 个):
+  ring 捕获 Diag/输入/帧描述并 replay 零差异;`catch_unwind` 捕获后 dump+replay;篡改 tick 摘要 = `trace.replay`;
+  篡改 trace 文本 = `trace.schema`;容量淘汰计数;display 超预算退化;
+  单 tick 超总预算占位;屏幕帧投影。
+
+### 3. M-C · 官方任务相位(DIV-L-002 续)
+
+- `tools/official_trace/probe_dispatch.py` 新增 `--mode task-phase`:
+  只在 tick 入口 `0x4040f8` 下 int3,每 tick 只读遍历任务链表
+  (`0x801704` 列表对象;节点 `+0x0c/+0x30/+0x34`;
+  上下文 `+0x18/+0x1c/+0x20/+0x3c`、`+0x14 & +0x15`、`+0x09`);
+  不挂命令分派断点。布防前先非阻塞找窗口并置前台(挂断点时
+  `SetForegroundWindow` 会等 UI 线程而死锁)。输出 `task_phase.jsonl`。
+- `crates/yu-trace/examples/emit_kernel_phase.rs`:同 600 tick 的内核
+  `Scheduler::nodes()` 相位快照(script/pc/wait/deadline/enabled/text_rest)。
+- `tools/task_phase_diff.py`:按 `click` / `index` / `anchor` 对齐,
+  比较每 tick 启用任务的 `(script,pc)` 多重集合(另有 script-only),输出
+  首分歧与焦点脚本 presence 区间;不做排序/去重/容差。
+- **600 tick 采集(无点击)结果**:
+  - 官方 600 样本(tick 4..603;布防晚 4 tick),产物
+    `target/tmp/p5-phase-click5/task_phase.jsonl`;
+  - 内核 600 tick(frame 1..602),产物
+    `target/tmp/p5-kernel/kernel_phase.jsonl`;
+  - `--align anchor --anchor-script 66`:官方 tick 12 / 内核 frame 12
+    **锚点一致**;script 20 三个实例的 `(script,pc)` 在相对 0..590 逐 tick 相同;
+  - 首分歧:官方常驻 `script 0`(容器/主任务)与 `script 8`;内核 `SYSTEM`
+    主任务(script 8)在 frame 16 左右结束并从链表消失;
+  - 显式忽略 0/8 后(`--ignore-scripts 0,8 --from-relative 0`):首个
+    `(script,pc)` 分歧在相对 49——官方 `66:5168`、内核 `66:5100`(官方 66
+    在 5100/5168 间推进,内核 600 tick 一直 5100);
+  - 首个 script-only 分歧在相对 206:官方用 `139` 取代 `66`,内核仍保留 `66`;
+    script 66 存活窗口官方 0..205、内核 0..590。
+  - 这是任务生命周期/调度差异,不是 script 60 体内命令差异;`DIV-L-002`
+    保持 open,新增证据已写入 `docs/divergences/DIV-L-002-script60-call-phase.md`。
+- **点击未生效(挂账)**:本会话 `SendInput` 在窗口前台时已发送
+  (`input_sent` 有记录),但官方 `0x80157c` 有效 UI 点击标志始终 0、
+  `trigger=null`;对已知的 設定 按钮 (217,368) 同样无 trigger。
+  script 60 返回后的转场相位仍缺官方样本;下一步需真实用户点击/可激活桌面。
+- `tools/official_trace/README.md` §7 记录任务链表布局证据、用法与限制。
+
+### 4. schema v4(回放闭包,外部 API 变更的必要适配)
+
+- 并行工作中的 `yu-rt::BootConfig` 新增 `window_init_pos`
+  (`@_WINDOW_INIT_POS`)与 `rng_seed`(MT19937 种子)。两者都是宿主注入且
+  影响脚本行为,**不进 header 就无法重放**。
+- `SCHEMA_VERSION` 3 → 4;`boot.host` 增加 `window_init_pos`(i64)/
+  `rng_seed`(u32);`BootSummary::from_config/to_config` 同步;v3 文件直接拒绝。
+- `tools/official_trace/{capture_screen,probe_dispatch}.py` 改写 schema 4,
+  并在 `boot.host` 写 `window_init_pos=0` / `rng_seed=5489`
+  (官方外部不可观测,按缺省占位;与内核缺省一致)。
+- `SCHEMA.md` 更新 §2/§4.1/§6.3/§6.4/§9 与字段表。
+- `crates/yu-trace/tests/golden/synthetic_frame.jsonl` 重新生成:外部
+  `yu-format`/`yu-rt` 夹具字节变化(ysc 3434→3793、YSCom.ycd 5132→5587)
+  只改了 vfs 身份与 table hash,**事件流逐字节不变**;schema 4 的
+  `window_init_pos/rng_seed` 同时进入 header。
+- `VmEvent::DomainCall` 新增可选 `script/pc`(P4):本 crate 的穷尽 match
+  用 `..` 兼容,payload schema 不变;ring 全事件摘要同样忽略这两个可选字段。
+
+### 5. 验证(原始输出)
+
+```text
+$ cargo test -p yu-trace -- --skip fault_dump_survives_600_ticks_and_replays
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+$ YURIS_SAMPLE_ERIS_YPF=...project-eris/data.ypf \
+  cargo test -p yu-trace --test real_sample fault_dump_survives_600_ticks_and_replays
+test fault_dump_survives_600_ticks_and_replays ... ok
+test result: ok. 1 passed; 0 failed; ... finished in 236.50s
+```
+
+- 真语料 600 tick:ring 记录 → `dump_on_fault` → 读回 → 离线 replay
+  **零差异**;`report.ticks_replayed=600`。
+- `cargo clippy -p yu-trace --all-targets --no-deps -- -D warnings`:clean。
+- `cargo fmt -p yu-trace`:clean。
+- 任务相位 diff 原始输出(`target/tmp/p5-kernel/phase_diff_title_anchor_ignore08.txt`):
+  `anchor script 66: official_tick=12 kernel_frame=12`;
+  `script 20 presence official=(0,590) kernel=(0,590)`;
+  `script 66 presence official=(0,205) kernel=(0,590)`;
+  `--ignore-scripts 0,8 --from-relative 0`:
+  `first divergence: relative_tick=49 expected=[20:190,20:241,20:248,66:5168] actual=[...,66:5100]`;
+  `first script-only divergence: relative_tick=206 expected=[20,20,20,139] actual=[20,20,20,66]`。
+- 官方 600 tick 采集 manifest:`task_samples=600`, `stop=max-ticks`,
+  `trigger=null`, `effective_click=0`(点击限制见 §3)。
+
+### 6. 仍挂账 / 交接
+
+- **H-P5-01**:桌面宿主/serve 的 panic hook → `dump_on_fault` 接线(P1/P4,
+  一行式见 `docs/tasks/handoff-p5.md`);`Fatal Diag` 同样入口。
+- **H-P5-02**:`case --trace` 开关(case.rs,P4)。
+- `yu-cli/examples/fault_dump.rs` 已写;本会话快照中 `cargo check -p yu-cli
+  --example fault_dump` 被并行 `yu-backend-wgpu` 的 `RenderReport` 字段改动
+  阻塞(错误在 `yu-render/wgpu/src/passes.rs`,不在本示例);wgpu 稳定后重跑。
+- `DIV-L-002` 仍 open:任务生命周期两处新分歧(script 0/8 常驻、script 66
+  结束/替换)已取证;script 60 返回后的转场仍需可用的官方点击样本。
+- 官方 `args` 级不可观测的结论不变;任务相位是**快照**,不是 spawn/finish 事件。
+
+
+---
+
+## 成果 P3 · yu-rt 命令与系统变量取证收口(默认槽 / DIALOG / P1–P4)
+
+> 任务书 `docs/tasks/task-p3-rt-forensics.md`。零 git 写操作;只改
+> `crates/yu-rt`(src/tests/examples/data/docs)。逆向锚点 = 0.495
+> `yu-ris.exe` sha256 `4f5eefa3544c7244a907477d89ccee97286f559df5e38b1b1fa674206981138f`
+> (REA/Ghidra 12.1.4 + 本仓库 `target/tmp/disasm.py` 区间反汇编)。
+
+### 1. P0-A · 默认处理体 `0x459e90` 定案(DIV-RT-043)
+
+- **分发表**:`FUN_0045cf90` `0x45d1ae..0x45d1c0` 先用
+  `MOV [EAX+0x7ace20], 0x459e90` 填满 119 槽(`0x1dc/4`),再逐槽覆盖。
+- **默认体**原始字节(REA `read_bytes 0x459e90`):
+  `6a 01 68 d2 bb 0d 00 e8 6c be 00 00 83 c4 08 b8 ff ff ff ff c3`
+  = `push 1; push 0xdbbd2; call 0x465d08; add esp,8; mov eax,-1; ret`。
+- `0xdbbd2` 经 `0x465dec` → `0x465e30` 查 `ysbin/yse.ybn`;工程 yse 解出
+  `「[内部エラー]\n\nスクリプト実行エラーが発生しました。」`。
+  `FUN_004612b0` 用全局 `[0x5e4f84]` 抑制重复错误框。
+- 结论:**不是 no-op**:官方报一次脚本执行错误 + 返回 -1(本帧让出),
+  pc 已前进、任务不终止。
+- **no-op 槽**:`0x4634d8` = `xor eax,eax; ret`,覆盖写地址
+  `0x7ace44/0x7acef0/0x7acf4c/0x7acf58/0x7acf60/0x7acf64/0x7acf68`
+  ⇒ DEBUGLIST/LABEL/PREP/RETURNBREAK/S_FLT/S_INT/S_STR。
+- **静态 vs 运行**:F_INT/F_FLT/F_STR 静态 337/72/64,全部在
+  `global_f.yst`(Sprite/Sound/Backlog)声明段;入口标签指向声明段之后,
+  600 帧运行命中 0。扫描器不改,两口径并列记录。
+- **内核**:新增 `HandlerKind::Noop` / `ScriptError`;`F_*`/`G_*`/`F_VAR`/
+  `S_VAR`/`G_VAR`/`MACRO`/`_IFDEF`/`_IFNDEF`/`_IFEND`/`);`/
+  `SYSTEMMODE`/`COMPILEMODE`/`RELEASEMODE`/`PROJECTFOLDER` 走
+  `rt.script.error`(仅首次进事件流)+ `Yield`;`S_INT/S_FLT/S_STR` 改
+  no-op;`script_slot_hits()` 计数全部命中。
+
+### 2. P0-B · DIALOG 完整契约与状态机(DIV-RT-044)
+
+- 三层:手册 `other/dialog.html`;语料 17 处(实际只用
+  STR/CAPTION/YESNO/LET/DEFBUTTON/INPUT/DEFSTR/LETSTR/OKCANCEL/
+  YESNOCANCEL);REA `0x43fc74` + 输入模板 `0x8083c4` + 过程 `0x4403d0`。
+- 关键 REA 事实:参数存在性判定不看值;非 INPUT = `MessageBoxA`;
+  按钮组按存在性 YESNOCANCEL > YESNO > OKCANCEL > 缺省 OK;`OK` 槽
+  从不读取;DEFBUTTON 1..4 → MB_DEFBUTTON1..4;ICON 1=Info/2=Question/
+  3=Warning/4=Error;LET = 1 基按钮序号(Yes/OK=1,No/Cancel=2,
+  YesNoCancel-Cancel=3);INPUT 走自绘对话框,INPUTLIMIT>0 时
+  EM_SETLIMITTEXT,OK 后文本写 LETSTR、LET=1。
+- **内核**:`src/dialog.rs` + `Vm::pending_dialogs()` /
+  `Vm::answer_dialog(id, button, text)`;DIALOG 使命中任务挂起
+  (`TaskExecutor::dialog_pending`),回答后下一逻辑帧继续;事件仍为
+  `DomainCall{System,"DIALOG"}`(通知,权威状态在 pending 队列)。
+- 未取证参数(STR2..8/A*/E*/CHECK*/FILEOPEN/FILEEXT/FOLDER/CHECKBOX/
+  SLIDER/NOWAIT)⇒ `Unimplemented`,不弹窗、不写回。
+- 与 `_WINDOW_EXEC_CLOSE` 的交互:对话框挂起期间宿主把关闭请求当取消,
+  不再推 `_WINDOW_EXEC_CLOSE`(写进 `domain-event-contracts.md` §8.4)。
+- 宿主呈现面列交接件(P1/P4)。
+
+### 3. P1 / P2 · 其余命令
+
+| 命令 | 结论 |
+|---|---|
+| `TRAY` | `Domain::System` 事件(宿主托盘图标;REA `0x453a4c`) |
+| `CLIPACT` | 内核镜像 + 事件;TEXT+SET 都存在才生效(REA `0x43e2d0`) |
+| `CLIPINFO` | 读镜像写 LET;过滤 `<0x20`(REA `0x43e410`) |
+| `REGINFO` | `Unimplemented`(需宿主注册表) |
+| `YMV`/`YMVEND` | `Domain::Movie` 事件;`YMVINFO` 需宿主媒体元数据 |
+| `ERROR` | 写逐命令启用表 `[0x689b00+opcode]`(默认全 1);消费者未定位(DIV-RT-046) |
+| `CSV`/`PLUG`/`ERRORINFO` | 官方 = 参数求值 + 返回 0 ⇒ no-op |
+| `MATH3D` | 代码已实现;本表旧「未取证」作废 |
+
+### 4. P3 · 系统变量
+
+- `_TEXT_FLAG` 写:REA `0x446b98..0x446bb5`(id 0x7b)= RHS 逐字节拷进
+  `[state+0x3c]`,不重建文本/不重算标志 ⇒ `set_text_flags`。
+- `_TEXT_NUM`:`0x4276e3` ← `[0x80174c]`;装载 `yst.ybn` 时由头部
+  text_total 写入(`0x45d73f`)。ERIS `yst.ybn` text_total=396 ==
+  `yst_list` 141 条 text_count 求和。`Vm::text_total()`。
+- `_WINDOW_INIT_POS`:`0x4276f3` ← `[0x80133c]`;写点 `0x460b74/0x460b87`
+  来自 `yscfg.dat` 第 10 个 int ⇒ `BootConfig::window_init_pos`(ERIS=0)。
+- `_WINDOW_EXEC_CAPTION`:维持宿主 setter 结论;新增
+  `Vm::request_window_caption()`(置 1)+ 脚本写回 0 的 LET 路径。
+- `HANTOZEN`/`ZENTOHAN`:从 0.495 exe 取三张表(A `0x5b5170` 95 项、
+  K `0x808840` 63 项、S `0x5b5230` 126 项),落
+  `data/case-tables-0495.tsv`;算法逐条对照 `0x4546aa..` / `0x4548cf..` /
+  `0x46b327` / `0x46b395`。单测覆盖 ASCII/半角片假名/反向。
+- `MATH[RND]`:REA `0x448571..0x4485b7` = `min + rand32 % (max-min+1)`,
+  反向交换;MT19937(`0x465f64` 种子常数),新增 `BootConfig::rng_seed`
+  (缺省 5489)与 `src/rng.rs`。
+
+### 5. P4 · 事件契约
+
+- `DomainCall` 新增可选 `script`/`pc`(内核发出总是 `Some`);JSON 仅在
+  `Some` 时输出。yu-trace 的映射已有 `..`,无需改动。
+- `ArgValue` 变量引用身份仍按 `DIV-RT-042` 只写提案,不实现(跨 crate)。
+
+### 6. 验证(原始输出)
+
+> 环境注记:本机 `project-eris/data` 已打包成 `data.ypf`,散盘语料用
+> `extract_ypf` 解到 `target/tmp/p3proj/data`,并以
+> `YURIS_SAMPLE_ERIS_YSBIN=target/tmp/p3proj/data/ysbin` 跑真实语料测试;
+> 否则 `tests/consistency.rs` 的缺样本路径会 panic(既有 skip 助手缺陷,
+> 不在 P3 范围)。
+
+```text
+$ cargo test -p yu-rt
+test result: ok. 64 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+```text
+$ cargo run -p yu-rt --example coverage_census -- 600 8
+- 运行: `SYSTEM_START`,tick 0..600 共 600 次,逻辑帧 602;…
+- 合计: 命令 7735679 次(报告累计 0),事件丢弃 0,文本 0 条 / 0 字节
+运行时未实现:LET=1(仅 _SAVE_PATH);ERROR=0;_WINDOW_EXEC_CAPTION 诊断=0
+```
+
+首帧金丝雀:`1_292_091 → 1_292_100`(+9;`_WINDOW_INIT_POS=0` 使
+`es_GSD.yst:490` 初始化分支首次成立;第 2 帧 272,296 不变)。
+逐命令计数**无回退**:`LET` +2、`IF` +2、`IFEND` +2、`ELSE` +1、
+`IFBLEND` +1、`WINDOW` +1(同一分支);其余命令与基线一致或只降
+「未实现」计数。
+`cargo fmt -p yu-rt -- --check` clean;
+`cargo clippy -p yu-rt --all-targets --no-deps -- -D warnings` clean。
+
+证据产物(仅 target/tmp):`default-handler.asm`、`dialog-handler.asm`、
+`p1-handlers.asm`、`p2-handlers.asm`、`sysvar-write2.asm`、
+`census-baseline.txt`、`census-final.txt`、`disasm.py`。
+
+### 7. 交接 / 仍挂账
+
+- **H-P3-01**:DIALOG 宿主呈现(原生/Web 选型)与窗口关闭路由(P1/P4)。
+- **H-P3-02**:`REGINFO`/`YMVINFO`/`CSVINFO` 需宿主能力。
+- **H-P3-03**:`ArgValue` 变量引用身份(DIV-RT-042)。
+- `ERROR` 启用表的消费者未定位(DIV-RT-046 open)。
+- `_WINDOW_EXEC_CAPTION` 触发条件(`*ecx` 来源)未取证;VM 只接受宿主
+  setter(DIV-RT-007/047)。
+- `_TEXT_NUM` 以 `yst_list` 求和代替 `yst.ybn` 头部;两者在其它工程若
+  分歧,需 `yu-format` 提供 YSTD 解码后再切(DIV-RT-048)。
+- `DIALOG` 扩展参数(STR2..8/A/E/CHECK/FILEOPEN/FOLDER/CHECKBOX/
+  SLIDER/NOWAIT)未取证。
+
+## 成果 P4 (2026-10-23) · 存档与文件域宿主 `yu-save` + YSSD 容器逐字节写路径 + log 门面桥
+
+> 任务书 `docs/tasks/task-p4-save-domain.md`。净室实现;零 git 写操作。
+> 与并行会话同树工作:期间 P3 契约(`DomainCall.script/pc`)与文本渲染
+> 重构先后落地,本成果在其上验证。
+
+### 1. M-E · log 门面消费(排障刚需)
+
+- `yu-log` 新增 `facade.rs`(加法,`log = "0.4"` 唯一新依赖):
+  `log::Record` → JSONL 一行(`{"sub":"log","level",…,"target","file","line","message"}`,
+  复用本包 JSON 转义)+ 控制台一行(回调注入;`yu-log` 不碰终端层)。
+  级别由 `YU_LOG` 控制(`error|warn|info|debug|trace`,缺省 `warn`;
+  不解析 `RUST_LOG`);`YU_LOG_JSONL` 给 JSONL 路径(进程内创建/截断)。
+- `yu-cli`/`yu-engine` 两个 main 入口初始化(先于引擎 boot);wasm 宿主不初始化。
+- **实测**:强制 `YURIS_WGPU_ADAPTER=__NO_SUCH_ADAPTER__ --backend wgpu`,
+  `wgpu_hal::vulkan::instance` 的 2 条 warning 同时出现在控制台与
+  `target/tmp/log-adapter-warn.jsonl`(带 file/line);`YU_LOG=error` 时
+  双通道均为 0 行;`YU_LOG=info` 时可见 `wgpu_hal::vulkan::adapter` 枚举信息。
+
+### 2. M-A · YSSD 容器:官方存档自证(真值层级 3)
+
+- 布局(证据:官方 0.495 产物 + 旧线 `<repo-old>` v494 反汇编事实,只引事实):
+  头 `YSSD + 0x1E0 + 块数 + 0x400` + 偏移表 `0x400×u32`(表项[i]=块 DNO=i+1
+  绝对偏移,0=空);块 = `dno u32 + 类型 u8 + 严格维数 u8 + 变量 id u16 +
+  压缩长 u32 + 未压长 u32 + 载荷`。载荷:`ty u32(1=INT 2=FLT 3=STR) +
+  维数 + 边界[] + 数据长 + 数据`(INT/FLT 8B/元素;STR 逐元素 {u32 长 + 字节})。
+  type1=配置块(段A/段B,结构往返);type2=多变量块(**外层裸**,子块各自
+  zlib,`pad` 恒 `0x0100`;外层 `ulen = Σ(子块 ulen + 12)` —— ERIS 实测,
+  旧线「clen=ulen=内层长」在 ERIS 不成立)。
+- **压缩层**:0.495 全部产物为 zlib level 1(`78 01`)。**libz-sys 钉版
+  `=1.1.22`(vendored zlib 1.3.1)**:1.1.30 的 zlib 1.3.2 deflate level-1
+  输出与官方产物不同(实测);flate2 `zlib` 后端的 deflateInit2 参数
+  (memLevel 8/默认策略/15 位窗)与 `compress2(level=1)` 同参。
+- `yu-format/tests/yssd_roundtrip.rs`:官方产物**快照**
+  (`target/tmp/yssd-corpus/`,5 文件 269 块)parse → rebuild **逐字节一致**
+  (extra 6 / gsd 4 / kidoku 1 / save50001 257 / seld 1;含 264 个值载荷与
+  全部 type1/type2 块)。快照原因:`<project>/save/` 是官方 exe 活动写盘位
+  (本轮实测 extra/gsd 在 12:24 被运行中的官方 exe 重写、save30001/30002
+  消失),移动靶不能当 golden。
+- 勘误留痕:AGENTS.md 的 `YURIS_SAMPLE_ERIS_YSBIN=project-eris/data/ysbin`
+  已失效(该目录不存在);实际在 `project-eris/save/data/ysbin`(官方 exe
+  解包产物,成果 N 续 2 同口径),本 rounds 测试均按此设置。
+
+### 3. M-B · 新 crate `yu-save`
+
+- `error.rs`:`sv.*` 码表 14 条(唯一性单测);`state.rs`:`SaveState`
+  (槽表=盘上事实 + SAVE/LOAD/SAVEEND/SAVEINFO/FILEACT/FILEINFO 事件
+  事实消费,参数名经 `domain_args`);`host.rs`:`SaveHost`(**不加
+  `yu-rt` trait** —— yu-rt 本轮冻结;由 Engine 每帧 drain 后喂入,事实
+  记录容忍一帧延迟,契约文档 §6 前提)。
+- **写侧门禁(不猜)**:`SAVE[FILE]` 刷盘显式拒绝(`sv.write.refused`):
+  `SET/LET` 变量引用身份在事件层丢失(DIV-RT-042),`var_id` 与整组数组
+  内容拿不到,写不出与官方一致的块;容器写路径本身已逐字节就绪(M-A)。
+  `FILEACT[EXEC]` 拒绝(`sv.exec.refused`);FILEACT 落盘仅在**显式可写
+  save 根**下允许(默认只读观察,保护语料目录);路径逃逸检查
+  (`sv.path.escape`)。SAVEINFO 挂账(REA 0x44e1c8 未取证,语料 0 次);
+  FILEINFO[EXIST] 不双写(内核 J3 已实现)。
+
+### 4. M-C · Engine 接线
+
+- `EngineOptions.save_root: Option<PathBuf>`:`None`=工程根 `save/`
+  (只读观察);`Some(dir)`=可写根(cases 注入 `target/tmp/save-cases/`)。
+  `$_SAVE_PATH` 跟随该根注入。事件 drain 改为取内容后喂 `SaveHost`。
+- `cases/save-title-flow.json`(600 帧,标题流):**PASS**;expect 新增
+  `save_state_sha256`(`SaveSnapshot` 确定性文本:槽表+预约+域事件计数;
+  case 启动时用 `target/tmp/yssd-corpus` 快照播种 save 根)。case 期间
+  语料工程目录零写入。
+- census 不回退:`SAVE 16 / LOAD 0 / FILEINFO 1136(已实现) / FILEACT 3 /
+  SAVEEND 3`,与 `coverage-matrix.md` 完全一致。
+
+### 5. M-D · P1 交接件
+
+- **H-P1-01**:engine.rs 三处 `sound.lock().unwrap()` 改
+  `unwrap_or_else(into_inner)` 中毒降级(SaveHost 同口径)。
+- **H-P1-02**:`Engine::take_diag_report()` → `DiagReport {frame,
+  waiting_tasks(等待任务面), unimplemented_cmds(挂号表), script_errors,
+  diags(内核+sv+snd 三路 drain), sound_layers, save_* 计数}`。
+- **H-P1-03**:`serve --diag-ws` 开 `/diag` WebSocket(500ms 推快照,
+  关闭即 404)。**实测**:握手 101;快照含 `waiting_tasks`/
+  `unimplemented_cmds`/域计数,frame 52 时 `save_calls=16, saveend=3,
+  fileact=3` 与 census 一致(实时闭环:VM 事件 → Engine drain →
+  SaveState → WS)。P3 的 `DomainCall.script/pc` 已在 `/diag` 的
+  `waiting_tasks`(script/pc 字段)透出。
+
+### 6. 验证原始输出
+
+```text
+$ cargo test -p yu-save -p yu-format -p yu-log -p yu-cli --lib
+（全部 ok:yu-save 6、yu-format lib 23、roundtrip 1、yu-log 17、yu-cli 10）
+
+$ cargo test -p yu-format --test yssd_roundtrip -- --nocapture
+extra.sd: 6 块,roundtrip OK … seld.sd: 1 块,roundtrip OK
+合计: 269 块 / 264 值载荷,全部逐字节一致
+
+$ yu-cli case <project-eris> --all
+5 passed; 2 failed
+（2 failed = 并行会话的 symptom-enter-story / symptom-ingame-config
+  「没有 expect;先跑 --update」,其 WIP;本任务 5 条含 save-title-flow 全 PASS)
+
+$ coverage_census 600 8
+SAVE 16 / LOAD 0 / FILEINFO 1136 / FILEACT 3 / SAVEEND 3(与矩阵一致)
+
+$ serve --no-open --diag-ws + WS 探针
+frame 52: save_calls=16 saveend=3 fileact=3 slots=5 waiting=5
+
+$ cargo clippy -p yu-save -p yu-log --all-targets
+0 warning(yu-cli 余 5 条警告均在 yu-sound/soft/gfx 既有或并行改动文件)
+```
+
+### 7. 挂账(不猜)
+
+- SAVE/LOAD 的**忠实写盘与 LET 写回** ⇒ DIV-RT-042(引用身份)关闭后
+  闭环;容器侧已就绪。
+- SAVEINFO 查询(REA `0x44e1c8`)、FILEACT 图层导出与 SAVE[ID]
+  (⇒ H-P4-02,P2/集成轮)、YSSD SNP 形态(本语料未出现)、
+  FILEINFO SIZE/RELATION。
+- 工程注记:libz-sys `=1.1.22` 是**持久钉版**(zlib 1.3.2 起 deflate
+  level-1 输出变化);`yu-gfx` 首屏 golden 在本树存在**先于本任务**的
+  漂移(pass10 `copy` 271→3,INPUT 闭环提交之后,非本任务改动;
+  需 Owner 复核后 UPDATE_GFX_GOLDEN)。
+
+## 成果 P2 · 文本链路落地(gfx 文本模型 + 两后端字形执行,2026-10-23)
+
+> 任务书 `docs/tasks/task-p2-text-pipeline.md`;只动 `yu-gfx` / `yu-font` /
+> `yu-render/{soft,wgpu}`;`yu-rt` / `yu-cli` 未改(契约变更写 H-P2-01/02)。
+> 净室:全部新写,事实只引用手册/REA/真实语料。
+
+### 1. 结论(先看这里)
+
+- **进本篇的对话文本可见**:ERIS 正文不是自动文本层,而是每字符
+  `CGACT[ID=<文本层> TEXT=1 SET=0/1 SETSTR=<char> X Y]`(`es_Font.yst`)。
+  P2 实现了该路径:gfx 产出 `TextDraw` → 后端把文本合成到图层基图副本 →
+  按图层 `A/MODE/Z` 合成。soft/wgpu 同帧逐像素一致。
+- **自动文本层也落地**:`TEXT[ID]` + `WORD`/`_`/`RETURNCODE` 的文本按 VM 的
+  `_TEXT_FLAG` 逐字 `'1'/'2'` 排版(半角 `SX/2`、全角 `SX`),不另造布局;
+  文本缓冲跨帧持久(`TEXT[CLEAR]` 经宿主同步传播),不再每帧清空。
+- **title 600 帧 0 差异**:soft 与 wgpu 各与改动前基线逐帧 SHA-256 相同
+  (600/600),两端互为 0 差异;文本代码对无文本帧完全惰性。
+
+### 2. 改动
+
+`crates/yu-gfx`
+- `text.rs`:新增 `TextDraw`(`CGACT[TEXT]` 绘制项)、`TextLayoutFrame`/
+  `TextGlyph`/`TextFlagsSource`、`layout_text`(唯一 `_TEXT_FLAG` 排版)、
+  `TextFontRequest`(`NAME`>`NO`>`BNO`>默认);
+  `TextStyle` 增加 `gradation`/`rotation`(默认 1/0)、引擎默认 `SX=SY=20`、
+  `COLOR2=0xffffff`、`clamp()`、`cell_width()`、`line_height()`。
+  `TextRun` 增加 `flags: Option<Vec<u8>>` / `reveal: Option<usize>`。
+- `state.rs`:文本缓冲改为**跨帧** `BTreeMap<LayerId, TextBuffer>`;
+  `FrameStart` 不再清空;`sync_text_state(&TextSnapshot)` /
+  `sync_text_state_for` / `clear_text` / `set_text_reveal`;`CGACT[TEXT]`
+  解析为 `text_draws`(不进 `ImageOp` 计数);`CGEND`/`CG(FILE)` 重建清层;
+  `FONT` 保存 + clamp GRADATION/ROTATION;`FONTINFO` 写回
+  `COLOR2/GRADATION/ROTATION`;`frame()` 输出 `text`/`text_layout`/`text_draws`。
+- `frame.rs`/`json.rs`/`lib.rs`:契约与 JSON(`flags`/`reveal`/`text_layout`/
+  `text_draws`;空时不输出,保持无文本帧 golden 稳定)。
+
+`crates/yu-font`
+- `cp932.rs`:`decode`/`decode_char`(WHATWG shift_jis,两后端共用);
+- `FontSource::ascent_px`(单元顶→基线,`Likely`);
+- 新增 `encoding_rs` 依赖(wam32/Android 可用)。
+
+`crates/yu-render/soft`
+- `text.rs`:`TextComposer`(懒加载系统字体 + 字形缓存 + CP932)、
+  `paint_draws`/`paint_layout_with`/`compose_layer`、`layer_base`;
+  `SET` → 1/9/3 次合成(REA `FUN_004056b8`,`Likely`);
+- `render.rs`:图层文本合成到基图副本(override 路径);屏幕级自动文本走
+  同一 `draw_image` 合成(与 wgpu 同公式);`RenderReport` 增加
+  `text_draws/text_glyphs/text_missing/text_diags`;
+  `frame_has_drawable_output` 把文本算作可见输出。
+- `examples/text_probe.rs`:§7 P0 方法(固定时钟 + 定时点击 + 每帧
+  `vm.text_state()` 同步),输出 TSV + PNG + `display.json`。
+
+`crates/yu-render/wgpu`
+- `passes.rs`:plan 阶段先做文本覆盖(基图/已加工覆盖纹理 → `TextComposer`
+  → 上传/缓存),屏幕级文本追加一个全视口覆盖 quad;报告字段与 soft 同构;
+- `lib.rs`:持有 `TextComposer`,`with_text_source`;`plan` 接收文本合成器;
+- `examples/wgpu_text_probe.rs`:soft/wgpu 同帧逐像素对拍。
+
+### 3. 证据(全部一手)
+
+| 事实 | 证据 | 等级 |
+|---|---|---|
+| `CGACT[TEXT=1 SETSTR=.. X Y]` 在图层上绘字符串 | 手册 `cg/cgact.html` 例 25/26 | Confirmed |
+| ERIS 正文逐字按 `_TEXT_FLAG` 的 `'1'/'2'` 算 `SX/2`/`SX` | `ERIS/Text/es_Text.yst::es.TX.BUFSET.SIZE` | Confirmed |
+| `SET=1` 轮廓 / `SET=0` 填色;同位置先 `SET=1` 再 `SET=0` | `ERIS/es_Font.yst`、`es_System.yst:311` | Confirmed |
+| `SET` → 合成 1/9/3 次 | REA `FUN_004056b8` @ `0x4056b8`(0→1,1..10→9,≥11→3;AA/非 AA 分支) | `Likely`(映射) |
+| 逐字符 GDI mask,无 kerning | REA `FUN_00445421`/`FUN_004450c0`(font-provenance §3.3) | Confirmed |
+| 字体默认 family / 默认样式 | `font-provenance` §2;REA `FUN_00464fac` | Confirmed |
+
+新分歧档案:`DIV-GFX-055`(图层合成模型/SET)、`DIV-GFX-056`(行距/基线)、
+`DIV-GFX-057`(无图层屏幕叠加)。交接件:`H-P2-01`(事件 ID 字节)、
+`H-P2-02`(VM reveal API)、`H-P2-03`(官方文本截图 oracle)。
+
+### 4. 验证原始输出
+
+```text
+$ export TEMP=<side-repo>/workbench/tmp YURIS_SAMPLE_ERIS_ROOT=<project-eris>
+$ cargo test -p yu-gfx -p yu-font -p yu-backend-soft -p yu-backend-wgpu
+28 个 test result: ok;0 个 FAILED(含新用例:
+  text_pipeline 10、soft render 12(新增 2)、wgpu text_layout_frames_match_soft_exactly、
+  yu-font cp932 3)
+$ cargo clippy -p yu-gfx -p yu-font -p yu-backend-soft -p yu-backend-wgpu --all-targets
+0 warning
+```
+
+P0 文本场景(soft,`text_probe`;列:bytes/flags/glyphs/last_x/x_extent/report_glyphs/ink):
+
+```text
+SCENARIO_EPILOGUE: entry=SCENARIO_EPILOGUE ticks=40
+tick  bytes flags glyphs last_x x_extent report_glyphs ink  hash
+0     12    10    6      100    120      6             550  b92091e4…5513a
+(1 行「エピローグ。」6 字全角,可见;直到点击才清)
+
+RP_101: entry=RP_101 ticks=130 click=10
+tick  bytes flags glyphs last_x x_extent report_glyphs ink  hash
+99    132   106   66     140    160      66            7562 c55a8dc5…5080d
+# main finished at tick 99 ; # text_events=10
+```
+
+soft/wgpu 同帧对拍(`wgpu_text_probe`):
+
+```text
+RP_101(100 tick,10 行):rows=100  mismatch=0(soft_hash == wgpu_hash 每帧)
+末帧 66 glyphs / ink 7562 / c55a8dc5…5080d(两端相同)
+SCENARIO_EPILOGUE(40 tick):0 mismatch,6 glyphs / ink 550
+```
+
+600 帧 title 回归(`frame_walk` / `wgpu_frame_walk`,与改动前基线比较):
+
+```text
+soft  0 / 600 差异
+wgpu  0 / 600 差异
+soft vs wgpu 0 / 600 差异
+```
+
+### 5. 挂账
+
+- `SET` 映射、行距/基线、无图层叠加均为 `Likely`;官方文本截图对拍挂
+  H-P2-03(YSCom attach 恢复后)。
+- VM 侧 reveal/已显字符数 ⇒ H-P2-02;`GfxState::set_text_reveal` 与后端
+  截断已就绪,但宿主暂不注入(不自建计时器)。
+- `VmEvent::Text.id` 非 UTF-8 CP932 ⇒ H-P2-01(模型已用 `LayerId` 字节)。
+- `CGACT[TEXT]` 目前按"每帧绘制项"建模(等价于 ERIS 每帧重画);若出现
+  只画一次依赖跨帧保留的脚本,需改为跨帧累积(DIV-GFX-055)。
+
+### 6. 注记(风险/清理)
+
+- 修复示例输出路径的 `ancestors().nth(2)`(实际写到 `crates/target/tmp`)
+  时,删除了 `crates/target/`;其中历史证据(`j3-*` TSV、walk PNG)全部
+  可由 `frame_walk` 示例复现,但**不是本任务应当删除的内容**,留档。
+- 并行会话正在改 `yu-rt`/`yu-cli`/`yu-platform`;本轮基线(会话开始时)
+  全绿,期间其 WIP 曾使 `yu-rt` 无法编译,已避开;P2 只对自有 crates 负责。
+
+### 7. 成果 P2 补记(收尾)
+
+- **H-P2-04**(新):宿主每帧把 `Vm::text_state()` 同步进 `GfxState`
+  (`yu-cli::engine::tick_inner` 3 行;`yu-cli` 不归本任务)。不接线时
+  `CGACT[TEXT]` 正文路径不受影响,只有"自动文本层"不显示
+  (`docs/handoffs/H-P2-04-host-text-sync.md`)。
+- 跨后端自动化回归补一条:`cgact_text_layer_frames_match_soft_exactly`
+  (图层文本合成,soft/wgpu RGBA 逐字节一致);加上
+  `text_layout_frames_match_soft_exactly`(屏幕覆盖)共两条。
+- `yu-font` 跨平台门禁复核:`cargo check -p yu-font --target
+  wasm32-unknown-unknown` / `aarch64-linux-android` 均通过
+  (`encoding_rs` 0.8 两个目标都可编译)。
+- `yu-font` 源码 `println!/eprintln!/dbg!` = 0(契约 §9)。
+- 收尾复跑:四 crate `cargo test` 全 ok(28 个 test result,0 failed);
+  `cargo clippy --all-targets` 0 warning;title 600 帧 soft/wgpu 与基线
+  各 0/600、互为 0/600;`RP_101` 100 tick 文本对拍 0 mismatch,
+  `SCENARIO_EPILOGUE` 40 tick 0 mismatch。
+
+## 成果 P1 (2026-10-23) · 症状工单与宿主稳定层:panic 防线、诊断面、S6 修复
+
+> 任务书 `docs/tasks/task-p1-symptom-host.md`。范围:`crates/yu-platform/host-desktop`、
+> `crates/yu-platform/input`、`www/`、`cases/symptom-*`、新建 `docs/symptom-ledger.md`。
+> `yu-cli`/`yu-gfx`/`yu-rt`/`yu-trace` 只读(需求写成交接件)。零 git 写操作。
+> 本会话与 P2/P3/P4 并发;主树有部分时段不可编译(见 §2.6)。
+
+### 1. 交付
+
+| 项 | 位置 | 说明 |
+|---|---|---|
+| 症状台账 | `docs/symptom-ledger.md` | 7 个剧本 + panic 自检 + `serve` 首帧,共 12 行档案、8 个交接件 |
+| panic 防线 | `host-desktop/src/panic_guard.rs` | 进程级 hook(消息/位置/线程/backtrace 摘要)+ tick/draw 双路径 `catch_unwind` + 冻结 + 红色横幅 + Esc/Quit |
+| 诊断账本 | `host-desktop/src/diagnostics.rs` | Diag 聚合(码/次数/首末帧/位置)、skipped top-N、Unimplemented top-N、输入计数、四路“为什么卡” |
+| 面板 | `host-desktop/src/ui.rs` | F1 四段 + 红/琥珀横幅;egui 0.37 `Panel`/`root_ui`;无头单测断言填充色与文案 |
+| 场景脚本 | `host-desktop/src/script.rs` + `cases/host/` | 按逻辑帧注入 input/pulse/resize/minimize/restore/focus_lost/close;S1–S7 七条 |
+| 日志 | `main.rs` | `yu_log::facade::init`(P4 M-E);`--log-file` > `YU_LOG_JSONL` > `%TEMP%/yu-desktop-host.jsonl`;panic 与 wgpu/winit 同 sink |
+| Web 对等 | `www/index.html` + `app.js` | overlay 新增 `diag` 行(只消费现有帧字段);新通道列为 H-P1-03 |
+| 用例 | `cases/symptom-{enter-story,ingame-config,ingame-save}.json` | 进 `case --all`;宿主脚本另在 `cases/host/` |
+| 证据工具 | `examples/scenario_probe.rs`、`examples/serve_probe.rs` | 逐帧画面 SHA/Diag/PNG;WS 场景回放(证据产物只进 `target/tmp`) |
+
+### 2. 关键实测结论(详见台账)
+
+1. **黑屏/无字的主因不是文本链路**:点 `スタート` 后 422 帧
+   `text_runs=0 / skipped_text=0` ⇒ 没有 TEXT 被跳过;同一帧起背景全黑。
+   真正上游是 `rt.expr.div_zero` @ `es_select.yst:es.ScenarioScript@153 LET`
+   (Fatal),背景/文本产出任务终止。文本链路缺口(DIV-GFX-012/033/034/035)仍在,
+   但不是本次黑屏的直接原因(勘误 §7.3)。
+2. **本篇底栏不是全灭**:`設定`/`タイトル`/`終了` 正常(脚本自绘 UI);
+   `終了 → はい` 正确 `main_finished=true`。无反应的是:
+   右键菜单、点文本框推进(任务已死)、`セーブ`。
+3. **`セーブ` 双缺陷**:界面 op(`SLTEMP`/`CGS100` rectpaint2)不落屏
+   (像素 SHA 不变),随后 `es_number.yst:SYSTEM@56` 第二次整数除 0 ⇒
+   **主任务 END**;桌面宿主按 END 语义直接关窗(实测 frames=440、exit 0)。
+4. **挂机黑屏**:桌面无输入 ~8.5s,标题演示任务命中同一处 Fatal,末帧纯黑;
+   该触发依赖 `tick_realtime`(墙钟),固定步 `tick()` 600 帧不复现,且跨运行
+   非确定(4 次:223/281/无/无)。3600 帧 release 复核:演示在
+   `frame≈1295` 启动但未命中 Fatal,末帧回到标题、无 panic。
+5. **标题“終了する”** 与“窗口关闭确认”走原生 `DIALOG`:VM 已挂起
+   (`pending_dialogs`),`Engine` 未透出 ⇒ 变暗后无对话框、静默挂起;
+   第二次关闭由宿主兜底退出。
+6. **最小化→还原** 原会触发 wgpu 校验错误(`set_scissor_rect` 960x50 vs
+   target 1x1):宿主 bug,**已修**(最小化跳过绘制 + draw 前同步 surface 尺寸)。
+7. **10 分钟 `serve`** 连续会话:36,646 帧、0 回退、0 断流、
+   `tick_avg 4.95ms / render 1.76ms`、音频首块非静音;首帧 1.858s 空白
+   (`serve` 未设步长上限 ⇒ H-P1-05)。
+
+### 3. 交接件(全部写进台账 §4)
+
+`H-P1-01` 音频锁中毒(P4 已并发落地;P1 复核:缺一次性 Diag)、
+`H-P1-02` Engine 公开 API(`pending_dialogs`/`answer_dialog`/`waiting_tasks`/
+`key_last`/`mouse_last`)、`H-P1-03` `serve --diag-ws`、`H-P1-04` DIALOG 呈现、
+`H-P1-05` `serve` 步长上限、`H-P1-06` `case` 的 `close` 动作、
+`H-P1-07` `es_select:153` + `es_number:56` 整数除 0(P3/P4)、
+`H-P1-08` 存档界面合成不可见(P2 gfx + P4 save)。
+
+### 4. 验证(原始输出)
+
+```text
+$ cargo test --workspace --no-fail-fast        (树恢复后,主树)
+passed=647 failed=0                            (exit 0)
+
+$ cargo test -p yu-host-desktop -p yu-platform-input
+21 passed (lib) + 3 passed (input) + 0 failed + 1 ignored(tests/input_host.rs)
+
+$ cargo test --release -p yu-host-desktop --test input_host -- --ignored
+test sub_frame_click_and_pulse_survive_a_single_host_frame ... ok   (17.83s)
+
+$ ./target/release/yu-cli.exe case <project-eris> --all
+8 passed; 0 failed
+
+$ cargo clippy -p yu-host-desktop -p yu-platform-input --all-targets
+0 warning / 0 error(仅 yu-sound 既有 1 条 manual_checked_division,与本线无关)
+
+$ rustfmt --check <本任务 10 个 .rs>
+0 diff
+```
+
+主树 release 宿主回放(全部 exit 0,无 PANIC):
+
+```text
+panic selftest : frames=120  panic@40 被接住 → frozen → 到限退出
+                 JSONL: "panic thread=main … backtrace= 0: …" + "exit frozen: …"
+S1 settings/back: frames=520  fatal=None
+S2 enter-story  : frames=470  FATAL es_select:153 @381;末帧与 case PNG 哈希一致
+S3 ingame-buttons: frames=620 FATAL es_select:153 @381(其余按钮仍可点)
+S4 save-load    : frames=440  FATAL es_number:56 @442,main_finished=true
+S5 close-twice  : frames=429  close#1 → @_WINDOW_EXEC_CLOSE=1 / close#2 → exit
+S6 stress       : frames=720  resize/minimize/restore/focus_lost 全执行,无 panic
+S7 serve 10m    : 36,646 帧 / 0 回退 / tick 4.95ms / render 1.76ms
+S7 desktop idle : frames=3600 elapsed=93.2s avg_fps=38.6,无 Fatal/PANIC,末帧标题
+serve 动作回放  : 设定→戻る→スタート→本篇設定 全部生效(472–481/550–551 有变化)
+```
+
+隔离快照(主树不可编译期间,HEAD + 仅本任务文件):24 passed / 0 failed。
+另:`cargo check -p yu-host-desktop --all-targets`(主树)在树恢复后 0 error。
+
+### 5. 勘误
+
+1. **`AGENTS.md` §2 样本路径失效**:`YURIS_SAMPLE_ERIS_YSBIN` 实为
+   `<project-eris>/save/data/ysbin`;`YURIS_SAMPLE_SDK0495/0479` 需传 SDK
+   **根目录**(测试会再拼 `システム/system/...`)。改正后基线由 2 target 失败
+   变为 559/0。
+2. **AU2 “`src/` 无 stdout 宏”不成立**:`yu-cli/src/engine/sound_device.rs`
+   有两处 `eprintln!`(P4 范围)。
+3. **任务书 §1“黑屏=文本链路”未证实**:见 §2.1。
+4. **本篇按钮全灭不成立**:见 §2.2。
+5. `egui 0.37` 的 `Window` 首遍只测量(面板晚一帧);`Panel` 首遍即绘制。
+6. 主树期间被并发改动带出两个非本线问题:①`flate2 → libz-sys` 需要显式
+   `INCLUDE/LIB`(本机 cc 找不到 MSVC 头);②`yu-gfx` 与 `yu-rt` 的
+   `DomainCall` 新字段一度互不上,导致整树不可编译(已由并发会话修复)。
+
+### 6. 未闭合
+
+- S2/S3d/S4/S7 的上游整数除 0(P3/P4 取证;官方 x87 语义无 trace)。
+- 右键菜单分支未取证;`es_number:56` 的除数来源未取证。
+- 存档界面合成(MODE 2 / offscreen 上屏)归 P2;`yu-save` 端到端未测。
+- `serve` 侧无 panic 防线(仅桌面宿主);`--diag-ws` 未实现(H-P1-03)。
+- 音频回调内 `SoundState::render_and_advance` 的 panic 穿 FFI(abort)未排除。
+
+## 成果 P6 (2026-10-23) · 性能与响应修复:60Hz 节拍、启动/场景装载、零拷贝
+
+> 会话范围:`yu-platform/host-desktop`、`yu-cli`(engine/server)、`yu-rt` VM、
+> `yu-gfx`/两个渲染后端的质量清理;`yu-trace` 拆模块。
+> 完整数据与复现命令:`docs/perf-report.md`;硬编码审计:`docs/hardcode-audit.md`;
+> 示例收敛:`docs/examples-audit.md`。零 git 写操作。
+> 语义纪律:除零 Fatal / SAVE 拒绝 / DIALOG 挂起**未改**;只登记交接。
+
+### 1. 核心结论(600 帧,release,`<project-eris>`)
+
+| 指标 | 修复前 | 修复后 | 变化 |
+|---|---|---|---|
+| 600 帧稳态 avg 帧时间 | ~24.5ms(40.9fps) | **16.665ms(60.0fps;含 2 次场景尖峰 16.92ms/59.1fps)** | -32% |
+| 稳态 p50 / p95 | —(未采) | **16.65–16.66 / 17.04–17.09ms** | 60Hz 内 |
+| 首帧 engine_tick | **1950.2ms** | **366–542ms** | -72~81% |
+| 第 4 帧 engine_tick | 1848.1ms | **382–587ms** | -68~79% |
+| 首帧脚本总耗时(采样) | 1775.6ms | 329.8ms | -81% |
+| 設定打开单帧(采样) | —(旧口径误记累计) | **220.4ms / tick 264–270ms** | 逐帧窗口 |
+| 設定点击端到端(未采样) | — | **283.86ms**(p95) | 仍是最大停顿 |
+| 首次「テキスト」页签 render | 165ms(fontdb 130ms) | **33.4ms**(启动预热后) | -80% |
+| 真实光标输入延迟 | — | avg 11.69–12.42 / p95 16.52–17.02ms;逻辑帧差 1 | ≤1 帧 |
+| 启动 boot + renderer | — | 98.9 + 570.3 = **669.3ms**(含 text_warm 143.9ms) | 窗口前 |
+| 首个可播放画面 | ~2.5s | **1.04–1.22s**(含字体预热) | -51~58% |
+
+### 2. 修复项(全部有不改像素/语义的验证)
+
+1. **固定节拍(P0-1)**
+   - `schedule_next_frame` 落后时对齐未来槽位,不再 `now + frame`;
+   - Windows `timeBeginPeriod(1)`(RAII),`WaitUntil` 提前 0.8ms 唤醒;
+   - 结果:`--fps 1000` 对照从 42.6fps → 正常节拍(定位到 15.6ms 定时器粒度)。
+2. **egui 惰性化(P0-2)**
+   - 面板隐藏/无冻结/无横幅:跳过 `run_pass/tessellate/update_buffers/egui pass`;
+   - 隐藏期仍排空 egui 输入队列(避免无界增长);
+   - 实测 draw 0.7→0.3ms;`--shot` 像素 SHA 完全一致。
+3. **零整帧拷贝(P0-3)**
+   - `RenderedFrame`/`RenderOutput`/`WgpuRenderOutput`/`Engine::last_surface`/
+     宿主 `last_surface` 统一 `Arc<Surface>`;软/硬后缓冲共享;
+   - 每帧省 2×1.9MB `Vec` 拷贝;case/serve 输出语义不变。
+4. **`serve` 诊断门控(P0-4)**
+   - 无 `/diag` 订阅:只排空诊断,不构造 `DiagReport` JSON;
+   - 有订阅:500ms 构造/推送一次(实测第三帧收到真实快照);
+   - 无客户端 40s 仍保持 `{"ok":false}`(证明没有逐帧构造)。
+5. **VM 热路径(P0-6 取证后)**
+   - 首帧 81.8% 在 `VARACT`:`shift_1d` 每次 O(n) 读+clone+逐元素写;
+     改 `VariableStore::shift_1d` 原地 `rotate`,语义不变;
+   - `step_command` 用 `remove_entry` 去掉每命令 TaskId `String` 分配;
+   - 诊断命令名改 `Rc<Cmd>`(不再逐命令复制);任务名按 `seq` 只在切换时写;
+   - `VARINFO SEARCH` 直接扫槽内数据(不再逐元素 read+clone);
+   - `VARACT[INIT]` ysv 投影只做一次;同掩码且 `VariableStore` 无写入时跳过
+     (generation 计数,任何写入/声明/改长度都会使缓存失效)。
+6. **解释器固定开销(本会话新增)**
+   - 执行位表 `BTreeMap<String, ExecState>` → `FxHashMap`(每命令一次树查找
+     变哈希);命令缓存 `(script,pc)` 哈希 → 按脚本的稠密 `Vec` 下标;
+   - 表达式窗口预解码 + 单条字面量常量折叠(`CmdWindow.const_value`);
+   - 设定打开单帧 tick **410–480ms → 264–270ms**(-35~45%),
+     再次打开同样 264–270ms(命令计数不变,是纯解释器开销);
+   - 通用兜底试验:`--pump-cap 100k/500k` 实测触发 `rt.label` Fatal
+     (`es_button@2377 GOSUB`,DIV-HOST-002)⇒ 任意抢占不安全,默认关闭;
+     通用修复走解释器吞吐,不靠限流。
+7. **首次文本页签:字体预热**
+   - 第一次「テキスト」页签 render 165ms,其中 **130ms 是 `fontdb` 首次
+     枚举系统字体**;`EngineOptions.warm_text` 在桌面宿主/serve 启动时预热;
+   - 首次文本页签 render 165→**33ms**,再次进入 11ms;
+   - 启动 +144ms(479→669ms),把一次性的字体枚举从游戏中移到启动阶段。
+8. **质量清理(P1)**
+   - `soft/text.rs` BNO 未取证分支:保留默认字体行为,但按帧去重报告
+     `text.font.bno_fallback`(DIV-FONT-007);
+   - `sx/sy=0→20`、`color2` 回退补证据锚点注释;
+   - `yu-gfx/state.rs` 4 处 `expect("checked")` 改为带上下文 Diag(不 panic);
+   - 删除 `engine.rs` 重复注释;`fault_dump.rs`/本会话文件过 rustfmt;
+   - `yu-trace/fault.rs` 拆为 `fault/{mod,ring,dump,replay}.rs`(纯搬运,
+     公开路径 `crate::fault::*` 不变,46+ 测试全绿)。
+
+### 3. 门禁(原始输出)
+
+```text
+$ cargo test -p yu-rt -p yu-host-desktop -p yu-cli -p yu-trace
+所有 test result: ok(含 yu-rt 11 passed 41.99s;yu-trace 46/13/7/14/8/2/3/7)
+环境:YURIS_SAMPLE_ERIS_YSBIN=<project-eris>/save/data/ysbin,
+      YURIS_SAMPLE_ERIS_ROOT=<project-eris>,SDK 根目录见台账 §5.0。
+
+$ yu-cli case <project-eris> --all
+8 passed; 0 failed; 8 total
+
+$ scenario_probe <project-eris> target/tmp/perf/title-600.json \
+    --backend soft --hash-csv target/tmp/perf/sha-soft.csv
+$ scenario_probe <project-eris> target/tmp/perf/title-600.json \
+    --backend wgpu --hash-csv target/tmp/perf/sha-wgpu.csv
+601 / 601 行;diff 无输出(逐帧 SHA 0 差异)
+
+$ yu-desktop <project-eris> --frames 600 --shot target/tmp/perf/ego-off.png
+shot sha256 a6db617b896dfb8a2f478238c3ef190fe4b0e5e4e825bb19771c8a940d05fc72
+= P1 台账 §5.4(本会话前基线)
+```
+
+### 4. 已知剩余(P0 结论,不在本会话修复)
+
+- 场景装载仍是同步突发:設定 tick 220 万 LET + 140 万 IF;
+  单命令 0.27–0.30µs 是主项(候选:泵内缓存执行位、按脚本 Vec 直接索引命令、
+  IF/LET 解码缓存去重哈希)。
+- `SOUND` 531 次同步解码 91ms(172µs/次);需 PCM 缓存或改线程(先取证)。
+- `CG` 111k 次 207ms(1.86µs/次),含缺失资产挂号;待 P2 gfx 取证。
+- 首个可播放 1.0s 中 0.48s 是 wgpu/软后端对账初始化;窗口创建提前需结构改动。
+
+### 5. 语义登记(P2,不改行为)
+
+- `DIV-RT-003`:追加 `es_select.yst:153` / `@1118` 取证:
+  `find_var_ref ... 1118 0x40` → 19 处全为读、槽 `Int[63]` 初值全 0;
+  下一步核对 `LOAD[G_INT*]` 批量恢复与官方 ysv 初值。**Fatal 保留**。
+- `H-P1-02/H-P1-04`(DIALOG 透出/呈现)、`DIV-RT-042`(SAVE 写盘被拒)、
+  `H-P1-08`(存档界面不可见)写入 `docs/handoffs/H-P2-05-dialog-save-ui.md`,
+  本会话不实现。
+
+## 成果 P7 (2026-10-23) · DIV-RT 台账状态对账(48 条全表复审)
+
+> 范围:仅文档(`crates/yu-rt/docs/divergences/README.md`)。零 git 写操作。
+> 把 P3/P4/P6 会话已落地但台账未翻状态的条目补上状态与证据;不做代码改动。
+
+### 1. 状态翻转(open/blocked → fixed,11 条,均有代码/测试证据)
+
+| 条目 | 证据 |
+|---|---|
+| DIV-RT-001 | 处置即本体(不内置序号表);`corpus::eris_entry_chain_runs_end_to_end` 真实 0.495 语料 ok |
+| DIV-RT-004 | `expr.rs` 缺右操作数容忍一次;语料全量跑通无挂号 |
+| DIV-RT-010 | `BootConfig::paths` + `yu-cli host_paths()` 注入;P6 `yu-cli case --all` 8 passed |
+| DIV-RT-012 | `yu-format::yssd` 官方 5 文件 269 块逐字节 roundtrip(P4);`yu-save` 宿主 |
+| DIV-RT-013 | `data/case-tables-0495.tsv` 三张表 + `case_tables.rs`;`fixture::varact_hantozen_and_zentohan_use_official_tables` ok |
+| DIV-RT-014 | `rng.rs` MT19937 + `BootConfig::rng_seed`;`fixture::math_rnd_uses_injected_mt19937_seed` ok |
+| DIV-RT-017 | `VarSpace::LegacyNum/LegacyStr` + `canonical_var`(源码↔编译产物↔YSVR 三方证);corpus 跑通 |
+| DIV-RT-023 | 四槽实现 + 处理体 `0x450478` 反汇编;手册缺页为不可修外部事实,保留条目 |
+| DIV-RT-024 | §3.26 ④ 算法逐条落地;census 无回退;同上保留手册缺页事实 |
+| DIV-RT-032 | `_TEXT_FLAG` 写入 REA `0x446b98..`(逐字节替换不重建);`fixture::text_flag_write_replaces_stream_without_rebuilding_text` ok |
+| (明细更新) | 005/007/011/015 的「影响」列改为现行事实(策略细化/收窄挂号面),状态保持 open |
+
+### 2. 门禁(原始输出)
+
+```text
+$ cargo test -p yu-rt --test fixture -- math_rnd_uses_injected_mt19937_seed \
+    text_flag_write_replaces_stream_without_rebuilding_text \
+    varact_hantozen_and_zentohan_use_official_tables \
+    task_without_tint_does_not_inherit_caller_registers \
+    window_init_pos_is_host_injected default_slot_reports_once_and_yields_without_terminating \
+    error_sets_the_per_command_enable_table dialog_blocks_task_until_answered_and_writes_let \
+    clipact_and_clipinfo_round_trip_with_control_filtering
+test result: ok. 9 passed; 0 failed; ... finished in 0.01s
+
+$ YURIS_SAMPLE_ERIS_YSBIN=<project-eris>/save/data/ysbin \
+  cargo test -p yu-rt --test corpus -- eris_entry_chain_runs_end_to_end text_num_matches_yst_header_total
+test result: ok. 2 passed; 0 failed; ... finished in 17.75s
+```
+
+### 3. 对账后余量(未实现/未修复,见 divergences README)
+
+open ×8:002(表达式逐位)、003(除零上游取证)、005(官方错误继续策略 trace)、
+007(`_CHR/_DXMODE/_VARTYPE/_SYSTEM_FRAME` 等)、009(`_OS_TIME(0)`+时区)、
+011(`STRTYPE/SJISCODE/UTF8CODE`、`VAR`)、015(`TEXTPOS/RESTART`)、
+046(`ERROR` 表消费者);blocked ×1:042(`DomainCall` 引用身份);
+fixed/partial ×1:045(`REGINFO`/`YMVINFO` 需宿主)。

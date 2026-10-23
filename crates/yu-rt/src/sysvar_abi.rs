@@ -93,7 +93,11 @@ const ABI_TSV_0292: &str = include_str!("../data/sysvar-abi-0292.tsv");
 
 impl SysVarTable {
     /// 从工程 `YSCom.ycd` 的解析结果构造。
-    pub fn from_ycd(ycd: &crate::ycd::YcdTable, path: impl Into<String>, sha256: impl Into<String>) -> Self {
+    pub fn from_ycd(
+        ycd: &crate::ycd::YcdTable,
+        path: impl Into<String>,
+        sha256: impl Into<String>,
+    ) -> Self {
         Self {
             decls: ycd
                 .system_variables
@@ -242,7 +246,10 @@ impl SysVarTable {
         }
         for (id, decl) in self.decls.iter().enumerate() {
             let Some(rec) = mirrors.iter().find(|r| r.var_id as usize == id) else {
-                return Err(mismatch(format!("id {id}({}) 在 ysv 中无镜像记录", decl.name)));
+                return Err(mismatch(format!(
+                    "id {id}({}) 在 ysv 中无镜像记录",
+                    decl.name
+                )));
             };
             if rec.value_type != decl.value_type || rec.dims != decl.dims {
                 return Err(mismatch(format!(
@@ -409,7 +416,11 @@ mod tests {
         let e = SysVarTable::select_for(&vars).expect_err("失配必须拒绝");
         assert_eq!(e.code, "table.version");
         for name in ["0292", "0466", "0479", "0495"] {
-            assert!(e.detail.contains(name), "失配原因应含族名 {name}: {}", e.detail);
+            assert!(
+                e.detail.contains(name),
+                "失配原因应含族名 {name}: {}",
+                e.detail
+            );
         }
     }
 

@@ -142,7 +142,7 @@ let out = backend.render_frame_scaled(
 | Blend | MODE 0/1/2/3/5/6/7/9;RGB 与 alpha 都按 D3D9 固定管线同因子。源色先按 stage 归约:`0/1=T`、`2/5/6/9=T·A`、`3/7=T·A+(1−a)`;颜色因子用 `Src/OneMinusDst/OneMinusSrc` 对应 `SRCCOLOR/INVDESTCOLOR/INVSRCCOLOR` |
 | Filter | `frame.filter` 全局;Point=nearest,Linear/Anisotropic=linear;引擎硬编码 MIP=POINT 且无 mip 链,故固定 LOD 0 等价 |
 | 颜色空间 | 存储值直接算术,不线性化 |
-| 文本 | 不栅格化,`skipped_text` 计数 |
+| 文本 | 与 soft 同一 `TextComposer`:图层文本合成到基图副本后上传为 override;屏幕文本为全视口覆盖 quad;缺 `_TEXT_FLAG` 的 `TextRun` 仍 `skipped_text` |
 
 `RenderReport` 直接复用 `yu_backend_soft::RenderReport`(同一结构、同一
 `SkippedOp` 排序键),因此字段与跳过原因不会漂移。
@@ -186,7 +186,7 @@ let out = backend.render_frame_scaled(
 | `draw_calls` vs `ops_drawn` | 记账 | 目标尺寸为 0 时 op 算“已执行”但不产生 GPU draw;报告分别给出两个数 |
 | i64 坐标 → f32 NDC | 舍入 | 极端坐标在 f32 下损失精度;这些四边形本来就在视口外,可见区域实测一致 |
 | 组尺寸未给时回退视口 | 未取证 | 继承 gfx/soft 的 Likely 决策(DIV-GFX-008) |
-| COPY/图像加工/掩码/过渡/文本 | 未实现 | 与 soft 同一跳过原因与计数;不近似 |
+| COPY/图像加工/掩码/过渡 | 未实现 | 与 soft 同一跳过原因与计数;不近似 |
 
 **唯一硬性检查**(不是逐像素对拍):
 - `passes / ops_total / ops_drawn / skipped_ops_total` 与
@@ -225,7 +225,7 @@ yu-backend-wgpu 自身 0 告警(输出中的 warning 来自依赖 yu-rt)
 $ grep -rn "println!\|eprintln!\|dbg!" crates/yu-render/wgpu/src
 0
 
-$ grep -rn "kotoneiro\|AnimalTrail\|C:\\\\Users\|D:\\\\Art" crates/yu-render/wgpu/src
+$ grep -rn "<game-b>\|<game-a>\|C:\\\\Users\|D:\\\\Art" crates/yu-render/wgpu/src
 0
 
 $ cargo check -p yu-backend-wgpu --target wasm32-unknown-unknown --lib
@@ -275,6 +275,6 @@ soft vs wgpu: diff_pixels=0/480000 max_channel_diff=0
   `MONO`/`BLUR*` 等图像加工;`RECTPAINT/2/3` 已实现(EVID-J-02..05),
   `ID2`/快照源/部分区域仍挂账;
 - 资源图 + `SX/SY` 的缩放/裁剪;
-- 文本字形栅格化/排版;
+- 文本 GPU 字形 atlas(当前是 CPU 栅格 + 纹理 quad,与 soft 同源同像素;atlas 只是性能优化);
 - 组 `SX/SY` 缺失时的引擎真实尺寸/清屏(DIV-GFX-008);
 - 颜色空间逐像素对拍(DIV-GFX-009)。

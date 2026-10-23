@@ -27,7 +27,7 @@ fn command(name: &str, params: &[&str]) -> FmtCommand {
             .iter()
             .map(|param| FmtArg {
                 name: (*param).into(),
-                flag: if matches!(*param, "ID" | "ID2" | "FILE" | "TID") {
+                flag: if matches!(*param, "ID" | "ID2" | "FILE" | "TID" | "NAME" | "SETSTR") {
                     1
                 } else {
                     0
@@ -48,21 +48,44 @@ fn table() -> ParamTable {
                     "ID", "FILE", "E", "A", "X", "Y", "Z", "SX", "SY", "MODE", "T", "TA", "TID",
                 ],
             ),
-            command("CGACT", &[
-                "ID",
-                "ID2",
-                "COPY2",
-                "SET",
-                "X",
-                "Y",
-                "X2",
-                "Y2",
-                "RECTPAINT",
-                "RECTPAINT2",
-                "RECTPAINT3",
-                "REVERSE",
-                "HORIZONTAL",
-            ]),
+            command(
+                "CGACT",
+                &[
+                    "ID",
+                    "ID2",
+                    "COPY2",
+                    "SET",
+                    "X",
+                    "Y",
+                    "X2",
+                    "Y2",
+                    "RECTPAINT",
+                    "RECTPAINT2",
+                    "RECTPAINT3",
+                    "REVERSE",
+                    "HORIZONTAL",
+                    "TEXT",
+                    "SETSTR",
+                    "BNO",
+                ],
+            ),
+            command(
+                "FONT",
+                &[
+                    "BNO",
+                    "NO",
+                    "NAME",
+                    "ANTIALIASING",
+                    "COLOR",
+                    "COLOR2",
+                    "GRADATION",
+                    "ROTATION",
+                    "DRAWMODE",
+                    "SX",
+                    "SY",
+                    "BOLD",
+                ],
+            ),
         ],
         messages: Vec::new(),
         key_table: Box::new([0u8; 256]),
@@ -90,6 +113,8 @@ fn call(frame: u64, name: &str, args: Vec<ArgValue>) -> VmEvent {
         domain: Domain::Graphics,
         name: name.to_string(),
         args,
+        script: None,
+        pc: None,
     }
 }
 
@@ -397,7 +422,7 @@ fn group_alpha_is_applied_once() {
 #[test]
 fn rectpaint_family_matches_soft_backend() {
     let table = table();
-    let mut gfx = state(Viewport::new(8, 4), [255, 255, 255, 255]);  
+    let mut gfx = state(Viewport::new(8, 4), [255, 255, 255, 255]);
     gfx.consume_events(&[
         VmEvent::FrameStart { frame: 1 },
         call(
@@ -550,7 +575,10 @@ fn semi_transparent_pixels_match_soft_within_one() {
         gpu_out.surface.rgba.len() / 4
     );
     assert!(
-        frame.layers.iter().any(|layer| layer.is_group() && layer.alpha < 256),
+        frame
+            .layers
+            .iter()
+            .any(|layer| layer.is_group() && layer.alpha < 256),
         "controle: 必须有半透明组,否则测试无意义"
     );
     assert!(
@@ -833,13 +861,8 @@ fn reference_scale(
                     let mut sum = [0.0f32; 4];
                     for (r, wy_r) in wy.iter().enumerate() {
                         for (c, wx_c) in wx.iter().enumerate() {
-                            let tap = ref_texel(
-                                src,
-                                width,
-                                height,
-                                ix - 1 + c as i64,
-                                iy - 1 + r as i64,
-                            );
+                            let tap =
+                                ref_texel(src, width, height, ix - 1 + c as i64, iy - 1 + r as i64);
                             let weight = wx_c * wy_r;
                             for ch in 0..4 {
                                 sum[ch] += tap[ch] * weight;
@@ -857,11 +880,7 @@ fn reference_scale(
     out
 }
 
-fn assert_scale_matches_reference(
-    filter: ScaleFilter,
-    output_width: u32,
-    output_height: u32,
-) {
+fn assert_scale_matches_reference(filter: ScaleFilter, output_width: u32, output_height: u32) {
     let table = table();
     let (width, height) = (8u32, 6u32);
     let frame = fullscreen_pattern_frame(&table, width, height);
@@ -880,11 +899,7 @@ fn assert_scale_matches_reference(
         filter,
     );
     let out = renderer
-        .render_frame_scaled(
-            &frame,
-            Viewport::new(output_width, output_height),
-            filter,
-        )
+        .render_frame_scaled(&frame, Viewport::new(output_width, output_height), filter)
         .expect("scaled render");
     assert_eq!(
         (out.surface.width, out.surface.height),
@@ -1007,18 +1022,134 @@ fn reverse_after_rectpaint_matches_soft() {
     assert_eq!(gpu_out.report.ops_drawn, soft_out.report.ops_drawn);
     assert_eq!(gpu_out.report.skipped, soft_out.report.skipped);
     let soft_surface = soft_out_surface(&soft_out);
-    assert_eq!(
-        pixel(&gpu_out, 0, 0),
-        pixel_of_surface(&soft_surface, 0, 0)
-    );
+    assert_eq!(pixel(&gpu_out, 0, 0), pixel_of_surface(&soft_surface, 0, 0));
     // 0x10,0x20,0x30 反色 = 0xEF,0xDF,0xCF;alpha 保持 0xFF。
     assert_eq!(pixel(&gpu_out, 0, 0), [0xEF, 0xDF, 0xCF, 0xFF]);
 }
 
 fn soft_out_surface(out: &yu_backend_soft::RenderOutput) -> yu_backend_soft::Surface {
-    out.surface.clone()
+    (*out.surface).clone()
 }
 
 fn pixel_of_surface(surface: &yu_backend_soft::Surface, x: u32, y: u32) -> [u8; 4] {
     surface.pixel(x, y).expect("pixel inside surface")
+}
+
+#[test]
+fn text_layout_frames_match_soft_exactly() {
+    let Some(mut gpu) = renderer_or_skip(store(&[])) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&[]));
+    if !soft.text_composer().available() {
+        SKIPPED.fetch_add(1, Ordering::Relaxed);
+        println!("SKIP text_layout_frames_match_soft_exactly: no system font");
+        return;
+    }
+    let mut gfx = state(Viewport::new(64, 32), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        VmEvent::Text {
+            frame: 1,
+            id: String::new(),
+            bytes: b"A\x82\xB1B".to_vec(),
+        },
+    ]);
+    // 权威 `_TEXT_FLAG`:半角/全角/半角(SX=SY=20 默认)。
+    gfx.sync_text_state(&yu_rt::text::TextSnapshot {
+        bytes: b"A\x82\xB1B".to_vec(),
+        flags: b"121".to_vec(),
+        output_mode: 1,
+        wait_ms: 0,
+        autoreturn: 1,
+        autopage: 1,
+        autoclick: 1,
+        click: false,
+        clear_pending: false,
+        cursor_x: 0,
+        cursor_y: 0,
+        click_buttons: [1, 13, 0x3ff, 0x3ff],
+        skip_buttons: [17, 0x3ff, 0x3ff, 0x3ff],
+    });
+    let frame = gfx.frame();
+    assert_eq!(frame.text_layout.as_ref().map_or(0, |l| l.glyphs.len()), 3);
+
+    let soft_out = soft.render_frame(&frame);
+    let gpu_out = gpu.render_frame(&frame).expect("render");
+    assert_eq!(soft_out.report.text_glyphs, 3);
+    assert_eq!(gpu_out.report.text_glyphs, 3);
+    assert_eq!(soft_out.report.text_draws, gpu_out.report.text_draws);
+    assert_eq!(soft_out.report.text_diags, gpu_out.report.text_diags);
+    assert_eq!(
+        soft_out.surface.rgba, gpu_out.surface.rgba,
+        "text frame must be pixel-identical across backends"
+    );
+}
+
+#[test]
+fn cgact_text_layer_frames_match_soft_exactly() {
+    let table = table();
+    let Some(mut gpu) = renderer_or_skip(store(&[(
+        b"dark.png",
+        png_bytes_for(32, 32, Rgba([0, 0, 0, 255])),
+    )])) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&[(
+        b"dark.png",
+        png_bytes_for(32, 32, Rgba([0, 0, 0, 255])),
+    )]));
+    if !soft.text_composer().available() {
+        SKIPPED.fetch_add(1, Ordering::Relaxed);
+        println!("SKIP cgact_text_layer_frames_match_soft_exactly: no system font");
+        return;
+    }
+    let mut gfx = state(Viewport::new(32, 32), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"dark".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "FONT",
+            vec![
+                arg(&table, "FONT", "SX", Value::Int(16)),
+                arg(&table, "FONT", "SY", Value::Int(16)),
+                arg(&table, "FONT", "COLOR", Value::Int(0x00_FF00)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CGACT", "TEXT", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0)),
+                arg(&table, "CGACT", "SETSTR", Value::Str(b"A".to_vec())),
+                arg(&table, "CGACT", "X", Value::Int(0)),
+                arg(&table, "CGACT", "Y", Value::Int(0)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    assert_eq!(frame.text_draws.len(), 1);
+
+    let soft_out = soft.render_frame(&frame);
+    let gpu_out = gpu.render_frame(&frame).expect("render");
+    assert_eq!(soft_out.report.text_draws, 1);
+    assert_eq!(gpu_out.report.text_draws, 1);
+    assert_eq!(soft_out.report.text_glyphs, 1);
+    assert_eq!(gpu_out.report.text_glyphs, 1);
+    assert_eq!(soft_out.report.text_diags, gpu_out.report.text_diags);
+    assert_eq!(
+        soft_out.surface.rgba, gpu_out.surface.rgba,
+        "CGACT[TEXT] layer frame must be pixel-identical across backends"
+    );
 }

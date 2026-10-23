@@ -81,7 +81,10 @@ fn run_entry(label: &str) -> Option<Vm> {
     let mut project = ysbun.parent();
     let mut found = None;
     for _ in 0..4 {
-        let d = match project { Some(d) => d, None => break };
+        let d = match project {
+            Some(d) => d,
+            None => break,
+        };
         if d.join("system/YSCom/YSCom.ycd").is_file() {
             found = Some(d.to_path_buf());
             break;
@@ -111,7 +114,11 @@ fn array_var(vm: &Vm, name_hint: &str) -> VarRef {
         .iter()
         .filter(|r| r.kind == 1 && r.value_type == 1 && r.dims == vec![128, 128])
         .collect();
-    assert_eq!(candidates.len(), 1, "{name_hint}: 期望唯一 [128,128] 全局数组");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "{name_hint}: 期望唯一 [128,128] 全局数组"
+    );
     VarRef::new(VarSpace::At, candidates[0].var_id)
 }
 

@@ -90,7 +90,7 @@ impl<D: DataSource> DataSource for TracingSource<D> {
     fn open(&self, path: &LookupKey) -> Result<Vec<u8>, Diag> {
         match self.inner.open(path) {
             Ok(bytes) => {
-                self.recorder.shared_log().lock().unwrap().push(
+                self.recorder.record_payload(
                     *self.frame.lock().unwrap(),
                     Payload::VfsOpen {
                         source: self.source_name.clone(),
@@ -103,7 +103,7 @@ impl<D: DataSource> DataSource for TracingSource<D> {
                 Ok(bytes)
             }
             Err(diag) => {
-                self.recorder.shared_log().lock().unwrap().push(
+                self.recorder.record_payload(
                     *self.frame.lock().unwrap(),
                     Payload::VfsOpen {
                         source: self.source_name.clone(),
@@ -120,7 +120,7 @@ impl<D: DataSource> DataSource for TracingSource<D> {
 
     fn exists(&self, path: &LookupKey) -> bool {
         let exists = self.inner.exists(path);
-        self.recorder.shared_log().lock().unwrap().push(
+        self.recorder.record_payload(
             *self.frame.lock().unwrap(),
             Payload::VfsExists {
                 source: self.source_name.clone(),
@@ -135,7 +135,7 @@ impl<D: DataSource> DataSource for TracingSource<D> {
         match self.inner.list(path) {
             Ok(entries) => {
                 let recorded: Vec<ListEntry> = entries.iter().map(ListEntry::from_entry).collect();
-                self.recorder.shared_log().lock().unwrap().push(
+                self.recorder.record_payload(
                     *self.frame.lock().unwrap(),
                     Payload::VfsList {
                         source: self.source_name.clone(),
@@ -147,7 +147,7 @@ impl<D: DataSource> DataSource for TracingSource<D> {
                 Ok(entries)
             }
             Err(diag) => {
-                self.recorder.shared_log().lock().unwrap().push(
+                self.recorder.record_payload(
                     *self.frame.lock().unwrap(),
                     Payload::VfsList {
                         source: self.source_name.clone(),

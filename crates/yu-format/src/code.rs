@@ -30,6 +30,8 @@ pub const YSV_FIELD: &str = "fmt.ysv.field";
 pub const CODEC_INVALID: &str = "fmt.codec.invalid";
 /// 请求的编解码器不存在。
 pub const CODEC_NAME: &str = "fmt.codec.name";
+/// YSSD 存档载荷压缩层失败(非 zlib 流/解压不闭合;P4)。
+pub const YSSD_CODEC: &str = "fmt.yssd.codec";
 
 /// 全部已登记错误码(顺序稳定)。唯一性由单元测试守卫。
 pub const ALL_CODES: &[&str] = &[
@@ -46,6 +48,7 @@ pub const ALL_CODES: &[&str] = &[
     YSV_FIELD,
     CODEC_INVALID,
     CODEC_NAME,
+    YSSD_CODEC,
 ];
 
 /// 码是否已登记。用于诊断自检与测试。

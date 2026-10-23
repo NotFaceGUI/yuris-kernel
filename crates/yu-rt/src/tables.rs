@@ -258,9 +258,7 @@ impl LabelTable {
 
     /// 按文本查(仅 ASCII 名等值于字节查;用于测试/诊断)。
     pub fn get(&self, name: &str) -> Option<&Label> {
-        self.by_name
-            .get(name.as_bytes())
-            .map(|&i| &self.labels[i])
+        self.by_name.get(name.as_bytes()).map(|&i| &self.labels[i])
     }
 
     pub fn len(&self) -> usize {
@@ -446,7 +444,9 @@ impl ScriptList {
 
     /// 脚本号 → 源码路径(脚本号即清单下标;见 [`Self::entries`] 的顺序)。
     pub fn path_of(&self, script_id: u16) -> Option<&[u8]> {
-        self.entries.get(script_id as usize).map(|e| e.path.as_slice())
+        self.entries
+            .get(script_id as usize)
+            .map(|e| e.path.as_slice())
     }
 
     pub fn len(&self) -> usize {
@@ -535,7 +535,10 @@ impl ScriptFile {
     ///
     /// 结构自检(`Σ window_count × 12 == 参数索引区长度`、非零 type 窗口的
     /// `offset+size` 边界)已在 `Segments::decrypt` 内完成,这里不再重复。
-    fn from_segments(script_id: u32, segs: yu_format::ystb::Segments) -> Result<Self, yu_log::Diag> {
+    fn from_segments(
+        script_id: u32,
+        segs: yu_format::ystb::Segments,
+    ) -> Result<Self, yu_log::Diag> {
         let count = segs.count as usize;
         let mut groups = Vec::with_capacity(count);
         let mut first_window = Vec::with_capacity(count);
@@ -658,10 +661,7 @@ impl TableSet {
     /// - 缺任一张表 → `table.missing`,装载失败(拒绝启动)。
     ///
     /// 单根装载(`ysbin/*` 与 `system/YSCom/YSCom.ycd` 同根)。
-    pub fn load(
-        src: &dyn yu_vfs::DataSource,
-        key: [u8; 4],
-    ) -> Result<Self, yu_log::Diag> {
+    pub fn load(src: &dyn yu_vfs::DataSource, key: [u8; 4]) -> Result<Self, yu_log::Diag> {
         Self::load_from(src, None, key)
     }
 
@@ -687,12 +687,18 @@ impl TableSet {
             .map_err(|d| wrap_table("ysc.ybn", d))?,
         )?;
         let labels = LabelTable::from_format(
-            yu_format::yslb::YslLabels::parse(&read(src, b"ysbin/ysl.ybn", "ysl")?, b"ysbin/ysl.ybn")
-                .map_err(|d| wrap_table("ysl.ybn", d))?,
+            yu_format::yslb::YslLabels::parse(
+                &read(src, b"ysbin/ysl.ybn", "ysl")?,
+                b"ysbin/ysl.ybn",
+            )
+            .map_err(|d| wrap_table("ysl.ybn", d))?,
         )?;
         let vars = VarImage::from_format(
-            yu_format::ysvr::VarDecls::parse(&read(src, b"ysbin/ysv.ybn", "ysv")?, b"ysbin/ysv.ybn")
-                .map_err(|d| wrap_table("ysv.ybn", d))?,
+            yu_format::ysvr::VarDecls::parse(
+                &read(src, b"ysbin/ysv.ybn", "ysv")?,
+                b"ysbin/ysv.ybn",
+            )
+            .map_err(|d| wrap_table("ysv.ybn", d))?,
         )?;
         let scripts = ScriptList::from_format(
             yu_format::ystl::ScriptList::parse(
@@ -725,8 +731,7 @@ impl TableSet {
             Some((bytes, path)) => {
                 let table = crate::ycd::YcdTable::parse(&bytes)?;
                 let sha = crate::sysvar_abi::sha256_hex(&bytes);
-                let sysvars =
-                    crate::sysvar_abi::SysVarTable::from_ycd(&table, path, sha);
+                let sysvars = crate::sysvar_abi::SysVarTable::from_ycd(&table, path, sha);
                 (Some(table), sysvars)
             }
             // 商业发行版无编译器定义:按工程 ysv.ybn 指纹从已知 ABI 族中
@@ -789,11 +794,7 @@ impl TableSet {
     }
 }
 
-fn read(
-    src: &dyn yu_vfs::DataSource,
-    path: &[u8],
-    what: &str,
-) -> Result<Vec<u8>, yu_log::Diag> {
+fn read(src: &dyn yu_vfs::DataSource, path: &[u8], what: &str) -> Result<Vec<u8>, yu_log::Diag> {
     let key = yu_vfs::LookupKey::new(path, yu_vfs::Codec::Cp932).map_err(|d| {
         diag::fatal(
             code::table::MISSING,
@@ -844,7 +845,12 @@ mod tests {
         data.extend_from_slice(&4u32.to_le_bytes());
         data.extend_from_slice(&0u32.to_le_bytes());
         let k = [0x11u8, 0x22, 0x33, 0x44];
-        let xor = |d: &[u8]| d.iter().enumerate().map(|(i, b)| b ^ k[i % 4]).collect::<Vec<u8>>();
+        let xor = |d: &[u8]| {
+            d.iter()
+                .enumerate()
+                .map(|(i, b)| b ^ k[i % 4])
+                .collect::<Vec<u8>>()
+        };
         let line_no = 9u32.to_le_bytes();
         data.extend_from_slice(&xor(&inst));
         data.extend_from_slice(&xor(&windows));
@@ -865,8 +871,14 @@ mod tests {
     /// 真实形态:`M` + u16 长度(含引号)+ 引号串。
     #[test]
     fn ysvr_string_init_decodes_ystb_literal() {
-        assert_eq!(decode_str_init(b"M\x10\x00\"SCENARIO_START\""), b"SCENARIO_START");
-        assert_eq!(decode_str_init(b"M\x13\x00\"es.ScenarioScript\""), b"es.ScenarioScript");
+        assert_eq!(
+            decode_str_init(b"M\x10\x00\"SCENARIO_START\""),
+            b"SCENARIO_START"
+        );
+        assert_eq!(
+            decode_str_init(b"M\x13\x00\"es.ScenarioScript\""),
+            b"es.ScenarioScript"
+        );
         // 空串:`M` + len=2 + `""`
         assert_eq!(decode_str_init(b"M\x02\x00\"\""), b"");
     }

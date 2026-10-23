@@ -131,7 +131,12 @@ mod tests {
         Texture {
             width: w,
             height: h,
-            rgba: px.iter().copied().cycle().take((w * h * 4) as usize).collect(),
+            rgba: px
+                .iter()
+                .copied()
+                .cycle()
+                .take((w * h * 4) as usize)
+                .collect(),
         }
     }
 
@@ -207,12 +212,7 @@ pub fn scale_region(
     }
     let (x0, y0, x1, y1) = match region {
         Some((x, y, x2, y2)) => (x, y, x2, y2),
-        None => (
-            0,
-            0,
-            i64::from(src.width) - 1,
-            i64::from(src.height) - 1,
-        ),
+        None => (0, 0, i64::from(src.width) - 1, i64::from(src.height) - 1),
     };
     let cw = (x1 - x0 + 1).max(1);
     let ch = (y1 - y0 + 1).max(1);
@@ -275,9 +275,7 @@ mod scale_tests {
         let src = Texture {
             width: 2,
             height: 2,
-            rgba: vec![
-                1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255,
-            ],
+            rgba: vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255],
         };
         let out = scale_region(&src, 4, 4, None, false);
         assert_eq!(out.width, 4);
@@ -293,9 +291,7 @@ mod scale_tests {
         let src = Texture {
             width: 4,
             height: 1,
-            rgba: vec![
-                1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255,
-            ],
+            rgba: vec![1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255],
         };
         let out = scale_region(&src, 3, 1, Some((1, 0, 2, 0)), false);
         assert_eq!(&out.rgba[0..4], &[2, 0, 0, 255]);

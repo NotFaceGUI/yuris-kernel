@@ -62,8 +62,8 @@ const GOSUB_MAX_CALLS: usize = 64;
 /// 必须由工程 `ysc.ybn` 提供;表里没有 = 该工程版本不兼容,直接拒启。
 pub fn required_commands(yscm: &crate::tables::YscmTable) -> Result<(), yu_log::Diag> {
     const REQUIRED: &[&str] = &[
-        "GOSUB", "RETURN", "GO", "IF", "ELSE", "IFBLEND", "IFEND", "LOOP", "LOOPEND",
-        "WAIT", "LET", "INT", "FLT", "STR", "END",
+        "GOSUB", "RETURN", "GO", "IF", "ELSE", "IFBLEND", "IFEND", "LOOP", "LOOPEND", "WAIT",
+        "LET", "INT", "FLT", "STR", "END",
     ];
     for name in REQUIRED {
         if yscm.index_of(name).is_none() {
@@ -122,60 +122,160 @@ pub enum HandlerKind {
     Labelinfo,
     /// `TEXTINFO`:文本属性查询(VM 侧状态;REA `0x4538cc`)。
     Textinfo,
+    /// `DIALOG`:模态对话框(VM 侧状态机;宿主呈现/回答;REA `0x43fc74`)。
+    Dialog,
+    /// `CLIPACT`:剪贴板写入(内核镜像 + 宿主同步;REA `0x43e2d0`)。
+    Clipact,
+    /// `CLIPINFO`:剪贴板读取并写 `LET`(REA `0x43e410`)。
+    Clipinfo,
+    /// `ERROR`:写「逐命令启用表」(`0x689b00`;REA `0x46358c`)。
+    ErrorTable,
+    /// 官方处理体只做参数求值、不产生副作用(`CSV`/`PLUG`/`ERRORINFO`)。
+    NoopEval,
+    /// 需要宿主能力(注册表/媒体元数据等),内核不猜。
+    HostRequired(&'static str),
     /// 手册有页的域命令(CG/SOUND/WINDOW/…)→ DomainCall 事件。
     Domain(Domain),
-    /// 无处理器(手册无页且非域)。
+    /// 官方 0.495 分发表里映射到 `0x4634d8`(`xor eax,eax; ret`)的槽:
+    /// 真正的 no-op(DIV-RT-043)。`DEBUGLIST`/`LABEL`/`PREP`/`RETURNBREAK`/
+    /// `S_INT`/`S_FLT`/`S_STR` 七条。
+    Noop,
+    /// 官方 0.495 分发表里未覆盖的默认槽 `0x459e90`:报「スクリプト実行
+    /// エラー」并返回 -1(本任务本帧让出,不终止)。DIV-RT-043。
+    ScriptError,
+    /// 无处理器(手册无页且非域,且不在官方默认槽清单内)。
     Unknown,
 }
 
+/// 0.495 分发表中**未被覆盖**的槽(落到默认处理体 `0x459e90`)。
+///
+/// 证据(REA,0.495 `yu-ris.exe` sha256 `4f5eefa3…`):
+/// `FUN_0045cf90` 先以 `MOV dword ptr [EAX+0x7ace20], 0x459e90` 填满
+/// 119 槽(`0x45d1ae..0x45d1c0`,循环上限 `0x1dc`),随后逐槽覆盖;
+/// 本清单 = 未被任何覆盖写到的命令名(按工程 `ysc.ybn` 序号反查)。
+/// 默认体本身只有 6 条指令(`0x459e90..0x459ea4`):
+/// `push 1; push 0xdbbd2; call 0x465d08; add esp,8; mov eax,-1; ret`。
+///
+/// `0xdbbd2` 是 `ysbin/yse.ybn` 的消息 id;官方语料 yse 解出
+/// `「[内部エラー]\n\nスクリプト実行エラーが発生しました。」`。
+/// 因此**不是 no-op**:报一次全局脚本执行错误 + 返回非 0(本帧让出),
+/// 任务不终止(`FUN_004612b0` 用全局 `[0x5e4f84]` 抑制重复弹窗)。
+const DEFAULT_SLOT_COMMANDS_0495: &[&str] = &[
+    "F_FLT",
+    "F_INT",
+    "F_STR",
+    "F_VAR",
+    "G_FLT",
+    "G_FLT2",
+    "G_FLT3",
+    "G_FLT4",
+    "G_INT",
+    "G_INT2",
+    "G_INT3",
+    "G_INT4",
+    "G_STR",
+    "G_STR2",
+    "G_STR3",
+    "G_STR4",
+    "G_VAR",
+    "MACRO",
+    "S_VAR",
+    "_IFDEF",
+    "_IFNDEF",
+    "_IFEND",
+    ");",
+    "SYSTEMMODE",
+    "COMPILEMODE",
+    "RELEASEMODE",
+    "PROJECTFOLDER",
+];
+
+/// 0.495 分发表中映射到 `0x4634d8` 的命令:真正的 no-op(`xor eax,eax; ret`)。
+///
+/// REA `FUN_0045cf90` 的覆盖写:`0x7ace44`(DEBUGLIST)/`0x7acef0`(LABEL)/
+/// `0x7acf4c`(PREP)/`0x7acf58`(RETURNBREAK)/`0x7acf60`(S_FLT)/
+/// `0x7acf64`(S_INT)/`0x7acf68`(S_STR)。
+const NOOP_COMMANDS_0495: &[&str] = &[
+    "DEBUGLIST",
+    "LABEL",
+    "PREP",
+    "RETURNBREAK",
+    "S_INT",
+    "S_FLT",
+    "S_STR",
+];
+
 /// 按工程 yscm 建表(名字 → 处理器类别)。表 = 数据解析结果,不是内置命令表。
+/// 注意:默认槽/无操作槽是 **0.495 引擎分发表**的属性;命令名与序号仍来自
+/// 工程 `ysc.ybn`(DIV-RT-001 的版本隔离不因此改变)。
 pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> {
     let mut table = Vec::with_capacity(yscm.len());
     for i in 0..yscm.len() {
         let name = yscm.command(i as u8).map(|c| c.name.as_str()).unwrap_or("");
-        let kind = match name {
-            "GOSUB" => HandlerKind::Gosub,
-            "RETURN" => HandlerKind::Return,
-            "GO" => HandlerKind::Go,
-            "IF" => HandlerKind::If,
-            "ELSE" => HandlerKind::Else,
-            "IFBLEND" => HandlerKind::Ifblend,
-            "IFEND" => HandlerKind::Ifend,
-            "IFBREAK" => HandlerKind::Ifbreak,
-            "IFCONTINUE" => HandlerKind::Ifcontinue,
-            "LOOP" => HandlerKind::Loop,
-            "LOOPEND" => HandlerKind::Loopend,
-            "LOOPBREAK" => HandlerKind::Loopbreak,
-            "LOOPCONTINUE" => HandlerKind::Loopcontinue,
-            "WAIT" => HandlerKind::Wait,
-            "FPS" => HandlerKind::Fps,
-            "END" => HandlerKind::End,
-            "LET" => HandlerKind::Let,
-            "INT" | "FLT" | "STR" | "S_INT" | "S_FLT" | "S_STR" => HandlerKind::Declare,
-            "VARINFO" => HandlerKind::Varinfo,
-            "VARACT" => HandlerKind::Varact,
-            "MATH" => HandlerKind::Math,
-            "TASK" => HandlerKind::Task,
-            "TASKEND" => HandlerKind::Taskend,
-            "TASKINFO" => HandlerKind::Taskinfo,
-            "SYSTEMINFO" => HandlerKind::Systeminfo,
-            "FILEINFO" => HandlerKind::Fileinfo,
-            "MATH3D" => HandlerKind::Math3d,
-            "CGINFO" => HandlerKind::Cginfo,
-            "FONTINFO" => HandlerKind::Fontinfo,
-            "WINDOWINFO" => HandlerKind::Windowinfo,
-            "TEXT" => HandlerKind::Text,
-            "_" => HandlerKind::TextOut,
-            "WORD" => HandlerKind::Word,
-            "RETURNCODE" => HandlerKind::ReturnCode,
-            "TEXTINFO" => HandlerKind::Textinfo,
-            "LABELINFO" => HandlerKind::Labelinfo,
-            other => {
-                let domain = domain_of(other);
-                if domain != Domain::Other {
-                    HandlerKind::Domain(domain)
-                } else {
-                    HandlerKind::Unknown
+        // 官方槽位判定先于域分类:`SYSTEMMODE` 虽以 SYSTEM 开头,但分发表
+        // 未覆盖它 ⇒ 执行到就是脚本执行错误,不能当域事件静默放过。
+        let kind = if DEFAULT_SLOT_COMMANDS_0495.contains(&name) {
+            HandlerKind::ScriptError
+        } else if NOOP_COMMANDS_0495.contains(&name) {
+            HandlerKind::Noop
+        } else {
+            match name {
+                "GOSUB" => HandlerKind::Gosub,
+                "RETURN" => HandlerKind::Return,
+                "GO" => HandlerKind::Go,
+                "IF" => HandlerKind::If,
+                "ELSE" => HandlerKind::Else,
+                "IFBLEND" => HandlerKind::Ifblend,
+                "IFEND" => HandlerKind::Ifend,
+                "IFBREAK" => HandlerKind::Ifbreak,
+                "IFCONTINUE" => HandlerKind::Ifcontinue,
+                "LOOP" => HandlerKind::Loop,
+                "LOOPEND" => HandlerKind::Loopend,
+                "LOOPBREAK" => HandlerKind::Loopbreak,
+                "LOOPCONTINUE" => HandlerKind::Loopcontinue,
+                "WAIT" => HandlerKind::Wait,
+                "FPS" => HandlerKind::Fps,
+                "END" => HandlerKind::End,
+                "LET" => HandlerKind::Let,
+                "INT" | "FLT" | "STR" => HandlerKind::Declare,
+                "VARINFO" => HandlerKind::Varinfo,
+                "VARACT" => HandlerKind::Varact,
+                "MATH" => HandlerKind::Math,
+                "TASK" => HandlerKind::Task,
+                "TASKEND" => HandlerKind::Taskend,
+                "TASKINFO" => HandlerKind::Taskinfo,
+                "SYSTEMINFO" => HandlerKind::Systeminfo,
+                "FILEINFO" => HandlerKind::Fileinfo,
+                "MATH3D" => HandlerKind::Math3d,
+                "CGINFO" => HandlerKind::Cginfo,
+                "FONTINFO" => HandlerKind::Fontinfo,
+                "WINDOWINFO" => HandlerKind::Windowinfo,
+                "TEXT" => HandlerKind::Text,
+                "_" => HandlerKind::TextOut,
+                "WORD" => HandlerKind::Word,
+                "RETURNCODE" => HandlerKind::ReturnCode,
+                "TEXTINFO" => HandlerKind::Textinfo,
+                "LABELINFO" => HandlerKind::Labelinfo,
+                "DIALOG" => HandlerKind::Dialog,
+                // 0.495 有独立处理体但无脚本可见返回(TRAY=托盘图标)。
+                "TRAY" => HandlerKind::Domain(Domain::System),
+                "CLIPACT" => HandlerKind::Clipact,
+                "CLIPINFO" => HandlerKind::Clipinfo,
+                // REA:只调参数求值器后返回 0(`0x43e640`/`0x44bd10`/`0x46356c`)。
+                "CSV" | "PLUG" | "ERRORINFO" => HandlerKind::NoopEval,
+                "ERROR" => HandlerKind::ErrorTable,
+                // 需要宿主:Windows 注册表 / YMV 媒体元数据。
+                "REGINFO" => HandlerKind::HostRequired("Windows 注册表读取"),
+                "YMVINFO" => HandlerKind::HostRequired("YMV 媒体元数据查询"),
+                // YMV/YMVEND 只控制媒体对象生命周期,无脚本可见返回。
+                "YMV" | "YMVEND" => HandlerKind::Domain(Domain::Movie),
+                other => {
+                    let domain = domain_of(other);
+                    if domain != Domain::Other {
+                        HandlerKind::Domain(domain)
+                    } else {
+                        HandlerKind::Unknown
+                    }
                 }
             }
         };
@@ -187,17 +287,13 @@ pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> 
 impl Vm {
     /// 把命令窗口逐条求值成 `(槽号, 值)`。跳转窗口与空窗口跳过;
     /// 求值失败省略该窗口(处理器/诊断会给出真正的失败原因)。
-    fn eval_arg_windows(
-        &mut self,
-        st: &mut ExecState,
-        cmd: &Cmd,
-    ) -> Vec<ArgValue> {
+    fn eval_arg_windows(&mut self, st: &mut ExecState, cmd: &Cmd) -> Vec<ArgValue> {
         let mut args = Vec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
             }
-            if let Ok(v) = self.eval_value(st, &w.payload) {
+            if let Ok(v) = self.eval_window(st, w) {
                 args.push(ArgValue::new(w.rec.kind, v));
             }
         }
@@ -264,6 +360,51 @@ impl Vm {
             HandlerKind::ReturnCode => self.op_returncode(st, cmd),
             HandlerKind::Textinfo => self.op_textinfo(st, cmd),
             HandlerKind::Labelinfo => self.op_labelinfo(st, cmd),
+            HandlerKind::Dialog => self.op_dialog(st, cmd),
+            HandlerKind::Clipact => self.op_clipact(st, cmd),
+            HandlerKind::Clipinfo => self.op_clipinfo(st, cmd),
+            HandlerKind::ErrorTable => self.op_error(st, cmd),
+            HandlerKind::NoopEval => {
+                // 官方处理体 = 参数求值 + `xor eax,eax; ret`。求值错误的
+                // 可恢复诊断照常记录,然后继续。
+                for w in &cmd.windows {
+                    if w.rec.length == 0 {
+                        continue;
+                    }
+                    let _ = self.eval_window(st, w);
+                }
+                Ok(StepOutcome::Continue)
+            }
+            HandlerKind::HostRequired(what) => Err(diag::unimplemented(
+                code::rt::CMD_UNIMPLEMENTED,
+                Boundary::Script,
+                format!(
+                    "命令 `{}` 需要宿主能力({what});内核不猜(DIV-RT-045)",
+                    cmd.name
+                ),
+            )
+            .into()),
+            // 官方 0.495 `0x4634d8`(xor eax,eax; ret):真的什么都不做。
+            HandlerKind::Noop => Ok(StepOutcome::Continue),
+            // 官方 0.495 默认槽 `0x459e90`:报一次全局「スクリプト実行エラー」
+            // (yse 0xdbbd2)并返回 -1 ⇒ 本任务本帧让出,pc 已前进,任务不终止。
+            HandlerKind::ScriptError => {
+                self.note_script_slot();
+                if !self.script_error_reported() {
+                    self.mark_script_error_reported();
+                    self.report(diag::recoverable(
+                        code::rt::SCRIPT_ERROR,
+                        Boundary::Script,
+                        format!(
+                            "命令 `{}` 未在官方分发表覆盖,落到默认槽 0x459e90:\
+                             官方报「[内部エラー] スクリプト実行エラーが発生しました。」\
+                             (yse 0xdbbd2)并返回 -1(本帧让出,不终止任务;DIV-RT-043)",
+                            cmd.name
+                        ),
+                    ));
+                }
+                Ok(StepOutcome::Yield)
+            }
             HandlerKind::Domain(domain) => {
                 // INPUT/MOUSE 是**输入状态机的一部分**(脚本可读计数器),
                 // 不是纯宿主表现:内核必须自己应用(REA 0x446564/0x44aaa0)。
@@ -277,22 +418,14 @@ impl Vm {
                 // 只在宿主已安装时走新的 LET 写回路径；未安装时保持
                 // M-2 的既有行为（通用域事件 + rt.cmd.unimplemented），
                 // 保证 600 帧普查逐位不变。
-                if domain == Domain::Sound
-                    && cmd.name == "SOUNDINFO"
-                    && self.sound_host.is_some()
-                {
+                if domain == Domain::Sound && cmd.name == "SOUNDINFO" && self.sound_host.is_some() {
                     return self.op_soundinfo(st, cmd);
                 }
                 // 域命令的参数是宿主域状态机唯一能看到的输入;必须带上
                 // 求值结果(槽号 = 工程 ysc 表的参数序号)。`record_events`
                 // 只控制通用 Command 事件,不影响域事件。
                 let args = self.eval_arg_windows(st, cmd);
-                self.emit(VmEvent::DomainCall {
-                    frame: self.frame(),
-                    domain,
-                    name: cmd.name.clone(),
-                    args,
-                });
+                self.emit_domain(domain, cmd.name.clone(), args);
                 // Graphics/Window 已由同步宿主消费时不再挂号;声音域同理。
                 let handled = (self.graphics_host.is_some()
                     && matches!(domain, Domain::Graphics | Domain::Window))
@@ -342,25 +475,29 @@ impl Vm {
                 )
                 .into());
             }
-            let value = self.eval_value(st, &w.payload)?;
+            let value = self.eval_window(st, w)?;
             let value = coerce_param(&pname, value);
             frame.args[idx - 1] = Some(value);
             frame.arg_flags[idx - 1] = true;
         }
         if st.frames.len() > GOSUB_MAX_CALLS {
-            return Err(crate::task::nesting_error(
-                "GOSUB",
-                st.frames.len() - 1,
-                GOSUB_MAX_CALLS,
-            )
-            .into());
+            return Err(
+                crate::task::nesting_error("GOSUB", st.frames.len() - 1, GOSUB_MAX_CALLS).into(),
+            );
         }
         // 块/循环栈按调用层隔离:RETURN 时截断回进入前的深度。
         frame.if_depth = st.if_stack.len();
         frame.loop_depth = st.loops.len();
         st.frames.push(frame);
         let from_pc = cmd.pc;
-        self.jump_to(st, label.script_id as u32, label.pc, label.base_a, JumpKind::Gosub, from_pc)?;
+        self.jump_to(
+            st,
+            label.script_id as u32,
+            label.pc,
+            label.base_a,
+            JumpKind::Gosub,
+            from_pc,
+        )?;
         Ok(StepOutcome::Continue)
     }
 
@@ -380,7 +517,7 @@ impl Vm {
             }
             let pname = self.param_name(cmd.opcode, w.rec.kind).unwrap_or_default();
             let idx = param_index_of(&pname).unwrap_or(1);
-            let value = self.eval_value(st, &w.payload)?;
+            let value = self.eval_window(st, w)?;
             let value = coerce_param(&pname, value);
             ret[idx - 1] = Some(value);
             flags[idx - 1] = true;
@@ -410,7 +547,14 @@ impl Vm {
     fn op_go(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         let label = self.label_from_window(st, cmd, 0)?;
         let from_pc = cmd.pc;
-        self.jump_to(st, label.script_id as u32, label.pc, label.base_a, JumpKind::Go, from_pc)?;
+        self.jump_to(
+            st,
+            label.script_id as u32,
+            label.pc,
+            label.base_a,
+            JumpKind::Go,
+            from_pc,
+        )?;
         Ok(StepOutcome::Continue)
     }
 
@@ -435,7 +579,7 @@ impl Vm {
         });
         // 条件求值:可恢复失败(Unimplemented)⇒ 记诊断并按「假」处理;
         // Fatal 照常抛出(任务终止)。
-        let truthy = match self.eval_value(st, &cmd.windows[0].payload) {
+        let truthy = match self.eval_window(st, &cmd.windows[0]) {
             Ok(v) => v.truthy()?,
             Err(d) => {
                 let recoverable = matches!(
@@ -499,7 +643,7 @@ impl Vm {
         let cond = if cmd.windows[0].payload.is_empty() {
             None
         } else {
-            Some(self.eval_value(st, &cmd.windows[0].payload)?)
+            Some(self.eval_window(st, &cmd.windows[0])?)
         };
         let truthy = match cond {
             Some(v) => v.truthy()?,
@@ -525,11 +669,7 @@ impl Vm {
     /// `IFBLEND`:无条件跳到当前块出口(§3.13;手册 IF 页)。
     fn op_ifblend(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         let top = *st.if_stack.last().ok_or_else(|| {
-            diag::fatal(
-                code::rt::CMD_WINDOWS,
-                Boundary::Script,
-                "IFBLEND 无配对 IF",
-            )
+            diag::fatal(code::rt::CMD_WINDOWS, Boundary::Script, "IFBLEND 无配对 IF")
         })?;
         self.emit(VmEvent::Jump {
             frame: self.frame(),
@@ -615,7 +755,11 @@ impl Vm {
             pc: cmd.pc,
             to_pc: to,
             to_script: st.script_id,
-            kind: if cont { JumpKind::IfContinue } else { JumpKind::IfBreak },
+            kind: if cont {
+                JumpKind::IfContinue
+            } else {
+                JumpKind::IfBreak
+            },
         });
         st.pc = to;
         Ok(StepOutcome::Continue)
@@ -633,7 +777,7 @@ impl Vm {
         let limit = if cmd.windows[0].payload.is_empty() {
             -1
         } else {
-            match self.eval_value(st, &cmd.windows[0].payload)? {
+            match self.eval_window(st, &cmd.windows[0])? {
                 Value::Int(n) => n,
                 other => {
                     return Err(diag::fatal(
@@ -753,7 +897,11 @@ impl Vm {
             pc: cmd.pc,
             to_pc: target.end_pc,
             to_script: st.script_id,
-            kind: if cont { JumpKind::LoopContinue } else { JumpKind::LoopBreak },
+            kind: if cont {
+                JumpKind::LoopContinue
+            } else {
+                JumpKind::LoopBreak
+            },
         });
         st.pc = target.end_pc;
         Ok(StepOutcome::Continue)
@@ -772,7 +920,7 @@ impl Vm {
             if w.rec.length == 0 {
                 continue;
             }
-            let v = self.eval_value(st, &w.payload)?;
+            let v = self.eval_window(st, w)?;
             let n = v.as_int().ok_or_else(|| {
                 diag::fatal(
                     code::rt::VAR_TYPE,
@@ -815,7 +963,7 @@ impl Vm {
             if w.rec.length == 0 {
                 continue;
             }
-            let v = self.eval_value(st, &w.payload)?;
+            let v = self.eval_window(st, w)?;
             let n = v.as_int().unwrap_or(0);
             match w.rec.kind {
                 0 => {
@@ -856,7 +1004,7 @@ impl Vm {
             if w.rec.length == 0 {
                 continue;
             }
-            let v = self.eval_value(st, &w.payload)?;
+            let v = self.eval_window(st, w)?;
             if w.rec.kind == 0 {
                 restart = v.as_int().unwrap_or(0) != 0;
             }
@@ -883,7 +1031,7 @@ impl Vm {
             )
             .into());
         }
-        let lval = self.eval_lvalue(st, &cmd.windows[0].payload)?;
+        let lval = self.eval_lvalue_window(st, &cmd.windows[0])?;
         // ERIS 旧式空间按 id 的声明类型归一化;其它未知前缀挂号继续(DIV-RT-017)。
         let lval = crate::expr::LValue {
             var: self.canonical_var(lval.var),
@@ -914,7 +1062,11 @@ impl Vm {
                 .filter(|rest| {
                     // 只收按钮族(排除 _MOUSE_X/Y 与 _KEYNUM_* 等)。
                     !matches!(*rest, "X" | "Y" | "LAST")
-                        && !rest.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(true)
+                        && !rest
+                            .chars()
+                            .next()
+                            .map(|c| c.is_ascii_digit())
+                            .unwrap_or(true)
                 })
                 .map(|rest| {
                     if name.starts_with("_KEY_") {
@@ -924,20 +1076,23 @@ impl Vm {
                     }
                 });
             if let Some(button) = button {
-                let rhs = self.eval_value(st, &cmd.windows[1].payload)?;
+                let rhs = self.eval_window(st, &cmd.windows[1])?;
                 let v = rhs.as_int().unwrap_or(0);
                 self.input_state_mut().set_counter(&button, v);
                 return Ok(StepOutcome::Continue);
             }
             // `@_MENUCODE` / `@_WINDOW_EXEC_MAX/CLOSE`(手册 ○)= 状态覆盖。
             if name == "_MENUCODE" {
-                let rhs = self.eval_value(st, &cmd.windows[1].payload)?;
+                let rhs = self.eval_window(st, &cmd.windows[1])?;
                 let v = rhs.as_int().unwrap_or(0);
                 self.set_menu_code(v);
                 return Ok(StepOutcome::Continue);
             }
-            if name == "_WINDOW_EXEC_MAX" || name == "_WINDOW_EXEC_CLOSE" {
-                let rhs = self.eval_value(st, &cmd.windows[1].payload)?;
+            if name == "_WINDOW_EXEC_MAX"
+                || name == "_WINDOW_EXEC_CLOSE"
+                || name == "_WINDOW_EXEC_CAPTION"
+            {
+                let rhs = self.eval_window(st, &cmd.windows[1])?;
                 let v = rhs.as_int().unwrap_or(0);
                 let which = name.rsplit('_').next().unwrap_or("").to_string();
                 self.set_window_exec(&which, v);
@@ -945,7 +1100,7 @@ impl Vm {
             }
             // `$_TEXT`(手册 ○)= 替换当前显示文本。
             if name == "_TEXT" {
-                let rhs = self.eval_value(st, &cmd.windows[1].payload)?;
+                let rhs = self.eval_window(st, &cmd.windows[1])?;
                 let bytes = match rhs.cast_to_str()? {
                     Value::Str(b) => b,
                     _ => Vec::new(),
@@ -953,9 +1108,23 @@ impl Vm {
                 self.set_text(bytes);
                 return Ok(StepOutcome::Continue);
             }
+            // `$_TEXT_FLAG`(手册 ○)= 替换控制字节流。
+            //
+            // REA `0x446b98..0x446bb5`(id 0x7b):RHS 字符串逐字节拷进
+            // `[state+0x3c]`;**不重建文本、不重算逐字符标志**(与 `$_TEXT`
+            // 的 `+0x38` 写入并列)。DIV-RT-032 写入路径收口。
+            if name == "_TEXT_FLAG" {
+                let rhs = self.eval_window(st, &cmd.windows[1])?;
+                let bytes = match rhs.cast_to_str()? {
+                    Value::Str(b) => b,
+                    _ => Vec::new(),
+                };
+                self.set_text_flags(bytes);
+                return Ok(StepOutcome::Continue);
+            }
             // `_CODE_*`(手册 ○;键位重映射)= 覆盖引擎缺省按钮码。
             if name.starts_with("_CODE_") {
-                let rhs = self.eval_value(st, &cmd.windows[1].payload)?;
+                let rhs = self.eval_window(st, &cmd.windows[1])?;
                 let v = rhs.as_int().unwrap_or(0);
                 let id = lval.var.id;
                 self.input_state_mut().set_code(id, v);
@@ -968,11 +1137,7 @@ impl Vm {
                     .strip_prefix("_PADNUM_")
                     .or_else(|| name.strip_prefix("_PAD_"))
                     .unwrap_or("");
-                let idx: Vec<i64> = lval
-                    .indices
-                    .iter()
-                    .copied()
-                    .collect();
+                let idx: Vec<i64> = lval.indices.iter().copied().collect();
                 let code = match (base, idx.as_slice()) {
                     ("UP", [n]) | ("DOWN", [n]) | ("LEFT", [n]) | ("RIGHT", [n]) => {
                         let dir = match base {
@@ -993,7 +1158,7 @@ impl Vm {
                         .into())
                     }
                 };
-                let rhs = self.eval_value(st, &cmd.windows[1].payload)?;
+                let rhs = self.eval_window(st, &cmd.windows[1])?;
                 let v = rhs.as_int().unwrap_or(0);
                 self.input_state_mut().set_pad_counter(code, v, is_num);
                 return Ok(StepOutcome::Continue);
@@ -1019,7 +1184,7 @@ impl Vm {
             )
             .into());
         }
-        let rhs = self.eval_value(st, &cmd.windows[1].payload)?;
+        let rhs = self.eval_window(st, &cmd.windows[1])?;
         let code = (cmd.windows[0].rec.slot >> 8) as u8;
         let value = if code == 0 {
             rhs
@@ -1048,22 +1213,19 @@ impl Vm {
         let target = self.decl_target(st, &cmd.windows[0])?;
         let dims: Vec<usize> = target.iter().map(|&d| d.max(0) as usize).collect();
         let init = match cmd.windows.get(1) {
-            Some(w) if !w.payload.is_empty() => self.eval_value(st, &w.payload)?,
+            Some(w) if !w.payload.is_empty() => self.eval_window(st, w)?,
             _ => ty.default_value(),
         };
-        self.store.declare(target_var(&cmd.windows[0])?, ty, &dims, &init);
+        self.store
+            .declare(target_var(&cmd.windows[0])?, ty, &dims, &init);
         let _ = st;
         Ok(StepOutcome::Continue)
     }
 
     /// 声明命令的变量窗口:引用 + 可选各维长度。
-    fn decl_target(
-        &mut self,
-        st: &ExecState,
-        w: &CmdWindow,
-    ) -> Result<Vec<i64>, VmError> {
+    fn decl_target(&mut self, st: &ExecState, w: &CmdWindow) -> Result<Vec<i64>, VmError> {
         // 单条变量指令 = 标量;含 `0x29` = 数组(前导值 = 各维长度)。
-        let lv = self.eval_lvalue(st, &w.payload)?;
+        let lv = self.eval_lvalue_window(st, w)?;
         Ok(lv.indices.into_vec())
     }
 
@@ -1079,10 +1241,10 @@ impl Vm {
                 continue;
             }
             match w.rec.kind {
-                0 => set = Some(self.eval_lvalue(st, &w.payload)?),
-                1 => target = Some(self.eval_lvalue(st, &w.payload)?),
+                0 => set = Some(self.eval_lvalue_window(st, w)?),
+                1 => target = Some(self.eval_lvalue_window(st, w)?),
                 slot => {
-                    let v = self.eval_value(st, &w.payload)?;
+                    let v = self.eval_window(st, w)?;
                     if let Some(n) = v.as_int() {
                         flags.push((slot, n));
                         if op.is_none() && n != 0 && !matches!(slot, 17..=20) {
@@ -1176,24 +1338,14 @@ impl Vm {
                     .into());
                 }
                 let start = flags_get(&flags, 20).unwrap_or(0).max(0);
-                let n = dims[0] as i64;
-                let mut found = -1i64;
-                for i in start..n {
-                    let v = self.read_var(st, set_var, &[i])?;
-                    let hit = match (&need, &v) {
-                        (None, _) => false,
-                        (Some(want), got) => match ty {
-                            ElemType::Str => {
-                                matches!((want, got), (Value::Str(a), Value::Str(b)) if a == b)
-                            }
-                            _ => want.as_f64() == got.as_f64(),
-                        },
-                    };
-                    if hit {
-                        found = i;
-                        break;
-                    }
-                }
+                let found = match &need {
+                    Some(want) => self
+                        .store
+                        .search_1d(set_var, start as usize, want, ty)
+                        .map(|index| index as i64)
+                        .unwrap_or(-1),
+                    None => -1,
+                };
                 Value::Int(found)
             }
             other => {
@@ -1240,6 +1392,13 @@ impl Vm {
 
     /// `VARACT`:手册 `variable/varact.html`;引擎 §3.26。
     fn op_varact(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        self.varact_calls = self.varact_calls.saturating_add(1);
+        if self.prof_commands {
+            *self
+                .prof_varact_sites
+                .entry((self.cur_script, self.cur_pc))
+                .or_insert(0) += 1;
+        }
         let mut set: Option<crate::expr::LValue> = None;
         let mut letv: Option<crate::expr::LValue> = None;
         let mut flags: Vec<(u8, i64)> = Vec::new();
@@ -1248,10 +1407,10 @@ impl Vm {
                 continue;
             }
             match w.rec.kind {
-                0 => set = Some(self.eval_lvalue(st, &w.payload)?),
-                1 => letv = Some(self.eval_lvalue(st, &w.payload)?),
+                0 => set = Some(self.eval_lvalue_window(st, w)?),
+                1 => letv = Some(self.eval_lvalue_window(st, w)?),
                 slot => {
-                    let v = self.eval_value(st, &w.payload)?;
+                    let v = self.eval_window(st, w)?;
                     if let Some(n) = v.as_int() {
                         flags.push((slot, n));
                     }
@@ -1283,8 +1442,15 @@ impl Vm {
             }
         }
         let flag = |slot: u8| flags.iter().find(|(s, _)| *s == slot).map(|(_, v)| *v);
-        let num = |slot: u8| flags.iter().find(|(s, _)| *s == slot).map(|(_, v)| *v).unwrap_or(0);
+        let num = |slot: u8| {
+            flags
+                .iter()
+                .find(|(s, _)| *s == slot)
+                .map(|(_, v)| *v)
+                .unwrap_or(0)
+        };
         if flag(6).unwrap_or(0) != 0 {
+            self.varact_type_calls = self.varact_type_calls.saturating_add(1);
             // TYPE:按目标类型转换(手册例 1/2;§3.22)。
             let target = letv.ok_or_else(|| {
                 diag::fatal(code::rt::CMD_SLOT, Boundary::Script, "VARACT TYPE 缺 LET")
@@ -1321,6 +1487,7 @@ impl Vm {
         // 这是 ERIS 启动链的硬依赖(`es_SoundDefine` 之类在初始化时
         // `VARACT[INIT=1 G_*]` 把全局表恢复成初值)。
         if flag(16).is_some() || (17..=28).any(|s| flag(s).is_some()) {
+            self.varact_init_calls = self.varact_init_calls.saturating_add(1);
             if flag(16).unwrap_or(0) == 0 {
                 // 无 INIT:引擎同位置 `je` 到函数尾 —— 什么都不做。
                 return Ok(StepOutcome::Continue);
@@ -1355,7 +1522,12 @@ impl Vm {
             // 手册例 9/10:`DIMSIZE=500`(绝对值)/ `DIMSIZE+=1`(相对值)。
             // 语料实测 **104/104 都是 `+=`**,复合码在窗口 `slot` 高字节
             // (与 `LET` 同一编码:0== 1+= 2-= …)。
-            let code = (cmd.windows.iter().find(|w| w.rec.kind == 13).map(|w| w.rec.slot >> 8).unwrap_or(0)) as u8;
+            let code = (cmd
+                .windows
+                .iter()
+                .find(|w| w.rec.kind == 13)
+                .map(|w| w.rec.slot >> 8)
+                .unwrap_or(0)) as u8;
             let operand = num(13);
             let (ty, dims) = self.var_shape(set_var).ok_or_else(|| {
                 diag::unimplemented(
@@ -1408,7 +1580,11 @@ impl Vm {
             return Ok(StepOutcome::Continue);
         }
         let target = letv.ok_or_else(|| {
-            diag::fatal(code::rt::CMD_SLOT, Boundary::Script, "VARACT 缺 LET(目标变量)")
+            diag::fatal(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                "VARACT 缺 LET(目标变量)",
+            )
         })?;
         let src = self.read_var(st, set_var, &set.indices)?;
         let Value::Str(bytes) = src else {
@@ -1420,29 +1596,37 @@ impl Vm {
             .into());
         };
         let out;
+        self.varact_bytes = self.varact_bytes.saturating_add(bytes.len() as u64);
         if flag(3).unwrap_or(0) != 0 || flag(2).unwrap_or(0) != 0 {
             let pos = num(4).max(1) as usize;
             let len = num(5).max(0) as usize;
             out = if flag(3).unwrap_or(0) != 0 {
+                self.varact_ops[0] = self.varact_ops[0].saturating_add(1);
                 copy_chars(&bytes, pos, len)
             } else {
+                self.varact_ops[1] = self.varact_ops[1].saturating_add(1);
                 cut_chars(&bytes, pos, len)
             };
         } else if flag(7).unwrap_or(0) != 0 {
+            self.varact_ops[2] = self.varact_ops[2].saturating_add(1);
             out = ascii_case(&bytes, true);
         } else if flag(8).unwrap_or(0) != 0 {
+            self.varact_ops[3] = self.varact_ops[3].saturating_add(1);
             out = fullwidth_case(&bytes, true);
         } else if flag(9).unwrap_or(0) != 0 {
+            self.varact_ops[4] = self.varact_ops[4].saturating_add(1);
             out = ascii_case(&bytes, false);
         } else if flag(10).unwrap_or(0) != 0 {
+            self.varact_ops[5] = self.varact_ops[5].saturating_add(1);
             out = fullwidth_case(&bytes, false);
-        } else if flag(11).unwrap_or(0) != 0 || flag(12).unwrap_or(0) != 0 {
-            return Err(diag::unimplemented(
-                code::rt::CMD_UNIMPLEMENTED,
-                Boundary::Script,
-                "VARACT HANTOZEN/ZENTOHAN 依赖引擎二进制转换表(0x808840/0x5B5170/0x5B5230),未移植(DIV-RT-013)",
-            )
-            .into());
+        } else if flag(11).unwrap_or(0) != 0 {
+            self.varact_ops[6] = self.varact_ops[6].saturating_add(1);
+            // 半角→全角:表/算法逐条见 `crate::case_tables`(0x4546aa..)。
+            out = crate::case_tables::hantozen(&bytes);
+        } else if flag(12).unwrap_or(0) != 0 {
+            self.varact_ops[7] = self.varact_ops[7].saturating_add(1);
+            // 全角→半角:0x4548cf.. / 0x46b395。
+            out = crate::case_tables::zentohan(&bytes);
         } else {
             return Err(diag::unimplemented(
                 code::rt::CMD_UNIMPLEMENTED,
@@ -1464,43 +1648,43 @@ impl Vm {
     /// 算法逐条照旁线 §3.26 ④(0.495 处理体 `0x455b60`):
     /// ① 只收 `kind == 1`(全局);② 按 `(值类型, 组号)` 查掩码,位为 0 则否决;
     /// ③ 组号超出 1..=4 时无否决项 ⇒ 照常恢复;④ 整槽重建(声明 + 类型 + 维数 + 初值)。
-    fn restore_globals(
-        &mut self,
-        st: &ExecState,
-        masks: &[u8; 3],
-    ) -> Result<(), VmError> {
+    fn restore_globals(&mut self, st: &ExecState, masks: &[u8; 3]) -> Result<(), VmError> {
         let _ = st;
-        let records: Vec<_> = self
-            .tables
-            .boot
-            .vars
-            .records
-            .iter()
-            .filter(|r| r.kind == 1)
-            .cloned()
-            .collect();
-        for r in records {
+        // 记忆化:同一掩码组合、且自上次恢复以来 `VariableStore` 没有任何
+        // 写入/声明/改长度 ⇒ 状态已经等于恢复结果,重复恢复可安全跳过。
+        // (启动脚本会在紧循环里对同一组掩码调用数万次。)
+        let key =
+            usize::from(masks[0]) | (usize::from(masks[1]) << 4) | (usize::from(masks[2]) << 8);
+        let generation = self.store.generation();
+        if self
+            .last_global_restore
+            .get(key)
+            .copied()
+            .flatten()
+            .is_some_and(|last| last == generation)
+        {
+            self.restore_skips = self.restore_skips.saturating_add(1);
+            return Ok(());
+        }
+        let mut rows = 0u64;
+        // 启动期已投影好 `(var, ty, dims, init, group, family)`;这里不再
+        // 逐次 clone ysv 记录/解码字符串初值。
+        for g in &self.globals_restore {
             // 掩码位 = 组号 - 1;组号 0 或 >4 没有否决项。
-            if (1..=4).contains(&r.group) {
-                let family = match r.value_type {
-                    2 => 1usize,
-                    3 => 2usize,
-                    _ => 0usize,
-                };
-                let bit = 1u8 << (r.group - 1);
-                if masks[family] & bit == 0 {
+            if (1..=4).contains(&g.group) {
+                let bit = 1u8 << (g.group - 1);
+                if masks[g.family] & bit == 0 {
                     continue;
                 }
             }
-            let Some(ty) = r.elem_type() else { continue };
-            if r.var_id < self.sys_count {
-                continue; // 系统变量镜像:由运行核按语义计算
-            }
-            let dims: Vec<usize> = r.dims.iter().map(|&d| d as usize).collect();
-            let init = r.init_value().unwrap_or_else(|| ty.default_value());
-            // 整槽重建(引擎 `0x455d8a`:写描述符 + 重建存储 + 写初值)。
-            self.store
-                .declare(VarRef::new(VarSpace::for_elem(ty), r.var_id), ty, &dims, &init);
+            rows += 1;
+            // 整槽重建(引擎 `0x455d8a`);类型/维数不变时复用存储,
+            // 可观察状态与重建一致。
+            self.store.reset_declared(g.var, g.ty, &g.dims, &g.init);
+        }
+        self.restore_rows = self.restore_rows.saturating_add(rows);
+        if let Some(slot) = self.last_global_restore.get_mut(key) {
+            *slot = Some(self.store.generation());
         }
         Ok(())
     }
@@ -1517,44 +1701,7 @@ impl Vm {
     }
 
     fn shift_1d(&mut self, var: VarRef, pos: usize, push: bool) -> Result<(), VmError> {
-        let Some((ty, dims)) = self.store.shape(var) else {
-            return Err(diag::unimplemented(
-                code::rt::VAR_UNDECLARED,
-                Boundary::Script,
-                format!("PUSH/POP 目标未声明 {}", var.display()),
-            )
-            .into());
-        };
-        if dims.len() != 1 {
-            return Err(diag::fatal(
-                code::rt::VAR_SHAPE,
-                Boundary::Script,
-                "PUSH/POP 只支持一维数组",
-            )
-            .into());
-        }
-        let n = dims[0];
-        let name: Vec<Value> = (0..n as i64)
-            .map(|i| self.store.read(var, &[i]).unwrap_or_else(|_| ty.default_value()))
-            .collect();
-        let mut out = name.clone();
-        if n > 0 {
-            let p = pos.min(n - 1);
-            if push {
-                for i in (p + 1..n).rev() {
-                    out[i] = name[i - 1].clone();
-                }
-                out[p] = ty.default_value();
-            } else {
-                for i in p..n - 1 {
-                    out[i] = name[i + 1].clone();
-                }
-                out[n - 1] = ty.default_value();
-            }
-        }
-        for (i, v) in out.into_iter().enumerate() {
-            self.store.write(var, &[i as i64], &v)?;
-        }
+        self.store.shift_1d(var, pos, push)?;
         Ok(())
     }
 
@@ -1571,9 +1718,9 @@ impl Vm {
                 continue;
             }
             match w.rec.kind {
-                0 => target = Some(self.eval_lvalue(st, &w.payload)?.var),
-                1 => set = self.eval_value(st, &w.payload)?.as_f64().unwrap_or(0.0),
-                2 => set2 = self.eval_value(st, &w.payload)?.as_f64().unwrap_or(0.0),
+                0 => target = Some(self.eval_lvalue_window(st, w)?.var),
+                1 => set = self.eval_window(st, w)?.as_f64().unwrap_or(0.0),
+                2 => set2 = self.eval_window(st, w)?.as_f64().unwrap_or(0.0),
                 3 => {
                     return Err(diag::unimplemented(
                         code::rt::CMD_UNIMPLEMENTED,
@@ -1583,16 +1730,15 @@ impl Vm {
                     .into())
                 }
                 slot => {
-                    let v = self.eval_value(st, &w.payload)?;
+                    let v = self.eval_window(st, w)?;
                     if v.as_int().unwrap_or(0) != 0 {
                         flags.push(slot);
                     }
                 }
             }
         }
-        let target = target.ok_or_else(|| {
-            diag::fatal(code::rt::CMD_SLOT, Boundary::Script, "MATH 缺 LET")
-        })?;
+        let target = target
+            .ok_or_else(|| diag::fatal(code::rt::CMD_SLOT, Boundary::Script, "MATH 缺 LET"))?;
         let Some(slot) = flags.first().copied() else {
             self.store.write(target, &[], &Value::Float(set))?;
             return Ok(StepOutcome::Continue);
@@ -1617,12 +1763,18 @@ impl Vm {
             "LOG10" => set.log10(),
             "POW" => set.powf(set2),
             "RND" => {
-                return Err(diag::unimplemented(
-                    code::rt::CMD_UNIMPLEMENTED,
-                    Boundary::Script,
-                    "MATH[RND] 引擎用 MT19937(§3.20),种子来源未取证;需注入 RNG(DIV-RT-014)",
-                )
-                .into())
+                // REA `0x448571..0x4485b7`:SET/SET2 取 64 位整数,反向时交换,
+                // `rand32 % (max-min+1)` 再加 min;手册例 17 `SET=1 SET2=9`。
+                let a = set.trunc() as i64;
+                let b = set2.trunc() as i64;
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                let span = (hi as i128 - lo as i128 + 1) as u128;
+                let r = if span == 0 {
+                    0
+                } else {
+                    u128::from(self.rng.next_u32()) % span
+                };
+                (lo as i128 + r as i128) as f64
             }
             other => {
                 return Err(diag::fatal(
@@ -1674,22 +1826,20 @@ impl Vm {
             }
             match w.rec.kind {
                 0 => {
-                    if let Value::Str(bytes) = self.eval_value(st, &w.payload)? {
+                    if let Value::Str(bytes) = self.eval_window(st, w)? {
                         id = Some(cp932_lossy(&bytes));
                     }
                 }
-                1 => enabled = self.eval_value(st, &w.payload)?.as_int().unwrap_or(1) != 0,
-                3 => priority = self.eval_value(st, &w.payload)?.as_int().unwrap_or(1),
+                1 => enabled = self.eval_window(st, w)?.as_int().unwrap_or(1) != 0,
+                3 => priority = self.eval_window(st, w)?.as_int().unwrap_or(1),
                 slot @ 4..=13 => {
-                    tints[(slot - 4) as usize] =
-                        self.eval_value(st, &w.payload)?.as_int().unwrap_or(0);
+                    tints[(slot - 4) as usize] = self.eval_window(st, w)?.as_int().unwrap_or(0);
                 }
                 slot @ 14..=23 => {
-                    tflts[(slot - 14) as usize] =
-                        self.eval_value(st, &w.payload)?.as_f64().unwrap_or(0.0);
+                    tflts[(slot - 14) as usize] = self.eval_window(st, w)?.as_f64().unwrap_or(0.0);
                 }
                 slot @ 24..=33 => {
-                    if let Value::Str(bytes) = self.eval_value(st, &w.payload)? {
+                    if let Value::Str(bytes) = self.eval_window(st, w)? {
                         tstrs[(slot - 24) as usize] = bytes;
                     }
                 }
@@ -1697,7 +1847,7 @@ impl Vm {
                 // 事実上のスクリプト位置ロード)。blob 由 TASKINFO[SCRIPTPOS]
                 // 产出,脚本视为不透明数据;本实现 blob = [script_id u32][pc u32]。
                 35 => {
-                    if let Value::Str(bytes) = self.eval_value(st, &w.payload)? {
+                    if let Value::Str(bytes) = self.eval_window(st, w)? {
                         if bytes.len() == 8 {
                             script_pos = Some((
                                 u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
@@ -1707,7 +1857,7 @@ impl Vm {
                     }
                 }
                 34 => {
-                    if let Value::Str(bytes) = self.eval_value(st, &w.payload)? {
+                    if let Value::Str(bytes) = self.eval_window(st, w)? {
                         label = Some(self.find_label(&bytes).ok_or_else(|| {
                             diag::fatal(
                                 code::rt::LABEL,
@@ -1721,7 +1871,9 @@ impl Vm {
                     return Err(diag::unimplemented(
                         code::rt::CMD_UNIMPLEMENTED,
                         Boundary::Script,
-                        format!("TASK 参数序号 {slot}(SCRIPTPOS/TEXTPOS/RESTART 等)未实现(DIV-RT-015)"),
+                        format!(
+                            "TASK 参数序号 {slot}(SCRIPTPOS/TEXTPOS/RESTART 等)未实现(DIV-RT-015)"
+                        ),
                     )
                     .into())
                 }
@@ -1809,7 +1961,7 @@ impl Vm {
                 continue;
             }
             if w.rec.kind == 0 {
-                if let Value::Str(bytes) = self.eval_value(st, &w.payload)? {
+                if let Value::Str(bytes) = self.eval_window(st, w)? {
                     id = Some(cp932_lossy(&bytes));
                 }
             }
@@ -1851,13 +2003,13 @@ impl Vm {
             }
             match w.rec.kind {
                 0 => {
-                    if let Value::Str(bytes) = self.eval_value(st, &w.payload)? {
+                    if let Value::Str(bytes) = self.eval_window(st, w)? {
                         id = Some(cp932_lossy(&bytes));
                     }
                 }
-                1 => target = Some(self.eval_lvalue(st, &w.payload)?),
+                1 => target = Some(self.eval_lvalue_window(st, w)?),
                 slot => {
-                    let v = self.eval_value(st, &w.payload)?;
+                    let v = self.eval_window(st, w)?;
                     if let Some(n) = v.as_int() {
                         ops.push((slot, n));
                     }
@@ -1917,10 +2069,7 @@ impl Vm {
             // スクリプト位置情報)。脚本视为不透明 blob;本实现 = 8 字节
             // [script_id u32 LE][pc u32 LE],与 `TASK[SCRIPTPOS=…]` 配对往返。
             19 => {
-                let (sid, pc) = exec
-                    .as_ref()
-                    .map(|e| (e.script_id, e.pc))
-                    .unwrap_or((0, 0));
+                let (sid, pc) = exec.as_ref().map(|e| (e.script_id, e.pc)).unwrap_or((0, 0));
                 let mut b = Vec::with_capacity(8);
                 b.extend_from_slice(&sid.to_le_bytes());
                 b.extend_from_slice(&pc.to_le_bytes());
@@ -1969,12 +2118,12 @@ impl Vm {
                 continue;
             }
             match w.rec.kind {
-                5 => target = Some(self.eval_lvalue(st, &w.payload)?),
+                5 => target = Some(self.eval_lvalue_window(st, w)?),
                 4 => {
-                    no = self.eval_value(st, &w.payload)?.as_int();
+                    no = self.eval_window(st, w)?.as_int();
                 }
                 0..=3 => {
-                    let v = self.eval_value(st, &w.payload)?;
+                    let v = self.eval_window(st, w)?;
                     want[w.rec.kind as usize] = v.as_int().unwrap_or(0) != 0;
                 }
                 _ => {}
@@ -2043,7 +2192,8 @@ impl Vm {
                 .map(|(_, _, v)| v.clone())
         };
         let flag = |name: &str| get(name).and_then(|v| v.as_int()).map(|v| v != 0);
-        self.input.apply_input(flag("KEY"), flag("PAD"), flag("MOUSE"));
+        self.input
+            .apply_input(flag("KEY"), flag("PAD"), flag("MOUSE"));
         self.emit_domain_from_values("INPUT", Domain::System, &vals);
         Ok(StepOutcome::Continue)
     }
@@ -2114,7 +2264,7 @@ impl Vm {
                 .get(usize::from(w.rec.kind))
                 .cloned()
                 .unwrap_or_default();
-            let value = self.eval_value(st, &w.payload)?;
+            let value = self.eval_window(st, w)?;
             out.push((w.rec.kind, name, value));
         }
         Ok(out)
@@ -2130,12 +2280,7 @@ impl Vm {
             .iter()
             .map(|(slot, _, value)| ArgValue::new(*slot, value.clone()))
             .collect();
-        self.emit(VmEvent::DomainCall {
-            frame: self.frame(),
-            domain,
-            name: name.to_string(),
-            args,
-        });
+        self.emit_domain(domain, name.to_string(), args);
     }
 
     /// `FILEINFO`:文件域查询。**只实现 `EXIST=1 FILE=... LET=...`**。
@@ -2174,9 +2319,9 @@ impl Vm {
                 .map(String::as_str)
                 .unwrap_or("");
             match name {
-                "LET" => target = Some(self.eval_lvalue(st, &w.payload)?),
+                "LET" => target = Some(self.eval_lvalue_window(st, w)?),
                 "FILE" | "FOLDER" => {
-                    if let Ok(v) = self.eval_value(st, &w.payload) {
+                    if let Ok(v) = self.eval_window(st, w) {
                         if let Value::Str(bytes) = &v {
                             if name == "FILE" {
                                 file = Some(bytes.clone());
@@ -2188,25 +2333,20 @@ impl Vm {
                     }
                 }
                 "EXIST" => {
-                    if let Ok(v) = self.eval_value(st, &w.payload) {
+                    if let Ok(v) = self.eval_window(st, w) {
                         exist = v.as_f64().map(|n| n != 0.0).unwrap_or(false);
                         args.push(ArgValue::new(w.rec.kind, v));
                     }
                 }
                 _ => {
-                    if let Ok(v) = self.eval_value(st, &w.payload) {
+                    if let Ok(v) = self.eval_window(st, w) {
                         args.push(ArgValue::new(w.rec.kind, v));
                     }
                 }
             }
         }
         // 事件流保持与实现前一致(File 域;宿主忽略 FILEINFO 本身)。
-        self.emit(VmEvent::DomainCall {
-            frame: self.frame(),
-            domain: Domain::File,
-            name: "FILEINFO".to_string(),
-            args,
-        });
+        self.emit_domain(Domain::File, "FILEINFO", args);
         if !exist || target.is_none() || folder.is_some() {
             self.report_unimplemented(
                 "FILEINFO",
@@ -2215,19 +2355,12 @@ impl Vm {
             return Ok(StepOutcome::Continue);
         }
         let Some(bytes) = file else {
-            self.report_unimplemented(
-                "FILEINFO",
-                "EXIST=1 缺 FILE(FOLDER 查询未取证)".to_string(),
-            );
+            self.report_unimplemented("FILEINFO", "EXIST=1 缺 FILE(FOLDER 查询未取证)".to_string());
             return Ok(StepOutcome::Continue);
         };
         let present = match yu_vfs::LookupKey::new(&bytes, yu_vfs::Codec::Cp932) {
             Ok(key) => {
-                self.src.exists(&key)
-                    || self
-                        .aux
-                        .as_ref()
-                        .is_some_and(|aux| aux.exists(&key))
+                self.src.exists(&key) || self.aux.as_ref().is_some_and(|aux| aux.exists(&key))
             }
             Err(diag) => {
                 self.report(diag);
@@ -2301,7 +2434,10 @@ impl Vm {
             return Err(diag::fatal(
                 code::rt::CMD_WINDOWS,
                 Boundary::Script,
-                format!("MATH3D 需要 INT+FLT 两个数组窗口,得到 {}", cmd.windows.len()),
+                format!(
+                    "MATH3D 需要 INT+FLT 两个数组窗口,得到 {}",
+                    cmd.windows.len()
+                ),
             )
             .into());
         }
@@ -2311,10 +2447,8 @@ impl Vm {
             if w.rec.length == 0 {
                 continue;
             }
-            let name = self
-                .param_name(cmd.opcode, w.rec.kind)
-                .unwrap_or_default();
-            let var = self.eval_lvalue(st, &w.payload)?.var;
+            let name = self.param_name(cmd.opcode, w.rec.kind).unwrap_or_default();
+            let var = self.eval_lvalue_window(st, w)?.var;
             match name.as_str() {
                 "INT" => int_var = Some(var),
                 "FLT" => flt_var = Some(var),
@@ -2350,8 +2484,7 @@ impl Vm {
         let wsx = rd_i(&self.store, 5) as f64;
         let wsy = rd_i(&self.store, 6) as f64;
         let tip = rd_i(&self.store, 7);
-        let (x, y, zx, zy) =
-            math3d_project(i1, i2, i4, wsx, wsy, tip, &|n| rd_f(&self.store, n));
+        let (x, y, zx, zy) = math3d_project(i1, i2, i4, wsx, wsy, tip, &|n| rd_f(&self.store, n));
         let out_ty = self
             .store
             .shape(flt_var)
@@ -2401,10 +2534,10 @@ impl Vm {
                 .map(String::as_str)
                 .unwrap_or("");
             if pname == "LET" {
-                targets.push(self.eval_lvalue(st, &w.payload)?);
+                targets.push(self.eval_lvalue_window(st, w)?);
                 continue;
             }
-            if let Ok(v) = self.eval_value(st, &w.payload) {
+            if let Ok(v) = self.eval_window(st, w) {
                 args.push(ArgValue::new(w.rec.kind, v));
             }
         }
@@ -2415,12 +2548,7 @@ impl Vm {
         } else {
             Domain::Graphics
         };
-        self.emit(VmEvent::DomainCall {
-            frame: self.frame(),
-            domain,
-            name: name.to_string(),
-            args: args.clone(),
-        });
+        self.emit_domain(domain, name.to_string(), args.clone());
         if targets.is_empty() {
             self.report(diag::recoverable(
                 code::rt::CMD_SLOT,
@@ -2454,33 +2582,28 @@ impl Vm {
                 // 时不猜序号,按“尺寸不可得”继续(仍走原诊断)。
                 let mut resolved = None;
                 if name == "CGINFO" && wanted.is_some() {
-                    let slot_of = |want: &str| {
-                        params
-                            .iter()
-                            .position(|p| p == want)
-                            .map(|i| i as u8)
-                    };
-                    if let (Some(mfile_slot), Some(id_slot)) =
-                        (slot_of("MFILE"), slot_of("ID"))
-                    {
+                    let slot_of =
+                        |want: &str| params.iter().position(|p| p == want).map(|i| i as u8);
+                    if let (Some(mfile_slot), Some(id_slot)) = (slot_of("MFILE"), slot_of("ID")) {
                         let idno_slot = slot_of("IDNO");
                         let mut ask: Vec<ArgValue> = args
                             .iter()
-                            .filter(|a| {
-                                a.slot == id_slot || Some(a.slot) == idno_slot
-                            })
+                            .filter(|a| a.slot == id_slot || Some(a.slot) == idno_slot)
                             .cloned()
                             .collect();
                         ask.push(ArgValue::new(mfile_slot, Value::Int(1)));
                         if let Ok(Value::Str(key)) = host.query("CGINFO", &ask) {
-                        if !key.is_empty() {
-                            if let Some((w, h)) = self.resolve_asset_size(&key) {
-                                host.note_asset_size(&key, w, h);
-                                resolved = Some(Value::Int(i64::from(
-                                    if wanted == Some("SX") { w } else { h },
-                                )));
+                            if !key.is_empty() {
+                                if let Some((w, h)) = self.resolve_asset_size(&key) {
+                                    host.note_asset_size(&key, w, h);
+                                    resolved =
+                                        Some(Value::Int(i64::from(if wanted == Some("SX") {
+                                            w
+                                        } else {
+                                            h
+                                        })));
+                                }
                             }
-                        }
                         }
                     }
                 }
@@ -2529,19 +2652,14 @@ impl Vm {
                 .map(String::as_str)
                 .unwrap_or("");
             if pname == "LET" {
-                targets.push(self.eval_lvalue(st, &w.payload)?);
+                targets.push(self.eval_lvalue_window(st, w)?);
                 continue;
             }
-            if let Ok(v) = self.eval_value(st, &w.payload) {
+            if let Ok(v) = self.eval_window(st, w) {
                 args.push(ArgValue::new(w.rec.kind, v));
             }
         }
-        self.emit(VmEvent::DomainCall {
-            frame: self.frame(),
-            domain: Domain::Sound,
-            name: "SOUNDINFO".to_string(),
-            args: args.clone(),
-        });
+        self.emit_domain(Domain::Sound, "SOUNDINFO", args.clone());
         if targets.is_empty() {
             self.report(diag::recoverable(
                 code::rt::CMD_SLOT,
@@ -2609,7 +2727,7 @@ impl Vm {
                 .get(usize::from(w.rec.kind))
                 .cloned()
                 .unwrap_or_default();
-            let v = self.eval_value(st, &w.payload)?;
+            let v = self.eval_window(st, w)?;
             vals.push((name, v));
         }
         let get = |n: &str| {
@@ -2627,8 +2745,7 @@ impl Vm {
                     self.text_layer_id.clear();
                     self.report_unimplemented(
                         "TEXT",
-                        "TEXT[ID] 为非 UTF-8 CP932 ID:事件字符串无法承载,保持空"
-                            .to_string(),
+                        "TEXT[ID] 为非 UTF-8 CP932 ID:事件字符串无法承载,保持空".to_string(),
                     );
                 }
             }
@@ -2638,10 +2755,13 @@ impl Vm {
             self.text.set_output_mode(v.as_int().unwrap_or(0));
         }
         // p2..p9 CLICKBUTTON1..4 / SKIPBUTTON1..4。
-        const CLICK_BUTTONS: [&str; 4] =
-            ["CLICKBUTTON", "CLICKBUTTON2", "CLICKBUTTON3", "CLICKBUTTON4"];
-        const SKIP_BUTTONS: [&str; 4] =
-            ["SKIPBUTTON", "SKIPBUTTON2", "SKIPBUTTON3", "SKIPBUTTON4"];
+        const CLICK_BUTTONS: [&str; 4] = [
+            "CLICKBUTTON",
+            "CLICKBUTTON2",
+            "CLICKBUTTON3",
+            "CLICKBUTTON4",
+        ];
+        const SKIP_BUTTONS: [&str; 4] = ["SKIPBUTTON", "SKIPBUTTON2", "SKIPBUTTON3", "SKIPBUTTON4"];
         for (i, name) in CLICK_BUTTONS.iter().enumerate() {
             if let Some(v) = get(name) {
                 crate::text::TextState::set_button(
@@ -2734,7 +2854,7 @@ impl Vm {
                 .cloned()
                 .unwrap_or_default();
             if name == "LET" {
-                target = Some(self.eval_lvalue(st, &w.payload)?);
+                target = Some(self.eval_lvalue_window(st, w)?);
             } else if !name.is_empty() {
                 // 引擎只检查槽位是否存在(0x4538fa..),不求值查询标志本身。
                 present.push(name);
@@ -2748,8 +2868,15 @@ impl Vm {
             ));
             return Ok(StepOutcome::Continue);
         };
-        for name in ["OUTPUTMODE", "CX", "CY", "CLICK", "AUTORETURN", "AUTOPAGE", "AUTOCLICK"]
-        {
+        for name in [
+            "OUTPUTMODE",
+            "CX",
+            "CY",
+            "CLICK",
+            "AUTORETURN",
+            "AUTOPAGE",
+            "AUTOCLICK",
+        ] {
             if !present.iter().any(|n| n == name) {
                 continue;
             }
@@ -2782,7 +2909,7 @@ impl Vm {
             if w.rec.length == 0 {
                 continue;
             }
-            let v = self.eval_value(st, &w.payload)?;
+            let v = self.eval_window(st, w)?;
             let bytes = match v.cast_to_str()? {
                 Value::Str(b) => b,
                 _ => Vec::new(),
@@ -2810,12 +2937,9 @@ impl Vm {
     fn op_word(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         let _ = st;
         let Some(w) = cmd.windows.first() else {
-            return Err(diag::fatal(
-                code::rt::CMD_WINDOWS,
-                Boundary::Script,
-                "WORD 缺文本窗口",
-            )
-            .into());
+            return Err(
+                diag::fatal(code::rt::CMD_WINDOWS, Boundary::Script, "WORD 缺文本窗口").into(),
+            );
         };
         self.append_text(&w.payload);
         self.emit(VmEvent::Text {
@@ -2871,8 +2995,389 @@ impl Vm {
             self.text.clear_pending = true;
         }
         self.text.push_flag(tflag::END);
-        self.emit(VmEvent::ReturnCode { frame: self.frame(), line });
+        self.emit(VmEvent::ReturnCode {
+            frame: self.frame(),
+            line,
+        });
         Ok(StepOutcome::TextYield)
+    }
+
+    /// `CLIPACT[TEXT=… SET=…]`:手册 `clip/clipact.html`。
+    ///
+    /// REA `0x43e2d0`:**两个参数都必须存在**(`TEXT` 只判存在、不看值),
+    /// 然后把 `SET` 的字节原样写入 Windows 剪贴板(CF_TEXT)。内核保存
+    /// 同一份 CP932 字节镜像并同步发域事件,由宿主写入 OS 剪贴板。
+    fn op_clipact(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let params = self.param_names(cmd.opcode);
+        let mut text_present = false;
+        let mut set: Option<Vec<u8>> = None;
+        let mut args: Vec<ArgValue> = Vec::new();
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let pname = params
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or("");
+            match pname {
+                "TEXT" => {
+                    text_present = true;
+                    if let Ok(v) = self.eval_window(st, w) {
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                "SET" => {
+                    let v = self.eval_window(st, w)?;
+                    let Value::Str(bytes) = v else {
+                        return Err(diag::unimplemented(
+                            code::rt::VAR_TYPE,
+                            Boundary::Script,
+                            "CLIPACT[SET] 的表达式不是字符串(类型强制未取证;DIV-RT-045)"
+                                .to_string(),
+                        )
+                        .into());
+                    };
+                    args.push(ArgValue::new(w.rec.kind, Value::Str(bytes.clone())));
+                    set = Some(bytes);
+                }
+                other => {
+                    return Err(diag::unimplemented(
+                        code::rt::CMD_UNIMPLEMENTED,
+                        Boundary::Script,
+                        format!("CLIPACT 参数 {other} 未在官方处理体中出现;DIV-RT-045"),
+                    )
+                    .into())
+                }
+            }
+        }
+        // REA `0x43e2ec..0x43e31a`:TEXT 与 SET 缺一即返回 0(什么都不做)。
+        if !text_present || set.is_none() {
+            return Ok(StepOutcome::Continue);
+        }
+        self.clipboard = set.unwrap_or_default();
+        self.emit_domain(Domain::System, "CLIPACT", args);
+        Ok(StepOutcome::Continue)
+    }
+
+    /// `CLIPINFO[TEXT=1 LET=$S]`:手册 `clip/clipinfo.html`。
+    ///
+    /// REA `0x43e410`:仅当 `TEXT` 存在时读取剪贴板;逐字符按 CP932 前导
+    /// 字节表(`0x5b40c0`)定长拷贝,并**丢弃所有 `< 0x20` 的字节**
+    /// (`0x43e4d2..0x43e54d`);结果写入 `LET`(字符串变量)。
+    fn op_clipinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let params = self.param_names(cmd.opcode);
+        let mut text_present = false;
+        let mut target: Option<crate::expr::LValue> = None;
+        let mut args: Vec<ArgValue> = Vec::new();
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let pname = params
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or("");
+            match pname {
+                "TEXT" => {
+                    text_present = true;
+                    if let Ok(v) = self.eval_window(st, w) {
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                "LET" => target = Some(self.eval_lvalue_window(st, w)?),
+                other => {
+                    return Err(diag::unimplemented(
+                        code::rt::CMD_UNIMPLEMENTED,
+                        Boundary::Script,
+                        format!("CLIPINFO 参数 {other} 未在官方处理体中出现;DIV-RT-045"),
+                    )
+                    .into())
+                }
+            }
+        }
+        self.emit_domain(Domain::System, "CLIPINFO", args);
+        // TEXT 缺席 ⇒ 官方直接返回 0(不读、不写)。
+        if !text_present {
+            return Ok(StepOutcome::Continue);
+        }
+        let Some(target) = target else {
+            self.report(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                "CLIPINFO[TEXT] 缺 LET 目标".to_string(),
+            ));
+            return Ok(StepOutcome::Continue);
+        };
+        let filtered: Vec<u8> = self
+            .clipboard
+            .iter()
+            .copied()
+            .filter(|b| *b >= 0x20)
+            .collect();
+        self.write_target(st, &target, &Value::Str(filtered))?;
+        Ok(StepOutcome::Continue)
+    }
+
+    /// `ERROR[NO=… SET=… COM_CG=… …]`:REA `0x46358c`。
+    ///
+    /// 官方处理体只有一个可观测副作用:参数槽 2 起(`COM_<命令名>`)的
+    /// 值按**命令序号**写进 `[0x689b00 + opcode]` 的「逐命令启用表」;
+    /// 引擎初始化时把 128 字节全置 1(`0x462124`)。该表的消费者未定位,
+    /// 所以内核只保存、不据此改变分派(DIV-RT-046)。
+    fn op_error(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let params = self.param_names(cmd.opcode);
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let pname = params
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or("");
+            let v = self.eval_window(st, w)?;
+            let Some(rest) = pname.strip_prefix("COM_") else {
+                // NO / SET:官方处理体不读(DIV-RT-046)。
+                continue;
+            };
+            let Some(opcode) = self.tables().boot.yscm.index_of(rest) else {
+                continue;
+            };
+            let value = v.as_int().unwrap_or(0) as u8;
+            if let Some(slot) = self.command_enable.get_mut(opcode) {
+                *slot = value;
+            }
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    /// 工程 `ysc.ybn` 的参数名表(槽号 → 名字)。
+    fn param_names(&self, opcode: u8) -> Vec<String> {
+        self.tables()
+            .boot
+            .yscm
+            .command(opcode)
+            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// `DIALOG`:手册 `other/dialog.html` + REA 处理体 `0x43fc74`。
+    ///
+    /// 官方行为(摘要):非 INPUT 走 `MessageBoxA`(同步模态),INPUT 走自绘
+    /// 对话框;`LET` 写「左起第几个按钮」(1 基),`LETSTR` 只在 INPUT 模式
+    /// 写输入文本。内核把模态改成「任务挂起 + `Vm::answer_dialog` 回答」,
+    /// 完整契约与逐参数证据见 `docs/domain-event-contracts.md` §7。
+    fn op_dialog(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let params: Vec<String> = self
+            .tables()
+            .boot
+            .yscm
+            .command(cmd.opcode)
+            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+        let mut caption = Vec::new();
+        let mut text = Vec::new();
+        let mut default_input = Vec::new();
+        let mut let_target: Option<crate::expr::LValue> = None;
+        let mut letstr_target: Option<crate::expr::LValue> = None;
+        let mut okcancel = false;
+        let mut yesno = false;
+        let mut yesnocancel = false;
+        let mut input = false;
+        let mut input_limit = 0u32;
+        let mut default_button = 0u8;
+        let mut icon = crate::dialog::DialogIcon::None;
+        let mut unsupported: Option<String> = None;
+        let mut event_args: Vec<ArgValue> = Vec::new();
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let pname = params
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or("");
+            match pname {
+                "CAPTION" | "STR" | "DEFSTR" => {
+                    let v = self.eval_window(st, w)?;
+                    let Value::Str(bytes) = v else {
+                        return Err(diag::unimplemented(
+                            code::rt::VAR_TYPE,
+                            Boundary::Script,
+                            format!(
+                                "DIALOG[{pname}] 的表达式不是字符串(类型强制未取证;DIV-RT-044)"
+                            ),
+                        )
+                        .into());
+                    };
+                    event_args.push(ArgValue::new(w.rec.kind, Value::Str(bytes.clone())));
+                    match pname {
+                        "CAPTION" => caption = bytes,
+                        "STR" => text = bytes,
+                        _ => default_input = bytes,
+                    }
+                }
+                "LET" | "LETSTR" => {
+                    let lv = self.eval_lvalue_window(st, w)?;
+                    if lv.var.id < self.sys_count {
+                        return Err(diag::unimplemented(
+                            code::rt::SYSVAR_WRITE,
+                            Boundary::Script,
+                            format!(
+                                "DIALOG[{pname}] 目标为系统变量 {}(写入语义未取证;DIV-RT-007)",
+                                lv.var.display()
+                            ),
+                        )
+                        .into());
+                    }
+                    if pname == "LET" {
+                        let_target = Some(lv);
+                    } else {
+                        letstr_target = Some(lv);
+                    }
+                }
+                // 存在性判定不看参数值(REA `0x68416d..0x684170` 只测非零
+                // 索引;`OKCANCEL=0` 也算存在,与手册「値(0/1)」不同)。
+                "OK" => {}
+                "OKCANCEL" => {
+                    okcancel = true;
+                    if let Ok(v) = self.eval_window(st, w) {
+                        event_args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                "YESNO" => {
+                    yesno = true;
+                    if let Ok(v) = self.eval_window(st, w) {
+                        event_args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                "YESNOCANCEL" => {
+                    yesnocancel = true;
+                    if let Ok(v) = self.eval_window(st, w) {
+                        event_args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                "INPUT" => {
+                    input = true;
+                    if let Ok(v) = self.eval_window(st, w) {
+                        event_args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                "INPUTLIMIT" => {
+                    let v = self.eval_window(st, w)?;
+                    let n = v.as_int().unwrap_or(0);
+                    input_limit = n.max(0).min(i64::from(u32::MAX)) as u32;
+                    event_args.push(ArgValue::new(w.rec.kind, v));
+                }
+                "DEFBUTTON" => {
+                    let v = self.eval_window(st, w)?;
+                    // REA:1..4 → MB_DEFBUTTON1..4;其它 → 0。
+                    default_button = match v.as_int().unwrap_or(0) {
+                        1..=4 => v.as_int().unwrap_or(0) as u8,
+                        _ => 0,
+                    };
+                    event_args.push(ArgValue::new(w.rec.kind, v));
+                }
+                "ICON" => {
+                    let v = self.eval_window(st, w)?;
+                    icon = crate::dialog::DialogIcon::from_slot(v.as_int().unwrap_or(0));
+                    event_args.push(ArgValue::new(w.rec.kind, v));
+                }
+                other => {
+                    // STR2..8 / A / E / CHECK / FILEOPEN / FOLDER / CHECKBOX /
+                    // SLIDER / NOWAIT:官方处理体未定位消费点,禁止猜(DIV-RT-044)。
+                    unsupported = Some(if other.is_empty() {
+                        format!("@{}(工程 ysc 无参数名)", w.rec.kind)
+                    } else {
+                        other.to_string()
+                    });
+                }
+            }
+        }
+        // 事件是事实通知(即使参数未取证也记录这次调用);权威状态在
+        // `Vm::pending_dialogs`(不可重放)。
+        self.emit_domain(Domain::System, "DIALOG", event_args);
+        if let Some(p) = unsupported {
+            return Err(diag::unimplemented(
+                code::rt::CMD_UNIMPLEMENTED,
+                Boundary::Script,
+                format!("DIALOG 参数 {p} 的语义未取证(不弹窗、不写回;DIV-RT-044)"),
+            )
+            .into());
+        }
+        // 回答时才写回 ⇒ 现在就把目标变量校验掉,避免宿主回答后才发现
+        // 未声明/类型不符(官方 LET 只接受 int/float 变量,LETSTR 只接受
+        // 字符串变量;错误消息 0x18b14)。
+        for target in [&let_target, &letstr_target].into_iter().flatten() {
+            let var = self.canonical_var(target.var);
+            if self.store.shape(var).is_none() {
+                return Err(diag::unimplemented(
+                    code::rt::VAR_UNDECLARED,
+                    Boundary::Script,
+                    format!("DIALOG 写回目标未声明 {}", var.display()),
+                )
+                .into());
+            }
+        }
+        if let Some(target) = &let_target {
+            let var = self.canonical_var(target.var);
+            if let Some(ElemType::Str) = self.store.shape(var).map(|s| s.0) {
+                return Err(diag::fatal(
+                    code::rt::VAR_TYPE,
+                    Boundary::Script,
+                    "DIALOG[LET] 目标必须是数值变量(引擎错误 0x18b14)",
+                )
+                .into());
+            }
+        }
+        if let Some(target) = &letstr_target {
+            let var = self.canonical_var(target.var);
+            match self.store.shape(var).map(|s| s.0) {
+                Some(ElemType::Str) | None => {}
+                Some(_) => {
+                    return Err(diag::fatal(
+                        code::rt::VAR_TYPE,
+                        Boundary::Script,
+                        "DIALOG[LETSTR] 目标必须是字符串变量(引擎错误 0x18b14)",
+                    )
+                    .into())
+                }
+            }
+        }
+
+        // 按钮组按存在性优先级:YESNOCANCEL > YESNO > OKCANCEL > OK(缺省)。
+        // `OK` 槽在官方处理体里从不读取,MB_OK 是缺省。
+        let buttons = if input {
+            // INPUT 模式走自绘对话框,MessageBox 按钮位不起作用;模板只有 OK。
+            crate::dialog::DialogButtons::Ok
+        } else if yesnocancel {
+            crate::dialog::DialogButtons::YesNoCancel
+        } else if yesno {
+            crate::dialog::DialogButtons::YesNo
+        } else if okcancel {
+            crate::dialog::DialogButtons::OkCancel
+        } else {
+            crate::dialog::DialogButtons::Ok
+        };
+        // 事件是事实通知;权威状态在 `Vm::pending_dialogs`(不可重放)。
+        let id = self.next_dialog_id;
+        self.next_dialog_id = self.next_dialog_id.wrapping_add(1).max(1);
+        let task = self.cur_task.clone();
+        self.dialogs.push(crate::dialog::DialogRequest {
+            id,
+            task,
+            caption,
+            text,
+            buttons,
+            default_button,
+            icon,
+            input,
+            input_limit,
+            default_input,
+            let_target,
+            letstr_target,
+        });
+        Ok(StepOutcome::Yield)
     }
 
     /// `LABELINFO[# LET EXIST]`:手册 `other/labelinfo.html`。
@@ -2886,12 +3391,12 @@ impl Vm {
             }
             match w.rec.kind {
                 0 => {
-                    if let Value::Str(b) = self.eval_value(st, &w.payload)? {
+                    if let Value::Str(b) = self.eval_window(st, w)? {
                         name = Some(b);
                     }
                 }
-                1 => target = Some(self.eval_lvalue(st, &w.payload)?.var),
-                2 => exist = self.eval_value(st, &w.payload)?.as_int().unwrap_or(0) != 0,
+                1 => target = Some(self.eval_lvalue_window(st, w)?.var),
+                2 => exist = self.eval_window(st, w)?.as_int().unwrap_or(0) != 0,
                 _ => {}
             }
         }
@@ -2909,7 +3414,7 @@ impl Vm {
     fn level_param(&mut self, st: &ExecState, cmd: &Cmd) -> Result<usize, VmError> {
         match cmd.windows.first() {
             Some(w) if !w.payload.is_empty() => {
-                let v = self.eval_value(st, &w.payload)?;
+                let v = self.eval_window(st, w)?;
                 Ok(v.as_int().unwrap_or(1).max(0) as usize)
             }
             _ => Ok(1),
@@ -2922,10 +3427,11 @@ impl Vm {
         cmd: &Cmd,
         index: usize,
     ) -> Result<crate::tables::Label, VmError> {
-        let w = cmd.windows.get(index).ok_or_else(|| {
-            windows_error(cmd, "缺少标签窗口")
-        })?;
-        let value = self.eval_value(st, &w.payload)?;
+        let w = cmd
+            .windows
+            .get(index)
+            .ok_or_else(|| windows_error(cmd, "缺少标签窗口"))?;
+        let value = self.eval_window(st, w)?;
         let Value::Str(name) = value else {
             return Err(diag::fatal(
                 code::rt::VAR_TYPE,
@@ -2954,21 +3460,21 @@ impl Vm {
         from_pc: u32,
     ) -> Result<(), VmError> {
         self.ensure_script(to_script)?;
-        let script = self
-            .tables
-            .script(to_script)
-            .ok_or_else(|| {
-                diag::fatal(
-                    code::rt::INTERNAL,
-                    Boundary::Script,
-                    format!("脚本 {to_script} 刚装载却取不到"),
-                )
-            })?;
+        let script = self.tables.script(to_script).ok_or_else(|| {
+            diag::fatal(
+                code::rt::INTERNAL,
+                Boundary::Script,
+                format!("脚本 {to_script} 刚装载却取不到"),
+            )
+        })?;
         if to_pc as usize >= script.group_count() {
             return Err(diag::fatal(
                 code::rt::LABEL,
                 Boundary::Script,
-                format!("跳转目标 s{to_script} pc={to_pc} 超出脚本 {} 组", script.group_count()),
+                format!(
+                    "跳转目标 s{to_script} pc={to_pc} 超出脚本 {} 组",
+                    script.group_count()
+                ),
             )
             .into());
         }
@@ -3005,14 +3511,12 @@ fn array_needle(
         if w.rec.length == 0 {
             continue;
         }
-        let is_needle = match (ty, w.rec.kind) {
-            (Some(ElemType::Str), 19) => true,
-            (Some(ElemType::Float), 18) => true,
-            (Some(ElemType::Int), 17) => true,
-            _ => false,
-        };
+        let is_needle = matches!(
+            (ty, w.rec.kind),
+            (Some(ElemType::Str), 19) | (Some(ElemType::Float), 18) | (Some(ElemType::Int), 17)
+        );
         if is_needle {
-            return Ok(Some(vm.eval_value(st, &w.payload)?));
+            return Ok(Some(vm.eval_window(st, w)?));
         }
     }
     let _ = cmd;
@@ -3053,7 +3557,10 @@ fn coerce_param(name: &str, v: Value) -> Value {
             other => Value::Str(other.to_event_repr().into_bytes()),
         }
     } else if name.starts_with("PINT") || name.starts_with("RINT") {
-        Value::Int(v.as_int().unwrap_or_else(|| v.as_f64().unwrap_or(0.0) as i64))
+        Value::Int(
+            v.as_int()
+                .unwrap_or_else(|| v.as_f64().unwrap_or(0.0) as i64),
+        )
     } else {
         v
     }
@@ -3138,7 +3645,11 @@ fn char_spans(bytes: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        let step = if is_lead(bytes[i]) && i + 1 < bytes.len() { 2 } else { 1 };
+        let step = if is_lead(bytes[i]) && i + 1 < bytes.len() {
+            2
+        } else {
+            1
+        };
         out.push((i, i + step));
         i += step;
     }
@@ -3235,9 +3746,11 @@ fn cp932_lossy(bytes: &[u8]) -> String {
 fn domain_of(name: &str) -> Domain {
     if name.starts_with("CG") {
         Domain::Graphics
-    } else if name.starts_with("SOUND") || name == "MIDI" || name == "MIDIEND" || name == "MIDIINFO" {
+    } else if name.starts_with("SOUND") || name == "MIDI" || name == "MIDIEND" || name == "MIDIINFO"
+    {
         Domain::Sound
-    } else if name == "SAVE" || name == "LOAD" || name.starts_with("SAVEINFO") || name == "SAVEEND" {
+    } else if name == "SAVE" || name == "LOAD" || name.starts_with("SAVEINFO") || name == "SAVEEND"
+    {
         Domain::Save
     } else if name.starts_with("FILE") {
         Domain::File
@@ -3343,8 +3856,7 @@ mod math3d_tests {
     #[test]
     fn background_is_centered_and_unscaled() {
         let f = sample(|_| {});
-        let (x, y, zx, zy) =
-            math3d_project(2, 2, 0, 800.0, 600.0, 0, &|n| f[n as usize]);
+        let (x, y, zx, zy) = math3d_project(2, 2, 0, 800.0, 600.0, 0, &|n| f[n as usize]);
         assert_eq!((x, y), (0.0, 0.0));
         assert_eq!((zx, zy), (100.0, 100.0));
     }
@@ -3357,8 +3869,7 @@ mod math3d_tests {
             f[18] = 200.0; // center X
             f[19] = 150.0; // center Y
         });
-        let (x, y, zx, zy) =
-            math3d_project(6, 2, 0, 800.0, 600.0, 0, &|n| f[n as usize]);
+        let (x, y, zx, zy) = math3d_project(6, 2, 0, 800.0, 600.0, 0, &|n| f[n as usize]);
         // 背景中心 (400,300) + (图层XY - 图层中心)
         assert_eq!((x, y), (300.0, 200.0));
         assert_eq!((zx, zy), (100.0, 100.0));
@@ -3372,8 +3883,7 @@ mod math3d_tests {
             f[18] = 200.0;
             f[19] = 150.0;
         });
-        let (x, y, zx, zy) =
-            math3d_project(6, 2, 0, 800.0, 600.0, 1, &|n| f[n as usize]);
+        let (x, y, zx, zy) = math3d_project(6, 2, 0, 800.0, 600.0, 1, &|n| f[n as usize]);
         assert_eq!((x, y), (10.0 - 200.0, 20.0 - 150.0));
         assert_eq!((zx, zy), (100.0, 100.0));
     }

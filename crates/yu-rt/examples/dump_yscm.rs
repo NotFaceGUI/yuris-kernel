@@ -6,7 +6,12 @@ fn eris_root() -> String {
     std::env::var("YURIS_SAMPLE_ERIS_ROOT")
         .or_else(|_| {
             std::env::var("YURIS_SAMPLE_ERIS_YSBIN").map(|p| {
-                std::path::Path::new(&p).ancestors().nth(2).unwrap().display().to_string()
+                std::path::Path::new(&p)
+                    .ancestors()
+                    .nth(2)
+                    .unwrap()
+                    .display()
+                    .to_string()
             })
         })
         .expect("set YURIS_SAMPLE_ERIS_ROOT or YURIS_SAMPLE_ERIS_YSBIN")
@@ -22,7 +27,10 @@ fn main() {
         Box::new(DirSource::open(format!("{root}/data"), Codec::Cp932).unwrap())
     };
     let aux = DirSource::open(root, Codec::Cp932).unwrap();
-    let cfg = BootConfig { entry_label: "SYSTEM_START".into(), ..BootConfig::default() };
+    let cfg = BootConfig {
+        entry_label: "SYSTEM_START".into(),
+        ..BootConfig::default()
+    };
     let vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).unwrap();
     let filter = std::env::args().nth(1).unwrap_or_default();
     let yscm = &vm.tables().boot.yscm;

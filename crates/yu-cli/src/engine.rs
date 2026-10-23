@@ -19,12 +19,21 @@ use yu_gfx::{
 };
 use yu_rt::input::{InputFrame, InputTimeline};
 use yu_rt::{BootConfig, Vm};
+use yu_save::{SaveHost, SaveState};
 #[cfg(feature = "device")]
 mod sound_device;
 use yu_sound::{SoundHost, SoundLoader, SoundState};
 
 use crate::project::{Project, CODEC};
 use crate::{CliResult, Failure};
+
+/// 实时 tick 的默认单步上限(引擎 `tick_realtime`)。
+///
+/// `serve` 保持 500ms(长帧后一次补完);桌面宿主用 2 帧(见
+/// `HostOptions::fps`,H-P1-05)。引用:症状台账 P1-B / H-P1-05。
+const DEFAULT_MAX_STEP_MS: u32 = 500;
+/// 声音域诊断暂存上限(超出丢前一半;诊断不是无界队列)。
+const SOUND_DIAG_CAP: usize = 8192;
 
 /// 渲染后端。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +83,15 @@ pub struct EngineOptions {
     pub media_readonly: bool,
     /// wgpu 首帧与软后端做计数对账(默认 true)。
     pub reconcile: bool,
+    /// 存档根重定向(P4 M-C)。`None` = 工程根下 `save/`(只读观察:
+    /// SAVE 刷盘与 FILEACT 落盘一律拒绝,保护语料目录);`Some(dir)` =
+    /// 用例/服务注入的可写根(存档域宿主在该目录下允许 FILEACT 落盘;
+    /// SAVE 刷盘仍受 DIV-RT-042 契约门禁)。
+    pub save_root: Option<std::path::PathBuf>,
+    /// 启动时预枚举系统字体(桌面/serve 宿主;默认 false = 首次文本绘制
+    /// 才懒加载)。`fontdb` 枚举在本机实测 ~130ms,预热可消除“第一次打开
+    /// テキスト页签”的停顿;headless 用例不需要。
+    pub warm_text: bool,
 }
 
 impl Default for EngineOptions {
@@ -89,6 +107,8 @@ impl Default for EngineOptions {
             os_sound: true,
             media_readonly: false,
             reconcile: true,
+            save_root: None,
+            warm_text: false,
         }
     }
 }
@@ -137,9 +157,46 @@ impl FrameReport {
 }
 
 /// 渲染产物(surface + 报告)。
+///
+/// `surface` 与渲染器内部的后缓冲共享同一份像素(`Arc`);引擎的
+/// `last_surface` 也只多持一个引用,不再逐帧 clone 1.9MB 整帧。
 pub struct RenderedFrame {
-    pub surface: Surface,
+    pub surface: Arc<Surface>,
     pub report: FrameReport,
+}
+
+/// 等待中的任务(H-P1-02;`Scheduler::nodes` 的等待面投影)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitingTask {
+    pub id: String,
+    pub main: bool,
+    pub script: u32,
+    pub pc: u32,
+    pub wait_frames: u32,
+    pub deadline_ms: Option<u32>,
+    pub text_rest: bool,
+    pub enabled: bool,
+}
+
+/// 诊断 drain 报告(H-P1-02;见 [`Engine::take_diag_report`])。
+#[derive(Clone, Debug, Default)]
+pub struct DiagReport {
+    pub frame: u64,
+    /// 等待中的任务(按调度器节点序)。
+    pub waiting_tasks: Vec<WaitingTask>,
+    /// 未实现命令挂号表(命令名 → 触发次数)。
+    pub unimplemented_cmds: Vec<(String, u64)>,
+    /// 执行器结束的任务留下的脚本错误。
+    pub script_errors: Vec<String>,
+    /// 内核诊断(drain:取走即清)。
+    pub diags: Vec<yu_log::Diag>,
+    pub sound_layers: usize,
+    pub save_slots: usize,
+    pub save_reservations: usize,
+    pub save_calls: u64,
+    pub load_calls: u64,
+    pub saveend_calls: u64,
+    pub fileact_calls: u64,
 }
 
 enum Renderer {
@@ -179,7 +236,22 @@ impl Renderer {
         }
     }
 
-    fn render(&mut self, frame: &CompositorFrame) -> Result<(Surface, RenderReport), Failure> {
+    /// 预枚举系统字体(见 [`EngineOptions::warm_text`])。
+    fn warm_text(&mut self) {
+        match self {
+            Renderer::Soft(renderer) => renderer.warm_text(),
+            Renderer::Wgpu {
+                renderer, check, ..
+            } => {
+                renderer.warm_text();
+                if let Some(soft) = check.as_mut() {
+                    soft.warm_text();
+                }
+            }
+        }
+    }
+
+    fn render(&mut self, frame: &CompositorFrame) -> Result<(Arc<Surface>, RenderReport), Failure> {
         match self {
             Renderer::Soft(renderer) => {
                 let out = renderer.render_frame(frame);
@@ -210,6 +282,8 @@ pub struct Engine {
     state: Option<Rc<RefCell<GfxState>>>,
     /// 声音域状态（与 `SoundHost` 共享；用于取走 `snd.*` 诊断）。
     sound: Option<Arc<Mutex<SoundState>>>,
+    /// 存档域宿主(P4 M-C;事件事实消费,含共享 `SaveState`)。
+    save_host: Option<SaveHost>,
     /// 已从声音宿主取走的诊断（`take_sound_diags` 的暂存）。
     sound_diags: Vec<yu_log::Diag>,
     /// 设备输出（默认 `device` feature；`--no-default-features` 时无此字段）。
@@ -235,7 +309,7 @@ pub struct Engine {
     pulses: BTreeSet<String>,
     cursor: (i64, i64),
     last_frame: Option<CompositorFrame>,
-    last_surface: Option<Surface>,
+    last_surface: Option<Arc<Surface>>,
     last_report: FrameReport,
     last_render: Option<RenderReport>,
     tick_history: VecDeque<f64>,
@@ -249,7 +323,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(project: Project, opts: EngineOptions) -> CliResult<Self> {
         let boot_started = Instant::now();
-        let (vm, state, sound, viewport, probe_order) = boot(&project, &opts)?;
+        let (vm, state, sound, save_host, viewport, probe_order) = boot(&project, &opts)?;
         #[cfg(feature = "device")]
         let sound_sink = if sound.is_some() {
             match sound_device::SoundSink::open() {
@@ -268,8 +342,9 @@ impl Engine {
         }
         let boot_ms = boot_started.elapsed().as_secs_f64() * 1000.0;
 
+        let renderer_started = Instant::now();
         let store = TextureStore::new(Box::new(project.mount()?), CODEC, probe_order.clone());
-        let renderer = match opts.backend {
+        let mut renderer = match opts.backend {
             Backend::Soft => Renderer::Soft(SoftRenderer::new(store)),
             Backend::Wgpu => {
                 let device = device_options_from_env();
@@ -292,6 +367,19 @@ impl Engine {
                 }
             }
         };
+        let text_warm_ms = if opts.warm_text {
+            let started = Instant::now();
+            renderer.warm_text();
+            started.elapsed().as_secs_f64() * 1000.0
+        } else {
+            0.0
+        };
+        log::info!(
+            target: "yu-cli::engine",
+            "startup: boot={boot_ms:.1}ms renderer={:.1}ms text_warm={text_warm_ms:.1}ms total={:.1}ms",
+            renderer_started.elapsed().as_secs_f64() * 1000.0,
+            boot_started.elapsed().as_secs_f64() * 1000.0
+        );
 
         Ok(Self {
             project,
@@ -299,11 +387,12 @@ impl Engine {
             vm: Some(vm),
             state: Some(state),
             sound,
+            save_host,
             sound_diags: Vec::new(),
             #[cfg(feature = "device")]
             sound_sink,
             realtime_last: Instant::now(),
-            max_step_ms: 500,
+            max_step_ms: DEFAULT_MAX_STEP_MS,
             realtime_us: 0,
             realtime_last_ms: 0,
             renderer,
@@ -380,7 +469,7 @@ impl Engine {
     }
 
     pub fn last_surface(&self) -> Option<&Surface> {
-        self.last_surface.as_ref()
+        self.last_surface.as_deref()
     }
 
     /// 最近一帧的 `display` JSON(按需生成,不逐帧持有)。
@@ -475,6 +564,15 @@ impl Engine {
         self.max_step_ms
     }
 
+    /// 每个任务每次泵的命令上限(宿主 `--pump-cap`;`None` = 官方同构的
+    /// 无限泵)。开启后长脚本会跨多帧续跑,是**显式的宿主调度分歧**
+    /// (DIV-HOST-002),默认关闭。
+    pub fn set_pump_cap(&mut self, cap: Option<usize>) {
+        if let Some(vm) = self.vm.as_mut() {
+            vm.set_pump_cap(cap);
+        }
+    }
+
     fn tick_inner(&mut self, now_ms: u32, _audio_delta_ms: u32) -> CliResult<RenderedFrame> {
         let vm = self
             .vm
@@ -485,19 +583,27 @@ impl Engine {
         self.main_finished |= chain.main_finished;
         if let Some(sound) = &self.sound {
             // 音频线程是时钟:这里只取诊断,不生产 PCM。
-            let mut fresh = sound.lock().unwrap().take_diags();
+            // 锁中毒降级(H-P1-01):回调线程 panic 过的锁仍可取回内部
+            // 数据(前一时刻的合法状态),降级继续,不 panic。
+            let mut fresh = sound
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take_diags();
             self.sound_diags.append(&mut fresh);
-            if self.sound_diags.len() > 8192 {
+            if self.sound_diags.len() > SOUND_DIAG_CAP {
                 let drop = self.sound_diags.len() / 2;
                 self.sound_diags.drain(..drop);
             }
         }
         self.frame = self.frame.saturating_add(1);
-        // 事件只做统计/drain:GfxHost 已同步消费同一批事件。
-        self.events_drained += vm.take_events().len() as u64;
+        // 事件 drain:统计 + 存档域事实消费(Save/File 域;P4 M-C)。
+        let events = vm.take_events();
+        self.events_drained += events.len() as u64;
+        if let Some(host) = &self.save_host {
+            host.apply_events(&events);
+        }
         // `MOUSE[X/Y]`:内核已改脚本可见坐标;宿主同步到时间线,下一帧
         // 的光标与脚本看到的一致(引擎同时 SetCursorPos)。
-        // `MOUSE[X/Y]`:内核已改脚本可见坐标;宿主时间线同步到同一位置。
         let warp = vm.input_state_mut().take_cursor_warp();
         let (cursor_x, cursor_y) = vm.input().cursor();
         if let Some((x, y)) = warp {
@@ -542,7 +648,7 @@ impl Engine {
             drawable,
         };
         self.last_frame = Some(frame);
-        self.last_surface = Some(surface.clone());
+        self.last_surface = Some(Arc::clone(&surface));
         self.last_report = out.clone();
         self.last_render = Some(report);
         push_history(&mut self.tick_history, tick_ms);
@@ -596,7 +702,6 @@ impl Engine {
     pub fn cursor(&self) -> (i64, i64) {
         self.cursor
     }
-
 
     /// 单帧脉冲(滚轮/单帧点击):只在下一次 tick 生效,随后自动抬起。
     pub fn pulse_input(&mut self, button: &str) {
@@ -668,15 +773,117 @@ impl Engine {
         std::mem::take(&mut self.sound_diags)
     }
 
+    /// 取走存档域诊断(`sv.*`;P4 M-C)。
+    pub fn take_save_diags(&mut self) -> Vec<yu_log::Diag> {
+        self.save_host
+            .as_ref()
+            .map(|host| {
+                host.state()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take_diags()
+            })
+            .unwrap_or_default()
+    }
+
+    ///
+    /// `serve` 在没有 `/diag` 订阅者时用这个低成本排空:只清内核/声音
+    /// 缓冲,不构造 [`DiagReport`] 的字符串 JSON。
+    pub fn drain_diags(&mut self) {
+        if let Some(vm) = self.vm.as_mut() {
+            vm.clear_diags();
+        }
+        self.sound_diags.clear();
+        let _ = self.take_save_diags();
+    }
+
+    /// P1 交接件 H-P1-02:统一诊断 drain(egui/诊断面板用)。
+    ///
+    /// 一次调用取走:内核诊断(挂号/未实现,`Vm::take_diags`)、等待任务
+    /// 列表(WAIT/文本等待/停用)、未实现命令挂号表、脚本错误、声音层
+    /// 计数与存档域计数。**drain 语义**:诊断取走后不再重复出现;任务
+    /// 列表/挂号表/计数是快照,可反复取。
+    pub fn take_diag_report(&mut self) -> DiagReport {
+        let mut diags = self.take_diags();
+        // 三路诊断合一(P4 M-C + 声音域 N 续):内核 + 存档域 + 声音域。
+        diags.extend(self.take_save_diags());
+        diags.extend(self.take_sound_diags());
+        let mut report = DiagReport {
+            frame: self.frame,
+            diags,
+            ..DiagReport::default()
+        };
+        if let Some(vm) = self.vm.as_ref() {
+            report.script_errors = vm.script_errors().to_vec();
+            report.unimplemented_cmds = vm
+                .unimplemented_cmds()
+                .iter()
+                .map(|(name, hits)| (name.clone(), *hits))
+                .collect();
+            for node in vm.scheduler().nodes() {
+                let waiting = node.wait_frames > 0 || node.deadline_ms.is_some() || node.text_rest;
+                if waiting {
+                    report.waiting_tasks.push(WaitingTask {
+                        id: node.id.to_string(),
+                        main: node.main,
+                        script: node.script_id,
+                        pc: node.pc,
+                        wait_frames: node.wait_frames,
+                        deadline_ms: node.deadline_ms,
+                        text_rest: node.text_rest,
+                        enabled: node.enabled,
+                    });
+                }
+            }
+        }
+        report.sound_layers = self.sound_layers();
+        if let Some(snapshot) = self.save_snapshot() {
+            report.save_slots = snapshot.slots.len();
+            report.save_reservations = snapshot.reservations.len();
+            report.save_calls = snapshot.save_calls;
+            report.load_calls = snapshot.load_calls;
+            report.saveend_calls = snapshot.saveend_calls;
+            report.fileact_calls = snapshot.fileact_calls;
+        }
+        report
+    }
+
+    /// 存档域状态快照(槽表 + 预约 + 计数;确定性,用例/诊断用)。
+    pub fn save_snapshot(&self) -> Option<yu_save::SaveSnapshot> {
+        self.save_host.as_ref().map(|host| {
+            host.state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .snapshot()
+        })
+    }
+
     /// 当前声音层快照（真实语料验证/诊断用）。
     pub fn sound_snapshot(&self) -> Vec<yu_sound::state::SoundSnapshot> {
         self.sound
             .as_ref()
-            .map(|state| state.lock().unwrap().snapshot())
+            .map(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .snapshot()
+            })
             .unwrap_or_default()
     }
 
     /// 当前声音层数（测试/诊断用）。
+    pub fn sound_layers(&self) -> usize {
+        self.sound
+            .as_ref()
+            .map(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .layers_len()
+            })
+            .unwrap_or(0)
+    }
+
     /// 按执行次数排序的命令名(宿主诊断用)。
     pub fn top_commands(&self, limit: usize) -> Vec<(String, u64)> {
         self.vm
@@ -685,11 +892,73 @@ impl Engine {
             .unwrap_or_default()
     }
 
-    pub fn sound_layers(&self) -> usize {
-        self.sound
+    /// 开关逐命令耗时采样(默认关;宿主 `--profile-frames` 用)。
+    pub fn set_command_profile(&mut self, on: bool) {
+        if let Some(vm) = self.vm.as_mut() {
+            vm.set_command_profile(on);
+        }
+    }
+
+    /// 清空命令耗时采样窗口(宿主逐帧调用;见 `Vm::reset_command_profile`)。
+    pub fn reset_command_profile(&mut self) {
+        if let Some(vm) = self.vm.as_mut() {
+            vm.reset_command_profile();
+        }
+    }
+
+    /// 取走命令耗时采样窗口(按累计纳秒降序;见 `Vm::take_command_profile`)。
+    pub fn take_command_profile(&mut self, limit: usize) -> (Vec<(String, u64, u64)>, u64) {
+        self.vm
+            .as_mut()
+            .map(|vm| vm.take_command_profile(limit))
+            .unwrap_or_default()
+    }
+
+    /// `VARACT` 分支取证计数(见 `Vm::varact_stats`)。
+    pub fn varact_stats(&self) -> [u64; 6] {
+        self.vm
             .as_ref()
-            .map(|state| state.lock().unwrap().layers_len())
-            .unwrap_or(0)
+            .map(|vm| vm.varact_stats())
+            .unwrap_or([0; 6])
+    }
+
+    /// 取走 `VARACT` 调用点(script/pc),诊断用。
+    pub fn take_varact_sites(&mut self, limit: usize) -> Vec<((u32, u32), u64)> {
+        self.vm
+            .as_mut()
+            .map(|vm| vm.take_varact_sites(limit))
+            .unwrap_or_default()
+    }
+
+    /// 脚本号 → 显示路径(诊断用)。
+    pub fn script_name(&self, script: u32) -> String {
+        self.vm
+            .as_ref()
+            .map(|vm| vm.script_name(script))
+            .unwrap_or_else(|| format!("s{script}"))
+    }
+
+    /// 脚本 pc → 源码行(诊断用)。
+    pub fn script_position(&self, script: u32, pc: u32) -> Option<u32> {
+        self.vm
+            .as_ref()
+            .and_then(|vm| vm.script_position(script, pc))
+    }
+
+    /// 取走命令调用点采样(见 `Vm::take_profile_sites`)。
+    pub fn take_profile_sites(&mut self, limit: usize) -> Vec<(String, u32, u32, u64)> {
+        self.vm
+            .as_mut()
+            .map(|vm| vm.take_profile_sites(limit))
+            .unwrap_or_default()
+    }
+
+    /// `VARACT` 字符串子操作计数与源字节总量(诊断用)。
+    pub fn varact_op_stats(&self) -> ([u64; 8], u64) {
+        self.vm
+            .as_ref()
+            .map(|vm| vm.varact_op_stats())
+            .unwrap_or(([0; 8], 0))
     }
 
     /// 跨帧渲染状态**(后缓冲/快照/离屏目标/加工缓存;DIV-HOST-001)。
@@ -723,11 +992,12 @@ impl Engine {
             sink.detach();
         }
         let started = Instant::now();
-        let (vm, state, sound, viewport, _) = boot(&self.project, &self.opts)?;
+        let (vm, state, sound, save_host, viewport, _) = boot(&self.project, &self.opts)?;
         self.boot_ms = started.elapsed().as_secs_f64() * 1000.0;
         self.vm = Some(vm);
         self.state = Some(state);
         self.sound = sound;
+        self.save_host = save_host;
         #[cfg(feature = "device")]
         if let (Some(sink), Some(sound)) = (&self.sound_sink, &self.sound) {
             sink.attach(Arc::clone(sound));
@@ -740,7 +1010,7 @@ impl Engine {
     pub fn write_png(&self, path: &std::path::Path) -> CliResult<usize> {
         let surface = self
             .last_surface
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| Failure::runtime("没有可写的帧"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -782,11 +1052,12 @@ impl SoundLoader for VfsSoundLoader {
     }
 }
 
-/// boot 产物:`Vm` + 共享 `GfxState` + 视口 + 纹理探测顺序。
+/// boot 产物:`Vm` + 共享 `GfxState` + 声音/存档域宿主 + 视口 + 纹理探测顺序。
 type BootBundle = (
     Vm,
     Rc<RefCell<GfxState>>,
     Option<Arc<Mutex<SoundState>>>,
+    Option<SaveHost>,
     Viewport,
     Vec<yu_gfx::ImageFormat>,
 );
@@ -827,6 +1098,18 @@ impl TextureSampler for StoreSampler {
 }
 
 fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
+    let boot_started = Instant::now();
+    // 存档根(P4 M-C):显式重定向 = 可写;默认 = 工程根下 save/(只读观察,
+    // SAVE 刷盘与 FILEACT 落盘被域宿主拒绝,保护语料目录)。
+    let save_root: std::path::PathBuf = match &opts.save_root {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                Failure::runtime(format!("创建 save 根 {} 失败: {e}", dir.display()))
+            })?;
+            dir.clone()
+        }
+        None => project.root().join("save"),
+    };
     let source = project.open_source()?;
     let aux = project.open_aux()?;
     let boot = BootConfig {
@@ -841,11 +1124,16 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         frame_ms: opts.frame_ms(),
         // 路径类系统变量由宿主注入(手册 `basic/svariable.html`)。
         // 缺失会让 `es_First.yst` 的 `$_SAVE_PATH` 走 Unimplemented(DIV-RT-010)。
-        paths: host_paths(project.root()),
+        paths: host_paths(&save_root),
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(source, Some(aux), boot)
         .map_err(|d| Failure::runtime(format!("boot 失败: {d}")))?;
+    log::info!(
+        target: "yu-cli::engine",
+        "startup: vm boot (tables/entry/script)={:.1}ms",
+        boot_started.elapsed().as_secs_f64() * 1000.0
+    );
     let viewport = Viewport::new(
         vm.tables().boot.config.width,
         vm.tables().boot.config.height,
@@ -889,7 +1177,26 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     } else {
         None
     };
-    Ok((vm, state, sound_state, viewport, probe_order))
+    // 存档域宿主(P4 M-C):Save/File 域事件的事实消费。参数名经工程
+    // yscm 取;可写性 = 显式 save 根重定向(见 boot 顶部)。
+    let save_host = {
+        let writable = opts.save_root.is_some();
+        let save_state = Arc::new(Mutex::new(SaveState::new(save_root.clone(), writable)));
+        let yscm = vm.tables().boot.yscm.clone();
+        let host = SaveHost::new(save_state, yscm);
+        // 开机先扫一遍槽表(盘上事实;SAVEINFO/LOAD 读侧的地基)。
+        host.state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .refresh_slots();
+        Some(host)
+    };
+    log::info!(
+        target: "yu-cli::engine",
+        "startup: boot rest (gfx/sound/save)={:.1}ms",
+        boot_started.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok((vm, state, sound_state, save_host, viewport, probe_order))
 }
 
 fn compare_reports(soft: &RenderReport, wgpu: &RenderReport) -> Result<(), Failure> {
@@ -970,18 +1277,26 @@ fn device_options_from_env() -> DeviceOptions {
 /// 宿主注入的路径系统变量(手册 `basic/svariable.html`)。
 ///
 /// - `$_SYSTEM_PATH` = YU-RIS 起動パス → 工程根(官方 exe 所在目录);
-/// - `$_SAVE_PATH` = YU-RIS セーブデータパス → 工程根下官方引擎实际写入的
-///   `save/`(原版数据自证:`save/*.sd`、`save/data/` 由官方 exe 生成);
+/// - `$_SAVE_PATH` = YU-RIS セーブデータパス → 存档根(P4 M-C:显式重定向
+///   时为注入目录,默认工程根下 `save/`;原版数据自证:`save/*.sd`、
+///   `save/data/` 由官方 exe 生成);
 /// - `$_APPDATA_PATH` = ユーザのホームディレクトリパス;
 /// - `$_PERSONAL_PATH` = マイドキュメントのパス;
 /// - `$_PROJECT_PATH` 手册无页(DIV-RT-010),不猜值 ⇒ `None`。
-fn host_paths(root: &std::path::Path) -> yu_rt::vm::HostPaths {
+fn host_paths(save_root: &std::path::Path) -> yu_rt::vm::HostPaths {
     const BS: char = '\\';
+    let root = save_root
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(save_root);
     let mut sys = root.to_string_lossy().replace(BS, "/");
     if !sys.ends_with('/') {
         sys.push('/');
     }
-    let save = format!("{sys}save/");
+    let mut save = save_root.to_string_lossy().replace(BS, "/");
+    if !save.ends_with('/') {
+        save.push('/');
+    }
     let home = std::env::var("USERPROFILE").ok();
     yu_rt::vm::HostPaths {
         system_path: Some(sys.into_bytes()),

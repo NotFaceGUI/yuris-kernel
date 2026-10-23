@@ -8,6 +8,8 @@ use yu_cli::server::{self, ServeOptions};
 use yu_cli::{CliResult, Failure, EXIT_FAIL};
 
 fn main() {
+    // log 门面桥(P4 M-E):HMR 子进程与主进程同口径。
+    yu_log::facade::init(|line| crate::output::error(line));
     let tokens: Vec<String> = std::env::args().skip(1).collect();
     let code = match run(tokens) {
         Ok(()) => 0,

@@ -70,14 +70,32 @@ fn show_value(v: &yu_rt::Value) -> String {
 
 fn main() {
     let root = eris_root();
-    let frames: u32 = std::env::args().nth(1).and_then(|v| v.parse().ok()).unwrap_or(600);
-    let interval: u32 = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(30);
-    let hold: u32 = std::env::args().nth(3).and_then(|v| v.parse().ok()).unwrap_or(2);
-    let samples: usize = std::env::args().nth(4).and_then(|v| v.parse().ok()).unwrap_or(12);
+    let frames: u32 = std::env::args()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+    let interval: u32 = std::env::args()
+        .nth(2)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let hold: u32 = std::env::args()
+        .nth(3)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    let samples: usize = std::env::args()
+        .nth(4)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
     let dump_frame: Option<u32> = std::env::args().nth(5).and_then(|v| v.parse().ok());
     let cursor: (i64, i64) = (
-        std::env::args().nth(6).and_then(|v| v.parse().ok()).unwrap_or(400),
-        std::env::args().nth(7).and_then(|v| v.parse().ok()).unwrap_or(300),
+        std::env::args()
+            .nth(6)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(400),
+        std::env::args()
+            .nth(7)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300),
     );
 
     let mut timeline = InputTimeline::new();
@@ -98,8 +116,7 @@ fn main() {
 
     let src = open_source(&root);
     let aux = DirSource::open(&root, Codec::Cp932).expect("project");
-    let entry = std::env::var("YURIS_ENTRY_LABEL")
-        .unwrap_or_else(|_| "SYSTEM_START".to_string());
+    let entry = std::env::var("YURIS_ENTRY_LABEL").unwrap_or_else(|_| "SYSTEM_START".to_string());
     let cfg = BootConfig {
         entry_label: entry.clone(),
         fps: 60,
@@ -112,11 +129,7 @@ fn main() {
     println!("entry={entry}");
     for name in ["SCENARIO_START", "SCENARIO_TITLE", "SCENARIO_MAIN"] {
         match vm.tables().boot.labels.get(name) {
-            Some(l) => println!(
-                "label {name}: s{} pc{}",
-                l.script_id,
-                l.pc
-            ),
+            Some(l) => println!("label {name}: s{} pc{}", l.script_id, l.pc),
             None => println!("label {name}: MISSING"),
         }
     }
@@ -153,9 +166,7 @@ fn main() {
                 }
                 if dump_frame == Some(*ef as u32) {
                     *dump_scripts.entry(*script).or_insert(0) += 1;
-                    *dump_sites
-                        .entry((*script, *pc, name.clone()))
-                        .or_insert(0) += 1;
+                    *dump_sites.entry((*script, *pc, name.clone())).or_insert(0) += 1;
                     if dump_seq.len() < 40 {
                         dump_seq.push(detail);
                     } else {
@@ -189,7 +200,13 @@ fn main() {
                 VmEvent::Diag { code, detail, .. } => {
                     *diag_counts.entry(format!("{code}: {detail}")).or_insert(0) += 1;
                 }
-                VmEvent::TaskSpawn { frame, id, script, pc, .. } if task_log.len() < 80 => {
+                VmEvent::TaskSpawn {
+                    frame,
+                    id,
+                    script,
+                    pc,
+                    ..
+                } if task_log.len() < 80 => {
                     task_log.push(format!("@{frame} spawn {id} s{script} pc{pc}"));
                 }
                 VmEvent::TaskFinish { frame, id } if task_log.len() < 80 => {
@@ -206,7 +223,9 @@ fn main() {
     let hits = vm.command_hits();
     let yscm = &vm.tables().boot.yscm;
     let hit = |name: &str| -> u64 {
-        yscm.index_of(name).map(|i| hits.get(i).copied().unwrap_or(0)).unwrap_or(0)
+        yscm.index_of(name)
+            .map(|i| hits.get(i).copied().unwrap_or(0))
+            .unwrap_or(0)
     };
     let st = vm.text_state();
     println!("frames={frames} interval={interval} hold={hold}");

@@ -18,7 +18,9 @@
 //!    计数,不近似;
 //! 8. 双纹理过渡:配对纹理的 G 通道为 mask,覆盖度见
 //!    `yu_gfx::transition_coverage`(EVID-T-05);
-//! 9. 文本(`TextRun`)不栅格化:只统计跳过数量;
+//! 9. 文本两条路径都执行:`CGACT[TEXT]` 绘制项合成到图层基图副本;
+//!    自动文本层按 `_TEXT_FLAG` 逐字排版后画到目标层/屏幕覆盖层。没有
+//!    `_TEXT_FLAG` 的 `TextRun` 仍然不猜排版(`skipped_text` 计数);
 //! 10. 颜色空间按存储值混合(`gamma_encoded_srgb8`),不做线性化;
 //! 11. 过滤用 `frame.filter`:`Point` 最近邻,`Linear/Anisotropic` 双线性;
 //!     `source=placeholder` 时报告里明确标注未取证。
@@ -59,11 +61,13 @@
 pub mod imageop;
 pub mod png;
 pub mod render;
+pub mod text;
 pub mod texture;
 
 pub use imageop::{apply_horizontal, apply_rect_paint, apply_reverse, scale_region};
 pub use render::{
-    ImageCacheKey, ImageOpSig, ImageSource, SizeKey, SizeSource,
-    frame_has_drawable_output, RenderOutput, RenderReport, SkippedOp, SoftRenderer, Surface,
+    frame_has_drawable_output, ImageCacheKey, ImageOpSig, ImageSource, RenderOutput, RenderReport,
+    SizeKey, SizeSource, SkippedOp, SoftRenderer, Surface,
 };
+pub use text::{layer_base, TextComposer, TextPaintStats};
 pub use texture::{AssetIssue, Texture, TextureStore};

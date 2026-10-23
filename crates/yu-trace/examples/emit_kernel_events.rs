@@ -1,4 +1,4 @@
-//! 内核侧事件 trace:同一 `data.ypf` 语料 + 注入输入,按帧窗口写 schema v3。
+//! 内核侧事件 trace:同一 `data.ypf` 语料 + 注入输入,按帧窗口写 schema v4。
 //!
 //! 用途:与 `tools/official_trace/probe_dispatch.py` 采到的官方事件 trace 对拍。
 //! 只消费 `yu-rt` / `yu-trace` 公开 API;输出 record 顺序与 `seq` 由 `yu-trace` 拥有。

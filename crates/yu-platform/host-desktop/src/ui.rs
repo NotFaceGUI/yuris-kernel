@@ -1,0 +1,617 @@
+//! egui 诊断面:数据是 [`crate::diagnostics::Diagnostics`] 的只读快照,
+//! 这里不持有 [`crate::App`],所以可以脱离窗口做无头 UI 测试
+//! (`egui::Context::run_pass` 不需要 GPU)。
+//!
+//! 面板分四段(对应任务书 §3.2):
+//!
+//! 1. **为什么卡** —— `StuckReport::hint()`,四路证据(无可绘制输出 /
+//!    逻辑帧不推进 / Fatal / 画面不变)+ 已知 API 缺口;
+//! 2. **挂号表** —— 按最近帧排序的前 50 条 Diag(码、严重级、次数、最近帧);
+//! 3. **本帧丢弃** —— skipped ops top-N、缺失资产、未栅格化文本、
+//!    Unimplemented top-N;
+//! 4. **输入** —— 按下沿计数、`_KEYLAST/_MOUSELAST` 的宿主等价物、
+//!    光标与按住集合。
+
+use egui::{Color32, RichText};
+
+use crate::diagnostics::Diagnostics;
+
+/// 红色横幅(panic)。
+pub const PANIC_RED: Color32 = Color32::from_rgb(176, 24, 24);
+/// 琥珀横幅(卡住 / Fatal 挂号)。
+pub const ATTENTION_AMBER: Color32 = Color32::from_rgb(150, 96, 8);
+
+/// 面板/横幅需要的全部读数(逐帧复制;`diagnostics` 借用,不 clone 大表)。
+pub struct UiSnapshot<'a> {
+    pub backend: String,
+    pub frame: u64,
+    pub viewport: (u32, u32),
+    pub window: (u32, u32),
+    pub tick_ms: f64,
+    pub render_ms: f64,
+    pub tick_avg: f64,
+    pub render_avg: f64,
+    pub ops: u32,
+    pub drawn: u32,
+    pub skipped: u32,
+    pub passes: u32,
+    pub layers: u32,
+    pub visible: u32,
+    pub drawable: bool,
+    pub textures_cached: usize,
+    pub textures_decoded: usize,
+    pub events_drained: u64,
+    pub events_dropped: u64,
+    pub sound_layers: usize,
+    pub cursor: (i64, i64),
+    pub held: String,
+    pub gpu: String,
+    pub main_finished: bool,
+    pub diagnostics: &'a Diagnostics,
+    /// `MOUSE[MODE/TIME/CURSOR]` 的脚本当前值。
+    pub mouse_mode: Option<i64>,
+    pub mouse_time_ms: Option<i64>,
+    pub cursor_visible: Option<bool>,
+    /// 是否显示卡住横幅(用户可在面板关掉)。
+    pub show_attention: bool,
+}
+
+/// 面板上可触发的动作(宿主在 UI 闭包外执行)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UiActions {
+    pub restart: bool,
+    pub hide: bool,
+    pub quit: bool,
+    /// `Some(false)` = 用户关掉卡住横幅;`Some(true)` = 重新打开。
+    pub show_attention: Option<bool>,
+}
+
+/// F1 主面板。
+pub fn debug_window(ctx: &egui::Context, snap: &UiSnapshot<'_>) -> UiActions {
+    let mut actions = UiActions::default();
+    egui::Window::new("yu-desktop")
+        .default_pos([12.0, 12.0])
+        .default_width(430.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            why_stuck(ui, snap);
+            ui.separator();
+            stats(ui, snap);
+            ui.separator();
+            diag_table(ui, snap.diagnostics);
+            ui.separator();
+            frame_drops(ui, snap.diagnostics);
+            ui.separator();
+            inputs(ui, snap);
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Restart").clicked() {
+                    actions.restart = true;
+                }
+                if ui.button("Hide (F1)").clicked() {
+                    actions.hide = true;
+                }
+                if ui.button("Quit").clicked() {
+                    actions.quit = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                if snap.show_attention {
+                    if ui.button("Hide stuck banner").clicked() {
+                        actions.show_attention = Some(false);
+                    }
+                } else if ui.button("Show stuck banner").clicked() {
+                    actions.show_attention = Some(true);
+                }
+                ui.label("F1 toggles this panel");
+            });
+            ui.separator();
+            ui.label(format!("GPU: {}", snap.gpu));
+        });
+    actions
+}
+
+fn why_stuck(ui: &mut egui::Ui, snap: &UiSnapshot<'_>) {
+    let stuck = &snap.diagnostics.stuck;
+    let hint = stuck.hint();
+    let normal = hint == "推进正常";
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("为什么卡").strong());
+        let (color, tag) = if normal {
+            (Color32::from_rgb(64, 160, 64), "OK")
+        } else if stuck.last_fatal.is_some() {
+            (PANIC_RED, "FATAL")
+        } else {
+            (ATTENTION_AMBER, "WAIT")
+        };
+        ui.colored_label(color, tag);
+    });
+    ui.colored_label(
+        if normal {
+            Color32::GRAY
+        } else {
+            Color32::WHITE
+        },
+        hint,
+    );
+    egui::Grid::new("yu-desktop-stuck")
+        .num_columns(2)
+        .spacing([12.0, 2.0])
+        .show(ui, |ui| {
+            ui.label("logic stall");
+            ui.monospace(format!(
+                "{} host frames (engine frame {})",
+                stuck.logic_stall_frames, stuck.engine_frame
+            ));
+            ui.end_row();
+            ui.label("pixel stall");
+            ui.monospace(format!("{} host frames", stuck.pixel_stall_frames));
+            ui.end_row();
+            ui.label("drawable");
+            ui.monospace(stuck.drawable.to_string());
+            ui.end_row();
+            ui.label("main_finished");
+            ui.monospace(snap.main_finished.to_string());
+            ui.end_row();
+            ui.label("waiting task");
+            ui.monospace("n/a · H-P1-02");
+            ui.end_row();
+            ui.label("DomainCall pc");
+            ui.monospace("n/a · P3");
+            ui.end_row();
+        });
+    if let Some(error) = &stuck.last_script_error {
+        ui.colored_label(ATTENTION_AMBER, format!("script error: {error}"));
+    }
+}
+
+fn stats(ui: &mut egui::Ui, snap: &UiSnapshot<'_>) {
+    egui::CollapsingHeader::new("frame / render")
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::Grid::new("yu-desktop-stats")
+                .num_columns(2)
+                .spacing([12.0, 2.0])
+                .show(ui, |ui| {
+                    let mut row = |name: &str, value: String| {
+                        ui.label(name);
+                        ui.monospace(value);
+                        ui.end_row();
+                    };
+                    row("frame", snap.frame.to_string());
+                    row("backend", snap.backend.clone());
+                    row(
+                        "viewport",
+                        format!("{}x{}", snap.viewport.0, snap.viewport.1),
+                    );
+                    row("window", format!("{}x{}", snap.window.0, snap.window.1));
+                    row(
+                        "tick",
+                        format!("{:.2} ms (avg {:.2})", snap.tick_ms, snap.tick_avg),
+                    );
+                    row(
+                        "render",
+                        format!("{:.2} ms (avg {:.2})", snap.render_ms, snap.render_avg),
+                    );
+                    row(
+                        "ops",
+                        format!(
+                            "{} drawn / {} skipped ({} total)",
+                            snap.drawn, snap.skipped, snap.ops
+                        ),
+                    );
+                    row("passes", snap.passes.to_string());
+                    row(
+                        "layers",
+                        format!("{} / {} visible", snap.layers, snap.visible),
+                    );
+                    row("drawable", snap.drawable.to_string());
+                    row(
+                        "textures",
+                        format!(
+                            "{} cached / {} decoded",
+                            snap.textures_cached, snap.textures_decoded
+                        ),
+                    );
+                    row(
+                        "events",
+                        format!(
+                            "{} drained / {} dropped",
+                            snap.events_drained, snap.events_dropped
+                        ),
+                    );
+                    row("sound", format!("{} layers", snap.sound_layers));
+                });
+        });
+}
+
+fn diag_table(ui: &mut egui::Ui, diagnostics: &Diagnostics) {
+    egui::CollapsingHeader::new(format!(
+        "挂号表 ({} codes / {} events)",
+        diagnostics.diag_rows.len(),
+        diagnostics.total_diags
+    ))
+    .default_open(true)
+    .show(ui, |ui| {
+        if diagnostics.diag_rows.is_empty() {
+            ui.label("(无诊断)");
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .max_height(190.0)
+            .show(ui, |ui| {
+                egui::Grid::new("yu-desktop-diags")
+                    .num_columns(4)
+                    .striped(true)
+                    .spacing([8.0, 2.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("code").strong());
+                        ui.label(RichText::new("sev").strong());
+                        ui.label(RichText::new("count").strong());
+                        ui.label(RichText::new("last").strong());
+                        ui.end_row();
+                        for row in &diagnostics.diag_rows {
+                            let color = severity_color(row.severity);
+                            ui.colored_label(color, &row.code);
+                            ui.colored_label(color, row.severity.as_str());
+                            ui.monospace(row.count.to_string());
+                            ui.monospace(row.last_frame.to_string());
+                            ui.end_row();
+                        }
+                    });
+            });
+        if let Some(last) = diagnostics.recent.back() {
+            ui.separator();
+            ui.label(RichText::new("最近一条").strong());
+            ui.monospace(format!("#{} {}", last.frame, last.code));
+            ui.label(&last.where_);
+            ui.label(&last.detail);
+        }
+    });
+}
+
+fn frame_drops(ui: &mut egui::Ui, diagnostics: &Diagnostics) {
+    egui::CollapsingHeader::new("本帧丢弃 / Unimplemented")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(RichText::new("skipped ops top-N").strong());
+            if diagnostics.frame_skips.is_empty() {
+                ui.label("(0 skipped)");
+            } else {
+                for (key, count) in &diagnostics.frame_skips {
+                    ui.monospace(format!("x{count:<5} {key}"));
+                }
+            }
+            if !diagnostics.frame_missing_assets.is_empty() {
+                ui.separator();
+                ui.label(RichText::new("missing assets").strong());
+                for asset in &diagnostics.frame_missing_assets {
+                    ui.monospace(asset);
+                }
+            }
+            if diagnostics.frame_skipped_text > 0 {
+                ui.colored_label(
+                    ATTENTION_AMBER,
+                    format!(
+                        "text runs not rasterized: {} (DIV-GFX-012/033/034/035,归 P2)",
+                        diagnostics.frame_skipped_text
+                    ),
+                );
+            }
+            ui.separator();
+            ui.label(RichText::new("Unimplemented 本帧 top-N").strong());
+            if diagnostics.frame_unimplemented.is_empty() {
+                ui.label("(0)");
+            } else {
+                for (code, count) in &diagnostics.frame_unimplemented {
+                    ui.monospace(format!("x{count:<5} {code}"));
+                }
+            }
+            ui.separator();
+            ui.label(RichText::new("Unimplemented 累计 top-N").strong());
+            for (code, count) in &diagnostics.total_unimplemented {
+                ui.monospace(format!("x{count:<8} {code}"));
+            }
+        });
+}
+
+fn inputs(ui: &mut egui::Ui, snap: &UiSnapshot<'_>) {
+    egui::CollapsingHeader::new("输入计数器")
+        .default_open(true)
+        .show(ui, |ui| {
+            let counters = &snap.diagnostics.input;
+            egui::Grid::new("yu-desktop-input")
+                .num_columns(2)
+                .spacing([12.0, 2.0])
+                .show(ui, |ui| {
+                    ui.label("cursor");
+                    ui.monospace(format!("{}, {}", snap.cursor.0, snap.cursor.1));
+                    ui.end_row();
+                    ui.label("_KEYLAST (host)");
+                    ui.monospace(last_button(&counters.last_key));
+                    ui.end_row();
+                    ui.label("_MOUSELAST (host)");
+                    ui.monospace(last_button(&counters.last_mouse));
+                    ui.end_row();
+                    ui.label("press edges");
+                    ui.monospace(counters.press_edges.values().sum::<u64>().to_string());
+                    ui.end_row();
+                    ui.label("max edges/frame");
+                    ui.monospace(counters.max_press_edges_in_frame.to_string());
+                    ui.end_row();
+                    ui.label("clicks / wheel");
+                    ui.monospace(format!("{} / {}", counters.clicks, counters.wheel_pulses));
+                    ui.end_row();
+                    ui.label("held");
+                    ui.monospace(snap.held.clone());
+                    ui.end_row();
+                    ui.label("MOUSE[MODE/TIME]");
+                    ui.monospace(format!("{:?} / {:?}", snap.mouse_mode, snap.mouse_time_ms));
+                    ui.end_row();
+                    ui.label("cursor visible");
+                    ui.monospace(format!("{:?}", snap.cursor_visible));
+                    ui.end_row();
+                });
+            let top = counters.top(8);
+            if !top.is_empty() {
+                ui.separator();
+                for (button, count) in top {
+                    ui.monospace(format!("x{count:<5} {button}"));
+                }
+            }
+            ui.separator();
+            ui.small("内核 `_KEYLAST/_MOUSELAST` 未公开 → 此处为宿主等价物 (H-P1-02)");
+        });
+}
+
+fn last_button(value: &Option<(String, u64)>) -> String {
+    match value {
+        Some((name, frame)) => format!("{name} @ frame {frame}"),
+        None => "-".to_string(),
+    }
+}
+
+/// 红色 panic 横幅。返回 `true` = 用户点了 Quit。
+pub fn panic_banner(ctx: &egui::Context, title: &str, body: &str) -> bool {
+    let mut quit = false;
+    // egui 0.37 统一成 `Panel`(旧的 `TopBottomPanel` 已移除);只有
+    // `Context` 的地方用 `root_ui` 拿根 `Ui`(官方文档推荐路径)。
+    ctx.root_ui(|ui| {
+        egui::Panel::top("yu-desktop-panic")
+            .frame(
+                egui::Frame::new()
+                    .fill(PANIC_RED)
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(title)
+                            .color(Color32::WHITE)
+                            .strong()
+                            .size(16.0),
+                    );
+                    if ui.button("Quit (Esc)").clicked() {
+                        quit = true;
+                    }
+                });
+                ui.label(RichText::new(body).color(Color32::from_rgb(255, 226, 226)));
+            });
+    });
+    quit
+}
+
+/// 琥珀“卡住”横幅(不是 panic;引擎仍在运行,只是画面/逻辑不推进)。
+pub fn attention_banner(ctx: &egui::Context, hint: &str) {
+    ctx.root_ui(|ui| {
+        egui::Panel::top("yu-desktop-attention")
+            .frame(
+                egui::Frame::new()
+                    .fill(ATTENTION_AMBER)
+                    .inner_margin(egui::Margin::symmetric(12, 6)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("为什么卡").color(Color32::WHITE).strong());
+                    ui.label(RichText::new(hint).color(Color32::from_rgb(255, 244, 214)));
+                });
+            });
+    });
+}
+
+fn severity_color(severity: yu_log::Severity) -> Color32 {
+    match severity {
+        yu_log::Severity::Fatal => PANIC_RED,
+        yu_log::Severity::Recoverable => Color32::from_rgb(200, 120, 24),
+        yu_log::Severity::Unimplemented => Color32::from_rgb(200, 200, 60),
+        yu_log::Severity::Info => Color32::GRAY,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diagnostics::{DiagRow, Diagnostics, InputCounters, StuckReport};
+    use yu_log::Severity;
+
+    fn base_snapshot<'a>(diag: &'a Diagnostics) -> UiSnapshot<'a> {
+        UiSnapshot {
+            backend: "wgpu".to_string(),
+            frame: 404,
+            viewport: (800, 600),
+            window: (1280, 960),
+            tick_ms: 3.0,
+            render_ms: 1.0,
+            tick_avg: 4.0,
+            render_avg: 1.5,
+            ops: 158,
+            drawn: 158,
+            skipped: 0,
+            passes: 137,
+            layers: 379,
+            visible: 115,
+            drawable: true,
+            textures_cached: 31,
+            textures_decoded: 31,
+            events_drained: 100,
+            events_dropped: 0,
+            sound_layers: 2,
+            cursor: (400, 300),
+            held: "-".to_string(),
+            gpu: "test".to_string(),
+            main_finished: false,
+            diagnostics: diag,
+            mouse_mode: Some(1),
+            mouse_time_ms: Some(2500),
+            cursor_visible: Some(true),
+            show_attention: true,
+        }
+    }
+
+    /// 无头跑 UI,返回(动作, 绘制出的全部文本, 全部填充色)。
+    ///
+    /// 跑**两遍**:egui 0.37 的 `Window` 在首遍只测量尺寸,第二遍才落
+    /// 绘制指令(与宿主真实帧一致 —— 面板晚一帧出现,不影响诊断)。
+    fn run_ui(
+        snapshot: &dyn Fn(&egui::Context) -> UiActions,
+    ) -> (UiActions, Vec<String>, Vec<Color32>) {
+        let ctx = egui::Context::default();
+        let mut actions = UiActions::default();
+        // `RawInput::default()` 没有 screen_rect:Window 会被裁成 0 面积。
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 960.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_pass(raw.clone(), |ctx| {
+            actions = snapshot(ctx);
+        });
+        output.textures_delta.clear();
+        let mut output = ctx.run_pass(raw, |ctx| {
+            actions = snapshot(ctx);
+        });
+        // epaint 的 `TexturesDelta` 有 Drop 守卫:测试里不上传纹理,
+        // 但必须显式清空后再丢弃。
+        output.textures_delta.clear();
+        let mut texts = Vec::new();
+        let mut fills = Vec::new();
+        for shape in output.shapes {
+            collect(&shape.shape, &mut texts, &mut fills);
+        }
+        (actions, texts, fills)
+    }
+
+    fn collect(shape: &egui::epaint::Shape, texts: &mut Vec<String>, fills: &mut Vec<Color32>) {
+        match shape {
+            egui::epaint::Shape::Text(text) => texts.push(text.galley.text().to_string()),
+            egui::epaint::Shape::Rect(rect) => fills.push(rect.fill),
+            egui::epaint::Shape::Vec(list) => {
+                for item in list {
+                    collect(item, texts, fills);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn panic_banner_paints_red_and_quit_button() {
+        let (actions, texts, fills) = run_ui(&|ctx| {
+            let quit = panic_banner(ctx, "PANIC 捕获于 tick", "boom @ src/lib.rs:1:1");
+            UiActions {
+                quit,
+                ..UiActions::default()
+            }
+        });
+        assert!(!actions.quit, "没有点击时不退出");
+        assert!(fills.contains(&PANIC_RED), "横幅必须用红色填充: {fills:?}");
+        assert!(
+            texts.iter().any(|text| text.contains("PANIC 捕获于 tick")),
+            "横幅标题必须可见: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn attention_banner_paints_amber_with_hint() {
+        let (_actions, texts, fills) = run_ui(&|ctx| {
+            attention_banner(ctx, "画面像素连续 120 宿主帧相同");
+            UiActions::default()
+        });
+        assert!(fills.contains(&ATTENTION_AMBER));
+        assert!(
+            texts.iter().any(|text| text.contains("画面像素连续")),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn panel_surfaces_diag_codes_and_stuck_hint() {
+        let mut diag = Diagnostics::default();
+        diag.diag_rows.push(DiagRow {
+            code: "rt.cmd.unimplemented".to_string(),
+            severity: Severity::Unimplemented,
+            count: 11,
+            first_frame: 1,
+            last_frame: 404,
+            last_detail: "ERROR: 命令无处理器".to_string(),
+            last_where: "es_eris.yst:SYSTEM@12 ERROR".to_string(),
+        });
+        diag.stuck = StuckReport {
+            engine_frame: 404,
+            logic_stall_frames: 200,
+            pixel_stall_frames: 158,
+            drawable: true,
+            main_finished: false,
+            last_fatal: Some((
+                "rt.expr.div_zero".to_string(),
+                404,
+                "es_select.yst:es.ScenarioScript@153 LET".to_string(),
+            )),
+            last_script_error: None,
+        };
+        diag.total_diags = 11;
+        let snapshot = base_snapshot(&diag);
+        let (_actions, texts, _fills) = run_ui(&|ctx| debug_window(ctx, &snapshot));
+        let joined = texts.join("\n");
+        assert!(joined.contains("rt.cmd.unimplemented"), "{joined}");
+        assert!(
+            joined.contains("rt.expr.div_zero"),
+            "Fatal 必须出现在提示里: {joined}"
+        );
+        assert!(joined.contains("es_select.yst"), "{joined}");
+        assert!(
+            joined.contains("n/a · H-P1-02"),
+            "缺 API 必须显式标注: {joined}"
+        );
+    }
+
+    #[test]
+    fn panel_buttons_report_actions() {
+        // 直接调用 build 逻辑无法模拟点击;这里验证返回值默认为空动作,
+        // 真实点击路径由 egui 的交互状态驱动(窗口级人工验收)。
+        let diag = Diagnostics::default();
+        let snapshot = base_snapshot(&diag);
+        let (actions, _texts, _fills) = run_ui(&|ctx| debug_window(ctx, &snapshot));
+        assert_eq!(actions, UiActions::default());
+    }
+
+    #[test]
+    fn last_button_formatting_is_readable() {
+        assert_eq!(last_button(&None), "-");
+        assert_eq!(
+            last_button(&Some(("MOUSE_L".to_string(), 300))),
+            "MOUSE_L @ frame 300"
+        );
+    }
+
+    #[test]
+    fn input_counters_top_is_sorted() {
+        let mut counters = InputCounters::default();
+        counters.press("MOUSE_L", 1);
+        counters.press("KEY_ENTER", 2);
+        counters.press("KEY_ENTER", 3);
+        assert_eq!(counters.top(2)[0], ("KEY_ENTER".to_string(), 2));
+    }
+}

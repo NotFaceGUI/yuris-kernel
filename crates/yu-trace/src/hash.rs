@@ -84,26 +84,89 @@ const H0: [u32; 8] = [
 
 /// 计算 SHA-256 并输出小写十六进制(64 字符)。
 pub fn sha256_hex(data: &[u8]) -> String {
-    let mut state = H0;
-    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finish()
+}
 
-    let mut padded = Vec::with_capacity(data.len() + 72);
-    padded.extend_from_slice(data);
-    padded.push(0x80);
-    while padded.len() % 64 != 56 {
-        padded.push(0);
-    }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
+/// 增量 SHA-256。
+///
+/// 故障快照的 ring buffer 要在**不保留**全部事件的前提下对单 tick 的命令流
+/// 做摘要:单 tick 可能产生百万级事件,一次性拼 buffer 再 `sha256_hex`
+/// 会把内存放大到不可接受。这里的 `update` 只保留 64 字节块尾,空间恒定。
+///
+/// 语义与 [`sha256_hex`] 完全一致(同一测试向量)。
+#[derive(Clone)]
+pub struct Sha256 {
+    state: [u32; 8],
+    /// 未满一个 64 字节块的前缀。
+    buffer: [u8; 64],
+    buffer_len: usize,
+    /// 已喂入的总字节数(用于长度填充)。
+    total_len: u64,
+}
 
-    for block in padded.chunks_exact(64) {
-        compress(&mut state, block);
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha256 {
+    pub fn new() -> Self {
+        Self {
+            state: H0,
+            buffer: [0u8; 64],
+            buffer_len: 0,
+            total_len: 0,
+        }
     }
 
-    let mut out = String::with_capacity(64);
-    for word in state {
-        out.push_str(&format!("{word:08x}"));
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
+        if self.buffer_len > 0 {
+            let room = 64 - self.buffer_len;
+            let take = room.min(data.len());
+            self.buffer[self.buffer_len..self.buffer_len + take].copy_from_slice(&data[..take]);
+            self.buffer_len += take;
+            data = &data[take..];
+            if self.buffer_len == 64 {
+                compress(&mut self.state, &self.buffer);
+                self.buffer_len = 0;
+            }
+        }
+        let mut chunks = data.chunks_exact(64);
+        for block in &mut chunks {
+            compress(&mut self.state, block);
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            self.buffer[..rest.len()].copy_from_slice(rest);
+            self.buffer_len = rest.len();
+        }
     }
-    out
+
+    /// 结束并输出小写十六进制(64 字符)。
+    pub fn finish(mut self) -> String {
+        let bit_len = self.total_len.wrapping_mul(8);
+        let mut tail = [0u8; 128];
+        let mut tail_len = self.buffer_len;
+        tail[..tail_len].copy_from_slice(&self.buffer[..tail_len]);
+        tail[tail_len] = 0x80;
+        tail_len += 1;
+        let pad_to = if tail_len <= 56 { 56 } else { 120 };
+        tail[pad_to..pad_to + 8].copy_from_slice(&bit_len.to_be_bytes());
+        let tail_len = pad_to + 8;
+        for block in tail[..tail_len].chunks_exact(64) {
+            compress(&mut self.state, block);
+        }
+
+        let mut out = String::with_capacity(64);
+        for word in self.state {
+            out.push_str(&format!("{word:08x}"));
+        }
+        out
+    }
 }
 
 fn compress(state: &mut [u32; 8], block: &[u8]) {
@@ -199,5 +262,24 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(b, c);
         assert_eq!(a, sha256_hex(&[b'a'; 55]));
+    }
+
+    #[test]
+    fn incremental_matches_one_shot_for_every_chunking() {
+        let data: Vec<u8> = (0..4096u32).map(|i| (i * 37 + 11) as u8).collect();
+        let expected = sha256_hex(&data);
+        // 覆盖 0 长块、1 字节块、跨越 64/56 边界的块组合。
+        for chunk in [1usize, 3, 7, 63, 64, 65, 127, 128, 129, 511] {
+            let mut hasher = Sha256::new();
+            for piece in data.chunks(chunk) {
+                hasher.update(piece);
+            }
+            // 交错空 update 也不得改变结果。
+            hasher.update(&[]);
+            assert_eq!(hasher.finish(), expected, "chunk size {chunk}");
+        }
+        let mut empty = Sha256::new();
+        empty.update(&[]);
+        assert_eq!(empty.finish(), sha256_hex(b""));
     }
 }

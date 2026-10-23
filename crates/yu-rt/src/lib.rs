@@ -41,23 +41,25 @@
 #![allow(clippy::result_large_err)]
 #![forbid(unsafe_code)]
 
+pub mod case_tables;
 pub mod code;
 pub mod diag;
+pub mod dialog;
 pub mod event;
 pub mod expr;
+mod image;
 pub mod input;
 pub mod json;
-mod image;
-pub mod tables;
+pub mod rng;
 pub mod sysvar;
 pub mod sysvar_abi;
+pub mod tables;
 pub mod task;
 pub mod text;
 pub mod value;
 pub mod vm;
 pub mod ycd;
 
-pub use yu_log::Diag;
 pub use event::VmEvent;
 pub use input::{InputState, InputTimeline};
 pub use tables::{BootTables, TableSet};
@@ -65,3 +67,4 @@ pub use task::{ChainReport, TaskSeed};
 pub use text::{TextSnapshot, TextState};
 pub use value::{ElemType, Value, VarRef, VarSpace};
 pub use vm::{BootConfig, Vm, VmError};
+pub use yu_log::Diag;

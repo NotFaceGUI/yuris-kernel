@@ -81,16 +81,26 @@ pub enum VmEvent {
         args: Vec<ArgValue>,
     },
     /// 显示/图形/声音等域命令:交宿主域状态机,事件流只记事实。
+    ///
+    /// `script`/`pc` 为**可选**定位(P4/`COV-M-05`):内核发出的域事件总是
+    /// `Some`;外部构造/旧 golden 可给 `None`。宿主可据此把域命令定位回
+    /// 脚本(与 `Command` 事件同坐标),不再依赖事件顺序猜位置。
     DomainCall {
         frame: u64,
         domain: Domain,
         name: String,
         args: Vec<ArgValue>,
+        script: Option<u32>,
+        pc: Option<u32>,
     },
     /// 引擎 `END` 被执行(可带 RESTART)。
     End { frame: u64, restart: bool },
     /// 诊断(挂号/未实现/可恢复错误),与 `yu-log::Diag` 一一对应。
-    Diag { frame: u64, code: String, detail: String },
+    Diag {
+        frame: u64,
+        code: String,
+        detail: String,
+    },
 }
 
 /// 参数求值结果(按 `kind` 序号)。

@@ -22,14 +22,15 @@
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use yu_gfx::{
-    transition_coverage, BlendMode, Clear, CompositorFrame, CopyId, CopyOp,
-    CopySource, FilterMode, ImageAction, ImageOp, Layer, LayerId, Op, OpStatus, PassTarget,
-    TextureRef,
+    transition_coverage, BlendMode, Clear, CompositorFrame, CopyId, CopyOp, CopySource, FilterMode,
+    ImageAction, ImageOp, Layer, LayerId, Op, OpStatus, PassTarget, TextDraw, TextureRef,
 };
 
 use crate::imageop::{apply_horizontal, apply_rect_paint, apply_reverse};
+use crate::text::{layer_base, TextComposer, TextPaintStats};
 use crate::texture::{AssetIssue, Texture, TextureStore};
 
 /// RGBA8 表面(行优先,直通 alpha)。
@@ -117,6 +118,14 @@ pub struct RenderReport {
     pub missing_assets: Vec<AssetIssue>,
     /// 本帧 `TextRun` 数量(全部未栅格化)。
     pub skipped_text: usize,
+    /// `CGACT[TEXT]` 绘制项应用数。
+    pub text_draws: usize,
+    /// 文本栅格化成功写入的字符数。
+    pub text_glyphs: usize,
+    /// 文本缺字/不可解码字符数。
+    pub text_missing: usize,
+    /// 文本失败原因(去重、稳定排序)。
+    pub text_diags: Vec<String>,
     pub filter_mag: &'static str,
     pub filter_min: &'static str,
     pub filter_mip: &'static str,
@@ -126,9 +135,13 @@ pub struct RenderReport {
 }
 
 /// `render_frame` 的输出。
+///
+/// `surface` 用 `Arc` 共享:软后端要把同一份屏幕像素留作下一帧的
+/// `COPY ID=:/W0/` 后缓冲,引擎/宿主又要消费返回值。入 `Arc` 后
+/// 每帧不再复制 800×600×4 ≈ 1.9MB 的整帧。
 #[derive(Clone, Debug)]
 pub struct RenderOutput {
-    pub surface: Surface,
+    pub surface: Arc<Surface>,
     pub report: RenderReport,
 }
 
@@ -143,12 +156,14 @@ pub struct SoftRenderer {
     textures: TextureStore,
     snapshots: Snapshots,
     /// 上一帧呈现的屏幕内容(引擎 `COPY ID=:/W0/` 读的是当时后缓冲)。
-    last_screen: Option<Surface>,
+    last_screen: Option<Arc<Surface>>,
     /// `CGACT[SIZE/SIZE2]`/`REVERSE`/`HORIZONTAL` 结果缓存(源身份 + 参数)。
     ///
     /// 精灵脚本每帧对所有可见层重发 SIZE;官方是 GPU StretchRect,
     /// 本后端若每帧重算 800×600 会把帧耗时推到数百 ms(EVID-J3-04)。
     image_cache: BTreeMap<ImageCacheKey, Rc<Texture>>,
+    /// 文本栅格化/合成器(懒加载系统字体;无文本帧零成本)。
+    text: TextComposer,
 }
 
 /// 图像加工的源身份(资产 key / 1×1 黑 / 冻结快照)。
@@ -201,7 +216,24 @@ impl SoftRenderer {
             snapshots: BTreeMap::new(),
             last_screen: None,
             image_cache: BTreeMap::new(),
+            text: TextComposer::new(),
         }
+    }
+
+    /// 用调用方字体源构造文本合成器(测试/自带字体)。
+    pub fn with_text_source(mut self, source: yu_font::FontSource) -> Self {
+        self.text = TextComposer::with_source(source);
+        self
+    }
+
+    /// 文本合成器(诊断/测试用)。
+    pub fn text_composer(&mut self) -> &mut TextComposer {
+        &mut self.text
+    }
+
+    /// 预枚举系统字体(宿主启动时;见 `TextComposer::warm`)。
+    pub fn warm_text(&mut self) {
+        let _ = self.text.warm();
     }
 
     /// 丢弃跨帧状态(重启用;DIV-HOST-001)。
@@ -229,7 +261,7 @@ impl SoftRenderer {
     pub fn render_frame(&mut self, frame: &CompositorFrame) -> RenderOutput {
         self.textures.begin_frame();
         prune_snapshots(&mut self.snapshots, frame);
-        let mut st = RenderState::new(frame);
+        let mut st = RenderState::new(frame, &mut self.text);
         let mut screen: Option<Surface> = None;
 
         for pass in &frame.passes {
@@ -261,7 +293,7 @@ impl SoftRenderer {
                                     target,
                                     copy,
                                     &mut st,
-                                    self.last_screen.as_ref(),
+                                    self.last_screen.as_deref(),
                                 ) {
                                     Ok(()) => st.report.ops_drawn += 1,
                                     Err(reason) => st.skip_op(op, reason),
@@ -270,9 +302,7 @@ impl SoftRenderer {
                             _ => {
                                 let reason = match op.status() {
                                     OpStatus::Unimplemented(why) => why.to_string(),
-                                    OpStatus::Executable => {
-                                        "texture_pass.not_executed".to_string()
-                                    }
+                                    OpStatus::Executable => "texture_pass.not_executed".to_string(),
                                 };
                                 st.skip_op(op, reason);
                             }
@@ -337,6 +367,49 @@ impl SoftRenderer {
                 frame.clear.rgba,
             )
         });
+        // 自动文本层(`TEXT[ID]` 不存在/为空时的屏幕叠加):`_TEXT_FLAG` 已由
+        // gfx 排版;引擎在窗口 CG 之上绘制文本层(DIV-GFX-057,`Likely`)。
+        if let Some(layout) = frame.text_layout.as_ref() {
+            match &layout.target {
+                None => {
+                    // 屏幕叠加:先画到透明覆盖层,再用与 wgpu 相同的纹理
+                    // 合成路径(MODE 0)贴上屏幕 —— 两端像素公式一致。
+                    let mut overlay = Surface::new(surface.width, surface.height, [0, 0, 0, 0]);
+                    let stats = st.text.paint_layout_with(
+                        &mut overlay.rgba,
+                        overlay.width,
+                        overlay.height,
+                        layout,
+                        Some(true),
+                    );
+                    let painted = stats.glyphs;
+                    merge_text_stats(&mut st.report, stats);
+                    if painted > 0 {
+                        let image = ImageRef::from_surface(&overlay);
+                        draw_image(
+                            &mut surface,
+                            image,
+                            0,
+                            0,
+                            overlay.width,
+                            overlay.height,
+                            255,
+                            BlendMode::Normal,
+                            frame.filter.mag,
+                            None,
+                        );
+                    }
+                }
+                Some(target) if !frame.layers.iter().any(|l| &l.id == target) => {
+                    let why = format!("text.layout_target_missing: {}", target.display());
+                    if !st.report.text_diags.contains(&why) {
+                        st.report.text_diags.push(why);
+                        st.report.text_diags.sort();
+                    }
+                }
+                Some(_) => {}
+            }
+        }
         // 屏幕是 opaque 窗口:组 RT 的 alpha 只参与“组合成到屏幕”这一步,
         // 最终呈现不带逐像素 alpha(D3D9 窗口后缓冲不用于桌面混合;浏览器
         // canvas 也是 alphaMode=opaque)。不归一会在按钮抗锯齿等半透明像素上
@@ -344,7 +417,8 @@ impl SoftRenderer {
         for px in surface.rgba.chunks_exact_mut(4) {
             px[3] = 255;
         }
-        self.last_screen = Some(surface.clone());
+        let surface = Arc::new(surface);
+        self.last_screen = Some(Arc::clone(&surface));
         RenderOutput {
             surface,
             report: st.finish(),
@@ -481,7 +555,8 @@ fn apply_image_op(
                 ImageAction::Reverse => apply_reverse(&mut texture),
                 _ => apply_horizontal(&mut texture),
             }
-            st.texture_overrides.insert(target.clone(), Rc::new(texture));
+            st.texture_overrides
+                .insert(target.clone(), Rc::new(texture));
             return Ok(());
         }
         if let Some(layer) = frame.layers.iter().find(|l| l.id == image.source) {
@@ -545,7 +620,8 @@ fn apply_image_op(
         }
         _ => return Err("gfx.imageop.unsupported".to_string()),
     }
-    st.texture_overrides.insert(target.clone(), Rc::new(texture));
+    st.texture_overrides
+        .insert(target.clone(), Rc::new(texture));
     Ok(())
 }
 
@@ -760,7 +836,10 @@ fn draw_op(
 ) {
     st.report.ops_total += 1;
     match op {
-        Op::Layer(layer) => draw_layer(textures, snapshots, frame, op, layer, dst, st),
+        Op::Layer(layer) => {
+            apply_layer_text(textures, frame, layer, st);
+            draw_layer(textures, snapshots, frame, op, layer, dst, st)
+        }
         Op::Group(group) => {
             if !group.layer.visible {
                 st.skip_op(op, "invisible");
@@ -806,6 +885,67 @@ fn draw_op(
         Op::Image(_) => {
             let reason = status_reason(op).unwrap_or("imageop.unsupported");
             st.skip_op(op, reason);
+        }
+    }
+}
+
+/// 把文本合成进图层基图的副本,供随后的常规图层绘制使用。
+///
+/// 化学等价性:引擎把文字写进图层像素,再按图层 `A/MODE` 合成;这里先生成
+/// "基图+文本"的覆盖纹理,再走同一 `draw_image` 路径(EVID/论证见
+/// `docs/divergences/gfx-text.md` DIV-GFX-055)。
+fn apply_layer_text(
+    textures: &mut TextureStore,
+    frame: &CompositorFrame,
+    layer: &Layer,
+    st: &mut RenderState,
+) {
+    let draws: Vec<TextDraw> = frame
+        .text_draws
+        .iter()
+        .filter(|d| d.target == layer.id)
+        .cloned()
+        .collect();
+    let layout = frame
+        .text_layout
+        .as_ref()
+        .filter(|l| l.target.as_ref() == Some(&layer.id));
+    if draws.is_empty() && layout.is_none() {
+        return;
+    }
+    if !layer.visible {
+        return;
+    }
+    let base = match st.texture_overrides.get(&layer.id) {
+        Some(base) => base.clone(),
+        None => match layer_base(textures, layer) {
+            Ok(t) => Rc::new(t),
+            Err(reason) => {
+                let why = format!("text.layer_base: {reason}");
+                if !st.report.text_diags.contains(&why) {
+                    st.report.text_diags.push(why);
+                    st.report.text_diags.sort();
+                }
+                return;
+            }
+        },
+    };
+    let (composed, stats) = st.text.compose_layer(&base, &draws, layout);
+    merge_text_stats(&mut st.report, stats);
+    if let Some(composed) = composed {
+        st.texture_overrides
+            .insert(layer.id.clone(), Rc::new(composed));
+    }
+}
+
+fn merge_text_stats(report: &mut RenderReport, stats: TextPaintStats) {
+    report.text_draws += stats.draws;
+    report.text_glyphs += stats.glyphs;
+    report.text_missing += stats.missing;
+    for d in stats.diags {
+        if !report.text_diags.contains(&d) {
+            report.text_diags.push(d);
+            report.text_diags.sort();
         }
     }
 }
@@ -1165,21 +1305,24 @@ fn draw_layer(
 /// 1×1 黑图(`FILE=""`;手册 `cg/cg.html`)。
 const SOLID_BLACK: &[u8] = &[0, 0, 0, 255];
 
-struct RenderState {
+struct RenderState<'a> {
     offscreens: BTreeMap<LayerId, Surface>,
     /// 帧内图像加工后的图层纹理(基图副本);只影响本帧。
     texture_overrides: BTreeMap<LayerId, Rc<Texture>>,
     skipped: BTreeMap<(&'static str, String, String), u32>,
     report: RenderReport,
+    /// 文本栅格化/合成(两条文本路径共用)。
+    text: &'a mut TextComposer,
 }
 
-impl RenderState {
-    fn new(frame: &CompositorFrame) -> Self {
+impl<'a> RenderState<'a> {
+    fn new(frame: &CompositorFrame, text: &'a mut TextComposer) -> Self {
         let visible_layers = frame.layers.iter().filter(|l| l.visible).count();
         Self {
             offscreens: BTreeMap::new(),
             texture_overrides: BTreeMap::new(),
             skipped: BTreeMap::new(),
+            text,
             report: RenderReport {
                 frame: frame.frame,
                 viewport_width: frame.viewport.width,
@@ -1193,7 +1336,11 @@ impl RenderState {
                 skipped_ops_total: 0,
                 skipped: Vec::new(),
                 missing_assets: Vec::new(),
-                skipped_text: frame.text.len(),
+                skipped_text: frame.text.iter().filter(|t| t.flags.is_none()).count(),
+                text_draws: 0,
+                text_glyphs: 0,
+                text_missing: 0,
+                text_diags: Vec::new(),
                 filter_mag: frame.filter.mag.as_str(),
                 filter_min: frame.filter.min.as_str(),
                 filter_mip: frame.filter.mip.as_str(),
@@ -1226,7 +1373,13 @@ impl RenderState {
 
 /// 预测 `frame_has_drawable_output`:按当前后端能力判断屏幕 pass 是否至少
 /// 有一个可执行绘制操作。用于 headless 循环选择“首个可绘制帧”,不做像素工作。
+///
+/// 文本也算可见输出:自动文本层(`text_layout`)或图层文本(`text_draws`)
+/// 非空时,即使没有任何可执行图层 op,画面也不是黑屏。
 pub fn frame_has_drawable_output(frame: &CompositorFrame) -> bool {
+    if frame.text_layout.is_some() || !frame.text_draws.is_empty() {
+        return true;
+    }
     let mut offscreen_drawable: BTreeMap<&LayerId, bool> = BTreeMap::new();
     for pass in &frame.passes {
         match &pass.target {
@@ -1262,10 +1415,7 @@ fn op_predict_drawable(op: &Op, offscreens: &BTreeMap<&LayerId, bool>) -> bool {
             group.layer.visible
                 && group.layer.parts.is_empty()
                 && supported_blend(group.layer.blend).is_some()
-                && offscreens
-                    .get(&group.offscreen)
-                    .copied()
-                    .unwrap_or(false)
+                && offscreens.get(&group.offscreen).copied().unwrap_or(false)
         }
         // 过渡把本层纹理画出来;配对缺失时 gfx 已回退普通层。
         Op::Transition(transition) => {
@@ -1300,10 +1450,9 @@ fn group_surface_size(frame: &CompositorFrame, id: &LayerId) -> (u32, u32) {
         .iter()
         .find(|layer| &layer.id == id)
         .and_then(|layer| layer.group_size())
-        .map_or(
-            (frame.viewport.width, frame.viewport.height),
-            |size| (size.width, size.height),
-        )
+        .map_or((frame.viewport.width, frame.viewport.height), |size| {
+            (size.width, size.height)
+        })
 }
 
 fn status_reason(op: &Op) -> Option<&'static str> {
@@ -1365,11 +1514,7 @@ fn op_target(op: &Op) -> String {
         Op::Transition(transition) => transition.layer.id.display(),
         Op::Mask(mask) => mask.layer.id.display(),
         Op::Copy(copy) => copy.dest.display(),
-        Op::Image(image) => image
-            .target
-            .as_ref()
-            .unwrap_or(&image.source)
-            .display(),
+        Op::Image(image) => image.target.as_ref().unwrap_or(&image.source).display(),
     }
 }
 
@@ -1473,13 +1618,12 @@ fn draw_image(
             let layer_a = alpha;
             let alpha = match transition {
                 Some(mask) => {
-                    let mask_px = if dest_width == mask.image.width
-                        && dest_height == mask.image.height
-                    {
-                        mask.image.pixel(dx, dy)
-                    } else {
-                        sample(mask.image, dx, dy, dest_width, dest_height, filter)
-                    };
+                    let mask_px =
+                        if dest_width == mask.image.width && dest_height == mask.image.height {
+                            mask.image.pixel(dx, dy)
+                        } else {
+                            sample(mask.image, dx, dy, dest_width, dest_height, filter)
+                        };
                     if mask.crossfade {
                         // pass0(psD):`oC0 = tex1*(1-FadeVal) + tex2*FadeVal`,
                         // 再乘 `YS_AlphaVal`(由本函数的 alpha 承担)。
@@ -1488,8 +1632,7 @@ fn draw_image(
                         for c in 0..4 {
                             src[c] = (f64::from(src[c]) * inv + f64::from(mask_px[c]) * f)
                                 .round()
-                                .clamp(0.0, 255.0)
-                                as u8;
+                                .clamp(0.0, 255.0) as u8;
                         }
                         alpha
                     } else {
@@ -1534,11 +1677,9 @@ fn sample(
 ) -> [u8; 4] {
     match filter {
         FilterMode::Point => {
-            let sx = (i64::from(dx) * 2 + 1)
-                .saturating_mul(i64::from(image.width))
+            let sx = (i64::from(dx) * 2 + 1).saturating_mul(i64::from(image.width))
                 / (i64::from(dest_width) * 2);
-            let sy = (i64::from(dy) * 2 + 1)
-                .saturating_mul(i64::from(image.height))
+            let sy = (i64::from(dy) * 2 + 1).saturating_mul(i64::from(image.height))
                 / (i64::from(dest_height) * 2);
             image.pixel(
                 (sx as u32).min(image.width - 1),
@@ -1842,7 +1983,13 @@ mod tests {
         // A=128:stage1 白混 = T·A + (1−C.a) ≈ 0.89;
         // blend = dst·stage/255 ≈ 89(向白色中性点淡化,不是变黑)。
         assert_eq!(
-            blend_pixel([100, 100, 100, 255], [200, 200, 200, 255], 128, 128, BlendMode::Multiply),
+            blend_pixel(
+                [100, 100, 100, 255],
+                [200, 200, 200, 255],
+                128,
+                128,
+                BlendMode::Multiply
+            ),
             [89, 89, 89, 128]
         );
     }
@@ -1889,8 +2036,8 @@ mod tests {
             width: 4,
             height: 2,
             rgba: vec![
-                1, 0, 0, 255, 1, 0, 0, 255, 2, 0, 0, 255, 2, 0, 0, 255, 1, 0, 0, 255, 1, 0,
-                0, 255, 2, 0, 0, 255, 2, 0, 0, 255,
+                1, 0, 0, 255, 1, 0, 0, 255, 2, 0, 0, 255, 2, 0, 0, 255, 1, 0, 0, 255, 1, 0, 0, 255,
+                2, 0, 0, 255, 2, 0, 0, 255,
             ],
         };
         let mut dst = Surface::new(4, 2, [0, 0, 0, 0]);
@@ -1906,7 +2053,13 @@ mod tests {
         // MODE 2 + A=128:固定路径 = dst − (T·A)·A = 50;
         // HLSL 路径 = dst − T·A = 0。
         assert_eq!(
-            blend_pixel([100, 100, 100, 255], [200, 200, 200, 255], 128, 128, BlendMode::Subtract),
+            blend_pixel(
+                [100, 100, 100, 255],
+                [200, 200, 200, 255],
+                128,
+                128,
+                BlendMode::Subtract
+            ),
             [50, 50, 50, 191]
         );
         assert_eq!(
@@ -2015,7 +2168,8 @@ mod tests {
                 let reduced = [q(s0 * 255.0), q(s1 * 255.0), q(s2 * 255.0)];
                 let expected = d3d9_equation_from_state(dst, reduced, src_alpha, &state);
                 assert_eq!(
-                    got, expected,
+                    got,
+                    expected,
                     "mode {} dst={dst:?} src={src:?} A={layer_alpha}",
                     mode.code()
                 );

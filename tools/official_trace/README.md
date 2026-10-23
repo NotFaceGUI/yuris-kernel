@@ -7,8 +7,8 @@
 
 | 等级 | 状态 | 证据 |
 |---|---|---|
-| **屏幕级（screen）** | 已达成 | `capture_screen.py` 启动官方 0.495 + ERIS 数据，截取客户区 800×600，写 schema v3 `frame/frame_description`（`level=screen`） |
-| **事件级（L1）** | **已达成（窗口级）** | `probe_dispatch.py` 在 `0x4044db` / `0x404547` 两个分派点下只读断点；命中记录 `(script, pc, handler → cmd/name)`，写 schema v3 `vm/command` |
+| **屏幕级（screen）** | 已达成 | `capture_screen.py` 启动官方 0.495 + ERIS 数据，截取客户区 800×600，写 schema v4 `frame/frame_description`（`level=screen`） |
+| **事件级（L1）** | **已达成（窗口级）** | `probe_dispatch.py` 在 `0x4044db` / `0x404547` 两个分派点下只读断点；命中记录 `(script, pc, handler → cmd/name)`，写 schema v4 `vm/command` |
 
 事件级 L1 的**明确边界**（不得外推）：
 
@@ -30,7 +30,7 @@ python tools/official_trace/capture_screen.py \
 
 ```text
 <out>/frame_0001.png ...       客户区截图(不入库)
-<out>/official_screen.jsonl    schema v3 trace(producer=official, level=screen)
+<out>/official_screen.jsonl    schema v4 trace(producer=official, level=screen)
 <out>/input_timeline.json      帧号 -> 输入(首屏为空)
 <out>/manifest.json            引擎/样本 hash、窗口尺寸、等级声明
 ```
@@ -144,7 +144,7 @@ python tools/official_trace/probe_dispatch.py \
 hits.jsonl             逐命中原始记录（含 handler/ecx/tick/线程/歧义候选）
 command_table.json     运行时 119 项 handler 表与共享分组
 manifest.json          引擎/样本/ysc hash、参数、计数、失败原因、debug_mode 证据
-<trace-out>            schema v3 trace（producer=official, sub=vm/kind=command）
+<trace-out>            schema v4 trace（producer=official, sub=vm/kind=command）
 ```
 
 ### 4.5 输入/前台约束（实测）
@@ -160,7 +160,7 @@ manifest.json          引擎/样本/ysc hash、参数、计数、失败原因�
 
 ### 4.6 trace 语义与命名
 
-- `schema=3`；记录字段顺序固定 `schema,seq,frame,sub,kind,payload`。
+- `schema=4`；记录字段顺序固定 `schema,seq,frame,sub,kind,payload`。
 - 事件记录：`sub="vm"`, `kind="command"`,
   `payload={"script":u32,"pc":u32,"name":str,"args":[]}`。
   `args` 恒为空数组：官方参数求值不可从分派点观测，未伪造。
@@ -214,9 +214,70 @@ cargo run -q -p yu-trace --example emit_kernel_events -- \
 
 - 官方 `args` 不可观测；共享 handler 的命令名留空。要补参数，需要在具体 handler
   入口读运行时窗口/栈，属下一步（不在 L1 范围）。
-- 官方任务事件（spawn/finish/wait/jump）尚未采集；当前只有命令事件。
+- 官方任务事件（spawn/finish/wait/jump）尚未采集；`--mode task-phase` 采的是
+  **每 tick 任务链表相位快照**（不是事件），见 §7。
 - 官方 tick 与内核逻辑帧的映射未证明；对拍只做命令顺序（§5）。
 - 点击转场的完整起点依赖手动触发或前台可控的自动输入；`run_click2` 的官方窗口
   从 tick 299 开始，已错过转场开头约 15 tick（DIV-L-002 说明）。
 - 屏幕截图与事件采集不能在同一断点会话内安全并行（PrintWindow 死锁）。
 - 首屏 vs 内核 `first_frame` 的比较仍按 `DIV-H-001` 撤回，不作结论。
+
+## 7. 任务相位采样（P5 / DIV-L-002）
+
+`--mode task-phase` 不在命令分派点下断点，只在 tick 函数入口 `0x4040f8` 下
+一个 int3，每 tick 只读遍历任务链表：
+
+| 地址/偏移 | 含义 | 证据 |
+|---|---|---|
+| `0x801704` | 任务列表对象；`[obj]` = 头节点 | `FUN_00404398` 入口 `MOV EAX,[0x801704]` |
+| 节点 `+0x0c` | next | `FUN_004046dc` 链表步进 |
+| 节点 `+0x30 == 1` | 该节点是子列表（递归遍历） | `0x4043ec` |
+| 节点 `+0x34` | 任务上下文 | `0x4043d9` |
+| 上下文 `+0x18` / `+0x1c` | FRAME 等待计数 / 绝对期限 ms | `0x40443a`/`0x404445` |
+| 上下文 `+0x20` | pc | `0x4044ac` |
+| 上下文 `+0x3c` | script id (u16) | 探针实测 |
+| 上下文 `+0x14 & +0x15` | 启用位 | `0x4043dc` |
+| 上下文 `+0x09` | 文本等待/结束标志 | `0x40442e` |
+
+用法（600 tick）：
+
+```bash
+python tools/official_trace/probe_dispatch.py --mode task-phase   --exe <官方 yu-ris.exe> --cwd <工程根>   --out-dir target/tmp/official/phase --seconds 40 --max-ticks 600   --input-at 8 --input both --click-xy 410,275 --input-method sendinput
+```
+
+输出 `<out-dir>/task_phase.jsonl`：每行
+`{"i","tick_counter","effective_click","list","tasks":[...]}`。`tick_counter`
+是引擎 `[0x801268]`；采样在 tick 函数**入口**，即“上一 tick 结束”的相位。
+任务字段读失败写 `null`，不猜。采样器会先把窗口置前台、再布防断点
+（挂断点时 `SetForegroundWindow` 会等待 UI 线程而死锁）。
+
+内核侧对拍：
+
+```bash
+cargo run -q -p yu-trace --example emit_kernel_phase --   --root <工程根> --out target/tmp/kernel_phase.jsonl --ticks 600 --debug-mode true
+python tools/task_phase_diff.py --official <task_phase.jsonl> --kernel <kernel_phase.jsonl>   --align anchor --anchor-script 66 --out target/tmp/phase_diff.txt
+```
+
+`--align anchor` 以目标脚本（默认 66 场景任务）首次出现为相对 0；`click`
+以首次 `trigger.tick` / 内核 `click_frame` 为 0；`index` 按采样序号。
+比较每 tick 的启用任务 **`(script,pc)` 多重集合**（另有 script-only 判据），
+不做排序/去重/容差。
+
+### 7.1 2026-10-23 采集结果（600 tick，无点击）
+
+- 官方：600 tick（tick 4..603；布防晚 4 tick），任务 66 首次出现在 tick 12；
+  任务 0/8/20×3/66 常驻；任务 66 在 tick 218 被 script 139 取代。
+- 内核：600 tick（frame 1..602），任务 66 首次出现在 **frame 12**（anchor 对齐一致）；
+  任务 20 三个实例的 pc 与官方逐 tick 相同（相对 0..590）。
+- 首分歧：官方常驻 script 0（容器/主任务）与 script 8；内核 `SYSTEM` 主任务
+  （script 8）在 frame 16 左右结束并从链表消失。
+- 显式忽略 script 0/8 后（`--ignore-scripts 0,8 --from-relative 0`）：
+  - 首个 `(script,pc)` 分歧在相对 **49**：官方 `66:5168`，内核 `66:5100`；
+    官方 66 的 pc 在 5100/5168 间推进（相对 49/50/62…），内核 600 tick 一直 5100。
+  - 首个 script-only 分歧在相对 **206**：官方用 `139` 取代 `66`，内核仍保留 `66`。
+  - script 66 存活窗口：官方 0..205，内核 0..590（内核未结束场景任务）。
+- **点击未生效**：`SendInput` 在窗口前台时已发送（`input_sent` 有记录），但
+  `0x80157c` 有效点击标志始终为 0、`trigger=null`、任务相位无转场。属本机
+  会话的输入/激活限制（官方引擎用 DirectInput 风格按键表）；script 60 返回
+  后的转场相位仍未被 600 tick 覆盖，`DIV-L-002` 保持 open。
+- 原始产物只在 `target/tmp/`，不入库。

@@ -195,6 +195,27 @@ pub enum HeaderCompare {
     Strict,
 }
 
+/// 帧描述载荷的字段投影策略。
+///
+/// 帧描述是唯一一个「同一 payload 里既有实测字段又有派生字段」的 kind:
+/// - `display_sha256` 是规范 display JSON 的派生值(内容寻址),不是独立观测;
+/// - 屏幕级采集的 `pass_count/op_count/executable_ops/skipped_ops` 在引擎外部
+///   不可观测,官方侧写 0 只是占位(见 `SCHEMA.md` §4.4)。
+///
+/// 因此跨 producer 比屏幕帧时不能用「全字段精确比较」冒充等价:那会把占位 0
+/// 当成实测值,或用派生摘要掩盖 display 的真实差异。这里的两个策略都是
+/// **显式投影**,被保留的字段仍然精确比较,没有任何容差。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FrameFieldPolicy {
+    /// 全部字段(默认;同 producer / 事件级)。
+    #[default]
+    Full,
+    /// 屏幕级跨 producer:只比较 `frame`、`level`、`display`;
+    /// `display` 存在时省略派生 `display_sha256`,计数占位字段省略。
+    /// `display` 为 null 的纯摘要记录仍比较 `display_sha256`。
+    Screen,
+}
+
 /// [`diff_aligned`] 的选项。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlignedDiffOptions {
@@ -204,6 +225,8 @@ pub struct AlignedDiffOptions {
     /// producer(例如 official 事件采集没有命令参数):这是**显式投影**,
     /// 未列出的字段明确不参与比较,但已列出的字段仍精确比较。
     pub payload_fields: Vec<String>,
+    /// 帧描述载荷的字段投影(见 [`FrameFieldPolicy`])。
+    pub frame_fields: FrameFieldPolicy,
     /// 首分歧报告附带的上下文条数(前后各 N 条逻辑记录)。
     pub context: usize,
 }
@@ -214,6 +237,7 @@ impl Default for AlignedDiffOptions {
             header: HeaderCompare::Semantic,
             projection: Projection::all(),
             payload_fields: Vec::new(),
+            frame_fields: FrameFieldPolicy::Full,
             context: 2,
         }
     }
@@ -226,6 +250,7 @@ impl AlignedDiffOptions {
             header: HeaderCompare::Semantic,
             projection: Projection::all(),
             payload_fields: Vec::new(),
+            frame_fields: FrameFieldPolicy::Full,
             context: 3,
         }
     }
@@ -236,6 +261,7 @@ impl AlignedDiffOptions {
             header: HeaderCompare::Strict,
             projection: Projection::all(),
             payload_fields: Vec::new(),
+            frame_fields: FrameFieldPolicy::Full,
             context: 2,
         }
     }
@@ -243,6 +269,12 @@ impl AlignedDiffOptions {
     /// 只比较 payload 的指定顶层键(两边可观测字段不同时使用)。
     pub fn with_payload_fields(mut self, fields: &[&str]) -> Self {
         self.payload_fields = fields.iter().map(|field| field.to_string()).collect();
+        self
+    }
+
+    /// 设置帧描述的字段投影。
+    pub fn with_frame_fields(mut self, policy: FrameFieldPolicy) -> Self {
+        self.frame_fields = policy;
         self
     }
 }
@@ -391,9 +423,18 @@ pub fn diff_aligned_logs(
         match actual_index.get(&entry.key) {
             Some(&actual_position) => {
                 let actual_entry = &actual_entries[actual_position];
-                let expected_payload = project_payload(&entry.payload, &options.payload_fields);
-                let actual_payload =
-                    project_payload(&actual_entry.payload, &options.payload_fields);
+                let expected_payload = project_payload(
+                    entry.key.kind,
+                    &entry.payload,
+                    &options.payload_fields,
+                    options.frame_fields,
+                );
+                let actual_payload = project_payload(
+                    actual_entry.key.kind,
+                    &actual_entry.payload,
+                    &options.payload_fields,
+                    options.frame_fields,
+                );
                 if let Some(site) = compare(&expected_payload, &actual_payload, "/payload") {
                     let report = AlignedDiffReport {
                         key: entry.key.clone(),
@@ -420,8 +461,10 @@ pub fn diff_aligned_logs(
                     actual_line: None,
                     path: String::new(),
                     expected: json::to_text(&project_payload(
+                        entry.key.kind,
                         &entry.payload,
                         &options.payload_fields,
+                        options.frame_fields,
                     )),
                     actual: "null".to_string(),
                     context: context_for(
@@ -452,7 +495,12 @@ pub fn diff_aligned_logs(
             actual_line: Some(entry.line),
             path: String::new(),
             expected: "null".to_string(),
-            actual: json::to_text(&project_payload(&entry.payload, &options.payload_fields)),
+            actual: json::to_text(&project_payload(
+                entry.key.kind,
+                &entry.payload,
+                &options.payload_fields,
+                options.frame_fields,
+            )),
             context,
         };
         return Err(aligned_failure(report));
@@ -518,20 +566,55 @@ fn context_for(
     out
 }
 
-fn project_payload(payload: &Json, fields: &[String]) -> Json {
+fn project_payload(
+    kind: Kind,
+    payload: &Json,
+    fields: &[String],
+    frame_fields: FrameFieldPolicy,
+) -> Json {
+    let payload = if kind == Kind::FrameDescription && frame_fields == FrameFieldPolicy::Screen {
+        project_screen_frame(payload)
+    } else {
+        payload.clone()
+    };
     if fields.is_empty() {
-        return payload.clone();
+        return payload;
     }
     match payload {
         Json::Obj(items) => Json::Obj(
             items
-                .iter()
+                .into_iter()
                 .filter(|(key, _)| fields.iter().any(|field| field == key))
-                .cloned()
                 .collect(),
         ),
-        other => other.clone(),
+        other => other,
     }
+}
+
+/// 屏幕级帧描述的显式投影(见 [`FrameFieldPolicy::Screen`])。
+///
+/// 只保留实测可比的 `frame` / `level` / `display`;`display` 非 null 时
+/// `display_sha256` 只是它的派生摘要(省略);`display` 为 null 时摘要就是
+/// 唯一内容(保留)。计数占位字段(`pass_count` 等)在引擎外部不可观测,
+/// 投影后不参与比较——这是"不声称相等",不是容差。
+fn project_screen_frame(payload: &Json) -> Json {
+    let Json::Obj(items) = payload else {
+        return payload.clone();
+    };
+    let display_present = items
+        .iter()
+        .any(|(key, value)| key == "display" && !matches!(value, Json::Null));
+    Json::Obj(
+        items
+            .iter()
+            .filter(|(key, _)| match key.as_str() {
+                "frame" | "level" | "display" => true,
+                "display_sha256" => !display_present,
+                _ => false,
+            })
+            .cloned()
+            .collect(),
+    )
 }
 
 fn compare_headers(
@@ -1079,6 +1162,7 @@ mod tests {
             header: HeaderCompare::Ignore,
             projection: Projection::all(),
             payload_fields: Vec::new(),
+            frame_fields: FrameFieldPolicy::Full,
             context: 2,
         };
         // 逻辑键按 (sub,kind,frame,ordinal):B/C 都落在 ordinal=1,
@@ -1105,6 +1189,7 @@ mod tests {
             header: HeaderCompare::Ignore,
             projection: Projection::all(),
             payload_fields: Vec::new(),
+            frame_fields: FrameFieldPolicy::Full,
             context: 1,
         };
 
@@ -1177,6 +1262,7 @@ mod tests {
             header: HeaderCompare::Ignore,
             projection: Projection::all().frames(1, 1),
             payload_fields: Vec::new(),
+            frame_fields: FrameFieldPolicy::Full,
             context: 0,
         };
         assert!(diff_aligned_logs(&expected, &actual, &frame_one).is_ok());
@@ -1185,6 +1271,7 @@ mod tests {
             header: HeaderCompare::Ignore,
             projection: Projection::all(),
             payload_fields: Vec::new(),
+            frame_fields: FrameFieldPolicy::Full,
             context: 0,
         };
         let failure = diff_aligned_logs(&expected, &actual, &all).unwrap_err();
@@ -1194,6 +1281,7 @@ mod tests {
             header: HeaderCompare::Ignore,
             projection: Projection::with_subs(&[Sub::Frame]),
             payload_fields: Vec::new(),
+            frame_fields: FrameFieldPolicy::Full,
             context: 0,
         };
         assert!(diff_aligned_logs(&expected, &actual, &only_frames).is_ok());
@@ -1202,6 +1290,7 @@ mod tests {
             header: HeaderCompare::Ignore,
             projection: Projection::all().frames(3, 1),
             payload_fields: Vec::new(),
+            frame_fields: FrameFieldPolicy::Full,
             context: 0,
         };
         let failure = diff_aligned_logs(&expected, &actual, &invalid).unwrap_err();
@@ -1244,6 +1333,7 @@ mod tests {
             header: HeaderCompare::Ignore,
             projection: Projection::all(),
             payload_fields: Vec::new(),
+            frame_fields: FrameFieldPolicy::Full,
             context: 0,
         };
         let failure = diff_aligned_logs(&expected, &actual, &full).unwrap_err();
@@ -1267,6 +1357,7 @@ mod tests {
             header: HeaderCompare::Ignore,
             projection: Projection::with_subs(&[Sub::Frame]),
             payload_fields: Vec::new(),
+            frame_fields: FrameFieldPolicy::Full,
             context: 1,
         };
         let failure = diff_aligned_logs(&expected, &actual, &options).unwrap_err();
@@ -1277,5 +1368,88 @@ mod tests {
         assert_eq!(report.path, "/payload/skipped_ops");
         assert_eq!(report.expected, "1");
         assert_eq!(report.actual, "2");
+    }
+
+    fn screen_frame(frame: u64, pixels: &str, op_count: u64) -> FrameSummary {
+        let display = format!(r#"{{"width":800,"height":600,"pixels_sha256":"{pixels}"}}"#);
+        FrameSummary::from_input(FrameDescriptionInput {
+            frame,
+            level: FrameLevel::Screen,
+            // 屏幕级计数在引擎外部不可观测:两侧都可能是占位值。
+            pass_count: 0,
+            op_count,
+            executable_ops: 0,
+            skipped_ops: 0,
+            display: Some(display.into_bytes()),
+            display_sha256: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn screen_frame_policy_compares_pixels_not_placeholder_counts() {
+        let header = header_with(ProducerInfo::kernel(), "yu-trace test", &[]);
+        let pixels = "c".repeat(64);
+        let mut expected = TraceLog::new();
+        expected.push_header(header.clone());
+        expected.push_frame(screen_frame(3, &pixels, 0));
+        let mut actual = TraceLog::new();
+        actual.push_header(header.clone());
+        // 占位计数不同、display 相同:Screen 投影必须为 0 分歧。
+        actual.push_frame(screen_frame(3, &pixels, 999));
+
+        let screen = AlignedDiffOptions {
+            header: HeaderCompare::Ignore,
+            projection: Projection::with_subs(&[Sub::Frame]),
+            payload_fields: Vec::new(),
+            frame_fields: FrameFieldPolicy::Screen,
+            context: 0,
+        };
+        assert!(diff_aligned_logs(&expected, &actual, &screen).is_ok());
+
+        // 同一对输入在 Full 策略下会报计数差异——证明投影不是"永远相等"。
+        let full = AlignedDiffOptions {
+            frame_fields: FrameFieldPolicy::Full,
+            ..screen.clone()
+        };
+        let failure = diff_aligned_logs(&expected, &actual, &full).unwrap_err();
+        assert_eq!(failure.aligned_report().unwrap().path, "/payload/op_count");
+
+        // 像素不同:即使 Screen 投影也必须精确报出 display 内部分歧,
+        // 而不能被派生摘要掩盖。
+        let mut other = TraceLog::new();
+        other.push_header(expected.header().expect("header").clone());
+        other.push_frame(screen_frame(3, &"d".repeat(64), 0));
+        let failure = diff_aligned_logs(&expected, &other, &screen).unwrap_err();
+        assert_eq!(
+            failure.aligned_report().unwrap().path,
+            "/payload/display/pixels_sha256"
+        );
+
+        // 纯摘要级记录(display = null):摘要就是唯一内容,必须比较。
+        let digest_only = |hash: &str| {
+            FrameSummary::from_input(FrameDescriptionInput {
+                frame: 3,
+                level: FrameLevel::Screen,
+                pass_count: 0,
+                op_count: 0,
+                executable_ops: 0,
+                skipped_ops: 0,
+                display: None,
+                display_sha256: Some(hash.to_string()),
+            })
+            .unwrap()
+        };
+        let mut a = TraceLog::new();
+        a.push_header(header.clone());
+        a.push_frame(digest_only(&"a".repeat(64)));
+        let mut b = TraceLog::new();
+        b.push_header(header);
+        b.push_frame(digest_only(&"b".repeat(64)));
+        let failure = diff_aligned_logs(&a, &b, &screen).unwrap_err();
+        assert_eq!(
+            failure.aligned_report().unwrap().path,
+            "/payload/display_sha256"
+        );
     }
 }

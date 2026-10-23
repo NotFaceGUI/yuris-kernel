@@ -125,6 +125,9 @@ struct CaseSpec {
     record_events: bool,
     backend: Backend,
     inputs: Vec<CaseInput>,
+    /// 存档域用例(P4 M-C):save 根重定向到 `target/tmp/save-cases/<名>`
+    /// (可写;每轮清空重建),并在 expect 里支持 `save_state_sha256`。
+    save: bool,
     expect: Expect,
 }
 
@@ -142,6 +145,8 @@ struct Expect {
     png_sha256: Option<String>,
     ops_total: Option<u64>,
     skipped_ops_total: Option<u64>,
+    /// 存档域快照摘要(`SaveSnapshot` 的确定性文本;P4 M-C)。
+    save_state_sha256: Option<String>,
 }
 
 impl Expect {
@@ -165,6 +170,9 @@ impl Expect {
         if let Some(v) = object.get("skipped_ops_total").and_then(|v| v.as_u64()) {
             expect.skipped_ops_total = Some(v);
         }
+        if let Some(v) = object.get("save_state_sha256").and_then(|v| v.as_str()) {
+            expect.save_state_sha256 = Some(v.to_string());
+        }
         expect
     }
 
@@ -182,6 +190,9 @@ impl Expect {
         if let Some(v) = self.skipped_ops_total {
             map.insert("skipped_ops_total".to_string(), Value::Number(v as f64));
         }
+        if let Some(v) = &self.save_state_sha256 {
+            map.insert("save_state_sha256".to_string(), Value::String(v.clone()));
+        }
         Value::Object(map)
     }
 
@@ -190,6 +201,7 @@ impl Expect {
             && self.png_sha256.is_none()
             && self.ops_total.is_none()
             && self.skipped_ops_total.is_none()
+            && self.save_state_sha256.is_none()
     }
 }
 
@@ -221,6 +233,7 @@ fn parse_case(path: &Path) -> CliResult<CaseSpec> {
         .get("record_events")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let save = value.get("save").and_then(|v| v.as_bool()).unwrap_or(false);
     let backend = match value.get("backend").and_then(|v| v.as_str()) {
         Some("wgpu") => Backend::Wgpu,
         _ => Backend::Soft,
@@ -259,6 +272,7 @@ fn parse_case(path: &Path) -> CliResult<CaseSpec> {
         record_events,
         backend,
         inputs,
+        save,
         expect: Expect::from_value(value.get("expect")),
     })
 }
@@ -302,10 +316,44 @@ fn build_timeline(inputs: &[CaseInput]) -> InputTimeline {
 
 fn run_case(project: &Project, path: &Path, update: bool) -> CliResult<bool> {
     let spec = parse_case(path)?;
+    // 存档域用例:save 根重定向到 target/tmp(产物只进 target/tmp,
+    // 语料工程目录永不落盘;每轮清空重建保证确定性)。
+    let save_root = spec.save.then(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crates/yu-cli -> workspace root")
+            .join("target/tmp/save-cases")
+            .join(&spec.name)
+    });
+    if let Some(dir) = &save_root {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Failure::runtime(format!("创建 save 根 {} 失败: {e}", dir.display())))?;
+        // 播种:官方 .sd 快照(若已快照到 target/tmp/yssd-corpus)复制进
+        // save 根,让槽表事实进入 save_state_sha256。快照缺失时留空
+        // (摘要只覆盖事件计数,同样确定性)。
+        let seed = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crates/yu-cli -> workspace root")
+            .join("target/tmp/yssd-corpus");
+        if let Ok(entries) = std::fs::read_dir(&seed) {
+            for entry in entries.flatten() {
+                if entry.path().extension().and_then(|e| e.to_str()) == Some("sd") {
+                    let target = dir.join(entry.file_name());
+                    std::fs::copy(entry.path(), &target).map_err(|e| {
+                        Failure::runtime(format!("播种 {} 失败: {e}", entry.path().display()))
+                    })?;
+                }
+            }
+        }
+    }
     let opts = EngineOptions {
         backend: spec.backend,
         entry: spec.entry.clone(),
         record_events: spec.record_events,
+        save_root: save_root.clone(),
         ..EngineOptions::default()
     };
     let mut engine = Engine::new(project.clone(), opts)?;
@@ -328,11 +376,23 @@ fn run_case(project: &Project, path: &Path, update: bool) -> CliResult<bool> {
     let png_bytes =
         png::png_bytes(surface).map_err(|e| Failure::runtime(format!("PNG 编码失败: {e}")))?;
 
+    let save_state = match save_root.as_ref() {
+        Some(_) => {
+            let snapshot = engine
+                .save_snapshot()
+                .ok_or_else(|| Failure::runtime("存档域宿主未安装"))?;
+            let text = save_snapshot_text(&snapshot);
+            Some(sha256_hex(text.as_bytes()))
+        }
+        None => None,
+    };
+
     let actual = Expect {
         display_json_sha256: Some(sha256_hex(display_json.as_bytes())),
         png_sha256: Some(sha256_hex(&png_bytes)),
         ops_total: Some(report.ops as u64),
         skipped_ops_total: Some(report.skipped as u64),
+        save_state_sha256: save_state,
     };
 
     if update {
@@ -377,6 +437,12 @@ fn run_case(project: &Project, path: &Path, update: bool) -> CliResult<bool> {
             .map(|v| v.to_string())
             .as_deref(),
         actual.skipped_ops_total.map(|v| v.to_string()).as_deref(),
+        &mut diffs,
+    );
+    compare(
+        "save_state_sha256",
+        spec.expect.save_state_sha256.as_deref(),
+        actual.save_state_sha256.as_deref(),
         &mut diffs,
     );
     if diffs.is_empty() {
@@ -446,6 +512,41 @@ fn short(value: &Value) -> String {
         Value::Array(_) => "[…]".to_string(),
         Value::Object(_) => "{…}".to_string(),
     }
+}
+
+/// `SaveSnapshot` 的确定性单行文本(save_state_sha256 的输入)。
+///
+/// 只含稳定事实:槽文件(名/尺寸/块数/DNO 表)、预约(DNO/帧/值)、
+/// 域事件计数。**不含**修改时间等易变事实;字段序固定。
+fn save_snapshot_text(snapshot: &yu_save::SaveSnapshot) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "save_calls={} load_calls={} saveend_calls={} fileact_calls={}\n",
+        snapshot.save_calls, snapshot.load_calls, snapshot.saveend_calls, snapshot.fileact_calls
+    ));
+    out.push_str("slots:\n");
+    for slot in &snapshot.slots {
+        let dnos: Vec<String> = slot
+            .dnos
+            .iter()
+            .map(|(dno, var)| format!("{dno}:{var}"))
+            .collect();
+        out.push_str(&format!(
+            "  {} size={} blocks={} dnos={{{}}}\n",
+            slot.name,
+            slot.size,
+            slot.blocks,
+            dnos.join(",")
+        ));
+    }
+    out.push_str("reservations:\n");
+    for fact in &snapshot.reservations {
+        out.push_str(&format!(
+            "  dno={} frame={} value={:?}\n",
+            fact.dno, fact.frame, fact.value
+        ));
+    }
+    out
 }
 
 /// 用例 `inputs` 的时间线展开(单测用)。

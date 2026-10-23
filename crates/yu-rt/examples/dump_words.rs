@@ -6,7 +6,12 @@ fn eris_root() -> String {
     std::env::var("YURIS_SAMPLE_ERIS_ROOT")
         .or_else(|_| {
             std::env::var("YURIS_SAMPLE_ERIS_YSBIN").map(|p| {
-                std::path::Path::new(&p).ancestors().nth(2).unwrap().display().to_string()
+                std::path::Path::new(&p)
+                    .ancestors()
+                    .nth(2)
+                    .unwrap()
+                    .display()
+                    .to_string()
             })
         })
         .expect("set YURIS_SAMPLE_ERIS_ROOT or YURIS_SAMPLE_ERIS_YSBIN")
@@ -14,12 +19,24 @@ fn eris_root() -> String {
 
 fn main() {
     let root = eris_root();
-    let sid: u32 = std::env::args().nth(1).and_then(|v| v.parse().ok()).unwrap_or(130);
-    let from: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(0);
-    let to: usize = std::env::args().nth(3).and_then(|v| v.parse().ok()).unwrap_or(18);
+    let sid: u32 = std::env::args()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(130);
+    let from: usize = std::env::args()
+        .nth(2)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let to: usize = std::env::args()
+        .nth(3)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(18);
     let src = DirSource::open(format!("{root}/data"), Codec::Cp932).unwrap();
     let aux = DirSource::open(&root, Codec::Cp932).unwrap();
-    let cfg = BootConfig { entry_label: "SYSTEM_START".into(), ..BootConfig::default() };
+    let cfg = BootConfig {
+        entry_label: "SYSTEM_START".into(),
+        ..BootConfig::default()
+    };
     let mut vm = Vm::boot_with_aux(Box::new(src), Some(Box::new(aux)), cfg).unwrap();
     let dat = DirSource::open(format!("{root}/data"), Codec::Cp932).unwrap();
     let sf = vm.tables_mut().load_script(&dat, sid).unwrap().clone();

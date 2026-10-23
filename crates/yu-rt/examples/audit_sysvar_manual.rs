@@ -15,7 +15,16 @@ fn main() {
         }
     }
     // 手册族谱记法(逐族在 svariable.html 明文):
-    let families = ["_KEYNUM_", "_KEY_", "_MOUSENUM_", "_MOUSE_", "_CODE_", "_PADNUM_", "_PAD_", "_SERIAL_"];
+    let families = [
+        "_KEYNUM_",
+        "_KEY_",
+        "_MOUSENUM_",
+        "_MOUSE_",
+        "_CODE_",
+        "_PADNUM_",
+        "_PAD_",
+        "_SERIAL_",
+    ];
     let abi = yu_rt::sysvar_abi::SysVarTable::builtin_abi();
     let mut miss = Vec::new();
     for d in &abi.decls {
@@ -24,7 +33,9 @@ fn main() {
             continue; // 族谱已明文(键/鼠标/码/手柄/序列号族)
         }
         let needle = name.trim_start_matches('_').as_bytes();
-        let hit = blobs.iter().any(|b| b.windows(needle.len()).any(|w| w == needle));
+        let hit = blobs
+            .iter()
+            .any(|b| b.windows(needle.len()).any(|w| w == needle));
         if !hit {
             miss.push(name);
         }

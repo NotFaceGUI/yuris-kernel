@@ -119,6 +119,7 @@ FUN_004669fc(&bits);                          // 读 DIB mask
 | `FUN_00406184` @ `0x406184` | AA 合成器，逐像素 coverage/颜色混合 |
 | `FUN_00407cf0` @ `0x407cf0` | 非 AA 合成器 |
 | `0x404a1b..0x404ac7` | 按字符取 AA 标志（`[text+0x34]`）、DRAWMODE（`[text+0x33]`）等，调用字形函数 |
+| `FUN_004056b8` @ `0x4056b8` | 取 mask 后按一个栈参数**重复合成**：`0 → 1 次`、`1..=10 → 9 次`、`>=11 → 3 次`；AA/非 AA 各自分支。`CGACT[TEXT]` 的 `SET` 在 ERIS 里只取 0/1（填色/轮廓），映射为 1/9 次（`Likely`，DIV-GFX-055） |
 
 **结论**：GDI outline rasterizer + 8-bit mask + 引擎自己的颜色合成；不是
 `GetGlyphOutline` 自绘，也不是 ClearType。

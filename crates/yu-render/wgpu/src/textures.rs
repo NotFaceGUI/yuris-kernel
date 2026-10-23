@@ -368,7 +368,8 @@ impl TargetSet {
     }
 
     /// 组离屏目标:尺寸不变则复用(`SX/SY` 未给时调用方已回退视口)。
-    pub fn ensure_offscreen(        &mut self,
+    pub fn ensure_offscreen(
+        &mut self,
         ctx: &GpuContext,
         id: &LayerId,
         width: u32,

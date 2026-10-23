@@ -215,7 +215,16 @@ fn fontinfo_answers_current_style_fields() {
 fn fontinfo_unset_fields_are_not_fabricated() {
     let table = table();
     let gfx = state();
-    for flag in ["COLOR2", "NAME"] {
+    // 引擎默认已取证(FUN_00464fac):COLOR2=0xffffff、GRADATION=1、ROTATION=0。
+    for (flag, expected) in [("COLOR2", 0xff_ffff), ("GRADATION", 1), ("ROTATION", 0)] {
+        assert_eq!(
+            q(&gfx, "FONTINFO", vec![arg(&table, "FONTINFO", flag, i(1))]),
+            Value::Int(expected),
+            "{flag}"
+        );
+    }
+    // NAME 未设置(需要系统字体列表)/NUM/PITCH/LANG 仍不猜。
+    for flag in ["NAME", "NUM", "PITCH", "LANG"] {
         let err = q_err(&gfx, "FONTINFO", vec![arg(&table, "FONTINFO", flag, i(1))]);
         assert_eq!(err.code, "gfx.info.unsupported", "{flag}");
     }

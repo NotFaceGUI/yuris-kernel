@@ -25,12 +25,7 @@ use crate::vm::{ExecState, Vm};
 /// 读取系统变量。
 ///
 /// `var.id` 由编译产物直接给出;`indices` 是脚本写的下标(空 = 无下标)。
-pub fn read(
-    vm: &Vm,
-    st: &ExecState,
-    var: VarRef,
-    indices: &[i64],
-) -> Result<Value, yu_log::Diag> {
+pub fn read(vm: &Vm, st: &ExecState, var: VarRef, indices: &[i64]) -> Result<Value, yu_log::Diag> {
     let Some(decl) = vm.sysvars().get(var.id) else {
         return Err(diag::fatal(
             code::rt::SYSVAR_UNIMPLEMENTED,
@@ -45,9 +40,7 @@ pub fn read(
         // 利用できます。5 回のループとした場合、1 周する度に 1～5 まで変化」。
         // 引擎 §3.13:LOOP 帧 +0x10 = 已执行轮数、置 1、LOOPEND 每轮 +1。
         // 语料:18,521 次(全系统变量第一位)。
-        "_LC" => Ok(Value::Int(
-            st.loops.last().map(|l| l.counter).unwrap_or(0),
-        )),
+        "_LC" => Ok(Value::Int(st.loops.last().map(|l| l.counter).unwrap_or(0))),
 
         // ---- GOSUB 参数 / RETURN 返回值 -----------------------------------
         // 手册 `basic/svariable.html` + `control/gosub.html`:
@@ -68,7 +61,10 @@ pub fn read(
             match name {
                 "_PINT" => Ok(frame.args[n].clone().unwrap_or(Value::Int(0))),
                 "_PFLT" => Ok(Value::Float(
-                    frame.args[n].as_ref().and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    frame.args[n]
+                        .as_ref()
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
                 )),
                 _ => Ok(frame.args[n]
                     .clone()
@@ -78,10 +74,7 @@ pub fn read(
         "_PFLG" => {
             let n = param_index(indices)?;
             Ok(Value::Int(
-                st.frames
-                    .last()
-                    .map(|f| f.arg_flags[n] as i64)
-                    .unwrap_or(0),
+                st.frames.last().map(|f| f.arg_flags[n] as i64).unwrap_or(0),
             ))
         }
         "_RINT" | "_RFLT" | "_RSTR" => {
@@ -96,7 +89,10 @@ pub fn read(
             match name {
                 "_RINT" => Ok(frame.ret[n].clone().unwrap_or(Value::Int(0))),
                 "_RFLT" => Ok(Value::Float(
-                    frame.ret[n].as_ref().and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    frame.ret[n]
+                        .as_ref()
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
                 )),
                 _ => Ok(frame.ret[n]
                     .clone()
@@ -106,10 +102,7 @@ pub fn read(
         "_RFLG" => {
             let n = param_index(indices)?;
             Ok(Value::Int(
-                st.frames
-                    .last()
-                    .map(|f| f.ret_flags[n] as i64)
-                    .unwrap_or(0),
+                st.frames.last().map(|f| f.ret_flags[n] as i64).unwrap_or(0),
             ))
         }
 
@@ -158,9 +151,7 @@ pub fn read(
         "_OS_TIME" => {
             let idx = indices.first().copied().unwrap_or(0);
             match idx {
-                1 => Ok(Value::Int(
-                    vm.now_ms().wrapping_sub(vm.start_ms()) as i64,
-                )),
+                1 => Ok(Value::Int(vm.now_ms().wrapping_sub(vm.start_ms()) as i64)),
                 0 => Err(diag::unimplemented(
                     code::rt::SYSVAR_UNIMPLEMENTED,
                     Boundary::Script,
@@ -281,9 +272,7 @@ pub fn read(
                     };
                     Ok(Value::Int(crate::input::pad_dir_code(dir, *n)))
                 }
-                ("PAD_BUTTON", [n, m]) => {
-                    Ok(Value::Int(crate::input::pad_button_code(*n, *m)))
-                }
+                ("PAD_BUTTON", [n, m]) => Ok(Value::Int(crate::input::pad_button_code(*n, *m))),
                 (_, []) => {
                     let default = vm.binding().code_of_id(var.id).ok_or_else(|| {
                         diag::fatal(
@@ -312,24 +301,24 @@ pub fn read(
         // `crate::text::flag`),返回与 `$_TEXT` 并行的控制字节流。
         // 台账:`COV-M-01`。
         "_TEXT_FLAG" => Ok(Value::Str(vm.text_flags())),
-        // `_TEXT_NUM`:手册无页;引擎 int getter `0x4276e3` 读的是装载期全局
-        // `0x80174c`(不是文本缓冲计数),语义未取证 ⇒ 保持挂号。
-        "_TEXT_NUM" => Err(diag::unimplemented(
-            code::rt::SYSVAR_UNIMPLEMENTED,
-            Boundary::Script,
-            format!(
-                "{name}:手册无页且引擎取值来自装载期全局 0x80174c,语义未取证 ⇒ 不实现(DIV-RT-007)"
-            ),
-        )),
+        // `_TEXT_NUM`:手册无页;引擎 int getter `0x4276e3` 读装载期全局
+        // `0x80174c`,该值在 `ysbin/yst.ybn` 装载时由头部 text_total 写入
+        // (`0x45d73f`)。内核用 `yst_list` 逐脚本 text_count 求和(ERIS 396,
+        // 与 yst.ybn 头部一致;DIV-RT-048)。
+        "_TEXT_NUM" => Ok(Value::Int(vm.text_total())),
         // 手册:`○@_MENUCODE` = 最後に選択されたメニュー項目の CODE 値。
         // 状态由菜单域宿主选中时推入([`Vm::set_menu_code`]);○ 可赋值。
         "_MENUCODE" => Ok(Value::Int(vm.menu_code())),
         // 手册:`○@_WINDOW_EXEC_MAX/CLOSE` = 最大化/閉じるボタン押下状態(0/1)。
         // 宿主窗口事件推入;○ 可赋值。`_WINDOW_EXEC_MIN`/`_WINDOW_INIT_POS`
         // 手册无页 ⇒ 走 undoc。
-        "_WINDOW_EXEC_MAX" | "_WINDOW_EXEC_CLOSE" => {
-            Ok(Value::Int(vm.window_exec(name.rsplit('_').next().unwrap_or(""))))
-        }
+        "_WINDOW_EXEC_MAX" | "_WINDOW_EXEC_CLOSE" | "_WINDOW_EXEC_CAPTION" => Ok(Value::Int(
+            vm.window_exec(name.rsplit('_').next().unwrap_or("")),
+        )),
+        // `_WINDOW_INIT_POS`:手册无页;引擎 int getter `0x4276f3` 读
+        // `[0x80133c]`,该字节由 `yscfg.dat` 第 10 项写入(`0x460b74` 路径),
+        // 由宿主注入(缺省 0;DIV-RT-047)。
+        "_WINDOW_INIT_POS" => Ok(Value::Int(vm.window_init_pos())),
 
         // ---- 其余:手册无页或无注入来源 -----------------------------------
         _ => Err(undoc(name)),

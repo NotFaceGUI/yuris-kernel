@@ -1,0 +1,37 @@
+{
+  "frames": 620,
+  "inputs": [
+    {
+      "button": "MOUSE_L",
+      "frame": 300,
+      "x": 217,
+      "y": 281
+    },
+    {
+      "button": "MOUSE_R",
+      "frame": 440,
+      "x": 400,
+      "y": 300
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 470,
+      "x": 390,
+      "y": 583
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 500,
+      "x": 430,
+      "y": 583
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 530,
+      "x": 494,
+      "y": 583
+    }
+  ],
+  "name": "symptom-3-ingame-buttons",
+  "note": "P1 S3:进本篇后右键菜单 + オート/スキップ/設定 点击。当前被 S2 的 Fatal 冻结,点击无响应。"
+}

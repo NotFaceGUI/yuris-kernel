@@ -8,6 +8,7 @@ members = [
     "crates/yu-log",
     "crates/yu-rt",
     "crates/yu-sound",
+    "crates/yu-save",
     "crates/yu-trace",
     "crates/yu-vfs",
     "crates/yu-platform/host-desktop",
@@ -24,3 +25,12 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 flate2 = "1"
+
+# 本机 MSVC 环境下 libz-sys 的 vendored zlib 在 dev/test 档带 `-Z7` 编译时
+# 触发 cl D8050(无法执行 c1.dll:未能将命令行放入调试记录中);该包是
+# 纯 C 依赖,调试信息无价值。release 档默认 debug=false,不受影响。
+[profile.dev.package.libz-sys]
+debug = false
+
+[profile.test.package.libz-sys]
+debug = false

@@ -12,9 +12,7 @@ use yu_format::yslb::YslLabels as FmtYsl;
 use yu_format::ystb::Segments;
 use yu_format::ystl::ScriptList as FmtYstl;
 use yu_format::ysvr::VarDecls as FmtYsv;
-use yu_rt::tables::{
-    ScriptFile, TableSet, DEFAULT_SCRIPT_KEY, ParamKind, VarInit, YscmTable,
-};
+use yu_rt::tables::{ParamKind, ScriptFile, TableSet, VarInit, YscmTable, DEFAULT_SCRIPT_KEY};
 use yu_rt::ycd::YcdTable;
 use yu_rt::{BootConfig, Vm};
 use yu_vfs::{Codec, DirSource};
@@ -114,7 +112,10 @@ fn adapter_projection_matches_format_metadata() {
         // by_name 字节键索引 ↔ format 线性 find,同一条记录。
         let found = rtsl.get_bytes(&fe.name).expect("字节键可查");
         let via_format = fysl.find(&fe.name).expect("format find");
-        assert_eq!((found.script_id, found.pc), (via_format.script_no, via_format.field_b));
+        assert_eq!(
+            (found.script_id, found.pc),
+            (via_format.script_no, via_format.field_b)
+        );
     }
 
     // ---- YSVR:kind/group/script/slot/type/dims/初值 ----
@@ -158,15 +159,27 @@ fn adapter_projection_matches_format_metadata() {
         assert_eq!(re.path, fe.name, "清单[{i}] path");
         assert_eq!(re.file_time, fe.file_time, "清单[{}] file_time", re.index);
         assert_eq!(re.var_count, fe.var_count, "清单[{}] var_count", re.index);
-        assert_eq!(re.label_count, fe.label_count, "清单[{}] label_count", re.index);
-        assert_eq!(re.text_count, fe.text_count, "清单[{}] text_count", re.index);
+        assert_eq!(
+            re.label_count, fe.label_count,
+            "清单[{}] label_count",
+            re.index
+        );
+        assert_eq!(
+            re.text_count, fe.text_count,
+            "清单[{}] text_count",
+            re.index
+        );
         assert_eq!(rtstl.path_of(i as u16), Some(fe.name.as_slice()));
         assert_eq!(rtstl.text_count(i as u16), Some(fe.text_count));
     }
 
     // ---- YSCF:宽/高 u32(REA FUN_0045dbb0)+ 标题/扩展名序 ----
     let cfg = yu_format::yscf::Yscf::parse(&read(&dir, "yscfg.ybn"), &origin("yscfg.ybn")).unwrap();
-    assert_eq!((cfg.width, cfg.height), (800, 600), "ERIS 工程 800x600(u32)");
+    assert_eq!(
+        (cfg.width, cfg.height),
+        (800, 600),
+        "ERIS 工程 800x600(u32)"
+    );
 
     eprintln!(
         "CONSISTENCY: ysc={} ysl={} ysv={} yst_list={} 全部逐字段同源",
@@ -181,7 +194,10 @@ fn adapter_projection_matches_format_metadata() {
 #[test]
 fn adapter_projection_matches_format_script_bodies() {
     let mut skips = Skips(0);
-    let dir = corpus_dir("adapter_projection_matches_format_script_bodies", &mut skips);
+    let dir = corpus_dir(
+        "adapter_projection_matches_format_script_bodies",
+        &mut skips,
+    );
     let origin = |n: &str| format!("ysbin/{n}").into_bytes();
 
     let mut files = 0u32;
@@ -262,7 +278,10 @@ fn adapter_projection_matches_format_script_bodies() {
         assert_eq!(flat, segs.args_index.len() / 12, "{name} 扁平窗口总数");
         assert_eq!(
             sf.windows.len(),
-            sf.groups.iter().map(|g| g.window_count as usize).sum::<usize>(),
+            sf.groups
+                .iter()
+                .map(|g| g.window_count as usize)
+                .sum::<usize>(),
             "{name} Σ窗口数"
         );
         // 源码位置:全组抽查逐 pc(与 part4 dword 一致)。
@@ -303,20 +322,25 @@ fn tableset_matches_direct_decoding() {
     let mut tables = TableSet::load_from(&src, Some(&aux), DEFAULT_SCRIPT_KEY).expect("装载七表");
 
     // config(直接采用 yu-format 类型)与 screen 投影。
-    assert_eq!((tables.boot.config.width, tables.boot.config.height), (800, 600));
+    assert_eq!(
+        (tables.boot.config.width, tables.boot.config.height),
+        (800, 600)
+    );
     let ycd_bytes = std::fs::read(project_root.join("system/YSCom/YSCom.ycd")).unwrap();
     let ycd = YcdTable::parse(&ycd_bytes).unwrap();
-    assert_eq!(tables.boot.ycd.as_ref().map(|t| t.version), Some(ycd.version));
+    assert_eq!(
+        tables.boot.ycd.as_ref().map(|t| t.version),
+        Some(ycd.version)
+    );
 
     // 入口标签 ↔ ysl 直解。
-    let ysl = FmtYsl::parse(
-        &read(&dir, "ysl.ybn"),
-        b"ysbin/ysl.ybn",
-    )
-    .unwrap();
+    let ysl = FmtYsl::parse(&read(&dir, "ysl.ybn"), b"ysbin/ysl.ybn").unwrap();
     let entry = tables.boot.labels.get("SYSTEM_START").expect("入口标签");
     let entry_fmt = ysl.find(b"SYSTEM_START").expect("format 入口标签");
-    assert_eq!((entry.script_id, entry.pc), (entry_fmt.script_no, entry_fmt.field_b));
+    assert_eq!(
+        (entry.script_id, entry.pc),
+        (entry_fmt.script_no, entry_fmt.field_b)
+    );
 
     // 按需装载的脚本体 ↔ ScriptFile::parse 直解 ↔ VM 启动后的 screen。
     for sid in [entry.script_id as u32, 8, 10] {
@@ -332,7 +356,9 @@ fn tableset_matches_direct_decoding() {
     // VM 启动链的 screen(BOOT config 投影)。
     let vm = Vm::boot_with_aux(
         Box::new(DirSource::open(&data_root, Codec::Cp932).unwrap()),
-        Some(Box::new(DirSource::open(&project_root, Codec::Cp932).unwrap())),
+        Some(Box::new(
+            DirSource::open(&project_root, Codec::Cp932).unwrap(),
+        )),
         BootConfig {
             entry_label: "SYSTEM_START".to_string(),
             ..BootConfig::default()

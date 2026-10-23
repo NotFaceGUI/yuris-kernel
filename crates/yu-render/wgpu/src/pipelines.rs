@@ -88,7 +88,11 @@ pub fn blend_state(mode: BlendMode) -> Option<wgpu::BlendState> {
             BlendOperation::ReverseSubtract,
         ),
         BlendMode::Multiply => both(BlendFactor::Zero, BlendFactor::Src, BlendOperation::Add),
-        BlendMode::Screen => both(BlendFactor::OneMinusDst, BlendFactor::One, BlendOperation::Add),
+        BlendMode::Screen => both(
+            BlendFactor::OneMinusDst,
+            BlendFactor::One,
+            BlendOperation::Add,
+        ),
         BlendMode::Lighten => both(BlendFactor::One, BlendFactor::One, BlendOperation::Max),
         BlendMode::Darken => both(BlendFactor::One, BlendFactor::One, BlendOperation::Min),
         BlendMode::Exclusion => both(
@@ -104,10 +108,7 @@ pub fn blend_state(mode: BlendMode) -> Option<wgpu::BlendState> {
 pub fn src_mode(mode: BlendMode) -> Option<u32> {
     Some(match mode {
         BlendMode::Normal | BlendMode::Add => 0,
-        BlendMode::Subtract
-        | BlendMode::Screen
-        | BlendMode::Lighten
-        | BlendMode::Exclusion => 1,
+        BlendMode::Subtract | BlendMode::Screen | BlendMode::Lighten | BlendMode::Exclusion => 1,
         BlendMode::Multiply | BlendMode::Darken => 2,
         _ => return None,
     })
@@ -243,24 +244,24 @@ impl PipelineCache {
                 bind_group_layouts: &[Some(&bind_group_layout)],
                 immediate_size: 0,
             });
-        let transition_shader =
-            ctx.device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("yu-backend-wgpu transition"),
-                    source: wgpu::ShaderSource::Wgsl(TRANSITION_SHADER.into()),
-                });
-        let transition_psc_shader =
-            ctx.device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("yu-backend-wgpu transition psC"),
-                    source: wgpu::ShaderSource::Wgsl(crate::shaders::TRANSITION_PSC.into()),
-                });
-        let transition_psd_shader =
-            ctx.device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("yu-backend-wgpu transition psD"),
-                    source: wgpu::ShaderSource::Wgsl(crate::shaders::TRANSITION_PSD.into()),
-                });
+        let transition_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("yu-backend-wgpu transition"),
+                source: wgpu::ShaderSource::Wgsl(TRANSITION_SHADER.into()),
+            });
+        let transition_psc_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("yu-backend-wgpu transition psC"),
+                source: wgpu::ShaderSource::Wgsl(crate::shaders::TRANSITION_PSC.into()),
+            });
+        let transition_psd_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("yu-backend-wgpu transition psD"),
+                source: wgpu::ShaderSource::Wgsl(crate::shaders::TRANSITION_PSD.into()),
+            });
         let transition_layout =
             ctx.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -321,18 +322,18 @@ impl PipelineCache {
             make_sampler(ctx, FilterKind::Point),
             make_sampler(ctx, FilterKind::Linear),
         ];
-        let scale_psb_shader =
-            ctx.device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("yu-backend-wgpu scale psB"),
-                    source: wgpu::ShaderSource::Wgsl(crate::shaders::SCALE_PSB.into()),
-                });
-        let scale_psa_shader =
-            ctx.device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("yu-backend-wgpu scale psA"),
-                    source: wgpu::ShaderSource::Wgsl(crate::shaders::SCALE_PSA.into()),
-                });
+        let scale_psb_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("yu-backend-wgpu scale psB"),
+                source: wgpu::ShaderSource::Wgsl(crate::shaders::SCALE_PSB.into()),
+            });
+        let scale_psa_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("yu-backend-wgpu scale psA"),
+                source: wgpu::ShaderSource::Wgsl(crate::shaders::SCALE_PSA.into()),
+            });
         let scale_layout = ctx
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -491,28 +492,16 @@ impl PipelineCache {
         ctx: &GpuContext,
         mode: BlendMode,
     ) -> Result<bool, Diag> {
-        self.ensure_transition_variant(
-            ctx,
-            TransitionVariant::Fixed,
-            mode,
-        )
+        self.ensure_transition_variant(ctx, TransitionVariant::Fixed, mode)
     }
 
     /// 引擎 psC(mask R)过渡管线。
-    pub fn ensure_psc_pipeline(
-        &mut self,
-        ctx: &GpuContext,
-        mode: BlendMode,
-    ) -> Result<bool, Diag> {
+    pub fn ensure_psc_pipeline(&mut self, ctx: &GpuContext, mode: BlendMode) -> Result<bool, Diag> {
         self.ensure_transition_variant(ctx, TransitionVariant::PsC, mode)
     }
 
     /// 引擎 psD(交叉淡化)过渡管线。
-    pub fn ensure_psd_pipeline(
-        &mut self,
-        ctx: &GpuContext,
-        mode: BlendMode,
-    ) -> Result<bool, Diag> {
+    pub fn ensure_psd_pipeline(&mut self, ctx: &GpuContext, mode: BlendMode) -> Result<bool, Diag> {
         self.ensure_transition_variant(ctx, TransitionVariant::PsD, mode)
     }
 
@@ -681,7 +670,9 @@ impl PipelineCache {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.samplers[FilterKind::Point as usize]),
+                        resource: wgpu::BindingResource::Sampler(
+                            &self.samplers[FilterKind::Point as usize],
+                        ),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -705,12 +696,7 @@ impl PipelineCache {
         tex_size: [f32; 2],
         param: [f32; 2],
     ) -> Option<&wgpu::BindGroup> {
-        let uniform = [
-            tex_size[0],
-            tex_size[1],
-            param[0],
-            param[1],
-        ];
+        let uniform = [tex_size[0], tex_size[1], param[0], param[1]];
         self.scale_groups.get(&(
             texture_id,
             ScaleVariant::from_filter(filter),
@@ -845,11 +831,7 @@ impl PipelineCache {
         Ok(())
     }
 
-    pub fn paint_bind_group(
-        &self,
-        alpha_only: bool,
-        color: [u32; 4],
-    ) -> Option<&wgpu::BindGroup> {
+    pub fn paint_bind_group(&self, alpha_only: bool, color: [u32; 4]) -> Option<&wgpu::BindGroup> {
         self.paint_groups.get(&(alpha_only, color))
     }
 
@@ -956,7 +938,8 @@ fn primitive_state() -> wgpu::PrimitiveState {
     }
 }
 
-fn make_sampler(ctx: &GpuContext, kind: FilterKind) -> wgpu::Sampler {    let filter = match kind {
+fn make_sampler(ctx: &GpuContext, kind: FilterKind) -> wgpu::Sampler {
+    let filter = match kind {
         FilterKind::Point => wgpu::FilterMode::Nearest,
         FilterKind::Linear => wgpu::FilterMode::Linear,
     };

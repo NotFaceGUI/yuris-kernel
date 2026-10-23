@@ -1,0 +1,26 @@
+{
+  "entry": "SYSTEM_START",
+  "expect": {
+    "display_json_sha256": "d30c144b644803cc18c19a1666901242515732f76a6f87ca7ec514a54e8aaff5",
+    "ops_total": 450,
+    "png_sha256": "ca1c8a3176ce037064410b80e5cd74fdac7e7e2ae1f716b187ac7d70122e5b09",
+    "skipped_ops_total": 0
+  },
+  "frames": 540,
+  "inputs": [
+    {
+      "button": "MOUSE_L",
+      "frame": 300,
+      "x": 217,
+      "y": 281
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 440,
+      "x": 494,
+      "y": 583
+    }
+  ],
+  "name": "symptom-ingame-config",
+  "note": "P1 症状回归:标题 スタート → 本篇菜单栏 設定(494,583)可以打开(ops 158→450,界面完整)。“点了没反应”的是故事推进/右键/セーブ,见 docs/symptom-ledger.md S3 与 symptom-ingame-save。"
+}

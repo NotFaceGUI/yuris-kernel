@@ -91,7 +91,9 @@ u8 取整),与 wgpu 固定管线/本后端共用同一舍入,淡入淡出区间 
   失败即终态,不回退后续扩展名。`.psb`/未知码无解码器 ⇒ `asset.unsupported`。
 - **资源图 + `SX/SY`**:跳过(`gfx.image.size.unsupported`);只有
   `FILE=""` 的 1×1 黑图按 `SX/SY` 拉伸。
-- **未实现项**:COPY/图像加工/掩码/过渡/文本栅格化/PSB 解码均不近似。
+- **未实现项**:掩码/部分图像加工/PSB 解码不近似;文本已实现两条路径
+  (`CGACT[TEXT]` 与 `_TEXT_FLAG` 自动层),缺少 `_TEXT_FLAG` 的
+  `TextRun` 仍显式跳过并计数。
 
 ## 确定性
 

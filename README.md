@@ -52,6 +52,7 @@ DIFFUSE 已按 A 灰度定案；MIP/各向异性、组 RT 子组 alpha、文本�
 | `yu-rt` | 运行核：脚本 / VM / 任务 / 帧边界 / 16 槽寄存器 / 变量域 / 系统变量 ABI / InputTimeline |
 | `yu-gfx` | 渲染语义层：`CompositorFrame`、图层 / 组 / 窗口 / 过渡 / 文本模型、GfxHost 查询 |
 | `yu-sound` | 声音域宿主：`SOUND/INFO/END` 层状态机、OGG/WAVE 解码、headless 确定性混音；`SoundHost` 查询 |
+| `yu-save` | 存档/文件域宿主：槽位表（盘上事实）+ `SAVE/LOAD/SAVEEND/FILEACT` 事件事实消费；写路径由 `yu-format::yssd` 逐字节对齐官方 |
 | `yu-font` | 字体发现 / 加载、字形栅格化、完整文本样式；不含换行 / 对齐 |
 | `yu-render/soft` · `yu-backend-soft` | `CompositorFrame` 的确定性软件参考后端：纹理管线 + RGBA8 合成 + PNG |
 | `yu-render/wgpu` · `yu-backend-wgpu` | `CompositorFrame` 的 wgpu 主后端：`Rgba8Unorm` 离屏合成 + 读回；纹理/管线/bind group 缓存 |

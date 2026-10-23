@@ -6,3 +6,11 @@ license.workspace = true
 
 [dependencies]
 yu-log = { path = "../yu-log" }
+# YSSD 存档压缩层(任务书 P4 M-A):写路径必须逐字节复现官方
+# `compress2(level=1)`。flate2 `zlib` 后端(C zlib;flate2 的
+# deflateInit2 参数 = memLevel 8/默认策略/15 位窗,与 compress2 同参),
+# 逐字节与官方产物一致由 `tests/yssd_roundtrip.rs` 对全部官方 .sd 断言。
+flate2 = { workspace = true, features = ["zlib"] }
+# libz-sys 1.1.22 vendored zlib 1.3.1;1.1.30 的 1.3.2 deflate level-1
+# 输出与官方引擎产物不同(实测),钉住以保字节一致。
+libz-sys = "=1.1.22"

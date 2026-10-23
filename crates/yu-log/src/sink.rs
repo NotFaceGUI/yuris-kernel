@@ -69,6 +69,11 @@ impl MemorySink {
         std::mem::take(&mut self.records)
     }
 
+    /// 丢弃全部记录但保留容量(无人消费时的低成本排空)。
+    pub fn clear(&mut self) {
+        self.records.clear();
+    }
+
     pub fn len(&self) -> usize {
         self.records.len()
     }

@@ -398,7 +398,7 @@ deformer mesh 继承、wgpu 管线、官方像素对拍。
 | 项目 | 语言/许可 | 能力 | wasm | 对本仓库 |
 |---|---|---|---|---|
 | [storycraft/emote-psb-rs](https://github.com/storycraft/emote-psb-rs) | Rust/MIT | PSB/MDF 读写、serde、资源流;**不渲染** | 依赖均可 wasm,未显式测试 | **M1 首选参考/依赖**(MIT) |
-| [xmoezzz/eluna](https://github.com/xmoezzz/eluna) | Rust/未声明 | PSB 解析、motion/layer/timeline/controller/draw-frame 提取、wgpu 预览播放器 | 未提及 | 行为参考;**无许可,不复制代码** |
+| [xmoezzz/eluna](https://github.com/xmoezzz/eluna) | Rust/**MPL-2.0** | PSB 解析、motion/layer/timeline/controller/draw-frame 提取、wgpu 预览播放器 | 未提及 | **主行为参考**;`yu-emote` 的 runtime/pose/physics/control 模块改编其恢复出的 native 语义,按 MPL-2.0 标注(NOTICE + LICENSE-MPL-2.0) |
 | [Mieluoxxx/amadeus-emote-loader](https://github.com/Mieluoxxx/amadeus-emote-loader) | Rust/Apache-2.0 | PSB/JSON 解析、烘焙给旧 runtime;**不渲染**;已归档 | **显式 wasm32**(约 351 KB) | wasm 证据;不采用(需闭源 runtime) |
 | [UlyssesWu/FreeMote](https://github.com/UlyssesWu/FreeMote) | C#/CC BY-NC-SA 4.0 | PSB/EMT 全套工具 + 桌面 Viewer | 无 | **只作 oracle/事实参考** |
 | FreeMote WebGL runtime(被 NekoWebShow / amadeus-next-emote / Emote_Widget 使用) | JS/WebGL,CC BY-NC-SA 4.0 | 浏览器 E-mote 渲染 | 无(JS) | 证明浏览器可行;非 1:1(“合成播放黑剪影”),不采用 |
@@ -410,7 +410,7 @@ deformer mesh 继承、wgpu 管线、官方像素对拍。
 
 1. M1 用 `emote-psb-rs`(MIT)做解析基线,逐字段用 `emote_test.psb`
    校验;若引入依赖,文件头/README 注明来源(MIT 合规)。
-2. M2/M3 自研;`eluna` 只读行为,不复制(无许可)。
+2. M2/M3 参考 `eluna`(MPL-2.0)的 native 语义;`yu-emote` 中改编的模块保留 MPL-2.0 声明与源码,其余仍 MIT/Apache-2.0。
 3. M3 用 wgpu 写网格管线:同一份 Rust 代码 native + wasm32;浏览器用
    WebGPU(Chrome/Edge 可用),老浏览器需要 WebGL2 回退(额外工作)。
 4. 不做“官方 DLL + Wine/wasm”;不把 FreeMote WebGL 作为交付依赖
@@ -425,4 +425,45 @@ deformer mesh 继承、wgpu 管线、官方像素对拍。
   官方 DLL 做 oracle,再写干净实现。
 - D3D9 网格/矩阵 → wgpu 的坐标/采样差异需单独对拍(vs 的 `cScOffset`
   与半像素问题)。
-- 许可:E-mote 是商业中间件;干净实现只参考可观测行为,不复制其代码。
+- 许可:E-mote 是商业中间件;`yu-emote` 参考 `eluna`(MPL-2.0)的实现,不复制官方 DLL 的代码/资源。
+
+
+## 7. 2026-10-23 续:动画底层修复与控制器
+
+- **时间轴不再按关键帧线性采样**:native 在跨帧时发命令,过渡时长 =
+  `next.time - crossing_time - 1`,easing 经 `sub_1026AD10` 转指数;
+  type-0 只移动游标。`yu-emote::anim` 已按此实现,采样 60 Hz。
+- **空 `mesh.bp` = identity**:Nekopara 的 hair 参数在中点(30/60)
+  用空 mesh 表示回正;此前当作“无 mesh”导致参数在 29.9965 处仍保留
+  满变形,下一帧跳到 identity,表现为头发瞬移/动画无过渡。修复后
+  逐帧像素差从 ~7.6 降到 ~0.1。
+- **控制器/物理**:`Player` 按 timeline → clamp/eye → pose → physics
+  推进;bust 单点弹簧、hair/parts 双段摆、clamp 类型 0/1、确定性眨眼。
+- **type-7 clip / type-9 anchor**:type-7 的 ±16 变换框与继承矩形求交,
+  CPU 光栅按 clip 裁剪;type-9 的 0..8 模式、flip 映射、exact>high>low
+  的聚合位移已实现。
+- **差分时间轴(DPLAY)**:每时间轴维护独立 delta 表,最终值 =
+  base + delta × blend ratio;`fade_in/out` 以指数过渡。
+- **demo**:`psb-anim` 整段渲染,`make_demo.py` 生成 30fps alpha WebM;
+  表情切换 260ms 交叉淡入。
+- 仍挂账:type-4 粒子、type-10 feedback、inner/outer stencil phase、
+  eyebrow/mouth graph 队列、selector、wind、pixelate、wgpu、M4 对拍。
+
+
+## 8. 2026-10-23 续 2:为什么“动画像没动”
+
+- **嵌套深度截断**:旧 `MAX_NESTED_MOTION_DEPTH=32`,Nekopara 的
+  `alt_parts/目R→瞳R→ハイライトR` 链共 39 段,导致 `hi_L/hi_R`
+  整层没有被求值。渲染只剩 34 个 draw item;参考 eluna 为 36 个。
+  上限改为 256 后眼部高光恢复。
+- **物理锚点未做 mesh-chain warp**:native `StepFrameMeshChain` 对
+  type-1 Shape / type-5 Camera 的 `position` 应用祖先 shape-sync patch;
+  physics 的 `baseLayer` 锚点(center_fronthair 是 type 1)因此会随
+  body_UD/head_slant 移动。此前直接用未 warp 的 `world_origin`,
+  锚点几乎不动,hair/bust 输出接近 0,所以角色像静止。已增加
+  `MeshChainEntry` 并在 `layer_position` 中按 native 逆序 warp。
+- 验证:4 tick 时 hair_UD 从 -0.0007 变为 -0.38(eluna -0.53),
+  bust_UD 从 -0.0001 变为 -0.14(eluna -0.19);demo 全片逐帧像素差
+  2.4–5.0,和 eluna 2 秒参考按分辨率归一后接近。
+- demo 增加 1.5 秒一次性 `挨拶` 片段,便于直接观察过渡;待机仍为
+  7 秒 30fps alpha WebM。

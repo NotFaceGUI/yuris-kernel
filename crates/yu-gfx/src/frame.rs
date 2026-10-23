@@ -11,7 +11,7 @@
 use crate::error::FrameDiag;
 use crate::layer::{ImageFormat, Layer, LayerId, SizeU32};
 use crate::pass::Pass;
-use crate::text::TextRun;
+use crate::text::{TextDraw, TextLayoutFrame, TextRun};
 
 /// 视口(引擎像素;来自工程 `yscfg` 或宿主注入)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,8 +258,12 @@ pub struct CompositorFrame {
     pub layers: Vec<Layer>,
     /// 绘制列表(只含可见/需要执行的 op)。
     pub passes: Vec<Pass>,
-    /// 本帧待显示文本。
+    /// 本帧待显示文本(跨帧文本缓冲的快照;DIV-GFX-034)。
     pub text: Vec<TextRun>,
+    /// 自动文本层排版结果(`_TEXT_FLAG` 逐字步进;缺失 ⇒ `None`)。
+    pub text_layout: Option<TextLayoutFrame>,
+    /// `CGACT[TEXT=1]` 绘制项(按目标层 ID 稳定排序;层内保持命令序)。
+    pub text_draws: Vec<TextDraw>,
     /// 本帧诊断(按 `(code, command, detail)` 稳定排序)。
     pub diagnostics: Vec<FrameDiag>,
 }
@@ -278,6 +282,8 @@ impl CompositorFrame {
             layers: Vec::new(),
             passes: Vec::new(),
             text: Vec::new(),
+            text_layout: None,
+            text_draws: Vec::new(),
             diagnostics: Vec::new(),
         }
     }

@@ -103,12 +103,10 @@ pub struct YcdTable {
 impl YcdTable {
     pub fn parse(data: &[u8]) -> Result<Self, yu_log::Diag> {
         if data.len() < 0x10 {
-            return Err(diag::fatal(
-                code::table::INCOMPLETE,
-                Boundary::Table,
-                "YSCom.ycd 过短",
-            )
-            .at_table("YSCom.ycd"));
+            return Err(
+                diag::fatal(code::table::INCOMPLETE, Boundary::Table, "YSCom.ycd 过短")
+                    .at_table("YSCom.ycd"),
+            );
         }
         if &data[0..4] != b"YSCD" {
             return Err(diag::fatal(
@@ -279,10 +277,7 @@ impl YcdTable {
 
 /// 定位系统变量段:候选 `u32 count + u32 0` 起点,要求
 /// ① 走完 count 条不越界;② 首条名字以 `_` 开头;③ 段尾紧跟下一个段头。
-fn locate_system_section(
-    data: &[u8],
-    from: usize,
-) -> Result<(usize, usize), yu_log::Diag> {
+fn locate_system_section(data: &[u8], from: usize) -> Result<(usize, usize), yu_log::Diag> {
     let mut off = from;
     while off + 8 <= data.len() {
         let count = le_u32(data, off) as usize;

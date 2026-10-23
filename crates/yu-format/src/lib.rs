@@ -16,6 +16,7 @@
 //! | [`yslb`] | ysl.ybn | 全局标签表 |
 //! | [`ysvr`] | ysv.ybn | 变量声明(kind/flag/file/slot/ty/dims/初值) |
 //! | [`ystd`] | yst.ybn | 变量槽位表头(varCount) |
+//! | [`yssd`] | save/*.sd | **存档容器**(YSSD:块表 + zlib level-1 写路径) |
 //! | [`yscf`] | yscfg.ybn | 引擎配置 |
 //! | [`yser`] | yse.ybn | id ↔ 名字表 |
 //! | [`codec`] | — | CP932/GBK 静态码表 + auto 评分器 |
@@ -56,6 +57,7 @@ pub mod yslb;
 pub mod ystb;
 pub mod yscf;
 pub mod yser;
+pub mod yssd;
 pub mod ystd;
 pub mod ystl;
 pub mod ysvr;

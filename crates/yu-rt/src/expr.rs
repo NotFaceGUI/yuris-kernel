@@ -229,7 +229,7 @@ impl<'a> Evaluator<'a> {
         // 末条 `0x29` 是左值标记:剥掉它,其余照常执行。
         let body: &[RawInstr] = match instrs.last() {
             Some(last) if last.op == 0x29 => &instrs[..instrs.len() - 1],
-            _ => &instrs[..],
+            _ => instrs,
         };
         for ins in body {
             if matches!(ins.op, 0x56 | 0x76) {
@@ -563,6 +563,32 @@ fn var_of(ins: &RawInstr) -> Option<VarRef> {
         space: VarSpace::from_prefix(ins.payload[0]),
         id: u16::from_le_bytes([ins.payload[1], ins.payload[2]]),
     })
+}
+
+/// 单条字面量窗口的常量值(0x42/0x57/0x49/0x4c/0x46/0x4d)。
+///
+/// VM 在 `fill_cmd` 时用它做常量折叠;只识别**单条**字面量指令,
+/// 其它窗口返回 `None` 走正常求值。语义与 `eval_instrs` 的这些分支一致。
+pub(crate) fn const_value_instrs(instrs: &[RawInstr]) -> Option<Value> {
+    let [ins] = instrs else { return None };
+    let bytes = &ins.payload;
+    match ins.op {
+        0x42 if bytes.len() == 1 => Some(Value::Int(i64::from(bytes[0] as i8))),
+        0x57 if bytes.len() == 2 => Some(Value::Int(i64::from(i16::from_le_bytes([
+            bytes[0], bytes[1],
+        ])))),
+        0x49 if bytes.len() == 4 => Some(Value::Int(i64::from(i32::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ])))),
+        0x4c if bytes.len() == 8 => Some(Value::Int(i64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))),
+        0x46 if bytes.len() == 8 => Some(Value::Float(f64::from_bits(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])))),
+        0x4d => decode_string_literal(bytes).ok().map(Value::Str),
+        _ => None,
+    }
 }
 
 /// 字符串字面量解码(引擎 opcode 0x4d,§3.11)。

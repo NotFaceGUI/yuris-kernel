@@ -1,0 +1,20 @@
+{
+  "entry": "SYSTEM_START",
+  "expect": {
+    "display_json_sha256": "e5bb15d28bdc91ddb2500c523922474d33ab524fb183a6010507ab563e778c4b",
+    "ops_total": 158,
+    "png_sha256": "396e23c64752645007346eb35930ab78a5e134074a75b92d5ece79f84bb5d23c",
+    "skipped_ops_total": 0
+  },
+  "frames": 470,
+  "inputs": [
+    {
+      "button": "MOUSE_L",
+      "frame": 300,
+      "x": 217,
+      "y": 281
+    }
+  ],
+  "name": "symptom-enter-story",
+  "note": "P1 症状回归:标题(スタート 217,281)→ 本篇。证据语义见 docs/symptom-ledger.md S2;底层 Fatal 修好后本用例需 --update 重生成。"
+}

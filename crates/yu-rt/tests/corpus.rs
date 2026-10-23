@@ -14,7 +14,7 @@
 //! 6. 命令频度与实现状态对照表(报告用,同时把未实现命令计数钉住)。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use yu_rt::tables::{ScriptFile, TableSet, DEFAULT_SCRIPT_KEY};
 use yu_rt::ycd::YcdTable;
@@ -51,6 +51,7 @@ fn corpus_dir() -> Option<PathBuf> {
 /// 判据不是猜:这两个命令的窗口载荷**没有记录头**(`[op][len u16][payload]`)。
 /// `WORD` = CP932 文本段(手册 `basic/basic.html` ●テキスト表示 + 语料 464 处
 /// + RxYuris TextEditor_V5 交叉证);`RETURNCODE` 无参数声明,唯一窗口的
+///
 /// `kind` 是行计数,载荷只有 3 处孤立 `4d` 字节(YSCom 空行的退化输出)。
 fn is_raw_payload_command(name: &str) -> bool {
     matches!(name, "WORD" | "RETURNCODE")
@@ -64,7 +65,7 @@ fn is_script_file(name: &str) -> bool {
         && name[3..8].bytes().all(|b| b.is_ascii_digit())
 }
 
-fn read(dir: &PathBuf, name: &str) -> Vec<u8> {
+fn read(dir: &Path, name: &str) -> Vec<u8> {
     std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("读 {name} 失败: {e}"))
 }
 
@@ -73,7 +74,10 @@ struct SkipCounter(usize);
 impl Drop for SkipCounter {
     fn drop(&mut self) {
         if self.0 > 0 {
-            eprintln!("SKIP[count={}] YURIS_SAMPLE_ERIS_YSBIN 不可用,已跳过真实语料断言", self.0);
+            eprintln!(
+                "SKIP[count={}] YURIS_SAMPLE_ERIS_YSBIN 不可用,已跳过真实语料断言",
+                self.0
+            );
         }
     }
 }
@@ -91,28 +95,28 @@ macro_rules! require_corpus {
 }
 
 /// R12:字节解析唯一入口 = yu-format;这些助手做 format → 运行核投影。
-fn yscm_table(dir: &PathBuf) -> yu_rt::tables::YscmTable {
+fn yscm_table(dir: &Path) -> yu_rt::tables::YscmTable {
     yu_rt::tables::YscmTable::from_format(
         yu_format::yscm::CommandTable::parse(&read(dir, "ysc.ybn"), b"ysbin/ysc.ybn").unwrap(),
     )
     .unwrap()
 }
 
-fn ysl_table(dir: &PathBuf) -> yu_rt::tables::LabelTable {
+fn ysl_table(dir: &Path) -> yu_rt::tables::LabelTable {
     yu_rt::tables::LabelTable::from_format(
         yu_format::yslb::YslLabels::parse(&read(dir, "ysl.ybn"), b"ysbin/ysl.ybn").unwrap(),
     )
     .unwrap()
 }
 
-fn ysv_image(dir: &PathBuf) -> yu_rt::tables::VarImage {
+fn ysv_image(dir: &Path) -> yu_rt::tables::VarImage {
     yu_rt::tables::VarImage::from_format(
         yu_format::ysvr::VarDecls::parse(&read(dir, "ysv.ybn"), b"ysbin/ysv.ybn").unwrap(),
     )
     .unwrap()
 }
 
-fn ystl_list(dir: &PathBuf) -> yu_rt::tables::ScriptList {
+fn ystl_list(dir: &Path) -> yu_rt::tables::ScriptList {
     yu_rt::tables::ScriptList::from_format(
         yu_format::ystl::ScriptList::parse(&read(dir, "yst_list.ybn"), b"ysbin/yst_list.ybn")
             .unwrap(),
@@ -134,7 +138,9 @@ fn metadata_tables_parse_and_close() {
     assert_eq!(param_total, 1122, "0.495 ysc 实测 1122 个参数槽");
 
     // 运行核语义依赖的命令必须在表里(不是硬编码名字用于语义,而是自检)。
-    for name in ["GO", "GOSUB", "RETURN", "LET", "IF", "IFEND", "LOOP", "LOOPEND", "WAIT"] {
+    for name in [
+        "GO", "GOSUB", "RETURN", "LET", "IF", "IFEND", "LOOP", "LOOPEND", "WAIT",
+    ] {
         assert!(yscm.index_of(name).is_some(), "ysc 缺 {name}");
     }
 
@@ -143,7 +149,11 @@ fn metadata_tables_parse_and_close() {
     let mut hash_ok = 0usize;
     let labels_again = ysl_table(&dir);
     for l in &labels.labels {
-        if labels_again.labels.iter().any(|x| x.name_bytes == l.name_bytes) {
+        if labels_again
+            .labels
+            .iter()
+            .any(|x| x.name_bytes == l.name_bytes)
+        {
             hash_ok += 1;
         }
     }
@@ -281,7 +291,10 @@ fn all_scripts_decode_and_close() {
         "SCRIPTS: files={files} groups={groups} windows={windows} \
          record_failures={bad_records} (of which boundary-adjacent≈{cross_boundary})"
     );
-    assert_eq!(files, 136, "0.495 ERIS 实际存在 136 个 ystNNNNN.ybn(清单 141 条)");
+    assert_eq!(
+        files, 136,
+        "0.495 ERIS 实际存在 136 个 ystNNNNN.ybn(清单 141 条)"
+    );
     assert_eq!(groups, 36974, "全语料组数(实测)");
     assert_eq!(windows, 80_102, "窗口总数(实测)");
     assert_eq!(bad_records, 0, "表达式窗口全部可切分(跳转槽/原始值除外)");
@@ -372,7 +385,9 @@ fn labels_are_closed_over_scripts() {
         referenced.insert(l.script_id);
         match counts.get(&(l.script_id as u32)) {
             Some(&n) if (l.pc as usize) < n => {}
-            Some(&n) => out_of_range.push(format!("{} s{} pc{} >= {}", l.name, l.script_id, l.pc, n)),
+            Some(&n) => {
+                out_of_range.push(format!("{} s{} pc{} >= {}", l.name, l.script_id, l.pc, n))
+            }
             None => out_of_range.push(format!("{} s{} 无脚本文件", l.name, l.script_id)),
         }
     }
@@ -461,9 +476,7 @@ fn commercial_ypf() -> Option<PathBuf> {
 #[test]
 fn commercial_ypf_boots_without_ycd() {
     let Some(ypf) = commercial_ypf() else {
-        eprintln!(
-            "SKIP[count=1] YURIS_SAMPLE_GAME_YPF 不可用,跳过商业发行版(无 ycd)断言"
-        );
+        eprintln!("SKIP[count=1] YURIS_SAMPLE_GAME_YPF 不可用,跳过商业发行版(无 ycd)断言");
         return;
     };
     let src = YpfSource::open(&ypf, Codec::Cp932).expect("打开 data.ypf");
@@ -576,7 +589,10 @@ fn commercial_game_reaches_steady_state() {
     // 稳态断言(旧:末 3 帧恒等 8_681)——FADE 任务链被 TINT 激活后,商业包
     // 同样进入真实场景流,末帧不再恒等;改为「零 Fatal + 有命令推进」,
     // 并钉住首帧作为回归金丝雀。
-    assert!(counts.iter().all(|c| *c > 0), "每帧都有命令推进: {counts:?}");
+    assert!(
+        counts.iter().all(|c| *c > 0),
+        "每帧都有命令推进: {counts:?}"
+    );
 }
 
 /// **端到端**:官方入口链 `SYSTEM_START → es.ERIS` 连续跑 8 帧。
@@ -636,7 +652,12 @@ fn eris_entry_chain_runs_end_to_end() {
     // 2026-10-21(J3):1,290,326 → 1,292,091。MATH3D 由 Unimplemented 变为
     // 实装(EVID-J3-03,REA 0x448900),启动首帧精灵投影后的分支与旧值不同;
     // 该帧无 GraphicsHost,变化只来自 MATH3D 写回 F31..34。
-    assert_eq!(counts[0], 1_292_091, "首帧启动链命令数(回归金丝雀)");
+    //
+    // 2026-10-23(P3):1,292,091 → 1,292,100。`@_WINDOW_INIT_POS` 由
+    // Unimplemented 变为宿主注入值 0(REA `0x460b74` 读 `yscfg.dat` 第 10
+    // 项;ERIS 工程该值为 0),`es_GSD.yst:490` 的
+    // `IF[@_WINDOW_INIT_POS==0]` 首次为真,多执行 9 条初始化命令。
+    assert_eq!(counts[0], 1_292_100, "首帧启动链命令数(回归金丝雀)");
     // 2026-10-20(E3):YSTL 字段勘误(R12)后,启动期 `SYSTEMINFO[TEXTNUM,
     // NO=1..n]` 逐脚本查询循环拿到**真实文本条数**(旧实现错读成 var_count),
     // 该帧命令数随之修正:332,550 → 274,466(主人裁决钉入;证据链见
@@ -649,7 +670,10 @@ fn eris_entry_chain_runs_end_to_end() {
     //   2. `TEXT[CLICK=1]` 在自动模式返回 -1(REA 0x45383f..0x45388b),
     //      与引擎一样让出本任务的本 vsync,后续命令推迟到下一帧。
     // 新的钉值来自同一语料的实测;若回退这两条语义会在此爆掉。
-    assert_eq!(counts[1], 272_296, "文本语义修正后的第 2 帧命令数(回归金丝雀)");
+    assert_eq!(
+        counts[1], 272_296,
+        "文本语义修正后的第 2 帧命令数(回归金丝雀)"
+    );
     assert!(
         counts.iter().all(|c| *c > 0),
         "每帧都有命令推进: {counts:?}"
@@ -715,8 +739,10 @@ fn eris_real_scenario_text_path_emits_expected_flags() {
     assert_eq!(returncodes, 10, "每行一个 RETURNCODE");
     assert_eq!(
         texts[0],
-        vec![0x89, 0xf1, 0x91, 0x7a, 0x83, 0x56, 0x81, 0x5b, 0x83, 0x93, 0x82, 0x50,
-             0x83, 0x58, 0x83, 0x5e, 0x81, 0x5b, 0x83, 0x67],
+        vec![
+            0x89, 0xf1, 0x91, 0x7a, 0x83, 0x56, 0x81, 0x5b, 0x83, 0x93, 0x82, 0x50, 0x83, 0x58,
+            0x83, 0x5e, 0x81, 0x5b, 0x83, 0x67
+        ],
         "首行 CP932 原样透传"
     );
     let flags = vm.text_flags();
@@ -774,7 +800,8 @@ fn loose_and_packed_eris_are_execution_equivalent() {
 
     let src = DirSource::open(&data_root, Codec::Cp932).expect("data");
     let aux = DirSource::open(&project_root, Codec::Cp932).expect("project");
-    let loose = run(Vm::boot_with_aux(Box::new(src), Some(Box::new(aux)), cfg()).expect("loose boot"));
+    let loose =
+        run(Vm::boot_with_aux(Box::new(src), Some(Box::new(aux)), cfg()).expect("loose boot"));
 
     let pack = YpfSource::open(&ypf, Codec::Cp932).expect("data.ypf");
     let aux2 = DirSource::open(&project_root, Codec::Cp932).expect("project");
@@ -822,8 +849,7 @@ fn returncode_kinds_are_per_script_line_counters() {
             if group.opcode == rc_op {
                 let w = script.group_windows(pc).first().unwrap();
                 assert_eq!(
-                    w.kind as u32,
-                    expect,
+                    w.kind as u32, expect,
                     "{name} pc{pc}: 改行计数断裂(期待 {expect})"
                 );
                 expect += 1;
@@ -847,4 +873,30 @@ fn returncode_kinds_are_per_script_line_counters() {
     eprintln!(
         "RETURNCODE: total={total_rc} scripts_with_rc={scripts_with_rc}          (每脚本 1 起逐行 +1,全量成立)"
     );
+}
+
+/// `@_TEXT_NUM` = 工程文本总数:引擎从 `yst.ybn` 头部取(REA `0x45d73f`),
+/// ERIS 0.495 头部 text_total = 396;`yst_list` 逐脚本 text_count 求和同为 396
+/// (DIV-RT-048)。
+#[test]
+fn text_num_matches_yst_header_total() {
+    let mut skip = SkipCounter(0);
+    let dir = require_corpus!(skip);
+    let data_root = dir.parent().expect("data").to_path_buf();
+    let Some(project_root) = find_project_root(&dir) else {
+        skip.0 += 1;
+        return;
+    };
+    let src = DirSource::open(&data_root, Codec::Cp932).expect("data");
+    let aux = DirSource::open(&project_root, Codec::Cp932).expect("project");
+    let vm = Vm::boot_with_aux(
+        Box::new(src),
+        Some(Box::new(aux)),
+        BootConfig {
+            entry_label: "SYSTEM_START".to_string(),
+            ..BootConfig::default()
+        },
+    )
+    .expect("boot");
+    assert_eq!(vm.text_total(), 396, "yst.ybn text_total == yst_list 求和");
 }

@@ -9,7 +9,9 @@
   静态扫描 136 个 `yst`、36,974 组、80,102 窗口。
 - 运行:`SYSTEM_START` 固定时钟,`tick_at(f*16)` 共 600 次,602 个逻辑帧;
   首个非空 tick / 首个可见帧(Graphics/Window/Text)都是 0;
-  命令 7,046,350 次;事件丢弃 0;主线未结束。
+  **P3 复跑(2026-10-23):命令 7,735,679 次**(P0/P1 前的同口径为
+  7,735,670;差值 9 条来自 `_WINDOW_INIT_POS` 变为宿主注入 0 后
+  `es_GSD.yst:490` 的初始化分支首次成立,见 §9);事件丢弃 0;主线未结束。
 - `record_events=false`:逐命令触发数来自 `Vm::command_hits`(与事件流无关);
   域事件/文本事件/诊断照常产生。
 - 手册页相对 `<sdk495>/マニュアル/YU-RIS/html/`;`—` = 本次索引未找到专门页。
@@ -28,21 +30,21 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | 命令名 | 域 | 语料频度 | 手册页 | REA 锚点 | 状态 | 决策 |
 |---|---|---:|---|---|---|---|
 | `GOSUB` | vm | 10215 | `control/gosub.html` | `0x4459c4` | ✅ 实现 | 保持 |
-| `LET` | vm | 8136 | `variable/let.html` | `0x4468e0` | 🔁 部分(2 次未实现) | 主路径实现;未实现路径见 §2 |
+| `LET` | vm | 8136 | `variable/let.html` | `0x4468e0` | 🔁 部分(1 次未实现) | 主路径实现;剩 `@_SAVE_PATH` 宿主未注入(DIV-RT-010) |
 | `IF` | vm | 3326 | `control/if.html` | `0x4462d0` | ✅ 实现 | 保持 |
 | `IFEND` | vm | 3326 | `control/ifend.html` | `0x446518` | ✅ 实现 | 保持 |
 | `RETURN` | vm | 1750 | `control/return.html` | `0x44c0fc` | ✅ 实现 | 保持 |
 | `INT` | vm | 1428 | `variable/int.html` | `0x44661c` | ✅ 实现 | 保持 |
 | `ELSE` | vm | 887 | `control/else.html` | `0x4404f0` | ✅ 实现 | 保持 |
 | `IFBLEND` | vm | 887 | `control/if.html` | `0x4463c8` | ✅ 实现 | 保持 |
-| `S_INT` | vm | 767 | `variable/s_int.html` | `0x4634d8` | ✅ 实现 | 本 600 帧未触发;静态语料有 767 处 |
+| `S_INT` | vm | 767 | `variable/s_int.html` | `0x4634d8` | ✅ no-op | 官方 `xor eax,eax; ret`;静态 767 处但不执行(DIV-RT-043) |
 | `CG` | graphics | 534 | `cg/cg.html` | `0x42a514` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `LOOPEND` | vm | 522 | `control/loopend.html` | `0x4481d8` | ✅ 实现 | 保持 |
 | `LOOP` | vm | 522 | `control/loop.html` | `0x447ef0` | ✅ 实现 | 保持 |
 | `WORD` | vm | 464 | `basic/basic.html` | `0x458d44` | ✅ 实现 | 本 600 帧未触发;静态语料有 464 处;COV-M-03 M-2:每字符写 '1'/'2' 到 _TEXT_FLAG(REA 0x458d44) |
 | `STR` | vm | 431 | `variable/str.html` | `0x4500d8` | ✅ 实现 | 保持 |
 | `RETURNCODE` | vm | 396 | — | `0x44c390` | ✅ 实现 | 本 600 帧未触发;静态语料有 396 处;COV-M-02 M-2:自动模式追加 C/R/P,恒追加 E;仍为让出点(REA 0x44c390) |
-| `F_INT` | vm | 337 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
+| `F_INT` | vm | 337 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 官方默认体报「スクリプト実行エラー」(yse 0xdbbd2)+ 返回 -1;静态 337 处全在 `global_f.yst` 声明段,600 帧 0 执行(DIV-RT-043) |
 | `VARACT` | vm | 310 | `variable/varact.html` | `0x453fa8` | ✅ 实现 | 保持 |
 | `SAVE` | save | 290 | `file/save.html` | `0x44c45c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `LOAD` | save | 289 | `file/load.html` | `0x44708c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
@@ -51,13 +53,13 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `GO` | vm | 195 | `control/go.html` | `0x445830` | ✅ 实现 | 保持 |
 | `FLT` | vm | 173 | `variable/flt.html` | `0x4442ec` | ✅ 实现 | 保持 |
 | `LOOPBREAK` | vm | 159 | `control/loopbreak.html` | `0x44808c` | ✅ 实现 | 保持 |
-| `S_STR` | vm | 144 | `variable/s_str.html` | `0x4634d8` | ✅ 实现 | 本 600 帧未触发;静态语料有 144 处 |
+| `S_STR` | vm | 144 | `variable/s_str.html` | `0x4634d8` | ✅ no-op | 同 S_INT(DIV-RT-043) |
 | `VARINFO` | vm | 119 | `variable/varinfo.html` | `0x456050` | ✅ 实现 | 保持 |
 | `CGEND` | graphics | 100 | `cg/cgend.html` | `0x43d334` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `CGINFO` | graphics | 100 | `cg/cginfo.html` | `0x43d664` | 🔁 部分 | 主路径 + `ONMOUSE/ONMOUSE2/ONMOUSE3` 已实现(需宿主纹理采样器);`COLOR`/多字段顺序仍缺,见 §2 |
 | `WAIT` | vm | 95 | `control/wait.html` | `0x456ae4` | ✅ 实现 | 保持 |
-| `F_FLT` | vm | 72 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
-| `F_STR` | vm | 64 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
+| `F_FLT` | vm | 72 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 同 F_INT(DIV-RT-043) |
+| `F_STR` | vm | 64 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 同 F_INT(DIV-RT-043) |
 | `FONT` | graphics | 42 | `font/font.html` | `0x444428` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `LOOPCONTINUE` | vm | 40 | `control/loopcontinue.html` | `0x448144` | ✅ 实现 | 保持 |
 | `SOUND` | sound | 34 | `sound/sound.html` | `0x44e1e8` | ✅ 宿主 | `yu-sound` 已接线(§8);不装宿主时仍只发 `DomainCall` |
@@ -69,22 +71,22 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `MATH` | vm | 21 | `math/math.html` | `0x4482c4` | ✅ 实现 | 保持 |
 | `FILEACT` | file | 20 | `file/fileact.html` | `0x441370` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `TASKINFO` | vm | 19 | `control/taskinfo.html` | `0x4523fc` | ✅ 实现 | 保持 |
-| `DIALOG` | system | 17 | `other/dialog.html` | `0x43fc74` | ⛔ 未实现 | 手册有页但语义未取证 ⇒ 挂档 |
-| `S_FLT` | vm | 17 | `variable/s_flt.html` | `0x4634d8` | ✅ 实现 | 本 600 帧未触发;静态语料有 17 处 |
+| `DIALOG` | system | 17 | `other/dialog.html` | `0x43fc74` | ✅ 实现 | VM 状态机:任务挂起 + `Vm::answer_dialog`;LET=1 基按钮序号,LETSTR=输入文本(DIV-RT-044) |
+| `S_FLT` | vm | 17 | `variable/s_flt.html` | `0x4634d8` | ✅ no-op | 同 S_INT(DIV-RT-043) |
 | `EMOTE` | emote | 13 | — | `0x4405a4` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `TASK` | vm | 10 | `control/task.html` | `0x4506f4` | ✅ 实现 | 保持 |
 | `FONTINFO` | graphics | 8 | `font/fontinfo.html` | `0x444cfc` | 🔁 部分(3 次未实现) | 主路径实现;未实现路径见 §2 |
 | `MOVIE` | movie | 6 | `movie/movie.html` | `0x44b134` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `SYSTEMINFO` | system | 5 | — | `0x4505e4` | ✅ 实现 | 保持 |
 | `SAVEEND` | save | 5 | `file/saveend.html` | `0x44e1a0` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `DEBUGLIST` | system | 5 | — | `0x4634d8` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
+| `DEBUGLIST` | system | 5 | — | `0x4634d8` | ✅ no-op | 官方 `xor eax,eax; ret`(DIV-RT-043) |
 | `IFBREAK` | vm | 5 | `control/ifbreak.html` | `0x446408` | ✅ 实现 | 本 600 帧未触发;静态语料有 5 处 |
 | `MOUSE` | system | 4 | `system/mouse.html` | `0x44aaa0` | ✅ 实现 | 内核输入状态(MODE/TIME/MOVE/CLICK/WHEEL/X/Y/CURSOR/HX/HY/ID);光标显示/形状归宿主 |
 | `MENU` | menu | 4 | `menu/menu.html` | `0x449df8` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `MOVIEINFO` | movie | 4 | `movie/movieinfo.html` | `0x44ba2c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `YMVINFO` | vm | 4 | — | `0x459b98` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
+| `YMVINFO` | vm | 4 | — | `0x459b98` | ⛔ 宿主能力 | YMV 元数据查询(需宿主媒体层;DIV-RT-045) |
 | `EMOTEINFO` | emote | 3 | — | `0x441014` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `YMV` | vm | 3 | — | `0x458ee0` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
+| `YMV` | vm | 3 | — | `0x458ee0` | ➖ 域事件 | 媒体对象生命周期;只发 `Domain::Movie`(DIV-RT-045) |
 | `SYSTEM` | system | 2 | — | `0x45023c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `FPS` | system | 2 | `system/fps.html` | `0x4457a8` | ✅ 实现 | 保持 |
 | `INPUT` | system | 2 | `system/input.html` | `0x446564` | ✅ 实现 | KEY/MOUSE/PAD 源开关;关闭时整源计数器冻结(`FUN_0041a4b8`) |
@@ -92,102 +94,104 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `TEXT` | vm | 2 | `text/text.html` | `0x453448` | ✅ 实现 | COV-M-02 M-2 重写:OUTPUTMODE/WAIT/CLICK/RETURN/PAGE/CLICKRETURN/CLICKPAGE/CLEAR/AUTO*;CLICK 自动模式让出(REA 0x453448) |
 | `MOVIEEND` | movie | 2 | `movie/movieend.html` | `0x44b9d8` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `TASKEND` | vm | 2 | `control/taskend.html` | `0x4521dc` | ✅ 实现 | 本 600 帧未触发;静态语料有 2 处 |
-| `TRAY` | system | 2 | `other/tray.html` | `0x453a4c` | ⛔ 未实现 | 手册有页但语义未取证 ⇒ 挂档 |
-| `YMVEND` | vm | 2 | — | `0x459a64` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
+| `TRAY` | system | 2 | `other/tray.html` | `0x453a4c` | ➖ 域事件 | 托盘图标属宿主;只发 `Domain::System` 事件(DIV-RT-045) |
+| `YMVEND` | vm | 2 | — | `0x459a64` | ➖ 域事件 | 同 YMV(DIV-RT-045) |
 | `LABELINFO` | vm | 1 | `other/labelinfo.html` | `0x44674c` | ✅ 实现 | 保持 |
-| `ERROR` | system | 1 | — | `0x46358c` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
-| `CLIPACT` | graphics | 1 | `clip/clipact.html` | `0x43e2d0` | ⛔ 未实现 | 手册有页但语义未取证 ⇒ 挂档 |
+| `ERROR` | system | 1 | — | `0x46358c` | ✅ 实现 | 写逐命令启用表 `[0x689b00+opcode]`(默认全 1);消费者未定位(DIV-RT-046) |
+| `CLIPACT` | graphics | 1 | `clip/clipact.html` | `0x43e2d0` | ✅ 实现 | 内核镜像 + `DomainCall`;TEXT/SET 都存在才生效(DIV-RT-045) |
 | `FLASH` | flash | 1 | `flash/flash.html` | `0x443814` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `FLASHEND` | flash | 1 | `flash/flashend.html` | `0x443e64` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `FLASHINFO` | flash | 1 | `flash/flashinfo.html` | `0x443eb4` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `MATH3D` | vm | 1 | — | `0x448900` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
+| `MATH3D` | vm | 1 | — | `0x448900` | ✅ 实现 | 已实现(EVID-J3-03;本表旧口径作废) |
 | `MENUINFO` | menu | 1 | `menu/menuinfo.html` | `0x44a6f4` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `);` | vm | 0 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
+| `);` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 宏/编译产物残留;运行时同默认槽(DIV-RT-043) |
 | `CDDA` | system | 0 | — | `0x429fb0` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
-| `CLIPINFO` | graphics | 0 | `clip/clipinfo.html` | `0x43e410` | ⛔ 未实现 | 手册有页但语义未取证 ⇒ 挂档 |
-| `COMPILEMODE` | vm | 0 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
-| `CSV` | vm | 0 | — | `0x43e640` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
-| `CSVINFO` | vm | 0 | — | `0x43e660` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
-| `ERRORINFO` | vm | 0 | — | `0x46356c` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
-| `F_VAR` | vm | 0 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
-| `G_FLT` | vm | 0 | `variable/g_flt.html` | `0x459e90(默认)` | ➖ 声明类 | 不按命令执行;初值/数组经 `VARACT[INIT]`(DIV-RT-024) |
-| `G_FLT2` | vm | 0 | — | `0x459e90(默认)` | ➖ 声明类 | 不按命令执行;初值/数组经 `VARACT[INIT]`(DIV-RT-024) |
-| `G_FLT3` | vm | 0 | — | `0x459e90(默认)` | ➖ 声明类 | 不按命令执行;初值/数组经 `VARACT[INIT]`(DIV-RT-024) |
-| `G_FLT4` | vm | 0 | — | `0x459e90(默认)` | ➖ 声明类 | 不按命令执行;初值/数组经 `VARACT[INIT]`(DIV-RT-024) |
-| `G_INT` | vm | 0 | `variable/g_int.html` | `0x459e90(默认)` | ➖ 声明类 | 不按命令执行;初值/数组经 `VARACT[INIT]`(DIV-RT-024) |
-| `G_INT2` | vm | 0 | — | `0x459e90(默认)` | ➖ 声明类 | 不按命令执行;初值/数组经 `VARACT[INIT]`(DIV-RT-024) |
-| `G_INT3` | vm | 0 | — | `0x459e90(默认)` | ➖ 声明类 | 不按命令执行;初值/数组经 `VARACT[INIT]`(DIV-RT-024) |
-| `G_INT4` | vm | 0 | — | `0x459e90(默认)` | ➖ 声明类 | 不按命令执行;初值/数组经 `VARACT[INIT]`(DIV-RT-024) |
-| `G_STR` | vm | 0 | `variable/g_str.html` | `0x459e90(默认)` | ➖ 声明类 | 不按命令执行;初值/数组经 `VARACT[INIT]`(DIV-RT-024) |
-| `G_STR2` | vm | 0 | — | `0x459e90(默认)` | ➖ 声明类 | 不按命令执行;初值/数组经 `VARACT[INIT]`(DIV-RT-024) |
-| `G_STR3` | vm | 0 | — | `0x459e90(默认)` | ➖ 声明类 | 不按命令执行;初值/数组经 `VARACT[INIT]`(DIV-RT-024) |
-| `G_STR4` | vm | 0 | — | `0x459e90(默认)` | ➖ 声明类 | 不按命令执行;初值/数组经 `VARACT[INIT]`(DIV-RT-024) |
-| `G_VAR` | vm | 0 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
+| `CLIPINFO` | graphics | 0 | `clip/clipinfo.html` | `0x43e410` | ✅ 实现 | 读镜像写入 LET;丢弃 `<0x20` 字节(DIV-RT-045) |
+| `COMPILEMODE` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期;运行时同默认槽(DIV-RT-043) |
+| `CSV` | vm | 0 | — | `0x43e640` | ✅ no-op | 官方只做参数求值后返回 0(DIV-RT-046) |
+| `CSVINFO` | vm | 0 | — | `0x43e660` | ⛔ 未取证 | 读 CSV 文件并写 LET;文件/解析语义未取证 |
+| `ERRORINFO` | vm | 0 | — | `0x46356c` | ✅ no-op | 官方只做参数求值后返回 0(DIV-RT-046) |
+| `F_VAR` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 同 F_INT(DIV-RT-043) |
+| `G_FLT` | vm | 0 | `variable/g_flt.html` | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;初值/数组经 `VARACT[INIT]`(DIV-RT-024);运行时落在默认槽(DIV-RT-043) |
+| `G_FLT2` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;初值/数组经 `VARACT[INIT]`(DIV-RT-024);运行时落在默认槽(DIV-RT-043) |
+| `G_FLT3` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;初值/数组经 `VARACT[INIT]`(DIV-RT-024);运行时落在默认槽(DIV-RT-043) |
+| `G_FLT4` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;初值/数组经 `VARACT[INIT]`(DIV-RT-024);运行时落在默认槽(DIV-RT-043) |
+| `G_INT` | vm | 0 | `variable/g_int.html` | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;初值/数组经 `VARACT[INIT]`(DIV-RT-024);运行时落在默认槽(DIV-RT-043) |
+| `G_INT2` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;初值/数组经 `VARACT[INIT]`(DIV-RT-024);运行时落在默认槽(DIV-RT-043) |
+| `G_INT3` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;初值/数组经 `VARACT[INIT]`(DIV-RT-024);运行时落在默认槽(DIV-RT-043) |
+| `G_INT4` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;初值/数组经 `VARACT[INIT]`(DIV-RT-024);运行时落在默认槽(DIV-RT-043) |
+| `G_STR` | vm | 0 | `variable/g_str.html` | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;初值/数组经 `VARACT[INIT]`(DIV-RT-024);运行时落在默认槽(DIV-RT-043) |
+| `G_STR2` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;初值/数组经 `VARACT[INIT]`(DIV-RT-024);运行时落在默认槽(DIV-RT-043) |
+| `G_STR3` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;初值/数组经 `VARACT[INIT]`(DIV-RT-024);运行时落在默认槽(DIV-RT-043) |
+| `G_STR4` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;初值/数组经 `VARACT[INIT]`(DIV-RT-024);运行时落在默认槽(DIV-RT-043) |
+| `G_VAR` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 同 S_VAR(DIV-RT-043) |
 | `IFCONTINUE` | vm | 0 | `control/ifcontinue.html` | `0x446490` | ✅ 实现 | 语料未使用;单测覆盖 |
-| `LABEL` | vm | 0 | `other/label.html` | `0x4634d8` | ⛔ 未实现 | 手册有页但语义未取证 ⇒ 挂档 |
-| `MACRO` | vm | 0 | `other/macro.html` | `0x459e90(默认)` | ⛔ 未实现 | 手册有页但语义未取证 ⇒ 挂档 |
+| `LABEL` | vm | 0 | `other/label.html` | `0x4634d8` | ✅ no-op | 标签由 `ysl` 装载;指令本体官方 no-op(DIV-RT-043) |
+| `MACRO` | vm | 0 | `other/macro.html` | `0x459e90(默认)` | ✅ 脚本错误槽 | 仅 `macro.yst` 编译期使用;运行时默认槽报脚本错误(DIV-RT-043) |
 | `MENUACT` | menu | 0 | `menu/menuact.html` | `0x44a41c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `MENUEND` | menu | 0 | `menu/menuend.html` | `0x44a5d0` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `MIDI` | sound | 0 | — | `0x44aa40` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `MIDIEND` | sound | 0 | — | `0x44aa60` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `MIDIINFO` | sound | 0 | — | `0x44aa80` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `PLUG` | vm | 0 | — | `0x44bd10` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
-| `PREP` | vm | 0 | — | `0x4634d8` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
-| `PROJECTFOLDER` | vm | 0 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
-| `REGINFO` | vm | 0 | `reg/reginfo.html` | `0x44bd30` | ⛔ 未实现 | 手册有页但语义未取证 ⇒ 挂档 |
-| `RELEASEMODE` | vm | 0 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
-| `RETURNBREAK` | vm | 0 | — | `0x4634d8` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
+| `PLUG` | vm | 0 | — | `0x44bd10` | ✅ no-op | 官方只做参数求值后返回 0(DIV-RT-046) |
+| `PREP` | vm | 0 | — | `0x4634d8` | ✅ no-op | 官方 no-op(DIV-RT-043) |
+| `PROJECTFOLDER` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期;运行时同默认槽(DIV-RT-043) |
+| `REGINFO` | vm | 0 | `reg/reginfo.html` | `0x44bd30` | ⛔ 宿主能力 | 读 Windows 注册表;内核不猜(DIV-RT-045) |
+| `RELEASEMODE` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期;运行时同默认槽(DIV-RT-043) |
+| `RETURNBREAK` | vm | 0 | — | `0x4634d8` | ✅ no-op | 官方 no-op(DIV-RT-043) |
 | `SAVEINFO` | save | 0 | — | `0x44e1c8` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `SYSTEMMODE` | system | 0 | `projectconfig/systemmode.html` | `0x459e90(默认)` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `S_VAR` | vm | 0 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
+| `SYSTEMMODE` | system | 0 | `projectconfig/systemmode.html` | `0x459e90(默认)` | ✅ 脚本错误槽 | 仅 `projectconfig.txt` 编译期有效;运行时官方默认槽报错(DIV-RT-043) |
+| `S_VAR` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;出现在 yst 即官方脚本错误(DIV-RT-043) |
 | `TEXTINFO` | vm | 0 | `text/textinfo.html` | `0x4538cc` | ✅ 实现 | 语料未使用;M-2 按手册 + REA 实现,单测覆盖(COV-M-02) |
 | `VAR` | vm | 0 | — | `0x453f88` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
 | `WINDOWEND` | window | 0 | `window/windowend.html` | `0x45866c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `_IFDEF` | vm | 0 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
-| `_IFEND` | vm | 0 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
-| `_IFNDEF` | vm | 0 | — | `0x459e90(默认)` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
+| `_IFDEF` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 预处理器指令;运行时同默认槽(DIV-RT-043) |
+| `_IFEND` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 同 _IFDEF(DIV-RT-043) |
+| `_IFNDEF` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 同 _IFDEF(DIV-RT-043) |
 
 ## 2. 600 帧运行期未实现/未接线(按触发次数)
 
+> P3 复跑(2026-10-23,`coverage_census 600 8`)的原始计数。`FILEINFO`
+> 已归零(实现后不再挂号);`ERROR` 已实现启用表;`LET` 只剩
+> `@_SAVE_PATH`;`_WINDOW_EXEC_CAPTION` 的 600 条诊断随宿主 setter 归零。
+
 | 命令 | 触发次数 | 处理器 | 归因/处置 |
 |---|---:|---|---|
-| `CG` | 80620 | 域事件:graphics | 域事件已发;查询/写回需宿主状态机 |
-| `SOUNDINFO` | 7200 | 域事件:sound | 域事件已发;查询/写回需宿主状态机 |
+| `CG` | 80902 | 域事件:graphics | 域事件已发;查询/写回需宿主状态机 |
+| `SOUNDINFO` | 7200 | 域事件:sound | 未装 `SoundHost` 时只发事件;装宿主后走 query(§8) |
 | `CGEND` | 5713 | 域事件:graphics | 域事件已发;查询/写回需宿主状态机 |
 | `CGINFO` | 1598 | 已实现 | 未安装 `GraphicsHost`(宿主查询面;INFO 不是 VM 语义) |
-| `FILEINFO` | 1136 | 域事件:file | 域事件已发;查询/写回需宿主状态机 |
 | `CGACT` | 631 | 域事件:graphics | 域事件已发;查询/写回需宿主状态机 |
-| `SOUND` | 531 | 域事件:sound | 域事件已发;查询/写回需宿主状态机 |
+| `SOUND` | 531 | 域事件:sound | 未装 `SoundHost` 时只发事件;装宿主后由 `yu-sound` 消费 |
 | `WINDOWINFO` | 129 | 已实现 | 未安装 `GraphicsHost`(宿主查询面;INFO 不是 VM 语义) |
-| `SAVE` | 16 | 域事件:save | 域事件已发;查询/写回需宿主状态机 |
-| `EMOTE` | 12 | 域事件:emote | 域事件已发;查询/写回需宿主状态机 |
-| `WINDOW` | 9 | 域事件:window | 域事件已发;查询/写回需宿主状态机 |
-| `SYSTEM` | 6 | 域事件:system | 域事件已发;查询/写回需宿主状态机 |
+| `SAVE` | 16 | 域事件:save | 域事件已发;存档容器归宿主(DIV-RT-012) |
+| `EMOTE` | 12 | 域事件:emote | 域事件已发;E-mote 子系统归宿主 |
+| `WINDOW` | 10 | 域事件:window | 域事件已发;查询/写回需宿主状态机(+1 来自 `_WINDOW_INIT_POS` 分支) |
+| `SYSTEM` | 6 | 域事件:system | 域事件已发;子系统语义归宿主 |
 | `FONT` | 5 | 域事件:graphics | 域事件已发;查询/写回需宿主状态机 |
 | `FILEACT` | 3 | 域事件:file | 域事件已发;查询/写回需宿主状态机 |
 | `FONTINFO` | 3 | 已实现 | 未安装 `GraphicsHost`(宿主查询面;INFO 不是 VM 语义) |
-| `SAVEEND` | 3 | 域事件:save | 域事件已发;查询/写回需宿主状态机 |
-| `LET` | 2 | 已实现 | 2 次:`@_SAVE_PATH` 宿主未注入 1 次 + `_TEXT_FLAG` 写入未取证 1 次 |
+| `SAVEEND` | 3 | 域事件:save | 域事件已发;存档容器归宿主(DIV-RT-012) |
+| `LET` | 1 | 已实现 | 仅剩 `@_SAVE_PATH` 宿主未注入(DIV-RT-010) |
 | `MOUSE` | 1 | 已实现 | 2026-10-22:内核输入状态(REA `0x44aaa0`);本表旧口径为未接线 |
 | `INPUT` | 1 | 已实现 | 2026-10-22:输入源开关(REA `0x446564`);本表旧口径为未接线 |
-| `SOUNDEND` | 1 | 域事件:sound | 域事件已发;查询/写回需宿主状态机 |
-| `ERROR` | 1 | 无处理器 | 手册无页;分发表 opcode 15 走默认处理体 `0x459e90` ⇒ 语义未取证 |
+| `SOUNDEND` | 1 | 域事件:sound | 未装 `SoundHost` 时只发事件;装宿主后删层 |
 
 > **2026-10-22 输入收口**:`CGINFO[ONMOUSE/ONMOUSE2/ONMOUSE3]` 已在
 > `yu-gfx` + 宿主 `TextureSampler` 中实现(REA `0x43d664`/`0x43de01`),
 > 按钮系统的 `es.BT.MOUSECHECK` 不再因 `INFO_UNSUPPORTED` 失去命中;
-> 上表 1598 次是“未安装 GraphicsHost”的旧普查口径,不再代表当前缺口。
+> 上表 1598 次是“未安装 GraphicsHost”的普查口径,不再代表当前缺口。
 > `COLOR`(显式坐标取色)与多字段顺序仍未实现。
 
 ## 3. 系统变量缺口(运行期高频)
 
 | 变量 | 600 帧诊断 | 手册页 | REA | 状态 | 决策 |
 |---|---:|---|---|---|---|
-| `_WINDOW_EXEC_CAPTION` | 600 次(每帧 `IF`) | —(0.479/0.495 字节级均无) | 读 `0x427704`(case 0x78 → `[0x801924]`);脚本写 `0x446f70`;引擎 `WM_SYSCOMMAND(0xA3)` 路径 `FUN_0045a9d0` → `0x45a9e7` | ⛔ 未取证 | 三层仍缺①(手册无页)。语料语义(es_Scenario):一次性「窗口尺寸再初始化」标志,处理完写回 0;注释掉的旧路径是 `WINDOW[MAXIMIZE=1]`。属宿主窗口事件,不是 VM 语义 ⇒ 保持挂号(DIV-RT-007);若将来放宽门禁,只能做宿主 setter,不得在 VM 猜 |
+| `_WINDOW_EXEC_CAPTION` | 0 次(P3 前 600 次/每帧 `IF`) | —(0.479/0.495 字节级均无) | 读 `0x427704`(case 0x78 → `[0x801924]`);脚本写 `0x446f70`;引擎 `WM_SYSCOMMAND(0xA3)` 路径 `FUN_0045a9d0` → `0x45a9e7` | ✅ 宿主 setter | 手册仍无页;实现形态按 P1 结论:内核持一次性标志,宿主经 `Vm::request_window_caption()` 置 1,脚本读 1 后写回 0(es_Scenario)。触发条件(`*ecx` 来源)未取证 ⇒ VM 不自行置位(DIV-RT-007/047) |
 | `_TEXT_FLAG` 读 | 120 次(M-2 前) | `basic/svariable.html` | `0x446b93`(id `0x7b` → `[state+0x3c]`) | ✅ 已实现 | `COV-M-01`;返回控制字节流,字节表见 `src/text.rs::flag` |
-| `_TEXT_FLAG` 写 | 1 次 | 同上(○ 可赋值) | 写入路径未复核 | ⛔ 未实现 | 读取已实现;写入语义(是否重建文本/标志)未取证,保持挂号(DIV-RT-032) |
-| `_TEXT_NUM` | 0 | — | `0x4276e3`(装载期全局 `0x80174c`) | ⛔ 未实现 | 手册无页;引擎取值不是文本缓冲计数,语义未取证 |
-| `_WINDOW_INIT_POS` | 1 次 | — | `0x4276f3`(int getter case 0x79 → `[0x80133c]`) | ⛔ 未取证 | 手册无页;DIV-RT-007 |
+| `_TEXT_FLAG` 写 | 1 次 | 同上(○ 可赋值) | `0x446b98..0x446bb5`(id 0x7b → `[state+0x3c]` 逐字节拷贝) | ✅ 实现 | 写 = 替换控制字节流;不改文本、不逐字符重算(DIV-RT-032) |
+| `_TEXT_NUM` | 0 | — | 读 `0x4276e3` ← `0x80174c`;装载 `yst.ybn` 时写 `0x45d73f` | ✅ 实现 | = 工程文本总数;ERIS 396(yst.ybn 头部 == yst_list 求和;DIV-RT-048) |
+| `_WINDOW_INIT_POS` | 1 次 | — | 读 `0x4276f3` ← `[0x80133c]`;写 `0x460b74/0x460b87`(← `yscfg.dat` 第 10 项) | ✅ 宿主注入 | `BootConfig::window_init_pos`(ERIS 工程 = 0;DIV-RT-047) |
 | `_SAVE_PATH` | 1 次 | `basic/svariable.html` | — | ⛔ 宿主注入 | 路径由宿主给值;示例未注入(DIV-RT-010) |
 
 ## 4. 与 `command-provenance.md` 的交叉核对(勘误留痕)
@@ -202,14 +206,21 @@ cargo run -p yu-rt --example coverage_census -- 600 8
   (自动 `C/R/P` + 恒 `E`,手动置清屏请求)。
 - `TEXTINFO`:`provenance` 未列;0.495 语料 0 次、600 帧 0 次,但手册
   `text/textinfo.html` 有页且 REA `0x4538cc` 完整,故实现(不是猜测)。
-- `_TEXT_FLAG`:`provenance` 记「⛔ 挂账(DIV-RT-032)」;读取已按 REA
-  解除挂账,写入仍挂。
-- `LET` 的运行时未实现从 122 次降到 2 次(读 `_TEXT_FLAG` 不再挂号)。
+- `_TEXT_FLAG`:`provenance` 记「⛔ 挂账(DIV-RT-032)」;读取与写入
+  (`0x446b98..`)均已按 REA 解除挂账。
+- `LET` 的运行时未实现 122 → 2(M-2)→ **1**(P3;只剩 `_SAVE_PATH`)。
+- `F_*`:`provenance` 记「⛔ Unimplemented」;P3 定案为官方默认槽脚本
+  执行错误(静态 473 处全部不执行;DIV-RT-043)。
+- `LABEL`/`PREP`/`RETURNBREAK`:`provenance` 未列;P3 证实为官方 no-op
+  (`0x4634d8`),已实现。
+- `MATH3D`:矩阵旧口径「未取证」作废;代码已实现(EVID-J3-03)。
+- `DomainCall`:§5 的「没有 script/pc」缺口已关闭(P4)。
 
 ## 5. 已知契约缺口(M-2 记录,留给宿主/事件契约会话)
 
-- `DomainCall` 只有 frame/domain/name/args:**没有 script/pc**;宿主无法
-  把域命令定位回脚本。新增字段会破坏既有构造与模式匹配,本轮不改。
+- ~~`DomainCall` 只有 frame/domain/name/args:没有 script/pc~~ **P4 已解决**:
+  新增可选 `script`/`pc`(内核发出的总是 `Some`);见 §9 与
+  `domain-event-contracts.md` §1。yu-trace 的映射已用 `..` 兼容。
 - `SAVE/LOAD/FILEINFO/SOUNDINFO` 的 `SET`/`LET` 是变量引用,但
   `ArgValue` 只携带求值结果,变量身份丢失(DIV-RT-042)。
   宿主可用 `VmEvent::domain_args(&yscm)` 取参数名,但拿不到引用目标。
@@ -225,7 +236,12 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `COV-M-03` | `WORD`/`_` 的逐字符宽度标志 | `src/text.rs::TextState::append_text` | `fixture::text_flags_*` |
 | `COV-M-04` | 域事件参数名视图(SOUND/SAVE/FILE 接口基础) | `src/event.rs::VmEvent::domain_args` | `fixture::domain_args_map_slots_through_project_yscm` |
 | `COV-P0-01` | 输入按下沿/文本推进键名修正 | `src/input.rs` | `input::tests::repress_after_release_restarts_at_one`, `text_advance_buttons_use_binding_names`, `fixture::one_text_line_per_frame_until_advance_input` |
-| `COV-P1-01` | `_WINDOW_EXEC_CAPTION` 有界取证(未实现) | 本文 §3/§7 | — |
+| `COV-P1-01` | `_WINDOW_EXEC_CAPTION` 有界取证 | 本文 §3/§7 | `fixture::window_exec_caption_is_a_host_setter_round_trip` |
+| `COV-P3-01` | 官方默认槽 `0x459e90` = 脚本执行错误(非 no-op) | `src/vm/handlers.rs`(`ScriptError`) | `fixture::default_slot_reports_once_and_yields_without_terminating` |
+| `COV-P3-02` | 官方 no-op 槽 `0x4634d8` | `src/vm/handlers.rs`(`Noop`) | `fixture::noop_slots_continue_in_the_same_pump` |
+| `COV-P3-03` | DIALOG 契约 + 任务挂起/回答 | `src/dialog.rs`, `src/vm.rs`(`answer_dialog`) | `fixture::dialog_*` |
+| `COV-P3-04` | 剪贴板镜像 / ERROR 启用表 / 域边界 | `src/vm/handlers.rs`(`op_clipact/op_clipinfo/op_error`) | `fixture::clipact_*`, `error_sets_*`, `tray_is_a_domain_event` |
+| `COV-P3-05` | HANTOZEN/ZENTOHAN 官方表 | `src/case_tables.rs`, `data/case-tables-0495.tsv` | `case_tables::tests::*`, `fixture::varact_hantozen_*` |
 
 ## 7. P0/P1 验证(2026-10-21)
 
@@ -296,3 +312,50 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 
 回归：不装宿主时 `coverage_census 600 8` 的三条计数与 M-2 一致
 （531 / 7,200 / 1），诊断文案不变。
+
+
+## 9. P3 收口(2026-10-23)
+
+### 9.1 默认槽定案(DIV-RT-043)
+
+- 0.495 分发表 `DAT_007ace20` 先以 **`0x459e90` 填满 119 槽**
+  (`FUN_0045cf90` `0x45d1ae`),再逐槽覆盖。
+- 默认体(`0x459e90..0x459ea4`,REA 原始字节):
+  `push 1; push 0xdbbd2; call 0x465d08; add esp,8; mov eax,-1; ret`。
+  `0xdbbd2` 在工程 `ysbin/yse.ybn` 里 = `「[内部エラー] スクリプト実行
+  エラーが発生しました。」`。⇒ **不是 no-op、不是静默继续**:报一次全局
+  错误(`[0x5e4f84]` 抑制重复)并返回 -1(本帧让出,任务不终止)。
+- 另一类槽映射到 `0x4634d8`(`xor eax,eax; ret`)= **真 no-op**:
+  `DEBUGLIST`/`LABEL`/`PREP`/`RETURNBREAK`/`S_INT`/`S_FLT`/`S_STR`。
+- 内核:`HandlerKind::ScriptError` / `Noop` 与 `Unknown` 分离;
+  `F_*`/`G_*`/`MACRO`/`S_VAR`/`_IF*`/`);`/`SYSTEMMODE`/`COMPILEMODE`/
+  `RELEASEMODE`/`PROJECTFOLDER` 归默认槽。
+- **静态口径 vs 运行口径**:F_* 静态 473 处(`global_f.yst` 的声明段,
+  group 0..N),但入口标签都指向声明段之后,600 帧运行期命中 **0**;
+  扫描器不改,两口径同时记录。
+
+### 9.2 600 帧复跑(改动后)
+
+| 指标 | 值 |
+|---|---:|
+| 命令总数 | 7,735,679 |
+| 逻辑帧 | 602 |
+| `LET` 未实现 | 1(`@_SAVE_PATH`) |
+| `ERROR` 未实现 | 0(已实现启用表) |
+| `_WINDOW_EXEC_CAPTION` 诊断 | 0(宿主 setter 状态) |
+| 文本事件 | 0(无 GraphicsHost/标题流,与 M-1 同因) |
+
+`_WINDOW_INIT_POS` 从 Unimplemented 变为 0 后,`es_GSD.yst:490` 的
+`IF[@_WINDOW_INIT_POS==0]` 首次成立,首帧命令数 1,292,091 → 1,292,100
+(9 条初始化命令);这是**按证据**的分支变化,语料测试金丝雀已同步钉值。
+
+### 9.3 新增实现一览
+
+`DIALOG`(VM 状态机)、`CLIPACT`/`CLIPINFO`(剪贴板镜像)、`ERROR`
+(逐命令启用表)、`TRAY`/`YMV`/`YMVEND`(宿主域事件)、`CSV`/`PLUG`/
+`ERRORINFO`(官方 no-op)、`LABEL`/`PREP`/`RETURNBREAK`/`DEBUGLIST`/
+`S_*`(官方 no-op)、`F_*`/`G_*`/`S_VAR`/`MACRO`/`_IF*`/`);`/
+`SYSTEMMODE`/`COMPILEMODE`/`RELEASEMODE`/`PROJECTFOLDER`(默认槽错误)、
+`MATH[RND]`(MT19937 + 注入种子)、`VARACT[HANTOZEN/ZENTOHAN]`(官方表)、
+`_TEXT_FLAG` 写、`_TEXT_NUM`、`_WINDOW_INIT_POS`、`_WINDOW_EXEC_CAPTION`
+宿主 setter、`DomainCall.script/pc`。

@@ -8,7 +8,12 @@ fn eris_root() -> String {
     std::env::var("YURIS_SAMPLE_ERIS_ROOT")
         .or_else(|_| {
             std::env::var("YURIS_SAMPLE_ERIS_YSBIN").map(|p| {
-                std::path::Path::new(&p).ancestors().nth(2).unwrap().display().to_string()
+                std::path::Path::new(&p)
+                    .ancestors()
+                    .nth(2)
+                    .unwrap()
+                    .display()
+                    .to_string()
             })
         })
         .expect("set YURIS_SAMPLE_ERIS_ROOT or YURIS_SAMPLE_ERIS_YSBIN")
@@ -18,10 +23,20 @@ fn main() {
     let root = eris_root();
     let src = DirSource::open(format!("{root}/data"), Codec::Cp932).unwrap();
     let aux = DirSource::open(&root, Codec::Cp932).unwrap();
-    let cfg = BootConfig { entry_label: "SYSTEM_START".into(), ..BootConfig::default() };
+    let cfg = BootConfig {
+        entry_label: "SYSTEM_START".into(),
+        ..BootConfig::default()
+    };
     let mut vm = Vm::boot_with_aux(Box::new(src), Some(Box::new(aux)), cfg).unwrap();
     // 预装载全部脚本(扫全表)。
-    let ids: Vec<u32> = vm.tables().boot.scripts.entries.iter().map(|e| e.index).collect();
+    let ids: Vec<u32> = vm
+        .tables()
+        .boot
+        .scripts
+        .entries
+        .iter()
+        .map(|e| e.index)
+        .collect();
     let dat = DirSource::open(format!("{root}/data"), Codec::Cp932).unwrap();
     for id in &ids {
         let _ = vm.tables_mut().load_script(&dat, *id);
@@ -46,7 +61,9 @@ fn main() {
                 .unwrap_or_default();
             if targets.iter().any(|t| name.eq_ignore_ascii_case(t)) {
                 let line = sf.source_position(gi).unwrap_or(0);
-                hits.entry(name).or_default().push((sid, gi, line, g.window_count as usize));
+                hits.entry(name)
+                    .or_default()
+                    .push((sid, gi, line, g.window_count as usize));
             }
         }
     }
@@ -58,7 +75,12 @@ fn main() {
             per_script.entry(*sid).or_default().push((*gi, *line, *w));
         }
         for (sid, rs) in &per_script {
-            println!("  yst{:05} ({}) × {}", sid, vm.tables().script_path(*sid), rs.len());
+            println!(
+                "  yst{:05} ({}) × {}",
+                sid,
+                vm.tables().script_path(*sid),
+                rs.len()
+            );
             for (gi, line, w) in rs.iter().take(4) {
                 println!("    group={:>4} line={} win={}", gi, line, w);
             }

@@ -44,8 +44,12 @@ fn assert_golden(name: &str, actual: &str) {
         eprintln!("UPDATED {}", path.display());
         return;
     }
-    let expected = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("读 golden {} 失败: {e}(先跑 UPDATE_GOLDEN=1)", path.display()));
+    let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "读 golden {} 失败: {e}(先跑 UPDATE_GOLDEN=1)",
+            path.display()
+        )
+    });
     if expected != actual {
         // 逐行 diff,便于定位
         let mut diff = String::new();

@@ -128,9 +128,7 @@ mod tests {
         for code in ALL_CODES {
             assert!(seen.insert(*code), "duplicate code: {code}");
             assert!(
-                code.starts_with("table.")
-                    || code.starts_with("fmt.")
-                    || code.starts_with("rt."),
+                code.starts_with("table.") || code.starts_with("fmt.") || code.starts_with("rt."),
                 "code lacks yu-rt namespace: {code}"
             );
         }

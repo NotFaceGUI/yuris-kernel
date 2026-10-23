@@ -239,10 +239,12 @@ impl Value {
     /// 旧线观测为进程级崩溃)。本内核按 **Fatal** 报错——不静默返回 0。
     pub fn div(&self, rhs: &Value) -> Result<Value, yu_log::Diag> {
         match (self, rhs) {
-            (Value::Int(_), Value::Int(0)) => Err(diag::fatal(
+            (Value::Int(a), Value::Int(0)) => Err(diag::fatal(
                 code::rt::EXPR_DIV_ZERO,
                 Boundary::Script,
-                "整数除以 0:引擎走 x87/CRT 硬件异常路径;内核按 Fatal 处理(DIV-RT-003)",
+                format!(
+                    "整数除以 0:被除数 {a},除数 0(引擎走 x87/CRT 硬件异常路径;内核按 Fatal 处理,DIV-RT-003)。操作数在 detail 内,便于定位上游变量"
+                ),
             )),
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_div(*b))),
             _ => match (self.as_f64(), rhs.as_f64()) {
@@ -256,10 +258,10 @@ impl Value {
     /// `%`。整数/0 同 `/`(Fatal);浮点用 `%` 运算(未取证舍入 → DIV-RT-003)。
     pub fn rem(&self, rhs: &Value) -> Result<Value, yu_log::Diag> {
         match (self, rhs) {
-            (Value::Int(_), Value::Int(0)) => Err(diag::fatal(
+            (Value::Int(a), Value::Int(0)) => Err(diag::fatal(
                 code::rt::EXPR_DIV_ZERO,
                 Boundary::Script,
-                "整数取模 0:同除零(DIV-RT-003)",
+                format!("整数取模 0:被除数 {a},除数 0(同除零,DIV-RT-003)"),
             )),
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_rem(*b))),
             _ => match (self.as_f64(), rhs.as_f64()) {
@@ -552,6 +554,9 @@ pub struct VariableStore {
     /// 热路径是逐命令读写,用 FxHashMap 代替 BTreeMap;需要稳定顺序的
     /// [`VariableStore::iter`] 单独排序键。
     slots: rustc_hash::FxHashMap<(VarSpace, u16), VarSlot>,
+    /// 每次可观察状态变化 +1。`VARACT[INIT]` 的“同掩码且期间无写入”
+    /// 快速路径用它判断是否需要真的重建全局槽。
+    generation: u64,
 }
 
 impl VariableStore {
@@ -570,6 +575,34 @@ impl VariableStore {
     pub fn declare(&mut self, r: VarRef, ty: ElemType, dims: &[usize], init: &Value) {
         self.slots
             .insert((r.space, r.id), VarSlot::new(ty, dims, init));
+        self.bump();
+    }
+
+    /// 声明并**尽量复用已有存储**:类型/维数不变时只重置元素值。
+    ///
+    /// 与 [`Self::declare`] 的可观察状态相同(每个元素 = `coerce(ty, init)`、
+    /// 同 type/dims);区别是不重新分配 Vec。`VARACT[INIT]` 在启动脚本里
+    /// 被循环调用数万次,原实现每次重建所有全局槽是首帧 2s 的主因。
+    pub fn reset_declared(&mut self, r: VarRef, ty: ElemType, dims: &[usize], init: &Value) {
+        if let Some(slot) = self.slots.get_mut(&(r.space, r.id)) {
+            if slot.ty == ty && slot.dims.as_slice() == dims {
+                for value in &mut slot.data {
+                    *value = coerce_to(ty, init);
+                }
+                self.bump();
+                return;
+            }
+        }
+        self.declare(r, ty, dims, init);
+    }
+
+    /// 可观察状态代号(写入/声明/删除/改长度都会改变它)。
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn bump(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// 改变一维数组长度,**保留已有元素**(新增元素取类型零值)。
@@ -609,18 +642,66 @@ impl VariableStore {
         let ty = slot.ty;
         slot.data.resize(new_len, ty.default_value());
         slot.dims[0] = new_len;
+        self.bump();
+        Ok(())
+    }
+
+    /// 一维数组的 PUSH/POP(在 `pos` 处插入/删除一个元素,长度不变,
+    /// 空出的位置填类型零值)。
+    ///
+    /// 与旧实现(整数组读成 `Vec<Value>`、clone、逐元素写回)可观察状态
+    /// 相同;这里用切片 rotate 原地搬运,不分配、不 clone 元素。
+    /// 证据:手册 `variable/varact.html` 例 9/10 的 `PUSH/POP` 语义。
+    pub fn shift_1d(&mut self, r: VarRef, pos: usize, push: bool) -> Result<(), yu_log::Diag> {
+        let slot = self.slots.get_mut(&(r.space, r.id)).ok_or_else(|| {
+            diag::unimplemented(
+                code::rt::VAR_UNDECLARED,
+                Boundary::Script,
+                format!("PUSH/POP 目标未声明 {}", r.display()),
+            )
+        })?;
+        if slot.dims.len() != 1 {
+            return Err(diag::fatal(
+                code::rt::VAR_SHAPE,
+                Boundary::Script,
+                "PUSH/POP 只支持一维数组",
+            ));
+        }
+        let n = slot.dims[0];
+        if n > 0 {
+            let p = pos.min(n - 1);
+            if push {
+                slot.data[p..n].rotate_right(1);
+                slot.data[p] = slot.ty.default_value();
+            } else {
+                slot.data[p..n].rotate_left(1);
+                slot.data[n - 1] = slot.ty.default_value();
+            }
+        }
+        self.bump();
         Ok(())
     }
 
     /// 声明若不存在(用于 YSVR 初值镜像与声明命令)。
     pub fn declare_if_absent(&mut self, r: VarRef, ty: ElemType, dims: &[usize], init: &Value) {
-        self.slots
-            .entry((r.space, r.id))
-            .or_insert_with(|| VarSlot::new(ty, dims, init));
+        let inserted = match self.slots.entry((r.space, r.id)) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(VarSlot::new(ty, dims, init));
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        };
+        if inserted {
+            self.bump();
+        }
     }
 
     pub fn remove(&mut self, r: VarRef) -> Option<VarSlot> {
-        self.slots.remove(&(r.space, r.id))
+        let removed = self.slots.remove(&(r.space, r.id));
+        if removed.is_some() {
+            self.bump();
+        }
+        removed
     }
 
     /// 读取(标量或数组元素)。未声明 → `rt.var.undeclared`。
@@ -673,6 +754,7 @@ impl VariableStore {
         let stored = coerce_to(ty, value);
         if slot.is_scalar() && indices.is_empty() {
             slot.data[0] = stored.clone();
+            self.bump();
             return Ok(stored);
         }
         let flat = if indices.is_empty() {
@@ -682,6 +764,7 @@ impl VariableStore {
             linear_offset_for(Some(r), &slot.dims, indices)?
         };
         slot.data[flat] = stored.clone();
+        self.bump();
         Ok(stored)
     }
 
@@ -690,6 +773,33 @@ impl VariableStore {
         self.slots
             .get(&(r.space, r.id))
             .map(|s| (s.ty, s.dims.as_slice()))
+    }
+
+    /// 一维数组线性查找(`VARINFO SEARCH`):从 `start` 起找第一个等于
+    /// `needle` 的元素下标。
+    ///
+    /// 直接扫槽内数据;旧实现每个元素走一次 `VmAccess::read`(槽查找 +
+    /// `Value` clone,字符串还会复制),169 元素的按钮表搜索要 ~10µs。
+    pub fn search_1d(
+        &self,
+        r: VarRef,
+        start: usize,
+        needle: &Value,
+        ty: ElemType,
+    ) -> Option<usize> {
+        let slot = self.slots.get(&(r.space, r.id))?;
+        for (index, value) in slot.data.iter().enumerate().skip(start) {
+            let hit = match ty {
+                ElemType::Str => {
+                    matches!((needle, value), (Value::Str(a), Value::Str(b)) if a == b)
+                }
+                _ => needle.as_f64() == value.as_f64(),
+            };
+            if hit {
+                return Some(index);
+            }
+        }
+        None
     }
 
     /// 键的确定顺序遍历(存档/事件用)。

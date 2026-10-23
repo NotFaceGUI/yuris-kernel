@@ -4,6 +4,8 @@ use yu_cli::build_info;
 use yu_cli::{output, CliResult, Failure, EXIT_FAIL};
 
 fn main() {
+    // log 门面桥(P4 M-E):先于任何引擎/依赖初始化;级别见 YU_LOG。
+    yu_log::facade::init(|line| crate::output::error(line));
     let tokens: Vec<String> = std::env::args().skip(1).collect();
     let code = match dispatch(tokens) {
         Ok(()) => 0,
@@ -56,7 +58,7 @@ yu-cli · 原生引擎宿主 + 本地服务 + wasm 呈现端
                              [--record-events on|off] [--data PATH]
   yu-cli serve <project-root> [--backend soft|wgpu] [--port 4173] [--no-open]
                              [--entry LABEL] [--fps 60] [--record-events on|off]
-                             [--data PATH] [--www DIR]
+                             [--data PATH] [--www DIR] [--diag-ws]
   yu-cli dev  <project-root> [--port 4173] [--no-open] [--backend soft|wgpu]
   yu-cli case <project-root> --all | --case NAME [--update]
   yu-cli bench <project-root>
@@ -80,6 +82,7 @@ yu-cli · 原生引擎宿主 + 本地服务 + wasm 呈现端
 serve:
   启动后打印 http://127.0.0.1:<port>/,默认打开浏览器。
   WebSocket /ws:帧下发 + 输入/控制;SSE /events:HMR reload。
+  --diag-ws 额外开 /diag 通道(500ms 推诊断快照:等待任务/挂号表/域计数)。
   服务端读数据并执行内核;**浏览器不下载整包**。
 
 dev:

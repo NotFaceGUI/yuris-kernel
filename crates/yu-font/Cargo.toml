@@ -11,6 +11,8 @@ yu-log = { path = "../yu-log" }
 swash = { version = "0.2.10", default-features = false, features = ["std", "scale", "render"] }
 # Face table + bytes. `std` only on wasm (no filesystem enumeration).
 fontdb = { version = "0.24", default-features = false, features = ["std"] }
+# CP932 (Shift_JIS) bytes -> chars for text drawing. Pure Rust, wasm clean.
+encoding_rs = "0.8"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # System font discovery on desktop/Android. memmap/fontconfig stay off.

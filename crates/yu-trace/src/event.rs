@@ -11,10 +11,11 @@
 //! 只拉取 [`yu_rt::Vm::take_events`],不在 `yu-rt` 内写任何 trace 代码。
 //! 事件按 `take_events` 返回顺序入流,`seq` 是唯一序。
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use yu_rt::event::{Domain, JumpKind, VmEvent};
 
+use crate::fault::{FaultDumpPaths, FaultInfo, FaultRing, RingConfig, TickSummary};
 use crate::hash::sha256_hex;
 use crate::record::{
     BootSummary, ClockSummary, FrameDescriptionInput, HeaderPayload, InputSummary, Payload,
@@ -28,6 +29,12 @@ pub type SharedLog = Arc<Mutex<TraceLog>>;
 /// 新建共享日志。
 pub fn shared_log() -> SharedLog {
     Arc::new(Mutex::new(TraceLog::new()))
+}
+
+/// 锁中毒时取回内部值:故障快照在 panic 路径上执行,不能因为前一个
+/// 持有者 panic 而拒绝写 dump。
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 /// 从 [`yu_rt::BootConfig`] 与 [`yu_rt::Vm`] 构造头部。
@@ -106,37 +113,168 @@ pub fn input_summary(timeline: &yu_rt::InputTimeline, frames: u64) -> InputSumma
     input_summary_range(timeline, 1, frames)
 }
 
+/// 宿主/任务书里的 `TraceRecorder` 别名(本 crate 的实现类型是
+/// [`EventRecorder`];功能相同,不另造类型)。
+pub type TraceRecorder = EventRecorder;
+
 /// 事件录制器。持有共享日志,可在 VFS 包装器与 `Vm` 事件拉取之间共用。
+///
+/// # ring buffer 模式
+///
+/// [`EventRecorder::enable_ring`] 后,带帧的记录不再进入无界 `TraceLog`,
+/// 而是进入 [`FaultRing`]:只保留最近 N tick 的摘要与故障现场。ring 槽位
+/// 是克隆间共享的,`TracingSource` 在启用前后都能看到同一份 ring。
 #[derive(Clone)]
 pub struct EventRecorder {
     log: SharedLog,
+    ring: Arc<Mutex<Option<FaultRing>>>,
 }
 
 impl EventRecorder {
     pub fn new(log: SharedLog) -> Self {
-        Self { log }
+        Self {
+            log,
+            ring: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// 新建日志并写入头部。
     pub fn with_header(header: HeaderPayload) -> Self {
         let log = shared_log();
         log.lock().unwrap().push_header(header);
-        Self { log }
+        Self::new(log)
+    }
+
+    /// 新建日志并启用 ring buffer(头部由宿主在启动后提供)。
+    pub fn with_ring(header: HeaderPayload, config: RingConfig) -> Result<Self, yu_log::Diag> {
+        let recorder = Self::with_header(header.clone());
+        let mut ring = FaultRing::new(config)?;
+        ring.set_header(header);
+        *lock(&recorder.ring) = Some(ring);
+        Ok(recorder)
+    }
+
+    /// 启用(或重配)ring buffer。
+    ///
+    /// 必须在第一 tick 前调用,否则 `start_frame != 1`,dump 会明确标注
+    /// 不可回放(不假装能重演)。
+    pub fn enable_ring(
+        &self,
+        config: RingConfig,
+        header: Option<HeaderPayload>,
+    ) -> Result<(), yu_log::Diag> {
+        let mut ring = FaultRing::new(config)?;
+        if let Some(header) = header {
+            ring.set_header(header);
+        }
+        *lock(&self.ring) = Some(ring);
+        Ok(())
+    }
+
+    pub fn has_ring(&self) -> bool {
+        lock(&self.ring).is_some()
+    }
+
+    /// 更新 ring 的头部(启动后补样本 hash / 表来源)。
+    pub fn set_fault_header(&self, header: HeaderPayload) {
+        if let Some(ring) = lock(&self.ring).as_mut() {
+            ring.set_header(header);
+        }
+    }
+
+    /// 开始一个 tick;上一 tick 自动收口。
+    pub fn begin_tick(&self, first_frame: u64, now_ms: Option<u32>) {
+        if let Some(ring) = lock(&self.ring).as_mut() {
+            ring.begin_tick(first_frame, now_ms);
+        }
+    }
+
+    /// 收口当前 tick,并返回它的摘要(无 tick 时 `None`)。
+    pub fn finish_fault_tick(&self) -> Option<TickSummary> {
+        let mut guard = lock(&self.ring);
+        let ring = guard.as_mut()?;
+        ring.finish_tick();
+        ring.last_tick().cloned()
+    }
+
+    /// 记录显式输入帧(稀疏时间线;dump 回放的数据源)。
+    pub fn record_timeline_entry(&self, frame: u64, input: &yu_rt::input::InputFrame) {
+        if let Some(ring) = lock(&self.ring).as_mut() {
+            ring.record_timeline_entry(frame, input);
+        }
+    }
+
+    /// 记录本 tick 观察到的输入帧(排障视图,不决定回放)。
+    pub fn record_tick_input(&self, frame: u64, input: &yu_rt::input::InputFrame) {
+        if let Some(ring) = lock(&self.ring).as_mut() {
+            ring.record_tick_input(frame, input);
+        }
+    }
+
+    /// 标注本 tick 实际消费到的最后一个逻辑帧。
+    pub fn note_tick_frames(&self, last_frame: u64) {
+        if let Some(ring) = lock(&self.ring).as_mut() {
+            ring.note_tick_frames(last_frame);
+        }
+    }
+
+    /// 写故障快照(JSONL + 伴生时间线文件,均为原子写)。
+    pub fn dump_on_fault(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        fault: FaultInfo,
+    ) -> Result<FaultDumpPaths, yu_log::Diag> {
+        let mut guard = lock(&self.ring);
+        let ring = guard.as_mut().ok_or_else(|| {
+            yu_log::Diag::fatal(crate::error::code::SCHEMA, yu_log::Boundary::Format)
+                .with_detail("dump_on_fault requires an enabled ring buffer")
+        })?;
+        crate::fault::write_dump(ring, path.as_ref(), fault)
+    }
+
+    /// ring 配置快照(诊断用)。
+    pub fn ring_config(&self) -> Option<RingConfig> {
+        lock(&self.ring).as_ref().map(|ring| ring.config().clone())
     }
 
     pub fn shared(&self) -> SharedLog {
         Arc::clone(&self.log)
     }
 
-    /// 记录一条事件;返回分配到的 `seq`。
+    pub fn shared_log(&self) -> SharedLog {
+        Arc::clone(&self.log)
+    }
+
+    /// 记录一条事件;ring 模式返回 0(不分配 trace seq)。
     pub fn record(&self, event: &VmEvent) -> u64 {
+        if let Some(ring) = lock(&self.ring).as_mut() {
+            ring.record_event(event);
+            return 0;
+        }
         let (frame, payload) = map_event(event);
         self.log.lock().unwrap().push(frame, payload)
     }
 
     /// 记录一条帧描述;校验失败原样返回 `trace.*`(不写半条记录)。
     pub fn record_frame(&self, input: FrameDescriptionInput) -> Result<u64, yu_log::Diag> {
-        self.log.lock().unwrap().push_frame_input(input)
+        let summary = crate::record::FrameSummary::from_input(input)?;
+        if let Some(ring) = lock(&self.ring).as_mut() {
+            ring.record_frame(summary);
+            return Ok(0);
+        }
+        Ok(self.log.lock().unwrap().push_frame(summary))
+    }
+
+    /// 边界①的记录入口(vfs 包装器使用)。
+    ///
+    /// ring 模式下成功读取只计数,失败读取保留记录;启动链(帧外)记录
+    /// 按 `max_boot_records` 保留。
+    pub(crate) fn record_payload(&self, frame: Option<u64>, payload: Payload) {
+        if let Some(ring) = lock(&self.ring).as_mut() {
+            ring.record_vfs(frame, payload);
+            return;
+        }
+        self.log.lock().unwrap().push(frame, payload);
     }
 
     /// 按给定顺序记录一批事件;返回新增条数。
@@ -158,10 +296,6 @@ impl EventRecorder {
     /// 当前日志快照(克隆)。
     pub fn snapshot(&self) -> TraceLog {
         self.log.lock().unwrap().clone()
-    }
-
-    pub fn shared_log(&self) -> SharedLog {
-        Arc::clone(&self.log)
     }
 }
 
@@ -265,6 +399,9 @@ pub fn map_event(event: &VmEvent) -> (Option<u64>, Payload) {
             domain,
             name,
             args,
+            // 可选定位字段(script/pc)不进入 v4 payload;事件种类仍由本
+            // crate 穷尽映射。新增可选字段不改变记录语义。
+            ..
         } => (
             Some(*frame),
             Payload::VmCall {
@@ -415,6 +552,8 @@ mod tests {
                 domain: Domain::Graphics,
                 name: "CG".to_string(),
                 args: vec![],
+                script: None,
+                pc: None,
             },
             VmEvent::End {
                 frame: 1,

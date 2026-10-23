@@ -568,6 +568,10 @@ fn text(out: &mut String, t: &crate::text::TextRun) {
     out.push_str(if t.style.antialias { "true" } else { "false" });
     out.push_str(",\"draw_mode\":");
     out.push_str(&t.style.draw_mode.to_string());
+    out.push_str(",\"gradation\":");
+    out.push_str(&t.style.gradation.to_string());
+    out.push_str(",\"rotation\":");
+    out.push_str(&t.style.rotation.to_string());
     out.push_str(",\"line_spacing\":");
     match t.style.line_spacing {
         Some(v) => out.push_str(&v.to_string()),
@@ -608,7 +612,90 @@ fn text(out: &mut String, t: &crate::text::TextRun) {
     }
     out.push_str(",\"frame\":");
     out.push_str(&t.frame.to_string());
+    out.push_str(",\"flags\":");
+    match &t.flags {
+        Some(f) => esc_bytes(out, f),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"reveal\":");
+    match t.reveal {
+        Some(n) => out.push_str(&n.to_string()),
+        None => out.push_str("null"),
+    }
     out.push('}');
+}
+
+/// 文本排版/`CGACT[TEXT]` 绘制项。空时不输出,保持无文本帧的 golden 稳定。
+fn text_frame_extras(out: &mut String, f: &crate::frame::CompositorFrame) {
+    if let Some(l) = &f.text_layout {
+        out.push_str(",\"text_layout\":{\"target\":");
+        match &l.target {
+            Some(t) => wid(out, t),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"origin\":[");
+        out.push_str(&l.origin.0.to_string());
+        out.push(',');
+        out.push_str(&l.origin.1.to_string());
+        out.push_str("],\"style\":{\"color\":");
+        out.push_str(&l.style.color.to_string());
+        out.push_str(",\"size_x\":");
+        out.push_str(&l.style.size_x.to_string());
+        out.push_str(",\"size_y\":");
+        out.push_str(&l.style.size_y.to_string());
+        out.push_str(",\"bold\":");
+        out.push_str(if l.style.bold { "true" } else { "false" });
+        out.push_str("},\"line_height\":");
+        out.push_str(&l.line_height.to_string());
+        out.push_str(",\"chars\":");
+        out.push_str(&l.chars.to_string());
+        out.push_str(",\"reveal\":");
+        match l.reveal {
+            Some(n) => out.push_str(&n.to_string()),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"flags_source\":\"text_flag\",\"glyphs\":[");
+        for (i, g) in l.glyphs.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"bytes\":");
+            esc_bytes(out, &g.bytes);
+            out.push_str(",\"full\":");
+            out.push_str(if g.full { "true" } else { "false" });
+            out.push_str(",\"x\":");
+            out.push_str(&g.x.to_string());
+            out.push_str(",\"y\":");
+            out.push_str(&g.y.to_string());
+            out.push('}');
+        }
+        out.push_str("]}");
+    }
+    if !f.text_draws.is_empty() {
+        out.push_str(",\"text_draws\":[");
+        for (i, d) in f.text_draws.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"target\":");
+            wid(out, &d.target);
+            out.push_str(",\"bytes\":");
+            esc_bytes(out, &d.bytes);
+            out.push_str(",\"x\":");
+            out.push_str(&d.x.to_string());
+            out.push_str(",\"y\":");
+            out.push_str(&d.y.to_string());
+            out.push_str(",\"set\":");
+            out.push_str(&d.set.to_string());
+            out.push_str(",\"bno\":");
+            match d.bno {
+                Some(v) => out.push_str(&v.to_string()),
+                None => out.push_str("null"),
+            }
+            out.push('}');
+        }
+        out.push(']');
+    }
 }
 
 fn diagnostics(out: &mut String, ds: &[crate::error::FrameDiag]) {
@@ -713,6 +800,7 @@ pub fn to_json(f: &CompositorFrame) -> String {
         }
         text(&mut out, t);
     }
+    text_frame_extras(&mut out, f);
     out.push_str("],\"diagnostics\":");
     diagnostics(&mut out, &f.diagnostics);
     out.push('}');
@@ -739,6 +827,7 @@ pub fn to_display_json(f: &CompositorFrame) -> String {
         }
         text(&mut out, t);
     }
+    text_frame_extras(&mut out, f);
     out.push_str("],\"diagnostics\":");
     diagnostics(&mut out, &f.diagnostics);
     out.push('}');

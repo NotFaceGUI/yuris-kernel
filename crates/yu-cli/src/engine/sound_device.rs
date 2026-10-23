@@ -26,13 +26,7 @@ fn current(slot: &Slot) -> Option<Arc<Mutex<SoundState>>> {
     slot.lock().ok().and_then(|slot| slot.clone())
 }
 
-fn render_f32(
-    slot: &Slot,
-    data: &mut [f32],
-    rate: u32,
-    channels: usize,
-    first_audio: &AtomicBool,
-) {
+fn render_f32(slot: &Slot, data: &mut [f32], rate: u32, channels: usize, first_audio: &AtomicBool) {
     let Some(state) = current(slot) else {
         data.fill(0.0);
         return;
@@ -43,7 +37,12 @@ fn render_f32(
     };
     let peak = data.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
     if peak > 0.0 && !first_audio.swap(true, Ordering::Relaxed) {
-        eprintln!("[sound] first non-silent block: peak={peak:.4} frames={} rate={rate}", data.len() / channels.max(1));
+        // `src/` 纪律:不走 stdout/stderr 宏;经 log 门面进宿主统一 sink。
+        log::info!(
+            target: "yu-sound",
+            "[sound] first non-silent block: peak={peak:.4} frames={} rate={rate}",
+            data.len() / channels.max(1)
+        );
     }
 }
 
@@ -92,7 +91,8 @@ impl SoundSink {
         let channels = usize::from(config.channels);
         let slot: Slot = Arc::new(Mutex::new(None));
         let first_audio = Arc::new(AtomicBool::new(false));
-        let err_fn = |err| eprintln!("[sound] 设备流错误: {err}");
+        // 回调线程不能 panic;错误经 log 门面留痕(宿主 main 已初始化桥)。
+        let err_fn = |err| log::warn!(target: "yu-sound", "[sound] 设备流错误: {err}");
         let stream = match sample_format {
             cpal::SampleFormat::F32 => {
                 let slot = slot.clone();

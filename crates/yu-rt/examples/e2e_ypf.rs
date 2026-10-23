@@ -26,14 +26,19 @@ fn run(vm: &mut Vm, frames: u32) -> (Vec<u64>, u64, usize) {
         total += r.commands_pumped;
         errs += r.errors.len();
         counts.push(r.commands_pumped);
-        if r.main_finished { break; }
+        if r.main_finished {
+            break;
+        }
     }
     (counts, total, errs)
 }
 
 fn main() {
     let root = std::env::args().nth(1).expect("project root");
-    let frames: u32 = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(6);
+    let frames: u32 = std::env::args()
+        .nth(2)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6);
 
     // A: 散盘
     let src = DirSource::open(format!("{root}/data"), Codec::Cp932).unwrap();

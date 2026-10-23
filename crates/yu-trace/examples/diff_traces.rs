@@ -14,8 +14,8 @@
 use std::process::ExitCode;
 
 use yu_trace::{
-    diff_aligned, diff_aligned_logs, error, AlignedDiffOptions, DiffFailure, HeaderCompare, Kind,
-    Projection, Sub, TraceLog,
+    diff_aligned, diff_aligned_logs, error, AlignedDiffOptions, DiffFailure, FrameFieldPolicy,
+    HeaderCompare, Kind, Projection, Sub, TraceLog,
 };
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -121,6 +121,16 @@ fn main() -> ExitCode {
     if let Some(fields) = arg(&args, "--payload-fields") {
         let fields = parse_list(&fields);
         options.payload_fields = fields;
+    }
+    if let Some(policy) = arg(&args, "--frame-fields") {
+        options.frame_fields = match policy.as_str() {
+            "full" => FrameFieldPolicy::Full,
+            "screen" => FrameFieldPolicy::Screen,
+            other => {
+                eprintln!("unknown --frame-fields {other:?} (full|screen)");
+                return ExitCode::from(2);
+            }
+        };
     }
     if let Some(context) = arg(&args, "--context") {
         options.context = context.parse::<usize>().expect("--context must be usize");

@@ -100,3 +100,30 @@ cargo run -q -p yu-trace --example diff_traces -- \
 - 原始结果: `order-only projection: expected 4681 commands, actual 1932 commands`;
   首分歧 `key=vm/command frame=0 ordinal=966`, `path=/payload/pc`,
   `expected=1414`, `actual=820`；前 966 条一致。
+
+## 2026-10-23 任务相位证据(P5,600 tick,无点击)
+
+官方探针新增 `--mode task-phase`:在 tick 入口 `0x4040f8` 只读遍历任务链表
+(`0x801704` 列表对象、节点 `+0x0c/+0x34/+0x30`、上下文 `+0x18/+0x1c/+0x20/+0x3c`),
+不挂命令分派断点。采集 600 tick,产物 `target/tmp/p5-phase-click5/task_phase.jsonl`
+(不入库);内核 `emit_kernel_phase` 同 600 tick(`target/tmp/p5-kernel/kernel_phase.jsonl`)。
+
+对拍方式:`tools/task_phase_diff.py --align anchor --anchor-script 66`(以场景任务 66
+首次出现为相对 0),比较每 tick 启用任务的 `(script,pc)` 多重集合。
+
+结果:
+
+- **对齐成立**:script 66 首次出现于官方 tick 12 / 内核 frame 12;script 20 三个实例的
+  `(script,pc)` 在相对 0..590 逐 tick 相同。
+- **新分歧 1**:官方任务链表常驻 `script 0`(容器/主任务)与 `script 8`;内核
+  `SYSTEM` 主任务(script 8)在 frame 16 左右结束并从 `Scheduler::nodes()` 消失。
+- **新分歧 2(显式忽略 0/8 后)**:相对 49 起,官方 script 66 的 pc 在
+  `5100/5168` 间推进(49/50/62/…),内核 600 tick 一直停在 `5100`;
+  首个 `(script,pc)` 分歧 = `expected 66:5168 actual 66:5100`。
+- **新分歧 3**:官方 script 66 在相对 205 之后被 `script 139` 取代(绝对 tick 218);
+  内核 script 66 一直存活到 600 tick 末尾(相对 590),没有对应的结束/替换。
+- 这两条是**任务生命周期/调度**差异,不是 script 60 体内命令差异;仍不能据此判定
+  script 60 语义错误。DIV-L-002 保持 open。
+- **点击未覆盖转场**:本会话 `SendInput` 已在窗口前台发送,但官方 `0x80157c`
+  “有效 UI 点击”标志始终 0、`trigger=null`,任务相位无转场。script 60 返回后的
+  相位仍缺官方样本;已把“真实用户点击/前台激活”列为下一步采集前提。

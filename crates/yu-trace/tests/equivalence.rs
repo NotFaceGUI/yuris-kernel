@@ -121,7 +121,11 @@ fn open_exists_list_are_byte_identical_through_the_wrapper() {
         calls += 1;
     }
 
-    assert_eq!(log.lock().unwrap().len(), calls, "every call must be recorded");
+    assert_eq!(
+        log.lock().unwrap().len(),
+        calls,
+        "every call must be recorded"
+    );
     assert_eq!(traced.source_name(), bare.source_name());
     assert_eq!(traced.source_name(), "mem");
 }

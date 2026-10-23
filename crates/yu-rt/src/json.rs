@@ -41,7 +41,11 @@ pub fn fmt_f64(v: f64) -> String {
     if v.is_nan() {
         "NaN".to_string()
     } else if v.is_infinite() {
-        if v > 0.0 { "Infinity".to_string() } else { "-Infinity".to_string() }
+        if v > 0.0 {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        }
     } else if v == 0.0 {
         "0.0".to_string()
     } else if v == v.trunc() && v.abs() < 1e16 {
@@ -197,7 +201,12 @@ pub fn event_line(ev: &VmEvent) -> String {
             write_args(&mut o, args);
         }
         VmEvent::DomainCall {
-            domain, name, args, ..
+            domain,
+            name,
+            args,
+            script,
+            pc,
+            ..
         } => {
             o.push_str(",\"domain\":");
             esc_str(&mut o, domain_str(*domain));
@@ -205,6 +214,12 @@ pub fn event_line(ev: &VmEvent) -> String {
             esc_str(&mut o, name);
             o.push_str(",\"args\":");
             write_args(&mut o, args);
+            if let Some(script) = script {
+                o.push_str(&format!(",\"script\":{script}"));
+            }
+            if let Some(pc) = pc {
+                o.push_str(&format!(",\"pc\":{pc}"));
+            }
         }
         VmEvent::End { restart, .. } => {
             o.push_str(",\"restart\":");

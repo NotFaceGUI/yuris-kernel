@@ -137,6 +137,8 @@ fn kind_label(kind: HandlerKind) -> String {
     match kind {
         HandlerKind::Unknown => "无处理器".to_string(),
         HandlerKind::Domain(d) => format!("域事件:{}", d.as_str()),
+        HandlerKind::Noop => "no-op(官方0x4634d8)".to_string(),
+        HandlerKind::ScriptError => "脚本错误槽(官方默认0x459e90)".to_string(),
         _ => "已实现".to_string(),
     }
 }
@@ -151,10 +153,7 @@ struct DomainStat {
 fn main() {
     let root = eris_root();
     let mut args = std::env::args().skip(1);
-    let frames: u32 = args
-        .next()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(600);
+    let frames: u32 = args.next().and_then(|v| v.parse().ok()).unwrap_or(600);
     let samples: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(6);
 
     let (corpus_desc, corpus_hash) = corpus_fingerprint(&root);
@@ -162,9 +161,12 @@ fn main() {
     // ---- 静态语料频度(全量 yst 组扫描;与 corpus 测试同口径) ----
     let scan_src = open_source(&root);
     let scan_aux = open_aux(&root);
-    let mut tables =
-        TableSet::load_from(scan_src.as_ref(), Some(scan_aux.as_ref()), DEFAULT_SCRIPT_KEY)
-            .expect("tables");
+    let mut tables = TableSet::load_from(
+        scan_src.as_ref(),
+        Some(scan_aux.as_ref()),
+        DEFAULT_SCRIPT_KEY,
+    )
+    .expect("tables");
     let yscm = tables.boot.yscm.clone();
     let script_list_len = tables.boot.scripts.len();
     let script_ids: Vec<u32> = (0..tables.boot.scripts.len() as u32).collect();
@@ -307,10 +309,7 @@ fn main() {
     // ---- 输出 ----
     println!("# yu-rt 覆盖普查(M-1)");
     println!();
-    println!(
-        "- 语料: `{}`,FNV-1a64 = `{corpus_hash:016x}`",
-        corpus_desc
-    );
+    println!("- 语料: `{}`,FNV-1a64 = `{corpus_hash:016x}`", corpus_desc);
     println!(
         "- 静态扫描: {} 个 yst,{} 组,{} 窗口(脚本清单 {} 条,缺文件 {} 条;命令表 {} 条)",
         static_scripts,
@@ -365,11 +364,7 @@ fn main() {
             bad,
         ));
     }
-    rows.sort_by(|a, b| {
-        b.2.cmp(&a.2)
-            .then(b.3.cmp(&a.3))
-            .then(a.1.cmp(b.1))
-    });
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then(b.3.cmp(&a.3)).then(a.1.cmp(b.1)));
     for (i, name, sf, hit, kind, bad) in &rows {
         println!("| `{name}` | {i} | {sf} | {hit} | {kind} | {bad} |");
     }

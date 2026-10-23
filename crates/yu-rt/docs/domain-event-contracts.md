@@ -27,6 +27,18 @@ for a in args {
 `domain_args` 是加法式 API:事件字段不变,只把槽号映射成参数名;
 查不到命令名时名字退化为 `@<slot>`。
 
+**P4 起**:`DomainCall` 增加可选 `script`/`pc`(内核发出的总是 `Some`),
+宿主可直接把域命令定位回脚本坐标:
+
+```rust
+if let VmEvent::DomainCall { domain, name, args, script, pc, .. } = event {
+    // script/pc = 与同一条 Command 事件相同的脚本号/组号
+}
+```
+
+DIALOG 例外:事件只是**通知**,权威状态在 `Vm::pending_dialogs()`
+(见 §8)。
+
 ## 2. SOUND(手册 `sound/sound.html`)
 
 处理体(0.495 分发表 opcode 87):`0x44e1e8`。
@@ -150,8 +162,8 @@ yu-save **不得**把 `SET` 当字面量存盘。
    (当前 `yu-trace` 对新事件变体没有兜底分支)。台账:`DIV-RT-042`。
    **例外（已解决）**:`SOUNDINFO[LET=@W]` 由 VM 侧 `op_soundinfo` 持
    `LValue` → `SoundHost::query` → `write_target`,事件层不变。
-2. **没有 script/pc**:`DomainCall` 只有 frame/domain/name/args,宿主无法
-   把一次域调用定位回脚本。当前只能按 frame+name+参数名关联。
+2. ~~没有 script/pc~~ **已解决(P4)**:`DomainCall` 新增可选
+   `script`/`pc`;内核发出的域事件总是 `Some`。
 3. **没有求值顺序**:`eval_arg_windows` 按窗口顺序求值;引擎参数求值顺序
    未逐命令取证。对无副作用的表达式无影响;对含 `MATH[HASH/RND]` 的
    参数(当前 RND 挂账)未来需要复核。
@@ -218,3 +230,86 @@ EMOTEINFO:静态 3 处,本窗口 0 次
   **RGBA 纹理 + 图层变换**,不新增 `Op::Emote`。
 - 视觉语义(PSB 模型/网格/时间线)不在 VM 事件契约内;见
   `docs/emote-parity.md` 与 `docs/tasks/task-emote-runtime.md`。
+
+
+## 8. DIALOG(手册 `other/dialog.html`;REA `0x43fc74`)
+
+> 这是**唯一需要宿主回答**的域命令。官方是同步模态 MessageBox;内核改成
+> 「任务挂起 + 宿主回答」,以保持单线程、可确定、可测试。
+
+### 8.1 参数契约(槽号来自工程 `ysc.ybn`;按名字消费)
+
+| 槽 | 参数 | 类型 | 语义(证据) | 状态 |
+|---:|---|---|---|---|
+| 0 | `CAPTION` | 字符串 | 标题 | ✅ 手册 + REA `0x43fcf0` |
+| 1 | `STR` | 字符串 | 正文 | ✅ 手册 + REA |
+| 2..8 | `STR2..STR8` | 字符串 | 附加文本 | ⛔ 处理体未定位消费点 |
+| 9 | `DEFSTR` | 字符串 | 输入框初值 | ✅ REA `0x43fd2a` |
+| 10 | `LETSTR` | `$变量` | 输入文本写回 | ✅ REA `0x440001`(仅 INPUT) |
+| 11 | `LET` | `@变量` | 按钮序号写回 | ✅ REA `0x43fe7a` |
+| 12 | `OK` | 值 | 官方**从不读取**;缺省即 MB_OK | ✅ REA |
+| 13 | `OKCANCEL` | 存在性 | MB_OKCANCEL | ✅ REA `0x43fdd9` |
+| 14 | `YESNO` | 存在性 | MB_YESNO | ✅ REA `0x43fded` |
+| 15 | `YESNOCANCEL` | 存在性 | MB_YESNOCANCEL | ✅ REA `0x43fdfd` |
+| 16 | `INPUT` | 存在性 | 文本输入框(自绘模板 `0x8083c4`) | ✅ REA `0x43fd24` |
+| 17 | `INPUTLIMIT` | 整数 | >0 时 EM_SETLIMITTEXT | ✅ REA `0x43ff14` |
+| 18 | `DEFBUTTON` | 1..4 | MB_DEFBUTTON1..4;其它 = 0 | ✅ REA `0x43fd70` |
+| 19 | `ICON` | 1..4 | 1=Info、2=Question、3=Warning、4=Error | ✅ REA `0x43fd8d` |
+| 20..49 | `FILEOPEN`/`FILEEXT`/`FOLDER`/`CHECKBOX`/`SLIDER`/`A*`/`E*`/`CHECK*`/`NOWAIT` | — | 未取证 | ⛔ 命中即 `Unimplemented`,不弹窗、不写回 |
+
+**存在性而非值**:`OKCANCEL=0` 仍然算「存在」(REA 只测参数索引非零)——
+与手册「値(0/1)」字面不同,以引擎为准。
+
+### 8.2 按钮与写回
+
+| 组合 | 左起按钮 | LET |
+|---|---|---|
+| 缺省(`OK`) | OK | 1 |
+| `OKCANCEL` | OK / Cancel | 1 / 2 |
+| `YESNO` | Yes / No | 1 / 2 |
+| `YESNOCANCEL` | Yes / No / Cancel | 1 / 2 / 3 |
+
+- `DEFBUTTON` 只影响默认焦点,不改 LET 序号。
+- `INPUT=1` 时按钮固定 OK,`LET=1`;`LETSTR` 写输入文本(CP932 字节)。
+- 非 INPUT 模式忽略 `LETSTR`。
+
+### 8.3 VM 生命周期
+
+1. `DIALOG` 求值 → 发 `DomainCall{System,"DIALOG",args}`(不带 LET/LETSTR
+   的求值结果)→ 生成 `DialogRequest`(id 单调);
+2. 任务在调度器里挂起(`TaskExecutor::dialog_pending`),pc 已前进;
+3. 宿主轮询 `Vm::pending_dialogs()`,呈现后调用
+   `Vm::answer_dialog(id, button, text)`:
+   - `button` 越界 → `Err`,请求保留;
+   - INPUT 缺 `text` → `Err`;
+   - 成功 → 写 LET/LETSTR、从队列移除、任务下一逻辑帧继续;
+4. `TASKEND` 等任务语义在挂起期间不会被执行(同一任务不推进)。
+
+### 8.4 宿主呈现面(交接件)
+
+- 原生 UI 选型不在内核:可用 Win32 MessageBox/自绘、Web modal、终端提示;
+- **窗口关闭路由**:DIALOG 挂起期间,宿主应把 `CloseRequested` 解释为
+  「取消对话框」(最后一个按钮),不要再推 `@_WINDOW_EXEC_CLOSE`;
+  对话框回答后恢复正常关闭路由(AU4 兜底)。
+- 图标/按钮标签由宿主按 `DialogRequest.buttons/icon` 渲染。
+
+## 9. 剪贴板 / 托盘 / YMV(域边界)
+
+| 命令 | 内核行为 | 宿主行为 |
+|---|---|---|
+| `CLIPACT` | 保存 `SET` 字节镜像;发 `DomainCall` | 写入 OS 剪贴板(CF_TEXT) |
+| `CLIPINFO` | 读镜像,过滤 `<0x20`,写 `LET`;发 `DomainCall` | 可先 `Vm::set_clipboard()` 注入外部剪贴板 |
+| `TRAY` | 只发 `Domain::System` 事件 | 托盘图标/菜单 |
+| `YMV`/`YMVEND` | 只发 `Domain::Movie` 事件 | 媒体对象生命周期 |
+| `YMVINFO` | `Unimplemented` | 需宿主媒体元数据(帧数/尺寸/FPS) |
+| `REGINFO` | `Unimplemented` | 需宿主注册表读取 |
+
+剪贴板过滤规则来自 REA `0x43e4d2..0x43e54d`:逐字符按 CP932 前导字节
+表定长拷贝,并丢弃所有 `< 0x20` 的字节。
+
+## 10. ERROR 的逐命令启用表(仅记录,不改分派)
+
+`ERROR[COM_<命令名>=v]` 把 `v` 的低字节写进引擎 `[0x689b00 + opcode]`;
+初始化时 128 字节全 1(REA `0x462124`)。消费者未定位 ⇒ 内核只提供
+`Vm::command_enable()` 快照,**不据此跳过命令**。`NO`/`SET` 槽在官方
+处理体里不被读取。

@@ -41,13 +41,13 @@
 | `INT` | 1,428 | `variable/int.html`(64bit;缺省 0) | ✅ 1,428 次 | 声明是**可执行指令**(旁线 §3.6 opcode 45 的类型回调) | ✅ 实现 |
 | `FLT` | 173 | `variable/flt.html` | ✅ 173 次 | 同上 | ✅ 实现 |
 | `STR` | 431 | `variable/str.html` | ✅ 431 次 | 同上 | ✅ 实现 |
-| `S_INT` | 767 | `variable/s_int.html`(静态) | ✅ 767 次 | §3.10 槽位 `kind=3`;`ysv` 记录 kind 3 | ✅ 实现 |
-| `S_FLT` | 17 | `variable/s_flt.html` | ✅ 17 次 | 同上 | ✅ 实现 |
-| `S_STR` | 144 | `variable/s_str.html` | ✅ 144 次 | 同上 | ✅ 实现 |
+| `S_INT` | 767 | `variable/s_int.html`(静态) | ✅ 767 次 | REA 分发表 → `0x4634d8`(`xor eax,eax; ret`)= no-op | ✅ no-op(DIV-RT-043) |
+| `S_FLT` | 17 | `variable/s_flt.html` | ✅ 17 次 | 同上 | ✅ no-op(DIV-RT-043) |
+| `S_STR` | 144 | `variable/s_str.html` | ✅ 144 次 | 同上 | ✅ no-op(DIV-RT-043) |
 | `VARINFO` | 119 | `variable/varinfo.html` | ✅ 119 次(TYPE/DIMNUM/DIMSIZE/LENGTH) | §3.21(`0x456050`,判定链原序) | ✅ 部分(SEARCH 等 `Unimplemented`) |
 | `VARACT` | 310 | `variable/varact.html`(**无 INIT/G_* 页**) | ✅ 310 次 + `INIT+G_*`(s12) | §3.26(`0x456050` 族 + `0x455b60` 恢复体) | ✅ 实现(除 HANTOZEN/ZENTOHAN) |
 | `G_INT`/`G_FLT`/`G_STR` | 0(声明)/ 2(`VARACT[INIT]`) | `variable/g_int.html`(声明)/ ⛔(`VARACT` 变体无页) | ✅ 宏重定义 + `VARACT[INIT G_*]` | §3.26 `0x455b60` | ✅ `VARACT` 侧已实现(DIV-RT-024) |
-| `F_INT`/`F_FLT`/`F_STR` | 337/72/64 | ⛔ 手册 `variable/` 无页 | ✅ 高频 | 旁线 §3.17 归入声明类 | ⛔ `Unimplemented`(缺①) |
+| `F_INT`/`F_FLT`/`F_STR` | 337/72/64 | ⛔ 手册 `variable/` 无页 | ✅ 高频(全在 `global_f.yst` 声明段) | REA 默认槽 `0x459e90`:报 `スクリプト実行エラー`(yse 0xdbbd2)+ 返回 -1;600 帧运行 0 次 | ✅ 脚本错误槽(DIV-RT-043) |
 | `RETURNCODE` | 396 | ⛔ 手册无页(ysc/ycd 双表无参;`kind`=行计数) | ✅ 396 次;137 文件计数不变量 | REA `0x44c390`(自动 `C/R/P` + 恒 `E` + 让出) | ✅ 实现(2026-10-21 M-2 补行尾标志) |
 | `WORD` | 464 | ⛔ 手册无页(`basic.html` ●テキスト表示覆盖) | ✅ 464 次(载荷=CP932 原始字节) | REA `0x458d44`(每字符写 `'1'/'2'` 到 `_TEXT_FLAG`) | ✅ 实现(2026-10-21 M-2 补标志) |
 
@@ -55,11 +55,17 @@
 
 | 命令 | 频度 | ①手册 | ②语料 | ③引擎 | 状态 |
 |---|---|---|---|---|---|
-| `MATH` | 21 | `math/math.html`(SIN..RND 全表) | ✅ 21 次(SQRT/ABS/POW/ATAN/RND) | §3.20(`0x4466bc`;HASH=CRC32、RND=MT19937) | ✅ 部分(RND 挂账) |
+| `MATH` | 21 | `math/math.html`(SIN..RND 全表) | ✅ 21 次(SQRT/ABS/POW/ATAN/RND) | §3.20 + REA `0x448571`:RND = `min + rand32 % (max-min+1)`,MT19937 | ✅ 实现(RNG 种子注入;DIV-RT-014) |
 | `TEXT` | 2 | `text/text.html`(属性表) | ✅ 2 次 | REA `0x453448`(属性槽/次序/CLICK 让出) | ✅ 实现(2026-10-21 M-2;CLICK 自动模式让出) |
 | `TEXTINFO` | 0 | `text/textinfo.html` | ⛔ 语料 0 次 | REA `0x4538cc`(按参数出现查询) | ✅ 实现(2026-10-21 M-2;单测覆盖) |
 | `_` | 33 | `basic/basic.html` ●テキスト表示(`_[式]` 显示式值) | ✅ 33 次(YSCom 改行宏展开形态) | §3.14 + REA `0x4567c0`(每字符 `'1'/'2'`) | ✅ 实现(2026-10-21 M-2 补 `_TEXT_FLAG` 标志) |
 | `LABELINFO` | 2 | `other/labelinfo.html` | ✅ 2 次 | §3.5b(标签表查名字;strcmp 字节) | ✅ 实现(EXIST) |
+| `DIALOG` | 17 | `other/dialog.html` | ✅ 17 次(STR/CAPTION/YESNO/LET/DEFBUTTON/INPUT/DEFSTR/LETSTR/OKCANCEL/YESNOCANCEL) | REA `0x43fc74`:MessageBox/自绘输入框;LET=1 基按钮序号 | ✅ 实现(VM 状态机 + 宿主回答;DIV-RT-044) |
+| `TRAY` | 2 | `other/tray.html` | ✅ 2 次 | REA `0x453a4c`:托盘图标 API | ➖ 域事件(宿主;DIV-RT-045) |
+| `CLIPACT` | 1 | `clip/clipact.html` | ✅ 1 次 | REA `0x43e2d0`:TEXT+SET 都存在才写 CF_TEXT | ✅ 实现(镜像;DIV-RT-045) |
+| `CLIPINFO` | 0 | `clip/clipinfo.html` | ⛔ 0 次 | REA `0x43e410`:TEXT 存在才读,过滤 `<0x20`,写 LET | ✅ 实现(DIV-RT-045) |
+| `ERROR` | 1 | ⛔ 手册无页 | ✅ 1 次 | REA `0x46358c`:写 `[0x689b00+opcode]` 启用表;消费者未定位 | ✅ 实现(表;DIV-RT-046) |
+| `CSV`/`PLUG`/`ERRORINFO` | 0 | ⛔ 无页 | ⛔ 0 次 | REA:仅参数求值后返回 0 | ✅ no-op(DIV-RT-046) |
 | `TASKINFO` | 19 | `control/taskinfo.html`(含 SCRIPTPOS 页) | ✅ 19 次 | §3.2 任务记录 | ✅ 实现(SCRIPTPOS 2026-10-19 补;TEXTPOS 挂账) |
 | `SYSTEMINFO` | 5 | ⛔ **手册无页** | ✅ 5 次 | v494 `0x450478` 逐槽反汇编 | ⚠ 实现但手册缺页(DIV-RT-023) |
 | `FONT`/`FONTINFO` | 42/— | `font/font.html` | ✅ | — | ➖ 域(图形) |
@@ -127,6 +133,9 @@
   「✅ 部分」= 主路径实现,个别参数/分支按 DIV-RT-* 挂账;
   「⛔」= 三层缺一,运行到即 `Unimplemented` + 事件流留痕(执行继续);
   「➖」= 语义属宿主域,运行核只发事件。
-- 2026-10-21(M-1/M-2):上表频度是**静态语料**;运行期频度(600 固定时钟帧,
-  7,046,350 条命令)与逐命令状态见 `docs/coverage-matrix.md`。两者冲突时以
-  矩阵的实测为准,并回写本表。M-2 实现把 `LET` 的运行期未实现从 122 次降到 2 次。
+- 2026-10-21(M-1/M-2):上表频度是**静态语料**;运行期频度与逐命令状态见
+  `docs/coverage-matrix.md`。两者冲突时以矩阵的实测为准,并回写本表。
+  M-2 实现把 `LET` 的运行期未实现从 122 次降到 2 次。
+- 2026-10-23(P3):600 帧命令 7,735,679;`LET` 未实现 1(`_SAVE_PATH`);
+  `ERROR`/`_WINDOW_EXEC_CAPTION` 归零;默认槽/no-op 槽按 0.495 分发表定案
+  (DIV-RT-043..048)。

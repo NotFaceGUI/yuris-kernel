@@ -70,6 +70,8 @@ pub use textures::{GpuTexture, RenderTarget, TextureCache};
 
 pub use yu_backend_soft::{AssetIssue, RenderReport, SkippedOp, Surface, TextureStore};
 
+use std::sync::Arc;
+
 use yu_gfx::{BlendMode, CompositorFrame, Viewport};
 use yu_log::Diag;
 
@@ -111,9 +113,12 @@ pub struct GpuStats {
 }
 
 /// `render_frame` 的输出。
+///
+/// `surface` 用 `Arc` 共享:未缩放帧的读回结果同时是下一帧 `:/W0/`
+/// 后缓冲,引擎/宿主也要消费。共享后每帧省掉一次 1.9MB 整帧拷贝。
 #[derive(Clone, Debug)]
 pub struct WgpuRenderOutput {
-    pub surface: Surface,
+    pub surface: Arc<Surface>,
     /// 与 `yu-backend-soft::RenderReport` 同一结构/字段语义。
     pub report: RenderReport,
     pub stats: GpuStats,
@@ -154,9 +159,11 @@ pub struct WgpuRenderer {
     /// `CGACT[SIZE/SIZE2]` 结果缓存(与 soft 同一键/算法;EVID-J3-04)。
     image_cache: std::collections::BTreeMap<yu_backend_soft::ImageCacheKey, passes::Override>,
     /// 上一帧呈现内容(`COPY ID=:/W0/` 读后缓冲;EVID-J3-06)。
-    backbuffer: Option<Surface>,
+    backbuffer: Option<Arc<Surface>>,
     /// 后缓冲 GPU 纹理缓存:`(content_hash, gpu_id)`。
     backbuffer_gpu: Option<(u64, u64)>,
+    /// 文本栅格化/合成器(与 soft 同一实现;懒加载系统字体)。
+    text: yu_backend_soft::TextComposer,
 }
 
 impl WgpuRenderer {
@@ -185,7 +192,24 @@ impl WgpuRenderer {
             image_cache: std::collections::BTreeMap::new(),
             backbuffer: None,
             backbuffer_gpu: None,
+            text: yu_backend_soft::TextComposer::new(),
         })
+    }
+
+    /// 用调用方字体源构造文本合成器(测试/自带字体)。
+    pub fn with_text_source(mut self, source: yu_font::FontSource) -> Self {
+        self.text = yu_backend_soft::TextComposer::with_source(source);
+        self
+    }
+
+    /// 文本合成器(诊断/测试用)。
+    pub fn text_composer(&mut self) -> &mut yu_backend_soft::TextComposer {
+        &mut self.text
+    }
+
+    /// 预枚举系统字体(宿主启动时;见 `TextComposer::warm`)。
+    pub fn warm_text(&mut self) {
+        let _ = self.text.warm();
     }
 
     pub fn adapter(&self) -> &AdapterSummary {
@@ -273,8 +297,9 @@ impl WgpuRenderer {
             &mut self.targets,
             &mut self.uploaded_overrides,
             &mut self.image_cache,
-            self.backbuffer.as_ref(),
+            self.backbuffer.as_deref(),
             &mut self.backbuffer_gpu,
+            &mut self.text,
         )?;
 
         let vertex_bytes = bytemuck::cast_slice::<Vertex, u8>(&plan.vertices);
@@ -312,6 +337,8 @@ impl WgpuRenderer {
         // 屏幕是 opaque 窗口(与 soft 的最终屏幕归一、浏览器 canvas 的
         // alphaMode=opaque 一致);组 RT alpha 不进入呈现读回。
         force_opaque(&mut screen_surface);
+        // 后缓冲与返回值共享同一份像素(未缩放时):不再 clone 整帧。
+        let screen_surface = Arc::new(screen_surface);
 
         let readback_bytes;
         let surface = match scale {
@@ -336,11 +363,11 @@ impl WgpuRenderer {
                 )?;
                 force_opaque(&mut surface);
                 readback_bytes = screen_surface.rgba.len() as u64 + surface.rgba.len() as u64;
-                surface
+                Arc::new(surface)
             }
             None => {
                 readback_bytes = screen_surface.rgba.len() as u64;
-                screen_surface.clone()
+                Arc::clone(&screen_surface)
             }
         };
 
@@ -415,14 +442,8 @@ impl WgpuRenderer {
                             .map(|texture| &texture.texture)
                             .or_else(|| targets.texture_by_id(copy.source_id))
                             .ok_or_else(|| {
-                                Diag::fatal(
-                                    device::code::TARGET,
-                                    yu_log::Boundary::Platform,
-                                )
-                                .with_detail(format!(
-                                    "COPY 源纹理 {} 缺失",
-                                    copy.source_id
-                                ))
+                                Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                                    .with_detail(format!("COPY 源纹理 {} 缺失", copy.source_id))
                             })?;
                         let dest = targets.snapshot(copy.dest).ok_or_else(|| {
                             Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
@@ -458,23 +479,16 @@ impl WgpuRenderer {
                             Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
                                 .with_detail("快照填充目标缺失")
                         })?;
-                        let pipeline = pipelines
-                            .paint_pipeline(paint.alpha_only)
-                            .ok_or_else(|| {
-                                Diag::fatal(
-                                    device::code::TARGET,
-                                    yu_log::Boundary::Platform,
-                                )
-                                .with_detail("快照填充管线缺失")
+                        let pipeline =
+                            pipelines.paint_pipeline(paint.alpha_only).ok_or_else(|| {
+                                Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                                    .with_detail("快照填充管线缺失")
                             })?;
                         let bind = pipelines
                             .paint_bind_group(paint.alpha_only, paint.color)
                             .ok_or_else(|| {
-                                Diag::fatal(
-                                    device::code::TARGET,
-                                    yu_log::Boundary::Platform,
-                                )
-                                .with_detail("快照填充 bind group 缺失")
+                                Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                                    .with_detail("快照填充 bind group 缺失")
                             })?;
                         let attachments = [Some(wgpu::RenderPassColorAttachment {
                             view: &target.view,
@@ -553,15 +567,16 @@ impl WgpuRenderer {
                         }
                     };
                     let pipeline = pipeline.ok_or_else(|| {
-                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                            .with_detail(format!(
+                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform).with_detail(
+                            format!(
                                 "缺少 blend {} 的{}管线",
                                 draw.blend.name(),
                                 match pipe_kind {
                                     0 => "",
                                     _ => "过渡",
                                 }
-                            ))
+                            ),
+                        )
                     })?;
                     let key = (draw.blend, pipe_kind);
                     if current_pipeline != Some(key) {
@@ -577,14 +592,11 @@ impl WgpuRenderer {
                         passes::DrawKind::Quad => pipelines
                             .bind_group(draw.texture_id, draw.filter)
                             .ok_or_else(|| {
-                                Diag::fatal(
-                                    device::code::TARGET,
-                                    yu_log::Boundary::Platform,
-                                )
-                                .with_detail(format!(
-                                    "缺少纹理 {} / {:?} 的 bind group",
-                                    draw.texture_id, draw.filter
-                                ))
+                                Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                                    .with_detail(format!(
+                                        "缺少纹理 {} / {:?} 的 bind group",
+                                        draw.texture_id, draw.filter
+                                    ))
                             })?,
                     };
                     let bind_key = match &draw.kind {

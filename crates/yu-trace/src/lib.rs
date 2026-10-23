@@ -3,7 +3,7 @@
 //! # 定位
 //!
 //! 本 crate **旁挂**:可依赖 `yu-log` / `yu-vfs` / `yu-rt`,但任何 crate 都不得
-//! 依赖它(architecture §2)。它只做两件事:
+//! 依赖它(architecture §2)。核心是两条边界:
 //!
 //! 1. [`TracingSource`] 包装任意 [`yu_vfs::DataSource`],记录 `open/exists/list`
 //!    的调用事实与结果身份(边界①);
@@ -14,6 +14,10 @@
 //! 调用方(gfx/后端/官方采集器)传入规范化 display JSON 或摘要,本 crate 只做
 //! 协议层校验/内容寻址,不硬绑 `yu-gfx` 字段。④平台命令仍保留
 //! [`record::Sub::Platform`] / [`record::Kind::PlatformCall`] 占位并显式拒绝。
+//!
+//! 排障现场见 [`fault`]:ring buffer 保留最近 N tick 的命令摘要/Diag/输入/
+//! 帧描述,`EventRecorder::dump_on_fault` 原子写 JSONL + 伴生时间线,
+//! [`FaultDump::replay`] 离线重演到故障帧并逐 tick 精确比较。
 //!
 //! # 确定性
 //!
@@ -34,6 +38,7 @@
 pub mod diff;
 pub mod error;
 pub mod event;
+pub mod fault;
 pub mod hash;
 mod json;
 pub mod record;
@@ -42,15 +47,19 @@ pub mod source;
 
 pub use diff::{
     diff_aligned, diff_aligned_logs, diff_logs, diff_text, AlignedDiffOptions, AlignedDiffReport,
-    DiffFailure, DiffReport, HeaderCompare, Projection, RecordKey,
+    DiffFailure, DiffReport, FrameFieldPolicy, HeaderCompare, Projection, RecordKey,
 };
 pub use error::code;
 pub use error::sample_missing;
 pub use event::{
     domain_name, header_from_vm, header_from_vm_with_clock, input_summary, input_summary_range,
-    jump_kind, map_event, shared_log, trace_value, EventRecorder, SharedLog,
+    jump_kind, map_event, shared_log, trace_value, EventRecorder, SharedLog, TraceRecorder,
 };
-pub use hash::sha256_hex;
+pub use fault::{
+    DiagEntry, FaultDump, FaultDumpPaths, FaultInfo, FaultInput, FaultKind, FaultManifest,
+    FaultReplayReport, FrameTickEntry, InputEntry, RingConfig, TickSummary, FAULT_MANIFEST_SCHEMA,
+};
+pub use hash::{sha256_hex, Sha256};
 pub use record::{
     argv_summary, paths_summary, BootSummary, ClockMode, ClockSummary, FrameDescriptionInput,
     FrameDisplay, FrameLevel, FrameSummary, HeaderPayload, HostSummary, InputSummary, Kind,

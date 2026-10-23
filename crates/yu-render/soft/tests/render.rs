@@ -7,9 +7,7 @@ use image::codecs::png::PngEncoder;
 use image::{ExtendedColorType, ImageEncoder, Rgba, RgbaImage};
 use yu_backend_soft::{frame_has_drawable_output, png, SoftRenderer, TextureStore};
 use yu_format::yscm::{Arg as FmtArg, Command as FmtCommand, CommandTable};
-use yu_gfx::{
-    Clear, GfxConfig, GfxState, ImageFormat, ParamTable, Viewport,
-};
+use yu_gfx::{Clear, GfxConfig, GfxState, ImageFormat, ParamTable, Viewport};
 use yu_rt::event::{ArgValue, Domain, VmEvent};
 use yu_rt::tables::YscmTable;
 use yu_rt::value::Value;
@@ -23,7 +21,7 @@ fn command(name: &str, params: &[&str]) -> FmtCommand {
             .iter()
             .map(|param| FmtArg {
                 name: (*param).into(),
-                flag: if matches!(*param, "ID" | "ID2" | "FILE") {
+                flag: if matches!(*param, "ID" | "ID2" | "FILE" | "NAME" | "SETSTR") {
                     1
                 } else {
                     0
@@ -43,19 +41,42 @@ fn table() -> ParamTable {
                 &["ID", "FILE", "E", "A", "X", "Y", "Z", "SX", "SY", "MODE"],
             ),
             command("CGEND", &["ID"]),
-            command("CGACT", &[
-                "ID",
-                "ID2",
-                "COPY2",
-                "SET",
-                "X",
-                "Y",
-                "X2",
-                "Y2",
-                "RECTPAINT",
-                "RECTPAINT2",
-                "RECTPAINT3",
-            ]),
+            command(
+                "FONT",
+                &[
+                    "BNO",
+                    "NO",
+                    "NAME",
+                    "ANTIALIASING",
+                    "COLOR",
+                    "COLOR2",
+                    "GRADATION",
+                    "ROTATION",
+                    "DRAWMODE",
+                    "SX",
+                    "SY",
+                    "BOLD",
+                ],
+            ),
+            command(
+                "CGACT",
+                &[
+                    "ID",
+                    "ID2",
+                    "COPY2",
+                    "SET",
+                    "X",
+                    "Y",
+                    "X2",
+                    "Y2",
+                    "RECTPAINT",
+                    "RECTPAINT2",
+                    "RECTPAINT3",
+                    "TEXT",
+                    "SETSTR",
+                    "BNO",
+                ],
+            ),
         ],
         messages: Vec::new(),
         key_table: Box::new([0u8; 256]),
@@ -83,6 +104,8 @@ fn call(frame: u64, name: &str, args: Vec<ArgValue>) -> VmEvent {
         domain: Domain::Graphics,
         name: name.to_string(),
         args,
+        script: None,
+        pc: None,
     }
 }
 
@@ -107,11 +130,7 @@ fn texture_store(entries: &[(&[u8], Vec<u8>)]) -> TextureStore {
     for (path, bytes) in entries {
         source.insert(path, bytes.clone()).expect("insert");
     }
-    TextureStore::new(
-        Box::new(source),
-        Codec::Cp932,
-        vec![ImageFormat::Png],
-    )
+    TextureStore::new(Box::new(source), Codec::Cp932, vec![ImageFormat::Png])
 }
 
 #[test]
@@ -229,7 +248,7 @@ fn missing_asset_is_reported_and_layer_skipped() {
 }
 
 #[test]
-fn text_runs_are_counted_but_not_rasterized() {
+fn text_without_flags_is_counted_but_not_rasterized() {
     let table = table();
     let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
     gfx.consume_events(&[
@@ -257,6 +276,136 @@ fn text_runs_are_counted_but_not_rasterized() {
     assert_eq!(out.report.skipped_text, 1);
     // 文本不参与像素:唯一可见内容仍是 1×1 黑图。
     assert_eq!(out.surface.pixel(0, 0), Some([0, 0, 0, 255]));
+}
+
+#[test]
+fn synced_text_flags_rasterize_glyphs() {
+    let mut gfx = state(Viewport::new(32, 32), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        VmEvent::Text {
+            frame: 1,
+            id: String::new(),
+            bytes: b"A".to_vec(),
+        },
+    ]);
+    // 权威 `_TEXT_FLAG`(VM `[state+0x3c]`):'2' = 全角单元。
+    let mut snapshot = yu_rt::text::TextSnapshot {
+        // 全角「こ」(CP932 0x82B1)配 '2';对齐必须成功。
+        bytes: b"\x82\xB1".to_vec(),
+        flags: b"2".to_vec(),
+        output_mode: 1,
+        wait_ms: 0,
+        autoreturn: 1,
+        autopage: 1,
+        autoclick: 1,
+        click: false,
+        clear_pending: false,
+        cursor_x: 0,
+        cursor_y: 0,
+        click_buttons: [1, 13, 0x3ff, 0x3ff],
+        skip_buttons: [17, 0x3ff, 0x3ff, 0x3ff],
+    };
+    gfx.sync_text_state(&snapshot);
+    let frame = gfx.frame();
+    assert!(frame.text_layout.is_some(), "layout comes from _TEXT_FLAG");
+
+    let mut backend = SoftRenderer::new(texture_store(&[]));
+    if !backend.text_composer().available() {
+        println!("SKIP synced_text_flags_rasterize_glyphs: no system font");
+        return;
+    }
+    let out = backend.render_frame(&frame);
+    assert_eq!(out.report.skipped_text, 0, "synced run is not skipped");
+    assert_eq!(out.report.text_glyphs, 1);
+    let ink = out
+        .surface
+        .rgba
+        .chunks_exact(4)
+        .filter(|px| px[0] > 0 || px[1] > 0 || px[2] > 0)
+        .count();
+    assert!(ink > 0, "glyph must be visible (white on black)");
+
+    // 同一帧两次渲染逐字节一致(确定性)。
+    let again = backend.render_frame(&frame);
+    assert_eq!(
+        png::png_bytes(&out.surface).expect("encode"),
+        png::png_bytes(&again.surface).expect("encode")
+    );
+
+    // 清空同步(CLEAR)后文本消失。
+    snapshot.bytes.clear();
+    snapshot.flags.clear();
+    gfx.consume_events(&[VmEvent::FrameStart { frame: 2 }]);
+    gfx.sync_text_state(&snapshot);
+    let cleared = backend.render_frame(&gfx.frame());
+    assert_eq!(cleared.report.text_glyphs, 0);
+}
+
+#[test]
+fn cgact_text_draws_into_layer() {
+    let table = table();
+    let mut gfx = state(Viewport::new(32, 32), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"dark".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "FONT",
+            vec![
+                arg(&table, "FONT", "SX", Value::Int(16)),
+                arg(&table, "FONT", "SY", Value::Int(16)),
+                arg(&table, "FONT", "COLOR", Value::Int(0x00_FF00)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CGACT", "TEXT", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0)),
+                arg(&table, "CGACT", "SETSTR", Value::Str(b"A".to_vec())),
+                arg(&table, "CGACT", "X", Value::Int(0)),
+                arg(&table, "CGACT", "Y", Value::Int(0)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    assert_eq!(frame.text_draws.len(), 1);
+
+    let mut backend = SoftRenderer::new(texture_store(&[(
+        b"dark.png",
+        png_bytes_for_wh(32, 32, Rgba([0, 0, 0, 255])),
+    )]));
+    if !backend.text_composer().available() {
+        println!("SKIP cgact_text_draws_into_layer: no system font");
+        return;
+    }
+    let out = backend.render_frame(&frame);
+    assert_eq!(out.report.text_draws, 1);
+    assert_eq!(out.report.text_glyphs, 1);
+    assert!(
+        out.report.text_diags.is_empty(),
+        "{:?}",
+        out.report.text_diags
+    );
+    // 绿色字画进黑色图层:出现绿色通道占优的像素。
+    let green = out
+        .surface
+        .rgba
+        .chunks_exact(4)
+        .filter(|px| px[1] > 0 && px[1] >= px[0] && px[1] >= px[2])
+        .count();
+    assert!(green > 0, "text draw must reach the layer pixels");
 }
 
 #[test]
@@ -374,17 +523,14 @@ fn rectpaint_region_fills_only_requested_texture_area() {
         VmEvent::FrameEnd { frame: 1 },
     ]);
     let frame = gfx.frame();
-    let mut backend = SoftRenderer::new(texture_store(&[(
-        b"img.png",
-        {
-            let image = RgbaImage::from_pixel(4, 4, Rgba([10, 20, 30, 255]));
-            let mut out = Vec::new();
-            PngEncoder::new(&mut out)
-                .write_image(image.as_raw(), 4, 4, ExtendedColorType::Rgba8)
-                .expect("encode fixture");
-            out
-        },
-    )]));
+    let mut backend = SoftRenderer::new(texture_store(&[(b"img.png", {
+        let image = RgbaImage::from_pixel(4, 4, Rgba([10, 20, 30, 255]));
+        let mut out = Vec::new();
+        PngEncoder::new(&mut out)
+            .write_image(image.as_raw(), 4, 4, ExtendedColorType::Rgba8)
+            .expect("encode fixture");
+        out
+    })]));
     let out = backend.render_frame(&frame);
     assert_eq!(out.surface.pixel(0, 0), Some([10, 20, 30, 255]));
     assert_eq!(out.surface.pixel(1, 1), Some([0, 255, 0, 255]));

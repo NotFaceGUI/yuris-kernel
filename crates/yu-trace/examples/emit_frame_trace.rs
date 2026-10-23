@@ -1,4 +1,4 @@
-//! 把调用方(gfx/后端/官方采集器)提供的 frame JSON 或屏幕描述写成 schema v3 trace。
+//! 把调用方(gfx/后端/官方采集器)提供的 frame JSON 或屏幕描述写成 schema v4 trace。
 //!
 //! 用法:
 //! ```text

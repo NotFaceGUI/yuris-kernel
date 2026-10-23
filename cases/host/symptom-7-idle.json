@@ -1,0 +1,5 @@
+{
+  "frames": 3600,
+  "name": "symptom-7-idle",
+  "note": "P1 S7:长时间挂机(桌面宿主 60s 快速验证;10 分钟口径用 serve + target/tmp/p1/ws_probe.py)。"
+}

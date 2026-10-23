@@ -11,7 +11,8 @@
 > - **`RenderBackend` trait 不存在**:两个后端(`yu-backend-soft`、
 >   `yu-backend-wgpu`)消费同一个可序列化 `CompositorFrame`,各自实现一帧渲染;
 >   契约是**数据**(`CompositorFrame`),不是 trait。§5 已按此改写。
-> - `yu-snd` 已以 `yu-sound` 落地(N 任务);`yu-inp`/`yu-save` 尚未建 crate;
+> - `yu-snd` 已以 `yu-sound` 落地(N 任务);`yu-save` 已以 `yu-save` 落地(P4 任务,
+  存档容器在 `yu-format::yssd`);`yu-inp` 尚未建 crate(输入语义在 `yu-rt::input`);
 >   内核输入语义/时间线在 `yu-rt::input`,宿主侧平台翻译在 `yu-platform-input`。
 > - 目录分层:`crates/yu-render/{soft,wgpu}` 放渲染后端,`crates/yu-platform/{host-desktop,host-wasm,input}`
 >   放宿主与平台输入;其余 crate 在 `crates/` 下。**包名不变**,`cargo -p` 命令不用改。
@@ -111,10 +112,11 @@ flowchart TD
 |---|---|---|---|
 | `yu-log` | **错误+日志一体包**:Diag/错误码/LogSink/JSONL;所有 crate 的错误与日志唯一出口 | 无 | 成为旁挂(trace 从它消费,不是反向) |
 | `yu-vfs` | DataSource 三实现 + Mount 叠加 + 路径归一;ypf 懒索引偏移直读 | log | 读真实文件系统之外的一切语义 |
-| `yu-format` | ybn 家族容器与结构解码(YSCM/YSLB/YSVR/YSTD/YSTL、YSTB 脚本组/窗口)+ CP932/GBK 编解码器;bytes 进 structs 出 | log(纯) | 碰 IO;碰执行语义;**不碰 ypf(包布局归 yu-vfs)** |
+| `yu-format` | ybn 家族容器与结构解码(YSCM/YSLB/YSVR/YSTD/YSTL、YSTB 脚本组/窗口)+ YSSD 存档容器(解码 + 官方逐字节写路径)+ CP932/GBK 编解码器;bytes 进 structs 出 | log, flate2(C zlib 后端 + libz-sys=1.1.22 钉版;yssd 写路径逐字节) | 碰 IO;碰执行语义;**不碰 ypf(包布局归 yu-vfs)** |
 | `yu-rt` | 命令组 VM:任务调度(让出=WAIT/显示文本)、按名分派、表达式求值(i64/f64/串)、16 槽 P/R 寄存器、变量域、输入时间线 | vfs, format, log | 渲染、音频、平台调用;**任何游戏/版本常量(A5)** |
 | `yu-gfx` | 图层树/Z/混合的**语义状态机**;产出可序列化 **`CompositorFrame`**(图层清单 + passes + 诊断);`GfxHost` 回答 INFO 同步查询 | rt, log | 绕过 rt 直接读数据;含平台代码 |
 | `yu-sound` | 声音域宿主:层表/循环/淡变/PAN/PITCH 状态机、OGG/WAVE 解码、headless 确定性混音;`SoundHost` 回答 SOUNDINFO | rt, log(以及 hound/lewton) | 碰文件系统/ypf;平台设备输出进 golden |
+| `yu-save` | 存档/文件域宿主:槽位表(盘上事实)+ `SAVE/LOAD/SAVEEND/FILEACT` 事件事实消费;`sv.*` 码表 | rt, format, log | 写半忠实存档(DIV-RT-042 门禁);执行外部程序;越过 save 根的路径 |
 | `yu-font` | 字体发现/加载、字形栅格化、文本样式;不含换行/对齐 | log | 平台窗口 |
 | `yu-render/soft` · `yu-backend-soft` | `CompositorFrame` 的**确定性参考后端**:纹理解析 + RGBA8 合成 + 快照 + 图像加工 + PNG | gfx, log, vfs | 含游戏语义;读 rt 内部 |
 | `yu-render/wgpu` · `yu-backend-wgpu` | 同一 `CompositorFrame` 的 **wgpu 主后端**:离屏 RGBA8 + 读回;纹理/管线/bind group/快照缓存;独立 WGSL 文件 | gfx, soft(复用像素算法与报告类型), log | 含游戏语义 |

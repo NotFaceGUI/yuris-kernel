@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""官方引擎屏幕级 trace 采集器(schema v3, producer=official, level=screen)。
+"""官方引擎屏幕级 trace 采集器(schema v4, producer=official, level=screen)。
 
 设计约束(任务书 H):
 - 只读观测:启动官方 exe、截取窗口客户区、记录输入时间线;**不改二进制/游戏文件**。
@@ -15,7 +15,7 @@
 
 输出:
   <out>/frame_0001.png ...       客户区截图(不入库)
-  <out>/official_screen.jsonl    schema v3 trace(可直接给 diff_traces)
+  <out>/official_screen.jsonl    schema v4 trace(可直接给 diff_traces)
   <out>/input_timeline.json      帧号 -> 输入
   <out>/manifest.json            引擎/样本 hash、窗口尺寸、级别声明
 
@@ -266,6 +266,8 @@ def main():
                 "media_readonly": False,
                 "os_sound": True,
                 "dx_mode": 0,
+                "window_init_pos": 0,
+                "rng_seed": 5489,
                 "paths": {"len": 0, "sha256": empty_paths_digest()},
             },
         },
@@ -278,7 +280,7 @@ def main():
         out.write(
             json.dumps(
                 {
-                    "schema": 3,
+                    "schema": 4,
                     "seq": 0,
                     "frame": None,
                     "sub": "meta",
@@ -304,7 +306,7 @@ def main():
             out.write(
                 json.dumps(
                     {
-                        "schema": 3,
+                        "schema": 4,
                         "seq": seq,
                         "frame": item["frame"],
                         "sub": "frame",

@@ -270,27 +270,71 @@ impl VmTrace {
     ///
     /// vfs 读取的帧标注见模块文档的已知限制。
     pub fn tick_at(&mut self, now_ms: u32, timeline: &InputTimeline) -> ChainReport {
-        self.tick_with(Some(now_ms), |vm| vm.tick_at(now_ms, timeline))
+        self.tick_with(Some(now_ms), timeline, |vm| vm.tick_at(now_ms, timeline))
     }
 
     /// 推进一帧(时钟由 `yu-rt` 的 fps/frame_ms 推进)。
     pub fn tick(&mut self, timeline: &InputTimeline) -> ChainReport {
-        self.tick_with(None, |vm| vm.tick(timeline))
+        self.tick_with(None, timeline, |vm| vm.tick(timeline))
     }
 
     fn tick_with(
         &mut self,
         now_ms: Option<u32>,
+        timeline: &InputTimeline,
         run: impl FnOnce(&mut Vm) -> ChainReport,
     ) -> ChainReport {
         let first = self.vm.scheduler().frame().saturating_add(1);
+        self.recorder.begin_tick(first, now_ms);
         *self.frame.lock().unwrap() = Some(first);
         let report = run(&mut self.vm);
         *self.frame.lock().unwrap() = None;
         self.next_frame = first.saturating_add(report.logical_frames as u64);
         self.clock.push(now_ms);
+        // 故障快照只记录**显式设定**的输入帧(稀疏);重建时 `effective` 的
+        // 继承语义与录制时一致。帧 0 的设定会影响 `effective(1)`,必须保留。
+        let last = self.vm.scheduler().frame();
+        if last >= first {
+            if first == 1 {
+                if let Some(input) = timeline.at(0) {
+                    self.recorder.record_timeline_entry(0, input);
+                }
+            }
+            for frame in first..=last {
+                if let Some(input) = timeline.at(frame) {
+                    self.recorder.record_timeline_entry(frame, input);
+                    self.recorder.record_tick_input(frame, input);
+                }
+            }
+            self.recorder.note_tick_frames(last);
+        }
         self.drain_events();
         report
+    }
+
+    /// 启用故障快照 ring buffer(必须在第一 tick 前调用)。
+    ///
+    /// `header` 为 `None` 时用当前 VM/启动配置构造一个基础头部;dump 时
+    /// `input`/`clock` 会按故障帧重算。样本 hash 请用
+    /// [`EventRecorder::set_fault_header`] 覆盖。
+    pub fn enable_fault_ring(
+        &mut self,
+        config: crate::fault::RingConfig,
+        header: Option<HeaderPayload>,
+    ) -> Result<(), Diag> {
+        let header = header.unwrap_or_else(|| {
+            header_from_vm_with_clock(
+                &self.vm,
+                &self.cfg,
+                self.codec,
+                InputSummary {
+                    events: 0,
+                    sha256: crate::hash::sha256_hex(&[]),
+                },
+                ClockSummary::none(),
+            )
+        });
+        self.recorder.enable_ring(config, Some(header))
     }
 
     fn drain_events(&mut self) {

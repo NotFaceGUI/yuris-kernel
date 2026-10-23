@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -27,6 +27,11 @@ use crate::{CliResult, Failure};
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
 
+/// `/diag` 快照节拍(H-P1-03:有订阅者时 500ms 推送一次)。
+const DIAG_PUSH_MS: u64 = 500;
+/// 无客户端/暂停时的空转睡眠(工程节拍,不影响游戏时钟)。
+const IDLE_SLEEP_MS: u64 = 15;
+
 /// `yu-cli serve` / `yu-engine serve` 参数。
 #[derive(Clone, Debug)]
 pub struct ServeOptions {
@@ -43,6 +48,8 @@ pub struct ServeOptions {
     pub supervised: bool,
     /// 到达该逻辑帧后暂停(验收/截图用;重启后重新计)。
     pub pause_at: Option<u64>,
+    /// 开 `/diag` WebSocket 诊断通道(P1 交接件 H-P1-03;www 消费)。
+    pub diag_ws: bool,
 }
 
 impl ServeOptions {
@@ -80,6 +87,7 @@ impl ServeOptions {
             .map(PathBuf::from)
             .unwrap_or_else(default_www);
         let supervised = args.switch("supervised");
+        let diag_ws = args.switch("diag-ws");
         let pause_at =
             match args.flag("pause-at") {
                 Some(value) => Some(value.parse::<u64>().map_err(|_| {
@@ -100,6 +108,7 @@ impl ServeOptions {
             www,
             supervised,
             pause_at,
+            diag_ws,
         })
     }
 }
@@ -121,9 +130,15 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         entry: opts.entry.clone(),
         record_events: opts.record_events,
         fps: opts.fps,
+        // 长跑宿主:首帧前预热字体表,避免第一次文本场景的 ~130ms 停顿。
+        warm_text: true,
         ..EngineOptions::default()
     };
-    let engine = Engine::new(project, engine_opts)?;
+    let mut engine = Engine::new(project, engine_opts)?;
+    // H-P1-05:实时路径只补 2 帧。默认 500ms 会在一次长帧(首场景装载、
+    // 交互触发的重脚本)后一次性执行整段补帧,表现为“点一下就卡住”。
+    // 桌面宿主同口径(set_max_step_ms(2 × frame_ms))。
+    engine.set_max_step_ms((1000 / opts.fps.max(1)).max(1).saturating_mul(2));
     let viewport = engine.viewport();
     let boot_ms = engine.boot_ms();
 
@@ -165,6 +180,9 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         sse: Mutex::new(Vec::new()),
         last_frame: Mutex::new(None),
         control: control_tx,
+        diag_ws: opts.diag_ws,
+        diag_json: Mutex::new("{\"ok\":false}".to_string()),
+        diag_clients: AtomicUsize::new(0),
     });
 
     {
@@ -272,6 +290,11 @@ struct Shared {
     /// 最近一帧已编码的二进制(新连接/重连立刻补发,暂停时也不空白)。
     last_frame: Mutex<Option<Arc<Vec<u8>>>>,
     control: Sender<Control>,
+    /// `/diag` 诊断通道开关与最近一次诊断快照(H-P1-03;engine_loop 刷新)。
+    diag_ws: bool,
+    diag_json: Mutex<String>,
+    /// 当前 `/diag` 订阅者数。无人订阅时引擎只排空诊断,不构造 JSON。
+    diag_clients: AtomicUsize,
 }
 
 enum Control {
@@ -327,6 +350,9 @@ fn engine_loop(
     let budget = Duration::from_micros(1_000_000 / u64::from(fps.max(1)));
     let mut next = Instant::now();
     let mut paused = false;
+    let mut last_diag_snapshot = Instant::now()
+        .checked_sub(Duration::from_millis(DIAG_PUSH_MS))
+        .unwrap_or_else(Instant::now);
     // 步进/重放剩余帧数:Some(n) 时临时解除暂停,推进 n 帧后回到暂停。
     let mut step_left: Option<u64> = None;
     loop {
@@ -381,7 +407,7 @@ fn engine_loop(
         if paused || !has_clients {
             // 暂停/无人观看：丢弃这段时间，恢复时不快进逻辑/声音时钟。
             engine.reset_realtime_clock();
-            thread::sleep(Duration::from_millis(15));
+            thread::sleep(Duration::from_millis(IDLE_SLEEP_MS));
             next = Instant::now();
             continue;
         }
@@ -413,6 +439,20 @@ fn engine_loop(
         ));
         broadcast_frame(&shared, payload);
         update_status(&shared, &engine, paused);
+        // H-P1-03:/diag 快照。只有**确实有订阅者**且距上次刷新 ≥500ms
+        // 时才构造 DiagReport/JSON;无人订阅时只低成本排空内核缓冲
+        // (否则每帧 format! 一遍全量诊断纯属浪费)。
+        if shared.diag_clients.load(Ordering::Relaxed) > 0 {
+            if last_diag_snapshot.elapsed() >= Duration::from_millis(DIAG_PUSH_MS) {
+                let report = engine.take_diag_report();
+                if let Ok(mut slot) = shared.diag_json.lock() {
+                    *slot = diag_report_json(&report);
+                }
+                last_diag_snapshot = Instant::now();
+            }
+        } else {
+            engine.drain_diags();
+        }
 
         next += budget;
         let now = Instant::now();
@@ -423,6 +463,128 @@ fn engine_loop(
             next = now;
         }
     }
+}
+
+/// H-P1-03:`/diag` WebSocket —— 每 500ms 推一次 [`diag_report_json`]
+/// 快照,直到客户端断开。www/egui 面板只读,不接受控制消息。
+fn handle_diag_ws(
+    stream: TcpStream,
+    headers: &BTreeMap<String, String>,
+    shared: Arc<Shared>,
+) -> Result<(), String> {
+    let (mut reader, mut writer) = ws::accept(stream, headers)?;
+    shared.diag_clients.fetch_add(1, Ordering::Relaxed);
+    // 连接存活期间保证计数回落(早退/写失败/读端关闭都走 Drop)。
+    struct Subscription(Arc<Shared>);
+    impl Drop for Subscription {
+        fn drop(&mut self) {
+            self.0.diag_clients.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let _subscription = Subscription(shared.clone());
+    // 关闭检测线程:读到 Close/错误即丢弃连接(写端 send 失败自然退出)。
+    let closed = {
+        let (tx, rx) = mpsc::sync_channel::<()>(1);
+        thread::spawn(move || {
+            loop {
+                match reader.read_message() {
+                    Ok(WsMessage::Ping(payload)) => {
+                        // 无独立 writer 共享;ping 由读端忽略(诊断通道为
+                        // 单向推送,浏览器默认心跳不依赖 pong)。
+                        let _ = payload;
+                    }
+                    Ok(WsMessage::Close) | Err(_) => break,
+                    _ => {}
+                }
+            }
+            let _ = tx.send(());
+        });
+        rx
+    };
+    writer.write_text("{\"ok\":true,\"channel\":\"diag\"}")?;
+    loop {
+        let snapshot = shared
+            .diag_json
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_else(|_| "{\"ok\":false}".to_string());
+        if writer.write_text(&snapshot).is_err() {
+            break;
+        }
+        // 500ms 节拍;客户端断开(close 线程)或服务退出即收摊。
+        if closed
+            .recv_timeout(Duration::from_millis(DIAG_PUSH_MS))
+            .is_ok()
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// [`crate::engine::DiagReport`] 的 JSON(www/egui 面板消费;字段稳定)。
+fn diag_report_json(report: &crate::engine::DiagReport) -> String {
+    let mut out = String::with_capacity(512);
+    out.push_str("{\"ok\":true,\"frame\":");
+    out.push_str(&report.frame.to_string());
+    out.push_str(",\"waiting_tasks\":[");
+    for (index, task) in report.waiting_tasks.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"id\":\"{}\",\"main\":{},\"script\":{},\"pc\":{},\"wait_frames\":{},\
+             \"deadline_ms\":{},\"text_rest\":{},\"enabled\":{}}}",
+            json_escape(&task.id),
+            task.main,
+            task.script,
+            task.pc,
+            task.wait_frames,
+            match task.deadline_ms {
+                Some(ms) => ms.to_string(),
+                None => "null".to_string(),
+            },
+            task.text_rest,
+            task.enabled
+        ));
+    }
+    out.push_str("],\"unimplemented_cmds\":[");
+    for (index, (name, hits)) in report.unimplemented_cmds.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"name\":\"{}\",\"hits\":{}}}",
+            json_escape(name),
+            hits
+        ));
+    }
+    out.push_str(&format!(
+        "],\"script_errors\":{},\"sound_layers\":{},\"save_slots\":{},\
+         \"save_reservations\":{},\"save_calls\":{},\"load_calls\":{},\
+         \"saveend_calls\":{},\"fileact_calls\":{},\"diags\":[",
+        report.script_errors.len(),
+        report.sound_layers,
+        report.save_slots,
+        report.save_reservations,
+        report.save_calls,
+        report.load_calls,
+        report.saveend_calls,
+        report.fileact_calls
+    ));
+    for (index, diag) in report.diags.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"code\":\"{}\",\"severity\":\"{}\",\"detail\":\"{}\"}}",
+            json_escape(diag.code.as_ref()),
+            json_escape(diag.severity.as_str()),
+            json_escape(&diag.detail)
+        ));
+    }
+    out.push_str("]}");
+    out
 }
 
 fn update_status(shared: &Shared, engine: &Engine, paused: bool) {
@@ -584,6 +746,18 @@ fn handle_connection(mut stream: TcpStream, shared: Arc<Shared>, www: &Path) -> 
         .to_string();
     match (request.method.as_str(), path.as_str()) {
         ("GET", "/ws") => handle_ws(stream, &request.headers, shared),
+        ("GET", "/diag") => {
+            if shared.diag_ws {
+                handle_diag_ws(stream, &request.headers, shared)
+            } else {
+                respond(
+                    stream,
+                    "404 Not Found",
+                    "text/plain; charset=utf-8",
+                    b"diag channel disabled (start with --diag-ws)",
+                )
+            }
+        }
         ("GET", "/events") => handle_sse(stream, shared),
         ("GET", "/api/status") => {
             let body = status_json(&shared);

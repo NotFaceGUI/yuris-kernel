@@ -237,6 +237,10 @@ fn main() {
                 println!("    {line}");
             }
         }
-        println!("  diags: unimplemented={} total_events={}", vm.unimplemented_cmds().len(), evs.len());
+        println!(
+            "  diags: unimplemented={} total_events={}",
+            vm.unimplemented_cmds().len(),
+            evs.len()
+        );
     }
 }

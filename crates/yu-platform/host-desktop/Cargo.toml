@@ -18,11 +18,13 @@ bytemuck = { version = "1.25", features = ["derive"] }
 egui = { version = "0.37", features = ["default_fonts"] }
 egui-wgpu = "0.37"
 egui-winit = "0.37"
+log = "0.4"
 pollster = "0.4"
 wgpu = "30.0.1"
 winit = "0.30"
 yu-backend-soft = { path = "../../yu-render/soft" }
 yu-backend-wgpu = { path = "../../yu-render/wgpu" }
 yu-cli = { path = "../../yu-cli" }
+yu-log = { path = "../../yu-log" }
 yu-platform-input = { path = "../input" }
 yu-rt = { path = "../../yu-rt" }

@@ -148,8 +148,10 @@ fn is_mouse_button(rest: &str) -> bool {
     // 按钮族 = 单个字母 + 可选数字(1..3)/`NUM_` 前缀。
     let base = rest.trim_start_matches("NUM_");
     let mut chars = base.chars();
-    matches!(chars.next(), Some('L') | Some('R') | Some('M') | Some('U') | Some('D'))
-        && chars.all(|c| c.is_ascii_digit())
+    matches!(
+        chars.next(),
+        Some('L') | Some('R') | Some('M') | Some('U') | Some('D')
+    ) && chars.all(|c| c.is_ascii_digit())
 }
 
 /// 引擎按钮码表(键盘/鼠标段)——**数据文件** `data/button-code-abi.tsv`,
@@ -175,9 +177,8 @@ fn is_mouse_button(rest: &str) -> bool {
 ///    [`pad_dir_code`] / [`pad_button_code`],不进数据表。
 ///
 /// 运行期可被脚本改写(手册 ○;键位重映射),见 [`InputState::set_code`]。
-static BUTTON_CODE_ABI: std::sync::LazyLock<Vec<(String, u16)>> = std::sync::LazyLock::new(|| {
-    parse_button_code_abi(include_str!("../data/button-code-abi.tsv"))
-});
+static BUTTON_CODE_ABI: std::sync::LazyLock<Vec<(String, u16)>> =
+    std::sync::LazyLock::new(|| parse_button_code_abi(include_str!("../data/button-code-abi.tsv")));
 
 fn parse_button_code_abi(tsv: &str) -> Vec<(String, u16)> {
     tsv.lines()
@@ -227,13 +228,16 @@ pub fn pad_button_code(pad: i64, button: i64) -> i64 {
 /// 同码多名如 `;`/`:` 取表序第一个)。
 pub fn button_of_code(code: i64) -> Option<String> {
     let code = u16::try_from(code).ok()?;
-    BUTTON_CODE_ABI.iter().find(|(_, c)| *c == code).map(|(n, _)| {
-        if n.starts_with("MOUSE") {
-            n.clone()
-        } else {
-            format!("KEY_{n}")
-        }
-    })
+    BUTTON_CODE_ABI
+        .iter()
+        .find(|(_, c)| *c == code)
+        .map(|(n, _)| {
+            if n.starts_with("MOUSE") {
+                n.clone()
+            } else {
+                format!("KEY_{n}")
+            }
+        })
 }
 /// 一帧的输入状态(**按下集合**,不是计数器)。
 ///
@@ -578,9 +582,7 @@ impl InputState {
         }
         // 先算键盘“任意键”本帧状态(只看已存在的键盘计数器)。
         let any_down = self.counters.iter().any(|(code, _)| {
-            source_of_code(*code) == InputSource::Keyboard
-                && *code != 0
-                && down.contains(code)
+            source_of_code(*code) == InputSource::Keyboard && *code != 0 && down.contains(code)
         });
 
         let keyboard = self.settings.keyboard;
@@ -676,7 +678,11 @@ impl InputState {
     /// - 点击按钮出现按下沿(`==1`)→ 推进;
     /// - 跳过按钮按住(`>0`)→ 推进;
     /// - 未分配(`0x3ff`)忽略。
-    pub fn text_advance_requested(&self, click_buttons: &[i64; 4], skip_buttons: &[i64; 4]) -> bool {
+    pub fn text_advance_requested(
+        &self,
+        click_buttons: &[i64; 4],
+        skip_buttons: &[i64; 4],
+    ) -> bool {
         let click = click_buttons
             .iter()
             .any(|code| *code > 0 && *code != 0x3ff && self.counter_code(*code) == 1);
@@ -854,9 +860,15 @@ mod tests {
         st.advance(0, &tl);
         let click = [13, 0x3ff, 0x3ff, 0x3ff];
         let skip = [0x3ff; 4];
-        assert!(st.text_advance_requested(&click, &skip), "ENTER 默认是点击按钮");
+        assert!(
+            st.text_advance_requested(&click, &skip),
+            "ENTER 默认是点击按钮"
+        );
         let click = [1, 0x3ff, 0x3ff, 0x3ff];
-        assert!(!st.text_advance_requested(&click, &skip), "改成鼠标后 ENTER 不再推进");
+        assert!(
+            !st.text_advance_requested(&click, &skip),
+            "改成鼠标后 ENTER 不再推进"
+        );
     }
 
     #[test]
@@ -893,7 +905,10 @@ mod tests {
     #[test]
     fn wheel_pulse_is_one_frame() {
         let mut tl = InputTimeline::new();
-        tl.set(0, InputFrame::new(std::iter::empty::<&str>()).with_pulse("MOUSE_U"));
+        tl.set(
+            0,
+            InputFrame::new(std::iter::empty::<&str>()).with_pulse("MOUSE_U"),
+        );
         tl.set(1, InputFrame::new(std::iter::empty::<&str>()));
         let mut st = InputState::new();
         st.advance(0, &tl);
@@ -932,7 +947,19 @@ mod tests {
     #[test]
     fn mouse_settings_are_script_visible() {
         let mut st = InputState::new();
-        st.apply_mouse(Some(1), Some(1500), Some(false), Some(false), Some(false), Some(11), Some(50), Some(20), None, None, Some(b"ES.MCURSOR"));
+        st.apply_mouse(
+            Some(1),
+            Some(1500),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(11),
+            Some(50),
+            Some(20),
+            None,
+            None,
+            Some(b"ES.MCURSOR"),
+        );
         let s = st.settings();
         assert_eq!(s.mouse_mode, 1);
         assert_eq!(s.mouse_time_ms, 1500);

@@ -1,0 +1,151 @@
+{
+  "actions": [
+    {
+      "action": "resize",
+      "frame": 360,
+      "height": 768,
+      "width": 1024
+    },
+    {
+      "action": "resize",
+      "frame": 380,
+      "height": 480,
+      "width": 640
+    },
+    {
+      "action": "minimize",
+      "frame": 400
+    },
+    {
+      "action": "restore",
+      "frame": 430
+    },
+    {
+      "action": "focus_lost",
+      "frame": 450
+    },
+    {
+      "action": "resize",
+      "frame": 470,
+      "height": 600,
+      "width": 800
+    }
+  ],
+  "frames": 720,
+  "inputs": [
+    {
+      "button": "MOUSE_L",
+      "frame": 300,
+      "x": 217,
+      "y": 368
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 302,
+      "x": 217,
+      "y": 368
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 304,
+      "x": 217,
+      "y": 368
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 306,
+      "x": 217,
+      "y": 368
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 308,
+      "x": 217,
+      "y": 368
+    }
+  ],
+  "name": "symptom-6-stress",
+  "note": "P1 S6:resize/最小化/还原/失焦/快速连点/滚轮狂转。判定:进程不死、恢复后继续出帧。",
+  "pulses": [
+    {
+      "button": "MOUSE_U",
+      "frame": 320
+    },
+    {
+      "button": "MOUSE_D",
+      "frame": 321
+    },
+    {
+      "button": "MOUSE_U",
+      "frame": 322
+    },
+    {
+      "button": "MOUSE_D",
+      "frame": 323
+    },
+    {
+      "button": "MOUSE_U",
+      "frame": 324
+    },
+    {
+      "button": "MOUSE_D",
+      "frame": 325
+    },
+    {
+      "button": "MOUSE_U",
+      "frame": 326
+    },
+    {
+      "button": "MOUSE_D",
+      "frame": 327
+    },
+    {
+      "button": "MOUSE_U",
+      "frame": 328
+    },
+    {
+      "button": "MOUSE_D",
+      "frame": 329
+    },
+    {
+      "button": "MOUSE_U",
+      "frame": 330
+    },
+    {
+      "button": "MOUSE_D",
+      "frame": 331
+    },
+    {
+      "button": "MOUSE_U",
+      "frame": 332
+    },
+    {
+      "button": "MOUSE_D",
+      "frame": 333
+    },
+    {
+      "button": "MOUSE_U",
+      "frame": 334
+    },
+    {
+      "button": "MOUSE_D",
+      "frame": 335
+    },
+    {
+      "button": "MOUSE_U",
+      "frame": 336
+    },
+    {
+      "button": "MOUSE_D",
+      "frame": 337
+    },
+    {
+      "button": "MOUSE_U",
+      "frame": 338
+    },
+    {
+      "button": "MOUSE_D",
+      "frame": 339
+    }
+  ]
+}

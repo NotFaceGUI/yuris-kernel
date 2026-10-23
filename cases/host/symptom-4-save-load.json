@@ -1,0 +1,25 @@
+{
+  "frames": 620,
+  "inputs": [
+    {
+      "button": "MOUSE_L",
+      "frame": 300,
+      "x": 217,
+      "y": 281
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 440,
+      "x": 45,
+      "y": 583
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 500,
+      "x": 92,
+      "y": 583
+    }
+  ],
+  "name": "symptom-4-save-load",
+  "note": "P1 S4:进本篇后点 セーブ/ロード。预期:P4(yu-save)与 DIALOG 呈现前无响应。"
+}

@@ -458,6 +458,24 @@ impl FontSource {
         })
     }
 
+    /// Baseline distance from the cell top at size `sy` (pixels, y-down).
+    ///
+    /// GDI `TextOutA` draws into a bitmap whose top row is the font cell top;
+    /// the baseline sits at the font ascent (`lfHeight` = cell height). We use
+    /// the face's horizontal-header ascent scaled to `sy`, which is the same
+    /// quantity GDI uses for outline fonts. This is `Likely` (not byte-exact
+    /// with GDI's integer rounding); see `docs/font-contract.md` §8.
+    pub fn ascent_px(&self, face: FaceId, sy: u16) -> Result<f32, Diag> {
+        if sy == 0 {
+            return Ok(0.0);
+        }
+        self.with_face_data(face, |bytes, index| {
+            swash::FontRef::from_index(bytes, index as usize)
+                .map(|f| f.metrics(&[]).scale(f32::from(sy)).ascent)
+                .unwrap_or(0.0)
+        })
+    }
+
     /// Legacy TrueType `kern` table, format 0, horizontal pairs.
     /// Returns the kerning value in font units.
     pub fn kerning_units(&self, face: FaceId, left: u16, right: u16) -> Result<i16, Diag> {

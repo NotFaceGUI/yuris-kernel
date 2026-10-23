@@ -1,0 +1,13 @@
+{
+  "frames": 470,
+  "inputs": [
+    {
+      "button": "MOUSE_L",
+      "frame": 300,
+      "x": 217,
+      "y": 281
+    }
+  ],
+  "name": "symptom-2-enter-story",
+  "note": "P1 S2:标题 スタート(217,281)进入本篇。预期黑屏 + 引擎在 es_select.yst:153 Fatal 后冻结。"
+}

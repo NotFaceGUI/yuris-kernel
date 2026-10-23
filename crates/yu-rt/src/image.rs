@@ -51,8 +51,7 @@ fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
             return None;
         }
         let seg_len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
-        let is_sof = (0xC0..=0xCF).contains(&marker)
-            && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+        let is_sof = (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
         if is_sof {
             if i + 9 > bytes.len() {
                 return None;

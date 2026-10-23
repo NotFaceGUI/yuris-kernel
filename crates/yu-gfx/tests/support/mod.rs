@@ -297,6 +297,8 @@ pub fn call(frame: u64, name: &str, args: Vec<ArgValue>) -> VmEvent {
         domain: Domain::Graphics,
         name: name.to_string(),
         args,
+        script: None,
+        pc: None,
     }
 }
 
@@ -306,6 +308,8 @@ pub fn window_call(frame: u64, name: &str, args: Vec<ArgValue>) -> VmEvent {
         domain: Domain::Window,
         name: name.to_string(),
         args,
+        script: None,
+        pc: None,
     }
 }
 

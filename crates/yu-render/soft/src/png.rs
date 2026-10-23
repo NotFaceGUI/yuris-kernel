@@ -15,11 +15,8 @@ use crate::render::Surface;
 /// 编码为 PNG 字节。
 pub fn png_bytes(surface: &Surface) -> Result<Vec<u8>, image::ImageError> {
     let mut out = Vec::new();
-    let encoder = PngEncoder::new_with_quality(
-        &mut out,
-        CompressionType::Fast,
-        FilterType::NoFilter,
-    );
+    let encoder =
+        PngEncoder::new_with_quality(&mut out, CompressionType::Fast, FilterType::NoFilter);
     encoder.write_image(
         &surface.rgba,
         surface.width,

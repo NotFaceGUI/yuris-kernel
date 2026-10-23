@@ -17,6 +17,10 @@
 `yu-font` **不负责**：换行、对齐、ruby、逐字节奏、行距、文本层管理、最终
 屏幕合成。这些归 `yu-gfx/text` / 后端。
 
+补充(P2):CP932 字节 → `char` 的**唯一**解码器在 `yu_font::cp932`
+(`decode` / `decode_char`,WHATWG `shift_jis`);两个渲染后端共用它,保证
+字符流一致。
+
 ## 2. 证据等级与策略
 
 ```rust
@@ -80,6 +84,10 @@ impl FontSource {
         -> Result<T, Diag>;
     pub fn glyph_index(&self, face: FaceId, ch: char) -> Result<Option<u16>, Diag>;
     pub fn advance_px(&self, face: FaceId, gid: u16, sx: u16, sy: u16) -> Result<f32, Diag>;
+    /// 单元顶边 → baseline 的距离(`sy` px;`hhea/OS2` ascent 缩放)。
+    /// 文本后端用它把 `CGACT[TEXT Y]`(单元顶边)换成字形基线。
+    /// `Likely`:GDI `lfHeight` 的整数舍入未取证(`DIV-GFX-056`)。
+    pub fn ascent_px(&self, face: FaceId, sy: u16) -> Result<f32, Diag>;
     pub fn units_per_em(&self, face: FaceId) -> Result<u16, Diag>;
     pub fn kerning_units(&self, face: FaceId, left: u16, right: u16) -> Result<i16, Diag>;
 }
@@ -318,6 +326,7 @@ release 的 1.0–1.2 倍（受 CPU/热状态影响）。
 | DIV-FONT-008 | ClearType、miter join、shadow blur | 显式 `font.unimplemented` |
 | DIV-FONT-009 | `FONT[NAME]` 若同一 family 有多个 localized 名称，匹配使用全部别名 | 与 GDI 的 family 选择可能不同 |
 | DIV-FONT-010 | 引擎的字符宽度/字距使用 GDI 度量；本实现用 swash advance | 行宽可能有亚像素差 |
+| DIV-FONT-011 | 单元顶边→基线的 ascent 取整(GDI `lfHeight` 单元 vs hhea ascent) | `ascent_px`(`Likely`)；官方文本截图对拍(H-P2-03) |
 
 需要 REA 复核的项：
 

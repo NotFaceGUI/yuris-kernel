@@ -6,7 +6,10 @@ fn main() {
     let root = std::env::args().nth(1).unwrap();
     let src = DirSource::open(format!("{root}/data"), Codec::Cp932).unwrap();
     let aux = DirSource::open(&root, Codec::Cp932).unwrap();
-    let cfg = BootConfig { entry_label: "SYSTEM_START".into(), ..BootConfig::default() };
+    let cfg = BootConfig {
+        entry_label: "SYSTEM_START".into(),
+        ..BootConfig::default()
+    };
     let mut vm = Vm::boot_with_aux(Box::new(src), Some(Box::new(aux)), cfg).unwrap();
     vm.tick_at(0, &InputTimeline::new());
     // 打印所有数组变量的形状(维数非空),按 id 排序
@@ -24,6 +27,8 @@ fn main() {
     // 关键:ERIS 中 @SP.DEF.NUM 这类计数是否增长
     println!("--- dims stats ---");
     let mut sizes: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
-    for (_, _, d) in &rows { *sizes.entry(*d.first().unwrap_or(&0)).or_insert(0) += 1; }
+    for (_, _, d) in &rows {
+        *sizes.entry(*d.first().unwrap_or(&0)).or_insert(0) += 1;
+    }
     println!("{sizes:?}");
 }

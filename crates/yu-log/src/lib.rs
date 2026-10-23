@@ -11,6 +11,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod code;
+pub mod facade;
 mod json;
 pub mod sink;
 

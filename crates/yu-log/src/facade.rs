@@ -1,0 +1,274 @@
+//! `log` 门面桥:把依赖(wgpu/winit 等)经 `log` 发的诊断接进本包结构。
+//!
+//! 现状背景(任务书 P4 M-E):全工作区此前没有任何 logger 初始化,依赖
+//! 经 `log` 门面发的 error/warning 全部被静默吞掉。本模块提供唯一的桥:
+//!
+//! - `log::Record` → JSONL 一行(`sub:"log"`,字段固定:
+//!   `level/target/file/line/message`,复用 [`crate::json`] 的确定性转义),
+//!   以及控制台一行(经调用方注入的回调;`yu-log` 不直接碰 stdout/stderr,
+//!   终端输出层仍归 `yu-cli::output`);
+//! - 级别映射 `Error/Warn/Info/Debug/Trace` 原样保留为小写字符串;
+//!   **本包自身的诊断码/`Diag` schema 不受影响**(`sub:"log"` 行不是
+//!   `Diag`,不走 [`crate::sink::LogSink`] 的往返契约);
+//! - 级别由 `YU_LOG` 控制(`error|warn|info|debug|trace`,缺省 `warn`;
+//!   非法值按 `warn` 并在控制台提示一次)。**不解析 `RUST_LOG`**:
+//!   避免隐式全局 per-crate 过滤语义(A3)。
+//!
+//! 全局性:`log::set_boxed_logger` 是进程级单例,本桥只应由 CLI/宿主
+//! main 入口显式调用一次;wasm 宿主不调用。桥自身不加任何过滤以外的
+//! 状态,`.sd`/容器解码等纯数据路径不感知它。
+
+use std::fs::File;
+use std::io::Write;
+use std::sync::Mutex;
+
+/// 控制台一行回调(由宿主注入;`yu-cli` 传 `output::error`)。
+pub type ConsoleFn = fn(&str);
+
+/// 门面日志级别(与 `log::Level` 一一对应)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FacadeLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl FacadeLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            FacadeLevel::Error => "error",
+            FacadeLevel::Warn => "warn",
+            FacadeLevel::Info => "info",
+            FacadeLevel::Debug => "debug",
+            FacadeLevel::Trace => "trace",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "error" => Some(FacadeLevel::Error),
+            "warn" => Some(FacadeLevel::Warn),
+            "info" => Some(FacadeLevel::Info),
+            "debug" => Some(FacadeLevel::Debug),
+            "trace" => Some(FacadeLevel::Trace),
+            _ => None,
+        }
+    }
+
+    fn from_log(level: log::Level) -> Self {
+        match level {
+            log::Level::Error => FacadeLevel::Error,
+            log::Level::Warn => FacadeLevel::Warn,
+            log::Level::Info => FacadeLevel::Info,
+            log::Level::Debug => FacadeLevel::Debug,
+            log::Level::Trace => FacadeLevel::Trace,
+        }
+    }
+
+    fn to_log(self) -> log::Level {
+        match self {
+            FacadeLevel::Error => log::Level::Error,
+            FacadeLevel::Warn => log::Level::Warn,
+            FacadeLevel::Info => log::Level::Info,
+            FacadeLevel::Debug => log::Level::Debug,
+            FacadeLevel::Trace => log::Level::Trace,
+        }
+    }
+}
+
+/// 从 `YU_LOG` 解析级别;缺省/非法为 `warn`。
+#[must_use]
+pub fn level_from_env(value: Option<&str>) -> FacadeLevel {
+    value
+        .and_then(FacadeLevel::parse)
+        .unwrap_or(FacadeLevel::Warn)
+}
+
+/// 门面桥。`log::Log` 的实现;JSONL 目标文件可选(不设则只走控制台)。
+pub struct FacadeLogger {
+    level: FacadeLevel,
+    jsonl: Mutex<Option<File>>,
+    console: ConsoleFn,
+}
+
+impl FacadeLogger {
+    /// 构造(不安装;安装走 [`init`])。
+    #[must_use]
+    pub fn new(level: FacadeLevel, jsonl: Option<File>, console: ConsoleFn) -> Self {
+        Self {
+            level,
+            jsonl: Mutex::new(jsonl),
+            console,
+        }
+    }
+
+    /// 一条记录的 JSONL 单行(确定性字段序;单测也用)。
+    pub fn record_json_line(&self, record: &log::Record<'_>) -> String {
+        let mut out = String::with_capacity(128);
+        out.push_str("{\"sub\":\"log\",\"level\":\"");
+        out.push_str(FacadeLevel::from_log(record.level()).as_str());
+        out.push_str("\",\"target\":");
+        crate::json::write_string(&mut out, record.target());
+        out.push_str(",\"file\":");
+        match record.file() {
+            Some(file) => crate::json::write_string(&mut out, file),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"line\":");
+        match record.line() {
+            Some(line) => out.push_str(&line.to_string()),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"message\":");
+        let mut message = String::new();
+        // `log::Record` 的消息只经 `fmt::Display`;写不进内存缓冲是不可能的
+        // (String 的 Write 永不失败),与 `log` 生态所有自定义 logger 同构。
+        let _ = std::fmt::write(&mut message, *record.args());
+        crate::json::write_string(&mut out, &message);
+        out.push('}');
+        out
+    }
+
+    /// 控制台一行(单测也用)。
+    pub fn console_line(&self, record: &log::Record<'_>) -> String {
+        let mut message = String::new();
+        let _ = std::fmt::write(&mut message, *record.args());
+        format!(
+            "[log:{}] {}: {}",
+            FacadeLevel::from_log(record.level()).as_str(),
+            record.target(),
+            message
+        )
+    }
+}
+
+impl log::Log for FacadeLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= self.level.to_log()
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        (self.console)(&self.console_line(record));
+        let line = self.record_json_line(record);
+        if let Ok(mut slot) = self.jsonl.lock() {
+            if let Some(file) = slot.as_mut() {
+                let _ = file.write_all(line.as_bytes());
+                let _ = file.write_all(b"\n");
+            }
+        }
+    }
+
+    fn flush(&self) {
+        if let Ok(mut slot) = self.jsonl.lock() {
+            if let Some(file) = slot.as_mut() {
+                let _ = file.flush();
+            }
+        }
+    }
+}
+
+/// 初始化全局门面桥(main 入口调用一次;重复调用是温和 no-op)。
+///
+/// - `YU_LOG`:级别(`error|warn|info|debug|trace`;缺省 `warn`);
+/// - `YU_LOG_JSONL`:可选 JSONL 文件路径(每次进程创建/截断)。
+///
+/// 返回实际生效的级别,供 CLI 报告;安装失败(已被占用)返回 `None`。
+pub fn init(console: ConsoleFn) -> Option<FacadeLevel> {
+    let level = level_from_env(std::env::var("YU_LOG").ok().as_deref());
+    let jsonl = match std::env::var("YU_LOG_JSONL") {
+        Ok(path) if !path.trim().is_empty() => File::create(path.trim()).ok(),
+        _ => None,
+    };
+    let logger = FacadeLogger::new(level, jsonl, console);
+    log::set_max_level(level.to_log().to_level_filter());
+    // 已有 logger 时(`--repeat` 的进程内重入/测试并行)保持现状,不覆盖。
+    if log::set_boxed_logger(Box::new(logger)).is_err() {
+        return None;
+    }
+    Some(level)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use log::Log as _;
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CONSOLE_HITS: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static LAST_LINE: RefCell<String> = const { RefCell::new(String::new()) };
+    }
+
+    fn grab_console(line: &str) {
+        LAST_LINE.with(|slot| *slot.borrow_mut() = line.to_string());
+        CONSOLE_HITS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// `format_args!` 的临时值只能活到语句末尾,所以记录构造必须内联。
+    macro_rules! test_record {
+        ($level:expr, $target:expr, $message:expr) => {
+            log::Record::builder()
+                .level($level)
+                .target($target)
+                .file(Some("src/lib.rs"))
+                .line(Some(42))
+                .args(format_args!($message))
+                .build()
+        };
+    }
+
+    #[test]
+    fn env_level_parses_with_warn_default() {
+        assert_eq!(level_from_env(None), FacadeLevel::Warn);
+        assert_eq!(level_from_env(Some("trace")), FacadeLevel::Trace);
+        assert_eq!(level_from_env(Some("WARN")), FacadeLevel::Warn);
+        assert_eq!(level_from_env(Some("nonsense")), FacadeLevel::Warn);
+    }
+
+    #[test]
+    fn record_line_has_stable_shape_and_escaping() {
+        let logger = FacadeLogger::new(FacadeLevel::Trace, None, grab_console);
+        let line = logger.record_json_line(&test_record!(
+            log::Level::Warn,
+            "wgpu::backend",
+            "quote \" and \\ slash"
+        ));
+        assert_eq!(
+            line,
+            "{\"sub\":\"log\",\"level\":\"warn\",\"target\":\"wgpu::backend\",\
+             \"file\":\"src/lib.rs\",\"line\":42,\
+             \"message\":\"quote \\\" and \\\\ slash\"}"
+        );
+        let parsed = crate::json::parse(&line).expect("jsonl parses");
+        let obj = crate::json::as_obj(&parsed).expect("object");
+        assert_eq!(
+            crate::json::as_str(crate::json::get(obj, "sub").expect("sub")).expect("str"),
+            "log"
+        );
+    }
+
+    #[test]
+    fn level_filter_gates_console_and_jsonl() {
+        let _ = CONSOLE_HITS.load(Ordering::SeqCst);
+        let logger = FacadeLogger::new(FacadeLevel::Warn, None, grab_console);
+        logger.log(&test_record!(log::Level::Info, "wgpu", "filtered out"));
+        assert_eq!(CONSOLE_HITS.load(Ordering::SeqCst), 0, "info filtered");
+        logger.log(&test_record!(log::Level::Error, "wgpu", "kept"));
+        assert_eq!(CONSOLE_HITS.load(Ordering::SeqCst), 1, "error kept");
+        assert!(logger.enabled(&log::Metadata::builder().level(log::Level::Warn).build()));
+        assert!(!logger.enabled(&log::Metadata::builder().level(log::Level::Debug).build()));
+    }
+
+    #[test]
+    fn console_line_is_one_line_with_target() {
+        let logger = FacadeLogger::new(FacadeLevel::Warn, None, grab_console);
+        let text = logger.console_line(&test_record!(log::Level::Error, "naga", "bad shader"));
+        assert_eq!(text, "[log:error] naga: bad shader");
+    }
+}

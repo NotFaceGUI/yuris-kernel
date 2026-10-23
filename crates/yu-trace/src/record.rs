@@ -27,7 +27,9 @@ use crate::json::{self, FieldError, Fields, Json};
 /// - v3:2026-10-20 producer-neutral —— header 增加 `producer`(kernel/official/
 ///   采集器版本/样本 hash)与 `clock`(tick_at 的 now_ms 序列);③
 ///   `frame/frame_description` 成为真实记录;④ `platform/platform_call` 继续拒绝。
-pub const SCHEMA_VERSION: u32 = 3;
+/// - v4:2026-10-23 回放闭包 —— `boot.host` 增加 `window_init_pos`
+///   (`@_WINDOW_INIT_POS`;宿主注入,影响脚本行为,必须进 header 才能重放)。
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// 子系统。③(`frame`)已实现;④(`platform`)仍为占位,本版本拒绝其记录。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -589,6 +591,10 @@ pub struct HostSummary {
     pub media_readonly: bool,
     pub os_sound: bool,
     pub dx_mode: u32,
+    /// `@_WINDOW_INIT_POS`(宿主注入;v4 起进 header,保证回放闭包)。
+    pub window_init_pos: i64,
+    /// `RANDOM` 的 MT19937 种子(宿主注入;数组初值/随机序列依赖它)。
+    pub rng_seed: u32,
     /// `Some` 的路径条数(0..=5)。
     pub paths_len: u64,
     pub paths_sha256: String,
@@ -612,6 +618,8 @@ impl BootSummary {
                 media_readonly: cfg.media_readonly,
                 os_sound: cfg.os_sound,
                 dx_mode: cfg.dx_mode,
+                window_init_pos: cfg.window_init_pos,
+                rng_seed: cfg.rng_seed,
                 paths_len,
                 paths_sha256,
             },
@@ -657,6 +665,8 @@ impl BootSummary {
             media_readonly: self.host.media_readonly,
             os_sound: self.host.os_sound,
             dx_mode: self.host.dx_mode,
+            window_init_pos: self.host.window_init_pos,
+            rng_seed: self.host.rng_seed,
             record_events: true,
         })
     }
@@ -1153,8 +1163,7 @@ impl TraceLog {
     pub fn command_sequence_projection(&self, script: Option<u32>) -> TraceLog {
         self.sequence_projection(|record| match record.payload() {
             Payload::VmCommand { script: s, .. } => {
-                record.kind() == Kind::VmCommand
-                    && script.is_none_or(|want| *s == want)
+                record.kind() == Kind::VmCommand && script.is_none_or(|want| *s == want)
             }
             _ => false,
         })
@@ -1691,6 +1700,13 @@ fn parse_header(line: u64, obj: &[(String, Json)]) -> Result<HeaderPayload, Diag
     let media_readonly = take_bool(&mut host_fields, line, "media_readonly")?;
     let os_sound = take_bool(&mut host_fields, line, "os_sound")?;
     let dx_mode = take_u32(&mut host_fields, line, "dx_mode")?;
+    let window_init_pos = json::as_i64(
+        host_fields
+            .take("window_init_pos")
+            .map_err(|e| field_error(line, e))?,
+    )
+    .map_err(|detail| error::parse(line, detail))?;
+    let rng_seed = take_u32(&mut host_fields, line, "rng_seed")?;
     let paths_value = host_fields
         .take("paths")
         .map_err(|e| field_error(line, e))?;
@@ -1733,6 +1749,8 @@ fn parse_header(line: u64, obj: &[(String, Json)]) -> Result<HeaderPayload, Diag
                 media_readonly,
                 os_sound,
                 dx_mode,
+                window_init_pos,
+                rng_seed,
                 paths_len,
                 paths_sha256,
             },
@@ -1918,6 +1936,14 @@ pub(crate) fn payload_to_json(payload: &Payload) -> Json {
                             (
                                 "dx_mode".to_string(),
                                 Json::UInt(header.boot.host.dx_mode as u64),
+                            ),
+                            (
+                                "window_init_pos".to_string(),
+                                Json::Int(header.boot.host.window_init_pos),
+                            ),
+                            (
+                                "rng_seed".to_string(),
+                                Json::UInt(header.boot.host.rng_seed as u64),
                             ),
                             (
                                 "paths".to_string(),

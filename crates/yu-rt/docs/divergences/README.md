@@ -4,33 +4,36 @@
 > 含:现象、证据、处置(已实现/`Unimplemented`)、复核方式。
 > 状态取值:`open`(待取证)、`fixed`(已修正)、`wontobserve`(官方不可观测)、
 > `blocked`(缺样本/缺工具)。
+>
+> 状态对账:2026-10-23 全表复审一轮(P3/P4 收口项落账;证据见各条目
+> 2026-10-23 更新行与 `PROGRESS.md` 成果 P3/P4/P6)。
 
 | 编号 | 主题 | 状态 | 影响 |
 |---|---|---|---|
-| DIV-RT-001 | 引擎 0.479/0.495 的 opcode 编号整体错位 | open | 跨版本脚本必须用各自的 ysc 表 |
+| DIV-RT-001 | 引擎 0.479/0.495 的 opcode 编号整体错位 | fixed | 运行核从不内置序号表;真实 0.495 语料 corpus 实测通过 |
 | DIV-RT-002 | 表达式类型提升/溢出/字符串↔数值细节 | open | 已按确定性规则实现,逐位未对齐 |
 | DIV-RT-003 | 整数除零/取模 0 | open | 引擎为硬件异常;内核 Fatal |
-| DIV-RT-004 | 「实参缺席」的运算符缺右操作数形态 | open | 已按语料唯一形态容忍 |
-| DIV-RT-005 | 脚本执行错误后的引擎继续策略 | open | 内核一律「让出+结束+记录」 |
+| DIV-RT-004 | 「实参缺席」的运算符缺右操作数形态 | fixed | 语料 20 窗口统计(19 掩码 + 1 真缺席);`expr.rs` 容忍一次;语料全量跑通 |
+| DIV-RT-005 | 脚本执行错误后的引擎继续策略 | open | 默认槽路径已取证(DIV-RT-043:报一次+让出,任务不终止);内核现行 = Unimplemented/Recoverable 挂号后继续、Fatal 结束+记录;官方其余错误路径仍无 trace |
 | DIV-RT-006 | 输入键码 `_CODE_*` / `_INP` / `_PAD` 的码值 | fixed | REA 证结构(VK 计数表)+ 手册不变量定值;`_KEYLAST/_MOUSELAST` 已另证(DIV-RT-033) |
-| DIV-RT-007 | 工程 ycd 声明但手册无页的系统变量 | open | 一律 `Unimplemented` |
+| DIV-RT-007 | 工程 ycd 声明但手册无页的系统变量 | open | `_WINDOW_EXEC_CAPTION` 已收口(DIV-RT-047);`_CHR`/`_DXMODE`/`_VARTYPE`/`_SYSTEM_FRAME` 等仍一律 `Unimplemented` |
 | DIV-RT-008 | `_`(文本输出)手册无页 | fixed | 手册 basic.html ●テキスト表示有页(`_[式]`);已实现,撤销旧挂账 |
 | DIV-RT-009 | `_TIME`/`_OS_TIME` 的时区与纪元 | open | 注入时钟固定 UTC |
-| DIV-RT-010 | 路径类系统变量(`_SAVE_PATH` 等) | blocked | 需宿主注入 |
-| DIV-RT-011 | 手册有页但语义未取证的命令(VARINFO SEARCH / VARACT INIT·G_* / F_* / ERROR) | open | `Unimplemented`(RETURNCODE/WORD 已另证实现) |
-| DIV-RT-012 | `SAVE`/`LOAD` 的盘上存档格式 | blocked | 交宿主,内核不猜 |
-| DIV-RT-013 | `HANTOZEN`/`ZENTOHAN` 转换表 | open | 需移植引擎三张表 |
-| DIV-RT-014 | `MATH[RND]` 的 MT19937 种子来源 | open | 需注入 RNG |
-| DIV-RT-015 | `TASK` 的 TINT..10/TFLT..10/TSTR..10/SCRIPTPOS 参数 | open | TINT/TFLT/TSTR/SCRIPTPOS 已按官方源码生产者/消费者对实现;TEXTPOS/RESTART/A 仍挂号 |
+| DIV-RT-010 | 路径类系统变量(`_SAVE_PATH` 等) | fixed | `BootConfig::paths` + yu-cli `host_paths()` 注入;`$_PROJECT_PATH` 手册无页保持 `None` |
+| DIV-RT-011 | 手册有页但语义未取证的命令(VARINFO SEARCH / VARACT INIT·G_* / F_* / ERROR) | open | 仅剩 VARINFO `STRTYPE/SJISCODE/UTF8CODE`(无手册例)与 `VAR`(无页);SEARCH/INIT·G_*/RETURNCODE/WORD/F_*/PREP 已另证实现 |
+| DIV-RT-012 | `SAVE`/`LOAD` 的盘上存档格式 | fixed | `yu-format::yssd` 官方 5 文件 269 块逐字节 roundtrip;`yu-save` 宿主消费域事件(忠实写盘受 DIV-RT-042 门禁) |
+| DIV-RT-013 | `HANTOZEN`/`ZENTOHAN` 转换表 | fixed | 三张表已自 0.495 exe 取出落 `data/case-tables-0495.tsv`;算法逐条对照 REA |
+| DIV-RT-014 | `MATH[RND]` 的 MT19937 种子来源 | fixed | 种子 = `GetTickCount`(REA `0x461f98`),内核 `BootConfig::rng_seed` 注入(缺省 5489);`rng.rs` MT19937 |
+| DIV-RT-015 | `TASK` 的 TINT..10/TFLT..10/TSTR..10/SCRIPTPOS 参数 | open | TINT/TFLT/TSTR/SCRIPTPOS 已按官方源码生产者/消费者对实现(带回归);TEXTPOS/RESTART/其余序号仍挂号 |
 | DIV-RT-016 | 商业发行版不带 `YSCom.ycd` | fixed | 改 ycd 可选 + 引擎 ABI 表 + ysv 自证校验 |
-| DIV-RT-017 | 变量空间前缀 `0x60` / `0x23` | open | 5+2 处,挂号继续 |
+| DIV-RT-017 | 变量空间前缀 `0x60` / `0x23` | fixed | = ERIS 旧式 `@G/@L`(0x60 数值)、`$G/$L`(0x23 字符串);源码↔编译产物↔YSVR 声明三方对上,`canonical_var` 归一化;其它前缀仍挂号 |
 | DIV-RT-018 | `ELSE` 的 0 窗口形态 | fixed | 商业包 726 次;无条件进 else 体 |
 | DIV-RT-019 | `VARACT[DIMSIZE/PUSH/POP]` 无 `LET` | fixed | 手册例 9/10 即此形态 |
 | DIV-RT-020 | 数组负下标 / 越界访问 | fixed | 根因是 lvalue 解析 + 未实现的 VARINFO/VARACT |
 | DIV-RT-021 | 输入系统变量可写(`@_MOUSE_L=5` 等) | fixed | 写入 = 设定帧计数器 |
 | DIV-RT-022 | 系统变量的宿主注入面(色深/路径/DX/媒体只读/声音) | fixed | `BootConfig` 注入 |
-| DIV-RT-023 | `SYSTEMINFO` 手册无页但启动链硬依赖 | open | 按引擎处理体实现 + 手册缺页挂账 |
-| DIV-RT-024 | `VARACT[INIT + G_*]` 手册无页 | open | 按引擎 §3.26 算法实现 |
+| DIV-RT-023 | `SYSTEMINFO` 手册无页但启动链硬依赖 | fixed | 四槽全实现 + 引擎处理体 `0x450478` 反汇编证据;手册缺页为不可修的外部事实,保留在条目内 |
+| DIV-RT-024 | `VARACT[INIT + G_*]` 手册无页 | fixed | 按引擎 §3.26 ④ 完整算法实现(掩码 `0x454d3d` + 恢复体 `0x455b60`);手册缺页为不可修的外部事实,保留在条目内 |
 | DIV-RT-025 | `TASKINFO` 的数值字段(LINE/FILE/嵌套数) | fixed | 用任务记录 + 数据区 B 行号 |
 | DIV-RT-026 | `yst_list` 每脚本的文本数 | fixed | 记录第 3 个 u32 |
 | DIV-RT-027 | `ELSE` 判定顺序 / IF 先压帧 | fixed | 引擎 §3.13 顺序 |
@@ -38,7 +41,7 @@
 | DIV-RT-029 | `_CODE_*` 的码值来源 | fixed | 引擎 BSS 字节表(REA)+ VK 规范;数据文件 button-code-abi.tsv |
 | DIV-RT-030 | 手册检索的二进制误判 | fixed | 手册 html 含非文本字节,普通 grep 误报"无页";字节级 grep 重审全表 |
 | DIV-RT-031 | `_TEXT`/`_MENUCODE`/`_WINDOW_EXEC_*` 状态系统变量 | fixed | 手册有页;内核状态 + 宿主 setter |
-| DIV-RT-032 | `_TEXT_FLAG` 的控制字节流 | open | 读取 + `WORD`/`_`/`TEXT`/`RETURNCODE` 写入已按 REA 实现;脚本写入 `_TEXT_FLAG` 仍挂号 |
+| DIV-RT-032 | `_TEXT_FLAG` 的控制字节流 | fixed | 读取、`WORD`/`_`/`TEXT`/`RETURNCODE` 写入、脚本写入(RHS 逐字节替换,REA `0x446b98..`)全部按 REA 实现 |
 | DIV-RT-033 | `_KEYLAST`/`_MOUSELAST` 读取 | fixed | 手册无页,但 REA `FUN_00427350` case 0x91/0x92 直接读 `DAT_00801908`/`DAT_0080190c`;写入点 `FUN_0045a3b4`(WM_KEYDOWN / WM_LBUTTONDOWN=1 / R=2 / M=4) |
 | DIV-RT-034 | panic 收口(任务书 E R7) | fixed | IFBREAK LV=0 / GOSUB·RETURN 参数名越界 / DIMSIZE·维长乘积防御上限 |
 | DIV-RT-035 | 文本让出点是 `RETURNCODE`,不是 `WORD`/`_` | fixed | 任务书 E R3;REA 实证(见下) |
@@ -49,6 +52,12 @@
 | DIV-RT-040 | 帧边界事件(`FrameStart`/`FrameEnd`)与有界事件队列 | fixed | 内部可观测契约(architecture §3/A3),非官方语义 |
 | DIV-RT-041 | `Diag` 的脚本定位(task/script/pc/cmd) | fixed | architecture §8;`Loc::Script.label` 承载任务 ID |
 | DIV-RT-042 | `DomainCall` 的变量引用身份丢失 | blocked | `SAVE[SET]`/`LOAD[LET]`/`FILEINFO[LET]` 只带求值结果;跨 crate 契约变更 |
+| DIV-RT-043 | 官方默认槽 `0x459e90` 的语义(脚本执行错误) | fixed | `F_*`/`G_*`/`MACRO`/`S_VAR`/`_IF*`/`);`/`SYSTEMMODE` 等不再静默 Unimplemented |
+| DIV-RT-044 | `DIALOG` 的 VM 侧契约与宿主回答 | fixed | 任务挂起/回答、LET/LETSTR 写回、扩展参数挂账 |
+| DIV-RT-045 | `TRAY`/`CLIPACT`/`CLIPINFO`/`REGINFO`/`YMV*` 的域边界 | fixed/partial | 剪贴板镜像实现;托盘/媒体归宿主;注册表挂账 |
+| DIV-RT-046 | `ERROR` 的逐命令启用表 | open | 表已按 REA 写入,消费者未定位 |
+| DIV-RT-047 | `_WINDOW_INIT_POS` / `_WINDOW_EXEC_CAPTION` 的宿主注入面 | fixed | 两个宿主 setter/注入值;手册仍无页 |
+| DIV-RT-048 | `_TEXT_NUM` 的数据源 | fixed | `yst.ybn` 头部 text_total == `yst_list` 求和(ERIS 396) |
 
 ---
 
@@ -61,6 +70,9 @@
 - **处置**:运行核**从不使用内置序号表**;`opcode → 名字` 一律查工程 `ysc.ybn`
   (`crate::tables::YscmTable`)。跨版本 = 换数据,不换代码(A5)。
 - **复核**:`cargo test -p yu-rt --test corpus` 对真实 0.495 语料逐组反查名字。
+- **2026-10-23 收口**:实现即处置本体(跨版本 = 换数据不换代码,已落地);
+  `cargo test -p yu-rt --test corpus -- eris_entry_chain_runs_end_to_end`
+  对真实 0.495 语料 **ok**(17.75s,本机实测)。状态改 `fixed`。
 
 ---
 
@@ -89,6 +101,32 @@
   返回 0**(静默会让脚本走错分支且无法审计)。
 - **代价**:一条除零会终结该任务(策略见 DIV-RT-005)。若官方 trace 证明
   引擎在某处容忍除零,须改回并留勘误。
+- **2026-10-23 取证(性能会话;未改语义)**:
+  - 现场:`es_select.yst:153 LET[@2279[@2320]=(@2264[@2284]/@1118[@48])&1]`,
+    `@48 = @_LC`,`@1118 = G_INT int[63]`。同一位置另有
+    `es_number.yst:SYSTEM@56` 的除零(症状台账 S4)。
+  - 写入者扫描:`find_var_ref <project-eris>/save 1118 0x40`
+    (工具 `crates/yu-rt/examples/find_var_ref.rs`):
+    ```text
+    # total=19
+    # var @1118 ty=Int dims=[63]
+    #   [0] = 0 … [7] = 0
+    kind=REF ×19(0x56/0x48 读操作数;无 0x76 / 写编码命中)
+    ```
+    ⇒ 表达式层面**没有** `@1118` 的写入者;启动后 63 个元素全为 0。
+  - 残余可能(下一步取证,按优先级):
+    1. **批量恢复路径**:`LOAD[FILE=… G_INT*]` / `SAVE` 的组恢复不经过
+       表达式写操作码。需在 `LOAD` 的 G_INT 组写回处加 watchpoint
+       (`VariableStore::write` 已有 `cur_script/cur_pc` 上下文),确认
+       `@1118` 是否属于被恢复的组、以及 `gsd.sd`/槽文件里该数组的值。
+    2. **`VARACT[INIT=1 G_INT3=1]`**(`es_GSD.yst:1258`)会把组 3 恢复成
+       ysv 初值;本次投影的 ysv 初值为 0。需核对官方 `ysv.ybn` 里
+       `@1118` 的 `init` 是否也为 0(若官方数据非 0,则是我们的 ysv
+       投影/组号映射问题)。
+    3. `@_LC` 在该 LET 前是否可能 ≥63(数组越界读);当前内核越界是 Fatal,
+       不是 0 除数,故不是本现场的直接原因。
+  - **禁止**:把 Fatal 改成“跳过该 LET”或伪造非 0 除数;必须等
+    `LOAD`/ysv 两条取证路径有结论后再动。
 
 ---
 
@@ -101,6 +139,10 @@
   且把栈上已有的 0 作为该参数值;其它操作数不足仍报 `rt.expr.malformed`。
 - **复核**:`crates/yu-rt/src/expr.rs` 的 `step` 分支 + 语料统计脚本
   `crates/yu-rt/scripts/corpus_stats.py`。
+- **2026-10-23 收口**:容忍分支落地(`expr.rs:372` 附近,仅「最后一个操作数
+  不足」的二元运算容忍一次);ERIS 全量语料跑通无该挂号 ⇒ 形态处置完成,
+  状态改 `fixed`。(引擎对该形态的官方处理仍无 trace;若后续 trace 与之
+  冲突以官方为准并勘误。)
 
 ---
 
@@ -112,6 +154,14 @@
   一旦拿到官方 trace 立即核对。
 - **复核**:`fixture.rs::unknown_label_is_fatal_and_recorded`、
   `fixture.rs::undeclared_variable_write_is_reported`。
+- **2026-10-23 更新(P3)**:策略已细化并部分取得官方证据:
+  - 默认槽(脚本执行错误)路径:**REA 实证**(DIV-RT-043)——报一次
+    `[内部エラー] スクリプト実行エラー` + 返回 -1 ⇒ 本帧让出,**任务不终止**;
+  - 内核现行:`Unimplemented`/`Recoverable` = 挂号留痕后**继续执行下一条**
+    (`vm.rs` `step_command` 错误分支);`Fatal` = 结束任务 + 记录
+    (`ChainReport::errors` + `VmEvent::Diag`);
+  - 官方对其它错误路径(非默认槽)的继续策略仍无 trace ⇒ 本条**保持 open**,
+    旧文「一律让出+结束+记录」已过时,以此为准。
 
 ---
 
@@ -159,6 +209,11 @@
     `[0x8015e0]==0`)。`*ecx` 的来源与两个条件全局仍未取证。
   - 结论:它是宿主窗口事件标志,不是 VM 可计算语义;保持 `Unimplemented`,
     若放宽门禁应做宿主 setter(同 `_WINDOW_EXEC_MAX/CLOSE` 形态)。
+- **2026-10-23(P3)**:`_WINDOW_INIT_POS` 语义已定:引擎读 `[0x80133c]`,
+  该字节由 `yscfg.dat` 第 10 个 int 写入(`0x460b74/0x460b87`),由宿主经
+  `BootConfig::window_init_pos` 注入(DIV-RT-047)。`_WINDOW_EXEC_CAPTION`
+  按原结论实现为宿主 setter:`Vm::request_window_caption()` 置 1,脚本读后
+  写回 0;VM 不自行置位。
 - **复核**:`crates/yu-rt/src/sysvar.rs::undoc`;频度见 `docs/coverage-matrix.md` §3。
 
 ---
@@ -190,6 +245,13 @@
 - `$_SYSTEM_PATH` / `$_SAVE_PATH` / `$_APPDATA_PATH` / `$_PERSONAL_PATH` /
   `$_PROJECT_PATH`:官方是真实文件系统路径。内核遵守 A2(数据只读、存档只写
   SaveDir),不猜宿主布局 ⇒ `Unimplemented`,由 CLI 装配层注入后解除。
+- **2026-10-23 收口(P4 M-C)**:`BootConfig::paths`(`vm::HostPaths`,五项
+  `Option<Vec<u8>>`)+ `yu-cli` 装配层注入(`engine.rs::host_paths`):
+  `$_SYSTEM_PATH`=工程根、`$_SAVE_PATH`=存档根(显式重定向或工程根
+  `save/`)、`$_APPDATA_PATH`/`$_PERSONAL_PATH`=`USERPROFILE`(+Documents);
+  `$_PROJECT_PATH` 手册无页 ⇒ 保持 `None`(不猜值)。P3 census 时未实现
+  `LET` 仅剩 `_SAVE_PATH` 1 次,注入后归零;P6 门禁 `yu-cli case --all`
+  **8 passed**。状态改 `fixed`。
 
 ---
 
@@ -204,6 +266,16 @@
 | `WORD` / `VAR` / `PREP` / `PLUG` | 无页 | 不实现 |
 
 处置:运行到即 `Unimplemented` + 事件流留痕,执行继续。
+- **2026-10-23 复核(状态收窄)**:原表多数子项已另证实现 ——
+  `VARINFO[SEARCH]` 按手册例 5/6/7 实现(`handlers.rs`,针值 `INT/FLT/STR`);
+  `VARACT[INIT+G_*]` 见 DIV-RT-024;`RETURNCODE`/`WORD`/`_` 见 DIV-RT-028;
+  `RETURNBREAK`/`PREP` = 官方 no-op 槽(REA `0x7acf58`/`0x7acf4c`,
+  `NOOP_COMMANDS_0495`);`F_INT/F_FLT/F_STR/F_VAR` = 默认槽 ScriptError
+  (DIV-RT-043:静态命中全在 `global_f.yst` 声明段,600 帧运行期 0 次);
+  `CSV`/`PLUG`/`ERRORINFO` = 官方「参数求值+返回 0」(`NoopEval`,
+  REA `0x43e640`/`0x44bd10`/`0x46356c`);`ERROR` 启用表见 DIV-RT-046。
+  **仍挂号**:`VARINFO` 的 `STRTYPE/SJISCODE/UTF8CODE`(手册无例,引擎
+  §3.21 只证到分支地址)与 `VAR`(无页、无官方体)⇒ 本条保持 open。
 
 ---
 
@@ -213,6 +285,15 @@
 `.sd` 字节布局未取证**。内核把 `SAVE`/`LOAD` 归入 DomainCall(Save 域),
 不写任何文件;存档字节级对齐属 `yu-save`(任务书后续)。
 
+**2026-10-23 收口(P4 M-A/M-B)**:盘上布局已按官方产物自证 ——
+`yu-format::yssd`(头 `YSSD` + 块偏移表 `0x400×u32` + 块结构 + type1/type2
+块 + zlib level-1 载荷;libz-sys 钉版 `=1.1.22` 保证 deflate 输出与官方
+一致),回归 `yu-format/tests/yssd_roundtrip.rs::official_sd_files_roundtrip_byte_exact`
+对官方 5 文件 269 块 **逐字节一致**(P4 实测)。宿主侧 `yu-save`(`SaveHost`)
+消费 SAVE/LOAD/SAVEEND/FILEACT 域事件;忠实写盘在 `SET/LET` 变量引用身份
+取证前显式拒绝(`sv.write.refused`,DIV-RT-042 门禁)。内核「不写文件、
+只发域事件」的分层不变。状态改 `fixed`。
+
 ---
 
 ## DIV-RT-013 · 全角/半角转换表
@@ -220,6 +301,13 @@
 手册 `variable/varact.html` 写了 HANTOZEN/ZENTOHAN 的**行为**;引擎用三张
 二进制表(§3.26:`0x808840` 63 项 / `0x5B5170` 95 项 / `0x5B5230` 126 对)。
 表未移植 ⇒ `Unimplemented`(不手抄、不近似)。
+
+**2026-10-23 收口(P3 §4)**:三张表已自 0.495 exe 取出,落
+`data/case-tables-0495.tsv`;`src/case_tables.rs` 按 `0x4546aa..`/
+`0x4548cf..`/`0x46b327`/`0x46b395` 逐条对照实现(`hantozen`/`zentohan`,
+单字节原样、双字节查表),`VARACT` 分支接线(`handlers.rs`)。
+**复核**:`fixture::varact_hantozen_and_zentohan_use_official_tables`
+(ASCII/半角片假名/汉字直通/反向;2026-10-23 本机实测 ok)。状态改 `fixed`。
 
 ---
 
@@ -229,6 +317,15 @@
 **MT19937**(§3.20),但种子来源未取证。确定性要求(A3)⇒ 必须注入 RNG;
 当前 `Unimplemented`。
 
+**2026-10-23 收口(P3 §4)**:REA 实证 —— 初始化 `0x465f64`(`mt[0]=seed`,
+624 项递推常数 `0x6c078965` = MT19937 `init_genrand`),种子来自
+`GetTickCount`(`0x461f98`);`RND` 体 `0x448571..0x4485b7` =
+`min + rand32 % (max-min+1)`、`min>max` 时交换。内核 `src/rng.rs`
+标准 MT19937 + `BootConfig::rng_seed`(缺省 5489 = 参考实现缺省)。
+**复核**:`fixture::math_rnd_uses_injected_mt19937_seed`(3499211612 % 9
+→ 首抽 3;2026-10-23 本机实测 ok)、`rng.rs::reference_sequence_seed_5489`。
+逐位复现官方仍需采集官方 trace(种子随机),状态改 `fixed`(语义+注入面齐)。
+
 ---
 
 ## DIV-RT-015 · TASK 的局部参数
@@ -237,6 +334,16 @@
 `RESTART`。本实现:`ID`/`E`/`Z`/`#`(生成与启停),其余参数运行到即
 `Unimplemented`(任务局部寄存器已建模但未接参数传递;`SCRIPTPOS` 属存档锚点,
 待 `yu-save`)。
+- **2026-10-23 更新**:`TINT..10`/`TFLT..10`/`TSTR..10` 已按官方源码
+  生产者/消费者对接线(`es_ERIS.yst:524` `TASK[…TINT=@_PINT(1)]` →
+  `:533` 任务体 `@_TINT(1)`;引擎槽位 `+0x3d0/+0x3d4`=TINT、
+  `+0x348/+0x34c`=TFLT、`+0x458`=TSTR;未传槽为 0,不继承调用者);
+  `SCRIPTPOS` 按 `TASKINFO[SCRIPTPOS]` 产 `[script_id u32][pc u32]` blob、
+  `TASK[SCRIPTPOS=…]` 对既有任务做位置ロード(手册例 4)往返实现。
+  **复核**:`fixture::task_without_tint_does_not_inherit_caller_registers`
+  (2026-10-23 本机实测 ok)。
+  **仍挂号**:`TEXTPOS`/`RESTART`/手册未列的其余参数序号(`handlers.rs`
+  TASK 参数分支统一 `Unimplemented`)⇒ 保持 open。
 
 ---
 
@@ -280,6 +387,17 @@
   (是否等价于全局/局部/静态空间,或不同的变量域基址)。
 - **处置**:运行到即 `Unimplemented` + 事件流留痕;**该次读写作废**,
   执行继续(不猜内存布局、不静默当 `@`)。
+- **2026-10-23 收口**:语义已由「源码 ↔ 编译产物 ↔ YSVR 声明」三方对上:
+  ERIS 0.495 源码 `\DBG.VAR("…", @G(0001))` 编译成
+  `56 03 00 60 89 04 …`(前缀 0x60、id 1161),YSVR 声明 1161 =
+  INT 数组 [8192];`@L(0101)` 同前缀(id 1163, INT [8192]);
+  `$G(0001)` → `56 03 00 23 8a 04 …`(id 1162, STR [8192])。
+  ⇒ 0x60 = ERIS 旧式**数值**空间(`@G/@L`)、0x23 = 旧式**字符串**空间
+  (`$G/$L`),id 全局唯一、类型由工程 `ysv.ybn` 声明决定。
+  实现:`VarSpace::LegacyNum/LegacyStr`(`value.rs`)+
+  `Vm::canonical_var` 按 id 声明归一化(`vm.rs`);真实语料 corpus
+  (`eris_entry_chain_runs_end_to_end`)跑通。**其余未知前缀**仍按原处置
+  `Unimplemented` 挂号(`vm.rs` VarAccess 读路径)。状态改 `fixed`。
 
 ## DIV-RT-018 · `ELSE` 的 0 窗口形态
 
@@ -359,6 +477,9 @@
   `SCRIPTNUM`=脚本总数;`TEXTNUM`=NO → 文本数表;`EMOTE`=E-mote 运行时标志。
 - **本实现**:四槽全实现(文本数见 DIV-RT-026)。**仍挂账**:手册缺页这一事实
   无法消除,若将来拿到手册补充或官方 trace 与之冲突,以官方为准。
+- **2026-10-23 状态**:实现与引擎证据均已完备(四槽 + 处理体反汇编 +
+  corpus),条目可处置的部分没有遗留 ⇒ 状态改 `fixed`;「手册缺页」作为
+  不可修的外部事实保留在本条目内备查。
 
 ## DIV-RT-024 · `VARACT[INIT + G_INT..G_STR4]`(手册无页)
 
@@ -375,6 +496,10 @@
   4. 重建是「整槽按声明重建」(类型 + 维数 + 初值),不是逐元素赋值;
   5. 这一组**不读 `SET`**(所以 `VARACT` 的「缺 SET」检查必须让位于它)。
 - **处置**:按上述算法实现。**仍挂账**:手册缺页(DIV 保留 open)。
+- **2026-10-23 状态**:算法按引擎反汇编逐条落地(含「缺 `INIT` 整条不做」
+  守卫、「不读 `SET`」特例),ERIS 语料 `es_SoundDefine.yst` 等初始化段
+  跑通、census 无回退 ⇒ 状态改 `fixed`;「手册缺页」作为不可修的外部
+  事实保留在本条目内备查。
 
 ## DIV-RT-025 · `TASKINFO` 数值字段
 
@@ -491,6 +616,13 @@ packed = ([1290322, 329227, 26, 249, 8765, 8765], 0, "cd1790…4bd2e")  ... ok
   `Unimplemented` + 无副作用。
 - **复核**:`cargo test -p yu-rt --test fixture text_flag_sysvar_reads_the_control_stream`、
   `text_flags_track_cp932_width_and_returncode_auto_defaults`。
+- **2026-10-23 收口(P3 §4)**:脚本**写入**路径已取证 —— REA
+  `0x446b98..0x446bb5`(id `0x7b`):RHS 字符串**逐字节拷进 `[state+0x3c]`**,
+  不重建文本、不重算逐字符标志(与 `$_TEXT` 的 `+0x38` 写入并列)。
+  实现:`LET[$v = …]` 目标为 `_TEXT_FLAG` 时 `set_text_flags` 整串替换
+  (`handlers.rs`)。旧文「写入保持 `Unimplemented` + 无副作用」作废。
+  **复核**:`fixture::text_flag_write_replaces_stream_without_rebuilding_text`
+  (2026-10-23 本机实测 ok)。状态改 `fixed`。
 
 ## DIV-RT-033 · `_KEYLAST`/`_MOUSELAST`(2026-10-19;2026-10-22 fixed)
 
@@ -643,3 +775,121 @@ packed = ([1290322, 329227, 26, 249, 8765, 8765], 0, "cd1790…4bd2e")  ... ok
 - **缓解**:`VmEvent::domain_args(&yscm)` 提供数据驱动的参数名视图;
   `docs/domain-event-contracts.md` §6 明确标注“事件是事实记录,不是可重放命令”。
 - **复核**:`cargo test -p yu-rt --test fixture domain_args_map_slots_through_project_yscm`。
+- **2026-10-23 登记**:下游 `yu-save` 已按本条设硬门禁 —— `SAVE[FILE]` 刷盘
+  **显式拒绝**(`sv.write.refused`;引用身份拿不到就写不出与官方一致的块),
+  读侧照常;容器写路径本身已逐字节就绪(DIV-RT-012)。解除条件 = 本条关闭
+  (`ArgValue` 加引用字段 + `yu-trace` 穷举匹配同步,跨 crate 契约变更,
+  登记为 H-P3-03)。状态维持 `blocked`。
+
+
+---
+
+## DIV-RT-043 · 官方默认槽 `0x459e90` = 脚本执行错误(2026-10-23,P3)
+
+- **取证**(0.495 `yu-ris.exe` sha256 `4f5eefa3…`):
+  - `FUN_0045cf90` `0x45d1ae..0x45d1c0`:`MOV [EAX+0x7ace20], 0x459e90`,
+    循环上限 `0x1dc` ⇒ 119 槽先全部填默认体,再逐槽覆盖;
+  - 默认体原始字节(REA `read_bytes 0x459e90`):
+    `6a 01 68 d2 bb 0d 00 e8 6c be 00 00 83 c4 08 b8 ff ff ff ff c3`
+    = `push 1; push 0xdbbd2; call 0x465d08; add esp,8; mov eax,-1; ret`;
+  - `0x465d08` → `0x465dec` 解析消息 id → `0x465e30` 查 `ysbin/yse.ybn`;
+    工程 yse 解出 id `0xdbbd2` = `「[内部エラー]
+
+スクリプト実行エラーが
+    発生しました。」`;
+  - `FUN_004612b0` 用全局 `[0x5e4f84]` 抑制重复错误框 ⇒ 只报一次;
+    处理体返回 -1 ⇒ 本帧让出(`task+9` 语义之外的另一条让出路径),
+    **任务不终止**,pc 在取指后已前进。
+- **no-op 槽**:`0x4634d8` = `xor eax,eax; ret`。覆盖写地址:
+  `0x7ace44`(DEBUGLIST)/`0x7acef0`(LABEL)/`0x7acf4c`(PREP)/
+  `0x7acf58`(RETURNBREAK)/`0x7acf60`(S_FLT)/`0x7acf64`(S_INT)/
+  `0x7acf68`(S_STR)。
+- **静态 vs 运行**:`F_INT/F_FLT/F_STR` 静态 337/72/64 处,全部位于
+  `global_f.yst`(Sprite/Sound/Backlog)的声明段(group 0..N);入口标签
+  指向声明段之后,600 帧运行期命中 0。静态扫描器不改,两口径并列记录。
+- **处置**:`HandlerKind::ScriptError` 报一次
+  `rt.script.error`(Recoverable)+ 返回 `StepOutcome::Yield`;后续命中
+  只计数(`Vm::script_slot_hits`)。`F_*`/`G_*`/`F_VAR`/`S_VAR`/`G_VAR`/
+  `MACRO`/`_IFDEF`/`_IFNDEF`/`_IFEND`/`);`/`SYSTEMMODE`/`COMPILEMODE`/
+  `RELEASEMODE`/`PROJECTFOLDER` 归此类。`S_INT`/`S_FLT`/`S_STR` 改 no-op
+  (全局初值仍由 `ysv` 预装载)。
+- **复核**:`fixture::default_slot_reports_once_and_yields_without_terminating`、
+  `fixture::noop_slots_continue_in_the_same_pump`。
+
+## DIV-RT-044 · DIALOG 的 VM 状态机(2026-10-23,P3)
+
+- **三层**:手册 `other/dialog.html`;语料 17 处(只用
+  STR/CAPTION/YESNO/LET/DEFBUTTON/INPUT/DEFSTR/LETSTR/OKCANCEL/
+  YESNOCANCEL);REA `0x43fc74`、输入模板 `0x8083c4`、对话框过程 `0x4403d0`。
+- **契约要点**:
+  - 参数存在性判定**不看值**(`OKCANCEL=0` 也算存在);
+  - 非 INPUT = `MessageBoxA`;按钮组按存在性
+    YESNOCANCEL > YESNO > OKCANCEL > 缺省 OK;`OK` 槽官方从不读取;
+  - `DEFBUTTON` 1..4 → MB_DEFBUTTON1..4;`ICON` 1=Info/2=Question/
+    3=Warning/4=Error;
+  - `LET` = 1 基按钮序号(OK/Yes=1, No/Cancel=2, YesNoCancel-Cancel=3);
+  - `INPUT` = 自绘对话框,`INPUTLIMIT`>0 时 EM_SETLIMITTEXT,OK 后把
+    控件文本写 `LETSTR`、`LET=1`;
+  - 官方是同步模态(计时器暂停);内核改为「任务挂起 + 宿主回答」。
+- **内核**:`Vm::pending_dialogs()` / `Vm::answer_dialog(id, button, text)`;
+  `DomainCall{System,DIALOG}` 是通知,权威状态在 pending 队列;回答前
+  调度器不推进该任务;回答后下一逻辑帧从 DIALOG 的下一条继续。
+- **未取证参数**:`STR2..8`/`A*`/`E*`/`CHECK*`/`FILEOPEN`/`FILEEXT`/
+  `FOLDER`/`CHECKBOX`/`SLIDER`/`NOWAIT` ⇒ `Unimplemented`,不弹窗、不写回。
+- **宿主呈现面**:交接件(P1/P4)。与 `_WINDOW_EXEC_CLOSE` 的交互:
+  DIALOG 挂起期间宿主应把窗口关闭请求当作对话框取消(最后按钮),
+  不要再推 `_WINDOW_EXEC_CLOSE`。
+- **复核**:`fixture::dialog_blocks_task_until_answered_and_writes_let`、
+  `dialog_input_writes_letstr_and_let`、`dialog_unsupported_param_is_unimplemented`。
+
+## DIV-RT-045 · 托盘/剪贴板/注册表/YMV 的域边界(2026-10-23,P3)
+
+| 命令 | 处理体 | 处置 | 证据 |
+|---|---|---|---|
+| `TRAY` | `0x453a4c` | `Domain::System` 事件(宿主托盘图标) | 手册 `other/tray.html`;语料 2 处 |
+| `CLIPACT` | `0x43e2d0` | 内核镜像 + 事件;需 TEXT+SET 都存在 | 手册;REA(CF_TEXT 写入) |
+| `CLIPINFO` | `0x43e410` | 读镜像写 LET;仅 TEXT 存在时动作;过滤 `<0x20` | 手册;REA `0x43e4d2..` |
+| `REGINFO` | `0x44bd30` | `Unimplemented`(需宿主注册表) | 手册 `reg/reginfo.html` |
+| `YMV`/`YMVEND` | `0x458ee0`/`0x459a64` | `Domain::Movie` 事件 | 分发表;无手册页 |
+| `YMVINFO` | `0x459b98` | `Unimplemented`(需宿主媒体元数据) | 分发表;写 LET |
+
+- 剪贴板镜像 API:`Vm::clipboard()` / `Vm::set_clipboard(bytes)`;宿主可
+  注入外部剪贴板内容(内核不访问 OS 剪贴板)。
+- **复核**:`fixture::clipact_and_clipinfo_round_trip_with_control_filtering`、
+  `tray_is_a_domain_event`。
+
+## DIV-RT-046 · `ERROR` 的逐命令启用表(2026-10-23,P3)
+
+- **REA**:`0x46358c` 求值参数后,对参数槽 2.. 的 `COM_<命令名>`,把值
+  低字节写进 `[0x689b00 + 命令序号]`;引擎初始化 `0x462124` 把 128 字节
+  全置 1。
+- **未取证**:该表的**消费者未定位**(xref 只找到初始化),因此内核只
+  保存(`Vm::command_enable()`),不据此改变分派。
+- `CSV`(`0x43e640`)、`PLUG`(`0x44bd10`)、`ERRORINFO`(`0x46356c`)
+  官方体都是「参数求值 + 返回 0」⇒ 实现为 no-op(保留求值诊断)。
+- **复核**:`fixture::error_sets_the_per_command_enable_table`。
+
+## DIV-RT-047 · `_WINDOW_INIT_POS` 与 `_WINDOW_EXEC_CAPTION`(2026-10-23,P3)
+
+- `_WINDOW_INIT_POS`:int getter `0x4276f3` ← `[0x80133c]`;写点
+  `0x460b74/0x460b87` 在 `FUN_00460924` 里,源是 `yscfg.dat` 第 10 个 int
+  (`FUN_00469df2` 打开 `\yscfg.dat` 后按 0x20 个 int 读入)。该文件属于
+  「エンジン設定.exe」,不在 `data.ypf`。⇒ `BootConfig::window_init_pos`
+  宿主注入;ERIS 工程值为 0。
+- `_WINDOW_EXEC_CAPTION`:手册仍无页;语料语义 = 一次性「窗口尺寸再初始化」
+  标志。内核 `Vm::request_window_caption()` 置 1,脚本读后写回 0;
+  触发条件(`WM_SYSCOMMAND` 路径 `*ecx` 来源)未取证 ⇒ VM 不自行置位。
+- **复核**:`fixture::window_init_pos_is_host_injected`、
+  `window_exec_caption_is_a_host_setter_round_trip`。
+
+## DIV-RT-048 · `_TEXT_NUM`(2026-10-23,P3)
+
+- **REA**:int getter `0x4276e3` 读 `[0x80174c]`;该全局在装载
+  `ysbin/yst.ybn` 时由记录 `+0xc` 写入(`0x45d73f`,同一路径写
+  `[0x801728] = count+1`)。
+- **实测**:ERIS `yst.ybn` 头部 = `YSTD, v495, count=4600, text_total=396`;
+  `yst_list` 141 条逐脚本 `text_count` 求和同为 **396**。
+- **处置**:内核用 `yst_list` 求和(`Vm::text_total()`),不新增必需表
+  `yst.ybn`;两者在其它工程若分歧,以 `yst.ybn` 为准的接入留待
+  `yu-format` 提供 YSTD 解码后再改。
+- **复核**:`corpus::text_num_matches_yst_header_total`。

@@ -24,6 +24,7 @@ const ui = {
   executed: document.getElementById('executed'),
   ms: document.getElementById('ms'),
   present: document.getElementById('present'),
+  diag: document.getElementById('diag'),
   engine: document.getElementById('engine'),
   viewport: document.getElementById('viewport'),
   entry: document.getElementById('entry'),
@@ -59,6 +60,9 @@ let status = null;
 let paused = false;
 let latest = { width: 0, height: 0 };
 let lastOverlay = 0;
+// 逻辑帧不推进的连续帧数(宿主侧“为什么卡”的 web 等价物)。
+let frameStall = 0;
+let lastSeenFrame = null;
 // boot() 在模块求值早期就被调用(?log=1 时同步走 setLogVisible/restoreLogLayout),
 // 这两个必须先于 boot() 声明,否则撞 let/const 的 TDZ。
 const LOG_LAYOUT_KEY = 'yu-log-layout';
@@ -428,6 +432,12 @@ function handleBinary(buffer) {
   if (FRAME_HEADER + rgbaLength > buffer.byteLength) return;
   const rgba = new Uint8Array(buffer, FRAME_HEADER, rgbaLength);
 
+  if (lastSeenFrame === frame) {
+    frameStall += 1;
+  } else {
+    frameStall = 0;
+    lastSeenFrame = frame;
+  }
   latest = { width, height, frame, ops, skipped, executed, passes, layers, visible, ms };
   latest.drawable = (flags & 1) !== 0;
   latest.engineBackend = backend === 1 ? 'wgpu' : 'soft';
@@ -477,12 +487,25 @@ function updateOverlay(force) {
     ui.viewport.textContent = `${latest.width}×${latest.height}`;
   }
   ui.present.textContent = lastPresent;
+  if (ui.diag) ui.diag.textContent = diagHint();
   if (status) {
     ui.engine.textContent = status.backend ?? '–';
     ui.entry.textContent = status.entry ?? '–';
     ui.marker.textContent = status.marker ?? '–';
     ui.statusLine.textContent = `${status.backend} · ${status.fps} fps · ${status.dataset?.kind ?? '?'} · built ${status.marker ?? '?'}`;
   }
+}
+
+// 只消费**现有** WS 帧字段(drawable/skipped/frame):演示页不复制诊断语义。
+// 引擎 Diag 挂号表、每帧 Unimplemented top-N 与宿主 panic 横幅需要
+// serve 侧新增通道(H-P1-03 `--diag-ws`,归 P4);在那之前这里只回答
+// “这一帧看起来卡在哪”,不猜原因。
+function diagHint() {
+  if (latest.frame === undefined) return '–';
+  if (latest.drawable === false) return '无可绘制输出(drawable=false)';
+  if (latest.skipped > 0) return `${latest.skipped} ops skipped · 见 Log → Report`;
+  if (frameStall >= 120) return `画面 ${frameStall} 帧未变化(可能等待输入)`;
+  return 'ok';
 }
 
 function applyStatus(text) {

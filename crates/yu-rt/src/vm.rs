@@ -25,6 +25,7 @@
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::time::Instant;
 
 use yu_log::{Boundary, Diag, LogSink, MemorySink};
 
@@ -34,8 +35,11 @@ use crate::event::VmEvent;
 use crate::expr::{Evaluator, LValue, VarAccess};
 use crate::input::{InputBinding, InputState, InputTimeline};
 use crate::tables::{TableSet, WindowRec};
-use crate::task::{ChainReport, Effect, Scheduler, StepOutcome, TaskExecutor, TaskNode, TaskSeed, TaskView, MAIN_TASK_ID};
-use crate::value::{Value, VarRef, VarSpace, VariableStore};
+use crate::task::{
+    ChainReport, Effect, Scheduler, StepOutcome, TaskExecutor, TaskNode, TaskSeed, TaskView,
+    MAIN_TASK_ID,
+};
+use crate::value::{ElemType, Value, VarRef, VarSpace, VariableStore};
 
 pub(crate) mod handlers;
 pub use handlers::HandlerKind;
@@ -44,6 +48,18 @@ pub use handlers::HandlerKind;
 /// 同时保证长跑有界;需要完整全量事件流的调用方用 [`Vm::take_events`]/
 /// [`Vm::drain_events`] 在帧间取走。
 pub const DEFAULT_EVENT_CAPACITY: usize = 1 << 20;
+
+/// `VARACT[INIT]` 掩码组合数:3 个类型族 × 4 位(`G_*1..4`)= 2^12。
+/// 键 = `masks[0] | masks[1]<<4 | masks[2]<<8`。
+const GLOBAL_RESTORE_KEYS: usize = 1 << 12;
+
+/// 表达式窗口解码缓存上限(工程护栏,不是引擎常量):脚本窗口种类有限,
+/// 超过即整体清空重建,避免长跑无界增长。
+const DECODE_CACHE_CAP: usize = 200_000;
+/// 命令缓存按脚本号/pc 直接下标;超出这些上限的畸形输入不走缓存,
+/// 交给 `fill_cmd` 的边界检查报错(避免巨型 `Vec` 分配)。
+const CMD_CACHE_SCRIPT_MAX: usize = 1 << 16;
+const CMD_CACHE_PC_MAX: usize = 1 << 20;
 
 /// 启动配置。
 #[derive(Clone, Debug)]
@@ -82,6 +98,15 @@ pub struct BootConfig {
     /// —— 非零时走 DirectX 缓冲图层分支。这是**宿主显示能力**,由平台层注入
     /// (wasm 后端应给 0;win 后端按实际 DX 模式给值)。见 DIV-RT-007。
     pub dx_mode: u32,
+    /// `@_WINDOW_INIT_POS`(工程 `yscfg.dat` 第 10 个 int;REA `0x460b74` 写
+    /// `[0x80133c]`,int getter `0x4276f3` 读)。
+    ///
+    /// `yscfg.dat` 是「エンジン設定.exe」的外部设置文件,不属于 `data.ypf`;
+    /// 内核不读它 ⇒ 由宿主注入(缺省 0,与 ERIS 工程一致)。DIV-RT-047。
+    pub window_init_pos: i64,
+    /// `MATH[RND]` 的 MT19937 种子(引擎用 `GetTickCount`,非确定)。
+    /// 缺省 5489 = MT19937 参考种子,保证同输入同输出(DIV-RT-014)。
+    pub rng_seed: u32,
     /// 事件流记录开关(默认开;golden/测试/对拍依赖完整事件流)。嵌入宿主
     /// 跑真实游戏时可关:`Command` 事件的窗口预求值是分派热路径的最大开销
     /// (每个窗口求值两遍)。关闭时 `Diag` 事件与挂号计数照常产出。
@@ -113,6 +138,8 @@ impl Default for BootConfig {
             media_readonly: false,
             os_sound: true,
             dx_mode: 0,
+            window_init_pos: 0,
+            rng_seed: 5489,
             // 事件流记录开关(默认开;结构体字段文档有完整说明)。
             record_events: true,
         }
@@ -233,6 +260,7 @@ impl ExecState {
 }
 
 /// 一条命令的视图(已从脚本里取出,避免执行期借用脚本)。
+#[derive(Default)]
 pub struct Cmd {
     pub opcode: u8,
     pub name: String,
@@ -240,21 +268,15 @@ pub struct Cmd {
     pub windows: Vec<CmdWindow>,
 }
 
-impl Default for Cmd {
-    fn default() -> Self {
-        Self {
-            opcode: 0,
-            name: String::new(),
-            pc: 0,
-            windows: Vec::new(),
-        }
-    }
-}
-
 /// 一个窗口 + 其载荷。
 pub struct CmdWindow {
     pub rec: WindowRec,
     pub payload: Vec<u8>,
+    /// 填充命令时预解码的表达式(脚本字节不变;`None` = 非表达式/解码失败,
+    /// 运行时回退到 `decode_cache` 并保留原诊断)。
+    pub instrs: Option<Rc<[crate::expr::RawInstr]>>,
+    /// 单条字面量窗口的常量值(常量折叠;`None` = 需要正常求值)。
+    pub const_value: Option<Value>,
 }
 
 impl CmdWindow {
@@ -271,7 +293,7 @@ pub struct Vm {
     tables: TableSet,
     scheduler: Scheduler,
     store: VariableStore,
-    exec: BTreeMap<String, ExecState>,
+    exec: rustc_hash::FxHashMap<String, ExecState>,
     input: InputState,
     binding: InputBinding,
     /// 图形域同步宿主(可选;安装后负责 INFO 查询与状态同步)。
@@ -297,12 +319,18 @@ pub struct Vm {
     media_readonly: bool,
     os_sound: bool,
     dx_mode: u32,
+    window_init_pos: i64,
+    /// `MATH[RND]` 的 MT19937(DIV-RT-014)。
+    rng: crate::rng::Mt19937,
     record_events: bool,
     /// opcode → 处理器类别表(启动期按工程 yscm 名字解析)。
     handler_of: Vec<crate::vm::handlers::HandlerKind>,
     /// 命令视图缓存:键 = `(script_id, pc)`。脚本装载后命令字节不变,
     /// 每条命令的窗口载荷只在首次执行时复制一次(Tyn 同思路优化)。
-    cmd_cache: rustc_hash::FxHashMap<(u32, u32), Rc<Cmd>>,
+    /// 命令视图缓存:按脚本号 → pc 直接下标(脚本号/pc 都是稠密的)。
+    /// 脚本装载后命令字节不变,窗口载荷只复制一次;之后每次执行只做一次
+    /// `Rc` 克隆。旧实现用 `FxHashMap<(u32,u32)>` 每命令一次哈希。
+    cmd_cache: Vec<Vec<Option<Rc<Cmd>>>>,
     /// 表达式求值复用栈(热路径零分配)。
     eval_scratch: Vec<crate::expr::Slot>,
     /// 命令窗口解码缓存(键 = FNV-1a(payload);碰撞用原始字节二次比较)。
@@ -322,11 +350,60 @@ pub struct Vm {
     /// 押下状態 0/1;○ 可赋值)。宿主窗口事件可经 setter 推入。
     window_exec_max: i64,
     window_exec_close: i64,
+    /// `@_WINDOW_EXEC_CAPTION`:窗口尺寸再初始化的一次性宿主事件标志
+    /// (DIV-RT-007 的宿主 setter 形态;P3 收口)。
+    window_exec_caption: i64,
     executed: u64,
     /// 每条命令(opcode)的执行次数。**不受 `record_events` 影响**:
     /// 覆盖普查要在关闭事件流的热路径上拿到逐命令频度(任务书 M-1)。
     /// 下标 = 工程 `ysc.ybn` 的命令序号;长度在启动期固定。
     command_hits: Vec<u64>,
+    /// 逐命令耗时采样开关(`Vm::set_command_profile`;默认关)。
+    /// 开启后每条命令两次 `Instant` 采样,只用于定位启动/场景切换卡顿,
+    /// 不进正常路径。
+    prof_commands: bool,
+    /// 采样窗口内每条 opcode 的累计纳秒(`prof_commands` 为 false 时不写)。
+    prof_ns: Vec<u64>,
+    /// 采样窗口内每条 opcode 的命中数(与 `prof_ns` 同窗口)。
+    prof_hits: Vec<u64>,
+    /// `VARACT[INIT=1 G_*]` 的全局槽镜像(启动期从 ysv 一次性投影)。
+    ///
+    /// 启动脚本对同一组掩码调用数万次;原实现每次都 clone 全部 ysv 记录、
+    /// 重新解码字符串初值再重建槽位(首帧 1.5s 的 82% 在 VARACT)。
+    globals_restore: Vec<GlobalRestore>,
+    /// 每个掩码组合最近一次恢复后的 `VariableStore::generation()`。
+    /// 与当前代号相同 ⇒ 期间没有任何写入,重复恢复可直接跳过。
+    last_global_restore: Vec<Option<u64>>,
+    /// `VARACT` 分支计数(`--profile-frames` 取证;正常路径只是 6 个 u64)。
+    varact_calls: u64,
+    varact_init_calls: u64,
+    varact_type_calls: u64,
+    restore_skips: u64,
+    restore_rows: u64,
+    /// 采样窗口内 `VARACT` 的调用点 `(script_id, pc) -> hits`。
+    prof_varact_sites: BTreeMap<(u32, u32), u64>,
+    /// 采样窗口内所有命令的调用点 `(opcode, script_id, pc) -> hits`。
+    /// 只在 `prof_commands` 为真时写;用于回答“这 50 万条 LET 来自哪”。
+    prof_sites: rustc_hash::FxHashMap<(u8, u32, u32), u64>,
+    /// `VARACT` 字符串子操作计数:[COPY, CUT, UPPER, UPPER2, LOWER, LOWER2,
+    /// HANTOZEN, ZENTOHAN]。
+    varact_ops: [u64; 8],
+    /// 字符串子操作处理的源字节总数(判断是否大字符串拷贝)。
+    varact_bytes: u64,
+    /// 官方默认槽(`0x459e90`)命中次数:每次执行都计入;事件/诊断只发一次
+    /// (官方全局 `[0x5e4f84]` 抑制重复错误框;DIV-RT-043)。
+    script_slot_hits: u64,
+    /// 默认槽错误是否已上报(对应引擎全局错误标志 `[0x5e4f84]`)。
+    script_error_reported: bool,
+    /// 待回答的 DIALOG(官方模态,理论上至多一条;内核允许排队,
+    /// 仍按 id 顺序回答)。见 [`crate::dialog`]。
+    dialogs: Vec<crate::dialog::DialogRequest>,
+    next_dialog_id: u64,
+    /// 剪贴板文本镜像(CP932 原始字节)。`CLIPACT` 写、`CLIPINFO` 读;
+    /// 宿主可经 [`Vm::set_clipboard`] 注入外部剪贴板内容。
+    clipboard: Vec<u8>,
+    /// `ERROR` 的逐命令启用表(引擎 `0x689b00`;默认全 1,REA `0x462124`)。
+    command_enable: Vec<u8>,
     unimplemented_cmds: BTreeMap<String, u64>,
     unimplemented_reported: std::collections::BTreeSet<String>,
     /// 事件队列容量上限(任务书 E R10:长跑不得无界增长)。
@@ -335,11 +412,14 @@ pub struct Vm {
     events_dropped: u64,
     /// 当前正在执行的命令位置(诊断定位用;任务书 E R11)。
     /// `report()` 在 `Diag.where_ == Loc::None` 时补进 `Loc::Script`。
-    /// 用可复用 String(而非 `Option<String>`)避免每条命令分配。
+    /// 命令名不逐条拷贝:保留 `Rc<Cmd>`(取指缓存本来就有这个 Rc),
+    /// 只有真正构造 Diag 时才取 `name`。
     cur_script: u32,
     cur_pc: u32,
-    cur_cmd: String,
+    cur_cmd: Option<Rc<Cmd>>,
     cur_task: String,
+    /// `cur_task` 对应的调度器序号(序号不变就不重写字符串)。
+    cur_task_seq: u64,
     /// 本步可见的任务链投影(`TASKINFO` 的数据源;泵期间调度器被借出)。
     task_view: Vec<TaskView>,
     /// 资产像素尺寸缓存(键 = `CG[FILE]`;`None` = 探测失败也缓存)。
@@ -350,6 +430,19 @@ pub struct Vm {
 struct DecodedWindow {
     payload: Vec<u8>,
     instrs: Rc<[crate::expr::RawInstr]>,
+}
+
+/// `VARACT[INIT]` 可恢复的全局变量(启动期投影;ysv 记录不变)。
+#[derive(Clone, Debug)]
+struct GlobalRestore {
+    var: VarRef,
+    ty: ElemType,
+    dims: Vec<usize>,
+    init: Value,
+    /// 恢复组号 1..4(`G_INT..G_INT4`);其他组没有否决项。
+    group: u8,
+    /// 类型族 0=INT / 1=FLT / 2=STR(对应 ysv `value_type` 1/2/3)。
+    family: usize,
 }
 
 fn window_hash(bytes: &[u8]) -> u64 {
@@ -400,10 +493,7 @@ impl Vm {
                 diag::fatal(
                     code::rt::LABEL,
                     Boundary::Script,
-                    format!(
-                        "入口标签 `{}` 不在工程 ysl.ybn(拒绝启动)",
-                        cfg.entry_label
-                    ),
+                    format!("入口标签 `{}` 不在工程 ysl.ybn(拒绝启动)", cfg.entry_label),
                 )
                 .at_table("ysl.ybn")
             })?
@@ -431,6 +521,7 @@ impl Vm {
         let binding = InputBinding::from_sysvars(&tables.boot.sysvars);
         // 逐命令命中计数按工程 yscm 的命令数开表(下标 = opcode)。
         let command_hits = vec![0u64; handler_of.len()];
+        let handler_len = command_hits.len();
 
         let mut vm = Vm {
             src,
@@ -438,7 +529,7 @@ impl Vm {
             tables,
             scheduler: Scheduler::new(),
             store: VariableStore::new(),
-            exec: BTreeMap::new(),
+            exec: rustc_hash::FxHashMap::default(),
             input: InputState::new(),
             binding,
             graphics_host: None,
@@ -462,9 +553,11 @@ impl Vm {
             media_readonly: cfg.media_readonly,
             os_sound: cfg.os_sound,
             dx_mode: cfg.dx_mode,
+            window_init_pos: cfg.window_init_pos,
+            rng: crate::rng::Mt19937::new(cfg.rng_seed),
             record_events: cfg.record_events,
             handler_of,
-            cmd_cache: rustc_hash::FxHashMap::default(),
+            cmd_cache: Vec::new(),
             eval_scratch: Vec::new(),
             decode_cache: rustc_hash::FxHashMap::default(),
             decode_cache_entries: 0,
@@ -474,20 +567,43 @@ impl Vm {
             menu_code: 0,
             window_exec_max: 0,
             window_exec_close: 0,
+            window_exec_caption: 0,
             executed: 0,
             command_hits,
+            prof_commands: false,
+            prof_ns: vec![0u64; handler_len],
+            prof_hits: vec![0u64; handler_len],
+            globals_restore: Vec::new(),
+            last_global_restore: vec![None; GLOBAL_RESTORE_KEYS],
+            varact_calls: 0,
+            varact_init_calls: 0,
+            varact_type_calls: 0,
+            restore_skips: 0,
+            restore_rows: 0,
+            prof_varact_sites: BTreeMap::new(),
+            prof_sites: rustc_hash::FxHashMap::default(),
+            varact_ops: [0; 8],
+            varact_bytes: 0,
+            script_slot_hits: 0,
+            script_error_reported: false,
+            dialogs: Vec::new(),
+            next_dialog_id: 1,
+            clipboard: Vec::new(),
+            command_enable: vec![1u8; 128],
             unimplemented_cmds: BTreeMap::new(),
             unimplemented_reported: std::collections::BTreeSet::new(),
             event_capacity: DEFAULT_EVENT_CAPACITY,
             events_dropped: 0,
             cur_script: script_id,
             cur_pc: pc,
-            cur_cmd: String::new(),
+            cur_cmd: None,
             cur_task: MAIN_TASK_ID.to_string(),
+            cur_task_seq: u64::MAX,
             task_view: Vec::new(),
             asset_size_cache: BTreeMap::new(),
         };
         vm.apply_global_initial_values();
+        vm.globals_restore = vm.build_globals_restore();
         vm.apply_script_locals(script_id);
 
         vm.exec
@@ -546,9 +662,46 @@ impl Vm {
             }
             let dims: Vec<usize> = r.dims.iter().map(|&d| d as usize).collect();
             let init = r.init_value().unwrap_or_else(|| ty.default_value());
-            self.store
-                .declare(VarRef::new(VarSpace::for_elem(ty), r.var_id), ty, &dims, &init);
+            self.store.declare(
+                VarRef::new(VarSpace::for_elem(ty), r.var_id),
+                ty,
+                &dims,
+                &init,
+            );
         }
+    }
+
+    /// 启动期投影 `VARACT[INIT]` 需要的全局记录(ysv 在本进程内不变)。
+    ///
+    /// 过滤条件与 `restore_globals` 的可观察条件一致:`kind == 1`、
+    /// 非系统变量镜像、类型可解析。初值在这里解码一次,之后每次恢复
+    /// 只按 `ty/dims/init` 重置槽位。
+    fn build_globals_restore(&self) -> Vec<GlobalRestore> {
+        let sys_count = self.sys_count;
+        self.tables
+            .boot
+            .vars
+            .records
+            .iter()
+            .filter(|r| r.kind == 1 && r.var_id >= sys_count)
+            .filter_map(|r| {
+                let ty = r.elem_type()?;
+                let init = r.init_value().unwrap_or_else(|| ty.default_value());
+                let family = match r.value_type {
+                    2 => 1,
+                    3 => 2,
+                    _ => 0,
+                };
+                Some(GlobalRestore {
+                    var: VarRef::new(VarSpace::for_elem(ty), r.var_id),
+                    ty,
+                    dims: r.dims.iter().map(|&d| d as usize).collect(),
+                    init,
+                    group: r.group,
+                    family,
+                })
+            })
+            .collect()
     }
 
     fn apply_script_locals(&mut self, script_id: u32) {
@@ -648,6 +801,11 @@ impl Vm {
         self.diags.take()
     }
 
+    /// 丢弃当前诊断但保留缓冲容量(服务端无 `/diag` 订阅者时用)。
+    pub fn clear_diags(&mut self) {
+        self.diags.clear();
+    }
+
     pub fn script_errors(&self) -> &[String] {
         &self.script_errors
     }
@@ -741,6 +899,32 @@ impl Vm {
         self.dx_mode
     }
 
+    /// `@_WINDOW_INIT_POS`(宿主从 `yscfg.dat` 第 10 项注入;DIV-RT-047)。
+    pub fn window_init_pos(&self) -> i64 {
+        self.window_init_pos
+    }
+
+    /// `@_TEXT_NUM`:工程文本总数。
+    ///
+    /// 引擎在装载 `ysbin/yst.ybn` 时把其头部的 text_total 写进 `[0x80174c]`
+    /// (REA `0x45d73f`),getter `0x4276e3` 直接读它。内核不装载 `yst.ybn`,
+    /// 改用 `yst_list` 逐脚本 `text_count` 求和 —— ERIS 0.495 实测两者都是
+    /// **396**(见 DIV-RT-048)。两者若在其它工程分歧,以引擎口径为准的
+    /// `yst.ybn` 头部尚未接入,按已知偏差记录。
+    pub fn text_total(&self) -> i64 {
+        // 缺产物的脚本用 `u32::MAX` 哨兵(DIV-RT-016):不计入总数。
+        let total: u64 = self
+            .tables
+            .boot
+            .scripts
+            .entries
+            .iter()
+            .map(|e| u64::from(e.text_count))
+            .filter(|n| *n != u64::from(u32::MAX))
+            .sum();
+        total.min(i64::MAX as u64) as i64
+    }
+
     pub fn engine_version(&self) -> u32 {
         self.tables.boot.yscm.version
     }
@@ -753,16 +937,44 @@ impl Vm {
     /// 表来源描述(进 golden 头/trace,可审计)。
     pub fn table_provenance(&self) -> Vec<String> {
         let mut out = vec![
-            format!("ysc: v{} ({} 命令)", self.tables.boot.yscm.version, self.tables.boot.yscm.len()),
-            format!("ysl: v{} ({} 标签)", self.tables.boot.labels.version, self.tables.boot.labels.len()),
-            format!("ysv: v{} ({} 记录)", self.tables.boot.vars.version, self.tables.boot.vars.records.len()),
-            format!("yst_list: v{} ({} 条)", self.tables.boot.scripts.version, self.tables.boot.scripts.len()),
-            format!("yscfg: v{} ({}x{})", self.tables.boot.config.version,
-                self.tables.boot.config.width, self.tables.boot.config.height),
-            format!("sysvars: {} 项 <- {}", self.tables.boot.sysvars.len(), self.tables.boot.sysvars.source.describe()),
+            format!(
+                "ysc: v{} ({} 命令)",
+                self.tables.boot.yscm.version,
+                self.tables.boot.yscm.len()
+            ),
+            format!(
+                "ysl: v{} ({} 标签)",
+                self.tables.boot.labels.version,
+                self.tables.boot.labels.len()
+            ),
+            format!(
+                "ysv: v{} ({} 记录)",
+                self.tables.boot.vars.version,
+                self.tables.boot.vars.records.len()
+            ),
+            format!(
+                "yst_list: v{} ({} 条)",
+                self.tables.boot.scripts.version,
+                self.tables.boot.scripts.len()
+            ),
+            format!(
+                "yscfg: v{} ({}x{})",
+                self.tables.boot.config.version,
+                self.tables.boot.config.width,
+                self.tables.boot.config.height
+            ),
+            format!(
+                "sysvars: {} 项 <- {}",
+                self.tables.boot.sysvars.len(),
+                self.tables.boot.sysvars.source.describe()
+            ),
         ];
         if let Some(ycd) = &self.tables.boot.ycd {
-            out.push(format!("ycd: v{} ({} 命令)", ycd.version, ycd.commands.len()));
+            out.push(format!(
+                "ycd: v{} ({} 命令)",
+                ycd.version,
+                ycd.commands.len()
+            ));
         } else {
             out.push("ycd: 不存在(商业发行版;系统变量改用引擎 ABI 表 + ysv 校验)".to_string());
         }
@@ -813,6 +1025,15 @@ impl Vm {
         self.text.bytes = bytes;
     }
 
+    /// 替换 `$_TEXT_FLAG` 控制字节流。
+    ///
+    /// REA `0x446b98..0x446bb5`(id 0x7b):把 RHS 字符串**逐字节拷进**
+    /// `[state+0x3c]` 已有的标志缓冲;不改文本缓冲(`+0x38`)、不重建文本、
+    /// 不按字符重算标志。P3 收口 DIV-RT-032 的写入路径。
+    pub(crate) fn set_text_flags(&mut self, bytes: Vec<u8>) {
+        self.text.flags = bytes;
+    }
+
     /// `@_MENUCODE` 读取(菜单域宿主选中项后应经 [`Vm::set_menu_code`] 推入)。
     pub(crate) fn menu_code(&self) -> i64 {
         self.menu_code
@@ -827,6 +1048,7 @@ impl Vm {
     pub(crate) fn window_exec(&self, which: &str) -> i64 {
         match which {
             "MAX" => self.window_exec_max,
+            "CAPTION" => self.window_exec_caption,
             _ => self.window_exec_close,
         }
     }
@@ -834,6 +1056,7 @@ impl Vm {
     pub(crate) fn set_window_exec(&mut self, which: &str, v: i64) {
         match which {
             "MAX" => self.window_exec_max = v,
+            "CAPTION" => self.window_exec_caption = v,
             _ => self.window_exec_close = v,
         }
     }
@@ -849,6 +1072,113 @@ impl Vm {
     /// 宿主要求的最大化状态(与 `request_window_close` 同型)。
     pub fn request_window_maximize(&mut self) {
         self.window_exec_max = 1;
+    }
+
+    /// 宿主窗口的「尺寸再初始化」事件(手册无页;DIV-RT-007)。
+    ///
+    /// 语料语义(`es_Scenario.yst`):`@_WINDOW_EXEC_CAPTION == 1` ⇒ 脚本
+    /// 写回 0 并按新尺寸重建窗口。内核只持有这个一次性标志;触发条件
+    /// (`WM_SYSCOMMAND` 路径里 `*ecx` 的来源)未取证,因此**只能由宿主**
+    /// 在它认为需要重建窗口时调用本 setter,VM 不猜。
+    pub fn request_window_caption(&mut self) {
+        self.window_exec_caption = 1;
+    }
+
+    // ---------------------------------------------------------- DIALOG
+
+    /// 当前待回答的 DIALOG(按发起顺序)。宿主应逐个呈现并调用
+    /// [`Vm::answer_dialog`];官方 MessageBox 是模态的,正常至多一条。
+    pub fn pending_dialogs(&self) -> &[crate::dialog::DialogRequest] {
+        &self.dialogs
+    }
+
+    /// 某任务当前挂起的 DIALOG id。
+    pub fn dialog_of_task(&self, task: &str) -> Option<u64> {
+        self.dialogs.iter().find(|d| d.task == task).map(|d| d.id)
+    }
+
+    // ---------------------------------------------------------- 剪贴板
+
+    /// 内核侧剪贴板文本镜像(CP932 原始字节;`CLIPACT` 写、`CLIPINFO` 读)。
+    pub fn clipboard(&self) -> &[u8] {
+        &self.clipboard
+    }
+
+    /// 宿主注入外部剪贴板内容(OS 剪贴板是宿主状态;内核只保存镜像)。
+    pub fn set_clipboard(&mut self, bytes: Vec<u8>) {
+        self.clipboard = bytes;
+    }
+
+    /// `ERROR` 设置的逐命令启用表(引擎 `0x689b00`;默认全 1)。
+    ///
+    /// **未取证**:该表在引擎里的消费者未定位(REA 只找到初始化
+    /// `0x462124`),因此内核只保存它、不据此改变分派(DIV-RT-046)。
+    pub fn command_enable(&self) -> &[u8] {
+        &self.command_enable
+    }
+
+    /// 回答一条 DIALOG。
+    ///
+    /// - `button`:1 基按钮序号(OK/Yes/No/Cancel 的位置,见
+    ///   [`crate::dialog::DialogButtons`]);写回 `LET`。
+    /// - `text`:`INPUT=1` 时的输入文本(CP932 原始字节),写回 `LETSTR`;
+    ///   非 INPUT 模式忽略。
+    ///
+    /// 官方是同步模态(宿主线程被 MessageBox 阻塞);内核改为任务挂起 +
+    /// 本方法回答,回答后任务在下一个逻辑帧从 `DIALOG` 的下一条继续
+    /// (pc 在分派前已前进,与引擎一致)。
+    pub fn answer_dialog(
+        &mut self,
+        id: u64,
+        button: u8,
+        text: Option<&[u8]>,
+    ) -> Result<(), yu_log::Diag> {
+        let Some(pos) = self.dialogs.iter().position(|d| d.id == id) else {
+            return Err(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                format!("DIALOG#{id} 不存在或已回答"),
+            ));
+        };
+        let request = &self.dialogs[pos];
+        if !request.accepts_button(button) {
+            return Err(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                format!(
+                    "DIALOG#{id} 按钮序号 {button} 越界({} 的合法范围 1..={})",
+                    request.buttons.as_str(),
+                    request.buttons.count()
+                ),
+            ));
+        }
+        if request.requires_text() && text.is_none() {
+            return Err(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                format!("DIALOG#{id} 是文本输入框,回答必须带文本(空串用 Some(b\"\"))"),
+            ));
+        }
+        let request = self.dialogs.remove(pos);
+        // LET = 左起第几个按钮(REA 0x440056/0x4400ea/0x44017e/0x440212/0x4402a6)。
+        if let Some(target) = &request.let_target {
+            let var = self.canonical_var(target.var);
+            self.store
+                .write(var, &target.indices, &Value::Int(i64::from(button)))
+                .map_err(|d| self.locate(d))?;
+        }
+        // LETSTR = 输入框文本(仅 INPUT 模式;REA 0x440001 → 0x43f0d8)。
+        if request.input {
+            if let (Some(target), Some(bytes)) = (&request.letstr_target, text) {
+                let var = self.canonical_var(target.var);
+                self.store
+                    .write(var, &target.indices, &Value::Str(bytes.to_vec()))
+                    .map_err(|d| self.locate(d))?;
+            }
+        }
+        // 唤醒发起任务(下一个逻辑帧继续 DIALOG 之后的指令):请求已从
+        // `dialogs` 移除,调度器的 `dialog_pending` 查询自然变为 false。
+        Ok(())
     }
 
     /// 脚本可见的输入设置(宿主用于光标显示/形状)。
@@ -871,6 +1201,29 @@ impl Vm {
         &self.command_hits
     }
 
+    /// 官方默认槽(`0x459e90`,脚本执行错误)的命中次数。
+    ///
+    /// 每次执行都计数;事件流里的 `rt.script.error` 诊断只出现一次
+    /// (对应引擎全局错误标志 `[0x5e4f84]` 的「只弹一次」语义;DIV-RT-043)。
+    pub fn script_slot_hits(&self) -> u64 {
+        self.script_slot_hits
+    }
+
+    /// 默认槽错误是否已上报(诊断/普查用)。
+    pub fn script_error_reported(&self) -> bool {
+        self.script_error_reported
+    }
+
+    /// 记录一次默认槽命中(处理器内部使用)。
+    pub(crate) fn note_script_slot(&mut self) {
+        self.script_slot_hits = self.script_slot_hits.saturating_add(1);
+    }
+
+    /// 标记默认槽错误已上报(对应引擎 `[0x5e4f84] = 1`)。
+    pub(crate) fn mark_script_error_reported(&mut self) {
+        self.script_error_reported = true;
+    }
+
     /// 按执行次数排序的命令名(启动/卡顿诊断用)。
     pub fn top_commands(&self, limit: usize) -> Vec<(String, u64)> {
         let mut out: Vec<(String, u64)> = self
@@ -887,7 +1240,7 @@ impl Vm {
                 (name, *hits)
             })
             .collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out.sort_by_key(|x| std::cmp::Reverse(x.1));
         out.truncate(limit);
         out
     }
@@ -896,6 +1249,89 @@ impl Vm {
     /// 用它区分「已实现 / 域事件 / 无处理器」,不靠名字猜测)。
     pub fn handler_kind(&self, opcode: u8) -> Option<HandlerKind> {
         self.handler_of.get(opcode as usize).copied()
+    }
+
+    /// `VARACT` 取证计数:[调用, INIT, TYPE, 其他, 恢复跳过, 恢复行数]。
+    pub fn varact_stats(&self) -> [u64; 6] {
+        let other = self
+            .varact_calls
+            .saturating_sub(self.varact_init_calls)
+            .saturating_sub(self.varact_type_calls);
+        [
+            self.varact_calls,
+            self.varact_init_calls,
+            self.varact_type_calls,
+            other,
+            self.restore_skips,
+            self.restore_rows,
+        ]
+    }
+
+    /// 取走采样窗口内 `VARACT` 的调用点(按次数降序),并清零。
+    pub fn take_varact_sites(&mut self, limit: usize) -> Vec<((u32, u32), u64)> {
+        let mut out: Vec<((u32, u32), u64)> = self
+            .prof_varact_sites
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out.truncate(limit);
+        self.prof_varact_sites.clear();
+        out
+    }
+
+    /// `VARACT` 字符串子操作计数与源字节总量(诊断用)。
+    pub fn varact_op_stats(&self) -> ([u64; 8], u64) {
+        (self.varact_ops, self.varact_bytes)
+    }
+
+    /// 开关逐命令耗时采样(默认关;只给启动/场景切换卡顿定位用)。
+    pub fn set_command_profile(&mut self, on: bool) {
+        self.prof_commands = on;
+    }
+
+    /// 取走采样窗口内的命令耗时,按累计纳秒降序。
+    ///
+    /// 返回 `(rows, total_ns)`;`rows` 每项 `(命令名, 命中数, 累计纳秒)`。
+    /// 取走后窗口清零(下一次调用只反映新窗口)。
+    /// 清空采样窗口(宿主每帧调用,使 `--profile-frames` 的读数是
+    /// **单帧**而不是“自上次打印以来”的累计)。
+    pub fn reset_command_profile(&mut self) {
+        self.prof_ns.fill(0);
+        self.prof_hits.fill(0);
+        self.prof_varact_sites.clear();
+        self.prof_sites.clear();
+        self.varact_calls = 0;
+        self.varact_init_calls = 0;
+        self.varact_type_calls = 0;
+        self.restore_skips = 0;
+        self.restore_rows = 0;
+        self.varact_ops = [0; 8];
+        self.varact_bytes = 0;
+    }
+
+    pub fn take_command_profile(&mut self, limit: usize) -> (Vec<(String, u64, u64)>, u64) {
+        let total_ns = self.prof_ns.iter().copied().fold(0u64, u64::saturating_add);
+        let mut rows: Vec<(String, u64, u64)> = self
+            .prof_ns
+            .iter()
+            .enumerate()
+            .filter(|(_, ns)| **ns > 0)
+            .map(|(index, ns)| {
+                let name = u8::try_from(index)
+                    .ok()
+                    .and_then(|index| self.tables.boot.yscm.command(index))
+                    .map(|decl| decl.name.clone())
+                    .unwrap_or_else(|| format!("#{index}"));
+                let hits = self.prof_hits.get(index).copied().unwrap_or(0);
+                (name, hits, *ns)
+            })
+            .collect();
+        rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        rows.truncate(limit);
+        self.prof_ns.fill(0);
+        self.prof_hits.fill(0);
+        (rows, total_ns)
     }
 
     // ---------------------------------------------------------- 帧推进
@@ -912,9 +1348,16 @@ impl Vm {
         let mut sched = std::mem::take(&mut self.scheduler);
         let report = sched.tick_frame(self, now);
         self.scheduler = sched;
-        let step = if self.fps > 0 { 1000 / self.fps } else { self.frame_ms };
+        let step = 1000u32.checked_div(self.fps).unwrap_or(self.frame_ms);
         self.now_ms = self.now_ms.wrapping_add(step);
         report
+    }
+
+    /// 每个任务每次泵的命令上限(宿主 `--pump-cap`;`None` = 无限泵)。
+    /// 只影响调度让出点,不改变任何命令语义;但会改变脚本的帧原子性
+    /// (DIV-HOST-002)。
+    pub fn set_pump_cap(&mut self, cap: Option<usize>) {
+        self.scheduler.set_pump_cap(cap);
     }
 
     /// 时钟严格固定的单帧(对拍/测试)。
@@ -935,6 +1378,26 @@ impl Vm {
 
     /// 事件入队。事件流是**有界**的(任务书 E R10):超过容量时丢最旧事件并
     /// 记账,长跑不会无界增长。容量可通过 [`Vm::with_event_capacity`] 调整。
+    /// 发域事件,并附当前命令的脚本坐标(P4:`DomainCall.script/pc` 可选)。
+    pub(crate) fn emit_domain(
+        &mut self,
+        domain: crate::event::Domain,
+        name: impl Into<String>,
+        args: Vec<crate::event::ArgValue>,
+    ) {
+        let frame = self.frame();
+        let script = Some(self.cur_script);
+        let pc = Some(self.cur_pc);
+        self.emit(VmEvent::DomainCall {
+            frame,
+            domain,
+            name: name.into(),
+            args,
+            script,
+            pc,
+        });
+    }
+
     pub(crate) fn emit(&mut self, ev: VmEvent) {
         // 图形宿主必须**同步**看到状态事件:同一帧 `CG[...]` 之后的 `CGINFO`
         // 才能读到最新图层。仅转发宿主关心的类别,避免 Command 热路径开销。
@@ -957,7 +1420,10 @@ impl Vm {
             &ev,
             VmEvent::FrameStart { .. }
                 | VmEvent::FrameEnd { .. }
-                | VmEvent::DomainCall { domain: crate::event::Domain::Sound, .. }
+                | VmEvent::DomainCall {
+                    domain: crate::event::Domain::Sound,
+                    ..
+                }
         );
         if sound_relevant {
             if let Some(host) = self.sound_host.as_mut() {
@@ -1001,7 +1467,7 @@ impl Vm {
         }
         let file = self.script_name(self.cur_script);
         let task = (!self.cur_task.is_empty()).then(|| self.cur_task.clone());
-        let cmd = (!self.cur_cmd.is_empty()).then(|| self.cur_cmd.clone());
+        let cmd = self.cur_cmd.as_ref().map(|cmd| cmd.name.clone());
         diag::at_script_task(d, file, task, self.cur_pc, cmd)
     }
 
@@ -1039,7 +1505,12 @@ impl Vm {
             return Err(diag::fatal(
                 code::rt::SCRIPT_ERROR,
                 Boundary::Script,
-                format!("s{} pc={} 越界(脚本 {} 组)", st.script_id, st.pc, script.group_count()),
+                format!(
+                    "s{} pc={} 越界(脚本 {} 组)",
+                    st.script_id,
+                    st.pc,
+                    script.group_count()
+                ),
             ));
         };
         let name = match self.tables.boot.yscm.command(group.opcode) {
@@ -1070,9 +1541,15 @@ impl Vm {
                     ),
                 )
             })?;
+            let instrs = crate::expr::decode(payload)
+                .ok()
+                .map(Rc::<[crate::expr::RawInstr]>::from);
+            let const_value = instrs.as_deref().and_then(crate::expr::const_value_instrs);
             cmd.windows.push(CmdWindow {
                 rec: *rec,
                 payload: payload.to_vec(),
+                instrs,
+                const_value,
             });
         }
         cmd.opcode = group.opcode;
@@ -1108,7 +1585,11 @@ impl Vm {
             return var;
         }
         // id 唯一 ⇒ 直接查两种存储空间(不走 `var_shape`,避免递归)。
-        let ty = if self.store.shape(VarRef::new(VarSpace::At, var.id)).is_some() {
+        let ty = if self
+            .store
+            .shape(VarRef::new(VarSpace::At, var.id))
+            .is_some()
+        {
             crate::value::ElemType::Int
         } else if self
             .store
@@ -1144,10 +1625,7 @@ impl Vm {
             return Some((ty, d.dims.iter().map(|&x| x as usize).collect()));
         }
         if !var.space.is_legacy() {
-            return self
-                .store
-                .shape(var)
-                .map(|(ty, dims)| (ty, dims.to_vec()));
+            return self.store.shape(var).map(|(ty, dims)| (ty, dims.to_vec()));
         }
         let canonical = self.canonical_var(var);
         self.store
@@ -1167,7 +1645,7 @@ impl Vm {
             }
         }
         let decoded: Rc<[crate::expr::RawInstr]> = crate::expr::decode(payload)?.into();
-        if self.decode_cache_entries >= 200_000 {
+        if self.decode_cache_entries >= DECODE_CACHE_CAP {
             self.decode_cache.clear();
             self.decode_cache_entries = 0;
         }
@@ -1182,12 +1660,15 @@ impl Vm {
         Ok(decoded)
     }
 
-    pub(crate) fn eval_value(
-        &mut self,
-        st: &ExecState,
-        payload: &[u8],
-    ) -> Result<Value, Diag> {
-        let instrs = self.decoded_window(payload)?;
+    /// 已填充命令窗口的求值(优先用 `fill_cmd` 时的预解码/常量折叠)。
+    pub(crate) fn eval_window(&mut self, st: &ExecState, w: &CmdWindow) -> Result<Value, Diag> {
+        if let Some(value) = &w.const_value {
+            return Ok(value.clone());
+        }
+        let instrs = match &w.instrs {
+            Some(instrs) => Rc::clone(instrs),
+            None => self.decoded_window(&w.payload)?,
+        };
         let mut stack = std::mem::take(&mut self.eval_scratch);
         let mut access = VmAccess { vm: self, st };
         let r = Evaluator::new(&mut access).eval_value_instrs(&instrs, &mut stack);
@@ -1195,12 +1676,16 @@ impl Vm {
         r
     }
 
-    pub(crate) fn eval_lvalue(
+    /// 已填充命令窗口的左值解析(预解码命中路径)。
+    pub(crate) fn eval_lvalue_window(
         &mut self,
         st: &ExecState,
-        payload: &[u8],
+        w: &CmdWindow,
     ) -> Result<LValue, Diag> {
-        let instrs = self.decoded_window(payload)?;
+        let instrs = match &w.instrs {
+            Some(instrs) => Rc::clone(instrs),
+            None => self.decoded_window(&w.payload)?,
+        };
         let mut stack = std::mem::take(&mut self.eval_scratch);
         let mut access = VmAccess { vm: self, st };
         let r = Evaluator::new(&mut access).eval_lvalue_instrs_with(&instrs, &mut stack);
@@ -1222,6 +1707,35 @@ impl Vm {
         self.tables.script_path(script_id)
     }
 
+    /// 脚本 pc → 源码行(诊断;未知返回 `None`)。
+    pub fn script_position(&self, script_id: u32, pc: u32) -> Option<u32> {
+        self.tables
+            .script(script_id)
+            .and_then(|script| script.source_position(pc as usize))
+    }
+
+    /// 取走采样窗口内的命令调用点(按命中数降序),并清零。
+    pub fn take_profile_sites(&mut self, limit: usize) -> Vec<(String, u32, u32, u64)> {
+        let mut rows: Vec<(String, u32, u32, u64)> = self
+            .prof_sites
+            .iter()
+            .map(|(&(opcode, script, pc), &hits)| {
+                let name = self
+                    .tables
+                    .boot
+                    .yscm
+                    .command(opcode)
+                    .map(|decl| decl.name.clone())
+                    .unwrap_or_else(|| format!("#{opcode}"));
+                (name, script, pc, hits)
+            })
+            .collect();
+        rows.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+        rows.truncate(limit);
+        self.prof_sites.clear();
+        rows
+    }
+
     /// 编译器表回退源是否在位(诊断)。
     pub fn has_aux_source(&self) -> bool {
         self.aux.is_some()
@@ -1232,7 +1746,12 @@ impl Vm {
         self.tables.boot.labels.get_bytes(name).cloned()
     }
 
-    pub(crate) fn record_command(&mut self, st: &ExecState, cmd: &Cmd, args: Vec<crate::event::ArgValue>) {
+    pub(crate) fn record_command(
+        &mut self,
+        st: &ExecState,
+        cmd: &Cmd,
+        args: Vec<crate::event::ArgValue>,
+    ) {
         // 频度计数先行(与 `record_events` 无关):覆盖普查必须能在关闭
         // 事件流时拿到逐命令触发次数(任务书 M-1)。
         if let Some(hit) = self.command_hits.get_mut(cmd.opcode as usize) {
@@ -1312,8 +1831,9 @@ impl TaskExecutor for Vm {
     }
 
     fn step_command(&mut self, task: &mut TaskNode) -> Result<StepOutcome, String> {
-        let id = task.id.clone();
-        let Some(mut st) = self.exec.remove(&id) else {
+        // `remove_entry` 把键一起取回:每命令不再 clone 一次 TaskId
+        // (`String` 分配),重新插入时直接复用原键。
+        let Some((id, mut st)) = self.exec.remove_entry(&task.id) else {
             return Ok(StepOutcome::Finish);
         };
         let res = self.step_one(&mut st, task);
@@ -1346,7 +1866,11 @@ impl TaskExecutor for Vm {
                     yu_log::Severity::Unimplemented | yu_log::Severity::Recoverable
                 );
                 if matches!(d.severity, yu_log::Severity::Unimplemented) {
-                    let name = self.cur_cmd.clone();
+                    let name = self
+                        .cur_cmd
+                        .as_ref()
+                        .map(|cmd| cmd.name.clone())
+                        .unwrap_or_default();
                     self.note_unimplemented(&name);
                 }
                 let positioned = self.locate(d.clone());
@@ -1392,6 +1916,10 @@ impl TaskExecutor for Vm {
             .text_advance_requested(&self.text.click_buttons, &self.text.skip_buttons)
     }
 
+    fn dialog_pending(&self, task: &str) -> bool {
+        self.dialogs.iter().any(|d| d.task == task)
+    }
+
     fn sync_task_view(&mut self, view: &[TaskView]) {
         self.task_view.clear();
         self.task_view.extend_from_slice(view);
@@ -1405,33 +1933,66 @@ impl Vm {
         task: &mut TaskNode,
     ) -> Result<StepOutcome, VmError> {
         // pc 越界 = 脚本尾(引擎:任务体走完)。
-        let cmd = match self.cached_cmd(st) {
-            Ok(cmd) => cmd,
-            Err(d) => return Err(d.into()),
-        };
-        // 诊断定位:记住「当前正在执行的命令」(R11)。
+        let cmd = self.cached_cmd(st)?;
+        // 诊断定位:记住「当前正在执行的命令」(R11)。命令名只存 Rc
+        // (取指缓存已有),不逐条复制字符串;任务名只在任务切换时重写。
         self.cur_script = st.script_id;
         self.cur_pc = cmd.pc;
-        self.cur_cmd.clear();
-        self.cur_cmd.push_str(&cmd.name);
-        self.cur_task.clear();
-        self.cur_task.push_str(&task.id);
+        self.cur_cmd = Some(Rc::clone(&cmd));
+        if self.cur_task_seq != task.seq {
+            self.cur_task_seq = task.seq;
+            self.cur_task.clear();
+            self.cur_task.push_str(&task.id);
+        }
         // 取指后先自增(引擎 §3.2b:先取后加;处理体写 pc 即跳转)。
         st.pc = st.pc.wrapping_add(1);
-        self.dispatch(st, task, &cmd)
+        // 可选耗时采样:只包住 dispatch(取指/缓存命中是固定成本)。
+        // 关闭时只多一次 bool 判断。
+        let profile_started = self.prof_commands.then(Instant::now);
+        let opcode = cmd.opcode as usize;
+        if profile_started.is_some() {
+            *self
+                .prof_sites
+                .entry((cmd.opcode, st.script_id, cmd.pc))
+                .or_insert(0) += 1;
+        }
+        let out = self.dispatch(st, task, &cmd);
+        if let Some(started) = profile_started {
+            let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            if let Some(slot) = self.prof_ns.get_mut(opcode) {
+                *slot = slot.saturating_add(ns);
+            }
+            if let Some(slot) = self.prof_hits.get_mut(opcode) {
+                *slot = slot.saturating_add(1);
+            }
+        }
+        out
     }
 
     /// 取一条命令的缓存视图。脚本装载后 `(script_id, pc)` 的命令字节不变,
     /// 窗口载荷只复制一次;之后每次执行只做一次 `Rc` 克隆。
     fn cached_cmd(&mut self, st: &ExecState) -> Result<Rc<Cmd>, Diag> {
-        let key = (st.script_id, st.pc);
-        if let Some(hit) = self.cmd_cache.get(&key) {
+        let script = st.script_id as usize;
+        let pc = st.pc as usize;
+        if script >= CMD_CACHE_SCRIPT_MAX || pc >= CMD_CACHE_PC_MAX {
+            // 畸形输入:不建巨型缓存,交给 fill_cmd 的边界检查报错。
+            let mut cmd = Cmd::default();
+            self.fill_cmd(st, &mut cmd)?;
+            return Ok(Rc::new(cmd));
+        }
+        if self.cmd_cache.len() <= script {
+            self.cmd_cache.resize_with(script + 1, Vec::new);
+        }
+        if self.cmd_cache[script].len() <= pc {
+            self.cmd_cache[script].resize_with(pc + 1, || None);
+        }
+        if let Some(hit) = self.cmd_cache[script].get(pc).and_then(Option::as_ref) {
             return Ok(Rc::clone(hit));
         }
         let mut cmd = Cmd::default();
         self.fill_cmd(st, &mut cmd)?;
         let cmd = Rc::new(cmd);
-        self.cmd_cache.insert(key, Rc::clone(&cmd));
+        self.cmd_cache[script][pc] = Some(Rc::clone(&cmd));
         Ok(cmd)
     }
 }

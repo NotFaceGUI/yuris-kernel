@@ -7,7 +7,10 @@ fn main() {
     let root = std::env::args().nth(1).unwrap();
     let src = DirSource::open(format!("{root}/data"), Codec::Cp932).unwrap();
     let aux = DirSource::open(&root, Codec::Cp932).unwrap();
-    let cfg = BootConfig { entry_label: "SYSTEM_START".into(), ..BootConfig::default() };
+    let cfg = BootConfig {
+        entry_label: "SYSTEM_START".into(),
+        ..BootConfig::default()
+    };
     let mut vm = Vm::boot_with_aux(Box::new(src), Some(Box::new(aux)), cfg).unwrap();
     vm.tick_at(0, &InputTimeline::new());
     let mut rows: BTreeMap<String, usize> = BTreeMap::new();
@@ -20,5 +23,7 @@ fn main() {
         }
     }
     println!("distinct negative-index patients: {}", rows.len());
-    for (k, v) in rows.iter().take(15) { println!("  {v:5}  {k}"); }
+    for (k, v) in rows.iter().take(15) {
+        println!("  {v:5}  {k}");
+    }
 }

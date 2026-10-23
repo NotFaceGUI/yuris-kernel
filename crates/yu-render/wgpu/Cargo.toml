@@ -9,6 +9,7 @@ bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "0.4"
 wgpu = "30.0.1"
 yu-backend-soft = { path = "../soft" }
+yu-font = { path = "../../yu-font" }
 yu-gfx = { path = "../../yu-gfx" }
 yu-log = { path = "../../yu-log" }
 

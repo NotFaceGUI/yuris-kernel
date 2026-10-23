@@ -54,7 +54,12 @@ impl Texture {
             return None;
         }
         let i = ((y as usize) * (self.width as usize) + x as usize) * 4;
-        Some([self.rgba[i], self.rgba[i + 1], self.rgba[i + 2], self.rgba[i + 3]])
+        Some([
+            self.rgba[i],
+            self.rgba[i + 1],
+            self.rgba[i + 2],
+            self.rgba[i + 3],
+        ])
     }
 
     fn from_rgba8(img: image::RgbaImage) -> Self {
@@ -106,11 +111,7 @@ pub struct TextureStore {
 }
 
 impl TextureStore {
-    pub fn new(
-        source: Box<dyn DataSource>,
-        codec: Codec,
-        probe_order: Vec<ImageFormat>,
-    ) -> Self {
+    pub fn new(source: Box<dyn DataSource>, codec: Codec, probe_order: Vec<ImageFormat>) -> Self {
         Self {
             source,
             codec,
@@ -167,11 +168,7 @@ impl TextureStore {
                 id.0.to_le_bytes().to_vec(),
                 "快照纹理:COPY 时序未取证,后端不物化",
             )),
-            TextureRef::None => Err(unimplemented(
-                code::UNSUPPORTED,
-                Vec::new(),
-                "图层没有纹理",
-            )),
+            TextureRef::None => Err(unimplemented(code::UNSUPPORTED, Vec::new(), "图层没有纹理")),
         }
     }
 
@@ -208,7 +205,11 @@ impl TextureStore {
                         result: Err(unimplemented(
                             code::MISSING,
                             key.to_vec(),
-                            format!("候选路径无法归一: {} ({})", display_bytes(&candidate), diag.detail),
+                            format!(
+                                "候选路径无法归一: {} ({})",
+                                display_bytes(&candidate),
+                                diag.detail
+                            ),
                         )),
                     };
                 }
@@ -307,7 +308,10 @@ fn unimplemented(code: &'static str, path: Vec<u8>, detail: impl Into<String>) -
 
 /// 最后一个路径组件是否带扩展名(`.` 不在首位)。
 fn has_extension(key: &[u8]) -> bool {
-    let name = key.rsplit(|&b| b == b'/' || b == b'\\').next().unwrap_or(key);
+    let name = key
+        .rsplit(|&b| b == b'/' || b == b'\\')
+        .next()
+        .unwrap_or(key);
     match name.iter().rposition(|&b| b == b'.') {
         Some(0) | None => false,
         Some(_) => true,
@@ -383,7 +387,10 @@ mod tests {
         assert_eq!((tex.width, tex.height), (2, 1));
         assert_eq!(tex.pixel(0, 0), Some([255, 0, 0, 255]));
         assert_eq!(tex.pixel(1, 0), Some([0, 255, 0, 128]));
-        assert_eq!(store.resolved_path(b"img/foo"), Some(b"img/foo.png".as_slice()));
+        assert_eq!(
+            store.resolved_path(b"img/foo"),
+            Some(b"img/foo.png".as_slice())
+        );
         // 第二次直接命中文档缓存,不再解码。
         let _ = store.resolve(b"img/foo").expect("cached resolve");
         assert_eq!(store.decoded_count(), 1);
@@ -392,10 +399,7 @@ mod tests {
 
     #[test]
     fn existing_raw_key_is_tried_first() {
-        let mut store = store(
-            &[(b"img/bar.png", png_2x1())],
-            vec![ImageFormat::Png],
-        );
+        let mut store = store(&[(b"img/bar.png", png_2x1())], vec![ImageFormat::Png]);
         let tex = store.resolve(b"img/bar.png").expect("raw key");
         assert_eq!(tex.width, 2);
     }
@@ -428,10 +432,7 @@ mod tests {
 
     #[test]
     fn psb_is_reported_as_unsupported() {
-        let mut store = store(
-            &[(b"cg/x.psb", vec![0u8; 4])],
-            vec![ImageFormat::Psb],
-        );
+        let mut store = store(&[(b"cg/x.psb", vec![0u8; 4])], vec![ImageFormat::Psb]);
         let err = store.resolve(b"cg/x").expect_err("psb unsupported");
         assert_eq!(err.code, code::UNSUPPORTED);
         assert_eq!(store.issues()[0].code, code::UNSUPPORTED);

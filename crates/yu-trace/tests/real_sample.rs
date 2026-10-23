@@ -21,7 +21,10 @@ use yu_log::{LogSink, MemorySink};
 use yu_rt::input::InputTimeline;
 use yu_rt::BootConfig;
 use yu_trace::record::{Payload, TraceLog};
-use yu_trace::{diff_text, sample_missing, TracingSource, VmTrace};
+use yu_trace::{
+    diff_text, header_from_vm_with_clock, sample_missing, sha256_hex, ClockSummary, FaultDump,
+    FaultInfo, InputSummary, RingConfig, TracingSource, VmTrace,
+};
 use yu_vfs::{Codec, DataSource, LookupKey, YpfSource};
 
 /// 本测试二进制里因缺样本而跳过的用例数(必须恰好等于 1)。
@@ -180,6 +183,87 @@ fn official_data_ypf_smoke() {
 
     // 样本存在 ⇒ 没有跳过。
     assert_eq!(SKIPPED.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn fault_dump_survives_600_ticks_and_replays() {
+    // P5 验收:真语料 600 tick —— ring 记录 → 故障 dump → 离线重演到故障帧。
+    let Some(path) = ypf_path() else {
+        let mut sink = MemorySink::new();
+        sink.emit(&sample_missing("data.ypf", "YURIS_SAMPLE_ERIS_YPF"))
+            .expect("memory sink");
+        assert_eq!(sink.len(), 1, "explicit skip must emit one diag");
+        return;
+    };
+    let sample_sha = sha256_hex(&std::fs::read(&path).expect("read sample"));
+    let cfg = BootConfig {
+        entry_label: "SYSTEM_START".to_string(),
+        start_ms: 0,
+        fps: 60,
+        ..BootConfig::default()
+    };
+    let mut trace = VmTrace::boot(
+        Box::new(YpfSource::open(&path, Codec::Cp932).expect("open ypf")),
+        cfg.clone(),
+        Codec::Cp932,
+    )
+    .expect("official data.ypf boots");
+    let mut header = header_from_vm_with_clock(
+        trace.vm(),
+        &cfg,
+        Codec::Cp932,
+        InputSummary {
+            events: 0,
+            sha256: sha256_hex(&[]),
+        },
+        ClockSummary::none(),
+    );
+    header.producer = header.producer.with_sample_sha256(sample_sha);
+    trace
+        .enable_fault_ring(
+            RingConfig {
+                ticks: 700,
+                ..RingConfig::default()
+            },
+            None,
+        )
+        .expect("enable ring");
+    trace.recorder().set_fault_header(header);
+
+    let timeline = InputTimeline::new();
+    for tick in 0..600u32 {
+        trace.tick_at(tick.saturating_mul(16), &timeline);
+    }
+    let dir = support::fresh_dir("fault-600");
+    let paths = trace
+        .recorder()
+        .dump_on_fault(
+            dir.join("fault.jsonl"),
+            FaultInfo::panic("P5 600-tick test"),
+        )
+        .expect("dump");
+    let dump = FaultDump::read(&paths.trace).expect("dump reads back");
+    assert!(dump.manifest.replayable(), "600 ticks must all be retained");
+    assert_eq!(dump.manifest.ticks.len(), 600);
+    assert!(dump.manifest.fault_frame >= 600);
+    assert!(
+        dump.manifest
+            .ticks
+            .iter()
+            .any(|tick| tick.command_count > 0),
+        "recorded ticks must contain commands"
+    );
+
+    let report = dump
+        .replay(
+            Box::new(YpfSource::open(&path, Codec::Cp932).expect("open ypf for replay")),
+            None,
+            Vec::new(),
+            yu_rt::vm::HostPaths::default(),
+        )
+        .expect("offline replay reaches the fault frame with zero divergence");
+    assert_eq!(report.ticks_replayed, 600);
+    assert!(report.frames_replayed >= 600);
 }
 
 #[test]
