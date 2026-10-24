@@ -330,6 +330,19 @@ fn read_button(vm: &Vm, name: &str, indices: &[i64]) -> Result<Value, yu_log::Di
     match name {
         "_MOUSE_X" => return Ok(Value::Int(vm.input().cursor().0)),
         "_MOUSE_Y" => return Ok(Value::Int(vm.input().cursor().1)),
+        // `_MOUSE_X0..3`/`_MOUSE_Y0..3`:手册无页;REA 0.495 `FUN_00427350`
+        // case 0x85..0x8e = 4 个窗口状态槽(槽表 `DAT_008019c0..cc`)的客户区
+        // 光标坐标(每槽 HWND@+0x5b0、X@+0x5b8、Y@+0x5bc);case 0x85/0x86
+        // 同槽 ⇒ `_MOUSE_X` ≡ `_MOUSE_X0`。每帧更新 `FUN_00403ee0`:槽无
+        // 窗口(HWND=0)⇒ 坐标写 0,不报错(2026-10-24 政策:按 REA 实现并
+        // 标注)。内核 headless 只有注入光标(槽 0)⇒ 槽 1..3 恒 0,与官方
+        // 单窗口场景一致;debug UI(ERIS s66)读 `_MOUSE_X2` 由此不再 Fatal
+        // (DIV-L-001 黑帧根因)。
+        "_MOUSE_X0" => return Ok(Value::Int(vm.input().cursor().0)),
+        "_MOUSE_Y0" => return Ok(Value::Int(vm.input().cursor().1)),
+        "_MOUSE_X1" | "_MOUSE_X2" | "_MOUSE_X3" | "_MOUSE_Y1" | "_MOUSE_Y2" | "_MOUSE_Y3" => {
+            return Ok(Value::Int(0))
+        }
         "_KEY_ANY" => return Ok(Value::Int(vm.input().any_counter())),
         _ => {}
     }

@@ -31,6 +31,10 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         .flag("cases")
         .map(PathBuf::from)
         .unwrap_or_else(default_cases_dir);
+    let debug_mode = match args.flag("debug-mode") {
+        Some(value) => ArgReader::on_off("debug-mode", &value)?,
+        None => false,
+    };
     args.finish()?;
     if !all && only.is_none() {
         return Err(Failure::usage(
@@ -53,7 +57,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let mut passed = 0usize;
     let mut failed = 0usize;
     for path in &files {
-        match run_case(&project, path, update) {
+        match run_case(&project, path, update, debug_mode) {
             Ok(true) => {
                 passed += 1;
                 output::line(format!("case {}: PASS", case_name(path)));
@@ -333,7 +337,7 @@ fn build_timeline(inputs: &[CaseInput]) -> InputTimeline {
     timeline
 }
 
-fn run_case(project: &Project, path: &Path, update: bool) -> CliResult<bool> {
+fn run_case(project: &Project, path: &Path, update: bool, debug_mode: bool) -> CliResult<bool> {
     let spec = parse_case(path)?;
     // 存档域用例:save 根重定向到 target/tmp(产物只进 target/tmp,
     // 语料工程目录永不落盘;每轮清空重建保证确定性)。
@@ -372,6 +376,7 @@ fn run_case(project: &Project, path: &Path, update: bool) -> CliResult<bool> {
         backend: spec.backend,
         entry: spec.entry.clone(),
         record_events: spec.record_events,
+        debug_mode,
         save_root: save_root.clone(),
         ..EngineOptions::default()
     };

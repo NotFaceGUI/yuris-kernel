@@ -178,7 +178,7 @@
 |---|---|---|
 | ~~P0~~ | ~~A1 主组 COPY 无后缓冲源~~ **AU1 已修**:`frame.clear` 合成后缓冲初值(DIV-GFX-051 fixed;官方启动瞬间截图仍待采集) | ~~首帧 golden/case 全依赖~~ |
 | ~~P0~~ | ~~A3 渲染器 `reset()`~~ **AU1 已修**:两后端 reset + restart 接线 + `yu-cli/tests/restart.rs` 真语料回归(DIV-HOST-001 fixed) | ~~重启后像素错~~ |
-| P0 | 解 boot/golden 回归:给 gfx/后端示例与测试注入 `debug_mode=true`(语料是 debug 构建,DIV-L-001 证据),重跑 census;不回再二分 `1365918`。**AU2 复核注**:title 对拍(600 帧两端 0 差异 + 官方平坦区域 max 2)当前不受此阻塞;该 P0 只影响 census 口径是否与官方 debug 构建一致,保留待办 | 不解决则 census 口径存疑 |
+| ~~P0~~ | ~~解 boot/golden 回归:给 gfx/后端示例与测试注入 `debug_mode=true`(语料是 debug 构建,DIV-L-001 证据),重跑 census;不回再二分 `1365918`~~ **B4 已修(2026-10-24)**:黑帧根因 = 调试 UI(s66)读 `_MOUSE_X2` 被误判为未声明按钮 → Fatal 杀主任务;REA 定案 `_MOUSE_X0..3/Y0..3` = 窗口槽坐标族(`FUN_00427350` case 0x85..0x8e + `FUN_00403ee0`),已按官方语义实现。修复后 debug=true 与 false 同帧(f126)进 title;CLI 五子命令加 `--debug-mode`,示例/测试改 `YURIS_DEBUG_MODE` 环境门控;census 双口径落台账(coverage-matrix §0)。eris_first_screen 双模式 4/4 绿 | ~~不解决则 census 口径存疑~~(已双口径落账) |
 | ~~P1~~ | ~~C1 `case --all --update`~~ **AU1 已修**(85 ops / 0 skipped,3/3 PASS);门禁保持提交前手跑,CI 挂接待宿主 | ~~当前用例等于无门禁~~ |
 | ~~P1~~ | ~~A2 `image_probe_order`~~ **AU1 已修**:空表在 `from_tables` 拒绝构造(DIV-GFX-049 fixed) | ~~违反 A5 原文~~ |
 | P1 | ~~后端 P1-2 / P2-2/3/4/5/8/9 + example 重名~~ **全部关闭**(P1-2=J4,P2-3/4=J2,P2-5=AU1 C3,P2-2/P2-8 复核与交叉检查=AU2,P2-9 作废=AU2,重名已改) | — |

@@ -73,6 +73,9 @@ fn main() {
         fps: 60,
         // 只保留域事件(Command 事件在首帧 130 万条,会挤爆有界队列)。
         record_events: false,
+        // 官方 debug 构建口径对拍(B4/DIV-L-001):`YURIS_DEBUG_MODE=1`
+        // 注入 @_DEBUGMODE=1;缺省 false。
+        debug_mode: std::env::var("YURIS_DEBUG_MODE").map(|v| v == "1").unwrap_or(false),
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).expect("boot");

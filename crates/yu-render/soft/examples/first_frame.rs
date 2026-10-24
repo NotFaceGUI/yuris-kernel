@@ -48,11 +48,13 @@ fn run() -> Result<(), String> {
             YpfSource::open(&ypf, Codec::Cp932)
                 .map_err(|d| format!("打开 {} 失败: {}", ypf.display(), d.detail))?,
         ),
-        None => Box::new(
-            DirSource::open(&data_dir, Codec::Cp932).map_err(|d| {
-                format!("打开 {} 失败(且无 data.ypf): {}", data_dir.display(), d.detail)
-            })?,
-        ),
+        None => Box::new(DirSource::open(&data_dir, Codec::Cp932).map_err(|d| {
+            format!(
+                "打开 {} 失败(且无 data.ypf): {}",
+                data_dir.display(),
+                d.detail
+            )
+        })?),
     };
     let aux = DirSource::open(&root_path, Codec::Cp932)
         .map_err(|d| format!("打开 {} 失败: {}", root_path.display(), d.detail))?;
@@ -62,9 +64,11 @@ fn run() -> Result<(), String> {
         record_events: false,
         // 标题锚点用工程配置运行值 @_DEBUGMODE=0
         // (<project-eris>/save/data/config/projectconfig.txt DEBUGMODE=0);
-        // debug_mode=true 在本语料会走 debug UI,1200 tick 内不进 title(黑帧)。
-        // 证据与对照见 docs/title-motion-ledger.md §9。
-        debug_mode: false,
+        // `YURIS_DEBUG_MODE=1` 走 debug 分支对照(B4:debug=true 已可进 title,
+        // DIV-L-001 复核;黑帧根因 = _MOUSE_X2 误判按钮,已修)。
+        debug_mode: std::env::var("YURIS_DEBUG_MODE")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         paths: host_paths(&root_path),
         ..BootConfig::default()
     };
@@ -127,9 +131,7 @@ fn run() -> Result<(), String> {
         .ok_or_else(|| "没有产出任何帧".to_string())?;
     let tick = selected_tick.unwrap_or(ticks.saturating_sub(1));
     if selected_tick.is_none() {
-        println!(
-            "warning: {limit} 帧内没有找到可绘制屏幕;渲染最后一帧,摘要会列出跳过项"
-        );
+        println!("warning: {limit} 帧内没有找到可绘制屏幕;渲染最后一帧,摘要会列出跳过项");
     }
 
     // 纹理源:存在的形态入挂载栈;散盘在上,可覆盖封包同名资源。
@@ -156,28 +158,21 @@ fn run() -> Result<(), String> {
     );
     let mut backend = SoftRenderer::new(store);
     let first = backend.render_frame(&frame);
-    if first.surface.width != frame.viewport.width
-        || first.surface.height != frame.viewport.height
+    if first.surface.width != frame.viewport.width || first.surface.height != frame.viewport.height
     {
         return Err(format!(
             "输出尺寸 {}x{} 与 viewport {}x{} 不一致",
-            first.surface.width,
-            first.surface.height,
-            frame.viewport.width,
-            frame.viewport.height
+            first.surface.width, first.surface.height, frame.viewport.width, frame.viewport.height
         ));
     }
-    let png_a = png::png_bytes(&first.surface)
-        .map_err(|e| format!("PNG 编码失败: {e}"))?;
+    let png_a = png::png_bytes(&first.surface).map_err(|e| format!("PNG 编码失败: {e}"))?;
     // 同一帧再渲染一次:确定性验收(缓存命中路径也必须逐字节一致)。
     let second = backend.render_frame(&frame);
-    let png_b = png::png_bytes(&second.surface)
-        .map_err(|e| format!("PNG 编码失败: {e}"))?;
+    let png_b = png::png_bytes(&second.surface).map_err(|e| format!("PNG 编码失败: {e}"))?;
     let deterministic = png_a == png_b;
 
     let out_dir = workspace_root().join("target").join("tmp");
-    fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("创建 {} 失败: {e}", out_dir.display()))?;
+    fs::create_dir_all(&out_dir).map_err(|e| format!("创建 {} 失败: {e}", out_dir.display()))?;
     let png_path = out_dir.join("first_frame.png");
     let display_path = out_dir.join("first_frame.display.json");
     fs::write(&png_path, &png_a).map_err(|e| format!("写 {} 失败: {e}", png_path.display()))?;
@@ -222,7 +217,10 @@ fn run() -> Result<(), String> {
             issue.detail
         );
     }
-    println!("skipped text: {} runs (no glyph rasterizer)", report.skipped_text);
+    println!(
+        "skipped text: {} runs (no glyph rasterizer)",
+        report.skipped_text
+    );
     println!(
         "filter: mag={} min={} mip={} source={}",
         report.filter_mag, report.filter_min, report.filter_mip, report.filter_source

@@ -55,13 +55,17 @@ yu-cli · 原生引擎宿主 + 本地服务 + wasm 呈现端
 用法:
   yu-cli run  <project-root> [--backend soft|wgpu] [--entry LABEL] [--frames N]
                              [--until-visible] [--shot PATH] [--json PATH]
-                             [--record-events on|off] [--data PATH]
+                             [--record-events on|off] [--debug-mode on|off]
+                             [--data PATH]
   yu-cli serve <project-root> [--backend soft|wgpu] [--port 4173] [--no-open]
                              [--entry LABEL] [--fps 60] [--record-events on|off]
-                             [--data PATH] [--www DIR] [--diag-ws]
+                             [--debug-mode on|off] [--data PATH] [--www DIR]
+                             [--diag-ws]
   yu-cli dev  <project-root> [--port 4173] [--no-open] [--backend soft|wgpu]
+                             [--debug-mode on|off]
   yu-cli case <project-root> --all | --case NAME [--update]
-  yu-cli bench <project-root>
+                             [--debug-mode on|off]
+  yu-cli bench <project-root> [--frames N] [--debug-mode on|off]
 
 数据入口(唯一约定):
   <project-root>/data.ypf 优先;否则 <project-root>/data/;
@@ -72,6 +76,7 @@ yu-cli · 原生引擎宿主 + 本地服务 + wasm 呈现端
   dx_mode=0         @_DXMODE(无 DX 分支)
   os_sound=true     @_OS_SOUND(引擎认为音频可用;默认设备输出见下)
   media_readonly=0  @_MEDIA_READONLY(只读介质语义,不是内核只读数据 A2)
+  debug_mode=off    @_DEBUGMODE(官方 debug 构建 = on,DIV-L-001;对拍口径)
   record_events=off 默认关闭(首帧 129 万命令;对拍时 --record-events on)
 
 声音:

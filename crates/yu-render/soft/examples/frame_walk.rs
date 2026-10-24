@@ -60,9 +60,11 @@ fn run() -> Result<(), String> {
         record_events: false,
         // 标题锚点用工程配置运行值 @_DEBUGMODE=0
         // (<project-eris>/save/data/config/projectconfig.txt DEBUGMODE=0);
-        // debug_mode=true 在本语料会走 debug UI,1200 tick 内不进 title(黑帧)。
-        // 证据与对照见 docs/title-motion-ledger.md §9。
-        debug_mode: false,
+        // `YURIS_DEBUG_MODE=1` 走 debug 分支对照(B4:debug=true 已可进 title,
+        // DIV-L-001 复核;黑帧根因 = _MOUSE_X2 误判按钮,已修)。
+        debug_mode: std::env::var("YURIS_DEBUG_MODE")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         paths: host_paths(&root_path),
         ..BootConfig::default()
     };

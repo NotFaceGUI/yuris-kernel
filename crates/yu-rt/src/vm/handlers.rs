@@ -1149,8 +1149,15 @@ impl Vm {
                 .strip_prefix("_KEY_")
                 .or_else(|| name.strip_prefix("_MOUSE_"))
                 .filter(|rest| {
-                    // 只收按钮族(排除 _MOUSE_X/Y 与 _KEYNUM_* 等)。
-                    !matches!(*rest, "X" | "Y" | "LAST")
+                    // 只收按钮族(排除 _MOUSE_X/Y0..3 坐标槽与 _KEYNUM_* 等;
+                    // X/Y 后缀数字 = 窗口槽坐标族,REA `FUN_00427350`
+                    // case 0x85..0x8e,非按钮)。
+                    !matches!(*rest, "LAST")
+                        && !matches!(*rest, "X" | "Y")
+                        && !rest
+                            .strip_suffix(['0', '1', '2', '3'])
+                            .map(|base| matches!(base, "X" | "Y"))
+                            .unwrap_or(false)
                         && !rest
                             .chars()
                             .next()

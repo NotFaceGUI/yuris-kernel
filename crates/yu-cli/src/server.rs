@@ -50,6 +50,8 @@ pub struct ServeOptions {
     pub pause_at: Option<u64>,
     /// 开 `/diag` WebSocket 诊断通道(P1 交接件 H-P1-03;www 消费)。
     pub diag_ws: bool,
+    /// `@_DEBUGMODE` 注入(DIV-L-001;debug 语料对拍口径)。
+    pub debug_mode: bool,
 }
 
 impl ServeOptions {
@@ -88,6 +90,10 @@ impl ServeOptions {
             .unwrap_or_else(default_www);
         let supervised = args.switch("supervised");
         let diag_ws = args.switch("diag-ws");
+        let debug_mode = match args.flag("debug-mode") {
+            Some(value) => ArgReader::on_off("debug-mode", &value)?,
+            None => false,
+        };
         let pause_at =
             match args.flag("pause-at") {
                 Some(value) => Some(value.parse::<u64>().map_err(|_| {
@@ -109,6 +115,7 @@ impl ServeOptions {
             supervised,
             pause_at,
             diag_ws,
+            debug_mode,
         })
     }
 }
@@ -130,6 +137,7 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         entry: opts.entry.clone(),
         record_events: opts.record_events,
         fps: opts.fps,
+        debug_mode: opts.debug_mode,
         // 长跑宿主:首帧前预热字体表,避免第一次文本场景的 ~130ms 停顿。
         warm_text: true,
         ..EngineOptions::default()

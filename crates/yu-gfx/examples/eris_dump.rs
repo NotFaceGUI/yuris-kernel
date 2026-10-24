@@ -54,7 +54,9 @@ fn main() {
         record_events: false,
         // 标题锚点用 @_DEBUGMODE=0(projectconfig.txt);
         // YURIS_DEBUG_MODE=1 用于 debug 分支 A/B 对照(见台账 §9)。
-        debug_mode: std::env::var("YURIS_DEBUG_MODE").map(|v| v == "1").unwrap_or(false),
+        debug_mode: std::env::var("YURIS_DEBUG_MODE")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         paths: host_paths(std::path::Path::new(&root)),
         ..BootConfig::default()
     };

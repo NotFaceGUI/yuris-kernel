@@ -9,9 +9,18 @@
   静态扫描 136 个 `yst`、36,974 组、80,102 窗口。
 - 运行:`SYSTEM_START` 固定时钟,`tick_at(f*16)` 共 600 次,602 个逻辑帧;
   首个非空 tick / 首个可见帧(Graphics/Window/Text)都是 0;
-  **P3 复跑(2026-10-23):命令 7,735,679 次**(P0/P1 前的同口径为
-  7,735,670;差值 9 条来自 `_WINDOW_INIT_POS` 变为宿主注入 0 后
-  `es_GSD.yst:490` 的初始化分支首次成立,见 §9);事件丢弃 0;主线未结束。
+  **B4 复跑(2026-10-24,默认 `@_DEBUGMODE=0`):命令 7,735,437 次**
+  (与 B6 记录的同树基线一致;较 P3 2026-10-23 的 7,735,679 的差值来自
+  B5 折回/CGS revert 等同树并行改动,B6 成果已归因,B4 内核改动不影响
+  false 口径计数);事件丢弃 0;主线未结束。
+- **debug 构建口径(B4 新增)**:官方 debug 构建运行期 `_DEBUGMODE=1`
+  (DIV-L-001:窗口标题【デバッグモード】)。`YURIS_DEBUG_MODE=1` 复跑:
+  **命令 8,764,407 次**,与 false 口径差 +1,028,970 = 调试 UI 自身流量
+  (es.DebugTask/调试窗;增量集中在 `TASKINFO` 2,985 / `CGINFO` +370 /
+  `WINDOWINFO` +1 / `SOUNDINFO` +1);**零 Fatal、零新挂号码**——B4 修复
+  `_MOUSE_X0..3/Y0..3`(窗口槽坐标族,见 §3)后 debug 分支可完整进 title。
+  §1/§2 表格仍以 false 口径为准(官方 release 游戏对拍的保守锚点),
+  debug 口径数字以此注为准。
 - `record_events=false`:逐命令触发数来自 `Vm::command_hits`(与事件流无关);
   域事件/文本事件/诊断照常产生。
 - 手册页相对 `<sdk495>/マニュアル/YU-RIS/html/`;`—` = 本次索引未找到专门页。
@@ -163,7 +172,9 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `CGINFO` | 1598 | 已实现 | 未安装 `GraphicsHost`(宿主查询面;INFO 不是 VM 语义) |
 | `CGACT` | 631 | 域事件:graphics | 域事件已发;查询/写回需宿主状态机 |
 | `SOUND` | 531 | 域事件:sound | 未装 `SoundHost` 时只发事件;装宿主后由 `yu-sound` 消费 |
-| `WINDOWINFO` | 129 | 部分 | AU5 勘误:旧口径「已实现/未装宿主」归因不全。几何(EXIST/E/X/Y/SX/SY)装 `GraphicsHost` 即可答;`FULLSCREEN/CAPTION/ACTIVE/MAXIMIZE/RESIZE/CLOSEMODE/MENUID/REGIONID/DRAGID` **装了宿主仍 `INFO_UNSUPPORTED`**(字段族 = DIV-RT-050 候选根因,REA 锚点 `0x4586ec`) |
+| `WINDOWINFO` | 371 | 部分 | AU5 勘误:旧口径「已实现/未装宿主」归因不全。几何(EXIST/E/X/Y/SX/SY)装 `GraphicsHost` 即可答;`FULLSCREEN/CAPTION/ACTIVE/MAXIMIZE/RESIZE/CLOSEMODE/MENUID/REGIONID/DRAGID` **装了宿主仍 `INFO_UNSUPPORTED`**(字段族 = DIV-RT-050 候选根因,REA 锚点 `0x4586ec`)。B4 复跑 371(P3 时 129;+242 发生在 B4 之前——
+B4 内核改动不触碰 WINDOWINFO 计数路径,false 口径总命令数与 B6 基线
+7,735,437 逐字节一致;精确归因随 B2 字段族收口复核) |
 | `SAVE` | 16 | 已实现(B1) | 未装存档宿主时只发域事件;装宿主(命令时刻预约/刷盘,DIV-RT-042 闭环)——`save-load-loop` 用例落盘 gsd/extra/seld/kidoku |
 | `EMOTE` | 12 | 域事件:emote | 域事件已发;E-mote 子系统归宿主 |
 | `WINDOW` | 10 | 域事件:window | 域事件已发;查询/写回需宿主状态机(+1 来自 `_WINDOW_INIT_POS` 分支) |
@@ -193,6 +204,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `_TEXT_NUM` | 0 | — | 读 `0x4276e3` ← `0x80174c`;装载 `yst.ybn` 时写 `0x45d73f` | ✅ 实现 | = 工程文本总数;ERIS 396(yst.ybn 头部 == yst_list 求和;DIV-RT-048) |
 | `_WINDOW_INIT_POS` | 1 次 | — | 读 `0x4276f3` ← `[0x80133c]`;写 `0x460b74/0x460b87`(← `yscfg.dat` 第 10 项) | ✅ 宿主注入 | `BootConfig::window_init_pos`(ERIS 工程 = 0;DIV-RT-047) |
 | `_SAVE_PATH` | 1 次 | `basic/svariable.html` | — | ⛔ 宿主注入 | 路径由宿主给值;示例未注入(DIV-RT-010) |
+| `_MOUSE_X0..3`/`_MOUSE_Y0..3` | debug 口径运行期读(s66 调试 UI);false 口径 0 次 | —(手册无页) | 读 `FUN_00427350` case 0x85..0x8e = 4 窗口槽客户区坐标(槽表 `DAT_008019c0..cc`;每槽 HWND@+0x5b0、X@+0x5b8、Y@+0x5bc;case 0x85/0x86 同槽 ⇒ `_MOUSE_X`≡`_MOUSE_X0`);每帧 `FUN_00403ee0`:槽无窗口 ⇒ 坐标 0,不报错 | ✅ fixed(no-manual) | 2026-10-24 政策:按 REA 实现并标注。旧实现误当 ycd 按钮查绑定 → Fatal 杀主任务 = debug 口径黑帧根因(DIV-L-001 复核;`yu-rt/src/sysvar.rs`) |
 
 ## 4. 与 `command-provenance.md` 的交叉核对(勘误留痕)
 

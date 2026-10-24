@@ -5,6 +5,31 @@
 - 发现日期 / 发现方式: 2026-10-21 / 官方事件级 L1 trace vs 内核 `emit_kernel_events` 同语料 trace
 - 相关任务: 任务书 L（Phase L-3）
 
+## B4 复核(2026-10-24):「debug_mode=true 黑帧」定案收口
+
+本档案「运行期注入 debug_mode=true」修法留下一个后续:B4 之前内核
+`debug_mode=true` 会黑帧不进 title(title-motion-ledger §9.2 挂账)。
+B4 取证定案并修复:
+
+- **根因不是 script 20 分支**(本档案结论仍成立),而是调试 UI(ERIS s66,
+  debug 任务在 f1 建立调试窗)读 `_MOUSE_X2` 时,内核把它当工程 ycd 声明
+  按钮查绑定 → 查不到 → `rt.sysvar.unimplemented` **Fatal** → SYSTEM 主任务
+  在 frame 3 被摘链 → `ES.TITLE.LOOP`(s58)永不执行 ⇒ 黑帧。
+- **REA 定案**(官方 0.495,sha256 `4f5eefa3…`):`FUN_00427350` case
+  0x85..0x8e = `_MOUSE_X/Y0..3` 是 **4 个窗口槽客户区坐标**(槽表
+  `DAT_008019c0..cc`;每槽 HWND@+0x5b0、X@+0x5b8、Y@+0x5bc;case 0x85/0x86
+  同槽 ⇒ `_MOUSE_X`≡`_MOUSE_X0`);每帧更新 `FUN_00403ee0`:槽无窗口
+  (HWND=0)⇒ 坐标写 0,**不报错**。手册无页 ⇒ 按 REA 实现(fixed(no-manual),
+  2026-10-24 政策)。修点:`yu-rt/src/sysvar.rs`(读)+ `vm/handlers.rs`
+  (写路径按钮过滤器)。
+- **修复后**(内核事件 trace `target/tmp/b4-debug-probe/`):debug=true 与
+  false 两模式 `ES.TITLE.LOOP`(s58)都在 **frame 126** 起跑(修复前 true
+  模式 0 条 s58);`eris_first_screen` 双模式 4/4 绿;census 双口径见
+  `crates/yu-rt/docs/coverage-matrix.md` §0(false 7,735,437 / debug
+  8,764,407,debug 零 Fatal 零新挂号)。
+- 注:本档案「修法」节的 `projectconfig.txt DEBUGMODE=0` 勘误结论维持——
+  官方运行期真实值为 true(窗口标题证据),但两种注入现在都可用且都能进 title。
+
 ## 复现
 
 - 语料: `<project-eris>/data.ypf`（官方 YSCom 0.495 **debug 构建**）

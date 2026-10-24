@@ -47,6 +47,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     // 默认 release:实测 debug 的 ERIS 初始化帧 ~14 s,页面首帧不可接受。
     // `--debug` 显式换回 debug(要符号/断点时用)。
     let release = !args.switch("debug");
+    // `@_DEBUGMODE` 注入(DIV-L-001;debug 语料对拍口径),透传给引擎子进程。
+    let debug_mode = match args.flag("debug-mode") {
+        Some(value) => ArgReader::on_off("debug-mode", &value)?,
+        None => false,
+    };
     args.finish()?;
 
     let workspace = workspace_root();
@@ -76,6 +81,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         backend,
         no_open,
         release,
+        debug_mode,
         child: None,
         stdin: None,
         first_spawn: true,
@@ -145,6 +151,7 @@ struct Supervisor {
     backend: Backend,
     no_open: bool,
     release: bool,
+    debug_mode: bool,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     first_spawn: bool,
@@ -170,6 +177,9 @@ impl Supervisor {
             .stderr(Stdio::inherit());
         if self.no_open || !self.first_spawn {
             command.arg("--no-open");
+        }
+        if self.debug_mode {
+            command.arg("--debug-mode").arg("on");
         }
         let mut child = command.spawn().map_err(|e| {
             Failure::runtime(format!(

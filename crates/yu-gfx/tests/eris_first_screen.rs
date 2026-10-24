@@ -69,17 +69,20 @@ fn eris_first_screen_display_list() {
         Box::new(DirSource::open(format!("{root}/data"), Codec::Cp932).expect("data"))
     };
     let aux = DirSource::open(&root, Codec::Cp932).expect("project");
+    // 标题锚点(golden)= @_DEBUGMODE=0;`YURIS_DEBUG_MODE=1` 切 debug 分支。
+    // B4 复核(DIV-L-001):debug_mode=true 的旧「黑帧不进 title」根因 =
+    // 调试 UI 读 `_MOUSE_X2` 被误判为未声明按钮而 Fatal(REA 0.495
+    // `FUN_00427350` case 0x85..0x8e = 窗口槽坐标族,已按官方语义实现);
+    // 现双模式都能进 title(ES.TITLE.LOOP 两模式都在 frame 126)。
+    // golden 文件是 false 模式锚点(§9.1 像素对照在该模式完成);
+    // debug 模式走独立 census 断言(本函数 debug 分支),不比对 golden 文件。
+    let debug_mode = std::env::var("YURIS_DEBUG_MODE").map(|v| v == "1").unwrap_or(false);
     let cfg = BootConfig {
         entry_label: "SYSTEM_START".to_string(),
         fps: 60,
         // 首帧 130 万 Command 事件会挤爆有界队列;gfx 只需要 DomainCall。
         record_events: false,
-        // 标题锚点用工程配置的运行值 `@_DEBUGMODE=0`
-        // (`<project-eris>/save/data/config/projectconfig.txt` DEBUGMODE=0)。
-        // 对照:debug_mode=true 时内核在 1200 tick 内不进 title(黑帧,debug UI),
-        // 而官方 title 截图可见 ⇒ 本测试锚点取 0;窗口标题证据只作旁证。
-        // 见 docs/title-motion-ledger.md §9.2。
-        debug_mode: false,
+        debug_mode,
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).expect("boot");
@@ -106,6 +109,49 @@ fn eris_first_screen_display_list() {
         gfx.consume_events(&events);
     }
     let f = gfx.frame();
+    if debug_mode {
+        // debug 分支首屏(独立口径;不入 golden 文件;B4 复跑实测 2026-10-24):
+        // 调试任务在 f1 建立调试窗(:/W2/* 13 层)⇒ 层/可见/pass/op 都多于
+        // false 模式;screen pass 仍 4 op(主组直绘,与 false 模式同)。
+        assert_eq!(f.layers.len(), 299, "debug layers");
+        assert_eq!(
+            f.layers.iter().filter(|l| l.visible).count(),
+            18,
+            "debug visible"
+        );
+        assert_eq!(f.passes.len(), 93, "debug passes");
+        let ops: usize = f.passes.iter().map(|p| p.ops.len()).sum();
+        assert_eq!(ops, 104, "debug total ops");
+        let texture_passes = f
+            .passes
+            .iter()
+            .filter(|p| matches!(p.target, yu_gfx::PassTarget::Texture(_)))
+            .count();
+        assert_eq!(texture_passes, 90, "debug texture passes");
+        let screen = f
+            .passes
+            .iter()
+            .find(|p| matches!(p.target, yu_gfx::PassTarget::Screen))
+            .expect("screen pass");
+        assert_eq!(screen.ops.len(), 4, "debug screen pass (main group direct)");
+        assert!(
+            f.layers.iter().any(|l| l.id.display() == ":/W1/DBG"),
+            "debug task must create :/W1/DBG"
+        );
+        assert_eq!(
+            f.layers
+                .iter()
+                .filter(|l| l.id.display().starts_with(":/W2/"))
+                .count(),
+            13,
+            "debug window layers"
+        );
+        assert!(
+            !f.diagnostics.iter().any(|d| d.severity == "Fatal"),
+            "debug first screen must be fatal-free"
+        );
+        return;
+    }
     // 精确 census(会话 F;与 docs/render-parity.md §2 同步)。
     //
     // J3 复核:旧值(visible 34 / ops 44 / W0 30 / invisible 238)来自
@@ -272,11 +318,12 @@ fn eris_first_screen_with_synchronous_info_queries() {
         Box::new(DirSource::open(format!("{root}/data"), Codec::Cp932).expect("data"))
     };
     let aux = DirSource::open(&root, Codec::Cp932).expect("project");
+    let debug_mode = std::env::var("YURIS_DEBUG_MODE").map(|v| v == "1").unwrap_or(false);
     let cfg = BootConfig {
         entry_label: "SYSTEM_START".to_string(),
         fps: 60,
         record_events: false,
-        debug_mode: false,
+        debug_mode,
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).expect("boot");
@@ -303,24 +350,29 @@ fn eris_first_screen_with_synchronous_info_queries() {
         vm.drain_events(&mut events);
     }
     let f = state.borrow().frame();
-    assert_eq!(f.layers.len(), 272, "layers");
-    assert_eq!(f.layers.iter().filter(|l| l.visible).count(), 8, "visible");
-    // 1 屏 + 1 组离屏 + 80 纹理 pass(69 copy + 11 image)。
+    // census 双模式口径(golden 测试同源;B4 复跑实测):
+    let (layers, visible, passes, tex_passes, total_ops) = if debug_mode {
+        (299, 18, 93, 90, 104)
+    } else {
+        (272, 8, 82, 80, 85)
+    };
+    assert_eq!(f.layers.len(), layers, "layers");
+    assert_eq!(f.layers.iter().filter(|l| l.visible).count(), visible, "visible");
+    // 1 屏 + 组离屏 + 纹理 pass(69 copy + 11 image = false;debug 另有调试窗)。
     //
-    // 69 条 copy = 1 条主组 `CGS100` + 68 条按钮状态快照;后者的源
+    // false 模式 69 条 copy = 1 条主组 `CGS100` + 68 条按钮状态快照;后者的源
     // `BT.OFF.TMP` 在同一帧末尾被 `CGEND` 删除,靠 `CopyOp.source_texture`
     // 在命令时刻捕获(DIV-GFX-053)。旧实现在这里丢掉了 68 条。
-    assert_eq!(f.passes.len(), 82, "passes");
+    assert_eq!(f.passes.len(), passes, "passes");
     let texture_passes = f
         .passes
         .iter()
         .filter(|p| matches!(p.target, yu_gfx::PassTarget::Texture(_)))
         .count();
-    assert_eq!(texture_passes, 80, "texture passes (copies + images)");
-    // 80 纹理 op + 4 屏幕 op(主组直绘)+ 1 离屏 DBG 层。
+    assert_eq!(texture_passes, tex_passes, "texture passes (copies + images)");
     assert_eq!(
         f.passes.iter().map(|p| p.ops.len()).sum::<usize>(),
-        85,
+        total_ops,
         "total ops"
     );
     let screen = f
@@ -328,7 +380,7 @@ fn eris_first_screen_with_synchronous_info_queries() {
         .iter()
         .find(|p| matches!(p.target, yu_gfx::PassTarget::Screen))
         .expect("screen pass");
-    // 主组直绘:屏幕 pass 直接含 W0 子层,不再是单个 Group op。
+    // 主组直绘:屏幕 pass 直接含 W0 子层,不再是单个 Group op(双模式同)。
     assert_eq!(screen.ops.len(), 4, "W0 children drawn directly");
     assert!(screen
         .ops
@@ -369,7 +421,9 @@ fn empty_image_ext_order_is_rejected_not_defaulted() {
         entry_label: "SYSTEM_START".to_string(),
         fps: 60,
         record_events: false,
-        debug_mode: false,
+        // 本用例主题 = image_ext_order 拒绝构造,与 debug 分支无关;
+        // 仍走环境门控(与全文件一致)。
+        debug_mode: std::env::var("YURIS_DEBUG_MODE").map(|v| v == "1").unwrap_or(false),
         ..BootConfig::default()
     };
     let vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).expect("boot");
@@ -381,7 +435,10 @@ fn empty_image_ext_order_is_rejected_not_defaulted() {
     let mut tables = vm.tables().clone();
     tables.boot.config.image_ext_order = [0; 8];
     let config = GfxConfig::new(viewport);
-    assert!(config.image_probe_order.is_empty(), "GfxConfig 不得内置探测序");
+    assert!(
+        config.image_probe_order.is_empty(),
+        "GfxConfig 不得内置探测序"
+    );
     let err = match GfxState::from_tables(&tables, config) {
         Ok(_) => panic!("yscfg 空序 + 宿主未注入 必须拒绝构造"),
         Err(diag) => diag,
@@ -393,4 +450,71 @@ fn empty_image_ext_order_is_rejected_not_defaulted() {
     injected.image_probe_order = vec![yu_gfx::ImageFormat::Png];
     let state = GfxState::from_tables(&tables, injected).expect("显式注入应允许构造");
     assert_eq!(state.frame().image_probe_order.len(), 1);
+}
+
+/// B4 验收(DIV-L-001 复核):`debug_mode=true` 出帧且主任务存活进 title。
+///
+/// 旧黑帧:调试 UI(ERIS s66)读 `_MOUSE_X2` 被误判为未声明按钮 →
+/// `rt.sysvar.unimplemented` **Fatal** → SYSTEM 主任务在 frame 3 被摘链,
+/// `ES.TITLE.LOOP`(s58)永不执行,screen 0..1200 黑帧。根因与修法见
+/// `yu-rt/src/sysvar.rs`(REA 0.495 `FUN_00427350` case 0x85..0x8e +
+/// `FUN_00403ee0`:窗口槽坐标族,无窗口槽 = 0,不报错)。
+#[test]
+fn eris_first_screen_debug_mode_draws_and_reaches_title() {
+    let Some(root) = eris_root() else {
+        if std::env::var("YURIS_REQUIRE_SAMPLES").ok().as_deref() == Some("1") {
+            panic!("YURIS_REQUIRE_SAMPLES=1 but YURIS_SAMPLE_ERIS_YSBIN/ROOT is missing");
+        }
+        eprintln!("SKIP eris_first_screen_debug_mode_draws_and_reaches_title: no sample");
+        return;
+    };
+    let ypf = std::path::PathBuf::from(&root).join("data.ypf");
+    let src: Box<dyn yu_vfs::DataSource> = if ypf.is_file() {
+        Box::new(YpfSource::open(&ypf, Codec::Cp932).expect("data.ypf"))
+    } else {
+        Box::new(DirSource::open(format!("{root}/data"), Codec::Cp932).expect("data"))
+    };
+    let aux = DirSource::open(&root, Codec::Cp932).expect("project");
+    let cfg = BootConfig {
+        entry_label: "SYSTEM_START".to_string(),
+        fps: 60,
+        record_events: false,
+        debug_mode: true,
+        ..BootConfig::default()
+    };
+    let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).expect("boot");
+    let viewport = Viewport::new(
+        vm.tables().boot.config.width,
+        vm.tables().boot.config.height,
+    );
+    let mut gfx = GfxState::from_tables(vm.tables(), GfxConfig::new(viewport)).expect("gfx");
+    let timeline = InputTimeline::new();
+    let mut events = Vec::new();
+    // 140 帧 > 旧致命点(frame 3)且 > `ES.TITLE.LOOP` 进入帧(两模式同为
+    // frame 126);事件流对照(kernel_debug_true_fixed)证实 s58 在 f126 起跑。
+    let mut last_visible = 0usize;
+    for frame in 0..=140u32 {
+        let r = vm.tick_at(frame * 16, &timeline);
+        assert!(
+            r.errors.is_empty(),
+            "frame {frame} errors(旧黑帧在此显形): {:?}",
+            r.errors
+        );
+        events.clear();
+        vm.drain_events(&mut events);
+        gfx.consume_events(&events);
+        let f = gfx.frame();
+        last_visible = f.layers.iter().filter(|l| l.visible).count();
+        assert!(
+            !f.diagnostics.iter().any(|d| d.severity == "Fatal"),
+            "frame {frame} fatal diag"
+        );
+    }
+    // 主任务仍活着,并已回到状态机主循环(s8;title 稳态同 false 模式)。
+    let main = vm
+        .scheduler()
+        .main_node()
+        .expect("SYSTEM 主任务在 debug 模式下必须存活");
+    assert_eq!(main.script_id, 8, "SYSTEM task must be in the s8 state loop");
+    assert!(last_visible > 0, "debug mode must keep visible layers (出帧)");
 }

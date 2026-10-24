@@ -135,7 +135,10 @@ fn run() -> Result<(), String> {
         entry,
         record_events: false,
         fps,
-        debug_mode: false,
+        // 桌面宿主同口径:YURIS_DEBUG_MODE=1 走 debug 分支(DIV-L-001)。
+        debug_mode: std::env::var("YURIS_DEBUG_MODE")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         screen_color: 32,
         dx_mode: 0,
         os_sound: !no_sound,

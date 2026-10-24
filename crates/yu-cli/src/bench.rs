@@ -35,6 +35,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     };
     let skip_wasm = args.switch("skip-wasm");
     let skip_server = args.switch("skip-server");
+    // debug 语料对拍口径(DIV-L-001):官方 debug 构建 `_DEBUGMODE=1`。
+    let debug_mode = match args.flag("debug-mode") {
+        Some(value) => ArgReader::on_off("debug-mode", &value)?,
+        None => false,
+    };
     args.finish()?;
 
     let project = Project::discover(Path::new(&root), None)?;
@@ -54,7 +59,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     ));
 
     // 1/2. boot + 逐帧(off)。
-    let off = measure_boot(&project, false)?;
+    let off = measure_boot(&project, false, debug_mode)?;
     rows.extend(off.rows("record_events=off"));
     output::line(format!(
         "boot(off): {:.2} ms; first tick {:.2} ms; first drawable at frame {} after {:.2} ms",
@@ -67,7 +72,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     }
 
     // 同一条链开事件记录再跑一次(信息项 + 输出守恒检查)。
-    let on = measure_boot(&project, true)?;
+    let on = measure_boot(&project, true, debug_mode)?;
     rows.extend(on.rows("record_events=on"));
     output::line(format!(
         "boot(on): {:.2} ms; first tick {:.2} ms; first drawable at frame {} after {:.2} ms",
@@ -338,12 +343,13 @@ impl BootStats {
     }
 }
 
-fn measure_boot(project: &Project, record_events: bool) -> CliResult<BootStats> {
+fn measure_boot(project: &Project, record_events: bool, debug_mode: bool) -> CliResult<BootStats> {
     let created = Instant::now();
     let mut engine = Engine::new(
         project.clone(),
         EngineOptions {
             record_events,
+            debug_mode,
             ..EngineOptions::default()
         },
     )?;

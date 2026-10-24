@@ -205,6 +205,9 @@ fn main() {
         screen_color: 32,
         // 频度用 command_hits;关事件流的 Command/Jump 预求值(热路径)。
         record_events: false,
+        // 官方 debug 构建口径对拍(B4/DIV-L-001):`YURIS_DEBUG_MODE=1`
+        // 注入 @_DEBUGMODE=1;缺省 false(与 §0 基线同口径)。
+        debug_mode: std::env::var("YURIS_DEBUG_MODE").map(|v| v == "1").unwrap_or(false),
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(src, Some(aux), cfg).expect("boot");

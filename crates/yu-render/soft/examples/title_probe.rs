@@ -65,11 +65,13 @@ fn run() -> Result<(), String> {
             YpfSource::open(&ypf, Codec::Cp932)
                 .map_err(|d| format!("打开 {} 失败: {}", ypf.display(), d.detail))?,
         ),
-        None => Box::new(
-            DirSource::open(&data_dir, Codec::Cp932).map_err(|d| {
-                format!("打开 {} 失败(且无 data.ypf): {}", data_dir.display(), d.detail)
-            })?,
-        ),
+        None => Box::new(DirSource::open(&data_dir, Codec::Cp932).map_err(|d| {
+            format!(
+                "打开 {} 失败(且无 data.ypf): {}",
+                data_dir.display(),
+                d.detail
+            )
+        })?),
     };
     let aux = DirSource::open(&root_path, Codec::Cp932)
         .map_err(|d| format!("打开 {} 失败: {}", root_path.display(), d.detail))?;
@@ -79,9 +81,11 @@ fn run() -> Result<(), String> {
         record_events: false,
         // 标题锚点用工程配置运行值 @_DEBUGMODE=0
         // (<project-eris>/save/data/config/projectconfig.txt DEBUGMODE=0);
-        // debug_mode=true 在本语料会走 debug UI,1200 tick 内不进 title(黑帧)。
-        // 证据与对照见 docs/title-motion-ledger.md §9。
-        debug_mode: false,
+        // `YURIS_DEBUG_MODE=1` 走 debug 分支对照(B4:debug=true 已可进 title,
+        // DIV-L-001 复核;黑帧根因 = _MOUSE_X2 误判按钮,已修)。
+        debug_mode: std::env::var("YURIS_DEBUG_MODE")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         paths: host_paths(&root_path),
         ..BootConfig::default()
     };
@@ -99,16 +103,14 @@ fn run() -> Result<(), String> {
 
     let mut mount = Mount::new(Codec::Cp932);
     if let Some(ypf) = ypf_path(&root_path) {
-        mount.push(Box::new(
-            YpfSource::open(&ypf, Codec::Cp932)
-                .map_err(|d| format!("打开 {} 失败: {}", ypf.display(), d.detail))?,
-        ));
+        mount.push(Box::new(YpfSource::open(&ypf, Codec::Cp932).map_err(
+            |d| format!("打开 {} 失败: {}", ypf.display(), d.detail),
+        )?));
     }
     if data_dir.is_dir() {
-        mount.push(Box::new(
-            DirSource::open(&data_dir, Codec::Cp932)
-                .map_err(|d| format!("打开 {} 失败: {}", data_dir.display(), d.detail))?,
-        ));
+        mount.push(Box::new(DirSource::open(&data_dir, Codec::Cp932).map_err(
+            |d| format!("打开 {} 失败: {}", data_dir.display(), d.detail),
+        )?));
     }
     let limit: u32 = env::var("YURIS_TITLE_PROBE_LIMIT")
         .ok()
@@ -173,7 +175,7 @@ fn run() -> Result<(), String> {
             let TextureRef::Asset(key) = &layer.texture else {
                 continue;
             };
-            if key.windows(7).any(|w| w == b"cgsys/" ) || key.windows(4).any(|w| w == b"btn_") {
+            if key.windows(7).any(|w| w == b"cgsys/") || key.windows(4).any(|w| w == b"btn_") {
                 title_keys += 1;
             }
             if resolved.contains_key(key) {
@@ -226,10 +228,7 @@ fn run() -> Result<(), String> {
     }
     println!("\n# assets (key\tcode\tdetail\tframes)");
     for (key, (code, detail, frames)) in &missing {
-        println!(
-            "ASSET\t{}\t{code}\t{detail}\t{frames}",
-            display_bytes(key)
-        );
+        println!("ASSET\t{}\t{code}\t{detail}\t{frames}", display_bytes(key));
     }
     println!("\n# trace");
     for line in &title_events {
@@ -245,7 +244,10 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn collect_skips(frame: &CompositorFrame, skipped: &mut BTreeMap<(&'static str, String, String), u32>) {
+fn collect_skips(
+    frame: &CompositorFrame,
+    skipped: &mut BTreeMap<(&'static str, String, String), u32>,
+) {
     for pass in &frame.passes {
         for op in &pass.ops {
             if let OpStatus::Unimplemented(reason) = op.status() {
@@ -321,11 +323,7 @@ fn op_target(op: &Op) -> String {
         Op::Transition(transition) => transition.layer.id.display(),
         Op::Mask(mask) => mask.layer.id.display(),
         Op::Copy(copy) => copy.dest.display(),
-        Op::Image(image) => image
-            .target
-            .as_ref()
-            .unwrap_or(&image.source)
-            .display(),
+        Op::Image(image) => image.target.as_ref().unwrap_or(&image.source).display(),
     }
 }
 

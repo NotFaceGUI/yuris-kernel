@@ -100,7 +100,9 @@ fn run() -> Result<(), String> {
         frame_ms: 16,
         screen_color: 32,
         record_events: false,
-        debug_mode: false,
+        debug_mode: std::env::var("YURIS_DEBUG_MODE")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         paths: host_paths(&root_path),
         ..BootConfig::default()
     };

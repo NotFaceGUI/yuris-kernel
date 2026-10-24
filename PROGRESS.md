@@ -6204,3 +6204,120 @@ $ cargo test -p yu-rt → lib 66 passed
 - 并行干扰留痕:本批进行中的 state.rs/error.rs/decode.rs 曾被外部
   `git stash`(stash@{0} "parallel-sound-break")移出工作区;已按原样恢复
   (stash 未消耗)。工作区归主人裁决,零 git 写操作。
+
+## 成果 DIV50 取证 (2026-10-24) · RT-050 命令级对拍收口:官方菜单走「替换式」打开,内核误走「嵌套式+空栈基座推入」
+
+> 任务:主人令「结合上下文/代码/引擎/SDK/源码脚本排查 RT-50,怀疑命令未实现或差异」。
+> 结论:**不是命令缺失,是同一点击走了不同脚本路径**。零引擎代码改动(纯取证)。
+
+### 1. 方法与工具(全部可复现)
+
+- 官方侧:`target/tmp/official/div50f/hits.jsonl`(60,000 条,bp=CG/CGACT/CGEND handler;
+  pc 语义与内核 `Cmd.pc` 一致,manifest 佐证)。新增按 pc 反汇编/调用点扫描三件套
+  (untracked example,`crates/yu-rt/examples/`):`dump_pc_cmds`(含窗口 slot 复合赋值码
+  `~1`=+=、`~2=`-=)、`scan_gosub_callers`、`scan_var_refs`。
+- 内核侧:`vm.rs::step_one` 临时注入 `YU_CMD_TRACE` 环境开关(每命令打印
+  frame/script/pc/命令名 + @1019 当前值;**已回滚**),复跑
+  `input_probe --frames 480 --click 300,217,281 --click 470,750,583`
+  → `target/tmp/div50k/trace2.log`(728 万行)。
+
+### 2. 关键事实链(证据锚点均为 script/pc)
+
+- **官方菜单打开(tick477)**:恰好 1 次 `es.CGTSS`(s8 pc334/335/337/338,含
+  **RECTPAINT2 SET=255**)+ 淡出任务 2 tick(pc502×2)+ CGEND CGS100(pc391);
+  **无 `es.CGSSS`(pc298/299/301)、无 `es.CGTA`(pc366)**;tick484 弹窗自动存档
+  (s19 pc312/313/343)+ 菜单按钮风暴(s0 pc1940/2148/1877×16)。
+  全 trace CGSSS 仅 tick737 出现 1 次 ⇒ **官方从未在菜单处推 CGS 截图层**。
+- **内核菜单打开(f470)**:s0 事件循环 pc2424 → `ES.GAMEMAIN.BTN.MENU.ON`(s52 pc434)
+  → pc440 `es.S.GOSUB("ES.MENU")` → s8 pc79(硬编码 PINT2=1)→ `es.SS.GOSUB` pc192
+  判假 → ELSE 臂 pc199-211:CGTSS + CGTA(0) + **pc205 IF(@1019==0) 判真 → pc206
+  `es.CGSSS` 推 `:/W0/CGS1`(z=9.5e10,A=256,持久)** → CGTA(256) → pc213 `@1019+=1`。
+  CGS1 在 40% 暗纱下永久可见 = RT-050 可观测面。
+- **@1019 记账**(全程仅 3 翻转):f227 标题打开(s20 pc63 `es.S.GOSUB("ES.TITLE")`)
+  +1(pc213,slot~1)→ f397 标题退出(es_title pc87 → SS.RETURN pc226,slot~2)−1 →
+  f470 菜单读到 0。启动链 ES.FIRST/ES.GAMEMAIN 均走 `es.S.GO`(s8 pc13 / s10 pc123,
+  **替换式,不 +1**)⇒ 记账本身自洽,计数器实现无误。
+- **根因定论**:官方菜单打开**不经过 `es.SS.GOSUB` 两臂**(THEN 必随 CGSSS、ELSE 必随
+  CGTA,官方两者皆无)⇒ 官方走 `es.SS.GO`(pc178)或 `es.SS.RETURN`(pc222)的
+  「替换/返回」式路径;内核走「嵌套覆盖」式 ⇒ 差异在**上游按钮事件处理**
+  (内核由 es_button 直接 GOSUB ON 标签;官方疑似 `ES.GAMEMAIN.BTLOOP`(s20 pc296+)
+  就地消费底栏按钮事件)。
+- **勘误**:旧记「调用方 PINT2=0 → .OVER」为误读(那是数据参数;选择器是 pc79 硬编码
+  PINT2=1,内核实际正确走了 ELSE);「CGSDELALL 未执行」「截图黑帧/亮帧」两候选均排除。
+
+### 3. 台账与残留
+
+- DIV-RT-050 文档全量重写(状态 open,根因/勘误/修法/回归齐备);三次渲染层补丁的
+  否决教训留痕。
+- 待办(下次):官方 **GOSUB 级补采**(bp=GOSUB,仅采 pc∈{178,193,200,222,307})定位
+  官方 CGTSS 调用点 → 对拍定第一个路径分歧(预计在 `es.BT.BTLOOP` 事件消费语义)。
+- 次要分歧挂账:RECTPAINT2 SET=255 像素语义对拍;幕布淡出 ms→帧换算
+  (官方菜单 2 tick / 500ms 场景 33 tick,内核恒 ~14 tick)。
+- 工作区:vm.rs 探针已回滚;`dump_pc_cmds`/`scan_gosub_callers`/`scan_var_refs`
+  三个取证 example 留存待主人裁决;并行会话改动未触碰。
+
+## 成果 B4 (2026-10-24) · debug_mode 注入链:黑帧定案 + CLI 旗标 + 双口径 census
+
+### 1. 内容
+
+- **黑帧定案(DIV-L-001 复核)**:`debug_mode=true` 黑帧不进 title 的根因
+  不是 rt debug 分支语义,而是调试 UI(ERIS s66,debug 任务在 f1 建立调试窗)
+  读 `_MOUSE_X2` 时内核误判为「工程 ycd 未声明按钮」→ Fatal → SYSTEM 主任务
+  frame 3 被摘链 → s58 `ES.TITLE.LOOP` 永不执行。REA 定案(官方 0.495,
+  sha256 `4f5eefa3…`,手册无页 → fixed(no-manual)):`FUN_00427350` case
+  0x85..0x8e = `_MOUSE_X/Y0..3` 是 4 窗口槽客户区坐标族(槽表
+  `DAT_008019c0..cc`,每槽 HWND@+0x5b0/X@+0x5b8/Y@+0x5bc;case 0x85/0x86
+  同槽 ⇒ `_MOUSE_X`≡`_MOUSE_X0`);每帧 `FUN_00403ee0`:槽无窗口 ⇒ 坐标 0,
+  不报错。修点:`yu-rt/src/sysvar.rs`(读)+ `yu-rt/src/vm/handlers.rs`
+  (写路径按钮过滤器排除 X/Y0..3)。
+- **CLI 五子命令 `--debug-mode on|off`**:run/serve/dev/case/bench 全接线
+  (dev 透传引擎子进程);help 文本补注入口径说明(DIV-L-001)。
+- **示例/测试去硬编码**:9 处 `debug_mode: false` 改 `YURIS_DEBUG_MODE=1`
+  环境门控(soft first_frame/frame_walk/title_probe/text_probe、wgpu 同名、
+  host-desktop、eris_first_screen ×3、coverage_census/gfx_census;
+  eris_dump 既有门控保持)。
+- **eris_first_screen 双模式**:false 锚点不变(golden 文件 272/8/82/85);
+  debug 模式独立 census 断言(299/18/93/104/90,W1/DBG + W2 调试窗 13 层);
+  新增 `eris_first_screen_debug_mode_draws_and_reaches_title`(140 帧零错误、
+  零 Fatal、主任务 s8 存活、可见层 >0)。
+
+### 2. 验证(原始结果)
+
+```text
+$ emit_kernel_events --debug-mode true --frames 300(修复前)
+  script58 cmds=0(黑帧);修复后 first at frame 126(2823 条)
+  与 debug=false 同帧进入(126)
+
+$ PROBE_DEBUG=1 探针(修复前)f3: ERR task SYSTEM s66 pc634:
+  Fatal[rt.sysvar.unimplemented] _MOUSE_X2:工程 ycd 未声明该按钮
+(修复后)300 帧零 ERR,SYSTEM 存活 s8 pc37
+
+$ cargo test -p yu-gfx --test eris_first_screen(默认与 YURIS_DEBUG_MODE=1 各一轮)
+  4 passed; 0 failed(两轮)
+
+$ cargo test -p yu-rt --lib → 66 passed
+$ cargo test -p yu-cli --lib → 13 passed(需 YURIS_TEST_TMP 指向可写目录;
+  缺省 temp 不可写是环境问题,project.rs 三例 PermissionDenied 与本批无关)
+
+$ coverage_census 600 8(false 口径)= 7,735,437 命令,与 B6 基线逐字节一致
+  (B4 内核改动不碰 false 路径);YURIS_DEBUG_MODE=1(debug 口径)
+  = 8,764,407(+1,028,970 = 调试 UI 自身流量;TASKINFO 2,985/CGINFO +370);
+  零 Fatal、零新挂号码。gfx_census 双模式同结论(debug +1 域事件挂号)。
+  双口径结论落 `crates/yu-rt/docs/coverage-matrix.md` §0(表仍以 false 口径
+  为锚,debug 口径以 §0 注为准)。
+
+$ yu-cli case <project-eris> --all → 9 passed; 0 failed
+  注:8 条期望漂移与 corpus 2 例(loose/packed)失败经 A/B 隔离
+  (HEAD 版 src 产出同哈希/同失败)证实为 B4 之前已有(P8 字体等已入库
+  显示变化未重生成期望;散盘语料 143 文件 vs 封包全集),按既有
+  `--update` 流程重生成,ops 面无 B4 相关变化。
+```
+
+### 3. 台账
+
+- todo-inventory §5 行 3(P0 挂两轮)划掉;audit-2026-10-24 §1 P0-4 划掉;
+  DIV-L-001 加 B4 复核节;coverage-matrix §0 双口径 + §3 加
+  `_MOUSE_X0..3/Y0..3` 行(fixed(no-manual))。
+- 遗留移交:corpus loose/packed 2 例(散盘语料漂移,与 B5 数据入口相关);
+  WINDOWINFO 371 vs 129 的 +242 归因(B4 前已存在,随 B2 字段族收口复核);
+  B12 口径注:census 现可按 debug 构建口径对拍官方。

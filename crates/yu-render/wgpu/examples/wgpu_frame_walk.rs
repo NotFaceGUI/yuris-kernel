@@ -47,11 +47,13 @@ fn run() -> Result<(), String> {
             YpfSource::open(&ypf, Codec::Cp932)
                 .map_err(|d| format!("打开 {} 失败: {}", ypf.display(), d.detail))?,
         ),
-        None => Box::new(
-            DirSource::open(&data_dir, Codec::Cp932).map_err(|d| {
-                format!("打开 {} 失败(且无 data.ypf): {}", data_dir.display(), d.detail)
-            })?,
-        ),
+        None => Box::new(DirSource::open(&data_dir, Codec::Cp932).map_err(|d| {
+            format!(
+                "打开 {} 失败(且无 data.ypf): {}",
+                data_dir.display(),
+                d.detail
+            )
+        })?),
     };
     let aux = DirSource::open(&root_path, Codec::Cp932)
         .map_err(|d| format!("打开 {} 失败: {}", root_path.display(), d.detail))?;
@@ -61,9 +63,11 @@ fn run() -> Result<(), String> {
         record_events: false,
         // 标题锚点用工程配置运行值 @_DEBUGMODE=0
         // (<project-eris>/save/data/config/projectconfig.txt DEBUGMODE=0);
-        // debug_mode=true 在本语料会走 debug UI,1200 tick 内不进 title(黑帧)。
-        // 证据与对照见 docs/title-motion-ledger.md §9。
-        debug_mode: false,
+        // `YURIS_DEBUG_MODE=1` 走 debug 分支对照(B4:debug=true 已可进 title,
+        // DIV-L-001 复核;黑帧根因 = _MOUSE_X2 误判按钮,已修)。
+        debug_mode: std::env::var("YURIS_DEBUG_MODE")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         paths: host_paths(&root_path),
         ..BootConfig::default()
     };
@@ -74,23 +78,24 @@ fn run() -> Result<(), String> {
         vm.tables().boot.config.height,
     );
     let state = Rc::new(RefCell::new(
-        GfxState::from_tables(vm.tables(), GfxConfig::new(viewport).with_dx_mode(dx_mode()))
-            .map_err(|d| format!("GfxState 构造失败: {}", d.detail))?,
+        GfxState::from_tables(
+            vm.tables(),
+            GfxConfig::new(viewport).with_dx_mode(dx_mode()),
+        )
+        .map_err(|d| format!("GfxState 构造失败: {}", d.detail))?,
     ));
     vm.set_graphics_host(Box::new(GfxHost::new(state.clone())));
 
     let mut mount = Mount::new(Codec::Cp932);
     if let Some(ypf) = ypf_path(&root_path) {
-        mount.push(Box::new(
-            YpfSource::open(&ypf, Codec::Cp932)
-                .map_err(|d| format!("打开 {} 失败: {}", ypf.display(), d.detail))?,
-        ));
+        mount.push(Box::new(YpfSource::open(&ypf, Codec::Cp932).map_err(
+            |d| format!("打开 {} 失败: {}", ypf.display(), d.detail),
+        )?));
     }
     if data_dir.is_dir() {
-        mount.push(Box::new(
-            DirSource::open(&data_dir, Codec::Cp932)
-                .map_err(|d| format!("打开 {} 失败: {}", data_dir.display(), d.detail))?,
-        ));
+        mount.push(Box::new(DirSource::open(&data_dir, Codec::Cp932).map_err(
+            |d| format!("打开 {} 失败: {}", data_dir.display(), d.detail),
+        )?));
     }
     let probe_order = state.borrow().frame().image_probe_order.clone();
     let store = TextureStore::new(Box::new(mount), Codec::Cp932, probe_order);

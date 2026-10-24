@@ -43,6 +43,12 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     // 存档根重定向(P4/B1):给显式目录 = 可写(存档真落盘);
     // 缺省 = 工程根 save/(只读保护,SAVE 刷盘被拒)。
     let save_root = args.flag("save-root").map(PathBuf::from);
+    // debug 语料对拍口径(DIV-L-001):官方 debug 构建 `_DEBUGMODE=1`,
+    // 分支语义(如 script 20 的 debug 任务)依赖该注入。
+    let debug_mode = match args.flag("debug-mode") {
+        Some(value) => ArgReader::on_off("debug-mode", &value)?,
+        None => false,
+    };
     args.finish()?;
 
     let project = Project::discover(Path::new(&root), data.as_deref())?;
@@ -50,6 +56,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         backend,
         entry,
         record_events,
+        debug_mode,
         save_root,
         ..EngineOptions::default()
     };
