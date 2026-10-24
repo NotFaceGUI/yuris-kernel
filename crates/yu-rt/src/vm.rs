@@ -300,6 +300,8 @@ pub struct Vm {
     graphics_host: Option<Box<dyn crate::event::GraphicsHost>>,
     /// 声音域同步宿主(可选;SOUND/SOUNDEND 消费 + SOUNDINFO 查询)。
     sound_host: Option<Box<dyn crate::event::SoundHost>>,
+    /// 存档域同步宿主(可选;SAVE 预约/刷盘 + LOAD 拉取,B1 裁 1-A/2-A)。
+    save_host: Option<Box<dyn crate::event::SaveHost>>,
     events: Vec<VmEvent>,
     diags: MemorySink,
     pending_effects: Vec<Effect>,
@@ -534,6 +536,7 @@ impl Vm {
             binding,
             graphics_host: None,
             sound_host: None,
+            save_host: None,
             events: Vec::new(),
             diags: MemorySink::new(),
             pending_effects: Vec::new(),
@@ -782,6 +785,19 @@ impl Vm {
     /// 取走声音宿主(便于宿主自己持有 `Rc` 状态)。
     pub fn take_sound_host(&mut self) -> Option<Box<dyn crate::event::SoundHost>> {
         self.sound_host.take()
+    }
+
+    /// 安装存档域同步宿主(B1)。安装后 `SAVE`/`LOAD`/`SAVEEND` 在**命令
+    /// 时刻**走 [`crate::event::SaveHost`] 的预约/刷盘/拉取契约;域事件
+    /// 照常产生(trace 事实流,现在携带 `SET`/`LET` 的变量引用)。宿主
+    /// 自身不得再消费这三条命令的 DomainCall(会重复)。
+    pub fn set_save_host(&mut self, host: Box<dyn crate::event::SaveHost>) {
+        self.save_host = Some(host);
+    }
+
+    /// 取走存档宿主。
+    pub fn take_save_host(&mut self) -> Option<Box<dyn crate::event::SaveHost>> {
+        self.save_host.take()
     }
 
     /// 因容量上限被丢弃的最旧事件数。

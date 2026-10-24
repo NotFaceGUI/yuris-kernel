@@ -286,13 +286,55 @@ pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> 
 }
 
 impl Vm {
+    /// 引用型参数槽白名单(DIV-RT-042,B1 裁 1-A):该命令的哪些槽在引擎里
+    /// 传**变量地址**(REA SAVE `0x44c45c`:身份经 `0x683a60/0x683c00/
+    /// 0x683da0[slot]` 三表;LOAD `0x44708c` 的 LET 同型;FILEINFO
+    /// `0x4432dc`/SOUNDINFO `0x44f4bc` 的 LET 同族)。事件在求值结果之外
+    /// 保留归一化 `VarRef`;其余命令/槽维持只传值(M-2 形态,普查不变)。
+    fn reference_slot_names(cmd: &str) -> Option<&'static str> {
+        match cmd {
+            "SAVE" => Some("SET"),
+            "LOAD" | "FILEINFO" | "SOUNDINFO" => Some("LET"),
+            _ => None,
+        }
+    }
+
     /// 把命令窗口逐条求值成 `(槽号, 值)`。跳转窗口与空窗口跳过;
     /// 求值失败省略该窗口(处理器/诊断会给出真正的失败原因)。
     fn eval_arg_windows(&mut self, st: &mut ExecState, cmd: &Cmd) -> Vec<ArgValue> {
+        // 引用槽号(有白名单时按工程 yscm 参数名解析;查不到表 = 无引用槽)。
+        let ref_name = Self::reference_slot_names(&cmd.name);
+        let ref_slots: Vec<u8> = ref_name
+            .map(|want| {
+                self.tables()
+                    .boot
+                    .yscm
+                    .command(cmd.opcode)
+                    .map(|c| {
+                        c.params
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, p)| p.name == want)
+                            .map(|(i, _)| i as u8)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
         let mut args = Vec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
+            }
+            if ref_slots.contains(&w.rec.kind) {
+                // 引用槽:保留变量身份。求值失败退回普通值求值(原形态)。
+                if let Ok(lv) = self.eval_lvalue_window(st, w) {
+                    let var = self.canonical_var(lv.var);
+                    if let Ok(v) = self.read_var(st, var, &lv.indices) {
+                        args.push(ArgValue::with_ref(w.rec.kind, v, var));
+                        continue;
+                    }
+                }
             }
             if let Ok(v) = self.eval_window(st, w) {
                 args.push(ArgValue::new(w.rec.kind, v));
@@ -421,6 +463,17 @@ impl Vm {
                 // 保证 600 帧普查逐位不变。
                 if domain == Domain::Sound && cmd.name == "SOUNDINFO" && self.sound_host.is_some() {
                     return self.op_soundinfo(st, cmd);
+                }
+                // 存档域同步宿主(B1):SAVE/LOAD/SAVEEND 在命令时刻走
+                // 预约/刷盘/拉取契约(REA:预约即快照 0x44d73d,LOAD 写回
+                // 0x447b3d);SAVEINFO 无同步路径,落通用域事件。
+                if domain == Domain::Save && self.save_host.is_some() {
+                    match cmd.name.as_str() {
+                        "SAVE" => return self.op_save(st, cmd),
+                        "LOAD" => return self.op_load(st, cmd),
+                        "SAVEEND" => return self.op_saveend(st, cmd),
+                        _ => {}
+                    }
                 }
                 // 域命令的参数是宿主域状态机唯一能看到的输入;必须带上
                 // 求值结果(槽号 = 工程 ysc 表的参数序号)。`record_events`
@@ -2367,7 +2420,16 @@ impl Vm {
                 .map(String::as_str)
                 .unwrap_or("");
             match name {
-                "LET" => target = Some(self.eval_lvalue_window(st, w)?),
+                "LET" => {
+                    let lv = self.eval_lvalue_window(st, w)?;
+                    let var = self.canonical_var(lv.var);
+                    // 事件带上引用身份与当前值(DIV-RT-042;写回仍由下方
+                    // write_target 做,读值只是事件事实)。
+                    if let Ok(v) = self.read_var(st, var, &lv.indices) {
+                        args.push(ArgValue::with_ref(w.rec.kind, v, var));
+                    }
+                    target = Some(lv);
+                }
                 "FILE" | "FOLDER" => {
                     if let Ok(v) = self.eval_window(st, w) {
                         if let Value::Str(bytes) = &v {
@@ -2406,7 +2468,7 @@ impl Vm {
             self.report_unimplemented("FILEINFO", "EXIST=1 缺 FILE(FOLDER 查询未取证)".to_string());
             return Ok(StepOutcome::Continue);
         };
-        let present = match yu_vfs::LookupKey::new(&bytes, yu_vfs::Codec::Cp932) {
+        let mut present = match yu_vfs::LookupKey::new(&bytes, yu_vfs::Codec::Cp932) {
             Ok(key) => {
                 self.src.exists(&key) || self.aux.as_ref().is_some_and(|aux| aux.exists(&key))
             }
@@ -2415,11 +2477,443 @@ impl Vm {
                 false
             }
         };
+        // 「散盘」策略(REA `0x44316c` 四策略的文件系统支;语料
+        // `es.SaveDataCheck`/`es.GSD.INIT` 实测:`FILE=$es.SAVEPATH+名`):
+        // 路径以注入的 `$_SAVE_PATH` 为前缀 ⇒ save 根文件系统判存在。
+        // 缺它则存档界面的槽存在判定(`\_file.info.exist`)与启动恢复
+        // (gsd/seld/kidoku)的 FILEINFO 闸恒 0 —— B1 桌面实测暴露。
+        if !present {
+            present = self.save_root_fs_exists(&bytes);
+        }
         if let Some(target) = target {
             let value = Value::Int(if present { 1 } else { 0 });
             self.write_target(st, &target, &value)?;
         }
         Ok(StepOutcome::Continue)
+    }
+
+    /// save 根文件系统存在性(FILEINFO 的散盘支):路径以注入的
+    /// `$_SAVE_PATH` 为前缀时,剥出相对名做越界检查后查文件系统。
+    /// 注入值 = save 根的显示字符串(正斜杠、尾 `/`,`yu-cli::host_paths`)。
+    fn save_root_fs_exists(&self, path: &[u8]) -> bool {
+        let Some(root) = self
+            .paths
+            .save_path
+            .as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+        else {
+            return false;
+        };
+        let Some(rel) = path.strip_prefix(root.as_bytes()) else {
+            return false;
+        };
+        if rel.is_empty() {
+            return false;
+        }
+        let Ok(text) = std::str::from_utf8(rel) else {
+            return false;
+        };
+        if text.contains('\\') || text.split('/').any(|c| c == "..") {
+            return false;
+        }
+        std::path::Path::new(&root).join(text).exists()
+    }
+
+    // ---------------------------------------------------------- 存档域(B1)
+
+    /// 一个变量的整组快照(SAVE 预约 / LOAD 对拍用)。
+    fn var_snapshot(&self, var: VarRef) -> Option<crate::event::VarSnapshot> {
+        let slot = self.store.slot(var)?;
+        Some(crate::event::VarSnapshot {
+            ty: slot.ty,
+            dims: slot.dims.iter().map(|&d| d as u32).collect(),
+            data: slot.data.clone(),
+        })
+    }
+
+    /// `(值类型, 组号)` 匹配的全局变量快照,顺序 = 工程变量表(ysv 记录序;
+    /// 与 `VARACT[INIT]` 的恢复序同源)。
+    fn globals_of_group(&self, ty: ElemType, group: u8) -> Vec<(u16, crate::event::VarSnapshot)> {
+        self.globals_restore
+            .iter()
+            .filter(|g| g.group == group && g.ty == ty)
+            .filter_map(|g| {
+                let var = g.var;
+                self.var_snapshot(var).map(|snap| (var.id, snap))
+            })
+            .collect()
+    }
+
+    /// `SAVE`:手册 `file/save.html`;REA 0.495 处理体 `0x44c45c`(opcode 84,
+    /// 分发表 `0x7ace20[84]`;任务书旧锚 `0x44e1c8` 实为 SAVEINFO,勘误)。
+    ///
+    /// 参数序(官方 ycd):FILE(0)/DNO(1)/SET(2)/ID(3)/IDNO(4)/
+    /// G_INT(5)..G_STR4(16)。取证要点:
+    /// - `SET=@x`/`SET=@x()` = 变量引用;块内容 = 该变量**当前全部元素**
+    ///   (尺寸式 `0x44d5dd`;官方 seld.sd Int[2001]、save50001 标量
+    ///   dims=[] 自证);
+    /// - **预约即快照**:`SAVE[DNO]` 时刻 `0x44d73d` 序列化当前值(zlib 压缩
+    ///   后入预约表),`SAVE[FILE]` 只写文件头/偏移表并流出预约块
+    ///   (`0x44cd5a..`);同 DNO 重复预约 = 替换(`0x44c740`);
+    /// - `G_<族><组>=1`:按首个在场旗标(官方级联序 G_INT→G_INT2→G_INT3→
+    ///   G_INT4→G_FLT→…)定 (类型,组),枚举全局变量表逐变量子块化
+    ///   (块类型 2;`0x44ca8a..0x44cc57`);
+    /// - `ID=` 图层快照 = H-P4-02(挂账,不阻塞变量保存);
+    /// - FILE 缺 `.sd` 补上、含 `.sd` 超 32 字节报错(手册 + REA `0x44c663`)。
+    fn op_save(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let names: Vec<String> = self
+            .tables()
+            .boot
+            .yscm
+            .command(cmd.opcode)
+            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+        let mut file: Option<String> = None;
+        let mut dno: Option<i64> = None;
+        let mut set: Option<(LValue, Value)> = None;
+        let mut layer_id = false;
+        // G_* 旗标按官方级联序的**首个在场**生效(与值无关,DIV-RT-019 同判)。
+        let mut group_slot: Option<(ElemType, u8)> = None;
+        let mut args: Vec<ArgValue> = Vec::new();
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let name = names
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or("");
+            match name {
+                "SET" => {
+                    let lv = self.eval_lvalue_window(st, w)?;
+                    let var = self.canonical_var(lv.var);
+                    let v = self.read_var(st, var, &lv.indices)?;
+                    args.push(ArgValue::with_ref(w.rec.kind, v.clone(), var));
+                    set = Some((lv, v));
+                }
+                "FILE" => {
+                    if let Ok(v) = self.eval_window(st, w) {
+                        if let Value::Str(bytes) = &v {
+                            file = Some(
+                                yu_format::Codec::Cp932
+                                    .decode(bytes, b"save-file")
+                                    .unwrap_or_else(|_| {
+                                        String::from_utf8_lossy(bytes).into_owned()
+                                    }),
+                            );
+                        }
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                "DNO" => {
+                    if let Ok(v) = self.eval_window(st, w) {
+                        dno = v.as_int();
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                "ID" => {
+                    layer_id = true;
+                    if let Ok(v) = self.eval_window(st, w) {
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                "G_INT" | "G_INT2" | "G_INT3" | "G_INT4" | "G_FLT" | "G_FLT2" | "G_FLT3"
+                | "G_FLT4" | "G_STR" | "G_STR2" | "G_STR3" | "G_STR4" => {
+                    // 组旗标按官方级联序取**首个在场**(与值无关;DIV-RT-019
+                    // 存在性判定同族)。
+                    if group_slot.is_none() {
+                        if let Ok(v) = self.eval_window(st, w) {
+                            group_slot = Some(Self::group_of_name(name));
+                            args.push(ArgValue::new(w.rec.kind, v));
+                        }
+                    }
+                }
+                _ => {
+                    if let Ok(v) = self.eval_window(st, w) {
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+            }
+        }
+        self.emit_domain(Domain::Save, "SAVE", args);
+        if layer_id {
+            // 图层快照需要 gfx(CGETSCREEN 类),H-P4-02 交接;官方 SAVE
+            // 的 ID 分支与变量保存同函数不同路径,不互相阻塞。
+            self.report_unimplemented(
+                "SAVE",
+                "SAVE[ID] 图层快照未实现(H-P4-02;变量保存不受影响)".to_string(),
+            );
+        }
+        // 预约(DNO 在场;官方 DNO 与 FILE 可同条,先预约后刷盘)。
+        if let Some(dno) = dno {
+            if !(1..=1024).contains(&dno) {
+                self.report(diag::recoverable(
+                    code::rt::CMD_SLOT,
+                    Boundary::Script,
+                    format!("SAVE DNO={dno} 越界(手册 file/save.html:1~1024)"),
+                ));
+                return Ok(StepOutcome::Continue);
+            }
+            let dno = dno as u32;
+            if let Some((ty, group)) = group_slot {
+                let vars = self.globals_of_group(ty, group);
+                let failure = match self.save_host.as_mut() {
+                    Some(host) => host.reserve_group(dno, ty, group, &vars).err(),
+                    None => None,
+                };
+                if let Some(d) = failure {
+                    return Err(VmError::from(self.locate(d)));
+                }
+            } else if let Some((lv, _)) = set {
+                let var = self.canonical_var(lv.var);
+                let snap = self.var_snapshot(var);
+                match snap {
+                    Some(snap) => {
+                        let failure = match self.save_host.as_mut() {
+                            Some(host) => host.reserve(dno, var, &snap).err(),
+                            None => None,
+                        };
+                        if let Some(d) = failure {
+                            return Err(VmError::from(self.locate(d)));
+                        }
+                    }
+                    None => {
+                        self.report(diag::recoverable(
+                            code::rt::VAR_UNDECLARED,
+                            Boundary::Script,
+                            format!("SAVE[SET] 目标未声明 {}(不猜块内容)", var.display()),
+                        ));
+                    }
+                }
+            } else {
+                self.report(diag::recoverable(
+                    code::rt::CMD_SLOT,
+                    Boundary::Script,
+                    "SAVE 缺 SET/G_*(无内容可预约)",
+                ));
+            }
+        }
+        // 刷盘(FILE 在场;官方先写头/偏移表再流出预约块)。
+        if let Some(file) = file {
+            let name = Self::ensure_sd_ext(&file);
+            if name.len() > 32 {
+                self.report(diag::recoverable(
+                    code::rt::CMD_SLOT,
+                    Boundary::Script,
+                    format!("SAVE[FILE] 名字含 .sd 超 32 字节(手册 file/save.html): {file}"),
+                ));
+                return Ok(StepOutcome::Continue);
+            }
+            let failure = match self.save_host.as_mut() {
+                Some(host) => host.flush(&name).err(),
+                None => None,
+            };
+            if let Some(d) = failure {
+                return Err(VmError::from(self.locate(d)));
+            }
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    /// `LOAD`:手册 `file/load.html`;REA 0.495 处理体 `0x44708c`(opcode 55)。
+    ///
+    /// 取证要点:偏移表寻址 = `0xC + DNO*4`(`0x44735a`);块类型 2 逐子块
+    /// **按块内 var_id 直接恢复**(`0x447460..0x4474de`,不读 `LET`/`G_*`
+    /// 在场位——语料 `LOAD[... G_INT3=1]` 的组旗标被求值但不消费);
+    /// 块类型 0 写 `LET` 目标整组(`0x447b3d`);`ID=` 图层恢复 = H-P4-02。
+    /// 类型/维数不符官方报错(手册:「サイズが違う場合は、エラー」)。
+    fn op_load(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let names: Vec<String> = self
+            .tables()
+            .boot
+            .yscm
+            .command(cmd.opcode)
+            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+        let mut file: Option<String> = None;
+        let mut dno: Option<i64> = None;
+        let mut target: Option<LValue> = None;
+        let mut layer_id = false;
+        let mut args: Vec<ArgValue> = Vec::new();
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let name = names
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or("");
+            match name {
+                "LET" => {
+                    let lv = self.eval_lvalue_window(st, w)?;
+                    let var = self.canonical_var(lv.var);
+                    if let Ok(v) = self.read_var(st, var, &lv.indices) {
+                        args.push(ArgValue::with_ref(w.rec.kind, v, var));
+                    }
+                    target = Some(lv);
+                }
+                "FILE" => {
+                    if let Ok(v) = self.eval_window(st, w) {
+                        if let Value::Str(bytes) = &v {
+                            file = Some(
+                                yu_format::Codec::Cp932
+                                    .decode(bytes, b"load-file")
+                                    .unwrap_or_else(|_| {
+                                        String::from_utf8_lossy(bytes).into_owned()
+                                    }),
+                            );
+                        }
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                "DNO" => {
+                    if let Ok(v) = self.eval_window(st, w) {
+                        dno = v.as_int();
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                "ID" => {
+                    layer_id = true;
+                    if let Ok(v) = self.eval_window(st, w) {
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                _ => {
+                    if let Ok(v) = self.eval_window(st, w) {
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+            }
+        }
+        self.emit_domain(Domain::Save, "LOAD", args);
+        if layer_id {
+            self.report_unimplemented(
+                "LOAD",
+                "LOAD[ID] 图层恢复未实现(H-P4-02;变量恢复不受影响)".to_string(),
+            );
+            return Ok(StepOutcome::Continue);
+        }
+        let Some(file) = file else {
+            self.report(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                "LOAD 缺 FILE",
+            ));
+            return Ok(StepOutcome::Continue);
+        };
+        let Some(dno) = dno else {
+            self.report(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                "LOAD 缺 DNO",
+            ));
+            return Ok(StepOutcome::Continue);
+        };
+        if !(1..=1024).contains(&dno) {
+            self.report(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                format!("LOAD DNO={dno} 越界(1..=1024)"),
+            ));
+            return Ok(StepOutcome::Continue);
+        }
+        let (dno, target) = (dno as u32, target);
+        // 宿主借用只包住容器读取;写回需要 &mut self 的变量域。
+        let loaded = match self.save_host.as_mut() {
+            Some(host) => host.load_block(&Self::ensure_sd_ext(&file), dno),
+            None => return Ok(StepOutcome::Continue),
+        };
+        let block = match loaded {
+            Ok(block) => block,
+            Err(d) => {
+                // 宿主诊断(文件缺失/容器损坏)原样入流;命令继续
+                // (语料用 IF[FILEINFO EXIST] 包裹,缺失属正常路径)。
+                self.report(d);
+                return Ok(StepOutcome::Continue);
+            }
+        };
+        for item in block.vars {
+            // 块类型 2:块自带 var_id;块类型 0:写 LET 目标。
+            let var = match item.var {
+                Some(var) => self.canonical_var(var),
+                None => match &target {
+                    Some(lv) => self.canonical_var(lv.var),
+                    None => continue, // 官方:无处可写即读后丢弃(0x44760c 路径)
+                },
+            };
+            if let Err(d) = self.restore_snapshot(var, &item.snap) {
+                self.report(d);
+            }
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    /// 把一份快照写回变量槽(类型/维数校验;手册 load.html 尺寸不符 = 错误)。
+    fn restore_snapshot(
+        &mut self,
+        var: VarRef,
+        snap: &crate::event::VarSnapshot,
+    ) -> Result<(), yu_log::Diag> {
+        let Some((ty, dims)) = self.var_shape(var) else {
+            return Err(diag::recoverable(
+                code::rt::VAR_UNDECLARED,
+                Boundary::Script,
+                format!(
+                    "LOAD 目标未声明 {}(手册:读档前脚本须先声明同型变量)",
+                    var.display()
+                ),
+            ));
+        };
+        let dims_match = dims.len() == snap.dims.len()
+            && dims.iter().zip(&snap.dims).all(|(&a, &b)| a as u32 == b);
+        if ty != snap.ty || !dims_match {
+            return Err(diag::recoverable(
+                code::rt::VAR_SHAPE,
+                Boundary::Script,
+                format!(
+                    "LOAD 类型/维数不符:目标 {} = {}{:?},块 = {}{:?}(手册 load.html)",
+                    var.display(),
+                    ty.as_str(),
+                    dims,
+                    snap.ty.as_str(),
+                    snap.dims
+                ),
+            ));
+        }
+        self.store.restore_elements(var, snap.data.clone())
+    }
+
+    /// `SAVEEND`:手册 `file/saveend.html`(清预约);官方体 `0x44e1a0`。
+    fn op_saveend(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let args = self.eval_arg_windows(st, cmd);
+        self.emit_domain(Domain::Save, "SAVEEND", args);
+        if let Some(host) = self.save_host.as_mut() {
+            host.save_end();
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    /// `G_<族><组>` 参数名 → (值类型, 组号 1..4)。官方 ycd 名(`G_INT`=组 1
+    /// … `G_STR4`=组 4);首个在场的旗标生效由调用方保证。
+    fn group_of_name(name: &str) -> (ElemType, u8) {
+        let (ty, rest) = if let Some(rest) = name.strip_prefix("G_INT") {
+            (ElemType::Int, rest)
+        } else if let Some(rest) = name.strip_prefix("G_FLT") {
+            (ElemType::Float, rest)
+        } else {
+            (ElemType::Str, name.strip_prefix("G_STR").unwrap_or(""))
+        };
+        (ty, rest.parse::<u8>().unwrap_or(1))
+    }
+
+    /// 存档名缺 `.sd` 时补上(手册:拡張子省略可;REA SAVE `0x44c6cc..`
+    /// 检测后拼 `0x8083d8`)。
+    fn ensure_sd_ext(name: &str) -> String {
+        if name.ends_with(".sd") {
+            name.to_string()
+        } else {
+            format!("{name}.sd")
+        }
     }
 
     /// 解析 `CG[FILE]` 的像素尺寸:按工程 `yscfg` 扩展名序尝试 `.png/.bmp/
@@ -2572,7 +3066,8 @@ impl Vm {
             .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
             .unwrap_or_default();
         let mut targets: Vec<crate::expr::LValue> = Vec::new();
-        let mut args: Vec<ArgValue> = Vec::new();
+        let mut event_args: Vec<ArgValue> = Vec::new();
+        let mut query_args: Vec<ArgValue> = Vec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
@@ -2582,11 +3077,20 @@ impl Vm {
                 .map(String::as_str)
                 .unwrap_or("");
             if pname == "LET" {
-                targets.push(self.eval_lvalue_window(st, w)?);
+                // 引用身份随事件走(DIV-RT-042/B1);`query` 参数面保持原
+                // 契约(只含提问字段,LET 是答案目标);写回仍由 query 结果
+                // 经 write_target 完成。
+                let lv = self.eval_lvalue_window(st, w)?;
+                let var = self.canonical_var(lv.var);
+                if let Ok(v) = self.read_var(st, var, &lv.indices) {
+                    event_args.push(ArgValue::with_ref(w.rec.kind, v, var));
+                }
+                targets.push(lv);
                 continue;
             }
             if let Ok(v) = self.eval_window(st, w) {
-                args.push(ArgValue::new(w.rec.kind, v));
+                event_args.push(ArgValue::new(w.rec.kind, v.clone()));
+                query_args.push(ArgValue::new(w.rec.kind, v));
             }
         }
         // 事件流仍记录命令事实(trace/golden 需要);宿主会忽略 INFO 本身,
@@ -2596,7 +3100,7 @@ impl Vm {
         } else {
             Domain::Graphics
         };
-        self.emit_domain(domain, name.to_string(), args.clone());
+        self.emit_domain(domain, name.to_string(), event_args);
         if targets.is_empty() {
             self.report(diag::recoverable(
                 code::rt::CMD_SLOT,
@@ -2613,13 +3117,13 @@ impl Vm {
             return Ok(StepOutcome::Continue);
         };
         // 请求的字段名(SX/SY 才走资产元数据回退;其余字段保持原样)。
-        let wanted = args.iter().find_map(|a| {
+        let wanted = query_args.iter().find_map(|a| {
             params
                 .get(usize::from(a.slot))
                 .map(String::as_str)
                 .filter(|n| matches!(*n, "SX" | "SY"))
         });
-        let result = host.query(name, &args);
+        let result = host.query(name, &query_args);
         let mut value = match result {
             Ok(v) => Some(v),
             Err(d) => {
@@ -2634,7 +3138,7 @@ impl Vm {
                         |want: &str| params.iter().position(|p| p == want).map(|i| i as u8);
                     if let (Some(mfile_slot), Some(id_slot)) = (slot_of("MFILE"), slot_of("ID")) {
                         let idno_slot = slot_of("IDNO");
-                        let mut ask: Vec<ArgValue> = args
+                        let mut ask: Vec<ArgValue> = query_args
                             .iter()
                             .filter(|a| a.slot == id_slot || Some(a.slot) == idno_slot)
                             .cloned()
@@ -2690,7 +3194,8 @@ impl Vm {
             .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
             .unwrap_or_default();
         let mut targets: Vec<crate::expr::LValue> = Vec::new();
-        let mut args: Vec<ArgValue> = Vec::new();
+        let mut event_args: Vec<ArgValue> = Vec::new();
+        let mut query_args: Vec<ArgValue> = Vec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
@@ -2700,14 +3205,22 @@ impl Vm {
                 .map(String::as_str)
                 .unwrap_or("");
             if pname == "LET" {
-                targets.push(self.eval_lvalue_window(st, w)?);
+                // 引用身份随事件走(DIV-RT-042/B1);`query` 参数面保持原
+                // 契约(LET 是答案目标,不进提问字段)。
+                let lv = self.eval_lvalue_window(st, w)?;
+                let var = self.canonical_var(lv.var);
+                if let Ok(v) = self.read_var(st, var, &lv.indices) {
+                    event_args.push(ArgValue::with_ref(w.rec.kind, v, var));
+                }
+                targets.push(lv);
                 continue;
             }
             if let Ok(v) = self.eval_window(st, w) {
-                args.push(ArgValue::new(w.rec.kind, v));
+                event_args.push(ArgValue::new(w.rec.kind, v.clone()));
+                query_args.push(ArgValue::new(w.rec.kind, v));
             }
         }
-        self.emit_domain(Domain::Sound, "SOUNDINFO", args.clone());
+        self.emit_domain(Domain::Sound, "SOUNDINFO", event_args);
         if targets.is_empty() {
             self.report(diag::recoverable(
                 code::rt::CMD_SLOT,
@@ -2723,7 +3236,7 @@ impl Vm {
             );
             return Ok(StepOutcome::Continue);
         };
-        let result = host.query("SOUNDINFO", &args);
+        let result = host.query("SOUNDINFO", &query_args);
         self.sound_host = Some(host);
         match result {
             Ok(v) => {

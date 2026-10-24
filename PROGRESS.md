@@ -5844,3 +5844,200 @@ wgpu 菜单帧 render:修前 48-65ms → 修后 1.7-2.1ms
   的 `CGS1` 仍 visible/A=256 且内容为上一亮帧,官方背景为黑。已立
   **DIV-RT-050**(`docs/divergences/DIV-RT-050-cgs-scene-screenshot-stack.md`),
   待官方事件级 trace 定论;不在 P8 文本范围,未改代码。
+
+## 成果 AU5 (2026-10-24) · 全项目未实现面审查:四路并行 + 台账对账勘误 + 批次路线图
+
+> 承 P8。用户令:全面审查所有模块未实现面、找迫在眉睫项、对齐官方引擎/手册;
+> **手册缺页不构成不实现理由**;**修完必须划台账**。审查事实源 =
+> `docs/audit-2026-10-24.md`;第一批任务书 = `docs/tasks/task-b1-save-loop.md`。
+> 零代码行为变化(仅 1 处过时注释),零 git 写操作。
+
+### 1. 审查(四路 Explore 并行 + 主线抽查)
+
+- 覆盖:yu-rt / yu-gfx+双后端+yu-font / yu-sound+save+vfs+format+trace+log /
+  yu-cli+platform+emote+全部台账;对象 = HEAD `88eea55`、submodule `d0f03a1`。
+- 主线抽查 4 项关键论断属实:`sv.write.refused` 门禁、DIALOG 宿主零接线、
+  CLI 无 `--debug-mode`、`yu-emote` 物理未求值(`anim.rs:23`)。
+- 结论:P0 ×4(DIV-RT-042 存档闭环 / DIV-RT-050 CGS 栈 / DIALOG 宿主 /
+  debug_mode census 口径);P1 ×9(WINDOWINFO 字段族、CGINFO[COLOR]、
+  FONTINFO 清单、DirSource 非 ASCII、update1..9 挂载、serve 欠账、文本 oracle、
+  WINDOW/TRAY 宿主、存档快照);「手册缺页但 REA 证据已够」挂账 5 族
+  (DATALEFT/DATARIGHT、`_CHR`、WINDOWINFO、负 START、字体清单)。
+
+### 2. 台账勘误(本次落地;"修复了必须划掉"的第一轮清账)
+
+- `todo-inventory.md`:头部 AU5 注记;§3.2 GBK 码表已落地;§5 行8(文字桥主体
+  fixed)/行9(E-mote 以 submodule 为准)/行11(A4)/行12(C2/C3)划掉。
+- `gfx-unimplemented-todo.md`:补 058/059(P8);024→partial(J3);050→partial;
+  「TEXT 持久缺失」过时句;推进顺序第 7 条划掉。
+- `crates/yu-rt/docs/coverage-matrix.md`:FILEINFO(➖→✅ J3)/FONTINFO(→部分)/
+  WINDOWINFO(→部分,补字段族归因)/LET(→装配已解)四行勘误 + §8 口径注
+  (CDDA 域错位待一行修)。
+- `crates/yu-rt/docs/divergences/README.md`:003 补「根因已修」;011 补
+  CSVINFO/CDDA;新增 DIV-RT-050 交叉引用行。
+- `crates/yu-gfx/docs/divergences/README.md`:033/036 → partial(P2);055 撞号注记(★待裁决)。
+- `yu-gfx/src/state.rs`:FONTINFO `other =>` 过时注释修正(GRADATION/ROTATION 实已答)。
+- `docs/divergences/DIV-003`:码表已落地,剩余 = DirSource 折回。
+- `docs/emote-parity.md`:头部失真警告(§7/§8 宣称项在 `d0f03a1` 不可复核;★待主人裁子仓)。
+- `docs/symptom-ledger.md`:S2/S3d/S4/S7 销账(根因 = P7 续;界面 = P8;残留→
+  DIV-RT-050/042);H-P1-07/H-P1-08 销账头;§7.2 eprintln 勘误划掉(已清)。
+
+### 3. 门禁(原始输出)
+
+```text
+$ cargo check -p yu-gfx        # state.rs 仅注释级改动
+    Finished `dev` profile target(s) in 0.37s
+```
+
+### 4. 挂账 / 交接
+
+- **B1 任务书待主人拍三个契约点**(`docs/tasks/task-b1-save-loop.md` §0):
+  引用身份进事件的方式(推荐 ArgValue 加 `VarRef`)、LOAD 写回通道(推荐
+  SaveHost 同步接口)、既读色启动链取证口径。拍板后即可开工。
+- ★ 待主人裁决:DIV-GFX-055 撞号合并;emote-parity §7/§8 与 submodule 对齐方向;
+  examples-audit B/C 组;CI 缺位;`audit_hardcode.py` 全仓化。
+- 批次路线图 B2–B9 见 `docs/audit-2026-10-24.md` §6。
+
+## 成果 AU5 续 (2026-10-24) · 全量批次路线图定稿(至待办清空,B1–B15)
+
+> 用户令:剩余待办全部分批规划到清空;E-mote 暂缓;其余 SDK 面不允许任何
+> 「未实现」终态;手册缺页 = 凭 REA/引擎证据实现并标注,不作为挂账理由。
+
+### 1. 产出
+
+- **`docs/tasks/roadmap-batches.md`(定稿)**:B1–B15 全量细案。
+  - §0 五种终态定义:`fixed` / `fixed(no-manual)` / `aligned-stub` /
+    `unsupported-by-official` / `deferred(master)`;`unimplemented/blocked/open`
+    禁止作为终态;AU6(B15)复核时全仓 grep 归零(E-mote 域除外)。
+  - B9 = E-mote **deferred(主人令)**;B10(rt 零挂号 campaign)、B11(gfx 命令面)、
+    B12(合成/像素取证)、B13(ypf 全分支 + YSTB v2/SNP/配置块)、
+    B14(MOVIE/YMV 媒体宿主)、B15(Platform 边界/CI/AU6 清空宣告)为新增批次。
+  - 四波次并行建议;每批含条目锚点、证据路径、终态预期、强制划台账清单。
+- **`AGENTS.md` §0 政策行**:手册缺页 ≠ 不实现;`fixed(no-manual)` /
+  `aligned-stub` / `unsupported-by-official` 标注约定;`Unimplemented` 仅过渡态。
+- **`docs/audit-2026-10-24.md` §6**:改为指向路线图。
+- **`docs/todo-inventory.md` §3.2**:rt 命令行勘误(F_INT 族/MATH3D/DIALOG 实已
+  收口;剩余归 B7/B10/B14)。
+
+### 2. 待办清空的判定(路线图 §0)
+
+每条挂账先 REA 定「官方做不做」→ 官方做=实现(手册缺页就 no-manual 标注)、
+官方空桩=aligned-stub、官方也不支持=unsupported-by-official。REA 反汇编本身
+就是证据层,「三层缺层」不再构成无限期挂账理由。
+
+### 3. 门禁
+
+纯文档轮;无代码改动。`git status`:+1 文档(roadmap),3 文件修订。
+
+### 4. 挂账
+
+- B1 三个契约点仍待主人拍板(拍板即开工)。
+- B8 官方截图采集需主人桌面/官方引擎环境窗口。
+- E-mote(B9)deferred;其 emote-parity §7/§8 对齐方向仍在 ★ 清单。
+
+## 成果 B1 (2026-10-24) · 存档闭环(DIV-RT-042):引用身份 + SaveHost 同步契约
+
+> 任务书 `docs/tasks/task-b1-save-loop.md`;契约裁决 = 裁 1-A / 裁 2-A /
+> 裁 3 取证定论。**唯一功能级 P0 关闭**(audit §1 P0-1 ✅)。
+
+### 1. 取证(0.495 `yu-ris.exe` sha256 `4f5eefa3…`;capstone 递归下降,产物 `target/tmp/b1/*.asm`)
+
+- **SAVE 处理体 = `0x44c45c`**(opcode 84,分发表 `0x7ace20[84]`;
+  **任务书旧锚 `0x44e1c8` 实为 SAVEINFO 本体,勘误留痕**,SAVEINFO 挂账 B7):
+  1. `SET`/`LET` 变量身份经 `0x683a60/0x683c00/0x683da0[slot]` 三表传递
+     (`0x44c583`/`0x4471eb`)——引用,不是值;
+  2. **预约即快照**:`SAVE[DNO]` 时刻 `0x44d73d` 写 btype/strict/var/clen/ulen
+     并取当前值 zlib 压缩入预约表(`0x7fad1c`/`0x7fbe1c`);
+     `SAVE[FILE]`(`0x44cd5a..0x44ceab`)只写文件头+偏移表(容量 `0x400`、
+     版本 `0x1e0`),按 DNO 升序流出**预约时**字节;预约表不清
+     (SAVEEND `0x44e1a0` 才清;语料 es_GSD 每次刷盘后显式 SAVEEND 同型);
+  3. 同 DNO 重复预约 = 替换(`0x44c740`);
+  4. 组形态 `G_<族><组>=1`:按首个在场旗标(级联序 G_INT→…→G_STR4)定
+     (类型,组),枚举全局变量表逐变量子块化(块类型 2,
+     `0x44ca8a..0x44cc57`);
+  5. LOAD `0x44708c`:偏移寻址 `0xC+DNO*4`(`0x44735a`);块类型 2 逐子块
+     **按块内 var_id 直接恢复**(`0x447460..0x4474de`,不读 `LET`/`G_*`
+     在场位);块类型 0 写 `LET` 目标整组(`0x447b3d`)。
+- **官方 golden**(真值层级 3):`seld.sd`=1 块 var 2264(`@es.SELD`)
+  Int[2001]、值 `[1]=6`;`gsd.sd` DNO 3/4 = btype2 子块 var 1161/1162
+  (`@G(0001)`/`$G(0001)`,与 DIV-RT-017 三方对齐互证)。
+- **语料形态清点**(明文 `save/data/script/ERIS/`):标量 `SET=@X`
+  (es_Select:997)、整组 `SET=@X()`(:1025)、组形态 `SAVE[DNO=03 G_INT2=1]`
+  (es_GSD:578)、LOAD 组形态 `LOAD[... DNO=0005 G_INT3=1]`(es_Select:219)。
+- **裁 3(既读色)**:`es_First.yst:139 \GSD.INIT` → `es_GSD.yst:130` →
+  `:142 GOSUB[#=ES.SEL.FILELOAD]` → `es_Select.yst:1068
+  LOAD[FILE="seld.sd" DNO=1 LET=@es.SELD()]` —— **全是脚本命令,零内核
+  新机制**;LOAD[LET] 落地即自然接通。
+
+### 2. 实施(裁 1-A / 裁 2-A)
+
+- `yu-rt`:①`ArgValue.reference: Option<VarRef>`(白名单槽 SAVE[SET]/
+  LOAD[LET]/FILEINFO[LET]/SOUNDINFO[LET];`eval_arg_windows` 求值时保留
+  lvalue 身份,旧事件流缺字段=None);②`SaveHost` 同步契约
+  (`reserve/reserve_group/flush/save_end/load_block`)+ `Vm::set_save_host`;
+  ③`op_save/op_load/op_saveend`(命令时刻执行;FILE 缺 `.sd` 补齐、
+  名 >32B 报错,REA `0x44c663` 同判);④INFO/SOUNDINFO 拆「事件参数面
+  (带引用)/query 参数面(原契约)」;⑤`VariableStore::restore_elements`
+  (同型整组写回)。
+- `yu-trace`:`TraceArg.reference`(`{prefix,id}`)序列化/解析;旧 trace
+  缺字段按 `None` 读(向后兼容)。
+- `yu-save`:状态机重写——`ReservedFact`=块快照(btype 0 单变量/btype 2
+  多变量组);`flush` 按 DNO 升序流出预约时快照、**不清表**;`save_end` 清;
+  `load_block` 解容器(btype1 配置块不解释,DIV-RT-012/B13);`SaveHost`
+  trait 实现;`sv.write.refused` 语义收窄为「只读根拒绝」(引用缺席拒绝
+  删除);apply_event 里 SAVE/LOAD/SAVEEND 改由同步路径计数。
+- `yu-cli`:`boot()` 安装 `Vm::set_save_host`(同一 SaveHost 双通道:
+  同步契约 + FILEACT 等事件事实);`save_state_sha256` 摘要改块事实形态。
+- **不碰**:yu-gfx / yu-render / yu-font / DIV-RT-050 / debug_mode。
+
+### 3. 验证命令与原始输出
+
+```text
+$ cargo test -p yu-rt -p yu-trace -p yu-save -p yu-format
+19 个测试目标全部 ok(0 failed),含:
+  fixture 72 passed(save_load_loop_records_reserve_flush_and_writes_back /
+    save_group_form_enumerates_matching_globals /
+    load_group_block_restores_each_var_by_id 新增 ×3)
+  yu-save 8 passed(flush_writes_official_container_and_load_roundtrips /
+    official_seld_block_reads_as_var_snapshot(官方 seld.sd 结构对拍)新增)
+  yu-trace golden 2 passed(UPDATE_GOLDEN=1 重生成:夹具表补 LOAD/SAVE
+    参数后 YSCom.ycd sha 变更;args 含 "reference":null ×5)
+
+$ cargo run -p yu-cli -- case <project-eris> --case save-load-loop
+case save-load-loop: PASS(×2 复验;470 tick,frame=472,ops=173,
+  fatal_codes=[],gsd/extra/seld/kidoku/save30002.sd 落盘
+  target/tmp/save-cases/save-load-loop/)
+$ cargo run -p yu-cli -- case <project-eris> --case save-title-flow
+case save-title-flow: PASS(--update 仅 save_state_sha256:预约语义升级;
+  ops/png 逐位不变)
+
+正常路径 sv.write.refused 零出现:save-load-loop 可写根下全部刷盘成功
+(槽表含产物字节事实 = save_state_sha256);refused 现仅存于只读根
+(yu-save flush 单测覆盖)。
+```
+
+### 4. 口径与残留
+
+- census 口径:SAVE 16 / SAVEEND 3 在未装存档宿主的普查下仍为域事件
+  (coverage-matrix §2 已更新两侧口径);装宿主即闭环。
+- `SAVEINFO` 查询(REA `0x44e1c8`,语料 0 次)挂账 **B7**(本批确认锚点
+  归属);SAVE/LOAD[ID] 图层快照/恢复 = H-P4-02(B7)。
+- 桌面实测(存档→读档→既读色)待主人复验:内核与宿主链路已由
+  `save-load-loop` 用例 + fixture ×3 + 官方 golden 覆盖。
+
+### 5. 勘误(B1 收口后同日,主人令)
+
+- **默认可写**:官方原版已备份 `project-eris/save-backup-20261024/`
+  (root 6 文件 + data-save 4 文件;seld.sd sha 前缀 a54ce12a 校验一致);
+  `engine.rs::boot` 不再从 `--save-root` 推导 writable,**缺省(工程根
+  `save/`)即可读写**,`--save-root` 仅作目录重定向(上方"默认只读"句作废)。
+  `run` 子命令补 `--save-root` 旗标(桌面宿主/serve 的旗标透传仍归 B7)。
+- save-load-loop 用例摘掉 png/display 哈希:基线渲染(yu-font/yu-gfx 文本)
+  另一会话活跃改动中,像素回归归 gfx 用例;B1 断言面 = ops +
+  fatal_codes=[] + save_state_sha256(PASS×2 复验)。
+- **FILEINFO「散盘」回退**(存档界面槽列表空 + 启动恢复不生效的根因):
+  槽判定链 `es.SaveDataCheck → \_file.info.exist → FILEINFO[EXIST]`
+  (ystdlib:989 宏)原只查 VFS ⇒ `$_SAVE_PATH+名` 恒不存在;按 REA
+  `0x44316c` 文件系统支补 `save_root_fs_exists`(前缀 `$_SAVE_PATH` +
+  越界防护),`fixture::fileinfo_fs_fallback_checks_save_root` 回归;
+  官方 seld.sd golden 的值断言放宽为选项号合法域(活语料随游玩变化)。

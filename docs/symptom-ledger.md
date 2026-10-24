@@ -66,15 +66,15 @@ cargo test -p yu-host-desktop -p yu-platform-input   → 24 passed, 0 failed
 | # | 症状 | 稳定复现步骤 | 根因归类 | 证据 | 处置 | 状态 |
 |---|---|---|---|---|---|---|
 | S1 | 标题 → 設定 → 戻る:正常 | 桌面 `--script symptom-1`,点 (217,368) → (750,565) | 无(冒烟通过) | 340 帧=設定画面 `6bc7a605…`;440 帧=标题 `a6db617b…`(= `cases/title-config-back.json` 的 title 哈希);`fatal=None` | 保留为宿主冒烟 | fixed(无缺陷) |
-| S2 | 标题 → スタート:进本篇后**背景全黑、文本框空白** | headless `scenario_probe` 点 (217,281)@300,到 470 | 引擎语义缺失:背景/文本的产出任务在 `es_select.yst:153` 被 Fatal 终止 | 404 帧 `rt.expr.div_zero`(`es.ScenarioScript@153 LET`);同帧 `CGINFO[TEX] SPLBUF1 不存在` ×100;422 帧 `ops=158 / text_runs=0 / skipped_text=0 / missing=[]`,342 帧 PNG 纯黑 | H-P1-07(上游);宿主横幅/面板可见化 | mitigated |
+| S2 | 标题 → スタート:进本篇后**背景全黑、文本框空白** | headless `scenario_probe` 点 (217,281)@300,到 470 | 引擎语义缺失:背景/文本的产出任务在 `es_select.yst:153` 被 Fatal 终止 | 404 帧 `rt.expr.div_zero`(`es.ScenarioScript@153 LET`);同帧 `CGINFO[TEX] SPLBUF1 不存在` ×100;422 帧 `ops=158 / text_runs=0 / skipped_text=0 / missing=[]`,342 帧 PNG 纯黑 | **已销账(AU5)**:根因 = P7 续修复的 `op_math` LET 下标丢失(POW2 表全落 [0]),非真除零;用例 `fatal_codes=[]` 复验(P7 续 3) | fixed(根因,P7 续) |
 | S3a | 本篇 設定 按钮:正常 | スタート@300 → 設定 (494,583)@440 | 无 | ops 158→450;截图完整设定菜单(6 个页签、开关、底栏);此后 165 帧静态(等输入) | 用例 `symptom-ingame-config` | fixed(无缺陷) |
 | S3b | 本篇 タイトル / 終了 按钮:正常(脚本自绘确认框) | (654,583)@440 → 「タイトル画面へ戻りますか?」;(690,583)@440 → 「ゲームを終しますか?」→ はい (352,302)@490 | 无 | 点击后 ops 158→143、画面切换;はい 后 `main_finished=true`,ops→11,末帧 `a7aff0f8` | 无需修 | fixed(无缺陷) |
 | S3c | 本篇 **右键**:完全没有反应 | スタート@300 → MOUSE_R (400,520)@440 | 引擎语义缺失/取证阻塞(右键菜单分支未生效;无 Diag) | 430→560 帧 SHA 恒为 `f0c2706d`,`ops=158` 不变;无 Fatal/新增 Diag | H-P1-07 附注(右键路径需 P3 取证);宿主横幅 | mitigated |
-| S3d | 本篇 **故事推进点击**:没有反应(文本不前进) | スタート@300 → 点文本框 (400,520)@440 与 @500 | 同 S2:推进文本的任务已被 Fatal 终止 | 未点击时 158 ops;两次点击后仍 `f0c2706d`/158;`text_runs=0` | H-P1-07;宿主“为什么卡”直接显示 Fatal | mitigated |
-| S4 | 本篇 **セーブ**:界面不可见,并且**主任务随后终止**(桌面宿主直接关窗) | スタート@300 → セーブ (45,585)@440 | ①合成不可见(P2/P4);②`es_number.yst:SYSTEM@56` 再次整数除 0(Fatal)→ 主任务 END | headless:ops 158→196 但像素恒 `f0c2706d`;桌面:`FATAL rt.expr.div_zero @ es_number.yst:SYSTEM@56 LET engine_frame=442`、`main_finished=true`、host frames=440 即退出(exit 0);`sv.arg.missing`×5 / `sv.write.refused`×3(P4 SaveHost) | H-P1-08(P2+P4);H-P1-07 扩展(es_number:56);用例 `symptom-ingame-save` | handed-off |
+| S3d | 本篇 **故事推进点击**:没有反应(文本不前进) | スタート@300 → 点文本框 (400,520)@440 与 @500 | 同 S2:推进文本的任务已被 Fatal 终止 | 未点击时 158 ops;两次点击后仍 `f0c2706d`/158;`text_runs=0` | **已销账(AU5)**:同 S2 根因(P7 续) | fixed(根因,P7 续) |
+| S4 | 本篇 **セーブ**:界面不可见,并且**主任务随后终止**(桌面宿主直接关窗) | スタート@300 → セーブ (45,585)@440 | ①合成不可见(P2/P4);②`es_number.yst:SYSTEM@56` 再次整数除 0(Fatal)→ 主任务 END | headless:ops 158→196 但像素恒 `f0c2706d`;桌面:`FATAL rt.expr.div_zero @ es_number.yst:SYSTEM@56 LET engine_frame=442`、`main_finished=true`、host frames=440 即退出(exit 0);`sv.arg.missing`×5 / `sv.write.refused`×3(P4 SaveHost) | **已销账(AU5)**:①除零根因 = P7 续(MATH[LET] 下标);②界面合成/行文本 = P8(058/059:板/锁图标/底栏正常);「背景透出上一亮帧」残留另立 **DIV-RT-050**;`sv.write.refused`(存档落盘)已解(**B1**,DIV-RT-042 fixed) | fixed(P7 续 + P8 + B1;残留→DIV-RT-050) |
 | S5 | 标题点“終了する”:画面**变暗后没有对话框**,再点无反应;关窗两次才退出 | 桌面 `--script symptom-5`(close@400, close@430);或标题点 (217,557) | 宿主能力缺失:标题走**原生 `DIALOG`**(VM 已挂起,无呈现端);与 S3b 的脚本自绘确认框不同 | 变暗后像素恒定 121+ 帧;无任何 Diag(静默挂起);close#1=`@_WINDOW_EXEC_CLOSE=1`,close#2=`exit`,exit 0 | H-P1-02(API)+ H-P1-04(egui 模态);宿主保证第二次关闭可退 | mitigated |
 | S6 | 最小化 → 还原:**draw 阶段 wgpu 校验错误**;其余 resize/失焦/连点/滚轮不崩 | 桌面 `--script symptom-6`(1024x768→640x480→minimize→restore) | **宿主 bug**(surface 配置 1x1 与 egui scissor 不一致) | `PANIC 捕获 phase=draw frame=430 … Scissor Rect {x:0,y:0,w:960,h:50} is not contained in the render target (1,1,1)`;修复后同剧本 720 帧 exit 0、无 panic | **本任务修复**(§3.6) | fixed |
-| S7 | 挂机数秒后:标题进入演示 → **黑屏并永久停住** | 桌面无输入 `--frames 500` | 引擎语义缺失(演示任务命中同一 Fatal);依赖**实时时钟路径** | 末帧 PNG 纯黑;Fatal@269;无输入 260 帧无 Fatal(未到触发点);4 次运行分别 223/281/无/无(**非确定**;3600 帧那次演示已启动但未命中 Fatal) | H-P1-07(含实时/固定步取证);宿主面板/横幅 | mitigated |
+| S7 | 挂机数秒后:标题进入演示 → **黑屏并永久停住** | 桌面无输入 `--frames 500` | 引擎语义缺失(演示任务命中同一 Fatal);依赖**实时时钟路径** | 末帧 PNG 纯黑;Fatal@269;无输入 260 帧无 Fatal(未到触发点);4 次运行分别 223/281/无/无(**非确定**;3600 帧那次演示已启动但未命中 Fatal) | **已销账(AU5)**:同 S2 根因(P7 续,Fatal 不再触发);实时/固定步时钟差异残余保留在 §6.1 | fixed(根因,P7 续) |
 | P1-A | 引擎 panic(任意原因) | `--panic-selftest 30 --frames 60` | 宿主缺陷(原:无防线,进程直接死) | 日志含 panic message/location/backtrace 摘要;`exit frozen: phase=tick …`;进程 **exit 0**;冻结期继续出帧(2.5–3.3ms/draw) | **本任务修复**(§3.1) | fixed |
 | P1-B | `serve` 连接后首帧 ~1.9s 无输出 | `serve` 建立 WS 后首帧 | 宿主调度(一次性场景装载;`serve` 未设步长上限) | 10 分钟会话 `max_gap_ms=1858`(首帧);之后 36,528 帧 0 回退 | H-P1-05 | handed-off |
 
@@ -110,6 +110,11 @@ cargo test -p yu-host-desktop -p yu-platform-input   → 24 passed, 0 failed
 - 假设(未取证,不实现):`CGINFO[TEX]` 对不存在的 `SPLBUF*` 返回缺失值,
   脚本把它当尺寸/数量做 `LET` 除法 ⇒ 0 除数。需要 P3 把 `LET` 的左右操作数
   打进 Diag 才能定论。
+- **2026-10-24 销账(AU5)**:上述假设作废——真根因是 `op_math` 丢弃
+  `MATH[POW...] LET=@es.POW2(@_LC-1)` 的目标下标(63 次写全落 `[0]`,
+  POW2 表全 0),`es_select:153` 读到 0 除数。P7 续修复 + 回归
+  `fixture::math_let_writes_indexed_array_element`;用例 `fatal_codes=[]`
+  复验(P7 续 3)。本条假设链与 H-P1-07 的取证请求就此关闭。
 - 归类:引擎语义缺失/取证阻塞(官方 x87 整数除 0 行为未采集,DIV-RT-003)。
   **不在宿主层绕过。**
 
@@ -374,6 +379,12 @@ pub fn mouse_last(&self) -> Option<(u32, u32)>;
 
 ### H-P1-07 · `es_select.yst:153` 整数除 0(归 P3/P4)
 
+> **2026-10-24 销账(AU5/P7 续)**:根因不是官方除零分歧,而是
+> `op_math` 丢弃 `LET` 目标下标(POW2 表 63 次写全落 `[0]`)。
+> 修复后 S2/S3d/S7/S4 的 `rt.expr.div_zero` 全部消失(用例
+> `fatal_codes=[]`,P7 续 3)。本件取证请求关闭;**残余另挂**:
+> 右键菜单(S3c,仍 mitigated)、实时/固定步时钟差异(§6.1)。
+
 - 同一位置 `LET` 整数除 0 的两条触发路径:
   1. 点 `スタート` 进本篇后 ~1.7s(headless 固定步,帧 404);
   2. 无输入挂机的标题演示/超时(桌面实时,host frame 223/269/281,**非确定**)。
@@ -389,6 +400,13 @@ pub fn mouse_last(&self) -> Option<(u32, u32)>;
   `es.BT.MOUSECHECK` 对 `MOUSE_R` 的分支是否被调用。
 
 ### H-P1-08 · 存档界面合成不可见(S4;归 P2 + P4)
+
+> **2026-10-24 销账(AU5)**:①除零根因 = P7 续修复;②界面合成与行文本 =
+> P8 落地(DIV-GFX-058/059:存读档板/锁图标/底栏正常,
+> `cases/symptom-ingame-save.json` 复验)。「背景透出上一亮帧」为新缺口,
+> 另立 `docs/divergences/DIV-RT-050-cgs-scene-screenshot-stack.md`;
+> 存档落盘(`sv.write.refused`)已解(**B1**,2026-10-24,DIV-RT-042 fixed:
+> `ArgValue.reference` + `SaveHost` 同步契约,`save-load-loop` 用例闭环)。
 
 - 现象:点セーブ后 display 新增 `CGS100`/`SLTEMP` 的 `rectpaint2` 与 8 个按钮
   拷贝,但屏幕像素完全不变;`skipped=0`(所有 op 都“执行”了)。
@@ -581,9 +599,11 @@ $ cd target/tmp/shadow-head &&
      559 passed / 0 failed。
    - 附:并发改动引入 `flate2 → libz-sys` 后,本机 `cc` 找不到 MSVC/SDK 头
      (`stddef.h`);显式给 `INCLUDE`/`LIB`(§5.0)即可,不是代码问题。
-2. **AU2 §1 的“`src/` 无 stdout 宏”不成立**:
+2. ~~**AU2 §1 的“`src/` 无 stdout 宏”不成立**:
    `crates/yu-cli/src/engine/sound_device.rs` 有两处 `eprintln!`
-   (首块非静音、设备流错误)。不在 P1 文件范围,记录待 P4 统一。
+   (首块非静音、设备流错误)。不在 P1 文件范围,记录待 P4 统一。~~
+   **已清(AU5 复核)**:P4 log 门面桥落地后 `grep "eprintln!|println!|dbg!" crates/*/src`
+   零命中,挂账销掉。
 3. **任务书 §1 的“黑屏 = 文本链路未落地”在本次语料未被证实**:
    S2 的 in-game 帧 `text_runs=0` 且 `skipped_text=0` ⇒ 没有 TEXT 被跳过;
    黑屏发生在背景/文本任务死亡之后。文本链路缺口(DIV-GFX-012/033/034/035)

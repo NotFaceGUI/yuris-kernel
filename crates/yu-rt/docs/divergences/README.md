@@ -12,7 +12,7 @@
 |---|---|---|---|
 | DIV-RT-001 | 引擎 0.479/0.495 的 opcode 编号整体错位 | fixed | 运行核从不内置序号表;真实 0.495 语料 corpus 实测通过 |
 | DIV-RT-002 | 表达式类型提升/溢出/字符串↔数值细节 | open | 已按确定性规则实现,逐位未对齐 |
-| DIV-RT-003 | 整数除零/取模 0 | open | 引擎为硬件异常;内核 Fatal |
+| DIV-RT-003 | 整数除零/取模 0 | open | 引擎为硬件异常;内核 Fatal。P7 续已修现语料的真实根因(`op_math` 丢弃 LET 下标 ⇒ POW2 表全 0),S2/S3d/S4/S7 的 Fatal 全部消失;「官方 Fatal 策略」本身仍待 trace |
 | DIV-RT-004 | 「实参缺席」的运算符缺右操作数形态 | fixed | 语料 20 窗口统计(19 掩码 + 1 真缺席);`expr.rs` 容忍一次;语料全量跑通 |
 | DIV-RT-005 | 脚本执行错误后的引擎继续策略 | open | 默认槽路径已取证(DIV-RT-043:报一次+让出,任务不终止);内核现行 = Unimplemented/Recoverable 挂号后继续、Fatal 结束+记录;官方其余错误路径仍无 trace |
 | DIV-RT-006 | 输入键码 `_CODE_*` / `_INP` / `_PAD` 的码值 | fixed | REA 证结构(VK 计数表)+ 手册不变量定值;`_KEYLAST/_MOUSELAST` 已另证(DIV-RT-033) |
@@ -20,7 +20,7 @@
 | DIV-RT-008 | `_`(文本输出)手册无页 | fixed | 手册 basic.html ●テキスト表示有页(`_[式]`);已实现,撤销旧挂账 |
 | DIV-RT-009 | `_TIME`/`_OS_TIME` 的时区与纪元 | open | 注入时钟固定 UTC |
 | DIV-RT-010 | 路径类系统变量(`_SAVE_PATH` 等) | fixed | `BootConfig::paths` + yu-cli `host_paths()` 注入;`$_PROJECT_PATH` 手册无页保持 `None` |
-| DIV-RT-011 | 手册有页但语义未取证的命令(VARINFO SEARCH / VARACT INIT·G_* / F_* / ERROR) | open | 仅剩 VARINFO `STRTYPE/SJISCODE/UTF8CODE`(无手册例)与 `VAR`(无页);SEARCH/INIT·G_*/RETURNCODE/WORD/F_*/PREP 已另证实现 |
+| DIV-RT-011 | 手册有页但语义未取证的命令(VARINFO SEARCH / VARACT INIT·G_* / F_* / ERROR) | open | 仅剩 VARINFO `STRTYPE/SJISCODE/UTF8CODE`(无手册例)、`VAR`/`CSVINFO`(无页/未取证,AU5 补录)与 `CDDA`(空桩,见 sound-ledger N0-10);SEARCH/INIT·G_*/RETURNCODE/WORD/F_*/PREP 已另证实现 |
 | DIV-RT-012 | `SAVE`/`LOAD` 的盘上存档格式 | fixed | `yu-format::yssd` 官方 5 文件 269 块逐字节 roundtrip;`yu-save` 宿主消费域事件(忠实写盘受 DIV-RT-042 门禁) |
 | DIV-RT-013 | `HANTOZEN`/`ZENTOHAN` 转换表 | fixed | 三张表已自 0.495 exe 取出落 `data/case-tables-0495.tsv`;算法逐条对照 REA |
 | DIV-RT-014 | `MATH[RND]` 的 MT19937 种子来源 | fixed | 种子 = `GetTickCount`(REA `0x461f98`),内核 `BootConfig::rng_seed` 注入(缺省 5489);`rng.rs` MT19937 |
@@ -51,7 +51,7 @@
 | DIV-RT-039 | GOSUB 允许 64 次嵌套 | fixed | 手册 64 回 + REA 0x4459e6(`depth+1 == 0x40` 才报错) |
 | DIV-RT-040 | 帧边界事件(`FrameStart`/`FrameEnd`)与有界事件队列 | fixed | 内部可观测契约(architecture §3/A3),非官方语义 |
 | DIV-RT-041 | `Diag` 的脚本定位(task/script/pc/cmd) | fixed | architecture §8;`Loc::Script.label` 承载任务 ID |
-| DIV-RT-042 | `DomainCall` 的变量引用身份丢失 | blocked | `SAVE[SET]`/`LOAD[LET]`/`FILEINFO[LET]` 只带求值结果;跨 crate 契约变更 |
+| DIV-RT-042 | `DomainCall` 的变量引用身份丢失 | fixed(B1) | `ArgValue.reference`(裁 1-A)+ `SaveHost` 同步契约(裁 2-A);SAVE 预约即值快照/LOAD 按 var_id 写回,`save-load-loop` 用例闭环 |
 | DIV-RT-043 | 官方默认槽 `0x459e90` 的语义(脚本执行错误) | fixed | `F_*`/`G_*`/`MACRO`/`S_VAR`/`_IF*`/`);`/`SYSTEMMODE` 等不再静默 Unimplemented |
 | DIV-RT-044 | `DIALOG` 的 VM 侧契约与宿主回答 | fixed | 任务挂起/回答、LET/LETSTR 写回、扩展参数挂账 |
 | DIV-RT-045 | `TRAY`/`CLIPACT`/`CLIPINFO`/`REGINFO`/`YMV*` 的域边界 | fixed/partial | 剪贴板镜像实现;托盘/媒体归宿主;注册表挂账 |
@@ -59,6 +59,7 @@
 | DIV-RT-047 | `_WINDOW_INIT_POS` / `_WINDOW_EXEC_CAPTION` 的宿主注入面 | fixed | 两个宿主 setter/注入值;手册仍无页 |
 | DIV-RT-048 | `_TEXT_NUM` 的数据源 | fixed | `yst.ybn` 头部 text_total == `yst_list` 求和(ERIS 396) |
 | DIV-RT-049 | 旗标/目标形态判定族(MATH 捕获、INIT 守卫、LABELINFO 下标)——P7 续审查轮的三个同族潜伏点 | fixed | 旁线 §3.20/§3.26 反汇编判据 + 语料形态扫描(scanmath:21 处 MATH 旗标全 =1、无 INIT=0);回归 ×3 |
+| DIV-RT-050 | CGS 场景截图栈:进菜单/存档弹窗背景透出上一亮帧,官方为黑底 | open | 档案在仓库根 `docs/divergences/DIV-RT-050-cgs-scene-screenshot-stack.md`(跨 crate 编号,AU5 起在此交叉引用);候选根因含 WINDOWINFO 字段族缺口 |
 
 ---
 
@@ -836,6 +837,48 @@ packed = ([1290322, 329227, 26, 249, 8765, 8765], 0, "cd1790…4bd2e")  ... ok
   读侧照常;容器写路径本身已逐字节就绪(DIV-RT-012)。解除条件 = 本条关闭
   (`ArgValue` 加引用字段 + `yu-trace` 穷举匹配同步,跨 crate 契约变更,
   登记为 H-P3-03)。状态维持 `blocked`。
+- **2026-10-24 收口(B1,任务书 `docs/tasks/task-b1-save-loop.md`)**:
+  - **取证**(0.495 `yu-ris.exe` sha256 `4f5eefa3…`;capstone 线性+递归下降,
+    产物 `target/tmp/b1/*.asm`):SAVE 处理体 = `0x44c45c`(opcode 84,
+    分发表 `0x7ace20[84]`;**旧锚 `0x44e1c8` 实为 SAVEINFO,勘误**)——
+    ①`SET`/`LET` 变量身份经 `0x683a60/0x683c00/0x683da0[slot]` 三表传递
+    (0x44c583/0x4471eb);②**预约即快照**:`0x44d73d` 在 `SAVE[DNO]` 时刻
+    写 btype/strict/var/clen/ulen 并取当前值 zlib 压缩入预约表
+    (`0x7fad1c`/`0x7fbe1c`),`SAVE[FILE]`(`0x44cd5a..0x44ceab`)只写文件头
+    +偏移表(容量 `0x400`,版本 `0x1e0`)按 DNO 升序流出**预约时**字节,
+    预约表不清(SAVEEND `0x44e1a0` 才清;语料 es_GSD 每次刷盘后显式
+    SAVEEND);③同 DNO 重复预约 = 替换(`0x44c740`);④组形态
+    `G_<族><组>=1` 按**首个在场旗标**(级联序 G_INT→…→G_STR4)定
+    (类型,组),枚举全局变量表逐变量子块化(块类型 2,
+    `0x44ca8a..0x44cc57`);⑤LOAD `0x44708c`:偏移寻址 `0xC+DNO*4`
+    (`0x44735a`),块类型 2 逐子块**按块内 var_id 直接恢复**
+    (`0x447460..0x4474de`,不读 `LET`/`G_*` 在场位),块类型 0 写 `LET`
+    目标整组(`0x447b3d`);⑥官方 golden:`seld.sd`=1 块 var 2264
+    Int[2001](值 `[1]=6`)、`gsd.sd` DNO 3/4 = btype2 子块 var 1161/1162
+    (旧式空间 `@G(0001)`/`$G(0001)`,DIV-RT-017)。
+  - **裁 3(既读色)**:启动链 `es_First.yst:139 \GSD.INIT` →
+    `es_GSD.yst:130 es.GSD.INIT` → `:142 GOSUB[#=ES.SEL.FILELOAD]` →
+    `es_Select.yst:1068 LOAD[FILE="seld.sd" DNO=1 LET=@es.SELD()]` ——
+    **全是脚本命令,零内核新机制**;LOAD[LET] 落地即自然接通。
+  - **实施**:①`ArgValue.reference: Option<VarRef>`(裁 1-A;旧事件流
+    缺字段=None);②`yu-trace` `TraceArg.reference` 序列化/解析(旧 trace
+    兼容);③`SaveHost` 同步契约(`reserve/reserve_group/flush/save_end/
+    load_block`);④`op_save/op_load/op_saveend` + FILEINFO/SOUNDINFO/INFO
+    的 LET 引用槽;⑤`yu-save` 重写:预约=值快照、flush 不清表、只读根仍拒
+    (原因改为「根不可写」);⑥`save-load-loop` 用例 + 回归 ×3 +
+    官方 seld.sd golden 结构对拍。`sv.write.refused` 语义保留但正常路径
+    零出现(2026-10-24 主人令后**默认可写**,只读为显式构造态)。
+  - **桌面实测追加修(同日)**:存档界面槽列表空的根因 = `FILEINFO`
+    缺「散盘」回退——槽存在判定链
+    `es.SaveDataCheck → \_file.info.exist($es.SAVEPATH+名) →
+    FILEINFO[EXIST]`(ystdlib:989)只查 VFS ⇒ save 根文件恒「不存在」,
+    同闸门挡住启动恢复。已按 REA `0x44316c` 文件系统支补
+    (`save_root_fs_exists`;`fixture::fileinfo_fs_fallback_checks_save_root`)。
+  - **复核**:`fixture::save_load_loop_records_reserve_flush_and_writes_back`
+    / `save_group_form_enumerates_matching_globals` /
+    `load_group_block_restores_each_var_by_id`;
+    `yu-save::official_seld_block_reads_as_var_snapshot`;
+    用例 `cases/save-load-loop.json`(PASS,gsd/extra/seld/kidoku 落盘)。
 
 
 ---

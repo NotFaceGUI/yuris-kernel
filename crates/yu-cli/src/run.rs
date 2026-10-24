@@ -40,6 +40,9 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         Some(value) => ArgReader::on_off("record-events", &value)?,
         None => false,
     };
+    // 存档根重定向(P4/B1):给显式目录 = 可写(存档真落盘);
+    // 缺省 = 工程根 save/(只读保护,SAVE 刷盘被拒)。
+    let save_root = args.flag("save-root").map(PathBuf::from);
     args.finish()?;
 
     let project = Project::discover(Path::new(&root), data.as_deref())?;
@@ -47,6 +50,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         backend,
         entry,
         record_events,
+        save_root,
         ..EngineOptions::default()
     };
     let mut engine = Engine::new(project, opts)?;

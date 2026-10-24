@@ -777,6 +777,37 @@ impl VariableStore {
             .map(|s| (s.ty, s.dims.as_slice()))
     }
 
+    /// 整组恢复(`LOAD[LET]` 写回;B1):目标槽已按同型声明时替换全部元素。
+    ///
+    /// 手册 `file/load.html`:「保存した配列変数を読み出す時は、保存した時と
+    /// 全く同じ配列サイズの配列変数を用意します。サイズが違う場合は、
+    /// エラーとなります」——类型/维数/元素数不一致由调用方(VM)先查声明
+    /// 并报错;本方法只做一致路径(引擎 `0x447b3d` 同型整写)。
+    pub fn restore_elements(&mut self, r: VarRef, data: Vec<Value>) -> Result<(), yu_log::Diag> {
+        let slot = self.slots.get_mut(&(r.space, r.id)).ok_or_else(|| {
+            diag::fatal(
+                code::rt::VAR_UNDECLARED,
+                Boundary::Script,
+                format!("恢复目标未声明 {}(手册:读档前脚本须先声明)", r.display()),
+            )
+        })?;
+        if slot.data.len() != data.len() {
+            return Err(diag::fatal(
+                code::rt::VAR_SHAPE,
+                Boundary::Script,
+                format!(
+                    "恢复元素数不符:{} 槽 {} 个,块 {} 个",
+                    r.display(),
+                    slot.data.len(),
+                    data.len()
+                ),
+            ));
+        }
+        slot.data = data;
+        self.bump();
+        Ok(())
+    }
+
     /// 一维数组线性查找(`VARINFO SEARCH`):从 `start` 起找第一个等于
     /// `needle` 的元素下标。
     ///

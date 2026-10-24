@@ -1,29 +1,28 @@
-//! `SaveState`:存档/文件域的宿主状态机(事实记录 + 盘上事实)。
+//! `SaveState`:存档/文件域的宿主状态机(B1 存档闭环)。
 //!
-//! # 真值边界(本轮的硬约束,读后再用)
+//! # 真值边界
 //!
-//! 1. **容器字节级是闭环的**:`yu-format::yssd` 对官方 0.495 产物
-//!    parse → rebuild **逐字节一致**(269 块全量,见
-//!    `yu-format/tests/yssd_roundtrip.rs`)。读侧(SLOT 表/LOAD 解析)
-//!    因此是忠实的。
-//! 2. **写侧暂被契约挡住**:`SAVE[SET=@X]` / `LOAD[LET=@Y]` 在引擎里传
-//!    **变量引用**,而 `DomainCall` 事件层只剩求值结果(契约缺口
-//!    DIV-RT-042,`yu-rt/docs/domain-event-contracts.md` §6.1)。块的
-//!    `var_id` 与整组数组内容拿不到 ⇒ 任何“从事件重建块”都是猜。
-//!    本状态机对 `SAVE[FILE]` 刷盘**显式拒绝并挂号**
-//!    (`sv.write.refused`),直到引用身份关闭;绝不写半忠实的存档。
-//! 3. **FILEACT 只在显式可写根下落盘**:`DELETE/COPY` 会改宿主文件系统;
-//!    只有构造时给了显式 save 根(用例/服务注入 `target/tmp` 之类)才
-//!    允许,默认只读观察(保护语料工程目录)。
-//! 4. 事件是**事实记录**,不是可重放的命令对象(契约文档 §6 的前提)。
+//! 1. **容器字节级闭环**:`yu-format::yssd` 对官方 0.495 产物 parse →
+//!    rebuild **逐字节一致**(269 块全量,`yu-format/tests/yssd_roundtrip.rs`)。
+//! 2. **块内容 = 预约时刻的值快照**(B1,REA 取证):`SAVE[DNO]` 处理体
+//!    `0x44c45c` → `0x44d73d` 在预约时刻写 btype/strict/var/clen/ulen 并
+//!    取当前值压缩入表;`SAVE[FILE]`(`0x44cd5a..`)只写文件头 + 偏移表,
+//!    按 DNO 升序流出**预约时**的字节;预约表**不被 flush 清空**
+//!    (SAVEEND `0x44e1a0` 才清;语料 es_GSD 每次刷盘后显式 SAVEEND)。
+//!    本状态机同型:`reserve` 快照、`flush` 写盘不清、`save_end` 清。
+//! 3. `FILEACT`/SAVE 刷盘**默认可写**(2026-10-24 主人令;官方原版已备份
+//!    `save-backup-20261024/`);显式构造只读状态机(单测)才拒绝。
+//! 4. 事件是**事实记录**;SAVE/LOAD/SAVEEND 的语义经 `yu-rt` 的
+//!    `SaveHost` 同步契约(B1 裁 1-A/裁 2-A)进入本状态机,事件流里的
+//!    这三条不再重复消费(`apply_event` 只剩 FILEACT/SAVEINFO/FILEINFO)。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use yu_log::Diag;
-use yu_rt::event::{Domain, VmEvent};
+use yu_rt::event::{Domain, LoadedBlock, LoadedVar, VarSnapshot, VmEvent};
 use yu_rt::tables::YscmTable;
-use yu_rt::value::Value;
+use yu_rt::value::{ElemType, Value, VarRef, VarSpace};
 
 use crate::error::{self, code};
 
@@ -40,15 +39,23 @@ pub struct SlotFile {
     pub dnos: BTreeMap<u32, u16>,
 }
 
-/// 一次 `SAVE` 预约的事实记录(未刷盘;见模块文档真值边界 2)。
+/// 一次 `SAVE[DNO]` 预约(**值快照**,B1)。
+///
+/// 形态 = 官方预约表(`0x7fad1c`/`0x7fbe1c` 按 DNO 索引)的内核投影:
+/// 块类型 0 = 单变量(整组快照);块类型 2 = 多变量组(逐子块,顺序 =
+/// 工程变量表序)。同 DNO 重复预约 = 替换(REA `0x44c740`)。
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReservedFact {
     /// `DNO` 参数(1..=1024)。
     pub dno: u32,
-    /// `SET` 的**求值结果**(注意:不是变量内容的事实,见 DIV-RT-042)。
-    pub value: Value,
-    /// 事件帧号。
-    pub frame: u64,
+    /// 块类型(0 = 单变量;2 = 多变量组;与容器头一致)。
+    pub btype: u8,
+    /// 块头目标变量 id(块类型 2 = 0,子块各带)。
+    pub var_id: u16,
+    /// 块类型 0 的单变量快照(整组;标量 = 单元素)。
+    pub snap: Option<VarSnapshot>,
+    /// 块类型 2 的子变量 `(var_id, 快照)`。
+    pub subs: Vec<(u16, VarSnapshot)>,
 }
 
 /// 槽位表的确定性快照(诊断/用例摘要用;不含时间戳等易变事实)。
@@ -67,13 +74,13 @@ pub struct SaveSnapshot {
 
 /// 存档/文件域宿主状态。
 pub struct SaveState {
-    /// save 根(唯一的盘上事实来源与(未来)写盘根)。
+    /// save 根(唯一的盘上事实来源与写盘根)。
     root: PathBuf,
-    /// 是否允许 FILEACT 落盘(真值边界 3)。
+    /// 是否允许 SAVE 刷盘 / FILEACT 落盘(真值边界 3)。
     writable: bool,
     /// 盘上槽表(按文件名排序;`refresh_slots` 重建)。
     slots: BTreeMap<String, SlotFile>,
-    /// 未刷盘预约(DNO → 事实)。
+    /// 未刷盘预约(DNO → 快照;同 DNO 覆盖)。
     reservations: BTreeMap<u32, ReservedFact>,
     /// 诊断(容量上限 [`MAX_DIAGS`],超限丢最旧并记账)。
     diags: std::collections::VecDeque<Diag>,
@@ -228,32 +235,16 @@ impl SaveState {
             .unwrap_or_default();
         let command = name.as_str();
         match command {
-            "SAVE" => {
-                self.save_calls += 1;
-                self.apply_save(*frame, &args);
-            }
-            "LOAD" => {
-                self.load_calls += 1;
-                self.apply_load(*frame, command, &args);
-            }
-            "SAVEEND" => {
-                self.saveend_calls += 1;
-                let n = self.reservations.len();
-                self.reservations.clear();
-                if n > 0 {
-                    self.push_diag(error::info(
-                        code::COMMAND_UNIMPLEMENTED,
-                        format!("SAVEEND 丢弃 {n} 条未刷盘预约(手册 file/saveend.html)"),
-                    ));
-                }
+            "SAVE" | "LOAD" | "SAVEEND" => {
+                // B1:这三条经 `SaveHost` 同步契约处理(预约/刷盘/拉取都在
+                // 命令时刻),事件流里不再重复消费(计数走同步路径)。
             }
             "FILEACT" => {
                 self.fileact_calls += 1;
                 self.apply_fileact(*frame, &args);
             }
             "SAVEINFO" => {
-                // 查询处理体 REA 0x44e1c8 未取证,语料 0 次;LET 写回同时
-                // 受 DIV-RT-042 阻塞 ⇒ 整体挂账,不猜字段。
+                // 查询处理体 REA 0x44e1c8 未取证,语料 0 次 ⇒ 整体挂账 B7。
                 self.push_diag(error::at_command(
                     error::unimplemented(
                         code::COMMAND_UNIMPLEMENTED,
@@ -265,11 +256,11 @@ impl SaveState {
             }
             "FILEINFO" => {
                 // FILEINFO[FILE+EXIST+LET] 已由内核实现(J3,REA 0x44286c);
-                // 宿主不双写。SIZE/RELATION 的 LET 写回受 DIV-RT-042 阻塞。
+                // 宿主不双写。SIZE/RELATION 的宿主文件事实查询未取证。
                 self.push_diag(error::at_command(
                     error::unimplemented(
                         code::COMMAND_UNIMPLEMENTED,
-                        "FILEINFO SIZE/RELATION 未实现(DIV-RT-042:LET 引用身份;EXIST 已由内核实现)"
+                        "FILEINFO SIZE/RELATION 未实现(宿主文件事实查询挂账 B10;EXIST 已由内核实现)"
                             .to_string(),
                     ),
                     *frame,
@@ -289,166 +280,194 @@ impl SaveState {
         }
     }
 
-    /// `SAVE`:无 `FILE` = 预约;有 `FILE` = 刷盘(当前拒绝,见真值边界 2)。
-    fn apply_save(&mut self, frame: u64, args: &[(String, &Value)]) {
-        let mut file: Option<String> = None;
-        let mut dno: Option<u32> = None;
-        let mut set: Option<&Value> = None;
-        let mut layer_id = false;
-        for (name, value) in args {
-            match name.as_str() {
-                "FILE" => {
-                    if let Value::Str(bytes) = value {
-                        file = Some(decode_name(bytes));
-                    } else {
-                        self.push_diag(error::at_command(
-                            error::recoverable(code::ARG_TYPE, "SAVE[FILE] 需要 STR"),
-                            frame,
-                            "SAVE",
-                        ));
-                    }
-                }
-                "DNO" => {
-                    dno = value.as_int().map(|n| n as u32);
-                }
-                "SET" => set = Some(value),
-                "ID" => layer_id = true,
-                _ => {}
-            }
-        }
-        if layer_id {
-            // 图层快照需要 gfx(CGETSCREEN 类),H-P4-02 交接 P2/集成轮。
-            self.push_diag(error::at_command(
-                error::unimplemented(
-                    code::COMMAND_UNIMPLEMENTED,
-                    "SAVE[ID] 图层快照未实现(H-P4-02 → P2/集成轮)".to_string(),
-                ),
-                frame,
-                "SAVE",
-            ));
-        }
-        let Some(dno) = dno else {
-            self.push_diag(error::at_command(
-                error::recoverable(code::ARG_MISSING, "SAVE 缺 DNO"),
-                frame,
-                "SAVE",
-            ));
-            return;
-        };
+    // ---------------------------------------------------- 同步契约(B1)
+
+    /// `SAVE[DNO=n SET=@x]`:预约一块(块类型 0),**快照当前值**
+    /// (REA `0x44d73d`;同 DNO = 替换 `0x44c740`)。
+    pub fn reserve(&mut self, dno: u32, var: VarRef, snap: &VarSnapshot) -> Result<(), Diag> {
+        self.save_calls += 1;
         if !(1..=1024).contains(&dno) {
-            self.push_diag(error::at_command(
-                error::recoverable(code::ARG_RANGE, format!("SAVE DNO={dno} 越界(1..=1024)")),
-                frame,
-                "SAVE",
+            return Err(error::recoverable(
+                code::ARG_RANGE,
+                format!("SAVE DNO={dno} 越界(1..=1024)"),
             ));
-            return;
         }
-        match file {
-            None => {
-                // 预约:只记事实(SET 的求值结果;变量身份未进事件)。
-                let value = set.cloned().unwrap_or(Value::Int(0));
-                self.reservations
-                    .insert(dno, ReservedFact { dno, value, frame });
-            }
-            Some(file) => {
-                // 刷盘:契约缺口(DIV-RT-042)未关闭前拒绝写,不猜。
-                self.push_diag(error::at_command(
-                    error::unimplemented(
-                        code::WRITE_REFUSED,
-                        format!(
-                            "SAVE[FILE={file} DNO={dno}] 刷盘拒绝:SET/LET 变量引用身份在事件层丢失 \
-                             (DIV-RT-042),写不出与官方一致的块;容器写路径已就绪 \
-                             (yu-format::yssd 逐字节 roundtrip)"
-                        ),
-                    ),
-                    frame,
-                    "SAVE",
-                ));
-            }
-        }
+        self.reservations.insert(
+            dno,
+            ReservedFact {
+                dno,
+                btype: 0,
+                var_id: var.id,
+                snap: Some(snap.clone()),
+                subs: Vec::new(),
+            },
+        );
+        Ok(())
     }
 
-    /// `LOAD`:读侧(容器解析 + 槽表)可行;`LET` 写回被 DIV-RT-042 挡住。
-    fn apply_load(&mut self, frame: u64, command: &str, args: &[(String, &Value)]) {
-        let mut file: Option<String> = None;
-        let mut dno: Option<u32> = None;
-        for (name, value) in args {
-            match name.as_str() {
-                "FILE" => {
-                    if let Value::Str(bytes) = value {
-                        file = Some(decode_name(bytes));
-                    }
+    /// `SAVE[DNO=n G_<族><组>=1]`:预约一块(块类型 2),逐子块快照
+    /// (REA `0x44ca8a..0x44cc57`;顺序 = 工程变量表序)。
+    pub fn reserve_group(
+        &mut self,
+        dno: u32,
+        _ty: ElemType,
+        _group: u8,
+        vars: &[(u16, VarSnapshot)],
+    ) -> Result<(), Diag> {
+        self.save_calls += 1;
+        if !(1..=1024).contains(&dno) {
+            return Err(error::recoverable(
+                code::ARG_RANGE,
+                format!("SAVE DNO={dno} 越界(1..=1024)"),
+            ));
+        }
+        self.reservations.insert(
+            dno,
+            ReservedFact {
+                dno,
+                btype: 2,
+                var_id: 0,
+                snap: None,
+                subs: vars.to_vec(),
+            },
+        );
+        Ok(())
+    }
+
+    /// `SAVE[FILE="x"]`:刷盘。按 DNO 升序流出**预约时**的快照
+    /// (REA `0x44cd5a..0x44ceab`:写头/偏移表 + 逐块写;预约表不清)。
+    pub fn flush(&mut self, file: &str) -> Result<(), Diag> {
+        if !self.writable {
+            return Err(error::recoverable(
+                code::WRITE_REFUSED,
+                format!("SAVE[FILE={file}] 拒绝:save 根为只读模式(显式构造)"),
+            ));
+        }
+        let mut writer = yu_format::yssd::YssdWriter::default();
+        for fact in self.reservations.values() {
+            match fact.btype {
+                0 => {
+                    let Some(snap) = &fact.snap else { continue };
+                    let payload = snapshot_payload(snap)?;
+                    writer.set_block(
+                        fact.dno,
+                        yu_format::yssd::encode_block_body(0, 1, fact.var_id, &payload.to_bytes()),
+                    );
                 }
-                "DNO" => dno = value.as_int().map(|n| n as u32),
-                "LET" | "ID" => {
-                    self.push_diag(error::at_command(
-                        error::unimplemented(
-                            code::COMMAND_UNIMPLEMENTED,
-                            "LOAD[LET/ID] 未实现(DIV-RT-042:LET 引用;ID 图层恢复 → H-P4-02)"
-                                .to_string(),
-                        ),
-                        frame,
-                        command,
+                2 => {
+                    let mut raws = Vec::with_capacity(fact.subs.len());
+                    for (var_id, snap) in &fact.subs {
+                        let payload = snapshot_payload(snap)?;
+                        raws.push((*var_id, payload.to_bytes()));
+                    }
+                    let subs: Vec<yu_format::yssd::YssdSubBlockRaw<'_>> = raws
+                        .iter()
+                        .map(|(var_id, raw)| yu_format::yssd::YssdSubBlockRaw {
+                            var_id: *var_id,
+                            raw,
+                        })
+                        .collect();
+                    writer.set_block(fact.dno, yu_format::yssd::encode_multi_body(&subs));
+                }
+                other => {
+                    let _ = other;
+                    return Err(error::recoverable(
+                        code::INTERNAL,
+                        format!("未知预约块类型 {other}"),
                     ));
                 }
-                _ => {}
             }
         }
-        let Some(file) = file.or_else(|| {
-            dno.filter(|_| false).map(|_| String::new()) // DNO 只指槽内块号,不指文件
-        }) else {
-            self.push_diag(error::at_command(
-                error::recoverable(code::ARG_MISSING, "LOAD 缺 FILE"),
-                frame,
-                command,
-            ));
-            return;
-        };
-        let path = match self.confined_path(&file) {
-            Ok(path) => path,
-            Err(diag) => {
-                self.push_diag(error::at_command(diag, frame, command));
-                return;
-            }
-        };
-        match std::fs::read(&path) {
-            Ok(bytes) => match yu_format::yssd::YssdSave::parse(&bytes, file.as_bytes()) {
-                Ok(save) => {
-                    self.push_diag(error::at_command(
-                        error::info(
-                            code::COMMAND_UNIMPLEMENTED,
-                            format!(
-                                "LOAD[FILE={file}] 容器已读:{}/{} 块;值写回挂账(DIV-RT-042)",
-                                save.entries.len(),
-                                file
-                            ),
-                        ),
-                        frame,
-                        command,
-                    ));
-                }
-                Err(diag) => {
-                    self.push_diag(error::at_command(
-                        error::recoverable(code::CONTAINER, format!("LOAD[FILE={file}] {diag}")),
-                        frame,
-                        command,
-                    ));
-                }
-            },
+        let bytes = writer.build();
+        let path = self.confined_path(file)?;
+        std::fs::write(&path, &bytes).map_err(|e| {
+            error::recoverable(code::FILE_WRITE, format!("SAVE[FILE={file}] 写入失败: {e}"))
+        })?;
+        self.refresh_slots();
+        Ok(())
+    }
+
+    /// `SAVEEND[]`:丢弃全部未刷盘预约(REA `0x44e1a0`;官方 flush 不清,
+    /// 语料每次刷盘后显式 SAVEEND)。
+    pub fn save_end(&mut self) {
+        self.saveend_calls += 1;
+        self.reservations.clear();
+    }
+
+    /// `LOAD[FILE DNO=n]`:读一块恢复数据(容器解析;写回归 VM)。
+    ///
+    /// 块类型 0 → 单项(`var = None`,写调用方 `LET` 目标);块类型 2 →
+    /// 逐子块按块内 var_id 恢复(REA `0x447460..`,不读 `LET`/`G_*`);
+    /// 块类型 1 = 配置块,段内语义未逆向 ⇒ 不解释(DIV-RT-012/B13)。
+    pub fn load_block(&mut self, file: &str, dno: u32) -> Result<LoadedBlock, Diag> {
+        self.load_calls += 1;
+        let path = self.confined_path(file)?;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.push_diag(error::at_command(
-                    error::recoverable(code::FILE_MISSING, format!("LOAD 目标不存在: {file}")),
-                    frame,
-                    command,
+                return Err(error::recoverable(
+                    code::FILE_MISSING,
+                    format!("LOAD 目标不存在: {file}"),
                 ));
             }
             Err(e) => {
-                self.push_diag(error::at_command(
-                    error::recoverable(code::FILE_READ, format!("LOAD 读取失败: {file}: {e}")),
-                    frame,
-                    command,
+                return Err(error::recoverable(
+                    code::FILE_READ,
+                    format!("LOAD 读取失败: {file}: {e}"),
                 ));
             }
+        };
+        let origin = file.as_bytes();
+        let save = yu_format::yssd::YssdSave::parse(&bytes, origin)
+            .map_err(|d| error::recoverable(code::CONTAINER, format!("LOAD[FILE={file}] {d}")))?;
+        let Some(entry) = save.entry(dno) else {
+            return Err(error::recoverable(
+                code::FILE_MISSING,
+                format!(
+                    "LOAD[FILE={file}] DNO={dno} 不在容器(共 {} 块)",
+                    save.entries.len()
+                ),
+            ));
+        };
+        match entry.btype {
+            0 => {
+                let raw = entry
+                    .decompress(origin)
+                    .map_err(|d| error::recoverable(code::CONTAINER, format!("{d}")))?;
+                let value = yu_format::yssd::YssdValue::parse(&raw, origin, dno)
+                    .map_err(|d| error::recoverable(code::CONTAINER, format!("{d}")))?;
+                Ok(LoadedBlock {
+                    vars: vec![LoadedVar {
+                        var: None,
+                        snap: payload_to_snapshot(&value, origin, dno)?,
+                    }],
+                })
+            }
+            2 => {
+                let subs = yu_format::yssd::parse_multi_payload(&entry.compressed, origin, dno)
+                    .map_err(|d| error::recoverable(code::CONTAINER, format!("{d}")))?;
+                let mut vars = Vec::with_capacity(subs.len());
+                for sub in &subs {
+                    let sraw = sub
+                        .decompress(origin, dno)
+                        .map_err(|d| error::recoverable(code::CONTAINER, format!("{d}")))?;
+                    let value = yu_format::yssd::YssdValue::parse(&sraw, origin, dno)
+                        .map_err(|d| error::recoverable(code::CONTAINER, format!("{d}")))?;
+                    vars.push(LoadedVar {
+                        var: Some(VarRef::new(space_for(value.ty), sub.var_id)),
+                        snap: payload_to_snapshot(&value, origin, dno)?,
+                    });
+                }
+                Ok(LoadedBlock { vars })
+            }
+            1 => Err(error::recoverable(
+                code::COMMAND_UNIMPLEMENTED,
+                format!("LOAD[FILE={file} DNO={dno}] 配置块(btype 1)不解释(DIV-RT-012/B13)"),
+            )),
+            other => Err(error::recoverable(
+                code::CONTAINER,
+                format!("LOAD[FILE={file} DNO={dno}] 未知块类型 {other}"),
+            )),
         }
     }
 
@@ -745,6 +764,105 @@ impl SaveState {
     }
 }
 
+/// 快照 → YSSD 值载荷(容器 `ty u32 + dims + dlen + data`;布局事实见
+/// `yu-format/src/yssd.rs` `YssdValue`)。INT/FLT 每元素 8 字节,STR 逐
+/// 元素 `{u32 长 + 字节}`——与官方产物一致(P4 roundtrip 自证)。
+fn snapshot_payload(snap: &VarSnapshot) -> Result<yu_format::yssd::YssdValue, Diag> {
+    let ty = match snap.ty {
+        ElemType::Int => yu_format::yssd::YssdValueType::Int,
+        ElemType::Float => yu_format::yssd::YssdValueType::Flt,
+        ElemType::Str => yu_format::yssd::YssdValueType::Str,
+    };
+    let mut data = Vec::new();
+    for value in &snap.data {
+        match (snap.ty, value) {
+            (ElemType::Int, Value::Int(n)) => data.extend_from_slice(&n.to_le_bytes()),
+            (ElemType::Int, _) => data.extend_from_slice(&0i64.to_le_bytes()),
+            (ElemType::Float, Value::Float(f)) => data.extend_from_slice(&f.to_le_bytes()),
+            (ElemType::Float, _) => data.extend_from_slice(&0f64.to_le_bytes()),
+            (ElemType::Str, Value::Str(bytes)) => {
+                data.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                data.extend_from_slice(bytes);
+            }
+            (ElemType::Str, _) => data.extend_from_slice(&0u32.to_le_bytes()),
+        }
+    }
+    Ok(yu_format::yssd::YssdValue {
+        ty,
+        dims: snap.dims.clone(),
+        data,
+    })
+}
+
+/// YSSD 值载荷 → 快照(容器类型 → 变量元素类型;`Value::Str` = CP932 原样)。
+fn payload_to_snapshot(
+    value: &yu_format::yssd::YssdValue,
+    origin: &[u8],
+    dno: u32,
+) -> Result<VarSnapshot, Diag> {
+    let ty = match value.ty {
+        yu_format::yssd::YssdValueType::Int => ElemType::Int,
+        yu_format::yssd::YssdValueType::Flt => ElemType::Float,
+        yu_format::yssd::YssdValueType::Str => ElemType::Str,
+    };
+    let count = value.element_count() as usize;
+    let mut data = Vec::with_capacity(count);
+    match ty {
+        ElemType::Int | ElemType::Float => {
+            for chunk in value.data.chunks_exact(8) {
+                if ty == ElemType::Int {
+                    data.push(Value::Int(i64::from_le_bytes(
+                        chunk.try_into().expect("8B"),
+                    )));
+                } else {
+                    data.push(Value::Float(f64::from_le_bytes(
+                        chunk.try_into().expect("8B"),
+                    )));
+                }
+            }
+        }
+        ElemType::Str => {
+            let mut cursor = 0usize;
+            for _ in 0..count {
+                let Some(head) = value.data.get(cursor..cursor + 4) else {
+                    break;
+                };
+                let len = u32::from_le_bytes(head.try_into().expect("4B")) as usize;
+                cursor += 4;
+                let Some(bytes) = value.data.get(cursor..cursor + len) else {
+                    break;
+                };
+                data.push(Value::Str(bytes.to_vec()));
+                cursor += len;
+            }
+        }
+    }
+    if data.len() != count {
+        return Err(error::recoverable(
+            code::CONTAINER,
+            format!(
+                "DNO={dno}({}):元素数不符,解出 {}",
+                String::from_utf8_lossy(origin),
+                count
+            ),
+        ));
+    }
+    Ok(VarSnapshot {
+        ty,
+        dims: value.dims.clone(),
+        data,
+    })
+}
+
+/// 容器值类型 → 变量空间(数值 = `@`,字符串 = `$`;旧式空间由 VM 的
+/// `canonical_var` 按 id 声明归一化,DIV-RT-017)。
+fn space_for(ty: yu_format::yssd::YssdValueType) -> VarSpace {
+    match ty {
+        yu_format::yssd::YssdValueType::Int | yu_format::yssd::YssdValueType::Flt => VarSpace::At,
+        yu_format::yssd::YssdValueType::Str => VarSpace::Dollar,
+    }
+}
+
 /// CP932 文件名解码(事件里的 `Value::Str` 字节;失败按 lossy,不影响
 /// 后续路径拒绝)。
 fn decode_name(bytes: &[u8]) -> String {
@@ -757,111 +875,147 @@ fn decode_name(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yu_rt::event::ArgValue;
 
-    /// 合成 yscm:SAVE(DNO,FILE,SET)/ LOAD(FILE,LET)/ SAVEEND / FILEACT。
-    fn synthetic_yscm() -> YscmTable {
-        use yu_format::yscm::{Arg, Command, CommandTable, KEY_TABLE_BYTES};
-        let command = |name: &str, args: &[&str]| Command {
-            name: name.to_string().into(),
-            argc: args.len() as u8,
-            args: args
-                .iter()
-                .map(|a| Arg {
-                    name: (*a).to_string().into(),
-                    flag: 0,
-                    kind: 0,
-                })
-                .collect(),
-        };
-        let table = CommandTable {
-            version: 495,
-            commands: vec![
-                command("SAVE", &["DNO", "FILE", "SET", "ID"]),
-                command("LOAD", &["FILE", "LET", "ID", "DNO"]),
-                command("SAVEEND", &[]),
-                command(
-                    "FILEACT",
-                    &["FILE", "FILE2", "FOLDER", "COPY", "DELETE", "EXEC"],
-                ),
-            ],
-            messages: Vec::new(),
-            key_table: Box::new([0u8; KEY_TABLE_BYTES]),
-        };
-        YscmTable::from_format(table).expect("synthetic yscm")
-    }
-
-    fn domain_call(name: &str, args: &[(u8, &str, Value)]) -> VmEvent {
-        use yu_rt::event::Domain;
-        VmEvent::DomainCall {
-            frame: 7,
-            domain: Domain::Save,
-            name: name.to_string(),
-            args: args
-                .iter()
-                .map(|(slot, _, value)| ArgValue::new(*slot, value.clone()))
-                .collect(),
-            script: None,
-            pc: None,
+    fn int_snapshot(vals: &[i64], dims: &[u32]) -> VarSnapshot {
+        VarSnapshot {
+            ty: ElemType::Int,
+            dims: dims.to_vec(),
+            data: vals.iter().map(|&v| Value::Int(v)).collect(),
         }
     }
 
     #[test]
-    fn save_without_file_reserves_fact_and_saveend_clears() {
-        let yscm = synthetic_yscm();
+    fn reserve_snapshots_value_and_saveend_clears() {
         let mut state = SaveState::new("target/tmp/sv-unit-1", false);
-        // 槽号按合成 yscm 的 SAVE 参数序:DNO=0 / FILE=1 / SET=2 / ID=3。
-        state.apply_event(
-            &domain_call(
-                "SAVE",
-                &[(0, "DNO", Value::Int(12)), (2, "SET", Value::Int(2))],
-            ),
-            &yscm,
-        );
+        state
+            .reserve(
+                12,
+                VarRef::new(VarSpace::At, 0x0a43),
+                &int_snapshot(&[7, 9], &[2]),
+            )
+            .expect("reserve");
         assert_eq!(state.reservations_len(), 1);
         let snap = state.snapshot();
         assert_eq!(snap.reservations[0].dno, 12);
-        assert_eq!(snap.reservations[0].value, Value::Int(2));
+        assert_eq!(snap.reservations[0].btype, 0);
+        assert_eq!(snap.reservations[0].var_id, 0x0a43);
+        assert_eq!(
+            snap.reservations[0].snap.as_ref().expect("snap").data,
+            vec![Value::Int(7), Value::Int(9)]
+        );
         assert_eq!(snap.save_calls, 1);
-        state.apply_event(&domain_call("SAVEEND", &[]), &yscm);
+        // 同 DNO 重复预约 = 替换(REA 0x44c740)。
+        state
+            .reserve(12, VarRef::new(VarSpace::At, 1), &int_snapshot(&[1], &[]))
+            .expect("reserve again");
+        assert_eq!(state.reservations_len(), 1);
+        assert_eq!(state.snapshot().reservations[0].var_id, 1);
+        state.save_end();
         assert_eq!(state.reservations_len(), 0);
         assert_eq!(state.snapshot().saveend_calls, 1);
     }
 
     #[test]
-    fn save_with_file_is_refused_not_written() {
-        let yscm = synthetic_yscm();
+    fn flush_is_refused_on_readonly_root() {
         let root = temp_root("sv-unit-2-must-not-exist");
         let mut state = SaveState::new(&root, true);
-        state.apply_event(
-            &domain_call(
-                "SAVE",
-                &[
-                    (0, "DNO", Value::Int(1)),
-                    (1, "FILE", Value::Str(b"n1.sd".to_vec())),
-                    (2, "SET", Value::Int(5)),
-                ],
-            ),
-            &yscm,
-        );
-        // 拒绝写:文件不出现;挂号 WRITE_REFUSED。
+        state
+            .reserve(1, VarRef::new(VarSpace::At, 5), &int_snapshot(&[5], &[]))
+            .expect("reserve");
+        // 只读观察根:拒绝写(语义保护;引用/值齐备,拒绝原因不再是 DIV-RT-042)。
+        state.writable = false;
+        let err = state.flush("n1.sd").expect_err("refused");
+        assert_eq!(err.code, code::WRITE_REFUSED);
         assert!(!root.join("n1.sd").exists());
-        let diags = state.take_diags();
-        assert!(diags.iter().any(|d| d.code == code::WRITE_REFUSED));
     }
 
     #[test]
-    fn dno_out_of_range_is_reported() {
-        let yscm = synthetic_yscm();
-        let mut state = SaveState::new("target/tmp/sv-unit-3", false);
-        state.apply_event(&domain_call("SAVE", &[(0, "DNO", Value::Int(0))]), &yscm);
-        state.apply_event(&domain_call("SAVE", &[(0, "DNO", Value::Int(1025))]), &yscm);
-        let diags = state.take_diags();
+    fn flush_writes_official_container_and_load_roundtrips() {
+        let root = temp_root("sv-unit-6");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut state = SaveState::new(&root, true);
+        // int 数组 + str 标量 + 多变量组:三类各一(DNO 1/2/3)。
+        state
+            .reserve(
+                1,
+                VarRef::new(VarSpace::At, 2264),
+                &int_snapshot(&[0, 6, 0], &[3]),
+            )
+            .expect("reserve int");
+        let str_snap = VarSnapshot {
+            ty: ElemType::Str,
+            dims: Vec::new(),
+            data: vec![Value::Str("テスト".as_bytes().to_vec())],
+        };
+        state
+            .reserve(2, VarRef::new(VarSpace::Dollar, 1112), &str_snap)
+            .expect("reserve str");
+        state
+            .reserve_group(3, ElemType::Int, 2, &[(1161, int_snapshot(&[1, 2], &[2]))])
+            .expect("reserve group");
+        state.flush("gsd-test.sd").expect("flush");
+        assert!(root.join("gsd-test.sd").exists());
+        assert_eq!(state.reservations_len(), 3, "官方 flush 不清预约(REA)");
+        // 读回:块类型 0(写 LET 目标)+ 块类型 2(自带 var)。
+        let block = state.load_block("gsd-test.sd", 1).expect("load 1");
+        assert_eq!(block.vars.len(), 1);
+        assert!(block.vars[0].var.is_none());
         assert_eq!(
-            diags.iter().filter(|d| d.code == code::ARG_RANGE).count(),
-            2
+            block.vars[0].snap.data,
+            vec![Value::Int(0), Value::Int(6), Value::Int(0)]
         );
+        let block = state.load_block("gsd-test.sd", 3).expect("load 3");
+        assert_eq!(block.vars.len(), 1);
+        assert_eq!(block.vars[0].var, Some(VarRef::new(VarSpace::At, 1161)));
+        assert_eq!(block.vars[0].snap.data, vec![Value::Int(1), Value::Int(2)]);
+        // 结构级:官方解析器可读,DNO/var 与预约一致。
+        let bytes = std::fs::read(root.join("gsd-test.sd")).unwrap();
+        let save = yu_format::yssd::YssdSave::parse(&bytes, b"gsd-test.sd").expect("parse");
+        assert_eq!(save.entries.len(), 3);
+        assert_eq!(save.entry(1).expect("dno1").var_id, 2264);
+        assert_eq!(save.entry(2).expect("dno2").var_id, 1112);
+        assert_eq!(save.entry(3).expect("dno3").btype, 2);
+        assert_eq!(save.entry(2).expect("dno2").var_id, 1112);
+        state.save_end();
         assert_eq!(state.reservations_len(), 0);
+    }
+
+    #[test]
+    fn load_missing_file_is_reported() {
+        let mut state = SaveState::new("target/tmp/sv-unit-7", false);
+        let err = state.load_block("none.sd", 1).expect_err("missing");
+        assert_eq!(err.code, code::FILE_MISSING);
+    }
+
+    /// 官方 golden 结构对拍(真值层级 3;缺语料环境 = 显式报错,禁止空跑):
+    /// 官方 `seld.sd` DNO=1 = `@es.SELD`(id 2264)Int[2001],本实现的
+    /// load_block 必须读出同型快照。
+    #[test]
+    fn official_seld_block_reads_as_var_snapshot() {
+        let Some(root) = std::env::var_os("YURIS_SAMPLE_ERIS_ROOT") else {
+            panic!("YURIS_SAMPLE_ERIS_ROOT 未设置(缺样本环境必须显式报错)");
+        };
+        let path = Path::new(&root).join("save/seld.sd");
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("官方 seld.sd 不可读({e}): {}", path.display()));
+        std::fs::create_dir_all(temp_root("sv-golden")).unwrap();
+        std::fs::write(temp_root("sv-golden/seld.sd"), &bytes).unwrap();
+        let mut state = SaveState::new(temp_root("sv-golden"), false);
+        let block = state.load_block("seld.sd", 1).expect("load");
+        assert_eq!(block.vars.len(), 1);
+        let snap = &block.vars[0].snap;
+        assert_eq!(snap.ty, ElemType::Int);
+        assert_eq!(snap.dims, vec![2001]);
+        assert_eq!(snap.data.len(), 2001);
+        // 值域断言(活语料:seld 是选择历史,随游玩推进而变;
+        // 2026-10-23 DIV-RT-003 取证时 [1]=6,2026-10-24 主人实测后已更新):
+        // [0] 恒 0(占位),[1] = 最近选项号,合法域 0..=2001。
+        assert_eq!(snap.data[0], Value::Int(0));
+        let Value::Int(sel) = snap.data[1] else {
+            panic!("seld[1] 应为 INT");
+        };
+        assert!((0..=2001).contains(&sel), "seld[1]={sel} 越出选项号域");
     }
 
     #[test]

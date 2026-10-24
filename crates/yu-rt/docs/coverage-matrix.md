@@ -46,8 +46,8 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `RETURNCODE` | vm | 396 | — | `0x44c390` | ✅ 实现 | 本 600 帧未触发;静态语料有 396 处;COV-M-02 M-2:自动模式追加 C/R/P,恒追加 E;仍为让出点(REA 0x44c390) |
 | `F_INT` | vm | 337 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 官方默认体报「スクリプト実行エラー」(yse 0xdbbd2)+ 返回 -1;静态 337 处全在 `global_f.yst` 声明段,600 帧 0 执行(DIV-RT-043) |
 | `VARACT` | vm | 310 | `variable/varact.html` | `0x453fa8` | ✅ 实现 | 保持 |
-| `SAVE` | save | 290 | `file/save.html` | `0x44c45c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `LOAD` | save | 289 | `file/load.html` | `0x44708c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
+| `SAVE` | save | 290 | `file/save.html` | `0x44c45c` | ✅ 实现(B1) | 装存档宿主时命令时刻预约(值快照)/刷盘;`SET` 槽事件携带变量引用;未装宿主仍只发 `DomainCall`。REA 锚勘误:`0x44e1c8` 是 SAVEINFO(DIV-RT-042) |
+| `LOAD` | save | 289 | `file/load.html` | `0x44708c` | ✅ 实现(B1) | 装存档宿主时块类型 2 按 var_id 直接恢复、块类型 0 写 `LET` 整组;`LET` 槽事件携带变量引用(DIV-RT-042) |
 | `CGACT` | graphics | 274 | `cg/cgact.html` | `0x42c4a4` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `END` | system | 205 | `control/end.html` | `0x441334` | ✅ 实现 | 本 600 帧未触发;静态语料有 205 处 |
 | `GO` | vm | 195 | `control/go.html` | `0x445830` | ✅ 实现 | 保持 |
@@ -67,7 +67,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `WINDOWINFO` | window | 31 | `window/windowinfo.html` | `0x4586ec` | 🔁 部分(129 次未实现) | 主路径实现;未实现路径见 §2 |
 | `WINDOW` | window | 31 | `window/window.html` | `0x456b70` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `SOUNDINFO` | sound | 25 | `sound/soundinfo.html` | `0x44f4bc` | ✅ 宿主 | 装宿主时 `op_soundinfo` → `SoundHost::query` → LET;未装时保持 M-2 |
-| `FILEINFO` | file | 22 | `file/fileinfo.html` | `0x44286c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
+| `FILEINFO` | file | 22 | `file/fileinfo.html` | `0x44286c` | ✅ 实现(FILE+EXIST+LET) | AU5 勘误:旧口径「➖ 域事件」未随 J3 更新。J3 起 `op_fileinfo` VFS 存在性查询写 LET(EVID-J3-01);B1 补「散盘」回退(REA `0x44316c` 文件系统支:`FILE=$es.SAVEPATH+名` ⇒ save 根判存在;存档槽判定/启动恢复闸门依赖,桌面实测暴露);FOLDER/SIZE/RELATION 变体仍挂账(B10) |
 | `MATH` | vm | 21 | `math/math.html` | `0x4482c4` | ✅ 实现 | 保持 |
 | `FILEACT` | file | 20 | `file/fileact.html` | `0x441370` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `TASKINFO` | vm | 19 | `control/taskinfo.html` | `0x4523fc` | ✅ 实现 | 保持 |
@@ -78,7 +78,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `FONTINFO` | graphics | 8 | `font/fontinfo.html` | `0x444cfc` | 🔁 部分(3 次未实现) | 主路径实现;未实现路径见 §2 |
 | `MOVIE` | movie | 6 | `movie/movie.html` | `0x44b134` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `SYSTEMINFO` | system | 5 | — | `0x4505e4` | ✅ 实现 | 保持 |
-| `SAVEEND` | save | 5 | `file/saveend.html` | `0x44e1a0` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
+| `SAVEEND` | save | 5 | `file/saveend.html` | `0x44e1a0` | ✅ 实现(B1) | 装存档宿主时清预约(官方 flush 不清表,语料 es_GSD 刷盘后显式 SAVEEND 同型);未装宿主仍只发 `DomainCall` |
 | `DEBUGLIST` | system | 5 | — | `0x4634d8` | ✅ no-op | 官方 `xor eax,eax; ret`(DIV-RT-043) |
 | `IFBREAK` | vm | 5 | `control/ifbreak.html` | `0x446408` | ✅ 实现 | 本 600 帧未触发;静态语料有 5 处 |
 | `MOUSE` | system | 4 | `system/mouse.html` | `0x44aaa0` | ✅ 实现 | 内核输入状态(MODE/TIME/MOVE/CLICK/WHEEL/X/Y/CURSOR/HX/HY/ID);光标显示/形状归宿主 |
@@ -139,7 +139,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `REGINFO` | vm | 0 | `reg/reginfo.html` | `0x44bd30` | ⛔ 宿主能力 | 读 Windows 注册表;内核不猜(DIV-RT-045) |
 | `RELEASEMODE` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期;运行时同默认槽(DIV-RT-043) |
 | `RETURNBREAK` | vm | 0 | — | `0x4634d8` | ✅ no-op | 官方 no-op(DIV-RT-043) |
-| `SAVEINFO` | save | 0 | — | `0x44e1c8` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
+| `SAVEINFO` | save | 0 | — | `0x44e1c8` | ⛔ 挂账(B7) | 查询处理体未取证、语料 0 次;REA 锚勘误:`0x44e1c8` 是 SAVEINFO 本体(SAVE=`0x44c45c`,B1) |
 | `SYSTEMMODE` | system | 0 | `projectconfig/systemmode.html` | `0x459e90(默认)` | ✅ 脚本错误槽 | 仅 `projectconfig.txt` 编译期有效;运行时官方默认槽报错(DIV-RT-043) |
 | `S_VAR` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;出现在 yst 即官方脚本错误(DIV-RT-043) |
 | `TEXTINFO` | vm | 0 | `text/textinfo.html` | `0x4538cc` | ✅ 实现 | 语料未使用;M-2 按手册 + REA 实现,单测覆盖(COV-M-02) |
@@ -163,16 +163,16 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `CGINFO` | 1598 | 已实现 | 未安装 `GraphicsHost`(宿主查询面;INFO 不是 VM 语义) |
 | `CGACT` | 631 | 域事件:graphics | 域事件已发;查询/写回需宿主状态机 |
 | `SOUND` | 531 | 域事件:sound | 未装 `SoundHost` 时只发事件;装宿主后由 `yu-sound` 消费 |
-| `WINDOWINFO` | 129 | 已实现 | 未安装 `GraphicsHost`(宿主查询面;INFO 不是 VM 语义) |
-| `SAVE` | 16 | 域事件:save | 域事件已发;存档容器归宿主(DIV-RT-012) |
+| `WINDOWINFO` | 129 | 部分 | AU5 勘误:旧口径「已实现/未装宿主」归因不全。几何(EXIST/E/X/Y/SX/SY)装 `GraphicsHost` 即可答;`FULLSCREEN/CAPTION/ACTIVE/MAXIMIZE/RESIZE/CLOSEMODE/MENUID/REGIONID/DRAGID` **装了宿主仍 `INFO_UNSUPPORTED`**(字段族 = DIV-RT-050 候选根因,REA 锚点 `0x4586ec`) |
+| `SAVE` | 16 | 已实现(B1) | 未装存档宿主时只发域事件;装宿主(命令时刻预约/刷盘,DIV-RT-042 闭环)——`save-load-loop` 用例落盘 gsd/extra/seld/kidoku |
 | `EMOTE` | 12 | 域事件:emote | 域事件已发;E-mote 子系统归宿主 |
 | `WINDOW` | 10 | 域事件:window | 域事件已发;查询/写回需宿主状态机(+1 来自 `_WINDOW_INIT_POS` 分支) |
 | `SYSTEM` | 6 | 域事件:system | 域事件已发;子系统语义归宿主 |
 | `FONT` | 5 | 域事件:graphics | 域事件已发;查询/写回需宿主状态机 |
 | `FILEACT` | 3 | 域事件:file | 域事件已发;查询/写回需宿主状态机 |
-| `FONTINFO` | 3 | 已实现 | 未安装 `GraphicsHost`(宿主查询面;INFO 不是 VM 语义) |
-| `SAVEEND` | 3 | 域事件:save | 域事件已发;存档容器归宿主(DIV-RT-012) |
-| `LET` | 1 | 已实现 | 仅剩 `@_SAVE_PATH` 宿主未注入(DIV-RT-010) |
+| `FONTINFO` | 3 | 部分 | AU5 勘误:旧口径「已实现」超前。样式字段(COLOR/COLOR2/SX/SY/BOLD/AA/DRAWMODE/GRADATION/ROTATION)已答;`NUM/LANG/NAME(未设置/NO=n)` 需宿主字体清单,仍挂号(DIV-GFX-036) |
+| `SAVEEND` | 3 | 已实现(B1) | 未装存档宿主时只发域事件;装宿主即清预约(DIV-RT-042) |
+| `LET` | 1 | 已实现 | AU5 勘误:`@_SAVE_PATH` 已由 `BootConfig::paths` + yu-cli `host_paths()` 注入解决(DIV-RT-010 fixed);仅 census example 未注入,产品装配已解 |
 | `MOUSE` | 1 | 已实现 | 2026-10-22:内核输入状态(REA `0x44aaa0`);本表旧口径为未接线 |
 | `INPUT` | 1 | 已实现 | 2026-10-22:输入源开关(REA `0x446564`);本表旧口径为未接线 |
 | `SOUNDEND` | 1 | 域事件:sound | 未装 `SoundHost` 时只发事件;装宿主后删层 |
@@ -221,9 +221,11 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 - ~~`DomainCall` 只有 frame/domain/name/args:没有 script/pc~~ **P4 已解决**:
   新增可选 `script`/`pc`(内核发出的总是 `Some`);见 §9 与
   `domain-event-contracts.md` §1。yu-trace 的映射已用 `..` 兼容。
-- `SAVE/LOAD/FILEINFO/SOUNDINFO` 的 `SET`/`LET` 是变量引用,但
-  `ArgValue` 只携带求值结果,变量身份丢失(DIV-RT-042)。
-  宿主可用 `VmEvent::domain_args(&yscm)` 取参数名,但拿不到引用目标。
+- ~~`SAVE/LOAD/FILEINFO/SOUNDINFO` 的 `SET`/`LET` 是变量引用,但
+  `ArgValue` 只携带求值结果,变量身份丢失(DIV-RT-042)。~~ **B1 已解决**
+  (2026-10-24):`ArgValue.reference`(白名单槽:SAVE[SET]/LOAD[LET]/
+  FILEINFO[LET]/SOUNDINFO[LET]);宿主另有 `SaveHost` 同步契约(预约/刷盘/
+  拉取),三条存档命令不再依赖异步事件做语义。旧 trace 缺字段按 `None` 读。
 - `VmEvent::Text.id` 仍是 UTF-8 `String`;非 UTF-8 CP932 ID 保持空并
   挂号(DIV-GFX-021)。修复需要改事件字段类型,跨 crate 契约变更。
 
@@ -299,11 +301,14 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 
 > 台账：`docs/sound-ledger.md`。REA 锚点仍是 0.495 处理体地址；
 > 状态列区分「事件层」与「宿主实现」。
+> 口径注(AU5)：§1 把 MIDI/MIDIEND/MIDIINFO 按事件层记「域事件」，本表按
+> 宿主实现记「⛔ 空桩」——同一事实的两侧口径，非矛盾；`CDDA` 在 `domain_of`
+> 落 `Domain::Other` 而非 `Sound`（归类错位，待一行修）。
 
 | 命令 | opcode | 运行触发 | 处理器 | 宿主/状态 | 说明 |
 |---|---:|---:|---|---|---|
 | `SOUND` | 87 | 531 | `0x44e1e8` | ✅ `yu-sound` | 层表/装载/参数写回；MIDI/CDDA 除外 |
-| `SOUNDINFO` | 89 | 7,200 | `0x44f4bc` | ✅ `yu-sound` | 装宿主时走 `op_soundinfo` → `SoundHost::query` → `LET`；未装宿主保持 M-2 通用域路径 |
+| `SOUNDINFO` | 89 | 7,200 | `0x44f4bc` | ✅ `yu-sound` | 装宿主时走 `op_soundinfo` → `SoundHost::query` → `LET`；未装宿主保持 M-2 通用域路径。B1:`LET` 槽事件携带变量引用(query 参数面不变,DIV-RT-042) |
 | `SOUNDEND` | 88 | 1 | `0x44f308` | ✅ `yu-sound` | 删层；随后 `SOUNDINFO[EXIST]=0` |
 | `MIDI` | 67 | 0 | `0x44aa40` | ⛔ Unimplemented | 处理体为空桩；无手册页 |
 | `MIDIEND` | 68 | 0 | `0x44aa60` | ⛔ Unimplemented | 同上 |

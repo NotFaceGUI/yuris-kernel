@@ -464,7 +464,7 @@ fn main() {
 fn signature(yscm: &yu_rt::tables::YscmTable, name: &str, args: &[ArgValue]) -> String {
     let opcode = yscm.index_of(name);
     let mut out = String::new();
-    for ArgValue { slot, value } in args {
+    for ArgValue { slot, value, .. } in args {
         if !out.is_empty() {
             out.push(' ');
         }

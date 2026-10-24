@@ -83,11 +83,12 @@ END/VOLUME/PAN/PITCH/TIME/TOTALTIME/CHANNEL/BIT/SAMPLE/CODEC`)+
 `CODEC` 值域(手册):`0=WAVE / 1=OGG / 2=ACM WAVE`。
 其余字段的返回类型由 `LET` 目标类型决定;`FILE` 返回字符串,其余为整数。
 
-**LET 写回（N 任务已接）**:`LET` 在引擎里是变量引用,`DomainCall.args`
-仍只带求值结果;但 VM 在 `op_soundinfo` 里自己 `eval_lvalue` 持左值,
-把其余参数交给 `SoundHost::query`,再把返回值 `write_target` 写回。
-因此 SOUNDINFO **不需要**给 `ArgValue` 加引用字段(与 `CGINFO` 的
-`op_info` 同型)。`SAVE/LOAD/FILEINFO` 的引用身份仍是 §6 的 open 项。
+**LET 写回（N 任务已接）**:`LET` 在引擎里是变量引用,但 VM 在
+`op_soundinfo` 里自己 `eval_lvalue` 持左值,把其余参数交给
+`SoundHost::query`,再把返回值 `write_target` 写回。B1 起事件里的
+`LET` 槽同样携带 `ArgValue.reference`(写回仍由 query 结果完成;
+`query` 参数面保持只含提问字段)。`SAVE/LOAD/FILEINFO` 的引用身份
+同批解决(§6.1 / DIV-RT-042 fixed)。
 
 ## 4. SAVE / LOAD / SAVEEND(手册 `file/save.html` / `file/load.html` / `file/saveend.html`)
 
@@ -156,12 +157,12 @@ yu-save **不得**把 `SET` 当字面量存盘。
 
 ## 6. 契约缺口(事件层,非子系统)
 
-1. **变量引用身份丢失**:`SAVE[SET=@X]` / `LOAD[LET=@Y]` /
-   `FILEINFO[LET=@Z]` 在引擎里传的是引用,`DomainCall.args` 只有求值结果。
-   修复需要给 `ArgValue` 增加引用字段或新增事件,均属跨 crate 契约变更
-   (当前 `yu-trace` 对新事件变体没有兜底分支)。台账:`DIV-RT-042`。
-   **例外（已解决）**:`SOUNDINFO[LET=@W]` 由 VM 侧 `op_soundinfo` 持
-   `LValue` → `SoundHost::query` → `write_target`,事件层不变。
+1. ~~**变量引用身份丢失**~~ **已解决(B1,2026-10-24)**:`ArgValue` 新增
+   `reference: Option<VarRef>`,白名单槽(SAVE[SET]/LOAD[LET]/
+   FILEINFO[LET]/SOUNDINFO[LET])在求值结果之外携带归一化变量引用;
+   旧事件流缺字段按 `None` 读(`yu-trace` 同步兼容)。三条存档命令另有
+   `SaveHost` 同步契约(预约/刷盘/拉取,见 §4),不再依赖异步事件做语义。
+   台账:`DIV-RT-042`(fixed)。
 2. ~~没有 script/pc~~ **已解决(P4)**:`DomainCall` 新增可选
    `script`/`pc`;内核发出的域事件总是 `Some`。
 3. **没有求值顺序**:`eval_arg_windows` 按窗口顺序求值;引擎参数求值顺序

@@ -569,8 +569,8 @@ fn short(value: &Value) -> String {
 
 /// `SaveSnapshot` 的确定性单行文本(save_state_sha256 的输入)。
 ///
-/// 只含稳定事实:槽文件(名/尺寸/块数/DNO 表)、预约(DNO/帧/值)、
-/// 域事件计数。**不含**修改时间等易变事实;字段序固定。
+/// 只含稳定事实:槽文件(名/尺寸/块数/DNO 表)、预约(DNO/块类型/变量 id,
+/// **不含块值**——数组快照动辄数千元素)、域事件计数。字段序固定。
 fn save_snapshot_text(snapshot: &yu_save::SaveSnapshot) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -594,10 +594,19 @@ fn save_snapshot_text(snapshot: &yu_save::SaveSnapshot) -> String {
     }
     out.push_str("reservations:\n");
     for fact in &snapshot.reservations {
-        out.push_str(&format!(
-            "  dno={} frame={} value={:?}\n",
-            fact.dno, fact.frame, fact.value
-        ));
+        if fact.btype == 2 {
+            let subs: Vec<String> = fact.subs.iter().map(|(id, _)| id.to_string()).collect();
+            out.push_str(&format!(
+                "  dno={} btype=2 var=0 subs=[{}]\n",
+                fact.dno,
+                subs.join(",")
+            ));
+        } else {
+            out.push_str(&format!(
+                "  dno={} btype={} var={}\n",
+                fact.dno, fact.btype, fact.var_id
+            ));
+        }
     }
     out
 }

@@ -14,7 +14,7 @@
 //! 规范形式,字段集合按「官方可观测行为能表达」设计。凡是官方观测不到的
 //! 内部量一律不出现在事件里。
 
-use crate::value::Value;
+use crate::value::{ElemType, Value, VarRef};
 use yu_log::Diag;
 
 /// 事件流中的一条记录。
@@ -104,15 +104,35 @@ pub enum VmEvent {
 }
 
 /// 参数求值结果(按 `kind` 序号)。
+///
+/// `reference` = 引用型参数槽(SAVE[SET]/LOAD[LET]/FILEINFO[LET]/
+/// SOUNDINFO[LET])保留的**变量身份**(DIV-RT-042,B1 裁 1-A):引擎把
+/// `SET=`/`LET=` 当变量地址执行(REA `0x44c45c`/`0x44708c`:引用经
+/// `0x683a60/0x683c00/0x683da0[slot]` 三表传递),只带求值结果会让宿主
+/// 写不出/恢复不了忠实块。`None` = 非引用槽或旧事件流(向后兼容)。
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArgValue {
     pub slot: u8,
     pub value: Value,
+    pub reference: Option<VarRef>,
 }
 
 impl ArgValue {
     pub fn new(slot: u8, value: Value) -> Self {
-        Self { slot, value }
+        Self {
+            slot,
+            value,
+            reference: None,
+        }
+    }
+
+    /// 引用型槽:值 + 变量身份一起携带(`var` 应为归一化后的引用)。
+    pub fn with_ref(slot: u8, value: Value, var: VarRef) -> Self {
+        Self {
+            slot,
+            value,
+            reference: Some(var),
+        }
     }
 }
 
@@ -123,9 +143,9 @@ pub struct DomainArg<'a> {
     pub name: std::borrow::Cow<'a, str>,
     /// 参数序号(= 事件里的 `ArgValue::slot`)。
     pub slot: u8,
-    /// 求值结果。**注意**:`SAVE/LOAD/FILEINFO/SOUNDINFO` 的
-    /// `SET`/`LET` 在引擎里是变量引用,本视图仍只能看到求值结果;
-    /// 变量身份未进入 `DomainCall`(契约缺口见 DIV-RT-042)。
+    /// 求值结果。引用型槽(SAVE[SET]/LOAD[LET] 等)的变量身份在
+    /// `ArgValue::reference`(DIV-RT-042,B1 已闭);本视图仍只给值,
+    /// 需要身份的宿主走 `SaveHost` 同步契约。
     pub value: &'a Value,
 }
 
@@ -341,4 +361,72 @@ pub trait SoundHost {
 
     /// 回答一条 SOUNDINFO 查询；返回写入 `LET` 的值。
     fn query(&mut self, command: &str, args: &[ArgValue]) -> Result<Value, Diag>;
+}
+
+/// 一个变量的整组快照(SAVE 预约 / LOAD 写回的传输形态;B1)。
+///
+/// 形态证据(REA `0x44d5dd` 尺寸式 + 官方产物):块内容 = 变量**当前全部
+/// 元素**——标量槽 `dims=[]`(save50001 DNO=421),数组槽整组(seld.sd
+/// Int[2001]);语料 `SET=@X`(标量)/`SET=@X()`(整组)两形态同型。
+#[derive(Clone, Debug, PartialEq)]
+pub struct VarSnapshot {
+    /// 元素类型(与声明一致;写容器 `ty u32` 1/2/3)。
+    pub ty: ElemType,
+    /// 各维边界(标量为空)。
+    pub dims: Vec<u32>,
+    /// 行主序元素,长度 = 维数积(标量 = 1)。
+    pub data: Vec<Value>,
+}
+
+/// LOAD 的一条恢复项。
+///
+/// `var = None` ⇒ 写调用方(VM)的 `LET` 目标(块类型 0);
+/// `var = Some` ⇒ 按**块内 var_id** 直接写回(块类型 2 的子块;LOAD 处理体
+/// `0x447460..0x4474de` 不读 `LET`/`G_*` 在场位,子块无条件按 id 恢复)。
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedVar {
+    pub var: Option<VarRef>,
+    pub snap: VarSnapshot,
+}
+
+/// `LOAD[FILE DNO]` 解出的一块恢复数据。
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct LoadedBlock {
+    pub vars: Vec<LoadedVar>,
+}
+
+/// 存档域同步宿主(B1 裁 1-A / 裁 2-A;与 [`GraphicsHost::query`] 同模式)。
+///
+/// 为什么同步:`SAVE` 的预约在**命令时刻序列化当前值**(REA `0x44d73d`:
+/// 写 btype/strict/var/clen/ulen + `0x44dc1d` 取值 + `0x48c4a4` 压缩,
+/// `FILE` 只写文件头与偏移表),`LOAD` 的写回在命令时刻落地——异步事件流
+/// 两者都拿不到正确时序。未安装宿主时,SAVE/LOAD/SAVEEND 保持纯域事件
+/// (M-2 既有行为,600 帧普查逐位不变)。
+pub trait SaveHost {
+    /// 同步应用一条事件(仅 `Domain::Save | Domain::File` 的 DomainCall;
+    /// SAVE/LOAD/SAVEEND 的语义走下面的专用方法,宿主不得重复消费)。
+    fn apply_event(&mut self, ev: &VmEvent);
+
+    /// `SAVE[DNO=n SET=@x]` 预约一块(块类型 0;**当前值在本次调用内快照**)。
+    fn reserve(&mut self, dno: u32, var: VarRef, snap: &VarSnapshot) -> Result<(), Diag>;
+
+    /// `SAVE[DNO=n G_<族><组>=1]` 预约一块(块类型 2):`vars` =
+    /// (type, group) 匹配的全局变量逐个 `(var_id, 快照)`,顺序 = 工程变量
+    /// 表序(REA `0x44ca8a..0x44cc57` 枚举 `[0x801724]` 记录)。
+    fn reserve_group(
+        &mut self,
+        dno: u32,
+        ty: ElemType,
+        group: u8,
+        vars: &[(u16, VarSnapshot)],
+    ) -> Result<(), Diag>;
+
+    /// `SAVE[FILE="x"]` 刷盘(写文件头 + 偏移表 + 全部预约块)。
+    fn flush(&mut self, file: &str) -> Result<(), Diag>;
+
+    /// `SAVEEND[]` 丢弃全部未刷盘预约。
+    fn save_end(&mut self);
+
+    /// `LOAD[FILE DNO=n]` 读一块恢复数据(容器解析归宿主;写回归 VM)。
+    fn load_block(&mut self, file: &str, dno: u32) -> Result<LoadedBlock, Diag>;
 }

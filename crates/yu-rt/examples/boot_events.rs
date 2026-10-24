@@ -75,7 +75,7 @@ fn args_text(tables: &BootTables, cmd: &str, args: &[ArgValue]) -> String {
         .index_of(cmd)
         .and_then(|i| tables.yscm.command(i as u8));
     let mut out = String::new();
-    for ArgValue { slot, value } in args {
+    for ArgValue { slot, value, .. } in args {
         let name = decl
             .and_then(|d| d.params.get(usize::from(*slot)))
             .map(|p| p.name.as_str())

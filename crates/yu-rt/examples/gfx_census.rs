@@ -106,7 +106,7 @@ fn main() {
                     continue;
                 };
                 let mut line = String::new();
-                for ArgValue { slot, value } in args {
+                for ArgValue { slot, value, .. } in args {
                     let pname = decl
                         .params
                         .get(usize::from(*slot))
@@ -132,7 +132,7 @@ fn main() {
                 continue;
             };
             let mut line = String::new();
-            for ArgValue { slot, value } in args {
+            for ArgValue { slot, value, .. } in args {
                 let pname = decl
                     .params
                     .get(usize::from(*slot))

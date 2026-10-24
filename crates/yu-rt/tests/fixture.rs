@@ -3188,3 +3188,413 @@ fn bare_wait_yields_one_frame() {
         "次帧恢复执行"
     );
 }
+
+// ---------------------------------------------------------------- 存档闭环(B1/DIV-RT-042)
+
+use yu_log::Diag;
+use yu_rt::event::{LoadedBlock, LoadedVar, SaveHost, VarSnapshot};
+
+/// 存档同步宿主记录器:断言 VM 侧契约(预约快照/组枚举/刷盘名/写回)本身,
+/// 不依赖 `yu-save`。通过 `Rc<RefCell<_>>` 共享(`Box<dyn SaveHost>` 无法
+/// downcast,测试持同一共享单元直查调用事实)。
+type GroupRecord = (u32, yu_rt::value::ElemType, u8, Vec<(u16, VarSnapshot)>);
+
+struct SaveRecorder {
+    reserves: Vec<(u32, VarRef, VarSnapshot)>,
+    groups: Vec<GroupRecord>,
+    flushes: Vec<String>,
+    ends: u32,
+    loads: Vec<(String, u32)>,
+}
+
+impl SaveRecorder {
+    fn new() -> std::rc::Rc<std::cell::RefCell<Self>> {
+        std::rc::Rc::new(std::cell::RefCell::new(Self {
+            reserves: Vec::new(),
+            groups: Vec::new(),
+            flushes: Vec::new(),
+            ends: 0,
+            loads: Vec::new(),
+        }))
+    }
+}
+
+/// 共享宿主包装:`reply` 为 `Some` 时 `load_block` 回复之(LOAD 写回用例)。
+struct SharedHost {
+    inner: std::rc::Rc<std::cell::RefCell<SaveRecorder>>,
+    reply: std::rc::Rc<std::cell::RefCell<Option<LoadedBlock>>>,
+}
+
+impl SaveHost for SharedHost {
+    fn apply_event(&mut self, _ev: &yu_rt::event::VmEvent) {}
+    fn reserve(&mut self, dno: u32, var: VarRef, snap: &VarSnapshot) -> Result<(), Diag> {
+        self.inner
+            .borrow_mut()
+            .reserves
+            .push((dno, var, snap.clone()));
+        Ok(())
+    }
+    fn reserve_group(
+        &mut self,
+        dno: u32,
+        ty: yu_rt::value::ElemType,
+        group: u8,
+        vars: &[(u16, VarSnapshot)],
+    ) -> Result<(), Diag> {
+        self.inner
+            .borrow_mut()
+            .groups
+            .push((dno, ty, group, vars.to_vec()));
+        Ok(())
+    }
+    fn flush(&mut self, file: &str) -> Result<(), Diag> {
+        self.inner.borrow_mut().flushes.push(file.to_string());
+        Ok(())
+    }
+    fn save_end(&mut self) {
+        self.inner.borrow_mut().ends += 1;
+    }
+    fn load_block(&mut self, file: &str, dno: u32) -> Result<LoadedBlock, Diag> {
+        self.inner.borrow_mut().loads.push((file.to_string(), dno));
+        let reply = self.reply.borrow_mut().take();
+        reply.ok_or_else(|| Diag::fatal("test", yu_log::Boundary::Domain))
+    }
+}
+
+fn int_snap(vals: &[i64], dims: &[u32]) -> VarSnapshot {
+    VarSnapshot {
+        ty: yu_rt::value::ElemType::Int,
+        dims: dims.to_vec(),
+        data: vals.iter().map(|&v| Value::Int(v)).collect(),
+    }
+}
+
+/// `SAVE[DNO SET=@a]`:预约 = **整组值快照**(REA `0x44d73d`);事件在 SET
+/// 槽携带变量引用(DIV-RT-042/B1 裁 1-A);`SAVE[FILE]` 名字补 `.sd`
+/// (手册拡張子省略可);`SAVEEND` 清预约。
+#[test]
+fn save_load_loop_records_reserve_flush_and_writes_back() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys,
+            value_type: 1,
+            dims: vec![4],
+            init: Init::Int(9),
+        },
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(0),
+        },
+    ];
+    let op_save = b.commands.iter().position(|(n, _)| *n == "SAVE").unwrap() as u8;
+    let op_load = b.commands.iter().position(|(n, _)| *n == "LOAD").unwrap() as u8;
+    let op_saveend = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "SAVEEND")
+        .unwrap() as u8;
+    let groups = vec![
+        // SAVE[DNO=3 SET=@a] —— 数组变量引用,预约 = 整组快照。
+        GroupSpec::new(op_save)
+            .window(1, ex::i8_(3))
+            .window(2, ex::r#ref(0x40, sys)),
+        // SAVE[FILE="arc"] —— 缺 .sd 由内核补。
+        GroupSpec::new(op_save).window(0, ex::s("arc")),
+        // LOAD[FILE="seld.sd" DNO=1 LET=@b] —— 块值 42 写回标量。
+        GroupSpec::new(op_load)
+            .window(0, ex::s("seld.sd"))
+            .window(1, ex::i8_(1))
+            .window(2, ex::r#ref(0x40, sys + 1)),
+        // SAVE[DNO=9 SET=@b] —— 写回后的值再次预约(闭环)。
+        GroupSpec::new(op_save)
+            .window(1, ex::i8_(9))
+            .window(2, ex::r#ref(0x40, sys + 1)),
+        GroupSpec::new(op_saveend),
+        GroupSpec::new(OP_END),
+    ];
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let recorder = SaveRecorder::new();
+    let reply = std::rc::Rc::new(std::cell::RefCell::new(Some(LoadedBlock {
+        vars: vec![LoadedVar {
+            var: None,
+            snap: int_snap(&[42], &[]),
+        }],
+    })));
+    let mut vm = boot(b);
+    vm.set_save_host(Box::new(SharedHost {
+        inner: recorder.clone(),
+        reply: reply.clone(),
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let rec = recorder.borrow();
+    // 预约 1:@a 整组快照(标量 init 填满数组是引擎语义,VarSlot::new)。
+    assert_eq!(rec.reserves.len(), 2, "两次预约: {:?}", rec.reserves);
+    let (dno, var, snap) = &rec.reserves[0];
+    assert_eq!(*dno, 3);
+    assert_eq!(*var, VarRef::new(VarSpace::At, sys));
+    assert_eq!(snap.dims, vec![4]);
+    assert_eq!(snap.data, vec![Value::Int(9); 4]);
+    // 刷盘名补 .sd(REA `0x44c6cc..` 检测后拼接)。
+    assert_eq!(rec.flushes, vec!["arc.sd".to_string()]);
+    // LOAD:文件/DNO 原样传宿主;块值写回 @b。
+    assert_eq!(rec.loads, vec![("seld.sd".to_string(), 1)]);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 1), &[])
+            .unwrap(),
+        Value::Int(42)
+    );
+    // 闭环预约:@b 的当前值(42)成为快照。
+    let (dno, var, snap) = &rec.reserves[1];
+    assert_eq!(*dno, 9);
+    assert_eq!(*var, VarRef::new(VarSpace::At, sys + 1));
+    assert_eq!(snap.data, vec![Value::Int(42)]);
+    assert_eq!(rec.ends, 1);
+    drop(rec);
+    // 事件流:SAVE/LOAD 域事件的引用槽携带变量身份(DIV-RT-042)。
+    let events = vm.take_events();
+    let save_args: Vec<_> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            yu_rt::event::VmEvent::DomainCall { name, args, .. } if name == "SAVE" => Some(args),
+            _ => None,
+        })
+        .collect();
+    // 三条 SAVE 域事件:DNO=3 / FILE-only(无预约,纯刷盘) / DNO=9。
+    assert_eq!(save_args.len(), 3);
+    let set_ref = save_args[0]
+        .iter()
+        .find(|a| a.slot == 2)
+        .expect("SET 槽在事件里");
+    assert_eq!(set_ref.reference, Some(VarRef::new(VarSpace::At, sys)));
+    let load_args: Vec<_> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            yu_rt::event::VmEvent::DomainCall { name, args, .. } if name == "LOAD" => Some(args),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(load_args.len(), 1);
+    let let_ref = load_args[0]
+        .iter()
+        .find(|a| a.slot == 2)
+        .expect("LET 槽在事件里");
+    assert_eq!(let_ref.reference, Some(VarRef::new(VarSpace::At, sys + 1)));
+}
+
+/// 组形态 `SAVE[DNO=5 G_INT2=1]`:枚举 (值类型=INT, 组=2) 的全局变量逐个
+/// 子块化,顺序 = 工程变量表序(REA `0x44ca8a..`;与 VARACT[INIT] 同源)。
+#[test]
+fn save_group_form_enumerates_matching_globals() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        VarSpec {
+            kind: 1,
+            group: 2,
+            script_id: 0,
+            var_id: sys,
+            value_type: 1,
+            dims: vec![2],
+            init: Init::Int(0),
+        },
+        VarSpec {
+            kind: 1,
+            group: 2,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(7),
+        },
+        VarSpec {
+            kind: 1,
+            group: 2,
+            script_id: 0,
+            var_id: sys + 2,
+            value_type: 2,
+            dims: vec![],
+            init: Init::Float(0.0),
+        },
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys + 3,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(0),
+        },
+    ];
+    let op_save = b.commands.iter().position(|(n, _)| *n == "SAVE").unwrap() as u8;
+    let groups = vec![
+        // SAVE[DNO=5 G_INT2=1](官方 ycd 参数序:DNO=1、G_INT2 = 槽 6)
+        GroupSpec::new(op_save)
+            .window(1, ex::i8_(5))
+            .window(6, ex::i8_(1)),
+        GroupSpec::new(OP_END),
+    ];
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let recorder = SaveRecorder::new();
+    let reply = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let mut vm = boot(b);
+    vm.set_save_host(Box::new(SharedHost {
+        inner: recorder.clone(),
+        reply,
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let rec = recorder.borrow();
+    assert_eq!(rec.groups.len(), 1, "groups: {:?}", rec.groups);
+    let (dno, ty, group, vars) = &rec.groups[0];
+    assert_eq!(*dno, 5);
+    assert_eq!(*ty, yu_rt::value::ElemType::Int);
+    assert_eq!(*group, 2);
+    // 只收 INT 组 2;FLT 组 2 / INT 组 1 不混入;顺序 = 声明序。
+    assert_eq!(
+        vars.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![sys, sys + 1]
+    );
+    assert_eq!(vars[0].1.data, vec![Value::Int(0), Value::Int(0)]);
+    assert_eq!(vars[1].1.data, vec![Value::Int(7)]);
+}
+
+/// 组块 `LOAD[FILE DNO G_*]`:块类型 2 的子块**按块内 var_id 直接恢复**
+/// (REA `0x447460..0x4474de`:不读 LET/G_* 在场位;语料组旗标被求值但
+/// 不消费)。目标 = 官方语料的旧式空间 id 同型(ERIS `@G(0001)` = 1161,
+/// DIV-RT-017;夹具用 ≥ sys 的等价 id)。
+#[test]
+fn load_group_block_restores_each_var_by_id() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 2,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![2],
+        init: Init::Int(0),
+    }];
+    let op_load = b.commands.iter().position(|(n, _)| *n == "LOAD").unwrap() as u8;
+    let groups = vec![
+        GroupSpec::new(op_load)
+            .window(0, ex::s("gsd.sd"))
+            .window(1, ex::i8_(3))
+            .window(6, ex::i8_(1)),
+        GroupSpec::new(OP_END),
+    ];
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let recorder = SaveRecorder::new();
+    let reply = std::rc::Rc::new(std::cell::RefCell::new(Some(LoadedBlock {
+        vars: vec![LoadedVar {
+            var: Some(VarRef::new(VarSpace::At, sys)),
+            snap: int_snap(&[5, 7], &[2]),
+        }],
+    })));
+    let mut vm = boot(b);
+    vm.set_save_host(Box::new(SharedHost {
+        inner: recorder.clone(),
+        reply,
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        recorder.borrow().loads,
+        vec![("gsd.sd".to_string(), 3)],
+        "LOAD 文件名/DNO 原样传宿主"
+    );
+    // 逐元素验证写回(整组恢复)。
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[0])
+            .unwrap(),
+        Value::Int(5)
+    );
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[1])
+            .unwrap(),
+        Value::Int(7)
+    );
+}
+
+/// FILEINFO 的「散盘」回退(REA `0x44316c`;B1 桌面实测暴露):路径以注入的
+/// `$_SAVE_PATH` 为前缀 ⇒ save 根文件系统判存在。存档界面的槽存在判定
+/// (`es.SaveDataCheck → \_file.info.exist`)与启动恢复的闸门都走这条。
+#[test]
+fn fileinfo_fs_fallback_checks_save_root() {
+    use yu_rt::vm::HostPaths;
+
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/fixture-fsinfo");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("t.sd"), b"YSSD-dummy").unwrap();
+    let root_str = format!("{}/", dir.to_string_lossy().replace('\\', "/"));
+
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(-1),
+    }];
+    let op_fileinfo = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "FILEINFO")
+        .unwrap() as u8;
+    let groups = vec![
+        // FILEINFO[FILE=$es.SAVEPATH+t.sd EXIST=1 LET=@r] —— save 根内存在
+        GroupSpec::new(op_fileinfo)
+            .window(0, ex::s(&format!("{root_str}t.sd")))
+            .window(1, ex::i8_(1))
+            .window(2, ex::r#ref(0x40, sys)),
+        GroupSpec::new(OP_END),
+    ];
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let src = b.build();
+    let cfg = BootConfig {
+        paths: HostPaths {
+            save_path: Some(root_str.clone().into_bytes()),
+            ..HostPaths::default()
+        },
+        ..BootConfig::default()
+    };
+    let mut vm = Vm::boot(Box::new(src), cfg).expect("boot");
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(1)
+    );
+}

@@ -1313,6 +1313,7 @@ mod tests {
                 args: vec![TraceArg {
                     slot: 0,
                     value: TraceValue::Str(b"ev01".to_vec()),
+                    reference: None,
                 }],
             },
         );

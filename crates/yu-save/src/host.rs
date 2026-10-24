@@ -1,14 +1,18 @@
-//! `SaveHost`:把 [`SaveState`] 接到 `yu-cli` 的帧循环(事件事实消费)。
+//! `SaveHost`:把 [`SaveState`] 接到帧循环与 VM(B1 存档闭环)。
 //!
-//! 与 `yu-sound::SoundHost` 的差别(有意为之):`yu-rt` 本轮冻结
-//! (任务书 P4 文件占用),所以存档宿主**不加 `yu-rt` trait**;由
-//! `yu-cli::engine` 在每帧 `Vm::take_events()` 之后把事件喂进来。
-//! 事实记录天然容忍这个一帧延迟(契约文档 §6:「事件是事实记录」)。
+//! 双通道(有意为之,与 `yu-sound` 同型):
+//! - **事件事实**(FILEACT/SAVEINFO/FILEINFO):`Engine` 每帧 drain 后喂入;
+//! - **同步契约**(SAVE 预约/刷盘、LOAD 拉取):实现 `yu_rt::event::SaveHost`,
+//!   VM 在命令时刻直接调用——预约值快照与 LOAD 写回的时序都在命令时刻
+//!   (REA `0x44d73d`/`0x447b3d`),异步事件流给不了。宿主不得再消费
+//!   SAVE/LOAD/SAVEEND 的 DomainCall(会重复)。
 
 use std::sync::{Arc, Mutex};
 
-use yu_rt::event::VmEvent;
+use yu_log::Diag;
+use yu_rt::event::{LoadedBlock, VarSnapshot, VmEvent};
 use yu_rt::tables::YscmTable;
+use yu_rt::value::{ElemType, VarRef};
 
 use crate::state::SaveState;
 
@@ -32,7 +36,8 @@ impl SaveHost {
         Arc::clone(&self.state)
     }
 
-    /// 喂入一条事件(非 Save/File 域直接忽略)。
+    /// 喂入一条事件(非 Save/File 域直接忽略;B1 起 SAVE/LOAD/SAVEEND
+    /// 的 DomainCall 被状态机忽略——语义已走同步契约)。
     pub fn apply_event(&self, ev: &VmEvent) {
         // 锁中毒降级(H-P1-01 同口径): poisoned 锁里的状态仍是合法的
         // 前一时刻快照,继续用,不 panic。
@@ -48,5 +53,43 @@ impl SaveHost {
         for ev in events {
             self.apply_event(ev);
         }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SaveState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl yu_rt::event::SaveHost for SaveHost {
+    fn apply_event(&mut self, ev: &VmEvent) {
+        SaveHost::apply_event(self, ev);
+    }
+
+    fn reserve(&mut self, dno: u32, var: VarRef, snap: &VarSnapshot) -> Result<(), Diag> {
+        self.lock().reserve(dno, var, snap)
+    }
+
+    fn reserve_group(
+        &mut self,
+        dno: u32,
+        ty: ElemType,
+        group: u8,
+        vars: &[(u16, VarSnapshot)],
+    ) -> Result<(), Diag> {
+        self.lock().reserve_group(dno, ty, group, vars)
+    }
+
+    fn flush(&mut self, file: &str) -> Result<(), Diag> {
+        self.lock().flush(file)
+    }
+
+    fn save_end(&mut self) {
+        self.lock().save_end();
+    }
+
+    fn load_block(&mut self, file: &str, dno: u32) -> Result<LoadedBlock, Diag> {
+        self.lock().load_block(file, dno)
     }
 }

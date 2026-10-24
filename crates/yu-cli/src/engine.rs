@@ -1099,8 +1099,9 @@ impl TextureSampler for StoreSampler {
 
 fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     let boot_started = Instant::now();
-    // 存档根(P4 M-C):显式重定向 = 可写;默认 = 工程根下 save/(只读观察,
-    // SAVE 刷盘与 FILEACT 落盘被域宿主拒绝,保护语料目录)。
+    // 存档根(P4 M-C;2026-10-24 主人令改为默认可写):缺省 = 工程根
+    // `save/`(官方原版已备份至 `save-backup-20261024/`,引擎按语义正常
+    // 读写);`--save-root`/用例 = 显式重定向目录。
     let save_root: std::path::PathBuf = match &opts.save_root {
         Some(dir) => {
             std::fs::create_dir_all(dir).map_err(|e| {
@@ -1177,18 +1178,22 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     } else {
         None
     };
-    // 存档域宿主(P4 M-C):Save/File 域事件的事实消费。参数名经工程
-    // yscm 取;可写性 = 显式 save 根重定向(见 boot 顶部)。
+    // 存档域宿主(P4 M-C;B1 存档闭环):同一 `SaveHost` 双通道——
+    // ① 安装进 VM(同步契约:SAVE 预约/刷盘、LOAD 拉取,REA 0x44d73d/
+    //    0x447b3d 的命令时刻时序);
+    // ② 事件事实消费(FILEACT/SAVEINFO/FILEINFO;Engine 每帧 drain 喂入)。
+    // 可写 = 默认(2026-10-24 主人令;原版存档已备份 save-backup-20261024/)。
     let save_host = {
-        let writable = opts.save_root.is_some();
-        let save_state = Arc::new(Mutex::new(SaveState::new(save_root.clone(), writable)));
+        // 可写 = 默认(2026-10-24 主人令;原版存档已备份 save-backup-20261024/)。
+        let save_state = Arc::new(Mutex::new(SaveState::new(save_root.clone(), true)));
         let yscm = vm.tables().boot.yscm.clone();
         let host = SaveHost::new(save_state, yscm);
-        // 开机先扫一遍槽表(盘上事实;SAVEINFO/LOAD 读侧的地基)。
+        // 开机先扫一遍槽表(盘上事实;LOAD 读侧的地基)。
         host.state()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .refresh_slots();
+        vm.set_save_host(Box::new(host.clone()));
         Some(host)
     };
     log::info!(

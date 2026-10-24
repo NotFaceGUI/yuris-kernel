@@ -1,0 +1,23 @@
+{
+  "entry": "SYSTEM_START",
+  "expect": {
+    "display_json_sha256": "5f3cda5546116f9e8629da482e35dde9633720637bce5cb24990c890751aa4f8",
+    "fatal_codes": [],
+    "ops_total": 173,
+    "png_sha256": "6f75e49f4fdc50f2f5146d08fe1be6d7f1276e7eb86c3b44df0c9e0e6795c015",
+    "save_state_sha256": "3efe59eaac7085890b01a0a4f8762d81ea737cccacca3ca8660c6b99ea60e0c8",
+    "skipped_ops_total": 0
+  },
+  "frames": 470,
+  "inputs": [
+    {
+      "button": "MOUSE_L",
+      "frame": 300,
+      "x": 217,
+      "y": 281
+    }
+  ],
+  "name": "save-load-loop",
+  "note": "B1 存档闭环(DIV-RT-042):标题スタート→本篇。GO 宏触发 \\GSD.SAVE(es_GSD.yst:558)→ SAVE 预约(值快照,REA 0x44d73d)→ SAVE[FILE] 刷盘(gsd.sd/extra.sd/seld.sd 落 target/tmp/save-cases/save-load-loop/)→ SAVEEND。写侧=save_state_sha256(槽表含产物字节事实);读侧(LOAD[LET]/组块按 var_id)由 fixture::save_load_loop_* / load_group_* 与 yu-save 官方 seld.sd golden 对拍覆盖。ops 与 symptom-enter-story 同帧位一致(存档不改画面)。 「png/display 哈希不钉:基线渲染(字体/文本)另有会话活跃改动中;像素回归归 gfx 用例。」",
+  "save": true
+}

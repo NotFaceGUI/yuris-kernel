@@ -9,6 +9,19 @@
 > **2026-10-22 改动审查**:新增 `docs/audit-2026-10-22.md`(4 项确定错误、
 > 4 项文档失真、3 项工程回归)。本次审查的 P0 项已写入 §2.0;`backend-soft-review.md`
 > 的 P1/P2 计数已过期(多数已由 J2/J3/J4 关闭),不再作为待办来源。
+>
+> **2026-10-24 全项目审查对账(AU5)**:本快照整体落后于 P1–P8/AU4/N/P4/P5
+> 落地后的现状;本轮审查事实源 = `docs/audit-2026-10-24.md`。本次已就地勘误:
+> §3.2 GBK 码表、§5 行8/9/11/12;rt 侧勘误见
+> `crates/yu-rt/docs/coverage-matrix.md`(FILEINFO/FONTINFO/WINDOWINFO/LET 四行)
+> 与 `docs/symptom-ledger.md`(S2/S3d/S4/S7 销账)。§1 计数与 §4/§5 未逐行
+> 重写,以各 crate 台账为准。
+>
+> **2026-10-24 B1(存档闭环)**:DIV-RT-042 fixed——`ArgValue.reference` +
+> `SaveHost` 同步契约;SAVE 预约/刷盘、LOAD 写回落地(`save-load-loop`
+> 用例);`sv.write.refused` 门禁语义收窄为「只读根拒绝」;既读色
+> (`seld.sd`)确认 es 脚本自 LOAD,零内核新机制。详见 DIV-RT-042 条目
+> 2026-10-24 收口段。
 
 ## 0. 口径
 
@@ -129,13 +142,18 @@
   资源图尺寸(024)、INFO 多字段(025/026/038)、CGACT 多图层(031)、
   FONT 字段(035/036)、RASTER/FSX(039)、半像素(042)、IDNO/TIDNO(027/030)、
   SWAP(032)、窗口 host(037)。
-- rt(静态频度高者):`F_INT` 337、`F_FLT` 72、`F_STR` 64、`DEBUGLIST` 5、
-  `YMVINFO` 4、`YMV` 3、`YMVEND` 2、`ERROR` 1、`MATH3D` 1;手册有页但语义未取:
-  `DIALOG` 17、`TRAY` 2、`CLIPACT` 1、`CLIPINFO`/`LABEL`/`MACRO`/`REGINFO` 0。
+- rt(AU5 勘误:此行多为旧口径):`F_INT`/`F_FLT`/`F_STR`/`DEBUGLIST` **已由
+  DIV-RT-043 收口**(脚本错误槽/no-op);`MATH3D` **已实现**(DIV-GFX-046);
+  `DIALOG` **已实现**(DIV-RT-044)。剩余:`YMV/YMVINFO/YMVEND`(宿主媒体,
+  路线图 B14)、`ERROR` 消费者(046,路线图 B10)、`TRAY/CLIPACT 写/REGINFO`
+  (宿主能力,路线图 B7)、`CLIPINFO/LABEL/MACRO`。全量清零计划见
+  `docs/tasks/roadmap-batches.md` B10。
 - rt 部分:INFO 类(1598/129/3 次)是“未安装 GraphicsHost”的普查口径,装了宿主
   即可;`LET` 剩 2 次 = `@_SAVE_PATH` 宿主注入 + `_TEXT_FLAG` 写入。
 - format:`DIV-002` NUL-XOR 方言(无真样本)、`DIV-007/009` YSTB v2
-  (仅当要支持老游戏)、`DIV-003` GBK 码表仍未落地。
+  (仅当要支持老游戏)。~~`DIV-003` GBK 码表仍未落地~~ **码表已落地**
+  (`yu-format/src/codec/table_gbk.rs` + 全表往返测试 `full_table_roundtrip_gbk`);
+  DIV-003 剩余 = `yu-vfs/src/dir.rs` DirSource 把 Unicode 文件名折回字节键。
 - trace:`DIV-L-002`(script 60 返回后的任务相位/调度)open;官方 L1 `args=[]`
   参数级不可观测,当前只到命令顺序级。
 
@@ -164,11 +182,11 @@
 | ~~P1~~ | ~~A2 `image_probe_order`~~ **AU1 已修**:空表在 `from_tables` 拒绝构造(DIV-GFX-049 fixed) | ~~违反 A5 原文~~ |
 | P1 | ~~后端 P1-2 / P2-2/3/4/5/8/9 + example 重名~~ **全部关闭**(P1-2=J4,P2-3/4=J2,P2-5=AU1 C3,P2-2/P2-8 复核与交叉检查=AU2,P2-9 作废=AU2,重名已改) | — |
 | P1 | 组 RT 子组 alpha(DIV-GFX-041,契约裁决后) | 依赖裁决 |
-| P2 | 文字桥:DIV-GFX-012/033/034/035/040(`yu-font` 已就绪) | 依赖 M2 的 TEXT 状态 |
-| P2 | **E1 E-mote 运行时(M0→M4)** | M0/M1 完成;M2 pose/参数表/Z 顺序、M3 plan/soft/composite mask 完成(2026-10-22);剩余参数化 deformer mesh、wgpu 管线、物理控制器/M4 对拍 + 内核接线 |
+| ~~P2~~ | ~~文字桥:DIV-GFX-012/033/034/035/040~~ **主体已 fixed(P2/P7 续 3 对账)**:012/034/040 落地;剩余 = 033 reveal(等 H-P2-02 取证)、035 尾项(宿主字体清单/BNO/PITCH/LANG,见 036) | ~~依赖 M2 的 TEXT 状态~~(已落地) |
+| P2 | **E1 E-mote 运行时(M0→M4)** | M0/M1 完成;M2 pose/参数表/Z 顺序、M3 plan/soft/composite mask 完成(2026-10-22);剩余参数化 deformer mesh、wgpu 管线、物理控制器/M4 对拍 + 内核接线。**AU5 对账**:以 submodule `d0f03a1` 为准(物理未求值、嵌套深度仍 32);`emote-parity.md` §7/§8 宣称项在该 checkout 不可复核,已加失真警告 |
 | P2 | 资产元数据 provider(DIV-GFX-024)→ CGINFO SX/SY | 已部分由 J3 落地(图像头),完整 provider 仍缺 |
-| P2 | **A4 `REVERSE`+`RECTPAINT` 组合补两端测试或删分支** | 未对拍 |
-| P2 | **C2 `eprintln!` 移出 `src/`;C3 示例注入 HostPaths** | 纪律/环境等价 |
+| ~~P2~~ | ~~**A4 `REVERSE`+`RECTPAINT` 组合补两端测试或删分支**~~ **已修(AU2)**:跨后端用例 `reverse_after_rectpaint_matches_soft` 逐像素一致(DIV-GFX-052) | — |
+| ~~P2~~ | ~~**C2 `eprintln!` 移出 `src/`;C3 示例注入 HostPaths**~~ **已修(AU1)**:`src/` 无 stdout 宏(§6.5);7 个示例 + `yu-cli boot()` 已注入宿主路径 | — |
 | P3 | 未取证命令取证 campaign(按静态频度) | 每个都要三层证据 |
 | P3 | YSTB v2 / NUL-XOR 方言(仅按目标游戏需要) | 需真样本 |
 | P3 | DIV-L-002 任务相位对齐 | 非渲染 |

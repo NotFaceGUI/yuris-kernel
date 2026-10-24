@@ -1,11 +1,11 @@
 {
   "entry": "SYSTEM_START",
   "expect": {
-    "fatal_codes": [],
     "display_json_sha256": "3d830df25b25b30365a4b9aa9b04dd5a19adf7564d53bb5015203ce38748ef37",
+    "fatal_codes": [],
     "ops_total": 147,
     "png_sha256": "a6db617b896dfb8a2f478238c3ef190fe4b0e5e4e825bb19771c8a940d05fc72",
-    "save_state_sha256": "bb3feaae5d14e1d89fa92f602635b0c75ccbfb2a3407b3ace235fdb4326c76a0",
+    "save_state_sha256": "1d45fcfc66aeea8fd16166c6239539afd46dd2e0e7a329692e377e3d3ed7515c",
     "skipped_ops_total": 0
   },
   "frames": 600,

@@ -32,6 +32,7 @@ fn log() -> TraceLog {
             args: vec![TraceArg {
                 slot: 0,
                 value: TraceValue::Str(vec![b'a', b'b']),
+                reference: None,
             }],
         },
     );

@@ -757,11 +757,32 @@ impl TraceValue {
     }
 }
 
+/// 引用槽携带的变量身份(`ArgValue::reference`;DIV-RT-042,B1)。
+///
+/// `prefix` = 工程源码的空间前缀字节(`@`=0x40 / `$`=0x24 / 旧式 0x60/0x23,
+/// DIV-RT-017);`id` = 变量 id(u16)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceVarRef {
+    pub prefix: u8,
+    pub id: u16,
+}
+
+impl TraceVarRef {
+    pub fn from_var(var: &yu_rt::value::VarRef) -> Self {
+        Self {
+            prefix: var.space.prefix(),
+            id: var.id,
+        }
+    }
+}
+
 /// 一个参数槽。
 #[derive(Clone, Debug, PartialEq)]
 pub struct TraceArg {
     pub slot: u8,
     pub value: TraceValue,
+    /// 引用型槽(SAVE[SET]/LOAD[LET] 等)的变量身份;非引用槽/旧 trace = `None`。
+    pub reference: Option<TraceVarRef>,
 }
 
 impl TraceArg {
@@ -769,6 +790,7 @@ impl TraceArg {
         Self {
             slot: arg.slot,
             value: TraceValue::from_value(&arg.value),
+            reference: arg.reference.as_ref().map(TraceVarRef::from_var),
         }
     }
 }
@@ -1303,8 +1325,29 @@ fn take_args(fields: &mut Fields<'_>, line: u64, key: &str) -> Result<Vec<TraceA
             .map_err(|_| error::parse(line, format!("slot out of u8 range: {slot}")))?;
         let value = arg_fields.take("value").map_err(|e| field_error(line, e))?;
         let value = parse_trace_value(line, value)?;
+        // 引用身份:B1 起携带;旧 trace 无该字段(或显式 null)按 None 读,
+        // 向后兼容(任务书 B1 §2.2)。
+        let reference = match arg_fields.take("reference") {
+            Ok(Json::Null) => None,
+            Ok(other) => {
+                let obj = json::as_obj(other).map_err(|detail| error::parse(line, detail))?;
+                let mut rf = Fields::new(obj);
+                let prefix = take_u64(&mut rf, line, "prefix")?;
+                let prefix =
+                    u8::try_from(prefix).map_err(|_| error::parse(line, "prefix out of u8"))?;
+                let id = take_u64(&mut rf, line, "id")?;
+                let id = u16::try_from(id).map_err(|_| error::parse(line, "id out of u16"))?;
+                rf.finish().map_err(|e| field_error(line, e))?;
+                Some(TraceVarRef { prefix, id })
+            }
+            Err(_) => None,
+        };
         arg_fields.finish().map_err(|e| field_error(line, e))?;
-        args.push(TraceArg { slot, value });
+        args.push(TraceArg {
+            slot,
+            value,
+            reference,
+        });
     }
     Ok(args)
 }
@@ -2193,10 +2236,21 @@ fn args_json(args: &[TraceArg]) -> Json {
     Json::Arr(
         args.iter()
             .map(|arg| {
-                Json::Obj(vec![
+                let mut fields = vec![
                     ("slot".to_string(), Json::UInt(arg.slot as u64)),
                     ("value".to_string(), value_json(&arg.value)),
-                ])
+                ];
+                fields.push((
+                    "reference".to_string(),
+                    match &arg.reference {
+                        Some(var) => Json::Obj(vec![
+                            ("prefix".to_string(), Json::UInt(var.prefix as u64)),
+                            ("id".to_string(), Json::UInt(var.id as u64)),
+                        ]),
+                        None => Json::Null,
+                    },
+                ));
+                Json::Obj(fields)
             })
             .collect(),
     )

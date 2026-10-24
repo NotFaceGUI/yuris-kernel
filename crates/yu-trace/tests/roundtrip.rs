@@ -76,14 +76,17 @@ fn sample_log() -> TraceLog {
                 TraceArg {
                     slot: 0,
                     value: TraceValue::Int(i64::MIN),
+                    reference: None,
                 },
                 TraceArg {
                     slot: 1,
                     value: TraceValue::Float(0.1),
+                    reference: None,
                 },
                 TraceArg {
                     slot: 2,
                     value: TraceValue::Str(vec![0x83, 0x5c, 0x83, 0x41, 0xff, 0x00]),
+                    reference: None,
                 },
             ],
         },
