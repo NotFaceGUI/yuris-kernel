@@ -152,6 +152,49 @@ impl DialogRequest {
     pub fn requires_text(&self) -> bool {
         self.input
     }
+
+    /// `CAPTION` 的显示文本(仅宿主呈现;内核语义仍是原始字节)。
+    ///
+    /// 严格 CP932 解码失败的**单个**坏字节以 U+FFFD 替换继续解码其余内容:
+    /// 呈现层不因一个坏字节顶掉整条对话框(官方 MessageBox 按 ANSI 直接
+    /// 显示,不存在"解码失败不显示"的分支)。
+    pub fn caption_display(&self) -> String {
+        decode_display(&self.caption)
+    }
+
+    /// `STR` 的显示文本(呈现层;同 [`Self::caption_display`])。
+    pub fn text_display(&self) -> String {
+        decode_display(&self.text)
+    }
+
+    /// `DEFSTR` 的显示文本(呈现层;同 [`Self::caption_display`])。
+    pub fn default_input_display(&self) -> String {
+        decode_display(&self.default_input)
+    }
+
+    /// 把宿主输入框文本编码回 CP932 原始字节([`Vm::answer_dialog`] 的
+    /// `text` 参数用;官方自绘对话框取控件文本后按 ANSI 保存)。
+    pub fn encode_input(text: &str) -> Result<Vec<u8>, yu_log::Diag> {
+        yu_format::Codec::Cp932.encode(text, &[])
+    }
+}
+
+/// 呈现层 CP932 解码:整体严格解码失败时逐字节降级(ASCII 直通,
+/// 其余 U+FFFD),**不**改内核侧原始字节。
+fn decode_display(bytes: &[u8]) -> String {
+    if let Ok(text) = yu_format::Codec::Cp932.decode(bytes, bytes) {
+        return text;
+    }
+    bytes
+        .iter()
+        .map(|&b| {
+            if b < 0x80 {
+                b as char
+            } else {
+                char::REPLACEMENT_CHARACTER
+            }
+        })
+        .collect()
 }
 
 /// `DIALOG` 状态机的内核侧错误(宿主回答越界/未知 ID)。

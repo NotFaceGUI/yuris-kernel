@@ -419,6 +419,169 @@ pub fn attention_banner(ctx: &egui::Context, hint: &str) {
     });
 }
 
+// ------------------------------------------------------------- DIALOG 模态(H-P1-04)
+
+/// 一条待回答 DIALOG 的**呈现视图**(CP932 已解码;内核语义仍是原始字节)。
+#[derive(Clone, Debug, PartialEq)]
+pub struct DialogView {
+    pub id: u64,
+    pub caption: String,
+    pub text: String,
+    /// [`yu_rt::dialog::DialogButtons::as_str`](ok/ok_cancel/yes_no/yes_no_cancel)。
+    pub buttons: &'static str,
+    /// 1 基默认按钮(0 = 未指定)。
+    pub default_button: u8,
+    /// 图标名(none/information/question/warning/error)。
+    pub icon: &'static str,
+    /// `INPUT=1`(按钮固定 OK,文本框)。
+    pub input: bool,
+    /// `INPUTLIMIT`(0 = 不限)。
+    pub input_limit: u32,
+    /// `DEFSTR`(输入框初始文本)。
+    pub default_input: String,
+}
+
+/// 用户在本帧给出的回答。
+#[derive(Clone, Debug, PartialEq)]
+pub struct DialogAnswer {
+    pub id: u64,
+    /// 1 基按钮序号(官方 MessageBox 语义,写回 `LET`)。
+    pub button: u8,
+    /// INPUT 模式的编辑文本(宿主负责 CP932 编码后交给内核)。
+    pub input_text: Option<String>,
+}
+
+/// DIALOG 模态框(对齐官方 `MessageBoxA` 的呈现面:标题/正文/图标/
+/// 按钮组/默认按钮;Esc = 含 Cancel 组合的取消)。
+///
+/// 官方模态期间引擎计时器暂停、不收玩家输入 —— 宿主侧的“不收输入”
+/// 由 [`crate::App`] 在挂起任务层保证;这里只负责呈现与回答。
+pub fn dialog_modal(
+    ctx: &egui::Context,
+    dialogs: &[DialogView],
+    inputs: &mut std::collections::BTreeMap<u64, String>,
+) -> Vec<DialogAnswer> {
+    let mut answers = Vec::new();
+    let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    for dialog in dialogs {
+        // INPUT 型的编辑缓冲:首次出现时播种 DEFSTR。
+        let mut text = if dialog.input {
+            Some(
+                inputs
+                    .entry(dialog.id)
+                    .or_insert_with(|| dialog.default_input.clone())
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let mut clicked: Option<u8> = None;
+        egui::Window::new(dialog_window_title(dialog))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                if dialog.icon != "none" {
+                    ui.label(icon_text(dialog.icon));
+                }
+                ui.add(egui::Label::new(RichText::new(&dialog.text).weak()).wrap());
+                if let Some(buffer) = &mut text {
+                    ui.add_space(4.0);
+                    let field = egui::TextEdit::singleline(buffer)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(dialog.input_limit.max(1) as usize);
+                    ui.add(field);
+                }
+                ui.add_space(6.0);
+                ui.with_layout(
+                    egui::Layout::top_down_justified(egui::Align::Center),
+                    |ui| {
+                        if dialog.input {
+                            // INPUT 型固定 OK(官方自绘对话框只有确定键;LET=1)。
+                            if ui.button("OK").clicked() {
+                                clicked = Some(1);
+                            }
+                        } else {
+                            let count = button_count(dialog.buttons);
+                            for index in 1..=count {
+                                let response = ui.button(button_label(dialog.buttons, index));
+                                // 官方 MessageBox 的 DEFBUTTON:回车触发默认键。
+                                // 模态期间焦点归对话框,逐帧重取是安全的。
+                                if index == dialog.default_button {
+                                    response.request_focus();
+                                }
+                                if response.clicked() {
+                                    clicked = Some(index);
+                                }
+                            }
+                        }
+                    },
+                );
+            });
+        if clicked.is_none() && esc {
+            // Esc = Cancel(仅组合里真的有 Cancel;MB_YESNO/MB_OK 官方不响应)。
+            clicked = match dialog.buttons {
+                "ok_cancel" => Some(2),
+                "yes_no_cancel" => Some(3),
+                _ => None,
+            };
+        }
+        if let Some(button) = clicked {
+            if dialog.input {
+                inputs.remove(&dialog.id);
+            }
+            answers.push(DialogAnswer {
+                id: dialog.id,
+                button,
+                input_text: text,
+            });
+        }
+    }
+    answers
+}
+
+fn dialog_window_title(dialog: &DialogView) -> String {
+    if dialog.caption.is_empty() {
+        "DIALOG".to_string()
+    } else {
+        dialog.caption.clone()
+    }
+}
+
+fn button_count(buttons: &str) -> u8 {
+    match buttons {
+        "ok" => 1,
+        "ok_cancel" | "yes_no" => 2,
+        "yes_no_cancel" => 3,
+        _ => 1,
+    }
+}
+
+/// 按钮的日文标签(官方 MessageBox 在日文 Windows 上的 OS 文案)。
+fn button_label(buttons: &str, index: u8) -> &'static str {
+    match (buttons, index) {
+        ("ok", 1) | ("ok_cancel", 1) => "OK",
+        ("ok_cancel", 2) => "キャンセル",
+        ("yes_no", 1) | ("yes_no_cancel", 1) => "はい",
+        ("yes_no", 2) | ("yes_no_cancel", 2) => "いいえ",
+        ("yes_no_cancel", 3) => "キャンセル",
+        _ => "?",
+    }
+}
+
+/// 图标占位(调试字体不保证 emoji 字形;用可渲染的 ASCII 记号)。
+fn icon_text(icon: &str) -> RichText {
+    let mark = match icon {
+        "information" => "(i)",
+        "question" => "(?)",
+        "warning" => "(!)",
+        "error" => "(X)",
+        _ => "",
+    };
+    RichText::new(mark).strong()
+}
+
 fn severity_color(severity: yu_log::Severity) -> Color32 {
     match severity {
         yu_log::Severity::Fatal => PANIC_RED,
@@ -603,6 +766,201 @@ mod tests {
         assert_eq!(
             last_button(&Some(("MOUSE_L".to_string(), 300))),
             "MOUSE_L @ frame 300"
+        );
+    }
+
+    // -------------------------------------------------- DIALOG 模态(H-P1-04)
+
+    fn yes_no_view() -> DialogView {
+        DialogView {
+            id: 7,
+            caption: "確認".to_string(),
+            text: "ゲームを終了します。よろしいですか？".to_string(),
+            buttons: "yes_no",
+            default_button: 0,
+            icon: "question",
+            input: false,
+            input_limit: 0,
+            default_input: String::new(),
+        }
+    }
+
+    fn screen_raw() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 960.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// 找一段绘制文本的中心点(无头点击用)。
+    fn text_center(shapes: &[egui::epaint::ClippedShape], want: &str) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::epaint::Shape, want: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::epaint::Shape::Text(text) => text
+                    .galley
+                    .text()
+                    .contains(want)
+                    .then(|| text.pos + egui::vec2(0.0, text.galley.size().y * 0.5)),
+                egui::epaint::Shape::Vec(list) => list.iter().find_map(|item| walk(item, want)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|s| walk(&s.shape, want))
+    }
+
+    #[test]
+    fn dialog_modal_renders_caption_and_button_labels() {
+        let ctx = egui::Context::default();
+        let mut inputs = std::collections::BTreeMap::new();
+        let raw = screen_raw();
+        let mut first = ctx.run_pass(raw.clone(), |ctx| {
+            dialog_modal(ctx, &[yes_no_view()], &mut inputs);
+        });
+        first.textures_delta.clear();
+        let mut out = ctx.run_pass(raw, |ctx| {
+            dialog_modal(ctx, &[yes_no_view()], &mut inputs);
+        });
+        out.textures_delta.clear();
+        let mut texts = Vec::new();
+        for shape in &out.shapes {
+            collect(&shape.shape, &mut texts, &mut Vec::new());
+        }
+        let joined = texts.join("\n");
+        assert!(joined.contains("確認"), "标题可见: {joined}");
+        assert!(joined.contains("ゲームを終了します"), "正文可见: {joined}");
+        assert!(joined.contains("はい"), "YesNo 按钮日文标签: {joined}");
+        assert!(joined.contains("いいえ"), "{joined}");
+        assert!(inputs.is_empty(), "非 INPUT 型不建编辑缓冲");
+    }
+
+    #[test]
+    fn dialog_modal_answers_clicked_button() {
+        let ctx = egui::Context::default();
+        let mut inputs = std::collections::BTreeMap::new();
+        // 两遍定位「いいえ」(首遍只测量);窗口锚定 CENTER_CENTER,布局稳定。
+        for _ in 0..2 {
+            let mut out = ctx.run_pass(screen_raw(), |ctx| {
+                dialog_modal(ctx, &[yes_no_view()], &mut inputs);
+            });
+            out.textures_delta.clear();
+        }
+        let pos = {
+            let mut probe = ctx.run_pass(screen_raw(), |ctx| {
+                dialog_modal(ctx, &[yes_no_view()], &mut inputs);
+            });
+            let pos = text_center(&probe.shapes, "いいえ").expect("いいえ 按钮应已绘制");
+            probe.textures_delta.clear();
+            pos
+        };
+        // 按下+抬起各一遍(egui click 语义)。
+        let press = egui::RawInput {
+            screen_rect: screen_raw().screen_rect,
+            events: vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let mut answers = Vec::new();
+        let mut out = ctx.run_pass(press, |ctx| {
+            answers = dialog_modal(ctx, &[yes_no_view()], &mut inputs);
+        });
+        out.textures_delta.clear();
+        let release = egui::RawInput {
+            screen_rect: screen_raw().screen_rect,
+            events: vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let mut out = ctx.run_pass(release, |ctx| {
+            answers = dialog_modal(ctx, &[yes_no_view()], &mut inputs);
+        });
+        out.textures_delta.clear();
+        assert_eq!(
+            answers,
+            vec![DialogAnswer {
+                id: 7,
+                button: 2,
+                input_text: None
+            }],
+            "点击「いいえ」= 按钮 2"
+        );
+    }
+
+    #[test]
+    fn dialog_modal_escape_answers_only_cancelable_groups() {
+        // Esc:ok_cancel → cancel(2);yes_no → 无响应(官方 MB_YESNO 不响应 Esc)。
+        let ok_cancel = DialogView {
+            buttons: "ok_cancel",
+            ..yes_no_view()
+        };
+        let ctx = egui::Context::default();
+        let mut inputs = std::collections::BTreeMap::new();
+        let esc = egui::RawInput {
+            screen_rect: screen_raw().screen_rect,
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let mut answers = Vec::new();
+        let mut out = ctx.run_pass(esc.clone(), |ctx| {
+            answers = dialog_modal(ctx, std::slice::from_ref(&ok_cancel), &mut inputs);
+        });
+        out.textures_delta.clear();
+        assert_eq!(
+            answers,
+            vec![DialogAnswer {
+                id: 7,
+                button: 2,
+                input_text: None
+            }],
+            "ok_cancel 的 Esc = キャンセル(2)"
+        );
+        let ctx = egui::Context::default();
+        let mut answers = Vec::new();
+        let mut out = ctx.run_pass(esc, |ctx| {
+            answers = dialog_modal(ctx, &[yes_no_view()], &mut inputs);
+        });
+        out.textures_delta.clear();
+        assert!(answers.is_empty(), "yes_no 的 Esc 不产生回答(官方语义)");
+    }
+
+    #[test]
+    fn dialog_modal_input_mode_buffers_text() {
+        let view = DialogView {
+            input: true,
+            input_limit: 5,
+            default_input: "はじめ".to_string(),
+            ..yes_no_view()
+        };
+        let ctx = egui::Context::default();
+        let mut inputs = std::collections::BTreeMap::new();
+        let mut first = ctx.run_pass(screen_raw(), |ctx| {
+            dialog_modal(ctx, &[view.clone()], &mut inputs);
+        });
+        first.textures_delta.clear();
+        let mut out = ctx.run_pass(screen_raw(), |ctx| {
+            dialog_modal(ctx, std::slice::from_ref(&view), &mut inputs);
+        });
+        out.textures_delta.clear();
+        assert_eq!(
+            inputs.get(&7).map(String::as_str),
+            Some("はじめ"),
+            "INPUT 型首次出现播种 DEFSTR"
         );
     }
 

@@ -631,6 +631,10 @@ struct App {
     input_latencies: Vec<(f64, u64, &'static str)>,
     /// 需要打印 VM 命令耗时的宿主帧(`--profile-frames`)。
     profile_frames: BTreeSet<u64>,
+    /// INPUT 型 DIALOG 的编辑缓冲(对话框存续期跨帧;回答后移除)。
+    dialog_inputs: std::collections::BTreeMap<u64, String>,
+    /// 已打过「呈现」日志的 DIALOG id(每个 id 只记一次)。
+    presented_dialogs: std::collections::BTreeSet<u64>,
 }
 
 impl App {
@@ -701,6 +705,8 @@ impl App {
             pending_inputs: Vec::new(),
             input_latencies: Vec::new(),
             profile_frames,
+            dialog_inputs: Default::default(),
+            presented_dialogs: Default::default(),
         })
     }
 
@@ -983,12 +989,41 @@ impl App {
             .as_ref()
             .map(|freeze| (freeze.title(), freeze.body()));
         let attention = self.attention_hint();
+        // DIALOG 模态(S5/H-P1-04):待回答对话框存在时 egui 必须每帧跑,
+        // 呈现窗口并接受点击;官方 MessageBox 是同步模态,挂起的任务在
+        // 内核侧等 `answer_dialog`。
+        let dialog_views = self.dialog_views();
+        let has_dialogs = !dialog_views.is_empty();
+        if has_dialogs {
+            let ids: Vec<u64> = dialog_views.iter().map(|view| view.id).collect();
+            let mut newly_presented = false;
+            for id in &ids {
+                if self.presented_dialogs.insert(*id) {
+                    newly_presented = true;
+                    if let Some(view) = dialog_views.iter().find(|view| view.id == *id) {
+                        host_line!(
+                            "yu-desktop: DIALOG#{} 呈现 buttons={} icon={} caption={:?} text={:?}",
+                            view.id,
+                            view.buttons,
+                            view.icon,
+                            view.caption,
+                            view.text
+                        );
+                    }
+                }
+            }
+            if newly_presented {
+                // 官方模态会吞掉打开对话框的那次点击;不释放会把按下沿
+                // 带进模态后面的场景。
+                self.release_all();
+            }
+        }
         let show_debug = self.show_debug || self.freeze.is_some();
-        // egui 惰性:面板隐藏、无冻结、无卡住横幅时,整条 egui 管线
-        // (run_pass / tessellate / update_buffers / egui render pass)都不跑,
+        // egui 惰性:面板隐藏、无冻结、无卡住横幅、无对话框时,整条 egui
+        // 管线 (run_pass / tessellate / update_buffers / egui render pass)都不跑,
         // 只做游戏帧 blit。输入事件仍要排空:egui_winit 的缓冲在隐藏期间
         // 若不取会无界增长,重新显示时还会一次回放陈旧的点击。
-        let wants_egui = frozen.is_some() || show_debug || attention.is_some();
+        let wants_egui = has_dialogs || frozen.is_some() || show_debug || attention.is_some();
         let mut actions = ui::UiActions::default();
         let mut banner_quit = false;
         let mut paint_jobs = Vec::new();
@@ -1010,6 +1045,11 @@ impl App {
                     banner_quit = ui::panic_banner(ctx, title, body);
                 } else if let Some(hint) = &attention {
                     ui::attention_banner(ctx, hint);
+                }
+                if has_dialogs {
+                    for answer in ui::dialog_modal(ctx, &dialog_views, &mut self.dialog_inputs) {
+                        self.apply_dialog_answer(answer);
+                    }
                 }
                 if show_debug {
                     let panel = self.build_ui(ctx);
@@ -1248,6 +1288,11 @@ impl App {
         if !self.show_attention || self.freeze.is_some() {
             return None;
         }
+        // DIALOG 模态本身就在解释「为什么不动」;琥珀横幅会盖在模态上,
+        // 等待回答期间不报卡住。
+        if self.dialog_pending() {
+            return None;
+        }
         let snapshot = self.diagnostics.snapshot();
         let stuck = &snapshot.stuck;
         // 静态标题/静态场景是正常的“等输入”,只在**刚点过**且画面仍不变时
@@ -1264,6 +1309,58 @@ impl App {
             Some(stuck.hint())
         } else {
             None
+        }
+    }
+
+    /// 是否有待回答的 DIALOG(模态期:egui 呈现 + 抑制游戏输入)。
+    fn dialog_pending(&self) -> bool {
+        !self.engine.pending_dialogs().is_empty()
+    }
+
+    /// 把内核的 CP932 对话框请求转成 egui 呈现视图(H-P1-04)。
+    fn dialog_views(&self) -> Vec<ui::DialogView> {
+        self.engine
+            .pending_dialogs()
+            .iter()
+            .map(|request| ui::DialogView {
+                id: request.id,
+                caption: request.caption_display(),
+                text: request.text_display(),
+                buttons: request.buttons.as_str(),
+                default_button: request.default_button,
+                icon: request.icon.as_str(),
+                input: request.input,
+                input_limit: request.input_limit,
+                default_input: request.default_input_display(),
+            })
+            .collect()
+    }
+
+    /// 把用户的回答交回内核(`LET/LETSTR` 写回由内核完成)。
+    fn apply_dialog_answer(&mut self, answer: ui::DialogAnswer) {
+        let text = match answer.input_text {
+            Some(input) => match yu_rt::dialog::DialogRequest::encode_input(&input) {
+                Ok(bytes) => Some(bytes),
+                Err(diag) => {
+                    host_error!(
+                        "yu-desktop: DIALOG#{} 入力テキストを CP932 にエンコード失敗: {diag}",
+                        answer.id
+                    );
+                    return;
+                }
+            },
+            None => None,
+        };
+        match self
+            .engine
+            .answer_dialog(answer.id, answer.button, text.as_deref())
+        {
+            Ok(()) => host_line!(
+                "yu-desktop: DIALOG#{} answered button={} (task resumes next frame)",
+                answer.id,
+                answer.button
+            ),
+            Err(diag) => host_error!("yu-desktop: DIALOG#{} 回答被拒: {diag}", answer.id),
         }
     }
 
@@ -1660,10 +1757,13 @@ impl ApplicationHandler for App {
         if window.id() != window_id {
             return;
         }
-        // egui 只在面板/冻结横幅真正可见时才允许消费游戏输入。
+        // egui 只在面板/冻结横幅/DIALOG 模态真正可见时才允许消费游戏输入。
         // 惰性化后 `egui_ctx` 保留“上一帧指针在面板上”的记忆;若仍按它
         // 拦截事件,隐藏面板后游戏会永久收不到鼠标/键盘。
-        let egui_ui_active = self.show_debug || self.freeze.is_some();
+        // DIALOG 模态期间官方引擎是同步阻塞(0x440370 暂停计时器):
+        // 指针/滚轮/键盘一律不进游戏,只喂 egui(模态按钮/输入框)。
+        let dialog_pending = self.dialog_pending();
+        let egui_ui_active = self.show_debug || self.freeze.is_some() || dialog_pending;
         let egui_consumed = {
             let response = self
                 .egui_state
@@ -1706,14 +1806,20 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(false) => self.release_all(),
             WindowEvent::RedrawRequested => self.draw(event_loop),
             WindowEvent::CursorMoved { position, .. } => {
-                if !(egui_consumed || egui_ui_active && self.egui_ctx.egui_wants_pointer_input()) {
+                if !(egui_consumed
+                    || egui_ui_active && self.egui_ctx.egui_wants_pointer_input()
+                    || dialog_pending)
+                {
                     self.note_mouse_activity(MouseActivity::Move);
                     self.update_cursor_from_position(position.x, position.y);
                     self.note_input_event("cursor");
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if egui_consumed || (egui_ui_active && self.egui_ctx.egui_wants_pointer_input()) {
+                if egui_consumed
+                    || (egui_ui_active && self.egui_ctx.egui_wants_pointer_input())
+                    || dialog_pending
+                {
                     return;
                 }
                 if let Some(name) = winit_pointer_button(button).name() {
@@ -1725,7 +1831,10 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if egui_consumed || (egui_ui_active && self.egui_ctx.egui_wants_pointer_input()) {
+                if egui_consumed
+                    || (egui_ui_active && self.egui_ctx.egui_wants_pointer_input())
+                    || dialog_pending
+                {
                     return;
                 }
                 // 引擎 `FUN_0045a3b4` WM_MOUSEWHEEL → 一格脉冲;脚本读
@@ -1762,6 +1871,7 @@ impl ApplicationHandler for App {
                     || (egui_ui_active
                         && (self.egui_ctx.egui_wants_keyboard_input()
                             || self.egui_ctx.egui_wants_pointer_input()))
+                    || dialog_pending
                 {
                     return;
                 }

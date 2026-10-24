@@ -72,7 +72,7 @@ cargo test -p yu-host-desktop -p yu-platform-input   → 24 passed, 0 failed
 | S3c | 本篇 **右键**:完全没有反应 | スタート@300 → MOUSE_R (400,520)@440 | 引擎语义缺失/取证阻塞(右键菜单分支未生效;无 Diag) | 430→560 帧 SHA 恒为 `f0c2706d`,`ops=158` 不变;无 Fatal/新增 Diag | H-P1-07 附注(右键路径需 P3 取证);宿主横幅 | mitigated |
 | S3d | 本篇 **故事推进点击**:没有反应(文本不前进) | スタート@300 → 点文本框 (400,520)@440 与 @500 | 同 S2:推进文本的任务已被 Fatal 终止 | 未点击时 158 ops;两次点击后仍 `f0c2706d`/158;`text_runs=0` | **已销账(AU5)**:同 S2 根因(P7 续) | fixed(根因,P7 续) |
 | S4 | 本篇 **セーブ**:界面不可见,并且**主任务随后终止**(桌面宿主直接关窗) | スタート@300 → セーブ (45,585)@440 | ①合成不可见(P2/P4);②`es_number.yst:SYSTEM@56` 再次整数除 0(Fatal)→ 主任务 END | headless:ops 158→196 但像素恒 `f0c2706d`;桌面:`FATAL rt.expr.div_zero @ es_number.yst:SYSTEM@56 LET engine_frame=442`、`main_finished=true`、host frames=440 即退出(exit 0);`sv.arg.missing`×5 / `sv.write.refused`×3(P4 SaveHost) | **已销账(AU5)**:①除零根因 = P7 续(MATH[LET] 下标);②界面合成/行文本 = P8(058/059:板/锁图标/底栏正常);「背景透出上一亮帧」残留另立 **DIV-RT-050**;`sv.write.refused`(存档落盘)已解(**B1**,DIV-RT-042 fixed) | fixed(P7 续 + P8 + B1;残留→DIV-RT-050) |
-| S5 | 标题点“終了する”:画面**变暗后没有对话框**,再点无反应;关窗两次才退出 | 桌面 `--script symptom-5`(close@400, close@430);或标题点 (217,557) | 宿主能力缺失:标题走**原生 `DIALOG`**(VM 已挂起,无呈现端);与 S3b 的脚本自绘确认框不同 | 变暗后像素恒定 121+ 帧;无任何 Diag(静默挂起);close#1=`@_WINDOW_EXEC_CLOSE=1`,close#2=`exit`,exit 0 | H-P1-02(API)+ H-P1-04(egui 模态);宿主保证第二次关闭可退 | mitigated |
+| S5 | 标题点“終了する”:画面**变暗后没有对话框**,再点无反应;关窗两次才退出 | 桌面 `--script symptom-5`(close@400, close@430);或标题点 (217,557) | 宿主能力缺失:标题走**原生 `DIALOG`**(VM 已挂起,无呈现端);与 S3b 的脚本自绘确认框不同 | 变暗后像素恒定 121+ 帧;无任何 Diag(静默挂起);close#1=`@_WINDOW_EXEC_CLOSE=1`,close#2=`exit`,exit 0 | **已销账(B2,2026-10-24)**:①语料事实修正——菜单「終了する」= 脚本自绘确认框(`ES_ENDCONF.LOOP`,P1 时坐标 (217,557) 不准,实测按钮在 (217,522) 且本来就能出框);**原生 DIALOG 的真正入口 = 窗口关闭**(WM_CLOSE → `@_WINDOW_EXEC_CLOSE=1` → `es_Scenario:481/1461` → `ES.ENDCONF.DIALOG`,門 `@es.GSD(114,01)==1`,STR=`$T(13,02)`);②Engine 透出 `pending_dialogs/answer_dialog`(H-P1-02 的 DIALOG 部分)+ 桌面 egui 模态(H-P1-04)。**证据**:headless `cargo test -p yu-cli --test dialog -- --ignored`(close→DIALOG#1 呈现(YesNo「確認/ゲームを終了します…」)→いいえ=2 主线继续→close→DIALOG#2→はい=1→`\es.END`→GSD.SAVE 副档落盘);桌面 `cases/host/b2-dialog-chain.json`(title→設定→戻る→スタート→セーブ→close@660)实测日志 `close #1 → @_WINDOW_EXEC_CLOSE=1` + `DIALOG#1 呈现 buttons=yes_no caption=確認 text=ゲームを終了します…`(此前静默挂起,现 egui 模态呈现、鼠标可点/Enter=默认键/Esc=キャンセル)。**残余另挂**:END 由非 main 任务执行时内核只 Finish 该任务(→ DIV-RT-052,B10);`ES.ENDCONF.DIALOG` 的 WINDOWINFO[CAPTION] 查询仍 unsupported(→ B2 子波 2 字段族) | fixed(B2) |
 | S6 | 最小化 → 还原:**draw 阶段 wgpu 校验错误**;其余 resize/失焦/连点/滚轮不崩 | 桌面 `--script symptom-6`(1024x768→640x480→minimize→restore) | **宿主 bug**(surface 配置 1x1 与 egui scissor 不一致) | `PANIC 捕获 phase=draw frame=430 … Scissor Rect {x:0,y:0,w:960,h:50} is not contained in the render target (1,1,1)`;修复后同剧本 720 帧 exit 0、无 panic | **本任务修复**(§3.6) | fixed |
 | S7 | 挂机数秒后:标题进入演示 → **黑屏并永久停住** | 桌面无输入 `--frames 500` | 引擎语义缺失(演示任务命中同一 Fatal);依赖**实时时钟路径** | 末帧 PNG 纯黑;Fatal@269;无输入 260 帧无 Fatal(未到触发点);4 次运行分别 223/281/无/无(**非确定**;3600 帧那次演示已启动但未命中 Fatal) | **已销账(AU5)**:同 S2 根因(P7 续,Fatal 不再触发);实时/固定步时钟差异残余保留在 §6.1 | fixed(根因,P7 续) |
 | P1-A | 引擎 panic(任意原因) | `--panic-selftest 30 --frames 60` | 宿主缺陷(原:无防线,进程直接死) | 日志含 panic message/location/backtrace 摘要;`exit frozen: phase=tick …`;进程 **exit 0**;冻结期继续出帧(2.5–3.3ms/draw) | **本任务修复**(§3.1) | fixed |
@@ -320,6 +320,13 @@ cargo test -p yu-host-desktop -p yu-platform-input   → 24 passed, 0 failed
 
 ### H-P1-02 · 诊断/呈现所需的 Engine 公开 API(归 P4)
 
+> **2026-10-24 部分销账(B2)**:①②的 DIALOG 呈现/回答已落地 ——
+> `Engine::pending_dialogs() -> &[DialogRequest]`、
+> `Engine::answer_dialog(id, button, text)`(yu-cli/src/engine.rs;桌面
+> egui 模态消费,见 H-P1-04)。③`waiting_tasks` 已有
+> (`take_diag_report().waiting_tasks`,P4)。**仍挂**:`key_last/mouse_last`
+> 脚本侧输入计数器透出(F1 面板的宿主等价物对账)——归 B7 宿主能力面。
+
 F1 面板当前显式标 `n/a`;需要的透出(只读优先):
 
 ```rust
@@ -354,6 +361,21 @@ pub fn mouse_last(&self) -> Option<(u32, u32)>;
   `{"t":"panic",...}`。
 
 ### H-P1-04 · DIALOG 呈现(P3 契约已就绪;集成轮)
+
+> **2026-10-24 销账(B2)**:桌面 egui 模态落地
+> (`host-desktop/src/ui.rs::dialog_modal` + `lib.rs` 集成):
+> - 标题/正文/图标/按钮组按 `DialogRequest` 渲染(CP932 经
+>   `DialogRequest::{caption,text,default_input}_display` 解码,呈现层坏字节
+>   U+FFFD 降级,不改内核原始字节);DEFBUTTON 聚焦(Enter 触发);
+>   Esc 只对含 Cancel 的组合生效(官方 MB_YESNO/MB_OK 不响应 Esc);
+>   `INPUT=1` 文本框(DEFSTR 播种、INPUTLIMIT 截断),回答经
+>   `DialogRequest::encode_input` 编回 CP932。
+> - 模态期抑制宿主→引擎的指针/滚轮/键盘(官方 MessageBox 同步阻塞语义),
+>   第二次关闭强制退出兜底保持。
+> - 呈现/回答各记一条宿主日志(`DIALOG#n 呈现` / `answered button=k`)。
+> - 验收:S5(本台账)+ `cargo test -p yu-host-desktop --lib`(模态渲染/
+>   点击回答/Esc/INPUT 缓冲 5 用例)+ S5 headless(yu-cli tests/dialog.rs)。
+> **残余**:`serve`(无窗口宿主)的 DIALOG 呈现通道仍缺(→ B7 --diag-ws/宿主面)。
 
 - VM 侧:`yu_rt::vm::Vm::pending_dialogs/answer_dialog`(已落地)。
 - 缺:`Engine` 透出(H-P1-02)+ 宿主 UI(egui 模态:按钮集合

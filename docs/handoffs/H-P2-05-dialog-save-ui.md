@@ -1,5 +1,18 @@
 # H-P2-05 · DIALOG / SAVE / 存档界面(交接,不在性能会话实现)
 
+> **2026-10-24 全部销账**:
+> - **§1(H-P1-02 + H-P1-04)→ B2 落地**:`Engine::pending_dialogs/answer_dialog`
+>   透出 + 桌面 egui 模态(`host-desktop/src/ui.rs::dialog_modal`);验收 =
+>   symptom-ledger S5(fixed(B2))+ `yu-cli tests/dialog.rs` + host-desktop
+>   lib 5 用例。语料事实修正:菜单「終了する」走脚本自绘框,原生 DIALOG 的
+>   入口是**窗口关闭**(`es_Scenario:481/1461` → `ES.ENDCONF.DIALOG`)。
+> - **§2(DIV-RT-042 SAVE 写盘)→ B1 落地**(2026-10-24,`ArgValue.reference`
+>   + `SaveHost` 同步契约;coverage-matrix §5 已记)。
+> - **§3(H-P1-08 存档界面不可见)→ P8 + B1 落地**(除零根因 P7 续;
+>   合成/行文本 = DIV-GFX-058/059;存档落盘 = B1;「背景透出上一亮帧」
+>   残余另立 DIV-RT-050,归并行 CGS 会话)。
+> 本文件保留为交接记录,不再作为挂账依据。
+
 > 来源:2026-10-23 性能与质量修复会话(P2 语义只登记)。
 > 这三项**不得**为了“画面好看”改游戏语义;需要内核/宿主契约或官方 trace。
 > 真值层级见 `AGENTS.md` §0。

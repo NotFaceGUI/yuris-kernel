@@ -1,0 +1,14 @@
+{
+  "frames": 700,
+  "inputs": [
+    { "button": "MOUSE_L", "frame": 300, "x": 217, "y": 368 },
+    { "button": "MOUSE_L", "frame": 390, "x": 750, "y": 565 },
+    { "button": "MOUSE_L", "frame": 450, "x": 217, "y": 281 },
+    { "button": "MOUSE_L", "frame": 600, "x": 45, "y": 583 }
+  ],
+  "actions": [
+    { "frame": 660, "action": "close" }
+  ],
+  "name": "b2-dialog-chain",
+  "note": "B2 桌面实测链路:标题→設定(217,368)→戻る(750,565)→スタート(217,281)进本篇→セーブ(45,583)→窗口关闭(660)。关闭走原生 DIALOG(es_Scenario→ES.ENDCONF.DIALOG),宿主 egui 模态呈现并在 JSONL 记录「DIALOG#n 呈现」。S5 销账证据;语义证据另见 yu-cli tests/dialog.rs。"
+}

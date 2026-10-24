@@ -752,6 +752,33 @@ impl Engine {
         }
     }
 
+    /// 当前待回答的 DIALOG(H-P1-02/S5:内核状态机就绪,Engine 透出;
+    /// 宿主呈现并经 [`Engine::answer_dialog`] 回答)。
+    pub fn pending_dialogs(&self) -> &[yu_rt::dialog::DialogRequest] {
+        match self.vm.as_ref() {
+            Some(vm) => vm.pending_dialogs(),
+            None => &[],
+        }
+    }
+
+    /// 回答一条 DIALOG(按钮 1 基;`text` 仅 INPUT 模式,CP932 原始字节;
+    /// `LET/LETSTR` 写回由内核完成)。
+    pub fn answer_dialog(
+        &mut self,
+        id: u64,
+        button: u8,
+        text: Option<&[u8]>,
+    ) -> Result<(), yu_log::Diag> {
+        match self.vm.as_mut() {
+            Some(vm) => vm.answer_dialog(id, button, text),
+            None => Err(yu_rt::diag::recoverable(
+                yu_rt::code::rt::CMD_SLOT,
+                yu_log::Boundary::Script,
+                format!("DIALOG#{id} 无法回答:引擎未启动(无 Vm)"),
+            )),
+        }
+    }
+
     pub fn held_buttons(&self) -> Vec<String> {
         self.held.iter().cloned().collect()
     }

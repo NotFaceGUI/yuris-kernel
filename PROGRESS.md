@@ -6321,3 +6321,372 @@ $ yu-cli case <project-eris> --all → 9 passed; 0 failed
 - 遗留移交:corpus loose/packed 2 例(散盘语料漂移,与 B5 数据入口相关);
   WINDOWINFO 371 vs 129 的 +242 归因(B4 前已存在,随 B2 字段族收口复核);
   B12 口径注:census 现可按 debug 构建口径对拍官方。
+
+## 成果 DIV50 修复撤回 (2026-10-24 下午) · 「快照恒黑」为错误实现,全部还原(主人裁决)
+
+- **裁决**:官方有的弹窗背景就是正常(活的)背景,有一些才是黑屏;
+  `COPY2 ID=:/W0/` 恒改窗口基色面的实现会把该显示正常背景的弹窗也盖黑 ⇒ 错误,撤回。
+- **已还原**(构建+三 crate 测试全绿,600 帧对拍恢复):
+  `yu-gfx/src/{op,state,json}.rs`、golden `eris_first_screen_display.json`、
+  `soft/src/render.rs`、`wgpu/src/{lib,passes}.rs`(含 last_screen/backbuffer
+  死代码清理,一并回退)。
+- **保留的有效取证**:
+  - 官方 GOSUB 级补采(div50g,42.9 万条,`probe_dispatch.py` 新增 `--clicks`
+    定时点击队列 + `--ysc` 缺参导致 armed-0 的坑):菜单打开与内核**同路径**
+    (SS.GOSUB ELSE 臂全序列,官方同样推 CGS 层,幕布 3 tick 淡出);
+  - 内核命令级 trace 方法(`YU_CMD_TRACE` 临时探针已回滚,example 三件套留存);
+  - 两次快照语义实测像素:冻结帧→(104,137,169) 透出底栏 / 恒黑→(0,4,16)。
+- **下一步方向**(DIV-RT-050 文档「候选方向」节):验证官方弹窗纱下是否为
+  **活场景**(动画是否继续);若成立,修复点在弹窗期间底层场景层的存活/渲染
+  编排,而非快照内容。
+
+## 成果 DIV50 四方向总结 (2026-10-24 晚) · 差异收敛到「CGS 快照内容」+ 弹窗双形态发现
+
+- 主人事实:淡入淡出无恙,唯一问题是「盖不住」;继续多方向排查(本轮零代码改动)。
+- **收敛**:双方同路径/同命令/同层栈(f530 层表 vs 官方序列逐项对上,诊断 0、零丢层);
+  唯一差异 = 纱下 `:/W0/CGS1` 内容:内核=冻结上一呈现帧(EVID-J3-06 后缓冲解释),
+  官方=黑。
+- **弹窗双形态**(语料:CONF 系 `.OVER` 场景版 vs `.DIALOG` 叠加版,s52 IF(@53[1]) 分派):
+  场景型走幕布 ⇒ 黑;叠加型不换场景 ⇒ 活背景 —— 与主人「有的盖着有的不盖着」吻合。
+- 方向裁决:C(缺底板)排除;D(淡出)系调试降速伪影+官方为墙钟毫秒驱动
+  (pc471/472 `256×elapsed/时长`),归档;A(根画布黑)与 B(z 语义)留待
+  主人确认「正常背景弹窗清单」/官方 DIALOG 型自动截屏/REA 呈现序,三选一即可定案。
+
+## 成果 DIV50 定案 (2026-10-24 深夜) · 黑底/活底双形态机制收口(主人手动点击会话)
+
+- 主人确认图1(黑)=メニュー、图2(活)=タイトルへ;手动会话 trace(div50h)证明
+  **两种弹窗官方都推 CGS 栈** ⇒ CGS 内容非区分因素(恒黑被否决的技术根因:
+  它无法产生活底形态)。
+- 最终机制:可见背景 = 纱下存活层(メニュー系处理器先 `ES.SCENARIO.SS` 关场景 ⇒ 黑;
+  タイトルへ系不关 ⇒ 活场景暗化);官方 CGS 栈层不参与可见合成(reserve)。
+- 内核缺陷:CGS1(COPY2 冻结帧)被当最底可见层 ⇒ 「盖不住」+ 嵌套时盖活场景。
+- 修法(已写入 DIV-RT-050,待主人批准后实施):主窗口根 COPY2 的 Snapshot 目标层
+  移出可见合成;FILE 载入的 CGS 层与转场机制不受影响。
+
+## 成果 R3-fix (2026-10-24) · `RETURNCODE` 手动模式恢复判据修复 —— 商业包初始化链贯通
+
+> 触发:主人实测 `kotoneiro`(v494/3.3GB 单包)——「开屏 logo 显示成了对话框」
+> + 「必须手动点击才推进」。两个症状同一根因。
+> 改动:`crates/yu-rt/src/task.rs`(恢复判据)、`crates/yu-rt/src/vm.rs`
+> (`text_auto_mode` 实现)、`crates/yu-rt/src/vm/handlers.rs`(失效锚点文案)、
+> `crates/yu-rt/tests/fixture.rs`(+1 回归)。
+
+### 1. 定案证据(双版本 REA + 旧线交叉印证)
+
+`RETURNCODE` 处理体尾部置让出位是**无条件**的,但**恢复**判据分模式:
+
+| 版本 | 处理体 | 恢复判据函数 | 关键指令 |
+|---|---|---|---|
+| 0.495 | `0x44c390` | `FUN_004046fc` | `0x404711 CMP byte[state+0x1c],1` / `0x404715 JNE 0x404828` |
+| v494(本作) | `0x44c20c` | 同构 | 头部逐指令对齐(`[0x802ad8]` vs `[0x801800]`),尾部 `C64609` = `MOV byte[esi+9],…` |
+
+- `[state+0x1c]` = `TEXT[OUTPUTMODE]`(0=手動 / 1=自動,手册 `text/text.html`)。
+- **`!= 1` 分支直达 `0x404828` → `0x40482d MOV byte[task+9],0`**,不经任何按钮表。
+- `== 1`(自动)才进 `0x40471b..0x4047ec` 读 CLICKBUTTON/SKIPBUTTON
+  (`0x5b48ac..0x5b48bc`);SKIP 计数器 `-1`(`DEC`)即「当前帧按下沿」、
+  CLICK 直接 `OR` 判零。
+- 旧线 `<repo-old>` `crates/yuris-vm/src/commands.rs` 独立结论一致:「RETURNCODE
+  = 调用点返回标记,**不改控制流**」,实现为纯 pc 推进(v494/v555 双版本同判)。
+
+### 2. 症状链(为什么表现为那两张图)
+
+`es_first.yst` 首指令 `TEXT[OUTPUTMODE=0]` → 框架自己用 `INPUT/MOUSE`
+状态机做点击等待。内核把「手动模式的一帧休憩」错实现成「等输入」:
+
+```text
+frame 0: s84 pc6  text_rest=true   ← 卡在 キャラ名定義 第一条 RETURNCODE
+frame 1..N: cmds=0                 ← 每帧撞同一点,点击才走一两条
+```
+
+`es_first` pc4..pc54 的 `.DEFINE` 链因此永远走不完(pc55 `SYSTEMStartCheck`
+与 pc123 `es.S.GO "ES.GAMEMAIN"` 到不了)。画面残留 `pc8
+ES.GAMEMAIN.DEFINE` 已建的按钮栏 + `es_eris` pc334 `CG[FILE=""]`
+(手册 `cg/cg.html`:**1×1 黑图**)被 `CGACT[COPY2]` 铺满 ⇒ 主人看到的
+「黑底 + 日期框 + SAVE/LOAD/… 一排」。
+
+### 3. 修法
+
+`TaskExecutor` 增 `text_auto_mode()`(默认 `false`,`Vm` 实现为
+`self.text.output_mode == 1`);调度器 text_rest 门控改为:
+
+```rust
+if nodes[i].text_rest {
+    if exec.text_auto_mode() && !exec.text_advance_requested() {
+        continue;
+    }
+    nodes[i].text_rest = false;
+}
+```
+
+自动模式行为**逐位不变**(既有 `one_text_line_per_frame_until_advance_input`
+原样通过);手动模式回到一帧休憩。
+
+### 4. 验证原始输出
+
+```text
+$ cargo test -p yu-rt        # 66+4+11+4+73+3 全绿
+$ cargo test -p yu-rt --test fixture manual_outputmode_returncode_resumes_without_input
+test manual_outputmode_returncode_resumes_without_input ... ok
+
+$ yu-cli run <kotoneiro> --frames 400 --shot final-title.png
+frame: 402 viewport: 1100x825
+layers: 234 (visible 11), passes: 73
+ops: 79 total, 78 drawn, 1 skipped
+textures: decoded=47 cache_entries=49
+events: drained=2028539 dropped=0
+```
+
+- 帧 1..239 无输入即连续推进(修前帧 1 起 `cmds=0`);
+- 帧 240 起画面开始演进;**帧 300 = 完整标题画面**(背景 CG + 「コトネイロ
+  Kotoneiro」logo + 六个菜单项 最初からはじめる/続きからはじめる/CGモード/
+  回想モード/コンフィグ/終了する);
+- 任务面稳定为 `SYSTEM` + `es.IDSubTask` + `es.IDSubTask2` + `es.ScenarioScript`
+  (修前恒为单任务 `SYSTEM` 卡死)。
+
+### 5. 既有漂移(非本改动)
+
+`yu-gfx --test eris_first_screen` 的 `eris_first_screen_display_list` 仍失败:
+`passes[10]/ops[0]/copy 3 vs 271`。已用 `git stash` 撤掉本改动复跑,
+**同样失败** ⇒ 属 PROGRESS 早前记录的既有 golden 漂移(`pass10 copy 271→3`),
+需 Owner 复核后 `UPDATE_GFX_GOLDEN=1`。
+
+### 6. 本次顺带查明/未修(挂账)
+
+- **`clear_pending` 无人消费**:`op_returncode` 手动路径置 `self.text.clear_pending`
+  (引擎 `+0x36`)与 `0x44c437 CMP.../0x404824 MOV byte[state+0x36],1` 对齐,
+  但全仓 `yu-gfx`/`yu-cli` 无读取点 ⇒ 文本缓冲(`\x81@` 全角空格,来自 s84
+  的 WORD)跨帧残留。显示侧因 `_TEXT_FLAG` 对齐失败未光栅化(**不影响画面**),
+  属 `DIV-GFX-034` 的宿主传播路径缺口,建议与 `sync_text_state` 接线一并处理。
+- **`FILEACT[CREATE]`**:工程 ysc 第 3 槽存在、三版手册无页;`yu-save`
+  `apply_fileact` 落到 `_ => {}` 静默吞,且 `confined_path` 拒绝 `$_SAVE_PATH`
+  的绝对路径形态 ⇒ 开机建目录实际未生效(本作 `save/` 已存在故未暴露)。
+- **失效文档锚点已修**:`rt.cmd.unimplemented` 文案原引「任务书 A 的域边界」,
+  该文档只覆盖 workspace/yu-log/yu-vfs;改为指向
+  `crates/yu-rt/docs/domain-event-contracts.md §9`。
+- **表名 CP932 lossy**:`tables.rs` 的 `script_path`/标签 `name` 用
+  `from_utf8_lossy` 解 CP932 字节,诊断里显示为 `����`(查表走原始字节,
+  语义不受影响,仅定位失效)。
+- **探针留存**:`yu-rt/examples/` 新增 `probe_game_tasks` / `probe_jumps` /
+  `probe_domain_stream` / `probe_startup_cmds` / `probe_cp932_names` /
+  `probe_pack_layout` / `probe_script_map` / `probe_hardcode_audit` /
+  `dump_game_cmds`;`yu-cli/examples/game_diag_probe`。全部只读。
+
+## 成果 DIV50 修复落地 (2026-10-24 深夜) · RT-050 修好「盖不住」:透明根画布 + RECTPAINT2 黑幕布
+
+- **机制(三层证据闭合)**:① `COPY2 ID=:/W0/` = 窗口根自有画布=全透明空面
+  (REA FUN_0042f809 纯 memcpy;根画布不接收合成内容)⇒ CGS 栈层不参与可见合成;
+  ② CGTSS 后固定 `RECTPAINT2 SET=255`(mode 2 只写 alpha,REA FUN_0043185c)
+  把幕布拉成不透明黑 ⇒ 淡出=黑幕布淡出;③ 弹窗背景=纱下存活层
+  (メニュー系 CG[E=0] 隐藏全部 BT 层⇒黑;タイトルへ系 ev 层存活⇒暗化透出,
+  black.png=(0,0,0,128) 半透明纱)。
+- **实施**:soft `last_screen`/wgpu `backbuffer` 两套「上一帧后缓冲」机器全部
+  移除,主组 CopySource → 透明面(soft `Surface::new([0,0,0,0])` / wgpu
+  `window_root_canvas()`);EVID-J3-06 勘误入 title-motion-ledger。
+- **验证**:菜单弹窗纱下 (0,4,16) 近黑(官方同量级),淡出=黑幕布,旧屏零透出,
+  soft/wgpu 逐点一致;21 测试目标全绿;600 帧标题门禁哈希 0 差异;
+  soft vs wgpu 600 帧 0 差异;first-screen golden 不变。
+- **待主人桌面实测**:タイトルへ在有背景 CG 处的暗化透出(headless 剧情后
+  点击未命中按钮);メニュー淡入淡出手感。
+- 临时探针(vm.rs cmdtrace / gfx cgtrace)已全部回滚;取证 example 三件套留存。
+
+## 成果 DIV50 回退 (2026-10-24 深夜,主人令) · 透明根画布方案撤回,暂接受「不盖住」
+
+- 主人桌面实测「タイトルへ」在有背景 CG 处仍显示盖住(黑),下令回退本方案。
+- 已还原:`soft/render.rs`、`wgpu/{lib,passes}.rs`(重建通过,无警告);
+  EVID-J3-06 恢复后缓冲口径(取证注记留痕);DIV-RT-050 状态回
+  open/deferred(master),全部取证、机制、实现与验证记录保留,
+  遗留问题(桌面端 タイトルへ 黑底原因)已写入档案。
+- 回退后基线:内核回到「冻结旧屏透出」行为(主人暂接受)。
+
+## 成果 CP932-text (2026-10-24) · 字符串操作按 CP932 字符边界统一(片头 LOGO 破名根因)
+
+> 触发:主人实测 `kotoneiro`(v494)片头**厂商 LOGO 整段黑屏**;并指出
+> 「这个作品图片是日文命名的」——直指编码处理。要求做成**真正的通用**修复,
+> 而非单点补丁。
+> 改动:新增 `crates/yu-rt/src/cp932_text.rs`(唯一字符边界真源);
+> `vm/handlers.rs` 的 `ascii_case`/`fullwidth_case`/`copy_chars`/`cut_chars`
+> 及 `case_tables.rs::char_len` 全部改走它。
+
+### 1. 根因(字节级复现)
+
+脚本字符串在核内一律是 **CP932 原始字节**,不是 UTF-8。凡逐字节做 ASCII
+大小写/取子串的实现,都会改写双字节字符的**尾字节**——CP932 尾字节覆盖
+`0x40..0xFC`,其中 `0x41..0x5A`/`0x61..0x7A` 与 ASCII 字母同码:
+
+```text
+サークル = 83 54 81 5b 83 4e 83 8b      ← 厂商 LOGO 真名(cg/ev/サークル.jpg, 293724B 实存)
+           ^^ ^^    ^^ ^^
+      54='T'   4e='N'                   ← 尾字节落在大写区
+逐字节小写 ⇒ 83 74 81 5b 83 6e 83 8b = フーハル   ← 包内不存在的名字
+```
+
+链路(实测 trace):
+`es_first` → `es.S.GO "SCENARIO_LOGO"` → s142 不存在该标签(Tyn 早已定案,
+标签表确认为真缺,非解析截断)→ 片头走 `s142 pc1 GOSUB MAC.EV("サークル")` →
+`s66 pc3401 es.SP.PRO.CHECKCG` → `s65 pc8 es._strlower("サークル")` →
+`s70 pc215 VARACT[LOWER2]` / `pc218 VARACT[LOWER]` → 名字被毁 →
+`es._cg.exist` 的 `FILEINFO[EXIST]` 对 `.bmp/.png/.jpg/.gif/.psb/裸名`
+**全部落空** → `SPL*` 层无纹理 → 片头黑屏。
+
+### 2. 通用修法(不是补丁)
+
+新增 `cp932_text` 模块,把「按 CP932 字符推进」收敛成唯一实现:
+
+| 导出 | 语义 |
+|---|---|
+| `is_lead` | lead byte = `0x81..=0x9F` ∪ `0xE0..=0xFC`(与 `yu-format` 码表同口径) |
+| `char_len_at` | 该位置的字符字节数;末尾截断的孤立 lead 按 1(保证前进) |
+| `spans` / `char_count` | 字符区间 / 字符数 |
+| `slice_chars` | 按**字符**下标取子串(0 起算,超界收敛) |
+
+接入点(全部改为调用上面,不再各写一套):
+
+- `handlers.rs::ascii_case`(`VARACT[UPPER/LOWER]`)—— 双字节字符原样跳过;
+- `handlers.rs::fullwidth_case`(`VARACT[UPPER2/LOWER2]`)—— 兜底分支同样跳步
+  (`0x82` 全角拉丁区之外的汉字/假名绝不逐字节 ASCII 化);
+- `handlers.rs::copy_chars`/`cut_chars`(`VARACT[COPY/CUT]`,即 `_strmid`)——
+  字符位置语义;
+- `case_tables.rs::char_len`(`VARACT[HANTOZEN/ZENTOHAN]`)—— 指向同一真源。
+
+### 3. 验证原始输出
+
+```text
+$ cargo test -p yu-rt --lib
+test result: ok. 70 passed; 0 failed    （含 4 个新增 cp932_text 单测）
+
+$ probe_cg_files <kotoneiro> 90
+f84  s65 pc99 CG [ID="SPLBUF1" Z=1 FILE="cg/ev/サークル"]     ← 修前为 フーハル
+```
+
+单测覆盖:`サークル`=4 字符、`slice(0,1)`=`サ`(完整两字节)、ASCII+双字节混合、
+末尾孤立 lead 不越界、越界区间返回空。
+
+### 4. 未完成(另案,不属本条目)
+
+片头 LOGO 仍未上屏,卡点与编码无关:SPA(精灵)定义表变量 `0x0457`
+(16384 项)全程为空 —— 该表由本作的 sprite 定义载入路径填充,核内尚未命中
+载入点。另 `s66 pc3437 CGACT[ID="SPLBUF401" ID2="SPLBUF1" COPY2=1]` 的目标层
+`SPLBUF401` 从未被 `CG` 创建(该分支由 `pc3389` 的 sprite 版本比较决定)。
+这两项与 CP932 无关,单独排期。
+
+### 5. 期间发现的构建事故(已恢复)
+
+并行会话改动使 `yu-backend-soft` 报 `family_has_bold` 不存在(该 API 实际在
+`yu-font/src/source.rs:362`,HEAD 中即在);`cargo clean -p yu-font` 后重建正常。
+排查期间的「layers=2」读数是脏缓存导致的假象,清理后回到 190/192 层。
+
+## 成果 B2 子波 1 (2026-10-24) · 宿主呈现与查询闭环(第一波)—— DIALOG 接线 / CDDA 域 / B4 两移交项
+
+> 任务书:`docs/tasks/roadmap-batches.md` §2 B2。子波 2(WINDOWINFO 字段族 /
+> CGINFO[COLOR] / FONTINFO / INFO 025+038)**门控未过停做**(见 §4),
+> 其台账行维持原状;本条只销子波 1 的账。
+
+### 1. CDDA 域归类一行修(fixed)
+
+`yu-rt/src/vm/handlers.rs`:`domain_of("CDDA")` 归 `Domain::Sound`(与 MIDI 族
+一致);Domain 分支的 aligned-stub 名单补 `CDDA`(0x429fb0),Unknown 分支的
+CDDA 特例(死代码)删除。行为不变:域事件照发、诊断 `rt.cmd.aligned_stub`、
+600 帧触发 0 次(census 口径不变)。coverage-matrix §8 口径注与 §1/§8 两行
+CDDA 行同步销掉「归类错位保留」注。
+
+### 2. DIALOG 宿主接线(S5 销账;H-P1-02 DIALOG 部分 + H-P1-04 销账)
+
+- **Engine 透出**(`yu-cli/src/engine.rs`):`pending_dialogs() ->
+  &[DialogRequest]`、`answer_dialog(id, button, text)`。
+- **呈现层助手**(`yu-rt/src/dialog.rs`):`caption/text/default_input_display`
+  (CP932 严格解码,坏字节逐字节 U+FFFD 降级,不改内核原始字节)、
+  `encode_input`(宿主输入框 → CP932)。
+- **桌面 egui 模态**(`host-desktop/src/ui.rs::dialog_modal` + `lib.rs` 集成):
+  标题/正文/图标/按钮组/DEFBUTTON 聚焦(Enter)/Esc(仅含 Cancel 组合;
+  官方 MB_YESNO 不响应)/INPUT 文本框;模态期抑制宿主→引擎输入(官方
+  MessageBox 同步阻塞语义);呈现/回答各记宿主日志;待回答时琥珀「卡住」
+  横幅让位;第二次关闭强制退出兜底保持。
+- **语料事实修正**(S5 档案勘误):菜单「終了する」走**脚本自绘**确认框
+  (`ES_ENDCONF.LOOP`;P1 记录的坐标 (217,557) 不准,实测按钮在 (217,522),
+  且该框本来就能出——P1 桌面观测的静默挂起来自**窗口关闭**路径:
+  WM_CLOSE → `@_WINDOW_EXEC_CLOSE=1` → `es_Scenario.yst:481/1461` →
+  `ES.ENDCONF.DIALOG`(門 `@es.GSD(114,01)==1`,STR=`$T(13,02)`
+  「ゲームを終了します。よろしいですか？」)。
+
+**证据(原始输出)**:
+
+- headless(Engine 层,临时 save_root 预拷 gsd.sd,不触真实存档):
+
+  ```
+  $ cargo test -p yu-cli --test dialog -- --ignored --nocapture
+  DIALOG 呈现 @frame25: [(1, YesNo, "確認", "ゲームを終了します。よろしいですか？", "es.IDSubTask")]
+  いいえ 后主线仍在 @frame30
+  S5 证据: DIALOG#1(いいえ→继续)/ #2(はい→\es.END→GSD.SAVE 落盘)全链通 @36
+  test result: ok. 1 passed; 0 failed
+  ```
+
+- 桌面实测(`cases/host/b2-dialog-chain.json`:title→設定→戻る→スタート→
+  セーブ→close@660;日志 `target/tmp/b2/b2-desktop2.jsonl`):
+
+  ```
+  yu-desktop: script frame=660 close #1 → @_WINDOW_EXEC_CLOSE=1
+  yu-desktop: DIALOG#1 呈现 buttons=yes_no icon=none caption="確認" text="ゲームを終了します。よろしいですか？"
+  ```
+
+  (此前该路径静默挂起、无任何呈现;现 egui 模态弹出,鼠标可点、
+  Enter=默认键、Esc=キャンセル。)
+- 模态单测:`cargo test -p yu-host-desktop --lib` → 25 passed(含新增
+  渲染/点击回答/Esc/INPUT 缓冲 5 用例)。
+
+### 3. B4 移交两件(均已定案)
+
+1. **corpus loose/packed 2 例失败**:`loose_and_packed_eris_are_execution_equivalent`
+   在当前树 **通过**(corpus 11/11 全绿)——散盘语料漂移已被 B5 的
+   DirSource 折回修复解决。本会话期间的 4 例 yu-vfs dir 测试失败为**环境
+   问题**:本机系统 `TMP=E:\Temp` 在沙箱内拒写,`GetTempPathW` 优先读 TMP
+   且单行 `export TEMP=… TMP="$TEMP"` 在本 Git Bash 不传播新值 ⇒ 测试进程
+   落到拒写路径。AGENTS.md §2 的**两行式 export**(TEMP 与 TMP 分两行)是
+   正确形态,设齐后 4 例全过;`YURIS_TEST_TMP` 逃生口同样有效。无代码缺陷,
+   不改代码。
+2. **WINDOWINFO 371 vs 129 的 +242 归因**(定案,详见 coverage-matrix §2):
+   P3(d66ed41)129 → P7(88eea55)371;差异 = `FULLSCREEN` 轮询环 ×121 +
+   `FULLSCREEN2` 增量 ×121(参数组合表逐项对账,`EXIST NO=2`×120 与 9 条
+   一次性查询两树一致)。轮询环 = `es_first`(yst00000)pc 2278 的
+   `IF[@1451==@415/419/423]` 守卫下每帧一对查询(pc 2279/2280,写
+   `LET=@1140/@1141`);P7 的 op_math LET 下标修复(POW2 表)+ VARACT
+   存在性口径使 `@1451` 落到预期值,轮询恢复。P8 不触 yu-rt,P7 树与 HEAD
+   计数逐字节一致 ⇒ B4/B5/B6 无关。实测:census@d66ed41 = 7,735,679/129、
+   @88eea55 与 @HEAD = 7,735,437/371(语料 data.ypf FNV `64d15de36b4fff30`
+   全程未变)。
+
+### 4. 子波 2 门控未过 → 停做(纪律)
+
+门控条件:`yu-gfx/src/state.rs` 无未提交改动(✓ 满足)+ git log 已含
+CGS/WindowBase **收尾提交**(✗ 不满足——最近 CGS 提交以 87dc07f 回退告终,
+并行会话对 yu-gfx 测试/渲染后端仍有在飞改动,期间还两次打断编译)。
+按任务书停在子波 1 收尾:**WINDOWINFO 字段族 / CGINFO[COLOR]+组 ONMOUSE /
+FONTINFO / INFO 025+038 全部未动**,其台账行(DIV-GFX-025/026/036/038、
+coverage 三行、audit §2 三行)维持原状并标注「B2 子波 2(待 CGS 落地)」。
+CGS 会话落地后按任务书继续(REA 0x4586ec / 0x43d664 取证 → 实现)。
+
+### 5. 验收与测试态(原始结果)
+
+```
+$ cargo test -p yu-rt -p yu-gfx -p yu-cli        # 本会话改动后
+全部 test result: ok,0 failed(66 lib + 69 fixture + 11 corpus + 10/10/…)
+$ cargo test -p yu-host-desktop --lib            # 模态 5 用例在内
+25 passed; 0 failed
+$ cargo test -p yu-cli --test dialog -- --ignored --nocapture
+1 passed(S5 headless 全链)
+```
+
+`case --all` = **4/8**(first-screen / record-events-off / title-config-back /
+until-visible PASS)。4 例 FAIL(save-title-flow / symptom-enter-story /
+symptom-ingame-config / symptom-ingame-save)为 display/png sha 漂移,
+与本批无关:B2 不触渲染/存档路径;同期 HEAD 影子树(dd4c179)对拍
+9/9 全挂且失败集随运行时点变化 ⇒ 语料工程 `<project-eris>/save/` 是**活
+状态**(并行 DIV-RT-050 会话正用官方引擎跑同一工程),B4 门禁的 8/8 是
+其时点的存档态。期望值再生需待 CGS 会话落地 + 主人过目(S4 既定纪律)。
+
+### 6. 期间新发现(立档,不在本批修)
+
+- **DIV-RT-052**(yu-rt divergences README):`END` 由非 main 任务执行时
+  内核只 Finish 该任务(`es.END` → `GSD.SAVE` 落盘可证执行链通),
+  `main_finished` 不亮 ⇒ 程序退出链未闭合。官方 `END`(0x441334)是否
+  「结束整个程序」待 REA 取证,归 B10。
+- H-P1-02 的 `key_last/mouse_last` 透出仍未做(F1 面板对账用),归 B7。
