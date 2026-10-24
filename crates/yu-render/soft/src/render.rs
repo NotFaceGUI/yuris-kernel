@@ -665,14 +665,24 @@ fn apply_copy_op(
         .find(|w| w.number == 0)
         .and_then(|w| w.layer_set.as_ref());
     let source = match &copy.source {
-        CopySource::Group(id) if Some(id) == main_group => match last_screen {
-            Some(surface) => surface.clone(),
-            None => Surface::new(
-                frame.viewport.width,
-                frame.viewport.height,
-                frame.clear.rgba,
-            ),
-        },
+        CopySource::Group(id) if Some(id) == main_group => {
+            // 命令时刻本帧已有图层被隐藏 ⇒ 后缓冲上的「已隐藏」尚未呈现,
+            // 按**当前层状态**合成(ERIS 换屏宏:CGTSS 截旧屏 → 隐藏按钮 →
+            // CGSSS 截新屏,同一 tick 内完成;官方弹窗背景因此是纯黑)。
+            // 否则仍取上一呈现帧(EVID-J3-06:title 淡入红线依赖它)。
+            if copy.after_hide_this_frame {
+                compose_group(textures, snapshots, frame, id, st)?
+            } else {
+                match last_screen {
+                    Some(surface) => surface.clone(),
+                    None => Surface::new(
+                        frame.viewport.width,
+                        frame.viewport.height,
+                        frame.clear.rgba,
+                    ),
+                }
+            }
+        }
         CopySource::Group(id) => compose_group(textures, snapshots, frame, id, st)?,
         CopySource::Layer(id) => {
             let mut surface = layer_surface(textures, snapshots, frame, id, st, Some(copy))?;

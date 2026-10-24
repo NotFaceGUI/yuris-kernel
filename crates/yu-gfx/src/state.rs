@@ -163,6 +163,11 @@ pub struct GfxState {
     /// 文本修订号发号器(全局单调;后端合成缓存键必须全局唯一,
     /// 不能因层重建/内容清除而复用旧号)。
     text_revision_seq: u64,
+    /// 本帧是否已发生过「图层由可见变隐藏」。
+    ///
+    /// 由 [`Self::apply_layer_params`] 写入,`FrameStart` 清零。
+    /// 用途:`CopyOp::after_hide_this_frame`(DIV-RT-050 的 CGS 截图时机)。
+    hid_this_frame: bool,
     /// `CGACT[TEXT=1]` 绘制项(按目标图层,**跨帧持久**)。
     ///
     /// DIV-GFX-058(P8):官方把字符即时写进图层表面,画一次即常驻
@@ -269,6 +274,7 @@ impl GfxState {
             text_layers: BTreeMap::new(),
             current_text: LayerId::new(Vec::new()),
             text_revision_seq: 0,
+            hid_this_frame: false,
             text_draws: BTreeMap::new(),
             copy_log: Vec::new(),
             image_log: Vec::new(),
@@ -435,6 +441,8 @@ impl GfxState {
                 // 表面,画一次即常驻);`FrameStart` 不再清空。
                 // 诊断是“本帧”诊断:每帧清空,防止跨帧无界增长。
                 self.diags.clear();
+                // 本帧的「隐藏事件」标记(COPY 快照时机判定,DIV-RT-050)。
+                self.hid_this_frame = false;
                 // 复制/图像操作是**状态生产**(快照/纹理修改),不是逐帧易失;
                 // 保留日志,frame() 只输出仍被现存图层引用的项。
             }
@@ -1345,13 +1353,18 @@ impl GfxState {
                     ),
                 );
             }
-            let diags = {
+            let (diags, hid) = {
                 let node = self
                     .nodes
                     .get_mut(&parsed.path)
                     .expect("group just ensured");
-                apply_layer_params(&mut node.layer, &params, true)
+                let was_visible = node.layer.visible;
+                let diags = apply_layer_params(&mut node.layer, &params, true);
+                (diags, was_visible && !node.layer.visible)
             };
+            if hid {
+                self.hid_this_frame = true;
+            }
             for d in diags {
                 self.push_diag("CG", d);
             }
@@ -1399,13 +1412,18 @@ impl GfxState {
             self.clear_layer_texts(&parsed.path);
         }
 
-        let diags = {
+        let (diags, hid) = {
             let node = self
                 .nodes
                 .get_mut(&parsed.path)
                 .expect("layer just ensured");
-            apply_layer_params(&mut node.layer, &params, false)
+            let was_visible = node.layer.visible;
+            let diags = apply_layer_params(&mut node.layer, &params, false);
+            (diags, was_visible && !node.layer.visible)
         };
+        if hid {
+            self.hid_this_frame = true;
+        }
         for d in diags {
             self.push_diag("CG", d);
         }
@@ -1728,6 +1746,7 @@ impl GfxState {
             dest: dest.clone(),
             region,
             timing: CopyTiming::CommandCurrent,
+            after_hide_this_frame: self.hid_this_frame,
             status,
         });
         if kind == CopyKind::Copy {
