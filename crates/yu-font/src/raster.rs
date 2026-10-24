@@ -61,9 +61,11 @@ impl Rasterizer {
     ///
     /// * `sx`/`sy` are engine pixels; `sy == 0` or `sx == 0` yields an empty
     ///   bitmap (the engine accepts 0 and draws nothing).
-    /// * BOLD prefers a real bold face; otherwise a fixed synthetic embolden
-    ///   of `(sy*0.04).clamp(0.5, 2.0)` px is applied (GDI's exact synthetic
-    ///   amount is not observable, marked Likely).
+    /// * BOLD 只接受**真实粗体面**;本机 family 没有 weight>=600 的 face 时
+    ///   **不做合成加粗**,按原 face 绘制并由调用方报 `font.bold_missing`。
+    ///   合成加粗(GDI 的 bold simulation 也不是简单膨胀)会让笔画明显变粗,
+    ///   实测墨迹 212→361(+70%),与官方截图对不上;按 AGENTS.md §0 无证据
+    ///   不猜,宁可按原 face 画并显式报告。
     /// * Italic prefers a real italic face; otherwise a shear of the requested
     ///   angle is applied. The engine has no italic parameter.
     pub fn rasterize(
@@ -91,11 +93,6 @@ impl Rasterizer {
         };
         let x_scale = f32::from(params.sx) / f32::from(params.sy);
         let sy = f32::from(params.sy);
-        let embolden = if resolved.synthetic_bold {
-            (sy * 0.04).clamp(0.5, 2.0)
-        } else {
-            0.0
-        };
         let aa = params.aa;
 
         let inner = source.with_face_data(resolved.face, |bytes, index| {
@@ -130,9 +127,6 @@ impl Rasterizer {
                     x: 0.0,
                     y: 0.0,
                 }));
-            if embolden != 0.0 {
-                render.embolden(embolden);
-            }
             let mut scaler = self.ctx.builder(font).size(sy).hint(false).build();
             let Some(image) = render.render(&mut scaler, gid) else {
                 // Whitespace and a few control glyphs have no outline.

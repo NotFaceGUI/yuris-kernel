@@ -22,20 +22,37 @@ fn setup() -> Option<(support::TestFont, FontRenderer)> {
     Some((font, renderer))
 }
 
+/// BOLD 的语义(P9 勘误):只接受**真实粗体面**。
+///
+/// - 本机 family 有 weight>=600 的 face ⇒ 换成该 face,墨迹变多;
+/// - 本机只有 regular(如 MS Gothic)⇒ **不做合成加粗**,两图相同。
+///
+/// 旧实现无条件按 `0.04*sy` 膨胀合成,实测墨迹 212→361(+70%),与官方
+/// 800×600 选项菜单截图不符;官方 GDI 的 bold simulation 只让墨迹框 +1px。
+/// 按 AGENTS.md §0 无证据不猜:宁可按原 face 画并由后端报
+/// `text.font.bold_missing`。
 #[test]
-fn bold_increases_ink() {
+fn bold_adds_ink_only_with_a_real_bold_face() {
     let Some((font, mut r)) = setup() else { return };
     let normal = support::style(&font, 24, 24);
     let mut bold = normal;
     bold.bold = true;
     let a = r.render_glyph('漢', &normal, StylePolicy::Strict).unwrap();
     let b = r.render_glyph('漢', &bold, StylePolicy::Strict).unwrap();
-    assert!(
-        b.alpha_mass() > a.alpha_mass(),
-        "bold must add ink ({} -> {})",
-        a.alpha_mass(),
-        b.alpha_mass()
-    );
+    if font.source.family_has_bold(normal.face) {
+        assert!(
+            b.alpha_mass() > a.alpha_mass(),
+            "真实粗体面必须增加墨迹 ({} -> {})",
+            a.alpha_mass(),
+            b.alpha_mass()
+        );
+    } else {
+        assert_eq!(
+            a.alpha_mass(),
+            b.alpha_mass(),
+            "无粗体面时按原 face 绘制(不合成加粗)"
+        );
+    }
 }
 
 #[test]

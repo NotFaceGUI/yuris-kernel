@@ -268,23 +268,55 @@ pub struct TextDraw {
     pub y: i64,
     /// 绘制时的 `FONT` 快照。
     pub style: TextStyle,
-    /// `SET` 原值。已取证映射(REA `FUN_004056b8`,`Likely`):
-    /// `0` = 1 次合成;`1..=10` = 9 次;`>=11` = 3 次。
+    /// `SET` 原值。已取证映射(REA `FUN_004056b8`):`SET=0` 单次;
+    /// `SET=1..=10` 3×3 邻域 9 次;`SET>=11` 3 次阶梯偏移。
     pub set: i64,
     /// `CGACT[BNO]`(调试字体槽;原值保留,语义未取证 DIV-FONT-007)。
     pub bno: Option<i64>,
 }
 
 impl TextDraw {
-    /// 合成重复次数(REA `FUN_004056b8` 的 1/9/3 分支,`Likely`)。
-    pub fn composite_passes(&self) -> u32 {
+    /// `SET` → 合成偏移列表(REA 0.495 `FUN_004056b8`,asm `0x405703..0x405c32`)。
+    ///
+    /// 引擎**不是**在同一位置重复画 N 次,而是对每次 `FUN_00406184` 调用
+    /// 传入不同的 X/Y 偏移(asm 每处 `LEA EDI,[EAX+EDI]` / `SUB EDI,EAX`
+    /// 组装,`0x20`/`0x24` 两个栈参数):
+    ///
+    /// - `SET=0`:1 次,偏移 `(0,0)`;
+    /// - `SET=1..=10`:9 次,3×3 邻域,步长 = `SET`
+    ///   (即 `ERIS es_Font.yst` 的 `SET=1` = 外扩 1 px 的轮廓/加粗);
+    /// - `SET>=11`:3 次,偏移 `(SET-10,0)`、`(0,SET-10)`、
+    ///   `(SET-10,SET-10)`(asm `0x40571c: LEA EDI,[EDI+EAX-0xa]` 及
+    ///   `0x405789` 同式)。
+    ///
+    /// 同位置叠 9 次会把抗锯齿边缘压实成实心(字变粗变白),
+    /// 与官方"外扩 1 px 但保留 AA"不同 ⇒ 必须按偏移画。
+    pub fn composite_offsets(&self) -> ([(i32, i32); 9], usize) {
+        let mut out = [(0i32, 0i32); 9];
         if self.set == 0 {
-            1
-        } else if self.set < 11 {
-            9
-        } else {
-            3
+            return (out, 1);
         }
+        if self.set < 11 {
+            let step = self.set.max(1) as i32;
+            let mut n = 0;
+            for dy in [-step, 0, step] {
+                for dx in [-step, 0, step] {
+                    out[n] = (dx, dy);
+                    n += 1;
+                }
+            }
+            return (out, n);
+        }
+        let d = (self.set - 10) as i32;
+        out[0] = (d, 0);
+        out[1] = (0, d);
+        out[2] = (d, d);
+        (out, 3)
+    }
+
+    /// 合成次数(= [`Self::composite_offsets`] 的有效长度)。
+    pub fn composite_passes(&self) -> u32 {
+        self.composite_offsets().1 as u32
     }
 
     /// 命令时刻去重键(不含 `target`:键控按目标层分桶)。
@@ -474,12 +506,30 @@ mod tests {
             set: 0,
             bno: None,
         };
+        // SET=0 → 1 次,偏移 (0,0)
         assert_eq!(d.composite_passes(), 1);
+        let (off, n) = d.composite_offsets();
+        assert_eq!((n, off[0]), (1, (0, 0)));
+
+        // SET=1..=10 → 3×3 邻域 9 次,步长 = SET
         d.set = 1;
         assert_eq!(d.composite_passes(), 9);
+        let (off, n) = d.composite_offsets();
+        assert_eq!(n, 9);
+        assert!(off[..9].contains(&(-1, -1)));
+        assert!(off[..9].contains(&(0, 0)));
+        assert!(off[..9].contains(&(1, 1)));
+
         d.set = 10;
         assert_eq!(d.composite_passes(), 9);
+        let (off, _) = d.composite_offsets();
+        assert!(off[..9].contains(&(-10, 10)));
+
+        // SET>=11 → 3 次阶梯偏移 (d,0)/(0,d)/(d,d),d = SET-10
         d.set = 11;
         assert_eq!(d.composite_passes(), 3);
+        let (off, n) = d.composite_offsets();
+        assert_eq!(n, 3);
+        assert_eq!((off[0], off[1], off[2]), ((1, 0), (0, 1), (1, 1)));
     }
 }

@@ -353,6 +353,21 @@ impl FontSource {
         sorted.get(no).map(|x| x.2)
     }
 
+    /// 该 face 所属 family 里是否存在**真实粗体面**(weight >= 600)。
+    ///
+    /// 只扫本 source 的 face 表(纯内存),不走 `fontdb::Database::query` ——
+    /// 后者在首次调用时会加载字体文件,实测造成 173ms 单帧尖峰。
+    /// 用途:决定 `FONT[BOLD=1]` 能否按真粗体绘制,而不是合成膨胀。
+    #[must_use]
+    pub fn family_has_bold(&self, face: FaceId) -> bool {
+        let Ok(base) = self.record(face) else {
+            return false;
+        };
+        self.faces
+            .iter()
+            .any(|f| f.family_key == base.family_key && f.weight >= 600)
+    }
+
     /// Resolve bold/italic to an actual face, reporting synthetic fallbacks.
     pub fn resolve_style(
         &self,

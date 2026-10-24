@@ -73,6 +73,13 @@ pub struct TextComposer {
     /// (DIV-GFX-058),内容没变就不该每帧重烤。键 = 层 + 文本修订号 +
     /// 基面身份;自动文本层(布局每帧变化)不进缓存。
     compose_cache: BTreeMap<LayerId, ComposeCacheEntry>,
+    /// `face -> 是否存在真实粗体面`(weight>=600)。**缓存**:
+    /// `FontSource::resolve_style` 内部走 fontdb 查询,每帧每文本项调用一次
+    /// 会拖出秒级 render 尖峰(实测 1061ms),因此只在首次解析时求值。
+    real_bold: BTreeMap<yu_font::FaceId, bool>,
+    /// 「要求 BOLD 但本机无粗体面」待报告(发现时置位,发出后清除;
+    /// 不逐帧重发,避免刷帧日志)。
+    pending_bold_note: bool,
 }
 
 /// 一条合成缓存(见 [`TextComposer::compose_cache`])。
@@ -153,6 +160,8 @@ impl TextComposer {
             faces: BTreeMap::new(),
             load_ms: None,
             compose_cache: BTreeMap::new(),
+            real_bold: BTreeMap::new(),
+            pending_bold_note: false,
         }
     }
 
@@ -165,6 +174,8 @@ impl TextComposer {
             faces: BTreeMap::new(),
             load_ms: None,
             compose_cache: BTreeMap::new(),
+            real_bold: BTreeMap::new(),
+            pending_bold_note: false,
         }
     }
 
@@ -300,6 +311,31 @@ impl TextComposer {
         } else {
             DrawMode::Replace
         };
+        // BOLD:只接受真实粗体面。本机 family 无 weight>=600 的 face 时
+        // **不做合成加粗**(实测合成膨胀让墨迹 +70%,与官方截图不符),
+        // 按原 face 绘制并显式报告 `text.font.bold_missing`。
+        if s.bold {
+            let has_real = match self.real_bold.get(&face) {
+                Some(&v) => v,
+                None => {
+                    // 纯内存表扫描(不触发 fontdb 加载 ⇒ 无单帧尖峰)。
+                    let v = self
+                        .renderer
+                        .as_ref()
+                        .expect("ensured above")
+                        .source()
+                        .family_has_bold(face);
+                    self.real_bold.insert(face, v);
+                    if !v {
+                        self.pending_bold_note = true;
+                    }
+                    v
+                }
+            };
+            if !has_real {
+                s.bold = false;
+            }
+        }
         Some((s, sy, fallback))
     }
 
@@ -327,6 +363,12 @@ impl TextComposer {
             stats.note("text.font_missing");
             return;
         };
+        if self.pending_bold_note {
+            self.pending_bold_note = false;
+            stats.note(
+                "text.font.bold_missing: 本机 family 无粗体面(weight>=600);按原 face 绘制,不做合成加粗",
+            );
+        }
         match &fallback {
             FaceFallback::None => {}
             FaceFallback::Bno => stats.note(
@@ -349,7 +391,10 @@ impl TextComposer {
             }
         };
         let blended = font_style.draw_mode == DrawMode::Blend;
-        let passes = draw.composite_passes();
+        // 引擎按 **偏移** 多次合成(3×3 邻域),不是同位置重复画
+        // (REA `FUN_004056b8`;见 `TextDraw::composite_offsets`)。
+        // 同位置叠 9 次会把 AA 边缘压实成实心 ⇒ 字变粗变白。
+        let (offsets, passes) = draw.composite_offsets();
         let decoded = cp932::decode(&draw.bytes);
         if decoded.invalid > 0 {
             stats.missing += decoded.invalid;
@@ -370,8 +415,8 @@ impl TextComposer {
                     let gx = pen_x + image.left;
                     let gy = baseline + image.top;
                     let td = std::time::Instant::now();
-                    for _ in 0..passes {
-                        image.draw_onto(dst, w, h, gx, gy, blended);
+                    for &(dx, dy) in &offsets[..passes] {
+                        image.draw_onto(dst, w, h, gx + dx, gy + dy, blended);
                     }
                     dbg_draw_ns += td.elapsed().as_nanos();
                     let step = ((image.advance as f32) / 256.0).round() as i32;

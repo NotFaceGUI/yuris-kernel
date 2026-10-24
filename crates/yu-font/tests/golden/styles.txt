@@ -1,5 +1,5 @@
 solid_white_20 size=17x19 left=2 top=-17 adv=5120 hash=18bbfd3d2d00a36a mass=28110
-bold_20 size=19x20 left=2 top=-18 adv=5120 hash=f81d234a69171c6d mass=53649
+bold_20 size=17x19 left=2 top=-17 adv=5120 hash=18bbfd3d2d00a36a mass=28110
 italic_shear12_20 size=10x17 left=0 top=-17 adv=2560 hash=0299d8dc2ff1ab58 mass=14265
 aa_off_20 size=17x19 left=2 top=-17 adv=5120 hash=f6dfd5e73d0a20ed mass=27540
 outline1_red_20 size=19x21 left=1 top=-18 adv=5120 hash=45ca556058394b24 mass=37732

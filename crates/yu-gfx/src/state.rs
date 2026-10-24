@@ -969,8 +969,9 @@ impl GfxState {
                 }
             }
             other => {
-                // TODO(DIV-GFX-036):NUM/LANG/GRADATION/ROTATION/PITCH/X/Y
-                // 需要字体列表或未取证语义。
+                // TODO(DIV-GFX-036):NUM/LANG/NAME(NO=)/PITCH/X/Y 需要宿主
+                // 字体清单(EnumFontFamiliesExA 语义);GRADATION/ROTATION
+                // 已在上方分支按默认值/原值写回(AU5 勘误,旧注释未更新)。
                 return Err(error::unimplemented(
                     error::code::INFO_UNSUPPORTED,
                     format!("FONTINFO[{other}] 需要字体列表/未取证语义"),
@@ -2215,9 +2216,17 @@ impl GfxState {
                     None => self.arg_type("FONT", name, "整数", &r.value),
                 },
                 "COLOR2" => match int_arg(&r.value) {
-                    // `es._txcolor` 以 -1 为“未给 COLOR2”的哨兵并**照发**
-                    // `FONT[COLOR2=-1]`(stdlib/ystdlib.yst:706);官方 clamp
-                    // 把 -1 变成 0x000000(纯黑),不是 0xFFFFFF。
+                    // `es._txcolor` 的宏默认第二参数是 **-1**
+                    // (`macro.yst`: `TXCOLOR ... def2="-1"`),脚本只传一个
+                    // 颜色时(`\_txcolor(@FONT.OUTLINE)` / `_txcolor(@FONT.SHADE.COLOR)`)
+                    // 会照发 `FONT[COLOR2=-1]`。**-1 = “未给 COLOR2”的哨兵**:
+                    // 表示该 pass 用**纯色**(COLOR),不做渐变。
+                    //
+                    // P8 曾按 clamp(REA `0x444620..0x44464a`)把 -1 落成纯黑,
+                    // 结果描边/影子被画成 `蓝→黑` 渐变(官方截图里描边是纯紫蓝、
+                    // 没有黑色)。哨兵判定必须在 clamp 之前 —— 与 `_txcolor`
+                    // 的 `IF[@_PINT(2)>=-1 …]` 放行 -1 的写法一致。
+                    Some(n) if n < 0 => self.style.color2 = None,
                     Some(n) => self.style.color2 = Some(clamp_color(n)),
                     None => self.arg_type("FONT", name, "整数", &r.value),
                 },

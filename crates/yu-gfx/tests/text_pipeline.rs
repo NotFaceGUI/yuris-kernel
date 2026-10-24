@@ -211,7 +211,12 @@ fn cgact_text_becomes_a_layer_draw() {
     assert_eq!((draw.x, draw.y), (2, 3));
     assert_eq!(draw.style.size_x, 12);
     assert_eq!(draw.style.color, 0x00_FF00);
-    assert_eq!(draw.composite_passes(), 9, "REA FUN_004056b8: SET=1 → 9 次");
+    // REA FUN_004056b8:SET=1 → 3×3 邻域 9 次合成(偏移,非同位置叠加)
+    assert_eq!(draw.composite_passes(), 9);
+    let (offsets, n) = draw.composite_offsets();
+    assert_eq!(n, 9);
+    assert!(offsets[..9].contains(&(-1, -1)));
+    assert!(offsets[..9].contains(&(1, 1)));
 
     // 跨帧持久(DIV-GFX-058:官方写层表面,画一次即常驻)。
     gfx.on_event(&frame_start(1));

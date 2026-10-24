@@ -104,3 +104,40 @@
   - json:`to_json`/`to_display_json` 的 `text_layout`/`text_draws` 由“写在 `"text":[...]` 数组内部”改为**数组闭合后的帧级兄弟成员**(空 text + 非空 extras 曾产出非法 JSON;`--full` 转储受影响,display golden 形状随 S4/config 用例 expect 一并复核)。
 - **回归**:`group.rs::swap_exchanges_layer_texts` 等文本语义用例;微场景 5 条(见 058);S4/设定/正文三用例画面按新渲染出图待主人批准后 `--update`。
 - **仍挂账**:字体列表 `FONTINFO[NUM/LANG/NAME]`(设置界面字体选择器)仍需宿主注入系统字体清单(TEXT 域跨宿主接线);既読色依赖 SAVE 域 `seld.sd`。
+
+## DIV-GFX-060 · `CGACT[TEXT]` 的 `SET` 合成是**偏移**外扩,不是同位置叠加
+
+- 状态: **fixed(P9,2026-10-24)**
+- 优先级: 高(所有按钮/选项标签的描边粗细)
+
+### 现象
+
+选项菜单标签与官方逐字步进一致(191 vs 192 px),但墨迹明显更粗、更白、更糊;
+`SET=1` 轮廓把字压实成实心。
+
+### 证据(REA 0.495 `FUN_004056b8`,asm `0x405703..0x405c32`)
+
+`SET` 分支里 9 次 `FUN_00406184` 调用**每次传入不同的 X/Y 偏移**:
+
+```text
+0x40571c: MOV EAX, [ESP+0x80]        ; 基准
+0x405727: LEA EDI, [EDI+EAX-0xa]     ; SET-10
+0x405789: MOV EAX, [ESP+0x84]
+0x405794: LEA EDI, [EDI+EAX-0xa]
+...      每处 LEA EDI,[EAX+EDI] / SUB EDI,EAX 组装出 ±step
+```
+
+- `SET=0`:1 次,`(0,0)`;
+- `SET=1..=10`:9 次,3×3 邻域,步长 = `SET`;
+- `SET>=11`:3 次,`(d,0)/(0,d)/(d,d)`,`d = SET-10`。
+
+### 旧实现(错)
+
+`for _ in 0..9 { draw_at(same_pos) }` —— 同位置 9 次 alpha 合成把抗锯齿边缘
+压实成实心,轮廓与字心同色 ⇒ 字变粗变白。官方是外扩 1 px 但保留 AA。
+
+### 修复
+
+`TextDraw::composite_offsets() -> ([(i32,i32); 9], usize)`;soft 渲染循环按
+`offsets[..passes]` 逐次偏移绘制。回归:`yu-gfx` lib 单测
+`composite_passes_follow_rea_branches` 断言三种分支的偏移集合。
