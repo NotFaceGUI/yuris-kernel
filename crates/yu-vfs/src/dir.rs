@@ -4,8 +4,11 @@
 //! `list` 由共用的 [`DirTree`] 派生,因此与 [`crate::YpfSource`] 的结果可比。
 //!
 //! **非 ASCII 文件名**: 归一键是 CP932/GBK 字节,而 `std::fs` 只给 Unicode。
-//! 完整编解码表归 `yu-format`(任务书 B),本层不猜编码:非 ASCII 组件被跳过并
-//! 计数留痕,调用方可据此显式拒绝启动。纯 ASCII 数据源不受影响。
+//! 非 ASCII 组件经 `yu-format` 的码表 encode 回配置编解码器的字节键
+//! (DIV-003;architecture §7:表本体归 yu-format,本层只调用)。编码表对
+//! 全表满足 `decode∘encode` 恒等,Windows 引擎按 Unicode 名访问散盘文件,
+//! 折回即恢复其 CP932/GBK 字节路径语义。名字里有该编码不可映射字符的组件
+//! 无法折回,被跳过并计数留痕(`unencodable_name`),调用方可据此显式拒绝。
 
 use crate::{missing, Codec, DataSource, DirTree, Entry, LookupKey};
 use std::fs;
@@ -13,12 +16,13 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use yu_log::{code, Boundary, Diag};
 
-/// 构造期被跳过的条目(非 ASCII 名 / 符号链接)。
+/// 构造期被跳过的条目(不可编码名 / 符号链接)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirSkip {
     /// 相对根的路径(显示用,可能含非 UTF-8 替换符)。
     pub path: String,
-    /// 跳过原因:`non_ascii_name` / `symlink`。
+    /// 跳过原因:`unencodable_name` / `non_utf8_name` / `non_normal_component`
+    /// / `symlink` / `not_a_regular_file`。
     pub reason: &'static str,
 }
 
@@ -123,8 +127,8 @@ impl DirSource {
         Ok(())
     }
 
-    /// 把相对路径转成原始字节键;任一组件的名字不是纯 ASCII 时返回 `None`
-    /// 并留痕(编码表归 yu-format)。
+    /// 把相对路径转成原始字节键。非 ASCII 组件经 `yu-format` 码表折回配置
+    /// 编解码器的字节;任一组件编码失败(不可映射字符)时整体跳过并留痕。
     fn relative_key(&mut self, rel: &Path) -> Option<Vec<u8>> {
         let mut bytes = Vec::new();
         for component in rel.components() {
@@ -142,17 +146,24 @@ impl DirSource {
                 });
                 return None;
             };
-            if !text.is_ascii() {
-                self.skipped.push(DirSkip {
-                    path: rel.to_string_lossy().into_owned(),
-                    reason: "non_ascii_name",
-                });
-                return None;
-            }
+            let encoded = if text.is_ascii() {
+                text.as_bytes().to_vec()
+            } else {
+                match self.codec.to_format().encode(text, &[]) {
+                    Ok(encoded) => encoded,
+                    Err(_) => {
+                        self.skipped.push(DirSkip {
+                            path: rel.to_string_lossy().into_owned(),
+                            reason: "unencodable_name",
+                        });
+                        return None;
+                    }
+                }
+            };
             if !bytes.is_empty() {
                 bytes.push(b'/');
             }
-            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(&encoded);
         }
         if bytes.is_empty() {
             None
@@ -237,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_names_are_counted_not_silently_dropped() {
+    fn non_ascii_names_are_folded_to_codec_bytes() {
         let root = temp_root("nonascii");
         fs::write(root.join("ascii.txt"), b"a").unwrap();
         // 仅在文件系统接受该名字时构造;Windows/Linux 都可写 UTF-8 名。
@@ -245,8 +256,43 @@ mod tests {
         if fs::write(&jp, b"j").is_ok() {
             let src = DirSource::open(&root, Codec::Cp932).unwrap();
             assert!(src.exists(&LookupKey::new(b"ascii.txt", Codec::Cp932).unwrap()));
+            // CP932 独立 oracle(Python cp932): 日=0x93FA 本=0x967B 語=0x8CEA。
+            let raw = [0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA, 0x2E, 0x74, 0x78, 0x74];
+            let key = LookupKey::new(&raw, Codec::Cp932).unwrap();
+            assert_eq!(src.open(&key).unwrap(), b"j");
+            assert_eq!(src.skipped_count(), 0);
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn unencodable_name_is_skipped_and_counted() {
+        let root = temp_root("unencodable");
+        fs::write(root.join("ascii.txt"), b"a").unwrap();
+        // U+1F642 在 CP932/GBK 中均不可映射;仅当文件系统接受该名字时构造。
+        let emoji = root.join("🙂.txt");
+        if fs::write(&emoji, b"e").is_ok() {
+            let src = DirSource::open(&root, Codec::Cp932).unwrap();
+            assert!(src.exists(&LookupKey::new(b"ascii.txt", Codec::Cp932).unwrap()));
             assert_eq!(src.skipped_count(), 1);
-            assert_eq!(src.skipped()[0].reason, "non_ascii_name");
+            assert_eq!(src.skipped()[0].reason, "unencodable_name");
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn gbk_codec_folds_names_and_keeps_trail_bytes() {
+        let root = temp_root("gbkfold");
+        let jp = root.join("日本語.txt");
+        if fs::write(&jp, b"j").is_ok() {
+            let src = DirSource::open(&root, Codec::Gbk).unwrap();
+            // GBK 独立 oracle(Python gbk): 日=0xC8D5 本=0xB1BE 語=0xD55A。
+            // 語 的 trail 0x5A 是 ASCII 'Z',多字节整对语义下不得折成 0x7A。
+            let raw = [0xC8, 0xD5, 0xB1, 0xBE, 0xD5, 0x5A, 0x2E, 0x74, 0x78, 0x74];
+            let key = LookupKey::new(&raw, Codec::Gbk).unwrap();
+            assert_eq!(key.as_bytes(), &raw, "多字节 trail 字节不得折大小写");
+            assert_eq!(src.open(&key).unwrap(), b"j");
+            assert_eq!(src.skipped_count(), 0);
         }
         fs::remove_dir_all(&root).ok();
     }

@@ -3,6 +3,9 @@
 //! 样本由环境变量提供:
 //! - `YURIS_SAMPLE_ERIS_YPF`: 官方 YSPac 0.495 打出的 `data.ypf`
 //!   (见 `docs/eris-corpus.md`:1,407 条,31,501,753 字节)。
+//! - `YURIS_SAMPLE_SDK0495`: 官方 SDK 0.495 的 `システム` 散盘目录。
+//! - `YURIS_SAMPLE_SDK0479`: 官方 SDK 0.479 的 `システム` 散盘目录
+//!   (1,424 个文件,其中 85 个日文名,DIV-003 折回验收)。
 //!
 //! 样本缺失时**显式打印 skip 并累计计数**,不静默通过。
 //! 断言只读取索引与少量按偏移定位的负载,不整包载入。
@@ -273,6 +276,27 @@ fn sdk_0495_dir() -> Option<PathBuf> {
     }
 }
 
+fn sdk_0479_dir() -> Option<PathBuf> {
+    let Some(path) = std::env::var_os("YURIS_SAMPLE_SDK0479") else {
+        skip("YURIS_SAMPLE_SDK0479 is not set (0.479 loose-dir check)");
+        return None;
+    };
+    let path = PathBuf::from(path);
+    if !path.is_dir() {
+        skip(&format!(
+            "YURIS_SAMPLE_SDK0479={} is not a directory",
+            path.display()
+        ));
+        return None;
+    }
+    let system = path.join("システム");
+    if system.is_dir() && path.file_name().is_none_or(|n| n != "システム") {
+        Some(system)
+    } else {
+        Some(path)
+    }
+}
+
 fn find_first_ascii_file(source: &DirSource, dir: &LookupKey, depth: usize) -> Option<LookupKey> {
     if depth > 8 {
         return None;
@@ -323,4 +347,42 @@ fn sdk_0495_loose_directory_works_with_case_folding() {
     assert!(source.exists(&key(&upper)));
     assert_eq!(source.open(&key(&upper)).unwrap(), bytes);
     eprintln!("loose sample: {} bytes={}", file.display(), bytes.len());
+}
+
+/// DIV-003 验收: 0.479 SDK 散盘 1,424 个文件全部索引,0 skipped。
+/// 其中 85 个日文名经 yu-format CP932 码表折回字节键(引擎在 Windows 上
+/// 按 Unicode 名访问散盘文件;折回即恢复其 CP932 字节路径语义)。
+#[test]
+fn sdk_0479_loose_directory_indexes_every_file_including_japanese_names() {
+    let Some(root) = sdk_0479_dir() else {
+        return;
+    };
+    let source = DirSource::open(&root, Codec::Cp932).unwrap();
+    eprintln!(
+        "0.479 DirSource: files={} skipped={}",
+        source.file_count(),
+        source.skipped_count()
+    );
+    assert_eq!(
+        source.file_count(),
+        1_424,
+        "官方 0.479 SDK システム 目录文件数"
+    );
+    assert_eq!(
+        source.skipped_count(),
+        0,
+        "DIV-003: 非 ASCII 名必须全部折回,不得跳过"
+    );
+
+    // 日文名锚点: data/cgsys/extra/bgmmode/tip_再生時間.png
+    // (CP932 独立 oracle,Python cp932: 再=0x8DC4 生=0x90B6 時=0x8E9E 間=0x8A94)。
+    let raw = b"data/cgsys/extra/bgmmode/tip_\x8D\xC4\x90\xB6\x8E\x9E\x8A\xD4.png";
+    let tip = key(raw);
+    assert!(source.exists(&tip), "折回后的日文名必须命中: {}", tip.display());
+    let bytes = source.open(&tip).unwrap();
+    assert!(
+        bytes.starts_with(&[0x89, b'P', b'N', b'G']),
+        "tip_再生時間.png 必须按 PNG 魔数读出"
+    );
+    eprintln!("japanese name ok: {} bytes={}", tip.display(), bytes.len());
 }

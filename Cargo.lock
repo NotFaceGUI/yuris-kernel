@@ -4204,6 +4204,7 @@ name = "yu-vfs"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "yu-format",
  "yu-log",
 ]
 

@@ -153,7 +153,8 @@
 - format:`DIV-002` NUL-XOR 方言(无真样本)、`DIV-007/009` YSTB v2
   (仅当要支持老游戏)。~~`DIV-003` GBK 码表仍未落地~~ **码表已落地**
   (`yu-format/src/codec/table_gbk.rs` + 全表往返测试 `full_table_roundtrip_gbk`);
-  DIV-003 剩余 = `yu-vfs/src/dir.rs` DirSource 把 Unicode 文件名折回字节键。
+  ~~DIV-003 剩余 = `yu-vfs/src/dir.rs` DirSource 把 Unicode 文件名折回字节键~~
+  **已 fixed(B5,2026-10-24)**:折回落地,0.479 SDK 实测 files=1424 skipped=0。
 - trace:`DIV-L-002`(script 60 返回后的任务相位/调度)open;官方 L1 `args=[]`
   参数级不可观测,当前只到命令顺序级。
 

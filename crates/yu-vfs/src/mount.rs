@@ -2,6 +2,9 @@
 //!
 //! 引擎实测的挂载顺序: 基础包 + `update1..9` 依次覆盖。覆盖按**归一路径**
 //! 精确匹配;上层存在文件时,下层同路径的目录整体被遮蔽。
+//!
+//! 接线在 `yu-cli/src/project.rs`(`Project::update_packs` 枚举增量包,
+//! `open_source` / `mount` 按序 push;批次 B5)。
 
 use crate::{missing, not_dir, Codec, DataSource, Entry, LookupKey};
 use std::collections::BTreeMap;

@@ -3,7 +3,8 @@
 //! 路径归一和名字比较是**字节级**操作,但多字节字符的步进表随编解码器不同:
 //! CP932 的 0xA1–0xDF 是半角片名单字节,GBK 同区间却是前导字节;更关键的是
 //! CP932 的 trail 字节可以取 0x5C(`\`),若按裸字节折分隔符会把一个日文字符
-//! 劈成两段。这里只提供步进/尾字节判据;完整码表归 `yu-format`(任务书 A §3)。
+//! 劈成两段。这里只提供步进/尾字节判据;完整码表归 `yu-format`(任务书 A §3),
+//! 需要 encode/decode 时经 [`Codec::to_format`] 调用。
 
 /// 字节扫描使用的编解码器。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +34,14 @@ impl Codec {
         match self {
             Codec::Cp932 => (b >= 0x40 && b <= 0x7e) || (b >= 0x80 && b <= 0xfc),
             Codec::Gbk => b >= 0x40 && b <= 0xfe && b != 0x7f,
+        }
+    }
+
+    /// 映射到 `yu-format` 的同名编解码器(encode/decode 调用面)。
+    pub(crate) fn to_format(self) -> yu_format::Codec {
+        match self {
+            Codec::Cp932 => yu_format::Codec::Cp932,
+            Codec::Gbk => yu_format::Codec::Gbk,
         }
     }
 }

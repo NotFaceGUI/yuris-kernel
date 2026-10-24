@@ -6,4 +6,7 @@ license.workspace = true
 
 [dependencies]
 yu-log = { path = "../yu-log" }
+# 非 ASCII 文件名折回字节键用的 CP932/GBK 码表(architecture §7:表本体归
+# yu-format,本层只调用;DIV-003)。
+yu-format = { path = "../yu-format" }
 flate2.workspace = true

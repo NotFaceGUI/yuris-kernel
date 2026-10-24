@@ -6041,3 +6041,83 @@ case save-title-flow: PASS(--update 仅 save_state_sha256:预约语义升级;
   `0x44316c` 文件系统支补 `save_root_fs_exists`(前缀 `$_SAVE_PATH` +
   越界防护),`fixture::fileinfo_fs_fallback_checks_save_root` 回归;
   官方 seld.sd golden 的值断言放宽为选项号合法域(活语料随游玩变化)。
+
+## 成果 B5 (2026-10-24) · VFS 挂载与名字:update1..9 增量包 + DirSource 非 ASCII 折回(DIV-003 归零)
+
+### 1. 取证(全部为既有证据锚点,本批未新增 REA)
+
+- **增量包挂载顺序**: 引擎目录扫描(`FUN_0045eda0`)按 `.ypf` 后缀命中
+  `update1..9.ypf`、按序号登记(`0x80182c + n*4`),随后(`FUN_0045e3b8`)
+  在基础数据之后**依序挂载非空槽**(旁线笔记 `format-ypf.md` §挂载顺序/
+  §目录扫描;`architecture.md` §启动链 REA 字符串 `ev_bdf145d8…`/
+  `ev_bb5e8e01…`)。序号域就是 1..9 —— `update10.ypf` 不入列(有单测钉住)。
+- **编码选择(CP932 vs GBK)**: 不猜 —— 语料与 SDK 均为日文 CP932 形态,
+  `DirSource`/`Project` 的 `Codec` 本就是既有配置参数(CP932 为全仓缺省);
+  GBK 走同一条折回路径,有独立单测(Python gbk 独立 oracle)。
+- **折回语义依据**: Windows 上引擎按 Unicode 名访问散盘文件(DIV-003
+  「官方行为」节,文件系统事实 + 引擎读序推断),`std::fs` 只给 Unicode;
+  折回 = 恢复引擎的 CP932/GBK 字节路径语义。`yu-format` 码表全表满足
+  `decode∘encode` 恒等 ⇒ 同目录不同 Unicode 名折回后键必不同,索引无碰撞。
+
+### 2. 实施
+
+- `yu-vfs`:
+  - `Cargo.toml` 增依赖 `yu-format`(architecture §7:表本体归 yu-format,
+    本层只调用 —— 这正是 DIV-003 的分层修法);
+  - `codec.rs`: `Codec::to_format()` 映射到同名编解码器;
+  - `dir.rs` `relative_key`: 非 ASCII 组件经 `yu-format` 码表 `encode` 回
+    字节键;编码失败(不可映射字符)才跳过,原因记 `unencodable_name`
+    (取代旧 `non_ascii_name`;其余原因不变)。ASCII 快路径不触码表。
+  - `mount.rs`: 头部补接线注记(audit「Mount 无人用」销账)。
+- `yu-cli/src/project.rs`:
+  - `Project::update_packs()`: 数据入口所在目录枚举 `update1..9.ypf`
+    (按序号递增;`--data` 覆盖时取数据文件同级目录);
+  - `open_source()`: 存在增量包时返回 `基础包 + update1..9` 的
+    [`Mount`] 叠加栈;**无增量包时保持单一源不变**(诊断 `source_name`
+    与既有 golden 不受影响);
+  - `mount()`: 层序 = `基础包 → update1..9 → 散盘`(散盘是开发/覆写
+    通道,置于官方增量之上,同名覆盖语义不变);
+  - `open_ypf()` 小助手统一打开错误映射。
+
+### 3. 验证命令与原始输出
+
+```text
+$ export YURIS_TEST_TMP=<repo>/target/test-tmp
+$ export YURIS_SAMPLE_SDK0479=<side-repo>/target/sdk/0.479/yu-ris_0479_014/システム
+$ cargo test -p yu-vfs -p yu-cli
+yu-vfs:  lib 42 passed(含 dir 折回 ×3 新增)+ equivalence 13 passed
+  (含 non_ascii_name_dir_and_ypf_agree 新增: 散盘 Unicode 名 ↔ 封包
+   CP932 字节名跨源一致)+ nul_xor 2 passed + real_sample 5 passed
+  (含 sdk_0479 折回验收新增)
+yu-cli:  lib 13 passed(含 project ×3 新增: 枚举序 / open_source 叠加 /
+  mount 层序)+ bin/集成目标 0 failed
+全部 ok,0 failed(完整日志 target/tmp/b5-test-full.log)
+
+$ cargo test -p yu-vfs --test real_sample sdk_0479 -- --nocapture
+0.479 DirSource: files=1424 skipped=0          ← DIV-003 验收: 1,424 文件 0 skipped
+japanese name ok: data/cgsys/extra/bgmmode/tip_再生時間.png bytes=1468
+test sdk_0479_loose_directory_indexes_every_file_including_japanese_names ... ok
+```
+
+- 0.479 实测口径: `システム` 目录 1,424 文件 = 旧实测 files=1339 +
+  skipped=85;折回后 85 个日文名(tip_再生時間 / tip_鑑賞数 /
+  エンジン設定.exe 等)全部入索引,日文名锚点按 PNG 魔数读出。
+- 折回 oracle 均为硬编码字节(Python cp932/gbk 独立计算,不经实现码表):
+  CP932 日=0x93FA 本=0x967B 語=0x8CEA 再=0x8DC4 生=0x90B6 時=0x8E9E
+  間=0x8A94;GBK 日=0xC8D5 本=0xB1BE 語=0xD55A(trail 0x5A='Z' 不折)。
+
+### 4. 口径与残留
+
+- **无带更新包的样本工程**(注明): `<side-repo>/workbench/project-eris`
+  为封包无 `update*.ypf`、`project-479` 为散盘、`<games>` 不存在(AGENTS §2)
+  —— 按任务书 B5 预案,以**自造 update 包往返测试**覆盖:`project.rs` 三个
+  单测用最小 v495 写入器构造 基础包+update1+update2,断言枚举序
+  (1..9 域,update10 不入列)、open_source 叠加覆盖(shared.txt:
+  base→u1→u2)、mount 层序(散盘 > update > 基础包)。真样本到手后
+  可用 `case` 流程复验资源齐。
+- 残留(低风险,留痕): CP932 的 NEC/IBM 别名码(398 条多码一符)编码时取
+  系统首选码 —— 散盘 Unicode 名唯一 ⇒ 索引无碰撞;但若脚本以**别名形态**
+  字节引用散盘日文名,字节键可能不命中(引擎实际按 Unicode 匹配,不受此限)。
+  SDK 1,424 文件实测零缺口;真游戏命中时再取证(YSCom 输出形态未定)。
+- 台账: DIV-003 → fixed;audit §2 两行划掉;todo-inventory format 行勘误。
+- 本批未触达 yu-sound —— 工作区 `yu-sound` 在途改动属并行批次 B6,与 B5 无关。

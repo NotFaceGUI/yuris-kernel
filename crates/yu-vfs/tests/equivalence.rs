@@ -190,6 +190,62 @@ fn dir_and_ypf_agree_on_open_exists_list() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// 非 ASCII 名折回的跨源等价(DIV-003): 散盘上的 Unicode 名经码表折回的
+/// 字节键,必须与封包里同一资源的 CP932 字节名一致。
+#[test]
+fn non_ascii_name_dir_and_ypf_agree() {
+    let root = temp_dir("nonascii");
+    // 仅在文件系统接受该名字时构造。
+    if fs::write(root.join("日本語.txt"), b"jp").is_err() {
+        eprintln!("SKIP: filesystem rejects Japanese file name");
+        return;
+    }
+    // CP932 独立 oracle(Python cp932): 日=0x93FA 本=0x967B 語=0x8CEA。
+    let name: &[u8] = &[0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA, 0x2E, 0x74, 0x78, 0x74];
+    let pack_bytes = write_ypf(
+        &TestPack::default(),
+        &[TestEntry {
+            name: name.to_vec(),
+            data: b"jp".to_vec(),
+            compress: false,
+            file_type: 0,
+        }],
+    );
+    let pack_path = root.join("synthetic.ypf");
+    fs::write(&pack_path, &pack_bytes).unwrap();
+
+    let dir = DirSource::open(&root, Codec::Cp932).unwrap();
+    let ypf = YpfSource::open(&pack_path, Codec::Cp932).unwrap();
+    let lookup = key(name);
+
+    assert_eq!(dir.skipped_count(), 0, "折回后不得有跳过");
+    assert!(dir.exists(&lookup), "散盘必须按折回字节键命中");
+    assert_eq!(dir.open(&lookup).unwrap(), b"jp");
+    assert!(ypf.exists(&lookup));
+    assert_eq!(ypf.open(&lookup).unwrap(), b"jp");
+
+    // 根目录列表: 封包侧恰好一条该字节名;散盘侧包含它(另有 synthetic.ypf)。
+    let ypf_names: Vec<Vec<u8>> = ypf
+        .list(&LookupKey::root())
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(ypf_names, vec![name.to_vec()]);
+    let dir_names: Vec<Vec<u8>> = dir
+        .list(&LookupKey::root())
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(
+        dir_names.contains(&name.to_vec()),
+        "散盘根列表必须含折回字节名: {dir_names:?}"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
 /// V2 验收:0.495 布局但 version=300 的包必须能读(引擎无版本分支;
 /// 表与 meta 都不随版本变化)。
 #[test]

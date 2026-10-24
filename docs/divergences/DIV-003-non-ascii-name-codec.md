@@ -1,6 +1,9 @@
 # DIV-003 · 非 ASCII 资源名: yu-vfs 无编解码表,显式跳过并计数
 
-- 状态: partial(检测器已落地;码表仍归任务书 B)
+- 状态: **fixed**(2026-10-24 批次 B5。`yu-vfs/src/dir.rs` 的 `relative_key`
+  把非 ASCII 组件经 `yu-format` 码表 encode 回 CP932/GBK 字节键;编码失败才
+  跳过并计数。0.479 SDK 散盘实测 **files=1424 skipped=0**;0.479/GBK 依据
+  = 语料与 SDK 均为日文 CP932 形态,编码选择是既有 `Codec` 配置,不是猜测)
 - 优先级: 中
 - 发现日期 / 发现方式: 2026-10-19,用官方 0.479 SDK 散盘目录实测 DirSource。
 
@@ -28,8 +31,8 @@ Windows 上引擎以 CP932 字节路径打开散盘文件;含日文名的资源�
 ## 二分记录
 
 - [x] ASCII 名 `open/exists/list` 与 `YpfSource` 一致(等价性测试)
-- [ ] 非 ASCII 名往返 —— 待 `yu-format` 提供 CP932/GBK 编解码后,把 Unicode
-      文件名按配置编解码器折回字节键;届时本档案改 fixed。
+- [x] 非 ASCII 名往返 —— `yu-format` CP932/GBK 码表就位后,`DirSource`
+      把 Unicode 文件名按配置编解码器折回字节键(B5 落地,本档案改 fixed)。
 
 ## 根因
 
@@ -57,4 +60,30 @@ cargo test -p yu-vfs --test real_sample sdk_0479 -- --nocapture
 0.479 DirSource: files=1339 skipped=85
 loose sample: data/bgm/bgm01.ogg bytes=907689 skipped_total=85
 test result: ok
+```
+
+## B5(2026-10-24)· 折回落地,fixed
+
+- 实现:`yu-vfs/src/dir.rs` `relative_key` —— 非 ASCII 组件经
+  `yu-format` 码表 `encode` 回配置编解码器的字节键(表本体仍在 yu-format,
+  分层边界不变);编码失败(名字含不可映射字符)才跳过,原因记
+  `unencodable_name`(取代旧 `non_ascii_name`;其余原因不变)。
+- 语义依据:Windows 引擎按 Unicode 名访问散盘文件(官方行为节),
+  折回即恢复其 CP932/GBK 字节路径语义;`yu-format` 全表满足
+  `decode∘encode` 恒等,同目录不同 Unicode 名折回后键必不同。
+- 覆盖回归:
+  - `dir::tests::non_ascii_names_are_folded_to_codec_bytes`(CP932 独立
+    oracle:日=0x93FA 本=0x967B 語=0x8CEA)
+  - `dir::tests::gbk_codec_folds_names_and_keeps_trail_bytes`(GBK 語
+    trail 0x5A='Z' 不得折大小写)
+  - `dir::tests::unencodable_name_is_skipped_and_counted`(emoji 不可映射)
+  - `equivalence::non_ascii_name_dir_and_ypf_agree`(散盘 Unicode 名 ↔
+    封包 CP932 字节名跨源一致)
+- 回归输出:
+
+```text
+$ cargo test -p yu-vfs --test real_sample sdk_0479 -- --nocapture
+0.479 DirSource: files=1424 skipped=0
+japanese name ok: data/cgsys/extra/bgmmode/tip_再生時間.png bytes=1468
+test sdk_0479_loose_directory_indexes_every_file_including_japanese_names ... ok
 ```
