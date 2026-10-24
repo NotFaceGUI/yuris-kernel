@@ -182,17 +182,6 @@ pub struct CopyOp {
     pub dest: LayerId,
     pub region: CopyRegion,
     pub timing: CopyTiming,
-    /// **命令时刻**本帧是否已有图层被隐藏(E 由 1→0)。
-    ///
-    /// 引擎的 COPY 读后缓冲;而 ERIS 的换屏宏 `es.SS.GOSUB` 是
-    /// 「CGTSS 截旧屏 → `BT.ES20.ALL` 隐藏本屏按钮 → CGSSS 截新屏」,
-    /// 一个 tick 内完成。若两次都取「上一呈现帧」,CGS1 就会带上已隐藏的
-    /// 按钮 —— 官方截图里弹窗背景是**纯黑**(veil 叠黑 `(0,3,14)`),
-    /// 我们则是 veil 叠按钮色 `(0,39,76)`(DIV-RT-050)。
-    ///
-    /// 因此:本帧发生过隐藏 ⇒ 该 COPY 按**当前层状态**合成;
-    /// 否则仍取上一呈现帧(`EVID-J3-06` 的 title 淡入红线依赖它)。
-    pub after_hide_this_frame: bool,
     pub status: OpStatus,
 }
 

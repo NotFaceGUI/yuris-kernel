@@ -1269,11 +1269,6 @@ impl Planner<'_> {
             .find(|w| w.number == 0)
             .and_then(|w| w.layer_set.as_ref());
         let source = match &copy.source {
-            CopySource::Group(id) if Some(id) == main_group && copy.after_hide_this_frame => {
-                // 本帧已有图层被隐藏 ⇒ 后缓冲尚未呈现隐藏后的画面,
-                // 按当前组状态合成(DIV-RT-050;与 soft 同规则)。
-                self.group_image(id)?
-            }
             CopySource::Group(id) if Some(id) == main_group => self.backbuffer_image()?,
             CopySource::Group(id) => self.group_image(id)?,
             CopySource::Layer(id) => match self.copy_text_sources.get(&copy.id) {
