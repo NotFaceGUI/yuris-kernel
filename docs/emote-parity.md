@@ -6,6 +6,15 @@
 > 引擎主体自身的 shader 集仍只有 4 个 ps_2_0(`docs/shader-parity.md`)。
 >
 > 本台账记录证据、现状与支持计划;未实现部分显式挂账,不伪造。
+>
+> ⚠ **2026-10-24 对账(AU5)**:本文件 §7/§8(2026-10-23)宣称的
+> 「时间轴跨帧命令化、物理控制器(bust/hair/parts)、type-7 clip rect、
+> type-9 anchor、嵌套深度 32→256」等,在本仓钉住的 submodule
+> `yu-emote@d0f03a1` 中**不可复核**(`pose.rs:41` 仍 `MAX_NESTED_MOTION_DEPTH=32`、
+> `anim.rs:23` 明言物理控制器未求值、`soft.rs:18` type-7 clip 仍挂账)。
+> 差异要么在子仓未推提交、要么文档超前于实现;**以 submodule checkout 为准**,
+> 待主人核对子仓后推进 gitlink 或修正 §7/§8。内核侧同样未接线
+> (无任何 crate 依赖 `yu-emote`,语料 13 次 `EMOTE` 命令仍只是域事件)。
 
 ## 0. 证据源
 
