@@ -52,7 +52,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `LOOP` | vm | 522 | `control/loop.html` | `0x447ef0` | ✅ 实现 | 保持 |
 | `WORD` | vm | 464 | `basic/basic.html` | `0x458d44` | ✅ 实现 | 本 600 帧未触发;静态语料有 464 处;COV-M-03 M-2:每字符写 '1'/'2' 到 _TEXT_FLAG(REA 0x458d44) |
 | `STR` | vm | 431 | `variable/str.html` | `0x4500d8` | ✅ 实现 | 保持 |
-| `RETURNCODE` | vm | 396 | — | `0x44c390` | ✅ 实现 | 本 600 帧未触发;静态语料有 396 处;COV-M-02 M-2:自动模式追加 C/R/P,恒追加 E;仍为让出点(REA 0x44c390) |
+| `RETURNCODE` | vm | 396 | — | `0x44c390` | ✅ 实现 | 本 600 帧未触发;静态语料有 396 处;COV-M-02 M-2:自动模式追加 C/R/P,恒追加 E;让出点(REA 0x44c390 `MOV byte[task+9],1` **无条件**)。**AU5 勘误**:恢复判据分模式 —— `FUN_004046fc` `0x404711 CMP byte[state+0x1c],1` / `0x404715 JNE` ⇒ 手动(`OUTPUTMODE≠1`)**一帧即恢复、不经按钮表**;仅自动(`==1`)才读 CLICKBUTTON/SKIPBUTTON(`0x5b48ac..0x5b48bc`)。v494 同构(`0x44c20c`)。DIV-RT-035 已勘误 |
 | `F_INT` | vm | 337 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 官方默认体报「スクリプト実行エラー」(yse 0xdbbd2)+ 返回 -1;静态 337 处全在 `global_f.yst` 声明段,600 帧 0 执行(DIV-RT-043) |
 | `VARACT` | vm | 310 | `variable/varact.html` | `0x453fa8` | ✅ 实现 | 保持 |
 | `SAVE` | save | 290 | `file/save.html` | `0x44c45c` | ✅ 实现(B1) | 装存档宿主时命令时刻预约(值快照)/刷盘;`SET` 槽事件携带变量引用;未装宿主仍只发 `DomainCall`。REA 锚勘误:`0x44e1c8` 是 SAVEINFO(DIV-RT-042) |
@@ -114,7 +114,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `MATH3D` | vm | 1 | — | `0x448900` | ✅ 实现 | 已实现(EVID-J3-03;本表旧口径作废) |
 | `MENUINFO` | menu | 1 | `menu/menuinfo.html` | `0x44a6f4` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `);` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 宏/编译产物残留;运行时同默认槽(DIV-RT-043) |
-| `CDDA` | system | 0 | — | `0x429fb0` | 🔵 aligned-stub | 官方空桩(B6,声音台账 0-9);归类保持现状,诊断 `rt.cmd.aligned_stub` |
+| `CDDA` | sound | 0 | — | `0x429fb0` | 🔵 aligned-stub | 官方空桩(B6,声音台账 0-9);B2 起域归类 = Sound(与 MIDI 族一致),诊断 `rt.cmd.aligned_stub` |
 | `CLIPINFO` | graphics | 0 | `clip/clipinfo.html` | `0x43e410` | ✅ 实现 | 读镜像写入 LET;丢弃 `<0x20` 字节(DIV-RT-045) |
 | `COMPILEMODE` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期;运行时同默认槽(DIV-RT-043) |
 | `CSV` | vm | 0 | — | `0x43e640` | ✅ no-op | 官方只做参数求值后返回 0(DIV-RT-046) |
@@ -172,9 +172,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `CGINFO` | 1598 | 已实现 | 未安装 `GraphicsHost`(宿主查询面;INFO 不是 VM 语义) |
 | `CGACT` | 631 | 域事件:graphics | 域事件已发;查询/写回需宿主状态机 |
 | `SOUND` | 531 | 域事件:sound | 未装 `SoundHost` 时只发事件;装宿主后由 `yu-sound` 消费 |
-| `WINDOWINFO` | 371 | 部分 | AU5 勘误:旧口径「已实现/未装宿主」归因不全。几何(EXIST/E/X/Y/SX/SY)装 `GraphicsHost` 即可答;`FULLSCREEN/CAPTION/ACTIVE/MAXIMIZE/RESIZE/CLOSEMODE/MENUID/REGIONID/DRAGID` **装了宿主仍 `INFO_UNSUPPORTED`**(字段族 = DIV-RT-050 候选根因,REA 锚点 `0x4586ec`)。B4 复跑 371(P3 时 129;+242 发生在 B4 之前——
-B4 内核改动不触碰 WINDOWINFO 计数路径,false 口径总命令数与 B6 基线
-7,735,437 逐字节一致;精确归因随 B2 字段族收口复核) |
+| `WINDOWINFO` | 371 | 部分 | AU5 勘误:旧口径「已实现/未装宿主」归因不全。几何(EXIST/E/X/Y/SX/SY)装 `GraphicsHost` 即可答;`FULLSCREEN/CAPTION/ACTIVE/MAXIMIZE/RESIZE/CLOSEMODE/MENUID/REGIONID/DRAGID` **装了宿主仍 `INFO_UNSUPPORTED`**(字段族 = DIV-RT-050 候选根因,REA 锚点 `0x4586ec`)。**+242 归因定案(B2,2026-10-24 复核)**:P3(d66ed41)129 → P7(88eea55)371,差异 = `WINDOWINFO[FULLSCREEN]` 轮询环 ×121 + `FULLSCREEN2` 增量 ×121(参数组合表逐项对账;`EXIST NO=2`×120 与 9 条一次性查询两树完全一致)——轮询环在 `es_first`(yst00000)pc 2278 `IF[@1451==@415/419/423]` 守卫下每帧发 pc 2279/2280 一对查询(写 `LET=@1140/@1141`);P7 的 op_math LET 下标修复(POW2 表)+ VARACT 存在性口径让 `@1451` 落到预期值,轮询恢复。B4/B5/B6 无关(P7 树与 HEAD 的总数/计数逐字节一致;P8 不触 yu-rt)。该轮询也是 `es.END` 收尾链的等待面(DIV-RT-052) |
 | `SAVE` | 16 | 已实现(B1) | 未装存档宿主时只发域事件;装宿主(命令时刻预约/刷盘,DIV-RT-042 闭环)——`save-load-loop` 用例落盘 gsd/extra/seld/kidoku |
 | `EMOTE` | 12 | 域事件:emote | 域事件已发;E-mote 子系统归宿主 |
 | `WINDOW` | 10 | 域事件:window | 域事件已发;查询/写回需宿主状态机(+1 来自 `_WINDOW_INIT_POS` 分支) |
@@ -214,7 +212,7 @@ B4 内核改动不触碰 WINDOWINFO 计数路径,false 口径总命令数与 B6 
   (REA `0x4567c0`),事件字段不变。
 - `WORD`:`provenance` 记「✅ 实现」;M-2 补上 `_TEXT_FLAG` 宽度标志
   (REA `0x458d44`)。
-- `RETURNCODE`:`DIV-RT-035` 只写了让出;M-2 补上行尾控制标志
+- `RETURNCODE`:`DIV-RT-035` 只写了让出;M-2 补上行尾控制标志;R3-fix 补上**恢复判据的模式分支**(手动 = 一帧休憩,自动 = 等推进输入)
   (自动 `C/R/P` + 恒 `E`,手动置清屏请求)。
 - `TEXTINFO`:`provenance` 未列;0.495 语料 0 次、600 帧 0 次,但手册
   `text/textinfo.html` 有页且 REA `0x4538cc` 完整,故实现(不是猜测)。
@@ -313,10 +311,10 @@ B4 内核改动不触碰 WINDOWINFO 计数路径,false 口径总命令数与 B6 
 
 > 台账：`docs/sound-ledger.md`。REA 锚点仍是 0.495 处理体地址；
 > 状态列区分「事件层」与「宿主实现」。
-> 口径注(AU5/B6)：§1 把 MIDI/MIDIEND/MIDIINFO 按事件层记「域事件」，本表按
-> 终态记「🔵 aligned-stub」——同一事实的两侧口径，非矛盾；`CDDA` 在 `domain_of`
-> 落 `Domain::Other` 而非 `Sound`（归类错位保留——B6 纪律是行为不变，只改
-> 诊断归属；域归类一行修仍归 B2）。
+> 口径注(AU5/B6/B2):§1 把 MIDI/MIDIEND/MIDIINFO 按事件层记「域事件」,本表按
+> 终态记「🔵 aligned-stub」——同一事实的两侧口径,非矛盾。B2 起 `CDDA` 在
+> `domain_of` 归 `Domain::Sound`(与 MIDI 族一致;原先错落 `Domain::Other`
+> 的口径注已销掉),域事件照发、诊断仍 `rt.cmd.aligned_stub`。
 > B6（2026-10-24）：SOUNDINFO 增列 `DATALEFT/DATARIGHT` fixed(no-manual)
 > （DIV-SND-001）；`SOUND[SPEED=]` unsupported-by-official（处理体无槽 13
 > 读取点）；ACM WAVE fixed(no-manual)（DIV-SND-004）；负 START/RESTART
@@ -330,7 +328,7 @@ B4 内核改动不触碰 WINDOWINFO 计数路径,false 口径总命令数与 B6 
 | `MIDI` | 67 | 0 | `0x44aa40` | 🔵 aligned-stub | 官方空桩,内核同型:域事件照发,诊断 `rt.cmd.aligned_stub`(B6) |
 | `MIDIEND` | 68 | 0 | `0x44aa60` | 🔵 aligned-stub | 同上 |
 | `MIDIINFO` | 69 | 0 | `0x44aa80` | 🔵 aligned-stub | 同上 |
-| `CDDA` | 0 | 0 | `0x429fb0` | 🔵 aligned-stub | 官方空桩;事件行为不变(归类仍在 Other),只改诊断归属(B6) |
+| `CDDA` | 0 | 0 | `0x429fb0` | 🔵 aligned-stub | 官方空桩;B2 起域归类 = Sound(域事件照发),诊断 `rt.cmd.aligned_stub` |
 
 回归：不装宿主时 `coverage_census 600 8` 的三条计数与 M-2 一致
 （531 / 7,200 / 1），诊断文案不变。

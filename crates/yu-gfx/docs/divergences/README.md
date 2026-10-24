@@ -34,8 +34,8 @@
 | DIV-GFX-022 | 资源图 + `SX/SY` 的缩放/裁剪语义未取证(仅 `FILE=""` 黑图有真实用法) | unimplemented | `SolidBlack1x1` 按尺寸可执行;资源图带尺寸标 `gfx.image.size.unsupported` |
 | DIV-GFX-023 | 复制/图像日志上限 16,384 条,超限丢弃最旧一半 | note | 记录 `dropped_ops()` + `gfx.log.truncated`;正常首屏为 0 |
 | DIV-GFX-024 | `CGINFO[SX/SY]` 对资源图返回真实纹理尺寸需要资产元数据(图像文件头/解码器);gfx 不读文件 | blocked | 有显式 `SX/SY` 的层、组、`SolidBlack1x1` 可答;资源图无显式尺寸时 Unimplemented,不猜 0 |
-| DIV-GFX-025 | INFO 多字段同时置位时 `LET` 写回顺序未取证 | unimplemented | `gfx.info.multi`;VM 不写 LET,避免猜顺序 |
-| DIV-GFX-026 | INFO 的 `COLOR/ONMOUSE*/CAPTION/ACTIVE/FULLSCREEN/...` 需要像素/鼠标/窗口 host | partial | `ONMOUSE/ONMOUSE2/ONMOUSE3` 已实现(REA `0x43d664`/`0x43de01`;宿主注入 `TextureSampler`;快照按 `snapshot_files` 源资产采样);`COLOR`/组/离屏像素仍 `gfx.info.unsupported` |
+| DIV-GFX-025 | INFO 多字段同时置位时 `LET` 写回顺序未取证 | unimplemented | `gfx.info.multi`;VM 不写 LET,避免猜顺序;**B2 子波 2 排期中(2026-10-24 门控未过,等并行 CGS 会话落地后按 REA 取证实现;roadmap-batches §2 B2)** |
+| DIV-GFX-026 | INFO 的 `COLOR/ONMOUSE*/CAPTION/ACTIVE/FULLSCREEN/...` 需要像素/鼠标/窗口 host | partial | `ONMOUSE/ONMOUSE2/ONMOUSE3` 已实现(REA `0x43d664`/`0x43de01`;宿主注入 `TextureSampler`;快照按 `snapshot_files` 源资产采样);`COLOR`/组/离屏像素仍 `gfx.info.unsupported`;**B2 子波 2 排期中(2026-10-24 门控未过,等并行 CGS 会话落地后按 REA 取证实现;roadmap-batches §2 B2)** |
 | DIV-GFX-027 | `IDNO` 的 `ID + "." + 十进制` 拼接未重新锚定(旧地址失效) | open | 路径按现规则;若引擎不同则需改 |
 | DIV-GFX-028 | 图像层下挂子层的目标 RT(同一目标 vs 组 RT)只有遍历汇编证据,无真实样本 | open | 当前按后序扁平绘制到父目标;需官方合成脚本确认 |
 | DIV-GFX-029 | pass 的 copy/image 分组顺序与脚本命令交错序不同 | fixed(J2) | EVID-T-15:官方命令处理器立即执行;`frame()` 按 `CopyOp::seq`/`ImageOp::seq` 交错输出纹理 pass(微场景 `j2-micro-copy2` 软/硬/官方一致) |
@@ -45,9 +45,9 @@
 | DIV-GFX-033 | `TEXT` 的 `OUTPUTMODE/WAIT/RETURN/PAGE/CLICK/AUTO*/…BUTTON` 显示节奏未实现 | unimplemented | VM 只记录命令事实;点击/跳过按钮属 host |
 | DIV-GFX-034 | 文本跨帧持久 | **fixed(P2)** | 跨帧 `BTreeMap<LayerId, TextBuffer>`;`TEXT[CLEAR]` 经宿主同步传播;`FrameStart` 不再清空 |
 | DIV-GFX-035 | `FONT` 字段解析与默认字体 | partial | P2:`TextFontRequest`(NAME>`NO`>BNO>默认)+ GRADATION/ROTATION clamp 保存;P6:BNO 未取证分支按帧去重报 `text.font.bno_fallback`(DIV-FONT-007);PITCH/LANG 仍只留值 |
-| DIV-GFX-036 | `FONTINFO NUM/LANG/GRADATION/ROTATION/PITCH/X/Y` 需要字体列表;未设置的 COLOR2/NAME 默认值未取证 | unimplemented | 返回 `gfx.info.unsupported`,不写 LET |
+| DIV-GFX-036 | `FONTINFO NUM/LANG/GRADATION/ROTATION/PITCH/X/Y` 需要字体列表;未设置的 COLOR2/NAME 默认值未取证 | unimplemented | 返回 `gfx.info.unsupported`,不写 LET;**B2 子波 2 排期中(2026-10-24 门控未过,等并行 CGS 会话落地后按 REA 取证实现;roadmap-batches §2 B2)** |
 | DIV-GFX-037 | `WINDOW` 的 CAPTION/ACTIVE/FULLSCREEN/MINIMIZE/CLOSEMODE/MENUID/REGIONID/DRAGID/Z 归 host;主窗口 `A` 透明度(β4 仅显隐)/`SX/SY` 是否改视口未取证 | open | gfx 记录 X/Y/SX/SY/Z;Screen 只消费 E/A 的显隐与 CGID |
-| DIV-GFX-038 | INFO 对“缺失图层/窗口”的非 EXIST 字段、以及 `MFILE/TEX/FX/TRIM/...` 未取证 | unimplemented | 返回 `gfx.info.missing/unsupported`;VM 不写 LET |
+| DIV-GFX-038 | INFO 对“缺失图层/窗口”的非 EXIST 字段、以及 `MFILE/TEX/FX/TRIM/...` 未取证 | unimplemented | 返回 `gfx.info.missing/unsupported`;VM 不写 LET;**B2 子波 2 排期中(2026-10-24 门控未过,等并行 CGS 会话落地后按 REA 取证实现;roadmap-batches §2 B2)** |
 | DIV-GFX-039 | `CGACT` 未分类参数:`RASTER1`(手册有、ERIS 表无)、`FSX/FSY/FX2/FY2`、`Z2` | unimplemented | `RASTER1` 已识别为图像动作;其余原样留存 |
 | DIV-GFX-040 | `TEXTINFO` 只读文本状态查询 | **fixed(M-2/P2)** | `yu-rt` `op_textinfo` 按工程 ysc 参数名路由(OUTPUTMODE/CX/CY/CLICK/AUTO*/LET);ERIS 语料 0 使用,状态源 = P2 文本状态机 |
 | DIV-GFX-041 | 主组/子组 RT 的结构与 alpha 格式:主组 `W0` 官方直绘到屏幕;子组 RT alpha 不参与合成(行为已由 EVID-J-08 微场景确认),生产路径的 `D3DFMT`/alpha 写掩码未定位 | partial | 主组直绘已落地(DIV-GFX-008 fixed);子组 RT 仍按 RGBA8 直通 alpha,生产格式/写掩码待取证 |

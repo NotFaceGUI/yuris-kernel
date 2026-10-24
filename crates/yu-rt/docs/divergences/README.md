@@ -20,6 +20,7 @@
 | DIV-RT-008 | `_`(文本输出)手册无页 | fixed | 手册 basic.html ●テキスト表示有页(`_[式]`);已实现,撤销旧挂账 |
 | DIV-RT-009 | `_TIME`/`_OS_TIME` 的时区与纪元 | open | 注入时钟固定 UTC |
 | DIV-RT-010 | 路径类系统变量(`_SAVE_PATH` 等) | fixed | `BootConfig::paths` + yu-cli `host_paths()` 注入;`$_PROJECT_PATH` 手册无页保持 `None` |
+| DIV-RT-051 | 字符串操作按 CP932 字符边界(非逐字节) | **fixed(2026-10-24)** | 根因:CP932 尾字节覆盖 `0x40..0xFC`,其中 `0x41..0x5A`/`0x61..0x7A` 与 ASCII 字母同码 ⇒ 逐字节 ASCII 化会改写双字节字符。实测 `VARACT[LOWER]("サークル")` = `83 54 81 5b 83 4e 83 8b` → `83 74 81 5b 83 6e 83 8b` = `フーハル`,厂商 LOGO `cg/ev/サークル.jpg` 因此查不到、片头黑屏。修法:新增 `crates/yu-rt/src/cp932_text.rs` 作唯一真源(`is_lead`/`char_len_at`/`spans`/`char_count`/`slice_chars`);`ascii_case`/`fullwidth_case`/`copy_chars`/`cut_chars`/`case_tables::char_len` 全部改走它。复核 `cargo test -p yu-rt --lib`(70 passed,含 4 个 cp932_text 单测) |
 | DIV-RT-011 | 手册有页但语义未取证的命令(VARINFO SEARCH / VARACT INIT·G_* / F_* / ERROR) | open | 仅剩 VARINFO `STRTYPE/SJISCODE/UTF8CODE`(无手册例)、`VAR`/`CSVINFO`(无页/未取证,AU5 补录)与 `CDDA`(空桩,见 sound-ledger N0-10);SEARCH/INIT·G_*/RETURNCODE/WORD/F_*/PREP 已另证实现 |
 | DIV-RT-012 | `SAVE`/`LOAD` 的盘上存档格式 | fixed | `yu-format::yssd` 官方 5 文件 269 块逐字节 roundtrip;`yu-save` 宿主消费域事件(忠实写盘受 DIV-RT-042 门禁) |
 | DIV-RT-013 | `HANTOZEN`/`ZENTOHAN` 转换表 | fixed | 三张表已自 0.495 exe 取出落 `data/case-tables-0495.tsv`;算法逐条对照 REA |
@@ -60,6 +61,7 @@
 | DIV-RT-048 | `_TEXT_NUM` 的数据源 | fixed | `yst.ybn` 头部 text_total == `yst_list` 求和(ERIS 396) |
 | DIV-RT-049 | 旗标/目标形态判定族(MATH 捕获、INIT 守卫、LABELINFO 下标)——P7 续审查轮的三个同族潜伏点 | fixed | 旁线 §3.20/§3.26 反汇编判据 + 语料形态扫描(scanmath:21 处 MATH 旗标全 =1、无 INIT=0);回归 ×3 |
 | DIV-RT-050 | CGS 场景截图栈:进菜单/存档弹窗背景透出上一亮帧,官方为黑底 | open | 档案在仓库根 `docs/divergences/DIV-RT-050-cgs-scene-screenshot-stack.md`(跨 crate 编号,AU5 起在此交叉引用);候选根因含 WINDOWINFO 字段族缺口 |
+| DIV-RT-052 | `END` 由**非 main 任务**执行时只 Finish 该任务,主任务继续 ⇒ 程序不退出(`\es.END` → `END[RESTART=0]` 后 `main_finished` 不亮) | open | B2 实测(`yu-cli tests/dialog.rs`):はい 后 `\es.END`→`GSD.SAVE` 落盘(执行链通),但 `END`(REA `0x441334`)语义待取证——官方是「结束整个程序」还是「结束当前任务」;影响所有退出确认流程。归 B10 rt campaign;修复前宿主以 `main_finished`/`VmEvent::End` 判退出需自行取或 |
 
 ---
 
@@ -724,14 +726,36 @@ packed = ([1290322, 329227, 26, 249, 8765, 8765], 0, "cd1790…4bd2e")  ... ok
   - `WORD` 处理体 `0x458ee0` 成功路径 `0x459054: XOR EAX,EAX; RET`;
   - `_` 处理体 `0x4567c0` 成功路径 `0x4569cc: XOR EAX,EAX; RET`。
   ⇒ **只有 `RETURNCODE` 让出**;一行内多个 `WORD`/`_` 在同一次泵内跑完。
-- **恢复条件**:`FUN_004046fc` 在推进输入为正时清 `task+9`;推进按钮表为
-  `0x5b48ac..0x5b48b8`(MOUSE_L=1 / ENTER=13 / PAD=0x3FF / PAD=0x3FF)与
-  `0x5b48bc`(CTRL=17)。
+- **恢复条件**(2026-10-24 勘误:原文漏了模式分支,把「等输入」当成唯一判据):
+  引擎 `FUN_004046fc`(`0x4046fc..0x404910`)先判**文本输出模式**:
+  - `0x404700 MOVSX EDX,[EBX+9]` + `0x404706 JE 0x404831` —— `task+9` 未置位即返回;
+  - `0x404711 CMP byte[state+0x1c],1` + `0x404715 JNE 0x404828` ——
+    **`[state+0x1c] != 1`(手动/其它值)直达 `0x40482d MOV byte[task+9],0`,
+    不经任何按钮表**;
+  - `== 1`(自动)才走 `0x40471b..0x4047ec` 的 SKIPBUTTON/CLICKBUTTON 判定:
+    推进按钮表 `0x5b48ac..0x5b48b8`(MOUSE_L=1 / ENTER=13 / PAD=0x3FF /
+    PAD=0x3FF)与 `0x5b48bc`(CTRL=17);SKIP 侧计数 `DEC` 判当前帧按下沿,
+    CLICK 侧 `OR` 判零。
+  `[state+0x1c]` = `TEXT[OUTPUTMODE]`(手册 `text/text.html`:0=手動 / 1=自動,
+  默认自动)。**v494 同构**:本作 `kotoneiro_v494.exe`(sha256 `1ff3135d…`)
+  `RETURNCODE` = `0x44c20c`,头部逐指令对齐(`[0x802ad8]` vs `[0x801800]`),
+  尾部 `C64609` = `MOV byte[ESI+9],…`。
 - **处置**:`op_returncode` 返回 `StepOutcome::TextYield`;调度器置 `text_rest`,
-  下一次逻辑帧若无推进输入则跳过该任务。宿主/测试用 `InputTimeline` 注入点击。
+  恢复按上述模式分支:`TaskExecutor::text_auto_mode()` 为真才要求推进输入,
+  否则下一逻辑帧直接恢复(手动模式 = 一帧休憩,手册「一旦休憩します」)。
+  `InputTimeline` 注入的点击只对自动模式有意义。
+- **为什么不修就起不来**(2026-10-24,商业包实测):ERIS 框架 `es_first.yst`
+  首指令 `TEXT[OUTPUTMODE=0]` 切手动、自己用 `INPUT`/`MOUSE` 做点击等待。
+  若把手动模式也当"等输入",`ES.CHARNAME.DEFINE`(s84,256 组)这类定义链
+  会永久停在第一条 `RETURNCODE`;`es_first` pc4..pc54 的 `.DEFINE` 链走不完、
+  `es.S.GO "ES.GAMEMAIN"` 到不了,画面只剩已建的 GAMEMAIN 按钮栏 +
+  `CG[FILE=""]`(手册 `cg/cg.html`:1×1 黑图)被 `COPY2` 铺满 ⇒ 表现为
+  「黑底 + 日期框 + 一排 SAVE/LOAD」且必须点击才动。
 - **未取证**:`TEXT[WAIT=…]` 等文本命令对同一标志的影响(手册 `text/text.html`
   有 `WAIT`/`RETURN` 关键字,语义待取证)。
-- **复核**:`cargo test -p yu-rt --test fixture one_text_line_per_frame_until_advance_input`。
+- **复核**:`cargo test -p yu-rt --test fixture one_text_line_per_frame_until_advance_input`
+  (自动模式,行为未变)与 `manual_outputmode_returncode_resumes_without_input`
+  (手动模式,零输入连续推进)。
 
 ---
 

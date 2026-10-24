@@ -487,42 +487,37 @@ impl Vm {
                         && domain == Domain::Sound
                         && matches!(cmd.name.as_str(), "SOUND" | "SOUNDEND"));
                 if !handled {
-                    if matches!(cmd.name.as_str(), "MIDI" | "MIDIEND" | "MIDIINFO") {
-                        // 官方 0.495 处理体是空桩(0x44aa40/0x44aa60/0x44aa80:
-                        // 仅 FUN_00429fd1 守卫后 return 0),无媒体输出;内核
-                        // 同型对齐 —— 域事件照发、不建任何声音状态。
+                    if matches!(cmd.name.as_str(), "MIDI" | "MIDIEND" | "MIDIINFO" | "CDDA") {
+                        // 官方 0.495 处理体是空桩(0x44aa40/0x44aa60/0x44aa80、
+                        // CDDA 0x429fb0:仅 FUN_00429fd1 守卫后 return 0),无媒体
+                        // 输出;内核同型对齐 —— 域事件照发、不建任何声音状态。
                         // 终态 aligned-stub(声音台账 0-9/N0-10),不计挂号。
                         self.report_aligned_stub(
                             &cmd.name,
-                            "官方 0.495 处理体为空桩(0x44aa40/0x44aa60/0x44aa80),\
-                             同型对齐:只发域事件,无媒体输出(声音台账 N0-10)"
+                            "官方 0.495 处理体为空桩(0x44aa40/0x44aa60/0x44aa80、\
+                             CDDA 0x429fb0),同型对齐:只发域事件,无媒体输出(声音台账 N0-10)"
                                 .to_string(),
                         );
                     } else {
+                        // 挂号文案给**可执行的**锚点:域事件契约 §9 是域边界的
+                        // 正式定义处(`docs/domain-event-contracts.md`);旧文案
+                        // 引「任务书 A」,该文档只覆盖 workspace/yu-log/yu-vfs,
+                        // 从来没有域边界章节(2026-10-24 核对)。
                         self.report_unimplemented(
                             &cmd.name,
-                            "域命令未接线:语义属宿主域状态机(见任务书 A 的域边界)".to_string(),
+                            "域命令未接线:语义属宿主域状态机(域边界见 \
+                             crates/yu-rt/docs/domain-event-contracts.md §9)"
+                                .to_string(),
                         );
                     }
                 }
                 Ok(StepOutcome::Continue)
             }
             HandlerKind::Unknown => {
-                if cmd.name == "CDDA" {
-                    // 官方 0.495 `0x429fb0` 是空桩(同 MIDI 族,声音台账 0-9)。
-                    // 事件行为保持不变(CDDA 归类仍落 Unknown、不发域事件),
-                    // 只把诊断归属从「未实现」改为 aligned-stub。
-                    self.report_aligned_stub(
-                        &cmd.name,
-                        "官方 0.495 处理体为空桩(0x429fb0),同型对齐:无媒体输出(声音台账 N0-10)"
-                            .to_string(),
-                    );
-                } else {
-                    self.report_unimplemented(
-                        &cmd.name,
-                        "命令无处理器(手册无页或语义未取证)".to_string(),
-                    );
-                }
+                self.report_unimplemented(
+                    &cmd.name,
+                    "命令无处理器(手册无页或语义未取证)".to_string(),
+                );
                 Ok(StepOutcome::Continue)
             }
         }
@@ -4227,64 +4222,63 @@ fn is_lead(b: u8) -> bool {
 }
 
 /// 按字符位置取子串(1 起算;手册 `VARACT` 例 5)。
+///
+/// 字符边界统一走 [`crate::cp932_text`](CP932 lead byte 跳步),不在本文件
+/// 另写一套 —— 见该模块文档里的片头 LOGO 事故。
 fn copy_chars(bytes: &[u8], pos: usize, len: usize) -> Vec<u8> {
-    let n = char_spans(bytes).len();
+    let n = crate::cp932_text::char_count(bytes);
     let start = pos.saturating_sub(1).min(n);
-    slice_chars(bytes, start, start + len)
-}
-
-/// 内部辅助:trait 不存在,改用函数式写法。
-fn char_spans(bytes: &[u8]) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let step = if is_lead(bytes[i]) && i + 1 < bytes.len() {
-            2
-        } else {
-            1
-        };
-        out.push((i, i + step));
-        i += step;
-    }
-    out
-}
-
-fn slice_chars(bytes: &[u8], start: usize, end: usize) -> Vec<u8> {
-    let spans = char_spans(bytes);
-    if start >= end || start >= spans.len() {
-        return Vec::new();
-    }
-    let end = end.min(spans.len());
-    bytes[spans[start].0..spans[end - 1].1].to_vec()
+    crate::cp932_text::slice_chars(bytes, start, start + len)
 }
 
 /// 挖掉 `[pos, pos+len)` 字符,保留头尾(手册 `VARACT` 例 6)。
 fn cut_chars(bytes: &[u8], pos: usize, len: usize) -> Vec<u8> {
-    let n = char_spans(bytes).len();
+    let n = crate::cp932_text::char_count(bytes);
     let start = pos.saturating_sub(1).min(n);
     let end = (start + len).min(n);
-    let mut out = slice_chars(bytes, 0, start);
-    out.extend_from_slice(&slice_chars(bytes, end, n));
+    let mut out = crate::cp932_text::slice_chars(bytes, 0, start);
+    out.extend_from_slice(&crate::cp932_text::slice_chars(bytes, end, n));
     out
 }
 
-/// 半角 ASCII 大小写(手册:UPPER/LOWER 只碰半角;引擎 §3.26)。
+/// 半角 ASCII 大小写(`VARACT[UPPER/LOWER]`;手册 `variable/varact.html`
+/// 只列半角,引擎 §3.26)。
+///
+/// **必须按 CP932 lead byte 跳步**:字符串是 CP932 原始字节,双字节字符的
+/// 尾字节常落在 ASCII 大写区(`0x41..0x5A`),逐字节转换会把它当半角字母
+/// 改写,整字变成别的汉字。实测(2026-10-24,`kotoneiro` 片头):
+/// `サークル` = `83 54 81 5b 83 4e 83 8b`,逐字节小写后 =
+/// `83 74 81 5b 83 6e 83 8b` = **`フーハル`** —— 厂商 LOGO
+/// `cg/ev/サークル.jpg`(包内实际存在,293KB)因此查不到,片头整段黑屏。
+/// 官方 `VARACT` 处理体按双字节字符推进,不会出现该改写。
 fn ascii_case(bytes: &[u8], upper: bool) -> Vec<u8> {
-    bytes
-        .iter()
-        .map(|&b| {
-            if upper {
-                b.to_ascii_uppercase()
-            } else {
-                b.to_ascii_lowercase()
-            }
-        })
-        .collect()
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let step = crate::cp932_text::char_len_at(bytes, i);
+        if step == 2 {
+            // 双字节字符原样保留(半角大小写只碰 ASCII 段)。
+            out.extend_from_slice(&bytes[i..i + step]);
+            i += step;
+            continue;
+        }
+        out.push(if upper {
+            bytes[i].to_ascii_uppercase()
+        } else {
+            bytes[i].to_ascii_lowercase()
+        });
+        i += 1;
+    }
+    out
 }
 
 /// 半角 + 全角拉丁字母大小写(手册 UPPER2/LOWER2)。
 ///
 /// CP932 全角:Ａ-Ｚ = `0x82 0x60..0x79`,ａ-ｚ = `0x82 0x81..0x9A`。
+///
+/// 兜底分支同样按 [`crate::cp932_text::char_len_at`] 跳步:非 `0x82` 的双字节
+/// 字符(汉字/假名)原样保留,绝不逐字节 ASCII 化 —— 与 `ascii_case` 同一
+/// 类事故(见其文档)。
 fn fullwidth_case(bytes: &[u8], upper: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -4309,6 +4303,12 @@ fn fullwidth_case(bytes: &[u8], upper: bool) -> Vec<u8> {
                 i += 2;
                 continue;
             }
+        }
+        let step = crate::cp932_text::char_len_at(bytes, i);
+        if step == 2 {
+            out.extend_from_slice(&bytes[i..i + step]);
+            i += step;
+            continue;
         }
         let b = bytes[i];
         out.push(if upper {
@@ -4339,8 +4339,13 @@ fn cp932_lossy(bytes: &[u8]) -> String {
 fn domain_of(name: &str) -> Domain {
     if name.starts_with("CG") {
         Domain::Graphics
-    } else if name.starts_with("SOUND") || name == "MIDI" || name == "MIDIEND" || name == "MIDIINFO"
+    } else if name.starts_with("SOUND")
+        || name == "CDDA"
+        || name == "MIDI"
+        || name == "MIDIEND"
+        || name == "MIDIINFO"
     {
+        // CDDA 与 MIDI 族同域(B2:官方 0x429fb0 空桩也在声音域;coverage §8)。
         Domain::Sound
     } else if name == "SAVE" || name == "LOAD" || name.starts_with("SAVEINFO") || name == "SAVEEND"
     {
