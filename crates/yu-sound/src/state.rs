@@ -4,9 +4,16 @@
 //! - **Confirmed（静态 REA + 手册）**：层 ID 键、扩展名探测序、E/PLAY/PAUSE/
 //!   VOLUME/PAN/PITCH/LOOP/START/RESTART/END/FADE 的字段与公式、
 //!   LOOPCOUNT 在 END 边界 +1、LOOP=N 在计数达到 N 时停止并清零、
-//!   TIME = 播放位置(ms)、TOTALTIME = 总长(ms)、CODEC/FILETYPE 枚举。
-//! - **Unverified**：重采样插值、混音限幅、负 START/RESTART 的延迟语义。
-//! - **Unimplemented**：ACM WAVE、MIDI/MIDIEND/MIDIINFO、CDDA。
+//!   TIME = 播放位置(ms)、TOTALTIME = 总长(ms)、CODEC/FILETYPE 枚举、
+//!   DATALEFT/DATARIGHT 的帧采样（REA `0x44fe3c`/`0x44ff58`；手册无页）。
+//! - **Likely（静态可读、缺动态对拍）**：负 START/RESTART 延迟期间的
+//!   TIME/PLAY 返回值（DIV-SND-002；延迟累加器 `+0x190/+0x194` 本身已
+//!   字节级取证）；默认音量 256。
+//! - **Unverified**：重采样插值、混音限幅。
+//! - **aligned-stub**：MIDI/MIDIEND/MIDIINFO（官方 `0x44aa40/60/80`）、
+//!   CDDA（`0x429fb0`）——官方处理体是空桩，内核同型对齐。
+//! - **unsupported-by-official**：`SOUND[SPEED=]`（yscm 槽 13，
+//!   处理体 `0x44e1e8` 从不读 `0x68416d`，静默忽略）。
 
 use std::collections::BTreeMap;
 
@@ -135,8 +142,13 @@ pub struct Layer {
     playhead_ms: f64,
     total_ms: i64,
     fade: Fade,
-    /// 负 START/RESTART 的延迟剩余（0 = 无延迟）。
-    delay_ms: i64,
+    /// 负 START/RESTART 的延迟剩余（毫秒；0 = 无延迟）。
+    ///
+    /// 引擎侧是 64 位**字节**累加器 `+0x190/+0x194`（REA `0x423f9c/0x424424`）：
+    /// `delay_bytes += |param_ms| * bytes_per_sec / 1000`，再按 block align
+    /// 向下取整。换算回 ms 与 `|param_ms|` 只差一个 block 对齐的亚毫秒截断，
+    /// 故以 ms 存储并用浮点消除块间累加误差。
+    delay_ms: f64,
 }
 
 impl Layer {
@@ -165,7 +177,7 @@ impl Layer {
             playhead_ms: 0.0,
             total_ms: 0,
             fade: Fade::none(),
-            delay_ms: 0,
+            delay_ms: 0.0,
         }
     }
 
@@ -230,6 +242,11 @@ impl Layer {
         self.restart_ms
     }
 
+    /// 剩余延迟（毫秒）；混音端用它把延迟窗口渲染成静音。
+    pub(crate) fn delay_ms(&self) -> f64 {
+        self.delay_ms
+    }
+
     /// 当前可听音量（0..256）：E=0 时强制 0（引擎 `+0x106` × `+0x148`）。
     pub fn audible_volume(&self) -> i64 {
         if self.enabled {
@@ -273,8 +290,9 @@ pub struct SoundCommand {
     pub volume: Option<i64>,
     pub pan: Option<i64>,
     pub pitch: Option<i64>,
-    /// 0.495 yscm 额外参数槽 13（手册无页；语料未用）。无证据 ⇒ 不动。
-    pub speed: Option<i64>,
+    // 0.495 yscm 槽 13 `SPEED`：官方 SOUND 处理体（`0x44e1e8`）只读
+    // `0x684160..0x68416c`（参数 0..12），从不读 `0x68416d` ⇒ 静默忽略
+    // （unsupported-by-official，DIV-SND-001/台账 §3）。宿主不建模该参数。
 }
 
 /// SOUNDINFO 单字段查询。
@@ -432,7 +450,7 @@ impl SoundState {
     pub fn report_unimplemented(&mut self, command: &str) {
         self.report(error::unimplemented(
             code::COMMAND_UNIMPLEMENTED,
-            format!("{command}: 声音域命令未取证/未实现(MIDI/CDDA 与未知命令)"),
+            format!("{command}: 声音域命令未取证/未实现(未知命令;MIDI 族/CDDA 走官方空桩对齐,不经此路)"),
         ));
     }
 
@@ -532,12 +550,7 @@ impl SoundState {
     pub fn apply_sound(&mut self, cmd: &SoundCommand) {
         // 引擎不校验空 ID：空名字同样进哈希表（REA `0x44e1e8` 直接建节点）。
         // 这里不拒绝，避免把数据问题变成宿主策略。
-        if cmd.speed.is_some() {
-            self.report(error::unimplemented(
-                code::COMMAND_UNIMPLEMENTED,
-                "SOUND[SPEED=]（0.495 yscm 槽 13）无手册页/语料/REA 语义，保持未实现",
-            ));
-        }
+        // `SPEED`（槽 13）官方静默忽略 ⇒ 这里同样不产生任何诊断。
 
         // 先把层取出为局部值：参数应用期间允许 `self.report`/`self.loader`
         // 再借用 self；结束后放回层表（见借用检查器错误的历史）。
@@ -624,27 +637,13 @@ impl SoundState {
         // START/RESTART: 负值原样保留（延迟播放）；>= total 写 0；否则原值。
         // END: <= total 原样；> total 写 total。
         // 三者都只写字段，**不移动**当前位置 `+0x118`（TIME 不变）。
+        // 负值的延迟排程发生在 PLAY/循环边界的 seek 时刻
+        // （`0x423f9c/0x424424` 把 `|param|*bps/1000` 累加进 `+0x190/+0x194`）。
         if let Some(s) = cmd.start {
             layer.start_ms = normalize_start(s, layer.total_ms);
-            if s < 0 {
-                self.report(error::unimplemented(
-                    code::DELAY_UNIMPLEMENTED,
-                    format!("SOUND[START={s}] 负值=延迟播放；N0-3 未取得 TIME/PLAY 动态证据"),
-                ));
-                layer.delay_ms = 0;
-            } else {
-                layer.delay_ms = 0;
-            }
         }
         if let Some(r) = cmd.restart {
             layer.restart_ms = normalize_start(r, layer.total_ms);
-            if r < 0 {
-                self.report(error::unimplemented(
-                    code::DELAY_UNIMPLEMENTED,
-                    format!("SOUND[RESTART={r}] 负值=延迟；N0-3 未取得动态证据"),
-                ));
-                layer.restart_ms = 0;
-            }
         }
         if let Some(e) = cmd.end {
             layer.end_ms = if e > layer.total_ms {
@@ -787,7 +786,6 @@ impl SoundState {
             });
         };
         let mut value: Option<Value> = None;
-        let mut unsupported = false;
         for field in effective {
             value = Some(match field {
                 QueryField::Exist => Value::Int(i64::from(layer.file_type() != FileType::None)),
@@ -824,12 +822,23 @@ impl SoundState {
                         .unwrap_or(0),
                 ),
                 QueryField::DataLeft | QueryField::DataRight => {
-                    // REA 0x44fe3c/0x44ff58 已逐行取证（读播放光标处一帧、
-                    // 16-bit 取 abs、8-bit 取 |byte-0x80|、单声道无右值），
-                    // 但 0.495 手册没有这两个字段 ⇒ 三层证据缺手册层，
-                    // 按任务书 §0.1 保持 Unimplemented（只加深取证，不实现）。
-                    unsupported = true;
-                    continue;
+                    // REA 0x44fe3c（LEFT）/0x44ff58（RIGHT），逐字节核实
+                    // （0x4500a1..0x4500be）：在播放光标处 Lock 一帧
+                    // （channels*(bits/8) 字节），缓冲缺失/CHANNEL∉{1,2}/
+                    // BIT∉{8,16}/光标不足一帧 ⇒ -1。16-bit 取首个 i16 的
+                    // 绝对值（-32768 因回绕仍返回 -32768）；8-bit 取
+                    // |byte-0x80|。**DATARIGHT 的官方 16-bit 分支读
+                    // `word [ptr+4]`——越过 4 字节锁区 = 下一帧的左声道**，
+                    // 不是同帧右声道（官方越界怪癖，1:1 保留）；8-bit 立体声
+                    // 读 `ptr[1]`（同帧右采样）；单声道 DATARIGHT = -1。
+                    // 手册无此二字段（2026-10-24 政策：手册无页，按 REA 实现
+                    // 并标注；终态 fixed(no-manual)，DIV-SND-001）。
+                    // 与官方的已知刻度差：8-bit 源在内核已归一化为 i16，
+                    // 值域 0..32768 而非官方缓冲字节域 0..128（语料无 8-bit
+                    // 音频；16-bit 分支逐位对齐）。光标越过 PCM 末尾时官方
+                    // 读 ~1s 环形缓冲的回绕字节（内容不可预测），内核以 -1
+                    // 显式化该未知。
+                    Value::Int(pcm_data_sample(layer, field == QueryField::DataRight))
                 }
                 QueryField::Codec => {
                     Value::Int(layer.meta.as_ref().map(|m| m.codec.value()).unwrap_or(0))
@@ -838,10 +847,6 @@ impl SoundState {
         }
         match value {
             Some(v) => Ok(v),
-            None if unsupported => Err(error::unimplemented(
-                code::QUERY_UNSUPPORTED,
-                "DATALEFT/DATARIGHT 是 0.495 yscm 扩展字段，手册无页；REA 0x44fe3c/0x44ff58 已取证但缺手册层，按三层规则保持 Unimplemented",
-            )),
             None => Ok(Value::Int(0)),
         }
     }
@@ -865,7 +870,7 @@ fn reset_for_load(layer: &mut Layer) {
     layer.restart_ms = 0;
     layer.end_ms = 0;
     layer.set_position(0);
-    layer.delay_ms = 0;
+    layer.delay_ms = 0.0;
     layer.fade = Fade::none();
 }
 
@@ -881,6 +886,16 @@ fn start_play(layer: &mut Layer, fade_ms: i64) {
             if layer.end_ms <= layer.start_ms {
                 layer.start_ms = 0;
             }
+            // seek 时刻的延迟排程（REA `0x423f9c/0x424424`）：负 START 的
+            // `|ms|*bps/1000` 进字节累加器、数据填充从字节 0 开始 ⇒ 内核把
+            // 起始位置钉在 0 并以静音区间兑现延迟。延迟期间 TIME 冻结在 0、
+            // PLAY 保持 1（Likely——`+0x190` 的消费点在混音线程未逐行取证，
+            // 动态曲线归 DIV-SND-003 校准）。
+            layer.delay_ms = if layer.start_ms < 0 {
+                -layer.start_ms as f64
+            } else {
+                0.0
+            };
             layer.set_position(layer.start_ms.max(0).min(layer.total_ms.max(0)));
             // type 2 不写 `+0x110`（LOOPCOUNT 只由循环边界 0x464960 清零）。
             layer.state = PlayState::Playing;
@@ -936,6 +951,7 @@ fn stop_play(layer: &mut Layer, fade_ms: i64) {
     } else {
         layer.state = PlayState::Stopped;
         layer.fade = Fade::none();
+        layer.delay_ms = 0.0;
         // 引擎淡出完成后把音量字段重置为 0x100（FUN_00423718）。
         layer.volume_current = 256;
         layer.volume_target = 256;
@@ -959,6 +975,7 @@ fn advance_layer(layer: &mut Layer, delta_ms: f64) {
                 layer.volume_current = 256;
                 layer.volume_target = 256;
                 layer.fade = Fade::none();
+                layer.delay_ms = 0.0;
                 return;
             }
         } else {
@@ -968,9 +985,10 @@ fn advance_layer(layer: &mut Layer, delta_ms: f64) {
     }
 
     // 位置推进：PITCH 512=1.5x / 0=0.5x（REA 0x423614）。
-    if layer.delay_ms > 0 {
-        let step = delta_ms.min(layer.delay_ms as f64).round() as i64;
-        layer.delay_ms -= step;
+    // 延迟窗口（`+0x190/+0x194` 消费）：只烧掉时间，位置/TIME 冻结（Likely）。
+    if layer.delay_ms > 0.0 {
+        let take = delta_ms.min(layer.delay_ms);
+        layer.delay_ms -= take;
         return;
     }
     // 引擎 SetFrequency：base*(pitch+256)/512（0→0.5x, 256→1x, 512→1.5x）。
@@ -991,10 +1009,19 @@ fn advance_layer(layer: &mut Layer, delta_ms: f64) {
             // START(+0x128)/RESTART(+0x12c)。
             layer.start_ms = 0;
             layer.restart_ms = 0;
+            layer.delay_ms = 0.0;
             layer.state = PlayState::Stopped;
         } else {
             layer.loop_count = next;
-            layer.set_position(layer.restart_ms);
+            // 负 RESTART 的延迟与 PLAY 起点同型（`0x424424` 累加器分支）：
+            // 数据从字节 0 重灌，延迟以静音区间兑现。
+            if layer.restart_ms < 0 {
+                layer.delay_ms = -layer.restart_ms as f64;
+                layer.set_position(0);
+            } else {
+                layer.delay_ms = 0.0;
+                layer.set_position(layer.restart_ms);
+            }
         }
     }
 }
@@ -1008,6 +1035,54 @@ fn div_round(num: i64, den: i64) -> i64 {
     } else {
         -((-num + den / 2) / den)
     }
+}
+
+/// DATALEFT/DATARIGHT 的帧采样（证据锚点见 `query` 内注释；官方
+/// `0x44fe3c/0x44ff58`）。`right` 时复现官方 16-bit `ptr+4`（下一帧左声道）
+/// 与 8-bit `ptr[1]`（同帧右采样）分支；单声道/格式不符/越界 ⇒ -1。
+fn pcm_data_sample(layer: &Layer, right: bool) -> i64 {
+    let Some(meta) = layer.meta.as_ref() else {
+        return -1;
+    };
+    let Some(pcm) = layer.pcm.as_ref() else {
+        return -1;
+    };
+    // 官方守卫读解码器格式字段（`+0x1ba` CHANNEL / `+0x1c6` BIT）。
+    if !matches!(meta.channels, 1 | 2) || !matches!(meta.bits, 8 | 16) {
+        return -1;
+    }
+    let ch = pcm.channels as usize;
+    let rate = pcm.sample_rate as f64;
+    if rate == 0.0 {
+        return -1;
+    }
+    // 播放光标处的帧号（引擎 `GetCurrentPosition` ⇒ 字节光标；等价换算）。
+    let frame = (layer.playhead_ms * rate / 1000.0).floor() as i64;
+    let frames = pcm.frames() as i64;
+    if frame < 0 || frame >= frames {
+        return -1;
+    }
+    // 官方以 32 位 abs 后截断回 i16：-32768 因回绕仍返回 -32768。
+    let abs16 = |v: i16| -> i64 {
+        i64::from(i32::from(v).wrapping_abs() as i16)
+    };
+    if !right {
+        return abs16(pcm.samples[(frame * ch as i64) as usize]);
+    }
+    if ch == 1 {
+        // 官方：单声道 DATARIGHT = -1。
+        return -1;
+    }
+    if meta.bits == 8 {
+        // 8-bit 立体声：官方读同帧第二采样 `ptr[1]`（锁区内）。
+        return abs16(pcm.samples[(frame * 2 + 1) as usize]);
+    }
+    // 16-bit 立体声：官方读 `word [ptr+4]` = **下一帧的左声道**（锁区外怪癖）。
+    let next = (frame + 1) * 2;
+    if next >= (pcm.samples.len() as i64) {
+        return -1;
+    }
+    abs16(pcm.samples[next as usize])
 }
 
 /// 引擎的文件名归一化（REA `0x45f348`）：ASCII 大写→小写，`\`→`/`。

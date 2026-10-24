@@ -105,7 +105,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `MATH3D` | vm | 1 | — | `0x448900` | ✅ 实现 | 已实现(EVID-J3-03;本表旧口径作废) |
 | `MENUINFO` | menu | 1 | `menu/menuinfo.html` | `0x44a6f4` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `);` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 宏/编译产物残留;运行时同默认槽(DIV-RT-043) |
-| `CDDA` | system | 0 | — | `0x429fb0` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
+| `CDDA` | system | 0 | — | `0x429fb0` | 🔵 aligned-stub | 官方空桩(B6,声音台账 0-9);归类保持现状,诊断 `rt.cmd.aligned_stub` |
 | `CLIPINFO` | graphics | 0 | `clip/clipinfo.html` | `0x43e410` | ✅ 实现 | 读镜像写入 LET;丢弃 `<0x20` 字节(DIV-RT-045) |
 | `COMPILEMODE` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期;运行时同默认槽(DIV-RT-043) |
 | `CSV` | vm | 0 | — | `0x43e640` | ✅ no-op | 官方只做参数求值后返回 0(DIV-RT-046) |
@@ -130,9 +130,9 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `MACRO` | vm | 0 | `other/macro.html` | `0x459e90(默认)` | ✅ 脚本错误槽 | 仅 `macro.yst` 编译期使用;运行时默认槽报脚本错误(DIV-RT-043) |
 | `MENUACT` | menu | 0 | `menu/menuact.html` | `0x44a41c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `MENUEND` | menu | 0 | `menu/menuend.html` | `0x44a5d0` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `MIDI` | sound | 0 | — | `0x44aa40` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `MIDIEND` | sound | 0 | — | `0x44aa60` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `MIDIINFO` | sound | 0 | — | `0x44aa80` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
+| `MIDI` | sound | 0 | — | `0x44aa40` | ➖ 域事件 | 只发 `DomainCall`;官方处理体为空桩 ⇒ aligned-stub(B6,声音台账 0-9),诊断 `rt.cmd.aligned_stub` |
+| `MIDIEND` | sound | 0 | — | `0x44aa60` | ➖ 域事件 | 只发 `DomainCall`;官方处理体为空桩 ⇒ aligned-stub(B6,声音台账 0-9),诊断 `rt.cmd.aligned_stub` |
+| `MIDIINFO` | sound | 0 | — | `0x44aa80` | ➖ 域事件 | 只发 `DomainCall`;官方处理体为空桩 ⇒ aligned-stub(B6,声音台账 0-9),诊断 `rt.cmd.aligned_stub` |
 | `PLUG` | vm | 0 | — | `0x44bd10` | ✅ no-op | 官方只做参数求值后返回 0(DIV-RT-046) |
 | `PREP` | vm | 0 | — | `0x4634d8` | ✅ no-op | 官方 no-op(DIV-RT-043) |
 | `PROJECTFOLDER` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期;运行时同默认槽(DIV-RT-043) |
@@ -301,19 +301,24 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 
 > 台账：`docs/sound-ledger.md`。REA 锚点仍是 0.495 处理体地址；
 > 状态列区分「事件层」与「宿主实现」。
-> 口径注(AU5)：§1 把 MIDI/MIDIEND/MIDIINFO 按事件层记「域事件」，本表按
-> 宿主实现记「⛔ 空桩」——同一事实的两侧口径，非矛盾；`CDDA` 在 `domain_of`
-> 落 `Domain::Other` 而非 `Sound`（归类错位，待一行修）。
+> 口径注(AU5/B6)：§1 把 MIDI/MIDIEND/MIDIINFO 按事件层记「域事件」，本表按
+> 终态记「🔵 aligned-stub」——同一事实的两侧口径，非矛盾；`CDDA` 在 `domain_of`
+> 落 `Domain::Other` 而非 `Sound`（归类错位保留——B6 纪律是行为不变，只改
+> 诊断归属；域归类一行修仍归 B2）。
+> B6（2026-10-24）：SOUNDINFO 增列 `DATALEFT/DATARIGHT` fixed(no-manual)
+> （DIV-SND-001）；`SOUND[SPEED=]` unsupported-by-official（处理体无槽 13
+> 读取点）；ACM WAVE fixed(no-manual)（DIV-SND-004）；负 START/RESTART
+> fixed(Likely)（DIV-SND-002）。
 
 | 命令 | opcode | 运行触发 | 处理器 | 宿主/状态 | 说明 |
 |---|---:|---:|---|---|---|
-| `SOUND` | 87 | 531 | `0x44e1e8` | ✅ `yu-sound` | 层表/装载/参数写回；MIDI/CDDA 除外 |
-| `SOUNDINFO` | 89 | 7,200 | `0x44f4bc` | ✅ `yu-sound` | 装宿主时走 `op_soundinfo` → `SoundHost::query` → `LET`；未装宿主保持 M-2 通用域路径。B1:`LET` 槽事件携带变量引用(query 参数面不变,DIV-RT-042) |
+| `SOUND` | 87 | 531 | `0x44e1e8` | ✅ `yu-sound` | 层表/装载/参数写回；`SPEED`(槽 13) 官方不读 ⇒ 静默忽略(unsupported-by-official)；负 START/RESTART 延迟 fixed(Likely) |
+| `SOUNDINFO` | 89 | 7,200 | `0x44f4bc` | ✅ `yu-sound` | 装宿主时走 `op_soundinfo` → `SoundHost::query` → `LET`；未装宿主保持 M-2 通用域路径。B1:`LET` 槽事件携带变量引用(query 参数面不变,DIV-RT-042)。B6:`DATALEFT/DATARIGHT` fixed(no-manual,`0x44fe3c/0x44ff58`) |
 | `SOUNDEND` | 88 | 1 | `0x44f308` | ✅ `yu-sound` | 删层；随后 `SOUNDINFO[EXIST]=0` |
-| `MIDI` | 67 | 0 | `0x44aa40` | ⛔ Unimplemented | 处理体为空桩；无手册页 |
-| `MIDIEND` | 68 | 0 | `0x44aa60` | ⛔ Unimplemented | 同上 |
-| `MIDIINFO` | 69 | 0 | `0x44aa80` | ⛔ Unimplemented | 同上 |
-| `CDDA` | 0 | 0 | `0x429fb0` | ⛔ Unimplemented | 空桩；无手册页 |
+| `MIDI` | 67 | 0 | `0x44aa40` | 🔵 aligned-stub | 官方空桩,内核同型:域事件照发,诊断 `rt.cmd.aligned_stub`(B6) |
+| `MIDIEND` | 68 | 0 | `0x44aa60` | 🔵 aligned-stub | 同上 |
+| `MIDIINFO` | 69 | 0 | `0x44aa80` | 🔵 aligned-stub | 同上 |
+| `CDDA` | 0 | 0 | `0x429fb0` | 🔵 aligned-stub | 官方空桩;事件行为不变(归类仍在 Other),只改诊断归属(B6) |
 
 回归：不装宿主时 `coverage_census 600 8` 的三条计数与 M-2 一致
 （531 / 7,200 / 1），诊断文案不变。

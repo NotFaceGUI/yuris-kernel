@@ -40,6 +40,9 @@ pub mod fmt {
 pub mod rt {
     /// 未实现/未取证的命令(挂号留痕)。
     pub const CMD_UNIMPLEMENTED: &str = "rt.cmd.unimplemented";
+    /// 官方 0.495 处理体为空桩的命令(MIDI 族 `0x44aa40/60/80`、CDDA
+    /// `0x429fb0`),内核同型对齐(aligned-stub,不计挂号)。
+    pub const CMD_ALIGNED_STUB: &str = "rt.cmd.aligned_stub";
     /// 当前表里不存在的命令号(YSCM 覆盖不到)。
     pub const CMD_UNKNOWN: &str = "rt.cmd.unknown";
     /// 命令窗口数与处理器要求不符。

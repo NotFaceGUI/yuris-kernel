@@ -7,7 +7,8 @@ use yu_log::{Boundary, Diag, Severity};
 
 /// 稳定错误码表（`snd.*` 命名空间）。
 pub mod code {
-    /// 声音域命令未实现/未取证（MIDI/CDDA/未知命令）。
+    /// 声音域命令未实现/未取证（未知命令；MIDI 族/CDDA 是官方空桩
+    /// aligned-stub，不走此码）。
     pub const COMMAND_UNIMPLEMENTED: &str = "snd.command.unimplemented";
     /// 命令名不在工程 ysc 表里。
     pub const COMMAND_UNKNOWN: &str = "snd.command.unknown";
@@ -34,8 +35,6 @@ pub mod code {
     /// 多字段同调时按引擎固定检查顺序写回。
     /// `EXIST..PITCH` 短路；其余字段最后写入者胜出。仅作 Info 记录，不改变行为。
     pub const QUERY_MULTI: &str = "snd.query.multi";
-    /// 负 START/RESTART 的延迟播放语义未完整取证（DIV-SND-002）。
-    pub const DELAY_UNIMPLEMENTED: &str = "snd.delay.unimplemented";
     /// 设备输出未装配（headless 路径不产出音频）。
     pub const DEVICE_ABSENT: &str = "snd.device.absent";
     /// 内部不变量被破坏（应为不可能）。
@@ -59,7 +58,6 @@ pub const ALL_CODES: &[&str] = &[
     code::CODEC_UNSUPPORTED,
     code::QUERY_UNSUPPORTED,
     code::QUERY_MULTI,
-    code::DELAY_UNIMPLEMENTED,
     code::DEVICE_ABSENT,
     code::INTERNAL,
     code::LOG_TRUNCATED,

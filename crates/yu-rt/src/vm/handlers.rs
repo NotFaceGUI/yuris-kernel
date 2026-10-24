@@ -487,18 +487,42 @@ impl Vm {
                         && domain == Domain::Sound
                         && matches!(cmd.name.as_str(), "SOUND" | "SOUNDEND"));
                 if !handled {
-                    self.report_unimplemented(
-                        &cmd.name,
-                        "域命令未接线:语义属宿主域状态机(见任务书 A 的域边界)".to_string(),
-                    );
+                    if matches!(cmd.name.as_str(), "MIDI" | "MIDIEND" | "MIDIINFO") {
+                        // 官方 0.495 处理体是空桩(0x44aa40/0x44aa60/0x44aa80:
+                        // 仅 FUN_00429fd1 守卫后 return 0),无媒体输出;内核
+                        // 同型对齐 —— 域事件照发、不建任何声音状态。
+                        // 终态 aligned-stub(声音台账 0-9/N0-10),不计挂号。
+                        self.report_aligned_stub(
+                            &cmd.name,
+                            "官方 0.495 处理体为空桩(0x44aa40/0x44aa60/0x44aa80),\
+                             同型对齐:只发域事件,无媒体输出(声音台账 N0-10)"
+                                .to_string(),
+                        );
+                    } else {
+                        self.report_unimplemented(
+                            &cmd.name,
+                            "域命令未接线:语义属宿主域状态机(见任务书 A 的域边界)".to_string(),
+                        );
+                    }
                 }
                 Ok(StepOutcome::Continue)
             }
             HandlerKind::Unknown => {
-                self.report_unimplemented(
-                    &cmd.name,
-                    "命令无处理器(手册无页或语义未取证)".to_string(),
-                );
+                if cmd.name == "CDDA" {
+                    // 官方 0.495 `0x429fb0` 是空桩(同 MIDI 族,声音台账 0-9)。
+                    // 事件行为保持不变(CDDA 归类仍落 Unknown、不发域事件),
+                    // 只把诊断归属从「未实现」改为 aligned-stub。
+                    self.report_aligned_stub(
+                        &cmd.name,
+                        "官方 0.495 处理体为空桩(0x429fb0),同型对齐:无媒体输出(声音台账 N0-10)"
+                            .to_string(),
+                    );
+                } else {
+                    self.report_unimplemented(
+                        &cmd.name,
+                        "命令无处理器(手册无页或语义未取证)".to_string(),
+                    );
+                }
                 Ok(StepOutcome::Continue)
             }
         }

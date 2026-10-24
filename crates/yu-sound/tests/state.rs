@@ -30,6 +30,28 @@ fn wav_ms(duration_ms: u32, rate: u32, channels: u16) -> Vec<u8> {
     out.into_inner()
 }
 
+/// 斜坡 WAV：第 i 帧第 ch 声道 = `(i * mult[ch]) as i16`（确定性、无削顶）。
+fn ramp_wav(duration_ms: u32, rate: u32, mults: &[i64]) -> Vec<u8> {
+    let spec = hound::WavSpec {
+        channels: mults.len() as u16,
+        sample_rate: rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let frames = (u64::from(duration_ms) * u64::from(rate) / 1000) as usize;
+    let mut out = Cursor::new(Vec::new());
+    {
+        let mut w = hound::WavWriter::new(&mut out, spec).expect("wav writer");
+        for i in 0..frames {
+            for m in mults {
+                w.write_sample((i as i64 * m) as i16).expect("sample");
+            }
+        }
+        w.finalize().expect("finalize");
+    }
+    out.into_inner()
+}
+
 fn state_with(files: &[(&str, Vec<u8>)]) -> SoundState {
     let mut loader = MemoryLoader::new();
     for (name, bytes) in files {
@@ -710,20 +732,213 @@ fn golden_loop_timeline_and_render_hash() {
 }
 
 #[test]
-fn example5_negative_start_is_explicitly_unimplemented() {
+fn dataleft_dataright_read_play_cursor_frame() {
+    // REA 0x44fe3c/0x44ff58（手册无页，fixed(no-manual)）：
+    // LEFT = 播放光标帧首采样的 |abs|；单声道 RIGHT = -1；
+    // **16-bit 立体声 RIGHT 官方读 `ptr+4` = 下一帧左声道**（越锁区怪癖）。
+    let mut mono = state_with(&[("m.wav", ramp_wav(1000, 1000, &[3]))]);
+    let mut c = cmd("BGM");
+    c.file = Some(b"m.wav".to_vec());
+    c.play = Some(1);
+    mono.apply_sound(&c);
+    assert_eq!(int(&mut mono, "BGM", QueryField::DataLeft), 0);
+    mono.advance_ms(100);
+    // 第 100 帧 = 300。
+    assert_eq!(int(&mut mono, "BGM", QueryField::DataLeft), 300);
+    assert_eq!(int(&mut mono, "BGM", QueryField::DataRight), -1);
+
+    let mut stereo = state_with(&[("s.wav", ramp_wav(1000, 1000, &[3, 7]))]);
+    let mut c = cmd("BGM");
+    c.file = Some(b"s.wav".to_vec());
+    c.play = Some(1);
+    stereo.apply_sound(&c);
+    stereo.advance_ms(100);
+    assert_eq!(int(&mut stereo, "BGM", QueryField::DataLeft), 300);
+    // +4 字节 = 下一帧（101）左声道 = 303；不是同帧右声道 700。
+    assert_eq!(int(&mut stereo, "BGM", QueryField::DataRight), 303);
+
+    // 缺层走引擎缺层分支：LET 写 0（不是 -1）。
+    let mut empty = state_with(&[]);
+    assert_eq!(int(&mut empty, "NOPE", QueryField::DataLeft), 0);
+}
+
+#[test]
+fn acm_wave_roundtrip_through_system_adpcm() {
+    // 官方 `0x422e04` 非 PCM 分支 1:1：宿主 MSACM32 编解码（DIV-SND-004）。
+    // 用系统 MS-ADPCM 编码器把 PCM 压成 CODEC=2 形态，再走 decode() 解回。
+    if !cfg!(windows) {
+        eprintln!("SKIP snd-acm: win32 ACM only");
+        return;
+    }
+    const RATE: u32 = 8000;
+    const MS: u32 = 250;
+    let pcm_ms = wav_ms(MS, RATE, 1);
+    // 源 PCM WAVEFORMATEX（18 字节）。
+    let mut src_fmt: Vec<u8> = Vec::new();
+    src_fmt.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    src_fmt.extend_from_slice(&1u16.to_le_bytes()); // mono
+    src_fmt.extend_from_slice(&(RATE as u16).to_le_bytes());
+    src_fmt.extend_from_slice(&(RATE * 2).to_le_bytes());
+    src_fmt.extend_from_slice(&2u16.to_le_bytes()); // block align
+    src_fmt.extend_from_slice(&16u16.to_le_bytes()); // bits
+    src_fmt.extend_from_slice(&0u16.to_le_bytes()); // cbSize
+    // MS-ADPCM 目标格式（tag=2，blockAlign=128，cbSize=32 扩展含标准系数表）。
+    let coef: [i16; 14] = [256, 0, 512, -256, 0, 0, 192, 64, 240, 0, 460, -208, 392, -232];
+    let block_align: u16 = 128;
+    let samples_per_block: u16 = (block_align - 7) * 2 + 2;
+    let avg_bytes = u32::from(RATE) / u32::from(block_align)
+        * u32::from(samples_per_block)
+        * u32::from(block_align / 2);
+    let mut adpcm_fmt: Vec<u8> = Vec::new();
+    adpcm_fmt.extend_from_slice(&2u16.to_le_bytes());
+    adpcm_fmt.extend_from_slice(&1u16.to_le_bytes()); // mono
+    adpcm_fmt.extend_from_slice(&(RATE as u16).to_le_bytes());
+    adpcm_fmt.extend_from_slice(&avg_bytes.to_le_bytes());
+    adpcm_fmt.extend_from_slice(&block_align.to_le_bytes());
+    adpcm_fmt.extend_from_slice(&4u16.to_le_bytes()); // bits
+    adpcm_fmt.extend_from_slice(&32u16.to_le_bytes()); // cbSize
+    adpcm_fmt.extend_from_slice(&samples_per_block.to_le_bytes());
+    adpcm_fmt.extend_from_slice(&7u16.to_le_bytes()); // wNumCoef
+    for c in coef {
+        adpcm_fmt.extend_from_slice(&c.to_le_bytes());
+    }
+    for c in coef {
+        adpcm_fmt.extend_from_slice(&c.to_le_bytes());
+    }
+    // 取 data chunk（hound 产物按 RIFF 布局找 data）。
+    let data = wav_data_chunk(&pcm_ms).expect("data chunk");
+    let encoded = match yu_sound::acm::convert(&src_fmt, &adpcm_fmt, &data) {
+        Ok(v) => v,
+        Err(d) => {
+            eprintln!("SKIP snd-acm: 系统无 MS-ADPCM 编码器（{d}）");
+            return;
+        }
+    };
+    // 拼回 RIFF WAVE（fmt 40 字节 + data）。
+    let mut wav: Vec<u8> = b"RIFF".to_vec();
+    let riff_size = 4 + 8 + adpcm_fmt.len() + 8 + encoded.len();
+    wav.extend_from_slice(&(riff_size as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&(adpcm_fmt.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&adpcm_fmt);
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&encoded);
+
+    let pcm = decode(b"probe.wav", &wav).expect("acm decode");
+    assert_eq!(pcm.codec, yu_sound::decode::Codec::Acm);
+    assert_eq!(pcm.channels, 1);
+    assert_eq!(pcm.sample_rate, RATE);
+    assert_eq!(pcm.bits, 16);
+    // ADPCM 有损：结构对齐 + 粗粒度保真界（静音会让峰值误差≈12000）。
+    let frame0 = u64::from(MS) * u64::from(RATE) / 1000;
+    let drift_ms = (pcm.frames() as i64 - frame0 as i64).abs() * 1000 / i64::from(RATE);
+    assert!(drift_ms <= 40, "时长漂移过大: {drift_ms}ms");
+    let original = wav_samples_i16(&pcm_ms);
+    let max_err = pcm
+        .samples
+        .iter()
+        .zip(original.iter())
+        .map(|(a, b)| i32::from(*a - *b).unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    assert!(max_err < 6000, "MS-ADPCM 往返误差过大: {max_err}");
+}
+
+/// 从 hound 产物取 `data` chunk 字节。
+fn wav_data_chunk(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut off = 12usize;
+    while off + 8 <= bytes.len() {
+        let id = &bytes[off..off + 4];
+        let size = u32::from_le_bytes([
+            bytes[off + 4],
+            bytes[off + 5],
+            bytes[off + 6],
+            bytes[off + 7],
+        ]) as usize;
+        if id == b"data" {
+            return Some(bytes[off + 8..off + 8 + size].to_vec());
+        }
+        off += 8 + size + (size & 1);
+    }
+    None
+}
+
+fn wav_samples_i16(bytes: &[u8]) -> Vec<i16> {
+    wav_data_chunk(bytes)
+        .expect("data chunk")
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect()
+}
+
+#[test]
+fn example5_negative_start_delays_with_silence() {
+    // 手册例 5（负 START = 遅延再生）+ REA `0x423f9c/0x424424`：延迟以
+    // 静音区间兑现，期间 TIME 冻结在 0、PLAY 保持 1（Likely，DIV-SND-002；
+    // 动态曲线归 DIV-SND-003 校准）。
     let mut s = state_with(&[("abc.wav", wav_ms(5000, 1000, 1))]);
     let mut c = cmd("BGM");
     c.file = Some(b"abc.wav".to_vec());
-    c.start = Some(-10000);
+    c.start = Some(-1000);
     c.play = Some(1);
     s.apply_sound(&c);
-    // 负 START 的延迟语义未取证（DIV-SND-002）：不猜排程，位置停在 0。
-    assert_eq!(int(&mut s, "BGM", QueryField::Start), -10000);
+    assert_eq!(int(&mut s, "BGM", QueryField::Start), -1000);
     assert_eq!(int(&mut s, "BGM", QueryField::Time), 0);
+    assert_eq!(int(&mut s, "BGM", QueryField::Play), 1);
+
+    s.advance_ms(999);
+    assert_eq!(int(&mut s, "BGM", QueryField::Time), 0);
+    s.advance_ms(1); // 延迟恰好烧完；本 tick 不推进位置。
+    assert_eq!(int(&mut s, "BGM", QueryField::Time), 0);
+    s.advance_ms(500);
+    assert_eq!(int(&mut s, "BGM", QueryField::Time), 500);
+    // 延迟是已实现的官方语义，不再产生任何挂号诊断。
+    assert!(!s.diags().iter().any(|d| d.code == "snd.delay.unimplemented"));
+    assert!(s.diags().iter().all(|d| d.severity != yu_log::Severity::Unimplemented));
+}
+
+#[test]
+fn negative_restart_delays_each_loop_wrap() {
+    let mut s = state_with(&[("abc.wav", wav_ms(1000, 1000, 1))]);
+    let mut c = cmd("BGM");
+    c.file = Some(b"abc.wav".to_vec());
+    c.loop_ = Some(0);
+    c.restart = Some(-500);
+    c.play = Some(1);
+    s.apply_sound(&c);
+    // 到 END 边界：LOOPCOUNT+1，RESTART=-500 ⇒ 回 0 并静音 500ms。
     s.advance_ms(1000);
-    assert_eq!(int(&mut s, "BGM", QueryField::Time), 1000);
-    assert!(s
-        .diags()
-        .iter()
-        .any(|d| d.code == "snd.delay.unimplemented"));
+    assert_eq!(int(&mut s, "BGM", QueryField::LoopCount), 1);
+    assert_eq!(int(&mut s, "BGM", QueryField::Time), 0);
+    s.advance_ms(499);
+    assert_eq!(int(&mut s, "BGM", QueryField::Time), 0);
+    s.advance_ms(1);
+    assert_eq!(int(&mut s, "BGM", QueryField::Time), 0);
+    s.advance_ms(250);
+    assert_eq!(int(&mut s, "BGM", QueryField::Time), 250);
+}
+
+#[test]
+fn delay_window_renders_silence_on_device_path() {
+    // 设备路径（render_and_advance：先渲染后推进）在延迟窗口内输出静音。
+    let mut s = state_with(&[("abc.wav", wav_ms(5000, 8000, 1))]);
+    let mut c = cmd("BGM");
+    c.file = Some(b"abc.wav".to_vec());
+    c.start = Some(-1000);
+    c.play = Some(1);
+    s.apply_sound(&c);
+    let mut buf = vec![0.0f32; 800]; // 8000Hz × 800 帧 = 100ms
+    s.render_and_advance(&mut buf, 8000, 1);
+    assert!(buf.iter().all(|v| *v == 0.0), "延迟前 100ms 应为静音");
+    // 烧完剩余 900ms 延迟后再取一块，应已出声。
+    for _ in 0..9 {
+        s.render_and_advance(&mut buf, 8000, 1);
+    }
+    s.render_and_advance(&mut buf, 8000, 1);
+    assert!(
+        buf.iter().any(|v| *v != 0.0),
+        "延迟结束后应恢复出声（本块 TIME={}）",
+        int(&mut s, "BGM", QueryField::Time)
+    );
 }

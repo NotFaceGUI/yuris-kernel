@@ -6121,3 +6121,86 @@ test sdk_0479_loose_directory_indexes_every_file_including_japanese_names ... ok
   SDK 1,424 文件实测零缺口;真游戏命中时再取证(YSCom 输出形态未定)。
 - 台账: DIV-003 → fixed;audit §2 两行划掉;todo-inventory format 行勘误。
 - 本批未触达 yu-sound —— 工作区 `yu-sound` 在途改动属并行批次 B6,与 B5 无关。
+
+## 成果 B6 (2026-10-24) · 声音收口:五项全部落入终态(零 unimplemented)
+
+> 任务:`docs/tasks/roadmap-batches.md` B6。REA 复核 = Ghidra 12.1.4 重开
+> `yu-ris.exe`(sha256 `4f5eefa3…` 与台账一致);关键字节/调用点证据入
+> `docs/sound-ledger.md` §0-11。
+
+### 1. REA 复核结论(全部字节/调用点级)
+
+- **SOUND[SPEED=](槽 13)**:处理体 `0x44e1e8` 只读 `0x684160..0x68416c`
+  (反编译逐槽核对,无 `0x68416d` 引用)⇒ 官方静默忽略 ⇒
+  **unsupported-by-official**:宿主删除 `SoundCommand::speed` 建模,
+  零诊断(DIV-SND-001 定案)。
+- **ACM WAVE(CODEC=2)**:官方 `0x422e04` 的 `fmt tag==1` 走 PCM 直解,
+  **其余全部 tag 走 ACM**;7 个 `acm*` 导入的全部调用点
+  `0x423086..0x4232a4`(IAT 跳板 `0x47f86e..0x47f892`);序列
+  `FormatSuggest(WFORMATTAG)`→`StreamOpen(NONREALTIME)`→`Size`→
+  `PrepareHeader`→一次 `Convert`→`Unprepare`→`Close`,失败=装载失败。
+  手册「不支持」句过时 ⇒ **fixed(no-manual)**:新增
+  `yu-sound/src/acm.rs`(全仓第一个第一方 unsafe:FFI msacm32;crate 级
+  `forbid`→`deny`+模块 `allow`,理由入注释)。
+- **DATALEFT/DATARIGHT 勘误 + 实现**:16-bit 立体声 DATARIGHT 官方读
+  `word [ptr+4]`＝**下一帧左声道**(越 4 字节锁区;旧台账「第二采样」
+  仅对 8-bit `ptr[1]` 成立)⇒ 怪癖 1:1 保留;**fixed(no-manual)**
+  (`state.rs::pcm_data_sample`,-32768 回绕/单声道 -1/守卫全对齐)。
+- **延迟累加器**(`0x423f9c/0x424424` 反编译):`+0x190/+0x194 +=
+  |param|*bps/1000` 按 block align 向下取整;填充从字节 0 重灌 ⇒
+  **fixed(Likely)**:ms 域静音区间 + TIME 冻结 + PLAY 保持 1(DIV-SND-002;
+  动态曲线仍归 DIV-SND-003 校准)。
+- **MIDI 族/CDDA**:空桩(0x44aa40/60/80、0x429fb0)⇒ **aligned-stub**:
+  行为不变(域事件照发/CDDA 归类不动),只改诊断归属——新增
+  `rt.cmd.aligned_stub`(Info、每命令名只报一次、**不计挂号表**,
+  `yu-rt` vm.rs/handlers.rs/code.rs)。
+
+### 2. 验证(原始结果)
+
+```text
+$ cargo test -p yu-sound
+test result: ok. 37 passed; 0 failed        ← 含 golden loop_timeline 不回归
+  新增: 延迟 3 例(TIME 冻结/负 RESTART 循环/设备路径静音块)
+        DATALEFT/DATARIGHT(含 +4 怪癖钉子 303≠700)
+        acm_wave_roundtrip_through_system_adpcm(系统 MS-ADPCM 真实往返)
+
+$ cargo run -q -p yu-rt --example coverage_census -- 600 8
+SOUND 531 / SOUNDINFO 7200 / SOUNDEND 1     ← 与基线逐项一致
+MIDI/CDDA 0;M-2 诊断文案不变(不装宿主)
+合计 7,735,437 vs 10-22 基线 7,735,670:差值来自同树并行改动
+  (B5 折回/CGS revert),B6 不触碰命令计数
+
+$ yu-cli run <project-eris> --frames 60 → exit 0(60 帧,0 资产缺失)
+$ yu-cli --example sound_census(装 SoundHost)
+id=BGM/B1 file=bgm/bgm01.ogg state=Playing time=15500 total=90802
+snd_diags=0
+
+$ cargo test -p yu-rt → lib 66 passed
+  (tests/consistency.rs 4 例失败与 B6 无关:语料散盘 data/ysbin 已被
+   并行改动移除,封包 data.ypf 优先;skip 路径 unreachable! 为既有缺陷)
+```
+
+### 3. 台账划线
+
+- DIV-SND-001 → fixed(SPEED=unsupported-by-official、DATALEFT/DATARIGHT=
+  fixed(no-manual),含 +4 勘误);DIV-SND-002 → fixed(Likely);
+  DIV-SND-004 → fixed(no-manual)(手册勘误留痕)。
+- sound-ledger:§0-9/0-10 补终态、新增 §0-11(四项字节级复核)、N0-3/N0-12
+  改写、§3 槽 13 定案(修正旧记法端点含混)、§7 清单全部落入终态 +
+  §7.1 验收记录。
+- coverage-matrix:§1 CDDA/MIDI×3 行 → aligned-stub;§8 口径注 + SOUND/
+  SOUNDINFO/MIDI 族/CDDA 行更新。
+- PROGRESS:本条。
+
+### 4. 口径与残留
+
+- 延迟 Likely 三项(TIME=0/PLAY=1/输出静音)待 DIV-SND-003 动态样本定论;
+  混音 headless advance-then-render 序列不体现静音区间(设备路径才体现),
+  已在 mixer.rs 注释声明。
+- 8-bit 源的 DATALEFT/DATARIGHT 值域为内核 i16 归一化域(0..32768),非官方
+  缓冲字节域(0..128);语料无 8-bit 音频,16-bit 分支逐位对齐(代码注释留痕)。
+- `snd.codec.unsupported` 码位保留但已无触发点(非 PCM 全走 ACM);0.479
+  等旧版引擎若证实不装 ACM,再按版本分叉处理(无证据,不猜)。
+- 并行干扰留痕:本批进行中的 state.rs/error.rs/decode.rs 曾被外部
+  `git stash`(stash@{0} "parallel-sound-break")移出工作区;已按原样恢复
+  (stash 未消耗)。工作区归主人裁决,零 git 写操作。

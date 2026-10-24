@@ -77,7 +77,10 @@ impl SoundHostTrait for SoundHost {
                                 "VOLUME" => cmd.volume = number(value),
                                 "PAN" => cmd.pan = number(value),
                                 "PITCH" => cmd.pitch = number(value),
-                                "SPEED" => cmd.speed = number(value),
+                                // `SPEED`（0.495 yscm 槽 13）官方 SOUND 处理体
+                                // （`0x44e1e8`）只读 `0x684160..0x68416c`，
+                                // 从不读 `0x68416d` ⇒ 静默忽略（unsupported-
+                                // by-official，DIV-SND-001），落到 `_ => {}`。
                                 _ => {}
                             }
                         }
@@ -110,7 +113,9 @@ impl SoundHostTrait for SoundHost {
 
     fn query(&mut self, command: &str, args: &[ArgValue]) -> Result<Value, Diag> {
         if command != "SOUNDINFO" {
-            return Err(error::unimplemented(
+            // yu-rt 只把 SOUNDINFO 路由到本宿主(handlers.rs 的
+            // `HandlerKind::Domain` 分支);此臂是防御性不变量。
+            return Err(error::recoverable(
                 code::COMMAND_UNIMPLEMENTED,
                 format!("SoundHost 不支持查询 {command}"),
             ));

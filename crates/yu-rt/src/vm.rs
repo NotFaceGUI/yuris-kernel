@@ -408,6 +408,8 @@ pub struct Vm {
     command_enable: Vec<u8>,
     unimplemented_cmds: BTreeMap<String, u64>,
     unimplemented_reported: std::collections::BTreeSet<String>,
+    /// aligned-stub 命令(MIDI 族/CDDA)的「只报一次」去重集。
+    aligned_stub_reported: std::collections::BTreeSet<String>,
     /// 事件队列容量上限(任务书 E R10:长跑不得无界增长)。
     event_capacity: usize,
     /// 因容量上限被丢弃的最旧事件数(可观测,不静默)。
@@ -595,6 +597,7 @@ impl Vm {
             command_enable: vec![1u8; 128],
             unimplemented_cmds: BTreeMap::new(),
             unimplemented_reported: std::collections::BTreeSet::new(),
+            aligned_stub_reported: std::collections::BTreeSet::new(),
             event_capacity: DEFAULT_EVENT_CAPACITY,
             events_dropped: 0,
             cur_script: script_id,
@@ -1492,6 +1495,19 @@ impl Vm {
         *self.unimplemented_cmds.entry(name.to_string()).or_insert(0) += 1;
         if self.unimplemented_reported.insert(name.to_string()) {
             self.report(diag::cmd_unimplemented(name, detail));
+        }
+    }
+
+    /// aligned-stub 命令(MIDI 族 `0x44aa40/60/80`、CDDA `0x429fb0`):
+    /// 官方 0.495 处理体是空桩,内核同型对齐 —— **不计挂号表**(它不是
+    /// 未实现),只以 Info 诊断标注归属,每个命令名只报一次(事件流不刷屏)。
+    pub(crate) fn report_aligned_stub(&mut self, name: &str, detail: String) {
+        if self.aligned_stub_reported.insert(name.to_string()) {
+            self.report(diag::info(
+                code::rt::CMD_ALIGNED_STUB,
+                Boundary::Script,
+                format!("{name}: {detail}"),
+            ));
         }
     }
 

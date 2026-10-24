@@ -93,8 +93,21 @@ fn mix_layer(layer: &Layer, out: &mut [f32], frames: usize, out_rate: u32, chann
     let restart_ms = layer.restart_ms().max(0) as f64;
     let mut pos_ms = layer.playhead_ms();
     let step_ms = 1000.0 / out_rate as f64;
+    // 延迟窗口（`+0x190/+0x194`）＝按字节填充的静音区间（Likely，DIV-SND-002）：
+    // 本块开头 floor(剩余延迟×rate/1000) 帧保持静音且不推进位置。
+    // 注意：设备路径 `render_and_advance` 是先渲染后推进，延迟在本块内可见；
+    // headless 的 advance-then-render 序列会先烧掉延迟，静音区间不体现在
+    // 该路径的渲染输出（TIME 查询语义不受影响）。
+    let silent_frames = if layer.delay_ms() > 0.0 {
+        ((layer.delay_ms() * f64::from(out_rate) / 1000.0).floor() as usize).min(frames)
+    } else {
+        0
+    };
 
     for f in 0..frames {
+        if f < silent_frames {
+            continue;
+        }
         // 循环边界（与状态机相同的 END/RESTART 规则；只在本块内回绕）。
         if end_ms > 0.0 && pos_ms >= end_ms {
             pos_ms = restart_ms;

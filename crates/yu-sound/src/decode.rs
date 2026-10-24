@@ -1,17 +1,22 @@
-//! 解码：OGG Vorbis（lewton）与 RIFF WAVE PCM（hound）。
+//! 解码：OGG Vorbis（lewton）、RIFF WAVE PCM（hound）与 ACM WAVE
+//! （win32 ACM 转换，`acm` 模块）。
 //!
 //! 证据：
 //! - 手册 `sound/sound.html`：可播放 OGG/WAVE；“特殊コーデック形式の WAVE
-//!   には対応していません”。
+//!   には対応していません”。**该「不支持」句系过时**：REA 证明 0.495 对
+//!   非 PCM WAVE 完整走 ACM 转换链（`0x422e04` else 分支），终态按
+//!   fixed(no-manual) 实现并标注（DIV-SND-004）。
 //! - 0.495 `yu-ris.exe`：静态链接 `vorbis`/`vorbisfile`（字符串 `vorbis`
-//!   @ `0x5b8e5c`）；WAVE 普通 PCM 走 `mmio*`，非 PCM 走 ACM
-//!   （`acmStreamOpen`/`acmFormatSuggest`/…）。
+//!   @ `0x5b8e5c`）；WAVE `fmt tag == 1` 走 PCM 直解，**其余全部 tag
+//!   （含 3=float、0xFFFE=extensible）走 ACM**：`acmFormatSuggest(NULL,
+//!   src, dst=PCM, 0x12, ACM_FORMATSUGGESTF_WFORMATTAG)` → `acmStreamOpen
+//!   (…, NONREALTIME)` → `acmStreamSize` → `PrepareHeader` → `Convert`
+//!   （整块一次）→ `Unprepare` → `Close`，`+0x107` 写 2；任一步失败 =
+//!   装载失败（返回负错误码，层保持旧元数据）。7 个 ACM 导入的全部调用点
+//!   都在该函数内（`0x423086..0x4232a4`，IAT 跳板 `0x47f86e..0x47f892`）。
 //! - CODEC 取值（手册）：`0=WAVE / 1=OGG / 2=ACM WAVE`；REA 侧内部字段
 //!   `+0x107` 的写入点：OGG `0x422ab0` 写 1，PCM WAVE `0x422e04` 写 0，
 //!   ACM 分支写 2。
-//!
-//! ACM WAVE 在 0.495 里由 ACM 转换后再播放；本 crate **不实现 ACM**
-//! （缺 N0 级证据），返回 [`crate::error::code::CODEC_UNSUPPORTED`]。
 
 use std::io::Cursor;
 
@@ -64,8 +69,9 @@ impl Pcm {
     }
 }
 
-/// 走 RIFF chunk 链找 `fmt `，不假设它是第一个 chunk（JUNK/LIST 前置也成立）。
-fn wav_format_tag(bytes: &[u8]) -> Option<u16> {
+/// 走 RIFF chunk 链找指定 chunk（`fmt `/`data`），不假设它是第一个 chunk
+/// （JUNK/LIST 前置也成立）。返回 chunk 数据区的 `(偏移, 长度)`。
+fn wav_chunk(bytes: &[u8], want: &[u8; 4]) -> Option<(usize, usize)> {
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return None;
     }
@@ -79,11 +85,11 @@ fn wav_format_tag(bytes: &[u8]) -> Option<u16> {
             bytes[off + 7],
         ]) as usize;
         let data = off + 8;
-        if id == b"fmt " && size >= 2 && data + 2 <= bytes.len() {
-            return Some(u16::from_le_bytes([bytes[data], bytes[data + 1]]));
+        if id == want && data + size <= bytes.len() {
+            return Some((data, size));
         }
         // 防 0 长度 chunk 造成死循环；RIFF 的 chunk 按偶数字节对齐。
-        if size == 0 && id != b"fmt " {
+        if size == 0 && id != want {
             off += 8;
         } else {
             off = data.saturating_add(size).saturating_add(size & 1);
@@ -100,7 +106,7 @@ pub fn decode(name: &[u8], bytes: &[u8]) -> Result<Pcm, Diag> {
     if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
         return decode_wav(name, bytes);
     }
-    Err(error::unimplemented(
+    Err(error::recoverable(
         code::DECODE_FAILED,
         format!(
             "无法识别的声音容器（{} 字节；只取证 OGG/RIFF WAVE）",
@@ -151,28 +157,39 @@ fn decode_ogg(name: &[u8], bytes: &[u8]) -> Result<Pcm, Diag> {
 }
 
 fn decode_wav(name: &[u8], bytes: &[u8]) -> Result<Pcm, Diag> {
-    let tag = wav_format_tag(bytes);
-    // 1 = PCM, 3 = IEEE float, 0xFFFE = extensible（交由 hound 判子格式）。
-    if let Some(tag) = tag {
-        if tag != 1 && tag != 3 && tag != 0xFFFE {
-            return Err(error::unimplemented(
-                code::CODEC_UNSUPPORTED,
-                format!(
-                    "WAVE 格式 0x{tag:04x}({}) 不在取证范围；ACM WAVE(CODEC=2)未实现",
-                    display(name)
-                ),
-            ));
+    // 官方 WAVE 装载（`0x422e04`）：`fmt tag == 1` 走 PCM 直解；
+    // **其余全部 tag（含 3=float、0xFFFE=extensible）走 ACM 转换**，
+    // 转换失败 = 装载失败（层保持旧元数据，N0-8）。手册的「不支持」句过时。
+    match wav_chunk(bytes, b"fmt ") {
+        Some((off, len)) if len >= 2 => {
+            let tag = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+            if tag == 1 {
+                decode_wav_pcm(name, bytes)
+            } else {
+                let (data_off, data_len) = wav_chunk(bytes, b"data").ok_or_else(|| {
+                    error::recoverable(
+                        code::DECODE_FAILED,
+                        format!("WAVE 缺 data chunk({});官方 -0x2760 同型失败", display(name)),
+                    )
+                })?;
+                crate::acm::decode_acm_wave(name, &bytes[off..off + len], &bytes[data_off..data_off + data_len])
+            }
         }
+        // 无 `fmt `：官方 `mmioDescend` 失败（-0x274c）。交 hound 产出
+        // 同型失败诊断（保持既有文案路径）。
+        _ => decode_wav_pcm(name, bytes),
     }
+}
+
+fn decode_wav_pcm(name: &[u8], bytes: &[u8]) -> Result<Pcm, Diag> {
     let mut reader = match hound::WavReader::new(Cursor::new(bytes)) {
         Ok(reader) => reader,
+        // 仅 tag==1 到达此路（非 PCM 已走 ACM）；hound 拒收即 PCM 形态
+        // 越界（如非法位深）＝解码失败，非「未实现」。
         Err(hound::Error::Unsupported) => {
-            return Err(error::unimplemented(
-                code::CODEC_UNSUPPORTED,
-                format!(
-                    "WAVE 编码不受支持({})；ACM WAVE(CODEC=2)未实现",
-                    display(name)
-                ),
+            return Err(error::recoverable(
+                code::DECODE_FAILED,
+                format!("WAVE 编码不受支持({})", display(name)),
             ));
         }
         Err(e) => {
