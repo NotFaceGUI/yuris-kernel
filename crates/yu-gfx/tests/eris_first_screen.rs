@@ -76,7 +76,9 @@ fn eris_first_screen_display_list() {
     // 现双模式都能进 title(ES.TITLE.LOOP 两模式都在 frame 126)。
     // golden 文件是 false 模式锚点(§9.1 像素对照在该模式完成);
     // debug 模式走独立 census 断言(本函数 debug 分支),不比对 golden 文件。
-    let debug_mode = std::env::var("YURIS_DEBUG_MODE").map(|v| v == "1").unwrap_or(false);
+    let debug_mode = std::env::var("YURIS_DEBUG_MODE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let cfg = BootConfig {
         entry_label: "SYSTEM_START".to_string(),
         fps: 60,
@@ -318,7 +320,9 @@ fn eris_first_screen_with_synchronous_info_queries() {
         Box::new(DirSource::open(format!("{root}/data"), Codec::Cp932).expect("data"))
     };
     let aux = DirSource::open(&root, Codec::Cp932).expect("project");
-    let debug_mode = std::env::var("YURIS_DEBUG_MODE").map(|v| v == "1").unwrap_or(false);
+    let debug_mode = std::env::var("YURIS_DEBUG_MODE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let cfg = BootConfig {
         entry_label: "SYSTEM_START".to_string(),
         fps: 60,
@@ -357,7 +361,11 @@ fn eris_first_screen_with_synchronous_info_queries() {
         (272, 8, 82, 80, 85)
     };
     assert_eq!(f.layers.len(), layers, "layers");
-    assert_eq!(f.layers.iter().filter(|l| l.visible).count(), visible, "visible");
+    assert_eq!(
+        f.layers.iter().filter(|l| l.visible).count(),
+        visible,
+        "visible"
+    );
     // 1 屏 + 组离屏 + 纹理 pass(69 copy + 11 image = false;debug 另有调试窗)。
     //
     // false 模式 69 条 copy = 1 条主组 `CGS100` + 68 条按钮状态快照;后者的源
@@ -369,7 +377,10 @@ fn eris_first_screen_with_synchronous_info_queries() {
         .iter()
         .filter(|p| matches!(p.target, yu_gfx::PassTarget::Texture(_)))
         .count();
-    assert_eq!(texture_passes, tex_passes, "texture passes (copies + images)");
+    assert_eq!(
+        texture_passes, tex_passes,
+        "texture passes (copies + images)"
+    );
     assert_eq!(
         f.passes.iter().map(|p| p.ops.len()).sum::<usize>(),
         total_ops,
@@ -423,7 +434,9 @@ fn empty_image_ext_order_is_rejected_not_defaulted() {
         record_events: false,
         // 本用例主题 = image_ext_order 拒绝构造,与 debug 分支无关;
         // 仍走环境门控(与全文件一致)。
-        debug_mode: std::env::var("YURIS_DEBUG_MODE").map(|v| v == "1").unwrap_or(false),
+        debug_mode: std::env::var("YURIS_DEBUG_MODE")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         ..BootConfig::default()
     };
     let vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).expect("boot");
@@ -515,6 +528,12 @@ fn eris_first_screen_debug_mode_draws_and_reaches_title() {
         .scheduler()
         .main_node()
         .expect("SYSTEM 主任务在 debug 模式下必须存活");
-    assert_eq!(main.script_id, 8, "SYSTEM task must be in the s8 state loop");
-    assert!(last_visible > 0, "debug mode must keep visible layers (出帧)");
+    assert_eq!(
+        main.script_id, 8,
+        "SYSTEM task must be in the s8 state loop"
+    );
+    assert!(
+        last_visible > 0,
+        "debug mode must keep visible layers (出帧)"
+    );
 }

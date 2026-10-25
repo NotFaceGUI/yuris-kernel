@@ -2,7 +2,6 @@
 //!
 //! 用法: `dump_pc_cmds <sid> <pc_start> <pc_end>`
 //! 载荷指令流按 `[op, u16le len, data[len]]` 逐条解码(与 expr.rs RawInstr 同构)。
-use yu_rt::input::InputTimeline;
 use yu_rt::{BootConfig, Vm};
 use yu_vfs::{Codec, DataSource, DirSource};
 

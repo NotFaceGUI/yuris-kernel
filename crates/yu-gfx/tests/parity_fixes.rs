@@ -429,10 +429,7 @@ fn window_cgid_selects_main_layer_set_and_e_zero_hides_screen() {
     // 主组直绘(DIV-GFX-008/041):CGID 指定的主组不再包成 Group op,
     // 它的子层直接进屏幕 pass。
     assert!(
-        screen(&f)
-            .ops
-            .iter()
-            .all(|op| !matches!(op, Op::Group(_))),
+        screen(&f).ops.iter().all(|op| !matches!(op, Op::Group(_))),
         "main layer set must be drawn directly"
     );
     assert!(

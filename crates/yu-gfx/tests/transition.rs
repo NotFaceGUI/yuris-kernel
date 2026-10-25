@@ -247,7 +247,10 @@ fn transition_uses_layer_state_not_layer_names() {
         .iter()
         .find(|l| l.id.display() == ":/W0/VIS")
         .expect("VIS layer");
-    assert_eq!(vis.image_size().map(|s| (s.width, s.height)), Some((800, 600)));
+    assert_eq!(
+        vis.image_size().map(|s| (s.width, s.height)),
+        Some((800, 600))
+    );
 }
 
 #[test]
@@ -298,7 +301,10 @@ fn group_tid_emits_transition_from_offscreen() {
             _ => None,
         })
         .expect("group transition");
-    assert_eq!(op.from, TextureRef::Offscreen(LayerId::new(b":/W0/G".to_vec())));
+    assert_eq!(
+        op.from,
+        TextureRef::Offscreen(LayerId::new(b":/W0/G".to_vec()))
+    );
     assert_eq!(op.to, Some(TextureRef::Asset(b"b".to_vec())));
     assert!(!f
         .passes

@@ -29,18 +29,36 @@ fn main() {
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(src, Some(Box::new(aux)), cfg).unwrap();
-    let viewport = Viewport::new(vm.tables().boot.config.width, vm.tables().boot.config.height);
-    let state = Rc::new(RefCell::new(GfxState::from_tables(vm.tables(), GfxConfig::new(viewport)).unwrap()));
+    let viewport = Viewport::new(
+        vm.tables().boot.config.width,
+        vm.tables().boot.config.height,
+    );
+    let state = Rc::new(RefCell::new(
+        GfxState::from_tables(vm.tables(), GfxConfig::new(viewport)).unwrap(),
+    ));
     vm.set_graphics_host(Box::new(GfxHost::new(state.clone())));
     let timeline = InputTimeline::new();
-    let ticks: u32 = env::args().nth(1).and_then(|v| v.parse().ok()).unwrap_or(20);
+    let ticks: u32 = env::args()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
     for tick in 0..ticks {
         vm.tick_at(tick * 16, &timeline);
         for ev in vm.take_events() {
-            if let VmEvent::DomainCall { frame, name, args, .. } = &ev {
+            if let VmEvent::DomainCall {
+                frame, name, args, ..
+            } = &ev
+            {
                 if name == "CG" || name == "CGACT" || name == "CGEND" {
-                    let text = args.iter().map(|a| format!("{}={}", a.slot, a.value.to_event_repr())).collect::<Vec<_>>().join(" ");
-                    if text.contains("SPL") || text.contains("logo") || (name == "CGACT" && (text.contains("64=") || text.contains("65="))) {
+                    let text = args
+                        .iter()
+                        .map(|a| format!("{}={}", a.slot, a.value.to_event_repr()))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if text.contains("SPL")
+                        || text.contains("logo")
+                        || (name == "CGACT" && (text.contains("64=") || text.contains("65=")))
+                    {
                         println!("tick {tick} frame {frame} {name} {text}");
                     }
                 }
