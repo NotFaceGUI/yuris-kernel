@@ -31,7 +31,7 @@
 
 use std::path::Path;
 
-use yu_cli::json::{self, Value};
+use yu_engine::json::{self, Value};
 
 /// 脚本里的一条动作。
 #[derive(Clone, Debug, PartialEq)]

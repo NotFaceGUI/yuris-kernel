@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use yu_cli::engine::{Engine, FrameReport};
+use yu_engine::engine::{Engine, FrameReport};
 use yu_log::{Diag, Loc, Severity};
 
 /// 面板最多显示多少条挂号(按最近帧排序)。

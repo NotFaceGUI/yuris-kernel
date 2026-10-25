@@ -3,18 +3,15 @@ name = "yu-host-desktop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Native desktop host: winit window + wgpu presenter + egui debug UI"
+description = "Native desktop host: winit window + wgpu presenter + egui debug UI + cpal audio out"
 
 [lib]
 name = "yu_host_desktop"
 path = "src/lib.rs"
 
-[[bin]]
-name = "yu-desktop"
-path = "src/main.rs"
-
 [dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
+cpal = "0.15"
 egui = { version = "0.37", features = ["default_fonts"] }
 egui-wgpu = "0.37"
 egui-winit = "0.37"
@@ -24,7 +21,13 @@ wgpu = "30.0.1"
 winit = "0.30"
 yu-backend-soft = { path = "../../yu-render/soft" }
 yu-backend-wgpu = { path = "../../yu-render/wgpu" }
-yu-cli = { path = "../../yu-cli" }
+yu-engine = { path = "../../yu-engine" }
 yu-log = { path = "../../yu-log" }
 yu-platform-input = { path = "../input" }
 yu-rt = { path = "../../yu-rt" }
+yu-sound = { path = "../../yu-sound" }
+
+# serve_probe 示例复用 CLI 的 WS 客户端(dev 依赖允许与 yu-cli → 本 crate 的
+# desktop feature 构成环;仅示例/测试编译时生效)。
+[dev-dependencies]
+yu-cli = { path = "../../yu-cli", default-features = false }

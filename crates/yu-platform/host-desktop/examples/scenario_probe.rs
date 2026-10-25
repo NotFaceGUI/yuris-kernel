@@ -32,9 +32,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use yu_cli::engine::{Backend, Engine, EngineOptions};
-use yu_cli::json::{self, Value};
-use yu_cli::project::Project;
+use yu_engine::engine::{Backend, Engine, EngineOptions};
+use yu_engine::json::{self, Value};
+use yu_engine::project::Project;
 use yu_rt::input::{InputFrame, InputTimeline};
 
 fn main() {
@@ -131,7 +131,7 @@ fn run() -> Result<(), String> {
             ledger.closes += 1;
         }
         let rendered = engine.tick().map_err(|e| e.message)?;
-        let sha = yu_cli::sha::sha256_hex(&rendered.surface.rgba);
+        let sha = yu_engine::sha::sha256_hex(&rendered.surface.rgba);
         let report = &rendered.report;
         ledger.observe(
             report.frame,
@@ -472,7 +472,7 @@ fn summarize(
     scenario: &Scenario,
     ledger: &Ledger,
     shots: &[ShotNote],
-    report: &yu_cli::engine::FrameReport,
+    report: &yu_engine::engine::FrameReport,
     final_sha: String,
     main_finished: bool,
     script_errors: &[String],

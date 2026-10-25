@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/yu-cli",
+    "crates/yu-engine",
     "crates/yu-font",
     "crates/yu-format",
     "crates/yu-gfx",

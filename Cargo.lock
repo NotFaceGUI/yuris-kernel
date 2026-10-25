@@ -4069,7 +4069,26 @@ dependencies = [
 name = "yu-cli"
 version = "0.1.0"
 dependencies = [
- "cpal",
+ "log",
+ "wgpu",
+ "yu-backend-soft",
+ "yu-backend-wgpu",
+ "yu-engine",
+ "yu-gfx",
+ "yu-host-desktop",
+ "yu-log",
+ "yu-platform-input",
+ "yu-rt",
+ "yu-save",
+ "yu-sound",
+ "yu-trace",
+ "yu-vfs",
+]
+
+[[package]]
+name = "yu-engine"
+version = "0.1.0"
+dependencies = [
  "log",
  "sha1",
  "sha2",
@@ -4078,11 +4097,9 @@ dependencies = [
  "yu-backend-wgpu",
  "yu-gfx",
  "yu-log",
- "yu-platform-input",
  "yu-rt",
  "yu-save",
  "yu-sound",
- "yu-trace",
  "yu-vfs",
 ]
 
@@ -4123,6 +4140,7 @@ name = "yu-host-desktop"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "cpal",
  "egui",
  "egui-wgpu",
  "egui-winit",
@@ -4133,9 +4151,11 @@ dependencies = [
  "yu-backend-soft",
  "yu-backend-wgpu",
  "yu-cli",
+ "yu-engine",
  "yu-log",
  "yu-platform-input",
  "yu-rt",
+ "yu-sound",
 ]
 
 [[package]]

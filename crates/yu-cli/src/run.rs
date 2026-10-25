@@ -1,4 +1,4 @@
-//! `yu-cli run`:桌面 headless 入口(与 `first_frame` 示例同一条链)。
+//! `yu-cli run`:跑工程 —— 缺省 headless;`--mode desktop` 开原生窗口。
 
 use std::path::{Path, PathBuf};
 
@@ -9,7 +9,37 @@ use crate::project::Project;
 use crate::{CliResult, Failure};
 
 pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
+    // 模式先行(2026-10-25 架构 v2,H3):--mode desktop 时整条命令行交给
+    // 桌面宿主解析。参数按模式解耦:桌面旗标在 headless 下会被
+    // `finish()` 显式报「未知参数」,反之亦然 —— 写错边不会静默生效。
+    let mut probe = ArgReader::new(tokens.clone());
+    if let Some(mode) = probe.flag("mode") {
+        match mode.as_str() {
+            "headless" | "" => {}
+            "desktop" => {
+                #[cfg(feature = "desktop")]
+                {
+                    return crate::desktop::from_args(tokens);
+                }
+                #[cfg(not(feature = "desktop"))]
+                {
+                    return Err(Failure::usage(
+                        "本构建未启用 desktop feature(--no-default-features);\
+                         桌面窗口请用默认 feature 构建",
+                    ));
+                }
+            }
+            other => {
+                return Err(Failure::usage(format!(
+                    "--mode 只接受 headless|desktop,收到 `{other}`"
+                )))
+            }
+        }
+    }
+    // headless 路径:probe 已确认 `--mode`(显式 headless 或空值),这里
+    // 在正式解析器里同样消费掉,避免 `finish()` 把它当未知旗标报错。
     let mut args = ArgReader::new(tokens);
+    let _ = args.flag("mode");
     let root = args
         .positional(0)
         .ok_or_else(|| Failure::usage("用法: yu-cli run <project-root> [...]"))?;

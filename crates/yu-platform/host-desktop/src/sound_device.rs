@@ -1,4 +1,4 @@
-//! 设备输出（默认 `device` feature）。
+//! 桌面宿主的音频输出(cpal;实现 `yu_engine::engine::AudioOut` 端口)。
 //!
 //! **音频线程是时钟**：cpal 回调直接锁 `Arc<Mutex<SoundState>>` 渲染,并按
 //! 实际输出帧数推进播放头。主线程只应用 SOUND 命令/查询,不生产 PCM。
@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use yu_engine::engine::AudioOut;
 use yu_sound::SoundState;
 
 /// 可热替换的状态槽：restart 时换入新 `SoundState`，不重开设备。
@@ -76,6 +77,21 @@ fn render_u16(
     }
 }
 
+impl AudioOut for SoundSink {
+    /// 换入新的声音状态。旧状态在回调下一次取槽后自然释放。
+    ///
+    /// 同时标记外部时钟:VM 的 `advance(now_ms)` 只更新时钟,层位置由
+    /// 本回调按精确帧数推进。
+    fn attach(&mut self, state: Arc<Mutex<SoundState>>) {
+        state.lock().unwrap().set_external_clock(true);
+        *self.slot.lock().unwrap() = Some(state);
+    }
+
+    /// 静音(restart 的 boot 期间)。
+    fn detach(&mut self) {
+        *self.slot.lock().unwrap() = None;
+    }
+}
 impl SoundSink {
     pub fn open() -> Result<Self, String> {
         let host = cpal::default_host();
@@ -140,19 +156,5 @@ impl SoundSink {
             slot,
             _stream: stream,
         })
-    }
-
-    /// 换入新的声音状态。旧状态在回调下一次取槽后自然释放。
-    ///
-    /// 同时标记外部时钟:VM 的 `advance(now_ms)` 只更新时钟,层位置由
-    /// 本回调按精确帧数推进。
-    pub fn attach(&self, state: Arc<Mutex<SoundState>>) {
-        state.lock().unwrap().set_external_clock(true);
-        *self.slot.lock().unwrap() = Some(state);
-    }
-
-    /// 静音(restart 的 boot 期间)。
-    pub fn detach(&self) {
-        *self.slot.lock().unwrap() = None;
     }
 }

@@ -22,9 +22,9 @@
 
 use std::path::Path;
 
-use yu_cli::engine::{Backend, Engine, EngineOptions};
-use yu_cli::project::Project;
-use yu_cli::sha::sha256_hex;
+use yu_engine::engine::{Backend, Engine, EngineOptions};
+use yu_engine::project::Project;
+use yu_engine::sha::sha256_hex;
 
 fn project() -> Option<Project> {
     let root = std::env::var_os("YURIS_SAMPLE_ERIS_ROOT")?;

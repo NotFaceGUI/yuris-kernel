@@ -248,7 +248,7 @@ fn open_ypf(path: &Path) -> Result<YpfSource, Failure> {
         .map_err(|d| Failure::runtime(format!("打开 {} 失败: {d}", path.display())))
 }
 
-pub(crate) fn json_escape(value: &str) -> String {
+pub fn json_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {

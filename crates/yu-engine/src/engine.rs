@@ -1,7 +1,8 @@
-//! 原生引擎宿主:boot、帧循环、输入、重启、渲染。
+//! 引擎装配:boot、帧循环、输入、重启、渲染。
 //!
-//! 读取与执行都在本进程;`yu-cli run` / `serve` / `case` / `bench` 共用这一份
-//! 装配,保证「浏览器里看到的数字」与 native 报告同源。
+//! 所有宿主(`yu-cli` headless / `--mode desktop`、未来 wasm 与 Android)共用
+//! 这一份装配;平台设备(音频输出)经 [`AudioOut`] 端口注入,默认 `None`
+//! = headless 静音。
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
@@ -20,12 +21,25 @@ use yu_gfx::{
 use yu_rt::input::{InputFrame, InputTimeline};
 use yu_rt::{BootConfig, Vm};
 use yu_save::{SaveHost, SaveState};
-#[cfg(feature = "device")]
-mod sound_device;
 use yu_sound::{SoundHost, SoundLoader, SoundState};
 
 use crate::project::{Project, CODEC};
 use crate::{CliResult, Failure};
+
+/// 平台音频出口(L1 端口,2026-10-25 架构 v2)。
+///
+/// 混音仍在 `yu-sound`(`SoundState::render_and_advance`,逐样本一致);
+/// 本端口只负责「PCM 送到哪个设备」(桌面 cpal;headless/用例不注入)。
+/// 回调线程是声音时钟(实现方在 attach 时启用外部时钟模式)。
+///
+/// 不要求 `Send`:`Engine` 自身含 `Rc`(非 Send),端口随引擎留在宿主线;
+/// cpal 的 `Stream` 在部分平台刻意 `!Send`,同一线程持有正符合其契约。
+pub trait AudioOut {
+    /// 换入新的声音状态(restart 后由引擎重挂)。
+    fn attach(&mut self, state: Arc<Mutex<SoundState>>);
+    /// 静音(restart 的 boot 期间)。
+    fn detach(&mut self);
+}
 
 /// 实时 tick 的默认单步上限(引擎 `tick_realtime`)。
 ///
@@ -309,9 +323,8 @@ pub struct Engine {
     save_host: Option<SaveHost>,
     /// 已从声音宿主取走的诊断（`take_sound_diags` 的暂存）。
     sound_diags: Vec<yu_log::Diag>,
-    /// 设备输出（默认 `device` feature；`--no-default-features` 时无此字段）。
-    #[cfg(feature = "device")]
-    sound_sink: Option<sound_device::SoundSink>,
+    /// 平台音频出口(宿主经 [`Engine::attach_audio`] 注入;`None` = 静音)。
+    audio: Option<Box<dyn AudioOut>>,
     /// 实时墙钟：`serve` 的 `tick_realtime` 用它推进逻辑/声音时间。
     realtime_last: Instant,
     /// 单次 `tick_realtime` 允许推进的逻辑毫秒上限(默认 500)。
@@ -346,22 +359,6 @@ pub struct Engine {
 impl Engine {
     pub fn new(project: Project, opts: EngineOptions) -> CliResult<Self> {        let boot_started = Instant::now();
         let (vm, state, sound, save_host, viewport, probe_order) = boot(&project, &opts)?;
-        #[cfg(feature = "device")]
-        let sound_sink = if sound.is_some() {
-            match sound_device::SoundSink::open() {
-                Ok(sink) => Some(sink),
-                Err(e) => {
-                    crate::output::error(format!("[sound] 设备输出未启用: {e}"));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        #[cfg(feature = "device")]
-        if let (Some(sink), Some(sound)) = (&sound_sink, &sound) {
-            sink.attach(Arc::clone(sound));
-        }
         let boot_ms = boot_started.elapsed().as_secs_f64() * 1000.0;
 
         let renderer_started = Instant::now();
@@ -421,8 +418,7 @@ impl Engine {
             sound,
             save_host,
             sound_diags: Vec::new(),
-            #[cfg(feature = "device")]
-            sound_sink,
+            audio: None,
             realtime_last: Instant::now(),
             max_step_ms: DEFAULT_MAX_STEP_MS,
             realtime_us: 0,
@@ -446,6 +442,15 @@ impl Engine {
             events_drained: 0,
             main_finished: false,
         })
+    }
+
+    /// 注入平台音频出口(桌面宿主在 `Engine::new` 后调用;headless 不调)。
+    /// 立即挂接当前声音状态;之后的 `restart` 自动重挂。
+    pub fn attach_audio(&mut self, mut audio: Box<dyn AudioOut>) {
+        if let Some(sound) = &self.sound {
+            audio.attach(Arc::clone(sound));
+        }
+        self.audio = Some(audio);
     }
 
     pub fn viewport(&self) -> Viewport {
@@ -1065,9 +1070,8 @@ impl Engine {
         self.realtime_last = Instant::now();
         self.realtime_us = 0;
         self.realtime_last_ms = 0;
-        #[cfg(feature = "device")]
-        if let Some(sink) = &self.sound_sink {
-            sink.detach();
+        if let Some(audio) = &mut self.audio {
+            audio.detach();
         }
         let started = Instant::now();
         let (vm, state, sound, save_host, viewport, _) = boot(&self.project, &self.opts)?;
@@ -1076,9 +1080,8 @@ impl Engine {
         self.state = Some(state);
         self.sound = sound;
         self.save_host = save_host;
-        #[cfg(feature = "device")]
-        if let (Some(sink), Some(sound)) = (&self.sound_sink, &self.sound) {
-            sink.attach(Arc::clone(sound));
+        if let (Some(audio), Some(sound)) = (&mut self.audio, &self.sound) {
+            audio.attach(Arc::clone(sound));
         }
         self.viewport = viewport;
         self.renderer.reset();

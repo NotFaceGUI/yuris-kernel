@@ -7301,3 +7301,52 @@ yu-cli serve <root> --font "MS Gothic"
 判据修正:`halfwidth_is_monospace` → `fullwidth_is_monospace`,
 样本由半角 `A/i/m/W/0/.` 改为全角 `あ/ア/機/４/Ｅ/－/ｍ/ッ`
 (脚本公式针对的是全角等宽假设;半角判据会误判)。
+
+## 成果 ARCH-H1H3 (2026-10-25) · 架构 v2 快速重构落地:桌面并入 CLI + 引擎装配抽 crate + 声音下沉平台
+
+主人指示:新平台只预留不实现,当前只做桌面;启动参数按模式解耦;补全 help。
+
+- **H1 抽 `yu-engine`(新 crate,15 号 workspace 成员)**:`engine.rs`(boot/tick/
+  restart/Engine/EngineOptions/FrameReport/DiagReport)+ `project.rs` + 宿主公共件
+  (`output/json/sha`)整体上移;`Failure/CliResult/EXIT_*` 一并迁入,yu-cli 全量
+  re-export(`yu_cli::engine` 等旧路径零改动兼容)。`json_escape` 升 pub。
+- **H2 声音下沉(解耦决策落地)**:cpal `SoundSink` 从 yu-cli 移入
+  `yu-host-desktop`,实现新端口 `yu_engine::engine::AudioOut`(attach/detach;
+  不要求 Send——cpal Stream 部分平台刻意 !Send,Engine 本身含 Rc);
+  `Engine::attach_audio(Box<dyn AudioOut>)` 注入,restart 自动重挂(原
+  detach→boot→attach 时序原样保留)。yu-cli `device` feature 与 cpal 依赖删除,
+  **headless/serve/case/bench 一律静音**;`@_OS_SOUND` 注入恒 true(原桌面
+  `--no-sound` 绑定 os_sound 的写法解除,`--no-sound` 只关出声)。
+- **H3 桌面并入 CLI(参数按模式解耦)**:`yu-cli run --mode headless|desktop`
+  (缺省 headless);桌面旗标与 headless 旗标互不认识,写错边 `finish()` 显式
+  报「未知参数」(已双向验证)。原 `host-desktop/src/main.rs`(240 行参数壳)
+  移植为 `yu-cli/src/desktop.rs`(feature=desktop,默认开;
+  `--no-default-features` 构建显式报错);`yu-desktop` bin 删除,host-desktop
+  只剩 lib(依赖 yu-cli → yu-engine;serve_probe 示例以 dev-dep 回用 ws_client)。
+- **HMR bin 更名**:`yu-engine` bin(只跑 serve)→ `yu-serve`(让位新 crate),
+  `dev.rs`/`engine_main.rs` 同步。
+- **log 门面归属**:`run --mode desktop` 时 main 不抢 `yu-log` 门面(init 时读
+  `YU_LOG_JSONL` 接管 JSONL 文件,先 init 会挤掉文件 sink);其余路径 main 统一接管。
+- **help 三态**:总览(`help`/`-h`/`--help`)、逐命令(`help <command>`)、就地
+  (`<command> --help`);全文按新模式结构重写(全局 `--log-level` 保留)。
+- 预留(未实现,按主人指示):wasm/Android 编译目标——架构槽位 = `yu-engine`
+  唯一装配 + `AudioOut` 端口范式,见 `docs/architecture.md` §2.5。
+
+#### 验证
+
+```text
+cargo check --workspace --all-targets          # 通过(仅 yu-rt scan_gosub_callers 既有警告)
+cargo build -p yu-cli --no-default-features    # 纯 headless 构建通过
+cargo test --workspace(语料 env 齐备)          # 55 套 ok
+  - 环境项:YURIS_TEST_TMP 需指向可写 tmp(系统 TEMP 不可写,既有约束);
+    YURIS_SAMPLE_ERIS_ROOT 补齐后 yu-save golden 过。
+  - yu-trace synthetic_trace_matches_golden FAILED:语料 YSCom.ycd sha256 与库内
+    golden 漂移(期望 29957e15..,实际 39ba92ef..)——先于本次重构,未触碰
+    yu-trace/语料,待台账跟进(疑语料再生未同步 golden)。
+./target/debug/yu-cli.exe help | help run | run --help            # 三态输出正常
+run <eris> --fullscreen                          # => 未知参数:--fullscreen(headless 拒桌面旗标)
+run <eris> --mode desktop --json x               # => 未知参数:--json(桌面拒 headless 旗标)
+run <eris> --frames 10 --shot headless.png       # engine: backend=soft ... frame: 12, png 540267B
+run <eris> --mode desktop --frames 5 --no-sound --shot desktop.png
+                                                 # wgpu 窗口 5 帧自动关,png 540267B(与 headless 同帧同大小)
+```

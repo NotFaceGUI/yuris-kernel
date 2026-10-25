@@ -2,7 +2,7 @@
 //!
 //! 监督进程本身**不重建**(Windows 上运行中的 exe 不可覆盖)。它只负责:
 //!
-//! 1. 构建并启动 `yu-engine serve` 子进程(stdin 作为控制通道);
+//! 1. 构建并启动 `yu-serve serve` 子进程(stdin 作为控制通道);
 //! 2. 500 ms 指纹轮询 `crates/**/*.rs` + `Cargo.toml`;
 //! 3. Rust 变更 → 结束子进程 → 重建 → 重启(浏览器 WebSocket 自动重连);
 //! 4. `www/**` 变更 → 向子进程 stdin 发 `reload` → SSE → 页面刷新;
@@ -183,7 +183,7 @@ impl Supervisor {
         }
         let mut child = command.spawn().map_err(|e| {
             Failure::runtime(format!(
-                "启动 {} 失败: {e}(先执行 cargo build -p yu-cli --bin yu-engine?)",
+                "启动 {} 失败: {e}(先执行 cargo build -p yu-cli --bin yu-serve?)",
                 self.engine_bin.display()
             ))
         })?;
@@ -232,7 +232,7 @@ impl Supervisor {
         let temp = self.workspace.join("target").join("tmp").join("cargo-temp");
         let _ = fs::create_dir_all(&temp);
         let mut command = Command::new(cargo());
-        command.args(["build", "-p", "yu-cli", "--bin", "yu-engine"]);
+        command.args(["build", "-p", "yu-cli", "--bin", "yu-serve"]);
         if self.release {
             command.arg("--release");
         }
@@ -287,9 +287,9 @@ fn engine_binary(workspace: &Path, release: bool) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace.join("target"));
     let name = if cfg!(windows) {
-        "yu-engine.exe"
+        "yu-serve.exe"
     } else {
-        "yu-engine"
+        "yu-serve"
     };
     target
         .join(if release { "release" } else { "debug" })

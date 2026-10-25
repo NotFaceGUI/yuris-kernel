@@ -2,9 +2,13 @@
 //!
 //! # 定位
 //!
-//! 窗口 = winit 0.30;游戏帧仍由 `yu-cli::Engine`(wgpu 30 / soft)产出;
-//! 本 crate 只做「窗口 + surface 上屏 + 输入转发 + egui 调试面板」。
+//! 窗口 = winit 0.30;游戏帧仍由 `yu_engine::Engine`(wgpu 30 / soft)产出;
+//! 本 crate 只做「窗口 + surface 上屏 + 输入转发 + egui 调试面板 + cpal
+//! 音频输出」(`sound_device` 实现 `yu_engine::engine::AudioOut` 端口)。
 //! 渲染语义、VM、音频状态机都不在这里。
+//!
+//! 入口在 `yu-cli --mode desktop`(2026-10-25 架构 v2:H3,独立
+//! `yu-desktop` exe 已退役);本 crate 只剩 lib。
 //!
 //! # 上屏路径
 //!
@@ -32,7 +36,10 @@
 pub mod diagnostics;
 pub mod panic_guard;
 pub mod script;
+pub mod sound_device;
 pub mod ui;
+
+pub use sound_device::SoundSink;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -48,7 +55,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
 
 use yu_backend_soft::Surface;
-use yu_cli::engine::Engine;
+use yu_engine::engine::Engine;
 use yu_platform_input::{
     cursor_shape, cursor_visible, key_button, mouse_activity_reactive, wheel_button, CursorClock,
     CursorShape, MouseActivity, PointerButton,
@@ -58,13 +65,13 @@ use crate::diagnostics::DiagnosticsHost;
 use crate::panic_guard::{CloseAction, Phase};
 use crate::script::{ScriptAction, ScriptRunner};
 
-// 宿主日志与终端输出统一走 `yu-cli::output`(项目纪律:src 内不直接
+// 宿主日志与终端输出统一走 `yu_engine::output`(项目纪律:src 内不直接
 // `println!/eprintln!`)。
 macro_rules! host_error {
-    ($($arg:tt)*) => { yu_cli::output::error(format!($($arg)*)) };
+    ($($arg:tt)*) => { yu_engine::output::error(format!($($arg)*)) };
 }
 macro_rules! host_line {
-    ($($arg:tt)*) => { yu_cli::output::line(format!($($arg)*)) };
+    ($($arg:tt)*) => { yu_engine::output::line(format!($($arg)*)) };
 }
 
 /// Windows 定时器粒度(实测:P1 固定节拍已改为 `next_frame += 1/fps`,

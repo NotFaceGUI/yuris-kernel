@@ -1,4 +1,7 @@
 //! `yu-cli` 入口:run / serve / dev / case / bench。
+//!
+//! help 三态:总览(`help`/`-h`/`--help`)、逐命令(`help <command>`)、
+//! 就地(`yu-cli run --help`)。
 
 use yu_cli::build_info;
 use yu_cli::{output, CliResult, Failure, EXIT_FAIL};
@@ -15,7 +18,12 @@ fn main() {
             std::process::exit(EXIT_FAIL);
         }
     }
-    yu_log::facade::init(|line| crate::output::error(line));
+    // `run --mode desktop` 由桌面模式自建 log 门面:门面在 init 时读
+    // `YU_LOG_JSONL` 接管 JSONL 文件,这里先 init 会把文件 sink 挤掉
+    // (旧 yu-desktop 是独立进程,不存在此问题)。其余路径在此统一接管。
+    if !desktop_run(&tokens) {
+        yu_log::facade::init(|line| output::error(line));
+    }
     let code = match dispatch(tokens) {
         Ok(()) => 0,
         Err(failure) => {
@@ -59,23 +67,51 @@ fn extract_log_level(tokens: &mut Vec<String>) -> Result<Option<String>, String>
     Ok(found)
 }
 
+/// 命令行是否为 `run --mode desktop`(桌面模式自己接管 log 门面)。
+fn desktop_run(tokens: &[String]) -> bool {
+    if tokens.first().map(String::as_str) != Some("run") {
+        return false;
+    }
+    let mut i = 1;
+    while i < tokens.len() {
+        if tokens[i] == "--mode" {
+            return tokens.get(i + 1).map(|value| value == "desktop").unwrap_or(false);
+        }
+        if let Some(rest) = tokens[i].strip_prefix("--mode=") {
+            return rest == "desktop";
+        }
+        i += 1;
+    }
+    false
+}
+
 fn dispatch(tokens: Vec<String>) -> CliResult<()> {
     let Some(command) = tokens.first().cloned() else {
-        print_help();
+        output::raw(OVERVIEW);
         return Ok(());
     };
     let rest = tokens[1..].to_vec();
+
+    if matches!(command.as_str(), "help" | "-h" | "--help") {
+        match rest.first().map(String::as_str) {
+            None | Some("help") => output::raw(OVERVIEW),
+            Some(cmd) => print_command_help(cmd)?,
+        }
+        return Ok(());
+    }
+    // 就地 help:已知命令后跟 `--help` 时只打印用法,不进入参数解析。
+    if rest.iter().any(|token| token == "--help") && is_known_command(&command) {
+        print_command_help(&command)?;
+        return Ok(());
+    }
+
     match command.as_str() {
         "run" => yu_cli::run::from_args(rest),
         "serve" => yu_cli::server::run(yu_cli::server::ServeOptions::from_args(rest)?),
         "dev" => yu_cli::dev::from_args(rest),
         "case" => yu_cli::case::from_args(rest),
         "bench" => yu_cli::bench::from_args(rest),
-        "help" | "-h" | "--help" => {
-            print_help();
-            Ok(())
-        }
-        "version" | "--version" => {
+        "version" | "-V" | "--version" => {
             output::line(format!(
                 "yu-cli 0.1.0 (marker {})",
                 build_info::ENGINE_MARKER
@@ -84,67 +120,162 @@ fn dispatch(tokens: Vec<String>) -> CliResult<()> {
         }
         other => Err(Failure::new(
             EXIT_FAIL,
-            format!("未知子命令 `{other}`;可用: run | serve | dev | case | bench | help"),
+            format!(
+                "未知子命令 `{other}`;可用: run | serve | dev | case | bench | help \
+                 (逐命令细节: yu-cli help run)"
+            ),
         )),
     }
 }
 
-fn print_help() {
-    output::raw(
-        "\
-yu-cli · 原生引擎宿主 + 本地服务 + wasm 呈现端
+fn is_known_command(command: &str) -> bool {
+    matches!(command, "run" | "serve" | "dev" | "case" | "bench")
+}
+
+fn print_command_help(command: &str) -> CliResult<()> {
+    let text = match command {
+        "run" => RUN_HELP,
+        "serve" => SERVE_HELP,
+        "dev" => DEV_HELP,
+        "case" => CASE_HELP,
+        "bench" => BENCH_HELP,
+        other => {
+            return Err(Failure::new(
+                EXIT_FAIL,
+                format!("`{other}` 没有单独的 help;可用: run | serve | dev | case | bench"),
+            ))
+        }
+    };
+    output::raw(text);
+    Ok(())
+}
+
+const OVERVIEW: &str = "\
+yu-cli · 桌面唯一入口(headless + --mode desktop)+ 本地服务 + 用例执行器
 
 用法:
-  yu-cli run  <project-root> [--backend soft|wgpu] [--entry LABEL] [--frames N]
-                             [--until-visible] [--shot PATH] [--json PATH]
-                             [--record-events on|off] [--debug-mode on|off]
-                             [--data PATH] [--font FAMILY]
-  yu-cli serve <project-root> [--backend soft|wgpu] [--port 4173] [--no-open]
-                             [--entry LABEL] [--fps 60] [--record-events on|off]
-                             [--debug-mode on|off] [--data PATH] [--www DIR]
-                             [--diag-ws] [--font FAMILY]
-  yu-cli dev  <project-root> [--port 4173] [--no-open] [--backend soft|wgpu]
-                             [--debug-mode on|off]
+  yu-cli <command> [args...]     # 逐命令细节: yu-cli help <command>
+                                 # 或就地: yu-cli <command> --help
+  yu-cli run <project-root> [--mode headless|desktop] [...]
+  yu-cli serve <project-root> [--port 4173] [...]
+  yu-cli dev <project-root>      # HMR 监督(改码重启,改 www 刷新)
   yu-cli case <project-root> --all | --case NAME [--update]
-                             [--debug-mode on|off]
-  yu-cli bench <project-root> [--frames N] [--debug-mode on|off]
+  yu-cli bench <project-root> [--frames N]
+
+命令:
+  run     跑工程。缺省 headless(soft 后端,跑完即退,出报告/PNG/JSON);
+          --mode desktop 开原生窗口(wgpu 优先,默认 feature,不单独编译)
+  serve   本地 HTTP/WS 服务:服务端读数据并执行内核,浏览器只做呈现(架构 B)
+  dev     监督 yu-serve 子进程:改 crates/**/*.rs → 重建重启;改 www/** → 刷新
+  case    golden 用例执行器
+  bench   帧耗时基准
+  help    本总览,或逐命令 help
+
+全局参数:
+  --log-level error|warn|info|debug|trace   覆盖 YU_LOG(默认 warn);
+                                            也可 --log-level=X 形式。
 
 数据入口(唯一约定):
   <project-root>/data.ypf 优先;否则 <project-root>/data/;
   <project-root> 也可以直接是 .ypf 文件。
 
-全局参数:
-  --log-level error|warn|info|debug|trace   覆盖 YU_LOG(默认 warn)。
-                                            查字体解析链用 info(看 target=yu-font
-                                            的 [font] 行);也可 --log-level=X 形式。
+声音:
+  出声只在 run --mode desktop(cpal 设备输出,平台 AudioOut 端口);
+  headless/serve/case/bench 一律静音;@_OS_SOUND 注入口径恒 true。
 
-字体诊断:
-  --font FAMILY   强制所有 FONT 请求用该 family,忽略脚本的 NAME/NO/BNO。
-                  family 查不到 = 硬失败(不回落默认表)。family 名按 fontdb
-                  规范化匹配,全角/半角与空格差异自动折叠,故
-                  --font MS\\ Gothic 与 --font MS-Gothic 等价。
+构建:
+  默认 feature=desktop(带窗口,一个 exe 两种模式);
+  纯 headless/CI:cargo build -p yu-cli --no-default-features。
+";
+
+const RUN_HELP: &str = "\
+yu-cli run · 跑工程(缺省 headless;--mode desktop 开原生窗口)
+
+用法:
+  yu-cli run <project-root> [--mode headless|desktop] [参数...]
+
+共用参数(两种模式):
+  --entry LABEL        入口标签(缺省 SYSTEM_START)
+  --data PATH          数据入口覆盖(缺省 data.ypf 优先,退 data/)
+  --backend soft|wgpu  渲染后端(headless 缺省 soft;desktop 缺省 wgpu,
+                       wgpu 失败自动回退 soft)
+  --frames N           跑 N 帧停(desktop = 验收模式,到帧关窗)
+  --shot PATH          最后一帧写 PNG
+  --save-root DIR      存档根重定向(缺省工程根 save/)
+  --debug-mode on|off  @_DEBUGMODE 注入(缺省 off;desktop 缺省时亦读
+                       环境变量 YURIS_DEBUG_MODE=1,DIV-L-001)
+
+headless 专有(缺省模式):
+  --until-visible      首个可绘制帧即停
+  --until-frame N      跑到引擎第 N 帧
+  --json PATH          最后一帧 display JSON 写盘
+  --record-events on|off  事件录制(缺省 off;对拍时 on)
+  --font FAMILY        强制字体(诊断/换字体;忽略脚本的 NAME/NO/BNO,
+                       family 查不到 = 硬失败;全角/半角与空格差异自动折叠)
+
+desktop 专有(--mode desktop;需默认 feature 构建):
+  --width N  --height N  --fps N   窗口尺寸与帧率(缺省 60fps)
+  --fullscreen  --pixel            全屏 / 像素整数缩放
+  --title TEXT                     窗口标题(缺省 YU-RIS · <工程名>)
+  --debug-ui                       启动即开 egui 调试面板(F1 切换)
+  --no-sound                       不出声(@_OS_SOUND 注入口径不变)
+  --script case.json               定时输入剧本(自动点击等)
+  --reconcile                      wgpu 首帧与 soft 计数对账
+  --log-file PATH                  宿主 JSONL 日志(缺省 %TEMP%/yu-cli-desktop.jsonl)
+  --frame-stats CSV                逐帧耗时 CSV
+  --profile-frames 1,4,340         指定帧打印 VM 命令耗时 top-10
+  --pump-cap N                     每任务每泵命令上限(DIV-HOST-002,诊断用)
+  --panic-selftest N               panic 防线自测
 
 宿主注入(BootConfig,全部显式给值):
   screen_color=32   @_SCREEN_COLOR(浏览器/桌面 32bpp)
   dx_mode=0         @_DXMODE(无 DX 分支)
-  os_sound=true     @_OS_SOUND(引擎认为音频可用;默认设备输出见下)
-  media_readonly=0  @_MEDIA_READONLY(只读介质语义,不是内核只读数据 A2)
-  debug_mode=off    @_DEBUGMODE(官方 debug 构建 = on,DIV-L-001;对拍口径)
+  os_sound=true     @_OS_SOUND(注入恒 true;是否真出声由平台端口决定)
+  media_readonly=0  @_MEDIA_READONLY
   record_events=off 默认关闭(首帧 129 万命令;对拍时 --record-events on)
 
-声音:
-  默认构建含 device 特性:run/serve 把 PCM 输出到本机默认设备。
-  `--no-default-features` 构建为纯 headless(不依赖声卡/不输出)。
-  www 浏览器侧不实现音频(当前不是真 wasm 目标)。
+示例:
+  yu-cli run D:/game --frames 600 --shot out.png
+  yu-cli run D:/game --mode desktop --fullscreen
+";
 
-serve:
+const SERVE_HELP: &str = "\
+yu-cli serve · 本地服务:服务端读数据并执行内核,浏览器只做呈现(架构 B)
+
+用法:
+  yu-cli serve <project-root> [--backend soft|wgpu] [--port 4173] [--no-open]
+               [--entry LABEL] [--fps 60] [--record-events on|off]
+               [--debug-mode on|off] [--data PATH] [--www DIR] [--diag-ws]
+               [--font FAMILY]
+
+说明:
   启动后打印 http://127.0.0.1:<port>/,默认打开浏览器。
   WebSocket /ws:帧下发 + 输入/控制;SSE /events:HMR reload。
   --diag-ws 额外开 /diag 通道(500ms 推诊断快照:等待任务/挂号表/域计数)。
-  服务端读数据并执行内核;**浏览器不下载整包**。
+  服务端读数据并执行内核;浏览器不下载整包。
+";
 
-dev:
-  监督 yu-engine 子进程:改 crates/**/*.rs → 重建并重启;改 www/** → 页面刷新。
-",
-    );
-}
+const DEV_HELP: &str = "\
+yu-cli dev · HMR 监督
+
+用法:
+  yu-cli dev <project-root> [--port 4173] [--no-open] [--backend soft|wgpu]
+              [--debug-mode on|off]
+
+说明:
+  监督 yu-serve 子进程:改 crates/**/*.rs → 重建并重启;改 www/** → 页面刷新。
+";
+
+const CASE_HELP: &str = "\
+yu-cli case · golden 用例执行器
+
+用法:
+  yu-cli case <project-root> --all | --case NAME [--update] [--debug-mode on|off]
+";
+
+const BENCH_HELP: &str = "\
+yu-cli bench · 帧耗时基准
+
+用法:
+  yu-cli bench <project-root> [--frames N] [--debug-mode on|off]
+";

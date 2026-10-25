@@ -1,4 +1,4 @@
-//! `yu-engine`:只跑 `serve` 的引擎子进程(`yu-cli dev` 拉起)。
+//! `yu-serve`:只跑 `serve` 的引擎子进程(`yu-cli dev` 拉起)。
 //!
 //! 独立 bin 是为了让 HMR 监督进程能反复重建并替换它(Windows 上运行中的
 //! exe 不可覆盖)。产品入口仍然是 `yu-cli serve`。
@@ -14,7 +14,7 @@ fn main() {
     let code = match run(tokens) {
         Ok(()) => 0,
         Err(failure) => {
-            output::error(format!("yu-engine: {}", failure.message));
+            output::error(format!("yu-serve: {}", failure.message));
             failure.exit
         }
     };
@@ -26,7 +26,7 @@ fn run(tokens: Vec<String>) -> CliResult<()> {
         Some("serve") => server::run(ServeOptions::from_args(tokens[1..].to_vec())?),
         _ => Err(Failure::new(
             EXIT_FAIL,
-            "yu-engine 只接受 `serve <project-root> [...]`(由 yu-cli dev 内部使用)",
+            "yu-serve 只接受 `serve <project-root> [...]`(由 yu-cli dev 内部使用)",
         )),
     }
 }
