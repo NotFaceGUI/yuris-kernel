@@ -576,6 +576,10 @@ def main():
     parser.add_argument("--trace-out", default=None)
     parser.add_argument("--sample", default="data.ypf")
     parser.add_argument("--bp-rva", default="0x44db,0x4547")
+    parser.add_argument("--bp-cmd-names", default="",
+                        help="只在这些命令的 handler 入口下断点(逗号分隔;空=分派点全量记录)")
+    parser.add_argument("--filter-names", default="",
+                        help="只记录这些命令名(逗号分隔);空 = 全部。强烈建议过滤否则引擎被断点拖成幻灯片")
     parser.add_argument("--trigger-rva", default="0x5ab63",
                         help="0x45ab63 = WM_LBUTTONDOWN 命中非透明 UI 像素后的写点;"
                              "先只挂它,点中后再挂分派断点(不拖慢标题)")
@@ -595,6 +599,8 @@ def main():
     parser.add_argument("--input", choices=["enter", "click", "both"], default="both")
     parser.add_argument("--input-method", choices=["sendinput", "post"], default="sendinput")
     parser.add_argument("--click-xy", default="410,275")
+    parser.add_argument("--clicks", default="",
+                        help="定时点击队列 T1:X1,Y1;T2:X2,Y2(秒:客户区坐标,可与 --input-at 并存)")
     parser.add_argument("--producer-name", default="official-eris-events")
     parser.add_argument("--producer-version", default="0.2.0")
     parser.add_argument("--debug-mode", choices=["true", "false"], default="true",
@@ -603,6 +609,16 @@ def main():
     if not args.exe or not args.cwd:
         parser.error("--exe/--cwd required (or set YURIS_OFFICIAL_EXE/YURIS_OFFICIAL_CWD)")
     args.click_xy = tuple(int(part) for part in args.click_xy.split(","))
+    # 定时点击队列:(时刻, x, y),按时刻升序;串行执行(上一次释放后才发下一次)。
+    click_queue = []
+    for token in args.clicks.split(";"):
+        token = token.strip()
+        if not token:
+            continue
+        t_str, xy = token.split(":")
+        x_str, y_str = xy.split(",")
+        click_queue.append((float(t_str), int(x_str), int(y_str)))
+    click_queue.sort(key=lambda item: item[0])
     bps = ([int(part, 0) for part in args.bp_rva.split(",") if part.strip()]
            if args.mode == "dispatch" else [])
     trigger_rva = int(args.trigger_rva, 0) if args.trigger_rva else 0
@@ -614,6 +630,19 @@ def main():
     if args.ysc:
         ysc_version, commands = parse_ysc(args.ysc)
     names = {index: name for index, name in commands}
+    bp_cmd_names = {
+        token.strip().upper()
+        for token in args.bp_cmd_names.split(",")
+        if token.strip()
+    }
+    filter_set = None
+    if args.filter_names.strip():
+        filter_set = {
+            token.strip().upper()
+            for token in args.filter_names.split(",")
+            if token.strip()
+        }
+        print("filter", sorted(filter_set), flush=True)
 
     sample_path = os.path.join(args.cwd, args.sample)
     sample_sha = sha256_file(sample_path) if os.path.isfile(sample_path) else None
@@ -672,6 +701,7 @@ def main():
     hit_file = open(os.path.join(args.out_dir, "hits.jsonl"), "w", encoding="utf-8")
     handler_table = None
     handler_groups = None
+    handler_addr_to_cmd = {}
     click_tick = None
     input_sent = []
     input_done = False
@@ -752,6 +782,29 @@ def main():
         print("dispatch table", hex(base + DISPATCH_TABLE_RVA),
               "unique", len(groups), flush=True)
 
+    def handler_addrs_for(names_wanted):
+        """命令名 → handler 入口绝对地址(来自运行时 119 项表)。"""
+        if handler_table is None:
+            return {}
+        out = {}
+        for index, handler in enumerate(handler_table):
+            if not handler:
+                continue
+            name = (names.get(index) or "").upper()
+            if name in names_wanted:
+                out[name] = handler
+        return out
+
+    def arm_abs(address):
+        if address in armed:
+            return
+        original = read_mem(hproc, address, 1)
+        if original["ok"] and original["got"] == 1:
+            originals[address] = original["bytes"]
+            if write_mem(hproc, address, bytes([0xCC])):
+                armed.add(address)
+        return
+
     def arm_address(rva):
         address = base + rva
         if address in armed:
@@ -766,8 +819,27 @@ def main():
                 print("arm failed", hex(address), last_error(), flush=True)
 
     def arm():
+        nonlocal armed
         if args.mode == "dispatch":
             read_dispatch_table()
+        if bp_cmd_names:
+            # 只为指定命令的 handler 入口下断点:其余命令全速跑,
+            # 不会把官方引擎拖成幻灯片。
+            if handler_table is None:
+                return
+            wanted = {}
+            for index, handler in enumerate(handler_table):
+                if not handler:
+                    continue
+                name = (names.get(index) or "").upper()
+                if name in bp_cmd_names:
+                    wanted[name] = (index, handler)
+            for name, (index, handler) in sorted(wanted.items()):
+                handler_addr_to_cmd[handler] = index
+                arm_abs(handler)
+                print("armed-cmd", name, hex(handler), flush=True)
+            print("armed-cmd count", len(wanted), flush=True)
+            return
         for rva in bps:
             arm_address(rva)
 
@@ -805,6 +877,24 @@ def main():
                 print("input", input_sent, "tick", click_tick, flush=True)
             else:
                 input_sent = ["window-not-found"]
+        if click_queue and input_pending is None:
+            when, cx, cy = click_queue[0]
+            if elapsed >= when:
+                click_queue.pop(0)
+                found = ensure_window()
+                if found:
+                    q_tick = read_u64(hproc, base + TICK_COUNTER_RVA)
+                    q_sent, q_notes, q_pending = send_input(
+                        found[0], "click", cx, cy, args.input_method,
+                        force_foreground=(False if args.mode == "task-phase" else not armed))
+                    manifest.setdefault("click_notes", []).extend(q_notes)
+                    if q_pending:
+                        input_pending = q_pending
+                        input_down_tick = read_u64(hproc, base + TICK_COUNTER_RVA)
+                        input_down_at = time.time()
+                    print("queued-click", q_sent, "@", when, cx, cy, "tick", q_tick, flush=True)
+                else:
+                    manifest.setdefault("click_notes", []).append(f"window-not-found@{when}")
         if input_pending is not None:
             current_tick = read_u64(hproc, base + TICK_COUNTER_RVA)
             held = time.time() - input_down_at if input_down_at else 0.0
@@ -815,7 +905,7 @@ def main():
             if progressed or held > 5.0:
                 released = release_input(input_pending)
                 input_sent.extend(released)
-                manifest["input_notes"].extend(released)
+                manifest.setdefault("input_notes", []).extend(released)
                 if progressed:
                     input_hold_ticks = current_tick - input_down_tick
                 manifest["input_hold_ticks"] = input_hold_ticks
@@ -850,6 +940,11 @@ def main():
                           "ok", ok, fg_notes, flush=True)
             if armed:
                 read_dispatch_table()
+                if bp_cmd_names and handler_table is not None:
+                    for name, address in handler_addrs_for(bp_cmd_names).items():
+                        if address not in armed:
+                            arm_abs(address)
+                            print("armed-cmd", name, hex(address), flush=True)
             continue
         code = event.dwDebugEventCode
         status = DBG_CONTINUE
@@ -925,13 +1020,20 @@ def main():
                     task = read_u32(hproc, base + TASK_GLOBAL_RVA)
                     script = read_u16(hproc, task + 0x3C) if task else None
                     tick = read_u64(hproc, base + TICK_COUNTER_RVA)
-                    handler = read_u32(hproc, ctx.Ecx + ctx.Edi * 4)
+                    cmd = handler_addr_to_cmd.get(site)
+                    if cmd is not None:
+                        handler = site
+                    else:
+                        handler = read_u32(hproc, ctx.Ecx + ctx.Edi * 4)
                     candidates = None
-                    cmd = None
                     if handler is not None and handler_groups is not None:
                         candidates = handler_groups.get(handler)
-                        if candidates is not None and len(candidates) == 1:
+                        if candidates is not None and len(candidates) == 1 and cmd is None:
                             cmd = candidates[0]
+                    if filter_set is not None:
+                        hit_name = names.get(cmd, "").upper() if cmd is not None else ""
+                        if hit_name not in filter_set:
+                            continue
                     row = {
                         "i": len(hits),
                         "t": round(time.time() - started, 3),
