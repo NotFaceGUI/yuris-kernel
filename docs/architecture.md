@@ -18,6 +18,11 @@
 >   放宿主与平台输入;其余 crate 在 `crates/` 下。**包名不变**,`cargo -p` 命令不用改。
 > - 帧契约字段以 `crates/yu-gfx/src/frame.rs` 为准(含 `dx_mode`,
 >   见 §5.1 的范围说明)。
+>
+> **v2 提案(2026-10-25,待主人定稿)**:§2.5 跨平台目标架构 —— 桌面并入
+> `yu-cli --mode desktop`(运行期开关,不再单独编译)、wasm/Android 等 =
+> 同一代码基的**编译期**派生(各自壳 crate)、cpal 声音下沉平台层、
+> `@_OS_SOUND` 注入与实际出声解耦。定稿后升版并改写 §2/§3。
 
 ## 0. 不变式
 
@@ -125,6 +130,263 @@ flowchart TD
 | `yu-platform/host-desktop` · `yu-host-desktop` | **原生桌面宿主**(Windows 首版):winit 窗口 + wgpu 上屏 + egui 调试面板;复用 `yu-cli::Engine`,事件翻译走 `yu-platform-input`,不复制引擎语义 | cli, render/wgpu, platform-input, egui/winit | 含游戏语义;直接读数据 |
 | `yu-cli` | 原生装配:输入时间线 → rt 泵 → 事件分流 → gfx → 后端呈现;本地 HTTP/WS 服务、HMR 监督、用例执行器;默认 `device` feature 接入 cpal 声音输出(`--no-default-features` 为纯 headless) | 全部 | 含游戏语义 |
 | `yu-trace` | 四条边界(①vfs 读 ②事件流 ③帧描述 ④平台命令)JSONL 记录/回放/diff;schema v3 | 全部(旁挂) | 成为运行时依赖 |
+
+## 2.5 跨平台目标架构(v2 提案,2026-10-25,待主人定稿)
+
+> 决策来源(2026-10-25 主人指示):① 桌面与 wasm 都由 cli 派生,桌面经
+> `--mode desktop` 运行期开关、不单独编译;② 声音由各平台宿主播放,cli 不播;
+> ③ wasm 暂不出声。技术修正(已与主人对过):wasm 无法是同一 exe 的运行期
+> 开关(浏览器无 argv、wasm32 是另一编译目标),「cli 派生」在 wasm 上
+> = **同一代码基、编译期选目标**。
+>
+> 同日追加(主人):**Android 等移动编译目标**。落位模式与 wasm 相同——
+> L3 新宿主 + L1 端口实现,内核与 `yu-engine` 零改动(R2 的意义);引擎侧
+> 唯一新需求 = **挂起/恢复生命周期**(Android 可暂停/杀进程,见 H7)。
+> iOS 等后续目标照此模式追加,不新增架构机制。
+
+### 2.5.1 分层图(目标态)
+
+```mermaid
+flowchart TD
+    subgraph SHELLS["L4 · 入口层 —— 同一代码基 · 桌面开关 + 多编译目标"]
+        CLI["yu-cli(exe,桌面唯一入口)<br/>headless: run/case/bench/serve/dev<br/>窗口: --mode desktop(feature = desktop)"]
+        WEB["yu-host-web(wasm32-unknown-unknown)<br/>wasm-bindgen 导出 · 无 argv<br/>编译期派生,非运行期开关"]
+        ANDR["yu-host-android(aarch64-linux-android 等 NDK 目标)<br/>android_main 入口 · 无 argv<br/>与 wasm 同为编译期派生"]
+    end
+
+    subgraph HOSTS["L3 · 宿主层 —— 平台外设,可替换"]
+        HDESK["host-desktop(lib,不再单独出 exe)<br/>winit 窗口 + wgpu 上屏 + egui 调试<br/>cpal AudioSink · 原生 fs/存档 · win32 能力(B7)"]
+        HWEB["host-web(真 wasm 壳,新;命名待定)<br/>canvas/WebGPU present · fetch data.ypf→MemSource<br/>DOM 输入 · WebAudio(暂 no-op)· OPFS 存档(后)"]
+        HWS["host-wasm(WS 呈现端 = 现状架构 B)<br/>调试期保留: serve 推帧<br/>真 wasm 对拍达成后退役"]
+        HADR["host-android(新)<br/>winit(android-activity)+ wgpu(Vulkan/GLES)<br/>cpal/oboe AudioSink · AAssetManager→MemSource<br/>内部存储存档 · 触摸→指针 · 挂起/恢复生命周期"]
+    end
+
+    ENG["L2 · yu-engine(新 crate)<br/>Engine / EngineOptions / Project / boot / tick / restart<br/>(现 yu-cli/src/engine.rs + project.rs 上移;解 CLI↔桌面宿主依赖环)"]
+
+    subgraph PORTS["L1 · 能力端口 —— 宿主实现,引擎消费"]
+        ASSET["AssetSource(数据树:fs 发现 | fetch→Mem)"]
+        AUDIO["AudioSink(混音 PCM 出口)"]
+        CLOCK["Clock(墙钟注入,A3)"]
+        SAVEIO["SaveIo(存档落盘)"]
+        PSVC["PlatformSvc(剪贴板/对话框/托盘/字体枚举… B7)"]
+    end
+
+    subgraph CORE["L0 · 内核层 —— 平台中立:禁 fs/墙钟/设备 IO"]
+        RT["yu-rt"]
+        GFX["yu-gfx + CompositorFrame"]
+        SND["yu-sound(解码/状态/混音,无设备)"]
+        SAVE["yu-save"]
+        SOFT["yu-render/soft(纯 CPU = wasm 基线)"]
+        WGPUR["yu-render/wgpu(native;web 可选增强)"]
+        VFS["yu-vfs(Dir/Ypf/Mem + Mount)"]
+    end
+
+    CLI -->|"headless 直装"| ENG
+    CLI -->|"--mode desktop 内嵌"| HDESK
+    HDESK --> ENG
+    WEB --> HWEB
+    HWEB --> ENG
+    ANDR --> HADR
+    HADR --> ENG
+    HWS -.->|"WS RGBA 帧(调试)"| CLI
+
+    HDESK -.->|"实现端口"| PORTS
+    HWEB -.->|"实现端口"| PORTS
+    HADR -.->|"实现端口"| PORTS
+    ENG -->|"消费(注入)"| PORTS
+
+    ENG --> RT
+    ENG --> GFX
+    ENG --> SND
+    ENG --> SAVE
+    ENG --> SOFT
+    ENG --> WGPUR
+    GFX --> RT
+    SND --> RT
+    SOFT --> GFX
+    WGPUR --> GFX
+    RT --> VFS
+```
+
+(内核层内部完整依赖与 v1.3 §2 图相同,此处省略;`yu-format`/`yu-font`/
+`yu-log`/`yu-trace` 归属不变。)
+
+**新平台接入模式固定**:L3 一个宿主 crate + L1 一组端口实现,内核与
+`yu-engine` 零改动(R2)。iOS 等后续目标照此追加,不新增架构机制。
+
+### 2.5.2 目标态流程图(启动派发 · 一帧主循环 · 生命周期)
+
+结构图(§2.5.1)回答「谁依赖谁」;本图回答「跑起来怎么流」。要点:
+**平台差异只出现在 ①端口装配 与 ④出口/生命周期,②③ 四平台逐字同一**。
+
+```mermaid
+flowchart TD
+    subgraph BOOT["① 启动派发:平台只决定外设从哪来(端口装配)"]
+        direction LR
+        H["yu-cli headless<br/>run/case/bench/serve"] --> HP["端口: fs 资源 · 无音频<br/>虚时钟(回放)/墙钟 · 存档只读"]
+        D["yu-cli --mode desktop"] --> DP["端口: fs · cpal · Instant · save 根"]
+        W["wasm 页面加载"] --> WP["端口: fetch→Mem · no-op 音频<br/>performance.now · OPFS(后)"]
+        An["android_main"] --> AP["端口: AAsset→Mem · oboe<br/>内部存储 · 触摸→指针"]
+    end
+
+    HP --> NEW
+    DP --> NEW
+    WP --> NEW
+    AP --> NEW
+    NEW["② Engine::new —— 四平台同一份代码<br/>boot: 装表(A5,缺表拒绝)→ VM → Gfx/Sound/Save 状态"]
+
+    NEW --> START
+
+    subgraph LOOP["③ 一帧主循环(平台零差异)"]
+        START("帧起点") --> IN["宿主输入/事件<br/>(yu-platform-input 翻译)"]
+        IN --> TICK["clock.now_ms → tick_realtime"]
+        TICK --> PUMP["VM 泵至让出 → VmEvent 流"]
+        PUMP --> DOM["Gfx/Sound/SaveHost 同步消费<br/>(事件只消费一次)"]
+        DOM --> FRAME["CompositorFrame"]
+        FRAME --> REN["render: soft(基线) | wgpu"]
+        REN --> PRES["present: 窗口 / canvas / GLSurface"]
+        PRES --> START
+        DOM -.->|"共享 SoundState"| AUD["AudioSink 回调(桌面/安卓)<br/>SoundState::render → PCM(音频线程即时钟)"]
+    end
+
+    PRES -.->|"trace ①②③④ 旁挂"| TRC["yu-trace JSONL(对拍)"]
+    PRES --> GATE{"④ 每帧检查:出口/生命周期"}
+    GATE -->|"headless: frames N"| OUT1["PNG/JSON → 退出"]
+    GATE -->|"桌面: 主任务 END"| OUT2["关窗退出"]
+    GATE -->|"android 挂起 / wasm 页面隐藏"| SUS["suspend: 停时钟停泵 · 释放呈现器"]
+    SUS -->|"resume / 页面可见"| RESUME["重建呈现器"]
+    RESUME --> START
+```
+
+- 对拍不变量(A3):同数据 + 同输入时间线 + 同虚时钟 ⇒ 任何平台同一帧序列;
+  平台差异若造成 golden 分歧,只可能在 ① 或 ④ 出现 —— 排查面被结构收窄。
+- 桌面双时钟说明:逻辑时间走 `Clock` 端口(`tick_realtime`),声音渲染由
+  音频回调驱动(H2 下沉时明确权威关系,避免声音/逻辑漂移)。
+
+### 2.5.3 与 v1.3 的差异
+
+| 项 | v1.3 现状 | v2 目标 | 动因 |
+|---|---|---|---|
+| `yu-cli` | 引擎装配(1342 行 engine.rs)+ cpal(`device` feature)+ 全部入口 | 薄壳入口;装配上移 `yu-engine`;cpal 移出、`device` feature 删除 | 跨平台复用同一装配;纯 headless |
+| `yu-engine`(新) | — | 唯一引擎装配 crate,所有宿主嵌它 | 解 `yu-cli`↔`host-desktop` 依赖环;wasm 复用 |
+| `host-desktop` | 独立 `yu-desktop` exe + lib | 仅 lib,由 `yu-cli` `desktop` feature 内嵌;吸收 cpal AudioSink | 桌面 = 运行期开关,不单独编译 |
+| `host-wasm` | WS 呈现端(架构 B 调试胶水) | 保留为调试链路;真 wasm 达成对拍后退役 | 过渡 |
+| `host-web`(新,命名待定) | — | 真 wasm 壳:引擎 + soft 编进 wasm32,页面自跑 | 浏览器目标 |
+| `host-android`(新) | — | winit(android-activity)壳:wgpu(Vulkan/GLES)+ cpal/oboe 音频 + AAssetManager→MemSource + 内部存储存档 + 挂起/恢复生命周期 | Android 编译目标 |
+| 声音设备输出 | 在 `yu-cli`(`engine/sound_device.rs`,cpal) | 移入 `host-desktop`;wasm 端 NullSink(暂不出声) | 声音平台所有 |
+| `@_OS_SOUND` | 桌面与 `--no-sound` 绑定(`os_sound=!no_sound`) | 注入与出声解耦:对拍口径恒 `true`;`--no-sound` 只关 sink | A3/A4 对拍不受平台能力影响 |
+| 渲染后端 | soft/wgpu 双后端(契约=CompositorFrame) | 不变;soft = wasm 基线,wgpu-web 可选增强 | 契约是数据,天然可移植 |
+| 存档 | fs save 根 | 桌面不变;wasm 走 `SaveIo` 端口(OPFS 等,后) | 跨平台 |
+
+### 2.5.4 平台矩阵
+
+| 目标 | 入口/编译 | 渲染 | 音频 | 资源 | 存档 |
+|---|---|---|---|---|---|
+| Windows 桌面(首版) | `yu-cli --mode desktop` | wgpu(失败回退 soft) | cpal | fs(data.ypf 或散盘) | save 根目录 |
+| Linux/macOS 桌面 | 同一 exe(随 winit/wgpu 验收) | wgpu/soft | cpal | 同 | 同 |
+| 浏览器 | `host-web` 编 wasm32 | soft 基线(wgpu-web 可选) | WebAudio(暂 no-op) | fetch `data.ypf` → MemSource | OPFS/局部存储(后) |
+| Android | `host-android` 编 aarch64-linux-android(cargo-ndk;APK) | wgpu(Vulkan/GLES) | cpal/oboe | APK assets(AAssetManager)→MemSource,或下载数据包→内部存储 | 应用内部存储(SaveIo fs 实现复用) |
+| CI/headless | `yu-cli run/case/bench` | soft | 无(NullSink) | fs | 只读观察(现状) |
+
+iOS/其它后续目标按同模式追加(L3 新宿主 + L1 端口实现),不另设机制。
+
+### 2.5.5 能力端口(契约示意;内核只认端口,不认平台)
+
+```rust
+trait AssetSource { fn mount(&self) -> Box<dyn DataSource>; }
+//   桌面 = Project::discover(fs);web = fetch 单 ypf → MemSource
+trait AudioSink   { fn attach(&mut self, snd: Arc<Mutex<SoundState>>); fn detach(&mut self); }
+//   桌面 = cpal(回调即时钟,语义随迁);web = no-op;headless = Null
+trait Clock       { fn now_ms(&mut self) -> u32; }
+//   桌面 = Instant;headless = 虚时钟(回放);web = performance.now
+trait SaveIo      { /* 槽位读写 */ }        // 桌面 = 目录;web = OPFS(后)
+trait PlatformSvc { /* B7:剪贴板/对话框/托盘/FONTINFO 枚举 */ }
+```
+
+### 2.5.6 设计规则(候选不变式,主人可升格 A6/A7)
+
+- **R1 内核零平台代码**:L0 禁 `std::fs`/墙钟/设备 IO,一切经端口注入
+  (现有 A3 时钟注入的推广)。
+- **R2 唯一装配**:所有宿主嵌同一 `yu-engine`;golden/case 语义 = 装配语义,
+  平台差异只允许存在于端口实现。
+- **R3 契约 = 数据 + 端口**:`CompositorFrame` 契约不变;宿主外设以端口交付,
+  禁止宿主反向伸进内核。
+- **R4 单一桌面入口**:桌面是 `yu-cli` 的运行期模式;wasm/Android 等是
+  同一代码基的编译目标(各自壳 crate、各自入口 ABI,均无 argv),不存在
+  运行期 `--mode wasm/android`。
+- **R5 声音平台所有**:`@_OS_SOUND` 注入恒按对拍口径,与是否真出声解耦。
+- **R6 wasm 基线 = soft**(确定性参考天然可移植);wgpu-web 是可选增强,
+  不作为验收门槛。
+
+### 2.5.7 是否最优:方案对比与取舍(2026-10-25 评估)
+
+**结论先行:在「多平台 + 对拍为真值 + 净室 + 单代码库」四约束下,v2 是
+结构最优;若任一约束放松(比如只做 Windows),更简单的方案反而更好。
+它是约束下的最优,不是无条件的最简。**
+
+备选方案对比:
+
+| 备选 | 结构 | 为什么落选 |
+|---|---|---|
+| v1.3 现状 | 装配寄居 `yu-cli`,host-desktop 复用 `yu_cli::Engine` | 依赖环堵死「桌面并入 CLI」;wasm/android 复用装配要么循环依赖要么复制;cpal 在 CLI 使 headless 不纯 |
+| A. 单 crate 巨石 + `cfg(target)` 全覆盖 | 不抽中间 crate | cfg 组合随平台数爆炸;wasm 与 native 依赖树纠缠(cpal/winit vs web-sys);装配无法单独测试,违反「边界=契约」(§2) |
+| B. 全面插件化/宿主全接口 trait 对象 | 一切皆插件 | 对拍要的是**唯一确定装配**;插件化制造组合不确定性,与 A3 相克;抽象税大于收益,过度设计 |
+| C. 每平台自持装配(N 份 Engine/main) | 各平台独立 | N 份漂移,golden 只锁得住一份;修一处改 N 处(旧接手线教训) |
+| D. 现成跨平台壳(Qt/Flutter/Tauri)包内核 | 框架出 UI | 像素契约(CompositorFrame→逐字段一致 RenderReport)必须自己搬;框架合成器是不可对拍层,体量与净室纪律冲突 |
+| **v2(选定)** | 唯一装配 + 端口 + 薄壳 | 见下方论证与真实成本 |
+
+为什么这四约束指向 v2:
+
+1. **对拍是第一公民**(真值层级 §0):「同输入 ⇒ 同帧」必须在每个平台可
+   验证 ⇒ 唯一装配 + 平台差异囚于端口,是结构上的最小充分条件;任何把
+   平台差异引进装配的方案都直接劣化对拍。
+2. **净室/零硬编码(A5)**:装配与端口不携带平台/游戏常量;A、C 都守不住。
+3. **目标数 ≥ 4**(桌面/浏览器/安卓/headless,后续可加 iOS)且共享同一
+   内核语义 ⇒ 复用同一装配的边际收益最大;目标越多,v2 相对 C 的优势
+   越大(维护量 O(1) vs O(N))。
+4. **迁移是搬不是重写**:H1 抽 crate 是单文件机械搬移(engine.rs 1342 行),
+   H2–H4 是删代码/搬代码;没有一步引入新算法语义 ⇒ 风险可控、可逐字节验收。
+
+真实成本与非最优处(诚实账,不藏):
+
+- 多一层 crate + 端口 trait 的间接(编译时间、跳转、API 面变大);
+- 桌面**双时钟**(Clock 端口推逻辑时间 vs 音频回调驱动声音)必须在 H2
+  定权威关系,否则声音/逻辑漂移 —— 已列入流程图注记;
+- wasm/安卓**首版体验上限**:soft 基线是 CPU 合成,低端机大分辨率可能吃力
+  (wgpu-web / Vulkan 是增强路径,不锁死);
+- Android 生命周期(suspend/resume)是唯一渗入装配的新语义 —— 以端口
+  调用进入,属最小侵入,但确实扩大了 `yu-engine` API;
+- egui 调试 UI 在安卓触摸下未验证(调试件,不阻塞主线)。
+
+### 2.5.8 迁移步骤(退出条件可验证)
+
+| # | 内容 | 退出条件 |
+|---|---|---|
+| H1 | 抽 `yu-engine`(engine.rs + project.rs 上移;`yu-cli`/`host-desktop` 改依赖,host-desktop 残余 `yu_cli::output/args` 引用一并改指) | 全测试绿;`host-desktop` 不再依赖 `yu-cli` |
+| H2 | 声音下沉:cpal SoundSink 移入 `host-desktop`;删 `device` feature;`@_OS_SOUND` 与 `--no-sound` 解耦 | headless 构建零声卡依赖;golden 逐字节不变 |
+| H3 | 桌面并入 CLI:`desktop` feature + `--mode desktop`;退役 `yu-desktop` bin | 同一 exe 两模式跑同一工程;`--shot` 与旧 exe 逐字节一致 |
+| H4 | 装配端口化:AssetSource/Clock/SaveIo/PlatformSvc 注入;headless 虚时钟 + NullSink | A3 回放测试全绿;serve/dev 不回归 |
+| H5 | 真 wasm 壳(host-web):MemSource + soft + present;www 双模式(本地 wasm / WS 调试) | 浏览器离线跑通同一工程;首 N 帧 hash 与 native soft 一致 |
+| H6 | 退役 WS 呈现链路(host-wasm);多平台对拍记录入台账 | 台账归档 |
+| H7 | `host-android` 壳(cargo-ndk + winit/android-activity + wgpu + cpal/oboe;AAssetManager→MemSource;**生命周期接线**:挂起=停时钟停泵、恢复=重建呈现器,复用 restart/DIV-HOST-001 机制;触摸→指针;APK 打包)。依赖 H4,可与 H5 并行 | 真机跑通同一工程,首 N 帧 hash 与 native soft 一致;挂起/恢复不丢状态、存档即时落盘 |
+
+### 2.5.9 开放问题(待主人定夺)
+
+1. 真 wasm 壳的 crate 命名与落位(新名 `host-web`?还是吸收现 `host-wasm` 名字)。
+2. www 页面双模式切换方式(路由/参数);WS 调试链路保留多久。
+3. wasm 存档选型(OPFS / localStorage / IndexedDB)与官方槽位大小约束。
+4. wgpu-web 是否纳入 wasm 目标(增强),还是长期 soft-only。
+5. `desktop` 是否进 `yu-cli` default features(单体分发 vs 分开 slim 构建)。
+6. Android 壳的组织:独立 `host-android`,还是把 `host-desktop` 泛化成
+   `host-native`(winit 家族)以 cfg 分支共享事件循环/呈现器(生命周期差异
+   是主要分叉点)。
+7. Android 分发形态:游戏数据内嵌 APK vs 首启下载到内部存储(影响
+   AssetSource 实现与包体;商业包体量需 Play asset delivery 评估)。
+8. armeabi-v7a 是否保留(Play 只强制 64 位)。
+9. 触摸交互:点击=鼠标左键之外,虚拟按键/手势映射是否要对齐官方
+   PDA 目标机语义(取证后定)。
+10. iOS 是否同模式启动(winit 有 UIKit 后端;音频 AVAudio;同
+    「新宿主 + 端口」模式,待主人排期)。
 
 ## 3. 一帧数据流(实现现状,架构 B)
 
