@@ -1134,3 +1134,113 @@ fn layer_composite_actions_write_to_id2() {
         assert_eq!(layer(&f, ":/W0/LOW").status, LayerStatus::Executable);
     }
 }
+
+/// `CGEND` 删除本就不存在的层 = 幂等空操作(`Verbose`,默认不显示)。
+///
+/// 证据:ERIS 精灵清理助手 `es.SP.DEL2.SET`(`yst00066` pc2008..)对每个
+/// 精灵槽**无条件**发 `CGEND`,不先查 `EXIST`;演出期实测刷出 1301 条
+/// WARN。后置条件在删除前已成立 ⇒ 与成功等价。
+///
+/// 级别选 `Verbose` 而非 `Info`:这不是运维信息,更不是告警 —— 默认输出里
+/// 出现 1300+ 条只会训练使用者忽略日志。只有 `--log-level verbose` 才看得到。
+#[test]
+fn cgend_on_absent_layer_is_idempotent_verbose() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CGEND",
+            vec![arg(&table, "CGEND", "ID", s("NEVER_CREATED"))],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let has_warn = f
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == "Recoverable");
+    assert!(!has_warn, "删除不存在的层不应产生 Recoverable 告警");
+    let entry = f
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "gfx.layer.already_absent")
+        .expect("应有幂等删除的留痕记录");
+    assert_eq!(entry.severity, "Verbose", "幂等删除属最低档,默认不显示");
+}
+
+/// `CGINFO[TEX]` 读回 `CG[TEX=]` 写入的值;层不存在时回 0(类型探测语义)。
+///
+/// 证据:`es_Sprite.yst` 源码
+/// - `CG[ID=... TEX=@_DXMODE]` 写入(`:4091/4144/4396/5280/...`);
+/// - `CGINFO[ID=... TEX=1 LET=@texchk]` 读回(`:3454/4155/5848/7770`);
+/// - `IF[@texchk==2]` 四处的分支注释为「E-moteレイヤなら」⇒ **2 = E-mote**。
+///
+/// 这四处 ID 由 `$LIDBUF+槽号` 拼出,未装载的槽自然不存在,且中间没有
+/// `EXIST` 前置检查 ⇒ 缺层必须答 0 而不是报 `gfx.info.missing`。
+#[test]
+fn cginfo_tex_reads_back_and_absent_is_zero() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SP")),
+                arg(&table, "CG", "FILE", s("cg/bg/x")),
+                arg(&table, "CG", "TEX", i(2)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let q = |gfx: &yu_gfx::GfxState, id: &str| {
+        gfx.query_info(
+            "CGINFO",
+            &[
+                arg(&table, "CGINFO", "ID", s(id)),
+                arg(&table, "CGINFO", "TEX", i(1)),
+            ],
+        )
+    };
+    assert_eq!(q(&gfx, "SP").expect("TEX 查询"), yu_rt::value::Value::Int(2));
+    assert_eq!(
+        q(&gfx, "NOT_LOADED").expect("缺层 TEX 应回 0 而不是报错"),
+        yu_rt::value::Value::Int(0)
+    );
+}
+
+/// `LINT`/`REMALLOC` 等非视觉参数原样留档,不再报 Unimplemented。
+///
+/// 它们不进像素、不进 `CGINFO` 返回值,留档即完整语义(手册 `cg/cg.html`
+/// 无页;语料里以固定常量出现)。
+#[test]
+fn nonvisual_cg_params_are_archived_without_unimplemented() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("L")),
+                arg(&table, "CG", "FILE", s("cg/x")),
+                arg(&table, "CG", "LINT", i(3)),
+                arg(&table, "CG", "REMALLOC", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let diag = f
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "gfx.param.nonvisual");
+    assert!(diag.is_none(), "非视觉参数不应报 Unimplemented");
+    let layer = layer(&f, ":/W0/L");
+    assert_eq!(layer.extra.get("LINT"), Some(&yu_gfx::EngineValue::Int(3)));
+    assert_eq!(layer.extra.get("REMALLOC"), Some(&yu_gfx::EngineValue::Int(1)));
+}

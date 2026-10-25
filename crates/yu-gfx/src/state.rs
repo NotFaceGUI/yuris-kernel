@@ -758,6 +758,16 @@ impl GfxState {
             return Ok(Value::Int(i64::from(self.nodes.contains_key(&parsed.path))));
         }
         let Some(node) = self.nodes.get(&parsed.path) else {
+            // `TEX` 是**类型探测**查询:脚本典型用法是先 `CGINFO[TEX]`
+            // 判 `==2`(E-mote)再决定要不要 `EMOTE[...]`,中间没有任何
+            // `EXIST` 前置检查。层不存在 ⇒ 不是 E-mote ⇒ 0。
+            // 证据:`es_Sprite.yst:3454/4155/5848/7770` 的四处
+            // `CGINFO[... TEX=1 LET=@texchk]` + `IF[@texchk==2]`,其分支
+            // 注释为「E-moteレイヤなら」;这些 ID 由 `$LIDBUF+槽号` 拼出,
+            // 未装载的槽自然不存在。
+            if flag == "TEX" {
+                return Ok(Value::Int(0));
+            }
             return Err(error::unimplemented(
                 error::code::INFO_MISSING,
                 format!("CGINFO[{}] 目标 `{}` 不存在", flag, parsed.path.display()),
@@ -789,6 +799,11 @@ impl GfxState {
             }),
             "SX" => Value::Int(self.query_layer_size(layer, true)?),
             "SY" => Value::Int(self.query_layer_size(layer, false)?),
+            // `TEX` = 表面类型码(`CG[TEX=]` 写入,零初始化):`2` 表示
+            // E-mote 层(`es_Sprite.yst:3455/4156/5849/7771` 的
+            // 「E-moteレイヤなら」分支按 `==2` 判定)。本内核不装载
+            // E-mote(`deferred(master)`),该值只会是脚本显式写入的。
+            "TEX" => Value::Int(layer.tex),
             "ONMOUSE" | "ONMOUSE2" | "ONMOUSE3" => {
                 let sampler = sampler.ok_or_else(|| {
                     error::unimplemented(
@@ -1542,11 +1557,15 @@ impl GfxState {
             return;
         }
         if !self.nodes.contains_key(&parsed.path) {
+            // 幂等删除:后置条件「该层不存在」已成立,与成功等价。
+            // 脚本侧是无条件清理(`es.SP.DEL2.SET` 对每个精灵槽都发 CGEND),
+            // 按 Recoverable 报会在演出期刷出上千条无意义 WARN;真正的故障
+            // 由后续对该层的 CGACT/CGINFO 暴露。
             self.push_diag(
                 "CGEND",
-                error::recoverable(
-                    error::code::LAYER_MISSING,
-                    format!("删除不存在的图层 `{}`", parsed.path.display()),
+                error::verbose(
+                    error::code::LAYER_ALREADY_ABSENT,
+                    format!("删除本就不存在的图层 `{}`(幂等空操作)", parsed.path.display()),
                 ),
             );
             return;
@@ -2680,6 +2699,7 @@ impl GfxState {
             mask: None,
             transition: None,
             clip: None,
+            tex: 0,
             status: LayerStatus::Executable,
             texture_status: LayerStatus::Executable,
             param_status: LayerStatus::Executable,
@@ -2714,6 +2734,7 @@ impl GfxState {
             mask: None,
             transition: None,
             clip: None,
+            tex: 0,
             status: LayerStatus::Executable,
             texture_status: LayerStatus::Executable,
             param_status: LayerStatus::Executable,
@@ -2741,6 +2762,7 @@ impl GfxState {
             mask: None,
             transition: None,
             clip: None,
+            tex: 0,
             status: LayerStatus::Executable,
             texture_status: LayerStatus::Executable,
             param_status: LayerStatus::Executable,
@@ -3567,6 +3589,18 @@ fn apply_layer_params(
             },
             "SX" => sx = value.as_int(),
             "SY" => sy = value.as_int(),
+            // `TEX`:表面类型码。`CG` 写入、`CGINFO[TEX]` 读回。脚本
+            // `es_Sprite.yst:4091/4144/5280/...` 用 `TEX=@_DXMODE` 写入,
+            // `:3455/4156/5849/7771` 用 `IF[@texchk==2]`(分支注释
+            // 「E-moteレイヤなら」)判定 E-mote ⇒ **2 = E-mote**。
+            // 它不是「未分类非视觉参数」:有明确的写入→读回语义。
+            "TEX" => match value.as_int() {
+                Some(n) => layer.tex = n,
+                None => diags.push(error::recoverable(
+                    error::code::ARG_TYPE,
+                    "参数 `TEX` 期望整数",
+                )),
+            },
             "MODE" => match value.as_int() {
                 Some(n) => match BlendMode::from_code(n) {
                     Some(m) => {
@@ -3670,6 +3704,29 @@ fn apply_layer_params(
                     "参数 `MID` 期望字符串",
                 )),
             },
+            // `LINT` / `REMALLOC`:合法的**非视觉**参数,原样留档即完整语义。
+            //
+            // - `LINT`(手册 `cg/cg.html` 无页):`es_Button.yst:2421` 的注释
+            //   是「レイヤにボタン番号格納」—— 把**按钮号**写进图层,供引擎
+            //   点击命中时回读(`:2422 CG[ID=$off LINT=@mLC]`、
+            //   `:3131/3290` 同型;`:2860` 用 `LINT=0` 注销)。
+            //   注意它**不是**「线路件 id 组」——那是早前无证据的猜测,已更正。
+            //   语料里脚本从不回读 LINT,消费方是引擎的点击分派。
+            //   本内核没有引擎那套「图层→按钮号」命中链,故只留档;
+            //   脚本可见行为(命中后走哪个 GOSUB)由按钮层几何 +
+            //   `ONMOUSE` 查询承担,不依赖此字段。
+            // - `REMALLOC`:`es_Sprite.yst:8652` 原注释
+            //   「//メモリ再確保しない」⇒ 控制 `CG` 重建时是否重新分配缓冲,
+            //   纯内存策略,不影响像素或查询结果。
+            //
+            // 两者都不进像素、不进 `CGINFO` 返回值 ⇒ 不是「未分类/未实现」。
+            //
+            // `LINT2` 与 `LINT` 同族(语料 0 次调用,保留同一归档口径)。
+            // `TSX`/`TSY` **不在此列**:语料 0 次、手册无页、语义完全未知,
+            // 继续走下面的兜底并如实报「未分类」—— 不确定的参数不能假装已归档。
+            "LINT" | "LINT2" | "REMALLOC" => {
+                layer.extra.insert(name.clone(), value.clone());
+            }
             other => {
                 if let Some(fp) = FilterParam::from_name(other) {
                     // TODO(DIV-GFX-003):槽位→+0x1b0..+0x200 绑定/变换公式未取证。

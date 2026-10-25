@@ -7658,3 +7658,104 @@ cargo test -p yu-save -p yu-vfs -p yu-trace -p yu-engine \
 - `FILEINFO SIZE/RELATION` ×626:宿主文件事实查询,挂账 B10。
 
 新增档案:`DIV-GFX-062`(本轮黑屏)、`DIV-GFX-063`(无手册页滤镜族 `partial(no-manual)`)。
+
+## 成果 DIAG-CLEAN (2026-10-25) · 日志告警收口:1306 条诊断 → 非 Info 仅 1 条(E-mote 暂缓)
+
+> 口径:「接下来你需要修补的是 大量的 warn 和 UNIMP」。
+> 全量取证与逐条锚点见 `docs/divergences/DIV-RT-054-diagnostic-noise-cleanup.md`。
+
+### 方法与结果
+
+700 帧 headless 真实语料抓 JSONL,按 (severity, code) 聚合后**逐条查证据**
+(手册 / `es_Sprite.yst` 源码 / `yst00066.ybn` 编译产物 / REA 0x495)。
+
+| 修复前 | 修复后 |
+|---|---|
+| 1301 Recoverable `gfx.layer.missing` | Info `gfx.layer.already_absent` |
+| 626 Unimplemented `sv.command.unimplemented` | **0**(纯误报) |
+| 979 Unimplemented `gfx.info.unsupported` | **0**(实现 TEX) |
+| 300 Unimplemented `gfx.info.missing` | **0**(缺层 TEX 回 0) |
+| 3 Unimplemented `gfx.param.nonvisual` | **0**(合法参数归档) |
+| 3 Unimplemented `rt.cmd.unimplemented` | 1(E-mote `deferred(master)`) |
+| 2 Recoverable `sv.path.escape` | **0**(绝对路径误判) |
+| 2 Recoverable `sv.file.missing` | Info(幂等删除) |
+
+**收口后非 Info 诊断:1 条**,即主人明令暂缓的 E-mote。
+
+### 两类问题的区分(关键)
+
+这批告警混了三种性质,处置完全不同:
+
+1. **误报**(`FILEINFO` ×626、`FILEACT` ×1):内核/宿主已实现或已由别的
+   宿主消费,诊断却照报。→ 删掉或修正判定。
+2. **归属**(`SYSTEM` ×1、`TRAY`):语义在宿主/平台边界外,内核只发事件。
+   → 按域事件契约 §9 标 `aligned_stub`,不进挂号表。
+3. **未实现**(`CGINFO[TEX]`):真的缺功能。→ 取证后实现。
+
+第 2 类**没有**为了消警告而假装已实现:`SYSTEM` 的逐参数处理体仍未定位
+(手册无 `system.html`、`BACKGROUNDEXEC` 全手册 0 命中、经
+`YU-RISScreenSaver` 字符串 xref 找到的 `0x41b42c` 是屏保窗口创建而非
+命令处理体),故只声明归属、不声称逐参数对齐。
+
+### 实现:CGINFO[TEX](`fixed(no-manual)`)
+
+手册 `cg/cginfo.html` 的字段表没有 `TEX`。证据来自脚本源码的四处闭环:
+`CG[... TEX=@_DXMODE]` 写入(`:4091/4144/4396/5280/...`),
+`CGINFO[... TEX=1 LET=@texchk]` 读回(`:3454/4155/5848/7770`),
+紧跟的 `IF[@texchk==2]` 分支注释为「E-moteレイヤなら」⇒ **2 = E-mote**。
+
+`Layer` 新增 `tex: i64`(零初始化),`CG` 写、`CGINFO` 读;层不存在时回 0
+(类型探测语义 —— 四处 ID 由 `$LIDBUF+槽号` 拼出,未装载的槽自然不存在,
+中间无 `EXIST` 前置检查)。
+
+### 附带修掉的 bug
+
+- `FILEACT` 被误报未接线:`SaveHost` 契约确实消费 `Domain::Save|File`,
+  但 VM 的 `handled` 判定漏算 ⇒ 补上;
+- `sv.path.escape`:脚本 `$es.SAVEPATH = $_SAVE_PATH` 传的是宿主注入的
+  **绝对路径**,旧 `confined_path` 见绝对路径即拒。改为接受但仍强制
+  「必须在 save 根内、不得含 `..`」(安全边界未放松)。
+
+### 验证
+
+```text
+700 帧真实语料           非 Info 诊断 = 1(E-mote);此前 1306 条非 Info
+cargo test --workspace   80 套件全绿
+像素回归(wgpu 演出1 f900) sha256 9584b2d6… 与修复前逐位相同
+```
+
+新增测试 3 条(幂等删除 / TEX 读写与缺层回 0 / 非视觉参数归档);
+更新 `tray_is_a_domain_event` 断言以对齐 §9 归属。
+
+### 残留(在册)
+
+- `SYSTEM` 逐参数处理体待定位(归属已定);
+- E-mote 全族 `deferred(master)`;
+- `gfx.texture.missing`(1 条 Info)是 `CG` 无 `FILE` 时的正常 get-or-create 路径。
+
+## 成果 RENDER-GRAPH (2026-10-25) · 渲染耗时曲线窗口(egui 独立窗)
+
+`--debug-ui`(F1 同开关)下新增独立 egui 窗口 **render time (ms)**,
+横轴 = 宿主帧推进(固定容量 300 样本,约 5 秒 @60fps),纵轴 = 引擎
+`FrameReport::render_ms`。曲线按当前样本耗时三色分级:
+
+| 色 | 区间 | 含义 |
+|---|---|---|
+| 绿 | `< 8 ms` | 余量充足 |
+| 黄 | `8 – 16.7 ms` | 接近 60fps 预算 |
+| 红 | `≥ 16.7 ms` | 掉出 60fps 帧预算 |
+
+- 采样在 `App::record_frame` 里逐帧入环形缓冲,**面板关闭期间也采样**,
+  打开即见最近历史;`Restart` 时清空(新运行代际)。
+- 纵轴按窗口内最大值自适应(下限 1.5 × 16.7ms),仅自适应不固定刻度,
+  长尖峰也能整体入图;两条参考线(黄/红阈值)半透明绘制。
+- 窗口与主面板同属 `wants_egui` 惰性路径:面板隐藏时整条 egui 管线不跑,
+  不产生额外开销。
+
+### 验证
+
+```text
+cargo check -p yu-host-desktop -p yu-cli   Finished(无 warning)
+```
+
+行为验收由主人跑 `--debug-ui` 目视(按约定不新增测试)。

@@ -995,6 +995,18 @@ pub struct Layer {
     pub transition: Option<Transition>,
     /// 范围裁剪(目前只由显式数据填充;组尺寸由离屏 RT 天然裁剪)。
     pub clip: Option<RectI>,
+    /// `TEX`:`CG` 写入、`CGINFO[TEX]` 读回的表面类型码。
+    ///
+    /// 证据(`es_Sprite.yst` **源码**,非编译产物):
+    /// - `CG[ID=... TEX=@_DXMODE]` 在建层时写入(`:4091/4144/4396/5280/...`);
+    /// - `CGINFO[ID=... TEX=1 LET=@texchk]` 随后读回(`:3454/4155/5848/7770`);
+    /// - `IF[@texchk==2]` 的四处分支注释为「E-moteレイヤなら」⇒ **2 = E-mote 层**。
+    ///
+    /// 语料里**没有任何脚本**把 `TEX` 设成 2(E-mote 由引擎装载时置位);
+    /// 本内核 E-mote 属 `deferred(master)`,故该字段只会是 `CG[TEX=]` 的显式
+    /// 值(语料中恒为 `@_DXMODE` = 0)。未设置 = 0:层对象零初始化,语义即
+    /// 「非 E-mote、非纹理化」。
+    pub tex: i64,
     /// 有效状态(= `texture_status` 优先,否则 `param_status`)。
     pub status: LayerStatus,
     /// 纹理级状态(`CGACT` 复制/图像加工留下)。

@@ -487,7 +487,18 @@ impl Vm {
                     && matches!(domain, Domain::Graphics | Domain::Window))
                     || (self.sound_host.is_some()
                         && domain == Domain::Sound
-                        && matches!(cmd.name.as_str(), "SOUND" | "SOUNDEND"));
+                        && matches!(cmd.name.as_str(), "SOUND" | "SOUNDEND"))
+                    // 文件域由 `SaveHost` 消费:实现在 `yu_save::SaveState::
+                    // apply_event` 的 match 里,逐命令是
+                    // `FILEACT`(落盘/复制/删除)与 `FILEINFO`(事实统计)。
+                    // `SaveHost::apply_event` 的契约是「事件 drain 时调用」
+                    // (见 `event.rs` trait 注释),不在本命令点同步发生,
+                    // 所以判据是「宿主已安装 **且命令名确实被它处理**」。
+                    //
+                    // 必须按名收窄:早前写成整个 `Domain::File` 会把
+                    // `FOLDER` 之类**真未实现**的查询一起吞掉,那才是掩盖问题。
+                    || (self.save_host.is_some()
+                        && matches!(cmd.name.as_str(), "FILEACT" | "FILEINFO"));
                 if !handled {
                     if matches!(cmd.name.as_str(), "MIDI" | "MIDIEND" | "MIDIINFO" | "CDDA") {
                         // 官方 0.495 处理体是空桩(0x44aa40/0x44aa60/0x44aa80、
@@ -498,6 +509,37 @@ impl Vm {
                             &cmd.name,
                             "官方 0.495 处理体为空桩(0x44aa40/0x44aa60/0x44aa80、\
                              CDDA 0x429fb0),同型对齐:只发域事件,无媒体输出(声音台账 N0-10)"
+                                .to_string(),
+                        );
+                    } else if domain == Domain::System {
+                        // `SYSTEM`(`SCREENSAVER`/`BACKGROUNDEXEC`/`SX`/`SY`/
+                        // `TIMECOUNT*`)是**宿主窗口/进程策略**:全部参数由
+                        // 引擎写进进程级状态供 WndProc 读,没有脚本可见返回。
+                        // 域事件契约 §9 把 `TRAY` 等 System 域命令定为宿主边界;
+                        // `SYSTEM` 同属此类 —— 内核只发事件,由平台层决定是否
+                        // 设置屏保/后台执行策略。不是「未实现」,按归属记录
+                        // (Info,每命令名一次),不计挂号表。
+                        //
+                        // 取证限制:手册 `system/` 目录下**没有** `system.html`
+                        // (只有 fps/input/mouse),`BACKGROUNDEXEC` 全手册 0 命中;
+                        // 引擎侧逐参数处理体尚未定位(0x41b42c 是屏保窗口创建,
+                        // 不是命令处理体)。故此处只声明**归属**,不声称逐参数
+                        // 已对齐 —— 参数值照原样进事件载荷,平台层可作为。
+                        self.report_aligned_stub(
+                            &cmd.name,
+                            "SYSTEM 参数为宿主窗口/进程策略(屏保、后台执行、客户区尺寸、\
+                             计时器),无脚本可见返回;内核只发域事件(域事件契约 §9)"
+                                .to_string(),
+                        );
+                    } else if domain == Domain::Emote {
+                        // E-mote 家族:主人明令暂缓(`deferred(master)`,B9)。
+                        // 仍走 Unimplemented 而不是静默,避免下游把「没做」
+                        // 误当「做了但没效果」;但文案标明这是**已决定暂缓**,
+                        // 不是待查项。
+                        self.report_unimplemented(
+                            &cmd.name,
+                            "E-mote 域:deferred(master)(路线图 B9,主人明令暂缓);\
+                             语义属 E-mote 运行时,内核边界外"
                                 .to_string(),
                         );
                     } else {

@@ -54,7 +54,7 @@ fn parse_script(sid: u32) -> Result<yu_rt::tables::ScriptFile, String> {
 }
 
 fn boot_vm(root: &str) -> Vm {
-    let src = DirSource::open(format!("{root}/save/data"), Codec::Cp932).unwrap();
+    let src = DirSource::open(format!("{root}/data"), Codec::Cp932).unwrap();
     let aux = DirSource::open(root, Codec::Cp932).unwrap();
     Vm::boot_with_aux(
         Box::new(src),

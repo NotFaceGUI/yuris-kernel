@@ -255,17 +255,13 @@ impl SaveState {
                 ));
             }
             "FILEINFO" => {
-                // FILEINFO[FILE+EXIST+LET] 已由内核实现(J3,REA 0x44286c);
-                // 宿主不双写。SIZE/RELATION 的宿主文件事实查询未取证。
-                self.push_diag(error::at_command(
-                    error::unimplemented(
-                        code::COMMAND_UNIMPLEMENTED,
-                        "FILEINFO SIZE/RELATION 未实现(宿主文件事实查询挂账 B10;EXIST 已由内核实现)"
-                            .to_string(),
-                    ),
-                    *frame,
-                    command,
-                ));
+                // 查询**已全部由内核实现**(`op_fileinfo`):`EXIST` 走封包/散盘
+                // 四策略(REA 0x44286c→0x44316c),`SIZE` 走 `FindFirstFileA`
+                // (0x443572),`RELATION` 走 `FindExecutableA`(0x4429e6)。
+                // 内核自己会为真正未实现的支(如 `FOLDER`)发带位置的诊断,
+                // 宿主这里**不得**再对每条事件无条件报「SIZE/RELATION 未实现」
+                // —— 那会产出与事实相反的误报(演出1 实测 626 条)。
+                // 事件仍计入域计数,供诊断面板观察调用量。
             }
             other => {
                 self.push_diag(error::at_command(
@@ -644,10 +640,14 @@ impl SaveState {
                 ));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 幂等删除:后置条件「该文件不存在」已成立。
+                // 脚本 `es_SaveLoad.yst:417` 的注释是「上書き保存でなく
+                // 新規保存にする」—— 它在**每次保存前**无条件删旧槽,
+                // 首次保存时目标本就不存在,属正常路径而非故障。
                 self.push_diag(error::at_command(
-                    error::recoverable(
+                    error::verbose(
                         code::FILE_MISSING,
-                        format!("FILEACT[DELETE] 目标不存在: {file}"),
+                        format!("FILEACT[DELETE] 目标本就不存在(幂等): {file}"),
                     ),
                     frame,
                     "FILEACT",
@@ -720,24 +720,68 @@ impl SaveState {
         }
     }
 
-    /// 把 save 根内相对名解析成安全绝对路径:`..`/绝对路径/越界一律
+    /// 把路径名解析成安全绝对路径:越出 save 根/含 `..` 一律
     /// `sv.path.escape`(安全拒绝;契约文档 §5「宿主必须自己做路径归一化
     /// 与越界检查」)。
+    ///
+    /// **接受 save 根内的绝对路径**:脚本用 `$es.SAVEPATH = $_SAVE_PATH`
+    /// (宿主注入的 save 目录绝对路径)拼文件名,`es_First.yst:30` 的
+    /// `FILEACT[CREATE=1 FOLDER=$es.SAVEPATH]` 与 `es_SaveLoad.yst` 的
+    /// 删除/复制都直接传这个绝对前缀。旧实现见绝对路径即拒,把合法调用
+    /// 误判成越界(演出1 实测 2 条)。真正的安全边界仍是「不得越出 save 根」。
     fn confined_path(&self, name: &str) -> Result<PathBuf, Diag> {
         if name.is_empty() {
             return Err(error::recoverable(code::ARG_MISSING, "路径名为空"));
         }
-        let rel = Path::new(name);
-        if rel.is_absolute() || name.contains('\\') {
+        let raw = Path::new(name);
+        // 绝对路径:只做越界校验(必须在 save 根内)。
+        if raw.is_absolute() {
+            for comp in raw.components() {
+                if matches!(comp, std::path::Component::ParentDir) {
+                    return Err(error::recoverable(
+                        code::PATH_ESCAPE,
+                        format!("路径含 `..`: {name}"),
+                    ));
+                }
+            }
+            // 目标可能尚不存在(`FILEACT[CREATE=1 FOLDER=...]` 建目录、
+            // 新建存档文件),`canonicalize` 会失败 —— 此时退化为**词法**
+            // 前缀校验。
+            //
+            // 判据只能是 `raw` 等于 save 根、或位于其下;不能反写
+            // `root.starts_with(raw)` —— 那会放行 save 根的**祖先**
+            // (`D:/.../project-eris` 之于 `.../project-eris/save`),
+            // 等于允许脚本从上层目录读删。
+            let lexical_ok = raw == self.root.as_path() || raw.starts_with(&self.root);
+            let (Ok(root), Ok(resolved)) = (self.root.canonicalize(), raw.canonicalize()) else {
+                return if lexical_ok {
+                    Ok(raw.to_path_buf())
+                } else {
+                    Err(error::recoverable(
+                        code::PATH_ESCAPE,
+                        format!("绝对路径不在 save 根内: {name}"),
+                    ))
+                };
+            };
+            return if resolved.starts_with(&root) {
+                Ok(resolved)
+            } else {
+                Err(error::recoverable(
+                    code::PATH_ESCAPE,
+                    format!("目标解析后越出 save 根: {name}"),
+                ))
+            };
+        }
+        if name.contains('\\') {
             return Err(error::recoverable(
                 code::PATH_ESCAPE,
                 format!("路径非 save 根内相对形式: {name}"),
             ));
         }
-        let joined = self.root.join(rel);
+        let joined = self.root.join(raw);
         let Ok(resolved) = joined.canonicalize() else {
             // 目标不存在时退化为词法归一化(仍拒绝 `..` 分量)。
-            for comp in rel.components() {
+            for comp in raw.components() {
                 if matches!(comp, std::path::Component::ParentDir) {
                     return Err(error::recoverable(
                         code::PATH_ESCAPE,
@@ -1065,4 +1109,40 @@ mod tests {
             .join("../../target/tmp")
             .join(name)
     }
+}
+
+/// 路径越界防护:save 根的**祖先**绝不能被当作合法绝对路径。
+///
+/// 回归点:`FILEACT[CREATE=1 FOLDER=$es.SAVEPATH]` 需要放行 save 根本身
+/// (及下层),但词法兜底若写成 `root.starts_with(raw)` 就会连
+/// `D:/.../project-eris`(save 的父目录)一起放行 —— 脚本可以借此
+/// 在上层目录读删文件。
+#[test]
+fn confined_path_rejects_save_root_ancestor() {
+    // 生产路径的 save 根一定是**绝对**路径(宿主注入 `$_SAVE_PATH`);
+    // 这里必须同构构造,否则 `is_absolute()` 为 false 会走相对分支。
+    let abs = std::env::current_dir()
+        .expect("cwd")
+        .join("target/tmp/sv-confine-a/b/save");
+    let state = SaveState::new(abs.clone(), false);
+    let root = state.root.clone();
+    assert!(root.is_absolute(), "测试前置:save 根须为绝对路径");
+    let parent = root.parent().expect("save 根有父目录").to_path_buf();
+
+    // save 根本身:放行(CREATE 场景)。
+    state
+        .confined_path(&root.to_string_lossy())
+        .expect("save 根本身应放行");
+
+    // 其下层绝对路径:放行。
+    let child = root.join("save30001.sd");
+    state
+        .confined_path(&child.to_string_lossy())
+        .expect("save 根下层应放行");
+
+    // 祖先目录:必须拒绝。
+    let err = state
+        .confined_path(&parent.to_string_lossy())
+        .expect_err("save 根的祖先必须被拒绝");
+    assert_eq!(err.code, code::PATH_ESCAPE, "祖先应报 PATH_ESCAPE");
 }

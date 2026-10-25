@@ -19,6 +19,15 @@ pub mod code {
     pub const LAYER_MISSING: &str = "gfx.layer.missing";
     /// 图层 ID/路径非法。
     pub const LAYER_INVALID_ID: &str = "gfx.layer.invalid_id";
+    /// `CGEND` 删除本就不存在的图层:幂等空操作,不是缺陷。
+    ///
+    /// 证据:ERIS 的精灵清理助手 `es.SP.DEL2.SET`(`yst00066.ybc` pc2008..)
+    /// 对每个精灵槽**无条件**发 `CGEND`,不先查 `CGINFO[EXIST]`;同一模式在
+    /// `es.SP.FINISH.SET`/`es.SP.DELALL.SET` 也出现。后置条件「该层不存在」
+    /// 在删除前已成立 ⇒ 与成功等价,引擎也无从报错(它会继续执行后续命令)。
+    /// 真正会出问题的是**之后**对同名的 `CGACT`/`CGINFO`,那些仍按
+    /// [`LAYER_MISSING`]/[`INFO_MISSING`] 报 —— 真实故障点在用法处暴露。
+    pub const LAYER_ALREADY_ABSENT: &str = "gfx.layer.already_absent";
     /// 图层/图层组种类冲突(同一路径先建为组、后当图层用等)。
     pub const LAYER_KIND: &str = "gfx.layer.kind";
     /// 纹理/资源引用缺失或非法。
@@ -85,6 +94,15 @@ pub fn unimplemented(code: &'static str, detail: impl Into<String>) -> Diag {
 
 pub fn info(code: &'static str, detail: impl Into<String>) -> Diag {
     Diag::new(code, Severity::Info, Boundary::Domain).with_detail(detail)
+}
+
+/// 最低档:**只在 `--log-level verbose` 时显示**。
+///
+/// 用于「正常但值得留痕」的事实:幂等空操作、类型探测的缺省应答等。
+/// 它们不是 INFO 级别的运维信息,更不是 WARN —— 默认输出里出现只会训练
+/// 使用者忽略日志。需要排查时手动 `--log-level verbose` 打开。
+pub fn verbose(code: &'static str, detail: impl Into<String>) -> Diag {
+    Diag::new(code, Severity::Verbose, Boundary::Domain).with_detail(detail)
 }
 
 /// 给诊断补脚本位置(命令名/帧号)。图形域只拿得到事件帧号,

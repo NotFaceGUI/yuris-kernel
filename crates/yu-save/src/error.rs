@@ -74,6 +74,14 @@ pub fn info(code: &'static str, detail: impl Into<String>) -> Diag {
     Diag::new(code, Severity::Info, Boundary::Domain).with_detail(detail)
 }
 
+/// 最低档:**只在 `--log-level verbose` 时显示**。
+///
+/// 用于「正常但值得留痕」的事实(幂等空操作等)。默认输出里出现只会
+/// 训练使用者忽略日志;需要排查时手动打开。
+pub fn verbose(code: &'static str, detail: impl Into<String>) -> Diag {
+    Diag::new(code, Severity::Verbose, Boundary::Domain).with_detail(detail)
+}
+
 /// 给诊断补命令名/帧号(宿主只拿得到事件帧号)。
 pub fn at_command(mut diag: Diag, frame: u64, command: &str) -> Diag {
     diag.where_ = yu_log::Loc::script(

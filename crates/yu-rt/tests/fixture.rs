@@ -3467,10 +3467,13 @@ fn tray_is_a_domain_event() {
         e,
         yu_rt::VmEvent::DomainCall { domain: yu_rt::event::Domain::System, name, .. } if name == "TRAY"
     )));
+    // `TRAY`/`SYSTEM` 属 System 域 = 宿主窗口/托盘策略(域事件契约 §9):
+    // 内核只发事件、无脚本可见返回,属**归属**而非未实现 ⇒ 不进挂号表
+    // (以 Info 记录一次,码 `rt.cmd.aligned_stub`)。
     assert_eq!(
         vm.unimplemented_cmds().get("TRAY").copied(),
-        Some(1),
-        "未安装系统域宿主 ⇒ 事件已发但挂号"
+        None,
+        "System 域命令归宿主,不应进未实现挂号表"
     );
 }
 
