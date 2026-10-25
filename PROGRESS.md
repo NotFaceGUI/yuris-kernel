@@ -6365,7 +6365,7 @@ $ yu-cli case <project-eris> --all → 9 passed; 0 failed
 
 ## 成果 R3-fix (2026-10-24) · `RETURNCODE` 手动模式恢复判据修复 —— 商业包初始化链贯通
 
-> 触发:主人实测 `kotoneiro`(v494/3.3GB 单包)——「开屏 logo 显示成了对话框」
+> 触发:主人实测 `<game-b>`(v494/3.3GB 单包)——「开屏 logo 显示成了对话框」
 > + 「必须手动点击才推进」。两个症状同一根因。
 > 改动:`crates/yu-rt/src/task.rs`(恢复判据)、`crates/yu-rt/src/vm.rs`
 > (`text_auto_mode` 实现)、`crates/yu-rt/src/vm/handlers.rs`(失效锚点文案)、
@@ -6428,7 +6428,7 @@ $ cargo test -p yu-rt        # 66+4+11+4+73+3 全绿
 $ cargo test -p yu-rt --test fixture manual_outputmode_returncode_resumes_without_input
 test manual_outputmode_returncode_resumes_without_input ... ok
 
-$ yu-cli run <kotoneiro> --frames 400 --shot final-title.png
+$ yu-cli run <game-b> --frames 400 --shot final-title.png
 frame: 402 viewport: 1100x825
 layers: 234 (visible 11), passes: 73
 ops: 79 total, 78 drawn, 1 skipped
@@ -6437,8 +6437,8 @@ events: drained=2028539 dropped=0
 ```
 
 - 帧 1..239 无输入即连续推进(修前帧 1 起 `cmds=0`);
-- 帧 240 起画面开始演进;**帧 300 = 完整标题画面**(背景 CG + 「コトネイロ
-  Kotoneiro」logo + 六个菜单项 最初からはじめる/続きからはじめる/CGモード/
+- 帧 240 起画面开始演进;**帧 300 = 完整标题画面**(背景 CG + `<game-b>`
+  标题 logo + 六个菜单项 最初からはじめる/続きからはじめる/CGモード/
   回想モード/コンフィグ/終了する);
 - 任务面稳定为 `SYSTEM` + `es.IDSubTask` + `es.IDSubTask2` + `es.ScenarioScript`
   (修前恒为单任务 `SYSTEM` 卡死)。
@@ -6500,7 +6500,7 @@ events: drained=2028539 dropped=0
 
 ## 成果 CP932-text (2026-10-24) · 字符串操作按 CP932 字符边界统一(片头 LOGO 破名根因)
 
-> 触发:主人实测 `kotoneiro`(v494)片头**厂商 LOGO 整段黑屏**;并指出
+> 触发:主人实测 `<game-b>`(v494)片头**厂商 LOGO 整段黑屏**;并指出
 > 「这个作品图片是日文命名的」——直指编码处理。要求做成**真正的通用**修复,
 > 而非单点补丁。
 > 改动:新增 `crates/yu-rt/src/cp932_text.rs`(唯一字符边界真源);
@@ -6554,7 +6554,7 @@ events: drained=2028539 dropped=0
 $ cargo test -p yu-rt --lib
 test result: ok. 70 passed; 0 failed    （含 4 个新增 cp932_text 单测）
 
-$ probe_cg_files <kotoneiro> 90
+$ probe_cg_files <game-b> 90
 f84  s65 pc99 CG [ID="SPLBUF1" Z=1 FILE="cg/ev/サークル"]     ← 修前为 フーハル
 ```
 
