@@ -675,6 +675,8 @@ struct App {
     dialog_inputs: std::collections::BTreeMap<u64, String>,
     /// 已打过「呈现」日志的 DIALOG id(每个 id 只记一次)。
     presented_dialogs: std::collections::BTreeSet<u64>,
+    /// 渲染耗时曲线样本(`--debug-ui` 的独立窗口;每宿主帧一个)。
+    render_samples: std::collections::VecDeque<f32>,
 }
 
 impl App {
@@ -751,6 +753,7 @@ impl App {
             profile_frames,
             dialog_inputs: Default::default(),
             presented_dialogs: Default::default(),
+            render_samples: std::collections::VecDeque::with_capacity(ui::RENDER_GRAPH_SAMPLES),
         })
     }
 
@@ -1117,6 +1120,7 @@ impl App {
                         // 重启 = 新运行代际:清空账本与冻结(现场已写日志)。
                         self.diagnostics = DiagnosticsHost::default();
                         self.diagnostics.set_console(self.console.clone());
+                        self.render_samples.clear();
                         if let Some(freeze) = self.freeze.take() {
                             host_line!(
                                 "yu-desktop: restart 已恢复冻结运行(原 panic: {})",
@@ -1331,6 +1335,7 @@ impl App {
                 .unwrap_or_default(),
         };
         let actions = ui::debug_window(ctx, &snapshot);
+        ui::render_graph_window(ctx, &self.render_samples);
         if actions.clear_log {
             if let Some(console) = &self.console {
                 console.clear_recent();
@@ -1439,6 +1444,12 @@ impl App {
     ) {
         let host_frame = self.frames;
         let engine_frame = self.engine.last_report().frame;
+        // 渲染曲线:每宿主帧一个样本,环形只留最近 N 个。面板关闭期间
+        // 也采样,打开时看到的是真实历史而不是重新开始的空曲线。
+        self.render_samples.push_back(render_ms as f32);
+        while self.render_samples.len() > ui::RENDER_GRAPH_SAMPLES {
+            self.render_samples.pop_front();
+        }
         self.frame_rows.push(FrameRow {
             host_frame,
             engine_frame,

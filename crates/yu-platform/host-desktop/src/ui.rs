@@ -21,6 +21,25 @@ pub const PANIC_RED: Color32 = Color32::from_rgb(176, 24, 24);
 /// 琥珀横幅(卡住 / Fatal 挂号)。
 pub const ATTENTION_AMBER: Color32 = Color32::from_rgb(150, 96, 8);
 
+/// 渲染曲线保留的样本数(宿主帧);约 5 秒 @60fps。
+pub const RENDER_GRAPH_SAMPLES: usize = 300;
+/// 曲线分级阈值:低于 8ms 绿,8–16.7ms 黄,≥16.7ms(60fps 帧预算)红。
+const GRAPH_GREEN_MS: f32 = 8.0;
+const GRAPH_RED_MS: f32 = 16.7;
+const GRAPH_GREEN: Color32 = Color32::from_rgb(72, 190, 96);
+const GRAPH_YELLOW: Color32 = Color32::from_rgb(226, 184, 64);
+const GRAPH_RED: Color32 = Color32::from_rgb(226, 72, 64);
+
+fn graph_color(ms: f32) -> Color32 {
+    if ms < GRAPH_GREEN_MS {
+        GRAPH_GREEN
+    } else if ms < GRAPH_RED_MS {
+        GRAPH_YELLOW
+    } else {
+        GRAPH_RED
+    }
+}
+
 /// 面板/横幅需要的全部读数(逐帧复制;`diagnostics` 借用,不 clone 大表)。
 pub struct UiSnapshot<'a> {
     pub backend: String,
@@ -115,6 +134,90 @@ pub fn debug_window(ctx: &egui::Context, snap: &UiSnapshot<'_>) -> UiActions {
             ui.label(format!("GPU: {}", snap.gpu));
         });
     actions
+}
+
+/// 渲染耗时曲线(独立窗口,随 F1 / `--debug-ui` 一起显隐)。
+///
+/// 每个宿主帧一个样本,横轴按固定容量滚动、最新样本贴右边;线色按
+/// 当前样本耗时分级:绿 < 8ms、黄 < 16.7ms、红 ≥ 16.7ms。
+pub fn render_graph_window(ctx: &egui::Context, samples: &std::collections::VecDeque<f32>) {
+    egui::Window::new("render time (ms)")
+        .default_pos([470.0, 12.0])
+        .default_width(430.0)
+        .resizable(true)
+        .collapsible(true)
+        .show(ctx, |ui| {
+            let last = samples.back().copied().unwrap_or(0.0);
+            let max = samples.iter().copied().fold(0.0_f32, f32::max);
+            let avg = if samples.is_empty() {
+                0.0
+            } else {
+                samples.iter().sum::<f32>() / samples.len() as f32
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{last:.2} ms"))
+                        .color(graph_color(last))
+                        .strong(),
+                );
+                ui.weak(format!(
+                    "avg {avg:.2} · max {max:.2} · {} frames",
+                    samples.len()
+                ));
+            });
+
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width().max(160.0), 130.0),
+                egui::Sense::hover(),
+            );
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 4.0, Color32::from_rgb(20, 20, 22));
+
+            // 纵轴按窗口内最大值自适应;至少留到 1.5 倍红线,避免曲线贴顶。
+            let top = max.max(GRAPH_RED_MS * 1.5).max(1.0);
+            let y_of = |ms: f32| rect.bottom() - (ms / top) * rect.height();
+            for (ms, color) in [(GRAPH_GREEN_MS, GRAPH_YELLOW), (GRAPH_RED_MS, GRAPH_RED)] {
+                let y = y_of(ms);
+                painter.line_segment(
+                    [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                    egui::Stroke::new(1.0, color.gamma_multiply(0.45)),
+                );
+            }
+
+            // 横轴固定容量:x 间距不随样本数变化,曲线从右往左生长。
+            let dx = rect.width() / (RENDER_GRAPH_SAMPLES - 1) as f32;
+            for i in 1..samples.len() {
+                let from_right_prev = samples.len() - i;
+                let from_right_cur = samples.len() - 1 - i;
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.right() - from_right_prev as f32 * dx, y_of(samples[i - 1])),
+                        egui::pos2(rect.right() - from_right_cur as f32 * dx, y_of(samples[i])),
+                    ],
+                    egui::Stroke::new(1.5, graph_color(samples[i])),
+                );
+            }
+            if let Some(last) = samples.back() {
+                painter.circle_filled(
+                    egui::pos2(rect.right(), y_of(*last)),
+                    2.0,
+                    graph_color(*last),
+                );
+            }
+            painter.text(
+                egui::pos2(rect.left() + 4.0, rect.top() + 2.0),
+                egui::Align2::LEFT_TOP,
+                format!("0–{top:.1} ms"),
+                egui::FontId::monospace(10.0),
+                Color32::GRAY,
+            );
+
+            ui.horizontal(|ui| {
+                ui.colored_label(GRAPH_GREEN, format!("< {GRAPH_GREEN_MS:.0} ms"));
+                ui.colored_label(GRAPH_YELLOW, format!("< {GRAPH_RED_MS:.1} ms"));
+                ui.colored_label(GRAPH_RED, format!("≥ {GRAPH_RED_MS:.1} ms"));
+            });
+        });
 }
 
 fn why_stuck(ui: &mut egui::Ui, snap: &UiSnapshot<'_>) {
