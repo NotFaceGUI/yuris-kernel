@@ -2234,7 +2234,67 @@ fn one_text_line_per_frame_until_advance_input() {
     assert_eq!(rc_count(&vm), 3);
 }
 
-/// R9 回归:GOSUB 允许 64 次嵌套,第 65 次 Fatal。
+/// R3 回归(手动模式):`TEXT[OUTPUTMODE=0]` 下 `RETURNCODE` 只休憩**一帧**,
+/// 不等待点击。
+///
+/// 引擎 `FUN_004046fc`(`0x4046fc..0x404835`)对 `task+9` 的恢复判据:
+/// - `0x404711 CMP byte[state+0x1c],1`(文本状态 = `TEXT[OUTPUTMODE]`);
+/// - `0x404715 JNE 0x404828` ⇒ 手动(0)/其它值**无条件恢复**,不经按钮表;
+/// - `== 1`(自动)才读 CLICKBUTTON/SKIPBUTTON(`0x5b48ac..0x5b48bc`)。
+///
+/// v494 同构(`0x44c20c` 头部逐指令对齐,`[0x802ad8]` vs `[0x801800]`)。
+///
+/// 语料意义:ERIS 框架 `es_first` 首指令 `TEXT[OUTPUTMODE=0]`,若把手动模式
+/// 也当"等点击",`ES.CHARNAME.DEFINE`(s84,256 组)这类定义链会永久停住 ——
+/// 实测 `<game-b>` 表现为"必须手动点击才推进、只画出半套 GAMEMAIN 皮肤"。
+#[test]
+fn manual_outputmode_returncode_resumes_without_input() {
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    const OP_RETURNCODE: u8 = 79;
+    const OP_WORD: u8 = 106;
+    const OP_TEXT: u8 = 96;
+    let word = |s: &str| GroupSpec::new(OP_WORD).window(0, s.as_bytes().to_vec());
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TEXT).window(1, ex::i32_(0)), // OUTPUTMODE=0 手动
+        word("A"),
+        GroupSpec::new(OP_RETURNCODE).window(1, Vec::new()),
+        word("B"),
+        GroupSpec::new(OP_RETURNCODE).window(2, Vec::new()),
+        word("C"),
+        GroupSpec::new(OP_RETURNCODE).window(3, Vec::new()),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let texts = |vm: &Vm| -> Vec<Vec<u8>> {
+        vm.events()
+            .iter()
+            .filter_map(|e| match e {
+                yu_rt::VmEvent::Text { bytes, .. } => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // 全程零输入:每帧一行,不需要任何点击。
+    vm.tick_at(0, &no_input());
+    assert_eq!(texts(&vm), vec![b"A".to_vec()], "第一帧出 A");
+    vm.tick_at(16, &no_input());
+    assert_eq!(
+        texts(&vm),
+        vec![b"A".to_vec(), b"B".to_vec()],
+        "手动模式:无输入也进入下一行"
+    );
+    vm.tick_at(32, &no_input());
+    assert_eq!(
+        texts(&vm),
+        vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
+        "手动模式:继续自动推进"
+    );
+}
+
+/// R9 回归:`GOSUB` 允许 64 次嵌套,第 65 次 Fatal。
 ///
 /// 手册 `control/gosub.html`:「GOSUBのネストは64回まで可能です」;
 /// 引擎 `FUN_004459c4` @0x4459e6:`depth+1 == 0x40` 报错。

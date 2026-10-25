@@ -233,7 +233,28 @@ pub trait TaskExecutor {
     /// 本逻辑帧是否出现「推进文本」输入(引擎 `0x4046fc` 的 5 个按钮:
     /// `0x5b48ac..` = MOUSE_L(1) / ENTER(13) / PAD(0x3FF) / PAD(0x3FF) /
     /// CTRL(17),任一计数器为正 ⇒ 清 `task+9` 让该任务恢复)。
+    ///
+    /// **只在自动模式生效**:见 [`TaskExecutor::text_auto_mode`]——
+    /// 引擎 `FUN_004046fc` 先判 `[state+0x1c]`,不等于 1 就直接恢复,
+    /// 按钮表只在 `== 1` 的分支里读。
     fn text_advance_requested(&self) -> bool {
+        false
+    }
+    /// 文本输出模式是否为自动(`TEXT[OUTPUTMODE]` = 引擎文本状态 `+0x1c`)。
+    ///
+    /// 引擎 `FUN_004046fc`(`0x4046fc..0x404835`)对 `task+9` 的恢复判据:
+    /// - `0x404711 CMP byte[state+0x1c],1`;
+    /// - `0x404715 JNE 0x404828` ⇒ **手动(0)/其它值:无条件恢复**,不经任何
+    ///   按钮表(目标 `0x40482d MOV byte[task+9],0`);
+    /// - `== 1`(自动)才进 `0x40471b..0x4047ec` 的 SKIPBUTTON/CLICKBUTTON
+    ///   计数器判定(`0x5b48ac..0x5b48bc`)。
+    ///
+    /// 手册 `basic/task.html` 的「一旦休憩します(約0.016秒)」即手动模式的
+    /// 一帧休憩。ERIS 框架在 `es_first` 首指令 `TEXT[OUTPUTMODE=0]` 切手动、
+    /// 自己用 `INPUT`/`MOUSE` 状态机做点击等待 —— 所以 `RETURNCODE` 之后
+    /// 必须自动恢复;否则整条初始化链会永久停在第一条文本行上(实测:
+    /// `キャラ名定義` 的 256 组定义每帧只推进一条,不点不动)。
+    fn text_auto_mode(&self) -> bool {
         false
     }
     /// 该任务是否在等待一条 DIALOG 回答(内核模态;DIV-RT-044)。
@@ -396,9 +417,15 @@ impl Scheduler {
             if !nodes[i].enabled || nodes[i].finished {
                 continue;
             }
-            // 文本等待(引擎 `task+9`):未出现推进输入 ⇒ 本 vsync 跳过该任务。
+            // 文本等待(引擎 `task+9`,`FUN_004046fc` `0x4046fc..0x404835`):
+            // 先判文本输出模式 `[state+0x1c]`。
+            //   0x404711 CMP byte[state+0x1c],1
+            //   0x404715 JNE 0x404828        → 手动:直达 0x40482d 清标志
+            //   自动(==1):才读 CLICKBUTTON/SKIPBUTTON(`0x5b48ac..0x5b48bc`)
+            // 手动模式 = 一帧休憩(手册 basic/task.html「一旦休憩します」);
+            // 把它当成"等点击"会让没有输入驱动的初始化链永久停住。
             if nodes[i].text_rest {
-                if !exec.text_advance_requested() {
+                if exec.text_auto_mode() && !exec.text_advance_requested() {
                     continue;
                 }
                 nodes[i].text_rest = false;

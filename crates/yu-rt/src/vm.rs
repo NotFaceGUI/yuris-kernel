@@ -1948,6 +1948,15 @@ impl TaskExecutor for Vm {
             .text_advance_requested(&self.text.click_buttons, &self.text.skip_buttons)
     }
 
+    /// `TEXT[OUTPUTMODE]`(= 引擎文本状态 `+0x1c`):1 = 自动,其余 = 手动。
+    ///
+    /// 调度器用它决定 `task+9` 的恢复判据(引擎 `FUN_004046fc`
+    /// `0x404711 CMP byte[state+0x1c],1` / `0x404715 JNE`):手动模式一帧即恢复,
+    /// 只有自动模式才等推进输入。见 `task::TaskExecutor::text_auto_mode`。
+    fn text_auto_mode(&self) -> bool {
+        self.text.output_mode == 1
+    }
+
     fn dialog_pending(&self, task: &str) -> bool {
         self.dialogs.iter().any(|d| d.task == task)
     }
