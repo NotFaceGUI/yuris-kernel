@@ -1315,10 +1315,20 @@ impl Vm {
 
     /// `VARINFO`:手册 `variable/varinfo.html`;引擎 §3.21。
     fn op_varinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        // 参数名表(按 opcode 从工程 ysc 取)。SEARCH 的针值槽与 `NO=` 槽
+        // **必须按名字解析**:这两组槽号在 v494/0.495 之间整体位移,写死数字
+        // 会在另一版静默失效(2026-10-25 实测,见 `array_needle`)。
+        let varinfo_names: Vec<String> = self
+            .tables()
+            .boot
+            .yscm
+            .command(cmd.opcode)
+            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
         let mut target: Option<crate::expr::LValue> = None;
         let mut set: Option<crate::expr::LValue> = None;
         let mut op: Option<(u8, i64)> = None;
-        // 全部数值槽(SEARCH 的 NO=20 与 INT/FLT 针值要用)。
+        // 全部数值槽(SEARCH 的针值与 `NO=` 起始下标要用)。
         let mut flags: Vec<(u8, i64)> = Vec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
@@ -1331,7 +1341,15 @@ impl Vm {
                     let v = self.eval_window(st, w)?;
                     if let Some(n) = v.as_int() {
                         flags.push((slot, n));
-                        if op.is_none() && n != 0 && !matches!(slot, 17..=20) {
+                        // 「查询项」= 置位的旗标参数,**排除辅助参数**
+                        // (`INT`/`FLT`/`STR` 是 SEARCH 的针值,`NO` 是起始
+                        // 下标)。按名字排除,不按槽号区间 —— 后者的区间
+                        // 在版本间会位移(`17..=20` 在 v494 上是错的)。
+                        let is_helper = matches!(
+                            varinfo_names.get(usize::from(slot)).map(String::as_str),
+                            Some("INT" | "FLT" | "STR" | "NO")
+                        );
+                        if op.is_none() && n != 0 && !is_helper {
                             op = Some((slot, n));
                         }
                     }
@@ -1365,28 +1383,42 @@ impl Vm {
             }
         };
         let shape = (shape_ty, shape_dims.as_slice());
-        let result_val = match slot {
-            2 => Value::Int(match shape.0 {
+        // 查询项按**参数名**分派。槽号在版本间会整体位移(`VARINFO` 在
+        // v494/0.495 之间就移过位),而参数名稳定;写死数字会让某一边
+        // 静默落到错误分支。
+        let query = varinfo_names.get(usize::from(slot)).map(String::as_str);
+        let result_val = match query {
+            Some("TYPE") => Value::Int(match shape.0 {
                 ElemType::Int => 1,
                 ElemType::Float => 2,
                 ElemType::Str => 3,
             }),
-            4 => Value::Int(shape.1.len() as i64),
-            5..=12 => {
-                let k = (slot - 5) as usize;
-                match shape.1.get(k) {
+            Some("DIMNUM") => Value::Int(shape.1.len() as i64),
+            // `DIMSIZE` / `DIMSIZE2..8`:名字尾部编号 = 维序号(1 起)。
+            Some(name) if name.starts_with("DIMSIZE") => {
+                let k = match name.strip_prefix("DIMSIZE") {
+                    None | Some("") => 1,
+                    Some(digits) => digits.parse::<usize>().map_err(|_| {
+                        diag::fatal(
+                            code::rt::CMD_SLOT,
+                            Boundary::Script,
+                            format!("VARINFO 参数名 `{name}` 的维序号不可解析"),
+                        )
+                    })?,
+                };
+                match shape.1.get(k - 1) {
                     Some(&d) => Value::Int(d as i64),
                     None => {
                         return Err(diag::fatal(
                             code::rt::VAR_SHAPE,
                             Boundary::Script,
-                            format!("VARINFO DIMSIZE{} 超出维数 {}", k + 1, shape.1.len()),
+                            format!("VARINFO {name} 超出维数 {}", shape.1.len()),
                         )
                         .into())
                     }
                 }
             }
-            13 => {
+            Some("LENGTH") => {
                 // 保留 SET 里写的下标(`$_PSTR(1)` 的 `(1)`);无下标才用 0 号元素。
                 let idx: Vec<i64> = if set.indices.is_empty() {
                     vec![0; shape.1.len()]
@@ -1409,8 +1441,8 @@ impl Vm {
             // `SEARCH`:手册 `variable/varinfo.html` 例 5/6/7 ——
             // 从 NO 号元素开始在一维数组里找第一个相等的元素,返回下标,
             // 找不到返回 -1。要搜索的值由 `INT=`/`FLT=`/`STR=` 参数给出。
-            14 => {
-                let need = array_needle(self, cmd, st, set_var)?;
+            Some("SEARCH") => {
+                let need = array_needle(&varinfo_names, self, cmd, st, set_var)?;
                 let (ty, dims) = shape;
                 let (ty, dims) = (ty, dims.to_vec());
                 if dims.len() != 1 {
@@ -1421,7 +1453,12 @@ impl Vm {
                     )
                     .into());
                 }
-                let start = flags_get(&flags, 20).unwrap_or(0).max(0);
+                // `NO=` 槽号同样按参数名解析(写死 20 在 v494 上会取不到)。
+                let no_slot = varinfo_no_slot(&varinfo_names);
+                let start = no_slot
+                    .and_then(|s| flags_get(&flags, s))
+                    .unwrap_or(0)
+                    .max(0);
                 let found = match &need {
                     Some(want) => self
                         .store
@@ -1436,7 +1473,11 @@ impl Vm {
                 return Err(diag::unimplemented(
                     code::rt::CMD_UNIMPLEMENTED,
                     Boundary::Script,
-                    format!("VARINFO 参数序号 {other} 未实现(STRTYPE/SJISCODE/UTF8CODE 无手册例;DIV-RT-011)"),
+                    format!(
+                        "VARINFO 参数 `{}`(槽 {slot})未实现\
+                         (STRTYPE/SJISCODE/UTF8CODE 无手册例;DIV-RT-011)",
+                        other.unwrap_or("<不在工程 ysc 表>")
+                    ),
                 )
                 .into())
             }
@@ -1525,15 +1566,18 @@ impl Vm {
                 .into());
             }
         }
-        let flag = |slot: u8| flags.iter().find(|(s, _)| *s == slot).map(|(_, v)| *v);
-        let num = |slot: u8| {
-            flags
-                .iter()
-                .find(|(s, _)| *s == slot)
-                .map(|(_, v)| *v)
+        // 旗标一律**按参数名**判定(槽号在版本间会位移,见 `Vm::param_slot`)。
+        let names = self.param_names(cmd.opcode);
+        let slot_of = |want: &str| names.iter().position(|n| n == want).map(|i| i as u8);
+        let flag = |want: &str| {
+            slot_of(want).and_then(|slot| flags.iter().find(|(s, _)| *s == slot).map(|(_, v)| *v))
+        };
+        let num = |want: &str| {
+            slot_of(want)
+                .and_then(|slot| flags.iter().find(|(s, _)| *s == slot).map(|(_, v)| *v))
                 .unwrap_or(0)
         };
-        if flag(6).is_some() {
+        if flag("TYPE").is_some() {
             self.varact_type_calls = self.varact_type_calls.saturating_add(1);
             // TYPE:按目标类型转换(手册例 1/2;§3.22)。
             let target = letv.ok_or_else(|| {
@@ -1570,28 +1614,41 @@ impl Vm {
         //
         // 这是 ERIS 启动链的硬依赖(`es_SoundDefine` 之类在初始化时
         // `VARACT[INIT=1 G_*]` 把全局表恢复成初值)。
-        if flag(16).is_some() || (17..=28).any(|s| flag(s).is_some()) {
+        // `G_*` 族按名字识别(不是按 17..=28 的槽号区间):族 = 前缀,
+        // 位号 = 名字尾部数字(`G_INT` ⇒ 0,`G_INT3` ⇒ 3)。
+        // 掩码位 = **组号 - 1**(与 `restore_globals` 的 `1 << (group-1)` 对齐)。
+        // `G_INT` ⇒ 组 1 ⇒ bit 0;`G_INT2` ⇒ 组 2 ⇒ bit 1 …… `G_INT4` ⇒ bit 3。
+        let g_mask = |want_prefix: &str, family: usize, masks: &mut [u8; 3]| {
+            for (i, name) in names.iter().enumerate() {
+                let Some(idx) = family_index(name, want_prefix) else {
+                    continue;
+                };
+                if idx >= 4 {
+                    continue;
+                }
+                if flags.iter().any(|(s, _)| usize::from(*s) == i) {
+                    masks[family] |= 1 << idx;
+                }
+            }
+        };
+        // **必须看「本次指令给了哪些参数」,不能看「表里有没有这些名字」**
+        // —— 后者恒真,会把每条 VARACT 都误判进 INIT/G_* 分支并提前返回。
+        let any_g = flags.iter().any(|(slot, _)| {
+            names
+                .get(usize::from(*slot))
+                .is_some_and(|n| n.starts_with("G_INT") || n.starts_with("G_FLT") || n.starts_with("G_STR"))
+        });
+        if flag("INIT").is_some() || any_g {
             self.varact_init_calls = self.varact_init_calls.saturating_add(1);
-            if flag(16).is_none() {
+            if flag("INIT").is_none() {
                 // INIT **不在场**:引擎判定链 `je 0x454e05`(函数尾)——
                 // 什么都不做(旁线 §3.26 ③)。判据是在场,与值无关。
                 return Ok(StepOutcome::Continue);
             }
             let mut masks = [0u8; 3]; // INT / FLT / STR 三族的 4 位掩码
-            for slot in 17..=28u8 {
-                // 掩码位 = 载入器预写的「参数在场字节」(`0x454d3d
-                // movzx eax,byte ptr [0x684171]  ; G_INT 在场?` +
-                // `test/je`;旁线 §3.26 ③)—— 同样与值无关。
-                if flag(slot).is_none() {
-                    continue;
-                }
-                let (family, bit) = match slot {
-                    17..=20 => (0usize, slot - 17),
-                    21..=24 => (1usize, slot - 21),
-                    _ => (2usize, slot - 25),
-                };
-                masks[family] |= 1 << bit;
-            }
+            g_mask("G_INT", 0, &mut masks);
+            g_mask("G_FLT", 1, &mut masks);
+            g_mask("G_STR", 2, &mut masks);
             self.restore_globals(st, &masks)?;
             return Ok(StepOutcome::Continue);
         }
@@ -1606,17 +1663,19 @@ impl Vm {
         // 手册 `variable/varact.html` 例 9/10:`VARACT[DIMSIZE=500 SET=@A()]`
         // 与 `VARACT[DIMSIZE+=1 SET=@A()]` —— **没有 LET**,原地改数组。
         // 同理 PUSH/POP(例未给,但参数表无 LET 语义需求)。
-        if flag(13).is_some() {
+        if flag("DIMSIZE").is_some() {
             // 手册例 9/10:`DIMSIZE=500`(绝对值)/ `DIMSIZE+=1`(相对值)。
             // 语料实测 **104/104 都是 `+=`**,复合码在窗口 `slot` 高字节
             // (与 `LET` 同一编码:0== 1+= 2-= …)。
+            // 按名取窗口(槽号会位移);`slot >> 8` 是复合赋值码位。
+            let dimsize_slot = slot_of("DIMSIZE");
             let code = (cmd
                 .windows
                 .iter()
-                .find(|w| w.rec.kind == 13)
+                .find(|w| Some(w.rec.kind) == dimsize_slot)
                 .map(|w| w.rec.slot >> 8)
                 .unwrap_or(0)) as u8;
-            let operand = num(13);
+            let operand = num("DIMSIZE");
             let (ty, dims) = self.var_shape(set_var).ok_or_else(|| {
                 diag::unimplemented(
                     code::rt::VAR_UNDECLARED,
@@ -1661,9 +1720,9 @@ impl Vm {
             self.resize_1d(set_var, ty, new_len.max(0) as usize)?;
             return Ok(StepOutcome::Continue);
         }
-        if flag(14).is_some() || flag(15).is_some() {
-            let push = flag(14).is_some();
-            let pos = num(if push { 14 } else { 15 }).max(0) as usize;
+        if flag("PUSH").is_some() || flag("POP").is_some() {
+            let push = flag("PUSH").is_some();
+            let pos = num(if push { "PUSH" } else { "POP" }).max(0) as usize;
             self.shift_1d(set_var, pos, push)?;
             return Ok(StepOutcome::Continue);
         }
@@ -1685,33 +1744,33 @@ impl Vm {
         };
         let out;
         self.varact_bytes = self.varact_bytes.saturating_add(bytes.len() as u64);
-        if flag(3).is_some() || flag(2).is_some() {
-            let pos = num(4).max(1) as usize;
-            let len = num(5).max(0) as usize;
-            out = if flag(3).is_some() {
+        if flag("COPY").is_some() || flag("CUT").is_some() {
+            let pos = num("POS").max(1) as usize;
+            let len = num("LENGTH").max(0) as usize;
+            out = if flag("COPY").is_some() {
                 self.varact_ops[0] = self.varact_ops[0].saturating_add(1);
                 copy_chars(&bytes, pos, len)
             } else {
                 self.varact_ops[1] = self.varact_ops[1].saturating_add(1);
                 cut_chars(&bytes, pos, len)
             };
-        } else if flag(7).is_some() {
+        } else if flag("UPPER").is_some() {
             self.varact_ops[2] = self.varact_ops[2].saturating_add(1);
             out = ascii_case(&bytes, true);
-        } else if flag(8).is_some() {
+        } else if flag("UPPER2").is_some() {
             self.varact_ops[3] = self.varact_ops[3].saturating_add(1);
             out = fullwidth_case(&bytes, true);
-        } else if flag(9).is_some() {
+        } else if flag("LOWER").is_some() {
             self.varact_ops[4] = self.varact_ops[4].saturating_add(1);
             out = ascii_case(&bytes, false);
-        } else if flag(10).is_some() {
+        } else if flag("LOWER2").is_some() {
             self.varact_ops[5] = self.varact_ops[5].saturating_add(1);
             out = fullwidth_case(&bytes, false);
-        } else if flag(11).is_some() {
+        } else if flag("HANTOZEN").is_some() {
             self.varact_ops[6] = self.varact_ops[6].saturating_add(1);
             // 半角→全角:表/算法逐条见 `crate::case_tables`(0x4546aa..)。
             out = crate::case_tables::hantozen(&bytes);
-        } else if flag(12).is_some() {
+        } else if flag("ZENTOHAN").is_some() {
             self.varact_ops[7] = self.varact_ops[7].saturating_add(1);
             // 全角→半角:0x4548cf.. / 0x46b395。
             out = crate::case_tables::zentohan(&bytes);
@@ -1936,6 +1995,7 @@ impl Vm {
         // 引擎建任务时先把 T* 寄存器逐槽清零(`0x450916..0x450943`:
         // `+0x348/+0x34c`=TFLT、`+0x3d0/+0x3d4`=TINT、`+0x458`=TSTR),
         // 再按 TINT/TFLT/TSTR 参数落位 ⇒ **未传的槽为 0,不继承调用者**。
+        let names = self.param_names(cmd.opcode);
         let mut tints = [0i64; 16];
         let mut tflts = [0f64; 16];
         let mut tstrs: [Vec<u8>; 16] = std::array::from_fn(|_| Vec::new());
@@ -1944,29 +2004,22 @@ impl Vm {
             if w.rec.length == 0 {
                 continue;
             }
-            match w.rec.kind {
-                0 => {
+            // 窗口按**参数名**分派(槽号在版本间会位移,名字稳定)。
+            // `TINT`/`TFLT`/`TSTR` 族:族 = 前缀,槽位 = 后缀数字 - 1
+            // (`TINT` ⇒ 0、`TINT2` ⇒ 1 …… 与 `_TINT(1..10)` 的 `n-1` 同口径)。
+            let pname = names.get(usize::from(w.rec.kind)).map(String::as_str);
+            match pname {
+                Some("ID") => {
                     if let Value::Str(bytes) = self.eval_window(st, w)? {
                         id = Some(cp932_lossy(&bytes));
                     }
                 }
-                1 => enabled = self.eval_window(st, w)?.as_int().unwrap_or(1) != 0,
-                3 => priority = self.eval_window(st, w)?.as_int().unwrap_or(1),
-                slot @ 4..=13 => {
-                    tints[(slot - 4) as usize] = self.eval_window(st, w)?.as_int().unwrap_or(0);
-                }
-                slot @ 14..=23 => {
-                    tflts[(slot - 14) as usize] = self.eval_window(st, w)?.as_f64().unwrap_or(0.0);
-                }
-                slot @ 24..=33 => {
-                    if let Value::Str(bytes) = self.eval_window(st, w)? {
-                        tstrs[(slot - 24) as usize] = bytes;
-                    }
-                }
+                Some("E") => enabled = self.eval_window(st, w)?.as_int().unwrap_or(1) != 0,
+                Some("Z") => priority = self.eval_window(st, w)?.as_int().unwrap_or(1),
                 // SCRIPTPOS(手册 `control/task.html` 例 4:位置情報の上書き =
                 // 事実上のスクリプト位置ロード)。blob 由 TASKINFO[SCRIPTPOS]
                 // 产出,脚本视为不透明数据;本实现 blob = [script_id u32][pc u32]。
-                35 => {
+                Some("SCRIPTPOS") => {
                     if let Value::Str(bytes) = self.eval_window(st, w)? {
                         if bytes.len() == 8 {
                             script_pos = Some((
@@ -1976,7 +2029,10 @@ impl Vm {
                         }
                     }
                 }
-                34 => {
+                // 入口标签槽:本作与 ERIS 语料的 ysc 里该参数名都是 `#`
+                // (实测 v494 `TASK` 表 `#34  # kind=String`)。空串为防御
+                // 保留(某些编译器可能写匿名参数名)。
+                Some("#" | "") => {
                     if let Value::Str(bytes) = self.eval_window(st, w)? {
                         label = Some(self.find_label(&bytes).ok_or_else(|| {
                             diag::fatal(
@@ -1987,12 +2043,31 @@ impl Vm {
                         })?);
                     }
                 }
-                slot => {
+                Some(name) if name.starts_with("TINT") => {
+                    if let Some(i) = family_index(name, "TINT") {
+                        tints[i] = self.eval_window(st, w)?.as_int().unwrap_or(0);
+                    }
+                }
+                Some(name) if name.starts_with("TFLT") => {
+                    if let Some(i) = family_index(name, "TFLT") {
+                        tflts[i] = self.eval_window(st, w)?.as_f64().unwrap_or(0.0);
+                    }
+                }
+                Some(name) if name.starts_with("TSTR") => {
+                    if let Some(i) = family_index(name, "TSTR") {
+                        if let Value::Str(bytes) = self.eval_window(st, w)? {
+                            tstrs[i] = bytes;
+                        }
+                    }
+                }
+                other => {
                     return Err(diag::unimplemented(
                         code::rt::CMD_UNIMPLEMENTED,
                         Boundary::Script,
                         format!(
-                            "TASK 参数序号 {slot}(SCRIPTPOS/TEXTPOS/RESTART 等)未实现(DIV-RT-015)"
+                            "TASK 参数 `{}`(槽 {})未实现(TEXTPOS/RESTART 等;DIV-RT-015)",
+                            other.unwrap_or("<不在工程 ysc 表>"),
+                            w.rec.kind
                         ),
                     )
                     .into())
@@ -2154,17 +2229,20 @@ impl Vm {
         let Some((slot, _)) = ops.iter().find(|(_, v)| *v != 0).copied() else {
             return Ok(StepOutcome::Continue);
         };
-        let value = match slot {
-            2 => Value::Int(node.is_some() as i64),
-            3 => Value::Int(node.as_ref().map(|n| n.enabled as i64).unwrap_or(0)),
-            5 => Value::Int(node.as_ref().map(|n| n.priority).unwrap_or(0)),
-            6 => {
+        // 查询项按**参数名**分派(槽号在版本间会位移,名字稳定)。
+        let names = self.param_names(cmd.opcode);
+        let query = names.get(usize::from(slot)).map(String::as_str);
+        let value = match query {
+            Some("EXIST") => Value::Int(node.is_some() as i64),
+            Some("E") => Value::Int(node.as_ref().map(|n| n.enabled as i64).unwrap_or(0)),
+            Some("Z") => Value::Int(node.as_ref().map(|n| n.priority).unwrap_or(0)),
+            Some("FILE") => {
                 // FILE:当前脚本文件名(手册)→ 由 `yst_list` 的名字表给出。
                 let sid = exec.as_ref().map(|e| e.script_id).unwrap_or(0);
                 Value::Int(sid as i64)
             }
-            7 => Value::Int(exec.as_ref().map(|e| e.script_id as i64).unwrap_or(-1)),
-            8 => {
+            Some("FILENO") => Value::Int(exec.as_ref().map(|e| e.script_id as i64).unwrap_or(-1)),
+            Some("LINE") => {
                 // LINE:当前执行行数(数据区 B 的逐 pc 源码位置)。
                 let (sid, pc) = exec
                     .as_ref()
@@ -2178,17 +2256,21 @@ impl Vm {
                     .unwrap_or(-1);
                 Value::Int(line)
             }
-            16 => Value::Int(exec.as_ref().map(|e| e.if_stack.len() as i64).unwrap_or(0)),
-            17 => Value::Int(
+            Some("IFNEST") => {
+                Value::Int(exec.as_ref().map(|e| e.if_stack.len() as i64).unwrap_or(0))
+            }
+            Some("GOSUBNEST") => Value::Int(
                 exec.as_ref()
                     .map(|e| e.frames.len().saturating_sub(1) as i64)
                     .unwrap_or(0),
             ),
-            18 => Value::Int(exec.as_ref().map(|e| e.loops.len() as i64).unwrap_or(0)),
+            Some("LOOPNEST") => {
+                Value::Int(exec.as_ref().map(|e| e.loops.len() as i64).unwrap_or(0))
+            }
             // SCRIPTPOS(手册 `control/taskinfo.html`:現在実行されている
             // スクリプト位置情報)。脚本视为不透明 blob;本实现 = 8 字节
             // [script_id u32 LE][pc u32 LE],与 `TASK[SCRIPTPOS=…]` 配对往返。
-            19 => {
+            Some("SCRIPTPOS") => {
                 let (sid, pc) = exec.as_ref().map(|e| (e.script_id, e.pc)).unwrap_or((0, 0));
                 let mut b = Vec::with_capacity(8);
                 b.extend_from_slice(&sid.to_le_bytes());
@@ -2199,7 +2281,10 @@ impl Vm {
                 return Err(diag::unimplemented(
                     code::rt::CMD_UNIMPLEMENTED,
                     Boundary::Script,
-                    format!("TASKINFO 参数序号 {other} 未实现(DIV-RT-015)"),
+                    format!(
+                        "TASKINFO 参数 `{}`(槽 {slot})未实现(DIV-RT-015)",
+                        other.unwrap_or("<不在工程 ysc 表>")
+                    ),
                 )
                 .into())
             }
@@ -4076,32 +4161,74 @@ impl Vm {
 
 // ---------------------------------------------------------------- 纯函数
 
+/// `TINT`/`TFLT`/`TSTR` 族的**槽位索引**:后缀数字 - 1。
+///
+/// `TINT` ⇒ 0、`TINT2` ⇒ 1 …… `TINT10` ⇒ 9。
+/// 与 `sysvar::param_index`(`@_TINT(n)` 读 `n-1`)及 `TaskExecState`
+/// 的 `task_ints[16]` 同口径。
+///
+/// **后缀 N 不是索引 N**:第一版按 `N` 取值,导致 `G_INT2`/`TINT2` 全部
+/// 错位一格(`TINT10` ⇒ 索引 10 越界被静默丢弃)。
+fn family_index(name: &str, prefix: &str) -> Option<usize> {
+    let rest = name.strip_prefix(prefix)?;
+    let n = match rest {
+        "" => 1,
+        digits => digits.parse::<usize>().ok()?,
+    };
+    let idx = n.checked_sub(1)?;
+    (idx < 16).then_some(idx)
+}
+
 fn flags_get(flags: &[(u8, i64)], slot: u8) -> Option<i64> {
     flags.iter().find(|(s, _)| *s == slot).map(|(_, v)| *v)
 }
 
 /// VARINFO SEARCH 的针值:`INT=`/`FLT=`/`STR=`(手册例 5/6/7)。
+///
+/// **槽号必须按工程 ysc 的参数名解析,不能写死数字**(2026-10-25 实测):
+/// `VARINFO` 的参数表随版本新增条目而整体位移 ——
+///
+/// | 工程 | INT | FLT | STR | NO |
+/// |---|---|---|---|---|
+/// | SDK 0.495 ERIS 语料 | 17 | 18 | 19 | 20 |
+/// | 商业包 v494(本作) | 15 | 16 | 17 | 18 |
+///
+/// 旧实现写死 17/18/19 与 `NO=20`。在 v494 上 `SEARCH` 取不到针值,
+/// 一律返回 -1:`es.LNO.GET("BGF")` 明明存在(`$3153[4]`)却判「未找到」,
+/// 后续 sprite 注册链整条走空。参数名跨版本稳定,槽号不稳定。
 fn array_needle(
+    varinfo_names: &[String],
     vm: &mut Vm,
     cmd: &Cmd,
     st: &ExecState,
     set: VarRef,
 ) -> Result<Option<Value>, VmError> {
     let ty = vm.store.shape(set).map(|s| s.0);
+    let want = match ty {
+        Some(ElemType::Str) => "STR",
+        Some(ElemType::Float) => "FLT",
+        Some(ElemType::Int) => "INT",
+        None => return Ok(None),
+    };
+    let Some(slot) = varinfo_names.iter().position(|n| n == want).map(|i| i as u8) else {
+        return Ok(None);
+    };
     for w in &cmd.windows {
-        if w.rec.length == 0 {
+        if w.rec.length == 0 || w.rec.kind != slot {
             continue;
         }
-        let is_needle = matches!(
-            (ty, w.rec.kind),
-            (Some(ElemType::Str), 19) | (Some(ElemType::Float), 18) | (Some(ElemType::Int), 17)
-        );
-        if is_needle {
-            return Ok(Some(vm.eval_window(st, w)?));
-        }
+        return Ok(Some(vm.eval_window(st, w)?));
     }
     let _ = cmd;
     Ok(None)
+}
+
+/// `VARINFO[NO=]`:SEARCH 的起始下标;按参数名解析(理由同 [`array_needle`])。
+fn varinfo_no_slot(varinfo_names: &[String]) -> Option<u8> {
+    varinfo_names
+        .iter()
+        .position(|n| n == "NO")
+        .map(|i| i as u8)
 }
 
 fn windows_error(cmd: &Cmd, detail: &str) -> yu_log::Diag {

@@ -1262,6 +1262,356 @@ fn var_add_macro_chain_appends() {
     );
 }
 
+/// `VARINFO[SEARCH]` 的针值槽 / `NO=` 槽**必须按参数名解析**。
+///
+/// 背景(2026-10-25,官方 v494 取证):`VARINFO` 的参数表随版本新增条目
+/// 整体位移 —— SDK 0.495 是 `INT=17/FLT=18/STR=19/NO=20`,商业包 v494 是
+/// `INT=15/FLT=16/STR=17/NO=18`。旧实现把 17/18/19/20 写死,在 v494 上
+/// `SEARCH` 取不到针值、恒返回 -1:`es.LNO.GET("BGF")` 明明存在却判
+/// 「未找到」,sprite 注册链整条走空(`es.SP.DRAW` 一次都不调用)。
+///
+/// 本用例故意把合成工程的 `VARINFO` 表改成 **v494 形态**(在 SEARCH 与
+/// INT 之间插入 SJISCODE/UTF8CODE 前的位置关系不同),断言 SEARCH 仍命中。
+/// 若有人改回硬编码槽号,这里会红。
+#[test]
+fn varinfo_search_resolves_slots_by_param_name() {
+    // v494 形态:INT=15 / FLT=16 / STR=17 / NO=18(SEARCH=14)。
+    let v494_varinfo: Vec<(&'static str, u8, u8)> = vec![
+        ("SET", 0, 0),
+        ("LET", 0, 0),
+        ("TYPE", 0, 3),
+        ("STRTYPE", 0, 3),
+        ("DIMNUM", 0, 3),
+        ("DIMSIZE", 0, 3),
+        ("DIMSIZE2", 0, 3),
+        ("DIMSIZE3", 0, 3),
+        ("DIMSIZE4", 0, 3),
+        ("DIMSIZE5", 0, 3),
+        ("DIMSIZE6", 0, 3),
+        ("DIMSIZE7", 0, 3),
+        ("DIMSIZE8", 0, 3),
+        ("LENGTH", 0, 3),
+        ("SEARCH", 0, 3),
+        ("INT", 0, 0),
+        ("FLT", 0, 0),
+        ("STR", 1, 0),
+        ("NO", 0, 1),
+    ];
+    let mut b = ProjectBuilder::new();
+    // 只换 VARINFO 的参数表,其余保持默认(命令顺序/opcode 不变)。
+    for c in b.commands.iter_mut() {
+        if c.0 == "VARINFO" {
+            c.1 = v494_varinfo.clone();
+        }
+    }
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        // $names: ["", "BGF", ""] —— 目标是要查到 "BGF" 在下标 1
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys,
+            value_type: 3,
+            dims: vec![4],
+            init: Init::Str(b""),
+        },
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b"BGF"),
+        },
+        // @hit:接收 SEARCH 结果
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys + 2,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(-99),
+        },
+    ];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let names = ex::r#ref(0x24, sys);
+    let needle = ex::get(0x24, sys + 1);
+    let hit = ex::r#ref(0x40, sys + 2);
+    b.scripts = vec![vec![
+        // $names[1] = "BGF"(元素 0/2 保持空串)
+        GroupSpec::new(OP_LET)
+            .window(0, ex::cat(&[names.clone(), ex::i8_(1), ex::aload()]))
+            .window(0, needle.clone()),
+        // VARINFO[SET=$names SEARCH=1 STR=$needle NO=0 LET=@hit]
+        // 槽号全部取 v494 表:SEARCH=14 / STR=17 / NO=18。
+        GroupSpec::new(101)
+            .window(0, names.clone())
+            .window(14, ex::i8_(1))
+            .window(17, needle)
+            .window(18, ex::i8_(0))
+            .window(1, hit),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 2), &[])
+            .unwrap(),
+        Value::Int(1),
+        "v494 参数表下 SEARCH 必须命中下标 1(写死 17/18/19/20 会返回 -1)"
+    );
+}
+
+/// `VARINFO` 的**所有**查询项都按参数名分派(不只是 SEARCH 的针值槽)。
+///
+/// 2026-10-25 审查轮:`op_varinfo` 原本用 `match slot { 2=>TYPE, 4=>DIMNUM,
+/// 5..=12=>DIMSIZE, 13=>LENGTH, 14=>SEARCH }` 写死槽号,查询项筛选也用
+/// `!matches!(slot, 17..=20)` 排除辅助参数 —— 这个区间在 v494 上根本是错的
+/// (v494 的 INT/FLT/STR/NO 是 15/16/17/18)。一旦参数表再位移,`TYPE` 会
+/// 落到别的分支上并静默给出错值。
+///
+/// 本用例把 `VARINFO` 表**整体前移**(去掉 SJISCODE/UTF8CODE 两项),使所有
+/// 槽号都变;断言 `TYPE`/`DIMNUM`/`DIMSIZE2`/`LENGTH`/`SEARCH` 依旧正确。
+#[test]
+fn varinfo_query_dispatch_follows_param_names() {
+    // 前移后的形态: TYPE=2 / DIMNUM=3 / DIMSIZE=4 / DIMSIZE2=5 /
+    // LENGTH=6 / SEARCH=7 / INT=8 / FLT=9 / STR=10 / NO=11
+    // —— 与默认表(TYPE=2/DIMNUM=4/DIMSIZE=5..12/LENGTH=13/SEARCH=14/
+    // INT=17/FLT=18/STR=19/NO=20)几乎每个槽号都不同。
+    let shifted: Vec<(&'static str, u8, u8)> = vec![
+        ("SET", 0, 0),
+        ("LET", 0, 0),
+        ("TYPE", 0, 3),
+        ("DIMNUM", 0, 3),
+        ("DIMSIZE", 0, 3),
+        ("DIMSIZE2", 0, 3),
+        ("LENGTH", 0, 3),
+        ("SEARCH", 0, 3),
+        ("INT", 0, 0),
+        ("FLT", 0, 0),
+        ("STR", 1, 0),
+        ("NO", 0, 1),
+    ];
+    let mut b = ProjectBuilder::new();
+    for c in b.commands.iter_mut() {
+        if c.0 == "VARINFO" {
+            c.1 = shifted.clone();
+        }
+    }
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        // $table: 3×2 字符串数组(用于 DIMNUM/DIMSIZE2)
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys,
+            value_type: 3,
+            dims: vec![3, 2],
+            init: Init::Str(b""),
+        },
+        // $flat: 一维字符串数组(SEARCH 只支持一维)
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 3,
+            dims: vec![2],
+            init: Init::Str(b""),
+        },
+        // @out(0..4): 五个结果槽
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys + 2,
+            value_type: 1,
+            dims: vec![5],
+            init: Init::Int(-1),
+        },
+    ];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let table = ex::r#ref(0x24, sys);
+    let flat = ex::r#ref(0x24, sys + 1);
+    let out = |i: i8| ex::cat(&[ex::r#ref(0x40, sys + 2), ex::i8_(i), ex::aload()]);
+    b.scripts = vec![vec![
+        // TYPE → out0(Str = 3)
+        GroupSpec::new(101)
+            .window(0, table.clone())
+            .window(2, ex::i8_(1))
+            .window(1, out(0)),
+        // DIMNUM → out1(2 维)
+        GroupSpec::new(101)
+            .window(0, table.clone())
+            .window(3, ex::i8_(1))
+            .window(1, out(1)),
+        // DIMSIZE2 → out2(第 2 维 = 2)
+        GroupSpec::new(101)
+            .window(0, table.clone())
+            .window(5, ex::i8_(1))
+            .window(1, out(2)),
+        // LENGTH → out3(空串 = 0)
+        GroupSpec::new(101)
+            .window(0, table.clone())
+            .window(6, ex::i8_(1))
+            .window(1, out(3)),
+        // SEARCH(STR="") → out4(下标 0;一维 $flat)
+        GroupSpec::new(101)
+            .window(0, flat)
+            .window(7, ex::i8_(1))
+            .window(10, ex::get(0x24, sys + 1))
+            .window(11, ex::i8_(0))
+            .window(1, out(4)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let read = |vm: &Vm, i: i64| {
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 2), &[i])
+            .unwrap()
+    };
+    assert_eq!(read(&vm, 0), Value::Int(3), "TYPE = Str(3)");
+    assert_eq!(read(&vm, 1), Value::Int(2), "DIMNUM = 2");
+    assert_eq!(read(&vm, 2), Value::Int(2), "DIMSIZE2 = 2");
+    assert_eq!(read(&vm, 3), Value::Int(0), "LENGTH(空串) = 0");
+    assert_eq!(read(&vm, 4), Value::Int(0), "SEARCH(\"\") 命中下标 0");
+}
+
+/// `VARACT[INIT=1 G_INTn]` 的**位号映射**:后缀 N ⇒ 组 N ⇒ 掩码位 `1<<(N-1)`。
+///
+/// 2026-10-25 审查:把 `17..=28` 槽号区间改成按名解析时,第一版把
+/// `G_INT2` 算成了 bit 2(应为 bit 1)、`G_INT4` 算成 bit 4 后被
+/// `bit >= 4` 丢弃 —— 静默错位。本用例钉住四组各自的恢复范围。
+#[test]
+fn varact_g_int_group_bits_follow_suffix() {
+    // 四个全局变量,组号 1..4,初值即组号便于辨认。
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = (1..=4)
+        .map(|g| VarSpec {
+            kind: 1,
+            group: g as u8,
+            script_id: 0,
+            var_id: sys + g as u16,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(g as i64),
+        })
+        .collect();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    // 先把四个变量全改成 99,再用 VARACT 只恢复组 2。
+    let mut script = Vec::new();
+    for g in 1..=4u16 {
+        script.push(
+            GroupSpec::new(OP_LET)
+                .window(0, ex::r#ref(0x40, sys + g))
+                .window(0, ex::i8_(99)),
+        );
+    }
+    // VARACT[INIT=1 G_INT2=1](只该恢复组 2)
+    let slot_of = |name: &str| -> u8 {
+        crate::support::default_commands()
+            .iter()
+            .find(|c| c.0 == "VARACT")
+            .and_then(|c| c.1.iter().position(|p| p.0 == name))
+            .map(|i| i as u8)
+            .expect("VARACT 参数表里应有该名字")
+    };
+    script.push(
+        GroupSpec::new(OP_VARACT)
+            .window(slot_of("INIT"), ex::i8_(1))
+            .window(slot_of("G_INT2"), ex::i8_(1)),
+    );
+    script.push(GroupSpec::new(OP_END));
+    b.scripts = vec![script];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let read = |vm: &Vm, g: u16| {
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + g), &[])
+            .unwrap()
+    };
+    assert_eq!(read(&vm, 1), Value::Int(99), "组 1 不在掩码里,保持 99");
+    assert_eq!(read(&vm, 2), Value::Int(2), "组 2 命中,恢复初值 2");
+    assert_eq!(read(&vm, 3), Value::Int(99), "组 3 不在掩码里,保持 99");
+    assert_eq!(read(&vm, 4), Value::Int(99), "组 4 不在掩码里,保持 99");
+}
+
+/// 名字→槽位族的口径一致性(统一入口后的回归锁)。
+///
+/// 2026-10-25 审查:**同一类错误在本项目出现过两次**
+/// (`G_INT2` 当 bit 2、`TINT2` 当索引 2),根因都是「名字后缀 N 被当成
+/// 索引 N」,而正解是 `N-1`(1-based 序号)。本用例把四条族的 1-based
+/// 语义钉在行为上,任何人再写 `N` 就会红。
+///
+/// | 族 | 生产者 | 消费者 | 口径 |
+/// |---|---|---|---|
+/// | `PINTn`/`RINTn` | `GOSUB[PINTn=]`/`RETURN[RINTn=]` | `@_PINT(n)`/`@_RINT(n)` | `n-1` |
+/// | `TINTn` | `TASK[TINTn=]` | `@_TINT(n)` | `n-1` |
+/// | `DIMSIZEn` | — | `VARINFO[DIMSIZEn]` = 第 n 维 | `n-1` |
+/// | `G_INTn` | `VARACT[G_INTn=]` | `restore_globals` 组 n | 掩码位 `n-1` |
+#[test]
+fn name_suffix_families_are_one_based_everywhere() {
+    // 端到端:`RETURN[RINT2=42]`(生产者,槽 = 名字后缀 2)
+    //      → `@_RINT(2)`(消费者,索引 = 2-1 = 1)
+    // 若任一侧把后缀当索引,读到的是 0 而非 42。
+    // 结构照 `gosub_passes_pint_and_return_brings_rint`(同帧同步完成,
+    // 不需要 WAIT)。
+    let mut b = ProjectBuilder::new();
+    let v = with_int_var(&mut b, 0, -1);
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("SUB", 3, 0, 0)];
+    b.entry(0, 0);
+    const OP_GOSUB: u8 = 44;
+    const OP_RETURN: u8 = 77;
+    // RETURN 的参数表:`RINT`=槽 0、`RINT2`=槽 1 …(按名反查,不写死)。
+    let rint2_slot = crate::support::default_commands()
+        .iter()
+        .find(|c| c.0 == "RETURN")
+        .and_then(|c| c.1.iter().position(|p| p.0 == "RINT2"))
+        .map(|i| i as u8)
+        .expect("RETURN 参数表里应有 RINT2");
+    b.scripts = vec![vec![
+        // 0: GOSUB[#="SUB"]
+        GroupSpec::new(OP_GOSUB).window(0, ex::s("SUB")),
+        // 1: LET[@v = @_RINT(2)]
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, v.id))
+            .window(0, ex::cat(&[ex::get(0x40, 0), ex::i8_(0), ex::aload()])),
+        GroupSpec::new(OP_END),
+        // 3: SUB: RETURN[RINT2=42]
+        GroupSpec::new(OP_RETURN).window(rint2_slot, ex::i8_(42)),
+    ]];
+    // 填入 @_RINT 的真实 id(第二窗口目前是占位)。
+    let probe_src = {
+        let mut p = ProjectBuilder::new();
+        p.sysvars = b.sysvars.clone();
+        p.build()
+    };
+    let tables = yu_rt::TableSet::load(&probe_src, yu_rt::tables::DEFAULT_SCRIPT_KEY).unwrap();
+    let rint = tables.boot.sysvars.id("_RINT").unwrap();
+    b.scripts[0][1].windows[1].4 = ex::cat(&[ex::r#ref(0x40, rint), ex::i8_(2), ex::aload()]);
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(42),
+        "RETURN[RINT2=42] 必须能被 @_RINT(2) 读到(后缀 N ⇒ 槽位 N-1)"
+    );
+}
+
 // ---------------------------------------------------------------- 文本流(WORD/_/RETURNCODE)
 
 /// 0.495 `ysc.ybn` 实测序号(dump_ycd):79 RETURNCODE / 106 WORD / 110 `_`。
@@ -2107,6 +2457,64 @@ fn main_end_sets_main_finished() {
     let r = vm.tick_at(0, &no_input());
     assert!(r.main_finished, "END 后主线结束");
     assert!(vm.scheduler().find_by_id("SYSTEM").is_none(), "节点已摘链");
+}
+
+/// **端到端证明**:`TASK[TINTn=x]` 写入的槽必须等于 `@_TINT(n)` 读的槽。
+///
+/// 2026-10-25 审查:把「槽号区间」改成「名字后缀」时,第一版把后缀 N 直接
+/// 当索引用(`TINT2` ⇒ 索引 2),而消费者 `sysvar::param_index` 读的是
+/// `n-1`(`@_TINT(2)` ⇒ 索引 1)⇒ **生产者与消费者错位一格**,值静默丢失。
+///
+/// 本用例走完整链路:脚本 `TASK[TINT2=7]` → 子任务体 `@_TINT(2)`,
+/// 断言读到 7。修复前该用例必红(读到 0)。
+#[test]
+fn task_tint2_value_reaches_tint2_consumer() {
+    let mut b = ProjectBuilder::new();
+    let v = with_int_var(&mut b, 0, -1);
+    let tint = b
+        .sysvars
+        .iter()
+        .position(|(n, _, _)| *n == "_TINT")
+        .expect("_TINT") as u16;
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("BODY", 3, 0, 0)];
+    b.entry(0, 0);
+    const OP_TASK: u8 = 93;
+    const OP_TASKEND: u8 = 94;
+    // 按**参数名**取槽号,与实现同口径(不写死 5)。
+    let slot_of = |name: &str| -> u8 {
+        crate::support::default_commands()
+            .iter()
+            .find(|c| c.0 == "TASK")
+            .and_then(|c| c.1.iter().position(|p| p.0 == name))
+            .map(|i| i as u8)
+            .unwrap_or_else(|| panic!("TASK 参数表里应有 {name}"))
+    };
+    b.scripts = vec![vec![
+        // A = TASK[ID="A" #="BODY" TINT2=7]
+        GroupSpec::new(OP_TASK)
+            .window(slot_of("ID"), ex::s("A"))
+            .window(slot_of("#"), ex::s("BODY"))
+            .window(slot_of("TINT2"), ex::i8_(7)),
+        GroupSpec::new(OP_WAIT).window(0, ex::i8_(4)),
+        GroupSpec::new(OP_END),
+        // 3: BODY —— 读 @_TINT(2)
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, v.id))
+            .window(
+                0,
+                ex::cat(&[ex::r#ref(0x40, tint), ex::i8_(2), ex::aload()]),
+            ),
+        GroupSpec::new(OP_TASKEND),
+    ]];
+    let mut vm = boot(b);
+    for f in 0..5u32 {
+        vm.tick_at(f * 16, &no_input());
+    }
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(7),
+        "TASK[TINT2=7] 必须能被 @_TINT(2) 读到(后缀 N ⇒ 槽位 N-1)"
+    );
 }
 
 /// `TASK` 未传 `TINT` 时,新任务的 `@_TINT(n)` 必须是 0(不继承调用者)。

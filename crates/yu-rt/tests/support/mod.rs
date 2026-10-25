@@ -770,21 +770,32 @@ fn varinfo_params() -> Vec<(&'static str, u8, u8)> {
     ]
 }
 
+/// `TASK` 参数表 = **真实 ysc 的 38 项布局**(v494 与 0.495 逐项相同)。
+///
+/// 2026-10-25 审查:此表此前被压缩成 18 项(只留 TINT 十项),而夹具用
+/// 真实槽号构造窗口(`kind=34` 是入口标签 `#`、`35` 是 `SCRIPTPOS`)。
+/// 旧代码按槽号硬匹配真实布局,恰好"能过";改成按名解析后 `kind=34`
+/// 在 18 项表里越界 ⇒ 三个 TASK 用例同时红。**是夹具失真,不是实现错**。
+/// 现按真实布局展开,槽号与名字一致,两条路径都对。
+///
+/// | 槽 | 名字 |
+/// |---|---|
+/// | 0..4 | `ID` `E` `A` `Z` |
+/// | 4..13 | `TINT` `TINT2..TINT10` |
+/// | 14..23 | `TFLT` `TFLT2..TFLT10` |
+/// | 24..33 | `TSTR` `TSTR2..TSTR10` |
+/// | 34 | `#`(入口标签) |
+/// | 35..37 | `SCRIPTPOS` `TEXTPOS` `RESTART` |
 fn task_params() -> Vec<(&'static str, u8, u8)> {
     let mut p = vec![("ID", 1, 0), ("E", 0, 3), ("A", 0, 3), ("Z", 0, 2)];
-    for n in 0..10 {
-        p.push(match n {
-            0 => ("TINT", 0, 0),
-            1 => ("TINT2", 0, 0),
-            2 => ("TINT3", 0, 0),
-            3 => ("TINT4", 0, 0),
-            4 => ("TINT5", 0, 0),
-            5 => ("TINT6", 0, 0),
-            6 => ("TINT7", 0, 0),
-            7 => ("TINT8", 0, 0),
-            8 => ("TINT9", 0, 0),
-            _ => ("TINT10", 0, 0),
-        });
+    for i in 0..10u8 {
+        p.push((TINT_NAMES[i as usize], 0, 0));
+    }
+    for i in 0..10u8 {
+        p.push((TFLT_NAMES[i as usize], 0, 0));
+    }
+    for i in 0..10u8 {
+        p.push((TSTR_NAMES[i as usize], 0, 0));
     }
     p.push(("#", 1, 0));
     p.push(("SCRIPTPOS", 1, 0));
@@ -792,6 +803,16 @@ fn task_params() -> Vec<(&'static str, u8, u8)> {
     p.push(("RESTART", 0, 3));
     p
 }
+
+const TINT_NAMES: [&str; 10] = [
+    "TINT", "TINT2", "TINT3", "TINT4", "TINT5", "TINT6", "TINT7", "TINT8", "TINT9", "TINT10",
+];
+const TFLT_NAMES: [&str; 10] = [
+    "TFLT", "TFLT2", "TFLT3", "TFLT4", "TFLT5", "TFLT6", "TFLT7", "TFLT8", "TFLT9", "TFLT10",
+];
+const TSTR_NAMES: [&str; 10] = [
+    "TSTR", "TSTR2", "TSTR3", "TSTR4", "TSTR5", "TSTR6", "TSTR7", "TSTR8", "TSTR9", "TSTR10",
+];
 
 fn text_params() -> Vec<(&'static str, u8, u8)> {
     vec![
