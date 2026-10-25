@@ -39,8 +39,26 @@ fn env_path(name: &str) -> Option<PathBuf> {
 fn corpus() -> Option<(PathBuf, PathBuf, PathBuf)> {
     let ysbin = env_path("YURIS_SAMPLE_ERIS_YSBIN")?;
     let sdk = env_path("YURIS_SAMPLE_SDK0495")?;
-    let manual = sdk.join("マニュアル").join("YU-RIS").join("html");
-    Some((ysbin, sdk, manual))
+    // `YURIS_SAMPLE_SDK0495` 有两种既有约定,本函数两种都接受:
+    //   (a) SDK 根 `…/yu-ris_0495_032`(本文件历史的写法,`マニュアル`
+    //       与 `システム` 都在它下面);
+    //   (b) `…/yu-ris_0495_032/システム`(AGENTS.md §2 与
+    //       `yu-vfs/tests/real_sample.rs` 的写法)。
+    // 判据用目录存在性,不猜:哪种布局的 `マニュアル` 在位就用哪个根。
+    let sdk_root = if sdk.join("マニュアル").is_dir() {
+        sdk
+    } else if sdk
+        .parent()
+        .map(|p| p.join("マニュアル").is_dir())
+        .unwrap_or(false)
+    {
+        sdk.parent().expect("parent 已判存在").to_path_buf()
+    } else {
+        // 两种布局都不是 ⇒ 样本不可用(显式 skip,不算通过)。
+        return None;
+    };
+    let manual = sdk_root.join("マニュアル").join("YU-RIS").join("html");
+    Some((ysbin, sdk_root, manual))
 }
 
 // ---------------------------------------------------------------------------
