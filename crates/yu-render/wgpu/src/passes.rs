@@ -1722,10 +1722,7 @@ fn apply_image_to_override(
         (None, None, None, None) => None,
         _ => return Err("gfx.imageop.region.partial".to_string()),
     };
-    if matches!(
-        image.action,
-        ImageAction::SizeNearest | ImageAction::SizeBilinear
-    ) {
+    if image.action.is_scale() {
         let (Some(dw), Some(dh)) = (image.sx, image.sy) else {
             return Err("gfx.imageop.size.missing".to_string());
         };
@@ -1752,7 +1749,7 @@ fn apply_image_to_override(
         let key = source_key.map(|source| yu_backend_soft::ImageCacheKey {
             source,
             op: yu_backend_soft::ImageOpSig::Size {
-                bilinear: image.action == ImageAction::SizeBilinear,
+                bilinear: image.action.is_bilinear_scale(),
                 width: dw,
                 height: dh,
             },
@@ -1791,7 +1788,7 @@ fn apply_image_to_override(
             dw as u32,
             dh as u32,
             region,
-            image.action == ImageAction::SizeBilinear,
+            image.action.is_bilinear_scale(),
         );
         let shared = Override::new(Rc::new(scaled));
         if let Some(key) = key {

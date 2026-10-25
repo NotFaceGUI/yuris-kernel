@@ -257,6 +257,10 @@ pub trait TaskExecutor {
     fn text_auto_mode(&self) -> bool {
         false
     }
+    /// 文本让出释放时消费 `+0x36` 清缓冲请求(REA `0x4046fc` 手动路径
+    /// `0x404828 call 0x4638e4`:请求在位 ⇒ 清空 `$_TEXT`/`$_TEXT_FLAG`)。
+    /// 默认空实现;[`crate::Vm`] 覆写。
+    fn consume_text_clear_request(&mut self) {}
     /// 该任务是否在等待一条 DIALOG 回答(内核模态;DIV-RT-044)。
     fn dialog_pending(&self, _task: &str) -> bool {
         false
@@ -420,7 +424,7 @@ impl Scheduler {
             // 文本等待(引擎 `task+9`,`FUN_004046fc` `0x4046fc..0x404835`):
             // 先判文本输出模式 `[state+0x1c]`。
             //   0x404711 CMP byte[state+0x1c],1
-            //   0x404715 JNE 0x404828        → 手动:直达 0x40482d 清标志
+            //   0x404715 JNE 0x404828        → 手动:call 0x4638e4 后清标志
             //   自动(==1):才读 CLICKBUTTON/SKIPBUTTON(`0x5b48ac..0x5b48bc`)
             // 手动模式 = 一帧休憩(手册 basic/task.html「一旦休憩します」);
             // 把它当成"等点击"会让没有输入驱动的初始化链永久停住。
@@ -429,6 +433,14 @@ impl Scheduler {
                     continue;
                 }
                 nodes[i].text_rest = false;
+                // 释放时消费 `+0x36` 清缓冲请求(REA `0x404828`:
+                // `call 0x4638e4` —— 该例程在 `[+0x36]≠0` 时释放并清空
+                // `$_TEXT`(+0x38)/`$_TEXT_FLAG`(+0x3c) 与内部读位,置
+                // `[+0x37]=1`)。`RETURNCODE` 手动路径(`0x44c437`)置位。
+                // 缺这一步时,ERIS 文本泵的行末 `Z` 处理(`es_Text.yst` 的
+                // `es.TX.OUTPUT.Z`:读指针 `TX.POS/TASK.POS` 重置回 1)会从
+                // **累积缓冲的开头**重放——画面永远叠着第一句且位置逐轮漂移。
+                exec.consume_text_clear_request();
             }
             // DIALOG 挂起(模态):宿主回答前不推进该任务。状态由执行器持有
             // (`Vm::dialogs`),调度器只查询。

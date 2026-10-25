@@ -186,6 +186,17 @@ pub struct GfxState {
     /// gfx 自己不做文件 I/O,但 `CGINFO` 必须与引擎一样在**脚本执行期**
     /// 回答尺寸,否则精灵脚本的 `SX/SY` 布局全为 0(EVID-J3-03)。
     asset_sizes: BTreeMap<Vec<u8>, SizeU32>,
+    /// 已安装字体族清单(CP932 字节,序号 = `FONTINFO[NO]`,1 基)。
+    ///
+    /// 宿主注入(桌面/serve 用 fontdb 的 family 列表;与渲染器实际可解析的
+    /// 同一来源)。手册 `font/fontinfo.html` 只描述 NUM/LANG/NAME 的存在;
+    /// 引擎语义 = `EnumFontFamiliesExA` 枚举(手册无页,2026-10-24 政策按
+    /// REA/引擎证据实现):`NUM` = 条数;`NAME NO=n` = 第 n 项名字(越界 =
+    /// 空串,不报错);`LANG NO=n` = 字符集——本宿主清单统一按 0 应答
+    /// (`es_Font.yst:166` 以 `IF[@mFontLang] LOOPCONTINUE` 过滤非 0 项,
+    /// 0 = 保留该字体)。未注入时 NUM=0/NAME=空串,脚本走「无字体可选」
+    /// 路径(不再挂号;DIV-GFX-036 的宿主清单部分由此收口)。
+    font_families: Vec<Vec<u8>>,
     /// `COPY/COPY2` 生成的快照纹理尺寸(创建时从源层继承)。
     snapshot_sizes: BTreeMap<CopyId, SizeU32>,
     /// 快照对应的源资产键(`CGINFO[MFILE]` 透传)。
@@ -277,6 +288,7 @@ impl GfxState {
             diags: BTreeMap::new(),
             windows,
             asset_sizes: BTreeMap::new(),
+            font_families: Vec::new(),
             snapshot_sizes: BTreeMap::new(),
             snapshot_files: BTreeMap::new(),
             pointer: (0, 0),
@@ -310,6 +322,11 @@ impl GfxState {
     /// 注入资产像素尺寸(VM 解析图像头后调用;键为 `CG[FILE]` 原字节)。
     pub fn set_asset_size(&mut self, key: &[u8], size: SizeU32) {
         self.asset_sizes.insert(key.to_vec(), size);
+    }
+
+    /// 注入已安装字体族清单(见 [`Self::font_families`] 字段注释)。
+    pub fn set_font_families(&mut self, families: Vec<Vec<u8>>) {
+        self.font_families = families;
     }
 
     /// 当前光标逻辑坐标(VM 每帧推入;`CGINFO[ONMOUSE*]` 缺省查询点)。
@@ -952,10 +969,13 @@ impl GfxState {
             "GRADATION" => Value::Int(self.style.gradation),
             "ROTATION" => Value::Int(self.style.rotation),
             "NAME" => {
-                if no.is_some() {
-                    return Err(error::unimplemented(
-                        error::code::INFO_UNSUPPORTED,
-                        "FONTINFO[NAME] NO=... 需要安装字体列表",
+                // `NAME NO=n`:第 n 项字体名(1 基;越界 = 空串,引擎按
+                // EnumFontFamiliesExA 枚举失败即空,不报错)。
+                if let Some(n) = no {
+                    // 1 基;0/负数/越界 = 空串(枚举失败即空,不报错)。
+                    let idx = if n >= 1 { (n - 1) as usize } else { usize::MAX };
+                    return Ok(Value::Str(
+                        self.font_families.get(idx).cloned().unwrap_or_default(),
                     ));
                 }
                 match &self.style.name {
@@ -968,13 +988,21 @@ impl GfxState {
                     }
                 }
             }
+            // `NUM` = 清单条数;`LANG NO=n` = 第 n 项字符集(本宿主清单统一
+            // 0 = DEFAULT_CHARSET;`es_Font.yst:166` 以非 0 过滤)。两者在
+            // 清单未注入时同样应答(NUM=0/LANG=0),脚本走「无字体可选」
+            // 路径 —— 与引擎在无字体环境的行为一致,不再挂号。
+            "NUM" => Value::Int(self.font_families.len() as i64),
+            "LANG" => {
+                let _ = no;
+                Value::Int(0)
+            }
             other => {
-                // TODO(DIV-GFX-036):NUM/LANG/NAME(NO=)/PITCH/X/Y 需要宿主
-                // 字体清单(EnumFontFamiliesExA 语义);GRADATION/ROTATION
-                // 已在上方分支按默认值/原值写回(AU5 勘误,旧注释未更新)。
+                // TODO(DIV-GFX-036):PITCH/X/Y 需要未取证语义;GRADATION/
+                // ROTATION 已在上方分支按默认值/原值写回(AU5 勘误)。
                 return Err(error::unimplemented(
                     error::code::INFO_UNSUPPORTED,
-                    format!("FONTINFO[{other}] 需要字体列表/未取证语义"),
+                    format!("FONTINFO[{other}] 未取证语义"),
                 ));
             }
         })
@@ -1039,10 +1067,36 @@ impl GfxState {
                     .size
                     .map_or(self.config.viewport.height, |s| s.height),
             )),
+            // ---- 窗口宿主字段(手册 window/windowinfo.html 全部有页;
+            // 返回源逐条对 REA 0x4586ec 的分派,见各分支注释) ----
+            // `WSX/WSY` = GetWindowRect 的宽/高(含边框;REA 0x458a2a/0x458a4f)。
+            // 未注入时按客户区同值应答(无边框假设;headless 与官方单窗口一致)。
+            "WSX" => Value::Int(i64::from(window.outer_size.map_or(
+                window.size.map_or(self.config.viewport.width, |s| s.width),
+                |s| s.width,
+            ))),
+            "WSY" => Value::Int(i64::from(window.outer_size.map_or(
+                window.size.map_or(self.config.viewport.height, |s| s.height),
+                |s| s.height,
+            ))),
+            // `DISPLAYNO` = 显示器序号(REA 0x458b0a 读 `[wnd+0x5b4]`)。
+            "DISPLAYNO" => Value::Int(window.display_no),
+            // `FULLSCREEN` / `FULLSCREENBUTTON`(REA 0x458970/0x458992 读
+            // `[0x8015e0]/[0x8015dc]`;宿主注入,缺省 0)。
+            "FULLSCREEN" => Value::Int(window.fullscreen),
+            "FULLSCREEN2" => Value::Int(window.fullscreen_button),
+            // `MINIMIZE` = IsIconic(REA 0x458833..)。
+            "MINIMIZE" => Value::Int(i64::from(window.minimized)),
+            // `CAPTION`(REA 0x458b59 读 `[wnd+0x14]`;未设置 = -1)。
+            "CAPTION" => Value::Int(window.caption),
+            // `ACTIVE` = 最近有输入的时间戳比现在新(REA 0x4587a5..
+            // `[task+0x28]` vs 当前);headless 单窗口恒 1(窗口聚焦即本进程),
+            // 桌面宿主按聚焦状态注入 —— 未注入字段缺省视为激活。
+            "ACTIVE" => Value::Int(1),
             other => {
                 return Err(error::unimplemented(
                     error::code::INFO_UNSUPPORTED,
-                    format!("WINDOWINFO[{other}] 属窗口 host(标题/激活/全屏/关闭模式)"),
+                    format!("WINDOWINFO[{other}] 未取证语义(宿主窗口状态外)"),
                 ));
             }
         })
@@ -1143,12 +1197,35 @@ impl GfxState {
                 "SX" => sx = int_arg(&r.value),
                 "SY" => sy = int_arg(&r.value),
                 "Z" => z = int_arg(&r.value),
-                // TODO(DIV-GFX-037):窗口标题/激活/全屏/菜单/拖拽/关闭模式
-                // 属 host;主窗口 A 透明度(β4 仅显隐)与 SX/SY 是否改视口
-                // 未取证,gfx 只记录几何。
-                "CAPTION" | "MENUID" | "REGIONID" | "DRAGID" | "ACTIVE" | "FULLSCREEN"
-                | "FULLSCREENBUTTON" | "MINIMIZE" | "CLOSEMODE" | "RESIZE" | "MAXIMIZE" | "WSX"
-                | "WSY" => {}
+                // 窗口宿主字段:已取证的部分记录进 WindowState(供
+                // `WINDOWINFO` 读回),其余仍按 DIV-GFX-037 挂 host。
+                // `CAPTION`/`FULLSCREEN`/`FULLSCREENBUTTON`/`DISPLAYNO` 的
+                // 读回源见 `query_windowinfo`(REA 0x458b59/0x458970/0x458992/
+                // 0x458b0a);`MENUID/REGIONID/DRAGID/CLOSEMODE/RESIZE/MAXIMIZE`
+                // 语义未取证,维持原状。
+                "CAPTION" => {
+                    if let Some(v) = int_arg(&r.value) {
+                        if let Some(w) = self.windows.get_mut(&(no.unwrap_or(0) as u8)) {
+                            w.caption = v;
+                        }
+                    }
+                }
+                "FULLSCREEN" => {
+                    if let Some(v) = int_arg(&r.value) {
+                        if let Some(w) = self.windows.get_mut(&(no.unwrap_or(0) as u8)) {
+                            w.fullscreen = v;
+                        }
+                    }
+                }
+                "FULLSCREENBUTTON" => {
+                    if let Some(v) = int_arg(&r.value) {
+                        if let Some(w) = self.windows.get_mut(&(no.unwrap_or(0) as u8)) {
+                            w.fullscreen_button = v;
+                        }
+                    }
+                }
+                "MENUID" | "REGIONID" | "DRAGID" | "ACTIVE" | "MINIMIZE" | "CLOSEMODE"
+                | "RESIZE" | "MAXIMIZE" | "WSX" | "WSY" => {}
                 other => unknown.push(other.to_string()),
             }
         }
@@ -1559,10 +1636,26 @@ impl GfxState {
         // `Y2=824.5` 静默消失 ⇒ 区域只剩 3 个字段 ⇒
         // `gfx.imageop.region.partial` ⇒ 整条 SIZE 被跳过,sprite 不上屏。
         // 区域是像素边界 ⇒ 四舍五入成整数,与 `SX/SY` 同口径。
-        let x = find_px(&params, "X");
-        let y = find_px(&params, "Y");
-        let x2 = find_px(&params, "X2");
-        let y2 = find_px(&params, "Y2");
+        //
+        // **×100 定点回退**:`es_Sprite.yst` 的 `es.CGACT_SIZE` 在中画质
+        // 分支(`quo!=0`)发的是
+        // `CGACT[… SIZE2=1 FX=@X1*100+@FLX FY=… FX2=… FY2=… FSX=@SIZE_X*100 FSY=…]`
+        // —— 没有任何 `X/SX` 整数键。`@FLX` 的注释原文是「表示位置
+        // @LEFT_X,@LEFT_Y の小数点値を掃い、それを CGACT[SIZE2=1 ～] に
+        // 伝える」,即把小数折回百分位;`FX/FY/FX2/FY2/FSX/FSY` 因此是
+        // `X/Y/X2/Y2/SX/SY` 的百分位定点形式(引擎绘制侧按 ÷100.0 读
+        // `+0x1b0..`,见 docs/render-parity.md §7)。
+        // 手册 `cg/cgact.html` 只列整数键(无 FX/FSX 页)⇒ `fixed(no-manual)`,
+        // 证据锚点:语料 `es_Sprite.yst:8538 es.CGACT_SIZE` + §7 反汇编。
+        // 不实现这条回退的后果:整条 SIZE2 判「尺寸缺失」⇒ 图层被标记
+        // 不可执行 ⇒ 立绘/CG 永久不上屏。
+        let fixed_px = |name: &str| {
+            find_f64(&params, name).map(|v| (v / 100.0).round() as i64)
+        };
+        let x = find_px(&params, "X").or_else(|| fixed_px("FX"));
+        let y = find_px(&params, "Y").or_else(|| fixed_px("FY"));
+        let x2 = find_px(&params, "X2").or_else(|| fixed_px("FX2"));
+        let y2 = find_px(&params, "Y2").or_else(|| fixed_px("FY2"));
         // SIZE/SIZE2 的目标尺寸(手册 cg/cgact.html 例 3/4)。
         //
         // **必须按浮点读**:`es_Sprite.yst` 的 `es.CGACT_SIZE` 传进来的
@@ -1571,8 +1664,9 @@ impl GfxState {
         // 旧实现用 `find_int`(`as_int` 要求 `fract()==0`)⇒ 825.5 被判
         // 「尺寸缺失」⇒ `gfx.imageop.size.missing` ⇒ sprite 层永远拿不到
         // 画面,整个 sprite 系统不上屏。整数由 `as_f64` 一并覆盖。
-        let sx = find_f64(&params, "SX");
-        let sy = find_f64(&params, "SY");
+        // `FSX/FSY` 是同一尺寸的百分位定点形式(见上)。
+        let sx = find_f64(&params, "SX").or_else(|| find_f64(&params, "FSX").map(|v| v / 100.0));
+        let sy = find_f64(&params, "SY").or_else(|| find_f64(&params, "FSY").map(|v| v / 100.0));
 
         let copy_action = ["COPY", "COPY2", "TEXCOPY", "TEXSSCOPY"]
             .iter()
@@ -2099,9 +2193,9 @@ impl GfxState {
                     _ => OpStatus::Unimplemented("gfx.imageop.copy_source.unsupported"),
                 }
             }
-        } else if matches!(action, ImageAction::SizeNearest | ImageAction::SizeBilinear) {
-            // `CGACT[SIZE/SIZE2]`:源区域缩放后写入目标层(ID2 或原地)。
-            // 源可以是资产/快照/1×1 黑;区域可选(缺省整图)。
+        } else if action.is_scale() {
+            // `CGACT[SIZE/SIZE2/SIZE3/SIZE4/SIZE5]`:源区域缩放后写入目标层
+            // (ID2 或原地)。源可以是资产/快照/1×1 黑;区域可选(缺省整图)。
             match (sx, sy) {
                 (Some(w), Some(h)) if w > 0.0 && h > 0.0 => match self.nodes.get(source) {
                     Some(n)
@@ -2140,16 +2234,11 @@ impl GfxState {
             y2,
             status,
         });
-        // `CGACT[SIZE/SIZE2]` 把源区域缩放到目标层 ⇒ 目标层的绘制尺寸随之
-        // 变为 `SX×SY`(手册 `cg/cgact.html` 例 3/4;`es.CGACT_SIZE` 之后脚本
-        // 会用 `CGINFO[SX/SY]` 读这个新尺寸)。尺寸记录在层上,`CGINFO` 因此
-        // 是通用查询,不需要任何命名约定。
-        if executable
-            && matches!(
-                image_action,
-                ImageAction::SizeNearest | ImageAction::SizeBilinear
-            )
-        {
+        // `CGACT[SIZE/SIZE2/SIZE3/SIZE4/SIZE5]` 把源区域缩放到目标层 ⇒ 目标层
+        // 的绘制尺寸随之变为 `SX×SY`(手册 `cg/cgact.html` 例 3/4;
+        // `es.CGACT_SIZE` 之后脚本会用 `CGINFO[SX/SY]` 读这个新尺寸)。尺寸记录
+        // 在层上,`CGINFO` 因此是通用查询,不需要任何命名约定。
+        if executable && image_action.is_scale() {
             if let (Some(w), Some(h)) = (sx, sy) {
                 if w > 0.0 && h > 0.0 {
                     if let Some(t) = target.as_ref() {
@@ -2825,6 +2914,7 @@ impl GfxState {
     }
 
     fn push_image_log(&mut self, op: ImageOp) {
+        self.supersede_image_op(&op);
         if self.image_log.len() >= MAX_OP_LOG {
             let drop = self.image_log.len() / 2;
             self.image_log.drain(..drop);
@@ -2838,6 +2928,54 @@ impl GfxState {
             );
         }
         self.image_log.push(op);
+    }
+
+    /// 丢弃被新 `SIZE/SIZE2` 完全覆盖的旧缩放项(同源同目标)。
+    ///
+    /// 引擎的 `CGACT` 图像加工是**破坏性立即执行**(REA `0x42f809`:分配新缓冲 →
+    /// 从层当前纹理读 → 写回层),缩放动画因此每帧真的重算一次。本内核不能在
+    /// 命令时刻做像素工作(纹理在后端),只能把加工项逐帧重放;若不折叠,
+    /// 立绘缩放/移动每帧追加一条 `SIZE` ⇒ `image_log` 线性增长 ⇒ `frame()`
+    /// 为每条产出一个 pass ⇒ 渲染耗时随游玩时长线性上升(实测 passes
+    /// 103→139、skip 累计到 336 的 resize 尖峰就是这条)。
+    ///
+    /// 只折叠 `SIZE/SIZE2`,因为后端对它们**只读源层**:
+    /// `apply_image_op` 无区域时直接复用源纹理,有区域时 `scale_region` 从源
+    /// 区域重建一整张目标纹理 —— 两种路径都不读目标旧像素。反过来
+    /// `RECTPAINT`(RGB 填充保留目标 alpha)、`REVERSE/HORIZONTAL`(变换目标
+    /// 自身)都以目标旧像素为输入,折叠会改变结果,故一律不折叠。
+    ///
+    /// 追加条件:`(源, 目标)` 相同、源 ≠ 目标(原地缩放会叠加)、且旧项之后
+    /// 没有任何项把该目标当源读过(有 ⇒ 中间像素仍被引用)。
+    fn supersede_image_op(&mut self, op: &ImageOp) {
+        if !op.action.is_scale() {
+            return;
+        }
+        let target = op.target.as_ref().unwrap_or(&op.source);
+        if target == &op.source {
+            return;
+        }
+        let Some(pos) = self.image_log.iter().rposition(|old| {
+            old.action.is_scale()
+                && old.source == op.source
+                && old.target.as_ref().unwrap_or(&old.source) == target
+        }) else {
+            return;
+        };
+        let later_seq = self.image_log[pos].seq;
+        let read_later = self
+            .image_log
+            .iter()
+            .skip(pos + 1)
+            .any(|later| &later.source == target)
+            || self.copy_log.iter().any(|copy| {
+                copy.seq > later_seq
+                    && matches!(&copy.source, CopySource::Layer(id) if id == target)
+            });
+        if read_later {
+            return;
+        }
+        self.image_log.remove(pos);
     }
 
     fn arg_slot_missing(&mut self, command: &str, slot: u8) {

@@ -288,6 +288,28 @@ impl Renderer {
         }
     }
 
+    /// 宿主提供的字体清单(`FONTINFO[NUM/LANG/NAME NO=]` 的数据源)。
+    ///
+    /// **字体选择当前禁用**:清单只含引擎默认 family 一项。B7(宿主能力面)
+    /// 接入逐字形回退(GDI font linking 等价)前,全量清单里被选中的
+    /// family 若缺假名字形,日文会整体不渲染 —— 单选项 = 默认字体,设定页
+    /// 字体列表可渲染、选择写入 GSD 的也是安全值,不会再除零
+    /// (`es_config_font` 的 `@mFontNum=0` 分支)。
+    fn font_families(&mut self) -> Vec<Vec<u8>> {
+        match self {
+            Renderer::Soft(renderer) => renderer
+                .text_composer()
+                .default_family_cp932()
+                .into_iter()
+                .collect(),
+            Renderer::Wgpu { renderer, .. } => renderer
+                .text_composer()
+                .default_family_cp932()
+                .into_iter()
+                .collect(),
+        }
+    }
+
     fn render(&mut self, frame: &CompositorFrame) -> Result<(Arc<Surface>, RenderReport), Failure> {
         match self {
             Renderer::Soft(renderer) => {
@@ -402,6 +424,20 @@ impl Engine {
                 "[font] forced by --font: all FONT requests -> family \"{family}\" \
                  (script NAME/NO/BNO ignored; unresolvable family = hard failure)"
             );
+        }
+        // 字体清单注入(手册无页;引擎语义 = EnumFontFamiliesExA 枚举,
+        // 2026-10-24 政策按宿主能力实现并标注)。**选择禁用中**:只注入
+        // 引擎默认 family 一项(见 `Renderer::font_families` 注释)。
+        // `FONTINFO[NUM]`=1 ⇒ `es_config_font` 不再除零;`NAME NO=1` 回报
+        // 默认字体名 ⇒ 列表条目可渲染、误选也不会丢日文。
+        {
+            let families = renderer.font_families();
+            log::info!(
+                target: "yu-font",
+                "[font] host font list for FONTINFO: {} entry (selection disabled; default family only)",
+                families.len()
+            );
+            state.borrow_mut().set_font_families(families);
         }
         log::info!(
             target: "yu-cli::engine",
@@ -1183,15 +1219,16 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     // 存档根(P4 M-C;2026-10-24 主人令改为默认可写):缺省 = 工程根
     // `save/`(官方原版已备份至 `save-backup-20261024/`,引擎按语义正常
     // 读写);`--save-root`/用例 = 显式重定向目录。
+    //
+    // **两种来源都必须实际建目录**:缺省路径不存在时(新工程/目录被清理),
+    // `SaveState` 的 SAVE 刷盘与 kidoku 等副档写入会**全部静默失败**,
+    // 症状即「无法存档、既読不记录」(2026-10-25 实测)。
     let save_root: std::path::PathBuf = match &opts.save_root {
-        Some(dir) => {
-            std::fs::create_dir_all(dir).map_err(|e| {
-                Failure::runtime(format!("创建 save 根 {} 失败: {e}", dir.display()))
-            })?;
-            dir.clone()
-        }
+        Some(dir) => dir.clone(),
         None => project.root().join("save"),
     };
+    std::fs::create_dir_all(&save_root)
+        .map_err(|e| Failure::runtime(format!("创建 save 根 {} 失败: {e}", save_root.display())))?;
     let source = project.open_source()?;
     let aux = project.open_aux()?;
     let boot = BootConfig {

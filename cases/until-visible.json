@@ -1,7 +1,7 @@
 {
   "entry": "SYSTEM_START",
   "expect": {
-    "display_json_sha256": "4699e74667a9f9e72cea1916067ec632f2555aa48789fa8c5838cf17e4c4b45d",
+    "display_json_sha256": "ba94d1dc7b8b7346896d3ec8a28ce2459de4e442b028564c143a3657fb66ae7c",
     "fatal_codes": [],
     "ops_total": 85,
     "png_sha256": "052951c4e84a429a7e8e5dc527c74c20c60ca30611adecd78ea01f690168715d",

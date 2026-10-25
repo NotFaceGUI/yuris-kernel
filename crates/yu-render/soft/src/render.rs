@@ -480,10 +480,7 @@ fn apply_image_op(
         (None, None, None, None) => None,
         _ => return Err("gfx.imageop.region.partial".to_string()),
     };
-    if matches!(
-        image.action,
-        ImageAction::SizeNearest | ImageAction::SizeBilinear
-    ) {
+    if image.action.is_scale() {
         let (Some(dw), Some(dh)) = (image.sx, image.sy) else {
             return Err("gfx.imageop.size.missing".to_string());
         };
@@ -511,7 +508,7 @@ fn apply_image_op(
         let key = source_key.as_ref().map(|source| ImageCacheKey {
             source: source.clone(),
             op: ImageOpSig::Size {
-                bilinear: image.action == ImageAction::SizeBilinear,
+                bilinear: image.action.is_bilinear_scale(),
                 width: dw,
                 height: dh,
             },
@@ -551,7 +548,7 @@ fn apply_image_op(
             dw,
             dh,
             region,
-            image.action == ImageAction::SizeBilinear,
+            image.action.is_bilinear_scale(),
         ));
         if let Some(key) = key {
             image_cache.insert(key, scaled.clone());

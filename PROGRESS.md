@@ -7350,3 +7350,60 @@ run <eris> --frames 10 --shot headless.png       # engine: backend=soft ... fram
 run <eris> --mode desktop --frames 5 --no-sound --shot desktop.png
                                                  # wgpu 窗口 5 帧自动关,png 540267B(与 headless 同帧同大小)
 ```
+
+## 成果 DEMO-PLAY2 (2026-10-25) · demo 可玩性第二轮:文本循环/字体页/窗口·文件查询收口
+
+> 承接 `docs/audit-2026-10-25.md` 的修复顺序;证据文件在 `target/tmp/`
+> (desk2.jsonl 逐帧追踪、r2_s4.json、full950.json);交接文档
+> `docs/handoffs/H-DEMO-PLAYABLE-investigation.md`。
+
+### 根因链(桌面实测坐实)
+
+VM 层剧情推进一直是好的(逐帧追踪:bytes 32→76→170→…→707,9 句全走完,
+`es.ScenarioScript` 每句 `TASK[E=0]` 暂停/点击恢复是设计行为)。用户观感的
+「循环/不推进」= 呈现与文本缓冲链:
+
+1. `RETURNCODE` 手动模式置 `+0x36`(清缓冲请求),内核**只写不读**;
+2. 官方在文本让出释放点消费它(`0x404828 call 0x4638e4`:清 `$_TEXT`/
+   `$_TEXT_FLAG`+内部读位);缺它时 `es.TX.OUTPUT.Z` 把读指针重置回 1 后
+   从**累积缓冲开头**重放 ⇒ 永远叠第一句且位置逐轮漂移;
+3. `$_CHR(n)` 未实现(46,696 次)⇒ `C/R/P/E` 控制符判断全走 else;
+4. `TASK[RESTART=1]` 未实现 ⇒ 行末不请求续帧(REA `0x450c55`)。
+
+### 修复清单
+
+| 修复 | 锚点 | 效果 |
+|---|---|---|
+| 文本让出释放消费 `+0x36`(`Vm::consume_text_clear_request`) | REA `0x404828→0x4638e4` | **文本正常逐句推进**(r2_s4.json 实测第 5 句三行齐全) |
+| `$_CHR(n)` = 单字节构造(`fixed(no-manual)`) | REA `0x446b93`;es_Text.yst:878 | 控制符识别恢复,46,696 次挂号清零 |
+| `TASK[RESTART=1]` → `RequestExtraFrame`(`fixed(no-manual)`) | REA `0x450c46/0x450c55`;手册无页 | 行末同 vsync 续帧 |
+| 入口标签 CP932 编码(`BootConfig::entry_label`) | `LabelTable::get_bytes` | 非 ASCII 标签可直连取证 |
+| `FONTINFO[NUM/LANG/NAME NO=]`(gfx `fixed(no-manual)`) | EnumFontFamiliesExA 语义;手册无页 | `es_config_font` 除零 Fatal 消除 |
+| **字体选择禁用**:清单只含引擎默认 family | B7 逐字形回退前置 | 列表条目可渲染;误选不会丢日文 |
+| `WINDOWINFO[WSX/WSY/DISPLAYNO/FULLSCREEN/FULLSCREENBUTTON/MINIMIZE/CAPTION/ACTIVE]`(gfx 读侧 `fixed(no-manual)`) | REA `0x4586ec` 逐字段 | 桌面会话 10,224 次挂号消除 |
+| `FILEINFO[SIZE/RELATION]`(DIV-RT-056 `fixed(no-manual)`) | REA `0x443572`(FindFirstFileA)/`0x442a48`(FindExecutableA) | 手册例 3/4;RELATION 暂空串(B7 宿主位) |
+| **存档根自动创建**(engine boot) | 默认 `save/` 不存在时全部写盘静默失败 | 「无法存档/既読不记录」根因消除 |
+
+### 存档初始化记录(2026-10-25)
+
+主人发现选中坏字体后日文全部消失(渲染器缺 GDI font linking 等价的逐字形
+回退),令初始化 save + 禁用字体选择。处置:旧 `save/` 改名
+`save-backup-badfont-20261025/`(含坏字体名的 gsd.sd 不回灌);kidoku/seld/
+extra/save30002 恢复进新 `save/`;引擎补「存档根必须实际创建」修复。
+
+### 验证
+
+```text
+cargo test -p yu-rt        # 70 lib + 4 consistency + 11 corpus + 4 + 79 fixture + 3 golden 全绿
+yu-cli case --all          # 9/9 PASS(--update 重新生成:旧行为钉死已过期,新行为经主人实机验证)
+run --frames 320 --shot    # 标题画面日文正常(target/tmp/defaultfont.png)
+headless 字体页路径        # 零诊断(fp2.json/tx1.json)
+```
+
+### 残留(在册)
+
+- 字体选择恢复 = B7(逐字形回退 + 全量清单);
+- FILEINFO[RELATION] 真 OS 关联 = B7(`FindExecutableW`);
+- WINDOWINFO 写侧 CLOSEMODE/MENUID/REGIONID/DRAGID、主窗口 A/SX/SY 视口语义 = DIV-GFX-037 余项;
+- `WINDOWINFO[FULLSCREEN]` 等桌面宿主实时注入(最小化/聚焦)未接;
+- `_CHR` 之外 undoc 系统变量(`_DXMODE/_VARTYPE/_SYSTEM_FRAME`)仍 DIV-RT-007 open。

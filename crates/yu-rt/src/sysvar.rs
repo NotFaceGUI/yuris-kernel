@@ -121,6 +121,28 @@ pub fn read(vm: &Vm, st: &ExecState, var: VarRef, indices: &[i64]) -> Result<Val
             }
         }
 
+        // ---- 系统字符构造 ------------------------------------------------
+        // `$_CHR(n)`:把一个数值当作**单字节**取回(CP932 原始字节,不做
+        // 码位到 CP932 的编码)。REA 依据:0.495 的字符串系统变量取值走
+        // `0x446b93` 分派,`_CHR` 一支按字节写回缓冲;语料用法把它当
+        // "构造控制字符"用 —— `es_Text.yst:878` 用
+        // `$_CHR(0xEF)+$_CHR(0xF3)` 拼出文本流里的 `C` 控制码,而编译器把
+        // 剧本里的 `\r` 展开成 `$_TEXT(239)+$_TEXT(240)`(字节 0xEF 0xF0)。
+        // 因此返回**原始字节**才与 `_TEXT` 里的控制码逐字节相等;
+        // 若按 Unicode 码位再编码成 CP932(0xEF ⇒ 双字节),比较恒不成立,
+        // 文本控制符('C'/'R'/'P'/'E')将全部识别失败(DIV-RT-007,
+        // 手册无页 ⇒ 本条按语料用法+REA 定语义)。
+        "_CHR" => {
+            let [v] = indices else {
+                return Err(diag::unimplemented(
+                    code::rt::SYSVAR_UNIMPLEMENTED,
+                    Boundary::Script,
+                    "_CHR 需要 1 个下标(字节值);手册无页(DIV-RT-007)".to_string(),
+                ));
+            };
+            Ok(Value::Str(vec![(*v & 0xff) as u8]))
+        }
+
         // ---- 帧率/帧号 ----------------------------------------------------
         // 手册 `basic/svariable.html` 未列 `_SYSTEM_FRAME`;旁线未给语义
         // ⇒ 不实现(DIV-RT-007)。

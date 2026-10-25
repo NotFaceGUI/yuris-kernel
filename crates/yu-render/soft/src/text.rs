@@ -280,6 +280,48 @@ impl TextComposer {
         self.force_font.as_deref()
     }
 
+    /// 已安装字体族清单(CP932 字节,去重保序;与渲染器同源的 `fontdb`
+    /// family 列表)。未初始化过字体源时为空 —— 调用方需要清单时先
+    /// [`Self::warm`]。
+    pub fn font_families(&mut self) -> Vec<Vec<u8>> {
+        if !self.ensure() {
+            return Vec::new();
+        }
+        let renderer = self.renderer.as_ref().expect("ensured above");
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for family in renderer.source().family_names() {
+            // 名字编码成 CP932 原始字节(脚本比较/写回 GSD 用的形态);
+            // 编不进 CP932 的 family(罕见非日文字形名)跳过 —— 引擎的
+            // EnumFontFamiliesExA 也只回报 CP932 可表达的名字。
+            let Ok(bytes) = yu_format::Codec::Cp932.encode(&family, b"fontlist") else {
+                continue;
+            };
+            if seen.insert(bytes.clone()) {
+                out.push(bytes);
+            }
+        }
+        out
+    }
+
+    /// 引擎默认 family 的 CP932 字节(fontdb 实际命中的引擎内置候选;
+    /// 未初始化/未命中 = `None`)。宿主把它作为字体清单的**唯一**条目
+    /// 注入(`FONTINFO[NUM]`=1):逐字形回退(font linking)接入前,清单
+    /// 里的其它 family 一旦被脚本选走且缺假名字形,日文会整体不渲染
+    /// (GDI 有自动回退,我们还没有)——单选项 = 默认字体,设定页字体
+    /// 列表可渲染、写入 GSD 的也是安全值。
+    pub fn default_family_cp932(&mut self) -> Option<Vec<u8>> {
+        if !self.ensure() {
+            return None;
+        }
+        let renderer = self.renderer.as_ref().expect("ensured above");
+        let name = renderer.source().default_family_hit()?;
+        yu_format::Codec::Cp932
+            .encode(name, b"fontlist")
+            .ok()
+            .filter(|b| !b.is_empty())
+    }
+
     fn ensure(&mut self) -> bool {
         if self.renderer.is_some() {
             return true;

@@ -8,13 +8,13 @@ license.workspace = true
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }
 log = "0.4"
 yu-font = { path = "../../yu-font" }
+yu-format = { path = "../../yu-format" }
 yu-gfx = { path = "../../yu-gfx" }
 yu-log = { path = "../../yu-log" }
 yu-vfs = { path = "../../yu-vfs" }
 
 [dev-dependencies]
 sha2 = "0.10"
-yu-format = { path = "../../yu-format" }
 yu-rt = { path = "../../yu-rt" }
 
 [lib]

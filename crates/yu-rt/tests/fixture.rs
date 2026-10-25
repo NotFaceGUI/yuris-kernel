@@ -4066,3 +4066,46 @@ fn fileinfo_fs_fallback_checks_save_root() {
         Value::Int(1)
     );
 }
+
+/// `VARACT` 的 `LET` 可缺省:引擎 `0x4542ab` 按 `[0x684161]`(LET 在场)
+/// 分两支,**两支都调 `0x43f0d8`**;缺省时结果写回 `SET` 指向的变量。
+///
+/// 语料实测 `es_Text.yst:2568`/`:2586`/`:2024`/`:2040` 全是
+/// `VARACT[CUT=1 SET=$TX POS=… LENGTH=…]` 的原地剪切形态。旧实现在这里
+/// Fatal(`rt.cmd.slot`),直接终止 `es_Text` 任务(桌面实测:进入演出样例后
+/// `FATAL rt.cmd.slot at es_text.yst:SYSTEM@1354 VARACT`,此后输入不再推进)。
+#[test]
+fn varact_cut_without_let_writes_back_to_set() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 3,
+        dims: vec![],
+        init: Init::Str(b"ABCDE"),
+    }];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        // VARACT[CUT=1 SET=$s POS=1 LENGTH=2] → 删掉第 1..2 字符 ⇒ "CDE"
+        GroupSpec::new(OP_VARACT)
+            .window(0, ex::r#ref(0x24, sys))
+            .window(2, ex::i8_(1))
+            .window(4, ex::i8_(1))
+            .window(5, ex::i8_(2)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::Dollar, sys), &[])
+            .unwrap(),
+        Value::Str(b"CDE".to_vec()),
+        "LET 缺省时 CUT 结果必须回写 SET(手册例 6 的原地形态)"
+    );
+}

@@ -1545,6 +1545,9 @@ impl Vm {
         // `INIT`/`G_*` 分支不读 `SET`(引擎 §3.26 ③:`0x454d3d..0x454e00`
         // 一次都没碰 `0x683a60`),因此把「缺 SET → Fatal」的判定推到它们之后。
         let set_missing = set.is_none();
+        // 字符串加工 / TYPE 在 `LET` 缺省时写回 `SET`(见下方各分支的
+        // `fixed(no-manual)` 注释),所以这里先留住原始左值。
+        let set_lvalue = set.clone();
         let set = set.unwrap_or(crate::expr::LValue {
             var: VarRef::new(VarSpace::At, 0),
             indices: smallvec::SmallVec::new(),
@@ -1580,8 +1583,13 @@ impl Vm {
         if flag("TYPE").is_some() {
             self.varact_type_calls = self.varact_type_calls.saturating_add(1);
             // TYPE:按目标类型转换(手册例 1/2;§3.22)。
-            let target = letv.ok_or_else(|| {
-                diag::fatal(code::rt::CMD_SLOT, Boundary::Script, "VARACT TYPE 缺 LET")
+            //
+            // **LET 可缺省**:侧线 §第七轮第 6 条已取证 —— 引擎 `0x4542ab`
+            // 按 `[0x684161]`(LET 是否在场)分两支,**两支都调 `0x43f0d8`**
+            // 写结果;LET 缺省时写回 `SET` 指向的变量。手册只示范了带 LET 的
+            // 例 1/2,缺省形态无手册页 ⇒ `fixed(no-manual)`。
+            let target = letv.as_ref().or(set_lvalue.as_ref()).ok_or_else(|| {
+                diag::fatal(code::rt::CMD_SLOT, Boundary::Script, "VARACT 缺 SET/LET")
             })?;
             let ty = self.var_shape(target.var).map(|s| s.0).ok_or_else(|| {
                 diag::unimplemented(
@@ -1726,12 +1734,16 @@ impl Vm {
             self.shift_1d(set_var, pos, push)?;
             return Ok(StepOutcome::Continue);
         }
-        let target = letv.ok_or_else(|| {
-            diag::fatal(
-                code::rt::CMD_SLOT,
-                Boundary::Script,
-                "VARACT 缺 LET(目标变量)",
-            )
+        // `LET` 可缺省:引擎 `0x4542ab` 按 `[0x684161]`(LET 在场)分两支,
+        // **两支都调 `0x43f0d8`**;缺省时结果写回 `SET` 指向的变量。
+        // 语料实测:`es_Text.yst:2568` `VARACT[CUT=1 SET=$TX POS=1 LENGTH=@lenA]`
+        // (删掉文本开头的名字字符)、`:2586` 同形 `SET=$TX.TASK`、`:2024/:2040`
+        // 同形 —— 全部**没有 LET**,都是原地剪切。手册
+        // `variable/varact.html` 例 5/6 只示范带 LET 的形态,缺省无手册页
+        // ⇒ `fixed(no-manual)`。旧实现此处 Fatal(`rt.cmd.slot`),直接杀掉
+        // `es_Text` 任务(用户实测演出 1 触发后全流程终止)。
+        let target = letv.or(set_lvalue).ok_or_else(|| {
+            diag::fatal(code::rt::CMD_SLOT, Boundary::Script, "VARACT 缺 SET/LET")
         })?;
         let src = self.read_var(st, set_var, &set.indices)?;
         let Value::Str(bytes) = src else {
@@ -2000,6 +2012,8 @@ impl Vm {
         let mut tflts = [0f64; 16];
         let mut tstrs: [Vec<u8>; 16] = std::array::from_fn(|_| Vec::new());
         let mut script_pos: Option<(u32, u32)> = None;
+        // `RESTART=1`:本 vsync 再跑一逻辑帧(REA `[0x801944]`)。
+        let mut request_restart = false;
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
@@ -2060,12 +2074,32 @@ impl Vm {
                         }
                     }
                 }
+                // `RESTART`:请求「本 vsync 再跑一个逻辑帧」。
+                //
+                // REA 0.495 `TASK` 处理体(`0x4506f4`)在 `0x450c46` 读槽 37
+                // 的存在标志 `[0x684185]`;存在 ⇒ `0x450c55
+                // mov dword ptr [0x801944], 1`,随后 `0x450d05 call 0x42f7bc`
+                // (按 Z 重排任务链)返回。`[0x801944]` 正是内核
+                // `Scheduler::extra_frame` 的同一个量(另一处消费者
+                // `0x40413d` 在逻辑帧开头清零)。
+                //
+                // 语料用法正是这个语义:`es_Text.yst:1545` 在 `es.TX.OUTPUT.Z`
+                // (行末 2 = 一句文本彻底结束)里 `TASK[RESTART=1]`,让文本任务
+                // 在同一次 vsync 内立即重跑主循环。手册 `control/task.html` 只列
+                // ID/E/Z/#/SCRIPTPOS,**无此参数页** ⇒ 按 REA + 语料实现并标注
+                // (DIV-RT-015)。
+                Some("RESTART") => {
+                    let on = self.eval_window(st, w)?.as_int().unwrap_or(0) != 0;
+                    if on {
+                        request_restart = true;
+                    }
+                }
                 other => {
                     return Err(diag::unimplemented(
                         code::rt::CMD_UNIMPLEMENTED,
                         Boundary::Script,
                         format!(
-                            "TASK 参数 `{}`(槽 {})未实现(TEXTPOS/RESTART 等;DIV-RT-015)",
+                            "TASK 参数 `{}`(槽 {})未实现(TEXTPOS 等;DIV-RT-015)",
                             other.unwrap_or("<不在工程 ysc 表>"),
                             w.rec.kind
                         ),
@@ -2130,6 +2164,9 @@ impl Vm {
                 }
                 self.push_effect(Effect::SetEnabled(target_id, enabled));
             }
+        }
+        if request_restart {
+            self.push_effect(Effect::RequestExtraFrame);
         }
         Ok(StepOutcome::Continue)
     }
@@ -2513,6 +2550,8 @@ impl Vm {
         let mut file: Option<Vec<u8>> = None;
         let mut folder: Option<Vec<u8>> = None;
         let mut exist = false;
+        let mut size = false;
+        let mut relation = false;
         let mut target: Option<crate::expr::LValue> = None;
         let mut args: Vec<ArgValue> = Vec::new();
         for w in &cmd.windows {
@@ -2552,6 +2591,18 @@ impl Vm {
                         args.push(ArgValue::new(w.rec.kind, v));
                     }
                 }
+                "SIZE" => {
+                    if let Ok(v) = self.eval_window(st, w) {
+                        size = v.as_f64().map(|n| n != 0.0).unwrap_or(false);
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                "RELATION" => {
+                    if let Ok(v) = self.eval_window(st, w) {
+                        relation = v.as_f64().map(|n| n != 0.0).unwrap_or(false);
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
                 _ => {
                     if let Ok(v) = self.eval_window(st, w) {
                         args.push(ArgValue::new(w.rec.kind, v));
@@ -2561,10 +2612,62 @@ impl Vm {
         }
         // 事件流保持与实现前一致(File 域;宿主忽略 FILEINFO 本身)。
         self.emit_domain(Domain::File, "FILEINFO", args);
-        if !exist || target.is_none() || folder.is_some() {
+        if folder.is_some() {
+            // 手册:「パックファイル内のフォルダの存在はまだチェックできません」
+            // —— 引擎 FOLDER 支只查散盘;语料 0 次,保持挂号。
             self.report_unimplemented(
                 "FILEINFO",
-                "只实现 FILE+EXIST+LET(file/fileinfo.html;REA 0x44286c)".to_string(),
+                "FOLDER 查询未取证(手册注明封包内文件夹不可查;REA 0x44286c)".to_string(),
+            );
+            return Ok(StepOutcome::Continue);
+        }
+        // RELATION(手册例 4;REA `0x4429e6` → `0x442a20`:
+        // `FindExecutableA(NULL, FILE, buf)` → 关联 exe 全路径写入**字符串**
+        // LET;引擎按任务 kind 1/2/3 分派 int/float/str 槽)。失败/非 Windows
+        // 宿主 = 空串。
+        if relation {
+            let Some(bytes) = file.clone() else {
+                self.report_unimplemented(
+                    "FILEINFO",
+                    "RELATION=1 缺 FILE(file/fileinfo.html 例 4)".to_string(),
+                );
+                return Ok(StepOutcome::Continue);
+            };
+            if let Some(target) = target.clone() {
+                let resolved = self.resolve_file_path(&bytes);
+                let assoc = resolved
+                    .and_then(|path| self.file_association(&path))
+                    .unwrap_or_default();
+                self.write_target(st, &target, &Value::Str(assoc))?;
+            }
+            return Ok(StepOutcome::Continue);
+        }
+        // SIZE(手册例 3;REA `0x443572`:`FindFirstFileA` → 目录 = 0、
+        // 文件 = `nFileSizeLow`(32 位);找不到 = 0)。封包内文件引擎同样
+        // 查不到大小(手册注明),内核与官方一致:只查散盘/宿主路径。
+        if size {
+            let Some(bytes) = file.clone() else {
+                self.report_unimplemented(
+                    "FILEINFO",
+                    "SIZE=1 缺 FILE(file/fileinfo.html 例 3)".to_string(),
+                );
+                return Ok(StepOutcome::Continue);
+            };
+            let len = self
+                .resolve_file_path(&bytes)
+                .and_then(|path| std::fs::metadata(&path).ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if let Some(target) = target {
+                self.write_target(st, &target, &Value::Int(len as i64))?;
+            }
+            return Ok(StepOutcome::Continue);
+        }
+        if !exist || target.is_none() {
+            self.report_unimplemented(
+                "FILEINFO",
+                "需要 EXIST/SIZE/RELATION 之一 + LET(file/fileinfo.html;REA 0x44286c)".to_string(),
             );
             return Ok(StepOutcome::Continue);
         }
@@ -2621,6 +2724,39 @@ impl Vm {
             return false;
         }
         std::path::Path::new(&root).join(text).exists()
+    }
+
+    /// 把 `FILE=` 的脚本路径解析成宿主文件系统路径(`SIZE`/`RELATION` 用)。
+    ///
+    /// 与 `save_root_fs_exists` 同一口径:`$_SAVE_PATH` 前缀 = save 根下相对
+    /// 名;其余按封包外相对路径不解析(引擎对封包内文件同样查不到大小,
+    /// 手册 `file/fileinfo.html` 例 3 注)。返回 `None` = 不可解析。
+    fn resolve_file_path(&self, path: &[u8]) -> Option<std::path::PathBuf> {
+        let root = self
+            .paths
+            .save_path
+            .as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())?;
+        let rel = path.strip_prefix(root.as_bytes())?;
+        if rel.is_empty() {
+            return None;
+        }
+        let text = std::str::from_utf8(rel).ok()?;
+        if text.contains('\\') || text.split('/').any(|c| c == "..") {
+            return None;
+        }
+        Some(std::path::Path::new(&root).join(text))
+    }
+
+    /// 文件关联 exe 全名(`FILEINFO[RELATION]`;REA `0x442a48`
+    /// `FindExecutableA(NULL, file, buf)`)。
+    ///
+    /// 内核不做 OS 关联查询(纯内核,无 win32 依赖):语料仅 `es_Debug.yst`
+    /// 1 处(调试用),B7(宿主能力面)接入真实 `FindExecutableW` 后由宿主
+    /// 覆写。当前恒空串 —— 与 `FindExecutableA` 失败时引擎缓冲首字节为 0
+    /// 的结果一致,脚本判空走「无关联」分支,行为安全。
+    fn file_association(&self, _path: &std::path::Path) -> Option<Vec<u8>> {
+        Some(Vec::new())
     }
 
     // ---------------------------------------------------------- 存档域(B1)

@@ -606,3 +606,223 @@ fn transition_defaults_to_t_256() {
     assert_eq!(t.ta, 0);
     assert!(t.tid.is_none());
 }
+
+/// `es_Sprite.yst` 的中画质分支(`quo != 0`)只发 `FX/FY/FX2/FY2/FSX/FSY`
+/// 百分位定点键,没有整数 `X/SX` 键:
+///
+/// ```text
+/// CGACT[ID=$src ID2=$dst SIZE2=1 FX=@X1*100+@FLX FY=... FX2=... FY2=...
+///        FSX=@SIZE_X*100 FSY=@SIZE_Y*100]
+/// ```
+///
+/// 脚本注释原文:「表示位��� @LEFT_X,@LEFT_Y の小数点値を掃い、それを
+/// CGACT[SIZE2=1 ～] に伝える」⇒ ÷100 回退。若不回退,整条 SIZE2 被判定
+/// 「尺寸缺失」(`gfx.imageop.size.missing`)⇒ 目标层标 Unimplemented ⇒
+/// 立绘/CG 永久不上屏。
+#[test]
+fn cgact_size_accepts_fixed_point_fx_fsx_keys() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SPLBUF")),
+                arg(&table, "CG", "FILE", s("spl")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SPL")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SPLBUF")),
+                arg(&table, "CGACT", "ID2", s("SPL")),
+                arg(&table, "CGACT", "SIZE2", i(1)),
+                arg(&table, "CGACT", "FX", f(1234.0)),
+                arg(&table, "CGACT", "FY", f(5678.0)),
+                arg(&table, "CGACT", "FX2", f(1234.0 + 39900.0)),
+                arg(&table, "CGACT", "FY2", f(5678.0 + 29900.0)),
+                arg(&table, "CGACT", "FSX", f(39900.0)),
+                arg(&table, "CGACT", "FSY", f(29900.0)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let img = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|o| match o {
+            Op::Image(i) => Some(i),
+            _ => None,
+        })
+        .expect("SIZE2 op");
+    assert_eq!(img.action, ImageAction::SizeBilinear);
+    // 尺寸:FSX/FSY ÷100(`@SIZE_X*100` ⇒ 原像素)。
+    assert_eq!(img.sx, Some(399.0));
+    assert_eq!(img.sy, Some(299.0));
+    // 区域:FX/FY/FX2/FY2 ÷100 后取整(与 `find_px` 同口径)。
+    assert_eq!((img.x, img.y), (Some(12), Some(57)));
+    assert_eq!((img.x2, img.y2), (Some(411), Some(356)));
+    assert_eq!(img.status, OpStatus::Executable);
+}
+
+/// `SIZE4` 在语料里与 `SIZE2` 同形(同为 `SX/SY` + 可选源区域):
+/// `es_ERIS.yst:631` `CGACT[ID=$id SIZE4=1 SX=@sx/2 SY=@sy/2]`、
+/// `es_System.yst:261` 二分降采样。手册 `cg/cgact.html` 无 SIZE4 页
+/// ⇒ `partial(no-manual)`;几何语义按缩放执行,不再毒化整层。
+#[test]
+fn cgact_size4_executes_as_scale() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BIG")),
+                arg(&table, "CG", "FILE", s("big")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BIG")),
+                arg(&table, "CGACT", "SIZE4", i(1)),
+                arg(&table, "CGACT", "SX", i(400)),
+                arg(&table, "CGACT", "SY", i(300)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let img = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|o| match o {
+            Op::Image(i) => Some(i),
+            _ => None,
+        })
+        .expect("SIZE4 op");
+    assert_eq!(img.action, ImageAction::Other("size4"));
+    assert!(img.action.is_scale());
+    assert_eq!((img.sx, img.sy), (Some(400.0), Some(300.0)));
+    assert_eq!(img.status, OpStatus::Executable);
+    assert_eq!(layer(&f, ":/W0/BIG").status, LayerStatus::Executable);
+}
+
+/// 同一 `(源, 目标)` 的重复缩放必须折叠:引擎的 `CGACT` 加工是立即执行的破坏性
+/// 写入,旧版本像素不会再被看到;本内核逐帧重放若不折叠,`image_log` 线性增长
+/// ⇒ `frame()` 每帧产出更多 pass ⇒ 渲染耗时随游玩时长上升(实测 passes
+/// 103→139、skip 累计到 336)。
+///
+/// 但原地加工(`ID` 无 `ID2`)会叠加,必须保留历史。
+#[test]
+fn repeated_scale_ops_collapse_but_in_place_ops_stay() {
+    let table = table();
+    let mut gfx = state();
+    let scale = |sx: i64| {
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "ID2", s("DST")),
+                arg(&table, "CGACT", "SIZE", i(1)),
+                arg(&table, "CGACT", "SX", i(sx)),
+                arg(&table, "CGACT", "SY", i(sx)),
+            ],
+        )
+    };
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SRC")),
+                arg(&table, "CG", "FILE", s("src")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        scale(100),
+        scale(200),
+        scale(300),
+        frame_end(1),
+    ]);
+    let imgs: Vec<_> = gfx
+        .frame()
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .filter_map(|o| match o {
+            Op::Image(i) => Some(i.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(imgs.len(), 1, "同源同目标的重复缩放应折叠为最后一条");
+    assert_eq!(imgs[0].sx, Some(300.0));
+
+    // 原地缩放(源 = 目标):每次都要在上一版像素上再缩放,不能折叠。
+    gfx.consume_events(&[
+        frame_start(2),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SELF")),
+                arg(&table, "CG", "FILE", s("self")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SELF")),
+                arg(&table, "CGACT", "SIZE", i(1)),
+                arg(&table, "CGACT", "SX", i(50)),
+                arg(&table, "CGACT", "SY", i(50)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SELF")),
+                arg(&table, "CGACT", "SIZE", i(1)),
+                arg(&table, "CGACT", "SX", i(25)),
+                arg(&table, "CGACT", "SY", i(25)),
+            ],
+        ),
+        frame_end(2),
+    ]);
+    let self_imgs = gfx
+        .frame()
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .filter(|o| matches!(o, Op::Image(i) if i.source.display() == ":/W0/SELF"))
+        .count();
+    assert_eq!(self_imgs, 2, "原地缩放必须逐次保留");
+}

@@ -225,6 +225,35 @@ impl ImageAction {
             Self::Other(s) => s,
         }
     }
+
+    /// 缩放族:`SIZE`/`SIZE2` 与 `SIZE3`/`SIZE4`/`SIZE5`。
+    ///
+    /// `SIZE3/4/5` 手册 `cg/cgact.html` 无页,但语料用法与 `SIZE` 完全同形
+    /// (同为 `SX/SY` 目标尺寸,可带源区域):
+    /// - `es_ERIS.yst:631` `CGACT[ID=$id SIZE4=1 SX=@sx/2 SY=@sy/2]`(CG 半尺寸);
+    /// - `es_System.yst:261` `CGACT[ID=$SRCID ID2=$DSTID SIZE4=1 SX=@SSX SY=@SSY]`
+    ///   (二分降采样,与 `SIZE2` 交替出现在同一循环里)。
+    ///
+    /// ⇒ 几何语义(区域 + 目标尺寸)有语料锚点;三者相对 `SIZE2` 的**重采样
+    /// 滤波差异**未取证,按双线性执行(与 `SIZE2` 同),DIV-GFX-039 记
+    /// `partial(no-manual)`。关键点:不实现会让整层被标 Unimplemented ⇒
+    /// CG/立绘永久不上屏。
+    pub fn is_scale(&self) -> bool {
+        matches!(
+            self,
+            Self::SizeNearest
+                | Self::SizeBilinear
+                | Self::Other("size3" | "size4" | "size5")
+        )
+    }
+
+    /// 走双线性(或更高画质)重采样。
+    pub fn is_bilinear_scale(&self) -> bool {
+        matches!(
+            self,
+            Self::SizeBilinear | Self::Other("size3" | "size4" | "size5")
+        )
+    }
 }
 
 /// 一次图像加工操作。

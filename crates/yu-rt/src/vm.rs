@@ -489,10 +489,19 @@ impl Vm {
         let handler_of = crate::vm::handlers::build_handler_table(&tables.boot.yscm);
 
         // 入口标签(引擎 `FUN_00451e90` 按名字查 ysl;strcmp 字节级)。
+        //
+        // 标签名在 ysl 里是**原始 CP932 字节**:语料的演示标签有
+        // `フェイスウィンドウサンプル` 这类非 ASCII 名。`LabelTable::get`
+        // 只做 ASCII 等值(见 `tables.rs`),所以这里先用 CP932 编码再走
+        // 字节级 `get_bytes`;ASCII 名的编码结果与原文相同,行为不变。
+        let entry_name = match yu_format::Codec::Cp932.encode(&cfg.entry_label, b"entry") {
+            Ok(bytes) => bytes,
+            Err(_) => cfg.entry_label.as_bytes().to_vec(),
+        };
         let label = tables
             .boot
             .labels
-            .get(&cfg.entry_label)
+            .get_bytes(&entry_name)
             .ok_or_else(|| {
                 diag::fatal(
                     code::rt::LABEL,
@@ -1955,6 +1964,15 @@ impl TaskExecutor for Vm {
     /// 只有自动模式才等推进输入。见 `task::TaskExecutor::text_auto_mode`。
     fn text_auto_mode(&self) -> bool {
         self.text.output_mode == 1
+    }
+
+    /// REA `0x4046fc` 手动路径的 `0x404828 call 0x4638e4`:请求位
+    /// `[+0x36]`(RETURNCODE 手动模式 `0x44c437` 置位)在位 ⇒ 清空
+    /// `$_TEXT`(`[+0x38]`)/`$_TEXT_FLAG`(`[+0x3c]`)与内部读位。
+    fn consume_text_clear_request(&mut self) {
+        if self.text.clear_pending {
+            self.text.clear();
+        }
     }
 
     fn dialog_pending(&self, task: &str) -> bool {

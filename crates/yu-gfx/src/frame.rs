@@ -219,6 +219,23 @@ pub struct WindowState {
     pub size: Option<SizeU32>,
     /// `Z` 窗口叠放(0 前面 / 1 常前 / 2 最背 / 3 主窗口后);gfx 只记录。
     pub z: i64,
+    /// `WSX/WSY`:含边框的窗口整体尺寸(REA `0x458a2a/0x458a4f` 读
+    /// `GetWindowRect().right-left / bottom-top`;缺省 = 与客户区同值,
+    /// 即无边框假设 —— headless 与官方单窗口一致)。
+    pub outer_size: Option<SizeU32>,
+    /// `DISPLAYNO`:显示器序号(REA `0x458b0a` 读 `[wnd+0x5b4]` 字节;
+    /// 单窗口宿主恒 0,与官方主显示器一致)。
+    pub display_no: i64,
+    /// `FULLSCREEN`(REA `0x458970` 读 `[0x8015e0]`;宿主注入,缺省 0)。
+    pub fullscreen: i64,
+    /// `FULLSCREENBUTTON`(REA `0x458992` 读 `[0x8015dc]`;缺省 0)。
+    pub fullscreen_button: i64,
+    /// `MINIMIZE`(REA `0x458833..` = `IsIconic`;headless 恒 0,
+    /// 桌面宿主按窗口最小化状态注入)。
+    pub minimized: bool,
+    /// `CAPTION`(REA `0x458b59` 读 `[wnd+0x14]`;未设置 = -1,与引擎
+    /// 初始值一致;桌面宿主 `WINDOW[CAPTION=]` 时写入)。
+    pub caption: i64,
 }
 
 impl WindowState {
@@ -232,6 +249,12 @@ impl WindowState {
             y: 0,
             size: None,
             z: 0,
+            outer_size: None,
+            display_no: 0,
+            fullscreen: 0,
+            fullscreen_button: 0,
+            minimized: false,
+            caption: -1,
         }
     }
 }
