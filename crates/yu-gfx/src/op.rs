@@ -247,9 +247,13 @@ pub struct ImageOp {
     /// `SETSTR` 原文(CP932 字节)。
     pub set_str: Option<Vec<u8>>,
     /// `SIZE/SIZE2` 的目标宽(手册 `cg/cgact.html` 例 3/4)。
-    pub sx: Option<i64>,
+    ///
+    /// **浮点**:缩放后的实际尺寸常带小数(实测 `SIZE=1 SX=1101 SY=825.5`)。
+    /// 用整数会丢掉 `.5`,并且旧实现因此在 `as_int()` 的 `fract()==0`
+    /// 守卫处被判「尺寸缺失」。
+    pub sx: Option<f64>,
     /// `SIZE/SIZE2` 的目标高。
-    pub sy: Option<i64>,
+    pub sy: Option<f64>,
     pub x: Option<i64>,
     pub y: Option<i64>,
     pub x2: Option<i64>,

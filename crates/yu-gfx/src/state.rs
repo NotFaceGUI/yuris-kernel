@@ -1553,13 +1553,26 @@ impl GfxState {
         let set2 = find_value(&params, "SET2");
         let set_str = find_str(&params, "SETSTR");
         let bno = find_int(&params, "BNO");
-        let x = find_int(&params, "X");
-        let y = find_int(&params, "Y");
-        let x2 = find_int(&params, "X2");
-        let y2 = find_int(&params, "Y2");
+        // 区域坐标按**像素取整**读:`es.CGACT_SIZE` 的源区域是缩放后的实际
+        // 范围,实测 `CGACT[… SIZE=1 X=0 Y=0 X2=1100 Y2=824.5 …]` —— 带
+        // 小数。旧实现用 `find_int`(`as_int` 要求 `fract()==0`)会让
+        // `Y2=824.5` 静默消失 ⇒ 区域只剩 3 个字段 ⇒
+        // `gfx.imageop.region.partial` ⇒ 整条 SIZE 被跳过,sprite 不上屏。
+        // 区域是像素边界 ⇒ 四舍五入成整数,与 `SX/SY` 同口径。
+        let x = find_px(&params, "X");
+        let y = find_px(&params, "Y");
+        let x2 = find_px(&params, "X2");
+        let y2 = find_px(&params, "Y2");
         // SIZE/SIZE2 的目标尺寸(手册 cg/cgact.html 例 3/4)。
-        let sx = find_int(&params, "SX");
-        let sy = find_int(&params, "SY");
+        //
+        // **必须按浮点读**:`es_Sprite.yst` 的 `es.CGACT_SIZE` 传进来的
+        // `SX/SY` 是缩放后的实际尺寸,常带小数(实测
+        // `CGACT[ID=SPLBUF401 ID2=SPL401 SIZE=1 SX=1101 SY=825.5]`)。
+        // 旧实现用 `find_int`(`as_int` 要求 `fract()==0`)⇒ 825.5 被判
+        // 「尺寸缺失」⇒ `gfx.imageop.size.missing` ⇒ sprite 层永远拿不到
+        // 画面,整个 sprite 系统不上屏。整数由 `as_f64` 一并覆盖。
+        let sx = find_f64(&params, "SX");
+        let sy = find_f64(&params, "SY");
 
         let copy_action = ["COPY", "COPY2", "TEXCOPY", "TEXSSCOPY"]
             .iter()
@@ -2000,8 +2013,8 @@ impl GfxState {
         set: Option<EngineValue>,
         set2: Option<EngineValue>,
         set_str: Option<Vec<u8>>,
-        sx: Option<i64>,
-        sy: Option<i64>,
+        sx: Option<f64>,
+        sy: Option<f64>,
         x: Option<i64>,
         y: Option<i64>,
         x2: Option<i64>,
@@ -2090,7 +2103,7 @@ impl GfxState {
             // `CGACT[SIZE/SIZE2]`:源区域缩放后写入目标层(ID2 或原地)。
             // 源可以是资产/快照/1×1 黑;区域可选(缺省整图)。
             match (sx, sy) {
-                (Some(w), Some(h)) if w > 0 && h > 0 => match self.nodes.get(source) {
+                (Some(w), Some(h)) if w > 0.0 && h > 0.0 => match self.nodes.get(source) {
                     Some(n)
                         if matches!(
                             n.layer.texture,
@@ -2138,13 +2151,17 @@ impl GfxState {
             )
         {
             if let (Some(w), Some(h)) = (sx, sy) {
-                if w > 0 && h > 0 {
+                if w > 0.0 && h > 0.0 {
                     if let Some(t) = target.as_ref() {
                         if let Some(node) = self.nodes.get_mut(t) {
+                            // 缩放尺寸带小数(实测 `SY=825.5`):纹理实际像素
+                            // 只能是整数,`CGINFO[SX/SY]` 读回的也应是这个
+                            // 取整后的层尺寸。四舍五入与 `as u32`(截断)在
+                            // `.5` 上差 1 像素,选四舍五入以保持面积最接近。
                             node.layer.kind = LayerKind::Image {
                                 size: Some(SizeU32 {
-                                    width: w as u32,
-                                    height: h as u32,
+                                    width: w.round() as u32,
+                                    height: h.round() as u32,
                                 }),
                             };
                         }
@@ -2911,6 +2928,23 @@ fn find_int(params: &[(String, EngineValue)], name: &str) -> Option<i64> {
     find_value(params, name).and_then(|v| v.as_int())
 }
 
+/// 取浮点参数(整数原值也接受)。
+///
+/// `CGACT[SIZE/SIZE2]` 的 `SX/SY` 是缩放后的尺寸,实测带小数
+/// (`SY=825.5`);`find_int` 的 `fract()==0` 守卫会把它们判成「未给」。
+fn find_f64(params: &[(String, EngineValue)], name: &str) -> Option<f64> {
+    find_value(params, name).and_then(|v| v.as_f64())
+}
+
+/// 取**像素坐标**参数:接受整数与浮点(浮点四舍五入成整数像素)。
+///
+/// 与 [`find_int`] 的区别:后者要求 `fract()==0`,会把
+/// `CGACT[… Y2=824.5]` 这类真实参数判成「未给」,进而让区域只剩 3 个字段
+/// 并触发 `gfx.imageop.region.partial`(sprite 整条 SIZE 被跳过)。
+fn find_px(params: &[(String, EngineValue)], name: &str) -> Option<i64> {
+    find_value(params, name).and_then(|v| v.as_f64()).map(|f| f.round() as i64)
+}
+
 fn find_str(params: &[(String, EngineValue)], name: &str) -> Option<Vec<u8>> {
     find_value(params, name).and_then(|v| v.as_bytes().map(|b| b.to_vec()))
 }
@@ -2978,8 +3012,8 @@ fn rect_paint_precheck(
     set: &Option<EngineValue>,
     set2: &Option<EngineValue>,
     set_str: &Option<Vec<u8>>,
-    sx: Option<i64>,
-    sy: Option<i64>,
+    sx: Option<f64>,
+    sy: Option<f64>,
     x: Option<i64>,
     y: Option<i64>,
     x2: Option<i64>,

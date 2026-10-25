@@ -184,8 +184,10 @@ fn cgact_size_keeps_sx_sy_and_resize_trim_are_recognized() {
         })
         .unwrap();
     assert_eq!(img.action, ImageAction::SizeNearest);
-    assert_eq!(img.sx, Some(315));
-    assert_eq!(img.sy, Some(190));
+    // `SIZE` 的 SX/SY 是浮点(实测 `SY=825.5`);整数输入经 `as_f64` 后
+    // 仍是 315.0/190.0。
+    assert_eq!(img.sx, Some(315.0));
+    assert_eq!(img.sy, Some(190.0));
 
     gfx.consume_events(&[
         frame_start(2),

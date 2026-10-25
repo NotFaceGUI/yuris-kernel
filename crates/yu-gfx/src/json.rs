@@ -376,6 +376,14 @@ fn opt_i64(out: &mut String, v: Option<i64>) {
     }
 }
 
+/// `SIZE/SIZE2` 的目标尺寸是浮点(实测 `SY=825.5`),保留小数。
+fn opt_f64(out: &mut String, v: Option<f64>) {
+    match v {
+        Some(n) => out.push_str(&n.to_string()),
+        None => out.push_str("null"),
+    }
+}
+
 fn image_action(out: &mut String, a: &ImageAction) {
     esc_str(out, a.name());
 }
@@ -479,9 +487,9 @@ pub fn op(out: &mut String, o: &Op) {
                 None => out.push_str("null"),
             }
             out.push_str(",\"sx\":");
-            opt_i64(out, i.sx);
+            opt_f64(out, i.sx);
             out.push_str(",\"sy\":");
-            opt_i64(out, i.sy);
+            opt_f64(out, i.sy);
             out.push_str(",\"x\":");
             opt_i64(out, i.x);
             out.push_str(",\"y\":");

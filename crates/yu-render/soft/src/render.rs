@@ -476,9 +476,12 @@ fn apply_image_op(
         let (Some(dw), Some(dh)) = (image.sx, image.sy) else {
             return Err("gfx.imageop.size.missing".to_string());
         };
-        if dw <= 0 || dh <= 0 {
+        // 缩放尺寸是浮点(实测 `SY=825.5`);`<= 0` 才是「无尺寸」。
+        if dw <= 0.0 || dh <= 0.0 {
             return Ok(());
         }
+        // 纹理像素只能是整数:四舍五入(与 `yu-gfx` 写层尺寸的口径一致)。
+        let (dw, dh) = (dw.round() as u32, dh.round() as u32);
         let layer = frame
             .layers
             .iter()
@@ -498,8 +501,8 @@ fn apply_image_op(
             source: source.clone(),
             op: ImageOpSig::Size {
                 bilinear: image.action == ImageAction::SizeBilinear,
-                width: dw as u32,
-                height: dh as u32,
+                width: dw,
+                height: dh,
             },
             region,
         });
@@ -534,8 +537,8 @@ fn apply_image_op(
         };
         let scaled = Rc::new(crate::imageop::scale_region(
             &source,
-            dw as u32,
-            dh as u32,
+            dw,
+            dh,
             region,
             image.action == ImageAction::SizeBilinear,
         ));
