@@ -6690,3 +6690,454 @@ symptom-ingame-config / symptom-ingame-save)为 display/png sha 漂移,
   `main_finished` 不亮 ⇒ 程序退出链未闭合。官方 `END`(0x441334)是否
   「结束整个程序」待 REA 取证,归 B10。
 - H-P1-02 的 `key_last/mouse_last` 透出仍未做(F1 面板对账用),归 B7。
+
+## 成果 VARINFO-SLOT (2026-10-25) · 槽号按参数名解析(商业包 sprite 全链打通)
+
+> 范围 `crates/yu-rt/src/vm/handlers.rs`、`crates/yu-rt/tests/{fixture,corpus}.rs`、
+> `crates/yu-format/tests/corpus_eris.rs`;零 git 写操作。
+
+### 1. 取证:官方 v494 事件级 trace 首次打通
+
+v494 的分派点与 0.495 **不同址**:0.495 是 `0x4044db`/`0x404547`,
+v494 是 `0x4044cb`/`0x404537`(早 `0x10`)。定位方法:按字节模式
+`ff 14 b9`(`call dword ptr [ecx+edi*4]`)在 `.text` 里扫描,全文件仅两处命中。
+
+```text
+$ python tools/official_trace/probe_dispatch.py \
+    --exe <game-b>/<game>.exe --cwd <game-b> \
+    --ysc <ysc.ybn> --out-dir target/tmp/official/game-b-v494 \
+    --seconds 6 --arm-after 0.2 --trigger-rva "" --bp-rva 0x44cb,0x4537
+armed 0x4044cb ff / armed 0x404537 ff
+...
+stop timeout hits 16805
+```
+
+v494 的 CG handler = `0x42a4a8`、CGACT = `0x42c438`(handler 直方图 +
+ysc 表序交叉确认)。收窄到这两个 handler 后拿到 38964 次命中、最大 pc 6056
+(已跑到 `es_sprite.yst` 深处)。
+
+### 2. 定案:不是「同帧先建后删」,是 `es.SP.DRAW` 从未被调用
+
+逐帧对拍(官方 t≈9.50–9.54 s vs 内核 f86):
+
+```text
+官方                                 内核            结论
+pc3442 CG SPLBUF1                    pc3442         一致
+pc3523 CG SPLBUF1 TEX=0              pc3523         一致（该槽无操作，§F）
+pc3572/3573 CG SPL1                  pc3572/3573    一致
+pc5533 ×100 CG[A=0]                  —              官方执行
+pc5582/5583 CG[E=1]/[E=0]            —              ← 官方让 sprite 可见
+pc6026/6028/6056 CG/REMALLOC         —              官方执行
+```
+
+即:官方同帧里 `es.SP.DRAW` 让 `SPL1` 的 `E` 置 1,内核一次都没调用。
+`docs/divergences/DIV-GFX-046-sprite-bg-hold.md` 的 §H/§I/§J 结论
+(「同帧建完就删」)作废 —— 那三节引用的命令序列来自**未挂 `GraphicsHost`**
+的裸 `Vm` trace,`CGINFO` 的 `LET` 不写回,脚本走假分支。
+
+### 3. 根因:`VARINFO` 参数表跨版本整体位移,槽号被写死
+
+| 参数 | SDK 0.495(ERIS 语料) | 商业包 v494 |
+|---|---|---|
+| SEARCH | 14 | 14 |
+| INT | 17 | **15** |
+| FLT | 18 | **16** |
+| STR | 19 | **17** |
+| NO | 20 | **18** |
+
+`array_needle` 写死 `(Str,19)|(Float,18)|(Int,17)`,`SEARCH` 起始下标写死
+`flags_get(&flags, 20)`。在 v494 上两者都落空 ⇒ `SEARCH` 恒返回 `-1`:
+
+```text
+es.LNO.GET("BGF")  →  -1（"BGF" 实际在 $3153[4]）
+  ⇒ @3743（槽号）恒 0
+  ⇒ es.SP.SET.SET / es.SP.GO.SET 登记到槽 0 而非 3
+  ⇒ @3394（槽→绘制层映射）全 0
+  ⇒ es.SP.DRAW 从不调用
+  ⇒ sprite 全不上屏
+```
+
+### 4. 修复与实测
+
+`array_needle` 与新增的 `varinfo_no_slot` 改为按**参数名**从工程 ysc 反查
+槽号(参数名跨版本稳定,槽号不稳定)。
+
+挂宿主实测(同帧,`examples/probe_host_vars.rs` / `probe_host_cmds.rs`):
+
+```text
+指标                                 修复前   修复后
+$3153 查 "BGF" 的结果                 -1       4
+@3743（槽号）                          0        4
+@3270[3]（槽→层号）                    0        4
+es.SP.DRAW 调用次数（f84..f86）        0        9
+CGINFO[EXIST "SPLBUF1"]                1        1
+```
+
+画面:`yu-cli run ... --frames 300 --shot` 出标题画面
+(背景 CG + LOGO + 6 项菜单),f86 起不再残留调试 UI。
+
+### 5. 新增取证工具(全部只读)
+
+| 工具 | 用途 |
+|---|---|
+| `yu-render/soft/examples/probe_host_cmds.rs` | **挂宿主**的命令级 trace(按 sid/pc 区间过滤) |
+| `yu-render/soft/examples/probe_host_vars.rs` | **挂宿主**的变量导出(逐帧/指定帧,只打非零项) |
+| `yu-render/soft/examples/probe_host_query.rs` | 包装 `GfxHost`,记录每次 `CGINFO` 提问与答案 |
+| `yu-render/soft/examples/probe_at_pc.rs` | 命令边界采样变量(定位同帧内的写/清竞争) |
+| `yu-rt/examples/probe_ysc_params.rs` | 打印工程 ysc 的命令参数表(槽号取证) |
+| `yu-rt/examples/probe_var_refs.rs` | 全脚本扫描谁读/写了某变量 |
+| `yu-rt/examples/probe_label_raw.rs` | ysl 标签原始记录(pc/script/base_a/hash) |
+| `yu-rt/examples/probe_src_diff.rs` | 散盘 `data/` 与 `data.ypf` 的条目字节比对 |
+| `yu-rt/examples/probe_list_cmp.rs` | 两个 `DataSource` 的 `list()` 结果比对 |
+
+### 6. 验收(原始结果)
+
+```text
+$ cargo test -p yu-rt --test fixture varinfo_search_resolves
+running 1 test
+test result: ok. 1 passed; 0 failed
+
+$ cargo test -p yu-rt            # 含样本
+lib 70 / consistency 4 / corpus 11 / fixture 75 / golden 全绿
+
+$ cargo test -q --workspace -- --test-threads=1   # 见下节
+```
+
+### 7. 台账
+
+- `DIV-RT-053`(yu-rt divergences README):VARINFO 槽号按名解析,fixed。
+- `DIV-GFX-046` §K:撤销 §H/§I/§J(附「裸 Vm trace 不可信」的工具层教训),
+  记录官方 v494 trace 证据链与修复前后对照。
+- `corpus.rs` 首帧金丝雀 `1_292_100 → 1_290_335`:经 `git stash` 撤回本修复
+  后实测数字不变 ⇒ **与本次修复无因果**,是当前语料本身偏离旧钉值;
+  注释已明确写「不声称因果」。`loose_and_packed` 改为「散盘缺资产 ⇒
+  显式 SKIP + 计数」(实测 `data/` 缺 1264 个资产,`ysbin/` 143 项字节全同)。
+
+### 8. 第二处修复:`CGACT[SIZE]` 参数按浮点读(片头 LOGO 上屏)
+
+`VARINFO` 修好后 `es.SP.DRAW` 会被调用了,但画面仍黑。渲染报告:
+
+```text
+skip image x2  gfx.imageop.region.partial   :/W0/SPL401
+```
+
+`s66 pc6028`(`es.CGACT_SIZE` 内部)的真实实参:
+
+```text
+CGACT[ID=SPLBUF401 ID2=SPL401 SIZE=1
+      X=0 Y=0 X2=1100 Y2=824.5      ← 浮点
+      SX=1101 SY=825.5]             ← 浮点
+```
+
+`cgact_image` 用 `find_int` 读这六个参数,而 `EngineValue::as_int` 要求
+`fract()==0` ⇒ `Y2=824.5`/`SY=825.5` 被静默判成「未给」⇒ 区域字段数不足
+(`region.partial`)+ 尺寸缺失(`size.missing`)⇒ SIZE 整条跳过 ⇒ sprite 层
+永远拿不到像素。`.5` 不是怪值:缩放比例含 0.5 是 `es_Sprite.yst` 的常态。
+
+修法:`SX/SY` → `find_f64` 后 `round() as u32`;`X/Y/X2/Y2` → 新增 `find_px`
+(浮点四舍五入);`ImageOp.sx/sy` 与 JSON 输出改浮点保值;soft/wgpu 后端
+同步(`<= 0.0` 判定 + 取整)。
+
+### 9. 验收(截图,原始输出)
+
+```text
+$ cargo run -p yu-cli -- run <game> --frames 90  --shot v3_90.png
+ops: 83 total, 83 drawn, 0 skipped
+missing assets: 0
+png: v3_90.png (2197650 bytes)
+
+$ cargo run -p yu-cli -- run <game> --frames 140 --shot v3_140.png
+ops: 133 total, 133 drawn, 0 skipped
+png: v3_140.png (3492161 bytes)     ← 片头 LOGO「通行止め」灰底红黑书法
+
+$ cargo run -p yu-cli -- run <game> --frames 300 --shot v3_300.png
+ops: 79 total, 79 drawn, 0 skipped
+png: v3_300.png (3427152 bytes)     ← 标题画面正常
+```
+
+修复前对照:`79 total, 77 drawn, 2 skipped`,f90/f140 全黑,PNG 1.0 MB。
+修复后 0 skipped,同一帧的构图与底色与官方 `frame_0020` 一致。
+
+### 10. 挂账(诚实登记)
+
+`@3394` 在**帧末**读到 0 属正常:`pc2940 LET @3394[@48-1]=0` 是
+`es.SP.DRAW` 的**收尾清理**(每帧重建 → 绘制 → 清空),官方同构。此前把它
+当成缺陷,是因为裸 `Vm` trace 里 `@3394` 从未被写过;修复后帧内序列完整。
+
+### 11. 审查轮(2026-10-25):还有多少同类硬编码
+
+`VARINFO` 只修针值槽是不够的 —— 本轮把它的**全部分派**改成按参数名解析:
+
+| 位置 | 旧写法 | 新写法 |
+|---|---|---|
+| 查询项筛选 | `!matches!(slot, 17..=20)` 排除辅助参数 | 按名排除 `INT/FLT/STR/NO` |
+| 结果分派 | `match slot { 2=>TYPE, 4=>DIMNUM, 5..=12=>DIMSIZE, 13=>LENGTH, 14=>SEARCH }` | `match varinfo_names[slot]` + `DIMSIZE` 尾部编号解析 |
+
+那两处旧写法在 v494 上都错(`17..=20` 应是 `15..=18`,且 `TYPE` 之后的
+槽位并不连续成段)。复核 `fixture::varinfo_query_dispatch_follows_param_names`
+(参数表整体前移后五个查询项仍正确)。
+
+**同类风险盘点(按名 vs 按槽号):**
+
+| 命令 | 表在 v494/0.495 之间 | 现状 |
+|---|---|---|
+| `VARINFO` | **位移**(INT/FLT/STR/NO:17/18/19/20 → 15/16/17/18) | 已全部改为按名 |
+| `VARACT` | 逐项相同(100 号,槽 0..28 一致) | 仍有 `17..=28` 等按槽号写法,**潜伏风险** |
+| `TASKINFO` | 逐项相同(95 号,槽 0..14 一致) | 仍有 `match slot { 2|3|5|6|7|8… }`,**潜伏风险** |
+| `CGINFO`/`CG`/`CGACT` | 参数名与顺序稳定 | gfx 侧已按名(`params.resolve`) |
+
+结论:**已知会漂移的只有 `VARINFO` 一处,已收口**;`VARACT`/`TASKINFO` 目前
+两版一致,但写法仍是按槽号,新版本若在它们中间插入参数就会静默走错分支。
+这两处列为观察项,等有第三份语料(不同版本)时再按名收口 —— 现在改属于
+无证据的重构,不做。
+
+### 12. 收口(2026-10-25):三处按槽号分派全部改为按参数名
+
+§11 盘出的 `VARACT` / `TASK` / `TASKINFO` 三处(两版目前一致但写法脆弱)
+本轮一并改为按名解析 —— 与其留观察项等第三份语料,不如现在就消除机制性
+风险(参数名是 `ysc.ybn` 里的一等事实,不是猜的)。
+
+| 命令 | 旧写法 | 新写法 |
+|---|---|---|
+| `VARACT` | `flag(6)`/`flag(13)`/`flag(14)`/`num(4)` 等共 16 处数字;`INIT`+`G_*` 用 `17..=28` 区间与 `slot-17/21/25` 算族和位 | `flag("TYPE")`/`flag("DIMSIZE")`/`flag("PUSH")` 等;`G_INT/G_FLT/G_STR` 按**前缀匹配 + 名字尾部数字**定位族与位 |
+| `TASK` | `slot @ 4..=13` / `14..=23` / `24..=33` 三段区间 + `slot-4/14/24` | `TINT`/`TFLT`/`TSTR` 前缀匹配 + `task_family_bit()` 取位号 |
+| `TASKINFO` | `match slot { 2/3/5/6/7/8/16/17/18/19 }` | `match names[slot] { "EXIST"/"E"/"Z"/"FILE"/"FILENO"/"LINE"/"IFNEST"/"GOSUBNEST"/"LOOPNEST"/"SCRIPTPOS" }` |
+
+**过程中自曝一个我自己引入的 bug**:`INIT`+`G_*` 的守卫最初写成
+`names.iter().any(|n| n.starts_with("G_INT") …)` —— 那是「表里有没有这个
+名字」,恒真,导致每条 `VARACT` 都被误判进该分支并提前返回。`fixture` 的
+4 个 VARACT 用例立刻红(`varact_hantozen_…`、`var_add_macro_chain_appends`
+等)。改成看 `flags`(本次指令**实际给了**哪些槽)后全绿。这条留作记录:
+「按名解析」必须配「在场判定仍然基于本次窗口」。
+
+**零漂移验证(逐字节):**
+
+```text
+f140  重构前 3492161 bytes  →  重构后 3492161 bytes
+f300  重构前 3427152 bytes  →  重构后 3427152 bytes
+ops: 133/133 drawn 0 skipped(f140) / 79/79 drawn 0 skipped(f300)
+```
+
+```text
+cargo test -p yu-rt --lib      70 passed
+cargo test -p yu-rt --test fixture  76 passed
+cargo test -p yu-rt --test corpus   11 passed
+```
+
+### 13. 全项目硬编码扫描结论(2026-10-25)
+
+扫描口径:按**槽号**分派、按 **opcode** 数字分派、按**系统变量 id** 分派。
+
+| 类别 | 结果 |
+|---|---|
+| 命令 → 处理体 | **按名**(`HandlerKind` 由 `cmd.name` 匹配,`handlers.rs:230+`)✅ |
+| 参数 → 语义 | `VARINFO`/`VARACT`/`TASK`/`TASKINFO` 已全部按名 ✅;gfx 侧(`CG`/`CGACT`/`CGINFO`…)本来就走 `params.resolve(name)` ✅ |
+| opcode 数字 | 仅测试文件(`fixture.rs`/`golden.rs` 的 `OP_*` 常量),生产代码零处 ✅ |
+| 系统变量 id | `sysvar.rs` 全部按**名字** match(`_LC`/`_PINT`/…)✅;id→名字的映射来自工程 `ycd` 或内置 ABI 族 TSV,按 `ysv.ybn` 指纹自动选 ✅ |
+| `rec.kind == 0/1` | `op_end`/`op_taskend`/`op_let` 里的 0/1 是**命令自身参数表的前两位**(`RESTART`/`ID`、`SET`/`LET`),由 `ysc` 声明,属结构常量;已确认两版一致 |
+| `slot >> 8` | 复合赋值码位(`LET`/`DIMSIZE+=`),是窗口编码而非参数序号 ✅ |
+
+结论:**生产代码里已无「按槽号区间分派」的残留**。剩余数字都是
+(1) 结构常量(参数表前两位)、(2) 窗口编码、(3) 测试夹具。
+
+新增版本若在 `VARINFO`/`VARACT`/`TASK`/`TASKINFO` 之外**新增**参数,
+按名解析自动适配;若在这些命令**中间插入**参数,也不会再走错分支。
+
+### 14. 全方位硬编码审查(2026-10-25)—— 含 1 处真雷
+
+口径修正:上一轮把「没证据」当成不动的理由,不对。**能从游戏自带数据
+读出来的东西,游戏数据就是最高档证据**,读它不需要额外取证。按这个标准
+把全项目过了一遍。
+
+#### A. 找到并修掉的**真雷**:YPF 版本上限
+
+```text
+// 旧代码(会拒掉真实商业作品)
+pub const MAX_ACCEPTED_VERSION: u32 = 495;
+if version > MAX_ACCEPTED_VERSION { → Unimplemented, 拒绝启动 }
+```
+
+这一条与项目**自己的 REA 证据冲突**:`FUN_0045e3b8`(0.495 `yu-ris.exe`,
+sha256 `4f5eefa3…`)逐字节无版本分支 —— 索引起点恒 `0x20`、步长恒
+`nameLen + 0x1B`、长度码表恒 `T[0xFF - lenEnc]`、名字逐字节取反,
+`version` 只被读入从不参与分支(见 `docs/tasks/task-e-fixes.md` §4)。
+项目自己的 `equivalence.rs` 也早就有 「version=300 必须能读」的用例。
+
+而 `<game-a>` 的 `data.ypf` 是 **YPF v500** —— 旧代码会直接拒启。
+
+修法:去掉上限闸门,常量改名为 `VERIFIED_MAX_VERSION` 并注明「仅信息,
+不是门禁」;真正的把关交给版本闸门之后已有的结构校验
+(entry_count 上限、索引容量、`detect_layout` 方言探测、名字
+MurmurHash 核验)。新增用例 `engine_layout_with_version_500_is_readable`
+(同布局 + v500 ⇒ 正常读取,版本号原样透传)。
+
+#### B. 补掉上一轮漏改的一处槽号
+
+`VARACT[DIMSIZE]` 的复合码位取值用 `.find(|w| w.rec.kind == 13)` ——
+我上轮改 `flag("DIMSIZE")` 时漏了这行。已改为 `slot_of("DIMSIZE")`。
+
+#### C. 全项目扫描结果(分类)
+
+| 类别 | 扫描结果 | 判定 |
+|---|---|---|
+| 命令 → 处理体 | `HandlerKind` 由 `cmd.name` 匹配 | ✅ 动态 |
+| 参数 → 语义 | `VARINFO`/`VARACT`/`TASK`/`TASKINFO` 已按名;gfx 侧本来按名 | ✅ 动态 |
+| **屏幕尺寸** | `yscfg.ybn` 的 `+0x10/+0x14`(本作实测 1100×825) | ✅ 动态 |
+| 图像/音频扩展名序 | `yscfg.ybn` 的 `image_ext_order`/`sound_ext_order` | ✅ 动态 |
+| **系统变量 id→名字** | 游戏自带 `ycd`,否则按 `ysv.ybn` 指纹从 4 个 ABI 族自动选 | ✅ 动态 |
+| **YPF 版本** | ~~上限 495 硬拒~~ → 无上限,结构校验把关 | ✅ **本轮修复** |
+| YPF 版本下限 234 | 早期布局无任何样本 | 保留(拒绝优于硬套) |
+| 图层名 `W0` | 手册 `basic/layer.html` 规定的根路径 | ✅ 格式常量 |
+| 命令名 `SPL`/`CG` 等 | 脚本字符串常量,引擎无感 | ✅ 非实现 |
+| opcode 数字 | 仅测试夹具 `OP_*` 常量;生产零处 | ✅ |
+| `ysv` 的 `kind==1/2` | `ysv.ybn` 文件格式字段(全局/局部) | ✅ 格式常量 |
+| `slot >> 8` | 复合赋值码位,窗口编码 | ✅ 格式常量 |
+| `rec.kind == 0/1` | 各命令参数表前两位(由 ysc 声明) | ✅ 格式常量 |
+| 默认字号 20 | REA `FUN_00464fac` + `docs/font-contract.md` §3.3 | ✅ 引擎内置 |
+| fps=60 | `yscfg` 无此字段;官方为宿主时钟基准,脚本可 `FPS[SET]` 覆盖 | ✅ 合理默认 |
+| 字体名 | 脚本传入,`find_family` 按名查(全角/空格/连字符折叠) | ✅ 动态 |
+| 音频采样率 | 从 ogg/wav 头读,`channels==1` 只是单声道分支 | ✅ 动态 |
+| 存档格式版本 `0x1E0` | v494 实测 5 个存档全部 `0x1E0` | ✅ 已实测 |
+| `YSTD` 版本 495 | 该解析器不在装载链上(仅 yu-format 独立 API) | 低风险,记录 |
+
+#### D. 验证(零漂移)
+
+```text
+f140  3492161 bytes（与重构前逐字节相同）
+ops: 133 total, 133 drawn, 0 skipped
+
+cargo test -p yu-rt --test fixture   76 passed
+cargo test -p yu-vfs                 42 + 14 + 2 + 5 passed
+```
+
+### 15. 代码质量审查(2026-10-25)—— 自审抓到 2 个我自己引入的 bug
+
+按「逐行读 diff + clippy + 全测」过了一遍本会话全部改动。**找到并修掉
+两个由本轮重构引入的真实错误**,均属"按名解析"改造的副作用:
+
+#### BUG-1 `G_INT2..G_INT4` / `TINT2..TINT10` 位号错位一格 ★会产生错误行为
+
+改造时把「槽号区间」换成「后缀数字」,但**后缀 N 不是索引 N**:
+
+| 名字 | 应得索引/位 | 第一版实际 |
+|---|---|---|
+| `TINT` | 0 | 0 ✅ |
+| `TINT2` | 1 | 2 ❌ |
+| `TINT10` | 9 | 10 ❌(越界,被 `bit < 16` 放过但写错槽) |
+| `G_INT2` | 掩码 bit 1 | bit 2 ❌ |
+| `G_INT4` | 掩码 bit 3 | bit 4 ❌(被 `bit >= 4` 丢弃 ⇒ **整组不恢复**) |
+
+后果:`VARACT[INIT=1 G_INT4=1]` 完全不生效;`TASK[TINT2=x]` 写进错误寄存器。
+**这是静默错误行为,不是崩溃。**
+
+修法:新增 `family_index(name, prefix)` —— 后缀 N ⇒ 索引 `N-1`(与
+`sysvar::param_index` 的 `_TINT(n)` 读 `n-1` 同口径)。`g_mask` 亦改用
+它,并在注释里写清「掩码位 = 组号 - 1,与 `restore_globals` 的
+`1 << (group-1)` 对齐」。
+
+新增回归 `fixture::varact_g_int_group_bits_follow_suffix`:四组变量、
+只给 `G_INT2`,断言只有组 2 恢复、组 1/3/4 保持改动后的值。
+**该用例在修复前是红的**(实测 `组2 保持 99`),修复后绿。
+
+#### BUG-2 `TASK` 入口标签槽的名字是 `#` 不是空串
+
+第一版把该槽写成 `Some("")`,但两版 ysc 实测参数名都是 `#`
+(v494 `TASK` 表 `#34  # kind=String`)。`Some("")` 永不命中 ⇒
+`TASK` 的 `#=` 入口标签被当成"未实现参数"直接报错。
+
+修法:`Some("#" | "")`,注释写明 `#` 是实测名、空串为防御保留。
+
+#### 连带发现:夹具的 `TASK` 参数表失真
+
+修 BUG-2 时三个 TASK 用例同时红。起因是**测试夹具把真实 38 项的
+`TASK` 表压缩成了 18 项**(只留 TINT 十项),而夹具用真实槽号构造窗口
+(`kind=34` = `#`、`35` = `SCRIPTPOS`)。旧代码按槽号硬匹配真实布局,
+恰好"能过" —— 这掩盖了夹具与真实数据不一致。
+
+已把 `tests/support/mod.rs::task_params` 按真实 38 项布局展开
+(`TINT2..TINT10`/`TFLT*`/`TSTR*` 全在),并写明表格。之后 77/77 全绿。
+
+> 这一条本身值得记:夹具失真会让"按槽号"的实现看起来永远正确。
+
+#### 代码卫生(顺手清)
+
+| 项 | 处置 |
+|---|---|
+| 37 个临时探针中 11 个已被后续探针取代(裸 `Vm` 版) | 删除(`probe_arr_full`/`probe_sprite_state`/`probe_str_arr`/`probe_var_ints`/`probe_cmd_filter`/`probe_logo_gate`/`probe_hardcode_audit`/`probe_scan_bytes`/`probe_str_writes`/`probe_jumps`/`probe_var_dump`) |
+| `vm.rs` 多出的连续空行 | 删 |
+| `corpus.rs` `is_dir() == false` | 改 `!is_dir()` |
+| `probe_var_refs.rs` needless borrow | 改 `window_payload(w)` |
+| `dump_pc_cmds.rs` / `dump_game_cmds.rs` unused import | 删 |
+| 调试用 `YURIS_DBG_TASK` 环境变量分支 | 全部移除(源码零残留) |
+
+#### 验证(原始输出)
+
+```text
+$ cargo clippy -q -p yu-rt -p yu-gfx -p yu-vfs --all-targets
+仅剩 2 条既有告警(非本会话引入):
+  - scan_gosub_callers.rs:22  fn ysbin_dir 未使用
+  - result_large_err(既有 API 形状)
+
+$ cargo test -q -p yu-rt -p yu-gfx -p yu-vfs
+全部 ok:70 lib + 77 fixture + 11 corpus + 42/14/2/5 vfs + gfx 各套
+
+$ yu-cli run --frames 140 --shot
+ops: 133 total, 133 drawn, 0 skipped
+png: 3492161 bytes   ← 与重构前逐字节一致
+$ yu-cli run --frames 300 --shot
+ops: 79 total, 79 drawn, 0 skipped
+png: 3427152 bytes   ← 同上
+```
+
+结论:**两处 bug 都已修且有用例钉住;画面零漂移。**
+
+### 16. 同类错位扫描 + 静默处理 TODO 加料(2026-10-25)
+
+按「`G_INT2`/`TINT2` 那个错位还有没有别处」扫了全项目的
+「名字→索引」族,并补掉一处**真缺陷**。
+
+#### 新修:`RETURN` 缺边界守卫(会 panic)
+
+`GOSUB` 侧有 `1..=16` 守卫(`RINT0` 会 `usize` 下溢、`RINT17+` 会越界),
+`RETURN` 侧**没有**。抽成共用 `param_slot_index(name, slot, command)`,
+两处同口径,违者 Fatal 不 panic。
+
+#### 新增三道行为锁(都能证伪)
+
+| 用例 | 钉住 |
+|---|---|
+| `fixture::varact_g_int_group_bits_follow_suffix` | `G_INTn` ⇒ 掩码位 `n-1` |
+| `fixture::task_tint2_value_reaches_tint2_consumer` | `TASK[TINT2=7]` ⇒ `@_TINT(2)` 读到 7 |
+| `fixture::name_suffix_families_are_one_based_everywhere` | `RETURN[RINT2=42]` ⇒ `@_RINT(2)` 读到 42 |
+
+**证伪方式(实际执行,非推演)**:把实现改回错误版本,三条全红
+(`left: 99/0/0` vs `right: 2/7/42`);恢复后全绿。这条写进台账是为了让
+以后的人能重复这个验证,而不是信"作者说对了"。
+
+#### 扫描结论
+
+| 族 | 口径 | 状态 |
+|---|---|---|
+| `PINTn`/`RINTn` | `n-1` | ✅ 两侧统一 + 有守卫 + 有端到端用例 |
+| `TINTn`/`TFLTn`/`TSTRn` | `n-1` | ✅ 有端到端用例 |
+| `DIMSIZEn` | `n-1` | ✅ 有 VARINFO 分派用例 |
+| `G_INTn`/`G_FLTn`/`G_STRn` | 掩码位 `n-1` | ✅ 有用例 |
+| `PAD_*` | 两侧传原始 `n`,换算在 `input::pad_*_code` | ⚠ 同函数 ⇒ 无错位,但**无端到端用例** |
+| `KEY_*`/`MOUSE_*` | 名字→码 | ⚠ 未逐个核 1/0 基;已登记 |
+
+#### 文档
+
+`docs/todo-silent-handling.md` 追加 S7–S9:
+
+- **S7** 名字后缀被当索引(2 次实例 + 结构性消除 + 仍存风险的族清单);
+- **S8** 静默错值比静默跳过难查 —— 列了三条"加料"方案(事件带落位 /
+  写过的索引集合统计 / 调试构建值域断言);
+- **S9** 夹具与真实数据失真会掩盖错位(`TASK` 表 18 vs 38 已修);
+  建议加「夹具参数表 vs 真实 ysc 一致性」测试,一次性暴露所有压缩表。
+
+#### 验证
+
+```text
+cargo test -p yu-rt --lib         70 passed
+cargo test -p yu-rt --test fixture 79 passed
+```
