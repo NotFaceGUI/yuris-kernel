@@ -538,20 +538,11 @@ impl Vm {
                 continue;
             }
             let pname = self.param_name(cmd.opcode, w.rec.kind).unwrap_or_default();
-            let idx = param_index_of(&pname).unwrap_or(1);
-            // 工程表异常(PINT0/PINT17+)→ Fatal 诊断,不回绕/不越界(任务书 E R7)。
-            if !(1..=16).contains(&idx) {
-                return Err(diag::fatal(
-                    code::rt::CMD_WINDOWS,
-                    Boundary::Script,
-                    format!("GOSUB 参数名 {pname} 超出 1..16(工程 ysc 表异常)"),
-                )
-                .into());
-            }
+            let idx = param_slot_index(&pname, cmd.windows[0].rec.kind, "GOSUB")?;
             let value = self.eval_window(st, w)?;
             let value = coerce_param(&pname, value);
-            frame.args[idx - 1] = Some(value);
-            frame.arg_flags[idx - 1] = true;
+            frame.args[idx] = Some(value);
+            frame.arg_flags[idx] = true;
         }
         if st.frames.len() > GOSUB_MAX_CALLS {
             return Err(
@@ -589,11 +580,13 @@ impl Vm {
                 continue;
             }
             let pname = self.param_name(cmd.opcode, w.rec.kind).unwrap_or_default();
-            let idx = param_index_of(&pname).unwrap_or(1);
+            // 与 GOSUB 同一守卫:此前 RETURN 缺这条,**`RINT0` 会 usize 下溢、
+            // `RINT17+` 会越界 panic**(DIV-RT-034「panic 收口」)。
+            let idx = param_slot_index(&pname, w.rec.kind, "RETURN")?;
             let value = self.eval_window(st, w)?;
             let value = coerce_param(&pname, value);
-            ret[idx - 1] = Some(value);
-            flags[idx - 1] = true;
+            ret[idx] = Some(value);
+            flags[idx] = true;
         }
         let frame = st.frames.pop().expect("帧数 > 1");
         // 被调层未闭合的 IF/LOOP 不得泄漏给调用方(块结构按调用层独立)。
@@ -4117,6 +4110,28 @@ fn windows_error(cmd: &Cmd, detail: &str) -> yu_log::Diag {
         Boundary::Script,
         format!("{}: {detail}(实给 {} 个窗口)", cmd.name, cmd.windows.len()),
     )
+}
+
+/// 参数名 → **0 基槽位**,带 1..=16 守卫(违者 Fatal,不 panic)。
+///
+/// 生产侧(`GOSUB[PINTn=]` / `RETURN[RINTn=]`)与消费侧
+/// (`@_PINT(n)` / `@_RINT(n)`,`sysvar::param_index` 读 `n-1`)必须指向
+/// 同一格:名字里的后缀 N ⇒ 索引 `N-1`。2026-10-25 审查发现 `RETURN`
+/// 少了 GOSUB 已有的边界守卫,`RINT0` 会 `usize` 下溢、`RINT17+` 会越界,
+/// 故抽成本函数统一口径。
+fn param_slot_index(name: &str, slot: u8, command: &str) -> Result<usize, VmError> {
+    let n = param_index_of(name).unwrap_or(1);
+    if !(1..=16).contains(&n) {
+        return Err(diag::fatal(
+            code::rt::CMD_WINDOWS,
+            Boundary::Script,
+            format!(
+                "{command} 参数 `{name}`(槽 {slot})编号 {n} 超出 1..16(工程 ysc 表异常;DIV-RT-034)"
+            ),
+        )
+        .into());
+    }
+    Ok(n - 1)
 }
 
 /// 参数名尾部编号:`PINT2` → 2,`PINT` → 1。
