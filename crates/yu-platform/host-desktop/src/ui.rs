@@ -724,6 +724,8 @@ fn severity_color(severity: yu_log::Severity) -> Color32 {
         yu_log::Severity::Recoverable => Color32::from_rgb(200, 120, 24),
         yu_log::Severity::Unimplemented => Color32::from_rgb(200, 200, 60),
         yu_log::Severity::Info => Color32::GRAY,
+        // Verbose 属于可选噪声(默认不出),面板里用更暗的灰区分。
+        yu_log::Severity::Verbose => Color32::from_rgb(110, 110, 110),
     }
 }
 

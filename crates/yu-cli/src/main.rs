@@ -38,7 +38,7 @@ fn main() {
 }
 
 /// 从参数里摘出全局旗标(任意位置可用;子命令不认识它们):
-/// `--log-level quiet|error|warn|info|debug|trace` → `YU_LOG`,
+/// `--log-level quiet|error|warn|info|debug|trace|verbose` → `YU_LOG`,
 /// `--color on|off|auto` → 控制台颜色覆盖。
 fn extract_globals(tokens: &mut Vec<String>) -> Result<(), String> {
     let mut log_level: Option<String> = None;
@@ -77,12 +77,14 @@ fn extract_globals(tokens: &mut Vec<String>) -> Result<(), String> {
     if let Some(level) = log_level {
         let level = level.trim().to_ascii_lowercase();
         match level.as_str() {
-            "quiet" | "error" | "warn" | "info" | "debug" | "trace" => {
+            // `verbose` = 最低档,额外显示 `Severity::Verbose`(幂等空操作
+            // 等「正常但值得留痕」的事实);其余档位都不显示该级别。
+            "quiet" | "error" | "warn" | "info" | "debug" | "trace" | "verbose" => {
                 std::env::set_var("YU_LOG", level);
             }
             other => {
                 return Err(format!(
-                    "--log-level 只接受 quiet|error|warn|info|debug|trace,收到 `{other}`"
+                    "--log-level 只接受 quiet|error|warn|info|debug|trace|verbose,收到 `{other}`"
                 ))
             }
         }
@@ -198,8 +200,10 @@ yu-cli · 桌面唯一入口(headless + --mode desktop)+ 本地服务 + 用例�
   help    本总览,或逐命令 help
 
 全局参数:
-  --log-level quiet|error|warn|info|debug|trace   覆盖 YU_LOG(默认 info:
-                  内核挂号/生命周期行默认可见;quiet 压掉生命周期 Info);
+  --log-level quiet|error|warn|info|debug|trace|verbose
+                  覆盖 YU_LOG(默认 info:内核挂号/生命周期行默认可见;
+                  quiet 压掉生命周期 Info;verbose 额外显示最低档
+                  「正常但值得留痕」的事实,如幂等删除空操作);
                   也可 --log-level=X 形式。
   --color on|off|auto   控制台颜色(默认 auto:stderr 非终端时自动关并
                   在文件日志留原因;显式 on|off 优先于环境;

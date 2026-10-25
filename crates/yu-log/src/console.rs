@@ -70,6 +70,7 @@ pub fn severity_word(severity: Severity) -> &'static str {
         Severity::Recoverable => "WARN",
         Severity::Unimplemented => "UNIMP",
         Severity::Info => "INFO",
+        Severity::Verbose => "VERB",
     }
 }
 
@@ -79,6 +80,8 @@ pub fn severity_color(severity: Severity) -> &'static str {
         Severity::Fatal => "1;37;41",
         Severity::Recoverable | Severity::Unimplemented => "33",
         Severity::Info => "32",
+        // Verbose 是可选噪声:开启后也用最暗的灰,不抢注意力。
+        Severity::Verbose => "90",
     }
 }
 
@@ -110,6 +113,7 @@ pub fn host_word(level: HostLevel) -> &'static str {
         HostLevel::Error => "ERROR",
         HostLevel::Warn => "WARN",
         HostLevel::Info => "INFO",
+        HostLevel::Verbose => "VERB",
     }
 }
 
@@ -118,6 +122,7 @@ pub fn host_color(level: HostLevel) -> &'static str {
         HostLevel::Error => "1;31",
         HostLevel::Warn => "33",
         HostLevel::Info => "32",
+        HostLevel::Verbose => "90",
     }
 }
 
@@ -127,15 +132,31 @@ fn host_level_json(level: HostLevel) -> &'static str {
         HostLevel::Error => "error",
         HostLevel::Warn => "warn",
         HostLevel::Info => "info",
+        HostLevel::Verbose => "verbose",
     }
 }
 
 /// 宿主生命周期行的级别(非内核诊断,不进 `Severity`)。
+///
+/// `Verbose` 与 [`Severity::Verbose`] 同义:默认任何档位都不显示,
+/// 只有 `--log-level verbose` 才出现(周期性能采样等)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostLevel {
     Info,
     Warn,
     Error,
+    Verbose,
+}
+
+impl HostLevel {
+    /// 宿主级别 → 是否过 `--log-level` 门槛。宿主行没有诊断码,
+    /// 但门槛语义必须与内核诊断一致(否则 verbose 档行为分裂)。
+    fn passes(self, min: MinLevel) -> bool {
+        match self {
+            HostLevel::Verbose => min == MinLevel::Verbose,
+            _ => true,
+        }
+    }
 }
 
 // ------------------------------------------------------------ 颜色开关
@@ -339,25 +360,36 @@ fn strip_ansi(text: &str) -> String {
 /// 控制台最低可见级(`--log-level` 的内核诊断门槛)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MinLevel {
-    /// 压掉 `Severity::Info`(quiet/error/warn);挂号/可恢复/致命仍显示。
+    /// 压掉 `Severity::Info` 与 `Verbose`(quiet/error/warn);
+    /// 挂号/可恢复/致命仍显示。
     Quiet,
-    /// 全部显示(info/debug/trace)。
+    /// 显示到 `Info`(info/debug/trace)。**仍压掉 `Verbose`**。
     Normal,
+    /// 显式开启的最低档(仅 `--log-level verbose` / `YU_LOG=verbose`)。
+    Verbose,
 }
 
 impl MinLevel {
     pub fn passes(self, severity: Severity) -> bool {
         match self {
-            MinLevel::Quiet => severity != Severity::Info,
-            MinLevel::Normal => true,
+            MinLevel::Quiet => !matches!(severity, Severity::Info | Severity::Verbose),
+            MinLevel::Normal => severity != Severity::Verbose,
+            MinLevel::Verbose => true,
         }
     }
 
-    /// `YU_LOG`/`--log-level` 值 → 门槛。quiet/error/warn 压 Info,
-    /// info/debug/trace 全显(门面桥自身的级别另见 `facade::level_from_env`)。
+    /// `YU_LOG`/`--log-level` 值 → 门槛。quiet/error/warn 压 Info 与
+    /// Verbose;info/debug/trace 显示到 Info 但仍压 Verbose;
+    /// **只有 `verbose` 才显示 Verbose**(门面桥自身的级别另见
+    /// `facade::level_from_env`)。
     pub fn from_level_value(value: Option<&str>) -> Self {
-        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        match value
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
             Some("quiet") | Some("error") | Some("warn") => MinLevel::Quiet,
+            Some("verbose") => MinLevel::Verbose,
             _ => MinLevel::Normal,
         }
     }
@@ -583,6 +615,9 @@ impl Console {
     pub fn emit_host(&mut self, level: HostLevel, channel: &str, message: &str) {
         if let Some(file) = &self.opts.file {
             file.write_log_line(host_level_json(level), channel, message);
+        }
+        if !level.passes(self.opts.min) {
+            return;
         }
         let line = format_line(
             elapsed_secs(),

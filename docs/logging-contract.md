@@ -38,6 +38,7 @@
 | `UNIMP` | `Severity::Unimplemented` | `33`(黄) |
 | `INFO` | `Severity::Info` / 门面 Info / 宿主 Info | `32`(绿) |
 | `DEBUG` / `TRACE` | 门面 Debug/Trace | `36`(青) / `90`(灰) |
+| `VERB` | `Severity::Verbose`(仅 `--log-level verbose`) | `90`(灰) |
 
 不引入第二套级别集合(主人裁决 2026-10-25):生命周期行不新增级别,
 由 `[host]` 等频道标识;`Severity::Info` 之外的细分不进词表。
@@ -68,9 +69,11 @@
 | Info(生命周期) | 显示(绿) | `--log-level quiet` 压掉(含末尾汇总) |
 | 门面 Debug/Trace | 默认关 | `YU_LOG`/`--log-level` 维持旧语义 |
 | 门面 Warn | 显示(`[log-facade]`) | 维持 |
+| Verbose(最低档) | **恒不显示** | 仅 `--log-level verbose` 显示 |
 
-- `--log-level quiet|error|warn|info|debug|trace`(全局):quiet/error/warn
-  压内核 Info;info(缺省)/debug/trace 全显;debug/trace 同时放大门面级别。
+- `--log-level quiet|error|warn|info|debug|trace|verbose`(全局):quiet/error/warn
+  压内核 Info;info(缺省)/debug/trace 全显;debug/trace 同时放大门面级别;
+  **`verbose` 才显示 `Severity::Verbose`**(其余任何档位都不显示)。
 - headless `run`:live 行不打,末尾打**诊断汇总**(频次降序,同受门槛);
   `--diag-summary off` 关闭。
 - 桌面:observe 后同步控制台行(与 egui 面板同一次 drain,两路消费)。

@@ -23,12 +23,19 @@ use std::fmt;
 
 /// 严重级。语义对齐官方: `Unimplemented` = 已知语义未实装(挂号留痕);
 /// `Recoverable` = 调用方可继续;`Fatal` = 当前操作无法继续。
+///
+/// [`Severity::Verbose`] 是**只在显式开启时出现**的最低档:记录「正常但
+/// 值得留痕」的事实(幂等空操作、探测性查询的缺省值等)。它不属于普通
+/// 可见性阶梯 —— `quiet`/`info`/`debug`/`trace` 都不显示,只有
+/// `--log-level verbose`(或 `YU_LOG=verbose`)才出现。这样默认输出只留
+/// 真正需要动作的条目。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
     Fatal,
     Recoverable,
     Unimplemented,
     Info,
+    Verbose,
 }
 
 impl Severity {
@@ -38,6 +45,7 @@ impl Severity {
             Severity::Recoverable => "Recoverable",
             Severity::Unimplemented => "Unimplemented",
             Severity::Info => "Info",
+            Severity::Verbose => "Verbose",
         }
     }
 
@@ -53,6 +61,7 @@ impl Severity {
             "Recoverable" => Some(Severity::Recoverable),
             "Unimplemented" => Some(Severity::Unimplemented),
             "Info" => Some(Severity::Info),
+            "Verbose" => Some(Severity::Verbose),
             _ => None,
         }
     }

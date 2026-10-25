@@ -96,6 +96,12 @@ macro_rules! host_error {
 macro_rules! host_fatal {
     ($($arg:tt)*) => { host_emit(yu_log::console::HostLevel::Error, format!($($arg)*)) };
 }
+/// 最低档行(Verbose,暗灰):**只在 `--log-level verbose` 显示**。
+/// 周期性能采样这类「正常但值得留痕」的进度事实走这里 —— 默认输出
+/// 不该每 60 帧刷一行帧耗时。
+macro_rules! host_verbose {
+    ($($arg:tt)*) => { host_emit(yu_log::console::HostLevel::Verbose, format!($($arg)*)) };
+}
 
 /// Windows 定时器粒度(实测:P1 固定节拍已改为 `next_frame += 1/fps`,
 /// 但 600 帧仍只有 ~41fps;`--fps 1000` 同样 ~42fps ⇒ 不是 work+睡眠
@@ -2098,8 +2104,10 @@ impl ApplicationHandler for App {
         self.flush_input_latency();
         if self.frames <= 8 || self.frames.is_multiple_of(60) {
             let report = self.engine.last_report();
-            // 周期采样是进度不是警告:INFO(绿);spike 另走 host_error!(WARN)。
-            host_line!(
+            // 周期采样是**进度**不是告警:走 Verbose,默认不显示,
+            // `--log-level verbose` 才出现。真正的长帧另有阈值分支
+            // (下方 render_ms > 30 的 host_error!),那条保持 WARN 可见。
+            host_verbose!(
                 "frame {}: host_tick={tick_host_ms:.1}ms engine_tick={:.1}ms engine_render={:.1}ms draw={draw_ms:.1}ms",
                 self.frames, report.tick_ms, report.render_ms
             );
