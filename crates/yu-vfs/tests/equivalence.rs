@@ -246,6 +246,35 @@ fn non_ascii_name_dir_and_ypf_agree() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// **高于实测版本**的包也必须能读:装载器无版本分支。
+///
+/// 2026-10-25:此前 `version > 495` 直接 `Unimplemented` 拒绝 —— 那是把
+/// 「我们没样本」误当成「格式不同」。REA 证明 `FUN_0045e3b8` 逐字节无
+/// 版本分支(索引起点 `0x20`、步长 `nameLen+0x1B`、长度码表、名字取反),
+/// 版本只被读入从不参与分支。真实商业作品存在 YPF v500;拒掉它属实现
+/// 缺陷。本用例钉住:同布局 + 任意高版本号 ⇒ 正常读取。
+#[test]
+fn engine_layout_with_version_500_is_readable() {
+    let root = temp_dir("v500");
+    let files = sample_tree();
+    let pack_bytes = write_ypf(
+        &TestPack {
+            version: 500,
+            ..TestPack::default()
+        },
+        &pack_entries(&files),
+    );
+    let pack_path = root.join("v500_engine_layout.ypf");
+    fs::write(&pack_path, &pack_bytes).unwrap();
+
+    let ypf = YpfSource::open(&pack_path, Codec::Cp932).unwrap();
+    assert_eq!(ypf.header().version, 500, "版本号原样透传");
+    let key = LookupKey::new(br"CG\Ev\A.PNG", Codec::Cp932).unwrap();
+    assert_eq!(ypf.open(&key).unwrap(), files[1].data);
+
+    fs::remove_dir_all(&root).ok();
+}
+
 /// V2 验收:0.495 布局但 version=300 的包必须能读(引擎无版本分支;
 /// 表与 meta 都不随版本变化)。
 #[test]

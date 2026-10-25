@@ -57,10 +57,27 @@ use yu_log::{code, Boundary, Diag};
 
 /// 封包魔数。
 pub const YPF_MAGIC: [u8; 4] = *b"YPF\0";
-/// 官方接受的最低版本。
+/// 下限:**没有样本、且已知早期格式不同**,低于此值拒绝(DIV-002)。
+///
+/// 这与上限不同 —— 上限曾是 `495`,而 REA 证明装载器**没有版本分支**,
+/// 见 [`VERIFIED_MAX_VERSION`]。下限保留是因为 0.2xx 时代的布局无任何
+/// 本地样本,拒绝而不是硬套现布局。
 pub const MIN_ACCEPTED_VERSION: u32 = 234;
-/// 官方接受的最高版本(0.495;REA 无版本分支,超出视为未知)。
-pub const MAX_ACCEPTED_VERSION: u32 = 495;
+/// **已实测验证过的最高版本**(仅信息,不是闸门)。
+///
+/// 证据:官方索引装载器 `FUN_0045e3b8`(0.495 `yu-ris.exe`,
+/// sha256 `4f5eefa3…`)**逐字节无版本分支** ——
+/// 索引起点恒 `0x20`、步长恒 `nameLen + 0x1B`、长度码表恒
+/// `T[0xFF - lenEnc]`、名字逐字节取反,`version` 字段只被读入而从不
+/// 参与分支(见 `docs/tasks/task-e-fixes.md` §4 与
+/// `docs/divergences/DIV-002-ypf-nul-xor-dialect.md`)。
+///
+/// 因此版本号是**透传字段,不是门禁**:高于本值的包按同一套布局解析,
+/// 由结构校验(条目数、索引容量、方言探测、名字哈希)判定真伪。
+/// 曾经写死 `version > 495 ⇒ 拒绝`,会把低于本引擎的更高版本包
+/// (如 YPF v500 的商业作品)直接拒之门外 —— 那是把"没样本"误当成
+/// "格式不同",属实现缺陷而非证据缺口。
+pub const VERIFIED_MAX_VERSION: u32 = 495;
 /// 固定文件头长度。
 pub const HEADER_LEN: usize = 0x20;
 /// 索引起点(REA `FUN_0045e3b8` 恒 `0x20`)。
@@ -321,17 +338,15 @@ impl YpfSource {
             return Err(Diag::fatal(code::vfs::YPF_BAD_VERSION, Boundary::Data)
                 .at_data(path_bytes(&path), 4)
                 .with_detail(format!(
-                    "version {version} rejected (accepted: {MIN_ACCEPTED_VERSION}..={MAX_ACCEPTED_VERSION})"
+                    "version {version} below the verified lower bound {MIN_ACCEPTED_VERSION} \
+                     (early-format layouts have no local sample)"
                 )));
         }
-        if version > MAX_ACCEPTED_VERSION {
-            // 0.495 引擎无版本分支,但 >495 的布局/字段宽度未经实证,不猜。
-            return Err(Diag::unimplemented(code::vfs::YPF_UNSUPPORTED, Boundary::Data)
-                .at_data(path_bytes(&path), 4)
-                .with_detail(format!(
-                    "version {version} is newer than the verified {MAX_ACCEPTED_VERSION} layout; no local sample, refusing to guess"
-                )));
-        }
+        // **不设上限**:装载器 `FUN_0045e3b8` 无版本分支(见
+        // [`VERIFIED_MAX_VERSION`]),版本是透传字段。高于实测版本的包按
+        // 同一布局解析,真伪由下面的结构校验(条目数 / 索引容量 /
+        // 方言探测 / 名字哈希)判定。
+        let _ = VERIFIED_MAX_VERSION;
         if (data_start as u64) < HEADER_LEN as u64 || data_start as u64 > file_len {
             return Err(Diag::fatal(code::vfs::YPF_BAD_HEADER, Boundary::Data)
                 .at_data(path_bytes(&path), 12)
