@@ -22,7 +22,10 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use yu_font::cache::CacheLimits;
-use yu_font::{cp932, AaMode, DrawMode, FontRenderer, FontSource, Gradation, Rgb, Rotation};
+use yu_font::{
+    cp932, AaMode, DrawMode, FontRenderer, FontSource, Gradation, Rgb, Rotation,
+    ENGINE_DEFAULT_FAMILIES,
+};
 use yu_font::{StylePolicy, TextStyle as FontStyle};
 use yu_gfx::{LayerId, TextDraw, TextFontRequest, TextLayoutFrame, TextureRef};
 
@@ -80,6 +83,15 @@ pub struct TextComposer {
     /// 「要求 BOLD 但本机无粗体面」待报告(发现时置位,发出后清除;
     /// 不逐帧重发,避免刷帧日志)。
     pending_bold_note: bool,
+    /// 系统字体源的摘要(face 数 + 引擎默认 family 实际落到的 face/文件)。
+    /// `ensure()` 成功时填一次;日志按 `YU_LOG`/`--log-level` 的 info 级输出。
+    source_summary: Option<String>,
+    /// 强制字体 family(诊断/换字体用):非 `None` 时**所有** `FONT` 请求
+    /// 都解析到这个 family,绕过脚本给的 `NAME`/`NO`/`BNO`。
+    ///
+    /// 查不到时不用引擎回退表兜底 —— 强制指定就该显式失败,否则用户会
+    /// 以为换上了、其实画的还是默认字体。
+    force_font: Option<String>,
 }
 
 /// 一条合成缓存(见 [`TextComposer::compose_cache`])。
@@ -144,6 +156,43 @@ enum FaceFallback {
     Name(Vec<u8>),
 }
 
+/// 枚举结果摘要:face 总数、耗时、引擎默认 family 实际命中的是哪一项以及
+/// 它落在哪个字体文件。
+///
+/// 只在 `ensure()` 成功那一次生成。返回值同时进 `info` 日志和
+/// [`TextComposer::source_summary`](供宿主在默认 `warn` 级别下无条件打印)。
+fn font_source_summary(source: &FontSource, elapsed_ms: u128) -> String {
+    let head = format!(
+        "[font] system fonts: {} faces enumerated in {elapsed_ms}ms",
+        source.len()
+    );
+    match source.default_face() {
+        Ok(face) => format!(
+            "{head}; engine default family \"{}\" -> {}",
+            source.default_family_hit().unwrap_or("<unresolved>"),
+            source.describe_face(face)
+        ),
+        Err(_) => format!(
+            "{head}; none of the engine default families is installed: {}",
+            ENGINE_DEFAULT_FAMILIES.join(", ")
+        ),
+    }
+}
+
+/// 把 `FONT` 请求渲染成人读形式(日志用):`NAME="ＭＳ ゴシック"` /
+/// `NO=3` / `BNO=1` / `Default`(脚本未指定,走引擎回退表)。
+fn describe_request(request: &TextFontRequest) -> String {
+    match request {
+        TextFontRequest::Name(bytes) => {
+            let text: String = cp932::decode(bytes).chars.into_iter().collect();
+            format!("NAME=\"{text}\"")
+        }
+        TextFontRequest::No(no) => format!("NO={no}"),
+        TextFontRequest::Bno(no) => format!("BNO={no}"),
+        TextFontRequest::Default => "Default(script gave no font)".to_string(),
+    }
+}
+
 impl Default for TextComposer {
     fn default() -> Self {
         Self::new()
@@ -162,6 +211,8 @@ impl TextComposer {
             compose_cache: BTreeMap::new(),
             real_bold: BTreeMap::new(),
             pending_bold_note: false,
+            source_summary: None,
+            force_font: None,
         }
     }
 
@@ -176,6 +227,8 @@ impl TextComposer {
             compose_cache: BTreeMap::new(),
             real_bold: BTreeMap::new(),
             pending_bold_note: false,
+            source_summary: None,
+            force_font: None,
         }
     }
 
@@ -203,6 +256,30 @@ impl TextComposer {
         self.failure.as_deref()
     }
 
+    /// 系统字体源摘要(face 数 + 引擎默认 family 实际落到的 face/文件)。
+    ///
+    /// 日志按 `YU_LOG` / `--log-level` 输出(字体诊断是 `info` 级)。
+    #[must_use]
+    pub fn source_summary(&self) -> Option<&str> {
+        self.source_summary.as_deref()
+    }
+
+    /// 强制所有 `FONT` 请求解析到这个 family(诊断/换字体用)。
+    ///
+    /// 传 `None` 恢复脚本原语义。已有解析缓存会被清空 —— 否则同一 `FONT`
+    /// 请求还命中旧 face,看上去像没生效。family 查不到时不用引擎回退表
+    /// 兜底,解析失败并通过 `text.font_missing` 显式暴露。
+    pub fn set_force_font(&mut self, family: Option<String>) {
+        self.force_font = family;
+        self.faces.clear();
+    }
+
+    /// 当前的强制字体 family。
+    #[must_use]
+    pub fn force_font(&self) -> Option<&str> {
+        self.force_font.as_deref()
+    }
+
     fn ensure(&mut self) -> bool {
         if self.renderer.is_some() {
             return true;
@@ -214,11 +291,20 @@ impl TextComposer {
         let started = Instant::now();
         match FontSource::load_system_fonts() {
             Ok(source) => {
+                let summary = font_source_summary(&source, started.elapsed().as_millis());
+                log::info!(target: "yu-font", "{}", summary);
+                self.source_summary = Some(summary);
                 self.renderer = Some(FontRenderer::new(source, CacheLimits::default()));
                 self.load_ms = Some(started.elapsed().as_millis());
                 true
             }
             Err(diag) => {
+                log::error!(
+                    target: "yu-font",
+                    "[font] system font enumeration failed: {} {}",
+                    diag.code,
+                    diag.detail
+                );
                 self.failure = Some(format!("{}: {}", diag.code, diag.detail));
                 false
             }
@@ -226,6 +312,9 @@ impl TextComposer {
     }
 
     /// 解析 `FONT` 字体身份请求(`NAME` → `NO` → `BNO` → 引擎默认回退表)。
+    ///
+    /// 设了 [`TextComposer::set_force_font`] 时整段被它短路:不管脚本要什么,
+    /// 都解析到那个 family(诊断用);查不到就返回 `None` 显式失败。
     fn resolve_face(
         &mut self,
         request: &TextFontRequest,
@@ -239,39 +328,87 @@ impl TextComposer {
         }
         let renderer = self.renderer.as_ref()?;
         let source = renderer.source();
-        let face = match request {
-            TextFontRequest::Name(bytes) => {
-                let text: String = cp932::decode(bytes).chars.into_iter().collect();
-                match source.find_family(&text) {
-                    Some(face) => Some((face, FaceFallback::None)),
-                    // 名字查不到(空串/本机未装):引擎按默认 family 回退表
-                    // 选第一个已安装 family(`0x403b8e..0x403bdc`),不是错误。
-                    None => source
-                        .default_face()
-                        .ok()
-                        .map(|face| (face, FaceFallback::Name(bytes.clone()))),
+        let forced = self.force_font.clone();
+        let face = match forced {
+            Some(family) => {
+                let hit = source.find_family(&family);
+                if hit.is_none() {
+                    log::warn!(
+                        target: "yu-font",
+                        "[font] forced family \"{family}\" not installed; \
+                         every FONT request will fail (drop --font to restore script semantics)"
+                    );
+                } else if let Some(id) = hit {
+                    // 脚本自己算居中(X = 框宽/2 - 字符数*SX/2),假定半角字宽
+                    // 恒为 SX/2。比例字体不满足该假定 ⇒ 文本整体偏移。
+                    // 这是 `--font` 的诊断代价,不是渲染缺陷,必须说清楚。
+                    if !source.fullwidth_is_monospace(id) {
+                        log::warn!(
+                            target: "yu-font",
+                            "[font] forced family \"{family}\" has PROPORTIONAL metrics; \
+                             script-computed centering (X = box/2 - len*SX/2) assumes every \
+                             glyph is exactly SX wide, so forced-font text will look off-centre"
+                        );
+                    }
                 }
+                hit.map(|face| (face, FaceFallback::None))
             }
-            TextFontRequest::No(no) => {
-                if *no >= 0 {
-                    source
-                        .face_by_no(*no as usize)
-                        .map(|face| (face, FaceFallback::None))
-                } else {
-                    None
+            None => match request {
+                TextFontRequest::Name(bytes) => {
+                    let text: String = cp932::decode(bytes).chars.into_iter().collect();
+                    match source.find_family(&text) {
+                        Some(face) => Some((face, FaceFallback::None)),
+                        // 名字查不到(空串/本机未装):引擎按默认 family 回退表
+                        // 选第一个已安装 family(`0x403b8e..0x403bdc`),不是错误。
+                        None => source
+                            .default_face()
+                            .ok()
+                            .map(|face| (face, FaceFallback::Name(bytes.clone()))),
+                    }
                 }
-            }
-            // BNO 的字体列表语义未取证(DIV-FONT-007):不解析,退回默认。
-            TextFontRequest::Bno(_) => source
-                .default_face()
-                .ok()
-                .map(|face| (face, FaceFallback::Bno)),
-            TextFontRequest::Default => source
-                .default_face()
-                .ok()
-                .map(|face| (face, FaceFallback::None)),
+                TextFontRequest::No(no) => {
+                    if *no >= 0 {
+                        source
+                            .face_by_no(*no as usize)
+                            .map(|face| (face, FaceFallback::None))
+                    } else {
+                        None
+                    }
+                }
+                // BNO 的字体列表语义未取证(DIV-FONT-007):不解析,退回默认。
+                TextFontRequest::Bno(_) => source
+                    .default_face()
+                    .ok()
+                    .map(|face| (face, FaceFallback::Bno)),
+                TextFontRequest::Default => source
+                    .default_face()
+                    .ok()
+                    .map(|face| (face, FaceFallback::None)),
+            },
         };
-        self.faces.insert(key, face.clone());
+        self.faces.insert(key.clone(), face.clone());
+        // 每个不同的 FONT 请求只在首次解析时记一条:脚本重发同一字体不刷日志。
+        // 这是「游戏实际用了什么字体」的直接答案(请求 → 文件 → TTC 面)。
+        let want = describe_request(request);
+        match &face {
+            Some((id, fallback)) => {
+                let how = match fallback {
+                    FaceFallback::None => "exact",
+                    FaceFallback::Bno => "bno-fallback",
+                    FaceFallback::Name(_) => "name-fallback",
+                };
+                let line = format!(
+                    "[font] {want} -> {how} {}",
+                    source.describe_face(*id)
+                );
+                if matches!(fallback, FaceFallback::None) {
+                    log::info!(target: "yu-font", "{line}");
+                } else {
+                    log::warn!(target: "yu-font", "{line}");
+                }
+            }
+            None => log::warn!(target: "yu-font", "[font] {want} -> unresolvable"),
+        }
         face
     }
 

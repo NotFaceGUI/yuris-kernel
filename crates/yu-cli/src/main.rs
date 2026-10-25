@@ -5,8 +5,17 @@ use yu_cli::{output, CliResult, Failure, EXIT_FAIL};
 
 fn main() {
     // log 门面桥(P4 M-E):先于任何引擎/依赖初始化;级别见 YU_LOG。
+    // `--log-level X` 是全局参数,先摘出来再交给子命令(子命令不认它)。
+    let mut tokens: Vec<String> = std::env::args().skip(1).collect();
+    match extract_log_level(&mut tokens) {
+        Ok(Some(level)) => std::env::set_var("YU_LOG", level),
+        Ok(None) => {}
+        Err(message) => {
+            output::error(format!("yu-cli: {message}"));
+            std::process::exit(EXIT_FAIL);
+        }
+    }
     yu_log::facade::init(|line| crate::output::error(line));
-    let tokens: Vec<String> = std::env::args().skip(1).collect();
     let code = match dispatch(tokens) {
         Ok(()) => 0,
         Err(failure) => {
@@ -15,6 +24,39 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// 从参数里摘出 `--log-level X` / `--log-level=X`(全局,任意位置可用)。
+fn extract_log_level(tokens: &mut Vec<String>) -> Result<Option<String>, String> {
+    let mut found = None;
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i].as_str();
+        let value = if token == "--log-level" {
+            if i + 1 >= tokens.len() {
+                return Err("--log-level 需要一个值:error|warn|info|debug|trace".to_string());
+            }
+            let value = tokens[i + 1].clone();
+            tokens.drain(i..=i + 1);
+            value
+        } else if let Some(rest) = token.strip_prefix("--log-level=") {
+            let value = rest.to_string();
+            tokens.remove(i);
+            value
+        } else {
+            i += 1;
+            continue;
+        };
+        match value.trim().to_ascii_lowercase().as_str() {
+            "error" | "warn" | "info" | "debug" | "trace" => found = Some(value.trim().to_string()),
+            other => {
+                return Err(format!(
+                    "--log-level 只接受 error|warn|info|debug|trace,收到 `{other}`"
+                ))
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn dispatch(tokens: Vec<String>) -> CliResult<()> {
@@ -56,11 +98,11 @@ yu-cli · 原生引擎宿主 + 本地服务 + wasm 呈现端
   yu-cli run  <project-root> [--backend soft|wgpu] [--entry LABEL] [--frames N]
                              [--until-visible] [--shot PATH] [--json PATH]
                              [--record-events on|off] [--debug-mode on|off]
-                             [--data PATH]
+                             [--data PATH] [--font FAMILY]
   yu-cli serve <project-root> [--backend soft|wgpu] [--port 4173] [--no-open]
                              [--entry LABEL] [--fps 60] [--record-events on|off]
                              [--debug-mode on|off] [--data PATH] [--www DIR]
-                             [--diag-ws]
+                             [--diag-ws] [--font FAMILY]
   yu-cli dev  <project-root> [--port 4173] [--no-open] [--backend soft|wgpu]
                              [--debug-mode on|off]
   yu-cli case <project-root> --all | --case NAME [--update]
@@ -70,6 +112,17 @@ yu-cli · 原生引擎宿主 + 本地服务 + wasm 呈现端
 数据入口(唯一约定):
   <project-root>/data.ypf 优先;否则 <project-root>/data/;
   <project-root> 也可以直接是 .ypf 文件。
+
+全局参数:
+  --log-level error|warn|info|debug|trace   覆盖 YU_LOG(默认 warn)。
+                                            查字体解析链用 info(看 target=yu-font
+                                            的 [font] 行);也可 --log-level=X 形式。
+
+字体诊断:
+  --font FAMILY   强制所有 FONT 请求用该 family,忽略脚本的 NAME/NO/BNO。
+                  family 查不到 = 硬失败(不回落默认表)。family 名按 fontdb
+                  规范化匹配,全角/半角与空格差异自动折叠,故
+                  --font MS\\ Gothic 与 --font MS-Gothic 等价。
 
 宿主注入(BootConfig,全部显式给值):
   screen_color=32   @_SCREEN_COLOR(浏览器/桌面 32bpp)

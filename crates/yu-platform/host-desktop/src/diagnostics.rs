@@ -139,7 +139,7 @@ impl StuckReport {
         if let Some((code, frame, where_)) = &self.last_fatal {
             return format!(
                 "Fatal `{code}` @ {where_} (frame {frame}) ⇒ 该脚本任务已终止;\
-                 后续输入不会推进(引擎语义,归 P4/P3)"
+                 后续输入不会推进"
             );
         }
         if self.logic_stall_frames >= STUCK_LOGIC_FRAMES {

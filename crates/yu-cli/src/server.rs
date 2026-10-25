@@ -52,6 +52,8 @@ pub struct ServeOptions {
     pub diag_ws: bool,
     /// `@_DEBUGMODE` 注入(DIV-L-001;debug 语料对拍口径)。
     pub debug_mode: bool,
+    /// 强制字体 family(诊断/换字体;`None` = 脚本语义)。
+    pub force_font: Option<String>,
 }
 
 impl ServeOptions {
@@ -101,6 +103,7 @@ impl ServeOptions {
                 })?),
                 None => None,
             };
+        let force_font = args.flag("font").filter(|value| !value.trim().is_empty());
         args.finish()?;
         Ok(Self {
             root: PathBuf::from(root),
@@ -116,6 +119,7 @@ impl ServeOptions {
             pause_at,
             diag_ws,
             debug_mode,
+            force_font,
         })
     }
 }
@@ -140,6 +144,7 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         debug_mode: opts.debug_mode,
         // 长跑宿主:首帧前预热字体表,避免第一次文本场景的 ~130ms 停顿。
         warm_text: true,
+        force_font: opts.force_font.clone(),
         ..EngineOptions::default()
     };
     let mut engine = Engine::new(project, engine_opts)?;

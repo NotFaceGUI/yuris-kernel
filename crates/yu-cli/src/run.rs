@@ -49,6 +49,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         Some(value) => ArgReader::on_off("debug-mode", &value)?,
         None => false,
     };
+    // 强制字体(诊断/换字体):忽略脚本的 NAME/NO/BNO。
+    let force_font = args.flag("font").filter(|value| !value.trim().is_empty());
     args.finish()?;
 
     let project = Project::discover(Path::new(&root), data.as_deref())?;
@@ -58,9 +60,15 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         record_events,
         debug_mode,
         save_root,
+        force_font,
         ..EngineOptions::default()
     };
     let mut engine = Engine::new(project, opts)?;
+    // 字体枚举是懒加载(默认 warm_text=false),首帧前才预热的话启动摘要就
+    // 是空的。这里显式预热一次,让 `--log-level info` 能看到字体事实。
+    if engine.font_summary().is_none() {
+        engine.warm_text();
+    }
     let limit = frames
         .unwrap_or(if until_frame.is_some() { 2000 } else { 1 })
         .max(1);

@@ -10,10 +10,29 @@
 //! A cache must therefore never mix faces from two sources.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use yu_log::{Boundary, Diag};
 
 use crate::code;
 use crate::style::Italic;
+
+/// Font file behind a fontdb face (`None` for caller-supplied bytes).
+///
+/// `Source::File` exists only with fontdb's `fs` feature, which
+/// `Cargo.toml` enables for every non-wasm target and nowhere else; the
+/// inner `cfg` mirrors that. wasm enumerates nothing, so the fallback arm
+/// is the only one it can reach.
+fn source_path_of(source: &fontdb::Source) -> Option<PathBuf> {
+    let _ = source;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match source {
+            fontdb::Source::File(path) => return Some(path.clone()),
+            _ => {}
+        }
+    }
+    None
+}
 
 /// Engine fallback list, in the exact order `FUN_00403afc` tries it.
 pub const ENGINE_DEFAULT_FAMILIES: &[&str] = &[
@@ -69,6 +88,9 @@ pub struct FaceInfo {
     /// Face index inside its font file (TTC index).
     pub index: u32,
     pub origin: FaceOrigin,
+    /// Font file the face was enumerated from. `None` for caller-supplied
+    /// bytes([`FontSource::from_bytes`]), where no path exists.
+    pub source_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +103,7 @@ struct FaceRecord {
     style: FaceStyle,
     index: u32,
     origin: FaceOrigin,
+    source_path: Option<PathBuf>,
 }
 
 /// Result of resolving bold/italic for a face.
@@ -144,6 +167,7 @@ impl FontSource {
                 },
                 index: info.index,
                 origin,
+                source_path: source_path_of(&info.source),
             };
             by_db.insert(id, FaceId(faces.len() as u32));
             faces.push(record);
@@ -203,6 +227,7 @@ impl FontSource {
                 },
                 index: info.index,
                 origin: FaceOrigin::System,
+                source_path: source_path_of(&info.source),
             });
         }
         Ok(Self {
@@ -249,7 +274,73 @@ impl FontSource {
             style: r.style,
             index: r.index,
             origin: r.origin,
+            source_path: r.source_path.clone(),
         })
+    }
+
+    /// One-line description of a face for diagnostics: family, PostScript
+    /// name, weight/style, TTC index and the font file behind it.
+    ///
+    /// Kept as a `String` (not a log call) so the font crate stays free of
+    /// the `log` facade; callers decide level and sink.
+    #[must_use]
+    pub fn describe_face(&self, face: FaceId) -> String {
+        let Ok(info) = self.face_info(face) else {
+            return format!("<unknown face {}>", face.index());
+        };
+        let families = info.families.join(" / ");
+        let file = match &info.source_path {
+            Some(path) => path.display().to_string(),
+            None => "<caller-supplied bytes>".to_string(),
+        };
+        format!(
+            "family=\"{families}\" postscript=\"{}\" weight={} style={:?} ttc_index={} origin={:?} file=\"{file}\"",
+            info.post_script_name, info.weight, info.style, info.index, info.origin
+        )
+    }
+
+    /// Engine default family that [`FontSource::default_face`] actually picks.
+    ///
+    /// `None` when no candidate is installed, or when the first installed
+    /// candidate is not the one `find_family` resolved (cannot happen with
+    /// the current scoring, but this stays honest instead of guessing).
+    #[must_use]
+    pub fn default_family_hit(&self) -> Option<&'static str> {
+        ENGINE_DEFAULT_FAMILIES
+            .iter()
+            .copied()
+            .find(|name| self.find_family(name).is_some())
+    }
+
+    /// 每个字符宽是否恰好等于字号(`SX`)。
+    ///
+    /// 脚本自己算居中(`es_Select.yst:546`/`es_Text.yst:2687`「中央揃え」):
+    /// `X = 框宽/2 - 字符数 * SX/2`,**假定每个字符宽恰好 `SX`**。
+    /// 全角等宽字体(`MS Gothic`:任何字符都是 `SX`)满足该假定,居中精确;
+    /// 比例字体(`MS UI Gothic`:ッ=12.1、フ=14.2、ｔ=7.1 @SX=21)不满足,
+    /// 文本整体偏移 —— 脚本硬编码假设与字体度量冲突,不是渲染缺陷。
+    ///
+    /// 用 `--font` 换字体前查这个,就知道换上去会不会歪。
+    #[must_use]
+    pub fn fullwidth_is_monospace(&self, face: FaceId) -> bool {
+        // 覆盖假名/汉字/全角数字/全角字母/全角符号(脚本实际会画的类别)。
+        const SAMPLE: [char; 8] = ['あ', 'ア', '機', '４', 'Ｅ', '－', 'ｍ', 'ッ'];
+        let mut first: Option<f32> = None;
+        for ch in SAMPLE {
+            let Ok(Some(gid)) = self.glyph_index(face, ch) else {
+                return false;
+            };
+            let Ok(px) = self.advance_px(face, gid, 100, 100) else {
+                return false;
+            };
+            match first {
+                None => first = Some(px),
+                // 100 号下容许 0.5px 的取整噪声。
+                Some(v) if (v - px).abs() > 0.5 => return false,
+                _ => {}
+            }
+        }
+        first.is_some()
     }
 
     /// Deterministic family list: primary family name, sorted, deduplicated.

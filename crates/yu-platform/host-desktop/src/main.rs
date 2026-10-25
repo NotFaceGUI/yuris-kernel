@@ -88,6 +88,12 @@ fn run() -> Result<(), String> {
     let script = args.flag("script").map(PathBuf::from);
     let panic_selftest = parse_opt::<u64>(&mut args, "panic-selftest")?;
     let log_file = args.flag("log-file").map(PathBuf::from);
+    // 日志级别:显式参数优先于环境变量 `YU_LOG`。字体/文本诊断是
+    // `info` 级,默认 `warn` 看不到 —— 想查“这局用了什么字体”就加
+    // `--log-level info`。
+    let log_level = args.flag("log-level");
+    // 强制字体:诊断/换字体。给了就忽略脚本的 NAME/NO/BNO。
+    let force_font = args.flag("font").filter(|value| !value.trim().is_empty());
     // 性能证据(只写调用方给的路径;默认不产生文件):
     // `--frame-stats` 逐帧 CSV;`--profile-frames 1,4,340` 在指定宿主帧
     // 打印 VM 命令耗时 top-10。
@@ -111,7 +117,7 @@ fn run() -> Result<(), String> {
     args.finish().map_err(|error| error.to_string())?;
 
     // 日志/panic 防线必须早于 boot:引擎/GPU 初始化期的 panic 也要留现场。
-    let log_path = init_logging(log_file.as_deref())?;
+    let log_path = init_logging(log_file.as_deref(), log_level.as_deref())?;
     yu_host_desktop::panic_guard::install();
     host_line!(
         "yu-desktop: log file {} (level {})",
@@ -148,6 +154,7 @@ fn run() -> Result<(), String> {
         // 桌面宿主:启动时预枚举系统字体,避免第一次打开テキスト页签
         // 付 ~130ms 的 fontdb 枚举(实测)。
         warm_text: true,
+        force_font,
     };
     let engine = match Engine::new(project.clone(), options.clone()) {
         Ok(engine) => engine,
@@ -184,7 +191,10 @@ fn run() -> Result<(), String> {
 ///
 /// 只在调用方没有显式设置 `YU_LOG_JSONL` 时填默认值(不覆盖用户的
 /// 环境语义);`--log-file` 优先于环境变量。
-fn init_logging(cli: Option<&Path>) -> Result<PathBuf, String> {
+///
+/// 级别来源优先级:`--log-level` > 环境变量 `YU_LOG` > `warn`。
+/// `--log-level` 会写进 `YU_LOG`,因为门面只认这一个环境变量。
+fn init_logging(cli: Option<&Path>, cli_level: Option<&str>) -> Result<PathBuf, String> {
     let path = match cli {
         Some(path) => path.to_path_buf(),
         None => match std::env::var("YU_LOG_JSONL") {
@@ -205,8 +215,23 @@ fn init_logging(cli: Option<&Path>) -> Result<PathBuf, String> {
         Err(error) => host_error!("yu-desktop: 无法清理旧日志 {}: {error}", path.display()),
     }
     std::env::set_var("YU_LOG_JSONL", &path);
-    if std::env::var_os("YU_LOG").is_none() {
-        std::env::set_var("YU_LOG", "warn");
+    match cli_level {
+        Some(level) => {
+            if !matches!(
+                level.trim().to_ascii_lowercase().as_str(),
+                "error" | "warn" | "info" | "debug" | "trace"
+            ) {
+                return Err(format!(
+                    "--log-level 只接受 error|warn|info|debug|trace,收到 `{level}`"
+                ));
+            }
+            std::env::set_var("YU_LOG", level.trim());
+        }
+        None => {
+            if std::env::var_os("YU_LOG").is_none() {
+                std::env::set_var("YU_LOG", "warn");
+            }
+        }
     }
     let level = yu_log::facade::init(facade_console);
     if level.is_none() {
@@ -234,7 +259,14 @@ fn usage() -> String {
     "用法: yu-desktop <project-root> [--entry NAME] [--data PATH] [--backend wgpu|soft]\n\
      \x20      [--title TEXT] [--frames N] [--shot PNG] [--width N] [--height N]\n\
      \x20      [--fps N] [--fullscreen] [--pixel] [--debug-ui] [--no-sound] [--reconcile]\n\
-     \x20      [--script case.json] [--panic-selftest N] [--log-file PATH] [--save-root DIR]\n\
-     \x20      [--frame-stats CSV] [--profile-frames 1,4,340] [--pump-cap N]"
+     \x20      [--script case.json] [--panic-selftest N] [--log-file PATH]\n\
+     \x20      [--log-level error|warn|info|debug|trace] [--font FAMILY]\n\
+     \x20      [--save-root DIR] [--frame-stats CSV]\n\
+     \x20      [--profile-frames 1,4,340] [--pump-cap N]\n\
+     \n\
+     日志级别默认 warn(--log-level 优先于环境变量 YU_LOG)。查字体解析链:\n\
+     \x20      yu-desktop <root> --log-level info   然后看 target=yu-font 的 [font] 行\n\
+     强制字体(忽略脚本 FONT 语义,仅诊断用):\n\
+     \x20      yu-desktop <root> --font \"MS Gothic\""
         .to_string()
 }

@@ -212,6 +212,17 @@ impl WgpuRenderer {
         let _ = self.text.warm();
     }
 
+    /// 系统字体源摘要(预热后非空;见 `TextComposer::source_summary`)。
+    #[must_use]
+    pub fn font_summary(&self) -> Option<&str> {
+        self.text.source_summary()
+    }
+
+    /// 强制所有 `FONT` 请求使用指定 family(`None` = 恢复脚本语义)。
+    pub fn set_force_font(&mut self, family: Option<String>) {
+        self.text.set_force_font(family);
+    }
+
     pub fn adapter(&self) -> &AdapterSummary {
         &self.ctx.adapter_info
     }

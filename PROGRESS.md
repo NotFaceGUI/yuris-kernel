@@ -7141,3 +7141,163 @@ png: 3427152 bytes   ← 同上
 cargo test -p yu-rt --lib         70 passed
 cargo test -p yu-rt --test fixture 79 passed
 ```
+
+## 成果 ARCH-V2 提案 (2026-10-25) · 跨平台目标架构图(§2.5,待主人定稿)
+
+- `docs/architecture.md` 新增 §2.5(文档头部已加 v2 提案注记):
+  - 分层图 L0–L4:内核中立层 / 能力端口(AssetSource·AudioSink·Clock·SaveIo·
+    PlatformSvc)/ 新 crate `yu-engine`(唯一装配,现 `yu-cli/src/engine.rs`
+    上移,解 CLI↔桌面宿主依赖环)/ 宿主层 / 入口层;
+  - 桌面并入 `yu-cli --mode desktop`(运行期开关,`yu-desktop` bin 退役);
+    wasm = 同一代码基的**编译期**派生(新 wasm 壳,浏览器无 argv 不可能是
+    运行期开关——已与主人对过);
+  - cpal 声音下沉 `host-desktop`;`@_OS_SOUND` 注入与实际出声解耦(对拍恒 true);
+    wasm 暂 NullSink;
+  - 含 v1.3→v2 差异表、平台矩阵、端口契约示意、设计规则 R1–R6(候选不变式)、
+    迁移步骤 H1–H6(每步带退出条件)、开放问题 5 条(命名/双模式/存档选型/
+    wgpu-web/feature 集)。
+- 状态:**提案,未动任何代码**;主人更新定稿后按 H1–H6 落地。
+
+#### 验证
+
+```text
+纯文档改动,无代码/测试变更(mermaid 语法人工校对;渲染以主人预览为准)。
+```
+
+#### 追记(同日 · Android 等编译目标)
+
+- 主人追加 Android 等移动编译目标;§2.5 同步扩:
+  - L4 增 `yu-host-android`(aarch64-linux-android 等 NDK 目标,android_main
+    入口,与 wasm 同为编译期派生);L3 增 `host-android` 宿主
+    (winit/android-activity + wgpu Vulkan/GLES + cpal/oboe +
+    AAssetManager→MemSource + 内部存储存档 + 挂起/恢复生命周期);
+  - 平台矩阵、v1.3→v2 差异表、迁移步 H7(依赖 H4,可与 H5 并行;退出条件
+    = 真机跑通同工程且帧 hash 与 native soft 一致、挂起/恢复不丢状态)、
+    开放问题 6–10(壳组织/分发形态/v7a/触摸映射/iOS)一并补齐;
+  - R4 改为「单一桌面入口」:wasm/Android 均为编译目标,无运行期 mode。
+- 架构结论不变:新平台 = L3 宿主 + L1 端口实现,内核与 `yu-engine` 零改动;
+  Android 唯一引擎侧新需求 = 挂起/恢复生命周期(复用 restart/DIV-HOST-001
+  机制)。
+
+## 成果 FONT-DIAG (2026-10-25) · 字体解析可见化 + `--font` 强制字体 + `--log-level`
+
+### 动机
+
+此前完全没有"这局游戏用了哪个字体"的日志:字体诊断只进每帧 `text_diags`
+(`text.font_init` / `text.font_name_fallback`),默认 `warn` 级看不到,
+换机器/换字体后无从判断命中项。同时缺一个能换字体做对照的手段。
+
+### 改动
+
+| 位置 | 内容 |
+|---|---|
+| `yu-font::FontSource` | `FaceInfo`/`FaceRecord` 增 `source_path`(fontdb `Source::File`,`from_bytes` 为 `None`);新增 `describe_face`(family/postscript/weight/style/ttc_index/origin/文件路径一行)、`default_family_hit`(引擎回退表实际命中项)、`halfwidth_is_monospace` |
+| `yu-backend-soft::TextComposer` | `ensure()` 成功时产出字体源摘要并 `info!` 输出(target `yu-font`);`resolve_face` 每个不同 FONT 请求**首次**解析时记一条(请求 → face → 文件);新增 `set_force_font` / `force_font`;`log` 依赖 |
+| `TextComposer::set_force_font` | 强制所有 FONT 请求走指定 family,清 face 缓存;family 不可解析 → 硬失败(不回落默认表,避免"以为换上了") |
+| `Engine` / `EngineOptions` | 新增 `force_font: Option<String>`、`warm_text()`、`font_summary()`、`set_force_font()` |
+| 宿主 | `yu-desktop --log-level <lvl>` / `--font FAMILY`;`yu-cli` 全局 `--log-level`(`--log-level=X` 亦支持)+ `run`/`serve` 的 `--font` |
+
+日志级别优先级:`--log-level` > `YU_LOG` > `warn`。
+
+### 关键发现:`--font` 换比例字体会破坏居中(非渲染缺陷)
+
+脚本自己算居中(`es_Text.yst`「中央揃え」):
+`X = 框宽/2 - 字符数 * SX/2` —— **假定每个字符宽恰好 `SX/2`**。
+
+本机 `msgothic.ttc` 三个 face 的半角度量:
+
+| family | 半角 advance(SX=20) | 等宽 |
+|---|---|---|
+| MS Gothic | 全部 10.0(=SX/2) | 是 |
+| MS UI Gothic | E=11.3 m=14.7 t=7.0 o=10.2 | **否(比例)** |
+| MS PGothic | 同 MS UI Gothic | **否(比例)** |
+
+故:默认 `MS Gothic` 下居中**精确**;`--font "MS UI Gothic"` 因比例度量
+与脚本等宽假设冲突,文本整体偏移(实测 800×600 下 `dX≈-18px`,
+1200×900 窗口缩放后 ≈-27px)。`halfwidth_is_monospace` 会在强制到比例
+字体时发 `warn`,把这一点显式说出来。
+
+### 验证(全部实机,release)
+
+```text
+# 默认字体:脚本公式自洽 ⇒ 居中 0px 误差
+[font] system fonts: 248 faces enumerated in 141ms; engine default family "ＭＳ ゴシック"
+       -> family="MS Gothic / ＭＳ ゴシック" postscript="MS-Gothic" weight=400 ttc_index=0
+          file="C:\Windows\Fonts\msgothic.ttc"
+
+# 强制字体生效(请求侧保留脚本原意)
+[font] forced by --font: all FONT requests -> family "MS UI Gothic"
+[font] Default(script gave no font) -> exact family="MS UI Gothic / MS UI Gothic" ttc_index=1
+
+# 比例字体警告
+[log:warn] [font] forced family "MS UI Gothic" has PROPORTIONAL half-width metrics;
+           script-computed centering (X = box/2 - len*SX/2) assumes monospace SX/2 ...
+
+# 查不到的 family = 硬失败
+[log:warn] [font] forced family "No Such Font" not installed; every FONT request will fail
+[log:warn] [font] Default(script gave no font) -> unresolvable
+```
+
+居中自洽性验算(layer 局部 X 反推框宽,与像素实测 585~586 一致):
+
+| 字符串 | 字符数 | X | 反推框宽 | 实测 adv | 期望 adv | 文本中心 | 框中心 |
+|---|---|---|---|---|---|---|---|
+| β４機能紹介 | 6 | 230 | 586 | 126 | 126 | 293.0 | 293.0 |
+| Ｅ－ｍｏｔｅ機能紹介 | 10 | 188 | 586 | 210 | 210 | 293.0 | 293.0 |
+| 各種フラグセット | 8 | 209 | 586 | 168 | 168 | 293.0 | 293.0 |
+| タイトルへ戻る | 7 | 220 | 587 | 147 | 147 | 293.5 | 293.5 |
+
+```text
+cargo test -p yu-font -p yu-backend-soft   → 全绿(22/15/18/1/5/7/1/12/1/1)
+cargo build --release -p yu-host-desktop -p yu-cli  → OK
+```
+
+### 用法
+
+```text
+# 看字体解析链(默认 warn 看不到,必须 info)
+yu-cli run <root> --frames 5 --log-level info
+yu-desktop <root> --backend wgpu --log-level info
+
+# 强制字体(诊断用;忽略脚本 NAME/NO/BNO)
+yu-desktop <root> --backend wgpu --font "MS Gothic"
+yu-cli serve <root> --font "MS Gothic"
+```
+
+`--font` 是**诊断开关**,不是正常游戏路径;等宽半角字体(MS Gothic)才能
+保持脚本居中,比例字体请预期偏移(warn 会说明)。
+
+### 追记(同日)· 等宽字体实测:换等宽字体后居中恢复
+
+`--font` 换成**全角等宽**字体验证(判据见 `FontSource::fullwidth_is_monospace`:
+脚本假定「每字符宽 = SX」,故要测全角样本而非半角)。
+
+800×600、title 菜单 5 行,墨迹中心 vs 按钮框中心(实测像素):
+
+| 字体 | β4機能紹介 | Ｅ－ｍｏｔｅ | 各種フラグ | タイトル | 終了する | 最大偏移 |
+|---|---|---|---|---|---|---|
+| MS Gothic(默认) | +1.5 | +2.0 | 0.0 | +1.0 | 0.0 | **2.0** |
+| Microsoft YaHei | -2.5 | +3.0 | -1.0 | +1.0 | -0.5 | **3.0** |
+| SimSun | +3.0 | +2.5 | 0.0 | +1.5 | -1.5 | **3.0** |
+| MS UI Gothic(比例) | -2.0 | **-18.5** | **-18.0** | **-15.0** | -3.5 | **18.5** |
+
+⇒ 全角等宽字体(MS Gothic / YaHei / SimSun)偏移都在 ±3px 的取整噪声内;
+比例字体(MS UI Gothic)偏移达 18.5px。**换等宽字体后对齐正常。**
+
+字体粗体面实查(`family_has_bold`,weight>=600):
+
+| family | 真实粗体面 | 全角等宽 |
+|---|---|---|
+| MS Gothic | **无** | 是 |
+| SimSun | **无** | 是 |
+| Microsoft YaHei | **有** | 是 |
+| Yu Gothic | **有** | 是 |
+| MS UI Gothic | 无 | 否(比例) |
+
+⇒ SimSun 不显示粗体不是缺陷:该字体本来只有 weight=400,
+与 MS Gothic 同况(`text.font.bold_missing` 早已显式报告)。
+**本机同时满足「有真粗体 + 全角等宽」的推荐项:Microsoft YaHei / Yu Gothic。**
+
+判据修正:`halfwidth_is_monospace` → `fullwidth_is_monospace`,
+样本由半角 `A/i/m/W/0/.` 改为全角 `あ/ア/機/４/Ｅ/－/ｍ/ッ`
+(脚本公式针对的是全角等宽假设;半角判据会误判)。

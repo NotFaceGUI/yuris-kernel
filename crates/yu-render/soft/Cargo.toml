@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }
+log = "0.4"
 yu-font = { path = "../../yu-font" }
 yu-gfx = { path = "../../yu-gfx" }
 yu-log = { path = "../../yu-log" }

@@ -92,6 +92,10 @@ pub struct EngineOptions {
     /// 才懒加载)。`fontdb` 枚举在本机实测 ~130ms,预热可消除“第一次打开
     /// テキスト页签”的停顿;headless 用例不需要。
     pub warm_text: bool,
+    /// 强制字体 family(诊断/换字体):`Some` 时所有 `FONT` 请求都解析到它,
+    /// 忽略脚本给的 `NAME`/`NO`/`BNO`。查不到 family 就显式失败,不回落
+    /// 引擎默认表 —— 否则会“以为换上了其实没换”。
+    pub force_font: Option<String>,
 }
 
 impl Default for EngineOptions {
@@ -109,6 +113,7 @@ impl Default for EngineOptions {
             reconcile: true,
             save_root: None,
             warm_text: false,
+            force_font: None,
         }
     }
 }
@@ -237,7 +242,9 @@ impl Renderer {
     }
 
     /// 预枚举系统字体(见 [`EngineOptions::warm_text`])。
-    fn warm_text(&mut self) {
+    ///
+    /// 可重复调用(已加载即 no-op),因此 `run` 里按需补预热是安全的。
+    pub fn warm_text(&mut self) {
         match self {
             Renderer::Soft(renderer) => renderer.warm_text(),
             Renderer::Wgpu {
@@ -248,6 +255,22 @@ impl Renderer {
                     soft.warm_text();
                 }
             }
+        }
+    }
+
+    /// 系统字体源摘要(face 数 + 引擎默认 family 落到的文件)。
+    #[must_use]
+    pub fn font_summary(&self) -> Option<&str> {
+        match self {
+            Renderer::Soft(renderer) => renderer.font_summary(),
+            Renderer::Wgpu { renderer, .. } => renderer.font_summary(),
+        }
+    }
+
+    fn set_force_font(&mut self, family: Option<String>) {
+        match self {
+            Renderer::Soft(renderer) => renderer.set_force_font(family),
+            Renderer::Wgpu { renderer, .. } => renderer.set_force_font(family),
         }
     }
 
@@ -321,8 +344,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(project: Project, opts: EngineOptions) -> CliResult<Self> {
-        let boot_started = Instant::now();
+    pub fn new(project: Project, opts: EngineOptions) -> CliResult<Self> {        let boot_started = Instant::now();
         let (vm, state, sound, save_host, viewport, probe_order) = boot(&project, &opts)?;
         #[cfg(feature = "device")]
         let sound_sink = if sound.is_some() {
@@ -374,6 +396,16 @@ impl Engine {
         } else {
             0.0
         };
+        // 强制字体必须在任何文本绘制之前生效(此时还没人解析过 FONT,
+        // 所以不需要清缓存;`set_force_font` 自己会清)。
+        if let Some(family) = &opts.force_font {
+            renderer.set_force_font(Some(family.clone()));
+            log::info!(
+                target: "yu-font",
+                "[font] forced by --font: all FONT requests -> family \"{family}\" \
+                 (script NAME/NO/BNO ignored; unresolvable family = hard failure)"
+            );
+        }
         log::info!(
             target: "yu-cli::engine",
             "startup: boot={boot_ms:.1}ms renderer={:.1}ms text_warm={text_warm_ms:.1}ms total={:.1}ms",
@@ -418,6 +450,25 @@ impl Engine {
 
     pub fn viewport(&self) -> Viewport {
         self.viewport
+    }
+
+    /// 预枚举系统字体。已加载即 no-op(`run` 里按需补预热用)。
+    pub fn warm_text(&mut self) {
+        self.renderer.warm_text();
+    }
+
+    /// 系统字体源摘要(face 数 + 引擎默认 family 落到的文件)。
+    ///
+    /// 未预热且还没画过文本时为 `None`(此时调用 [`Engine::warm_text`] 或
+    /// 直接看首帧 `text_diags` 的 `text.font_init`)。
+    #[must_use]
+    pub fn font_summary(&self) -> Option<&str> {
+        self.renderer.font_summary()
+    }
+
+    /// 运行期切换强制字体(`None` = 恢复脚本语义)。下一次文本绘制生效。
+    pub fn set_force_font(&mut self, family: Option<String>) {
+        self.renderer.set_force_font(family);
     }
 
     pub fn entry(&self) -> &str {

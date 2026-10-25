@@ -236,6 +236,17 @@ impl SoftRenderer {
         let _ = self.text.warm();
     }
 
+    /// 系统字体源摘要(预热后非空;见 `TextComposer::source_summary`)。
+    #[must_use]
+    pub fn font_summary(&self) -> Option<&str> {
+        self.text.source_summary()
+    }
+
+    /// 强制所有 `FONT` 请求使用指定 family(`None` = 恢复脚本语义)。
+    pub fn set_force_font(&mut self, family: Option<String>) {
+        self.text.set_force_font(family);
+    }
+
     /// 丢弃跨帧状态(重启用;DIV-HOST-001)。
     ///
     /// 引擎重启 = 新设备:后缓冲、快照、图像加工缓存都属于上一轮
