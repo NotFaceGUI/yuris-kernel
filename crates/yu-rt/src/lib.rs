@@ -43,6 +43,7 @@
 
 pub mod case_tables;
 pub mod code;
+pub mod cp932_text;
 pub mod diag;
 pub mod dialog;
 pub mod event;

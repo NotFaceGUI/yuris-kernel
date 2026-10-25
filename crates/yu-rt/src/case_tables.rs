@@ -93,8 +93,11 @@ impl CaseTables {
 }
 
 /// `0x5b40c0` 的字符长度(1 或 2;CP932 无 3/4 字节项)。
+///
+/// 单一真源 = [`crate::cp932_text::is_lead`](与 `yu-format` 码表、`VARACT`
+/// 的字符步进同一口径)。
 fn char_len(b: u8) -> usize {
-    if (0x81..=0x9f).contains(&b) || (0xe0..=0xfc).contains(&b) {
+    if crate::cp932_text::is_lead(b) {
         2
     } else {
         1
