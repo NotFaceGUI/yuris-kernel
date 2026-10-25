@@ -48,7 +48,7 @@
 | `VARACT` | 310 | `variable/varact.html`(**无 INIT/G_* 页**) | ✅ 310 次 + `INIT+G_*`(s12) | §3.26(`0x456050` 族 + `0x455b60` 恢复体) | ✅ 实现(除 HANTOZEN/ZENTOHAN) |
 | `G_INT`/`G_FLT`/`G_STR` | 0(声明)/ 2(`VARACT[INIT]`) | `variable/g_int.html`(声明)/ ⛔(`VARACT` 变体无页) | ✅ 宏重定义 + `VARACT[INIT G_*]` | §3.26 `0x455b60` | ✅ `VARACT` 侧已实现(DIV-RT-024) |
 | `F_INT`/`F_FLT`/`F_STR` | 337/72/64 | ⛔ 手册 `variable/` 无页 | ✅ 高频(全在 `global_f.yst` 声明段) | REA 默认槽 `0x459e90`:报 `スクリプト実行エラー`(yse 0xdbbd2)+ 返回 -1;600 帧运行 0 次 | ✅ 脚本错误槽(DIV-RT-043) |
-| `RETURNCODE` | 396 | ⛔ 手册无页(ysc/ycd 双表无参;`kind`=行计数) | ✅ 396 次;137 文件计数不变量 | REA `0x44c390`(自动 `C/R/P` + 恒 `E` + 让出) | ✅ 实现(2026-10-21 M-2 补行尾标志) |
+| `RETURNCODE` | 396 | ⛔ 手册无页(ysc/ycd 双表无参;`kind`=行计数) | ✅ 396 次;137 文件计数不变量 | REA `0x44c390`(自动 `C/R/P` + 恒 `E` + 让出);恢复判据 `FUN_004046fc` 分模式 | ✅ 实现(2026-10-21 M-2 补行尾标志;2026-10-24 R3-fix 补恢复模式分支) |
 | `WORD` | 464 | ⛔ 手册无页(`basic.html` ●テキスト表示覆盖) | ✅ 464 次(载荷=CP932 原始字节) | REA `0x458d44`(每字符写 `'1'/'2'` 到 `_TEXT_FLAG`) | ✅ 实现(2026-10-21 M-2 补标志) |
 
 ## 3. 数学 / 文本 / 查询
