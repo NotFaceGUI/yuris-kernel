@@ -268,6 +268,11 @@ impl LabelTable {
     pub fn is_empty(&self) -> bool {
         self.labels.is_empty()
     }
+
+    /// 逐条遍历(诊断/取证探针用;字节名 + 位置)。
+    pub fn iter(&self) -> impl Iterator<Item = &Label> {
+        self.labels.iter()
+    }
 }
 
 // ---------------------------------------------------------------- YSVR
