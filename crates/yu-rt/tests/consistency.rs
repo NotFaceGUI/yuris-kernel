@@ -25,7 +25,11 @@ impl Skips {
         }
         self.0 += 1;
         println!("SKIP[count={}] {name}: {reason}", self.0);
-        unreachable!("skip 必须让调用方返回")
+        // Rust 测试没有原生 skip,而 `skip` 必须发散。这里显式失败并给出
+        // 可执行的修复指引 —— 原来的 `unreachable!` 会打印 "internal error",
+        // 把「环境缺样本」误报成内核内部错误(AGENTS §2:显式报错,
+        // 但错误信息必须指向真实原因)。
+        panic!("SKIP {name}: {reason}(设 YURIS_SAMPLE_ERIS_YSBIN=<project>/data/ysbin)")
     }
 }
 

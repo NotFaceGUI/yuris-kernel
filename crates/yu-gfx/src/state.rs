@@ -178,6 +178,10 @@ pub struct GfxState {
     image_log_dropped: u64,
     /// 本帧诊断(按 `(code, command, detail)` 有序去重;`FrameStart` 清空)。
     diags: BTreeMap<(String, String, String), error::FrameDiag>,
+    /// 正在消费的域事件脚本位置(todo-silent-handling S1):
+    /// `DomainCall` 携带 `(script, pc)`,诊断聚合时不许再把它丢掉。
+    /// 仅在事件分派窗口内非空;INFO 查询等带外路径保持 None(不猜位置)。
+    cur_call_at: Option<error::DiagAt>,
     /// 窗口状态(按 `NO`;0 = 主窗口)。
     windows: BTreeMap<u8, WindowState>,
     /// 资产像素尺寸缓存(键 = `CG[FILE]` 原始字节)。
@@ -286,6 +290,7 @@ impl GfxState {
             copy_log_dropped: 0,
             image_log_dropped: 0,
             diags: BTreeMap::new(),
+            cur_call_at: None,
             windows,
             asset_sizes: BTreeMap::new(),
             font_families: Vec::new(),
@@ -476,14 +481,24 @@ impl GfxState {
                 domain,
                 name,
                 args,
-                ..
+                script,
+                pc,
             } => {
                 self.frame = *frame;
+                // S1:域事件自带脚本定位,分派窗口内产生的诊断全部带上。
+                self.cur_call_at = script.zip(*pc).map(|(s, p)| error::DiagAt {
+                    script: format!("s{s}"),
+                    pc: p,
+                    cmd: Some(name.clone()),
+                });
                 match domain {
                     Domain::Graphics => self.dispatch(name, args),
                     Domain::Window => self.dispatch_window(name, args),
+                    // Sound/Save/System 域各有自己的宿主消费(事件只消费一次),
+                    // gfx 不看它们 —— 有意的分域,不是丢事件(Q1 自查 b 类)。
                     _ => {}
                 }
+                self.cur_call_at = None;
             }
             _ => {}
         }
@@ -1693,6 +1708,20 @@ impl GfxState {
                 return;
             }
         }
+        // `CGACT[TRANSITION=1 SET=f ID=$LB1 ID2=$LB2 ID3=$LB3]`:两源按 `SET`
+        // (0..256 混合系数)插值写成**第三层**。语料唯一用法
+        // `es_Sprite.yst:7978`(立绘/背景动画的逐帧重采样输入)。
+        // 与 SWAP/COPY 的「ID2=目标」不同,这里 ID2 是第二输入、ID3 是目标。
+        if flag(&params, "TRANSITION") {
+            let blend = set.as_ref().and_then(EngineValue::as_int).unwrap_or(0);
+            self.cgact_transition(
+                &source,
+                paths[1].clone(),
+                paths[2].clone(),
+                blend,
+            );
+            return;
+        }
         if flag(&params, "SWAP") {
             self.cgact_swap(&source, &dest, false);
             return;
@@ -1889,6 +1918,119 @@ impl GfxState {
                 ),
             );
         }
+    }
+
+    /// `CGACT[TRANSITION=1 SET=f ID=from ID2=to ID3=dst]`:两源按 `SET`
+    /// (0..256)线性插值写入第三层。
+    ///
+    /// 证据:
+    /// - 手册 `cg/cgact.html` 只写「画像Ａから画像Ｂへの遷移途中画像を生成する」,
+    ///   `SET` 是在场参数但未说量纲 ⇒ 手册页不完整;
+    /// - 语料唯一用法 `es_Sprite.yst:7978`:
+    ///   `CGACT[TRANSITION=1 SET=@L.F2(@LNO) ID=$LB1 ID2=$LB2 ID3=$LB3]`,
+    ///   其中 `@L.F2` 逐帧由动画引擎递减/递增(见 `es.EF.CC.COM.F2`),
+    ///   `$LB1` = 上一帧的采样结果、`$LB2` = 目标图、`$LB3` = 本帧采样源。
+    ///   产物随后被 `es.CGACT_SIZE` 缩放到可见层 ⇒ 语义就是**帧间插值**;
+    /// - `SET` 取值域与 `A` 同量纲(0..256):脚本 `_range(@A,0,256)` 同族。
+    ///
+    /// 因此按 `out = from*(256-f)/256 + to*f/256` 逐通道插值。这条一旦缺失,
+    /// 立绘/背景的**动画**分支拿到的就是全透明缓冲(静态图不走这里),正是
+    /// 「有动画就不显示、静止 CG 正常」的直接原因。
+    fn cgact_transition(
+        &mut self,
+        from: &LayerId,
+        to: Option<LayerId>,
+        dst: Option<LayerId>,
+        blend: i64,
+    ) {
+        let Some(to) = to else {
+            self.push_diag(
+                "CGACT",
+                error::recoverable(
+                    error::code::ARG_MISSING,
+                    "TRANSITION 缺 ID2(第二源);手册要求两个源图",
+                ),
+            );
+            return;
+        };
+        let Some(dst) = dst else {
+            self.push_diag(
+                "CGACT",
+                error::recoverable(
+                    error::code::ARG_MISSING,
+                    "TRANSITION 缺 ID3(输出层);手册要求生成第三张图",
+                ),
+            );
+            return;
+        };
+        for id in [from, &to] {
+            if !self.nodes.contains_key(id) {
+                self.push_diag(
+                    "CGACT",
+                    error::recoverable(
+                        error::code::LAYER_MISSING,
+                        format!("TRANSITION 源 `{}` 不存在", id.display()),
+                    ),
+                );
+                return;
+            }
+        }
+        if !self.nodes.contains_key(&dst) {
+            self.create_image(&dst, TextureRef::None, None);
+        }
+        if self.nodes.get(&dst).is_some_and(|n| n.layer.is_group()) {
+            self.push_diag(
+                "CGACT",
+                error::unimplemented(
+                    error::code::IMAGEOP_UNSUPPORTED,
+                    "TRANSITION 输出为图层组:写入组合成纹理的语义未取证",
+                ),
+            );
+            return;
+        }
+        // 两个源都必须可解析成像素(资产/快照/1×1 黑);否则显式跳过,
+        // 不把输出层标成可执行(否则后续 SIZE 会拿全透明图当有效结果)。
+        for id in [from, &to] {
+            let ok = self.nodes.get(id).is_some_and(|n| {
+                matches!(
+                    n.layer.texture,
+                    TextureRef::Asset(_) | TextureRef::Snapshot(_) | TextureRef::SolidBlack1x1
+                ) && n.layer.texture_status == LayerStatus::Executable
+            });
+            if !ok {
+                let why = "gfx.imageop.copy_source.unsupported";
+                if let Some(node) = self.nodes.get_mut(id) {
+                    node.layer.set_texture_status(LayerStatus::Unimplemented(why));
+                }
+                self.push_diag(
+                    "CGACT",
+                    error::unimplemented(
+                        error::code::IMAGEOP_UNSUPPORTED,
+                        format!("TRANSITION 源 `{}` 无法解析像素: {why}", id.display()),
+                    ),
+                );
+                return;
+            }
+        }
+        let seq = self.next_texture_seq();
+        let blend = EngineValue::Int(blend.clamp(0, 256));
+        self.push_image_log(ImageOp {
+            seq,
+            source: from.clone(),
+            source2: Some(to.clone()),
+            target: Some(dst.clone()),
+            action: ImageAction::Other("transition"),
+            set: Some(blend),
+            set2: None,
+            set_str: None,
+            sx: None,
+            sy: None,
+            x: None,
+            y: None,
+            x2: None,
+            y2: None,
+            status: OpStatus::Executable,
+        });
     }
 
     fn cgact_swap(&mut self, source: &LayerId, dest: &LayerId, image_only: bool) {
@@ -2172,7 +2314,10 @@ impl GfxState {
                     Err(reason) => OpStatus::Unimplemented(reason),
                 }
             }
-        } else if matches!(action, ImageAction::Reverse | ImageAction::Horizontal) {
+        } else if matches!(
+            action,
+            ImageAction::Reverse | ImageAction::Horizontal | ImageAction::Vertical
+        ) {
             // EVID-T-13:REVERSE = RGB 取反,HORIZONTAL = 水平镜像;两者都
             // 只对可解析的基图(资产/1×1 黑)放行。ID2 与区域变体未测,
             // 保持显式跳过。
@@ -2212,6 +2357,69 @@ impl GfxState {
                 },
                 _ => OpStatus::Unimplemented("gfx.imageop.size.missing"),
             }
+        } else if action.is_layer_composite() {
+            // `MERGE/MERGE2/XOR/AND`:`ID` 上层合成到 `ID2` 下层,结果留 `ID2`。
+            // 手册例 23:`BG` 上、`BG2` 下,结果写 `BG2`(原文明示「順番に注意」)。
+            // 两个源都必须能解析出像素。
+            let upper = self.nodes.get(source);
+            match (upper, target.as_ref().and_then(|t| self.nodes.get(t))) {
+                (Some(upper), Some(lower))
+                    if lower.layer.texture_status == LayerStatus::Executable
+                        && upper.layer.texture_status == LayerStatus::Executable
+                        && matches!(
+                            lower.layer.texture,
+                            TextureRef::Asset(_)
+                                | TextureRef::Snapshot(_)
+                                | TextureRef::SolidBlack1x1
+                        )
+                        && matches!(
+                            upper.layer.texture,
+                            TextureRef::Asset(_)
+                                | TextureRef::Snapshot(_)
+                                | TextureRef::SolidBlack1x1
+                        ) =>
+                {
+                    OpStatus::Executable
+                }
+                _ => OpStatus::Unimplemented("gfx.imageop.copy_source.unsupported"),
+            }
+        } else if action.is_in_place_filter() {
+            // `RESIZE` / `TRIM` / `MEIDO`:都是**单层原地**动作(手册例 7/21/22
+            // 均无 ID2)。像素语义有手册页;几何由官方执行体给出:
+            // - `RESIZE`:官方 `FUN_0043c971`(`0x43c971`,CGACT RESIZE 执行器,
+            //   调用点 `0x42e713`)——
+            //   `0x43c9b7 LEA EDX,[EDX+ESI-1]` / `0x43c9ce SUB EDX,EDI`(EDI=-X)
+            //   / `0x43c9d0 LEA EDI,[EDX+1]` ⇒ **newW = srcW + X + X2**,
+            //   **newH = srcH + Y + Y2**(仓内旧文档写的 `w+X+X2-1` 是中间量,
+            //   -1 与 +1 相消,已勘误)。尺寸变了置脏位 `[dst+0x86]=1`。
+            // - `TRIM`:手册例 22 给位掩码 8=上/4=下/2=左/1=右。
+            // - `MEIDO`:手册例 7 给 `SET=0xffff00` = 「赤200% 緑200% 青0%」
+            //   ⇒ 每通道 ×(该字节/128)(0x80=100%,0xFF≈200%)。
+            if explicit_target && target.as_ref() != Some(source) {
+                // 手册例 5..17 全部是原地动作,没有 ID2 形态。
+                OpStatus::Unimplemented("gfx.imageop.id2.unsupported")
+            } else if action.is_trim() && set.is_none() {
+                OpStatus::Unimplemented("gfx.imageop.set.missing")
+            } else if (x.is_some() || y.is_some() || x2.is_some() || y2.is_some())
+                && !action.is_resize()
+            {
+                // `TRIM`/`MEIDO` 不接受区域(手册例 7/22 的用法都没有 X/X2)。
+                OpStatus::Unimplemented("gfx.imageop.region.unsupported")
+            } else {
+                match self.nodes.get(source) {
+                    Some(n)
+                        if matches!(
+                            n.layer.texture,
+                            TextureRef::Asset(_)
+                                | TextureRef::Snapshot(_)
+                                | TextureRef::SolidBlack1x1
+                        ) && n.layer.texture_status == LayerStatus::Executable =>
+                    {
+                        OpStatus::Executable
+                    }
+                    _ => OpStatus::Unimplemented("gfx.imageop.copy_source.unsupported"),
+                }
+            }
         } else {
             OpStatus::Unimplemented("gfx.imageop.unsupported")
         };
@@ -2221,6 +2429,7 @@ impl GfxState {
         self.push_image_log(ImageOp {
             seq,
             source: source.clone(),
+            source2: None,
             target: target.clone(),
             action,
             set,
@@ -2887,12 +3096,20 @@ impl GfxState {
     fn push_diag(&mut self, command: &str, d: Diag) {
         let key = (d.code.to_string(), command.to_string(), d.detail.clone());
         match self.diags.get_mut(&key) {
-            Some(existing) => existing.count = existing.count.saturating_add(1),
+            Some(existing) => {
+                existing.count = existing.count.saturating_add(1);
+                // S1:聚合丢计数可以,丢位置不行。
+                if let Some(at) = self.cur_call_at.clone() {
+                    existing.push_at(&at);
+                }
+            }
             None => {
-                self.diags.insert(
-                    key,
-                    error::FrameDiag::new(d.code.to_string(), d.severity, command, d.detail),
-                );
+                let mut frame_diag =
+                    error::FrameDiag::new(d.code.to_string(), d.severity, command, d.detail);
+                if let Some(at) = self.cur_call_at.clone() {
+                    frame_diag.push_at(&at);
+                }
+                self.diags.insert(key, frame_diag);
             }
         }
     }
@@ -3220,7 +3437,7 @@ static IMAGE_ACTIONS: &[(&str, ImageAction)] = &[
     ("SEPIA", ImageAction::Other("sepia")),
     ("AKARUSA", ImageAction::Other("akarusa")),
     ("MONO", ImageAction::Other("mono")),
-    ("VERTICAL", ImageAction::Other("vertical")),
+    ("VERTICAL", ImageAction::Vertical),
     ("HORIZONTAL", ImageAction::Horizontal),
     ("MOSAIC", ImageAction::Other("mosaic")),
     ("BLUR", ImageAction::Other("blur")),
@@ -3313,25 +3530,39 @@ fn apply_layer_params(
                     "参数 `A` 期望整数",
                 )),
             },
+            // `X/Y/Z/SX/SY` 按**整数**读:与引擎一致,浮点显式拒绝并留痕。
+            //
+            // 引擎证据(0.495 `FUN_0042f809` 的 X/Y 读取块,`0x42b064` / `0x42b09d`
+            // 起):参数一律 `MOV reg, dword ptr [idx*8+0x683740]` 取低 32 位,
+            // 并用 `OR reg,[idx*8+0x683744]` 合并高位做零判定 —— **64 位整数
+            // 语义,没有 ftol/取整**。参数序言 `FUN_00429fd1`(`0x429fd1`)把每个
+            // 实参求值成 64 位值 + 一字节类型标记,但 X/Y 的消费点不看类型标记。
+            //
+            // 语料确实存在把 FLT 喂给 `CG[X]` 的写法
+            // (`es_Sprite.yst:8574 FLT[@LEFT_X]` → `:8703`
+            // `CG[ID=$dst X=@LEFT_X Y=@LEFT_Y]`),官方此时读到的是浮点值的
+            // 位模式。**该行为无意义、不照抄**;这里按「类型不符 ⇒ 参数丢弃 +
+            // 诊断」处理,不发明四舍五入。待取证:官方该路径的实际可见结果
+            // (需要官方引擎 trace)。
             "X" => match value.as_int() {
                 Some(n) => layer.transform.x = n,
                 None => diags.push(error::recoverable(
                     error::code::ARG_TYPE,
-                    "参数 `X` 期望整数",
+                    "参数 `X` 期望整数(引擎按 64 位整数读参数槽,浮点无对齐依据)",
                 )),
             },
             "Y" => match value.as_int() {
                 Some(n) => layer.transform.y = n,
                 None => diags.push(error::recoverable(
                     error::code::ARG_TYPE,
-                    "参数 `Y` 期望整数",
+                    "参数 `Y` 期望整数(引擎按 64 位整数读参数槽,浮点无对齐依据)",
                 )),
             },
             "Z" => match value.as_int() {
                 Some(n) => layer.z = n,
                 None => diags.push(error::recoverable(
                     error::code::ARG_TYPE,
-                    "参数 `Z` 期望整数",
+                    "参数 `Z` 期望整数(引擎按 64 位整数读参数槽,浮点无对齐依据)",
                 )),
             },
             "SX" => sx = value.as_int(),

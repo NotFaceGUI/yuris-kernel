@@ -200,7 +200,10 @@ fn fontinfo_answers_current_style_fields() {
     assert_eq!(info("DRAWMODE"), Value::Int(1));
     assert_eq!(info("NAME"), Value::Str(b"TestFont".to_vec()));
 
-    let err = q_err(
+    // `NAME NO=n` 走字体清单(1 基);清单未注入/越界 = 空串。引擎按
+    // EnumFontFamiliesExA 枚举失败即空,不报错 —— 见 `query_fontinfo` 的
+    // `NAME` 分支注释。
+    let listed = q(
         &gfx,
         "FONTINFO",
         vec![
@@ -208,7 +211,7 @@ fn fontinfo_answers_current_style_fields() {
             arg(&table, "FONTINFO", "NO", i(3)),
         ],
     );
-    assert_eq!(err.code, "gfx.info.unsupported");
+    assert_eq!(listed, Value::Str(Vec::new()));
 }
 
 #[test]
@@ -223,8 +226,18 @@ fn fontinfo_unset_fields_are_not_fabricated() {
             "{flag}"
         );
     }
-    // NAME 未设置(需要系统字体列表)/NUM/PITCH/LANG 仍不猜。
-    for flag in ["NAME", "NUM", "PITCH", "LANG"] {
+    // `NUM`/`LANG` 在清单未注入时显式应答 0(`query_fontinfo` 注释:脚本
+    // `es_Font.yst:166` 以 LANG 非 0 过滤,清单空 ⇒ 走「无字体可选」路径,
+    // 与引擎在无字体环境的行为一致)。`NAME`(需系统字体列表)/`PITCH`
+    // 仍未取证,必须报错。
+    for flag in ["NUM", "LANG"] {
+        assert_eq!(
+            q(&gfx, "FONTINFO", vec![arg(&table, "FONTINFO", flag, i(1))]),
+            Value::Int(0),
+            "{flag}"
+        );
+    }
+    for flag in ["NAME", "PITCH"] {
         let err = q_err(&gfx, "FONTINFO", vec![arg(&table, "FONTINFO", flag, i(1))]);
         assert_eq!(err.code, "gfx.info.unsupported", "{flag}");
     }
@@ -272,7 +285,8 @@ fn windowinfo_answers_main_geometry() {
     assert_eq!(info(&gfx, "SY", 0), Value::Int(480));
     assert_eq!(info(&gfx, "EXIST", 1), Value::Int(0));
 
-    let err = q_err(
+    // `CAPTION` 已按 REA 0x458b59 实现(`[wnd+0x14]`,未设置 = -1)。
+    let caption = q(
         &gfx,
         "WINDOWINFO",
         vec![
@@ -280,5 +294,5 @@ fn windowinfo_answers_main_geometry() {
             arg(&table, "WINDOWINFO", "CAPTION", i(1)),
         ],
     );
-    assert_eq!(err.code, "gfx.info.unsupported");
+    assert_eq!(caption, Value::Int(-1));
 }

@@ -105,7 +105,7 @@ fn title_close_dialog_presents_and_answers() {
         .collect();
     eprintln!("DIALOG 呈现 @frame{}: {snapshot:?}", engine.frame());
     assert_eq!(snapshot.len(), 1, "关闭请求应挂起一条原生 DIALOG");
-    let (id, buttons, caption, text, owner) = snapshot[0].clone();
+    let (id, buttons, caption, text, _task) = snapshot[0].clone();
     assert_eq!(buttons, DialogButtons::YesNo, "終了確認 = はい/いいえ");
     assert!(
         caption.contains("確認"),

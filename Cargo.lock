@@ -4152,6 +4152,8 @@ dependencies = [
  "yu-backend-wgpu",
  "yu-cli",
  "yu-engine",
+ "yu-format",
+ "yu-gfx",
  "yu-log",
  "yu-platform-input",
  "yu-rt",

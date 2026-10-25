@@ -19,7 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use yu_backend_soft::{
-    apply_horizontal, apply_rect_paint, apply_reverse, blit, text_base_key, AssetIssue,
+    apply_horizontal, apply_meido, apply_rect_paint, apply_resize, apply_reverse, apply_trim,
+    apply_vertical, blit, text_base_key, AssetIssue,
     RenderReport, SkippedOp, Surface, TextComposer, TextPaintStats, Texture, TextureStore,
 };
 use yu_gfx::{
@@ -191,6 +192,7 @@ pub(crate) fn plan(
                     match apply_image_to_override(
                         frame,
                         textures,
+                        targets,
                         target,
                         image,
                         &mut overrides,
@@ -1708,6 +1710,7 @@ fn clear_color(clear: Clear) -> wgpu::Color {
 fn apply_image_to_override(
     frame: &CompositorFrame,
     textures: &mut TextureStore,
+    targets: &TargetSet,
     pass_target: &LayerId,
     image: &ImageOp,
     overrides: &mut BTreeMap<LayerId, Override>,
@@ -1774,7 +1777,7 @@ fn apply_image_to_override(
                 overrides.insert(target.clone(), shared);
                 return Ok(());
             }
-            let source = resolve_cpu_source(frame, textures, overrides, &image.source, 0)?;
+            let source = resolve_cpu_source(frame, textures, targets, overrides, &image.source, 0)?;
             let shared = Override::new(source);
             if let Some(key) = key {
                 image_cache.insert(key, shared.clone());
@@ -1782,7 +1785,7 @@ fn apply_image_to_override(
             overrides.insert(target.clone(), shared);
             return Ok(());
         }
-        let source = resolve_cpu_source(frame, textures, overrides, &image.source, 0)?;
+        let source = resolve_cpu_source(frame, textures, targets, overrides, &image.source, 0)?;
         let scaled = yu_backend_soft::scale_region(
             &source,
             dw as u32,
@@ -1800,21 +1803,25 @@ fn apply_image_to_override(
     // `REVERSE`/`HORIZONTAL`:整层像素变换,按“源身份 + 操作”跨帧缓存。
     // 与 soft 的同名分支逐字对齐(`DIV-GFX-052`):源已在本帧加工过时基于
     // 当前像素算一次(不缓存);否则按源身份查缓存。
-    if matches!(image.action, ImageAction::Reverse | ImageAction::Horizontal) {
+    if matches!(
+        image.action,
+        ImageAction::Reverse | ImageAction::Horizontal | ImageAction::Vertical
+    ) {
         if let Some(src) = overrides.get(&image.source) {
             let mut texture = (*src.tex).clone();
             match image.action {
                 ImageAction::Reverse => apply_reverse(&mut texture),
+                ImageAction::Vertical => apply_vertical(&mut texture),
                 _ => apply_horizontal(&mut texture),
             }
             overrides.insert(target.clone(), Override::new(Rc::new(texture)));
             return Ok(());
         }
         if let Some(layer) = frame.layers.iter().find(|l| l.id == image.source) {
-            let sig = if image.action == ImageAction::Reverse {
-                yu_backend_soft::ImageOpSig::Reverse
-            } else {
-                yu_backend_soft::ImageOpSig::Horizontal
+            let sig = match image.action {
+                ImageAction::Reverse => yu_backend_soft::ImageOpSig::Reverse,
+                ImageAction::Vertical => yu_backend_soft::ImageOpSig::Vertical,
+                _ => yu_backend_soft::ImageOpSig::Horizontal,
             };
             let source_id = match &layer.texture {
                 TextureRef::Asset(key) => Some(yu_backend_soft::ImageSource::Asset(key.clone())),
@@ -1836,6 +1843,7 @@ fn apply_image_to_override(
             let mut texture = (*resolve_base_texture(frame, textures, target)?).clone();
             match image.action {
                 ImageAction::Reverse => apply_reverse(&mut texture),
+                ImageAction::Vertical => apply_vertical(&mut texture),
                 _ => apply_horizontal(&mut texture),
             }
             let shared = Override::new(Rc::new(texture));
@@ -1845,6 +1853,37 @@ fn apply_image_to_override(
             overrides.insert(target.clone(), shared);
             return Ok(());
         }
+    }
+    // `TRANSITION`:两源线性插值写成目标层(与 soft 同名分支逐字对齐)。
+    // 源 = `image.source` / `image.source2`,不读目标旧像素。
+    if matches!(&image.action, ImageAction::Other("transition")) {
+        let to_id = image
+            .source2
+            .as_ref()
+            .ok_or_else(|| "gfx.imageop.source.missing".to_string())?;
+        let from = resolve_cpu_source(frame, textures, targets, overrides, &image.source, 0)?;
+        let to = resolve_cpu_source(frame, textures, targets, overrides, to_id, 0)?;
+        let blend = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
+        let blended = yu_backend_soft::blend_transition(&from, &to, blend);
+        overrides.insert(target.clone(), Override::new(Rc::new(blended)));
+        return Ok(());
+    }
+    // `MERGE/MERGE2/XOR/AND`:`ID`(上层)合成到 `ID2`(下层),结果写 `ID2`。
+    if image.action.is_layer_composite() {
+        let mut lower = match overrides.remove(target) {
+            Some(ov) => Rc::try_unwrap(ov.tex).unwrap_or_else(|rc| (*rc).clone()),
+            None => (*resolve_base_texture(frame, textures, target)?).clone(),
+        };
+        let upper = resolve_cpu_source(frame, textures, targets, overrides, &image.source, 0)?;
+        match &image.action {
+            ImageAction::Merge => yu_backend_soft::apply_merge(&mut lower, &upper, false),
+            ImageAction::Merge2 => yu_backend_soft::apply_merge(&mut lower, &upper, true),
+            ImageAction::Other("xor") => yu_backend_soft::apply_bitwise(&mut lower, &upper, true),
+            ImageAction::Other("and") => yu_backend_soft::apply_bitwise(&mut lower, &upper, false),
+            _ => return Err("gfx.imageop.unsupported".to_string()),
+        }
+        overrides.insert(target.clone(), Override::new(Rc::new(lower)));
+        return Ok(());
     }
     let mut texture = match overrides.remove(target) {
         Some(ov) => Rc::try_unwrap(ov.tex).unwrap_or_else(|rc| (*rc).clone()),
@@ -1869,6 +1908,65 @@ fn apply_image_to_override(
             }
             apply_horizontal(&mut texture);
         }
+        ImageAction::Vertical => {
+            if region.is_some() {
+                return Err("gfx.imageop.region.unsupported".to_string());
+            }
+            apply_vertical(&mut texture);
+        }
+        ImageAction::Resize => {
+            let (x, y, x2, y2) = (
+                image.x.unwrap_or(0),
+                image.y.unwrap_or(0),
+                image.x2.unwrap_or(0),
+                image.y2.unwrap_or(0),
+            );
+            apply_resize(&mut texture, x, y, x2, y2)?;
+        }
+        ImageAction::Trim => {
+            let Some(set) = image.set.as_ref().and_then(|v| v.as_int()) else {
+                return Err("gfx.imageop.set.missing".to_string());
+            };
+            apply_trim(&mut texture, set);
+        }
+        ImageAction::Other("meido") => {
+            let Some(set) = image.set.as_ref().and_then(|v| v.as_int()) else {
+                return Err("gfx.imageop.set.missing".to_string());
+            };
+            apply_meido(&mut texture, set);
+        }
+        ImageAction::Rotation => {
+            let deg = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
+            yu_backend_soft::apply_rotation(&mut texture, deg);
+        }
+        ImageAction::Other(name @ ("saido" | "akarusa" | "mono" | "mosaic" | "blur" | "diffusion"
+        | "whirlpool" | "raster" | "raster1" | "raster2" | "raster3" | "blur2" | "blur3" | "blur4"
+        | "blur5" | "blur6" | "rotation2")) => {
+            let set = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
+            let set2 = image.set2.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
+            match name {
+                "saido" => yu_backend_soft::apply_saido(&mut texture, set),
+                "akarusa" => yu_backend_soft::apply_akarusa(&mut texture, set),
+                "mono" => yu_backend_soft::apply_mono(&mut texture, set),
+                "mosaic" => yu_backend_soft::apply_mosaic(&mut texture, set),
+                "blur" => yu_backend_soft::apply_blur(&mut texture, set),
+                "blur2" => yu_backend_soft::apply_blur(&mut texture, set.max(1) * 2),
+                "blur3" => yu_backend_soft::apply_blur(&mut texture, set.max(1) * 3),
+                "blur4" => yu_backend_soft::apply_blur(&mut texture, set.max(1) * 4),
+                "blur5" => yu_backend_soft::apply_blur(&mut texture, set.max(1) * 5),
+                "blur6" => yu_backend_soft::apply_blur(&mut texture, set.max(1) * 6),
+                "diffusion" => yu_backend_soft::apply_diffusion(&mut texture, set),
+                "whirlpool" => yu_backend_soft::apply_whirlpool(&mut texture, set),
+                "raster" => yu_backend_soft::apply_raster(&mut texture, set, set2, true, false),
+                "raster1" => yu_backend_soft::apply_raster(&mut texture, set, set2, false, true),
+                "raster2" | "raster3" => {
+                    yu_backend_soft::apply_raster(&mut texture, set, set2, true, true)
+                }
+                "rotation2" => yu_backend_soft::apply_rotation(&mut texture, set),
+                _ => return Err("gfx.imageop.unsupported".to_string()),
+            }
+        }
+        ImageAction::Other("sepia") => yu_backend_soft::apply_sepia(&mut texture),
         _ => return Err("gfx.imageop.unsupported".to_string()),
     }
     overrides.insert(target.clone(), Override::new(Rc::new(texture)));
@@ -1878,10 +1976,17 @@ fn apply_image_to_override(
 /// CPU 侧解析图层当前像素(资产/1×1/快照/已加工覆盖)。
 ///
 /// `CGACT[SIZE]` 是 CPU 缩放(与 soft 同一实现),因此 wgpu 需要源层
-/// 的 RGBA;快照按其 `CopyOp` 的源递归解析并裁剪(EVID-J3-04)。
+/// 的 RGBA;**快照优先取冻结的 CPU 镜像**(与 soft 的 `snapshots` 表同义)。
+///
+/// 证据(演出1 黑屏,f740..f2775):COPY 的源层会在同一帧稍后被 `CGEND`
+/// 删除(ERIS 背景/按钮快照都是 `CG[SPLBUF401]` → `COPY` → `CGEND[SPLBUF401]`)。
+/// soft 端 `apply_copy_op` 在命令段就把像素写进 `snapshots` 并冻结,之后
+/// 只读该表;旧 wgpu 端每次都按 `CopyOp.source` 惰性重建,源层已死 ⇒
+/// `gfx.imageop.source.missing` ⇒ 目标层保留 `SolidBlack1x1` ⇒ 整屏黑。
 fn resolve_cpu_source(
     frame: &CompositorFrame,
     textures: &mut TextureStore,
+    targets: &TargetSet,
     overrides: &BTreeMap<LayerId, Override>,
     id: &LayerId,
     depth: usize,
@@ -1910,6 +2015,11 @@ fn resolve_cpu_source(
             .map_err(|diag| diag.code.to_string()),
         TextureRef::SolidBlack1x1 => Ok(Rc::new(Texture::solid_black_1x1())),
         TextureRef::Snapshot(copy_id) => {
+            // 冻结镜像优先:它由 1.4/1.6 段在**命令时刻**捕获,源层之后
+            // 被 `CGEND` 删除也不影响(与 soft `snapshots` 表同一语义)。
+            if let Some(mirror) = targets.snapshot_cpu(*copy_id) {
+                return Ok(Rc::new(mirror.clone()));
+            }
             for pass in &frame.passes {
                 for op in &pass.ops {
                     let Op::Copy(copy) = op else { continue };
@@ -1918,7 +2028,7 @@ fn resolve_cpu_source(
                     }
                     let source = match &copy.source {
                         CopySource::Layer(src) => {
-                            resolve_cpu_source(frame, textures, overrides, src, depth + 1)?
+                            resolve_cpu_source(frame, textures, targets, overrides, src, depth + 1)?
                         }
                         CopySource::Group(_) => return Err("gfx.imageop.source.group".to_string()),
                     };

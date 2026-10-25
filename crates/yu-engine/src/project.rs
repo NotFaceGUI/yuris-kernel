@@ -271,15 +271,19 @@ mod tests {
     use yu_vfs::{LookupKey, ypf::{murmur2, name_len_code}};
 
     fn temp_root(tag: &str) -> PathBuf {
+        // 缺省落在**仓库内** `target/test-tmp`(本仓既有约定):受限环境
+        // (Codex 沙箱等)只允许写工作区,系统 TEMP 会 `PermissionDenied`。
+        // `YURIS_TEST_TMP` 仍可覆盖。
         let base = std::env::var_os("YURIS_TEST_TMP")
             .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp"));
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let dir = base.join(format!("yu-cli-{tag}-{}-{unique}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("create_dir_all({}) 失败: {e}", dir.display()));
         dir
     }
 

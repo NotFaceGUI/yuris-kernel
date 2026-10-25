@@ -7407,3 +7407,254 @@ headless 字体页路径        # 零诊断(fp2.json/tx1.json)
 - WINDOWINFO 写侧 CLOSEMODE/MENUID/REGIONID/DRAGID、主窗口 A/SX/SY 视口语义 = DIV-GFX-037 余项;
 - `WINDOWINFO[FULLSCREEN]` 等桌面宿主实时注入(最小化/聚焦)未接;
 - `_CHR` 之外 undoc 系统变量(`_DXMODE/_VARTYPE/_SYSTEM_FRAME`)仍 DIV-RT-007 open。
+
+## 成果 CG-ANIM (2026-10-25) · 动画立绘/背景不上屏收口(`TRANSITION` + 定点尺寸键 + 缩放日志折叠)
+
+> 证据与逐条锚点见 `docs/divergences/DIV-GFX-061-animated-sprite-transition.md`。
+> 用户口径:「CG 的缩放移动,包括立绘都不显示,而且会触发 render spike
+> (特别是文字一个一个显示出来的时候)」,并指出「有动画就不显示,后面的
+> 静止 CG 正常显示」—— 后半句直接指向动画分支。
+
+### 根因(两条,都是动画分支独有)
+
+| # | 写法 | 出现处 | 旧行为 |
+|---|---|---|---|
+| A | `CGACT[TRANSITION=1 SET=f ID=$LB1 ID2=$LB2 ID3=$LB3]` | `es_Sprite.yst:7978` | 判 `Unimplemented`;`ID2` 被当目标误用 ⇒ 输出层 `$LB3` 永远全透明 |
+| B | `CGACT[… SIZE2=1 FX=… FY=… FX2=… FY2=… FSX=… FSY=…]` | `es_Sprite.yst:8665/8690` | 无整数 `SX/SY` ⇒ `gfx.imageop.size.missing` ⇒ 层被标 `Unimplemented` |
+
+静止 CG 走 `quo==0` 的低画质分支(发整数 `SX/SY`)且 `@L.ST==0` 不发 TRANSITION,
+所以静止图正常 —— 与用户观察一致。
+
+### 修复清单
+
+| 修复 | 锚点 | 效果 |
+|---|---|---|
+| `TRANSITION` = 两源按 `SET`(0..256)插值写入 **ID3** | 手册无 `ID3`/`SET` 量纲;语料 `es_Sprite.yst:7915..7985`;`fixed(no-manual)` | 动画路径的输出层有图 |
+| `FX/FY/FX2/FY2/FSX/FSY` = 整数键的百分位定点(÷100) | 脚本注释「小数点値を掃い…伝える」;`render-parity.md` §7(绘制侧 `÷100.0`) | `SIZE2` 中画质分支可执行 |
+| `SIZE3/SIZE4/SIZE5` 按缩放族执行 | `es_ERIS.yst:631`、`es_System.yst:261`;滤波差异未取证 ⇒ `partial(no-manual)` | CG 半尺寸/二分降采样不再毒化整层 |
+| 缩放族日志折叠(`supersede_image_op`) | REA `0x42f809`(立即破坏性写入) | `image_log` 66→15,`passes` 103→稳定 84–88,render spike 消除 |
+| `VARACT` 缺 `LET` 回写 `SET` | 引擎 `0x4542ab` 两支都写;`es_Text.yst:2024/2040/2568/2586` | `es_Text@1354` 的 Fatal 消除 |
+
+### 验证
+
+```text
+cargo test -p yu-gfx --test parity_fixes     # 19 passed(含 4 条新增)
+cargo test -p yu-gfx --test transform        # 6 passed
+cargo test -p yu-backend-soft --lib          # 含 blend_transition 2 条像素单测
+cargo test -p yu-rt --test fixture varact    # 6 passed(含 LET 缺省回写)
+场景 A/B(关闭/开启日志折叠)                 # 8 帧 SHA-256 逐位相同
+演出１ 真实菜单路径 3000 帧                   # 0 script_errors;此前 `rt.cmd.slot` Fatal
+```
+
+### 残留(在册)
+
+- `SIZE3/SIZE5` 的滤波差异未取证(按双线性代用,DIV-GFX-039 `partial`);
+- `TRANSITION` 的 `SET` 上限按 0..256 夹紧,动画端实际范围待实测确认;
+- `CGINFO[TEX]`(E-mote 判定)仍属 `deferred(master)`。
+
+## 成果 Q1-LOGGING (2026-10-25) · 日志收口:统一格式 + 级别颜色 + 默认可见(含 S1 与全仓静默自查)
+
+> 任务书 `docs/tasks/task-q1-logging.md`;契约单页 `docs/logging-contract.md`;
+> 自查台账 `docs/todo-silent-handling.md` §7。裁决按主人默认值执行:
+> Severity 单一级别集(Info/Lifecycle 由频道区分)、生命周期 Info 默认显示
+> (`--log-level quiet` 可压)、S1 并入 R0、诊断/日志全走 stderr。
+
+### R0(S1)FrameDiag 带位置
+
+- `yu-gfx`:`FrameDiag.at: Vec<DiagAt>`(上限 `MAX_FRAME_AT=8`,超出进
+  `at_more` 显式计数);`push_diag` 聚合 key 不变,位置去重并入;
+  `on_event(DomainCall)` 分派窗口注入 `(script, pc)`(S1 原缺口);
+  frame JSON 的 `at` 段**只在非空时写出**(空帧 JSON 逐字节不变,旧 golden
+  形状不破)。
+- 验证:`cargo test -p yu-gfx --test diag_positions`(4/4:跨 pc 双位置、
+  cap 折叠、JSON 键条件出现);真实语料实测见下。
+
+### R1 统一格式化 + ConsoleSink(`yu-log/src/console.rs` 新建)
+
+- 行格式 `[  +12.345s] WARN  [gfx] 码 @ 位置 x次数: 详情`(tyn 行格式为
+  事实参照,`record.rs::format_line` 出处注明;未搬代码);级别词
+  FATAL/ERROR/WARN/UNIMP/INFO/DEBUG/TRACE 单一词表;色表 = tyn 同表
+  (`level.rs:71..76` 数值),多行逐行包色、每行复位;
+- 颜色:`--color on|off|auto`(显式 > `CLICOLOR_FORCE=1` > `NO_COLOR` >
+  stderr 终端检测);auto→off 必须在 JSONL 留原因行(tyn 静默无色教训);
+- `Console`:聚合(同 key 只 `count+=1`)、级别过滤在格式化之前、
+  recent 环形缓冲(面板页签)、`JsonlFile` 单写者(`Arc<Mutex<File>>`);
+- 门面桥改统一格式(`[log-facade]` 频道;`ConsoleFn` 改 `Arc<dyn Fn>`);
+  `Diag::to_json_line_with_sub`(sub:"diag" 前置,schema/往返不变)。
+- 验证:`cargo test -p yu-log` 29/29(格式确定性、逐行包色字节级、
+  聚合排序、quiet 门槛、JSONL 双行型往返)。
+
+### R2 默认可见性
+
+- 桌面:`DiagnosticsHost.observe` 同一次 drain 两路消费(面板聚合 +
+  控制台行,gfx 帧诊断经 `frame_total_to_diag` 同源出行);`HostOptions.console`;
+- headless:`run` 末尾诊断汇总(频次降序,带 pc;`--diag-summary off` 干净);
+  serve:关闭时汇总 + `drained_diags/sound_diags_dropped` 计数行;
+- `--log-level quiet`:压 Info(含汇总);`--log-level/--color` 全局参数化。
+
+### R3 频道化
+
+- desktop/run/server/dev/case 的 ad-hoc 前缀改 `[host]/[run]/[serve]/[dev]/[case]`,
+  生命周期/警告行迁 stderr(产品输出留在 stdout:case PASS/FAIL、run 报告块、
+  bench 表);桌面宿主宏(44 处)统一 `[host] ` stderr 前缀(合流 Console
+  为台账遗留,宏看不到 self)。
+- 验收 grep:`output::error(format!` 每处首段均为 `[频道]`。
+
+### R4 文件统一
+
+- JSONL 单写者同时落 `sub:"diag"`(内核)与 `sub:"log"`(门面/宿主);
+  `run/serve` 新增 `--log-file`(每轮截断,与 desktop 同口径);
+- egui 面板「日志」页签:环形缓冲快照 + 清空按钮(只清面板,不动文件)。
+- 验证:ERIS headless JSONL 逐行回读 `sub=diag x1232 + sub=log x1` 字段齐全;
+  desktop 5 帧实测 577 diag + 14 log 同文件。
+
+### R5 守卫(`crates/yu-cli/tests/logging_guards.rs`,3/3 绿)
+
+- src 零终端宏;ANSI 字面量只许在 `yu-log/src/console.rs`;
+  `silent_fallback_audit`:yu-rt/yu-gfx 未标注 `unwrap_or` 按文件计数白名单
+  锁定(快照 162 处,只许减不许增;S3 排期逐条分类)。
+
+### 全仓静默自查(任务重中之重;明细见 todo-silent-handling §7)
+
+- 扫描 7 类模式,a 类 8 处全部处置(dev www 遍历吞错、YU_LOG_JSONL 打开
+  失败静默、SOUND_DIAG_CAP/drain_diags/serve 排空无痕 → 显式计数、
+  S1 位置注入、**desktop 缺省 JSONL 路径打不开静默无文件日志(终验时
+  抓到,已改三态:显式失败=硬失败/缺省失败=WARN 继续)**,S2 型降级
+  未发现新点位);b 类代表性 4 处注释自证;c 类 7 项转台账(未顺手改语义)。
+- 桌面日志路径三态实测(本机系统 TEMP 不可写恰好是天然用例):
+  缺省失败 → `WARN [host] 创建日志文件 … 失败 …;本运行不落文件日志`,
+  运行继续(exit 0);TEMP 指向沙箱 → 缺省文件正常创建;
+  `--log-file` 指向不可写处 → `[yu-cli] …` exit=2。
+
+### 验证(原始输出摘要)
+
+```text
+cargo test --workspace            # 除 info_query 3 个既有失败外全绿
+cargo test -p yu-cli --test logging_guards   # 3/3
+yu-cli run <eris> --frames 120    # stderr 汇总:
+# [ +18.949s] UNIMP [gfx] gfx.param.nonvisual @ s0 pc2148 x39546: CG: 参数 `LINT` …
+# [ +18.938s] WARN  [gfx] gfx.layer.missing @ s66 pc3399: CGEND: 删除不存在的图层 …
+yu-cli run <eris> --frames 120 --diag-summary off   # stderr 0 行
+YU_LOG=quiet yu-cli run <eris> --frames 60          # INFO 级行 0(汇总同压)
+game_diag_probe <eris> 120        # gfx.texture.missing x612 at s66 pc245,s66 pc263,s66 pc264,s0 pc1800,…(S1 验收)
+--color on / NO_COLOR=1 / auto(重定向)  # ANSI 有/无/关+留痕 三态实测
+```
+
+### 残留(在册)
+
+- `cases/*.json` golden 9/9 FAIL 为 **HEAD 既有**(git archive 干净副本
+  复现,actual sha 逐字节一致 ⇒ 非本轮引入;demo 修复后需主人实机确认
+  再 `--update`);
+- `yu-gfx --test info_query` 3 个失败同为既有(WINDOWINFO/FONTINFO 读侧
+  实现后断言未更新);
+- 桌面宿主宏行合流 Console、save 域诊断接入脚本 pc、S3/S5/S6 余项:见
+  todo-silent-handling §7.4。
+
+## 成果 Q1-LOGGING-R2 (2026-10-25) · 日志收口复审:宏行合流/时间域着色/锁中毒静默修复
+
+> 主人实机截图指出两点(未对齐的 `[host] yu-desktop: …` 行、时间域无色),
+> 连同代码质量复审,本轮修复如下;全部行级验收见下方验证。
+
+### 修复清单
+
+| 项 | 原状 | 处置 |
+|---|---|---|
+| 桌面宏 44 处未对齐 | `output::error("[host] …")` 纯文本(宏看不到 self) | `install_host_console` 进程级注入槽(`run()` 最先安装;宿主运维层元数据,内核不读取);`host_line!`=INFO / `host_error!`=WARN / `host_fatal!`(新,fail/panic 冻结)=ERROR,全部走统一格式+JSONL;槽未装时退化纯 `[host]` stderr |
+| 时间域无色 | `[  +32.948s]` 白色 | 着色时时间域恒暗灰 `\x1b[90m`(与级别色分离降视觉权重);实测 94/94 行带灰时间域 |
+| **锁中毒静默(复审新抓到,a 类 #9)** | `ConsoleHandle`/`JsonlFile` 的 `Mutex::lock()` 用 `if let Ok` ⇒ 一次 panic 中毒后所有后续日志**静默消失** | 恢复式取锁 `unwrap_or_else(poisoned→into_inner)`(H-P1-01 同型);serve 汇总取锁同改 |
+| 诊断消息路径不可读 | 缺省路径含 NUL 时显示成「空路径」 | 日志消息中路径一律 `{:?}`(空白/NUL/非法字符现形) |
+| debug build 提示行在 Console 建立前 | 平文本 | 移入 Console(Warn 级,统一格式) |
+| 决策分支事实(减少排查时间) | 分散 | desktop 新增 `boot: entry=… data=packed:….ypf (bytes) debug_mode=… fps=… backend=…` INFO 行;headless stdout `engine:` 行扩展 `debug_mode=` 与 `data=kind:path (bytes)` |
+
+### VM 未知命令路径核验(主人问询项,无需改动)
+
+- opcode 不在工程 ysc ⇒ Fatal `rt.cmd.unknown`,detail 带 `s{script} pc={pc} opcode …`
+  (`vm.rs::fill_cmd`,Fatal 恒显示);
+- 命令名在表但无处理器 ⇒ `report_unimplemented` → `rt.cmd.unimplemented`,
+  `locate()` 补 task/file/pc/cmd 且进挂号表计数(ERIS 实测:
+  `UNIMP [vm] rt.cmd.unimplemented @ data\script\eris\es_emote.yst pc214`)。
+
+### 验证
+
+```text
+cargo test --workspace                # 31 套件 ok;仅 info_query 3 个既有失败
+cargo test -p yu-cli --test logging_guards   # 3/3
+桌面 --frames 3 --no-sound            # 全部行(含 timer/window/render spike/
+                                      # DIALOG 帧)统一格式;boot 事实行可见
+--color on                            # 94/94 行时间域 \x1b[90m,行体按级别色
+```
+
+### 残留
+
+- info_query 3 个既有失败与 cases golden 9/9(HEAD 既有)不变,见上节;
+- `host_error!` 的历史语义偏「注意」(如 debug UI font),现映射 WARN(黄);
+  若主人想要更细分级别再挂号。
+
+## 成果 WGSL-BLACK (2026-10-25) · wgpu 演出1 黑屏根因收口(快照冻结镜像)+ 全仓警告/测试基线清理
+
+> 用户口径:「我用 wgpu 启动,我的 cg 还是黑屏,会闪一下然后黑屏(演出1那个)」。
+> 取证路径与逐帧数据见 `docs/divergences/DIV-GFX-062-wgpu-snapshot-cpu-mirror.md`。
+
+### 根因(一条,后端专属)
+
+ERIS 背景快照链在同一帧内完成三步:`CG[SPLBUF401]=bg_030` → `COPY → SPLBUF201`
+→ `CGEND[SPLBUF401]`。**COPY 的源层当场被删**。
+
+| 后端 | 快照像素来源 | 源层已删时 |
+|---|---|---|
+| soft | 命令段写进 `snapshots` 表并冻结,之后只读该表 | 无影响 |
+| wgpu(旧) | 按 `CopyOp.source` 惰性重建,递归回看源层 | `gfx.imageop.source.missing` ⇒ 目标层留 `SolidBlack1x1` ⇒ 全黑 |
+
+wgpu 端 `capture_copy_mirror` 其实已捕获了同样的 CPU 镜像,但
+`resolve_cpu_source` 的快照分支**没先查它**,直接走惰性递归 ⇒ 冻结镜像白存。
+
+### 修复
+
+`resolve_cpu_source` 增加 `targets: &TargetSet`,快照分支**先查
+`targets.snapshot_cpu(copy_id)`**,命中即返回冻结镜像;未命中才回落惰性递归
+(留给组源等 CPU 镜像不可得的组合)。`apply_image_to_override` 同步贯通。
+语义与 soft `apply_copy_op`/`layer_surface` 对齐。
+
+### 验证(逐位对拍,不是"没崩")
+
+| 帧 | soft | wgpu 修复前 | wgpu 修复后 |
+|---|---|---|---|
+| 760 | `972a15c9…` | `d8d9f702…`(skip×1) | `972a15c9…` |
+| 900 | `9584b2d6…` | `a7aff0f8…`(**纯黑**,skip×1) | `9584b2d6…` |
+| 1200 | `184568aa…` | `80556fa6…`(skip×1) | `184568aa…` |
+
+```text
+probe_skips --frames 1000 --wgpu
+  修复前: x59  f740..f798  image:gfx.imageop.source.missing  target=:/W0/SPL201
+  修复后: (无 skip);f2775 段同样清零
+```
+
+### 同批清理(日志驱动排查发现)
+
+| 项 | 现状 | 处置 |
+|---|---|---|
+| `YU_DEBUG_CG` 临时 eprintln | 遗留在 `apply_cg` | 删除(已完成取证使命) |
+| `info_query` 3 个失败 | 基线过期:`62f9898` 已实现 FONTINFO/WINDOWINFO 但断言仍写「必须 Unimplemented」 | 按实现的证据锚点更新断言(NAME NO→空串、NUM/LANG→0、CAPTION→-1) |
+| `yu-trace` golden 失败 | `cc9c05e` 扩了测试夹具命令表,漏重生成 golden | 重生成;diff 仅 3 行(ysc 4065→4225B、ycd 5927→6127B),字节增长与参数扩充一致 |
+| `yu-engine`/`yu-vfs` 测试 `PermissionDenied` | 受限环境只允许写工作区,`env::temp_dir()` 被拒 | 测试临时根缺省改到仓库 `target/test-tmp`(`YURIS_TEST_TMP` 仍可覆盖),共 4 处 |
+| `yu-rt` consistency `unreachable!` | 缺样本时报 "internal error",把环境问题误报成内核缺陷 | 改为显式 panic 并打印 `设置 YURIS_SAMPLE_ERIS_YSBIN=<project>/data/ysbin` |
+| 编译警告 3 条 | 未用 `mut`/未用变量/死函数 | 全部清零 |
+
+### 验证
+
+```text
+cargo build --workspace --all-targets    # 0 warning 0 error
+cargo test -p yu-save -p yu-vfs -p yu-trace -p yu-engine \
+           -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu
+                                         # 全绿(附样本环境变量)
+```
+
+### 剩余未实现(不属本轮,在册)
+
+日志抓取(700 帧)暴露的三条,均**已确认不影响本轮画面**:
+
+- `CGINFO[TEX]` ×979(`es_sprite.yst:5418`):E-mote 判定,`deferred(master)`;
+- `CGINFO[TEX]` 目标不存在 ×300(`:2340`):等待 E-mote 侧一并做;
+- `FILEINFO SIZE/RELATION` ×626:宿主文件事实查询,挂账 B10。
+
+新增档案:`DIV-GFX-062`(本轮黑屏)、`DIV-GFX-063`(无手册页滤镜族 `partial(no-manual)`)。

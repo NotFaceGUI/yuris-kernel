@@ -62,7 +62,7 @@ fn main() {
     ));
     vm.set_graphics_host(Box::new(GfxHost::new(state.clone())));
 
-    let mut slice = |vm: &Vm, tag: &str| {
+    let slice = |vm: &Vm, tag: &str| {
         let mut out = Vec::new();
         for (r, slot) in vm.store().iter() {
             if !vars.contains(&r.id) {

@@ -48,7 +48,8 @@ fn parse_script(sid: u32) -> Result<yu_rt::tables::ScriptFile, String> {
 }
 
 fn boot_vm(root: &str) -> Vm {
-    let src = DirSource::open(format!("{root}/save/data"), Codec::Cp932).unwrap();
+    // 数据入口唯一约定:散盘 `<project>/data/`(2026-10-20 起不再识别 save/data)。
+    let src = DirSource::open(format!("{root}/data"), Codec::Cp932).unwrap();
     let aux = DirSource::open(root, Codec::Cp932).unwrap();
     Vm::boot_with_aux(
         Box::new(src),

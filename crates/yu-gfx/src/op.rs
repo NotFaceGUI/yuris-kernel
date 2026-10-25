@@ -203,6 +203,8 @@ pub enum ImageAction {
     Reverse,
     /// `HORIZONTAL=1`:水平镜像。
     Horizontal,
+    /// `VERTICAL=1`:垂直镜像(上下翻转),alpha 不变。
+    Vertical,
     Other(&'static str),
 }
 
@@ -222,6 +224,7 @@ impl ImageAction {
             Self::Merge2 => "merge2",
             Self::Reverse => "reverse",
             Self::Horizontal => "horizontal",
+            Self::Vertical => "vertical",
             Self::Other(s) => s,
         }
     }
@@ -247,6 +250,68 @@ impl ImageAction {
         )
     }
 
+    /// `RESIZE`:改层尺寸、像素不重采样(手册例 21)。
+    pub fn is_resize(&self) -> bool {
+        matches!(self, Self::Resize)
+    }
+
+    /// `TRIM`:裁掉完全透明边缘(手册例 22)。
+    pub fn is_trim(&self) -> bool {
+        matches!(self, Self::Trim)
+    }
+
+    /// `MEIDO`:逐通道明度缩放(手册例 7)。
+    pub fn is_meido(&self) -> bool {
+        matches!(self, Self::Other("meido"))
+    }
+
+    /// 逐层**原地滤镜**族(手册例 5..17 + 无页同族键)。
+    ///
+    /// 这些动作只改本层像素,不涉及 ID2;判定为可执行后由后端按 `action`
+    /// 分派像素算法。`MERGE/MERGE2/XOR/AND` 是**两图层**动作,不在此列。
+    pub fn is_in_place_filter(&self) -> bool {
+        if matches!(self, Self::Rotation | Self::Resize | Self::Trim) {
+            return true;
+        }
+        matches!(
+            self,
+            Self::Other(
+                "meido"
+                    | "saido"
+                    | "akarusa"
+                    | "mono"
+                    | "sepia"
+                    | "mosaic"
+                    | "blur"
+                    | "blur2"
+                    | "blur3"
+                    | "blur4"
+                    | "blur5"
+                    | "blur6"
+                    | "diffusion"
+                    | "whirlpool"
+                    | "raster"
+                    | "raster1"
+                    | "raster2"
+                    | "raster3"
+                    | "rotation2"
+            )
+        )
+    }
+
+    /// 两图层合成族(`ID` 上层、`ID2` 下层、结果写 `ID2`)。
+    pub fn is_layer_composite(&self) -> bool {
+        matches!(
+            self,
+            Self::Merge | Self::Merge2 | Self::Other("xor" | "and")
+        )
+    }
+
+    /// 这三种动作会**改变层尺寸**(像素面重建),不只是改像素。
+    pub fn changes_extent(&self) -> bool {
+        self.is_resize() || self.is_trim()
+    }
+
     /// 走双线性(或更高画质)重采样。
     pub fn is_bilinear_scale(&self) -> bool {
         matches!(
@@ -266,6 +331,14 @@ pub struct ImageOp {
     pub seq: u64,
     /// 源图层(`ID`;`ID2` 存在时加工结果写入目标层)。
     pub source: LayerId,
+    /// 第二源图层(`ID2`;仅 `TRANSITION` 用)。
+    ///
+    /// 语料唯一用法 `es_Sprite.yst:7978`:
+    /// `CGACT[TRANSITION=1 SET=@L.F2(@LNO) ID=$LB1 ID2=$LB2 ID3=$LB3]`
+    /// —— `$LB1`=旧图、`$LB2`=新图,混合结果写进 `$LB3`,随后
+    /// `es.CGACT_SIZE` 再从 `$LB3` 缩放到可见层。所以这个动作的
+    /// 「目标」是 **ID3**,`ID2` 是第二个输入,与本结构其余动作不同。
+    pub source2: Option<LayerId>,
     /// `ID2`(复制/加工结果目标;`None` = 原地加工)。
     pub target: Option<LayerId>,
     pub action: ImageAction,

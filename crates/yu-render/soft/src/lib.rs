@@ -58,13 +58,22 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::result_large_err)]
 
+pub mod imagefilters;
 pub mod imageop;
 pub mod png;
 pub mod render;
 pub mod text;
 pub mod texture;
 
-pub use imageop::{apply_horizontal, apply_rect_paint, apply_reverse, scale_region};
+pub use imageop::{
+    apply_horizontal, apply_meido, apply_rect_paint, apply_resize, apply_reverse, apply_trim,
+    apply_vertical, blend_transition, scale_region,
+};
+#[allow(unused_imports)]
+pub use imagefilters::{
+    apply_akarusa, apply_bitwise, apply_blur, apply_diffusion, apply_merge, apply_mono,
+    apply_mosaic, apply_raster, apply_rotation, apply_saido, apply_sepia, apply_whirlpool,
+};
 pub use render::blit;
 pub use render::{
     frame_has_drawable_output, ImageCacheKey, ImageOpSig, ImageSource, RenderOutput, RenderReport,

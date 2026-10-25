@@ -722,6 +722,30 @@ fn diagnostics(out: &mut String, ds: &[crate::error::FrameDiag]) {
         esc_str(out, &d.detail);
         out.push_str(",\"count\":");
         out.push_str(&d.count.to_string());
+        // S1:发生位置。空时不写键,旧 golden(无位置诊断)逐字节不变。
+        if !d.at.is_empty() {
+            out.push_str(",\"at\":[");
+            for (j, at) in d.at.iter().enumerate() {
+                if j > 0 {
+                    out.push(',');
+                }
+                out.push_str("{\"script\":");
+                esc_str(out, &at.script);
+                out.push_str(",\"pc\":");
+                out.push_str(&at.pc.to_string());
+                out.push_str(",\"cmd\":");
+                match &at.cmd {
+                    Some(cmd) => esc_str(out, cmd),
+                    None => out.push_str("null"),
+                }
+                out.push('}');
+            }
+            out.push(']');
+            if d.at_more > 0 {
+                out.push_str(",\"at_more\":");
+                out.push_str(&d.at_more.to_string());
+            }
+        }
         out.push('}');
     }
     out.push(']');

@@ -302,6 +302,18 @@ pub fn call(frame: u64, name: &str, args: Vec<ArgValue>) -> VmEvent {
     }
 }
 
+/// 带脚本定位的域事件(todo-silent-handling S1:内核发出的域事件总有位置)。
+pub fn call_at(frame: u64, script: u32, pc: u32, name: &str, args: Vec<ArgValue>) -> VmEvent {
+    VmEvent::DomainCall {
+        frame,
+        domain: Domain::Graphics,
+        name: name.to_string(),
+        args,
+        script: Some(script),
+        pc: Some(pc),
+    }
+}
+
 pub fn window_call(frame: u64, name: &str, args: Vec<ArgValue>) -> VmEvent {
     VmEvent::DomainCall {
         frame,

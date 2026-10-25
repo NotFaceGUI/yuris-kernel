@@ -54,7 +54,7 @@ pub mod table;
 pub mod text;
 pub mod transition;
 
-pub use error::FrameDiag;
+pub use error::{DiagAt, FrameDiag, MAX_FRAME_AT};
 pub use frame::{
     probe_order_from_codes, Clear, ColorSpace, CompositorFrame, FilterMode, FilterSource,
     MipFilter, TextureFilter, Viewport, WindowState,

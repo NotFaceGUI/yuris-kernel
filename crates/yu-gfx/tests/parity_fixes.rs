@@ -826,3 +826,311 @@ fn repeated_scale_ops_collapse_but_in_place_ops_stay() {
         .count();
     assert_eq!(self_imgs, 2, "原地缩放必须逐次保留");
 }
+
+/// `CGACT[TRANSITION=1 SET=f ID=from ID2=to ID3=dst]`:
+/// 两源按 `f`(0..256)插值写成**第三层**。
+///
+/// 语料唯一用法 `es_Sprite.yst:7978`
+/// `CGACT[TRANSITION=1 SET=@L.F2(@LNO) ID=$LB1 ID2=$LB2 ID3=$LB3]`:
+/// `$LB1`=上一帧采样结果、`$LB2`=目标图、`$LB3`=本帧采样源;产物随后被
+/// `es.CGACT_SIZE` 缩放到可见层。缺这条 ⇒ 动画分支的输出层永远全透明
+/// ⇒「有动画的立绘/背景不显示,静态 CG 正常」。
+///
+/// 注意参数方向:这里 `ID2` 是**第二输入**(不是目标),目标在 `ID3`。
+#[test]
+fn cgact_transition_blends_two_sources_into_id3() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("FROM")),
+                arg(&table, "CG", "FILE", s("from")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("TO")),
+                arg(&table, "CG", "FILE", s("to")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("FROM")),
+                arg(&table, "CGACT", "ID2", s("TO")),
+                arg(&table, "CGACT", "ID3", s("DST")),
+                arg(&table, "CGACT", "TRANSITION", i(1)),
+                arg(&table, "CGACT", "SET", i(128)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let img = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|o| match o {
+            Op::Image(i) if matches!(&i.action, ImageAction::Other("transition")) => Some(i),
+            _ => None,
+        })
+        .expect("transition op 必须被登记(而不是判未实现后丢弃)");
+    assert_eq!(img.source.display(), ":/W0/FROM");
+    assert_eq!(
+        img.source2.as_ref().map(|l| l.display()),
+        Some(":/W0/TO".to_string()),
+        "ID2 是第二输入"
+    );
+    assert_eq!(
+        img.target.as_ref().map(|l| l.display()),
+        Some(":/W0/DST".to_string()),
+        "ID3 才是输出层"
+    );
+    assert_eq!(img.set.as_ref().and_then(|v| v.as_int()), Some(128));
+    assert_eq!(img.status, OpStatus::Executable);
+    // 输出层必须存在且未被毒化(否则后续 SIZE 拿不到图)。
+    assert_eq!(layer(&f, ":/W0/DST").status, LayerStatus::Executable);
+}
+
+/// `VERTICAL` 与 `HORIZONTAL` 同类(整层几何翻转),必须判可执行而不是毒化。
+/// 语料 `es_Sprite.yst:8233/8240` 成对出现,各自由 `IF[@POSTF_*]` 门控。
+#[test]
+fn cgact_vertical_executes_like_horizontal() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("V")),
+                arg(&table, "CG", "FILE", s("v")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("V")),
+                arg(&table, "CGACT", "VERTICAL", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let img = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|o| match o {
+            Op::Image(i) => Some(i),
+            _ => None,
+        })
+        .expect("VERTICAL op");
+    assert_eq!(img.action, ImageAction::Vertical);
+    assert_eq!(img.status, OpStatus::Executable);
+    assert_eq!(layer(&f, ":/W0/V").status, LayerStatus::Executable);
+}
+
+/// `RESIZE` / `TRIM` / `MEIDO` 都是**单层原地**动作(手册例 7/21/22 均无 ID2),
+/// 必须判可执行而不是毒化整层。
+///
+/// 语料 live 用量(`es_Sprite.yst`):`RESIZE` 12 次(含 `:5877` 立绘加载路径的
+/// 无条件调用)、`SAIDO` 5、`MEIDO` 5。未实现时它们会把源层标成
+/// `Unimplemented` ⇒ 该层永不绘制。
+#[test]
+fn cgact_resize_trim_meido_execute_in_place() {
+    let table = table();
+    // 各动作按手册例子的**真实形态**构造:
+    // - 例 21 RESIZE:`RESIZE=1 X=10 Y=20 X2=-30 Y2=-40`
+    // - 例 22 TRIM:只有 `SET=15`
+    // - 例 7  MEIDO:只有 `SET=0xffff00`
+    for (action, extra, with_edges) in [
+        ("RESIZE", None, true),
+        ("TRIM", Some(15i64), false),
+        ("MEIDO", Some(0x808080i64), false),
+    ] {
+        let mut gfx = state();
+        let mut args = vec![
+            arg(&table, "CGACT", "ID", s("L")),
+            arg(&table, "CGACT", action, i(1)),
+        ];
+        if with_edges {
+            args.push(arg(&table, "CGACT", "X", i(10)));
+            args.push(arg(&table, "CGACT", "Y", i(20)));
+            args.push(arg(&table, "CGACT", "X2", i(-30)));
+            args.push(arg(&table, "CGACT", "Y2", i(-40)));
+        }
+        if let Some(v) = extra {
+            args.push(arg(&table, "CGACT", "SET", i(v)));
+        }
+        gfx.consume_events(&[
+            frame_start(1),
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", s("L")),
+                    arg(&table, "CG", "FILE", s("l")),
+                ],
+            ),
+            call(1, "CGACT", args),
+            frame_end(1),
+        ]);
+        let f = gfx.frame();
+        let img = f
+            .passes
+            .iter()
+            .flat_map(|p| p.ops.iter())
+            .find_map(|o| match o {
+                Op::Image(img) => Some(img),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{action} op 必须被登记"));
+        assert_eq!(img.status, OpStatus::Executable, "{action} 应可执行");
+        assert_eq!(
+            layer(&f, ":/W0/L").status,
+            LayerStatus::Executable,
+            "{action} 不得毒化源层"
+        );
+    }
+}
+
+/// 手册例 5..17 与 yscm 表内全部逐层滤镜动作,都必须判**可执行**,不得毒化。
+///
+/// 「手册无页」的键(`SEPIA`/`XOR`/`AND`/`RASTER2..3`/`BLUR2..6`/`ROTATION2`)
+/// 按同族约定实现(见 `DIV-GFX-062`),等级是 `partial(no-manual)`,
+/// 但**不允许残留 Unimplemented**。
+#[test]
+fn all_layer_filter_actions_are_executable() {
+    let table = table();
+    // 按手册例子给参数;无页键用同族默认值。
+    let cases: &[(&str, &[(&str, i64)])] = &[
+        ("ROTATION", &[("SET", 30)]),
+        ("SAIDO", &[("SET", 64)]),
+        ("MEIDO", &[("SET", 0x00ff_ff00)]),
+        ("AKARUSA", &[("SET", 192)]),
+        ("MONO", &[("SET", 160)]),
+        ("MOSAIC", &[("SET", 4)]),
+        ("BLUR", &[("SET", 8)]),
+        ("DIFFUSION", &[("SET", 8)]),
+        ("REVERSE", &[]),
+        ("WHIRLPOOL", &[("SET", 3000)]),
+        ("RASTER", &[("SET", 5), ("SET2", 1)]),
+        ("RASTER2", &[("SET", 5), ("SET2", 1)]),
+        ("RASTER3", &[("SET", 5), ("SET2", 1)]),
+        ("BLUR2", &[("SET", 4)]),
+        ("BLUR3", &[("SET", 4)]),
+        ("BLUR4", &[("SET", 4)]),
+        ("BLUR5", &[("SET", 4)]),
+        ("BLUR6", &[("SET", 4)]),
+        ("ROTATION2", &[("SET", 45)]),
+        ("SEPIA", &[]),
+        ("VERTICAL", &[]),
+        ("HORIZONTAL", &[]),
+        ("TRIM", &[("SET", 15)]),
+    ];
+    for (action, params) in cases {
+        let mut gfx = state();
+        let mut args = vec![
+            arg(&table, "CGACT", "ID", s("F")),
+            arg(&table, "CGACT", action, i(1)),
+        ];
+        for (name, v) in *params {
+            args.push(arg(&table, "CGACT", name, i(*v)));
+        }
+        gfx.consume_events(&[
+            frame_start(1),
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", s("F")),
+                    arg(&table, "CG", "FILE", s("f")),
+                ],
+            ),
+            call(1, "CGACT", args),
+            frame_end(1),
+        ]);
+        let f = gfx.frame();
+        let img = f
+            .passes
+            .iter()
+            .flat_map(|p| p.ops.iter())
+            .find_map(|o| match o {
+                Op::Image(img) => Some(img),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{action} op 必须被登记"));
+        assert_eq!(img.status, OpStatus::Executable, "{action} 应可执行");
+        assert_eq!(
+            layer(&f, ":/W0/F").status,
+            LayerStatus::Executable,
+            "{action} 不得毒化图层"
+        );
+    }
+}
+
+/// `MERGE` / `MERGE2` / `XOR` / `AND`:两层合成,`ID` 上层、`ID2` 下层、结果写 `ID2`。
+/// 手册例 23/24 原文明示「結合した結果はレイヤ「BG2」(=ID2)のほうに格納」。
+#[test]
+fn layer_composite_actions_write_to_id2() {
+    let table = table();
+    for action in ["MERGE", "MERGE2", "XOR", "AND"] {
+        let mut gfx = state();
+        gfx.consume_events(&[
+            frame_start(1),
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", s("UP")),
+                    arg(&table, "CG", "FILE", s("up")),
+                ],
+            ),
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", s("LOW")),
+                    arg(&table, "CG", "FILE", s("low")),
+                ],
+            ),
+            call(
+                1,
+                "CGACT",
+                vec![
+                    arg(&table, "CGACT", "ID", s("UP")),
+                    arg(&table, "CGACT", "ID2", s("LOW")),
+                    arg(&table, "CGACT", action, i(1)),
+                ],
+            ),
+            frame_end(1),
+        ]);
+        let f = gfx.frame();
+        let img = f
+            .passes
+            .iter()
+            .flat_map(|p| p.ops.iter())
+            .find_map(|o| match o {
+                Op::Image(img) => Some(img),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{action} op"));
+        assert_eq!(img.status, OpStatus::Executable, "{action} 应可执行");
+        assert_eq!(
+            img.target.as_ref().map(|t| t.display()),
+            Some(":/W0/LOW".to_string()),
+            "{action} 结果必须写 ID2"
+        );
+        assert_eq!(layer(&f, ":/W0/LOW").status, LayerStatus::Executable);
+    }
+}

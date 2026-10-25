@@ -99,6 +99,24 @@ pub fn at_command(mut diag: Diag, frame: u64, command: &str) -> Diag {
     diag
 }
 
+/// 一条 FrameDiag 的发生位置(脚本坐标)。
+///
+/// gfx 是事件消费者,拿不到脚本文件名,只有 `DomainCall` 事件携带的
+/// 脚本号与 pc(todo-silent-handling S1):显示形式 `s66 pc6028`。
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DiagAt {
+    /// `s{script}` 形式的脚本标识。
+    pub script: String,
+    pub pc: u32,
+    pub cmd: Option<String>,
+}
+
+impl DiagAt {
+    pub fn display(&self) -> String {
+        format!("{} pc{}", self.script, self.pc)
+    }
+}
+
 /// 可稳定序列化的诊断快照(字段顺序固定;不含 `Loc` 的路径细节)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameDiag {
@@ -108,7 +126,16 @@ pub struct FrameDiag {
     pub detail: String,
     /// 同一帧内相同 `(code, command, detail)` 的出现次数(诊断去重但不丢频率)。
     pub count: u32,
+    /// 发生位置(todo-silent-handling S1):同一 key 的不同脚本位置列表,
+    /// 上限 [`MAX_FRAME_AT`];不为空时序列化进 frame JSON(空时不写键,
+    /// 旧 golden 逐字节不变)。
+    pub at: Vec<DiagAt>,
+    /// 位置数超过上限时,被折叠的不同位置个数(显式计数,不静默丢)。
+    pub at_more: u64,
 }
+
+/// 单条 FrameDiag 保留的不同位置上限;超出进 `at_more` 计数。
+pub const MAX_FRAME_AT: usize = 8;
 
 impl FrameDiag {
     pub fn new(
@@ -123,6 +150,29 @@ impl FrameDiag {
             command: command.to_string(),
             detail: detail.into(),
             count: 1,
+            at: Vec::new(),
+            at_more: 0,
         }
+    }
+
+    /// 登记一个发生位置(去重;超上限折进 `at_more`)。
+    pub fn push_at(&mut self, at: &DiagAt) {
+        if self.at.contains(at) {
+            return;
+        }
+        if self.at.len() < MAX_FRAME_AT {
+            self.at.push(at.clone());
+        } else {
+            self.at_more += 1;
+        }
+    }
+
+    /// 位置段的一行显示(`s66 pc6028,s71 pc33+1`;空 = 无位置)。
+    pub fn at_display(&self) -> String {
+        let mut parts: Vec<String> = self.at.iter().map(|a| a.display()).collect();
+        if self.at_more > 0 {
+            parts.push(format!("+{}", self.at_more));
+        }
+        parts.join(",")
     }
 }

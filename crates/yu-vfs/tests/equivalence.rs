@@ -14,15 +14,18 @@ use yu_log::code::vfs;
 use yu_vfs::{Codec, DataSource, DirSource, LookupKey, YpfDialect, YpfSource};
 
 fn temp_dir(tag: &str) -> PathBuf {
+    // 缺省落在仓库内 `target/test-tmp`:受限环境只允许写工作区,
+    // 系统 TEMP 会 `PermissionDenied`。`YURIS_TEST_TMP` 仍可覆盖。
     let base = std::env::var_os("YURIS_TEST_TMP")
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp"));
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let dir = base.join(format!("yu-vfs-eq-{tag}-{}-{unique}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    fs::create_dir_all(&dir)
+        .unwrap_or_else(|e| panic!("create_dir_all({}) 失败: {e}", dir.display()));
     dir
 }
 

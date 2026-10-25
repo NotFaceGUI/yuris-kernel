@@ -19,12 +19,6 @@ fn eris_root() -> String {
         .expect("set YURIS_SAMPLE_ERIS_ROOT or YURIS_SAMPLE_ERIS_YSBIN")
 }
 
-fn ysbin_dir() -> String {
-    std::env::var("YURIS_SAMPLE_ERIS_YSBIN")
-        .or_else(|_| std::env::var("YURIS_SAMPLE_ERIS_ROOT").map(|r| format!("{r}/save/data/ysbin")))
-        .expect("set YURIS_SAMPLE_ERIS_YSBIN or ROOT")
-}
-
 fn parse_script(sid: u32) -> Option<ScriptFile> {
     let root = eris_root();
     let pack = yu_vfs::YpfSource::open(format!("{root}/data.ypf"), Codec::Cp932).ok()?;

@@ -29,7 +29,10 @@ use yu_gfx::{
     ImageAction, ImageOp, Layer, LayerId, Op, OpStatus, PassTarget, TextDraw, TextureRef,
 };
 
-use crate::imageop::{apply_horizontal, apply_rect_paint, apply_reverse};
+use crate::imageop::{
+    apply_horizontal, apply_meido, apply_rect_paint, apply_resize, apply_reverse, apply_trim,
+    apply_vertical,
+};
 use crate::text::{layer_base, text_base_key, texture_content_hash, TextComposer, TextPaintStats};
 use crate::texture::{AssetIssue, Texture, TextureStore};
 
@@ -190,6 +193,8 @@ pub enum ImageOpSig {
     Reverse,
     /// `CGACT[HORIZONTAL]`:水平镜像。
     Horizontal,
+    /// `CGACT[VERTICAL]`:垂直镜像。
+    Vertical,
 }
 
 /// 跨帧图像结果缓存键。
@@ -558,12 +563,16 @@ fn apply_image_op(
     }
     // `REVERSE`/`HORIZONTAL`:整层像素变换,同样按“源身份 + 操作”缓存。
     // 脚本每帧重发同一条(配对 mask 每帧一次),缓存后帧内零像素工作。
-    if matches!(image.action, ImageAction::Reverse | ImageAction::Horizontal) {
+    if matches!(
+        image.action,
+        ImageAction::Reverse | ImageAction::Horizontal | ImageAction::Vertical
+    ) {
         if let Some(src) = st.texture_overrides.get(&image.source) {
             // 源已在本帧加工过:基于当前像素做一次(结果随源变化,不缓存)。
             let mut texture = (**src).clone();
             match image.action {
                 ImageAction::Reverse => apply_reverse(&mut texture),
+                ImageAction::Vertical => apply_vertical(&mut texture),
                 _ => apply_horizontal(&mut texture),
             }
             st.texture_overrides
@@ -571,10 +580,10 @@ fn apply_image_op(
             return Ok(());
         }
         if let Some(layer) = frame.layers.iter().find(|l| l.id == image.source) {
-            let sig = if image.action == ImageAction::Reverse {
-                ImageOpSig::Reverse
-            } else {
-                ImageOpSig::Horizontal
+            let sig = match image.action {
+                ImageAction::Reverse => ImageOpSig::Reverse,
+                ImageAction::Vertical => ImageOpSig::Vertical,
+                _ => ImageOpSig::Horizontal,
             };
             let source_id = match &layer.texture {
                 TextureRef::Asset(key) => Some(ImageSource::Asset(key.clone())),
@@ -596,6 +605,7 @@ fn apply_image_op(
             let mut texture = base_texture(textures, snapshots, frame, target)?;
             match image.action {
                 ImageAction::Reverse => apply_reverse(&mut texture),
+                ImageAction::Vertical => apply_vertical(&mut texture),
                 _ => apply_horizontal(&mut texture),
             }
             let shared = Rc::new(texture);
@@ -605,6 +615,63 @@ fn apply_image_op(
             st.texture_overrides.insert(target.clone(), shared);
             return Ok(());
         }
+    }
+    // `TRANSITION`:两源线性插值写成目标层。源是 `image.source` /
+    // `image.source2`,与「目标层旧像素」无关,因此不走下面的 in-place 路径。
+    if matches!(&image.action, ImageAction::Other("transition")) {
+        let from_id = &image.source;
+        let to_id = image
+            .source2
+            .as_ref()
+            .ok_or_else(|| "gfx.imageop.source.missing".to_string())?;
+        let from = layer_surface(textures, snapshots, frame, from_id, st, None)?;
+        let to = layer_surface(textures, snapshots, frame, to_id, st, None)?;
+        let blend = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
+        let blended = crate::imageop::blend_transition(
+            &crate::texture::Texture {
+                width: from.width,
+                height: from.height,
+                rgba: from.rgba,
+            },
+            &crate::texture::Texture {
+                width: to.width,
+                height: to.height,
+                rgba: to.rgba,
+            },
+            blend,
+        );
+        st.texture_overrides
+            .insert(target.clone(), Rc::new(blended));
+        return Ok(());
+    }
+    // `MERGE/MERGE2/XOR/AND`:`ID`(上层)合成到 `ID2`(下层),结果写 `ID2`。
+    if image.action.is_layer_composite() {
+        let Some(upper_id) = Some(&image.source) else {
+            return Err("gfx.imageop.source.missing".to_string());
+        };
+        let mut lower = match st.texture_overrides.remove(target) {
+            Some(t) => Rc::try_unwrap(t).unwrap_or_else(|rc| (*rc).clone()),
+            None => base_texture(textures, snapshots, frame, target)?,
+        };
+        let upper = layer_surface(textures, snapshots, frame, upper_id, st, None)?;
+        let upper = crate::texture::Texture {
+            width: upper.width,
+            height: upper.height,
+            rgba: upper.rgba,
+        };
+        match &image.action {
+            ImageAction::Merge => crate::imagefilters::apply_merge(&mut lower, &upper, false),
+            ImageAction::Merge2 => crate::imagefilters::apply_merge(&mut lower, &upper, true),
+            ImageAction::Other("xor") => {
+                crate::imagefilters::apply_bitwise(&mut lower, &upper, true)
+            }
+            ImageAction::Other("and") => {
+                crate::imagefilters::apply_bitwise(&mut lower, &upper, false)
+            }
+            _ => return Err("gfx.imageop.unsupported".to_string()),
+        }
+        st.texture_overrides.insert(target.clone(), Rc::new(lower));
+        return Ok(());
     }
     let mut texture = match st.texture_overrides.remove(target) {
         Some(texture) => Rc::try_unwrap(texture).unwrap_or_else(|rc| (*rc).clone()),
@@ -629,6 +696,73 @@ fn apply_image_op(
             }
             apply_horizontal(&mut texture);
         }
+        ImageAction::Vertical => {
+            if region.is_some() {
+                return Err("gfx.imageop.region.unsupported".to_string());
+            }
+            apply_vertical(&mut texture);
+        }
+        ImageAction::Resize => {
+            // RESIZE 的 X/Y/X2/Y2 是四边相对扩缩量(不是源区域),
+            // 因此走专用路径:上面统一解析出的 `region` 只对区域类动作有意义。
+            let (x, y, x2, y2) = (
+                image.x.unwrap_or(0),
+                image.y.unwrap_or(0),
+                image.x2.unwrap_or(0),
+                image.y2.unwrap_or(0),
+            );
+            apply_resize(&mut texture, x, y, x2, y2)?;
+        }
+        ImageAction::Trim => {
+            let Some(set) = image.set.as_ref().and_then(|v| v.as_int()) else {
+                return Err("gfx.imageop.set.missing".to_string());
+            };
+            apply_trim(&mut texture, set);
+        }
+        ImageAction::Other("meido") => {
+            let Some(set) = image.set.as_ref().and_then(|v| v.as_int()) else {
+                return Err("gfx.imageop.set.missing".to_string());
+            };
+            apply_meido(&mut texture, set);
+        }
+        ImageAction::Rotation => {
+            let deg = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
+            crate::imagefilters::apply_rotation(&mut texture, deg);
+        }
+        ImageAction::Other(name @ ("saido" | "akarusa" | "mono" | "mosaic" | "blur" | "diffusion"
+        | "whirlpool" | "raster" | "raster1" | "raster2" | "raster3" | "blur2" | "blur3" | "blur4"
+        | "blur5" | "blur6" | "rotation2")) => {
+            let set = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
+            let set2 = image.set2.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
+            match name {
+                "saido" => crate::imagefilters::apply_saido(&mut texture, set),
+                "akarusa" => crate::imagefilters::apply_akarusa(&mut texture, set),
+                "mono" => crate::imagefilters::apply_mono(&mut texture, set),
+                "mosaic" => crate::imagefilters::apply_mosaic(&mut texture, set),
+                "blur" => crate::imagefilters::apply_blur(&mut texture, set),
+                // `BLUR2..6` 无手册页:按同族以 radius = set*(档位) 处理。
+                "blur2" => crate::imagefilters::apply_blur(&mut texture, set.max(1) * 2),
+                "blur3" => crate::imagefilters::apply_blur(&mut texture, set.max(1) * 3),
+                "blur4" => crate::imagefilters::apply_blur(&mut texture, set.max(1) * 4),
+                "blur5" => crate::imagefilters::apply_blur(&mut texture, set.max(1) * 5),
+                "blur6" => crate::imagefilters::apply_blur(&mut texture, set.max(1) * 6),
+                "diffusion" => crate::imagefilters::apply_diffusion(&mut texture, set),
+                "whirlpool" => crate::imagefilters::apply_whirlpool(&mut texture, set),
+                "raster" => {
+                    crate::imagefilters::apply_raster(&mut texture, set, set2, true, false)
+                }
+                "raster1" => {
+                    crate::imagefilters::apply_raster(&mut texture, set, set2, false, true)
+                }
+                "raster2" | "raster3" => {
+                    crate::imagefilters::apply_raster(&mut texture, set, set2, true, true)
+                }
+                // `ROTATION2` 无手册页:按 ROTATION 同族(SET 为度)。
+                "rotation2" => crate::imagefilters::apply_rotation(&mut texture, set),
+                _ => return Err("gfx.imageop.unsupported".to_string()),
+            }
+        }
+        ImageAction::Other("sepia") => crate::imagefilters::apply_sepia(&mut texture),
         _ => return Err("gfx.imageop.unsupported".to_string()),
     }
     st.texture_overrides

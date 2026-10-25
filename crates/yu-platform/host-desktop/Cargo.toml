@@ -31,3 +31,6 @@ yu-sound = { path = "../../yu-sound" }
 # desktop feature 构成环;仅示例/测试编译时生效)。
 [dev-dependencies]
 yu-cli = { path = "../../yu-cli", default-features = false }
+# 取证探针(probe_buttons/probe_layer_status)需要直接读合成契约与 CP932 解码。
+yu-format = { path = "../../yu-format" }
+yu-gfx = { path = "../../yu-gfx" }
