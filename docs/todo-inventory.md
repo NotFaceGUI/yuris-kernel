@@ -29,6 +29,10 @@
   诊断聚合丢位置、类型不符静默变 `None`、语义层 `unwrap_or` 不挂号、
   `let _ =`/`_ => {}` 丢弃错误。与功能缺口(`todo-inventory.md`)和
   常量出处(`hardcode-audit.md`)是不同维度,勿混。
+- `docs/tasks/task-q1-logging.md`(2026-10-25 建立):**日志收口** ——
+  统一控制台行格式(前缀/级别/时间戳)、按级别 ANSI 着色(tyn 事实参照)、
+  内核诊断默认可见(headless 现状是静默丢弃,见该任务书 §1 盘点)、
+  Diag 落 JSONL。其 R0 = silent-handling S1(FrameDiag 带位置)并入。
 
 ## 0. 口径
 

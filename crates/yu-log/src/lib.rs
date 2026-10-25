@@ -11,6 +11,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod code;
+pub mod console;
 pub mod facade;
 mod json;
 pub mod sink;
@@ -41,6 +42,12 @@ impl Severity {
     }
 
     fn parse(s: &str) -> Option<Self> {
+        Self::parse_str(s)
+    }
+
+    /// 从 `as_str` 的输出解析(公开给把严重级存成字符串的序列化层,
+    /// 如 `yu-gfx::FrameDiag`);未知值显式 None,不猜。
+    pub fn parse_str(s: &str) -> Option<Self> {
         match s {
             "Fatal" => Some(Severity::Fatal),
             "Recoverable" => Some(Severity::Recoverable),
@@ -207,8 +214,29 @@ impl Diag {
         out
     }
 
+    /// 确定性 JSON(单行),前置一个 `"sub"` 键(JSONL 混合流用)。
+    ///
+    /// 字段集与 [`Self::to_json_line`] 完全一致,只是对象多一个首键;
+    /// [`Self::from_json_line`] 忽略未知键,往返契约不受影响。
+    pub fn to_json_line_with_sub(&self, sub: &str) -> String {
+        let mut out = String::with_capacity(160);
+        out.push_str("{\"sub\":");
+        json::write_string(&mut out, sub);
+        out.push(',');
+        self.write_json_fields(&mut out);
+        out.push('}');
+        out
+    }
+
     fn write_json(&self, out: &mut String) {
-        out.push_str("{\"code\":");
+        out.push('{');
+        self.write_json_fields(out);
+        out.push('}');
+    }
+
+    /// 花括号之间的字段(供 `to_json_line` 与 `to_json_line_with_sub` 共用)。
+    fn write_json_fields(&self, out: &mut String) {
+        out.push_str("\"code\":");
         json::write_string(out, self.code.as_ref());
         out.push_str(",\"severity\":");
         json::write_string(out, self.severity.as_str());
@@ -261,7 +289,7 @@ impl Diag {
             }
             cause.write_json(out);
         }
-        out.push_str("]}");
+        out.push(']');
     }
 
     /// 解析 [`Self::to_json_line`] 产生的单行 JSON。

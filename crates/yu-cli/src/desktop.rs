@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use yu_engine::engine::{Backend, Engine, EngineOptions};
 use yu_engine::project::Project;
-use yu_engine::{output, CliResult, Failure};
+use yu_engine::{CliResult, Failure};
 
 use crate::args::ArgReader;
 
@@ -85,25 +85,91 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let save_root = args.flag("save-root").map(PathBuf::from);
     args.finish()?;
 
+    // 统一控制台(Q1 R2/R4):日志/panic 防线必须早于 boot;JSONL 单写者
+    // 同时接门面行(sub:"log")与内核 Diag 行(sub:"diag")。
+    let mut log_warning: Option<String> = None;
+    let opened = match init_logging(log_file.as_deref())? {
+        LogFileInit::Opened(path, file) => Some((path, file)),
+        LogFileInit::Degraded(warning) => {
+            log_warning = Some(warning);
+            None
+        }
+    };
+    let console = yu_log::console::ConsoleHandle::new(yu_log::console::Console::stderr_live(
+        crate::logging::min_level(),
+        LOG_RECENT_CAP,
+        opened.as_ref().map(|(_, file)| file.clone()),
+    ));
+    // 日志文件打不开不许静默(旧代码在此静默禁用文件日志——Q1 自查 a 类);
+    // 但默认路径失败不挡运行,降级为「无文件日志」并 WARN 留痕。
     if cfg!(debug_assertions) {
-        output::error(
-            "yu-cli --mode desktop: debug build (VM/render 5–10x slower than release); \
-             use `cargo build --release -p yu-cli` for playable fps"
-                .to_string(),
+        console.emit_host(
+            yu_log::console::HostLevel::Warn,
+            "host",
+            "debug build (VM/render 5–10x slower than release); \
+             use `cargo build --release -p yu-cli` for playable fps",
+        );
+    }
+    if let Some(warning) = &log_warning {
+        console.emit_host(yu_log::console::HostLevel::Warn, "host", warning);
+    } else if let Some(reason) = yu_log::console::color_auto_off_reason() {
+        // 无文件时 auto 关色的原因也要有出处(契约:不允许静默无色)。
+        console.emit_host(
+            yu_log::console::HostLevel::Info,
+            "host",
+            &format!("color auto→off: {reason}"),
+        );
+    }
+    if let Some((log_path, file)) = &opened {
+        crate::logging::write_color_notice(file);
+        console.emit_host(
+            yu_log::console::HostLevel::Info,
+            "host",
+            &format!(
+                "log file {} (facade level {})",
+                log_path.display(),
+                std::env::var("YU_LOG").unwrap_or_else(|_| "warn(default)".to_string())
+            ),
+        );
+    }
+    yu_host_desktop::panic_guard::install();
+    // 门面桥共享同一个 Console 与 JSONL(单写者);失败 = 已被占用(进程内
+    // 重入),沿用现有 sink 但要留痕。
+    let facade_console = console.clone();
+    if yu_log::facade::init_with(
+        std::sync::Arc::new(move |level, target, message| {
+            facade_console.emit_facade(level, target, message);
+        }),
+        opened.as_ref().map(|(_, file)| file.clone()),
+    )
+    .is_none()
+    {
+        console.emit_host(
+            yu_log::console::HostLevel::Warn,
+            "host",
+            "log 门面已被占用,沿用现有 sink",
         );
     }
 
-    // 日志/panic 防线必须早于 boot:引擎/GPU 初始化期的 panic 也要留现场。
-    let log_path = init_logging(log_file.as_deref())?;
-    yu_host_desktop::panic_guard::install();
-    output::line(format!(
-        "yu-cli --mode desktop: log file {} (level {})",
-        log_path.display(),
-        std::env::var("YU_LOG").unwrap_or_else(|_| "warn(default)".to_string())
-    ));
-
     let project =
         Project::discover(Path::new(&root), data.as_deref()).map_err(|error| error.to_string())?;
+    // 决策分支留痕(减少排查时间):数据入口选了哪条、调试口径、帧率——
+    // 排查「为什么行为不同」时第一眼就要看的事实。
+    {
+        let dataset = project.describe();
+        console.emit_host(
+            yu_log::console::HostLevel::Info,
+            "host",
+            &format!(
+                "boot: entry={entry} data={}:{} ({} bytes) debug_mode={} fps={fps} backend={}",
+                dataset.kind,
+                dataset.path.display(),
+                dataset.bytes,
+                if debug_mode { "on" } else { "off" },
+                backend.as_str(),
+            ),
+        );
+    }
     let title = title.unwrap_or_else(|| {
         let name = project
             .root()
@@ -135,7 +201,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let mut engine = match Engine::new(project.clone(), options.clone()) {
         Ok(engine) => engine,
         Err(first) if backend == Backend::Wgpu => {
-            output::error(format!("--mode desktop: wgpu 启动失败({first});回退 soft"));
+            console.emit_host(
+                yu_log::console::HostLevel::Warn,
+                "host",
+                &format!("wgpu 启动失败({first});回退 soft"),
+            );
             options.backend = Backend::Soft;
             Engine::new(project, options).map_err(|error| error.to_string())?
         }
@@ -146,7 +216,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         match yu_host_desktop::SoundSink::open() {
             Ok(sink) => engine.attach_audio(Box::new(sink)),
             Err(error) => {
-                output::error(format!("[sound] 设备输出未启用: {error}"));
+                console.emit_host(
+                    yu_log::console::HostLevel::Warn,
+                    "sound",
+                    &format!("设备输出未启用: {error}"),
+                );
             }
         }
     }
@@ -168,48 +242,50 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             frame_stats,
             profile_frames,
             pump_cap,
+            console: Some(console),
         },
     )
     .map_err(|error| Failure::runtime(error))
 }
 
-/// 初始化 `yu-log` 门面桥,返回实际使用的 JSONL 路径。
+/// 桌面面板「日志」页签的环形缓冲容量(明文无色;清空只影响面板)。
+const LOG_RECENT_CAP: usize = 512;
+
+/// 初始化共享 JSONL 写者(Q1 R4)。
 ///
 /// 只在调用方没有显式设置 `YU_LOG_JSONL` 时填默认值(不覆盖用户的
-/// 环境语义);`--log-file` 优先于环境变量。
-fn init_logging(cli: Option<&Path>) -> Result<PathBuf, String> {
-    let path = match cli {
-        Some(path) => path.to_path_buf(),
-        None => match std::env::var("YU_LOG_JSONL") {
+/// 环境语义);`--log-file` 优先于环境变量。每轮截断:一次运行 = 一个现场。
+///
+/// 失败语义(Q1 自查 a 类,不许静默):
+/// - 显式 `--log-file` 打不开 = 硬失败(用户点名的路径,`Err` 上抛);
+/// - 缺省路径(环境变量/系统 TEMP)打不开 = [`LogFileInit::Degraded`]
+///   WARN 留痕后**无文件日志继续**(旧代码此处静默禁用文件日志,
+///   正是本任务要消灭的降级)。
+enum LogFileInit {
+    Opened(PathBuf, yu_log::console::JsonlFile),
+    /// 缺省路径打不开;载荷 = 给控制台的 WARN 文案。
+    Degraded(String),
+}
+
+fn init_logging(cli: Option<&Path>) -> Result<LogFileInit, String> {
+    let Some(path) = cli else {
+        let path = match std::env::var("YU_LOG_JSONL") {
             Ok(value) if !value.trim().is_empty() => PathBuf::from(value.trim()),
             _ => std::env::temp_dir().join("yu-cli-desktop.jsonl"),
-        },
+        };
+        return match crate::logging::open_jsonl_truncating(&path) {
+            Ok(file) => {
+                std::env::set_var("YU_LOG_JSONL", &path);
+                Ok(LogFileInit::Opened(path, file))
+            }
+            Err(open_error) => Ok(LogFileInit::Degraded(format!(
+                "{open_error};本运行不落文件日志(--log-file 可重定向)"
+            ))),
+        };
     };
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("创建日志目录 {} 失败: {e}", parent.display()))?;
-        }
-    }
-    // 每次启动截断:一次运行 = 一个现场,避免上一轮 panic 混进本轮证据。
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => output::error(format!(
-            "--mode desktop: 无法清理旧日志 {}: {error}",
-            path.display()
-        )),
-    }
-    std::env::set_var("YU_LOG_JSONL", &path);
-    if std::env::var_os("YU_LOG").is_none() {
-        std::env::set_var("YU_LOG", "warn");
-    }
-    let level = yu_log::facade::init(|line| output::error(line.to_string()));
-    if level.is_none() {
-        // 已有 logger(测试/进程内重入):保持现状,但至少把路径报出来。
-        output::error("--mode desktop: log 门面已被占用,沿用现有 sink");
-    }
-    Ok(path)
+    let file = crate::logging::open_jsonl_truncating(path)?;
+    std::env::set_var("YU_LOG_JSONL", path);
+    Ok(LogFileInit::Opened(path.to_path_buf(), file))
 }
 
 fn parse_opt<T>(args: &mut ArgReader, name: &str) -> Result<Option<T>, Failure>

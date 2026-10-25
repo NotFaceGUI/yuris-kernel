@@ -81,9 +81,28 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     };
     // 强制字体(诊断/换字体):忽略脚本的 NAME/NO/BNO。
     let force_font = args.flag("font").filter(|value| !value.trim().is_empty());
+    // Q1 日志收口:`--log-file` 落 JSONL(内核 Diag + 门面行,每轮截断);
+    // `--diag-summary off` 关闭末尾诊断汇总(用例流水线不想看时用)。
+    let log_file = args.flag("log-file").map(PathBuf::from);
+    let diag_summary = match args.flag("diag-summary") {
+        Some(value) => crate::logging::parse_on_off("diag-summary", &value)?,
+        None => true,
+    };
     args.finish()?;
 
+    // 统一控制台(Q1):headless 聚合不即印,末尾汇总;JSONL 可选。
+    let jsonl = match log_file.as_deref() {
+        Some(path) => Some(crate::logging::open_jsonl_truncating(path)?),
+        None => None,
+    };
+    if let Some(file) = &jsonl {
+        crate::logging::write_color_notice(file);
+    }
+    let mut console = yu_log::console::Console::stderr_aggregate(crate::logging::min_level(), jsonl);
+
     let project = Project::discover(Path::new(&root), data.as_deref())?;
+    // 数据入口决策留痕(stdout 报告行扩展;排查「行为为何不同」的第一事实)。
+    let dataset = project.describe();
     let opts = EngineOptions {
         backend,
         entry,
@@ -119,15 +138,22 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         }
     }
     if until_visible && !engine.last_report().drawable {
-        output::line(format!("warning: {limit} 帧内没有可绘制屏幕;渲染最后一帧"));
+        // 降级必须留痕(诊断/日志走 stderr,频道化前缀)。
+        output::error(format!(
+            "[run] {limit} 帧内没有可绘制屏幕;渲染最后一帧"
+        ));
     }
 
     let report = engine.last_report().clone();
     output::line(format!(
-        "engine: backend={} entry={} record_events={} boot_ms={:.2}",
+        "engine: backend={} entry={} record_events={} debug_mode={} data={}:{} ({} bytes) boot_ms={:.2}",
         engine.backend(),
         engine.entry(),
         if record_events { "on" } else { "off" },
+        if debug_mode { "on" } else { "off" },
+        dataset.kind,
+        dataset.path.display(),
+        dataset.bytes,
         engine.boot_ms()
     ));
     output::line(format!(
@@ -214,6 +240,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             path.display(),
             json.len()
         ));
+    }
+
+    // Q1 R2:末尾诊断汇总(挂号行带脚本 pc;频次降序;--diag-summary off 可关)。
+    if diag_summary {
+        crate::logging::print_diag_summary(&mut console, &mut engine);
     }
     Ok(())
 }

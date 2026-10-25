@@ -507,11 +507,11 @@ fn run_case(project: &Project, path: &Path, update: bool, debug_mode: bool) -> C
         Ok(true)
     } else {
         output::error(format!(
-            "case {}: frame={} ticks={} ops={} skipped={}",
+            "[case] {}: frame={} ticks={} ops={} skipped={}",
             spec.name, report.frame, ticks, report.ops, report.skipped
         ));
         for diff in diffs {
-            output::error(format!("  {diff}"));
+            output::error(format!("[case]   {diff}"));
         }
         Ok(false)
     }

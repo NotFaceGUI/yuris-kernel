@@ -64,8 +64,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         )));
     }
 
-    output::line(format!(
-        "dev: workspace={} engine={} profile={} port={} watch_files={}",
+    output::error(format!(
+        "[dev] workspace={} engine={} profile={} port={} watch_files={}",
         workspace.display(),
         engine_bin.display(),
         if release { "release" } else { "debug" },
@@ -93,8 +93,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     state.www_fingerprint = fingerprint(&collect_www_files(&state.workspace.join("www")));
     state.start_child()?;
     state.wait_healthy()?;
-    output::line(format!(
-        "dev ready: http://127.0.0.1:{}/ (改 Rust 会自动重建;Ctrl-C 退出)",
+    output::error(format!(
+        "[dev] ready: http://127.0.0.1:{}/ (改 Rust 会自动重建;Ctrl-C 退出)",
         state.port
     ));
 
@@ -137,7 +137,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             if let Some(stdin) = state.stdin.as_mut() {
                 let _ = stdin.write_all(b"reload\n");
                 let _ = stdin.flush();
-                output::line("dev: www changed -> reload");
+                output::error("[dev] www changed -> reload");
             }
         }
     }
@@ -197,8 +197,8 @@ impl Supervisor {
         let started = Instant::now();
         while started.elapsed() < HEALTH_TIMEOUT {
             if http_ok(self.port, "/healthz") {
-                output::line(format!(
-                    "dev: engine healthy in {:.0} ms",
+                output::error(format!(
+                    "[dev] engine healthy in {:.0} ms",
                     started.elapsed().as_secs_f64() * 1000.0
                 ));
                 return Ok(());
@@ -223,8 +223,8 @@ impl Supervisor {
     fn rebuild_and_restart(&mut self) -> CliResult<()> {
         let detected = Instant::now();
         self.builds += 1;
-        output::line(format!(
-            "dev: change detected (#{}) -> rebuild",
+        output::error(format!(
+            "[dev] change detected (#{}) -> rebuild",
             self.builds
         ));
         self.stop_child();
@@ -244,7 +244,7 @@ impl Supervisor {
             .map_err(|e| Failure::runtime(format!("调用 cargo 失败: {e}")))?;
         if !status.success() {
             output::error(format!(
-                "dev: 构建失败(status {});保持当前页面,修正后再次修改触发重试",
+                "[dev] 构建失败(status {});保持当前页面,修正后再次修改触发重试",
                 status.code().unwrap_or(-1)
             ));
             // 重新拉起旧二进制,避免服务完全消失。
@@ -256,8 +256,8 @@ impl Supervisor {
         self.start_child()?;
         self.wait_healthy()?;
         let total_ms = detected.elapsed().as_secs_f64() * 1000.0;
-        output::line(format!(
-            "dev: rebuilt + restarted in {:.0} ms (build {:.0} ms)",
+        output::error(format!(
+            "[dev] rebuilt + restarted in {:.0} ms (build {:.0} ms)",
             total_ms, build_ms
         ));
         Ok(())
@@ -309,7 +309,11 @@ fn collect_watch_files(workspace: &Path) -> CliResult<Vec<PathBuf>> {
 
 fn collect_www_files(www: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    let _ = walk(www, &mut files, false);
+    // www 树遍历失败不能再吞:指纹恒空 ⇒ www 变更永远不触发 reload,
+    // 页面改动静默失效(Q1 自查 a 类,S4 原挂号项)。
+    if let Err(error) = walk(www, &mut files, false) {
+        output::error(format!("[dev] www 遍历失败({error}):HMR 的 www 变更检测失效"));
+    }
     files.sort();
     files
 }

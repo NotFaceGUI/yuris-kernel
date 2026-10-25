@@ -7,64 +7,90 @@ use yu_cli::build_info;
 use yu_cli::{output, CliResult, Failure, EXIT_FAIL};
 
 fn main() {
+    // 统一控制台(Q1):启动时刻戳先行,日志行才有 `[  +s]` 前缀。
+    yu_log::console::init_process_start();
     // log 门面桥(P4 M-E):先于任何引擎/依赖初始化;级别见 YU_LOG。
-    // `--log-level X` 是全局参数,先摘出来再交给子命令(子命令不认它)。
+    // `--log-level X` 是全局参数,先摘出来再交给子命令(子命令不认它);
+    // `--color on|off|auto` 同为全局参数(auto 时按 NO_COLOR/CLICOLOR_FORCE/
+    // stderr 终端检测解析)。
     let mut tokens: Vec<String> = std::env::args().skip(1).collect();
-    match extract_log_level(&mut tokens) {
-        Ok(Some(level)) => std::env::set_var("YU_LOG", level),
-        Ok(None) => {}
+    match extract_globals(&mut tokens) {
+        Ok(()) => {}
         Err(message) => {
-            output::error(format!("yu-cli: {message}"));
+            output::error(format!("[yu-cli] {message}"));
             std::process::exit(EXIT_FAIL);
         }
     }
-    // `run --mode desktop` 由桌面模式自建 log 门面:门面在 init 时读
-    // `YU_LOG_JSONL` 接管 JSONL 文件,这里先 init 会把文件 sink 挤掉
-    // (旧 yu-desktop 是独立进程,不存在此问题)。其余路径在此统一接管。
+    // `run --mode desktop` 由桌面模式自建 log 门面与共享 JSONL 写者:门面在
+    // init 时接管桌面模式打开的文件(与内核 Diag 同一个 `JsonlFile`,
+    // Q1 R4 单写者契约)。其余路径在此统一接管。
     if !desktop_run(&tokens) {
-        yu_log::facade::init(|line| output::error(line));
+        yu_log::facade::init(std::sync::Arc::new(yu_log::console::facade_line_to_stderr));
     }
     let code = match dispatch(tokens) {
         Ok(()) => 0,
         Err(failure) => {
-            output::error(format!("yu-cli: {}", failure.message));
+            output::error(format!("[yu-cli] {}", failure.message));
             failure.exit
         }
     };
     std::process::exit(code);
 }
 
-/// 从参数里摘出 `--log-level X` / `--log-level=X`(全局,任意位置可用)。
-fn extract_log_level(tokens: &mut Vec<String>) -> Result<Option<String>, String> {
-    let mut found = None;
+/// 从参数里摘出全局旗标(任意位置可用;子命令不认识它们):
+/// `--log-level quiet|error|warn|info|debug|trace` → `YU_LOG`,
+/// `--color on|off|auto` → 控制台颜色覆盖。
+fn extract_globals(tokens: &mut Vec<String>) -> Result<(), String> {
+    let mut log_level: Option<String> = None;
+    let mut color: Option<bool> = None;
     let mut i = 0;
     while i < tokens.len() {
-        let token = tokens[i].as_str();
-        let value = if token == "--log-level" {
+        let (name, value, consumed_next) = if tokens[i] == "--log-level" || tokens[i] == "--color" {
+            let name = tokens[i].trim_start_matches('-').to_string();
             if i + 1 >= tokens.len() {
-                return Err("--log-level 需要一个值:error|warn|info|debug|trace".to_string());
+                return Err(format!("--{name} 需要一个值"));
             }
-            let value = tokens[i + 1].clone();
-            tokens.drain(i..=i + 1);
-            value
-        } else if let Some(rest) = token.strip_prefix("--log-level=") {
-            let value = rest.to_string();
-            tokens.remove(i);
-            value
+            (name, tokens[i + 1].clone(), true)
+        } else if let Some(rest) = tokens[i].strip_prefix("--log-level=") {
+            ("log-level".to_string(), rest.to_string(), false)
+        } else if let Some(rest) = tokens[i].strip_prefix("--color=") {
+            ("color".to_string(), rest.to_string(), false)
         } else {
             i += 1;
             continue;
         };
-        match value.trim().to_ascii_lowercase().as_str() {
-            "error" | "warn" | "info" | "debug" | "trace" => found = Some(value.trim().to_string()),
+        tokens.drain(i..=i + if consumed_next { 1 } else { 0 });
+        match name.as_str() {
+            "log-level" => log_level = Some(value),
+            _ => match value.trim().to_ascii_lowercase().as_str() {
+                "on" | "always" => color = Some(true),
+                "off" | "never" => color = Some(false),
+                "auto" => color = None,
+                other => {
+                    return Err(format!(
+                        "--color 只接受 on|off|auto,收到 `{other}`"
+                    ))
+                }
+            },
+        }
+    }
+    if let Some(level) = log_level {
+        let level = level.trim().to_ascii_lowercase();
+        match level.as_str() {
+            "quiet" | "error" | "warn" | "info" | "debug" | "trace" => {
+                std::env::set_var("YU_LOG", level);
+            }
             other => {
                 return Err(format!(
-                    "--log-level 只接受 error|warn|info|debug|trace,收到 `{other}`"
+                    "--log-level 只接受 quiet|error|warn|info|debug|trace,收到 `{other}`"
                 ))
             }
         }
     }
-    Ok(found)
+    if let Some(on) = color {
+        yu_log::console::set_color_override(on);
+    }
+    Ok(())
 }
 
 /// 命令行是否为 `run --mode desktop`(桌面模式自己接管 log 门面)。
@@ -172,8 +198,13 @@ yu-cli · 桌面唯一入口(headless + --mode desktop)+ 本地服务 + 用例�
   help    本总览,或逐命令 help
 
 全局参数:
-  --log-level error|warn|info|debug|trace   覆盖 YU_LOG(默认 warn);
-                                            也可 --log-level=X 形式。
+  --log-level quiet|error|warn|info|debug|trace   覆盖 YU_LOG(默认 info:
+                  内核挂号/生命周期行默认可见;quiet 压掉生命周期 Info);
+                  也可 --log-level=X 形式。
+  --color on|off|auto   控制台颜色(默认 auto:stderr 非终端时自动关并
+                  在文件日志留原因;显式 on|off 优先于环境;
+                  CLICOLOR_FORCE=1 强制 on,NO_COLOR 非空强制 off)。
+                  也可 --color=X 形式。
 
 数据入口(唯一约定):
   <project-root>/data.ypf 优先;否则 <project-root>/data/;
@@ -212,6 +243,9 @@ headless 专有(缺省模式):
   --record-events on|off  事件录制(缺省 off;对拍时 on)
   --font FAMILY        强制字体(诊断/换字体;忽略脚本的 NAME/NO/BNO,
                        family 查不到 = 硬失败;全角/半角与空格差异自动折叠)
+  --log-file PATH      JSONL 日志(内核 Diag sub=diag + 门面行 sub=log;
+                       每轮截断)
+  --diag-summary on|off  末尾诊断汇总(缺省 on;off 时 stderr 不出诊断行)
 
 desktop 专有(--mode desktop;需默认 feature 构建):
   --width N  --height N  --fps N   窗口尺寸与帧率(缺省 60fps)
@@ -246,12 +280,13 @@ yu-cli serve · 本地服务:服务端读数据并执行内核,浏览器只做�
   yu-cli serve <project-root> [--backend soft|wgpu] [--port 4173] [--no-open]
                [--entry LABEL] [--fps 60] [--record-events on|off]
                [--debug-mode on|off] [--data PATH] [--www DIR] [--diag-ws]
-               [--font FAMILY]
+               [--font FAMILY] [--log-file PATH]
 
 说明:
   启动后打印 http://127.0.0.1:<port>/,默认打开浏览器。
   WebSocket /ws:帧下发 + 输入/控制;SSE /events:HMR reload。
   --diag-ws 额外开 /diag 通道(500ms 推诊断快照:等待任务/挂号表/域计数)。
+  --log-file JSONL 日志(内核 Diag + 门面行;每轮截断;关闭时打汇总)。
   服务端读数据并执行内核;浏览器不下载整包。
 ";
 

@@ -315,3 +315,99 @@ detail 写清"未识别的域/子命令 + 实际名字"。第三条维持现状�
 **建议的检查**:写个测试,断言夹具 `default_commands()` 里每个命令的
 参数个数与名字**与真实语料 `ysc.ybn` 一致**(现在只有部分命令对得上)。
 这条能一次性暴露所有夹具失真。
+
+---
+
+# §7 Q1 自查结果(2026-10-25,任务书 task-q1-logging 硬性要求)
+
+> 方法:全仓 `crates/*/src` grep 扫描(模式:`let _ =`、`_ => {}`、
+> `unwrap_or(`/`_default`、`.ok()`、`if let Ok(` 无 else、drain/take/clear
+> 丢弃、`_CAP` 截断、feature 关闭回退、宿主缺位空实现),逐处三分类:
+> **a) 需要日志(已补)** / **b) 良性静默(已注释自证)** /
+> **c) 范围外(挂号待排期,未顺手改语义)**。a 类合计 8 处。
+> 判定基准 = silent-handling §4 三问:不写探针就能从控制台/JSONL 回答
+> 「哪条脚本哪个 pc、为什么、几次几个位置」。
+
+## 7.1 总量与分类计数
+
+| 模式 | 命中(src,非测试) | a(补日志/计数) | b(注释自证) | c(转台账) |
+|---|---:|---:|---:|---:|
+| `let _ =` | 82 | 3 处(dev walk、facade JSONL、engine drain/CAP 计数) | 已抽样注释 4 处代表性点位 | 余下皆为 IO 尽力而为/清理路径(见 7.4) |
+| `_ => {}` | 25 | 0(未发现行为分歧型) | 4 处补注释 | 6 处进 S5 原清单口径 |
+| `unwrap_or(_default)`(yu-rt/yu-gfx) | 162 未标注 | 0(S3 逐条分类未做,不顺手改语义) | — | 162 处锁进守卫白名单(只许减不许增) |
+| `.ok()` | 56 | 2 处(YU_LOG_JSONL 打开失败静默禁用文件日志;desktop 缺省 JSONL 路径打不开静默无文件日志——终验时新抓到) | 余为探测/锁/解析兜底 | — |
+| drain/take/clear + CAP | 6 处关键 | 3 处(SOUND_DIAG_CAP、drain_diags、serve 无订阅者排空 → 全部显式计数) | — | S6(截断区间记账)维持原排期 |
+| 宿主缺位 | §6 现象 | 0 | 既有 `report_unimplemented` 已挂号 | 「host.missing 且中止」维持待排期 |
+
+## 7.2 a 类处置明细(本轮已落地)
+
+| 位置 | 原行为 | 处置 |
+|---|---|---|
+| `yu-cli/src/dev.rs` `collect_www_files` | www 树遍历失败被吞 ⇒ HMR 变更检测静默失效 | `[dev] www 遍历失败(…)` stderr 行 |
+| `yu-log/src/facade.rs` `init` | `YU_LOG_JSONL` 打开失败 ⇒ 文件日志静默禁用 | 控制台 WARN 一行(路径+错误)后继续 |
+| `yu-engine` `SOUND_DIAG_CAP` 半量丢弃 | 丢一半声音诊断无痕迹 | `sound_diags_dropped` 计数;进 `DiagReport.sound_diags_dropped` 与 serve 关闭行 |
+| `yu-engine` `drain_diags` | 无痕清空 | `drained_diags` 计数(`Engine::diags_drained`) |
+| `yu-cli/src/server.rs` 无 `/diag` 订阅者 | 每帧 drain 丢弃 | drain 计数 + shutdown 时 `drained_diags/sound_diags_dropped` 汇总行 |
+| `yu-cli/src/desktop.rs` `init_logging`(终验时新抓到) | 缺省 JSONL 路径打不开 ⇒ **静默无文件日志继续跑**(旧 `facade::init` 的 `.ok()` 链) | 三态:显式 `--log-file` 失败=硬失败;缺省失败=WARN 一行后无文件继续;面板 auto 关色原因在无文件时也走控制台 |
+| `yu-log` `ConsoleHandle`/`JsonlFile`(复审新抓到) | `Mutex::lock()` 用 `if let Ok` ⇒ 一次 panic 中毒后**所有后续日志静默消失** | 恢复式取锁(`unwrap_or_else(poisoned→into_inner)`),与引擎声音锁 H-P1-01 同型;诊断消息中的路径改 `{:?}`(NUL/空白现形) |
+
+另:**S1 并入本任务已完成**(原 §1,本文件最高优先项)——
+`FrameDiag.at: Vec<DiagAt>`(上限 8,超出进 `at_more` 显式计数),key 聚合
+不再丢位置;`DomainCall` 的 `script/pc` 在 gfx 消费现场注入;frame JSON
+位置段只在非空时出现(空帧 JSON 逐字节不变)。实测锚点:
+ERIS 120 帧 `game_diag_probe` 输出
+`gfx.texture.missing x612 at s66 pc245,s66 pc263,s66 pc264,s0 pc1800,…`
+(S1 原验收要求的 `s66 pc…` 级定位,无需挂宿主探针)。
+
+## 7.3 b 类代表性注释点(其余同类按同一口径自证)
+
+- `yu-rt/src/vm/handlers.rs` NoopEval `let _ = self.eval_window(...)`:Err 在
+  eval_window 内部已挂号,此处丢弃的是已报告的返回值;
+- `yu-rt/src/vm.rs` `report()`:`MemorySink::emit` 只做 Vec::push 不会失败;
+- `yu-gfx/src/state.rs` on_event 非 Graphics/Window 域:分域消费设计,
+  事件只消费一次,gfx 不看 sound/save/system 域;
+- `yu-cli/src/server.rs` SSE 订阅管道 `tx.send(())`:订阅端已断开发送失败
+  是常态,无读者可报告。
+
+## 7.4 c 类(转台账待排期;未顺手改语义)
+
+1. **S3(162 处 unwrap_or 逐条分类)**:守卫已挂
+   (`yu-cli/tests/logging_guards.rs::silent_fallback_audit`,按
+   文件→计数白名单锁定 2026-10-25 快照;新增未标注 = 测试红)。分类推进
+   后把白名单同步下调。快照:expr 1 / input 9 / sysvar 15 / sysvar_abi 2 /
+   task 3 / value 4 / vm 4 / ycd 1 / handlers 103 / gfx op 2 / gfx state 18。
+2. **S5 空分支**:本轮新发现 3 处同类——`rt/handlers.rs:2371`(SYSINFO 未知
+   窗口槽)、`rt/handlers.rs:3237`(DINT 非 INT/FLT 槽)、`rt/handlers.rs:4202`
+   (未知 LET 下标槽);连同原 S5 清单一起排期。
+3. **S6 截断区间记账**:gfx MAX_OP_LOG/文本绘制上限/DECODE_CACHE_CAP 的
+   「丢了哪些 seq 区间」仍未记;本轮只让 engine 层两个 CAP 有了计数。
+4. **save/gfx 诊断位置粒度**:`sv.*` 诊断的 `where` 是 `sv@frameN`(帧号),
+   同码跨帧聚合成多条;待 save 域接入脚本 pc 后统一(依赖 S1 同款注入,
+   机制已就绪)。
+5. **(已完成 2026-10-25 复审)桌面宿主宏行**:`install_host_console`
+   进程级注入槽 + `host_line!/host_error!/host_fatal!` 三级宏,44 处
+   全部走统一格式与 JSONL;槽未安装时退化纯 `[host]` stderr 行。
+6. **info_query 三个测试失败(既有)**:`windowinfo_answers_main_geometry` /
+   `fontinfo_answers_current_style_fields` / `fontinfo_unset_fields_are_not_fabricated`
+   —— DEMO-PLAY2 实现 WINDOWINFO/FONTINFO 读侧后测试未跟上(HEAD 干净
+   副本同样失败,与本轮无关);需按新行为重写断言。
+7. **`cases/*.json` golden 落后**(既有):9/9 FAIL 在 HEAD 干净副本复现
+   (actual sha 与本轮构建逐字节一致 ⇒ 非本轮引入);demo 修复
+   (62f9898)后的行为需要主人实机确认后 `--update` 重生成。
+
+## 7.5 本轮验证锚点(真实语料 ERIS;`D:\Art\ai\games` 不存在,<game-a>
+f86 场景无法复现,以 ERIS 主语料等价机制验证)
+
+```text
+yu-cli run <eris> --frames 120
+  → stderr 汇总:UNIMP [gfx] gfx.param.nonvisual @ s0 pc2148 x39546(频次降序,带 pc 与计数)
+  → --diag-summary off:stderr 0 行
+  → YU_LOG=quiet:INFO 级行 0(汇总同受门槛)
+  → --log-file:sub=diag x1232 + sub=log x1,逐行 JSON 字段齐全
+yu-cli run --mode desktop --frames 5 --no-sound --log-file …
+  → 内核挂号行默认上屏(UNIMP/WARN/INFO 带时间戳/频道/位置)
+  → 门面行统一格式([log-facade],多行逐行包色)
+  → 同一 JSONL 双流:577 diag + 14 log(单写者)
+颜色:--color on 强制出 ANSI(黄 \x1b[33m 实测);NO_COLOR=1 强制关;
+      auto(重定向)关并在 JSONL 留原因行
+守卫:cargo test -p yu-cli --test logging_guards → 3/3 绿

@@ -117,5 +117,23 @@ fn run() -> Result<(), String> {
         engine.textures_decoded(),
         engine.textures_cached()
     );
+
+    // S1(todo-silent-handling):gfx 帧诊断按「码 + 位置列表」输出——
+    // `region.partial @ s66 pc6028` 级别的定位必须直接可见,不再需要
+    // 挂宿主探针反查 pc。最后一帧 + 全程累计两张口径都给。
+    println!("-- gfx frame diagnostics (last frame) --");
+    for d in engine.frame_diagnostics() {
+        let at = d.at_display();
+        println!("  {:<44} x{:<5} at {}", d.code, d.count, if at.is_empty() { "-".to_string() } else { at });
+        println!("         {}", d.detail.chars().take(150).collect::<String>());
+    }
+    println!("-- gfx frame diagnostics (totals, x count desc) --");
+    let mut totals = engine.take_frame_diag_totals();
+    totals.sort_by_key(|(_, total)| std::cmp::Reverse(*total));
+    for (d, total) in totals.iter().take(30) {
+        let at = d.at_display();
+        println!("  {:<44} x{:<5} at {}", d.code, total, if at.is_empty() { "-".to_string() } else { at });
+        println!("         {}", d.detail.chars().take(150).collect::<String>());
+    }
     Ok(())
 }

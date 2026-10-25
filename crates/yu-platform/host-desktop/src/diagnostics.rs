@@ -338,9 +338,17 @@ pub struct DiagnosticsHost {
     frame_unimplemented: Vec<(String, u64)>,
     last_snapshot: Diagnostics,
     last_engine_frame: u64,
+    /// 统一控制台(Q1 R2):同一次 drain 两路消费——面板聚合 + 控制台行;
+    /// `None` = 旧行为(只进面板;测试/嵌入)。
+    console: Option<yu_log::console::ConsoleHandle>,
 }
 
 impl DiagnosticsHost {
+    /// 注入统一控制台(桌面宿主启动时一次;重启重建账本后须重注)。
+    pub fn set_console(&mut self, console: Option<yu_log::console::ConsoleHandle>) {
+        self.console = console;
+    }
+
     /// 每宿主帧一次:取走引擎与声音诊断、聚合 skipped、更新卡住判定。
     pub fn observe(&mut self, engine: &mut Engine, surface: &[u8], host_frame: u64) {
         let report = engine.last_report().clone();
@@ -352,6 +360,19 @@ impl DiagnosticsHost {
         diags.extend(engine.take_sound_diags());
         // 存档域诊断(P4 M-C 的 `sv.*`;未接 SaveHost 时为空)。
         diags.extend(engine.take_save_diags());
+        // Q1 R2:同一次 drain 两路消费——控制台行(统一格式/聚合/JSONL)
+        // 与面板聚合互不影响。gfx 帧诊断(S1:带脚本位置)同源出行。
+        if let Some(console) = &self.console {
+            for diag in &diags {
+                console.emit_diag(diag);
+            }
+            for frame_diag in engine.frame_diagnostics() {
+                console.emit_diag_counted(
+                    &yu_engine::engine::frame_total_to_diag(&frame_diag),
+                    frame_diag.count as u64,
+                );
+            }
+        }
         let frame_unimplemented = self.ledger.ingest(report.frame, diags);
 
         let (skips, missing, skipped_text) = skip_totals(engine);

@@ -43,7 +43,7 @@ pub use sound_device::SoundSink;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use egui_wgpu::ScreenDescriptor;
@@ -65,13 +65,36 @@ use crate::diagnostics::DiagnosticsHost;
 use crate::panic_guard::{CloseAction, Phase};
 use crate::script::{ScriptAction, ScriptRunner};
 
-// 宿主日志与终端输出统一走 `yu_engine::output`(项目纪律:src 内不直接
-// `println!/eprintln!`)。
-macro_rules! host_error {
-    ($($arg:tt)*) => { yu_engine::output::error(format!($($arg)*)) };
+// 宿主日志:与 `yu_log::console` 统一格式合流(Q1 复审,主人 2026-10-25
+// 指出的「未对齐格式」即本处)。宏看不到 self,经进程级**注入槽**取
+// `run()` 安装的 ConsoleHandle;未安装(极早期/嵌入/测试)退化为纯
+// `[host] …` stderr 行——凡宿主行必带频道。A3 注:这是宿主运维层元数据
+// 槽(同 `console::STARTED`/`build_info` 一类),内核语义不读取。
+static HOST_CONSOLE: OnceLock<yu_log::console::ConsoleHandle> = OnceLock::new();
+
+/// 宿主启动时安装统一控制台(`run()` 最先调用;重复安装是温和 no-op)。
+pub fn install_host_console(handle: yu_log::console::ConsoleHandle) {
+    let _ = HOST_CONSOLE.set(handle);
 }
+
+fn host_emit(level: yu_log::console::HostLevel, message: String) {
+    match HOST_CONSOLE.get() {
+        Some(console) => console.emit_host(level, "host", &message),
+        None => yu_engine::output::error(format!("[host] {message}")),
+    }
+}
+
+/// 生命周期/进度行(Info,绿)。
 macro_rules! host_line {
-    ($($arg:tt)*) => { yu_engine::output::line(format!($($arg)*)) };
+    ($($arg:tt)*) => { host_emit(yu_log::console::HostLevel::Info, format!($($arg)*)) };
+}
+/// 注意/警告行(Warn,黄)。
+macro_rules! host_error {
+    ($($arg:tt)*) => { host_emit(yu_log::console::HostLevel::Warn, format!($($arg)*)) };
+}
+/// 致命/冻结行(Error,红):fail()、panic 冻结等不可继续场景。
+macro_rules! host_fatal {
+    ($($arg:tt)*) => { host_emit(yu_log::console::HostLevel::Error, format!($($arg)*)) };
 }
 
 /// Windows 定时器粒度(实测:P1 固定节拍已改为 `next_frame += 1/fps`,
@@ -182,6 +205,9 @@ pub struct HostOptions {
     /// 每任务每次泵的命令上限(脚本突发兜底;`None` = 官方同构无限泵)。
     /// 开启会让长脚本跨帧续跑(DIV-HOST-002),默认关闭。
     pub pump_cap: Option<usize>,
+    /// 统一控制台(Q1 R2):宿主 observe 的诊断同步出控制台行(与 egui
+    /// 面板同源、两路消费);`None` = 保持旧只进面板行为(测试/嵌入)。
+    pub console: Option<yu_log::console::ConsoleHandle>,
 }
 
 impl Default for HostOptions {
@@ -201,6 +227,7 @@ impl Default for HostOptions {
             frame_stats: None,
             profile_frames: BTreeSet::new(),
             pump_cap: None,
+            console: None,
         }
     }
 }
@@ -210,6 +237,10 @@ impl Default for HostOptions {
 /// panic 防线在 `run()` 里安装(进程级 hook),早于任何窗口/GPU 调用:
 /// 这样 wgpu/winit 初始化期的 panic 也走同一条日志路径。
 pub fn run(engine: Engine, opts: HostOptions) -> Result<(), String> {
+    // 统一控制台先行:此后一切 host 行(宏)都走统一格式+JSONL。
+    if let Some(console) = &opts.console {
+        install_host_console(console.clone());
+    }
     panic_guard::install();
     // 定时器粒度必须在事件循环启动前抬高(见 `timer_resolution`)。
     let timer = timer_resolution::raise();
@@ -619,6 +650,8 @@ struct App {
     last_keyboard_activity_ms: u64,
     /// 诊断账本(挂号表 / skipped / 输入计数 / 卡住判定)。
     diagnostics: DiagnosticsHost,
+    /// 统一控制台(Q1;重启重建账本后要重新注入,所以 App 也持有一份)。
+    console: Option<yu_log::console::ConsoleHandle>,
     /// 被防线接住的 panic;`Some` = 引擎冻结,只出横幅。
     freeze: Option<panic_guard::Freeze>,
     /// 场景脚本(复现用;`None` = 正常交互)。
@@ -645,7 +678,7 @@ struct App {
 }
 
 impl App {
-    fn new(mut engine: Engine, opts: HostOptions) -> Result<Self, String> {
+    fn new(mut engine: Engine, mut opts: HostOptions) -> Result<Self, String> {
         let egui_ctx = egui::Context::default();
         install_debug_fonts(&egui_ctx);
         // 桌面宿主按固定两帧的步进推进逻辑:长帧后不再一次性跑 500ms
@@ -679,13 +712,16 @@ impl App {
                 runner.frames
             );
         }
+        // 统一控制台(Q1 R2):账本与 App 各持一份句柄(重启重建账本后重注)。
+        let console = opts.console.take();
+        let mut diagnostics = DiagnosticsHost::default();
+        diagnostics.set_console(console.clone());
         Ok(Self {
             engine,
             opts,
             viewport: (viewport.width, viewport.height),
             window: None,
-            presenter: None,
-            egui_ctx,
+            presenter: None,            egui_ctx,
             egui_state: None,
             egui_renderer: None,
             last_surface: None,
@@ -702,7 +738,8 @@ impl App {
             cursor_icon: None,
             last_mouse_activity_ms: 0,
             last_keyboard_activity_ms: 0,
-            diagnostics: DiagnosticsHost::default(),
+            diagnostics,
+            console,
             freeze: None,
             script,
             show_attention: true,
@@ -718,7 +755,7 @@ impl App {
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, message: String) {
-        host_error!("yu-desktop: {message}");
+        host_fatal!("yu-desktop: {message}");
         self.fatal = Some(message);
         self.stopping = true;
         event_loop.exit();
@@ -777,7 +814,7 @@ impl App {
             );
             return;
         }
-        host_error!(
+        host_fatal!(
             "yu-desktop: PANIC 捕获 phase={} frame={} engine_frame={} msg={} at {}",
             record.phase.as_str(),
             record.host_frame,
@@ -1079,6 +1116,7 @@ impl App {
                     Ok(()) => {
                         // 重启 = 新运行代际:清空账本与冻结(现场已写日志)。
                         self.diagnostics = DiagnosticsHost::default();
+                        self.diagnostics.set_console(self.console.clone());
                         if let Some(freeze) = self.freeze.take() {
                             host_line!(
                                 "yu-desktop: restart 已恢复冻结运行(原 panic: {})",
@@ -1286,8 +1324,19 @@ impl App {
             mouse_time_ms,
             cursor_visible,
             show_attention: self.show_attention,
+            log_lines: self
+                .console
+                .as_ref()
+                .map(|c| c.recent_snapshot())
+                .unwrap_or_default(),
         };
-        ui::debug_window(ctx, &snapshot)
+        let actions = ui::debug_window(ctx, &snapshot);
+        if actions.clear_log {
+            if let Some(console) = &self.console {
+                console.clear_recent();
+            }
+        }
+        actions
     }
 
     /// 卡住横幅的触发条件(不是 panic;引擎仍在跑,只是不推进)。
@@ -2038,7 +2087,8 @@ impl ApplicationHandler for App {
         self.flush_input_latency();
         if self.frames <= 8 || self.frames.is_multiple_of(60) {
             let report = self.engine.last_report();
-            host_error!(
+            // 周期采样是进度不是警告:INFO(绿);spike 另走 host_error!(WARN)。
+            host_line!(
                 "frame {}: host_tick={tick_host_ms:.1}ms engine_tick={:.1}ms engine_render={:.1}ms draw={draw_ms:.1}ms",
                 self.frames, report.tick_ms, report.render_ms
             );

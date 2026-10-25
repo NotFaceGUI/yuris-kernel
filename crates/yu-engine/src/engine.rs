@@ -5,7 +5,7 @@
 //! = headless 静音。
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -216,6 +216,40 @@ pub struct DiagReport {
     pub load_calls: u64,
     pub saveend_calls: u64,
     pub fileact_calls: u64,
+    /// 声音诊断缓冲被上限截掉的累计条数(显式计数;正常运行为 0)。
+    pub sound_diags_dropped: u64,
+}
+
+/// gfx 帧诊断的跨帧累计行(`take_frame_diag_totals` 的内部形态)。
+struct FrameDiagTotal {
+    severity: &'static str,
+    total: u64,
+    at: Vec<yu_gfx::DiagAt>,
+    at_more: u64,
+}
+
+/// 把 gfx 帧诊断(含 S1 位置)转成统一格式的 `Diag`,供控制台/汇总与
+/// 桌面面板同源消费(yu-cli 与 host-desktop 共用,不经 yu-cli 中转)。
+pub fn frame_total_to_diag(frame_diag: &yu_gfx::FrameDiag) -> yu_log::Diag {
+    let severity = yu_log::Severity::parse_str(frame_diag.severity)
+        .unwrap_or(yu_log::Severity::Recoverable);
+    let where_ = match frame_diag.at.first() {
+        Some(at) => yu_log::Loc::script(at.script.clone(), None, at.pc, at.cmd.clone()),
+        None => yu_log::Loc::None,
+    };
+    let detail = if frame_diag.command.is_empty() {
+        frame_diag.detail.clone()
+    } else {
+        format!("{}: {}", frame_diag.command, frame_diag.detail)
+    };
+    yu_log::Diag {
+        code: std::borrow::Cow::Owned(frame_diag.code.clone()),
+        severity,
+        boundary: yu_log::Boundary::Domain,
+        where_,
+        detail,
+        causes: Vec::new(),
+    }
 }
 
 enum Renderer {
@@ -345,6 +379,14 @@ pub struct Engine {
     save_host: Option<SaveHost>,
     /// 已从声音宿主取走的诊断（`take_sound_diags` 的暂存）。
     sound_diags: Vec<yu_log::Diag>,
+    /// 声音诊断缓冲超过 [`SOUND_DIAG_CAP`] 被丢弃的条数(显式计数,
+    /// 不静默丢;Q1 自查 a 类)。
+    sound_diags_dropped: u64,
+    /// 无消费者时被 [`Engine::drain_diags`] 排空的诊断条数(serve 无
+    /// `/diag` 订阅者场景;回答「丢了几条」,不再无痕丢弃)。
+    drained_diags: u64,
+    /// 全程 gfx 帧诊断累计(跨帧聚合;headless 末尾汇总用,Q1 R2)。
+    frame_diag_totals: BTreeMap<(String, String, String), FrameDiagTotal>,
     /// 平台音频出口(宿主经 [`Engine::attach_audio`] 注入;`None` = 静音)。
     audio: Option<Box<dyn AudioOut>>,
     /// 实时墙钟：`serve` 的 `tick_realtime` 用它推进逻辑/声音时间。
@@ -454,6 +496,9 @@ impl Engine {
             sound,
             save_host,
             sound_diags: Vec::new(),
+            sound_diags_dropped: 0,
+            drained_diags: 0,
+            frame_diag_totals: BTreeMap::new(),
             audio: None,
             realtime_last: Instant::now(),
             max_step_ms: DEFAULT_MAX_STEP_MS,
@@ -685,6 +730,7 @@ impl Engine {
             if self.sound_diags.len() > SOUND_DIAG_CAP {
                 let drop = self.sound_diags.len() / 2;
                 self.sound_diags.drain(..drop);
+                self.sound_diags_dropped += drop as u64;
             }
         }
         self.frame = self.frame.saturating_add(1);
@@ -739,6 +785,7 @@ impl Engine {
             ms: tick_ms + render_ms,
             drawable,
         };
+        self.accumulate_frame_diags(&frame);
         self.last_frame = Some(frame);
         self.last_surface = Some(Arc::clone(&surface));
         self.last_report = out.clone();
@@ -909,11 +956,78 @@ impl Engine {
     /// `serve` 在没有 `/diag` 订阅者时用这个低成本排空:只清内核/声音
     /// 缓冲,不构造 [`DiagReport`] 的字符串 JSON。
     pub fn drain_diags(&mut self) {
-        if let Some(vm) = self.vm.as_mut() {
-            vm.clear_diags();
-        }
+        // Q1 自查(a 类):排空也要留痕——丢了几条必须可回答,
+        // 不再无痕丢弃(计数经 [`Engine::diags_drained`] 读出)。
+        self.drained_diags += self.take_diags().len() as u64;
+        self.drained_diags += self.take_save_diags().len() as u64;
+        self.drained_diags += self.sound_diags.len() as u64;
         self.sound_diags.clear();
-        let _ = self.take_save_diags();
+    }
+
+    /// 无消费者排空的诊断累计条数(serve 状态行/汇总用)。
+    pub fn diags_drained(&self) -> u64 {
+        self.drained_diags
+    }
+
+    /// 声音诊断缓冲被上限截掉的条数(显式计数,不静默丢)。
+    pub fn sound_diags_dropped(&self) -> u64 {
+        self.sound_diags_dropped
+    }
+
+    /// 最后一帧的 gfx 帧诊断(S1:带 `at` 位置;桌面面板/控制台同源消费)。
+    pub fn frame_diagnostics(&self) -> Vec<yu_gfx::FrameDiag> {
+        self.last_frame
+            .as_ref()
+            .map(|frame| frame.diagnostics.clone())
+            .unwrap_or_default()
+    }
+
+    /// 全程 gfx 帧诊断累计(跨帧聚合;headless 末尾汇总用)。
+    /// 取走即清(与 `take_diags` 同语义);`restart` 时一并清零。
+    pub fn take_frame_diag_totals(&mut self) -> Vec<(yu_gfx::FrameDiag, u64)> {
+        let totals = std::mem::take(&mut self.frame_diag_totals);
+        totals
+            .into_iter()
+            .map(|((code, command, detail), acc)| {
+                (
+                    yu_gfx::FrameDiag {
+                        code,
+                        severity: acc.severity,
+                        command,
+                        detail,
+                        count: 0,
+                        at: acc.at,
+                        at_more: acc.at_more,
+                    },
+                    acc.total,
+                )
+            })
+            .collect()
+    }
+
+    fn accumulate_frame_diags(&mut self, frame: &CompositorFrame) {
+        for d in &frame.diagnostics {
+            let acc = self
+                .frame_diag_totals
+                .entry((d.code.clone(), d.command.clone(), d.detail.clone()))
+                .or_insert(FrameDiagTotal {
+                    severity: d.severity,
+                    total: 0,
+                    at: Vec::new(),
+                    at_more: 0,
+                });
+            acc.total += d.count as u64;
+            for at in &d.at {
+                if acc.at.contains(at) {
+                    continue;
+                }
+                if acc.at.len() < yu_gfx::MAX_FRAME_AT {
+                    acc.at.push(at.clone());
+                } else {
+                    acc.at_more += 1;
+                }
+            }
+        }
     }
 
     /// P1 交接件 H-P1-02:统一诊断 drain(egui/诊断面板用)。
@@ -930,6 +1044,7 @@ impl Engine {
         let mut report = DiagReport {
             frame: self.frame,
             diags,
+            sound_diags_dropped: self.sound_diags_dropped,
             ..DiagReport::default()
         };
         if let Some(vm) = self.vm.as_ref() {
@@ -1103,6 +1218,9 @@ impl Engine {
         self.render_history.clear();
         self.events_drained = 0;
         self.sound_diags.clear();
+        self.sound_diags_dropped = 0;
+        self.drained_diags = 0;
+        self.frame_diag_totals.clear();
         self.realtime_last = Instant::now();
         self.realtime_us = 0;
         self.realtime_last_ms = 0;

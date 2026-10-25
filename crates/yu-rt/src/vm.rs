@@ -1472,6 +1472,8 @@ impl Vm {
 
     /// 诊断入库(不做容量裁剪:诊断本身已有每命令去重)。
     pub(crate) fn emit_diag(&mut self, d: Diag) {
+        // MemorySink::emit 只做 Vec::push,不会失败;丢弃的是 Result 形参
+        // (良性静默,Q1 自查 b 类)。
         let _ = self.diags.emit(&d);
     }
 

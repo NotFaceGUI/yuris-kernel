@@ -54,6 +54,8 @@ pub struct ServeOptions {
     pub debug_mode: bool,
     /// 强制字体 family(诊断/换字体;`None` = 脚本语义)。
     pub force_font: Option<String>,
+    /// JSONL 日志路径(Q1 R4;`None` = 不落盘,关闭时只打 stderr 汇总)。
+    pub log_file: Option<PathBuf>,
 }
 
 impl ServeOptions {
@@ -104,6 +106,7 @@ impl ServeOptions {
                 None => None,
             };
         let force_font = args.flag("font").filter(|value| !value.trim().is_empty());
+        let log_file = args.flag("log-file").map(PathBuf::from);
         args.finish()?;
         Ok(Self {
             root: PathBuf::from(root),
@@ -120,6 +123,7 @@ impl ServeOptions {
             diag_ws,
             debug_mode,
             force_font,
+            log_file,
         })
     }
 }
@@ -134,6 +138,20 @@ fn default_www() -> PathBuf {
 
 /// 服务主入口(阻塞到收到 `quit` / stdin EOF)。
 pub fn run(opts: ServeOptions) -> CliResult<()> {
+    // 统一控制台(Q1 R2/R4):serve 聚合不即印(长跑不刷屏),关闭时打
+    // 末尾汇总;`--log-file` 落 JSONL(每轮截断,与 desktop/headless 同口径)。
+    let jsonl = match opts.log_file.as_deref() {
+        Some(path) => Some(crate::logging::open_jsonl_truncating(path)?),
+        None => None,
+    };
+    if let Some(file) = &jsonl {
+        crate::logging::write_color_notice(file);
+    }
+    let console =
+        yu_log::console::ConsoleHandle::new(yu_log::console::Console::stderr_aggregate(
+            crate::logging::min_level(),
+            jsonl,
+        ));
     let project = Project::discover(&opts.root, opts.data.as_deref())?;
     let dataset = project.describe();
     let engine_opts = EngineOptions {
@@ -208,20 +226,25 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
     }
 
     let url = format!("http://127.0.0.1:{port}/");
-    output::line(format!(
-        "serving {url}  backend={} entry={} fps={} data={}:{} ({} bytes) boot_ms={:.2}",
-        opts.backend.as_str(),
-        opts.entry,
-        opts.fps,
-        dataset.kind,
-        dataset.path.display(),
-        dataset.bytes,
-        boot_ms
-    ));
-    output::line(format!(
-        "marker={} (HMR 可观测点)",
-        build_info::ENGINE_MARKER
-    ));
+    console.emit_host(
+        yu_log::console::HostLevel::Info,
+        "serve",
+        &format!(
+            "serving {url}  backend={} entry={} fps={} data={}:{} ({} bytes) boot_ms={:.2}",
+            opts.backend.as_str(),
+            opts.entry,
+            opts.fps,
+            dataset.kind,
+            dataset.path.display(),
+            dataset.bytes,
+            boot_ms
+        ),
+    );
+    console.emit_host(
+        yu_log::console::HostLevel::Info,
+        "serve",
+        &format!("marker={} (HMR 可观测点)", build_info::ENGINE_MARKER),
+    );
     if !opts.no_open {
         open_browser(&url);
     }
@@ -232,6 +255,7 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         opts.fps,
         opts.backend,
         opts.pause_at,
+        console,
     )
 }
 
@@ -359,6 +383,7 @@ fn engine_loop(
     fps: u32,
     backend: Backend,
     pause_at: Option<u64>,
+    console: yu_log::console::ConsoleHandle,
 ) -> CliResult<()> {
     let budget = Duration::from_micros(1_000_000 / u64::from(fps.max(1)));
     let mut next = Instant::now();
@@ -375,7 +400,11 @@ fn engine_loop(
                 Control::Pulse { button } => engine.pulse_input(&button),
                 Control::Cursor { x, y } => engine.set_cursor(x, y),
                 Control::Restart => {
-                    output::line("restart: 丢 Vm+GfxState,保留渲染器/纹理缓存");
+                    console.emit_host(
+                        yu_log::console::HostLevel::Info,
+                        "serve",
+                        "restart: 丢 Vm+GfxState,保留渲染器/纹理缓存",
+                    );
                     engine.restart()?;
                     paused = false;
                     step_left = None;
@@ -384,12 +413,20 @@ fn engine_loop(
                     }
                 }
                 Control::Step(frames) => {
-                    output::line(format!("step: +{} frame(s)", frames.max(1)));
+                    console.emit_host(
+                        yu_log::console::HostLevel::Info,
+                        "serve",
+                        &format!("step: +{} frame(s)", frames.max(1)),
+                    );
                     paused = false;
                     step_left = Some(frames.max(1));
                 }
                 Control::Replay(target) => {
-                    output::line(format!("replay: restart → frame {target}"));
+                    console.emit_host(
+                        yu_log::console::HostLevel::Info,
+                        "serve",
+                        &format!("replay: restart → frame {target}"),
+                    );
                     engine.restart()?;
                     if let Ok(mut last) = shared.last_frame.lock() {
                         *last = None;
@@ -399,13 +436,39 @@ fn engine_loop(
                 }
                 Control::Pause(value) => {
                     paused = value;
-                    output::line(if value { "paused" } else { "resumed" });
+                    console.emit_host(
+                        yu_log::console::HostLevel::Info,
+                        "serve",
+                        if value { "paused" } else { "resumed" },
+                    );
                 }
                 Control::Reload => {
                     broadcast_sse(&shared, "{\"type\":\"reload\"}");
                 }
                 Control::Shutdown => {
-                    output::line("shutdown");
+                    // 关闭时打这一轮的诊断汇总与排空计数(Q1 R2;Q1 自查:
+                    // 无 /diag 订阅者时的 drain 现在有「丢了几条」的答案)。
+                    console.emit_host(
+                        yu_log::console::HostLevel::Info,
+                        "serve",
+                        &format!(
+                            "shutdown: drained_diags={} sound_diags_dropped={}",
+                            engine.diags_drained(),
+                            engine.sound_diags_dropped()
+                        ),
+                    );
+                    // 中毒恢复式取锁(与 ConsoleHandle 同型,不让一次
+                    // panic 永久关闭汇总)。
+                    let mut guard = console
+                        .0
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    crate::logging::print_diag_summary(&mut guard, &mut engine);
+                    console.emit_host(
+                        yu_log::console::HostLevel::Info,
+                        "serve",
+                        "shutdown",
+                    );
                     return Ok(());
                 }
             }
@@ -431,16 +494,21 @@ fn engine_loop(
             if *left == 0 {
                 paused = true;
                 step_left = None;
-                output::line(format!("paused at frame {}", rendered.report.frame));
+                console.emit_host(
+                    yu_log::console::HostLevel::Info,
+                    "serve",
+                    &format!("paused at frame {}", rendered.report.frame),
+                );
             }
         }
         if let Some(target) = pause_at {
             if rendered.report.frame >= target && !paused {
                 paused = true;
-                output::line(format!(
-                    "paused at frame {} (--pause-at {target})",
-                    rendered.report.frame
-                ));
+                console.emit_host(
+                    yu_log::console::HostLevel::Info,
+                    "serve",
+                    &format!("paused at frame {} (--pause-at {target})", rendered.report.frame),
+                );
             }
         }
         let payload = Arc::new(encode_frame(
@@ -510,6 +578,8 @@ fn handle_diag_ws(
                     _ => {}
                 }
             }
+            // 订阅端已断开时发送失败是常态:管道本身没有读者了,
+            // 无从报告也无需报告(良性静默,Q1 自查 b 类)。
             let _ = tx.send(());
         });
         rx
@@ -742,7 +812,7 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>, www: PathBuf) {
                 });
             }
             Err(error) => {
-                output::error(format!("accept: {error}"));
+                output::error(format!("[serve] accept: {error}"));
                 break;
             }
         }

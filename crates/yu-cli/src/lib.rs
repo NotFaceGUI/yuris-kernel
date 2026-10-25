@@ -15,6 +15,7 @@ pub mod bench;
 pub mod build_info;
 pub mod case;
 pub mod dev;
+pub mod logging;
 pub mod run;
 pub mod server;
 pub mod ws;

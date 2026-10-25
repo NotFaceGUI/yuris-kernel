@@ -54,6 +54,8 @@ pub struct UiSnapshot<'a> {
     pub cursor_visible: Option<bool>,
     /// 是否显示卡住横幅(用户可在面板关掉)。
     pub show_attention: bool,
+    /// 统一控制台的最近行快照(明文无色;Q1 R4「日志」页签)。
+    pub log_lines: Vec<String>,
 }
 
 /// 面板上可触发的动作(宿主在 UI 闭包外执行)。
@@ -64,6 +66,8 @@ pub struct UiActions {
     pub quit: bool,
     /// `Some(false)` = 用户关掉卡住横幅;`Some(true)` = 重新打开。
     pub show_attention: Option<bool>,
+    /// 清空「日志」页签的环形缓冲(只清面板视图,不动 JSONL 文件)。
+    pub clear_log: bool,
 }
 
 /// F1 主面板。
@@ -79,6 +83,8 @@ pub fn debug_window(ctx: &egui::Context, snap: &UiSnapshot<'_>) -> UiActions {
             stats(ui, snap);
             ui.separator();
             diag_table(ui, snap.diagnostics);
+            ui.separator();
+            log_tab(ui, snap, &mut actions);
             ui.separator();
             frame_drops(ui, snap.diagnostics);
             ui.separator();
@@ -268,6 +274,33 @@ fn diag_table(ui: &mut egui::Ui, diagnostics: &Diagnostics) {
             ui.label(&last.detail);
         }
     });
+}
+
+/// 「日志」页签(Q1 R4):统一控制台的最近行(明文无色),滚动缓冲 +
+/// 清空按钮。清空只影响面板环形缓冲,不动 JSONL 文件记录。
+fn log_tab(ui: &mut egui::Ui, snap: &UiSnapshot<'_>, actions: &mut UiActions) {
+    egui::CollapsingHeader::new(format!("日志({})", snap.log_lines.len()))
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("清空").clicked() {
+                    actions.clear_log = true;
+                }
+                ui.weak("stderr 控制台同源;文件记录不受清空影响");
+            });
+            if snap.log_lines.is_empty() {
+                ui.weak("(暂无;内核挂号/门面/生命周期行会出现在这里)");
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for line in &snap.log_lines {
+                        ui.monospace(line);
+                    }
+                });
+        });
 }
 
 fn frame_drops(ui: &mut egui::Ui, diagnostics: &Diagnostics) {
@@ -628,6 +661,10 @@ mod tests {
             mouse_time_ms: Some(2500),
             cursor_visible: Some(true),
             show_attention: true,
+            log_lines: vec![
+                "[   +0.102s] INFO  [host] data.ypf mounted".to_string(),
+                "[  +12.345s] UNIMP [gfx] gfx.command.unimplemented @ s66 pc6028: …".to_string(),
+            ],
         }
     }
 

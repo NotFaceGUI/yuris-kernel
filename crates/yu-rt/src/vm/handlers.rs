@@ -414,6 +414,8 @@ impl Vm {
                     if w.rec.length == 0 {
                         continue;
                     }
+                    // Err 只在诊断已记录后丢弃(eval_window 内部已挂号),
+                    // 不二次报告 —— 良性静默(Q1 自查 b 类)。
                     let _ = self.eval_window(st, w);
                 }
                 Ok(StepOutcome::Continue)
