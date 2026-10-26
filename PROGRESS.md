@@ -7809,3 +7809,116 @@ case until-visible actual       4699e746… 与改动前逐位一致 ⇒ 软渲�
 - 新 CG 首次显示的同步解码 20-27ms 单帧黄闪(每张一次;`image` crate 解码,
   与原版引擎 CG 加载同量级);后台预解码待立项。
 - 9 条 case golden 过期为改动前既有(actual 与干净树一致),`--update` 重生成由主人定。
+
+## 成果 MOTION-SPIKE (2026-10-26) · 演出移动抖动/卡顿六根因收口
+
+用户实测(ERIS β4「演出1」摄像机推近 + 立绘 3D 位移):移动像走像素网格、
+越慢抖得越厉害、长跑掉到 40fps、终点有跳变。逐项取证后定位到六个独立根因。
+
+### 根因与修复
+
+| # | 根因 | 证据 | 修复 |
+|---|---|---|---|
+| 1 | `CGACT` 带区域缩放走 CPU `scale_region` 逐像素重采样;立绘动画每帧换区域 ⇒ 像素缓存全 miss,单条 16–35ms | `YU_RENDER_TIMING`:image 阶段 14210ms/2800 帧,p95 5.27,max 37.14 | 改成 **GPU UV 子矩形采样**(`Override::Uv`):缩放只是一次带 UV 的 quad,不物化纹理、不读回。峰值 37.14→7.13ms,慢缩放调用归零 |
+| 2 | 精灵位置被量化:脚本把位置拆成整数+小数(`es_Sprite.yst` `CGACT[… FX=@X1*100+@FLX …]`),`fixed_px` 做 `.round() as i64` 丢掉小数 | 同帧区域 `(250.26,47.70)-(708.74,391.31)` 逐帧漂移;测试样本 `FX=1234 ⇒ 12.34` 被 round 成 12 | `ImageOp.x/y/x2/y2` 改 `f64`,`FX/100` 不取整;只有整数像素动作(COPY 切片/RECTPAINT/RESIZE/字符落位)在各自边界显式取整 |
+| 3 | `CG[X/Y]` 遇浮点**整条丢弃**(`as_int()` 在 `fract()!=0` 返回 `None`)⇒ 层停在上一次位置 | `es_Sprite.yst:8574 FLT[@LEFT_X]` → `CG[X=@LEFT_X]` | `EngineValue::as_px()` 起改 `as_f64()`;`Transform.x/y` 由 `i64` 改 `f64`;两后端按 D3D9 浮点顶点/亚像素取样 |
+| 4 | `X+=` / `Y+=` 增量参数语法**完全未实现**(YSCM 参数种类 2 `NumericOffset` 只有枚举,零消费代码) | 语料 `es_Sprite.yst` 56 处 `CG[…] X+=… Y+=…` | `ArgValue.offset` + `apply_layer_params` 增量语义 |
+| 5 | 纹理滤波停在 `TextureFilter::unknown()`(POINT/POINT)占位,从未注入引擎真值 | REAL `FUN_00460924` 读完 `yscfg.dat` 后无条件写 `MAG=1/MIN=1/MIP=0`(LINEAR/LINEAR) | `GfxState::set_filter(engine_settings(Linear, Linear, Point))` |
+| 6 | 桌面宿主把逻辑时钟上限压到 2 帧(32ms),**超出部分直接丢弃不顺延** | 3258 帧中 1260 帧(38.7%)被截断,累计丢 6.58s;最长帧 366ms 只算 32ms | 恢复 500ms 上限。补间按 `_OS_TIME` 真墙钟推进,截断会让动画永久落后于真实时间 |
+
+### 验证(原始结果)
+
+```text
+帧间隔 p50/p95/p99      16.65 / 49.83 / 50.41 ms  →  16.65 / 17.07 / 17.29 ms
+render_ms p50/p95/max   7.87 / 27.89 / 55.51     →  0.69 / 2.02 / 7.88
+work_ms  p95/max        34.98 / 212.53           →  6.59 / 162.47
+平均 FPS                40.6                     →  59.1
+cargo test --workspace --all-targets   174 套件全绿;cargo check 零 warning
+```
+
+退出帧间隔 p95 = 17.07ms 即真实 60Hz 的 16/17 交替节奏 ⇒ 无掉帧、无抖动。
+
+### 残留(在册)
+
+- 摄像机补间单帧断裂(`f957` 104px)已定案为**脚本「点击跳过」**
+  (`@es.TEXT.TIPCLICK==1 ⇒ @mTADD=999999999`),非缺陷;扣除后为
+  1.27px/帧的连续亚像素运动。
+- `REVERSE`(RGB 取反)与 RGB 滤镜族仍需 framebuffer;`Override::Pass` +
+  `TargetSet::image_op` 已就位等对应 WGSL。
+- 软后端按整数像素重采样(`scale_region`),亚像素只保证 wgpu 产品路径;
+  soft/wgpu 像素不再逐位相同(soft 是自建参考实现,真值以 SDK demo 为准)。
+
+## 成果 MOTION-SPIKE-2 (2026-10-26) · 文档/死代码/门禁收口 + 种类 2 语义 REA 定案
+
+承接 MOTION-SPIKE:主人确认抖动与吸附已解决,转入质量收口。
+
+### 1. 文档与实现矛盾(7 处)
+
+`X+=` 语义从「累加」改回「赋值」后,4 处注释仍写累加;另有 2 处陈旧论述
+(`as_px` 声称官方四舍五入、X 分支上方整段"浮点显式拒绝"已与代码相反)。
+全部改写并补证据锚点。`as_px` 文档收敛为「只用于 Z/SX/SY 等确实整数的槽」。
+
+### 2. 死代码清理(约 120 行)
+
+`Override::Pass` 变体(含绘制/`layer_image`/`image_source_texture`/几何诊断
+4 处分支)、`TargetSet::image_ops` 池(`ensure_image_op`/`prune_image_ops`/
+`image_op`)、`PlannedTarget::ImageOp`。全部无生产者;自检 0 引用。
+后续需要 framebuffer 的滤镜(REVERSE/RGB 族)再加,不预置。
+
+### 3. soft 门禁关闭(按主人指示)
+
+- `EngineOptions::reconcile` 默认 `true` → **`false`**。理由:soft 是自建
+  参考实现不是真值;且每次 wgpu 运行会额外构造整套 `SoftRenderer`(独立
+  `TextureStore`,重复解码资产)。
+- 修一处误报:`wgpu_reconciled()` 在「未请求对账」时返回 `Some(false)`,
+  CLI 打印 `PENDING`;改为 `None`,不再误报。
+- 删除 `host-desktop` 里重复魔数 `set_max_step_ms(500)`,回到引擎默认
+  `DEFAULT_MAX_STEP_MS`。
+
+### 4. 参数种类 2(`X+=`)语义 —— REA 定案:不是累加
+
+REA `FUN_00429fd1`(参数序言,`0x429fd1`,官方 0.495
+`4f5eefa3…`)按类型字节三路分派:
+
+```c
+if (kind == 0) { value = DAT_008018b4[subtype](script_base+off, len);   // 求值
+                 *(int*)&DAT_00683740 + i*8 = lo; ... hi; }
+else if (kind == 1) { /* 字符串: malloc(0x1000) + 拷贝 */ }
+else if (kind == 2) { *(int*)&DAT_00683e20 + i*4 = script_base + off;    // 只记偏移
+                      /* 数值槽 0x683740/44 一个字都不写 */ }
+```
+
+⇒ **种类 2 是「脚本内偏移」,不做算术、不读旧值、不写数值槽。**
+既非累加也非普通数值;消费点按偏移取内联数据。
+内核因此按赋值处理(VM 已求值),与实机现象一致(累加会让持久层逐帧漂移、
+补间结束"跳回原位")。`ArgValue::offset` 降级为诊断字段。
+
+证据档案:`docs/divergences/DIV-GFX-064-cg-float-coordinates.md`
+(状态 `partially-confirmed`;未决 = 官方 f64→i64 规约指令、消费点如何
+解读 `0x683e20[i]`)。
+
+### 5. case golden 重生成(9 条)
+
+`yu-cli case <project-eris> --all --update` → **9 passed / 0 failed**。
+逐条 diff 审查结论:
+
+- `display_json_sha256` 全部变化 = image op 区域字段由整数变小数
+  (亚像素契约变化,`"x":12` → `"x":12.34`);
+- 6 条 `ops_total` 一致 **−51**,经 HEAD 对照实验(暂存改动后重建)确认
+  **HEAD 同样为 122 ops** ⇒ 属改动前既有漂移,非本次回归
+  (用例注释亦写明"底层 Fatal 修好后需 --update 重生成");
+- `until-visible` 等 3 条 `ops_total` 不变,仅 JSON 哈希变。
+
+### 验证
+
+```text
+cargo test --workspace --all-targets   174 套件 ok / 0 failed
+cargo check --workspace --all-targets  0 warning
+yu-cli case <project-eris> --all       9 passed / 0 failed
+```
+
+### 残留(在册)
+
+- 官方把 f64 规约成 i64 的指令未定位(DIV-GFX-064 §5);
+- 消费点如何解读 `0x683e20[i]` 未逐命令定位;
+- `CGINFO[X/Y]` 读回取整(内部 f64)未取证官方口径。

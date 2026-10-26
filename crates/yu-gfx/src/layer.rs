@@ -78,6 +78,22 @@ impl EngineValue {
         }
     }
 
+    /// 需要**整数像素**的槽读取:整数取原值,浮点四舍五入。
+    ///
+    /// 只用于语义上确实是整数的槽:层 `Z`(排序键)、层 `SX/SY`(纹理尺寸)。
+    /// 位置类(`CG[X/Y]`、`CGACT` 源区域)一律走 `as_f64` 保留亚像素 ——
+    /// 取整会把慢速移动量化成阶梯(2026-10-26 实测)。
+    ///
+    /// 与 `as_int()` 的区别只在这里:后者遇 `fract()!=0` 返回 `None`
+    /// (调用方会当成「参数未给」),本函数把可表示的浮点规约成最近的整数。
+    pub fn as_px(&self) -> Option<i64> {
+        match self {
+            Self::Int(i) => Some(*i),
+            Self::Float(f) if f.is_finite() => Some(f.round() as i64),
+            _ => None,
+        }
+    }
+
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Str(b) => Some(b),
@@ -819,10 +835,16 @@ impl FilterTransform {
 /// 图层变换:只保存引擎单位的位置;滤镜参数原样保存。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Transform {
-    /// `CG[X=...]`,引擎 i64 像素(不在这里做半像素/缩放)。
-    pub x: i64,
-    /// `CG[Y=...]`,引擎 i64 像素。
-    pub y: i64,
+    /// `CG[X=...]` 的**原始浮点**像素位置。
+    ///
+    /// 引擎 D3D9 顶点是 `float`,脚本 `MATH3D` 逐帧算出的位置本身就是浮点
+    /// (实测推近镜头 `X=260.71190987262014 → 261.79777521694757`,每帧
+    /// 只走 1.08px)。若在写入时四舍五入成整数,0.3px/帧的位移会被量化成
+    /// 「一帧不动、下一帧跳 1px」的阶梯 —— 观感就是「移动像格子一样」。
+    /// 所以这里保留浮点,量化只发生在后端顶点构造(与官方一致的 float)。
+    pub x: f64,
+    /// `CG[Y=...]` 原始浮点像素位置(理由同 `x`)。
+    pub y: f64,
     /// `CG[FX/FY/...]` 原值。
     pub filter: FilterTransform,
 }

@@ -101,23 +101,15 @@ fn run() -> Result<(), String> {
             continue;
         }
         let size = layer.image_size();
+        // 局部坐标是浮点(亚像素);探针按 1px 网格输出点击点。
+        let (x, y) = (
+            layer.transform.x.round() as i64,
+            layer.transform.y.round() as i64,
+        );
         let (cx, cy) = size
-            .map(|s| {
-                (
-                    layer.transform.x + i64::from(s.width) / 2,
-                    layer.transform.y + i64::from(s.height) / 2,
-                )
-            })
-            .unwrap_or((layer.transform.x, layer.transform.y));
-        rows.push((
-            text,
-            draw.target.display(),
-            layer.transform.x,
-            layer.transform.y,
-            size,
-            cx,
-            cy,
-        ));
+            .map(|s| (x + i64::from(s.width) / 2, y + i64::from(s.height) / 2))
+            .unwrap_or((x, y));
+        rows.push((text, draw.target.display(), x, y, size, cx, cy));
     }
     rows.sort_by_key(|r| (r.6, r.5));
     println!("== 可见按钮(标签来自 CGACT[TEXT];位置来自层几何)== frame {}", frame.frame);
@@ -237,8 +229,8 @@ fn run() -> Result<(), String> {
                     continue;
                 }
                 drawn.push((
-                    layer.transform.y,
-                    layer.transform.x,
+                    layer.transform.y.round() as i64,
+                    layer.transform.x.round() as i64,
                     layer.image_size(),
                     layer.id.display(),
                     layer.alpha,

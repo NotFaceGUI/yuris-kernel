@@ -356,9 +356,16 @@ pub struct ImageOp {
     pub sx: Option<f64>,
     /// `SIZE/SIZE2` 的目标高。
     pub sy: Option<f64>,
-    pub x: Option<i64>,
-    pub y: Option<i64>,
-    pub x2: Option<i64>,
-    pub y2: Option<i64>,
+    /// 源区域左上 X(**浮点**)。
+    ///
+    /// 精灵系统把位置拆成「整数部分」+「小数部分」两条参数传进来
+    /// (`es_Sprite.yst`: `CGACT[… SIZE2=1 FX=@X1*100+@FLX …]`,`FX` 是
+    /// `X` 的百分位定点形式),`FX/100` 就是真正的亚像素位置。取整会让
+    /// 慢速移动(每帧 0.1–0.5px)变成「几帧不动再跳 1px」的抖动,而且
+    /// 越慢越明显 —— 实测已确认。
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub x2: Option<f64>,
+    pub y2: Option<f64>,
     pub status: OpStatus,
 }

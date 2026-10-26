@@ -103,6 +103,47 @@ pub(crate) struct PlannedPass {
     pub paints: Vec<PaintCmd>,
 }
 
+/// CPU 图像加工的细分计数(`YU_RENDER_TIMING` 门控)。
+///
+/// 用来回答「产品路径还剩多少 CPU 像素工作」:带区域 `SIZE` 与镜像已改成
+/// 纯采样修饰(零像素),剩下的是 `RECTPAINT`(填充)与 `REVERSE`(取反)。
+#[derive(Default)]
+struct ImageOpStats {
+    /// 采样修饰(`SIZE`/`SIZE2`/镜像):不碰像素。
+    sampled: u64,
+    /// `RECTPAINT` 族:CPU 填充(快照上的已推迟到 GPU)。
+    paint: u64,
+    paint_ms: f64,
+    /// `REVERSE` 等逐像素变换。
+    pixel: u64,
+    pixel_ms: f64,
+}
+
+impl ImageOpStats {
+    fn record(&mut self, action: &yu_gfx::op::ImageAction, elapsed: std::time::Duration) {
+        let ms = elapsed.as_secs_f64() * 1e3;
+        if action.is_scale() {
+            self.sampled += 1;
+        } else if matches!(
+            action,
+            yu_gfx::op::ImageAction::RectPaint
+                | yu_gfx::op::ImageAction::RectPaint2
+                | yu_gfx::op::ImageAction::RectPaint3
+        ) {
+            self.paint += 1;
+            self.paint_ms += ms;
+        } else if matches!(
+            action,
+            yu_gfx::op::ImageAction::Reverse
+                | yu_gfx::op::ImageAction::Horizontal
+                | yu_gfx::op::ImageAction::Vertical
+        ) {
+            self.pixel += 1;
+            self.pixel_ms += ms;
+        }
+    }
+}
+
 /// 一帧的 GPU 执行计划。
 #[derive(Default)]
 pub(crate) struct FramePlan {
@@ -140,6 +181,7 @@ pub(crate) fn plan(
     // 覆盖纹理缓存只保留本帧仍存在的层,防止临时层累积。
     uploaded_overrides.retain(|id, _| frame.layers.iter().any(|layer| &layer.id == id));
     let timing = std::env::var("YU_RENDER_TIMING").is_ok();
+    let trace_geometry = timing;
     let started = std::time::Instant::now();
     let t_snap;
     let t_image;
@@ -184,6 +226,7 @@ pub(crate) fn plan(
     let mut copy_text_sources: BTreeMap<CopyId, Rc<Texture>> = BTreeMap::new();
     let mut deferred: BTreeSet<(usize, usize)> = BTreeSet::new();
     let mark = started.elapsed();
+    let mut img_stats = ImageOpStats::default();
     for (pass_index, pass) in frame.passes.iter().enumerate() {
         let PassTarget::Texture(target) = &pass.target else {
             continue;
@@ -198,7 +241,8 @@ pub(crate) fn plan(
                         continue;
                     }
                     acc.ops_total += 1;
-                    match apply_image_to_override(
+                    let op_started = std::time::Instant::now();
+                    let result = apply_image_to_override(
                         frame,
                         textures,
                         targets,
@@ -206,7 +250,9 @@ pub(crate) fn plan(
                         image,
                         &mut overrides,
                         image_cache,
-                    ) {
+                    );
+                    img_stats.record(&image.action, op_started.elapsed());
+                    match result {
                         Ok(()) => acc.ops_drawn += 1,
                         Err(reason) => acc.skip(op, reason),
                     }
@@ -258,11 +304,11 @@ pub(crate) fn plan(
                 .as_ref()
                 .filter(|l| l.target.as_ref() == Some(&id));
             let revision = frame.text_revisions.get(&id).copied().unwrap_or(0);
-            let override_hash = overrides.get(&id).map(|o| o.hash);
+            let override_hash = overrides.get(&id).map(Override::hash);
             let base_key = text_base_key(&layer.texture, override_hash);
             // 基图惰性:命中/增量路径不解析不克隆基图(此前每帧整图复制)。
             let dims = match overrides.get(&id) {
-                Some(hit) => Ok((hit.tex.width, hit.tex.height)),
+                Some(hit) => Ok(hit.dims()),
                 None => layer_base_dims(textures, targets, layer),
             };
             let composed = match dims {
@@ -275,7 +321,11 @@ pub(crate) fn plan(
                     layout,
                     || {
                         match overrides.get(&id) {
-                            Some(hit) => Ok(hit.tex.clone()),
+                            // 文本合成要 CPU 像素;`Uv` 的像素属于源层、
+                            // `Pass` 在显存,都不在这里展开(显式报缺)。
+                            Some(hit) => hit.cpu_tex().cloned().ok_or_else(|| {
+                                "text.base_is_not_cpu".to_string()
+                            }),
                             None => layer_base_cpu(textures, targets, layer).map(Rc::new),
                         }
                     },
@@ -330,7 +380,9 @@ pub(crate) fn plan(
                     if text_override_ids.contains(source_layer) {
                         None
                     } else {
-                        Some(Ok(hit.tex.clone()))
+                        Some(hit.cpu_tex().cloned().ok_or_else(|| {
+                            "copy.base_is_not_cpu".to_string()
+                        }))
                     }
                 } else {
                     match copy_source_base_cpu(frame, textures, targets, copy, source_layer) {
@@ -424,6 +476,7 @@ pub(crate) fn plan(
                             &mut passes,
                             backbuffer,
                             backbuffer_gpu,
+                            trace_geometry,
                         )?;
                     }
                     let mut commands = PlannedPass {
@@ -447,6 +500,7 @@ pub(crate) fn plan(
                             counted: true,
                             backbuffer,
                             backbuffer_gpu,
+                            trace_geometry,
                             transition_bind_groups: &mut transition_bind_groups,
                             transition_buffers: &mut transition_buffers,
                             dst_width: 0,
@@ -484,6 +538,7 @@ pub(crate) fn plan(
                             counted: true,
                             backbuffer,
                             backbuffer_gpu,
+                            trace_geometry,
                             transition_bind_groups: &mut transition_bind_groups,
                             transition_buffers: &mut transition_buffers,
                             dst_width: 0,
@@ -542,6 +597,7 @@ pub(crate) fn plan(
                 counted: true,
                 backbuffer,
                 backbuffer_gpu,
+                trace_geometry,
                 transition_bind_groups: &mut transition_bind_groups,
                 transition_buffers: &mut transition_buffers,
                 dst_width: width,
@@ -587,6 +643,7 @@ pub(crate) fn plan(
                 counted: true,
                 backbuffer,
                 backbuffer_gpu,
+                trace_geometry,
                 transition_bind_groups: &mut transition_bind_groups,
                 transition_buffers: &mut transition_buffers,
                 dst_width: width,
@@ -647,7 +704,7 @@ pub(crate) fn plan(
                 // 屏幕 pass 是最后规划的 pass:顶点必须位于缓冲末尾才能整段追加。
                 let expected = screen.first_vertex as usize + screen.draws.len() * 6;
                 if expected == vertices.len() {
-                    push_quad(&mut vertices, width, height, 0, 0, width, height, 1.0);
+                    push_quad(&mut vertices, width, height, 0.0, 0.0, width, height, 1.0);
                     screen.draws.push(Draw {
                         blend: BlendMode::Normal,
                         texture_id: id,
@@ -679,6 +736,15 @@ pub(crate) fn plan(
             frame.text_draws.len(),
             acc.ops_drawn,
             acc.ops_total,
+        );
+        log::trace!(
+            target: "yu-render",
+            "[rt]   image_paths sampled={} paint={}({:.2}ms) pixel={}({:.2}ms)",
+            img_stats.sampled,
+            img_stats.paint,
+            img_stats.paint_ms,
+            img_stats.pixel,
+            img_stats.pixel_ms,
         );
         log::trace!(
             target: "yu-render",
@@ -891,27 +957,69 @@ fn snapshot_of(frame: &CompositorFrame, id: &LayerId) -> Option<CopyId> {
         })
 }
 
-/// 帧内图像加工结果 + **一次性**内容指纹。
+/// 帧内图像加工结果。
 ///
-/// 指纹只用于跨帧复用 GPU 纹理。若每次绘制都重算,一条 800×600 的覆盖纹理
-/// 就是 1.9 MB 的 FNV 遍历;title 期脚本每帧对 51 个层重发 `CGACT[SIZE]`,
-/// 逐帧重算 ≈ 100 MB 哈希(EVID-J3-08 性能勘误)。
+/// 按「有没有真的动像素」分两类:
+///
+/// - [`Override::Cpu`]:像素在 CPU(文本烘焙、逐像素滤镜)。指纹只用于跨帧
+///   复用 GPU 上传;若每次绘制都重算,一条 800×600 的覆盖纹理就是 1.9 MB
+///   的 FNV 遍历(title 期脚本每帧对 51 个层重发 `CGACT[SIZE]`,逐帧重算
+///   ≈ 100 MB 哈希,EVID-J3-08 性能勘误)。
+/// - [`Override::Uv`]:**没有动像素**,只是「从源的这块子矩形采样,铺到那个
+///   尺寸」。`CGACT[SIZE]` 带源区域就是这种:立绘/精灵动画每帧换区域与目标
+///   尺寸(实测 `(250,48)-(709,391)` 逐帧漂移),CPU `scale_region` 必然全
+///   miss、单条 16–35 ms;绘制期把这个矩形当 UV 交给采样器,一次全屏 quad
+///   即可,与区域是否变化无关。
 #[derive(Clone)]
-pub(crate) struct Override {
-    pub(crate) tex: Rc<Texture>,
-    pub(crate) hash: u64,
+pub(crate) enum Override {
+    Cpu {
+        tex: Rc<Texture>,
+        hash: u64,
+    },
+    /// 采样修饰:源层 + 归一化 UV 子矩形 + 输出尺寸。
+    Uv {
+        source: LayerId,
+        uv: [f32; 4],
+        width: u32,
+        height: u32,
+        bilinear: bool,
+        hash: u64,
+    },
 }
 
 impl Override {
     fn new(tex: Rc<Texture>) -> Self {
         let hash = hash_rgba(tex.width, tex.height, &tex.rgba);
-        Self { tex, hash }
+        Self::Cpu { tex, hash }
     }
 
     /// 用调用方已持有的内容指纹构造(文本合成缓存命中路径零重算:
     /// 指纹在烘焙/增量时算一次,存于 `yu_backend_soft::ComposedLayer::hash`)。
     fn with_hash(tex: Rc<Texture>, hash: u64) -> Self {
-        Self { tex, hash }
+        Self::Cpu { tex, hash }
+    }
+
+    fn hash(&self) -> u64 {
+        match self {
+            Self::Cpu { hash, .. } | Self::Uv { hash, .. } => *hash,
+        }
+    }
+
+    /// 输出表面尺寸(绘制该层时的像素尺寸;`SX/SY` 缺省时用这个)。
+    fn dims(&self) -> (u32, u32) {
+        match self {
+            Self::Cpu { tex, .. } => (tex.width, tex.height),
+            Self::Uv { width, height, .. } => (*width, *height),
+        }
+    }
+
+    /// CPU 像素视图。`Uv` 的像素属于源层:返回 `None`,需要 CPU 像素的
+    /// 调用方必须显式报缺(不静默补零)。
+    fn cpu_tex(&self) -> Option<&Rc<Texture>> {
+        match self {
+            Self::Cpu { tex, .. } => Some(tex),
+            Self::Uv { .. } => None,
+        }
     }
 }
 
@@ -938,6 +1046,8 @@ struct Planner<'a> {
     counted: bool,
     /// 上一帧呈现内容(`COPY ID=:/W0/` 在引擎里读后缓冲;EVID-J3-06)。
     backbuffer: Option<&'a yu_backend_soft::Surface>,
+    /// `YU_RENDER_TIMING` 下逐层记录几何(位置/尺寸/UV)。
+    trace_geometry: bool,
     /// 后缓冲上传缓存:`(content_hash, gpu_id)`。
     backbuffer_gpu: &'a mut Option<(u64, u64)>,
 }
@@ -1146,8 +1256,8 @@ impl Planner<'_> {
                 self.vertices,
                 self.dst_width,
                 self.dst_height,
-                x,
-                y,
+                x as f64,
+                y as f64,
                 width,
                 height,
                 alpha,
@@ -1188,10 +1298,91 @@ impl Planner<'_> {
         let explicit_size = layer.image_size();
         let (x, y) = (layer.transform.x, layer.transform.y);
         let alpha = fixed_pipeline_alpha(layer.alpha) as f32;
+        // 图层几何留痕(`YU_RENDER_TIMING` 门控):位置/尺寸是否逐帧连续变化,
+        // 是判定「动画是否被整数化/是否错位」的第一手事实。
+        if self.trace_geometry {
+            log::trace!(
+                target: "yu-render",
+                "[geo] f={} layer={} xy=({:.4},{:.4}) explicit_size={:?} override={} alpha={}",
+                self.frame.frame,
+                layer.id.display(),
+                x,
+                y,
+                explicit_size.map(|s| (s.width, s.height)),
+                self.overrides
+                    .get(&layer.id)
+                    .map(|o| match o {
+                        Override::Cpu { tex, .. } => format!("cpu {}x{}", tex.width, tex.height),
+                        Override::Uv {
+                            width,
+                            height,
+                            uv,
+                            ..
+                        } => format!(
+                            "uv {}x{} [{:.3},{:.3},{:.3},{:.3}]",
+                            width, height, uv[0], uv[1], uv[2], uv[3]
+                        ),
+                    })
+                    .unwrap_or_else(|| "-".to_string()),
+                alpha,
+            );
+        }
 
         if let Some(ov) = self.overrides.get(&layer.id) {
-            let tex = &ov.tex;
-            let hash = ov.hash;
+            // `Uv` 修饰:直接对源纹理做子矩形采样。缩放就是一次带 UV 的
+            // quad,不重采样、不生成中间纹理。
+            if let Override::Uv {
+                source,
+                uv,
+                width: ow,
+                height: oh,
+                bilinear,
+                ..
+            } = ov
+            {
+                let (source_id, source_view, sw, sh) = match self.image_source_texture(source) {
+                    Ok(value) => value,
+                    Err(reason) => {
+                        self.skip(op, reason);
+                        return Ok(());
+                    }
+                };
+                let (width, height) = match explicit_size {
+                    Some(size) => (size.width, size.height),
+                    None => (*ow, *oh),
+                };
+                // 显式指定了 point/线性(`SIZE` vs `SIZE2`)时以脚本为准;
+                // 否则按源/目标尺寸关系自动选(与既有 draw 同口径)。
+                // `SIZE2`/`SIZE3..5` 是双线性族;`SIZE` 是最近邻。两者都由
+                // 采样器承担,和官方 D3D9 的 point/linear 采样状态一一对应。
+                let filter = if *bilinear {
+                    FilterKind::Linear
+                } else if pick_filter(self.frame, sw, sh, width, height) == FilterKind::Linear
+                    && sw == width
+                    && sh == height
+                {
+                    FilterKind::Point
+                } else {
+                    FilterKind::Point
+                };
+                return self.draw_uv(
+                    out,
+                    blend,
+                    source_id,
+                    &source_view,
+                    filter,
+                    (x, y),
+                    (width, height),
+                    alpha,
+                    DrawKind::Quad,
+                    *uv,
+                );
+            }
+            let Some(tex) = ov.cpu_tex() else {
+                self.skip(op, "imageop.override_missing");
+                return Ok(());
+            };
+            let hash = ov.hash();
             let gpu_tex = match self.uploaded_overrides.get(&layer.id).copied() {
                 Some((id, w, h, cached)) if w == tex.width && h == tex.height && cached == hash => {
                     (id, w, h)
@@ -1225,8 +1416,8 @@ impl Planner<'_> {
                 gpu_tex.0,
                 &view,
                 filter,
-                x,
-                y,
+                x as f64,
+                y as f64,
                 width,
                 height,
                 alpha,
@@ -1256,8 +1447,8 @@ impl Planner<'_> {
                             texture_id,
                             &view,
                             filter,
-                            x,
-                            y,
+                            x as f64,
+                            y as f64,
                             width,
                             height,
                             alpha,
@@ -1479,8 +1670,15 @@ impl Planner<'_> {
             ),
             _ => return Err("gfx.imageop.unsupported".to_string()),
         };
+        // RECTPAINT 是整数像素矩形填充(在快照纹理上画),区域取整。
+        // 与 `SIZE` 的亚像素采样区分:后者保留浮点走 UV。
         let (x0, y0, x1, y1) = match (image.x, image.y, image.x2, image.y2) {
-            (Some(x), Some(y), Some(x2), Some(y2)) => (x, y, x2, y2),
+            (Some(x), Some(y), Some(x2), Some(y2)) => (
+                x.round() as i64,
+                y.round() as i64,
+                x2.round() as i64,
+                y2.round() as i64,
+            ),
             (None, None, None, None) => (0, 0, i64::from(sw) - 1, i64::from(sh) - 1),
             _ => return Err("gfx.imageop.region.partial".to_string()),
         };
@@ -1505,8 +1703,8 @@ impl Planner<'_> {
             self.vertices,
             sw,
             sh,
-            x0,
-            y0,
+            x0 as f64,
+            y0 as f64,
             (x1 - x0 + 1) as u32,
             (y1 - y0 + 1) as u32,
             1.0,
@@ -1577,6 +1775,57 @@ impl Planner<'_> {
         Ok((id, buffer.width, buffer.height))
     }
 
+    /// 某层的 GPU 纹理身份 + 视图 + 像素尺寸(UV 采样用)。
+    ///
+    /// 与 `layer_image` 的区别:这里返回**视图**而非只有 id —— 绘制期要
+    /// 直接拿它建 bind group。源可以是资产/1×1/快照/已加工结果。
+    fn image_source_texture(
+        &mut self,
+        source: &LayerId,
+    ) -> Result<(u64, wgpu::TextureView, u32, u32), String> {
+        if let Some(ov) = self.overrides.get(source) {
+            match ov {
+                Override::Uv { source: inner, .. } => {
+                    let inner = inner.clone();
+                    return self.image_source_texture(&inner);
+                }
+                                Override::Cpu { tex, .. } => {
+                    let (w, h, hash) = (tex.width, tex.height, ov.hash());
+                    if let Some((gpu_id, uw, uh, cached)) =
+                        self.uploaded_overrides.get(source).copied()
+                    {
+                        if uw == w && uh == h && cached == hash {
+                            let view = self
+                                .gpu
+                                .get(gpu_id)
+                                .map(|t| t.view.clone())
+                                .ok_or_else(|| "imageop.source_gpu_missing".to_string())?;
+                            return Ok((gpu_id, view, w, h));
+                        }
+                    }
+                    let rgba = tex.rgba.clone();
+                    let gpu_id = self
+                        .gpu
+                        .upload(self.ctx, w, h, &rgba, "imageop source")
+                        .map_err(|diag| diag.code.to_string())?;
+                    self.uploaded_overrides
+                        .insert(source.clone(), (gpu_id, w, h, hash));
+                    let view = self
+                        .gpu
+                        .get(gpu_id)
+                        .map(|t| t.view.clone())
+                        .ok_or_else(|| "imageop.source_gpu_missing".to_string())?;
+                    return Ok((gpu_id, view, w, h));
+                }
+            }
+        }
+        let (id, w, h) = self.layer_image(source, None)?;
+        let view = view_by_id(self.gpu, self.targets, id)
+            .cloned()
+            .ok_or_else(|| "imageop.source_view_missing".to_string())?;
+        Ok((id, view, w, h))
+    }
+
     /// 图层源的当前图像。
     ///
     /// 源层可能已被 `CGEND` 删除(`DIV-GFX-053`):此时回退到 `CopyOp` 在命令
@@ -1594,9 +1843,21 @@ impl Planner<'_> {
             .get(id)
             .filter(|_| !self.text_override_ids.contains(id))
         {
-            // 加工后的图层:内容未变时复用跨帧 GPU 纹理,避免逐帧重传。
-            let texture = &ov.tex;
-            let hash = ov.hash;
+            // `Uv`/`Pass` 没有可直接拷贝的整图层纹理:COPY 需要的是「该层
+            // 当前像素」这块矩形。`Uv` 只是采样修饰,源纹理就是它引用的源层;
+            // `Pass` 是显存里的渲染结果。两者都按「源纹理 + 目标尺寸」交给
+            // 调用方,由它把区域重映射到目标(见 `plan_copy`)。
+            match ov {
+                Override::Uv { source, .. } => {
+                    let (id, _view, w, h) = self.image_source_texture(source)?;
+                    return Ok((id, w, h));
+                }
+                Override::Cpu { .. } => {}
+            }
+            let Some(texture) = ov.cpu_tex() else {
+                return Err("copy.source.override_missing".to_string());
+            };
+            let hash = ov.hash();
             if let Some((gpu_id, w, h, cached)) = self.uploaded_overrides.get(id).copied() {
                 if w == texture.width && h == texture.height && cached == hash {
                     return Ok((gpu_id, w, h));
@@ -1701,12 +1962,42 @@ impl Planner<'_> {
         texture_id: u64,
         view: &wgpu::TextureView,
         filter: FilterKind,
-        x: i64,
-        y: i64,
+        x: f64,
+        y: f64,
         width: u32,
         height: u32,
         alpha: f32,
         kind: DrawKind,
+    ) -> Result<(), Diag> {
+        self.draw_uv(
+            out,
+            blend,
+            texture_id,
+            view,
+            filter,
+            (x as f64, y as f64),
+            (width, height),
+            alpha,
+            kind,
+            [0.0, 0.0, 1.0, 1.0],
+        )
+    }
+
+    /// 同一 draw,但 UV 取子矩形。`CGACT[SIZE]` 带源区域时,整个"缩放"就是
+    /// 一次带 UV 的 quad —— 不需要 CPU 重采样,也不需要中间纹理。
+    #[allow(clippy::too_many_arguments)]
+    fn draw_uv(
+        &mut self,
+        out: &mut PlannedPass,
+        blend: BlendMode,
+        texture_id: u64,
+        view: &wgpu::TextureView,
+        filter: FilterKind,
+        (x, y): (f64, f64),
+        (width, height): (u32, u32),
+        alpha: f32,
+        kind: DrawKind,
+        uv: [f32; 4],
     ) -> Result<(), Diag> {
         if !self.pipelines.ensure_pipeline(self.ctx, blend)? {
             // 调用方已用 `supported_blend` 过滤;走到这里说明计划器与管线
@@ -1717,15 +2008,16 @@ impl Planner<'_> {
         self.pipelines
             .ensure_bind_group(self.ctx, texture_id, view, filter)?;
         if width > 0 && height > 0 {
-            push_quad(
+            push_quad_uv(
                 self.vertices,
                 self.dst_width,
                 self.dst_height,
-                x,
-                y,
+                x as f64,
+                y as f64,
                 width,
                 height,
                 alpha,
+                uv,
             );
             out.draws.push(Draw {
                 blend,
@@ -1737,6 +2029,40 @@ impl Planner<'_> {
         self.drawn();
         Ok(())
     }
+}
+
+/// 生成目标矩形的两个三角形,UV 取子矩形 `[u0, v0, u1, v1]`。
+///
+/// `CGACT[SIZE]` 的源区域是**闭区间像素范围** `(x0,y0)-(x1,y1)`,与 CPU
+/// `scale_region` 的 `cw = x1-x0+1` 同口径,所以右下 UV 落在
+/// `(x1+1)/w`;采样器中心对齐后等价于 `sx = x0 + dx*cw/dw`。
+#[allow(clippy::too_many_arguments)]
+fn push_quad_uv(
+    vertices: &mut Vec<Vertex>,
+    dst_width: u32,
+    dst_height: u32,
+    x: f64,
+    y: f64,
+    width: u32,
+    height: u32,
+    alpha: f32,
+    uv: [f32; 4],
+) {
+    let target_w = f64::from(dst_width);
+    let target_h = f64::from(dst_height);
+    let left = 2.0 * x / target_w - 1.0;
+    let right = 2.0 * (x + f64::from(width)) / target_w - 1.0;
+    let top = 1.0 - 2.0 * y / target_h;
+    let bottom = 1.0 - 2.0 * (y + f64::from(height)) / target_h;
+    let (left, right) = (left as f32, right as f32);
+    let (top, bottom) = (top as f32, bottom as f32);
+    let [u0, v0, u1, v1] = uv;
+
+    let tl = Vertex { position: [left, top], uv: [u0, v0], alpha };
+    let tr = Vertex { position: [right, top], uv: [u1, v0], alpha };
+    let bl = Vertex { position: [left, bottom], uv: [u0, v1], alpha };
+    let br = Vertex { position: [right, bottom], uv: [u1, v1], alpha };
+    vertices.extend_from_slice(&[tl, tr, bl, tr, br, bl]);
 }
 
 fn view_by_id<'a>(
@@ -1756,18 +2082,18 @@ fn push_quad(
     vertices: &mut Vec<Vertex>,
     dst_width: u32,
     dst_height: u32,
-    x: i64,
-    y: i64,
+    x: f64,
+    y: f64,
     width: u32,
     height: u32,
     alpha: f32,
 ) {
     let target_w = f64::from(dst_width);
     let target_h = f64::from(dst_height);
-    let left = 2.0 * (x as f64) / target_w - 1.0;
-    let right = 2.0 * ((x as f64) + f64::from(width)) / target_w - 1.0;
-    let top = 1.0 - 2.0 * (y as f64) / target_h;
-    let bottom = 1.0 - 2.0 * ((y as f64) + f64::from(height)) / target_h;
+    let left = 2.0 * x / target_w - 1.0;
+    let right = 2.0 * (x + f64::from(width)) / target_w - 1.0;
+    let top = 1.0 - 2.0 * y / target_h;
+    let bottom = 1.0 - 2.0 * (y + f64::from(height)) / target_h;
     let (left, right) = (left as f32, right as f32);
     let (top, bottom) = (top as f32, bottom as f32);
 
@@ -1803,6 +2129,111 @@ fn clear_color(clear: Clear) -> wgpu::Color {
     }
 }
 
+
+/// 源层的像素尺寸(用于把 `CGACT` 的像素区域归一化成 UV)。
+///
+/// 优先本帧加工结果(`Override` 已记录输出尺寸),否则按层纹理取。链式
+/// `Uv` 只展开一层:语料里没有「区域缩放的结果再被区域缩放」。
+fn image_source_dims(
+    frame: &CompositorFrame,
+    textures: &mut TextureStore,
+    targets: &TargetSet,
+    overrides: &BTreeMap<LayerId, Override>,
+    source: &LayerId,
+) -> Result<(u32, u32), String> {
+    if let Some(ov) = overrides.get(source) {
+        return Ok(ov.dims());
+    }
+    let layer = frame
+        .layers
+        .iter()
+        .find(|layer| &layer.id == source)
+        .ok_or_else(|| "gfx.imageop.source.missing".to_string())?;
+    // 尺寸必须与**实际采样到的纹理**一致,否则 UV 归一化会错:
+    // - `Asset`:真的解码一次(`TextureStore` 有缓存),拿真实像素尺寸。
+    //   若只信 `layer.image_size()`,脚本对 `SPLBUF*` 不设 `SX/SY` 时这里
+    //   会得到 0 ⇒ UV 全被 clamp 成一点 ⇒ 整层采成纯色(2026-10-26 实测)。
+    // - `SolidBlack1x1`:1×1。
+    // - `Snapshot`:用快照目标尺寸。
+    // - 其余(Offscreen/None):退回层声明尺寸,拿不到就显式报缺。
+    match &layer.texture {
+        TextureRef::Asset(key) => textures
+            .resolve(key)
+            .map(|tex| (tex.width, tex.height))
+            .map_err(|diag| diag.code.to_string()),
+        TextureRef::SolidBlack1x1 => Ok((1, 1)),
+        TextureRef::Snapshot(id) => targets
+            .snapshot(*id)
+            .map(|t| (t.width, t.height))
+            .ok_or_else(|| "gfx.imageop.source.snapshot_missing".to_string()),
+        _ => layer
+            .image_size()
+            .map(|s| (s.width, s.height))
+            .filter(|(w, h)| *w > 0 && *h > 0)
+            .ok_or_else(|| "gfx.imageop.source_size.unknown".to_string()),
+    }
+}
+
+/// `CGACT` 源区域 → 归一化 UV 子矩形。
+///
+/// `region` 是**闭区间像素范围** `(x0,y0)-(x1,y1)`(与 CPU `scale_region`
+/// 的 `cw = x1-x0+1` 同口径),所以右下 UV 落在 `(x1+1)/w`;采样器中心对齐
+/// 后等价于 CPU 的 `sx = x0 + dx*cw/dw`。
+fn region_uv(region: Option<(f64, f64, f64, f64)>, source_w: u32, source_h: u32) -> [f32; 4] {
+    let (sw, sh) = (source_w.max(1) as f64, source_h.max(1) as f64);
+    match region {
+        // 区域是**闭区间像素范围**,右下 UV 落在 `(x1+1)/w`。
+        //
+        // 证据锚点:
+        // - 闭区间口径 = `yu_backend_soft::imageop::scale_region` 的
+        //   `cw = x1-x0+1`(CPU 参考实现,同一语义);
+        // - 坐标为浮点 = `ERIS/Sprite/es_Sprite.yst` 的
+        //   `CGACT[… SIZE2=1 FX=@X1*100+@FLX …]`(脚本注释原文:「@LEFT_X
+        //   の小数点値を掃い、それを CGACT に伝える」),`FX/100` 即亚像素
+        //   位置;取整会把慢速移动量化成阶梯(2026-10-26 实测);
+        // - **不做 `[0,1]` clamp**:夹紧会把满幅区域 `(0,0,800,600)` 的
+        //   右边界从 801/800 折成 1.0,图像被系统性压窄 1/800(10433 次
+        //   采样里 7226 次触发),放大后是几个像素的「周围往里挤」。
+        Some((x0, y0, x1, y1)) => {
+            // **不要 clamp 到 [0,1]**:区域是闭区间,跨度是 `x1-x0+1` 个源像素
+            // (与 CPU `scale_region` 的 `cw` 同口径)。满幅区域 `(0,0,800,600)`
+            // 在 800px 源上右边界是 `801/800 = 1.00125`;夹到 1.0 就只采
+            // 800px ⇒ 图像被系统性压窄 1/800,放大后是几个像素的"周围往里
+            // 挤"(实测 10433 次采样里 7226 次触发)。保留真实比例后几何
+            // 精确,越界部分由采样器边缘钳制承担。
+            [
+                (x0 / sw) as f32,
+                (y0 / sh) as f32,
+                ((x1 + 1.0) / sw) as f32,
+                ((y1 + 1.0) / sh) as f32,
+            ]
+        }
+        None => [0.0, 0.0, 1.0, 1.0],
+    }
+}
+
+/// UV 缩放的内容身份(没有像素可哈希,用「源 + 区域 + 输出尺寸 + 滤波」)。
+///
+/// 只用于同一帧内脚本重复发同一条 `CGACT` 时判定「同一结果」,不参与
+/// 跨帧像素缓存 —— UV 方案本身没有需要缓存的像素。
+fn uv_scale_hash(source: &LayerId, image: &ImageOp, w: u32, h: u32) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |value: u64| {
+        hash ^= value;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    };
+    for byte in source.as_bytes() {
+        mix(u64::from(*byte));
+    }
+    for value in [image.x, image.y, image.x2, image.y2] {
+        mix(value.map_or(u64::MAX, |v| v as u64));
+    }
+    mix(u64::from(w));
+    mix(u64::from(h));
+    mix(u64::from(image.action.is_bilinear_scale()));
+    hash
+}
+
 fn apply_image_to_override(
     frame: &CompositorFrame,
     textures: &mut TextureStore,
@@ -1816,11 +2247,21 @@ fn apply_image_to_override(
     if target != pass_target {
         return Err("gfx.imageop.target.mismatch".to_string());
     }
+    // 浮点区域(亚像素);只有整数像素动作(RECTPAINT/RESIZE)在各自分支取整。
     let region = match (image.x, image.y, image.x2, image.y2) {
         (Some(x), Some(y), Some(x2), Some(y2)) => Some((x, y, x2, y2)),
         (None, None, None, None) => None,
         _ => return Err("gfx.imageop.region.partial".to_string()),
     };
+    // 整数像素动作需要整数区域;`SIZE` 分支用浮点 `region` 走 UV。
+    let int_region = region.map(|(x, y, x2, y2)| {
+        (
+            x.round() as i64,
+            y.round() as i64,
+            x2.round() as i64,
+            y2.round() as i64,
+        )
+    });
     if image.action.is_scale() {
         let (Some(dw), Some(dh)) = (image.sx, image.sy) else {
             return Err("gfx.imageop.size.missing".to_string());
@@ -1831,80 +2272,93 @@ fn apply_image_to_override(
         }
         // 纹理像素只能是整数:四舍五入(与 `yu-gfx`/soft 后端同口径)。
         let (dw, dh) = (dw.round() as u32, dh.round() as u32);
-        let source_key = if overrides.contains_key(&image.source) {
-            None
-        } else {
-            frame
-                .layers
-                .iter()
-                .find(|layer| layer.id == image.source)
-                .and_then(|layer| match &layer.texture {
-                    TextureRef::Asset(key) => Some(yu_backend_soft::SizeSource::Asset(key.clone())),
-                    TextureRef::SolidBlack1x1 => Some(yu_backend_soft::SizeSource::Solid),
-                    TextureRef::Snapshot(id) => Some(yu_backend_soft::SizeSource::Snapshot(id.0)),
-                    _ => None,
-                })
-        };
-        let key = source_key.map(|source| yu_backend_soft::ImageCacheKey {
-            source,
-            op: yu_backend_soft::ImageOpSig::Size {
-                bilinear: image.action.is_bilinear_scale(),
-                width: dw,
-                height: dh,
-            },
-            region,
-        });
-        if let Some(key) = &key {
-            if let Some(hit) = image_cache.get(key) {
-                // 指纹随纹理一起缓存:同帧内脚本会对同一层重复发同一条
-                // `CGACT[SIZE]`(title 期实测 51 次),深拷贝或重算哈希都会
-                // 吃掉十几毫秒(EVID-J3-08)。
-                overrides.insert(target.clone(), hit.clone());
-                return Ok(());
-            }
-        }
-        if region.is_none() {
-            // 无区域 = 整幅源缩放到目标尺寸。绘制目标层时纹理已按
-            // `layer.image_size()`(= `SX×SY`)拉伸,因此**像素完全不用碰**:
-            // 直接把源纹理交给目标层即可(与引擎 StretchRect 等价)。
-            // 源已在本帧加工过时连 Rc 都不新建。
-            if let Some(src) = overrides.get(&image.source) {
-                let shared = src.clone();
-                overrides.insert(target.clone(), shared);
-                return Ok(());
-            }
-            let source = resolve_cpu_source(frame, textures, targets, overrides, &image.source, 0)?;
-            let shared = Override::new(source);
-            if let Some(key) = key {
-                image_cache.insert(key, shared.clone());
-            }
-            overrides.insert(target.clone(), shared);
+        if dw == 0 || dh == 0 {
             return Ok(());
         }
-        let source = resolve_cpu_source(frame, textures, targets, overrides, &image.source, 0)?;
-        let scaled = yu_backend_soft::scale_region(
-            &source,
-            dw as u32,
-            dh as u32,
-            region,
-            image.action.is_bilinear_scale(),
-        );
-        let shared = Override::new(Rc::new(scaled));
-        if let Some(key) = key {
-            image_cache.insert(key, shared.clone());
+        // **不碰像素**:带区域缩放是「从源的这块矩形采样,铺到那个尺寸」,
+        // 绘制期用 UV 子矩形交给采样器即可。立绘/精灵动画每帧换区域
+        // (实测 `(250,48)-(709,391)` 逐帧漂移),CPU `scale_region` 必然
+        // 全 miss 且单条 16–35 ms;UV 方案与区域是否变化无关。
+        //
+        // 源尺寸只用于把像素矩形归一化;源若本身也是 `Uv` 修饰,按链式展开
+        // (复合区域在语料里不存在,展开深度由 `image_source_dims` 限一)。
+        let (sw, sh) = image_source_dims(frame, textures, targets, overrides, &image.source)?;
+        let uv = region_uv(region, sw, sh);
+        let hash = uv_scale_hash(&image.source, image, dw, dh);
+        if std::env::var("YU_RENDER_TIMING").is_ok() {
+            log::trace!(
+                target: "yu-render",
+                "[rt]   uv_scale src={} source_dims={}x{} region={:?} dst={}x{} uv=[{:.4},{:.4},{:.4},{:.4}]",
+                image.source.display(),
+                sw,
+                sh,
+                region,
+                dw,
+                dh,
+                uv[0],
+                uv[1],
+                uv[2],
+                uv[3]
+            );
         }
-        overrides.insert(target.clone(), shared);
+        overrides.insert(
+            target.clone(),
+            Override::Uv {
+                source: image.source.clone(),
+                uv,
+                width: dw,
+                height: dh,
+                bilinear: image.action.is_bilinear_scale(),
+                hash,
+            },
+        );
         return Ok(());
     }
-    // `REVERSE`/`HORIZONTAL`:整层像素变换,按“源身份 + 操作”跨帧缓存。
-    // 与 soft 的同名分支逐字对齐(`DIV-GFX-052`):源已在本帧加工过时基于
-    // 当前像素算一次(不缓存);否则按源身份查缓存。
+    // `HORIZONTAL`/`VERTICAL`:镜像 = UV 负步长,**纯采样**,不碰像素。
+    //
+    // 与 `SIZE` 一样表达成 `Override::Uv`,只是 UV 矩形左右/上下对调:
+    // 水平镜像把 `[u0,u1]` 换成 `[u1,u0]`,垂直把 `[v0,v1]` 换成 `[v1,v0]`。
+    // 采样器按点/线性插值,与原像素完全一致(镜像没有插值误差)。
     if matches!(
         image.action,
-        ImageAction::Reverse | ImageAction::Horizontal | ImageAction::Vertical
+        ImageAction::Horizontal | ImageAction::Vertical
     ) {
+        let (sw, sh) = image_source_dims(frame, textures, targets, overrides, &image.source)?;
+        let (w, h) = match overrides.get(&image.source) {
+            Some(ov) => ov.dims(),
+            None => (sw, sh),
+        };
+        let mut uv = [0.0f32, 0.0, 1.0, 1.0];
+        // 源若是 UV 修饰(区域缩放结果再镜像),沿用其子矩形再翻转。
+        if let Some(Override::Uv { uv: inner, .. }) = overrides.get(&image.source) {
+            uv = *inner;
+        }
+        match image.action {
+            ImageAction::Horizontal => uv.swap(0, 2),
+            ImageAction::Vertical => uv.swap(1, 3),
+            _ => {}
+        }
+        overrides.insert(
+            target.clone(),
+            Override::Uv {
+                source: image.source.clone(),
+                uv,
+                width: w,
+                height: h,
+                bilinear: false,
+                hash: uv_scale_hash(&image.source, image, w, h),
+            },
+        );
+        return Ok(());
+    }
+    // `REVERSE`:RGB 逐通道取反,是真正的像素运算(需 shader)。在 GPU 版
+    // 反转着色器落地前保持 CPU 路径,并要求源是 CPU 面(显式报缺,不读回)。
+    if image.action == ImageAction::Reverse {
         if let Some(src) = overrides.get(&image.source) {
-            let mut texture = (*src.tex).clone();
+            let Some(src_tex) = src.cpu_tex() else {
+                return Err("gfx.imageop.flip.needs_cpu_source".to_string());
+            };
+            let mut texture = (**src_tex).clone();
             match image.action {
                 ImageAction::Reverse => apply_reverse(&mut texture),
                 ImageAction::Vertical => apply_vertical(&mut texture),
@@ -1967,7 +2421,10 @@ fn apply_image_to_override(
     // `MERGE/MERGE2/XOR/AND`:`ID`(上层)合成到 `ID2`(下层),结果写 `ID2`。
     if image.action.is_layer_composite() {
         let mut lower = match overrides.remove(target) {
-            Some(ov) => Rc::try_unwrap(ov.tex).unwrap_or_else(|rc| (*rc).clone()),
+            Some(Override::Cpu { tex, .. }) => {
+                Rc::try_unwrap(tex).unwrap_or_else(|rc| (*rc).clone())
+            }
+            Some(_) => return Err("gfx.imageop.needs_cpu_target".to_string()),
             None => (*resolve_base_texture(frame, textures, target)?).clone(),
         };
         let upper = resolve_cpu_source(frame, textures, targets, overrides, &image.source, 0)?;
@@ -1982,7 +2439,10 @@ fn apply_image_to_override(
         return Ok(());
     }
     let mut texture = match overrides.remove(target) {
-        Some(ov) => Rc::try_unwrap(ov.tex).unwrap_or_else(|rc| (*rc).clone()),
+        Some(Override::Cpu { tex, .. }) => {
+            Rc::try_unwrap(tex).unwrap_or_else(|rc| (*rc).clone())
+        }
+        Some(_) => return Err("gfx.imageop.needs_cpu_target".to_string()),
         None => (*resolve_base_texture(frame, textures, target)?).clone(),
     };
     match image.action {
@@ -1990,7 +2450,7 @@ fn apply_image_to_override(
             let Some(set) = image.set.as_ref().and_then(|v| v.as_int()) else {
                 return Err("gfx.imageop.set.missing".to_string());
             };
-            apply_rect_paint(&mut texture, image.action.clone(), set, region)?;
+            apply_rect_paint(&mut texture, image.action.clone(), set, int_region)?;
         }
         ImageAction::Reverse => {
             if region.is_some() {
@@ -2011,11 +2471,12 @@ fn apply_image_to_override(
             apply_vertical(&mut texture);
         }
         ImageAction::Resize => {
+            // RESIZE 的四边扩缩量是整数像素。
             let (x, y, x2, y2) = (
-                image.x.unwrap_or(0),
-                image.y.unwrap_or(0),
-                image.x2.unwrap_or(0),
-                image.y2.unwrap_or(0),
+                image.x.unwrap_or(0.0).round() as i64,
+                image.y.unwrap_or(0.0).round() as i64,
+                image.x2.unwrap_or(0.0).round() as i64,
+                image.y2.unwrap_or(0.0).round() as i64,
             );
             apply_resize(&mut texture, x, y, x2, y2)?;
         }
@@ -2091,7 +2552,10 @@ fn resolve_cpu_source(
         return Err("gfx.imageop.source.depth".to_string());
     }
     if let Some(ov) = overrides.get(id) {
-        return Ok(ov.tex.clone());
+        return ov
+            .cpu_tex()
+            .cloned()
+            .ok_or_else(|| "gfx.imageop.source_not_cpu".to_string());
     }
     let layer = frame
         .layers
@@ -2197,6 +2661,7 @@ fn plan_group_compose(
     passes: &mut Vec<PlannedPass>,
     backbuffer: Option<&yu_backend_soft::Surface>,
     backbuffer_gpu: &mut Option<(u64, u64)>,
+    trace_geometry: bool,
 ) -> Result<(), Diag> {
     let Some(pass) = frame
         .passes
@@ -2233,6 +2698,7 @@ fn plan_group_compose(
             counted: false,
             backbuffer,
             backbuffer_gpu,
+            trace_geometry,
             transition_bind_groups,
             transition_buffers,
             dst_width: width,

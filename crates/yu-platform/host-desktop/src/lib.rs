@@ -722,10 +722,17 @@ impl App {
     fn new(mut engine: Engine, mut opts: HostOptions) -> Result<Self, String> {
         let egui_ctx = egui::Context::default();
         install_debug_fonts(&egui_ctx);
-        // 桌面宿主按固定两帧的步进推进逻辑:长帧后不再一次性跑 500ms
-        // 的脚本批次(那是 title 切换时 2.5s 卡顿的来源)。
-        let frame_ms = (1000 / opts.fps.max(1)).max(1);
-        engine.set_max_step_ms(frame_ms * 2);
+        // 逻辑时钟上限**不在这里覆写**:引擎默认(`DEFAULT_MAX_STEP_MS`,
+        // 500ms)就是官方口径。
+        //
+        // 历史:这里曾把它压到两帧(`frame_ms*2` = 32ms),原意是「长帧后
+        // 不要一次性跑完 500ms 的脚本批次」。但脚本补间按真墙钟推进
+        // (`es_Sprite.yst`: `@mTADD = @OS_TIME - @S.TOLD` →
+        // `@S.TNOW += @mTADD`,`@OS_TIME = @_OS_TIME(1)`),把上限压低等于
+        // **把超出的时间直接丢弃、不顺延**:实测 3258 帧里 1260 帧(38.7%)
+        // 被截断,累计丢 6.58 秒 ⇒ 所有位移/缩放动画系统性慢于真实时间,
+        // 长卡顿(最长 366ms)后进度条几乎不动、下一个正常帧再猛追,观感
+        // 就是「卡住然后突然跳过去」。官方引擎不做这种截断。
         if let Some(cap) = opts.pump_cap {
             engine.set_pump_cap(Some(cap.max(1)));
             host_error!(

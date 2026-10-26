@@ -672,9 +672,12 @@ fn cgact_size_accepts_fixed_point_fx_fsx_keys() {
     // 尺寸:FSX/FSY ÷100(`@SIZE_X*100` ⇒ 原像素)。
     assert_eq!(img.sx, Some(399.0));
     assert_eq!(img.sy, Some(299.0));
-    // 区域:FX/FY/FX2/FY2 ÷100 后取整(与 `find_px` 同口径)。
-    assert_eq!((img.x, img.y), (Some(12), Some(57)));
-    assert_eq!((img.x2, img.y2), (Some(411), Some(356)));
+    // 区域:FX/FY/FX2/FY2 ÷100,**保留亚像素**(不取整)。
+    // 精灵系统把位置拆成整数部分 + 小数部分(`FX = @X1*100 + @FLX`),
+    // 取整会把慢速移动量化成阶梯抖动;亚像素值直接进 UV 采样。
+    // `FX=1234 ⇒ 12.34`:小数部分必须保留(取整会让慢速移动抖成阶梯)。
+    assert_eq!((img.x, img.y), (Some(12.34), Some(56.78)));
+    assert_eq!((img.x2, img.y2), (Some(411.34), Some(355.78)));
     assert_eq!(img.status, OpStatus::Executable);
 }
 

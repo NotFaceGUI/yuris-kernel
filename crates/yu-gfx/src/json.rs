@@ -491,13 +491,13 @@ pub fn op(out: &mut String, o: &Op) {
             out.push_str(",\"sy\":");
             opt_f64(out, i.sy);
             out.push_str(",\"x\":");
-            opt_i64(out, i.x);
+            opt_f64(out, i.x);
             out.push_str(",\"y\":");
-            opt_i64(out, i.y);
+            opt_f64(out, i.y);
             out.push_str(",\"x2\":");
-            opt_i64(out, i.x2);
+            opt_f64(out, i.x2);
             out.push_str(",\"y2\":");
-            opt_i64(out, i.y2);
+            opt_f64(out, i.y2);
             out.push_str(",\"status\":");
             op_status(out, i.status);
             out.push('}');

@@ -204,8 +204,8 @@ fn swap2_swaps_textures_only() {
     assert_eq!(a.texture, TextureRef::Asset(b"b".to_vec()));
     assert_eq!(b.texture, TextureRef::Asset(b"a".to_vec()));
     // FUN_0042f57d:SWAP/SWAP2 都交换 +0x68/+0x70(X/Y)。
-    assert_eq!((a.transform.x, a.transform.y), (33, 44));
-    assert_eq!((b.transform.x, b.transform.y), (11, 22));
+    assert_eq!((a.transform.x, a.transform.y), (33.0, 44.0));
+    assert_eq!((b.transform.x, b.transform.y), (11.0, 22.0));
     // SWAP2 只换图像(+坐标),不换 A。
     assert_eq!(a.alpha, 128);
     assert_eq!(b.alpha, 64);

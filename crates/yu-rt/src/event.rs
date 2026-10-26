@@ -115,6 +115,14 @@ pub struct ArgValue {
     pub slot: u8,
     pub value: Value,
     pub reference: Option<VarRef>,
+    /// 参数窗口是 YSCM 参数种类 2(`NumericOffset`,源写法 `X+=`)。
+    ///
+    /// **只表示数据编码**,不是「在当前值上累加」的算术语义:旁线 §3.17 把
+    /// 种类 2 记为「数字 + 脚本内偏移」(数值在脚本体里按偏移存取)。语料
+    /// `es_Sprite.yst` 56 处以该形式给 `CG[X/Y]`/`CGACT[X/Y/X2/Y2]` 传
+    /// 居中修正量;按累加处理会让持久层逐帧漂移、补间结束时"跳回原位"
+    /// (2026-10-26 实测)。消费方一律按普通数值处理,本字段仅供诊断留痕。
+    pub offset: bool,
 }
 
 impl ArgValue {
@@ -123,6 +131,7 @@ impl ArgValue {
             slot,
             value,
             reference: None,
+            offset: false,
         }
     }
 
@@ -132,6 +141,7 @@ impl ArgValue {
             slot,
             value,
             reference: Some(var),
+            offset: false,
         }
     }
 }

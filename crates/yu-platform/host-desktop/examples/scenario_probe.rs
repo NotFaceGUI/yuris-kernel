@@ -38,6 +38,11 @@ use yu_engine::project::Project;
 use yu_rt::input::{InputFrame, InputTimeline};
 
 fn main() {
+    // `YU_RENDER_TIMING`/`YU_FONT_TRACE` 等诊断走 `log::trace`,没有门面桥
+    // 就全被丢掉;级别由 `YU_LOG` 决定(缺省 warn,`trace`/`verbose` 才出声)。
+    yu_log::facade::init(std::sync::Arc::new(|level, target, message| {
+        eprintln!("[{level:?}] {target}: {message}");
+    }));
     if let Err(error) = run() {
         eprintln!("scenario_probe: {error}");
         std::process::exit(2);
@@ -63,6 +68,8 @@ fn run() -> Result<(), String> {
     let mut shots_override: Option<BTreeSet<u64>> = None;
     let mut out_dir = PathBuf::from("target/tmp/p1");
     let mut hash_csv: Option<PathBuf> = None;
+    // 逐帧时序 CSV(帧号/图层/op/阶段耗时):定位「越跑越慢」单调增长用。
+    let mut frame_csv: Option<PathBuf> = None;
     let mut index = 2;
     while index < args.len() {
         match args[index].as_str() {
@@ -97,6 +104,10 @@ fn run() -> Result<(), String> {
                 hash_csv = Some(PathBuf::from(args.get(index + 1).ok_or_else(usage)?));
                 index += 2;
             }
+            "--frame-csv" => {
+                frame_csv = Some(PathBuf::from(args.get(index + 1).ok_or_else(usage)?));
+                index += 2;
+            }
             other => return Err(format!("未知参数 `{other}`\n{}", usage())),
         }
     }
@@ -122,6 +133,10 @@ fn run() -> Result<(), String> {
     let mut shot_notes: Vec<ShotNote> = Vec::new();
     let mut previous_sha: Option<String> = None;
     let mut hash_lines = String::from("host_frame,engine_frame,sha256\n");
+    let mut frame_lines = String::from(
+        "host_frame,engine_frame,layers,visible,passes,ops,executed,skipped,drawable,\
+         tick_ms,render_ms,total_ms\n",
+    );
     let mut closes = scenario.closes.clone();
     closes.sort_unstable();
     for host_frame in 1..=u64::from(scenario.frames) {
@@ -148,6 +163,21 @@ fn run() -> Result<(), String> {
         {
             use std::fmt::Write as _;
             let _ = writeln!(hash_lines, "{host_frame},{},{sha}", report.frame);
+            let _ = writeln!(
+                frame_lines,
+                "{host_frame},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3}",
+                report.frame,
+                report.layers,
+                report.visible,
+                report.passes,
+                report.ops,
+                report.executed,
+                report.skipped,
+                report.drawable as u8,
+                report.tick_ms,
+                report.render_ms,
+                report.ms
+            );
         }
 
         if shots.contains(&host_frame) {
@@ -220,6 +250,17 @@ fn run() -> Result<(), String> {
         std::fs::write(&path, hash_lines)
             .map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
         println!("frame hashes: {}", path.display());
+    }
+    if let Some(path) = frame_csv {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("创建 {} 失败: {e}", parent.display()))?;
+            }
+        }
+        std::fs::write(&path, frame_lines)
+            .map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
+        println!("frame timings: {}", path.display());
     }
     Ok(())
 }

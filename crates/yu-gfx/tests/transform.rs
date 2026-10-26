@@ -29,8 +29,8 @@ fn xy_are_stored_as_engine_integers() {
         .iter()
         .find(|l| l.id.display() == ":/W0/L")
         .unwrap();
-    assert_eq!(l.transform.x, 123456789);
-    assert_eq!(l.transform.y, -987654321);
+    assert_eq!(l.transform.x, 123456789.0);
+    assert_eq!(l.transform.y, -987654321.0);
     // 不做 16.16/半像素换算:gfx 只保存引擎单位。
     assert_eq!(l.transform.filter.values.len(), 0);
 }

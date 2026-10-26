@@ -95,7 +95,13 @@ pub struct EngineOptions {
     pub dx_mode: u32,
     pub os_sound: bool,
     pub media_readonly: bool,
-    /// wgpu 首帧与软后端做计数对账(默认 true)。
+    /// wgpu 首帧与软后端做计数对账(**默认关**,2026-10-26)。
+    ///
+    /// 软后端是**自建参考实现**,不是官方真值(真值 = SDK demo / 官方二进制
+    /// 行为);亚像素与纹理滤波对齐到引擎真值之后,两端的绘制计数虽然仍应
+    /// 一致,但像素不再逐位相同。门禁已完成历史使命,默认关闭以免每次 wgpu
+    /// 运行都额外构造一整套 `SoftRenderer`(独立 `TextureStore`,会重复解码
+    /// 资产)。需要 A/B 时显式 `--reconcile` 打开。
     pub reconcile: bool,
     /// 存档根重定向(P4 M-C)。`None` = 工程根下 `save/`(只读观察:
     /// SAVE 刷盘与 FILEACT 落盘一律拒绝,保护语料目录);`Some(dir)` =
@@ -124,7 +130,7 @@ impl Default for EngineOptions {
             dx_mode: 0,
             os_sound: true,
             media_readonly: false,
-            reconcile: true,
+            reconcile: false,
             save_root: None,
             warm_text: false,
             force_font: None,
@@ -645,13 +651,19 @@ impl Engine {
         self.last_render.as_ref()
     }
 
-    /// `Some(true)` = 已与软后端做过逐计数对账且一致;`Some(false)` = 尚未;
-    /// `None` = 当前不是 wgpu 后端。
+    /// `Some(true)` = 已与软后端做过逐计数对账且一致;`Some(false)` = 已请求
+    /// 对账但尚未完成;**`None` = 不是 wgpu 后端,或根本没有请求对账**
+    /// (默认关;不再把「没请求」报成 PENDING)。
     pub fn wgpu_reconciled(&self) -> Option<bool> {
         match &self.renderer {
             Renderer::Wgpu {
                 check, configured, ..
-            } => Some(*configured && check.is_none()),
+            } => {
+                if !*configured {
+                    return None;
+                }
+                Some(check.is_none())
+            }
             Renderer::Soft(_) => None,
         }
     }
@@ -1003,6 +1015,13 @@ impl Engine {
             .as_ref()
             .map(|frame| frame.diagnostics.clone())
             .unwrap_or_default()
+    }
+
+    /// 只读访问 gfx 状态(诊断探针:图层表/复制日志/图像日志增长审计)。
+    ///
+    /// 借用只用于观察;状态写入仍必须经 VM 事件。
+    pub fn gfx_state(&self) -> Option<std::cell::Ref<'_, yu_gfx::GfxState>> {
+        self.state.as_ref().map(|state| state.borrow())
     }
 
     /// 全程 gfx 帧诊断累计(跨帧聚合;headless 末尾汇总用)。
@@ -1451,10 +1470,20 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
             from_config
         }
     };
-    let state = Rc::new(RefCell::new(
-        GfxState::from_tables(vm.tables(), GfxConfig::new(viewport))
-            .map_err(|d| Failure::runtime(format!("GfxState 构造失败: {d}")))?,
+    let mut gfx_state = GfxState::from_tables(vm.tables(), GfxConfig::new(viewport))
+        .map_err(|d| Failure::runtime(format!("GfxState 构造失败: {d}")))?;
+    // 引擎全局纹理过滤真值:`FUN_00460924` 读完 `yscfg.dat` 后**无条件**写
+    // `MAG=1`/`MIN=1`/`MIP=0`(LINEAR/LINEAR/POINT,无各向异性),不从设置
+    // 文件读(docs/render-parity.md §4)。此前从未注入,后端一直用
+    // `TextureFilter::unknown()`(POINT/POINT)占位 —— 立绘/背景位移时
+    // 采样点吸附到 texel 网格,亚像素位移不产生视觉变化,于是观感是
+    // 「一格格跳」而不是平滑移动。
+    gfx_state.set_filter(yu_gfx::TextureFilter::engine_settings(
+        yu_gfx::FilterMode::Linear,
+        yu_gfx::FilterMode::Linear,
+        yu_gfx::MipFilter::Point,
     ));
+    let state = Rc::new(RefCell::new(gfx_state));
     let mut gfx_host = GfxHost::new(state.clone());
     // `CGINFO[ONMOUSE*]` 需要像素;宿主用独立 `TextureStore` 提供采样面。
     // 打开数据源失败时保持 None,查询按 Unimplemented 挂号(不猜 0)。

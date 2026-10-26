@@ -407,8 +407,8 @@ impl SoftRenderer {
                         draw_image(
                             &mut surface,
                             image,
-                            0,
-                            0,
+                            0.0,
+                            0.0,
                             overlay.width,
                             overlay.height,
                             255,
@@ -482,8 +482,13 @@ fn apply_image_op(
     if target != pass_target {
         return Err("gfx.imageop.target.mismatch".to_string());
     }
+    // 软后端是**整数像素**参考实现(`scale_region` 逐 texel 重采样),区域
+    // 在这里显式取整。产品路径(wgpu)保留浮点并用 UV 子矩形做亚像素采样
+    // —— 精灵系统的位置小数部分正是靠那条路径才不抖。
     let region = match (image.x, image.y, image.x2, image.y2) {
-        (Some(x), Some(y), Some(x2), Some(y2)) => Some((x, y, x2, y2)),
+        (Some(x), Some(y), Some(x2), Some(y2)) => {
+            Some((x.round() as i64, y.round() as i64, x2.round() as i64, y2.round() as i64))
+        }
         (None, None, None, None) => None,
         _ => return Err("gfx.imageop.region.partial".to_string()),
     };
@@ -708,10 +713,10 @@ fn apply_image_op(
             // RESIZE 的 X/Y/X2/Y2 是四边相对扩缩量(不是源区域),
             // 因此走专用路径:上面统一解析出的 `region` 只对区域类动作有意义。
             let (x, y, x2, y2) = (
-                image.x.unwrap_or(0),
-                image.y.unwrap_or(0),
-                image.x2.unwrap_or(0),
-                image.y2.unwrap_or(0),
+                image.x.unwrap_or(0.0).round() as i64,
+                image.y.unwrap_or(0.0).round() as i64,
+                image.x2.unwrap_or(0.0).round() as i64,
+                image.y2.unwrap_or(0.0).round() as i64,
             );
             apply_resize(&mut texture, x, y, x2, y2)?;
         }
@@ -1799,8 +1804,8 @@ struct TransitionMask<'a> {
 fn draw_image(
     dst: &mut Surface,
     image: ImageRef<'_>,
-    x: i64,
-    y: i64,
+    x: f64,
+    y: f64,
     dest_width: u32,
     dest_height: u32,
     alpha: u8,
@@ -1817,39 +1822,72 @@ fn draw_image(
     {
         return;
     }
-    let clip_x0 = x.max(0);
-    let clip_y0 = y.max(0);
-    let clip_x1 = x
-        .saturating_add(i64::from(dest_width))
+    // 位置是**亚像素**(引擎顶点为 float)。覆盖的整数像素范围取
+    // `[floor(x), floor(x)+w+]`,取样相位由 `x` 的小数部分承担 ——
+    // 与官方 D3D9 光栅化 + 纹理坐标口径一致。
+    let x0i = x.floor() as i64;
+    let y0i = y.floor() as i64;
+    let clip_x0 = x0i.max(0);
+    let clip_y0 = y0i.max(0);
+    // 亚像素时最多多覆盖 1 个像素;整数时严格 `[x, x+w)`(与旧行为逐位相同)。
+    let extra = i64::from(!(x.fract() == 0.0 && y.fract() == 0.0));
+    let clip_x1 = x0i
+        .saturating_add(i64::from(dest_width) + extra)
         .min(i64::from(dst.width));
-    let clip_y1 = y
-        .saturating_add(i64::from(dest_height))
+    let clip_y1 = y0i
+        .saturating_add(i64::from(dest_height) + extra)
         .min(i64::from(dst.height));
     if clip_x1 <= clip_x0 || clip_y1 <= clip_y0 {
         return;
     }
-    let direct = dest_width == image.width && dest_height == image.height;
+    // 相位为零且尺寸一致时走整像素快路径(逐位与旧实现相同)。
+    let integral = x.fract() == 0.0 && y.fract() == 0.0;
+    let direct = integral && dest_width == image.width && dest_height == image.height;
     // psC/psD 由像素着色器接管源色;固定管线才做 stage0/stage1 归约。
     let shader_stage = transition.is_some_and(|mask| mask.hlsl_mask || mask.crossfade);
     for py in clip_y0..clip_y1 {
         for px in clip_x0..clip_x1 {
-            // i128: X/Y 是脚本 i64,极端值下 `px - x` 也不能溢出。
-            let dx = (i128::from(px) - i128::from(x)) as u32;
-            let dy = (i128::from(py) - i128::from(y)) as u32;
+            // 目标像素中心相对层原点的**浮点**偏移(可能为负,取样时钳到 0)。
+            let dxf = (px as f64 + 0.5) - x;
+            let dyf = (py as f64 + 0.5) - y;
             let mut src = if direct {
-                image.pixel(dx, dy)
+                let sx = (dxf.max(0.0) as u32).min(image.width - 1);
+                let sy = (dyf.max(0.0) as u32).min(image.height - 1);
+                image.pixel(sx, sy)
+            } else if integral {
+                sample(
+                    image,
+                    dxf.max(0.0) as u32,
+                    dyf.max(0.0) as u32,
+                    dest_width,
+                    dest_height,
+                    filter,
+                )
             } else {
-                sample(image, dx, dy, dest_width, dest_height, filter)
+                sample_subpixel(image, dxf, dyf, dest_width, dest_height, filter)
             };
             let layer_a = alpha;
             let alpha = match transition {
                 Some(mask) => {
-                    let mask_px =
-                        if dest_width == mask.image.width && dest_height == mask.image.height {
-                            mask.image.pixel(dx, dy)
-                        } else {
-                            sample(mask.image, dx, dy, dest_width, dest_height, filter)
-                        };
+                    let mask_px = if integral
+                        && dest_width == mask.image.width
+                        && dest_height == mask.image.height
+                    {
+                        let mx = (dxf.max(0.0) as u32).min(mask.image.width - 1);
+                        let my = (dyf.max(0.0) as u32).min(mask.image.height - 1);
+                        mask.image.pixel(mx, my)
+                    } else if integral {
+                        sample(
+                            mask.image,
+                            dxf.max(0.0) as u32,
+                            dyf.max(0.0) as u32,
+                            dest_width,
+                            dest_height,
+                            filter,
+                        )
+                    } else {
+                        sample_subpixel(mask.image, dxf, dyf, dest_width, dest_height, filter)
+                    };
                     if mask.crossfade {
                         // pass0(psD):`oC0 = tex1*(1-FadeVal) + tex2*FadeVal`,
                         // 再乘 `YS_AlphaVal`(由本函数的 alpha 承担)。
@@ -1941,6 +1979,65 @@ fn sample(
                 mix(c00[2], c10[2], c01[2], c11[2]),
                 mix(c00[3], c10[3], c01[3], c11[3]),
             ]
+        }
+    }
+}
+
+/// 亚像素取样(D3D9 纹理坐标口径)。
+///
+/// `dxf/dyf` 是「目标像素中心相对层原点」的浮点偏移。映射到源纹理:
+/// `sx = dxf * src_w / dst_w - 0.5`(D3D9 texel 中心在 +0.5);`Point` 取
+/// 最近 texel,`Linear` 取相邻 4 texel 按小数部分加权 —— 与官方
+/// `D3DTEXF_POINT`/`D3DTEXF_LINEAR` 采样状态同义。
+fn sample_subpixel(
+    image: ImageRef<'_>,
+    dxf: f64,
+    dyf: f64,
+    dest_width: u32,
+    dest_height: u32,
+    filter: FilterMode,
+) -> [u8; 4] {
+    if image.width == 0 || image.height == 0 || dest_width == 0 || dest_height == 0 {
+        return [0, 0, 0, 0];
+    }
+    let sx = dxf * f64::from(image.width) / f64::from(dest_width) - 0.5;
+    let sy = dyf * f64::from(image.height) / f64::from(dest_height) - 0.5;
+    let max_x = (image.width - 1) as f64;
+    let max_y = (image.height - 1) as f64;
+    match filter {
+        FilterMode::Point => {
+            let x = sx.round().clamp(0.0, max_x) as u32;
+            let y = sy.round().clamp(0.0, max_y) as u32;
+            image.pixel(x, y)
+        }
+        FilterMode::Linear | FilterMode::Anisotropic => {
+            let xf = sx.clamp(0.0, max_x);
+            let yf = sy.clamp(0.0, max_y);
+            let x0f = xf.floor();
+            let y0f = yf.floor();
+            let fx = xf - x0f;
+            let fy = yf - y0f;
+            let x0 = x0f as u32;
+            let y0 = y0f as u32;
+            let x1 = (x0 + 1).min(image.width - 1);
+            let y1 = (y0 + 1).min(image.height - 1);
+            let c00 = image.pixel(x0, y0);
+            let c10 = image.pixel(x1, y0);
+            let c01 = image.pixel(x0, y1);
+            let c11 = image.pixel(x1, y1);
+            let w00 = (1.0 - fx) * (1.0 - fy);
+            let w10 = fx * (1.0 - fy);
+            let w01 = (1.0 - fx) * fy;
+            let w11 = fx * fy;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                let v = f64::from(c00[c]) * w00
+                    + f64::from(c10[c]) * w10
+                    + f64::from(c01[c]) * w01
+                    + f64::from(c11[c]) * w11;
+                out[c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+            out
         }
     }
 }

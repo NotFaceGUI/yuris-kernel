@@ -337,7 +337,12 @@ impl Vm {
                 }
             }
             if let Ok(v) = self.eval_window(st, w) {
-                args.push(ArgValue::new(w.rec.kind, v));
+                let mut arg = ArgValue::new(w.rec.kind, v);
+                // 参数种类 2 = 数值 + 脚本内偏移(`X+=` 源写法;只是数据
+                // 编码,消费方按普通数值处理,不做累加)。
+                arg.offset = crate::tables::ParamKind::from_code(w.rec.kind)
+                    == crate::tables::ParamKind::NumericOffset;
+                args.push(arg);
             }
         }
         args

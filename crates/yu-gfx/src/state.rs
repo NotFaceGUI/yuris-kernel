@@ -54,6 +54,8 @@ struct OwnedArg {
     name: Option<String>,
     slot: u8,
     value: Value,
+    /// YSCM 参数种类 2(`NumericOffset`)。只表示数据编码,不改变算术语义。
+    offset: bool,
 }
 
 /// 图形域配置(视口/清屏/过滤/扩展名顺序/主窗口图层组)。
@@ -777,8 +779,10 @@ impl GfxState {
         Ok(match flag {
             "E" => Value::Int(i64::from(layer.visible)),
             "A" => Value::Int(i64::from(layer.alpha)),
-            "X" => Value::Int(layer.transform.x),
-            "Y" => Value::Int(layer.transform.y),
+            // `CGINFO[X/Y]` 的消费点是整数槽(引擎按 i64 读参数槽);
+            // 内部保留浮点,读回时量化。
+            "X" => Value::Int(layer.transform.x.round() as i64),
+            "Y" => Value::Int(layer.transform.y.round() as i64),
             "Z" => Value::Int(layer.z),
             "MODE" => Value::Int(i64::from(layer.blend.code())),
             "T" => Value::Int(i64::from(layer.transition.as_ref().map_or(256, |t| t.t))),
@@ -876,8 +880,10 @@ impl GfxState {
         if let Some(v) = set2 {
             my = v;
         }
-        let x0 = layer.transform.x;
-        let y0 = layer.transform.y;
+        // 命中测试按**像素包含**判定:左上角浮点位置覆盖的整数像素范围是
+        // `[floor(x), floor(x)+w)`(与绘制时 quad 覆盖的像素一致)。
+        let x0 = layer.transform.x.floor() as i64;
+        let y0 = layer.transform.y.floor() as i64;
         let lx = mx - x0;
         let ly = my - y0;
         if lx < 0 || ly < 0 || lx >= i64::from(display.width) || ly >= i64::from(display.height) {
@@ -1393,7 +1399,7 @@ impl GfxState {
         let resolved = self.resolved_owned("CG", args);
         let mut id: Option<Vec<u8>> = None;
         let mut idno: Option<i64> = None;
-        let mut params: Vec<(String, EngineValue)> = Vec::new();
+        let mut params: Vec<(String, EngineValue, bool)> = Vec::new();
         for r in resolved {
             let Some(name) = r.name.as_deref() else {
                 self.arg_slot_missing("CG", r.slot);
@@ -1408,7 +1414,11 @@ impl GfxState {
                     Some(n) => idno = Some(n),
                     None => self.arg_type("CG", "IDNO", "整数", &r.value),
                 },
-                _ => params.push((name.to_string(), EngineValue::from_value(&r.value))),
+                _ => params.push((
+                    name.to_string(),
+                    EngineValue::from_value(&r.value),
+                    r.offset,
+                )),
             }
         }
         let Some(id) = id else {
@@ -1587,7 +1597,7 @@ impl GfxState {
         let resolved = self.resolved_owned("CGACT", args);
         let mut ids: [Option<Vec<u8>>; 4] = [None, None, None, None];
         let mut idnos: [Option<i64>; 4] = [None, None, None, None];
-        let mut params: Vec<(String, EngineValue)> = Vec::new();
+        let mut params: Vec<(String, EngineValue, bool)> = Vec::new();
         for r in resolved {
             let Some(name) = r.name.as_deref() else {
                 self.arg_slot_missing("CGACT", r.slot);
@@ -1621,7 +1631,11 @@ impl GfxState {
                 }
                 continue;
             }
-            params.push((name.to_string(), EngineValue::from_value(&r.value)));
+            params.push((
+                name.to_string(),
+                EngineValue::from_value(&r.value),
+                r.offset,
+            ));
         }
 
         let paths: Vec<Option<LayerId>> = (0..4)
@@ -1683,13 +1697,18 @@ impl GfxState {
         // 证据锚点:语料 `es_Sprite.yst:8538 es.CGACT_SIZE` + §7 反汇编。
         // 不实现这条回退的后果:整条 SIZE2 判「尺寸缺失」⇒ 图层被标记
         // 不可执行 ⇒ 立绘/CG 永久不上屏。
-        let fixed_px = |name: &str| {
-            find_f64(&params, name).map(|v| (v / 100.0).round() as i64)
+        // `FX/FY/FX2/FY2` = 同一座标的百分位定点形式,**保留浮点**:
+        // `FX=@X1*100+@FLX` ⇒ `FX/100` 就是亚像素位置。旧实现在这里
+        // `round() as i64`,把小数部分整条丢掉 ⇒ 慢速移动(每帧 <1px)
+        // 被量化成阶梯抖动,越慢越明显。
+        let fixed_px = |name: &str| find_f64(&params, name).map(|v| v / 100.0);
+        let px = |name_int: &str, name_fixed: &str| -> Option<f64> {
+            find_f64(&params, name_int).or_else(|| fixed_px(name_fixed))
         };
-        let x = find_px(&params, "X").or_else(|| fixed_px("FX"));
-        let y = find_px(&params, "Y").or_else(|| fixed_px("FY"));
-        let x2 = find_px(&params, "X2").or_else(|| fixed_px("FX2"));
-        let y2 = find_px(&params, "Y2").or_else(|| fixed_px("FY2"));
+        let x = px("X", "FX");
+        let y = px("Y", "FY");
+        let x2 = px("X2", "FX2");
+        let y2 = px("Y2", "FY2");
         // SIZE/SIZE2 的目标尺寸(手册 cg/cgact.html 例 3/4)。
         //
         // **必须按浮点读**:`es_Sprite.yst` 的 `es.CGACT_SIZE` 传进来的
@@ -1794,10 +1813,10 @@ impl GfxState {
         kind: CopyKind,
         source: &LayerId,
         dest: &LayerId,
-        x: Option<i64>,
-        y: Option<i64>,
-        x2: Option<i64>,
-        y2: Option<i64>,
+        x: Option<f64>,
+        y: Option<f64>,
+        x2: Option<f64>,
+        y2: Option<f64>,
     ) {
         if !self.nodes.contains_key(source) {
             self.push_diag(
@@ -1826,8 +1845,21 @@ impl GfxState {
         }
         let copy_id = CopyId(self.next_copy());
         let seq = self.next_texture_seq();
-        let region = if x.is_some() || y.is_some() || x2.is_some() || y2.is_some() {
-            CopyRegion::Partial { x, y, x2, y2 }
+        // COPY 是像素切片(整数矩形),在这里显式取整;图像加工的 `SIZE`
+        // 保持浮点(亚像素采样),两者不共用量化点。
+        let (ci_x, ci_y, ci_x2, ci_y2) = (
+            x.map(|v| v.round() as i64),
+            y.map(|v| v.round() as i64),
+            x2.map(|v| v.round() as i64),
+            y2.map(|v| v.round() as i64),
+        );
+        let region = if ci_x.is_some() || ci_y.is_some() || ci_x2.is_some() || ci_y2.is_some() {
+            CopyRegion::Partial {
+                x: ci_x,
+                y: ci_y,
+                x2: ci_x2,
+                y2: ci_y2,
+            }
         } else {
             CopyRegion::Full
         };
@@ -2187,8 +2219,8 @@ impl GfxState {
         target: &LayerId,
         set: Option<EngineValue>,
         set_str: Option<Vec<u8>>,
-        x: Option<i64>,
-        y: Option<i64>,
+        x: Option<f64>,
+        y: Option<f64>,
         bno: Option<i64>,
     ) {
         if !self.nodes.contains_key(target) {
@@ -2225,8 +2257,9 @@ impl GfxState {
         let draw = TextDraw {
             target: target.clone(),
             bytes,
-            x: x.unwrap_or(0),
-            y: y.unwrap_or(0),
+            // 字符绘制按整数像素落位(与 `CGACT[TEXT]` 的整数语义一致)。
+            x: x.map(|v| v.round() as i64).unwrap_or(0),
+            y: y.map(|v| v.round() as i64).unwrap_or(0),
             // 引擎按命令到达时的 FONT 状态绘制(REA 0x404a1b 读 +0x28/+0x33/+0x34)。
             style: self.style.clone(),
             set,
@@ -2270,10 +2303,10 @@ impl GfxState {
         set_str: Option<Vec<u8>>,
         sx: Option<f64>,
         sy: Option<f64>,
-        x: Option<i64>,
-        y: Option<i64>,
-        x2: Option<i64>,
-        y2: Option<i64>,
+        x: Option<f64>,
+        y: Option<f64>,
+        x2: Option<f64>,
+        y2: Option<f64>,
     ) {
         if !self.nodes.contains_key(source) {
             self.push_diag(
@@ -2656,6 +2689,7 @@ impl GfxState {
                 name: r.name.map(str::to_string),
                 slot: r.slot,
                 value: r.value.clone(),
+                offset: r.offset,
             })
             .collect()
     }
@@ -3294,14 +3328,14 @@ fn flag_value(v: &Value) -> bool {
     }
 }
 
-fn find_value(params: &[(String, EngineValue)], name: &str) -> Option<EngineValue> {
+fn find_value(params: &[(String, EngineValue, bool)], name: &str) -> Option<EngineValue> {
     params
         .iter()
-        .find(|(n, _)| n == name)
-        .map(|(_, v)| v.clone())
+        .find(|(n, _, _)| n == name)
+        .map(|(_, v, _)| v.clone())
 }
 
-fn find_int(params: &[(String, EngineValue)], name: &str) -> Option<i64> {
+fn find_int(params: &[(String, EngineValue, bool)], name: &str) -> Option<i64> {
     find_value(params, name).and_then(|v| v.as_int())
 }
 
@@ -3309,7 +3343,7 @@ fn find_int(params: &[(String, EngineValue)], name: &str) -> Option<i64> {
 ///
 /// `CGACT[SIZE/SIZE2]` 的 `SX/SY` 是缩放后的尺寸,实测带小数
 /// (`SY=825.5`);`find_int` 的 `fract()==0` 守卫会把它们判成「未给」。
-fn find_f64(params: &[(String, EngineValue)], name: &str) -> Option<f64> {
+fn find_f64(params: &[(String, EngineValue, bool)], name: &str) -> Option<f64> {
     find_value(params, name).and_then(|v| v.as_f64())
 }
 
@@ -3318,15 +3352,12 @@ fn find_f64(params: &[(String, EngineValue)], name: &str) -> Option<f64> {
 /// 与 [`find_int`] 的区别:后者要求 `fract()==0`,会把
 /// `CGACT[… Y2=824.5]` 这类真实参数判成「未给」,进而让区域只剩 3 个字段
 /// 并触发 `gfx.imageop.region.partial`(sprite 整条 SIZE 被跳过)。
-fn find_px(params: &[(String, EngineValue)], name: &str) -> Option<i64> {
-    find_value(params, name).and_then(|v| v.as_f64()).map(|f| f.round() as i64)
-}
 
-fn find_str(params: &[(String, EngineValue)], name: &str) -> Option<Vec<u8>> {
+fn find_str(params: &[(String, EngineValue, bool)], name: &str) -> Option<Vec<u8>> {
     find_value(params, name).and_then(|v| v.as_bytes().map(|b| b.to_vec()))
 }
 
-fn flag(params: &[(String, EngineValue)], name: &str) -> bool {
+fn flag(params: &[(String, EngineValue, bool)], name: &str) -> bool {
     find_value(params, name).is_some_and(|v| match v {
         EngineValue::Int(i) => i != 0,
         EngineValue::Float(f) => f != 0.0,
@@ -3334,8 +3365,8 @@ fn flag(params: &[(String, EngineValue)], name: &str) -> bool {
     })
 }
 
-fn take_file(params: &[(String, EngineValue)], diags: &mut Vec<Diag>) -> Option<TextureRef> {
-    for (name, value) in params {
+fn take_file(params: &[(String, EngineValue, bool)], diags: &mut Vec<Diag>) -> Option<TextureRef> {
+    for (name, value, _offset) in params {
         if name != "FILE" {
             continue;
         }
@@ -3391,10 +3422,10 @@ fn rect_paint_precheck(
     set_str: &Option<Vec<u8>>,
     sx: Option<f64>,
     sy: Option<f64>,
-    x: Option<i64>,
-    y: Option<i64>,
-    x2: Option<i64>,
-    y2: Option<i64>,
+    x: Option<f64>,
+    y: Option<f64>,
+    x2: Option<f64>,
+    y2: Option<f64>,
 ) -> Result<(), &'static str> {
     if set.as_ref().and_then(EngineValue::as_int).is_none() {
         return Err("gfx.imageop.set.missing");
@@ -3486,15 +3517,15 @@ fn value_truthy(v: &EngineValue) -> bool {
 }
 
 /// 一次扫描得到“被置位的参数名”,避免每个动作重复全表查找。
-fn active_params(params: &[(String, EngineValue)]) -> BTreeSet<&str> {
+fn active_params(params: &[(String, EngineValue, bool)]) -> BTreeSet<&str> {
     params
         .iter()
-        .filter(|(_, v)| value_truthy(v))
-        .map(|(n, _)| n.as_str())
+        .filter(|(_, v, _)| value_truthy(v))
+        .map(|(n, _, _)| n.as_str())
         .collect()
 }
 
-fn count_image_actions(params: &[(String, EngineValue)]) -> usize {
+fn count_image_actions(params: &[(String, EngineValue, bool)]) -> usize {
     let active = active_params(params);
     IMAGE_ACTIONS
         .iter()
@@ -3502,10 +3533,10 @@ fn count_image_actions(params: &[(String, EngineValue)]) -> usize {
         .count()
 }
 
-fn first_image_action(params: &[(String, EngineValue)]) -> Option<(&'static str, ImageAction)> {
+fn first_image_action(params: &[(String, EngineValue, bool)]) -> Option<(&'static str, ImageAction)> {
     let active = active_params(params);
     // 参数顺序即编译器窗口顺序;取第一个出现的动作。
-    for (name, _) in params {
+    for (name, _, _) in params {
         if !active.contains(name.as_str()) {
             continue;
         }
@@ -3521,7 +3552,7 @@ fn first_image_action(params: &[(String, EngineValue)]) -> Option<(&'static str,
 /// 应用 `CG` 属性参数。返回诊断(不直接写 self,避免借用冲突)。
 fn apply_layer_params(
     layer: &mut Layer,
-    params: &[(String, EngineValue)],
+    params: &[(String, EngineValue, bool)],
     is_group: bool,
 ) -> Vec<Diag> {
     let mut diags = Vec::new();
@@ -3529,7 +3560,9 @@ fn apply_layer_params(
     layer.param_status = LayerStatus::Executable;
     let mut sx: Option<i64> = None;
     let mut sy: Option<i64> = None;
-    for (name, value) in params {
+    for (name, value, offset) in params {
+        // 参数种类 2 只影响数据编码,不影响算术语义(见 `X` 分支注释)。
+        let _ = offset;
         match name.as_str() {
             "FILE" | "ID" | "IDNO" => {}
             "E" => match value.as_int() {
@@ -3552,43 +3585,54 @@ fn apply_layer_params(
                     "参数 `A` 期望整数",
                 )),
             },
-            // `X/Y/Z/SX/SY` 按**整数**读:与引擎一致,浮点显式拒绝并留痕。
+            // `X/Y` 读**浮点**(`as_f64`),`Z`/`SX`/`SY` 取整(`as_px`)。
             //
-            // 引擎证据(0.495 `FUN_0042f809` 的 X/Y 读取块,`0x42b064` / `0x42b09d`
-            // 起):参数一律 `MOV reg, dword ptr [idx*8+0x683740]` 取低 32 位,
-            // 并用 `OR reg,[idx*8+0x683744]` 合并高位做零判定 —— **64 位整数
-            // 语义,没有 ftol/取整**。参数序言 `FUN_00429fd1`(`0x429fd1`)把每个
-            // 实参求值成 64 位值 + 一字节类型标记,但 X/Y 的消费点不看类型标记。
+            // 引擎证据(0.495 `FUN_0042f809` 的 X/Y 读取块,`0x42b064` /
+            // `0x42b09d` 起):参数一律 `MOV reg, dword ptr [idx*8+0x683740]`
+            // 取低 32 位,并用 `OR reg,[idx*8+0x683744]` 合并高位做零判定
+            // —— 消费点是 64 位整数语义,不看类型标记。但语料确实把浮点喂给
+            // `CG[X]`(`es_Sprite.yst:8574 FLT[@LEFT_X]` → `:8703
+            // CG[ID=$dst X=@LEFT_X Y=@LEFT_Y]`),而官方渲染位置正确 ⇒ 规约
+            // 发生在求值阶段而非消费点(具体指令未定位,`DIV-GFX-064` 在册)。
             //
-            // 语料确实存在把 FLT 喂给 `CG[X]` 的写法
-            // (`es_Sprite.yst:8574 FLT[@LEFT_X]` → `:8703`
-            // `CG[ID=$dst X=@LEFT_X Y=@LEFT_Y]`),官方此时读到的是浮点值的
-            // 位模式。**该行为无意义、不照抄**;这里按「类型不符 ⇒ 参数丢弃 +
-            // 诊断」处理,不发明四舍五入。待取证:官方该路径的实际可见结果
-            // (需要官方引擎 trace)。
-            "X" => match value.as_int() {
-                Some(n) => layer.transform.x = n,
+            // 内核的取舍:VM 保留 f64 精度,一路送到后端 `float` 顶点
+            // (与官方 D3D9 顶点阶段一致)。实测 `MATH3D` 输出
+            // `X=260.71190987262014 → 261.79777521694757`,每帧 1.08px;
+            // 若在读取边界取整,0.3px/帧 的慢速位移会变成「一帧不动、下一帧
+            // 跳 1px」的阶梯(2026-10-26 实机确认)。
+            // `Z` 是排序键、`SX/SY` 是纹理尺寸,均为整数像素,故仍取整。
+            "X" => match value.as_f64() {
+                // 参数种类 2(`X+=` 源写法)= 「脚本内偏移」,**不是累加**。
+                // REA `FUN_00429fd1`(参数序言,`0x429fd1`):类型字节 2 的分支
+                // 只写 `0x683e20[i] = script_base + off`,参数值槽
+                // (`0x683740/44`)一个字都不写,全程没有读旧值的路径。
+                // 因此按普通数值赋值(与种类 0 同口径);若按累加处理,
+                // `CG[…] X+=(@es.GSX/2)-(@WSX/2)` 会让持久层逐帧漂移。
+                // 消费点同证(`0x42c9a7`):`MOV EDX,[EAX*4+0x683e20]` 后把该
+                // 指针存进参数结构,按脚本体指针读内联数据。
+                // 详见 `docs/divergences/DIV-GFX-064-cg-float-coordinates.md` §4。
+                Some(v) => layer.transform.x = v,
                 None => diags.push(error::recoverable(
                     error::code::ARG_TYPE,
-                    "参数 `X` 期望整数(引擎按 64 位整数读参数槽,浮点无对齐依据)",
+                    "参数 `X` 期望数值",
                 )),
             },
-            "Y" => match value.as_int() {
-                Some(n) => layer.transform.y = n,
+            "Y" => match value.as_f64() {
+                Some(v) => layer.transform.y = v,
                 None => diags.push(error::recoverable(
                     error::code::ARG_TYPE,
-                    "参数 `Y` 期望整数(引擎按 64 位整数读参数槽,浮点无对齐依据)",
+                    "参数 `Y` 期望数值",
                 )),
             },
-            "Z" => match value.as_int() {
+            "Z" => match value.as_px() {
                 Some(n) => layer.z = n,
                 None => diags.push(error::recoverable(
                     error::code::ARG_TYPE,
-                    "参数 `Z` 期望整数(引擎按 64 位整数读参数槽,浮点无对齐依据)",
+                    "参数 `Z` 期望数值",
                 )),
             },
-            "SX" => sx = value.as_int(),
-            "SY" => sy = value.as_int(),
+            "SX" => sx = value.as_px(),
+            "SY" => sy = value.as_px(),
             // `TEX`:表面类型码。`CG` 写入、`CGINFO[TEX]` 读回。脚本
             // `es_Sprite.yst:4091/4144/5280/...` 用 `TEX=@_DXMODE` 写入,
             // `:3455/4156/5849/7771` 用 `IF[@texchk==2]`(分支注释

@@ -55,6 +55,7 @@ impl ParamTable {
                 name: self.param_name(command, a.slot),
                 slot: a.slot,
                 value: &a.value,
+                offset: a.offset,
             })
             .collect()
     }
@@ -96,4 +97,7 @@ pub struct ResolvedArg<'a> {
     pub name: Option<&'a str>,
     pub slot: u8,
     pub value: &'a yu_rt::value::Value,
+    /// YSCM 参数种类 2(`NumericOffset`,源写法 `X+=`)。只表示数据编码,
+    /// **不改变算术语义**(见 `yu_rt::event::ArgValue::offset`)。
+    pub offset: bool,
 }

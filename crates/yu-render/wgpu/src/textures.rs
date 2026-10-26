@@ -256,7 +256,11 @@ impl TargetSet {
                 return Some(&target.view);
             }
         }
-        for target in self.offscreen.values().chain(self.snapshots.values()) {
+        for target in self
+            .offscreen
+            .values()
+            .chain(self.snapshots.values())
+        {
             if target.id == id {
                 return Some(&target.view);
             }
@@ -271,7 +275,11 @@ impl TargetSet {
                 return Some(&target.texture);
             }
         }
-        for target in self.offscreen.values().chain(self.snapshots.values()) {
+        for target in self
+            .offscreen
+            .values()
+            .chain(self.snapshots.values())
+        {
             if target.id == id {
                 return Some(&target.texture);
             }
@@ -395,7 +403,6 @@ impl TargetSet {
         Ok(self.scale.as_ref().expect("scale target set above"))
     }
 
-    /// 组离屏目标:尺寸不变则复用(`SX/SY` 未给时调用方已回退视口)。
     pub fn ensure_offscreen(
         &mut self,
         ctx: &GpuContext,
