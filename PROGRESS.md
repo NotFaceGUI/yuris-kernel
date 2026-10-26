@@ -7922,3 +7922,339 @@ yu-cli case <project-eris> --all       9 passed / 0 failed
 - 官方把 f64 规约成 i64 的指令未定位(DIV-GFX-064 §5);
 - 消费点如何解读 `0x683e20[i]` 未逐命令定位;
 - `CGINFO[X/Y]` 读回取整(内部 f64)未取证官方口径。
+
+***
+
+## 成果 TASKINFO-SLOTS (2026-10-26) · `TASKINFO` 9..13 槽收口 + `TASK[TEXTPOS]` 官方对齐
+
+用户桌面日志(78.8s)每帧 5 条 `TASKINFO 参数 FILE0/FILENO0/LINE0/TEXTLINE/
+NEXTVOICE 未实现(DIV-RT-015)`,来源 `ystdlib.yst` pc373..378。手册
+`control/taskinfo.html` 只列到 `SCRIPTPOS`,五个槽无页 ⇒ 按 0.495 处理体实现
+(`fixed(no-manual)`)。
+
+### 1. 引擎证据(REA 0.495 `yu-ris.exe`,sha256 `4f5eefa3…`)
+
+- `TASKINFO` 处理体 `0x4523fc` 按参数**存在性**短路(不看值),固定顺序
+  `EXIST/E/A/Z/FILE/FILE0/LINE/LINE0/TEXTLINE/NEXTVOICE/IFNEST/GOSUBNEST/
+  LOOPNEST/FILENO/FILENO0/SCRIPTPOS`;`GOLABEL/GOSUBLABEL/TEXTPOS` 在该
+  处理体**没有分支**,落到默认 `return 0` 且不写 LET。
+- `0x4528b3/0x4525fa/0x45274c`:`FILE0/FILENO0/LINE0` 读 `task+0x144[0]`
+  (GOSUB 帧数组第 0 项)。`0x4459c4` 在 GOSUB 写 `frame+4`=返回 pc、
+  `+8`=调用方脚本号、`+0xc`=调用点源码行。
+- `0x45272a/0x452708`:`TEXTLINE/NEXTVOICE` 读 `task+0xc/+0x10`;`0x44c390`
+  (RETURNCODE)把当前指令首窗口记录两个 dword 抄入(首 = `id|type<<16`,
+  次 = `length`)。语料 396 个 RETURNCODE 窗口均为 `{id=1..N,type=0,length=0}`
+  (`TEXTLINE`=文本行计数,`NEXTVOICE`=0)。
+- `0x43f0d8`:FILE/FILE0 走名字表 `0x801850[script_no]` 写字符串(LET 必须
+  STR);`0x455540`:数值写只接受 INT/FLT。
+- ID 未命中 `0x452918`:按 LET 目标类型写 0 / 0.0 / ""。
+- `TASK` 处理体 `0x4506f4` 只检查 `0x684160/161/162/163/182/183/185`
+  (ID/E/A/Z/#/SCRIPTPOS/RESTART),无槽 36 `TEXTPOS` 分支 ⇒ 官方忽略。
+
+### 2. 修复
+
+- `ExecState` 新增 `text_line/next_voice`(引擎 `task+0xc/+0x10`);
+  `op_returncode` 在文本模式分支前保存窗口 `id|type<<16` 与 `length`
+  (有符号 dword 扩展)。
+- `op_taskinfo` 重写:按参数名收集存在性(不看值)、按引擎固定顺序分派;
+  `FILE0/FILENO0/LINE0` 取内核 `frames[1]`(frames[0] 是基帧)= 第一层
+  GOSUB 调用点,无 GOSUB 回退当前执行位;`FILE` 改返回 `yst_list` 路径
+  (旧实现返回脚本号 `Int`,写进 `$` 变量会被 coerce 成 `"70"`);加 LET
+  类型闸门(字符串/数值分型,类型不符不写);ID 未命中按目标类型写默认;
+  `GOLABEL/GOSUBLABEL/TEXTPOS` 对齐官方 no-op(每槽一次 Info,不挂
+  Unimplemented)。
+- 夹具:`GroupSpec::line()` 写 YSTB part4 行号;`window_value()` 构造
+  RETURNCODE 的 `length` 值窗口;TASKINFO 参数表补齐 21 槽。
+
+### 3. 回归(原始结果)
+
+```text
+cargo test -p yu-rt --test fixture taskinfo_
+  4 passed / 0 failed
+  (RETURNCODE 来源、GOSUB 外框、存在性/引擎分派顺序、缺省值/无分支槽)
+
+YURIS_SAMPLE_ERIS_YSBIN=<project-eris>/data/ysbin cargo test -p yu-rt
+  unit 70 / consistency 4 / corpus 11 / corpus_golden 4 /
+  fixture 84 / golden 3  = 全部 ok / 0 failed
+
+cargo check --workspace --all-targets
+  Finished dev profile(仅既有 yu-gfx 测试 unused_mut 警告)
+```
+
+- 原始 YSTB 核对:`ystdlib.yst` pc373..378 的窗口正是
+  `ID(0) + FILE0/FILENO0/LINE0/TEXTLINE/NEXTVOICE(9..13) + LET(1)`;
+  `yst00123/124/…` 共 396 个 RETURNCODE 窗口 `id=1..N,length=0`。
+- ERIS 语料 300 帧 `diag_census` 未出现 `TASKINFO` 相关 UNIMP;
+  `text_scenario` 未推进到文本(启动链停在 scenario 等待输入),故五槽的
+  语料形态以原始 YSTB 窗口 + REA 分支 + 合成夹具三方对齐为准。
+
+### 4. 残留(在册)
+
+- `NEXTVOICE` 非零值:ERIS 语料无 voice(窗口 `length` 全 0);实现按引擎
+  原样读 `length`,不补猜。有 voice 的商业语料需另行取证交叉验证。
+- `GOLABEL/GOSUBLABEL/TEXTPOS` 在 0.495 无分支;若换用有分支的引擎版本,
+  需重新取证后实现(当前按官方 no-op)。
+
+***
+
+## 成果 TASKINFO-SLOTS-2 (2026-10-26) · 审查缺陷修复:A 槽取证、双写、断行与状态同步
+
+对 TASKINFO-SLOTS 的自审发现 1 个严重回归 + 1 个语义缺陷 + 若干日志/状态问题。
+本轮全部修复并补回归;手册无页项继续按 `fixed(no-manual)`。
+
+### 1. A 槽取证(手册无页)
+
+- `TASK` 处理体 `0x450bbf..0x450bd1`:A 参数存在时写 `task+0x15`
+  (`mov [ebx+0x15], cl`);E 参数 `0x450bb1..0x450bbc` 写 `task+0x14`。
+- 调度器 `0x4043dc..0x4043e6`:`movsx E; movsx A; test A, E; je 跳过`
+  ⇒ **A 与 E 按位与非零**才步进。
+- 任务构造器 `0x465630/0x465633` 对新任务同时写 E=A=1;
+  `TASKINFO[A]` `0x4527b0` 用 `movsx` 读回。
+- 内核新增 `TaskSeed/TaskNode/TaskView.active`、调度闸门
+  `enabled && active`、`TASK` 的 A 参数、`Effect::SetActive`;
+  `TASK[E/A]` 改为**只在参数存在时写**(修掉旧实现
+  `TASK[ID=X Z=…]` 无条件 `SetEnabled(true)` 把已禁用任务重新打开的 bug);
+  E/A 变更与 pending 任务都同步到 `task_view`。
+- **A1 回归修复**:旧 `ORDER` 含 `"A"` 但 `match` 无分支,`TASKINFO[A]`
+  会命中 `unreachable!` panic;现按引擎实现,不再崩溃。
+
+### 2. 其余修复
+
+- **TASK TEXTPOS**:上一轮台账写「官方无分支/n 内核 no-op」,但代码实际
+  仍走 `other => Unimplemented`;本轮加 `Some("TEXTPOS")` 求值后丢弃,
+  与 0.495 `0x4506f4` 同型(无槽 36 分支)。
+- **FILENO0→SCRIPTPOS fallthrough**:引擎 `0x4525fa/0x4528fa` 写完 FILENO0
+  后 `jmp 0x452628` 继续检查 SCRIPTPOS;两者同时请求时 SCRIPTPOS 二次写入。
+  内核原先只取第一个 query;现补第二次写入(类型闸门各自生效)。
+- **ReturnCode.line**:改用完整 u16 窗口 id(`kind | flag<<8`),不再被
+  u8 `kind` 截断(单脚本文本行 >255);`text_line` 仍保存
+  `id | type<<16` 的引擎原值。
+- **TASK 重配置**:引擎复用任务记录且不清 `task+0xc/+0x10`;
+  内核重建 `ExecState` 时继承 `text_line/next_voice`。
+- **诊断**:LET 类型不符按 `query+目标类型` 只报一次(消息带 query 名);
+  ID 未命中 + LET 未声明保留 `write_target` 的 Fatal,不再静默。
+
+### 3. 回归(原始结果)
+
+```text
+cargo test -p yu-rt --test fixture            92 passed / 0 failed
+  (新增 8 条:A 读写/E-A 同泵/双查询 fallthrough/完整 u16 行号/
+   重配置继承/类型诊断去重/未声明目标/TASK TEXTPOS)
+
+YURIS_SAMPLE_ERIS_YSBIN=… cargo test -p yu-rt
+  unit 70 / consistency 4 / corpus 11 / corpus_golden 4 /
+  fixture 92 / golden 3  = 全部 ok / 0 failed
+
+cargo check --workspace --all-targets         Finished(仅既有 yu-gfx 警告)
+```
+
+### 4. 残留(在册)
+
+- A 按 ysc checker 3(0/1)建模为 bool;引擎闸门是字节按位与,若脚本绕过
+  checker 传入 >1 的 A/E,内核与引擎可能分歧(手册/检查器均限 0/1)。
+- `NEXTVOICE` 非零值仍无 voiced 语料;实现按引擎原样读 `length`。
+- ~~`SCRIPTPOS` 仍是内核内部 8 字节 blob~~ —— 已由后续成果
+  `SCRIPTPOS-ENGINE` 替换为 0.495 引擎逐字节格式(旧 8 字节 blobs 不兼容)。
+
+***
+
+## 成果 SAVE-TIME (2026-10-26) · 存档时间错位:宿主本地时钟注入(`_TIME`)
+
+### 1. 根因
+
+- 存档菜单脚本 `es_SaveLoad.yst:178-266`(官方解包源)在保存时用
+  `@_TIME(0,0..6)` 取「現実の日付」写入 `$mDATE(1)`,经 DNO=0004
+  `$mSAVESTR()` 落盘;读档列表直接显示该字符串。
+- 内核 `_TIME` 的旧口径(DIV-RT-009)是纯注入时钟:桌面/serve 从未给
+  `BootConfig::start_ms` 注入真实值(恒 0),于是存档时间 = 1970-01-01 +
+  游戏逻辑流逝,与实际日期完全错位。
+- 这不是「命令未实现」,而是**宿主注入面缺失**;roadmap §B10 已挂
+  `_OS_TIME(0)` 余项、DIV-RT-009 记录时区/纪元差异。
+
+### 2. 修复
+
+- `yu-rt`:`BootConfig::local_time: Option<HostLocalTime>`(年月日时分秒
+  毫秒,构造函数校验范围);`@_TIME(1,*)` 返回注入基准,`@_TIME(0,*)`
+  在基准上叠加 `now_ms - start_ms`,跨日/月/年进位;`None` 时保持
+  1970 确定性注入时钟(用例/trace/golden)。
+- `yu-engine`:`EngineOptions::local_time` 透传 `BootConfig`。
+- `yu-cli`:新增 `clock::local_now()`(`time::OffsetDateTime::now_local`,
+  安全 API,无 unsafe);`run`/`serve`/`desktop` 启动时注入一次;
+  `case`/`bench`/测试默认 `None`。
+- trace 回放固定 `local_time: None`(`yu-trace/src/record.rs`),不引入墙钟。
+
+### 3. 回归(原始结果)
+
+```text
+cargo test -p yu-rt --lib
+  78 passed / 0 failed(含 civil_days_round_trip、local_time_fields_and_midnight_carry)
+
+cargo test -p yu-rt --test fixture time_sysvar_uses_injected_local_clock
+  1 passed / 0 failed(@_TIME(0,0)=2026,@_TIME(1,4)=13)
+
+cargo test -p yu-cli --lib clock
+  1 passed / 0 failed(Windows 本地时间读取可用)
+
+cargo check --workspace --all-targets
+  Finished(仅既有 yu-gfx parity_fixes unused_mut 警告)
+
+TEMP=<workbench>/tmp cargo run -q -p yu-cli --bin yu-cli -- case <project-eris> --case save-load-loop
+  case save-load-loop: PASS
+```
+
+### 4. 残留
+
+- `_OS_TIME(0)`(OS uptime)仍无宿主注入 ⇒ `Unimplemented`(roadmap 余项)。
+- `_TIME(0,*)` 用逻辑流逝近似墙钟:长会话跨 DST/手动改系统时间不会重新
+  取基准(存档时间戳场景可忽略);需要逐次取实时时钟时应扩宿主回调。
+- trace golden `synthetic_trace_matches_golden` 的不一致来自本轮之前
+  `yu-rt/tests/support/mod.rs` 的 TASKINFO 参数表改动(YCD sha 变化),
+  与本项无关,未改 golden。
+
+***
+
+## 成果 SCRIPTPOS-ENGINE (2026-10-26) · `SCRIPTPOS` 换成 0.495 引擎逐字节格式
+
+`TASKINFO[SCRIPTPOS]` 原先只产内核内部 8 字节 `[script_id][pc]` blob,
+`TASK[SCRIPTPOS]` 也只恢复 script+pc,丢掉 IF/GOSUB/LOOP 三栈;ERIS
+`s20/s21` 的 `es.LOG.TMPSAVE` + `TASK[ID,SCRIPTPOS]` 会在块内位置丢失
+控制流上下文。本轮按 0.495 序列化器/装载器逐字节重写。
+
+### 1. 引擎证据(REA 0.495 `yu-ris.exe` sha256 `4f5eefa3…`)
+
+- 序列化器 `0x452a54`(`TASKINFO[SCRIPTPOS]` `0x452633` 调用):
+  - 8 字节魔数 `0x5b4090` = `01..08`;
+  - 2 字符 IF 深度;每帧 18 字符:`+0` loop 深度、`+4` entry pc、`+8` end pc;
+  - 2 字符 GOSUB 深度;每项 16 字符:`+0` IF 深度、`+1` loop 深度、
+    `+4` 返回 pc、`+8` 返回脚本号(u16);
+  - 2 字符 LOOP 深度;每项 34 字符:`+0` IF 深度、`+4` body pc、
+    `+8` end pc、`+0x10` counter 低 32、`+0x18` limit 低 32;
+  - 8 字符 `task+0xc`(text_line)、8 字符 `task+0x20`(pc)、
+    8 字符脚本名长度 + 原始脚本名字节。
+  - 数值字节均为 `'a'+nibble` 双字符,多字节整数高字节在前(big-endian)。
+- 装载器 `0x450fe0`(`TASK` `0x450bec` 调用):按同一布局写回
+  `task+0x3e/+0x140/+0x244`、三个帧数组、`task+0xc/+0x20`,
+  并用脚本名在 `0x801850` 名字表 strcmp 找回 `task+0x3c`;
+  脚本名长度上限 `0x106`(`0x451749`)。
+- 帧字段来源:`IF 0x4462d0`(`+0`=task+0x244 loop 深度、`+4`=当前 pc、
+  `+8`=第三窗口 end)、`LOOP 0x447ef0`(`+4`=pc+1、`+0`=task+0x3e、
+  `+8`=end、`+0x10`=counter、`+0x18`=limit)、
+  `GOSUB 0x4459c4`(`+0`=task+0x3e、`+1`=task+0x244、`+4`=pc+1、
+  `+8`=task+0x3c)。
+- `TASK` 缺目标任务时 `0x4507b4 test ebx; je` 报错。
+
+### 2. 实现
+
+- 新增 `crates/yu-rt/src/scriptpos.rs`:`ScriptPos`/`IfEntry`/`GosubEntry`/
+  `LoopEntry` + 引擎字节编解码;6 条单元测试含**手工拼装引擎串反解**。
+- `IfFrame` 增加 `loop_depth`(op_if 压帧时取 `st.loops.len()`),
+  用于序列化引擎 IF 帧 `+0`。
+- `TASKINFO[SCRIPTPOS]`(含 FILENO0→SCRIPTPOS fallthrough)产引擎串;
+  `TASK[SCRIPTPOS]` 解码后完整写回 `script_id/pc/base_a/text_line/
+  if_stack/loops/frames`,脚本名→脚本号走 `yst_list` 精确匹配;
+  保留 `next_voice`、TINT/TFLT/TSTR、E/A/Z(引擎装载器不写这些);
+  目标任务不存在时 Fatal(对齐 `0x4507b4`)。
+- 旧的 8 字节内核 blob 不再接受(会报 `rt.scriptpos` 魔数错误);
+  需要兼容旧内核存档时必须重新生成。
+
+### 3. 回归(原始结果)
+
+```text
+cargo test -p yu-rt --lib scriptpos       6 passed / 0 failed
+cargo test -p yu-rt                       unit 79 / consistency 4 /
+  corpus 11 / corpus_golden 4 / fixture 94 / golden 3 = 全绿
+cargo check --workspace --all-targets     Finished(仅既有 yu-gfx 警告)
+```
+
+- 新增夹具:`fixture::task_scrip_pos_restores_full_exec_state`
+  (合成 IF×2+GOSUB×1+LOOP×1 快照 → `TASK[SCRIPTPOS]` → TASKINFO 三嵌套数
+  与 TEXTLINE 全对,且再次 TASKINFO[SCRIPTPOS] 还原同一 `ScriptPos`)。
+- `taskinfo_fileno0_falls_through_to_scrip_pos` 改为解码引擎串,断言
+  GOSUB 帧(返回 pc=1/script=0)、pc=1、脚本名 `fixture0001.yst`。
+- ERIS `text_scenario` 600 帧:无 `rt.scriptpos` 诊断/错误;
+  `s20/s21` 的 TASKINFO SCRIPTPOS 编码路径实际执行。
+
+### 4. 残留(在册)
+
+- 引擎不序列化 GOSUB 帧的 PINT/PFLT/PSTR 参数与返回值;内核恢复时新建
+  帧的 args/ret 为空(与引擎串字段集一致,引擎复用内存时的陈旧值不可依赖)。
+- LOOP counter/limit 在引擎格式里只有低 32 位;超出 i32 会截断/符号扩展
+  (内核同型)。
+- IF 帧的 base A 不在引擎串内;内核按帧索引(0 基)推导,恢复后 `IFBREAK`
+  的 `task+0x3e` 口径一致。
+- 损坏串:内核 Fatal(`rt.scriptpos`);引擎装载器打印错误后返回 0
+  (TASK 处理体只判负),内核选择显式失败。
+
+***
+
+## 成果 SCRIPTPOS-XVER (2026-10-26) · SCRIPTPOS 跨五版核对与 GOSUB 线上宽度勘误
+
+起因:审查提出实现证据过度集中在 0.495,要求用其他官方引擎交叉求证。
+本轮把序列化器/装载器在 0.292 / 0.466 / 0.479 / 0.495 / v494 五版逐一比对,
+发现并修正一处线格式误读:上一成果把 GOSUB 记录写成 16 字符,实际五版
+引擎的序列化与装载推进量都是 **20 字符**。
+
+### 1. 跨版本证据(序列化器 + 装载器,均为官方 exe)
+
+| 版本 | 序列化器 | 装载器 | IF | GOSUB | LOOP |
+|---|---|---|---|---|---|
+| 0.292 | `0x438b2c` | `0x437548` | `0x12` | `0x14` | `0x22` |
+| 0.466 | `0x4438d0` | `0x441ed4` | `0x12` | `0x14` | `0x22` |
+| 0.479 | `0x44b718` | `0x449d7c` | `0x12` | `0x14` | `0x22` |
+| 0.495 | `0x452a54` | `0x450fe0` | `0x12` | `0x14` | `0x22` |
+| v494 | `0x4528c8` | `0x450e74` | `0x12` | `0x14` | `0x22` |
+
+- 五版魔数都是 `01..08`(0.495 常量 `0x5b4090`;装载器校验
+  `add ecx,-0x30205 / add edx,-0x80705`)。
+- GOSUB 第 4 字段:序列化器把运行期 **u16** 零扩展后按 32 位写出
+  (0.292 `0x438eae`、0.466 `0x443c51`、0.479 `0x44ba9f`、
+  0.495 `0x452dbb` 均为 `movzx ..., word ptr [frame+8]` 后写 8 字符);
+  装载器消费 8 字符但只把低 16 位写回 `+8`(0.495 `0x451302`
+  `mov word ptr [edx+8], di`)。因此线上是 20 字符,不是 16。
+- IF 18 字符(loop 深度、entry pc、end pc)与 LOOP 34 字符
+  (IF 深度、body pc、end pc、counter 低 32、limit 低 32)五版一致;
+  尾部 `text_line`/`pc`/名字长度三个 u32 + 原始名字五版一致,
+  0.495 装载器把超过 `0x106` 的名字长度截断(`0x451749`)。
+- TASKINFO 分派面:0.466/0.479/0.495/v494 的存在标志检查顺序
+  (`+1,+0,+2,+3,+4,+5,+6,+9,+8,+b,+c,+d,+10,+11,+12,+7,+a,+13`)
+  与 FILENO0→SCRIPTPOS fallthrough 完全一致;各分支字段语义也同构,
+  只是任务结构体偏移随版本不同:
+  TEXTLINE/NEXTVOICE = 相邻两个 dword(0.466 `+0x7ffc/+0x8000`、
+  0.479 `+0xa74/+0xa78`、0.495 `+0xc/+0x10`);TASKINFO 的 A/E 分支
+  读相邻两字节且 A=E+1(0.466 `+0x8005/+0x8004`、0.479
+  `+0xa7d/+0xa7c`、0.495 `+0x15/+0x14`);IFNEST 读 IF 计数
+  (0.466/0.479 `+0xa`、0.495 `+0x3e`)。`A & E` 调度闸门另在
+  0.495 `0x4043dc` 与 v494 `0x4043cc` 逐指令一致;0.292 更早,
+  没有 FILENO0、SCRIPTPOS 也在别的槽位。内核按**参数名**解析
+  (不查任何一版槽号表),这类跨版本槽位变化不会造成静默失效。
+
+### 2. 修正
+
+- `scriptpos.rs`:`GosubEntry` 线上宽度 16→20;`return_script` 编排放宽为
+  零扩展 u32、解码只取低 16 位(与装载器 `mov word` 一致);
+  解码时脚本名超长按装载器行为截到 `0x106`(编码端仍拒绝超长名)。
+- 新增单测:`gosub_return_script_is_wire_u32_and_decode_keeps_low16`
+  (含篡改高位仍取低 16 位的对齐断言)、
+  `decode_clamps_oversized_name_length_like_loader`。
+- 模块注释改为跨五版证据(不再以 0.495 单版作唯一依据);
+  DIV-RT-025 正文同步勘误。
+
+### 3. 回归(原始结果)
+
+```text
+cargo test -p yu-rt --lib scriptpos       9 passed / 0 failed
+cargo test -p yu-rt                       unit 82 / consistency 4 /
+  corpus 11 / corpus_golden 4 / fixture 94 / golden 3 = 全绿
+cargo check --workspace --all-targets     Finished(仅既有 yu-gfx parity_fixes 警告)
+```
+
+### 4. 残留
+
+- 0.292 的 TASKINFO 参数集比 0.466+ 少(FILENO0 等),但其 SCRIPTPOS 线格式
+  与后续版本同构,内核可直接解码;参数集差异由名字解析吸收。
+- GOSUB 返回脚本号的高 16 位引擎恒写 0;内核与装载器一样只保留低 16 位,
+  不把高位当作错误。
+
+
+
+

@@ -29,6 +29,8 @@ desktop = ["dep:yu-host-desktop"]
 
 [dependencies]
 log = "0.4"
+# `@_TIME` 的宿主本地时间注入(DIV-RT-009);只用到 `now_local`。
+time = { version = "0.3", features = ["local-offset"] }
 wgpu = "30.0.1"
 yu-backend-soft = { path = "../yu-render/soft" }
 yu-backend-wgpu = { path = "../yu-render/wgpu" }

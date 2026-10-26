@@ -20,7 +20,7 @@ use yu_log::Boundary;
 use crate::code;
 use crate::diag;
 use crate::value::{Value, VarRef};
-use crate::vm::{ExecState, Vm};
+use crate::vm::{ExecState, HostLocalTime, Vm};
 
 /// 读取系统变量。
 ///
@@ -150,8 +150,11 @@ pub fn read(vm: &Vm, st: &ExecState, var: VarRef, indices: &[i64]) -> Result<Val
 
         // ---- 时间(手册 `basic/svariable.html` 全表) ---------------------
         // `@_TIME(0,k)` 当前日期时间 / `@_TIME(1,k)` 启动时刻;k: 0年1月2日
-        // 3星期4时5分6秒7毫秒。**时钟由宿主注入**(A3);纪元基准是注入时钟的
-        // 起点(`BootConfig::start_ms` 的基准原点),不是读墙钟(DIV-RT-009)。
+        // 3星期4时5分6秒7毫秒。**时钟由宿主注入**(A3):
+        // - 真实运行宿主注入 `BootConfig::local_time`(系统本地时间基准),
+        //   `(0,*)` = 基准 + 逻辑流逝,`(1,*)` = 基准本身;
+        // - 用例/trace/golden 不注入 ⇒ 以 `start_ms` 为 1970-01-01 UTC 的
+        //   确定性注入时钟(DIV-RT-009)。
         // 语料:336 次。
         "_TIME" => {
             let (row, col) = match indices {
@@ -164,8 +167,20 @@ pub fn read(vm: &Vm, st: &ExecState, var: VarRef, indices: &[i64]) -> Result<Val
                     ))
                 }
             };
-            let base = if row == 0 { vm.now_ms() } else { vm.start_ms() };
-            time_field(base, col)
+            match vm.local_time() {
+                Some(base) => {
+                    let elapsed = if row == 0 {
+                        vm.now_ms().wrapping_sub(vm.start_ms()) as i64
+                    } else {
+                        0
+                    };
+                    time_field_local(base, elapsed, col)
+                }
+                None => {
+                    let base = if row == 0 { vm.now_ms() } else { vm.start_ms() };
+                    time_field(base, col)
+                }
+            }
         }
         // `@_OS_TIME(0)` = OS 启动以来的毫秒;`(1)` = YU-RIS 启动以来的毫秒。
         // 手册同上。语料 1,463 次(实测下标恒为 1 → 引擎 uptime)。
@@ -426,10 +441,28 @@ fn param_index(indices: &[i64]) -> Result<usize, yu_log::Diag> {
     Ok((n - 1) as usize)
 }
 
-/// 注入时钟 → 日期字段。纪元基准 = 注入毫秒的原点(1970-01-01T00:00:00Z,
-/// 固定 UTC,不含本地时区;官方用系统本地时间 ⇒ DIV-RT-009)。
+/// 确定性注入时钟 → 日期字段。纪元基准 = 注入毫秒的原点
+/// (1970-01-01T00:00:00Z,固定 UTC;宿主未注入本地时间时的回退,
+/// 见 DIV-RT-009)。
 fn time_field(ms: u32, col: i64) -> Result<Value, yu_log::Diag> {
-    let secs = (ms as i64) / 1000;
+    time_field_ms(i64::from(ms), col)
+}
+
+/// 宿主本地时间基准 + **逻辑流逝毫秒** → 日期字段。
+///
+/// 手册语义是系统本地时间;本函数把注入的本地日期时间当作一个无时区的
+/// 公历基准(不读墙钟),再叠加游戏逻辑时间 ⇒ 跨日/跨月/跨年自然进位。
+fn time_field_local(base: HostLocalTime, elapsed_ms: i64, col: i64) -> Result<Value, yu_log::Diag> {
+    let days = days_from_civil(base.year, base.month, base.day);
+    let base_ms = (days * 86_400 + base.hour * 3_600 + base.minute * 60 + base.second) * 1_000
+        + base.millisecond;
+    time_field_ms(base_ms + elapsed_ms, col)
+}
+
+/// 绝对毫秒(公历基准)→ `_TIME` 列。
+fn time_field_ms(ms: i64, col: i64) -> Result<Value, yu_log::Diag> {
+    let secs = ms.div_euclid(1_000);
+    let millis = ms.rem_euclid(1_000);
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     let (y, m, d, wd) = civil_from_days(days);
@@ -441,7 +474,7 @@ fn time_field(ms: u32, col: i64) -> Result<Value, yu_log::Diag> {
         4 => rem / 3600,
         5 => (rem % 3600) / 60,
         6 => rem % 60,
-        7 => (ms as i64) % 1000,
+        7 => millis,
         other => {
             return Err(diag::fatal(
                 code::rt::SYSVAR_UNIMPLEMENTED,
@@ -475,6 +508,17 @@ fn days_since_epoch(z: i64) -> i64 {
     z - 719_468
 }
 
+/// `civil_from_days` 的逆变换(Howard Hinnant `days_from_civil`)。
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// 系统变量在工程 ycd 里存在但**手册无页** ⇒ 按任务书军规不实现。
 fn undoc(name: &str) -> yu_log::Diag {
     diag::unimplemented(
@@ -501,5 +545,48 @@ mod tests {
     fn time_field_columns_are_bounded() {
         assert!(time_field(0, 0).is_ok());
         assert!(time_field(0, 8).is_err());
+    }
+
+    #[test]
+    fn civil_days_round_trip() {
+        for (y, m, d) in [(1970, 1, 1), (2000, 2, 29), (2026, 10, 26), (2026, 12, 31)] {
+            let days = days_from_civil(y, m, d);
+            let (cy, cm, cd, _) = civil_from_days(days);
+            assert_eq!((cy, cm, cd), (y, m, d));
+        }
+    }
+
+    /// 存档菜单(`es_SaveLoad.yst`)用 `@_TIME(0,0..6)` 写现实日期;
+    /// 宿主注入本地时间后必须给出真实年月日,而不是 1970 纪元。
+    #[test]
+    fn local_time_fields_and_midnight_carry() {
+        let base = HostLocalTime::new(2026, 10, 26, 23, 59, 59, 900).expect("合法本地时间");
+        let field = |elapsed, col| time_field_local(base, elapsed, col).expect("字段");
+        assert_eq!(field(0, 0), Value::Int(2026));
+        assert_eq!(field(0, 1), Value::Int(10));
+        assert_eq!(field(0, 2), Value::Int(26));
+        assert_eq!(field(0, 3), Value::Int(1), "2026-10-26 = 月曜(0=日)");
+        assert_eq!(field(0, 4), Value::Int(23));
+        assert_eq!(field(0, 5), Value::Int(59));
+        assert_eq!(field(0, 6), Value::Int(59));
+        assert_eq!(field(0, 7), Value::Int(900));
+        // +200ms 跨到次日 00:00:00.100
+        assert_eq!(field(200, 2), Value::Int(27));
+        assert_eq!(field(200, 3), Value::Int(2), "2026-10-27 = 火曜");
+        assert_eq!(field(200, 4), Value::Int(0));
+        assert_eq!(field(200, 5), Value::Int(0));
+        assert_eq!(field(200, 6), Value::Int(0));
+        assert_eq!(field(200, 7), Value::Int(100));
+    }
+
+    #[test]
+    fn host_local_time_rejects_out_of_range() {
+        assert!(HostLocalTime::new(2026, 13, 1, 0, 0, 0, 0).is_none());
+        assert!(HostLocalTime::new(2026, 1, 32, 0, 0, 0, 0).is_none());
+        assert!(HostLocalTime::new(2026, 1, 1, 24, 0, 0, 0).is_none());
+        assert!(HostLocalTime::new(2026, 1, 1, 0, 60, 0, 0).is_none());
+        assert!(HostLocalTime::new(2026, 1, 1, 0, 0, 60, 0).is_none());
+        assert!(HostLocalTime::new(2026, 1, 1, 0, 0, 0, 1000).is_none());
+        assert!(HostLocalTime::new(2026, 1, 1, 0, 0, 0, 0).is_some());
     }
 }

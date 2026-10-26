@@ -67,6 +67,8 @@ fn table() -> ParamTable {
                     "TEXT",
                     "SETSTR",
                     "BNO",
+                    "MERGE",
+                    "MERGE2",
                 ],
             ),
             command(
@@ -1386,4 +1388,102 @@ fn text_on_snapshot_layer_matches_soft() {
         soft_out2.surface.rgba, gpu_out2.surface.rgba,
         "frame 2 must be pixel-identical"
     );
+}
+
+/// `CGACT[MERGE]/[MERGE2]` 走 GPU 合成,与 soft 逐像素一致。
+///
+/// 官方 `FUN_004405a4` 把上层**表面**用通配绘制原语
+/// `DAT_00801458(surface, …, X, Y, ratio, 0)` 画到目标表面 —— 是 D3D9 的
+/// 一次带纹理 quad,不是逐像素循环。`es_SPExec.yst:341` 的
+/// `CGACT[ID="sp.tmpB" ID2=<快照层> MERGE=1 X=@MGX Y=@MGY]` 每帧一条,
+/// 走 CPU 会让 render 出现 30ms 级尖峰(实测 p95 39.6→11.1ms)。
+///
+/// 语义差异必须保住:`MERGE` 只写 RGB(目标 alpha 保持),`MERGE2` 连 alpha
+/// 一起写。
+#[test]
+fn merge_on_snapshot_layer_matches_soft() {
+    for (merge2, name) in [(false, "merge"), (true, "merge2")] {
+        let table = table();
+        let mut gfx = state(Viewport::new(16, 16), [255, 255, 255, 255]);
+        let flag = if merge2 { "MERGE2" } else { "MERGE" };
+        let mut events = vec![
+            VmEvent::FrameStart { frame: 1 },
+            // 下层:半透明绿(alpha=128),作为快照目标(COPY2 生成快照)。
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"LOW".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"low".to_vec())),
+                ],
+            ),
+            call(
+                1,
+                "CGACT",
+                vec![
+                    arg(&table, "CGACT", "ID", Value::Str(b"LOW".to_vec())),
+                    arg(&table, "CGACT", "ID2", Value::Str(b"DST".to_vec())),
+                    arg(&table, "CGACT", "COPY2", Value::Int(1)),
+                ],
+            ),
+            // 快照层的 alpha 来自源的像素;确保源层不被视图 alpha 影响。
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"LOW".to_vec())),
+                    arg(&table, "CG", "E", Value::Int(0)),
+                ],
+            ),
+            // 上层:不透明红。
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"UP".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"up".to_vec())),
+                ],
+            ),
+            call(
+                1,
+                "CGACT",
+                vec![
+                    arg(&table, "CGACT", "ID", Value::Str(b"UP".to_vec())),
+                    arg(&table, "CGACT", "ID2", Value::Str(b"DST".to_vec())),
+                    arg(&table, "CGACT", flag, Value::Int(1)),
+                ],
+            ),
+        ];
+        events.push(VmEvent::FrameEnd { frame: 1 });
+        gfx.consume_events(&events);
+
+        let entries: &[(&[u8], Vec<u8>)] = &[
+            (b"low.png", png_bytes_for(16, 16, Rgba([0, 255, 0, 128]))),
+            (b"up.png", png_bytes_for(16, 16, Rgba([255, 0, 0, 255]))),
+        ];
+        let Some(mut gpu) = renderer_or_skip(store(entries)) else {
+            return;
+        };
+        let mut soft = SoftRenderer::new(store(entries));
+        let soft_out = soft.render_frame(&gfx.frame());
+        let gpu_out = gpu.render_frame(&gfx.frame()).expect("render");
+
+        // 屏幕呈现会把整帧 alpha 规范成不透明(`force_opaque`),所以 alpha
+        // 只在**快照层面**有意义:这里断言 RGB 被上层覆盖,并逐像素与
+        // soft 对齐 —— soft 的 `apply_merge` 就是官方语义的参考实现
+        // (`merge2=false` 只写 RGB)。
+        let actual = pixel(&gpu_out, 8, 8);
+        assert!(
+            actual[0] >= 250 && actual[1] <= 5,
+            "{name}: RGB 必须被上层红色覆盖,得到 {actual:?}"
+        );
+        let soft_rgba = &soft_out.surface.rgba;
+        let soft_px = [
+            soft_rgba[(8 * soft_out.surface.width as usize + 8) * 4],
+            soft_rgba[(8 * soft_out.surface.width as usize + 8) * 4 + 1],
+            soft_rgba[(8 * soft_out.surface.width as usize + 8) * 4 + 2],
+            soft_rgba[(8 * soft_out.surface.width as usize + 8) * 4 + 3],
+        ];
+        assert_close(actual, soft_px, 2, name);
+    }
 }

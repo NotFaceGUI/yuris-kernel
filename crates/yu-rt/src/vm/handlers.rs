@@ -42,6 +42,7 @@ use crate::code;
 use crate::diag;
 use crate::event::{ArgValue, Domain, JumpKind, VmEvent};
 use crate::expr::LValue;
+use crate::scriptpos;
 use crate::task::{Effect, StepOutcome, TaskSeed};
 use crate::value::{ElemType, Value, VarRef, VarSpace};
 use crate::vm::{Cmd, CmdWindow, ExecState, GosubFrame, IfFrame, LoopFrame, Vm, VmError};
@@ -322,6 +323,12 @@ impl Vm {
             })
             .unwrap_or_default();
         let mut args = Vec::new();
+        // 参数增量标志在窗口 +2 的 u16 高字节(`slot`):官方参数序言把
+        // `pbVar10[3]` 存进 `0x6835a0[i]`,低字节存进 `0x6830c0[i]` 当
+        // 求值器 subtype。语料实测:`CG[… X=…]` 的 slot=1,
+        // `CG[… X+=(…)]` 的 slot=257(0x0101);同一 `CG` 的 YSCM 参数
+        // 声明恒为 Numeric,不能从 `ParamKind` 区分。`X+=` 的零增量必须
+        // 按累加处理,否则会把绝对位置清零(立绘钉在左上)。
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
@@ -338,10 +345,9 @@ impl Vm {
             }
             if let Ok(v) = self.eval_window(st, w) {
                 let mut arg = ArgValue::new(w.rec.kind, v);
-                // 参数种类 2 = 数值 + 脚本内偏移(`X+=` 源写法;只是数据
-                // 编码,消费方按普通数值处理,不做累加)。
-                arg.offset = crate::tables::ParamKind::from_code(w.rec.kind)
-                    == crate::tables::ParamKind::NumericOffset;
+                // 参数种类 2(`X+=` 源写法)= 增量。消费方(gfx CG/CGACT
+                // 等)按 `offset` 加到当前值;零增量不得清零位置。
+                arg.offset = w.rec.slot & 0xff00 != 0;
                 args.push(arg);
             }
         }
@@ -691,6 +697,8 @@ impl Vm {
             entry_pc: cmd.pc,
             end_pc,
             base_a: st.base_a,
+            // 引擎 IF 帧 `+0` = 进入时的 LOOP 深度(0x4462f5)。
+            loop_depth: st.loops.len(),
         });
         // 条件求值:可恢复失败(Unimplemented)⇒ 记诊断并按「假」处理;
         // Fatal 照常抛出(任务终止)。
@@ -2044,6 +2052,12 @@ impl Vm {
     ) -> Result<StepOutcome, VmError> {
         let mut id: Option<String> = None;
         let mut enabled = true;
+        let mut active = true;
+        // E/A 只在参数**存在**时写任务记录(引擎 `0x450bb1/0x450bbf` 均为
+        // 「标志非零才写」;缺省由任务构造器给 1)。用存在标志避免
+        // `TASK[ID=X Z=…]` 之类的命令把已禁用的任务重新打开。
+        let mut enabled_param = false;
+        let mut active_param = false;
         let mut priority: i64 = 1;
         let mut label: Option<crate::tables::Label> = None;
         // 任务局部寄存器初值(TASK 参数序号 4..13=TINT..TINT10 / 14..23=TFLT.. /
@@ -2060,7 +2074,8 @@ impl Vm {
         let mut tints = [0i64; 16];
         let mut tflts = [0f64; 16];
         let mut tstrs: [Vec<u8>; 16] = std::array::from_fn(|_| Vec::new());
-        let mut script_pos: Option<(u32, u32)> = None;
+        // `SCRIPTPOS`:引擎执行位快照串(0.452a54 序列化 / 0x450fe0 装载)。
+        let mut script_pos: Option<Vec<u8>> = None;
         // `RESTART=1`:本 vsync 再跑一逻辑帧(REA `[0x801944]`)。
         let mut request_restart = false;
         for w in &cmd.windows {
@@ -2077,19 +2092,27 @@ impl Vm {
                         id = Some(cp932_lossy(&bytes));
                     }
                 }
-                Some("E") => enabled = self.eval_window(st, w)?.as_int().unwrap_or(1) != 0,
+                Some("E") => {
+                    enabled = self.eval_window(st, w)?.as_int().unwrap_or(1) != 0;
+                    enabled_param = true;
+                }
+                // `A`(引擎 `task+0x15`):0 = 不参与调度。手册 `control/task.html`
+                // 无 A 页;REA 0.495 调度器 `0x4043dc..0x4043e6`
+                // (`movsx E; movsx A; test A, E; je 跳过`)证得 A 与 E 按位与
+                // 后决定是否步进;TASK 处理体 `0x450bbf..0x450bd1` 按参数写它,
+                // 构造器 `0x465630/0x465633` 默认 E=A=1。DIV-RT-015。
+                Some("A") => {
+                    active = self.eval_window(st, w)?.as_int().unwrap_or(1) != 0;
+                    active_param = true;
+                }
                 Some("Z") => priority = self.eval_window(st, w)?.as_int().unwrap_or(1),
                 // SCRIPTPOS(手册 `control/task.html` 例 4:位置情報の上書き =
-                // 事実上のスクリプト位置ロード)。blob 由 TASKINFO[SCRIPTPOS]
-                // 产出,脚本视为不透明数据;本实现 blob = [script_id u32][pc u32]。
+                // 事実上のスクリプト位置ロード)。串格式见 `crate::scriptpos`
+                // (0.292/0.466/0.479/0.495/v494 五版线格式同构);这里只收
+                // 原始串,循环结束后统一解码。
                 Some("SCRIPTPOS") => {
                     if let Value::Str(bytes) = self.eval_window(st, w)? {
-                        if bytes.len() == 8 {
-                            script_pos = Some((
-                                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-                                u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-                            ));
-                        }
+                        script_pos = Some(bytes);
                     }
                 }
                 // 入口标签槽:本作与 ERIS 语料的 ysc 里该参数名都是 `#`
@@ -2143,12 +2166,18 @@ impl Vm {
                         request_restart = true;
                     }
                 }
+                // 0.495 TASK 处理体**没有** TEXTPOS(槽 36)分支(只检查
+                // `0x684160/161/162/163/182/183/185`);官方忽略该参数。
+                // 参数序言仍会求值窗口,这里同型求值后丢弃。
+                Some("TEXTPOS") => {
+                    let _ = self.eval_window(st, w)?;
+                }
                 other => {
                     return Err(diag::unimplemented(
                         code::rt::CMD_UNIMPLEMENTED,
                         Boundary::Script,
                         format!(
-                            "TASK 参数 `{}`(槽 {})未实现(TEXTPOS 等;DIV-RT-015)",
+                            "TASK 参数 `{}`(槽 {})未实现(DIV-RT-015;0.495 处理体无该槽分支)",
                             other.unwrap_or("<不在工程 ysc 表>"),
                             w.rec.kind
                         ),
@@ -2159,6 +2188,15 @@ impl Vm {
         }
         // 缺省目标 = 执行者自身(手册;REA 0x45074a 用当前任务记录)。
         let target_id = id.unwrap_or_else(|| task.id.clone());
+        // SCRIPTPOS 串在两条分支里都要用:先统一解码 + 脚本名反查。
+        let mut decoded_pos = match script_pos {
+            Some(bytes) => Some(self.decode_scriptpos(&bytes)?),
+            None => None,
+        };
+        let decoded_sid = match &decoded_pos {
+            Some(sp) => Some(self.script_id_by_path(&sp.script_name)?),
+            None => None,
+        };
         match label {
             Some(label) => {
                 let seed = TaskSeed {
@@ -2166,11 +2204,11 @@ impl Vm {
                     script_id: label.script_id as u32,
                     pc: label.pc,
                     enabled,
+                    active,
                     priority,
                     main: false,
                 };
-                let pos = script_pos.unwrap_or((seed.script_id, seed.pc));
-                let mut fresh = ExecState::new(pos.0, pos.1);
+                let mut fresh = ExecState::new(seed.script_id, seed.pc);
                 fresh.task_ints = tints;
                 fresh.task_floats = tflts;
                 fresh.task_strs = tstrs.clone();
@@ -2178,9 +2216,26 @@ impl Vm {
                     // 目标 = 自身:引擎 `TASK` 直接写当前任务记录的 pc/脚本号
                     // (`0x4508bc..0x4508d9`),不是另建一条执行流。这里同样改写
                     // 当前执行位(块/循环/调用栈随新入口重置)。
+                    //
+                    // 引擎复用任务记录,只写 +0x20/+0x3c/+0x24..+0x38、TINT/
+                    // TFLT/TSTR、E/A、SCRIPTPOS/RESTART,**不写 task+0xc/+0x10**
+                    // ⇒ 重配置后 TEXTLINE/NEXTVOICE 保留旧值。这里同型继承。
+                    fresh.text_line = st.text_line;
+                    fresh.next_voice = st.next_voice;
+                    if let (Some(sp), Some(sid)) = (decoded_pos.take(), decoded_sid) {
+                        // 引擎先落标签再执行 SCRIPTPOS 装载:完整执行位覆盖入口。
+                        Self::apply_scriptpos(&mut fresh, sp, sid);
+                    }
                     *st = fresh;
                 } else {
                     // 同 ID 重配置 = 换入口(引擎复用任务记录并重载脚本表)。
+                    if let Some(old) = self.exec.get(&seed.id) {
+                        fresh.text_line = old.text_line;
+                        fresh.next_voice = old.next_voice;
+                    }
+                    if let (Some(sp), Some(sid)) = (decoded_pos.take(), decoded_sid) {
+                        Self::apply_scriptpos(&mut fresh, sp, sid);
+                    }
                     self.exec.insert(seed.id.clone(), fresh);
                 }
                 self.emit(VmEvent::TaskSpawn {
@@ -2196,22 +2251,39 @@ impl Vm {
             }
             None => {
                 // SCRIPTPOS 无 # 形态(手册例 4:对既有任务做「位置ロード」)。
-                if let Some((sid, pc)) = script_pos {
-                    let target = target_id.clone();
-                    if target == task.id {
-                        // 目标 = 自身:直接改当前执行位(引擎 `0x450fe0` 走同一记录)。
-                        st.script_id = sid;
-                        st.pc = pc;
-                        st.if_stack.clear();
-                        st.loops.clear();
-                    } else if let Some(target_st) = self.exec.get_mut(&target) {
-                        target_st.script_id = sid;
-                        target_st.pc = pc;
-                        target_st.if_stack.clear();
-                        target_st.loops.clear();
+                if let (Some(sp), Some(sid)) = (decoded_pos.take(), decoded_sid) {
+                    if target_id == task.id {
+                        // 目标 = 自身:引擎 `0x450fe0` 写同一任务记录。
+                        Self::apply_scriptpos(st, sp, sid);
+                    } else if let Some(target_st) = self.exec.get_mut(&target_id) {
+                        Self::apply_scriptpos(target_st, sp, sid);
+                    } else if self
+                        .task_view()
+                        .iter()
+                        .any(|n| n.id == target_id && !n.finished)
+                    {
+                        // 目标任务还没有执行位:按解码出的入口新建,再落完整状态。
+                        let mut fresh = ExecState::new(sid, sp.pc);
+                        Self::apply_scriptpos(&mut fresh, sp, sid);
+                        self.exec.insert(target_id.clone(), fresh);
+                    } else {
+                        // 引擎 `0x4507b4`:`test ebx; je` ⇒ 无 ID/无目标任务 = 错误。
+                        return Err(diag::fatal(
+                            code::rt::TASK,
+                            Boundary::Script,
+                            format!("TASK SCRIPTPOS: 目标任务 `{target_id}` 不存在"),
+                        )
+                        .into());
                     }
                 }
-                self.push_effect(Effect::SetEnabled(target_id, enabled));
+                // E/A 只写命令里**实际给出**的参数(引擎 `0x450bb1/0x450bbf`
+                // 均为存在性守卫);否则 `TASK[ID=X Z=…]` 会把已禁用任务重新打开。
+                if enabled_param {
+                    self.push_effect(Effect::SetEnabled(target_id.clone(), enabled));
+                }
+                if active_param {
+                    self.push_effect(Effect::SetActive(target_id, active));
+                }
             }
         }
         if request_restart {
@@ -2257,43 +2329,59 @@ impl Vm {
         Ok(StepOutcome::Continue)
     }
 
-    /// `TASKINFO[ID LET EXIST/E/Z/FILE/LINE/IFNEST/GOSUBNEST/LOOPNEST]`:
-    /// 手册 `control/taskinfo.html`。
+    /// `TASKINFO[ID LET EXIST/E/A/Z/FILE/FILENO/LINE/FILE0/FILENO0/LINE0/
+    /// TEXTLINE/NEXTVOICE/IFNEST/GOSUBNEST/LOOPNEST/SCRIPTPOS]`:
+    /// 手册 `control/taskinfo.html` + 引擎处理体(0.495 `0x4523fc` 逐槽;
+    /// 0.466/0.479/v494 的存在标志检查顺序与 FILENO0→SCRIPTPOS
+    /// fallthrough 与之相同;任务结构偏移随版本不同,字段语义同构)。
+    ///
+    /// 官方按**参数存在性**短路(不看值是否为 0),分派顺序固定:
+    /// `EXIST, E, A, Z, FILE, FILE0, LINE, LINE0, TEXTLINE, NEXTVOICE,
+    /// IFNEST, GOSUBNEST, LOOPNEST, FILENO, FILENO0, SCRIPTPOS`。
+    /// `GOLABEL/GOSUBLABEL/TEXTPOS` 在 0.495 处理体里没有分支,落到默认
+    /// `return 0` 且不写 LET —— 本实现同型对齐,不挂 Unimplemented。
     ///
     /// 取值来源 = **引擎任务记录**(旁线 §3.2):`+0x20` pc、`+0x3c` 脚本号、
-    /// `+0x3e` 块深度(base_a)、`+0x244` 调用栈深度。手册逐条:
-    /// `LINE`=当前执行行数、`IFNEST`/`GOSUBNEST`/`LOOPNEST`=三种嵌套数、
-    /// `FILE`=当前文件名(这里按脚本号给出,名字表在 `yst_list`)、
-    /// `E`/`Z`=启用位/优先级、`EXIST`=任务存在。
+    /// `+0x3e` 块深度(base_a)、`+0x244` 调用栈深度;`LINE` 用编译产物的逐 pc
+    /// 源码位置(`ScriptFile::source_position`,引擎 `task+0x38[pc]`)。
     ///
-    /// 行号:引擎另有「数据区 B 逐 pc 源码位置」(脚本 `+0x38`,本 crate
-    /// `ScriptFile::source_position`),此处直接用它 —— 那是编译产物里
-    /// 与 pc 一一对应的真实行号,不是推算。
+    /// `FILE0/FILENO0/LINE0` 读引擎 `task+0x144[0]`(第一层 GOSUB 的返回位:
+    /// 调用方脚本/调用点源码行),是任务的**外框位置**;`FILE/FILENO/LINE`
+    /// 读当前执行位(跨脚本 GOSUB 后 = 被调方)。无 GOSUB 时前组回退到后组。
+    /// `TEXTLINE/NEXTVOICE` 读 `task+0xc/+0x10`,由 `RETURNCODE`(`0x44c390`)
+    /// 从窗口记录抄入。
     fn op_taskinfo(
         &mut self,
         st: &mut ExecState,
         task: &crate::task::TaskNode,
         cmd: &Cmd,
     ) -> Result<StepOutcome, VmError> {
+        let names = self.param_names(cmd.opcode);
         let mut id: Option<String> = None;
         let mut target: Option<crate::expr::LValue> = None;
-        let mut ops: Vec<(u8, i64)> = Vec::new();
+        // 查询槽按**名字**收集存在性(引擎 0x4523fc 看窗口存在,不看值;
+        // `FILE0=0` 也算请求)。槽号在版本间会位移,名字稳定。
+        let mut present: Vec<String> = Vec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
             }
-            match w.rec.kind {
-                0 => {
+            match names.get(usize::from(w.rec.kind)).map(String::as_str) {
+                Some("ID") => {
                     if let Value::Str(bytes) = self.eval_window(st, w)? {
                         id = Some(cp932_lossy(&bytes));
                     }
                 }
-                1 => target = Some(self.eval_lvalue_window(st, w)?),
-                slot => {
-                    let v = self.eval_window(st, w)?;
-                    if let Some(n) = v.as_int() {
-                        ops.push((slot, n));
-                    }
+                Some("LET") => target = Some(self.eval_lvalue_window(st, w)?),
+                Some(name) => {
+                    // 与引擎参数序言一致:所有窗口都求值(未选中的查询也不
+                    // 跳过),保持同一处未声明变量/表达式错误面。
+                    let _ = self.eval_window(st, w)?;
+                    present.push(name.to_string());
+                }
+                None => {
+                    let _ = self.eval_window(st, w)?;
+                    present.push(format!("#{}", w.rec.kind));
                 }
             }
         }
@@ -2306,79 +2394,333 @@ impl Vm {
             .iter()
             .find(|n| n.id == id && !n.finished)
             .cloned();
+        // 引擎 `0x452918`:ID 未命中 ⇒ 按 LET 目标类型写默认值
+        // (INT 0 / FLT 0.0 / STR 空串),**不**去读当前任务状态。
+        if node.is_none() {
+            if let Some(t) = &target {
+                match self.taskinfo_default(t) {
+                    Some(v) => self.write_target(st, t, &v)?,
+                    // `var_shape` 为 None = LET 目标未声明。旧实现同样走
+                    // write_target 报 Fatal;这里保留显式诊断,不静默跳过。
+                    None => {
+                        self.write_target(st, t, &Value::Int(0))?;
+                    }
+                }
+            }
+            return Ok(StepOutcome::Continue);
+        }
         // 该任务的执行位(自身就在这里;其它任务在 exec 表里)。
         let exec = if id == task.id {
             Some(st.clone())
         } else {
             self.exec_of(&id).cloned()
         };
-        let Some((slot, _)) = ops.iter().find(|(_, v)| *v != 0).copied() else {
+        // 引擎处理体的固定分派顺序(0.495 `0x4523fc`;0.466/0.479/v494
+        // 的存在标志检查顺序相同,不是窗口顺序)。
+        const ORDER: [&str; 16] = [
+            "EXIST",
+            "E",
+            "A",
+            "Z",
+            "FILE",
+            "FILE0",
+            "LINE",
+            "LINE0",
+            "TEXTLINE",
+            "NEXTVOICE",
+            "IFNEST",
+            "GOSUBNEST",
+            "LOOPNEST",
+            "FILENO",
+            "FILENO0",
+            "SCRIPTPOS",
+        ];
+        let Some(query) = ORDER
+            .iter()
+            .copied()
+            .find(|q| present.iter().any(|p| p.as_str() == *q))
+        else {
+            // `GOLABEL/GOSUBLABEL/TEXTPOS` 与未知槽:0.495 处理体没有分支,
+            // 落到默认 `return 0` 且不写 LET。显式留一条对齐记录(每个槽名
+            // 一次),不挂 Unimplemented。
+            for name in &present {
+                if !ORDER.contains(&name.as_str()) {
+                    self.report_aligned_stub(
+                        &format!("TASKINFO[{name}]"),
+                        "0.495 处理体 0x4523fc 无该查询槽分支;按官方 no-op(不写 LET)".to_string(),
+                    );
+                }
+            }
             return Ok(StepOutcome::Continue);
         };
-        // 查询项按**参数名**分派(槽号在版本间会位移,名字稳定)。
-        let names = self.param_names(cmd.opcode);
-        let query = names.get(usize::from(slot)).map(String::as_str);
+        let (sid, pc) = exec.as_ref().map(|e| (e.script_id, e.pc)).unwrap_or((0, 0));
+        // 引擎 `0x4524dc/0x4525fa/0x4528b3`:GOSUB 深度 > 0 时读
+        // `task+0x144[0]`(第一层调用的返回位);内核 frames[0] 是基帧,
+        // frames[1] 才是第一层 GOSUB。
+        let origin = exec
+            .as_ref()
+            .and_then(|e| e.frames.get(1).map(|f| (f.return_script, f.return_pc)))
+            .unwrap_or((sid, pc));
         let value = match query {
-            Some("EXIST") => Value::Int(node.is_some() as i64),
-            Some("E") => Value::Int(node.as_ref().map(|n| n.enabled as i64).unwrap_or(0)),
-            Some("Z") => Value::Int(node.as_ref().map(|n| n.priority).unwrap_or(0)),
-            Some("FILE") => {
-                // FILE:当前脚本文件名(手册)→ 由 `yst_list` 的名字表给出。
-                let sid = exec.as_ref().map(|e| e.script_id).unwrap_or(0);
-                Value::Int(sid as i64)
-            }
-            Some("FILENO") => Value::Int(exec.as_ref().map(|e| e.script_id as i64).unwrap_or(-1)),
-            Some("LINE") => {
-                // LINE:当前执行行数(数据区 B 的逐 pc 源码位置)。
-                let (sid, pc) = exec
-                    .as_ref()
-                    .map(|e| (e.script_id, e.pc.saturating_sub(1)))
-                    .unwrap_or((0, 0));
-                let line = self
-                    .tables
-                    .script(sid)
-                    .and_then(|s| s.source_position(pc as usize))
-                    .map(|v| v as i64)
-                    .unwrap_or(-1);
-                Value::Int(line)
-            }
-            Some("IFNEST") => {
-                Value::Int(exec.as_ref().map(|e| e.if_stack.len() as i64).unwrap_or(0))
-            }
-            Some("GOSUBNEST") => Value::Int(
+            "EXIST" => Value::Int(1),
+            "E" => Value::Int(node.as_ref().map(|n| n.enabled as i64).unwrap_or(0)),
+            // A:调度闸门第二字节(引擎 task+0x15;REA 0x4527b0 读)。
+            "A" => Value::Int(node.as_ref().map(|n| n.active as i64).unwrap_or(0)),
+            "Z" => Value::Int(node.as_ref().map(|n| n.priority).unwrap_or(0)),
+            // FILE:当前脚本文件名(手册)→ 引擎 `0x801850[script_no]` 名字表。
+            "FILE" => Value::Str(self.script_path_bytes(sid)),
+            "FILENO" => Value::Int(sid as i64),
+            // LINE:当前执行行数(数据区 B 的逐 pc 源码位置)。
+            "LINE" => Value::Int(self.script_line(sid, pc)),
+            // 以下三项 = 第一层 GOSUB 的调用点(引擎 `task+0x144[0]`)。
+            "FILE0" => Value::Str(self.script_path_bytes(origin.0)),
+            "FILENO0" => Value::Int(origin.0 as i64),
+            "LINE0" => Value::Int(self.script_line(origin.0, origin.1)),
+            // task+0xc / task+0x10:最近一次 RETURNCODE 的窗口记录。
+            "TEXTLINE" => Value::Int(exec.as_ref().map(|e| e.text_line).unwrap_or(0)),
+            "NEXTVOICE" => Value::Int(exec.as_ref().map(|e| e.next_voice).unwrap_or(0)),
+            "IFNEST" => Value::Int(exec.as_ref().map(|e| e.if_stack.len() as i64).unwrap_or(0)),
+            "GOSUBNEST" => Value::Int(
                 exec.as_ref()
                     .map(|e| e.frames.len().saturating_sub(1) as i64)
                     .unwrap_or(0),
             ),
-            Some("LOOPNEST") => {
-                Value::Int(exec.as_ref().map(|e| e.loops.len() as i64).unwrap_or(0))
-            }
+            "LOOPNEST" => Value::Int(exec.as_ref().map(|e| e.loops.len() as i64).unwrap_or(0)),
             // SCRIPTPOS(手册 `control/taskinfo.html`:現在実行されている
-            // スクリプト位置情報)。脚本视为不透明 blob;本实现 = 8 字节
-            // [script_id u32 LE][pc u32 LE],与 `TASK[SCRIPTPOS=…]` 配对往返。
-            Some("SCRIPTPOS") => {
-                let (sid, pc) = exec.as_ref().map(|e| (e.script_id, e.pc)).unwrap_or((0, 0));
-                let mut b = Vec::with_capacity(8);
-                b.extend_from_slice(&sid.to_le_bytes());
-                b.extend_from_slice(&pc.to_le_bytes());
-                Value::Str(b)
-            }
-            other => {
-                return Err(diag::unimplemented(
-                    code::rt::CMD_UNIMPLEMENTED,
-                    Boundary::Script,
-                    format!(
-                        "TASKINFO 参数 `{}`(槽 {slot})未实现(DIV-RT-015)",
-                        other.unwrap_or("<不在工程 ysc 表>")
-                    ),
-                )
-                .into())
-            }
+            // スクリプト位置情報)。产官方引擎线格式(见 `crate::scriptpos`;
+            // 0.292/0.466/0.479/0.495/v494 五版同构)。
+            "SCRIPTPOS" => self.scriptpos_value(exec.as_ref(), sid, pc)?,
+            _ => unreachable!("ORDER 覆盖全部分支"),
         };
-        if let Some(t) = target {
-            self.write_target(st, &t, &value)?;
+        if let Some(t) = &target {
+            self.write_taskinfo_value(st, t, query, &value)?;
+            // 引擎 `0x4525fa/0x4528fa`:FILENO0 写完不返回,`jmp 0x452628`
+            // 继续检查 SCRIPTPOS;两者同时存在时 SCRIPTPOS 二次写入覆盖。
+            // 其余分支均在写后直接返回(`0x452673` 等)。
+            if query == "FILENO0" && present.iter().any(|p| p == "SCRIPTPOS") {
+                let blob = self.scriptpos_value(exec.as_ref(), sid, pc)?;
+                self.write_taskinfo_value(st, t, "SCRIPTPOS", &blob)?;
+            }
         }
         Ok(StepOutcome::Continue)
+    }
+
+    /// `TASKINFO[SCRIPTPOS]` / `FILENO0+SCRIPTPOS`:把目标任务当前执行位编码成
+    /// 官方引擎线格式(线格式跨五版核对,见 [`crate::scriptpos`])。
+    fn scriptpos_value(
+        &self,
+        exec: Option<&ExecState>,
+        sid: u32,
+        pc: u32,
+    ) -> Result<Value, VmError> {
+        Ok(Value::Str(self.encode_scriptpos(exec, sid, pc)?))
+    }
+
+    fn encode_scriptpos(
+        &self,
+        exec: Option<&ExecState>,
+        sid: u32,
+        pc: u32,
+    ) -> Result<Vec<u8>, VmError> {
+        let fallback;
+        let exec = match exec {
+            Some(e) => e,
+            None => {
+                fallback = ExecState::new(sid, pc);
+                &fallback
+            }
+        };
+        let sid = exec.script_id;
+        let name = u16::try_from(sid)
+            .ok()
+            .and_then(|s| self.tables().boot.scripts.path_of(s))
+            .map(|p| p.to_vec())
+            .ok_or_else(|| -> VmError {
+                diag::fatal(
+                    code::rt::SCRIPT_POS,
+                    Boundary::Script,
+                    format!("SCRIPTPOS: 脚本号 {sid} 不在 yst_list 名字表"),
+                )
+                .into()
+            })?;
+        let sp = scriptpos::ScriptPos {
+            if_entries: exec
+                .if_stack
+                .iter()
+                .map(|f| scriptpos::IfEntry {
+                    loop_depth: f.loop_depth as u8,
+                    entry_pc: f.entry_pc,
+                    end_pc: f.end_pc,
+                })
+                .collect(),
+            gosub_entries: exec
+                .frames
+                .iter()
+                .skip(1)
+                .map(|f| scriptpos::GosubEntry {
+                    if_depth: f.if_depth as u8,
+                    loop_depth: f.loop_depth as u8,
+                    return_pc: f.return_pc,
+                    return_script: f.return_script as u16,
+                })
+                .collect(),
+            loop_entries: exec
+                .loops
+                .iter()
+                .map(|f| scriptpos::LoopEntry {
+                    if_depth: f.if_depth as u8,
+                    body_pc: f.body_pc,
+                    end_pc: f.end_pc,
+                    counter: f.counter,
+                    limit: f.limit,
+                })
+                .collect(),
+            text_line: exec.text_line as i32 as u32,
+            pc: exec.pc,
+            script_name: name,
+        };
+        sp.encode().map_err(|e| -> VmError {
+            diag::fatal(code::rt::SCRIPT_POS, Boundary::Script, e).into()
+        })
+    }
+
+    fn decode_scriptpos(&self, blob: &[u8]) -> Result<scriptpos::ScriptPos, VmError> {
+        scriptpos::ScriptPos::decode(blob).map_err(|e| -> VmError {
+            diag::fatal(code::rt::SCRIPT_POS, Boundary::Script, e).into()
+        })
+    }
+
+    fn script_id_by_path(&self, name: &[u8]) -> Result<u32, VmError> {
+        self.tables()
+            .boot
+            .scripts
+            .entries
+            .iter()
+            .find(|e| e.path.as_slice() == name)
+            .map(|e| e.index)
+            .ok_or_else(|| -> VmError {
+                diag::fatal(
+                    code::rt::SCRIPT_POS,
+                    Boundary::Script,
+                    format!("SCRIPTPOS: 脚本名不在 yst_list 清单:{}", cp932_lossy(name)),
+                )
+                .into()
+            })
+    }
+
+    /// 把引擎 SCRIPTPOS 解出的执行位写进内核 `ExecState`。
+    ///
+    /// 不触碰 `next_voice`(引擎装载器不写 `task+0x10`)与 TINT/TFLT/TSTR
+    /// (TASK 参数落位,SCRIPTPOS 不序列化)。
+    fn apply_scriptpos(exec: &mut ExecState, sp: scriptpos::ScriptPos, sid: u32) {
+        let base_a = sp.if_entries.len() as u8;
+        exec.script_id = sid;
+        exec.pc = sp.pc;
+        exec.base_a = base_a;
+        exec.text_line = i64::from(sp.text_line as i32);
+        exec.if_stack = sp
+            .if_entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| IfFrame {
+                entry_pc: e.entry_pc,
+                end_pc: e.end_pc,
+                // 引擎 IF 帧不序列化 base A;基址 = 该帧压入前的 IF 深度(0 基),
+                // 与 `IFBREAK` 截断到该帧后的 `task+0x3e` 同口径。
+                base_a: i as u8,
+                loop_depth: e.loop_depth as usize,
+            })
+            .collect();
+        exec.loops = sp
+            .loop_entries
+            .iter()
+            .map(|e| LoopFrame {
+                body_pc: e.body_pc,
+                end_pc: e.end_pc,
+                limit: e.limit,
+                counter: e.counter,
+                if_depth: e.if_depth as usize,
+                base_a: e.if_depth,
+            })
+            .collect();
+        exec.frames.clear();
+        exec.frames.push(GosubFrame::new(sid, sp.pc, base_a));
+        for e in &sp.gosub_entries {
+            let mut f = GosubFrame::new(e.return_script as u32, e.return_pc, e.if_depth);
+            f.if_depth = e.if_depth as usize;
+            f.loop_depth = e.loop_depth as usize;
+            exec.frames.push(f);
+        }
+    }
+
+    /// `TASKINFO` 的脚本号 → 源码行(引擎 `task+0x38[pc]`);
+    /// pc 是「下一条命令」下标,查表用当前命令下标 `pc-1`。
+    fn script_line(&self, sid: u32, pc: u32) -> i64 {
+        self.tables
+            .script(sid)
+            .and_then(|s| s.source_position(pc.saturating_sub(1) as usize))
+            .map(|v| v as i64)
+            .unwrap_or(-1)
+    }
+
+    /// `TASKINFO FILE/FILE0`:脚本号 → `yst_list` 路径字节
+    /// (引擎 `0x801850[script_no]`;不是 `script_id` 的十进制串)。
+    fn script_path_bytes(&self, sid: u32) -> Vec<u8> {
+        u16::try_from(sid)
+            .ok()
+            .and_then(|s| self.tables().boot.scripts.path_of(s))
+            .map(|p| p.to_vec())
+            .unwrap_or_default()
+    }
+
+    /// ID 未命中时按 LET 目标类型给出引擎默认值(`0x452918`:INT 0 /
+    /// FLT 0.0 / STR 空串;其它类型不写)。
+    fn taskinfo_default(&self, target: &crate::expr::LValue) -> Option<Value> {
+        let (ty, _) = self.var_shape(target.var)?;
+        Some(match ty {
+            ElemType::Int => Value::Int(0),
+            ElemType::Float => Value::Float(0.0),
+            ElemType::Str => Value::Str(Vec::new()),
+        })
+    }
+
+    /// `TASKINFO` 的 LET 类型闸门。
+    ///
+    /// 引擎写字符串走 `0x43f0d8`(目标必须是 STR,否则不写),写数值走
+    /// `0x455540`(目标必须是 INT/FLT,否则不写)。类型不符时只留一条
+    /// Recoverable 诊断(按 query + 目标类型去重,避免热循环刷屏),
+    /// 不把值硬转进异型变量。
+    fn write_taskinfo_value(
+        &mut self,
+        st: &ExecState,
+        target: &crate::expr::LValue,
+        query: &str,
+        value: &Value,
+    ) -> Result<(), VmError> {
+        // 系统变量写入策略(DIV-RT-007)优先交给 write_target 报挂号。
+        if target.var.id < self.sys_count {
+            return self.write_target(st, target, value);
+        }
+        let Some((ty, _)) = self.var_shape(target.var) else {
+            return self.write_target(st, target, value);
+        };
+        let compatible = match value {
+            Value::Str(_) => matches!(ty, ElemType::Str),
+            Value::Int(_) | Value::Float(_) => matches!(ty, ElemType::Int | ElemType::Float),
+        };
+        if compatible {
+            self.write_target(st, target, value)?;
+        } else {
+            let key = format!("{query}:{ty:?}");
+            if self.taskinfo_type_reported.insert(key) {
+                self.report(diag::recoverable(
+                    code::rt::VAR_TYPE,
+                    Boundary::Script,
+                    format!("TASKINFO[{query}] LET 目标类型 {ty:?} 与查询值类型不符;按引擎不写入"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// `SYSTEMINFO[SCRIPTFILE/SCRIPTNUM/TEXTNUM/EMOTE/NO/LET]`。
@@ -3829,8 +4171,22 @@ impl Vm {
     /// 台账:`COV-M-02`。
     fn op_returncode(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         use crate::text::flag as tflag;
-        let _ = st;
-        let line = cmd.windows.first().map(|w| w.rec.kind as u32).unwrap_or(0);
+        // 引擎 `0x44c390` 在进入文本模式分支前先把当前指令首窗口记录的两个
+        // dword 抄进任务记录:`task+0xc` = 首 dword(窗口 `id | type<<16`),
+        // `task+0x10` = 次 dword(窗口 `length`)。`TASKINFO[TEXTLINE/NEXTVOICE]`
+        // (`0x45272a/0x452708`)随后原样读回(两者都按有符号 dword 扩展)。
+        // 事件里的行号用窗口 **u16 id**(低字节 `kind` + 高字节 `flag`),
+        // 不能用 u8 `kind` —— 单脚本文本行超过 255 时会截断。
+        let (line_id, packed_line, next_voice) = match cmd.windows.first() {
+            Some(w) => {
+                let id = u32::from(w.rec.kind) | (u32::from(w.rec.flag) << 8);
+                (id, id | (u32::from(w.rec.slot) << 16), w.rec.length)
+            }
+            None => (0, 0, 0),
+        };
+        st.text_line = i64::from(packed_line as i32);
+        st.next_voice = i64::from(next_voice as i32);
+
         if self.text.output_mode != 0 {
             if self.text.autoclick != 0 {
                 self.text.push_flag(tflag::CLICK);
@@ -3847,7 +4203,7 @@ impl Vm {
         self.text.push_flag(tflag::END);
         self.emit(VmEvent::ReturnCode {
             frame: self.frame(),
-            line,
+            line: line_id,
         });
         Ok(StepOutcome::TextYield)
     }

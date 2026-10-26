@@ -51,6 +51,8 @@ pub mod rt {
     pub const CMD_SLOT: &str = "rt.cmd.slot";
     /// 任务 ID 重复/不存在等任务语义问题。
     pub const TASK: &str = "rt.task";
+    /// `SCRIPTPOS` 执行位快照损坏/脚本名无法解析。
+    pub const SCRIPT_POS: &str = "rt.scriptpos";
     /// 任务嵌套/循环嵌套超过引擎上限。
     pub const NESTING: &str = "rt.nesting";
     /// 标签不存在。
@@ -99,6 +101,7 @@ pub const ALL_CODES: &[&str] = &[
     rt::CMD_WINDOWS,
     rt::CMD_SLOT,
     rt::TASK,
+    rt::SCRIPT_POS,
     rt::NESTING,
     rt::LABEL,
     rt::VAR_UNDECLARED,

@@ -40,6 +40,12 @@ fn graph_color(ms: f32) -> Color32 {
     }
 }
 
+/// 保留 RGB、换掉 alpha(面积渐变从线色渐隐到全透明)。
+fn with_alpha(color: Color32, alpha: u8) -> Color32 {
+    let [r, g, b, _] = color.to_array();
+    Color32::from_rgba_unmultiplied(r, g, b, alpha)
+}
+
 /// 面板/横幅需要的全部读数(逐帧复制;`diagnostics` 借用,不 clone 大表)。
 pub struct UiSnapshot<'a> {
     pub backend: String,
@@ -139,7 +145,8 @@ pub fn debug_window(ctx: &egui::Context, snap: &UiSnapshot<'_>) -> UiActions {
 /// 渲染耗时曲线(独立窗口,随 F1 / `--debug-ui` 一起显隐)。
 ///
 /// 每个宿主帧一个样本,横轴按固定容量滚动、最新样本贴右边;线色按
-/// 当前样本耗时分级:绿 < 8ms、黄 < 16.7ms、红 ≥ 16.7ms。
+/// 当前样本耗时分级:绿 < 8ms、黄 < 16.7ms、红 ≥ 16.7ms。曲线下方
+/// 是同色到透明的渐变面积。
 pub fn render_graph_window(ctx: &egui::Context, samples: &std::collections::VecDeque<f32>) {
     egui::Window::new("render time (ms)")
         .default_pos([470.0, 12.0])
@@ -176,6 +183,33 @@ pub fn render_graph_window(ctx: &egui::Context, samples: &std::collections::VecD
             // 纵轴按窗口内最大值自适应;至少留到 1.5 倍红线,避免曲线贴顶。
             let top = max.max(GRAPH_RED_MS * 1.5).max(1.0);
             let y_of = |ms: f32| rect.bottom() - (ms / top) * rect.height();
+            // 横轴固定容量:x 间距不随样本数变化,曲线从右往左生长。
+            let dx = rect.width() / (RENDER_GRAPH_SAMPLES - 1) as f32;
+
+            // 同色到透明的渐变面积:每段两个三角形,顶点色由线色渐隐到底边透明。
+            let area_alpha = 64;
+            let mut mesh = egui::Mesh::default();
+            let mut prev: Option<(egui::Pos2, Color32)> = None;
+            for (i, ms) in samples.iter().enumerate() {
+                let from_right = samples.len() - 1 - i;
+                let pos = egui::pos2(rect.right() - from_right as f32 * dx, y_of(*ms));
+                let color = graph_color(*ms);
+                if let Some((prev_pos, prev_color)) = prev {
+                    let base = mesh.vertices.len() as u32;
+                    mesh.colored_vertex(prev_pos, with_alpha(prev_color, area_alpha));
+                    mesh.colored_vertex(
+                        egui::pos2(prev_pos.x, rect.bottom()),
+                        with_alpha(prev_color, 0),
+                    );
+                    mesh.colored_vertex(egui::pos2(pos.x, rect.bottom()), with_alpha(color, 0));
+                    mesh.colored_vertex(pos, with_alpha(color, area_alpha));
+                    mesh.add_triangle(base, base + 1, base + 2);
+                    mesh.add_triangle(base, base + 2, base + 3);
+                }
+                prev = Some((pos, color));
+            }
+            painter.add(egui::Shape::mesh(mesh));
+
             for (ms, color) in [(GRAPH_GREEN_MS, GRAPH_YELLOW), (GRAPH_RED_MS, GRAPH_RED)] {
                 let y = y_of(ms);
                 painter.line_segment(
@@ -184,8 +218,6 @@ pub fn render_graph_window(ctx: &egui::Context, samples: &std::collections::VecD
                 );
             }
 
-            // 横轴固定容量:x 间距不随样本数变化,曲线从右往左生长。
-            let dx = rect.width() / (RENDER_GRAPH_SAMPLES - 1) as f32;
             for i in 1..samples.len() {
                 let from_right_prev = samples.len() - i;
                 let from_right_cur = samples.len() - 1 - i;

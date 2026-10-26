@@ -459,6 +459,11 @@ fn prune_snapshots(snapshots: &mut Snapshots, frame: &CompositorFrame) {
         for op in &pass.ops {
             if let Op::Copy(copy) = op {
                 live.insert(copy.id);
+                // 中间层被删除后,后续 copy 仍以它的快照为源
+                // (`source_texture`);快照必须保留到消费完。
+                if let Some(TextureRef::Snapshot(id)) = &copy.source_texture {
+                    live.insert(*id);
+                }
             }
         }
     }
@@ -532,7 +537,15 @@ fn apply_image_op(
                 return Ok(());
             }
         }
-        let source = layer_surface(textures, snapshots, frame, &image.source, st, None)?;
+        // 源层可能已被 `CGEND` 删除(`ImageOp::source_texture`)。
+        let source = layer_surface(
+            textures,
+            snapshots,
+            frame,
+            &image.source,
+            st,
+            image.source_texture.as_ref(),
+        )?;
         if region.is_none() {
             // 无区域 = 整幅源缩放到目标尺寸。绘制目标层时纹理会按
             // `layer.image_size()`(= `SX×SY`)拉伸,因此**像素无需重采样**:
@@ -631,7 +644,7 @@ fn apply_image_op(
             .source2
             .as_ref()
             .ok_or_else(|| "gfx.imageop.source.missing".to_string())?;
-        let from = layer_surface(textures, snapshots, frame, from_id, st, None)?;
+        let from = layer_surface(textures, snapshots, frame, from_id, st, image.source_texture.as_ref())?;
         let to = layer_surface(textures, snapshots, frame, to_id, st, None)?;
         let blend = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
         let blended = crate::imageop::blend_transition(
@@ -660,7 +673,7 @@ fn apply_image_op(
             Some(t) => Rc::try_unwrap(t).unwrap_or_else(|rc| (*rc).clone()),
             None => base_texture(textures, snapshots, frame, target)?,
         };
-        let upper = layer_surface(textures, snapshots, frame, upper_id, st, None)?;
+        let upper = layer_surface(textures, snapshots, frame, upper_id, st, image.source_texture.as_ref())?;
         let upper = crate::texture::Texture {
             width: upper.width,
             height: upper.height,
@@ -827,7 +840,7 @@ fn apply_copy_op(
         },
         CopySource::Group(id) => compose_group(textures, snapshots, frame, id, st)?,
         CopySource::Layer(id) => {
-            let mut surface = layer_surface(textures, snapshots, frame, id, st, Some(copy))?;
+            let mut surface = layer_surface(textures, snapshots, frame, id, st, copy.source_texture.as_ref())?;
             if !copy.texts.is_empty() {
                 compose_copy_texts(&mut surface, copy, st);
             }
@@ -945,7 +958,7 @@ fn layer_surface(
     frame: &CompositorFrame,
     id: &LayerId,
     st: &mut RenderState,
-    fallback: Option<&CopyOp>,
+    fallback: Option<&TextureRef>,
 ) -> Result<Surface, String> {
     // 文本覆盖纹理不作为 COPY 源(DIV-GFX-058):快照面 = 基图(+图像加工)
     // + `copy.texts` 在命令时刻冻结的文本,不带帧末实时文本。
@@ -959,9 +972,7 @@ fn layer_surface(
     let layer = frame.layers.iter().find(|layer| &layer.id == id);
     let texture = match layer {
         Some(layer) => &layer.texture,
-        None => fallback
-            .and_then(|copy| copy.source_texture.as_ref())
-            .ok_or_else(|| "gfx.copy.source.gone".to_string())?,
+        None => fallback.ok_or_else(|| "gfx.copy.source.gone".to_string())?,
     };
     match texture {
         TextureRef::Asset(key) => textures

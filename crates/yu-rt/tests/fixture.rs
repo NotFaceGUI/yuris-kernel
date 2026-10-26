@@ -10,7 +10,7 @@ use yu_rt::input::{InputFrame, InputTimeline};
 use yu_rt::json::to_jsonl;
 use yu_rt::task::MAIN_TASK_ID;
 use yu_rt::value::{Value, VarRef, VarSpace};
-use yu_rt::{BootConfig, Vm};
+use yu_rt::{BootConfig, HostLocalTime, Vm};
 
 /// 与 0.495 `ysc.ybn` 一致的 opcode(夹具命令表同序)。
 const OP_END: u8 = 14;
@@ -28,6 +28,7 @@ const OP_LOOP: u8 = 56;
 const OP_LOOPEND: u8 = 59;
 const OP_RETURN: u8 = 77;
 const OP_STR: u8 = 90;
+const OP_TASKINFO: u8 = 95;
 const OP_VARACT: u8 = 100;
 const OP_WAIT: u8 = 102;
 const OP_MATH: u8 = 61;
@@ -45,6 +46,27 @@ fn boot(builder: ProjectBuilder) -> Vm {
 fn user_var(vm: &Vm, offset: u16) -> VarRef {
     let sys = vm.sysvars().len() as u16;
     VarRef::new(VarSpace::At, sys + offset)
+}
+
+/// 按 `b.vars` 的当前顺序追加一个用户变量(offset = 追加序号)。
+fn push_var(b: &mut ProjectBuilder, value_type: u8, init: Init) -> VarRef {
+    let sys = b.sysvars.len() as u16;
+    let var_id = sys + b.vars.len() as u16;
+    b.vars.push(VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id,
+        value_type,
+        dims: vec![],
+        init,
+    });
+    let space = if value_type == 3 {
+        VarSpace::Dollar
+    } else {
+        VarSpace::At
+    };
+    VarRef::new(space, var_id)
 }
 
 // ---------------------------------------------------------------- 基本声明/赋值
@@ -363,6 +385,67 @@ fn loop_counts_and_lc_is_visible() {
             .unwrap(),
         Value::Int(5),
         "_LC 在最后一轮 = 5(手册 1..5)"
+    );
+}
+
+/// `@_TIME` 在宿主注入本地时间后返回真实日期时间(存档菜单的现实日期;
+/// 未注入时仍走 1970 确定性注入时钟,DIV-RT-009)。
+#[test]
+fn time_sysvar_uses_injected_local_clock() {
+    let mut b = ProjectBuilder::new();
+    let year = push_var(&mut b, 1, Init::Int(0));
+    let hour = push_var(&mut b, 1, Init::Int(0));
+    // `_TIME` id 由夹具 ycd 顺序决定;构建前解析一次(与 `_LC` 用例同法)。
+    let mut probe = ProjectBuilder::new();
+    probe.sysvars = b.sysvars.clone();
+    let src = probe.build();
+    let tables = yu_rt::TableSet::load(&src, yu_rt::tables::DEFAULT_SCRIPT_KEY).unwrap();
+    let time_id = tables.boot.sysvars.id("_TIME").expect("_TIME 系统变量");
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        // LET[@year = @_TIME(0,0)]
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, year.id))
+            .window(
+                0,
+                ex::cat(&[
+                    ex::r#ref(0x40, time_id),
+                    ex::i8_(0),
+                    ex::i8_(0),
+                    ex::aload(),
+                ]),
+            ),
+        // LET[@hour = @_TIME(1,4)]
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, hour.id))
+            .window(
+                0,
+                ex::cat(&[
+                    ex::r#ref(0x40, time_id),
+                    ex::i8_(1),
+                    ex::i8_(4),
+                    ex::aload(),
+                ]),
+            ),
+        GroupSpec::new(OP_END),
+    ]];
+    let local = HostLocalTime::new(2026, 10, 26, 13, 45, 30, 250).expect("合法本地时间");
+    let boot_cfg = BootConfig {
+        local_time: Some(local),
+        ..BootConfig::default()
+    };
+    let mut vm = Vm::boot(Box::new(b.build()), boot_cfg).expect("boot");
+    vm.tick_at(0, &no_input());
+    assert_eq!(
+        vm.store().read(year, &[]).unwrap(),
+        Value::Int(2026),
+        "@_TIME(0,0) = 宿主本地年,不是 1970 纪元"
+    );
+    assert_eq!(
+        vm.store().read(hour, &[]).unwrap(),
+        Value::Int(13),
+        "@_TIME(1,4) = 启动时刻的小时"
     );
 }
 
@@ -1016,6 +1099,667 @@ fn taskend_without_id_ends_only_self_and_main_continues() {
         "TASKINFO[ID=\"SYSTEM\" EXIST=1] 命中主线"
     );
     assert!(vm.scheduler().find_by_id("SUB").is_none(), "子任务已摘链");
+}
+
+/// `TASKINFO[TEXTLINE/NEXTVOICE]`:引擎 `0x44c390`(RETURNCODE)把当前指令
+/// 首窗口记录的两个 dword 抄进 `task+0xc/+0x10`,TASKINFO 分支
+/// `0x45272a/0x452708` 原样读回。夹具窗口 `id` = 文本行(3)、
+/// `length` = voice(7);内核必须保存同一对值。
+#[test]
+fn taskinfo_text_line_and_next_voice_come_from_returncode_window() {
+    let mut b = ProjectBuilder::new();
+    let line = push_var(&mut b, 1, Init::Int(-1));
+    let voice = push_var(&mut b, 1, Init::Int(-1));
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        // RETURNCODE:窗口 id=3(文本行)、length=7(voice)。
+        GroupSpec::new(OP_RETURNCODE).window_value(3, 7).line(11),
+        GroupSpec::new(OP_TASKINFO)
+            .window(12, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, line.id))
+            .line(12),
+        GroupSpec::new(OP_TASKINFO)
+            .window(13, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, voice.id))
+            .line(13),
+        GroupSpec::new(OP_END).line(14),
+    ]];
+    let mut vm = boot(b);
+    // RETURNCODE → TextYield;TextYield 需要推进输入才恢复(引擎 `task+9`)。
+    vm.tick_at(0, &no_input());
+    let mut tl = InputTimeline::new();
+    tl.set(1, InputFrame::new(["MOUSE_L"]));
+    vm.tick_at(16, &tl);
+    vm.tick_at(32, &tl);
+    assert_eq!(vm.store().read(line, &[]).unwrap(), Value::Int(3));
+    assert_eq!(vm.store().read(voice, &[]).unwrap(), Value::Int(7));
+}
+
+/// `TASKINFO[FILE0/FILENO0/LINE0]` = 第一层 GOSUB 的调用点(引擎
+/// `task+0x144[0]`:调用方脚本号/调用点源码行);`FILE/FILENO/LINE` =
+/// 当前执行位(跨脚本 GOSUB 后是被调方)。
+#[test]
+fn taskinfo_file0_fileno0_line0_are_first_gosub_call_site() {
+    let mut b = ProjectBuilder::new();
+    let path0 = push_var(&mut b, 3, Init::Str(b""));
+    let n0 = push_var(&mut b, 1, Init::Int(-1));
+    let l0 = push_var(&mut b, 1, Init::Int(-1));
+    let path1 = push_var(&mut b, 3, Init::Str(b""));
+    let n1 = push_var(&mut b, 1, Init::Int(-1));
+    let l1 = push_var(&mut b, 1, Init::Int(-1));
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("CALLEE", 0, 1, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![
+        vec![
+            GroupSpec::new(OP_GOSUB).window(0, ex::s("CALLEE")).line(10),
+            GroupSpec::new(OP_END).line(11),
+        ],
+        vec![
+            GroupSpec::new(OP_TASKINFO)
+                .window(9, ex::i8_(1))
+                .window(1, ex::r#ref(0x24, path0.id))
+                .line(30),
+            GroupSpec::new(OP_TASKINFO)
+                .window(10, ex::i8_(1))
+                .window(1, ex::r#ref(0x40, n0.id))
+                .line(31),
+            GroupSpec::new(OP_TASKINFO)
+                .window(11, ex::i8_(1))
+                .window(1, ex::r#ref(0x40, l0.id))
+                .line(32),
+            GroupSpec::new(OP_TASKINFO)
+                .window(6, ex::i8_(1))
+                .window(1, ex::r#ref(0x24, path1.id))
+                .line(33),
+            GroupSpec::new(OP_TASKINFO)
+                .window(7, ex::i8_(1))
+                .window(1, ex::r#ref(0x40, n1.id))
+                .line(34),
+            GroupSpec::new(OP_TASKINFO)
+                .window(8, ex::i8_(1))
+                .window(1, ex::r#ref(0x40, l1.id))
+                .line(35),
+            GroupSpec::new(OP_RETURN).line(36),
+            GroupSpec::new(OP_END).line(37),
+        ],
+    ];
+    let mut vm = boot(b);
+    for f in 0..8u32 {
+        vm.tick_at(f * 16, &no_input());
+    }
+    assert_eq!(
+        vm.store().read(path0, &[]).unwrap(),
+        Value::Str(b"data\\script\\fixture0000.yst".to_vec()),
+        "FILE0 = 调用方脚本路径(引擎 0x801850[frame[0].script])"
+    );
+    assert_eq!(
+        vm.store().read(n0, &[]).unwrap(),
+        Value::Int(0),
+        "FILENO0 = 第一层 GOSUB 的调用方脚本号"
+    );
+    assert_eq!(
+        vm.store().read(l0, &[]).unwrap(),
+        Value::Int(10),
+        "LINE0 = 第一层 GOSUB 的调用点源码行(引擎 frame+0xc)"
+    );
+    assert_eq!(
+        vm.store().read(path1, &[]).unwrap(),
+        Value::Str(b"data\\script\\fixture0001.yst".to_vec()),
+        "FILE = 当前执行(被调方)脚本路径"
+    );
+    assert_eq!(
+        vm.store().read(n1, &[]).unwrap(),
+        Value::Int(1),
+        "FILENO = 当前执行脚本号"
+    );
+    assert_eq!(
+        vm.store().read(l1, &[]).unwrap(),
+        Value::Int(35),
+        "LINE = 当前执行命令的源码行(数据区 B)"
+    );
+}
+
+/// 查询槽按**存在性**判定(值为 0 也算请求),且分派顺序按 0.495
+/// 处理体 `0x4523fc` 的固定链(`LINE` 在 `LINE0` 前),不是窗口顺序。
+#[test]
+fn taskinfo_query_presence_ignores_zero_and_dispatch_uses_engine_order() {
+    let mut b = ProjectBuilder::new();
+    let path = push_var(&mut b, 3, Init::Str(b""));
+    let x = push_var(&mut b, 1, Init::Int(-1));
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("CALLEE", 0, 1, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![
+        vec![
+            GroupSpec::new(OP_GOSUB).window(0, ex::s("CALLEE")).line(10),
+            GroupSpec::new(OP_END).line(11),
+        ],
+        vec![
+            // FILE0=0:值 0 也算请求(引擎看参数存在性)。
+            GroupSpec::new(OP_TASKINFO)
+                .window(9, ex::i8_(0))
+                .window(1, ex::r#ref(0x24, path.id))
+                .line(30),
+            // 同时给出 LINE0=1 与 LINE=0:0.495 固定顺序 LINE 在 LINE0 前。
+            GroupSpec::new(OP_TASKINFO)
+                .window(11, ex::i8_(1))
+                .window(8, ex::i8_(0))
+                .window(1, ex::r#ref(0x40, x.id))
+                .line(31),
+            GroupSpec::new(OP_RETURN).line(32),
+            GroupSpec::new(OP_END).line(33),
+        ],
+    ];
+    let mut vm = boot(b);
+    for f in 0..6u32 {
+        vm.tick_at(f * 16, &no_input());
+    }
+    assert_eq!(
+        vm.store().read(path, &[]).unwrap(),
+        Value::Str(b"data\\script\\fixture0000.yst".to_vec()),
+        "FILE0=0 仍是请求;返回调用方脚本路径"
+    );
+    assert_eq!(
+        vm.store().read(x, &[]).unwrap(),
+        Value::Int(31),
+        "0.495 分派顺序 LINE 在 LINE0 前 ⇒ 取 LINE(31),不是 LINE0(10)"
+    );
+}
+
+/// ID 未命中:按 LET 目标类型写默认值(引擎 `0x452918`);
+/// `GOLABEL` 等 0.495 无分支的槽不写 LET,`FILE` 的 STR 值不写进 INT 目标。
+#[test]
+fn taskinfo_missing_id_uses_type_defaults_and_unhandled_slots_are_noop() {
+    let mut b = ProjectBuilder::new();
+    let int_target = push_var(&mut b, 1, Init::Int(42));
+    let str_target = push_var(&mut b, 3, Init::Str(b"keep"));
+    let file_int_target = push_var(&mut b, 1, Init::Int(42));
+    let golabel_target = push_var(&mut b, 1, Init::Int(7));
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TASKINFO)
+            .window(0, ex::s("NOPE"))
+            .window(8, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, int_target.id))
+            .line(10),
+        GroupSpec::new(OP_TASKINFO)
+            .window(0, ex::s("NOPE"))
+            .window(8, ex::i8_(1))
+            .window(1, ex::r#ref(0x24, str_target.id))
+            .line(11),
+        // FILE 需要 STR 目标;INT 目标不写(引擎 0x43f0d8)。
+        GroupSpec::new(OP_TASKINFO)
+            .window(6, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, file_int_target.id))
+            .line(12),
+        // GOLABEL 在 0.495 处理体无分支:不写 LET。
+        GroupSpec::new(OP_TASKINFO)
+            .window(14, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, golabel_target.id))
+            .line(13),
+        GroupSpec::new(OP_END).line(14),
+    ]];
+    let mut vm = boot(b);
+    for f in 0..5u32 {
+        vm.tick_at(f * 16, &no_input());
+    }
+    assert_eq!(
+        vm.store().read(int_target, &[]).unwrap(),
+        Value::Int(0),
+        "ID 未命中:INT 目标写 0"
+    );
+    assert_eq!(
+        vm.store().read(str_target, &[]).unwrap(),
+        Value::Str(Vec::new()),
+        "ID 未命中:STR 目标写空串"
+    );
+    assert_eq!(
+        vm.store().read(file_int_target, &[]).unwrap(),
+        Value::Int(42),
+        "FILE 的字符串值不写进 INT 目标"
+    );
+    assert_eq!(
+        vm.store().read(golabel_target, &[]).unwrap(),
+        Value::Int(7),
+        "GOLABEL 在 0.495 无分支,不写 LET"
+    );
+}
+
+/// A 槽(引擎 `task+0x15`):`TASK` 写、`TASKINFO` 读,默认 1。
+///
+/// 证据:调度器 `0x4043dc..0x4043e6`(`movsx E; movsx A; test A, E`)、
+/// `TASK` 处理体 `0x450bbf..0x450bd1`、`TASKINFO` `0x4527b0`、构造器
+/// `0x465630/0x465633` 默认 E=A=1。手册无 A 页(DIV-RT-015)。
+#[test]
+fn taskinfo_a_reads_default_and_task_a_toggles_it() {
+    let mut b = ProjectBuilder::new();
+    let before = push_var(&mut b, 1, Init::Int(-1));
+    let disabled = push_var(&mut b, 1, Init::Int(-1));
+    let reenabled = push_var(&mut b, 1, Init::Int(-1));
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    const OP_TASK: u8 = 93;
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TASKINFO)
+            .window(4, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, before.id))
+            .line(10),
+        GroupSpec::new(OP_TASK).window(2, ex::i8_(0)).line(11),
+        GroupSpec::new(OP_TASKINFO)
+            .window(4, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, disabled.id))
+            .line(12),
+        GroupSpec::new(OP_TASK).window(2, ex::i8_(1)).line(13),
+        GroupSpec::new(OP_TASKINFO)
+            .window(4, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, reenabled.id))
+            .line(14),
+        GroupSpec::new(OP_END).line(15),
+    ]];
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.store().read(before, &[]).unwrap(),
+        Value::Int(1),
+        "新建任务 A 默认 1"
+    );
+    assert_eq!(
+        vm.store().read(disabled, &[]).unwrap(),
+        Value::Int(0),
+        "TASK[A=0] 后同一次泵里 TASKINFO[A] 立即为 0"
+    );
+    assert_eq!(
+        vm.store().read(reenabled, &[]).unwrap(),
+        Value::Int(1),
+        "TASK[A=1] 恢复"
+    );
+}
+
+/// E/A 只按**存在性**写任务记录;Z-only 的 `TASK` 不得把禁用任务重新打开。
+/// 同一次泵内 E/A 变更必须同步到 `task_view`(TASKINFO 立即看到新值)。
+#[test]
+fn task_e_a_changes_are_visible_to_taskinfo_in_same_pump() {
+    let mut b = ProjectBuilder::new();
+    let e_after_disable = push_var(&mut b, 1, Init::Int(-1));
+    let a_after_disable = push_var(&mut b, 1, Init::Int(-1));
+    let e_after_z = push_var(&mut b, 1, Init::Int(-1));
+    let a_after_z = push_var(&mut b, 1, Init::Int(-1));
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("SUB.BODY", 9, 0, 0)];
+    b.entry(0, 0);
+    const OP_TASK: u8 = 93;
+    b.scripts = vec![vec![
+        // 0 生成 SUB
+        GroupSpec::new(OP_TASK)
+            .window(0, ex::s("SUB"))
+            .window(34, ex::s("SUB.BODY"))
+            .line(10),
+        // 1 E=0
+        GroupSpec::new(OP_TASK)
+            .window(0, ex::s("SUB"))
+            .window(1, ex::i8_(0))
+            .line(11),
+        // 2 A=0
+        GroupSpec::new(OP_TASK)
+            .window(0, ex::s("SUB"))
+            .window(2, ex::i8_(0))
+            .line(12),
+        // 3-4 同泵查询
+        GroupSpec::new(OP_TASKINFO)
+            .window(0, ex::s("SUB"))
+            .window(3, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, e_after_disable.id))
+            .line(13),
+        GroupSpec::new(OP_TASKINFO)
+            .window(0, ex::s("SUB"))
+            .window(4, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, a_after_disable.id))
+            .line(14),
+        // 5 Z-only:不得触碰 E/A
+        GroupSpec::new(OP_TASK)
+            .window(0, ex::s("SUB"))
+            .window(3, ex::i8_(5))
+            .line(15),
+        // 6-7 再次查询,仍应为 0
+        GroupSpec::new(OP_TASKINFO)
+            .window(0, ex::s("SUB"))
+            .window(3, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, e_after_z.id))
+            .line(16),
+        GroupSpec::new(OP_TASKINFO)
+            .window(0, ex::s("SUB"))
+            .window(4, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, a_after_z.id))
+            .line(17),
+        GroupSpec::new(OP_END).line(18),
+        // 9 SUB.BODY(任务被禁用,保持挂起)
+        GroupSpec::new(OP_WAIT).window(0, ex::i8_(10)).line(19),
+    ]];
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.store().read(e_after_disable, &[]).unwrap(),
+        Value::Int(0)
+    );
+    assert_eq!(
+        vm.store().read(a_after_disable, &[]).unwrap(),
+        Value::Int(0)
+    );
+    assert_eq!(
+        vm.store().read(e_after_z, &[]).unwrap(),
+        Value::Int(0),
+        "Z-only TASK 不得重新打开 E"
+    );
+    assert_eq!(
+        vm.store().read(a_after_z, &[]).unwrap(),
+        Value::Int(0),
+        "Z-only TASK 不得重新打开 A"
+    );
+}
+
+/// 引擎 `0x4525fa/0x4528fa` 写完 FILENO0 后继续检查 SCRIPTPOS
+/// (`jmp 0x452628`);同时请求时 SCRIPTPOS 二次写入覆盖。
+#[test]
+fn taskinfo_fileno0_falls_through_to_scrip_pos() {
+    let mut b = ProjectBuilder::new();
+    let blob = push_var(&mut b, 3, Init::Str(b""));
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("CALLEE", 0, 1, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![
+        vec![
+            GroupSpec::new(OP_GOSUB).window(0, ex::s("CALLEE")).line(10),
+            GroupSpec::new(OP_END).line(11),
+        ],
+        vec![
+            // FILENO0 + SCRIPTPOS 同时给;LET 是字符串目标:
+            // FILENO0 的数值写入应被类型闸门丢弃,随后 SCRIPTPOS 写入。
+            GroupSpec::new(OP_TASKINFO)
+                .window(10, ex::i8_(1))
+                .window(19, ex::i8_(1))
+                .window(1, ex::r#ref(0x24, blob.id))
+                .line(30),
+            GroupSpec::new(OP_RETURN).line(31),
+            GroupSpec::new(OP_END).line(32),
+        ],
+    ];
+    let mut vm = boot(b);
+    for f in 0..4u32 {
+        vm.tick_at(f * 16, &no_input());
+    }
+    let stored = vm.store().read(blob, &[]).unwrap();
+    let Value::Str(raw) = stored else {
+        panic!("SCRIPTPOS 必须写字符串变量");
+    };
+    let sp = yu_rt::scriptpos::ScriptPos::decode(&raw).expect("引擎 SCRIPTPOS 格式");
+    assert!(sp.if_entries.is_empty());
+    assert_eq!(sp.gosub_entries.len(), 1, "被调方在 GOSUB 内");
+    assert_eq!(sp.gosub_entries[0].if_depth, 0);
+    assert_eq!(sp.gosub_entries[0].loop_depth, 0);
+    assert_eq!(sp.gosub_entries[0].return_pc, 1);
+    assert_eq!(sp.gosub_entries[0].return_script, 0);
+    assert!(sp.loop_entries.is_empty());
+    assert_eq!(sp.text_line, 0);
+    assert_eq!(sp.pc, 1);
+    assert_eq!(sp.script_name, b"data\\script\\fixture0001.yst");
+    assert_eq!(
+        &raw[..8],
+        &yu_rt::scriptpos::MAGIC,
+        "FILENO0 后必须继续写 SCRIPTPOS(引擎 0x4525fa→0x452628)"
+    );
+}
+
+/// `TASK[SCRIPTPOS]` 必须按引擎 `0x450fe0` 完整恢复 IF/GOSUB/LOOP 三栈、
+/// text_line、pc 与脚本号(脚本名反查),而不是旧的 8 字节 script+pc。
+#[test]
+fn task_scrip_pos_restores_full_exec_state() {
+    use yu_rt::scriptpos::{GosubEntry, IfEntry, LoopEntry, ScriptPos};
+
+    let mut b = ProjectBuilder::new();
+    let ifn = push_var(&mut b, 1, Init::Int(-1));
+    let gn = push_var(&mut b, 1, Init::Int(-1));
+    let ln = push_var(&mut b, 1, Init::Int(-1));
+    let tl = push_var(&mut b, 1, Init::Int(-1));
+    let blob = push_var(&mut b, 3, Init::Str(b""));
+    let out = push_var(&mut b, 3, Init::Str(b""));
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("SUB.BODY", 9, 0, 0)];
+    b.entry(0, 0);
+    const OP_TASK: u8 = 93;
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TASK)
+            .window(0, ex::s("SUB"))
+            .window(34, ex::s("SUB.BODY"))
+            .line(10),
+        GroupSpec::new(OP_TASK)
+            .window(0, ex::s("SUB"))
+            .window(1, ex::i8_(0))
+            .line(11),
+        // 用合成 blob 把 SUB 的执行位恢复成 IF×2 + GOSUB×1 + LOOP×1。
+        GroupSpec::new(OP_TASK)
+            .window(0, ex::s("SUB"))
+            .window(35, ex::get(0x24, blob.id))
+            .line(12),
+        GroupSpec::new(OP_TASKINFO)
+            .window(0, ex::s("SUB"))
+            .window(16, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, ifn.id))
+            .line(13),
+        GroupSpec::new(OP_TASKINFO)
+            .window(0, ex::s("SUB"))
+            .window(17, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, gn.id))
+            .line(14),
+        GroupSpec::new(OP_TASKINFO)
+            .window(0, ex::s("SUB"))
+            .window(18, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, ln.id))
+            .line(15),
+        GroupSpec::new(OP_TASKINFO)
+            .window(0, ex::s("SUB"))
+            .window(12, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, tl.id))
+            .line(16),
+        GroupSpec::new(OP_TASKINFO)
+            .window(0, ex::s("SUB"))
+            .window(19, ex::i8_(1))
+            .window(1, ex::r#ref(0x24, out.id))
+            .line(17),
+        GroupSpec::new(OP_END).line(18),
+        // 9 SUB.BODY(被禁用,保持挂起)
+        GroupSpec::new(OP_WAIT).window(0, ex::i8_(10)).line(19),
+    ]];
+    let synthetic = ScriptPos {
+        if_entries: vec![
+            IfEntry {
+                loop_depth: 0,
+                entry_pc: 10,
+                end_pc: 11,
+            },
+            IfEntry {
+                loop_depth: 0,
+                entry_pc: 12,
+                end_pc: 13,
+            },
+        ],
+        gosub_entries: vec![GosubEntry {
+            if_depth: 2,
+            loop_depth: 1,
+            return_pc: 0,
+            return_script: 0,
+        }],
+        loop_entries: vec![LoopEntry {
+            if_depth: 2,
+            body_pc: 14,
+            end_pc: 15,
+            counter: 1,
+            limit: 3,
+        }],
+        text_line: 7,
+        pc: 0,
+        script_name: b"data\\script\\fixture0000.yst".to_vec(),
+    };
+    let raw = synthetic.encode().expect("encode synthetic SCRIPTPOS");
+    let mut vm = boot(b);
+    vm.store_mut()
+        .write(blob, &[], &Value::Str(raw))
+        .expect("write blob var");
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(vm.store().read(ifn, &[]).unwrap(), Value::Int(2));
+    assert_eq!(vm.store().read(gn, &[]).unwrap(), Value::Int(1));
+    assert_eq!(vm.store().read(ln, &[]).unwrap(), Value::Int(1));
+    assert_eq!(vm.store().read(tl, &[]).unwrap(), Value::Int(7));
+
+    let Value::Str(round_raw) = vm.store().read(out, &[]).unwrap() else {
+        panic!("SCRIPTPOS 输出必须是字符串");
+    };
+    let round = ScriptPos::decode(&round_raw).expect("engine format roundtrip");
+    assert_eq!(round, synthetic, "TASKINFO[SCRIPTPOS] 必须还原同一执行位");
+}
+#[test]
+fn returncode_line_keeps_full_u16_id() {
+    let mut b = ProjectBuilder::new();
+    let line = push_var(&mut b, 1, Init::Int(-1));
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        // id = 0x012C = 300(kind=0x2C, flag=1),length=0
+        GroupSpec::new(OP_RETURNCODE)
+            .window_tagged(0x2C, 1, 0, Vec::new())
+            .line(11),
+        GroupSpec::new(OP_TASKINFO)
+            .window(12, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, line.id))
+            .line(12),
+        GroupSpec::new(OP_END).line(13),
+    ]];
+    let mut vm = boot(b);
+    vm.tick_at(0, &no_input());
+    let rc: Vec<u32> = vm
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            yu_rt::VmEvent::ReturnCode { line, .. } => Some(*line),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rc, vec![300], "ReturnCode.line 必须保留 u16 id");
+    let mut tl = InputTimeline::new();
+    tl.set(1, InputFrame::new(["MOUSE_L"]));
+    vm.tick_at(16, &tl);
+    assert_eq!(
+        vm.store().read(line, &[]).unwrap(),
+        Value::Int(300),
+        "TEXTLINE 与事件行同源"
+    );
+}
+
+/// `TASK` 重配置复用任务记录,不清 `task+0xc/+0x10`;
+/// 内核重建 ExecState 时必须继承 TEXTLINE/NEXTVOICE。
+#[test]
+fn task_reconfiguration_preserves_text_line_and_voice() {
+    let mut b = ProjectBuilder::new();
+    let line = push_var(&mut b, 1, Init::Int(-1));
+    let voice = push_var(&mut b, 1, Init::Int(-1));
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("BODY", 3, 0, 0)];
+    b.entry(0, 0);
+    const OP_TASK: u8 = 93;
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_RETURNCODE).window_value(3, 7).line(11),
+        GroupSpec::new(OP_TASK).window(34, ex::s("BODY")).line(12),
+        GroupSpec::new(OP_END).line(13),
+        // 3 BODY
+        GroupSpec::new(OP_TASKINFO)
+            .window(12, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, line.id))
+            .line(30),
+        GroupSpec::new(OP_TASKINFO)
+            .window(13, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, voice.id))
+            .line(31),
+        GroupSpec::new(OP_END).line(32),
+    ]];
+    let mut vm = boot(b);
+    vm.tick_at(0, &no_input());
+    let mut tl = InputTimeline::new();
+    tl.set(1, InputFrame::new(["MOUSE_L"]));
+    vm.tick_at(16, &tl);
+    vm.tick_at(32, &tl);
+    assert_eq!(vm.store().read(line, &[]).unwrap(), Value::Int(3));
+    assert_eq!(vm.store().read(voice, &[]).unwrap(), Value::Int(7));
+}
+
+/// LET 目标类型不符时按引擎不写入,但诊断只报一次(按 query+类型去重)。
+#[test]
+fn taskinfo_type_mismatch_reports_once() {
+    let mut b = ProjectBuilder::new();
+    let target = push_var(&mut b, 1, Init::Int(42));
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TASKINFO)
+            .window(6, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, target.id))
+            .line(10),
+        GroupSpec::new(OP_TASKINFO)
+            .window(6, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, target.id))
+            .line(11),
+        GroupSpec::new(OP_END).line(12),
+    ]];
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(vm.store().read(target, &[]).unwrap(), Value::Int(42));
+    let reports = vm
+        .events()
+        .iter()
+        .filter(
+            |e| matches!(e, yu_rt::VmEvent::Diag { code, .. } if code == yu_rt::code::rt::VAR_TYPE),
+        )
+        .count();
+    assert_eq!(reports, 1, "同 query/类型只报一次");
+}
+
+/// ID 未命中且 LET 目标未声明:不得静默,必须保留 write_target 的 Fatal 诊断。
+#[test]
+fn taskinfo_missing_id_with_undeclared_target_is_reported() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TASKINFO)
+            .window(0, ex::s("NOPE"))
+            .window(8, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, sys + 77))
+            .line(10),
+        GroupSpec::new(OP_END).line(11),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+    assert!(r.errors[0].contains("rt.var.undeclared"), "{:?}", r.errors);
+}
+
+/// `TASK[TEXTPOS=…]`:0.495 处理体无槽 36 分支,官方忽略;内核同型 no-op,
+/// 不得报 Unimplemented(与 DIV-RT-015 的台账一致)。
+#[test]
+fn task_textpos_is_aligned_noop() {
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    const OP_TASK: u8 = 93;
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TASK)
+            .window(36, ex::s("ignored"))
+            .line(10),
+        GroupSpec::new(OP_END).line(11),
+    ]];
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
 }
 
 /// R2 回归:`TASKEND[]` 后紧邻的 `LET` 不执行;同 ID 重建从新标签开始。

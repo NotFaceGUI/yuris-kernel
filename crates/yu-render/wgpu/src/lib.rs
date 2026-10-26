@@ -618,17 +618,53 @@ impl WgpuRenderer {
                             Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
                                 .with_detail("快照填充目标缺失")
                         })?;
-                        let pipeline =
-                            pipelines.paint_pipeline(paint.alpha_only).ok_or_else(|| {
-                                Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                                    .with_detail("快照填充管线缺失")
-                            })?;
-                        let bind = pipelines
-                            .paint_bind_group(paint.alpha_only, paint.color)
-                            .ok_or_else(|| {
-                                Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                                    .with_detail("快照填充 bind group 缺失")
-                            })?;
+                        let (pipeline, bind) = match &paint.kind {
+                            passes::PaintKind::Solid { alpha_only, color } => {
+                                let pipeline = pipelines.paint_pipeline(*alpha_only).ok_or_else(
+                                    || {
+                                        Diag::fatal(
+                                            device::code::TARGET,
+                                            yu_log::Boundary::Platform,
+                                        )
+                                        .with_detail("快照填充管线缺失")
+                                    },
+                                )?;
+                                let bind = pipelines
+                                    .paint_bind_group(*alpha_only, *color)
+                                    .ok_or_else(|| {
+                                        Diag::fatal(
+                                            device::code::TARGET,
+                                            yu_log::Boundary::Platform,
+                                        )
+                                        .with_detail("快照填充 bind group 缺失")
+                                    })?;
+                                (pipeline, bind)
+                            }
+                            passes::PaintKind::Texture {
+                                source_id,
+                                write_alpha,
+                            } => {
+                                let pipeline = pipelines.merge_pipeline(*write_alpha).ok_or_else(
+                                    || {
+                                        Diag::fatal(
+                                            device::code::TARGET,
+                                            yu_log::Boundary::Platform,
+                                        )
+                                        .with_detail("MERGE 合成管线缺失")
+                                    },
+                                )?;
+                                let bind = pipelines
+                                    .bind_group(*source_id, crate::pipelines::FilterKind::Linear)
+                                    .ok_or_else(|| {
+                                        Diag::fatal(
+                                            device::code::TARGET,
+                                            yu_log::Boundary::Platform,
+                                        )
+                                        .with_detail("MERGE 源 bind group 缺失")
+                                    })?;
+                                (pipeline, bind)
+                            }
+                        };
                         let attachments = [Some(wgpu::RenderPassColorAttachment {
                             view: &target.view,
                             depth_slice: None,

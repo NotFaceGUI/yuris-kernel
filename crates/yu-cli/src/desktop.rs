@@ -197,6 +197,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         // 付 ~130ms 的 fontdb 枚举(实测)。
         warm_text: true,
         force_font: None,
+        // 真实运行:`@_TIME` 注入系统本地时间(存档菜单的现实日期)。
+        local_time: crate::clock::local_now(),
     };
     let mut engine = match Engine::new(project.clone(), options.clone()) {
         Ok(engine) => engine,

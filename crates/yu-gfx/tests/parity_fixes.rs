@@ -1247,3 +1247,63 @@ fn nonvisual_cg_params_are_archived_without_unimplemented() {
     assert_eq!(layer.extra.get("LINT"), Some(&yu_gfx::EngineValue::Int(3)));
     assert_eq!(layer.extra.get("REMALLOC"), Some(&yu_gfx::EngineValue::Int(1)));
 }
+
+/// `CG[… X+=v]`(参数种类 2)是**增量**,不是赋值。
+///
+/// 证据:0.495 窗口 `+2` 的 u16 高字节 = 官方参数类型字节 ——
+/// `CG[… X=…]` 的窗口 slot=1(种类 0),`CG[… X+=…]` 的窗口 slot=257
+/// (0x0101,种类 2)。语料 `es_Sprite.yst:8173`
+/// `CG[ID=$L1 X+=(@es.GSX/2)-(@WSX/2) Y+=…]` 每帧在
+/// `es.CGACT_SIZE` 写入的绝对位置上做旋转画布补偿;若按赋值处理,
+/// 补偿量 0 会把位置清成 0 —— 立绘被钉在屏幕左上(2026-10-26 实测)。
+#[test]
+fn cg_numeric_offset_params_accumulate() {
+    let table = table();
+    let mut gfx = state();
+    let mut offset_arg = |cmd: &str, name: &str, value: yu_rt::value::Value| {
+        let mut a = arg(&table, cmd, name, value);
+        a.offset = true;
+        a
+    };
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("L")),
+                arg(&table, "CG", "FILE", s("cg/x")),
+                arg(&table, "CG", "X", f(240.5)),
+                arg(&table, "CG", "Y", f(70.25)),
+                arg(&table, "CG", "A", i(200)),
+            ],
+        ),
+        // 零增量不得清零位置
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("L")),
+                offset_arg("CG", "X", f(0.0)),
+                offset_arg("CG", "Y", f(0.0)),
+            ],
+        ),
+        // 非零增量累加(含负数)
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("L")),
+                offset_arg("CG", "X", f(1.25)),
+                offset_arg("CG", "Y", f(-2.5)),
+                offset_arg("CG", "A", i(-50)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let layer = layer(&f, ":/W0/L");
+    assert_eq!(layer.transform.x, 241.75);
+    assert_eq!(layer.transform.y, 67.75);
+    assert_eq!(layer.alpha, 150);
+}

@@ -127,8 +127,8 @@ fixed(现 Likely 项全部定论)。
 
 | 条目 | REA 锚点/路径 | 归档 |
 |---|---|---|
-| TASK[TEXTPOS/RESTART]、序号>35 | `0x4506f4` | DIV-RT-015 归零 |
-| TASKINFO 序号>19 | `0x4523fc` | — |
+| TASK[TEXTPOS/RESTART]、序号>35 | `0x4506f4` | ✅ fixed(no-manual):RESTART 已实现(`0x450c46/0x450c55`);TEXTPOS(槽 36)官方无分支 → 对齐 no-op(DIV-RT-015) |
+| TASKINFO 序号>19 | `0x4523fc` | ✅ fixed(no-manual):A(4)/FILE0/FILENO0/LINE0/TEXTLINE/NEXTVOICE 已实现;FILENO0→SCRIPTPOS fallthrough;SCRIPTPOS 引擎字节格式(`0x452a54`/`0x450fe0`);GOLABEL/GOSUBLABEL/TEXTPOS 官方无分支 → no-op(DIV-RT-025) |
 | TEXT[ID] 事件字节契约 | `VmEvent::Text.id → Vec<u8>`(跨 yu-trace/gfx) | DIV-GFX-021、H-P2-01 |
 | DIALOG 扩展参数族(STR2..8/A/E/CHECK*/FILEOPEN/FOLDER/CHECKBOX/SLIDER/NOWAIT) | `0x43fc74` + 手册 dialog.html(宿主框接 B7) | DIV-RT-044 残项归零 |
 | FILEINFO FOLDER/SIZE/RELATION | `0x44286c` | — |

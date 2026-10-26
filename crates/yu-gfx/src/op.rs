@@ -341,6 +341,18 @@ pub struct ImageOp {
     pub source2: Option<LayerId>,
     /// `ID2`(复制/加工结果目标;`None` = 原地加工)。
     pub target: Option<LayerId>,
+    /// 命令时刻源层的基图(`DIV-GFX-053` 的 image 版)。
+    ///
+    /// 与 [`CopyOp::source_texture`] 同理由:官方 `CGACT` 在命令到达时就
+    /// **立即执行**(REA `0x42f809`:分配新缓冲 → 读源 → 写回),源层随后被
+    /// `CGEND` 删除不影响结果。本内核的像素工作推迟到帧末回放,那时源节点
+    /// 可能已不存在 —— 记录命令时刻的 `TextureRef` 才能按官方语义重放。
+    ///
+    /// 语料:`es_SPExec.yst:341` 的
+    /// `CGACT[ID="sp.tmpB" ID2=$lid … MERGE=1]` 紧跟
+    /// `CGEND[ID="sp.tmpB"]`;不记录会让 MERGE 整条被丢弃,动画帧层只剩
+    /// 前一步的 `RECTPAINT3` 清空结果 ⇒ 立绘在眨眼/表情切换时闪空白。
+    pub source_texture: Option<TextureRef>,
     pub action: ImageAction,
     /// `SET` 原值。
     pub set: Option<EngineValue>,
@@ -359,13 +371,25 @@ pub struct ImageOp {
     /// 源区域左上 X(**浮点**)。
     ///
     /// 精灵系统把位置拆成「整数部分」+「小数部分」两条参数传进来
-    /// (`es_Sprite.yst`: `CGACT[… SIZE2=1 FX=@X1*100+@FLX …]`,`FX` 是
-    /// `X` 的百分位定点形式),`FX/100` 就是真正的亚像素位置。取整会让
-    /// 慢速移动(每帧 0.1–0.5px)变成「几帧不动再跳 1px」的抖动,而且
-    /// 越慢越明显 —— 实测已确认。
+    /// (`es_Sprite.yst`: `CGACT[… SIZE2=1 FX=@X1*100+@FLX …]`)。取整会让
+    /// 慢速移动(每帧 0.1–0.5px)变成「几帧不动再跳 1px」的抖动。
+    ///
+    /// 注意 `FX/100 = X1 - LEFT_X` 是**相对屏幕位置的偏移**,不是源坐标;
+    /// 见 [`Self::region_from_fixed`]。
     pub x: Option<f64>,
     pub y: Option<f64>,
     pub x2: Option<f64>,
     pub y2: Option<f64>,
+    /// 源区域是否按「图层位置 + 百分位偏移」给出(`SIZE2` 的 `FX/FY/FX2/FY2`)。
+    ///
+    /// `es.CGACT_SIZE` 的中画质分支只发定点键:`FX=@X1*100+@FLX`,其中
+    /// `@FLX = -(@LEFT_X*100 % 100)`。因此 `FX/100 = X1 - LEFT_X`
+    /// (源起点 − 屏幕位置),真实源起点是 `LEFT_X + FX/100`。若直接拿
+    /// `FX/100` 当源坐标,UV 窗口整体偏移 `frac(LEFT_X)`,而且逐帧变化 ——
+    /// 立绘慢速移动时采样窗口在纹理上来回滑动 = 抽搐 + 边缘 texel 拉伸闪烁。
+    ///
+    /// 标志为 `true` 时,`frame()` 输出前会把目标层的最终位置加到
+    /// `x/y/x2/y2`,后端因此始终只看到绝对源坐标。
+    pub region_from_fixed: bool,
     pub status: OpStatus,
 }

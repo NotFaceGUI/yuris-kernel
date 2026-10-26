@@ -192,6 +192,9 @@ pub struct PipelineCache {
     paint_pipeline_layout: wgpu::PipelineLayout,
     paint_shader: wgpu::ShaderModule,
     paint_pipelines: [Option<wgpu::RenderPipeline>; 2],
+    /// `CGACT[MERGE/MERGE2]` 的 GPU 合成管线:`false` = 只写 RGB(保留目标
+    /// alpha,`MERGE`),`true` = 连同 alpha 一起写(`MERGE2`)。
+    merge_pipelines: [Option<wgpu::RenderPipeline>; 2],
     /// RECTPAINT 的颜色 uniform/bind group(同一颜色跨帧复用;语义不变)。
     paint_groups: BTreeMap<(bool, [u32; 4]), wgpu::BindGroup>,
     pub total_pipelines_created: u64,
@@ -384,6 +387,7 @@ impl PipelineCache {
             paint_pipeline_layout,
             paint_shader,
             paint_pipelines: [None, None],
+            merge_pipelines: [None, None],
             paint_groups: BTreeMap::new(),
             total_pipelines_created: 0,
             total_bind_groups_created: 0,
@@ -790,6 +794,115 @@ impl PipelineCache {
         self.paint_pipelines[index] = Some(pipeline);
         self.total_pipelines_created += 1;
         Ok(())
+    }
+
+    /// `CGACT[MERGE/MERGE2]` 合成管线。
+    ///
+    /// 官方 `FUN_004405a4` 把上层**表面**用通配绘制原语画到目标表面
+    /// (`DAT_00801458(surface, …, X, Y, ratio, 0)`),是 D3D9 的一次带纹理
+    /// quad,不是逐像素循环。这里用与图层相同的 QUAD shader + `Normal`
+    /// 混合(`SRCALPHA/INVSRCALPHA`,与引擎未开 SEPARATEALPHABLENDENABLE
+    /// 时一致):
+    /// - `MERGE`:只写 RGB ⇒ 目标 alpha 保持不变(与官方「保留下层 alpha」
+    ///   的可观测结果一致);
+    /// - `MERGE2`:连 alpha 一起写。
+    pub fn ensure_merge_pipeline(
+        &mut self,
+        ctx: &GpuContext,
+        write_alpha: bool,
+    ) -> Result<(), Diag> {
+        let index = usize::from(write_alpha);
+        if self.merge_pipelines[index].is_some() {
+            return Ok(());
+        }
+        let Some(mut blend) = blend_state(BlendMode::Normal) else {
+            return Ok(());
+        };
+        let Some(src_mode) = src_mode(BlendMode::Normal) else {
+            return Ok(());
+        };
+        // `MERGE` 只写 RGB:alpha 用 `One/Zero`(恒等)混合,配合
+        // `ColorWrites::COLOR` 不写出 —— 即目标 alpha 保持不变。
+        // 直接沿用 Normal 的 alpha 混合会让 alpha 被上层覆盖,
+        // 与软后端 `apply_merge`(merge2=false 不写 alpha)不一致。
+        if !write_alpha {
+            blend.alpha = wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::Zero,
+                operation: wgpu::BlendOperation::Add,
+            };
+        }
+        let constants = [("SRC_MODE", f64::from(src_mode))];
+        let label = if write_alpha {
+            "yu-backend-wgpu merge2"
+        } else {
+            "yu-backend-wgpu merge"
+        };
+        let pipeline = ctx.checked(code::TARGET, "MERGE 合成管线", || {
+            ctx.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&self.layout),
+                    vertex: wgpu::VertexState {
+                        module: &self.shader,
+                        entry_point: Some("vs_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants: &constants,
+                            ..Default::default()
+                        },
+                        buffers: &[Some(wgpu::VertexBufferLayout {
+                            array_stride: Vertex::SIZE,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &[
+                                wgpu::VertexAttribute {
+                                    format: wgpu::VertexFormat::Float32x2,
+                                    offset: 0,
+                                    shader_location: 0,
+                                },
+                                wgpu::VertexAttribute {
+                                    format: wgpu::VertexFormat::Float32x2,
+                                    offset: 8,
+                                    shader_location: 1,
+                                },
+                                wgpu::VertexAttribute {
+                                    format: wgpu::VertexFormat::Float32,
+                                    offset: 16,
+                                    shader_location: 2,
+                                },
+                            ],
+                        })],
+                    },
+                    primitive: primitive_state(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &self.shader,
+                        entry_point: Some("fs_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants: &constants,
+                            ..Default::default()
+                        },
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: TARGET_FORMAT,
+                            blend: Some(blend),
+                            write_mask: if write_alpha {
+                                wgpu::ColorWrites::ALL
+                            } else {
+                                wgpu::ColorWrites::COLOR
+                            },
+                        })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+        })?;
+        self.merge_pipelines[index] = Some(pipeline);
+        self.total_pipelines_created += 1;
+        Ok(())
+    }
+
+    pub fn merge_pipeline(&self, write_alpha: bool) -> Option<&wgpu::RenderPipeline> {
+        self.merge_pipelines[usize::from(write_alpha)].as_ref()
     }
 
     pub fn paint_pipeline(&self, alpha_only: bool) -> Option<&wgpu::RenderPipeline> {

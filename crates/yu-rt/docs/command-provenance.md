@@ -27,9 +27,9 @@
 | `LOOPBREAK` | 159 | `control/loopbreak.html`(LV) | ✅ 159 次 | §3.13 opcode 57(`0x445b9c` 族) | ✅ 实现 |
 | `LOOPCONTINUE` | 40 | `control/loopcontinue.html` | ✅ 40 次 | §3.13 opcode 58(`0x445c54`) | ✅ 实现 |
 | `WAIT` | 95 | `control/wait.html`(TIME=ms / FRAME=帧) | ✅ 95 次(FRAME 81 / TIME 14) | §3.2b 门控 `+0x18`/`+0x1c`;`0x456ae4` | ✅ 实现 |
-| `TASK` | 10 | `control/task.html`(ID/E/Z/#;RETURN 自动消亡) | ✅ 10 次 | §3.15(`0x450ae9` 续帧标志;任务对象入链) | ✅ 部分(仅 ID/E/Z/#) |
+| `TASK` | 10 | `control/task.html`(ID/E/Z/#;TINT..TSTR/SCRIPTPOS/RESTART) | ✅ 10 次 | §3.15(`0x450ae9` 续帧标志;任务对象入链);REA `0x4506f4` 逐槽;A=`task+0x15`(`0x450bbf`),调度器 `A&E` 闸门 | ✅ 实现(A 按引擎证据;TEXTPOS 官方无分支,对齐 no-op) |
 | `TASKEND` | 2 | `control/taskend.html` | ✅ 2 次 | §3.15(`LAB_00452070`) | ✅ 实现 |
-| `TASKINFO` | 19 | `control/taskinfo.html` | ✅ 19 次 | §3.21 族 | ✅ 部分(EXIST/E/Z) |
+| `TASKINFO` | 19 | `control/taskinfo.html`(FILE0..NEXTVOICE 无页) | ✅ 19 次 | REA `0x4523fc` 逐槽;`0x44c390` RETURNCODE 写 `task+0xc/+0x10`;A=`task+0x15`;SCRIPTPOS `0x452a54`/`0x450fe0` | ✅ 实现(21 槽含 A/FILE0/FILENO0/LINE0/TEXTLINE/NEXTVOICE;FILENO0→SCRIPTPOS fallthrough;GOLABEL/GOSUBLABEL/TEXTPOS 官方无分支;SCRIPTPOS 引擎字节格式) |
 | `END` | 205 | `control/end.html`(RESTART) | ✅ 205 次 | `FUN_0043da44`(旧线注记) | ✅ 实现 |
 | `FPS` | 2 | `system/fps.html`(1..256 / SKIP) | ✅ 2 次(`SET=60`) | `FUN_004040e8` 链的帧率源 | ✅ 实现 |
 
@@ -66,7 +66,7 @@
 | `CLIPINFO` | 0 | `clip/clipinfo.html` | ⛔ 0 次 | REA `0x43e410`:TEXT 存在才读,过滤 `<0x20`,写 LET | ✅ 实现(DIV-RT-045) |
 | `ERROR` | 1 | ⛔ 手册无页 | ✅ 1 次 | REA `0x46358c`:写 `[0x689b00+opcode]` 启用表;消费者未定位 | ✅ 实现(表;DIV-RT-046) |
 | `CSV`/`PLUG`/`ERRORINFO` | 0 | ⛔ 无页 | ⛔ 0 次 | REA:仅参数求值后返回 0 | ✅ no-op(DIV-RT-046) |
-| `TASKINFO` | 19 | `control/taskinfo.html`(含 SCRIPTPOS 页) | ✅ 19 次 | §3.2 任务记录 | ✅ 实现(SCRIPTPOS 2026-10-19 补;TEXTPOS 挂账) |
+| `TASKINFO` | 19 | `control/taskinfo.html`(含 SCRIPTPOS 页) | ✅ 19 次 | §3.2 任务记录 + REA `0x4523fc` 逐槽;`0x44c390` 写 `task+0xc/+0x10`;SCRIPTPOS `0x452a54`/`0x450fe0` | ✅ 实现(21 槽含 A/FILE0/FILENO0/LINE0/TEXTLINE/NEXTVOICE;SCRIPTPOS 引擎字节格式;DIV-RT-025) |
 | `SYSTEMINFO` | 5 | ⛔ **手册无页** | ✅ 5 次 | v494 `0x450478` 逐槽反汇编 | ⚠ 实现但手册缺页(DIV-RT-023) |
 | `FONT`/`FONTINFO` | 42/— | `font/font.html` | ✅ | — | ➖ 域(图形) |
 | `FILEACT`/`FILEINFO` | 20/22 | `file/*.html` | ✅ | — | ➖ 域(文件;`FILEINFO` 可查询) |
@@ -82,7 +82,7 @@
 | `_RFLG` | 63 | 0 | 同上 | ⛔ 未使用 | §3.16 | ✅ |
 | `_TINT/_TFLT/_TSTR` | 67/68/69 | (TASK 参数) | ⛔ **两版手册均无页**(旧注误引已勘误) | ✅ 官方源码生产者/消费者对(`es_ERIS.yst:524→533`) | §3.16 `task+0x3d0` | ✅(2026-10-19 勘误引用) |
 | `_OS_TIME` | 1 | 1,463 | `basic/svariable.html` | ✅ 全部 `(1)` | — | ✅(下标 1;`(0)` 挂账) |
-| `_TIME` | 0 | 336 | `basic/svariable.html`(8 字段) | ✅ | — | ✅(注入时钟,UTC) |
+| `_TIME` | 0 | 336 | `basic/svariable.html`(8 字段) | ✅ | — | ✅(真实运行宿主注入本地时间;未注入回退 1970 注入时钟) |
 | `_PAI` | 10 | 0 | `basic/svariable.html` | ⛔ | — | ✅ |
 | `_DEBUGMODE` | 11 | 570 | 同上 | ✅ | 工程 `projectconfig.txt` | ✅ |
 | `_SYSTEM_VERSION` | 108 | 0 | 同上 | ⛔ | 工程表 version | ✅ |

@@ -522,16 +522,29 @@ impl GfxState {
         //
         // 可达性:
         // - 复制目标必须仍引用该快照(否则快照无人可见);
+        // - 或者该快照被**后续复制的 `source_texture`** 引用:中间层
+        //   (`sp.tmpA` 这类)在 `CGEND` 删除后,其快照仍是下一跳的源;
+        //   丢掉它会让下游 copy/image 报 snapshot.unsupported,立绘在
+        //   换表情/眨眼的帧闪一下(2026-10-26 β4 演出实测);
         // - 源层仍存在 → 按层自合成;源层已被 `CGEND` 删除 → 用命令时刻
         //   记录的 `source_texture` 重放(`DIV-GFX-053`:ERIS 按钮快照的
         //   源 `BT.OFF.TMP` 在同一批命令末尾被删,官方复制已经完成)。
         //   两者都不可得才丢弃,完整历史留在 `GfxState::copies()` 供审计。
+        let needed_snapshots: std::collections::BTreeSet<CopyId> = self
+            .copy_log
+            .iter()
+            .filter_map(|c| match &c.source_texture {
+                Some(TextureRef::Snapshot(id)) => Some(*id),
+                _ => None,
+            })
+            .collect();
         let mut texture_ops: Vec<(u64, Op)> = Vec::new();
         for c in &self.copy_log {
             let dest_live = self
                 .nodes
                 .get(&c.dest)
-                .is_some_and(|n| matches!(n.layer.texture, TextureRef::Snapshot(id) if id == c.id));
+                .is_some_and(|n| matches!(n.layer.texture, TextureRef::Snapshot(id) if id == c.id))
+                || needed_snapshots.contains(&c.id);
             if !dest_live {
                 continue;
             }
@@ -546,8 +559,35 @@ impl GfxState {
         for i in &self.image_log {
             let source_live = self.nodes.contains_key(&i.source);
             let target_live = i.target.as_ref().is_none_or(|t| self.nodes.contains_key(t));
-            if source_live && target_live {
-                texture_ops.push((i.seq, Op::Image(i.clone())));
+            // 源层已被 `CGEND` 删除但命令时刻记了基图 ⇒ 仍可重放
+            // (`ImageOp::source_texture`;`sp.tmpB` 的 MERGE 是真实用法)。
+            let replayable = source_live || i.source_texture.is_some();
+            if replayable && target_live {
+                let mut op = i.clone();
+                if op.region_from_fixed {
+                    // `FX/FY/FX2/FY2` 是「源坐标 − 位置小数部分」:
+                    // 脚本 `@FLX = -(@LEFT_X*100 % 100)` 假设引擎把目标位置
+                    // 量化成整数,再把丢掉的小数补偿回源坐标。本内核目标位置
+                    // 保留亚像素,直接采样已正确,因此只需把这段补偿还原,
+                    // 让源坐标回到脚本算出的 `X1/X2/Y1/Y2`。
+                    // 位置在命令之后还会被 `CG[ID=… X=…]` 改写,所以必须在
+                    // 输出前解析,不能用命令时刻的快照。
+                    let target = match &op.target {
+                        Some(t) => t,
+                        None => &op.source,
+                    };
+                    if let Some(node) = self.nodes.get(target) {
+                        let (fx, fy) = (
+                            node.layer.transform.x.fract(),
+                            node.layer.transform.y.fract(),
+                        );
+                        op.x = op.x.map(|v| v + fx);
+                        op.x2 = op.x2.map(|v| v + fx);
+                        op.y = op.y.map(|v| v + fy);
+                        op.y2 = op.y2.map(|v| v + fy);
+                    }
+                }
+                texture_ops.push((op.seq, Op::Image(op)));
             }
         }
         texture_ops.sort_by_key(|(seq, _)| *seq);
@@ -591,7 +631,8 @@ impl GfxState {
             if self.nodes.get(&main).is_some_and(|n| n.layer.is_group()) {
                 self.emit_children_ops(&main, &mut screen_ops, &emitted_groups);
             } else {
-                self.emit_node_ops(&main, &mut screen_ops, &emitted_groups);
+                let produced = self.surface_producers();
+                self.emit_node_ops(&main, &mut screen_ops, &emitted_groups, &produced);
             }
         }
         passes.push(Pass {
@@ -916,10 +957,13 @@ impl GfxState {
         }
         match &layer.texture {
             TextureRef::SolidBlack1x1 => Ok(1),
-            TextureRef::None => Err(error::unimplemented(
-                error::code::INFO_UNSUPPORTED,
-                "无纹理层的尺寸未知",
-            )),
+            // 引擎 `0x43d86d/0x43d87d`(CGINFO 的 SX/SY 分支)直接读图层
+            // `+0x78/+0x7c` 的矩形宽高,**不检查纹理指针**。刚由
+            // `CG[ID=… E=… X=… Y=…]` 建立、没有 FILE 的层这两字段为零 ⇒
+            // 官方返回 0。`es.BT.SXY.GET` 对无 OFF 图的按钮正是查询这种层
+            // (es_Button.yst:3865 → `CGINFO[ID="BT.OFF…" SX]`);返回
+            // Unimplemented 只会把 LET 留旧值并刷 3812 条噪声诊断。
+            TextureRef::None => Ok(0),
             // 尺寸由 VM 解析资产头后注入(见 `set_asset_size`);未注入时
             // 仍返回专用错误码,让 VM 走回退路径(DIV-GFX-024)。
             TextureRef::Asset(key) => match self.asset_sizes.get(key) {
@@ -986,15 +1030,18 @@ impl GfxState {
         };
         Ok(match flag {
             "COLOR" => Value::Int(i64::from(self.style.color)),
-            "COLOR2" => match self.style.color2 {
-                Some(c) => Value::Int(i64::from(c)),
-                None => {
-                    return Err(error::unimplemented(
-                        error::code::INFO_UNSUPPORTED,
-                        "FONTINFO[COLOR2] 未设置:引擎默认值未取证",
-                    ));
-                }
-            },
+            // `FONT[COLOR2=-1]` 是 `_txcolor` 宏的「不给 COLOR2」哨兵
+            // (`macro.yst` def2=-1),`es._txcolor` 会先 `FONTINFO[COLOR2]`
+            // 存档、改色后再 `FONT[COLOR2=@s2]` 还原。若这里不写 LET,
+            // `@s2` 保持 0,还原时把渐变终点改成黑色 —— 文字会变色/闪烁。
+            // ⇒ 内部 `None`(纯色)对应官方字段值 **-1**,原样返回。
+            "COLOR2" => Value::Int(
+                // 良性:None = 「未给 COLOR2」哨兵,官方字段值 -1。
+                self.style
+                    .color2
+                    .map(i64::from) // 良性:None = -1 哨兵
+                    .unwrap_or(-1),
+            ),
             "SX" => Value::Int(self.style.size_x),
             "SY" => Value::Int(self.style.size_y),
             "BOLD" => Value::Int(i64::from(self.style.bold)),
@@ -1508,8 +1555,9 @@ impl GfxState {
                 // 新纹理没有旧快照/图像加工的状态;属性随后重算。
                 node.layer.reset_status();
             }
-            // 旧快照/图像加工随旧纹理作废。
-            self.copy_log.retain(|c| c.dest != parsed.path);
+            // 旧快照/图像加工随旧纹理作废。若后续 copy 仍以旧快照为
+            // `source_texture`,保留生产者(见 `prune_copy_log`)。
+            self.prune_copy_log(|c| c.dest == parsed.path);
             self.image_log
                 .retain(|i| i.source != parsed.path && i.target.as_ref() != Some(&parsed.path));
             // 新纹理 = 干净像素面:之前 `CGACT[TEXT]` 的绘制项随之作废。
@@ -1653,8 +1701,14 @@ impl GfxState {
             return;
         };
         let dest = paths[1].clone().unwrap_or_else(|| source.clone());
-        // TODO(DIV-GFX-031):ID3/ID4 多图层运算、Z2/BNO 修饰语义未取证。
-        if paths[2].is_some() || paths[3].is_some() {
+        // TODO(DIV-GFX-031):ID3/ID4 的多图层运算、Z2/BNO 修饰语义未取证。
+        //
+        // `TRANSITION` 是例外:`CGACT[TRANSITION=1 SET=f ID=$LB1 ID2=$LB2
+        // ID3=$LB3]`(`es_Sprite.yst:7978`)里 ID2 是**第二输入**、ID3 才是
+        // 目标,已由 `cgact_transition` 实现。旧实现无条件报警,既刷噪声
+        // (每帧一条)又让转场被当成未取证。
+        let is_transition = flag(&params, "TRANSITION");
+        if !is_transition && (paths[2].is_some() || paths[3].is_some()) {
             self.push_diag(
                 "CGACT",
                 error::unimplemented(
@@ -1702,6 +1756,11 @@ impl GfxState {
         // `round() as i64`,把小数部分整条丢掉 ⇒ 慢速移动(每帧 <1px)
         // 被量化成阶梯抖动,越慢越明显。
         let fixed_px = |name: &str| find_f64(&params, name).map(|v| v / 100.0);
+        // 只要区域来自定点键(`FX/FY/FX2/FY2`),就是「相对屏幕位置的偏移」,
+        // 需要在输出时加上目标层最终位置(见 `ImageOp::region_from_fixed`)。
+        let uses_fixed_region = ["FX", "FY", "FX2", "FY2"]
+            .iter()
+            .any(|n| find_f64(&params, n).is_some());
         let px = |name_int: &str, name_fixed: &str| -> Option<f64> {
             find_f64(&params, name_int).or_else(|| fixed_px(name_fixed))
         };
@@ -1791,6 +1850,7 @@ impl GfxState {
                 y,
                 x2,
                 y2,
+                uses_fixed_region,
             );
             return;
         }
@@ -1889,7 +1949,7 @@ impl GfxState {
                 .map(|t| t.draws.clone())
                 .unwrap_or_default()
         };
-        self.copy_log.retain(|c| c.dest != *dest);
+        self.prune_copy_log(|c| c.dest == *dest);
         self.image_log
             .retain(|i| i.target.as_ref().is_none_or(|t| t != dest));
         // EVID-T-11/T-12:COPY/COPY2 在命令执行时取源层当前状态;区域是源
@@ -2065,10 +2125,35 @@ impl GfxState {
         }
         let seq = self.next_texture_seq();
         let blend = EngineValue::Int(blend.clamp(0, 256));
+        // 过渡结果**就是目标层的表面**(官方 `FUN_0042f809` 尾部
+        // `*(iVar4+0x90) = local_68`:加工产出直接成为该层表面)。
+        //
+        // 所以这里必须像 `COPY` 一样给目标层换上一个快照身份:
+        // 1. 目标层此后的 `texture` 不再是无用的建层基图,`CGACT[SIZE]`
+        //    命令时刻记到的 `source_texture` 才会指向**过渡结果**;
+        // 2. 该快照被 `CGEND` 之外的引用闭包保护,不会因为临时层
+        //    (`SPLBUFb601`)被删而在下一帧解析不到像素。
+        //
+        // 不做这一步时:`es_Sprite.yst` 的立绘淡入在最后一帧
+        // `CGEND[SPLBUFb601]` 之后,`CGACT[SIZE2]` 的源已不存在 ⇒
+        // 整层被 skip 一帧 ⇒ 归位瞬间闪一下(2026-10-26 实测)。
+        let copy_id = CopyId(self.next_copy());
+        if let Some(size) = self
+            .nodes
+            .get(&dst)
+            .and_then(|n| n.layer.image_size())
+        {
+            self.snapshot_sizes.insert(copy_id, size);
+        }
+        if let Some(node) = self.nodes.get_mut(&dst) {
+            node.layer.texture = TextureRef::Snapshot(copy_id);
+            node.layer.set_texture_status(LayerStatus::Executable);
+        }
         self.push_image_log(ImageOp {
             seq,
             source: from.clone(),
             source2: Some(to.clone()),
+            source_texture: None,
             target: Some(dst.clone()),
             action: ImageAction::Other("transition"),
             set: Some(blend),
@@ -2080,6 +2165,7 @@ impl GfxState {
             y: None,
             x2: None,
             y2: None,
+            region_from_fixed: false,
             status: OpStatus::Executable,
         });
     }
@@ -2307,6 +2393,7 @@ impl GfxState {
         y: Option<f64>,
         x2: Option<f64>,
         y2: Option<f64>,
+        region_from_fixed: bool,
     ) {
         if !self.nodes.contains_key(source) {
             self.push_diag(
@@ -2478,10 +2565,19 @@ impl GfxState {
         let executable = status == OpStatus::Executable;
         let seq = self.next_texture_seq();
         let image_action = action.clone();
+        // 命令时刻的源基图(见 `ImageOp::source_texture`):源层可能在同帧
+        // 稍后被 `CGEND` 删除,帧末回放需要这份快照身份。
+        // 命令时刻源层的基图(`DIV-GFX-053` 的 image 版)。
+        let source_texture = self
+            .nodes
+            .get(&source)
+            .map(|n| n.layer.texture.clone())
+            .filter(|t| !matches!(t, TextureRef::None));
         self.push_image_log(ImageOp {
             seq,
             source: source.clone(),
             source2: None,
+            source_texture,
             target: target.clone(),
             action,
             set,
@@ -2493,6 +2589,7 @@ impl GfxState {
             y,
             x2,
             y2,
+            region_from_fixed,
             status,
         });
         // `CGACT[SIZE/SIZE2/SIZE3/SIZE4/SIZE5]` 把源区域缩放到目标层 ⇒ 目标层
@@ -2857,10 +2954,52 @@ impl GfxState {
 
     fn drop_ops_for(&mut self, removed: &BTreeSet<LayerId>) {
         // 快照是独立纹理:源图层被删后,已完成的复制仍需留给后端物化。
-        self.copy_log.retain(|c| !removed.contains(&c.dest));
+        // 目标层被删时不能无条件丢掉复制项 —— 后续 copy 可能以它的快照
+        // 为 `source_texture`(sprite 的 `sp.tmpA` 中转层),依赖闭包见
+        // `prune_copy_log`。
+        self.prune_copy_log(|c| removed.contains(&c.dest));
         // 图像加工同理:只要目标还在,操作历史仍描述目标纹理。
-        self.image_log
-            .retain(|i| i.target.as_ref().is_none_or(|t| !removed.contains(t)));
+        //
+        // **源被删**也要作废:官方 `CGACT` 在命令时刻就地执行
+        // (`FUN_0042f809`),结果已经写进目标表面,后续读取只依赖目标;
+        // 本内核延迟回放,若源层随后被 `CGEND`,该条永远解析不到像素
+        // (每帧报 `gfx.imageop.source.missing`)。语料正是这样:
+        // 立绘过渡最后一帧 `CGEND[SPLBUFb601]`,而 `SIZE2` 仍以它作源。
+        //
+        // 例外:源层被删但命令时刻已记下基图(`source_texture`)或目标
+        // 是快照(像素在快照里)的项仍可重放,保留。
+        self.image_log.retain(|i| {
+            let target_alive = i.target.as_ref().is_none_or(|t| !removed.contains(t));
+            let source_alive = !removed.contains(&i.source);
+            target_alive && (source_alive || i.source_texture.is_some())
+        });
+    }
+
+    /// 删除满足 `remove` 的复制项,但保留仍被后续复制 `source_texture`
+    /// 引用的快照生产者(从新到旧扫描,建立依赖闭包)。
+    fn prune_copy_log(&mut self, remove: impl Fn(&CopyOp) -> bool) {
+        let mut keep = vec![true; self.copy_log.len()];
+        let mut needed: BTreeSet<CopyId> = BTreeSet::new();
+        for i in (0..self.copy_log.len()).rev() {
+            let copy = &self.copy_log[i];
+            if remove(copy) && !needed.contains(&copy.id) {
+                keep[i] = false;
+                continue;
+            }
+            if let Some(TextureRef::Snapshot(id)) = &copy.source_texture {
+                needed.insert(*id);
+            }
+        }
+        let mut index = 0usize;
+        self.copy_log.retain(|_| {
+            // 良性:keep 与 copy_log 等长。
+            let result = match keep.get(index) {
+                Some(keep_it) => *keep_it,
+                None => true,
+            };
+            index += 1;
+            result
+        });
     }
 
     fn sorted_children(&self, parent: Option<&LayerId>) -> Vec<LayerId> {
@@ -2976,7 +3115,13 @@ impl GfxState {
 
     /// 把一个子节点写进当前目标:组 → 已生成的离屏纹理;
     /// 图像 → 自身子树(引擎先递归子层,再画本层)。
-    fn emit_node_ops(&self, id: &LayerId, out: &mut Vec<Op>, emitted: &BTreeSet<LayerId>) {
+    fn emit_node_ops(
+        &self,
+        id: &LayerId,
+        out: &mut Vec<Op>,
+        emitted: &BTreeSet<LayerId>,
+        produced: &BTreeSet<LayerId>,
+    ) {
         let Some(node) = self.nodes.get(id) else {
             return;
         };
@@ -2993,7 +3138,7 @@ impl GfxState {
             }
             return;
         }
-        self.emit_image_subtree(id, out, emitted);
+        self.emit_image_subtree(id, out, emitted, produced);
     }
 
     /// 组(layer set)上的 `T/TA/TID`:引擎按层表统一解析配对(组也是层),
@@ -3021,14 +3166,37 @@ impl GfxState {
     }
 
     fn emit_children_ops(&self, parent: &LayerId, out: &mut Vec<Op>, emitted: &BTreeSet<LayerId>) {
+        let produced = self.surface_producers();
         for child in self.sorted_children(Some(parent)) {
-            self.emit_node_ops(&child, out, emitted);
+            self.emit_node_ops(&child, out, emitted, &produced);
         }
+    }
+
+    /// 本帧有可执行加工/复制把像素写进表面的层(官方 `层+0x90`)。
+    fn surface_producers(&self) -> BTreeSet<LayerId> {
+        let mut produced = BTreeSet::new();
+        for image in &self.image_log {
+            if image.status == OpStatus::Executable {
+                produced.insert(image.target.clone().unwrap_or_else(|| image.source.clone()));
+            }
+        }
+        for copy in &self.copy_log {
+            if copy.status == OpStatus::Executable {
+                produced.insert(copy.dest.clone());
+            }
+        }
+        produced
     }
 
     /// 图像节点及其非组后代的绘制顺序 = 引擎后序:子层全部先于本层。
     /// 组子节点只输出 `Op::Group`(其内部在本组的 Offscreen pass)。
-    fn emit_image_subtree(&self, id: &LayerId, out: &mut Vec<Op>, emitted: &BTreeSet<LayerId>) {
+    fn emit_image_subtree(
+        &self,
+        id: &LayerId,
+        out: &mut Vec<Op>,
+        emitted: &BTreeSet<LayerId>,
+        produced: &BTreeSet<LayerId>,
+    ) {
         enum Frame {
             Enter(LayerId),
             Group(LayerId),
@@ -3073,7 +3241,19 @@ impl GfxState {
                     let Some(node) = self.nodes.get(&id) else {
                         continue;
                     };
-                    if node.layer.visible && !matches!(node.layer.texture, TextureRef::None) {
+                    // 层的**表面**可以没有基图:官方 `CGACT` 在命令时刻
+                    // malloc 一块表面写进 `*(层+0x90)`(REA `0x42f809`
+                    // 尾部 `*(iVar4 + 0x90) = local_68`),之后绘制读的就是
+                    // 它,与 `+0x78`(源图指针)无关。所以「无基图」不等于
+                    // 「画不出像素」—— 只要本帧有可执行的图像加工/复制把像素
+                    // 产出到该层,它就是可绘制的。
+                    //
+                    // 旧实现按 `texture != None` 过滤,会让
+                    // `es_SPExec.yst` 的动画帧层(基图 None、像素来自
+                    // `SIZE2` 加工)整层不上屏 ⇒ 立绘眨眼/换表情闪空白。
+                    let has_surface = !matches!(node.layer.texture, TextureRef::None)
+                        || produced.contains(&id);
+                    if node.layer.visible && has_surface {
                         out.push(self.op_for_layer(&node.layer));
                     }
                 }
@@ -3188,6 +3368,7 @@ impl GfxState {
 
     fn push_image_log(&mut self, op: ImageOp) {
         self.supersede_image_op(&op);
+        self.supersede_full_paint(&op);
         if self.image_log.len() >= MAX_OP_LOG {
             let drop = self.image_log.len() / 2;
             self.image_log.drain(..drop);
@@ -3221,26 +3402,85 @@ impl GfxState {
     /// 追加条件:`(源, 目标)` 相同、源 ≠ 目标(原地缩放会叠加)、且旧项之后
     /// 没有任何项把该目标当源读过(有 ⇒ 中间像素仍被引用)。
     fn supersede_image_op(&mut self, op: &ImageOp) {
-        if !op.action.is_scale() {
+        // 「纯写」动作:结果只由源(以及 `SET` 等参数)决定,不读目标旧像素。
+        //
+        // - 缩放族 `SIZE..SIZE5`、`HORIZONTAL/VERTICAL`(纯采样修饰);
+        // - `TRANSITION`:两源按 `SET` 插值写 ID3(`es_Sprite.yst:7978`
+        //   立绘换表情/眨眼每帧一条),同样不读 ID3 旧像素。
+        //
+        // 后两种此前没有折叠 ⇒ 转场/表情每帧追加一条 ⇒ `frame()` 每帧多出
+        // 一个 pass,`render` 随游玩时长线性上涨(实测 680 层时
+        // passes 128→139、render 30.8→40.8ms/帧,2026-10-26)。
+        let pure_write = op.action.is_scale()
+            || matches!(
+                op.action,
+                ImageAction::Horizontal | ImageAction::Vertical | ImageAction::Other("transition")
+            );
+        if !pure_write {
             return;
         }
         let target = op.target.as_ref().unwrap_or(&op.source);
-        if target == &op.source {
+        // 缩放族源=目标时是原地重采样(会叠加),不能折叠。
+        //
+        // `TRANSITION` 例外:官方 `FUN_00442c60` 的混合是「读两源 → 写目标」,
+        // **不读目标旧像素**,原地过渡(语料 `SPLBUFb601` 的
+        // `TRANSITION=1 … ID=SPLBUF601 ID2=SPLBUFa601 ID3=SPLBUFb601`,
+        // `SET` 逐帧 0→131 递增)每帧一条,折叠后只保留最后一条,像素与
+        // 逐帧重算完全相同。旧实现被这条规则挡掉 ⇒ 立绘渐变期
+        // passes 每帧 +1、render 3.7→63ms 一路爬升(2026-10-26 实测)。
+        let is_transition = op.action == ImageAction::Other("transition");
+        if target == &op.source && !is_transition {
             return;
         }
+        // 折叠键:`(动作, 源, 目标)`。**不含 `source2`/`SET`** ——
+        // `es_Sprite.yst` 的立绘淡入每帧对同一目标连发数十条
+        // `TRANSITION`(同源、`SET` 0→131 递增、`source2` 逐条不同),
+        // 语义是「同一块表面被反复覆写」,最终像素只由最后一条决定。
+        // 把 `source2`/`SET` 放进键会让它们全部留下 ⇒ 单帧内就堆 29 条
+        // pass,render 一路涨到 105ms(2026-10-26 实测)。
+        // 缩放族是「该目标本帧的最终表面描述」:同目标同动作只保留最后
+        // 一条,**不比对 `source`** —— `es_Sprite.yst` 的过渡态与稳态在
+        // 同一帧会分别发 `SIZE2`(源分别是临时层 `SPLBUFb601` 与数据层
+        // `SPLBUF601`),最终显示只由后者决定;临时层随后被 `CGEND`,
+        // 留下前者会让该层每帧报 `source.missing` 并跳过一帧(归位闪)。
+        let is_scale = op.action.is_scale();
         let Some(pos) = self.image_log.iter().rposition(|old| {
-            old.action.is_scale()
-                && old.source == op.source
+            old.action == op.action
                 && old.target.as_ref().unwrap_or(&old.source) == target
+                && (!is_scale || true)
+                && (is_scale || old.source == op.source)
         }) else {
             return;
         };
         let later_seq = self.image_log[pos].seq;
+        // 「旧结果是否仍被读」:纯写动作不读目标旧像素,所以只有**后续
+        // 其它项把该目标当源**时才算被读。这里必须排除「自身读自身」——
+        // 原地 `TRANSITION`(`ID3` = 目标 = 它自己那一层)的
+        // `source` 恰好等于 `target`,若不排除就永远判成「被读了」,
+        // 折叠全部失效(实测立绘淡入期 passes 每帧 +1、render 至 105ms)。
+        let is_transition = op.action == ImageAction::Other("transition");
         let read_later = self
             .image_log
             .iter()
             .skip(pos + 1)
-            .any(|later| &later.source == target)
+            .any(|later| {
+                if &later.source != target {
+                    return false;
+                }
+                // 原地过渡(源=目标)自己读自己不算阻断。
+                if is_transition && later.target.as_ref() == Some(target) {
+                    return false;
+                }
+                // 折叠项是过渡时,**同帧紧接着的缩放族**是它的消费者
+                // (`es_Sprite.yst:7978` 的 `TRANSITION` 之后立刻
+                // `GOSUB es.CGACT_SIZE`),读的正是最新结果,不构成
+                // 「中间像素被引用」。旧实现把它当阻断 ⇒ 立绘淡入期
+                // 单帧堆 29 条过渡 pass、render 涨到 105ms。
+                if is_transition && later.action.is_scale() {
+                    return false;
+                }
+                true
+            })
             || self.copy_log.iter().any(|copy| {
                 copy.seq > later_seq
                     && matches!(&copy.source, CopySource::Layer(id) if id == target)
@@ -3249,6 +3489,77 @@ impl GfxState {
             return;
         }
         self.image_log.remove(pos);
+    }
+
+    /// 折叠被**整面填充**覆盖的旧图像项。
+    ///
+    /// `CGACT[RECTPAINT/2/3]` 不带区域 = 用纯色改写整个目标表面。`es_Button`
+    /// 的文本框清理每帧/每条消息重发一次,旧实现全部保留 ⇒ `image_log`
+    /// 持续增长 ⇒ `frame()` 每项产出一个 pass,渲染耗时随游玩时长线性上升
+    /// (2026-10-26 β4 演出实测:passes 107→155、render 4.9→14.0ms/帧,
+    /// 图层数与可见数都不变)。
+    ///
+    /// 安全性:整面填充把目标每个像素都覆盖掉,之前的写入不再影响最终像素;
+    /// 但若中间有项把目标当**源**读过,那些中间像素仍被引用,只能删除读取
+    /// 之后的项。区域填充(`X/Y/X2/Y2` 有值)不折叠。
+    fn supersede_full_paint(&mut self, op: &ImageOp) {
+        if !matches!(
+            op.action,
+            ImageAction::RectPaint | ImageAction::RectPaint2 | ImageAction::RectPaint3
+        ) {
+            return;
+        }
+        if op.x.is_some() || op.y.is_some() || op.x2.is_some() || op.y2.is_some() {
+            return;
+        }
+        // 良性:未给 target 时加工原地进行(source 即目标)。
+        let target = op.target.as_ref().unwrap_or(&op.source);
+        let same = |old: &ImageOp| {
+            old.action == op.action
+                && old.source == op.source
+                && old.target == op.target
+                && old.set == op.set
+                && old.set2 == op.set2
+                && old.set_str == op.set_str
+                && old.sx == op.sx
+                && old.sy == op.sy
+        };
+        // 目标被当作源读取的最后位置:读取之后才产生的填充不可能影响它。
+        let last_read = self
+            .image_log
+            .iter()
+            .filter(|old| &old.source == target)
+            .map(|old| old.seq)
+            .chain(
+                self.copy_log
+                    .iter()
+                    .filter(|copy| matches!(&copy.source, CopySource::Layer(id) if id == target))
+                    .map(|copy| copy.seq),
+            )
+            .max();
+        match last_read {
+            // 只保留“最后一次读取之前的最新一次同参填充”;读取看到的状态
+            // 不变,更早的重复填充对该读取没有贡献。
+            Some(cutoff) => {
+                let keep = self
+                    .image_log
+                    .iter()
+                    .filter(|old| same(old) && old.seq <= cutoff)
+                    .map(|old| old.seq)
+                    .max();
+                let keep_seq = keep;
+                self.image_log.retain(|old| {
+                    if !same(old) {
+                        return true;
+                    }
+                    match keep_seq {
+                        Some(seq) => old.seq == seq,
+                        None => false,
+                    }
+                });
+            }
+            None => self.image_log.retain(|old| !same(old)),
+        }
     }
 
     fn arg_slot_missing(&mut self, command: &str, slot: u8) {
@@ -3561,8 +3872,12 @@ fn apply_layer_params(
     let mut sx: Option<i64> = None;
     let mut sy: Option<i64> = None;
     for (name, value, offset) in params {
-        // 参数种类 2 只影响数据编码,不影响算术语义(见 `X` 分支注释)。
-        let _ = offset;
+        // 参数种类 2(`X+=` 源写法)是**增量**:语料 `es_Sprite.yst:8173`
+        // 每帧先由 `es.CGACT_SIZE` 写入绝对位置 `CG[ID=$dst X=@LEFT_X]`,
+        // 随后用 `CG[ID=$L1 X+=(@es.GSX/2)-(@WSX/2)]` 补偿旋转画布;
+        // 若按赋值处理,补偿值 0 会把位置清成 0(立绘被钉在屏幕左上)。
+        // 同理 `ES_Title.yst:104` 的 `CG[ID=FOUT_B A+=4]` 在 64 次循环里
+        // 逐步淡入,赋值语义会让 alpha 恒为 4。=> kind 2 = 相对当前值累加。
         match name.as_str() {
             "FILE" | "ID" | "IDNO" => {}
             "E" => match value.as_int() {
@@ -3573,13 +3888,20 @@ fn apply_layer_params(
                 )),
             },
             "A" => match value.as_int() {
-                Some(n) => match i16::try_from(n) {
-                    Ok(v) => layer.alpha = v,
-                    Err(_) => diags.push(error::recoverable(
-                        error::code::ARG_TYPE,
-                        format!("参数 `A={n}` 超出 s16 存储范围"),
-                    )),
-                },
+                Some(n) => {
+                    let next = if *offset {
+                        i64::from(layer.alpha).saturating_add(n)
+                    } else {
+                        n
+                    };
+                    match i16::try_from(next) {
+                        Ok(v) => layer.alpha = v,
+                        Err(_) => diags.push(error::recoverable(
+                            error::code::ARG_TYPE,
+                            format!("参数 `A={next}` 超出 s16 存储范围"),
+                        )),
+                    }
+                }
                 None => diags.push(error::recoverable(
                     error::code::ARG_TYPE,
                     "参数 `A` 期望整数",
@@ -3602,30 +3924,36 @@ fn apply_layer_params(
             // 跳 1px」的阶梯(2026-10-26 实机确认)。
             // `Z` 是排序键、`SX/SY` 是纹理尺寸,均为整数像素,故仍取整。
             "X" => match value.as_f64() {
-                // 参数种类 2(`X+=` 源写法)= 「脚本内偏移」,**不是累加**。
-                // REA `FUN_00429fd1`(参数序言,`0x429fd1`):类型字节 2 的分支
-                // 只写 `0x683e20[i] = script_base + off`,参数值槽
-                // (`0x683740/44`)一个字都不写,全程没有读旧值的路径。
-                // 因此按普通数值赋值(与种类 0 同口径);若按累加处理,
-                // `CG[…] X+=(@es.GSX/2)-(@WSX/2)` 会让持久层逐帧漂移。
-                // 消费点同证(`0x42c9a7`):`MOV EDX,[EAX*4+0x683e20]` 后把该
-                // 指针存进参数结构,按脚本体指针读内联数据。
-                // 详见 `docs/divergences/DIV-GFX-064-cg-float-coordinates.md` §4。
-                Some(v) => layer.transform.x = v,
+                // 参数种类 2(`X+=` 源写法)= 增量(见循环头注释)。
+                Some(v) => {
+                    layer.transform.x = if *offset {
+                        layer.transform.x + v
+                    } else {
+                        v
+                    }
+                }
                 None => diags.push(error::recoverable(
                     error::code::ARG_TYPE,
                     "参数 `X` 期望数值",
                 )),
             },
             "Y" => match value.as_f64() {
-                Some(v) => layer.transform.y = v,
+                Some(v) => {
+                    layer.transform.y = if *offset {
+                        layer.transform.y + v
+                    } else {
+                        v
+                    }
+                }
                 None => diags.push(error::recoverable(
                     error::code::ARG_TYPE,
                     "参数 `Y` 期望数值",
                 )),
             },
             "Z" => match value.as_px() {
-                Some(n) => layer.z = n,
+                Some(n) => {
+                    layer.z = if *offset { layer.z + n } else { n };
+                }
                 None => diags.push(error::recoverable(
                     error::code::ARG_TYPE,
                     "参数 `Z` 期望数值",

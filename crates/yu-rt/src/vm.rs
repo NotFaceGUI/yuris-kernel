@@ -61,6 +61,58 @@ const DECODE_CACHE_CAP: usize = 200_000;
 const CMD_CACHE_SCRIPT_MAX: usize = 1 << 16;
 const CMD_CACHE_PC_MAX: usize = 1 << 20;
 
+/// 宿主注入的**本地**日期时间(`@_TIME` 的手册语义 = 系统本地时间)。
+///
+/// 内核不直接读墙钟(A3):宿主启动时读一次系统本地时间,经
+/// [`BootConfig::local_time`] 注入。`@_TIME(1,k)` 返回注入值本身,
+/// `@_TIME(0,k)` 在其上叠加游戏逻辑流逝时间(`now_ms - start_ms`)。
+///
+/// `month` 1..=12、`day` 1..=31、`hour` 0..=23、`minute`/`second` 0..=59、
+/// `millisecond` 0..=999;越界值由 [`HostLocalTime::new`] 拒绝。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostLocalTime {
+    pub year: i64,
+    pub month: i64,
+    pub day: i64,
+    pub hour: i64,
+    pub minute: i64,
+    pub second: i64,
+    pub millisecond: i64,
+}
+
+impl HostLocalTime {
+    /// 校验并构造。字段越界 ⇒ `None`(宿主必须给合法本地时间,不猜)。
+    #[must_use]
+    pub fn new(
+        year: i64,
+        month: i64,
+        day: i64,
+        hour: i64,
+        minute: i64,
+        second: i64,
+        millisecond: i64,
+    ) -> Option<Self> {
+        if !(1..=12).contains(&month)
+            || !(1..=31).contains(&day)
+            || !(0..=23).contains(&hour)
+            || !(0..=59).contains(&minute)
+            || !(0..=59).contains(&second)
+            || !(0..=999).contains(&millisecond)
+        {
+            return None;
+        }
+        Some(Self {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            millisecond,
+        })
+    }
+}
+
 /// 启动配置。
 #[derive(Clone, Debug)]
 pub struct BootConfig {
@@ -70,6 +122,12 @@ pub struct BootConfig {
     pub fps: u32,
     /// 注入时钟起点(毫秒)。
     pub start_ms: u32,
+    /// 宿主本地时间基准(`@_TIME` 的年月日时分秒;`None` = 确定性注入时钟)。
+    ///
+    /// 真实运行宿主(`yu-cli` run/serve/desktop)在启动时读一次系统本地时间
+    /// 填入;用例/trace/golden 保持 `None` ⇒ `@_TIME` 继续以 1970-01-01 UTC
+    /// 为纪元的注入时钟计算(可复现,DIV-RT-009)。
+    pub local_time: Option<HostLocalTime>,
     /// 每逻辑帧毫秒(`WAIT[TIME]` 与 `@_TIME` 同源)。
     pub frame_ms: u32,
     /// 脚本 XOR 密钥(默认 `CRC32("Yu-ris")`)。
@@ -129,6 +187,7 @@ impl Default for BootConfig {
             entry_label: "SYSTEM_START".to_string(),
             fps: 60,
             start_ms: 0,
+            local_time: None,
             frame_ms: 16,
             script_key: crate::tables::DEFAULT_SCRIPT_KEY,
             debug_mode: false,
@@ -213,6 +272,8 @@ pub struct IfFrame {
     pub entry_pc: u32,
     pub end_pc: u32,
     pub base_a: u8,
+    /// 进入 IF 时的 LOOP 深度(引擎 IF 帧 `+0`;SCRIPTPOS 序列化字段)。
+    pub loop_depth: usize,
 }
 
 /// `LOOP` 帧(引擎循环栈帧 0x20 字节;§3.13)。
@@ -235,6 +296,18 @@ pub struct ExecState {
     pub pc: u32,
     /// 变量域基址 A(引擎 `task+0x3e`;同时是块深度)。
     pub base_a: u8,
+    /// 最近一次 `RETURNCODE` 的文本行信息(引擎 `task+0xc`)。
+    ///
+    /// 引擎 `0x44c390` 把当前指令首窗口记录的第一个 dword 原样抄进
+    /// `task+0xc`(RETURNCODE 的窗口 `id` = 本脚本文本行计数,`type` = 0),
+    /// `TASKINFO[TEXTLINE]`(`0x45272a`)直接读回。这里保存同一个打包值,
+    /// 不另行解释 `flag/slot` 位。
+    pub text_line: i64,
+    /// 最近一次 `RETURNCODE` 的 voice 值(引擎 `task+0x10`)。
+    ///
+    /// 同一条窗口记录的第二个 dword(记录里的 `length` 字段);
+    /// `TASKINFO[NEXTVOICE]`(`0x452708`)直接读回。
+    pub next_voice: i64,
     pub frames: Vec<GosubFrame>,
     pub if_stack: Vec<IfFrame>,
     pub loops: Vec<LoopFrame>,
@@ -249,6 +322,8 @@ impl ExecState {
             script_id,
             pc,
             base_a: 0,
+            text_line: 0,
+            next_voice: 0,
             frames: vec![GosubFrame::new(script_id, pc, 0)],
             if_stack: Vec::new(),
             loops: Vec::new(),
@@ -309,6 +384,8 @@ pub struct Vm {
     frame: u64,
     now_ms: u32,
     start_ms: u32,
+    /// 宿主本地时间基准(`@_TIME`;`None` = 确定性注入时钟)。
+    local_time: Option<HostLocalTime>,
     frame_ms: u32,
     fps: u32,
     skip: bool,
@@ -410,6 +487,9 @@ pub struct Vm {
     unimplemented_reported: std::collections::BTreeSet<String>,
     /// aligned-stub 命令(MIDI 族/CDDA)的「只报一次」去重集。
     aligned_stub_reported: std::collections::BTreeSet<String>,
+    /// `TASKINFO` LET 类型不符诊断的「只报一次」去重集(按 query + 目标类型)。
+    /// 引擎每次都会打印错误(`0x465cdc`),但脚本热循环里重复报告只会刷屏。
+    taskinfo_type_reported: std::collections::BTreeSet<String>,
     /// 事件队列容量上限(任务书 E R10:长跑不得无界增长)。
     event_capacity: usize,
     /// 因容量上限被丢弃的最旧事件数(可观测,不静默)。
@@ -555,6 +635,7 @@ impl Vm {
             frame: 0,
             now_ms: cfg.start_ms,
             start_ms: cfg.start_ms,
+            local_time: cfg.local_time,
             frame_ms: cfg.frame_ms,
             fps: cfg.fps,
             skip: false,
@@ -607,6 +688,7 @@ impl Vm {
             unimplemented_cmds: BTreeMap::new(),
             unimplemented_reported: std::collections::BTreeSet::new(),
             aligned_stub_reported: std::collections::BTreeSet::new(),
+            taskinfo_type_reported: std::collections::BTreeSet::new(),
             event_capacity: DEFAULT_EVENT_CAPACITY,
             events_dropped: 0,
             cur_script: script_id,
@@ -877,6 +959,11 @@ impl Vm {
 
     pub fn start_ms(&self) -> u32 {
         self.start_ms
+    }
+
+    /// 宿主注入的本地时间基准(`@_TIME`;`None` = 确定性注入时钟)。
+    pub fn local_time(&self) -> Option<HostLocalTime> {
+        self.local_time
     }
 
     pub fn debug_mode(&self) -> bool {

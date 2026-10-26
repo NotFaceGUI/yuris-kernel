@@ -110,6 +110,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         debug_mode,
         save_root,
         force_font,
+        // 真实运行:`@_TIME` 注入系统本地时间(存档菜单的现实日期)。
+        local_time: crate::clock::local_now(),
         ..EngineOptions::default()
     };
     let mut engine = Engine::new(project, opts)?;

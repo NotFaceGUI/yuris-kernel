@@ -79,7 +79,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `FILEINFO` | file | 22 | `file/fileinfo.html` | `0x44286c` | ✅ 实现(FILE+EXIST+LET) | AU5 勘误:旧口径「➖ 域事件」未随 J3 更新。J3 起 `op_fileinfo` VFS 存在性查询写 LET(EVID-J3-01);B1 补「散盘」回退(REA `0x44316c` 文件系统支:`FILE=$es.SAVEPATH+名` ⇒ save 根判存在;存档槽判定/启动恢复闸门依赖,桌面实测暴露);FOLDER/SIZE/RELATION 变体仍挂账(B10) |
 | `MATH` | vm | 21 | `math/math.html` | `0x4482c4` | ✅ 实现 | 保持 |
 | `FILEACT` | file | 20 | `file/fileact.html` | `0x441370` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `TASKINFO` | vm | 19 | `control/taskinfo.html` | `0x4523fc` | ✅ 实现 | 保持 |
+| `TASKINFO` | vm | 19 | `control/taskinfo.html` | `0x4523fc` | ✅ 实现 | 21 槽:A/FILE0/FILENO0/LINE0/TEXTLINE/NEXTVOICE 按 0.495 逐分支补齐(2026-10-26);SCRIPTPOS 用 `0x452a54`/`0x450fe0` 引擎字节格式(三栈+text_line/pc/脚本名);FILENO0→SCRIPTPOS fallthrough;GOLABEL/GOSUBLABEL/TEXTPOS 官方无分支 → 对齐 no-op(DIV-RT-025) |
 | `DIALOG` | system | 17 | `other/dialog.html` | `0x43fc74` | ✅ 实现 | VM 状态机:任务挂起 + `Vm::answer_dialog`;LET=1 基按钮序号,LETSTR=输入文本(DIV-RT-044) |
 | `S_FLT` | vm | 17 | `variable/s_flt.html` | `0x4634d8` | ✅ no-op | 同 S_INT(DIV-RT-043) |
 | `EMOTE` | emote | 13 | — | `0x4405a4` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |

@@ -14,6 +14,7 @@ pub mod args;
 pub mod bench;
 pub mod build_info;
 pub mod case;
+pub mod clock;
 pub mod dev;
 pub mod logging;
 pub mod run;

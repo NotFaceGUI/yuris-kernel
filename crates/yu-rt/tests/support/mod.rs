@@ -50,6 +50,8 @@ pub struct GroupSpec {
     /// `(kind, flag, slot, length, payload)`。`length` 由 payload 长度自动算,
     /// 但**跳转窗口**要用 `jump_len` 显式给组号。
     pub windows: Vec<WindowSpec>,
+    /// 该组在 YSTB 行号区(part4)的源码行;0 = 不设行号(旧夹具默认)。
+    pub line: u32,
 }
 
 impl GroupSpec {
@@ -57,7 +59,14 @@ impl GroupSpec {
         Self {
             opcode,
             windows: Vec::new(),
+            line: 0,
         }
+    }
+
+    /// 设置该组的源码行(写入 YSTB part4;`TASKINFO LINE/LINE0` 的数据源)。
+    pub fn line(mut self, line: u32) -> Self {
+        self.line = line;
+        self
     }
 
     pub fn window(mut self, kind: u8, payload: Vec<u8>) -> Self {
@@ -68,6 +77,15 @@ impl GroupSpec {
     /// 跳转窗口:`length` = 目标组号(引擎语义,payload 通常为空)。
     pub fn jump(mut self, target_pc: u32) -> Self {
         self.windows.push((0, 0, 0, Some(target_pc), Vec::new()));
+        self
+    }
+
+    /// 值窗口:`length` 显式给数值、payload 为空。
+    ///
+    /// 编译器对 `RETURNCODE` 的写法:窗口 `id` = 文本行计数、
+    /// 窗口 `length` = voice 值(无载荷)。
+    pub fn window_value(mut self, kind: u8, value: u32) -> Self {
+        self.windows.push((kind, 0, 0, Some(value), Vec::new()));
         self
     }
 
@@ -500,7 +518,29 @@ pub fn default_commands() -> Vec<CommandSpec> {
         ("TASKEND", vec![("ID", 1, 0)]),
         (
             "TASKINFO",
-            vec![("ID", 1, 0), ("LET", 0, 0), ("EXIST", 0, 3)],
+            vec![
+                ("ID", 1, 0),
+                ("LET", 0, 0),
+                ("EXIST", 0, 3),
+                ("E", 0, 3),
+                ("A", 0, 3),
+                ("Z", 0, 3),
+                ("FILE", 0, 3),
+                ("FILENO", 0, 3),
+                ("LINE", 0, 3),
+                ("FILE0", 0, 3),
+                ("FILENO0", 0, 3),
+                ("LINE0", 0, 3),
+                ("TEXTLINE", 0, 3),
+                ("NEXTVOICE", 0, 3),
+                ("GOLABEL", 0, 3),
+                ("GOSUBLABEL", 0, 3),
+                ("IFNEST", 0, 3),
+                ("GOSUBNEST", 0, 3),
+                ("LOOPNEST", 0, 3),
+                ("SCRIPTPOS", 0, 3),
+                ("TEXTPOS", 0, 3),
+            ],
         ),
         ("TEXT", text_params()),
         ("TEXTINFO", vec![]),
@@ -1130,6 +1170,7 @@ pub fn build_ystb(groups: &[GroupSpec], key: [u8; 4]) -> Vec<u8> {
         part1.push(g.opcode);
         part1.push(g.windows.len() as u8);
         part1.extend_from_slice(&0u16.to_le_bytes());
+        part4.extend_from_slice(&g.line.to_le_bytes());
         for (kind, flag, slot, jump_len, payload) in &g.windows {
             window_bytes.push(*kind);
             window_bytes.push(*flag);
@@ -1146,8 +1187,8 @@ pub fn build_ystb(groups: &[GroupSpec], key: [u8; 4]) -> Vec<u8> {
             window_bytes.extend_from_slice(&off.to_le_bytes());
         }
     }
-    // part4 与 part1 等长(0.495 实测 137/137);内容置零。
-    part4.resize(part1.len(), 0);
+    // part4 与 part1 等长(0.495 实测 137/137),逐组源码行。
+    debug_assert_eq!(part4.len(), part1.len());
 
     let mut header = Vec::new();
     header.extend_from_slice(b"YSTB");

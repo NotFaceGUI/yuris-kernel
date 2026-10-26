@@ -19,7 +19,7 @@
 | DIV-RT-007 | 工程 ycd 声明但手册无页的系统变量 | open | `_WINDOW_EXEC_CAPTION` 已收口(DIV-RT-047);**`_CHR` 已收口(2026-10-25,fixed(no-manual))**:按语料用法+REA `0x446b93` 取值链实现为「单字节构造」——`$_CHR(n)` 返回字节 `n` 的 1 字节字符串(非码位再编码);证据:es_Text.yst:878 用 `$_CHR(0xEF)+$_CHR(0xF3)` 匹配文本流控制码 `C`,而编译器把 `
 ` 展开成 `$_TEXT(239)+$_TEXT(240)`(原始字节 0xEF 0xF0),按 Unicode 再编码恒不匹配(桌面会话实测 46,696 次挂号清零)。`_DXMODE`/`_VARTYPE`/`_SYSTEM_FRAME` 等仍 `Unimplemented` |
 | DIV-RT-008 | `_`(文本输出)手册无页 | fixed | 手册 basic.html ●テキスト表示有页(`_[式]`);已实现,撤销旧挂账 |
-| DIV-RT-009 | `_TIME`/`_OS_TIME` 的时区与纪元 | open | 注入时钟固定 UTC |
+| DIV-RT-009 | `_TIME`/`_OS_TIME` 的时区与纪元 | fixed/partial | 真实运行宿主注入本地时间基准(`_TIME` 全字段,存档现实日期);`_OS_TIME(0)` 与跨 DST 漂移仍 open |
 | DIV-RT-010 | 路径类系统变量(`_SAVE_PATH` 等) | fixed | `BootConfig::paths` + yu-cli `host_paths()` 注入;`$_PROJECT_PATH` 手册无页保持 `None` |
 | DIV-RT-051 | 字符串操作按 CP932 字符边界(非逐字节) | **fixed(2026-10-24)** | 根因:CP932 尾字节覆盖 `0x40..0xFC`,其中 `0x41..0x5A`/`0x61..0x7A` 与 ASCII 字母同码 ⇒ 逐字节 ASCII 化会改写双字节字符。实测 `VARACT[LOWER]("サークル")` = `83 54 81 5b 83 4e 83 8b` → `83 74 81 5b 83 6e 83 8b` = `フーハル`,厂商 LOGO `cg/ev/サークル.jpg` 因此查不到、片头黑屏。修法:新增 `crates/yu-rt/src/cp932_text.rs` 作唯一真源(`is_lead`/`char_len_at`/`spans`/`char_count`/`slice_chars`);`ascii_case`/`fullwidth_case`/`copy_chars`/`cut_chars`/`case_tables::char_len` 全部改走它。复核 `cargo test -p yu-rt --lib`(70 passed,含 4 个 cp932_text 单测) |
 | DIV-RT-053 | `VARINFO` 的针值槽 / `NO=` 槽 / 查询项按写死槽号分派 | **fixed(2026-10-25)** | 根因:`VARINFO` 的参数表随版本新增条目**整体位移** —— SDK 0.495 是 `INT=17/FLT=18/STR=19/NO=20`,商业包 v494 是 `INT=15/FLT=16/STR=17/NO=18`。旧实现把后者的三个数字写死在 `array_needle` 与 `flags_get(&flags, 20)` 里,查询项分派也是 `match slot { 2=>TYPE, 4=>DIMNUM, 5..=12=>DIMSIZE, 13=>LENGTH, 14=>SEARCH }`、筛选用 `!matches!(slot, 17..=20)` ⇒ 在 v494 上 `SEARCH` 取不到针值、恒返回 -1,`TYPE`/`DIMNUM`/`DIMSIZE` 也会落到错误分支:`es.LNO.GET("BGF")` 明明存在(`$3153[4]`)却判「未找到」,`es.SP.SET.SET`→`es.SP.GO.SET` 后续的 `LET @3394[...]=1` 从不执行,`es.SP.DRAW` 一次都不调用 ⇒ sprite 全不上屏。修法:新增 `varinfo_no_slot()`,`array_needle` 与全部分派改按**参数名**(`TYPE`/`DIMNUM`/`DIMSIZEn`/`LENGTH`/`SEARCH`,针值 `INT`/`FLT`/`STR`,起始 `NO`)从工程 ysc 反查槽号;`VARACT`/`TASK`/`TASKINFO` 的同类写死槽号一并改按名解析。证据:官方 v494 事件级 trace(分派点 `0x44cb`/`0x4537`,CG handler `0x42a4a8`),同帧 pc 序列与内核逐条对拍。复核 `fixture::varinfo_search_resolves_slots_by_param_name` 与 `fixture::varinfo_query_dispatch_follows_param_names`(把参数表整体前移,断言五个查询项仍正确)。台账细节见 `docs/divergences/DIV-GFX-046-sprite-bg-hold.md` §K |
@@ -30,7 +30,7 @@
 | DIV-RT-012 | `SAVE`/`LOAD` 的盘上存档格式 | fixed | `yu-format::yssd` 官方 5 文件 269 块逐字节 roundtrip;`yu-save` 宿主消费域事件(忠实写盘受 DIV-RT-042 门禁) |
 | DIV-RT-013 | `HANTOZEN`/`ZENTOHAN` 转换表 | fixed | 三张表已自 0.495 exe 取出落 `data/case-tables-0495.tsv`;算法逐条对照 REA |
 | DIV-RT-014 | `MATH[RND]` 的 MT19937 种子来源 | fixed | 种子 = `GetTickCount`(REA `0x461f98`),内核 `BootConfig::rng_seed` 注入(缺省 5489);`rng.rs` MT19937 |
-| DIV-RT-015 | `TASK` 的 TINT..10/TFLT..10/TSTR..10/SCRIPTPOS 参数 | open | TINT/TFLT/TSTR/SCRIPTPOS 已按官方源码生产者/消费者对实现(带回归);**RESTART 已收口(2026-10-25,fixed(no-manual))**:REA `0x450c46` 读槽 37 存在标志、`0x450c55 mov dword[0x801944],1` = 本 vsync 再跑一逻辑帧(内核 `Effect::RequestExtraFrame`);语料 `es_Text.yst:1545` 行末 `TASK[RESTART=1]`;手册无页。TEXTPOS/其余序号仍挂号 |
+| DIV-RT-015 | `TASK` 的局部参数 | **fixed(no-manual)** | TINT/TFLT/TSTR/SCRIPTPOS 已按官方源码生产者/消费者对实现(带回归);**RESTART 已收口(2026-10-25)**:REA `0x450c46` 读槽 37 存在标志、`0x450c55 mov dword[0x801944],1` = 本 vsync 再跑一逻辑帧(内核 `Effect::RequestExtraFrame`);**TEXTPOS 已对齐(2026-10-26)**:0.495 TASK 处理体 `0x4506f4` 无槽 36 分支 ⇒ 官方忽略(no-op,代码不再报 Unimplemented);**A 已实现(2026-10-26)**:调度器 `0x4043dc..0x4043e6` 以 `A & E` 为步进闸门、`TASK` `0x450bbf` 写 `task+0x15`、构造器默认 1、`TASKINFO[A]` `0x4527b0` 读;手册无页 |
 | DIV-RT-016 | 商业发行版不带 `YSCom.ycd` | fixed | 改 ycd 可选 + 引擎 ABI 表 + ysv 自证校验 |
 | DIV-RT-017 | 变量空间前缀 `0x60` / `0x23` | fixed | = ERIS 旧式 `@G/@L`(0x60 数值)、`$G/$L`(0x23 字符串);源码↔编译产物↔YSVR 声明三方对上,`canonical_var` 归一化;其它前缀仍挂号 |
 | DIV-RT-018 | `ELSE` 的 0 窗口形态 | fixed | 商业包 726 次;无条件进 else 体 |
@@ -40,7 +40,7 @@
 | DIV-RT-022 | 系统变量的宿主注入面(色深/路径/DX/媒体只读/声音) | fixed | `BootConfig` 注入 |
 | DIV-RT-023 | `SYSTEMINFO` 手册无页但启动链硬依赖 | fixed | 四槽全实现 + 引擎处理体 `0x450478` 反汇编证据;手册缺页为不可修的外部事实,保留在条目内 |
 | DIV-RT-024 | `VARACT[INIT + G_*]` 手册无页 | fixed | 按引擎 §3.26 ④ 完整算法实现(掩码 `0x454d3d` + 恢复体 `0x455b60`);手册缺页为不可修的外部事实,保留在条目内 |
-| DIV-RT-025 | `TASKINFO` 的数值字段(LINE/FILE/嵌套数) | fixed | 用任务记录 + 数据区 B 行号 |
+| DIV-RT-025 | `TASKINFO` 的数值/位置字段 | fixed(no-manual) | 2026-10-26:FILE0/FILENO0/LINE0/TEXTLINE/NEXTVOICE 按 0.495 `0x4523fc` 逐分支实现;A 槽(4)按 `task+0x15`/`A&E` 闸门实现;FILE 返回 `yst_list` 路径;GOLABEL/GOSUBLABEL/TEXTPOS 官方无分支(对齐 no-op);FILENO0→SCRIPTPOS fallthrough、完整 u16 文本行、类型诊断去重、SCRIPTPOS 引擎字节格式(`0x452a54`/`0x450fe0`,IF/GOSUB/LOOP 三栈 + text_line/pc/脚本名)均已收口 |
 | DIV-RT-026 | `yst_list` 每脚本的文本数 | fixed | 记录第 3 个 u32 |
 | DIV-RT-027 | `ELSE` 判定顺序 / IF 先压帧 | fixed | 引擎 §3.13 顺序 |
 | DIV-RT-028 | 文本流三件套(WORD/`_`/RETURNCODE) | fixed | YSCom 合成;源码↔编译产物↔手册+RxYuris 三方证 |
@@ -288,10 +288,25 @@
 
 - **现象**:手册给出 `@_TIME(0,k)` 当前日期/`(1,k)` 启动时刻(k=年/月/日/
   星期/时/分/秒/毫秒)与 `@_OS_TIME(0/1)`。引擎读系统本地时间。
-- **处置**:全部使用**注入时钟**(`BootConfig::start_ms` + 每逻辑帧步进),
+- **旧处置**:全部使用**注入时钟**(`BootConfig::start_ms` + 每逻辑帧步进),
   固定 UTC 纪元 1970-01-01,星期 0=日..6=土;**不读墙钟**(A3)。
   `_OS_TIME(0)`(OS uptime)需要宿主注入 ⇒ `Unimplemented`。
-- **后果**:跨时区/夏令时的逐位一致性未对齐;golden 用同一注入时钟即可复现。
+- **2026-10-26 收口(存档时间错位)**:ERIS `es_SaveLoad.yst:194-200` 在存档
+  时用 `@_TIME(0,0..6)` 写「現実の日付」进存档块,桌面实测落盘时间显示为
+  1970-01-01(注入纪元),根因即本条。
+  - 新增 `BootConfig::local_time: Option<HostLocalTime>`(年月日时分秒毫秒
+    = 宿主启动时的**系统本地时间**);`@_TIME(1,*)` 返回该基准,
+    `@_TIME(0,*)` 在基准上叠加逻辑流逝(`now_ms - start_ms`),跨日/月/年
+    自然进位。内核仍不直接读墙钟(A3)。
+  - `yu-cli` 在**真实运行宿主**(`run` / `serve` / desktop)启动时用
+    `time::OffsetDateTime::now_local()` 读一次并注入;用例/trace/golden
+    保持 `None`,继续走 1970 确定性纪元。
+  - 复核:`cargo test -p yu-rt --lib`(73 passed,含跨午夜进位/公历往返);
+    `cargo test -p yu-rt --test fixture time_sysvar_uses_injected_local_clock`
+    (1 passed)。
+- **残留**:`_OS_TIME(0)`(OS uptime)仍未注入 ⇒ `Unimplemented`;`_TIME(0,*)`
+  用逻辑流逝近似墙钟,长会话跨 DST 切换时不会自动改偏移(存档时间戳场景
+  偏差可忽略)。golden 用同一注入时钟即可复现。
 
 ---
 
@@ -386,19 +401,35 @@
 ## DIV-RT-015 · TASK 的局部参数
 
 手册 `control/task.html` 列出 `TINT..TSTR`、`SCRIPTPOS`、`TEXTPOS`、
-`RESTART`。本实现:`ID`/`E`/`Z`/`#`(生成与启停),其余参数运行到即
-`Unimplemented`(任务局部寄存器已建模但未接参数传递;`SCRIPTPOS` 属存档锚点,
-待 `yu-save`)。
+`RESTART`。本实现:`ID`/`E`/`Z`/`#`(生成与启停);其余参数见下。
 - **2026-10-23 更新**:`TINT..10`/`TFLT..10`/`TSTR..10` 已按官方源码
   生产者/消费者对接线(`es_ERIS.yst:524` `TASK[…TINT=@_PINT(1)]` →
   `:533` 任务体 `@_TINT(1)`;引擎槽位 `+0x3d0/+0x3d4`=TINT、
   `+0x348/+0x34c`=TFLT、`+0x458`=TSTR;未传槽为 0,不继承调用者);
-  `SCRIPTPOS` 按 `TASKINFO[SCRIPTPOS]` 产 `[script_id u32][pc u32]` blob、
-  `TASK[SCRIPTPOS=…]` 对既有任务做位置ロード(手册例 4)往返实现。
+  `SCRIPTPOS` 已按 0.495 `0x452a54` 序列化 / `0x450fe0` 装载的**完整执行位**
+  实现(魔数 `01..08`、IF/GOSUB/LOOP 三栈、`text_line`、`pc`、脚本名),
+  `TASK[SCRIPTPOS=…]` 对既有/新建任务做位置ロード(手册例 4)。
   **复核**:`fixture::task_without_tint_does_not_inherit_caller_registers`
   (2026-10-23 本机实测 ok)。
-  **仍挂号**:`TEXTPOS`/`RESTART`/手册未列的其余参数序号(`handlers.rs`
-  TASK 参数分支统一 `Unimplemented`)⇒ 保持 open。
+- **2026-10-26 收口**:`RESTART`(槽 37)已按 `0x450c46/0x450c55` 实现
+  (`fixed(no-manual)`,2026-10-25);`TEXTPOS`(槽 36)在 0.495 TASK 处理体
+  `0x4506f4` 的参数链里**没有分支**——只检查 `0x684160/161/162/163/182/
+  183/185`(ID/E/A/Z/#/SCRIPTPOS/RESTART),无 `0x684184` ⇒ 官方忽略
+  `TEXTPOS`。内核按同型对齐(不写任务字段、不报 Unimplemented)。
+  TASK 的参数面(含 `TINT..10/TFLT..10/TSTR..10`、`SCRIPTPOS`、`RESTART`)
+  至此全部有官方依据;手册无页项按 `fixed(no-manual)` 归档。
+  `TASKINFO` 的 9..13 槽另见 DIV-RT-025(2026-10-26 更新)。
+- **2026-10-26 A 槽**:`A`(槽 2)手册无页;`TASK` 处理体
+  `0x450bbf..0x450bd1` 按参数写 `task+0x15`,构造器
+  `0x465630/0x465633` 默认 E=A=1;调度器 `0x4043dc..0x4043e6`
+  (`movsx E; movsx A; test A, E`)以 `A & E != 0` 为步进闸门。
+  `TASKINFO[A]`(`0x4527b0`)原样读回。内核新增 `TaskSeed/TaskNode/TaskView`
+  的 `active`、`TASK` 的 A 参数与 `Effect::SetActive`;`TASK[E/A]` 改为
+  只在参数**存在**时写(修掉旧实现 `TASK[ID=X Z=…]` 无条件
+  `SetEnabled(true)` 把已禁用任务重新打开的 bug)。
+  回归:`fixture::taskinfo_a_reads_default_and_task_a_toggles_it`、
+  `task_e_a_changes_are_visible_to_taskinfo_in_same_pump`、
+  `task_textpos_is_aligned_noop`。
 
 ---
 
@@ -565,14 +596,58 @@
   跑通、census 无回退 ⇒ 状态改 `fixed`;「手册缺页」作为不可修的外部
   事实保留在本条目内备查。
 
-## DIV-RT-025 · `TASKINFO` 数值字段
+## DIV-RT-025 · `TASKINFO` 的数值/位置字段
 
 - **手册** `control/taskinfo.html`:EXIST/E/Z/FILE/LINE/IFNEST/GOSUBNEST/
-  LOOPNEST/SCRIPTPOS。
-- **取值来源(引擎任务记录,旁线 §3.2)**:`+0x20` pc、`+0x3c` 脚本号,
-  加上本内核建模的三种栈深度;**LINE 用编译产物里的「数据区 B 逐 pc 源码位置」**
-  (`ScriptFile::source_position`,0.495 实测 `part4_len == part1_len == 组数×4`)。
-- **未实现**:`SCRIPTPOS`(存档锚点串,归 `yu-save`)、`TEXTPOS`。
+  LOOPNEST/SCRIPTPOS。0.495 页**不含** `FILE0/FILENO0/LINE0/TEXTLINE/
+  NEXTVOICE`(无页,按引擎证据实现)。
+- **0.495 处理体 `0x4523fc` 逐槽**(REA,2026-10-26):
+  - 分派顺序固定:`EXIST/E/A/Z/FILE/FILE0/LINE/LINE0/TEXTLINE/NEXTVOICE/
+    IFNEST/GOSUBNEST/LOOPNEST/FILENO/FILENO0/SCRIPTPOS`;存在性判定**不看值**
+    (`FILE0=0` 也算请求)。
+  - `FILE` = `0x801850[task+0x3c]` 名字表字符串(`0x43f0d8` 要求 LET 为 STR),
+    不是脚本号数字;`FILENO` = `task+0x3c`。
+  - `LINE` = `task+0x38[task+0x20]`(数据区 B 逐 pc 源码行);
+    `LINE0` = `frame[0]+0xc`(第一层 GOSUB 的调用点行),无 GOSUB 时回退 `LINE`。
+  - `FILE0`/`FILENO0` 同上取 `frame[0]+8`(调用方脚本号 → 名字表)。
+    `task+0x144` 是 GOSUB 帧数组,`[0]` = 第一层调用的返回位
+    (`0x4459c4` 写入 `frame+4`=返回 pc、`+8`=调用方脚本、`+0xc`=调用点行)。
+  - `TEXTLINE`/`NEXTVOICE` = `task+0xc/+0x10`;由 `RETURNCODE`(`0x44c390`)
+    从当前指令首窗口记录抄入(首 dword = `id|type<<16`,次 dword = `length`)。
+    语料 `ystdlib.yst` 的 RETURNCODE 窗口 = `{id=1..N, type=0, length=0}`,
+    因此 `TEXTLINE` = 文本行计数、`NEXTVOICE` = 0(ERIS 语料无 voice);
+    引擎原样读,内核同型保存。
+  - `GOLABEL`/`GOSUBLABEL`/`TEXTPOS` 在 0.495 处理体**无分支** ⇒ 默认
+    `return 0` 且不写 LET(本实现对齐,不挂号)。
+  - `A` 槽(4)读 `task+0x15`;值来源与 `TASK[A]` 见 DIV-RT-015(同一条
+    `A & E` 调度闸门)。
+  - ID 未命中:`0x452918` 按 LET 目标类型写 0 / 0.0 / ""。
+- **本实现(2026-10-26 复核修复)**:以上全部落地;另修:
+  - `FILENO0` 与 `SCRIPTPOS` 同时请求时的引擎 fallthrough
+    (`0x4525fa/0x4528fa` → `0x452628`):先写 FILENO0,再写 SCRIPTPOS
+    (旧实现只取第一个查询,漏第二次写入);
+  - `SCRIPTPOS` 从内核 8 字节 blob 换成引擎线格式
+    (`0x452a54`/`0x450fe0`):magic `01..08`、IF 18 字符/帧、
+    GOSUB 20 字符/项(返回脚本号线上 4 字节:引擎把运行期 u16 零扩展写出,
+    装载只取低 16 位)、LOOP 34 字符/项、`text_line`/`pc`/脚本名;
+    线格式已跨五版核对(2026-10-26 勘误):0.292/0.466/0.479/0.495/v494
+    的序列化器与装载器推进量均为 18/20/34 字符,各版只有任务结构体内偏移
+    不同、线上字节一致;`TASKINFO` 产引擎串,`TASK` 完整恢复三栈与位置
+    (见 `crate::scriptpos`);
+  - `ReturnCode.line` 改用完整 u16 窗口 id(`kind|flag<<8`),不再被
+    u8 `kind` 截断(单脚本文本行 >255);
+  - `TASK` 重配置继承 `task+0xc/+0x10`(引擎 TASK 处理体不清这两个字段);
+  - LET 类型不符诊断按 `query+目标类型` 去重(引擎每次打印,内核只留一条,
+    避免热循环刷屏);消息补上 query 名;
+  - ID 未命中 + LET 目标未声明时保留 `write_target` 的 Fatal,不再静默。
+  回归:`fixture::taskinfo_text_line_and_next_voice_*`、`taskinfo_file0_*`、
+  `taskinfo_query_presence_*`、`taskinfo_missing_id_*`、
+  `taskinfo_a_reads_default_and_task_a_toggles_it`、
+  `taskinfo_fileno0_falls_through_to_scrip_pos`、
+  `returncode_line_keeps_full_u16_id`、
+  `task_reconfiguration_preserves_text_line_and_voice`、
+  `taskinfo_type_mismatch_reports_once`、
+  `taskinfo_missing_id_with_undeclared_target_is_reported`。
 
 ## DIV-RT-026 · `yst_list` 的逐脚本正文数
 

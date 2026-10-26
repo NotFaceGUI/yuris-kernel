@@ -29,7 +29,8 @@ fn main() {
             continue;
         };
         for (i, p) in params.iter().enumerate() {
-            println!("  {i:3}  {}", p.name);
+            let kind = vm.tables().boot.yscm.commands.iter().find(|c| c.name == cmd).and_then(|c| c.params.get(i)).map(|q| q.kind);
+            println!("  {i:3}  {} kind={kind:?}", p.name);
         }
     }
 }

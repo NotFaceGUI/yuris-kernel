@@ -57,7 +57,11 @@ pub struct TaskView {
     pub id: TaskId,
     pub script_id: u32,
     pub pc: u32,
+    /// 引擎 `task+0x14`(`E`):调度闸门的第一个字节。
     pub enabled: bool,
+    /// 引擎 `task+0x15`(`A`):调度闸门的第二个字节;调度器按
+    /// `A & E != 0` 步进(REA `0x4043dc..0x4043e6`)。`TASKINFO[A]` 读它。
+    pub active: bool,
     pub priority: i64,
     pub finished: bool,
     pub main: bool,
@@ -87,6 +91,8 @@ pub enum Effect {
     SpawnTask(TaskSeed),
     /// `TASK[E=0/1]`:只改启用位。
     SetEnabled(TaskId, bool),
+    /// `TASK[A=0/1]`:只改 A 字节(引擎 `task+0x15`;与 `E` 按位与后决定步进)。
+    SetActive(TaskId, bool),
     /// `TASKEND[ID]`:按 ID 结束。目标不是当前任务时由调度器立即摘链
     /// (`0x452364` 链表摘除)并回调执行器丢弃执行位。
     FinishTask(TaskId),
@@ -101,8 +107,16 @@ pub struct TaskSeed {
     pub script_id: u32,
     /// 入口组号。
     pub pc: u32,
-    /// `E` 槽:0 = 不参与调度(默认 1)。
+    /// `E` 槽:0 = 不参与调度(默认 1;引擎 `task+0x14`)。
     pub enabled: bool,
+    /// `A` 槽:0 = 不参与调度(默认 1;引擎 `task+0x15`)。
+    ///
+    /// 手册 `control/task.html` **无 A 页**;语义来自引擎调度器
+    /// (0.495 `0x4043dc..0x4043e6`、v494 `0x4043cc..` 同型):
+    /// `movsx E; movsx A; test A, E; je 跳过` —— 两个字节按位与非零才步进。
+    /// `TASK` 处理体 `0x450bbf..0x450bd1` 按参数写 `task+0x15`;
+    /// 构造器 `0x465630/0x465633` 默认 E=A=1。
+    pub active: bool,
     /// 优先级 `Z`(手册:省略 = 1;仅生成时有效)。
     pub priority: i64,
     /// 是否主线(启动链建的系统任务,不是 `TASK` 产物)。
@@ -116,6 +130,9 @@ impl TaskSeed {
             script_id,
             pc,
             enabled: true,
+            // 引擎任务构造器 `0x465630/0x465633` 对新建任务同时写 E=A=1;
+            // `TASK` 处理体只在参数存在时覆盖(`0x450bb1/0x450bbf`)。
+            active: true,
             // 手册 `basic/task.html`:「起動時に自動的に生成されるシステムタスクは
             // デフォルトで「100」」;REA `FUN_004621d0` @0x4623f4 以 `+0x28 = 0x64`
             // 插入 SYSTEM 任务,实证同一结论。
@@ -147,8 +164,10 @@ pub struct TaskNode {
     pub wait_frames: u32,
     /// `+0x1c`:TIME 型绝对期限(毫秒,注入时钟;回绕语义同 u32)。
     pub deadline_ms: Option<u32>,
-    /// `+0x15 & +0x5`:启用位。
+    /// `+0x14`(`E`):调度闸门第一个字节。
     pub enabled: bool,
+    /// `+0x15`(`A`):调度闸门第二个字节;调度器按 `A & E != 0` 步进。
+    pub active: bool,
     /// `Z`:优先级(手册:省略 = 1)。
     pub priority: i64,
     /// 任务体已走完 / 已被 `TASKEND` 摘链(EXIST 立即为 0)。
@@ -174,6 +193,7 @@ impl TaskNode {
             wait_frames: 0,
             deadline_ms: None,
             enabled: seed.enabled,
+            active: seed.active,
             priority: seed.priority,
             finished: false,
             text_rest: false,
@@ -193,6 +213,7 @@ impl TaskNode {
         self.wait_frames = 0;
         self.deadline_ms = None;
         self.enabled = seed.enabled;
+        self.active = seed.active;
         self.priority = seed.priority;
         self.finished = false;
         self.text_rest = false;
@@ -418,7 +439,7 @@ impl Scheduler {
             };
             nodes[i].last_frame = stamp;
             visited += 1;
-            if !nodes[i].enabled || nodes[i].finished {
+            if !nodes[i].enabled || !nodes[i].active || nodes[i].finished {
                 continue;
             }
             // 文本等待(引擎 `task+9`,`FUN_004046fc` `0x4046fc..0x404835`):
@@ -500,6 +521,7 @@ fn view_of(nodes: &[TaskNode], pending: &[TaskNode]) -> Vec<TaskView> {
             script_id: n.script_id,
             pc: n.pc,
             enabled: n.enabled,
+            active: n.active,
             priority: n.priority,
             finished: n.finished,
             main: n.main,
@@ -555,9 +577,24 @@ fn pump_node(
                     chain_changed = true;
                 }
                 Effect::SetEnabled(id, on) => {
+                    // 同一次泵里刚 `TASK` 生成的任务还在 `pending`;引擎的任务
+                    // 链表已包含它,所以 E 变更必须同时作用于 pending。
                     if let Some(n) = nodes.iter_mut().find(|n| n.id == id) {
                         n.enabled = on;
+                    } else if let Some(n) = ctx.pending.iter_mut().find(|n| n.id == id) {
+                        n.enabled = on;
                     }
+                    // `TASKINFO[E]` 读的是 task_view 投影;E 变化后必须同步,
+                    // 否则同一次泵里后续 TASKINFO 看到旧值。
+                    chain_changed = true;
+                }
+                Effect::SetActive(id, on) => {
+                    if let Some(n) = nodes.iter_mut().find(|n| n.id == id) {
+                        n.active = on;
+                    } else if let Some(n) = ctx.pending.iter_mut().find(|n| n.id == id) {
+                        n.active = on;
+                    }
+                    chain_changed = true;
                 }
                 Effect::FinishTask(id) => {
                     // 引擎 `TASKEND` 处理体对非自身目标:查找 → `0x452364` 摘链
@@ -712,6 +749,7 @@ mod tests {
             script_id: 0,
             pc: 0,
             enabled: true,
+            active: true,
             priority: 1,
             main: false,
         }

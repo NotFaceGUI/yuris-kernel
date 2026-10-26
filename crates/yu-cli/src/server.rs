@@ -163,6 +163,8 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         // 长跑宿主:首帧前预热字体表,避免第一次文本场景的 ~130ms 停顿。
         warm_text: true,
         force_font: opts.force_font.clone(),
+        // 真实运行:`@_TIME` 注入系统本地时间(存档菜单的现实日期)。
+        local_time: crate::clock::local_now(),
         ..EngineOptions::default()
     };
     let mut engine = Engine::new(project, engine_opts)?;

@@ -90,6 +90,9 @@ pub struct EngineOptions {
     pub entry: String,
     pub record_events: bool,
     pub fps: u32,
+    /// `@_TIME` 的宿主本地时间基准(真实运行宿主启动时读一次;
+    /// `None` = 确定性 1970 注入时钟,用例/trace/golden 用)。
+    pub local_time: Option<yu_rt::HostLocalTime>,
     pub debug_mode: bool,
     pub screen_color: u32,
     pub dx_mode: u32,
@@ -125,6 +128,7 @@ impl Default for EngineOptions {
             entry: "SYSTEM_START".to_string(),
             record_events: false,
             fps: 60,
+            local_time: None,
             debug_mode: false,
             screen_color: 32,
             dx_mode: 0,
@@ -1433,6 +1437,8 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     let boot = BootConfig {
         entry_label: opts.entry.clone(),
         fps: opts.fps,
+        // `@_TIME` 本地时间基准(真实运行宿主注入;用例/trace 保持 None)。
+        local_time: opts.local_time,
         record_events: opts.record_events,
         debug_mode: opts.debug_mode,
         screen_color: opts.screen_color,

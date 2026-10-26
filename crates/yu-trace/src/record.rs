@@ -656,6 +656,8 @@ impl BootSummary {
             entry_label: self.entry.clone(),
             fps: self.fps,
             start_ms: self.start_ms,
+            // trace 回放保持确定性注入时钟;`@_TIME` 不引入墙钟(DIV-RT-009)。
+            local_time: None,
             frame_ms: self.frame_ms,
             script_key: self.script_key,
             debug_mode: self.debug_mode,
