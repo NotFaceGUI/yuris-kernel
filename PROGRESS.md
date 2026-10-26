@@ -7759,3 +7759,53 @@ cargo check -p yu-host-desktop -p yu-cli   Finished(无 warning)
 ```
 
 行为验收由主人跑 `--debug-ui` 目视(按约定不新增测试)。
+
+## 成果 FONT-SPIKE (2026-10-26) · 文字/CG 逐帧渲染尖峰收口(字形→合成→读回→呈现全链路)
+
+症状:对话每推进一句/逐字吐字时卡顿,CG 页 render 曲线黄红段(9700X+5070 实机)。
+定位(探针脚本 + `YU_RENDER_TIMING`/`YU_FONT_TRACE`/`raster_bench` 分段计时):
+
+| # | 根因 | 证据 |
+|---|---|---|
+| 1 | fontdb(只开 `fs` 无 `memmap`)的 `Source::File` 在**每次** `with_face_data` 时 `std::fs::read` 整个字体文件(msgothic.ttc ≈5MB):字形缓存 miss、甚至每次 ascent/advance 查询都整读一次盘 | `raster_bench`:1518µs/字形,与字号无关(24px=96px);closure 内部仅 20-120µs |
+| 2 | 文本修订变化即**整页重烤**:基图整图 clone + 全部绘制项从头重画,吐字一字烤一遍,O(页长)/字 | `YU_RENDER_TIMING` text 阶段随页长增长 |
+| 3 | 合成缓存「256 条超限整体清空」:角色加载演示一屏 480-779 个文本精灵层 ⇒ 缓存永远全 miss,单帧 200-720ms 反复出现 | 帧 1076 text=719ms layers=678 draws=360 |
+| 4 | (架构)每帧 `poll(wait_indefinitely)` 同步读回整帧 + 宿主把读回像素再整帧上传呈现:CPU/GPU 流水线被拍死,一帧两次整帧拷贝 | `readback.rs`/宿主 `Presenter::upload` |
+
+修复(全部语义保守,软/硬两端像素一致):
+
+- `FontSource` 按路径缓存字体字节(`Arc<Vec<u8>>`,每文件只读一次盘;`source.rs`)。
+- **增量烘焙**(`compose_layer_cached`):缓存条目记录已烘焙的 `TextDrawKey` 前缀,
+  新绘制集合严格前缀追加时**只画尾部**(官方 `CGACT[TEXT]` 命令时刻写层表面语义,
+  DIV-GFX-058;与整体重烤逐位等价)。前缀比对走新增的 `TextDrawKey::matches_draw`(免分配)。
+- 合成缓存改**字节预算 LRU**(256MB / 8192 条,逐条淘汰),不再整体清空。
+- 命中路径零成本:基图惰性解析(不克隆)、内容指纹烘焙时算一次存条目
+  (`ComposedLayer::hash`);指纹单点实现在 soft `content_hash_rgba`,wgpu `hash_rgba` 委托。
+- **异步读回**(`ReadbackCache::read`):本帧只提交拷贝,取回上一帧结果;
+  「滞后一帧」与 `COPY :/W0/` 的上一帧后缓冲语义完全一致。`read_now` 保留精确读
+  (`--shot`/对账)。桌面宿主改走 `render_frame_streaming`。
+- **GPU 直呈现**:引擎暴露 `screen_texture`/`screen_handle`,宿主按 `(代际,宽,高)`
+  缓存视图/bind group 直采引擎屏幕纹理,免「读回→重上传」两次整帧拷贝;
+  `refresh_screen_surface` 保 `--shot` 末帧精确。
+- 每层 resolve_style memo(fontdb 查询逐字形 → 一次);诊断设施:
+  `YU_RENDER_TIMING`(plan 分段 + 合成路径计数)、`YU_FONT_TRACE`(栅格化分段),
+  均为 env 门控 `log::trace`;新增 `yu-font/examples/raster_bench.rs`。
+
+### 验证(原始结果)
+
+```text
+raster_bench(msgothic 首渲染)   1518µs/字 → 139µs/字(sy=24);命中 0.5µs/字
+角色加载场景 text 阶段 >5ms     19/2400 帧(最大 719.1ms)→ 0/2400 帧(最大 3.4ms)
+菜单页 f401 text 阶段            235.6ms → 3.4ms
+2400 帧全场景 render_ms          p50 3.32 / p95 15.97 / max 27.3
+对话吐字段(probe1)              render p95 1.85ms / max 9.9ms(修前 20-33ms 常驻)
+cargo test --workspace          44 套件全绿;仅预存 yu-rt consistency 4 红(干净树同红)
+logging_guards                  3 绿(插桩已改走 log::trace)
+case until-visible actual       4699e746… 与改动前逐位一致 ⇒ 软渲染像素未变
+```
+
+### 残留(在册)
+
+- 新 CG 首次显示的同步解码 20-27ms 单帧黄闪(每张一次;`image` crate 解码,
+  与原版引擎 CG 加载同量级);后台预解码待立项。
+- 9 条 case golden 过期为改动前既有(actual 与干净树一致),`--update` 重生成由主人定。
