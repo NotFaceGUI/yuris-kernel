@@ -4053,6 +4053,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "image",
+ "log",
  "pollster",
  "sha2",
  "wgpu",
@@ -4109,6 +4110,7 @@ version = "0.1.0"
 dependencies = [
  "encoding_rs",
  "fontdb",
+ "log",
  "png 0.17.16",
  "swash",
  "yu-format",

@@ -79,5 +79,8 @@ pub use render::{
     frame_has_drawable_output, ImageCacheKey, ImageOpSig, ImageSource, RenderOutput, RenderReport,
     SizeKey, SizeSource, SkippedOp, SoftRenderer, Surface,
 };
-pub use text::{layer_base, text_base_key, texture_content_hash, TextComposer, TextPaintStats};
+pub use text::{
+    content_hash_rgba, layer_base, layer_base_dims, text_base_key, texture_content_hash,
+    ComposedLayer, TextComposer, TextPaintStats,
+};
 pub use texture::{AssetIssue, Texture, TextureStore};

@@ -344,15 +344,33 @@ impl Renderer {
         }
     }
 
-    fn render(&mut self, frame: &CompositorFrame) -> Result<(Arc<Surface>, RenderReport), Failure> {
+    fn render(
+        &mut self,
+        frame: &CompositorFrame,
+    ) -> Result<(Arc<Surface>, RenderReport, Option<(u64, u32, u32)>), Failure> {
         match self {
             Renderer::Soft(renderer) => {
                 let out = renderer.render_frame(frame);
-                Ok((out.surface, out.report))
+                Ok((out.surface, out.report, None))
             }
             Renderer::Wgpu {
                 renderer, check, ..
             } => {
+                if check.is_none() {
+                    // 流式呈现(桌面宿主常驻路径):读回异步一帧滞后,不再
+                    // 每帧同步等 GPU;屏幕纹理经 `Engine::screen_texture`
+                    // 由宿主直接采样(省掉读回 CPU → 再整帧上传的两次拷贝)。
+                    let streaming = renderer
+                        .render_frame_streaming(frame)
+                        .map_err(|d| Failure::runtime(format!("wgpu 渲染失败: {d}")))?;
+                    let screen = Some((
+                        streaming.screen_id,
+                        streaming.screen_width,
+                        streaming.screen_height,
+                    ));
+                    return Ok((streaming.surface, streaming.report, screen));
+                }
+                // 首帧(或对账帧):走精确路径,先与软后端对账。
                 let out = renderer
                     .render_frame(frame)
                     .map_err(|d| Failure::runtime(format!("wgpu 渲染失败: {d}")))?;
@@ -361,7 +379,7 @@ impl Renderer {
                     compare_reports(&soft_out.report, &out.report)?;
                     *check = None;
                 }
-                Ok((out.surface, out.report))
+                Ok((out.surface, out.report, None))
             }
         }
     }
@@ -410,6 +428,9 @@ pub struct Engine {
     cursor: (i64, i64),
     last_frame: Option<CompositorFrame>,
     last_surface: Option<Arc<Surface>>,
+    /// 流式呈现的屏幕纹理身份(`(代际, 宽, 高)`;软后端/未渲染过 = None)。
+    /// 宿主据此直接采样引擎屏幕纹理呈现,不再走「读回 → 重上传」。
+    last_screen: Option<(u64, u32, u32)>,
     last_report: FrameReport,
     last_render: Option<RenderReport>,
     tick_history: VecDeque<f64>,
@@ -515,6 +536,7 @@ impl Engine {
             cursor: (0, 0),
             last_frame: None,
             last_surface: None,
+            last_screen: None,
             last_report: FrameReport::empty(0),
             last_render: None,
             tick_history: VecDeque::with_capacity(120),
@@ -769,7 +791,8 @@ impl Engine {
         let drawable = frame_has_drawable_output(&frame);
 
         let render_started = Instant::now();
-        let (surface, report) = self.renderer.render(&frame)?;
+        let (surface, report, screen) = self.renderer.render(&frame)?;
+        self.last_screen = screen;
         let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
 
         let out = FrameReport {
@@ -1256,6 +1279,45 @@ impl Engine {
         std::fs::write(path, &bytes)
             .map_err(|e| Failure::runtime(format!("写 {} 失败: {e}", path.display())))?;
         Ok(bytes.len())
+    }
+
+    /// 流式呈现的屏幕纹理身份:`(代际 id, 宽, 高)`。
+    ///
+    /// 宿主以该三元组为键缓存视图/bind group,直采引擎屏幕纹理呈现;
+    /// 软后端或尚未渲染过 = `None`(宿主退回 `last_surface` 上传)。
+    pub fn screen_handle(&self) -> Option<(u64, u32, u32)> {
+        self.last_screen
+    }
+
+    /// 当前屏幕纹理本体(流式呈现直采用)。
+    ///
+    /// 队列提交顺序保证「上一提交的采样 < 下一提交的写入」,跨提交
+    /// 采样安全。
+    pub fn screen_texture(&self) -> Option<(u64, u32, u32, &wgpu::Texture)> {
+        match &self.renderer {
+            Renderer::Wgpu { renderer, .. } => {
+                let (id, w, h, texture) = renderer.screen_target()?;
+                Some((id, w, h, texture))
+            }
+            Renderer::Soft(_) => None,
+        }
+    }
+
+    /// 同步读回当前屏幕纹理到 `last_surface`(流式模式下 `last_surface`
+    /// 是上一帧后缓冲;`--shot` 前先刷新,保证末帧精确)。
+    pub fn refresh_screen_surface(&mut self) -> CliResult<()> {
+        let fresh = match &mut self.renderer {
+            Renderer::Wgpu { renderer, .. } => Some(
+                renderer
+                    .read_screen_now()
+                    .map_err(|d| Failure::runtime(format!("读回屏幕失败: {d}")))?,
+            ),
+            Renderer::Soft(_) => None,
+        };
+        if let Some(surface) = fresh {
+            self.last_surface = Some(Arc::new(surface));
+        }
+        Ok(())
     }
 }
 

@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 use yu_log::{Boundary, Diag};
 
 use crate::code;
@@ -122,6 +123,13 @@ pub struct FontSource {
     faces: Vec<FaceRecord>,
     by_db: HashMap<fontdb::ID, FaceId>,
     origin: FaceOrigin,
+    /// 文件面字节缓存:`路径 → 字节`。fontdb(只开 `fs`、无 `memmap`)的
+    /// `Source::File` 分支在每次 `with_face_data` 时 `std::fs::read` **整个
+    /// 字体文件**(日文系统字体 TTC 可达 20MB+),导致每个字形缓存 miss、
+    /// 甚至每次 ascent/advance 查询都是一次整文件读(实测单次 ~1.5ms,
+    /// 一句话一帧 ~50ms 尖峰)。按需读入一次后常驻共享;只缓存实际用到的
+    /// 文件,不做全库预热。
+    data_cache: Mutex<HashMap<PathBuf, Arc<Vec<u8>>>>,
 }
 
 impl std::fmt::Debug for FontSource {
@@ -181,6 +189,7 @@ impl FontSource {
             faces,
             by_db,
             origin,
+            data_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -235,6 +244,7 @@ impl FontSource {
             faces,
             by_db,
             origin: FaceOrigin::System,
+            data_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -515,12 +525,41 @@ impl FontSource {
     }
 
     /// Run `f` with the raw bytes and TTC face index of `face`.
+    ///
+    /// 文件面走 [`Self::data_cache`]:fontdb 的 `Source::File` 分支每次调用
+    /// 都从磁盘整读字体文件,这里改为每路径一次。`from_bytes` 面没有路径,
+    /// fontdb 的 `Source::Binary` 分支本来就是零拷贝,原样委托。
     pub fn with_face_data<T>(
         &self,
         face: FaceId,
         f: impl FnOnce(&[u8], u32) -> T,
     ) -> Result<T, Diag> {
         let r = self.record(face)?;
+        if let Some(path) = &r.source_path {
+            let cached = self
+                .data_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(path)
+                .cloned();
+            let bytes = match cached {
+                Some(bytes) => bytes,
+                None => {
+                    let bytes = Arc::new(std::fs::read(path).map_err(|e| {
+                        Diag::fatal(code::font::IO, Boundary::Platform).with_detail(format!(
+                            "cannot read font {}: {e}",
+                            path.display()
+                        ))
+                    })?);
+                    self.data_cache
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(path.clone(), Arc::clone(&bytes));
+                    bytes
+                }
+            };
+            return Ok(f(&bytes, r.index));
+        }
         self.db.with_face_data(r.db_id, f).ok_or_else(|| {
             Diag::fatal(code::font::BAD_FACE, Boundary::Data)
                 .with_detail("fontdb could not expose face bytes")

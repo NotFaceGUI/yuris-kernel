@@ -33,7 +33,9 @@ use crate::imageop::{
     apply_horizontal, apply_meido, apply_rect_paint, apply_resize, apply_reverse, apply_trim,
     apply_vertical,
 };
-use crate::text::{layer_base, text_base_key, texture_content_hash, TextComposer, TextPaintStats};
+use crate::text::{
+    layer_base, layer_base_dims, text_base_key, texture_content_hash, TextComposer, TextPaintStats,
+};
 use crate::texture::{AssetIssue, Texture, TextureStore};
 
 /// RGBA8 表面(行优先,直通 alpha)。
@@ -1079,11 +1081,10 @@ fn apply_layer_text(
     layer: &Layer,
     st: &mut RenderState,
 ) {
-    let draws: Vec<TextDraw> = frame
+    let draws: Vec<&TextDraw> = frame
         .text_draws
         .iter()
         .filter(|d| d.target == layer.id)
-        .cloned()
         .collect();
     let layout = frame
         .text_layout
@@ -1100,34 +1101,56 @@ fn apply_layer_text(
     if !st.text_composed.insert(layer.id.clone()) {
         return;
     }
-    let base = match st.texture_overrides.get(&layer.id) {
-        Some(base) => base.clone(),
-        None => match layer_base(textures, snapshots, layer) {
-            Ok(t) => Rc::new(t),
-            Err(reason) => {
-                let why = format!("text.layer_base: {reason}");
-                if !st.report.text_diags.contains(&why) {
-                    st.report.text_diags.push(why);
-                    st.report.text_diags.sort();
-                }
-                return;
-            }
-        },
-    };
     // 持久文本是烘焙语义:内容(revision)与基面都没变 ⇒ 直接复用上次合成
     // 结果,不再逐帧重烤(P8 性能;wgpu 的上传缓存随内容哈希一起命中)。
+    // 新字符只增量画尾部;基图只在真正重烤时才克隆(命中路径零复制)。
     let revision = frame.text_revisions.get(&layer.id).copied().unwrap_or(0);
     let override_hash = st
         .texture_overrides
         .get(&layer.id)
         .map(|t| texture_content_hash(t));
     let base_key = text_base_key(&layer.texture, override_hash);
-    let (composed, stats) = st
-        .text
-        .compose_layer_cached(&layer.id, revision, base_key, &base, &draws, layout);
-    merge_text_stats(&mut st.report, stats);
+    let dims = match st.texture_overrides.get(&layer.id) {
+        Some(t) => Ok((t.width, t.height)),
+        None => layer_base_dims(textures, snapshots, layer),
+    };
+    let composed = match dims {
+        Ok(dims) => {
+            let overrides = &st.texture_overrides;
+            st.text.compose_layer_cached(
+                &layer.id,
+                revision,
+                base_key,
+                dims,
+                &draws,
+                layout,
+                || {
+                    match overrides.get(&layer.id) {
+                        Some(t) => Ok(t.clone()),
+                        None => layer_base(textures, snapshots, layer).map(Rc::new),
+                    }
+                },
+            )
+        }
+        Err(reason) => Err(reason),
+    };
+    let composed = match composed {
+        Ok((composed, stats)) => {
+            merge_text_stats(&mut st.report, stats);
+            composed
+        }
+        Err(reason) => {
+            let why = format!("text.layer_base: {reason}");
+            if !st.report.text_diags.contains(&why) {
+                st.report.text_diags.push(why);
+                st.report.text_diags.sort();
+            }
+            return;
+        }
+    };
     if let Some(composed) = composed {
-        st.texture_overrides.insert(layer.id.clone(), composed);
+        st.texture_overrides
+            .insert(layer.id.clone(), composed.texture);
         st.text_override_ids.insert(layer.id.clone());
     }
 }

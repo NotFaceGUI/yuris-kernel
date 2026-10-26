@@ -348,6 +348,22 @@ pub struct TextDrawKey {
     style: TextStyle,
 }
 
+impl TextDrawKey {
+    /// 与一条绘制项逐字段比对(等价于 `draw.dedup_key() == *self`,免分配)。
+    ///
+    /// 增量烘焙的前缀校验按此逐项确认;`dedup_key()` 每次构造都要克隆
+    /// bytes/style,逐帧逐项调用会白耗分配。
+    #[must_use]
+    pub fn matches_draw(&self, draw: &TextDraw) -> bool {
+        self.bytes == draw.bytes
+            && self.x == draw.x
+            && self.y == draw.y
+            && self.set == draw.set
+            && self.bno == draw.bno
+            && self.style == draw.style
+    }
+}
+
 /// 单层持久文本绘制项的硬上限(DIV-GFX-055 预登记“加去重/上限”)。
 ///
 /// 语料规模参考:对话一页 ~ 数千(逐字 + 影/轮廓/填色),存读档 8 板 ×

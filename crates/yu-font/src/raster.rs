@@ -41,6 +41,9 @@ impl RasterParams {
 /// Reusable swash scale context.
 pub struct Rasterizer {
     ctx: swash::scale::ScaleContext,
+    /// `(源 face, bold, italic 量化)` → 已解析 face。`resolve_style` 内部走
+    /// fontdb 查询,逐字形调用会在大字库上累积成毫秒级;同参必同果,记一次。
+    style_memo: std::collections::HashMap<(crate::source::FaceId, bool, i16), ResolvedFace>,
 }
 
 impl Default for Rasterizer {
@@ -54,6 +57,7 @@ impl Rasterizer {
     pub fn new() -> Self {
         Self {
             ctx: swash::scale::ScaleContext::new(),
+            style_memo: std::collections::HashMap::new(),
         }
     }
 
@@ -85,7 +89,15 @@ impl Rasterizer {
         if params.sx == 0 || params.sy == 0 {
             return Ok(GlyphBitmap::empty(0));
         }
-        let resolved: ResolvedFace = source.resolve_style(face, params.bold, params.italic)?;
+        let style_key = (face, params.bold, params.italic.quantized());
+        let resolved: ResolvedFace = match self.style_memo.get(&style_key) {
+            Some(hit) => *hit,
+            None => {
+                let resolved = source.resolve_style(face, params.bold, params.italic)?;
+                self.style_memo.insert(style_key, resolved);
+                resolved
+            }
+        };
         let shear = if resolved.synthetic_italic {
             params.italic.shear_tan()
         } else {
@@ -95,12 +107,17 @@ impl Rasterizer {
         let sy = f32::from(params.sy);
         let aa = params.aa;
 
+        let trace = std::env::var("YU_FONT_TRACE").is_ok();
+        let t_total = std::time::Instant::now();
         let inner = source.with_face_data(resolved.face, |bytes, index| {
+            let t0 = std::time::Instant::now();
             let font = swash::FontRef::from_index(bytes, index as usize).ok_or_else(|| {
                 Diag::fatal(code::font::BAD_FACE, Boundary::Data)
                     .with_detail("swash rejected the sfnt face")
             })?;
+            let t1 = t0.elapsed();
             let gid = font.charmap().map(ch);
+            let t1b = t0.elapsed();
             if gid == 0 && ch != '\0' {
                 return Err(Diag::recoverable(code::font::GLYPH_MISSING, Boundary::Data)
                     .with_detail(format!(
@@ -111,6 +128,7 @@ impl Rasterizer {
             }
             let metrics = font.glyph_metrics(&[]).scale(sy);
             let advance_f = metrics.advance_width(gid) * x_scale;
+            let t1c = t0.elapsed();
             let advance = (advance_f * 256.0).round() as i32;
             if ch == '\0' {
                 return Ok(GlyphBitmap::empty(advance));
@@ -127,8 +145,26 @@ impl Rasterizer {
                     x: 0.0,
                     y: 0.0,
                 }));
+            // ScaleContext 按字体字节地址+face 序号维护内部准备缓存:
+            // 同一 face 的第二次 builder 命中缓存,构建退化为微秒级。
+            let t2 = t0.elapsed();
             let mut scaler = self.ctx.builder(font).size(sy).hint(false).build();
-            let Some(image) = render.render(&mut scaler, gid) else {
+            let t3 = t0.elapsed();
+            let image = render.render(&mut scaler, gid);
+            let t4 = t0.elapsed();
+            if trace {
+                log::trace!(
+                    target: "yu-font",
+                    "[ft] ch={:#x} from_index={t1:?} charmap={:?} metrics={:?} build={:?} render={:?} total={:?}",
+                    ch as u32,
+                    t1b - t1,
+                    t1c - t1b,
+                    t3 - t2,
+                    t4 - t3,
+                    t_total.elapsed()
+                );
+            }
+            let Some(image) = image else {
                 // Whitespace and a few control glyphs have no outline.
                 return Ok(GlyphBitmap::empty(advance));
             };

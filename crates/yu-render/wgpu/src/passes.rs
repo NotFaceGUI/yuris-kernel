@@ -139,6 +139,12 @@ pub(crate) fn plan(
     targets.prune_snapshots(&live_snapshots(frame));
     // 覆盖纹理缓存只保留本帧仍存在的层,防止临时层累积。
     uploaded_overrides.retain(|id, _| frame.layers.iter().any(|layer| &layer.id == id));
+    let timing = std::env::var("YU_RENDER_TIMING").is_ok();
+    let started = std::time::Instant::now();
+    let t_snap;
+    let t_image;
+    let t_text;
+    let t_copy_text;
     let mut acc = Accum::new(frame);
     let mut vertices: Vec<Vertex> = Vec::new();
     let mut passes: Vec<PlannedPass> = Vec::new();
@@ -146,9 +152,10 @@ pub(crate) fn plan(
     let mut transition_buffers: Vec<wgpu::Buffer> = Vec::new();
 
     // 1.4 快照 CPU 镜像预捕获(DIV-GFX-058,按命令序):1.5 的文本基面解析
-    // 需要快照像素,而 GPU 快照在命令段才捕获;这里先把 CPU 可得源(资产/
-    // 1×1 黑/另一快照镜像)按 soft `apply_copy_op` 的同一构造(目标尺寸 +
-    // 区域裁剪)落成镜像。带冻结文本的 COPY 在 1.6 段连文本一起落。
+    //     需要快照像素,而 GPU 快照在命令段才捕获;这里先把 CPU 可得源(资产/
+    //     1×1 黑/另一快照镜像)按 soft `apply_copy_op` 的同一构造(目标尺寸 +
+    //     区域裁剪)落成镜像。带冻结文本的 COPY 在 1.6 段连文本一起落。
+    let mark = started.elapsed();
     for pass in &frame.passes {
         let PassTarget::Texture(_) = &pass.target else {
             continue;
@@ -165,6 +172,7 @@ pub(crate) fn plan(
             capture_copy_mirror(frame, textures, targets, copy);
         }
     }
+    t_snap = started.elapsed() - mark;
 
     // 1. RECTPAINT/REVERSE/HORIZONTAL:CPU 预执行到图层覆盖纹理。
     //    目标是快照的 RECTPAINT 族推迟到命令段(GPU 直接在快照纹理上画)。
@@ -175,6 +183,7 @@ pub(crate) fn plan(
     // COPY 冻结文本的源面(1.6 段合成;plan_copy 直接上传为 GPU 源)。
     let mut copy_text_sources: BTreeMap<CopyId, Rc<Texture>> = BTreeMap::new();
     let mut deferred: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mark = started.elapsed();
     for (pass_index, pass) in frame.passes.iter().enumerate() {
         let PassTarget::Texture(target) = &pass.target else {
             continue;
@@ -215,10 +224,14 @@ pub(crate) fn plan(
             }
         }
     }
+    t_image = started.elapsed() - mark;
 
     // 1.5 文本:图层基图(或已加工的覆盖纹理)副本上合成,再按图层
     //     `A/MODE/尺寸` 走常规 quad。与 soft 同一 `TextComposer`(字节/字体
-    //     /栅格一致 ⇒ 同帧像素一致)。
+    //     /栅格一致 ⇒ 同帧像素一致)。命中/增量路径不克隆基图、不重算整图
+    //     哈希;新字符只增量画尾部(官方命令时刻写层表面语义,DIV-GFX-058)。
+    let mark = started.elapsed();
+    text.begin_frame_stats();
     {
         let mut text_ids: BTreeSet<LayerId> =
             frame.text_draws.iter().map(|d| d.target.clone()).collect();
@@ -235,42 +248,62 @@ pub(crate) fn plan(
             if !layer.visible {
                 continue;
             }
-            let draws: Vec<TextDraw> = frame
+            let draws: Vec<&TextDraw> = frame
                 .text_draws
                 .iter()
                 .filter(|d| d.target == id)
-                .cloned()
                 .collect();
             let layout = frame
                 .text_layout
                 .as_ref()
                 .filter(|l| l.target.as_ref() == Some(&id));
-            let base: Rc<Texture> = match overrides.get(&id) {
-                Some(hit) => hit.tex.clone(),
-                None => match layer_base_cpu(textures, targets, layer) {
-                    Ok(base) => Rc::new(base),
-                    Err(reason) => {
-                        note_text_diag(&mut acc, format!("text.layer_base: {reason}"));
-                        continue;
-                    }
-                },
-            };
             let revision = frame.text_revisions.get(&id).copied().unwrap_or(0);
             let override_hash = overrides.get(&id).map(|o| o.hash);
             let base_key = text_base_key(&layer.texture, override_hash);
-            let (composed, stats) =
-                text.compose_layer_cached(&id, revision, base_key, &base, &draws, layout);
-            merge_text_stats(&mut acc, stats);
-            if let Some(composed) = composed {
-                overrides.insert(id.clone(), Override::new(composed));
-                text_override_ids.insert(id);
+            // 基图惰性:命中/增量路径不解析不克隆基图(此前每帧整图复制)。
+            let dims = match overrides.get(&id) {
+                Some(hit) => Ok((hit.tex.width, hit.tex.height)),
+                None => layer_base_dims(textures, targets, layer),
+            };
+            let composed = match dims {
+                Ok(dims) => text.compose_layer_cached(
+                    &id,
+                    revision,
+                    base_key,
+                    dims,
+                    &draws,
+                    layout,
+                    || {
+                        match overrides.get(&id) {
+                            Some(hit) => Ok(hit.tex.clone()),
+                            None => layer_base_cpu(textures, targets, layer).map(Rc::new),
+                        }
+                    },
+                ),
+                Err(reason) => Err(reason),
+            };
+            match composed {
+                Ok((composed, stats)) => {
+                    merge_text_stats(&mut acc, stats);
+                    if let Some(composed) = composed {
+                        overrides
+                            .insert(id.clone(), Override::with_hash(composed.texture, composed.hash));
+                        text_override_ids.insert(id);
+                    }
+                }
+                Err(reason) => {
+                    note_text_diag(&mut acc, format!("text.layer_base: {reason}"));
+                }
             }
         }
     }
+    let text_stats = text.take_frame_stats();
+    t_text = started.elapsed() - mark;
 
     // 1.6 COPY 冻结文本的源面(DIV-GFX-058):命令时刻已画文本进入快照,
     // 命令之后画的文本不得进入(与 soft 的 `compose_copy_texts` 同一语义;
     // 每帧只在快照未捕获时合成一次,冻结帧零成本)。
+    let mark = started.elapsed();
     for pass in &frame.passes {
         let PassTarget::Texture(_) = &pass.target else {
             continue;
@@ -354,6 +387,7 @@ pub(crate) fn plan(
             );
         }
     }
+    t_copy_text = started.elapsed() - mark;
 
     // 2. 命令段(按 gfx pass 顺序):COPY 与快照 RECTPAINT。
     //
@@ -628,6 +662,37 @@ pub(crate) fn plan(
     }
 
     let missing_assets = textures.issues();
+    if timing {
+        let total = started.elapsed();
+        let rest = total - t_snap - t_image - t_text - t_copy_text;
+        log::trace!(
+            target: "yu-render",
+            "[rt] frame={} plan_total={:.2}ms snap={:.2} image={:.2} text={:.2} copy_text={:.2} rest={:.2} layers={} draws={} ops={}/{}",
+            frame.frame,
+            total.as_secs_f64() * 1e3,
+            t_snap.as_secs_f64() * 1e3,
+            t_image.as_secs_f64() * 1e3,
+            t_text.as_secs_f64() * 1e3,
+            t_copy_text.as_secs_f64() * 1e3,
+            rest.as_secs_f64() * 1e3,
+            frame.layers.len(),
+            frame.text_draws.len(),
+            acc.ops_drawn,
+            acc.ops_total,
+        );
+        log::trace!(
+            target: "yu-render",
+            "[rt]   text_paths hits={} incr={} bakes={} bake={:.2}ms hash={:.2}ms paint={:.2}ms base={:.2}ms dims={:?}",
+            text_stats.hits,
+            text_stats.incremental,
+            text_stats.full_bakes,
+            text_stats.bake_ms,
+            text_stats.hash_ms,
+            text_stats.paint_ms,
+            text_stats.base_ms,
+            text_stats.max_dims,
+        );
+    }
     Ok((
         FramePlan {
             passes,
@@ -757,6 +822,31 @@ fn layer_base_cpu(
     }
 }
 
+/// 只窥视图层基图尺寸(**免克隆**)。与 [`layer_base_cpu`] 同一分支序;
+/// 合成缓存命中/增量路径用它做尺寸校验,不再为校验整图复制一遍。
+fn layer_base_dims(
+    textures: &mut TextureStore,
+    targets: &TargetSet,
+    layer: &Layer,
+) -> Result<(u32, u32), String> {
+    match &layer.texture {
+        TextureRef::Asset(key) => textures
+            .resolve(key)
+            .map(|t| (t.width, t.height))
+            .map_err(|d| d.code.to_string()),
+        TextureRef::SolidBlack1x1 => Ok((1, 1)),
+        TextureRef::None => layer
+            .image_size()
+            .map(|size| (size.width, size.height))
+            .ok_or_else(|| "text.layer_size_unknown".to_string()),
+        TextureRef::Snapshot(copy_id) => targets
+            .snapshot_cpu(*copy_id)
+            .map(|t| (t.width, t.height))
+            .ok_or_else(|| "snapshot.cpu_mirror_missing".to_string()),
+        TextureRef::Offscreen(_) => Err("text.layer_source_unsupported".to_string()),
+    }
+}
+
 /// COPY 冻结文本的基面(源层可能已被 `CGEND` 删除,回退命令时刻的
 /// `source_texture`;DIV-GFX-058)。
 fn copy_source_base_cpu(
@@ -815,6 +905,12 @@ pub(crate) struct Override {
 impl Override {
     fn new(tex: Rc<Texture>) -> Self {
         let hash = hash_rgba(tex.width, tex.height, &tex.rgba);
+        Self { tex, hash }
+    }
+
+    /// 用调用方已持有的内容指纹构造(文本合成缓存命中路径零重算:
+    /// 指纹在烘焙/增量时算一次,存于 `yu_backend_soft::ComposedLayer::hash`)。
+    fn with_hash(tex: Rc<Texture>, hash: u64) -> Self {
         Self { tex, hash }
     }
 }
@@ -2152,20 +2248,7 @@ fn plan_group_compose(
 
 /// 覆盖纹理内容指纹(FNV-1a 64):尺寸 + RGBA 字节。
 fn hash_rgba(width: u32, height: u32, rgba: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in width.to_le_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    for byte in height.to_le_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    for &byte in rgba {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    hash
+    yu_backend_soft::content_hash_rgba(width, height, rgba)
 }
 
 fn note_text_diag(acc: &mut Accum, why: String) {

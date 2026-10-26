@@ -27,7 +27,7 @@ use yu_font::{
     ENGINE_DEFAULT_FAMILIES,
 };
 use yu_font::{StylePolicy, TextStyle as FontStyle};
-use yu_gfx::{LayerId, TextDraw, TextFontRequest, TextLayoutFrame, TextureRef};
+use yu_gfx::{LayerId, TextDraw, TextDrawKey, TextFontRequest, TextLayoutFrame, TextureRef};
 
 use crate::texture::Texture;
 
@@ -92,14 +92,79 @@ pub struct TextComposer {
     /// 查不到时不用引擎回退表兜底 —— 强制指定就该显式失败,否则用户会
     /// 以为换上了、其实画的还是默认字体。
     force_font: Option<String>,
+    /// 合成缓存当前字节占用(`ComposeCacheEntry::bytes` 之和)。
+    cache_bytes: u64,
+    /// LRU 时钟(每次合成触碰/插入时递增)。
+    cache_clock: u64,
+    /// 帧内合成统计(`YU_RENDER_TIMING` 诊断;`begin_frame_stats` 清零)。
+    frame_stats: ComposeFrameStats,
+}
+
+/// 一帧内合成缓存路径的计数与分段耗时(诊断用)。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ComposeFrameStats {
+    pub hits: u32,
+    pub incremental: u32,
+    pub full_bakes: u32,
+    pub bake_ms: f64,
+    pub hash_ms: f64,
+    pub paint_ms: f64,
+    pub base_ms: f64,
+    /// 本帧最大一次 bake 的合成纹理尺寸(诊断)。
+    pub max_dims: (u32, u32),
 }
 
 /// 一条合成缓存(见 [`TextComposer::compose_cache`])。
-#[derive(Clone)]
 struct ComposeCacheEntry {
     revision: u64,
     base_key: u64,
     texture: Rc<Texture>,
+    /// 已烘焙进 `texture` 的绘制键(顺序 = 烘焙顺序)。
+    ///
+    /// 官方语义是 `CGACT[TEXT]` 命令时刻直接写层表面的持久烘焙
+    /// (DIV-GFX-058):已画上去的像素不会因后续命令改变。因此新绘制集合
+    /// 若以它为**严格前缀追加**,就只增量画尾部 —— 与整体重烤逐位等价,
+    /// 成本从 O(整页) 降到 O(新字符);这是“逐字吐字越到后面越卡”的主修。
+    baked: Vec<TextDrawKey>,
+    /// `texture` 内容指纹(烘焙/增量时算一次;命中路径零重算)。
+    /// 算法 = [`content_hash_rgba`](与 wgpu `hash_rgba` 同一口径)。
+    hash: u64,
+    /// LRU 时钟(`compose_cache_clock` 递增;逐条淘汰的次序依据)。
+    last_use: u64,
+    /// `texture.rgba` 字节数(预算记账)。
+    bytes: u64,
+}
+
+/// 合成缓存的**字节预算**:超过时按 LRU 逐条淘汰最旧条目。
+///
+/// 实测语料(角色加载演示)一屏可建 480-779 个文本精灵层;旧实现
+/// 「256 条超限整体清空」会让缓存彻底失效,每帧全量重烤 + 整图 FNV
+/// (单帧 200-700ms 反复出现)。按字节预算逐条淘汰既不无界占内存,
+/// 也不再把整屏图层全拍死。
+const COMPOSE_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+/// 条目数硬上限(元数据防无界;每条还有 `bytes` 记账)。
+const COMPOSE_CACHE_MAX_ENTRIES: usize = 8192;
+
+/// 「宽 + 高 + RGBA 字节」的 FNV-1a 内容指纹。
+///
+/// wgpu 后端的 `hash_rgba` 委托到这里:单一实现,保证烘焙期算出的指纹与
+/// `Override` 跨帧比对、GPU 上传缓存键的口径完全一致。
+#[must_use]
+pub fn content_hash_rgba(width: u32, height: u32, rgba: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in width.to_le_bytes() {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    for byte in height.to_le_bytes() {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    for &byte in rgba {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 /// 纹理内容哈希(FNV-1a;仅用于帧内图像加工覆盖纹理的缓存键)。
@@ -213,6 +278,9 @@ impl TextComposer {
             pending_bold_note: false,
             source_summary: None,
             force_font: None,
+            cache_bytes: 0,
+            cache_clock: 0,
+            frame_stats: ComposeFrameStats::default(),
         }
     }
 
@@ -229,6 +297,9 @@ impl TextComposer {
             pending_bold_note: false,
             source_summary: None,
             force_font: None,
+            cache_bytes: 0,
+            cache_clock: 0,
+            frame_stats: ComposeFrameStats::default(),
         }
     }
 
@@ -611,7 +682,8 @@ impl TextComposer {
         }
         let _ = drew_any;
         if std::env::var("YU_P8_TIMING").is_ok() && dbg_glyph_ns + dbg_draw_ns > 500_000 {
-            eprintln!(
+            log::trace!(
+                target: "yu-render",
                 "[p8] draw chars={} glyph={}us onto={}us passes={}",
                 decoded.chars.len(),
                 dbg_glyph_ns / 1000,
@@ -629,6 +701,18 @@ impl TextComposer {
         w: u32,
         h: u32,
         draws: &[TextDraw],
+    ) -> TextPaintStats {
+        let refs: Vec<&TextDraw> = draws.iter().collect();
+        self.paint_draw_refs(dst, w, h, &refs)
+    }
+
+    /// 同 [`Self::paint_draws`],但借用绘制项(增量烘焙免深拷贝)。
+    pub fn paint_draw_refs(
+        &mut self,
+        dst: &mut [u8],
+        w: u32,
+        h: u32,
+        draws: &[&TextDraw],
     ) -> TextPaintStats {
         let mut stats = TextPaintStats::default();
         if w == 0 || h == 0 || dst.len() < (w as usize) * (h as usize) * 4 {
@@ -740,73 +824,220 @@ impl TextComposer {
         draws: &[TextDraw],
         layout: Option<&TextLayoutFrame>,
     ) -> (Option<Texture>, TextPaintStats) {
+        let refs: Vec<&TextDraw> = draws.iter().collect();
+        self.compose_layer_refs(base, &refs, layout)
+    }
+
+    /// 同 [`Self::compose_layer`],但借用绘制项(调用方可免去深拷贝)。
+    pub fn compose_layer_refs(
+        &mut self,
+        base: &Texture,
+        draws: &[&TextDraw],
+        layout: Option<&TextLayoutFrame>,
+    ) -> (Option<Texture>, TextPaintStats) {
         if draws.is_empty() && layout.is_none() {
             return (None, TextPaintStats::default());
         }
         let mut out = base.clone();
-        let mut stats = self.paint_draws(&mut out.rgba, out.width, out.height, draws);
+        let mut stats = self.paint_draw_refs(&mut out.rgba, out.width, out.height, draws);
         if let Some(layout) = layout {
             stats.merge(self.paint_layout(&mut out.rgba, out.width, out.height, layout));
         }
         (Some(out), stats)
     }
 
-    /// 同 [`TextComposer::compose_layer`],但按「层 + 文本修订号 + 基面身份」
-    /// 缓存结果(P8:持久文本是烘焙语义,内容不变不重合成)。
+    /// 同 [`Self::compose_layer_cached`],但按「层 + 文本修订号 + 基面身份」
+    /// 缓存结果并支持**增量烘焙**(P8:持久文本是烘焙语义,内容不变不重合成;
+    /// 新字符只画增量,与官方“命令时刻写层表面”一致)。
+    ///
+    /// - `base_dims`:基图尺寸(调用方**免克隆**地窥视;命中/增量路径不碰基图)。
+    /// - `resolve_base`:整体重烤/自动文本层时才调用(整图克隆只发生在真正
+    ///   需要时);`Err` 原样上抛给调用方记诊断。
+    /// - 返回的 [`ComposedLayer::hash`] 供 wgpu 侧直接构造 `Override`,
+    ///   命中路径不再逐帧重扫整图(800×600 ≈ 1.9 MB FNV)。
     ///
     /// 只在 `layout.is_none()`(纯 `CGACT[TEXT]`)时缓存:自动文本层的布局
-    /// 每帧变化,缓存会读到旧内容。缓存命中返回同一 `Rc`(wgpu 侧内容哈希
-    /// 不变 ⇒ 上传缓存也命中),统计按 0 字形报告(两端一致)。
+    /// 每帧变化,缓存会读到旧内容。统计只计实际画上的字符。
     pub fn compose_layer_cached(
         &mut self,
         layer: &LayerId,
         revision: u64,
         base_key: u64,
-        base: &Texture,
-        draws: &[TextDraw],
+        base_dims: (u32, u32),
+        draws: &[&TextDraw],
         layout: Option<&TextLayoutFrame>,
-    ) -> (Option<Rc<Texture>>, TextPaintStats) {
-        if layout.is_some() {
-            let (out, stats) = self.compose_layer(base, draws, layout);
-            return (out.map(Rc::new), stats);
+        resolve_base: impl FnOnce() -> Result<Rc<Texture>, String>,
+    ) -> Result<(Option<ComposedLayer>, TextPaintStats), String> {
+        if let Some(layout) = layout {
+            let base = resolve_base()?;
+            let (out, stats) = self.compose_layer_refs(&base, &[], Some(layout));
+            return Ok((
+                out.map(|texture| {
+                    let hash = content_hash_rgba(texture.width, texture.height, &texture.rgba);
+                    ComposedLayer {
+                        texture: Rc::new(texture),
+                        hash,
+                    }
+                }),
+                stats,
+            ));
         }
         if draws.is_empty() {
-            return (None, TextPaintStats::default());
+            return Ok((None, TextPaintStats::default()));
         }
-        if let Some(hit) = self.compose_cache.get(layer) {
+        // 命中:同修订 + 同基面身份 + 同尺寸 ⇒ 零重烤、零哈希、零克隆。
+        if let Some(hit) = self.compose_cache.get_mut(layer) {
             if hit.revision == revision
                 && hit.base_key == base_key
-                && hit.texture.width == base.width
-                && hit.texture.height == base.height
+                && hit.texture.width == base_dims.0
+                && hit.texture.height == base_dims.1
             {
-                return (Some(hit.texture.clone()), TextPaintStats::default());
+                self.cache_clock += 1;
+                hit.last_use = self.cache_clock;
+                self.frame_stats.hits += 1;
+                let composed = ComposedLayer {
+                    texture: hit.texture.clone(),
+                    hash: hit.hash,
+                };
+                return Ok((Some(composed), TextPaintStats::default()));
             }
         }
-        let (out, stats) = self.compose_layer(base, draws, None);
-        let Some(texture) = out else {
-            return (None, stats);
-        };
-        let texture = Rc::new(texture);
-        if self.compose_cache.len() >= 256 && !self.compose_cache.contains_key(layer) {
-            // 上限保护:文本层数量远小于此;极端语料下整体清空(一次性重烤),
-            // 不引入跨帧无界内存。
-            self.compose_cache.clear();
+        // 增量:基面身份/尺寸未变,且新集合严格延伸已烘焙前缀 ⇒ 只画尾部。
+        // 语义与整体重烤逐位等价:烘焙顺序保持绘制顺序,已画像素不再变。
+        let cached = self.compose_cache.remove(layer);
+        if let Some(hit) = cached {
+            let extends = hit.base_key == base_key
+                && hit.texture.width == base_dims.0
+                && hit.texture.height == base_dims.1
+                && draws.len() > hit.baked.len()
+                && draws[..hit.baked.len()]
+                    .iter()
+                    .zip(&hit.baked)
+                    .all(|(draw, key)| key.matches_draw(draw));
+            if extends {
+                self.frame_stats.incremental += 1;
+                let t0 = Instant::now();
+                let mut texture = match Rc::try_unwrap(hit.texture) {
+                    Ok(texture) => texture,
+                    Err(rc) => (*rc).clone(),
+                };
+                let stats = self.paint_draw_refs(
+                    &mut texture.rgba,
+                    texture.width,
+                    texture.height,
+                    &draws[hit.baked.len()..],
+                );
+                let paint_t = t0.elapsed();
+                let h0 = Instant::now();
+                let hash = content_hash_rgba(texture.width, texture.height, &texture.rgba);
+                let hash_t = h0.elapsed();
+                self.frame_stats.paint_ms += paint_t.as_secs_f64() * 1e3;
+                self.frame_stats.hash_ms += hash_t.as_secs_f64() * 1e3;
+                let baked = draws.iter().map(|d| d.dedup_key()).collect();
+                let bytes = texture.rgba.len() as u64;
+                let texture = Rc::new(texture);
+                self.cache_bytes = self.cache_bytes + bytes - hit.bytes;
+                self.cache_clock += 1;
+                self.compose_cache.insert(
+                    layer.clone(),
+                    ComposeCacheEntry {
+                        revision,
+                        base_key,
+                        texture: texture.clone(),
+                        baked,
+                        hash,
+                        last_use: self.cache_clock,
+                        bytes,
+                    },
+                );
+                return Ok((Some(ComposedLayer { texture, hash }), stats));
+            }
+            // 前缀不成立(清页/中段改动/换基面):丢弃旧条目,走整体重烤。
+            self.cache_bytes = self.cache_bytes.saturating_sub(hit.bytes);
         }
+        self.frame_stats.full_bakes += 1;
+        let b0 = Instant::now();
+        let r0 = Instant::now();
+        let base = resolve_base()?;
+        self.frame_stats.base_ms += r0.elapsed().as_secs_f64() * 1e3;
+        let (out, stats) = self.compose_layer_refs(&base, draws, None);
+        let Some(texture) = out else {
+            return Ok((None, stats));
+        };
+        let h0 = Instant::now();
+        let hash = content_hash_rgba(texture.width, texture.height, &texture.rgba);
+        let hash_t = h0.elapsed();
+        let bake_t = b0.elapsed();
+        self.frame_stats.bake_ms += bake_t.as_secs_f64() * 1e3;
+        self.frame_stats.hash_ms += hash_t.as_secs_f64() * 1e3;
+        if (texture.width, texture.height) > self.frame_stats.max_dims {
+            self.frame_stats.max_dims = (texture.width, texture.height);
+        }
+        let bytes = texture.rgba.len() as u64;
+        let texture = Rc::new(texture);
+        self.cache_bytes += bytes;
+        self.cache_clock += 1;
         self.compose_cache.insert(
             layer.clone(),
             ComposeCacheEntry {
                 revision,
                 base_key,
                 texture: texture.clone(),
+                baked: draws.iter().map(|d| d.dedup_key()).collect(),
+                hash,
+                last_use: self.cache_clock,
+                bytes,
             },
         );
-        (Some(texture), stats)
+        self.evict_compose_cache();
+        Ok((Some(ComposedLayer { texture, hash }), stats))
+    }
+
+    /// 合成缓存超预算时的 LRU 淘汰(逐条,不再整体清空)。
+    fn evict_compose_cache(&mut self) {
+        while self.compose_cache.len() > COMPOSE_CACHE_MAX_ENTRIES
+            || self.cache_bytes > COMPOSE_CACHE_BUDGET_BYTES
+        {
+            let Some(victim) = self
+                .compose_cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_use)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            if let Some(entry) = self.compose_cache.remove(&victim) {
+                self.cache_bytes = self.cache_bytes.saturating_sub(entry.bytes);
+            }
+        }
+    }
+
+    /// 清零帧内合成统计(诊断;`YU_RENDER_TIMING` 下每帧调用)。
+    pub fn begin_frame_stats(&mut self) {
+        self.frame_stats = ComposeFrameStats::default();
+    }
+
+    /// 取走帧内合成统计(诊断)。
+    #[must_use]
+    pub fn take_frame_stats(&mut self) -> ComposeFrameStats {
+        std::mem::replace(&mut self.frame_stats, ComposeFrameStats::default())
     }
 
     /// 丢弃一个层的合成分缓存(层删除后调用;保守清理由上限保护兜底)。
     pub fn forget_compose_cache(&mut self, layer: &LayerId) {
-        self.compose_cache.remove(layer);
+        if let Some(entry) = self.compose_cache.remove(layer) {
+            self.cache_bytes = self.cache_bytes.saturating_sub(entry.bytes);
+        }
     }
+}
+
+/// [`TextComposer::compose_layer_cached`] 的输出。
+#[derive(Clone)]
+pub struct ComposedLayer {
+    /// 合成结果(基图 + 已烘焙文本)。
+    pub texture: Rc<Texture>,
+    /// 内容指纹(与 wgpu `hash_rgba` 同一算法;命中路径零重算)。
+    pub hash: u64,
 }
 
 /// 解析图层的基图(文本合成的输入)。
@@ -842,6 +1073,33 @@ pub fn layer_base(
                 height: surface.height,
                 rgba: surface.rgba.clone(),
             })
+            .ok_or_else(|| "text.layer_snapshot_missing".to_string()),
+        yu_gfx::TextureRef::Offscreen(_) => Err("text.layer_source_unsupported".to_string()),
+    }
+}
+
+/// 只窥视图层基图尺寸(**免克隆**)。
+///
+/// 与 [`layer_base`] 同一分支序;合成缓存命中/增量路径用它做尺寸校验,
+/// 不再为校验整图复制一遍。
+pub fn layer_base_dims(
+    textures: &mut crate::texture::TextureStore,
+    snapshots: &crate::render::Snapshots,
+    layer: &yu_gfx::Layer,
+) -> Result<(u32, u32), String> {
+    match &layer.texture {
+        yu_gfx::TextureRef::Asset(key) => textures
+            .resolve(key)
+            .map(|t| (t.width, t.height))
+            .map_err(|d| d.code.to_string()),
+        yu_gfx::TextureRef::SolidBlack1x1 => Ok((1, 1)),
+        yu_gfx::TextureRef::None => layer
+            .image_size()
+            .map(|size| (size.width, size.height))
+            .ok_or_else(|| "text.layer_size_unknown".to_string()),
+        yu_gfx::TextureRef::Snapshot(copy_id) => snapshots
+            .get(copy_id)
+            .map(|surface| (surface.width, surface.height))
             .ok_or_else(|| "text.layer_snapshot_missing".to_string()),
         yu_gfx::TextureRef::Offscreen(_) => Err("text.layer_source_unsupported".to_string()),
     }

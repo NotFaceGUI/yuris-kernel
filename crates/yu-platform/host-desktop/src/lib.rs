@@ -287,6 +287,8 @@ struct Presenter {
     bind_group: wgpu::BindGroup,
     size: (u32, u32),
     adapter: String,
+    /// GPU 直呈现键 `(引擎屏幕代际, 宽, 高)`;`None` = 走 `upload` 的拷贝路径。
+    direct: Option<(u64, u32, u32)>,
 }
 
 impl Presenter {
@@ -435,7 +437,37 @@ impl Presenter {
             bind_group,
             size: (1, 1),
             adapter: adapter_name,
+            direct: None,
         })
+    }
+
+    /// GPU 直呈现:直接采样引擎屏幕纹理(同一 device,免读回+重上传)。
+    ///
+    /// `(id, 宽, 高)` 未变时不重建视图/bind group。队列提交顺序保证
+    /// 「上一提交的采样 < 下一提交的写入」,跨提交采样安全。
+    fn bind_screen(&mut self, texture: &wgpu::Texture, id: u64, width: u32, height: u32) {
+        if self.direct == Some((id, width, height)) && self.size == (width, height) {
+            return;
+        }
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("yu-host-desktop present bind group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        self.view = view;
+        self.bind_group = bind_group;
+        self.size = (width, height);
+        self.direct = Some((id, width, height));
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -454,7 +486,8 @@ impl Presenter {
         if surface.width == 0 || surface.height == 0 {
             return;
         }
-        if self.size != (surface.width, surface.height) {
+        let was_direct = self.direct.take().is_some();
+        if was_direct || self.size != (surface.width, surface.height) {
             let (texture, view, bind_group) = create_target(
                 &self.device,
                 &self.bind_group_layout,
@@ -1158,16 +1191,28 @@ impl App {
             let _ = state.take_egui_input(&window);
         }
 
-        // 先上传游戏帧并拿到 swapchain 纹理;borrow 收敛在块内,
-        // 之后的 render pass / egui 只借用互不重叠的字段。
+        // 游戏帧进 swapchain:流式模式直采引擎屏幕纹理(同一 device,
+        // 免「读回 CPU → 再整帧上传」的两次整帧拷贝);否则退回上传。
+        // borrow 收敛在块内,之后的 render pass / egui 只借用互不重叠的字段。
+        let screen_direct = self
+            .engine
+            .screen_handle()
+            .and_then(|_| self.engine.screen_texture());
         let game = self.last_surface.take();
         let acquired = {
             let Some(presenter) = self.presenter.as_mut() else {
                 self.last_surface = game;
                 return;
             };
-            if let Some(game) = &game {
-                presenter.upload(game);
+            match &screen_direct {
+                Some((id, width, height, texture)) => {
+                    presenter.bind_screen(texture, *id, *width, *height);
+                }
+                None => {
+                    if let Some(game) = &game {
+                        presenter.upload(game);
+                    }
+                }
             }
             presenter.acquire()
         };
@@ -1206,9 +1251,13 @@ impl App {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let (game_w, game_h) = game
+        let (game_w, game_h) = screen_direct
             .as_ref()
-            .map(|game| (game.width, game.height))
+            .map(|(_, width, height, _)| (*width, *height))
+            .or_else(|| {
+                game.as_ref()
+                    .map(|game| (game.width, game.height))
+            })
             .unwrap_or((self.viewport.0, self.viewport.1));
         let (vx, vy, vw, vh) = content_rect(width, height, game_w, game_h);
         {
@@ -1659,6 +1708,8 @@ impl App {
 
     fn finish(&mut self) {
         if let Some(path) = self.opts.shot.clone() {
+            // 流式模式下 last_surface 是上一帧后缓冲;截图前同步读回当前帧。
+            let _ = self.engine.refresh_screen_surface();
             match self.engine.write_png(&path) {
                 Ok(bytes) => host_line!("shot: {} ({bytes} bytes)", path.display()),
                 Err(error) => host_error!("yu-desktop: 写截图失败: {error}"),

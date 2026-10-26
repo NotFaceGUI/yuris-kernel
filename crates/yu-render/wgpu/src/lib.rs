@@ -124,6 +124,19 @@ pub struct WgpuRenderOutput {
     pub stats: GpuStats,
 }
 
+/// [`WgpuRenderer::render_frame_streaming`] 的产物。
+///
+/// `surface` 是**上一帧**呈现内容(后缓冲语义);屏幕纹理本体经
+/// [`WgpuRenderer::screen_target`] 采样,`screen_*` 是它的身份键。
+pub struct StreamingFrameOutput {
+    pub surface: Arc<Surface>,
+    pub report: RenderReport,
+    pub stats: GpuStats,
+    pub screen_id: u64,
+    pub screen_width: u32,
+    pub screen_height: u32,
+}
+
 /// 引擎显示缩放滤镜(effect Pass2/Pass3)。
 ///
 /// 证据:`FUN_004195ec`(`0x4195ec`)按 `DAT_00801334` 选 pass:
@@ -152,6 +165,8 @@ pub struct WgpuRenderer {
     targets: TargetSet,
     vertex_buffer: Option<VertexBufferSlot>,
     readback: ReadbackCache,
+    /// 显示缩放输出的读回(与主读回分开:同帧两次读共用一块缓冲会互踩)。
+    scale_readback: ReadbackCache,
     total_draw_calls: u64,
     /// 图像加工覆盖纹理的跨帧缓存:`LayerId -> (gpu_id, w, h, content_hash)`。
     /// 内容未变时复用 GPU 纹理,避免逐帧重传(600 帧验收)。
@@ -187,6 +202,7 @@ impl WgpuRenderer {
             targets: TargetSet::new(),
             vertex_buffer: None,
             readback: ReadbackCache::new(),
+            scale_readback: ReadbackCache::new(),
             total_draw_calls: 0,
             uploaded_overrides: std::collections::BTreeMap::new(),
             image_cache: std::collections::BTreeMap::new(),
@@ -270,7 +286,7 @@ impl WgpuRenderer {
 
     /// 执行一帧并读回 `frame.viewport` 尺寸的 RGBA8。
     pub fn render_frame(&mut self, frame: &CompositorFrame) -> Result<WgpuRenderOutput, Diag> {
-        self.render_frame_inner(frame, None)
+        self.render_inner(frame, None, false).map(|(out, _)| out)
     }
 
     /// 执行一帧,并在读回前跑引擎的显示缩放 pass(effect Pass2/Pass3)。
@@ -287,14 +303,85 @@ impl WgpuRenderer {
         output: Viewport,
         filter: ScaleFilter,
     ) -> Result<WgpuRenderOutput, Diag> {
-        self.render_frame_inner(frame, Some((output, filter)))
+        self.render_inner(frame, Some((output, filter)), false)
+            .map(|(out, _)| out)
     }
 
-    fn render_frame_inner(
+    /// 流水线友好帧(桌面宿主专用):读回改为**异步一帧滞后**
+    /// (见 [`readback`模块文档]`crate::readback`),不再每帧同步等待 GPU;
+    /// 同时返回屏幕目标的身份,宿主可直接采样该纹理呈现
+    /// (省掉「读回 CPU → 再整帧上传」的两次整帧拷贝)。
+    ///
+    /// 返回的 `surface` 是**上一帧**呈现内容(后缓冲/COPY :/W0/ 语义,
+    /// 与精确模式下的「上一帧后缓冲」一致);需要当帧像素时用
+    /// [`Self::read_screen_now`]。
+    pub fn render_frame_streaming(
+        &mut self,
+        frame: &CompositorFrame,
+    ) -> Result<StreamingFrameOutput, Diag> {
+        let (out, screen) = self.render_inner(frame, None, true)?;
+        let Some(screen) = screen else {
+            return Err(Diag::fatal(
+                device::code::TARGET,
+                yu_log::Boundary::Platform,
+            )
+            .with_detail("流式帧没有屏幕目标"));
+        };
+        Ok(StreamingFrameOutput {
+            surface: out.surface,
+            report: out.report,
+            stats: out.stats,
+            screen_id: screen.0,
+            screen_width: screen.1,
+            screen_height: screen.2,
+        })
+    }
+
+    /// 当前屏幕目标(流式呈现用):`(代际 id, 宽, 高, 纹理)`。
+    ///
+    /// 宿主以 `(id, 宽, 高)` 为键缓存视图/bind group;尺寸或代际变化
+    /// (视口重建)时重建。队列提交顺序保证「上一提交采样 < 下一提交写入」,
+    /// 跨提交直接采样屏幕纹理是安全的。
+    #[must_use]
+    pub fn screen_target(&self) -> Option<(u64, u32, u32, &wgpu::Texture)> {
+        let target = self.targets.screen()?;
+        Some((target.id, target.width, target.height, &target.texture))
+    }
+
+    /// 同步读回**当前**屏幕纹理(`--shot` 末帧精确像素;低频)。
+    pub fn read_screen_now(&mut self) -> Result<Surface, Diag> {
+        let (width, height, texture) = {
+            let target = self.targets.screen().ok_or_else(|| {
+                Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                    .with_detail("没有屏幕目标可读")
+            })?;
+            (target.width, target.height, target.texture.clone())
+        };
+        let encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("yu-backend-wgpu read screen now"),
+            });
+        let mut surface = self.readback.read_now(
+            &self.ctx,
+            &texture,
+            width,
+            height,
+            encoder,
+        )?;
+        force_opaque(&mut surface);
+        Ok(surface)
+    }
+
+    fn render_inner(
         &mut self,
         frame: &CompositorFrame,
         scale: Option<(Viewport, ScaleFilter)>,
-    ) -> Result<WgpuRenderOutput, Diag> {
+        streaming: bool,
+    ) -> Result<(WgpuRenderOutput, Option<(u64, u32, u32)>), Diag> {
+        let timing = std::env::var("YU_RENDER_TIMING").is_ok();
+        let started = std::time::Instant::now();
         self.textures.begin_frame();
         let uploads_before = self.gpu_textures.total_uploads;
         let bytes_before = self.gpu_textures.total_upload_bytes;
@@ -312,6 +399,7 @@ impl WgpuRenderer {
             &mut self.backbuffer_gpu,
             &mut self.text,
         )?;
+        let t_plan = started.elapsed();
 
         let vertex_bytes = bytemuck::cast_slice::<Vertex, u8>(&plan.vertices);
         if !plan.vertices.is_empty() {
@@ -327,24 +415,38 @@ impl WgpuRenderer {
                 label: Some("yu-backend-wgpu frame"),
             });
         self.encode_passes(&plan, &mut encoder)?;
+        let t_encode = started.elapsed() - t_plan;
 
         // 屏幕读回:即使随后缩放也要保留缩放前的游戏画面作为 `:/W0/`
         // 后缓冲(引擎的 COPY 读内部画面,不读窗口缩放结果)。
+        // 流式模式读回是异步一帧滞后(不阻塞流水线);精确模式当帧读回。
         let screen_width = frame.viewport.width;
         let screen_height = frame.viewport.height;
+        let t_read0 = started.elapsed();
         let mut screen_surface = {
             let screen = self.targets.screen().ok_or_else(|| {
                 Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
                     .with_detail("帧结束时没有屏幕目标")
             })?;
-            self.readback.read(
-                &self.ctx,
-                &screen.texture,
-                screen_width,
-                screen_height,
-                encoder,
-            )?
+            if streaming {
+                self.readback.read(
+                    &self.ctx,
+                    &screen.texture,
+                    screen_width,
+                    screen_height,
+                    encoder,
+                )?
+            } else {
+                self.readback.read_now(
+                    &self.ctx,
+                    &screen.texture,
+                    screen_width,
+                    screen_height,
+                    encoder,
+                )?
+            }
         };
+        let t_readback = started.elapsed() - t_read0;
         // 屏幕是 opaque 窗口(与 soft 的最终屏幕归一、浏览器 canvas 的
         // alphaMode=opaque 一致);组 RT alpha 不进入呈现读回。
         force_opaque(&mut screen_surface);
@@ -365,7 +467,9 @@ impl WgpuRenderer {
                     Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
                         .with_detail("缺少显示缩放目标")
                 })?;
-                let mut surface = self.readback.read(
+                // 缩放输出只服务对账/测试的精确像素:保持当帧同步读,
+                // 且用独立的缓冲(与主读回同帧两次读会互踩)。
+                let mut surface = self.scale_readback.read_now(
                     &self.ctx,
                     &target.texture,
                     output.width,
@@ -381,6 +485,27 @@ impl WgpuRenderer {
                 Arc::clone(&screen_surface)
             }
         };
+        let screen_handle = if streaming {
+            self.targets
+                .screen()
+                .map(|target| (target.id, target.width, target.height))
+        } else {
+            None
+        };
+        if timing {
+            let total = started.elapsed();
+            log::trace!(
+                target: "yu-render",
+                "[rt] host render_total={:.2}ms plan={:.2} encode={:.2} readback={:.2} tail={:.2} uploads={} bytes={}",
+                total.as_secs_f64() * 1e3,
+                t_plan.as_secs_f64() * 1e3,
+                t_encode.as_secs_f64() * 1e3,
+                t_readback.as_secs_f64() * 1e3,
+                (total - t_plan - t_encode - t_readback).as_secs_f64() * 1e3,
+                self.gpu_textures.total_uploads - uploads_before,
+                self.gpu_textures.total_upload_bytes - bytes_before,
+            );
+        }
 
         self.backbuffer = Some(screen_surface);
         let stats = GpuStats {
@@ -400,11 +525,14 @@ impl WgpuRenderer {
             readback_bytes,
         };
 
-        Ok(WgpuRenderOutput {
-            surface,
-            report,
-            stats,
-        })
+        Ok((
+            WgpuRenderOutput {
+                surface,
+                report,
+                stats,
+            },
+            screen_handle,
+        ))
     }
 
     fn upload_vertices(&mut self, bytes: &[u8]) -> Result<(), Diag> {

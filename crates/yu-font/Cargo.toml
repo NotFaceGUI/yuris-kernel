@@ -6,6 +6,7 @@ license.workspace = true
 description = "YU-RIS font loading, glyph rasterization and text style composition"
 
 [dependencies]
+log = "0.4"
 yu-log = { path = "../yu-log" }
 # Pure-Rust outline/coverage rasterizer (wasm32 + Android clean).
 swash = { version = "0.2.10", default-features = false, features = ["std", "scale", "render"] }
