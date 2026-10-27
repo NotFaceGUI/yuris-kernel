@@ -1,0 +1,85 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已存在的版本 tag（例如 v0.1.0）"
+        required: true
+        type: string
+      dry_run:
+        description: "只校验并生成更新日志，不创建/修改 Release"
+        required: false
+        default: false
+        type: boolean
+
+# 默认只读；只有 release job 需要写 Release。
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="$INPUT_TAG"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$tag' 不是 vX.Y.Z 形式的版本 tag"
+            exit 1
+          fi
+          if ! git rev-parse --verify --quiet "refs/tags/$tag^{commit}" >/dev/null; then
+            echo "::error::tag '$tag' 不存在；手动运行前必须先推送 tag"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release tag: $tag"
+
+      - name: Test release tooling
+        run: python3 tools/release/test_release_notes.py -v
+
+      - name: Verify tag matches Cargo.toml version
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: python3 tools/release/release_notes.py check-version --tag "$RELEASE_TAG"
+
+      - name: Generate changelog
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p .release
+          python3 tools/release/release_notes.py notes --tag "$RELEASE_TAG" --output .release/notes.md
+          cat .release/notes.md
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          YU_RELEASE_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          python3 tools/release/release_notes.py publish --tag "$RELEASE_TAG" --notes-file .release/notes.md

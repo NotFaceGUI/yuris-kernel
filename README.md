@@ -150,6 +150,7 @@ target/release/yu-desktop.exe "<project-eris>" --backend wgpu --debug-ui
 - `docs/gfx-verification-ledger.md` — gfx 复核台账（Confirmed / Refuted / Uncertain）
 - `docs/gfx-unimplemented-todo.md` — 未实现模块 DIV 清单与解除条件
 - `docs/font-contract.md` / `docs/font-provenance.md` — 字体接口与取证
+- `docs/release.md` — tag 触发 Release 与更新日志；本地预演命令
 - `docs/oracle.md` — 对拍方法论；`docs/divergences/` — 不一致档案
 
 ## TODO 总览

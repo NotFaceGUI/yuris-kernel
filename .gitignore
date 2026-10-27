@@ -3,6 +3,9 @@ AGENTS.md
 
 /target
 
+# 本地预演 Release 更新日志的产物
+/.release
+
 # 机器相关配置(含本机路径)
 .cargo/
 
