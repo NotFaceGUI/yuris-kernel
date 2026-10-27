@@ -24,6 +24,8 @@ pub mod code {
     /// 存档文件写入失败(预留;当前写路径被忠实性门禁拒绝,见
     /// `WRITE_REFUSED`)。
     pub const FILE_WRITE: &str = "sv.file.write";
+    /// 文件/空文件夹已删除(信息级事实,不是未实现)。
+    pub const FILE_DELETED: &str = "sv.file.deleted";
     /// YSSD 容器解析失败(载荷来自 `yu-format::yssd` 的诊断)。
     pub const CONTAINER: &str = "sv.container";
     /// 路径越界:目标解析后不在 save 根内(安全拒绝,不猜)。
@@ -50,6 +52,7 @@ pub const ALL_CODES: &[&str] = &[
     code::FILE_MISSING,
     code::FILE_READ,
     code::FILE_WRITE,
+    code::FILE_DELETED,
     code::CONTAINER,
     code::PATH_ESCAPE,
     code::WRITE_REFUSED,

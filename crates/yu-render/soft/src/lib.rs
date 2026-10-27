@@ -3,6 +3,21 @@
 //! 本 crate 只消费 `yu-gfx` 的公开契约,把一帧 [`CompositorFrame`] 合成为
 //! RGBA8,并编码成 PNG。它是确定性参考实现,不替代 GPU 后端。
 //!
+//! # 定位(2026-10-27 起):CPU 模式 + 对拍基线
+//!
+//! 本 crate 就是 `--backend soft`(**CPU 模式**),同时充当 `yu-backend-wgpu`
+//! 的语义参考与逐像素对拍基线。两条实现**互相独立**:
+//!
+//! - 这里的像素算法(`apply_*`、`blend_transition`、`scale_region`、`blit`)
+//!   **不得**被 GPU 后端在运行期调用 —— GPU 模式的像素工作必须由 GPU 完成。
+//!   否则(a)双后端失去交叉验证价值,(b)GPU 模式被 CPU 循环拖住。
+//! - `Surface`/`RenderReport`/`SkippedOp`/`AssetIssue`、[`texture::TextureStore`]
+//!   (资产解码)与 [`text::TextComposer`](字形栅格化)属于**共享契约与平台
+//!   设施**,物理上寄居本 crate 只是历史归属,应迁到共享 crate;GPU 后端
+//!   可以引用它们。
+//!
+//! 判定规则、现状账本与迁移顺序见 `docs/architecture/backends.md`。
+//!
 //! # 执行契约(与 `docs/render-parity.md` §12 一致)
 //!
 //! 1. 严格按 `CompositorFrame.passes` 顺序执行,不重排、不合并;

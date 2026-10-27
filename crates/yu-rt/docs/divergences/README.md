@@ -26,6 +26,7 @@
 | DIV-RT-054 | `CGACT[SIZE/SIZE2]` 的 `SX/SY/X/Y/X2/Y2` 被按整数读取 | **fixed(2026-10-25)** | 根因:`cgact_image` 用 `find_int` 取这六个参数,而 `EngineValue::as_int` 要求 `fract()==0`。`es_Sprite.yst` 的 `es.CGACT_SIZE` 传的是**缩放后的实际像素范围**(实测 `CGACT[ID=SPLBUF401 ID2=SPL401 SIZE=1 X=0 Y=0 X2=1100 Y2=824.5 SX=1101 SY=825.5]`),`.5` 是正常值。旧实现把 `Y2`/`SY` 静默判成「未给」⇒ 区域只剩 3 字段 (`gfx.imageop.region.partial`)+ 尺寸缺失(`gfx.imageop.size.missing`)⇒ 整条 SIZE 被跳过 ⇒ sprite 层永远拿不到像素。修法:`SX/SY` 走 `find_f64` 后取整、`X/Y/X2/Y2` 走新增的 `find_px`(浮点四舍五入)、`ImageOp.sx/sy` 与 JSON 改浮点保值;soft/wgpu 后端同步。实测 `ops 83/83 drawn, 0 skipped`(此前 77/79,2 skipped),片头 LOGO 上屏。台账细节见 `docs/divergences/DIV-GFX-046-sprite-bg-hold.md` §L |
 | DIV-RT-055 | YPF 封包版本上限 `495` 是硬编码闸门 | **fixed(2026-10-25)** | 根因:`MAX_ACCEPTED_VERSION = 495`,高于此值直接 `Unimplemented` 拒启。但 REA 证明索引装载器 `FUN_0045e3b8` **逐字节无版本分支**(起点 `0x20`、步长 `nameLen+0x1B`、长度码表 `T[0xFF-lenEnc]`、名字取反全为常量),`version` 只读入不参与分支;项目自己的 `equivalence.rs` 也早有 「version=300 必须能读」用例。真实商业作品存在 YPF v500(`<game-a>`),旧闸门会直接拒掉。修法:去掉上限,改名为 `VERIFIED_MAX_VERSION` 并注明「仅信息,非门禁」,把关交给后续结构校验(entry_count 上限 / 索引容量 / `detect_layout` 方言探测 / 名字 MurmurHash)。下限 234 保留(早期布局无样本)。复核 `equivalence::engine_layout_with_version_500_is_readable` |
 | DIV-RT-056 | `FILEINFO[SIZE/RELATION]` 未实现 | **fixed(no-manual)(2026-10-25)** | REA `0x44286c`:SIZE 分支 `0x443572` = `FindFirstFileA` → 目录 0 / 文件 `nFileSizeLow`(32 位)/ 找不到 0;RELATION 分支 `0x4429e6→0x442a20` = `FindExecutableA(NULL,FILE,buf)` → 关联 exe 全路径写**字符串** LET。手册 `file/fileinfo.html` 例 3/4 有页。实现:SIZE 走宿主文件系统(`$_SAVE_PATH` 前缀解析,封包内文件与官方一致查不到=0);RELATION 内核恒空串(B7 接 `FindExecutableW` 前的宿主能力位;`FindExecutableA` 失败同样得空串,脚本判空安全)。FOLDER 查询保持挂号(手册注明封包内文件夹不可查;语料 0 次)。复核:全量用例 9/9、fixture 79 | 
+| DIV-RT-057 | Save/File 域事件在帧末才应用(`FILEACT[DELETE]` 晚于同帧 `SAVE[FILE]` 刷盘) | **fixed(2026-10-27)** | 根因:`Vm::emit` 只对 Graphics/Window/Sound 同步 `apply_event`,Save/File 仅入队,由 `Engine::tick` 帧末 `apply_events`;`es_SaveLoad.yst` 的存档流程是「pc315 先删旧槽 → pc341 `SAVE[FILE]` 同步刷盘」,延迟的删除落在刷盘之后,刚写出的存档被删,`SAVEEND` 再清预约 ⇒ 无文件、无报错。修法:统一为命令时刻同步(`Vm::emit` 对 `Domain::Save|File` 也调用 `apply_event`,Engine 帧末不再重复喂),与官方 `FILEACT` 就地执行一致。复核 `fixture::fileact_is_applied_before_save_file_flush_in_same_frame`;桌面复现 `save30002.sd` 25608 字节保留 |
 | DIV-RT-011 | 手册有页但语义未取证的命令(VARINFO SEARCH / VARACT INIT·G_* / F_* / ERROR) | open | 仅剩 VARINFO `STRTYPE/SJISCODE/UTF8CODE`(无手册例)、`VAR`/`CSVINFO`(无页/未取证,AU5 补录)与 `CDDA`(空桩,见 sound-ledger N0-10);SEARCH/INIT·G_*/RETURNCODE/WORD/F_*/PREP 已另证实现 |
 | DIV-RT-012 | `SAVE`/`LOAD` 的盘上存档格式 | fixed | `yu-format::yssd` 官方 5 文件 269 块逐字节 roundtrip;`yu-save` 宿主消费域事件(忠实写盘受 DIV-RT-042 门禁) |
 | DIV-RT-013 | `HANTOZEN`/`ZENTOHAN` 转换表 | fixed | 三张表已自 0.495 exe 取出落 `data/case-tables-0495.tsv`;算法逐条对照 REA |
@@ -1127,3 +1128,40 @@ packed = ([1290322, 329227, 26, 249, 8765, 8765], 0, "cd1790…4bd2e")  ... ok
   `cargo test -p yu-rt` 全绿(65 lib + 11 corpus + 68 fixture + 3 golden)。
   审查工具:`examples/dump_label_cmds.rs`(标签反汇编 / `scan:<sid>` /
   `scanmath` 全语料 MATH/VARACT 旗标形态统计)。
+
+---
+
+## DIV-RT-057 · Save/File 域事件在帧末才应用(2026-10-27)
+
+- **现象**:点击菜单存档后目标 `.sd` 被删除且不再生成;日志只有
+  `FILEACT[DELETE] 已删 …` 与可恢复告警(VARINFO STRTYPE、`SAVE[ID]`、
+  `SAVE[SET]` 系统变量),**没有 Fatal**。
+- **根因**:`Vm::emit` 只对 Graphics/Window/Sound 域同步调用
+  `host.apply_event`;Save/File 域仅入队,由 `Engine::tick` 在整帧脚本
+  执行完后 `host.apply_events(&events)`。而存档脚本
+  `es_SaveLoad.yst` 的顺序是:
+  1. `pc315 FILEACT[FILE=$es.SAVEPATH+$SFNAME DELETE=1]` → 删除事件**入队**;
+  2. `pc341 SAVE[FILE=$SFNAME]` → `op_save` **同步** `host.flush` 写盘;
+  3. 帧末 drain → 才执行第 1 步的删除 ⇒ 刚写出的存档被删;
+  4. `pc342 SAVEEND[]` → 清空预约 ⇒ 最终既无文件也无错误。
+- **临时探针证据**(已还原):同一帧内依次打印
+  `AUDIT FILEACT script=19 pc=315` → `AUDIT SAVE flush pc=341 file=save30002.sd`
+  → `AUDIT FLUSH ok exists=true`(25602 字节)→ `AUDIT FILEACT DELETE`
+  → `final exists=false`。把 Save/File 事件临时改为 `emit` 同步应用后,
+  删除排到 flush 之前,文件保留(但引擎随后仍 drain 一次,事件被重复
+  应用;故修复必须"同步 + 只消费一次")。
+- **引入点**:该顺序问题是 SaveHost 接线(B1,`16cef47`,2026-10-24)以来
+  的结构性问题,不是近期 TASKINFO/TASK/SCRIPTPOS/VARINFO 改动;`Vm::emit`
+  自 `d66ed41` 起从未同步处理 Save/File。修复前的最后一次内核菜单存档
+  `save00001.sd`(2026-10-25)缺少 DNO 3(缩略图)与 DNO 90(ICON),
+  与内核两个既有缺口一致;说明当时存档成功过,但写入/删除时序未覆盖。
+- **修法(统一,不打补丁)**:所有域宿主统一为**命令时刻同步**——
+  `Vm::emit` 对 `Domain::Save | Domain::File` 也调用
+  `save_host.apply_event`;`Engine::tick` 帧末只保留事件统计/trace,
+  不再把同一批事件喂给 `SaveHost`。事件仍入队供 `yu-trace`/golden 记录。
+  这与官方 `FILEACT` 处理体就地执行一致,避免"同步写、延迟删"。
+- **复核**:`fixture::fileact_is_applied_before_save_file_flush_in_same_frame`
+  (顺序 = FILEACT → SAVE → flush → SAVEEND);`cargo test -p yu-rt`
+  (82 lib / 4 consistency / 11 corpus / 4 corpus_golden / 95 fixture /
+  3 golden);`cargo check --workspace --all-targets` 通过;桌面复现
+  (临时 save 根)菜单存档后 `save30002.sd` 25608 字节保留。

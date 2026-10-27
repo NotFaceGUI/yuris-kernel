@@ -415,8 +415,14 @@ pub struct LoadedBlock {
 /// `FILE` 只写文件头与偏移表),`LOAD` 的写回在命令时刻落地——异步事件流
 /// 两者都拿不到正确时序。未安装宿主时,SAVE/LOAD/SAVEEND 保持纯域事件
 /// (M-2 既有行为,600 帧普查逐位不变)。
+///
+/// `FILEACT`/`FILEINFO`/`SAVEINFO` 也走 [`SaveHost::apply_event`](Self::apply_event),
+/// 由 `Vm::emit` 在**命令时刻**同步调用:官方 `FILEACT` 处理体就地删除/复制;
+/// 若推迟到帧末 drain,存档脚本「先删旧槽、再 `SAVE[FILE]` 刷盘」会让删除
+/// 落在写盘之后,刚写出的存档被删。
 pub trait SaveHost {
     /// 同步应用一条事件(仅 `Domain::Save | Domain::File` 的 DomainCall;
+    /// `Vm::emit` 在命令时刻调用,调用方不得再把 drain 出的同一事件喂入;
     /// SAVE/LOAD/SAVEEND 的语义走下面的专用方法,宿主不得重复消费)。
     fn apply_event(&mut self, ev: &VmEvent);
 

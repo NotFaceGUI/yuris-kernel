@@ -502,9 +502,9 @@ impl Vm {
                     // 文件域由 `SaveHost` 消费:实现在 `yu_save::SaveState::
                     // apply_event` 的 match 里,逐命令是
                     // `FILEACT`(落盘/复制/删除)与 `FILEINFO`(事实统计)。
-                    // `SaveHost::apply_event` 的契约是「事件 drain 时调用」
-                    // (见 `event.rs` trait 注释),不在本命令点同步发生,
-                    // 所以判据是「宿主已安装 **且命令名确实被它处理**」。
+                    // `SaveHost::apply_event` 与 Graphics/Sound 一样在
+                    // `Vm::emit` 的**命令时刻**同步调用(官方 FILEACT 就地
+                    // 执行);判据是「宿主已安装 **且命令名确实被它处理**」。
                     //
                     // 必须按名收窄:早前写成整个 `Domain::File` 会把
                     // `FOLDER` 之类**真未实现**的查询一起吞掉,那才是掩盖问题。
@@ -2189,14 +2189,15 @@ impl Vm {
         // 缺省目标 = 执行者自身(手册;REA 0x45074a 用当前任务记录)。
         let target_id = id.unwrap_or_else(|| task.id.clone());
         // SCRIPTPOS 串在两条分支里都要用:先统一解码 + 脚本名反查。
-        let mut decoded_pos = match script_pos {
-            Some(bytes) => Some(self.decode_scriptpos(&bytes)?),
+        // 旧内核存档(2026-10-26 前)是 8 字节 `[script_id u32 LE][pc u32 LE]`:
+        // 这不是引擎串,但为了不让旧存档读档直接 Fatal,按兼容路径还原
+        // (无 IF/GOSUB/LOOP 栈与 text_line;script_id 已能定位脚本)。
+        let decoded = match script_pos {
+            Some(bytes) => Some(self.decode_scriptpos_compat(&bytes)?),
             None => None,
         };
-        let decoded_sid = match &decoded_pos {
-            Some(sp) => Some(self.script_id_by_path(&sp.script_name)?),
-            None => None,
-        };
+        let mut decoded_pos = decoded.as_ref().map(|(sp, _)| sp.clone());
+        let decoded_sid = decoded.as_ref().and_then(|(_, sid)| *sid);
         match label {
             Some(label) => {
                 let seed = TaskSeed {
@@ -2588,6 +2589,43 @@ impl Vm {
         scriptpos::ScriptPos::decode(blob).map_err(|e| -> VmError {
             diag::fatal(code::rt::SCRIPT_POS, Boundary::Script, e).into()
         })
+    }
+
+    /// 解码 SCRIPTPOS:优先引擎线格式;旧内核 8 字节 blob 走兼容路径。
+    ///
+    /// 旧格式(2026-10-26 前)是 `[script_id u32 LE][pc u32 LE]`,没有三栈
+    /// 与 text_line;脚本号直接按 yst_list 定位(不依赖脚本名字节)。仅用于
+    /// 读旧存档;新存档/官方存档仍走 [`scriptpos::ScriptPos::decode`]。
+    fn decode_scriptpos_compat(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(scriptpos::ScriptPos, Option<u32>), VmError> {
+        if bytes.len() == 8 && bytes != scriptpos::MAGIC.as_slice() {
+            let sid = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let pc = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            let known = u16::try_from(sid)
+                .ok()
+                .and_then(|s| self.tables().boot.scripts.path_of(s))
+                .is_some();
+            if !known {
+                return Err(diag::fatal(
+                    code::rt::SCRIPT_POS,
+                    Boundary::Script,
+                    format!("SCRIPTPOS: 旧内核 blob 的脚本号 {sid} 不在 yst_list 清单"),
+                )
+                .into());
+            }
+            return Ok((
+                scriptpos::ScriptPos {
+                    pc,
+                    ..Default::default()
+                },
+                Some(sid),
+            ));
+        }
+        let sp = self.decode_scriptpos(bytes)?;
+        let sid = self.script_id_by_path(&sp.script_name)?;
+        Ok((sp, Some(sid)))
     }
 
     fn script_id_by_path(&self, name: &[u8]) -> Result<u32, VmError> {
@@ -3153,6 +3191,10 @@ impl Vm {
     // ---------------------------------------------------------- 存档域(B1)
 
     /// 一个变量的整组快照(SAVE 预约 / LOAD 对拍用)。
+    ///
+    /// 普通变量走变量域槽位。系统变量没有 `VarSlot`:`op_save` 的 SET 分支
+    /// 已按引用求值(如 `@_RINT(1)`),那里直接以标量结果成块(官方
+    /// DNO 90 = Int 标量、dims=[],见 `op_save`)。
     fn var_snapshot(&self, var: VarRef) -> Option<crate::event::VarSnapshot> {
         let slot = self.store.slot(var)?;
         Some(crate::event::VarSnapshot {
@@ -3295,9 +3337,25 @@ impl Vm {
                 if let Some(d) = failure {
                     return Err(VmError::from(self.locate(d)));
                 }
-            } else if let Some((lv, _)) = set {
+            } else if let Some((lv, v)) = set {
                 let var = self.canonical_var(lv.var);
-                let snap = self.var_snapshot(var);
+                // 普通变量 = 整组槽位快照;系统变量(`@_RINT(1)` 等)没有
+                // VarSlot,但 SET 窗口已在命令时刻按引用求值 —— 官方把该值
+                // 写成**标量块**(DNO 90 实测:type=Int、dims=[]、data=[0])。
+                let snap = self.var_snapshot(var).or_else(|| {
+                    (var.id < self.sys_count).then(|| {
+                        let ty = match &v {
+                            Value::Int(_) => ElemType::Int,
+                            Value::Float(_) => ElemType::Float,
+                            Value::Str(_) => ElemType::Str,
+                        };
+                        crate::event::VarSnapshot {
+                            ty,
+                            dims: Vec::new(),
+                            data: vec![v],
+                        }
+                    })
+                });
                 match snap {
                     Some(snap) => {
                         let failure = match self.save_host.as_mut() {
@@ -3316,7 +3374,9 @@ impl Vm {
                         ));
                     }
                 }
-            } else {
+            } else if !layer_id {
+                // 只有 ID 的块(缩略图)合法;它的未实现在上面的
+                // `SAVE[ID] 图层快照未实现` 已挂号,不再误报缺 SET/G_*。
                 self.report(diag::recoverable(
                     code::rt::CMD_SLOT,
                     Boundary::Script,

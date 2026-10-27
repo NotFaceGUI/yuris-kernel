@@ -772,12 +772,11 @@ impl Engine {
             }
         }
         self.frame = self.frame.saturating_add(1);
-        // 事件 drain:统计 + 存档域事实消费(Save/File 域;P4 M-C)。
+        // 事件 drain:统计 + trace/golden 记录。存档/文件域事实
+        // (`FILEACT`/`FILEINFO`/`SAVEINFO`)已在 `Vm::emit` 的命令时刻
+        // 同步喂给 `SaveHost`(与 Graphics/Sound 同口径),这里不得重复消费。
         let events = vm.take_events();
         self.events_drained += events.len() as u64;
-        if let Some(host) = &self.save_host {
-            host.apply_events(&events);
-        }
         // `MOUSE[X/Y]`:内核已改脚本可见坐标;宿主同步到时间线,下一帧
         // 的光标与脚本看到的一致(引擎同时 SetCursorPos)。
         let warp = vm.input_state_mut().take_cursor_warp();
@@ -1511,10 +1510,11 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     } else {
         None
     };
-    // 存档域宿主(P4 M-C;B1 存档闭环):同一 `SaveHost` 双通道——
+    // 存档域宿主(P4 M-C;B1 存档闭环):同一 `SaveHost` 全部命令时刻同步——
     // ① 安装进 VM(同步契约:SAVE 预约/刷盘、LOAD 拉取,REA 0x44d73d/
     //    0x447b3d 的命令时刻时序);
-    // ② 事件事实消费(FILEACT/SAVEINFO/FILEINFO;Engine 每帧 drain 喂入)。
+    // ② 事件事实(FILEACT/SAVEINFO/FILEINFO)也由 `Vm::emit` 命令时刻同步
+    //    喂入(与 Graphics/Sound 同口径;帧末 drain 不得重复消费)。
     // 可写 = 默认(2026-10-24 主人令;原版存档已备份 save-backup-20261024/)。
     let save_host = {
         // 可写 = 默认(2026-10-24 主人令;原版存档已备份 save-backup-20261024/)。

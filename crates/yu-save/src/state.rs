@@ -213,7 +213,7 @@ impl SaveState {
         }
     }
 
-    /// 消费一条域事件(调用方从 `Vm::take_events()` 的 drain 里喂入;
+    /// 消费一条域事件(`Vm::emit` 在**命令时刻**同步喂入;
     /// 只关心 `Domain::Save | Domain::File`)。参数名经工程 `yscm` 取。
     pub fn apply_event(&mut self, ev: &VmEvent, yscm: &YscmTable) {
         let VmEvent::DomainCall {
@@ -631,10 +631,7 @@ impl SaveState {
             Ok(()) => {
                 self.refresh_slots();
                 self.push_diag(error::at_command(
-                    error::info(
-                        code::COMMAND_UNIMPLEMENTED,
-                        format!("FILEACT[DELETE] 已删 {file}"),
-                    ),
+                    error::info(code::FILE_DELETED, format!("FILEACT[DELETE] 已删 {file}")),
                     frame,
                     "FILEACT",
                 ));
@@ -690,7 +687,7 @@ impl SaveState {
             Ok(()) => {
                 self.push_diag(error::at_command(
                     error::info(
-                        code::COMMAND_UNIMPLEMENTED,
+                        code::FILE_DELETED,
                         format!("FILEACT[DELETE] 已删空文件夹 {folder}"),
                     ),
                     frame,

@@ -882,9 +882,11 @@ impl Vm {
     }
 
     /// 安装存档域同步宿主(B1)。安装后 `SAVE`/`LOAD`/`SAVEEND` 在**命令
-    /// 时刻**走 [`crate::event::SaveHost`] 的预约/刷盘/拉取契约;域事件
-    /// 照常产生(trace 事实流,现在携带 `SET`/`LET` 的变量引用)。宿主
-    /// 自身不得再消费这三条命令的 DomainCall(会重复)。
+    /// 时刻**走 [`crate::event::SaveHost`] 的预约/刷盘/拉取契约;
+    /// `FILEACT`/`FILEINFO`/`SAVEINFO` 的 DomainCall 也在 [`Vm::emit`] 里
+    /// **同步**喂给宿主(与 Graphics/Sound 同口径,官方处理体就是命令时刻
+    /// 执行)。事件照常入队供 trace 记录,因此**调用方不得再把 drain 出来的
+    /// 同一批事件喂给宿主**(会重复应用)。
     pub fn set_save_host(&mut self, host: Box<dyn crate::event::SaveHost>) {
         self.save_host = Some(host);
     }
@@ -1542,6 +1544,22 @@ impl Vm {
         );
         if sound_relevant {
             if let Some(host) = self.sound_host.as_mut() {
+                host.apply_event(&ev);
+            }
+        }
+        // 存档/文件域事实(`FILEACT`/`FILEINFO`/`SAVEINFO`)同样在**命令时刻**
+        // 落地:官方 `FILEACT` 处理体就地删除/复制。若推迟到帧末 drain,
+        // 存档脚本「先删旧槽、再 `SAVE[FILE]` 同步刷盘」会让删除落在写盘
+        // 之后,刚写出的存档被删。事件仍入队供 trace/golden 记录。
+        let save_relevant = matches!(
+            &ev,
+            VmEvent::DomainCall {
+                domain: crate::event::Domain::Save | crate::event::Domain::File,
+                ..
+            }
+        );
+        if save_relevant {
+            if let Some(host) = self.save_host.as_mut() {
                 host.apply_event(&ev);
             }
         }

@@ -34,6 +34,9 @@ use crate::device::{code, GpuContext};
 use crate::pipelines::{FilterKind, PipelineCache};
 use crate::textures::{TargetSet, TextureCache, Vertex};
 
+/// COPY 目标表面的尺寸,按**命令序**预先定稿(见 [`plan`] 步骤 0)。
+pub(crate) type SnapshotDims = BTreeMap<CopyId, (u32, u32)>;
+
 /// 计划中的一个 pass 目标。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PlannedTarget {
@@ -128,6 +131,9 @@ struct ImageOpStats {
     /// `REVERSE` 等逐像素变换。
     pixel: u64,
     pixel_ms: f64,
+    /// `MERGE/MERGE2/XOR/AND/TRANSITION`:整面 CPU 合成(逐像素)。
+    composite: u64,
+    composite_ms: f64,
 }
 
 impl ImageOpStats {
@@ -151,6 +157,11 @@ impl ImageOpStats {
         ) {
             self.pixel += 1;
             self.pixel_ms += ms;
+        } else if action.is_layer_composite()
+            || matches!(action, yu_gfx::op::ImageAction::Other("transition"))
+        {
+            self.composite += 1;
+            self.composite_ms += ms;
         }
     }
 }
@@ -184,6 +195,7 @@ pub(crate) fn plan(
     targets: &mut TargetSet,
     uploaded_overrides: &mut BTreeMap<LayerId, (u64, u32, u32, u64)>,
     image_cache: &mut BTreeMap<yu_backend_soft::ImageCacheKey, Override>,
+    composite_cache: &mut BTreeMap<LayerId, (u64, Rc<Texture>)>,
     backbuffer: Option<&yu_backend_soft::Surface>,
     backbuffer_gpu: &mut Option<(u64, u64)>,
     text: &mut TextComposer,
@@ -204,32 +216,171 @@ pub(crate) fn plan(
     let mut transition_bind_groups: Vec<wgpu::BindGroup> = Vec::new();
     let mut transition_buffers: Vec<wgpu::Buffer> = Vec::new();
 
+    // 0. 快照表面尺寸,按**命令序**预先定稿。
+    //
+    // 官方 `FUN_0042f809` 在 COPY 命令执行时建目标表面、把区域尺寸写回层
+    // 并且立即生效;所以「先 COPY、后 SIZE」的同一帧里,后面的加工读到的
+    // 就是已经建好的表面尺寸。本内核把图像加工提前到命令段之前预执行,
+    // 若那时才想从 GPU 目标反查尺寸,目标还不存在 ⇒
+    // `gfx.imageop.source.snapshot_missing` ⇒ 整层跳一帧
+    // (`es_SPExec.yst` 立绘归位:COPY 351 之后紧跟 SIZE2,实测那一帧立绘
+    // 消失,2026-10-27)。
+    //
+    // 尺寸只由「目标层声明尺寸 / 复制区域」决定,与源像素无关,因此在
+    // 命令序扫描里就能定稿;镜像捕获、命令段建纹理、后续加工统一引用这
+    // 一份值,避免三处各算一遍。
+    let mut snapshot_dims: SnapshotDims = BTreeMap::new();
+    for pass in &frame.passes {
+        for op in &pass.ops {
+            let Op::Copy(copy) = op else { continue };
+            if copy.status != OpStatus::Executable {
+                continue;
+            }
+            if let Ok(dims) = copy_output_dims(frame, textures, targets, &snapshot_dims, copy) {
+                snapshot_dims.insert(copy.id, dims);
+            }
+        }
+    }
+
     // 1.4 快照 CPU 镜像预捕获(DIV-GFX-058,按命令序):1.5 的文本基面解析
     //     需要快照像素,而 GPU 快照在命令段才捕获;这里先把 CPU 可得源(资产/
     //     1×1 黑/另一快照镜像)按 soft `apply_copy_op` 的同一构造(目标尺寸 +
     //     区域裁剪)落成镜像。带冻结文本的 COPY 在 1.6 段连文本一起落。
+    //
+    // **迭代到不动点**:`es_SPExec.yst` 的立绘换图是链式快照
+    // (`SPLBUFa601` → 快照 349 → `SPLBUF601` → 快照 351),后者的源是前者的
+    // 镜像。单遍顺序扫描时若上游镜像在同遍更晚才建,下游就永远拿不到
+    // (`gfx.imageop.source.snapshot_missing` ⇒ 该帧整层被 skip ⇒ 归位闪)。
+    // 每轮只要有新增就再扫一遍;链长不会超过本帧 op 数,故上限取 op 数。
     let mark = started.elapsed();
-    for pass in &frame.passes {
-        let PassTarget::Texture(_) = &pass.target else {
-            continue;
-        };
-        for op in &pass.ops {
-            let Op::Copy(copy) = op else { continue };
-            if copy.status != OpStatus::Executable
-                || !copy.texts.is_empty()
-                || targets.snapshot(copy.id).is_some()
-                || targets.snapshot_cpu(copy.id).is_some()
-            {
+    let copy_count = frame
+        .passes
+        .iter()
+        .filter(|pass| matches!(pass.target, PassTarget::Texture(_)))
+        .map(|pass| pass.ops.len())
+        .sum::<usize>();
+    for _ in 0..=copy_count {
+        let mut progress = false;
+        for pass in &frame.passes {
+            let PassTarget::Texture(_) = &pass.target else {
                 continue;
+            };
+            for op in &pass.ops {
+                let Op::Copy(copy) = op else { continue };
+                // 只按 **CPU 镜像**是否已存在判「已捕获」。
+                //
+                // 旧条件还要求 `targets.snapshot(copy.id).is_none()`(GPU 快照
+                // 不存在),但 GPU 快照一旦冻结就长期存在,而 CPU 镜像会随
+                // `prune_snapshots` 的存活集合变化被单独剪掉。两者用同一条件
+                // 判断会让「GPU 快照在、镜像被剪」的组合永久缺镜像 ⇒
+                // `gfx.imageop.source.snapshot_missing` ⇒ 立绘归位那帧画成
+                // 纯黑(2026-10-27 实测:`SPLBUF601` 持 `Snapshot(351)`,
+                // 351 的 GPU 快照在、镜像不在)。
+                if copy.status != OpStatus::Executable
+                    || !copy.texts.is_empty()
+                    || targets.snapshot_cpu(copy.id).is_some()
+                {
+                    continue;
+                }
+                if capture_copy_mirror(frame, textures, targets, &snapshot_dims, copy) {
+                    progress = true;
+                }
             }
-            capture_copy_mirror(frame, textures, targets, copy);
+        }
+        if !progress {
+            break;
         }
     }
     t_snap = started.elapsed() - mark;
 
+    // 0.5 合成链记忆化。
+    //
+    // 目标层本帧的「整面清屏 + 若干 MERGE」是一条**纯函数**链:输入(动作
+    // 序列、几何、各源像素身份、源的文本修订号)逐项相同时,输出像素必然
+    // 相同。官方逐帧重算,结果一致;这里直接复用上一帧的表面,跳过整条
+    // 逐像素链。现场(β4 演出1 的对话窗):每帧 40 条 MERGE/MERGE2 全走
+    // CPU `apply_merge`,800×600 × 40 ≈ 10.9ms/帧(`composite=40(10.87ms)`
+    // 实测,占规划时间 12.7ms 的绝大部分)。
+    //
+    // 只对「链首是整面 RECTPAINT」的层生效:它把旧表面整块覆盖,结果才与
+    // 上一帧内容无关。目标层是快照时不做(那里的 RECTPAINT 走 GPU 命令段)。
+    let mut overrides: BTreeMap<LayerId, Override> = BTreeMap::new();
+    let mut memo_skip: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut memo_last: BTreeMap<LayerId, (usize, usize)> = BTreeMap::new();
+    let mut memo_sig: BTreeMap<LayerId, u64> = BTreeMap::new();
+    composite_cache.retain(|id, _| frame.layers.iter().any(|layer| &layer.id == id));
+    {
+        let mut chains: BTreeMap<LayerId, Vec<(&ImageOp, (usize, usize))>> = BTreeMap::new();
+        for (pass_index, pass) in frame.passes.iter().enumerate() {
+            let PassTarget::Texture(_) = &pass.target else {
+                continue;
+            };
+            for (op_index, op) in pass.ops.iter().enumerate() {
+                let Op::Image(image) = op else { continue };
+                if op.status() != OpStatus::Executable {
+                    continue;
+                }
+                let target = image.target.as_ref().unwrap_or(&image.source).clone();
+                chains
+                    .entry(target)
+                    .or_default()
+                    .push((image, (pass_index, op_index)));
+            }
+        }
+        for (layer, ops) in chains {
+            // 单条 MERGE 只 0.26ms,链太短不值得记。
+            if ops.len() < 4 {
+                continue;
+            }
+            // 链的起点是**层基图**:每帧的第一条 op 在 `apply_image_to_override`
+            // 里取 `resolve_base_texture`(不是上一帧的结果),所以整条链是
+            // 「基图 + op 列表 + 各源像素」的纯函数 —— 链首是否整面清屏并不
+            // 影响这个结论,只要基图本身可寻址(资产/1×1 黑)。
+            match frame
+                .layers
+                .iter()
+                .find(|entry| entry.id == layer)
+                .map(|entry| &entry.texture)
+            {
+                Some(TextureRef::Asset(_) | TextureRef::SolidBlack1x1) => {}
+                _ => continue,
+            }
+            if !ops
+                .iter()
+                .all(|(op, _)| is_full_paint(op) || op.action.is_layer_composite())
+            {
+                continue;
+            }
+            if snapshot_of(frame, &layer).is_some() {
+                continue;
+            }
+            let signature = chain_signature(frame, targets, &overrides, &ops);
+            match composite_cache.get(&layer) {
+                Some((cached, texture)) if *cached == signature => {
+                    // 命中:形状与像素都等价 ⇒ 直接沿用,链上每条都算已执行
+                    // (与 soft 逐条重算的计数口径一致)。
+                    overrides.insert(
+                        layer.clone(),
+                        Override::with_hash(texture.clone(), signature),
+                    );
+                    acc.ops_total += ops.len();
+                    acc.ops_drawn += ops.len();
+                    for (_, at) in &ops {
+                        memo_skip.insert(*at);
+                    }
+                }
+                _ => {
+                    memo_sig.insert(layer.clone(), signature);
+                    if let Some((_, at)) = ops.last() {
+                        memo_last.insert(layer, *at);
+                    }
+                }
+            }
+        }
+    }
+
     // 1. RECTPAINT/REVERSE/HORIZONTAL:CPU 预执行到图层覆盖纹理。
     //    目标是快照的 RECTPAINT 族推迟到命令段(GPU 直接在快照纹理上画)。
-    let mut overrides: BTreeMap<LayerId, Override> = BTreeMap::new();
     // 文本合成产生的覆盖层(DIV-GFX-058):COPY 取源面时跳过(快照只带
     // 命令时刻冻结的 `copy.texts`)。
     let mut text_override_ids: BTreeSet<LayerId> = BTreeSet::new();
@@ -244,6 +395,9 @@ pub(crate) fn plan(
         };
         acc.passes += 1;
         for (op_index, op) in pass.ops.iter().enumerate() {
+            if memo_skip.contains(&(pass_index, op_index)) {
+                continue;
+            }
             match op {
                 Op::Image(image) if op.status() == OpStatus::Executable => {
                     let image_target = image.target.as_ref().unwrap_or(&image.source);
@@ -275,6 +429,7 @@ pub(crate) fn plan(
                         frame,
                         textures,
                         targets,
+                        &snapshot_dims,
                         target,
                         image,
                         &mut overrides,
@@ -284,6 +439,14 @@ pub(crate) fn plan(
                     match result {
                         Ok(()) => acc.ops_drawn += 1,
                         Err(reason) => acc.skip(op, reason),
+                    }
+                    // 链尾:把结果记进记忆化缓存,下一帧同输入直接复用。
+                    if memo_last.get(image_target) == Some(&(pass_index, op_index)) {
+                        if let Some(signature) = memo_sig.get(image_target).copied() {
+                            if let Some(Override::Cpu { tex, .. }) = overrides.get(image_target) {
+                                composite_cache.insert(image_target.clone(), (signature, tex.clone()));
+                            }
+                        }
                     }
                 }
                 // 可执行 COPY 在命令段计数(需要先有组离屏结果)。
@@ -536,7 +699,7 @@ pub(crate) fn plan(
                             dst_height: 0,
                         };
                         planner.acc.ops_total += 1;
-                        match planner.plan_copy(target, copy, &mut commands) {
+                        match planner.plan_copy(target, copy, &snapshot_dims, &mut commands) {
                             Ok(()) => planner.acc.ops_drawn += 1,
                             Err(reason) => planner.acc.skip(op, reason),
                         }
@@ -768,12 +931,14 @@ pub(crate) fn plan(
         );
         log::trace!(
             target: "yu-render",
-            "[rt]   image_paths sampled={} paint={}({:.2}ms) pixel={}({:.2}ms)",
+            "[rt]   image_paths sampled={} paint={}({:.2}ms) pixel={}({:.2}ms) composite={}({:.2}ms)",
             img_stats.sampled,
             img_stats.paint,
             img_stats.paint_ms,
             img_stats.pixel,
             img_stats.pixel_ms,
+            img_stats.composite,
+            img_stats.composite_ms,
         );
         log::trace!(
             target: "yu-render",
@@ -800,20 +965,49 @@ pub(crate) fn plan(
 }
 
 fn live_snapshots(frame: &CompositorFrame) -> BTreeSet<CopyId> {
+    // 存活快照的**传递闭包**。
+    //
+    // 起点:①层当前引用的快照(`SPLBUF601` 持 `Snapshot(351)`);②本帧 COPY
+    // 产出的快照;③COPY 命令时刻源纹理里的快照。
+    //
+    // 必须做闭包:快照可以由**另一快照**复制而来
+    // (`es_SPExec.yst` 的 `SPLBUFa601` → `sp.tmpA` → `SPLBUF601`),而上游
+    // 快照的产生 COPY 只在创建它的那一帧出现过。按「本帧是否被引用」判活会
+    // 在下一帧把上游快照剪掉 ⇒ 下游镜像无法重建
+    // (`gfx.imageop.source.snapshot_missing`)⇒ 立绘归位那帧画成纯黑。
     let mut live = BTreeSet::new();
     for layer in &frame.layers {
         if let TextureRef::Snapshot(id) = &layer.texture {
             live.insert(*id);
         }
     }
+    let mut pending: Vec<CopyId> = Vec::new();
     for pass in &frame.passes {
         for op in &pass.ops {
-            if let Op::Copy(copy) = op {
-                live.insert(copy.id);
-                // 中间层被删除后,后续 copy 仍以它的快照为源
-                // (`source_texture`);快照必须保留到消费完。
-                if let Some(TextureRef::Snapshot(id)) = &copy.source_texture {
-                    live.insert(*id);
+            let Op::Copy(copy) = op else { continue };
+            live.insert(copy.id);
+            pending.push(copy.id);
+            // 中间层被删除后,后续 copy 仍以它的快照为源
+            // (`source_texture`);快照必须保留到消费完。
+            if let Some(TextureRef::Snapshot(id)) = &copy.source_texture {
+                if live.insert(*id) {
+                    pending.push(*id);
+                }
+            }
+        }
+    }
+    // 沿「快照 ← 产生它的 COPY 的源」回溯,直到不动点。
+    while let Some(id) = pending.pop() {
+        for pass in &frame.passes {
+            for op in &pass.ops {
+                let Op::Copy(copy) = op else { continue };
+                if copy.id != id {
+                    continue;
+                }
+                if let Some(TextureRef::Snapshot(src)) = &copy.source_texture {
+                    if live.insert(*src) {
+                        pending.push(*src);
+                    }
                 }
             }
         }
@@ -830,10 +1024,11 @@ fn capture_copy_mirror(
     frame: &CompositorFrame,
     textures: &mut TextureStore,
     targets: &mut TargetSet,
+    snapshot_dims: &SnapshotDims,
     copy: &CopyOp,
-) {
+) -> bool {
     let CopySource::Layer(source_layer) = &copy.source else {
-        return;
+        return false;
     };
     let source: Texture = {
         let texture_ref = frame
@@ -844,28 +1039,27 @@ fn capture_copy_mirror(
             .filter(|t| !matches!(t, TextureRef::None))
             .or(copy.source_texture.as_ref());
         let Some(texture_ref) = texture_ref else {
-            return;
+            return false;
         };
         match texture_ref {
             TextureRef::Asset(key) => match textures.resolve(key) {
                 Ok(texture) => texture.clone(),
-                Err(_) => return,
+                Err(_) => return false,
             },
             TextureRef::SolidBlack1x1 => Texture::solid_black_1x1(),
             TextureRef::Snapshot(pid) => match targets.snapshot_cpu(*pid) {
                 Some(texture) => texture.clone(),
-                None => return,
+                None => return false,
             },
-            TextureRef::None | TextureRef::Offscreen(_) => return,
+            TextureRef::None | TextureRef::Offscreen(_) => return false,
         }
     };
     let (sw, sh) = (source.width, source.height);
-    let (width, height) = frame
-        .layers
-        .iter()
-        .find(|layer| layer.id == copy.dest)
-        .and_then(|layer| layer.image_size())
-        .map(|size| (size.width, size.height))
+    // 尺寸与命令段建出来的 GPU 快照**必须一致**,否则镜像与显存内容错位;
+    // 两边都取步骤 0 按命令序定稿的同一份值。
+    let (width, height) = snapshot_dims
+        .get(&copy.id)
+        .copied()
         .unwrap_or((sw, sh));
     let mut surface = Surface::new(width, height, [0, 0, 0, 0]);
     let (x0, y0, x1, y1) = copy.region.resolve(sw, sh);
@@ -889,6 +1083,7 @@ fn capture_copy_mirror(
             rgba: surface.rgba,
         },
     );
+    true
 }
 
 /// 图层文本合成的 CPU 基面(wgpu 版;与 soft 的 `layer_base` 同一支持范围:
@@ -1588,6 +1783,7 @@ impl Planner<'_> {
         &mut self,
         pass_target: &LayerId,
         copy: &CopyOp,
+        snapshot_dims: &SnapshotDims,
         out: &mut PlannedPass,
     ) -> Result<(), String> {
         if &copy.dest != pass_target {
@@ -1629,14 +1825,13 @@ impl Planner<'_> {
         if self.targets.snapshot(copy.id).is_some() {
             return Ok(());
         }
-        let dest_size = self
-            .frame
-            .layers
-            .iter()
-            .find(|layer| layer.id == copy.dest)
-            .and_then(|layer| layer.image_size())
-            .map(|size| (size.width, size.height));
-        let (width, height) = dest_size.unwrap_or((source.1, source.2));
+        // 快照尺寸 = 步骤 0 按命令序定稿的**本次复制输出尺寸**(官方
+        // `FUN_0042f809` 把区域尺寸写回层表面,同一帧后续加工立即读到)。
+        // 定稿值与镜像捕获、后续加工共用一份,避免三处各算一遍。
+        let (width, height) = snapshot_dims
+            .get(&copy.id)
+            .copied()
+            .unwrap_or((source.1, source.2));
         if width == 0 || height == 0 {
             return Err("group.size.zero".to_string());
         }
@@ -2260,10 +2455,18 @@ fn image_source_dims(
     overrides: &BTreeMap<LayerId, Override>,
     source: &LayerId,
     fallback: Option<&TextureRef>,
+    planned: Option<&SnapshotDims>,
 ) -> Result<(u32, u32), String> {
     if let Some(ov) = overrides.get(source) {
         return Ok(ov.dims());
     }
+    // 快照尺寸优先取**命令序定稿**值:同一帧「先 COPY 后 SIZE」时 GPU
+    // 目标还没建(要等命令段),只有这份值可用。
+    let planned_dims = |id: &CopyId| {
+        planned
+            .and_then(|map| map.get(id).copied())
+            .or_else(|| targets.snapshot(*id).map(|t| (t.width, t.height)))
+    };
     let layer = frame.layers.iter().find(|layer| &layer.id == source);
     // 源层已被 `CGEND` 删除(`ImageOp::source_texture`):按命令时刻的基图
     // 取尺寸。语料 `es_Sprite.yst` 的动画帧每帧都是
@@ -2277,9 +2480,7 @@ fn image_source_dims(
                 .map(|tex| (tex.width, tex.height))
                 .map_err(|diag| diag.code.to_string()),
             TextureRef::SolidBlack1x1 => Ok((1, 1)),
-            TextureRef::Snapshot(id) => targets
-                .snapshot(*id)
-                .map(|t| (t.width, t.height))
+            TextureRef::Snapshot(id) => planned_dims(id)
                 .ok_or_else(|| "gfx.imageop.source.snapshot_missing".to_string()),
             _ => Err("gfx.imageop.source_size.unknown".to_string()),
         };
@@ -2297,16 +2498,190 @@ fn image_source_dims(
             .map(|tex| (tex.width, tex.height))
             .map_err(|diag| diag.code.to_string()),
         TextureRef::SolidBlack1x1 => Ok((1, 1)),
-        TextureRef::Snapshot(id) => targets
-            .snapshot(*id)
-            .map(|t| (t.width, t.height))
-            .ok_or_else(|| "gfx.imageop.source.snapshot_missing".to_string()),
+        TextureRef::Snapshot(id) => {
+            planned_dims(id).ok_or_else(|| "gfx.imageop.source.snapshot_missing".to_string())
+        }
         _ => layer
             .image_size()
             .map(|s| (s.width, s.height))
             .filter(|(w, h)| *w > 0 && *h > 0)
             .ok_or_else(|| "gfx.imageop.source_size.unknown".to_string()),
     }
+}
+
+/// 整面 `RECTPAINT` 族(无区域):把层表面整块覆盖。
+fn is_full_paint(image: &ImageOp) -> bool {
+    matches!(
+        image.action,
+        ImageAction::RectPaint | ImageAction::RectPaint2 | ImageAction::RectPaint3
+    ) && image.x.is_none()
+        && image.y.is_none()
+        && image.x2.is_none()
+        && image.y2.is_none()
+}
+
+fn fnv_mix(hash: &mut u64, value: u64) {
+    *hash ^= value;
+    *hash = hash.wrapping_mul(0x100_0000_01b3);
+}
+
+fn fnv_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        fnv_mix(hash, u64::from(*byte));
+    }
+}
+
+/// 合成链的**输入指纹**:动作序列 + 几何 + `SET` + 各源像素身份。
+///
+/// 这些逐项相同 ⇒ `apply_rect_paint`/`apply_merge` 的输出必然逐像素相同
+/// (两者都是纯函数),因此可以跨帧复用结果。
+fn chain_signature(
+    frame: &CompositorFrame,
+    targets: &TargetSet,
+    overrides: &BTreeMap<LayerId, Override>,
+    ops: &[(&ImageOp, (usize, usize))],
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    // 目标层的基图:链的起点(`resolve_base_texture`)。
+    if let Some((first, _)) = ops.first() {
+        let target = first.target.as_ref().unwrap_or(&first.source);
+        if let Some(layer) = frame.layers.iter().find(|entry| &entry.id == target) {
+            fnv_mix(&mut hash, texture_ref_token(targets, &layer.texture));
+        }
+    }
+    for (image, _) in ops {
+        fnv_bytes(&mut hash, image.action.name().as_bytes());
+        for value in [image.x, image.y, image.x2, image.y2] {
+            fnv_mix(&mut hash, value.map(f64::to_bits).unwrap_or(u64::MAX));
+        }
+        fnv_mix(
+            &mut hash,
+            image
+                .set
+                .as_ref()
+                .and_then(|value| value.as_int())
+                .map(|value| value as u64)
+                .unwrap_or(u64::MAX),
+        );
+        fnv_mix(&mut hash, layer_token(frame, targets, overrides, &image.source, 0));
+        if let Some(source2) = &image.source2 {
+            fnv_mix(&mut hash, layer_token(frame, targets, overrides, source2, 0));
+        }
+    }
+    hash
+}
+
+/// 源层**当前像素**的身份:文本修订号 + 覆盖纹理哈希 / 基图引用。
+fn layer_token(
+    frame: &CompositorFrame,
+    targets: &TargetSet,
+    overrides: &BTreeMap<LayerId, Override>,
+    id: &LayerId,
+    depth: usize,
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    fnv_mix(
+        &mut hash,
+        frame.text_revisions.get(id).copied().unwrap_or(0),
+    );
+    if depth >= 2 {
+        return hash;
+    }
+    match overrides.get(id) {
+        Some(Override::Cpu { tex: _, .. }) => {
+            fnv_mix(&mut hash, 1);
+            if let Some(override_) = overrides.get(id) {
+                fnv_mix(&mut hash, override_.hash());
+            }
+        }
+        Some(Override::Uv {
+            source,
+            uv,
+            width,
+            height,
+            bilinear,
+            hash: uv_hash,
+        }) => {
+            fnv_mix(&mut hash, 2);
+            fnv_mix(&mut hash, *uv_hash);
+            for value in uv {
+                fnv_mix(&mut hash, u64::from(value.to_bits()));
+            }
+            fnv_mix(&mut hash, width.to_bits());
+            fnv_mix(&mut hash, height.to_bits());
+            fnv_mix(&mut hash, u64::from(*bilinear));
+            fnv_mix(&mut hash, layer_token(frame, targets, overrides, source, depth + 1));
+        }
+        None => match frame.layers.iter().find(|layer| &layer.id == id) {
+            Some(layer) => {
+                fnv_mix(&mut hash, 3);
+                fnv_mix(&mut hash, texture_ref_token(targets, &layer.texture));
+            }
+            None => fnv_mix(&mut hash, 4),
+        },
+    }
+    hash
+}
+
+fn texture_ref_token(targets: &TargetSet, texture: &TextureRef) -> u64 {
+    match texture {
+        TextureRef::Asset(key) => {
+            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            fnv_bytes(&mut hash, key);
+            hash
+        }
+        // 快照内容由 `CopyId` 冻结;纹理重建(尺寸变化)时 `RenderTarget.id`
+        // 会变,所以把当前目标 id 也混进去。
+        TextureRef::Snapshot(id) => {
+            let target = targets.snapshot(*id).map(|target| target.id).unwrap_or(0);
+            id.0.wrapping_mul(31).wrapping_add(target)
+        }
+        TextureRef::SolidBlack1x1 => 0x5bf0_0001,
+        TextureRef::None => 0x5bf0_0002,
+        TextureRef::Offscreen(_) => 0x5bf0_0003,
+    }
+}
+
+/// 一次 COPY 的目标表面尺寸。
+///
+/// 官方 `FUN_0042f809`:`local_2c = (X2 - X) + 1`、`local_28 = (Y2 - Y) + 1`,
+/// 末尾写回层的 `+0x78/+0x7c`;目标层若只有 `CG[ID=… FILE=""]` 的 1×1 占位,
+/// 沿用它的 `SX/SY` 会把快照建成 1×1 ⇒ 之后每帧按 1×1 采样 ⇒ 整层画成单色
+/// (`es_SPExec.yst` 的立绘缓冲层 `SPLBUF601` 就是这样)。
+fn copy_output_dims(
+    frame: &CompositorFrame,
+    textures: &mut TextureStore,
+    targets: &TargetSet,
+    planned: &SnapshotDims,
+    copy: &CopyOp,
+) -> Result<(u32, u32), String> {
+    let (sw, sh) = match &copy.source {
+        CopySource::Layer(id) => image_source_dims(
+            frame,
+            textures,
+            targets,
+            &BTreeMap::new(),
+            id,
+            copy.source_texture.as_ref(),
+            Some(planned),
+        )?,
+        CopySource::Group(id) => group_surface_size(frame, id),
+    };
+    let region_full = copy.region.resolve(sw, sh);
+    let (rw, rh) = (
+        (region_full.2 - region_full.0 + 1).max(0) as u32,
+        (region_full.3 - region_full.1 + 1).max(0) as u32,
+    );
+    // 1×1 是 `FILE=""` 的占位尺寸,不代表真实表面;这时按区域算。
+    Ok(frame
+        .layers
+        .iter()
+        .find(|layer| layer.id == copy.dest)
+        .and_then(|layer| layer.image_size())
+        .filter(|size| size.width > 1 || size.height > 1)
+        .map(|size| (size.width, size.height))
+        .or_else(|| (rw > 1 || rh > 1).then_some((rw, rh)))
+        .unwrap_or((sw, sh)))
 }
 
 /// `CGACT` 源区域 → 归一化 UV 子矩形。
@@ -2373,6 +2748,7 @@ fn apply_image_to_override(
     frame: &CompositorFrame,
     textures: &mut TextureStore,
     targets: &TargetSet,
+    planned: &SnapshotDims,
     pass_target: &LayerId,
     image: &ImageOp,
     overrides: &mut BTreeMap<LayerId, Override>,
@@ -2435,7 +2811,7 @@ fn apply_image_to_override(
         //
         // 源尺寸只用于把像素矩形归一化;源若本身也是 `Uv` 修饰,按链式展开
         // (复合区域在语料里不存在,展开深度由 `image_source_dims` 限一)。
-        let (sw, sh) = image_source_dims(frame, textures, targets, overrides, &image.source, image.source_texture.as_ref())?;
+        let (sw, sh) = image_source_dims(frame, textures, targets, overrides, &image.source, image.source_texture.as_ref(), Some(planned))?;
         let uv = region_uv(region, sw, sh);
         let hash = uv_scale_hash(&image.source, image, dw, dh);
         if std::env::var("YU_RENDER_TIMING").is_ok() {
@@ -2476,7 +2852,7 @@ fn apply_image_to_override(
         image.action,
         ImageAction::Horizontal | ImageAction::Vertical
     ) {
-        let (sw, sh) = image_source_dims(frame, textures, targets, overrides, &image.source, image.source_texture.as_ref())?;
+        let (sw, sh) = image_source_dims(frame, textures, targets, overrides, &image.source, image.source_texture.as_ref(), Some(planned))?;
         let (w, h) = match overrides.get(&image.source) {
             Some(ov) => ov.draw_dims(),
             None => (f64::from(sw), f64::from(sh)),

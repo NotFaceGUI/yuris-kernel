@@ -69,6 +69,10 @@ fn table() -> ParamTable {
                     "BNO",
                     "MERGE",
                     "MERGE2",
+                    "SIZE",
+                    "SIZE2",
+                    "SX",
+                    "SY",
                 ],
             ),
             command(
@@ -1486,4 +1490,95 @@ fn merge_on_snapshot_layer_matches_soft() {
         ];
         assert_close(actual, soft_px, 2, name);
     }
+}
+
+/// 同一帧「先 `COPY` 建快照、再 `SIZE2` 采样该快照」:快照表面的尺寸在
+/// **命令时刻**就已定稿(官方 `FUN_0042f809` 建表面并把区域尺寸写回层),
+/// 后续加工不得因为 GPU 目标尚未创建而整层跳过。
+///
+/// 语料 `es_SPExec.yst` 的立绘归位正是这个形状
+/// (`CGACT[COPY2=1 ID=SPLBUFa601 ID2=SPLBUF601]` → `SIZE2`),旧实现那一帧
+/// 报 `gfx.imageop.source.snapshot_missing`,立绘整层消失一帧(2026-10-27
+/// 逐帧像素实测)。
+#[test]
+fn size_after_copy_in_same_frame_keeps_snapshot_dims() {
+    let table = table();
+    let mut gfx = state(Viewport::new(16, 16), [0, 0, 0, 255]);
+    let mut events = vec![
+        VmEvent::FrameStart { frame: 1 },
+        // 源层:8×8 纯红。
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"SRC".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"src".to_vec())),
+            ],
+        ),
+        // 复制到缓冲层(BUF 只有 `FILE=""` 的占位尺寸)。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"SRC".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"BUF".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+            ],
+        ),
+        // 同一帧:把缓冲层的整块 8×8 采样铺到 OUT 的 16×16。
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"OUT".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"out".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"BUF".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"OUT".to_vec())),
+                arg(&table, "CGACT", "SIZE2", Value::Int(1)),
+                arg(&table, "CGACT", "X", Value::Int(0)),
+                arg(&table, "CGACT", "Y", Value::Int(0)),
+                arg(&table, "CGACT", "X2", Value::Int(7)),
+                arg(&table, "CGACT", "Y2", Value::Int(7)),
+                arg(&table, "CGACT", "SX", Value::Int(16)),
+                arg(&table, "CGACT", "SY", Value::Int(16)),
+            ],
+        ),
+    ];
+    events.push(VmEvent::FrameEnd { frame: 1 });
+    gfx.consume_events(&events);
+
+    let entries: &[(&[u8], Vec<u8>)] = &[
+        (b"src.png", png_bytes_for(8, 8, Rgba([255, 0, 0, 255]))),
+        (b"out.png", png_bytes_for(16, 16, Rgba([0, 0, 0, 0]))),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(entries));
+    let soft_out = soft.render_frame(&gfx.frame());
+    let gpu_out = gpu.render_frame(&gfx.frame()).expect("render");
+
+    let reasons: Vec<&str> = gpu_out
+        .report
+        .skipped
+        .iter()
+        .map(|skip| skip.reason.as_str())
+        .collect();
+    assert!(
+        !reasons.iter().any(|r| r.contains("snapshot_missing")),
+        "同一帧 COPY→SIZE2 不得报快照缺失,得到 {reasons:?}"
+    );
+    let actual = pixel(&gpu_out, 8, 8);
+    assert!(
+        actual[0] >= 250 && actual[1] <= 5 && actual[2] <= 5,
+        "快照内容必须被采样到 OUT,得到 {actual:?}"
+    );
+    let soft_px = pixel_of_surface(&soft_out.surface, 8, 8);
+    assert_close(actual, soft_px, 2, "size_after_copy");
 }

@@ -29,15 +29,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "SYSTEM_START".to_string());
     let data = args.flag("data").map(PathBuf::from);
-    // 桌面缺省 wgpu(headless 缺省 soft):交互帧率要 GPU;失败自动回退。
-    let backend = match args.flag("backend").as_deref() {
-        None | Some("wgpu") => Backend::Wgpu,
-        Some("soft") => Backend::Soft,
-        Some(other) => {
-            return Err(Failure::usage(format!(
-                "--backend 只接受 wgpu|soft,收到 `{other}`"
-            )))
-        }
+    // 桌面缺省 wgpu、headless 缺省 soft —— 这是**模式策略**,不是两套解析:
+    // 旗标取值统一交给 `Backend::parse`,避免两处校验文案/取值漂移。
+    let backend = match args.flag("backend") {
+        Some(value) => Backend::parse(&value)?,
+        None => Backend::Wgpu,
     };
     let title = args.flag("title").filter(|value| !value.is_empty());
     let width = parse_opt::<u32>(&mut args, "width")?;
@@ -179,7 +175,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         format!("YU-RIS · {name}")
     });
 
-    let mut options = EngineOptions {
+    let options = EngineOptions {
         backend,
         entry,
         record_events: false,
@@ -200,19 +196,19 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         // 真实运行:`@_TIME` 注入系统本地时间(存档菜单的现实日期)。
         local_time: crate::clock::local_now(),
     };
-    let mut engine = match Engine::new(project.clone(), options.clone()) {
-        Ok(engine) => engine,
-        Err(first) if backend == Backend::Wgpu => {
-            console.emit_host(
-                yu_log::console::HostLevel::Warn,
-                "host",
-                &format!("wgpu 启动失败({first});回退 soft"),
-            );
-            options.backend = Backend::Soft;
-            Engine::new(project, options).map_err(|error| error.to_string())?
+    // **不做 GPU→CPU 自动回退**:soft 与 wgpu 是两条独立实现,自动降级会让
+    // 「GPU 模式变慢/画错」永远对不上号(用户看到的是 CPU 结果,却以为在
+    // 看 GPU)。要 CPU 模式请显式 `--backend soft`。
+    let mut engine = Engine::new(project.clone(), options.clone()).map_err(|error| {
+        if backend == Backend::Wgpu {
+            format!(
+                "wgpu 后端启动失败:{error}
+                 本内核不会自动回退到 CPU 模式;确需 CPU 渲染请显式加 --backend soft。"
+            )
+        } else {
+            error.to_string()
         }
-        Err(error) => return Err(error),
-    };
+    })?;
     // 平台音频端口:cpal 回调即时钟(`AudioOut`;headless 从不注入)。
     if !no_sound {
         match yu_host_desktop::SoundSink::open() {

@@ -19,6 +19,12 @@
 > - 帧契约字段以 `crates/yu-gfx/src/frame.rs` 为准(含 `dx_mode`,
 >   见 §5.1 的范围说明)。
 >
+> **v1.4 补充(2026-10-27)**:两个后端是**互相独立的实现** —— `soft` = CPU 模式
+> (兼语义参考与逐像素对拍基线),`wgpu` = GPU 模式且**像素工作必须由 GPU 完成**;
+> 运行期不得把像素算法委托给 soft,也不得在 GPU 初始化失败时自动降级到 CPU。
+> 判定规则、现状账本、迁移顺序与耦合审查见
+> [`architecture/backends.md`](architecture/backends.md)。
+>
 > **v2 提案(2026-10-25,待主人定稿)**:§2.5 跨平台目标架构 —— 桌面并入
 > `yu-cli --mode desktop`(运行期开关,不再单独编译)、wasm/Android 等 =
 > 同一代码基的**编译期**派生(各自壳 crate)、cpal 声音下沉平台层、

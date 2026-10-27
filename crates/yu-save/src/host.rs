@@ -1,7 +1,9 @@
 //! `SaveHost`:把 [`SaveState`] 接到帧循环与 VM(B1 存档闭环)。
 //!
-//! 双通道(有意为之,与 `yu-sound` 同型):
-//! - **事件事实**(FILEACT/SAVEINFO/FILEINFO):`Engine` 每帧 drain 后喂入;
+//! 全部**命令时刻同步**(与 `yu-gfx`/`yu-sound` 同型):
+//! - **事件事实**(FILEACT/SAVEINFO/FILEINFO):`Vm::emit` 在命令点同步喂入
+//!   (官方 `FILEACT` 处理体就地删除/复制;若推迟到帧末,存档脚本的
+//!   「先删旧槽、再 `SAVE[FILE]` 刷盘」会把刚写出的文件删掉);
 //! - **同步契约**(SAVE 预约/刷盘、LOAD 拉取):实现 `yu_rt::event::SaveHost`,
 //!   VM 在命令时刻直接调用——预约值快照与 LOAD 写回的时序都在命令时刻
 //!   (REA `0x44d73d`/`0x447b3d`),异步事件流给不了。宿主不得再消费

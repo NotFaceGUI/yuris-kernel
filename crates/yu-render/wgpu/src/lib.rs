@@ -1,8 +1,20 @@
 //! `yu-backend-wgpu` · `CompositorFrame` 的 wgpu 后端。
 //!
-//! 语义唯一来源是 `yu-gfx` 的 [`CompositorFrame`];`yu-backend-soft` 是整数
-//! 参考执行器。本 crate 与软后端**互为实现,不互为真值**:像素允许舍入差,
-//! 跳过/执行计数与跳过原因必须逐项一致(见 README 的差异账本)。
+//! 语义唯一来源是 `yu-gfx` 的 [`CompositorFrame`]。
+//!
+//! # 定位:独立的 GPU 实现
+//!
+//! 本 crate 是 `--backend wgpu`(GPU 模式)的**独立实现**:像素工作必须由
+//! GPU 自己完成,运行期**不得**调用 `yu-backend-soft` 的像素算法
+//! (`apply_*` / `blend_*` / `scale_region` / `blit`)。软后端是同契约的
+//! **CPU 模式**与对拍基线,不是本 crate 的兜底,也不是实现库 ——
+//! 违反这条会让双后端失去交叉验证价值,并让 GPU 模式被 CPU 逐像素循环
+//! 拖住(已发生过多轮)。允许共享的只有契约与平台设施:
+//! `Surface`/`RenderReport`/`SkippedOp`/`AssetIssue`、`TextureStore`(资产解码)、
+//! `TextComposer`(字形栅格化)。判定规则与迁移台账见
+//! `docs/architecture/backends.md`。
+//!
+//! 像素允许舍入差;跳过/执行计数与跳过原因必须逐项一致(差异账本见 README)。
 //!
 //! # 执行契约
 //!
@@ -173,6 +185,11 @@ pub struct WgpuRenderer {
     uploaded_overrides: std::collections::BTreeMap<yu_gfx::LayerId, (u64, u32, u32, u64)>,
     /// `CGACT[SIZE/SIZE2]` 结果缓存(与 soft 同一键/算法;EVID-J3-04)。
     image_cache: std::collections::BTreeMap<yu_backend_soft::ImageCacheKey, passes::Override>,
+    /// 合成链记忆化:层 id → (输入指纹, 上一帧的合成结果)。
+    composite_cache: std::collections::BTreeMap<
+        yu_gfx::LayerId,
+        (u64, std::rc::Rc<yu_backend_soft::Texture>),
+    >,
     /// 上一帧呈现内容(`COPY ID=:/W0/` 读后缓冲;EVID-J3-06)。
     backbuffer: Option<Arc<Surface>>,
     /// 后缓冲 GPU 纹理缓存:`(content_hash, gpu_id)`。
@@ -206,6 +223,7 @@ impl WgpuRenderer {
             total_draw_calls: 0,
             uploaded_overrides: std::collections::BTreeMap::new(),
             image_cache: std::collections::BTreeMap::new(),
+            composite_cache: std::collections::BTreeMap::new(),
             backbuffer: None,
             backbuffer_gpu: None,
             text: yu_backend_soft::TextComposer::new(),
@@ -266,6 +284,7 @@ impl WgpuRenderer {
         self.backbuffer_gpu = None;
         self.uploaded_overrides.clear();
         self.image_cache.clear();
+        self.composite_cache.clear();
         self.targets.clear_snapshots(&mut self.pipelines);
         self.targets.clear_offscreen(&mut self.pipelines);
         self.readback = ReadbackCache::new();
@@ -395,6 +414,7 @@ impl WgpuRenderer {
             &mut self.targets,
             &mut self.uploaded_overrides,
             &mut self.image_cache,
+            &mut self.composite_cache,
             self.backbuffer.as_deref(),
             &mut self.backbuffer_gpu,
             &mut self.text,

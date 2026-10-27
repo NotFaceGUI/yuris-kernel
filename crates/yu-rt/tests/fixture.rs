@@ -1617,6 +1617,63 @@ fn task_scrip_pos_restores_full_exec_state() {
     let round = ScriptPos::decode(&round_raw).expect("engine format roundtrip");
     assert_eq!(round, synthetic, "TASKINFO[SCRIPTPOS] 必须还原同一执行位");
 }
+/// 旧内核存档(2026-10-26 前)的 SCRIPTPOS 是 8 字节
+/// `[script_id u32 LE][pc u32 LE]`;读档必须按兼容路径还原(无三栈),
+/// 不能 Fatal。新/官方存档仍走引擎串。
+#[test]
+fn task_scrip_pos_accepts_legacy_eight_byte_kernel_blob() {
+    use yu_rt::scriptpos::ScriptPos;
+
+    let mut b = ProjectBuilder::new();
+    let blob = push_var(&mut b, 3, Init::Str(b""));
+    let out = push_var(&mut b, 3, Init::Str(b""));
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("SUB.BODY", 9, 0, 0)];
+    b.entry(0, 0);
+    const OP_TASK: u8 = 93;
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TASK)
+            .window(0, ex::s("SUB"))
+            .window(34, ex::s("SUB.BODY"))
+            .line(10),
+        // 旧内核 blob:脚本号 0 + pc 9(SUB.BODY)。
+        GroupSpec::new(OP_TASK)
+            .window(0, ex::s("SUB"))
+            .window(35, ex::get(0x24, blob.id))
+            .line(11),
+        GroupSpec::new(OP_TASKINFO)
+            .window(0, ex::s("SUB"))
+            .window(19, ex::i8_(1))
+            .window(1, ex::r#ref(0x24, out.id))
+            .line(12),
+        GroupSpec::new(OP_END).line(13),
+        // 4..=8 填充,pc9 = SUB.BODY。
+        GroupSpec::new(OP_WAIT).window(0, ex::i8_(10)).line(14),
+        GroupSpec::new(OP_WAIT).window(0, ex::i8_(10)).line(15),
+        GroupSpec::new(OP_WAIT).window(0, ex::i8_(10)).line(16),
+        GroupSpec::new(OP_WAIT).window(0, ex::i8_(10)).line(17),
+        GroupSpec::new(OP_WAIT).window(0, ex::i8_(10)).line(18),
+        GroupSpec::new(OP_WAIT).window(0, ex::i8_(10)).line(19),
+    ]];
+    let mut legacy = Vec::new();
+    legacy.extend_from_slice(&0u32.to_le_bytes());
+    legacy.extend_from_slice(&9u32.to_le_bytes());
+    let mut vm = boot(b);
+    vm.store_mut()
+        .write(blob, &[], &Value::Str(legacy))
+        .expect("write legacy blob");
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let Value::Str(raw) = vm.store().read(out, &[]).unwrap() else {
+        panic!("SCRIPTPOS 输出必须是字符串");
+    };
+    let sp = ScriptPos::decode(&raw).expect("legacy restore must round-trip as engine format");
+    assert_eq!(sp.pc, 9);
+    assert!(sp.if_entries.is_empty(), "{:?}", sp.if_entries);
+    assert!(sp.gosub_entries.is_empty(), "{:?}", sp.gosub_entries);
+    assert!(sp.loop_entries.is_empty(), "{:?}", sp.loop_entries);
+    assert_eq!(sp.script_name, b"data\\script\\fixture0000.yst");
+}
+
 #[test]
 fn returncode_line_keeps_full_u16_id() {
     let mut b = ProjectBuilder::new();
@@ -4420,6 +4477,9 @@ struct SaveRecorder {
     flushes: Vec<String>,
     ends: u32,
     loads: Vec<(String, u32)>,
+    /// `Vm::emit` 同步喂入的 Save/File 事件与 flush 的**先后顺序**
+    /// (FILEACT 必须先于同一帧的 SAVE[FILE] 刷盘)。
+    order: Vec<String>,
 }
 
 impl SaveRecorder {
@@ -4430,6 +4490,7 @@ impl SaveRecorder {
             flushes: Vec::new(),
             ends: 0,
             loads: Vec::new(),
+            order: Vec::new(),
         }))
     }
 }
@@ -4441,7 +4502,16 @@ struct SharedHost {
 }
 
 impl SaveHost for SharedHost {
-    fn apply_event(&mut self, _ev: &yu_rt::event::VmEvent) {}
+    fn apply_event(&mut self, ev: &yu_rt::event::VmEvent) {
+        if let yu_rt::event::VmEvent::DomainCall {
+            domain: yu_rt::event::Domain::Save | yu_rt::event::Domain::File,
+            name,
+            ..
+        } = ev
+        {
+            self.inner.borrow_mut().order.push(format!("event:{name}"));
+        }
+    }
     fn reserve(&mut self, dno: u32, var: VarRef, snap: &VarSnapshot) -> Result<(), Diag> {
         self.inner
             .borrow_mut()
@@ -4463,6 +4533,10 @@ impl SaveHost for SharedHost {
         Ok(())
     }
     fn flush(&mut self, file: &str) -> Result<(), Diag> {
+        self.inner
+            .borrow_mut()
+            .order
+            .push(format!("flush:{file}"));
         self.inner.borrow_mut().flushes.push(file.to_string());
         Ok(())
     }
@@ -4609,6 +4683,99 @@ fn save_load_loop_records_reserve_flush_and_writes_back() {
         .find(|a| a.slot == 2)
         .expect("LET 槽在事件里");
     assert_eq!(let_ref.reference, Some(VarRef::new(VarSpace::At, sys + 1)));
+}
+
+/// 存档脚本的「先删旧槽(pc315)、再 `SAVE[FILE]`(pc341)」必须在同一帧里
+/// 保持**命令顺序**:`FILEACT` 事件由 `Vm::emit` 在命令时刻同步喂宿主,
+/// 不能落到帧末 drain;否则删除晚于同步刷盘,刚写出的存档会被删
+/// (2026-10-27 菜单存档实测回归)。
+#[test]
+fn fileact_is_applied_before_save_file_flush_in_same_frame() {
+    let mut b = ProjectBuilder::new();
+    let op_fileact = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "FILEACT")
+        .unwrap() as u8;
+    let op_save = b.commands.iter().position(|(n, _)| *n == "SAVE").unwrap() as u8;
+    let op_saveend = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "SAVEEND")
+        .unwrap() as u8;
+    let groups = vec![
+        // FILEACT[FILE="order.sd"] —— 事件必须在下一命令前已落到宿主。
+        GroupSpec::new(op_fileact).window(0, ex::s("order.sd")),
+        // SAVE[FILE="order.sd"] —— 同步刷盘。
+        GroupSpec::new(op_save).window(0, ex::s("order.sd")),
+        GroupSpec::new(op_saveend),
+        GroupSpec::new(OP_END),
+    ];
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let recorder = SaveRecorder::new();
+    let reply = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let mut vm = boot(b);
+    vm.set_save_host(Box::new(SharedHost {
+        inner: recorder.clone(),
+        reply,
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let rec = recorder.borrow();
+    assert_eq!(
+        rec.order,
+        vec![
+            "event:FILEACT".to_string(),
+            "event:SAVE".to_string(),
+            "flush:order.sd".to_string(),
+            "event:SAVEEND".to_string(),
+        ],
+        "FILEACT 必须早于同一帧的 SAVE[FILE] 刷盘: {:?}",
+        rec.order
+    );
+}
+
+/// `SAVE[SET=@系统变量]`(语料 DNO 90 = `@_RINT(1)`):系统变量没有
+/// `VarSlot`,但 SET 已在命令时刻求值;预约必须是**标量快照**
+/// (官方块:type=Int、dims=[]、data=[值])。
+#[test]
+fn save_set_on_system_variable_reserves_scalar_snapshot() {
+    let mut b = ProjectBuilder::new();
+    let lc_id = b
+        .sysvars
+        .iter()
+        .position(|(name, _, _)| *name == "_LC")
+        .expect("_LC sysvar")
+        as u16;
+    let op_save = b.commands.iter().position(|(n, _)| *n == "SAVE").unwrap() as u8;
+    b.scripts = vec![vec![
+        GroupSpec::new(op_save)
+            .window(1, ex::i8_(90))
+            .window(2, ex::get(0x40, lc_id))
+            .line(10),
+        GroupSpec::new(OP_END).line(11),
+    ]];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let recorder = SaveRecorder::new();
+    let reply = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let mut vm = boot(b);
+    vm.set_save_host(Box::new(SharedHost {
+        inner: recorder.clone(),
+        reply,
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let rec = recorder.borrow();
+    assert_eq!(rec.reserves.len(), 1, "{:?}", rec.reserves);
+    let (dno, var, snap) = &rec.reserves[0];
+    assert_eq!(*dno, 90);
+    assert_eq!(*var, VarRef::new(VarSpace::At, lc_id));
+    assert_eq!(snap.ty, yu_rt::value::ElemType::Int);
+    assert!(snap.dims.is_empty(), "{:?}", snap.dims);
+    assert_eq!(snap.data, vec![Value::Int(0)]);
 }
 
 /// 组形态 `SAVE[DNO=5 G_INT2=1]`:枚举 (值类型=INT, 组=2) 的全局变量逐个

@@ -2125,30 +2125,6 @@ impl GfxState {
         }
         let seq = self.next_texture_seq();
         let blend = EngineValue::Int(blend.clamp(0, 256));
-        // 过渡结果**就是目标层的表面**(官方 `FUN_0042f809` 尾部
-        // `*(iVar4+0x90) = local_68`:加工产出直接成为该层表面)。
-        //
-        // 所以这里必须像 `COPY` 一样给目标层换上一个快照身份:
-        // 1. 目标层此后的 `texture` 不再是无用的建层基图,`CGACT[SIZE]`
-        //    命令时刻记到的 `source_texture` 才会指向**过渡结果**;
-        // 2. 该快照被 `CGEND` 之外的引用闭包保护,不会因为临时层
-        //    (`SPLBUFb601`)被删而在下一帧解析不到像素。
-        //
-        // 不做这一步时:`es_Sprite.yst` 的立绘淡入在最后一帧
-        // `CGEND[SPLBUFb601]` 之后,`CGACT[SIZE2]` 的源已不存在 ⇒
-        // 整层被 skip 一帧 ⇒ 归位瞬间闪一下(2026-10-26 实测)。
-        let copy_id = CopyId(self.next_copy());
-        if let Some(size) = self
-            .nodes
-            .get(&dst)
-            .and_then(|n| n.layer.image_size())
-        {
-            self.snapshot_sizes.insert(copy_id, size);
-        }
-        if let Some(node) = self.nodes.get_mut(&dst) {
-            node.layer.texture = TextureRef::Snapshot(copy_id);
-            node.layer.set_texture_status(LayerStatus::Executable);
-        }
         self.push_image_log(ImageOp {
             seq,
             source: from.clone(),
@@ -2959,20 +2935,8 @@ impl GfxState {
         // `prune_copy_log`。
         self.prune_copy_log(|c| removed.contains(&c.dest));
         // 图像加工同理:只要目标还在,操作历史仍描述目标纹理。
-        //
-        // **源被删**也要作废:官方 `CGACT` 在命令时刻就地执行
-        // (`FUN_0042f809`),结果已经写进目标表面,后续读取只依赖目标;
-        // 本内核延迟回放,若源层随后被 `CGEND`,该条永远解析不到像素
-        // (每帧报 `gfx.imageop.source.missing`)。语料正是这样:
-        // 立绘过渡最后一帧 `CGEND[SPLBUFb601]`,而 `SIZE2` 仍以它作源。
-        //
-        // 例外:源层被删但命令时刻已记下基图(`source_texture`)或目标
-        // 是快照(像素在快照里)的项仍可重放,保留。
-        self.image_log.retain(|i| {
-            let target_alive = i.target.as_ref().is_none_or(|t| !removed.contains(t));
-            let source_alive = !removed.contains(&i.source);
-            target_alive && (source_alive || i.source_texture.is_some())
-        });
+        self.image_log
+            .retain(|i| i.target.as_ref().is_none_or(|t| !removed.contains(t)));
     }
 
     /// 删除满足 `remove` 的复制项,但保留仍被后续复制 `source_texture`
@@ -3432,22 +3396,26 @@ impl GfxState {
         if target == &op.source && !is_transition {
             return;
         }
-        // 折叠键:`(动作, 源, 目标)`。**不含 `source2`/`SET`** ——
-        // `es_Sprite.yst` 的立绘淡入每帧对同一目标连发数十条
-        // `TRANSITION`(同源、`SET` 0→131 递增、`source2` 逐条不同),
-        // 语义是「同一块表面被反复覆写」,最终像素只由最后一条决定。
-        // 把 `source2`/`SET` 放进键会让它们全部留下 ⇒ 单帧内就堆 29 条
-        // pass,render 一路涨到 105ms(2026-10-26 实测)。
-        // 缩放族是「该目标本帧的最终表面描述」:同目标同动作只保留最后
-        // 一条,**不比对 `source`** —— `es_Sprite.yst` 的过渡态与稳态在
-        // 同一帧会分别发 `SIZE2`(源分别是临时层 `SPLBUFb601` 与数据层
-        // `SPLBUF601`),最终显示只由后者决定;临时层随后被 `CGEND`,
-        // 留下前者会让该层每帧报 `source.missing` 并跳过一帧(归位闪)。
+        // 折叠键:**缩放族只按 `(动作族, 目标)`**,不比 `source`;过渡族按
+        // `(动作, 源, 目标)`。
+        //
+        // 依据是官方语义:`CGACT` 把结果**覆盖写进目标层表面**
+        // (`FUN_0042f809` 尾部 `*(iVar4+0x90) = local_68`),同一目标在一帧里
+        // 被写多次时只有最后一次留下,与源是谁无关。
+        //
+        // 语料实测:`es_Sprite.yst` 立绘淡入结束时,同一帧里脚本先发
+        // `SIZE2`(源 = 过渡临时层 `SPLBUFb601`)、再发 `SIZE2`(源 = 数据层
+        // `SPLBUF601`)。两条都留着时,先前那条把 `SPL601` 的绘制修饰绑到
+        // 已删除的 `SPLBUFb601` 上 ⇒ 屏幕 pass 报 `gfx.copy.source.gone`
+        // ⇒ 整层消失一帧(归位闪,`H-SPRITE-PARITY` §5)。
+        //
+        // 过渡族仍比 `source`:同帧连发的数十条 `TRANSITION` 源相同、
+        // `SET` 0→131 递增,只保留最后一条即等价(不进键的 `source2`/`SET`
+        // 见下)。
         let is_scale = op.action.is_scale();
         let Some(pos) = self.image_log.iter().rposition(|old| {
             old.action == op.action
                 && old.target.as_ref().unwrap_or(&old.source) == target
-                && (!is_scale || true)
                 && (is_scale || old.source == op.source)
         }) else {
             return;

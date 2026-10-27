@@ -7897,6 +7897,14 @@ else if (kind == 2) { *(int*)&DAT_00683e20 + i*4 = script_base + off;    // 只�
 (状态 `partially-confirmed`;未决 = 官方 f64→i64 规约指令、消费点如何
 解读 `0x683e20[i]`)。
 
+> **勘误(2026-10-27)**:本节结论「不是累加」**已被推翻**,见
+> `DIV-GFX-064` §6。窗口记录 `+2` 的 u16 高字节就是参数类型字节:
+> `X=` 是 `slot=1`(0x0001),`X+=` 是 `slot=257`(0x0101)。序言不写数值槽
+> 与消费点是否叠加并不矛盾(序言只是登记偏移)。按赋值处理会让
+> `es_Sprite.yst:8173` 的 `CG[ID=$L1 X+=(@es.GSX/2)-(@WSX/2)]` 在补偿量为 0
+> 时把位置清成 0 —— 立绘钉在屏幕左上角,正是**实测症状**;改为增量后位置
+> 收敛到 240.93 并保持稳定。
+
 ### 5. case golden 重生成(9 条)
 
 `yu-cli case <project-eris> --all --update` → **9 passed / 0 failed**。
@@ -8258,3 +8266,267 @@ cargo check --workspace --all-targets     Finished(仅既有 yu-gfx parity_fixes
 
 
 
+
+## 成果 SPRITE-SNAP-ORDER (2026-10-27) · 立绘归位空白帧收口:快照表面尺寸按命令序定稿
+
+起因:上一轮收口了立绘位置、移动阶梯与逐帧卡顿,残留「过渡结束归位那一下
+闪一帧空白」。本轮把它定位到**规划阶段顺序倒置**,并按官方语义(COPY 命令
+执行时建表面并把尺寸写回层)改成命令序定稿,一帧不再丢。
+
+### 1. 症状(原始证据)
+
+β4 演出1 过渡结束,`es_SPExec.yst` 发
+`CGACT[COPY2=1 ID=SPLBUFa601 ID2=SPLBUF601]` → `SIZE2`。逐帧 PNG(wgpu,
+精确读回):host 2866 有立绘、2867 **整张背景**、2868 恢复;像素采样同结论
+(`(388,180)` 从 `152,121,90` 跳到 `176,172,173` 再回 `245,192,139`)。
+
+### 2. 根因:同一帧「先 COPY 后 SIZE」时,尺寸只能从**还没建的 GPU 目标**取
+
+- `passes::plan` 原先把「图像加工预执行」(步骤 1)排在「命令段 COPY
+  规划/建纹理」(步骤 2)之前。`SIZE2` 在步骤 1 里向 `Targets::snapshot(id)`
+  要快照尺寸,而该 GPU 目标要到步骤 2 的 `ensure_snapshot` 才创建
+  ⇒ `gfx.imageop.source.snapshot_missing` ⇒ 该 op 被跳过 ⇒ 整层只剩
+  `RECTPAINT3` 的清空结果 ⇒ 这一帧没有立绘。
+- 快照**内容**没有错:把快照纹理读回来,创建帧与之后两帧的哈希完全一致
+  (`c7a79fd81b1ac1e9`,`(147,110)=[245,192,139,255]`),原判断
+  「首建即空、冻结后不重试」被推翻。
+- 与后端无关:soft 逐帧连续(它按命令序执行,COPY 先落 `snapshots`,不存在
+  这个空洞);也无 `SKIP` 以外的报错。
+
+### 3. 修法(单一口径,不是兜底)
+
+- `passes::plan` 新增**步骤 0**:按 `frame.passes` 命令序预扫描全部可执行
+  `Op::Copy`,用 `copy_output_dims()` 定稿 `SnapshotDims`(官方
+  `FUN_0042f809` 的 `local_2c=(X2-X)+1` / `local_28=(Y2-Y)+1` 写回层)。
+- `image_source_dims()` 的 `Snapshot` 分支优先取定稿值,其次才是既有 GPU
+  目标。后续加工因此在本帧就能拿到「已经存在」的表面尺寸。
+- `plan_copy()` 建纹理与 `capture_copy_mirror()` 建 CPU 镜像**共用同一份**
+  尺寸,三处不再各算一遍(此前是两份近似公式,存在错位风险)。
+- 全部落在 `crates/yu-render/wgpu/src/passes.rs`;无环境变量开关。
+
+### 4. 回归
+
+```text
+cargo test -p yu-backend-wgpu --test wgpu size_after_copy_in_same_frame_keeps_snapshot_dims
+test result: ok. 1 passed; 0 failed
+```
+
+测试有效性已反向验证:把 `image_source_dims` 的定稿分支临时去掉后,同一用例
+精确复现生产错误并失败:
+
+```text
+同一帧 COPY→SIZE2 不得报快照缺失,得到 ["gfx.imageop.source.snapshot_missing"]
+```
+
+场景级验证(逐帧像素,`probe_layers --px 388,180 --px 388,350`):
+
+```text
+2866  (388,180)=152,121,90  (388,350)=255,248,229
+2867  (388,180)=152,121,90  (388,350)=255,248,229   ← 修复前这里是背景色
+2868  (388,180)=245,192,139 (388,350)=255,247,228
+2869..2880  diff=0(完全静止)
+```
+
+### 5. 卡顿复查:不是泄漏,是 CPU 合成
+
+`state_audit` 拉到 6200 帧(每 200 帧一档,同一场景内):
+
+| frame | layers | copies | images | passes | render |
+|---|---|---|---|---|---|
+| 3200 | 678 | 72 | 28 | 102 | 3.49 |
+| 3800 | 678 | 72 | 29 | 103 | 3.38 |
+| 4000 | 678 | 72 | 68 | 142 | 10.70 |
+| 4400 | 680 | 72 | 70 | 144 | 10.28 |
+| 5000 | 581 | 70 | 65 | 136 | 10.71 |
+| 6200 | 480 | 70 | 60 | 131 | 11.11 |
+
+- 没有单调爬升:同一场景段内持平,跨场景随内容(可见层/op 数)起伏。
+- 3800→4000 的一次台阶来自**对话文本窗**上线:文本窗层每帧 40 条
+  `MERGE2/MERGE/TRANSITION` 全走 CPU 逐像素合成。新增计时桶实测:
+
+```text
+[rt] frame=4065 plan_total=12.68ms snap=0.34 image=11.63
+[rt]   image_paths sampled=9 paint=17(0.54ms) pixel=1(0.00ms) composite=40(10.87ms)
+```
+
+  ⇒ 10.9ms / 12.7ms 花在 composite 上。
+
+### 5.1 收口:合成链记忆化(2026-10-27)
+
+`MERGE` 只有「目标是快照」时走 GPU(`plan_paint` 的 `PaintKind::Texture`),
+普通层仍走 CPU,而对话窗每帧 41 条(`2×RECTPAINT3 + 39×MERGE2`)。
+
+**关键事实**:每帧层表面都从**基图**重新开始(`apply_image_to_override` 的
+首条 op 取 `resolve_base_texture`,不读上一帧结果),所以「基图 + 动作序列 +
+几何 + `SET` + 各源像素身份 + 源文本修订号」构成**纯函数输入**;逐项相同时
+输出必然逐像素相同。缓存命中时直接复用上一帧的 CPU 表面,链上每条仍按
+「已执行」计数(与 soft 逐条重算的 `ops_drawn` 口径一致)。
+
+- 判定:`passes::plan` 步骤 0.5;只对「全部动作 ∈ {RECTPAINT 族, MERGE 族}」
+  且基图是资产/1×1 黑的层生效(快照目标走 GPU 命令段,不参与)。
+- 指纹:`chain_signature()` + `layer_token()`(覆盖 `text_revisions`、
+  覆盖纹理哈希、UV 修饰、资产键、快照 `CopyId`+目标 id)。
+- 缓存:`WgpuRenderer::composite_cache`,`reset()` 清空,逐帧按存活层剪枝。
+
+**验证(逐帧像素对拍,开/关记忆化各跑一遍)**
+
+```text
+4100 帧:frames compared 4100  differing 0
+6200 帧:frames compared 6200  differing 0
+```
+
+**收益(同一帧,`YU_RENDER_TIMING=1`)**
+
+| | 修前 | 修后 |
+|---|---|---|
+| `plan_total` | 12.68ms | 3.28–3.82ms |
+| `composite` | 40 op / 10.87ms | 1 op / 1.45–2.04ms |
+| 剩余 composite | — | `sp.tmpB → SPLBUF602`(2 条链,低于记忆化阈值) |
+
+**残留(可选)**:普通层的 `MERGE` 仍是 CPU;若将来出现「每帧输入都在变」
+的合成链(记忆化必然 miss),再上「离屏覆盖目标」(`Override::Pass`)把整条
+链搬到 GPU。
+
+### 6. 取证工具
+
+`probe_layers` 扩充(仍是只读探针):
+
+- `--px x,y`(可重复):采样最终屏幕像素,并给相邻帧 `diff=/changed=`;
+- `--backend soft|wgpu`:同场景换后端对拍;
+- 打印 `COPY <id> <dest> <- <src> src_tex=… region=… status=…`;
+- `IMG … status=…` 补上状态,`SKIP` 行带 `source`。
+
+### 7. 勘误
+
+`X+=`(参数种类 2)按**增量**处理,与 `DIV-GFX-064` §4 原结论相反,详见该
+文档新增的勘误小节与 `MOTION-SPIKE-2` §4 附注。
+
+### 8. 验证命令(原始结果)
+
+```text
+cargo build --workspace --all-targets                                   Finished
+cargo test -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu --all-targets 37 套件全绿
+```
+
+***
+
+## 成果 SAVE-EVENT-ORDER (2026-10-27) · 存档域统一命令时刻同步,修删档晚于刷盘
+
+菜单存档失败(目标 `.sd` 被删且不再生成、无 Fatal)定位为存档/文件域
+事件的**应用时机**问题,按统一口径修复,不是补丁。
+
+### 1. 根因(探针实测,已还原)
+
+`es_SaveLoad.yst` 的存档顺序:
+
+1. `pc315 FILEACT[FILE=$es.SAVEPATH+$SFNAME DELETE=1]` —— 删除**事件入队**;
+2. `pc341 SAVE[FILE=$SFNAME]` —— `op_save` **同步** `host.flush` 写盘;
+3. `Engine::tick` 帧末 `host.apply_events(&events)` —— 此时才执行删除;
+4. `pc342 SAVEEND[]` —— 清预约。
+
+结果:刚写出的存档被延迟的删除抹掉,最终无文件、无报错。同一帧探针输出:
+`AUDIT FILEACT script=19 pc=315` → `AUDIT SAVE flush pc=341 file=save30002.sd`
+→ `AUDIT FLUSH ok exists=true`(25602 字节)→ `AUDIT FILEACT DELETE`
+→ `final exists=false`。把 Save/File 事件临时改为 `emit` 同步应用后删除
+排到 flush 之前,文件保留;但引擎随后仍 drain 一次,事件被重复应用——
+所以正确修法是「命令时刻同步 + 只消费一次」。
+
+日志里的 VARINFO STRTYPE、`SAVE[ID]` 缺 SET/G_*、`SAVE[SET]` 系统变量
+`@60` 都是既有 **Recoverable/Unimplemented**(`step_command` 记录后继续),
+与本次失败无关。
+
+### 2. 引入点
+
+结构性问题自 SaveHost 接线(B1 `16cef47`,2026-10-24)起存在:
+`Vm::emit` 自 `d66ed41` 起只同步 Graphics/Window/Sound,Save/File 一直
+等到帧末 drain。不是近期 TASKINFO/TASK/SCRIPTPOS/VARINFO 改动。
+修复前最后一次内核菜单存档 `save00001.sd`(2026-10-25)缺 DNO 3(缩略图)
+与 DNO 90(ICON),与内核两个既有缺口一致,说明当时写过但时序未被覆盖。
+
+### 3. 修法(统一)
+
+- `Vm::emit`:对 `Domain::Save | Domain::File` 的 DomainCall 也**命令时刻**
+  同步调用 `save_host.apply_event`(与 Graphics/Sound 同口径);
+- `Engine::tick`:帧末只保留事件统计/trace,不再把同一批事件喂给
+  `SaveHost`(避免重复应用);
+- 更新 `SaveHost` trait / `yu-save` 宿主文档 / 处理器注释,契约从
+  「drain 时调用」统一为「命令时刻同步且只消费一次」。
+
+### 4. 回归(原始结果)
+
+```text
+cargo test -p yu-rt --test fixture fileact_is_applied_before_save_file_flush_in_same_frame
+  1 passed
+cargo test -p yu-rt
+  unit 82 / consistency 4 / corpus 11 / corpus_golden 4 / fixture 95 / golden 3 = 全绿
+cargo check --workspace --all-targets  Finished
+```
+
+桌面复现(临时 save 根,菜单快捷存档):`save30002.sd` **25608 字节保留**
+(修复前被删除)。
+
+### 5. 残留(在册,另行处理)
+
+- `SAVE[SET=@_RINT(1)]`(DNO 90):系统变量无 `var_snapshot`,仍只告警
+  不写块。
+- `SAVE[ID]`(DNO 3 缩略图):图层快照未实现(H-P4-02)。
+- `FILEACT[DELETE]` 成功仍挂 `sv.command.unimplemented`(INFO)日志码,
+  属日志码误用,不影响行为。
+- 旧 `save00002.sd` 在用户工程根已被删除;新存档需在游戏内重新生成。
+
+## 成果 BACKEND-SPLIT (2026-10-27) · 双后端定位:GPU 模式不再由 CPU 兜底/代劳
+
+起因:主人指出 `soft` 与 `wgpu` 是**两条独立实现**,GPU 模式理应由 GPU 完成,
+不得接入 soft 的实现;并要求把这条写进文档、再审查一遍职责耦合。
+
+### 1. 写入的原则(新文档)
+
+`docs/architecture/backends.md`(并在 `docs/architecture.md` v1.4 补充里挂链):
+
+- `yu-backend-soft` = **CPU 模式**(`--backend soft`)+ 语义参考/对拍基线;
+- `yu-backend-wgpu` = **GPU 模式**;像素工作必须由 GPU 完成,
+  **运行期不得调用** `apply_*`/`blend_transition`/`scale_region`/`blit`;
+- 允许共享的只有**契约与平台设施**:`Surface`/`RenderReport`/`SkippedOp`/
+  `AssetIssue`、`TextureStore`(资产解码)、`TextComposer`(字形栅格);
+- 机械判定规则(grep 命令)+ 现状账本(每个动作 → 现状 → 目标)+ 迁移顺序。
+
+两个 crate 的模块头注释同步声明了该定位(rag 检索与新人先看到的就是它)。
+
+### 2. 审查发现并修掉:GPU 启动失败会静默降级到 CPU
+
+`crates/yu-cli/src/desktop.rs` 原来在 wgpu 初始化失败时自动 `options.backend =
+Backend::Soft` 重试,只打一条 Warn。用户会以为在看 GPU 结果、实际是 CPU,
+所有「GPU 模式还是卡/画错」的定位都会失真。已删除该兜底,改为显式失败:
+
+```text
+wgpu 后端启动失败:<原因>
+本内核不会自动回退到 CPU 模式;确需 CPU 渲染请显式加 --backend soft。
+```
+
+### 3. 审查结论(在册,未清)
+
+| 项 | 现状 | 处置 |
+|---|---|---|
+| 普通层 `MERGE/MERGE2/RECTPAINT` 等 ~20 个图像动作 | wgpu 调 `yu_backend_soft::apply_*`(CPU) | 按账本迁 GPU;`Override::Pass` 优先 |
+| `ImageCacheKey`/`ImageOpSig`/`ImageSource` | wgpu 的缓存键类型定义在 soft | 抽 `yu-render-core` |
+| `TextureStore`/`TextComposer` | 共享设施寄居 soft crate | 同上迁出 |
+| `reconcile` 对拍 | `Renderer::Wgpu` 内持一个 `SoftRenderer` | **唯一允许共存**,缺省关闭,只读同一份 frame |
+| 依赖方向 | `yu-gfx` 不依赖后端;soft 不依赖 wgpu;wgpu 依赖 soft | 待上面两项迁移后断开 |
+
+### 4. 后端选择(两个独立项目,同一入口)
+
+```text
+yu-cli run <project> --mode desktop  --backend wgpu   # GPU 模式(产品路径)
+yu-cli run <project> --mode headless --backend soft   # CPU 模式(确定性/无 GPU)
+yu-cli serve <project> --backend soft
+```
+
+缺省:`headless`/`serve` = soft,`desktop` = wgpu。桌面宿主在 soft 下直接报错
+并提示切 `--backend wgpu`(`host-desktop` 需要 wgpu 设备做窗口呈现)。
+
+### 5. 验证(原始结果)
+
+```text
+cargo build -p yu-cli -p yu-backend-wgpu -p yu-backend-soft     Finished
+cargo build --workspace --all-targets                           Finished
+```
