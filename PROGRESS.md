@@ -8530,3 +8530,370 @@ yu-cli serve <project> --backend soft
 cargo build -p yu-cli -p yu-backend-wgpu -p yu-backend-soft     Finished
 cargo build --workspace --all-targets                           Finished
 ```
+
+### 6. 结构重构(2026-10-27):抽出 `yu-render-core`,契约不再寄居 CPU 后端
+
+按「先重构区分/耦合,再推性能」的顺序落地:
+
+- 新 crate `crates/yu-render/core`(`yu-render-core`)承接两后端共享的**契约与
+  平台设施**:`Surface`/`blit`/`RenderReport`/`SkippedOp`、`Texture`/
+  `TextureStore`/`AssetIssue`(资产解码)、`TextComposer`/`TextPaintStats`/
+  `text_base_key`/`ComposedLayer`(字形栅格)、`ImageCacheKey`/`ImageOpSig`/
+  `ImageSource`/`SizeKey`/`SizeSource`、`scale_region`、`png`。
+- `yu-backend-soft` 保留同名再导出(既有路径不破),`apply_*`/`blend_transition`
+  等**像素算法仍留在本 crate** —— 它们就是 CPU 模式的实现。
+- `yu-backend-wgpu`/`yu-engine`/`yu-cli`/`host-desktop` 改为直接引用
+  `yu_render_core::`。重构后 `grep yu_backend_soft crates/yu-render/wgpu/src`
+  只剩在册的 `apply_*` + `blend_transition`。
+- 顺带把 `scale_region` 从 `imageop` 移入 core(它是通用栅格原语,不是后端语义)。
+
+**行为中性验证(原始结果)**
+
+```text
+6200 帧逐帧屏幕哈希 vs 重构前:frames compared 6200  differing 0
+cargo test -p yu-render-core -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu --all-targets
+  38 套件全绿
+cargo build --workspace --all-targets   Finished
+```
+
+**剩余耦合(账本 §4)**:wgpu 仍在普通层调用 `apply_merge`/`apply_rect_paint`/
+`blend_transition`/`apply_reverse`/… 这批动作需逐个 GPU 化;优先级最高的仍是
+普通层 `MERGE/MERGE2`(立绘表情合成的 `sp.tmpB → SPLBUF602` 每帧约 2ms)。
+
+### 7. 渲染尖峰归因(2026-10-27,立绘在场稳态)
+
+重构后用逐 op 计时(`>0.02ms` 才打印)定位立绘场景的每帧耗时构成:
+
+```text
+f=2890  merge      :/W0/sp.tmpB    -> :/W0/SPLBUF602  2.15ms   ← 表情/身体合成
+f=2890  transition :/W0/SPLBUF601  -> :/W0/SPLBUFb601 1.20ms   ← 换图过渡
+f=2890  rectpaint3 :/W0/BT…MESW.TX -> 同层            0.25/0.28ms
+f=2890  rectpaint3 :/W0/BT…NAMEW.TX -> 同层           0.04/0.05ms
+```
+
+稳态(2500–2900 帧,393 帧)`plan_total` 中位 **3.08ms**,构成:
+`image 2.14` / `snap 0.25` / `text 0.02` / `rest 0.63`。image 里就是上面两条
+普通层合成 —— 也就是「立绘一出现 ms 就 3ms」的来源。
+
+两条都在账本 §4 的未清项里(普通层 `MERGE` 与 `TRANSITION` 仍调用 CPU 实现):
+`apply_merge`/`blend_transition` 各要克隆两侧表面(295×580×4 ≈ 0.68MB×2)再
+逐像素处理。**修复方向 = `Override::Pass` 离屏目标 + 现有 merge/过渡 pipeline**,
+验收:这两条 op 的 `composite` 计时归零、soft 对应函数在 wgpu 构建里
+`unreachable!()` 仍能出画面。
+
+## 成果 SPRITE-TRANSITION (2026-10-27) · 立绘过渡查证:`TID` 配对层缺失导致过渡整条被跳过
+
+用户报演出1 后半程:①过渡应为半透明、实际直接黑边;②立绘过渡时被压矮/竖条;
+③个别字不显示;④偶发尖峰。本轮按脚本 → gfx → 后端逐层对照,已定位②③之外的
+主链,并修掉一处错误判据。
+
+### 1. 脚本原貌(证据源)
+
+`project-479/data/script/UserScript/演出機能.txt:207-236`:
+
+```text
+\SP.TR(11)            // 选过渡图案 11
+\SP.2TP(256,0,1000)   // T: 256 → 0,1000ms
+\SP.GO(YUURI)
+```
+
+`es_Sprite.yst` 的实现链:
+
+- `es.SP.LOADTR`(`:6294-6375`):`$tr=$S.FTR(@wn)` 非空时
+  `CG[ID=$TRBUF1 … FILE=$loadfilename]`(图案图 = `cg/tr/ysr023`)
+  + `CG[ID=$TR1 … SX=1 SY=1 FILE=""]`(mask 层);
+- 每帧(`:8162-8186`):`@L.TRA>0` 时先
+  `CGACT[ID=$TRBUF1 ID2=$TR1 SIZE=1 SX=@lsx1 SY=@lsy1]` 把 mask 对齐到精灵尺寸,
+  再 `CG[ID=$L1 TID=$TR1 T=@TP TA=@L.TRA(@LNO)]`。
+
+图案 `cg/tr/ysr023.png` 实测是**柔和的点阵网格**(不是硬条纹),所以官方的
+`TR(11)` 是"按点阵渐隐"的半透明过渡。
+
+### 2. 现场(更正版:过渡确实执行了,问题在 mask)
+
+> ⚠️ 本节原写「mask 层没被创建、过渡整条被跳过」,那是把观察窗口
+> (4090-4160) 截在 `\SP.TR(11)` 生效之前导致的误判。以下是 4160-4260 的复核。
+
+`probe_layers`(新增 `TRANS` 行与层状态 `T=/TA=/TID=`)在引擎帧 4253 附近:
+
+```text
+[tid] f=4253 ID=:/W0/SPL601 TID=SPLTR601
+TRANS :/W0/SPL601 from=SolidBlack1x1 mask=Some(SolidBlack1x1)
+      fade=0.0932 t=47 ta=128 from_layer=SPL601 to_layer=SPLTR601 size=295x501
+```
+
+- 过渡 op **有产出**,`T` 按 256→0 推进,`fade` 随公式变化;
+- `from`/`mask` 在数据层是 `SolidBlack1x1`(SC 层 `FILE=""` 的 1×1 黑),
+  真实像素由后端的 `from_layer`/`to_layer` 取**加工后表面**;
+- mask 层 `SPLTR601`/`SPLTRBUF601` 在 `\SP.TR(11)` 生效帧才创建
+  (此前不存在,所以 4090-4160 窗口里看不到)。
+
+**软/硬对拍(同帧、精确读回)**:4245 帧两边都是"半透明渐隐",**都没有竖条**;
+4154 帧两边**都出现同样的竖条**。⇒ 竖条不是 GPU 采样差异,是**上游(mask 内容/
+取样区间)**的问题,两个后端一致复现。
+
+### 3. 顺带修正的判据:`TextureRef::None` 不等于"没有配对"
+
+`transition_pair` 原先把 `FILE=""` 的配对层判成无配对。引擎的 `YS_Texture2`
+取的是配对层**表面**(`FUN_00414ba4` 行 881-971),`FILE=""` 层照样有 1×1 表面
+并被 `CGACT` 写入,所以判据应是"节点存在即成立",像素由后端的 `to_layer`
+(图像加工覆盖纹理)解析。已改;6200 帧逐帧像素对拍 **differing 0**(该语料里
+本层始终缺失,所以是"修对了但还没被触发")。
+
+### 4. 未闭环
+
+- **竖条(软硬同现)**:4154 帧两后端一致。mask 图案 `cg/tr/ysr023` 是柔和点阵,
+  不是竖条,所以是 **mask 的取样区间/尺寸**被算错。下一步在后端把
+  `TRANS` 的 `mask` 解析结果(纹理 id + dims + uv 矩形)打出来对拍。
+- **压矮**:`SPL601 size=295x501`(常态 531),同一过渡段出现;需确认是脚本
+  `SXYZ` 的 Z 缩放还是 `SIZE` 源区间错。
+- **过渡的"黑边 vs 半透明"**:4245 帧已接近半透明,说明 `T` 模型方向对;
+  但 `transition_coverage` 仍是 TA=128 校准模型(DIV-GFX-045,TA≠128 偏差 ~0.12),
+  要按官方固定管线状态重推。
+- **个别字空白**、**偶发尖峰**:4200 帧 summary 的 `skipped_total=0`、无 text 诊断,
+  需要按用户时间点抓帧再定位。
+
+### 5. 结论
+
+过渡问题的第一块多米诺是 **mask 层缺失**(VM/脚本侧),不是渲染公式;
+但即便 mask 到位,`transition_coverage` 也只是 TA=128 校准模型
+(DIV-GFX-045 已记 TA≠128 偏差 ~0.12),届时需按官方固定管线状态重推。
+
+### 6. 已修:立绘退出时被压矮(过渡绘制丢失层的有效源区间)
+
+**现场**:`SP.TR(11)` 淡出期间,立绘明显变矮;同一层在过渡帧的 `size=295x501`,
+而常规帧的源区间是 295×531(源纹理 295×580)。
+
+**根因**:`passes::plan_transition` 用 `push_quad`(**uv 恒 [0,1]**)画过渡 quad。
+层上其实挂着 `SIZE`/`SIZE2` 的 UV 修饰(`Override::Uv { uv, width, height }`,
+有效源是 295×580 里的 295×501 子矩形),而过渡路径把 uv 丢掉 ⇒ 整张 295×580
+被压进 295×501 的框,**高度压 0.864×**。
+
+**修法**(`crates/yu-render/wgpu/src/passes.rs` + `shaders/transition_fixed.wgsl`):
+
+- 固定管线路径改取层上的 `Override::Uv`:`draw_uv/draw_w/draw_h` 来自修饰,
+  顶点改用 `push_quad_uv`;
+- mask 是独立表面,仍按整层 [0,1] 取样,所以在 shader 里把顶点 UV
+  **反归一化**回层内坐标(`mask_uv = (uv - uv_min) / (uv_max - uv_min)`);
+  UV 矩形随 uniform 下发(`Fade` 结构扩到 32 字节,`_DXMODE≠0` 的 psC/psD
+  仍用 16 字节,不动)。
+
+**验证**:
+
+- 4154 帧源行映射:修前 `screen_y = 100 + src_row*501/580`(压缩),
+  修后 `screen_y = 100 + src_row`(1:1),与脚本 `SIZE2` 的源矩形一致;
+- **6500 帧逐帧哈希收口到只剩立绘过渡窗口**:`[4145,4193]`、`[4196,4450]`
+  两组共 304 帧变化,**其余 5896 帧逐字节不变**。
+
+**越界 UV 的夹取(现场回归的教训)**:整面区域按闭区间换算会得到
+`1.00125/1.001667`(801/800)这类**越界 UV**;开幕 logo 的过渡层正好是这种
+"整面 + 一点点越界",第一版未夹取 ⇒ 开幕那 100 帧全部变化(用户报
+「黑白分界线很明显」)。加 `clamp_uv_max`(上界夹到 1,真正的子矩形不变)后,
+**开幕/标题的过渡恢复逐字节一致**,只有立绘那种真子矩形(`v1=0.8638`)才走新路径。
+教训:改公共绘制路径时,先用 6200 帧哈希把变化范围压到目标窗口,再交付。
+
+> 说明:**过渡里那层点阵/竖纹是 mask 图案**(`cg/tr/ysr023` 的点阵模板),
+> 属官方转场效果,不是缺陷;本轮只修"源被压进框"的几何。
+
+```
+cargo build --workspace --all-targets             Finished
+cargo test -p yu-render-core -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu --all-targets
+  38 套件全绿
+```
+
+### 7. 过渡覆盖度模型(官方是顶点 α 渐变,不是阈值)—— 在册待实现
+
+用户报「时钟/开幕的过渡是硬边黑幕,官方是平滑半透明」。REA 逐指令解出官方
+固定管线的真实做法(详见 `docs/divergences/DIV-GFX-065-transition-coverage-model.md`):
+
+- 两个纹理 stage 都是 `SELECTARG1`(颜色) + `ALPHAOP=MODULATE`(alpha =
+  纹理 alpha × `D3DRS_TEXTUREFACTOR.a` = 层 A),**stage2 关闭**——
+  没有任何 `T` 参与 stage 状态,也就没有阈值;
+- `T` 进入**顶点色**:`0x415462-0x415532` 连续构造 4 个带灰度 D3DCOLOR 的顶点,
+  即一块**四角 α 渐变**的 quad,随 `T` 扫过层矩形;
+- 因此官方视觉是「渐变 × mask 乘子」,天然柔和;我们的
+  `transition_coverage`(slope 30..100、threshold 1-2fade)是 TA=128 的校准拟合,
+  斜率导致 1%–3% 的过渡带 ⇒ 硬边。
+
+**结论**:这不是调参能修好的,必须把 `plan_transition` 改成逐角 alpha + mask 乘子;
+公式还需继续解 `0x415462-0x415532` 的浮点链。台账状态 `open`。
+
+### 8. 过渡配置真值(脚本表)与结论更新
+
+- `\FOUT(1500,5)`(jp_0053.txt:249,「幕を下ろす」)展开为全屏黑幕 +
+  `\SP.TR("5")` + `\SP.2TP(0,256,1500)`。
+- `SP.TR(name)` 经 `es.TRDEF.CHECK` 查表(`UserDefine/jp_0011.txt`):
+  **`5` → `ysr005`,TA=4**(回転/時計回り);**`11`/`12` → `ysr011/012`,TA=128**
+  (シャッター);`0` → `ysr000`,TA=0(纯 fade)。
+- 脚本原注释:「値が大きいと『くっきりした感じ』」——**TA 就是软硬旋钮**。
+- 我们的 `transition_coverage` 只在 **TA=128** 标定过(残差 ≤8/255),TA≠128
+  偏差 ~0.12 ⇒ 时钟(TA=4)必然走样。这就是「时钟硬边、立绘勉强」的根因,
+  与「调参」无关。
+
+**下一步**:按官方微场景重测 TA∈{0,4,64,128} 的原始 α 表 → 反解闭式 →
+替换 `transition_coverage`,soft/wgpu 同步。台账见 DIV-GFX-065 §4/§5。
+
+### 9. 官方过渡 α 原始表(从已有 micro 参考帧读出)
+
+`j2-micro-trans8` 的参数网格(TA{2,64,128,192} × T{0,64,128,192,255} × mask{0,128})
+参考帧已把 α 写在像素里,读表结果与四条硬事实见
+`docs/divergences/DIV-GFX-065-transition-coverage-model.md` §6。要点:
+
+- mask=128 在 T=128 恒 0.5、T=192 恒 1.0(与 TA 无关);
+- mask=0 在 T<=192 恒 0(唯一例外 TA=2/T=192 = 0.502);
+- mask=0 在 T=255 **精确等于 `(256 − TA/2)/256`**(TA=2/64/128/192 → 0.996/0.875/0.749/0.624)。
+
+结论:**只有两个 mask 电平,不足以分离「阈值/斜率/分块顶点 alpha」三个自由度**,
+现有 `transition_coverage` 的拟合在 TA=4(时钟)上必然错。闭环需要新造一个
+**256 级渐变 mask + 密 T 网格**的官方微场景(工程与官方 exe 已在
+`target/tmp/j2-micro-trans8`,缺的是抓帧驱动,按
+`<repo-old>/docs/windows-handoff.md` 重写)。
+
+### 10. 结论修正:官方过渡是「CPU 轮廓带 + 逐块顶点 α」,不是逐像素覆盖率公式
+
+重读 `FUN_00414ba4` 伪代码(REA `ev_128a7aa3…`)后确认:
+stage1 的 `ALPHAOP` 最终被设成 `D3DTOP_DISABLE`(0x415846)⇒ **mask 不参与 alpha**;
+`alpha = tex0.a × TFACTOR.a`,而 TFACTOR 是**每次 DrawPrimitiveUP 前设一次的标量**;
+循环按 `+0x130`(部件)/`+0xb0`(分块)两张表逐块构造 4 顶点画 triangle strip。
+
+⇒ 官方在 CPU 上**沿 mask 等值线切块**,每条带子按 T 算 α 再画。
+这解释了 §9 的 α 表为什么怎么拟合都对不上(单块单元只有一个 α 台阶),
+也解释了 TA=精度=分块密度=软硬。
+
+**待办(在册)**:实现「轮廓带 + 逐块顶点 α」路径,soft/wgpu 同步;
+现有 `transition_coverage` 仅为临时近似,在 `docs/architecture/backends.md` 账本标 `open`。
+
+### 11. 定稿:过渡软边来自几何(等值线带),alpha 是常量
+
+把 `FUN_00414ba4` 的赋值链对完后确认:4 个顶点同色(灰度 A)、TFACTOR 每层设一次、
+stage1 `ALPHAOP=DISABLE` ⇒ **最终 alpha = tex0.a × A,与 mask/T 无关**。
+「哪里看得见」由**几何**决定:循环按 `+0x130`(部件)/`+0xb0`(分块)表把可见区域
+沿 mask 等值线切成 triangle strip,块内用 16.16 定点插值边界;`T` 决定等值线位置,
+`TA` 决定分块密度。
+
+⇒ 结论:不存在逐像素覆盖率公式;软边 = 等值线几何的平滑。要 1:1 必须实现
+「等值线 → strip」渲染,与现有「单 quad + 覆盖率」是两种实现。
+台账:`docs/divergences/DIV-GFX-065-transition-coverage-model.md` §7/§8。
+
+### 12. 过渡 oracle 测试落地(40 格官方 α 网格)
+
+新增 `crates/yu-render/soft/tests/transition_alpha.rs`:把官方微场景
+`j2-micro-trans8` 参考帧里读出的 40 格 α 作为真值,逐格渲染同样构型并比对
+(容差 2/255)。当前 **9/40 格超差,且全部落在 TA 依赖上**;新硬事实:
+**官方 T=128 的 α 与 TA 无关**(mask=128 → 0.498、mask=0 → 0.000,四个 TA 一致),
+而我们的 `fade` 随 TA 变 ⇒ 系统性偏差。测试以 `#[ignore]`(注明原因)留作
+轮廓带实现的验收门禁。
+
+### 13. 撤回宽带覆盖率模型 + 官方整场 FOUT 幕对拍(IoU 0.85-0.87)
+
+**撤回**:曾把 `transition_coverage` 改成宽带形(`c=1-t`,`w=1/6`),在官方 9 级
+mask 扫描上 rms 0.0043 —— 但它把**开幕**的平滑梯度掩膜糊成灰阶(帧 40 与
+回退前逐像素差 10 万+ 像素、max 129),而官方开幕是锐利生长的黑菱形格。
+两种带宽都能过那张表(采样只落在连通域边界,钉不住带宽),所以带宽必须靠
+梯度掩膜画面判别。已回退 `c=1-2f / K=30+70f` 窄带阈值(`yu-gfx/src/layer.rs`、
+soft `render.rs`、wgpu `passes.rs` + `transition_fixed.wgsl` 的同式),
+并加 `transition_coverage_stays_a_hard_threshold` 防再被改宽。
+回退验证:重渲帧 40 与回退前基线**逐像素一致**(changed=0, max=0)。
+
+**整场取证**:新增 `tools/official_trace/capture_run.py`(默认**完全被动**,
+不发任何输入,窗口关闭即结束),人手动把官方 0.495 点到
+`jp_0053.txt:249` 的 `\FOUT(1500,5)`,0.2s 截屏;内核侧同一段演出在宿主帧
+4585 进入同一条幕。按覆盖率对齐后黑区 IoU:
+
+```text
+官方0116 cov 0.149 <-> 内核4596 cov 0.148 IoU 0.477(小区域,边界占比大)
+官方0117 cov 0.364 <-> 内核4608 cov 0.367 IoU 0.850
+官方0118 cov 0.469 <-> 内核4616 cov 0.468 IoU 0.873
+官方0119 cov 0.643 <-> 内核4630 cov 0.606 IoU 0.839
+```
+
+覆盖区内官方与内核**都是纯 0** ⇒ 官方这条幕也是「不透明黑 + 柔和等值线边」,
+不是半透明白;推进速度在 0.2s 采样误差内一致。
+立绘退场(`ysr011/012`,TA=128)确认为竖百叶快门擦除,非瞬失。
+台账:`docs/divergences/DIV-GFX-065-transition-coverage-model.md` §10/§11。
+
+**验证命令与结果**:
+
+```text
+cargo test -p yu-gfx -p yu-render-core -p yu-backend-soft -p yu-backend-wgpu
+  => passed 221 failed 0 ignored 1(trans8 40 格,等值线带实现的验收门)
+scenario_probe(开幕帧 40,回退前后逐像素)      => changed=0 max=0
+capture_run.py(被动,132 帧 / 31.7s)          => stop: process-exit
+```
+
+注:`cargo build --workspace --all-targets` 本轮被并行会话的
+`crates/yu-engine/src/capture.rs`(未跟踪文件,格式串参数不匹配)挡住,与本次改动无关;
+受影响 crate 全部单独通过。
+
+### 14. 修好「演出 1 最后淡出」的硬边幕:覆盖率按 TA 分两档
+
+**症状(用户)**:「标题的 logo 浮现是没问题的,是剧情中的过渡便锐利了」,
+点名演出 1 的最后淡出;官方是宽的柔边,我们是硬边。
+
+**根因**:覆盖率一律用窄带 `K=30+70*fade`(等效带宽 0.02..0.033 mask 单位)。
+标题 `SP.TR` 的 `TA=128` 用这个正好是硬边(已验收),但 `\FOUT(1500,5)` 的
+`TA=4` 在官方是宽渐变幕,同一个窄带把它画成硬边。
+
+**改动**(`crates/yu-gfx/src/layer.rs` + soft/wgpu/shader 同式):
+
+```text
+c = 1-2*fade;  K = 30+70*fade;  wide = 0.16/TA
+a = wide <= 1/K ? clamp(K*(m-c))      // 硬档:与旧实现逐位一致(标题/快门)
+                : clamp((m-c)/wide)   // 软档:剧情宽渐变(TA=4 → 0.04 ≈ 40px)
+```
+
+**验证**:
+
+```text
+标题帧 22/28/40/52 与改动前逐像素   => changed=0 max=0(逐位不变)
+演出1 FOUT 覆盖率(dark%)           => 4594:0.086 4600:0.223 4606:0.308
+                                      4612:0.417 4618:0.474 4624:0.524 4650:0.970
+                                      覆盖区内部仍是实黑,边界 ~40px 柔带
+soft vs wgpu 同帧 dark%             => 4608:0.372/0.350 4630:0.605/0.586 4650:0.983/0.970
+cargo test -p yu-gfx --lib          => 17 passed(新增两档回归测试)
+cargo test -p yu-backend-soft/-wgpu => 37+15+1+9+21 全过(9 级扫描仍 8/255 内)
+cargo build --workspace --all-targets => 通过
+```
+
+**取证设施**:`YU_TRANS_DEBUG`(转场实际参数)/`YU_TRANS_DUMP`(落 from/mask
+纹理);`capture_run.py` 改为只取客户区(旧实现含标题栏且底部被裁,像素比对错位)。
+
+台账:`docs/divergences/DIV-GFX-065-transition-coverage-model.md` §12。
+
+**补充(统一公式)**:按反编译 `*0.25` 常数把两档合成一条
+`a = clamp((m-c)/(1/K + 0.25/TA))`,无分支。标题帧 28/40 与已验收基线差
+0.0055%(2.6万/480万像素,最大 Δ19);演出 1 淡出实黑占比
+0.029→0.272→0.453→0.555→0.928→1.000,边界柔带 ~65px。
+对照图:`target/tmp/fade_montage.png`(上排新版 4594/4606/4618/4630,
+下排旧版 4606/4630)。
+**仍存在的硬边**:过渡 quad 只画 `size` 区域 399×299(位于 400,300),
+其矩形边界是几何硬边(与掩膜无关);官方由「格 × 掩膜」网格承担,需落地
+`DIV-GFX-065 §12.3` 的 quad 网格才能消除。
+
+**定稿(统一公式 `0.16/TA²`)**:`a = clamp((m-c)/(1/K + 0.16/TA²))`,无分支。
+
+```text
+标题帧 28/40 与已验收基线   => 1303 / 861 px 差,max Δ1/255(等同未变)
+演出1 淡出(mean,dark,mid)  => 4594 (158.0, 0.086, 0.365)
+                              4606 (138.8, 0.314, 0.150)
+                              4618 (112.6, 0.479, 0.070)
+                              4630 ( 84.1, 0.596, 0.061)
+                              4650 (  1.3, 0.983, 0.016)
+                              4660 (  0.0, 1.000, 0.000)
+cargo test -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu => 215 passed / 0 failed / 1 ignored
+```
+
+`0.16/TA²` 的两锚点:官方 micro 网格(TA=128)要求 TA=128 的格带≈0(否则
+`mask=128,T=128` 的 α=0.498 被推到 0.43);整场帧(TA=4)实测柔带≈40px
+(掩膜梯度≈0.001/px ⇒ 0.04 mask 单位)。真正的 1:1 仍是 quad 网格(§12.3)。
+
+## 待办(截至 2026-10-27,按优先级)
+
+| # | 待办 | 现状 / 卡点 | 证据锚点 |
+|---|---|---|---|
+| 1 | **过渡按官方两形态重写**:带表层走「部件 × 分块」网格+逐顶点 α,不带表层走 4 顶点 quad | 静态已确认判据 `if (layer[+0xa7])`,层对象 0x640 字节;缺**真机层里的两张表**——需完整播到幕落(几次采集都在 5s 内被关窗,`hits=0`) | `DIV-GFX-065 §12.3/§12.5`;工具 `tools/official_trace/dump_layer.py` |
+| 2 | 开幕 logo 浮现**不该有过渡**:官方开幕 `FUN_00414ba4` 一次未被调用,我们多挂了一条 `SP.TR` | 已定位现象,未查「谁在开幕挂了 TR」 | `DIV-GFX-065 §12.5`、本次采集日志(`hits=0`) |
+| 3 | 过渡柔带目前是 `1/K + 0.16/TA²` 的**行为替身**,非官方机制 | 标题 max Δ1/255、演出1 淡出已成连续融合带;边界走向仍是掩膜折线 | `crates/yu-gfx/src/layer.rs` 注释 |
+| 4 | 普通层 `MERGE`/`TRANSITION` 上 GPU(`Override::Pass` 离屏目标) | 每帧约 2.15ms + 1.2ms 的 CPU 合成 | `docs/architecture/backends.md` 账本 |
+| 5 | 「有的字不显示空白」 | 缺具体时间点/台词,无法复现 | 用户报告 |
+| 6 | 40 格 oracle(`transition_alpha_matches_official_grid`)解锁 | `#[ignore]`,等第 1 项 | `crates/yu-render/soft/tests/transition_alpha.rs` |

@@ -23,7 +23,7 @@ pub use codec::Codec;
 pub use dir::DirSource;
 pub use encoding::{detect as detect_encoding, Decision as EncodingDecision, TextEncoding};
 pub use key::{normalize_component, split_components, LookupKey};
-pub use mem::MemSource;
+pub use mem::{MemSource, SharedMem};
 pub use mount::Mount;
 pub use ypf::{YpfDialect, YpfEntryInfo, YpfHeader, YpfParseStats, YpfSource};
 

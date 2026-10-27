@@ -29,6 +29,9 @@ use yu_gfx::{
     ImageAction, ImageOp, Layer, LayerId, Op, OpStatus, PassTarget, TextDraw, TextureRef,
 };
 
+use yu_render_core::{
+    blit, ImageCacheKey, ImageOpSig, ImageSource, RenderReport, SizeSource, SkippedOp, Surface,
+};
 use crate::imageop::{
     apply_horizontal, apply_meido, apply_rect_paint, apply_resize, apply_reverse, apply_trim,
     apply_vertical,
@@ -36,108 +39,13 @@ use crate::imageop::{
 use crate::text::{
     layer_base, layer_base_dims, text_base_key, texture_content_hash, TextComposer, TextPaintStats,
 };
-use crate::texture::{AssetIssue, Texture, TextureStore};
+use crate::texture::{Texture, TextureStore};
 
-/// RGBA8 表面(行优先,直通 alpha)。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Surface {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
-}
 
-impl Surface {
-    /// 用单一 RGBA 颜色填满。
-    pub fn new(width: u32, height: u32, rgba: [u8; 4]) -> Self {
-        let pixels = (width as usize).saturating_mul(height as usize);
-        let mut bytes = Vec::with_capacity(pixels.saturating_mul(4));
-        for _ in 0..pixels {
-            bytes.extend_from_slice(&rgba);
-        }
-        Self {
-            width,
-            height,
-            rgba: bytes,
-        }
-    }
 
-    pub fn pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
-        if x >= self.width || y >= self.height {
-            return None;
-        }
-        let i = ((y as usize) * (self.width as usize) + x as usize) * 4;
-        Some([
-            self.rgba[i],
-            self.rgba[i + 1],
-            self.rgba[i + 2],
-            self.rgba[i + 3],
-        ])
-    }
 
-    fn set_pixel(&mut self, x: u32, y: u32, px: [u8; 4]) {
-        let i = ((y as usize) * (self.width as usize) + x as usize) * 4;
-        self.rgba[i..i + 4].copy_from_slice(&px);
-    }
 
-    fn from_texture(texture: &Texture) -> Self {
-        Self {
-            width: texture.width,
-            height: texture.height,
-            rgba: texture.rgba.clone(),
-        }
-    }
-}
 
-/// 一种被跳过的操作(按 `(kind, reason, target)` 聚合计数)。
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SkippedOp {
-    /// `layer` / `group` / `transition` / `mask` / `copy` / `image`。
-    pub kind: &'static str,
-    /// 跳过原因(`OpStatus` 的稳定 code,或后端自身的原因)。
-    pub reason: String,
-    /// 操作目标图层/组(稳定显示形式)。
-    pub target: String,
-    /// 同一 key 在本帧的出现次数。
-    pub count: u32,
-}
-
-/// 一帧的渲染摘要。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RenderReport {
-    pub frame: u64,
-    pub viewport_width: u32,
-    pub viewport_height: u32,
-    /// `CompositorFrame.layers` 数量(含不可见层)。
-    pub layers: usize,
-    pub visible_layers: usize,
-    /// pass 总数(含空 pass)。
-    pub passes: usize,
-    /// 实际执行并写入 offscreen 表面的组 pass 数。
-    pub offscreen_passes: usize,
-    pub ops_total: usize,
-    /// 真正执行(含完全在视口外、未写像素的操作)。
-    pub ops_drawn: usize,
-    pub skipped_ops_total: u32,
-    pub skipped: Vec<SkippedOp>,
-    /// 本帧解析失败的资产(`asset.*`)。
-    pub missing_assets: Vec<AssetIssue>,
-    /// 本帧 `TextRun` 数量(全部未栅格化)。
-    pub skipped_text: usize,
-    /// `CGACT[TEXT]` 绘制项应用数。
-    pub text_draws: usize,
-    /// 文本栅格化成功写入的字符数。
-    pub text_glyphs: usize,
-    /// 文本缺字/不可解码字符数。
-    pub text_missing: usize,
-    /// 文本失败原因(去重、稳定排序)。
-    pub text_diags: Vec<String>,
-    pub filter_mag: &'static str,
-    pub filter_min: &'static str,
-    pub filter_mip: &'static str,
-    /// `engine_settings` / `placeholder`。
-    pub filter_source: &'static str,
-    pub color_space: &'static str,
-}
 
 /// `render_frame` 的输出。
 ///
@@ -171,50 +79,7 @@ pub struct SoftRenderer {
     text: TextComposer,
 }
 
-/// 图像加工的源身份(资产 key / 1×1 黑 / 冻结快照)。
-///
-/// 用它而不是图层名做缓存键:同一份像素无论挂在哪个图层名下,加工结果相同
-/// (EVID-T-10:图层名只是脚本约定,不参与引擎语义)。
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ImageSource {
-    Asset(Vec<u8>),
-    Solid,
-    Snapshot(u64),
-}
 
-/// 图像加工的确定性签名(同一源 + 同一签名 ⇒ 同一结果)。
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ImageOpSig {
-    /// `CGACT[SIZE]`(最近邻)/`SIZE2`(双线性)。
-    Size {
-        bilinear: bool,
-        width: u32,
-        height: u32,
-    },
-    /// `CGACT[REVERSE]`:RGB 取反。
-    Reverse,
-    /// `CGACT[HORIZONTAL]`:水平镜像。
-    Horizontal,
-    /// `CGACT[VERTICAL]`:垂直镜像。
-    Vertical,
-}
-
-/// 跨帧图像结果缓存键。
-///
-/// 脚本每帧都会重发同样的 `CGACT[SIZE]`/`REVERSE`(title 期实测每帧 51 条
-/// `SIZE` + 1 条 `REVERSE`);结果只依赖源像素与参数,缓存后帧内无像素工作
-/// (EVID-J3-08)。
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ImageCacheKey {
-    pub source: ImageSource,
-    pub op: ImageOpSig,
-    pub region: Option<(i64, i64, i64, i64)>,
-}
-
-/// 兼容旧名(任务内已有引用)。
-pub type SizeSource = ImageSource;
-/// 兼容旧名。
-pub type SizeKey = ImageCacheKey;
 
 impl SoftRenderer {
     pub fn new(textures: TextureStore) -> Self {
@@ -273,6 +138,22 @@ impl SoftRenderer {
 
     pub fn textures_mut(&mut self) -> &mut TextureStore {
         &mut self.textures
+    }
+
+    /// 注入「上一帧屏幕」(引擎 `COPY ID=:/W0/` 读的后缓冲)。
+    ///
+    /// 供离屏抓帧(存档缩略图)复用主渲染路径:抓帧渲染器不参与逐帧呈现,
+    /// 只有把引擎已呈现的上一帧喂进来,副本语义才与主渲染器一致。
+    pub fn set_last_screen(&mut self, screen: Option<std::sync::Arc<Surface>>) {
+        self.last_screen = screen;
+    }
+
+    /// 取一帧内捕获的快照表面(`CGACT[COPY/COPY2]` 的落点)。
+    ///
+    /// 用于 `SAVE[ID]`:命令时刻的图层像素就是快照表面(官方读的是同一块
+    /// 层表面)。未捕获/已被剪枝返回 `None`。
+    pub fn snapshot_surface(&self, id: CopyId) -> Option<&Surface> {
+        self.snapshots.get(&id)
     }
 
     /// 执行一帧。输出表面尺寸恒为 `frame.viewport`。
@@ -487,6 +368,49 @@ fn apply_image_op(
     if target != pass_target {
         return Err("gfx.imageop.target.mismatch".to_string());
     }
+    // `MERGE/MERGE2/XOR/AND`:`ID`(上层)合成到 `ID2`(下层),结果写 `ID2`。
+    //
+    // `X/Y` 是**绘制偏移**(wgpu 侧 `push_quad` 直接用它;证据见
+    // `passes.rs` 的 `FUN_004405a4`),不是源区域 —— 因此必须先于区域解析
+    // 处理,否则 `X=0 Y=0`(语料存读档的缩略图合成)会被误判成
+    // `gfx.imageop.region.partial` 整条跳过。
+    if image.action.is_layer_composite() {
+        let dx = image.x.unwrap_or(0.0);
+        let dy = image.y.unwrap_or(0.0);
+        if dx != 0.0 || dy != 0.0 {
+            return Err("gfx.imageop.merge.offset.unsupported".to_string());
+        }
+        let mut lower = match st.texture_overrides.remove(target) {
+            Some(t) => Rc::try_unwrap(t).unwrap_or_else(|rc| (*rc).clone()),
+            None => base_texture(textures, snapshots, frame, target)?,
+        };
+        let upper = layer_surface(
+            textures,
+            snapshots,
+            frame,
+            &image.source,
+            st,
+            image.source_texture.as_ref(),
+        )?;
+        let upper = crate::texture::Texture {
+            width: upper.width,
+            height: upper.height,
+            rgba: upper.rgba,
+        };
+        match &image.action {
+            ImageAction::Merge => crate::imagefilters::apply_merge(&mut lower, &upper, false),
+            ImageAction::Merge2 => crate::imagefilters::apply_merge(&mut lower, &upper, true),
+            ImageAction::Other("xor") => {
+                crate::imagefilters::apply_bitwise(&mut lower, &upper, true)
+            }
+            ImageAction::Other("and") => {
+                crate::imagefilters::apply_bitwise(&mut lower, &upper, false)
+            }
+            _ => return Err("gfx.imageop.unsupported".to_string()),
+        }
+        st.texture_overrides.insert(target.clone(), Rc::new(lower));
+        return Ok(());
+    }
     // 软后端是**整数像素**参考实现(`scale_region` 逐 texel 重采样),区域
     // 在这里显式取整。产品路径(wgpu)保留浮点并用 UV 子矩形做亚像素采样
     // —— 精灵系统的位置小数部分正是靠那条路径才不抖。
@@ -568,7 +492,7 @@ fn apply_image_op(
             height: source.height,
             rgba: source.rgba,
         };
-        let scaled = Rc::new(crate::imageop::scale_region(
+        let scaled = Rc::new(yu_render_core::scale_region(
             &source,
             dw,
             dh,
@@ -664,35 +588,7 @@ fn apply_image_op(
             .insert(target.clone(), Rc::new(blended));
         return Ok(());
     }
-    // `MERGE/MERGE2/XOR/AND`:`ID`(上层)合成到 `ID2`(下层),结果写 `ID2`。
-    if image.action.is_layer_composite() {
-        let Some(upper_id) = Some(&image.source) else {
-            return Err("gfx.imageop.source.missing".to_string());
-        };
-        let mut lower = match st.texture_overrides.remove(target) {
-            Some(t) => Rc::try_unwrap(t).unwrap_or_else(|rc| (*rc).clone()),
-            None => base_texture(textures, snapshots, frame, target)?,
-        };
-        let upper = layer_surface(textures, snapshots, frame, upper_id, st, image.source_texture.as_ref())?;
-        let upper = crate::texture::Texture {
-            width: upper.width,
-            height: upper.height,
-            rgba: upper.rgba,
-        };
-        match &image.action {
-            ImageAction::Merge => crate::imagefilters::apply_merge(&mut lower, &upper, false),
-            ImageAction::Merge2 => crate::imagefilters::apply_merge(&mut lower, &upper, true),
-            ImageAction::Other("xor") => {
-                crate::imagefilters::apply_bitwise(&mut lower, &upper, true)
-            }
-            ImageAction::Other("and") => {
-                crate::imagefilters::apply_bitwise(&mut lower, &upper, false)
-            }
-            _ => return Err("gfx.imageop.unsupported".to_string()),
-        }
-        st.texture_overrides.insert(target.clone(), Rc::new(lower));
-        return Ok(());
-    }
+    // (MERGE/MERGE2/XOR/AND 在函数入口已按绘制偏移处理,不会走到这里。)
     let mut texture = match st.texture_overrides.remove(target) {
         Some(texture) => Rc::try_unwrap(texture).unwrap_or_else(|rc| (*rc).clone()),
         None => base_texture(textures, snapshots, frame, target)?,
@@ -847,15 +743,23 @@ fn apply_copy_op(
             surface
         }
     };
-    let dest_size = frame
-        .layers
-        .iter()
-        .find(|layer| layer.id == copy.dest)
-        .and_then(|layer| layer.image_size())
-        .map(|size| (size.width, size.height));
-    let (width, height) = dest_size.unwrap_or((source.width, source.height));
-    let mut surface = Surface::new(width, height, [0, 0, 0, 0]);
+    // 表面尺寸 = 源表面(有区域时 = 区域尺寸),**不看**目标层的显示尺寸。
+    //
+    // 证据:官方 COPY 替换目标表面(尺寸随源);`CG`/`CGACT` 的尺寸只是
+    // 绘制拉伸。语料 `es_SaveLoad` 的缩略图链:COPY2 800×600 → `SIZE2`
+    // 缩到 100×75;若按目标层当时的显示尺寸(100×75)裁剪,只会截到画面
+    // 左上角(实测整张缩略图变黑)。
     let (x0, y0, x1, y1) = copy.region.resolve(source.width, source.height);
+    let (width, height) = (
+        (x1 - x0 + 1).max(0) as u32,
+        (y1 - y0 + 1).max(0) as u32,
+    );
+    let (width, height) = if width > 0 && height > 0 {
+        (width, height)
+    } else {
+        (source.width, source.height)
+    };
+    let mut surface = Surface::new(width, height, [0, 0, 0, 0]);
     blit(&source, &mut surface, x0, y0, x1, y1);
     snapshots.insert(copy.id, surface);
     Ok(())
@@ -883,33 +787,6 @@ fn compose_copy_texts(surface: &mut Surface, copy: &CopyOp, st: &mut RenderState
 /// 把 `src` 的矩形(含端点)写到 `dst` 的 `(0,0)`;越界裁剪。
 ///
 /// 快照 CPU 镜像的构造(wgpu 端 DIV-GFX-058)复用同一裁剪规则。
-pub fn blit(src: &Surface, dst: &mut Surface, x0: i64, y0: i64, x1: i64, y1: i64) {
-    if x1 < x0 || y1 < y0 || src.width == 0 || src.height == 0 {
-        return;
-    }
-    let x0 = x0.max(0);
-    let y0 = y0.max(0);
-    let x1 = x1.min(i64::from(src.width) - 1);
-    let y1 = y1.min(i64::from(src.height) - 1);
-    if x1 < x0 || y1 < y0 {
-        return;
-    }
-    let run = (x1 - x0 + 1) as u32;
-    let run = run.min(dst.width);
-    for y in y0..=y1 {
-        let dy = (y - y0) as u32;
-        if dy >= dst.height {
-            break;
-        }
-        for i in 0..run {
-            let dx = i;
-            let Some(px) = src.pixel((x0 as u32) + i, y as u32) else {
-                break;
-            };
-            dst.set_pixel(dx, dy, px);
-        }
-    }
-}
 
 /// 组源:按当前子层状态重绘组的离屏内容(EVID-T-12 的“命令执行时当前状态”)。
 fn compose_group(
@@ -1274,6 +1151,7 @@ fn draw_transition(
         Some(TransitionMask {
             image: mask_ref,
             fade: transition.fade,
+            ta: transition.ta,
             fade2: f64::from(transition.ta),
             complete: transition.complete(),
             hlsl_mask,
@@ -1618,34 +1496,6 @@ impl<'a> RenderState<'a> {
 ///
 /// 文本也算可见输出:自动文本层(`text_layout`)或图层文本(`text_draws`)
 /// 非空时,即使没有任何可执行图层 op,画面也不是黑屏。
-pub fn frame_has_drawable_output(frame: &CompositorFrame) -> bool {
-    if frame.text_layout.is_some() || !frame.text_draws.is_empty() {
-        return true;
-    }
-    let mut offscreen_drawable: BTreeMap<&LayerId, bool> = BTreeMap::new();
-    for pass in &frame.passes {
-        match &pass.target {
-            PassTarget::Offscreen(id) => {
-                let drawable = pass
-                    .ops
-                    .iter()
-                    .any(|op| op_predict_drawable(op, &offscreen_drawable));
-                offscreen_drawable.insert(id, drawable);
-            }
-            PassTarget::Screen => {
-                if pass
-                    .ops
-                    .iter()
-                    .any(|op| op_predict_drawable(op, &offscreen_drawable))
-                {
-                    return true;
-                }
-            }
-            PassTarget::Texture(_) => {}
-        }
-    }
-    false
-}
 
 fn op_predict_drawable(op: &Op, offscreens: &BTreeMap<&LayerId, bool>) -> bool {
     if !matches!(op.status(), OpStatus::Executable) {
@@ -1801,6 +1651,8 @@ struct TransitionMask<'a> {
     image: ImageRef<'a>,
     /// `YS_FadeVal`。
     fade: f64,
+    /// `TA`(软硬;进入 `transition_coverage` 的带宽 `2/TA`)。
+    ta: i16,
     /// `YS_FadeVal2`(HLSL psC 的 TA;固定管线不用)。
     fade2: f64,
     /// `T >= 256`。
@@ -1919,7 +1771,7 @@ fn draw_image(
                                 .clamp(0.0, 1.0);
                             (c * 255.0).round().clamp(0.0, 255.0) as u8
                         } else {
-                            transition_coverage(mask_px[1], mask.fade, mask.complete)
+                            transition_coverage(mask_px[1], mask.fade, mask.ta, mask.complete)
                         };
                         mul255(alpha, coverage)
                     }
@@ -2233,6 +2085,35 @@ fn blend_pixel_with_stage(
     }
 }
 
+pub fn frame_has_drawable_output(frame: &CompositorFrame) -> bool {
+    if frame.text_layout.is_some() || !frame.text_draws.is_empty() {
+        return true;
+    }
+    let mut offscreen_drawable: BTreeMap<&LayerId, bool> = BTreeMap::new();
+    for pass in &frame.passes {
+        match &pass.target {
+            PassTarget::Offscreen(id) => {
+                let drawable = pass
+                    .ops
+                    .iter()
+                    .any(|op| op_predict_drawable(op, &offscreen_drawable));
+                offscreen_drawable.insert(id, drawable);
+            }
+            PassTarget::Screen => {
+                if pass
+                    .ops
+                    .iter()
+                    .any(|op| op_predict_drawable(op, &offscreen_drawable))
+                {
+                    return true;
+                }
+            }
+            PassTarget::Texture(_) => {}
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2353,15 +2234,22 @@ mod tests {
     fn transition_coverage_matches_official_micro_scene() {
         // TA=128 的官方 T 扫描(docs/title-motion-ledger.md §2.1)。
         // 模型在三个中点上的官方残差 ≤ 8/255(DIV-GFX-045)。
-        let fade = |t: i16| f64::from(t) / (256.0 / (256.0 / 128.0 + 128.0)) * (1.0 / 256.0);
+        // 官方 `j2-micro-trans6` 原始扫描(TA=128),逐点核对。
         let near = |actual: u8, expected: i32| (i32::from(actual) - expected).abs() <= 8;
-        assert!(near(transition_coverage(0, fade(64), false), 0));
-        assert!(near(transition_coverage(128, fade(64), false), 0));
-        assert!(near(transition_coverage(192, fade(64), false), 63));
-        assert!(near(transition_coverage(128, fade(128), false), 127));
-        assert!(near(transition_coverage(64, fade(192), false), 191));
-        assert!(near(transition_coverage(0, fade(192), false), 0));
-        assert_eq!(transition_coverage(0, fade(256), true), 255);
+        let fade = |t: i16| f64::from(t) / (256.0 / (256.0 / 128.0 + 128.0)) * (1.0 / 256.0);
+        // T=64: mask 192 → 63,mask 224 → 255
+        assert!(near(transition_coverage(192, fade(64), 128, false), 63));
+        assert!(near(transition_coverage(224, fade(64), 128, false), 255));
+        assert!(near(transition_coverage(160, fade(64), 128, false), 0));
+        // T=128: mask 128 → 127,mask 160 → 255
+        assert!(near(transition_coverage(128, fade(128), 128, false), 127));
+        assert!(near(transition_coverage(160, fade(128), 128, false), 255));
+        assert!(near(transition_coverage(96, fade(128), 128, false), 0));
+        // T=192: mask 64 → 191,mask 96 → 255,mask 32 → 0
+        assert!(near(transition_coverage(64, fade(192), 128, false), 191));
+        assert!(near(transition_coverage(96, fade(192), 128, false), 255));
+        assert!(near(transition_coverage(32, fade(192), 128, false), 0));
+        assert_eq!(transition_coverage(0, fade(256), 128, true), 255);
     }
 
     #[test]

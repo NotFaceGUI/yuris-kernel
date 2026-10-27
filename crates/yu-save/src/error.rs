@@ -28,6 +28,8 @@ pub mod code {
     pub const FILE_DELETED: &str = "sv.file.deleted";
     /// YSSD 容器解析失败(载荷来自 `yu-format::yssd` 的诊断)。
     pub const CONTAINER: &str = "sv.container";
+    /// 图像块形状不符(SAVE[ID] 像素数 ≠ w*h*4,或块内段长自证失败)。
+    pub const IMAGE_SHAPE: &str = "sv.image.shape";
     /// 路径越界:目标解析后不在 save 根内(安全拒绝,不猜)。
     pub const PATH_ESCAPE: &str = "sv.path.escape";
     /// 写盘拒绝:`SAVE[SET/LET]` 的变量引用身份在 `DomainCall` 事件层丢失
@@ -54,6 +56,7 @@ pub const ALL_CODES: &[&str] = &[
     code::FILE_WRITE,
     code::FILE_DELETED,
     code::CONTAINER,
+    code::IMAGE_SHAPE,
     code::PATH_ESCAPE,
     code::WRITE_REFUSED,
     code::EXEC_REFUSED,

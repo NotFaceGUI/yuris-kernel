@@ -11,10 +11,10 @@
 //! - 这里的像素算法(`apply_*`、`blend_transition`、`scale_region`、`blit`)
 //!   **不得**被 GPU 后端在运行期调用 —— GPU 模式的像素工作必须由 GPU 完成。
 //!   否则(a)双后端失去交叉验证价值,(b)GPU 模式被 CPU 循环拖住。
-//! - `Surface`/`RenderReport`/`SkippedOp`/`AssetIssue`、[`texture::TextureStore`]
-//!   (资产解码)与 [`text::TextComposer`](字形栅格化)属于**共享契约与平台
-//!   设施**,物理上寄居本 crate 只是历史归属,应迁到共享 crate;GPU 后端
-//!   可以引用它们。
+//! - `Surface`/`RenderReport`/`SkippedOp`/`AssetIssue`、`TextureStore`(资产
+//!   解码)、`TextComposer`(字形栅格化)、图像缓存键与 `scale_region` 已经
+//!   **迁到 `yu-render-core`**(本 crate 保留同名再导出,兼容既有路径);
+//!   GPU 后端应直接引用 `yu_render_core::`。
 //!
 //! 判定规则、现状账本与迁移顺序见 `docs/architecture/backends.md`。
 //!
@@ -75,24 +75,31 @@
 
 pub mod imagefilters;
 pub mod imageop;
-pub mod png;
 pub mod render;
 pub mod text;
-pub mod texture;
+
+// 共享契约/设施的**兼容再导出**:`crate::texture::…`、`crate::png::…` 等
+// 既有路径保持可用,但定义在 `yu-render-core`(两个后端共享)。
+pub mod png {
+    pub use yu_render_core::png::*;
+}
+pub mod texture {
+    pub use yu_render_core::texture::*;
+}
 
 pub use imageop::{
     apply_horizontal, apply_meido, apply_rect_paint, apply_resize, apply_reverse, apply_trim,
-    apply_vertical, blend_transition, scale_region,
+    apply_vertical, blend_transition,
 };
 #[allow(unused_imports)]
 pub use imagefilters::{
     apply_akarusa, apply_bitwise, apply_blur, apply_diffusion, apply_merge, apply_mono,
     apply_mosaic, apply_raster, apply_rotation, apply_saido, apply_sepia, apply_whirlpool,
 };
-pub use render::blit;
-pub use render::{
-    frame_has_drawable_output, ImageCacheKey, ImageOpSig, ImageSource, RenderOutput, RenderReport,
-    SizeKey, SizeSource, SkippedOp, SoftRenderer, Surface,
+pub use render::{frame_has_drawable_output, RenderOutput, SoftRenderer};
+pub use yu_render_core::{
+    blit, scale_region, ImageCacheKey, ImageOpSig, ImageSource, RenderReport, SizeKey, SizeSource,
+    SkippedOp, Surface,
 };
 pub use text::{
     content_hash_rgba, layer_base, layer_base_dims, text_base_key, texture_content_hash,

@@ -60,9 +60,7 @@ impl DataSource for MemSource {
             .get(path)
             .cloned()
             .ok_or_else(|| missing(path, self.source_name()))
-    }
-
-    fn exists(&self, path: &LookupKey) -> bool {
+    }    fn exists(&self, path: &LookupKey) -> bool {
         self.files.contains_key(path)
     }
 
@@ -72,6 +70,78 @@ impl DataSource for MemSource {
 
     fn source_name(&self) -> &str {
         "mem"
+    }
+}
+
+/// 可共享写入的内存叠层(运行时合成资产)。
+///
+/// 用途:`LOAD[ID]` 把存档缩略图装回图层时,内核把它编码成图像写进这个
+/// 叠层;挂载栈里每个 `TextureStore` 与 VM 的资产解析都看到同一份内容。
+/// 键是内容哈希,重复写入字节一致、天然幂等;`exists/list` 走内存树。
+#[derive(Clone)]
+pub struct SharedMem {
+    inner: std::sync::Arc<std::sync::Mutex<MemSource>>,
+}
+
+impl std::fmt::Debug for SharedMem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedMem").field("len", &self.len()).finish()
+    }
+}
+
+impl SharedMem {
+    pub fn new(codec: Codec) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(MemSource::new(codec))),
+        }
+    }
+
+    /// 写入一个文件(路径归一;重复键覆盖)。
+    pub fn insert(&self, raw_path: &[u8], bytes: Vec<u8>) -> Result<(), Diag> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.insert(raw_path, bytes)
+    }
+
+    /// 已写入的条目数(诊断 / 用例断言)。
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl DataSource for SharedMem {
+    fn open(&self, path: &LookupKey) -> Result<Vec<u8>, Diag> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .open(path)
+    }
+
+    fn exists(&self, path: &LookupKey) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .exists(path)
+    }
+
+    fn list(&self, path: &LookupKey) -> Result<Vec<Entry>, Diag> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .list(path)
+    }
+
+    fn source_name(&self) -> &str {
+        "mem-overlay"
     }
 }
 

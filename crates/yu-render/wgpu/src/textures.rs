@@ -1,6 +1,6 @@
 //! GPU 纹理与渲染目标缓存。
 //!
-//! 像素字节**只**来自 [`yu_backend_soft::TextureStore`]:同一套 vfs 探测/
+//! 像素字节**只**来自 [`yu_render_core::TextureStore`]:同一套 vfs 探测/
 //! 解码/缓存,保证软硬后端吃到的是同一份 RGBA8。本模块负责:
 //!
 //! - 按资产 key 上传一次,之后只复用 `wgpu::TextureView`/bind group;
@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::Pod;
-use yu_backend_soft::{Texture, TextureStore};
+use yu_render_core::{Texture, TextureStore};
 use yu_gfx::{CopyId, LayerId};
 use yu_log::Diag;
 

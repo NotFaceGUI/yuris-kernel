@@ -10,6 +10,7 @@ log = "0.4"
 yu-font = { path = "../../yu-font" }
 yu-format = { path = "../../yu-format" }
 yu-gfx = { path = "../../yu-gfx" }
+yu-render-core = { path = "../core" }
 yu-log = { path = "../../yu-log" }
 yu-vfs = { path = "../../yu-vfs" }
 

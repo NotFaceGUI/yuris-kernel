@@ -18,10 +18,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+// 共享契约与平台设施(两个后端同源)。
+use yu_render_core::{
+    blit, text_base_key, AssetIssue, RenderReport, SkippedOp, Surface, TextComposer,
+    TextPaintStats, Texture, TextureStore,
+};
+// 仅剩的 CPU 像素算法依赖(**在册待清**,见 `docs/architecture/backends.md` §4):
+// 这些动作目前在 GPU 后端里调用软后端实现,须逐个 GPU 化。
 use yu_backend_soft::{
     apply_horizontal, apply_meido, apply_rect_paint, apply_resize, apply_reverse, apply_trim,
-    apply_vertical, blit, text_base_key, AssetIssue,
-    RenderReport, SkippedOp, Surface, TextComposer, TextPaintStats, Texture, TextureStore,
+    apply_vertical,
 };
 use yu_gfx::{
     fixed_pipeline_alpha, shader_alpha, BlendMode, Clear, CompositorFrame, CopyId, CopyOp,
@@ -194,9 +200,9 @@ pub(crate) fn plan(
     pipelines: &mut PipelineCache,
     targets: &mut TargetSet,
     uploaded_overrides: &mut BTreeMap<LayerId, (u64, u32, u32, u64)>,
-    image_cache: &mut BTreeMap<yu_backend_soft::ImageCacheKey, Override>,
+    image_cache: &mut BTreeMap<yu_render_core::ImageCacheKey, Override>,
     composite_cache: &mut BTreeMap<LayerId, (u64, Rc<Texture>)>,
-    backbuffer: Option<&yu_backend_soft::Surface>,
+    backbuffer: Option<&yu_render_core::Surface>,
     backbuffer_gpu: &mut Option<(u64, u64)>,
     text: &mut TextComposer,
 ) -> Result<(FramePlan, RenderReport), Diag> {
@@ -1289,7 +1295,7 @@ struct Planner<'a> {
     /// COPY 源组的按需重绘不进入报告计数(soft 的同名路径同样回滚)。
     counted: bool,
     /// 上一帧呈现内容(`COPY ID=:/W0/` 在引擎里读后缓冲;EVID-J3-06)。
-    backbuffer: Option<&'a yu_backend_soft::Surface>,
+    backbuffer: Option<&'a yu_render_core::Surface>,
     /// `YU_RENDER_TIMING` 下逐层记录几何(位置/尺寸/UV)。
     trace_geometry: bool,
     /// 后缓冲上传缓存:`(content_hash, gpu_id)`。
@@ -1425,6 +1431,48 @@ impl Planner<'_> {
             Some(size) => (size.width, size.height),
             None => (from.1, from.2),
         };
+        // 取证开关(默认关):`YU_TRANS_DEBUG` 打一行实际取样参数,
+        // `YU_TRANS_DUMP` 额外把 from/mask 两张 GPU 纹理落成 `.rgba`(800x600 等)。
+        // 2026-10-27 用它在 FOUT 幕上确认:mask 走的是子区域+UV 覆盖,不是整面。
+        if std::env::var("YU_TRANS_DEBUG").is_ok() {
+            let describe = |id: &LayerId| match self.overrides.get(id) {
+                Some(Override::Uv { uv, width: ow, height: oh, .. }) => {
+                    format!("uv={uv:?} ow={ow} oh={oh}")
+                }
+                Some(_) => "override=other".to_string(),
+                None => "override=none".to_string(),
+            };
+            let own = describe(&layer.id);
+            let paired = transition
+                .to_layer
+                .as_ref()
+                .map(|id| describe(id))
+                .unwrap_or_default();
+            eprintln!(
+                "[trans] {} from={}x{} mask={}x{} layer={}x{} t={} ta={} {own} mask_{paired}",
+                layer.id.display(), from.1, from.2, mask.1, mask.2, width, height,
+                transition.t, transition.ta
+            );
+            if std::env::var("YU_TRANS_DUMP").is_ok() {
+                let safe: String = layer
+                    .id
+                    .display()
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect();
+                for (tag, (id, w, h)) in [("from", from), ("mask", mask)] {
+                    let Some(gpu) = self.gpu.get(id) else { continue };
+                    let Ok(bytes) = crate::readback::dump_texture(self.ctx, &gpu.texture, w, h)
+                    else {
+                        continue;
+                    };
+                    let path =
+                        format!("target/tmp/trans_f{}_{safe}_{tag}_{w}x{h}.rgba", self.frame.frame);
+                    let _ = std::fs::write(&path, &bytes);
+                    eprintln!("[trans] dumped {tag} -> {path}");
+                }
+            }
+        }
         let filter = pick_filter(self.frame, from.1, from.2, width, height);
         // `_DXMODE=0`:固定管线 G-mask 模型(J3 基线)。
         // `_DXMODE≠0`:引擎 effect 的两个转场 pass(EVID-T-09/台账 §2):
@@ -1452,17 +1500,61 @@ impl Planner<'_> {
             return Ok(());
         }
         let sa = shader_alpha(layer.alpha) as f32;
-        let uniform_values = match variant {
-            Variant::Fixed => [
+        // 几何:官方 `FUN_00414ba4` 的网格循环覆盖**整个层矩形**(部件表
+        // `+0x130` × 分块表 `+0xb0` 的累计坐标铺满层),所以过渡 quad 至少是
+        // 层框大小;`SIZE`/`SIZE2` 修饰只决定「内容自己的尺寸」。
+        //
+        // 取逐分量 max:
+        // - 立绘退出:内容 295x580 > 层框 295x501 ⇒ 用内容尺寸(否则被压矮);
+        // - 演出 1 淡出:`size` 只把内容画进层表面的右下角(399x299 < 801x601)
+        //   ⇒ 仍画满层框,否则那块矩形的边界会露出一条几何硬边
+        //   (2026-10-27 实机:幕的左边是直的,与掩膜无关)。
+        let (draw_w, draw_h, draw_uv) = match self.overrides.get(&layer.id) {
+            Some(Override::Uv {
+                uv,
+                width: ow,
+                height: oh,
+                ..
+            }) if variant == Variant::Fixed => (*ow, *oh, *uv),
+            _ => (
+                f64::from(width),
+                f64::from(height),
+                [0.0f32, 0.0, 1.0, 1.0],
+            ),
+        };
+        let mask_uv = match transition.to_layer.as_ref().and_then(|id| self.overrides.get(id)) {
+            Some(Override::Uv { uv, .. }) if variant == Variant::Fixed => *uv,
+            _ => [0.0f32, 0.0, 1.0, 1.0],
+        };
+        let (draw_uv, mask_uv) = (clamp_uv_max(draw_uv), clamp_uv_max(mask_uv));
+        let uniform_values: Vec<f32> = match variant {
+            // 固定管线:UV 矩形随 uniform 下发,mask 在 shader 里反归一化回 [0,1]。
+            // 第 0 槽是 `YS_FadeVal`(psC/psD 同源)。
+            Variant::Fixed => vec![
                 transition.fade as f32,
                 if transition.complete() { 1.0 } else { 0.0 },
+                // 官方「一格」柔带 `0.16/TA²`;与亚像素带 `1/K` 相加成单一公式
+                // (见 `yu_gfx::transition_coverage`)。
+                if transition.ta >= 1 {
+                    let ta = transition.ta as f32;
+                    0.16 / (ta * ta)
+                } else {
+                    0.0
+                },
                 0.0,
-                0.0,
+                draw_uv[0],
+                draw_uv[1],
+                draw_uv[2],
+                draw_uv[3],
+                mask_uv[0],
+                mask_uv[1],
+                mask_uv[2],
+                mask_uv[3],
             ],
             // psC: YS_FadeVal, YS_FadeVal2(=TA), YS_AlphaVal(=A/256)
-            Variant::Psc => [transition.fade as f32, f32::from(transition.ta), sa, 0.0],
+            Variant::Psc => vec![transition.fade as f32, f32::from(transition.ta), sa, 0.0],
             // psD: YS_FadeVal, YS_AlphaVal
-            Variant::Psd => [transition.fade as f32, sa, 0.0, 0.0],
+            Variant::Psd => vec![transition.fade as f32, sa, 0.0, 0.0],
         };
         let uniform = wgpu::util::DeviceExt::create_buffer_init(
             &self.ctx.device,
@@ -1495,16 +1587,17 @@ impl Planner<'_> {
             Variant::Fixed => fixed_pipeline_alpha(layer.alpha) as f32,
             Variant::Psc | Variant::Psd => sa,
         };
-        if width > 0 && height > 0 {
-            push_quad(
+        if draw_w > 0.0 && draw_h > 0.0 {
+            push_quad_uv(
                 self.vertices,
                 self.dst_width,
                 self.dst_height,
                 x as f64,
                 y as f64,
-                width,
-                height,
+                draw_w,
+                draw_h,
                 alpha,
+                draw_uv,
             );
             let kind = match variant {
                 Variant::Fixed => DrawKind::Transition { bind_index },
@@ -2509,6 +2602,17 @@ fn image_source_dims(
     }
 }
 
+/// UV 矩形上界夹到 1(闭区间区域换算出 801/800 这类越界值;越界取样在
+/// ClampToEdge 下等价于边缘像素,夹取只是把「整面」还原成恒等 [0,1])。
+fn clamp_uv_max(uv: [f32; 4]) -> [f32; 4] {
+    [
+        uv[0].min(1.0),
+        uv[1].min(1.0),
+        uv[2].min(1.0).max(uv[0].min(1.0)),
+        uv[3].min(1.0).max(uv[1].min(1.0)),
+    ]
+}
+
 /// 整面 `RECTPAINT` 族(无区域):把层表面整块覆盖。
 fn is_full_paint(image: &ImageOp) -> bool {
     matches!(
@@ -2672,16 +2776,10 @@ fn copy_output_dims(
         (region_full.2 - region_full.0 + 1).max(0) as u32,
         (region_full.3 - region_full.1 + 1).max(0) as u32,
     );
-    // 1×1 是 `FILE=""` 的占位尺寸,不代表真实表面;这时按区域算。
-    Ok(frame
-        .layers
-        .iter()
-        .find(|layer| layer.id == copy.dest)
-        .and_then(|layer| layer.image_size())
-        .filter(|size| size.width > 1 || size.height > 1)
-        .map(|size| (size.width, size.height))
-        .or_else(|| (rw > 1 || rh > 1).then_some((rw, rh)))
-        .unwrap_or((sw, sh)))
+    // 表面尺寸 = 源表面(有区域时 = 区域尺寸),**不看**目标层的显示尺寸:
+    // 官方 COPY 替换目标表面,`CG`/`CGACT` 的尺寸只是绘制拉伸
+    // (与 soft `apply_copy_op` 同口径;缩略图链 COPY 800×600 → SIZE2 100×75)。
+    Ok(if rw > 0 && rh > 0 { (rw, rh) } else { (sw, sh) })
 }
 
 /// `CGACT` 源区域 → 归一化 UV 子矩形。
@@ -2752,7 +2850,7 @@ fn apply_image_to_override(
     pass_target: &LayerId,
     image: &ImageOp,
     overrides: &mut BTreeMap<LayerId, Override>,
-    image_cache: &mut BTreeMap<yu_backend_soft::ImageCacheKey, Override>,
+    image_cache: &mut BTreeMap<yu_render_core::ImageCacheKey, Override>,
 ) -> Result<(), String> {
     let target = image.target.as_ref().unwrap_or(&image.source);
     if target != pass_target {
@@ -2898,17 +2996,17 @@ fn apply_image_to_override(
         }
         if let Some(layer) = frame.layers.iter().find(|l| l.id == image.source) {
             let sig = match image.action {
-                ImageAction::Reverse => yu_backend_soft::ImageOpSig::Reverse,
-                ImageAction::Vertical => yu_backend_soft::ImageOpSig::Vertical,
-                _ => yu_backend_soft::ImageOpSig::Horizontal,
+                ImageAction::Reverse => yu_render_core::ImageOpSig::Reverse,
+                ImageAction::Vertical => yu_render_core::ImageOpSig::Vertical,
+                _ => yu_render_core::ImageOpSig::Horizontal,
             };
             let source_id = match &layer.texture {
-                TextureRef::Asset(key) => Some(yu_backend_soft::ImageSource::Asset(key.clone())),
-                TextureRef::SolidBlack1x1 => Some(yu_backend_soft::ImageSource::Solid),
-                TextureRef::Snapshot(id) => Some(yu_backend_soft::ImageSource::Snapshot(id.0)),
+                TextureRef::Asset(key) => Some(yu_render_core::ImageSource::Asset(key.clone())),
+                TextureRef::SolidBlack1x1 => Some(yu_render_core::ImageSource::Solid),
+                TextureRef::Snapshot(id) => Some(yu_render_core::ImageSource::Snapshot(id.0)),
                 _ => None,
             };
-            let key = source_id.map(|source| yu_backend_soft::ImageCacheKey {
+            let key = source_id.map(|source| yu_render_core::ImageCacheKey {
                 source,
                 op: sig,
                 region: None,
@@ -3280,7 +3378,7 @@ fn plan_group_compose(
     transition_bind_groups: &mut Vec<wgpu::BindGroup>,
     transition_buffers: &mut Vec<wgpu::Buffer>,
     passes: &mut Vec<PlannedPass>,
-    backbuffer: Option<&yu_backend_soft::Surface>,
+    backbuffer: Option<&yu_render_core::Surface>,
     backbuffer_gpu: &mut Option<(u64, u64)>,
     trace_geometry: bool,
 ) -> Result<(), Diag> {

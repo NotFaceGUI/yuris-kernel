@@ -4091,6 +4091,7 @@ dependencies = [
  "yu-format",
  "yu-gfx",
  "yu-log",
+ "yu-render-core",
  "yu-rt",
  "yu-vfs",
 ]
@@ -4110,6 +4111,7 @@ dependencies = [
  "yu-format",
  "yu-gfx",
  "yu-log",
+ "yu-render-core",
  "yu-rt",
  "yu-vfs",
 ]
@@ -4128,6 +4130,7 @@ dependencies = [
  "yu-host-desktop",
  "yu-log",
  "yu-platform-input",
+ "yu-render-core",
  "yu-rt",
  "yu-save",
  "yu-sound",
@@ -4147,6 +4150,7 @@ dependencies = [
  "yu-backend-wgpu",
  "yu-gfx",
  "yu-log",
+ "yu-render-core",
  "yu-rt",
  "yu-save",
  "yu-sound",
@@ -4207,6 +4211,7 @@ dependencies = [
  "yu-gfx",
  "yu-log",
  "yu-platform-input",
+ "yu-render-core",
  "yu-rt",
  "yu-sound",
 ]
@@ -4232,6 +4237,19 @@ name = "yu-platform-input"
 version = "0.1.0"
 dependencies = [
  "yu-rt",
+]
+
+[[package]]
+name = "yu-render-core"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "log",
+ "yu-font",
+ "yu-format",
+ "yu-gfx",
+ "yu-log",
+ "yu-vfs",
 ]
 
 [[package]]

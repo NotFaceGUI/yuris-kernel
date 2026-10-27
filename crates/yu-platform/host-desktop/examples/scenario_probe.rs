@@ -478,7 +478,7 @@ struct ShotNote {
     text_runs: usize,
 }
 
-fn skip_summary(report: Option<&yu_backend_soft::RenderReport>) -> Vec<(String, u32)> {
+fn skip_summary(report: Option<&yu_render_core::RenderReport>) -> Vec<(String, u32)> {
     let Some(report) = report else {
         return Vec::new();
     };
@@ -493,7 +493,7 @@ fn skip_summary(report: Option<&yu_backend_soft::RenderReport>) -> Vec<(String, 
     list
 }
 
-fn asset_summary(report: Option<&yu_backend_soft::RenderReport>) -> (Vec<String>, usize) {
+fn asset_summary(report: Option<&yu_render_core::RenderReport>) -> (Vec<String>, usize) {
     let Some(report) = report else {
         return (Vec::new(), 0);
     };

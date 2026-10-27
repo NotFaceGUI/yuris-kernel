@@ -355,6 +355,23 @@ pub trait GraphicsHost {
     /// 引擎的 `ONMOUSE*` 直接读窗口的鼠标位置(`app+0x5b8/0x5bc`),不是一个
     /// 事件;因此这里由 VM 在帧边界同步一次,而不是伪造 DomainCall。
     fn set_pointer(&mut self, _x: i64, _y: i64) {}
+
+    /// `SAVE[DNO=n ID=图层]`:取图层在**命令时刻**的表面像素。
+    ///
+    /// 引擎在 `SAVE` 处理体里直接读图层表面(REA `0x4477c0` 读取端按首
+    /// u32 = `0x640` 校验);本内核由宿主用渲染器回放当前帧的复制/加工
+    /// 命令取得同一份像素。`Ok(None)` = 宿主不具备该能力(VM 报
+    /// Unimplemented,不猜内容)。
+    fn capture_layer(&mut self, _id: &[u8]) -> Result<Option<CapturedImage>, Diag> {
+        Ok(None)
+    }
+
+    /// `LOAD[FILE DNO=n ID=图层]`:把图像装回图层表面。
+    ///
+    /// `Ok(false)` = 宿主不具备该能力(VM 报 Unimplemented)。
+    fn restore_layer(&mut self, _id: &[u8], _image: &CapturedImage) -> Result<bool, Diag> {
+        Ok(false)
+    }
 }
 
 /// 声音域同步宿主（SOUND / SOUNDEND 消费 + SOUNDINFO 查询）。
@@ -448,4 +465,41 @@ pub trait SaveHost {
 
     /// `LOAD[FILE DNO=n]` 读一块恢复数据(容器解析归宿主;写回归 VM)。
     fn load_block(&mut self, file: &str, dno: u32) -> Result<LoadedBlock, Diag>;
+
+    /// `SAVE[DNO=n ID=图层]` 预约一块(块类型 1):`image` 是**命令时刻**
+    /// 图层表面的像素(VM 已通过 [`GraphicsHost::capture_layer`] 取出)。
+    ///
+    /// 证据:官方 `SAVE` 的 ID 分支在命令处理器里直接读图层表面
+    /// (`0x4477c0` 读取端校验首 u32 = `0x640`),块体 = 段长表 + 两段像素。
+    fn reserve_image(&mut self, dno: u32, image: &CapturedImage) -> Result<(), Diag> {
+        let _ = (dno, image);
+        Err(crate::diag::cmd_unimplemented(
+            "SAVE",
+            "宿主未实现 SAVE[ID] 图像块",
+        ))
+    }
+
+    /// `LOAD[FILE DNO=n ID=图层]` 读回一块图层图像(块类型 1)。
+    fn load_image(&mut self, file: &str, dno: u32) -> Result<CapturedImage, Diag> {
+        let _ = (file, dno);
+        Err(crate::diag::cmd_unimplemented(
+            "LOAD",
+            "宿主未实现 LOAD[ID] 图像块",
+        ))
+    }
+}
+
+/// 图层图像(SAVE[ID] / LOAD[ID] 的传输形态;行优先 RGBA8)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedImage {
+    pub width: u32,
+    pub height: u32,
+    /// 长度 = `width * height * 4`。
+    pub rgba: Vec<u8>,
+}
+
+impl CapturedImage {
+    pub fn len_bytes(&self) -> usize {
+        self.width as usize * self.height as usize * 4
+    }
 }

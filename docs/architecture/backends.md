@@ -27,32 +27,39 @@
 
 | 类别 | 内容 | 归属 |
 |---|---|---|
-| 输出/报告契约 | `Surface`、`RenderReport`、`SkippedOp`、`AssetIssue`、`GpuStats` | 共享(当前寄居 soft crate) |
-| 资产解码 | `TextureStore`(vfs 探测、PNG/BMP/JPG/GIF/PSB 解码) | 共享(当前寄居 soft crate) |
-| 字形栅格化/排版 | `TextComposer` | 共享(当前寄居 soft crate;**字体栅格天然是 CPU**,不是后端职责) |
-| 语义常量 | `fixed_pipeline_alpha`、`shader_alpha`、`transition_coverage`(在 `yu-gfx`) | 共享 |
+| 输出/报告契约 | `Surface`、`blit`、`RenderReport`、`SkippedOp` | `yu-render-core`(2026-10-27 已迁) |
+| 资产解码 | `TextureStore`(vfs 探测、PNG/BMP/JPG/GIF/PSB 解码)、`Texture`、`AssetIssue` | `yu-render-core`(已迁) |
+| 字形栅格化/排版 | `TextComposer`、`TextPaintStats`、`text_base_key`、`ComposedLayer` | `yu-render-core`(已迁;**字体栅格天然是 CPU**,不是后端职责) |
+| 图像缓存键 | `ImageCacheKey`/`ImageOpSig`/`ImageSource`/`SizeKey`/`SizeSource` | `yu-render-core`(已迁) |
+| 栅格原语 | `scale_region` | `yu-render-core`(已迁;GPU 只允许在 CPU 读回路径用) |
+| PNG | `png_bytes` | `yu-render-core`(已迁) |
+| 语义常量 | `fixed_pipeline_alpha`、`shader_alpha`、`transition_coverage` | `yu-gfx` |
 
-这些共享件**物理上寄居在 `yu-backend-soft` 是历史归属,不是设计结论**:
-它们应迁到独立共享 crate(暂定 `yu-render-core`),让「后端」这个名字只
-指渲染实现。迁移不改变行为,按需分批做。
+`yu-render-core` 里**不放任何后端行为**:软后端的 `apply_*` 与 wgpu 的
+管线/目标管理各自留在自己的 crate。`yu-backend-soft` 为兼容保留了同名
+再导出(`pub use yu_render_core::…`),新代码应直接用 `yu_render_core::`。
 
 ## 3. 判定规则(机械可查)
 
 在 `crates/yu-render/wgpu/**` 里:
 
-- **违规**:调用 `apply_*`(rect_paint/merge/bitwise/resize/trim/meido/
-  reverse/horizontal/vertical/rotation/saido/akarusa/mono/mosaic/blur*/
-  diffusion/whirlpool/raster)、`blend_transition`、`scale_region`、`blit`
-  —— 这些是**像素算法**,属于 CPU 后端的实现。
-- **允许**:`Surface`/`Texture`/`RenderReport`/`SkippedOp`/`AssetIssue`/
-  `TextureStore`/`TextComposer`/`ImageCacheKey`(契约与共享设施,见 §2)。
+- **违规**:`yu_backend_soft::apply_*`(rect_paint/merge/bitwise/resize/trim/
+  meido/reverse/horizontal/vertical/rotation/saido/akarusa/mono/mosaic/blur*/
+  diffusion/whirlpool/raster)与 `yu_backend_soft::blend_transition`
+  —— 这些是**CPU 后端的像素实现**。
+- **允许**:`yu_render_core::*`(契约与平台设施,见 §2)。其中
+  `scale_region` 只允许出现在「CPU 消费者确实需要像素」的读回路径,并需在
+  调用处标注原因;`blit`/`text_base_key` 等为共享原语。
 
-审查命令(应只剩契约类):
+审查命令(应只剩账本 §4 里在册的 `apply_*`):
 
 ```bash
-grep -rn "yu_backend_soft::\(apply_\|blend_\|scale_region\|blit\)" crates/yu-render/wgpu/src
-grep -rn "^\s*\(apply_\|blend_\|scale_region\|blit\)(" crates/yu-render/wgpu/src/passes.rs
+grep -rn "yu_backend_soft::" crates/yu-render/wgpu/src
 ```
+
+合规结果应只有 `apply_*` / `blend_transition` 这一类**在册待清**的算法调用;
+出现 `Surface`/`TextureStore`/`TextComposer`/`ImageCacheKey` 等指向
+`yu_backend_soft` 即回退(它们应来自 `yu_render_core`)。
 
 ## 4. 现状账本(2026-10-27 实测)
 
@@ -73,8 +80,8 @@ grep -rn "^\s*\(apply_\|blend_\|scale_region\|blit\)(" crates/yu-render/wgpu/src
 | **`RESIZE`/`TRIM`/`MEIDO`** | `apply_resize/trim/meido`(CPU) | ❌ | 几何变换走顶点/UV,必要时 GPU pass |
 | **`ROTATION`/`SAIDO`/`AKARUSA`/`MONO`/`MOSAIC`/`BLUR*`/`DIFFUSION`/`WHIRLPOOL`/`RASTER*`** | `apply_*`(CPU) | ❌ | 各自 GPU pass/shader |
 | 快照像素重建(`snapshot_pixels`) | `scale_region`(CPU) | ⚠️ 条件合规 | 只在「CPU 消费者确实需要像素」时保留(文本合成基面、需要读回的后续加工),并标注为**读回路径**,不作为常规渲染路径 |
-| 文本合成 | `TextComposer` | ✅ 共享设施 | 迁到共享 crate |
-| 资产解码 | `TextureStore` | ✅ 共享设施 | 迁到共享 crate |
+| 文本合成 | `TextComposer`(`yu-render-core`) | ✅ 共享设施 | 已迁(2026-10-27) |
+| 资产解码 | `TextureStore`(`yu-render-core`) | ✅ 共享设施 | 已迁(2026-10-27) |
 
 行号锚点(`crates/yu-render/wgpu/src/passes.rs`,2026-10-27):
 `blend_transition` 2954、`apply_merge` 2977–2978、`apply_bitwise` 2979–2980、
@@ -131,7 +138,7 @@ yu-cli dev <project> --backend wgpu
 |---|---|
 | `yu-gfx` 是否依赖任一后端 | 否(只依赖 `yu-log`/`yu-rt`) |
 | `yu-backend-soft` 是否依赖 `yu-backend-wgpu` | 否 |
-| `yu-backend-wgpu` 是否依赖 `yu-backend-soft` | **是**(= 本文件的整改对象) |
+| `yu-backend-wgpu` 是否依赖 `yu-backend-soft` | **是,但只剩 §4 在册的 `apply_*`**(契约/设施已迁 `yu-render-core`) |
 | `yu-engine` 构建渲染器的位置 | `engine.rs:461-485`,按 `opts.backend` 分支,失败即报错 |
 
 ### 7.2 已修:GPU 启动失败会自动降级到 CPU
@@ -156,13 +163,21 @@ wgpu 后端启动失败:<原因>
 错误文案都可能漂移。已统一为 `Backend::parse`,两个入口只保留**缺省策略**
 (headless=soft、desktop=wgpu)—— 缺省属于模式策略,不重复实现校验。
 
-### 7.3 未清(在册):契约类型寄居 soft
+### 7.3 已清:契约类型不再寄居 soft(2026-10-27)
 
-`ImageCacheKey` / `ImageOpSig` / `ImageSource` 是 wgpu 的缓存键类型,却定义在
-`yu-backend-soft`;`TextureStore`(资产解码)、`TextComposer`(字形栅格)同理。
-它们不是「CPU 实现」,但放在 CPU 后端 crate 里会让**依赖方向**看起来像
-「GPU 依赖 CPU 后端」。整改:抽 `yu-render-core` 承接契约与平台设施,
-两个后端都只依赖它。属于结构调整,不改变行为,单独一轮做。
+新建 `crates/yu-render/core`(`yu-render-core`),承接:两后端的表面/报告
+(`Surface`/`blit`/`RenderReport`/`SkippedOp`)、资产解码(`TextureStore`/
+`Texture`/`AssetIssue`)、字形栅格(`TextComposer`/`TextPaintStats`/
+`text_base_key`)、图像缓存键(`ImageCacheKey`/`ImageOpSig`/`ImageSource`)、
+共享栅格原语(`scale_region`)、PNG。
+
+- `yu-backend-soft` 保留同名再导出(既有路径不破),实现留在本地;
+- `yu-backend-wgpu`/`yu-engine`/`yu-cli`/`host-desktop` 改为直接引用
+  `yu_render_core::`;
+- **行为中性**:6200 帧逐帧屏幕哈希与重构前完全一致(`differing 0`);
+  38 个测试套件全绿。
+
+剩下的唯一 `wgpu → soft` 依赖就是 §4 账本里的 `apply_*` 像素算法。
 
 ### 7.4 唯一允许两后端共存的地方:对拍
 

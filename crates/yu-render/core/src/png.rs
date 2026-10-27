@@ -10,7 +10,7 @@ use std::path::Path;
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ExtendedColorType, ImageEncoder};
 
-use crate::render::Surface;
+use crate::surface::Surface;
 
 /// 编码为 PNG 字节。
 pub fn png_bytes(surface: &Surface) -> Result<Vec<u8>, image::ImageError> {

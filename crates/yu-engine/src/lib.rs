@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::result_large_err)]
 
+pub mod capture;
 pub mod engine;
 pub mod json;
 pub mod output;

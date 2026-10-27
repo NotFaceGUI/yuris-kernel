@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use yu_backend_soft::png;
+use yu_render_core::png;
 use yu_rt::input::{InputFrame, InputTimeline};
 
 use crate::args::ArgReader;

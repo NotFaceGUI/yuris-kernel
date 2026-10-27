@@ -60,7 +60,7 @@ pub use frame::{
     MipFilter, TextureFilter, Viewport, WindowState,
 };
 pub use group::GroupDraw;
-pub use host::GfxHost;
+pub use host::{GfxHost, LayerCapture};
 pub use layer::{
     fixed_pipeline_alpha, shader_alpha, transition_coverage, BlendConfidence, BlendFactor,
     BlendMode, BlendOp, CopyId, EngineValue, FilterParam, FilterTransform, FixedPipelineState,

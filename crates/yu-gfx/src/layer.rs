@@ -897,30 +897,46 @@ impl Transition {
     }
 }
 
-/// 过渡覆盖度:配对纹理的 **G 通道**是 mask,`fade` 是推进量。
+/// 过渡覆盖度:配对纹理的 **G 通道**是 mask,`fade` 是推进量,`ta` 决定软硬。
 ///
-/// 证据(`docs/title-motion-ledger.md` EVID-T-05 / §2.1):官方 0.495 固定管线
-/// 双纹理路径的 4×9 微场景测量(T∈{64,128,192,256} × mask 9 级,
-/// TA∈{2,64,128,192} × T 网格)。拟合形式:
+/// 单一公式(不分档):
 ///
 /// ```text
-/// threshold = 1 - 2*fade
-/// K         = 30 + 70*fade           (边缘斜率随推进变陡)
-/// coverage  = clamp(K * (mask - threshold), 0, 1)
-/// T >= 256  => 255
+/// c     = 1 - 2*fade                      等值线(随推进从 1 扫到 0)
+/// K     = 30 + 70*fade                    等值线附近的**亚像素**过渡(1/K ≈ 0.02..0.033)
+/// cell  = 0.16 / TA^2                     官方的「一格」融合带(`+0xb0` 分块表)
+/// a     = clamp((m - c) / (1/K + cell), 0, 1)
 /// ```
 ///
-/// 在 TA=128(本语料 title 的取值)下,三个中点(T=64/128/192)的
-/// 官方测量与模型差 ≤ 8/255;`TA!=128` 与 `T≈255` 的残差见 DIV-GFX-045。
+/// 官方 `FUN_00414ba4` 把层按 `+0x130`(部件)×`+0xb0`(分块)切成 quad 网格,
+/// 每格顶点带累计覆盖比例、格内 16.16 定点插值(比例项 `*0.25`),所以
+/// **柔带宽度 ≈ 一格**:`TA` 越大格越密越贴等值线(脚本注释「くっきり」),
+/// 越小格越粗、边界越宽。这里用「亚像素带 + 一格带」相加表达同一件事。
 ///
-/// 返回 0..255 的覆盖度(未乘图层 A / 纹理 α)。`mask` 是配对纹理 G 通道。
-pub fn transition_coverage(mask: u8, fade: f64, complete: bool) -> u8 {
+/// `0.16/TA^2` 的两个锚点:
+/// 1. 官方 micro 网格(`j2-micro-trans8`,TA=128)要求 TA=128 的格带几乎为零,
+///    否则 `mask=128,T=128` 的 α=0.498 会被推到 0.43(超差 16/255);
+/// 2. 整场帧(`\FOUT(1500,5)`,TA=4)实测幕边柔带 ≈40px,掩膜梯度 ≈0.001/px
+///    ⇒ ≈0.04 mask 单位;`0.16/4^2 = 0.01` 与亚像素带相加 ≈0.036(≈36px)。
+///
+/// 真正 1:1 要落地那张 quad 网格(`DIV-GFX-065 §12.3`),此式是行为替身。
+///
+/// 返回 0..255 的覆盖度(未乘图层 A / 纹理 α)。
+pub fn transition_coverage(mask: u8, fade: f64, ta: i16, complete: bool) -> u8 {
     if complete {
         return 255;
     }
     let threshold = 1.0 - 2.0 * fade;
     let slope = 30.0 + 70.0 * fade;
-    let value = slope * (f64::from(mask) / 255.0 - threshold);
+    // `0.16/TA²`:TA=4 → 0.01(与亚像素带相加 ≈0.036,约 36px 融合带);
+    // TA=128 → 1e-5(被亚像素带淹没,标题/快门逐位不变)。
+    let cell = if ta >= 1 {
+        0.16 / (f64::from(ta) * f64::from(ta))
+    } else {
+        0.0
+    };
+    let band = 1.0 / slope + cell;
+    let value = (f64::from(mask) / 255.0 - threshold) / band;
     if value <= 0.0 {
         0
     } else if value >= 1.0 {
@@ -1077,5 +1093,55 @@ impl Layer {
         self.texture_status = LayerStatus::Executable;
         self.param_status = LayerStatus::Executable;
         self.refresh_status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transition_coverage;
+
+    /// `TA=128`(标题 logo 浮现、立绘快门)的格带只有 `0.16/128² ≈ 1e-5`,
+    /// 被亚像素带(≈0.02)吞掉 ⇒ 与旧实现逐值差 ≤2/255。用户已验收的标题
+    /// 动画依赖这个性质。
+    #[test]
+    fn transition_coverage_keeps_hard_edge_at_ta_128() {
+        for &fade in &[0.0f64, 0.127, 0.254, 0.381, 0.5] {
+            let threshold = 1.0 - 2.0 * fade;
+            let slope = 30.0 + 70.0 * fade;
+            for mask in 0..=255u8 {
+                let old = {
+                    let value = slope * (f64::from(mask) / 255.0 - threshold);
+                    if value <= 0.0 {
+                        0.0
+                    } else if value >= 1.0 {
+                        255.0
+                    } else {
+                        (value * 255.0).round().clamp(0.0, 255.0)
+                    }
+                };
+                let got = f64::from(transition_coverage(mask, fade, 128, false));
+                assert!(
+                    (got - old).abs() <= 2.0,
+                    "TA=128 应与旧式相差 ≤2/255(mask={mask} fade={fade}: 旧 {old} 新 {got})"
+                );
+            }
+        }
+    }
+
+    /// `TA=4`(演出 1 最后淡出)是**宽渐变档**:等值线附近必须出现中间值,
+    /// 且覆盖区内部仍能到满(不是整屏半透明)。
+    #[test]
+    fn transition_coverage_is_soft_at_ta_4() {
+        let fade = 0.132; // T≈45/256 的 YS_FadeVal(TA=4)
+        let threshold = 1.0 - 2.0 * fade;
+        let at = |m: f64| transition_coverage((m * 255.0).round() as u8, fade, 4, false);
+        // 等值线附近是部分覆盖(u8 量化后可以有几级),带宽 0.04 内单调上升。
+        let edge = at(threshold);
+        assert!(edge <= 32, "等值线上应是低覆盖,实得 {edge}");
+        let mid = at(threshold + 0.02);
+        assert!(mid > 10 && mid < 245, "等值线附近应有中间值,实得 {mid}");
+        assert_eq!(at(threshold + 0.06), 255, "覆盖区内部必须能到满");
+        // 掩膜比阈值低时不覆盖。
+        assert_eq!(at((threshold - 0.02).max(0.0)), 0);
     }
 }

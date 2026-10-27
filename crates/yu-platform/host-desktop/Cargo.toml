@@ -20,6 +20,7 @@ pollster = "0.4"
 wgpu = "30.0.1"
 winit = "0.30"
 yu-backend-soft = { path = "../../yu-render/soft" }
+yu-render-core = { path = "../../yu-render/core" }
 yu-backend-wgpu = { path = "../../yu-render/wgpu" }
 yu-engine = { path = "../../yu-engine" }
 yu-log = { path = "../../yu-log" }

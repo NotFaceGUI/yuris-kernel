@@ -15,6 +15,7 @@ members = [
     "crates/yu-platform/host-desktop",
     "crates/yu-platform/host-wasm",
     "crates/yu-platform/input",
+    "crates/yu-render/core",
     "crates/yu-render/soft",
     "crates/yu-render/wgpu",
 ]

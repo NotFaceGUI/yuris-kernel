@@ -213,6 +213,7 @@ const NOOP_COMMANDS_0495: &[&str] = &[
 pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> {
     let mut table = Vec::with_capacity(yscm.len());
     for i in 0..yscm.len() {
+        // 良性:未声明命令名只影响诊断显示,不参与分派语义。
         let name = yscm.command(i as u8).map(|c| c.name.as_str()).unwrap_or("");
         // 官方槽位判定先于域分类:`SYSTEMMODE` 虽以 SYSTEM 开头,但分发表
         // 未覆盖它 ⇒ 执行到就是脚本执行错误,不能当域事件静默放过。
@@ -3245,6 +3246,8 @@ impl Vm {
         let mut dno: Option<i64> = None;
         let mut set: Option<(LValue, Value)> = None;
         let mut layer_id = false;
+        // `SAVE[DNO=n ID=图层]` 的目标图层(命令时刻取像素)。
+        let mut layer_id_bytes: Option<Vec<u8>> = None;
         // G_* 旗标按官方级联序的**首个在场**生效(与值无关,DIV-RT-019 同判)。
         let mut group_slot: Option<(ElemType, u8)> = None;
         let mut args: Vec<ArgValue> = Vec::new();
@@ -3287,6 +3290,9 @@ impl Vm {
                 "ID" => {
                     layer_id = true;
                     if let Ok(v) = self.eval_window(st, w) {
+                        if let Value::Str(bytes) = &v {
+                            layer_id_bytes = Some(bytes.clone());
+                        }
                         args.push(ArgValue::new(w.rec.kind, v));
                     }
                 }
@@ -3309,14 +3315,6 @@ impl Vm {
             }
         }
         self.emit_domain(Domain::Save, "SAVE", args);
-        if layer_id {
-            // 图层快照需要 gfx(CGETSCREEN 类),H-P4-02 交接;官方 SAVE
-            // 的 ID 分支与变量保存同函数不同路径,不互相阻塞。
-            self.report_unimplemented(
-                "SAVE",
-                "SAVE[ID] 图层快照未实现(H-P4-02;变量保存不受影响)".to_string(),
-            );
-        }
         // 预约(DNO 在场;官方 DNO 与 FILE 可同条,先预约后刷盘)。
         if let Some(dno) = dno {
             if !(1..=1024).contains(&dno) {
@@ -3328,7 +3326,36 @@ impl Vm {
                 return Ok(StepOutcome::Continue);
             }
             let dno = dno as u32;
-            if let Some((ty, group)) = group_slot {
+            if layer_id {
+                // `SAVE[ID]` = 图层快照(块类型 1)。官方在命令处理器里直接
+                // 读图层表面(REA `0x4477c0` 读取端);本内核由图形宿主用
+                // 渲染器回放当前帧的 COPY/加工命令取同一份像素。
+                let captured = match (self.graphics_host.as_mut(), layer_id_bytes.as_deref()) {
+                    (Some(host), Some(id)) => match host.capture_layer(id) {
+                        Ok(img) => img,
+                        Err(d) => {
+                            self.report(d);
+                            None
+                        }
+                    },
+                    _ => None,
+                };
+                match captured {
+                    Some(image) => {
+                        let failure = match self.save_host.as_mut() {
+                            Some(host) => host.reserve_image(dno, &image).err(),
+                            None => None,
+                        };
+                        if let Some(d) = failure {
+                            return Err(VmError::from(self.locate(d)));
+                        }
+                    }
+                    None => self.report_unimplemented(
+                        "SAVE",
+                        "SAVE[ID] 图层快照:图形宿主未提供图层像素(H-P4-02)".to_string(),
+                    ),
+                }
+            } else if let Some((ty, group)) = group_slot {
                 let vars = self.globals_of_group(ty, group);
                 let failure = match self.save_host.as_mut() {
                     Some(host) => host.reserve_group(dno, ty, group, &vars).err(),
@@ -3425,6 +3452,7 @@ impl Vm {
         let mut dno: Option<i64> = None;
         let mut target: Option<LValue> = None;
         let mut layer_id = false;
+        let mut layer_id_bytes: Option<Vec<u8>> = None;
         let mut args: Vec<ArgValue> = Vec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
@@ -3466,6 +3494,9 @@ impl Vm {
                 "ID" => {
                     layer_id = true;
                     if let Ok(v) = self.eval_window(st, w) {
+                        if let Value::Str(bytes) = &v {
+                            layer_id_bytes = Some(bytes.clone());
+                        }
                         args.push(ArgValue::new(w.rec.kind, v));
                     }
                 }
@@ -3478,10 +3509,46 @@ impl Vm {
         }
         self.emit_domain(Domain::Save, "LOAD", args);
         if layer_id {
-            self.report_unimplemented(
-                "LOAD",
-                "LOAD[ID] 图层恢复未实现(H-P4-02;变量恢复不受影响)".to_string(),
-            );
+            // `LOAD[DNO=n ID=图层]` = 图像块(btype 1):块内像素装回图层表面。
+            let (Some(file), Some(dno), Some(id)) =
+                (file.clone(), dno, layer_id_bytes.as_deref())
+            else {
+                self.report(diag::recoverable(
+                    code::rt::CMD_SLOT,
+                    Boundary::Script,
+                    "LOAD[ID] 缺 FILE/DNO/ID",
+                ));
+                return Ok(StepOutcome::Continue);
+            };
+            if !(1..=1024).contains(&dno) {
+                self.report(diag::recoverable(
+                    code::rt::CMD_SLOT,
+                    Boundary::Script,
+                    format!("LOAD DNO={dno} 越界(1..=1024)"),
+                ));
+                return Ok(StepOutcome::Continue);
+            }
+            let loaded = match self.save_host.as_mut() {
+                Some(host) => host.load_image(&Self::ensure_sd_ext(&file), dno as u32),
+                None => return Ok(StepOutcome::Continue),
+            };
+            match loaded {
+                Ok(image) => {
+                    let applied = match self.graphics_host.as_mut() {
+                        Some(host) => host.restore_layer(id, &image),
+                        None => Ok(false),
+                    };
+                    match applied {
+                        Ok(true) => {}
+                        Ok(false) => self.report_unimplemented(
+                            "LOAD",
+                            "LOAD[ID] 图层恢复:图形宿主未接受图层像素(H-P4-02)".to_string(),
+                        ),
+                        Err(d) => self.report(d),
+                    }
+                }
+                Err(d) => self.report(d),
+            }
             return Ok(StepOutcome::Continue);
         }
         let Some(file) = file else {
@@ -3610,6 +3677,11 @@ impl Vm {
     /// 解析 `CG[FILE]` 的像素尺寸:按工程 `yscfg` 扩展名序尝试 `.png/.bmp/
     /// .jpg/.gif`,只读图像头。结果(含失败)缓存,避免每帧重读。
     ///
+    /// 候选序与渲染器 `TextureStore::candidates` **同口径**:键已带扩展名时
+    /// 先按原样查,再按探测序补扩展名。两处不一致会造成「渲染器画得出、
+    /// VM 量不到尺寸」:按钮的 `@BT.SX/SY` 来自 `CGINFO[SX/SY]`,为 0 时
+    /// 命中矩形退化成点,点击永远不生效。
+    ///
     /// 这是 [`crate::image`] 的唯一调用点;尺寸语义来自引擎 `CGINFO[SX/SY]`
     /// = 已装载纹理尺寸,证据与分层说明见 DIV-GFX-024 / EVID-J3-03。
     fn resolve_asset_size(&mut self, key: &[u8]) -> Option<(u32, u32)> {
@@ -3618,7 +3690,11 @@ impl Vm {
         }
         let mut found = None;
         let ext_order = self.tables.boot.config.image_ext_order;
-        'probe: for &code in ext_order.iter() {
+        let mut candidates: Vec<Vec<u8>> = Vec::new();
+        if has_image_extension(key) {
+            candidates.push(key.to_vec());
+        }
+        for &code in ext_order.iter() {
             let ext: &[u8] = match code {
                 0 => break,
                 1 => b".png",
@@ -3630,6 +3706,9 @@ impl Vm {
             };
             let mut path = key.to_vec();
             path.extend_from_slice(ext);
+            candidates.push(path);
+        }
+        'probe: for path in candidates {
             let Ok(lookup) = yu_vfs::LookupKey::new(&path, yu_vfs::Codec::Cp932) else {
                 continue;
             };
@@ -4670,6 +4749,12 @@ impl Vm {
         if exist {
             if let (Some(name), Some(t)) = (name, target) {
                 let found = self.find_label(&name).is_some();
+                if std::env::var_os("YU_LABEL_TRACE").is_some()
+                    && (name.windows(7).any(|w| w == b"BTN.YES")
+                        || name.windows(6).any(|w| w == b"BTN.NO"))
+                {
+                    let _ = (String::from_utf8_lossy(&name), found);
+                }
                 self.write_target(st, &t, &Value::Int(found as i64))?;
             }
         }
@@ -4707,6 +4792,15 @@ impl Vm {
             )
             .into());
         };
+        if std::env::var_os("YU_LABEL_TRACE").is_some() {
+            let text = String::from_utf8_lossy(&name);
+            if ["BTN.YES", "BTN.NO", "S.RETURN", "CGTSS", "es.Load", "LOADCONF"]
+                .iter()
+                .any(|k| text.contains(k))
+            {
+                let _ = &text;
+            }
+        }
         self.find_label(&name).ok_or_else(|| {
             let d = diag::fatal(
                 code::rt::LABEL,
@@ -4876,6 +4970,21 @@ pub(crate) fn param_index_of(name: &str) -> Option<usize> {
         Some(1)
     } else {
         digits.parse().ok()
+    }
+}
+
+/// 键的最后一个路径组件是否已带图像扩展名(与渲染器 `has_extension` 同判)。
+///
+/// 以 `.` 开头视为无扩展名;`/` 与 `\` 都算分隔符。
+fn has_image_extension(key: &[u8]) -> bool {
+    let name = match key.rsplit(|&b| b == b'/' || b == b'\\').next() {
+        Some(name) => name,
+        // 无分隔符时整串就是文件名。
+        None => key,
+    };
+    match name.iter().rposition(|&b| b == b'.') {
+        Some(0) | None => false,
+        Some(_) => true,
     }
 }
 

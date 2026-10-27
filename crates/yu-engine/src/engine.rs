@@ -10,9 +10,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use yu_backend_soft::{
-    frame_has_drawable_output, png, RenderReport, SoftRenderer, Surface, TextureStore,
-};
+use yu_backend_soft::{frame_has_drawable_output, SoftRenderer};
+use yu_render_core::{png, RenderReport, Surface, TextureStore};
 use yu_backend_wgpu::{DeviceOptions, WgpuRenderer};
 use yu_gfx::{
     json, probe_order_from_codes, CompositorFrame, GfxConfig, GfxHost, GfxState, SizeU32,
@@ -449,11 +448,16 @@ pub struct Engine {
     events_drained: u64,
     /// 主任务已 `END`/走完(宿主据此退出窗口)。
     main_finished: bool,
+    /// 上一帧呈现画面(`SAVE[ID]` 抓帧渲染器的 `:/W0/` 后缓冲)。
+    capture_screen: Arc<Mutex<Option<Arc<Surface>>>>,
+    /// `SAVE[ID]` 的离屏抓帧器(逐帧 `observe`,在与主渲染器同刻冻结快照)。
+    capture_bridge: Option<crate::capture::SharedCapture>,
 }
 
 impl Engine {
     pub fn new(project: Project, opts: EngineOptions) -> CliResult<Self> {        let boot_started = Instant::now();
-        let (vm, state, sound, save_host, viewport, probe_order) = boot(&project, &opts)?;
+        let (vm, state, sound, save_host, viewport, probe_order, capture_screen, capture_bridge) =
+            boot(&project, &opts)?;
         let boot_ms = boot_started.elapsed().as_secs_f64() * 1000.0;
 
         let renderer_started = Instant::now();
@@ -554,6 +558,8 @@ impl Engine {
             boot_ms,
             events_drained: 0,
             main_finished: false,
+            capture_screen,
+            capture_bridge,
         })
     }
 
@@ -805,6 +811,14 @@ impl Engine {
         let tick_ms = tick_started.elapsed().as_secs_f64() * 1000.0;
         let drawable = frame_has_drawable_output(&frame);
 
+        // `SAVE[ID]` 抓帧器:只在本帧出现新 COPY 时整帧回放一次,快照因此
+        // 与主渲染器**同刻**冻结(`last_screen` = 上一帧呈现面)。
+        if let Some(bridge) = &self.capture_bridge {
+            bridge
+                .0
+                .borrow_mut()
+                .observe(&frame, self.last_surface.clone());
+        }
         let render_started = Instant::now();
         let (surface, report, screen) = self.renderer.render(&frame)?;
         self.last_screen = screen;
@@ -824,8 +838,25 @@ impl Engine {
             drawable,
         };
         self.accumulate_frame_diags(&frame);
+        if let Some(want) = std::env::var_os("YU_DUMP_LAYERS_AT") {
+            if want.to_string_lossy().parse::<u64>().ok() == Some(frame.frame) {
+                let shown: Vec<String> = frame
+                    .layers
+                    .iter()
+                    .filter(|l| l.visible)
+                    .map(|l| l.id.display())
+                    .take(40)
+                    .collect();
+                let _ = &shown;
+            }
+        }
         self.last_frame = Some(frame);
         self.last_surface = Some(Arc::clone(&surface));
+        // `SAVE[ID]` 抓帧渲染器的后缓冲:与主渲染器同源(上一帧呈现画面)。
+        *self
+            .capture_screen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&surface));
         self.last_report = out.clone();
         self.last_render = Some(report);
         push_history(&mut self.tick_history, tick_ms);
@@ -1257,6 +1288,10 @@ impl Engine {
         self.main_finished = false;
         self.last_frame = None;
         self.last_surface = None;
+        *self
+            .capture_screen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.last_report = FrameReport::empty(0);
         self.last_render = None;
         self.tick_history.clear();
@@ -1273,12 +1308,15 @@ impl Engine {
             audio.detach();
         }
         let started = Instant::now();
-        let (vm, state, sound, save_host, viewport, _) = boot(&self.project, &self.opts)?;
+        let (vm, state, sound, save_host, viewport, _, capture_screen, capture_bridge) =
+            boot(&self.project, &self.opts)?;
         self.boot_ms = started.elapsed().as_secs_f64() * 1000.0;
         self.vm = Some(vm);
         self.state = Some(state);
         self.sound = sound;
         self.save_host = save_host;
+        self.capture_screen = capture_screen;
+        self.capture_bridge = capture_bridge;
         if let (Some(audio), Some(sound)) = (&mut self.audio, &self.sound) {
             audio.attach(Arc::clone(sound));
         }
@@ -1379,6 +1417,8 @@ type BootBundle = (
     Option<SaveHost>,
     Viewport,
     Vec<yu_gfx::ImageFormat>,
+    Arc<Mutex<Option<Arc<Surface>>>>,
+    Option<crate::capture::SharedCapture>,
 );
 
 /// `CGINFO[ONMOUSE*]` 的像素采样面。
@@ -1497,6 +1537,21 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
             store: TextureStore::new(source, CODEC, probe_order.clone()),
         }));
     }
+    // `SAVE[ID]/LOAD[ID]` 的图层像素通道:抓帧渲染器(独立 `TextureStore`,
+    // 只在存/读档时用)+ 共享合成资产叠层。`last_screen` 由 `Engine::tick`
+    // 每帧写入(`COPY ID=:/W0/` 读的后缓冲)。
+    let capture_screen: Arc<Mutex<Option<Arc<Surface>>>> = Arc::new(Mutex::new(None));
+    let capture_bridge = if let Ok(source) = project.open_source() {
+        let capture = Rc::new(RefCell::new(crate::capture::GfxCapture::new(
+            TextureStore::new(source, CODEC, probe_order.clone()),
+            capture_screen.clone(),
+            project.overlay().clone(),
+        )));
+        gfx_host.set_layer_capture(Box::new(crate::capture::SharedCapture(capture.clone())));
+        Some(crate::capture::SharedCapture(capture))
+    } else {
+        None
+    };
     vm.set_graphics_host(Box::new(gfx_host));
     let sound_state = if opts.os_sound {
         // 声音初始化跟随 `@_OS_SOUND` 开关：关时不装宿主（行为与 M-2 一致）。
@@ -1534,7 +1589,16 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         "startup: boot rest (gfx/sound/save)={:.1}ms",
         boot_started.elapsed().as_secs_f64() * 1000.0
     );
-    Ok((vm, state, sound_state, save_host, viewport, probe_order))
+    Ok((
+        vm,
+        state,
+        sound_state,
+        save_host,
+        viewport,
+        probe_order,
+        capture_screen,
+        capture_bridge,
+    ))
 }
 
 fn compare_reports(soft: &RenderReport, wgpu: &RenderReport) -> Result<(), Failure> {

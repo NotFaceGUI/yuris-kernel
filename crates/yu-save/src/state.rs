@@ -56,6 +56,8 @@ pub struct ReservedFact {
     pub snap: Option<VarSnapshot>,
     /// 块类型 2 的子变量 `(var_id, 快照)`。
     pub subs: Vec<(u16, VarSnapshot)>,
+    /// 块类型 1 的图层图像(`SAVE[ID]` 命令时刻像素)。
+    pub image: Option<yu_rt::event::CapturedImage>,
 }
 
 /// 槽位表的确定性快照(诊断/用例摘要用;不含时间戳等易变事实)。
@@ -296,6 +298,7 @@ impl SaveState {
                 var_id: var.id,
                 snap: Some(snap.clone()),
                 subs: Vec::new(),
+                image: None,
             },
         );
         Ok(())
@@ -325,6 +328,48 @@ impl SaveState {
                 var_id: 0,
                 snap: None,
                 subs: vars.to_vec(),
+                image: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// `SAVE[DNO=n ID=图层]`:预约一块(块类型 1),内容 = 命令时刻图层
+    /// 表面像素(`image_block::encode` 组装段长表 + 两段)。
+    pub fn reserve_image(
+        &mut self,
+        dno: u32,
+        image: &yu_rt::event::CapturedImage,
+    ) -> Result<(), Diag> {
+        self.save_calls += 1;
+        if !(1..=1024).contains(&dno) {
+            return Err(error::recoverable(
+                code::ARG_RANGE,
+                format!("SAVE DNO={dno} 越界(1..=1024)"),
+            ));
+        }
+        let expected = image.len_bytes();
+        if image.rgba.len() != expected || expected == 0 {
+            return Err(error::recoverable(
+                code::IMAGE_SHAPE,
+                format!(
+                    "SAVE[ID] 图像形状非法: {}x{} 需要 {} 字节,实有 {}",
+                    image.width,
+                    image.height,
+                    expected,
+                    image.rgba.len()
+                ),
+            ));
+        }
+        self.reservations.insert(
+            dno,
+            ReservedFact {
+                dno,
+                btype: 1,
+                var_id: 0,
+                snap: None,
+                subs: Vec::new(),
+                image: Some(image.clone()),
             },
         );
         Ok(())
@@ -364,6 +409,14 @@ impl SaveState {
                         })
                         .collect();
                     writer.set_block(fact.dno, yu_format::yssd::encode_multi_body(&subs));
+                }
+                1 => {
+                    let Some(image) = &fact.image else { continue };
+                    let raw = crate::image_block::encode(image);
+                    writer.set_block(
+                        fact.dno,
+                        yu_format::yssd::encode_block_body(1, 1, 0, &raw),
+                    );
                 }
                 other => {
                     let _ = other;
@@ -465,6 +518,57 @@ impl SaveState {
                 format!("LOAD[FILE={file} DNO={dno}] 未知块类型 {other}"),
             )),
         }
+    }
+
+    /// `LOAD[FILE DNO=n ID=图层]`:读回图像块(btype 1)。
+    ///
+    /// 载荷格式见 [`crate::image_block`];读取端同时接受 0.495 与 0.479 的
+    /// 表头偏移(以段长自证),官方读取端 `0x4477c0` 校验首 u32 是 `0x640`。
+    pub fn load_image(&mut self, file: &str, dno: u32) -> Result<yu_rt::event::CapturedImage, Diag> {
+        self.load_calls += 1;
+        let path = self.confined_path(file)?;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(error::recoverable(
+                    code::FILE_MISSING,
+                    format!("LOAD 目标不存在: {file}"),
+                ));
+            }
+            Err(e) => {
+                return Err(error::recoverable(
+                    code::FILE_READ,
+                    format!("LOAD 读取失败: {file}: {e}"),
+                ));
+            }
+        };
+        let origin = file.as_bytes();
+        let save = yu_format::yssd::YssdSave::parse(&bytes, origin)
+            .map_err(|d| error::recoverable(code::CONTAINER, format!("LOAD[FILE={file}] {d}")))?;
+        let Some(entry) = save.entry(dno) else {
+            return Err(error::recoverable(
+                code::FILE_MISSING,
+                format!("LOAD[FILE={file}] DNO={dno} 不在容器"),
+            ));
+        };
+        if entry.btype != 1 {
+            return Err(error::recoverable(
+                code::CONTAINER,
+                format!(
+                    "LOAD[FILE={file} DNO={dno}] 不是图像块(btype={})",
+                    entry.btype
+                ),
+            ));
+        }
+        let raw = entry
+            .decompress(origin)
+            .map_err(|d| error::recoverable(code::CONTAINER, format!("{d}")))?;
+        crate::image_block::decode(&raw).map_err(|detail| {
+            error::recoverable(
+                code::IMAGE_SHAPE,
+                format!("LOAD[FILE={file} DNO={dno}] 图像块解析失败: {detail}"),
+            )
+        })
     }
 
     /// `FILEACT`:手册 `file/fileact.html`。已实现 COPY / DELETE(FILE 存档
@@ -1098,6 +1202,59 @@ mod tests {
             code::PATH_ESCAPE
         );
         assert_eq!(state.confined_path("").unwrap_err().code, code::ARG_MISSING);
+    }
+
+    /// `SAVE[DNO ID=图层]` → 容器 → `LOAD[ID]` 闭环:块必须是 btype 1,
+    /// 载荷段长表 = `[1600][w*h*4]`,`LOAD[ID]` 读回同尺寸同像素。
+    #[test]
+    fn image_block_roundtrips_through_container() {
+        let root = temp_root("sv-unit-image");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut state = SaveState::new(&root, true);
+        let image = yu_rt::event::CapturedImage {
+            width: 4,
+            height: 3,
+            rgba: (0..48).map(|i| (i * 5) as u8).collect(),
+        };
+        state.reserve_image(3, &image).expect("reserve");
+        state.flush("thumb.sd").expect("flush");
+        // 容器层:块类型 1 + 段长表自证。
+        let bytes = std::fs::read(root.join("thumb.sd")).unwrap();
+        let save = yu_format::yssd::YssdSave::parse(&bytes, b"thumb.sd").unwrap();
+        let entry = save.entry(3).expect("DNO3");
+        assert_eq!(entry.btype, 1);
+        let raw = entry.decompress(b"thumb.sd").unwrap();
+        assert_eq!(&raw[0..4], &1600u32.to_le_bytes());
+        assert_eq!(&raw[4..8], &(4u32 * 3 * 4).to_le_bytes());
+        assert_eq!(raw.len(), 8 + 1600 + 48);
+        // 读取端:同尺寸同像素。
+        let back = state.load_image("thumb.sd", 3).expect("load_image");
+        assert_eq!(back, image);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 官方 0.495 `save00001.sd` 的 DNO=3 必须解成 `100×75 RGBA`
+    /// (真值层级 3;缺样本环境显式报错)。样本缩略图是黑屏,只钉形状。
+    #[test]
+    fn official_dno3_thumbnail_decodes_as_100x75() {
+        let Some(sdk) = std::env::var_os("YURIS_SAMPLE_SDK0495") else {
+            panic!("YURIS_SAMPLE_SDK0495 未设置(缺样本环境必须显式报错)");
+        };
+        let path = Path::new(&sdk).join("data/save/save00001.sd");
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("官方 save00001.sd 不可读({e}): {}", path.display()));
+        let root = temp_root("sv-official-thumb");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("save00001.sd"), &bytes).unwrap();
+        let mut state = SaveState::new(&root, false);
+        let image = state.load_image("save00001.sd", 3).expect("DNO3");
+        assert_eq!((image.width, image.height), (100, 75));
+        assert_eq!(image.rgba.len(), 30000);
+        // 该样本是纯黑不透明(RGBA 0,0,0,255)。
+        assert_eq!(&image.rgba[0..4], &[0, 0, 0, 255]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 单测专用根:本 crate `target/tmp` 下(系统 TEMP 在本环境不可写)。

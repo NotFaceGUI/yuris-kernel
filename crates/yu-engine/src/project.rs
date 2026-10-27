@@ -47,6 +47,11 @@ pub struct Project {
     root: PathBuf,
     aux_root: PathBuf,
     entry: DataEntry,
+    /// 运行时合成资产叠层(挂载栈最高优先;`LOAD[ID]` 缩略图)。
+    ///
+    /// 内容哈希命名 ⇒ 重复写入幂等;所有 `open_source()`/`mount()` 出来的
+    /// 数据源共享同一份,渲染器纹理解析与 VM 资产解析看到相同字节。
+    overlay: yu_vfs::SharedMem,
 }
 
 /// `/api/status` 用的数据入口摘要。
@@ -71,6 +76,7 @@ impl DatasetInfo {
 impl Project {
     /// 按唯一约定发现数据入口。`--data` 覆盖时按覆盖路径的形态判定。
     pub fn discover(root: &Path, data_override: Option<&Path>) -> Result<Self, Failure> {
+        let overlay = yu_vfs::SharedMem::new(CODEC);
         if let Some(data) = data_override {
             let entry = entry_for(data)?;
             let aux_root = data.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -78,6 +84,7 @@ impl Project {
                 root: root.to_path_buf(),
                 aux_root,
                 entry,
+                overlay,
             });
         }
         if root.is_file() {
@@ -86,6 +93,7 @@ impl Project {
                 root: parent.clone(),
                 aux_root: parent,
                 entry: DataEntry::Packed(root.to_path_buf()),
+                overlay,
             });
         }
         if !root.is_dir() {
@@ -103,6 +111,7 @@ impl Project {
                 root: root.to_path_buf(),
                 aux_root: root.to_path_buf(),
                 entry: DataEntry::Packed(packed),
+                overlay,
             });
         }
         let loose = root.join("data");
@@ -111,6 +120,7 @@ impl Project {
                 root: root.to_path_buf(),
                 aux_root: root.to_path_buf(),
                 entry: DataEntry::Loose(loose),
+                overlay,
             });
         }
         Err(Failure::new(
@@ -156,8 +166,8 @@ impl Project {
 
     /// 打开主数据源(每次 boot 独立打开;文件句柄不复用)。
     ///
-    /// 存在增量包时返回 `基础包 + update1..9` 的叠加栈([`Mount`];
-    /// 无增量包时直接返回单一源,保持诊断的 `source_name` 不变)。
+    /// 返回 `基础包 + update1..9 + 合成资产叠层` 的叠加栈([`Mount`]);
+    /// 叠层是 `LOAD[ID]` 缩略图的写入点,必须始终在位。
     pub fn open_source(&self) -> Result<Box<dyn DataSource>, Failure> {
         let base: Box<dyn DataSource> = match &self.entry {
             DataEntry::Packed(path) => Box::new(open_ypf(path)?),
@@ -165,16 +175,20 @@ impl Project {
                 Failure::runtime(format!("打开 {} 失败: {d}", dir.display()))
             })?),
         };
-        let updates = self.update_packs();
-        if updates.is_empty() {
-            return Ok(base);
-        }
+        // 合成资产叠层始终置顶:`LOAD[ID]` 的缩略图以内容哈希命名写入,
+        // 任何位置读取都拿到同一份字节。
         let mut mount = Mount::new(CODEC);
         mount.push(base);
-        for path in updates {
+        for path in self.update_packs() {
             mount.push(Box::new(open_ypf(&path)?));
         }
+        mount.push(Box::new(self.overlay.clone()));
         Ok(Box::new(mount))
+    }
+
+    /// 运行时合成资产叠层(`LOAD[ID]` 缩略图写入点;所有数据源共享)。
+    pub fn overlay(&self) -> &yu_vfs::SharedMem {
+        &self.overlay
     }
 
     /// 辅助源:工程根(`system/YSCom/YSCom.ycd` 可能在这里;缺失不是错误)。
@@ -184,8 +198,8 @@ impl Project {
         )?))
     }
 
-    /// 纹理挂载栈:`基础包 → update1..9 → 散盘`(散盘同名覆盖,
-    /// 置于更新包之上 —— 它是开发/覆写通道,必须能压过官方增量内容)。
+    /// 纹理挂载栈:`基础包 → update1..9 → 散盘 → 合成资产叠层`(后来者
+    /// 覆盖;叠层置顶,`LOAD[ID]` 的缩略图不会被同名的官方资产遮住)。
     pub fn mount(&self) -> Result<Mount, Failure> {
         let mut mount = Mount::new(CODEC);
         if let DataEntry::Packed(path) = &self.entry {
@@ -202,6 +216,7 @@ impl Project {
                 })?));
             }
         }
+        mount.push(Box::new(self.overlay.clone()));
         Ok(mount)
     }
 

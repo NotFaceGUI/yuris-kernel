@@ -1,0 +1,15 @@
+[package]
+name = "yu-render-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "两个渲染后端共享的契约与平台设施(表面/报告/纹理/字形栅格/栅格原语)"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }
+log = "0.4"
+yu-font = { path = "../../yu-font" }
+yu-format = { path = "../../yu-format" }
+yu-gfx = { path = "../../yu-gfx" }
+yu-log = { path = "../../yu-log" }
+yu-vfs = { path = "../../yu-vfs" }

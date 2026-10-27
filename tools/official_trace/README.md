@@ -46,6 +46,23 @@ display_sha256 = SHA-256(display JSON 规范文本,无空白,键序 width/height
 屏幕级记录的 `pass_count/op_count/executable_ops/skipped_ops` 在引擎外部不可观测，
 按 0/默认值记录；**不是实测 0**。`level=screen` 已表达这一点。
 
+### 2.1 整场被动采集(`capture_run.py`)
+
+`capture_screen.py` 只采首屏;要取证**演出中途**(例如 1.5s 的 FOUT 幕),
+用 `capture_run.py`:
+
+```bash
+python tools/official_trace/capture_run.py   --exe <官方 yu-ris.exe> --cwd <工程根>   --out <仓库外输出目录> --interval 0.2 --max-shots 4000
+```
+
+- **默认不发送任何输入**:鼠标/键盘完全交给操作者;窗口关闭(=进程退出)即结束,
+  并写 `capture_index.json`(`elapsed` = 相对启动的秒数,每张截图一行);
+- 只有显式 `--send-input` 才会按 `--click`/`--click-every` 发真实鼠标点击;
+- 0.2s 间隔足以覆盖 1.5s 的过渡(约 7 帧),整场 5 分钟约 1500 张、~170MB。
+
+用途与产出示例见 `docs/divergences/DIV-GFX-065-transition-coverage-model.md` §11
+(用同一份 `project-eris` 数据对拍 FOUT 幕,黑区 IoU 0.85-0.87)。
+
 ## 3. 运行环境与安全
 
 - 64 位 Python（本机 3.12）、Pillow；Windows 桌面会话。

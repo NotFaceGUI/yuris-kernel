@@ -196,6 +196,23 @@ fn run() -> Result<(), String> {
             // 只打 target 无法判断是哪一条被跳(`H-SPRITE-PARITY` §5)。
             for pass in &frame.passes {
                 for op in &pass.ops {
+                    if let yu_gfx::Op::Transition(draw) = op {
+                        let id = draw.layer.id.display();
+                        if id.contains(&args.prefix) {
+                            println!(
+                                "  TRANS {id} from={:?} mask={:?} fade={:.4} t={} ta={} from_layer={:?} to_layer={:?} size={:?}",
+                                draw.from,
+                                draw.to,
+                                draw.fade,
+                                draw.t,
+                                draw.ta,
+                                draw.from_layer.as_ref().map(|l| l.display()),
+                                draw.to_layer.as_ref().map(|l| l.display()),
+                                draw.layer.image_size()
+                            );
+                        }
+                        continue;
+                    }
                     if let yu_gfx::Op::Image(image) = op {
                         let target = image
                             .target
@@ -255,8 +272,12 @@ fn run() -> Result<(), String> {
             if !id.contains(&args.prefix) {
                 continue;
             }
+            let transition = match &layer.transition {
+                Some(t) => format!(" T={} TA={} TID={}", t.t, t.ta, t.tid.as_ref().map(|id| id.display()).unwrap_or_default()),
+                None => String::new(),
+            };
             lines.push(format!(
-                "  {id:<12} E={} A={:<4} Z={:<9} xy=({:.3},{:.3}) size={:?} tex={:?} status={:?}",
+                "  {id:<12} E={} A={:<4} Z={:<9} xy=({:.3},{:.3}) size={:?} tex={:?} status={:?}{}",
                 u8::from(layer.visible),
                 layer.alpha,
                 layer.z,
@@ -264,7 +285,8 @@ fn run() -> Result<(), String> {
                 layer.transform.y,
                 layer.image_size(),
                 layer.texture,
-                layer.status
+                layer.status,
+                transition
             ));
         }
         println!("== host_frame {host_frame} engine_frame {}", frame.frame);

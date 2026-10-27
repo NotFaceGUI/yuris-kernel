@@ -331,6 +331,21 @@ impl GfxState {
         self.asset_sizes.insert(key.to_vec(), size);
     }
 
+    /// `LOAD[ID]`:把图像作为资产挂到图层表面(存档缩略图恢复)。
+    ///
+    /// 像素由宿主写成内容哈希命名的合成资产(共享 overlay),渲染器经常规
+    /// 资产管线解码;尺寸同刻注入,`CGINFO[SX/SY]` 立即与官方一致。
+    /// 返回 `false` = 图层不存在(调用方言明未实现,不静默)。
+    pub fn set_layer_asset(&mut self, id: &LayerId, key: Vec<u8>, size: SizeU32) -> bool {
+        self.asset_sizes.insert(key.clone(), size);
+        let Some(node) = self.nodes.get_mut(id) else {
+            return false;
+        };
+        node.layer.texture = TextureRef::Asset(key);
+        node.layer.reset_status();
+        true
+    }
+
     /// 注入已安装字体族清单(见 [`Self::font_families`] 字段注释)。
     pub fn set_font_families(&mut self, families: Vec<Vec<u8>>) {
         self.font_families = families;
@@ -817,6 +832,18 @@ impl GfxState {
             ));
         };
         let layer = &node.layer;
+        if std::env::var_os("YU_CGINFO_TRACE").is_some()
+            && parsed.path.as_str_lossy().contains("LOADCONF")
+        {
+            let _ = (
+                &parsed,
+                flag,
+                layer.image_size(),
+                self.query_layer_size(layer, true),
+                self.query_layer_size(layer, false),
+                &layer.texture
+            );
+        }
         Ok(match flag {
             "E" => Value::Int(i64::from(layer.visible)),
             "A" => Value::Int(i64::from(layer.alpha)),
@@ -856,7 +883,19 @@ impl GfxState {
                         format!("CGINFO[{flag}] 需要纹理采样器(宿主未注入)"),
                     )
                 })?;
-                self.query_onmouse(layer, flag, set, set2, sampler)?
+                let out = self.query_onmouse(layer, flag, set, set2, sampler);
+                if std::env::var_os("YU_CGINFO_TRACE").is_some()
+                    && parsed.path.as_str_lossy().contains("LOADCONF")
+                {
+                    let _ = (
+                        &parsed,
+                        flag,
+                        set,
+                        set2,
+                        out.as_ref().map(|v| v.clone())
+                    );
+                }
+                out?
             }
             other => {
                 // COLOR/TEX/LINT 等无手册语义或未取证。
@@ -3285,10 +3324,16 @@ impl GfxState {
                     None
                 }
             } else {
-                match &n.layer.texture {
-                    TextureRef::None => None,
-                    texture => Some(texture.clone()),
-                }
+                // **配对层存在就成立**,哪怕它没有基图。
+                //
+                // `es_Sprite.yst:4608` 用 `CG[ID=$TR1 … FILE=""]` 建过渡 mask 层,
+                // 之后 `CGACT[ID=$TRBUF1 ID2=$TR1 SIZE=1 …]` 把图案做进它的
+                // **表面**;引擎的 `YS_Texture2` 取的就是这个表面
+                // (`FUN_00414ba4` 行 881-971)。旧实现把 `TextureRef::None` 判成
+                // "无配对",整条过渡 op 退化成普通层绘制 —— 立绘 `SP.TR(11)`
+                // 淡出于是完全没发生(2026-10-27 实机:立绘直接消失)。
+                // 像素由后端的 `to_layer` 解析(图像加工覆盖纹理),不在这里取。
+                Some(n.layer.texture.clone())
             }
         })
     }

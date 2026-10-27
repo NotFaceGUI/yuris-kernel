@@ -29,6 +29,7 @@
 
 pub mod error;
 pub mod host;
+pub mod image_block;
 pub mod state;
 
 pub use host::SaveHost;

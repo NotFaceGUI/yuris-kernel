@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use yu_backend_soft::RenderReport;
+use yu_render_core::RenderReport;
 use yu_platform_input::{key_button, wheel_button, PointerButton};
 
 use crate::args::ArgReader;
@@ -743,7 +743,7 @@ fn encode_frame(
     backend: u8,
     drawable: bool,
     paused: bool,
-    surface: &yu_backend_soft::Surface,
+    surface: &yu_render_core::Surface,
 ) -> Vec<u8> {
     const HEADER: usize = 56;
     let mut out = Vec::with_capacity(HEADER + surface.rgba.len());
@@ -1205,7 +1205,7 @@ fn open_browser(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yu_backend_soft::Surface;
+    use yu_render_core::Surface;
 
     #[test]
     fn frame_header_layout_is_stable() {

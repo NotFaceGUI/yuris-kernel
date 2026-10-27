@@ -4477,6 +4477,10 @@ struct SaveRecorder {
     flushes: Vec<String>,
     ends: u32,
     loads: Vec<(String, u32)>,
+    /// `SAVE[ID]` 的图像预约(命令时刻像素)。
+    images: Vec<(u32, yu_rt::event::CapturedImage)>,
+    /// `LOAD[ID]` 的图像读取请求。
+    image_loads: Vec<(String, u32)>,
     /// `Vm::emit` 同步喂入的 Save/File 事件与 flush 的**先后顺序**
     /// (FILEACT 必须先于同一帧的 SAVE[FILE] 刷盘)。
     order: Vec<String>,
@@ -4490,6 +4494,8 @@ impl SaveRecorder {
             flushes: Vec::new(),
             ends: 0,
             loads: Vec::new(),
+            images: Vec::new(),
+            image_loads: Vec::new(),
             order: Vec::new(),
         }))
     }
@@ -4548,6 +4554,138 @@ impl SaveHost for SharedHost {
         let reply = self.reply.borrow_mut().take();
         reply.ok_or_else(|| Diag::fatal("test", yu_log::Boundary::Domain))
     }
+    fn reserve_image(
+        &mut self,
+        dno: u32,
+        image: &yu_rt::event::CapturedImage,
+    ) -> Result<(), Diag> {
+        self.inner.borrow_mut().images.push((dno, image.clone()));
+        Ok(())
+    }
+    fn load_image(
+        &mut self,
+        file: &str,
+        dno: u32,
+    ) -> Result<yu_rt::event::CapturedImage, Diag> {
+        self.inner
+            .borrow_mut()
+            .image_loads
+            .push((file.to_string(), dno));
+        Ok(sample_image())
+    }
+}
+
+fn sample_image() -> yu_rt::event::CapturedImage {
+    // 2×1 RGBA:用来区分「取到像素」与「空层」。
+    yu_rt::event::CapturedImage {
+        width: 2,
+        height: 1,
+        rgba: vec![1, 2, 3, 255, 4, 5, 6, 255],
+    }
+}
+
+/// 图形宿主桩:记录 `SAVE[ID]` 抓帧与 `LOAD[ID]` 装回。
+struct PixelHost {
+    captured: std::rc::Rc<std::cell::RefCell<Vec<(Vec<u8>, yu_rt::event::CapturedImage)>>>,
+    restored: std::rc::Rc<std::cell::RefCell<Vec<(Vec<u8>, yu_rt::event::CapturedImage)>>>,
+}
+
+impl yu_rt::event::GraphicsHost for PixelHost {
+    fn apply_event(&mut self, _ev: &yu_rt::event::VmEvent) {}
+
+    fn query(
+        &mut self,
+        _command: &str,
+        _args: &[yu_rt::event::ArgValue],
+    ) -> Result<Value, Diag> {
+        Err(Diag::fatal("test", yu_log::Boundary::Domain))
+    }
+
+    fn capture_layer(
+        &mut self,
+        id: &[u8],
+    ) -> Result<Option<yu_rt::event::CapturedImage>, Diag> {
+        let image = sample_image();
+        self.captured
+            .borrow_mut()
+            .push((id.to_vec(), image.clone()));
+        Ok(Some(image))
+    }
+
+    fn restore_layer(
+        &mut self,
+        id: &[u8],
+        image: &yu_rt::event::CapturedImage,
+    ) -> Result<bool, Diag> {
+        self.restored
+            .borrow_mut()
+            .push((id.to_vec(), image.clone()));
+        Ok(true)
+    }
+}
+
+/// `SAVE[ID]` = 命令时刻图层像素 → 宿主图像预约;`LOAD[ID]` = 宿主读块 →
+/// 图形宿主装回图层。两条命令都不得再误报「未实现」。
+#[test]
+fn save_id_reserves_layer_image_and_load_id_restores_it() {
+    let mut b = ProjectBuilder::new();
+    let op_save = b.commands.iter().position(|(n, _)| *n == "SAVE").unwrap() as u8;
+    let op_saveend = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "SAVEEND")
+        .unwrap() as u8;
+    let op_load = b.commands.iter().position(|(n, _)| *n == "LOAD").unwrap() as u8;
+    let groups = vec![
+        // SAVE[DNO=3 ID="THUMB"]
+        GroupSpec::new(op_save)
+            .window(1, ex::i8_(3))
+            .window(3, ex::s("THUMB")),
+        // SAVE[FILE="lay"]
+        GroupSpec::new(op_save).window(0, ex::s("lay")),
+        // LOAD[FILE="lay" DNO=3 ID="THUMB"]
+        GroupSpec::new(op_load)
+            .window(0, ex::s("lay"))
+            .window(1, ex::i8_(3))
+            .window(3, ex::s("THUMB")),
+        GroupSpec::new(op_saveend),
+        GroupSpec::new(OP_END),
+    ];
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let recorder = SaveRecorder::new();
+    let reply = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let restored = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut vm = boot(b);
+    vm.set_save_host(Box::new(SharedHost {
+        inner: recorder.clone(),
+        reply,
+    }));
+    vm.set_graphics_host(Box::new(PixelHost {
+        captured: captured.clone(),
+        restored: restored.clone(),
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    // SAVE[ID]:抓帧 ID 原样交给宿主,像素进入图像预约。
+    assert_eq!(
+        captured.borrow().as_slice(),
+        &[("THUMB".to_string().into_bytes(), sample_image())]
+    );
+    let rec = recorder.borrow();
+    assert_eq!(rec.images, vec![(3, sample_image())]);
+    assert_eq!(rec.flushes, vec!["lay.sd".to_string()]);
+    // LOAD[ID]:读块 → 装回同名图层。
+    assert_eq!(rec.image_loads, vec![("lay.sd".to_string(), 3)]);
+    assert_eq!(
+        restored.borrow().as_slice(),
+        &[("THUMB".to_string().into_bytes(), sample_image())]
+    );
+    assert_eq!(rec.ends, 1);
 }
 
 fn int_snap(vals: &[i64], dims: &[u32]) -> VarSnapshot {

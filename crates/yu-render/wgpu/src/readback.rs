@@ -21,7 +21,7 @@
 
 use std::sync::mpsc;
 
-use yu_backend_soft::Surface;
+use yu_render_core::Surface;
 use yu_log::{Boundary, Diag};
 
 use crate::device::{code, GpuContext};
@@ -236,4 +236,83 @@ mod tests {
             assert_eq!(padded, expected_padded);
         }
     }
+}
+
+/// 取证用:把一张 GPU 纹理读成 RGBA8(同步,`YU_TRANS_DUMP` 专用)。
+///
+/// 只在环境变量开启时由转场规划调用;不做缓存、不管行尾填充之外的优化。
+pub fn dump_texture(
+    ctx: &GpuContext,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, Diag> {
+    let (padded_row, size) = {
+        let unpadded = u64::from(width) * 4;
+        let align = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let padded = unpadded.div_ceil(align) * align;
+        (padded, padded * u64::from(height))
+    };
+    let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("yu-backend-wgpu dump"),
+        size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dump") });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(u32::try_from(padded_row).unwrap_or(u32::MAX)),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    ctx.queue.submit(Some(encoder.finish()));
+    let slice = buffer.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|err| {
+            Diag::fatal(code::READBACK, Boundary::Platform)
+                .with_detail(format!("dump 等待失败: {err}"))
+        })?;
+    receiver
+        .recv()
+        .map_err(|_| {
+            Diag::fatal(code::READBACK, Boundary::Platform).with_detail("dump 映射回调丢失")
+        })?
+        .map_err(|err| {
+            Diag::fatal(code::READBACK, Boundary::Platform).with_detail(format!("dump 映射失败: {err}"))
+        })?;
+    let mapped = slice.get_mapped_range().map_err(|err| {
+        Diag::fatal(code::READBACK, Boundary::Platform).with_detail(format!("dump 范围无效: {err}"))
+    })?;
+    let unpadded = (u64::from(width) * 4) as usize;
+    let mut rgba = Vec::with_capacity(unpadded * height as usize);
+    for row in 0..height as usize {
+        let start = row * padded_row as usize;
+        rgba.extend_from_slice(&mapped[start..start + unpadded]);
+    }
+    drop(mapped);
+    buffer.unmap();
+    Ok(rgba)
 }

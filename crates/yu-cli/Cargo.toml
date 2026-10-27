@@ -33,6 +33,7 @@ log = "0.4"
 time = { version = "0.3", features = ["local-offset"] }
 wgpu = "30.0.1"
 yu-backend-soft = { path = "../yu-render/soft" }
+yu-render-core = { path = "../yu-render/core" }
 yu-backend-wgpu = { path = "../yu-render/wgpu" }
 yu-engine = { path = "../yu-engine" }
 yu-gfx = { path = "../yu-gfx" }

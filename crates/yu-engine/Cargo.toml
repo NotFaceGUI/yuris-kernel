@@ -15,6 +15,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 wgpu = "30.0.1"
 yu-backend-soft = { path = "../yu-render/soft" }
+yu-render-core = { path = "../yu-render/core" }
 yu-backend-wgpu = { path = "../yu-render/wgpu" }
 yu-gfx = { path = "../yu-gfx" }
 yu-log = { path = "../yu-log" }

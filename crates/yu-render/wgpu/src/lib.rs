@@ -37,7 +37,7 @@
 //! # 模块
 //!
 //! - [`device`]:instance/adapter/device 与 `platform.gpu.*` 诊断码;
-//! - [`textures`]:`yu_backend_soft::TextureStore` 字节 → GPU 上传/目标缓存;
+//! - [`textures`]:`yu_render_core::TextureStore` 字节 → GPU 上传/目标缓存;
 //! - [`pipelines`]:blend 0/1/2 × `Rgba8Unorm` 管线与 bind group 缓存;
 //! - [`passes`]:pass 顺序、纹理解析、计数与顶点生成;
 //! - [`readback`]:GPU 纹理 → 256 字节行对齐缓冲 → 紧凑 RGBA8。
@@ -46,7 +46,7 @@
 //!
 //! ```no_run
 //! # use yu_backend_wgpu::WgpuRenderer;
-//! # use yu_backend_soft::TextureStore;
+//! # use yu_render_core::TextureStore;
 //! # use yu_gfx::CompositorFrame;
 //! # use yu_vfs::{Codec, Mount};
 //! # fn demo(frame: &CompositorFrame, mount: Mount) {
@@ -80,7 +80,7 @@ pub use device::{AdapterSummary, DeviceOptions, GpuContext};
 pub use readback::ReadbackCache;
 pub use textures::{GpuTexture, RenderTarget, TextureCache};
 
-pub use yu_backend_soft::{AssetIssue, RenderReport, SkippedOp, Surface, TextureStore};
+pub use yu_render_core::{AssetIssue, RenderReport, SkippedOp, Surface, TextureStore};
 
 use std::sync::Arc;
 
@@ -184,18 +184,18 @@ pub struct WgpuRenderer {
     /// 内容未变时复用 GPU 纹理,避免逐帧重传(600 帧验收)。
     uploaded_overrides: std::collections::BTreeMap<yu_gfx::LayerId, (u64, u32, u32, u64)>,
     /// `CGACT[SIZE/SIZE2]` 结果缓存(与 soft 同一键/算法;EVID-J3-04)。
-    image_cache: std::collections::BTreeMap<yu_backend_soft::ImageCacheKey, passes::Override>,
+    image_cache: std::collections::BTreeMap<yu_render_core::ImageCacheKey, passes::Override>,
     /// 合成链记忆化:层 id → (输入指纹, 上一帧的合成结果)。
     composite_cache: std::collections::BTreeMap<
         yu_gfx::LayerId,
-        (u64, std::rc::Rc<yu_backend_soft::Texture>),
+        (u64, std::rc::Rc<yu_render_core::Texture>),
     >,
     /// 上一帧呈现内容(`COPY ID=:/W0/` 读后缓冲;EVID-J3-06)。
     backbuffer: Option<Arc<Surface>>,
     /// 后缓冲 GPU 纹理缓存:`(content_hash, gpu_id)`。
     backbuffer_gpu: Option<(u64, u64)>,
     /// 文本栅格化/合成器(与 soft 同一实现;懒加载系统字体)。
-    text: yu_backend_soft::TextComposer,
+    text: yu_render_core::TextComposer,
 }
 
 impl WgpuRenderer {
@@ -226,18 +226,18 @@ impl WgpuRenderer {
             composite_cache: std::collections::BTreeMap::new(),
             backbuffer: None,
             backbuffer_gpu: None,
-            text: yu_backend_soft::TextComposer::new(),
+            text: yu_render_core::TextComposer::new(),
         })
     }
 
     /// 用调用方字体源构造文本合成器(测试/自带字体)。
     pub fn with_text_source(mut self, source: yu_font::FontSource) -> Self {
-        self.text = yu_backend_soft::TextComposer::with_source(source);
+        self.text = yu_render_core::TextComposer::with_source(source);
         self
     }
 
     /// 文本合成器(诊断/测试用)。
-    pub fn text_composer(&mut self) -> &mut yu_backend_soft::TextComposer {
+    pub fn text_composer(&mut self) -> &mut yu_render_core::TextComposer {
         &mut self.text
     }
 

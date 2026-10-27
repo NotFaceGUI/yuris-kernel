@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use yu_backend_soft::png;
+use yu_render_core::png;
 use yu_cli::args::ArgReader;
 use yu_cli::engine::{Backend, Engine, EngineOptions};
 use yu_cli::project::Project;
