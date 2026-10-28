@@ -40,17 +40,35 @@
    引擎侧的混合公式未反出。
 4. **`MERGE`/`MERGE2` 的 alpha 公式**:目前依据手册文字(`MERGE` 按
    上层 alpha 插值,`MERGE2` 直接覆盖)。缺 REA 级验证。
-   - **2026-10-28 新增待取证点(表面已被同帧清空时的 alpha)**:ERIS 立绘换
-     差分的命令序是 `COPY2 → RECTPAINT3 SET=0 → MERGE`(`es_SPExec.yst`)。
-     官方在同一表面**就地**执行(`FUN_0042f809`:`*(iVar4+0x90) = local_68`),
-     清空后再 MERGE 的结果在实机上必然可见 ⇒ 官方这次绘制**必然写了 alpha**,
-     与「`MERGE` 保留目标 alpha」矛盾。缺直接 REA 证据,故不猜。
-     - 现状:GPU 快照合成路径在该形态下回退 CPU(基面 = `snapshot_pixels()`
-       的 COPY 时刻冻结像素,与回归前一致);未清空/未改写的快照仍走 GPU。
-       见 `PROGRESS.md` 成果 `SPRITE-FLASH-GPU-MERGE` 与门禁
-       `merge_after_rectpaint_clear_on_snapshot_keeps_pixels`。
-     - 待办:补 REA(`FUN_004405a4` 调用点的 `SetRenderState` 混合状态 +
-       目标表面 alpha 变化),再定 `MERGE` 是否应写 alpha。
+   - **2026-10-28 收口(REA 证据)**:官方合并执行体 `FUN_004405a4`
+     (0.495 `yu-ris.exe`,sha256 `4f5eefa3…81138f`,Ghidra 12.1.4)的合并
+     分支(`DAT_00684174` / `DAT_00684175` 两块图层表)是:
+     ```text
+     list[i].ptr = layer[upper]->+0x38[i]      // 上层的每部件纹理
+     list[i].val = layer[lower]->+0x34[i]      // 下层的每部件位置
+     for each: dev->Draw(ptr, val, ratio*0.06, 0)   // 画到当前渲染目标
+     ```
+     `dev` = `[iVar9+0x61c]`,渲染目标由命令处理器在此前选定(即**下层
+     表面**)。⇒ **`MERGE` 只把上层“画”进下层表面,不读下层的旧像素**;
+     不透明度由 D3D9 固定管线的混合状态给出。D3D9 未启用
+     `SEPARATEALPHABLENDENABLE` ⇒ alpha 与 RGB 同因子,即
+     `a' = a² + lower_a·(1−a)`(与 `quad.wgsl` 的 Normal 同式)。
+   - 由此解释并修掉实机问题:立绘换差分的命令序
+     `COPY2 → RECTPAINT3 SET=0 → MERGE`,清空后下层 alpha=0,但 MERGE 的
+     alpha 是**写回**的(不是保留旧值)⇒ 结果 alpha = 上层 alpha,
+     整层可见。旧实现「MERGE 保留目标 alpha」会让整层 alpha=0,经 SRCALPHA
+     混合整层不可见 —— 实机症状正是眨眼/换差分闪屏(**skipped=0、RGB 正常,
+     只有 alpha 全零**)。
+   - 实现:wgpu `merge.wgsl` 的 `out.a = (a·a + la·(255−a) + 127)/255`;
+     soft `apply_merge(…, false)` 同一整数式。两后端仍逐位一致。
+   - 门禁:`merge_after_rectpaint_clear_on_snapshot_writes_alpha`(跨后端
+     一致 + 清空后仍可见)、soft 单测
+     `merge_writes_alpha_so_cleared_target_stays_visible` /
+     `merge_alpha_uses_same_factor_blend`。
+   - 残留:`MERGE2` 的 `/ao` 归一化仍按手册 + 既有实现(语料未在快照清空
+     形态下用到);`ratio*0.06` 的每部件缩放因子语义未取证(与本内核
+     X/Y=0 的用法无关)。
+
 5. **`RESIZE` 的缩放滤波**:`SIZE` 族用最近邻/双线性区分,`RESIZE` 走
    双线性;官方是否另有滤波选择未取证。
 

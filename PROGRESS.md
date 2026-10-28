@@ -54,6 +54,138 @@ yu-trace: vfs/vm/frame 边界录制、回放、跨 producer diff
   (`yu-vfs` 取字节 + `frame.image_probe_order` + image 解码 + 缓存)。
 - 文字链路: `yu-font` 已独立完成,尚未桥接进 `yu-gfx`/后端(DIV-GFX-012)。
 
+## 成果 SURFACE-RESIDENT (2026-10-28) · wgpu 帧契约改常驻图层表面(不再逐 op 重放)
+
+### 目标与证据
+
+官方 `CGACT` 在命令处理器内**就地**改目标表面(`FUN_0042f809` 尾部
+`*(iVar4+0x90) = local_68`,`crates/yu-gfx/src/state.rs:3440`);`COPY` 直接
+读写纹理(`DIV-GFX-051`);存档直接读层表面(`0x4477c0`,
+`crates/yu-gfx/src/host.rs:37`)。旧 wgpu 每帧重放整条命令日志并在 CPU 上
+重新合成覆盖纹理(实测 `<game-b>` 1200 帧:image p95 15–35ms、上传平均
+8.8MB/帧/重帧 115MB、快照整帧拷贝 2×35MB)。
+
+### 改动(全部在本轮未提交工作区)
+
+1. **`yu-render/wgpu/src/surfaces.rs`(新)**:`LayerSurfaces` 常驻表面表
+   (`Content{tex,uv,width,height,display,bilinear,hash}`)+ 纹理池 + 预算/剪枝
+   + `SurfaceStats`。大表面(>4MB)不入池;池上限 64MB。
+2. **`yu-render/wgpu/src/plan.rs`(新)**:按 `Op.seq` 命令序就地应用。
+   新增着色器 `composite.wgsl`(MERGE2/XOR/AND)、`transform.wgsl`
+   (REVERSE/镜像/MEIDO/SAIDO/AKARUSA/MONO/SEPIA/MOSAIC/ROTATION)、
+   `resample.wgsl`(`scale_region` 的 GPU 等价)。`MERGE` 仍用已验证的
+   `merge.wgsl`。
+3. **操作前缀复用**:每层 `(seq, 签名)` 前缀;签名含各源**当前内容身份**,
+   自引用用基面身份。日志被折叠/`CG[FILE]` 重建 ⇒ 回基面重放。
+4. **快照三态**:整幅+未采样 ⇒ 别名源内容句柄(零拷贝);否则区域拷贝;
+   CPU 像素按需读回(存档抓帧)。
+5. **文本进层表面**:`CGACT[TEXT]`/`TextRun` 以「修订号+内容签名+基面身份」
+   为键合成一次、上传一次;`raw`(文本前像素)单独保存,供冻结文本 COPY。
+6. **`yu-engine/src/capture.rs`**:删每帧 CPU 镜像预捕获与整帧软回放
+   (`SNAPSHOT_READBACK_CAP`、`GfxCapture.mirrors` 的预捕获语义);改为
+   `observe` 只登记新 `CopyId`、宿主渲染后按需读回这一张。`SAVE/LOAD`
+   仍走合成资产叠层。
+7. **`RenderPhases`** 新字段:`surface_passes/blits/alias_hits/reused_layers/
+   materialized/cpu_fallbacks/upload_asset_bytes`(帧 CSV 46 列;`RenderReport`
+   语义未改)。spike 行同步补 `surfaces/blits/alias/reused/materialized/cpu_fb`。
+8. 旧路径删除:`Override`(Cpu/Gpu/Uv)、`apply_image_to_override`、
+   `capture_copy_mirror`、`TextureCache::rewrite`、cpu 覆盖上传、合成记忆化。
+   wgpu crate 零新增告警(`param_names`/`coerce_param` 为 yu-rt 既有)。
+
+### 实机回归(本轮修复,均有对拍用例)
+
+- **按钮栏全部同一段文字**:基面缓存只按图层 id 做键 ⇒ 同一模板层一帧内
+  15 次 `CG[FILE]+COPY2` 全部命中第一次的纹理。修:键加纹理引用身份。
+- **`CG[FILE]` 后旧表面仍被读取**:基面身份只在写路径核对。修:帧首/源层/
+  COPY 源都核对;源层已 `CGEND` 删除时按命令时刻纹理重放。
+- **区域复制越界 / 过渡被跳过**:旧内容尺寸与新纹理不符导致
+  `Copy of X 198..264 overrunning Source texture of X size 200`;跨帧常驻的
+  过渡 mask 不在逐帧 views 表 ⇒ `transition.mask_missing`。修:`push_blit`
+  规划期校验;`transition_source` 直接带出 `TextureView`。
+
+### 数据(`<game-b>` v494,1200 帧,桌面 wgpu,`--no-sound`,本机同口径)
+
+```text
+口径                     改前        改后
+render p95               24.5ms      2.10–3.30ms
+plan p95                 22.2ms      0.30–1.91ms
+work p95                 49.6ms      7.27ms(轻场景)/23.5ms(含美术首次解码帧)
+fps                      38.5        50.4–57.6
+上传(合成,不含解码)     平均8.6MB   平均 0.01–0.05MB / 单帧 ≤3.63MB
+上传(含资产首次解码)     平均8.9MB   平均 0.02–0.32MB / 单帧 ≤54MB(解码帧)
+copy_bytes               重帧 79MB   单帧 ≤8.00MB(p95 = 0)
+GPU 目标字节             127MB       4–217MB(池上限 64MB;大表面不复用)
+surface_passes/帧        每 op 重放  平均 1.5–1.6(前缀复用 17.5 层/帧)
+```
+
+`<project-eris>` 3000 帧(`YURIS_CASE_BENCH=1 case perf-eris`):
+
+```text
+          改前(本机)   改后
+tick p50  5.79ms       4.22ms
+tick p95  8.35ms       5.68ms
+启动帧    438ms        278ms
+```
+
+资产首次解码尖峰(18–54MB / 5–30ms)两版都在(改前同场景 71MB/38ms);
+`upload_asset_bytes` 把“加载新美术”与“每帧渲染上传”分开记账。
+
+### 验证命令与原始结果
+
+```text
+$ cargo build --workspace --all-targets                        OK(仅 yu-rt 既有 2 警告)
+$ cargo test -p yu-backend-wgpu
+  25 passed(逐像素对拍)+ 10 passed(surfaces 契约)+ 9 passed(单测)
+  + 1 passed(wgsl_check:naga 解析三支新着色器)
+$ cargo test --workspace --no-fail-fast
+  59 suite 全绿;唯一失败 yu-trace --test golden(YSCom.ycd sha,既有红灯)
+$ cargo test -p yu-cli --test logging_guards                   OK
+$ YURIS_CASE_BENCH=1 yu-cli case <project-eris> --case perf-eris
+  [casebench] frames=3000 p50=4.22 p95=5.68 p99=6.74 max=278.20
+$ yu-cli case <project-eris> --all
+  1 passed / 8 failed —— 与 pristine HEAD(未改动导出构建)对比:HEAD 为
+  0 passed / 9 failed,失败集合相同(display JSON golden 与本机字体族相关,
+  既有红灯);本改动额外使 save-load-loop 的 PNG 与 save-title-flow 通过。
+$ yu-cli run <game-b> --mode desktop --frames 2500 --no-sound --script perf-vm-bench.json
+  exit=0 · 2265 帧 · avg 52.3fps · gpu targets 26MB 稳定 · uncaptured error 0
+```
+
+### 追加(同日):`MERGE` 写 alpha —— 眨眼/换差分闪屏的 REA 收口
+
+先按实机症状加过一版「快照目标取冻结像素」的特例;主人指出这是打补丁,
+遂回到官方二进制取证。REA 0.495(Ghidra 12.1.4,`FUN_004405a4`
+= `0x4405a4`)的合并分支结构是:
+
+```text
+list[i].ptr = layer[upper]->+0x38[i]     // 上层的每部件纹理
+list[i].val = layer[lower]->+0x34[i]     // 下层的每部件位置
+for each: dev->Draw(ptr, val, ratio*0.06, 0)   // 画到当前渲染目标(下层表面)
+```
+
+⇒ 官方 **不读下层旧像素**,只把上层画进下层表面;不透明度由 D3D9 固定
+管线混合给出,未启用独立 alpha 混合 ⇒ `a' = a² + la·(1−a)`,即 **MERGE
+会写 alpha**。这同时解释了为什么 `COPY2 → RECTPAINT3 SET=0 → MERGE`
+清空后立绘仍可见,以及旧实现(保留目标 alpha)为什么闪屏。
+
+改动:删掉「冻结像素」特例(wgpu/soft 都恢复“下层 = 当前表面”),把 alpha
+改成同因子混合写回(`merge.wgsl` / soft `apply_merge`)。门禁改为
+`merge_after_rectpaint_clear_on_snapshot_writes_alpha`(跨后端一致 +
+清空后 RGB≈纯红、不黑)+ soft 两条 alpha 单测。
+
+回归:`cargo test -p yu-backend-wgpu -p yu-backend-soft` 全绿
+(soft lib 41 条含新锚点);`<game-b>` 2500 帧双后端对拍计数/跳过差异 0。
+
+### 未做 / 已知残留
+
+- `SIZE*` 的 UV 采样与 soft `scale_region` 在硬边缘差 >1(标题 logo f20
+  max 194;平场/文字帧 0)——既有采样模型分歧,详见 DIV-GFX-066 §3.2。
+- `BLUR*/DIFFUSION/WHIRLPOOL/RASTER*` 无 GPU shader:显式跳过并计数
+  (`gpu.imageop.unsupported.*`),两份语料未出现。
+- `TRIM` 读回一次求 alpha 包围盒(`cpu_fallbacks` 计数)。
+- `YURIS_LEGACY_FRAME_REPLAY` 回退开关未保留:旧实现与“每帧 CPU 镜像”
+  在同一改动里删除(保留死代码会与 W8 冲突);旧文件留
+  `target/tmp/passes.orig.rs`(仅本地)。
+
 ## 成果 1 (2026-10-19) · 仓库脚手架
 
 - 内容: 12 个子系统 crate 骨架 + oracle 方法论(docs/oracle.md)+ 不一致档案制度
