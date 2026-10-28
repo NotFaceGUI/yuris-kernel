@@ -4510,6 +4510,9 @@ impl Vm {
     }
 
     /// 工程 `ysc.ybn` 的参数名表(槽号 → 名字)。
+    ///
+    /// 诊断/工具入口(解释器热路径已改走 `Cmd::param_names` 缓存)。
+    #[allow(dead_code)]
     fn param_names(&self, opcode: u8) -> Vec<String> {
         self.tables()
             .boot
@@ -5052,6 +5055,8 @@ fn has_image_extension(key: &[u8]) -> bool {
     }
 }
 
+/// 按参数名前缀做类型归一化(旧路径;热路径改用 `ParamTy::coerce`)。
+#[allow(dead_code)]
 fn coerce_param(name: &str, v: Value) -> Value {
     if name.starts_with("PFLT") || name.starts_with("RFLT") {
         Value::Float(v.as_f64().unwrap_or(0.0))
