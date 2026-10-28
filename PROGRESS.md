@@ -9698,6 +9698,14 @@ work p50=4.43 p95=10.82 p99=26.00;>25ms 30 帧(1.2%)
 tick 线程(`TOTALTIME` 改用 OGG granule/WAV 头算,播放等 PCM 就绪),属**语义分歧**,
 需先定口径再动手;当前代码与官方一致,未擅自改。
 
+> **勘误(2026-10-28,REA 逐行复核)**:上段「官方同型 = 同步整段解码」**不成立**。
+> 0.495 `0x422ab0` 只做 `ov_open` + `ov_time_total`(`FUN_004806c5` ×1000 →
+> `+0x120`),**没有 `ov_read`/整段解码**;它尾部调用的 `0x422c65` 只写格式字段并
+> `malloc(bytes_per_sec/2 + 0x1000)` 后 `CreateSoundBuffer`(**0.5 秒 DirectSound 环**)。
+> 93ms 是**本内核整段 `Vec<i16>` 解码**的实现偏差,不是官方行为。已按官方架构
+> 重构为流式(见下一条成果);`TOTALTIME` 改为 `ov_time_total` 同口径(最后 page
+> granule),不再需要「异步等待 PCM」这类语义分歧。
+
 ## 成果 PERF-READBACK-ASYNC (2026-10-28) · 屏幕读回不再每帧等 GPU
 
 ### 症状与定位
@@ -9752,3 +9760,230 @@ render max  181.5ms     63.1ms
 后缓冲 —— 不存在「每帧重新合成 + 整张上传 + 整面拷贝」。我们每帧重放 op 流并用 CPU
 重新合成,才是真正的瓶颈;要收口需把图层表面做成常驻 GPU 纹理、CGACT 链变成对该纹理
 的 GPU pass,快照改成纹理句柄而不是整面复制。这是渲染契约级改动,待主人确认后再动。
+
+## 成果 PERF-SOUND-STREAM (2026-10-28) · 声音装载改为官方流式架构,93ms BGM 解码离开 tick
+
+### 定位与勘误(先纠正前一条成果的错误结论)
+
+前一条成果把场景进入的 ~95ms 归因为「官方同型 = SOUND 命令内同步整段解码」。
+2026-10-28 用 REA 对 0.495 `yu-ris.exe`(sha256 `4f5eefa3…`)逐行复核:
+
+- `0x422ab0`(OGG 装载)只做 `FUN_0047f9a2`(ov_open 族)→ `FUN_00480654` →
+  `FUN_0048064c` → `FUN_004815c8` → `FUN_004806c5`(**`ov_time_total`**,
+  返回秒 ×1000 写 `+0x120/+0x134`),**没有任何 `ov_read` 或整段解码**;
+- 它尾部调的 `0x422c65` 只写格式字段(`+0x1ba/+0x1bc/+0x1c6`,`+0x1b4/+0x198`
+  = `channels*rate` 字节/秒),随后 `malloc(0x1000)` + `malloc(bytes_per_sec/2 + 0x1000)`
+  并 `CreateSoundBuffer` —— **0.5 秒 DirectSound 环形缓冲**,解码是播放期按需填充。
+
+所以 93ms 是**本内核整段 `Vec<i16>` 解码**的实现偏差,不是官方行为;也不需要
+「异步解码/等 PCM 就绪」这类语义分歧。
+
+### 改法
+
+- 新增 `crates/yu-sound/src/meta.rs`:容器头部探测。OGG 读 ident header +
+  首个逻辑流最后一个 page 的 granule;WAVE 读 `fmt `/`data`。`TOTALTIME`
+  与 `ov_time_total` 同口径,装载 O(1)。
+- 新增 `crates/yu-sound/src/stream.rs`:官方同构的流式音源。
+  - OGG 装载只 `OggStreamReader::new`(3 个 header packet),不碰音频;
+    `sample()`/`prefetch()` 按需 `read_dec_packet_itl`,窗口 0.5s(`LEAD_MS`,
+    对齐官方环大小);`request_seek` 懒定位(PLAY/START/RESTART/循环回绕);
+  - WAVE PCM / ACM 保持整段样本(官方 mmio 直读 / 一次 ACM 转换,
+    REA `0x422e04`),逐样本与旧路径一致;语料仅 1 个 WAV(445KB)。
+- `Layer.pcm: Option<Arc<Pcm>>` → `stream: RefCell<Option<Box<Stream>>>`;
+  `mixer::render` 从窗口取样本(正常播放时 tick 已预取,回调只拷贝);
+  `SOUNDINFO[DATALEFT/DATARIGHT]` 改为在播放光标按需取帧(官方 Lock 一帧同构)。
+- 删除整段 PCM 缓存对 OGG 的使用(官方不缓存整段);WAVE/ACM 仍缓存 `Arc`。
+- 帧账单新增 `sound_decode_ms`(tick 线程:装载头部+预取+查询按需取帧)、
+  `sound_stream_ms`(含音频回调兜底)、`sound_stream_frames`、
+  `sound_underruns`、`sound_seeks`、`sound_slow_seeks`;spike 行同步输出。
+  解码错误经 `drain_stream_errors` 回到 `Diag` 并按装载失败同型停层。
+
+### 证据
+
+- REA `procedure_pseudo_code 0x422ab0 / 0x422c65 / 0x4806c5`(Ghidra 12.1.4,
+  同哈希 `4f5eefa3…`);`0x4806c5` 的 `pcmlengths[i*2+1]/rate` 形状即
+  vorbisfile `ov_time_total`。
+- 语料审计 `cargo run --release -p yu-engine --example audio_duration_audit -- <root>`:
+  `<game-b>` 6966 个音频(6965 OGG + 1 WAV)`header_drift=98`
+  (BGM 3 / SE 34 / voice 61,`max_drift_ms=36`);`<project-eris>` 8 个 OGG 漂移 0。
+  granule 与 lewton 末包裁剪的差异**以官方 granule 为准**:播放样本按总长截断、
+  不足补静音,`TIME/END/LOOP` 自洽;这 98 个文件的 `TOTALTIME` 相比旧内核
+  变化 ≤36ms(旧值来自 lewton 未按 granule 裁剪的帧数,不是官方值)。
+- 单测:`gated_ogg_load_reads_header_only_then_streams_on_play`(装载零解码、
+  `TOTALTIME` 来自 granule、重复 SOUND 仍零解码)、
+  `gated_ogg_stream_render_matches_full_decode`(流式混音逐样本 == 整段
+  `decode()`,含 `START=5000ms` 定位)、
+  `gated_ogg_loop_wrap_back_to_zero_reopens_stream`(循环回绕必须重开 reader;
+  修复前会把「窗口空且在末尾」误判为「reader 在 0」并欠载)、
+  `wav_load_plays_immediately_and_keeps_totaltime`;`cargo test -p yu-sound`
+  6 lib + 45 集成全绿。
+
+### 结果(桌面 wgpu,`--no-sound`,同脚本同口径)
+
+`<game-b>` 1200 帧:
+
+```text
+            改前(整段解码)      改后(流式,v4)
+tick p50    3.03ms              1.88ms
+tick p95    5.28ms              4.39ms
+tick p99    29.48ms             6.53ms
+tick max    295.06ms            226.44ms   ← f78 纯 VM 场景构建,非解码
+render max  176.95ms            12.97ms
+work p95    9.24ms              6.75ms
+fps(稳态)   54.9                58.9
+sound tick 解码 max  —          1.23ms(装载+0.5s 预取/定位)
+```
+
+解码主项的场景帧:f240 **238.0ms → 35.0ms**、f579 **295.1ms → 2.0ms**;
+f78 是脚本场景构建(改前 255ms/改后 226ms,均无声音解码参与)。
+
+`<project-eris>` 3000 帧:
+
+```text
+            改前      改后(v4)
+tick p50    3.40ms    2.34ms
+tick p95    5.15ms    3.54ms
+tick p99    18.14ms   4.59ms
+tick max    261.01ms  249.57ms(启动帧 f4;解码贡献 0)
+f215        170.1ms   38.4ms   ← 场景进入(余量为 VM 脚本)
+fps         59.9      59.9
+```
+
+启动帧 f4 的 6 次交替采样(head vs 本改动):中位数 256 vs 270、276 vs 265
+(两次会话方向相反),声音解码贡献恒 0 —— 差异是脚本场景构建/机器负载噪声。
+
+桌面 2500 帧(带 cpal 出声):exit 0、`fatal=None`、无 wgpu 验证错误;
+`sound_decode_ms` max 1.56ms、`underruns=0`、`seeks=4`(循环回绕重开 reader)、
+`slow_seeks=0`,首次非静音块正常(`[sound] first non-silent block`)。
+
+### 其它编码路径(量化后不动)
+
+- 纹理解码(`decode_ms`):p99 ≤1.0ms;<game-b> 最坏 10.7–13.7ms/4.1MB 在
+  **render plan**(CG 切换首帧),不在 tick;渲染契约由另一条线改常驻表面,
+  本任务不碰。
+- 字形烘焙(`text_bake_ms`):p99 0,最大 5.14ms(<8ms)。
+- 存档缩略图 PNG:`LOAD[ID]` 100×75 编码 69–75µs(`YURIS_CAPTION_TIMING=1`
+  时 debug 行);SAVE 图像块本身是原始 RGBA(非 PNG),无需改。
+- 「同文件重复 SOUND 的解码次数」:OGG 装载**恒 0 次整段解码**;
+  `full_decodes` 只统计 WAVE/ACM 整段装载(本语料 0)。
+
+### 门禁
+
+- `cargo build --workspace --all-targets` 通过。
+- `cargo test -p yu-sound`(6+45)、`-p yu-engine`(14)、`-p yu-rt`(86/4/11/4/98/3;语料测试需 `YURIS_SAMPLE_ERIS_YSBIN`,未设时 4 条显式失败)、
+  `-p yu-backend-wgpu`(9/10/25)、`-p yu-backend-soft`(41/15/1/1)、
+  `-p yu-cli --test logging_guards`(3)全部通过。
+- `yu-cli case <project-eris> --all`:**既有红灯**,与本改动无关。
+  `git archive HEAD` 重建的纯净二进制同样 0 passed / 9 failed,且 first-screen
+  的 actual display sha 与本次构建逐字节相同(`f2d2fb…`);当前工作区另有
+  `save-title-flow` 因存档目录状态偶发通过。用例期望值自 2026-10-26 未随最新
+  gfx 改动重生成,待另一条线统一 `--update`。
+- `cargo test -p yu-trace --test golden`:已知红灯(YSCom.ycd sha),同前。
+
+### 已知限制(留档)
+
+- 大 `START/RESTART`/循环回绕的懒定位是「重开 reader + 解码到目标帧」;
+  语料均为 0 或小值(2500 帧带声运行 `seeks=4 slow_seeks=0`,单次 <2ms),
+  若以后出现分钟级 START,需要改用 `seek_absgp_pg`(lewton 支持,页粒度)
+  再做帧内丢弃。
+- 窗口 0.5s 由 VM tick 预取;若游戏线程被外部阻塞 >0.5s,音频回调会按需解码
+  (lewton 每 packet 一次小分配)。官方由独立声音线程填充环,本内核回调兜底,
+  已用 `sound_stream_ms`/`underruns` 分开记账。
+
+## 补充 PERF-STORY-SPIKE (2026-10-28) · 推进剧情/角色出场/差分高峰归因
+
+### 复现
+
+桌面 wgpu,`<game-b>`,脚本逐 5 帧点击 START/对话区(`target/tmp/story-robust2.json`),
+`--no-sound --frame-stats --spike-log --spike-ms 20`。命中角色出场的帧:
+
+```text
+f1796  tick=44.7  render=131.8  plan=130.5  image=42.3  text=87.4
+       text_cpu=86.4  text_bake=0.8  decode_bytes=71,416,512  upload_bytes=71,991,360
+       text_draws=105 glyphs=110 layers/visible≈800/620
+f1811  tick=39.6  render=31.3  image=26.4  decode≈24.6ms(35.7MB) upload=36.3MB text_cpu=0.9
+f1846  tick=43.8  render=36.6  image=30.8  decode≈28.7ms(35.7MB) upload=36.3MB text_cpu=0.9
+f1981  tick=36.4  render=29.2  image=24.6  decode≈21.9ms(53.6MB) upload=54.1MB text_cpu=1.0
+```
+
+### 归因(三类,互不混淆)
+
+1. **渲染:新资产首帧解码 + 整张上传**
+   `decode` 19–35ms、`upload_bytes` 18–72MB/帧;差分帧的 `image_ms` 基本就是
+   `decode_ms`(`MERGE`/`TRANSITION` op 计数为 0)。这是 `TextureStore` 首次
+   解析 PNG→RGBA 与 wgpu 首次上传的固有成本,缓存命中后为 0。
+2. **渲染:文本层整张基面拿到 CPU(`content_cpu`)**
+   角色出场帧 `text=87.4ms`,其中 **`text_cpu=86.4ms`**(新探针),而
+   `bake/paint/hash/base` 合计 <1ms。`apply_text` 对每个文本目标层调用
+   `content_cpu`(`crates/yu-render/wgpu/src/plan.rs:1593/1714`):
+   - 层内容不在 `contents` 且纹理是资产 ⇒ `textures.resolve(key).cloned()`
+     **整张 RGBA 拷贝**;
+   - 否则 `read_back`(`read_texture`,**同步 GPU 读回**)。
+   后续用 `--fixed-step` + 分段计数复现:`tcpu_rb=69.2ms / 2 次`,
+   `tcpu_asset=0` —— **2 次全屏同步 GPU 读回**(约 35ms/次),不是 105 层
+   逐层拷贝。每次读回的主要时间是在等同一帧的 72MB 上传/绘制队列
+   (`read_texture` 的 `poll(wait_indefinitely)`)。这是「常驻图层表面 +
+   GPU 文本合成」要收口的路径(另一条线),不是日志、也不是声音。
+3. **tick:游戏脚本自身的场景/差分构建**
+   `--profile-frames` 同帧采样:LET 24–29ms(105k–120k 次,0.21–0.24µs/次)、
+   IF 4–9ms(12k–24k)、CG 1.1–1.6ms(700–1267 次)、CGACT/CGINFO;
+   某一帧 `CGINFO` 85 次 × 49µs = 4.2ms(按层表查询,可缓存)。
+   这是脚本执行量,不是解码;声音在本场景的 `sdecode` ≤2ms。
+
+### 日志本身的影响(标题页稳定内容 A/B,300 帧)
+
+```text
+              tick p50/p95     render p50/p95    work p50/p95
+quiet         2.81 / 4.79      1.53 / 2.36       5.06 / 7.38
+info          3.10 / 5.18      2.27 / 2.94       5.94 / 8.86
+debug         3.07 / 5.18      2.03 / 3.04       5.83 / 8.63
+quiet+UI      2.88 / 4.88      1.87 / 2.44       5.75 / 8.46(draw p50 0.29→0.74)
+```
+
+info/debug 相对 quiet 只多 ~0.3ms tick / ~0.5ms render,debug-ui 多 ~0.45ms
+draw;不会产生 30–120ms 尖峰。尖峰是上面的资产/文本/脚本成本,日志只是让它可见。
+
+### 记账补充
+
+`RenderPhases` 新增 `text_cpu_base_us`(仅 wgpu 填;soft 默认 0),spike 行输出
+`text_cpu=`。`cargo build --workspace --all-targets`、wgpu 9/10/25、soft
+41/15/1/1、logging_guards 3 全绿。
+
+### 收口方向(需渲染线确认,本任务不动渲染契约)
+
+- 文本合成不再逐层把整张基面搬到 CPU:层表面常驻 GPU,文本 pass 直接在 GPU
+  上写;必须 CPU 合成时只取需要的区域/复用缓存。
+- 差分/CG 在场景装载期预解码下几张候选(脚本按标签顺序加载),或把首帧解码
+  分摊到非尖峰帧;首帧缺资产必须带 `asset.*` 诊断。
+- 脚本侧:LET 循环是最大的 tick 项(0.21µs/次 × 十万级),`CGINFO` 可按层版本
+  缓存(49µs/次 × 85),属 VM/域查询优化,不是编解码。
+
+### 修复推进(2026-10-28)
+
+已落地的安全修复(不改渲染契约、像素级回归):
+
+1. **资产身份快路径**:层内容就是它的资产(`raw.hash == fnv(id, tex.id)`
+   且采样窗恒等)时,直接复用 `TextureStore` 的资产 CPU 纹理,跳过 GPU 读回。
+2. **文本基面 CPU 缓存**:键 = `(层, 基面稳定身份)`。稳定身份 =
+   `layer base token + 已应用操作前缀`(`LayerSurfaces::raw_identity`),
+   不混纹理池 id;同一基面换池/换文本仍命中。预算 64MB / 32 条,LRU。
+   `YURIS_TEXT_BASE_CACHE=0` 可关闭做 A/B。
+3. 记账/探针:`RenderPhases` 增 `text_cpu_base_us`、`text_cpu_readback_us/
+   readbacks`、`text_cpu_asset_us/bytes`、`text_cpu_cached`、`text_cpu_stores`;
+   spike 行输出 `text_cpu= / tcpu_rb= / tcpu_asset= / tcpu_cache= / tcpu_store=`。
+   读回发生时还有 `RUST_LOG` 可控的 `[text-base] layer=... base_key=...` debug 行。
+4. 宿主加 `--fixed-step`(固定 1/fps 逻辑时钟 + 确定性 `local_time`)供性能/
+   像素回放;仍不能完全消除该作品的运行间差异(同一脚本可能落在不同剧情点),
+   游戏级 A/B 以 spike 现场为准。
+
+回归:`cgact_text_reuses_cached_cpu_base_across_text_changes`(wgpu)验证
+「资产层首帧零读回 + 换文本零读回 + 与 soft 像素一致」;`base_cache_hits_by_
+layer_and_hash_and_forgets`(core)验证缓存键/淘汰。`cargo test -p yu-render-core`
+10、`-p yu-backend-wgpu` 26、`-p yu-backend-soft` 41/15/1/1、logging_guards 3 全绿。
+
+**仍未解决(需常驻表面/GPU 文本,渲染线)**:
+
+- 游戏里这两层是 GPU 合成基面,且每帧基面身份变化/层重建,缓存与资产快路径
+  都不命中:首帧仍 2 次读回 ≈73ms,后续文本帧仍各 2 次(队列空闲时 3.8ms/次)。
+- 差分帧仍是首用差分图解码 19–35ms + 36–54MB 上传;并行预解码可把解码墙钟
+  压到 1/4 左右,但上传/合成仍在,需与常驻表面一起做。

@@ -232,6 +232,12 @@ VARACT     3.4ms ( 1.6%) hits= 14,412 avg=0.237us/op
    - `LET` 常量右值在 `fill_cmd` 时预求值(`CmdWindow.const_value`)。
 2. **`SOUND` 同步解码**:531 次调用 91ms(172µs/次)。需要按时长/文件缓存
    已解码 PCM,或把解码移到声音线程(必须先取证官方加载时机)。
+
+   > **更新(2026-10-28)**:REA 复核官方 `0x422ab0` 只做 `ov_open` +
+   > `ov_time_total`,随后 `0x422c65` 建 0.5s DirectSound 环,**不整段解码**;
+   > 本内核已改为头部元数据 + 流式按需解码(见 `PROGRESS.md` 的
+   > `PERF-SOUND-STREAM` 与 `docs/sound-ledger.md` N0-13)。本条的「同步解码」
+   > 是当时旧实现的测量,不再是现状。
 3. **`VARINFO`/`CG` 查询**:`CG` 111k 次 179ms(1.61µs/次),多为缺失资产
    挂号路径;需要在 P2 的 gfx 取证里确认是否可缓存“缺失”结果。
 4. **首个可播放 1.0s**:启动前 0.67s 是 wgpu/adapter + 软后端对账 + 字体预热;
