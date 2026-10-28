@@ -57,8 +57,10 @@ pub struct RenderPhases {
     pub image_composite_us: u64,
     /// 本帧新上传纹理数。
     pub uploads: u64,
-    /// 本帧上传字节(解码后的 RGBA8)。
+    /// 本帧上传字节(解码后的 RGBA8;含资产首次解码)。
     pub upload_bytes: u64,
+    /// 其中资产**首次解码**的字节(一次性加载成本,不是每帧渲染预算)。
+    pub upload_asset_bytes: u64,
     /// 本帧 draw call 数。
     pub draw_calls: u64,
     /// 本帧读回字节数。
@@ -87,6 +89,18 @@ pub struct RenderPhases {
     /// 是「该命中却未命中」的直接证据。
     pub memo_chains: u64,
     pub memo_hits: u64,
+    /// 本帧真实执行的表面像素 pass 数(填充/合成/过渡/滤镜/重采样)。
+    pub surface_passes: u64,
+    /// 本帧纹理区域复制次数(COPY 快照/RESIZE/TRIM)。
+    pub blits: u64,
+    /// 快照别名命中数(零拷贝;W3 第一态)。
+    pub alias_hits: u64,
+    /// 操作前缀相同而直接复用的层数(官方的“就地执行一次”)。
+    pub reused_layers: u64,
+    /// UV 采样修饰被物化成真实像素的次数。
+    pub materialized: u64,
+    /// 无 GPU 实现的 CPU 回退次数(显式计数,不静默)。
+    pub cpu_fallbacks: u64,
 }
 
 /// 一帧的渲染摘要。
