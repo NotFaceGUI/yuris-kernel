@@ -500,10 +500,11 @@ fn run_case(project: &Project, path: &Path, update: bool, debug_mode: bool) -> C
                         _ => -1.0,
                     };
                     output::error(format!(
-                        "[frametrace] f={frame} mean={:.2} nonzero={} diff={:.2}% layers={} visible={} ops={} skipped={}",
+                        "[frametrace] f={frame} mean={:.2} nonzero={} diff={:.2}% sha={} layers={} visible={} ops={} skipped={}",
                         luma / count,
                         nonzero,
                         diff,
+                        crate::sha::sha256_hex(&surface.rgba),
                         rendered.report.layers,
                         rendered.report.visible,
                         rendered.report.ops,
