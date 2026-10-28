@@ -17,6 +17,15 @@
 //!   CDDA（`0x429fb0`）。
 //! - **unsupported-by-official**：`SOUND[SPEED=]`（官方处理体不读槽 13）。
 //!
+//! # 架构(与官方 0.495 同构)
+//!
+//! - **装载只读头部**:OGG 走 `ov_open` + `ov_time_total` 的等价物
+//!   (`meta::probe` + 内部 `stream` 模块),O(1),`TOTALTIME` 立即精确;官方
+//!   `0x422ab0` 之后只建 0.5s DirectSound 环(`0x422c65`),不整段解码。
+//! - **播放期按需解码**:tick 侧预取 0.5s(`LEAD_MS`),音频回调
+//!   只拷贝;窗口不足时回调按需解码并计数。WAVE PCM/ACM 沿官方
+//!   mmio 直读/一次 ACM 转换,整段样本在手(旧路径逐样本一致)。
+//!
 //! # 边界
 //!
 //! - 不碰文件系统、不认识 ypf；装载经 [`loader::SoundLoader`] 注入。
@@ -34,9 +43,12 @@ pub mod decode;
 pub mod error;
 pub mod host;
 pub mod loader;
+pub mod meta;
 pub mod mixer;
 pub mod state;
+mod stream;
 
 pub use host::SoundHost;
 pub use loader::{MemoryLoader, SoundLoader};
-pub use state::{FileType, Layer, PlayState, QueryField, SoundCommand, SoundState};
+pub use meta::AudioMeta;
+pub use state::{DecodeStats, FileType, Layer, PlayState, QueryField, SoundCommand, SoundState};

@@ -1039,3 +1039,190 @@ fn delay_window_renders_silence_on_device_path() {
         int(&mut s, "BGM", QueryField::Time)
     );
 }
+
+/// OGG 装载 = 官方 `0x422ab0` 架构:只读头部(总长立即精确),不解码;
+/// 播放/预取才按需解 packet。`TOTALTIME` 用 granule(`ov_time_total` 同口径)。
+#[test]
+fn gated_ogg_load_reads_header_only_then_streams_on_play() {
+    let Ok(root) = std::env::var("YURIS_SAMPLE_SDK0495") else {
+        eprintln!("SKIP snd-stream: YURIS_SAMPLE_SDK0495 not set");
+        return;
+    };
+    let root = std::path::Path::new(&root);
+    let candidates = [
+        root.join("data/bgm/bgm03.ogg"),
+        root.join("システム/data/bgm/bgm03.ogg"),
+    ];
+    let Some(path) = candidates.iter().find(|p| p.is_file()) else {
+        eprintln!("SKIP snd-stream: bgm03.ogg not under {}", root.display());
+        return;
+    };
+    let bytes = std::fs::read(path).expect("read bgm03.ogg");
+    let header = yu_sound::meta::probe(b"bgm03.ogg", &bytes).expect("header probe");
+    assert!(header.is_exact(), "SDK 样本应有精确 granule");
+    let mut s = state_with(&[("bgm03.ogg", bytes)]);
+
+    let mut c = cmd("BGM");
+    c.file = Some(b"bgm03.ogg".to_vec());
+    c.play = Some(1);
+    s.apply_sound(&c);
+    // 装载当帧:PLAY 立即为 1(官方语义),TOTALTIME 来自 granule,零解码。
+    assert_eq!(int(&mut s, "BGM", QueryField::Play), 1);
+    assert_eq!(
+        int(&mut s, "BGM", QueryField::TotalTime),
+        header.total_ms().expect("total")
+    );
+    let stats = s.take_decode_stats();
+    assert_eq!(stats.full_decodes, 0, "OGG 装载不得整段解码");
+    assert_eq!(stats.decoded_frames, 0, "装载当帧不得解码音频");
+    assert!(stats.decode_us < 5_000, "装载只解析头部:{}us", stats.decode_us);
+
+    // 同一文件重复 SOUND(另一层):装载仍零解码(官方每次重新开流)。
+    let mut c2 = cmd("SE");
+    c2.file = Some(b"bgm03.ogg".to_vec());
+    c2.play = Some(1);
+    s.apply_sound(&c2);
+    let stats = s.take_decode_stats();
+    assert_eq!(stats.full_decodes, 0);
+    assert_eq!(stats.decoded_frames, 0, "重复 SOUND 不得整段解码");
+    assert_eq!(int(&mut s, "SE", QueryField::Play), 1);
+
+    // 混音一个块:按需解码(流式),输出非静音。
+    let mut buf = vec![0.0f32; 4096 * 2];
+    s.render(&mut buf, 44_100, 2);
+    assert!(
+        buf.iter().any(|v| v.abs() > 0.0),
+        "流式解码后应有声音"
+    );
+    let stats = s.take_decode_stats();
+    assert!(stats.decoded_frames > 0, "播放时必须解出帧");
+
+    // tick 预取 0.5s:再次解码并保持 PLAY/时间语义。
+    s.advance_ms(16);
+    let stats = s.take_decode_stats();
+    assert!(stats.decoded_frames > 0, "预取应继续填充窗口");
+}
+
+/// WAVE PCM:官方 mmio 直读,整段样本一次读入;PLAY 当帧即可听。
+#[test]
+fn wav_load_plays_immediately_and_keeps_totaltime() {
+    let bytes = wav_ms(1000, 8000, 1);
+    let expected = decode(b"abc.wav", &bytes).expect("decode").total_ms();
+    let mut s = state_with(&[("abc.wav", bytes)]);
+    let mut c = cmd("BGM");
+    c.file = Some(b"abc.wav".to_vec());
+    c.play = Some(1);
+    s.apply_sound(&c);
+    assert_eq!(int(&mut s, "BGM", QueryField::Play), 1);
+    assert_eq!(int(&mut s, "BGM", QueryField::TotalTime), expected);
+    assert_eq!(s.take_decode_stats().full_decodes, 1);
+    let mut buf = vec![0.0f32; 800];
+    s.render_and_advance(&mut buf, 8000, 1);
+    assert!(buf.iter().any(|v| *v != 0.0));
+}
+
+/// OGG 流式混音输出必须与整段解码逐样本一致(含 START 定位)。
+/// 这是「装载只读头部、播放按需解码」不改变可观测音频的直接证据。
+#[test]
+fn gated_ogg_stream_render_matches_full_decode() {
+    let Ok(root) = std::env::var("YURIS_SAMPLE_SDK0495") else {
+        eprintln!("SKIP snd-stream-render: YURIS_SAMPLE_SDK0495 not set");
+        return;
+    };
+    let root = std::path::Path::new(&root);
+    let candidates = [
+        root.join("data/bgm/bgm03.ogg"),
+        root.join("システム/data/bgm/bgm03.ogg"),
+    ];
+    let Some(path) = candidates.iter().find(|p| p.is_file()) else {
+        eprintln!("SKIP snd-stream-render: bgm03.ogg not under {}", root.display());
+        return;
+    };
+    let bytes = std::fs::read(path).expect("read bgm03.ogg");
+    let header = yu_sound::meta::probe(b"bgm03.ogg", &bytes).expect("header");
+    let pcm = decode(b"bgm03.ogg", &bytes).expect("decode");
+    let ch = usize::from(pcm.channels);
+    let rate = pcm.sample_rate;
+    let total = header.total_frames.unwrap_or(0).min(pcm.frames());
+    let frames = 50_000usize.min(total as usize);
+
+    let render = |start_ms: Option<i64>| {
+        let mut s = state_with(&[("bgm03.ogg", bytes.clone())]);
+        let mut c = cmd("BGM");
+        c.file = Some(b"bgm03.ogg".to_vec());
+        c.start = start_ms;
+        c.play = Some(1);
+        s.apply_sound(&c);
+        let mut buf = vec![0.0f32; frames * 2];
+        s.render(&mut buf, rate, 2);
+        buf
+    };
+    let plain = render(None);
+    for i in 0..frames {
+        for c in 0..2usize {
+            let src = if c < ch { pcm.samples[i * ch + c] } else { pcm.samples[i * ch] };
+            let expected = src as f32 / 32768.0;
+            assert!(
+                (plain[i * 2 + c] - expected).abs() < 2e-4,
+                "frame={i} ch={c} stream={} decode={expected}",
+                plain[i * 2 + c]
+            );
+        }
+    }
+    // START=5000ms:定位后从该帧继续。
+    let start_ms = 5000i64;
+    let start_frame = (start_ms as u128 * u128::from(rate) / 1000) as usize;
+    let seeked = render(Some(start_ms));
+    for i in 0..frames.min(total as usize - start_frame) {
+        let src = if ch >= 2 {
+            pcm.samples[(start_frame + i) * ch]
+        } else {
+            pcm.samples[start_frame + i]
+        };
+        let expected = src as f32 / 32768.0;
+        assert!(
+            (seeked[i * 2] - expected).abs() < 2e-4,
+            "seek frame={i} stream={} decode={expected}",
+            seeked[i * 2]
+        );
+    }
+}
+
+/// 循环回绕到 0 必须真的重开 OGG reader(窗口已在末尾且为空时不能
+/// 误判为「reader 就在 0」),否则 sample(0) 会欠载。
+#[test]
+fn gated_ogg_loop_wrap_back_to_zero_reopens_stream() {
+    let Ok(root) = std::env::var("YURIS_SAMPLE_SDK0495") else {
+        eprintln!("SKIP snd-loop-wrap: YURIS_SAMPLE_SDK0495 not set");
+        return;
+    };
+    let root = std::path::Path::new(&root);
+    let candidates = [
+        root.join("data/bgm/bgm03.ogg"),
+        root.join("システム/data/bgm/bgm03.ogg"),
+    ];
+    let Some(path) = candidates.iter().find(|p| p.is_file()) else {
+        eprintln!("SKIP snd-loop-wrap: bgm03.ogg not under {}", root.display());
+        return;
+    };
+    let bytes = std::fs::read(path).expect("read bgm03.ogg");
+    let mut s = state_with(&[("bgm03.ogg", bytes)]);
+    let mut c = cmd("BGM");
+    c.file = Some(b"bgm03.ogg".to_vec());
+    c.end = Some(500);
+    c.restart = Some(0);
+    c.loop_ = Some(0);
+    c.play = Some(1);
+    s.apply_sound(&c);
+    // 先解码一段(让 reader/窗口离开 0),再推进到 END 之外回绕。
+    let mut warm = vec![0.0f32; 4096];
+    s.render(&mut warm, 44_100, 2);
+    s.advance_ms(700);
+    let stats = s.take_decode_stats();
+    assert!(stats.seeks >= 1, "循环回绕必须触发 seek(实际 {})", stats.seeks);
+    let mut buf = vec![0.0f32; 2048];
+    s.render(&mut buf, 44_100, 2);
+    let stats = s.take_decode_stats();
+    assert_eq!(stats.underruns, 0, "回绕后不应欠载");
+    assert!(buf.iter().any(|v| v.abs() > 0.0), "回绕后应继续出声");
+}

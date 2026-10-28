@@ -232,6 +232,20 @@ pub struct FrameReport {
     pub clock_ms: u32,
     /// 本帧被显式 `max_step` 上限丢弃的墙钟毫秒(默认 0 = 未丢)。
     pub lag_ms: u32,
+    /// 本帧落在 **tick 线程**的声音解码耗时(毫秒;装载 + 预取)。
+    /// 验收口径:任一帧的 tick 增量里解码部分 ≤8ms。
+    pub sound_decode_ms: f64,
+    /// 本帧全部解码耗时(含音频回调兜底;不占用 tick)。
+    pub sound_stream_ms: f64,
+    /// 本帧 WAVE/ACM 整段装载次数(OGG 流式恒 0)。
+    pub sound_decodes: u32,
+    /// 本帧 OGG 流式解出的帧数。
+    pub sound_stream_frames: u32,
+    /// 本帧需要样本但窗口未覆盖的次数(正常播放为 0)。
+    pub sound_underruns: u32,
+    /// 本帧定位次数与 >2ms 的慢定位次数(大 START/RESTART 代价)。
+    pub sound_seeks: u32,
+    pub sound_slow_seeks: u32,
 }
 
 impl FrameReport {
@@ -250,6 +264,13 @@ impl FrameReport {
             drawable: false,
             clock_ms: 0,
             lag_ms: 0,
+            sound_decode_ms: 0.0,
+            sound_stream_ms: 0.0,
+            sound_decodes: 0,
+            sound_stream_frames: 0,
+            sound_underruns: 0,
+            sound_seeks: 0,
+            sound_slow_seeks: 0,
         }
     }
 }
@@ -954,14 +975,16 @@ impl Engine {
         let tick_started = Instant::now();
         let chain = vm.tick_at(now_ms, &self.timeline);
         self.main_finished |= chain.main_finished;
+        let mut sound_stats = yu_sound::DecodeStats::default();
         if let Some(sound) = &self.sound {
-            // 音频线程是时钟:这里只取诊断,不生产 PCM。
+            // 音频线程是时钟:这里只取诊断/解码统计,不生产 PCM。
             // 锁中毒降级(H-P1-01):回调线程 panic 过的锁仍可取回内部
             // 数据(前一时刻的合法状态),降级继续,不 panic。
-            let mut fresh = sound
+            let mut guard = sound
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take_diags();
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            sound_stats = guard.take_decode_stats();
+            let mut fresh = guard.take_diags();
             self.sound_diags.append(&mut fresh);
             if self.sound_diags.len() > SOUND_DIAG_CAP {
                 let drop = self.sound_diags.len() / 2;
@@ -1062,6 +1085,14 @@ impl Engine {
             drawable,
             clock_ms: now_ms,
             lag_ms: self.last_clock_drop_ms,
+            sound_decode_ms: sound_stats.tick_decode_us as f64 / 1000.0,
+            sound_stream_ms: sound_stats.decode_us as f64 / 1000.0,
+            sound_decodes: u32::try_from(sound_stats.full_decodes).unwrap_or(u32::MAX),
+            sound_stream_frames: u32::try_from(sound_stats.decoded_frames)
+                .unwrap_or(u32::MAX),
+            sound_underruns: u32::try_from(sound_stats.underruns).unwrap_or(u32::MAX),
+            sound_seeks: u32::try_from(sound_stats.seeks).unwrap_or(u32::MAX),
+            sound_slow_seeks: u32::try_from(sound_stats.slow_seeks).unwrap_or(u32::MAX),
         };
         self.accumulate_frame_diags(&frame);
         self.last_frame = Some(frame);
@@ -1790,6 +1821,9 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         let loader = VfsSoundLoader {
             source: project.open_source()?,
         };
+        // 官方 0.495 架构(REA `0x422ab0` → `0x422c65`):装载只读头部
+        // (`ov_time_total`)并建 0.5s 环,音频按需解码;本内核同构
+        // (`yu_sound::stream`),不在 tick 里整段解码。
         let sound_state = Arc::new(Mutex::new(SoundState::new(Box::new(loader))));
         let yscm = vm.tables().boot.yscm.clone();
         vm.set_sound_host(Box::new(SoundHost::new(sound_state.clone(), yscm)));

@@ -1235,6 +1235,13 @@ mod tests {
             drawable: true,
             clock_ms: 16,
             lag_ms: 0,
+            sound_decode_ms: 0.0,
+            sound_decodes: 0,
+            sound_stream_ms: 0.0,
+            sound_stream_frames: 0,
+            sound_underruns: 0,
+            sound_seeks: 0,
+            sound_slow_seeks: 0,
         };
         let bytes = encode_frame(&report, 1, true, false, &surface);
         assert_eq!(&bytes[0..4], b"YUF1");

@@ -63,6 +63,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let pump_cap = parse_opt::<usize>(&mut args, "pump-cap")?;
     // 调试复现:显式给单步上限才丢墙钟时间(默认不截断)。
     let max_step_ms = parse_opt::<u32>(&mut args, "max-step-ms")?.filter(|ms| *ms > 0);
+    // 固定步长回放:性能/像素对拍专用(牺牲墙钟语义,换可复现)。
+    let fixed_step = args.switch("fixed-step");
     let profile_frames = match args.flag("profile-frames") {
         Some(list) => list
             .split(',')
@@ -200,7 +202,12 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         warm_text: true,
         force_font: None,
         // 真实运行:`@_TIME` 注入系统本地时间(存档菜单的现实日期)。
-        local_time: crate::clock::local_now(),
+        // 固定步长回放用确定性 1970 基准(与 case/golden 同口径)。
+        local_time: if fixed_step {
+            None
+        } else {
+            crate::clock::local_now()
+        },
     };
     // **不做 GPU→CPU 自动回退**:soft 与 wgpu 是两条独立实现,自动降级会让
     // 「GPU 模式变慢/画错」永远对不上号(用户看到的是 CPU 结果,却以为在
@@ -250,6 +257,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             profile_commands,
             pump_cap,
             max_step_ms,
+            fixed_step,
             console: Some(console),
         },
     )
@@ -316,6 +324,6 @@ fn usage() -> String {
      \x20      [--frames N] [--shot PNG] [--fullscreen] [--pixel] [--debug-ui]\n\
      \x20      [--no-sound] [--reconcile] [--script case.json] [--save-root DIR]\n\
      \x20      [--log-file PATH] [--frame-stats CSV] [--profile-frames 1,4,340] [--pump-cap N]\n\
-     \x20      [--spike-log PATH] [--spike-ms 20] [--max-step-ms N]"
+     \x20      [--spike-log PATH] [--spike-ms 20] [--max-step-ms N] [--fixed-step]"
         .to_string()
 }

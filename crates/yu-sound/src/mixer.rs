@@ -74,8 +74,7 @@ impl SoundState {
 }
 
 fn mix_layer(layer: &Layer, out: &mut [f32], frames: usize, out_rate: u32, channels: usize) {
-    let Some(pcm) = layer.pcm() else { return };
-    if !layer.state().audible() || layer.paused() || pcm.sample_rate == 0 || pcm.channels == 0 {
+    if !layer.state().audible() || layer.paused() {
         return;
     }
     let gain = volume_gain(layer.audible_volume());
@@ -85,8 +84,14 @@ fn mix_layer(layer: &Layer, out: &mut [f32], frames: usize, out_rate: u32, chann
     let (left_gain, right_gain) = pan_gains(layer.pan());
     // 与状态机同一映射：base*(pitch+256)/512。
     let pitch = (layer.pitch().clamp(0, 512) + 256) as f64 / 512.0;
-    let src_frames = pcm.frames() as f64;
-    if src_frames <= 0.0 {
+    // 流式源:窗口内随机访问,不足则按需解码(官方 0.5s 环的同构;
+    // 正常播放时 tick 的 `prefetch` 已把窗口填好,回调只拷贝)。
+    let mut guard = layer.stream_mut();
+    let Some(stream) = guard.as_mut() else { return };
+    let src_rate = stream.sample_rate();
+    let src_channels = usize::from(stream.channels());
+    let total = stream.total_frames();
+    if src_rate == 0 || src_channels == 0 || total == 0 {
         return;
     }
     let end_ms = layer.end_ms().max(0) as f64;
@@ -111,24 +116,28 @@ fn mix_layer(layer: &Layer, out: &mut [f32], frames: usize, out_rate: u32, chann
         // 循环边界（与状态机相同的 END/RESTART 规则；只在本块内回绕）。
         if end_ms > 0.0 && pos_ms >= end_ms {
             pos_ms = restart_ms;
+            stream.request_seek_ms(restart_ms as i64);
         }
-        let src_pos = pos_ms * pcm.sample_rate as f64 / 1000.0;
-        if src_pos >= src_frames {
+        let src_pos = pos_ms * src_rate as f64 / 1000.0;
+        if src_pos >= total as f64 {
             break;
         }
-        let i0 = src_pos.floor() as usize;
+        let i0 = src_pos.floor() as u64;
         let frac = (src_pos - i0 as f64) as f32;
-        let i1 = (i0 + 1).min(src_frames as usize - 1);
-        let base0 = i0 * pcm.channels as usize;
-        let base1 = i1 * pcm.channels as usize;
+        let i1 = (i0 + 1).min(total - 1);
+        let Some(l0) = stream.sample(i0, 0) else { break };
+        let Some(l1) = stream.sample(i1, 0) else { break };
         let o = f * channels;
         if channels == 1 {
-            let s = lerp(pcm, base0, base1, frac, 0);
+            let s = lerp(l0, l1, frac);
             out[o] += s * gain;
         } else {
-            let l = lerp(pcm, base0, base1, frac, 0);
-            let r = if pcm.channels >= 2 {
-                lerp(pcm, base0, base1, frac, 1)
+            let l = lerp(l0, l1, frac);
+            let r = if src_channels >= 2 {
+                match (stream.sample(i0, 1), stream.sample(i1, 1)) {
+                    (Some(r0), Some(r1)) => lerp(r0, r1, frac),
+                    _ => l,
+                }
             } else {
                 l
             };
@@ -137,10 +146,12 @@ fn mix_layer(layer: &Layer, out: &mut [f32], frames: usize, out_rate: u32, chann
         }
         pos_ms += step_ms * pitch;
     }
+    // 有界窗口:丢已消费前缀(官方环 0.5s;backward seek 由 request_seek 重建)。
+    stream.discard_before((pos_ms.max(0.0) * src_rate as f64 / 1000.0).floor() as u64);
 }
 
-fn lerp(pcm: &crate::decode::Pcm, base0: usize, base1: usize, frac: f32, ch: usize) -> f32 {
-    let a = pcm.samples.get(base0 + ch).copied().unwrap_or(0) as f32 / 32768.0;
-    let b = pcm.samples.get(base1 + ch).copied().unwrap_or(0) as f32 / 32768.0;
+fn lerp(a: i16, b: i16, frac: f32) -> f32 {
+    let a = a as f32 / 32768.0;
+    let b = b as f32 / 32768.0;
     a * (1.0 - frac) + b * frac
 }

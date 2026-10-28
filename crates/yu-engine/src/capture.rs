@@ -195,12 +195,26 @@ impl LayerCapture for GfxCapture {
             height: image.height,
             rgba: image.rgba.clone(),
         };
+        let encode_started = std::time::Instant::now();
         let png = png::png_bytes(&surface).map_err(|e| {
             yu_gfx::error::recoverable(
                 yu_gfx::error::code::INFO_UNSUPPORTED,
                 format!("LOAD[ID] 缩略图 PNG 编码失败: {e}"),
             )
         })?;
+        let encode_us = encode_started.elapsed().as_micros() as u64;
+        if std::env::var("YURIS_CAPTION_TIMING").is_ok() {
+            // 缩略图编码是命令时刻的一次性成本:留在统一控制台(debug),
+            // 回答「存档/读档这一帧有没有编码尖峰」。
+            log::debug!(
+                target: "yu-engine",
+                "[caption] LOAD[ID] PNG {}x{} {}B encode={}us",
+                image.width,
+                image.height,
+                png.len(),
+                encode_us
+            );
+        }
         let key = synthetic_key(&png);
         self.overlay.insert(&key, png).map_err(|d| {
             yu_gfx::error::recoverable(

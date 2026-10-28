@@ -185,6 +185,14 @@ struct FrameRow {
     clock_ms: u32,
     /// 本帧被显式 `--max-step-ms` 丢弃的墙钟毫秒(默认 0)。
     lag_ms: u32,
+    /// 本帧声音解码:tick 线程/总计(ms)、整段装载、流式帧、欠载、定位。
+    sound_decode_ms: f64,
+    sound_stream_ms: f64,
+    sound_decodes: u32,
+    sound_stream_frames: u32,
+    sound_underruns: u32,
+    sound_seeks: u32,
+    sound_slow_seeks: u32,
 }
 
 /// 宿主参数(由 `yu-desktop` CLI 填充)。
@@ -228,6 +236,12 @@ pub struct HostOptions {
     /// 调试用:实时逻辑时钟的单步上限(毫秒)。`None` = 不截断(默认,
     /// 与官方墙钟语义一致;超出时间不会被丢弃)。仅用于复现旧症状。
     pub max_step_ms: Option<u32>,
+    /// 调试用:固定步长回放(`Engine::tick()` 的 1/fps 逻辑时钟)。
+    ///
+    /// 默认走墙钟(`tick_realtime`),输入脚本的进度取决于机器速度,同一
+    /// 帧号在不同运行里可能落在不同剧情点;固定步长用于性能/像素对拍,
+    /// 牺牲「动画跟墙钟」语义,只换可复现性。
+    pub fixed_step: bool,
     /// 统一控制台(Q1 R2):宿主 observe 的诊断同步出控制台行(与 egui
     /// 面板同源、两路消费);`None` = 保持旧只进面板行为(测试/嵌入)。
     pub console: Option<yu_log::console::ConsoleHandle>,
@@ -254,6 +268,7 @@ impl Default for HostOptions {
             profile_commands: false,
             pump_cap: None,
             max_step_ms: None,
+            fixed_step: false,
             console: None,
         }
     }
@@ -1592,10 +1607,18 @@ impl App {
             "[spike] host={} engine={} interval={interval_ms:.1}ms work={work_ms:.1}ms \
              tick={tick_ms:.1}ms render={render_ms:.1}ms draw={draw_ms:.1}ms \
              capture={capture_ms:.1}ms frame_build={frame_build_ms:.1}ms \
+             sdecode={:.1}ms sstream={:.1}ms sdecodes={} sframes={} sunder={} sseeks={} sslow={} \
              clock={}ms lag={}ms \
              ops={total_ops} layers={} visible={} passes={} drawn={} skipped={}",
             self.frames,
             report.frame,
+            report.sound_decode_ms,
+            report.sound_stream_ms,
+            report.sound_decodes,
+            report.sound_stream_frames,
+            report.sound_underruns,
+            report.sound_seeks,
+            report.sound_slow_seeks,
             report.clock_ms,
             report.lag_ms,
             report.layers,
@@ -1611,7 +1634,7 @@ impl App {
                     line,
                     " plan={:.1} snap={:.1} image={:.1} text={:.1} copy_text={:.1} \
                      rest={:.1} encode={:.1} readback={:.1} tail={:.1} \
-                     text_bake={:.1} text_paint={:.1} image_paint={:.1} \
+                     text_bake={:.1} text_cpu={:.1} tcpu_rb={:.1}/{:.0} tcpu_asset={:.1}/{:.0} tcpu_cache={} tcpu_store={} text_paint={:.1} image_paint={:.1} \
                      image_composite={:.1} decode={:.1} decode_bytes={} \
                      uploads={} upload_bytes={} draws={} copy_bytes={} copies={} snapshots_alloc={} \
                      surfaces={} blits={} alias={} reused={} materialized={} cpu_fb={}",
@@ -1625,6 +1648,13 @@ impl App {
                     p.readback_us as f64 / 1e3,
                     p.tail_us as f64 / 1e3,
                     p.text_bake_us as f64 / 1e3,
+                    p.text_cpu_base_us as f64 / 1e3,
+                    p.text_cpu_readback_us as f64 / 1e3,
+                    p.text_cpu_readbacks as f64,
+                    p.text_cpu_asset_us as f64 / 1e3,
+                    p.text_cpu_asset_bytes as f64,
+                    p.text_cpu_cached,
+                    p.text_cpu_stores,
                     p.text_paint_us as f64 / 1e3,
                     p.image_paint_us as f64 / 1e3,
                     p.image_composite_us as f64 / 1e3,
@@ -1775,6 +1805,13 @@ impl App {
         let engine_frame = report.frame;
         let clock_ms = report.clock_ms;
         let lag_ms = report.lag_ms;
+        let sound_decode_ms = report.sound_decode_ms;
+        let sound_stream_ms = report.sound_stream_ms;
+        let sound_decodes = report.sound_decodes;
+        let sound_stream_frames = report.sound_stream_frames;
+        let sound_underruns = report.sound_underruns;
+        let sound_seeks = report.sound_seeks;
+        let sound_slow_seeks = report.sound_slow_seeks;
         // 渲染曲线:每宿主帧一个样本,环形只留最近 N 个。面板关闭期间
         // 也采样,打开时看到的是真实历史而不是重新开始的空曲线。
         self.render_samples.push_back(render_ms as f32);
@@ -1792,6 +1829,13 @@ impl App {
             phases: self.engine.render_phases(),
             clock_ms,
             lag_ms,
+            sound_decode_ms,
+            sound_stream_ms,
+            sound_decodes,
+            sound_stream_frames,
+            sound_underruns,
+            sound_seeks,
+            sound_slow_seeks,
         });
         // 长跑有界:只保留最近 20 万帧(约 55 分钟@60fps)。
         if self.frame_rows.len() > FRAME_STATS_CAP {
@@ -1963,7 +2007,9 @@ impl App {
                  merge_ops,merge2_ops,paint_ops,pixel_ops,memo_chains,memo_hits,\
                  surface_passes,blits,alias_hits,reused_layers,materialized,cpu_fallbacks,\
                  copy_bytes,copy_count,\
-                 decode_ms,decode_bytes,clock_ms,lag_ms\n",
+                 decode_ms,decode_bytes,clock_ms,lag_ms,\
+                 sound_decode_ms,sound_stream_ms,sound_decodes,sound_stream_frames,\
+                 sound_underruns,sound_seeks,sound_slow_seeks\n",
             );
             for row in &self.frame_rows {
                 use std::fmt::Write as _;
@@ -1986,7 +2032,7 @@ impl App {
                              {:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{},\
                              {},{},{},{},{},{},\
                              {},{},{},{},{},{},{},{},\
-                             {:.3},{},{},{}",
+                             {:.3},{},{},{},{:.3},{:.3},{},{},{},{},{}",
                             p.plan_us as f64 / 1e3,
                             p.snap_us as f64 / 1e3,
                             p.image_us as f64 / 1e3,
@@ -2025,11 +2071,18 @@ impl App {
                             p.decode_us as f64 / 1e3,
                             p.decode_bytes,
                             row.clock_ms,
-                            row.lag_ms
+                            row.lag_ms,
+                            row.sound_decode_ms,
+                            row.sound_stream_ms,
+                            row.sound_decodes,
+                            row.sound_stream_frames,
+                            row.sound_underruns,
+                            row.sound_seeks,
+                            row.sound_slow_seeks
                         );
                     }
                     None => {
-                        let _ = writeln!(text, ",{0}", ",".repeat(38));
+                        let _ = writeln!(text, ",{0}", ",".repeat(45));
                     }
                 }
             }
@@ -2459,7 +2512,11 @@ impl ApplicationHandler for App {
                     self.frames
                 );
             }
-            self.engine.tick_realtime()
+            if self.opts.fixed_step {
+                self.engine.tick()
+            } else {
+                self.engine.tick_realtime()
+            }
         });
         match outcome {
             Ok(Ok(rendered)) => {

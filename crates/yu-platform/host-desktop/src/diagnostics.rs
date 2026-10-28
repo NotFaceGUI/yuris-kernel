@@ -522,6 +522,13 @@ mod tests {
             drawable: true,
             clock_ms: 0,
             lag_ms: 0,
+            sound_decode_ms: 0.0,
+            sound_decodes: 0,
+            sound_stream_ms: 0.0,
+            sound_stream_frames: 0,
+            sound_underruns: 0,
+            sound_seeks: 0,
+            sound_slow_seeks: 0,
         };
         let snap = ledger.snapshot(&report, false, None);
         assert_eq!(snap.diag_rows.len(), 2);
@@ -559,6 +566,13 @@ mod tests {
             drawable: false,
             clock_ms: 0,
             lag_ms: 0,
+            sound_decode_ms: 0.0,
+            sound_decodes: 0,
+            sound_stream_ms: 0.0,
+            sound_stream_frames: 0,
+            sound_underruns: 0,
+            sound_seeks: 0,
+            sound_slow_seeks: 0,
         };
         let snap = ledger.snapshot(&report, false, None);
         let hint = snap.stuck.hint();

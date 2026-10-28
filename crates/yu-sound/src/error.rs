@@ -28,6 +28,8 @@ pub mod code {
     pub const FILE_READ: &str = "snd.file.read";
     /// 解码失败（OGG/WAVE 结构损坏）。
     pub const DECODE_FAILED: &str = "snd.decode.failed";
+    /// 声音窗口欠载(按需解码未覆盖播放光标;已计数,附首次现场)。
+    pub const STREAM_UNDERRUN: &str = "snd.stream.underrun";
     /// 编码不受支持（ACM WAVE，或未知容器）。
     pub const CODEC_UNSUPPORTED: &str = "snd.codec.unsupported";
     /// 查询字段未取证/未实现。
@@ -55,6 +57,7 @@ pub const ALL_CODES: &[&str] = &[
     code::FILE_MISSING,
     code::FILE_READ,
     code::DECODE_FAILED,
+    code::STREAM_UNDERRUN,
     code::CODEC_UNSUPPORTED,
     code::QUERY_UNSUPPORTED,
     code::QUERY_MULTI,

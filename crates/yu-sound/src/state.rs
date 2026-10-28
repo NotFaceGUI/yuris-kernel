@@ -15,7 +15,9 @@
 //! - **unsupported-by-official**：`SOUND[SPEED=]`（yscm 槽 13，
 //!   处理体 `0x44e1e8` 从不读 `0x68416d`，静默忽略）。
 
+use std::cell::{RefCell, RefMut};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use yu_log::Diag;
 use yu_rt::value::Value;
@@ -23,6 +25,8 @@ use yu_rt::value::Value;
 use crate::decode::{decode, Codec, Pcm};
 use crate::error::{self, code};
 use crate::loader::SoundLoader;
+use crate::meta;
+use crate::stream::{Stream, StreamCounters, LEAD_MS};
 
 /// 引擎 `+0x105` 的内部文件类型（**不是**对外 CODEC）。
 ///
@@ -96,23 +100,11 @@ struct SoundMeta {
     sample_rate: u32,
 }
 
-impl SoundMeta {
-    fn from_pcm(pcm: &Pcm) -> Self {
-        Self {
-            file_type: match pcm.codec {
-                Codec::Ogg => FileType::Ogg,
-                Codec::Wav | Codec::Acm => FileType::Wav,
-            },
-            codec: pcm.codec,
-            channels: pcm.channels,
-            bits: pcm.bits,
-            sample_rate: pcm.sample_rate,
-        }
-    }
-}
 
 /// 一个声音层 = 引擎 `layer->+0x34` 的声音对象 + 名字节点。
-#[derive(Clone, Debug)]
+///
+/// 不实现 `Clone`:`Stream` 持有解码器/窗口,拷贝它会复制解码状态(无意义)。
+#[derive(Debug)]
 pub struct Layer {
     /// `SOUND[FILE=]` 的原始参数（`SOUNDINFO[FILE]` 的来源；见台账 N0-7）。
     file_arg: Vec<u8>,
@@ -135,7 +127,11 @@ pub struct Layer {
     volume_current: i64,
     /// 引擎 `+0x150`（淡变目标）。
     volume_target: i64,
-    pcm: Option<std::sync::Arc<Pcm>>,
+    /// 流式音源(官方:头部 + 0.5s 环;WAVE/ACM 为整段样本)。
+    ///
+    /// `RefCell` 只为让 `mixer::render(&self)` 能按需解码 —— 状态机本身
+    /// 始终在 `SoundState` 的互斥锁内单线程执行。
+    stream: RefCell<Option<Box<Stream>>>,
     position_ms: i64,
     /// 块间连续播放头(毫秒,浮点)。`position_ms` 是它的整数投影。
     /// 旧实现每个音频块都从整数毫秒重开,块边界最多 1ms 相位跳变。
@@ -172,7 +168,7 @@ impl Layer {
             pitch: 256,
             volume_current: 256,
             volume_target: 256,
-            pcm: None,
+            stream: RefCell::new(None),
             position_ms: 0,
             playhead_ms: 0.0,
             total_ms: 0,
@@ -208,6 +204,11 @@ impl Layer {
     fn set_position(&mut self, ms: i64) {
         self.position_ms = ms;
         self.playhead_ms = ms as f64;
+        // 定位是懒的(重建 OGG reader + 解码到目标),在混音/预取时执行;
+        // PLAY/START/RESTART/循环回绕都不在 tick 里解码。
+        if let Some(stream) = self.stream.get_mut() {
+            stream.request_seek_ms(ms);
+        }
     }
 
     pub fn total_ms(&self) -> i64 {
@@ -218,8 +219,9 @@ impl Layer {
         self.loop_setting
     }
 
-    pub(crate) fn pcm(&self) -> Option<&Pcm> {
-        self.pcm.as_deref()
+    /// 流式音源(可变借用;混音/按需解码用)。
+    pub(crate) fn stream_mut(&self) -> RefMut<'_, Option<Box<Stream>>> {
+        self.stream.borrow_mut()
     }
 
     pub(crate) fn paused(&self) -> bool {
@@ -381,25 +383,58 @@ impl QueryField {
     }
 }
 
-/// 声音域状态机。单线程；只由 [`SoundState::advance`] 的注入时钟推进。
+/// 声音解码计数(逐帧增量;`take_decode_stats` 取走即清零)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecodeStats {
+    /// WAVE/ACM 整段装载次数(OGG 不再整段解码,恒 0)。
+    pub full_decodes: u64,
+    /// 解码耗时(微秒;装载整段 + tick 预取 + 音频回调兜底)。
+    pub decode_us: u64,
+    /// 其中落在 **tick 线程**的部分(装载 + 预取;验收口径)。
+    pub tick_decode_us: u64,
+    /// OGG 流式解出的 PCM 帧数。
+    pub decoded_frames: u64,
+    /// 定位次数与耗时(PLAY/START/RESTART/循环回绕)。
+    pub seeks: u64,
+    pub seek_us: u64,
+    /// 单次定位 >2ms 的次数(大 START/RESTART 的代价,正常为 0)。
+    pub slow_seeks: u64,
+    /// 需要样本但窗口未覆盖的次数(解码错误/异常;正常播放为 0)。
+    pub underruns: u64,
+    /// 流内解码错误次数(已转 Diag)。
+    pub decode_errors: u64,
+}
+
+/// 声音域状态机。单线程；播放位置只由 [`SoundState::advance`] 的注入时钟
+/// 推进；解码按官方架构流式进行(tick 侧预取 0.5s,音频回调按需兜底)。
 pub struct SoundState {
     layers: BTreeMap<Vec<u8>, Layer>,
     loader: Box<dyn SoundLoader>,
-    /// 已解码 PCM 缓存(按解析后的文件名)。
+    /// WAVE/ACM 整段样本缓存(按解析后的文件名)。
     ///
-    /// `SOUND` 命令在 VM tick 里**同步**解码:实测单帧 6 次 BGM 装载 235ms
-    /// (39ms/次)、场景初始化 205 次 158ms。同一文件反复装载(VN 常见:
-    /// 切场景回同一 BGM、SE 复用)以前每次都重解码;这里命中后只复制样本。
+    /// OGG 不再整段解码(官方 `0x422ab0` 只 `ov_open`+`ov_time_total`,
+    /// `0x422c65` 建 0.5s 环;见 `stream` 模块),所以不进这个缓存。
+    /// WAVE PCM / ACM 官方是 mmio 直读 / 一次 ACM 转换,整段样本在手;
+    /// 同文件反复装载(SE 复用)命中后共享 `Arc`,不再重复读/转换。
     pcm_cache: BTreeMap<Vec<u8>, std::sync::Arc<Pcm>>,
     pcm_cache_bytes: usize,
+    /// PCM 缓存命中次数(诊断:「重复 SOUND 只解一次」的计数证据)。
+    pcm_cache_hits: u64,
     clock_ms: i64,
     /// 设备回调驱动位置时,`advance(now_ms)` 只更新时钟,不推进层。
     external_clock: bool,
     diags: Vec<Diag>,
     frame: u64,
+    /// 流解码计数(所有层共享;`render` 是 `&self`,用原子量跨线程记账)。
+    stream_counters: Arc<StreamCounters>,
+    /// WAVE/ACM 整段装载次数(逐帧增量)。
+    full_decodes: u64,
+    /// 本帧落在 tick 线程的解码耗时(装载 + 预取;逐帧增量)。
+    tick_decode_us: u64,
 }
 
 const DIAG_CAP: usize = 4096;
+
 
 /// 解码缓存上限(采样字节,含帧副本)。超出后不再插入新条目(已有命中仍生效)。
 const PCM_CACHE_CAP: usize = 96 * 1024 * 1024;
@@ -411,11 +446,40 @@ impl SoundState {
             loader,
             pcm_cache: BTreeMap::new(),
             pcm_cache_bytes: 0,
+            pcm_cache_hits: 0,
             clock_ms: 0,
             external_clock: false,
             diags: Vec::new(),
             frame: 0,
+            stream_counters: Arc::new(StreamCounters::default()),
+            full_decodes: 0,
+            tick_decode_us: 0,
         }
+    }
+
+    /// 取走自上次调用以来的解码增量(逐帧记账)。
+    pub fn take_decode_stats(&mut self) -> DecodeStats {
+        let (decode_us, decoded_frames, seeks, seek_us, slow_seeks, underruns, decode_errors) =
+            self.stream_counters.take();
+        let stats = DecodeStats {
+            full_decodes: self.full_decodes,
+            decode_us,
+            tick_decode_us: self.tick_decode_us,
+            decoded_frames,
+            seeks,
+            seek_us,
+            slow_seeks,
+            underruns,
+            decode_errors,
+        };
+        self.full_decodes = 0;
+        self.tick_decode_us = 0;
+        stats
+    }
+
+    /// PCM 缓存命中次数(WAVE/ACM 整段装载;诊断用)。
+    pub fn pcm_cache_hits(&self) -> u64 {
+        self.pcm_cache_hits
     }
 
     pub fn set_frame(&mut self, frame: u64) {
@@ -504,9 +568,15 @@ impl SoundState {
         let delta = now - self.clock_ms;
         self.clock_ms = now;
         if self.external_clock {
+            // 设备回调是时钟:位置由回调推进,但预解码仍在 VM tick 做,
+            // 让回调只拷贝已解窗口(官方环由引擎侧填充的同构)。
+            self.prefetch_layers();
+            self.drain_stream_errors();
             return;
         }
         self.advance_delta(delta);
+        self.prefetch_layers();
+        self.drain_stream_errors();
     }
 
     /// 设备回调/环形缓冲用:按实际渲染的输出帧数推进播放头。
@@ -547,6 +617,8 @@ impl SoundState {
     pub fn advance_ms(&mut self, delta_ms: u32) {
         self.clock_ms = self.clock_ms.saturating_add(i64::from(delta_ms));
         self.advance_delta(i64::from(delta_ms));
+        self.prefetch_layers();
+        self.drain_stream_errors();
     }
 
     fn advance_delta(&mut self, delta: i64) {
@@ -680,7 +752,7 @@ impl SoundState {
             layer.paused = p != 0;
         }
 
-        if cmd.file.is_some() && cmd.play.is_none() && layer.pcm.is_some() {
+        if cmd.file.is_some() && cmd.play.is_none() && layer.stream.borrow().is_some() {
             // 手册例 8：SOUND[FILE=] 只装载，不自动播放。
             // 装载/解码失败时保持 Stopped（没有可播放数据）。
             layer.state = PlayState::Loaded;
@@ -722,7 +794,7 @@ impl SoundState {
             if layer.state != PlayState::Stopped {
                 layer.file_arg.clear();
                 layer.resolved.clear();
-                layer.pcm = None;
+                layer.stream.replace(None);
                 layer.start_ms = 0;
                 layer.restart_ms = 0;
                 layer.fade = Fade::none();
@@ -742,49 +814,173 @@ impl SoundState {
             ));
             return LoadOutcome::NotFound;
         };
+        // 换文件:释放旧流(解码窗口随 RefCell 回收)。
+        let prev = (layer.meta.clone(), layer.total_ms);
         // 引擎 type 1（`0x424614`）在装载前重置：PAN/PITCH 回 256、
         // START/RESTART/END/位置清零；E/VOLUME/LOOP/LOOPCOUNT 保留。
         reset_for_load(layer);
+        layer.stream.replace(None);
         layer.file_arg = resolved.clone();
         layer.resolved = resolved.clone();
-        // 解码缓存:同一文件反复装载(VN 常见:切回同一 BGM、SE 复用)不再重解码。
-        // 命中 = `Arc` 克隆(旧实现 `(**hit).clone()` 把整段 PCM 复制一遍:
-        // 90 秒 BGM 是 16MB,每次重播都要 memcpy 2–4ms)。
-        let decoded = match self.pcm_cache.get(&resolved) {
-            Some(hit) => Ok(std::sync::Arc::clone(hit)),
-            None => match decode(&resolved, &bytes) {
-                Ok(pcm) => {
-                    let pcm = std::sync::Arc::new(pcm);
-                    let bytes_len = pcm.samples.len() * std::mem::size_of::<i16>();
-                    if self.pcm_cache_bytes + bytes_len <= PCM_CACHE_CAP {
-                        self.pcm_cache_bytes += bytes_len;
-                        self.pcm_cache.insert(resolved.clone(), std::sync::Arc::clone(&pcm));
+
+        // 头部元数据(不整段解码)。OGG 走官方架构:ov_open + ov_time_total
+        // 的等价物,只解析容器头与 granule(0.495 `0x422ab0` → `0x4806c5`,
+        // 随后 `0x422c65` 只建 0.5s DirectSound 环,不解码)。
+        let load_started = std::time::Instant::now();
+        let probe = meta::probe(&resolved, &bytes);
+        match probe {
+            Ok(header) if header.codec == Codec::Ogg && header.is_exact() => {
+                let stream = Stream::ogg(
+                    resolved,
+                    bytes,
+                    &header,
+                    Arc::clone(&self.stream_counters),
+                );
+                // 头部探测 + ov_open 等价物是 tick 内的装载成本(官方同样在
+                // SOUND 命令里做);记进 tick 账单,不与「解码」混为一谈。
+                self.tick_decode_us = self.tick_decode_us.saturating_add(
+                    u64::try_from(load_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
+                match stream {
+                    Ok(stream) => install_stream(layer, stream),
+                    Err(diag) => {
+                        fail_load(layer, prev);
+                        self.report(diag);
                     }
-                    Ok(pcm)
                 }
-                Err(diag) => Err(diag),
-            },
-        };
-        match decoded {
-            Ok(pcm) => {
-                layer.total_ms = pcm.total_ms();
-                layer.end_ms = layer.total_ms;
-                layer.set_position(0);
-                layer.state = PlayState::Loaded;
-                layer.meta = Some(SoundMeta::from_pcm(&pcm));
-                layer.pcm = Some(pcm);
             }
-            Err(d) => {
-                // 解码失败：名字已写入，PCM 清空；type 1 不重置
-                // `+0x105/+0x107/+0x120`，元数据与 TOTALTIME 保留旧值。
-                layer.pcm = None;
-                layer.end_ms = 0;
-                layer.set_position(0);
-                layer.state = PlayState::Stopped;
-                self.report(d);
+            Ok(_) => {
+                self.tick_decode_us = self.tick_decode_us.saturating_add(
+                    u64::try_from(load_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
+                // WAVE PCM / ACM:官方 mmio 直读 / 一次 ACM 转换(REA
+                // `0x422e04`),整段样本在手;旧路径逐样本一致。
+                self.decode_whole(layer, resolved, bytes, prev);
+            }
+            Err(diag) => {
+                self.tick_decode_us = self.tick_decode_us.saturating_add(
+                    u64::try_from(load_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
+                fail_load(layer, prev);
+                self.report(diag);
             }
         }
         LoadOutcome::Loaded
+    }
+
+    /// WAVE/ACM 整段装载(缓存命中零拷贝;miss 时一次 decode)。
+    fn decode_whole(
+        &mut self,
+        layer: &mut Layer,
+        key: Vec<u8>,
+        bytes: Vec<u8>,
+        prev: (Option<SoundMeta>, i64),
+    ) {
+        if let Some(hit) = self.pcm_cache.get(&key) {
+            let pcm = Arc::clone(hit);
+            self.pcm_cache_hits = self.pcm_cache_hits.saturating_add(1);
+            install_stream(
+                layer,
+                Stream::pcm(key, pcm, Arc::clone(&self.stream_counters)),
+            );
+            return;
+        }
+        let started = std::time::Instant::now();
+        match decode(&key, &bytes) {
+            Ok(pcm) => {
+                let us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                self.stream_counters.add_us_direct(us);
+                self.tick_decode_us = self.tick_decode_us.saturating_add(us);
+                self.full_decodes = self.full_decodes.saturating_add(1);
+                let pcm = Arc::new(pcm);
+                self.cache_put(key.clone(), Arc::clone(&pcm));
+                install_stream(
+                    layer,
+                    Stream::pcm(key, pcm, Arc::clone(&self.stream_counters)),
+                );
+            }
+            Err(diag) => {
+                let us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                self.stream_counters.add_us_direct(us);
+                self.tick_decode_us = self.tick_decode_us.saturating_add(us);
+                self.full_decodes = self.full_decodes.saturating_add(1);
+                fail_load(layer, prev);
+                self.report(diag);
+            }
+        }
+    }
+
+    /// PCM 缓存写入(WAVE/ACM;超出上限时按 key 序淘汰最旧条目)。
+    fn cache_put(&mut self, key: Vec<u8>, pcm: Arc<Pcm>) {
+        let bytes_len = pcm.samples.len() * std::mem::size_of::<i16>();
+        if let Some(old) = self.pcm_cache.remove(&key) {
+            self.pcm_cache_bytes = self
+                .pcm_cache_bytes
+                .saturating_sub(old.samples.len() * std::mem::size_of::<i16>());
+        }
+        if bytes_len > PCM_CACHE_CAP {
+            return;
+        }
+        while self.pcm_cache_bytes + bytes_len > PCM_CACHE_CAP {
+            let Some(victim) = self.pcm_cache.keys().next().cloned() else {
+                break;
+            };
+            if let Some(old) = self.pcm_cache.remove(&victim) {
+                self.pcm_cache_bytes = self
+                    .pcm_cache_bytes
+                    .saturating_sub(old.samples.len() * std::mem::size_of::<i16>());
+            }
+        }
+        self.pcm_cache_bytes += bytes_len;
+        self.pcm_cache.insert(key, pcm);
+    }
+
+    /// tick 侧预解码:给每个可听层保留 [`LEAD_MS`](官方 0.5s 环)的已解码
+    /// 窗口,正常播放时音频回调不再解码。返回本 tick 的预取耗时(微秒)。
+    fn prefetch_layers(&mut self) {
+        let started = std::time::Instant::now();
+        for layer in self.layers.values() {
+            if !layer.state.audible() || layer.paused {
+                continue;
+            }
+            if let Some(stream) = layer.stream.borrow_mut().as_mut() {
+                stream.prefetch(layer.position_ms, LEAD_MS);
+            }
+        }
+        let us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.tick_decode_us = self.tick_decode_us.saturating_add(us);
+    }
+
+    /// 把流内错误转成 Diag,并按装载失败同型收口(解码失败必须回到诊断,
+    /// 不静默;层停止、流释放、元数据/TOTALTIME 保留旧值)。
+    fn drain_stream_errors(&mut self) {
+        let mut errors = Vec::new();
+        for layer in self.layers.values_mut() {
+            let mut note = None;
+            let error = match layer.stream.get_mut().as_mut() {
+                Some(stream) => {
+                    note = stream.take_underrun_note();
+                    stream.take_error()
+                }
+                None => None,
+            };
+            if let Some(note) = note {
+                errors.push(error::info(
+                    code::STREAM_UNDERRUN,
+                    format!("声音窗口欠载(按需解码未覆盖播放光标):{note}"),
+                ));
+            }
+            if let Some(diag) = error {
+                layer.stream.replace(None);
+                layer.end_ms = 0;
+                layer.set_position(0);
+                layer.state = PlayState::Stopped;
+                errors.push(diag);
+            }
+        }
+        for diag in errors {
+            self.report(diag);
+        }
     }
 
     /// SOUNDINFO 查询。返回写回 `LET` 的值；未取证字段返回错误。
@@ -824,6 +1020,9 @@ impl SoundState {
             });
         };
         let mut value: Option<Value> = None;
+        // DATALEFT/DATARIGHT 在播放光标按需取帧(可能触发一次懒定位);
+        // 这部分是 tick 内的真实解码成本,记进 tick 账单。
+        let mut query_decode_us = 0u64;
         for field in effective {
             value = Some(match field {
                 QueryField::Exist => Value::Int(i64::from(layer.file_type() != FileType::None)),
@@ -876,13 +1075,16 @@ impl SoundState {
                     // 音频；16-bit 分支逐位对齐）。光标越过 PCM 末尾时官方
                     // 读 ~1s 环形缓冲的回绕字节（内容不可预测），内核以 -1
                     // 显式化该未知。
-                    Value::Int(pcm_data_sample(layer, field == QueryField::DataRight))
+                    let (v, us) = pcm_data_sample(layer, field == QueryField::DataRight);
+                    query_decode_us = query_decode_us.saturating_add(us);
+                    Value::Int(v)
                 }
                 QueryField::Codec => {
                     Value::Int(layer.meta.as_ref().map(|m| m.codec.value()).unwrap_or(0))
                 }
             });
         }
+        self.tick_decode_us = self.tick_decode_us.saturating_add(query_decode_us);
         match value {
             Some(v) => Ok(v),
             None => Ok(Value::Int(0)),
@@ -912,8 +1114,41 @@ fn reset_for_load(layer: &mut Layer) {
     layer.fade = Fade::none();
 }
 
+/// 安装流式音源(OGG 头部流 / WAVE/ACM 整段)。
+///
+/// `TOTAL_TIME` 取流的总长:OGG = 官方 `ov_time_total`(最后 page granule),
+/// WAVE/ACM = 解码帧数(与旧路径逐值一致)。
+fn install_stream(layer: &mut Layer, stream: Stream) {
+    layer.meta = Some(SoundMeta {
+        file_type: match stream.codec() {
+            Codec::Ogg => FileType::Ogg,
+            Codec::Wav | Codec::Acm => FileType::Wav,
+        },
+        codec: stream.codec(),
+        channels: stream.channels(),
+        bits: stream.bits(),
+        sample_rate: stream.sample_rate(),
+    });
+    layer.total_ms = stream.total_ms();
+    layer.end_ms = layer.total_ms;
+    layer.set_position(0);
+    layer.state = PlayState::Loaded;
+    layer.stream.replace(Some(Box::new(stream)));
+}
+
+/// 装载失败:名字已写入、流清空;元数据/TOTALTIME 保留旧值(官方 type 1
+/// 不重置 `+0x105/+0x107/+0x120`)。
+fn fail_load(layer: &mut Layer, prev: (Option<SoundMeta>, i64)) {
+    layer.meta = prev.0;
+    layer.total_ms = prev.1;
+    layer.stream.replace(None);
+    layer.end_ms = 0;
+    layer.set_position(0);
+    layer.state = PlayState::Stopped;
+}
+
 fn start_play(layer: &mut Layer, fade_ms: i64) {
-    if layer.pcm.is_none() {
+    if layer.stream.borrow().is_none() {
         // 有 ID 无 FILE：保持 Stopped；引擎 type 2 在 `*pcVar2==0` 时返回 1。
         return;
     }
@@ -1078,49 +1313,56 @@ fn div_round(num: i64, den: i64) -> i64 {
 /// DATALEFT/DATARIGHT 的帧采样（证据锚点见 `query` 内注释；官方
 /// `0x44fe3c/0x44ff58`）。`right` 时复现官方 16-bit `ptr+4`（下一帧左声道）
 /// 与 8-bit `ptr[1]`（同帧右采样）分支；单声道/格式不符/越界 ⇒ -1。
-fn pcm_data_sample(layer: &Layer, right: bool) -> i64 {
+fn pcm_data_sample(layer: &Layer, right: bool) -> (i64, u64) {
+    let started = std::time::Instant::now();
+    let value = pcm_data_sample_inner(layer, right);
+    (
+        value,
+        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+    )
+}
+
+fn pcm_data_sample_inner(layer: &Layer, right: bool) -> i64 {
     let Some(meta) = layer.meta.as_ref() else {
-        return -1;
-    };
-    let Some(pcm) = layer.pcm.as_ref() else {
         return -1;
     };
     // 官方守卫读解码器格式字段（`+0x1ba` CHANNEL / `+0x1c6` BIT）。
     if !matches!(meta.channels, 1 | 2) || !matches!(meta.bits, 8 | 16) {
         return -1;
     }
-    let ch = pcm.channels as usize;
-    let rate = pcm.sample_rate as f64;
+    let mut guard = layer.stream_mut();
+    let Some(stream) = guard.as_mut() else {
+        return -1;
+    };
+    let rate = stream.sample_rate() as f64;
     if rate == 0.0 {
         return -1;
     }
+    let total = stream.total_frames();
     // 播放光标处的帧号（引擎 `GetCurrentPosition` ⇒ 字节光标；等价换算）。
     let frame = (layer.playhead_ms * rate / 1000.0).floor() as i64;
-    let frames = pcm.frames() as i64;
-    if frame < 0 || frame >= frames {
+    if frame < 0 || frame as u64 >= total {
         return -1;
     }
     // 官方以 32 位 abs 后截断回 i16：-32768 因回绕仍返回 -32768。
-    let abs16 = |v: i16| -> i64 {
-        i64::from(i32::from(v).wrapping_abs() as i16)
-    };
+    let abs16 = |v: i16| -> i64 { i64::from(i32::from(v).wrapping_abs() as i16) };
     if !right {
-        return abs16(pcm.samples[(frame * ch as i64) as usize]);
+        return stream.sample(frame as u64, 0).map(abs16).unwrap_or(-1);
     }
-    if ch == 1 {
+    if meta.channels == 1 {
         // 官方：单声道 DATARIGHT = -1。
         return -1;
     }
     if meta.bits == 8 {
         // 8-bit 立体声：官方读同帧第二采样 `ptr[1]`（锁区内）。
-        return abs16(pcm.samples[(frame * 2 + 1) as usize]);
+        return stream.sample(frame as u64, 1).map(abs16).unwrap_or(-1);
     }
     // 16-bit 立体声：官方读 `word [ptr+4]` = **下一帧的左声道**（锁区外怪癖）。
-    let next = (frame + 1) * 2;
-    if next >= (pcm.samples.len() as i64) {
+    let next = frame as u64 + 1;
+    if next >= total {
         return -1;
     }
-    abs16(pcm.samples[next as usize])
+    stream.sample(next, 0).map(abs16).unwrap_or(-1)
 }
 
 /// 引擎的文件名归一化（REA `0x45f348`）：ASCII 大写→小写，`\`→`/`。
