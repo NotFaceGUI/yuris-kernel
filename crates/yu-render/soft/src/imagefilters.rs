@@ -378,6 +378,12 @@ pub fn apply_merge(lower: &mut Texture, upper: &Texture, merge2: bool) {
                 }
                 lp[3] = (ao * 255.0).round().clamp(0.0, 255.0) as u8;
             } else {
+                // `MERGE` 的 alpha 口径(官方 `0x4405a4` 合并分支:只把上层
+                // 按设备混合画进下层表面,不读下层旧像素)⇒ 与普通 draw 相同
+                // 的同因子混合:`a² + la·(1−a)`。
+                let a = u32::from(up[3]);
+                let la = u32::from(lp[3]);
+                lp[3] = ((a * a + la * (255 - a) + 127) / 255) as u8;
                 // `MERGE` 的整数化(与 f64 实现**逐位一致**,见下方证明):
                 //
                 //   round(cl*(1-a/255) + cu*(a/255))
@@ -552,10 +558,54 @@ mod tests {
                         let co = cl * (1.0 - au) + cu * au;
                         out.rgba[li + c] = co.round().clamp(0.0, 255.0) as u8;
                     }
+                    // `MERGE` 的 alpha:`a² + la·(1−a)`(同因子混合;见
+                    // `apply_merge` 的注释与 `DIV-GFX-063` §2.4)。
+                    let a = u32::from(upper.rgba[ui + 3]);
+                    let la = u32::from(out.rgba[li + 3]);
+                    out.rgba[li + 3] = ((a * a + la * (255 - a) + 127) / 255) as u8;
                 }
             }
         }
         out
+    }
+
+    /// `MERGE` 的 alpha 口径(REA `0x4405a4`:只把上层画进下层表面,不读
+    /// 下层旧像素;D3D9 同因子混合 ⇒ `a² + la·(1−a)`):
+    /// 目标被清空(alpha=0)时,不透明上层必须把 alpha 写回 255 —— 这是
+    /// 「立绘换差分眨眼闪屏」的回归锚点。
+    #[test]
+    fn merge_writes_alpha_so_cleared_target_stays_visible() {
+        let mut lower = Texture {
+            width: 2,
+            height: 1,
+            rgba: vec![0, 0, 0, 0, 0, 0, 0, 0],
+        };
+        let upper = Texture {
+            width: 2,
+            height: 1,
+            rgba: vec![255, 0, 0, 255, 255, 0, 0, 255],
+        };
+        apply_merge(&mut lower, &upper, false);
+        assert_eq!(&lower.rgba[..4], &[255, 0, 0, 255]);
+        assert_eq!(&lower.rgba[4..8], &[255, 0, 0, 255]);
+    }
+
+    /// 半透明上层 + 半透明下层:`a² + la·(1−a)`(与 D3D9 同因子混合一致)。
+    #[test]
+    fn merge_alpha_uses_same_factor_blend() {
+        let mut lower = Texture {
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 0, 128],
+        };
+        let upper = Texture {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 0, 0, 160],
+        };
+        apply_merge(&mut lower, &upper, false);
+        let expected = ((160u32 * 160 + 128 * (255 - 160) + 127) / 255) as u8;
+        assert_eq!(lower.rgba[3], expected);
     }
 
     /// 行跨度 + 透明跳过必须**逐位**等于旧公式:随机内容(含整行透明/窄源)。

@@ -380,6 +380,9 @@ fn apply_image_op(
         if dx != 0.0 || dy != 0.0 {
             return Err("gfx.imageop.merge.offset.unsupported".to_string());
         }
+        // 下层 = 目标层当前表面(`st.texture_overrides` 是同帧加工结果)。
+        // 官方的合并执行体只把上层“画”进这块表面、不读它的旧像素;
+        // 清空后是否可见取决于 alpha 的混合口径(见 `apply_merge` 的注释)。
         let mut lower = match st.texture_overrides.remove(target) {
             Some(t) => Rc::try_unwrap(t).unwrap_or_else(|rc| (*rc).clone()),
             None => base_texture(textures, snapshots, frame, target)?,
