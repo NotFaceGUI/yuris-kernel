@@ -135,7 +135,7 @@ pub struct Layer {
     volume_current: i64,
     /// 引擎 `+0x150`（淡变目标）。
     volume_target: i64,
-    pcm: Option<Pcm>,
+    pcm: Option<std::sync::Arc<Pcm>>,
     position_ms: i64,
     /// 块间连续播放头(毫秒,浮点)。`position_ms` 是它的整数投影。
     /// 旧实现每个音频块都从整数毫秒重开,块边界最多 1ms 相位跳变。
@@ -219,7 +219,7 @@ impl Layer {
     }
 
     pub(crate) fn pcm(&self) -> Option<&Pcm> {
-        self.pcm.as_ref()
+        self.pcm.as_deref()
     }
 
     pub(crate) fn paused(&self) -> bool {
@@ -385,6 +385,13 @@ impl QueryField {
 pub struct SoundState {
     layers: BTreeMap<Vec<u8>, Layer>,
     loader: Box<dyn SoundLoader>,
+    /// 已解码 PCM 缓存(按解析后的文件名)。
+    ///
+    /// `SOUND` 命令在 VM tick 里**同步**解码:实测单帧 6 次 BGM 装载 235ms
+    /// (39ms/次)、场景初始化 205 次 158ms。同一文件反复装载(VN 常见:
+    /// 切场景回同一 BGM、SE 复用)以前每次都重解码;这里命中后只复制样本。
+    pcm_cache: BTreeMap<Vec<u8>, std::sync::Arc<Pcm>>,
+    pcm_cache_bytes: usize,
     clock_ms: i64,
     /// 设备回调驱动位置时,`advance(now_ms)` 只更新时钟,不推进层。
     external_clock: bool,
@@ -394,11 +401,16 @@ pub struct SoundState {
 
 const DIAG_CAP: usize = 4096;
 
+/// 解码缓存上限(采样字节,含帧副本)。超出后不再插入新条目(已有命中仍生效)。
+const PCM_CACHE_CAP: usize = 96 * 1024 * 1024;
+
 impl SoundState {
     pub fn new(loader: Box<dyn SoundLoader>) -> Self {
         Self {
             layers: BTreeMap::new(),
             loader,
+            pcm_cache: BTreeMap::new(),
+            pcm_cache_bytes: 0,
             clock_ms: 0,
             external_clock: false,
             diags: Vec::new(),
@@ -716,9 +728,17 @@ impl SoundState {
                 layer.fade = Fade::none();
                 layer.state = PlayState::Stopped;
             }
+            // 诊断必须带上**归一化后真正尝试的候选名**:脚本里的原始参数与
+            // 实际查找键可能不同(小写归一/扩展名探测),只打原始参数会让
+            // “名字被改写”与“文件确实不存在”看起来一模一样。
+            let tried = candidates
+                .iter()
+                .map(|candidate| display(candidate))
+                .collect::<Vec<_>>()
+                .join(", ");
             self.report(error::recoverable(
                 code::FILE_MISSING,
-                format!("SOUND 文件未找到: {}", display(file)),
+                format!("SOUND 文件未找到: {}（已尝试: {tried}）", display(file)),
             ));
             return LoadOutcome::NotFound;
         };
@@ -727,7 +747,25 @@ impl SoundState {
         reset_for_load(layer);
         layer.file_arg = resolved.clone();
         layer.resolved = resolved.clone();
-        match decode(&resolved, &bytes) {
+        // 解码缓存:同一文件反复装载(VN 常见:切回同一 BGM、SE 复用)不再重解码。
+        // 命中 = `Arc` 克隆(旧实现 `(**hit).clone()` 把整段 PCM 复制一遍:
+        // 90 秒 BGM 是 16MB,每次重播都要 memcpy 2–4ms)。
+        let decoded = match self.pcm_cache.get(&resolved) {
+            Some(hit) => Ok(std::sync::Arc::clone(hit)),
+            None => match decode(&resolved, &bytes) {
+                Ok(pcm) => {
+                    let pcm = std::sync::Arc::new(pcm);
+                    let bytes_len = pcm.samples.len() * std::mem::size_of::<i16>();
+                    if self.pcm_cache_bytes + bytes_len <= PCM_CACHE_CAP {
+                        self.pcm_cache_bytes += bytes_len;
+                        self.pcm_cache.insert(resolved.clone(), std::sync::Arc::clone(&pcm));
+                    }
+                    Ok(pcm)
+                }
+                Err(diag) => Err(diag),
+            },
+        };
+        match decoded {
             Ok(pcm) => {
                 layer.total_ms = pcm.total_ms();
                 layer.end_ms = layer.total_ms;
@@ -1086,23 +1124,52 @@ fn pcm_data_sample(layer: &Layer, right: bool) -> i64 {
 }
 
 /// 引擎的文件名归一化（REA `0x45f348`）：ASCII 大写→小写，`\`→`/`。
+///
+/// **必须按 CP932 字符推进**：双字节字符的尾字节可以落在 ASCII 大写区间
+/// （`コ`=`83 52` 的尾字节是 `'R'`、`イ`=`83 43` 的尾字节是 `'C'`），逐字节
+/// 折小写会把字符改成别的一个（`コトネイロ` → `ビトネツロ`），包里存在的
+/// 资产因此查不到。官方处理体不逐字节改写（同名文件在包内可装载即为证）。
+/// 与 `yu_rt::cp932_text` 同一口径 —— `VARACT` 的 `ascii_case` 已踩过同类
+/// 事故（厂商 LOGO `cg/ev/サークル.jpg` 被改写导致片头黑屏）。
 pub fn normalize_name(file: &[u8]) -> Vec<u8> {
-    file.iter()
-        .map(|&b| match b {
+    let mut out = Vec::with_capacity(file.len());
+    let mut i = 0;
+    while i < file.len() {
+        let step = yu_rt::cp932_text::char_len_at(file, i);
+        if step == 2 {
+            out.extend_from_slice(&file[i..i + step]);
+            i += step;
+            continue;
+        }
+        let b = file[i];
+        out.push(match b {
             b'\\' => b'/',
             b'A'..=b'Z' => b + 0x20,
             other => other,
-        })
-        .collect()
+        });
+        i += 1;
+    }
+    out
+}
+
+/// 尾部 ASCII 后缀比较（大小写不敏感）。
+///
+/// 只看末尾若干字节：`.ogg`/`.wav` 的 `.`(`0x2E`)既不是 CP932 的 lead，
+/// 也不在尾字节区间(`0x40..=0x7E`/`0x80..=0xFC`)，所以这 4 个字节必定是
+/// 4 个单字节字符，逐字节比较不可能切进双字节字符；不需要（也不能）先把
+/// 整串折小写。
+fn ends_with_ascii_ci(name: &[u8], suffix: &[u8]) -> bool {
+    name.len() >= suffix.len() && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
 /// 引擎扩展名探测序（手册原文 + REA `0x40c9b4`）：
 /// 已带 `.ogg`/`.wav` 则原样；否则 `(无扩展名) → .ogg → .wav`。
-/// 二进制里的追加串是小写（`0x8079dc/0x8079e4`）。
+/// 二进制里的追加串是小写（`0x8079dc/0x8079e4`）。引擎在尾部比较之前已对
+/// 整串做过字符级小写归一，因此这里的大小写不敏感与引擎顺序一致（直接调用
+/// 本函数也不依赖调用方先归一）。
 pub fn probe_names(file: &[u8]) -> Vec<Vec<u8>> {
     let mut out = vec![file.to_vec()];
-    let lower = file.to_ascii_lowercase();
-    if !(lower.ends_with(b".ogg") || lower.ends_with(b".wav")) {
+    if !(ends_with_ascii_ci(file, b".ogg") || ends_with_ascii_ci(file, b".wav")) {
         let mut ogg = file.to_vec();
         ogg.extend_from_slice(b".ogg");
         out.push(ogg);

@@ -707,6 +707,7 @@ impl VariableStore {
     }
 
     /// 读取(标量或数组元素)。未声明 → `rt.var.undeclared`。
+    ///
     pub fn read(&self, r: VarRef, indices: &[i64]) -> Result<Value, yu_log::Diag> {
         let slot = self.slots.get(&(r.space, r.id)).ok_or_else(|| {
             // 引擎错误文案「変数を初期化しないで使用しようとしました。」
@@ -736,12 +737,14 @@ impl VariableStore {
 
     /// 写入:`indices` 空 = 标量;数组元素写入,类型按**槽位当前类型**转换。
     /// 写时无跨类型转换(§3.10 结论一)——只有同类型的旧值被替换。
+    /// 写入。返回值：所有调用方都丢弃(旧签名返回存储值，白白多一次
+    /// `Value` 克隆 —— 字符串变量就是一次堆复制)。
     pub fn write(
         &mut self,
         r: VarRef,
         indices: &[i64],
         value: &Value,
-    ) -> Result<Value, yu_log::Diag> {
+    ) -> Result<(), yu_log::Diag> {
         let slot = self.slots.get_mut(&(r.space, r.id)).ok_or_else(|| {
             diag::fatal(
                 code::rt::VAR_UNDECLARED,
@@ -753,21 +756,21 @@ impl VariableStore {
             )
         })?;
         let ty = slot.ty;
-        let stored = coerce_to(ty, value);
         if slot.is_scalar() && indices.is_empty() {
-            slot.data[0] = stored.clone();
+            slot.data[0] = coerce_to(ty, value);
             self.bump();
-            return Ok(stored);
+            return Ok(());
         }
+        let stored = coerce_to(ty, value);
         let flat = if indices.is_empty() {
             let zeros: smallvec::SmallVec<[i64; 4]> = smallvec::smallvec![0i64; slot.dims.len()];
             linear_offset_for(Some(r), &slot.dims, &zeros)?
         } else {
             linear_offset_for(Some(r), &slot.dims, indices)?
         };
-        slot.data[flat] = stored.clone();
+        slot.data[flat] = stored;
         self.bump();
-        Ok(stored)
+        Ok(())
     }
 
     /// 槽位类型/维数(诊断与 `VARINFO` 用)。

@@ -84,7 +84,7 @@ pub use yu_render_core::{AssetIssue, RenderReport, SkippedOp, Surface, TextureSt
 
 use std::sync::Arc;
 
-use yu_gfx::{BlendMode, CompositorFrame, Viewport};
+use yu_gfx::{BlendMode, CompositorFrame, CopyId, Viewport};
 use yu_log::Diag;
 
 use crate::device::backend_name;
@@ -118,6 +118,8 @@ pub struct GpuStats {
     pub cached_textures: usize,
     /// 当前缓存的离屏目标数。
     pub offscreen_targets: usize,
+    /// 当前图层级 GPU 合成目标数(`CGACT[TRANSITION]` 的 GPU 路径)。
+    pub layer_composites: usize,
     /// 本帧顶点缓冲字节数。
     pub vertex_bytes: u64,
     /// 本帧读回字节数。
@@ -179,6 +181,12 @@ pub struct WgpuRenderer {
     readback: ReadbackCache,
     /// 显示缩放输出的读回(与主读回分开:同帧两次读共用一块缓冲会互踩)。
     scale_readback: ReadbackCache,
+    /// 快照按需读回(SAVE 抓帧器缺失 CPU 镜像时;与屏幕流式读回分开,
+    /// 不能共用缓冲:流式读回的下一次 `collect` 会被踩掉)。
+    snapshot_readback: ReadbackCache,
+    /// 本帧 GPU 纹理拷贝字节/次数(诊断;`copy_texture_to_texture` 的读写合计)。
+    frame_copy_bytes: u64,
+    frame_copy_count: u64,
     total_draw_calls: u64,
     /// 图像加工覆盖纹理的跨帧缓存:`LayerId -> (gpu_id, w, h, content_hash)`。
     /// 内容未变时复用 GPU 纹理,避免逐帧重传(600 帧验收)。
@@ -196,6 +204,8 @@ pub struct WgpuRenderer {
     backbuffer_gpu: Option<(u64, u64)>,
     /// 文本栅格化/合成器(与 soft 同一实现;懒加载系统字体)。
     text: yu_render_core::TextComposer,
+    /// 最近一帧的阶段耗时(性能取证;不进入 `RenderReport` 的对账字段)。
+    last_phases: yu_render_core::RenderPhases,
 }
 
 impl WgpuRenderer {
@@ -220,6 +230,9 @@ impl WgpuRenderer {
             vertex_buffer: None,
             readback: ReadbackCache::new(),
             scale_readback: ReadbackCache::new(),
+            snapshot_readback: ReadbackCache::new(),
+            frame_copy_bytes: 0,
+            frame_copy_count: 0,
             total_draw_calls: 0,
             uploaded_overrides: std::collections::BTreeMap::new(),
             image_cache: std::collections::BTreeMap::new(),
@@ -227,6 +240,7 @@ impl WgpuRenderer {
             backbuffer: None,
             backbuffer_gpu: None,
             text: yu_render_core::TextComposer::new(),
+            last_phases: yu_render_core::RenderPhases::default(),
         })
     }
 
@@ -239,6 +253,34 @@ impl WgpuRenderer {
     /// 文本合成器(诊断/测试用)。
     pub fn text_composer(&mut self) -> &mut yu_render_core::TextComposer {
         &mut self.text
+    }
+
+    /// 最近一帧的阶段耗时(微秒;宿主逐帧 CSV / 长帧取证)。
+    #[must_use]
+    pub fn render_phases(&self) -> yu_render_core::RenderPhases {
+        self.last_phases
+    }
+
+    /// GPU 资源计数:`(合成目标, 组离屏, 快照)`。用于退出摘要核对显存不泄漏。
+    #[must_use]
+    pub fn resource_counts(&self) -> (usize, usize, usize) {
+        (
+            self.targets.composite_count(),
+            self.targets.offscreen_count(),
+            self.targets.snapshot_count(),
+        )
+    }
+
+    /// 全部 GPU 目标占用字节(诊断:确认显存不随场景累积)。
+    #[must_use]
+    pub fn target_bytes(&self) -> usize {
+        self.targets.allocated_bytes()
+    }
+
+    /// 快照的 CPU 镜像(共享 `Rc`;`SAVE[ID]` 抓帧器直接复用,不再整帧回放)。
+    #[must_use]
+    pub fn snapshot_cpu_shared(&self, id: CopyId) -> Option<std::rc::Rc<yu_render_core::Texture>> {
+        self.targets.snapshot_cpu_shared(id)
     }
 
     /// 预枚举系统字体(宿主启动时;见 `TextComposer::warm`)。
@@ -367,6 +409,28 @@ impl WgpuRenderer {
         Some((target.id, target.width, target.height, &target.texture))
     }
 
+    /// 同步读回一张**快照**纹理(SAVE 抓帧器的按需镜像;低频)。
+    ///
+    /// 只读回该快照,不重放整帧:差分切换每帧产生新 CopyId,旧实现让离屏
+    /// 软后端整帧重放(实测 300–360ms/次),这里 1–8ms。
+    pub fn read_snapshot(&mut self, id: CopyId) -> Option<Surface> {
+        let (width, height, texture) = {
+            let target = self.targets.snapshot(id)?;
+            (target.width, target.height, target.texture.clone())
+        };
+        let encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("yu-backend-wgpu read snapshot"),
+            });
+        let surface = self
+            .snapshot_readback
+            .read_now(&self.ctx, &texture, width, height, encoder)
+            .ok()?;
+        Some(surface)
+    }
+
     /// 同步读回**当前**屏幕纹理(`--shot` 末帧精确像素;低频)。
     pub fn read_screen_now(&mut self) -> Result<Surface, Diag> {
         let (width, height, texture) = {
@@ -402,10 +466,13 @@ impl WgpuRenderer {
         let timing = std::env::var("YU_RENDER_TIMING").is_ok();
         let started = std::time::Instant::now();
         self.textures.begin_frame();
+        self.frame_copy_bytes = 0;
+        self.frame_copy_count = 0;
+        let snapshots_before = self.targets.resource_counts().2;
         let uploads_before = self.gpu_textures.total_uploads;
         let bytes_before = self.gpu_textures.total_upload_bytes;
 
-        let (plan, report) = passes::plan(
+        let (plan, report, mut phases) = passes::plan(
             &self.ctx,
             frame,
             &mut self.textures,
@@ -467,6 +534,19 @@ impl WgpuRenderer {
             }
         };
         let t_readback = started.elapsed() - t_read0;
+        phases.plan_us = t_plan.as_micros() as u64;
+        phases.encode_us = t_encode.as_micros() as u64;
+        phases.readback_us = t_readback.as_micros() as u64;
+        phases.draw_calls = draw_calls;
+        phases.copy_bytes = self.frame_copy_bytes;
+        phases.copy_count = self.frame_copy_count;
+        phases.snapshot_alloc = self
+            .targets
+            .resource_counts()
+            .2
+            .saturating_sub(snapshots_before) as u64;
+        phases.uploads = self.gpu_textures.total_uploads - uploads_before;
+        phases.upload_bytes = self.gpu_textures.total_upload_bytes - bytes_before;
         // 屏幕是 opaque 窗口(与 soft 的最终屏幕归一、浏览器 canvas 的
         // alphaMode=opaque 一致);组 RT alpha 不进入呈现读回。
         force_opaque(&mut screen_surface);
@@ -528,6 +608,10 @@ impl WgpuRenderer {
         }
 
         self.backbuffer = Some(screen_surface);
+        phases.tail_us = (started.elapsed().as_micros() as u64)
+            .saturating_sub(phases.plan_us + phases.encode_us + phases.readback_us);
+        phases.readback_bytes = readback_bytes;
+        self.last_phases = phases;
         let stats = GpuStats {
             adapter: self.ctx.adapter_info.clone(),
             draw_calls,
@@ -541,6 +625,7 @@ impl WgpuRenderer {
             bind_groups: self.pipelines.bind_groups(),
             cached_textures: self.gpu_textures.cached_textures(),
             offscreen_targets: self.targets.offscreen_count(),
+            layer_composites: self.targets.composite_count(),
             vertex_bytes: vertex_bytes.len() as u64,
             readback_bytes,
         };
@@ -563,12 +648,16 @@ impl WgpuRenderer {
             .is_none_or(|slot| slot.capacity < needed);
         if recreate {
             let capacity = needed.next_power_of_two().max(64 * 1024);
-            let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("yu-backend-wgpu vertices"),
-                size: capacity,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let buffer = self
+                .ctx
+                .checked_oom(&format!("vertex buffer {capacity}B"), || {
+                    self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("yu-backend-wgpu vertices"),
+                        size: capacity,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                })?;
             self.vertex_buffer = Some(VertexBufferSlot { buffer, capacity });
         }
         let slot = self
@@ -631,6 +720,58 @@ impl WgpuRenderer {
                                 depth_or_array_layers: 1,
                             },
                         );
+                        self.frame_copy_bytes = self.frame_copy_bytes.saturating_add(
+                            u64::from(copy.extent.0)
+                                .saturating_mul(u64::from(copy.extent.1))
+                                .saturating_mul(8),
+                        );
+                        self.frame_copy_count += 1;
+                    }
+                    // 通用纹理 → 纹理整面复制(`MERGE` 下层快照 → 临时槽)。
+                    for blit in &pass.blits {
+                        // 源快照缺失 = 该 COPY 本帧没成功落地(被跳过/源不可解析)。
+                        // 跳过这条 blit(以及依赖它的合成 pass 会因目标缺失跳过),
+                        // 不让整帧 fatal。
+                        let Some(source) = targets
+                            .snapshot(blit.source)
+                            .map(|target| &target.texture)
+                        else {
+                            log::warn!(
+                                target: "yu-render",
+                                "[blit] snapshot {} missing; skipped",
+                                blit.source.0
+                            );
+                            continue;
+                        };
+                        let dest = targets.texture_by_id(blit.dest_id).ok_or_else(|| {
+                            Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                                .with_detail(format!("BLIT 目标纹理 {} 缺失", blit.dest_id))
+                        })?;
+                        encoder.copy_texture_to_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: source,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::TexelCopyTextureInfo {
+                                texture: dest,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::Extent3d {
+                                width: blit.width,
+                                height: blit.height,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                        self.frame_copy_bytes = self.frame_copy_bytes.saturating_add(
+                            u64::from(blit.width)
+                                .saturating_mul(u64::from(blit.height))
+                                .saturating_mul(8),
+                        );
+                        self.frame_copy_count += 1;
                     }
                     // 快照上的 RECTPAINT 族:逐条独立 render pass(Load 保留内容)。
                     for paint in &pass.paints {
@@ -722,9 +863,42 @@ impl WgpuRenderer {
                             .with_detail(format!("缺少离屏目标 {}", id.display()))
                     })?,
                     PlannedTarget::Commands => unreachable!("handled above"),
+                    // 合成/快照目标在下面的 `target_view` 里解析。
+                    PlannedTarget::Composite(_) | PlannedTarget::Snapshot(_) => {
+                        targets.screen().ok_or_else(|| {
+                            Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                                .with_detail("缺少屏幕目标")
+                        })?
+                    }
+                };
+                // 图层级合成 pass 的目标按**纹理 id** 查(槽位由 Override 决定,
+                // 不绑定 LayerId 单键)。
+                let composite_view;
+                let target_view: &wgpu::TextureView = match planned_target {
+                    PlannedTarget::Composite(gpu_id) => {
+                        composite_view = targets.view_by_id(*gpu_id).ok_or_else(|| {
+                            Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform).with_detail(
+                                format!("缺少图层合成目标 {gpu_id}"),
+                            )
+                        })?;
+                        composite_view
+                    }
+                    PlannedTarget::Snapshot(copy_id) => {
+                        let Some(target) = targets.snapshot(*copy_id) else {
+                            log::warn!(
+                                target: "yu-render",
+                                "[merge] snapshot {} missing; pass skipped",
+                                copy_id.0
+                            );
+                            continue;
+                        };
+                        composite_view = &target.view;
+                        composite_view
+                    }
+                    _ => &target.view,
                 };
                 let attachments = [Some(wgpu::RenderPassColorAttachment {
-                    view: &target.view,
+                    view: target_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -760,6 +934,8 @@ impl WgpuRenderer {
                         passes::DrawKind::TransitionPsd { .. } => {
                             (pipelines.psd_pipeline(draw.blend), 3)
                         }
+                        passes::DrawKind::Lerp { .. } => (pipelines.lerp_pipeline(), 4),
+                        passes::DrawKind::Merge { .. } => (pipelines.layer_merge_pipeline(), 5),
                     };
                     let pipeline = pipeline.ok_or_else(|| {
                         Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform).with_detail(
@@ -784,6 +960,12 @@ impl WgpuRenderer {
                         | passes::DrawKind::TransitionPsd { bind_index } => {
                             &plan.transition_bind_groups[*bind_index as usize]
                         }
+                        passes::DrawKind::Lerp { bind_index } => {
+                            &plan.lerp_bind_groups[*bind_index as usize]
+                        }
+                        passes::DrawKind::Merge { bind_index } => {
+                            &plan.merge_bind_groups[*bind_index as usize]
+                        }
                         passes::DrawKind::Quad => pipelines
                             .bind_group(draw.texture_id, draw.filter)
                             .ok_or_else(|| {
@@ -800,14 +982,28 @@ impl WgpuRenderer {
                         | passes::DrawKind::TransitionPsd { bind_index } => {
                             (u64::MAX - u64::from(*bind_index), draw.filter)
                         }
+                        passes::DrawKind::Lerp { bind_index } => {
+                            (u64::MAX / 2 - u64::from(*bind_index), draw.filter)
+                        }
+                        passes::DrawKind::Merge { bind_index } => {
+                            (u64::MAX / 4 - u64::from(*bind_index), draw.filter)
+                        }
                         passes::DrawKind::Quad => (draw.texture_id, draw.filter),
                     };
                     if current_bind != Some(bind_key) {
                         render_pass.set_bind_group(0, bind, &[]);
                         current_bind = Some(bind_key);
                     }
-                    let first = pass.first_vertex + (index as u32) * 6;
-                    render_pass.draw(first..first + 6, 0..1);
+                    // lerp/merge 用全屏三角形(`@builtin(vertex_index)`),不读顶点缓冲。
+                    if matches!(
+                        draw.kind,
+                        passes::DrawKind::Lerp { .. } | passes::DrawKind::Merge { .. }
+                    ) {
+                        render_pass.draw(0..3, 0..1);
+                    } else {
+                        let first = pass.first_vertex + (index as u32) * 6;
+                        render_pass.draw(first..first + 6, 0..1);
+                    }
                 }
             }
         }

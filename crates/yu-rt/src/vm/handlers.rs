@@ -345,10 +345,23 @@ impl Vm {
                 }
             }
             if let Ok(v) = self.eval_window(st, w) {
-                let mut arg = ArgValue::new(w.rec.kind, v);
-                // 参数种类 2(`X+=` 源写法)= 增量。消费方(gfx CG/CGACT
-                // 等)按 `offset` 加到当前值;零增量不得清零位置。
-                arg.offset = w.rec.slot & 0xff00 != 0;
+                // 复合赋值算子 = 窗口 `slot` 的高字节(低字节是求值 subtype):
+                // **1 = `+=`,2 = `-=`**。
+                //
+                // 证据(0.495 官方编译产物实测):
+                // - `es_Sprite.yst:8173 CG[… X+=(…)]` → 窗口 `X~1`;
+                // - `es_SaveLoad.yst:623 CG[ID=$id A-=8]` → 窗口 `A~2`;
+                // - `es_Scenario.yst:244/1319`、`ES_ReplayMode.yst:111/389`
+                //   的淡出循环同样是 `A-=`。
+                //
+                // 消费方(gfx `CG/CGACT`)只认 `offset` = 「加到当前值」,所以
+                // `-=` 在这里先取负。曾经把两种算子都当加法:`A-=8` 把
+                // 256 一路加到 512(不 clamp)⇒ 全屏截图幕布(CGS999)永远
+                // 淡不掉,读档完成后画面停在读档界面上(2026-10-27 实测)。
+                let comp = w.rec.slot >> 8;
+                let (value, offset) = compose_window_arg(comp, v);
+                let mut arg = ArgValue::new(w.rec.kind, value);
+                arg.offset = offset;
                 args.push(arg);
             }
         }
@@ -593,11 +606,10 @@ impl Vm {
             if w.rec.length == 0 {
                 continue;
             }
-            let pname = self.param_name(cmd.opcode, w.rec.kind).unwrap_or_default();
-            let idx = param_slot_index(&pname, cmd.windows[0].rec.kind, "GOSUB")?;
+            let (n, ty) = self.param_plan(cmd.opcode, w.rec.kind);
+            let idx = checked_param_index(n, cmd.opcode, w.rec.kind, self, "GOSUB")?;
             let value = self.eval_window(st, w)?;
-            let value = coerce_param(&pname, value);
-            frame.args[idx] = Some(value);
+            frame.args[idx] = Some(ty.coerce(value));
             frame.arg_flags[idx] = true;
         }
         if st.frames.len() > GOSUB_MAX_CALLS {
@@ -635,13 +647,12 @@ impl Vm {
             if w.rec.length == 0 {
                 continue;
             }
-            let pname = self.param_name(cmd.opcode, w.rec.kind).unwrap_or_default();
             // 与 GOSUB 同一守卫:此前 RETURN 缺这条,**`RINT0` 会 usize 下溢、
             // `RINT17+` 会越界 panic**(DIV-RT-034「panic 收口」)。
-            let idx = param_slot_index(&pname, w.rec.kind, "RETURN")?;
+            let (n, ty) = self.param_plan(cmd.opcode, w.rec.kind);
+            let idx = checked_param_index(n, cmd.opcode, w.rec.kind, self, "RETURN")?;
             let value = self.eval_window(st, w)?;
-            let value = coerce_param(&pname, value);
-            ret[idx] = Some(value);
+            ret[idx] = Some(ty.coerce(value));
             flags[idx] = true;
         }
         let frame = st.frames.pop().expect("帧数 > 1");
@@ -1166,12 +1177,11 @@ impl Vm {
             )
             .into());
         }
-        let lval = self.eval_lvalue_window(st, &cmd.windows[0])?;
+        let mut lval = self.eval_lvalue_window(st, &cmd.windows[0])?;
         // ERIS 旧式空间按 id 的声明类型归一化;其它未知前缀挂号继续(DIV-RT-017)。
-        let lval = crate::expr::LValue {
-            var: self.canonical_var(lval.var),
-            indices: lval.indices.clone(),
-        };
+        // 就地改写:此处原本重建一个 LValue 并克隆 indices,而标量写入
+        // (99% 的 LET)根本不需要下标表。
+        lval.var = self.canonical_var(lval.var);
         if matches!(lval.var.space, VarSpace::Other(_)) {
             return Err(diag::unimplemented(
                 code::rt::EXPR_UNSUPPORTED,
@@ -1358,8 +1368,11 @@ impl Vm {
             Some(w) if !w.payload.is_empty() => self.eval_window(st, w)?,
             _ => ty.default_value(),
         };
+        // 复用已有槽存储:同型同维时只重置元素值(可观察状态与 `declare`
+        // 一致,见 `VariableStore::reset_declared` 文档);循环里反复声明同一
+        // 变量时不再每轮重建两个 `Vec` + 一次哈希重插。
         self.store
-            .declare(target_var(&cmd.windows[0])?, ty, &dims, &init);
+            .reset_declared(target_var(&cmd.windows[0])?, ty, &dims, &init);
         let _ = st;
         Ok(StepOutcome::Continue)
     }
@@ -1628,7 +1641,7 @@ impl Vm {
             }
         }
         // 旗标一律**按参数名**判定(槽号在版本间会位移,见 `Vm::param_slot`)。
-        let names = self.param_names(cmd.opcode);
+        let names = std::rc::Rc::clone(&cmd.param_names);
         let slot_of = |want: &str| names.iter().position(|n| n == want).map(|i| i as u8);
         let flag = |want: &str| {
             slot_of(want).and_then(|slot| flags.iter().find(|(s, _)| *s == slot).map(|(_, v)| *v))
@@ -2071,7 +2084,7 @@ impl Vm {
         // 引擎建任务时先把 T* 寄存器逐槽清零(`0x450916..0x450943`:
         // `+0x348/+0x34c`=TFLT、`+0x3d0/+0x3d4`=TINT、`+0x458`=TSTR),
         // 再按 TINT/TFLT/TSTR 参数落位 ⇒ **未传的槽为 0,不继承调用者**。
-        let names = self.param_names(cmd.opcode);
+        let names = std::rc::Rc::clone(&cmd.param_names);
         let mut tints = [0i64; 16];
         let mut tflts = [0f64; 16];
         let mut tstrs: [Vec<u8>; 16] = std::array::from_fn(|_| Vec::new());
@@ -2238,7 +2251,7 @@ impl Vm {
                     if let (Some(sp), Some(sid)) = (decoded_pos.take(), decoded_sid) {
                         Self::apply_scriptpos(&mut fresh, sp, sid);
                     }
-                    self.exec.insert(seed.id.clone(), fresh);
+                    self.exec.insert(seed.id.clone(), Box::new(fresh));
                 }
                 self.emit(VmEvent::TaskSpawn {
                     frame: self.frame(),
@@ -2267,7 +2280,7 @@ impl Vm {
                         // 目标任务还没有执行位:按解码出的入口新建,再落完整状态。
                         let mut fresh = ExecState::new(sid, sp.pc);
                         Self::apply_scriptpos(&mut fresh, sp, sid);
-                        self.exec.insert(target_id.clone(), fresh);
+                        self.exec.insert(target_id.clone(), Box::new(fresh));
                     } else {
                         // 引擎 `0x4507b4`:`test ebx; je` ⇒ 无 ID/无目标任务 = 错误。
                         return Err(diag::fatal(
@@ -2358,7 +2371,7 @@ impl Vm {
         task: &crate::task::TaskNode,
         cmd: &Cmd,
     ) -> Result<StepOutcome, VmError> {
-        let names = self.param_names(cmd.opcode);
+        let names = std::rc::Rc::clone(&cmd.param_names);
         let mut id: Option<String> = None;
         let mut target: Option<crate::expr::LValue> = None;
         // 查询槽按**名字**收集存在性(引擎 0x4523fc 看窗口存在,不看值;
@@ -4353,7 +4366,7 @@ impl Vm {
     /// 然后把 `SET` 的字节原样写入 Windows 剪贴板(CF_TEXT)。内核保存
     /// 同一份 CP932 字节镜像并同步发域事件,由宿主写入 OS 剪贴板。
     fn op_clipact(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        let params = self.param_names(cmd.opcode);
+        let params = std::rc::Rc::clone(&cmd.param_names);
         let mut text_present = false;
         let mut set: Option<Vec<u8>> = None;
         let mut args: Vec<ArgValue> = Vec::new();
@@ -4411,7 +4424,7 @@ impl Vm {
     /// 字节表(`0x5b40c0`)定长拷贝,并**丢弃所有 `< 0x20` 的字节**
     /// (`0x43e4d2..0x43e54d`);结果写入 `LET`(字符串变量)。
     fn op_clipinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        let params = self.param_names(cmd.opcode);
+        let params = std::rc::Rc::clone(&cmd.param_names);
         let mut text_present = false;
         let mut target: Option<crate::expr::LValue> = None;
         let mut args: Vec<ArgValue> = Vec::new();
@@ -4471,7 +4484,7 @@ impl Vm {
     /// 引擎初始化时把 128 字节全置 1(`0x462124`)。该表的消费者未定位,
     /// 所以内核只保存、不据此改变分派(DIV-RT-046)。
     fn op_error(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        let params = self.param_names(cmd.opcode);
+        let params = std::rc::Rc::clone(&cmd.param_names);
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
@@ -4749,12 +4762,6 @@ impl Vm {
         if exist {
             if let (Some(name), Some(t)) = (name, target) {
                 let found = self.find_label(&name).is_some();
-                if std::env::var_os("YU_LABEL_TRACE").is_some()
-                    && (name.windows(7).any(|w| w == b"BTN.YES")
-                        || name.windows(6).any(|w| w == b"BTN.NO"))
-                {
-                    let _ = (String::from_utf8_lossy(&name), found);
-                }
                 self.write_target(st, &t, &Value::Int(found as i64))?;
             }
         }
@@ -4778,11 +4785,25 @@ impl Vm {
         st: &ExecState,
         cmd: &Cmd,
         index: usize,
-    ) -> Result<crate::tables::Label, VmError> {
+    ) -> Result<crate::vm::LabelTarget, VmError> {
         let w = cmd
             .windows
             .get(index)
             .ok_or_else(|| windows_error(cmd, "缺少标签窗口"))?;
+        // 常量标签(窗口里没有变量引用)按调用点缓存:官方语料的
+        // `GOSUB #label` 每帧成千上万次,旧实现每次都重解码窗口、
+        // 在 BTreeMap 里按字节查表、再把 `Label` 的两个堆字符串克隆一遍。
+        let constant = w
+            .instrs
+            .as_deref()
+            .map(|instrs| instrs.iter().all(|i| !matches!(i.op, 0x48 | 0x56 | 0x76)))
+            .unwrap_or(false);
+        let site = (st.script_id, cmd.pc);
+        if constant {
+            if let Some(hit) = self.label_cache.get(&site) {
+                return Ok(*hit);
+            }
+        }
         let value = self.eval_window(st, w)?;
         let Value::Str(name) = value else {
             return Err(diag::fatal(
@@ -4792,23 +4813,23 @@ impl Vm {
             )
             .into());
         };
-        if std::env::var_os("YU_LABEL_TRACE").is_some() {
-            let text = String::from_utf8_lossy(&name);
-            if ["BTN.YES", "BTN.NO", "S.RETURN", "CGTSS", "es.Load", "LOADCONF"]
-                .iter()
-                .any(|k| text.contains(k))
-            {
-                let _ = &text;
-            }
-        }
-        self.find_label(&name).ok_or_else(|| {
+        let label = self.find_label(&name).ok_or_else(|| {
             let d = diag::fatal(
                 code::rt::LABEL,
                 Boundary::Script,
                 format!("标签不存在:{}", cp932_lossy(&name)),
             );
             VmError::Fatal(d)
-        })
+        })?;
+        let target = crate::vm::LabelTarget {
+            script_id: label.script_id as u32,
+            pc: label.pc,
+            base_a: label.base_a,
+        };
+        if constant {
+            self.label_cache.insert(site, target);
+        }
+        Ok(target)
     }
 
     fn jump_to(
@@ -4941,6 +4962,22 @@ fn windows_error(cmd: &Cmd, detail: &str) -> yu_log::Diag {
 /// 同一格:名字里的后缀 N ⇒ 索引 `N-1`。2026-10-25 审查发现 `RETURN`
 /// 少了 GOSUB 已有的边界守卫,`RINT0` 会 `usize` 下溢、`RINT17+` 会越界,
 /// 故抽成本函数统一口径。
+/// `GOSUB`/`RETURN` 参数编号守卫(1..=16)。零分配快路径:编号合法就直接
+/// 返回 0 基下标;不合法才回到旧路径取参数名生成**原文案**(含 ysc 表异常)。
+fn checked_param_index(
+    n: usize,
+    opcode: u8,
+    slot: u8,
+    vm: &crate::vm::Vm,
+    command: &str,
+) -> Result<usize, VmError> {
+    if (1..=16).contains(&n) {
+        return Ok(n - 1);
+    }
+    let pname = vm.param_name(opcode, slot).unwrap_or_default(); // silent-ok:诊断文案用,缺声明即空名
+    param_slot_index(&pname, slot, command)
+}
+
 fn param_slot_index(name: &str, slot: u8, command: &str) -> Result<usize, VmError> {
     let n = param_index_of(name).unwrap_or(1);
     if !(1..=16).contains(&n) {
@@ -4973,15 +5010,42 @@ pub(crate) fn param_index_of(name: &str) -> Option<usize> {
     }
 }
 
+/// 命令窗口复合赋值算子 → (交给宿主的增量值, 是否增量)。
+///
+/// 算子 = 窗口 `slot` 的高字节:**1 = `+=`,2 = `-=`**(0 = 普通赋值)。
+/// 证据:`es_Sprite.yst:8173` 的 `X+=` 编译为 `X~1`;`es_SaveLoad.yst:623`
+/// 的 `A-=` 编译为 `A~2`(0.495 官方产物,`dump_pc_cmds 19` 实测)。
+/// `-=` 在这里取负,宿主统一按「加到当前值」处理。
+fn compose_window_arg(comp: u16, value: Value) -> (Value, bool) {
+    let value = if comp == 2 {
+        match value {
+            Value::Int(n) => Value::Int(n.wrapping_neg()),
+            Value::Float(f) => Value::Float(-f),
+            other => other,
+        }
+    } else {
+        value
+    };
+    (value, comp != 0)
+}
+
 /// 键的最后一个路径组件是否已带图像扩展名(与渲染器 `has_extension` 同判)。
 ///
-/// 以 `.` 开头视为无扩展名;`/` 与 `\` 都算分隔符。
+/// 以 `.` 开头视为无扩展名;`/` 与 `\` 都算分隔符 —— 但分隔符只在**单字节
+/// 字符**位置上生效:CP932 尾字节区间(`0x40..=0x7E`)含 `\`(`0x5C`),
+/// `ソ`=`83 5C`、`表`=`95 5C` 若被当成路径分隔符,`cg/ソ.png` 就被判成
+/// “无扩展名”,原 key 不参与候选,存在的资产会报缺失。
 fn has_image_extension(key: &[u8]) -> bool {
-    let name = match key.rsplit(|&b| b == b'/' || b == b'\\').next() {
-        Some(name) => name,
-        // 无分隔符时整串就是文件名。
-        None => key,
-    };
+    let mut start = 0;
+    let mut i = 0;
+    while i < key.len() {
+        let step = crate::cp932_text::char_len_at(key, i);
+        if step == 1 && (key[i] == b'/' || key[i] == b'\\') {
+            start = i + 1;
+        }
+        i += step;
+    }
+    let name = &key[start..];
     match name.iter().rposition(|&b| b == b'.') {
         Some(0) | None => false,
         Some(_) => true,
@@ -5336,5 +5400,75 @@ mod math3d_tests {
         let (x, y, zx, zy) = math3d_project(6, 2, 0, 800.0, 600.0, 1, &|n| f[n as usize]);
         assert_eq!((x, y), (10.0 - 200.0, 20.0 - 150.0));
         assert_eq!((zx, zy), (100.0, 100.0));
+    }
+}
+
+#[cfg(test)]
+mod window_ops_tests {
+    use super::compose_window_arg;
+    use crate::value::Value;
+
+    /// 窗口 `slot` 高字节:**1 = `+=`,2 = `-=`**(0.495 官方产物实测:
+    /// `es_Sprite.yst:8173 X+=` → `X~1`;`es_SaveLoad.yst:623 A-=` → `A~2`)。
+    ///
+    /// 回归:`A-=8` 曾被当成加法,把全屏截图幕布 CGS999 的 alpha 从 256
+    /// 一路加到 512(不 clamp),读档完成后画面永远停在读档界面。
+    #[test]
+    fn plus_and_minus_operators_are_distinct() {
+        assert_eq!(
+            compose_window_arg(1, Value::Int(8)),
+            (Value::Int(8), true),
+            "+= 是正增量"
+        );
+        assert_eq!(
+            compose_window_arg(2, Value::Int(8)),
+            (Value::Int(-8), true),
+            "-= 必须取负"
+        );
+        assert_eq!(
+            compose_window_arg(2, Value::Float(2.5)),
+            (Value::Float(-2.5), true),
+            "-= 浮点同样取负"
+        );
+        assert_eq!(
+            compose_window_arg(0, Value::Int(256)),
+            (Value::Int(256), false),
+            "普通赋值不加增量标志"
+        );
+    }
+}
+
+#[cfg(test)]
+mod image_extension_tests {
+    use super::has_image_extension;
+
+    /// `ソ`=`83 5C`：尾字节是 `\`，不能被当成路径分隔符，否则 `cg/ソ.png`
+    /// 的“最后组件”只剩 `.png`，会被判成无扩展名。
+    #[test]
+    fn cp932_trail_backslash_is_not_a_path_separator() {
+        assert!(has_image_extension(b"cg/\x83\x5c.png"));
+        assert!(has_image_extension(b"cg\\\x83\x5c.png"));
+        assert!(!has_image_extension(b"cg/\x83\x5c"));
+    }
+
+    #[test]
+    fn leading_dot_is_not_an_extension() {
+        assert!(!has_image_extension(b"cg/.hidden"));
+        assert!(has_image_extension(b"cg/a.png"));
+        assert!(!has_image_extension(b"cg/a"));
+    }
+
+    /// 回归护栏：所有 CP932 lead 与尾字节 `0x5C`(`\`) 的组合都不得被当成
+    /// 路径分隔符；带 `.png` 后缀时必须判为“有扩展名”。
+    #[test]
+    fn trail_backslash_never_splits_last_component() {
+        for lead in (0x81u8..=0x9f).chain(0xe0..=0xfc) {
+            let mut key = b"cg/".to_vec();
+            key.push(lead);
+            key.push(0x5c);
+            assert!(!has_image_extension(&key), "lead={lead:#04x}");
+            key.extend_from_slice(b".png");
+            assert!(has_image_extension(&key), "lead={lead:#04x}");
+        }
     }
 }

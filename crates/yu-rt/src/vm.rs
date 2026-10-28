@@ -341,6 +341,12 @@ pub struct Cmd {
     pub name: String,
     pub pc: u32,
     pub windows: Vec<CmdWindow>,
+    /// 该 opcode 的参数名表(工程 `ysc.ybn` 的静态事实)。
+    ///
+    /// 按 opcode 共享一份 `Rc`,执行期只是引用计数(旧实现 `param_names`
+    /// 每次调用克隆整张表:`VARACT` 在启动帧被调用 2.8 万次、每次约 14 个
+    /// `String` 分配)。空 = 工程表里没有该命令(与旧 `unwrap_or_default` 同口径)。
+    pub param_names: Rc<[String]>,
 }
 
 /// 一个窗口 + 其载荷。
@@ -361,14 +367,36 @@ impl CmdWindow {
 }
 
 /// 运行核。
+/// 标签跳转目标(只含跳转需要的标量;`Label` 自带两个堆字符串,
+/// 按调用点缓存时复制它会付两份分配,故投影成 `Copy` 形态)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LabelTarget {
+    pub script_id: u32,
+    pub pc: u32,
+    pub base_a: u8,
+}
+
 pub struct Vm {
     src: Box<dyn yu_vfs::DataSource>,
     /// 编译器表回退源(工程根/SDK);脚本与其余表仍从 `src` 读。
     aux: Option<Box<dyn yu_vfs::DataSource>>,
     tables: TableSet,
+    /// `GOSUB`/`GO` 常量标签按调用点缓存(`(script_id, pc)` → 目标)。
+    /// 标签表在启动装载后不变,窗口内无变量引用 ⇒ 每次结果相同。
+    pub(crate) label_cache: rustc_hash::FxHashMap<(u32, u32), LabelTarget>,
     scheduler: Scheduler,
     store: VariableStore,
-    exec: rustc_hash::FxHashMap<String, ExecState>,
+    /// 任务执行位(`TaskId` → 执行位)。
+    ///
+    /// `Box`:执行位本身 ~700B(16 组任务寄存器 + 三个栈),旧实现每条命令
+    /// `remove_entry` + `insert` 搬两次整块;装箱后只搬指针。
+    exec: rustc_hash::FxHashMap<String, Box<ExecState>>,
+    /// **当前泵任务**的执行位缓存:同一任务连续推进时不碰哈希表。
+    ///
+    /// 调度器 `pump_node` 会对同一任务连跑多到上限条命令,逐条
+    /// 摘/插哈希表是纯开销(`IFEND` 的 ~30ns 固定成本主要就是它)。
+    /// 换任务/任务结束时由 `flush_exec_slot` 还回 `exec`。
+    exec_slot: Option<(String, Box<ExecState>)>,
     input: InputState,
     binding: InputBinding,
     /// 图形域同步宿主(可选;安装后负责 INFO 查询与状态同步)。
@@ -437,12 +465,22 @@ pub struct Vm {
     /// 覆盖普查要在关闭事件流的热路径上拿到逐命令频度(任务书 M-1)。
     /// 下标 = 工程 `ysc.ybn` 的命令序号;长度在启动期固定。
     command_hits: Vec<u64>,
+    /// `command_hits` 的增量基线(宿主逐帧取「本帧各命令执行次数」的
+    /// 诊断游标;与 `command_hits` 同长,只在
+    /// `take_command_hit_deltas` 里推进)。
+    hit_mark: Vec<u64>,
     /// 逐命令耗时采样开关(`Vm::set_command_profile`;默认关)。
     /// 开启后每条命令两次 `Instant` 采样,只用于定位启动/场景切换卡顿,
     /// 不进正常路径。
     prof_commands: bool,
     /// 采样窗口内每条 opcode 的累计纳秒(`prof_commands` 为 false 时不写)。
+    /// **按 1/32 抽样并折算**:逐条 `Instant` 本身要 ~0.2µs,原实现把测量
+    /// 开销算进了命令成本(LET 显示 0.21µs 里大半是采样器自己的开销)。
     prof_ns: Vec<u64>,
+    /// 采样计数器(每 `prof_sample` 条命令计时一次)。
+    prof_calls: u64,
+    /// 命令计时采样率(默认 32;`1` = 逐条计时,仅诊断用)。
+    prof_sample: u64,
     /// 采样窗口内每条 opcode 的命中数(与 `prof_ns` 同窗口)。
     prof_hits: Vec<u64>,
     /// `VARACT[INIT=1 G_*]` 的全局槽镜像(启动期从 ysv 一次性投影)。
@@ -620,9 +658,11 @@ impl Vm {
             src,
             aux,
             tables,
+            label_cache: rustc_hash::FxHashMap::default(),
             scheduler: Scheduler::new(),
             store: VariableStore::new(),
             exec: rustc_hash::FxHashMap::default(),
+            exec_slot: None,
             input: InputState::new(),
             binding,
             graphics_host: None,
@@ -665,8 +705,11 @@ impl Vm {
             window_exec_caption: 0,
             executed: 0,
             command_hits,
+            hit_mark: vec![0u64; handler_len],
             prof_commands: false,
             prof_ns: vec![0u64; handler_len],
+            prof_calls: 0,
+            prof_sample: 32,
             prof_hits: vec![0u64; handler_len],
             globals_restore: Vec::new(),
             last_global_restore: vec![None; GLOBAL_RESTORE_KEYS],
@@ -704,7 +747,7 @@ impl Vm {
         vm.apply_script_locals(script_id);
 
         vm.exec
-            .insert(MAIN_TASK_ID.to_string(), ExecState::new(script_id, pc));
+            .insert(MAIN_TASK_ID.to_string(), Box::new(ExecState::new(script_id, pc)));
         vm.scheduler.spawn(TaskSeed::main(script_id, pc));
         vm.events.push(VmEvent::TaskSpawn {
             frame: 0,
@@ -981,8 +1024,23 @@ impl Vm {
     }
 
     /// 取某任务的执行位快照(诊断 / TASKINFO 用)。
+    ///
+    /// 正在泵的任务,执行位在 `exec_slot` 而不是 `exec` 里 —— 漏查会让
+    /// `TASKINFO` 读到旧状态(脚本可见)。
     pub(crate) fn exec_of(&self, id: &str) -> Option<&ExecState> {
-        self.exec.get(id)
+        if let Some((slot_id, st)) = &self.exec_slot {
+            if slot_id == id {
+                return Some(st);
+            }
+        }
+        self.exec.get(id).map(|st| &**st)
+    }
+
+    /// 把缓存里的执行位还回 `exec`(换任务 / 任务结束 / 需要遍历时)。
+    fn flush_exec_slot(&mut self) {
+        if let Some((id, st)) = self.exec_slot.take() {
+            self.exec.insert(id, st);
+        }
     }
 
     /// 输入状态的可变借用(写入输入系统变量)。
@@ -1368,6 +1426,38 @@ impl Vm {
         self.handler_of.get(opcode as usize).copied()
     }
 
+    /// 取走「距上次调用」各命令的执行次数增量(宿主长帧取证的逐帧口径)。
+    ///
+    /// 只扫一遍 `command_hits`(数百项),不解析命令名、不分配字符串;
+    /// 调用方按需把 opcode 映射成名字([`Vm::command_name`])。宿主每帧
+    /// 调用一次 ⇒ 返回值严格是**这一帧**的命令构成,而不是累计值。
+    pub fn take_command_hit_deltas(&mut self) -> Vec<(u8, u64)> {
+        let mut out = Vec::new();
+        for (index, total) in self.command_hits.iter().copied().enumerate() {
+            let Some(mark) = self.hit_mark.get_mut(index) else {
+                continue;
+            };
+            if total != *mark {
+                let delta = total.saturating_sub(*mark);
+                *mark = total;
+                if let Ok(opcode) = u8::try_from(index) {
+                    out.push((opcode, delta));
+                }
+            }
+        }
+        out
+    }
+
+    /// opcode → 命令名(诊断;未声明退回 `#N`)。
+    pub fn command_name(&self, opcode: u8) -> String {
+        self.tables
+            .boot
+            .yscm
+            .command(opcode)
+            .map(|decl| decl.name.clone())
+            .unwrap_or_else(|| format!("#{opcode}"))
+    }
+
     /// `VARACT` 取证计数:[调用, INIT, TYPE, 其他, 恢复跳过, 恢复行数]。
     pub fn varact_stats(&self) -> [u64; 6] {
         let other = self
@@ -1403,6 +1493,11 @@ impl Vm {
     }
 
     /// 开关逐命令耗时采样(默认关;只给启动/场景切换卡顿定位用)。
+    /// 采样率(每 N 条计时一次并折算;`1` = 逐条,计时开销会算进成本)。
+    pub fn set_command_profile_sample(&mut self, sample: u64) {
+        self.prof_sample = sample.max(1);
+    }
+
     pub fn set_command_profile(&mut self, on: bool) {
         self.prof_commands = on;
     }
@@ -1416,6 +1511,7 @@ impl Vm {
     pub fn reset_command_profile(&mut self) {
         self.prof_ns.fill(0);
         self.prof_hits.fill(0);
+        self.prof_calls = 0;
         self.prof_varact_sites.clear();
         self.prof_sites.clear();
         self.varact_calls = 0;
@@ -1448,6 +1544,7 @@ impl Vm {
         rows.truncate(limit);
         self.prof_ns.fill(0);
         self.prof_hits.fill(0);
+        self.prof_calls = 0;
         (rows, total_ns)
     }
 
@@ -1661,6 +1758,16 @@ impl Vm {
                 ),
             ));
         };
+        // 参数名表随命令缓存一次(每个 (script,pc) 站点一份;执行期只 bump
+        // 引用计数)。工程 ysc 表在启动后不变。
+        cmd.param_names = self
+            .tables
+            .boot
+            .yscm
+            .command(group.opcode)
+            .map(|c| c.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>())
+            .unwrap_or_default() // silent-ok:无该命令 ⇒ 空表(与旧 `param_names` 同口径)
+            .into();
         let name = match self.tables.boot.yscm.command(group.opcode) {
             Some(decl) => decl.name.as_str(),
             None => {
@@ -1728,6 +1835,7 @@ impl Vm {
     /// `@G(n)`/`@L(n)` 编译成前缀 0x60,`$G(n)`/`$L(n)` 编译成 0x23;
     /// id 本身唯一,类型由工程 `ysv.ybn` 声明(DIV-RT-017)。找不到声明时
     /// 原样返回(上层会报未声明)。
+    #[inline]
     pub(crate) fn canonical_var(&self, var: VarRef) -> VarRef {
         if !var.space.is_legacy() {
             return var;
@@ -1841,7 +1949,31 @@ impl Vm {
         r
     }
 
-    /// 参数声明名(工程 ysc;`None` = 该序号未声明)。
+    /// 参数槽 → (1 基编号, 目标类型),零分配。
+    ///
+    /// 旧路径每次 `GOSUB`/`RETURN` 都 `param_name` 克隆一个 `String`,
+    /// 再用 `param_index_of` 把名字尾部数字做两次 `String` 收集 + `parse`;
+    /// 参数名来自工程 ysc 表(启动后不变),这些分配纯属浪费。
+    pub(crate) fn param_plan(&self, opcode: u8, slot: u8) -> (usize, crate::expr::ParamTy) {
+        let Some(decl) = self.tables.boot.yscm.param(opcode, slot) else {
+            // 与旧路径一致:缺声明 ⇒ 空名 ⇒ 编号 1、类型不转换。
+            return (1, crate::expr::ParamTy::Raw);
+        };
+        let name = decl.name.as_str();
+        let n = param_index_bytes(name.as_bytes());
+        let ty = if name.starts_with("PFLT") || name.starts_with("RFLT") {
+            crate::expr::ParamTy::Float
+        } else if name.starts_with("PSTR") || name.starts_with("RSTR") {
+            crate::expr::ParamTy::Str
+        } else if name.starts_with("PINT") || name.starts_with("RINT") {
+            crate::expr::ParamTy::Int
+        } else {
+            crate::expr::ParamTy::Raw
+        };
+        (n, ty)
+    }
+
+    /// 参数声明名(工程 ysc;`None` = 该序号未声明)。诊断路径用。
     pub(crate) fn param_name(&self, opcode: u8, slot: u8) -> Option<String> {
         self.tables
             .boot
@@ -1860,6 +1992,17 @@ impl Vm {
         self.tables
             .script(script_id)
             .and_then(|script| script.source_position(pc as usize))
+    }
+
+    /// 最近一条已执行命令的落点(诊断:脚本显示名、pc、任务名)。
+    ///
+    /// 长帧取证用:和 `take_command_hit_deltas` 一起回答「这一帧在跑谁」。
+    pub fn current_position(&self) -> (String, u32, String) {
+        (
+            self.script_name(self.cur_script),
+            self.cur_pc,
+            self.cur_task.clone(),
+        )
     }
 
     /// 取走采样窗口内的命令调用点(按命中数降序),并清零。
@@ -1940,10 +2083,15 @@ struct VmAccess<'a> {
 
 impl VarAccess for VmAccess<'_> {
     fn read(&mut self, var: VarRef, indices: &[i64]) -> Result<Value, Diag> {
-        // 未知变量空间(实测商业语料 s91 有 5 处 `` ` `` 前缀 0x60,
-        // 手册/引擎均无对应语义)⇒ 挂号并继续(DIV-RT-017)。
-        // ERIS 旧式空间(`@G`/`@L`/`$G`/`$L`)按 id 的声明类型归一化(DIV-RT-017)。
-        let var = self.vm.canonical_var(var);
+        // 一次空间判别覆盖三种情况:`@`/`$` 直通、ERIS 旧式空间
+        // (`@G`/`@L`/`$G`/`$L`)按 id 的声明类型归一化、未知前缀挂号继续
+        // (DIV-RT-017)。旧写法先无条件调 `canonical_var` 再做一次 matches,
+        // 热路径(每帧 ~1.6 万次读)上多一次函数调用。
+        let var = if var.space.is_legacy() {
+            self.vm.canonical_var(var)
+        } else {
+            var
+        };
         if matches!(var.space, VarSpace::Other(_)) {
             return Err(diag::unimplemented(
                 code::rt::EXPR_UNSUPPORTED,
@@ -1979,11 +2127,18 @@ impl TaskExecutor for Vm {
     }
 
     fn step_command(&mut self, task: &mut TaskNode) -> Result<StepOutcome, String> {
-        // `remove_entry` 把键一起取回:每命令不再 clone 一次 TaskId
-        // (`String` 分配),重新插入时直接复用原键。
-        let Some((id, mut st)) = self.exec.remove_entry(&task.id) else {
-            return Ok(StepOutcome::Finish);
-        };
+        // 同一任务连续推进时执行位留在 `exec_slot`;首次/换任务才查表。
+        let cached = matches!(&self.exec_slot, Some((id, _)) if id == &task.id);
+        if !cached {
+            self.flush_exec_slot();
+            let Some((id, st)) = self.exec.remove_entry(&task.id) else {
+                return Ok(StepOutcome::Finish);
+            };
+            self.exec_slot = Some((id, st));
+        }
+        // 执行位必须临时移出 `self`,才能同时借 `&mut self` 跑脚本。
+        // 装箱后这次移动只有指针 + 键,不再是 700B 整块。
+        let (id, mut st) = self.exec_slot.take().expect("刚刚填过");
         let res = self.step_one(&mut st, task);
         // 同步任务记录(pc/脚本号;引擎 `task+0x20/+0x3c`)。
         task.pc = st.pc;
@@ -1993,7 +2148,7 @@ impl TaskExecutor for Vm {
             Ok(out) => {
                 let finishing = matches!(out, StepOutcome::Finish);
                 if !finishing {
-                    self.exec.insert(id, st);
+                    self.exec_slot = Some((id, st));
                     // 文本行尾让出:任务级等待(引擎 `task+9`)由调度器记录,
                     // 推进输入出现时清标志(REA 0x44c451 / 0x4046fc)。
                 } else {
@@ -2031,7 +2186,7 @@ impl TaskExecutor for Vm {
                 if recoverable {
                     // `Unimplemented`/`Recoverable` = 挂号留痕后**继续**执行下一条
                     // (该命令按未实装处理,无副作用)。architecture §8。
-                    self.exec.insert(id, st);
+                    self.exec_slot = Some((id, st));
                     Ok(StepOutcome::Continue)
                 } else {
                     // `Fatal`:任务终止(官方继续策略未取证 ⇒ DIV-RT-005)。
@@ -2051,7 +2206,11 @@ impl TaskExecutor for Vm {
 
     fn task_removed(&mut self, id: &str) {
         // `TASKEND[ID=其他任务]`:摘链由调度器完成,这里回收执行位并落事件。
-        if self.exec.remove(id).is_some() {
+        let cached_hit = matches!(&self.exec_slot, Some((slot_id, _)) if slot_id == id);
+        if cached_hit {
+            self.exec_slot = None;
+        }
+        if cached_hit || self.exec.remove(id).is_some() {
             self.emit(VmEvent::TaskFinish {
                 frame: self.frame,
                 id: id.to_string(),
@@ -2114,22 +2273,29 @@ impl Vm {
         st.pc = st.pc.wrapping_add(1);
         // 可选耗时采样:只包住 dispatch(取指/缓存命中是固定成本)。
         // 关闭时只多一次 bool 判断。
-        let profile_started = self.prof_commands.then(Instant::now);
+        // 抽样计时(1/32):`Instant::now()` 本身 ~20–25ns × 2,逐条计时会把
+        // 采样器开销算进命令成本;命中数仍逐条累加(数组自增,便宜)。
+        let rate = self.prof_sample;
+        let sample = self.prof_commands && self.prof_calls % rate == 0;
+        self.prof_calls = self.prof_calls.wrapping_add(1);
         let opcode = cmd.opcode as usize;
-        if profile_started.is_some() {
-            *self
-                .prof_sites
-                .entry((cmd.opcode, st.script_id, cmd.pc))
-                .or_insert(0) += 1;
+        if self.prof_commands {
+            if let Some(slot) = self.prof_hits.get_mut(opcode) {
+                *slot = slot.saturating_add(1);
+            }
+            if sample {
+                *self
+                    .prof_sites
+                    .entry((cmd.opcode, st.script_id, cmd.pc))
+                    .or_insert(0) += 1;
+            }
         }
+        let profile_started = sample.then(Instant::now);
         let out = self.dispatch(st, task, &cmd);
         if let Some(started) = profile_started {
             let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             if let Some(slot) = self.prof_ns.get_mut(opcode) {
-                *slot = slot.saturating_add(ns);
-            }
-            if let Some(slot) = self.prof_hits.get_mut(opcode) {
-                *slot = slot.saturating_add(1);
+                *slot = slot.saturating_add(ns.saturating_mul(rate));
             }
         }
         out
@@ -2161,6 +2327,27 @@ impl Vm {
         self.cmd_cache[script][pc] = Some(Rc::clone(&cmd));
         Ok(cmd)
     }
+}
+
+/// 参数名尾部编号(字节版;`PINT2` → 2、`PINT` → 1)。
+///
+/// 与 `handlers::param_index_of` 严格同口径:无数字尾 ⇒ 1;`parse` 溢出 ⇒ 1。
+fn param_index_bytes(name: &[u8]) -> usize {
+    let mut end = name.len();
+    while end > 0 && name[end - 1].is_ascii_digit() {
+        end -= 1;
+    }
+    if end == name.len() {
+        return 1;
+    }
+    let mut n: u128 = 0;
+    for &b in &name[end..] {
+        n = n * 10 + u128::from(b - b'0');
+        if n > usize::MAX as u128 {
+            return 1;
+        }
+    }
+    n as usize // silent-ok:上面已拒绝溢出(与 `param_index_of` 的 `parse` 失败同口径)
 }
 
 #[cfg(test)]

@@ -376,6 +376,49 @@ pub fn apply_meido(texture: &mut Texture, set: i64) {
 ///
 /// 尺寸取 `to` 的尺寸(新图),`from` 越界按透明;这与引擎「遷移途中画像」的
 /// 用途一致(新图决定画布,旧图按同点采样)。
+/// 一行里「不全为零」的列跨度(`(usize::MAX, 0)` = 整行全零)。
+///
+/// `blend_transition` 的输出缓冲是**新建的零面**:两个源在该像素都为零时,
+/// 融合结果 `(0*inv + 0*f)/256 = 0` 与零面一致 ⇒ 整段可以跳过不写。
+/// 精灵缓冲(2048²)里大部分行/列是全零,旧实现逐像素走完全图。
+fn row_span_rgba(row: &[u8], width: usize) -> (usize, usize) {
+    let mut first = usize::MAX;
+    let mut last = 0usize;
+    for (x, px) in row.chunks_exact(4).take(width).enumerate() {
+        if px != [0, 0, 0, 0] {
+            if first == usize::MAX {
+                first = x;
+            }
+            last = x;
+        }
+    }
+    (first, last)
+}
+
+/// 一行里 alpha 非零的列跨度(`(usize::MAX, 0)` = 整行透明)。
+///
+/// `MERGE`/`MERGE2` 在 `au == 0` 时是恒等变换(见 [`apply_merge`]),整行
+/// 透明就完全不用读目标行、也不用写。
+pub fn alpha_span(row: &[u8], width: usize) -> (usize, usize) {
+    let mut first = usize::MAX;
+    let mut last = 0usize;
+    for (x, px) in row.chunks_exact(4).take(width).enumerate() {
+        if px[3] != 0 {
+            if first == usize::MAX {
+                first = x;
+            }
+            last = x;
+        }
+    }
+    (first, last)
+}
+
+/// 双源线性过渡(逐通道 `(from*inv + to*f)/256`;整数截断,与旧实现一致)。
+///
+/// 输出 = 按 `to` 尺寸的新零面;两个源在该像素都为零时结果本就是零,因此
+/// **按行求非零跨度,只写该跨度**(`row_span_rgba`)。这一步把「立绘淡入」
+/// 这种 2048² 缓冲 + 局部内容的逐帧全图混合,从 `O(缓冲)` 降到 `O(内容)`
+/// (实测单帧 15–52ms → 个位数;输出逐位不变)。
 pub fn blend_transition(from: &Texture, to: &Texture, blend: i64) -> Texture {
     let f = blend.clamp(0, 256) as u32;
     let (w, h) = (to.width, to.height);
@@ -386,26 +429,49 @@ pub fn blend_transition(from: &Texture, to: &Texture, blend: i64) -> Texture {
             rgba: Vec::new(),
         };
     }
-    let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+    let ww = w as usize;
+    let mut out = vec![0u8; ww * (h as usize) * 4];
     let inv = 256 - f;
+    let fw = from.width as usize;
+    let fh = from.height as usize;
+    let overlap = fw.min(ww);
     for y in 0..h as usize {
-        for x in 0..w as usize {
-            let d = (y * (w as usize) + x) * 4;
-            let ti = d;
-            let ti = if ti + 4 <= to.rgba.len() { ti } else { 0 };
-            let fi = if x < from.width as usize && y < from.height as usize {
-                (y * (from.width as usize) + x) * 4
-            } else {
-                usize::MAX
-            };
+        let Some(to_row) = to.rgba.get(y * ww * 4..(y + 1) * ww * 4) else {
+            // 短缓冲(畸形输入):其余行保持零面,与旧实现 `unwrap_or(0)` 同义。
+            break;
+        };
+        let from_row = if y < fh {
+            from.rgba.get(y * fw * 4..y * fw * 4 + overlap * 4)
+        } else {
+            None
+        };
+        let (mut x0, mut x1) = row_span_rgba(to_row, ww);
+        if let Some(from_row) = from_row {
+            let (fx0, fx1) = row_span_rgba(from_row, overlap);
+            x0 = x0.min(fx0);
+            x1 = x1.max(fx1);
+        }
+        if x0 > x1 {
+            continue;
+        }
+        let x1 = x1.min(ww - 1);
+        let out_row = &mut out[y * ww * 4 + x0 * 4..y * ww * 4 + (x1 + 1) * 4];
+        let to_span = &to_row[x0 * 4..(x1 + 1) * 4];
+        // `from` 可能比 `to` 窄:取与跨度相交的那一段,越界部分按透明(0)。
+        let from_span: Option<&[u8]> = from_row.and_then(|row| {
+            let start = (x0 * 4).min(row.len());
+            let end = ((x1 + 1) * 4).min(row.len());
+            (start < end).then(|| &row[start..end])
+        });
+        for (i, dst) in out_row.chunks_exact_mut(4).enumerate() {
+            let base = i * 4;
             for c in 0..4 {
-                let src_to = u32::from(to.rgba.get(ti + c).copied().unwrap_or(0));
-                let src_from = if fi == usize::MAX {
-                    0
-                } else {
-                    u32::from(from.rgba.get(fi + c).copied().unwrap_or(0))
+                let src_to = u32::from(to_span[base + c]);
+                let src_from = match from_span {
+                    Some(span) if base + c < span.len() => u32::from(span[base + c]),
+                    _ => 0,
                 };
-                out[d + c] = ((src_from * inv + src_to * f) / 256) as u8;
+                dst[c] = ((src_from * inv + src_to * f) / 256) as u8;
             }
         }
     }
@@ -453,6 +519,86 @@ mod blend_tests {
         // 第 1 像素取旧图,第 2 像素旧图越界 ⇒ 透明。
         assert_eq!(&out.rgba[0..4], &[255, 255, 255, 255]);
         assert_eq!(&out.rgba[4..8], &[0, 0, 0, 0]);
+    }
+
+    /// 参考实现 = 优化前的逐像素全图公式(逐字保留)。
+    fn blend_reference(from: &Texture, to: &Texture, blend: i64) -> Texture {
+        let f = blend.clamp(0, 256) as u32;
+        let (w, h) = (to.width, to.height);
+        let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+        let inv = 256 - f;
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let d = (y * w as usize + x) * 4;
+                let ti = if d + 4 <= to.rgba.len() { d } else { 0 };
+                let fi = if x < from.width as usize && y < from.height as usize {
+                    (y * from.width as usize + x) * 4
+                } else {
+                    usize::MAX
+                };
+                for c in 0..4 {
+                    let src_to = u32::from(to.rgba.get(ti + c).copied().unwrap_or(0));
+                    let src_from = if fi == usize::MAX {
+                        0
+                    } else {
+                        u32::from(from.rgba.get(fi + c).copied().unwrap_or(0))
+                    };
+                    out[d + c] = ((src_from * inv + src_to * f) / 256) as u8;
+                }
+            }
+        }
+        Texture {
+            width: w,
+            height: h,
+            rgba: out,
+        }
+    }
+
+    /// 跨度优化必须**逐位**等于旧公式:随机内容(含全零行/窄源/异尺寸)。
+    #[test]
+    fn blend_transition_span_optimization_is_bit_exact() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..64 {
+            let tw = 1 + (next() % 37) as u32;
+            let th = 1 + (next() % 29) as u32;
+            let fw = 1 + (next() % 41) as u32;
+            let fh = 1 + (next() % 33) as u32;
+            let mut to = Texture {
+                width: tw,
+                height: th,
+                rgba: vec![0; (tw * th * 4) as usize],
+            };
+            let mut from = Texture {
+                width: fw,
+                height: fh,
+                rgba: vec![0; (fw * fh * 4) as usize],
+            };
+            for byte in to.rgba.iter_mut() {
+                *byte = (next() % 256) as u8;
+            }
+            for byte in from.rgba.iter_mut() {
+                *byte = (next() % 256) as u8;
+            }
+            // 每 3 例留一整行全零(覆盖「跳过整行」路径)。
+            if case % 3 == 0 {
+                let y = (next() % th as u64) as usize;
+                for byte in &mut to.rgba[y * tw as usize * 4..(y + 1) * tw as usize * 4] {
+                    *byte = 0;
+                }
+            }
+            let blend = (next() % 257) as i64;
+            assert_eq!(
+                blend_transition(&from, &to, blend),
+                blend_reference(&from, &to, blend),
+                "case {case} (to {tw}x{th}, from {fw}x{fh}, blend {blend})"
+            );
+        }
     }
 }
 

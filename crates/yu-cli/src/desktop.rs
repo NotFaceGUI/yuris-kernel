@@ -54,9 +54,15 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let log_file = args.flag("log-file").map(PathBuf::from);
     // 性能证据(只写调用方给的路径;默认不产生文件):
     // `--frame-stats` 逐帧 CSV;`--profile-frames 1,4,340` 在指定宿主帧
-    // 打印 VM 命令耗时 top-10。
+    // 打印 VM 命令耗时 top-10;`--spike-log` 自动把 ≥ `--spike-ms` 的
+    // 长帧(阶段耗时 + 本帧命令构成 + 渲染计数)逐行落盘。
     let frame_stats = args.flag("frame-stats").map(PathBuf::from);
+    let spike_log = args.flag("spike-log").map(PathBuf::from);
+    let spike_ms = parse_opt::<f64>(&mut args, "spike-ms")?.unwrap_or(20.0).max(0.0);
+    let profile_commands = args.switch("profile-commands");
     let pump_cap = parse_opt::<usize>(&mut args, "pump-cap")?;
+    // 调试复现:显式给单步上限才丢墙钟时间(默认不截断)。
+    let max_step_ms = parse_opt::<u32>(&mut args, "max-step-ms")?.filter(|ms| *ms > 0);
     let profile_frames = match args.flag("profile-frames") {
         Some(list) => list
             .split(',')
@@ -239,7 +245,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             panic_selftest,
             frame_stats,
             profile_frames,
+            spike_log,
+            spike_ms,
+            profile_commands,
             pump_cap,
+            max_step_ms,
             console: Some(console),
         },
     )
@@ -305,6 +315,7 @@ fn usage() -> String {
      \x20      [--backend wgpu|soft] [--title TEXT] [--width N] [--height N] [--fps N]\n\
      \x20      [--frames N] [--shot PNG] [--fullscreen] [--pixel] [--debug-ui]\n\
      \x20      [--no-sound] [--reconcile] [--script case.json] [--save-root DIR]\n\
-     \x20      [--log-file PATH] [--frame-stats CSV] [--profile-frames 1,4,340] [--pump-cap N]"
+     \x20      [--log-file PATH] [--frame-stats CSV] [--profile-frames 1,4,340] [--pump-cap N]\n\
+     \x20      [--spike-log PATH] [--spike-ms 20] [--max-step-ms N]"
         .to_string()
 }

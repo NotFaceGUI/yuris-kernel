@@ -338,31 +338,63 @@ pub fn apply_sepia(texture: &mut Texture) {
 /// - 两者都注明「レイヤ「BG」を上、レイヤ「BG2」を下に置いた状態で結合され、
 ///   結合した結果はレイヤ「BG2」のほうに格納されます」⇒ 输出写 `ID2`。
 pub fn apply_merge(lower: &mut Texture, upper: &Texture, merge2: bool) {
-    let w = lower.width.min(upper.width);
-    let h = lower.height.min(upper.height);
+    let w = lower.width.min(upper.width) as usize;
+    let h = lower.height.min(upper.height) as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let lstride = lower.width as usize * 4;
+    let ustride = upper.width as usize * 4;
+    // 逐行切片 + `chunks_exact_mut(4)` 配对:去掉逐像素的下标/边界检查,
+    // 保持**逐字同式**的浮点运算(像素结果与旧实现完全一致)。
+    // `au == 0` 的像素两个公式都是恒等(merge: `cl*(1-0)+cu*0 = cl`;
+    // merge2: `ao = al`,rgb 化简回 `cl`,alpha 写回 `al`)⇒ 直接跳过,
+    // 省掉写回(精灵部件在大缓冲里大部分是透明像素)。
     for y in 0..h {
-        for x in 0..w {
-            let ui = ((y * upper.width + x) * 4) as usize;
-            let li = ((y * lower.width + x) * 4) as usize;
-            let au = f64::from(upper.rgba[ui + 3]) / 255.0;
+        let urow = &upper.rgba[y * ustride..y * ustride + w * 4];
+        // 整行透明 ⇒ 恒等,连目标行都不用读/写(精灵部件在 2048² 缓冲里
+        // 通常只占中间一块,旧实现逐行扫满整个宽度)。
+        let (x0, x1) = crate::imageop::alpha_span(urow, w);
+        if x0 > x1 {
+            continue;
+        }
+        let lrow = &mut lower.rgba[y * lstride + x0 * 4..y * lstride + (x1 + 1) * 4];
+        let urow = &urow[x0 * 4..(x1 + 1) * 4];
+        for (lp, up) in lrow.chunks_exact_mut(4).zip(urow.chunks_exact(4)) {
+            let au = f64::from(up[3]) / 255.0;
+            if au == 0.0 {
+                continue;
+            }
             if merge2 {
-                let al = f64::from(lower.rgba[li + 3]) / 255.0;
+                let al = f64::from(lp[3]) / 255.0;
                 let ao = au + al * (1.0 - au);
                 if ao > 0.0 {
                     for c in 0..3 {
-                        let cu = f64::from(upper.rgba[ui + c]);
-                        let cl = f64::from(lower.rgba[li + c]);
+                        let cu = f64::from(up[c]);
+                        let cl = f64::from(lp[c]);
                         let co = (cu * au + cl * al * (1.0 - au)) / ao;
-                        lower.rgba[li + c] = co.round().clamp(0.0, 255.0) as u8;
+                        lp[c] = co.round().clamp(0.0, 255.0) as u8;
                     }
                 }
-                lower.rgba[li + 3] = (ao * 255.0).round().clamp(0.0, 255.0) as u8;
+                lp[3] = (ao * 255.0).round().clamp(0.0, 255.0) as u8;
             } else {
+                // `MERGE` 的整数化(与 f64 实现**逐位一致**,见下方证明):
+                //
+                //   round(cl*(1-a/255) + cu*(a/255))
+                // = round((cl*(255-a) + cu*a) / 255)
+                //
+                // 精确值是有理数 `num/255`,距任何半整数 ≥ 1/510 ≈ 0.00196,
+                // 而 f64 计算的误差在 1e-13 量级 ⇒ 不可能跨过舍入边界;
+                // `round`(正数 half-away)等于 `(num + 127) / 255`。
+                // 旧实现每像素 6 次 u8→f64 + 3 次浮点乘 + round + clamp,
+                // 在 2048² 合成缓冲上是**计算瓶颈**(实测单条 MERGE 28ms);
+                // 整数版只受内存带宽限制。
+                let a = u32::from(up[3]);
+                let inv = 255 - a;
                 for c in 0..3 {
-                    let cu = f64::from(upper.rgba[ui + c]);
-                    let cl = f64::from(lower.rgba[li + c]);
-                    let co = cl * (1.0 - au) + cu * au;
-                    lower.rgba[li + c] = co.round().clamp(0.0, 255.0) as u8;
+                    let cu = u32::from(up[c]);
+                    let cl = u32::from(lp[c]);
+                    lp[c] = ((cl * inv + cu * a + 127) / 255) as u8;
                 }
             }
         }
@@ -489,5 +521,90 @@ mod tests {
         let upper = solid(1, 1, [0b1111_0000, 0, 0x0F, 0]);
         apply_bitwise(&mut lower, &upper, true);
         assert_eq!(lower.rgba[0], 0b0011_0000);
+    }
+
+    /// 参考实现 = 跨度优化前的逐像素全图公式(逐字保留)。
+    fn merge_reference(lower: &Texture, upper: &Texture, merge2: bool) -> Texture {
+        let mut out = lower.clone();
+        let w = out.width.min(upper.width);
+        let h = out.height.min(upper.height);
+        for y in 0..h {
+            for x in 0..w {
+                let ui = ((y * upper.width + x) * 4) as usize;
+                let li = ((y * out.width + x) * 4) as usize;
+                let au = f64::from(upper.rgba[ui + 3]) / 255.0;
+                if merge2 {
+                    let al = f64::from(out.rgba[li + 3]) / 255.0;
+                    let ao = au + al * (1.0 - au);
+                    if ao > 0.0 {
+                        for c in 0..3 {
+                            let cu = f64::from(upper.rgba[ui + c]);
+                            let cl = f64::from(out.rgba[li + c]);
+                            let co = (cu * au + cl * al * (1.0 - au)) / ao;
+                            out.rgba[li + c] = co.round().clamp(0.0, 255.0) as u8;
+                        }
+                    }
+                    out.rgba[li + 3] = (ao * 255.0).round().clamp(0.0, 255.0) as u8;
+                } else {
+                    for c in 0..3 {
+                        let cu = f64::from(upper.rgba[ui + c]);
+                        let cl = f64::from(out.rgba[li + c]);
+                        let co = cl * (1.0 - au) + cu * au;
+                        out.rgba[li + c] = co.round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 行跨度 + 透明跳过必须**逐位**等于旧公式:随机内容(含整行透明/窄源)。
+    #[test]
+    fn merge_span_optimization_is_bit_exact() {
+        let mut seed = 0x0bad_f00d_dead_beefu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..64 {
+            let lw = 1 + (next() % 31) as u32;
+            let lh = 1 + (next() % 23) as u32;
+            let uw = 1 + (next() % 35) as u32;
+            let uh = 1 + (next() % 27) as u32;
+            let mut lower = Texture {
+                width: lw,
+                height: lh,
+                rgba: vec![0; (lw * lh * 4) as usize],
+            };
+            let mut upper = Texture {
+                width: uw,
+                height: uh,
+                rgba: vec![0; (uw * uh * 4) as usize],
+            };
+            for byte in lower.rgba.iter_mut() {
+                *byte = (next() % 256) as u8;
+            }
+            for byte in upper.rgba.iter_mut() {
+                *byte = (next() % 256) as u8;
+            }
+            // 每 2 例把上层一整行清零(覆盖「跳过整行」路径)。
+            if case % 2 == 0 {
+                let y = (next() % uh as u64) as usize;
+                for byte in &mut upper.rgba[y * uw as usize * 4..(y + 1) * uw as usize * 4] {
+                    *byte = 0;
+                }
+            }
+            for merge2 in [false, true] {
+                let expected = merge_reference(&lower, &upper, merge2);
+                let mut actual = lower.clone();
+                apply_merge(&mut actual, &upper, merge2);
+                assert_eq!(
+                    actual, expected,
+                    "case {case} merge2={merge2} (lower {lw}x{lh}, upper {uw}x{uh})"
+                );
+            }
+        }
     }
 }

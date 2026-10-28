@@ -183,7 +183,12 @@ pub struct GfxState {
     /// 正在消费的域事件脚本位置(todo-silent-handling S1):
     /// `DomainCall` 携带 `(script, pc)`,诊断聚合时不许再把它丢掉。
     /// 仅在事件分派窗口内非空;INFO 查询等带外路径保持 None(不猜位置)。
-    cur_call_at: Option<error::DiagAt>,
+    /// 当前域命令的脚本定位(`(script_id, pc)`);`DiagAt` 只在真正要记
+    /// 诊断时才构造 —— 旧实现每条域命令都 `format!("s{s}")` + 克隆命令名,
+    /// 然后立刻丢弃(参数求值后的 gather 无诊断即全废)。
+    cur_call: Option<(u32, u32)>,
+    /// 当前域命令名(复用缓冲,避免每条命令一次 `String` 分配)。
+    cur_call_cmd: String,
     /// 窗口状态(按 `NO`;0 = 主窗口)。
     windows: BTreeMap<u8, WindowState>,
     /// 资产像素尺寸缓存(键 = `CG[FILE]` 原始字节)。
@@ -292,7 +297,8 @@ impl GfxState {
             copy_log_dropped: 0,
             image_log_dropped: 0,
             diags: BTreeMap::new(),
-            cur_call_at: None,
+            cur_call: None,
+            cur_call_cmd: String::new(),
             windows,
             asset_sizes: BTreeMap::new(),
             font_families: Vec::new(),
@@ -503,11 +509,9 @@ impl GfxState {
             } => {
                 self.frame = *frame;
                 // S1:域事件自带脚本定位,分派窗口内产生的诊断全部带上。
-                self.cur_call_at = script.zip(*pc).map(|(s, p)| error::DiagAt {
-                    script: format!("s{s}"),
-                    pc: p,
-                    cmd: Some(name.clone()),
-                });
+                self.cur_call = script.zip(*pc);
+                self.cur_call_cmd.clear();
+                self.cur_call_cmd.push_str(name);
                 match domain {
                     Domain::Graphics => self.dispatch(name, args),
                     Domain::Window => self.dispatch_window(name, args),
@@ -515,7 +519,7 @@ impl GfxState {
                     // gfx 不看它们 —— 有意的分域,不是丢事件(Q1 自查 b 类)。
                     _ => {}
                 }
-                self.cur_call_at = None;
+                self.cur_call = None;
             }
             _ => {}
         }
@@ -832,18 +836,6 @@ impl GfxState {
             ));
         };
         let layer = &node.layer;
-        if std::env::var_os("YU_CGINFO_TRACE").is_some()
-            && parsed.path.as_str_lossy().contains("LOADCONF")
-        {
-            let _ = (
-                &parsed,
-                flag,
-                layer.image_size(),
-                self.query_layer_size(layer, true),
-                self.query_layer_size(layer, false),
-                &layer.texture
-            );
-        }
         Ok(match flag {
             "E" => Value::Int(i64::from(layer.visible)),
             "A" => Value::Int(i64::from(layer.alpha)),
@@ -884,17 +876,6 @@ impl GfxState {
                     )
                 })?;
                 let out = self.query_onmouse(layer, flag, set, set2, sampler);
-                if std::env::var_os("YU_CGINFO_TRACE").is_some()
-                    && parsed.path.as_str_lossy().contains("LOADCONF")
-                {
-                    let _ = (
-                        &parsed,
-                        flag,
-                        set,
-                        set2,
-                        out.as_ref().map(|v| v.clone())
-                    );
-                }
                 out?
             }
             other => {
@@ -3338,20 +3319,31 @@ impl GfxState {
         })
     }
 
+    /// 当前域命令定位(仅诊断路径调用;构造 `DiagAt` 要两次分配)。
+    fn diag_at(&self) -> Option<error::DiagAt> {
+        let (script, pc) = self.cur_call?;
+        Some(error::DiagAt {
+            script: format!("s{script}"),
+            pc,
+            cmd: Some(self.cur_call_cmd.clone()),
+        })
+    }
+
     fn push_diag(&mut self, command: &str, d: Diag) {
+        let at = self.diag_at();
         let key = (d.code.to_string(), command.to_string(), d.detail.clone());
         match self.diags.get_mut(&key) {
             Some(existing) => {
                 existing.count = existing.count.saturating_add(1);
                 // S1:聚合丢计数可以,丢位置不行。
-                if let Some(at) = self.cur_call_at.clone() {
+                if let Some(at) = at {
                     existing.push_at(&at);
                 }
             }
             None => {
                 let mut frame_diag =
                     error::FrameDiag::new(d.code.to_string(), d.severity, command, d.detail);
-                if let Some(at) = self.cur_call_at.clone() {
+                if let Some(at) = at {
                     frame_diag.push_at(&at);
                 }
                 self.diags.insert(key, frame_diag);

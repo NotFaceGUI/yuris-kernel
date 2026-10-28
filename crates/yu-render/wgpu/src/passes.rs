@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 // 共享契约与平台设施(两个后端同源)。
 use yu_render_core::{
-    blit, text_base_key, AssetIssue, RenderReport, SkippedOp, Surface, TextComposer,
+    blit, text_base_key, AssetIssue, RenderPhases, RenderReport, SkippedOp, Surface, TextComposer,
     TextPaintStats, Texture, TextureStore,
 };
 // 仅剩的 CPU 像素算法依赖(**在册待清**,见 `docs/architecture/backends.md` §4):
@@ -48,6 +48,10 @@ pub(crate) type SnapshotDims = BTreeMap<CopyId, (u32, u32)>;
 pub(crate) enum PlannedTarget {
     Screen,
     Offscreen(LayerId),
+    /// 图层级 GPU 合成目标(`CGACT[TRANSITION]`/`MERGE` 的结果面;按纹理 id)。
+    Composite(u64),
+    /// 直接写快照纹理(`MERGE` 原地写快照表面的官方语义)。
+    Snapshot(CopyId),
     /// 复制/快照填充命令段(无 draw,不改变渲染目标)。
     Commands,
 }
@@ -66,6 +70,15 @@ pub(crate) enum DrawKind {
     },
     /// 引擎 psD(交叉淡化)过渡;`_DXMODE≠0` 且 TA<1。
     TransitionPsd {
+        bind_index: u32,
+    },
+    /// `CGACT[TRANSITION]` 双源整数 lerp:`lerp_bind_groups[bind_index]`,
+    /// 无顶点缓冲(全屏三角形),整面写入目标。
+    Lerp {
+        bind_index: u32,
+    },
+    /// `CGACT[MERGE]` 双纹理整数合成:`merge_bind_groups[bind_index]`。
+    Merge {
         bind_index: u32,
     },
 }
@@ -121,6 +134,18 @@ pub(crate) struct PlannedPass {
     pub draws: Vec<Draw>,
     pub copies: Vec<CopyCmd>,
     pub paints: Vec<PaintCmd>,
+    /// 通用纹理 → 纹理复制(整面;`MERGE` 写回快照前把「下层」拷到临时槽)。
+    pub blits: Vec<BlitCmd>,
+}
+
+/// 一次整面纹理复制:源是**执行期才存在**的快照(COPY 命令段创建),
+/// 目标是普通纹理 id。
+#[derive(Clone, Debug)]
+pub(crate) struct BlitCmd {
+    pub source: CopyId,
+    pub dest_id: u64,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// CPU 图像加工的细分计数(`YU_RENDER_TIMING` 门控)。
@@ -140,6 +165,12 @@ struct ImageOpStats {
     /// `MERGE/MERGE2/XOR/AND/TRANSITION`:整面 CPU 合成(逐像素)。
     composite: u64,
     composite_ms: f64,
+    /// 其中纯 `MERGE` / `MERGE2` 的条数(取证:哪些动作在吃 CPU)。
+    merge: u64,
+    merge2: u64,
+    /// 双源过渡 / 位运算合成(同属整面 CPU 合成,单独计数便于归因)。
+    transition: u64,
+    bitwise: u64,
 }
 
 impl ImageOpStats {
@@ -168,6 +199,13 @@ impl ImageOpStats {
         {
             self.composite += 1;
             self.composite_ms += ms;
+            match action {
+                yu_gfx::op::ImageAction::Merge => self.merge += 1,
+                yu_gfx::op::ImageAction::Merge2 => self.merge2 += 1,
+                yu_gfx::op::ImageAction::Other("transition") => self.transition += 1,
+                yu_gfx::op::ImageAction::Other("xor" | "and") => self.bitwise += 1,
+                _ => {}
+            }
         }
     }
 }
@@ -182,6 +220,10 @@ pub(crate) struct FramePlan {
     /// 过渡 uniform buffer(保活,执行期由 bind group 引用)。
     #[allow(dead_code)]
     pub transition_buffers: Vec<wgpu::Buffer>,
+    /// `CGACT[TRANSITION]` GPU lerp 的 bind group(按 draw 索引)。
+    pub lerp_bind_groups: Vec<wgpu::BindGroup>,
+    /// `CGACT[MERGE]` GPU 合成的 bind group(按 draw 索引)。
+    pub merge_bind_groups: Vec<wgpu::BindGroup>,
 }
 
 impl FramePlan {
@@ -205,12 +247,36 @@ pub(crate) fn plan(
     backbuffer: Option<&yu_render_core::Surface>,
     backbuffer_gpu: &mut Option<(u64, u64)>,
     text: &mut TextComposer,
-) -> Result<(FramePlan, RenderReport), Diag> {
+) -> Result<(FramePlan, RenderReport, RenderPhases), Diag> {
     targets.prune_snapshots(&live_snapshots(frame));
+    {
+        // 合成目标按「图层本帧是否存活」剪枝(否则跨场景累积 ⇒ 显存 OOM)。
+        let live_layers: BTreeSet<LayerId> =
+            frame.layers.iter().map(|layer| layer.id.clone()).collect();
+        targets.prune_composites(&live_layers, pipelines);
+        // 组离屏:存活集合 = 组 pass 目标 + 图层引用的 Offscreen。
+        let mut live_offscreen: BTreeSet<LayerId> = frame
+            .passes
+            .iter()
+            .filter_map(|pass| match &pass.target {
+                PassTarget::Offscreen(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        for layer in &frame.layers {
+            if let TextureRef::Offscreen(id) = &layer.texture {
+                live_offscreen.insert(id.clone());
+            }
+        }
+        targets.prune_offscreen(&live_offscreen, pipelines);
+    }
     // 覆盖纹理缓存只保留本帧仍存在的层,防止临时层累积。
     uploaded_overrides.retain(|id, _| frame.layers.iter().any(|layer| &layer.id == id));
     let timing = std::env::var("YU_RENDER_TIMING").is_ok();
-    let trace_geometry = timing;
+    // 几何留痕是**逐层**日志(长会话可达成百上千行/帧),与「每帧一行」
+    // 的阶段耗时分开门控:性能采集只要 `YU_RENDER_TIMING`,做视觉对齐
+    // 取证时才开 `YU_RENDER_TRACE_GEOMETRY`。
+    let trace_geometry = std::env::var("YU_RENDER_TRACE_GEOMETRY").is_ok();
     let started = std::time::Instant::now();
     let t_snap;
     let t_image;
@@ -314,6 +380,9 @@ pub(crate) fn plan(
     let mut memo_skip: BTreeSet<(usize, usize)> = BTreeSet::new();
     let mut memo_last: BTreeMap<LayerId, (usize, usize)> = BTreeMap::new();
     let mut memo_sig: BTreeMap<LayerId, u64> = BTreeMap::new();
+    // 合成链记账(取证):判定过的层链数 / 记忆化命中数。
+    let mut memo_chains: u64 = 0;
+    let mut memo_hits: u64 = 0;
     composite_cache.retain(|id, _| frame.layers.iter().any(|layer| &layer.id == id));
     {
         let mut chains: BTreeMap<LayerId, Vec<(&ImageOp, (usize, usize))>> = BTreeMap::new();
@@ -361,8 +430,10 @@ pub(crate) fn plan(
                 continue;
             }
             let signature = chain_signature(frame, targets, &overrides, &ops);
+            memo_chains += 1;
             match composite_cache.get(&layer) {
                 Some((cached, texture)) if *cached == signature => {
+                    memo_hits += 1;
                     // 命中:形状与像素都等价 ⇒ 直接沿用,链上每条都算已执行
                     // (与 soft 逐条重算的计数口径一致)。
                     overrides.insert(
@@ -395,6 +466,13 @@ pub(crate) fn plan(
     let mut deferred: BTreeSet<(usize, usize)> = BTreeSet::new();
     let mark = started.elapsed();
     let mut img_stats = ImageOpStats::default();
+    // GPU `CGACT[TRANSITION]`:bind group + 按 (pass, op) 排队的合成 pass
+    // (pass 在下面的规划循环里按命令序插入,保证在依赖它的 COPY 之后、
+    // 屏幕 pass 之前)。
+    let mut lerp_bind_groups: Vec<wgpu::BindGroup> = Vec::new();
+    let mut gpu_transitions: BTreeMap<(usize, usize), Vec<PlannedPass>> = BTreeMap::new();
+    // GPU `CGACT[MERGE]`:ping-pong 合成 pass(bind group 按 draw 索引)。
+    let mut merge_bind_groups: Vec<wgpu::BindGroup> = Vec::new();
     for (pass_index, pass) in frame.passes.iter().enumerate() {
         let PassTarget::Texture(target) = &pass.target else {
             continue;
@@ -428,6 +506,56 @@ pub(crate) fn plan(
                     if is_paint && snapshot_of(frame, image_target).is_some() {
                         deferred.insert((pass_index, op_index));
                         continue;
+                    }
+                    // `CGACT[TRANSITION]`:两源都是稳定 GPU 纹理、且目标层
+                    // 本帧没有 CPU 像素消费者 ⇒ 在 GPU 上做整数 lerp
+                    // (shader `lerp.wgsl`,与 soft `blend_transition` 逐位一致)。
+                    if matches!(&image.action, yu_gfx::op::ImageAction::Other("transition")) {
+                        let op_started = std::time::Instant::now();
+                        if let Some(planned) = try_gpu_transition(
+                            ctx,
+                            frame,
+                            textures,
+                            targets,
+                            gpu,
+                            pipelines,
+                            &mut overrides,
+                            &mut lerp_bind_groups,
+                            image_target,
+                            image,
+                            (pass_index, op_index),
+                        ) {
+                            acc.ops_total += 1;
+                            acc.ops_drawn += 1;
+                            img_stats.record(&image.action, op_started.elapsed());
+                            gpu_transitions.insert((pass_index, op_index), vec![planned]);
+                            continue;
+                        }
+                    }
+                    // `CGACT[MERGE]`(非 MERGE2):上下层都是稳定 GPU 纹理
+                    // ⇒ ping-pong 离屏 + 整数合成(shader `merge.wgsl`)。
+                    if matches!(&image.action, yu_gfx::op::ImageAction::Merge) {
+                        let op_started = std::time::Instant::now();
+                        if let Some(planned) = try_gpu_merge(
+                            ctx,
+                            frame,
+                            textures,
+                            targets,
+                            gpu,
+                            pipelines,
+                            &mut overrides,
+                            &mut merge_bind_groups,
+                            &snapshot_dims,
+                            image_target,
+                            image,
+                            (pass_index, op_index),
+                        ) {
+                            acc.ops_total += 1;
+                            acc.ops_drawn += 1;
+                            img_stats.record(&image.action, op_started.elapsed());
+                            gpu_transitions.insert((pass_index, op_index), planned);
+                            continue;
+                        }
                     }
                     acc.ops_total += 1;
                     let op_started = std::time::Instant::now();
@@ -714,6 +842,11 @@ pub(crate) fn plan(
                         passes.push(commands);
                     }
                 }
+                Op::Image(_) if gpu_transitions.contains_key(&(pass_index, op_index)) => {
+                    if let Some(planned) = gpu_transitions.remove(&(pass_index, op_index)) {
+                        passes.extend(planned);
+                    }
+                }
                 Op::Image(image) if deferred.contains(&(pass_index, op_index)) => {
                     let mut commands = PlannedPass {
                         target: Some(PlannedTarget::Commands),
@@ -916,10 +1049,42 @@ pub(crate) fn plan(
         }
     }
 
+
     let missing_assets = textures.issues();
+    // 阶段耗时**无条件**采集(每帧 6 次 `Instant`,纳秒级):宿主
+    // `--frame-stats` 的渲染子阶段列由它填充,不依赖 `YU_RENDER_TIMING`
+    // 的日志门控。`YU_RENDER_TIMING` 只负责把同一组数打成一行人类可读
+    // 的 `[rt]` 日志。
+    let total = started.elapsed();
+    let rest = total - t_snap - t_image - t_text - t_copy_text;
+    let phases = RenderPhases {
+        plan_us: total.as_micros() as u64,
+        snap_us: t_snap.as_micros() as u64,
+        image_us: t_image.as_micros() as u64,
+        text_us: t_text.as_micros() as u64,
+        copy_text_us: t_copy_text.as_micros() as u64,
+        rest_us: rest.as_micros() as u64,
+        text_bake_us: (text_stats.bake_ms * 1e3) as u64,
+        text_hash_us: (text_stats.hash_ms * 1e3) as u64,
+        text_paint_us: (text_stats.paint_ms * 1e3) as u64,
+        text_base_us: (text_stats.base_ms * 1e3) as u64,
+        image_paint_us: (img_stats.paint_ms * 1e3) as u64,
+        image_pixel_us: (img_stats.pixel_ms * 1e3) as u64,
+        image_composite_us: (img_stats.composite_ms * 1e3) as u64,
+        decode_us: textures.decode_stats().0,
+        decode_bytes: textures.decode_stats().1,
+        image_merge_ops: img_stats.merge,
+        image_merge2_ops: img_stats.merge2,
+        image_transition_ops: img_stats.transition,
+        image_bitwise_ops: img_stats.bitwise,
+        image_paint_ops: img_stats.paint,
+        image_pixel_ops: img_stats.pixel,
+        image_sampled_ops: img_stats.sampled,
+        memo_chains,
+        memo_hits,
+        ..RenderPhases::default()
+    };
     if timing {
-        let total = started.elapsed();
-        let rest = total - t_snap - t_image - t_text - t_copy_text;
         log::trace!(
             target: "yu-render",
             "[rt] frame={} plan_total={:.2}ms snap={:.2} image={:.2} text={:.2} copy_text={:.2} rest={:.2} layers={} draws={} ops={}/{}",
@@ -965,9 +1130,521 @@ pub(crate) fn plan(
             vertices,
             transition_bind_groups,
             transition_buffers,
+            lerp_bind_groups,
+            merge_bind_groups,
         },
         acc.finish(missing_assets),
+        phases,
     ))
+}
+
+/// `CGACT[TRANSITION]` 的 GPU 路径(整数 lerp,与 soft `blend_transition` 同式)。
+///
+/// 前置条件全部成立才返回计划,否则 `None` 由调用方落回 CPU:
+/// 1. 两个源都能解析成**稳定 GPU 纹理**(资产/1×1/快照/离屏/本帧更早的
+///    GPU 合成);CPU 覆盖或 `Uv` 采样修饰一律回退;
+/// 2. 目标层本帧没有「需要 CPU 像素」的后续消费者(文本、MERGE、填充、
+///    滤镜、作为上层源…),否则 GPU 结果拿不到 CPU 像素;
+/// 3. 目标不是快照层(快照目标走命令段的 GPU 填充路径)。
+#[allow(clippy::too_many_arguments)]
+fn try_gpu_transition(
+    ctx: &GpuContext,
+    frame: &CompositorFrame,
+    textures: &mut TextureStore,
+    targets: &mut TargetSet,
+    gpu: &mut TextureCache,
+    pipelines: &mut PipelineCache,
+    overrides: &mut BTreeMap<LayerId, Override>,
+    lerp_bind_groups: &mut Vec<wgpu::BindGroup>,
+    target: &LayerId,
+    image: &ImageOp,
+    at: (usize, usize),
+) -> Option<PlannedPass> {
+    let debug = std::env::var_os("YU_TRANSITION_DEBUG").is_some();
+    let bail = |why: &str| -> Option<PlannedPass> {
+        if debug {
+            log::info!(target: "yu-render", "[transition] CPU fallback: {why}");
+        }
+        None
+    };
+    let Some(to_id) = image.source2.as_ref() else {
+        return bail("no ID2");
+    };
+    if snapshot_of(frame, target).is_some() {
+        return bail("target is snapshot");
+    }
+    if frame.text_revisions.contains_key(target)
+        || frame.text_draws.iter().any(|draw| &draw.target == target)
+    {
+        return bail("text on target");
+    }
+    if has_cpu_consumer_after(frame, target, at) {
+        return bail("later CPU consumer");
+    }
+    let blend = image.set.as_ref().and_then(|value| value.as_int()).unwrap_or(0);
+    let f = blend.clamp(0, 256) as u32;
+    let Some((from_id, _fw, _fh)) = gpu_source(
+        ctx,
+        frame,
+        textures,
+        targets,
+        gpu,
+        overrides,
+        &image.source,
+        image.source_texture.as_ref(),
+    ) else {
+        return bail("from is CPU-only");
+    };
+    let Some((to_gpu, width, height)) =
+        gpu_source(ctx, frame, textures, targets, gpu, overrides, to_id, None)
+    else {
+        return bail("to is CPU-only");
+    };
+    if width == 0 || height == 0 {
+        return bail("zero size");
+    }
+    let target_gpu_id = match targets.ensure_composite(ctx, target, 0, width, height, pipelines) {
+        Ok(target) => target.id,
+        Err(_) => return bail("no composite target"),
+    };
+    let (Some(from_view), Some(to_view)) = (
+        view_for_id(targets, gpu, from_id),
+        view_for_id(targets, gpu, to_gpu),
+    ) else {
+        return bail("source view missing");
+    };
+    let from_view = from_view.clone();
+    let to_view = to_view.clone();
+    if pipelines.ensure_lerp_pipeline(ctx).is_err() {
+        return bail("lerp pipeline");
+    }
+    let Ok(group) = pipelines.create_lerp_bind_group(ctx, &from_view, &to_view, f) else {
+        return bail("bind group");
+    };
+    let bind_index = lerp_bind_groups.len() as u32;
+    lerp_bind_groups.push(group);
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    fnv_mix(&mut hash, from_id);
+    fnv_mix(&mut hash, to_gpu);
+    fnv_mix(&mut hash, u64::from(f));
+    overrides.insert(
+        target.clone(),
+        Override::Gpu {
+            id: target_gpu_id,
+            width,
+            height,
+            slot: 0,
+            hash,
+        },
+    );
+    Some(PlannedPass {
+        target: Some(PlannedTarget::Composite(target_gpu_id)),
+        draws: vec![Draw {
+            blend: BlendMode::Normal,
+            texture_id: target_gpu_id,
+            filter: FilterKind::Point,
+            kind: DrawKind::Lerp { bind_index },
+        }],
+        ..PlannedPass::default()
+    })
+}
+
+/// 本帧在 `at` 之前是否有图像加工改写了该快照的表面。
+///
+/// 用于区分「快照表面 = COPY 时刻像素」与「表面已被同帧 `RECTPAINT` 族改写」:
+/// 只有前者 GPU 的当前纹理与 CPU 参考路径的冻结像素同源,GPU 合成才可替换。
+fn snapshot_modified_before(
+    frame: &CompositorFrame,
+    copy_id: CopyId,
+    at: (usize, usize),
+) -> bool {
+    for (pass_index, pass) in frame.passes.iter().enumerate() {
+        for (op_index, op) in pass.ops.iter().enumerate() {
+            if (pass_index, op_index) == at {
+                return false;
+            }
+            let Op::Image(image) = op else { continue };
+            if op.status() != OpStatus::Executable {
+                continue;
+            }
+            let target = image.target.as_ref().unwrap_or(&image.source);
+            if snapshot_of(frame, target) == Some(copy_id) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 把图层当前像素解析成**稳定 GPU 纹理 id**(不产生 CPU 像素)。
+///
+/// `None` = 该源只能走 CPU(被加工成 CPU 覆盖 / 采样修饰 / 不存在)。
+fn gpu_source(
+    ctx: &GpuContext,
+    frame: &CompositorFrame,
+    textures: &mut TextureStore,
+    targets: &TargetSet,
+    gpu: &mut TextureCache,
+    overrides: &BTreeMap<LayerId, Override>,
+    id: &LayerId,
+    fallback: Option<&TextureRef>,
+) -> Option<(u64, u32, u32)> {
+    if let Some(ov) = overrides.get(id) {
+        return match ov {
+            Override::Gpu {
+                id, width, height, ..
+            } => Some((*id, *width, *height)),
+            _ => None,
+        };
+    }
+    let texture_ref = frame
+        .layers
+        .iter()
+        .find(|layer| &layer.id == id)
+        .map(|layer| &layer.texture)
+        .filter(|texture| !matches!(texture, TextureRef::None))
+        .or(fallback)?;
+    match texture_ref {
+        TextureRef::Asset(key) => {
+            let texture = textures.resolve_shared(key).ok()?;
+            let gpu_id = gpu
+                .upload(ctx, texture.width, texture.height, &texture.rgba, "transition source")
+                .ok()?;
+            Some((gpu_id, texture.width, texture.height))
+        }
+        TextureRef::SolidBlack1x1 => {
+            let texture = Texture::solid_black_1x1();
+            let gpu_id = gpu
+                .upload(ctx, texture.width, texture.height, &texture.rgba, "transition solid")
+                .ok()?;
+            Some((gpu_id, texture.width, texture.height))
+        }
+        TextureRef::Snapshot(copy_id) => targets
+            .snapshot(*copy_id)
+            .map(|target| (target.id, target.width, target.height)),
+        TextureRef::Offscreen(group) => targets
+            .offscreen(group)
+            .map(|target| (target.id, target.width, target.height)),
+        TextureRef::None => None,
+    }
+}
+
+/// 纹理 id → view:离屏/快照/合成目标在 `TargetSet`,资产上传在 `TextureCache`。
+fn view_for_id<'a>(
+    targets: &'a TargetSet,
+    gpu: &'a TextureCache,
+    id: u64,
+) -> Option<&'a wgpu::TextureView> {
+    targets
+        .view_by_id(id)
+        .or_else(|| gpu.get(id).map(|texture| &texture.view))
+}
+
+/// `CGACT[MERGE]` 的 GPU 路径(整数合成,与 soft `apply_merge(…, false)` 同式)。
+///
+/// 与过渡同一套前置条件;额外要求下层(目标层当前像素)可解析成稳定 GPU
+/// 纹理。链式 MERGE 用两槽 ping-pong(读上一槽、写下一槽),不会对同一纹理
+/// 读写。`MERGE2`(带 `/ao` 除法)保持 CPU。
+#[allow(clippy::too_many_arguments)]
+fn try_gpu_merge(
+    ctx: &GpuContext,
+    frame: &CompositorFrame,
+    textures: &mut TextureStore,
+    targets: &mut TargetSet,
+    gpu: &mut TextureCache,
+    pipelines: &mut PipelineCache,
+    overrides: &mut BTreeMap<LayerId, Override>,
+    merge_bind_groups: &mut Vec<wgpu::BindGroup>,
+    snapshot_dims: &SnapshotDims,
+    target: &LayerId,
+    image: &ImageOp,
+    at: (usize, usize),
+) -> Option<Vec<PlannedPass>> {
+    let debug = std::env::var_os("YU_TRANSITION_DEBUG").is_some();
+    let bail = |why: &str| -> Option<Vec<PlannedPass>> {
+        if debug {
+            log::info!(target: "yu-render", "[merge] CPU fallback: {why}");
+        }
+        None
+    };
+    // 目标持快照 = 官方「原地写快照表面」形态,单独走下面的 blit + 写回分支。
+    let snapshot_target = snapshot_of(frame, target);
+    if frame.text_revisions.contains_key(target)
+        || frame.text_draws.iter().any(|draw| &draw.target == target)
+    {
+        return bail("text on target");
+    }
+    if has_cpu_consumer_after(frame, target, at) {
+        return bail("later CPU consumer");
+    }
+    let Some((upper, _uw, _uh)) = gpu_source(
+        ctx,
+        frame,
+        textures,
+        targets,
+        gpu,
+        overrides,
+        &image.source,
+        image.source_texture.as_ref(),
+    ) else {
+        return bail("upper is CPU-only");
+    };
+    // 快照目标:blit 快照 → 临时槽 → 整数 merge 写回快照纹理(不动 CPU 镜像)。
+    if let Some(copy_id) = snapshot_target {
+        // 快照 GPU 目标由更早的 COPY 命令在**命令段**创建/冻结(执行期),
+        // 规划期只拿步骤 0 定稿的尺寸;blit 源按 `CopyId` 在执行期解析。
+        let Some((width, height)) = snapshot_dims.get(&copy_id).copied() else {
+            return bail("snapshot dims missing");
+        };
+        // 快照内容只能来自:①本帧的 COPY(命令段先执行) 或 ②上一帧已冻结的
+        // GPU 纹理。两者都不满足 ⇒ 执行期读不到源,回退 CPU(禁止 fatal)。
+        let will_exist = targets.snapshot(copy_id).is_some()
+            || frame.passes.iter().any(|pass| {
+                pass.ops.iter().any(|op| {
+                    matches!(op, Op::Copy(copy) if copy.id == copy_id)
+                })
+            });
+        if !will_exist {
+            return bail("snapshot not materialized");
+        }
+        // 本帧这条 MERGE 之前,该快照表面是否已被图像加工改写
+        // (`es_SPExec.yst` 的标准形态就是 `COPY → RECTPAINT3 SET=0 → MERGE`)。
+        //
+        // 这种形态下 GPU 的「下层」= **当前**快照纹理(已被 `RECTPAINT3` 清成
+        // alpha=0、RGB=0),而 CPU 参考路径的下层 = `snapshot_pixels()` 给出的
+        // **COPY 时刻冻结像素**。两者不是同一份数据:
+        //
+        // - `MERGE` 按现状只写 RGB、保留目标 alpha(`merge.wgsl`:`out.a = lower.a`);
+        // - ⇒ GPU 结果是 alpha 恒 0 的表面。`SPLBUF602` 的 `SIZE` 再以它为源
+        //   (`TextUri`/`Override::Uv` 解析源层时,GPU 路径没有 CPU 覆盖可复用),
+        //   整层在 `SRCALPHA` 混合里被抹掉 ⇒ 立绘在换差分/眨眼的过渡帧消失,
+        //   下一帧切回原路径又出现(`dir1-real` 实测 f=2651..2658、2894..2900)。
+        //
+        // 官方在同一表面上是**就地执行**(`FUN_0042f809`:`*(iVar4+0x90) = local_68`),
+        // 清空后 MERGE 的结果必然可见 ⇒ 官方这次绘制会写 alpha,这正是
+        // `docs/divergences/DIV-GFX-063` §2.4 记的未取证点。本轮不猜语义:
+        // 只在该分歧**实际发生**时回退 CPU(基面 = 冻结像素,与回归前一致),
+        // 未清空/未改写的快照仍走 GPU 合成。
+        if snapshot_modified_before(frame, copy_id, at) {
+            return bail("snapshot surface modified earlier in frame");
+        }
+        // 自合成(ID 与 ID2 指向同一快照):GPU 不能同纹理读写 ⇒ 回退 CPU。
+        let upper_is_target = upper
+            == targets
+                .snapshot(copy_id)
+                .map(|target| target.id)
+                .unwrap_or(u64::MAX)
+            || frame
+                .layers
+                .iter()
+                .find(|layer| layer.id == image.source)
+                .map(|layer| matches!(&layer.texture, TextureRef::Snapshot(id) if *id == copy_id))
+                .unwrap_or(false);
+        if upper_is_target {
+            return bail("upper is the target snapshot");
+        }
+        if width == 0 || height == 0 {
+            return bail("zero size");
+        }
+        let temp = match targets.ensure_composite(ctx, target, 2, width, height, pipelines) {
+            Ok(target) => target.id,
+            Err(_) => return bail("no temp target"),
+        };
+        let (Some(temp_view), Some(upper_view)) = (
+            view_for_id(targets, gpu, temp),
+            view_for_id(targets, gpu, upper),
+        ) else {
+            return bail("source view missing");
+        };
+        let temp_view = temp_view.clone();
+        let upper_view = upper_view.clone();
+        if pipelines.ensure_layer_merge_pipeline(ctx).is_err() {
+            return bail("merge pipeline");
+        }
+        let Ok(group) = pipelines.create_layer_merge_bind_group(ctx, &temp_view, &upper_view) else {
+            return bail("bind group");
+        };
+        let bind_index = merge_bind_groups.len() as u32;
+        merge_bind_groups.push(group);
+        // 快照内容即将改变:CPU 镜像失效(需要 CPU 像素的消费者已在扫描里回退)。
+        targets.invalidate_snapshot_cpu(copy_id);
+        return Some(vec![
+            PlannedPass {
+                target: Some(PlannedTarget::Commands),
+                blits: vec![BlitCmd {
+                    source: copy_id,
+                    dest_id: temp,
+                    width,
+                    height,
+                }],
+                ..PlannedPass::default()
+            },
+            PlannedPass {
+                target: Some(PlannedTarget::Snapshot(copy_id)),
+                draws: vec![Draw {
+                    blend: BlendMode::Normal,
+                    texture_id: temp,
+                    filter: FilterKind::Point,
+                    kind: DrawKind::Merge { bind_index },
+                }],
+                ..PlannedPass::default()
+            },
+        ]);
+    }
+    // 下层 = 目标层当前像素(上一槽 / CPU 覆盖上传 / 层基图)。
+    let (lower, prev_slot) = match overrides.get(target) {
+        Some(Override::Gpu {
+            id, width, height, slot, ..
+        }) => ((*id, *width, *height), Some(*slot)),
+        Some(Override::Cpu { tex, .. }) => {
+            let gpu_id = gpu
+                .upload(ctx, tex.width, tex.height, &tex.rgba, "merge lower")
+                .ok()?;
+            ((gpu_id, tex.width, tex.height), None)
+        }
+        Some(Override::Uv { .. }) => return bail("lower is Uv"),
+        None => {
+            let Some((id, width, height)) = gpu_base(ctx, frame, textures, targets, gpu, target)
+            else {
+                return bail("lower base is CPU-only");
+            };
+            ((id, width, height), None)
+        }
+    };
+    let (lower_id, width, height) = lower;
+    if width == 0 || height == 0 {
+        return bail("zero size");
+    }
+    let next_slot = match prev_slot {
+        Some(0) => 1,
+        _ => 0,
+    };
+    let target_gpu_id = match targets.ensure_composite(
+        ctx, target, next_slot, width, height, pipelines,
+    ) {
+        Ok(target) => target.id,
+        Err(_) => return bail("no composite target"),
+    };
+    let (Some(lower_view), Some(upper_view)) = (
+        view_for_id(targets, gpu, lower_id),
+        view_for_id(targets, gpu, upper),
+    ) else {
+        return bail("source view missing");
+    };
+    let lower_view = lower_view.clone();
+    let upper_view = upper_view.clone();
+    if pipelines.ensure_layer_merge_pipeline(ctx).is_err() {
+        return bail("merge pipeline");
+    }
+    let Ok(group) = pipelines.create_layer_merge_bind_group(ctx, &lower_view, &upper_view) else {
+        return bail("bind group");
+    };
+    let bind_index = merge_bind_groups.len() as u32;
+    merge_bind_groups.push(group);
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    fnv_mix(&mut hash, lower_id);
+    fnv_mix(&mut hash, upper);
+    fnv_mix(&mut hash, u64::from(next_slot));
+    overrides.insert(
+        target.clone(),
+        Override::Gpu {
+            id: target_gpu_id,
+            width,
+            height,
+            slot: next_slot,
+            hash,
+        },
+    );
+    Some(vec![PlannedPass {
+        target: Some(PlannedTarget::Composite(target_gpu_id)),
+        draws: vec![Draw {
+            blend: BlendMode::Normal,
+            texture_id: target_gpu_id,
+            filter: FilterKind::Point,
+            kind: DrawKind::Merge { bind_index },
+        }],
+        ..PlannedPass::default()
+    }])
+}
+
+/// 目标层的**基图**解析成 GPU 纹理(不看 `overrides`;供 MERGE 下层用)。
+fn gpu_base(
+    ctx: &GpuContext,
+    frame: &CompositorFrame,
+    textures: &mut TextureStore,
+    targets: &TargetSet,
+    gpu: &mut TextureCache,
+    target: &LayerId,
+) -> Option<(u64, u32, u32)> {
+    let layer = frame.layers.iter().find(|layer| &layer.id == target)?;
+    match &layer.texture {
+        TextureRef::Asset(key) => {
+            let texture = textures.resolve_shared(key).ok()?;
+            let gpu_id = gpu
+                .upload(ctx, texture.width, texture.height, &texture.rgba, "merge base")
+                .ok()?;
+            Some((gpu_id, texture.width, texture.height))
+        }
+        TextureRef::SolidBlack1x1 => {
+            let texture = Texture::solid_black_1x1();
+            let gpu_id = gpu
+                .upload(ctx, texture.width, texture.height, &texture.rgba, "merge solid")
+                .ok()?;
+            Some((gpu_id, texture.width, texture.height))
+        }
+        TextureRef::Snapshot(copy_id) => targets
+            .snapshot(*copy_id)
+            .map(|target| (target.id, target.width, target.height)),
+        TextureRef::Offscreen(group) => targets
+            .offscreen(group)
+            .map(|target| (target.id, target.width, target.height)),
+        TextureRef::None => None,
+    }
+}
+
+/// 本帧在 `at` 之后是否还有需要**该层 CPU 像素**的加工/文本消费。
+fn has_cpu_consumer_after(
+    frame: &CompositorFrame,
+    target: &LayerId,
+    at: (usize, usize),
+) -> bool {
+    let mut later = false;
+    for (pass_index, pass) in frame.passes.iter().enumerate() {
+        for (op_index, op) in pass.ops.iter().enumerate() {
+            if !later {
+                if (pass_index, op_index) == at {
+                    later = true;
+                }
+                continue;
+            }
+            let Op::Image(image) = op else { continue };
+            if op.status() != OpStatus::Executable {
+                continue;
+            }
+            let image_target = image.target.as_ref().unwrap_or(&image.source);
+            // 这些动作不需要读回 CPU 像素:过渡/MERGE(可继续 GPU 链)、
+            // SIZE/镜像(纯采样修饰)。
+            let gpu_friendly = matches!(
+                image.action,
+                yu_gfx::op::ImageAction::Other("transition")
+                    | yu_gfx::op::ImageAction::Merge
+                    | yu_gfx::op::ImageAction::SizeNearest
+                    | yu_gfx::op::ImageAction::SizeBilinear
+                    | yu_gfx::op::ImageAction::Horizontal
+                    | yu_gfx::op::ImageAction::Vertical
+            );
+            if gpu_friendly {
+                continue;
+            }
+            if image_target == target
+                || &image.source == target
+                || image.source2.as_ref() == Some(target)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn live_snapshots(frame: &CompositorFrame) -> BTreeSet<CopyId> {
@@ -1033,10 +1710,18 @@ fn capture_copy_mirror(
     snapshot_dims: &SnapshotDims,
     copy: &CopyOp,
 ) -> bool {
+    // 源一律按 `Rc` 共享:旧实现每次 COPY 把整张源图 `clone()` 一遍
+    // (1100×825/2048² 上每帧几十 MB),是 `snap_ms` 33ms 的主体。
+    // 只覆盖 CPU 可得源(资产/1×1/快照/后缓冲镜像的链式展开)。
+    //
+    // 主组(`:/W0/`)复制**不在这里**造镜像:它的像素是上一帧呈现面,而
+    // `SAVE[ID]` 需要的是「命令时刻该层表面」——软后端回放在同一帧里会
+    // 继续应用后续 `CGACT` 加工,镜像拿不到这个时序。保留旧语义(抓帧器
+    // 回放),不引入未验证的存档缩略图差异。
     let CopySource::Layer(source_layer) = &copy.source else {
         return false;
     };
-    let source: Texture = {
+    let source: Rc<Texture> = {
         let texture_ref = frame
             .layers
             .iter()
@@ -1048,13 +1733,13 @@ fn capture_copy_mirror(
             return false;
         };
         match texture_ref {
-            TextureRef::Asset(key) => match textures.resolve(key) {
-                Ok(texture) => texture.clone(),
+            TextureRef::Asset(key) => match textures.resolve_shared(key) {
+                Ok(texture) => texture,
                 Err(_) => return false,
             },
-            TextureRef::SolidBlack1x1 => Texture::solid_black_1x1(),
-            TextureRef::Snapshot(pid) => match targets.snapshot_cpu(*pid) {
-                Some(texture) => texture.clone(),
+            TextureRef::SolidBlack1x1 => Rc::new(Texture::solid_black_1x1()),
+            TextureRef::Snapshot(pid) => match targets.snapshot_cpu_shared(*pid) {
+                Some(texture) => texture,
                 None => return false,
             },
             TextureRef::None | TextureRef::Offscreen(_) => return false,
@@ -1069,12 +1754,12 @@ fn capture_copy_mirror(
         .unwrap_or((sw, sh));
     let mut surface = Surface::new(width, height, [0, 0, 0, 0]);
     let (x0, y0, x1, y1) = copy.region.resolve(sw, sh);
-    blit(
-        &Surface {
-            width: source.width,
-            height: source.height,
-            rgba: source.rgba.clone(),
-        },
+    // 直接按 (宽, 高, 像素切片) 拷区域:旧实现先整帧 clone 一份源
+    // (1100×825/2048² 每帧几十 MB)再逐像素 blit,是 `snap_ms` 33ms 的主体。
+    yu_render_core::blit_rgba(
+        source.width,
+        source.height,
+        &source.rgba,
         &mut surface,
         x0,
         y0,
@@ -1225,6 +1910,19 @@ pub(crate) enum Override {
         bilinear: bool,
         hash: u64,
     },
+    /// 显存里的图层合成结果(目前用于 `CGACT[TRANSITION]`/`MERGE` 的 GPU 合成)。
+    ///
+    /// 像素只在 GPU 上,`cpu_tex()` = `None`:后续需要 CPU 像素的加工
+    /// (`MERGE2`/`REVERSE`/文本基面…)必须先落回 CPU 路径 —— 规划阶段会
+    /// 预扫描目标层,存在 CPU 消费者时**不走 GPU 分支**(显式回退,不猜)。
+    /// `slot` = 该结果所在的 ping-pong 槽(`MERGE` 链读上一槽、写下一槽)。
+    Gpu {
+        id: u64,
+        width: u32,
+        height: u32,
+        slot: u8,
+        hash: u64,
+    },
 }
 
 impl Override {
@@ -1241,7 +1939,7 @@ impl Override {
 
     fn hash(&self) -> u64 {
         match self {
-            Self::Cpu { hash, .. } | Self::Uv { hash, .. } => *hash,
+            Self::Cpu { hash, .. } | Self::Uv { hash, .. } | Self::Gpu { hash, .. } => *hash,
         }
     }
 
@@ -1252,6 +1950,7 @@ impl Override {
             Self::Uv { width, height, .. } => {
                 ((*width).round() as u32, (*height).round() as u32)
             }
+            Self::Gpu { width, height, .. } => (*width, *height),
         }
     }
 
@@ -1260,15 +1959,16 @@ impl Override {
         match self {
             Self::Cpu { tex, .. } => (f64::from(tex.width), f64::from(tex.height)),
             Self::Uv { width, height, .. } => (*width, *height),
+            Self::Gpu { width, height, .. } => (f64::from(*width), f64::from(*height)),
         }
     }
 
-    /// CPU 像素视图。`Uv` 的像素属于源层:返回 `None`,需要 CPU 像素的
-    /// 调用方必须显式报缺(不静默补零)。
+    /// CPU 像素视图。`Uv` 的像素属于源层、`Gpu` 的像素只在显存:返回
+    /// `None`,需要 CPU 像素的调用方必须显式报缺(不静默补零)。
     fn cpu_tex(&self) -> Option<&Rc<Texture>> {
         match self {
             Self::Cpu { tex, .. } => Some(tex),
-            Self::Uv { .. } => None,
+            Self::Uv { .. } | Self::Gpu { .. } => None,
         }
     }
 }
@@ -1650,6 +2350,9 @@ impl Planner<'_> {
                     .get(&layer.id)
                     .map(|o| match o {
                         Override::Cpu { tex, .. } => format!("cpu {}x{}", tex.width, tex.height),
+                        Override::Gpu {
+                            width, height, ..
+                        } => format!("gpu {width}x{height}"),
                         Override::Uv {
                             width,
                             height,
@@ -1710,27 +2413,111 @@ impl Planner<'_> {
                     *uv,
                 );
             }
+            // GPU 合成结果(`CGACT[TRANSITION]` 的 lerp 输出):直接画纹理。
+            if let Override::Gpu {
+                id, width, height, ..
+            } = ov
+            {
+                let Some(view) = view_for_id(self.targets, self.gpu, *id).cloned() else {
+                    self.skip(op, "imageop.composite_missing");
+                    return Ok(());
+                };
+                let (draw_width, draw_height) = match explicit_size {
+                    Some(size) => (size.width, size.height),
+                    None => (*width, *height),
+                };
+                let filter = pick_filter(self.frame, *width, *height, draw_width, draw_height);
+                return self.draw(
+                    out,
+                    blend,
+                    *id,
+                    &view,
+                    filter,
+                    x as f64,
+                    y as f64,
+                    draw_width,
+                    draw_height,
+                    alpha,
+                    DrawKind::Quad,
+                );
+            }
             let Some(tex) = ov.cpu_tex() else {
                 self.skip(op, "imageop.override_missing");
                 return Ok(());
             };
             let hash = ov.hash();
-            let gpu_tex = match self.uploaded_overrides.get(&layer.id).copied() {
-                Some((id, w, h, cached)) if w == tex.width && h == tex.height && cached == hash => {
+            // 1) 尺寸与内容都没变:直接复用;2) 同尺寸内容变化:原地重写
+            // (每帧新建一张整尺寸纹理 ⇒ 显存泄漏/OOM);3) 其余:新上传。
+            let cached = self.uploaded_overrides.get(&layer.id).copied();
+            let same_dims = cached.is_some_and(|(_, w, h, _)| w == tex.width && h == tex.height);
+            let gpu_tex = match cached {
+                Some((id, w, h, cached_hash))
+                    if same_dims && cached_hash == hash =>
+                {
                     (id, w, h)
                 }
-                _ => {
-                    let id = self.gpu.upload(
-                        self.ctx,
-                        tex.width,
-                        tex.height,
-                        &tex.rgba,
-                        "imageop layer",
-                    )?;
-                    self.uploaded_overrides
-                        .insert(layer.id.clone(), (id, tex.width, tex.height, hash));
-                    (id, tex.width, tex.height)
+                Some((id, _, _, _)) if same_dims => {
+                    match self
+                        .gpu
+                        .rewrite(self.ctx, id, tex.width, tex.height, &tex.rgba)
+                    {
+                        Ok(true) => {
+                            self.uploaded_overrides.insert(
+                                layer.id.clone(),
+                                (id, tex.width, tex.height, hash),
+                            );
+                            (id, tex.width, tex.height)
+                        }
+                        Ok(false) => match self.gpu.upload(
+                            self.ctx,
+                            tex.width,
+                            tex.height,
+                            &tex.rgba,
+                            "imageop layer",
+                        ) {
+                            Ok(new_id) => {
+                                self.uploaded_overrides.insert(
+                                    layer.id.clone(),
+                                    (new_id, tex.width, tex.height, hash),
+                                );
+                                (new_id, tex.width, tex.height)
+                            }
+                            Err(diag) => {
+                                self.skip(
+                                    op,
+                                    format!("gpu.upload {}: {}", diag.code, diag.detail),
+                                );
+                                return Ok(());
+                            }
+                        },
+                        Err(diag) => {
+                            self.skip(
+                                op,
+                                format!("gpu.rewrite {}: {}", diag.code, diag.detail),
+                            );
+                            return Ok(());
+                        }
+                    }
                 }
+                _ => match self.gpu.upload(
+                    self.ctx,
+                    tex.width,
+                    tex.height,
+                    &tex.rgba,
+                    "imageop layer",
+                ) {
+                    Ok(id) => {
+                        self.uploaded_overrides.insert(
+                            layer.id.clone(),
+                            (id, tex.width, tex.height, hash),
+                        );
+                        (id, tex.width, tex.height)
+                    }
+                    Err(diag) => {
+                        self.skip(op, format!("gpu.upload {}: {}", diag.code, diag.detail));
+                        return Ok(());
+                    }
+                },
             };
             let texture = self
                 .gpu
@@ -2167,18 +2954,42 @@ impl Planner<'_> {
                     let inner = inner.clone();
                     return self.image_source_texture(&inner);
                 }
-                                Override::Cpu { tex, .. } => {
+                // GPU 合成结果:纹理就在显存,直接返回(零拷贝)。
+                Override::Gpu {
+                    id, width, height, ..
+                } => {
+                    let view = self
+                        .targets
+                        .view_by_id(*id)
+                        .cloned()
+                        .or_else(|| self.gpu.get(*id).map(|t| t.view.clone()))
+                        .ok_or_else(|| "imageop.source_gpu_missing".to_string())?;
+                    return Ok((*id, view, *width, *height));
+                }
+                Override::Cpu { tex, .. } => {
                     let (w, h, hash) = (tex.width, tex.height, ov.hash());
-                    if let Some((gpu_id, uw, uh, cached)) =
-                        self.uploaded_overrides.get(source).copied()
-                    {
-                        if uw == w && uh == h && cached == hash {
-                            let view = self
-                                .gpu
-                                .get(gpu_id)
-                                .map(|t| t.view.clone())
-                                .ok_or_else(|| "imageop.source_gpu_missing".to_string())?;
-                            return Ok((gpu_id, view, w, h));
+                    let cached = self.uploaded_overrides.get(source).copied();
+                    // 同尺寸:命中直接复用;内容变了就**原地重写**(新建会每帧
+                    // 泄漏一张整尺寸纹理 ⇒ 显存 OOM)。
+                    if let Some((gpu_id, uw, uh, cached_hash)) = cached {
+                        if uw == w && uh == h {
+                            if cached_hash != hash
+                                && !self
+                                    .gpu
+                                    .rewrite(self.ctx, gpu_id, w, h, &tex.rgba)
+                                    .map_err(|diag| diag.code.to_string())?
+                            {
+                                // 尺寸/内容不符(极少):落到新上传
+                            } else {
+                                self.uploaded_overrides
+                                    .insert(source.clone(), (gpu_id, w, h, hash));
+                                let view = self
+                                    .gpu
+                                    .get(gpu_id)
+                                    .map(|t| t.view.clone())
+                                    .ok_or_else(|| "imageop.source_gpu_missing".to_string())?;
+                                return Ok((gpu_id, view, w, h));
+                            }
                         }
                     }
                     let rgba = tex.rgba.clone();
@@ -2243,6 +3054,16 @@ impl Planner<'_> {
         id: &LayerId,
         fallback: Option<&TextureRef>,
     ) -> Result<(u64, u32, u32), String> {
+        // GPU 合成结果(`CGACT[TRANSITION]`):像素已在显存,直接给纹理 id。
+        if let Some(Override::Gpu {
+            id: gpu_id,
+            width,
+            height,
+            ..
+        }) = self.overrides.get(id)
+        {
+            return Ok((*gpu_id, *width, *height));
+        }
         // 文本覆盖纹理不作为 COPY 源(DIV-GFX-058):快照面 = 基图(+图像
         // 加工)+ 命令时刻冻结的 `copy.texts`,不带帧末实时文本。转场取样
         // (`plan_transition`)不受此限制 —— 引擎取样当前像素,含已画文本。
@@ -2259,6 +3080,12 @@ impl Planner<'_> {
                 Override::Uv { source, .. } => {
                     let (id, _view, w, h) = self.image_source_texture(source)?;
                     return Ok((id, w, h));
+                }
+                // GPU 合成结果:显存纹理,直接给 COPY 用。
+                Override::Gpu {
+                    id, width, height, ..
+                } => {
+                    return Ok((*id, *width, *height));
                 }
                 Override::Cpu { .. } => {}
             }
@@ -2715,6 +3542,12 @@ fn layer_token(
             fnv_mix(&mut hash, height.to_bits());
             fnv_mix(&mut hash, u64::from(*bilinear));
             fnv_mix(&mut hash, layer_token(frame, targets, overrides, source, depth + 1));
+        }
+        Some(Override::Gpu { id, hash: gpu_hash, .. }) => {
+            // GPU 合成结果:身份 = 目标纹理 id + 输入指纹(跨帧稳定)。
+            fnv_mix(&mut hash, 5);
+            fnv_mix(&mut hash, *id);
+            fnv_mix(&mut hash, *gpu_hash);
         }
         None => match frame.layers.iter().find(|layer| &layer.id == id) {
             Some(layer) => {
@@ -3223,22 +4056,17 @@ fn resolve_cpu_source_with(
         },
     };
     match texture {
+        // 共享缓存里的 `Rc`(零拷贝):旧实现每解析一次资产就整图
+        // `rgba.clone()`,一条 `MERGE` 链的上层源每帧被复制几十次。
         TextureRef::Asset(key) => textures
-            .resolve(key)
-            .map(|texture| {
-                Rc::new(Texture {
-                    width: texture.width,
-                    height: texture.height,
-                    rgba: texture.rgba.clone(),
-                })
-            })
+            .resolve_shared(key)
             .map_err(|diag| diag.code.to_string()),
         TextureRef::SolidBlack1x1 => Ok(Rc::new(Texture::solid_black_1x1())),
         TextureRef::Snapshot(copy_id) => {
             // 冻结镜像优先:它由 1.4/1.6 段在**命令时刻**捕获,源层之后
             // 被 `CGEND` 删除也不影响(与 soft `snapshots` 表同一语义)。
-            if let Some(mirror) = targets.snapshot_cpu(*copy_id) {
-                return Ok(Rc::new(mirror.clone()));
+            if let Some(mirror) = targets.snapshot_cpu_shared(*copy_id) {
+                return Ok(mirror);
             }
             for pass in &frame.passes {
                 for op in &pass.ops {

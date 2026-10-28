@@ -1,10 +1,19 @@
-//! 临时取证探针:按输入时间线跑引擎,逐帧打印命令调用点(script/pc/行)
-//! 与关键图层状态,用于定位「读档确认后卡在对话框」。
+//! 流程取证探针:按输入时间线跑引擎,逐帧打印**命令调用点**
+//! (命令名 / script / pc / 源码行)、存档域诊断与关键图层状态,
+//! 用于定位「点击后脚本走到哪一步 / 场景是否返回」类症状。
 //!
 //! 用法:
 //! ```text
-//! probe_flow <root> <to> <f,x,y;f,x,y;...> [站点帧列表: 600,650,700]
+//! probe_flow <root> <to> "<f,x,y;f,x,y;...>" ["站点帧,逗号分隔"]
 //! ```
+//!
+//! 环境变量:
+//! - `PROBE_BACKEND=wgpu`  改走 wgpu(缺省 soft);
+//! - `PROBE_ALL_LAYERS=1`  额外列出可见层(`DIALOG/LOADCONF/SAVE` 关键层);
+//! - `PROBE_SHOT=<path>`   跑完把最后一帧写 PNG(末帧图层集合/像素指纹
+//!   同时打印,便于判断「画面是否来自本帧」)。
+//!
+//! 只读 `Engine` 的公开 API,不改引擎语义。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

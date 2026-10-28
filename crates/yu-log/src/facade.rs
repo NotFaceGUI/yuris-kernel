@@ -186,7 +186,10 @@ impl log::Log for FacadeLogger {
     }
 
     fn flush(&self) {
-        // `JsonlFile` 内部是无缓冲 `File`,write_all 即达盘队列;无额外刷点。
+        // JSONL 写者异步:退出前把队列排空并落盘(否则尾部行会丢)。
+        if let Some(file) = &self.jsonl {
+            file.flush();
+        }
     }
 }
 

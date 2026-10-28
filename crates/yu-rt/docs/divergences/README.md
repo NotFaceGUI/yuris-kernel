@@ -27,6 +27,8 @@
 | DIV-RT-055 | YPF 封包版本上限 `495` 是硬编码闸门 | **fixed(2026-10-25)** | 根因:`MAX_ACCEPTED_VERSION = 495`,高于此值直接 `Unimplemented` 拒启。但 REA 证明索引装载器 `FUN_0045e3b8` **逐字节无版本分支**(起点 `0x20`、步长 `nameLen+0x1B`、长度码表 `T[0xFF-lenEnc]`、名字取反全为常量),`version` 只读入不参与分支;项目自己的 `equivalence.rs` 也早有 「version=300 必须能读」用例。真实商业作品存在 YPF v500(`<game-a>`),旧闸门会直接拒掉。修法:去掉上限,改名为 `VERIFIED_MAX_VERSION` 并注明「仅信息,非门禁」,把关交给后续结构校验(entry_count 上限 / 索引容量 / `detect_layout` 方言探测 / 名字 MurmurHash)。下限 234 保留(早期布局无样本)。复核 `equivalence::engine_layout_with_version_500_is_readable` |
 | DIV-RT-056 | `FILEINFO[SIZE/RELATION]` 未实现 | **fixed(no-manual)(2026-10-25)** | REA `0x44286c`:SIZE 分支 `0x443572` = `FindFirstFileA` → 目录 0 / 文件 `nFileSizeLow`(32 位)/ 找不到 0;RELATION 分支 `0x4429e6→0x442a20` = `FindExecutableA(NULL,FILE,buf)` → 关联 exe 全路径写**字符串** LET。手册 `file/fileinfo.html` 例 3/4 有页。实现:SIZE 走宿主文件系统(`$_SAVE_PATH` 前缀解析,封包内文件与官方一致查不到=0);RELATION 内核恒空串(B7 接 `FindExecutableW` 前的宿主能力位;`FindExecutableA` 失败同样得空串,脚本判空安全)。FOLDER 查询保持挂号(手册注明封包内文件夹不可查;语料 0 次)。复核:全量用例 9/9、fixture 79 | 
 | DIV-RT-057 | Save/File 域事件在帧末才应用(`FILEACT[DELETE]` 晚于同帧 `SAVE[FILE]` 刷盘) | **fixed(2026-10-27)** | 根因:`Vm::emit` 只对 Graphics/Window/Sound 同步 `apply_event`,Save/File 仅入队,由 `Engine::tick` 帧末 `apply_events`;`es_SaveLoad.yst` 的存档流程是「pc315 先删旧槽 → pc341 `SAVE[FILE]` 同步刷盘」,延迟的删除落在刷盘之后,刚写出的存档被删,`SAVEEND` 再清预约 ⇒ 无文件、无报错。修法:统一为命令时刻同步(`Vm::emit` 对 `Domain::Save|File` 也调用 `apply_event`,Engine 帧末不再重复喂),与官方 `FILEACT` 就地执行一致。复核 `fixture::fileact_is_applied_before_save_file_flush_in_same_frame`;桌面复现 `save30002.sd` 25608 字节保留 |
+| DIV-RT-058 | 命令参数的复合赋值算子 `+=` / `-=` 被合并成加法 | **fixed(2026-10-27)** | 根因:窗口 `slot` 的高字节是算子(**1 = `+=`,2 = `-=`**),`eval_arg_windows` 只置 `offset = 高字节!=0`,gfx 一律按「当前值 + 增量」处理。`es_SaveLoad.yst:623 CG[ID=$id A-=8]` 因此变成 `A+=8`:全屏截图幕布 `CGS999` 的 alpha 从 256 一路加到 512(超出 0..256 不 clamp),32 帧淡出后仍是 256 全不透明 ⇒ 读档确认后逻辑帧继续推进、图层已切换,画面却永远停在读档界面(用户报「点击读档直接卡死」)。证据:`dump_pc_cmds 19` 的 `pc368 L623 CG … A~2(len4)=i8`(=`-=`);`dump_pc_cmds 66` 的 `pc5659 L8173 CG … X~1`(=`+=`)。修法:新增 `compose_window_arg`(`comp==2` 先取负,`offset=comp!=0`),单测 `window_ops_tests::plus_and_minus_operators_are_distinct`。复核:`CGS999` alpha 256→112→0;headless 与桌面 wgpu 读档后均回到游戏(宿主 `stuck="推进正常"`) |
+| DIV-RT-059 | `SAVE[ID]` / `LOAD[ID]` 图层缩略图长期 `Unimplemented`(DNO 3 缺失) | **fixed(2026-10-27)** | 块格式(官方 0.495 `save00001.sd` DNO=3,btype 1,ulen=31608):`[u32 1600][u32 30000][A 1600B][B 30000B]`;B = 100×75 RGBA 画面,A 的 w/h 在 `+0x78/+0x7c`(0.479 样本 A=1536、w/h 在 `+0x68/+0x6c`,读取端按 `lenB == w*h*4` 自证)。实现:`yu-save::image_block` 编解码 + `SaveHost::reserve_image/load_image`;`GraphicsHost::capture_layer/restore_layer`;`yu-engine::capture::GfxCapture`(离屏软渲,`observe` 在出现新 COPY 的帧与主渲染器同刻冻结快照;SAVE 时回放当前帧取目标层快照并按图层声明尺寸重采样;LOAD 时 PNG 写入 `SharedMem` 合成资产叠层并 `set_layer_asset`)。沿途修三条渲染语义:① COPY 表面尺寸 = 源/区域尺寸,不看目标层显示尺寸(soft+wgpu;否则 800×600 截图被裁成左上 100×75 全黑);② soft `MERGE/MERGE2` 必须先于区域解析(`X/Y` 是绘制偏移,原来 `MERGE2 X=0 Y=0` 被判 `region.partial` 整条跳过,缩略图合不进存档盘);③ VM `resolve_asset_size` 候选序与渲染器一致。复核:`yu-save` 14 通过(含官方 save00001 DNO3→100×75);fixture 98;存档 DNO3 `ulen=31608 / w=100 / h=75 / 24956 非零字节`;读档界面缩略图为真实游戏画面(headless soft/wgpu 与桌面 wgpu 截图)。限制:抓帧的 `:/W0/` 后缓冲与主渲染器同源;目标层无可序列化表面(空层/离屏组/未取证加工)时返回 `None` 并报 Unimplemented,不猜内容 |
 | DIV-RT-011 | 手册有页但语义未取证的命令(VARINFO SEARCH / VARACT INIT·G_* / F_* / ERROR) | open | 仅剩 VARINFO `STRTYPE/SJISCODE/UTF8CODE`(无手册例)、`VAR`/`CSVINFO`(无页/未取证,AU5 补录)与 `CDDA`(空桩,见 sound-ledger N0-10);SEARCH/INIT·G_*/RETURNCODE/WORD/F_*/PREP 已另证实现 |
 | DIV-RT-012 | `SAVE`/`LOAD` 的盘上存档格式 | fixed | `yu-format::yssd` 官方 5 文件 269 块逐字节 roundtrip;`yu-save` 宿主消费域事件(忠实写盘受 DIV-RT-042 门禁) |
 | DIV-RT-013 | `HANTOZEN`/`ZENTOHAN` 转换表 | fixed | 三张表已自 0.495 exe 取出落 `data/case-tables-0495.tsv`;算法逐条对照 REA |
@@ -1165,3 +1167,73 @@ packed = ([1290322, 329227, 26, 249, 8765, 8765], 0, "cd1790…4bd2e")  ... ok
   (82 lib / 4 consistency / 11 corpus / 4 corpus_golden / 95 fixture /
   3 golden);`cargo check --workspace --all-targets` 通过;桌面复现
   (临时 save 根)菜单存档后 `save30002.sd` 25608 字节保留。
+
+---
+
+## DIV-RT-058 · 复合赋值算子 `+=` / `-=` 被合并成加法(2026-10-27)
+
+- **现象**:读档确认「はい」后,逻辑帧继续推进、`es.Load` 与场景返回都执行了,
+  但画面永远停在读档界面(用户报「点击读档直接卡死」);宿主诊断
+  `画面像素连续 N 帧相同(逻辑帧仍在推进)`。
+- **根因**:命令窗口 `slot` 的高字节是**复合赋值算子**,低字节才是求值 subtype:
+  **1 = `+=`,2 = `-=`**。`eval_arg_windows` 只看「非零即增量」,gfx 一律
+  `当前值 + 增量`。于是 `es_SaveLoad.yst:623 CG[ID=$id A-=8]` 变成
+  `A += 8`:全屏截图幕布 `CGS999`(`es.CGTSS.2`)的 alpha 从 256 一路加到
+  512(`Alpha` 字段原值存储、不 clamp),32 帧淡出后仍是 256 ⇒ 幕布永久不透明,
+  盖住已经恢复的游戏画面。
+- **证据**(0.495 官方编译产物,`yu-rt/examples/dump_pc_cmds`):
+  - `dump_pc_cmds 19 0 4000` → `pc368 L623 CG ID=v($#2176) | A~2(len4)=i8`
+    (`~2` = slot 高字节 2,源写法 `A-=8`);
+  - `dump_pc_cmds 66 0 20000` → `pc5659 L8173 CG … X~1 …`(`~1` = `+=`)。
+  - 语料 `-=` 出现在 `es_SaveLoad.yst:623`、`es_Scenario.yst:244/1319`、
+    `ES_ReplayMode.yst:111/389` 等淡出/收场路径(共 9 处 `A-=`)。
+- **修法**:抽出 `compose_window_arg(comp, value)`:`comp == 2` 先把值取负
+  (`Int` 用 `wrapping_neg`,`Float` 取负),`offset = comp != 0`;宿主仍按
+  「加到当前值」消费。单测 `window_ops_tests::plus_and_minus_operators_are_distinct`。
+- **复核**:`CGS999` alpha 256 → 112 → 0 并保持 0;headless(soft)与桌面
+  (wgpu)同一输入序列读档完成后画面回到游戏(截图对白「近づけてみました。」),
+  宿主退出摘要 `stuck="推进正常"`。
+
+---
+
+## DIV-RT-059 · SAVE[ID] / LOAD[ID] 图层缩略图(2026-10-27)
+
+- **背景**:H-P4-02 长期挂账(`SAVE[ID]`/`LOAD[ID]` = `Unimplemented`),
+  存档缺 DNO 3、读档界面缩略图全空;官方读取端 (`0x4477c0`) 校验块首
+  u32 = `0x640`,块类型 1。
+- **块格式**(官方 0.495 `save00001.sd` DNO=3,btype 1,`ulen=31608`):
+  `[u32 1600][u32 w*h*4][A 1600B][B RGBA]`。
+  - `B` = 100×75 RGBA(保存瞬间画面);
+  - `A` = 表面描述,0.495 的 w/h 在 `+0x78/+0x7c`;0.479 样本
+    (`save30001.sd`)为 `[1536][4][A 1536][B 4]`,w/h 在 `+0x68/+0x6c`。
+    读取端两处都试,以 `lenB == w*h*4` 自证;写入端跟随 0.495。
+- **实现**:
+  - `yu-save::image_block`(编码/解码)+ `SaveHost::reserve_image/load_image`;
+  - `GraphicsHost::capture_layer/restore_layer`(yu-rt 契约);
+  - `yu-engine::capture::GfxCapture`:离屏软后端。
+    `observe(frame, 上一帧屏幕)` 只在出现**新 CopyId** 的帧整帧回放一次,
+    让快照与主渲染器**同刻冻结**(`es_SaveLoad` 的截图层保留按下存档菜单
+    那一帧的画面);`capture` 在 `SAVE[ID]` 命令时刻回放当前帧,取目标层
+    快照,并按图层声明尺寸(复制链上游的 `CGACT[SIZE]`)双线性重采样;
+    `restore` 把图像编码 PNG 写入 `SharedMem` 合成资产叠层(内容哈希命名,
+    所有 `TextureStore`/VM 资产解析共享),再 `set_layer_asset` + 注入尺寸。
+- **沿途修正的三条渲染语义**(缩略图黑屏/被裁的根因):
+  1. **COPY 目标表面尺寸 = 源/区域尺寸**,不看目标层当时的显示尺寸
+     (soft `apply_copy_op` 与 wgpu `copy_output_dims` 同步改)。原实现把
+     800×600 的窗口截图裁成左上 100×75(整张黑)。
+  2. **soft 的 `MERGE/MERGE2` 必须先于区域解析**:`X/Y` 是绘制偏移,
+     不是源区域;原作把 `MERGE2 X=0 Y=0` 判成 `gfx.imageop.region.partial`
+     整条跳过,缩略图合不进存档盘。
+  3. VM `resolve_asset_size` 的候选序与渲染器 `TextureStore::candidates`
+     一致(已带扩展名先按原样查),避免「画得出、量不到尺寸」导致按钮
+     命中矩形退化。
+- **复核**:
+  - `cargo test -p yu-save`:14 通过(含官方 `save00001.sd` DNO3 → 100×75);
+  - `cargo test -p yu-rt --test fixture`:98 通过(含 `SAVE[ID]` → 图像预约、
+    `LOAD[ID]` → 图层装回);
+  - 存档 DNO3:`btype=1 / ulen=31608 / w=100 / h=75 / 24956 个非零字节`;
+  - 读档界面截图:缩略图为真实游戏画面(headless soft、headless wgpu 与
+    桌面 wgpu 三条路径一致)。
+- **限制**:抓帧的 `:/W0/` 后缓冲与主渲染器同源(流式 wgpu 为上一帧读回);
+  目标层没有可序列化表面(空层/离屏组/未取证的图像加工链)时 `capture_layer`
+  返回 `None`,VM 按 `Unimplemented` 挂号,**不猜内容**。

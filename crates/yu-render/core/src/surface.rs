@@ -53,29 +53,58 @@ impl Surface {
 }
 
 pub fn blit(src: &Surface, dst: &mut Surface, x0: i64, y0: i64, x1: i64, y1: i64) {
-    if x1 < x0 || y1 < y0 || src.width == 0 || src.height == 0 {
+    blit_rgba(src.width, src.height, &src.rgba, dst, x0, y0, x1, y1);
+}
+
+/// 与 [`blit`] 同一语义,但源直接给 `(width, height, rgba)` 切片。
+///
+/// 快照镜像捕获用它:**不再为每次 COPY 整帧 clone 一份源**(旧实现
+/// `Surface { rgba: source.rgba.clone() }` 在 1100×825/2048² 源上每帧
+/// 要复制几十 MB,`snap_ms` 实测 33ms)。行内是 `copy_from_slice`
+/// (memcpy),不再逐像素 `pixel()/set_pixel()`。
+pub fn blit_rgba(
+    src_width: u32,
+    src_height: u32,
+    src_rgba: &[u8],
+    dst: &mut Surface,
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+) {
+    if x1 < x0 || y1 < y0 || src_width == 0 || src_height == 0 {
         return;
     }
     let x0 = x0.max(0);
     let y0 = y0.max(0);
-    let x1 = x1.min(i64::from(src.width) - 1);
-    let y1 = y1.min(i64::from(src.height) - 1);
+    let x1 = x1.min(i64::from(src_width) - 1);
+    let y1 = y1.min(i64::from(src_height) - 1);
     if x1 < x0 || y1 < y0 {
         return;
     }
-    let run = (x1 - x0 + 1) as u32;
-    let run = run.min(dst.width);
+    let run = ((x1 - x0 + 1) as u32).min(dst.width) as usize;
+    if run == 0 {
+        return;
+    }
+    let src_stride = src_width as usize * 4;
+    let dst_stride = dst.width as usize * 4;
     for y in y0..=y1 {
         let dy = (y - y0) as u32;
         if dy >= dst.height {
             break;
         }
-        for i in 0..run {
-            let dx = i;
-            let Some(px) = src.pixel((x0 as u32) + i, y as u32) else {
-                break;
-            };
-            dst.set_pixel(dx, dy, px);
+        let src_start = y as usize * src_stride + x0 as usize * 4;
+        let dst_start = dy as usize * dst_stride;
+        // 源切片可能短于名义尺寸(畸形输入):按实际长度截断,与逐像素
+        // `pixel()` 的越界即停保持一致。
+        let available = src_rgba.len().saturating_sub(src_start);
+        let bytes = (run * 4).min(available);
+        if bytes == 0 {
+            break;
         }
+        let Some(dst_row) = dst.rgba.get_mut(dst_start..dst_start + bytes) else {
+            break;
+        };
+        dst_row.copy_from_slice(&src_rgba[src_start..src_start + bytes]);
     }
 }

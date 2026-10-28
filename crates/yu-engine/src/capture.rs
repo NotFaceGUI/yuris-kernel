@@ -13,7 +13,7 @@
 //!   尺寸。渲染器走常规资产管线,无需任何后端改动。
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +22,9 @@ use yu_gfx::{CompositorFrame, CopyId, CopySource, GfxState, Layer, LayerCapture,
 use yu_log::Diag;
 use yu_rt::event::CapturedImage;
 use yu_vfs::SharedMem;
+
+/// 镜像表条目上限(超过后按当前帧存活集合剪一次;见 `GfxCapture::observe`)。
+const MIRROR_PRUNE_THRESHOLD: usize = 4096;
 
 /// 抓帧渲染器 + 运行时合成资产叠层。
 pub struct GfxCapture {
@@ -34,6 +37,18 @@ pub struct GfxCapture {
     /// 已经在离屏渲染器里冻结过的快照(`observe` 去重;未出现新 COPY 的
     /// 帧不重复整帧回放,避免给每帧加一份软渲染成本)。
     seen: BTreeSet<CopyId>,
+    /// 从**主渲染器**接过来的快照 CPU 镜像(`CopyId → 像素`)。
+    ///
+    /// 主渲染器在 1.4/1.6 段已经为每个可从 CPU 源解析的 COPY 建了同构镜像
+    /// (`capture_copy_mirror`:目标尺寸 + 区域裁剪,与 soft `apply_copy_op`
+    /// 同构造)。旧实现不用它们,只要出现新 CopyId 就让离屏软后端**整帧
+    /// 回放**,在「每帧都换 CopyId」的场景里等于每帧多做一次全量软渲染
+    /// (实测 100–375ms/帧)。现在先查镜像,只有镜像缺失(组源/后缓冲源)
+    /// 才回放。
+    mirrors: BTreeMap<CopyId, Rc<Texture>>,
+    /// 是否允许「整帧软后端回放」兜底。GPU 后端 = false(改用按需读回);
+    /// soft 后端 = true。
+    allow_replay: bool,
 }
 
 impl GfxCapture {
@@ -41,21 +56,31 @@ impl GfxCapture {
         store: TextureStore,
         last_screen: Arc<Mutex<Option<Arc<Surface>>>>,
         overlay: SharedMem,
+        allow_replay: bool,
     ) -> Self {
         Self {
             soft: SoftRenderer::new(store),
             last_screen,
             overlay,
             seen: BTreeSet::new(),
+            mirrors: BTreeMap::new(),
+            allow_replay,
         }
     }
 
-    /// 在 `frame` 之前调用(参数 = 该帧即将渲染的合成帧 + **上一帧**呈现面)。
+    /// 在 `frame` 渲染后调用(参数 = 该帧合成帧 + **上一帧**呈现面 +
+    /// 主渲染器的快照镜像查询)。
     ///
-    /// 只在该帧出现**新 CopyId** 时整帧回放:离屏渲染器的快照表因此与主
-    /// 渲染器同刻冻结 —— `es_SaveLoad` 的截图层(`COPY2 :/W0/ → SLTEMP`)
-    /// 保留的是按下存档菜单那一帧的画面,而不是保存确认时(存档界面)的画面。
-    pub fn observe(&mut self, frame: &CompositorFrame, previous_screen: Option<Arc<Surface>>) {
+    /// 语义与旧实现相同:快照在**创建它的那一帧**冻结 —— `es_SaveLoad` 的
+    /// 截图层(`COPY2 :/W0/ → SLTEMP`)保留的是按下存档菜单那一帧的画面。
+    /// 差别只在实现:能从主渲染器拿到 CPU 镜像时**零回放**;只有镜像缺失
+    /// (组源/后缓冲源)才让离屏软后端整帧回放一次。
+    pub fn observe(
+        &mut self,
+        frame: &CompositorFrame,
+        previous_screen: Option<Arc<Surface>>,
+        mirror: &dyn Fn(CopyId) -> Option<Rc<Texture>>,
+    ) -> Vec<CopyId> {
         let fresh: Vec<CopyId> = frame
             .passes
             .iter()
@@ -68,9 +93,28 @@ impl GfxCapture {
             })
             .collect();
         if fresh.is_empty() {
-            return;
+            // 镜像条目持有 `Rc<Texture>`(可能几 MB/张)。新 CopyId 稀少的
+            // 游戏里 `live` 剪枝可能很久不触发,给一个尺寸上限兜底:
+            // 超过上限时按当前帧存活集合剪一次(`live` 只扫 ops,罕见路径)。
+            if self.mirrors.len() > MIRROR_PRUNE_THRESHOLD {
+                let live: BTreeSet<CopyId> = frame
+                    .passes
+                    .iter()
+                    .flat_map(|pass| pass.ops.iter())
+                    .filter_map(|op| match op {
+                        Op::Copy(copy) => Some(copy.id),
+                        _ => None,
+                    })
+                    .chain(frame.layers.iter().filter_map(|layer| match &layer.texture {
+                        TextureRef::Snapshot(id) => Some(*id),
+                        _ => None,
+                    }))
+                    .collect();
+                self.mirrors.retain(|id, _| live.contains(id));
+            }
+            return Vec::new();
         }
-        self.seen.extend(fresh);
+        self.seen.extend(fresh.iter().copied());
         // 快照只随帧内引用存活:同步一次存活集合,避免无界增长。
         let live: BTreeSet<CopyId> = frame
             .passes
@@ -86,8 +130,30 @@ impl GfxCapture {
             }))
             .collect();
         self.seen.retain(|id| live.contains(id));
-        self.soft.set_last_screen(previous_screen);
-        self.soft.render_frame(frame);
+        self.mirrors.retain(|id, _| live.contains(id));
+        let mut missing = Vec::new();
+        for id in fresh {
+            match mirror(id) {
+                Some(texture) => {
+                    self.mirrors.insert(id, texture);
+                }
+                None => missing.push(id),
+            }
+        }
+        // GPU 后端:缺失镜像由宿主按需**读回该快照**(1–8ms/张),不再整帧
+        // 软后端重放(差分切换时实测 300–360ms/帧)。软后端没有 GPU 可读,
+        // 仍回放一次(仅 soft 路径)。
+        if !missing.is_empty() && self.allow_replay {
+            self.soft.set_last_screen(previous_screen);
+            self.soft.render_frame(frame);
+        }
+        missing
+    }
+
+    /// 写入一张从 GPU 读回的快照镜像(宿主在 `observe` 之后调用)。
+    pub fn insert_mirror(&mut self, id: CopyId, width: u32, height: u32, rgba: Vec<u8>) {
+        self.mirrors
+            .insert(id, Rc::new(Texture { width, height, rgba }));
     }
 }
 
@@ -116,10 +182,30 @@ impl LayerCapture for GfxCapture {
         // `CGACT[SIZE2]` 定成 100×75 → `SLTEMP2` 只是 `COPY2` 的落点)。
         let size = intended_size(state, layer);
         let frame = state.frame();
-        self.soft.set_last_screen(lock_screen(&self.last_screen).clone());
-        self.soft.render_frame(&frame);
         let surface = match &texture {
-            TextureRef::Snapshot(copy_id) => self.soft.snapshot_surface(*copy_id).cloned(),
+            // 主渲染器转交的镜像优先:命中时**不做软后端整帧回放**。
+            TextureRef::Snapshot(copy_id) => match self.mirrors.get(copy_id) {
+                Some(mirror) => Some(Surface {
+                    width: mirror.width,
+                    height: mirror.height,
+                    rgba: mirror.rgba.clone(),
+                }),
+                None if self.allow_replay => {
+                    self.soft.set_last_screen(lock_screen(&self.last_screen).clone());
+                    self.soft.render_frame(&frame);
+                    self.soft.snapshot_surface(*copy_id).cloned()
+                }
+                // GPU 后端:镜像由宿主在帧末按需读回;仍未命中就显式报缺
+                // (交给 VM 记 `gfx.capture.mirror_missing`,不静默回放整帧)。
+                None => {
+                    log::warn!(
+                        target: "yu-engine",
+                        "[caption] snapshot {} has no CPU mirror (GPU path; save image unavailable)",
+                        copy_id.0
+                    );
+                    None
+                }
+            },
             TextureRef::Asset(key) => self
                 .soft
                 .textures_mut()

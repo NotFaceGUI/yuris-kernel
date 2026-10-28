@@ -56,6 +56,9 @@ pub struct ServeOptions {
     pub force_font: Option<String>,
     /// JSONL 日志路径(Q1 R4;`None` = 不落盘,关闭时只打 stderr 汇总)。
     pub log_file: Option<PathBuf>,
+    /// 调试用:实时 tick 的单步上限(毫秒)。`None` = 不截断(默认,
+    /// 与官方墙钟语义一致);仅用于复现“长帧截断”症状。
+    pub max_step_ms: Option<u32>,
 }
 
 impl ServeOptions {
@@ -107,6 +110,10 @@ impl ServeOptions {
             };
         let force_font = args.flag("font").filter(|value| !value.trim().is_empty());
         let log_file = args.flag("log-file").map(PathBuf::from);
+        let max_step_ms = match args.flag("max-step-ms") {
+            Some(value) => Some(parse_u32("max-step-ms", &value)?.max(1)),
+            None => None,
+        };
         args.finish()?;
         Ok(Self {
             root: PathBuf::from(root),
@@ -124,6 +131,7 @@ impl ServeOptions {
             debug_mode,
             force_font,
             log_file,
+            max_step_ms,
         })
     }
 }
@@ -168,10 +176,13 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         ..EngineOptions::default()
     };
     let mut engine = Engine::new(project, engine_opts)?;
-    // H-P1-05:实时路径只补 2 帧。默认 500ms 会在一次长帧(首场景装载、
-    // 交互触发的重脚本)后一次性执行整段补帧,表现为“点一下就卡住”。
-    // 桌面宿主同口径(set_max_step_ms(2 × frame_ms))。
-    engine.set_max_step_ms((1000 / opts.fps.max(1)).max(1).saturating_mul(2));
+    // 实时路径**不设**单步上限:脚本淡出/补间按 `@_OS_TIME(1)` 的墙钟差推进,
+    // 截断(旧 H-P1-05 的 2 帧/500ms)会把超出时间永久丢弃,让动画落后于真实
+    // 时间。长帧的代价改为“时钟照走、帧数变少”,与官方墙钟语义一致。
+    // 需要复现旧症状时才用 `--max-step-ms` 显式打开(默认关)。
+    if let Some(ms) = opts.max_step_ms {
+        engine.set_max_step_ms(ms);
+    }
     let viewport = engine.viewport();
     let boot_ms = engine.boot_ms();
 
@@ -1222,6 +1233,8 @@ mod tests {
             render_ms: 2.0,
             ms: 3.0,
             drawable: true,
+            clock_ms: 16,
+            lag_ms: 0,
         };
         let bytes = encode_frame(&report, 1, true, false, &surface);
         assert_eq!(&bytes[0..4], b"YUF1");

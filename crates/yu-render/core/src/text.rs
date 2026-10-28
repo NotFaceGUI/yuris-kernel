@@ -145,36 +145,50 @@ const COMPOSE_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// 条目数硬上限(元数据防无界;每条还有 `bytes` 记账)。
 const COMPOSE_CACHE_MAX_ENTRIES: usize = 8192;
 
-/// 「宽 + 高 + RGBA 字节」的 FNV-1a 内容指纹。
+/// 「宽 + 高 + RGBA 字节」的 64 位内容指纹。
 ///
 /// wgpu 后端的 `hash_rgba` 委托到这里:单一实现,保证烘焙期算出的指纹与
 /// `Override` 跨帧比对、GPU 上传缓存键的口径完全一致。
+///
+/// **按 8 字节一个字混合**(不是逐字节 FNV):逐字节 FNV 的乘法是串行依赖
+/// (≈3 cycles/byte),1100×825 一帧光指纹就要十几毫秒 —— 实测 `MERGE`
+/// 链里单条 2.7ms 的画像一半以上是它。这里用「xor 字 + 乘 + 右移」把成本
+/// 压到内存带宽级;契约仍是「确定性 + 内容敏感」(仅作运行时缓存键,
+/// 不做持久化,也不与外部的 SHA 指纹互换)。
 #[must_use]
 pub fn content_hash_rgba(width: u32, height: u32, rgba: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in width.to_le_bytes() {
-        h ^= u64::from(byte);
-        h = h.wrapping_mul(0x0100_0000_01b3);
+    const PRIME: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = 0xcbf2_9ce4_8422_2325_u64
+        ^ (u64::from(width) << 32)
+        ^ u64::from(height);
+    let mut chunks = rgba.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) 长度为 8"));
+        h = (h ^ word).wrapping_mul(PRIME);
+        h ^= h >> 32;
     }
-    for byte in height.to_le_bytes() {
-        h ^= u64::from(byte);
-        h = h.wrapping_mul(0x0100_0000_01b3);
+    let rest = chunks.remainder();
+    if !rest.is_empty() {
+        let mut tail = [0u8; 8];
+        tail[..rest.len()].copy_from_slice(rest);
+        h = (h ^ u64::from_le_bytes(tail)).wrapping_mul(PRIME);
+        h ^= h >> 32;
     }
-    for &byte in rgba {
-        h ^= u64::from(byte);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
+    // 终结混合(splitmix64):把差异扩散到全部 64 位。
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 33;
     h
 }
 
-/// 纹理内容哈希(FNV-1a;仅用于帧内图像加工覆盖纹理的缓存键)。
+/// 纹理内容哈希(仅用于帧内图像加工覆盖纹理的缓存键)。
+///
+/// 与 [`content_hash_rgba`] 同一算法;尺寸也进指纹(两图同像素不同尺寸
+/// 不得相等)。
 pub fn texture_content_hash(texture: &Texture) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325_u64;
-    for &b in &texture.rgba {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
+    content_hash_rgba(texture.width, texture.height, &texture.rgba)
 }
 
 /// 文本合成基面的身份哈希(资产 key / 1×1 黑 / 快照 id / 无纹理尺寸 +

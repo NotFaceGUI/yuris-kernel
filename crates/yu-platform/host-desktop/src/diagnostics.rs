@@ -520,6 +520,8 @@ mod tests {
             render_ms: 0.0,
             ms: 0.0,
             drawable: true,
+            clock_ms: 0,
+            lag_ms: 0,
         };
         let snap = ledger.snapshot(&report, false, None);
         assert_eq!(snap.diag_rows.len(), 2);
@@ -555,6 +557,8 @@ mod tests {
             render_ms: 0.0,
             ms: 0.0,
             drawable: false,
+            clock_ms: 0,
+            lag_ms: 0,
         };
         let snap = ledger.snapshot(&report, false, None);
         let hint = snap.stuck.hint();

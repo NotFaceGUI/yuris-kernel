@@ -25,9 +25,9 @@ pub mod text;
 pub mod texture;
 
 pub use cache::{ImageCacheKey, ImageOpSig, ImageSource, SizeKey, SizeSource};
-pub use report::{RenderReport, SkippedOp};
+pub use report::{RenderPhases, RenderReport, SkippedOp};
 pub use scale::scale_region;
-pub use surface::{blit, Surface};
+pub use surface::{blit, blit_rgba, Surface};
 pub use text::{
     content_hash_rgba, text_base_key, texture_content_hash, ComposedLayer, TextComposer,
     TextPaintStats,

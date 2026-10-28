@@ -15,6 +15,80 @@ pub struct SkippedOp {
     pub count: u32,
 }
 
+/// 一帧渲染的阶段耗时(微秒)。
+///
+/// **与 [`RenderReport`] 分开**是硬约束:`RenderReport` 参与 soft/wgpu 的
+/// 逐计数对账(要求 `Eq` 且两后端逐帧可比较),把运行时耗时混进去会让同
+/// 一帧的两个后端永远不相等。这里只做性能取证:后端能测的项填值,测不到
+/// 的项保持 0(soft 只填 `total_us`/`plan_us` 之类的大项)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderPhases {
+    /// 规划总时长(含下列 `snap`/`image`/`text`/`copy_text`/`rest`)。
+    pub plan_us: u64,
+    /// 快照尺寸定稿 + CPU 镜像预捕获。
+    pub snap_us: u64,
+    /// 图像加工(`SIZE`/`MERGE`/`RECTPAINT` …)。
+    pub image_us: u64,
+    /// 文本合成(烘焙/增量)。
+    pub text_us: u64,
+    /// COPY 上的冻结文本。
+    pub copy_text_us: u64,
+    /// 规划其余部分(遍历 passes/层、顶点生成)。
+    pub rest_us: u64,
+    /// 顶点上传 + 命令编码。
+    pub encode_us: u64,
+    /// 屏幕读回(流式模式为提交,不阻塞)。
+    pub readback_us: u64,
+    /// 读回之后的收尾(缩放 pass / 状态更新)。
+    pub tail_us: u64,
+    /// 文本子阶段:`TextComposer` 的整面重烘焙。
+    pub text_bake_us: u64,
+    /// 文本子阶段:内容哈希。
+    pub text_hash_us: u64,
+    /// 文本子阶段:字形绘制。
+    pub text_paint_us: u64,
+    /// 文本子阶段:基面解析。
+    pub text_base_us: u64,
+    /// 图像子阶段:`RECTPAINT` 族 CPU 填充。
+    pub image_paint_us: u64,
+    /// 图像子阶段:`REVERSE` 等逐像素变换。
+    pub image_pixel_us: u64,
+    /// 图像子阶段:`MERGE`/`TRANSITION` 整面 CPU 合成。
+    pub image_composite_us: u64,
+    /// 本帧新上传纹理数。
+    pub uploads: u64,
+    /// 本帧上传字节(解码后的 RGBA8)。
+    pub upload_bytes: u64,
+    /// 本帧 draw call 数。
+    pub draw_calls: u64,
+    /// 本帧读回字节数。
+    pub readback_bytes: u64,
+    /// 本帧 GPU 纹理拷贝的**读写总字节**(copy_texture_to_texture,
+    /// 含 COPY 快照与 merge blit;按 `extent` 计算,读+写各算一次)。
+    pub copy_bytes: u64,
+    /// 本帧 GPU 纹理拷贝次数。
+    pub copy_count: u64,
+    /// 本帧新建的快照 GPU 纹理数(按 CopyId 首次出现计)。
+    pub snapshot_alloc: u64,
+    /// 本帧资产解码耗时(微秒)与像素字节(VFS 读 + 图像解码)。
+    pub decode_us: u64,
+    pub decode_bytes: u64,
+    /// 图像加工 op 计数(按动作族;长帧取证:`MERGE`/`MERGE2` 是 CPU 合成)。
+    pub image_merge_ops: u64,
+    pub image_merge2_ops: u64,
+    pub image_transition_ops: u64,
+    pub image_bitwise_ops: u64,
+    pub image_paint_ops: u64,
+    pub image_pixel_ops: u64,
+    pub image_sampled_ops: u64,
+    /// 合成链记账:参与判定的层链数 / 记忆化命中数。
+    ///
+    /// `chains=5 hits=0` + `image_composite` 高 = 每帧都在重算同一批像素,
+    /// 是「该命中却未命中」的直接证据。
+    pub memo_chains: u64,
+    pub memo_hits: u64,
+}
+
 /// 一帧的渲染摘要。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderReport {

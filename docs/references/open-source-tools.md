@@ -72,20 +72,18 @@
 4. **冲突裁决**:工具行为与官方包/官方引擎冲突时,以官方为准,并在 `docs/divergences/` 留勘误。
 5. 新增参考项目时,补一行"能力 + 可参考点 + 许可证状态",并写清是否亲自验证过。
 
-## 4. 致谢链(README 用)
+## 4. README 致谢(只列实际采用)
 
-开源生态的相互致谢可直接沿用,建议 README 致谢至少包含:
+README 只列**实际采用/实际参考**的项目；参考但未采用的不进入 README 致谢，
+保留在本文件 §1。当前实际采用：
 
-- **YURIS_TOOLS**(jyxjyx1234): 新版 YU-RIS 引擎解密算法
-- **RxYuris**(ZQF-ReVN): 旧版引擎解密算法、YSCOM Loader、YSCM/YSTB 解析
-- **GARbro**(morkt): YPF 封包解密算法
-- **YU-RIS-Script-Editor**(Aionfatedio): YSTB V2/V5 解析、密钥/编码自检测实践
-- **yuri**(shimamura-sakura): 反编译/命令语义参照
-- 其余: YuRISTools、YPF_Tool、YPF-Manager、ypf-repacker、YurisKeyFinder(按实际采用情况列)
+- **旧接手线**(`<repo-old>`): 启动链、任务/驱动形态、格式事实与 golden 回归参照
+- **RxYuris**(ZQF-ReVN): YSTB/YSCM/YSTL 解析流程、YSCOM Loader
+- **YU-RIS-Script-Editor**(Aionfatedio): YSTB V5 段序、V2 版本带判定、编码自检测
+  （未声明许可，仅事实参考，未复制代码）
 
-> 这 3 个核心库(YURIS_TOOLS / RxYuris / GARbro)本身相互致谢:
-> Script-Editor 的 README 明确鸣谢这三者,并分别对应"新版解密/旧版解密/YPF 解密"。
-> 我们的致谢按同样的"代际+职责"结构写,便于溯源。
+未采用(保留在 §1，不进入 README): YURIS_TOOLS、GARbro、yuri、YuRISTools、
+YPF_Tool、YPF-Manager、ypf-repacker、YurisKeyFinder 等。
 
 ## 5. 实际采用登记(yu-rt,成果 C2)
 

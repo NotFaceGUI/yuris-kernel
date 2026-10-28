@@ -179,6 +179,12 @@ struct FrameRow {
     tick_ms: f64,
     render_ms: f64,
     draw_ms: f64,
+    /// 渲染子阶段(`None` = soft 后端不提供)。
+    phases: Option<yu_render_core::RenderPhases>,
+    /// 本帧脚本可见的逻辑时钟毫秒(`@_OS_TIME(1)` 口径)。
+    clock_ms: u32,
+    /// 本帧被显式 `--max-step-ms` 丢弃的墙钟毫秒(默认 0)。
+    lag_ms: u32,
 }
 
 /// 宿主参数(由 `yu-desktop` CLI 填充)。
@@ -208,9 +214,20 @@ pub struct HostOptions {
     pub frame_stats: Option<PathBuf>,
     /// 在这些宿主帧打印 VM 逐命令耗时 top-10(`take_command_profile`)。
     pub profile_frames: BTreeSet<u64>,
+    /// 长帧取证日志:工作耗时 ≥ [`HostOptions::spike_ms`] 的帧写一行
+    /// (阶段耗时 + 本帧命令构成 + 渲染报告计数;逐帧命令增量本身零分配)。
+    pub spike_log: Option<PathBuf>,
+    /// 长帧阈值(毫秒,`work_ms` 口径;默认 20ms ≈ 60fps 下丢一帧)。
+    pub spike_ms: f64,
+    /// 逐命令耗时采样(诊断):每帧清零;tick 超过 `spike_ms` 时打印 top-8。
+    /// 常开会给每条命令加两次 `Instant`(~50ns/条),只用于定位。
+    pub profile_commands: bool,
     /// 每任务每次泵的命令上限(脚本突发兜底;`None` = 官方同构无限泵)。
     /// 开启会让长脚本跨帧续跑(DIV-HOST-002),默认关闭。
     pub pump_cap: Option<usize>,
+    /// 调试用:实时逻辑时钟的单步上限(毫秒)。`None` = 不截断(默认,
+    /// 与官方墙钟语义一致;超出时间不会被丢弃)。仅用于复现旧症状。
+    pub max_step_ms: Option<u32>,
     /// 统一控制台(Q1 R2):宿主 observe 的诊断同步出控制台行(与 egui
     /// 面板同源、两路消费);`None` = 保持旧只进面板行为(测试/嵌入)。
     pub console: Option<yu_log::console::ConsoleHandle>,
@@ -232,7 +249,11 @@ impl Default for HostOptions {
             panic_selftest: None,
             frame_stats: None,
             profile_frames: BTreeSet::new(),
+            spike_log: None,
+            spike_ms: 20.0,
+            profile_commands: false,
             pump_cap: None,
+            max_step_ms: None,
             console: None,
         }
     }
@@ -710,6 +731,12 @@ struct App {
     input_latencies: Vec<(f64, u64, &'static str)>,
     /// 需要打印 VM 命令耗时的宿主帧(`--profile-frames`)。
     profile_frames: BTreeSet<u64>,
+    /// 长帧取证写者(`--spike-log`;逐帧取命令增量,只有 ≥ 阈值的帧落盘)。
+    spike_writer: Option<std::io::BufWriter<std::fs::File>>,
+    /// 已落盘的长帧条数(退出摘要)。
+    spike_rows: u64,
+    /// 逐命令耗时采样(诊断;`--profile-commands`)。
+    profile_commands: bool,
     /// INPUT 型 DIALOG 的编辑缓冲(对话框存续期跨帧;回答后移除)。
     dialog_inputs: std::collections::BTreeMap<u64, String>,
     /// 已打过「呈现」日志的 DIALOG id(每个 id 只记一次)。
@@ -722,17 +749,25 @@ impl App {
     fn new(mut engine: Engine, mut opts: HostOptions) -> Result<Self, String> {
         let egui_ctx = egui::Context::default();
         install_debug_fonts(&egui_ctx);
-        // 逻辑时钟上限**不在这里覆写**:引擎默认(`DEFAULT_MAX_STEP_MS`,
-        // 500ms)就是官方口径。
+        // 逻辑时钟**不在这里设上限**:引擎默认已不截断(墙钟即逻辑时钟,
+        // 与官方 `@_OS_TIME(1)` 语义一致)。桌面也不再把上限压到帧预算。
         //
         // 历史:这里曾把它压到两帧(`frame_ms*2` = 32ms),原意是「长帧后
-        // 不要一次性跑完 500ms 的脚本批次」。但脚本补间按真墙钟推进
+        // 不要一次性跑完一整段脚本批次」。但脚本补间按真墙钟推进
         // (`es_Sprite.yst`: `@mTADD = @OS_TIME - @S.TOLD` →
         // `@S.TNOW += @mTADD`,`@OS_TIME = @_OS_TIME(1)`),把上限压低等于
         // **把超出的时间直接丢弃、不顺延**:实测 3258 帧里 1260 帧(38.7%)
         // 被截断,累计丢 6.58 秒 ⇒ 所有位移/缩放动画系统性慢于真实时间,
         // 长卡顿(最长 366ms)后进度条几乎不动、下一个正常帧再猛追,观感
-        // 就是「卡住然后突然跳过去」。官方引擎不做这种截断。
+        // 就是「卡住然后突然跳过去」。官方引擎不做这种截断,现在内核也
+        // 默认不截断;需要复现旧症状时才显式 `set_max_step_ms` 打开。
+        if let Some(ms) = opts.max_step_ms {
+            engine.set_max_step_ms(ms);
+            host_error!(
+                "yu-desktop: clock step cap {ms}ms — DEBUG ONLY \
+                 (drops wall-clock time; animations run slower than real time)"
+            );
+        }
         if let Some(cap) = opts.pump_cap {
             engine.set_pump_cap(Some(cap.max(1)));
             host_error!(
@@ -749,9 +784,31 @@ impl App {
         };
         let script_frames = script.as_ref().and_then(|runner| runner.frames);
         let profile_frames = opts.profile_frames.clone();
-        if !profile_frames.is_empty() {
+        let opts_profile_commands = opts.profile_commands;
+        if !profile_frames.is_empty() || opts_profile_commands {
             engine.set_command_profile(true);
         }
+        // 长帧取证:显式路径打不开 = 硬失败(用户点名的现场,不许静默)。
+        let spike_writer = match opts.spike_log.clone() {
+            Some(path) => {
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent).map_err(|error| {
+                            format!("创建长帧日志目录 {:?} 失败: {error}", parent)
+                        })?;
+                    }
+                }
+                let file = std::fs::File::create(&path)
+                    .map_err(|error| format!("创建长帧日志 {:?} 失败: {error}", path))?;
+                host_line!(
+                    "yu-desktop: spike log → {} (threshold {:.1}ms work)",
+                    path.display(),
+                    opts.spike_ms
+                );
+                Some(std::io::BufWriter::new(file))
+            }
+            None => None,
+        };
         if let Some(runner) = &script {
             host_line!(
                 "yu-desktop: script `{}` loaded ({} actions, frames={:?})",
@@ -797,6 +854,9 @@ impl App {
             pending_inputs: Vec::new(),
             input_latencies: Vec::new(),
             profile_frames,
+            spike_writer,
+            spike_rows: 0,
+            profile_commands: opts_profile_commands,
             dialog_inputs: Default::default(),
             presented_dialogs: Default::default(),
             render_samples: std::collections::VecDeque::with_capacity(ui::RENDER_GRAPH_SAMPLES),
@@ -1495,6 +1555,205 @@ impl App {
         }
     }
 
+    /// 长帧自动取证(`--spike-log`)。
+    ///
+    /// 每帧都取一次「本帧各命令执行次数」(线性扫一遍数百项,零字符串
+    /// 分配),只有 `work_ms ≥ spike_ms` 的帧才解析命令名并落盘 —— 因此
+    /// `cmds=` 严格是**这一帧**的构成,而不是「自上次长帧以来」的累计。
+    /// 行内同时带引擎 `FrameReport`(层/pass/op/跳过)与后端
+    /// `RenderReport`(文本/缺资产/离屏 pass),回答「这一帧在干什么」。
+    fn observe_spike(
+        &mut self,
+        interval_ms: f64,
+        work_ms: f64,
+        tick_ms: f64,
+        render_ms: f64,
+        draw_ms: f64,
+    ) {
+        if self.spike_writer.is_none() {
+            return;
+        }
+        let mut deltas = self.engine.take_command_hit_deltas();
+        if work_ms < self.opts.spike_ms {
+            return;
+        }
+        deltas.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let total_ops: u64 = deltas.iter().map(|(_, hits)| *hits).sum();
+        let cmds: Vec<String> = deltas
+            .iter()
+            .take(8)
+            .map(|(opcode, hits)| format!("{}={hits}", self.engine.command_name(*opcode)))
+            .collect();
+        let report = self.engine.last_report().clone();
+        let render = self.engine.render_report().cloned();
+        let capture_ms = self.engine.capture_ms();
+        let frame_build_ms = self.engine.frame_build_ms();
+        let mut line = format!(
+            "[spike] host={} engine={} interval={interval_ms:.1}ms work={work_ms:.1}ms \
+             tick={tick_ms:.1}ms render={render_ms:.1}ms draw={draw_ms:.1}ms \
+             capture={capture_ms:.1}ms frame_build={frame_build_ms:.1}ms \
+             clock={}ms lag={}ms \
+             ops={total_ops} layers={} visible={} passes={} drawn={} skipped={}",
+            self.frames,
+            report.frame,
+            report.clock_ms,
+            report.lag_ms,
+            report.layers,
+            report.visible,
+            report.passes,
+            report.executed,
+            report.skipped,
+        );
+        if let Some(render) = render {
+            use std::fmt::Write as _;
+            if let Some(p) = self.engine.render_phases() {
+                let _ = write!(
+                    line,
+                    " plan={:.1} snap={:.1} image={:.1} text={:.1} copy_text={:.1} \
+                     rest={:.1} encode={:.1} readback={:.1} tail={:.1} \
+                     text_bake={:.1} text_paint={:.1} image_paint={:.1} \
+                     image_composite={:.1} decode={:.1} decode_bytes={} \
+                     uploads={} upload_bytes={} draws={} copy_bytes={} copies={} snapshots_alloc={}",
+                    p.plan_us as f64 / 1e3,
+                    p.snap_us as f64 / 1e3,
+                    p.image_us as f64 / 1e3,
+                    p.text_us as f64 / 1e3,
+                    p.copy_text_us as f64 / 1e3,
+                    p.rest_us as f64 / 1e3,
+                    p.encode_us as f64 / 1e3,
+                    p.readback_us as f64 / 1e3,
+                    p.tail_us as f64 / 1e3,
+                    p.text_bake_us as f64 / 1e3,
+                    p.text_paint_us as f64 / 1e3,
+                    p.image_paint_us as f64 / 1e3,
+                    p.image_composite_us as f64 / 1e3,
+                    p.decode_us as f64 / 1e3,
+                    p.decode_bytes,
+                    p.uploads,
+                    p.upload_bytes,
+                    p.draw_calls,
+                    p.copy_bytes,
+                    p.copy_count,
+                    p.snapshot_alloc,
+                );
+                let _ = write!(
+                    line,
+                    " imgactions=merge:{} merge2:{} transition:{} bitwise:{} \
+                     paint:{} pixel:{} sampled:{} memo=chains:{} hits:{}",
+                    p.image_merge_ops,
+                    p.image_merge2_ops,
+                    p.image_transition_ops,
+                    p.image_bitwise_ops,
+                    p.image_paint_ops,
+                    p.image_pixel_ops,
+                    p.image_sampled_ops,
+                    p.memo_chains,
+                    p.memo_hits,
+                );
+            }
+            let _ = write!(
+                line,
+                " text_draws={} glyphs={} text_missing={} missing_assets={} \n                 skipped_ops={} offscreen_passes={}",
+                render.text_draws,
+                render.text_glyphs,
+                render.text_missing,
+                render.missing_assets.len(),
+                render.skipped_ops_total,
+                render.offscreen_passes,
+            );
+            if !render.skipped.is_empty() {
+                let skips: Vec<String> = render
+                    .skipped
+                    .iter()
+                    .take(3)
+                    .map(|skip| format!("{}:{} x{}", skip.kind, skip.reason, skip.count))
+                    .collect();
+                let _ = write!(line, " skip_top={}", skips.join("|"));
+            }
+            if !render.text_diags.is_empty() {
+                let _ = write!(
+                    line,
+                    " text_diags={:?}",
+                    render.text_diags.iter().take(2).collect::<Vec<_>>()
+                );
+            }
+        }
+        if !cmds.is_empty() {
+            use std::fmt::Write as _;
+            let _ = write!(line, " cmds={}", cmds.join(" "));
+        }
+        if let Some((script, pc, task)) = self.engine.current_position() {
+            use std::fmt::Write as _;
+            let _ = write!(line, " at={script}@{pc} task={task}");
+        }
+        if let Some(summary) = self.engine.frame_op_summary(6) {
+            use std::fmt::Write as _;
+            let _ = write!(
+                line,
+                " passtarget=screen:{} off:{} tex:{} \
+                 opmix=layer:{} group:{} trans:{} mask:{} copy:{} image:{}",
+                summary.screen_passes,
+                summary.offscreen_passes,
+                summary.texture_passes,
+                summary.layer_ops,
+                summary.group_ops,
+                summary.transition_ops,
+                summary.mask_ops,
+                summary.copy_ops,
+                summary.image_ops,
+            );
+            if !summary.top_targets.is_empty() {
+                let targets: Vec<String> = summary
+                    .top_targets
+                    .iter()
+                    .map(|(id, count)| format!("{id}:{count}"))
+                    .collect();
+                let _ = write!(line, " top={}", targets.join(" "));
+            }
+        }
+        use std::io::Write as _;
+        let writer = self.spike_writer.as_mut().expect("checked above");
+        if writeln!(writer, "{line}").is_ok() {
+            let _ = writer.flush();
+            self.spike_rows += 1;
+        }
+    }
+
+    /// 长 tick 的逐命令耗时(top-8;`--profile-commands` 诊断)。
+    fn observe_tick_profile(&mut self, tick_ms: f64) {
+        if !self.profile_commands || tick_ms < self.opts.spike_ms {
+            return;
+        }
+        let (rows, total_ns) = self.engine.take_command_profile(8);
+        if rows.is_empty() {
+            return;
+        }
+        host_error!(
+            "[cmdprofile] host={} tick={tick_ms:.1}ms sampled_total={:.1}ms",
+            self.frames,
+            total_ns as f64 / 1e6
+        );
+        for (name, hits, ns) in rows {
+            host_error!(
+                "  {name}: {:.1}ms ({:.1}%) hits={hits} avg={:.3}us/op",
+                ns as f64 / 1e6,
+                ns as f64 * 100.0 / total_ns.max(1) as f64,
+                ns as f64 / hits.max(1) as f64 / 1000.0
+            );
+        }
+        for (name, script, pc, hits) in self.engine.take_profile_sites(5) {
+            let line = self
+                .engine
+                .script_position(script, pc)
+                .map(|line| format!(" line {line}"))
+                .unwrap_or_default();
+            host_error!(
+                "  [site] {name} {} pc{pc}{line} hits={hits}",
+                self.engine.script_name(script)
+            );
+        }
+    }
+
     /// 记录一帧节奏样本(逐帧 CSV + 退出摘要)。
     fn record_frame(
         &mut self,
@@ -1505,7 +1764,10 @@ impl App {
         draw_ms: f64,
     ) {
         let host_frame = self.frames;
-        let engine_frame = self.engine.last_report().frame;
+        let report = self.engine.last_report();
+        let engine_frame = report.frame;
+        let clock_ms = report.clock_ms;
+        let lag_ms = report.lag_ms;
         // 渲染曲线:每宿主帧一个样本,环形只留最近 N 个。面板关闭期间
         // 也采样,打开时看到的是真实历史而不是重新开始的空曲线。
         self.render_samples.push_back(render_ms as f32);
@@ -1520,6 +1782,9 @@ impl App {
             tick_ms,
             render_ms,
             draw_ms,
+            phases: self.engine.render_phases(),
+            clock_ms,
+            lag_ms,
         });
         // 长跑有界:只保留最近 20 万帧(约 55 分钟@60fps)。
         if self.frame_rows.len() > FRAME_STATS_CAP {
@@ -1678,12 +1943,22 @@ impl App {
             }
         }
         if let Some(path) = self.opts.frame_stats.clone() {
+            // 渲染子阶段列(微秒→毫秒):`plan/snap/image/text/copy_text/rest/
+            // encode/readback/tail` 是阶段,`text_bake/text_paint/image_paint/
+            // image_composite` 是阶段内部的细项,最后四项是计数。
+            // soft 后端不提供 ⇒ 全部留空(列数不变,分析侧按空值处理)。
             let mut text = String::from(
-                "host_frame,engine_frame,interval_ms,work_ms,tick_ms,render_ms,draw_ms\n",
+                "host_frame,engine_frame,interval_ms,work_ms,tick_ms,render_ms,draw_ms,\
+                 plan_ms,snap_ms,image_ms,text_ms,copy_text_ms,rest_ms,encode_ms,\
+                 readback_ms,tail_ms,text_bake_ms,text_paint_ms,text_hash_ms,text_base_ms,\
+                 image_paint_ms,image_pixel_ms,image_composite_ms,\
+                 uploads,upload_bytes,draw_calls,readback_bytes,\
+                 merge_ops,merge2_ops,paint_ops,pixel_ops,memo_chains,memo_hits,\
+                 decode_ms,decode_bytes,clock_ms,lag_ms\n",
             );
             for row in &self.frame_rows {
                 use std::fmt::Write as _;
-                let _ = writeln!(
+                let _ = write!(
                     text,
                     "{},{},{:.3},{:.3},{:.3},{:.3},{:.3}",
                     row.host_frame,
@@ -1694,6 +1969,49 @@ impl App {
                     row.render_ms,
                     row.draw_ms
                 );
+                match row.phases {
+                    Some(p) => {
+                        let _ = writeln!(
+                            text,
+                            ",{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},\
+                             {:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},\
+                             {},{},{},{},{},{},{:.3},{},{},{}",
+                            p.plan_us as f64 / 1e3,
+                            p.snap_us as f64 / 1e3,
+                            p.image_us as f64 / 1e3,
+                            p.text_us as f64 / 1e3,
+                            p.copy_text_us as f64 / 1e3,
+                            p.rest_us as f64 / 1e3,
+                            p.encode_us as f64 / 1e3,
+                            p.readback_us as f64 / 1e3,
+                            p.tail_us as f64 / 1e3,
+                            p.text_bake_us as f64 / 1e3,
+                            p.text_paint_us as f64 / 1e3,
+                            p.text_hash_us as f64 / 1e3,
+                            p.text_base_us as f64 / 1e3,
+                            p.image_paint_us as f64 / 1e3,
+                            p.image_pixel_us as f64 / 1e3,
+                            p.image_composite_us as f64 / 1e3,
+                            p.uploads,
+                            p.upload_bytes,
+                            p.draw_calls,
+                            p.readback_bytes,
+                            p.image_merge_ops,
+                            p.image_merge2_ops,
+                            p.image_paint_ops,
+                            p.image_pixel_ops,
+                            p.memo_chains,
+                            p.memo_hits,
+                            p.decode_us as f64 / 1e3,
+                            p.decode_bytes,
+                            row.clock_ms,
+                            row.lag_ms
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(text, ",{0}", ",".repeat(29));
+                    }
+                }
             }
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
@@ -1710,6 +2028,11 @@ impl App {
                     host_error!("yu-desktop: 写逐帧统计 {} 失败: {error}", path.display())
                 }
             }
+        }
+        if let Some(mut writer) = self.spike_writer.take() {
+            use std::io::Write as _;
+            let _ = writer.flush();
+            host_line!("spike log: {} rows", self.spike_rows);
         }
     }
 
@@ -1735,6 +2058,13 @@ impl App {
             self.viewport.0,
             self.viewport.1
         );
+        if let Some((composites, offscreen, snapshots)) = self.engine.gpu_resource_counts() {
+            host_line!(
+                "yu-desktop: gpu targets composites={composites} offscreen={offscreen}                  snapshots={snapshots} textures={} target_bytes={}MB",
+                self.engine.textures_cached(),
+                self.engine.target_bytes().unwrap_or(0) / (1024 * 1024)
+            );
+        }
         self.finish_timing();
         // 退出时把诊断摘要写进日志(JSONL + 控制台):即使窗口一闪而过,
         // 复盘也能看到挂号表与“为什么卡”的判定。
@@ -1769,6 +2099,13 @@ impl App {
                 freeze.record.engine_frame
             );
         }
+        // 退出前同步落盘:stderr 走 64KB 块缓冲、JSONL 走后台队列,而
+        // `yu-cli` 最后是 `process::exit`(不跑析构)—— 不显式 flush 会丢尾部。
+        if let Some(console) = &self.console {
+            console.flush();
+        } else if let Some(console) = HOST_CONSOLE.get() {
+            console.flush();
+        }
     }
 
     /// 唤醒目标:`next_frame` 前 0.8ms。
@@ -1788,8 +2125,9 @@ impl App {
     ///
     /// 错过截止时间时**对齐到下一个未来槽位**(保留相位),而不是
     /// `now + frame`——后者等于把本帧工作和一整帧睡眠再次串行。
-    /// 落后太多时也不会补跑逻辑(P1 的“不追帧”仍由引擎 `max_step`
-    /// 上限保证)。
+    /// 不补跑逻辑帧:实时钟走的是**墙钟**(`tick_realtime`),漏掉的
+    /// 时间会一次性体现在下一次 tick 的 delta 里(官方 `_OS_TIME` 语义),
+    /// 不再有 `max_step` 截断可依赖——这是有意的:截断会让动画永久变慢。
     fn schedule_next_frame(&mut self, event_loop: &ActiveEventLoop) {
         let frame = Duration::from_secs_f64(1.0 / f64::from(self.opts.fps.max(1)));
         self.next_frame += frame;
@@ -1873,6 +2211,10 @@ impl ApplicationHandler for App {
             rgba: [0, 0, 0, 255].repeat(vw.max(1) as usize * vh.max(1) as usize),
         }));
         self.next_frame = Instant::now();
+        // 窗口/交换链/首张呈现的初始化时间**不计入首帧 delta**:否则脚本
+        // 在 f1 读到的 `_OS_TIME` 会凭空多出数百 ms,开场的第一个淡出
+        // 直接跳到中段(启动期本来就有字体/纹理/场景构建长帧)。
+        self.engine.reset_realtime_clock();
         window.request_redraw();
     }
 
@@ -2084,7 +2426,7 @@ impl ApplicationHandler for App {
 
         // `--profile-frames` 的窗口 = 这一帧(否则第一次打印会把此前
         // 所有帧的累计都算进来,曾把設定点击误读成 1.8s)。
-        if !self.profile_frames.is_empty() {
+        if !self.profile_frames.is_empty() || self.profile_commands {
             self.engine.reset_command_profile();
         }
         let tick_started = Instant::now();
@@ -2160,14 +2502,19 @@ impl ApplicationHandler for App {
             draw_ms,
         );
         self.flush_input_latency();
+        self.observe_spike(interval_ms, work_ms, engine_tick_ms, engine_render_ms, draw_ms);
+        self.observe_tick_profile(engine_tick_ms);
         if self.frames <= 8 || self.frames.is_multiple_of(60) {
             let report = self.engine.last_report();
             // 周期采样是**进度**不是告警:走 Verbose,默认不显示,
             // `--log-level verbose` 才出现。真正的长帧另有阈值分支
             // (下方 render_ms > 30 的 host_error!),那条保持 WARN 可见。
             host_verbose!(
-                "frame {}: host_tick={tick_host_ms:.1}ms engine_tick={:.1}ms engine_render={:.1}ms draw={draw_ms:.1}ms",
-                self.frames, report.tick_ms, report.render_ms
+                "frame {}: host_tick={tick_host_ms:.1}ms engine_tick={:.1}ms engine_render={:.1}ms draw={draw_ms:.1}ms gpu_targets={}MB",
+                self.frames,
+                report.tick_ms,
+                report.render_ms,
+                self.engine.target_bytes().unwrap_or(0) / (1024 * 1024)
             );
         }
         // 渲染侧长帧取证(文本页签曾出现 175ms render):把后端报告里

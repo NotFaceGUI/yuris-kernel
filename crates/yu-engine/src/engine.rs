@@ -11,11 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use yu_backend_soft::{frame_has_drawable_output, SoftRenderer};
-use yu_render_core::{png, RenderReport, Surface, TextureStore};
+use yu_render_core::{png, RenderPhases, RenderReport, Surface, TextureStore};
 use yu_backend_wgpu::{DeviceOptions, WgpuRenderer};
 use yu_gfx::{
-    json, probe_order_from_codes, CompositorFrame, GfxConfig, GfxHost, GfxState, SizeU32,
-    TextureRef, TextureSampler, Viewport,
+    json, probe_order_from_codes, CompositorFrame, GfxConfig, GfxHost, GfxState, Op, PassTarget,
+    SizeU32, TextureRef, TextureSampler, Viewport,
 };
 use yu_rt::input::{InputFrame, InputTimeline};
 use yu_rt::{BootConfig, Vm};
@@ -24,6 +24,10 @@ use yu_sound::{SoundHost, SoundLoader, SoundState};
 
 use crate::project::{Project, CODEC};
 use crate::{CliResult, Failure};
+
+/// 每帧最多从 GPU 读回多少张缺失快照(差分切换帧通常 1–5 张;上限兜底
+/// 防止异常语料把一帧拖长)。
+const SNAPSHOT_READBACK_CAP: usize = 8;
 
 /// 平台音频出口(L1 端口,2026-10-25 架构 v2)。
 ///
@@ -40,11 +44,75 @@ pub trait AudioOut {
     fn detach(&mut self);
 }
 
-/// 实时 tick 的默认单步上限(引擎 `tick_realtime`)。
+/// 实时逻辑时钟:墙钟毫秒、单调、默认**不丢时间**。
 ///
-/// `serve` 保持 500ms(长帧后一次补完);桌面宿主用 2 帧(见
-/// `HostOptions::fps`,H-P1-05)。引用:症状台账 P1-B / H-P1-05。
-const DEFAULT_MAX_STEP_MS: u32 = 500;
+/// 脚本的时间语义是官方 `@_OS_TIME(1)`(启动以来的毫秒):淡出/补间按
+/// `now - t0` 推进(ERIS `es.CGFADEEXEC` pc460/471/472:`@8 = @_OS_TIME(1)`
+/// → `@: = 256 * (now - @8) / 时长`;sprite 补间同型)。因此实时路径必须喂
+/// **真实流逝的毫秒**;任何“单帧上限”都会把超出部分永久丢弃,让整场动画
+/// 慢于真实时间——2026-10-24 实测:2 帧上限下 3258 帧里 1260 帧(38.7%)
+/// 被截断、累计丢 6.58s(见 `PROGRESS.md` 成果 H-P1-05 与
+/// `host-desktop/src/lib.rs` 的现场注记)。
+///
+/// 上限只保留为**显式调试开关**(`Engine::set_max_step_ms`),默认 `None`;
+/// 一旦启用,丢弃量逐帧计数并由帧报告(`lag_ms`)与诊断呈现,不静默。
+struct RealtimeClock {
+    /// 上一次 advance 的墙钟时刻。
+    last_tick: Instant,
+    /// 累计逻辑时间(微秒;按 µs 累计再取整,60Hz 下自然得到 16/17ms 交替)。
+    elapsed_us: u64,
+    /// 上一次 advance 返回的毫秒值(用于算 delta)。
+    last_ms: u32,
+    /// 显式调试上限;`None` = 不截断(默认)。
+    cap_ms: Option<u32>,
+    /// 因显式上限丢弃的累计毫秒。
+    dropped_total_ms: u64,
+    /// 发生丢弃的帧数。
+    dropped_frames: u64,
+}
+
+impl RealtimeClock {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_tick: now,
+            elapsed_us: 0,
+            last_ms: 0,
+            cap_ms: None,
+            dropped_total_ms: 0,
+            dropped_frames: 0,
+        }
+    }
+
+    /// 推进到 `now`,返回 `(逻辑毫秒, 本帧增量, 本帧丢弃量)`。
+    fn advance(&mut self, now: Instant) -> (u32, u32, u32) {
+        let mut delta_us = now.saturating_duration_since(self.last_tick).as_micros() as u64;
+        self.last_tick = now;
+        let mut dropped_us = 0u64;
+        if let Some(cap) = self.cap_ms {
+            let max_us = u64::from(cap.max(1)) * 1000;
+            if delta_us > max_us {
+                dropped_us = delta_us - max_us;
+                delta_us = max_us;
+            }
+        }
+        self.elapsed_us = self.elapsed_us.saturating_add(delta_us);
+        let now_ms = (self.elapsed_us / 1000) as u32;
+        let delta_ms = now_ms.saturating_sub(self.last_ms);
+        self.last_ms = now_ms;
+        let dropped_ms = (dropped_us / 1000) as u32;
+        if dropped_ms > 0 {
+            self.dropped_total_ms = self.dropped_total_ms.saturating_add(u64::from(dropped_ms));
+            self.dropped_frames = self.dropped_frames.saturating_add(1);
+        }
+        (now_ms, delta_ms, dropped_ms)
+    }
+
+    /// 丢弃暂停期间的真实时间,恢复时不快进;时钟值不回退。
+    fn reset(&mut self, now: Instant) {
+        self.last_tick = now;
+    }
+}
+
 /// 声音域诊断暂存上限(超出丢前一半;诊断不是无界队列)。
 const SOUND_DIAG_CAP: usize = 8192;
 
@@ -164,6 +232,10 @@ pub struct FrameReport {
     pub render_ms: f64,
     pub ms: f64,
     pub drawable: bool,
+    /// 本帧脚本可见的逻辑时钟(`@_OS_TIME(1)` 的毫秒;headless 固定步长)。
+    pub clock_ms: u32,
+    /// 本帧被显式 `max_step` 上限丢弃的墙钟毫秒(默认 0 = 未丢)。
+    pub lag_ms: u32,
 }
 
 impl FrameReport {
@@ -180,6 +252,8 @@ impl FrameReport {
             render_ms: 0.0,
             ms: 0.0,
             drawable: false,
+            clock_ms: 0,
+            lag_ms: 0,
         }
     }
 }
@@ -191,6 +265,22 @@ impl FrameReport {
 pub struct RenderedFrame {
     pub surface: Arc<Surface>,
     pub report: FrameReport,
+}
+
+/// 一帧的合成构成摘要(长帧取证;只在宿主索取时计算,不进逐帧热路径)。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrameOpSummary {
+    pub screen_passes: usize,
+    pub offscreen_passes: usize,
+    pub texture_passes: usize,
+    pub layer_ops: usize,
+    pub group_ops: usize,
+    pub transition_ops: usize,
+    pub mask_ops: usize,
+    pub copy_ops: usize,
+    pub image_ops: usize,
+    /// 本帧 op 目标层(`LayerId`)按 op 数降序的前 N 项。
+    pub top_targets: Vec<(String, usize)>,
 }
 
 /// 等待中的任务(H-P1-02;`Scheduler::nodes` 的等待面投影)。
@@ -416,13 +506,11 @@ pub struct Engine {
     frame_diag_totals: BTreeMap<(String, String, String), FrameDiagTotal>,
     /// 平台音频出口(宿主经 [`Engine::attach_audio`] 注入;`None` = 静音)。
     audio: Option<Box<dyn AudioOut>>,
-    /// 实时墙钟：`serve` 的 `tick_realtime` 用它推进逻辑/声音时间。
-    realtime_last: Instant,
-    /// 单次 `tick_realtime` 允许推进的逻辑毫秒上限(默认 500)。
-    /// 桌面宿主降到 2 帧,避免长帧后一次性跑完整段脚本造成卡死。
-    max_step_ms: u32,
-    realtime_us: u64,
-    realtime_last_ms: u32,
+    /// 实时墙钟:`serve`/桌面 `tick_realtime` 用它推进逻辑/声音时间。
+    /// 默认不截断(见 [`RealtimeClock`])。
+    clock: RealtimeClock,
+    /// 上一帧被显式 `max_step` 上限丢弃的毫秒(0 = 未丢;进帧报告 `lag_ms`)。
+    last_clock_drop_ms: u32,
     renderer: Renderer,
     viewport: Viewport,
     frame: u64,
@@ -442,6 +530,10 @@ pub struct Engine {
     last_screen: Option<(u64, u32, u32)>,
     last_report: FrameReport,
     last_render: Option<RenderReport>,
+    /// 上一帧 `SAVE` 抓帧器回放耗时(毫秒;`tick`/`render` 之外的墙钟)。
+    last_capture_ms: f64,
+    /// 上一帧 `GfxState::frame()` 合成帧装配耗时(毫秒;含在 `tick_ms` 内)。
+    last_frame_build_ms: f64,
     tick_history: VecDeque<f64>,
     render_history: VecDeque<f64>,
     boot_ms: f64,
@@ -535,10 +627,8 @@ impl Engine {
             drained_diags: 0,
             frame_diag_totals: BTreeMap::new(),
             audio: None,
-            realtime_last: Instant::now(),
-            max_step_ms: DEFAULT_MAX_STEP_MS,
-            realtime_us: 0,
-            realtime_last_ms: 0,
+            clock: RealtimeClock::new(Instant::now()),
+            last_clock_drop_ms: 0,
             renderer,
             viewport,
             frame: 0,
@@ -553,6 +643,8 @@ impl Engine {
             last_screen: None,
             last_report: FrameReport::empty(0),
             last_render: None,
+            last_capture_ms: 0.0,
+            last_frame_build_ms: 0.0,
             tick_history: VecDeque::with_capacity(120),
             render_history: VecDeque::with_capacity(120),
             boot_ms,
@@ -661,6 +753,91 @@ impl Engine {
         self.last_render.as_ref()
     }
 
+    /// 上一帧 `SAVE` 抓帧器回放耗时(毫秒;`tick`/`render` 之外的墙钟)。
+    pub fn capture_ms(&self) -> f64 {
+        self.last_capture_ms
+    }
+
+    /// GPU 资源计数 `(合成目标, 组离屏, 快照)`;soft 后端为 `None`。
+    pub fn gpu_resource_counts(&self) -> Option<(usize, usize, usize)> {
+        match &self.renderer {
+            Renderer::Wgpu { renderer, .. } => Some(renderer.resource_counts()),
+            Renderer::Soft(_) => None,
+        }
+    }
+
+    /// 全部 GPU 目标占用字节(诊断;soft 后端为 `None`)。
+    pub fn target_bytes(&self) -> Option<usize> {
+        match &self.renderer {
+            Renderer::Wgpu { renderer, .. } => Some(renderer.target_bytes()),
+            Renderer::Soft(_) => None,
+        }
+    }
+
+    /// 上一帧合成帧装配耗时(`GfxState::frame()`;包含在 `tick_ms` 内)。
+    pub fn frame_build_ms(&self) -> f64 {
+        self.last_frame_build_ms
+    }
+
+    /// 本帧 ops/passes 构成(长帧取证;按需调用,不进逐帧热路径)。
+    ///
+    /// `top` = 目标层排行榜长度。回答「这一帧的几万条 op 到底压在哪几个层
+    /// 上」,是区分「组内精灵组装」与「屏幕直绘」的第一手事实。
+    pub fn frame_op_summary(&self, top: usize) -> Option<FrameOpSummary> {
+        let frame = self.last_frame.as_ref()?;
+        let mut summary = FrameOpSummary::default();
+        let mut targets: BTreeMap<String, usize> = BTreeMap::new();
+        for pass in &frame.passes {
+            match &pass.target {
+                PassTarget::Screen => summary.screen_passes += 1,
+                PassTarget::Offscreen(_) => summary.offscreen_passes += 1,
+                PassTarget::Texture(_) => summary.texture_passes += 1,
+            }
+            for op in &pass.ops {
+                let target = match op {
+                    Op::Layer(layer) => {
+                        summary.layer_ops += 1;
+                        layer.id.display()
+                    }
+                    Op::Group(group) => {
+                        summary.group_ops += 1;
+                        group.layer.id.display()
+                    }
+                    Op::Transition(transition) => {
+                        summary.transition_ops += 1;
+                        transition.layer.id.display()
+                    }
+                    Op::Mask(mask) => {
+                        summary.mask_ops += 1;
+                        mask.layer.id.display()
+                    }
+                    Op::Copy(copy) => {
+                        summary.copy_ops += 1;
+                        copy.dest.display()
+                    }
+                    Op::Image(image) => {
+                        summary.image_ops += 1;
+                        image.target.as_ref().unwrap_or(&image.source).display()
+                    }
+                };
+                *targets.entry(target).or_insert(0) += 1;
+            }
+        }
+        let mut rows: Vec<(String, usize)> = targets.into_iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        rows.truncate(top);
+        summary.top_targets = rows;
+        Some(summary)
+    }
+
+    /// 最近一帧的渲染阶段耗时(微秒;wgpu 后端;soft 为 `None`)。
+    pub fn render_phases(&self) -> Option<RenderPhases> {
+        match &self.renderer {
+            Renderer::Wgpu { renderer, .. } => Some(renderer.render_phases()),
+            Renderer::Soft(_) => None,
+        }
+    }
+
     /// `Some(true)` = 已与软后端做过逐计数对账且一致;`Some(false)` = 已请求
     /// 对账但尚未完成;**`None` = 不是 wgpu 后端,或根本没有请求对账**
     /// (默认关;不再把「没请求」报成 PENDING)。
@@ -707,42 +884,63 @@ impl Engine {
     /// 实时出声走 [`Engine::tick_realtime`]（`serve`）。
     pub fn tick(&mut self) -> CliResult<RenderedFrame> {
         let now_ms = (self.frame as u32).saturating_mul(self.opts.frame_ms());
+        self.last_clock_drop_ms = 0;
         self.tick_inner(now_ms, 0)
     }
 
-    /// 实时推进（`serve` 用）：逻辑时钟按**真实墙钟**走，声音状态与设备
-    /// 输出使用同一毫秒增量，避免 1000/fps 取整造成的系统性欠载。
+    /// 实时推进（`serve`/桌面用）：逻辑时钟按**真实墙钟**走，声音状态与
+    /// 设备输出使用同一毫秒增量，避免 1000/fps 取整造成的系统性欠载。
     ///
     /// 墙钟按微秒累计后再取整，60Hz 下得到 16/17ms 交替的增量，
-    /// 长期平均与设备消费一致；暂停/断点造成的长间隔最多补 500ms。
+    /// 长期平均与设备消费一致。**默认不设单步上限**：脚本淡出/补间按
+    /// `@_OS_TIME(1)` 的墙钟差推进，截断会让动画永久落后于真实时间
+    /// （2026-10-24 实测 2 帧上限丢 6.58s）。上限只作显式调试开关，
+    /// 启用后丢弃量记入帧报告 `lag_ms` 并打诊断，不静默。
     pub fn tick_realtime(&mut self) -> CliResult<RenderedFrame> {
-        let now = Instant::now();
-        let mut delta_us = now.duration_since(self.realtime_last).as_micros() as u64;
-        self.realtime_last = now;
-        let max_us = u64::from(self.max_step_ms.max(1)) * 1000;
-        if delta_us > max_us {
-            delta_us = max_us;
+        self.tick_realtime_at(Instant::now())
+    }
+
+    /// [`Engine::tick_realtime`] 的注入缝：宿主/测试给出单调时刻。
+    pub fn tick_realtime_at(&mut self, now: Instant) -> CliResult<RenderedFrame> {
+        let (now_ms, delta_ms, dropped_ms) = self.clock.advance(now);
+        self.last_clock_drop_ms = dropped_ms;
+        if dropped_ms > 0 && (self.clock.dropped_frames <= 3 || self.clock.dropped_frames % 600 == 0)
+        {
+            log::warn!(
+                target: "yu-cli::engine",
+                "[clock] 显式 max_step 上限丢弃 {dropped_ms}ms(本帧);累计 {}ms / {} 帧 —— \
+                 该路径会让动画慢于真实时间,仅限调试",
+                self.clock.dropped_total_ms,
+                self.clock.dropped_frames
+            );
         }
-        self.realtime_us = self.realtime_us.saturating_add(delta_us);
-        let now_ms = (self.realtime_us / 1000) as u32;
-        let delta_ms = now_ms.saturating_sub(self.realtime_last_ms);
-        self.realtime_last_ms = now_ms;
         self.tick_inner(now_ms, delta_ms)
     }
 
     /// 暂停/无客户端时调用：丢弃暂停期间的真实时间，恢复时不快进。
     pub fn reset_realtime_clock(&mut self) {
-        self.realtime_last = Instant::now();
+        self.clock.reset(Instant::now());
     }
 
-    /// 设置单次实时 tick 的逻辑步进上限(毫秒)。默认 500;
-    /// 桌面宿主用 2 帧,避免长帧后一次性执行整段脚本。
+    /// 设置实时 tick 的单步上限（毫秒）。**默认关闭**；仅供调试复现
+    /// “长帧截断”症状。启用后超出的墙钟时间会被丢弃并计入帧报告 `lag_ms`。
     pub fn set_max_step_ms(&mut self, ms: u32) {
-        self.max_step_ms = ms.max(1);
+        self.clock.cap_ms = Some(ms.max(1));
     }
 
+    /// 关闭单步上限（回到与官方同构的墙钟语义；默认状态）。
+    pub fn clear_max_step_ms(&mut self) {
+        self.clock.cap_ms = None;
+    }
+
+    /// 当前单步上限毫秒；`0` = 不截断。
     pub fn max_step_ms(&self) -> u32 {
-        self.max_step_ms
+        self.clock.cap_ms.unwrap_or(0)
+    }
+
+    /// 因显式上限累计丢弃的墙钟毫秒（`0` = 从未丢）。
+    pub fn clock_dropped_ms(&self) -> u64 {
+        self.clock.dropped_total_ms
     }
 
     /// 每个任务每次泵的命令上限(宿主 `--pump-cap`;`None` = 官方同构的
@@ -802,27 +1000,57 @@ impl Engine {
             }
             self.sync_input();
         }
+        let build_started = Instant::now();
         let frame = self
             .state
             .as_ref()
             .ok_or_else(|| Failure::runtime("engine 未启动"))?
             .borrow()
             .frame();
+        self.last_frame_build_ms = build_started.elapsed().as_secs_f64() * 1000.0;
         let tick_ms = tick_started.elapsed().as_secs_f64() * 1000.0;
         let drawable = frame_has_drawable_output(&frame);
 
-        // `SAVE[ID]` 抓帧器:只在本帧出现新 COPY 时整帧回放一次,快照因此
-        // 与主渲染器**同刻**冻结(`last_screen` = 上一帧呈现面)。
-        if let Some(bridge) = &self.capture_bridge {
-            bridge
-                .0
-                .borrow_mut()
-                .observe(&frame, self.last_surface.clone());
-        }
+        let previous_surface = self.last_surface.clone();
         let render_started = Instant::now();
         let (surface, report, screen) = self.renderer.render(&frame)?;
         self.last_screen = screen;
         let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
+
+        // `SAVE[ID]` 抓帧器(渲染之后调用:主渲染器本帧已把可从 CPU 源解析
+        // 的快照建好 CPU 镜像)。镜像命中 ⇒ 零回放;只有组源/后缓冲源这类
+        // 拿不到镜像的快照才退回软后端整帧回放。
+        let capture_started = Instant::now();
+        if let Some(bridge) = &self.capture_bridge {
+            let missing = {
+                let renderer = &self.renderer;
+                let mirror = |id: yu_gfx::CopyId| match renderer {
+                    Renderer::Wgpu { renderer, .. } => renderer.snapshot_cpu_shared(id),
+                    Renderer::Soft(_) => None,
+                };
+                bridge
+                    .0
+                    .borrow_mut()
+                    .observe(&frame, previous_surface, &mirror)
+            };
+            // 没有 CPU 镜像的新快照:直接从 GPU 读回这一张(1–8ms/张),
+            // 不再让软后端整帧重放(差分切换时实测 300–360ms/次)。
+            if !missing.is_empty() {
+                if let Renderer::Wgpu { renderer, .. } = &mut self.renderer {
+                    for id in missing.into_iter().take(SNAPSHOT_READBACK_CAP) {
+                        if let Some(surface) = renderer.read_snapshot(id) {
+                            bridge.0.borrow_mut().insert_mirror(
+                                id,
+                                surface.width,
+                                surface.height,
+                                surface.rgba,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        self.last_capture_ms = capture_started.elapsed().as_secs_f64() * 1000.0;
 
         let out = FrameReport {
             frame: frame.frame,
@@ -836,20 +1064,10 @@ impl Engine {
             render_ms,
             ms: tick_ms + render_ms,
             drawable,
+            clock_ms: now_ms,
+            lag_ms: self.last_clock_drop_ms,
         };
         self.accumulate_frame_diags(&frame);
-        if let Some(want) = std::env::var_os("YU_DUMP_LAYERS_AT") {
-            if want.to_string_lossy().parse::<u64>().ok() == Some(frame.frame) {
-                let shown: Vec<String> = frame
-                    .layers
-                    .iter()
-                    .filter(|l| l.visible)
-                    .map(|l| l.id.display())
-                    .take(40)
-                    .collect();
-                let _ = &shown;
-            }
-        }
         self.last_frame = Some(frame);
         self.last_surface = Some(Arc::clone(&surface));
         // `SAVE[ID]` 抓帧渲染器的后缓冲:与主渲染器同源(上一帧呈现画面)。
@@ -1203,10 +1421,38 @@ impl Engine {
     }
 
     /// 开关逐命令耗时采样(默认关;宿主 `--profile-frames` 用)。
+    /// 命令计时采样率(诊断;`1` = 逐条计时)。
+    pub fn set_command_profile_sample(&mut self, sample: u64) {
+        if let Some(vm) = self.vm.as_mut() {
+            vm.set_command_profile_sample(sample);
+        }
+    }
+
     pub fn set_command_profile(&mut self, on: bool) {
         if let Some(vm) = self.vm.as_mut() {
             vm.set_command_profile(on);
         }
+    }
+
+    /// 本帧各命令执行次数(与上次调用成对;宿主长帧取证用)。
+    pub fn take_command_hit_deltas(&mut self) -> Vec<(u8, u64)> {
+        self.vm
+            .as_mut()
+            .map(|vm| vm.take_command_hit_deltas())
+            .unwrap_or_default()
+    }
+
+    /// opcode → 命令名(诊断)。
+    pub fn command_name(&self, opcode: u8) -> String {
+        self.vm
+            .as_ref()
+            .map(|vm| vm.command_name(opcode))
+            .unwrap_or_else(|| format!("#{opcode}"))
+    }
+
+    /// 最近一条已执行命令的落点(脚本显示名、pc、任务名;长帧取证)。
+    pub fn current_position(&self) -> Option<(String, u32, String)> {
+        self.vm.as_ref().map(|vm| vm.current_position())
     }
 
     /// 清空命令耗时采样窗口(宿主逐帧调用;见 `Vm::reset_command_profile`)。
@@ -1294,6 +1540,8 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.last_report = FrameReport::empty(0);
         self.last_render = None;
+        self.last_capture_ms = 0.0;
+        self.last_frame_build_ms = 0.0;
         self.tick_history.clear();
         self.render_history.clear();
         self.events_drained = 0;
@@ -1301,9 +1549,6 @@ impl Engine {
         self.sound_diags_dropped = 0;
         self.drained_diags = 0;
         self.frame_diag_totals.clear();
-        self.realtime_last = Instant::now();
-        self.realtime_us = 0;
-        self.realtime_last_ms = 0;
         if let Some(audio) = &mut self.audio {
             audio.detach();
         }
@@ -1322,6 +1567,10 @@ impl Engine {
         }
         self.viewport = viewport;
         self.renderer.reset();
+        // 时钟在 boot **之后**归零:否则重启后的第一帧 delta 会把 boot 时间
+        // (可能数百 ms~秒级)算进脚本的 `_OS_TIME`,开场地一次淡出直接被跳过。
+        self.clock = RealtimeClock::new(Instant::now());
+        self.last_clock_drop_ms = 0;
         Ok(())
     }
 
@@ -1546,6 +1795,8 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
             TextureStore::new(source, CODEC, probe_order.clone()),
             capture_screen.clone(),
             project.overlay().clone(),
+            // GPU 后端不回放整帧:缺失镜像按需从 GPU 读回。
+            opts.backend != Backend::Wgpu,
         )));
         gfx_host.set_layer_capture(Box::new(crate::capture::SharedCapture(capture.clone())));
         Some(crate::capture::SharedCapture(capture))
@@ -1708,5 +1959,71 @@ fn host_paths(save_root: &std::path::Path) -> yu_rt::vm::HostPaths {
             .as_ref()
             .map(|h| format!("{h}{BS}Documents").into_bytes()),
         project_path: None,
+    }
+}
+
+#[cfg(test)]
+mod realtime_clock_tests {
+    use super::RealtimeClock;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn long_gap_advances_full_wall_time() {
+        let t0 = Instant::now();
+        let mut clock = RealtimeClock::new(t0);
+        let (now_ms, delta_ms, dropped_ms) = clock.advance(t0 + Duration::from_millis(700));
+        assert_eq!((now_ms, delta_ms, dropped_ms), (700, 700, 0));
+        assert_eq!(clock.dropped_total_ms, 0);
+    }
+
+    #[test]
+    fn explicit_cap_is_counted_not_silent() {
+        let t0 = Instant::now();
+        let mut clock = RealtimeClock::new(t0);
+        clock.cap_ms = Some(500);
+        let (now_ms, delta_ms, dropped_ms) = clock.advance(t0 + Duration::from_millis(700));
+        assert_eq!((now_ms, delta_ms, dropped_ms), (500, 500, 200));
+        assert_eq!(clock.dropped_total_ms, 200);
+        assert_eq!(clock.dropped_frames, 1);
+    }
+
+    #[test]
+    fn clearing_cap_restores_lossless_clock() {
+        let t0 = Instant::now();
+        let mut clock = RealtimeClock::new(t0);
+        clock.cap_ms = Some(500);
+        clock.advance(t0 + Duration::from_millis(700));
+        clock.cap_ms = None;
+        let (now_ms, delta_ms, dropped_ms) =
+            clock.advance(t0 + Duration::from_millis(1400));
+        assert_eq!((now_ms, delta_ms, dropped_ms), (1200, 700, 0));
+        assert_eq!(clock.dropped_total_ms, 200, "清掉上限后不再新增丢弃");
+    }
+
+    #[test]
+    fn pause_reset_discards_without_rewinding() {
+        let t0 = Instant::now();
+        let mut clock = RealtimeClock::new(t0);
+        let (before, ..) = clock.advance(t0 + Duration::from_millis(100));
+        assert_eq!(before, 100);
+        // 暂停 5s;恢复时 reset 丢弃暂停时长,但时钟不回退。
+        clock.reset(t0 + Duration::from_secs(5));
+        let (after, delta_ms, _) =
+            clock.advance(t0 + Duration::from_secs(5) + Duration::from_millis(16));
+        assert_eq!(after, 116);
+        assert_eq!(delta_ms, 16);
+    }
+
+    #[test]
+    fn sixty_hz_microseconds_average_to_one_second() {
+        let t0 = Instant::now();
+        let mut clock = RealtimeClock::new(t0);
+        let mut sum = 0u32;
+        for i in 1..=60u32 {
+            let (_, delta_ms, _) = clock.advance(t0 + Duration::from_micros(16_667 * u64::from(i)));
+            sum += delta_ms;
+        }
+        assert_eq!(clock.last_ms, 1000, "60×16.667ms 应取整到 1000ms");
+        assert_eq!(sum, 1000, "逐帧增量之和必须等于总推进,不能丢毫秒");
     }
 }

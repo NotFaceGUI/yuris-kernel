@@ -34,6 +34,9 @@ fn main() {
             failure.exit
         }
     };
+    // 日志写者异步(桌面宿主已在 `finish` 里刷过;这里兜底门面 JSONL 与
+    // 控制台缓冲,`process::exit` 不跑析构)。
+    log::logger().flush();
     std::process::exit(code);
 }
 
@@ -262,6 +265,8 @@ desktop 专有(--mode desktop;需默认 feature 构建):
   --log-file PATH                  宿主 JSONL 日志(缺省 %TEMP%/yu-cli-desktop.jsonl)
   --frame-stats CSV                逐帧耗时 CSV
   --profile-frames 1,4,340         指定帧打印 VM 命令耗时 top-10
+  --spike-log PATH                 长帧自动取证日志(阶段耗时 + 本帧命令构成)
+  --spike-ms 20                    长帧阈值(ms,work 口径;默认 20)
   --pump-cap N                     每任务每泵命令上限(DIV-HOST-002,诊断用)
   --panic-selftest N               panic 防线自测
 
@@ -284,13 +289,14 @@ yu-cli serve · 本地服务:服务端读数据并执行内核,浏览器只做�
   yu-cli serve <project-root> [--backend soft|wgpu] [--port 4173] [--no-open]
                [--entry LABEL] [--fps 60] [--record-events on|off]
                [--debug-mode on|off] [--data PATH] [--www DIR] [--diag-ws]
-               [--font FAMILY] [--log-file PATH]
+               [--font FAMILY] [--log-file PATH] [--max-step-ms N]
 
 说明:
   启动后打印 http://127.0.0.1:<port>/,默认打开浏览器。
   WebSocket /ws:帧下发 + 输入/控制;SSE /events:HMR reload。
   --diag-ws 额外开 /diag 通道(500ms 推诊断快照:等待任务/挂号表/域计数)。
   --log-file JSONL 日志(内核 Diag + 门面行;每轮截断;关闭时打汇总)。
+  --max-step-ms 调试用:实时逻辑时钟单步上限(默认关 = 不截断,墙钟语义)。
   服务端读数据并执行内核;浏览器不下载整包。
 ";
 

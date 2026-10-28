@@ -53,6 +53,8 @@ fn table() -> ParamTable {
                 &[
                     "ID",
                     "ID2",
+                    "ID3",
+                    "TRANSITION",
                     "COPY2",
                     "SET",
                     "X",
@@ -515,6 +517,184 @@ fn rectpaint_family_matches_soft_backend() {
     assert_eq!(
         gpu_out.report, soft_out.report,
         "双后端 RenderReport 必须逐字段一致"
+    );
+}
+
+/// `CGACT[TRANSITION]`:GPU 整数 lerp 必须与 soft `blend_transition` 逐字节一致。
+///
+/// 两个源都是资产(稳定 GPU 纹理)、目标层没有 CPU 消费者 ⇒ 走 GPU 合成;
+/// 结果层直接绘制。逐像素断言覆盖 `SET=0/128/256` 三个端点/中点。
+#[test]
+fn cgact_transition_gpu_matches_soft_exactly() {
+    let table = table();
+    for (blend, label) in [(0i64, "f=0"), (128, "f=128"), (256, "f=256")] {
+        let mut gfx = state(Viewport::new(4, 4), [0, 0, 0, 255]);
+        gfx.consume_events(&[
+            VmEvent::FrameStart { frame: 1 },
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"FROM".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"from".to_vec())),
+                ],
+            ),
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"TO".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"to".to_vec())),
+                ],
+            ),
+            call(
+                1,
+                "CGACT",
+                vec![
+                    arg(&table, "CGACT", "ID", Value::Str(b"FROM".to_vec())),
+                    arg(&table, "CGACT", "ID2", Value::Str(b"TO".to_vec())),
+                    arg(&table, "CGACT", "ID3", Value::Str(b"OUT".to_vec())),
+                    arg(&table, "CGACT", "TRANSITION", Value::Int(1)),
+                    arg(&table, "CGACT", "SET", Value::Int(blend)),
+                ],
+            ),
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"OUT".to_vec())),
+                    arg(&table, "CG", "SX", Value::Int(4)),
+                    arg(&table, "CG", "SY", Value::Int(4)),
+                ],
+            ),
+            VmEvent::FrameEnd { frame: 1 },
+        ]);
+        let frame = gfx.frame();
+        let make_store = || {
+            store(&[
+                (
+                    b"from.png",
+                    png_bytes_for(4, 4, Rgba([200, 40, 10, 180])),
+                ),
+                (b"to.png", png_bytes_for(4, 4, Rgba([20, 90, 240, 255]))),
+            ])
+        };
+        let Some(mut gpu) = renderer_or_skip(make_store()) else {
+            return;
+        };
+        let gpu_out = gpu.render_frame(&frame).expect("gpu render");
+        let soft_out = SoftRenderer::new(make_store()).render_frame(&frame);
+
+        let mut max_diff = 0u8;
+        for (gpu_px, soft_px) in gpu_out
+            .surface
+            .rgba
+            .chunks_exact(4)
+            .zip(soft_out.surface.rgba.chunks_exact(4))
+        {
+            let d = (0..4)
+                .map(|i| gpu_px[i].abs_diff(soft_px[i]))
+                .max()
+                .unwrap();
+            max_diff = max_diff.max(d);
+        }
+        if max_diff != 0 {
+            println!("--- {label} gpu vs soft ---");
+            for (i, (g, s)) in gpu_out
+                .surface
+                .rgba
+                .chunks_exact(4)
+                .zip(soft_out.surface.rgba.chunks_exact(4))
+                .enumerate()
+            {
+                if g != s {
+                    println!("  px{} gpu={:?} soft={:?}", i, g, s);
+                }
+            }
+        }
+        assert_eq!(max_diff, 0, "{label}: GPU lerp 必须与 soft 逐字节一致");
+        assert_eq!(
+            gpu_out.report, soft_out.report,
+            "{label}: 双后端 RenderReport 必须逐字段一致"
+        );
+        assert!(
+            gpu_out.stats.layer_composites >= 1,
+            "{label}: 应走 GPU 合成目标(实际 {})",
+            gpu_out.stats.layer_composites
+        );
+    }
+}
+
+/// `CGACT[MERGE]`:GPU 整数合成(含链式 ping-pong)必须与 soft 逐字节一致。
+#[test]
+fn cgact_merge_gpu_matches_soft_exactly() {
+    let table = table();
+    let mut gfx = state(Viewport::new(4, 4), [0, 0, 0, 255]);
+    let cg = |id: &[u8], file: &[u8], visible: bool| {
+        let mut args = vec![
+            arg(&table, "CG", "ID", Value::Str(id.to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(file.to_vec())),
+        ];
+        if !visible {
+            args.push(arg(&table, "CG", "E", Value::Int(0)));
+        }
+        call(1, "CG", args)
+    };
+    let merge = |upper: &[u8], lower: &[u8]| {
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(upper.to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(lower.to_vec())),
+                arg(&table, "CGACT", "MERGE", Value::Int(1)),
+            ],
+        )
+    };
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        cg(b"L", b"base", true),
+        cg(b"U1", b"top1", false),
+        cg(b"U2", b"top2", false),
+        merge(b"U1", b"L"),
+        merge(b"U2", b"L"),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let make_store = || {
+        store(&[
+            (b"base.png", png_bytes_for(4, 4, Rgba([40, 120, 200, 255]))),
+            (b"top1.png", png_bytes_for(4, 4, Rgba([220, 30, 20, 160]))),
+            (b"top2.png", png_bytes_for(4, 4, Rgba([20, 230, 60, 90]))),
+        ])
+    };
+    let Some(mut gpu) = renderer_or_skip(make_store()) else {
+        return;
+    };
+    let gpu_out = gpu.render_frame(&frame).expect("gpu render");
+    let soft_out = SoftRenderer::new(make_store()).render_frame(&frame);
+    let mut max_diff = 0u8;
+    for (gpu_px, soft_px) in gpu_out
+        .surface
+        .rgba
+        .chunks_exact(4)
+        .zip(soft_out.surface.rgba.chunks_exact(4))
+    {
+        let d = (0..4)
+            .map(|i| gpu_px[i].abs_diff(soft_px[i]))
+            .max()
+            .unwrap();
+        max_diff = max_diff.max(d);
+    }
+    assert_eq!(max_diff, 0, "GPU MERGE 必须与 soft 逐字节一致");
+    assert_eq!(
+        gpu_out.report, soft_out.report,
+        "双后端 RenderReport 必须逐字段一致"
+    );
+    assert!(
+        gpu_out.stats.layer_composites >= 1,
+        "应走 GPU 合成目标(实际 {})",
+        gpu_out.stats.layer_composites
     );
 }
 
@@ -1399,6 +1579,95 @@ fn text_on_snapshot_layer_matches_soft() {
 /// 官方 `FUN_004405a4` 把上层**表面**用通配绘制原语
 /// `DAT_00801458(surface, …, X, Y, ratio, 0)` 画到目标表面 —— 是 D3D9 的
 /// 一次带纹理 quad,不是逐像素循环。`es_SPExec.yst:341` 的
+/// `CGACT[ID=UP ID2=<快照层> MERGE=1]` 的 GPU 整数合成必须与 soft **逐字节**一致。
+///
+/// 半透明上下层(160/128)覆盖完整公式;断言 `layer_composites≥1` 证明走的是
+/// 「blit 快照 → 临时槽 → 整数 shader 写回快照」的 GPU 路径。
+#[test]
+fn merge_on_snapshot_gpu_is_bit_exact() {
+    let table = table();
+    let mut gfx = state(Viewport::new(16, 16), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"low".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"DST".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"UP".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"up".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"UP".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"DST".to_vec())),
+                arg(&table, "CGACT", "MERGE", Value::Int(1)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let make_store = || {
+        store(&[
+            (b"low.png", png_bytes_for(16, 16, Rgba([0, 255, 0, 128]))),
+            (b"up.png", png_bytes_for(16, 16, Rgba([200, 40, 60, 160]))),
+        ])
+    };
+    let Some(mut gpu) = renderer_or_skip(make_store()) else {
+        return;
+    };
+    let gpu_out = gpu.render_frame(&frame).expect("gpu render");
+    let soft_out = SoftRenderer::new(make_store()).render_frame(&frame);
+    let mut max_diff = 0u8;
+    for (gpu_px, soft_px) in gpu_out
+        .surface
+        .rgba
+        .chunks_exact(4)
+        .zip(soft_out.surface.rgba.chunks_exact(4))
+    {
+        let d = (0..4)
+            .map(|i| gpu_px[i].abs_diff(soft_px[i]))
+            .max()
+            .unwrap();
+        max_diff = max_diff.max(d);
+    }
+    assert_eq!(max_diff, 0, "快照目标上的 GPU MERGE 必须与 soft 逐字节一致");
+    assert_eq!(gpu_out.report, soft_out.report, "RenderReport 必须逐字段一致");
+    assert!(
+        gpu_out.stats.layer_composites >= 1,
+        "应走 GPU 合成目标(实际 {})",
+        gpu_out.stats.layer_composites
+    );
+}
+
 /// `CGACT[ID="sp.tmpB" ID2=<快照层> MERGE=1 X=@MGX Y=@MGY]` 每帧一条,
 /// 走 CPU 会让 render 出现 30ms 级尖峰(实测 p95 39.6→11.1ms)。
 ///
@@ -1581,4 +1850,123 @@ fn size_after_copy_in_same_frame_keeps_snapshot_dims() {
     );
     let soft_px = pixel_of_surface(&soft_out.surface, 8, 8);
     assert_close(actual, soft_px, 2, "size_after_copy");
+}
+
+/// `es_SPExec.yst` 的立绘换差分形态:
+/// `COPY(快照) → RECTPAINT3 SET=0(清成透明) → MERGE(把上层 sp.tmpB 叠上去)`。
+///
+/// 回归证据(2026-10-28):GPU 快照 MERGE 把**已被 `RECTPAINT3` 清空**的表面
+/// 当「下层」,而 `MERGE` 只写 RGB、保留目标 alpha(`merge.wgsl` 的
+/// `out.a = lower.a`)⇒ 结果为 alpha 全 0。`SPLBUF` 层以该快照为源时整层在
+/// `SRCALPHA` 混合里被抹掉,立绘在眨眼/换差分的过渡帧消失 8 帧
+/// (`dir1-real` 实测 engine f=2651..2658、2894..2900)。
+///
+/// CPU 参考路径的「下层」是 COPY 时刻冻结的像素(`snapshot_pixels`),所以
+/// 这种「同帧先改写表面」的形态必须回退 CPU:GPU 用当前(已清空)纹理替换
+/// 不了它。
+///
+/// **基准是回归前的 wgpu 行为**(`dfa7b0b`/HEAD),不是 soft:`MERGE` 保留
+/// 下层 alpha 时,soft 的快照下层就是被清空的那张表面 ⇒ alpha=0 ⇒ 该像素
+/// 纯黑,soft 在这个形态下本来就丢图层(既有分歧,
+/// `DIV-GFX-063` §2.4「MERGE/MERGE2 的 alpha 公式缺 REA 级验证」)。
+/// 本测试只守本次回归:快照必须以 COPY 时刻像素为基面合成,结果可见。
+#[test]
+fn merge_after_rectpaint_clear_on_snapshot_keeps_pixels() {
+    let table = table();
+    let mut gfx = state(Viewport::new(16, 16), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        // 下层源层:LOW(取其像素做快照)。
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"low".to_vec())),
+            ],
+        ),
+        // COPY2:LOW → DST 快照。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"DST".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+            ],
+        ),
+        // 同帧:DST 表面被 RECTPAINT3 SET=0 清成 (0,0,0,0)。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"DST".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0)),
+            ],
+        ),
+        // 上层:不透明红。
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"UP".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"up".to_vec())),
+            ],
+        ),
+        // MERGE:UP 叠到 DST。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"UP".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"DST".to_vec())),
+                arg(&table, "CGACT", "MERGE", Value::Int(1)),
+            ],
+        ),
+        // 只留快照层可见:上下层都隐藏,屏幕像素只能来自 DST 的表面。
+        // (否则 UP 自己就画成红,断言对「快照被清成空」不敏感。)
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"UP".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let entries: &[(&[u8], Vec<u8>)] = &[
+        (b"low.png", png_bytes_for(16, 16, Rgba([0, 255, 0, 200]))),
+        (b"up.png", png_bytes_for(16, 16, Rgba([255, 0, 0, 255]))),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(entries)) else {
+        return;
+    };
+    let gpu_out = gpu.render_frame(&frame).expect("render");
+    let mut soft = SoftRenderer::new(store(entries));
+    let soft_out = soft.render_frame(&frame);
+
+    assert_eq!(gpu_out.report.ops_total, soft_out.report.ops_total);
+    assert_eq!(gpu_out.report.ops_drawn, soft_out.report.ops_drawn);
+    assert_eq!(gpu_out.report.skipped, soft_out.report.skipped);
+
+    // 屏幕呈现会 force_opaque,alpha 不可直接断言。真正的缺陷形态是
+    // 「快照 alpha 被留成 0 ⇒ 整层在 SRCALPHA 混合里不可见 ⇒ 该像素是纯黑」;
+    // 正确形态是上层红经快照 alpha(取自 COPY 时刻像素 200)混到黑底上,
+    // 即 `(255,0,0) * 200/255 ≈ 200`——与回归前的 wgpu 输出逐位一致。
+    let actual = pixel(&gpu_out, 8, 8);
+    assert!(
+        actual[0] >= 190 && actual[0] <= 210 && actual[1] <= 5 && actual[2] <= 5,
+        "RECTPAINT3 清空后的 MERGE 必须以 COPY 时刻像素为基面(非黑),得到 {actual:?}"
+    );
 }

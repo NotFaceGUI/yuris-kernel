@@ -64,6 +64,10 @@ use crate::value::{Value, VarRef, VarSpace};
 pub struct RawInstr {
     pub offset: usize,
     pub op: u8,
+    /// 指令载荷(窗口里 `[op][len:u16][payload]` 的 payload 段)。
+    ///
+    /// 实测 `SmallVec<[u8; 16]>` 内联版本反而更慢(IF 233→256ns):求值循环
+    /// 里 `SmallVec` 的访问分支比一次指针追堆更贵,故保持 `Vec`。
     pub payload: Vec<u8>,
 }
 
@@ -72,6 +76,36 @@ pub struct RawInstr {
 pub enum Slot {
     Val(Value),
     Ref(VarRef),
+}
+
+/// GOSUB/RETURN 参数槽的目标类型(由工程 ysc 参数名决定)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamTy {
+    Int,
+    Float,
+    Str,
+    /// 未识别前缀:原样传递(与 `coerce_param` 的 else 分支一致)。
+    Raw,
+}
+
+impl ParamTy {
+    /// 与 `handlers::coerce_param` 同口径的转换。
+    pub fn coerce(self, v: Value) -> Value {
+        match self {
+            // silent-ok:与旧 `coerce_param` 同口径(非数值按 0)
+            ParamTy::Int => Value::Int(
+                v.as_int()
+                    .unwrap_or_else(|| v.as_f64().unwrap_or(0.0) as i64), // silent-ok:非数值按 0
+            ),
+            // silent-ok:同口径
+            ParamTy::Float => Value::Float(v.as_f64().unwrap_or(0.0)),
+            ParamTy::Str => match v {
+                Value::Str(_) => v,
+                other => Value::Str(other.to_event_repr().into_bytes()),
+            },
+            ParamTy::Raw => v,
+        }
+    }
 }
 
 /// 左值:变量 + 下标表(空 = 标量)。

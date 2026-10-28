@@ -8897,3 +8897,726 @@ cargo test -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu => 215 passed / 0 fai
 | 4 | 普通层 `MERGE`/`TRANSITION` 上 GPU(`Override::Pass` 离屏目标) | 每帧约 2.15ms + 1.2ms 的 CPU 合成 | `docs/architecture/backends.md` 账本 |
 | 5 | 「有的字不显示空白」 | 缺具体时间点/台词,无法复现 | 用户报告 |
 | 6 | 40 格 oracle(`transition_alpha_matches_official_grid`)解锁 | `#[ignore]`,等第 1 项 | `crates/yu-render/soft/tests/transition_alpha.rs` |
+
+## 成果 SAVE-THUMB (2026-10-27) · 存档缩略图两端打通 + 读档"卡死"根因(参数 `-=` 被当 `+=`)
+
+### 0. 症状与结论
+
+- 症状 A(主人报告):点击读档、确认「はい」后**画面永远停在读档界面**,
+  逻辑帧仍在推进(宿主诊断 `画面像素连续 N 帧相同(逻辑帧仍在推进)`)。
+- 症状 B(主人报告):存档**没有缩略图**。
+- 结论:
+  - A 的根因不在存读档脚本链路 —— 点「はい」后 `ES.LOADCONF.BTN.YES.ON` →
+    `es.CGTSS.2` → `es.S.RETURN` → `es.SS.RETURN` → `es.Load` →
+    `es.S.RETURN.LBL` 全部执行,存档也被 LOAD。真正卡住画面的是
+    `CG[ID=CGS999 A-=8]` 的**复合赋值算子被当成加法**:全屏截图幕布
+    alpha 从 256 加到 512(越界不 clamp),永不淡出,盖住已恢复的游戏画面。
+  - B 是 H-P4-02 的两个 `Unimplemented`(`SAVE[ID]`/`LOAD[ID]`),本轮按官方
+    DNO3 块格式实现,存档写入 100×75 真实画面、读档界面正常显示。
+
+### 1. 取证(真值层级 2/3)
+
+```text
+# 参数算子 = 窗口 slot 高字节:1 = += , 2 = -=
+$ cargo run -p yu-rt --example dump_pc_cmds -- 19 0 4000 | grep 'L623'
+pc368 L623 CG  ID(len6)=v($#2176) | A~2(len4)=i8        # es_SaveLoad.yst:623 A-=8
+$ cargo run -p yu-rt --example dump_pc_cmds -- 66 0 20000 | grep 'X~1'
+pc5659 L8173 CG ID(len6)=v($#4115) | X~1(len29)=...      # es_Sprite.yst:8173 X+=(…)
+
+# DNO3 图像块(官方 0.495 save00001.sd,btype 1)
+ulen=31608 = [u32 1600][u32 30000][A 1600B][B 30000B]
+A+0x78 = 100, A+0x7c = 75; B = 100×75 RGBA
+# 0.479 save30001.sd:A=1536、B=4,w/h 在 +0x68/+0x6c ⇒ 读取端按 lenB==w*h*4 自证
+```
+
+### 2. 修法
+
+1. **`yu-rt`**:新增 `compose_window_arg(comp, value)`(`comp==2` 先取负,
+   `offset = comp != 0`),`eval_arg_windows` 统一走它。
+   单测 `window_ops_tests::plus_and_minus_operators_are_distinct`。
+2. **缩略图两端**:
+   - `yu-save::image_block`(DNO3 编解码)+ `SaveHost::reserve_image/load_image`;
+   - `GraphicsHost::capture_layer/restore_layer`;
+   - `yu-engine::capture::GfxCapture`:离屏软渲 + `observe`(出现新 COPY 的帧
+     与主渲染器同刻冻结快照;`SAVE[ID]` 回放当前帧取目标层快照并按图层声明
+     尺寸重采样;`LOAD[ID]` 写 PNG 进 `SharedMem` 合成资产叠层 + `set_layer_asset`)。
+3. **沿途三条渲染语义修正**:
+   - COPY 目标表面尺寸 = 源/区域尺寸,不看目标层显示尺寸(soft + wgpu)。
+     否则窗口截图被裁成左上角 100×75(全黑)。
+   - soft `MERGE/MERGE2` 先于区域解析(`X/Y` 是绘制偏移;原来
+     `MERGE2 X=0 Y=0` 被判 `region.partial` 跳过,缩略图合不进存档盘)。
+   - VM `resolve_asset_size` 候选序与渲染器一致(已带扩展名先按原样)。
+
+### 3. 验证(原始结果)
+
+```text
+# 幕布 alpha 随帧衰减(soft,点击 はい 在 700)
+YU_SAMPLE_STEP=20 probe_layers <project> 700 1150 CGS999 --click …
+engine 702: A=256 / 722: A=112 / 742..1150: A=0
+
+# 读档后画面回到游戏
+probe_flow <project> 1150 "300,217,281;440,100,590;540,180,130;700,350,303"
+end-state: frame=1152 layers=607 visible=324 loadconf=0 ops=121
+截图 target/tmp/e2e/fixed-soft.png  => 对白「近づけてみました。」(游戏画面)
+
+# 桌面宿主(wgpu + winit)同一输入
+yu-cli run <project> --mode desktop --backend wgpu --frames 1150 \
+  --script load-confirm.json --shot fixed-desktop.png
+stuck="推进正常";截图 => 游戏画面(对白「遠ざけてみました。」)
+
+# 存档缩略图
+save00001.sd DNO3: btype=1 ulen=31608 w=100 h=75 非零字节 24956
+读档界面截图:三块缩略图为真实游戏画面(headless soft / headless wgpu /
+桌面 wgpu 一致)
+
+# 测试
+cargo test -p yu-save                     => 14 passed(含官方 save00001 DNO3→100×75)
+cargo test -p yu-rt --test fixture        => 98 passed
+cargo test -p yu-rt --lib window_ops      => 1 passed
+cargo test -p yu-backend-soft / -p yu-gfx => 37 / 17 等全过
+cargo build --workspace --all-targets     => 通过
+```
+
+### 4. 未闭环 / 说明
+
+- `yu-trace::golden::synthetic_trace_matches_golden` 仍红:合成
+  `YSCom.ycd` 的 sha256 与 golden 不一致(HEAD 上即如此,与本轮改动无关;
+  复核时未改 golden)。
+- `cases/save-load-loop` 仅 `save_state_sha256` 变化(存档里多了 DNO3 缩略图,
+  预期变化);`ops_total=122 / skipped=0` 不变。其余用例的 png/display 哈希
+  受并行会话渲染改动影响,基线待统一重生成(本轮未动 golden)。
+- `SAVEINFO` 仍 `Unimplemented`:手册无页、REA 处理体未取证、语料 0 次,
+  按"无证据不猜"保留过渡态。
+
+台账:`crates/yu-rt/docs/divergences/README.md` §DIV-RT-058(参数算子)、
+§DIV-RT-059(SAVE[ID]/LOAD[ID] 图像块)。
+
+## 成果 PERF-SPIKE (2026-10-27) · 双游戏实测尖峰归因:内容指纹/整图 clone/抓帧器整帧回放
+
+**症状(用户)**:两款游戏都要抓渲染尖峰做优化;kotoneiro 有整段 30fps/10fps,
+eris 场景切换有 200ms 级停顿。
+
+**取样(人工推进,非脚本)**:`yu-cli run … --mode desktop --frame-stats CSV
+--spike-log PATH --spike-ms 20`。`--spike-log` 是本轮新增的长帧自动取证:
+阶段耗时 + 本帧逐命令增量(`take_command_hit_deltas`,零字符串分配) +
+脚本落点 + pass/op 构成 + 目标层 op 排行。渲染子阶段改由 `RenderPhases`
+走 CSV(与参与对账的 `RenderReport` 分离),**不再依赖 `YU_LOG=trace`**
+(那会把 wgpu 自身每帧数百行 trace 灌进日志,20s 37MB 并拖慢帧)。
+
+**根因(实测归因,按收益)**:
+
+1. `content_hash_rgba` 是逐字节 FNV-1a(串行乘法 ≈3 cycles/byte),且在
+   **每条图像加工 op 后**对整张结果图算一次 ⇒ `MERGE` 单条 2.7ms 里一半以上
+   是指纹;
+2. 每次 COPY 的镜像捕获与每次资产解析都**整图 clone**(重帧 64 COPY +
+   27 加工 ⇒ 数百 MB/帧)⇒ `snap_ms=33ms` 主体;
+3. `blit` 逐像素 `Option` 调用;
+4. `SAVE` 抓帧器在出现新 CopyId 时**整帧软后端回放**;kotoneiro 精灵/按钮
+   场景每帧换 CopyId ⇒ 每帧 100–375ms(`capture_ms` 单独计时后才可见);
+5. VM 解释器 0.21µs/命令(未改,另线)。
+
+**改动**:哈希改 8 字节字混合+splitmix64;`TextureStore`/快照镜像改存
+`Rc<Texture>` + `resolve_shared`;新增 `blit_rgba` 行级 memcpy;
+`apply_merge` 行切片 + 跳过 `au=0` 像素(恒等变换);抓帧器改为渲染后取
+主渲染器镜像,缺失才回放(另试过给 `:/W0/` 主组复制补后缓冲镜像,会改变
+`SAVE[ID]` 的命令时刻语义且无 headless 覆盖 ⇒ **已回退**,见报告 §5.4)。
+
+**验证命令与结果**:
+
+```text
+kotoneiro 基线(1357 帧/36.7s,三项渲染修复前):
+  interval avg=26.800 p50=16.695 p95=100.053 p99=216.402 max=733.711
+  render avg=8.159 p95=83.044   snap avg=0.259 max=37.465
+  image_composite avg=5.501 p95=77.909 max=144.276
+kotoneiro 修复后(5930 帧/108.5s):
+  interval avg=18.236 p50=16.660 p95=17.093 p99=66.639
+  render avg=2.294 p95=2.268    snap avg=0.084 max=20.473
+  image_composite avg=0.361 p95=0.000 p99=21.554 max=73.181
+  capture>20ms 仅 6 帧(修复前每帧 100–375ms)
+project-eris 基线(4804 帧/84.9s):
+  interval p50=16.667 p95=17.126; tick max=128.707; 宿主未计入 max=217.302
+project-eris 修复后(2958 帧/56.1s):
+  render avg 2.055→1.759ms; capture>20ms 5 帧(peak 199.2ms)
+  p95=33.397 属流程差异(本轮多开菜单);稳态 p50=16.672
+中间态证据(run4):459 个重帧全部 memo=chains:0
+  ⇒ ES 精灵合成链从未进入记忆化判定(快照基图/链含非 paint 动作)
+
+cargo test -p yu-render-core -p yu-backend-soft -p yu-backend-wgpu -p yu-engine
+  => 37/15/9/21/9/6 全 passed(含 soft↔wgpu 逐计数对拍)
+yu-cli case <project-eris> --all
+  => 1 passed / 8 failed:全部是 display_json/ops 差异,来自并行会话在改的
+     VM `A-=` 语义;golden 待那边落定后统一重生成(本轮未动 golden)
+```
+
+**未闭环 / 下一步**:合成链记忆化对快照基图无效(需镜像代际进签名或前缀
+缓存);CPU MERGE 已到内存带宽级,再降只能 alpha bbox 裁剪或 GPU 合成
+(`MERGE2` 的 `/ao` 除法 GPU 固定混合无法逐位复刻,属研究项);抓帧器残余
+回放(非主组源/镜像被 GPU 加工失效)。
+
+报告:`docs/perf-spike-report-2026-10-27.md`。证据产物在
+`target/tmp/perf/{kotoneiro,eris}/`(不入库)。
+
+## 成果 PERF-FADE (2026-10-27) · 角色出场卡顿拆分、MERGE 整数化与日志异步化
+
+**症状(用户)**:「角色一出来就卡顿」「开日志会发现更卡」;要求用 `--debug-ui`
+看尖峰图。
+
+**取证**(`--debug-ui` + `--frame-stats` + `--spike-log 20`,kotoneiro,
+7379 帧/130.3s)。角色出场那一帧拆成三块:
+
+```text
+host=2914 work=320.8ms = tick 263.4 + render 55.5 + draw 0.8
+  render: decode 31.0ms(35.7MB) / image 38.9ms(其中 MERGE 16.3ms)
+  uploads 39.7MB
+```
+
+1. 脚本突发 263ms = `LET 112960 + LOOPEND 25385 + IF 19753`(0.21µs/条);
+2. 资产解码 31ms / 35.7MB(`TextureStore::load`,新增 `decode_us` 记账,
+   它是 `image`/`rest` 的子集);
+3. CPU 整面合成/混合 16–82ms/帧(淡入期间每帧)。
+
+**改动**:
+
+- **MERGE 整数化**(`yu-render/soft/src/imagefilters.rs`):
+  `round(cl*(1-a/255)+cu*(a/255)) = (cl*(255-a)+cu*a+127)/255`。
+  证明:`num/255` 距半整数 ≥1/510,f64 误差 1e-13 量级,不会跨舍入边界。
+  实测同形态帧 `merge:2`:55.8 → **7.8ms**。`MERGE2` 的 `/ao` 可能精确落在
+  .5,**保留 f64 原式**。
+- **跨度跳过**:`blend_transition` 按行求非零跨度(输出是新零面,双零源
+  结果必零);`apply_merge` 整行 alpha 全 0 直接跳过。
+- **日志异步**:JSONL 改后台线程 + 256KB `BufWriter` + 65536 行有界队列
+  (满则丢行计数,退出前落一行);stderr 改 64KB 块缓冲、仅 WARN+ 立即刷;
+  退出/panic 同步点:桌面 `App::finish` → `ConsoleHandle::flush()`、
+  `main` 兜底 `log::logger().flush()`。修了首版异步写者「队列空当关闭」
+  的 bug(run6 日志只剩 1 行),`yu-log` 单测改为先 `flush()` 再读。
+- 诊断字段:`RenderPhases` 增 `decode_us/decode_bytes`、
+  `image_transition_ops/image_bitwise_ops`;CSV/spike 行同步。
+
+**验证**:
+
+```text
+cargo test -p yu-log -p yu-backend-soft -p yu-backend-wgpu -p yu-render-core -p yu-engine
+  => 29/39/15/9/21/9/6 全 passed
+  新增逐位对拍:merge_span_optimization_is_bit_exact(64 组随机+整行透明)
+                blend_transition_span_optimization_is_bit_exact(64 组随机+窄源)
+kotoneiro 复测(7379 帧/130.3s,--debug-ui 常开):
+  interval avg=17.616 p50=16.633 p95=17.092 p99=33.664
+  render avg=1.627 p95=1.628 p99=19.662
+  image_composite avg=0.385 p95=0.000 p99=16.938 max=81.476(>5ms 帧 2.6%)
+  decode avg=0.038 max=34.649(单帧峰值 71.4MB)
+  日志 12391 行,退出摘要完整
+对照(MERGE=f64,1649 帧):interval p95=66.377,image_composite avg=5.605 max=57.990
+```
+
+**未闭环**:角色出场的 263ms 脚本突发(VM 吞吐线,与并行会话 `A-=` 同域);
+全屏 CG 过渡仍是 CPU 全图混合(≈24ms/条,跨度跳过无效,需 GPU 双纹理
+shader);首次解码 31ms 可做预取/后台解码(需脚本层「即将使用」信号)。
+
+报告 `docs/perf-spike-report-2026-10-27.md` §7。
+
+## 成果 PERF-GPU-TRANS (2026-10-27) · `CGACT[TRANSITION]` 上 GPU(整数 lerp 逐位对拍)+ CPU/GPU 分工审查
+
+**症状(用户)**:角色场景 `render spike 43.9ms`,面板上周期性黄/红尖峰;
+「合成用到了 CPU…重点是 cpu 可以 cpu,但 gpu 就是 gpu」。
+
+**审查结论**(802 层/619 可见/99 pass,角色场景每帧):
+
+```text
+图层 draw / SIZE 采样        已是 GPU
+MERGE 到快照目标             已是 GPU(paint pass)
+CGACT[TRANSITION] 双源 lerp  CPU,40–60ms/帧  ← 本轮迁走
+MERGE/MERGE2 到普通层        CPU,8–60ms/帧   ← 下一步
+合成结果上传                  36–75MB/帧      ← 随合成迁走消失
+资产解码 / 脚本               CPU(本职),31ms/一次性 + 263ms/一次性
+```
+
+**改动**:
+
+- `shaders/lerp.wgsl` + `pipelines.rs`:双纹理整数 lerp(`(from*(256-f)+to*f)>>8`),
+  `textureLoad` 同坐标取 texel;`LayerId` 级离屏目标(`TargetSet.composites`)。
+- `try_gpu_transition`:两源均为稳定 GPU 纹理、目标层无 CPU 消费者、非快照
+  目标 ⇒ GPU 合成 pass(`DrawKind::Lerp`);否则显式回退 CPU
+  (`YU_TRANSITION_DEBUG=1` 打印原因)。
+- `Override::Gpu` + `plan_layer` 直接画合成纹理、COPY 可直接取它(不再上传)。
+
+**验证**:
+
+```text
+cargo test -p yu-backend-wgpu --test wgpu cgact_transition
+  => ok(GPU 路径断言 layer_composites≥1;f=0/128/256 与 soft 逐字节一致)
+cargo test -p yu-render-core -p yu-backend-soft -p yu-backend-wgpu -p yu-engine
+  => 39/15/9/22/9 全 passed
+kotoneiro 复测(3034 帧/58s,--debug-ui):
+  interval p50=16.651 p95=17.221;render p95=2.095
+  image_composite >5ms 的帧 72/3034,全部是 merge:2(21–44ms)
+  剩余回退:4 条(2× from CPU-only、2× to CPU-only)
+  诊断无新增合成/lerp 缺失码(gfx.layer.already_absent 10987 条被异步日志吸收)
+```
+
+**未闭环**:`MERGE/MERGE2` 到普通层仍 CPU(需 ping-pong 离屏 + 整数 shader;
+`MERGE2` 的 `/ao` 精确 .5 情况下 f64 round 方向不定,需单独定标);
+SAVE 抓帧器仍有 430–455ms 单帧回放;解码/脚本属 CPU 本职(预取 + 解释器吞吐)。
+
+报告 `docs/perf-spike-report-2026-10-27.md` §8。
+
+## 成果 SND-CP932 (2026-10-27) · 日文文件名双字节被逐字节折小写导致声音资产查不到,同类字节扫描收口三处
+
+**症状(用户)**:`kotoneiro` 片头出现
+`WARN [sound] snd.file.missing @ snd@frame240 pc0: SOUND 文件未找到: voice/\x83R\x83g\x83l\x83C\x83\x8d`。
+
+**取证(先证伪"封包/查询不通用")**:
+
+```text
+YpfSource::open(kotoneiro/data.ypf, Cp932)
+  version=494 entries=12212 closed=true hash=12212/12212 key=0xff
+  voice\コトネイロ.ogg  type=6(ogg) stored 54226B offset=0x958a0
+LookupKey::new(b"voice/コトネイロ.ogg", Cp932) → exists()==true
+```
+
+**复现(修复前)**:`yu-sound` + 真实包,loader 依次收到
+`voice/\x83r\x83g\x83l\x83c\x83\x8d`、`…ogg`、`…wav`,全部未命中 →
+`snd.file.missing`(诊断文本与用户日志逐字节一致)。
+
+**根因**:`yu-sound::normalize_name` 逐字节折 ASCII 小写,没有按 CP932 字符
+推进。双字节字符的尾字节可以落在 `0x41..=0x5A`:`コ`=`83 52`、`イ`=`83 43`,
+被折成 `83 72`/`83 63`(`コトネイロ` → `ビトネツロ`),包里存在的资产永远查
+不到。官方处理体不逐字节改写(该文件在包内且官方可装载即为证)。
+
+**同类审查(逐字节扫 CP932 串,不含 examples/tests)**:
+
+| 位置 | 结论 |
+|---|---|
+| `yu-sound/state.rs normalize_name` | **真缺陷**(本轮复现)→ 按字符跳步 |
+| `yu-sound/state.rs probe_names` 整串 `to_ascii_lowercase` | 同型写法 → 改为尾部 ASCII 后缀比较 |
+| `yu-render/core/texture.rs has_extension` | **真缺陷**:`rsplit(0x5C)` 把 `ソ`(`83 5C`)当分隔符,`cg/ソ.png` 被判"无扩展名",原 key 不参与候选 → `asset.missing` |
+| `yu-render/core/texture.rs known_extension_format` | 整串折小写(只用于尾部比较,未致命)→ 改为尾部比较 |
+| `yu-rt/vm/handlers.rs has_image_extension` | **真缺陷**(与渲染器同判、同一 `rsplit`)→ 按 `cp932_text::char_len_at` 跳步 |
+| `yu-vfs/key.rs normalize_component` | 安全(多字节整对跳过;单测已覆盖 0x5C 尾字节) |
+| `yu-gfx/path.rs` | 安全(只以 `/` 为分隔符,0x5C 按字符保留) |
+| `yu-rt ascii_case/fullwidth_case` | 安全(2026-10-24 已按字符跳步,同类事故前案) |
+| `yu-sound/decode.rs` | 安全(按魔数判容器,不看扩展名) |
+| `yu-font/source.rs normalize_name` | 不同域(`&str` 字体族名归一,非 CP932 字节) |
+| CLI/日志/HTTP/GPU 名的大小写折叠 | 不同域(纯 ASCII 配置/协议串) |
+| `yu-vfs/dir.rs` | 安全(非 ASCII 组件经码表 encode 回字节键,已有 GBK 尾字节单测) |
+
+**改动**:
+
+- `yu-sound/state.rs`:`normalize_name` 按 `yu_rt::cp932_text::char_len_at`
+  跳步(双字节原样拷贝,只有单字节做 `\`→`/` 与 A–Z 折小写);新增
+  `ends_with_ascii_ci`,`probe_names` 不再整串折小写。
+- `yu-render/core/texture.rs`:新增 `last_component(key, codec)`(按 `Codec`
+  lead/trail 跳步)与 `ends_with_ascii_ci`;`has_extension`/`known_extension_format`
+  改用之。
+- `yu-rt/vm/handlers.rs`:`has_image_extension` 改按字符跳步取最后组件。
+- 单测:`yu-sound/tests/state.rs` 新增 CP932 归一/端到端解析 2 例并扩充探测序
+  断言;`texture.rs` 新增尾字节分隔符 + 精确 key 解析 2 例;`handlers.rs` 新增
+  `image_extension_tests` 2 例。
+
+**验证**:
+
+```text
+cargo test -p yu-rt -p yu-sound -p yu-render-core --lib
+  => yu-render-core 8/8, yu-rt 85/85, yu-sound(lib) 1/1 全 passed
+cargo test -p yu-sound
+  => 集成 39/39 passed(含新增 cp932_file_name_resolves_through_probe_order)
+端到端(真实 kotoneiro/data.ypf,修复后同一探针):
+  loader.query raw="voice/コトネイロ" → 未命中(无扩展名)
+  loader.query raw="voice/コトネイロ.ogg" → 命中
+  state=Playing file_type=Ogg total=1842  diags=0
+```
+
+**未闭环**:`docs/sound-ledger.md` §1.1 已补勘误(官方小写按字符而非逐字节);
+当前工作区 `yu-render/wgpu` 在改(签名不匹配),整仓 `--workspace` 构建待其
+收口;本轮只跑受影响 crate 的 lib/集成测试。
+
+**收尾复审(2026-10-27)**:
+
+- **诊断可定位性**:`snd.file.missing` 现在附带“已尝试的候选名”(归一化后
+  真正的查找键)。修复前日志只打印原始参数 —— `名字被改写` 与 `文件不存在`
+  在日志里完全同形,这是本缺陷难排查的直接原因。样例:
+  `SOUND 文件未找到: VOICE/\x83R…（已尝试: voice/\x83R…_nope, …_nope.ogg, …_nope.wav）`。
+- **回归护栏**:三处修复各加全 lead 扫描用例(lead `0x81..=0x9F` /
+  `0xE0..=0xFC` × 尾字节 `0x41..=0x5A`,以及尾字节 `0x5C`);任何回到
+  逐字节处理的做法都会在这些用例上成片失败。
+- **复审范围扩大**:`yu-platform/*`、`yu-emote`、`yu-gfx/path.rs`、
+  `yu-vfs/dir.rs` 均无新增同类点(`yu-emote` 的大小写只作用于贴图格式串
+  `&str`,不碰 CP932 资源名)。
+- **复跑**(语料环境变量按 AGENTS §2):
+  `cargo test -p yu-sound -p yu-rt -p yu-render-core -p yu-vfs -p yu-backend-soft`
+  => 18 个测试套件全 passed(39/15/2+1 ignored/9/86/4/11/4/98/3/1/41/42/14/2/5/1)。
+
+## 成果 PERF-GPU-MERGE (2026-10-27) · `CGACT[MERGE]` 上 GPU(普通层 ping-pong + 快照目标原地写回)
+
+**取证**:角色场景 939 帧含 MERGE,重帧 `render 19.9ms` = 2 条 MERGE
+(`comp≈17ms`);加日志后在 1884 次回退里**全部是 `target is snapshot`**
+—— 立绘缓冲层持快照纹理,而 GPU 合成此前只对普通层开(且只做了过渡)。
+
+**改动**:
+
+- `shaders/merge.wgsl`:整数式 `out.rgb=(lower*(255-a)+upper*a+127)/255`、
+  `out.a=lower.a`,与 soft `apply_merge(…,false)` 逐位一致;`MERGE2` 的
+  `/ao` 在精确 .5 处 f64 round 方向不定,**保留 CPU**。
+- 普通层:两槽 ping-pong 离屏(`composites[(layer, slot)]`),读上槽写下槽。
+- **快照目标**(官方语义 = 原地写快照表面):先按 `CopyId` 在**执行期**把
+  快照 blit 到临时槽(COPY 命令先执行),再用整数 shader 写回快照纹理;
+  CPU 镜像随之失效。新增 `PlannedTarget::Snapshot` / `BlitCmd`。
+- 消费者预扫描把后续 MERGE 也算 GPU 友好(链式继续走 GPU)。
+
+**验证**:
+
+```text
+cargo test -p yu-backend-wgpu --test wgpu cgact_merge_gpu_matches_soft_exactly
+  => ok(普通层链式 2 条 MERGE,逐字节 + layer_composites≥1)
+cargo test -p yu-backend-wgpu --test wgpu merge_on_snapshot_gpu_is_bit_exact
+  => ok(快照目标、半透明上下层,逐字节)
+cargo test -p yu-render-core -p yu-backend-soft -p yu-backend-wgpu -p yu-engine
+  => 39/15/9/24/9 全 passed
+kotoneiro 复测(2801 帧):939 帧含 MERGE,仅 72 帧仍有 >5ms CPU 合成
+  (回退原因 upper is CPU-only);render p95 13.6ms
+```
+
+**新发现(下一刀)**:差分切换的剩余尖峰是 **SAVE 抓帧器整帧软后端回放**:
+`work≈415–459ms = tick 44–69 + render 8–97 + capture 307–362`;
+`capture>100ms` 9 次/2801 帧。GPU MERGE 让快照镜像失效,增加了「镜像缺失
+→ 回放」的概率(run13 2 次 → run16 9 次)。两条候选:软后端只回放 Texture
+pass(跳过 619 层屏幕绘制)或 SAVE 时刻按需回读 GPU 快照(1–5ms)。
+
+报告 `docs/perf-spike-report-2026-10-27.md` §9。
+
+## 成果 PERF-OOM-FIX (2026-10-27) · GPU 合成目标剪枝,修 wgpu Out of Memory
+
+**现象(用户)**:角色出场后 `PANIC phase=tick frame=1679 msg=wgpu error:
+Out of Memory`(wgpu 默认错误即致命)。
+
+**根因**:`TargetSet.composites`(本轮 GPU 过渡/MERGE 的离屏目标,键 =
+`(LayerId, 槽位)`)每张整尺寸纹理**只增不删**;差分/切场景不断产生新
+LayerId ⇒ 显存耗尽。组离屏 `offscreen` 同样是存量泄漏。
+
+**修复**:`prune_composites`(图层本帧存活 + 32 张硬上限)、
+`prune_offscreen`(组 pass/图层引用存活集合),每帧规划开头执行;合成目标
+只服务当帧,剪掉后当帧重建。退出摘要新增
+`gpu targets composites/offscreen/snapshots/textures` 便于核对。
+
+**另**:`SOUND` 同步解码是当前最大单帧成本(逐命令 profile:6 次 BGM =
+235ms,占该帧 tick 95.8%;205 次 SE = 158ms),已加按文件名的 PCM 解码
+缓存(96MB 上限,`Arc<Pcm>`);首次装载仍需付解码。
+
+```text
+cargo test -p yu-render-core/-soft/-wgpu/-engine/-sound
+  => 39/15/9/24/9/41 全 passed;cargo build --workspace --all-targets 通过
+```
+
+**补充(run26 实测)**:15335 帧 / 263.2s / **avg 58.3fps**,显存目标峰值
+127MB 无 OOM;唯一中断是 `BLIT 源快照缺失`(该 COPY 本帧被跳过)——已改为
+blit/合成 pass 目标缺失时**跳过该合成**(不 fatal)。渲染侧稳态已成立,
+剩余尖峰为 SOUND 解码与脚本突发(见 §10 profile)。
+
+**根因(2026-10-27 收口)**:`wgpu: Out of Memory` 的真因是 **CPU 覆盖纹理
+每次内容变化都新建 GPU 纹理**,而 `TextureCache` 只增不删 ⇒ 立绘/差分场景
+每帧泄漏数 MB,46–63 秒耗尽显存(与三次崩溃点吻合)。新增
+`TextureCache::rewrite`(同尺寸 `queue.write_texture` 原地写回,id 不变),
+`plan_layer` / `image_source_texture` 两个上传点改为「复用/原地重写/新建」
+三态;上传失败按 op 跳过不 fatal。
+
+**干净长跑(run28,2026-10-27)**:12267 帧 / 217.6s / avg 56.4fps,正常关窗
+exit 0;**OOM/校验/fatal/panic 计数为 0**;`gpu targets` 全程 4–7MB;
+interval p95 17.12ms、render p95 2.08ms;`work>60ms` 仅 49/12267 帧(0.4%),
+全部是 tick 主导(SOUND 解码 + 场景脚本)。
+
+## 成果 CLOCK-WALL (2026-10-28) · 实时逻辑时钟去截断:动画时长回到墙钟,serve 不再丢 2 帧
+
+> 触发:主人实测片头淡出变短,追问「动画时间是固定的还是会被截断的」。
+
+### 1. 事实链(先取证,后改码)
+
+- **动画不是固定帧数**:淡出/补间由脚本按毫秒推进。`es.CGFADEEXEC`(s8 pc453-521)
+  pc460 `@8 = @_OS_TIME(1)` → pc471 `@< = @_OS_TIME(1) - @8` →
+  pc472 `@: = 256 * @< / @2` → pc502 `CG[ID=$1 A=@=]`,pc510 `WAIT[FRAME=1]`;
+  内核 `_OS_TIME(1) = now_ms - start_ms`(`crates/yu-rt/src/sysvar.rs:185`)。
+- **离屏固定步长实测**(kotoneiro,`probe_layers`):片头 `MAC.EV("サークル", PINT3=2500)`
+  的 logo 淡入 157 帧 × 16ms ≈ 2512ms(与脚本 2500ms 差 0.5%);标题幕布
+  `CGS100` 由同一 `es.CGFADEEXEC` 驱动,A 256→0 用 25 帧 = 400ms。**脚本时长
+  没有被引擎改短**。
+- **桌面实跑(debug 构建,140 帧)暴露真正的尖峰**:f78 `interval=1249.7ms /
+  tick=1216.4ms`(场景构建,纯 VM 泵);f85 `render=150.9ms`(其中 `snap=138.5ms`、
+  `decode=138.2ms`、上传 3.6MB,首张全屏 logo 解码)。淡出期间帧间隔 33–50ms。
+  ⇒ 「淡出变短」= **长帧/可见帧少**,不是时长被改;旧 500ms / 2 帧上限还会把
+  这段时间永久丢弃(2 帧实测丢 6.58s,见 H-P1-05)。
+
+### 2. 改动
+
+- `yu-engine`:新增 `RealtimeClock`(墙钟毫秒、单调、**默认不截断**);
+  `tick_realtime` 不再把 delta 夹到 `max_step_ms`,并新增 `tick_realtime_at(now)`
+  注入缝。`max_step_ms` 降级为**显式调试开关**(默认 `None`);启用时丢弃量逐帧
+  计数,经 `FrameReport::lag_ms` 暴露,首 3 次与每 600 帧打 WARN,不静默。
+- `FrameReport` 新增 `clock_ms`(脚本可见时钟)与 `lag_ms`(被显式上限丢弃的毫秒)。
+- `restart`:时钟在 boot **之后**重新归零,避免重启首帧把 boot 时间算进脚本时钟。
+- `host-desktop`:`resumed` 末尾(窗口/交换链就绪后)调 `reset_realtime_clock()`,
+  首帧 delta 从 0 起算;新增 `--max-step-ms N` 调试旗标(默认关)。
+  `--frame-stats` CSV 末尾追加 `clock_ms,lag_ms`(脚本时钟/本帧丢弃量),
+  `--spike-log` 行内加 `clock=/lag=`;旧列序不变。
+- `serve`:删除 `2 × frame_ms` 上限(`server.rs`),新增 `--max-step-ms` 调试旗标;
+  帮助文本同步。
+- 旧「500ms 是官方口径」注记全部改为「默认不截断;截断 = 显式调试」。
+
+### 3. 验证(原始结果)
+
+```text
+$ cargo build --workspace --all-targets
+Finished `dev` profile ... 59.87s
+(仅 yu-gfx tests/parity_fixes.rs 的 unused_mut 既有警告)
+
+$ cargo test -p yu-engine
+running 14 tests ... test result: ok. 14 passed
+  含 realtime_clock_tests:
+  long_gap_advances_full_wall_time(700ms 间隔推进 700ms,0 丢弃)
+  explicit_cap_is_counted_not_silent(500ms 上限:推进 500 / 丢弃 200 计数)
+  clearing_cap_restores_lossless_clock(关上限后恢复零丢弃)
+  pause_reset_discards_without_rewinding(暂停 5s 后时钟不回退,只丢暂停段)
+  sixty_hz_microseconds_average_to_one_second(60×16.667ms 逐帧增量之和=1000ms)
+
+$ cargo test --workspace
+除 `yu-cli --test logging_guards` 外全绿。该失败来自工作区里他人未提交的
+`crates/yu-cli/src/case.rs` / `crates/yu-sound/src/state.rs`(HEAD 版本无
+println!/eprintln!),与本轮改动无关,未触碰。
+
+$ ./target/debug/yu-cli.exe run <kotoneiro> --mode desktop --frames 140 --no-sound \
+    --frame-stats target/tmp/ktn/frames.csv --spike-log target/tmp/ktn/spikes.log --spike-ms 5
+exit=0;CSV 关键行:
+  f78 interval=1249.710 work=1234.384 tick=1216.448 render=12.418
+  f85 interval=67.558  work=200.639  tick=47.955   render=150.940
+      (plan=139.594 snap=138.499 decode=138.240 decode_bytes=3630000)
+  f86-f125 淡出窗口:interval 33–50ms(work 32–40ms)
+
+$ 同命令复跑(100 帧,验证新列)
+  f1  clock_ms=34  lag=0   (首帧从 resumed 重置后起算)
+  f78 clock_ms=3149 lag=0  (tick=1241ms 全部计入脚本时钟,旧 500ms 上限会丢 741ms)
+  f85 clock_ms=4649 lag=0
+```
+
+### 4. 剩余(第 2 层,另立任务)
+
+- 「淡出可见帧少」的根因是**开局单帧内的 VM 场景构建**(debug 1216ms / release
+  90–450ms,见 perf 报告)与**首张全屏纹理解码/上传**(debug 138ms)。方向:
+  预热首 pass 管线/glyph atlas、VM 命令泵吞吐;预热不碰脚本时序,才是正确修法。
+- `--max-step-ms` 一旦打开就会让动画慢于真实时间,只用于复现旧症状,不作产品路径。
+
+## 成果 SPRITE-FLASH-GPU-MERGE:修复 wgpu 立绘换差分/眨眼时的整层消失(2026-10-28)
+
+### 症状与复现
+
+桌面 wgpu 下角色立绘在眨眼/换差分的过渡帧整层消失(持续约 8 帧),
+下一帧又回来。`--backend soft` 未见该现象。
+
+复现用例:`target/tmp/case-dir1real.json`(标题 → β4機能紹介 → 演出機能 → 演出１,
+3000 帧),逐帧画面签名经 `YURIS_CASE_TRACE_FRAMES` 采集。消失窗口
+(engine frame,与 host frame 差 ~39,用 display JSON 的 `frame` 对齐):
+
+```text
+              改前(wgpu)        改后(wgpu)       HEAD(dfa7b0b) wgpu
+f=2651..2658  165.77 nz=479542   155.30 nz=479174   155.30 nz=479174
+f=2894..2900  165.26 nz=479240   158.8x nz=479xxx   158.83 nz=479200
+f=2982..2988  162.78 nz=479690   139.53 nz=479540   139.53 nz=479540
+```
+
+(数值 = 全帧 RGB 均值 / 非零像素数;立绘消失时均值升高约 10,因为背景露出。)
+
+### 根因(有代码依据,非推测)
+
+`es_SPExec.yst` 换差分的标准命令序是:
+
+```text
+CGACT[COPY2=1 ID=<src> ID2=SPLBUF602]        ← 冻结 src 像素到快照 350
+CGACT[ID=SPLBUF602 RECTPAINT3=1 SET=0 X=0 Y=0 X2=294 Y2=579]  ← 表面清成 (0,0,0,0)
+CGACT[ID="sp.tmpB" ID2=SPLBUF602 MERGE=1]     ← 把上层叠上去
+```
+
+本轮新增的 GPU 合成路径(`try_gpu_merge` 的快照分支,`passes.rs`)把
+**执行期的当前快照纹理**当 MERGE 的「下层」。但该纹理在同一个命令序里刚被
+`RECTPAINT3 SET=0` 清成 alpha=0,而 `merge.wgsl` 按设计只写 RGB
+(`out.a = lower.a`)⇒ 写回去的快照 alpha 恒 0。
+
+随后 `SPLBUF602` 上的 `SIZE`→`SPL602` 以该快照为源,整层在 `SRCALPHA` 混合里
+被抹掉 ⇒ 立绘消失。逐帧取证确认过这一点:诊断读回快照 350 的 GPU 纹理得到
+`alpha_nz=0, mean=104.40`(RGB 有内容、alpha 全 0),同一帧 CPU 镜像
+`alpha_nz=122259`。
+
+CPU 参考路径的「下层」是 `snapshot_pixels()`(COPY 时刻冻结的像素),所以同一
+命令序在 CPU 上画得出立绘——这正是回归前(HEAD)的行为。
+
+### 修法
+
+`crates/yu-render/wgpu/src/passes.rs` 新增 `snapshot_modified_before(frame, copy_id, at)`:
+本帧在该 op 之前是否已有图像加工改写过这个快照的表面。命中则
+`try_gpu_merge` 回退 CPU(`bail("snapshot surface modified earlier in frame")`),
+基面仍是 COPY 时刻像素,与回归前逐位一致。未被同帧改写的快照仍走 GPU 合成,
+所以本轮的性能收益不受影响。
+
+不猜官方语义:`MERGE` 在「表面已清空」时是否应写 alpha 属
+`docs/divergences/DIV-GFX-063` §2.4 的未取证点(手册只说 MERGE 反映上层不透明度),
+本修复只在该分歧实际发生处回到已验证路径,并在 `DIV-GFX-063` 记一条待取证。
+
+### 回归门禁
+
+`crates/yu-render/wgpu/tests/wgpu.rs::merge_after_rectpaint_clear_on_snapshot_keeps_pixels`
+(COPY → RECTPAINT3 SET=0 → MERGE,上下层隐藏后只留快照可见)。
+已验证该测试在移除守卫时失败(`[0,0,0,255]`)、带守卫时通过(`[200,0,0,255]`)。
+
+### 验证命令与原始结果
+
+```text
+$ cargo test -p yu-backend-wgpu --test wgpu merge_after_rectpaint_clear_on_snapshot_keeps_pixels
+test result: ok. 1 passed
+
+$ YURIS_CASE_TRACE_FRAMES=1..3000 ./target/release/yu-cli.exe case <project-eris> \
+    --case dir1-wgpu --cases target/tmp/dir1-cases
+改前→改后仅 22 帧变化,全部落在上面三个窗口,且都与 HEAD 的 wgpu 值一致。
+
+$ cargo test --workspace --no-fail-fast
+唯一失败:yu-trace --test golden 的 synthetic_trace_matches_golden
+(YSCom.ycd sha256 不一致,已知既有红灯,与本轮无关)。
+
+$ cargo build --workspace --all-targets
+Finished(仅 yu-rt 既有 `coerce_param` 未使用警告)
+```
+
+### 取证工具(本轮临时加、已全部移除)
+
+`YU_SPRITE_DBG`/`YU_GPU_IMG_TRACE`/`YU_GPU_IMG_OFF` 三组临时环境开关与
+逐 op 打印已从工作区删除;保留的 `YU_TRANSITION_DEBUG`(既有)只打 CPU 回退原因,
+可用 `[merge] CPU fallback: snapshot surface modified earlier in frame` 观察本修复命中。
+
+## 成果 PERF-VM-HOTPATH (2026-10-28) · 解释器热路径:每命令摘/插执行位、参数名整表克隆、GOSUB 参数分配
+
+### 定位方法(先量再改)
+
+`--profile-commands` 的逐命令计时改为 **1/32 抽样并折算**:逐条 `Instant::now()`
+两个加法本身约 0.2µs,旧实现把采样器开销算进了命令成本。另加 `YURIS_CASE_BENCH=1`
+(用例执行器逐帧 tick 分位数 + 命令成本表 + `[casespike]` 长帧构成)与
+`YURIS_CASE_TRACE_FRAMES` / `YURIS_CASE_SHOT_FRAMES`(逐帧画面签名/定点截帧),
+全部只写诊断、不参与判定。
+
+基线(`project-eris`,3000 帧,headless wgpu,自动推进到 `es_scenario.yst`):
+
+```text
+tick p50=4.34ms p95=5.67  work>25ms 50%(含采样开销)
+IF=271ns×1263万  LET=165ns×763万  INT=229ns×397万  GOSUB=782ns×118万
+VARACT=1.05µs  CG=1.29µs  LOOPEND=35ns×666万  IFEND=30ns×1262万
+启动帧(engine f=3)=297–330ms:LET 121ms / CG 56ms / IF 33ms / VARACT 28ms
+```
+
+### 改动(全部在本轮未提交工作区)
+
+1. **执行位缓存**(`yu-rt/src/vm.rs`):`exec` 由 `FxHashMap<String, ExecState>`
+   改 `…Box<ExecState>`,并新增 `exec_slot` —— 调度器对同一任务连跑多条命令时
+   不再逐条 `remove_entry`/`insert`(旧实现每条命令两次字符串键哈希 + 两次
+   700B 搬移)。`exec_of`(TASKINFO)先查缓存位,`task_removed` 命中缓存即丢弃。
+2. **参数名表随命令缓存**(`Vm::fill_cmd` → `Cmd::param_names: Rc<[String]>`):
+   `VARACT`/`TASK`/`TASKINFO`/`CLIPACT`/`CLIPINFO`/`ERROR` 原本**每次执行**克隆整张
+   参数名表(`VARACT` 启动帧 2.8 万次 × ~14 个 `String`);现在每个 `(script,pc)`
+   站点克隆一次,执行期只 bump 引用计数。
+3. **GOSUB/RETURN**:`param_plan`(参数编号+类型,零分配)、`ParamTy::coerce`、
+   `LabelTarget` 常量标签按调用点缓存(不再每次重解码窗口 + BTreeMap 按字节查表 +
+   克隆 `Label` 的两个堆字符串)。
+4. **LET/声明/写**:`op_let` 就地归一化(不再重建 `LValue` 并克隆下标表);
+   `op_declare` 改 `reset_declared`(同型同维复用槽存储);`VariableStore::write`
+   去掉调用方一律丢弃的返回值克隆。
+5. `VariableStore::read`/`canonical_var` 标 `#[inline]`,读取路径的空间判别合并为一次。
+
+### 结果(A/B,同机同口径;`min of 3`)
+
+```text
+                 改前        改后
+tick p50        4.34ms      3.62–3.66ms   (-16%)
+work p50        5.30ms      4.43ms        (-16%,桌面 2500 帧)
+work>25ms 占比  2.5%        1.2%
+IF              271ns       226–229ns     (-16%)
+LET             165ns       133–134ns     (-19%)
+INT             229ns       179–180ns     (-22%)
+GOSUB           782ns       329–346ns     (-56%)
+RETURN          249ns       147–157ns     (-40%)
+VARACT(启动帧) 28.6ms      8.2–9.5ms     (-70%)
+启动帧总耗时    297–330ms   241–261ms     (-20%)
+桌面 tick p50   3.89ms      2.94ms        (-24%)
+```
+
+### 验证命令与原始结果
+
+```text
+$ cargo test --workspace --no-fail-fast        # 带语料环境变量
+59 个 suite 全绿;唯一失败 yu-trace --test golden
+(synthetic_trace_matches_golden:YSCom.ycd sha256 不一致,既有红灯,与本轮无关)
+
+$ YURIS_CASE_BENCH=1 ./target/release/yu-cli.exe case <project-eris> \
+    --case perf-eris --cases target/tmp
+[casebench] frames=3000 p50=3.63 p95=4.30 p99=4.88 max=260.9
+[casebench] cmd IF avg=226ns  LET=133ns  INT=180ns  GOSUB=346ns  VARACT=1022ns
+
+$ ./target/release/yu-cli.exe run <project-eris> --mode desktop --frames 2500 \
+    --script target/tmp/perf-vm-bench.json --frame-stats target/tmp/desk-opt2.csv
+exit=0  56.2fps  tick p50=2.94 p95=7.61 p99=22.08 max=314.0
+work p50=4.43 p95=10.82 p99=26.00;>25ms 30 帧(1.2%)
+```
+
+### 未做(需主人决策,不是技术障碍)
+
+场景进入仍有一次 **~95ms 的 BGM 解码**:`bgm/bgm01.ogg` 4,004,356 帧整段解码
+(约 926× 实时),发生在 `SOUND` 命令内(官方同型 = 同步整段解码)。已确认这是
+场景进入尖峰的主项(engine f=224:132ms 里 93ms 是它)。要做只能把解码挪出
+tick 线程(`TOTALTIME` 改用 OGG granule/WAV 头算,播放等 PCM 就绪),属**语义分歧**,
+需先定口径再动手;当前代码与官方一致,未擅自改。
+
+## 成果 PERF-READBACK-ASYNC (2026-10-28) · 屏幕读回不再每帧等 GPU
+
+### 症状与定位
+
+<game-b>(v494 商业包)桌面 wgpu 模式「角色出场后卡得要死」,偶发崩溃。逐帧阶段表
+(`--spike-log`)显示:render 159ms 里 **readback=139ms**,而该帧只画了 31 个 draw。
+读回实现是 `ReadbackCache::read` → `collect()` → `device.poll(wait_indefinitely)`:
+只要 GPU 队列里还有活(立绘换差分帧有 71MB 纹理拷贝 + 数十 MB 上传),CPU 就被按在
+帧里等整条队列跑完。决定性对照实验:把屏幕读回整段跳过 →
+34.4fps → 50.9fps、work p95 60.5ms → 21.2ms、render max 181.5ms → 59.8ms。
+
+### 改法
+
+`crates/yu-render/wgpu/src/readback.rs` 主帧路径改为**非阻塞单缓冲**:
+
+1. 每帧先 `poll(Poll)`(不等待)收上一帧;收不到就沿用上一次成功的表面;
+2. 上一帧映射未完成(缓冲仍 mapped)⇒ **本帧干脆不提交读回**,只提交绘制命令
+   (绝不往 mapped 缓冲写 —— 第一版双缓冲实现漏了这一条,触发
+   `BufferStillMapped` 验证错误并让 tick 失败);
+3. `read_now` 保持阻塞语义(首帧 / `--shot` / 用例 golden / 存档抓帧),
+   `collect_blocking` 在未挂映射时自行 `map_async` 再等。
+
+桌面呈现本来就靠 `screen_texture`,CPU 面只服务存档抓帧,允许滞后一两帧。
+
+顺带把 `dump_texture`(另一会话新增的 `YU_TRANS_DUMP` 取证助手)恢复并接到
+新的 `read_now` 上。
+
+### 结果(<game-b>,1200 帧,同脚本同口径)
+
+```text
+            改前        改后
+fps         34.4        45.2
+work p50    6.63ms      5.25ms
+work p95    60.49ms     30.68ms
+work p99    168.97ms    93.02ms
+render p50  2.01ms      1.78ms
+render p95  32.39ms     16.92ms
+render max  181.5ms     63.1ms
+```
+
+`cargo test -p yu-backend-wgpu` 25 个像素对拍 + 9 单测全绿(精确路径语义不变)。
+
+### 仍然存在的**实现路线**问题(下一步,未做)
+
+非阻塞读回只拆掉了「CPU 等 GPU」这一个同步点。逐帧账单仍然是:
+
+- `plan` p95 16–58ms、`image` p95 10–35ms:**CPU 合成** 2048² 立绘缓冲;
+- 上传 8.8MB/帧(重帧 54–115MB),快照 `copy_texture_to_texture` 107–186MB/重帧;
+- 场景进入仍是 150–470ms 的 tick 突发(脚本初始化 + BGM 整段解码 95ms)。
+
+官方引擎(REA 取证)每层有**常驻表面**,`CGACT` 就地改它,每帧只把可见图层 blit 到
+后缓冲 —— 不存在「每帧重新合成 + 整张上传 + 整面拷贝」。我们每帧重放 op 流并用 CPU
+重新合成,才是真正的瓶颈;要收口需把图层表面做成常驻 GPU 纹理、CGACT 链变成对该纹理
+的 GPU pass,快照改成纹理句柄而不是整面复制。这是渲染契约级改动,待主人确认后再动。

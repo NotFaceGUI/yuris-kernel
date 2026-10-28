@@ -195,6 +195,16 @@ pub struct PipelineCache {
     /// `CGACT[MERGE/MERGE2]` 的 GPU 合成管线:`false` = 只写 RGB(保留目标
     /// alpha,`MERGE`),`true` = 连同 alpha 一起写(`MERGE2`)。
     merge_pipelines: [Option<wgpu::RenderPipeline>; 2],
+    /// `CGACT[TRANSITION]` 的双源整数 lerp(两张纹理 → 目标表面)。
+    lerp_shader: wgpu::ShaderModule,
+    lerp_layout: wgpu::BindGroupLayout,
+    lerp_pipeline_layout: wgpu::PipelineLayout,
+    lerp_pipeline: Option<wgpu::RenderPipeline>,
+    /// `CGACT[MERGE=1]` 的 GPU 整数合成(两张纹理,无 uniform)。
+    layer_merge_shader: wgpu::ShaderModule,
+    layer_merge_layout: wgpu::BindGroupLayout,
+    layer_merge_pipeline_layout: wgpu::PipelineLayout,
+    layer_merge_pipeline: Option<wgpu::RenderPipeline>,
     /// RECTPAINT 的颜色 uniform/bind group(同一颜色跨帧复用;语义不变)。
     paint_groups: BTreeMap<(bool, [u32; 4]), wgpu::BindGroup>,
     pub total_pipelines_created: u64,
@@ -321,6 +331,98 @@ impl PipelineCache {
                     bind_group_layouts: &[Some(&paint_layout)],
                     immediate_size: 0,
                 });
+        // `CGACT[TRANSITION]` 的双源整数 lerp(GPU):两张纹理 + f。
+        let lerp_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("yu-backend-wgpu lerp"),
+                source: wgpu::ShaderSource::Wgsl(crate::shaders::LERP.into()),
+            });
+        let lerp_layout = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("yu-backend-wgpu lerp layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let lerp_pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("yu-backend-wgpu lerp pipeline layout"),
+                    bind_group_layouts: &[Some(&lerp_layout)],
+                    immediate_size: 0,
+                });
+        // `CGACT[MERGE]` 的 GPU 整数合成(两张纹理,无参数)。
+        let layer_merge_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("yu-backend-wgpu merge"),
+                source: wgpu::ShaderSource::Wgsl(crate::shaders::MERGE.into()),
+            });
+        let layer_merge_layout = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("yu-backend-wgpu merge layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let layer_merge_pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("yu-backend-wgpu merge pipeline layout"),
+                    bind_group_layouts: &[Some(&layer_merge_layout)],
+                    immediate_size: 0,
+                });
         let samplers = [
             make_sampler(ctx, FilterKind::Point),
             make_sampler(ctx, FilterKind::Linear),
@@ -388,6 +490,14 @@ impl PipelineCache {
             paint_shader,
             paint_pipelines: [None, None],
             merge_pipelines: [None, None],
+            lerp_shader,
+            lerp_layout,
+            lerp_pipeline_layout,
+            lerp_pipeline: None,
+            layer_merge_shader,
+            layer_merge_layout,
+            layer_merge_pipeline_layout,
+            layer_merge_pipeline: None,
             paint_groups: BTreeMap::new(),
             total_pipelines_created: 0,
             total_bind_groups_created: 0,
@@ -741,6 +851,158 @@ impl PipelineCache {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: fade.as_entire_binding(),
+                    },
+                ],
+            })
+        })?;
+        self.total_bind_groups_created += 1;
+        Ok(group)
+    }
+
+    /// `CGACT[TRANSITION]` 的双源整数 lerp 管线(无顶点缓冲,全屏三角形)。
+    pub fn ensure_lerp_pipeline(&mut self, ctx: &GpuContext) -> Result<(), Diag> {
+        if self.lerp_pipeline.is_some() {
+            return Ok(());
+        }
+        let pipeline = ctx.checked(code::TARGET, "lerp 管线", || {
+            ctx.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("yu-backend-wgpu lerp"),
+                    layout: Some(&self.lerp_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &self.lerp_shader,
+                        entry_point: Some("vs_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[],
+                    },
+                    primitive: primitive_state(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &self.lerp_shader,
+                        entry_point: Some("fs_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: TARGET_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+        })?;
+        self.lerp_pipeline = Some(pipeline);
+        self.total_pipelines_created += 1;
+        Ok(())
+    }
+
+    pub fn lerp_pipeline(&self) -> Option<&wgpu::RenderPipeline> {
+        self.lerp_pipeline.as_ref()
+    }
+
+    /// 双源 lerp 的 bind group(两张纹理 + `f` uniform)。
+    pub fn create_lerp_bind_group(
+        &mut self,
+        ctx: &GpuContext,
+        from: &wgpu::TextureView,
+        to: &wgpu::TextureView,
+        f: u32,
+    ) -> Result<wgpu::BindGroup, Diag> {
+        let values: [u32; 4] = [f, 0, 0, 0];
+        let buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &ctx.device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("yu-backend-wgpu lerp f"),
+                contents: bytemuck::cast_slice(&values),
+                usage: wgpu::BufferUsages::UNIFORM,
+            },
+        );
+        let group = ctx.checked(code::TARGET, "lerp bind group", || {
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("yu-backend-wgpu lerp bind group"),
+                layout: &self.lerp_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(from),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(to),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buffer.as_entire_binding(),
+                    },
+                ],
+            })
+        })?;
+        self.total_bind_groups_created += 1;
+        Ok(group)
+    }
+
+    /// `CGACT[MERGE]` 的 GPU 整数合成管线(无顶点缓冲,全屏三角形)。
+    pub fn ensure_layer_merge_pipeline(&mut self, ctx: &GpuContext) -> Result<(), Diag> {
+        if self.layer_merge_pipeline.is_some() {
+            return Ok(());
+        }
+        let pipeline = ctx.checked(code::TARGET, "merge 管线", || {
+            ctx.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("yu-backend-wgpu merge"),
+                    layout: Some(&self.layer_merge_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &self.layer_merge_shader,
+                        entry_point: Some("vs_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[],
+                    },
+                    primitive: primitive_state(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &self.layer_merge_shader,
+                        entry_point: Some("fs_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: TARGET_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+        })?;
+        self.layer_merge_pipeline = Some(pipeline);
+        self.total_pipelines_created += 1;
+        Ok(())
+    }
+
+    pub fn layer_merge_pipeline(&self) -> Option<&wgpu::RenderPipeline> {
+        self.layer_merge_pipeline.as_ref()
+    }
+
+    /// 双纹理 MERGE 的 bind group(lower + upper)。
+    pub fn create_layer_merge_bind_group(
+        &mut self,
+        ctx: &GpuContext,
+        lower: &wgpu::TextureView,
+        upper: &wgpu::TextureView,
+    ) -> Result<wgpu::BindGroup, Diag> {
+        let group = ctx.checked(code::TARGET, "merge bind group", || {
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("yu-backend-wgpu merge bind group"),
+                layout: &self.layer_merge_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(lower),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(upper),
                     },
                 ],
             })

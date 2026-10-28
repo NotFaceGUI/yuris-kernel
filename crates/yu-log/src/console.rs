@@ -24,6 +24,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -402,34 +403,129 @@ impl MinLevel {
 /// 两种行共存:`{"sub":"diag",…}`(内核 `Diag`,schema 不变,仅前置 sub 键;
 /// `Diag::from_json_line` 忽略未知键,往返契约不受影响)与
 /// `{"sub":"log",…}`(门面/生命周期行,字段序同 `facade`)。
+///
+/// **异步**:帧线程只做一次 `try_send`,磁盘 I/O 与格式化落盘全在后台线程
+/// (`BufWriter`,队列排空后统一 flush)。旧实现是 `Arc<Mutex<File>>` + 每条
+/// 两次 `write_all`:尖峰帧一次灌几千条诊断时,帧线程被同步文件 I/O 拖住,
+/// 这正是「开日志更卡」的来源。队列满时丢行并计数(退出前把丢弃数落成
+/// 一行,不静默)。
 #[derive(Clone)]
-pub struct JsonlFile(Arc<Mutex<File>>);
+pub struct JsonlFile(Arc<JsonlSink>);
+
+enum LogMsg {
+    Line(String),
+    Flush(std::sync::mpsc::SyncSender<()>),
+    Shutdown,
+}
+
+struct JsonlSink {
+    tx: std::sync::mpsc::SyncSender<LogMsg>,
+    dropped: AtomicU64,
+}
+
+impl Drop for JsonlSink {
+    fn drop(&mut self) {
+        // 最后一个句柄消失:让后台线程排空并 flush 后退出。
+        let _ = self.tx.send(LogMsg::Shutdown);
+    }
+}
+
+/// 队列容量(行)。按 100 行/帧的极端洪水算,可缓冲约 10 分钟。
+const JSONL_QUEUE: usize = 65536;
+/// 后台缓冲(字节):一次 flush 落一大块,syscall 数量与行数解耦。
+const JSONL_BUF: usize = 256 * 1024;
 
 impl JsonlFile {
     /// 创建/截断日志文件(一次运行 = 一个现场)。
     pub fn create(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
-        Ok(Self(Arc::new(Mutex::new(File::create(path)?))))
+        let file = File::create(path)?;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<LogMsg>(JSONL_QUEUE);
+        let sink = Arc::new(JsonlSink {
+            tx,
+            dropped: AtomicU64::new(0),
+        });
+        let dropped_tail = Arc::clone(&sink);
+        std::thread::Builder::new()
+            .name("yu-log-jsonl".to_string())
+            .spawn(move || {
+                let mut out = std::io::BufWriter::with_capacity(JSONL_BUF, file);
+                'main: loop {
+                    match rx.recv() {
+                        Ok(LogMsg::Line(line)) => {
+                            let _ = out.write_all(line.as_bytes());
+                            let _ = out.write_all(b"\n");
+                        }
+                        Ok(LogMsg::Flush(ack)) => {
+                            let _ = out.flush();
+                            let _ = ack.send(());
+                            continue;
+                        }
+                        Ok(LogMsg::Shutdown) | Err(_) => break 'main,
+                    }
+                    // 突发:把已到的行一次写完,只 flush 一次。
+                    loop {
+                        match rx.try_recv() {
+                            Ok(LogMsg::Line(line)) => {
+                                let _ = out.write_all(line.as_bytes());
+                                let _ = out.write_all(b"\n");
+                            }
+                            Ok(LogMsg::Flush(ack)) => {
+                                let _ = out.flush();
+                                let _ = ack.send(());
+                            }
+                            Ok(LogMsg::Shutdown) => break 'main,
+                            // 队列暂时为空 = 这一批写完;不是关闭。
+                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'main,
+                        }
+                    }
+                    let _ = out.flush();
+                }
+                let dropped = dropped_tail.dropped.load(Ordering::Relaxed);
+                if dropped > 0 {
+                    let _ = writeln!(
+                        out,
+                        "{{\"sub\":\"log\",\"level\":\"warn\",\"target\":\"yu-log\",\
+                         \"file\":null,\"line\":null,\"message\":\"写队列满,丢弃 {dropped} 行\"}}"
+                    );
+                }
+                let _ = out.flush();
+            })
+            .map_err(|error| io::Error::other(format!("启动 JSONL 写线程失败: {error}")))?;
+        Ok(Self(sink))
+    }
+
+    fn write_owned(&self, line: String) {
+        match self.0.tx.try_send(LogMsg::Line(line)) {
+            Ok(()) => {}
+            // 队列满 = 磁盘明显跟不上;丢行并计数(退出前落一行说明)。
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.0.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+        }
     }
 
     pub(crate) fn write_raw(&self, line: &str) {
-        // 锁中毒(某次写时 panic 过)不弃疗:取回内部数据继续写,
-        // 与引擎对声音锁的处置同型(H-P1-01)。静默弃写所有后续日志
-        // 是比单行丢失严重得多的降级。
-        let mut file = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        // 写失败(盘满/句柄失效)无第二现场可报;丢弃但不 panic,
-        // 与门面桥对 JSONL 写失败的处置一致。
-        let _ = file.write_all(line.as_bytes());
-        let _ = file.write_all(b"\n");
+        self.write_owned(line.to_string());
+    }
+
+    /// 同步落盘点(退出/panic 前调用):排队并等后台线程 flush 完。
+    pub fn flush(&self) {
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(0);
+        if self.0.tx.send(LogMsg::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv_timeout(std::time::Duration::from_millis(1000));
+        }
     }
 
     /// 内核诊断一行(sub:"diag";schema 即 `Diag::to_json_line`,前置 sub)。
     pub fn write_diag(&self, diag: &Diag) {
-        self.write_raw(&diag.to_json_line_with_sub("diag"));
+        self.write_owned(diag.to_json_line_with_sub("diag"));
     }
 
     /// 门面/生命周期一行(sub:"log";字段序同 `facade::record_json_line`)。
     pub fn write_log_line(&self, level: &str, target: &str, message: &str) {
-        self.write_raw(&crate::facade::json_line(level, target, None, None, message));
+        self.write_owned(crate::facade::json_line(level, target, None, None, message));
     }
 }
 
@@ -488,7 +584,9 @@ impl Console {
         let recent_cap = opts.recent_cap;
         Self {
             opts,
-            out: Box::new(std::io::stderr()),
+            // 块缓冲:诊断洪水时不逐行触碰 stderr(WARN+ 仍即时 flush,
+            // 见 `write_line`;退出/panic 走 `flush`)。
+            out: Box::new(std::io::BufWriter::with_capacity(64 * 1024, std::io::stderr())),
             seen: HashMap::new(),
             recent: VecDeque::with_capacity(recent_cap.min(1024)),
         }
@@ -527,10 +625,18 @@ impl Console {
         })
     }
 
-    fn write_line(&mut self, line: String) {
+    /// 写一行到 stderr。`flush` = 立即落盘(告警/致命;普通行走缓冲,
+    /// 由 [`Console::flush`] 或缓冲满时成批刷出)。
+    ///
+    /// 旧实现对**每一行**都 `flush()`,而 stderr 在 Windows 控制台窗口里
+    /// 每条 write 都要宿主重绘:诊断洪水时帧线程被同步写拖住(用户实测
+    /// 「开日志更卡」)。现在 64KB 块缓冲,只有 WARN+ 立即刷。
+    fn write_line(&mut self, line: String, flush: bool) {
         let _ = self.out.write_all(line.as_bytes());
         let _ = self.out.write_all(b"\n");
-        let _ = self.out.flush();
+        if flush {
+            let _ = self.out.flush();
+        }
         if self.opts.recent_cap > 0 {
             // 面板「日志」页签存明文:彩色行进 egui monospace 会露出 ANSI
             // 转义字形(控制台与面板同源、不同形)。
@@ -543,6 +649,14 @@ impl Console {
                 self.recent.pop_front();
             }
             self.recent.push_back(plain);
+        }
+    }
+
+    /// 同步落盘(退出/panic 前调用):stderr 缓冲 + JSONL 队列。
+    pub fn flush(&mut self) {
+        let _ = self.out.flush();
+        if let Some(file) = &self.opts.file {
+            file.flush();
         }
     }
 
@@ -590,7 +704,15 @@ impl Console {
                 &body,
                 self.opts.color,
             );
-            self.write_line(line);
+            self.write_line(
+                line,
+                matches!(
+                    diag.severity,
+                    crate::Severity::Fatal
+                        | crate::Severity::Recoverable
+                        | crate::Severity::Unimplemented
+                ),
+            );
         }
     }
 
@@ -608,7 +730,7 @@ impl Console {
             &body,
             self.opts.color,
         );
-        self.write_line(line);
+        self.write_line(line, matches!(level, FacadeLevel::Error | FacadeLevel::Warn));
     }
 
     /// 宿主生命周期行(`[host]`/`[serve]`/`[run]`/`[dev]` 频道)。
@@ -627,7 +749,7 @@ impl Console {
             message,
             self.opts.color,
         );
-        self.write_line(line);
+        self.write_line(line, matches!(level, HostLevel::Warn | HostLevel::Error));
     }
 
     /// 末尾诊断汇总(频次降序,同频次按码序;行复用首次出现的时刻戳)。
@@ -683,7 +805,7 @@ impl Console {
             let _ = self.out.write_all(line.as_bytes());
             let _ = self.out.write_all(b"\n");
         }
-        let _ = self.out.flush();
+        self.flush();
     }
 
     /// 面板「日志」页签的最近行快照(明文无色)。
@@ -749,6 +871,11 @@ impl ConsoleHandle {
 
     pub fn summary_lines(&self) -> Vec<String> {
         self.with_lock(|console| console.summary_lines()).unwrap_or_default()
+    }
+
+    /// 同步落盘(stderr 缓冲 + JSONL 队列;退出/panic 前调用)。
+    pub fn flush(&self) {
+        self.with_lock(|console| console.flush());
     }
 }
 
@@ -954,6 +1081,8 @@ mod tests {
         let file = JsonlFile::create(&path).unwrap();
         file.write_diag(&gfx_diag());
         file.write_log_line("info", "host", "data.ypf mounted");
+        // 写者异步(帧线程不碰磁盘):读文件前先要一次同步落盘点。
+        file.flush();
         let text = std::fs::read_to_string(&path).unwrap();
         let mut lines = text.lines();
         let diag_line = lines.next().unwrap();

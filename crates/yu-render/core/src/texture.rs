@@ -93,7 +93,8 @@ impl AssetIssue {
 struct Cached {
     /// 实际命中的探测路径(缺失时 `None`)。
     resolved: Option<Vec<u8>>,
-    result: Result<Texture, Diag>,
+    /// 已解码纹理。存 `Rc`:CPU 图像加工的源可以零拷贝共享(`resolve_shared`)。
+    result: Result<std::rc::Rc<Texture>, Diag>,
 }
 
 /// 纹理解析 + 缓存。
@@ -108,9 +109,20 @@ pub struct TextureStore {
     issues: BTreeMap<(Vec<u8>, String), AssetIssue>,
     solid: Texture,
     decoded: u64,
+    /// 本帧解码耗时/字节(VFS 读 + 图像解码;`begin_frame` 清零)。
+    ///
+    /// 首次显示角色/立绘时的卡顿主要在这里(磁盘 + PNG 解码),它发生在
+    /// `plan` 里,和 MERGE 合成混在一起看不出来 ⇒ 单独记账。
+    decode_us: u64,
+    decode_bytes: u64,
 }
 
 impl TextureStore {
+    /// 本帧资产解码耗时(微秒)与像素字节。
+    #[must_use]
+    pub fn decode_stats(&self) -> (u64, u64) {
+        (self.decode_us, self.decode_bytes)
+    }
     pub fn new(source: Box<dyn DataSource>, codec: Codec, probe_order: Vec<ImageFormat>) -> Self {
         Self {
             source,
@@ -120,26 +132,24 @@ impl TextureStore {
             issues: BTreeMap::new(),
             solid: Texture::solid_black_1x1(),
             decoded: 0,
+            decode_us: 0,
+            decode_bytes: 0,
         }
     }
 
-    /// 开始新一帧:清空本帧问题清单(缓存保留)。
+    /// 开始新一帧:清空本帧问题清单与解码计时(缓存保留)。
     pub fn begin_frame(&mut self) {
         self.issues.clear();
+        self.decode_us = 0;
+        self.decode_bytes = 0;
     }
 
     /// 解析一个资产 key。成功返回缓存中的纹理;失败返回 `asset.*` [`Diag`]。
     pub fn resolve(&mut self, key: &[u8]) -> Result<&Texture, Diag> {
-        if !self.cache.contains_key(key) {
-            let cached = self.load(key);
-            self.cache.insert(key.to_vec(), cached);
-        }
+        self.ensure(key)?;
         let entry = self.cache.get(key).expect("cache entry inserted above");
         match &entry.result {
-            Ok(_) => Ok(match &entry.result {
-                Ok(tex) => tex,
-                Err(_) => unreachable!("matched Ok above"),
-            }),
+            Ok(tex) => Ok(tex.as_ref()),
             Err(diag) => {
                 let issue = AssetIssue {
                     key: key.to_vec(),
@@ -151,6 +161,37 @@ impl TextureStore {
                 Err(diag.clone())
             }
         }
+    }
+
+    /// 解析资产并共享缓存纹理(`Rc` 克隆,O(1))。
+    ///
+    /// GPU 后端的 CPU 图像加工(`MERGE` 的上层源)用它:旧实现每次解析都把
+    /// 整张资产 `rgba.clone()` 到新 `Rc`,一条 2048² 的部件每帧被复制几十次。
+    pub fn resolve_shared(&mut self, key: &[u8]) -> Result<std::rc::Rc<Texture>, Diag> {
+        self.ensure(key)?;
+        let entry = self.cache.get(key).expect("cache entry inserted above");
+        match &entry.result {
+            Ok(tex) => Ok(std::rc::Rc::clone(tex)),
+            Err(diag) => {
+                let issue = AssetIssue {
+                    key: key.to_vec(),
+                    code: diag.code.to_string(),
+                    detail: diag.detail.clone(),
+                };
+                self.issues
+                    .insert((key.to_vec(), issue.code.clone()), issue);
+                Err(diag.clone())
+            }
+        }
+    }
+
+    /// 确保 key 已有缓存条目(成功/失败都会缓存,避免重复探测)。
+    fn ensure(&mut self, key: &[u8]) -> Result<(), Diag> {
+        if !self.cache.contains_key(key) {
+            let cached = self.load(key);
+            self.cache.insert(key.to_vec(), cached);
+        }
+        Ok(())
     }
 
     /// 解析 [`TextureRef`]。`Offscreen/Snapshot/None` 不归本模块物化。
@@ -194,7 +235,20 @@ impl TextureStore {
             .and_then(|entry| entry.resolved.as_deref())
     }
 
+    /// 解码并记账(VFS 读 + 图像解码;仅缓存未命中时调用)。
     fn load(&mut self, key: &[u8]) -> Cached {
+        let started = std::time::Instant::now();
+        let cached = self.load_inner(key);
+        self.decode_us = self
+            .decode_us
+            .saturating_add(started.elapsed().as_micros() as u64);
+        if let Ok(texture) = &cached.result {
+            self.decode_bytes = self.decode_bytes.saturating_add(texture.rgba.len() as u64);
+        }
+        cached
+    }
+
+    fn load_inner(&mut self, key: &[u8]) -> Cached {
         let candidates = self.candidates(key);
         for (candidate, format) in candidates {
             let lookup = match LookupKey::new(&candidate, self.codec) {
@@ -253,7 +307,7 @@ impl TextureStore {
                     self.decoded += 1;
                     Cached {
                         resolved: Some(candidate),
-                        result: Ok(Texture::from_rgba8(img.to_rgba8())),
+                        result: Ok(std::rc::Rc::new(Texture::from_rgba8(img.to_rgba8()))),
                     }
                 }
                 Err(err) => Cached {
@@ -282,7 +336,7 @@ impl TextureStore {
 
     fn candidates(&self, key: &[u8]) -> Vec<(Vec<u8>, Option<ImageFormat>)> {
         let mut out = Vec::new();
-        if has_extension(key) {
+        if has_extension(key, self.codec) {
             out.push((key.to_vec(), known_extension_format(key)));
         }
         for format in &self.probe_order {
@@ -307,28 +361,56 @@ fn unimplemented(code: &'static str, path: Vec<u8>, detail: impl Into<String>) -
 }
 
 /// 最后一个路径组件是否带扩展名(`.` 不在首位)。
-fn has_extension(key: &[u8]) -> bool {
-    let name = key
-        .rsplit(|&b| b == b'/' || b == b'\\')
-        .next()
-        .unwrap_or(key);
+fn has_extension(key: &[u8], codec: Codec) -> bool {
+    let name = last_component(key, codec);
     match name.iter().rposition(|&b| b == b'.') {
         Some(0) | None => false,
         Some(_) => true,
     }
 }
 
+/// 最后一个路径组件，分隔符只在**单字节字符**位置上生效。
+///
+/// 不能对原始字节直接 `rsplit(b'\\')`：CP932 的尾字节区间(`0x40..=0x7E`)
+/// 含 `\`(`0x5C`)，`ソ`=`83 5C`、`表`=`95 5C` 会被劈成两段，`cg/ソ.png`
+/// 的“最后组件”会只剩 `.png`，随即被判成“无扩展名”，原 key 不参与探测，
+/// 实际存在的资产报 `asset.missing`。
+fn last_component(key: &[u8], codec: Codec) -> &[u8] {
+    let mut start = 0;
+    let mut i = 0;
+    while i < key.len() {
+        let step = if key[i] >= 0x80 && codec.is_lead(key[i]) && i + 1 < key.len() {
+            2
+        } else {
+            1
+        };
+        if step == 1 && (key[i] == b'/' || key[i] == b'\\') {
+            start = i + 1;
+        }
+        i += step;
+    }
+    &key[start..]
+}
+
+/// 尾部 ASCII 后缀比较（大小写不敏感）。
+///
+/// 后缀首字节 `.`(`0x2E`)既不是 CP932 的 lead，也不在尾字节区间，因此后缀
+/// 不可能切进双字节字符；逐字节比较即可，不需要先把整串折小写（整串折小写
+/// 会改写双字节字符的尾字节）。
+fn ends_with_ascii_ci(name: &[u8], suffix: &[u8]) -> bool {
+    name.len() >= suffix.len() && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
 fn known_extension_format(key: &[u8]) -> Option<ImageFormat> {
-    let lower: Vec<u8> = key.iter().map(u8::to_ascii_lowercase).collect();
-    if lower.ends_with(b".png") {
+    if ends_with_ascii_ci(key, b".png") {
         Some(ImageFormat::Png)
-    } else if lower.ends_with(b".bmp") {
+    } else if ends_with_ascii_ci(key, b".bmp") {
         Some(ImageFormat::Bmp)
-    } else if lower.ends_with(b".jpg") || lower.ends_with(b".jpeg") {
+    } else if ends_with_ascii_ci(key, b".jpg") || ends_with_ascii_ci(key, b".jpeg") {
         Some(ImageFormat::Jpg)
-    } else if lower.ends_with(b".gif") {
+    } else if ends_with_ascii_ci(key, b".gif") {
         Some(ImageFormat::Gif)
-    } else if lower.ends_with(b".psb") {
+    } else if ends_with_ascii_ci(key, b".psb") {
         Some(ImageFormat::Psb)
     } else {
         None
@@ -402,6 +484,48 @@ mod tests {
         let mut store = store(&[(b"img/bar.png", png_2x1())], vec![ImageFormat::Png]);
         let tex = store.resolve(b"img/bar.png").expect("raw key");
         assert_eq!(tex.width, 2);
+    }
+
+    /// `ソ`=`83 5C`：尾字节是 `\`。它不能被当成分隔符，否则 `cg/ソ.png`
+    /// 的“最后组件”只剩 `.png`，会被判成无扩展名，原 key 不参与探测。
+    #[test]
+    fn cp932_trail_backslash_is_not_a_path_separator() {
+        let key = b"cg/\x83\x5c.png";
+        assert!(has_extension(key, Codec::Cp932));
+        assert_eq!(last_component(key, Codec::Cp932), b"\x83\x5c.png");
+        assert_eq!(known_extension_format(key), Some(ImageFormat::Png));
+        assert!(!has_extension(b"cg/\x83\x5c", Codec::Cp932));
+        assert_eq!(last_component(b"cg/\x83\x5c", Codec::Cp932), b"\x83\x5c");
+    }
+
+    #[test]
+    fn cp932_name_with_extension_resolves_exact_key() {
+        let mut store = store(&[(b"cg/\x83\x5c.png", png_2x1())], vec![ImageFormat::Png]);
+        let tex = store.resolve(b"cg/\x83\x5c.png").expect("cp932 name");
+        assert_eq!(tex.width, 2);
+        assert_eq!(
+            store.resolved_path(b"cg/\x83\x5c.png"),
+            Some(b"cg/\x83\x5c.png".as_slice())
+        );
+    }
+
+    /// 回归护栏：所有 CP932 lead 与尾字节 `0x5C`(`\`) 的组合都不得被当成
+    /// 路径分隔符；带 `.png` 后缀时必须判为“有扩展名”。
+    #[test]
+    fn last_component_never_splits_trail_backslash() {
+        for lead in (0x81u8..=0x9f).chain(0xe0..=0xfc) {
+            let mut key = b"cg/".to_vec();
+            key.push(lead);
+            key.push(0x5c);
+            assert_eq!(
+                last_component(&key, Codec::Cp932),
+                &[lead, 0x5c],
+                "lead={lead:#04x} 被切开"
+            );
+            assert!(!has_extension(&key, Codec::Cp932));
+            key.extend_from_slice(b".png");
+            assert!(has_extension(&key, Codec::Cp932), "lead={lead:#04x}");
+        }
     }
 
     #[test]

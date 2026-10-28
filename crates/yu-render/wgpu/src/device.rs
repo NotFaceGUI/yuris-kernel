@@ -142,6 +142,15 @@ impl GpuContext {
             ))
         })?;
 
+        // wgpu 默认把未捕获的 GPU 错误升级成 panic(游戏直接冻结)。这里改成
+        // **完整记录**(`{error:?}` 带资源与校验细节)后继续运行:显存/校验
+        // 问题不该让整场游戏崩掉,而且默认处理器只打印一句 "Out of Memory",
+        // 拿不到是哪个资源。致命性由调用方的 `checked_oom`/`checked` 作用域
+        // 决定(那些会转成 Diag 并按 op 跳过)。
+        device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
+            log::error!(target: "yu-render", "[wgpu] uncaptured error: {error:?}");
+        }));
+
         Ok(Self {
             instance,
             adapter,
@@ -172,6 +181,31 @@ impl GpuContext {
             );
         }
         Ok(())
+    }
+
+    /// 同时捕获 `Validation` 与 `OutOfMemory` 的创建作用域:两类错误都转
+    /// [`Diag`](调用方按 op 跳过),不再让 wgpu 默认处理器 panic;日志带
+    /// 具体资源与尺寸。
+    ///
+    /// 作用域必须嵌套 pop(先 Validation 后 OOM):只抓 OOM 会让同一次
+    /// 创建里的校验错误逃逸成 panic(实测修 OOM 时引入的回归)。
+    pub fn checked_oom<T>(&self, what: &str, f: impl FnOnce() -> T) -> Result<T, Diag> {
+        let oom = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let validation = self
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let value = f();
+        let validation_error = pollster::block_on(validation.pop());
+        if let Some(error) = validation_error {
+            let _ = pollster::block_on(oom.pop());
+            return Err(Diag::fatal(code::TARGET, Boundary::Platform)
+                .with_detail(format!("{what}: {error}")));
+        }
+        match pollster::block_on(oom.pop()) {
+            Some(error) => Err(Diag::fatal(code::TARGET, Boundary::Platform)
+                .with_detail(format!("{what}: {error}"))),
+            None => Ok(value),
+        }
     }
 
     /// 在 wgpu 验证作用域里执行 `f`;验证错误转成 [`Diag`]。

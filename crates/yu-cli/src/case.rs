@@ -382,15 +382,159 @@ fn run_case(project: &Project, path: &Path, update: bool, debug_mode: bool) -> C
     };
     let mut engine = Engine::new(project.clone(), opts)?;
     engine.set_timeline(build_timeline(&spec.inputs));
+    // 基准口径(`YURIS_CASE_BENCH=1`):逐帧 tick 耗时 + 命令成本汇总,
+    // 只写 stderr,不进入用例判定与金标。命令计时是 VM 侧 1/32 抽样
+    // (逐条 `Instant` 的测量开销本身就有 ~0.2µs/条,会污染结论)。
+    let bench = std::env::var_os("YURIS_CASE_BENCH").is_some();
+    if bench {
+        engine.set_command_profile(true);
+        if std::env::var_os("YURIS_CASE_PROFILE_ALL").is_some() {
+            engine.set_command_profile_sample(1);
+        }
+    }
+    // 逐帧画面签名(`YURIS_CASE_TRACE_FRAMES=from..to`):诊断「只闪一帧」
+    // 这类时序异常——软/硬两后端跑同一段剧情,对比逐帧变化率即可。
+    let trace_frames: Option<(u64, u64)> = std::env::var("YURIS_CASE_TRACE_FRAMES")
+        .ok()
+        .and_then(|raw| {
+            let (from, to) = raw.split_once("..")?;
+            Some((from.trim().parse().ok()?, to.trim().parse().ok()?))
+        });
+    let mut prev_surface: Option<Vec<u8>> = None;
+    // 定点截帧(`YURIS_CASE_SHOT_FRAMES=900,1200`):诊断用,写 target/tmp。
+    let shot_frames: Option<std::collections::BTreeSet<u64>> = std::env::var(
+        "YURIS_CASE_SHOT_FRAMES",
+    )
+    .ok()
+    .map(|raw| {
+        raw.split(',')
+            .filter_map(|item| item.trim().parse().ok())
+            .collect()
+    });
+    let mut tick_ms: Vec<f64> = Vec::with_capacity(spec.frames as usize);
+    let mut cmd_totals: std::collections::BTreeMap<String, (u64, u64)> =
+        std::collections::BTreeMap::new();
+    let bench_started = std::time::Instant::now();
     let mut ticks = 0u32;
     for _ in 0..spec.frames {
+        let started = bench.then(std::time::Instant::now);
         let rendered = engine.tick()?;
+        if let Some(started) = started {
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            tick_ms.push(ms);
+            let rows = engine.take_command_profile(usize::MAX).0;
+            if ms >= 30.0 {
+                // 长帧取证:该帧的命令构成(按累计耗时 top-8)。
+                let mut spike: Vec<(&str, u64, u64)> =
+                    rows.iter().map(|(n, h, ns)| (n.as_str(), *h, *ns)).collect();
+                spike.sort_by(|a, b| b.2.cmp(&a.2));
+                let top: Vec<String> = spike
+                    .iter()
+                    .take(8)
+                    .filter(|(_, _, ns)| *ns > 0)
+                    .map(|(n, h, ns)| format!("{n}={:.1}ms/{}", *ns as f64 / 1e6, h))
+                    .collect();
+                let report = engine.last_report();
+                output::error(format!(
+                    "[casespike] frame={ticks} ms={ms:.1} tick={:.1} render={:.1} build={:.1} capture={:.1} ops={} layers={} | {}",
+                    report.tick_ms,
+                    report.render_ms,
+                    engine.frame_build_ms(),
+                    engine.capture_ms(),
+                    report.ops,
+                    report.layers,
+                    top.join(" ")
+                ));
+            }
+            for (name, hits, ns) in rows {
+                let slot = cmd_totals.entry(name).or_insert((0, 0));
+                slot.0 = slot.0.saturating_add(hits);
+                slot.1 = slot.1.saturating_add(ns);
+            }
+        }
         ticks += 1;
+        if let Some(surface) = shot_frames
+            .as_ref()
+            .filter(|frames| frames.contains(&rendered.report.frame))
+            .and_then(|_| engine.last_surface())
+        {
+            let path = format!(
+                "target/tmp/shot-f{}-{}.png",
+                rendered.report.frame,
+                spec.backend.as_str()
+            );
+            if let Ok(bytes) = png::png_bytes(surface) {
+                if std::fs::write(&path, bytes).is_ok() {
+                    output::error(format!("[caseshot] {path}"));
+                }
+            }
+        }
+        if let Some((from, to)) = trace_frames {
+            let frame = rendered.report.frame;
+            if frame >= from && frame <= to {
+                if let Some(surface) = engine.last_surface() {
+                    let pixels = surface.rgba.chunks_exact(4);
+                    let count = pixels.len().max(1) as f64;
+                    let mut luma = 0.0f64;
+                    let mut nonzero = 0u64;
+                    for px in surface.rgba.chunks_exact(4) {
+                        luma += (f64::from(px[0]) + f64::from(px[1]) + f64::from(px[2])) / 3.0;
+                        if px[0] | px[1] | px[2] != 0 {
+                            nonzero += 1;
+                        }
+                    }
+                    let diff = match &prev_surface {
+                        Some(prev) if prev.len() == surface.rgba.len() => {
+                            let changed = prev
+                                .chunks_exact(4)
+                                .zip(surface.rgba.chunks_exact(4))
+                                .filter(|(a, b)| {
+                                    let d = |i: usize| {
+                                        a[i].abs_diff(b[i])
+                                    };
+                                    d(0) > 8 || d(1) > 8 || d(2) > 8
+                                })
+                                .count();
+                            changed as f64 * 100.0 / count
+                        }
+                        _ => -1.0,
+                    };
+                    output::error(format!(
+                        "[frametrace] f={frame} mean={:.2} nonzero={} diff={:.2}% layers={} visible={} ops={} skipped={}",
+                        luma / count,
+                        nonzero,
+                        diff,
+                        rendered.report.layers,
+                        rendered.report.visible,
+                        rendered.report.ops,
+                        rendered.report.skipped
+                    ));
+                    prev_surface = Some(surface.rgba.clone());
+                }
+            }
+        }
         if spec.until_visible && rendered.report.drawable {
             break;
         }
     }
+    if bench {
+        report_case_bench(&spec.name, &tick_ms, &cmd_totals, bench_started.elapsed());
+    }
     let report = engine.last_report().clone();
+    if bench {
+        let (script, pc, task) = engine
+            .current_position()
+            .unwrap_or_else(|| ("-".to_string(), 0, "-".to_string()));
+        output::error(format!(
+            "[casebench] state frame={} layers={} visible={} passes={} ops={} script={script} pc={pc} task={task}",
+            report.frame,
+            report.layers,
+            report.visible,
+            report.passes,
+            report.ops
+        ));
+    }
+
     let display_json = engine
         .display_json()
         .ok_or_else(|| Failure::runtime("用例没有产出帧"))?;
@@ -614,6 +758,52 @@ fn save_snapshot_text(snapshot: &yu_save::SaveSnapshot) -> String {
         }
     }
     out
+}
+
+/// `YURIS_CASE_BENCH=1` 的基准输出:逐帧 tick 分位数 + 命令成本 top-N。
+///
+/// 口径说明:tick 耗时含脚本推进/帧构建/渲染整条链路;命令成本是 VM
+/// 1/32 抽样外推值,单条命令的绝对值受采样粒度影响,但**同一口径的 A/B
+/// 对比**可信。输出只走 stderr,不写金标。
+fn report_case_bench(
+    name: &str,
+    tick_ms: &[f64],
+    cmd_totals: &std::collections::BTreeMap<String, (u64, u64)>,
+    elapsed: std::time::Duration,
+) {
+    let mut sorted = tick_ms.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pick = |pct: f64| -> f64 {
+        if sorted.is_empty() {
+            return 0.0;
+        }
+        let index = ((sorted.len() - 1) as f64 * pct).round() as usize;
+        sorted[index.min(sorted.len() - 1)]
+    };
+    let total: f64 = sorted.iter().sum();
+    output::error(format!(
+        "[casebench] case={name} frames={} wall={:.2}s tick_total={:.1}ms p50={:.2} p95={:.2} p99={:.2} max={:.2}",
+        sorted.len(),
+        elapsed.as_secs_f64(),
+        total,
+        pick(0.50),
+        pick(0.95),
+        pick(0.99),
+        pick(1.0),
+    ));
+    let mut rows: Vec<(&String, &(u64, u64))> = cmd_totals.iter().collect();
+    rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    for (cmd, (hits, ns)) in rows.into_iter().take(16) {
+        let ms = *ns as f64 / 1e6;
+        let avg_ns = if *hits > 0 {
+            *ns as f64 / *hits as f64
+        } else {
+            0.0
+        };
+        output::error(format!(
+            "[casebench] cmd {cmd} total={ms:.1}ms hits={hits} avg={avg_ns:.0}ns"
+        ));
+    }
 }
 
 /// 用例 `inputs` 的时间线展开(单测用)。

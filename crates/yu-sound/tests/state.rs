@@ -5,7 +5,7 @@ use std::io::Cursor;
 use yu_rt::value::Value;
 use yu_sound::decode::decode;
 use yu_sound::loader::MemoryLoader;
-use yu_sound::state::{probe_names, QueryField, SoundCommand, SoundState};
+use yu_sound::state::{normalize_name, probe_names, QueryField, SoundCommand, SoundState};
 use yu_sound::{FileType, PlayState};
 
 fn wav_ms(duration_ms: u32, rate: u32, channels: u16) -> Vec<u8> {
@@ -90,6 +90,103 @@ fn probe_order_is_engine_order() {
     );
     // 已带扩展名：不再追加（引擎查找序的第一项就是原样名字）。
     assert_eq!(probe_names(b"x.ogg"), vec![b"x.ogg".to_vec()]);
+    // 后缀比较大小写不敏感，但不改写名字字节（`.OGG` 原样保留）。
+    assert_eq!(probe_names(b"X.OGG"), vec![b"X.OGG".to_vec()]);
+}
+
+/// `コトネイロ` = `83 52 83 67 83 6C 83 43 83 8D`：尾字节 `0x52`(`'R'`)、
+/// `0x43`(`'C'`) 落在 ASCII 大写区间。逐字节折小写会把它改写成
+/// `ビトネツロ`(`83 72 83 63`)，包内存在的资产因此永远查不到。
+#[test]
+fn normalize_keeps_cp932_double_byte_characters_intact() {
+    let cp932 = b"\x83\x52\x83\x67\x83\x6c\x83\x43\x83\x8d";
+    let mut raw = b"VOICE\\".to_vec();
+    raw.extend_from_slice(cp932);
+    let mut want = b"voice/".to_vec();
+    want.extend_from_slice(cp932);
+    assert_eq!(normalize_name(&raw), want);
+
+    // 尾字节 `0x5C`(`\`) 的双字节字符(`ソ`=`83 5C`)不能被当成分隔符。
+    assert_eq!(
+        normalize_name(b"VOICE\\\x83\x5c"),
+        b"voice/\x83\x5c".to_vec()
+    );
+}
+
+/// 回归护栏：**所有**尾字节落在 ASCII 大写区间(`0x41..=0x5A`)的 CP932
+/// 双字节字符，以及尾字节恰为 `\`(`0x5C`) 的双字节字符，归一化后必须逐字节
+/// 不变。逐字节折小写的实现在这里会成片失败。
+#[test]
+fn normalize_never_rewrites_double_byte_trail_bytes() {
+    for lead in (0x81u8..=0x9f).chain(0xe0..=0xfc) {
+        for trail in 0x41u8..=0x5a {
+            let raw = [b'T', lead, trail, b'X'];
+            // 只有两侧的单字节 ASCII 折小写；中间的双字节整对原样保留。
+            let want = vec![b't', lead, trail, b'x'];
+            assert_eq!(
+                normalize_name(&raw),
+                want,
+                "lead={lead:#04x} trail={trail:#04x} 被改写"
+            );
+        }
+        // 尾字节 0x5C 是 `\`，不能被折成路径分隔符。
+        let raw = [b'T', lead, 0x5c];
+        assert_eq!(
+            normalize_name(&raw),
+            vec![b't', lead, 0x5c],
+            "lead={lead:#04x} trail=0x5c 被改写"
+        );
+    }
+}
+
+/// 失败诊断必须列出**归一化后实际尝试**的候选名，否则“名字被改写”与
+/// “文件确实不存在”在日志里完全同形（本缺陷曾因此难以定位）。
+#[test]
+fn missing_diag_lists_normalized_candidates() {
+    let mut s = SoundState::new(Box::new(MemoryLoader::new()));
+    let mut c = cmd("V");
+    c.file = Some(b"VOICE\\\x83\x52\x83\x67\x83\x6c\x83\x43\x83\x8d".to_vec());
+    s.apply_sound(&c);
+
+    let diags = s.diags();
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0].code, "snd.file.missing");
+    let detail = &diags[0].detail;
+    assert!(
+        detail.contains(r"voice/\x83R\x83g\x83l\x83C\x83\x8d.ogg"),
+        "应列出归一化后的候选名: {detail}"
+    );
+    assert!(
+        !detail.contains(r"\x83r"),
+        "候选名里的双字节尾字节被改写: {detail}"
+    );
+}
+
+/// 端到端：CP932 文件名经归一化 + 扩展名探测后必须命中真实资产。
+#[test]
+fn cp932_file_name_resolves_through_probe_order() {
+    let cp932 = b"\x83\x52\x83\x67\x83\x6c\x83\x43\x83\x8d";
+    let mut resolved = b"voice/".to_vec();
+    resolved.extend_from_slice(cp932);
+    resolved.extend_from_slice(b".wav");
+    let mut loader = MemoryLoader::new();
+    loader.insert(resolved, wav_ms(100, 1000, 1));
+    let mut s = SoundState::new(Box::new(loader));
+
+    let mut c = cmd("V");
+    let mut file = b"voice/".to_vec();
+    file.extend_from_slice(cp932);
+    c.file = Some(file);
+    c.play = Some(1);
+    s.apply_sound(&c);
+
+    assert_eq!(int(&mut s, "V", QueryField::Exist), 1);
+    assert_eq!(int(&mut s, "V", QueryField::TotalTime), 100);
+    assert!(
+        s.diags().is_empty(),
+        "不应产生诊断: {:?}",
+        s.diags().iter().map(|d| &d.detail).collect::<Vec<_>>()
+    );
 }
 
 #[test]

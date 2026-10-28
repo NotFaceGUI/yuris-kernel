@@ -155,7 +155,7 @@ impl TextureCache {
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         };
-        let texture = ctx.checked(code::TARGET, label, || {
+        let texture = ctx.checked_oom(&format!("{label} {width}x{height}"), || {
             use wgpu::util::DeviceExt as _;
             ctx.device.create_texture_with_data(
                 &ctx.queue,
@@ -181,6 +181,56 @@ impl TextureCache {
         self.total_uploads += 1;
         Ok(id)
     }
+
+    /// 原地重写一张已上传纹理(尺寸一致时)。返回 `false` = 尺寸不符或 id 不在。
+    ///
+    /// 帧内 CPU 覆盖(立绘缓冲合成结果)每帧内容都在变:旧实现每次都
+    /// `upload` **新建**一张纹理,而 [`TextureCache`] 只增不删 ⇒ 每帧泄漏
+    /// 数 MB,50 秒级把显存吃光(`wgpu: Out of Memory`)。同尺寸原地写回
+    /// 既消除泄漏,也保持纹理 id 不变(bind group 缓存继续命中)。
+    pub(crate) fn rewrite(
+        &mut self,
+        ctx: &GpuContext,
+        id: u64,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<bool, Diag> {
+        let expected = (width as usize) * (height as usize) * 4;
+        if rgba.len() != expected {
+            return Ok(false);
+        }
+        let Some(existing) = self.textures.get(&id) else {
+            return Ok(false);
+        };
+        if existing.width != width || existing.height != height {
+            return Ok(false);
+        }
+        let texture = &existing.texture;
+        ctx.checked_oom(&format!("rewrite {width}x{height}"), || {
+            ctx.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        })?;
+        self.total_upload_bytes += rgba.len() as u64;
+        Ok(true)
+    }
 }
 
 impl Default for TextureCache {
@@ -203,21 +253,38 @@ pub struct RenderTarget {
 pub struct TargetSet {
     screen: Option<RenderTarget>,
     offscreen: BTreeMap<LayerId, RenderTarget>,
+    /// 图层级 GPU 合成结果(`CGACT[TRANSITION]`/`MERGE` 的离屏目标)。
+    ///
+    /// 键含**槽位**(0/1):`MERGE` 链要读上一槽、写下一槽(ping-pong),
+    /// 同一帧内不能对同一纹理读写。与组离屏分开存:组目标按组状态重建,
+    /// 这里按图层像素缓存复用。
+    composites: BTreeMap<(LayerId, u8), RenderTarget>,
     snapshots: BTreeMap<CopyId, RenderTarget>,
     /// 快照的 CPU 镜像(DIV-GFX-058):`CGACT[TEXT]` 直接画在快照精灵层上
     /// 时,文本合成的基面 = 快照像素;GPU 侧没有可读像素,捕获时从 CPU
     /// 可得的源(资产/1×1 黑/另一快照镜像/冻结文本合成)留一份。组/后缓冲
     /// 源无法廉价取得 CPU 像素 ⇒ 不留镜像,后续需要时显式报缺(不猜)。
     /// 与 GPU 快照同键同生命周期(prune/clear 同步)。
-    snapshot_cpu: BTreeMap<CopyId, Texture>,
+    snapshot_cpu: BTreeMap<CopyId, std::rc::Rc<Texture>>,
     scale: Option<RenderTarget>,
 }
+
+/// 合成目标硬上限(每个约等于一张整屏/精灵缓冲)。
+const COMPOSITE_TARGET_CAP: usize = 32;
+/// 单个 GPU 目标上限(字节)。4096² RGBA = 64MB;超过 128MB 的单个目标
+/// 一定是畸形尺寸(COPY 区域异常),拒绝创建而不是让 wgpu 抛 OOM。
+const MAX_TARGET_BYTES: usize = 128 * 1024 * 1024;
+/// 全部目标(屏幕/离屏/合成/快照/缩放)的预算。GPU 还要放资产纹理与
+/// 交换链;2GB 给目标,超出时拒绝新建(调用方回退 CPU 或跳过该 op),
+/// 避免 wgpu 直接 `Out of Memory` 崩进程。
+const MAX_TOTAL_TARGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 impl TargetSet {
     pub fn new() -> Self {
         Self {
             screen: None,
             offscreen: BTreeMap::new(),
+            composites: BTreeMap::new(),
             snapshots: BTreeMap::new(),
             snapshot_cpu: BTreeMap::new(),
             scale: None,
@@ -259,6 +326,7 @@ impl TargetSet {
         for target in self
             .offscreen
             .values()
+            .chain(self.composites.values())
             .chain(self.snapshots.values())
         {
             if target.id == id {
@@ -278,6 +346,7 @@ impl TargetSet {
         for target in self
             .offscreen
             .values()
+            .chain(self.composites.values())
             .chain(self.snapshots.values())
         {
             if target.id == id {
@@ -303,6 +372,16 @@ impl TargetSet {
             .get(&id)
             .is_some_and(|t| t.width == width && t.height == height);
         if !reusable {
+            if !self.budget_ok(width, height) {
+                return Err(Diag::fatal(
+                    code::TARGET,
+                    yu_log::Boundary::Platform,
+                )
+                .with_detail(format!(
+                    "快照目标预算不足({width}x{height},累计 {}MB)",
+                    self.allocated_bytes() / (1024 * 1024)
+                )));
+            }
             // 仅在**替换**已有 GPU 目标时失效 CPU 镜像(旧内容不再对应);
             // 首建时 1.4/1.6 段预写的镜像恰好就是本快照的内容,保留。
             if let Some(old) = self.snapshots.remove(&id) {
@@ -317,12 +396,18 @@ impl TargetSet {
 
     /// 快照的 CPU 镜像(捕获时写入;与 GPU 快照同键)。
     pub fn snapshot_cpu(&self, id: CopyId) -> Option<&Texture> {
-        self.snapshot_cpu.get(&id)
+        self.snapshot_cpu.get(&id).map(|tex| tex.as_ref())
+    }
+
+    /// 快照的 CPU 镜像(`Rc` 共享;CPU 图像加工的源用它,避免整图复制)。
+    pub fn snapshot_cpu_shared(&self, id: CopyId) -> Option<std::rc::Rc<Texture>> {
+        self.snapshot_cpu.get(&id).map(std::rc::Rc::clone)
     }
 
     /// 写入/替换快照 CPU 镜像(捕获/重捕获时)。
     pub fn insert_snapshot_cpu(&mut self, id: CopyId, texture: Texture) {
-        self.snapshot_cpu.insert(id, texture);
+        self.snapshot_cpu
+            .insert(id, std::rc::Rc::new(texture));
     }
 
     /// 快照被 GPU 原地加工(RECTPAINT 族)后 CPU 镜像失效:删除而不是
@@ -350,11 +435,35 @@ impl TargetSet {
         removed
     }
 
+    /// 只保留本帧仍被引用的组离屏目标(与合成目标同理:整张纹理只增不删
+    /// 会在长会话里吃光显存)。
+    pub fn prune_offscreen(
+        &mut self,
+        live: &std::collections::BTreeSet<LayerId>,
+        pipelines: &mut crate::pipelines::PipelineCache,
+    ) {
+        let stale: Vec<LayerId> = self
+            .offscreen
+            .keys()
+            .filter(|id| !live.contains(id))
+            .cloned()
+            .collect();
+        for id in stale {
+            if let Some(target) = self.offscreen.remove(&id) {
+                pipelines.forget_texture(target.id);
+            }
+        }
+    }
+
     /// 丢弃全部离屏组目标(尺寸/内容都是上一轮 `GfxState` 的)。
     pub fn clear_offscreen(&mut self, pipelines: &mut crate::pipelines::PipelineCache) -> usize {
-        let removed = self.offscreen.len();
+        let mut removed = self.offscreen.len();
         for (_, target) in std::mem::take(&mut self.offscreen) {
             pipelines.forget_texture(target.id);
+        }
+        for (_, target) in std::mem::take(&mut self.composites) {
+            pipelines.forget_texture(target.id);
+            removed += 1;
         }
         removed
     }
@@ -416,6 +525,10 @@ impl TargetSet {
             .get(id)
             .is_some_and(|t| t.width == width && t.height == height);
         if !reusable {
+            if !self.budget_ok(width, height) {
+                return Err(Diag::fatal(code::TARGET, yu_log::Boundary::Platform)
+                    .with_detail("组离屏目标预算不足"));
+            }
             if let Some(old) = self.offscreen.remove(id) {
                 pipelines.forget_texture(old.id);
             }
@@ -423,6 +536,101 @@ impl TargetSet {
             self.offscreen.insert(id.clone(), target);
         }
         Ok(self.offscreen.get(id).expect("offscreen target set above"))
+    }
+
+    /// 图层级 GPU 合成目标(`CGACT[TRANSITION]`/`MERGE` 的结果面;按
+    /// `(图层, 槽位)` 复用)。`slot` 只允许 0/1。
+    pub fn ensure_composite(
+        &mut self,
+        ctx: &GpuContext,
+        id: &LayerId,
+        slot: u8,
+        width: u32,
+        height: u32,
+        pipelines: &mut crate::pipelines::PipelineCache,
+    ) -> Result<&RenderTarget, Diag> {
+        let key = (id.clone(), slot);
+        let reusable = self
+            .composites
+            .get(&key)
+            .is_some_and(|t| t.width == width && t.height == height);
+        if !reusable {
+            if !self.budget_ok(width, height) {
+                return Err(Diag::fatal(code::TARGET, yu_log::Boundary::Platform)
+                    .with_detail("图层合成目标预算不足"));
+            }
+            if let Some(old) = self.composites.remove(&key) {
+                pipelines.forget_texture(old.id);
+            }
+            let target = create_target(ctx, width, height, "layer composite")?;
+            self.composites.insert(key.clone(), target);
+        }
+        Ok(self
+            .composites
+            .get(&key)
+            .expect("composite target set above"))
+    }
+
+    /// 当前图层级 GPU 合成目标数(诊断:证明 GPU 合成路径确实生效)。
+    /// `(合成目标, 组离屏, 快照)` 计数(诊断/退出摘要)。
+    pub fn resource_counts(&self) -> (usize, usize, usize) {
+        (self.composites.len(), self.offscreen.len(), self.snapshots.len())
+    }
+
+    pub fn composite_count(&self) -> usize {
+        self.composites.len()
+    }
+
+    /// 当前全部目标占用字节(诊断/预算;按 RGBA8 计)。
+    pub fn allocated_bytes(&self) -> usize {
+        let mut total = 0usize;
+        for target in self
+            .screen
+            .iter()
+            .chain(self.offscreen.values())
+            .chain(self.composites.values())
+            .chain(self.snapshots.values())
+            .chain(self.scale.iter())
+        {
+            total += (target.width as usize) * (target.height as usize) * 4;
+        }
+        total
+    }
+
+    /// 目标创建的预算检查:单张过大或总量超预算都拒绝(返回 `None` 让调用方
+    /// 回退),避免 wgpu 的致命 OOM。
+    fn budget_ok(&self, width: u32, height: u32) -> bool {
+        let bytes = (width as usize) * (height as usize) * 4;
+        bytes <= MAX_TARGET_BYTES && self.allocated_bytes() + bytes <= MAX_TOTAL_TARGET_BYTES
+    }
+
+    /// 只保留本帧仍存在的图层的合成目标,并设硬上限。
+    ///
+    /// 这些目标是**整张纹理**,叠加快照/离屏后显存压力很大:合成目标表
+    /// 此前只增不删,切场景/差分累积数百张 ⇒ wgpu `Out of Memory`(实测
+    /// frame 1679 崩溃)。合成目标只服务当前帧(当帧用 `ensure_composite`
+    /// 会重建),所以按「图层本帧是否存活」剪枝 + 超限整表清空。
+    pub fn prune_composites(
+        &mut self,
+        live: &std::collections::BTreeSet<LayerId>,
+        pipelines: &mut crate::pipelines::PipelineCache,
+    ) {
+        let stale: Vec<(LayerId, u8)> = self
+            .composites
+            .keys()
+            .filter(|(id, _)| !live.contains(id))
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some(target) = self.composites.remove(&key) {
+                pipelines.forget_texture(target.id);
+            }
+        }
+        if self.composites.len() > COMPOSITE_TARGET_CAP {
+            for (_, target) in std::mem::take(&mut self.composites) {
+                pipelines.forget_texture(target.id);
+            }
+        }
     }
 }
 
@@ -453,7 +661,8 @@ fn create_target(
         usage: TARGET_USAGE,
         view_formats: &[],
     };
-    let texture = ctx.checked(code::TARGET, what, || {
+    // 显存分配失败要能定位到具体目标:scope 抓 OOM 并转 Diag(不 panic)。
+    let texture = ctx.checked_oom(&format!("{what} {width}x{height}"), || {
         ctx.device.create_texture(&descriptor)
     })?;
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
