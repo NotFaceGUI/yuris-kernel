@@ -1260,7 +1260,7 @@ fn nonvisual_cg_params_are_archived_without_unimplemented() {
 fn cg_numeric_offset_params_accumulate() {
     let table = table();
     let mut gfx = state();
-    let mut offset_arg = |cmd: &str, name: &str, value: yu_rt::value::Value| {
+    let offset_arg = |cmd: &str, name: &str, value: yu_rt::value::Value| {
         let mut a = arg(&table, cmd, name, value);
         a.offset = true;
         a
