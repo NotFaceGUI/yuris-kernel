@@ -4103,6 +4103,7 @@ dependencies = [
  "bytemuck",
  "image",
  "log",
+ "naga",
  "pollster",
  "sha2",
  "wgpu",

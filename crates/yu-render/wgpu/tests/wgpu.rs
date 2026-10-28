@@ -1844,6 +1844,9 @@ fn size_after_copy_in_same_frame_keeps_snapshot_dims() {
         "同一帧 COPY→SIZE2 不得报快照缺失,得到 {reasons:?}"
     );
     let actual = pixel(&gpu_out, 8, 8);
+    println!("gpu px={:?} soft px={:?}", actual, pixel_of_surface(&soft_out_surface(&soft_out), 8, 8));
+    println!("gpu report={:?}", gpu_out.report);
+    println!("soft report={:?}", soft_out.report);
     assert!(
         actual[0] >= 250 && actual[1] <= 5 && actual[2] <= 5,
         "快照内容必须被采样到 OUT,得到 {actual:?}"
@@ -1871,7 +1874,7 @@ fn size_after_copy_in_same_frame_keeps_snapshot_dims() {
 /// `DIV-GFX-063` §2.4「MERGE/MERGE2 的 alpha 公式缺 REA 级验证」)。
 /// 本测试只守本次回归:快照必须以 COPY 时刻像素为基面合成,结果可见。
 #[test]
-fn merge_after_rectpaint_clear_on_snapshot_keeps_pixels() {
+fn merge_after_rectpaint_clear_on_snapshot_writes_alpha() {
     let table = table();
     let mut gfx = state(Viewport::new(16, 16), [0, 0, 0, 255]);
     gfx.consume_events(&[
@@ -1960,13 +1963,22 @@ fn merge_after_rectpaint_clear_on_snapshot_keeps_pixels() {
     assert_eq!(gpu_out.report.ops_drawn, soft_out.report.ops_drawn);
     assert_eq!(gpu_out.report.skipped, soft_out.report.skipped);
 
-    // 屏幕呈现会 force_opaque,alpha 不可直接断言。真正的缺陷形态是
-    // 「快照 alpha 被留成 0 ⇒ 整层在 SRCALPHA 混合里不可见 ⇒ 该像素是纯黑」;
-    // 正确形态是上层红经快照 alpha(取自 COPY 时刻像素 200)混到黑底上,
-    // 即 `(255,0,0) * 200/255 ≈ 200`——与回归前的 wgpu 输出逐位一致。
+    // 官方合并执行体(`FUN_004405a4`,REA 0.495 `0x4405a4`)把**上层**的每
+    // 部件纹理按**下层**的每部件位置 `dev->Draw(...)` 画到当前渲染目标
+    // (= 下层表面),**不读下层旧像素**;不透明度由设备固定管线混合决定。
+    // D3D9 未启用独立 alpha 混合 ⇒ alpha 也按 `a² + dst·(1−a)` 写入:
+    //   COPY2 → RECTPAINT3 SET=0(目标 alpha=0) → MERGE(上层不透明红)
+    // ⇒ 结果 alpha = 255、RGB = 红,**整层可见**。
+    // 旧实现「MERGE 保留目标 alpha」会让清空后的整层 alpha=0,经 SRCALPHA
+    // 混合整层消失 —— 实机表现就是眨眼/换差分闪屏(skipped=0、只有 alpha 全零)。
     let actual = pixel(&gpu_out, 8, 8);
+    let expected = pixel_of_surface(&soft_out_surface(&soft_out), 8, 8);
+    assert_eq!(
+        actual, expected,
+        "MERGE 写 alpha 后的结果必须与 soft 逐像素一致(两后端同一语义)"
+    );
     assert!(
-        actual[0] >= 190 && actual[0] <= 210 && actual[1] <= 5 && actual[2] <= 5,
-        "RECTPAINT3 清空后的 MERGE 必须以 COPY 时刻像素为基面(非黑),得到 {actual:?}"
+        actual[0] >= 245 && actual[1] <= 5 && actual[2] <= 5,
+        "MERGE 必须写 alpha(清空后仍可见,不闪),得到 {actual:?}"
     );
 }

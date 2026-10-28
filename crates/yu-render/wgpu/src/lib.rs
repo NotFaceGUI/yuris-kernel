@@ -71,9 +71,11 @@
 
 pub mod device;
 pub mod passes;
+pub(crate) mod plan;
 pub mod pipelines;
 pub mod readback;
 mod shaders;
+pub mod surfaces;
 pub mod textures;
 
 pub use device::{AdapterSummary, DeviceOptions, GpuContext};
@@ -90,6 +92,7 @@ use yu_log::Diag;
 use crate::device::backend_name;
 use crate::passes::PlannedTarget;
 use crate::pipelines::PipelineCache;
+use crate::surfaces::LayerSurfaces;
 use crate::textures::{TargetSet, Vertex};
 
 /// 一帧的 GPU 统计(报告/示例打印用)。
@@ -188,16 +191,10 @@ pub struct WgpuRenderer {
     frame_copy_bytes: u64,
     frame_copy_count: u64,
     total_draw_calls: u64,
-    /// 图像加工覆盖纹理的跨帧缓存:`LayerId -> (gpu_id, w, h, content_hash)`。
-    /// 内容未变时复用 GPU 纹理,避免逐帧重传(600 帧验收)。
-    uploaded_overrides: std::collections::BTreeMap<yu_gfx::LayerId, (u64, u32, u32, u64)>,
-    /// `CGACT[SIZE/SIZE2]` 结果缓存(与 soft 同一键/算法;EVID-J3-04)。
-    image_cache: std::collections::BTreeMap<yu_render_core::ImageCacheKey, passes::Override>,
-    /// 合成链记忆化:层 id → (输入指纹, 上一帧的合成结果)。
-    composite_cache: std::collections::BTreeMap<
-        yu_gfx::LayerId,
-        (u64, std::rc::Rc<yu_render_core::Texture>),
-    >,
+    /// 图层常驻表面(每层一张 GPU 纹理;`CGACT` 就地改它)。
+    surfaces: LayerSurfaces,
+    /// 文本合成的上传缓存(内容哈希命中时不重传)。
+    text_uploads: plan::TextUploads,
     /// 上一帧呈现内容(`COPY ID=:/W0/` 读后缓冲;EVID-J3-06)。
     backbuffer: Option<Arc<Surface>>,
     /// 后缓冲 GPU 纹理缓存:`(content_hash, gpu_id)`。
@@ -234,9 +231,8 @@ impl WgpuRenderer {
             frame_copy_bytes: 0,
             frame_copy_count: 0,
             total_draw_calls: 0,
-            uploaded_overrides: std::collections::BTreeMap::new(),
-            image_cache: std::collections::BTreeMap::new(),
-            composite_cache: std::collections::BTreeMap::new(),
+            surfaces: LayerSurfaces::new(),
+            text_uploads: plan::TextUploads::default(),
             backbuffer: None,
             backbuffer_gpu: None,
             text: yu_render_core::TextComposer::new(),
@@ -265,22 +261,28 @@ impl WgpuRenderer {
     #[must_use]
     pub fn resource_counts(&self) -> (usize, usize, usize) {
         (
-            self.targets.composite_count(),
+            self.surfaces.stats().live_surfaces,
             self.targets.offscreen_count(),
             self.targets.snapshot_count(),
         )
     }
 
+    /// 常驻层表面统计(退出摘要/诊断)。
+    #[must_use]
+    pub fn surface_stats(&self) -> crate::surfaces::SurfaceStats {
+        self.surfaces.stats()
+    }
+
     /// 全部 GPU 目标占用字节(诊断:确认显存不随场景累积)。
     #[must_use]
     pub fn target_bytes(&self) -> usize {
-        self.targets.allocated_bytes()
+        self.targets.allocated_bytes() + self.surfaces.total_bytes()
     }
 
-    /// 快照的 CPU 镜像(共享 `Rc`;`SAVE[ID]` 抓帧器直接复用,不再整帧回放)。
+    /// 快照纹理是否存在(存档抓帧的按需读回入口)。
     #[must_use]
-    pub fn snapshot_cpu_shared(&self, id: CopyId) -> Option<std::rc::Rc<yu_render_core::Texture>> {
-        self.targets.snapshot_cpu_shared(id)
+    pub fn has_snapshot(&self, id: CopyId) -> bool {
+        self.targets.snapshot(id).is_some()
     }
 
     /// 预枚举系统字体(宿主启动时;见 `TextComposer::warm`)。
@@ -324,9 +326,8 @@ impl WgpuRenderer {
     pub fn reset(&mut self) {
         self.backbuffer = None;
         self.backbuffer_gpu = None;
-        self.uploaded_overrides.clear();
-        self.image_cache.clear();
-        self.composite_cache.clear();
+        self.surfaces.reset();
+        self.text_uploads.clear();
         self.targets.clear_snapshots(&mut self.pipelines);
         self.targets.clear_offscreen(&mut self.pipelines);
         self.readback = ReadbackCache::new();
@@ -471,17 +472,17 @@ impl WgpuRenderer {
         let snapshots_before = self.targets.resource_counts().2;
         let uploads_before = self.gpu_textures.total_uploads;
         let bytes_before = self.gpu_textures.total_upload_bytes;
+        let asset_before = self.gpu_textures.asset_upload_bytes;
 
-        let (plan, report, mut phases) = passes::plan(
+        let (plan, report, mut phases) = plan::plan(
             &self.ctx,
             frame,
             &mut self.textures,
             &mut self.gpu_textures,
             &mut self.pipelines,
             &mut self.targets,
-            &mut self.uploaded_overrides,
-            &mut self.image_cache,
-            &mut self.composite_cache,
+            &mut self.surfaces,
+            &mut self.text_uploads,
             self.backbuffer.as_deref(),
             &mut self.backbuffer_gpu,
             &mut self.text,
@@ -547,6 +548,10 @@ impl WgpuRenderer {
             .saturating_sub(snapshots_before) as u64;
         phases.uploads = self.gpu_textures.total_uploads - uploads_before;
         phases.upload_bytes = self.gpu_textures.total_upload_bytes - bytes_before;
+        phases.upload_asset_bytes = self
+            .gpu_textures
+            .asset_upload_bytes
+            .saturating_sub(asset_before);
         // 屏幕是 opaque 窗口(与 soft 的最终屏幕归一、浏览器 canvas 的
         // alphaMode=opaque 一致);组 RT alpha 不进入呈现读回。
         force_opaque(&mut screen_surface);
@@ -625,7 +630,7 @@ impl WgpuRenderer {
             bind_groups: self.pipelines.bind_groups(),
             cached_textures: self.gpu_textures.cached_textures(),
             offscreen_targets: self.targets.offscreen_count(),
-            layer_composites: self.targets.composite_count(),
+            layer_composites: self.surfaces.stats().surface_passes as usize,
             vertex_bytes: vertex_bytes.len() as u64,
             readback_bytes,
         };
@@ -673,337 +678,268 @@ impl WgpuRenderer {
         plan: &passes::FramePlan,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Result<(), Diag> {
-        {
-            let pipelines = &self.pipelines;
-            let targets = &self.targets;
-            let gpu = &self.gpu_textures;
-            let vertex_buffer = self.vertex_buffer.as_ref().map(|slot| &slot.buffer);
-            for pass in &plan.passes {
-                let Some(planned_target) = pass.target.as_ref() else {
-                    continue;
-                };
-                if matches!(planned_target, PlannedTarget::Commands) {
-                    // COPY:GPU 纹理复制(源 → 快照)。
-                    for copy in &pass.copies {
-                        let source = gpu
-                            .get(copy.source_id)
-                            .map(|texture| &texture.texture)
-                            .or_else(|| targets.texture_by_id(copy.source_id))
-                            .ok_or_else(|| {
-                                Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                                    .with_detail(format!("COPY 源纹理 {} 缺失", copy.source_id))
-                            })?;
-                        let dest = targets.snapshot(copy.dest).ok_or_else(|| {
-                            Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                                .with_detail("COPY 目标快照缺失")
-                        })?;
-                        encoder.copy_texture_to_texture(
-                            wgpu::TexelCopyTextureInfo {
-                                texture: source,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d {
-                                    x: copy.origin.0,
-                                    y: copy.origin.1,
-                                    z: 0,
-                                },
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::TexelCopyTextureInfo {
-                                texture: &dest.texture,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::Extent3d {
-                                width: copy.extent.0,
-                                height: copy.extent.1,
-                                depth_or_array_layers: 1,
-                            },
-                        );
-                        self.frame_copy_bytes = self.frame_copy_bytes.saturating_add(
-                            u64::from(copy.extent.0)
-                                .saturating_mul(u64::from(copy.extent.1))
-                                .saturating_mul(8),
-                        );
-                        self.frame_copy_count += 1;
-                    }
-                    // 通用纹理 → 纹理整面复制(`MERGE` 下层快照 → 临时槽)。
-                    for blit in &pass.blits {
-                        // 源快照缺失 = 该 COPY 本帧没成功落地(被跳过/源不可解析)。
-                        // 跳过这条 blit(以及依赖它的合成 pass 会因目标缺失跳过),
-                        // 不让整帧 fatal。
-                        let Some(source) = targets
-                            .snapshot(blit.source)
-                            .map(|target| &target.texture)
-                        else {
-                            log::warn!(
-                                target: "yu-render",
-                                "[blit] snapshot {} missing; skipped",
-                                blit.source.0
-                            );
-                            continue;
-                        };
-                        let dest = targets.texture_by_id(blit.dest_id).ok_or_else(|| {
-                            Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                                .with_detail(format!("BLIT 目标纹理 {} 缺失", blit.dest_id))
-                        })?;
-                        encoder.copy_texture_to_texture(
-                            wgpu::TexelCopyTextureInfo {
-                                texture: source,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::TexelCopyTextureInfo {
-                                texture: dest,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::Extent3d {
-                                width: blit.width,
-                                height: blit.height,
-                                depth_or_array_layers: 1,
-                            },
-                        );
-                        self.frame_copy_bytes = self.frame_copy_bytes.saturating_add(
-                            u64::from(blit.width)
-                                .saturating_mul(u64::from(blit.height))
-                                .saturating_mul(8),
-                        );
-                        self.frame_copy_count += 1;
-                    }
-                    // 快照上的 RECTPAINT 族:逐条独立 render pass(Load 保留内容)。
-                    for paint in &pass.paints {
-                        let target = targets.snapshot(paint.target).ok_or_else(|| {
-                            Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                                .with_detail("快照填充目标缺失")
-                        })?;
-                        let (pipeline, bind) = match &paint.kind {
-                            passes::PaintKind::Solid { alpha_only, color } => {
-                                let pipeline = pipelines.paint_pipeline(*alpha_only).ok_or_else(
-                                    || {
-                                        Diag::fatal(
-                                            device::code::TARGET,
-                                            yu_log::Boundary::Platform,
-                                        )
-                                        .with_detail("快照填充管线缺失")
-                                    },
-                                )?;
-                                let bind = pipelines
-                                    .paint_bind_group(*alpha_only, *color)
-                                    .ok_or_else(|| {
-                                        Diag::fatal(
-                                            device::code::TARGET,
-                                            yu_log::Boundary::Platform,
-                                        )
-                                        .with_detail("快照填充 bind group 缺失")
-                                    })?;
-                                (pipeline, bind)
-                            }
-                            passes::PaintKind::Texture {
-                                source_id,
-                                write_alpha,
-                            } => {
-                                let pipeline = pipelines.merge_pipeline(*write_alpha).ok_or_else(
-                                    || {
-                                        Diag::fatal(
-                                            device::code::TARGET,
-                                            yu_log::Boundary::Platform,
-                                        )
-                                        .with_detail("MERGE 合成管线缺失")
-                                    },
-                                )?;
-                                let bind = pipelines
-                                    .bind_group(*source_id, crate::pipelines::FilterKind::Linear)
-                                    .ok_or_else(|| {
-                                        Diag::fatal(
-                                            device::code::TARGET,
-                                            yu_log::Boundary::Platform,
-                                        )
-                                        .with_detail("MERGE 源 bind group 缺失")
-                                    })?;
-                                (pipeline, bind)
-                            }
-                        };
-                        let attachments = [Some(wgpu::RenderPassColorAttachment {
-                            view: &target.view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })];
-                        let mut render_pass =
-                            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("yu-backend-wgpu snapshot paint"),
-                                color_attachments: &attachments,
-                                depth_stencil_attachment: None,
-                                timestamp_writes: None,
-                                occlusion_query_set: None,
-                                multiview_mask: None,
-                            });
-                        if let Some(buffer) = vertex_buffer {
-                            render_pass.set_vertex_buffer(0, buffer.slice(..));
-                        }
-                        render_pass.set_pipeline(pipeline);
-                        render_pass.set_bind_group(0, bind, &[]);
-                        render_pass.draw(paint.first_vertex..paint.first_vertex + 6, 0..1);
-                    }
-                    continue;
-                }
-                let target = match planned_target {
-                    PlannedTarget::Screen => targets.screen().ok_or_else(|| {
-                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                            .with_detail("缺少屏幕目标")
-                    })?,
-                    PlannedTarget::Offscreen(id) => targets.offscreen(id).ok_or_else(|| {
-                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                            .with_detail(format!("缺少离屏目标 {}", id.display()))
-                    })?,
-                    PlannedTarget::Commands => unreachable!("handled above"),
-                    // 合成/快照目标在下面的 `target_view` 里解析。
-                    PlannedTarget::Composite(_) | PlannedTarget::Snapshot(_) => {
-                        targets.screen().ok_or_else(|| {
-                            Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                                .with_detail("缺少屏幕目标")
-                        })?
-                    }
-                };
-                // 图层级合成 pass 的目标按**纹理 id** 查(槽位由 Override 决定,
-                // 不绑定 LayerId 单键)。
-                let composite_view;
-                let target_view: &wgpu::TextureView = match planned_target {
-                    PlannedTarget::Composite(gpu_id) => {
-                        composite_view = targets.view_by_id(*gpu_id).ok_or_else(|| {
-                            Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform).with_detail(
-                                format!("缺少图层合成目标 {gpu_id}"),
-                            )
-                        })?;
-                        composite_view
-                    }
-                    PlannedTarget::Snapshot(copy_id) => {
-                        let Some(target) = targets.snapshot(*copy_id) else {
-                            log::warn!(
-                                target: "yu-render",
-                                "[merge] snapshot {} missing; pass skipped",
-                                copy_id.0
-                            );
-                            continue;
-                        };
-                        composite_view = &target.view;
-                        composite_view
-                    }
-                    _ => &target.view,
+        let pipelines = &self.pipelines;
+        let targets = &self.targets;
+        let gpu = &self.gpu_textures;
+        let vertex_buffer = self.vertex_buffer.as_ref().map(|slot| &slot.buffer);
+        let resolve_view = |id: u64| -> Option<&wgpu::TextureView> {
+            plan.views
+                .get(&id)
+                .or_else(|| gpu.get(id).map(|texture| &texture.view))
+                .or_else(|| targets.view_by_id(id))
+        };
+        let resolve_texture = |id: u64| -> Option<&wgpu::Texture> {
+            plan.textures
+                .get(&id)
+                .or_else(|| gpu.get(id).map(|texture| &texture.texture))
+                .or_else(|| targets.texture_by_id(id))
+        };
+        for pass in &plan.passes {
+            // 先清屏(池里复用的表面可能带旧内容;TRANSPARENT = 引擎空面)。
+            for id in &pass.clear_targets {
+                let Some(view) = resolve_view(*id) else {
+                    return Err(Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                        .with_detail(format!("清屏目标 {id} 缺失")));
                 };
                 let attachments = [Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
+                    view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(pass.clear),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 })];
-                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("yu-backend-wgpu pass"),
+                let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("yu-backend-wgpu clear"),
                     color_attachments: &attachments,
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                if let Some(buffer) = vertex_buffer {
-                    if !pass.draws.is_empty() {
+            }
+            let Some(planned_target) = pass.target.as_ref() else {
+                continue;
+            };
+            if matches!(planned_target, PlannedTarget::Commands) {
+                // 纹理区域复制(COPY 快照/RESIZE/TRIM/保留内容)。
+                for blit in &pass.blits {
+                    let source = resolve_texture(blit.source_id).ok_or_else(|| {
+                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                            .with_detail(format!(
+                            "blit({}) 源纹理 {} 缺失",
+                            blit.label, blit.source_id
+                        ))
+                    })?;
+                    let dest = resolve_texture(blit.dest_id).ok_or_else(|| {
+                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                            .with_detail(format!(
+                            "blit({}) 目标纹理 {} 缺失",
+                            blit.label, blit.dest_id
+                        ))
+                    })?;
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: source,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: blit.src_origin.0,
+                                y: blit.src_origin.1,
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: dest,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: blit.dst_origin.0,
+                                y: blit.dst_origin.1,
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: blit.width,
+                            height: blit.height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    self.frame_copy_bytes = self.frame_copy_bytes.saturating_add(
+                        u64::from(blit.width)
+                            .saturating_mul(u64::from(blit.height))
+                            .saturating_mul(8),
+                    );
+                    self.frame_copy_count += 1;
+                }
+                // 表面上的 RECTPAINT 族:每条独立 render pass(Load 保留内容)。
+                for paint in &pass.paints {
+                    let Some(view) = resolve_view(paint.target_id) else {
+                        return Err(Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                            .with_detail(format!("填充目标 {} 缺失", paint.target_id)));
+                    };
+                    let pipeline = pipelines.paint_pipeline(paint.alpha_only).ok_or_else(|| {
+                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                            .with_detail("填充管线缺失")
+                    })?;
+                    let bind = pipelines
+                        .paint_bind_group(paint.alpha_only, paint.color)
+                        .ok_or_else(|| {
+                            Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                                .with_detail("填充 bind group 缺失")
+                        })?;
+                    let attachments = [Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })];
+                    let mut render_pass =
+                        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("yu-backend-wgpu surface paint"),
+                            color_attachments: &attachments,
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                    if let Some(buffer) = vertex_buffer {
                         render_pass.set_vertex_buffer(0, buffer.slice(..));
                     }
+                    render_pass.set_pipeline(pipeline);
+                    render_pass.set_bind_group(0, bind, &[]);
+                    render_pass.draw(paint.first_vertex..paint.first_vertex + 6, 0..1);
                 }
-                let mut current_pipeline: Option<(BlendMode, u8)> = None;
-                let mut current_bind = None;
-                for (index, draw) in pass.draws.iter().enumerate() {
-                    // 0=quad,1=固定过渡,2=psC,3=psD;管线键必须区分变体。
-                    let (pipeline, pipe_kind) = match &draw.kind {
-                        passes::DrawKind::Quad => (pipelines.pipeline(draw.blend), 0u8),
-                        passes::DrawKind::Transition { .. } => {
-                            (pipelines.transition_pipeline(draw.blend), 1)
-                        }
-                        passes::DrawKind::TransitionPsc { .. } => {
-                            (pipelines.psc_pipeline(draw.blend), 2)
-                        }
-                        passes::DrawKind::TransitionPsd { .. } => {
-                            (pipelines.psd_pipeline(draw.blend), 3)
-                        }
-                        passes::DrawKind::Lerp { .. } => (pipelines.lerp_pipeline(), 4),
-                        passes::DrawKind::Merge { .. } => (pipelines.layer_merge_pipeline(), 5),
-                    };
-                    let pipeline = pipeline.ok_or_else(|| {
-                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform).with_detail(
-                            format!(
-                                "缺少 blend {} 的{}管线",
-                                draw.blend.name(),
-                                match pipe_kind {
-                                    0 => "",
-                                    _ => "过渡",
-                                }
-                            ),
-                        )
-                    })?;
-                    let key = (draw.blend, pipe_kind);
-                    if current_pipeline != Some(key) {
-                        render_pass.set_pipeline(pipeline);
-                        current_pipeline = Some(key);
+                continue;
+            }
+            let target_view: &wgpu::TextureView = match planned_target {
+                PlannedTarget::Screen => targets
+                    .screen()
+                    .map(|target| &target.view)
+                    .ok_or_else(|| {
+                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                            .with_detail("缺少屏幕目标")
+                    })?,
+                PlannedTarget::Offscreen(id) => targets
+                    .offscreen(id)
+                    .map(|target| &target.view)
+                    .ok_or_else(|| {
+                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                            .with_detail(format!("缺少离屏目标 {}", id.display()))
+                    })?,
+                PlannedTarget::Surface(id) => resolve_view(*id).ok_or_else(|| {
+                    Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                        .with_detail(format!("缺少层表面 {id}"))
+                })?,
+                PlannedTarget::Commands => unreachable!("handled above"),
+            };
+            let load = if pass.load {
+                wgpu::LoadOp::Load
+            } else {
+                wgpu::LoadOp::Clear(pass.clear)
+            };
+            let attachments = [Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })];
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("yu-backend-wgpu pass"),
+                color_attachments: &attachments,
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if let Some(buffer) = vertex_buffer {
+                if !pass.draws.is_empty() {
+                    render_pass.set_vertex_buffer(0, buffer.slice(..));
+                }
+            }
+            let mut current_pipeline: Option<(BlendMode, u8)> = None;
+            let mut current_bind = None;
+            for (index, draw) in pass.draws.iter().enumerate() {
+                let (pipeline, pipe_kind) = match &draw.kind {
+                    passes::DrawKind::Quad => (pipelines.pipeline(draw.blend), 0u8),
+                    passes::DrawKind::Transition { .. } => {
+                        (pipelines.transition_pipeline(draw.blend), 1)
                     }
-                    let bind = match &draw.kind {
-                        passes::DrawKind::Transition { bind_index }
-                        | passes::DrawKind::TransitionPsc { bind_index }
-                        | passes::DrawKind::TransitionPsd { bind_index } => {
-                            &plan.transition_bind_groups[*bind_index as usize]
-                        }
-                        passes::DrawKind::Lerp { bind_index } => {
-                            &plan.lerp_bind_groups[*bind_index as usize]
-                        }
-                        passes::DrawKind::Merge { bind_index } => {
-                            &plan.merge_bind_groups[*bind_index as usize]
-                        }
-                        passes::DrawKind::Quad => pipelines
-                            .bind_group(draw.texture_id, draw.filter)
-                            .ok_or_else(|| {
-                                Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                                    .with_detail(format!(
-                                        "缺少纹理 {} / {:?} 的 bind group",
-                                        draw.texture_id, draw.filter
-                                    ))
-                            })?,
-                    };
-                    let bind_key = match &draw.kind {
-                        passes::DrawKind::Transition { bind_index }
-                        | passes::DrawKind::TransitionPsc { bind_index }
-                        | passes::DrawKind::TransitionPsd { bind_index } => {
-                            (u64::MAX - u64::from(*bind_index), draw.filter)
-                        }
-                        passes::DrawKind::Lerp { bind_index } => {
-                            (u64::MAX / 2 - u64::from(*bind_index), draw.filter)
-                        }
-                        passes::DrawKind::Merge { bind_index } => {
-                            (u64::MAX / 4 - u64::from(*bind_index), draw.filter)
-                        }
-                        passes::DrawKind::Quad => (draw.texture_id, draw.filter),
-                    };
-                    if current_bind != Some(bind_key) {
-                        render_pass.set_bind_group(0, bind, &[]);
-                        current_bind = Some(bind_key);
+                    passes::DrawKind::TransitionPsc { .. } => {
+                        (pipelines.psc_pipeline(draw.blend), 2)
                     }
-                    // lerp/merge 用全屏三角形(`@builtin(vertex_index)`),不读顶点缓冲。
-                    if matches!(
-                        draw.kind,
-                        passes::DrawKind::Lerp { .. } | passes::DrawKind::Merge { .. }
-                    ) {
-                        render_pass.draw(0..3, 0..1);
-                    } else {
-                        let first = pass.first_vertex + (index as u32) * 6;
-                        render_pass.draw(first..first + 6, 0..1);
+                    passes::DrawKind::TransitionPsd { .. } => {
+                        (pipelines.psd_pipeline(draw.blend), 3)
                     }
+                    passes::DrawKind::Aux { pipeline, .. } => match pipeline {
+                        passes::AuxPipeline::LayerMerge => (pipelines.layer_merge_pipeline(), 10),
+                        passes::AuxPipeline::Composite => (pipelines.composite_pipeline(), 6),
+                        passes::AuxPipeline::Lerp => (pipelines.lerp_pipeline(), 7),
+                        passes::AuxPipeline::Transform => (pipelines.transform_pipeline(), 8),
+                        passes::AuxPipeline::Resample => (pipelines.resample_pipeline(), 9),
+                    },
+                };
+                let pipeline = pipeline.ok_or_else(|| {
+                    Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform).with_detail(
+                        format!(
+                            "缺少 blend {} 的{}管线",
+                            draw.blend.name(),
+                            if pipe_kind == 0 { "" } else { "表面写入" }
+                        ),
+                    )
+                })?;
+                let key = (draw.blend, pipe_kind);
+                if current_pipeline != Some(key) {
+                    render_pass.set_pipeline(pipeline);
+                    current_pipeline = Some(key);
+                }
+                let bind = match &draw.kind {
+                    passes::DrawKind::Transition { bind_index }
+                    | passes::DrawKind::TransitionPsc { bind_index }
+                    | passes::DrawKind::TransitionPsd { bind_index } => {
+                        &plan.transition_bind_groups[*bind_index as usize]
+                    }
+                    passes::DrawKind::Aux { bind_index, .. } => {
+                        &plan.aux_bind_groups[*bind_index as usize]
+                    }
+                    passes::DrawKind::Quad => pipelines
+                        .bind_group(draw.texture_id, draw.filter)
+                        .ok_or_else(|| {
+                            Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                                .with_detail(format!(
+                                    "缺少纹理 {} / {:?} 的 bind group",
+                                    draw.texture_id, draw.filter
+                                ))
+                        })?,
+                };
+                let bind_key = match &draw.kind {
+                    passes::DrawKind::Transition { bind_index }
+                    | passes::DrawKind::TransitionPsc { bind_index }
+                    | passes::DrawKind::TransitionPsd { bind_index } => {
+                        (u64::MAX - u64::from(*bind_index), draw.filter)
+                    }
+                    passes::DrawKind::Aux { bind_index, .. } => {
+                        (u64::MAX / 2 - u64::from(*bind_index), draw.filter)
+                    }
+                    passes::DrawKind::Quad => (draw.texture_id, draw.filter),
+                };
+                if current_bind != Some(bind_key) {
+                    render_pass.set_bind_group(0, bind, &[]);
+                    current_bind = Some(bind_key);
+                }
+                // 全屏三角形(合成/滤镜/重采样)不读顶点缓冲。
+                if matches!(draw.kind, passes::DrawKind::Aux { .. }) {
+                    render_pass.draw(0..3, 0..1);
+                } else {
+                    let first = pass.first_vertex + (index as u32) * 6;
+                    render_pass.draw(first..first + 6, 0..1);
                 }
             }
         }

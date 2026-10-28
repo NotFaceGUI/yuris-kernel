@@ -39,3 +39,12 @@ pub const LERP: &str = include_str!("lerp.wgsl");
 
 /// `CGACT[MERGE=1]` 的 GPU 整数合成(与 soft `apply_merge(…, false)` 逐位一致)。
 pub const MERGE: &str = include_str!("merge.wgsl");
+
+/// `CGACT[MERGE2/XOR/AND]` 的 GPU 合成(lower + upper + mode uniform)。
+pub const COMPOSITE: &str = include_str!("composite.wgsl");
+
+/// 逐层原地滤镜族(REVERSE/镜像/MEIDO/SAIDO/AKARUSA/MONO/SEPIA/MOSAIC/ROTATION)。
+pub const TRANSFORM: &str = include_str!("transform.wgsl");
+
+/// 区域重采样(`scale_region` 的 GPU 等价;物化 UV 采样修饰)。
+pub const RESAMPLE: &str = include_str!("resample.wgsl");

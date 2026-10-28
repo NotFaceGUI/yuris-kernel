@@ -13,8 +13,10 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::Pod;
-use yu_render_core::{Texture, TextureStore};
+use yu_render_core::TextureStore;
 use yu_gfx::{CopyId, LayerId};
+
+use crate::surfaces::TexRef;
 use yu_log::Diag;
 
 use crate::device::{code, GpuContext};
@@ -25,7 +27,7 @@ use crate::pipelines::TARGET_FORMAT;
 /// 统一分配;id 不进入任何报告/像素输出,因此不影响确定性。
 static NEXT_TEXTURE_ID: AtomicU64 = AtomicU64::new(1);
 
-fn allocate_texture_id() -> u64 {
+pub(crate) fn allocate_texture_id() -> u64 {
     NEXT_TEXTURE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -52,6 +54,9 @@ pub struct TextureCache {
     solid_id: Option<u64>,
     /// 累计上传字节(解码后的 RGBA8 字节数,不含 wgpu 内部行填充)。
     pub total_upload_bytes: u64,
+    /// 其中**资产首次解码**带来的字节(`ensure_asset`)。与覆盖/合成上传分开
+    /// 记账:前者是加载新美术的一次性成本,后者才是每帧渲染预算。
+    pub asset_upload_bytes: u64,
     /// 累计上传纹理数。
     pub total_uploads: u64,
 }
@@ -63,6 +68,7 @@ impl TextureCache {
             asset_ids: BTreeMap::new(),
             solid_id: None,
             total_upload_bytes: 0,
+            asset_upload_bytes: 0,
             total_uploads: 0,
         }
     }
@@ -100,6 +106,10 @@ impl TextureCache {
             "asset texture",
         )?;
         self.asset_ids.insert(key.to_vec(), uploaded);
+        let texture = store.resolve(key)?;
+        self.asset_upload_bytes = self
+            .asset_upload_bytes
+            .saturating_add(texture.rgba.len() as u64);
         Ok(uploaded)
     }
 
@@ -182,55 +192,6 @@ impl TextureCache {
         Ok(id)
     }
 
-    /// 原地重写一张已上传纹理(尺寸一致时)。返回 `false` = 尺寸不符或 id 不在。
-    ///
-    /// 帧内 CPU 覆盖(立绘缓冲合成结果)每帧内容都在变:旧实现每次都
-    /// `upload` **新建**一张纹理,而 [`TextureCache`] 只增不删 ⇒ 每帧泄漏
-    /// 数 MB,50 秒级把显存吃光(`wgpu: Out of Memory`)。同尺寸原地写回
-    /// 既消除泄漏,也保持纹理 id 不变(bind group 缓存继续命中)。
-    pub(crate) fn rewrite(
-        &mut self,
-        ctx: &GpuContext,
-        id: u64,
-        width: u32,
-        height: u32,
-        rgba: &[u8],
-    ) -> Result<bool, Diag> {
-        let expected = (width as usize) * (height as usize) * 4;
-        if rgba.len() != expected {
-            return Ok(false);
-        }
-        let Some(existing) = self.textures.get(&id) else {
-            return Ok(false);
-        };
-        if existing.width != width || existing.height != height {
-            return Ok(false);
-        }
-        let texture = &existing.texture;
-        ctx.checked_oom(&format!("rewrite {width}x{height}"), || {
-            ctx.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                rgba,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width * 4),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-        })?;
-        self.total_upload_bytes += rgba.len() as u64;
-        Ok(true)
-    }
 }
 
 impl Default for TextureCache {
@@ -259,13 +220,9 @@ pub struct TargetSet {
     /// 同一帧内不能对同一纹理读写。与组离屏分开存:组目标按组状态重建,
     /// 这里按图层像素缓存复用。
     composites: BTreeMap<(LayerId, u8), RenderTarget>,
-    snapshots: BTreeMap<CopyId, RenderTarget>,
-    /// 快照的 CPU 镜像(DIV-GFX-058):`CGACT[TEXT]` 直接画在快照精灵层上
-    /// 时,文本合成的基面 = 快照像素;GPU 侧没有可读像素,捕获时从 CPU
-    /// 可得的源(资产/1×1 黑/另一快照镜像/冻结文本合成)留一份。组/后缓冲
-    /// 源无法廉价取得 CPU 像素 ⇒ 不留镜像,后续需要时显式报缺(不猜)。
-    /// 与 GPU 快照同键同生命周期(prune/clear 同步)。
-    snapshot_cpu: BTreeMap<CopyId, std::rc::Rc<Texture>>,
+    /// 快照纹理:COPY 时刻冻结。**可以别名源内容纹理**(零拷贝;W3 第一态),
+    /// 也可以是自己的一张区域拷贝。按 `CopyId` 跨帧复用。
+    snapshots: BTreeMap<CopyId, std::rc::Rc<TexRef>>,
     scale: Option<RenderTarget>,
 }
 
@@ -286,7 +243,6 @@ impl TargetSet {
             offscreen: BTreeMap::new(),
             composites: BTreeMap::new(),
             snapshots: BTreeMap::new(),
-            snapshot_cpu: BTreeMap::new(),
             scale: None,
         }
     }
@@ -304,8 +260,14 @@ impl TargetSet {
         self.offscreen.get(id)
     }
 
-    pub fn snapshot(&self, id: CopyId) -> Option<&RenderTarget> {
+    pub fn snapshot(&self, id: CopyId) -> Option<&std::rc::Rc<TexRef>> {
         self.snapshots.get(&id)
+    }
+
+    /// 冻结一张快照(COPY 规划期)。内容纹理由 `LayerSurfaces` 的池/层内容
+    /// 或本模块新建,这里只登记句柄。
+    pub fn set_snapshot(&mut self, id: CopyId, tex: std::rc::Rc<TexRef>) {
+        self.snapshots.insert(id, tex);
     }
 
     pub fn offscreen_count(&self) -> usize {
@@ -327,8 +289,12 @@ impl TargetSet {
             .offscreen
             .values()
             .chain(self.composites.values())
-            .chain(self.snapshots.values())
         {
+            if target.id == id {
+                return Some(&target.view);
+            }
+        }
+        for target in self.snapshots.values() {
             if target.id == id {
                 return Some(&target.view);
             }
@@ -347,8 +313,12 @@ impl TargetSet {
             .offscreen
             .values()
             .chain(self.composites.values())
-            .chain(self.snapshots.values())
         {
+            if target.id == id {
+                return Some(&target.texture);
+            }
+        }
+        for target in self.snapshots.values() {
             if target.id == id {
                 return Some(&target.texture);
             }
@@ -356,70 +326,25 @@ impl TargetSet {
         None
     }
 
-    /// COPY 目标的快照纹理(EVID-T-12:按 `CopyId` 冻结;已存在则复用)。
-    ///
-    /// 快照同时可被采样、被 COPY 写入、被 RECTPAINT 族渲染。
-    pub fn ensure_snapshot(
-        &mut self,
-        ctx: &GpuContext,
-        id: CopyId,
-        width: u32,
-        height: u32,
-        pipelines: &mut crate::pipelines::PipelineCache,
-    ) -> Result<&RenderTarget, Diag> {
-        let reusable = self
-            .snapshots
-            .get(&id)
-            .is_some_and(|t| t.width == width && t.height == height);
-        if !reusable {
-            if !self.budget_ok(width, height) {
-                return Err(Diag::fatal(
-                    code::TARGET,
-                    yu_log::Boundary::Platform,
-                )
-                .with_detail(format!(
-                    "快照目标预算不足({width}x{height},累计 {}MB)",
-                    self.allocated_bytes() / (1024 * 1024)
-                )));
-            }
-            // 仅在**替换**已有 GPU 目标时失效 CPU 镜像(旧内容不再对应);
-            // 首建时 1.4/1.6 段预写的镜像恰好就是本快照的内容,保留。
-            if let Some(old) = self.snapshots.remove(&id) {
-                pipelines.forget_texture(old.id);
-                self.snapshot_cpu.remove(&id);
-            }
-            let target = create_target(ctx, width, height, "copy snapshot")?;
-            self.snapshots.insert(id, target);
-        }
-        Ok(self.snapshots.get(&id).expect("snapshot target set above"))
-    }
-
-    /// 快照的 CPU 镜像(捕获时写入;与 GPU 快照同键)。
-    pub fn snapshot_cpu(&self, id: CopyId) -> Option<&Texture> {
-        self.snapshot_cpu.get(&id).map(|tex| tex.as_ref())
-    }
-
-    /// 快照的 CPU 镜像(`Rc` 共享;CPU 图像加工的源用它,避免整图复制)。
-    pub fn snapshot_cpu_shared(&self, id: CopyId) -> Option<std::rc::Rc<Texture>> {
-        self.snapshot_cpu.get(&id).map(std::rc::Rc::clone)
-    }
-
-    /// 写入/替换快照 CPU 镜像(捕获/重捕获时)。
-    pub fn insert_snapshot_cpu(&mut self, id: CopyId, texture: Texture) {
-        self.snapshot_cpu
-            .insert(id, std::rc::Rc::new(texture));
-    }
-
-    /// 快照被 GPU 原地加工(RECTPAINT 族)后 CPU 镜像失效:删除而不是
-    /// 保留旧像素(后续需要时显式报缺,不用脏数据)。
-    pub fn invalidate_snapshot_cpu(&mut self, id: CopyId) {
-        self.snapshot_cpu.remove(&id);
-    }
-
     /// 只保留本帧仍被引用的快照(`CopyId` 由目标层或本帧复制引用)。
-    pub fn prune_snapshots(&mut self, live: &std::collections::BTreeSet<CopyId>) {
-        self.snapshots.retain(|id, _| live.contains(id));
-        self.snapshot_cpu.retain(|id, _| live.contains(id));
+    pub fn prune_snapshots(
+        &mut self,
+        live: &std::collections::BTreeSet<CopyId>,
+        pipelines: &mut crate::pipelines::PipelineCache,
+    ) {
+        let stale: Vec<CopyId> = self
+            .snapshots
+            .keys()
+            .filter(|id| !live.contains(id))
+            .copied()
+            .collect();
+        for id in stale {
+            if let Some(tex) = self.snapshots.remove(&id) {
+                if std::rc::Rc::strong_count(&tex) == 1 {
+                    pipelines.forget_texture(tex.id);
+                }
+            }
+        }
     }
 
     /// 丢弃全部快照纹理(渲染器 `reset()` 用;DIV-HOST-001)。
@@ -429,9 +354,10 @@ impl TargetSet {
     pub fn clear_snapshots(&mut self, pipelines: &mut crate::pipelines::PipelineCache) -> usize {
         let removed = self.snapshots.len();
         for (_, target) in std::mem::take(&mut self.snapshots) {
-            pipelines.forget_texture(target.id);
+            if std::rc::Rc::strong_count(&target) == 1 {
+                pipelines.forget_texture(target.id);
+            }
         }
-        self.snapshot_cpu.clear();
         removed
     }
 
@@ -589,10 +515,12 @@ impl TargetSet {
             .iter()
             .chain(self.offscreen.values())
             .chain(self.composites.values())
-            .chain(self.snapshots.values())
             .chain(self.scale.iter())
         {
             total += (target.width as usize) * (target.height as usize) * 4;
+        }
+        for target in self.snapshots.values() {
+            total += target.bytes();
         }
         total
     }

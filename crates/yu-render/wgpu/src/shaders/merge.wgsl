@@ -2,7 +2,15 @@
 // **逐位一致**):
 //
 //   out.rgb = (lower*(255-a) + upper*a + 127) / 255     // a = upper.alpha
-//   out.a   = lower.alpha                                // MERGE 不改目标 alpha
+//   out.a   = (a*a + lower.a*(255-a) + 127) / 255       // 同因子混合(见下)
+//
+// alpha 的口径来自官方执行体(`FUN_004405a4` 的合并分支,REA 0.495
+// `0x4405a4`):它只把**上层**的每部件纹理按**下层**的每部件位置
+// `dev->Draw(...)` 画到当前渲染目标(= 下层表面),**不读下层的旧像素**;
+// 合成的不透明度因此由 D3D9 固定管线的混合状态给出,与普通 draw 同式。
+// D3D9 未启用 `SEPARATEALPHABLENDENABLE` ⇒ alpha 通道的源因子也是
+// `SRCALPHA`,即 `a² + dst·(1−a)`。⇒ 目标表面被 `RECTPAINT3 SET=0` 清空后
+// MERGE 结果仍可见(alpha=0 的旧实现会让整层在 SRCALPHA 下消失)。
 //
 // 逐项与 CPU 同式:`round(cl*(1-a/255) + cu*(a/255))` 的精确值是 num/255,
 // 距半整数 ≥ 1/510,f64 误差不可能跨舍入边界 ⇒ 整数 `(num+127)/255` 等价。
@@ -47,5 +55,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let rgb = (vec3<u32>(l.x, l.y, l.z) * inv
         + vec3<u32>(u.x, u.y, u.z) * a
         + vec3<u32>(127u)) / vec3<u32>(255u);
-    return vec4<f32>(f32(rgb.x) / 255.0, f32(rgb.y) / 255.0, f32(rgb.z) / 255.0, lower.a);
+    // 同因子混合的 alpha:`a² + la·(1−a)`(见文件头)。
+    let out_a = (a * a + l.w * inv + 127u) / 255u;
+    return vec4<f32>(f32(rgb.x) / 255.0, f32(rgb.y) / 255.0, f32(rgb.z) / 255.0, f32(out_a) / 255.0);
 }

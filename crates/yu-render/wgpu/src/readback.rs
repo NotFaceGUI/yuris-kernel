@@ -298,6 +298,26 @@ impl ReadbackCache {
     }
 }
 
+/// 一次性同步读回一张纹理(`TRIM`/文本基面/存档抓帧等低频路径)。
+///
+/// 独立缓冲 + 独立 encoder:不与流式读回共用(`collect` 会互踩)。调用方
+/// 负责把这次读回计入 `RenderPhases::readback_bytes`(不允许静默)。
+pub fn read_texture(
+    ctx: &GpuContext,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) -> Result<Surface, Diag> {
+    let mut cache = ReadbackCache::new();
+    let encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("yu-backend-wgpu read texture"),
+        });
+    cache.read_now(ctx, texture, width, height, encoder)
+}
+
+
 /// 调试用:把一张纹理读成紧凑 RGBA8(`YU_TRANS_DUMP` 转场取证)。
 ///
 /// 低频诊断路径,允许同步等待。

@@ -25,10 +25,6 @@ use yu_sound::{SoundHost, SoundLoader, SoundState};
 use crate::project::{Project, CODEC};
 use crate::{CliResult, Failure};
 
-/// 每帧最多从 GPU 读回多少张缺失快照(差分切换帧通常 1–5 张;上限兜底
-/// 防止异常语料把一帧拖长)。
-const SNAPSHOT_READBACK_CAP: usize = 8;
-
 /// 平台音频出口(L1 端口,2026-10-25 架构 v2)。
 ///
 /// 混音仍在 `yu-sound`(`SoundState::render_and_advance`,逐样本一致);
@@ -541,14 +537,13 @@ pub struct Engine {
     /// 主任务已 `END`/走完(宿主据此退出窗口)。
     main_finished: bool,
     /// 上一帧呈现画面(`SAVE[ID]` 抓帧渲染器的 `:/W0/` 后缓冲)。
-    capture_screen: Arc<Mutex<Option<Arc<Surface>>>>,
     /// `SAVE[ID]` 的离屏抓帧器(逐帧 `observe`,在与主渲染器同刻冻结快照)。
     capture_bridge: Option<crate::capture::SharedCapture>,
 }
 
 impl Engine {
     pub fn new(project: Project, opts: EngineOptions) -> CliResult<Self> {        let boot_started = Instant::now();
-        let (vm, state, sound, save_host, viewport, probe_order, capture_screen, capture_bridge) =
+        let (vm, state, sound, save_host, viewport, probe_order, capture_bridge) =
             boot(&project, &opts)?;
         let boot_ms = boot_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -650,7 +645,6 @@ impl Engine {
             boot_ms,
             events_drained: 0,
             main_finished: false,
-            capture_screen,
             capture_bridge,
         })
     }
@@ -1011,7 +1005,6 @@ impl Engine {
         let tick_ms = tick_started.elapsed().as_secs_f64() * 1000.0;
         let drawable = frame_has_drawable_output(&frame);
 
-        let previous_surface = self.last_surface.clone();
         let render_started = Instant::now();
         let (surface, report, screen) = self.renderer.render(&frame)?;
         self.last_screen = screen;
@@ -1022,29 +1015,32 @@ impl Engine {
         // 拿不到镜像的快照才退回软后端整帧回放。
         let capture_started = Instant::now();
         if let Some(bridge) = &self.capture_bridge {
-            let missing = {
-                let renderer = &self.renderer;
-                let mirror = |id: yu_gfx::CopyId| match renderer {
-                    Renderer::Wgpu { renderer, .. } => renderer.snapshot_cpu_shared(id),
-                    Renderer::Soft(_) => None,
-                };
-                bridge
-                    .0
-                    .borrow_mut()
-                    .observe(&frame, previous_surface, &mirror)
-            };
-            // 没有 CPU 镜像的新快照:直接从 GPU 读回这一张(1–8ms/张),
-            // 不再让软后端整帧重放(差分切换时实测 300–360ms/次)。
-            if !missing.is_empty() {
-                if let Renderer::Wgpu { renderer, .. } = &mut self.renderer {
-                    for id in missing.into_iter().take(SNAPSHOT_READBACK_CAP) {
-                        if let Some(surface) = renderer.read_snapshot(id) {
-                            bridge.0.borrow_mut().insert_mirror(
-                                id,
-                                surface.width,
-                                surface.height,
-                                surface.rgba,
-                            );
+            // 只登记**新出现**的快照(W6:不再每帧做 CPU 镜像预捕获)。
+            let fresh = bridge.0.borrow_mut().observe(&frame);
+            if !fresh.is_empty() {
+                match &mut self.renderer {
+                    Renderer::Wgpu { renderer, .. } => {
+                        for id in fresh {
+                            if let Some(surface) = renderer.read_snapshot(id) {
+                                bridge.0.borrow_mut().insert_mirror(
+                                    id,
+                                    surface.width,
+                                    surface.height,
+                                    surface.rgba,
+                                );
+                            }
+                        }
+                    }
+                    Renderer::Soft(soft) => {
+                        for id in fresh {
+                            if let Some(surface) = soft.snapshot_surface(id) {
+                                bridge.0.borrow_mut().insert_mirror(
+                                    id,
+                                    surface.width,
+                                    surface.height,
+                                    surface.rgba.clone(),
+                                );
+                            }
                         }
                     }
                 }
@@ -1070,11 +1066,6 @@ impl Engine {
         self.accumulate_frame_diags(&frame);
         self.last_frame = Some(frame);
         self.last_surface = Some(Arc::clone(&surface));
-        // `SAVE[ID]` 抓帧渲染器的后缓冲:与主渲染器同源(上一帧呈现画面)。
-        *self
-            .capture_screen
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&surface));
         self.last_report = out.clone();
         self.last_render = Some(report);
         push_history(&mut self.tick_history, tick_ms);
@@ -1534,10 +1525,6 @@ impl Engine {
         self.main_finished = false;
         self.last_frame = None;
         self.last_surface = None;
-        *self
-            .capture_screen
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.last_report = FrameReport::empty(0);
         self.last_render = None;
         self.last_capture_ms = 0.0;
@@ -1553,14 +1540,13 @@ impl Engine {
             audio.detach();
         }
         let started = Instant::now();
-        let (vm, state, sound, save_host, viewport, _, capture_screen, capture_bridge) =
+        let (vm, state, sound, save_host, viewport, _, capture_bridge) =
             boot(&self.project, &self.opts)?;
         self.boot_ms = started.elapsed().as_secs_f64() * 1000.0;
         self.vm = Some(vm);
         self.state = Some(state);
         self.sound = sound;
         self.save_host = save_host;
-        self.capture_screen = capture_screen;
         self.capture_bridge = capture_bridge;
         if let (Some(audio), Some(sound)) = (&mut self.audio, &self.sound) {
             audio.attach(Arc::clone(sound));
@@ -1666,7 +1652,6 @@ type BootBundle = (
     Option<SaveHost>,
     Viewport,
     Vec<yu_gfx::ImageFormat>,
-    Arc<Mutex<Option<Arc<Surface>>>>,
     Option<crate::capture::SharedCapture>,
 );
 
@@ -1789,14 +1774,10 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     // `SAVE[ID]/LOAD[ID]` 的图层像素通道:抓帧渲染器(独立 `TextureStore`,
     // 只在存/读档时用)+ 共享合成资产叠层。`last_screen` 由 `Engine::tick`
     // 每帧写入(`COPY ID=:/W0/` 读的后缓冲)。
-    let capture_screen: Arc<Mutex<Option<Arc<Surface>>>> = Arc::new(Mutex::new(None));
     let capture_bridge = if let Ok(source) = project.open_source() {
         let capture = Rc::new(RefCell::new(crate::capture::GfxCapture::new(
             TextureStore::new(source, CODEC, probe_order.clone()),
-            capture_screen.clone(),
             project.overlay().clone(),
-            // GPU 后端不回放整帧:缺失镜像按需从 GPU 读回。
-            opts.backend != Backend::Wgpu,
         )));
         gfx_host.set_layer_capture(Box::new(crate::capture::SharedCapture(capture.clone())));
         Some(crate::capture::SharedCapture(capture))
@@ -1847,7 +1828,6 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         save_host,
         viewport,
         probe_order,
-        capture_screen,
         capture_bridge,
     ))
 }

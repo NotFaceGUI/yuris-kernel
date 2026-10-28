@@ -33,3 +33,7 @@ path = "examples/wgpu_frame_walk.rs"
 [lib]
 name = "yu_backend_wgpu"
 path = "src/lib.rs"
+
+[dev-dependencies.naga]
+version = "30.0.1"
+features = ["wgsl-in"]

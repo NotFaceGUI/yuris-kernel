@@ -207,6 +207,21 @@ pub struct PipelineCache {
     layer_merge_pipeline: Option<wgpu::RenderPipeline>,
     /// RECTPAINT 的颜色 uniform/bind group(同一颜色跨帧复用;语义不变)。
     paint_groups: BTreeMap<(bool, [u32; 4]), wgpu::BindGroup>,
+    /// `CGACT[MERGE2/XOR/AND]` 的双纹理合成(lower + upper + mode uniform)。
+    composite_shader: wgpu::ShaderModule,
+    composite_layout: wgpu::BindGroupLayout,
+    composite_pipeline_layout: wgpu::PipelineLayout,
+    composite_pipeline: Option<wgpu::RenderPipeline>,
+    /// 逐层原地滤镜族(reverse/镜像/meido/saido/akarusa/mono/sepia/mosaic/rotation)。
+    transform_shader: wgpu::ShaderModule,
+    transform_layout: wgpu::BindGroupLayout,
+    transform_pipeline_layout: wgpu::PipelineLayout,
+    transform_pipeline: Option<wgpu::RenderPipeline>,
+    /// 区域重采样(`scale_region` 的 GPU 等价;物化 UV 采样窗)。
+    resample_shader: wgpu::ShaderModule,
+    resample_layout: wgpu::BindGroupLayout,
+    resample_pipeline_layout: wgpu::PipelineLayout,
+    resample_pipeline: Option<wgpu::RenderPipeline>,
     pub total_pipelines_created: u64,
     pub total_bind_groups_created: u64,
 }
@@ -423,6 +438,102 @@ impl PipelineCache {
                     bind_group_layouts: &[Some(&layer_merge_layout)],
                     immediate_size: 0,
                 });
+        // `CGACT[MERGE2/XOR/AND]`:两张纹理 + mode uniform。
+        let composite_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("yu-backend-wgpu composite"),
+                source: wgpu::ShaderSource::Wgsl(crate::shaders::COMPOSITE.into()),
+            });
+        let composite_layout = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("yu-backend-wgpu composite layout"),
+                entries: &[
+                    texture_entry_unfilterable(0),
+                    texture_entry_unfilterable(1),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let composite_pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("yu-backend-wgpu composite pipeline layout"),
+                    bind_group_layouts: &[Some(&composite_layout)],
+                    immediate_size: 0,
+                });
+        // 原地滤镜族:一张纹理 + 参数 uniform。
+        let transform_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("yu-backend-wgpu transform"),
+                source: wgpu::ShaderSource::Wgsl(crate::shaders::TRANSFORM.into()),
+            });
+        let transform_layout = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("yu-backend-wgpu transform layout"),
+                entries: &[
+                    texture_entry_unfilterable(0),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let transform_pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("yu-backend-wgpu transform pipeline layout"),
+                    bind_group_layouts: &[Some(&transform_layout)],
+                    immediate_size: 0,
+                });
+        let resample_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("yu-backend-wgpu resample"),
+                source: wgpu::ShaderSource::Wgsl(crate::shaders::RESAMPLE.into()),
+            });
+        let resample_layout = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("yu-backend-wgpu resample layout"),
+                entries: &[
+                    texture_entry_unfilterable(0),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let resample_pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("yu-backend-wgpu resample pipeline layout"),
+                    bind_group_layouts: &[Some(&resample_layout)],
+                    immediate_size: 0,
+                });
         let samplers = [
             make_sampler(ctx, FilterKind::Point),
             make_sampler(ctx, FilterKind::Linear),
@@ -498,6 +609,18 @@ impl PipelineCache {
             layer_merge_layout,
             layer_merge_pipeline_layout,
             layer_merge_pipeline: None,
+            composite_shader,
+            composite_layout,
+            composite_pipeline_layout,
+            composite_pipeline: None,
+            transform_shader,
+            transform_layout,
+            transform_pipeline_layout,
+            transform_pipeline: None,
+            resample_shader,
+            resample_layout,
+            resample_pipeline_layout,
+            resample_pipeline: None,
             paint_groups: BTreeMap::new(),
             total_pipelines_created: 0,
             total_bind_groups_created: 0,
@@ -984,6 +1107,213 @@ impl PipelineCache {
         self.layer_merge_pipeline.as_ref()
     }
 
+    /// `CGACT[MERGE2/XOR/AND]` 的双纹理合成管线(无顶点缓冲,全屏三角形)。
+    pub fn ensure_composite_pipeline(&mut self, ctx: &GpuContext) -> Result<(), Diag> {
+        if self.composite_pipeline.is_some() {
+            return Ok(());
+        }
+        let pipeline = ctx.checked(code::TARGET, "composite 管线", || {
+            fullscreen_pipeline(
+                ctx,
+                "yu-backend-wgpu composite",
+                &self.composite_shader,
+                &self.composite_pipeline_layout,
+            )
+        })?;
+        self.composite_pipeline = Some(pipeline);
+        self.total_pipelines_created += 1;
+        Ok(())
+    }
+
+    pub fn composite_pipeline(&self) -> Option<&wgpu::RenderPipeline> {
+        self.composite_pipeline.as_ref()
+    }
+
+    /// MERGE2/XOR/AND 的 bind group(`mode`:0=MERGE2,1=XOR,2=AND)。
+    pub fn create_composite_bind_group(
+        &mut self,
+        ctx: &GpuContext,
+        lower: &wgpu::TextureView,
+        upper: &wgpu::TextureView,
+        mode: u32,
+    ) -> Result<wgpu::BindGroup, Diag> {
+        let uniform = [mode, 0u32, 0, 0];
+        let buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &ctx.device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("yu-backend-wgpu composite uniform"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            },
+        );
+        let group = ctx.checked(code::TARGET, "composite bind group", || {
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("yu-backend-wgpu composite bind group"),
+                layout: &self.composite_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(lower),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(upper),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buffer.as_entire_binding(),
+                    },
+                ],
+            })
+        })?;
+        self.total_bind_groups_created += 1;
+        Ok(group)
+    }
+
+    /// 原地滤镜族管线(无顶点缓冲,全屏三角形)。
+    pub fn ensure_transform_pipeline(&mut self, ctx: &GpuContext) -> Result<(), Diag> {
+        if self.transform_pipeline.is_some() {
+            return Ok(());
+        }
+        let pipeline = ctx.checked(code::TARGET, "transform 管线", || {
+            fullscreen_pipeline(
+                ctx,
+                "yu-backend-wgpu transform",
+                &self.transform_shader,
+                &self.transform_pipeline_layout,
+            )
+        })?;
+        self.transform_pipeline = Some(pipeline);
+        self.total_pipelines_created += 1;
+        Ok(())
+    }
+
+    pub fn transform_pipeline(&self) -> Option<&wgpu::RenderPipeline> {
+        self.transform_pipeline.as_ref()
+    }
+
+    /// 滤镜 bind group。`params = [mode, set, set2, pad]`;`m` 只给 ROTATION。
+    pub fn create_transform_bind_group(
+        &mut self,
+        ctx: &GpuContext,
+        view: &wgpu::TextureView,
+        params: [i32; 4],
+        m: [f32; 4],
+    ) -> Result<wgpu::BindGroup, Diag> {
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Uniform {
+            mode: u32,
+            set: i32,
+            set2: i32,
+            pad: u32,
+            m: [f32; 4],
+        }
+        let uniform = [Uniform {
+            mode: params[0] as u32,
+            set: params[1],
+            set2: params[2],
+            pad: params[3] as u32,
+            m,
+        }];
+        let buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &ctx.device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("yu-backend-wgpu transform uniform"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            },
+        );
+        let group = ctx.checked(code::TARGET, "transform bind group", || {
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("yu-backend-wgpu transform bind group"),
+                layout: &self.transform_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buffer.as_entire_binding(),
+                    },
+                ],
+            })
+        })?;
+        self.total_bind_groups_created += 1;
+        Ok(group)
+    }
+
+    /// 区域重采样管线(`scale_region` 的 GPU 等价)。
+    pub fn ensure_resample_pipeline(&mut self, ctx: &GpuContext) -> Result<(), Diag> {
+        if self.resample_pipeline.is_some() {
+            return Ok(());
+        }
+        let pipeline = ctx.checked(code::TARGET, "resample 管线", || {
+            fullscreen_pipeline(
+                ctx,
+                "yu-backend-wgpu resample",
+                &self.resample_shader,
+                &self.resample_pipeline_layout,
+            )
+        })?;
+        self.resample_pipeline = Some(pipeline);
+        self.total_pipelines_created += 1;
+        Ok(())
+    }
+
+    pub fn resample_pipeline(&self) -> Option<&wgpu::RenderPipeline> {
+        self.resample_pipeline.as_ref()
+    }
+
+    /// 重采样 bind group:`region` = 闭区间源矩形,`dst` = 输出尺寸。
+    pub fn create_resample_bind_group(
+        &mut self,
+        ctx: &GpuContext,
+        view: &wgpu::TextureView,
+        region: (i64, i64, i64, i64),
+        dst: (u32, u32),
+        bilinear: bool,
+    ) -> Result<wgpu::BindGroup, Diag> {
+        let uniform = [
+            region.0 as i32,
+            region.1 as i32,
+            (region.2 - region.0 + 1) as i32,
+            (region.3 - region.1 + 1) as i32,
+            dst.0 as i32,
+            dst.1 as i32,
+            i32::from(bilinear),
+            0i32,
+        ];
+        let buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &ctx.device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("yu-backend-wgpu resample uniform"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            },
+        );
+        let group = ctx.checked(code::TARGET, "resample bind group", || {
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("yu-backend-wgpu resample bind group"),
+                layout: &self.resample_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buffer.as_entire_binding(),
+                    },
+                ],
+            })
+        })?;
+        self.total_bind_groups_created += 1;
+        Ok(group)
+    }
+
+
     /// 双纹理 MERGE 的 bind group(lower + upper)。
     pub fn create_layer_merge_bind_group(
         &mut self,
@@ -1261,6 +1591,54 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         },
         count: None,
     }
+}
+
+fn texture_entry_unfilterable(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+/// 全屏三角形的渲染管线(无顶点缓冲、无混合、替换写入)。
+fn fullscreen_pipeline(
+    ctx: &GpuContext,
+    label: &str,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
+    ctx.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            primitive: primitive_state(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: TARGET_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
 }
 
 fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
