@@ -1613,7 +1613,8 @@ impl App {
                      rest={:.1} encode={:.1} readback={:.1} tail={:.1} \
                      text_bake={:.1} text_paint={:.1} image_paint={:.1} \
                      image_composite={:.1} decode={:.1} decode_bytes={} \
-                     uploads={} upload_bytes={} draws={} copy_bytes={} copies={} snapshots_alloc={}",
+                     uploads={} upload_bytes={} draws={} copy_bytes={} copies={} snapshots_alloc={} \
+                     surfaces={} blits={} alias={} reused={} materialized={} cpu_fb={}",
                     p.plan_us as f64 / 1e3,
                     p.snap_us as f64 / 1e3,
                     p.image_us as f64 / 1e3,
@@ -1635,6 +1636,12 @@ impl App {
                     p.copy_bytes,
                     p.copy_count,
                     p.snapshot_alloc,
+                    p.surface_passes,
+                    p.blits,
+                    p.alias_hits,
+                    p.reused_layers,
+                    p.materialized,
+                    p.cpu_fallbacks,
                 );
                 let _ = write!(
                     line,
@@ -1952,8 +1959,10 @@ impl App {
                  plan_ms,snap_ms,image_ms,text_ms,copy_text_ms,rest_ms,encode_ms,\
                  readback_ms,tail_ms,text_bake_ms,text_paint_ms,text_hash_ms,text_base_ms,\
                  image_paint_ms,image_pixel_ms,image_composite_ms,\
-                 uploads,upload_bytes,draw_calls,readback_bytes,\
+                 uploads,upload_bytes,upload_asset_bytes,draw_calls,readback_bytes,\
                  merge_ops,merge2_ops,paint_ops,pixel_ops,memo_chains,memo_hits,\
+                 surface_passes,blits,alias_hits,reused_layers,materialized,cpu_fallbacks,\
+                 copy_bytes,copy_count,\
                  decode_ms,decode_bytes,clock_ms,lag_ms\n",
             );
             for row in &self.frame_rows {
@@ -1974,8 +1983,10 @@ impl App {
                         let _ = writeln!(
                             text,
                             ",{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},\
-                             {:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},\
-                             {},{},{},{},{},{},{:.3},{},{},{}",
+                             {:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{},\
+                             {},{},{},{},{},{},\
+                             {},{},{},{},{},{},{},{},\
+                             {:.3},{},{},{}",
                             p.plan_us as f64 / 1e3,
                             p.snap_us as f64 / 1e3,
                             p.image_us as f64 / 1e3,
@@ -1994,6 +2005,7 @@ impl App {
                             p.image_composite_us as f64 / 1e3,
                             p.uploads,
                             p.upload_bytes,
+                            p.upload_asset_bytes,
                             p.draw_calls,
                             p.readback_bytes,
                             p.image_merge_ops,
@@ -2002,6 +2014,14 @@ impl App {
                             p.image_pixel_ops,
                             p.memo_chains,
                             p.memo_hits,
+                            p.surface_passes,
+                            p.blits,
+                            p.alias_hits,
+                            p.reused_layers,
+                            p.materialized,
+                            p.cpu_fallbacks,
+                            p.copy_bytes,
+                            p.copy_count,
                             p.decode_us as f64 / 1e3,
                             p.decode_bytes,
                             row.clock_ms,
@@ -2009,7 +2029,7 @@ impl App {
                         );
                     }
                     None => {
-                        let _ = writeln!(text, ",{0}", ",".repeat(29));
+                        let _ = writeln!(text, ",{0}", ",".repeat(38));
                     }
                 }
             }
