@@ -346,6 +346,22 @@ impl LayerSurfaces {
         state.raw = Some(content);
     }
 
+    /// 基面像素的稳定身份:基面 token + 已应用操作前缀。
+    ///
+    /// `Content::hash` 混入了纹理池 id,同一像素在换池后身份会变;文本
+    /// 基面缓存必须用这份**像素来源**身份,否则每帧重画同一基面都会缓存
+    /// 失配并重复 GPU 读回。
+    pub fn raw_identity(&self, id: &LayerId) -> Option<u64> {
+        let state = self.layers.get(id)?;
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        fnv_mix(&mut hash, state.base);
+        for (seq, sig) in &state.applied {
+            fnv_mix(&mut hash, *seq);
+            fnv_mix(&mut hash, *sig);
+        }
+        Some(hash)
+    }
+
     /// 文本合成前的像素(冻结文本 COPY 的基面)。
     pub fn raw_content(&self, id: &LayerId) -> Option<Content> {
         self.layers.get(id).and_then(|state| state.raw.clone())
@@ -541,3 +557,8 @@ impl LayerSurfaces {
 
 /// 一帧的图层内容视图(`LayerId → Content`;命令序推进时同步更新)。
 pub(crate) type Contents = BTreeMap<LayerId, Content>;
+
+fn fnv_mix(hash: &mut u64, value: u64) {
+    *hash ^= value;
+    *hash = hash.wrapping_mul(0x100_0000_01b3);
+}

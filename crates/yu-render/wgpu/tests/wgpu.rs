@@ -1982,3 +1982,106 @@ fn merge_after_rectpaint_clear_on_snapshot_writes_alpha() {
         "MERGE 必须写 alpha(清空后仍可见,不闪),得到 {actual:?}"
     );
 }
+
+/// 文本基面 CPU 缓存:同一层换文本(基面不变)时不得再做同步 GPU 读回。
+/// 语料角色出场帧实测 2 次全屏读回 = 69ms;此测试盯住回归。
+#[test]
+fn cgact_text_reuses_cached_cpu_base_across_text_changes() {
+    let table = table();
+    let Some(mut gpu) = renderer_or_skip(store(&[(
+        b"dark.png",
+        png_bytes_for(32, 32, Rgba([0, 0, 0, 255])),
+    )])) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&[(
+        b"dark.png",
+        png_bytes_for(32, 32, Rgba([0, 0, 0, 255])),
+    )]));
+    if !soft.text_composer().available() {
+        SKIPPED.fetch_add(1, Ordering::Relaxed);
+        println!("SKIP cgact_text_reuses_cached_cpu_base_across_text_changes: no system font");
+        return;
+    }
+    gpu.text_composer().set_base_cache_enabled(true);
+    let mut gfx = state(Viewport::new(32, 32), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"dark".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "FONT",
+            vec![
+                arg(&table, "FONT", "SX", Value::Int(16)),
+                arg(&table, "FONT", "SY", Value::Int(16)),
+                arg(&table, "FONT", "COLOR", Value::Int(0x00_FF00)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CGACT", "TEXT", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0)),
+                arg(&table, "CGACT", "SETSTR", Value::Str(b"A".to_vec())),
+                arg(&table, "CGACT", "X", Value::Int(0)),
+                arg(&table, "CGACT", "Y", Value::Int(0)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame1 = gfx.frame();
+    let _ = gpu.render_frame(&frame1).expect("render frame 1");
+    let first = gpu.render_phases();
+
+    // 只改文本(基面 identity 不变):第二帧应命中基面缓存。
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 2 },
+        call(
+            2,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CGACT", "TEXT", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0)),
+                arg(&table, "CGACT", "SETSTR", Value::Str(b"B".to_vec())),
+                arg(&table, "CGACT", "X", Value::Int(0)),
+                arg(&table, "CGACT", "Y", Value::Int(0)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 2 },
+    ]);
+    let frame2 = gfx.frame();
+    let gpu_out = gpu.render_frame(&frame2).expect("render frame 2");
+    let second = gpu.render_phases();
+    let soft_out = soft.render_frame(&frame2);
+    assert_eq!(
+        soft_out.surface.rgba, gpu_out.surface.rgba,
+        "cached-base text frame must stay pixel-identical across backends"
+    );
+    assert_eq!(
+        first.text_cpu_readbacks, 0,
+        "资产层首次文本应走资产 CPU 纹理快路径,不得读回(first rb={} asset={}us)",
+        first.text_cpu_readbacks, first.text_cpu_asset_us
+    );
+    assert!(
+        second.text_cpu_readbacks == 0,
+        "换文本不得再同步 GPU 读回(first={:?} second rb={} cached={})",
+        first.text_cpu_readbacks,
+        second.text_cpu_readbacks,
+        second.text_cpu_cached
+    );
+    assert!(
+        second.text_cpu_cached >= 1,
+        "第二帧应命中文本基面缓存(second cached={})",
+        second.text_cpu_cached
+    );
+}

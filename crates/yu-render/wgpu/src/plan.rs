@@ -238,7 +238,7 @@ pub(crate) fn plan(
     // ---- 2. 文本:`CGACT[TEXT]`/TextRun 进层表面(修订号驱动) ----
     let mark_text = started.elapsed();
     text.begin_frame_stats();
-    apply_text(
+    let (text_cpu_base_us, text_cpu_info) = apply_text(
         ctx,
         frame,
         textures,
@@ -409,6 +409,13 @@ pub(crate) fn plan(
         text_hash_us: (text_stats.hash_ms * 1e3) as u64,
         text_paint_us: (text_stats.paint_ms * 1e3) as u64,
         text_base_us: (text_stats.base_ms * 1e3) as u64,
+        text_cpu_base_us,
+        text_cpu_readback_us: text_cpu_info.readback_us,
+        text_cpu_readbacks: text_cpu_info.readbacks,
+        text_cpu_asset_us: text_cpu_info.asset_us,
+        text_cpu_asset_bytes: text_cpu_info.asset_bytes,
+        text_cpu_cached: u64::from(text_stats.base_cache_hits),
+        text_cpu_stores: u64::from(text_stats.base_cache_stores),
         decode_us: textures.decode_stats().0,
         decode_bytes: textures.decode_stats().1,
         surface_passes: stats.surface_passes,
@@ -1258,7 +1265,7 @@ fn apply_copy(
             } else {
                 // 冻结文本:命令时刻已画的字形进快照(DIV-GFX-058)。
                 let raw = surfaces.raw_content(id).unwrap_or_else(|| content.clone());
-                let cpu = content_cpu(ctx, frame, textures, contents, id, &raw)?;
+                let (cpu, _info) = content_cpu(ctx, frame, textures, contents, id, &raw)?;
                 let (composed, stats) = text.compose_layer(&cpu, &copy.texts, None);
                 merge_text_stats(acc, stats);
                 match composed {
@@ -1588,8 +1595,55 @@ fn text_signature(draws: &[&yu_gfx::TextDraw], layout: Option<&yu_gfx::TextLayou
     hash
 }
 
+/// 层内容是否仍由它的资产纹理构成(本帧没有像素 op 改写)。
+///
+/// 判据是**底层纹理身份**:`raw.tex.id == asset.tex.id` ⇒ 当前像素就是
+/// 资产本身(可能带 `SIZE` 族采样修饰)。这时直接复用资产 CPU 纹理:
+/// 恒等窗原样返回;采样窗按 `content_region` 做一次 `scale_region`(与
+/// `content_cpu` 读回后的缩放同式),两者都不需要同步 GPU 读回。
+fn asset_identity_base(
+    ctx: &GpuContext,
+    frame: &CompositorFrame,
+    textures: &mut TextureStore,
+    gpu: &mut TextureCache,
+    targets: &TargetSet,
+    bases: &mut BTreeMap<(LayerId, u64), Rc<TexRef>>,
+    id: &LayerId,
+    raw: &Content,
+) -> Option<Rc<Texture>> {
+    let layer = frame.layers.iter().find(|layer| &layer.id == id)?;
+    let TextureRef::Asset(key) = &layer.texture else {
+        return None;
+    };
+    let tex = resolve_ref(ctx, textures, gpu, targets, id, &layer.texture, bases).ok()?;
+    if raw.tex.id != tex.id {
+        // 像素 op 产出了新纹理:内容已不是资产,必须读回。
+        return None;
+    }
+    let asset = textures.resolve_shared(key).ok()?;
+    if raw.is_identity() {
+        return Some(asset);
+    }
+    let region = content_region(raw);
+    Some(Rc::new(yu_render_core::scale_region(
+        &asset,
+        raw.width,
+        raw.height,
+        Some(region),
+        raw.bilinear,
+    )))
+}
+
+/// CPU 基面取得的来源与耗时(诊断:资产克隆 vs 同步 GPU 读回)。
+#[derive(Default, Clone, Copy)]
+struct CpuBaseInfo {
+    readback_us: u64,
+    readbacks: u64,
+    asset_us: u64,
+    asset_bytes: u64,
+}
+
 /// 文本合成的 CPU 基面像素(纯基图且可 CPU 解析时零读回)。
-#[allow(clippy::too_many_arguments)]
 fn content_cpu(
     ctx: &GpuContext,
     frame: &CompositorFrame,
@@ -1597,19 +1651,36 @@ fn content_cpu(
     contents: &Contents,
     id: &LayerId,
     content: &Content,
-) -> Result<Texture, String> {
+) -> Result<(Texture, CpuBaseInfo), String> {
+    let mut info = CpuBaseInfo::default();
     let mut texture = if !contents.contains_key(id) {
         let layer = frame.layers.iter().find(|layer| &layer.id == id);
         match layer.map(|layer| &layer.texture) {
-            Some(TextureRef::Asset(key)) => textures
-                .resolve(key)
-                .cloned()
-                .map_err(|diag| diag.code.to_string())?,
+            Some(TextureRef::Asset(key)) => {
+                let t = std::time::Instant::now();
+                let texture = textures
+                    .resolve(key)
+                    .cloned()
+                    .map_err(|diag| diag.code.to_string())?;
+                info.asset_us = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX);
+                info.asset_bytes = texture.rgba.len() as u64;
+                texture
+            }
             Some(TextureRef::SolidBlack1x1) => Texture::solid_black_1x1(),
-            _ => read_back(ctx, content)?,
+            _ => {
+                let t = std::time::Instant::now();
+                let texture = read_back(ctx, content)?;
+                info.readback_us = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX);
+                info.readbacks = 1;
+                texture
+            }
         }
     } else {
-        read_back(ctx, content)?
+        let t = std::time::Instant::now();
+        let texture = read_back(ctx, content)?;
+        info.readback_us = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX);
+        info.readbacks = 1;
+        texture
     };
     if !content.is_identity() {
         let (x0, y0, x1, y1) = content_region(content);
@@ -1624,7 +1695,7 @@ fn content_cpu(
         texture =
             yu_render_core::scale_region(&texture, content.width, content.height, None, false);
     }
-    Ok(texture)
+    Ok((texture, info))
 }
 
 fn read_back(ctx: &GpuContext, content: &Content) -> Result<Texture, String> {
@@ -1656,7 +1727,9 @@ fn apply_text(
     text: &mut TextComposer,
     acc: &mut Accum,
     targets: &TargetSet,
-) {
+) -> (u64, CpuBaseInfo) {
+    let mut cpu_base_us = 0u64;
+    let mut cpu_info = CpuBaseInfo::default();
     let mut ids: BTreeSet<LayerId> = frame.text_draws.iter().map(|d| d.target.clone()).collect();
     if let Some(layout) = &frame.text_layout {
         if let Some(target) = &layout.target {
@@ -1711,7 +1784,47 @@ fn apply_text(
             }
             continue;
         }
-        let cpu_base = content_cpu(ctx, frame, textures, contents, &id, &raw);
+        let cpu_started = std::time::Instant::now();
+        // 缓存键用“基面像素来源”身份(基面 token + 操作前缀),不用混了
+        // 纹理池 id 的 `raw.hash`:同一基面换池后仍应命中。
+        let base_key = surfaces.raw_identity(&id).unwrap_or(raw.hash);
+        let cpu_base: Result<Rc<Texture>, String> =
+            if let Some(hit) = text.cached_base(&id, base_key) {
+                Ok(hit)
+            } else if let Some(asset) = asset_identity_base(
+                ctx, frame, textures, gpu, targets, bases, &id, &raw,
+            ) {
+                text.store_base(&id, base_key, Rc::clone(&asset));
+                Ok(asset)
+            } else {
+                match content_cpu(ctx, frame, textures, contents, &id, &raw) {
+                    Ok((texture, info)) => {
+                        if info.readbacks > 0 {
+                            log::debug!(
+                                target: "yu-render",
+                                "[text-base] layer={} raw={}x{} base_key={:#x} raw_hash={:#x} readback={}us",
+                                id.display(),
+                                raw.width,
+                                raw.height,
+                                base_key,
+                                raw.hash,
+                                info.readback_us
+                            );
+                        }
+                        cpu_info.readback_us = cpu_info.readback_us.saturating_add(info.readback_us);
+                        cpu_info.readbacks = cpu_info.readbacks.saturating_add(info.readbacks);
+                        cpu_info.asset_us = cpu_info.asset_us.saturating_add(info.asset_us);
+                        cpu_info.asset_bytes = cpu_info.asset_bytes.saturating_add(info.asset_bytes);
+                        let texture = Rc::new(texture);
+                        text.store_base(&id, base_key, Rc::clone(&texture));
+                        Ok(texture)
+                    }
+                    Err(reason) => Err(reason),
+                }
+            };
+        cpu_base_us = cpu_base_us.saturating_add(
+            u64::try_from(cpu_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
         let composed = text.compose_layer_cached(
             &id,
             revision,
@@ -1719,7 +1832,7 @@ fn apply_text(
             dims,
             &draws,
             layout,
-            || cpu_base.map(Rc::new),
+            || cpu_base,
         );
         let (composed, stats) = match composed {
             Ok(value) => value,
@@ -1779,6 +1892,7 @@ fn apply_text(
         surfaces.note_text_baked(&id, revision, signature, raw.hash);
         contents.insert(id, content);
     }
+    (cpu_base_us, cpu_info)
 }
 
 /// 屏幕级自动文本(`target=None`):全视口透明覆盖 + 一次合成 quad。

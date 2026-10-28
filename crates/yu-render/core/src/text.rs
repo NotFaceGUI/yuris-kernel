@@ -63,6 +63,17 @@ impl TextPaintStats {
 }
 
 /// 文本合成器:持有字体源/栅格器/字形缓存(懒加载系统字体)。
+/// 文本基面 CPU 缓存条目。
+struct BaseCacheEntry {
+    texture: Rc<Texture>,
+    last_use: u64,
+    bytes: u64,
+}
+
+/// 基面 CPU 缓存预算(整张层表面;两张全屏 3.6MB 也远低于此)。
+const BASE_CACHE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+const BASE_CACHE_MAX_ENTRIES: usize = 32;
+
 pub struct TextComposer {
     renderer: Option<FontRenderer>,
     /// 首次初始化失败原因(`None` = 尚未尝试)。
@@ -94,6 +105,15 @@ pub struct TextComposer {
     force_font: Option<String>,
     /// 合成缓存当前字节占用(`ComposeCacheEntry::bytes` 之和)。
     cache_bytes: u64,
+    /// 文本基面 CPU 像素缓存:键 = (层, 基面身份 `raw.hash`)。
+    ///
+    /// 文本每次变化都会重烤,但基面通常不变;没有这份缓存时,每个新文本
+    /// 版本都要重新 `content_cpu`(资产整张拷贝或同步 GPU 读回)。语料实测
+    /// 角色出场帧 2 次全屏读回 = 69ms,是文本尖峰的主项。
+    base_cache: BTreeMap<(LayerId, u64), BaseCacheEntry>,
+    base_cache_bytes: u64,
+    /// `YURIS_TEXT_BASE_CACHE=0` 关闭基面缓存(性能 A/B 用;默认开)。
+    base_cache_enabled: bool,
     /// LRU 时钟(每次合成触碰/插入时递增)。
     cache_clock: u64,
     /// 帧内合成统计(`YU_RENDER_TIMING` 诊断;`begin_frame_stats` 清零)。
@@ -112,6 +132,10 @@ pub struct ComposeFrameStats {
     pub base_ms: f64,
     /// 本帧最大一次 bake 的合成纹理尺寸(诊断)。
     pub max_dims: (u32, u32),
+    /// 本帧文本基面 CPU 缓存命中次数(免 GPU 读回/整张拷贝)。
+    pub base_cache_hits: u32,
+    /// 本帧写入基面缓存的次数(诊断缓存是否在积累)。
+    pub base_cache_stores: u32,
 }
 
 /// 一条合成缓存(见 [`TextComposer::compose_cache`])。
@@ -293,6 +317,11 @@ impl TextComposer {
             source_summary: None,
             force_font: None,
             cache_bytes: 0,
+            base_cache: BTreeMap::new(),
+            base_cache_bytes: 0,
+            base_cache_enabled: std::env::var("YURIS_TEXT_BASE_CACHE")
+                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false"))
+                .unwrap_or(true),
             cache_clock: 0,
             frame_stats: ComposeFrameStats::default(),
         }
@@ -312,6 +341,11 @@ impl TextComposer {
             source_summary: None,
             force_font: None,
             cache_bytes: 0,
+            base_cache: BTreeMap::new(),
+            base_cache_bytes: 0,
+            base_cache_enabled: std::env::var("YURIS_TEXT_BASE_CACHE")
+                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false"))
+                .unwrap_or(true),
             cache_clock: 0,
             frame_stats: ComposeFrameStats::default(),
         }
@@ -1042,6 +1076,67 @@ impl TextComposer {
         if let Some(entry) = self.compose_cache.remove(layer) {
             self.cache_bytes = self.cache_bytes.saturating_sub(entry.bytes);
         }
+        self.base_cache.retain(|(id, _), _| id != layer);
+        self.base_cache_bytes = self.base_cache.values().map(|e| e.bytes).sum();
+    }
+
+    /// 显式开关基面缓存(测试 / 性能 A-B;默认由 `YURIS_TEXT_BASE_CACHE` 决定)。
+    pub fn set_base_cache_enabled(&mut self, on: bool) {
+        self.base_cache_enabled = on;
+    }
+
+    /// 取文本基面 CPU 缓存(层 + 基面身份)。命中即免读回/免拷贝。
+    pub fn cached_base(&mut self, layer: &LayerId, base_hash: u64) -> Option<Rc<Texture>> {
+        if !self.base_cache_enabled {
+            return None;
+        }
+        let key = (layer.clone(), base_hash);
+        let entry = self.base_cache.get_mut(&key)?;
+        self.cache_clock += 1;
+        entry.last_use = self.cache_clock;
+        self.frame_stats.base_cache_hits += 1;
+        Some(Rc::clone(&entry.texture))
+    }
+
+    /// 存文本基面 CPU 缓存(按预算 LRU 淘汰)。
+    pub fn store_base(&mut self, layer: &LayerId, base_hash: u64, texture: Rc<Texture>) {
+        if !self.base_cache_enabled {
+            return;
+        }
+        let bytes = texture.rgba.len() as u64;
+        let key = (layer.clone(), base_hash);
+        if let Some(old) = self.base_cache.remove(&key) {
+            self.base_cache_bytes = self.base_cache_bytes.saturating_sub(old.bytes);
+        }
+        if bytes > BASE_CACHE_BUDGET_BYTES {
+            return;
+        }
+        while self.base_cache_bytes + bytes > BASE_CACHE_BUDGET_BYTES
+            || self.base_cache.len() >= BASE_CACHE_MAX_ENTRIES
+        {
+            let victim = self
+                .base_cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_use)
+                .map(|(key, _)| key.clone());
+            let Some(victim) = victim else {
+                break;
+            };
+            if let Some(old) = self.base_cache.remove(&victim) {
+                self.base_cache_bytes = self.base_cache_bytes.saturating_sub(old.bytes);
+            }
+        }
+        self.frame_stats.base_cache_stores += 1;
+        self.cache_clock += 1;
+        self.base_cache.insert(
+            key,
+            BaseCacheEntry {
+                texture,
+                last_use: self.cache_clock,
+                bytes,
+            },
+        );
+        self.base_cache_bytes += bytes;
     }
 }
 
@@ -1054,3 +1149,28 @@ pub struct ComposedLayer {
     pub hash: u64,
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::texture::Texture;
+
+    #[test]
+    fn base_cache_hits_by_layer_and_hash_and_forgets() {
+        let mut text = TextComposer::new();
+        text.set_base_cache_enabled(true);
+        let layer = LayerId::new(b"L".to_vec());
+        let texture = Rc::new(Texture {
+            width: 2,
+            height: 1,
+            rgba: vec![0; 8],
+        });
+        assert!(text.cached_base(&layer, 7).is_none());
+        text.store_base(&layer, 7, Rc::clone(&texture));
+        assert!(text.cached_base(&layer, 7).is_some());
+        // 基面身份变化 ⇒ 不命中(必须重新取基面)。
+        assert!(text.cached_base(&layer, 8).is_none());
+        text.forget_compose_cache(&layer);
+        assert!(text.cached_base(&layer, 7).is_none());
+    }
+}

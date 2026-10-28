@@ -49,6 +49,17 @@ pub struct RenderPhases {
     pub text_paint_us: u64,
     /// 文本子阶段:基面解析。
     pub text_base_us: u64,
+    /// 文本子阶段:CPU 基面取得(`content_cpu`:资产整张克隆或 GPU 读回)。
+    pub text_cpu_base_us: u64,
+    /// 其中:同步 GPU 读回耗时/次数(按层内容 `read_texture`)。
+    pub text_cpu_readback_us: u64,
+    pub text_cpu_readbacks: u64,
+    /// 其中:资产整张克隆耗时/字节。
+    pub text_cpu_asset_us: u64,
+    pub text_cpu_asset_bytes: u64,
+    /// 其中:文本基面 CPU 缓存命中次数(免读回/免拷贝)与写入次数。
+    pub text_cpu_cached: u64,
+    pub text_cpu_stores: u64,
     /// 图像子阶段:`RECTPAINT` 族 CPU 填充。
     pub image_paint_us: u64,
     /// 图像子阶段:`REVERSE` 等逐像素变换。
