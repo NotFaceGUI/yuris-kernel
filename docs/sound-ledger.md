@@ -40,6 +40,7 @@
 | N0-11 | 装载重置 / VOLUME 无 PLAY / LOOPCOUNT 生命周期 | type 1 load（`0x424614`）重装时 PAN/PITCH→256、START/RESTART/END/位置清零；E/VOLUME/LOOP/LOOPCOUNT **保留**。type 5（`0x42511c`）无 PLAY 时立即写 `+0x148/+0x154/+0x150` 并 SetVolume；有 PLAY 时 type 6（`0x425164`）只更新目标，由 type 2 的 FADE 淡变。`+0x110`(LOOPCOUNT) 只由 `0x464960` 的边界写；type 1/2/14 都不清零。PLAY 的 state 0 分支若 `END <= START` 则把 START 写 0。释放辅助 `0x423940`（Stop + Release + 释放解码缓冲）只清 START/RESTART，不清元数据/音量/LOOP | `0x424614`、`0x42511c`、`0x425164`、`0x424950`、`0x464960`、`0x423940` | Confirmed（静态） |
 | N0-12 | DATALEFT / DATARIGHT | **B6 已实现**（DIV-SND-001 → fixed(no-manual)）：`0x44fe3c/0x44ff58` 要求缓冲存在、CHANNEL∈{1,2}、BIT∈{8,16}；在播放光标处 Lock 一帧。16-bit 取首个 i16 的绝对值（-32768 回绕为 -32768）；8-bit 取 `abs(byte-0x80)`；DATARIGHT 单声道返回 -1；失败 -1。**勘误（2026-10-24 字节级复核，0x4500a1..0x4500be）**：16-bit 立体声 DATARIGHT 官方读 `word [ptr+4]`——越过 4 字节锁区＝**下一帧的左声道**（旧表述「取第二采样」只对 8-bit 的 `ptr[1]` 成立）；官方越界怪癖 1:1 保留。手册无页（2026-10-24 政策：按 REA 实现并标注） | `0x44fe3c`/`0x44ff58` 原始汇编；`0x44f9f1`/`0x44fa3d` 调用点；内核 `pcm_data_sample` + 单测 `dataleft_dataright_read_play_cursor_frame` | Confirmed（静态字节级） |
 | N0-13 | 装载/播放架构(整段 vs 流式) | **官方装载不整段解码**:`0x422ab0` 仅 `ov_open` + `ov_time_total`;`0x422c65` 写入 `+0x1b8/+0x1ba/+0x1bc/+0x1c6` 格式字段(`+0x1b4/+0x198` = `channels*rate` 字节/秒)后,只 `malloc` 一个 4KB 块与 `bytes_per_sec/2 + 0x1000`(**0.5 秒**)块并 `CreateSoundBuffer`(虚表 `+0xc`)。解码是播放期按需填充,不在 SOUND 命令里。`TOTALTIME` = `ov_time_total` = 最后 page granule/rate。**旧内核在 SOUND 命令里整段解出 `Vec<i16>`(语料 90s BGM ≈ 93–98ms)是架构偏差,已按官方改为流式(`yu-sound/src/stream.rs`:头部 O(1) + 0.5s 预取窗口 + 按需 `read_dec_packet_itl`)。granule 与 lewton 末包裁剪在 98/6966 个文件上 ≤36ms 不一致(lewton 不按 granule 裁剪的已知偏差);总长以官方 granule 为准,多出的样本截断、不足补静音,保证 TIME/END/LOOP 自洽。 | REA `procedure_pseudo_code 0x422ab0/0x422c65/0x4806c5`(2026-10-28);语料审计 `cargo run -p yu-engine --example audio_duration_audit`(koto 6966 文件 `header_drift=98 max_drift_ms=36`,ERIS 8 文件 0 漂移);单测 `gated_ogg_load_reads_header_only_then_streams_on_play` / `gated_ogg_stream_render_matches_full_decode` / `gated_ogg_loop_wrap_back_to_zero_reopens_stream` | Confirmed(静态 + 语料自证 + 逐样本对拍) |
+| N0-14 | 层路径树 / 音量继承 / SOUNDEND 语义 | **声音层是名字树,不是扁平表**:ID 先经 `FUN_004141e4` 规范化(前缀 `S0` = `.data:0x80bf54` → `[0x801718]`;字符表 `0x689b80` 运行时只有 `'.'`/`'/'`/`':'` 非零;`:/` 绝对写法、`//`/`./`/`../` 折叠、末尾 `/`;空格 ⇒ -1),`FUN_00414559` 按 `/` 逐段下行(节点 `+0x10` 父 / `+0x00` 首子 / `+0x0c` 兄弟 / `+0x30` 容器 / `+0x34` 声音对象)。有效音量 `FUN_00424dfc`:`v=(E==1)*VOLUME; v=v*parent_eff>>8`(每级截断),根层 `S0` 就是脚本的 `SOUND[ID=":/S0/"]`(主音量)。容器改音量(type 5 `0x42511c` → `FUN_004238e0`)时 `+0x30!=0` ⇒ `FUN_00424db8` 递归重写全部后代的有效音量。`SOUNDINFO[VOLUME]` 读 `+0x148`(自身字段)。`SOUNDEND 0x44f308` 不删节点:入队 type 0xe(`0x4253b8`,state==0 时 no-op),清文件名/停播/释放/清 START+RESTART、state=0,保留元数据/TOTALTIME/位置/PAN/PITCH/LOOP/LOOPCOUNT/E/VOLUME;ID 以 `/` 结尾时递归停止叶子后代(`0x44f388`→`0x44f3a4`)。 | REA `0x462566`(root malloc)/`0x462577`(root 声音对象)/`0x462592`(前缀复制)/`0x4625be`(前缀建根层)/`0x4141e4`/`0x414559`/`0x41478c`/`0x424dfc`/`0x424db8`/`0x4238e0`/`0x42511c`/`0x425164`/`0x4253b8`/`0x44f308`;运行时 ReadProcessMemory 层树(prefix=`S0`,S0→BGM→B1,15 频道容器,字符表 {'.','/',':'});脚本 `ERIS/Sound/es_Sound.yst` `es.SOUND.SETVOL`/`es.VOL.*.GET` | Confirmed(静态 + 运行时 + 语料) |
 
 ### 1.1 文件名归一化与扩展名探测（REA `0x40c9b4` / `0x45f348`）
 
@@ -59,6 +60,73 @@
   `SOUNDINFO[FILE]` 返回它，而不是脚本里的原始 `FILE` 参数。
 - 探测全失败时 `local_24` 停在最后一个候选；但处理体此时直接返回，
   **不会入队 type 1**，所以这个候选名不会复制进 `+0x000`（见 N0-8）。
+
+
+### 1.2 层路径树、音量继承与 SOUNDEND(2026-10-29)
+
+**ID 规范化** `FUN_004141e4`(调用点 `0x44e235` SOUND / `0x44f500` SOUNDINFO /
+`0x44f346` SOUNDEND;前缀 `[0x801718]` = `"S0"`,来源 `.data:0x80bf54`,
+启动时 `0x462592..0x4625a6` 复制):
+
+- 字符分类表 `0x689b80` 运行时实测只有 `'.'(0x2e)`、`'/'(0x2f)`、
+  `':'(0x3a)` 非零(静态文件里是 BSS 零,启动期初始化;直接搜索立即数
+  只有读点 `0x414205`,写点经计算地址)。
+- ID 不含这三者 ⇒ 快速路径:`前缀 + "/" + ID`(空 ID ⇒ `"S0/"`)。
+- 含任一者 ⇒ 慢路径:以 `:` 开头为绝对 ID(`:/S0/` → `S0`);
+  折叠连续 `/`、去掉非末段 `./`、`../` 回退一级、去掉末尾 `/`;
+  段内空格 ⇒ 返回 -1(SOUND/SOUNDINFO/SOUNDEND 处理体整条不应用)。
+- 原 ID 以 `/` 结尾 ⇒ 返回 1(SOUNDEND 用它区分递归停止子树)。
+
+**层树**:`FUN_00414559` 按 `/` 逐段下行,`FUN_0041478c` 用 MurmurHash2
+查子节点(只查不建)。**建节点规则**(`0x44ef31..0x44f245`):带 FILE 且
+ID 不以 `/` 结尾 ⇒ 叶子(`+0x30=0`,写入点 `0x44f1fd`);不带 FILE 且以
+`/` 结尾 ⇒ 容器(`+0x30=1`,写入点 `0x44f08e`);带 FILE 且以 `/` 结尾
+⇒ 错误 `0x18bac`;其余 ⇒ 整条命令丢弃。父链必须已存在(`FUN_00461328`
+逐段查找,缺段 `0x18786` 失败),官方不补建中间节点。节点布局:`+0x00` 首子、
+`+0x0c` 下一兄弟、`+0x10` 父、`+0x14/+0x18` 名字指针/长度、`+0x1c` hash、
+`+0x30` 容器标记、`+0x34` 声音对象(容器也分配 `0x1d0` 对象,`0x462566..`)。
+
+**有效音量** `FUN_00424dfc`:
+
+```text
+v = (E == 1) * VOLUME(自身 +0x148)
+if 父节点存在且父节点有名字:
+    v = v * FUN_00424dfc(父) >> 8      // 每级整数截断
+```
+
+脚本的 `SOUND[ID=":/S0/" VOLUME=主音量]` 就是根层 `S0` 自身,所以主音量
+沿 `S0 → BGM → BGM/A1` 折进每一条声音;`SOUND[ID="BGM/" VOLUME=]` 是
+频道整体音量。`SOUNDINFO[VOLUME]` 仍返回自身 `+0x148`(`0x44fb87`)。
+
+**容器改音量** type 5 `0x42511c` 写 `+0x148/+0x154/+0x150` 后调
+`FUN_004238e0`:节点 `+0x30 != 0` ⇒ `FUN_00424db8` 递归把每个后代的
+有效音量重写进各自 DirectSound 缓冲;叶子 ⇒ 自身有效音量直接写。
+所以主/频道滑杆一动,正在播的声音即时生效。
+
+**SOUNDEND** `0x44f308`:不删节点。`0x44f3e8` 入队 type 0xe(`0x4253b8`):
+`state==0` 时 no-op;否则清文件名 `+0x000`、停播、`0x423940` 释放缓冲、
+清 START/RESTART、`state=0`;**保留** `+0x105/+0x107/+0x120/+0x118/
+PAN/PITCH/LOOP/LOOPCOUNT/E/VOLUME`。ID 以 `/` 结尾时 `0x44f388` →
+`0x44f3a4` 先递归停止所有叶子后代(容器保留),再释放目标自身。
+
+**运行时层树**(官方引擎启动 ERIS 后 `ReadProcessMemory`):
+
+```text
+root(空名) → S0(容器, vol=256, E=1)
+              ├─ BGM(容器) → B1(叶子, 播放中)
+              ├─ SE / VO / EBGM / … / S2VO(15 条频道容器)
+              └─ ROOT(引擎内部层, 非 SOUND 命令建)
+prefix="S0"; 0x689b80 非零项={'.','/',':'}
+```
+
+`BGM/` 与 `:/S0/` 都**没有**产生 `S0/BGM/` 空名子节点或 `S0/:/S0` 节点,
+证明规范化路径生效(否则主音量/频道音量会落到孤立节点上)。
+
+**内核实现**:`crates/yu-sound/src/path.rs`(`normalize`)、
+`state.rs`(`Layer.container`、根层 `S0`、`parent_exists` + 官方建节点规则、
+`effective_for_key`、`apply_soundend`)、`mixer.rs`(按有效音量出增益)。单测见
+`tests/state.rs` 的 `layer_ids_are_path_normalized` 等 7 项 + `path` 模块 7 项;
+分歧档案 `DIV-SND-005`,设置面汇总 `docs/game-settings-ledger.md`。
 
 ## 2. 声音对象字段表（`layer+0x34`）
 

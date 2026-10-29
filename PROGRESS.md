@@ -54,6 +54,185 @@ yu-trace: vfs/vm/frame 边界录制、回放、跨 producer diff
   (`yu-vfs` 取字节 + `frame.image_probe_order` + image 解码 + 缓存)。
 - 文字链路: `yu-font` 已独立完成,尚未桥接进 `yu-gfx`/后端(DIV-GFX-012)。
 
+## 成果 SND-LAYER-TREE (2026-10-29) · 游戏设置音量链对齐:声音层路径树 + 祖先音量继承
+
+### 目标与证据
+
+设置画面的主音量/频道音量滑杆在脚本里写成 `SOUND[ID=":/S0/" …]`、
+`SOUND[ID="BGM/" …]`,最终声音是 `SOUND[ID="BGM/A1" …]`。官方 0.495 的
+声音层是**名字树**(不是扁平表),音量按祖先链继承:
+
+- ID 规范化 `FUN_004141e4`:前缀 `"S0"`(`.data:0x80bf54` → `[0x801718]`,
+  启动 `0x462592..0x4625a6`);字符表 `0x689b80` **运行时实测**只有
+  `'.'`/`'/'`/`':'` 非零;`:/` 绝对写法、`//`/`./`/`../` 折叠、末尾 `/`、
+  空格 ⇒ -1。调用点 `0x44e235`(SOUND)/`0x44f500`(SOUNDINFO)/
+  `0x44f346`(SOUNDEND)。
+- 层树 `FUN_00414559` + `FUN_0041478c`(MurmurHash2,只查不建);节点
+  `+0x10` 父 / `+0x00` 首子 / `+0x0c` 兄弟 / `+0x30` 容器 / `+0x34` 声音对象。
+- 建节点规则 `0x44ef31..0x44f245`:带 FILE 建叶子(`+0x30=0`,`0x44f1fd`)、
+  末尾 `/` 建容器(`+0x30=1`,`0x44f08e`)、带 FILE+末尾 `/` ⇒ 错误
+  `0x18bac`、其余整条丢弃;父链必须已存在(`0x18786`,不补建中间节点)。
+- 有效音量 `FUN_00424dfc`:`v=(E==1)*VOLUME; v=v*parent_eff>>8`(每级截断);
+  容器改音量 `FUN_004238e0` → `FUN_00424db8` 递归重写后代。
+- `SOUNDINFO[VOLUME]` 读 `+0x148`(自身字段,`0x44fb87`)。
+- `SOUNDEND 0x44f308` 不删节点:type 0xe(`0x4253b8`)释放声音对象,
+  保留元数据/TOTALTIME/位置/PAN/PITCH/LOOP/LOOPCOUNT/E/VOLUME;末尾 `/`
+  时递归停止叶子后代(`0x44f388`→`0x44f3a4`)。
+
+运行时佐证:官方引擎跑 ERIS 后 `ReadProcessMemory` 层树 =
+`root → S0(容器) → BGM(容器) → B1(叶子)` + 15 条频道容器;
+`prefix="S0"`,字符表非零项 `{'.','/',':'}`;`BGM/` 与 `:/S0/` 均未产生
+多余空名/`":"`节点。脚本侧链路见 `ERIS/Sound/es_Sound.yst`
+(`es.SOUND.SETVOL`/`es.VOL.*.GET`)与 `ERIS/es_GSD.yst`(`es.GSD.REFLECT`)。
+
+### 改动(未提交工作区)
+
+1. **`crates/yu-sound/src/path.rs`(新)**:`normalize`(快速/慢路径、绝对
+   ID、`./`/`../`、末尾 `/`、空格拒绝、`trailing_slash`)。
+2. **`crates/yu-sound/src/state.rs`**:`Layer.container`;`SoundState::new`
+   建根层 `S0`;`apply_sound` 走规范化键 + 官方建节点规则
+   (`parent_exists`);`query`/`layer` 同样规范化;`effective_for_key`
+   逐级 `>>8`;`apply_soundend` 实现 type 0xe 释放语义与带 `/` 递归;
+   `snapshot` 增 `effective_volume`/`container`。
+3. **`crates/yu-sound/src/mixer.rs`**:每块按 `effective_for_key` 取增益
+   (`volume_gain` 仍是 `(v/256)^2`,REA `0x424e4c`)。
+4. **`crates/yu-sound/src/host.rs`**:`SOUNDEND` → `apply_soundend`。
+5. **`crates/yu-cli/examples/sound_census.rs`**:输出 `eff=`/`container=`。
+6. 台账:`docs/game-settings-ledger.md`(新)、`docs/divergences/DIV-SND-005-
+   sound-layer-tree.md`(新)、`docs/sound-ledger.md` N0-14 + §1.2。
+
+### 验证命令与原始结果
+
+```bash
+export TEMP="D:/Art/ai/projects/YurisDroid/workbench/tmp"
+export YURIS_SAMPLE_ERIS_ROOT="D:/Art/ai/projects/YurisDroid/workbench/project-eris"
+cargo test -p yu-sound
+# → test result: ok. 51 passed; 0 failed
+cargo run -p yu-cli --example sound_census -- 300
+# → frames=300 layers=17
+#   id=S0/BGM ... container=true
+#   id=S0/BGM/B1 file=bgm/bgm01.ogg state=Playing time=1200 total=90802 ... eff=256 container=false
+#   id=S0/SE / S0/VO / S0/SSE / S0/SVO ... container=true
+#   snd_diags=0
+python tools/rea/sound_tree_probe.py 6
+# → char_table@689b80: [(46,1),(47,1),(58,1)]  prefix: b'S0'
+#   root → S0(flag=01) → BGM(flag=01) → B1(flag=00) + 15 条频道容器
+```
+
+`layers=17` = 根 `S0` + 15 条频道容器 + 正在播的 `BGM/B1`,与官方运行时
+层树同形(官方另有引擎内部 `ROOT` 层,不经 SOUND 命令创建)。
+
+### 用例基线:既有环境漂移(非本轮回归)
+
+`yu-cli case --all` 9 条里 8 条 FAIL,全部是**改动前既有**的哈希漂移:
+
+- 现象:每个用例前都有 `fontdb: Failed to load a font face 0 from
+  'C:\Windows\Fonts\mstmc.ttf' cause malformed font`。
+- A/B 取证:临时 `git stash` 掉 `crates/yu-sound` 与 census 示例后重跑
+  `record-events-off` / `symptom-ingame-config`,actual 哈希与本轮
+  **逐字节相同**(`f2d2fbbc…` / `b4bba9b3…`);`save-load-loop`、
+  `symptom-enter-story` 的 actual 也与本轮相同(`e264bf3b…` /
+  `83e0e765…`)。
+- 结论:失败源于本机字体环境与 golden 记录环境不一致,与本轮声音改动
+  无关;golden 未更新(避免把坏字体环境固化进基线)。
+- 同类既有漂移:`cargo test --workspace` 仅 `yu-trace
+  synthetic_trace_matches_golden` 失败(项目 `system/YSCom/YSCom.ycd`
+  sha256 `997b5b63…` vs golden `39ba92ef…`);stash 掉本轮改动后同样失败,
+  属工程数据漂移,非本轮回归。其余 63 个测试二进制全绿。
+
+### 后续挂账
+
+- `WINDOW[NO=0 Z=]` 的宿主落地(常に手前 ⇒ `SetWindowPos`);内核只存
+  字段(`WindowState.z`),桌面宿主未应用。
+- `SYSTEM[BACKGROUNDEXEC=]/[SCREENSAVER=]` 维持宿主策略 aligned-stub。
+- `yscfg.dat` 其余 31 项未逐项映射(第 10 项 `_WINDOW_INIT_POS` 已映射)。
+- 空格 ID 拒绝的调用方 flag 为栈残值,按 `Likely` 处理(语料无含空格 ID)。
+
+## 成果 SYSVAR-WRITE (2026-10-29) · 可赋值输入系统变量写入落地(`_INP`/`_KEYLAST`/`_MOUSELAST`)
+
+### 现象与判定
+
+桌面点击/推进时每次打印
+`UNIMP [vm] rt.sysvar.write ... 写入系统变量 _INP ... 本次写入被忽略(DIV-RT-007)`。
+**这是误报**:`_INP` 的写入语义早已取证,只是写处理器漏了路由(原语
+`InputState::set_counter_code` 已存在且带单测)。
+
+### 证据(0.495 REA,写分派)
+
+- `_INP`(case 0x90 → `0x446efc` → `0x447014`):下标 `n>0` 时按物理按下
+  状态钳制写**同一张** VK 计数表(`DAT_00685800[n*8]`,与 `_KEY_*` 读同址);
+  `n<=0` 忽略。
+- `_KEYLAST`(0x91 → `0x446f52`)/ `_MOUSELAST`(0x92 → `0x446f3c`):
+  RHS 直接写 `DAT_00801908`/`0x80190c`,无钳制。
+- 语料:`es_Button.yst:3417` 每次按下写 `_INP(...)=2`(消费按下);
+  `es_Sprite.yst:851..854` 写 `=11`(连发限速);`es_Text.yst:1287`、
+  `es_TXExec.yst:9/119` 写 `_KEYLAST=0`/`_MOUSELAST=0`(取消 skip)。
+
+### 改动
+
+- `crates/yu-rt/src/input.rs`:`InputState::set_last(key, value)`。
+- `crates/yu-rt/src/vm/handlers.rs` 系统变量写路径新增 `_INP`(按
+  `lval.indices` 取码 → `set_counter_code`)与 `_KEYLAST`/`_MOUSELAST`
+  (→ `set_last`),不再落 `rt.sysvar.write` 挂号。
+- 文档:`crates/yu-rt/docs/divergences/README.md` DIV-RT-007 增补收口记录。
+
+### 验证
+
+```bash
+cargo test -p yu-rt --test fixture inp_keylast_mouselast_writes_are_applied
+# → 1 passed(修复前:counter 1≠2,写入被丢弃)
+
+YURIS_SAMPLE_ERIS_ROOT=<project-eris>   cargo test -p yu-cli --test sysvar_write -- --ignored --nocapture
+# → 1 passed;A/B:修复前同一用例报 7 条 _INP/_KEYLAST/_MOUSELAST 挂号,修复后 0
+```
+
+## 成果 SETTINGS-PERSIST (2026-10-29) · 设置读取/存储闭环与 GSD 全量目录
+
+### 取证
+
+- 设置存储 = 官方 `save/*.sd`(YSSD v0x1E0):`gsd.sd`(全局设置)、
+  `kidoku.sd`(既読)、`extra.sd`(解锁)、`seld.sd`(直前选择)、
+  `saveNNNNN.sd`(游戏存档)。
+- 读:`es_GSD.yst:154..165` `FILEINFO[EXIST]` + `LOAD[FILE="gsd.sd"
+  DNO=01 LET=@es.GSD()]` / `DNO=02 LET=$es.GSD()` / `DNO=03 G_INT2=1` /
+  `DNO=04 G_STR2=1`;启动序 `es_First.yst:139 GSD.INIT → :201 SOUND.INIT
+  (SETVOL) → :237 GSD.REFLECT`。
+- 写:`es_GSD.yst:558..585` `\GSD.SAVE` → `SAVE[DNO=01 SET=@es.GSD()]` /
+  `DNO=02 SET=$es.GSD()` / `DNO=03 G_INT2=1` / `DNO=04 G_STR2=1` +
+  `SAVE[FILE="gsd.sd"]`;`ES.CONFIG.END` 与标题开始都会触发。
+- 设置目录:`es_GSD.yst:1..130` 的逐项注释(音量矩阵 001..010、功能开关
+  110/111/112、字体 113、确认框 114、文本/演出 115/116/120/121/125、
+  E-mote 131、运行期 141/150/151、存档槽 092/093/151)。全量映射见
+  `docs/game-settings-ledger.md` §2.1。
+
+### 验证(官方 gsd.sd 端到端)
+
+新增 `crates/yu-cli/tests/settings_persist.rs`(两个 `#[ignore]`,需语料):
+
+```bash
+export YURIS_SAMPLE_ERIS_ROOT="D:/Art/ai/projects/YurisDroid/workbench/project-eris"
+cargo test -p yu-cli --test settings_persist -- --ignored --nocapture
+# → gsd_master_volume_is_loaded_and_applied ... ok
+#   gsd_settings_survive_resave ... ok
+```
+
+1. **读 + 应用**:把官方 `gsd.sd` 的 `GSD(001,01)` 改成 128 → 启动到标题 →
+   声音层 `S0/BGM/B1` 有效音量 = **128**(自身字段仍 256)。
+2. **写 + 保留**:同文件跑「标题→スタート」触发 `\GSD.SAVE` → 重写后的
+   `gsd.sd` 仍是 4 块,DNO/类型/变量 id/维数逐块与官方一致;主音量 128
+   原样保留;与官方文件的差异只落在运行期字段(141,01 启动回数、
+   141,03 累计时间、101,01..03 窗口尺寸、113,01 字体号)。
+- 块格式层:官方 7 个 `.sd` parse→rebuild 逐字节一致(`yu-format`
+  `tests/yssd_roundtrip.rs`,既有)。
+
+### 发现的残余差异(已记档,非本轮改动)
+
+- `101,01..03`:headless 内核按工程视口 800×600 回写,官方按真实窗口
+  (2560×1369 最大化)回写 ⇒ 宿主窗口尺寸注入,不是存储格式问题。
+- `113,01` 字体号:内核 fontdb 枚举顺序/过滤与官方 GDI
+  `EnumFontFamiliesExA` 不一致,默认字体下标 0 vs 1(本机伴随
+  `mstmc.ttf malformed` 告警)⇒ 字体域枚举保真待查。
+
 ## 成果 SURFACE-RESIDENT (2026-10-28) · wgpu 帧契约改常驻图层表面(不再逐 op 重放)
 
 ### 目标与证据
