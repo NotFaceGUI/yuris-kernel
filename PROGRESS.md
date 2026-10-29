@@ -10611,3 +10611,52 @@ total value diffs: 0
 - 仿射字段的**绘制侧合成公式**仍未对拍(DIV-GFX-070):字段已存,
   后端只消费 `x/y`;非默认值图层标 `gfx.affine.unverified`。
 - `RID` 资源图链路缺 provider(PSB/E-mote 资产头),保持显式挂号。
+
+---
+
+## 成果 DATA-ENTRY-KEY (2026-10-29) · 数据入口支持 pac 多包,脚本密钥自动解析
+
+### 问题
+
+商业发行版把封包放在 `pac/` 下并按内容命名(`bn.ypf`/`cg.ypf`/…),不是单个
+`data.ypf`;`Project::discover` 只认 `data.ypf`/`data/`,遇到 夏ノ鎖 直接报
+「找不到数据入口」。同时脚本密钥是每作可变的(`CRC32(字符串)`;本作 =
+`CRC32("ClockupDl")`),运行核只认默认值 `CRC32("Yu-ris")`,换钥作品停在
+`fmt.ybn.key`。
+
+### 改动
+
+- `crates/yu-engine/src/project.rs`:按官方发现规则(`FUN_0045eda0` /
+  `FUN_0045e3b8`)扫 `<根>/*.ypf` + `<根>/pac/*.ypf`(开发工程再并入
+  `<根>/data`);`update1..9.ypf` 为增量层、其余为基础包(按文件名排序,
+  确定性);非 `YPF\0` 魔数的文件跳过并计数(实测 `pac/ed01..04.ypf` 是
+  MPEG-PS)。`DataEntry` 改为 `PackSet{base,updates,skipped}`,
+  `describe()` 带 `packs/updates/skipped`。
+- `crates/yu-engine/src/keys.rs`(新):按开源实现的两条静态路线取钥 ——
+  RxYuris `YSTB_Coder::GetXorKey`(读 `0x20+s1+8`)与 YU-RIS-Script-Editor
+  `_guess_v5_key`(12 字节窗口投票);候选一律过结构自检
+  (`Σ argc×12 == s2`、`opcode < 命令数`)。exe 字面量 CRC32 只作最后兜底
+  (已标注:工具未用此路线)。
+- `crates/yu-engine/src/engine.rs`:`BootConfig.script_key` 接解析结果,
+  启动日志打印密钥与来源。
+- `crates/yu-cli/src/{run,desktop,server}.rs`:数据摘要统一走
+  `DatasetInfo::summary()`;`run` 新增 `--script-key <8 位十六进制>`。
+- `docs/formats/ypf.md` §4.1:记录读取器的扫描/排序/跳过规则。
+
+### 验证(原始结果)
+
+```text
+cargo build --workspace --all-targets          → ok(无 warning)
+cargo test -p yu-engine -p yu-cli -p yu-vfs    → 全过
+cargo test -p yu-engine --test project_layout  → 1 passed(真实商业包布局)
+yu-cli run <夏ノ鎖根>                           → script key: 43 2F 06 B0 (source=rx-yuris:header)
+                                                 data=packed:...pac\bn.ypf (1099291835 bytes, packs=7 updates=2 skipped=4)
+                                                 frame: 1 viewport: 1152x720(首帧可绘制)
+yu-cli run <project-eris>                      → script key: D3 6F AC 96 (source=rx-yuris:header),packs=1,正常出帧
+```
+
+### 残余
+
+- 存档仍被 `YSSD == 0x1E0` 等值门拒(本作 0x1E1),读档不可用。
+- `YSTD == 495` 等值门未改(本作 481;本作 boot 路径未触发该表,留待统一处理)。
+- 包内嵌 exe overlay、WZ 加密 YPF 未实现(缺样本 / 仅工具级证据)。
