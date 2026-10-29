@@ -48,3 +48,5 @@ yu-vfs = { path = "../yu-vfs" }
 [dev-dependencies]
 # 仅 examples 使用:yu-trace 仍是旁挂(不进入 yu-cli 运行期依赖)。
 yu-trace = { path = "../yu-trace" }
+# 设置读写闭环测试(`tests/settings_persist.rs`)要拆/拼 gsd.sd 块。
+yu-format = { path = "../yu-format" }

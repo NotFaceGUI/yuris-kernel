@@ -4127,6 +4127,7 @@ dependencies = [
  "yu-backend-soft",
  "yu-backend-wgpu",
  "yu-engine",
+ "yu-format",
  "yu-gfx",
  "yu-host-desktop",
  "yu-log",

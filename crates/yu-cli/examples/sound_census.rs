@@ -35,7 +35,7 @@ fn main() {
     println!("frames={frames} layers={}", snap.len());
     for l in &snap {
         println!(
-            "id={} file={} state={:?} time={} total={} loop={} count={} vol={} pan={} pitch={} e={} pause={}",
+            "id={} file={} state={:?} time={} total={} loop={} count={} vol={} eff={} pan={} pitch={} e={} pause={} container={}",
             String::from_utf8_lossy(&l.id),
             String::from_utf8_lossy(&l.file),
             l.state,
@@ -44,10 +44,12 @@ fn main() {
             l.loop_setting,
             l.loop_count,
             l.volume,
+            l.effective_volume,
             l.pan,
             l.pitch,
             l.enabled,
-            l.paused
+            l.paused,
+            l.container
         );
     }
     let diags = engine.take_sound_diags();
