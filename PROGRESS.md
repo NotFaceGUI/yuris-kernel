@@ -9981,9 +9981,96 @@ draw;不会产生 30–120ms 尖峰。尖峰是上面的资产/文本/脚本成�
 layer_and_hash_and_forgets`(core)验证缓存键/淘汰。`cargo test -p yu-render-core`
 10、`-p yu-backend-wgpu` 26、`-p yu-backend-soft` 41/15/1/1、logging_guards 3 全绿。
 
-**仍未解决(需常驻表面/GPU 文本,渲染线)**:
+**仍未解决(需常驻表面/GPU 文本,渲染线;文本部分已于 2026-10-29 收口,见下节)**:
 
 - 游戏里这两层是 GPU 合成基面,且每帧基面身份变化/层重建,缓存与资产快路径
   都不命中:首帧仍 2 次读回 ≈73ms,后续文本帧仍各 2 次(队列空闲时 3.8ms/次)。
 - 差分帧仍是首用差分图解码 19–35ms + 36–54MB 上传;并行预解码可把解码墙钟
   压到 1/4 左右,但上传/合成仍在,需与常驻表面一起做。
+
+
+## 成果 PERF-TEXT-GPU (2026-10-29) · 文本字形直接写入 GPU 层表面,角色出场读回尖峰收口
+
+### 结论
+
+`CGACT[TEXT]` 的文本层不再把整张基面同步读回 CPU:字形仍由 CPU
+(`TextComposer`/fontdue)栅格化成与 soft 完全相同的像素,但合成改为
+**compute shader 直接把字形写进该层的常驻 GPU 表面**(storage
+`rgba8unorm` read_write)。实测角色出场/换文本帧的 `text_cpu=0`、
+`tcpu_rb=0`、`tgpu_fb=0`;365 个字形 = 949 次绘制(9 宫 SET 展开)时
+`text≈0.9ms`。官方证据同前:`0x4056b8` 在层表面就地写字形,不存在整面
+读回;此处对齐其数据流,不引入异步播放机制。
+
+### 实现
+
+- `yu-render-core/src/text.rs`:
+  - `GlyphPlacement { x, y, image, blend }`(导出);
+  - `TextComposer::collect_glyphs(&TextDraw)` 复用与原 CPU `paint_one`
+    相同的字体、字号(含 `ascent_px`)、cp932 解码与
+    `composite_offsets`(SET=0 → 1 遍;SET≠0 → 9 遍),按 CPU 绘制顺序
+    返回位图与位置。
+- `yu-render/wgpu/src/text_gpu.rs` + `shaders/text_glyph.wgsl`:
+  - 基面 `raw.tex` 恒等采样时 `copy_texture_to_texture` 到目标表面;
+    目标由 `LayerSurfaces::acquire` 分配,usage 增 `STORAGE_BINDING`;
+  - shader 用 **整数运算**逐像素复刻 `Rgba::over` / `replace_with`
+    (`yu-font/src/color.rs`),不做浮点混合;
+  - **单个 workgroup 按 draw 顺序串行 + `workgroupBarrier()`**:CPU 的
+    9 宫/多绘制项是有序叠加的,多个 workgroup 并行写重叠字形会让结果
+    依赖调度(曾复现 `diff` 在 0/224/230 间跳变);串行后与 soft 逐像素
+    一致;
+  - 缓存键 `(text revision, 签名, 基面 hash, 基面稳定身份)`;预算
+    128MB/32 层,LRU。同一帧重复渲染命中缓存,不重拷/不重 dispatch。
+- 能力门禁:`Rgba8Unorm` 需 `STORAGE_READ_WRITE`,并启用
+  `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`;不支持或管线创建失败时
+  记 `text.gpu.unsupported` 诊断并回退 CPU 合成(`tgpu_fb` 计数),
+  `YURIS_TEXT_GPU=0` 可强制关闭做 A/B。
+- 记账:`RenderPhases.text_gpu_{layers,glyphs,draws,cached,fallback}`;
+  spike 行 `tgpu=层/字形/draw tgpu_c= tgpu_fb=`;CSV 末尾追加 5 列
+  (旧列序不变)。
+- 未覆盖(仍走 CPU 文本合成,已计数 `tgpu_fb`):
+  `text_layout`(屏幕级自动文本)与缩放/非恒等采样基面。
+
+### 回归与测试
+
+- 新增/加强 `crates/yu-render/wgpu/tests/surfaces.rs`:
+  `text_layer_is_stable_across_frames` 覆盖首帧、同帧重复、换文本三态,
+  要求与 soft 逐像素一致且不残留旧字形(重叠 A/B 绘制项即上述调度回归)。
+- `cgact_text_layer_frames_match_soft_exactly`(1 字形)、
+  `cgact_text_reuses_cached_cpu_base_across_text_changes`(换文本零读回;
+  有 GPU 路径时断言 `tgpu_draws>=1`,无 GPU 时断言 CPU 基面缓存命中)。
+- `cargo build --workspace --all-targets` 通过;
+  `cargo test -p yu-sound`(6+45)、`-p yu-engine`(14)、
+  `-p yu-rt`(设 `YURIS_SAMPLE_ERIS_YSBIN` 后 4/11/4/98/3)、
+  `-p yu-render-core`(10)、`-p yu-backend-soft`(41/15/1/1)、
+  `-p yu-backend-wgpu`(9/10/26 + doc 1)、
+  `-p yu-cli --test logging_guards`(3)全绿。
+- `cargo fmt --all` 会重排历史未格式化文件,本轮未把这类无关改动带入;
+  改动文件按语义 diff 审阅。
+
+### 游戏实测(<game-b>,桌面 wgpu,`--no-sound --fixed-step`)
+
+复现命令(角色出场脚本,逐 5 帧点击 START/对话区;`--fixed-step` 固定
+1/fps 逻辑时钟):
+
+```bash
+./target/release/yu-cli.exe run <game-b> --mode desktop --frames 1400   --no-sound --fixed-step --script target/tmp/story-robust2.json   --frame-stats target/tmp/gputext/frames3.csv   --spike-log target/tmp/gputext/spikes3.log --spike-ms 20 --log-level quiet
+```
+
+- 1400 帧,93 个 work≥20ms 的尖峰,其中 **82 个走 GPU 文本**;
+  最大 365 字形/949 draws,`text=0.9ms`,`text_cpu=0`,`tcpu_rb=0`,
+  `tgpu_fb=0`;文本帧的 `render` p95 3.1ms。
+- 同口径历史基线(2026-10-28)f1796:`text=87.4ms`,其中
+  `text_cpu=86.4ms`、`tcpu_rb=69.2ms/2 次`;本改动后该类帧的两次全屏
+  同步读回消失。
+- 干净存档标题页 1200 帧:`avg_fps=57.8`,`work p50/p95=3.7/5.8ms`,
+  `tick p50=1.65ms`,`render p95=1.86ms`;首帧启动 170ms(资产装载/
+  捕获),`fatal=None`,无 wgpu 验证错误,exit 0。
+- 未覆盖项:自动文本 `text_layout` 仍 CPU(该作品场景首帧约 10ms);
+  差分纹理首用解码仍在 render plan(实测 19–36ms + 36–57MB 上传),
+  属常驻表面/预解码线的下一步,不在本轮文本路径内。
+
+### 门禁备注
+
+- `yu-cli case <project-eris> --all`:既有红灯(用例期望值未随最新 gfx
+  重生成),与本轮无关。
+- `cargo test -p yu-trace --test golden`:已知红灯(YSCom.ycd sha),同前。

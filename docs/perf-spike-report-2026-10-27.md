@@ -479,3 +479,17 @@ host=785 [site] IF/LOOPEND/IFEND es_cgmode.yst pc575/579/578 各 1.15 万次
 
 ⇒ 显存泄漏收口,渲染侧稳定(3 分半 56fps、无崩溃);剩余 0.4% 长帧是
 `tick` 里的 SOUND 解码与脚本突发(§10),属下一步。
+
+---
+
+## 12. 后续(2026-10-29):文本层读回已由 GPU 文本 pass 收口
+
+本报告 §1 记录的角色出场 `text_cpu` 尖峰(整张基面同步读回)已在后续
+落地中消除:`CGACT[TEXT]` 的字形仍由 CPU 栅格化(与 soft 同一份像素),
+但合成改为 compute shader 直接写入层的常驻 GPU 表面,不再
+`read_back`。实测尖峰帧 `text_cpu=0`、`tcpu_rb=0`,365 字形/949 draws
+`text≈0.9ms`;像素一致性由 wgpu/soft 逐像素测试锁定。实现与完整数据见
+`PROGRESS.md` 的「成果 PERF-TEXT-GPU (2026-10-29)」。
+
+仍未覆盖:`text_layout`(屏幕级自动文本)与缩放/非恒等采样基面仍走
+CPU;差分纹理首次解码/上传仍在 render plan。
