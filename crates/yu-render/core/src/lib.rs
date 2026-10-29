@@ -29,7 +29,7 @@ pub use report::{RenderPhases, RenderReport, SkippedOp};
 pub use scale::scale_region;
 pub use surface::{blit, blit_rgba, Surface};
 pub use text::{
-    content_hash_rgba, text_base_key, texture_content_hash, ComposedLayer, TextComposer,
-    TextPaintStats,
+    content_hash_rgba, text_base_key, texture_content_hash, ComposedLayer, GlyphPlacement,
+    TextComposer, TextPaintStats,
 };
 pub use texture::{AssetIssue, Texture, TextureStore};

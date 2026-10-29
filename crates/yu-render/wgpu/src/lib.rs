@@ -76,6 +76,7 @@ pub mod pipelines;
 pub mod readback;
 mod shaders;
 pub mod surfaces;
+mod text_gpu;
 pub mod textures;
 
 pub use device::{AdapterSummary, DeviceOptions, GpuContext};
@@ -201,6 +202,8 @@ pub struct WgpuRenderer {
     backbuffer_gpu: Option<(u64, u64)>,
     /// 文本栅格化/合成器(与 soft 同一实现;懒加载系统字体)。
     text: yu_render_core::TextComposer,
+    /// GPU 文本 pass(字形直接写层表面;能力不支持时为 `None` → CPU 回退)。
+    text_gpu: Option<text_gpu::TextGpuRenderer>,
     /// 最近一帧的阶段耗时(性能取证;不进入 `RenderReport` 的对账字段)。
     last_phases: yu_render_core::RenderPhases,
 }
@@ -218,6 +221,29 @@ impl WgpuRenderer {
     pub fn new_with_options(textures: TextureStore, options: &DeviceOptions) -> Result<Self, Diag> {
         let ctx = GpuContext::new(options)?;
         let pipelines = PipelineCache::new(&ctx)?;
+        let gpu_text_enabled = std::env::var("YURIS_TEXT_GPU")
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "off" | "false"
+                )
+            })
+            .unwrap_or(true);
+        let text_gpu = if ctx.text_storage && gpu_text_enabled {
+            match text_gpu::TextGpuRenderer::new(&ctx) {
+                Ok(renderer) => Some(renderer),
+                Err(diag) => {
+                    log::warn!(
+                        target: "yu-render",
+                        "[text-gpu] 禁用,回退 CPU 合成: {}",
+                        diag.detail
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             ctx,
             textures,
@@ -236,6 +262,7 @@ impl WgpuRenderer {
             backbuffer: None,
             backbuffer_gpu: None,
             text: yu_render_core::TextComposer::new(),
+            text_gpu,
             last_phases: yu_render_core::RenderPhases::default(),
         })
     }
@@ -328,6 +355,9 @@ impl WgpuRenderer {
         self.backbuffer_gpu = None;
         self.surfaces.reset();
         self.text_uploads.clear();
+        if let Some(text_gpu) = &mut self.text_gpu {
+            text_gpu.clear();
+        }
         self.targets.clear_snapshots(&mut self.pipelines);
         self.targets.clear_offscreen(&mut self.pipelines);
         self.readback = ReadbackCache::new();
@@ -486,6 +516,7 @@ impl WgpuRenderer {
             self.backbuffer.as_deref(),
             &mut self.backbuffer_gpu,
             &mut self.text,
+            &mut self.text_gpu,
         )?;
         let t_plan = started.elapsed();
 
@@ -502,6 +533,9 @@ impl WgpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("yu-backend-wgpu frame"),
             });
+        if let Some(text_gpu) = &self.text_gpu {
+            text_gpu.encode(&plan.text_jobs, &mut encoder);
+        }
         self.encode_passes(&plan, &mut encoder)?;
         let t_encode = started.elapsed() - t_plan;
 

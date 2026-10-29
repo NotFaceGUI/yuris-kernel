@@ -1983,8 +1983,9 @@ fn merge_after_rectpaint_clear_on_snapshot_writes_alpha() {
     );
 }
 
-/// 文本基面 CPU 缓存:同一层换文本(基面不变)时不得再做同步 GPU 读回。
+/// 同一层换文本(基面不变)时不得再做同步 GPU 读回。
 /// 语料角色出场帧实测 2 次全屏读回 = 69ms;此测试盯住回归。
+/// 有 GPU 文本 pass 时直接写常驻表面;不支持时回退到 CPU 基面缓存。
 #[test]
 fn cgact_text_reuses_cached_cpu_base_across_text_changes() {
     let table = table();
@@ -2079,9 +2080,17 @@ fn cgact_text_reuses_cached_cpu_base_across_text_changes() {
         second.text_cpu_readbacks,
         second.text_cpu_cached
     );
-    assert!(
-        second.text_cpu_cached >= 1,
-        "第二帧应命中文本基面缓存(second cached={})",
-        second.text_cpu_cached
-    );
+    if second.text_gpu_layers > 0 {
+        assert!(
+            second.text_gpu_draws >= 1,
+            "GPU 文本路径应至少编码一次字形写(gpu draws={})",
+            second.text_gpu_draws
+        );
+    } else {
+        assert!(
+            second.text_cpu_cached >= 1,
+            "无 GPU 文本路径时第二帧应命中文本基面缓存(second cached={})",
+            second.text_cpu_cached
+        );
+    }
 }

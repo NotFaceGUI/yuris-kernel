@@ -91,6 +91,9 @@ pub struct GpuContext {
     pub queue: wgpu::Queue,
     /// 所选后端对应的原始枚举(报告/测试用)。
     pub backend: wgpu::Backend,
+    /// `Rgba8Unorm` 是否支持 storage `read_write`(GPU 文本 pass 的前提;
+    /// 不支持时文本走 CPU 合成回退)。
+    pub text_storage: bool,
 }
 
 impl GpuContext {
@@ -126,9 +129,21 @@ impl GpuContext {
         let info = adapter.get_info();
         let adapter_info = AdapterSummary::from_info(&info);
 
+        // GPU 文本 pass 需要 `Rgba8Unorm` 的 storage read-write;该格式能力
+        // 属 adapter-specific,需同时启用对应 feature 才能建纹理/管线。
+        let format_flags = adapter
+            .get_texture_format_features(wgpu::TextureFormat::Rgba8Unorm)
+            .flags;
+        let text_storage =
+            format_flags.contains(wgpu::TextureFormatFeatureFlags::STORAGE_READ_WRITE);
+        let features = if text_storage {
+            adapter.features() & wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+        } else {
+            wgpu::Features::empty()
+        };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("yu-backend-wgpu device"),
-            required_features: wgpu::Features::empty(),
+            required_features: features,
             required_limits: options.limits.clone(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
@@ -158,6 +173,7 @@ impl GpuContext {
             device,
             queue,
             backend: info.backend,
+            text_storage,
         })
     }
 

@@ -53,6 +53,7 @@ pub(crate) fn plan(
     backbuffer: Option<&Surface>,
     backbuffer_gpu: &mut Option<(u64, u64)>,
     text: &mut TextComposer,
+    text_gpu: &mut Option<crate::text_gpu::TextGpuRenderer>,
 ) -> Result<(FramePlan, RenderReport, RenderPhases), Diag> {
     let started = std::time::Instant::now();
     surfaces.begin_frame(frame.frame);
@@ -238,7 +239,8 @@ pub(crate) fn plan(
     // ---- 2. 文本:`CGACT[TEXT]`/TextRun 进层表面(修订号驱动) ----
     let mark_text = started.elapsed();
     text.begin_frame_stats();
-    let (text_cpu_base_us, text_cpu_info) = apply_text(
+    let mut text_jobs: Vec<crate::text_gpu::TextGpuJob> = Vec::new();
+    let (text_cpu_base_us, text_cpu_info, text_gpu_stats) = apply_text(
         ctx,
         frame,
         textures,
@@ -250,6 +252,8 @@ pub(crate) fn plan(
         text,
         &mut acc,
         targets,
+        text_gpu,
+        &mut text_jobs,
     );
     let text_stats = text.take_frame_stats();
 
@@ -416,6 +420,11 @@ pub(crate) fn plan(
         text_cpu_asset_bytes: text_cpu_info.asset_bytes,
         text_cpu_cached: u64::from(text_stats.base_cache_hits),
         text_cpu_stores: u64::from(text_stats.base_cache_stores),
+        text_gpu_layers: text_gpu_stats.layers,
+        text_gpu_glyphs: text_gpu_stats.glyphs,
+        text_gpu_draws: text_gpu_stats.draws,
+        text_gpu_cached: text_gpu_stats.cached,
+        text_gpu_fallback: text_gpu_stats.fallback,
         decode_us: textures.decode_stats().0,
         decode_bytes: textures.decode_stats().1,
         surface_passes: stats.surface_passes,
@@ -451,6 +460,7 @@ pub(crate) fn plan(
             aux_bind_groups: aux,
             views,
             textures: textures_map,
+            text_jobs,
         },
         acc.finish(missing_assets),
         phases,
@@ -1552,6 +1562,16 @@ impl TextUploads {
     }
 }
 
+/// GPU 文本内容身份:修订 + 排版签名 + 基面像素 + 基面稳定身份。
+fn text_gpu_identity(revision: u64, signature: u64, raw_hash: u64, base_key: u64) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    fnv_mix(&mut hash, revision);
+    fnv_mix(&mut hash, signature);
+    fnv_mix(&mut hash, raw_hash);
+    fnv_mix(&mut hash, base_key);
+    hash
+}
+
 /// 文本绘制的身份(内容 + 排版 + 修订号):不变则不重烤、不重传。
 fn text_signature(draws: &[&yu_gfx::TextDraw], layout: Option<&yu_gfx::TextLayoutFrame>, dims: (u32, u32)) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -1632,6 +1652,16 @@ fn asset_identity_base(
         Some(region),
         raw.bilinear,
     )))
+}
+
+/// GPU 文本 pass 记账(逐帧)。
+#[derive(Default, Clone, Copy)]
+struct TextGpuStats {
+    layers: u64,
+    glyphs: u64,
+    draws: u64,
+    cached: u64,
+    fallback: u64,
 }
 
 /// CPU 基面取得的来源与耗时(诊断:资产克隆 vs 同步 GPU 读回)。
@@ -1727,9 +1757,12 @@ fn apply_text(
     text: &mut TextComposer,
     acc: &mut Accum,
     targets: &TargetSet,
-) -> (u64, CpuBaseInfo) {
+    text_gpu: &mut Option<crate::text_gpu::TextGpuRenderer>,
+    text_jobs: &mut Vec<crate::text_gpu::TextGpuJob>,
+) -> (u64, CpuBaseInfo, TextGpuStats) {
     let mut cpu_base_us = 0u64;
     let mut cpu_info = CpuBaseInfo::default();
+    let mut gpu_stats = TextGpuStats::default();
     let mut ids: BTreeSet<LayerId> = frame.text_draws.iter().map(|d| d.target.clone()).collect();
     if let Some(layout) = &frame.text_layout {
         if let Some(target) = &layout.target {
@@ -1784,10 +1817,97 @@ fn apply_text(
             }
             continue;
         }
-        let cpu_started = std::time::Instant::now();
         // 缓存键用“基面像素来源”身份(基面 token + 操作前缀),不用混了
         // 纹理池 id 的 `raw.hash`:同一基面换池后仍应命中。
         let base_key = surfaces.raw_identity(&id).unwrap_or(raw.hash);
+        // GPU 文本:恒等基面 + 非 layout 时,字形直接 compute 写进层表面。
+        if let Some(gpu_text) = text_gpu.as_mut() {
+            if layout.is_none() && raw.is_identity() && !draws.is_empty() {
+                let mut placements: Vec<yu_render_core::GlyphPlacement> = Vec::new();
+                let mut collected = true;
+                let mut gpu_glyphs = 0u32;
+                for draw in &draws {
+                    match text.collect_glyphs(draw) {
+                        Ok(mut items) => {
+                            let passes = draw.composite_passes().max(1) as usize;
+                            gpu_glyphs = gpu_glyphs.saturating_add((items.len() / passes) as u32);
+                            placements.append(&mut items);
+                        }
+                        Err(_) => {
+                            collected = false;
+                            break;
+                        }
+                    }
+                }
+                if collected && !placements.is_empty() {
+                    let identity = text_gpu_identity(revision, signature, raw.hash, base_key);
+                    if let Some(target) = gpu_text.cached(&id, identity) {
+                    merge_text_stats(
+                        acc,
+                        yu_render_core::TextPaintStats {
+                            draws: draws.len(),
+                            glyphs: gpu_glyphs as usize,
+                            ..yu_render_core::TextPaintStats::default()
+                        },
+                    );
+                        gpu_stats.cached += 1;
+                        let content = finish_content(
+                            surfaces,
+                            target,
+                            dims.0,
+                            dims.1,
+                            raw.display,
+                            Some(raw.bilinear),
+                        );
+                        surfaces.set_text_content(&id, content.clone(), raw.clone());
+                        surfaces.note_text_baked(&id, revision, signature, raw.hash);
+                        contents.insert(id.clone(), content);
+                        continue;
+                    }
+                    match gpu_text.build(
+                        ctx,
+                        surfaces,
+                        &id,
+                        identity,
+                        Rc::clone(&raw.tex),
+                        &placements,
+                    ) {
+                        Ok((target, job)) => {
+                    merge_text_stats(
+                        acc,
+                        yu_render_core::TextPaintStats {
+                            draws: draws.len(),
+                            glyphs: gpu_glyphs as usize,
+                            ..yu_render_core::TextPaintStats::default()
+                        },
+                    );
+                            gpu_stats.layers += 1;
+                            gpu_stats.glyphs += u64::from(job.glyphs);
+                            gpu_stats.draws += u64::from(job.draw_count);
+                            text_jobs.push(job);
+                            let content = finish_content(
+                                surfaces,
+                                target,
+                                dims.0,
+                                dims.1,
+                                raw.display,
+                                Some(raw.bilinear),
+                            );
+                            surfaces.set_text_content(&id, content.clone(), raw.clone());
+                            surfaces.note_text_baked(&id, revision, signature, raw.hash);
+                            contents.insert(id.clone(), content);
+                            continue;
+                        }
+                        Err(_) => {
+                            gpu_stats.fallback += 1;
+                        }
+                    }
+                } else {
+                    gpu_stats.fallback += 1;
+                }
+            }
+        }
+        let cpu_started = std::time::Instant::now();
         let cpu_base: Result<Rc<Texture>, String> =
             if let Some(hit) = text.cached_base(&id, base_key) {
                 Ok(hit)
@@ -1892,7 +2012,7 @@ fn apply_text(
         surfaces.note_text_baked(&id, revision, signature, raw.hash);
         contents.insert(id, content);
     }
-    (cpu_base_us, cpu_info)
+    (cpu_base_us, cpu_info, gpu_stats)
 }
 
 /// 屏幕级自动文本(`target=None`):全视口透明覆盖 + 一次合成 quad。

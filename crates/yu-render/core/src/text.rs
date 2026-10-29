@@ -742,6 +742,57 @@ impl TextComposer {
         stats.draws += 1;
     }
 
+    /// 收集一条 `CGACT[TEXT]` 的字形 placement(GPU 文本 pass 用)。
+    ///
+    /// 与 [`TextComposer::paint_one`] 同一套字体/样式/偏移语义;失败返回
+    /// 人读原因(调用方回退 CPU 合成,由 CPU 路径补诊断)。
+    pub fn collect_glyphs(&mut self, draw: &TextDraw) -> Result<Vec<GlyphPlacement>, String> {
+        if !self.ensure() {
+            return Err(self
+                .failure
+                .clone()
+                .unwrap_or_else(|| "text.font_unavailable".to_string()));
+        }
+        let Some((font_style, sy, _fallback)) = self.font_style(&draw.style) else {
+            return Err("text.font_missing".to_string());
+        };
+        let ascent = {
+            let renderer = self.renderer.as_ref().expect("ensured above");
+            match renderer.source().ascent_px(font_style.face, sy) {
+                Ok(a) => a.round() as i32,
+                Err(_) => return Err("text.metrics_unavailable".to_string()),
+            }
+        };
+        let blended = font_style.draw_mode == DrawMode::Blend;
+        let (offsets, passes) = draw.composite_offsets();
+        let decoded = cp932::decode(&draw.bytes);
+        if decoded.invalid > 0 {
+            return Err("text.decode_invalid".to_string());
+        }
+        let mut pen_x = draw.x as i32;
+        let baseline = draw.y as i32 + ascent;
+        let renderer = self.renderer.as_mut().expect("ensured above");
+        let mut out = Vec::new();
+        for ch in &decoded.chars {
+            let image = renderer
+                .render_glyph(*ch, &font_style, StylePolicy::Reference)
+                .map_err(|d| d.detail.clone())?;
+            let gx = pen_x + image.left;
+            let gy = baseline + image.top;
+            for &(dx, dy) in &offsets[..passes] {
+                out.push(GlyphPlacement {
+                    x: gx + dx,
+                    y: gy + dy,
+                    image: std::sync::Arc::clone(&image),
+                    blend: blended,
+                });
+            }
+            let step = ((image.advance as f32) / 256.0).round() as i32;
+            pen_x += step.max(0);
+        }
+        Ok(out)
+    }
+
     /// 按 `CGACT[TEXT]` 绘制项在 RGBA8 缓冲上合成(原地)。
     pub fn paint_draws(
         &mut self,
@@ -1138,6 +1189,18 @@ impl TextComposer {
         );
         self.base_cache_bytes += bytes;
     }
+}
+
+/// 一个已定位的字形绘制项(GPU 文本 pass 用):`x/y` 是目标像素左上角。
+///
+/// 同一字形按 `composite_offsets` 产生多个 placement,共享同一个
+/// `Arc<GlyphImage>`(字形位图只上传一次)。
+#[derive(Clone)]
+pub struct GlyphPlacement {
+    pub x: i32,
+    pub y: i32,
+    pub image: std::sync::Arc<yu_font::GlyphImage>,
+    pub blend: bool,
 }
 
 /// [`TextComposer::compose_layer_cached`] 的输出。

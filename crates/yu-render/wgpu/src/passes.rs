@@ -148,6 +148,8 @@ pub(crate) struct FramePlan {
     pub views: std::collections::BTreeMap<u64, wgpu::TextureView>,
     /// 表面纹理 id → 纹理(编码期做区域复制)。
     pub textures: std::collections::BTreeMap<u64, wgpu::Texture>,
+    /// GPU 文本任务(基面拷贝 + 字形 compute;编码期在所有 render pass 前执行)。
+    pub text_jobs: Vec<crate::text_gpu::TextGpuJob>,
 }
 
 impl FramePlan {

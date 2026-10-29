@@ -35,7 +35,9 @@ pub(crate) fn allocate_texture_id() -> u64 {
 const TARGET_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::RENDER_ATTACHMENT
     .union(wgpu::TextureUsages::TEXTURE_BINDING)
     .union(wgpu::TextureUsages::COPY_SRC)
-    .union(wgpu::TextureUsages::COPY_DST);
+    .union(wgpu::TextureUsages::COPY_DST)
+    // GPU 文本 pass 在层表面就地写字形(compute storage read_write)。
+    .union(wgpu::TextureUsages::STORAGE_BINDING);
 
 /// 一张已上传的纹理 + 稳定身份。
 pub struct GpuTexture {

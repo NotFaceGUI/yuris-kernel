@@ -60,6 +60,12 @@ pub struct RenderPhases {
     /// 其中:文本基面 CPU 缓存命中次数(免读回/免拷贝)与写入次数。
     pub text_cpu_cached: u64,
     pub text_cpu_stores: u64,
+    /// GPU 文本 pass:本帧处理的层数/字形数/draw 数/缓存命中/CPU 回退。
+    pub text_gpu_layers: u64,
+    pub text_gpu_glyphs: u64,
+    pub text_gpu_draws: u64,
+    pub text_gpu_cached: u64,
+    pub text_gpu_fallback: u64,
     /// 图像子阶段:`RECTPAINT` 族 CPU 填充。
     pub image_paint_us: u64,
     /// 图像子阶段:`REVERSE` 等逐像素变换。

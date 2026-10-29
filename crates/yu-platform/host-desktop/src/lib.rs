@@ -1634,7 +1634,7 @@ impl App {
                     line,
                     " plan={:.1} snap={:.1} image={:.1} text={:.1} copy_text={:.1} \
                      rest={:.1} encode={:.1} readback={:.1} tail={:.1} \
-                     text_bake={:.1} text_cpu={:.1} tcpu_rb={:.1}/{:.0} tcpu_asset={:.1}/{:.0} tcpu_cache={} tcpu_store={} text_paint={:.1} image_paint={:.1} \
+                     text_bake={:.1} text_cpu={:.1} tcpu_rb={:.1}/{:.0} tcpu_asset={:.1}/{:.0} tcpu_cache={} tcpu_store={} text_paint={:.1} tgpu={}/{}/{} tgpu_c={} tgpu_fb={} image_paint={:.1} \
                      image_composite={:.1} decode={:.1} decode_bytes={} \
                      uploads={} upload_bytes={} draws={} copy_bytes={} copies={} snapshots_alloc={} \
                      surfaces={} blits={} alias={} reused={} materialized={} cpu_fb={}",
@@ -1656,6 +1656,11 @@ impl App {
                     p.text_cpu_cached,
                     p.text_cpu_stores,
                     p.text_paint_us as f64 / 1e3,
+                    p.text_gpu_layers,
+                    p.text_gpu_glyphs,
+                    p.text_gpu_draws,
+                    p.text_gpu_cached,
+                    p.text_gpu_fallback,
                     p.image_paint_us as f64 / 1e3,
                     p.image_composite_us as f64 / 1e3,
                     p.decode_us as f64 / 1e3,
@@ -2009,7 +2014,7 @@ impl App {
                  copy_bytes,copy_count,\
                  decode_ms,decode_bytes,clock_ms,lag_ms,\
                  sound_decode_ms,sound_stream_ms,sound_decodes,sound_stream_frames,\
-                 sound_underruns,sound_seeks,sound_slow_seeks\n",
+                 sound_underruns,sound_seeks,sound_slow_seeks,text_gpu_layers,text_gpu_glyphs,text_gpu_draws,text_gpu_cached,text_gpu_fallback\n",
             );
             for row in &self.frame_rows {
                 use std::fmt::Write as _;
@@ -2032,7 +2037,7 @@ impl App {
                              {:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{},\
                              {},{},{},{},{},{},\
                              {},{},{},{},{},{},{},{},\
-                             {:.3},{},{},{},{:.3},{:.3},{},{},{},{},{}",
+                             {:.3},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{}",
                             p.plan_us as f64 / 1e3,
                             p.snap_us as f64 / 1e3,
                             p.image_us as f64 / 1e3,
@@ -2078,11 +2083,16 @@ impl App {
                             row.sound_stream_frames,
                             row.sound_underruns,
                             row.sound_seeks,
-                            row.sound_slow_seeks
+                            row.sound_slow_seeks,
+                            row.phases.map_or(0, |p| p.text_gpu_layers),
+                            row.phases.map_or(0, |p| p.text_gpu_glyphs),
+                            row.phases.map_or(0, |p| p.text_gpu_draws),
+                            row.phases.map_or(0, |p| p.text_gpu_cached),
+                            row.phases.map_or(0, |p| p.text_gpu_fallback)
                         );
                     }
                     None => {
-                        let _ = writeln!(text, ",{0}", ",".repeat(45));
+                        let _ = writeln!(text, ",{0}", ",".repeat(50));
                     }
                 }
             }

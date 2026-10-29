@@ -420,7 +420,9 @@ impl LayerSurfaces {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST,
+                | wgpu::TextureUsages::COPY_DST
+                // GPU 文本 pass 需要 storage read_write。
+                | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         };
         let texture = ctx
