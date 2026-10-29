@@ -493,3 +493,17 @@ host=785 [site] IF/LOOPEND/IFEND es_cgmode.yst pc575/579/578 各 1.15 万次
 
 仍未覆盖:`text_layout`(屏幕级自动文本)与缩放/非恒等采样基面仍走
 CPU;差分纹理首次解码/上传仍在 render plan。
+
+## 15. 后续(2026-10-29):同 tick `COPY2→SAVE[ID]` 与资产缓存预算
+
+`es_saveload.yst`(sid 19)在**同一 tick**执行
+`CG[FILE=""] → COPY2(SLTEMP→SLTEMP2) → SAVE[ID=SLTEMP2]`;官方 COPY 在
+命令处理器内立即写表面,内核的写表面在帧末,导致存档 DNO3 退化为 1×1。
+`GfxCapture` 现在按「上一帧注册表 → 源链裁剪 → 命令时刻整帧软回放」取
+像素,实测存档恢复 100×75(`ulen=31608`),桌面 wgpu 与 soft 一致;完整
+取证见 `DIV-GFX-068` 与 `PROGRESS.md`「成果 SAVE-THUMB-FIX」。
+
+`TextureStore` 增加 CPU 缓存字节预算(默认 512MiB,
+`YURIS_ASSET_CACHE_MB` 覆盖;只回收无外部引用的条目),长会话不再无限
+累积解码位图;GPU 资产纹理仍随资产数增长,待官方 `CASH`/`REMALLOC`
+语义取证后再定策略。

@@ -10074,3 +10074,281 @@ layer_and_hash_and_forgets`(core)验证缓存键/淘汰。`cargo test -p yu-rend
 - `yu-cli case <project-eris> --all`:既有红灯(用例期望值未随最新 gfx
   重生成),与本轮无关。
 - `cargo test -p yu-trace --test golden`:已知红灯(YSCom.ycd sha),同前。
+
+
+## 成果 PERF-VM-TICK (2026-10-29) · 控制流事件与变量热路径收口,场景构建 tick 降约 30%
+
+### 画像
+
+同一 120 帧固定步长启动(`<game-b> --no-sound --fixed-step`),e80 是场景/按钮
+构建帧:**811,375 条命令**。改前 `--profile-frames`(1/32 采样,含采样器
+开销)分项:`LET 66.2ms / 310k`、`LOOPEND 40.3ms / 208k`、`IF 23.3ms / 99k`、
+`CG 24.3ms / 21k`、`VARACT 6.0ms / 19.5k`,采样总时长 174ms;尖峰行
+`tick=149.7ms`。非 profile 基线 e80 tick 137–157ms。最终 profile:
+`LET 34.7ms`、`IF 11.4ms`、`CG 18.5ms`、`LOOPEND 5.8ms`,总采样
+**87.1ms**(-50%);非 profile e80 tick **92–95ms**。
+
+### 改动(全部保持脚本/画面语义)
+
+1. **控制流事件门控**:`record_events=false` 时 `Jump`(IF/ELSE/LOOP/
+   LOOPEND)不再入事件队列。引擎随后只统计队列长度并丢弃;场景构建帧的
+   208k 次 LOOPEND 回跳是纯诊断开销。`LOOPEND` 40.3→6.2ms。
+2. **图形/窗口域事件门控**:Graphics/Window `DomainCall` 已由同步图形宿主
+   在命令时刻消费;关事件流时不再入队(CG 22.6→22.1ms,主要消除 21k 条
+   事件/参数在队列里的驻留)。Text/FrameStart/End/SAVE/SOUND/File 等仍
+   照常入队;`record_events=true` 的 golden 事件流逐字节不变。
+   勘误(2026-10-29 复核):门控只在**确实注入了图形宿主**时生效;没有
+   宿主的测试/探针(如 `eris_first_screen` 用 `drain_events` 驱动
+   `GfxState`)仍照常入队,否则首屏 272 层会退化成只有根层。
+3. **单变量窗口快路径**:`0x48` 取值窗口直接读变量域/系统变量;
+   `LET` 左值单变量直接构造 `LValue`,不再走 Evaluator 栈机。门控后
+   采样总时长 137.7→133.3ms;`eval_window` 只对 `0x48` 生效,避免改变
+   Command 事件的参数记录(golden 锁定)。
+4. **数组偏移错误名惰性化**:`linear_offset_for` 原来每次成功读写都
+   `format!` 变量名,只为越界/负下标错误文案。改为错误分支内才格式化。
+   `LET` 64.6→41.1ms、`IF` 23.3→15.3ms,采样总时长 133.3→102.6ms。
+5. **数组取值栈去堆分配**:表达式 `0x29`(数组取值)原来每次 `Vec::new()`
+   收集下标,改为 `SmallVec<[i64;4]>`;域参数 `args` 按窗口数预分配。
+   采样总时长 102.6→87.1ms,`LET` 41.1→34.7ms、`IF` 15.3→11.4ms。
+6. **诊断命令名惰性化**:去掉每条命令第二次 `Rc<Cmd>` 克隆,错误定位时按
+   `(cur_script, cur_pc)` 从取指缓存取。
+
+### 数据(同一脚本/固定步长)
+
+- e80 tick:基线 137.4 / 156.6 / 159.8ms → 最终 91.8 / 95.3ms
+  (约 -35%~-40%)。
+- 1400 帧剧情脚本(剧情分支导致运行间差异):改前 93 / 92 个
+  `work≥20ms` 尖峰、`tick p95` 19.6 / 19.1ms;改后多轮为 36–81 个尖峰、
+  `tick p95` 6.0–17.6ms、`work p95` 10.7–23.2ms;同帧 e80 稳定在
+  92–95ms,tick 最大值从 159.8ms 降到约 95ms。
+- 干净标题页 1200 帧:`avg_fps≈58`,`work p95=5.37ms`,
+  `tick p50=1.37ms`,`render p95=2.06ms`,最大启动帧 109.5ms。
+- `<project-eris>` 600 帧:`avg_fps≈57`,`work p95=5.14ms`,
+  `tick p50=1.90ms`,`render p95=2.15ms`,启动帧 167.4ms
+  (此前同口径 272.6ms,含运行间波动)。
+
+### 语义与回归
+
+- `record_events=false` 只影响**内部事件队列**:Jump 与 Graphics/Window
+  DomainCall 不入队;图形宿主仍在命令时刻同步应用,存档/声音/文件域事件、
+  Text/ReturnCode/Diag 仍保留。`record_events=true` 时完整事件流不变。
+- 新增 `jump_events_are_suppressed_when_record_events_off`(fixture):
+  关事件流时无 Jump 且分支结果不变。
+- `cargo test -p yu-rt`:golden 3、corpus 11、fixture 99、consistency 4、
+  其它 86/3 全绿;`cargo build --workspace --all-targets` 通过;
+  `logging_guards` 3 通过(移除 `linear_offset_for` 的常驻
+  `unwrap_or_default` 后,`value.rs` 白名单 4→3)。
+- 未改动:脚本命令数/顺序、变量值、渲染契约、声音流式路径。
+
+### 剩余
+
+e80 仍有 ~92ms:811k 条命令的**解释器吞吐**本身是主成本(LET ~35ms、
+CG ~18.5ms、IF ~11.4ms、LOOPEND ~6ms)。下一步可做:
+lvalue 下标表达式的预编译计划、CG/域参数路径的零分配、
+`CGINFO` 按层版本缓存;按帧切分/跨帧续跑属显式宿主分歧
+(DIV-HOST-002),不作为默认优化。
+
+
+## 成果 PERF-ASSET-PRELOAD (2026-10-29) · 按官方 CG 命令时刻装载,消除角色出场解码/抓帧尖峰
+
+### 官方证据(v494/0.495,REA + Ghidra 强制建函数)
+
+- v494 `CG` 处理体入口 `0x42a498`(文档旧称 `0x42a4a8`;0.495 对应
+  `0x42a514`,sha256 `4f5eefa3…`)。
+- `FILE` 分支在处理体内**同步**调用 `0x42c2a8`;该函数:
+  - 空文件名 → `0x40c5f8`(1×1 黑图);
+  - 非空 → `0x40c7c9` → `0x40c9b4` 按 `.png/.bmp/.jpg/.gif` 探测并解码
+    (`0x40d6f9` 等),返回后立即更新图层 `+0x90` 像素。
+- 因此官方在 `CG[FILE]` **命令所在帧**完成解码,与图层当时是否参与合成无关。
+
+### 官方线程普查(REA,同 0.495 镜像)
+
+- 只导入 `KERNEL32.DLL::CreateThread`;无 `QueueUserWorkItem` /
+  `CreateThreadpool` / `_beginthread`。调用点只有 CRT 包装
+  `0x46bb30` / `0x46bdd1`。
+- 包装的实际调用方:
+  - `0x463f50`(WinMain `0x46164c` 内):按 CPU 数建**软件合成线程池**,
+    每线程 `SetThreadIdealProcessor`;任务体(`0x4265cc`/`0x425e08`/
+    `0x425a08`/`0x425680`/`0x4255ec`…)全是逐行 blit、alpha/色键混合、
+    缩放与通道混合。
+  - `0x45f3f4 → 0x422268`:先 `CoInitializeEx` 再进影片/COM 路径。
+  - `0x4640c4 → 0x42543c`:由开关 `DAT_008015fc` 控制。
+- 结论:官方**没有并行资产解码**;并行只用于软件合成与影片播放。
+  本内核的并行 PNG 解码属实现层分歧,登记为 `DIV-GFX-067`
+  (线程数 = `available_parallelism - 1`,钳制 `1..=4`,留一核给
+  主线程/音频;结果按输入序写回,像素与串行一致)。
+
+### 我们的分歧与修复
+
+- 旧路径把解码延迟到 render plan 首次真正使用该层:角色部件在
+  frame 834/852/… 已收到 `CG[FILE]`(keys `cg/stand/...`),但若层在组内/
+  隐藏,直到入口帧 e1014 才解码/上传 → **36ms 解码 + 76ms capture**。
+- `GfxState::apply_cg` 在命令时刻登记 `CG[FILE]` 资产 key;引擎在同一 tick
+  末尾调用 `Renderer::preload_assets`(官方同帧语义):
+  - `TextureStore::preload_parallel`:先顺序读 ypf 字节,再按资产并行
+    解码(1..=4 线程,仍在本帧内完成,输入顺序写回缓存);
+  - wgpu 侧随后在主线程 `ensure_asset` 上传;soft 侧只解码入缓存。
+- 幂等:同一 key 在单批内去重、成功缓存只解码一次;失败缓存并在
+  `ensure_asset`/`resolve` 处报 `asset.*` + `[asset] preload failed`。
+- 额外收口:`GfxCapture` 不再对每个新 `CopyId` 无条件同步回读。
+  - wgpu:`SAVE[ID]` 命令时刻用 `SnapshotSource` 按需读**上一帧已冻结
+    快照**;没有 SAVE 不读;
+  - soft:快照本来就是 CPU 表面,保留渲染后 eager 镜像(旧语义、无 GPU
+    等待);
+  - `observe` 只补“本帧 SAVE 已登记、但当帧尚未渲染”的 `wanted`。
+  e754 的 163ms capture 消失;晚一帧的 SAVE 不再回归(新增
+  `snapshot_source_reads_on_demand_and_caches`),save_state 与旧实现一致
+  (旧/新 A/B 都是 `e264…`;expected `bbd6…` 是 DNO3 缩略漂移)。
+
+### 实测(`<game-b>` 1200 帧固定步长剧情脚本)
+
+- 入口帧 e1014:`work 167.8→51.7ms`,`render 46.1→4.6ms`,
+  `decode 36.3→0`,`capture 76.1→0`;剩余 51.7ms 是 tick 46.3ms
+  (208k 条脚本命令,VM 线)。
+- 角色建立帧 e754:`work 241.1→4.7ms`(capture 163.1→0)。
+- 1200 帧全量:`decode` 最大 **0ms**(全部在命令时刻预热),`render p95=3.39ms`。
+- 并行解码:同批 4 张 1332×3351(17.85MB/张)从串行 57.5ms 降到
+  **21–24ms**;VFS 读包只占 ~0.6ms,瓶颈是 PNG 解码。
+
+### 回归
+
+- `cargo build --workspace --all-targets` 通过;
+  `yu-render-core` 11(新增 `parallel_preload_matches_sequential_and_caches`)、
+  `yu-backend-wgpu` 9/10/26、`yu-backend-soft` 41/15/1/1、`yu-engine` 16
+  (新增 `capture_snapshot`:晚一帧 SAVE 端到端 / 缺像素显式计数)、
+  `yu-sound` 6/45、`yu-save` 14(设 `YURIS_SAMPLE_ERIS_ROOT`/`SDK0495`)、
+  `yu-rt` 86/4/11/99/3、`logging_guards` 3 全绿;`yu-gfx`
+  `--test preload` 2(仅有效图像层登记、取走不重发)。
+- 像素未变:预加载只改变解码/上传时机;`decode` 降为 0 后入口帧 render
+  由 46.1ms 降到 4.6ms。
+- `cases/save-load-loop` 的 `save_state_sha256` 旧/新实现相同,仍是
+  DNO3 缩略图预期漂移;`record-events-off` 的 `ops=85` 不变。
+
+### 仍未解决
+
+- e1014 剩余 `tick 46.3ms` 是 208k 条脚本命令(VM 解释器),不是纹理;
+  下一步继续 VM 快路径/查询缓存。
+- 同批并行预热仍有 21–24ms(单张最慢 PNG 决定);若要再降,需要更快的
+  PNG 解码器或把命令批次拆到更早的隐藏装载帧(后者需官方证据)。
+- 资产缓存:CPU 侧已有字节预算(`TextureStore` 默认 512MiB,
+  `YURIS_ASSET_CACHE_MB=0` 关闭;只回收 `Rc::strong_count==1` 的条目,
+  仍在图层/快照里的纹理不回收)。预算在**帧边界**执行,本帧新插入的
+  条目豁免,避免 `preload_parallel` 批次在渲染前自我驱逐;帧内允许
+  暂时超额。GPU 侧 `TextureCache.asset_ids` 仍随资产数增长(官方
+  `CASH`/`REMALLOC` 策略未分类,暂不做未经证据的显存 LRU)。
+- 同 tick `SAVE[ID]` 指向刚 `CG[FILE]` 的**资产层**时,`GfxCapture` 的独立
+  `TextureStore` 可能重复解码一次(存档缩略图实际走快照链,本轮未触发);
+  彻底消除需要主渲染器与抓帧器共享解码缓存。
+- 同帧 `COPY/COPY2` 后立刻 `SAVE[ID]`:已按命令时刻补齐(注册表 →
+  源链裁剪 → 整帧软回放;见 `DIV-GFX-068`)。源与目标都是**同帧新建**时
+  仍需整帧回放(正确,约 0.4s/次),属于低频存档成本。
+
+## 成果 THREAD-AUDIT (2026-10-29) · 官方线程普查:无并行资产解码
+
+回答「并行是不是官方实现」:不是。REA 0.495(sha256 `4f5eefa3…`)普查结果:
+
+- 只导入 `KERNEL32.DLL::CreateThread`;无 `QueueUserWorkItem` /
+  `CreateThreadpool` / `_beginthread`。唯一调用点 `0x46bb30` / `0x46bdd1`
+  是 CRT 风格线程包装(分配 0x74 上下文、挂起创建、`ResumeThread`)。
+- 实际调用方三处:
+  - `0x463f50`:按 CPU 数建**软件合成线程池**,每线程
+    `SetThreadIdealProcessor`;任务体 `0x4265cc`/`0x425e08`/`0x425a08`/
+    `0x425680`/`0x4255ec` 等全是逐行 blit、alpha/色键混合(SSE
+    `pavgb`/`paddusw`)、缩放/通道混合。
+  - `0x45f3f4` → `0x422268`:`CoInitializeEx` 后进影片/COM 路径。
+  - `0x4640c4` → `0x42543c`:由开关 `DAT_008015fc` 控制。
+- `CG[FILE]` 解码仍在命令处理体内同步完成(`0x42a498`/`0x42a514` →
+  `0x42c2a8` → `0x40c7c9` → `0x40c9b4`),不投递线程池。
+
+处置:
+
+- 新增 `docs/divergences/DIV-GFX-067-asset-preload-parallel.md`:并行 PNG
+  解码登记为实现层分歧;线程数改为 `available_parallelism - 1`、钳制
+  `1..=4`(留一核给主线程/音频),结果按输入序写回,像素与串行一致。
+  本次 4 张同批的实测样本原本就是 4 线程,数字不变。
+- `GfxState::apply_cg` 的预热登记移到「确认该层会采用 FILE」之后:
+  图层组/类型冲突/空 FILE 不再预热未使用资产(新增 `yu-gfx --test preload`)。
+- 新增强化回归:并行与串行逐字节对比(不同颜色的 3 张 fixture);
+  晚一帧 `SAVE[ID]` 端到端(`crates/yu-engine/tests/capture_snapshot.rs`)。
+
+验证(原始结果):
+
+```text
+cargo build --workspace --all-targets            → Finished (50.40s)
+cargo test -p yu-render-core                     → 11 passed; 0 failed
+cargo test -p yu-gfx                             → 17/5/10/4/1/4/7/11/7/11/27/2/2/10/6/6 全 ok
+cargo test -p yu-engine                          → 15 passed + capture_snapshot 2 passed
+cargo test -p yu-cli --test logging_guards       → 3 passed
+cargo test -p yu-backend-soft/-wgpu/-save/-rt    → 41/15/1/1、9/10/26/1、14、86/4/11/99/3 全 ok
+```
+
+未复测:当前环境无 `<game-b>` 样本路径,无法重跑 1200 帧游戏口径;
+4 张同批的并行线程数未变(仍为 4),e1014/e754 数据沿用上一轮实测。
+
+## 成果 SAVE-THUMB-FIX (2026-10-29) · 同 tick `COPY2→SAVE[ID]` 恢复命令时刻抓帧
+
+### 症状与现场(用户存档实测)
+
+`<game-b>` 手动新存档的缩略图为空。解析用户 14:20 的两份 `.sd`:
+
+```text
+save30001.sd / save30002.sd  DNO3 btype=1 ulen=1612  A=1600 B=4     (1×1)
+官方/旧存档 save00001.sd     DNO3 btype=1 ulen=31608 A=1600 B=30000 (100×75)
+```
+
+### 根因(脚本 + 帧契约)
+
+`es_saveload.yst`(sid 19)**同一 tick**:
+
+```text
+pc312 CG ID="SLTEMP2" Z=1 A=0 SX=1 SY=1 FILE=""   # 1×1 占位层
+pc313 CGACT COPY2=1 ID="SLTEMP" ID2="SLTEMP2"
+pc319 SAVE DNO=3 ID="SLTEMP2"
+pc341 SAVE FILE=...   pc343 CGEND SLTEMP2
+```
+
+官方 `COPY2` 在命令处理器内立即写表面,`SAVE[ID]` 读同一块表面;
+帧契约(66)后主渲染器在帧末才写快照,`GfxCapture` 只有“上一帧注册表”，
+pc319 时新 `CopyId` 不存在 ⇒ 返回 `None`,目标层还是 `CG FILE=""` 的 1×1
+占位 ⇒ 写出 1×1 缩略图。
+
+### 修法
+
+`GfxCapture::capture` 对快照三级取像素(见 `DIV-GFX-068`):
+
+1. 注册表/镜像(上一帧快照,GPU 按需读回一次并缓存);
+2. **源链裁剪**:沿 `CopyOp.source_texture` 回溯源快照/资产,按
+   `CopyRegion` 裁剪(存档链 `SLTEMP→SLTEMP2` 走这条,**零回放**);
+3. 命令时刻**整帧软回放**(组/后缓冲/带文本源),`last_screen` 由引擎
+   每帧渲染后注入。
+4. `SAVE[ID]` 落到 `SolidBlack1x1` 时显式 WARN(`COPY missing?`),不再
+   静默写 1×1。
+
+顺带收口资源上限:`TextureStore` 增加 CPU 字节预算(默认 512MiB,
+`YURIS_ASSET_CACHE_MB` 覆盖;只回收 `Rc::strong_count==1` 的条目,
+图层/快照在用的纹理不回收),新增 `resident_bytes()/evicted_count()`。
+
+### 验证(原始结果)
+
+```text
+# 实机脚本(kotoneiro):START(750,415)→SAVE(380,812)→槽 1(350,200)
+# 修复前: [caption] snapshot 336 pixels not materialized yet; deferred
+#          DNO3 ulen=1612 / B=4
+# 修复后(soft,同脚本):DNO3 btype=1 ulen=31608 A=1600 B=30000
+# 首次整帧回放 436ms;加入源链裁剪后无 replay 行,存档界面看到缩略图
+# 桌面 wgpu(--mode desktop --backend wgpu --frames 640,同脚本):
+[caption] LOAD[ID] PNG 100x75 12241B encode=548us
+DNO3 btype=1 ulen=31608 A=1600 B=30000
+
+cargo test -p yu-engine --test capture_snapshot → 4 passed
+  (上一帧 SAVE / 同 tick 资产源裁剪 / 同 tick 组源回放 / 缺像素计数)
+cargo test -p yu-render-core              → 13 passed(新增缓存预算/预热批次豁免用例)
+cargo test -p yu-gfx --test preload       → 2 passed
+```
+
+### 残余
+
+- 组/后缓冲源仍整帧软回放(~0.4s/1100×825/188 层),低频存档可接受;
+  同帧源+目标都新建时也走这条(正确但慢)。
+- `GfxCapture` 的独立 `TextureStore` 仍与主渲染器分开;若 SAVE 直接指向
+  刚 `CG[FILE]` 的资产层会重复解码一次(存档缩略图走快照链,未触发)。
