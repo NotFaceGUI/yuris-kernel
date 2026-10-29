@@ -23,7 +23,8 @@ fn main() {
     .expect("boot");
     let table = ParamTable::from_tables(vm.tables());
     for cmd in ["CG", "CGACT", "CGINFO", "CGEND"] {
-        println!("== {cmd} ==");
+        let idx = vm.tables().boot.yscm.index_of(cmd);
+        println!("== {cmd} (opcode {idx:?}) ==");
         let Some(params) = table.params(cmd) else {
             println!("  (表里没有该命令)");
             continue;
