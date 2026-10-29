@@ -272,6 +272,22 @@
   `BootConfig::window_init_pos` 注入(DIV-RT-047)。`_WINDOW_EXEC_CAPTION`
   按原结论实现为宿主 setter:`Vm::request_window_caption()` 置 1,脚本读后
   写回 0;VM 不自行置位。
+- **2026-10-29(输入族写入收口)**:`@_INP(n)` / `@_KEYLAST` /
+  `@_MOUSELAST` 的**写入**不再挂号,按官方写分派实现:
+  - `_INP`(case 0x90 → `0x446efc` → `0x447014`):`n>0` 时按物理按下状态
+    钳制写**同一张** VK 计数表(与 `_KEY_*`/`_MOUSE_*` 写同表);
+    `n<=0` 忽略。内核 `InputState::set_counter_code`。
+  - `_KEYLAST` / `_MOUSELAST`(case 0x91/0x92 → `0x446f52`/`0x446f3c`):
+    RHS 直接覆盖 `DAT_00801908`/`0x80190c`,无钳制。内核
+    `InputState::set_last`。
+  - 语料依据:`es_Button.yst:3417` 每次按下写 `_INP(...)=2`(消费按下)、
+    `es_Sprite.yst:851..854` 写 `=11`(连发限速)、`es_Text.yst:1287` /
+    `es_TXExec.yst:9/119` 写 `_KEYLAST=0`/`_MOUSELAST=0`(取消 skip)。
+    修复前桌面/用例每次点击/推进都打印 `UNIMP rt.sysvar.write` 且写入被
+    丢弃(按下消费失效)。
+  - 回归:`yu-rt` fixture `inp_keylast_mouselast_writes_are_applied`;
+    `yu-cli` 语料用例 `click_and_advance_do_not_report_sysvar_write`
+    (A/B:修复前 7 条 `_INP/_KEYLAST/_MOUSELAST` 挂号,修复后 0)。
 - **复核**:`crates/yu-rt/src/sysvar.rs::undoc`;频度见 `docs/coverage-matrix.md` §3。
 
 ---

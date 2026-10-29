@@ -1233,6 +1233,27 @@ impl Vm {
                 self.input_state_mut().set_counter(&button, v);
                 return Ok(StepOutcome::Continue);
             }
+            // `@_INP(n)`(手册 `basic/svariable.html` ○ 数组版)= 按引擎
+            // 按钮码写**同一张** VK 计数表。REA 0x495 `0x446efc`(id 0x90)
+            // → `0x447014`(下标 `n<=0` 忽略;按物理按下状态钳制,与
+            // `_KEY_*` 同族)。ERIS `es_Button.yst:3417` 用 `=2` 消费一次
+            // 按下、`es_Sprite.yst:851..854` 用 `=11` 限制连发。
+            if name == "_INP" {
+                let rhs = self.eval_window(st, &cmd.windows[1])?;
+                let v = rhs.as_int().unwrap_or(0); // silent-ok: RHS 非整数按 0(官方同族)
+                let code = lval.indices.first().copied().unwrap_or(0); // silent-ok: 缺下标 = 0,setter 忽略
+                self.input_state_mut().set_counter_code(code, v);
+                return Ok(StepOutcome::Continue);
+            }
+            // `@_KEYLAST` / `@_MOUSELAST`(手册 ○)= 直接覆盖最近按下码
+            // (REA `0x446f52`/`0x446f3c` 写 `DAT_00801908/0x80190c`,
+            // 无钳制)。语料写 0 取消 skip(`es_Text.yst:1287`)。
+            if name == "_KEYLAST" || name == "_MOUSELAST" {
+                let rhs = self.eval_window(st, &cmd.windows[1])?;
+                let v = rhs.as_int().unwrap_or(0); // silent-ok: RHS 非整数按 0(官方同族)
+                self.input_state_mut().set_last(name == "_KEYLAST", v);
+                return Ok(StepOutcome::Continue);
+            }
             // `@_MENUCODE` / `@_WINDOW_EXEC_MAX/CLOSE`(手册 ○)= 状态覆盖。
             if name == "_MENUCODE" {
                 let rhs = self.eval_window(st, &cmd.windows[1])?;

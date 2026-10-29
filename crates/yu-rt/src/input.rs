@@ -754,6 +754,20 @@ impl InputState {
         self.mouselast
     }
 
+    /// `_KEYLAST` / `_MOUSELAST` 的脚本写入(手册 ○ 可赋值)。
+    ///
+    /// REA 0.495 `0x446f52`(id 0x91)/`0x446f3c`(id 0x92):RHS 直接写
+    /// `DAT_00801908` / `DAT_0080190c`,**无物理状态钳制**(与 `_INP` 的
+    /// `FUN_00447014` 不同)。语料用写 0 取消 skip(`es_Text.yst:1287`、
+    /// `es_TXExec.yst:9/119`、`es_Select*.yst`)。
+    pub fn set_last(&mut self, key: bool, value: i64) {
+        if key {
+            self.keylast = value;
+        } else {
+            self.mouselast = value;
+        }
+    }
+
     /// 本帧快照。
     pub fn current(&self) -> &InputFrame {
         &self.current

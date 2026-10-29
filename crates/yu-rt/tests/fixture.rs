@@ -5187,3 +5187,68 @@ fn varact_cut_without_let_writes_back_to_set() {
         "LET 缺省时 CUT 结果必须回写 SET(手册例 6 的原地形态)"
     );
 }
+
+#[test]
+fn inp_keylast_mouselast_writes_are_applied() {
+    // 手册 `basic/svariable.html` 把 `_INP` / `_KEYLAST` / `_MOUSELAST`
+    // 标为 ○ 可赋值;REA 0x495 写分派:
+    // - `_INP(n)=v`(case 0x90 → `0x446efc` → `0x447014`):n>0 时按物理
+    //   状态钳制写**同一张** VK 计数表;
+    // - `_KEYLAST=0` / `_MOUSELAST=0`(case 0x91/0x92 → `0x446f52/0x446f3c`):
+    //   直接覆盖 `DAT_00801908/0x80190c`,无钳制。
+    // ERIS `es_Button.yst:3417` 每次点击/推进都写 `_INP(...)=2` 消费按下;
+    // `es_Text.yst:1287` 写 `_KEYLAST=0` 取消 skip。修复前这两类写入
+    // 会误报 `rt.sysvar.write` 并被丢弃。
+    let mut b = ProjectBuilder::new();
+    b.sysvars_abi = true;
+    let abi = yu_rt::sysvar_abi::SysVarTable::builtin_abi();
+    let sysvar_id = |name: &str| -> u16 {
+        abi.decls
+            .iter()
+            .position(|d| d.name == name)
+            .expect("引擎 ABI 表应有该变量") as u16
+    };
+    let inp = sysvar_id("_INP");
+    let keylast = sysvar_id("_KEYLAST");
+    let mouselast = sysvar_id("_MOUSELAST");
+    let code: i16 = 0x5A; // VK_Z
+
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        // @_INP(VK_Z) = 2
+        GroupSpec::new(OP_LET)
+            .window(
+                0,
+                ex::cat(&[ex::r#ref(0x40, inp), ex::i16_(code), ex::aload()]),
+            )
+            .window(0, ex::i8_(2)),
+        // @_KEYLAST = 0
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, keylast))
+            .window(0, ex::i8_(0)),
+        // @_MOUSELAST = 0
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, mouselast))
+            .window(0, ex::i8_(0)),
+        GroupSpec::new(OP_END),
+    ]];
+
+    // 第 0 帧按下 Z:`_INP` 计数 = 1(按下),`_KEYLAST` = VK_Z。
+    let mut tl = InputTimeline::new();
+    tl.set(0, InputFrame::new(["KEY_Z"]));
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &tl);
+    assert!(
+        report.errors.is_empty(),
+        "可赋值系统变量写入不得再挂号: {:?}",
+        report.errors
+    );
+    assert_eq!(
+        vm.input().inp(i64::from(code)).unwrap(),
+        2,
+        "按下帧写 2:物理状态钳制后保留正数"
+    );
+    assert_eq!(vm.input().keylast(), 0, "_KEYLAST 直接写 0");
+    assert_eq!(vm.input().mouselast(), 0, "_MOUSELAST 直接写 0");
+}
