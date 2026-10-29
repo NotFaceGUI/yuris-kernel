@@ -17,12 +17,10 @@ wgpu = "30.0.1"
 yu-backend-soft = { path = "../yu-render/soft" }
 yu-render-core = { path = "../yu-render/core" }
 yu-backend-wgpu = { path = "../yu-render/wgpu" }
+yu-format = { path = "../yu-format" }
 yu-gfx = { path = "../yu-gfx" }
 yu-log = { path = "../yu-log" }
 yu-rt = { path = "../yu-rt" }
 yu-save = { path = "../yu-save" }
 yu-sound = { path = "../yu-sound" }
 yu-vfs = { path = "../yu-vfs" }
-
-[dev-dependencies]
-yu-format = { path = "../yu-format" }

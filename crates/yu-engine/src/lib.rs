@@ -17,6 +17,7 @@
 pub mod capture;
 pub mod engine;
 pub mod json;
+pub mod keys;
 pub mod output;
 pub mod project;
 pub mod sha;

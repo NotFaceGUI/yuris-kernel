@@ -243,13 +243,11 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         yu_log::console::HostLevel::Info,
         "serve",
         &format!(
-            "serving {url}  backend={} entry={} fps={} data={}:{} ({} bytes) boot_ms={:.2}",
+            "serving {url}  backend={} entry={} fps={} data={} boot_ms={:.2}",
             opts.backend.as_str(),
             opts.entry,
             opts.fps,
-            dataset.kind,
-            dataset.path.display(),
-            dataset.bytes,
+            dataset.summary(),
             boot_ms
         ),
     );

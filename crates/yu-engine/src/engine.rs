@@ -182,6 +182,9 @@ pub struct EngineOptions {
     /// 忽略脚本给的 `NAME`/`NO`/`BNO`。查不到 family 就显式失败,不回落
     /// 引擎默认表 —— 否则会“以为换上了其实没换”。
     pub force_font: Option<String>,
+    /// 显式脚本密钥(YSTB 分段异或)。`None` = 启动时解析
+    /// (`exe` 扫描 → 数据自举 → 默认值,见 [`crate::keys`])。
+    pub script_key: Option<[u8; 4]>,
 }
 
 impl Default for EngineOptions {
@@ -201,6 +204,7 @@ impl Default for EngineOptions {
             save_root: None,
             warm_text: false,
             force_font: None,
+            script_key: None,
         }
     }
 }
@@ -1823,6 +1827,15 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         .map_err(|e| Failure::runtime(format!("创建 save 根 {} 失败: {e}", save_root.display())))?;
     let source = project.open_source()?;
     let aux = project.open_aux()?;
+    // 脚本密钥:显式优先,否则按 exe 扫描 → 数据自举 → 默认值解析
+    // (换钥作品不再停在 `fmt.ybn.key`)。解析结果留痕,便于排查"为什么行为不同"。
+    let script_key = project.resolve_script_key(opts.script_key)?;
+    log::info!(
+        target: "yu-cli::engine",
+        "script key: {} (source={})",
+        script_key.hex(),
+        script_key.source.describe()
+    );
     let boot = BootConfig {
         entry_label: opts.entry.clone(),
         fps: opts.fps,
@@ -1835,6 +1848,7 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         os_sound: opts.os_sound,
         media_readonly: opts.media_readonly,
         frame_ms: opts.frame_ms(),
+        script_key: script_key.bytes,
         // 路径类系统变量由宿主注入(手册 `basic/svariable.html`)。
         // 缺失会让 `es_First.yst` 的 `$_SAVE_PATH` 走 Unimplemented(DIV-RT-010)。
         paths: host_paths(&save_root),

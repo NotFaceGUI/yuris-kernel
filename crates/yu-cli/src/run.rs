@@ -81,6 +81,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     };
     // 强制字体(诊断/换字体):忽略脚本的 NAME/NO/BNO。
     let force_font = args.flag("font").filter(|value| !value.trim().is_empty());
+    // 显式脚本密钥(换钥作品的兜底;缺省 = 启动时自动解析)。
+    let script_key = match args.flag("script-key") {
+        Some(value) => Some(parse_script_key(&value)?),
+        None => None,
+    };
     // Q1 日志收口:`--log-file` 落 JSONL(内核 Diag + 门面行,每轮截断);
     // `--diag-summary off` 关闭末尾诊断汇总(用例流水线不想看时用)。
     let log_file = args.flag("log-file").map(PathBuf::from);
@@ -110,6 +115,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         debug_mode,
         save_root,
         force_font,
+        script_key,
         // 真实运行:`@_TIME` 注入系统本地时间(存档菜单的现实日期)。
         local_time: crate::clock::local_now(),
         ..EngineOptions::default()
@@ -148,14 +154,12 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
 
     let report = engine.last_report().clone();
     output::line(format!(
-        "engine: backend={} entry={} record_events={} debug_mode={} data={}:{} ({} bytes) boot_ms={:.2}",
+        "engine: backend={} entry={} record_events={} debug_mode={} data={} boot_ms={:.2}",
         engine.backend(),
         engine.entry(),
         if record_events { "on" } else { "off" },
         if debug_mode { "on" } else { "off" },
-        dataset.kind,
-        dataset.path.display(),
-        dataset.bytes,
+        dataset.summary(),
         engine.boot_ms()
     ));
     output::line(format!(
@@ -255,4 +259,27 @@ pub fn parse_u32(name: &str, value: &str) -> CliResult<u32> {
     value
         .parse::<u32>()
         .map_err(|_| Failure::usage(format!("--{name} 需要非负整数,收到 `{value}`")))
+}
+
+/// `--script-key`:8 位十六进制(允许空格/下划线/冒号分隔与 `0x` 前缀)。
+pub fn parse_script_key(value: &str) -> CliResult<[u8; 4]> {
+    let cleaned: String = value
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '_' && *c != ':')
+        .collect();
+    let hex = cleaned
+        .strip_prefix("0x")
+        .or_else(|| cleaned.strip_prefix("0X"))
+        .unwrap_or(&cleaned);
+    if hex.len() != 8 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Failure::usage(format!(
+            "--script-key 需要 8 位十六进制(4 字节),收到 `{value}`"
+        )));
+    }
+    let mut key = [0u8; 4];
+    for (i, slot) in key.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| Failure::usage(format!("--script-key 解析失败:`{value}`")))?;
+    }
+    Ok(key)
 }
