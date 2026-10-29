@@ -4,6 +4,10 @@
 //! 声像 = `DSBPAN`（0..512 → -10000..+10000 百分之一分贝）、
 //! 音调 = `SetFrequency(base*(pitch+256)/512)`。
 //!
+//! 音量**不是**单层字段：官方 `FUN_00424dfc` 把自身 `(E==1)*VOLUME` 沿
+//! 祖先链逐级 `>>8` 折叠（主音量 `S0` → 频道 `BGM` → 单条声音），
+//! 见 [`SoundState::effective_for_key`]；本模块每块按有效音量出增益。
+//!
 //! **Unverified**：线性重采样插值、最终限幅。证据未覆盖，代码处标注。
 
 use crate::state::{Layer, SoundState};
@@ -63,8 +67,12 @@ impl SoundState {
             return;
         }
         let frames = out.len() / channels;
-        for (_, layer) in self.layers_iter() {
-            mix_layer(layer, out, frames, out_rate, channels);
+        for (id, layer) in self.layers_iter() {
+            // 官方在设置音量时用 `FUN_00424dfc` 把祖先链折进 DSB 音量
+            // （主音量 `:/S0/` → 频道 `BGM/` → 单条声音）；这里按同一
+            // 公式取有效音量，容器/父层改音量对全部后代即时生效。
+            let gain = volume_gain(self.effective_for_key(id));
+            mix_layer(layer, gain, out, frames, out_rate, channels);
         }
         // Unverified：引擎最终由 DirectSound 混音器限幅；这里只做 [-1,1] 钳制。
         for v in out.iter_mut() {
@@ -73,11 +81,17 @@ impl SoundState {
     }
 }
 
-fn mix_layer(layer: &Layer, out: &mut [f32], frames: usize, out_rate: u32, channels: usize) {
+fn mix_layer(
+    layer: &Layer,
+    gain: f32,
+    out: &mut [f32],
+    frames: usize,
+    out_rate: u32,
+    channels: usize,
+) {
     if !layer.state().audible() || layer.paused() {
         return;
     }
-    let gain = volume_gain(layer.audible_volume());
     if gain == 0.0 {
         return;
     }

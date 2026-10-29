@@ -45,6 +45,7 @@ pub mod host;
 pub mod loader;
 pub mod meta;
 pub mod mixer;
+pub mod path;
 pub mod state;
 mod stream;
 

@@ -67,6 +67,15 @@ fn cmd(id: &str) -> SoundCommand {
     }
 }
 
+/// 建出频道容器（官方脚本 `es.SND.INIT`：`SOUND[ID="BGM/" VOLUME=256 E=1]`）。
+/// 官方不补建中间节点，叶子必须先有父容器。
+fn create_channel(state: &mut SoundState, id: &str) {
+    let mut c = cmd(id);
+    c.volume = Some(256);
+    c.e = Some(1);
+    state.apply_sound(&c);
+}
+
 fn query(state: &mut SoundState, id: &str, field: QueryField) -> Value {
     state.query(id.as_bytes(), &[field]).expect("query")
 }
@@ -312,7 +321,8 @@ fn example8_two_layers_at_once() {
     s.advance_ms(300);
     assert_eq!(int(&mut s, "BGM", QueryField::Time), 300);
     assert_eq!(int(&mut s, "BGM2", QueryField::Time), 300);
-    assert_eq!(s.layers_len(), 2);
+    // 根层 `S0`（官方声音初始化就建）+ 两条声音。
+    assert_eq!(s.layers_len(), 3);
 }
 
 #[test]
@@ -376,17 +386,49 @@ fn example12_fade_to_target_volume() {
 }
 
 #[test]
-fn soundend_removes_layer() {
+fn soundend_releases_layer_but_keeps_node() {
+    // 官方 SOUNDEND（0x44f308）只入队 type 0xe（0x4253b8）：清文件名、
+    // 停播、释放缓冲、清 START/RESTART、state=0；**节点保留**，
+    // 元数据/TOTALTIME/位置/PAN/PITCH/LOOP/LOOPCOUNT/E/VOLUME 全保留。
     let mut s = state_with(&[("abc.wav", wav_ms(1000, 1000, 1))]);
     let mut c = cmd("BGM");
     c.file = Some(b"ABC.WAV".to_vec());
     c.play = Some(1);
     s.apply_sound(&c);
+    s.advance_ms(250);
     assert_eq!(int(&mut s, "BGM", QueryField::Exist), 1);
-    assert!(s.remove_layer(b"BGM"));
-    assert_eq!(int(&mut s, "BGM", QueryField::Exist), 0);
-    assert_eq!(int(&mut s, "BGM", QueryField::Time), 0);
-    assert_eq!(s.layers_len(), 0);
+    assert_eq!(int(&mut s, "BGM", QueryField::Play), 1);
+    assert!(s.apply_soundend(b"BGM"));
+    assert_eq!(int(&mut s, "BGM", QueryField::Exist), 1);
+    assert_eq!(int(&mut s, "BGM", QueryField::Play), 0);
+    // +0x000 被清 ⇒ FILE 空；+0x118 保留 ⇒ TIME 停在最后位置。
+    match query(&mut s, "BGM", QueryField::File) {
+        Value::Str(v) => assert!(v.is_empty(), "FILE should be cleared, got {v:?}"),
+        other => panic!("expected string, got {other:?}"),
+    }
+    assert_eq!(int(&mut s, "BGM", QueryField::Time), 250);
+    // state==0 时 type 0xe 是 no-op（0x4253d0..0x4253e5）。
+    assert!(s.apply_soundend(b"BGM"));
+    assert_eq!(int(&mut s, "BGM", QueryField::Time), 250);
+}
+
+#[test]
+fn soundend_with_trailing_slash_stops_subtree() {
+    let mut s = state_with(&[("abc.wav", wav_ms(1000, 1000, 1))]);
+    create_channel(&mut s, "BGM/");
+    for id in ["BGM/A1", "BGM/A2"] {
+        let mut c = cmd(id);
+        c.file = Some(b"ABC.WAV".to_vec());
+        c.play = Some(1);
+        s.apply_sound(&c);
+    }
+    assert_eq!(int(&mut s, "BGM/A1", QueryField::Play), 1);
+    assert_eq!(int(&mut s, "BGM/A2", QueryField::Play), 1);
+    assert!(s.apply_soundend(b"BGM/"));
+    assert_eq!(int(&mut s, "BGM/A1", QueryField::Play), 0);
+    assert_eq!(int(&mut s, "BGM/A2", QueryField::Play), 0);
+    // 中间容器保留（0x44f3a4 只对叶子调 0x44f3e8）。
+    assert!(s.layer(b"BGM/").is_some());
 }
 
 #[test]
@@ -410,7 +452,8 @@ fn file_probe_prefers_ogg_then_wav() {
     c.file = Some(b"x".to_vec());
     s.apply_sound(&c);
     // 第一个候选 "x" 不存在，第二个 "x.ogg" 存在（WAV 内容按魔数解码）。
-    assert_eq!(s.layers_len(), 1);
+    // 根层 S0 + 目标层。
+    assert_eq!(s.layers_len(), 2);
     let layer = s.layer(b"A").unwrap();
     assert_eq!(layer.file_type(), FileType::Wav);
     // REA `0x40c9b4`：`+0x000` 是最终候选名（含扩展名、已小写）。
@@ -1225,4 +1268,128 @@ fn gated_ogg_loop_wrap_back_to_zero_reopens_stream() {
     let stats = s.take_decode_stats();
     assert_eq!(stats.underruns, 0, "回绕后不应欠载");
     assert!(buf.iter().any(|v| v.abs() > 0.0), "回绕后应继续出声");
+}
+
+// ---------------------------------------------------------------------------
+// 层路径树与音量继承（官方 FUN_004141e4 / FUN_00424dfc / FUN_004238e0）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn layer_ids_are_path_normalized() {
+    let mut s = state_with(&[("abc.wav", wav_ms(500, 1000, 1))]);
+    create_channel(&mut s, "BGM/");
+    let mut c = cmd("BGM/A1");
+    c.file = Some(b"ABC.WAV".to_vec());
+    c.play = Some(1);
+    s.apply_sound(&c);
+    // 相对 ID 加根前缀；中间段 BGM 是容器。
+    assert!(s.layer(b"BGM/A1").is_some());
+    assert!(s.layer(b":/S0/BGM/A1").is_some());
+    assert!(s.layer(b"BGM/").is_some());
+    assert!(!s.layer(b"BGM/A1").unwrap().is_container());
+    assert!(s.layer(b"BGM/").unwrap().is_container());
+    assert!(s.layer(b":/S0/").unwrap().is_container());
+}
+
+#[test]
+fn effective_volume_folds_master_channel_and_sound() {
+    let mut s = state_with(&[("abc.wav", wav_ms(500, 1000, 1))]);
+    create_channel(&mut s, "BGM/");
+    let mut c = cmd("BGM/A1");
+    c.file = Some(b"ABC.WAV".to_vec());
+    c.play = Some(1);
+    c.volume = Some(256);
+    s.apply_sound(&c);
+    // 主音量 128、频道 128：256 * 128/256 * 128/256 = 64（每级 >>8 截断）。
+    let mut master = cmd(":/S0/");
+    master.volume = Some(128);
+    s.apply_sound(&master);
+    let mut channel = cmd("BGM/");
+    channel.volume = Some(128);
+    s.apply_sound(&channel);
+    assert_eq!(s.effective_volume(b"BGM/A1"), 64);
+    // 单条声音自己的音量再乘一层：64 * 128/256 = 32。
+    let mut own = cmd("BGM/A1");
+    own.volume = Some(128);
+    s.apply_sound(&own);
+    assert_eq!(s.effective_volume(b"BGM/A1"), 32);
+    // SOUNDINFO[VOLUME] 仍返回自身字段（官方 0x44fb87 读 +0x148）。
+    assert_eq!(int(&mut s, "BGM/A1", QueryField::Volume), 128);
+}
+
+#[test]
+fn ancestor_e_zero_mutes_descendants() {
+    let mut s = state_with(&[("abc.wav", wav_ms(500, 1000, 1))]);
+    create_channel(&mut s, "BGM/");
+    let mut c = cmd("BGM/A1");
+    c.file = Some(b"ABC.WAV".to_vec());
+    c.play = Some(1);
+    s.apply_sound(&c);
+    assert_eq!(s.effective_volume(b"BGM/A1"), 256);
+    // 频道层 E=0 ⇒ 子树静音（FUN_00424dfc 的 (E==1)*VOLUME 折叠）。
+    let mut mute = cmd("BGM/");
+    mute.e = Some(0);
+    s.apply_sound(&mute);
+    assert_eq!(s.effective_volume(b"BGM/A1"), 0);
+    // 恢复后音量回到自身值。
+    let mut on = cmd("BGM/");
+    on.e = Some(1);
+    s.apply_sound(&on);
+    assert_eq!(s.effective_volume(b"BGM/A1"), 256);
+}
+
+#[test]
+fn mixer_applies_effective_volume() {
+    let mut s = state_with(&[("abc.wav", wav_ms(500, 1000, 1))]);
+    create_channel(&mut s, "BGM/");
+    let mut c = cmd("BGM/A1");
+    c.file = Some(b"ABC.WAV".to_vec());
+    c.play = Some(1);
+    c.volume = Some(256);
+    s.apply_sound(&c);
+    let mut full = vec![0.0f32; 512];
+    s.render(&mut full, 44_100, 2);
+    let peak_full = full.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    assert!(peak_full > 0.0);
+    let mut master = cmd(":/S0/");
+    master.volume = Some(64);
+    s.apply_sound(&master);
+    let mut quiet = vec![0.0f32; 512];
+    s.render(&mut quiet, 44_100, 2);
+    let peak_quiet = quiet.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    // 振幅 = (v/256)^2：64/256 ⇒ 1/16。
+    let ratio = peak_quiet / peak_full;
+    assert!((ratio - 1.0 / 16.0).abs() < 0.01, "ratio={ratio}");
+}
+
+#[test]
+fn layer_creation_follows_official_rules() {
+    let mut s = state_with(&[("abc.wav", wav_ms(500, 1000, 1))]);
+    // 无 FILE、无末尾 `/`：官方 lookup 失败后不建节点（0x44ef45）。
+    let mut vol = cmd("NEW");
+    vol.volume = Some(128);
+    s.apply_sound(&vol);
+    assert!(s.layer(b"NEW").is_none());
+    // 末尾 `/` 建容器（0x44ef62，+0x30=1）。
+    let mut chan = cmd("NEW/");
+    chan.volume = Some(200);
+    s.apply_sound(&chan);
+    assert!(s.layer(b"NEW/").unwrap().is_container());
+    assert_eq!(int(&mut s, "NEW/", QueryField::Volume), 200);
+    // 带 FILE 建叶子，父容器必须已存在。
+    let mut leaf = cmd("NEW/A1");
+    leaf.file = Some(b"ABC.WAV".to_vec());
+    s.apply_sound(&leaf);
+    assert!(s.layer(b"NEW/A1").is_some());
+    // 父层不存在 ⇒ 不补建中间节点（FUN_00461328 缺段即失败）。
+    let mut orphan = cmd("NOPE/A1");
+    orphan.file = Some(b"ABC.WAV".to_vec());
+    s.apply_sound(&orphan);
+    assert!(s.layer(b"NOPE/A1").is_none());
+    assert!(s.layer(b"NOPE/").is_none());
+    // 末尾 `/` + FILE ⇒ 官方错误 0x18bac，命令不应用。
+    let mut bad = cmd("NEW/");
+    bad.file = Some(b"ABC.WAV".to_vec());
+    s.apply_sound(&bad);
+    assert_eq!(int(&mut s, "NEW/", QueryField::Volume), 200);
 }

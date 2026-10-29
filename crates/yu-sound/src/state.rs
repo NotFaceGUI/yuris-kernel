@@ -6,9 +6,13 @@
 //!   LOOPCOUNT 在 END 边界 +1、LOOP=N 在计数达到 N 时停止并清零、
 //!   TIME = 播放位置(ms)、TOTALTIME = 总长(ms)、CODEC/FILETYPE 枚举、
 //!   DATALEFT/DATARIGHT 的帧采样（REA `0x44fe3c`/`0x44ff58`；手册无页）。
+//! - **Confirmed（REA + 运行时，台账 N0-14）**：层 ID 是路径树
+//!   （`path::normalize`，前缀 `S0`）、节点按“带 FILE 建叶子 / 末尾 `/`
+//!   建容器”创建、有效音量沿祖先链逐级 `>>8` 折叠
+//!   （`effective_for_key`）、`SOUNDEND` 只释放声音对象不删节点。
 //! - **Likely（静态可读、缺动态对拍）**：负 START/RESTART 延迟期间的
 //!   TIME/PLAY 返回值（DIV-SND-002；延迟累加器 `+0x190/+0x194` 本身已
-//!   字节级取证）；默认音量 256。
+//!   字节级取证）；默认音量 256；ID 含空格被拒（调用方 flag 为栈残值）。
 //! - **Unverified**：重采样插值、混音限幅。
 //! - **aligned-stub**：MIDI/MIDIEND/MIDIINFO（官方 `0x44aa40/60/80`）、
 //!   CDDA（`0x429fb0`）——官方处理体是空桩，内核同型对齐。
@@ -106,6 +110,10 @@ struct SoundMeta {
 /// 不实现 `Clone`:`Stream` 持有解码器/窗口,拷贝它会复制解码状态(无意义)。
 #[derive(Debug)]
 pub struct Layer {
+    /// 路径容器节点（引擎 `+0x30 = 1`）：由 `SOUND[ID="BGM/" …]` 这类
+    /// 以 `/` 结尾、不带 FILE 的命令建出（`0x44f08e`），没有自己的解码流。
+    /// 音量/`E` 沿树向下继承（台账 N0-14）。
+    container: bool,
     /// `SOUND[FILE=]` 的原始参数（`SOUNDINFO[FILE]` 的来源；见台账 N0-7）。
     file_arg: Vec<u8>,
     /// 扩展名探测后真正命中的名字（诊断/渲染用，不对外查询）。
@@ -150,6 +158,7 @@ pub struct Layer {
 impl Layer {
     fn new() -> Self {
         Self {
+            container: false,
             file_arg: Vec::new(),
             resolved: Vec::new(),
             meta: None,
@@ -175,6 +184,19 @@ impl Layer {
             fade: Fade::none(),
             delay_ms: 0.0,
         }
+    }
+
+    /// 路径容器节点：引擎在建路径时给中间段分配的节点（`+0x30 = 1`），
+    /// 自带一个空的 0x1d0 声音对象（`0x462566..0x462582`）。
+    fn container() -> Self {
+        let mut layer = Self::new();
+        layer.container = true;
+        layer
+    }
+
+    /// 是否路径容器（引擎 `+0x30`）。
+    pub fn is_container(&self) -> bool {
+        self.container
     }
 
     pub fn file_type(&self) -> FileType {
@@ -270,17 +292,24 @@ pub struct SoundSnapshot {
     pub loop_setting: i64,
     pub loop_count: i64,
     pub volume: i64,
+    /// 沿祖先链折叠后的有效音量（引擎 `FUN_00424dfc`）。
+    pub effective_volume: i64,
     pub pan: i64,
     pub pitch: i64,
     pub enabled: bool,
     pub paused: bool,
+    pub container: bool,
 }
 
 /// `SOUND` 的按名参数（`yu-rt` 的 `DomainArg` 转换后）。
 #[derive(Clone, Debug, Default)]
 pub struct SoundCommand {
     pub id: Vec<u8>,
+    /// `FILE` 的字符串值(类型不符时保持 `None`)。
     pub file: Option<Vec<u8>>,
+    /// `FILE` 参数**是否出现**。官方建节点规则按参数槽存在性判定
+    /// (`0x684162 != 0`,`0x44ef57`),与值能否解析成字符串无关。
+    pub file_present: bool,
     pub e: Option<i64>,
     pub play: Option<i64>,
     pub pause: Option<i64>,
@@ -441,8 +470,13 @@ const PCM_CACHE_CAP: usize = 96 * 1024 * 1024;
 
 impl SoundState {
     pub fn new(loader: Box<dyn SoundLoader>) -> Self {
+        // 官方声音初始化建根层 `S0`（`0x4625be` 用前缀建路径，节点自带
+        // 声音对象，`+0x30 = 1`）；脚本的 `SOUND[ID=":/S0/"]` 就是这个节点，
+        // 主音量经它向全树继承（台账 N0-14）。
+        let mut layers = BTreeMap::new();
+        layers.insert(crate::path::SOUND_ROOT.to_vec(), Layer::container());
         Self {
-            layers: BTreeMap::new(),
+            layers,
             loader,
             pcm_cache: BTreeMap::new(),
             pcm_cache_bytes: 0,
@@ -491,7 +525,8 @@ impl SoundState {
     }
 
     pub fn layer(&self, id: &[u8]) -> Option<&Layer> {
-        self.layers.get(id)
+        let key = crate::path::normalize(id)?.key;
+        self.layers.get(&key)
     }
 
     pub(crate) fn layers_iter(&self) -> impl Iterator<Item = (&Vec<u8>, &Layer)> {
@@ -511,16 +546,106 @@ impl SoundState {
                 loop_setting: l.loop_setting,
                 loop_count: l.loop_count,
                 volume: l.volume_current,
+                effective_volume: self.effective_for_key(id),
                 pan: l.pan,
                 pitch: l.pitch,
                 enabled: l.enabled,
                 paused: l.paused,
+                container: l.container,
             })
             .collect()
     }
 
-    pub fn remove_layer(&mut self, id: &[u8]) -> bool {
-        self.layers.remove(id).is_some()
+    /// 有效音量（官方 `FUN_00424dfc`）：自身 `(E==1) × VOLUME`，再逐级乘
+    /// 祖先的**有效**音量并 `>> 8`（每级截断，不是一次性浮点积）。
+    ///
+    /// 祖先链止于根层 `S0`（它的父节点是名字为空的表头，不参与折叠）。
+    /// `SOUND[ID=":/S0/" VOLUME=v]` 改的是根层自身，所以主音量滑杆经
+    /// 这里乘进每一条声音（台账 N0-14）。
+    pub fn effective_for_key(&self, key: &[u8]) -> i64 {
+        // 从根到叶按 `/` 前缀走一遍（无分配：音频回调每块都会调用）。
+        let mut acc: Option<i64> = None;
+        let mut start = 0usize;
+        loop {
+            let next = key[start..]
+                .iter()
+                .position(|&b| b == b'/')
+                .map(|p| start + p);
+            let end = next.unwrap_or(key.len());
+            if let Some(layer) = self.layers.get(&key[..end]) {
+                let own = if layer.enabled {
+                    layer.volume_current.clamp(0, 256)
+                } else {
+                    0
+                };
+                acc = Some(match acc {
+                    None => own,
+                    Some(parent) => (own * parent) >> 8,
+                });
+            }
+            match next {
+                Some(pos) => start = pos + 1,
+                None => break,
+            }
+        }
+        acc.unwrap_or(0)
+    }
+
+    /// 按脚本 ID 取有效音量（测试/诊断用；内部路径用 [`Self::effective_for_key`]）。
+    pub fn effective_volume(&self, id: &[u8]) -> i64 {
+        match crate::path::normalize(id) {
+            Some(n) => self.effective_for_key(&n.key),
+            None => 0,
+        }
+    }
+
+    /// `SOUNDEND`：官方处理体 `0x44f308` 只把目标层（或带 `/` 结尾时整棵
+    /// 子树）入队 type 0xe，**不删除节点**。
+    ///
+    /// - 单个：`0x44f3e8` → type 0xe（`0x4253b8`）：state==0 时无操作；
+    ///   否则清文件名 `+0x000`、停播、释放缓冲、清 START/RESTART、
+    ///   state=0；**保留** `+0x105/+0x107/+0x120/+0x118/PAN/PITCH/LOOP/
+    ///   LOOPCOUNT`（`SOUNDINFO[EXIST]` 仍为 1，TIME 保留最后位置）。
+    /// - 带 `/` 结尾：`0x44f388` → `0x44f3a4` 递归停止所有**叶子**后代，
+    ///   中间容器保留，最后再释放目标自身。
+    pub fn apply_soundend(&mut self, id: &[u8]) -> bool {
+        let Some(norm) = crate::path::normalize(id) else {
+            self.report(error::recoverable(
+                code::LAYER_INVALID_ID,
+                "SOUNDEND[ID] 含空格且含路径字符:官方规范化返回 -1,命令不应用".to_string(),
+            ));
+            return false;
+        };
+        // 官方只查不建：层不存在时 SOUNDEND 是 no-op（`0x44f369` je）。
+        if !self.layers.contains_key(&norm.key) {
+            return false;
+        }
+        if norm.trailing_slash {
+            let mut prefix = norm.key.clone();
+            prefix.push(b'/');
+            let mut leaves: Vec<Vec<u8>> = self
+                .layers
+                .iter()
+                .filter(|(k, l)| !l.container && k.starts_with(&prefix))
+                .map(|(k, _)| k.clone())
+                .collect();
+            leaves.push(norm.key.clone());
+            for key in leaves {
+                release_layer(&mut self.layers, &key);
+            }
+        } else {
+            release_layer(&mut self.layers, &norm.key);
+        }
+        true
+    }
+
+    /// 父节点是否已存在（官方建节点前 `FUN_00461328` 逐段解析；顶层节点
+    /// 挂在名字为空的表头下，恒存在）。
+    fn parent_exists(&self, key: &[u8]) -> bool {
+        match key.iter().rposition(|&b| b == b'/') {
+            Some(pos) => self.layers.contains_key(&key[..pos]),
+            None => true,
+        }
     }
 
     pub fn report_unimplemented(&mut self, command: &str) {
@@ -632,20 +757,77 @@ impl SoundState {
 
     /// 应用一条 `SOUND` 命令。
     pub fn apply_sound(&mut self, cmd: &SoundCommand) {
-        // 引擎不校验空 ID：空名字同样进哈希表（REA `0x44e1e8` 直接建节点）。
-        // 这里不拒绝，避免把数据问题变成宿主策略。
+        // ID 先过官方 `FUN_004141e4`（前缀 `S0`、`:/` 绝对写法、`//`/`./`/
+        // `../` 折叠）。慢路径的空格检查失败 ⇒ 官方返回 -1、整条命令不应用。
         // `SPEED`（槽 13）官方静默忽略 ⇒ 这里同样不产生任何诊断。
-
-        // 先把层取出为局部值：参数应用期间允许 `self.report`/`self.loader`
-        // 再借用 self；结束后放回层表（见借用检查器错误的历史）。
-        let mut layer = self.layers.remove(&cmd.id).unwrap_or_else(Layer::new);
+        let Some(norm) = crate::path::normalize(&cmd.id) else {
+            self.report(error::recoverable(
+                code::LAYER_INVALID_ID,
+                format!(
+                    "SOUND[ID] 含空格且含路径字符:官方规范化返回 -1,整条命令不应用({})",
+                    display(&cmd.id)
+                ),
+            ));
+            return;
+        };
+        let key = norm.key;
+        // `FILE` 存在性:字符串值本身也说明参数在场(兼容只填 `file` 的
+        // 构造方);`file_present` 额外覆盖"参数在但值类型不符"的边角。
+        let file_present = cmd.file_present || cmd.file.is_some();
+        // 节点创建规则（官方 `0x44ef31..0x44f245`）：
+        // - 带 FILE 且 ID 不以 `/` 结尾 ⇒ 建**叶子**（`+0x30=0`）；
+        // - 不带 FILE 且 ID 以 `/` 结尾 ⇒ 建**容器**（`+0x30=1`）；
+        // - 带 FILE 且以 `/` 结尾 ⇒ 错误 0x18bac，命令不应用；
+        // - 其余（层不存在、无 FILE、无末尾 `/`）⇒ 直接丢弃，不建节点。
+        // 父链必须已存在（`FUN_00461328` 逐段查找，缺段即失败）；
+        // 频道容器由脚本 `es.SND.INIT` 的 `SOUND[ID="BGM/" …]` 预先建出。
+        let mut layer = match self.layers.remove(&key) {
+            Some(layer) => layer,
+            None => {
+                let create = match (file_present, norm.trailing_slash) {
+                    (true, false) => Some(false),
+                    (false, true) => Some(true),
+                    (true, true) => {
+                        self.report(error::recoverable(
+                            code::LAYER_INVALID_ID,
+                            format!(
+                                "SOUND[ID] 以 `/` 结尾且带 FILE:官方返回错误(0x18bac),命令不应用({})",
+                                display(&cmd.id)
+                            ),
+                        ));
+                        return;
+                    }
+                    (false, false) => None,
+                };
+                let Some(container) = create else {
+                    // 官方 lookup 失败后既不建叶子也不建容器 ⇒ 整条命令
+                    // 不应用（0x44ef45 直接 return 0）。
+                    return;
+                };
+                if !self.parent_exists(&key) {
+                    self.report(error::recoverable(
+                        code::LAYER_MISSING,
+                        format!(
+                            "SOUND[ID] 的父层不存在:官方不补建中间节点(0x18786),命令不应用({})",
+                            display(&cmd.id)
+                        ),
+                    ));
+                    return;
+                }
+                if container {
+                    Layer::container()
+                } else {
+                    Layer::new()
+                }
+            }
+        };
 
         // 1) FILE：装载 + 解码（引擎在参数写回前完成文件装入）。
         if let Some(file) = &cmd.file {
             if self.load_file(&mut layer, file) == LoadOutcome::NotFound {
                 // 引擎 `FUN_0040c9b4()==1` 时 SOUND 处理体直接 return 0，
                 // 同一命令里的 PLAY/VOLUME/START 等参数都不应用。
-                self.layers.insert(cmd.id.clone(), layer);
+                self.layers.insert(key, layer);
                 return;
             }
         }
@@ -757,7 +939,7 @@ impl SoundState {
             // 装载/解码失败时保持 Stopped（没有可播放数据）。
             layer.state = PlayState::Loaded;
         }
-        self.layers.insert(cmd.id.clone(), layer);
+        self.layers.insert(key, layer);
     }
 
     /// 装载。返回“文件解析是否成功”（不代表解码成功）。
@@ -1011,7 +1193,23 @@ impl SoundState {
                 "SOUNDINFO 多字段同调（无短路字段）：按引擎检查顺序逐个写 LET，最后者胜出",
             ));
         }
-        let Some(layer) = self.layers.get(id) else {
+        // SOUNDINFO 处理体同样先用 `[0x801718]` 前缀规范化（`0x44f500`），
+        // 所以脚本写 `BGM/A1`、`BGM/`、`:/S0/BGM/A1` 都落到同一节点。
+        let Some(norm) = crate::path::normalize(id) else {
+            self.report(error::recoverable(
+                code::LAYER_INVALID_ID,
+                format!(
+                    "SOUNDINFO[ID] 含空格且含路径字符:官方规范化返回 -1({})",
+                    display(id)
+                ),
+            ));
+            return Ok(if ordered.contains(&QueryField::File) {
+                Value::Str(Vec::new())
+            } else {
+                Value::Int(0)
+            });
+        };
+        let Some(layer) = self.layers.get(&norm.key) else {
             // 引擎缺层分支：把 LET 写成 0（字符串目标写空串）。
             return Ok(if ordered.contains(&QueryField::File) {
                 Value::Str(Vec::new())
@@ -1098,6 +1296,25 @@ enum LoadOutcome {
     NotFound,
     /// 找到文件并进入 type 1（含解码失败）。
     Loaded,
+}
+
+/// type 0xe（`0x4253b8`）的释放语义：**只**在 state != 0 时动作，清文件名、
+/// 停播、释放解码流、清 START/RESTART、state=0；元数据/TOTALTIME/播放位置/
+/// PAN/PITCH/LOOP/LOOPCOUNT/E/VOLUME 全部保留（`SOUNDINFO[EXIST]` 仍为 1）。
+fn release_layer(layers: &mut BTreeMap<Vec<u8>, Layer>, key: &[u8]) {
+    let Some(layer) = layers.get_mut(key) else {
+        return;
+    };
+    if layer.state == PlayState::Stopped {
+        return;
+    }
+    layer.file_arg.clear();
+    layer.resolved.clear();
+    layer.stream.replace(None);
+    layer.start_ms = 0;
+    layer.restart_ms = 0;
+    layer.fade = Fade::none();
+    layer.state = PlayState::Stopped;
 }
 
 fn reset_for_load(layer: &mut Layer) {

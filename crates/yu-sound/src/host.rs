@@ -62,10 +62,16 @@ impl SoundHostTrait for SoundHost {
                                     Value::Str(s) => cmd.id = s.clone(),
                                     _ => arg_type(&self.state, "ID", value),
                                 },
-                                "FILE" => match value {
-                                    Value::Str(s) => cmd.file = Some(s.clone()),
-                                    _ => arg_type(&self.state, "FILE", value),
-                                },
+                                "FILE" => {
+                                    // 官方建节点规则按**参数槽存在性**判定
+                                    // (`0x684162`,0x44ef57);类型不符只影响
+                                    // 装载,不影响"这条命令带 FILE"。
+                                    cmd.file_present = true;
+                                    match value {
+                                        Value::Str(s) => cmd.file = Some(s.clone()),
+                                        _ => arg_type(&self.state, "FILE", value),
+                                    }
+                                }
                                 "E" => cmd.e = number(value),
                                 "PLAY" => cmd.play = number(value),
                                 "PAUSE" => cmd.pause = number(value),
@@ -95,7 +101,9 @@ impl SoundHostTrait for SoundHost {
                                 _ => None,
                             });
                         if let Some(id) = id {
-                            self.state.lock().unwrap().remove_layer(&id);
+                            // 官方 SOUNDEND 不删节点，只入队 type 0xe 释放
+                            // 声音对象；带 `/` 结尾的 ID 递归停止子树。
+                            self.state.lock().unwrap().apply_soundend(&id);
                         }
                     }
                     // 查询由 `query` 处理；MIDI/CDDA/未知命令由 yu-rt 的
