@@ -85,6 +85,9 @@ pub use textures::{GpuTexture, RenderTarget, TextureCache};
 
 pub use yu_render_core::{AssetIssue, RenderReport, SkippedOp, Surface, TextureStore};
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use yu_gfx::{BlendMode, CompositorFrame, CopyId, Viewport};
@@ -174,6 +177,32 @@ struct VertexBufferSlot {
     capacity: u64,
 }
 
+/// `SAVE[ID]` 命令时刻的按需快照读回端口。
+struct WgpuSnapshotSource {
+    ctx: GpuContext,
+    readback: readback::ReadbackCache,
+    registry: Rc<RefCell<BTreeMap<CopyId, Rc<surfaces::TexRef>>>>,
+}
+
+impl yu_render_core::SnapshotSource for WgpuSnapshotSource {
+    fn read(&mut self, id: CopyId) -> Option<Surface> {
+        let (width, height, texture) = {
+            let registry = self.registry.borrow();
+            let target = registry.get(&id)?;
+            (target.width, target.height, target.texture.clone())
+        };
+        let encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("yu-backend-wgpu snapshot source"),
+            });
+        self.readback
+            .read_now(&self.ctx, &texture, width, height, encoder)
+            .ok()
+    }
+}
+
 /// wgpu 渲染器:持有设备、纹理解析缓存、GPU 纹理/目标/管线缓存。
 pub struct WgpuRenderer {
     ctx: GpuContext,
@@ -204,6 +233,8 @@ pub struct WgpuRenderer {
     text: yu_render_core::TextComposer,
     /// GPU 文本 pass(字形直接写层表面;能力不支持时为 `None` → CPU 回退)。
     text_gpu: Option<text_gpu::TextGpuRenderer>,
+    /// 快照句柄表(每帧刷新;供 SAVE[ID] 在命令时刻按需读回上一帧快照)。
+    snapshot_registry: Rc<RefCell<BTreeMap<CopyId, Rc<surfaces::TexRef>>>>,
     /// 最近一帧的阶段耗时(性能取证;不进入 `RenderReport` 的对账字段)。
     last_phases: yu_render_core::RenderPhases,
 }
@@ -215,6 +246,44 @@ impl WgpuRenderer {
     /// 跳过并计数,不要空跑通过。
     pub fn new(textures: TextureStore) -> Result<Self, Diag> {
         Self::new_with_options(textures, &DeviceOptions::default())
+    }
+
+    /// 在命令时刻预热资产:解码 + GPU 上传(官方 `CG[FILE]` 在命令处理体内
+    /// 同步装载纹理;渲染首用只命中缓存)。失败由 `TextureStore` 缓存,
+    /// 渲染阶段的 `asset.*` 诊断照常产出。
+    pub fn preload_assets(&mut self, keys: &[Vec<u8>]) -> (u64, u64) {
+        self.textures.preload_parallel(keys);
+        let mut errors = 0u64;
+        for key in keys {
+            if let Err(diag) = self
+                .gpu_textures
+                .ensure_asset(&self.ctx, &mut self.textures, key)
+            {
+                errors += 1;
+                log::warn!(
+                    target: "yu-render",
+                    "[asset] preload failed key={}: {} {}",
+                    String::from_utf8_lossy(key),
+                    diag.code,
+                    diag.detail
+                );
+            }
+        }
+        (keys.len() as u64, errors)
+    }
+
+    /// 刷新快照句柄表(主渲染提交之后调用;供下一次 SAVE[ID] 按需读回)。
+    pub fn refresh_snapshot_registry(&self) {
+        *self.snapshot_registry.borrow_mut() = self.targets.snapshot_refs();
+    }
+
+    /// 构造按需快照读回端口(共享同一设备/队列与快照句柄表)。
+    pub fn snapshot_source(&self) -> Box<dyn yu_render_core::SnapshotSource> {
+        Box::new(WgpuSnapshotSource {
+            ctx: self.ctx.clone(),
+            readback: readback::ReadbackCache::new(),
+            registry: Rc::clone(&self.snapshot_registry),
+        })
     }
 
     /// 指定后端/适配器名称子串等选项初始化。
@@ -263,6 +332,7 @@ impl WgpuRenderer {
             backbuffer_gpu: None,
             text: yu_render_core::TextComposer::new(),
             text_gpu,
+            snapshot_registry: Rc::new(RefCell::new(BTreeMap::new())),
             last_phases: yu_render_core::RenderPhases::default(),
         })
     }
@@ -358,6 +428,7 @@ impl WgpuRenderer {
         if let Some(text_gpu) = &mut self.text_gpu {
             text_gpu.clear();
         }
+        self.snapshot_registry.borrow_mut().clear();
         self.targets.clear_snapshots(&mut self.pipelines);
         self.targets.clear_offscreen(&mut self.pipelines);
         self.readback = ReadbackCache::new();

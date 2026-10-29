@@ -92,6 +92,26 @@ impl SoftRenderer {
         }
     }
 
+    /// 在命令时刻预热资产(官方 `CG[FILE]` 同步装载);soft 只需解码入
+    /// `TextureStore` 缓存,渲染首用命中。
+    pub fn preload_assets(&mut self, keys: &[Vec<u8>]) -> (u64, u64) {
+        self.textures.preload_parallel(keys);
+        let mut errors = 0u64;
+        for key in keys {
+            if let Err(diag) = self.textures.resolve(key) {
+                errors += 1;
+                log::warn!(
+                    target: "yu-render",
+                    "[asset] preload failed key={}: {} {}",
+                    String::from_utf8_lossy(key),
+                    diag.code,
+                    diag.detail
+                );
+            }
+        }
+        (keys.len() as u64, errors)
+    }
+
     /// 用调用方字体源构造文本合成器(测试/自带字体)。
     pub fn with_text_source(mut self, source: yu_font::FontSource) -> Self {
         self.text = TextComposer::with_source(source);

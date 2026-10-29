@@ -290,6 +290,32 @@ fn if_false_takes_else_branch() {
 }
 
 #[test]
+fn jump_events_are_suppressed_when_record_events_off() {
+    let b = if_fixture(0);
+    let src = b.build();
+    let mut vm = Vm::boot(
+        Box::new(src),
+        BootConfig {
+            record_events: false,
+            ..BootConfig::default()
+        },
+    )
+    .expect("boot");
+    vm.tick_at(0, &no_input());
+    assert!(
+        !vm.events()
+            .iter()
+            .any(|e| matches!(e, yu_rt::VmEvent::Jump { .. })),
+        "record_events=false 时 Jump 不得入队"
+    );
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(2),
+        "关事件流不改变分支语义"
+    );
+}
+
+#[test]
 fn if_false_jump_is_observable() {
     let mut vm = boot(if_fixture(0));
     vm.tick_at(0, &no_input());

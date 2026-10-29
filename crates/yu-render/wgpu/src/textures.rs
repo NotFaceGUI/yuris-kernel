@@ -100,18 +100,23 @@ impl TextureCache {
             return Ok(*id);
         }
         let texture = store.resolve(key)?;
-        let uploaded = self.upload(
-            ctx,
-            texture.width,
-            texture.height,
-            &texture.rgba,
-            "asset texture",
-        )?;
+        let (width, height, bytes) = (texture.width, texture.height, texture.rgba.len());
+        let started = std::time::Instant::now();
+        let uploaded = self.upload(ctx, width, height, &texture.rgba, "asset texture")?;
+        let upload_us = started.elapsed().as_micros() as u64;
         self.asset_ids.insert(key.to_vec(), uploaded);
-        let texture = store.resolve(key)?;
-        self.asset_upload_bytes = self
-            .asset_upload_bytes
-            .saturating_add(texture.rgba.len() as u64);
+        self.asset_upload_bytes = self.asset_upload_bytes.saturating_add(bytes as u64);
+        if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
+            log::warn!(
+                target: "yu-render",
+                "[asset] upload key={} size={}x{} bytes={} upload={}us",
+                String::from_utf8_lossy(key),
+                width,
+                height,
+                bytes,
+                upload_us
+            );
+        }
         Ok(uploaded)
     }
 
@@ -264,6 +269,11 @@ impl TargetSet {
 
     pub fn snapshot(&self, id: CopyId) -> Option<&std::rc::Rc<TexRef>> {
         self.snapshots.get(&id)
+    }
+
+    /// 当前存活快照的句柄表(按需读回端口跨帧使用;只克隆 `Rc`)。
+    pub(crate) fn snapshot_refs(&self) -> BTreeMap<CopyId, std::rc::Rc<TexRef>> {
+        self.snapshots.clone()
     }
 
     /// 冻结一张快照(COPY 规划期)。内容纹理由 `LayerSurfaces` 的池/层内容

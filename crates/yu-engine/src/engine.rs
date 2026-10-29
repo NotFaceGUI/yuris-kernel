@@ -405,6 +405,14 @@ impl Renderer {
         }
     }
 
+    /// 命令时刻预热资产(官方 `CG[FILE]` 同步装载):返回 `(资产数, 失败数)`。
+    fn preload_assets(&mut self, keys: &[Vec<u8>]) -> (u64, u64) {
+        match self {
+            Renderer::Soft(renderer) => renderer.preload_assets(keys),
+            Renderer::Wgpu { renderer, .. } => renderer.preload_assets(keys),
+        }
+    }
+
     /// 预枚举系统字体(见 [`EngineOptions::warm_text`])。
     ///
     /// 可重复调用(已加载即 no-op),因此 `run` 里按需补预热是安全的。
@@ -551,6 +559,10 @@ pub struct Engine {
     last_capture_ms: f64,
     /// 上一帧 `GfxState::frame()` 合成帧装配耗时(毫秒;含在 `tick_ms` 内)。
     last_frame_build_ms: f64,
+    /// 上一 tick 在命令时刻预热资产(`CG[FILE]`)的耗时/数量/失败数。
+    last_preload_ms: f64,
+    last_preload_assets: u64,
+    last_preload_errors: u64,
     tick_history: VecDeque<f64>,
     render_history: VecDeque<f64>,
     boot_ms: f64,
@@ -564,7 +576,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(project: Project, opts: EngineOptions) -> CliResult<Self> {        let boot_started = Instant::now();
-        let (vm, state, sound, save_host, viewport, probe_order, capture_bridge) =
+        let (vm, state, sound, save_host, viewport, probe_order, mut capture_bridge) =
             boot(&project, &opts)?;
         let boot_ms = boot_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -593,6 +605,15 @@ impl Engine {
                 }
             }
         };
+        if let Some(bridge) = capture_bridge.as_mut() {
+            match &renderer {
+                Renderer::Wgpu { renderer, .. } => {
+                    bridge.set_source(renderer.snapshot_source());
+                    bridge.set_eager(false);
+                }
+                Renderer::Soft(_) => bridge.set_eager(true),
+            }
+        }
         let text_warm_ms = if opts.warm_text {
             let started = Instant::now();
             renderer.warm_text();
@@ -661,6 +682,9 @@ impl Engine {
             last_render: None,
             last_capture_ms: 0.0,
             last_frame_build_ms: 0.0,
+            last_preload_ms: 0.0,
+            last_preload_assets: 0,
+            last_preload_errors: 0,
             tick_history: VecDeque::with_capacity(120),
             render_history: VecDeque::with_capacity(120),
             boot_ms,
@@ -792,6 +816,17 @@ impl Engine {
     /// 上一帧合成帧装配耗时(`GfxState::frame()`;包含在 `tick_ms` 内)。
     pub fn frame_build_ms(&self) -> f64 {
         self.last_frame_build_ms
+    }
+
+    /// 上一 tick 命令时刻资产预热耗时(毫秒;含在 `tick_ms` 内)。
+    pub fn preload_ms(&self) -> f64 {
+        self.last_preload_ms
+    }
+
+    /// 上一 tick 预热的资产数/失败数(失败由 `TextureStore` 缓存,
+    /// 渲染阶段照常产出 `asset.*` 诊断)。
+    pub fn preload_counts(&self) -> (u64, u64) {
+        (self.last_preload_assets, self.last_preload_errors)
     }
 
     /// 本帧 ops/passes 构成(长帧取证;按需调用,不进逐帧热路径)。
@@ -1017,6 +1052,35 @@ impl Engine {
             }
             self.sync_input();
         }
+        // 官方 `CG[FILE]` 在命令处理体内同步装载纹理。gfx 不做文件 I/O;
+        // 这里在 tick 末尾把本 tick 新登记的资产解码 + 上传,渲染首用命中原图。
+        // 与官方一样发生在命令所在帧,而不是首次参与合成的帧。
+        let preloads = self
+            .state
+            .as_ref()
+            .map(|state| state.borrow_mut().take_preloads())
+            .unwrap_or_default();
+        if preloads.is_empty() {
+            self.last_preload_ms = 0.0;
+            self.last_preload_assets = 0;
+            self.last_preload_errors = 0;
+        } else {
+            let started = Instant::now();
+            let (assets, errors) = self.renderer.preload_assets(&preloads);
+            self.last_preload_ms = started.elapsed().as_secs_f64() * 1000.0;
+            self.last_preload_assets = assets;
+            self.last_preload_errors = errors;
+            if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
+                log::warn!(
+                    target: "yu-engine",
+                    "[preload] frame={} assets={} errors={} ms={:.1}",
+                    self.frame.wrapping_add(1),
+                    assets,
+                    errors,
+                    self.last_preload_ms
+                );
+            }
+        }
         let build_started = Instant::now();
         let frame = self
             .state
@@ -1032,6 +1096,15 @@ impl Engine {
         let (surface, report, screen) = self.renderer.render(&frame)?;
         self.last_screen = screen;
         let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
+        if let Renderer::Wgpu { renderer, .. } = &self.renderer {
+            renderer.refresh_snapshot_registry();
+        }
+        // `SAVE[ID]` 命令时刻的回放需要上一帧呈现面(`COPY ID=:/W0/`)。
+        // 必须在 VM 下一次 tick 之前注入:同 tick 的 `COPY2→SAVE` 靠回放
+        // 取像素,而不是等本帧渲染。
+        if let Some(bridge) = &self.capture_bridge {
+            bridge.set_last_screen(Some(Arc::clone(&surface)));
+        }
 
         // `SAVE[ID]` 抓帧器(渲染之后调用:主渲染器本帧已把可从 CPU 源解析
         // 的快照建好 CPU 镜像)。镜像命中 ⇒ 零回放;只有组源/后缓冲源这类
@@ -1560,6 +1633,9 @@ impl Engine {
         self.last_render = None;
         self.last_capture_ms = 0.0;
         self.last_frame_build_ms = 0.0;
+        self.last_preload_ms = 0.0;
+        self.last_preload_assets = 0;
+        self.last_preload_errors = 0;
         self.tick_history.clear();
         self.render_history.clear();
         self.events_drained = 0;
@@ -1579,6 +1655,15 @@ impl Engine {
         self.sound = sound;
         self.save_host = save_host;
         self.capture_bridge = capture_bridge;
+        if let Some(bridge) = self.capture_bridge.as_mut() {
+            match &self.renderer {
+                Renderer::Wgpu { renderer, .. } => {
+                    bridge.set_source(renderer.snapshot_source());
+                    bridge.set_eager(false);
+                }
+                Renderer::Soft(_) => bridge.set_eager(true),
+            }
+        }
         if let (Some(audio), Some(sound)) = (&mut self.audio, &self.sound) {
             audio.attach(Arc::clone(sound));
         }

@@ -115,6 +115,21 @@ pub struct TextureStore {
     /// `plan` 里,和 MERGE 合成混在一起看不出来 ⇒ 单独记账。
     decode_us: u64,
     decode_bytes: u64,
+    /// 缓存像素预算(字节;0 = 不限制)。只回收**无外部引用**的条目
+    /// (图层/快照仍在用的纹理不会被踢掉)。
+    budget_bytes: usize,
+    /// 当前缓存内像素字节。
+    resident_bytes: usize,
+    /// 访问/插入时钟(LRU)。
+    clock: u64,
+    /// `key → (字节, 最近访问序)`(预算记账;与 `cache` 同步增删)。
+    meta: BTreeMap<Vec<u8>, (usize, u64)>,
+    /// 本帧新插入的 key(预算执行时豁免;防止预热批次在渲染前被回收)。
+    fresh: std::collections::BTreeSet<Vec<u8>>,
+    /// 已回收条目数(诊断)。
+    evicted: u64,
+    /// 超预算且无可回收条目时只告警一次(回落到预算内后复位)。
+    budget_warned: bool,
 }
 
 impl TextureStore {
@@ -124,6 +139,12 @@ impl TextureStore {
         (self.decode_us, self.decode_bytes)
     }
     pub fn new(source: Box<dyn DataSource>, codec: Codec, probe_order: Vec<ImageFormat>) -> Self {
+        // 默认 512MiB:足够覆盖常见立绘/背景工作集,同时避免长会话无限增长。
+        // `YURIS_ASSET_CACHE_MB=0` 关闭预算(取证/对照用)。
+        let mb = std::env::var("YURIS_ASSET_CACHE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(512);
         Self {
             source,
             codec,
@@ -134,19 +155,125 @@ impl TextureStore {
             decoded: 0,
             decode_us: 0,
             decode_bytes: 0,
+            budget_bytes: mb.saturating_mul(1024 * 1024),
+            resident_bytes: 0,
+            clock: 0,
+            meta: BTreeMap::new(),
+            fresh: std::collections::BTreeSet::new(),
+            evicted: 0,
+            budget_warned: false,
+        }
+    }
+
+    /// 覆盖缓存预算(字节;0 = 不限制)。测试/宿主诊断用。
+    pub fn set_budget_bytes(&mut self, bytes: usize) {
+        self.budget_bytes = bytes;
+        self.enforce_budget(false);
+    }
+
+    /// 当前缓存像素字节。
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    /// 已回收的无引用条目数。
+    #[must_use]
+    pub fn evicted_count(&self) -> u64 {
+        self.evicted
+    }
+
+    fn insert_cached(&mut self, key: Vec<u8>, cached: Cached) {
+        self.clock = self.clock.wrapping_add(1);
+        let bytes = cached
+            .result
+            .as_ref()
+            .map(|texture| texture.rgba.len())
+            .unwrap_or(0);
+        if self.cache.insert(key.clone(), cached).is_some() {
+            if let Some((old_bytes, _)) = self.meta.remove(&key) {
+                self.resident_bytes = self.resident_bytes.saturating_sub(old_bytes);
+            }
+        }
+        self.meta.insert(key.clone(), (bytes, self.clock));
+        self.resident_bytes = self.resident_bytes.saturating_add(bytes);
+        self.fresh.insert(key);
+        // 不在插入时回收:一次 `preload_parallel` 批量里,后面的 key 会把
+        // 同批尚未被图层引用的前序资产当场踢掉(→渲染时重新解码)。
+        // 预算在帧边界统一执行(`begin_frame` / `set_budget_bytes`)。
+    }
+
+    /// 超预算时按 LRU 回收**只有缓存引用**的条目(`Rc::strong_count == 1`)。
+    /// 仍在图层/快照里的纹理跳过;`skip_fresh` = 本帧新插入的条目也跳过
+    /// (预热/本帧刚解析的资产必须活到渲染结束)。实在没有可回收的就保持
+    /// 超预算并留痕。
+    fn enforce_budget(&mut self, skip_fresh: bool) {
+        if self.budget_bytes == 0 {
+            return;
+        }
+        if self.resident_bytes <= self.budget_bytes {
+            self.budget_warned = false;
+            return;
+        }
+        while self.resident_bytes > self.budget_bytes {
+            let victim = self
+                .meta
+                .iter()
+                .filter(|(_, (bytes, _))| *bytes > 0)
+                .filter(|(key, _)| !(skip_fresh && self.fresh.contains(*key)))
+                .filter(|(key, _)| {
+                    self.cache
+                        .get(key.as_slice())
+                        .and_then(|entry| entry.result.as_ref().ok())
+                        .is_some_and(|texture| std::rc::Rc::strong_count(texture) == 1)
+                })
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone());
+            let Some(key) = victim else {
+                if !self.budget_warned {
+                    self.budget_warned = true;
+                    log::warn!(
+                        target: "yu-render",
+                        "[asset] cache over budget ({}B > {}B); live surfaces still reference the remainder",
+                        self.resident_bytes,
+                        self.budget_bytes
+                    );
+                }
+                break;
+            };
+            self.cache.remove(&key);
+            self.fresh.remove(&key);
+            if let Some((bytes, _)) = self.meta.remove(&key) {
+                self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
+                self.evicted += 1;
+                if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
+                    log::debug!(
+                        target: "yu-render",
+                        "[asset] evicted cached asset {} ({}B)",
+                        display_bytes(&key),
+                        bytes
+                    );
+                }
+            }
         }
     }
 
     /// 开始新一帧:清空本帧问题清单与解码计时(缓存保留)。
+    ///
+    /// 缓存预算在这里统一执行:上一帧新插入/被引用的纹理全部豁免,只清掉
+    /// 之前帧里已无引用的旧资产;预热批次因此不会被自我驱逐。
     pub fn begin_frame(&mut self) {
         self.issues.clear();
         self.decode_us = 0;
         self.decode_bytes = 0;
+        self.enforce_budget(true);
+        self.fresh.clear();
     }
 
     /// 解析一个资产 key。成功返回缓存中的纹理;失败返回 `asset.*` [`Diag`]。
     pub fn resolve(&mut self, key: &[u8]) -> Result<&Texture, Diag> {
         self.ensure(key)?;
+        self.touch(key);
         let entry = self.cache.get(key).expect("cache entry inserted above");
         match &entry.result {
             Ok(tex) => Ok(tex.as_ref()),
@@ -169,6 +296,7 @@ impl TextureStore {
     /// 整张资产 `rgba.clone()` 到新 `Rc`,一条 2048² 的部件每帧被复制几十次。
     pub fn resolve_shared(&mut self, key: &[u8]) -> Result<std::rc::Rc<Texture>, Diag> {
         self.ensure(key)?;
+        self.touch(key);
         let entry = self.cache.get(key).expect("cache entry inserted above");
         match &entry.result {
             Ok(tex) => Ok(std::rc::Rc::clone(tex)),
@@ -189,9 +317,17 @@ impl TextureStore {
     fn ensure(&mut self, key: &[u8]) -> Result<(), Diag> {
         if !self.cache.contains_key(key) {
             let cached = self.load(key);
-            self.cache.insert(key.to_vec(), cached);
+            self.insert_cached(key.to_vec(), cached);
         }
         Ok(())
+    }
+
+    /// 记录一次缓存访问(LRU 预算用)。
+    fn touch(&mut self, key: &[u8]) {
+        self.clock = self.clock.wrapping_add(1);
+        if let Some((_, used)) = self.meta.get_mut(key) {
+            *used = self.clock;
+        }
     }
 
     /// 解析 [`TextureRef`]。`Offscreen/Snapshot/None` 不归本模块物化。
@@ -239,22 +375,34 @@ impl TextureStore {
     fn load(&mut self, key: &[u8]) -> Cached {
         let started = std::time::Instant::now();
         let cached = self.load_inner(key);
-        self.decode_us = self
-            .decode_us
-            .saturating_add(started.elapsed().as_micros() as u64);
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        self.decode_us = self.decode_us.saturating_add(elapsed_us);
         if let Ok(texture) = &cached.result {
             self.decode_bytes = self.decode_bytes.saturating_add(texture.rgba.len() as u64);
+            if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
+                log::warn!(
+                    target: "yu-render",
+                    "[asset] key={} size={}x{} bytes={} decode={}us",
+                    display_bytes(key),
+                    texture.width,
+                    texture.height,
+                    texture.rgba.len(),
+                    elapsed_us
+                );
+            }
         }
         cached
     }
 
-    fn load_inner(&mut self, key: &[u8]) -> Cached {
+    /// 读包内字节（不做图像解码）。返回 `(命中候选, 原始字节)`；失败时
+    /// 返回可直接入缓存的 `Cached`（与 `load_inner` 同诊断）。
+    fn read_source(&mut self, key: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Cached> {
         let candidates = self.candidates(key);
         for (candidate, format) in candidates {
             let lookup = match LookupKey::new(&candidate, self.codec) {
                 Ok(lookup) => lookup,
                 Err(diag) => {
-                    return Cached {
+                    return Err(Cached {
                         resolved: None,
                         result: Err(unimplemented(
                             code::MISSING,
@@ -265,7 +413,7 @@ impl TextureStore {
                                 diag.detail
                             ),
                         )),
-                    };
+                    });
                 }
             };
             if !self.source.exists(&lookup) {
@@ -273,7 +421,7 @@ impl TextureStore {
             }
             if let Some(format) = format {
                 if format == ImageFormat::Psb || matches!(format, ImageFormat::Other(_)) {
-                    return Cached {
+                    return Err(Cached {
                         resolved: Some(candidate.clone()),
                         result: Err(unimplemented(
                             code::UNSUPPORTED,
@@ -284,13 +432,13 @@ impl TextureStore {
                                 format.as_str()
                             ),
                         )),
-                    };
+                    });
                 }
             }
             let bytes = match self.source.open(&lookup) {
                 Ok(bytes) => bytes,
                 Err(diag) => {
-                    return Cached {
+                    return Err(Cached {
                         resolved: Some(candidate.clone()),
                         result: Err(Diag::recoverable(code::MISSING, Boundary::Data)
                             .at_data(candidate.clone(), 0)
@@ -299,15 +447,124 @@ impl TextureStore {
                                 display_bytes(&candidate),
                                 diag.detail
                             ))),
-                    };
+                    });
                 }
             };
-            return match image::load_from_memory(&bytes) {
-                Ok(img) => {
+            return Ok((candidate, bytes));
+        }
+        let tried = self.candidates(key).len();
+        Err(Cached {
+            resolved: None,
+            result: Err(Diag::recoverable(code::MISSING, Boundary::Data)
+                .at_data(key.to_vec(), 0)
+                .with_detail(format!(
+                    "资产 {} 不存在;已尝试 {tried} 个候选",
+                    display_bytes(key)
+                ))),
+        })
+    }
+
+    fn load_inner(&mut self, key: &[u8]) -> Cached {
+        let (candidate, bytes) = match self.read_source(key) {
+            Ok(value) => value,
+            Err(cached) => return cached,
+        };
+        let decoded = image::load_from_memory(&bytes);
+        match decoded {
+            Ok(img) => {
+                self.decoded += 1;
+                Cached {
+                    resolved: Some(candidate),
+                    result: Ok(std::rc::Rc::new(Texture::from_rgba8(img.into_rgba8()))),
+                }
+            }
+            Err(err) => Cached {
+                resolved: Some(candidate.clone()),
+                result: Err(Diag::recoverable(code::DECODE, Boundary::Data)
+                    .at_data(candidate.clone(), 0)
+                    .with_detail(format!(
+                        "命中 {} 但解码失败: {err}",
+                        display_bytes(&candidate)
+                    ))),
+            },
+        }
+    }
+
+    /// 并行预热一批尚未缓存的资产：顺序读包 + 多线程图像解码，最后按输入
+    /// 顺序写回缓存。互不依赖的资产解码可并行；帧边界/插入顺序不变。
+    ///
+    /// 官方 `CG[FILE]` 在命令处理体内同步装载；这里只缩小同一命令批次的
+    /// 墙钟，不改变“命令所在帧完成”的语义。
+    pub fn preload_parallel(&mut self, keys: &[Vec<u8>]) {
+        let mut jobs = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for key in keys {
+            if self.cache.contains_key(key) || !seen.insert(key.clone()) {
+                continue;
+            }
+            match self.read_source(key) {
+                Ok((candidate, bytes)) => jobs.push((key.clone(), candidate, bytes)),
+                Err(cached) => {
+                    self.insert_cached(key.clone(), cached);
+                }
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        // 官方线程只有软件合成池 + 影片播放(REA 0.495 `0x463f50` / `0x422268`),
+        // 资源解码是命令内单线程;这里的并行是登记分歧(DIV-GFX-067)。
+        // 留一核给主线程/音频,上限 4;结果按输入序写回,像素与串行一致。
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1))
+            .unwrap_or(3)
+            .clamp(1, 4)
+            .min(jobs.len());
+        let chunk = jobs.len().div_ceil(workers);
+        let decoded: Vec<(usize, Result<Texture, String>)> = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (base, part) in jobs.chunks(chunk).enumerate() {
+                handles.push(scope.spawn(move || {
+                    part.iter()
+                        .enumerate()
+                        .map(|(offset, (_, _, bytes))| {
+                            let result = std::panic::catch_unwind(|| {
+                                image::load_from_memory(bytes)
+                                    .map(|img| Texture::from_rgba8(img.into_rgba8()))
+                                    .map_err(|err| err.to_string())
+                            })
+                            .unwrap_or_else(|_| Err("PNG 解码线程 panic".to_string()));
+                            (base * chunk + offset, result)
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            handles
+                .into_iter()
+                .flat_map(|handle| match handle.join() {
+                    Ok(rows) => rows,
+                    Err(_) => {
+                        log::error!(
+                            target: "yu-render",
+                            "[asset] preload worker panic; affected assets fall back to lazy decode"
+                        );
+                        Vec::new()
+                    }
+                })
+                .collect()
+        });
+        let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.decode_us = self.decode_us.saturating_add(elapsed_us);
+        for (index, result) in decoded {
+            let (key, candidate, _) = &jobs[index];
+            let cached = match result {
+                Ok(texture) => {
                     self.decoded += 1;
+                    self.decode_bytes = self.decode_bytes.saturating_add(texture.rgba.len() as u64);
                     Cached {
-                        resolved: Some(candidate),
-                        result: Ok(std::rc::Rc::new(Texture::from_rgba8(img.to_rgba8()))),
+                        resolved: Some(candidate.clone()),
+                        result: Ok(std::rc::Rc::new(texture)),
                     }
                 }
                 Err(err) => Cached {
@@ -316,21 +573,11 @@ impl TextureStore {
                         .at_data(candidate.clone(), 0)
                         .with_detail(format!(
                             "命中 {} 但解码失败: {err}",
-                            display_bytes(&candidate)
+                            display_bytes(candidate)
                         ))),
                 },
             };
-        }
-        // 探测顺序本身可能为空(工程 yscfg 全 0):最后尝试原 key。
-        let tried = self.candidates(key).len();
-        Cached {
-            resolved: None,
-            result: Err(Diag::recoverable(code::MISSING, Boundary::Data)
-                .at_data(key.to_vec(), 0)
-                .with_detail(format!(
-                    "资产 {} 不存在;已尝试 {tried} 个候选",
-                    display_bytes(key)
-                ))),
+            self.insert_cached(key.clone(), cached);
         }
     }
 
@@ -451,6 +698,15 @@ mod tests {
         out
     }
 
+    fn png_solid(rgba: [u8; 4]) -> Vec<u8> {
+        let img = RgbaImage::from_pixel(2, 1, Rgba(rgba));
+        let mut out = Vec::new();
+        PngEncoder::new(&mut out)
+            .write_image(img.as_raw(), 2, 1, ExtendedColorType::Rgba8)
+            .expect("encode fixture png");
+        out
+    }
+
     fn store(files: &[(&[u8], Vec<u8>)], order: Vec<ImageFormat>) -> TextureStore {
         let mut source = MemSource::new(Codec::Cp932);
         for (path, bytes) in files {
@@ -526,6 +782,112 @@ mod tests {
             key.extend_from_slice(b".png");
             assert!(has_extension(&key, Codec::Cp932), "lead={lead:#04x}");
         }
+    }
+
+    #[test]
+    fn parallel_preload_matches_sequential_and_caches() {
+        let files = [
+            (b"a/img.png".as_slice(), png_solid([1, 2, 3, 255])),
+            (b"b/img.png".as_slice(), png_solid([4, 5, 6, 255])),
+            (b"c/img.png".as_slice(), png_solid([7, 8, 9, 255])),
+        ];
+        let keys = vec![
+            b"a/img".to_vec(),
+            b"a/img".to_vec(),
+            b"b/img".to_vec(),
+            b"c/img".to_vec(),
+            b"missing".to_vec(),
+        ];
+        let unique = [b"a/img".as_slice(), b"b/img", b"c/img"];
+
+        // 基准:逐个 `resolve`(串行、按 key 独立解码)。
+        let mut sequential = store(&files, vec![ImageFormat::Png]);
+        for key in unique {
+            sequential.resolve(key).expect("sequential");
+        }
+        let missing = sequential.resolve(b"missing").expect_err("missing").code;
+
+        let mut parallel = store(&files, vec![ImageFormat::Png]);
+        parallel.preload_parallel(&keys);
+        assert_eq!(parallel.decoded_count(), 3);
+
+        for key in unique {
+            let want = sequential.resolve(key).expect("sequential");
+            let got = parallel.resolve(key).expect("preloaded");
+            assert_eq!(
+                (got.width, got.height, got.rgba.as_slice()),
+                (want.width, want.height, want.rgba.as_slice()),
+                "并行结果必须与串行逐字节一致: {}",
+                String::from_utf8_lossy(key)
+            );
+            assert_eq!(parallel.resolved_path(key), sequential.resolved_path(key));
+        }
+        assert_eq!(
+            parallel.resolve(b"missing").expect_err("missing").code,
+            missing
+        );
+
+        // 重复预热不得重解码(已在缓存中的 key 直接跳过)。
+        parallel.preload_parallel(&keys);
+        assert_eq!(parallel.decoded_count(), 3);
+    }
+
+    #[test]
+    fn cache_budget_evicts_only_unreferenced() {
+        let mut store = store(
+            &[
+                (b"a/img.png", png_solid([1, 2, 3, 255])),
+                (b"b/img.png", png_solid([4, 5, 6, 255])),
+            ],
+            vec![ImageFormat::Png],
+        );
+        // 每张 2×1 RGBA = 8B;预算 = 一张。
+        store.set_budget_bytes(8);
+        let held = store.resolve_shared(b"a/img").expect("a");
+        store.resolve(b"b/img").expect("b");
+        assert_eq!(store.resident_bytes(), 16, "插入阶段不回收(允许本帧暂时超额)");
+        assert_eq!(
+            store.resolved_path(b"a/img"),
+            Some(b"a/img.png".as_slice()),
+            "图层/快照仍持有的纹理不得回收"
+        );
+
+        drop(held);
+        store.set_budget_bytes(8);
+        assert!(
+            store.resolved_path(b"a/img").is_none(),
+            "无外部引用后应被预算回收"
+        );
+        assert_eq!(store.resolved_path(b"b/img"), Some(b"b/img.png".as_slice()));
+        assert_eq!(store.evicted_count(), 1);
+        assert_eq!(store.resident_bytes(), 8);
+    }
+
+    #[test]
+    fn preload_batch_survives_budget_until_next_frame() {
+        let mut store = store(
+            &[
+                (b"a/img.png", png_solid([1, 2, 3, 255])),
+                (b"b/img.png", png_solid([4, 5, 6, 255])),
+            ],
+            vec![ImageFormat::Png],
+        );
+        store.set_budget_bytes(8);
+        store.preload_parallel(&[b"a/img".to_vec(), b"b/img".to_vec()]);
+        assert_eq!(store.resident_bytes(), 16, "预热允许本帧暂时超额");
+
+        // 预热发生在渲染前:本帧 begin_frame 必须豁免刚插入的条目,
+        // 否则渲染首用会重新解码。
+        store.begin_frame();
+        assert!(store.resolved_path(b"a/img").is_some());
+        assert!(store.resolved_path(b"b/img").is_some());
+        assert_eq!(store.resident_bytes(), 16);
+
+        // 下一帧仍无引用 ⇒ 按 LRU 回收旧条目。
+        store.begin_frame();
+        assert!(store.resolved_path(b"a/img").is_none());
+        assert_eq!(store.resolved_path(b"b/img"), Some(b"b/img.png".as_slice()));
+        assert_eq!(store.resident_bytes(), 8);
     }
 
     #[test]

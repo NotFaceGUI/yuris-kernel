@@ -323,7 +323,7 @@ impl Vm {
                     .unwrap_or_default()
             })
             .unwrap_or_default();
-        let mut args = Vec::new();
+        let mut args = Vec::with_capacity(cmd.windows.len());
         // 参数增量标志在窗口 +2 的 u16 高字节(`slot`):官方参数序言把
         // `pbVar10[3]` 存进 `0x6835a0[i]`,低字节存进 `0x6830c0[i]` 当
         // 求值器 subtype。语料实测:`CG[… X=…]` 的 slot=1,
@@ -741,7 +741,7 @@ impl Vm {
             )
             .into());
         }
-        self.emit(VmEvent::Jump {
+        self.emit_flow(VmEvent::Jump {
             frame: self.frame(),
             script: st.script_id,
             pc: cmd.pc,
@@ -789,7 +789,7 @@ impl Vm {
         }
         let next = cmd.windows[1].rec.length;
         let to = if next != 0 { next } else { top.end_pc };
-        self.emit(VmEvent::Jump {
+        self.emit_flow(VmEvent::Jump {
             frame: self.frame(),
             script: st.script_id,
             pc: cmd.pc,
@@ -806,7 +806,7 @@ impl Vm {
         let top = *st.if_stack.last().ok_or_else(|| {
             diag::fatal(code::rt::CMD_WINDOWS, Boundary::Script, "IFBLEND 无配对 IF")
         })?;
-        self.emit(VmEvent::Jump {
+        self.emit_flow(VmEvent::Jump {
             frame: self.frame(),
             script: st.script_id,
             pc: cmd.pc,
@@ -884,7 +884,7 @@ impl Vm {
             st.if_stack.truncate(keep + 1);
         }
         st.base_a = base;
-        self.emit(VmEvent::Jump {
+        self.emit_flow(VmEvent::Jump {
             frame: self.frame(),
             script: st.script_id,
             pc: cmd.pc,
@@ -962,7 +962,7 @@ impl Vm {
             }
             // `_LC` 必须读到新值;引擎 LOOPEND 先 +1 再回跳。
             st.base_a = top.base_a;
-            self.emit(VmEvent::Jump {
+            self.emit_flow(VmEvent::Jump {
                 frame: self.frame(),
                 script: st.script_id,
                 pc: cmd.pc,
@@ -1026,7 +1026,7 @@ impl Vm {
             st.if_stack.truncate(target.if_depth);
         }
         st.base_a = target.base_a;
-        self.emit(VmEvent::Jump {
+        self.emit_flow(VmEvent::Jump {
             frame: self.frame(),
             script: st.script_id,
             pc: cmd.pc,
@@ -4863,7 +4863,7 @@ impl Vm {
             )
             .into());
         }
-        self.emit(VmEvent::Jump {
+        self.emit_flow(VmEvent::Jump {
             frame: self.frame(),
             script: st.script_id,
             pc: from_pc,

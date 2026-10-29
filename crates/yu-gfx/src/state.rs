@@ -214,6 +214,11 @@ pub struct GfxState {
     snapshot_files: BTreeMap<CopyId, Vec<u8>>,
     /// 当前光标逻辑坐标(`CGINFO[ONMOUSE*]` 的缺省查询点;VM 每帧推入)。
     pointer: (i64, i64),
+    /// `CG[FILE]` 在命令时刻登记、等待宿主预热的资产 key(官方在 CG
+    /// 处理体内同步装载纹理;gfx 不做 I/O,由引擎在同一 tick 末尾解码/上传)。
+    preload_pending: BTreeSet<Vec<u8>>,
+    /// 已经交给宿主预热的 key,避免每帧重复登记。
+    preloaded: BTreeSet<Vec<u8>>,
 }
 
 /// [`GfxState::text_state`] 的返回视图(字节 / `_TEXT_FLAG` / 样式 / 原点)。
@@ -304,6 +309,8 @@ impl GfxState {
             font_families: Vec::new(),
             snapshot_sizes: BTreeMap::new(),
             snapshot_files: BTreeMap::new(),
+            preload_pending: BTreeSet::new(),
+            preloaded: BTreeSet::new(),
             pointer: (0, 0),
         };
         s.ensure_w0();
@@ -1495,12 +1502,11 @@ impl GfxState {
             );
             return;
         };
+        let mut file_diags = Vec::new();
+        let file = take_file(&params, &mut file_diags);
         let trailing = id.ends_with(b"/");
         let parsed = path::normalize(&id, idno, trailing);
         let is_dir = parsed.is_dir;
-
-        let mut file_diags = Vec::new();
-        let file = take_file(&params, &mut file_diags);
         for d in file_diags {
             self.push_diag("CG", d);
         }
@@ -1551,6 +1557,15 @@ impl GfxState {
                 ),
             );
             return;
+        }
+
+        // 官方 `CG[FILE]` 在命令处理体内同步装载纹理;gfx 不做 I/O,这里在
+        // **确认该层会采用 FILE 之后**登记,由引擎在本 tick 末尾预热。
+        // 图层组/类型冲突分支已在上面返回,不会预热未使用的资产。
+        if let Some(TextureRef::Asset(key)) = &file {
+            if !key.is_empty() && self.preloaded.insert(key.clone()) {
+                self.preload_pending.insert(key.clone());
+            }
         }
 
         if existing.is_none() {
@@ -2784,6 +2799,13 @@ impl GfxState {
                 value: r.value.clone(),
                 offset: r.offset,
             })
+            .collect()
+    }
+
+    /// 取走本 tick 新登记的 `CG[FILE]` 资产 key(引擎在 tick 末尾预热)。
+    pub fn take_preloads(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.preload_pending)
+            .into_iter()
             .collect()
     }
 

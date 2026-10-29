@@ -369,7 +369,7 @@ impl<'a> Evaluator<'a> {
                     Slot::Ref(r) => *r,
                     Slot::Val(_) => unreachable!(),
                 };
-                let mut indices = Vec::new();
+                let mut indices = smallvec::SmallVec::<[i64; 4]>::new();
                 for slot in stack.iter().skip(at + 1) {
                     match slot {
                         Slot::Val(Value::Int(v)) => indices.push(*v),
@@ -587,6 +587,27 @@ fn read_i64(payload: &[u8]) -> Result<i64, yu_log::Diag> {
             )
         })?;
     Ok(i64::from_le_bytes(b))
+}
+
+/// 单条变量引用窗口(`0x48` 取值 / `0x56`/`0x76` 引用)。
+///
+/// 只认这三种 opcode:3 字节字面量不得被误读成变量载荷。
+pub(crate) fn single_var(instrs: &[RawInstr]) -> Option<VarRef> {
+    let [ins] = instrs else { return None };
+    if !matches!(ins.op, 0x48 | 0x56 | 0x76) {
+        return None;
+    }
+    var_of(ins)
+}
+
+/// 单条**取值**变量窗口(`0x48`)。与 [`single_var`] 分开:引用窗口
+/// (`0x56`/`0x76`)在参数记录时按旧行为求值失败、不产生 arg。
+pub(crate) fn single_value_var(instrs: &[RawInstr]) -> Option<VarRef> {
+    let [ins] = instrs else { return None };
+    if ins.op != 0x48 {
+        return None;
+    }
+    var_of(ins)
 }
 
 fn var_of(ins: &RawInstr) -> Option<VarRef> {

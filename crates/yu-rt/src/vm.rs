@@ -168,6 +168,10 @@ pub struct BootConfig {
     /// 事件流记录开关(默认开;golden/测试/对拍依赖完整事件流)。嵌入宿主
     /// 跑真实游戏时可关:`Command` 事件的窗口预求值是分派热路径的最大开销
     /// (每个窗口求值两遍)。关闭时 `Diag` 事件与挂号计数照常产出。
+    ///
+    /// 关闭时还跳过 `Jump`(IF/ELSE/LOOP/LOOPEND 控制流)与 Graphics/Window
+    /// `DomainCall` 的入队:前者是场景构建帧的数十万条纯诊断事件,后者已由
+    /// 同步图形宿主在命令时刻消费;两者都不影响脚本/画面语义。
     pub record_events: bool,
 }
 
@@ -534,11 +538,9 @@ pub struct Vm {
     events_dropped: u64,
     /// 当前正在执行的命令位置(诊断定位用;任务书 E R11)。
     /// `report()` 在 `Diag.where_ == Loc::None` 时补进 `Loc::Script`。
-    /// 命令名不逐条拷贝:保留 `Rc<Cmd>`(取指缓存本来就有这个 Rc),
-    /// 只有真正构造 Diag 时才取 `name`。
+    /// 命令名按 `(cur_script, cur_pc)` 从取指缓存惰性取,不逐条克隆 Rc。
     cur_script: u32,
     cur_pc: u32,
-    cur_cmd: Option<Rc<Cmd>>,
     cur_task: String,
     /// `cur_task` 对应的调度器序号(序号不变就不重写字符串)。
     cur_task_seq: u64,
@@ -736,7 +738,6 @@ impl Vm {
             events_dropped: 0,
             cur_script: script_id,
             cur_pc: pc,
-            cur_cmd: None,
             cur_task: MAIN_TASK_ID.to_string(),
             cur_task_seq: u64::MAX,
             task_view: Vec::new(),
@@ -1612,6 +1613,18 @@ impl Vm {
         });
     }
 
+    /// 控制流事件(`Jump`):只在事件流开启时入队。
+    ///
+    /// `record_events=false` 时引擎只统计事件条数,不读取 `Jump`;而场景
+    /// 构建帧的 LOOPEND/IF/ELSE 可达数十万条,逐条入队 + 队满裁剪是 tick
+    /// 尖峰的主要来源。图形/声音/存档宿主同步路径与 `Jump` 无关,跳过不改变
+    /// 可观测语义。
+    pub(crate) fn emit_flow(&mut self, ev: VmEvent) {
+        if self.record_events {
+            self.emit(ev);
+        }
+    }
+
     pub(crate) fn emit(&mut self, ev: VmEvent) {
         // 图形宿主必须**同步**看到状态事件:同一帧 `CG[...]` 之后的 `CGINFO`
         // 才能读到最新图层。仅转发宿主关心的类别,避免 Command 热路径开销。
@@ -1625,10 +1638,29 @@ impl Vm {
                     ..
                 }
         );
+        let mut consumed_by_host = false;
         if graphics_relevant {
             if let Some(host) = self.graphics_host.as_mut() {
                 host.apply_event(&ev);
+                // 只有同步宿主确实消费过,才能安全跳过入队;没有宿主的
+                // 测试/探针仍依赖 `drain_events` 驱动 `GfxState`。
+                consumed_by_host = true;
             }
+        }
+        // 图形/窗口域事件已由同步宿主在命令时刻消费;`record_events=false`
+        // 时事件队列只被引擎统计后丢弃,不再入队(场景构建帧可达数万条)。
+        // Text/FrameStart/FrameEnd 不在此列:它们仍可能被事件流消费者读取。
+        if !self.record_events
+            && consumed_by_host
+            && matches!(
+                &ev,
+                VmEvent::DomainCall {
+                    domain: crate::event::Domain::Graphics | crate::event::Domain::Window,
+                    ..
+                }
+            )
+        {
+            return;
         }
         let sound_relevant = matches!(
             &ev,
@@ -1692,6 +1724,17 @@ impl Vm {
         self.emit_diag(d);
     }
 
+    /// 当前命令(诊断用):按执行位从取指缓存取,不持有额外 `Rc`。
+    fn current_cmd(&self) -> Option<Rc<Cmd>> {
+        let script = self.cur_script as usize;
+        let pc = self.cur_pc as usize;
+        self.cmd_cache
+            .get(script)
+            .and_then(|list| list.get(pc))
+            .and_then(Option::as_ref)
+            .map(Rc::clone)
+    }
+
     /// 给诊断补脚本位置(仅当调用点没给 `Loc`)。
     pub(crate) fn locate(&self, d: Diag) -> Diag {
         if !matches!(d.where_, yu_log::Loc::None) {
@@ -1699,7 +1742,7 @@ impl Vm {
         }
         let file = self.script_name(self.cur_script);
         let task = (!self.cur_task.is_empty()).then(|| self.cur_task.clone());
-        let cmd = self.cur_cmd.as_ref().map(|cmd| cmd.name.clone());
+        let cmd = self.current_cmd().map(|cmd| cmd.name.clone());
         diag::at_script_task(d, file, task, self.cur_pc, cmd)
     }
 
@@ -1925,6 +1968,10 @@ impl Vm {
             Some(instrs) => Rc::clone(instrs),
             None => self.decoded_window(&w.payload)?,
         };
+        if let Some(var) = crate::expr::single_value_var(&instrs) {
+            let mut access = VmAccess { vm: self, st };
+            return access.read(var, &[]);
+        }
         let mut stack = std::mem::take(&mut self.eval_scratch);
         let mut access = VmAccess { vm: self, st };
         let r = Evaluator::new(&mut access).eval_value_instrs(&instrs, &mut stack);
@@ -1942,6 +1989,12 @@ impl Vm {
             Some(instrs) => Rc::clone(instrs),
             None => self.decoded_window(&w.payload)?,
         };
+        if let Some(var) = crate::expr::single_var(&instrs) {
+            return Ok(crate::expr::LValue {
+                var,
+                indices: smallvec::SmallVec::new(),
+            });
+        }
         let mut stack = std::mem::take(&mut self.eval_scratch);
         let mut access = VmAccess { vm: self, st };
         let r = Evaluator::new(&mut access).eval_lvalue_instrs_with(&instrs, &mut stack);
@@ -2170,8 +2223,7 @@ impl TaskExecutor for Vm {
                 );
                 if matches!(d.severity, yu_log::Severity::Unimplemented) {
                     let name = self
-                        .cur_cmd
-                        .as_ref()
+                        .current_cmd()
                         .map(|cmd| cmd.name.clone())
                         .unwrap_or_default();
                     self.note_unimplemented(&name);
@@ -2263,7 +2315,6 @@ impl Vm {
         // (取指缓存已有),不逐条复制字符串;任务名只在任务切换时重写。
         self.cur_script = st.script_id;
         self.cur_pc = cmd.pc;
-        self.cur_cmd = Some(Rc::clone(&cmd));
         if self.cur_task_seq != task.seq {
             self.cur_task_seq = task.seq;
             self.cur_task.clear();

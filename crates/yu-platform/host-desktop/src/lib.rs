@@ -1606,12 +1606,15 @@ impl App {
         let mut line = format!(
             "[spike] host={} engine={} interval={interval_ms:.1}ms work={work_ms:.1}ms \
              tick={tick_ms:.1}ms render={render_ms:.1}ms draw={draw_ms:.1}ms \
-             capture={capture_ms:.1}ms frame_build={frame_build_ms:.1}ms \
+             capture={capture_ms:.1}ms frame_build={frame_build_ms:.1}ms preload={:.1}ms/{} preload_err={} \
              sdecode={:.1}ms sstream={:.1}ms sdecodes={} sframes={} sunder={} sseeks={} sslow={} \
              clock={}ms lag={}ms \
              ops={total_ops} layers={} visible={} passes={} drawn={} skipped={}",
             self.frames,
             report.frame,
+            self.engine.preload_ms(),
+            self.engine.preload_counts().0,
+            self.engine.preload_counts().1,
             report.sound_decode_ms,
             report.sound_stream_ms,
             report.sound_decodes,

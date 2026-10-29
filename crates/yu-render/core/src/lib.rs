@@ -28,6 +28,14 @@ pub use cache::{ImageCacheKey, ImageOpSig, ImageSource, SizeKey, SizeSource};
 pub use report::{RenderPhases, RenderReport, SkippedOp};
 pub use scale::scale_region;
 pub use surface::{blit, blit_rgba, Surface};
+
+/// 快照像素的按需来源(SAVE[ID] 命令时刻读回上一帧快照)。
+///
+/// 由后端实现;引擎把它注入 `GfxCapture`。不提供 `refresh` 等方法,
+/// 后端可在内部维护快照句柄表。
+pub trait SnapshotSource {
+    fn read(&mut self, id: yu_gfx::CopyId) -> Option<Surface>;
+}
 pub use text::{
     content_hash_rgba, text_base_key, texture_content_hash, ComposedLayer, GlyphPlacement,
     TextComposer, TextPaintStats,

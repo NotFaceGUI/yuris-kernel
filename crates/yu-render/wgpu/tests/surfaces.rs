@@ -839,3 +839,56 @@ fn copy_from_scaled_layer_materializes_before_blit() {
         "采样源 COPY 的落点必须与 soft 一致"
     );
 }
+
+/// `SnapshotSource` 在渲染 + 注册表刷新后必须能读回快照(存档抓帧的
+/// `SAVE[ID]` 路径)。这是 wgpu 懒读回的核心契约:没有镜像,只有注册表。
+#[test]
+fn snapshot_source_reads_registry_after_render() {
+    let table = table();
+    let Some(mut gpu) = renderer_or_skip(store(&[(
+        b"base.png",
+        png_bytes_for(8, 8, Rgba([20, 40, 60, 255])),
+    )])) else {
+        return;
+    };
+    let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"SRC".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"base".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"SRC".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"DST".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let copy_id = frame
+        .passes
+        .iter()
+        .flat_map(|pass| pass.ops.iter())
+        .find_map(|op| match op {
+            yu_gfx::Op::Copy(copy) => Some(copy.id),
+            _ => None,
+        })
+        .expect("COPY2 快照");
+    gpu.render_frame(&frame).expect("render");
+    gpu.refresh_snapshot_registry();
+
+    let mut source = gpu.snapshot_source();
+    let surface = yu_render_core::SnapshotSource::read(&mut *source, copy_id)
+        .expect("注册表必须能读到刚渲染的快照");
+    assert_eq!((surface.width, surface.height), (8, 8));
+    assert_eq!(pixel_of(&surface, 0, 0), [20, 40, 60, 255]);
+}

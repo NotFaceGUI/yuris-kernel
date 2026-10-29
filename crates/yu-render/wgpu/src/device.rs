@@ -82,6 +82,7 @@ impl AdapterSummary {
 }
 
 /// 已初始化的 GPU 上下文。
+#[derive(Clone)]
 pub struct GpuContext {
     /// Instance 必须比由它创建的 adapter/device 活得久。
     pub instance: wgpu::Instance,

@@ -505,7 +505,6 @@ pub fn linear_offset_for(
     dims: &[usize],
     indices: &[i64],
 ) -> Result<usize, yu_log::Diag> {
-    let who = var.map(|v| format!("{} ", v.display())).unwrap_or_default();
     if indices.len() != dims.len() {
         return Err(diag::fatal(
             code::rt::VAR_SHAPE,
@@ -523,6 +522,7 @@ pub fn linear_offset_for(
             // 负下标的引擎行为未取证(引擎判据只写 `index > dims-1` 越界)。
             // 商业语料实测出现 `-1`(常见于「空数组读末元素」)。
             // 按军规:挂号 + 该次访问作废,不猜内存越界读(DIV-RT-002)。
+            let who = var.map(|v| format!("{} ", v.display())).unwrap_or_default(); // 缺省:仅错误文案前缀
             return Err(diag::unimplemented(
                 code::rt::VAR_SHAPE,
                 Boundary::Script,
@@ -537,6 +537,7 @@ pub fn linear_offset_for(
             // 是否中止脚本未取证;商业语料实测存在越界访问(常见于
             // 「先声明 1 长度数组、再按运行期长度用」)。按军规:
             // 挂号 + 该次访问作废,不越界读写内存(DIV-RT-002)。
+            let who = var.map(|v| format!("{} ", v.display())).unwrap_or_default(); // 缺省:仅错误文案前缀
             return Err(diag::unimplemented(
                 code::rt::VAR_SHAPE,
                 Boundary::Script,

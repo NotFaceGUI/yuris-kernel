@@ -23,3 +23,6 @@ yu-rt = { path = "../yu-rt" }
 yu-save = { path = "../yu-save" }
 yu-sound = { path = "../yu-sound" }
 yu-vfs = { path = "../yu-vfs" }
+
+[dev-dependencies]
+yu-format = { path = "../yu-format" }

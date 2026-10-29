@@ -180,7 +180,7 @@ fn silent_fallback_whitelist() -> BTreeMap<&'static str, usize> {
         ("crates/yu-rt/src/sysvar.rs", 15),
         ("crates/yu-rt/src/sysvar_abi.rs", 2),
         ("crates/yu-rt/src/task.rs", 3),
-        ("crates/yu-rt/src/value.rs", 4),
+        ("crates/yu-rt/src/value.rs", 3),
         ("crates/yu-rt/src/vm.rs", 4),
         ("crates/yu-rt/src/ycd.rs", 1),
         ("crates/yu-rt/src/vm/handlers.rs", 101),
