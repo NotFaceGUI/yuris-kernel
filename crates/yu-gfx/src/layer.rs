@@ -722,117 +722,101 @@ pub struct FixedPipelineState {
     pub blend_op: BlendOp,
 }
 
-/// 滤镜/仿射参数(引擎 `FX/FY/FBX/FBY/FRX/FRY/FRZ/FCX/FCY/FEX/FEY/FEZ/FSD/FMD/FQU/FID/F`)。
+/// 图层的仿射/滤镜字段,逐项对应引擎 0.495 图层结构。
 ///
-/// 这些参数在 ERIS 里以 **×100 的整数**出现(例:`FX=@fx*100`、`FBX=10000`、
-/// `FCX=5000`);引擎绘制函数对 `+0x1b0..+0x200` 的字段统一 `/100.0`,
-/// 旋转角再 `×π/180`。**槽位→结构体偏移的逐项绑定尚未取证**(旧线 G1),
-/// 因此本结构只保留原值,不解释哪个参数是缩放/旋转/中心。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum FilterParam {
-    Fx,
-    Fy,
-    Fbx,
-    Fby,
-    Frx,
-    Fry,
-    Frz,
-    Fcx,
-    Fcy,
-    Fex,
-    Fey,
-    Fez,
-    Fsd,
-    Fmd,
-    Fqu,
-    Fid,
-    F,
+/// 绑定证据(REA 0.495 CG 处理体 `0x42a514` 的属性块;槽号 = 命令参数声明下标,
+/// 处理体按 `[0x684160 + 声明下标] → slot → [slot*8 + 0x683740]` 取值):
+///
+/// | 参数 | 写入点 | 字段 | 类型 |
+/// |---|---|---|---|
+/// | `X` | `0x42aa9c` | `+0x1b0` | i64(`X*100`) |
+/// | `FX` | `0x42ab3b` | `+0x1b0` | i64(直写) |
+/// | `Y`/`FY` | `0x42abf0`/`0x42ac82` | `+0x1b8` | i64 |
+/// | `FBX` | `0x42b10f` | `+0x1c0` | i64 |
+/// | `FBY` | `0x42b16f` | `+0x1c8` | i64 |
+/// | `FCX` | `0x42b394` | `+0x1d0` | i64 |
+/// | `FCY` | `0x42b3f4` | `+0x1d8` | i64 |
+/// | `FEX` | `0x42b454` | `+0x1e0` | i64 |
+/// | `FEY` | `0x42b4b4` | `+0x1e8` | i64 |
+/// | `FEZ` | `0x42b514` | `+0x1f0` | i64 |
+/// | `FRX` | `0x42b1ff` | `+0x1f8` | f32 |
+/// | `FRY` | `0x42b296` | `+0x1fc` | f32 |
+/// | `FRZ` | `0x42b32d` | `+0x200` | f32 |
+/// | `FSD` | `0x42a798` | `+0x204` | i32 |
+/// | `FMD` | `0x42b583` | `+0x208` | i32 |
+/// | `FQU` | `0x42b5ac` | `+0x20c` | i8 |
+/// | `F` | `0x42b63a` | `+0x214` | i16 |
+///
+/// 绘制侧(`FUN_00414ba4` 行 117-125)把 `+0x1b0/1b8/1c0/1c8/1d0/1d8` 与
+/// `+0x1f8/1fc/200` 统一 `/100.0`;`+0x1e0/1e8` 在 `0x414031/0x41403b`
+/// 另按 i64 读取。
+///
+/// `X`/`FX`、`Y`/`FY` 两行只说明写入点:位置本身存在 `Transform::x/y`
+/// (像素口径 = 引擎 `+0x68`)。`CG[X=n]` 写 `+0x68=n`、`+0x1b0=n*100`;
+/// `CG[FX=n]` 写 `+0x1b0=n`、`+0x68=n/100`。本结构的其余字段一律存
+/// **引擎 `+0x1xx` 原值**(百分位 / 角度×100 / 位掩码),不做换算。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Affine {
+    /// `FBX`/`FBY`:基准缩放百分位(`+0x1c0`/`+0x1c8`)。
+    pub bx: f64,
+    pub by: f64,
+    /// `FCX`/`FCY`:旋转中心(`+0x1d0`/`+0x1d8`)。
+    pub cx: f64,
+    pub cy: f64,
+    /// `FRX`/`FRY`/`FRZ`:旋转角(度;`+0x1f8/1fc/200`,引擎存 f32)。
+    pub rx: f64,
+    pub ry: f64,
+    pub rz: f64,
+    /// `FEX`/`FEY`/`FEZ`:附加偏移(`+0x1e0/1e8/1f0`)。
+    pub ex: f64,
+    pub ey: f64,
+    pub ez: f64,
+    /// `FSD`:滤镜强度(`+0x204`)。
+    pub sd: i32,
+    /// `FMD`:滤镜模式(`+0x208`)。
+    pub md: i32,
+    /// `FQU`:滤镜质量(`+0x20c`,引擎按有符号字节存取)。
+    pub qu: i8,
+    /// `F`:滤镜开关位(`+0x214`,引擎按有符号字存取)。
+    pub flags: i16,
 }
 
-impl FilterParam {
-    pub const ALL: [FilterParam; 17] = [
-        FilterParam::Fx,
-        FilterParam::Fy,
-        FilterParam::Fbx,
-        FilterParam::Fby,
-        FilterParam::Frx,
-        FilterParam::Fry,
-        FilterParam::Frz,
-        FilterParam::Fcx,
-        FilterParam::Fcy,
-        FilterParam::Fex,
-        FilterParam::Fey,
-        FilterParam::Fez,
-        FilterParam::Fsd,
-        FilterParam::Fmd,
-        FilterParam::Fqu,
-        FilterParam::Fid,
-        FilterParam::F,
-    ];
-
-    pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "FX" => Self::Fx,
-            "FY" => Self::Fy,
-            "FBX" => Self::Fbx,
-            "FBY" => Self::Fby,
-            "FRX" => Self::Frx,
-            "FRY" => Self::Fry,
-            "FRZ" => Self::Frz,
-            "FCX" => Self::Fcx,
-            "FCY" => Self::Fcy,
-            "FEX" => Self::Fex,
-            "FEY" => Self::Fey,
-            "FEZ" => Self::Fez,
-            "FSD" => Self::Fsd,
-            "FMD" => Self::Fmd,
-            "FQU" => Self::Fqu,
-            "FID" => Self::Fid,
-            "F" => Self::F,
-            _ => return None,
-        })
-    }
-
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Fx => "FX",
-            Self::Fy => "FY",
-            Self::Fbx => "FBX",
-            Self::Fby => "FBY",
-            Self::Frx => "FRX",
-            Self::Fry => "FRY",
-            Self::Frz => "FRZ",
-            Self::Fcx => "FCX",
-            Self::Fcy => "FCY",
-            Self::Fex => "FEX",
-            Self::Fey => "FEY",
-            Self::Fez => "FEZ",
-            Self::Fsd => "FSD",
-            Self::Fmd => "FMD",
-            Self::Fqu => "FQU",
-            Self::Fid => "FID",
-            Self::F => "F",
+impl Affine {
+    /// 引擎层构造 `FUN_00465730` 的初值:`+0x1c0/+0x1c8` = 10000
+    /// (`0x465771`/`0x46577d`,绘制侧 ÷100 = 100%),`+0x204` = 0x80
+    /// (`0x465789`),`+0x208` = 0x808080(`0x465793`),其余零初始化。
+    pub const fn engine_default() -> Self {
+        Self {
+            bx: 10000.0,
+            by: 10000.0,
+            cx: 0.0,
+            cy: 0.0,
+            rx: 0.0,
+            ry: 0.0,
+            rz: 0.0,
+            ex: 0.0,
+            ey: 0.0,
+            ez: 0.0,
+            sd: 0x80,
+            md: 0x0080_8080,
+            qu: 0,
+            flags: 0,
         }
     }
-}
 
-/// 滤镜/仿射参数原值集合(BTreeMap 保证稳定序列化)。
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct FilterTransform {
-    pub values: BTreeMap<FilterParam, EngineValue>,
-}
-
-impl FilterTransform {
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-
-    pub fn set(&mut self, param: FilterParam, value: EngineValue) {
-        self.values.insert(param, value);
+    /// 是否仍是引擎初值(用于判断本层是否带仿射/滤镜)。
+    pub fn is_default(&self) -> bool {
+        *self == Self::engine_default()
     }
 }
 
-/// 图层变换:只保存引擎单位的位置;滤镜参数原样保存。
+impl Default for Affine {
+    fn default() -> Self {
+        Self::engine_default()
+    }
+}
+
+/// 图层变换:引擎单位的位置 + 仿射/滤镜字段。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Transform {
     /// `CG[X=...]` 的**原始浮点**像素位置。
@@ -845,8 +829,8 @@ pub struct Transform {
     pub x: f64,
     /// `CG[Y=...]` 原始浮点像素位置(理由同 `x`)。
     pub y: f64,
-    /// `CG[FX/FY/...]` 原值。
-    pub filter: FilterTransform,
+    /// `FX/FBX/FRX/...` 仿射与滤镜字段(引擎 `+0x1b0..+0x214`)。
+    pub affine: Affine,
 }
 
 /// 过渡状态(`CG[T=... TA=... TID=...]`)。

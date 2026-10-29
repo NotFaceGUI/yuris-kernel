@@ -10,8 +10,9 @@
 //! | `FONT` | 3 | 字体属性快照 |
 //! | `CGINFO`/`FONTINFO` | 606/1 | 只读查询,归 VM;gfx 只挂号 |
 //!
-//! 其余 `CG` 参数(`LINT/TSX/FX/...`)原样进入 [`Layer::extra`]/
-//! [`crate::layer::FilterTransform`],并挂 `Unimplemented` 诊断;不静默丢。
+//! `CG` 的仿射/滤镜参数(`FX/FBX/FRX/...`)按引擎 `+0x1b0..+0x214`
+//! 逐项落到 [`crate::layer::Affine`](绑定见该结构文档);没有消费方的
+//! 非视觉参数(`LINT/TSX/...`)原样进入 [`Layer::extra`],不静默丢。
 //!
 //! # 错误容错
 //!
@@ -33,8 +34,8 @@ use crate::frame::{
     WindowState,
 };
 use crate::layer::{
-    BlendConfidence, BlendMode, CopyId, EngineValue, FilterParam, ImageFormat, Layer, LayerId,
-    LayerKind, LayerStatus, SizeU32, TextureRef, Transition,
+    BlendConfidence, BlendMode, CopyId, EngineValue, ImageFormat, Layer, LayerId, LayerKind,
+    LayerStatus, SizeU32, TextureRef, Transition,
 };
 use crate::op::{
     CopyKind, CopyOp, CopyRegion, CopySource, CopyTiming, ImageAction, ImageOp, MaskDraw, Op,
@@ -1736,19 +1737,25 @@ impl GfxState {
             return;
         };
         let dest = paths[1].clone().unwrap_or_else(|| source.clone());
-        // TODO(DIV-GFX-031):ID3/ID4 的多图层运算、Z2/BNO 修饰语义未取证。
+        // `ID/ID2/ID3/ID4` 在引擎里是**四个并列的图层引用**:命令处理器对
+        // 每个存在的 ID 做「拷 ID 到缓冲 + 若有同名 `IDNO` 则 `__itoa`
+        // 追加十进制」(`0x42c4ed`/`0x42c622`/`0x42c6df`/`0x42c798`),
+        // 结果分别落在 4 个缓冲里,由具体动作按需取用。`IDNO/IDNO2/IDNO3/
+        // IDNO4` 是各自的十进制后缀(`0x42c520`/`0x42c661`/`0x42c71e`/
+        // `0x42c7d7`)。
         //
-        // `TRANSITION` 是例外:`CGACT[TRANSITION=1 SET=f ID=$LB1 ID2=$LB2
-        // ID3=$LB3]`(`es_Sprite.yst:7978`)里 ID2 是**第二输入**、ID3 才是
-        // 目标,已由 `cgact_transition` 实现。旧实现无条件报警,既刷噪声
-        // (每帧一条)又让转场被当成未取证。
+        // 语料里 `ID3` 只出现在 `CGACT[TRANSITION=1 … ID3=$LB3]`
+        // (`es_Sprite.yst:7978`,已由 `cgact_transition` 实现),`ID4` 与
+        // `Z2` 零次调用。`Z2` 更是**从不被读取**:全量扫描
+        // `0x42c000..0x431700` 的 `[0x684160+声明下标]` 读取点,缺下标 8
+        // (`Z2=8`)⇒ 引擎只当合法参数接受、无副作用。
         let is_transition = flag(&params, "TRANSITION");
         if !is_transition && (paths[2].is_some() || paths[3].is_some()) {
             self.push_diag(
                 "CGACT",
                 error::unimplemented(
                     error::code::IMAGEOP_UNSUPPORTED,
-                    "ID3/ID4 的多图层运算语义未取证",
+                    "ID3/ID4 只被多输入动作(TRANSITION)消费;该动作之外的多图层语义未取证",
                 ),
             );
         }
@@ -3803,6 +3810,11 @@ fn rect_paint_precheck(
 }
 
 /// 真实 ysc 表(0.495 ERIS)的全部图像动作参数。
+///
+/// 表内容 = `ysc.ybn` 里 `CGACT` 的参数声明(`RASTER/RASTER2/RASTER3`,
+/// **没有 `RASTER1`**)。引擎按**声明下标**取参数(`[0x684160+下标]`),
+/// 所以不存在的名字在官方引擎里也取不到值 —— 旧表里的 `RASTER1` 是
+/// 凭手册臆测加的,已删(DIV-GFX-039)。
 static IMAGE_ACTIONS: &[(&str, ImageAction)] = &[
     ("RECTPAINT", ImageAction::RectPaint),
     ("RECTPAINT2", ImageAction::RectPaint2),
@@ -3841,7 +3853,6 @@ static IMAGE_ACTIONS: &[(&str, ImageAction)] = &[
     ("REVERSE", ImageAction::Reverse),
     ("WHIRLPOOL", ImageAction::Other("whirlpool")),
     ("RASTER", ImageAction::Other("raster")),
-    ("RASTER1", ImageAction::Other("raster1")),
     ("RASTER2", ImageAction::Other("raster2")),
     ("RASTER3", ImageAction::Other("raster3")),
 ];
@@ -3887,6 +3898,26 @@ fn first_image_action(params: &[(String, EngineValue, bool)]) -> Option<(&'stati
     None
 }
 
+/// 仿射/滤镜参数名 → 引擎字段(见 [`crate::layer::Affine`] 的绑定表)。
+///
+/// 返回 `None` 表示该名字没有对应字段 —— 调用方据此报诊断,而不是
+/// 悄悄写进别的槽位(加参数时忘改分支会立刻暴露)。
+fn affine_slot<'a>(a: &'a mut crate::layer::Affine, name: &str) -> Option<&'a mut f64> {
+    Some(match name {
+        "FBX" => &mut a.bx,
+        "FBY" => &mut a.by,
+        "FCX" => &mut a.cx,
+        "FCY" => &mut a.cy,
+        "FEX" => &mut a.ex,
+        "FEY" => &mut a.ey,
+        "FEZ" => &mut a.ez,
+        "FRX" => &mut a.rx,
+        "FRY" => &mut a.ry,
+        "FRZ" => &mut a.rz,
+        _ => return None,
+    })
+}
+
 /// 应用 `CG` 属性参数。返回诊断(不直接写 self,避免借用冲突)。
 fn apply_layer_params(
     layer: &mut Layer,
@@ -3898,13 +3929,20 @@ fn apply_layer_params(
     layer.param_status = LayerStatus::Executable;
     let mut sx: Option<i64> = None;
     let mut sy: Option<i64> = None;
+    // 本命令是否给出仿射/滤镜参数(诊断只在参数出现时发,避免无参更新刷屏)。
+    let mut affine_touched = false;
     for (name, value, offset) in params {
-        // 参数种类 2(`X+=` 源写法)是**增量**:语料 `es_Sprite.yst:8173`
-        // 每帧先由 `es.CGACT_SIZE` 写入绝对位置 `CG[ID=$dst X=@LEFT_X]`,
-        // 随后用 `CG[ID=$L1 X+=(@es.GSX/2)-(@WSX/2)]` 补偿旋转画布;
-        // 若按赋值处理,补偿值 0 会把位置清成 0(立绘被钉在屏幕左上)。
-        // 同理 `ES_Title.yst:104` 的 `CG[ID=FOUT_B A+=4]` 在 64 次循环里
-        // 逐步淡入,赋值语义会让 alpha 恒为 4。=> kind 2 = 相对当前值累加。
+        // `offset` = 「相对当前值」而不是赋值。窗口高字节的官方编码
+        // (0.495 编译产物实测):`0` = 赋值、`1` = `+=`、`2` = `-=`;
+        // `-=` 在 VM 里已把值取负(`compose_window_arg`),所以消费侧
+        // 一律按 `当前值 + v` 处理 —— 与引擎算子表 `0x42bd3c` 的
+        // `op1 = old+new` / `op2 = old−new` 同式。
+        //
+        // 按赋值处理会出错:`es_Sprite.yst:8173` 每帧先由 `es.CGACT_SIZE`
+        // 写入绝对位置 `CG[ID=$dst X=@LEFT_X]`,随后用
+        // `CG[ID=$L1 X+=(@es.GSX/2)-(@WSX/2)]` 补偿旋转画布,赋值语义会
+        // 把位置清成补偿值本身;`es_SaveLoad.yst:623` 的 `A-=8` 若当加法
+        // 会把 256 一路加到 512(2026-10-27 实测:读档幕布淡不掉)。
         match name.as_str() {
             "FILE" | "ID" | "IDNO" => {}
             "E" => match value.as_int() {
@@ -3951,7 +3989,7 @@ fn apply_layer_params(
             // 跳 1px」的阶梯(2026-10-26 实机确认)。
             // `Z` 是排序键、`SX/SY` 是纹理尺寸,均为整数像素,故仍取整。
             "X" => match value.as_f64() {
-                // 参数种类 2(`X+=` 源写法)= 增量(见循环头注释)。
+                // `offset` = 相对当前值(`+=`/`-=`,见循环头注释)。
                 Some(v) => {
                     layer.transform.x = if *offset {
                         layer.transform.x + v
@@ -4103,45 +4141,157 @@ fn apply_layer_params(
                     "参数 `MID` 期望字符串",
                 )),
             },
-            // `LINT` / `REMALLOC`:合法的**非视觉**参数,原样留档即完整语义。
+            // `RID`:资源图 ID —— 与 `FILE` 并列的另一条取图路径。引擎在
+            // 取图块 `0x42bb94..0x42bbd7`:存在时 `0x4141e4` 归一化 →
+            // `0x414559` 资源树查找 → `0x4656c8` 用资源对象建层;`FILE` 与
+            // `RID` 都缺才报 `0x18b6e`(`0x42bb29..0x42bb43`)。本内核没有
+            // 资源(PSB/E-mote)provider ⇒ 显式挂号,不当作「非视觉参数」。
+            "RID" => {
+                layer.extra.insert(name.clone(), value.clone());
+                mark_param_unimplemented(layer, "gfx.image.rid.unsupported");
+                diags.push(error::unimplemented(
+                    error::code::IMAGE_RID_UNSUPPORTED,
+                    "`RID` 资源图取图路径未实现(缺资源 provider)",
+                ));
+            }
+            // `LINT` / `LINT2` / `REMALLOC`:合法的**非视觉**参数。
             //
-            // - `LINT`(手册 `cg/cg.html` 无页):`es_Button.yst:2421` 的注释
-            //   是「レイヤにボタン番号格納」—— 把**按钮号**写进图层,供引擎
-            //   点击命中时回读(`:2422 CG[ID=$off LINT=@mLC]`、
-            //   `:3131/3290` 同型;`:2860` 用 `LINT=0` 注销)。
-            //   注意它**不是**「线路件 id 组」——那是早前无证据的猜测,已更正。
-            //   语料里脚本从不回读 LINT,消费方是引擎的点击分派。
-            //   本内核没有引擎那套「图层→按钮号」命中链,故只留档;
-            //   脚本可见行为(命中后走哪个 GOSUB)由按钮层几何 +
-            //   `ONMOUSE` 查询承担,不依赖此字段。
-            // - `REMALLOC`:`es_Sprite.yst:8652` 原注释
-            //   「//メモリ再確保しない」⇒ 控制 `CG` 重建时是否重新分配缓冲,
-            //   纯内存策略,不影响像素或查询结果。
-            //
-            // 两者都不进像素、不进 `CGINFO` 返回值 ⇒ 不是「未分类/未实现」。
-            //
-            // `LINT2` 与 `LINT` 同族(语料 0 次调用,保留同一归档口径)。
-            // `TSX`/`TSY` **不在此列**:语料 0 次、手册无页、语义完全未知,
-            // 继续走下面的兜底并如实报「未分类」—— 不确定的参数不能假装已归档。
+            // - `LINT`/`LINT2`:引擎存成 i64 图层字段 `+0x58`/`+0x60`
+            //   (`0x42b71f`/`0x42b760`),脚本注释是「レイヤにボタン番号格納」
+            //   —— 把**按钮号**写进图层,供引擎点击命中时回读
+            //   (`es_Button.yst:2422 CG[ID=$off LINT=@mLC]`、`:3131/3290`
+            //   同型;`:2860` 用 `LINT=0` 注销)。消费方是引擎的点击分派;
+            //   本内核没有「图层→按钮号」命中链,脚本可见行为由按钮层几何 +
+            //   `ONMOUSE` 查询承担 ⇒ 原样留档。
+            // - `REMALLOC`:引擎写字节字段 `+0x99`(`0x42b6a4`),消费方未定位;
+            //   `es_Sprite.yst:8652` 的注释是「//メモリ再確保しない」。
             "LINT" | "LINT2" | "REMALLOC" => {
                 layer.extra.insert(name.clone(), value.clone());
             }
-            other => {
-                if let Some(fp) = FilterParam::from_name(other) {
-                    // TODO(DIV-GFX-003):槽位→+0x1b0..+0x200 绑定/变换公式未取证。
-                    layer.transform.filter.set(fp, value.clone());
-                    mark_param_unimplemented(layer, "gfx.filter.unsupported");
-                    diags.push(error::unimplemented(
-                        error::code::FILTER_UNSUPPORTED,
-                        format!("滤镜/仿射参数 `{other}` 的槽位→偏移绑定未取证"),
-                    ));
-                } else {
-                    layer.extra.insert(other.to_string(), value.clone());
-                    diags.push(error::unimplemented(
-                        error::code::PARAM_NONVISUAL,
-                        format!("参数 `{other}` 已原样保留,视觉语义未分类"),
-                    ));
+            // `TSX`/`TSY`/`MFILE`/`CASH`:引擎 CG 处理体(入口 `0x42a514`,
+            // `mov eax,1; call 0x429fd1`)**从不读取**这四个槽位 —— 全量扫描
+            // `0x42a514..0x42bcb0` 的 `[0x684160+声明下标]`(含
+            // `mov reg,0x6841xx` 的间接形态),缺下标 9/10/36/42
+            // (`TSX=9 TSY=10 MFILE=36 CASH=42`,下标即 yscm 声明序)。
+            // 引擎只把它们当合法参数接受 ⇒ 本内核同样接受并留档,不报「未分类」。
+            "TSX" | "TSY" | "MFILE" | "CASH" => {
+                layer.extra.insert(name.clone(), value.clone());
+            }
+            // `DXDRAW`:引擎读它(`0x42b6b7`),但**只看一个全局开关**:
+            // `DAT_008012e4` 非零时对本层调 `0x42c400` + `0x409cd8`(强制
+            // 重绘)并置脏位,否则完全跳过。不是图层属性、不改几何/像素,
+            // 本内核没有对应设备路径 ⇒ 留档。
+            "DXDRAW" => {
+                layer.extra.insert(name.clone(), value.clone());
+            }
+            // `MIPMAP`:引擎把值减 1 后留用(`0x42b064`),但引擎**从不生成
+            // mip 链**(`FUN_00460924` 固定 `MIP=POINT`,render-parity §6)
+            // ⇒ 对像素无影响。
+            // `DXBUF`:写的是**全局**开关 `DAT_00801508`(`0x42b0b2/0x42b0c0`),
+            // 不是图层字段;本内核没有对应设备路径。
+            // 两者都只留档。
+            "MIPMAP" | "DXBUF" => {
+                layer.extra.insert(name.clone(), value.clone());
+            }
+            // ---- 仿射/滤镜族(引擎 `+0x1b0..+0x214`)----
+            //
+            // `FX`/`FY` 与 `X`/`Y` 是**同一物理量的两种单位**:引擎
+            // `CG[X=n]` 写 `+0x68=n`、`+0x1b0=n*100`;`CG[FX=n]` 写
+            // `+0x1b0=n`、`+0x68=n/100`(`0x42aa8b..0x42aa9c` /
+            // `0x42ab4b..0x42ab52`)。内核的 `transform.x/y` 是像素口径
+            // (`+0x68`),所以这里除 100。
+            "FX" => match value.as_f64() {
+                Some(v) => {
+                    affine_touched = true;
+                    let v = v / 100.0;
+                    layer.transform.x = if *offset {
+                        layer.transform.x + v
+                    } else {
+                        v
+                    }
                 }
+                None => diags.push(error::recoverable(
+                    error::code::ARG_TYPE,
+                    "参数 `FX` 期望数值",
+                )),
+            },
+            "FY" => match value.as_f64() {
+                Some(v) => {
+                    affine_touched = true;
+                    let v = v / 100.0;
+                    layer.transform.y = if *offset {
+                        layer.transform.y + v
+                    } else {
+                        v
+                    }
+                }
+                None => diags.push(error::recoverable(
+                    error::code::ARG_TYPE,
+                    "参数 `FY` 期望数值",
+                )),
+            },
+            // 其余仿射/滤镜字段按引擎原值保存(百分位/角度×100/位掩码),
+            // 绘制侧统一 `/100.0`(`FUN_00414ba4` 行 117-125)。
+            "FBX" | "FBY" | "FCX" | "FCY" | "FEX" | "FEY" | "FEZ" | "FRX" | "FRY" | "FRZ" => {
+                let Some(v) = value.as_f64() else {
+                    diags.push(error::recoverable(
+                        error::code::ARG_TYPE,
+                        format!("参数 `{name}` 期望数值"),
+                    ));
+                    continue;
+                };
+                let Some(slot) = affine_slot(&mut layer.transform.affine, name) else {
+                    diags.push(error::recoverable(
+                        error::code::PARAM_NONVISUAL,
+                        format!("参数 `{name}` 没有对应的仿射字段"),
+                    ));
+                    continue;
+                };
+                affine_touched = true;
+                *slot = if *offset { *slot + v } else { v };
+            }
+            "FSD" | "FMD" | "FQU" | "F" => {
+                let Some(n) = value.as_int() else {
+                    diags.push(error::recoverable(
+                        error::code::ARG_TYPE,
+                        format!("参数 `{name}` 期望整数"),
+                    ));
+                    continue;
+                };
+                // 引擎字段宽度:`FSD/FMD` = i32(`0x42a798`/`0x42b583`),
+                // `FQU` = i8(`0x42b5ac` 按 `movsx` 读回),`F` = i16
+                // (`0x42b63a` 按 `movsx word` 读回)。超宽按引擎截断。
+                affine_touched = true;
+                let a = &mut layer.transform.affine;
+                match name.as_str() {
+                    "FSD" => {
+                        let v = n as i32;
+                        a.sd = if *offset { a.sd.wrapping_add(v) } else { v };
+                    }
+                    "FMD" => {
+                        let v = n as i32;
+                        a.md = if *offset { a.md.wrapping_add(v) } else { v };
+                    }
+                    // `FQU` 引擎**不走算子**(直接赋值,`0x42b592..0x42b5ac`)。
+                    "FQU" => a.qu = n as i8,
+                    _ => {
+                        let v = n as i16;
+                        a.flags = if *offset { a.flags.wrapping_add(v) } else { v };
+                    }
+                }
+            }
+            // `FID`:滤镜图像 ID(字符串),引擎写进图层 `+0x210` 缓冲区
+            // (`0x42b5c6..0x42b5d8`,与 `MID` 共用同一块缓冲)。本内核的
+            // `MID` 外部掩码链路本身未取证(DIV-GFX-005),这里同样只留档。
+            "FID" => {
+                layer.extra.insert(name.clone(), value.clone());
+            }
+            other => {
+                layer.extra.insert(other.to_string(), value.clone());
+                diags.push(error::unimplemented(
+                    error::code::PARAM_NONVISUAL,
+                    format!("参数 `{other}` 已原样保留,视觉语义未分类"),
+                ));
             }
         }
     }
@@ -4159,8 +4309,17 @@ fn apply_layer_params(
             _ => {}
         }
     }
-    if !layer.transform.filter.is_empty() {
-        mark_param_unimplemented(layer, "gfx.filter.unsupported");
+    // 仿射/滤镜字段已按引擎偏移逐项落地(DIV-GFX-003 绑定部分已闭),
+    // 但**绘制侧公式**(缩放/旋转/中心如何合成)仍未取证 ⇒ 非默认值时
+    // 只标「未对拍」,不再声称「槽位绑定未取证」。
+    if !layer.transform.affine.is_default() {
+        mark_param_unimplemented(layer, "gfx.affine.unverified");
+        if affine_touched {
+            diags.push(error::unimplemented(
+                error::code::AFFINE_UNVERIFIED,
+                "仿射/滤镜字段已按引擎偏移落地,但绘制侧合成公式未对拍",
+            ));
+        }
     }
     if layer.mask.is_some() {
         mark_param_unimplemented(layer, "gfx.mask.unsupported");

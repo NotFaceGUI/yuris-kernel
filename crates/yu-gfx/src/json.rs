@@ -198,18 +198,40 @@ fn transform(out: &mut String, t: &Transform) {
     out.push_str(&t.x.to_string());
     out.push_str(",\"y\":");
     out.push_str(&t.y.to_string());
-    out.push_str(",\"filter\":[");
-    for (i, (k, v)) in t.filter.values.iter().enumerate() {
+    // 仿射/滤镜字段(引擎 `+0x1b0..+0x214` 原值)。键名 = 参数名。
+    let a = &t.affine;
+    out.push_str(",\"affine\":{");
+    for (i, (name, value)) in [
+        ("FBX", a.bx),
+        ("FBY", a.by),
+        ("FCX", a.cx),
+        ("FCY", a.cy),
+        ("FRX", a.rx),
+        ("FRY", a.ry),
+        ("FRZ", a.rz),
+        ("FEX", a.ex),
+        ("FEY", a.ey),
+        ("FEZ", a.ez),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         if i > 0 {
             out.push(',');
         }
-        out.push_str("{\"name\":");
-        esc_str(out, k.name());
-        out.push_str(",\"value\":");
-        engine_value(out, v);
-        out.push('}');
+        esc_str(out, name);
+        out.push(':');
+        out.push_str(&value.to_string());
     }
-    out.push_str("]}");
+    out.push_str(",\"FSD\":");
+    out.push_str(&a.sd.to_string());
+    out.push_str(",\"FMD\":");
+    out.push_str(&a.md.to_string());
+    out.push_str(",\"FQU\":");
+    out.push_str(&a.qu.to_string());
+    out.push_str(",\"F\":");
+    out.push_str(&a.flags.to_string());
+    out.push_str("}}");
 }
 
 fn transition(out: &mut String, t: &Transition) {

@@ -239,7 +239,7 @@ fn idno_appends_decimal_suffix() {
         frame_end(1),
     ]);
     let f = gfx.frame();
-    assert!(f.layers.iter().any(|l| l.id.display() == ":/W0/bg/title.2"));
+    assert!(f.layers.iter().any(|l| l.id.display() == ":/W0/bg/title2"));
 }
 
 #[test]

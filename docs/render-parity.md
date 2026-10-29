@@ -40,7 +40,7 @@
 | 2 | `A` 0..256 | `cg/cg.html`:「A = 値(0～256)」 | ERIS 首屏 `A=256`/`A=0`,后续 `A=@_PINT(1)`;源 `CG[... A=@mA]` | `FUN_00414ba4` 行 116(`(short)+0x80`)、135-140(clamp 0..255)、149-154(TFACTOR=A 灰度)、910-913(`YS_AlphaVal=A/256`) | Confirmed;固定管线 `min(A,255)/255`,着色器 `A/256` |
 | 3 | `MODE=0..18` | `cg/cg.html` 全表(0=通常…18=ピンライト);「4=除算…13=焼き込みリニア」 | ERIS 首屏 `MODE=0`(1015 次)+`MODE=2`(1 次);源 `MODE=@bl` | `FUN_00414ba4` 行 144-154(分派/TFACTOR)、391-462(M0)、463-509(M1)、510-560(M2)、561-633(M3)、634-701(M5)、702-752(M6)、753-820(M7)、824-874(M9)、881-971(HLSL) | 0 Likely;1/2 Confirmed;**3/5/6/7/9 状态表已实现(soft/wgpu 全部),官方像素待 YSCom 工具恢复**;4/8/10..18 Unimplemented |
 | 4 | 纹理过滤 MAG/MIN/MIP | 无手册页;引擎设定工具写入 | ERIS `yscfg` 无过滤字段(全局设置) | `FUN_0043cd6c` 行 46-117:stage 0/1 各下发 `D3DSAMP_MAG/MIN/MIPFILTER`;值来自 `DAT_005b4804/4808/80131c`;0=POINT/1=LINEAR/2=ANISOTROPIC,MIP=-1=NONE | Confirmed 全局,非逐层;旧线“固定 Linear”❌ |
-| 5 | 变换 X/Y/FX… | `cg/cg.html` 只文档化 X/Y;`basic/layer.html` 无 FX 说明 | ERIS `es_Sprite.yst` `FX=@fx*100 ... FRZ=@frz FCX=@fcx`;`FBX=10000`/`FCX=5000` | `FUN_00414ba4` 行 117-125(+0x1b0/1b8/1c0/1c8/1d0/1d8 `/100`,+0x1f8/1fc/200 f32 `/100`)、220-275(16.16 `ROUND(v*65536)`)、322-336(旋转矩阵,`π/180` 常量 0x58ebf8);半像素 `-0.5` 常量 0x58ebd0 | X/Y Confirmed;FX 家族槽位→偏移 Unimplemented(DIV-GFX-003) |
+| 5 | 变换 X/Y/FX… | `cg/cg.html` 只文档化 X/Y;`basic/layer.html` 无 FX 说明 | ERIS `es_Sprite.yst` `FX=@fx*100 ... FRZ=@frz FCX=@fcx`;`FBX=10000`/`FCX=5000` | `FUN_00414ba4` 行 117-125(+0x1b0/1b8/1c0/1c8/1d0/1d8 `/100`,+0x1f8/1fc/200 f32 `/100`)、220-275(16.16 `ROUND(v*65536)`)、322-336(旋转矩阵,`π/180` 常量 0x58ebf8);半像素 `-0.5` 常量 0x58ebd0 | X/Y Confirmed;FX 家族**绑定已闭**(DIV-GFX-003/069),绘制合成公式仍 open(DIV-GFX-070) |
 | 6 | 多部件层 / `FILE` 探测 / 1×1 黑 | `cg/cg.html`:「FILE="" で1x1サイズの黒画像生成」「拡張子…「.PNG」「.BMP」「.JPG」「.GIF」の順」 | ERIS 首屏 552 次 `FILE`(`FILE=""` 与 `cgsys/...` 资产);源 `CG[FILE=...]` | `FUN_0040c9b4`(`0x40c9b4`)按 `yscfg+0x1c` 码探测:`1→.png,2→.bmp,3→.jpg,4→.gif,5→.psb`;多部件 `+0xa6/+0xa7` 计数、`+0xb0/+0x130` 两表(`FUN_00414ba4` 155-156/200/219/985) | `FILE`/扩展名 Confirmed;多部件几何 Unimplemented(DIV-GFX-004) |
 | 7 | 组/离屏/COPY | `cg/cg.html`:「レイヤセット…レイヤ合成したもの」「COPY キーワード…複製（スクリーンショット機能）」;`basic/layer.html`:`CG[ID=ABC/ ...]`、`CGACT[COPY2=1 ID=:/W0/ ID2=TMP]` | ERIS 首屏 `CG[ID=":/W3/" SX=..]`、`CGACT[COPY2=1 ID=:/W0/ ID2=CGS100]` | `FUN_00413dc8` 行 34-36(递归)、51-102(调试 RT/`+0x61c`);`FUN_00462e40`(离屏创建族);`FUN_0043cd6c` 行 118-169(帧末读回) | 机制 Confirmed;主组直绘已实现(DIV-GFX-008);COPY 时序/区域/冻结已实现(DIV-GFX-007);**首帧主组 COPY 无后缓冲源仍 open(DIV-GFX-051)** |
 | 8 | 过渡 T/TA/TID | `cg/cg.html`:「T=トランジション進行度」「TA=精度」「TID=トランジションレイヤID」 | ERIS 源 `T/TID/TA` 少量(首屏 0 次);`TID=""` 用于结束过渡(`es_Button.yst:4526/4540`、`es_Sprite.yst:4238`) | `FUN_00414ba4` 行 166-188(TA<1 门控)、881-971(`YS_Texture1/2`、`YS_FadeVal` 公式 905-909、`YS_FadeVal2`);`FUN_00413dc8` `0x413e7b`:TID 空串直接跳过配对查询,非空才 `FUN_004141e4`+`FUN_00414559` | 公式 Confirmed;**TID 空串=无配对 Confirmed**;推进者仍未定位(DIV-GFX-006) |
@@ -73,7 +73,8 @@ X 1023 | Y 1023 | A 36 | SX 13 | SY 13
 - 取值:`A` = 256×34 / 0×2;`E` = 0×1025 / 1×33;`MODE` = 0×1015 / 2×1。
 - `Z` 出现 63 位大值(`4551686018427387903`)与 `99000000020` 等,必须用 i64。
 - 首屏没有任何 `T/TA/TID/MID/FX/...`;这些在后续帧/商业语料才出现。
-- `LINT` 出现 29,068 次,视觉语义未分类(DIV-GFX-011),原样留档。
+- `LINT` 出现 29,068 次;引擎把它存进图层 i64 字段 `+0x58`(按钮号,
+  消费方是点击分派),本内核无该命中链 ⇒ 原样留档(DIV-GFX-011 已定案)。
 - 首个有可见层的逻辑帧(历史 golden,`771cf79`):272 个图层、
   34 个 visible、15 个 pass / 44 个 op:12 个 `Texture` pass(11 个图像加工 +
   1 个复制;复制当前**全部** `Unimplemented`)、2 个组离屏(W0 30 ops、
@@ -309,7 +310,8 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
   **无条件**写 `MAG=1`、`MIN=1`、`MIP=0`、aniso=0
   (`DAT_005b4804/4808/80131c/801320`),不从设置文件读取 MIP/aniso;
   引擎不生成 mip 链。因此“引擎真值”= `LINEAR/LINEAR/POINT`、无各向异性。
-- 不是逐层属性;`CG[MIPMAP=...]` 是另一条未取证路径,原样留档(DIV-GFX-011)。
+- 不是逐层属性;`CG[MIPMAP=...]` 只把值减 1 留用(`0x42b064`),而引擎
+  不生成 mip 链 ⇒ 对像素无影响,原样留档(DIV-GFX-011 已定案)。
 - gfx 默认值仍是 POINT/POINT/NONE 占位(`filter.source=placeholder`),
   由宿主注入引擎真值(`GfxState::set_filter` → `filter.source=engine_settings`);
   后端在 `placeholder` 时不得声称过滤语义已对齐。
@@ -326,10 +328,15 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
   `ROUND(v * 65536)` 转 16.16 再拆分;行 322-336 构建旋转矩阵
   (`×π/180`,常量 0x58ebf8)。半像素:行 157/190/214 等有 `-0.5`
   (常量 0x58ebd0)。
-- `FX/FY/FBX/FBY/FRX/FRY/FRZ/FCX/FCY/FEX/FEY/FEZ/FSD/FMD/FQU/FID/F`
+- `FX/FY/FBX/FBY/FRX/FRY/FRZ/FCX/FCY/FEX/FEY/FEZ/FSD/FMD/FQU/F`
   在 ERIS 里以 ×100 整数出现(例 `FX=@fx*100`、`FBX=10000`、`FCX=5000`)。
-  绘制侧读取的字段已定位,但**槽位→字段的逐项绑定未取证**(旧线 G1)。
-  gfx 将原值放进 `Transform.filter` 并标 `Unimplemented`;后端不得猜。
+  **槽位→字段绑定已闭**(DIV-GFX-069):`X/FX` 都写 `+0x1b0`(`X` 另写
+  `+0x68`=`X`,`FX` 另写 `+0x68`=`FX/100`),`Y/FY`→`+0x1b8`,
+  `FBX/FBY`→`+0x1c0/1c8`,`FRX/FRY/FRZ`→`+0x1f8/1fc/200`(f32),
+  `FCX/FCY`→`+0x1d0/1d8`,`FEX/FEY/FEZ`→`+0x1e0/1e8/1f0`,
+  `FSD/FMD/FQU/F`→`+0x204/208/20c/214`。gfx 落到 `Transform.affine`
+  (引擎原值)并把 `FX/FY` 换算进 `transform.x/y`;绘制侧合成公式仍未对拍
+  (DIV-GFX-070),非默认值时图层标 `gfx.affine.unverified`。
 - UV 平铺/镜像(全局 `DAT_00801334` 1/2/3)未实现;`CGACT` 的
   `SIZE/ROTATION/...` 是图像加工,不是合成变换(DIV-GFX-013)。
 
@@ -492,7 +499,7 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
   aniso=0(`DAT_005b4804/4808/80131c/801320`),不从设置文件读取 MIP/aniso;
   引擎也不生成 mip 链。因此后端固定 LOD0 + anisotropy=1 + `mipmap_filter`
   最近点与引擎等价(不是“静默忽略”:引擎没有可注入的 MIP/aniso 值)。
-  `CG[MIPMAP]` 仍是未取证的另一条路径(DIV-GFX-011)。
+  `CG[MIPMAP]` 只改图层字段、引擎不生成 mip 链 ⇒ 对采样无影响(DIV-GFX-011)。
 - 不做逐层过滤;`frame.filter` 是全局设置。
 
 ### 12.5 Group / Transition / Copy

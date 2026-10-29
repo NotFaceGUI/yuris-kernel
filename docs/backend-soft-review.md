@@ -553,7 +553,7 @@ Op::Image(image) => image.source.display(),
 ### 5.6 P3-6 · `clip`、未分类 `extra`、UV wrap
 
 - `Layer.clip`(`layer.rs:956`)当前在 gfx 里恒为 None(所有构造点),但 `json.rs` 会序列化它;后端完全不看。若未来填充,后端会静默忽略。属潜在缺口。
-- `apply_layer_params` 对 `LINT/TSX/TSY/...` 只发 `gfx.param.nonvisual` 诊断并放进 `extra`,不改变 `LayerStatus`;首帧 `LINT` 出现 29,068 次(`render-parity.md` §2)。`DIV-GFX-011` 明说“视觉语义未分类”。后端仍然绘制这些层。如果其中任何参数影响像素,当前输出就是错的,而且没有跳过/报告。
+- `apply_layer_params` 对 `LINT/TSX/TSY/...` 放进 `extra`,不改变 `LayerStatus`;首帧 `LINT` 出现 29,068 次(`render-parity.md` §2)。**2026-10-29 更新**:`DIV-GFX-011` 已定案——`LINT/LINT2` 是引擎 i64 字段 `+0x58/+0x60`(按钮号,消费方是点击分派)、`TSX/TSY/DXDRAW/CASH` 在属性块无读取点、`MIPMAP` 不改采样、`DXBUF` 是全局开关 ⇒ 这些参数**确认不影响像素**,后端绘制这些层是正确的;`RID`(资源图)另记 `gfx.image.rid.unsupported`。
 - `render-parity.md:276-277` 记录全局 UV 平铺/镜像(`DAT_00801334` 1/2/3)未实现;`CompositorFrame` 没有对应字段,后端无法表达。
 
 建议:把 `extra` 的“未分类”与“非视觉”区分开;若不能证明非视觉,至少在后端/报告里加一个 `unclassified_params` 风险标记;UV wrap 新增 DIV。

@@ -315,12 +315,13 @@ fn persistent_unsupported_attributes_keep_layer_unimplemented() {
                 arg(&table, "CG", "ID", s("L")),
                 arg(&table, "CG", "FILE", s("l")),
                 arg(&table, "CG", "MODE", i(3)),
-                arg(&table, "CG", "FX", i(100)),
+                // 旋转角:绑定已取证,但绘制侧公式未对拍 ⇒ 持久「未对拍」标记。
+                arg(&table, "CG", "FRZ", i(3000)),
             ],
         ),
         frame_end(1),
     ]);
-    // 只做一次无参数更新,不得把持久 MODE/FX 的不可执行状态洗掉。
+    // 只做一次无参数更新,不得把持久 MODE/FRZ 的不可执行状态洗掉。
     gfx.consume_events(&[
         frame_start(2),
         call(2, "CG", vec![arg(&table, "CG", "ID", s("L"))]),

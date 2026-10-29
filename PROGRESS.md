@@ -10531,3 +10531,83 @@ cargo test -p yu-gfx --test preload       → 2 passed
   同帧源+目标都新建时也走这条(正确但慢)。
 - `GfxCapture` 的独立 `TextureStore` 仍与主渲染器分开;若 SAVE 直接指向
   刚 `CG[FILE]` 的资产层会重复解码一次(存档缩略图走快照链,未触发)。
+
+---
+
+## 成果 CG-AFFINE(2026-10-29) · CG 仿射/滤镜参数绑定 + 参数分类收口
+
+把 `CG` 的仿射/滤镜族(`FX FY FBX FBY FRX FRY FRZ FCX FCY FEX FEY FEZ
+FSD FMD FQU F`)从「原样归档 + 每帧挂号」改成**按引擎偏移逐项落地**,
+并把 CG/CGACT 里剩下的未分类参数一次定案。
+
+### 取证(REA 0.495,sha256 `4f5eefa3…`)
+
+1. 参数取值是**声明下标**驱动:`FUN_00429fd1` 每命令 `memset(&0x684160,100)`
+   后填 `[0x684160+name_id]=slot`(`0x42a078`),处理体再按
+   `[0x684160+下标] → slot → [slot*8+0x683740]` 读值。
+2. 属性块逐项写入点(下标 4/15 = X/FX 同写 `+0x1b0`;5/16 → `+0x1b8`;
+   17/18 → `+0x1c0/1c8`;19/20/21 → f32 `+0x1f8/1fc/200`;22/23 →
+   `+0x1d0/1d8`;24/25/26 → `+0x1e0/1e8/1f0`;27 → `+0x204`;28 → `+0x208`;
+   29 → 字节 `+0x20c`;31 → 字 `+0x214`)。
+3. 层构造默认值 `FUN_00465730`:`+0x1c0/1c8 = 10000`、`+0x204 = 0x80`、
+   `+0x208 = 0x808080`。
+4. `X` 与 `FX` 是同一物理量的两种单位:`CG[X=n]` → `+0x68=n`/`+0x1b0=n*100`;
+   `CG[FX=n]` → `+0x1b0=n`/`+0x68=n/100`(`0x42aa8b..0x42aa9c` /
+   `0x42ab4b..0x42ab52`)。
+5. 属性算子 `0x42bd3c`/`0x42bdbc`:0 赋值 / 1 加 / 2 减 / 3 乘 / 4 除;
+   `FQU` 是唯一直接赋值的例外(`0x42b592..0x42b5ac`)。
+6. 其余参数(CG 处理体 `0x42a514`、CGACT 处理体 `0x42c4a4`,含
+   `mov reg,0x6841xx` 的间接读取形态全量扫描):`TSX/TSY/MFILE/CASH`
+   (下标 9/10/36/42)在 CG **无读取点**;`DXDRAW`(14)有读取点但只受
+   全局 `DAT_008012e4` 门控(强制重绘);`MIPMAP` 值减 1 但引擎不生成
+   mip 链;`DXBUF` 写**全局** `DAT_00801508`;`RID` 是资源图取图路径
+   (`0x42bb94`:归一化 → 资源树 → 建层),`FILE` 与 `RID` 都缺才报错;
+   CGACT 侧 `Z2`(8)/`ROTATION2`(30)无读取点。
+7. `IDNO` 是 `__itoa(基数 10)` **直接追加**(`0x42c542..0x42c54c`),
+   旧实现的 `ID + "." + 十进制` 多一个点。
+8. `CGACT` 的 `RASTER1` **不在** 0.495 参数表(只有 RASTER/RASTER2/RASTER3)。
+
+### 改动
+
+- `crates/yu-gfx/src/layer.rs`:`FilterParam`/`FilterTransform` 退役,
+  新增 `Affine`(字段/默认值与引擎逐项对应,文档内含写入点表);
+  `Transform.filter` → `Transform.affine`。
+- `crates/yu-gfx/src/state.rs`:`apply_layer_params` 逐参数落地;
+  `FX/FY` 写 `transform.x/y`(= `+0x68` 口径);`TSX/TSY/MFILE/CASH`/
+  `DXDRAW`/`MIPMAP`/`DXBUF` 只留档不再报「未分类」;`RID` 显式
+  `gfx.image.rid.unsupported`;`RASTER1` 删除;`Z2` 静默接受;
+  诊断码 `gfx.filter.unsupported` → `gfx.affine.unverified`(只在命令
+  真的给了仿射参数时发一条)。
+- `crates/yu-gfx/src/path.rs`:`IDNO` 去掉点。
+- `crates/yu-gfx/src/json.rs`:`transform.affine` 结构化输出。
+
+### 验证(原始结果)
+
+```text
+cargo test -p yu-gfx                         → 全部通过(27+9+… 项)
+cargo test -p yu-gfx --test transform        → 9 passed
+  (fx_fy_are_the_same_field_as_x_y_in_hundredths / affine_params_land_on_engine_fields
+   / affine_defaults_match_engine_layer_constructor / fqu_is_plain_assignment_like_engine)
+cargo build --workspace --all-targets        → ok
+cargo test --workspace                       → 仅 yu-trace synthetic_trace_matches_golden 失败
+  (既有问题:YSCom.ycd sha 997b5b63… ≠ golden 39ba92ef…,与本轮无关)
+cargo test -p yu-cli --test logging_guards   → 3 passed
+```
+
+语料首屏 golden 复核(`YURIS_SAMPLE_ERIS_YSBIN=<project>/data/ysbin`,
+`UPDATE_GFX_GOLDEN=1` 后与 HEAD 逐节点 diff):
+
+```text
+ADD/DEL 仅 transform.affine ↔ transform.filter 的形态变化
+total value diffs: 0
+```
+
+900 帧实跑(`YURIS_SAMPLE_ERIS_ROOT=<project-eris>`,标题点击进本篇)
+`CG[FX]` 事件 0 条 —— 首屏/开场无立绘,`FX` 路径未触发,故本轮无像素风险;
+绑定由单测钉住。
+
+### 残余
+
+- 仿射字段的**绘制侧合成公式**仍未对拍(DIV-GFX-070):字段已存,
+  后端只消费 `x/y`;非默认值图层标 `gfx.affine.unverified`。
+- `RID` 资源图链路缺 provider(PSB/E-mote 资产头),保持显式挂号。

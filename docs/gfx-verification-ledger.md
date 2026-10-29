@@ -109,7 +109,7 @@ D6/D7/D10/D11/D12/D13 外,其余按“Confirmed → 修复/保持”处理
 | D10 | COPY 时序 | 旧线实测=上一帧已渲染目标;本会话未重做受控实验 | 保持 Unimplemented + DIV-GFX-007 |
 | D11 | RECTPAINT 等图像加工 | 参数/命令已确认,像素算法未定位 | 保持 Unimplemented(DIV-GFX-013) |
 | D12 | 文本栅格化 | 需字体会话 | 保持 Unimplemented(DIV-GFX-012) |
-| D13 | LINT 语义 | 首屏 29,068 次;手册无页 | 原样保留在 `extra`(DIV-GFX-011) |
+| D13 | LINT 语义 | 首屏 29,068 次;手册无页;REA:图层 i64 字段 `+0x58`(`0x42b71f`),按钮号 | 原样保留在 `extra`(DIV-GFX-011 已定案) |
 | D14 | psb 扩展名 | Confirmed(见 C5) | 修复 |
 | D15 | 主组缺失 fallback | 现实现“主组不存在→合成所有顶层节点”是测试便利,不是引擎证据;W0 在引擎启动时总存在 | 修复:显式主组缺失时 Screen 为空,不再猜测所有顶层 |
 | D16 | 图像层下挂子层 | `FUN_00413dc8` 对每个节点先递归子节点(`0x413e1a-0x413e24`),与层种类无关;gfx 只在组节点递归 | **Confirmed** | 修复:图像层子层按引擎后序(子先父后)扁平绘制,不再静默丢层 |
@@ -184,7 +184,7 @@ D6/D7/D10/D11/D12/D13 外,其余按“Confirmed → 修复/保持”处理
 | ID | 缺口 | 证据/状态 | 处置 |
 |---|---|---|---|
 | DIV-GFX-030 | `CG[TIDNO]` 未处理 | 真实 ysc 表有 `TIDNO`;其与 `TID` 的组合规则未重新锚定 | 原样留档 + Unimplemented |
-| DIV-GFX-031 | `CGACT ID3/ID4` 多图层、`Z2/BNO` 修饰 | 代码只诊断 ID3/ID4;Z2/BNO 语义无手册页 | 不执行,留档 |
+| DIV-GFX-031 | `CGACT ID3/ID4` 多图层、`Z2/BNO` 修饰 | REA:`ID/ID2/ID3/ID4` 是四个并列图层引用(`0x42c4ed/0x42c622/0x42c6df/0x42c798`);`Z2` 下标 8 **无读取点**;`BNO` 只被 `TEXT` 消费 | `Z2` 静默接受;非 TRANSITION 的 ID3/ID4 仍挂号 |
 | DIV-GFX-032 | `SWAP/SWAP2` 与引擎模式 1/2 对应 | `FUN_0042f57d` 已读,但调用点模式值未逐项确认;现按手册实现 | 保持 Likely,不改 |
 | DIV-GFX-033 | `TEXT OUTPUTMODE/WAIT/RETURN/PAGE/CLICK/AUTO*/BUTTON` | 手册 `text/text.html` 有页;属显示节奏/宿主输入 | 只记录事实,未实现 |
 | DIV-GFX-034 | 文本跨帧持久 + `TEXT[CLEAR]` 传播到 gfx | `GfxState` 每帧清空 `text`;VM 的 CLEAR 未变成 gfx 事件 | Unimplemented(当前无文本栅格化,暂不可见) |
@@ -192,7 +192,7 @@ D6/D7/D10/D11/D12/D13 外,其余按“Confirmed → 修复/保持”处理
 | DIV-GFX-036 | FONTINFO 字体列表字段/未设置默认值 | `NUM/LANG/...` 需安装字体列表;COLOR2/NAME 未设置默认值未取证 | 不写 LET |
 | DIV-GFX-037 | WINDOW host 属性、主窗口 A 透明度/SX-SY 视口 | 手册 `window/window.html`;0.495 的 A 是否仍仅显隐未实测 | 只消费 CGID/E/A 显隐 |
 | DIV-GFX-038 | INFO 缺失目标非 EXIST / 未分类字段 | 手册只定义 EXIST;缺失层其他字段返回未取证 | 不写 LET |
-| DIV-GFX-039 | `CGACT RASTER1/FSX/FSY/FX2/FY2/Z2` | 手册有 RASTER1;ERIS ysc 表无;其余未分类 | RASTER1 已识别;其余留档 |
+| DIV-GFX-039 | `CGACT RASTER1/FSX/FSY/FX2/FY2/Z2` | 手册有 RASTER1,0.495 ysc 表**无**(引擎按下标取参 ⇒ 取不到);`FX/FY/X2/Y2/FX2/FY2/FSX/FSY` 像素/百分位双口径已取证 | `RASTER1` 已删;双口径已实现;`Z2` 无副作用(DIV-GFX-031) |
 | DIV-GFX-040 | `TEXTINFO` 只读文本状态查询 | 手册 `text/textinfo.html`;VM 未接线,ERIS 未使用 | 随文本状态机一并实现 |
 
 **结论**:原 TODO 不是全部;补齐后仍有 001..039 与 3 个无编号决策/开放项。

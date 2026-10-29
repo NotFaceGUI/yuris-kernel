@@ -32,11 +32,15 @@ pub struct ParsedPath {
 
 /// 规范化一个图层 ID。
 ///
-/// `idno` 存在时按引擎约定拼成 `ID + "." + 十进制`。
+/// `idno` 存在时把十进制**直接接在 ID 尾部**(无分隔符)。证据:官方
+/// `CG`/`CGACT` 的 ID 解析块先把 ID 拷进缓冲,再用
+/// `lea edx,[eax+buf]`(指向字符串 NUL)作为目标调用 `__itoa`(基数 10)
+/// 追加数字 —— `0x42c765..0x42c77c`(CGACT ID3)、`0x42c542..0x42c54c`
+/// (CGACT ID)以及 CG 的同型块。旧实现拼的是 `ID + "." + 十进制`
+/// (DIV-GFX-027),多了一个点。
 pub fn normalize(id: &[u8], idno: Option<i64>, trailing_slash: bool) -> ParsedPath {
     let mut bytes = id.to_vec();
     if let Some(n) = idno {
-        bytes.push(b'.');
         bytes.extend_from_slice(n.to_string().as_bytes());
     }
     normalize_bytes(&bytes, trailing_slash)
@@ -183,7 +187,7 @@ mod tests {
     #[test]
     fn idno_is_decimal_suffix() {
         let p = normalize(b"bg/title", Some(2), false);
-        assert_eq!(p.path.display(), ":/W0/bg/title.2");
+        assert_eq!(p.path.display(), ":/W0/bg/title2");
         assert!(!p.is_dir);
     }
 

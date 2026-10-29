@@ -72,7 +72,8 @@ CGACT[ID=$src ID2=$dst SIZE2=1 FX=@X1*100+@FLX FY=@Y1*100+@FLY
   (二分降采样,与 `SIZE2` 交替出现在同一循环)
 
 手册无页;几何语义有语料锚点,**重采样滤波相对 `SIZE2` 的差异未取证** ⇒
-按双线性执行,DIV-GFX-039 由 `unimplemented` 降为 `partial(no-manual)`。
+按双线性执行。DIV-GFX-039 后续(2026-10-29)已随 `RASTER1`/双口径参数
+一并定案为 `fixed(no-manual)`,见 `DIV-GFX-069-cg-affine-binding.md` §2。
 关键点:不实现会让整层被标 `Unimplemented`,而 `SIZE4` 就用在 CG 缩放路径上。
 
 ## 3. 顺带修掉的两条放大链路

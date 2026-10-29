@@ -40,8 +40,10 @@ pub mod code {
     pub const TRANSITION_UNSUPPORTED: &str = "gfx.transition.unsupported";
     /// 外部掩码(`MID`)的取值通道未取证。
     pub const MASK_UNSUPPORTED: &str = "gfx.mask.unsupported";
-    /// 滤镜/变换参数(`FX/FY/FRX/FCX/FEX/...`)写侧绑定未取证。
-    pub const FILTER_UNSUPPORTED: &str = "gfx.filter.unsupported";
+    /// `RID` 资源图取图路径(缺资源 provider)。
+    pub const IMAGE_RID_UNSUPPORTED: &str = "gfx.image.rid.unsupported";
+    /// 仿射/滤镜字段已按引擎偏移落地,但绘制侧合成公式未对拍。
+    pub const AFFINE_UNVERIFIED: &str = "gfx.affine.unverified";
     /// 图层组/离屏语义缺项。
     pub const GROUP_UNSUPPORTED: &str = "gfx.group.unsupported";
     /// `CGACT[COPY/COPY2/SWAP...]` 的时序/区域语义缺项。
