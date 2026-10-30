@@ -78,7 +78,7 @@ grep -rn "yu_backend_soft::" crates/yu-render/wgpu/src
 | **`REVERSE`** | `apply_reverse`(CPU) | ❌ | 通道取反 shader |
 | **`HORIZONTAL`/`VERTICAL`(图像加工)** | `apply_horizontal/vertical`(CPU) | ❌ | 与层路径统一为 UV 负步长 |
 | **`RESIZE`/`TRIM`/`MEIDO`** | `apply_resize/trim/meido`(CPU) | ❌ | 几何变换走顶点/UV,必要时 GPU pass |
-| **`ROTATION`/`SAIDO`/`AKARUSA`/`MONO`/`MOSAIC`/`BLUR*`/`DIFFUSION`/`WHIRLPOOL`/`RASTER*`** | `apply_*`(CPU) | ❌ | 各自 GPU pass/shader |
+| **`ROTATION`/`SAIDO`/`AKARUSA`/`MONO`/`MOSAIC`/`BLUR*`/`DIFFUSION`/`WHIRLPOOL`/`RASTER*`** | `apply_*`(CPU) | ⚠️ 部分合规 | `BLUR*` 走 `transform.wgsl` mode 10..15(两遍 pass);`DIFFUSION`/`WHIRLPOOL`/`RASTER*` 走 mode 16..20(扩散为 `2×(SET/2)` 次 pass 的 ping-pong);`ROTATION/SAIDO/AKARUSA/MONO/MOSAIC` 仍是 mode 0..9 的单 pass |
 | 快照像素重建(`snapshot_pixels`) | `scale_region`(CPU) | ⚠️ 条件合规 | 只在「CPU 消费者确实需要像素」时保留(文本合成基面、需要读回的后续加工),并标注为**读回路径**,不作为常规渲染路径 |
 | 文本合成 | `TextComposer`(`yu-render-core`) | ✅ 共享设施 | 已迁(2026-10-27) |
 | 资产解码 | `TextureStore`(`yu-render-core`) | ✅ 共享设施 | 已迁(2026-10-27) |
@@ -100,9 +100,10 @@ grep -rn "yu_backend_soft::" crates/yu-render/wgpu/src
    miss 时仍走 CPU;`Override::Pass` 落地后 CPU 链整体退役。
 2. `TRANSITION` / `REVERSE` / `XOR` / `AND`(shader 或 blend 模式)。
 3. `HORIZONTAL`/`VERTICAL` 图像加工统一为 UV 负步长(与层路径同源)。
-4. `ROTATION`/`SAIDO`/`AKARUSA`/`MONO`/`MOSAIC`/`BLUR*`/`DIFFUSION`/
-   `WHIRLPOOL`/`RASTER*`:按语料实际出现顺序逐个 shader 化;未实现前
-   保持 CPU 并**在报告里显式标注 `gpu.cpu_fallback.<action>`**,不允许静默。
+4. ~~`BLUR*`/`DIFFUSION`/`WHIRLPOOL`/`RASTER*`~~ **已 shader 化(2026-10-30)**:
+   `BLUR*` = `transform.wgsl` mode 10..15,`DIFFUSION`/`WHIRLPOOL`/`RASTER*` =
+   mode 16..20;两后端逐像素对拍在册。剩余 `ROTATION`/`SAIDO`/`AKARUSA`/
+   `MONO`/`MOSAIC` 已有单 pass shader(mode 3..9),不需要 CPU 回退。
 
 **每一项的验收口径(缺一不可)**
 

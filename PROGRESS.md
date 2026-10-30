@@ -11316,8 +11316,11 @@ CGACT[ID=_FONT_TMP ID2=$dst MERGE=1 X=.. Y=..]    ← 合并到正文层
    `acc / 实际像素数` 整数除法;**窗口在区域边界收缩**
    (`lo=max(x0,x-r)`,`hi=min(x1,x+r)`,除数 = `hi-lo+1`),不是夹取重复边缘;
    **alpha 不参与平均**,从源图原样拷贝(`*(dst+3) = *(src+3)`)。
-4. **残余**:`BLUR2/3/4/5` 未逐个反编译;六者字节相似度仅 10–66%,是不同
-   实现 ⇒ 核按已证的盒式执行,标 `Likely`,不声称已证。
+4. **补记(同日收口)**:`BLUR2/3/4/5` 已逐个反编译并各自落地 ——
+   `BLUR2`(`FUN_0043265c`)只有水平遍、`BLUR3`(`FUN_00432e58`)只有垂直遍、
+   `BLUR4`(`FUN_00433718`)与 `BLUR` 同核、`BLUR5`(`FUN_00434748`)恒为
+   alpha-only 遮罩(RGB 归零);`BLUR6` 按层 `[+0x86]` 二选一。原先的
+   `Likely` 标注作废。
 
 ### 改动
 
@@ -11345,7 +11348,147 @@ soft vs wgpu 300 帧商业包 PNG                → sha256 一致
 
 ### 残余
 
-- `BLUR2/3/4/5` 的核未逐个反编译(见上),当前按盒式执行并标 `Likely`。
+- `BLUR2/3/4/5` 的核已逐个反编译(见上),不再有 `Likely` 标注。
 - `DIFFUSION`/`WHIRLPOOL`/`RASTER*` 在 wgpu 仍 skip;`DIFFUSION` 的动作码
   已定(0x0a → `FUN_004358d4`),下一步可按同一方法补。
 - `CGACT` 的**区域参数**对模糊是否生效未取证(语料未用区域 + 模糊)。
+
+## 成果 IDENTITY-HOST (2026-10-30) · 窗口标题/图标 + 游戏名/YU-RIS/内核版本变量下沉到宿主公共层
+
+### 改动
+
+- 新增 `crates/yu-engine/src/identity.rs`:`Identity`(游戏名、YU-RIS 版本、
+  内核版本、可选窗口图标),`Engine::identity()` 暴露给全部宿主。
+  来源全为数据自证 / 官方产物:
+  | 变量 | 来源 |
+  |---|---|
+  | 游戏名 | `ysbin/yscfg.ybn` 标题(CP932;官方装载器 `0x45dbb0` 拷到 `0x67fce0` 当窗口标题) |
+  | YU-RIS 版本 | `ysbin/ysc.ybn`(YSCM)容器头版本,495 ⇒ `0.495` |
+  | 内核版本 | `env!("CARGO_PKG_VERSION")` |
+  | 图标 | 工程根 `*.exe` 的 `RT_GROUP_ICON`/`RT_ICON`(`YSIcon.exe` 改写的同一资源) |
+- 图标解码器:`identity.rs` 内自写 PE 资源目录 + DIB(`BI_RGB` 8/24/32bpp)
+  解析,含 AND 掩码与"32bpp alpha 全 0 ⇒ 视作不透明"的旧式图标回调。
+  候选按"最接近 32px 优先、否则取最大"排序;PNG 压缩项暂不解,自动跳过。
+- `EngineOptions::with_icon`:桌面宿主置 true(启动期读 exe),headless/
+  用例默认 false(不付这次读盘);`Engine::restart()` 强制 false 复用旧身份。
+- `HostOptions::icon: Option<IconImage>` → winit `Icon::from_rgba`;
+  窗口标题缺省改成 `"<游戏名> · YU-RIS <版本> · yuris-kernel <版本>"`,
+  `--title` 仍可整体覆盖。
+- serve(windows-less 宿主)把同一份身份塞进 `/api/status.identity`
+  (`game` / `engine_version(_text)` / `kernel` / `kernel_version` / `icon`),
+  页面 `<title>`、面板新增的 `yuris`/`kernel` 行都从它来。
+- headless `yu-cli run` 末尾多打一行 `identity: …`。
+- 新探针 `crates/yu-engine/examples/identity_probe.rs`(可把图标写成 PNG,
+  便于与资源管理器里的 exe 图标肉眼对照)。
+
+### 验证(原始结果)
+
+```text
+cargo build --workspace --all-targets        → 0 error / 0 warning
+cargo run -p yu-engine --example identity_probe -- <project-eris>
+  game="(タイトル名)" yuris=0.495 kernel=yuris-kernel 0.1.0 icon=32x32
+  window title: (タイトル名) · YU-RIS 0.495 · yuris-kernel 0.1.0
+  与 System.Drawing.Icon.ExtractAssociatedIcon 抽出的 32×32 参考图逐字节一致(0/4096 差异)
+缺 exe 工程(散盘根无 exe)                  → icon=none,标题回退仍正确
+```
+
+### 残余
+
+- 只解 DIB 图标;若某作 `RT_ICON` 全是 PNG 压缩项(256×256 Vista 形态)则
+  回退到系统缺省图标(不伪造)。
+- `--title` 目前只覆盖标题,不覆盖图标(图标恒取工程 exe 资源)。
+
+## 成果 CGACT-FILTERS (2026-10-30) · `DIFFUSION`/`WHIRLPOOL`/`RASTER*` 逐个反编译并补上 wgpu 执行体
+
+### 取证(REA 0.495 `yu-ris.exe`,sha256 `4f5eefa3…81138f`)
+
+动作码与执行体由 `CGACT` 分派 `FUN_0042f809` 的调用点(每处 `mov eax, <code>`
++ `call 0x42f809`)与参数槽 `[0x684160+声明下标]` 的读取点配对得到:
+
+| 动作 | 下标 | action | 执行体 |
+|---|---|---|---|
+| `DIFFUSION` | 53 | `0x0a` | `FUN_004358d4` |
+| `RASTER` | 54 | `0x15` | 分派内联(0x42e880 块) |
+| `RASTER2` | 55 | `0x16` | 分派内联(0x42e811 块) |
+| `RASTER3` | 56 | `0x17` | `FUN_00431658`(`variant=3`) |
+| `WHIRLPOOL` | 61 | `0x27` | `FUN_00437368` |
+
+- **`DIFFUSION`** = 2×2 像素置换:整面 `memcpy` 后按 `SET/2` 轮、每轮正向
+  (`y` 步进 2、`x` 从 `it` 步进 2)+ 反向(`y` 从 `y1-1` 步退、`x` 从 `x1-1-it`
+  步退)扫块,每块取一次 `rand()%24` 按 `0x5b4780` 的 24×4 表重排四像素,
+  **只写 RGB**。随机源是 CRT `_rand()`(`0x46ac0c`,MSVC LCG,默认种子 1,
+  全 exe 仅本函数两处调用)。
+- **`RASTER` 族** = 行/列相位的正弦位移:`shift_x = round(sin((y+SET2)°·π/180)·SET)`、
+  `shift_y = round(cos((x+SET2)°·π/180)·SET)`,`SET` 是**幅度**、`SET2` 是**相位**;
+  水平下标夹到 `x1-1`(官方原样)。`RASTER` 只水平、`RASTER2` 只垂直、`RASTER3` 叠加。
+- **`WHIRLPOOL`** = 半径线性的旋涡:角度表 `SET/10·(1-r/maxr)` 度、
+  定点 `cos·256`/`sin·256` + 算术右移 8 位,半径 `trunc(hypot)`。
+  角度常量取 `0x58ed38` 的位模式(与 `π/180` 差在末位)。
+- **取整口径(重要)**:官方所有 `ROUND()` 都是 `fistp` + FPU 控制字
+  `or 0xC00`(RC=11)= **向零截断**,不是四舍五入(`0x43174b`/`0x4317a3`/
+  `0x4373ed`/`0x437490`/`0x4374af`/`0x437592`)。soft 用 `as i64/i32`
+  (同义)、wgpu 用 `i32(f32)`(同义);`round`/`round_ties_even` 全部改掉。
+  副作用:`RASTER SET2=90` 的位移是 **0**(f32 常量使 `sin` 得 0.99999999…)。
+
+### 改动
+
+- `crates/yu-render/soft/src/imagefilters.rs`:`apply_diffusion`(渲染器级 `seed`)/
+  `apply_whirlpool` / `apply_raster(amplitude, phase, RasterAxis)` 全部按官方语义
+  重写;旧实现(`xorshift` 位移 / 浮点旋涡 / 带宽环绕滚动)作废;`raster1` 死分支删除
+  (yscm 表里没有 `RASTER1`)。
+- `crates/yu-render/soft/src/render.rs`:`RenderState` 增 `diffusion_seed`,
+  `SoftRenderer` 持状态(一个渲染器 ≈ 一个引擎进程,跨帧延续、新渲染器从种子 1 重来)。
+- `crates/yu-render/wgpu/src/shaders/transform.wgsl`:新增 mode 16..20
+  (16/17/18 = RASTER/RASTER2/RASTER3,19 = WHIRLPOOL,20 = DIFFUSION 单遍);
+  扩散用 `lcg_jump`(仿射复合的二进制幂)按块号直接跳到第 k 个随机数,**纯 GPU**。
+- `crates/yu-render/wgpu/src/plan.rs`:扩散走 `2×(SET/2)` 次 fullscreen pass 的
+  ping-pong;`LayerSurfaces` 增 `diffusion_blocks` 计数器(跨帧累计,与 soft 同口径)。
+- `crates/yu-render/wgpu/src/pipelines.rs`:滤镜 uniform 增 `n: vec4<u32>`
+  (旋涡的 `maxr`、扩散的 `(方向, it, 基数, 每行块数)`)。
+
+### 验证(原始结果)
+
+```text
+cargo test -p yu-backend-soft --lib          → 53 passed
+cargo test -p yu-backend-wgpu --test wgpu    → 36 passed
+  (含 raster/raster2/raster3/whirlpool/diffusion 五条跨后端逐像素对拍
+   + diffusion_matches_soft_across_sizes:8 组尺寸 × SET)
+cargo build --workspace --all-targets        → 0 error
+```
+
+### 收尾(同日)· 取整口径取证 + 三个颜色滤镜重写
+
+**取整口径**:官方所有「浮点 → 整数」都是 `fistp` + FPU 控制字 `or 0xC00`
+(RC=11)= **向零截断**(全 exe 61 处,是 MSVC `(int)` 的通用惯例)。原先
+`round_ties_even`/`round` 的写法全部改掉(soft 用 `as i64/i32`、wgsl 用
+`i32(f32)`,同义)。副作用:`RASTER SET2=90` 的位移是 0(f32 常量使 `sin`
+得 `0.99999999…`,截断后为 0)。
+
+**扩展审查**:`CGACT` 的 17 个执行体里**只有 `WHIRLPOOL` 与 `RASTER` 族有
+浮点**,其余(模糊族/`DIFFUSION`/`MONO`/`MEIDO`/`SAIDO`/`AKARUSA`/`SEPIA`/
+`REVERSE`)一条浮点指令都没有 ⇒ 我们给 `SAIDO`/`AKARUSA`/`SEPIA` 用 f64 +
+四舍五入是**没有依据**的。三个执行体已逐个反编译并按整数公式重写:
+
+| 动作 | 官方执行体 | 旧实现(错) | 新实现(对官方) |
+|---|---|---|---|
+| `SAIDO` | `FUN_00436bdc` | Rec.601 灰度 + f64 四舍五入 | 灰度 = `(r+g+b)/3`;`SET<128` 用 `k=128-SET`、`SET>=128` 按溢出/下溢收缩 k;全程 `>>7` |
+| `AKARUSA` | `FUN_00431b40` | 乘法 `px*SET/128` | **加法** `clamp(px + SET - 128, 0, 255)`(`SET>=0x80` 查的 `DAT_00689e60` 用内存探针验证 400 项零偏差 = `clamp(i-128)`) |
+| `SEPIA` | `FUN_004371cc` | BT.601 经典矩阵(猜) | `l10 = 117B+601G+306R`(BGRA 序)、`base=l10<<10`、三通道 `trunc((base+C)/2^20)` 后夹取 |
+
+两后端同步改(`transform.wgsl` mode 4/5/7),新增对拍用例
+`saido_akarusa_sepia_match_soft`;soft 单测改成手算锚点
+(`saido_64_lerps_toward_plain_average`、`saido_192_above_neutral_shrinks_k_on_overflow`、
+`akarusa_192_adds_64`、`sepia_uses_official_bgra_weights`)。
+
+### 残余
+
+- 三角函数精度:官方 x87 `fsin/fcos`(double 参数、80 位中间结果),soft 用
+  `f64`、wgpu 用 `f32`;截断语义下只有乘积贴近整数 ±1e-9 时可能差 1 像素。
+- 区域参数(`X/Y/X2/Y2`)对这三族未接线(与 `BLUR` 族同现状);语料无该用法。
+- 仍属「模型」而非取证:`ROTATION`(官方 `CGACT` 链里没有像素旋转执行体,
+  应是绘制期变换)、`MERGE`/`MERGE2`(D3D9 绘制)、`TRANSITION`(D3D 混合)、
+  `SIZE/SIZE2/RESIZE`(D3D StretchRect)。
+- **已知 flaky**:`yu-backend-wgpu --test wgpu` 在**并行**跑 37 个用例时偶发
+  一次失败(约 1/6 观察到 2 次,20 轮压测未复现),症状是 GPU 表面只剩清屏色
+  (该层没画上),单独跑该用例 8/8 通过、`--test-threads=1` 亦无失败。疑与
+  同时创建多个 wgpu device 的驱动侧竞争有关,尚未定位。
