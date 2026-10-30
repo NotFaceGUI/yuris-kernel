@@ -11282,3 +11282,70 @@ yu-cli run <project-eris> --frames 200       → BNO 诊断 0,仅 EMOTE(deferred
 
 - 8 槽里脚本只能选 0/1(checker 限制);内核按 0..=7 clamp,与引擎数组同界。
 - `PITCH`/`LANG`(FONT 参数表里没有,`TextStyle` 只留值)仍无页。
+
+## 成果 CGACT-BLUR (2026-10-30) · 模糊族按 REA 定案:可分离盒式、半径=SET、alpha 保留;wgpu 补两遍 pass
+
+### 问题
+
+商业包对话文字(`data\script\eris\es_textdraw_blur.yst`,s30)的**黑色大块阴影**
+在我们这里没有。链路是:
+
+```
+CGEND / CG[FILE=""] / CGACT[RECTPAINT2 SET=0]
+CGACT[TEXT=1 BNO=1 SET=3 X=.. Y=.. SETSTR=..]   ← 多遍偏移写字
+CGACT[BLUR6=1 SET=5]                             ← 模糊
+CGACT[BLUR5=1 SET=7] / SET=5                     ← 再模糊(IF 两分支)
+CGACT[ID=_FONT_TMP ID2=$dst MERGE=1 X=.. Y=..]    ← 合并到正文层
+```
+
+`BLUR5`/`BLUR6` 在 **wgpu 上完全没有处理器**(`grep blur plan.rs` 零命中),
+所以影子层没被模糊;而 soft 虽然有,但算法有两处与官方不符、半径还是猜的。
+
+### 取证(REA 0.495)
+
+1. **动作码表**:`FUN_0042f809` 是 `CGACT` 图像动作分派(按 `AL` 分派)。
+   由各参数槽读取点(`0x684160+idx`)反推得到:
+   `BLUR(47)=0x02`、`BLUR2(48)=0x03`、`BLUR3(49)=0x04`、`BLUR4(50)=0x05`、
+   `BLUR5(51)=0x06`、`BLUR6(52)=0x07`、`DIFFUSION(53)=0x0a`。
+   即**六个模糊是六个不同函数**(`FUN_00431d28`/`43265c`/`432e58`/`433718`/
+   `434748`/`434b7c`),不是"同一个模糊 × 档位"。
+2. **半径**:六个函数的 prologue 一致 —— `iVar = (SET > 0) ? SET : 1`
+   (`be 01 00 00 00 / 7e 02 8b f2` 形态),即 **radius = max(1, SET)**。
+3. **算法**(`FUN_00431d28` = BLUR 与 `FUN_00434b7c` = BLUR6 逐行读):
+   **可分离盒式**——水平遍写临时缓冲、垂直遍写回;R/G/B 各自
+   `acc / 实际像素数` 整数除法;**窗口在区域边界收缩**
+   (`lo=max(x0,x-r)`,`hi=min(x1,x+r)`,除数 = `hi-lo+1`),不是夹取重复边缘;
+   **alpha 不参与平均**,从源图原样拷贝(`*(dst+3) = *(src+3)`)。
+4. **残余**:`BLUR2/3/4/5` 未逐个反编译;六者字节相似度仅 10–66%,是不同
+   实现 ⇒ 核按已证的盒式执行,标 `Likely`,不声称已证。
+
+### 改动
+
+- `crates/yu-render/soft/src/imagefilters.rs`:`apply_blur` 改为官方语义 ——
+  R/G/B 三通道平均、边界收缩、**alpha 从源图带回**;文档写明 REA 锚点。
+- `crates/yu-render/soft/src/render.rs`:`BLUR`/`BLUR2..6` 统一
+  `radius = set.max(1)`(删掉 `set × 档位` 的猜测)。
+- `crates/yu-render/wgpu/src/shaders/transform.wgsl`:新增 mode 10/11 =
+  水平/垂直盒式模糊(窗口收缩、除数 = 实际像素数、alpha 保留)。
+- `crates/yu-render/wgpu/src/plan.rs`:模糊动作走**两遍 pass**(src → 临时
+  表面 → 输出),与官方"水平 → 临时缓冲 → 垂直"同序;不再落到 skip。
+- 新用例 `blur_is_two_pass_box_and_matches_soft`:3×1 渐变
+  `R=[0,100,200]`、`SET=1`,手算 `[50,100,150]`、alpha 保持 255,且两后端
+  逐像素一致、无 skip。
+
+### 验证(原始结果)
+
+```text
+cargo build --workspace --all-targets        → 0 error / 0 warning
+cargo test -p yu-backend-wgpu --test wgpu    → 27 passed(含新模糊用例)
+cargo test --workspace                       → 仅 yu-trace 过期 golden(既有)
+商业包 1800 帧                                → UNIMP 0
+soft vs wgpu 300 帧商业包 PNG                → sha256 一致
+```
+
+### 残余
+
+- `BLUR2/3/4/5` 的核未逐个反编译(见上),当前按盒式执行并标 `Likely`。
+- `DIFFUSION`/`WHIRLPOOL`/`RASTER*` 在 wgpu 仍 skip;`DIFFUSION` 的动作码
+  已定(0x0a → `FUN_004358d4`),下一步可按同一方法补。
+- `CGACT` 的**区域参数**对模糊是否生效未取证(语料未用区域 + 模糊)。

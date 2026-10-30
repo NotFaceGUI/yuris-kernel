@@ -32,7 +32,7 @@
 | DIV-GFX-010 | 帧清屏 | open | `default_black` | 引擎帧入口/设备初始化观测 |
 | DIV-GFX-011 | `LINT/LINT2/TSX/TSY/MIPMAP/TEX/DXBUF/DXDRAW/RID/MFILE/CASH` | **fixed(no-manual)** | 逐项定案:`LINT/LINT2`=按钮号字段、`TSX/TSY/MFILE/CASH` CG 从不读取、`DXDRAW` 只受全局开关门控、`MIPMAP` 无 mip 链、`DXBUF` 是全局开关、`RID`=资源图(缺 provider) | DIV-GFX-069 §2 |
 | DIV-GFX-012 | 文本字形栅格化/排版 | **fixed(P2)** | 两条路径都执行:①`CGACT[TEXT]`→`TextDraw`→图层基图合成(ERIS 正文);②`TEXT[ID]` 自动层→`_TEXT_FLAG` 逐字 `'1'/'2'` 排版(`layout_text`)→屏幕/图层覆盖。字形用 `yu-font`;soft/wgpu 同帧逐像素一致 | 行距/基线/GDI 栅格差异见 DIV-GFX-056、DIV-FONT-002 |
-| DIV-GFX-013 | `CGACT` 图像加工像素 | partial | **soft 全量实现**(手册有页的全族 + 无页 `SIZE3/4/5`/`BLUR2..6`/`ROTATION2` 按同族);wgpu 缺 `BLUR*`/`DIFFUSION`/`WHIRLPOOL`/`RASTER*` 的 GPU 路径(报 skip,待 `gpu.cpu_fallback.<action>` 或 shader);`TEXCOPY/TEXSSCOPY` 手册无页,ERIS 3 处全为自复制,保持 Unimplemented | 两后端逐动作对拍 + wgpu 滤镜 shader/回退标注 |
+| DIV-GFX-013 | `CGACT` 图像加工像素 | partial | **soft 全量实现**(手册有页的全族 + 无页 `SIZE3/4/5`/`BLUR2..6`/`ROTATION2` 按同族);**模糊族已定案(2026-10-30)**:action 码 `BLUR 0x02..BLUR6 0x07`(REA `FUN_0042f809`),算法 = 可分离盒式、半径 `max(1,SET)`、R/G/B 整数平均、边界收缩、alpha 保留(`FUN_00431d28`/`FUN_00434b7c` 逐行);soft 与 wgpu(mode 10/11 两遍)都实现且逐像素一致,`BLUR2/3/4/5` 核未逐个反编译 ⇒ 标 `Likely`。wgpu 仍缺 `DIFFUSION`/`WHIRLPOOL`/`RASTER*`(报 skip);`TEXCOPY/TEXSSCOPY` 手册无页,ERIS 3 处全为自复制,保持 Unimplemented | 两后端逐动作对拍 + wgpu 滤镜 shader/回退标注 |
 | DIV-GFX-016 | `CG` 无 `FILE` 的 get-or-create | open | 建无纹理层(不绘制) | 重新锚定 CG 处理体 |
 | DIV-GFX-017 | COPY 属性复制范围 | fixed | REA 块明确 A/E/MODE/T/TA/X/Y/尺寸/TID/MID/滤镜,未见 Z;当前保持复制 Z(Likely),调用点未定位前不改 | 重新锚定 Z 字段/调用点 |
 | DIV-GFX-043 | 按钮状态后缀 `_na/_off/_on/_over` | **fixed(J3)** | 脚本用 `FILEINFO[EXIST=1]` 探测后拼名;`yu-rt` 已实现 FILE+EXIST+LET(EVID-J3-01,REA `0x44286c`)。title `asset.missing=0`,`ops 27/27/0` | `docs/title-motion-ledger.md` §9.1 |
