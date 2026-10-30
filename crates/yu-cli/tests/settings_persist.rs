@@ -76,7 +76,8 @@ fn rebuild_gsd(source: &Path, patch_master: Option<i64>) -> Vec<u8> {
     let bytes = std::fs::read(source).expect("read gsd.sd");
     let origin = b"gsd.sd";
     let save = YssdSave::parse(&bytes, origin).expect("parse gsd.sd");
-    let mut writer = YssdWriter::default();
+    // 沿用源文件的容器版本。
+    let mut writer = YssdWriter::new(save.version);
     for entry in &save.entries {
         match entry.btype {
             0 => {

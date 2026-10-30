@@ -246,17 +246,26 @@ fn yscf_real_fixture_and_engine_checks() {
 }
 
 #[test]
-fn ystd_real_fixture_and_version_check() {
+fn ystd_real_fixture_and_version_is_recorded_not_gated() {
     let bytes = load_fix("ystd.ybn");
     let header = YstdHeader::parse(&bytes, b"fixtures/yst.ybn").unwrap();
     assert_eq!(header.version, 495);
     assert_eq!(header.var_count, 4600);
     assert_eq!(header.slot_count(), 4601);
     assert_eq!(header.unknown, 396);
+    // 版本只记录:换成 0.481 商业包的值(481)或任意值都应照常解析。
+    for version in [481u32, 494, 0x1EF] {
+        let mut other = bytes.clone();
+        other[4..8].copy_from_slice(&version.to_le_bytes());
+        let parsed = YstdHeader::parse(&other, b"other").expect("版本不参与校验");
+        assert_eq!(parsed.version, version);
+        assert_eq!(parsed.var_count, 4600);
+    }
+    // 结构缺陷仍然拒绝:varCount = u32::MAX(槽位 +1 溢出)。
     let mut bad = bytes;
-    bad[4..8].copy_from_slice(&494u32.to_le_bytes());
+    bad[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
     let err = YstdHeader::parse(&bad, b"bad").unwrap_err();
-    assert_eq!(err.code, code::VERSION);
+    assert_eq!(err.code, code::LIMIT);
 }
 
 #[test]

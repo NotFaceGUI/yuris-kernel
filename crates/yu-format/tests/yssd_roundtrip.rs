@@ -49,7 +49,8 @@ fn official_sd_files_roundtrip_byte_exact() {
         // 1) 容器级重建:type 0/1 经 compress2(level=1) 重编码;type 2 外层
         //    保持裸多子块、内层子块各自重压缩;块按 DNO 升序落盘 ⇒ 整文件
         //    逐字节一致(头/偏移表/块序/压缩流全对齐)。
-        let mut writer = YssdWriter::default();
+        // 沿用源文件版本(0x138/0x1E0/0x1E1 都可能;不写死常量)。
+        let mut writer = YssdWriter::new(save.version);
         for entry in &save.entries {
             let entry_dno = entry.dno;
             let body = match entry.btype {

@@ -4,22 +4,23 @@
 //!
 //! ```text
 //! +0x00 char[4] "YSTD"
-//! +0x04 u32     版本 —— 引擎显式校验 == 495,否则报错(0x19a28)
+//! +0x04 u32     版本 —— 0.495 引擎显式校验 == 495(0x19a28);商业构建各有
+//!               自己的值(实测 0.481 = 481)。**读取不校验**,只记录
 //! +0x08 u32     varCount(槽位数 = varCount + 1,下标 0 保留;每槽 64 字节)
 //! +0x0C u32     未知(引擎存入 DAT_0080174c;原样保留)
 //! ```
+//!
+//! 版本是构建戳而不是布局选择器:实测版本的头部同构,合法性由 `varCount`
+//! 与 `ysv` 槽位上界决定,不按版本等值拒绝。
 
 use crate::container::{read_header, u32_at};
 use crate::code;
 use yu_log::{Boundary, Diag};
 
-/// 引擎要求的 YSTD 版本(0x1EF)。
-pub const REQUIRED_VERSION: u32 = 495;
-
 /// 已解码的槽位表头。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct YstdHeader {
-    /// 版本(必须 495)。
+    /// 版本(只记录,不校验;0.495 = 495,0.481 商业包 = 481)。
     pub version: u32,
     /// 变量槽数基数(实际槽位数 = `var_count + 1`)。
     pub var_count: u32,
@@ -28,17 +29,9 @@ pub struct YstdHeader {
 }
 
 impl YstdHeader {
-    /// 解码 `yst.ybn` 字节,执行与引擎相同的版本校验。
+    /// 解码 `yst.ybn` 字节(头 + `varCount` 自洽;版本只记录)。
     pub fn parse(buf: &[u8], origin: &[u8]) -> Result<Self, Diag> {
         let header = read_header(buf, origin, b"YSTD")?;
-        if header.version != REQUIRED_VERSION {
-            return Err(Diag::fatal(code::VERSION, Boundary::Format)
-                .at_data(origin, 4)
-                .with_detail(format!(
-                    "YSTD 版本必须为 {REQUIRED_VERSION}(引擎 0x19a28 报错),实际 {}",
-                    header.version
-                )));
-        }
         if buf.len() < 16 {
             return Err(crate::container::truncated(origin, 16, buf.len(), "YSTD 头"));
         }

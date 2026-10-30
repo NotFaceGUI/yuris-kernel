@@ -15,8 +15,10 @@
 //!   重编码逐字节一致,`tests/yssd_roundtrip.rs` 全量断言)。旧线另一
 //!   语料的 SNP 形态在本语料未出现 ⇒ 不实现、挂账(见模块尾)。
 //!
-//! 注意:存档容器版本是 `0x1E0`(480),**不是** `yst.ybn` 的 495 ——
-//! YSSD 容器版本在 0.495 引擎中未随引擎版本变化(官方产物实测)。
+//! 注意:容器版本是**格式修订号**,与引擎版本号没有换算关系 —— 0.479 SDK
+//! 样例 `0x138`、0.495 SDK 样例 `0x1E0`、0.481 商业包 `0x1E1`,三者布局
+//! 逐字节同构。因此读取**不校验版本**,只做结构自检(魔数 / 偏移表容量 /
+//! DNO 连续 / 边界 / zlib 闭合);写回版本由调用方指定。
 //!
 //! 净室声明:实现为本仓库新写;flate2(双后端下 C zlib 优先)用于保证
 //! `compress2(level=1)` 逐字节复现。
@@ -30,14 +32,11 @@ use yu_log::{Boundary, Diag};
 /// YSSD 魔数。
 pub const MAGIC: [u8; 4] = *b"YSSD";
 
-/// 官方 0.495 产物与旧线语料一致的容器版本。
-pub const REQUIRED_VERSION: u32 = 0x1E0;
+/// 默认偏移表容量(官方产物恒 0x400)。读取以头部 `+0x0C` 为准。
+pub const DEFAULT_OFFSET_TABLE_LEN: u32 = 0x400;
 
-/// 偏移表容量(官方产物恒 0x400;DNO 1..=0x400)。
-pub const OFFSET_TABLE_LEN: u32 = 0x400;
-
-/// 头 + 偏移表的总字节数(数据区从 0x1010 起;官方产物首个块偏移即此值)。
-pub const TABLE_END: usize = 0x10 + OFFSET_TABLE_LEN as usize * 4;
+/// 默认「头 + 偏移表」字节数(数据区起点;官方产物首个块偏移即此值)。
+pub const DEFAULT_TABLE_END: usize = 0x10 + DEFAULT_OFFSET_TABLE_LEN as usize * 4;
 
 /// 一个 YSSD 块(压缩形态;载荷不在此解压)。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,16 +56,18 @@ pub struct YssdEntry {
 }
 
 impl YssdEntry {
-    /// 解压载荷(0.495 = zlib;判据 = RFC1950 头)。
+    /// 解压载荷。两代压缩层并存:0.495 SDK 语料 = zlib level 1(块首
+    /// `78 01`);商业包(0.481,随包带 `YSSnp.dll`)= Google Snappy。
+    /// 先按 zlib 解,失败再按 Snappy 解;两者都不成立才报 `fmt.yssd.codec`。
     pub fn decompress(&self, origin: &[u8]) -> Result<Vec<u8>, Diag> {
-        zlib_decompress(&self.compressed, self.ulen, origin, self.dno)
+        decompress_payload(&self.compressed, self.ulen, origin, self.dno)
     }
 }
 
 /// 已解析的存档容器。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct YssdSave {
-    /// 容器版本(`REQUIRED_VERSION`)。
+    /// 容器版本(只记录,不参与校验;实测 0x138/0x1E0/0x1E1 布局同构)。
     pub version: u32,
     /// 块(按文件出现顺序;官方产物 = DNO 升序)。
     pub entries: Vec<YssdEntry>,
@@ -79,41 +80,46 @@ impl YssdSave {
     /// (官方产物块区连续到文件尾)。
     pub fn parse(buf: &[u8], origin: &[u8]) -> Result<Self, Diag> {
         let header = read_header(buf, origin, &MAGIC)?;
-        if header.version != REQUIRED_VERSION {
-            return Err(Diag::fatal(code::VERSION, Boundary::Format)
-                .at_data(origin, 4)
-                .with_detail(format!(
-                    "YSSD 版本必须为 {REQUIRED_VERSION:#x}(官方 0.495 产物实测),实际 {:#x}",
-                    header.version
-                )));
+        // 版本只记录、不校验:0x138/0x1E0/0x1E1
+        // 布局同构,真正的合法性由下面的结构自检决定。
+        let capacity = header.word0c as usize;
+        if capacity == 0 {
+            return Err(Diag::fatal(code::LIMIT, Boundary::Format)
+                .at_data(origin, 0x0C)
+                .with_detail("YSSD 偏移表容量为 0(块表无处寻址)"));
         }
-        let capacity = header.word0c;
-        if capacity != OFFSET_TABLE_LEN {
-            // 偏移表容量决定数据区起点;非 0x400 的容器在本语料与旧线语料
-            // 均未出现,表寻址(`0x10 + (DNO-1)*4`)随之失效 ⇒ 拒绝,不猜。
+        // 块号槽是 u16(DNO 1..=capacity);容量超过 u16 上限无法建索引。
+        if capacity > usize::from(u16::MAX) + 1 {
             return Err(Diag::fatal(code::LIMIT, Boundary::Format)
                 .at_data(origin, 0x0C)
                 .with_detail(format!(
-                    "YSSD 偏移表容量必须为 {OFFSET_TABLE_LEN:#x}(官方产物恒值),实际 {capacity:#x}"
+                    "YSSD 偏移表容量 {capacity:#x} 超出 16 位块号槽上限"
                 )));
         }
-        if buf.len() < TABLE_END {
-            return Err(truncated(origin, TABLE_END, buf.len(), "YSSD 头+偏移表"));
+        let table_end = capacity
+            .checked_mul(4)
+            .and_then(|bytes| 0x10usize.checked_add(bytes))
+            .ok_or_else(|| {
+                Diag::fatal(code::LIMIT, Boundary::Format)
+                    .at_data(origin, 0x0C)
+                    .with_detail(format!("YSSD 偏移表容量 {capacity:#x} 导致表长溢出"))
+            })?;
+        if buf.len() < table_end {
+            return Err(truncated(origin, table_end, buf.len(), "YSSD 头+偏移表"));
         }
-        let table_len = OFFSET_TABLE_LEN as usize;
         let mut entries = Vec::new();
-        let mut index: Vec<Option<u16>> = vec![None; table_len];
-        for (i, cell) in buf[0x10..TABLE_END].chunks_exact(4).enumerate() {
+        let mut index: Vec<Option<u16>> = vec![None; capacity];
+        for (i, cell) in buf[0x10..table_end].chunks_exact(4).enumerate() {
             let off = u32::from_le_bytes([cell[0], cell[1], cell[2], cell[3]]) as usize;
             if off == 0 {
                 continue;
             }
             // 块至少要有 0x10 字节头;偏移必须落在数据区内。
-            if off < TABLE_END || off > buf.len().saturating_sub(0x10) {
+            if off < table_end || off > buf.len().saturating_sub(0x10) {
                 return Err(Diag::fatal(code::COUNT, Boundary::Format)
                     .at_data(origin, (0x10 + i * 4) as u64)
                     .with_detail(format!(
-                        "YSSD 偏移表[{}](DNO={})偏移 {off:#x} 越界(文件 {} 字节,数据区自 {TABLE_END:#x})",
+                        "YSSD 偏移表[{}](DNO={})偏移 {off:#x} 越界(文件 {} 字节,数据区自 {table_end:#x})",
                         i + 1,
                         i + 1,
                         buf.len()
@@ -158,10 +164,12 @@ impl YssdSave {
     /// 按 DNO 取块(DNO 0 或超出表容量 = `None`)。
     #[must_use]
     pub fn entry(&self, dno: u32) -> Option<&YssdEntry> {
-        if dno == 0 || dno > OFFSET_TABLE_LEN {
-            return None;
-        }
-        self.index[(dno - 1) as usize].and_then(|slot| self.entries.get(usize::from(slot)))
+        let slot = usize::try_from(dno).ok()?.checked_sub(1)?;
+        self.index
+            .get(slot)
+            .copied()
+            .flatten()
+            .and_then(|i| self.entries.get(usize::from(i)))
     }
 }
 
@@ -388,15 +396,28 @@ pub fn encode_block_body(btype: u8, strict: u8, var_id: u16, raw_payload: &[u8])
 
 /// 存档容器写出器(`SAVE[FILE]` 刷盘形态)。
 ///
-/// 头 = `magic + 0x1E0 + 块数 + 0x400` + 全零偏移表(逐块回填);块按
+/// 头 = `magic + 版本 + 块数 + 0x400` + 全零偏移表(逐块回填);块按
 /// **DNO 升序**落盘(官方产物实测:extra 11,12,21,22,31,41;gsd 1..4;
 /// save30001 1..8 均升序)。
-#[derive(Debug, Default)]
+///
+/// 版本由调用方给出(**没有默认常量**):读改写应沿用源文件版本,
+/// 新建存档应沿用同一存档目录里既有 `.sd` 的版本(见 `yu-save`)。
+#[derive(Debug)]
 pub struct YssdWriter {
     blocks: Vec<(u32, Vec<u8>)>,
+    version: u32,
 }
 
 impl YssdWriter {
+    /// 指定写出的容器版本(调用方从源文件/同目录存档学习,不猜)。
+    #[must_use]
+    pub fn new(version: u32) -> Self {
+        Self {
+            blocks: Vec::new(),
+            version,
+        }
+    }
+
     /// 登记一块(DNO 1..=1024,手册 `file/save.html` 值域)。
     pub fn set_block(&mut self, dno: u32, body: Vec<u8>) {
         debug_assert!(
@@ -420,13 +441,13 @@ impl YssdWriter {
         for (dno, body) in self.blocks {
             latest.insert(dno, body);
         }
-        let mut out = Vec::with_capacity(TABLE_END + latest.len() * 64);
+        let mut out = Vec::with_capacity(DEFAULT_TABLE_END + latest.len() * 64);
         out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&REQUIRED_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&(latest.len() as u32).to_le_bytes());
-        out.extend_from_slice(&OFFSET_TABLE_LEN.to_le_bytes());
+        out.extend_from_slice(&DEFAULT_OFFSET_TABLE_LEN.to_le_bytes());
         let table_at = out.len();
-        out.resize(table_at + OFFSET_TABLE_LEN as usize * 4, 0);
+        out.resize(table_at + DEFAULT_OFFSET_TABLE_LEN as usize * 4, 0);
         for (dno, body) in latest {
             let off = out.len() as u32;
             out.extend_from_slice(&dno.to_le_bytes());
@@ -495,7 +516,32 @@ pub struct YssdSubBlock {
 
 impl YssdSubBlock {
     pub fn decompress(&self, origin: &[u8], dno: u32) -> Result<Vec<u8>, Diag> {
-        zlib_decompress(&self.compressed, self.ulen, origin, dno)
+        decompress_payload(&self.compressed, self.ulen, origin, dno)
+    }
+}
+
+/// 块载荷解压:两代压缩层并存 —— 0.495 SDK 语料 = zlib level 1;商业包
+/// (0.481,随包带 `YSSnp.dll`)= Google Snappy。先 zlib 后 Snappy,两者都
+/// 不成立才报 `fmt.yssd.codec`。
+fn decompress_payload(
+    src: &[u8],
+    expected_len: u32,
+    origin: &[u8],
+    dno: u32,
+) -> Result<Vec<u8>, Diag> {
+    match zlib_decompress(src, expected_len, origin, dno) {
+        Ok(raw) => Ok(raw),
+        Err(zlib_err) => match crate::snappy::decompress(src, expected_len) {
+            Ok(raw) => Ok(raw),
+            Err(snappy_err) => Err(codec_diag(
+                origin,
+                dno,
+                format!(
+                    "压缩层既不是 zlib 也不是 snappy(zlib: {};snappy: {snappy_err})",
+                    zlib_err.detail
+                ),
+            )),
+        },
     }
 }
 
@@ -611,19 +657,19 @@ mod tests {
             dims: vec![3],
             data: vec![0u8; 24],
         };
-        let mut writer = YssdWriter::default();
+        let mut writer = YssdWriter::new(0x1234);
         writer.set_block(2, encode_block_body(0, 1, 0x0a43, &payload.to_bytes()));
         writer.set_block(1, encode_block_body(0, 1, 0x0a44, &payload.to_bytes()));
         let bytes = writer.build();
         let save = YssdSave::parse(&bytes, b"synthetic").expect("parse");
-        assert_eq!(save.version, REQUIRED_VERSION);
+        assert_eq!(save.version, 0x1234);
         assert_eq!(save.entries.len(), 2);
         // 块按 DNO 升序落盘。
         assert_eq!(save.entries[0].dno, 1);
         assert_eq!(save.entries[1].dno, 2);
         assert_eq!(save.entry(2).expect("dno2").var_id, 0x0a43);
         // 容器级往返:重建字节完全一致。
-        let mut again = YssdWriter::default();
+        let mut again = YssdWriter::new(0x1234);
         for entry in &save.entries {
             let raw = entry.decompress(b"synthetic").expect("decompress");
             again.set_block(
@@ -657,22 +703,73 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_wrong_magic_and_version() {
-        let mut bytes = vec![b'X', b'S', b'S', b'D'];
-        bytes.extend_from_slice(&REQUIRED_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&[0u8; 8]);
-        bytes.resize(TABLE_END, 0);
+    fn parse_accepts_any_version_but_checks_structure() {
+        // 魔数错 ⇒ MAGIC。
+        let mut bad_magic = vec![b'X', b'S', b'S', b'D'];
+        bad_magic.extend_from_slice(&0x1234u32.to_le_bytes());
+        bad_magic.extend_from_slice(&[0u8; 8]);
+        bad_magic.resize(DEFAULT_TABLE_END, 0);
         assert_eq!(
-            YssdSave::parse(&bytes, b"t").expect_err("magic").code,
+            YssdSave::parse(&bad_magic, b"t").expect_err("magic").code,
             code::MAGIC
         );
-        let mut bytes2 = vec![b'Y', b'S', b'S', b'D'];
-        bytes2.extend_from_slice(&0x1EFu32.to_le_bytes());
-        bytes2.extend_from_slice(&[0u8; 8]);
-        bytes2.resize(TABLE_END, 0);
+
+        // 版本不校验:0x138 / 0x1E0 / 0x1E1 / 未知值都按结构接受,版本原样保留。
+        for version in [0x138u32, 0x1E0, 0x1E1, 0x1EF] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"YSSD");
+            bytes.extend_from_slice(&version.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // 块数
+            bytes.extend_from_slice(&DEFAULT_OFFSET_TABLE_LEN.to_le_bytes());
+            bytes.resize(DEFAULT_TABLE_END, 0);
+            let save = YssdSave::parse(&bytes, b"t").expect("结构合法即接受");
+            assert_eq!(save.version, version);
+            assert!(save.entries.is_empty());
+        }
+
+        // 容量为 0 ⇒ LIMIT(块表无处寻址)。
+        let mut zero = Vec::new();
+        zero.extend_from_slice(b"YSSD");
+        zero.extend_from_slice(&0x1234u32.to_le_bytes());
+        zero.extend_from_slice(&0u32.to_le_bytes());
+        zero.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(
-            YssdSave::parse(&bytes2, b"t").expect_err("version").code,
-            code::VERSION
+            YssdSave::parse(&zero, b"t").expect_err("capacity").code,
+            code::LIMIT
         );
+    }
+
+    #[test]
+    fn parse_uses_header_capacity_not_a_constant() {
+        // 4 槽表 + 1 块(DNO=2):容量来自头部 +0x0C,不是写死的 0x400。
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"YSSD");
+        bytes.extend_from_slice(&0x1E1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // 块数
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // 容量 4
+        let table_at = bytes.len();
+        bytes.resize(table_at + 4 * 4, 0);
+        let block_at = bytes.len() as u32;
+        bytes[table_at + 4..table_at + 8].copy_from_slice(&block_at.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // dno
+        bytes.push(0); // btype
+        bytes.push(1); // strict
+        bytes.extend_from_slice(&0x1234u16.to_le_bytes()); // var_id
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // clen
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // ulen
+
+        let save = YssdSave::parse(&bytes, b"t").expect("parse");
+        assert_eq!(save.entry(2).expect("dno2").var_id, 0x1234);
+        assert!(save.entry(1).is_none());
+        assert!(save.entry(5).is_none(), "超出表容量 = None");
+    }
+
+    #[test]
+    fn writer_preserves_requested_version() {
+        let mut writer = YssdWriter::new(0x1E1);
+        writer.set_block(1, encode_block_body(0, 1, 0x0a44, &[0u8; 8]));
+        let bytes = writer.build();
+        let save = YssdSave::parse(&bytes, b"t").expect("parse");
+        assert_eq!(save.version, 0x1E1);
     }
 }

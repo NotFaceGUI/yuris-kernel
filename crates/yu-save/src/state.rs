@@ -82,6 +82,9 @@ pub struct SaveState {
     writable: bool,
     /// 盘上槽表(按文件名排序;`refresh_slots` 重建)。
     slots: BTreeMap<String, SlotFile>,
+    /// 存档容器版本:从盘上 `.sd` 学到的值(写回时沿用;`None` = 还没见过
+    /// 任何存档)。容器版本是格式修订号,与引擎版本无关,所以不写死常量。
+    container_version: Option<u32>,
     /// 未刷盘预约(DNO → 快照;同 DNO 覆盖)。
     reservations: BTreeMap<u32, ReservedFact>,
     /// 诊断(容量上限 [`MAX_DIAGS`],超限丢最旧并记账)。
@@ -103,6 +106,7 @@ impl SaveState {
             root: root.into(),
             writable,
             slots: BTreeMap::new(),
+            container_version: None,
             reservations: BTreeMap::new(),
             diags: std::collections::VecDeque::new(),
             diags_dropped: 0,
@@ -189,6 +193,8 @@ impl SaveState {
             };
             match yu_format::yssd::YssdSave::parse(&bytes, name.as_bytes()) {
                 Ok(save) => {
+                    // 第一次见到存档即记住容器版本;后续写盘沿用它。
+                    self.container_version.get_or_insert(save.version);
                     let mut dnos = BTreeMap::new();
                     for entry in &save.entries {
                         // 配置/多变量块没有单一目标变量 ⇒ 记 0。
@@ -375,8 +381,22 @@ impl SaveState {
         Ok(())
     }
 
+    /// 盘上已知的存档容器版本(从 `.sd` 学习或宿主注入)。
+    #[must_use]
+    pub fn container_version(&self) -> Option<u32> {
+        self.container_version
+    }
+
+    /// 宿主注入存档容器版本(盘上没有任何 `.sd` 可参照时使用)。
+    pub fn set_container_version(&mut self, version: u32) {
+        self.container_version = Some(version);
+    }
+
     /// `SAVE[FILE="x"]`:刷盘。按 DNO 升序流出**预约时**的快照
     /// (REA `0x44cd5a..0x44ceab`:写头/偏移表 + 逐块写;预约表不清)。
+    ///
+    /// 容器版本:目标文件已存在 → 沿用它的;否则用同目录学到的版本;
+    /// 都没有 ⇒ 显式拒绝(不猜版本号)。
     pub fn flush(&mut self, file: &str) -> Result<(), Diag> {
         if !self.writable {
             return Err(error::recoverable(
@@ -384,7 +404,18 @@ impl SaveState {
                 format!("SAVE[FILE={file}] 拒绝:save 根为只读模式(显式构造)"),
             ));
         }
-        let mut writer = yu_format::yssd::YssdWriter::default();
+        let path = self.confined_path(file)?;
+        let version = existing_container_version(&path)
+            .or(self.container_version)
+            .ok_or_else(|| {
+                error::recoverable(
+                    code::CONTAINER,
+                    format!(
+                        "SAVE[FILE={file}]: 无法确定存档容器版本(save 目录里没有可参照的 .sd)"
+                    ),
+                )
+            })?;
+        let mut writer = yu_format::yssd::YssdWriter::new(version);
         for fact in self.reservations.values() {
             match fact.btype {
                 0 => {
@@ -428,9 +459,14 @@ impl SaveState {
             }
         }
         let bytes = writer.build();
-        let path = self.confined_path(file)?;
         std::fs::write(&path, &bytes).map_err(|e| {
-            error::recoverable(code::FILE_WRITE, format!("SAVE[FILE={file}] 写入失败: {e}"))
+            // 诊断必须带**解析后的绝对路径**:只报 `config.sd` 时「写到哪、
+            // 目录存不存在、是否被别的进程占着」全都看不出来(实测
+            // `os error 5` 就是靠这条路径定位的)。
+            error::recoverable(
+                code::FILE_WRITE,
+                format!("SAVE[FILE={file}] 写入失败: {e}(目标 {})", path.display()),
+            )
         })?;
         self.refresh_slots();
         Ok(())
@@ -939,6 +975,18 @@ fn snapshot_payload(snap: &VarSnapshot) -> Result<yu_format::yssd::YssdValue, Di
     })
 }
 
+/// 已存在存档的容器版本:只读文件头 8 字节(`YSSD` + u32 版本);
+/// 非 YSSD / 太短 / 打不开 ⇒ `None`(由调用方决定回退来源)。
+fn existing_container_version(path: &std::path::Path) -> Option<u32> {
+    use std::io::Read;
+    let mut head = [0u8; 8];
+    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
+    if &head[..4] != b"YSSD" {
+        return None;
+    }
+    Some(u32::from_le_bytes([head[4], head[5], head[6], head[7]]))
+}
+
 /// YSSD 值载荷 → 快照(容器类型 → 变量元素类型;`Value::Str` = CP932 原样)。
 fn payload_to_snapshot(
     value: &yu_format::yssd::YssdValue,
@@ -1080,6 +1128,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let mut state = SaveState::new(&root, true);
+        // 空目录里没有可参照的 .sd ⇒ 显式给版本(0.495 官方产物值)。
+        state.set_container_version(0x1E0);
         // int 数组 + str 标量 + 多变量组:三类各一(DNO 1/2/3)。
         state
             .reserve(
@@ -1171,7 +1221,7 @@ mod tests {
             dims: Vec::new(),
             data: 5i64.to_le_bytes().to_vec(),
         };
-        let mut writer = yu_format::yssd::YssdWriter::default();
+        let mut writer = yu_format::yssd::YssdWriter::new(0x1E0);
         writer.set_block(
             1,
             yu_format::yssd::encode_block_body(0, 1, 0x0a43, &payload.to_bytes()),
@@ -1212,6 +1262,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let mut state = SaveState::new(&root, true);
+        state.set_container_version(0x1E0);
         let image = yu_rt::event::CapturedImage {
             width: 4,
             height: 3,
@@ -1241,7 +1292,19 @@ mod tests {
         let Some(sdk) = std::env::var_os("YURIS_SAMPLE_SDK0495") else {
             panic!("YURIS_SAMPLE_SDK0495 未设置(缺样本环境必须显式报错)");
         };
-        let path = Path::new(&sdk).join("data/save/save00001.sd");
+        // `YURIS_SAMPLE_SDK0495` 有两种既有约定(指向包根或 `システム/`),两种都接受。
+        let sdk = PathBuf::from(&sdk);
+        let path = ["data/save/save00001.sd", "システム/data/save/save00001.sd"]
+            .iter()
+            .map(|rel| sdk.join(rel))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "官方 save00001.sd 不可读(试过 {}/data/save 与 {}/システム/data/save)",
+                    sdk.display(),
+                    sdk.display()
+                )
+            });
         let bytes = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("官方 save00001.sd 不可读({e}): {}", path.display()));
         let root = temp_root("sv-official-thumb");
