@@ -14,12 +14,30 @@ fn all_nineteen_modes_round_trip() {
 }
 
 #[test]
-fn fixed_pipeline_modes_are_exactly_the_eight_plus_one() {
+fn native_modes_are_eight_and_the_rest_reduce_to_normal() {
+    // 官方绘制体 `FUN_00414ba4` 的 MODE 分支只有 0/1/2/3/5/6/7/9
+    // (0 走默认块);**4/8/10..18 一条 D3D 状态都不设**。手册 `cg/cg.html`
+    // 列了这些名字(除算/差分/Overlay..PinLight),但引擎没实现。
+    // 因此内核把它们归约到通常路径(`engine_effective`)而不是丢层。
+    const NATIVE: [u8; 8] = [0, 1, 2, 3, 5, 6, 7, 9];
     for mode in BlendMode::ALL {
-        let fixed = mode.fixed_state().is_some();
-        let expected = matches!(mode.code(), 0 | 1 | 2 | 3 | 5 | 6 | 7 | 9);
-        assert_eq!(fixed, expected, "mode {}", mode.code());
-        assert_eq!(!mode.needs_shader(), expected, "mode {}", mode.code());
+        let native = NATIVE.contains(&mode.code());
+        // 每种模式都有状态表(无 case 的取通常路径的状态)。
+        assert!(mode.fixed_state().is_some(), "mode {} 缺状态表", mode.code());
+        assert!(!mode.needs_shader(), "mode {} 不应走着色器", mode.code());
+        // 原生 case 归约后是自己;其余归约为通常。
+        let effective = mode.engine_effective();
+        if native {
+            assert_eq!(effective, mode, "mode {} 不应被归约", mode.code());
+        } else {
+            assert_eq!(effective, BlendMode::Normal, "mode {} 应归约为通常", mode.code());
+            assert_eq!(
+                mode.fixed_state(),
+                BlendMode::Normal.fixed_state(),
+                "mode {} 的状态应与通常一致",
+                mode.code()
+            );
+        }
     }
 }
 
@@ -108,9 +126,15 @@ fn confidence_reflects_evidence_level() {
         assert_eq!(mode.confidence(), BlendConfidence::Likely, "{mode:?}");
     }
     for code in [4, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18] {
+        // 官方绘制体 `FUN_00414ba4` 的 MODE 分支只有 0/1/2/3/5/6/7/9;
+        // 手册 `cg/cg.html` 列了这 11 个名字但引擎没有实现 ⇒ 归
+        // `Unsupported`(unsupported-by-official),内核按通常路径绘制对齐,
+        // 不再标 Unimplemented(那会让整层消失)。
         let mode = BlendMode::from_code(code).unwrap();
-        assert_eq!(mode.confidence(), BlendConfidence::Unimplemented, "{code}");
-        assert!(mode.needs_shader());
+        assert_eq!(mode.confidence(), BlendConfidence::Unsupported, "{code}");
+        assert_eq!(mode.confidence().as_str(), "unsupported", "{code}");
+        assert_eq!(mode.engine_effective(), BlendMode::Normal, "{code}");
+        assert!(!mode.needs_shader(), "{code}");
     }
 }
 
@@ -122,8 +146,10 @@ fn blend_table_json_is_stable_and_complete() {
     for code in 0..=18 {
         assert!(a.contains(&format!("\"code\":{code},")), "missing {code}");
     }
-    assert_eq!(a.matches("\"fixed\":{").count(), 8);
-    assert_eq!(a.matches("\"fixed\":null").count(), 11);
+    // 19 种模式现在都有状态表:8 个原生 case(0/1/2/3/5/6/7/9)+ 11 个
+    // 官方无 case 的模式归约到通常路径(见 `engine_effective` 的 REA 依据)。
+    assert_eq!(a.matches("\"fixed\":{").count(), 19);
+    assert_eq!(a.matches("\"fixed\":null").count(), 0);
 }
 
 fn arg_frag(a: Option<yu_gfx::StageArg>) -> String {

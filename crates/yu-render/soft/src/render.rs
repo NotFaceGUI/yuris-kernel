@@ -1578,19 +1578,10 @@ fn status_reason(op: &Op) -> Option<&'static str> {
 }
 
 fn supported_blend(mode: BlendMode) -> Option<BlendMode> {
-    match mode {
-        // 状态表已取证的固定管线模式(见 `docs/render-parity.md` §5.2);
-        // 4/8/10..18 依赖未定位的 HLSL 本体,继续跳过。
-        BlendMode::Normal
-        | BlendMode::Add
-        | BlendMode::Subtract
-        | BlendMode::Multiply
-        | BlendMode::Screen
-        | BlendMode::Lighten
-        | BlendMode::Darken
-        | BlendMode::Exclusion => Some(mode),
-        _ => None,
-    }
+    // 归约到官方固定管线**实际执行**的模式:分派链只比 1/2/3/5/6/7/9,
+    // 4/8/10..18 没有 case(手册名仅文档)⇒ 按通常路径绘制,不丢层。
+    // 见 `yu_gfx::BlendMode::engine_effective` 与 `docs/render-parity.md` §5.2。
+    Some(mode.engine_effective())
 }
 
 fn layer_alpha(alpha: i16) -> u8 {
@@ -2016,7 +2007,8 @@ fn stage_reduce(
     if shader_stage {
         return (tex(0), tex(1), tex(2));
     }
-    match mode {
+    // 归约到官方固定管线实际执行的模式(4/8/10..18 官方无 case ⇒ 通常路径)。
+    match mode.engine_effective() {
         BlendMode::Normal | BlendMode::Add => (tex(0), tex(1), tex(2)),
         BlendMode::Multiply | BlendMode::Darken => (
             tex(0) * layer + (1.0 - a),
@@ -2041,6 +2033,8 @@ fn blend_pixel_with_stage(
     // 导致 soft/wgpu 同帧哈希不同。微场景(EVID-J-01/02..05)的取值在
     // 两种模型下相同,见 600 帧逐帧对拍。
     let q = |v: f64| v.round().clamp(0.0, 255.0) as u8;
+    // 归约到官方固定管线实际执行的模式(4/8/10..18 官方无 case ⇒ 通常路径)。
+    let mode = mode.engine_effective();
     // `a` = 片元 alpha(C.a = 纹理 alpha × 层 A),`layer` = 顶点 DIFFUSE 的
     // A 灰度(层 A,不含纹理 alpha)。两者只在 T.a≠1 时不同。
     let a = f64::from(src_alpha) / 255.0;

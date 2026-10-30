@@ -335,14 +335,41 @@ impl BlendMode {
         }
     }
 
-    /// 固定管线状态(仅 0/1/2/3/5/6/7/9;其余返回 `None`)。
+    /// 归约到**官方固定管线实际执行**的模式。
     ///
-    /// 状态序列逐条取自 `FUN_00414ba4`(`0x414ba4`)对应分支;数值是
-    /// D3D9 原始枚举,见 `docs/render-parity.md` §3。
+    /// 证据(REA 0.495 `FUN_00414ba4`,sha256 `4f5eefa3…`):绘制体按第 5 个
+    /// 栈参数(MODE)走 if/else 链,分支只有 `0/1/2/3/5/6/7/9`(早期分派链
+    /// `0x4155dd` 的比较集合与之相同);**`4/8/10..18` 落进最后的 `else`,
+    /// 一条 D3D 纹理阶段/混合状态都不设**。手册 `cg/cg.html` 列了这些名字
+    /// (除算/差分/Overlay..PinLight),但引擎没实现 —— 是
+    /// `unsupported-by-official`,不是"手册缺页"。
     ///
-    /// TODO(DIV-GFX-001/002):MODE 3/5/6/7/9 的辅助纹理内容、MODE
-    /// 4/8/10..18 的着色器本体未取证;`fixed_state()` 返回 `None` 或
-    /// `confidence()` 标 Unverified,后端不得执行。
+    /// 因此内核把这 11 个值按「无模式特有状态」对齐 = 按通常路径绘制,
+    /// 而不是把整层丢掉。官方那层的真实像素取决于**上一层留下的 D3D 状态**
+    /// (顺序相关),不可复现也不应复现。
+    pub const fn engine_effective(self) -> Self {
+        match self {
+            Self::Divide
+            | Self::Difference
+            | Self::Overlay
+            | Self::ColorDodge
+            | Self::ColorBurn
+            | Self::LinearBurn
+            | Self::HardLight
+            | Self::SoftLight
+            | Self::VividLight
+            | Self::LinearLight
+            | Self::PinLight => Self::Normal,
+            other => other,
+        }
+    }
+
+    /// D3D9 固定管线状态(最终状态,后写覆盖先写)。
+    ///
+    /// 状态序列逐条取自 `FUN_00414ba4` 对应分支;数值是 D3D9 原始枚举,
+    /// 见 `docs/render-parity.md` §3。归约到
+    /// [`BlendMode::engine_effective`] 之后每种模式都有状态:官方无 case 的
+    /// 模式取通常路径(见该方法文档)。
     pub fn fixed_state(self) -> Option<FixedPipelineState> {
         use BlendFactor as B;
         use BlendOp as O;
@@ -350,7 +377,7 @@ impl BlendMode {
         use StageOp as P;
 
         let disable = StageState::disabled();
-        Some(match self {
+        Some(match self.engine_effective() {
             Self::Normal => FixedPipelineState {
                 stages: [
                     StageState {
@@ -530,6 +557,9 @@ impl BlendMode {
             Self::Multiply | Self::Screen | Self::Lighten | Self::Darken | Self::Exclusion => {
                 BlendConfidence::Likely
             }
+            // 官方固定管线**没有 case**(绘制体 `FUN_00414ba4` 的 MODE 分支
+            // 只有 0/1/2/3/5/6/7/9),手册名仅文档 ⇒ 内核按通常路径绘制
+            // 对齐(见 `engine_effective`)。这不是"待对拍",是官方无实现。
             Self::Divide
             | Self::Difference
             | Self::Overlay
@@ -540,26 +570,20 @@ impl BlendMode {
             | Self::SoftLight
             | Self::VividLight
             | Self::LinearLight
-            | Self::PinLight => BlendConfidence::Unimplemented,
+            | Self::PinLight => BlendConfidence::Unsupported,
         }
     }
 
-    /// 是否需要着色器路径(4/8/10..18)。
+    /// 是否需要着色器路径。
+    ///
+    /// **恒 `false`**:官方 0.495 的 3 个 ps_2_0 blob 是转场/缩放 pass
+    /// (`YS_ShaderTest1` / `YS_TexDiffU` / `YS_TexSize`),不是 Photoshop
+    /// 混合模式;MODE 4/8/10..18 在固定管线上也没有 case。保留本方法只为
+    /// 调用点(`json.rs` 的 `"shader"/"fixed"` 字段)兼容。
+    #[allow(clippy::unused_self)]
     pub const fn needs_shader(self) -> bool {
-        matches!(
-            self,
-            Self::Divide
-                | Self::Difference
-                | Self::Overlay
-                | Self::ColorDodge
-                | Self::ColorBurn
-                | Self::LinearBurn
-                | Self::HardLight
-                | Self::SoftLight
-                | Self::VividLight
-                | Self::LinearLight
-                | Self::PinLight
-        )
+        // 目前没有任何模式走 shader;将来若有,在这里加分支。
+        false
     }
 }
 
@@ -574,6 +598,13 @@ pub enum BlendConfidence {
     Unverified,
     /// 只有手册名;着色器本体未定位。
     Unimplemented,
+    /// **官方引擎没有这个模式的实现**:手册 `cg/cg.html` 列了名字、编译器
+    /// 接受该值,但绘制体(`FUN_00414ba4`)里没有对应分支。内核按通常路径
+    /// 绘制对齐,不丢层。
+    ///
+    /// 与 `Likely` 的区别:后者是"照官方状态画、只差像素对拍";这里是
+    /// "官方根本没有状态可照",归 `unsupported-by-official`。
+    Unsupported,
 }
 
 impl BlendConfidence {
@@ -583,6 +614,7 @@ impl BlendConfidence {
             Self::Likely => "likely",
             Self::Unverified => "unverified",
             Self::Unimplemented => "unimplemented",
+            Self::Unsupported => "unsupported",
         }
     }
 }

@@ -879,17 +879,10 @@ pub(crate) fn status_reason(op: &Op) -> Option<&'static str> {
 }
 
 pub(crate) fn supported_blend(mode: BlendMode) -> Option<BlendMode> {
-    match mode {
-        BlendMode::Normal
-        | BlendMode::Add
-        | BlendMode::Subtract
-        | BlendMode::Multiply
-        | BlendMode::Screen
-        | BlendMode::Lighten
-        | BlendMode::Darken
-        | BlendMode::Exclusion => Some(mode),
-        _ => None,
-    }
+    // 归约到官方固定管线**实际执行**的模式:分派链只比 1/2/3/5/6/7/9,
+    // 4/8/10..18 没有 case(手册名仅文档)⇒ 按通常路径绘制,不丢层。
+    // 见 `yu_gfx::BlendMode::engine_effective` 与 `docs/render-parity.md` §5.2。
+    Some(mode.engine_effective())
 }
 
 pub(crate) fn pick_filter(

@@ -355,3 +355,143 @@ fn windowinfo_answers_main_geometry() {
     );
     assert_eq!(caption, Value::Int(-1));
 }
+
+/// `WINDOW[MINMODE]`/`WINDOW[MAXMODE]`:工程 ysc.ybn 里与 `WINDOWINFO`
+/// 的同名字段成对(WINDOW 槽 16/17、WINDOWINFO 槽 18/19),官方创建窗口时
+/// 落到 `WS_MINIMIZEBOX`/`WS_MAXIMIZEBOX`。内核存值 + 读回,不挂未实现。
+/// 语料用法:`es_first.yst:169` `WINDOW[NO=0 MINMODE=0]`。
+#[test]
+fn window_min_max_mode_round_trip_through_windowinfo() {
+    let table = table();
+    let mut gfx = state();
+    let info = |gfx: &yu_gfx::GfxState, flag: &str| {
+        q(
+            gfx,
+            "WINDOWINFO",
+            vec![
+                arg(&table, "WINDOWINFO", "NO", i(0)),
+                arg(&table, "WINDOWINFO", flag, i(1)),
+            ],
+        )
+    };
+    // 未设置 = 创建样式默认(主窗口两个按钮位都在)。
+    assert_eq!(info(&gfx, "MINMODE"), Value::Int(1));
+    assert_eq!(info(&gfx, "MAXMODE"), Value::Int(1));
+
+    gfx.consume_events(&[
+        frame_start(1),
+        window_call(
+            1,
+            "WINDOW",
+            vec![
+                arg(&table, "WINDOW", "NO", i(0)),
+                arg(&table, "WINDOW", "MINMODE", i(0)),
+                arg(&table, "WINDOW", "MAXMODE", i(0)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    assert_eq!(info(&gfx, "MINMODE"), Value::Int(0));
+    assert_eq!(info(&gfx, "MAXMODE"), Value::Int(0));
+    // 归类后不得再产生“窗口参数未分类”。
+    assert!(
+        !gfx.diagnostics()
+            .iter()
+            .any(|d| d.detail.contains("窗口参数未分类")),
+        "{:?}",
+        gfx.diagnostics()
+    );
+}
+
+/// `WINDOW[MINIMIZE]`/`WINDOW[CLOSEMODE]`/`WINDOW[ACTIVE]` —— 手册
+/// `window/window.html` 有页:`MINIMIZE` 是 1=最小化/0=通常化的**切换**,
+/// `CLOSEMODE` 是 0..2 的关闭按钮行为,`ACTIVE=0` 手册明示"也不能取消
+/// 激活"⇒ 无副作用。三者都不得再报"窗口参数未分类"。
+#[test]
+fn window_minimize_close_mode_follow_manual() {
+    let table = table();
+    let mut gfx = state();
+    let info = |gfx: &yu_gfx::GfxState, flag: &str| {
+        q(
+            gfx,
+            "WINDOWINFO",
+            vec![
+                arg(&table, "WINDOWINFO", "NO", i(0)),
+                arg(&table, "WINDOWINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info(&gfx, "MINIMIZE"), Value::Int(0));
+    assert_eq!(info(&gfx, "CLOSEMODE"), Value::Int(0));
+
+    let call = |gfx: &mut yu_gfx::GfxState, params: Vec<yu_rt::event::ArgValue>| {
+        let mut args = vec![arg(&table, "WINDOW", "NO", i(0))];
+        args.extend(params);
+        gfx.consume_events(&[
+            frame_start(1),
+            window_call(1, "WINDOW", args),
+            frame_end(1),
+        ]);
+    };
+    call(
+        &mut gfx,
+        vec![
+            arg(&table, "WINDOW", "MINIMIZE", i(1)),
+            arg(&table, "WINDOW", "CLOSEMODE", i(2)),
+            arg(&table, "WINDOW", "ACTIVE", i(0)),
+        ],
+    );
+    assert_eq!(info(&gfx, "MINIMIZE"), Value::Int(1));
+    assert_eq!(info(&gfx, "CLOSEMODE"), Value::Int(2));
+
+    call(&mut gfx, vec![arg(&table, "WINDOW", "MINIMIZE", i(0))]);
+    assert_eq!(info(&gfx, "MINIMIZE"), Value::Int(0));
+
+    assert!(
+        !gfx.diagnostics()
+            .iter()
+            .any(|d| d.detail.contains("窗口参数未分类")),
+        "{:?}",
+        gfx.diagnostics()
+    );
+}
+
+/// `WINDOW[WSX/WSY]` 是 `WINDOWINFO[WSX/WSY]` 的写侧(读侧 = `GetWindowRect`,
+/// REA `0x458a2a/0x458a4f`);成对给出时覆盖含边框整体尺寸。
+#[test]
+fn window_wsx_wsy_sets_outer_size_read_back_by_windowinfo() {
+    let table = table();
+    let mut gfx = state();
+    let info = |gfx: &yu_gfx::GfxState, flag: &str| {
+        q(
+            gfx,
+            "WINDOWINFO",
+            vec![
+                arg(&table, "WINDOWINFO", "NO", i(0)),
+                arg(&table, "WINDOWINFO", flag, i(1)),
+            ],
+        )
+    };
+    // 未设置 = 客户区同值(无边框假设)。
+    assert_eq!(info(&gfx, "WSX"), Value::Int(800));
+    assert_eq!(info(&gfx, "WSY"), Value::Int(600));
+
+    gfx.consume_events(&[
+        frame_start(1),
+        window_call(
+            1,
+            "WINDOW",
+            vec![
+                arg(&table, "WINDOW", "NO", i(0)),
+                arg(&table, "WINDOW", "WSX", i(816)),
+                arg(&table, "WINDOW", "WSY", i(639)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    assert_eq!(info(&gfx, "WSX"), Value::Int(816));
+    assert_eq!(info(&gfx, "WSY"), Value::Int(639));
+    // 客户区尺寸不受影响。
+    assert_eq!(info(&gfx, "SX"), Value::Int(800));
+    assert_eq!(info(&gfx, "SY"), Value::Int(600));
+}

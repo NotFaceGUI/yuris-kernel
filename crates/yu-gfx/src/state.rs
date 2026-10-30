@@ -1240,11 +1240,19 @@ impl GfxState {
             // `DISPLAYNO` = 显示器序号(REA 0x458b0a 读 `[wnd+0x5b4]`)。
             "DISPLAYNO" => Value::Int(window.display_no),
             // `FULLSCREEN` / `FULLSCREENBUTTON`(REA 0x458970/0x458992 读
-            // `[0x8015e0]/[0x8015dc]`;宿主注入,缺省 0)。
+            // `[0x8015e0]/[0x8015dc]`;宿主注入,缺省 0)。手册
+            // `window/windowinfo.html` 的字段名是 `FULLSCREENBUTTON`,
+            // 工程 ysc.ybn(0.495 编译器)叫 `FULLSCREEN2` ⇒ 两个都认。
             "FULLSCREEN" => Value::Int(window.fullscreen),
-            "FULLSCREEN2" => Value::Int(window.fullscreen_button),
+            "FULLSCREEN2" | "FULLSCREENBUTTON" => Value::Int(window.fullscreen_button),
             // `MINIMIZE` = IsIconic(REA 0x458833..)。
             "MINIMIZE" => Value::Int(i64::from(window.minimized)),
+            // `CLOSEMODE`(手册 `window/windowinfo.html`:关闭按钮行为)。
+            "CLOSEMODE" => Value::Int(window.close_mode),
+            // `MAXMODE`/`MINMODE` = `WINDOW` 同名字段的读回(工程 ysc.ybn
+            // WINDOWINFO 槽 18/19);未设置时取创建样式的默认(按钮存在 = 1)。
+            "MAXMODE" => Value::Int(window.max_mode),
+            "MINMODE" => Value::Int(window.min_mode),
             // `CAPTION`(REA 0x458b59 读 `[wnd+0x14]`;未设置 = -1)。
             "CAPTION" => Value::Int(window.caption),
             // `ACTIVE` = 最近有输入的时间戳比现在新(REA 0x4587a5..
@@ -1327,6 +1335,12 @@ impl GfxState {
         let mut sx: Option<i64> = None;
         let mut sy: Option<i64> = None;
         let mut z: Option<i64> = None;
+        let mut max_mode: Option<i64> = None;
+        let mut min_mode: Option<i64> = None;
+        let mut wsx: Option<i64> = None;
+        let mut wsy: Option<i64> = None;
+        let mut minimized: Option<i64> = None;
+        let mut close_mode: Option<i64> = None;
         let mut unknown: Vec<String> = Vec::new();
         for r in resolved {
             let Some(name) = r.name.as_deref() else {
@@ -1382,8 +1396,30 @@ impl GfxState {
                         }
                     }
                 }
-                "MENUID" | "REGIONID" | "DRAGID" | "ACTIVE" | "MINIMIZE" | "CLOSEMODE"
-                | "RESIZE" | "MAXIMIZE" | "WSX" | "WSY" => {}
+                // `MINIMIZE`(手册 `window/window.html`):最小化(=1)/通常化(=0)
+                // 的**切换动作**,不是"按钮开关"(那是 `MINMODE`)。
+                // 读回 = `WINDOWINFO[MINIMIZE]`(手册:是否最小化中)。
+                "MINIMIZE" => minimized = int_arg(&r.value),
+                // `CLOSEMODE`(手册 `window/window.html`):0..2 = 点关闭按钮
+                // 时的行为;读回见 `WINDOWINFO[CLOSEMODE]`。
+                "CLOSEMODE" => close_mode = int_arg(&r.value),
+                // `ACTIVE`(手册):`1` = 激活;手册明确"`ACTIVE=0` 也不能
+                // 取消激活" ⇒ 0 是无副作用值,不是错误。
+                "ACTIVE" => {}
+                // `MAXMODE`/`MINMODE` = 最大化/最小化按钮开关,与
+                // `WINDOWINFO` 的同名字段成对(工程 ysc.ybn:WINDOW 槽
+                // 16/17、WINDOWINFO 槽 18/19),官方在创建窗口时把它们
+                // 落到 `WS_MAXIMIZEBOX`/`WS_MINIMIZEBOX`(`FUN_00457d8c`)。
+                // 内核不持有 Win32 窗口 ⇒ 存值 + 供 INFO 读回(DIV-GFX-037)。
+                "MAXMODE" => max_mode = int_arg(&r.value),
+                "MINMODE" => min_mode = int_arg(&r.value),
+                // `WSX/WSY` = 含边框的窗口整体尺寸,是 `WINDOWINFO[WSX/WSY]`
+                // 的写侧(读侧 = `GetWindowRect().right-left/bottom-top`,
+                // REA 0x458a2a/0x458a4f);工程 ysc.ybn 里槽 9/10,检查器
+                // 与 `SX/SY` 同族(23/22)。ERIS 语料 3 处使用。
+                "WSX" => wsx = int_arg(&r.value),
+                "WSY" => wsy = int_arg(&r.value),
+                "MENUID" | "REGIONID" | "DRAGID" | "RESIZE" | "MAXIMIZE" => {}
                 other => unknown.push(other.to_string()),
             }
         }
@@ -1442,6 +1478,30 @@ impl GfxState {
             }
             (None, None) => None,
         };
+        // `WSX/WSY` 与 `SX/SY` 同族:成对给出才算完整尺寸更新。
+        let outer = match (wsx, wsy) {
+            (Some(w), Some(h)) => match (u32::try_from(w), u32::try_from(h)) {
+                (Ok(w), Ok(h)) => Some(SizeU32 {
+                    width: w,
+                    height: h,
+                }),
+                _ => {
+                    pending = Some(error::recoverable(
+                        error::code::ARG_TYPE,
+                        format!("WINDOW[WSX={w} WSY={h}] 超出 u32 范围"),
+                    ));
+                    None
+                }
+            },
+            (Some(_), None) | (None, Some(_)) => {
+                pending = Some(error::unimplemented(
+                    error::code::WINDOW_UNSUPPORTED,
+                    "WINDOW 只给 WSX/WSY 之一:窗口整体尺寸部分更新未取证",
+                ));
+                None
+            }
+            (None, None) => None,
+        };
         let entry = self
             .windows
             .entry(no as u8)
@@ -1473,6 +1533,21 @@ impl GfxState {
         }
         if let Some(s) = size {
             entry.size = Some(s);
+        }
+        if let Some(v) = max_mode {
+            entry.max_mode = v;
+        }
+        if let Some(v) = min_mode {
+            entry.min_mode = v;
+        }
+        if let Some(s) = outer {
+            entry.outer_size = Some(s);
+        }
+        if let Some(v) = minimized {
+            entry.minimized = v != 0;
+        }
+        if let Some(v) = close_mode {
+            entry.close_mode = v;
         }
         if let Some(d) = pending {
             self.push_diag("WINDOW", d);
@@ -4091,6 +4166,9 @@ fn apply_layer_params(
                         layer.blend = m;
                         match m.confidence() {
                             BlendConfidence::Confirmed | BlendConfidence::Likely => {}
+                            // 官方无实现(手册名仅文档)⇒ 内核按通常路径绘制,
+                            // 层仍可执行;不是"待取证",所以不挂诊断。
+                            BlendConfidence::Unsupported => {}
                             BlendConfidence::Unverified => {
                                 mark_param_unimplemented(layer, "gfx.blend.unverified");
                                 diags.push(error::unimplemented(

@@ -231,8 +231,29 @@ pub struct WindowState {
     /// `FULLSCREENBUTTON`(REA `0x458992` 读 `[0x8015dc]`;缺省 0)。
     pub fullscreen_button: i64,
     /// `MINIMIZE`(REA `0x458833..` = `IsIconic`;headless 恒 0,
-    /// 桌面宿主按窗口最小化状态注入)。
+    /// 桌面宿主按窗口最小化状态注入)。`WINDOW[MINIMIZE=0/1]` 是手册页
+    /// 明示的切换动作(1=最小化,0=通常化),写侧落到本字段。
     pub minimized: bool,
+    /// `CLOSEMODE`(手册 `window/window.html`:0..2 = 点关闭按钮时的行为;
+    /// `WINDOWINFO[CLOSEMODE]` 读回同一值)。语义细节(0/1/2 各自做什么)
+    /// 手册只给"挙動"未展开 ⇒ 内核只存值,行为交宿主(DIV-GFX-071)。
+    /// 缺省 0 是 Likely(手册未写初值,取最小值)。
+    pub close_mode: i64,
+    /// `MAXMODE`(WINDOW 槽 16 / WINDOWINFO 槽 18):最大化按钮开关。
+    ///
+    /// 官方在**创建窗口时**按窗口状态决定 `WS_MAXIMIZEBOX`:基样式
+    /// `0x02CB0000` = `WS_CLIPCHILDREN|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|
+    /// WS_MAXIMIZEBOX`,非主窗口改用 `0x02C80000`(去掉 `0x00010000`
+    /// = MAXIMIZEBOX;REA `FUN_00457d8c` `0x457e3a..0x457e57`)。
+    /// 内核不持有 Win32 窗口,只存值并供 `WINDOWINFO` 读回(DIV-GFX-037)。
+    ///
+    /// **缺省 1 是 Likely**:由创建样式含该按钮位推得;引擎窗口结构里该字段
+    /// 的初值本身未直接读到。无脚本查询时无观察差异。
+    pub max_mode: i64,
+    /// `MINMODE`(WINDOW 槽 17 / WINDOWINFO 槽 19):最小化按钮开关,
+    /// 与 `max_mode` 同源(基样式含 `WS_MINIMIZEBOX`)。`es_first.yst:169`
+    /// 在主窗口上置 0。缺省值同为 Likely(见 `max_mode`)。
+    pub min_mode: i64,
     /// `CAPTION`(REA `0x458b59` 读 `[wnd+0x14]`;未设置 = -1,与引擎
     /// 初始值一致;桌面宿主 `WINDOW[CAPTION=]` 时写入)。
     pub caption: i64,
@@ -254,6 +275,9 @@ impl WindowState {
             fullscreen: 0,
             fullscreen_button: 0,
             minimized: false,
+            close_mode: 0,
+            max_mode: 1,
+            min_mode: 1,
             caption: -1,
         }
     }

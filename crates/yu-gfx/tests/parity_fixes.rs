@@ -6,7 +6,8 @@ mod support;
 
 use support::*;
 use yu_gfx::{
-    json, ImageAction, LayerKind, LayerStatus, Op, OpStatus, PassTarget, TextureRef, Transition,
+    json, BlendMode, ImageAction, LayerKind, LayerStatus, Op, OpStatus, PassTarget, TextureRef,
+    Transition,
 };
 
 fn layer<'a>(f: &'a yu_gfx::CompositorFrame, id: &str) -> &'a yu_gfx::Layer {
@@ -263,7 +264,10 @@ fn font_no_and_bno_are_recorded() {
 }
 
 #[test]
-fn mode_update_recovers_executable_status() {
+fn mode_update_keeps_layer_executable() {
+    // REA 0.495 `FUN_00414ba4`:MODE 分派链只比 1/2/3/5/6/7/9,
+    // 4/8/10..18 没有 case(手册名仅文档)⇒ 归约到通常路径,层照常绘制。
+    // 所以 MODE=4 也是可执行的;层保留原始 MODE(4),渲染期才归约。
     let table = table();
     let mut gfx = state();
     gfx.consume_events(&[
@@ -279,10 +283,18 @@ fn mode_update_recovers_executable_status() {
         ),
         frame_end(1),
     ]);
-    assert!(matches!(
-        layer(&gfx.frame(), ":/W0/L").status,
-        LayerStatus::Unimplemented("gfx.blend.unsupported")
-    ));
+    let f = gfx.frame();
+    assert!(matches!(layer(&f, ":/W0/L").status, LayerStatus::Executable));
+    assert_eq!(
+        layer(&f, ":/W0/L").blend,
+        BlendMode::Divide,
+        "层保留原始 MODE(4)"
+    );
+    assert_eq!(
+        layer(&f, ":/W0/L").blend.engine_effective(),
+        BlendMode::Normal,
+        "官方无 case ⇒ 渲染期归约为通常"
+    );
 
     gfx.consume_events(&[
         frame_start(2),
@@ -300,6 +312,7 @@ fn mode_update_recovers_executable_status() {
         layer(&gfx.frame(), ":/W0/L").status,
         LayerStatus::Executable
     ));
+    assert_eq!(layer(&gfx.frame(), ":/W0/L").blend, BlendMode::Normal);
 }
 
 #[test]
