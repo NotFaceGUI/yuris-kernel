@@ -4,7 +4,8 @@
 //! [slot*8 + 0x683740]`),所以把处理体里的读取点还原成参数名需要
 //! 「下标 → 名字」表。本探针直接给出该表(`CG`/`CGACT` 的声明顺序)。
 //!
-//! 用法:`cargo run -p yu-gfx --example probe_param_bytes -- <game_root>`
+//! 用法:`cargo run -p yu-gfx --example probe_param_bytes -- <game_root> [命令名…]`
+//! (默认 `CG CGACT`;给了命令名就只打印这些)
 use yu_rt::{BootConfig, Vm};
 use yu_vfs::{Codec, DirSource, YpfSource};
 
@@ -23,7 +24,12 @@ fn main() {
         },
     )
     .expect("boot");
-    for cmd in ["CG", "CGACT"] {
+    let mut names: Vec<String> = std::env::args().skip(2).collect();
+    if names.is_empty() {
+        names = vec!["CG".into(), "CGACT".into()];
+    }
+    for cmd in names {
+        let cmd = cmd.as_str();
         let Some(c) = vm
             .tables()
             .boot
