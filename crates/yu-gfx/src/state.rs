@@ -876,18 +876,42 @@ impl GfxState {
             // 「E-moteレイヤなら」分支按 `==2` 判定)。本内核不装载
             // E-mote(`deferred(master)`),该值只会是脚本显式写入的。
             "TEX" => Value::Int(layer.tex),
-            "ONMOUSE" | "ONMOUSE2" | "ONMOUSE3" => {
+            // `CGINFO[COLOR]` = **指定坐标**的像素色,打包与 `ONMOUSE` 相同
+            // (`r | g<<8 | b<<16`;越界 `-1`)。与 `ONMOUSE*` 共用同一采样器,
+            // 差别只在坐标来源。
+            //
+            // 证据:
+            // - 语料(`es_button.yst` s0 pc2020-2026)先 `CG[ID=$0x5d4 …]`,
+            //   再 `CGINFO[ID SX]`/`[SY]`/`[COLOR SET=0 SET2=0 LET=@x]`,
+            //   随后 `IF @SX==1 && @SY==1 && @x == 0x00808080` →
+            //   `CGACT[RECTPAINT3]`:1×1 且 50% 灰(`128|128<<8|128<<16`)
+            //   的占位按钮图被重绘。取值打包方式由此确定。
+            // - 引擎:像素采样体 `0x43ddc0..0x43de86` 的坐标对来自
+            //   `[obj+0x58]/[obj+0x5c]` 或 `[obj+0x60]/[obj+0x64]`,由
+            //   全局 `[0x68417d]` 切换(= 鼠标坐标 / 显式 SET/SET2);
+            //   显式分支缺省走 `XOR ECX,ECX; XOR EDX,EDX`(坐标 0,0);
+            //   越界返回 `-1`(`0x43de4b MOV ECX,-1`)。
+            "ONMOUSE" | "ONMOUSE2" | "ONMOUSE3" | "COLOR" => {
                 let sampler = sampler.ok_or_else(|| {
                     error::unimplemented(
                         error::code::INFO_UNSUPPORTED,
                         format!("CGINFO[{flag}] 需要纹理采样器(宿主未注入)"),
                     )
                 })?;
-                let out = self.query_onmouse(layer, flag, set, set2, sampler);
+                // COLOR 是显式坐标查询:缺省 (0,0),不继承鼠标位置
+                // (与引擎显式分支的零初始化一致)。ONMOUSE* 缺省取鼠标。
+                let (sx, sy) = if flag == "COLOR" {
+                    let sx = set.unwrap_or(0); // silent-ok: 缺 SET = 坐标 0(引擎零初始化)
+                    let sy = set2.unwrap_or(0); // silent-ok: 缺 SET2 = 坐标 0(引擎零初始化)
+                    (Some(sx), Some(sy))
+                } else {
+                    (set, set2)
+                };
+                let out = self.query_onmouse(layer, flag, sx, sy, sampler);
                 out?
             }
             other => {
-                // COLOR/TEX/LINT 等无手册语义或未取证。
+                // TEX/LINT 等无手册语义或未取证。
                 return Err(error::unimplemented(
                     error::code::INFO_UNSUPPORTED,
                     format!("CGINFO[{other}] 需要像素/未分类语义,未取证"),
@@ -902,6 +926,7 @@ impl GfxState {
     /// - `ONMOUSE`  → `r | g<<8 | b<<16`(0..0xFFFFFF);
     /// - `ONMOUSE2` → `a`(0..255);
     /// - `ONMOUSE3` → `r | g<<8 | b<<16 | a<<24`(32 位结果,按 i32 符号扩展);
+    /// - `COLOR`    → 同 `ONMOUSE`,但坐标取自 `SET/SET2`(显式,缺省 0,0);
     /// - 不在任何部件内 / 越界 → `-1`。
     ///
     /// 本内核没有引擎的“部件链表”,图像层按单部件处理:矩形 =
@@ -932,12 +957,31 @@ impl GfxState {
             other => other.clone(),
         };
         let texture_size = sampler.size(&texture);
-        let display = layer.image_size().or(texture_size);
+        // 尺寸来源优先级:图层显式尺寸 → 采样器实测 → **VM 回填的资产尺寸**。
+        // 第三条是 `query_layer_size` 用的同一张表:资产缺失时 VM 会回填
+        // 0×0(官方 `CG[FILE=…]` 装载失败后矩形保持 0),这里必须同口径,
+        // 否则像素查询会一直报「资产头未注入」而尺寸表里其实已经有答案。
+        let display = layer
+            .image_size()
+            .or(texture_size)
+            .or_else(|| match &texture {
+                TextureRef::Asset(key) => self.asset_sizes.get(key).copied(),
+                _ => None,
+            });
         let Some(display) = display else {
-            return Err(error::unimplemented(
-                error::code::INFO_ASSET_SIZE,
-                "CGINFO[ONMOUSE*] 图层尺寸未知(无 SX/SY 且无纹理)",
-            ));
+            // 没有表面也没有显式尺寸 = 引擎的 0×0 矩形(与
+            // `query_layer_size` 对 `TextureRef::None` 返回 0 同一取证:
+            // 官方直接读 `+0x78/+0x7c`,不检查纹理指针)⇒ 任何坐标都越界。
+            //
+            // 例外:`Asset` 的尺寸尚未注入时保留专用错误码,让 VM 解析资产头
+            // 后重试(DIV-GFX-024 的回退链)。
+            if matches!(texture, TextureRef::Asset(_)) {
+                return Err(error::unimplemented(
+                    error::code::INFO_ASSET_SIZE,
+                    "CGINFO[ONMOUSE*/COLOR] 图层尺寸未知(资产头未注入)",
+                ));
+            }
+            return Ok(Value::Int(-1));
         };
         if display.width == 0 || display.height == 0 {
             return Ok(Value::Int(-1));
@@ -998,7 +1042,10 @@ impl GfxState {
                 Some(size) => Ok(i64::from(if width { size.width } else { size.height })),
                 None => Err(error::unimplemented(
                     error::code::INFO_ASSET_SIZE,
-                    "资源图尺寸尚未由资产元数据提供者注入(TODO DIV-GFX-024)",
+                    format!(
+                        "资源图尺寸尚未由资产元数据提供者注入(TODO DIV-GFX-024):{}",
+                        String::from_utf8_lossy(key)
+                    ),
                 )),
             },
             TextureRef::Snapshot(id) => match self.snapshot_sizes.get(id) {

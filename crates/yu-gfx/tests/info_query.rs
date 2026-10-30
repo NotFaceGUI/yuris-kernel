@@ -168,6 +168,65 @@ fn cginfo_multiple_fields_are_rejected_not_guessed() {
     assert_eq!(err.code, "gfx.info.multi");
 }
 
+/// `CGINFO[COLOR]` = **指定坐标**的像素色,打包与 `ONMOUSE` 相同
+/// (`r | g<<8 | b<<16`),坐标取 `SET/SET2`(缺省 0,0),越界 `-1`。
+///
+/// 语料依据(`es_button.yst` s0 pc2020-2026):`CG[ID]` 建层 →
+/// `CGINFO[SX]/[SY]/[COLOR SET=0 SET2=0]` → `IF @SX==1 && @SY==1 &&
+/// @color == 0x00808080` → `CGACT[RECTPAINT3]`:1×1 的 50% 灰占位图
+/// 会被重绘。引擎侧同体:像素采样器按全局 `[0x68417d]` 在鼠标坐标与
+/// 显式 `SET/SET2` 之间切换,越界返回 -1。
+#[test]
+fn cginfo_color_samples_pixel_at_set_coordinates() {
+    struct Grey1x1;
+    impl yu_gfx::TextureSampler for Grey1x1 {
+        fn size(&mut self, _t: &yu_gfx::TextureRef) -> Option<yu_gfx::SizeU32> {
+            Some(yu_gfx::SizeU32 {
+                width: 1,
+                height: 1,
+            })
+        }
+        fn sample(&mut self, _t: &yu_gfx::TextureRef, x: i64, y: i64) -> Option<[u8; 4]> {
+            if x == 0 && y == 0 {
+                Some([128, 128, 128, 255])
+            } else {
+                None
+            }
+        }
+    }
+
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BT")),
+                arg(&table, "CG", "FILE", s("bt")),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let color = |set: i64, set2: i64| {
+        let mut sampler = Grey1x1;
+        gfx.query_info_with(
+            "CGINFO",
+            &[
+                arg(&table, "CGINFO", "ID", s("BT")),
+                arg(&table, "CGINFO", "COLOR", i(1)),
+                arg(&table, "CGINFO", "SET", i(set)),
+                arg(&table, "CGINFO", "SET2", i(set2)),
+            ],
+            Some(&mut sampler),
+        )
+        .expect("CGINFO[COLOR]")
+    };
+    assert_eq!(color(0, 0), Value::Int(0x0080_8080), "1×1 灰 = r|g<<8|b<<16");
+    assert_eq!(color(5, 5), Value::Int(-1), "越界返回 -1");
+}
+
 #[test]
 fn fontinfo_answers_current_style_fields() {
     let table = table();
