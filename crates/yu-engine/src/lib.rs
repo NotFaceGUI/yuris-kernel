@@ -16,6 +16,7 @@
 
 pub mod capture;
 pub mod engine;
+pub mod identity;
 pub mod json;
 pub mod keys;
 pub mod output;

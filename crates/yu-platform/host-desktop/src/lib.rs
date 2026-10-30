@@ -56,6 +56,7 @@ use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
 
 use yu_render_core::Surface;
 use yu_engine::engine::Engine;
+use yu_engine::identity::IconImage;
 use yu_platform_input::{
     cursor_shape, cursor_visible, key_button, mouse_activity_reactive, wheel_button, CursorClock,
     CursorShape, MouseActivity, PointerButton,
@@ -200,6 +201,11 @@ struct FrameRow {
 pub struct HostOptions {
     /// 窗口标题。
     pub title: String,
+    /// 窗口图标(RGBA8);`None` = 系统缺省图标。
+    ///
+    /// 由引擎启动期从工程根 exe 的 `RT_GROUP_ICON` 抽出
+    /// (`Engine::identity().icon`),宿主只负责换成 winit 的 `WindowIcon`。
+    pub icon: Option<IconImage>,
     /// 初始窗口尺寸;`None` = 引擎视口。
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -251,6 +257,7 @@ impl Default for HostOptions {
     fn default() -> Self {
         Self {
             title: "YU-RIS".to_string(),
+            icon: None,
             width: None,
             height: None,
             fps: 60,
@@ -2241,6 +2248,9 @@ impl ApplicationHandler for App {
             .with_title(self.opts.title.clone())
             .with_inner_size(logical)
             .with_min_inner_size(LogicalSize::new(320.0, 240.0));
+        if let Some(icon) = self.opts.icon.as_ref().and_then(window_icon) {
+            attrs = attrs.with_window_icon(Some(icon));
+        }
         if self.opts.fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
@@ -2685,6 +2695,17 @@ fn winit_pointer_button(button: MouseButton) -> PointerButton {
         MouseButton::Forward => PointerButton::Other(4),
         MouseButton::Other(n) => PointerButton::Other(n),
     }
+}
+
+/// 引擎抽出的 RGBA 图标 → winit `WindowIcon`(非预乘,逐像素 clone)。
+fn window_icon(image: &IconImage) -> Option<winit::window::Icon> {
+    let expected = usize::try_from(image.width)
+        .ok()?
+        .checked_mul(usize::try_from(image.height).ok()?)?;
+    if expected == 0 || image.rgba.len() != expected.checked_mul(4)? {
+        return None;
+    }
+    Some(winit::window::Icon::from_rgba(image.rgba.clone(), image.width, image.height).ok()?)
 }
 
 /// 平台中性光标形状 → winit 光标。

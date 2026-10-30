@@ -29,6 +29,9 @@ const ui = {
   viewport: document.getElementById('viewport'),
   entry: document.getElementById('entry'),
   marker: document.getElementById('marker'),
+  game: document.getElementById('game'),
+  yurisVersion: document.getElementById('yuris-version'),
+  kernelVersion: document.getElementById('kernel-version'),
   hint: document.getElementById('hint'),
   statusLine: document.getElementById('status-line'),
   error: document.getElementById('error'),
@@ -492,6 +495,15 @@ function updateOverlay(force) {
     ui.engine.textContent = status.backend ?? '–';
     ui.entry.textContent = status.entry ?? '–';
     ui.marker.textContent = status.marker ?? '–';
+    const identity = status.identity;
+    if (identity) {
+      const game = identity.game ?? identity.project ?? 'yuris-kernel';
+      ui.game.textContent = game;
+      ui.yurisVersion.textContent = identity.engine_version_text ?? '–';
+      ui.kernelVersion.textContent = identity.kernel_version ?? '–';
+      // 无窗口宿主的标题栏等价物:浏览器标签页。
+      document.title = `${game} · YU-RIS ${identity.engine_version_text ?? '?'} · ${identity.kernel ?? 'yuris-kernel'} ${identity.kernel_version ?? ''}`.trim();
+    }
     ui.statusLine.textContent = `${status.backend} · ${status.fps} fps · ${status.dataset?.kind ?? '?'} · built ${status.marker ?? '?'}`;
   }
 }

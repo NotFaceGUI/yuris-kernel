@@ -259,7 +259,7 @@ headless 专有(缺省模式):
 desktop 专有(--mode desktop;需默认 feature 构建):
   --width N  --height N  --fps N   窗口尺寸与帧率(缺省 60fps)
   --fullscreen  --pixel            全屏 / 像素整数缩放
-  --title TEXT                     窗口标题(缺省 YU-RIS · <工程名>)
+  --title TEXT                     窗口标题(缺省 = 游戏真名 · YU-RIS <版本> · 内核 <版本>)
   --debug-ui                       启动即开 egui 调试面板(F1 切换)
   --no-sound                       不出声(@_OS_SOUND 注入口径不变)
   --script case.json               定时输入剧本(自动点击等)

@@ -195,6 +195,9 @@ pub struct EngineOptions {
     /// 给 `Some` 时不再看盘上存档与 DLL —— 用于"全新目录第一次写"这种
     /// 没有真值可依、又需要指定层的情形(`yu-cli run --save-codec`)。
     pub save_codec: Option<yu_format::yssd::BlockCodec>,
+    /// 启动期从工程根 exe 抽取窗口图标(桌面宿主用;默认 false = 不读)。
+    /// 图标是宿主资源,headless/用例不付出这次文件读取。
+    pub with_icon: bool,
 }
 
 impl Default for EngineOptions {
@@ -216,6 +219,7 @@ impl Default for EngineOptions {
             force_font: None,
             script_key: None,
             save_codec: None,
+            with_icon: false,
         }
     }
 }
@@ -528,6 +532,8 @@ impl Renderer {
 pub struct Engine {
     project: Project,
     opts: EngineOptions,
+    /// 游戏身份(游戏名/窗口图标/版本变量;宿主可读,不参与 VM 语义)。
+    identity: crate::identity::Identity,
     vm: Option<Vm>,
     state: Option<Rc<RefCell<GfxState>>>,
     /// 声音域状态（与 `SoundHost` 共享；用于取走 `snd.*` 诊断）。
@@ -591,7 +597,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(project: Project, opts: EngineOptions) -> CliResult<Self> {        let boot_started = Instant::now();
-        let (vm, state, sound, save_host, viewport, probe_order, mut capture_bridge) =
+        let (vm, state, sound, save_host, viewport, probe_order, mut capture_bridge, identity) =
             boot(&project, &opts)?;
         let boot_ms = boot_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -670,6 +676,7 @@ impl Engine {
         Ok(Self {
             project,
             opts,
+            identity,
             vm: Some(vm),
             state: Some(state),
             sound,
@@ -743,6 +750,14 @@ impl Engine {
 
     pub fn entry(&self) -> &str {
         &self.opts.entry
+    }
+
+    /// 游戏身份(游戏名 / YU-RIS 版本 / 内核版本 / 可选窗口图标)。
+    ///
+    /// 宿主层变量:桌面宿主拿它设窗口标题与图标,serve 拿它填
+    /// `/api/status.identity`;内核语义不读它。
+    pub fn identity(&self) -> &crate::identity::Identity {
+        &self.identity
     }
 
     pub fn backend(&self) -> &'static str {
@@ -1670,8 +1685,13 @@ impl Engine {
             audio.detach();
         }
         let started = Instant::now();
-        let (vm, state, sound, save_host, viewport, _, capture_bridge) =
-            boot(&self.project, &self.opts)?;
+        // 身份(游戏名/版本/图标)只随工程数据变化,重启沿用旧值:
+        // 重新跑一遍 exe 图标解码(最大 64MB 读盘)对重启没有意义,所以
+        // 重启轮把 `with_icon` 关掉(身份字段本身不覆盖)。
+        let mut restart_opts = self.opts.clone();
+        restart_opts.with_icon = false;
+        let (vm, state, sound, save_host, viewport, _, capture_bridge, _identity) =
+            boot(&self.project, &restart_opts)?;
         self.boot_ms = started.elapsed().as_secs_f64() * 1000.0;
         self.vm = Some(vm);
         self.state = Some(state);
@@ -1792,6 +1812,7 @@ type BootBundle = (
     Viewport,
     Vec<yu_gfx::ImageFormat>,
     Option<crate::capture::SharedCapture>,
+    crate::identity::Identity,
 );
 
 /// `CGINFO[ONMOUSE*]` 的像素采样面。
@@ -1879,6 +1900,15 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     };
     let mut vm = Vm::boot_with_aux(source, Some(aux), boot)
         .map_err(|d| Failure::runtime(format!("boot 失败: {d}")))?;
+    // 游戏身份(窗口标题/图标/版本;宿主变量,不参与 VM 语义)。
+    // 游戏名与 YU-RIS 版本都取自刚装载的表(数据自证),图标可选读 exe。
+    let identity = crate::identity::Identity::from_boot(
+        project,
+        &vm.tables().boot.config.title,
+        vm.tables().boot.yscm.version,
+        opts.with_icon,
+    );
+    log::info!(target: "yu-cli::engine", "identity: {}", identity.summary());
     log::info!(
         target: "yu-cli::engine",
         "startup: vm boot (tables/entry/script)={:.1}ms",
@@ -1996,6 +2026,7 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         viewport,
         probe_order,
         capture_bridge,
+        identity,
     ))
 }
 

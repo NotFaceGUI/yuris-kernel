@@ -185,6 +185,7 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
     }
     let viewport = engine.viewport();
     let boot_ms = engine.boot_ms();
+    let identity = engine.identity().clone();
 
     let listener = TcpListener::bind(("127.0.0.1", opts.port)).map_err(|e| {
         Failure::runtime(format!(
@@ -206,6 +207,7 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
             entry: opts.entry.clone(),
             fps: opts.fps,
             dataset: dataset.clone(),
+            identity_json: identity.to_json(),
             frame: 0,
             ops: 0,
             skipped: 0,
@@ -256,6 +258,11 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         "serve",
         &format!("marker={} (HMR 可观测点)", build_info::ENGINE_MARKER),
     );
+    console.emit_host(
+        yu_log::console::HostLevel::Info,
+        "serve",
+        &format!("identity: {}", identity.summary()),
+    );
     if !opts.no_open {
         open_browser(&url);
     }
@@ -279,6 +286,11 @@ struct Status {
     entry: String,
     fps: u32,
     dataset: DatasetInfo,
+    /// 游戏身份(游戏名 / YU-RIS 版本 / 内核版本)的预拼 JSON。
+    ///
+    /// 无窗口宿主没有标题栏,但页面标题与状态面板同样要这些变量;
+    /// 与桌面窗口同源(`Engine::identity`)。
+    identity_json: String,
     frame: u64,
     ops: u32,
     skipped: u32,
@@ -299,6 +311,7 @@ impl Status {
         format!(
             "{{\"ok\":true,\"marker\":\"{}\",\"backend\":\"{}\",\"frame\":{},\
              \"fps\":{},\"viewport\":[{},{}],\"entry\":\"{}\",\"dataset\":{},\
+             \"identity\":{},\
              \"clients\":{},\"dropped_frames\":{},\"uptime_ms\":{},\"pid\":{},\
              \"boot_ms\":{:.2},\"tick_ms_avg\":{:.2},\"render_ms_avg\":{:.2},\
              \"ops\":{},\"skipped\":{},\"executed\":{},\"ms\":{:.2},\"paused\":{}}}",
@@ -310,6 +323,7 @@ impl Status {
             self.viewport.1,
             json_escape(&self.entry),
             self.dataset.to_json(),
+            self.identity_json,
             clients,
             self.dropped_frames,
             uptime_ms,

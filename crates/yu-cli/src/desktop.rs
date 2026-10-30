@@ -185,15 +185,9 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             ),
         );
     }
-    let title = title.unwrap_or_else(|| {
-        let name = project
-            .root()
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| root.clone());
-        format!("YU-RIS · {name}")
-    });
-
+    // 标题/图标来自引擎身份(游戏真名 + YU-RIS 版本 + 内核版本,
+    // 见 `yu_engine::identity`);`--title` 显式覆盖标题,不动图标。
+    let title_override = title;
     let options = EngineOptions {
         backend,
         entry,
@@ -215,6 +209,9 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         // 脚本密钥缺省由启动期解析(exe 扫描/数据自举/默认值)。
         script_key: None,
         save_codec,
+        // 窗口图标:从工程根 exe 的 RT_GROUP_ICON 抽(官方 YSIcon.exe
+        // 写的就是这份资源),只有桌面宿主用得到。
+        with_icon: true,
         // 真实运行:`@_TIME` 注入系统本地时间(存档菜单的现实日期)。
         // 固定步长回放用确定性 1970 基准(与 case/golden 同口径)。
         local_time: if fixed_step {
@@ -250,10 +247,26 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         }
     }
 
+    let identity = engine.identity();
+    let title = title_override.unwrap_or_else(|| identity.window_title());
+    let icon = identity.icon.clone();
+    console.emit_host(
+        yu_log::console::HostLevel::Info,
+        "host",
+        &format!(
+            "window: title=\"{title}\" icon={}",
+            match &icon {
+                Some(icon) => format!("{}x{}", icon.width, icon.height),
+                None => "none".to_string(),
+            }
+        ),
+    );
+
     yu_host_desktop::run(
         engine,
         yu_host_desktop::HostOptions {
             title,
+            icon,
             width,
             height,
             fps,

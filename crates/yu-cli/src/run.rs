@@ -168,6 +168,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     }
 
     let report = engine.last_report().clone();
+    output::line(format!("identity: {}", engine.identity().summary()));
     output::line(format!(
         "engine: backend={} entry={} record_events={} debug_mode={} data={} boot_ms={:.2}",
         engine.backend(),
