@@ -347,9 +347,17 @@ pub fn read(vm: &Vm, st: &ExecState, var: VarRef, indices: &[i64]) -> Result<Val
         // 状态由菜单域宿主选中时推入([`Vm::set_menu_code`]);○ 可赋值。
         "_MENUCODE" => Ok(Value::Int(vm.menu_code())),
         // 手册:`○@_WINDOW_EXEC_MAX/CLOSE` = 最大化/閉じるボタン押下状態(0/1)。
-        // 宿主窗口事件推入;○ 可赋值。`_WINDOW_EXEC_MIN`/`_WINDOW_INIT_POS`
-        // 手册无页 ⇒ 走 undoc。
-        "_WINDOW_EXEC_MAX" | "_WINDOW_EXEC_CLOSE" | "_WINDOW_EXEC_CAPTION" => Ok(Value::Int(
+        // 宿主窗口事件推入;○ 可赋值。
+        //
+        // `_WINDOW_EXEC_MIN` 手册无页 ⇒ `fixed(no-manual)`(2026-10-30 取证):
+        // 0.495 getter `FUN_00427350` 跳表 case 117/118/119/120 分别读
+        // `[0x801918]`(MAX)/`[0x80191c]`(MIN)/`[0x801920]`(CLOSE)/
+        // `[0x801924]`(CAPTION),四条都是 `MOVSX`(有符号字节);写侧
+        // `MOV byte ptr [0x80191c],DL`;窗口过程 `FUN_0045acdc` 在
+        // `WM_SYSCOMMAND` 分支 `SC_MINIMIZE (0xF020)` 写 `(char)槽号 + 1`。
+        // 即 MIN = 最小化ボタン押下状態,与 MAX 同族、同存储宽度。
+        "_WINDOW_EXEC_MAX" | "_WINDOW_EXEC_MIN" | "_WINDOW_EXEC_CLOSE"
+        | "_WINDOW_EXEC_CAPTION" => Ok(Value::Int(
             vm.window_exec(name.rsplit('_').next().unwrap_or("")),
         )),
         // `_WINDOW_INIT_POS`:手册无页;引擎 int getter `0x4276f3` 读

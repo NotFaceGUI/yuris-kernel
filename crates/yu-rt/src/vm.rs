@@ -34,7 +34,7 @@ use crate::diag;
 use crate::event::VmEvent;
 use crate::expr::{Evaluator, LValue, VarAccess};
 use crate::input::{InputBinding, InputState, InputTimeline};
-use crate::tables::{TableSet, WindowRec};
+use crate::tables::{TableSet, VarRecord, WindowRec};
 use crate::task::{
     ChainReport, Effect, Scheduler, StepOutcome, TaskExecutor, TaskNode, TaskSeed, TaskView,
     MAIN_TASK_ID,
@@ -457,9 +457,14 @@ pub struct Vm {
     text_layer_id: String,
     /// `@_MENUCODE`(手册:最後に選択されたメニュー項目の CODE 値;○ 可赋值)。
     menu_code: i64,
-    /// `@_WINDOW_EXEC_MAX`/`_WINDOW_EXEC_CLOSE`(手册:最大化/閉じるボタン
-    /// 押下状態 0/1;○ 可赋值)。宿主窗口事件可经 setter 推入。
+    /// `@_WINDOW_EXEC_MAX/MIN/CLOSE/CAPTION`:窗口按钮/尺寸事件的按下状态。
+    ///
+    /// 官方把这四个做成**连续 4 字节全局**(0.495 `0x801918`/`0x80191c`/
+    /// `0x801920`/`0x801924`),读用 `MOVSX`(有符号字节),写用 `MOV byte`
+    /// —— 即**存储宽度是 1 字节**。MAX/CLOSE 手册有页(○ 可赋值),
+    /// MIN/CAPTION 手册无页(DIV-RT-007)。
     window_exec_max: i64,
+    window_exec_min: i64,
     window_exec_close: i64,
     /// `@_WINDOW_EXEC_CAPTION`:窗口尺寸再初始化的一次性宿主事件标志
     /// (DIV-RT-007 的宿主 setter 形态;P3 收口)。
@@ -703,6 +708,7 @@ impl Vm {
             text_layer_id: String::new(),
             menu_code: 0,
             window_exec_max: 0,
+            window_exec_min: 0,
             window_exec_close: 0,
             window_exec_caption: 0,
             executed: 0,
@@ -744,7 +750,8 @@ impl Vm {
             asset_size_cache: BTreeMap::new(),
         };
         vm.apply_global_initial_values();
-        vm.globals_restore = vm.build_globals_restore();
+        let restore = vm.build_globals_restore();
+        vm.globals_restore = restore;
         vm.apply_script_locals(script_id);
 
         vm.exec
@@ -783,6 +790,54 @@ impl Vm {
         Ok(vm)
     }
 
+    /// `ysv.ybn` 一条记录的初值 → 运行值。
+    ///
+    /// **串初值是 YSTB 参数数据,要在装载时求值,不是按字面存字节。**
+    /// 证据(0.481 商业引擎 `FUN_00456e50`,`0x456f61` 调用点):
+    /// ```text
+    /// uVar3 = *puVar11;                                  // u16 长度
+    /// uVar8 = (*DAT_008097e0)(pvVar6, puVar11 + 1, uVar3); // 窗口求值器
+    /// FUN_00465654(uVar10, pvVar6, uVar8);                // 写变量
+    /// ```
+    /// 同一条目里数值初值走 `FUN_004658e0`(int)/`FUN_00465800`(float)
+    /// 直写,只有串初值过求值器 —— 因为 `0x4d` 字面量与 `$1143[38,21]`
+    /// 这类表达式在字节层是同一种东西(命令参数形态)。
+    ///
+    /// 只认字面量的实现会把 `$1143[38,21]` 的**字节码本身**当字符串存进
+    /// 变量,随后被脚本拼进资源路径(实测:`cg/face/` 类前缀位置出现
+    /// `56 03 00 24 77 04 …`,VFS 报 `NUL byte in lookup key`)。
+    fn ysv_init_value(&mut self, r: &VarRecord, ty: ElemType, script_id: u32) -> Value {
+        if let Some(raw) = r.str_init_bytes().filter(|_| r.str_init_needs_eval()) {
+            return match self.eval_init_expr(raw, script_id) {
+                // 串槽位:结果按串口径归一(与参数槽同一套 coerce)。
+                Ok(v) => crate::expr::ParamTy::Str.coerce(v),
+                Err(d) => {
+                    // 求值失败不猜:留痕后按空串建槽(与「未声明初值」同
+                    // 口径),避免把字节码当内容继续传播。
+                    self.report(d);
+                    Value::Str(Vec::new())
+                }
+            };
+        }
+        r.init_value().unwrap_or_else(|| ty.default_value())
+    }
+
+    /// 求值一条 `ysv` 串初值窗口(装载期,无当前任务)。
+    fn eval_init_expr(&mut self, raw: &[u8], script_id: u32) -> Result<Value, Diag> {
+        let instrs = self.decoded_window(raw)?;
+        if let Some(var) = crate::expr::single_value_var(&instrs) {
+            let st = ExecState::new(script_id, 0);
+            let mut access = VmAccess { vm: self, st: &st };
+            return access.read(var, &[]);
+        }
+        let mut stack = std::mem::take(&mut self.eval_scratch);
+        let st = ExecState::new(script_id, 0);
+        let mut access = VmAccess { vm: self, st: &st };
+        let r = Evaluator::new(&mut access).eval_value_instrs(&instrs, &mut stack);
+        self.eval_scratch = stack;
+        r
+    }
+
     fn apply_global_initial_values(&mut self) {
         let sys_count = self.sys_count;
         let records: Vec<_> = self
@@ -802,7 +857,7 @@ impl Vm {
                 continue;
             }
             let dims: Vec<usize> = r.dims.iter().map(|&d| d as usize).collect();
-            let init = r.init_value().unwrap_or_else(|| ty.default_value());
+            let init = self.ysv_init_value(&r, ty, 0);
             self.store.declare(
                 VarRef::new(VarSpace::for_elem(ty), r.var_id),
                 ty,
@@ -817,32 +872,36 @@ impl Vm {
     /// 过滤条件与 `restore_globals` 的可观察条件一致:`kind == 1`、
     /// 非系统变量镜像、类型可解析。初值在这里解码一次,之后每次恢复
     /// 只按 `ty/dims/init` 重置槽位。
-    fn build_globals_restore(&self) -> Vec<GlobalRestore> {
+    fn build_globals_restore(&mut self) -> Vec<GlobalRestore> {
         let sys_count = self.sys_count;
-        self.tables
+        let records: Vec<_> = self
+            .tables
             .boot
             .vars
             .records
             .iter()
             .filter(|r| r.kind == 1 && r.var_id >= sys_count)
-            .filter_map(|r| {
-                let ty = r.elem_type()?;
-                let init = r.init_value().unwrap_or_else(|| ty.default_value());
-                let family = match r.value_type {
-                    2 => 1,
-                    3 => 2,
-                    _ => 0,
-                };
-                Some(GlobalRestore {
-                    var: VarRef::new(VarSpace::for_elem(ty), r.var_id),
-                    ty,
-                    dims: r.dims.iter().map(|&d| d as usize).collect(),
-                    init,
-                    group: r.group,
-                    family,
-                })
-            })
-            .collect()
+            .cloned()
+            .collect();
+        let mut out = Vec::with_capacity(records.len());
+        for r in records {
+            let Some(ty) = r.elem_type() else { continue };
+            let init = self.ysv_init_value(&r, ty, 0);
+            let family = match r.value_type {
+                2 => 1,
+                3 => 2,
+                _ => 0,
+            };
+            out.push(GlobalRestore {
+                var: VarRef::new(VarSpace::for_elem(ty), r.var_id),
+                ty,
+                dims: r.dims.iter().map(|&d| d as usize).collect(),
+                init,
+                group: r.group,
+                family,
+            });
+        }
+        out
     }
 
     fn apply_script_locals(&mut self, script_id: u32) {
@@ -856,7 +915,7 @@ impl Vm {
         for r in records {
             let Some(ty) = r.elem_type() else { continue };
             let dims: Vec<usize> = r.dims.iter().map(|&d| d as usize).collect();
-            let init = r.init_value().unwrap_or_else(|| ty.default_value());
+            let init = self.ysv_init_value(&r, ty, script_id);
             // 局部变量的声明指令会建槽;YSVR 只补初值镜像,不覆盖已建槽。
             self.store.declare_if_absent(
                 VarRef::new(VarSpace::for_elem(ty), r.var_id),
@@ -1220,18 +1279,28 @@ impl Vm {
         self.menu_code = code;
     }
 
-    /// `@_WINDOW_EXEC_MAX/CLOSE` 读写(手册 ○;宿主窗口事件推入)。
+    /// `@_WINDOW_EXEC_MAX/MIN/CLOSE/CAPTION` 读写(MAX/CLOSE 手册 ○;
+    /// MIN/CAPTION 手册无页,按 REA 落地)。
+    ///
+    /// 官方存储是**有符号字节**(0.495 getter `FUN_00427350` case
+    /// 117/118/119/120 = `MOVSX EBP,byte ptr [0x801918/1c/20/24]`;
+    /// 写入 `MOV byte ptr [0x80191c],DL`),所以这里按 `i8` 截断后再
+    /// 符号扩展 —— 脚本写 300 读回 44,写 -1 读回 -1。
     pub(crate) fn window_exec(&self, which: &str) -> i64 {
         match which {
             "MAX" => self.window_exec_max,
+            "MIN" => self.window_exec_min,
             "CAPTION" => self.window_exec_caption,
+            // 剩下的只有 "CLOSE"(调用方都按名字先过滤过)。
             _ => self.window_exec_close,
         }
     }
 
     pub(crate) fn set_window_exec(&mut self, which: &str, v: i64) {
+        let v = i64::from(v as i8);
         match which {
             "MAX" => self.window_exec_max = v,
+            "MIN" => self.window_exec_min = v,
             "CAPTION" => self.window_exec_caption = v,
             _ => self.window_exec_close = v,
         }
@@ -1242,12 +1311,24 @@ impl Vm {
     /// 引擎窗口过程把 WM_CLOSE 变成脚本可读的 0/1 状态,由脚本决定是否
     /// `END`;宿主**不得**直接退出进程。重复调用保持为 1。
     pub fn request_window_close(&mut self) {
-        self.window_exec_close = 1;
+        self.set_window_exec("CLOSE", 1);
     }
 
     /// 宿主要求的最大化状态(与 `request_window_close` 同型)。
     pub fn request_window_maximize(&mut self) {
-        self.window_exec_max = 1;
+        self.set_window_exec("MAX", 1);
+    }
+
+    /// 宿主窗口的「最小化」按钮被按下(手册无页;REA 落地,`fixed(no-manual)`)。
+    ///
+    /// 官方窗口过程 `FUN_0045acdc`(0.495)在 `WM_SYSCOMMAND`(`& 0xFFF0`)
+    /// 分支 `SC_MINIMIZE (0xF020)` 写 `DAT_0080191c = (char)*ecx + 1`
+    /// —— 即 `_WINDOW_EXEC_MIN = 窗口槽号 + 1`(主窗口槽 0 ⇒ 1);
+    /// 同函数 `SC_MAXIMIZE (0xF030)` 写 `_WINDOW_EXEC_MAX`、
+    /// `SC_CLOSE (0xF060)` 写 `_WINDOW_EXEC_CLOSE = 1`。
+    /// 内核只持有状态,窗口动作由宿主决定。
+    pub fn request_window_minimize(&mut self) {
+        self.set_window_exec("MIN", 1);
     }
 
     /// 宿主窗口的「尺寸再初始化」事件(手册无页;DIV-RT-007)。
@@ -1257,7 +1338,7 @@ impl Vm {
     /// (`WM_SYSCOMMAND` 路径里 `*ecx` 的来源)未取证,因此**只能由宿主**
     /// 在它认为需要重建窗口时调用本 setter,VM 不猜。
     pub fn request_window_caption(&mut self) {
-        self.window_exec_caption = 1;
+        self.set_window_exec("CAPTION", 1);
     }
 
     // ---------------------------------------------------------- DIALOG

@@ -784,6 +784,88 @@ fn string_declare_concat_and_varact_copy() {
     );
 }
 
+/// `ysv` 串初值 = **YSTB 参数数据**,装载时要过窗口求值器。
+///
+/// 证据(0.481 商业引擎 `FUN_00456e50`,调用点 `0x456f61`):
+/// `uVar3 = *puVar11; (*DAT_008097e0)(pvVar6, puVar11 + 1, uVar3)` 之后
+/// 才 `FUN_00465654(slot, buf, len)` 写变量 —— `0x4d` 字面量与
+/// `$arr[i]` 表达式在字节层是同一种东西,必须求值。
+///
+/// 只认字面量的实现会把**字节码本身**当字符串存进变量,随后被脚本拼进
+/// 资源路径(实测商业包:路径前缀出现 `56 03 00 24 77 04 …`,VFS 报
+/// `NUL byte in lookup key`)。
+#[test]
+fn ysv_str_init_expression_is_evaluated_not_stored_raw() {
+    fn leak(bytes: Vec<u8>) -> &'static [u8] {
+        Box::leak(bytes.into_boxed_slice())
+    }
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    // 表达式窗口 `$A[0]`(0x56 引用 + 0x42 下标 + 0x29 取值)。
+    let expr = || leak(ex::cat(&[ex::r#ref(0x24, sys), ex::i8_(0), ex::aload()]));
+    b.vars = vec![
+        // 先声明:`$A` 是 2 元素串数组,每个元素初值 "cg/"。
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys,
+            value_type: 3,
+            dims: vec![2],
+            init: Init::Str(b"cg/"),
+        },
+        // 全局串:初值不是字面量,是表达式 `$A[0]`。
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(expr()),
+        },
+        // 脚本 0 的局部串:同一表达式,在脚本装载时求值。
+        VarSpec {
+            kind: 2,
+            group: 0,
+            script_id: 0,
+            var_id: sys + 2,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(expr()),
+        },
+    ];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![GroupSpec::new(OP_END)]];
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let read = |vm: &Vm, id: u16| {
+        vm.store()
+            .read(VarRef::new(VarSpace::Dollar, id), &[])
+            .unwrap()
+    };
+    assert_eq!(
+        read(&vm, sys + 1),
+        Value::Str(b"cg/".to_vec()),
+        "全局表达式初值要按求值结果落地"
+    );
+    assert_eq!(
+        read(&vm, sys + 2),
+        Value::Str(b"cg/".to_vec()),
+        "局部表达式初值要按求值结果落地(不是字节码)"
+    );
+    // 数组元素初值保持字面量语义(与旧口径一致)。
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::Dollar, sys), &[1])
+            .unwrap(),
+        Value::Str(b"cg/".to_vec())
+    );
+}
+
 #[test]
 fn string_concat_assignment() {
     let mut b = ProjectBuilder::new();
@@ -4334,6 +4416,57 @@ fn window_exec_caption_is_a_host_setter_round_trip() {
     ]];
     let mut vm = boot(b);
     vm.request_window_caption();
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        vm.store().read(v, &[]).unwrap(),
+        Value::Int(1),
+        "宿主 setter 置 1"
+    );
+    assert_eq!(
+        vm.store().read(v2, &[]).unwrap(),
+        Value::Int(0),
+        "脚本写回 0"
+    );
+}
+
+/// `@_WINDOW_EXEC_MIN`:手册无页,但官方是真实状态变量 —— 宿主 setter 置 1,
+/// 脚本读 1 后写回 0(`fixed(no-manual)`)。
+///
+/// 证据(0.495 `yu-ris.exe`,sha256 `4f5eefa3…`):
+/// - getter `FUN_00427350` 跳表 case 118 → `MOVSX EBP,byte ptr [0x80191c]`;
+/// - 写侧 `0x446fa4` → `MOV byte ptr [0x80191c],DL`;
+/// - 窗口过程 `FUN_0045acdc` 在 `WM_SYSCOMMAND & 0xFFF0 == SC_MINIMIZE`
+///   写 `(char)槽号 + 1`(同分支族 MAX=`0x801918`/CLOSE=`0x801920`)。
+#[test]
+fn window_exec_min_is_a_host_setter_round_trip() {
+    let mut b = ProjectBuilder::new();
+    let v = with_int_var(&mut b, 0, -1);
+    let v2 = with_int_var(&mut b, 1, -1);
+    let min_id = b
+        .sysvars
+        .iter()
+        .position(|(n, _, _)| *n == "_WINDOW_EXEC_MIN")
+        .expect("_WINDOW_EXEC_MIN") as u16;
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        // LET[@v = @_WINDOW_EXEC_MIN]
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, v.id))
+            .window(1, ex::get(0x40, min_id)),
+        // LET[@_WINDOW_EXEC_MIN = 0](脚本写回 0)
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, min_id))
+            .window(1, ex::i8_(0)),
+        // LET[@v2 = @_WINDOW_EXEC_MIN](再读应为 0)
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, v2.id))
+            .window(1, ex::get(0x40, min_id)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    vm.request_window_minimize();
     let r = vm.tick_at(0, &no_input());
     assert!(r.errors.is_empty(), "{:?}", r.errors);
     assert_eq!(

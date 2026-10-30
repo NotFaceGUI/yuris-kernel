@@ -16,7 +16,7 @@
 | DIV-RT-004 | 「实参缺席」的运算符缺右操作数形态 | fixed | 语料 20 窗口统计(19 掩码 + 1 真缺席);`expr.rs` 容忍一次;语料全量跑通 |
 | DIV-RT-005 | 脚本执行错误后的引擎继续策略 | open | 默认槽路径已取证(DIV-RT-043:报一次+让出,任务不终止);内核现行 = Unimplemented/Recoverable 挂号后继续、Fatal 结束+记录;官方其余错误路径仍无 trace |
 | DIV-RT-006 | 输入键码 `_CODE_*` / `_INP` / `_PAD` 的码值 | fixed | REA 证结构(VK 计数表)+ 手册不变量定值;`_KEYLAST/_MOUSELAST` 已另证(DIV-RT-033) |
-| DIV-RT-007 | 工程 ycd 声明但手册无页的系统变量 | open | `_WINDOW_EXEC_CAPTION` 已收口(DIV-RT-047);**`_CHR` 已收口(2026-10-25,fixed(no-manual))**:按语料用法+REA `0x446b93` 取值链实现为「单字节构造」——`$_CHR(n)` 返回字节 `n` 的 1 字节字符串(非码位再编码);证据:es_Text.yst:878 用 `$_CHR(0xEF)+$_CHR(0xF3)` 匹配文本流控制码 `C`,而编译器把 `
+| DIV-RT-007 | 工程 ycd 声明但手册无页的系统变量 | open | `_WINDOW_EXEC_CAPTION` 已收口(DIV-RT-047);**`_WINDOW_EXEC_MIN` 已收口(2026-10-30,fixed(no-manual))**:0.495 getter `FUN_00427350` case 118 → `MOVSX EBP,byte [0x80191c]`,写侧 `0x446fa4` `MOV byte [0x80191c],DL`,窗口过程 `FUN_0045acdc` 在 `WM_SYSCOMMAND & 0xFFF0 == SC_MINIMIZE(0xF020)` 写 `(char)槽号+1`;与 MAX(`0x801918`)/CLOSE(`0x801920`)/CAPTION(`0x801924`)是**连续四字节**同族、存储宽度 1 字节 ⇒ 内核按 `i8` 截断读写,新增宿主 setter `Vm::request_window_minimize`。**`_CHR` 已收口(2026-10-25,fixed(no-manual))**:按语料用法+REA `0x446b93` 取值链实现为「单字节构造」——`$_CHR(n)` 返回字节 `n` 的 1 字节字符串(非码位再编码);证据:es_Text.yst:878 用 `$_CHR(0xEF)+$_CHR(0xF3)` 匹配文本流控制码 `C`,而编译器把 `
 ` 展开成 `$_TEXT(239)+$_TEXT(240)`(原始字节 0xEF 0xF0),按 Unicode 再编码恒不匹配(桌面会话实测 46,696 次挂号清零)。`_DXMODE`/`_VARTYPE`/`_SYSTEM_FRAME` 等仍 `Unimplemented` |
 | DIV-RT-008 | `_`(文本输出)手册无页 | fixed | 手册 basic.html ●テキスト表示有页(`_[式]`);已实现,撤销旧挂账 |
 | DIV-RT-009 | `_TIME`/`_OS_TIME` 的时区与纪元 | fixed/partial | 真实运行宿主注入本地时间基准(`_TIME` 全字段,存档现实日期);`_OS_TIME(0)` 与跨 DST 漂移仍 open |
@@ -288,6 +288,33 @@
   - 回归:`yu-rt` fixture `inp_keylast_mouselast_writes_are_applied`;
     `yu-cli` 语料用例 `click_and_advance_do_not_report_sysvar_write`
     (A/B:修复前 7 条 `_INP/_KEYLAST/_MOUSELAST` 挂号,修复后 0)。
+- **2026-10-30(`_WINDOW_EXEC_MIN` 收口,`fixed(no-manual)`)**:0.481 商业包
+  在 `es_scenario.yst` pc246 起每帧读该变量,内核按「手册无页」挂号,单次
+  运行 1,800 帧持续刷 `rt.sysvar.unimplemented`。取证(0.495 `yu-ris.exe`,
+  sha256 `4f5eefa3…`):
+  - getter `FUN_00427350` 跳表 case 117/118/119/120 → 分别
+    `MOVSX EBP,byte ptr [0x801918/0x80191c/0x801920/0x801924]`
+    (MAX/MIN/CLOSE/CAPTION),**四条都是 1 字节有符号读**;
+  - 写分派 case 118 → `0x446fa4` `MOV byte ptr [0x80191c],DL`;
+  - 窗口过程 `FUN_0045acdc`:`WM_SYSCOMMAND & 0xFFF0` 的
+    `SC_MINIMIZE(0xF020)` → `DAT_0080191c = (char)*ecx + 1`;
+    `SC_MAXIMIZE(0xF030)`/`SC_CLOSE(0xF060)` 同族写另外两个。
+  - 结论:MIN = 最小化ボタン押下状態,与 MAX 完全同型、同存储宽度。
+  - 落地:`sysvar::read` / 写分派加入 `_WINDOW_EXEC_MIN`;
+    `Vm::window_exec` 增 `MIN` 分支;四个状态统一按 `i8` 截断再符号扩展
+    (官方 `MOV byte` + `MOVSX`);新增宿主 setter
+    `Vm::request_window_minimize` / `Engine::request_window_minimize`。
+  - 回归:`yu-rt` fixture `window_exec_min_is_a_host_setter_round_trip`;
+    商业包 1,800 帧 `rt.sysvar.unimplemented` 由 5 → 4(仅余
+    `_SAVE_PATH_TYPE`×3 与 `_RET`×1)。
+  - 残余:`_SAVE_PATH_TYPE`(id 112)取证已推进到 `[0x801324]`,写侧
+    `FUN_00460c80` 从 **`yssfs.dat`**(`FUN_00469df2` 键控记录文件,
+    4 字节 key、0x20 dword 记录,取 `puVar2[0x15]` = 偏移 0x54,值 0..3)
+    读出后组路径:默认 `save\`;1/2/3 分别前置 `%APPDATA%` 类前缀 +
+    `\<name>_SaveData\<name>\save\`,3 再插 `\My Games`。缺
+    `yssfs.dat` 容器格式 ⇒ 仍 `Unimplemented`(宿主注入 `$_SAVE_PATH` 为
+    现行口径)。`_RET`(id 49)getter 命中 `MOV EDX,2`/`MOV EBP,0x3e7`
+    常量块(不读任何全局),说明它不是状态变量,待语料语义定案。
 - **复核**:`crates/yu-rt/src/sysvar.rs::undoc`;频度见 `docs/coverage-matrix.md` §3。
 
 ---

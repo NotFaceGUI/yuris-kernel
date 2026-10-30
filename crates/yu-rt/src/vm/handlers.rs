@@ -691,6 +691,29 @@ impl Vm {
         Ok(StepOutcome::Continue)
     }
 
+    /// 条件窗口求值(`IF` / `ELSE` 共用策略)。
+    ///
+    /// 可恢复失败(`Unimplemented` / `Recoverable`,典型 = 未取证的系统变量)
+    /// ⇒ 记诊断后按**「假」**处理;`Fatal` 照常抛出(任务终止)。
+    /// 策略集中在这里:两处各写一份时曾经分叉过 —— `ELSE` 用 `?` 抛出,
+    /// 通用错误处理「留痕后继续下一条」,于是直接落进 else 体。
+    fn eval_condition(&mut self, st: &mut ExecState, w: &CmdWindow) -> Result<bool, VmError> {
+        match self.eval_window(st, w) {
+            Ok(v) => Ok(v.truthy()?),
+            Err(d) => {
+                let recoverable = matches!(
+                    d.severity,
+                    yu_log::Severity::Unimplemented | yu_log::Severity::Recoverable
+                );
+                if !recoverable {
+                    return Err(d.into());
+                }
+                self.report(d);
+                Ok(false)
+            }
+        }
+    }
+
     /// `IF`:手册 `control/if.html`;引擎 §3.13(块帧 + 假分支跳 `item[2].length`,
     /// 为 0 则跳块出口)。
     fn op_if(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
@@ -714,20 +737,7 @@ impl Vm {
         });
         // 条件求值:可恢复失败(Unimplemented)⇒ 记诊断并按「假」处理;
         // Fatal 照常抛出(任务终止)。
-        let truthy = match self.eval_window(st, &cmd.windows[0]) {
-            Ok(v) => v.truthy()?,
-            Err(d) => {
-                let recoverable = matches!(
-                    d.severity,
-                    yu_log::Severity::Unimplemented | yu_log::Severity::Recoverable
-                );
-                if !recoverable {
-                    return Err(d.into());
-                }
-                self.report(d);
-                false
-            }
-        };
+        let truthy = self.eval_condition(st, &cmd.windows[0])?;
         if truthy {
             return Ok(StepOutcome::Continue);
         }
@@ -775,14 +785,16 @@ impl Vm {
                 "ELSE 无配对 IF(引擎同族报错)",
             )
         })?;
-        let cond = if cmd.windows[0].payload.is_empty() {
-            None
+        // 条件求值与 `IF` 同策(见 [`Vm::eval_condition`]):可恢复失败
+        // (Unimplemented)按「假」处理,先记诊断再跳下一 ELSE/出口。
+        //
+        // 旧实现用 `?` 抛出 ⇒ 通用错误处理「留痕后继续下一条」,直接落进
+        // else 体:实测 0.481 商业包把存档路径改写成 `Documents\…\save\`
+        // (分支 2),而正确行为是三个条件全假、保留宿主注入的 `$_SAVE_PATH`。
+        let truthy = if cmd.windows[0].payload.is_empty() {
+            true
         } else {
-            Some(self.eval_window(st, &cmd.windows[0])?)
-        };
-        let truthy = match cond {
-            Some(v) => v.truthy()?,
-            None => true,
+            self.eval_condition(st, &cmd.windows[0])?
         };
         if truthy {
             return Ok(StepOutcome::Continue);
@@ -1254,7 +1266,10 @@ impl Vm {
                 self.input_state_mut().set_last(name == "_KEYLAST", v);
                 return Ok(StepOutcome::Continue);
             }
-            // `@_MENUCODE` / `@_WINDOW_EXEC_MAX/CLOSE`(手册 ○)= 状态覆盖。
+            // `@_MENUCODE` / `@_WINDOW_EXEC_MAX/MIN/CLOSE/CAPTION` = 状态覆盖
+            // (MAX/CLOSE 手册 ○;MIN/CAPTION 手册无页)。MIN 的官方写侧确实
+            // 存在(0.495 `0x446fa4` `MOV byte ptr [0x80191c],DL`),
+            // 按 REA 落地,`fixed(no-manual)`。
             if name == "_MENUCODE" {
                 let rhs = self.eval_window(st, &cmd.windows[1])?;
                 let v = rhs.as_int().unwrap_or(0);
@@ -1262,6 +1277,7 @@ impl Vm {
                 return Ok(StepOutcome::Continue);
             }
             if name == "_WINDOW_EXEC_MAX"
+                || name == "_WINDOW_EXEC_MIN"
                 || name == "_WINDOW_EXEC_CLOSE"
                 || name == "_WINDOW_EXEC_CAPTION"
             {
@@ -3920,19 +3936,19 @@ impl Vm {
             );
             return Ok(StepOutcome::Continue);
         };
-        // 请求的字段名(SX/SY 才走资产元数据回退;其余字段保持原样)。
+        // 需要资产元数据回退的字段:`SX/SY`(尺寸本身)与像素查询
+        // `COLOR`/`ONMOUSE*`(先要尺寸才能建命中矩形)。其余字段保持原样。
         let wanted = query_args.iter().find_map(|a| {
-            params
-                .get(usize::from(a.slot))
-                .map(String::as_str)
-                .filter(|n| matches!(*n, "SX" | "SY"))
+            params.get(usize::from(a.slot)).map(String::as_str).filter(
+                |n| matches!(*n, "SX" | "SY" | "COLOR" | "ONMOUSE" | "ONMOUSE2" | "ONMOUSE3"),
+            )
         });
         let result = host.query(name, &query_args);
         let mut value = match result {
             Ok(v) => Some(v),
             Err(d) => {
-                // `CGINFO[SX/SY]` 的资源尺寸:gfx 不读文件 ⇒ 向宿主取
-                // `MFILE` 键,由本 VM 解析图像头后回填(DIV-GFX-024)。
+                // `CGINFO[SX/SY/COLOR/ONMOUSE*]` 的资源尺寸:gfx 不读文件 ⇒
+                // 向宿主取 `MFILE` 键,由本 VM 解析图像头后回填(DIV-GFX-024)。
                 //
                 // 槽号一律按工程 ysc 参数名解析:该工程表里没有 `MFILE`/`ID`
                 // 时不猜序号,按“尺寸不可得”继续(仍走原诊断)。
@@ -3950,15 +3966,23 @@ impl Vm {
                         ask.push(ArgValue::new(mfile_slot, Value::Int(1)));
                         if let Ok(Value::Str(key)) = host.query("CGINFO", &ask) {
                             if !key.is_empty() {
-                                if let Some((w, h)) = self.resolve_asset_size(&key) {
-                                    host.note_asset_size(&key, w, h);
-                                    resolved =
-                                        Some(Value::Int(i64::from(if wanted == Some("SX") {
-                                            w
-                                        } else {
-                                            h
-                                        })));
-                                }
+                                // 资产**不存在**时按 0×0 回填,不报错:
+                                // 官方 `CGINFO[SX/SY]` 直接读图层 `+0x78/+0x7c`
+                                // 的矩形,`CG[FILE=…]` 装载失败时该矩形保持 0
+                                // (与 `query_layer_size` 对 `TextureRef::None`
+                                // 返回 0 同一取证)。按钮系统会主动查询
+                                // `*_bt3/_bt4` 这类**派生**层名(包里只有
+                                // `_on/_na/_mask`),按错误处理会刷诊断并把
+                                // `LET` 留在旧值上。
+                                let (w, h) = self.resolve_asset_size(&key).unwrap_or((0, 0)); // silent-ok: 资产缺失 ⇒ 官方矩形 0
+                                host.note_asset_size(&key, w, h);
+                                resolved = match wanted {
+                                    Some("SX") => Some(Value::Int(i64::from(w))),
+                                    Some("SY") => Some(Value::Int(i64::from(h))),
+                                    // 像素查询:尺寸回填后**重试原查询**
+                                    // (命中矩形与纹理坐标都由尺寸推出)。
+                                    _ => host.query(name, &query_args).ok(),
+                                };
                             }
                         }
                     }

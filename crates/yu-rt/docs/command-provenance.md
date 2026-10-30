@@ -96,7 +96,8 @@
 | `_CODE_*(133 项)` | 415..547 | 39 读/8 帧 | `basic/svariable.html`(○) | ✅ | REA `FUN_00427350`(VK 计数表;DIV-RT-029) | ✅(2026-10-19) |
 | `_INP` | 144 | (数组) | 同上(`@_INP(@_CODE_Z)` 例) | ✅ | REA case 0x90(同表;`n<=0→0`) | ✅(2026-10-19) |
 | `_WINDOW_EXEC_MAX/CLOSE` | (ycd 序) | 8 读/8 帧 | `basic/svariable.html`(○) | ✅ | 内核状态,宿主窗口推入 | ✅(2026-10-19) |
-| `_WINDOW_EXEC_CAPTION` | 120 | 600 读(无输入普查) | ⛔ 手册无页(0.479/0.495 字节级) | ✅ `es_Scenario`:窗口尺寸再初始化的一次性标志 | REA `0x45a9d0`/`0x45a9e7`(WM_SYSCOMMAND 写 `[0x801924]`) | ⛔ 未实现(DIV-RT-007;2026-10-21 P1 有界取证) |
+| `_WINDOW_EXEC_MIN` | 118 | 多帧(`es_scenario.yst` pc246 起) | ⛔ 手册无页(0.479/0.495 字节级) | ✅ 最小化ボタン押下状態(与 MAX 同族) | REA 0.495 getter `FUN_00427350` case 118 → `MOVSX EBP,byte [0x80191c]`;写侧 `0x446fa4` `MOV byte [0x80191c],DL`;窗口过程 `FUN_0045acdc` `SC_MINIMIZE(0xF020)` → `(char)槽号+1` | ✅ `fixed(no-manual)`(2026-10-30) |
+| `_WINDOW_EXEC_CAPTION` | 120 | 600 读(无输入普查) | ⛔ 手册无页(0.479/0.495 字节级) | ✅ `es_Scenario`:窗口尺寸再初始化的一次性标志 | REA `0x45a9d0`/`0x45a9e7`(WM_SYSCOMMAND 写 `[0x801924]`) | ✅ 宿主 setter(2026-10-23 P3;DIV-RT-047) |
 | `_KEYLAST/_MOUSELAST` | 145/146 | 0 | ⛔ 手册无页(字节级核对) | ⛔ | InputState 内部记录,读取挂号 | ⛔(DIV-RT-033) |
 | `_MOUSE_X/Y` | 133/138 | 232/234 | `basic/svariable.html` | ✅ | 输入层 | ✅(注入光标) |
 | `_KEY_*`/`_MOUSE_L..D` | 167..275 | 高 | `basic/input.html`(带符号计数器) | ✅ | 输入层 | ✅ |

@@ -366,6 +366,38 @@ impl VarRecord {
             VarInit::None => None,
         }
     }
+
+    /// 串初值是否**需要运行核求值**才能得到值。
+    ///
+    /// 官方把串初值当 YSTB 参数数据交给窗口求值器(0.481 `FUN_00456e50`
+    /// 里的 `(*DAT_008097e0)(buf, bytes, len)`),所以「字面量」只是求值的
+    /// 特例;非字面量形态(如 `$1143[38,21]`)必须由运行核求值。
+    ///
+    /// 三种形态不求值(保持既有「原样字节」口径):
+    /// - 空串初值(常态,就是空字符串,不是「空表达式错误」);
+    /// - 单条 `0x4d` 字面量(等价于求值结果,走快路径);
+    /// - **解不成合法表达式**的字节(损坏或非该形态;求值必失败,
+    ///   官方此处亦无已取证行为,不猜)。
+    pub fn str_init_needs_eval(&self) -> bool {
+        let VarInit::Str(raw) = &self.init else {
+            return false;
+        };
+        if raw.is_empty() {
+            return false;
+        }
+        match crate::expr::decode(raw) {
+            Ok(ins) => !(ins.len() == 1 && ins[0].op == 0x4d),
+            Err(_) => false,
+        }
+    }
+
+    /// 串初值原始字节(非串记录 = `None`)。
+    pub fn str_init_bytes(&self) -> Option<&[u8]> {
+        match &self.init {
+            VarInit::Str(raw) => Some(raw),
+            _ => None,
+        }
+    }
 }
 
 /// `YSVR` 字符串初值 → 运行值。
