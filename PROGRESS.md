@@ -11216,3 +11216,69 @@ soft vs wgpu 300 帧商业包 --shot            → PNG sha256 完全一致
 `cargo test -p yu-gfx` 全绿(blend_table 10 / parity_fixes 27 / info_query 11);
 商业包 1800 帧 UNIMP 0;ERIS 200 帧仅 EMOTE(deferred);
 soft vs wgpu 300 帧 PNG sha256 与改动前完全一致(`6b2fd875…`)。
+
+## 成果 FONT-BNO (2026-10-30) · `FONT[BNO]` 定案为文字样式槽号选择器并实现,ERIS/商业包该码归零
+
+### 问题
+
+0.481 商业包 `s30 pc32` 起每帧刷 4~590 条:
+
+```text
+UNIMP [gfx] gfx.text.unsupported … FONT: FONT[BNO] 无手册页/字体列表语义未取证;值已保留
+```
+
+旧实现把 `BNO` 当"调试字体槽"塞进 `TextStyle.font_bno`,并让
+`font_request()` 在 `NO` 之后回退到它 —— 方向就是错的。
+
+### 取证(REA 0.495,`FUN_004039d0` / FONT 处理体 / `FUN_00464fac`)
+
+1. **setter 只有三条指令**:`FUN_004039d0` = `MOV [0x5d1684],arg; XOR EAX,EAX; RET`。
+2. **FONT 处理体**(`0x444428` 起,入口 `MOV EAX,0x1b` = 命令号 27):
+   先读 `byte [0x684160]`(参数 0 = BNO 的槽下标),非零 ⇒
+   `PUSH [slot*8+0x683740]; CALL FUN_004039d0`,然后才继续处理
+   `NO`(参数 1)/`NAME`(2)/`SX`(9)/`SY`(10)…
+3. **其余参数写哪**:`MOV EDX,[0x5d1684]; MOV [EDX*4 + 0x5d1688],EAX`
+   (SX 为例),即**按当前槽号写 per-slot 数组**;`EDX==0` 时额外镜像到全局
+   样式结构。`SY/COLOR/COLOR2/GRADATION/ROTATION/BOLD/AA/DRAWMODE` 同式。
+4. **8 槽**:`FUN_00464fac` 的初始化循环 `CMP ECX,8`,每槽 0x800 字节名字
+   缓冲 + 样式结构指针数组(`0x801a14 + i*4`)。
+5. **绘制侧同源**:`0x4065xx..0x4083xx` 的文本绘制代码按 `[0x5d1684]` 取样式。
+6. **`CGACT[BNO]` 是同一个选择器**:CGACT 处理体 `0x42e13c` 读参数 62
+   (BNO),非零 ⇒ `PUSH [slot*8+0x683740]; CALL FUN_004039d0`,之后才处理
+   参数 63(`TEXT`)。参数表里 BNO(62)正好在 TEXT(63)之前。
+7. **值域**:编译器 checker=3(0/1);引擎自己不校验,数组 8 槽。
+8. **语料**:商业包 `s30` 12 处、ERIS `s66/67/68` 15 处,**全部 `BNO=1`**。
+
+⇒ `BNO` = **文字样式槽号**(0 = 默认样式,1 = 第 2 套),先切槽再写参数。
+
+### 改动
+
+- `crates/yu-gfx/src/state.rs`:`GfxState` 增 `style_slots: [TextStyle; 8]` +
+  `style_slot: usize`,`style` 保持"当前槽的活副本";新增
+  `select_style_slot()`(切槽时把当前槽存回、取出目标槽,既有读写点语义不变)。
+  `FONT[BNO]` / `CGACT[BNO]` 都走它(`CGACT` 在任何绘制动作之前切槽)。
+- `crates/yu-gfx/src/text.rs`:删 `TextStyle.font_bno` 与
+  `TextFontRequest::Bno`;`font_request()` 改为 `NAME > NO > 默认`
+  (`BNO` 不再参与字体身份)。
+- `crates/yu-render/core/src/text.rs`:删 `FaceFallback::Bno` 与
+  `text.font.bno_fallback` 诊断。
+- `crates/yu-gfx/src/json.rs` / `crates/yu-render/wgpu/src/plan.rs`:
+  去掉 `font_bno` 输出与缓存键成分。
+- 用例 `font_no_is_recorded_and_bno_selects_style_slot`:槽 0 设 `NO=3` →
+  `BNO=1` 写 COLOR → 文本用**槽 1**(`NO` 不生效、COLOR 生效)→ `BNO=0`
+  切回后槽 0 的 `NO=3` 与默认白都还在,且不产生 BNO 诊断。
+
+### 验证(原始结果)
+
+```text
+cargo build --workspace --all-targets        → 0 error / 0 warning
+cargo test -p yu-gfx --test parity_fixes     → 27 passed
+cargo test --workspace                       → 仅 yu-trace 过期 golden(既有)
+yu-cli run <0.481 商业包根> --frames 3000    → BNO 诊断 0 / gfx.text.unsupported 0
+yu-cli run <project-eris> --frames 200       → BNO 诊断 0,仅 EMOTE(deferred)
+```
+
+### 残余
+
+- 8 槽里脚本只能选 0/1(checker 限制);内核按 0..=7 clamp,与引擎数组同界。
+- `PITCH`/`LANG`(FONT 参数表里没有,`TextStyle` 只留值)仍无页。

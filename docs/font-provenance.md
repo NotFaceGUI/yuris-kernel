@@ -20,7 +20,7 @@
 | COLOR/COLOR2 | `0xRRGGBB`，默认 `0xffffff`；COLOR2 是渐变第二色 | Confirmed |
 | GRADATION | 参数存在（0..=8，默认 1），但 0.495 手册无页、语料无使用；方向映射未见证据 | **Likely/Unknown** |
 | ROTATION | 参数存在（0..=8，默认 0），但 0.495 手册无页、语料无使用、渲染器读取未观察到 | **Unverified** |
-| BNO | 仅 ysc 表与真实脚本出现；手册无页；未解析 | **Unknown** |
+| BNO | **文字样式槽号选择器**(不是字体序号):setter `FUN_004039d0` = `MOV [0x5d1684],arg`;FONT/CGACT 处理体在 BNO 出现时先切槽,其余参数写 `[槽*4+数组]`。8 槽,编译器 checker=3 限 0/1 | Confirmed(REA) |
 | 官方参考图 | 标题画面 1200×900（用户提供），菜单 `スタート` 墨迹框 54×16 px；最佳匹配 15px bold MS Gothic，IoU 0.537 | Confirmed（图）/ Likely（字号） |
 
 ## 1. 字体文件扫描（不是字节搜索）
@@ -145,7 +145,7 @@ FONT 处理器按 `0x684160..0x68416b` 的“本次命令是否设置该参数�
 
 | 参数 | 写入 text 对象偏移 | per-slot 全局 | clamp | 默认值（`FUN_00464fac` @ 0x464fac） |
 |---|---|---|---|---|
-| BNO | 特殊分支 @ `0x444ce7`（未解析） | — | — | — |
+| BNO | **不写 text 对象**;切当前样式槽 `[0x5d1684]`(`0x444ce7` → `CALL FUN_004039d0`) | 槽选择器 | 无(编译器 checker=3 限 0/1;数组 8 槽) | 0 |
 | NO | font index（`0x4039e0`） | `0x5d1664` | `< 字体总数` | 0 |
 | NAME | font index（`0x403a6c`） | `0x5d1664` | 名字查找 | 槽默认 family |
 | ANTIALIASING | `+0x34` | `0x5d1738` | 0..=1 | 1 |
@@ -203,7 +203,7 @@ FONT 处理器按 `0x684160..0x68416b` 的“本次命令是否设置该参数�
 完整 42 组由 `render_reference` 运行时打印，并写入
 `target/tmp/font-ref/render.log`；`docs/font-contract.md` 只固定上面这组。
 
-### 4.5 GRADATION / ROTATION / BNO 的未知部分
+### 4.5 GRADATION / ROTATION 的未知部分与 BNO 定案
 
 - GRADATION：clamp 0..8、默认 1；`COLOR2` 是渐变第二色。**方向/坐标/色标未取证**。
   `docs/font-contract.md` 采用可替换的 `Gradation::Direction{octant}`，默认把
@@ -212,9 +212,17 @@ FONT 处理器按 `0x684160..0x68416b` 的“本次命令是否设置该参数�
 - ROTATION：clamp 0..8、默认 0；引擎存储但没有观察到 0.495 文本渲染读取/使用。
   实现为“octant × 45° 顺时针、绕 pen 原点”，标记 `Unverified`，仅
   `StylePolicy::Reference` 可用。
-- BNO：只在 `es_sprite.yst` 等真实脚本出现（FONT[BNO=1 …]），手册无页；
-  `FONT` 处理器有独立分支 `0x444ce7`，本会话未解析其字体列表语义。`yu-font`
-  只保存 `BNO` 值，不做解析（`font.unverified`）。
+- BNO：**已定案（2026-10-30）**——它是**文字样式槽号**，不是字体身份。
+  手册 `font/font.html` 无页，但 REA 完整:`FUN_004039d0` 只有三条指令
+  (`MOV [0x5d1684],arg; XOR EAX,EAX; RET`);FONT 处理体 `0x444428` 在
+  BNO(参数 0)出现时 `PUSH [slot*8+0x683740]; CALL FUN_004039d0` 再处理
+  `NO/NAME/SX…`,而后者写 `[EDX*4+数组]`、`EDX=[0x5d1684]`(槽 0 额外镜像
+  到全局样式结构);`FUN_00464fac` 初始化 **8 槽**(`CMP ECX,8`);绘制侧
+  `0x4065xx..0x4083xx` 同样按 `[0x5d1684]` 取样式。`CGACT[BNO]`(参数 62)
+  走同一个 setter(随后才是参数 63 `TEXT`)。语料:商业包 `s30` 12 处、
+  ERIS `s66/67/68` 15 处,**全部 `BNO=1`**。
+  内核:`GfxState` 持 8 套 `TextStyle` + 当前槽,`FONT[BNO]`/`CGACT[BNO]`
+  切槽;`BNO` 不再进字体请求链(`TextFontRequest` 去掉 `Bno`)。
 
 ## 5. 官方参考图
 
