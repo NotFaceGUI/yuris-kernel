@@ -10619,7 +10619,7 @@ total value diffs: 0
 ### 问题
 
 商业发行版把封包放在 `pac/` 下并按内容命名(`bn.ypf`/`cg.ypf`/…),不是单个
-`data.ypf`;`Project::discover` 只认 `data.ypf`/`data/`,遇到 夏ノ鎖 直接报
+`data.ypf`;`Project::discover` 只认 `data.ypf`/`data/`,遇到该商业包直接报
 「找不到数据入口」。同时脚本密钥是每作可变的(`CRC32(字符串)`;本作 =
 `CRC32("ClockupDl")`),运行核只认默认值 `CRC32("Yu-ris")`,换钥作品停在
 `fmt.ybn.key`。
@@ -10649,7 +10649,7 @@ total value diffs: 0
 cargo build --workspace --all-targets          → ok(无 warning)
 cargo test -p yu-engine -p yu-cli -p yu-vfs    → 全过
 cargo test -p yu-engine --test project_layout  → 1 passed(真实商业包布局)
-yu-cli run <夏ノ鎖根>                           → script key: 43 2F 06 B0 (source=rx-yuris:header)
+yu-cli run <0.481 商业包根>                           → script key: 43 2F 06 B0 (source=rx-yuris:header)
                                                  data=packed:...pac\bn.ypf (1099291835 bytes, packs=7 updates=2 skipped=4)
                                                  frame: 1 viewport: 1152x720(首帧可绘制)
 yu-cli run <project-eris>                      → script key: D3 6F AC 96 (source=rx-yuris:header),packs=1,正常出帧
@@ -10660,3 +10660,200 @@ yu-cli run <project-eris>                      → script key: D3 6F AC 96 (sour
 - 存档仍被 `YSSD == 0x1E0` 等值门拒(本作 0x1E1),读档不可用。
 - `YSTD == 495` 等值门未改(本作 481;本作 boot 路径未触发该表,留待统一处理)。
 - 包内嵌 exe overlay、WZ 加密 YPF 未实现(缺样本 / 仅工具级证据)。
+
+## 成果 YSV-STR-INIT-EVAL (2026-10-30) · ysv 串初值按官方语义求值,消除字节码拼进资源路径
+
+### 问题
+
+0.481 商业包引导期出现 5 条 `WARN [vfs] vfs.path @ V $w B &, B )…+0x0:
+NUL byte in lookup key`,前缀是一段 YSTB 表达式字节码,后缀是
+`cg/face/face_back_*.png`;声音侧同源(`se/` + 字节码 + `sys001`)。
+
+定位:`ysv.ybn` 里 `slot=1412/1413`(`kind=2`,脚本 0 局部串)的初值不是
+字面量,而是表达式 `$1143[38,21]` / `$1143[38,6]`;内核只认「单条 `0x4d`
+字面量」,其余形态原样存字节,于是**字节码本身成了变量值**,被脚本
+(`es_button.yst` s0 pc1124/1125 `LET $1351[$1382][i] = $1412 + $55[i]`)
+拼进资源名。
+
+### 证据(官方实现为准)
+
+0.481 引擎 `FUN_00456e50`(`0x456e50`,调用点 `0x456f61`)应用 ysv 记录时:
+数值初值走 `FUN_004658e0`/`FUN_00465800` 直写,串初值走
+`(*DAT_008097e0)(buf, bytes, len)` 再 `FUN_00465654(slot, buf, len)` ——
+**串初值过窗口求值器**(该指针静态镜像为 0,运行期赋值;全模块 9 处引用
+都是 `CALL dword ptr [0x008097e0]`,参数形态统一为「缓冲/参数字节/长度」,
+与命令参数同一入口)。`S_STR` 补不上这个缺口:0.495 分发表把它映射到
+`0x4634d8`(`xor eax,eax; ret`)。
+
+### 改动
+
+- `crates/yu-rt/src/tables.rs`:`VarRecord::str_init_needs_eval()` ——
+  空串初值 / 单条 `0x4d` / **解不成合法表达式**的字节都不求值(后者维持
+  既有「原样字节」口径,不猜);其余走求值。
+- `crates/yu-rt/src/vm.rs`:`ysv_init_value()` + `eval_init_expr()`,
+  `apply_global_initial_values` / `build_globals_restore` /
+  `apply_script_locals` 三处统一;求值失败留痕后按空串建槽,不再传播
+  字节码。结果按 `ParamTy::Str.coerce` 归一(与参数槽同口径)。
+- `crates/yu-rt/tests/fixture.rs`:新增回归
+  `ysv_str_init_expression_is_evaluated_not_stored_raw`(全局/局部/数组元素三路)。
+- `docs/divergences/DIV-RT-055-ysv-str-init-expression.md`:完整取证档案。
+
+### 验证(原始结果)
+
+```text
+cargo build --workspace --all-targets                              → ok
+cargo test --release -p yu-rt --test fixture ysv_str_init_expression
+  → test ysv_str_init_expression_is_evaluated_not_stored_raw ... ok
+cargo test --release -p yu-rt --test fixture                       → 100 passed
+cargo test --release -p yu-rt -p yu-format -p yu-engine            → 全过
+
+yu-cli run <0.481 商业包根> --frames 600 --log-level info
+  修复前:vfs.path ×5(NUL byte in lookup key)
+  修复后:vfs.path ×0,诊断汇总无新增条目
+  probe_asset se/sys001.ogg → HIT 5097 bytes(声音路径纠正为 se/sys001)
+  帧像素 sha256 未变(那些 CG 名在本包里本就不存在,属合法缺失)
+```
+
+### 残余
+
+- `crates/yu-trace/tests/golden/synthetic_frame.jsonl` 过期(夹具 ysc/ycd
+  字节自 `a117541` 之后被 `dfa7b0b` 改过,只有这两个夹具产物的 sha256/长度
+  不一致,事件流一致)。重录 golden 属独立 `test` 改动,待主人确认。
+- 官方 ysv 的**可见性掩码**(`in_EDX`/`in_ECX`/栈参,按 `flag`(恢复组)
+  × 值类型过滤)内核仍按「全部装载」处理;本作无观测差异,留档待取证。
+
+## 成果 SYSVAR-WINDOW-EXEC-MIN (2026-10-30) · `_WINDOW_EXEC_MIN` 按官方实现,消除每帧未实现挂号
+
+### 问题
+
+0.481 商业包运行期持续刷
+`UNIMP [vm] rt.sysvar.unimplemented @ es_scenario.yst pc246: _WINDOW_EXEC_MIN`,
+内核按「工程 ycd 声明但手册无页」一律挂号(DIV-RT-007 旧门禁)。
+按 2026-10-24 政策(AU5+):**手册缺页 ≠ 不实现**,REA 证据足够即落地。
+
+### 证据(0.495 `yu-ris.exe`,sha256 `4f5eefa3…`)
+
+- int getter `FUN_00427350`(跳表基址 `0x58c8a0`,548 项)case 117/118/119/120
+  分别指向 `MOVSX EBP,byte ptr [0x801918]` / `[0x80191c]` / `[0x801920]` /
+  `[0x801924]` —— MAX / **MIN** / CLOSE / CAPTION 是**连续四字节全局**,
+  四条都是 1 字节有符号读。
+- 写分派 case 118 → `0x446fa4` `MOV byte ptr [0x80191c],DL`(脚本可赋值)。
+- 窗口过程 `FUN_0045acdc`:`WM_SYSCOMMAND & 0xFFF0` 的
+  `SC_MINIMIZE(0xF020)` → `DAT_0080191c = (char)*ecx + 1`(槽号+1);
+  `SC_MAXIMIZE(0xF030)` / `SC_CLOSE(0xF060)` 同族写另两个。
+- 结论:MIN = 最小化ボタン押下状態,与 MAX 同型同宽。
+
+### 改动
+
+- `crates/yu-rt/src/sysvar.rs`:`_WINDOW_EXEC_MIN` 并入读分支(证据锚点写进注释)。
+- `crates/yu-rt/src/vm/handlers.rs`:写分派并入(官方 `MOV byte` 存在)。
+- `crates/yu-rt/src/vm.rs`:新增 `window_exec_min` 字段与 `MIN` 分支;
+  四个状态统一 `i8` 截断 + 符号扩展(官方存储宽度 = 1 字节);新增
+  `Vm::request_window_minimize`。
+- `crates/yu-engine/src/engine.rs`:`Engine::request_window_minimize` 透出。
+- `crates/yu-rt/tests/fixture.rs`:回归
+  `window_exec_min_is_a_host_setter_round_trip`(宿主置 1 → 脚本读 1 → 写回 0)。
+- 台账:`crates/yu-rt/docs/command-provenance.md` 新增 MIN 行;
+  `crates/yu-rt/docs/divergences/README.md` DIV-RT-007 增记 2026-10-30。
+
+### 验证(原始结果)
+
+```text
+cargo build --workspace --all-targets                    → ok,零 warning
+cargo test --release -p yu-rt --test fixture window_exec_min
+  → window_exec_min_is_a_host_setter_round_trip ... ok
+cargo test --release -p yu-rt -p yu-engine               → 全过(102 + …)
+
+yu-cli run <0.481 商业包根> --frames 1800 --log-level info
+  修复前:rt.sysvar.unimplemented ×5(含 _WINDOW_EXEC_MIN 每帧刷)
+  修复后:×4 —— 仅 _SAVE_PATH_TYPE×3(es_first.yst pc6/9/12)与 _RET×1
+```
+
+### 残余(取证已推进,待实现)
+
+- `_SAVE_PATH_TYPE`(id 112):全局 `[0x801324]`;写侧 `FUN_00460c80` 从
+  **`yssfs.dat`**(`FUN_00469df2` 键控记录文件,4 字节 key、0x20 dword
+  记录,取 `puVar2[0x15]` = 偏移 0x54,值 0..3)读出后组路径:默认 `save\`;
+  1/2/3 前置 `%APPDATA%` 类前缀 + `\<name>_SaveData\<name>\save\`,
+  3 再插 `\My Games`。缺 `yssfs.dat` 容器格式 ⇒ 仍 `Unimplemented`
+  (现行口径 = 宿主注入 `$_SAVE_PATH`)。
+- `_RET`(id 49):getter 命中 `MOV EDX,2` / `MOV EBP,0x3e7` 常量块,
+  **不读任何全局** ⇒ 不是状态变量,待语料语义定案后再实现。
+
+## 成果 CGINFO-COLOR (2026-10-30) · `CGINFO[COLOR]` 按官方语义实现,按钮层尺寸回退补齐
+
+### 问题
+
+0.481 商业包引导期刷 7 条
+`UNIMP [gfx] gfx.info.unsupported … CGINFO[COLOR] 需要像素/未分类语义,未取证`
+(`es_button.yst` s0 pc2023/2087/2143/2187/2243/2273)。
+
+### 证据
+
+- 语料自证(`es_button.yst` s0 pc2024):`CG[ID]` 建层后依次
+  `CGINFO[SX]/[SY]/[COLOR SET=0 SET2=0]`,再判
+  `@SX==1 && @SY==1 && @color == 0x00808080` → `CGACT[RECTPAINT3]`。
+  `0x00808080` = `128|128<<8|128<<16`(50% 灰)⇒ COLOR 返回
+  `r | g<<8 | b<<16`,与 `ONMOUSE` 同打包。
+- 引擎(0.495 `yu-ris.exe` sha256 `4f5eefa3…`):像素采样体
+  `0x43ddc0..0x43de86` 的坐标对由全局 `[0x68417d]` 在「鼠标」与
+  「显式 `SET/SET2`」之间切换,显式分支缺省 (0,0),越界 `-1`。
+
+### 改动
+
+- `crates/yu-gfx/src/state.rs`:`CGINFO` 增 `COLOR` 分支(复用
+  `query_onmouse`,坐标取 `SET/SET2`,缺省 0,0);`query_onmouse` 的
+  尺寸优先级补「VM 回填的资产尺寸」,并在无表面时按 0×0 返回 `-1`
+  而不是报错(官方装载失败后矩形保持 0)。
+- `crates/yu-rt/src/vm/handlers.rs`:`CGINFO` 资产元数据回退从
+  `SX/SY` 扩到 `SX/SY/COLOR/ONMOUSE*`;像素查询在尺寸回填后重试原查询;
+  资产**不存在**时按 `0×0` 回填。
+- `crates/yu-rt/src/vm/handlers.rs` / `crates/yu-gfx/src/state.rs`:
+  资产尺寸诊断补上具体键名(如 `cg/face/face_back`),便于定位。
+- `crates/yu-save/src/state.rs`:存档写失败诊断补**解析后的绝对路径**。
+- `crates/yu-gfx/tests/info_query.rs`:回归
+  `cginfo_color_samples_pixel_at_set_coordinates`。
+
+### 验证(原始结果)
+
+```text
+cargo build --workspace --all-targets   → ok,零 warning
+cargo test -p yu-gfx --test info_query  → 8 passed
+cargo test -p yu-cli --test logging_guards → 3 passed
+
+yu-cli run <0.481 商业包根> --frames 1800 --log-level info
+  gfx.info.unsupported : 51 → 0
+  gfx.info.asset_size  : 15 → 0
+  帧像素 sha256        : ad3cff2b…(未变)
+  其余诊断:sv.file.write×4 / rt.sysvar.unimplemented×4 /
+           snd.file.missing×1 / gfx.window.unsupported×1 /
+           gfx.texture.missing×1
+```
+
+### 附带结论(非内核缺陷)
+
+- **`sv.file.write` 拒绝访问(os error 5)**:不是内核问题,也不是游戏目录的
+  权限问题 —— 是**按 exe 所在路径生效的文件系统沙箱**。对照矩阵(同一份
+  二进制字节、同一令牌、同一目标 `D:\Download`):
+
+  | exe 位置 | 写 `D:\Download` | 写 `C:\Users\…\Temp` | 写 `D:\Art\ai\projects\…` |
+  |---|---|---|---|
+  | `<repo>/target/release/yu-cli.exe` | 拒绝 | 拒绝 | 成功 |
+  | `D:\Art\ai\projects\YurisDroid\…\wp.exe` | 拒绝 | — | 成功 |
+  | `D:\Art\wp3.exe` | 成功 | — | — |
+  | `D:\wp4.exe` | 成功 | — | — |
+  | `C:\Users\…\Temp\wp2.exe` | 成功 | — | — |
+
+  即:**exe 位于 `D:\Art\ai\projects\` 之下时,进程只能写该子树之内**;
+  写到外面任何位置都是 ACCESS_DENIED。同一时刻 `cmd.exe`/PowerShell/Python
+  都能写 `D:\Download`(ACL 为 `Authenticated Users:(M)`,令牌也带该组),
+  所以目标目录本身可写。验证:把 `yu-cli.exe` 复制到
+  `C:\Users\…\Temp\` 后跑同一命令,4 条 `sv.file.write` 全部消失,
+  `save/config.sd`(7054B)/`extra.sd`(6542B)正常落盘;`--save-root` 指到
+  工程子树内同样 5 个 `.sd` 全写成功 ⇒ 写入链路正确。规避方式:从普通终端
+  运行、或把 exe 放到项目树外、或 `--save-root` 指向可写目录。
+- **`snd.file.missing voice/GLO_M01_0458`**:该资产在本安装的任何包里都
+  不存在。全包 5852 条索引里没有任何 `*_M01_*` 语音;语音命名是
+  `voice\mit_n01_*.ogg` / `voice\sin_n01_*.ogg` / `voice\mob_n01_*.ogg`
+  (同号 `0458` 存在为 `mit_n01_0458`/`sin_n01_0458`)。查找链路本身正确
+  (小写归一 + `.ogg/.wav` 探测,REA `0x40c9b4`),属数据侧缺文件。
