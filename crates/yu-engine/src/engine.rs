@@ -1277,6 +1277,14 @@ impl Engine {
         }
     }
 
+    /// 宿主窗口的最小化按钮被按下:推 `@_WINDOW_EXEC_MIN=1` 给脚本
+    /// (手册无页,按官方窗口过程 `SC_MINIMIZE` 分支落地;`fixed(no-manual)`)。
+    pub fn request_window_minimize(&mut self) {
+        if let Some(vm) = self.vm.as_mut() {
+            vm.request_window_minimize();
+        }
+    }
+
     /// 当前待回答的 DIALOG(H-P1-02/S5:内核状态机就绪,Engine 透出;
     /// 宿主呈现并经 [`Engine::answer_dialog`] 回答)。
     pub fn pending_dialogs(&self) -> &[yu_rt::dialog::DialogRequest] {
