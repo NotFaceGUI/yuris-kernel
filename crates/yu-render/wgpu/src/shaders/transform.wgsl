@@ -11,6 +11,13 @@
 //   7 SEPIA     : 经典矩阵(整数,>>8,min 255)
 //   8 MOSAIC    : 块内取左上角像素(SET = 块边长)
 //   9 ROTATION  : 绕中心旋转 SET 度,正值顺时针,越界透明(画布尺寸不变)
+//  10 BLUR-X    : 水平盒式平均(半径 = max(1,SET)),窗口在左右边界**收缩**
+//  11 BLUR-Y    : 垂直盒式平均(同上,窗口在上下边界收缩)
+//
+// 10/11 逐条对齐官方 0.495 `FUN_00431d28`(action 0x02 = BLUR)与
+// `FUN_00434b7c`(action 0x07 = BLUR6):R/G/B 各自整数除法求平均、
+// 除数 = 实际窗口像素数(不是夹取重复边缘)、**alpha 从源图原样拷贝**。
+// 两遍由调用方串联(先 X 再 Y),与官方"水平 → 临时缓冲 → 垂直"同序。
 // luma = (r*77 + g*150 + b*29) >> 8(Rec.601 定点,与 CPU 一致)。
 
 struct Params {
@@ -123,6 +130,37 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let n = max(1u, u32(u.amount));
         let q = vec2<i32>((p.x / i32(n)) * i32(n), (p.y / i32(n)) * i32(n));
         return pack(load(q));
+    }
+    // BLUR-X / BLUR-Y:窗口在边界收缩,除数 = 实际像素数;alpha 保留。
+    if (u.mode == 10u || u.mode == 11u) {
+        let r = max(1, u.amount);
+        var acc = vec3<u32>(0u, 0u, 0u);
+        var cnt = 0u;
+        if (u.mode == 10u) {
+            let lo = max(0, p.x - r);
+            let hi = min(d.x - 1, p.x + r);
+            var k = lo;
+            loop {
+                if (k > hi) { break; }
+                let q = load(vec2<i32>(k, p.y));
+                acc = acc + vec3<u32>(q.x, q.y, q.z);
+                cnt = cnt + 1u;
+                k = k + 1;
+            }
+        } else {
+            let lo = max(0, p.y - r);
+            let hi = min(d.y - 1, p.y + r);
+            var k = lo;
+            loop {
+                if (k > hi) { break; }
+                let q = load(vec2<i32>(p.x, k));
+                acc = acc + vec3<u32>(q.x, q.y, q.z);
+                cnt = cnt + 1u;
+                k = k + 1;
+            }
+        }
+        let n = max(1u, cnt);
+        return pack(vec4<u32>(acc / vec3<u32>(n), px.w));
     }
     return pack(px);
 }

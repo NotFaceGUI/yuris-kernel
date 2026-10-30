@@ -1052,6 +1052,43 @@ fn apply_image_pixels(
         ImageAction::Rotation | ImageAction::Other("rotation2") => Some(9),
         _ => None,
     };
+    // `BLUR`/`BLUR2..6`:两遍盒式(先 X 再 Y),逐条对齐官方 0.495
+    // `FUN_00431d28`(action 0x02)与 `FUN_00434b7c`(action 0x07):
+    // 半径 = max(1, SET)、R/G/B 整数平均、除数 = 实际窗口像素数、alpha 保留。
+    let blur = matches!(
+        &image.action,
+        ImageAction::Other("blur" | "blur2" | "blur3" | "blur4" | "blur5" | "blur6")
+    );
+    if blur {
+        let (width, height) = (base.width, base.height);
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        let radius = image
+            .set
+            .as_ref()
+            .and_then(|v| v.as_int())
+            .unwrap_or(0)
+            .max(1) as i32;
+        pipelines
+            .ensure_transform_pipeline(ctx)
+            .map_err(|d| format!("{}: {}", d.code, d.detail))?;
+        let mid = surfaces.acquire(ctx, width, height, "blur horizontal")?;
+        let out = surfaces.acquire(ctx, width, height, "blur vertical")?;
+        let bind_x = pipelines
+            .create_transform_bind_group(ctx, &base.tex.view, [10, radius, 0, 0], [0.0; 4])
+            .map_err(|diag| format!("{}: {}", diag.code, diag.detail))?;
+        writes.fullscreen(&mid, bind_x, AuxPipeline::Transform);
+        let bind_y = pipelines
+            .create_transform_bind_group(ctx, &mid.view, [11, radius, 0, 0], [0.0; 4])
+            .map_err(|diag| format!("{}: {}", diag.code, diag.detail))?;
+        writes.fullscreen(&out, bind_y, AuxPipeline::Transform);
+        surfaces.stats_mut().surface_passes += 2;
+        let content = finish_content(surfaces, out, width, height, base.display, None);
+        surfaces.set_content(target, content.clone());
+        contents.insert(target.clone(), content);
+        return Ok(());
+    }
     if let Some(mode) = mode {
         let (width, height) = (base.width, base.height);
         if width == 0 || height == 0 {

@@ -678,13 +678,17 @@ fn apply_image_op(
                 "akarusa" => crate::imagefilters::apply_akarusa(&mut texture, set),
                 "mono" => crate::imagefilters::apply_mono(&mut texture, set),
                 "mosaic" => crate::imagefilters::apply_mosaic(&mut texture, set),
-                "blur" => crate::imagefilters::apply_blur(&mut texture, set),
-                // `BLUR2..6` 无手册页:按同族以 radius = set*(档位) 处理。
-                "blur2" => crate::imagefilters::apply_blur(&mut texture, set.max(1) * 2),
-                "blur3" => crate::imagefilters::apply_blur(&mut texture, set.max(1) * 3),
-                "blur4" => crate::imagefilters::apply_blur(&mut texture, set.max(1) * 4),
-                "blur5" => crate::imagefilters::apply_blur(&mut texture, set.max(1) * 5),
-                "blur6" => crate::imagefilters::apply_blur(&mut texture, set.max(1) * 6),
+                // 官方半径 = `max(1, SET)`(六个变体 prologue 一致):`SET=0`
+                // 也按半径 1 模糊,不是"不模糊"。
+                "blur" => crate::imagefilters::apply_blur(&mut texture, set.max(1)),
+                // `BLUR2..6`:手册无页,但 REA 0.495 证实六个变体(action
+                // `0x02..0x07`)的**半径公式一致** —— 各自 prologue 都是
+                // `iVar = (SET > 0) ? SET : 1`,不是 `SET × 档位`。
+                // 核的差异(BLUR 与 BLUR6 已逐行反编译为盒式;BLUR2..5 未
+                // 逐个反编译)按盒式执行,台账标 Likely(DIV-GFX-013)。
+                "blur2" | "blur3" | "blur4" | "blur5" | "blur6" => {
+                    crate::imagefilters::apply_blur(&mut texture, set.max(1))
+                }
                 "diffusion" => crate::imagefilters::apply_diffusion(&mut texture, set),
                 "whirlpool" => crate::imagefilters::apply_whirlpool(&mut texture, set),
                 "raster" => {

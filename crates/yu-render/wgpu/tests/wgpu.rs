@@ -75,6 +75,12 @@ fn table() -> ParamTable {
                     "SIZE2",
                     "SX",
                     "SY",
+                    "BLUR",
+                    "BLUR2",
+                    "BLUR3",
+                    "BLUR4",
+                    "BLUR5",
+                    "BLUR6",
                 ],
             ),
             command(
@@ -2092,5 +2098,73 @@ fn cgact_text_reuses_cached_cpu_base_across_text_changes() {
             "无 GPU 文本路径时第二帧应命中文本基面缓存(second cached={})",
             second.text_cpu_cached
         );
+    }
+}
+
+/// `CGACT[BLUR/BLUR2..6]`:两遍盒式模糊,两后端逐像素一致。
+///
+/// 期望值手算(官方 0.495 `FUN_00431d28` / `FUN_00434b7c` 的算法):
+/// 3×1 的层,R 通道自左向右 = [0, 100, 200],`SET=1` ⇒ 半径 1。
+/// 水平遍(窗口在边界收缩,除数 = 实际像素数):
+///   x0:(0+100)/2=50;x1:(0+100+200)/3=100;x2:(100+200)/2=150;
+/// 垂直遍(只有一行)⇒ 不变。alpha 不参与平均 ⇒ 三列都保持 255。
+#[test]
+fn blur_is_two_pass_box_and_matches_soft() {
+    let table = table();
+    let mut gfx = state(Viewport::new(3, 1), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"T".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"grad.png".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"T".to_vec())),
+                arg(&table, "CGACT", "BLUR5", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(1)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+
+    let grad = RgbaImage::from_fn(3, 1, |x, _| {
+        Rgba([(x as u8) * 100, 0, 0, 255])
+    });
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(grad.as_raw(), 3, 1, ExtendedColorType::Rgba8)
+        .expect("encode fixture");
+
+    let Some(mut gpu) = renderer_or_skip(store(&[(b"grad.png", png.clone())])) else {
+        return;
+    };
+    let gpu_out = gpu.render_frame(&frame).expect("render");
+    let mut soft = SoftRenderer::new(store(&[(b"grad.png", png)]));
+    let soft_out = soft.render_frame(&frame);
+    assert!(
+        gpu_out.report.skipped.is_empty(),
+        "BLUR 不得被跳过: {:?}",
+        gpu_out.report.skipped
+    );
+    let soft_surface = soft_out_surface(&soft_out);
+    for x in 0..3u32 {
+        assert_eq!(
+            pixel(&gpu_out, x, 0),
+            pixel_of_surface(&soft_surface, x, 0),
+            "x={x} 两后端不一致"
+        );
+    }
+    let got: Vec<u8> = (0..3).map(|x| pixel(&gpu_out, x, 0)[0]).collect();
+    assert_eq!(got, vec![50, 100, 150], "盒式模糊手算值");
+    for x in 0..3 {
+        assert_eq!(pixel(&gpu_out, x, 0)[3], 0xFF, "alpha 必须保持");
     }
 }

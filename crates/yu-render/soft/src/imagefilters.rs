@@ -130,10 +130,17 @@ pub fn apply_mosaic(texture: &mut Texture, block: i64) {
     }
 }
 
-/// `CGACT[BLUR=1 SET=r]`:可分离盒式模糊(半径 `r`,边缘夹取)。
+/// `CGACT[BLUR=1 SET=r]`:可分离盒式模糊(半径 `r`)。
 ///
-/// 手册例 13「レイヤをぼかす」`SET=8`。`BLUR2..BLUR6` 无手册页,
-/// 按 `BLUR` 同族以不同半径处理(调用方传入换算后的半径)。
+/// 手册例 13「レイヤをぼかす」`SET=8`。算法逐条取自官方 0.495:
+/// - `FUN_00431d28`(action `0x02` = BLUR)与 `FUN_00434b7c`(action `0x07`
+///   = BLUR6):**水平遍 → 临时缓冲 → 垂直遍**,R/G/B 各自整数除法求平均
+///   (`uVar4 / (iVar10 + 1)`);
+/// - 半径 = `max(1, SET)`(六个变体的 prologue 一致:`iVar = (SET > 0) ? SET : 1`);
+/// - **窗口在区域边界收缩**:`lo = max(x0, x - r)`、`hi = min(x1, x + r)`,
+///   除数 = `hi - lo + 1`(不是夹取重复边缘像素);
+/// - **alpha 不参与平均**:默认分支只写 R/G/B,alpha 从**源图**原样拷贝
+///   (`*(dst + 3) = *(src + 3)`)。只有"带 alpha 模糊"的分支才四通道平均。
 pub fn apply_blur(texture: &mut Texture, radius: i64) {
     let r = radius.max(0);
     if r == 0 {
@@ -145,42 +152,43 @@ pub fn apply_blur(texture: &mut Texture, radius: i64) {
     }
     let src = texture.rgba.clone();
     let mut mid = vec![0u8; src.len()];
-    // 水平
+    // 水平遍:窗口在左/右边界收缩,除数 = 实际像素数;alpha 不参与。
     for j in 0..h {
         for i in 0..w {
-            let mut acc = [0u32; 4];
-            let mut cnt = 0u32;
-            for d in -r..=r {
-                let k = (i + d).clamp(0, w - 1);
+            let lo = (i - r).max(0);
+            let hi = (i + r).min(w - 1);
+            let mut acc = [0u32; 3];
+            for k in lo..=hi {
                 let p = texel(&src, w, h, k, j);
-                for c in 0..4 {
+                for c in 0..3 {
                     acc[c] += u32::from(p[c]);
                 }
-                cnt += 1;
             }
+            let cnt = (hi - lo + 1) as u32;
             let di = (j as usize * w as usize + i as usize) * 4;
-            for c in 0..4 {
+            for c in 0..3 {
                 mid[di + c] = (acc[c] / cnt) as u8;
             }
         }
     }
-    // 垂直
+    // 垂直遍:同上;alpha 从**源图**原样带回(官方默认分支)。
     for j in 0..h {
         for i in 0..w {
-            let mut acc = [0u32; 4];
-            let mut cnt = 0u32;
-            for d in -r..=r {
-                let k = (j + d).clamp(0, h - 1);
+            let lo = (j - r).max(0);
+            let hi = (j + r).min(h - 1);
+            let mut acc = [0u32; 3];
+            for k in lo..=hi {
                 let p = texel(&mid, w, h, i, k);
-                for c in 0..4 {
+                for c in 0..3 {
                     acc[c] += u32::from(p[c]);
                 }
-                cnt += 1;
             }
+            let cnt = (hi - lo + 1) as u32;
             let di = (j as usize * w as usize + i as usize) * 4;
-            for c in 0..4 {
+            for c in 0..3 {
                 texture.rgba[di + c] = (acc[c] / cnt) as u8;
             }
+            texture.rgba[di + 3] = src[di + 3];
         }
     }
 }
