@@ -18,7 +18,16 @@
 //! 注意:容器版本是**格式修订号**,与引擎版本号没有换算关系 —— 0.479 SDK
 //! 样例 `0x138`、0.495 SDK 样例 `0x1E0`、0.481 商业包 `0x1E1`,三者布局
 //! 逐字节同构。因此读取**不校验版本**,只做结构自检(魔数 / 偏移表容量 /
-//! DNO 连续 / 边界 / zlib 闭合);写回版本由调用方指定。
+//! DNO 连续 / 边界 / 压缩流闭合);写回版本由调用方指定。
+//!
+//! 块形态(0.481 商业包实测,24 文件 / 3568 块):
+//! - `btype 0`(单变量)/ `btype 1`(配置):载荷 = **一层**压缩流。0.495 SDK
+//!   语料 = zlib level 1(`78 01`);商业包 = Google Snappy(随包带
+//!   `YSSnp.dll`)。读侧按实际流分流,写侧按 [`BlockCodec`] 选;
+//! - `btype 2`(多变量):**外层裸多子块流、内层子块各自压缩**
+//!   (见 [`parse_multi_payload`]),外层不当压缩流解;
+//! - `DNO=1024`:嵌套容器槽 = `u32 inner_len | u32 len_b | zlib(内层 YSSD)`,
+//!   不是普通单层块(见 `docs/divergences/DIV-RT-056`)。
 //!
 //! 净室声明:实现为本仓库新写;flate2(双后端下 C zlib 优先)用于保证
 //! `compress2(level=1)` 逐字节复现。
@@ -379,11 +388,75 @@ fn u32_at_nocopy(cell: &[u8]) -> u32 {
     u32::from_le_bytes([cell[0], cell[1], cell[2], cell[3]])
 }
 
+/// 块载荷压缩层。两代并存:0.495 SDK 语料 = zlib level 1;商业包(0.481,
+/// 随包带 `YSSnp.dll`)= Google Snappy。读侧按实际流分流(见
+/// `decompress_payload`),写侧由调用方按同目录既有存档学到的层决定。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlockCodec {
+    /// zlib level 1(`compress2(level=1)` 等价)。
+    #[default]
+    Zlib,
+    /// Google Snappy 原始块。
+    Snappy,
+}
+
+impl BlockCodec {
+    fn compress(self, raw: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Zlib => zlib_compress_level1(raw),
+            Self::Snappy => crate::snappy::compress(raw),
+        }
+    }
+
+    /// 从一条已解析块判定压缩层:块首通过 RFC1950 头校验 ⇒ `Zlib`,否则
+    /// `Snappy`。只用于「同目录存档用哪一层」的学习,不参与解码决策
+    /// (解码始终先试 zlib 再试 snappy)。
+    ///
+    /// 只有**单层压缩流**的块才能判定:`btype 2` 的载荷是外层裸多子块流、
+    /// `DNO=1024` 是嵌套容器(`u32 | u32 | zlib`),两者都不该拿去做 RFC1950
+    /// 头校验 —— 那会把 zlib 存档误判成 Snappy。这两种形态返回 `None`。
+    #[must_use]
+    pub fn detect(entry: &YssdEntry) -> Option<Self> {
+        if entry.dno == NESTED_CONTAINER_DNO || entry.btype > 1 {
+            return None;
+        }
+        Some(if looks_like_zlib(&entry.compressed) {
+            Self::Zlib
+        } else {
+            Self::Snappy
+        })
+    }
+}
+
+/// `DNO=1024` 是嵌套容器槽(`u32 inner_len | u32 len_b | zlib(内层 YSSD)`),
+/// 不是普通单层块;见 `docs/divergences/DIV-RT-056`。
+pub const NESTED_CONTAINER_DNO: u32 = 1024;
+
+/// RFC1950 头:CMF 低 4 位 = 8(deflate),且 `(CMF<<8 | FLG) % 31 == 0`。
+fn looks_like_zlib(src: &[u8]) -> bool {
+    match src {
+        [cmf, flg, ..] => cmf & 0x0F == 8 && (u32::from(*cmf) * 256 + u32::from(*flg)) % 31 == 0,
+        _ => false,
+    }
+}
+
 /// 块体(`dno u32` 之后):`btype u8 + strict u8 + var u16 + clen u32 +
 /// ulen u32 + 压缩载荷`。
 #[must_use]
 pub fn encode_block_body(btype: u8, strict: u8, var_id: u16, raw_payload: &[u8]) -> Vec<u8> {
-    let compressed = zlib_compress_level1(raw_payload);
+    encode_block_body_with(BlockCodec::Zlib, btype, strict, var_id, raw_payload)
+}
+
+/// 同 [`encode_block_body`],压缩层由调用方指定(写回沿用同目录存档的层)。
+#[must_use]
+pub fn encode_block_body_with(
+    codec: BlockCodec,
+    btype: u8,
+    strict: u8,
+    var_id: u16,
+    raw_payload: &[u8],
+) -> Vec<u8> {
+    let compressed = codec.compress(raw_payload);
     let mut out = Vec::with_capacity(12 + compressed.len());
     out.push(btype);
     out.push(strict);
@@ -588,10 +661,16 @@ pub fn parse_multi_payload(raw: &[u8], origin: &[u8], dno: u32) -> Result<Vec<Ys
 /// 「clen = ulen = 内层长」在 ERIS 不成立,以官方产物为准)。
 /// 子块各自由 [`zlib_compress_level1`] 压缩,`pad` 恒 `0x0100`(语料恒值)。
 pub fn encode_multi_body(subs: &[YssdSubBlockRaw<'_>]) -> Vec<u8> {
+    encode_multi_body_with(BlockCodec::Zlib, subs)
+}
+
+/// 同 [`encode_multi_body`],压缩层由调用方指定。
+#[must_use]
+pub fn encode_multi_body_with(codec: BlockCodec, subs: &[YssdSubBlockRaw<'_>]) -> Vec<u8> {
     let mut inner = Vec::new();
     let mut ulen_total: u64 = 0;
     for sub in subs {
-        let compressed = zlib_compress_level1(sub.raw);
+        let compressed = codec.compress(sub.raw);
         inner.extend_from_slice(&0x0100u16.to_le_bytes());
         inner.extend_from_slice(&sub.var_id.to_le_bytes());
         inner.extend_from_slice(&(compressed.len() as u32).to_le_bytes());

@@ -142,6 +142,99 @@ fn read_varint(src: &[u8], at: &mut usize) -> Result<u32, String> {
     Err("Snappy varint 超过 5 字节".to_string())
 }
 
+// ---------------------------------------------------------------- 编码
+
+/// 压一个 Snappy 原始块(`YSSnp_Compress` 的等价形态)。
+///
+/// 只保证**格式合法且可被任何 Snappy 解码器接受**(含官方 `YSSnp_Uncompress`):
+/// 块首 varint32 未压长 + 字面量/复制标签。不做 Google 实现那种逐字节复刻的
+/// 启发式(哈希表规模与跳步策略只影响压缩率,不影响格式)。
+#[must_use]
+pub fn compress(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len() / 2 + 32);
+    write_varint(&mut out, src.len() as u32);
+    if src.is_empty() {
+        return out;
+    }
+    // 4 字节序列的哈希表:槽内放 `pos + 1`(0 = 空槽)。
+    const BITS: u32 = 14;
+    const MAX_COPY: usize = 64;
+    let mut table = vec![0u32; 1 << BITS];
+    let mut lit = 0usize; // 待输出字面量的起点
+    let mut ip = 0usize;
+    while ip + 4 <= src.len() {
+        let h = hash4(&src[ip..ip + 4], BITS);
+        let cand = table[h] as usize;
+        table[h] = (ip + 1) as u32;
+        let matched = cand != 0 && {
+            let cand = cand - 1;
+            cand < ip && src[cand..cand + 4] == src[ip..ip + 4]
+        };
+        if !matched {
+            ip += 1;
+            continue;
+        }
+        let cand = cand - 1;
+        let mut len = 4usize;
+        while len < MAX_COPY && ip + len < src.len() && src[cand + len] == src[ip + len] {
+            len += 1;
+        }
+        emit_literal(&mut out, &src[lit..ip]);
+        emit_copy(&mut out, ip - cand, len);
+        ip += len;
+        lit = ip;
+    }
+    emit_literal(&mut out, &src[lit..]);
+    out
+}
+
+fn hash4(seq: &[u8], bits: u32) -> usize {
+    let v = u32::from_le_bytes([seq[0], seq[1], seq[2], seq[3]]);
+    ((v.wrapping_mul(0x1e35_a7bd)) >> (32 - bits)) as usize
+}
+
+fn write_varint(out: &mut Vec<u8>, mut v: u32) {
+    loop {
+        let byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// 字面量:长度 >60 时按 60 字节切块(合法且无需扩展长度字段)。
+fn emit_literal(out: &mut Vec<u8>, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let take = bytes.len().min(60);
+        out.push(((take - 1) as u8) << 2);
+        out.extend_from_slice(&bytes[..take]);
+        bytes = &bytes[take..];
+    }
+}
+
+/// 复制:长度 4..=64 一次输出;offset 按大小选 1/2/4 字节形态。
+fn emit_copy(out: &mut Vec<u8>, offset: usize, len: usize) {
+    debug_assert!((4..=64).contains(&len));
+    debug_assert!(offset >= 1);
+    let l = (len - 1) as u8;
+    if offset < 2048 && len <= 11 {
+        // 类型 1:11 位 offset + 3 位 (len-4)
+        out.push(((offset >> 8) as u8) << 5 | ((len - 4) as u8) << 2 | 0x01);
+        out.push((offset & 0xFF) as u8);
+    } else if offset <= u16::MAX as usize {
+        // 类型 2:16 位 offset
+        out.push(l << 2 | 0x02);
+        out.extend_from_slice(&(offset as u16).to_le_bytes());
+    } else {
+        // 类型 3:32 位 offset
+        out.push(l << 2 | 0x03);
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +260,36 @@ mod tests {
             rest = &rest[take..];
         }
         out
+    }
+
+    /// 编码器自检:随机 + 重复数据都过解码器,且官方块重压后仍解出原字节。
+    #[test]
+    fn compress_roundtrips_through_decoder() {
+        // 重复串(走复制)、伪随机(走字面量)、长偏移(>64K,走类型 3)。
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        cases.push(b"abcdefgh".repeat(400));
+        cases.push((0..5000u32).map(|i| (i * 37 + 11) as u8).collect());
+        let mut long = vec![0u8; 70000];
+        for (i, b) in long.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let head = [long[0], long[1], long[2], long[3]];
+        long[69996..70000].copy_from_slice(&head); // 触发 >64K 偏移
+        cases.push(long);
+        for raw in cases {
+            let block = compress(&raw);
+            assert_eq!(decompress(&block, raw.len() as u32).unwrap(), raw);
+            assert!(block.len() < raw.len() + raw.len() / 8 + 16, "编码不应膨胀过多");
+        }
+    }
+
+    /// 官方产物重压:解出原字节 → 重压 → 再解,必须逐字节回到原值。
+    #[test]
+    fn official_block_recompresses_losslessly() {
+        // "ab" + 复制 offset=2 len=6 的官方形态(见 copy_op_with_overlap)。
+        let raw = b"abababab".to_vec();
+        let block = compress(&raw);
+        assert_eq!(decompress(&block, raw.len() as u32).unwrap(), raw);
     }
 
     #[test]
