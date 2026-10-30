@@ -291,3 +291,66 @@ fn cgact_text_missing_layer_is_reported() {
         .iter()
         .any(|d| d.code == "gfx.layer.missing"));
 }
+
+/// 对话影子的真实形态(商业包 `s30 pc32..59`):脚本用 `FONT[BNO=0/1]` 配两套
+/// 样式(影/正文),再各发一条 `CGACT[TEXT SET=n]`。
+///
+/// 关键点:两条绘制项必须带**不同颜色**且各自带 SET —— 若 `BNO` 被当成字体
+/// 序号(旧实现),两套样式会合并成一个,两条绘制项同色 ⇒ 影子消失。
+#[test]
+fn two_style_slots_produce_shadow_and_body_draws() {
+    let mut gfx = state();
+    let t = table();
+    gfx.on_event(&frame_start(0));
+    gfx.on_event(&call(
+        0,
+        "CG",
+        vec![
+            arg(&t, "CG", "ID", s("TX")),
+            arg(&t, "CG", "FILE", s("")),
+        ],
+    ));
+    // 槽 0 = 影子(黑),槽 1 = 正文(青)。
+    gfx.on_event(&call(
+        0,
+        "FONT",
+        vec![
+            arg(&t, "FONT", "BNO", i(0)),
+            arg(&t, "FONT", "COLOR", i(0x00_0000)),
+            arg(&t, "FONT", "SX", i(24)),
+            arg(&t, "FONT", "SY", i(24)),
+        ],
+    ));
+    gfx.on_event(&call(
+        0,
+        "FONT",
+        vec![
+            arg(&t, "FONT", "BNO", i(1)),
+            arg(&t, "FONT", "COLOR", i(0x00_FFFF)),
+            arg(&t, "FONT", "SX", i(24)),
+            arg(&t, "FONT", "SY", i(24)),
+        ],
+    ));
+    // 影子:9 遍 3×3(SET=3);正文:1 遍。
+    for (bno, set) in [(0, 3), (1, 0)] {
+        gfx.on_event(&call(
+            0,
+            "CGACT",
+            vec![
+                arg(&t, "CGACT", "ID", s("TX")),
+                arg(&t, "CGACT", "TEXT", i(1)),
+                arg(&t, "CGACT", "BNO", i(bno)),
+                arg(&t, "CGACT", "SET", i(set)),
+                arg(&t, "CGACT", "SETSTR", s("A")),
+            ],
+        ));
+    }
+    let frame = gfx.frame();
+    assert_eq!(frame.text_draws.len(), 2, "影 + 正文两条绘制项");
+    let shadow = &frame.text_draws[0];
+    let body = &frame.text_draws[1];
+    assert_eq!(shadow.style.color, 0x00_0000, "影子用槽 0 的颜色");
+    assert_eq!(body.style.color, 0x00_FFFF, "正文用槽 1 的颜色");
+    assert_eq!(shadow.composite_passes(), 9, "SET=3 → 9 遍");
+    assert_eq!(body.composite_passes(), 1, "SET=0 → 1 遍");
+}
