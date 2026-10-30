@@ -240,6 +240,8 @@ yu-cli run · 跑工程(缺省 headless;--mode desktop 开原生窗口)
   --frames N           跑 N 帧停(desktop = 验收模式,到帧关窗)
   --shot PATH          最后一帧写 PNG
   --save-root DIR      存档根重定向(缺省工程根 save/)
+  --save-codec zlib|snappy  强制存档块压缩层(缺省 = 盘上既有存档 →
+                       引擎代号 YSSnp.dll → zlib;只影响写盘)
   --debug-mode on|off  @_DEBUGMODE 注入(缺省 off;desktop 缺省时亦读
                        环境变量 YURIS_DEBUG_MODE=1,DIV-L-001)
 

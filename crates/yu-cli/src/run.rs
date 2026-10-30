@@ -81,6 +81,20 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     };
     // 强制字体(诊断/换字体):忽略脚本的 NAME/NO/BNO。
     let force_font = args.flag("font").filter(|value| !value.trim().is_empty());
+    // 强制存档块压缩层,覆盖自动判定(盘上既有存档 → 引擎代号 → zlib)。
+    // 只影响**写盘**;读侧仍按实际流分流。
+    let save_codec = match args.flag("save-codec") {
+        Some(value) => Some(match value.trim().to_ascii_lowercase().as_str() {
+            "zlib" => yu_engine::engine::BlockCodec::Zlib,
+            "snappy" => yu_engine::engine::BlockCodec::Snappy,
+            other => {
+                return Err(Failure::usage(format!(
+                    "--save-codec 只接受 zlib|snappy,收到 `{other}`"
+                )))
+            }
+        }),
+        None => None,
+    };
     // 显式脚本密钥(换钥作品的兜底;缺省 = 启动时自动解析)。
     let script_key = match args.flag("script-key") {
         Some(value) => Some(parse_script_key(&value)?),
@@ -116,6 +130,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         save_root,
         force_font,
         script_key,
+        save_codec,
         // 真实运行:`@_TIME` 注入系统本地时间(存档菜单的现实日期)。
         local_time: crate::clock::local_now(),
         ..EngineOptions::default()

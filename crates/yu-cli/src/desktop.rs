@@ -87,6 +87,19 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     };
     // 存档根(P4 M-C):缺省 = 工程根 `save/`;显式给目录才重定向。
     let save_root = args.flag("save-root").map(PathBuf::from);
+    // 强制存档块压缩层(与 headless 同一口径;只影响写盘)。
+    let save_codec = match args.flag("save-codec") {
+        Some(value) => Some(match value.trim().to_ascii_lowercase().as_str() {
+            "zlib" => yu_engine::engine::BlockCodec::Zlib,
+            "snappy" => yu_engine::engine::BlockCodec::Snappy,
+            other => {
+                return Err(Failure::usage(format!(
+                    "--save-codec 只接受 zlib|snappy,收到 `{other}`"
+                )))
+            }
+        }),
+        None => None,
+    };
     args.finish()?;
 
     // 统一控制台(Q1 R2/R4):日志/panic 防线必须早于 boot;JSONL 单写者
@@ -201,6 +214,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         force_font: None,
         // 脚本密钥缺省由启动期解析(exe 扫描/数据自举/默认值)。
         script_key: None,
+        save_codec,
         // 真实运行:`@_TIME` 注入系统本地时间(存档菜单的现实日期)。
         // 固定步长回放用确定性 1970 基准(与 case/golden 同口径)。
         local_time: if fixed_step {
