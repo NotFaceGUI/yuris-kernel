@@ -1200,6 +1200,19 @@ impl PipelineCache {
         params: [i32; 4],
         m: [f32; 4],
     ) -> Result<wgpu::BindGroup, Diag> {
+        self.create_transform_bind_group_n(ctx, view, params, m, [0; 4])
+    }
+
+    /// 同上,额外带 4 个整数参数 `n`:旋涡的 `maxr`、扩散的
+    /// `(方向, it, 随机数基数, 每行块数)`;其余模式传 0。
+    pub fn create_transform_bind_group_n(
+        &mut self,
+        ctx: &GpuContext,
+        view: &wgpu::TextureView,
+        params: [i32; 4],
+        m: [f32; 4],
+        n: [u32; 4],
+    ) -> Result<wgpu::BindGroup, Diag> {
         #[repr(C)]
         #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
         struct Uniform {
@@ -1208,6 +1221,7 @@ impl PipelineCache {
             set2: i32,
             pad: u32,
             m: [f32; 4],
+            n: [u32; 4],
         }
         let uniform = [Uniform {
             mode: params[0] as u32,
@@ -1215,6 +1229,7 @@ impl PipelineCache {
             set2: params[2],
             pad: params[3] as u32,
             m,
+            n,
         }];
         let buffer = wgpu::util::DeviceExt::create_buffer_init(
             &ctx.device,

@@ -81,6 +81,15 @@ fn table() -> ParamTable {
                     "BLUR4",
                     "BLUR5",
                     "BLUR6",
+                    "SET2",
+                    "SAIDO",
+                    "AKARUSA",
+                    "SEPIA",
+                    "DIFFUSION",
+                    "WHIRLPOOL",
+                    "RASTER",
+                    "RASTER2",
+                    "RASTER3",
                 ],
             ),
             command(
@@ -2127,7 +2136,7 @@ fn blur_is_two_pass_box_and_matches_soft() {
             "CGACT",
             vec![
                 arg(&table, "CGACT", "ID", Value::Str(b"T".to_vec())),
-                arg(&table, "CGACT", "BLUR5", Value::Int(1)),
+                arg(&table, "CGACT", "BLUR", Value::Int(1)),
                 arg(&table, "CGACT", "SET", Value::Int(1)),
             ],
         ),
@@ -2167,4 +2176,248 @@ fn blur_is_two_pass_box_and_matches_soft() {
     for x in 0..3 {
         assert_eq!(pixel(&gpu_out, x, 0)[3], 0xFF, "alpha 必须保持");
     }
+}
+
+// 滤镜族跨后端对拍用例(追加到 tests/wgpu.rs 末尾)。
+//
+// 这一组把「与 soft 逐像素一致」作为唯一判据:滤镜族全是整数运算,
+// 取证见 `docs/divergences/DIV-GFX-063`。
+
+/// 唯一色夹具:`R = x*10`、`G = y*10`、`B = 7`、`A = 255`。
+fn grid_png(w: u32, h: u32) -> Vec<u8> {
+    let img = RgbaImage::from_fn(w, h, |x, y| {
+        Rgba([(x * 10) as u8, (y * 10) as u8, 7, 255])
+    });
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(img.as_raw(), w, h, ExtendedColorType::Rgba8)
+        .expect("encode grid fixture");
+    png
+}
+
+/// 在 w×h 夹具上跑一个 `CGACT` 动作,返回 (wgpu 输出, soft 输出)。
+fn run_filter_parity_sized(
+    action: &str,
+    extra: Vec<(&str, Value)>,
+    w: u32,
+    h: u32,
+) -> Option<(WgpuRenderOutput, yu_backend_soft::RenderOutput)> {
+    let table = table();
+    let mut gfx = state(Viewport::new(w, h), [0, 0, 0, 255]);
+    let mut params = vec![
+        arg(&table, "CGACT", "ID", Value::Str(b"T".to_vec())),
+        arg(&table, "CGACT", action, Value::Int(1)),
+    ];
+    for (name, value) in extra {
+        params.push(arg(&table, "CGACT", name, value));
+    }
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"T".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"grid5.png".to_vec())),
+            ],
+        ),
+        call(1, "CGACT", params),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let png = grid_png(w, h);
+    let mut gpu = renderer_or_skip(store(&[(b"grid5.png", png.clone())]))?;
+    let gpu_out = gpu.render_frame(&frame).expect("render");
+    let mut soft = SoftRenderer::new(store(&[(b"grid5.png", png)]));
+    let soft_out = soft.render_frame(&frame);
+    Some((gpu_out, soft_out))
+}
+
+fn run_filter_parity(
+    action: &str,
+    extra: Vec<(&str, Value)>,
+) -> Option<(WgpuRenderOutput, yu_backend_soft::RenderOutput)> {
+    run_filter_parity_sized(action, extra, 5, 5)
+}
+
+/// 逐像素对拍,并断言动作没有被跳过。
+fn assert_filter_parity(
+    action: &str,
+    gpu_out: &WgpuRenderOutput,
+    soft_out: &yu_backend_soft::RenderOutput,
+) {
+    assert!(
+        gpu_out.report.skipped.is_empty(),
+        "{action} 不得被跳过: {:?}",
+        gpu_out.report.skipped
+    );
+    let soft_surface = soft_out_surface(soft_out);
+    let (w, h) = (gpu_out.surface.width, gpu_out.surface.height);
+    for y in 0..h {
+        for x in 0..w {
+            assert_eq!(
+                pixel(gpu_out, x, y),
+                pixel_of_surface(&soft_surface, x, y),
+                "{action} ({x},{y}) 两后端不一致"
+            );
+        }
+    }
+}
+
+/// `RASTER` 族:`SET` 是**幅度**、`SET2` 是**相位(度)**;
+/// 位移与角度表全部**向零截断**(官方 `fistp` + 控制字 `0xC00`)。
+///
+/// `SET=2 SET2=60` ⇒ `trunc(sin60°·2) = 1` ⇒ 每行右移 1;
+/// 水平下标夹到 `x1-1`(官方原样,末列复用倒数第二列)。
+#[test]
+fn raster_shifts_rows_by_sin_on_gpu_and_matches_soft() {
+    let Some((gpu_out, soft_out)) = run_filter_parity(
+        "RASTER",
+        vec![("SET", Value::Int(2)), ("SET2", Value::Int(60))],
+    ) else {
+        return;
+    };
+    assert_filter_parity("RASTER", &gpu_out, &soft_out);
+    assert_eq!(pixel(&gpu_out, 0, 0), [10, 0, 7, 255]);
+    assert_eq!(pixel(&gpu_out, 1, 2), [20, 20, 7, 255]);
+    assert_eq!(pixel(&gpu_out, 4, 2), [30, 20, 7, 255], "末列夹到 x1-1");
+}
+
+/// `RASTER2`:只有垂直位移(`SET=3 SET2=60` ⇒ 列相位 `trunc(cos·3)` 恒为 1)。
+#[test]
+fn raster2_shifts_columns_by_cos_on_gpu_and_matches_soft() {
+    let Some((gpu_out, soft_out)) = run_filter_parity(
+        "RASTER2",
+        vec![("SET", Value::Int(3)), ("SET2", Value::Int(60))],
+    ) else {
+        return;
+    };
+    assert_filter_parity("RASTER2", &gpu_out, &soft_out);
+    assert_eq!(pixel(&gpu_out, 0, 0), [0, 10, 7, 255]);
+    assert_eq!(pixel(&gpu_out, 2, 3), [20, 40, 7, 255]);
+    assert_eq!(pixel(&gpu_out, 2, 4), [20, 40, 7, 255], "末行夹到 y1");
+}
+
+/// `RASTER3`:两个方向叠加(`FUN_00431658` 的 `variant=3`)。
+#[test]
+fn raster3_combines_both_axes_on_gpu_and_matches_soft() {
+    let Some((gpu_out, soft_out)) = run_filter_parity(
+        "RASTER3",
+        vec![("SET", Value::Int(2)), ("SET2", Value::Int(45))],
+    ) else {
+        return;
+    };
+    assert_filter_parity("RASTER3", &gpu_out, &soft_out);
+    assert_eq!(pixel(&gpu_out, 0, 0), [10, 10, 7, 255]);
+    assert_eq!(pixel(&gpu_out, 2, 2), [30, 30, 7, 255]);
+}
+
+/// `WHIRLPOOL`:`FUN_00437368`,半径线性的旋涡 + 定点角度表。
+#[test]
+fn whirlpool_rotates_by_radius_on_gpu_and_matches_soft() {
+    let Some((gpu_out, soft_out)) =
+        run_filter_parity("WHIRLPOOL", vec![("SET", Value::Int(900))])
+    else {
+        return;
+    };
+    assert_filter_parity("WHIRLPOOL", &gpu_out, &soft_out);
+    assert_eq!(pixel(&gpu_out, 2, 2), [20, 20, 7, 255], "圆心不动");
+    assert_eq!(pixel(&gpu_out, 3, 2), [20, 20, 7, 255], "(3,2) ← (2,2)");
+    // 半径向零截断:hypot(2,2)=2.83 ⇒ r=2(不是四舍五入的 3)。
+    assert_eq!(pixel(&gpu_out, 0, 0), [20, 0, 7, 255], "(0,0) ← (2,0)");
+}
+
+/// `DIFFUSION`:`FUN_004358d4` 的 2×2 置换;每块消耗一个 CRT `rand()`。
+#[test]
+fn diffusion_permutes_blocks_on_gpu_and_matches_soft() {
+    let Some((gpu_out, soft_out)) =
+        run_filter_parity("DIFFUSION", vec![("SET", Value::Int(2))])
+    else {
+        return;
+    };
+    assert_filter_parity("DIFFUSION", &gpu_out, &soft_out);
+    for y in 0..5 {
+        for x in 0..5 {
+            assert_eq!(pixel(&gpu_out, x, y)[3], 255, "({x},{y}) alpha 必须保留");
+        }
+    }
+    let mut before: Vec<[u8; 3]> = (0..5u32)
+        .flat_map(|y| (0..5u32).map(move |x| [(x * 10) as u8, (y * 10) as u8, 7]))
+        .collect();
+    let mut after: Vec<[u8; 3]> = Vec::new();
+    for y in 0..5u32 {
+        for x in 0..5u32 {
+            let p = pixel(&gpu_out, x, y);
+            after.push([p[0], p[1], p[2]]);
+        }
+    }
+    before.sort_unstable();
+    after.sort_unstable();
+    assert_eq!(before, after, "DIFFUSION 只重排像素,不改变颜色集合");
+}
+
+/// `DIFFUSION` 的块网格随尺寸变化(奇偶边界、`SET/2` 多轮),逐尺寸对拍。
+#[test]
+fn diffusion_matches_soft_across_sizes() {
+    for (w, h, set) in [
+        (4u32, 4u32, 2i64),
+        (6, 6, 2),
+        (7, 5, 2),
+        (5, 7, 2),
+        (8, 3, 2),
+        (3, 8, 2),
+        (8, 8, 8),
+        (9, 6, 4),
+    ] {
+        let Some((gpu_out, soft_out)) = run_filter_parity_sized(
+            "DIFFUSION",
+            vec![("SET", Value::Int(set))],
+            w,
+            h,
+        ) else {
+            return;
+        };
+        assert!(
+            gpu_out.report.skipped.is_empty(),
+            "DIFFUSION {w}x{h} 不得被跳过: {:?}",
+            gpu_out.report.skipped
+        );
+        let soft_surface = soft_out_surface(&soft_out);
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(
+                    pixel(&gpu_out, x, y),
+                    pixel_of_surface(&soft_surface, x, y),
+                    "DIFFUSION {w}x{h} SET={set} ({x},{y}) 两后端不一致"
+                );
+            }
+        }
+    }
+}
+
+/// `SAIDO` / `AKARUSA` / `SEPIA` 三个颜色滤镜(官方全是整数公式)。
+#[test]
+fn saido_akarusa_sepia_match_soft() {
+    for (action, set) in [
+        ("SAIDO", Some(64i64)),
+        ("SAIDO", Some(192)),
+        ("SAIDO", Some(0)),
+        ("AKARUSA", Some(192)),
+        ("AKARUSA", Some(64)),
+        ("SEPIA", None),
+    ] {
+        let extra = match set {
+            Some(v) => vec![("SET", Value::Int(v))],
+            None => vec![],
+        };
+        let Some((gpu_out, soft_out)) = run_filter_parity(action, extra) else {
+            return;
+        };
+        assert_filter_parity(action, &gpu_out, &soft_out);
+    }
+    // 手算锚点:AKARUSA 是加法偏移 ⇒ (0,0) 原色 [0,0,7] 各通道 +64。
+    let Some((gpu_out, _)) = run_filter_parity("AKARUSA", vec![("SET", Value::Int(192))]) else {
+        return;
+    };
+    assert_eq!(pixel(&gpu_out, 0, 0), [64, 64, 71, 255]);
 }

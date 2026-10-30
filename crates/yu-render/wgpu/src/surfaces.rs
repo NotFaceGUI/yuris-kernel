@@ -195,6 +195,10 @@ pub struct LayerSurfaces {
     pooled_bytes: usize,
     dropped_pooled: u64,
     stats: SurfaceStats,
+    /// `DIFFUSION` 已消耗的 2×2 块数:官方用 CRT `rand()` 的顺序流
+    /// (`FUN_004358d4` / `_rand` @`0x46ac0c`,种子 1),着色器按块号直跳,
+    /// 所以要跨帧累计。与 soft 的渲染器级 `diffusion_seed` 同口径。
+    diffusion_blocks: u32,
 }
 
 impl Default for LayerSurfaces {
@@ -213,6 +217,7 @@ impl LayerSurfaces {
             pooled_bytes: 0,
             dropped_pooled: 0,
             stats: SurfaceStats::default(),
+            diffusion_blocks: 0,
         }
     }
 
@@ -229,6 +234,16 @@ impl LayerSurfaces {
 
     pub fn stats_mut(&mut self) -> &mut SurfaceStats {
         &mut self.stats
+    }
+
+    /// 当前 `DIFFUSION` 的随机数基数(此前已消耗的 2×2 块数)。
+    pub fn diffusion_blocks(&self) -> u32 {
+        self.diffusion_blocks
+    }
+
+    /// 推进 `DIFFUSION` 的随机数基数(每块消耗一个 `rand()`)。
+    pub fn advance_diffusion_blocks(&mut self, blocks: u32) {
+        self.diffusion_blocks = self.diffusion_blocks.saturating_add(blocks);
     }
 
     pub fn note_reused_layer(&mut self) {

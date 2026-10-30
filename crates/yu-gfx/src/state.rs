@@ -2326,6 +2326,7 @@ impl GfxState {
             x2: None,
             y2: None,
             region_from_fixed: false,
+            alpha_aware: false,
             status: OpStatus::Executable,
         });
     }
@@ -2377,6 +2378,7 @@ impl GfxState {
             };
             s.layer.texture = dst.texture.clone();
             s.layer.texture_status = dst.texture_status;
+            s.layer.alpha_aware = dst.alpha_aware;
             s.layer.transform.x = dst.transform.x;
             s.layer.transform.y = dst.transform.y;
             s.layer.refresh_status();
@@ -2394,6 +2396,7 @@ impl GfxState {
             };
             d.layer.texture = src.texture.clone();
             d.layer.texture_status = src.texture_status;
+            d.layer.alpha_aware = src.alpha_aware;
             d.layer.transform.x = src.transform.x;
             d.layer.transform.y = src.transform.y;
             d.layer.refresh_status();
@@ -2581,7 +2584,8 @@ impl GfxState {
                 return;
             }
         }
-        // TODO(DIV-GFX-013):其余图像加工像素算法未实现;只记录参数。
+        // 图像加工的可执行性门禁(像素算法本身在 soft/wgpu 两个后端里;
+        // 全部 17 个执行体已逐个取证,见 `DIV-GFX-063`)。
         //
         // RECTPAINT/2/3 的像素语义已在 EVID-J-02..05 取证:
         // `FUN_0042f809`(0x42f809) 行 334-342 把动作 0x18/0x19/0x1a
@@ -2733,6 +2737,20 @@ impl GfxState {
             .get(&source)
             .map(|n| n.layer.texture.clone())
             .filter(|t| !matches!(t, TextureRef::None));
+        // 官方模糊族把源层 `[+0x86]` 当第 9 个参数(`0x430191`),命令到达时
+        // 取值 ⇒ 在记录时就固定下来(回放期层状态可能已变)。
+        let alpha_aware = self
+            .nodes
+            .get(&source)
+            .is_some_and(|n| n.layer.alpha_aware);
+        // 官方 `RECTPAINT/2/3` 处理块在参数值 `>= 2` 时置 `[层+0x86]=1`
+        // (`0x42df4b` 的 64 位比较 + `0x42df5b` 的 `c6 80 86..01`),
+        // `RESIZE` 执行体改尺寸后也置 1 —— 两者都让该层像素从此带有效 alpha。
+        let marks_alpha = (matches!(
+            image_action,
+            ImageAction::RectPaint | ImageAction::RectPaint2 | ImageAction::RectPaint3
+        ) && set.as_ref().and_then(EngineValue::as_int).is_some_and(|v| v >= 2))
+            || image_action.is_resize();
         self.push_image_log(ImageOp {
             seq,
             source: source.clone(),
@@ -2750,8 +2768,14 @@ impl GfxState {
             x2,
             y2,
             region_from_fixed,
+            alpha_aware,
             status,
         });
+        if marks_alpha {
+            if let Some(node) = self.nodes.get_mut(&source) {
+                node.layer.alpha_aware = true;
+            }
+        }
         // `CGACT[SIZE/SIZE2/SIZE3/SIZE4/SIZE5]` 把源区域缩放到目标层 ⇒ 目标层
         // 的绘制尺寸随之变为 `SX×SY`(手册 `cg/cgact.html` 例 3/4;
         // `es.CGACT_SIZE` 之后脚本会用 `CGINFO[SX/SY]` 读这个新尺寸)。尺寸记录
@@ -3017,6 +3041,7 @@ impl GfxState {
             transition: None,
             clip: None,
             tex: 0,
+            alpha_aware: false,
             status: LayerStatus::Executable,
             texture_status: LayerStatus::Executable,
             param_status: LayerStatus::Executable,
@@ -3052,6 +3077,7 @@ impl GfxState {
             transition: None,
             clip: None,
             tex: 0,
+            alpha_aware: false,
             status: LayerStatus::Executable,
             texture_status: LayerStatus::Executable,
             param_status: LayerStatus::Executable,
@@ -3080,6 +3106,7 @@ impl GfxState {
             transition: None,
             clip: None,
             tex: 0,
+            alpha_aware: false,
             status: LayerStatus::Executable,
             texture_status: LayerStatus::Executable,
             param_status: LayerStatus::Executable,
@@ -3903,6 +3930,9 @@ fn copy_attributes(src: &Layer, dst: &mut Layer) {
     dst.blend = src.blend;
     dst.visible = src.visible;
     dst.z = src.z;
+    // 官方 `CGACT` 的 COPY 分支把 `[+0x86]` 从源层复制给目标层
+    // (分派 `0x42f809` 的 0x08 块)。
+    dst.alpha_aware = src.alpha_aware;
     dst.transform = src.transform.clone();
     dst.parts = src.parts.clone();
     dst.mask = src.mask.clone();

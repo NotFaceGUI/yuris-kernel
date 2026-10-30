@@ -1059,6 +1059,7 @@ mod tests {
             transition: None,
             clip: None,
             tex: 0,
+            alpha_aware: false,
             status: LayerStatus::Executable,
             texture_status: LayerStatus::Executable,
             param_status: LayerStatus::Executable,

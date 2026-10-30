@@ -77,6 +77,13 @@ pub struct SoftRenderer {
     image_cache: BTreeMap<ImageCacheKey, Rc<Texture>>,
     /// 文本栅格化/合成器(懒加载系统字体;无文本帧零成本)。
     text: TextComposer,
+    /// `DIFFUSION` 用的 CRT `rand()` 状态(MSVC LCG,种子 1)。
+    ///
+    /// 官方 `_rand`(`0x46ac0c`)的状态在 CRT 线程局部区、**进程级**;
+    /// 本内核一个渲染器 ≈ 一个引擎进程,所以状态挂在渲染器上:
+    /// 跨帧延续、新渲染器从种子 1 重来(与 wgpu 的
+    /// `LayerSurfaces::diffusion_blocks` 同口径)。
+    diffusion_seed: u32,
 }
 
 
@@ -89,6 +96,7 @@ impl SoftRenderer {
             last_screen: None,
             image_cache: BTreeMap::new(),
             text: TextComposer::new(),
+            diffusion_seed: 1,
         }
     }
 
@@ -180,7 +188,7 @@ impl SoftRenderer {
     pub fn render_frame(&mut self, frame: &CompositorFrame) -> RenderOutput {
         self.textures.begin_frame();
         prune_snapshots(&mut self.snapshots, frame);
-        let mut st = RenderState::new(frame, &mut self.text);
+        let mut st = RenderState::new(frame, &mut self.text, &mut self.diffusion_seed);
         let mut screen: Option<Surface> = None;
 
         for pass in &frame.passes {
@@ -395,11 +403,10 @@ fn apply_image_op(
     // 处理,否则 `X=0 Y=0`(语料存读档的缩略图合成)会被误判成
     // `gfx.imageop.region.partial` 整条跳过。
     if image.action.is_layer_composite() {
-        let dx = image.x.unwrap_or(0.0);
-        let dy = image.y.unwrap_or(0.0);
-        if dx != 0.0 || dy != 0.0 {
-            return Err("gfx.imageop.merge.offset.unsupported".to_string());
-        }
+        // `X/Y` 不参与合并对齐(官方按部件位置画,见 wgpu 侧同处注释)。
+        // 2b53786 之前这里也不检查 `X/Y`;「非零即跳过」会让
+        // `RECTPAINT3 SET=0` 清掉的矩形填不回来。忽略之。
+        let _ = (image.x, image.y);
         // 下层 = 目标层当前表面(`st.texture_overrides` 是同帧加工结果)。
         // 官方的合并执行体只把上层“画”进这块表面、不读它的旧像素;
         // 清空后是否可见取决于 alpha 的混合口径(见 `apply_merge` 的注释)。
@@ -421,8 +428,12 @@ fn apply_image_op(
             rgba: upper.rgba,
         };
         match &image.action {
-            ImageAction::Merge => crate::imagefilters::apply_merge(&mut lower, &upper, false),
-            ImageAction::Merge2 => crate::imagefilters::apply_merge(&mut lower, &upper, true),
+            ImageAction::Merge => {
+                crate::imagefilters::apply_merge(&mut lower, &upper, false)
+            }
+            ImageAction::Merge2 => {
+                crate::imagefilters::apply_merge(&mut lower, &upper, true)
+            }
             ImageAction::Other("xor") => {
                 crate::imagefilters::apply_bitwise(&mut lower, &upper, true)
             }
@@ -669,7 +680,7 @@ fn apply_image_op(
             crate::imagefilters::apply_rotation(&mut texture, deg);
         }
         ImageAction::Other(name @ ("saido" | "akarusa" | "mono" | "mosaic" | "blur" | "diffusion"
-        | "whirlpool" | "raster" | "raster1" | "raster2" | "raster3" | "blur2" | "blur3" | "blur4"
+        | "whirlpool" | "raster" | "raster2" | "raster3" | "blur2" | "blur3" | "blur4"
         | "blur5" | "blur6" | "rotation2")) => {
             let set = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
             let set2 = image.set2.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
@@ -680,26 +691,55 @@ fn apply_image_op(
                 "mosaic" => crate::imagefilters::apply_mosaic(&mut texture, set),
                 // 官方半径 = `max(1, SET)`(六个变体 prologue 一致):`SET=0`
                 // 也按半径 1 模糊,不是"不模糊"。
-                "blur" => crate::imagefilters::apply_blur(&mut texture, set.max(1)),
-                // `BLUR2..6`:手册无页,但 REA 0.495 证实六个变体(action
-                // `0x02..0x07`)的**半径公式一致** —— 各自 prologue 都是
-                // `iVar = (SET > 0) ? SET : 1`,不是 `SET × 档位`。
-                // 核的差异(BLUR 与 BLUR6 已逐行反编译为盒式;BLUR2..5 未
-                // 逐个反编译)按盒式执行,台账标 Likely(DIV-GFX-013)。
-                "blur2" | "blur3" | "blur4" | "blur5" | "blur6" => {
-                    crate::imagefilters::apply_blur(&mut texture, set.max(1))
+                // `BLUR`/`BLUR4` 都是 H→V 两遍盒式(两种实现、同一像素结果);
+                // `BLUR2` 只有水平遍、`BLUR3` 只有垂直遍;
+                // `BLUR5` 恒为 alpha-only 遮罩(RGB 归零),`BLUR6` 按层
+                // `[+0x86]`(`image.alpha_aware`)二选一 —— 这五条已逐个
+                // 反编译取证(`FUN_0043265c`/`432e58`/`433718`/`434748`/
+                // `434b7c`),不再是"按同族猜"。
+                "blur" | "blur4" => {
+                    crate::imagefilters::apply_blur(&mut texture, set.max(1), image.alpha_aware);
                 }
-                "diffusion" => crate::imagefilters::apply_diffusion(&mut texture, set),
+                "blur2" => {
+                    crate::imagefilters::apply_blur_h(&mut texture, set.max(1), image.alpha_aware)
+                }
+                "blur3" => {
+                    crate::imagefilters::apply_blur_v(&mut texture, set.max(1), image.alpha_aware)
+                }
+                "blur5" => crate::imagefilters::apply_blur_alpha_mask(&mut texture, set.max(1)),
+                "blur6" => {
+                    if image.alpha_aware {
+                        crate::imagefilters::apply_blur_alpha_mask(&mut texture, set.max(1))
+                    } else {
+                        crate::imagefilters::apply_blur(&mut texture, set.max(1), false)
+                    }
+                }
+                "diffusion" => {
+                    crate::imagefilters::apply_diffusion(&mut texture, set, st.diffusion_seed)
+                }
                 "whirlpool" => crate::imagefilters::apply_whirlpool(&mut texture, set),
-                "raster" => {
-                    crate::imagefilters::apply_raster(&mut texture, set, set2, true, false)
-                }
-                "raster1" => {
-                    crate::imagefilters::apply_raster(&mut texture, set, set2, false, true)
-                }
-                "raster2" | "raster3" => {
-                    crate::imagefilters::apply_raster(&mut texture, set, set2, true, true)
-                }
+                // `RASTER` 族:`SET` = 位移幅度、`SET2` = 相位(不是"带宽/进度")。
+                // `RASTER` = 只有水平(正弦按行)、`RASTER2` = 只有垂直(余弦按列)、
+                // `RASTER3` = 两者(REA `FUN_0042f809` 的 0x15/0x16 内联支 +
+                // `FUN_00431658` 的 variant 1/2/3)。
+                "raster" => crate::imagefilters::apply_raster(
+                    &mut texture,
+                    set,
+                    set2,
+                    crate::imagefilters::RasterAxis::Horizontal,
+                ),
+                "raster2" => crate::imagefilters::apply_raster(
+                    &mut texture,
+                    set,
+                    set2,
+                    crate::imagefilters::RasterAxis::Vertical,
+                ),
+                "raster3" => crate::imagefilters::apply_raster(
+                    &mut texture,
+                    set,
+                    set2,
+                    crate::imagefilters::RasterAxis::Both,
+                ),
                 // `ROTATION2` 无手册页:按 ROTATION 同族(SET 为度)。
                 "rotation2" => crate::imagefilters::apply_rotation(&mut texture, set),
                 _ => return Err("gfx.imageop.unsupported".to_string()),
@@ -1445,6 +1485,8 @@ const SOLID_BLACK: &[u8] = &[0, 0, 0, 255];
 
 struct RenderState<'a> {
     offscreens: BTreeMap<LayerId, Surface>,
+    /// `DIFFUSION` 的 CRT `rand()` 状态(渲染器级,跨帧延续)。
+    diffusion_seed: &'a mut u32,
     /// 帧内图像加工后的图层纹理(基图副本);只影响本帧。
     texture_overrides: BTreeMap<LayerId, Rc<Texture>>,
     /// `texture_overrides` 中由文本合成产生的层(DIV-GFX-058):COPY 取源面
@@ -1461,10 +1503,15 @@ struct RenderState<'a> {
 }
 
 impl<'a> RenderState<'a> {
-    fn new(frame: &CompositorFrame, text: &'a mut TextComposer) -> Self {
+    fn new(
+        frame: &CompositorFrame,
+        text: &'a mut TextComposer,
+        diffusion_seed: &'a mut u32,
+    ) -> Self {
         let visible_layers = frame.layers.iter().filter(|l| l.visible).count();
         Self {
             offscreens: BTreeMap::new(),
+            diffusion_seed,
             texture_overrides: BTreeMap::new(),
             text_override_ids: BTreeSet::new(),
             text_composed: BTreeSet::new(),

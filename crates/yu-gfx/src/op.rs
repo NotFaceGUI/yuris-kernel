@@ -391,5 +391,11 @@ pub struct ImageOp {
     /// 标志为 `true` 时,`frame()` 输出前会把目标层的最终位置加到
     /// `x/y/x2/y2`,后端因此始终只看到绝对源坐标。
     pub region_from_fixed: bool,
+    /// 命令时刻源层的官方 `[+0x86]`(见 [`crate::layer::Layer::alpha_aware`])。
+    ///
+    /// 只有模糊族消费它:官方 `CGACT` 分派把该位作为第 9 个参数传给
+    /// `FUN_00431d28`/`43265c`/`432e58`/`433718`/`434748`/`434b7c`
+    /// (`0x430191`:`movsx ecx, byte [<层>+0x86]`)。
+    pub alpha_aware: bool,
     pub status: OpStatus,
 }

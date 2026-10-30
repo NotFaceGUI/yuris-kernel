@@ -875,22 +875,82 @@ fn apply_image_pixels(
 
     // ---------------- 两图层合成(MERGE/MERGE2/XOR/AND) ----------------
     if image.action.is_layer_composite() {
-        let dx = image.x.unwrap_or(0.0);
-        let dy = image.y.unwrap_or(0.0);
-        if dx != 0.0 || dy != 0.0 {
-            return Err("gfx.imageop.merge.offset.unsupported".to_string());
-        }
-        // 下层 = 目标层**当前**表面。官方合并执行体(`FUN_004405a4`,
-        // REA 0.495 `0x4405a4`)只把上层的每部件纹理按下层的每部件位置
-        // 画到当前渲染目标,不读下层旧像素;清空是否可见由 alpha 的混合
-        // 口径决定(见 `merge.wgsl` 头注:同因子混合会写 alpha),不需要
-        // 任何“冻结像素”特例。
-        let lower = match contents.get(target).cloned() {
+        // `X/Y` 是**落点**语义,但官方合并执行体(`FUN_004405a4`,REA 0.495
+        // `0x4405a4`)按「上层 `[+0x38]` 纹理 × 下层 `[+0x34]` 部件位置」
+        // 逐部件画进下层表面,命令里的 `X/Y` 不参与对齐。
+        //
+        // 2b53786 之前 wgpu 的 CPU 合并路径**完全不看 `X/Y`**,直接
+        // `apply_merge` 整面合成。2b53786 引入了「非零即跳过」
+        // (`gfx.imageop.merge.offset.unsupported`)——而语料
+        // `<game>`/`<game-b>` 的合并普遍带非零 `X/Y`(如 `X1*100+2*1`
+        // 这类表达式),于是整条合并被丢弃:前一步 `RECTPAINT3 SET=0`
+        // 清掉的矩形再也没人填回 ⇒ 立绘沿轮廓出现缝隙、眨眼帧眼部留下
+        // 条带。这里恢复 2b 之前的行为:忽略 `X/Y`,整面合成。
+        let _ = (image.x, image.y);
+        // 下层 = 目标层**当前**表面。官方合并执行体只把上层的每部件纹理
+        // 按下层的每部件位置画到当前渲染目标,不读下层旧像素;清空是否
+        // 可见由 alpha 的混合口径决定(见 `merge.wgsl` 头注)。
+        let lower_content = match contents.get(target).cloned() {
             Some(content) => content,
             None => resolve_target_base(ctx, frame, textures, gpu, targets, target, bases)?,
         };
-        let lower = materialize(ctx, pipelines, surfaces, writes, &lower, "merge lower")?;
-        let upper = materialize(ctx, pipelines, surfaces, writes, &source, "merge upper")?;
+        let upper_content = materialize(ctx, pipelines, surfaces, writes, &source, "merge upper")?;
+
+        // **诊断开关**:`YURIS_MERGE_CPU=1` 时合并族整条走 CPU(oracle)
+        // —— 读回下层/上层像素,直接调 soft 的 `apply_merge`,再上传成新
+        // 表面。用于判定「wgpu 的 GPU 合并实现是否与 soft 有偏差」。
+        if std::env::var_os("YURIS_MERGE_CPU").is_some() {
+            let (lw, lh) = (lower_content.width, lower_content.height);
+            let lower_surface =
+                crate::readback::read_texture(ctx, &lower_content.tex.texture, lw, lh)
+                    .map_err(|diag| diag.code.to_string())?;
+            let (uw, uh) = (upper_content.width, upper_content.height);
+            let upper_surface =
+                crate::readback::read_texture(ctx, &upper_content.tex.texture, uw, uh)
+                    .map_err(|diag| diag.code.to_string())?;
+            surfaces.stats_mut().cpu_fallbacks += 1;
+            let mut lower_tex = yu_render_core::Texture {
+                width: lw,
+                height: lh,
+                rgba: lower_surface.rgba.clone(),
+            };
+            let upper_tex = yu_render_core::Texture {
+                width: uw,
+                height: uh,
+                rgba: upper_surface.rgba.clone(),
+            };
+            match image.action {
+                ImageAction::Merge => {
+                    yu_backend_soft::apply_merge(&mut lower_tex, &upper_tex, false)
+                }
+                ImageAction::Merge2 => {
+                    yu_backend_soft::apply_merge(&mut lower_tex, &upper_tex, true)
+                }
+                ImageAction::Other("xor") => {
+                    yu_backend_soft::apply_bitwise(&mut lower_tex, &upper_tex, true)
+                }
+                _ => yu_backend_soft::apply_bitwise(&mut lower_tex, &upper_tex, false),
+            }
+            let id = gpu
+                .upload(ctx, lw, lh, &lower_tex.rgba, "merge cpu fallback")
+                .map_err(|diag| diag.code.to_string())?;
+            let uploaded = gpu
+                .get(id)
+                .ok_or_else(|| "gpu.upload_missing".to_string())?;
+            let tex = Rc::new(TexRef {
+                id: uploaded.id,
+                width: uploaded.width,
+                height: uploaded.height,
+                texture: uploaded.texture.clone(),
+                view: uploaded.view.clone(),
+            });
+            let content = finish_content(surfaces, tex, lw, lh, lower_content.display, None);
+            surfaces.set_content(target, content.clone());
+            contents.insert(target.clone(), content);
+            return Ok(());
+        }
+
+        let lower = materialize(ctx, pipelines, surfaces, writes, &lower_content, "merge lower")?;
         let (width, height) = (lower.width, lower.height);
         if width == 0 || height == 0 {
             return Ok(());
@@ -904,7 +964,7 @@ fn apply_image_pixels(
                 .map_err(|d| d.code.to_string())?;
             (
                 pipelines
-                    .create_layer_merge_bind_group(ctx, &lower.tex.view, &upper.tex.view)
+                    .create_layer_merge_bind_group(ctx, &lower.tex.view, &upper_content.tex.view)
                     .map_err(|diag| diag.code.to_string())?,
                 AuxPipeline::LayerMerge,
             )
@@ -919,7 +979,12 @@ fn apply_image_pixels(
                 .map_err(|d| d.code.to_string())?;
             (
                 pipelines
-                    .create_composite_bind_group(ctx, &lower.tex.view, &upper.tex.view, mode)
+                    .create_composite_bind_group(
+                        ctx,
+                        &lower.tex.view,
+                        &upper_content.tex.view,
+                        mode,
+                    )
                     .map_err(|diag| diag.code.to_string())?,
                 AuxPipeline::Composite,
             )
@@ -1039,6 +1104,13 @@ fn apply_image_pixels(
         Some(content) => content,
         None => resolve_target_base(ctx, frame, textures, gpu, targets, target, bases)?,
     };
+    // `DIFFUSION` 的 `SET/2 <= 0` 在官方只做一次整面 memcpy ⇒ 恒等;
+    // 提前返回,连基面都不必物化。
+    if image.action.name() == "diffusion"
+        && image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0) / 2 <= 0
+    {
+        return Ok(());
+    }
     let base = materialize(ctx, pipelines, surfaces, writes, &current, "image base")?;
     let mode = match &image.action {
         ImageAction::Reverse => Some(0i32),
@@ -1050,8 +1122,55 @@ fn apply_image_pixels(
         ImageAction::Other("sepia") => Some(7),
         ImageAction::Other("mosaic") => Some(8),
         ImageAction::Rotation | ImageAction::Other("rotation2") => Some(9),
+        // RASTER 族与 WHIRLPOOL 走 `transform.wgsl` 的 16..19。
+        ImageAction::Other("raster") => Some(16),
+        ImageAction::Other("raster2") => Some(17),
+        ImageAction::Other("raster3") => Some(18),
+        ImageAction::Other("whirlpool") => Some(19),
         _ => None,
     };
+    // `DIFFUSION`(`FUN_004358d4`):每轮两遍(正向 + 反向),每遍一次 fullscreen
+    // pass;`SET/2` 轮。每块消耗一个 `rand()`,着色器按块号直跳第 k 个。
+    if image.action.name() == "diffusion" {
+        let (width, height) = (base.width, base.height);
+        let passes = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0) / 2;
+        if passes <= 0 || width < 2 || height < 2 {
+            return Ok(());
+        }
+        let (x1, y1) = (i64::from(width) - 1, i64::from(height) - 1);
+        let rows = (y1 + 1) / 2;
+        pipelines
+            .ensure_transform_pipeline(ctx)
+            .map_err(|d| format!("{}: {}", d.code, d.detail))?;
+        let mut current = base.tex.clone();
+        for it in 0..passes {
+            let nx = (x1 - it + 1) / 2;
+            if nx <= 0 {
+                break;
+            }
+            for dir in 0..2u32 {
+                let out = surfaces.acquire(ctx, width, height, "diffusion pass")?;
+                let base_k = surfaces.diffusion_blocks();
+                let bind = pipelines
+                    .create_transform_bind_group_n(
+                        ctx,
+                        &current.view,
+                        [20, 0, 0, 0],
+                        [0.0; 4],
+                        [dir, it as u32, base_k, nx as u32],
+                    )
+                    .map_err(|diag| format!("{}: {}", diag.code, diag.detail))?;
+                writes.fullscreen(&out, bind, AuxPipeline::Transform);
+                surfaces.stats_mut().surface_passes += 1;
+                surfaces.advance_diffusion_blocks((rows * nx) as u32);
+                current = out;
+            }
+        }
+        let content = finish_content(surfaces, current, width, height, base.display, None);
+        surfaces.set_content(target, content.clone());
+        contents.insert(target.clone(), content);
+        return Ok(());
+    }
     // `BLUR`/`BLUR2..6`:两遍盒式(先 X 再 Y),逐条对齐官方 0.495
     // `FUN_00431d28`(action 0x02)与 `FUN_00434b7c`(action 0x07):
     // 半径 = max(1, SET)、R/G/B 整数平均、除数 = 实际窗口像素数、alpha 保留。
@@ -1098,6 +1217,14 @@ fn apply_image_pixels(
         let set2 = image.set2.as_ref().and_then(|v| v.as_int()).unwrap_or(0) as i32;
         let out = surfaces.acquire(ctx, width, height, "filter surface")?;
         pipelines.ensure_transform_pipeline(ctx).map_err(|d| format!("{}: {}", d.code, d.detail))?;
+        // 旋涡的半径表长度 trunc((hypot(w,h)+1)*0.5+1)(着色器无 f64)。
+        let n = if mode == 19 {
+            let hyp = (f64::from(width)).powi(2) + (f64::from(height)).powi(2);
+            let maxr = ((hyp.sqrt() + 1.0) * 0.5 + 1.0).max(1.0) as u32;
+            [maxr, 0, 0, 0]
+        } else {
+            [0; 4]
+        };
         let m = if mode == 9 {
             let deg = f64::from(set).rem_euclid(360.0);
             let (sin, cos) = deg.to_radians().sin_cos();
@@ -1108,7 +1235,7 @@ fn apply_image_pixels(
             [0.0, 0.0, 0.0, 0.0]
         };
         let bind = pipelines
-            .create_transform_bind_group(ctx, &base.tex.view, [mode, set, set2, 0], m)
+            .create_transform_bind_group_n(ctx, &base.tex.view, [mode, set, set2, 0], m, n)
             .map_err(|diag| format!("{}: {}", diag.code, diag.detail))?;
         writes.fullscreen(&out, bind, AuxPipeline::Transform);
         surfaces.stats_mut().surface_passes += 1;

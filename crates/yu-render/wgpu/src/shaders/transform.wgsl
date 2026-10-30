@@ -27,6 +27,8 @@ struct Params {
     _pad: u32,
     // ROTATION 的 (sin, cos, cx, cy);其余模式不用。
     m: vec4<f32>,
+    // 需要额外整数参数的模式:旋涡的 maxr、扩散的 (方向, it, 基数, 每行块数)。
+    n: vec4<u32>,
 };
 
 @group(0) @binding(0) var t_src: texture_2d<f32>;
@@ -56,6 +58,44 @@ fn load(p: vec2<i32>) -> vec4<u32> {
 
 fn luma(rgb: vec3<u32>) -> u32 {
     return (rgb.x * 77u + rgb.y * 150u + rgb.z * 29u) >> 8u;
+}
+
+// 0.495 `0x5b4780` 的 24×4 置换表(= 原始字节 / 4 的像素序号)。
+const PERM: array<u32, 96> = array<u32, 96>(
+    3u, 2u, 1u, 0u, 2u, 3u, 1u, 0u, 3u, 1u, 2u, 0u, 1u, 3u, 2u, 0u,
+    2u, 1u, 3u, 0u, 1u, 2u, 3u, 0u, 3u, 2u, 0u, 1u, 2u, 3u, 0u, 1u,
+    3u, 0u, 2u, 1u, 0u, 3u, 2u, 1u, 2u, 0u, 3u, 1u, 0u, 2u, 3u, 1u,
+    3u, 1u, 0u, 2u, 1u, 3u, 0u, 2u, 3u, 0u, 1u, 2u, 0u, 3u, 1u, 2u,
+    1u, 0u, 3u, 2u, 0u, 1u, 3u, 2u, 2u, 1u, 0u, 3u, 1u, 2u, 0u, 3u,
+    2u, 0u, 1u, 3u, 0u, 2u, 1u, 3u, 1u, 0u, 2u, 3u, 0u, 1u, 2u, 3u,
+);
+
+// 官方 `_rand()`(MSVC LCG,种子 1)跳 `steps` 步;`s -> a*s+c` 的二进制幂复合。
+fn lcg_jump(steps: u32) -> u32 {
+    var a: u32 = 0x343fdu;
+    var c: u32 = 0x269ec3u;
+    var ra: u32 = 1u;
+    var rc: u32 = 0u;
+    var left: u32 = steps;
+    loop {
+        if ((left & 1u) == 1u) {
+            ra = ra * a;
+            rc = rc * a + c;
+        }
+        let na = a * a;
+        let nc = c * (a + 1u);
+        a = na;
+        c = nc;
+        left = left >> 1u;
+        if (left == 0u) { break; }
+    }
+    return ra + rc;
+}
+
+// 官方 SEPIA 的「向零截断除以 2^20」(`sar 0x13` + `shr 0xc` 的符号修正)。
+fn trunc20(x: i32) -> i32 {
+    let corr = select(0, 0xfffff, x < 0);
+    return (x + corr) >> 20;
 }
 
 fn pack(px: vec4<u32>) -> vec4<f32> {
@@ -96,35 +136,64 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let out = min(rgb * gain / vec3<u32>(0x80u), vec3<u32>(255u));
         return pack(vec4<u32>(out, px.w));
     }
+    // SAIDO(4):官方 `FUN_00436bdc` —— 灰度 = (r+g+b)/3(整数截断,
+    // 不是 Rec.601);SET<128 用 k=128-SET,SET>=128 先按原始 k 试算再
+    // 按溢出/下溢收缩(上溢 R 比 k0、G/B 比已收缩的 k;下溢都比 k)。
     if (u.mode == 4u) {
-        let k = f32(clamp(u.amount, 0, 256)) / 128.0;
-        let l = f32(luma(rgb));
-        let out = vec3<u32>(
-            u32(round(clamp(l + (f32(rgb.x) - l) * k, 0.0, 255.0))),
-            u32(round(clamp(l + (f32(rgb.y) - l) * k, 0.0, 255.0))),
-            u32(round(clamp(l + (f32(rgb.z) - l) * k, 0.0, 255.0))),
-        );
-        return pack(vec4<u32>(out, px.w));
+        let sa = u.amount;
+        let p0 = vec3<i32>(rgb);
+        let l = (p0.x + p0.y + p0.z) / 3;
+        let dp = p0 - vec3<i32>(l);
+        let dl = vec3<i32>(l) - p0;
+        var out = p0;
+        if (sa < 0x80) {
+            let k = 0x80 - sa;
+            out = p0 + ((dl * vec3<i32>(k)) >> vec3<u32>(7u));
+        } else {
+            let k0 = sa - 0x80;
+            let trial = p0 + ((dp * vec3<i32>(k0)) >> vec3<u32>(7u));
+            var k = k0;
+            for (var c = 0; c < 3; c = c + 1) {
+                if (trial[c] > 0xff && dp[c] != 0) {
+                    let limit = (0xff - p0[c]) * 0x80 / dp[c];
+                    let base = select(k, k0, c == 0);
+                    if (limit < base) { k = limit; }
+                }
+            }
+            for (var c = 0; c < 3; c = c + 1) {
+                if (trial[c] < 0 && dp[c] != 0) {
+                    let limit = p0[c] * -0x80 / dp[c];
+                    if (limit < k) { k = limit; }
+                }
+            }
+            out = p0 + ((dp * vec3<i32>(k)) >> vec3<u32>(7u));
+        }
+        return pack(vec4<u32>(vec3<u32>(out), px.w));
     }
+    // AKARUSA(5):官方 `FUN_00431b40` 是**加法**亮度偏移 px+(SET-128),
+    // 夹到 [0,255](SET>=0x80 查的 DAT_00689e60 逐项 = clamp(i-128))。
     if (u.mode == 5u) {
-        let k = u32(clamp(u.amount, 0, 256));
-        let out = min(rgb * k / vec3<u32>(0x80u), vec3<u32>(255u));
-        return pack(vec4<u32>(out, px.w));
+        let off = vec3<i32>(u.amount - 0x80);
+        let out = clamp(vec3<i32>(rgb) + off, vec3<i32>(0), vec3<i32>(255));
+        return pack(vec4<u32>(vec3<u32>(out), px.w));
     }
     if (u.mode == 6u) {
         let v = select(0u, 255u, luma(rgb) >= u32(clamp(u.amount, 0, 255)));
         return pack(vec4<u32>(v, v, v, px.w));
     }
+    // SEPIA(7):官方 `FUN_004371cc` —— l10 = 117B+601G+306R、base=l10<<10、
+    // 三通道 trunc((base+C)/2^20) 后夹 [0,255]。
     if (u.mode == 7u) {
-        let r = rgb.x;
-        let g = rgb.y;
-        let b = rgb.z;
-        let out = vec3<u32>(
-            min((r * 393u + g * 769u + b * 189u) >> 8u, 255u),
-            min((r * 349u + g * 686u + b * 168u) >> 8u, 255u),
-            min((r * 272u + g * 534u + b * 131u) >> 8u, 255u),
+        let r = i32(rgb.x);
+        let g = i32(rgb.y);
+        let b = i32(rgb.z);
+        let base = (117 * b + 601 * g + 306 * r) << 10;
+        let out = vec3<i32>(
+            trunc20(base + 0x11e1400),
+            trunc20(base - 0x46361),
+            trunc20(base - 0x2c33311),
         );
-        return pack(vec4<u32>(out, px.w));
+        return pack(vec4<u32>(vec3<u32>(clamp(out, vec3<i32>(0), vec3<i32>(255))), px.w));
     }
     if (u.mode == 8u) {
         let n = max(1u, u32(u.amount));
@@ -161,6 +230,83 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
         let n = max(1u, cnt);
         return pack(vec4<u32>(acc / vec3<u32>(n), px.w));
+    }
+    // RASTER 族(16/17/18):`SET`=幅度、`SET2`=相位(度);位移向零截断;
+    // 水平下标夹到 x1-1(官方原样)。`FUN_0042f809` 的 0x15/0x16 内联支
+    // 与 `FUN_00431658`(variant 1/2/3)。
+    if (u.mode >= 16u && u.mode <= 18u) {
+        let amp = f32(u.amount);
+        let phase = f32(u.set2);
+        let horiz = (u.mode == 16u || u.mode == 18u);
+        let vert = (u.mode == 17u || u.mode == 18u);
+        let row_angle = (f32(p.y) + phase) * 0.017453292;
+        let col_angle = (f32(p.x) + phase) * 0.017453292;
+        var shift_x = 0;
+        var shift_y = 0;
+        if (horiz) { shift_x = i32(sin(row_angle) * amp); }
+        if (vert) { shift_y = i32(cos(col_angle) * amp); }
+        let sx = clamp(p.x + shift_x, 0, max(0, d.x - 2));
+        let sy = clamp(p.y + shift_y, 0, d.y - 1);
+        return pack(load(vec2<i32>(sx, sy)));
+    }
+    // WHIRLPOOL(19):`FUN_00437368`;定点 cos/sin 表 + 算术右移 8 位。
+    if (u.mode == 19u) {
+        let cx = d.x / 2;
+        let cy = d.y / 2;
+        let maxr = max(1, i32(u.n.x));
+        let dx = p.x - cx;
+        let dy = p.y - cy;
+        let r = clamp(i32(sqrt(f32(dx * dx + dy * dy))), 0, maxr - 1);
+        let deg = f32(u.amount) / 10.0 * (1.0 - f32(r) / f32(maxr));
+        let rad = deg * 0.017453292519444445;
+        let cs = i32(cos(rad) * 256.0);
+        let sn = i32(sin(rad) * 256.0);
+        let rx = (((-dy) * sn + dx * cs) >> 8) + cx;
+        let ry = ((dx * sn + cs * dy) >> 8) + cy;
+        let sx = clamp(rx, 0, d.x - 1);
+        let sy = clamp(ry, 0, d.y - 1);
+        return pack(load(vec2<i32>(sx, sy)));
+    }
+    // DIFFUSION(20):`FUN_004358d4` 的单遍;`n = (方向, it, 基数, 每行块数)`。
+    if (u.mode == 20u) {
+        let x1 = d.x - 1;
+        let y1 = d.y - 1;
+        let it = i32(u.n.y);
+        let reverse = (u.n.x == 1u);
+        var bx = 0;
+        var by = 0;
+        var covered = false;
+        var row = 0;
+        var col = 0;
+        if (!reverse) {
+            if (p.x >= it) {
+                bx = it + ((p.x - it) / 2) * 2;
+                by = (p.y / 2) * 2;
+                covered = (bx < x1) && (by < y1);
+                row = by / 2;
+                col = (bx - it) / 2;
+            }
+        } else {
+            let x_start = x1 - 1 - it;
+            let y_start = y1 - 1;
+            if (p.x <= x_start + 1 && p.y <= y_start + 1) {
+                bx = p.x - ((p.x - x_start) & 1);
+                by = p.y - ((p.y - y_start) & 1);
+                covered = (bx >= 0) && (by >= 0);
+                row = (y_start - by) / 2;
+                col = (x_start - bx) / 2;
+            }
+        }
+        if (!covered) { return pack(px); }
+        let k = u.n.z + u32(row) * u.n.w + u32(col);
+        let state = lcg_jump(k + 1u);
+        let idx = (((state >> 16u) & 0x7fffu) % 24u) * 4u;
+        let role = u32((p.y - by) * 2 + (p.x - bx));
+        let src_role = PERM[idx + role];
+        let sx = bx + i32(src_role & 1u);
+        let sy = by + i32(src_role >> 1u);
+        let q = load(vec2<i32>(sx, sy));
+        return pack(vec4<u32>(q.x, q.y, q.z, px.w));
     }
     return pack(px);
 }
