@@ -146,6 +146,11 @@ impl Backend {
     }
 }
 
+/// 存档块压缩层(宿主可显式指定,见 [`EngineOptions::save_codec`])。
+///
+/// 再导出 `yu_format::yssd::BlockCodec`,让宿主不必额外依赖 `yu-format`。
+pub use yu_format::yssd::BlockCodec;
+
 /// 引擎运行参数(全部由宿主给值;内核不猜)。
 #[derive(Clone, Debug)]
 pub struct EngineOptions {
@@ -185,6 +190,11 @@ pub struct EngineOptions {
     /// 显式脚本密钥(YSTB 分段异或)。`None` = 启动时解析
     /// (`exe` 扫描 → 数据自举 → 默认值,见 [`crate::keys`])。
     pub script_key: Option<[u8; 4]>,
+    /// 强制存档块压缩层,覆盖自动判定。`None`(默认)= 先按目标目录既有
+    /// `.sd` 学到的层,再按引擎代号(`YSSnp.dll` 在 ⇒ Snappy),最后 zlib。
+    /// 给 `Some` 时不再看盘上存档与 DLL —— 用于"全新目录第一次写"这种
+    /// 没有真值可依、又需要指定层的情形(`yu-cli run --save-codec`)。
+    pub save_codec: Option<yu_format::yssd::BlockCodec>,
 }
 
 impl Default for EngineOptions {
@@ -205,6 +215,7 @@ impl Default for EngineOptions {
             warm_text: false,
             force_font: None,
             script_key: None,
+            save_codec: None,
         }
     }
 }
@@ -1860,6 +1871,10 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         // 路径类系统变量由宿主注入(手册 `basic/svariable.html`)。
         // 缺失会让 `es_First.yst` 的 `$_SAVE_PATH` 走 Unimplemented(DIV-RT-010)。
         paths: host_paths(&save_root),
+        // `@_SAVE_PATH_TYPE`:游戏根 `yssfs.dat` 偏移 0x54(官方 0.495
+        // `FUN_00460c80` 读 `<app>\yssfs.dat`,CRT fread 明文,只接受 0..=3)。
+        // 文件缺失/全零 ⇒ 0,与官方等价。
+        save_path_type: i64::from(read_save_path_type(project.root(), project.aux_root())),
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(source, Some(aux), boot)
@@ -1947,6 +1962,17 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     let save_host = {
         // 可写 = 默认(2026-10-24 主人令;原版存档已备份 save-backup-20261024/)。
         let save_state = Arc::new(Mutex::new(SaveState::new(save_root.clone(), true)));
+        // 存档块压缩层按**引擎代号**选:随包带 `YSSnp.dll` 的构建(0.481 商业包)
+        // 写 Google Snappy,否则写 zlib level 1(0.495 SDK 语料形态)。
+        // 依据:该 DLL 导出 `YSSnp_Compress`/`YSSnp_Uncompress`,实机存档块
+        // 逐块解出即 Snappy;0.495 SDK 存档块首为 `78 01`(zlib level 1)。
+        if let Ok(mut state) = save_state.lock() {
+            // 宿主显式指定的层优先于引擎代号信号(`--save-codec`)。
+            state.set_block_codec(
+                opts.save_codec
+                    .unwrap_or_else(|| detect_block_codec(project.root())),
+            );
+        }
         let yscm = vm.tables().boot.yscm.clone();
         let host = SaveHost::new(save_state, yscm);
         // 开机先扫一遍槽表(盘上事实;LOAD 读侧的地基)。
@@ -2080,6 +2106,33 @@ fn host_paths(save_root: &std::path::Path) -> yu_rt::vm::HostPaths {
             .as_ref()
             .map(|h| format!("{h}{BS}Documents").into_bytes()),
         project_path: None,
+    }
+}
+
+/// 读游戏根的 `yssfs.dat`(「セーブファイル設定.exe」写出的存档路径设置)。
+///
+/// 官方 0.495 `FUN_00460c80` 读 `<app>\yssfs.dat`,取偏移 0x54 的 u32 写
+/// `[0x801324]`(只接受 0..=3)。文件缺失、过短或值超域都等价于 0。
+/// 先找工程根,再找辅助根(SDK 形态下 exe 与数据不同目录)。
+fn read_save_path_type(root: &std::path::Path, aux: &std::path::Path) -> u32 {
+    for dir in [root, aux] {
+        if let Ok(bytes) = std::fs::read(dir.join("yssfs.dat")) {
+            return yu_format::yssfs::save_path_type(&bytes);
+        }
+    }
+    0
+}
+
+/// 存档块压缩层:引擎根有 `YSSnp.dll` ⇒ Snappy,否则 zlib level 1。
+///
+/// `YSSnp.dll` 是引擎自带的压缩层实现(导出 `YSSnp_Compress` /
+/// `YSSnp_Uncompress` / `YSSnp_CompressedLength` / `YSSnp_UncompressedLength`),
+/// 所以它的存在就是「这一代写 Snappy」的直接信号。
+fn detect_block_codec(root: &std::path::Path) -> yu_format::yssd::BlockCodec {
+    if root.join("YSSnp.dll").is_file() {
+        yu_format::yssd::BlockCodec::Snappy
+    } else {
+        yu_format::yssd::BlockCodec::Zlib
     }
 }
 

@@ -85,6 +85,9 @@ pub struct SaveState {
     /// 存档容器版本:从盘上 `.sd` 学到的值(写回时沿用;`None` = 还没见过
     /// 任何存档)。容器版本是格式修订号,与引擎版本无关,所以不写死常量。
     container_version: Option<u32>,
+    /// 块载荷压缩层:从盘上 `.sd` 学到的值(0.495 SDK = zlib;0.481 商业包
+    /// 随包带 `YSSnp.dll` = Snappy)。`None` = 还没见过存档 ⇒ 写 zlib。
+    block_codec: Option<yu_format::yssd::BlockCodec>,
     /// 未刷盘预约(DNO → 快照;同 DNO 覆盖)。
     reservations: BTreeMap<u32, ReservedFact>,
     /// 诊断(容量上限 [`MAX_DIAGS`],超限丢最旧并记账)。
@@ -107,6 +110,7 @@ impl SaveState {
             writable,
             slots: BTreeMap::new(),
             container_version: None,
+            block_codec: None,
             reservations: BTreeMap::new(),
             diags: std::collections::VecDeque::new(),
             diags_dropped: 0,
@@ -195,6 +199,14 @@ impl SaveState {
                 Ok(save) => {
                     // 第一次见到存档即记住容器版本;后续写盘沿用它。
                     self.container_version.get_or_insert(save.version);
+                    // 压缩层同样只学一次:取**第一条能判定**的单层块
+                    // (`btype 2` 的外层裸流与 `DNO=1024` 嵌套槽判不了,跳过)。
+                    if self.block_codec.is_none() {
+                        self.block_codec = save
+                            .entries
+                            .iter()
+                            .find_map(yu_format::yssd::BlockCodec::detect);
+                    }
                     let mut dnos = BTreeMap::new();
                     for entry in &save.entries {
                         // 配置/多变量块没有单一目标变量 ⇒ 记 0。
@@ -392,6 +404,20 @@ impl SaveState {
         self.container_version = Some(version);
     }
 
+    /// 盘上学到的块压缩层(`None` = 还没见过存档,写盘按 zlib)。
+    #[must_use]
+    pub fn block_codec(&self) -> Option<yu_format::yssd::BlockCodec> {
+        self.block_codec
+    }
+
+    /// 宿主显式指定块压缩层(引擎代号信号:随包带 `YSSnp.dll` = Snappy)。
+    ///
+    /// 优先于「从盘上存档学到的」:混合目录(本引擎早先写出的是 zlib、官方
+    /// 存档是 Snappy)里以引擎代号为准,才不会再写出下一代不认的块。
+    pub fn set_block_codec(&mut self, codec: yu_format::yssd::BlockCodec) {
+        self.block_codec = Some(codec);
+    }
+
     /// `SAVE[FILE="x"]`:刷盘。按 DNO 升序流出**预约时**的快照
     /// (REA `0x44cd5a..0x44ceab`:写头/偏移表 + 逐块写;预约表不清)。
     ///
@@ -416,6 +442,9 @@ impl SaveState {
                 )
             })?;
         let mut writer = yu_format::yssd::YssdWriter::new(version);
+        // 压缩层沿用同目录存档(0.495 = zlib;0.481 商业包 = Snappy);
+        // 还没见过任何存档时用 zlib,与 0.495 官方产物逐字节一致。
+        let codec = self.block_codec.unwrap_or_default();
         for fact in self.reservations.values() {
             match fact.btype {
                 0 => {
@@ -423,7 +452,13 @@ impl SaveState {
                     let payload = snapshot_payload(snap)?;
                     writer.set_block(
                         fact.dno,
-                        yu_format::yssd::encode_block_body(0, 1, fact.var_id, &payload.to_bytes()),
+                        yu_format::yssd::encode_block_body_with(
+                            codec,
+                            0,
+                            1,
+                            fact.var_id,
+                            &payload.to_bytes(),
+                        ),
                     );
                 }
                 2 => {
@@ -439,14 +474,17 @@ impl SaveState {
                             raw,
                         })
                         .collect();
-                    writer.set_block(fact.dno, yu_format::yssd::encode_multi_body(&subs));
+                    writer.set_block(
+                        fact.dno,
+                        yu_format::yssd::encode_multi_body_with(codec, &subs),
+                    );
                 }
                 1 => {
                     let Some(image) = &fact.image else { continue };
                     let raw = crate::image_block::encode(image);
                     writer.set_block(
                         fact.dno,
-                        yu_format::yssd::encode_block_body(1, 1, 0, &raw),
+                        yu_format::yssd::encode_block_body_with(codec, 1, 1, 0, &raw),
                     );
                 }
                 other => {
