@@ -1594,7 +1594,6 @@ fn text_signature(draws: &[&yu_gfx::TextDraw], layout: Option<&yu_gfx::TextLayou
             fnv_bytes(&mut hash, name);
         }
         fnv_mix(&mut hash, draw.style.font_no.map_or(u64::MAX, |v| v as u64));
-        fnv_mix(&mut hash, draw.style.font_bno.map_or(u64::MAX, |v| v as u64));
     }
     if let Some(layout) = layout {
         fnv_mix(&mut hash, layout.glyphs.len() as u64);

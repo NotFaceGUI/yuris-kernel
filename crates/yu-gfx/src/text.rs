@@ -28,8 +28,6 @@ pub struct TextStyle {
     pub name: Option<Vec<u8>>,
     /// `NO`(字体列表序号;手册 `font/font.html` 例 2)。
     pub font_no: Option<i64>,
-    /// `BNO`(手册无页;真实脚本 `FONT[BNO=1]` 用作调试字体槽)。
-    pub font_bno: Option<i64>,
     /// `COLOR` 0xRRGGBB。
     pub color: u32,
     /// `COLOR2`(渐变终点;引擎默认与 `COLOR` 相同 = 0xffffff)。
@@ -76,7 +74,6 @@ impl Default for TextStyle {
         Self {
             name: None,
             font_no: None,
-            font_bno: None,
             color: 0x00FF_FFFF,
             color2: Some(0x00FF_FFFF),
             size_x: DEFAULT_FONT_SIZE,
@@ -138,18 +135,17 @@ impl TextStyle {
         }
     }
 
-    /// 字体身份请求(`NO`/`BNO`/`NAME` → `yu-font` 发现链)。
+    /// 字体身份请求(`NAME`/`NO` → `yu-font` 发现链)。
     ///
-    /// 引擎的 `FONT` 处理器按 ysc 槽序写入(BNo → NO → NAME),后写的覆盖;
-    /// 因此 `NAME` 优先于 `NO` 优先于 `BNO`。`BNO` 的字体列表语义未取证
-    /// (DIV-FONT-007),调用方只允许把它当调试槽透传。
+    /// 引擎的 `FONT` 处理器按 ysc 槽序写入(`NO` 在 `NAME` 之前),后写的
+    /// 覆盖 ⇒ `NAME` 优先于 `NO`。`BNO` **不是字体身份**:它是文字样式
+    /// 槽号选择器(REA `FUN_004039d0` 写 `[0x5d1684]`),由
+    /// `GfxState::select_style_slot` 处理,不进本请求。
     pub fn font_request(&self) -> TextFontRequest {
         if let Some(name) = &self.name {
             TextFontRequest::Name(name.clone())
         } else if let Some(no) = self.font_no {
             TextFontRequest::No(no)
-        } else if let Some(bno) = self.font_bno {
-            TextFontRequest::Bno(bno)
         } else {
             TextFontRequest::Default
         }
@@ -164,8 +160,6 @@ pub enum TextFontRequest {
     Name(Vec<u8>),
     /// 字体列表序号(`FONT[NO]`)。
     No(i64),
-    /// 调试字体槽(`FONT[BNO]`;语义未取证,DIV-FONT-007)。
-    Bno(i64),
     /// 未设置 → 引擎默认 family(REA `0x403b8e..0x403bdc` 回退表)。
     Default,
 }

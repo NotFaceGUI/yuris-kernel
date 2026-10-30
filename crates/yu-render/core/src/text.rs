@@ -253,8 +253,6 @@ pub fn text_base_key(texture: &TextureRef, override_hash: Option<u64>) -> u64 {
 enum FaceFallback {
     /// 正常解析。
     None,
-    /// `BNO` 调试槽未取证,按默认字体绘制(DIV-FONT-007)。
-    Bno,
     /// 字体名在本机不存在(或为空):按引擎回退表默认 family(DIV-GFX-059)。
     Name(Vec<u8>),
 }
@@ -283,7 +281,7 @@ fn font_source_summary(source: &FontSource, elapsed_ms: u128) -> String {
 }
 
 /// 把 `FONT` 请求渲染成人读形式(日志用):`NAME="ＭＳ ゴシック"` /
-/// `NO=3` / `BNO=1` / `Default`(脚本未指定,走引擎回退表)。
+/// `NO=3` / `Default`(脚本未指定,走引擎回退表)。
 fn describe_request(request: &TextFontRequest) -> String {
     match request {
         TextFontRequest::Name(bytes) => {
@@ -291,7 +289,6 @@ fn describe_request(request: &TextFontRequest) -> String {
             format!("NAME=\"{text}\"")
         }
         TextFontRequest::No(no) => format!("NO={no}"),
-        TextFontRequest::Bno(no) => format!("BNO={no}"),
         TextFontRequest::Default => "Default(script gave no font)".to_string(),
     }
 }
@@ -536,11 +533,6 @@ impl TextComposer {
                         None
                     }
                 }
-                // BNO 的字体列表语义未取证(DIV-FONT-007):不解析,退回默认。
-                TextFontRequest::Bno(_) => source
-                    .default_face()
-                    .ok()
-                    .map(|face| (face, FaceFallback::Bno)),
                 TextFontRequest::Default => source
                     .default_face()
                     .ok()
@@ -555,7 +547,6 @@ impl TextComposer {
             Some((id, fallback)) => {
                 let how = match fallback {
                     FaceFallback::None => "exact",
-                    FaceFallback::Bno => "bno-fallback",
                     FaceFallback::Name(_) => "name-fallback",
                 };
                 let line = format!(
@@ -669,9 +660,6 @@ impl TextComposer {
         }
         match &fallback {
             FaceFallback::None => {}
-            FaceFallback::Bno => stats.note(
-                "text.font.bno_fallback: BNO 字体列表语义未取证(DIV-FONT-007),按默认字体绘制",
-            ),
             FaceFallback::Name(bytes) => stats.note(&format!(
                 "text.font.name_fallback: {}",
                 String::from_utf8_lossy(bytes)
@@ -867,9 +855,6 @@ impl TextComposer {
         };
         match &fallback {
             FaceFallback::None => {}
-            FaceFallback::Bno => stats.note(
-                "text.font.bno_fallback: BNO 字体列表语义未取证(DIV-FONT-007),按默认字体绘制",
-            ),
             FaceFallback::Name(bytes) => stats.note(&format!(
                 "text.font.name_fallback: {}",
                 String::from_utf8_lossy(bytes)

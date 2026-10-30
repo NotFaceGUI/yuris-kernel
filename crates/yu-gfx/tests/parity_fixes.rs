@@ -235,17 +235,20 @@ fn cgact_size_keeps_sx_sy_and_resize_trim_are_recognized() {
 }
 
 #[test]
-fn font_no_and_bno_are_recorded() {
+fn font_no_is_recorded_and_bno_selects_style_slot() {
     let table = table();
     let mut gfx = state();
     gfx.consume_events(&[
         frame_start(1),
+        call(1, "FONT", vec![arg(&table, "FONT", "NO", i(3))]),
+        // `BNO=1` = 切到第 2 套样式(REA `FUN_004039d0` 写 `[0x5d1684]`),
+        // 不是字体序号 ⇒ `NO` 保持不变。
         call(
             1,
             "FONT",
             vec![
-                arg(&table, "FONT", "NO", i(3)),
                 arg(&table, "FONT", "BNO", i(1)),
+                arg(&table, "FONT", "COLOR", i(0x00_1234_56)),
             ],
         ),
         yu_rt::VmEvent::Text {
@@ -256,11 +259,40 @@ fn font_no_and_bno_are_recorded() {
         frame_end(1),
     ]);
     let f = gfx.frame();
-    assert_eq!(f.text[0].style.font_no, Some(3));
-    assert_eq!(f.text[0].style.font_bno, Some(1));
+    // 文本按**当前槽**(槽 1)的样式绘制:槽 0 的 `NO=3` 不生效。
+    assert_eq!(f.text[0].style.font_no, None);
+    assert_eq!(f.text[0].style.color, 0x00_1234_56, "槽 1 的 COLOR");
+    let js = json::to_json(&f);
+    // BNO 不是样式字段,JSON 不再输出 `font_bno`。
+    assert!(!js.contains("font_bno"));
+
+    // 切回槽 0:槽 0 的 NO 与默认 COLOR 都还在,槽 1 的改动不外溢。
+    gfx.consume_events(&[
+        frame_start(2),
+        call(2, "FONT", vec![arg(&table, "FONT", "BNO", i(0))]),
+        yu_rt::VmEvent::Text {
+            frame: 2,
+            id: "MSG".to_string(),
+            bytes: b"abc".to_vec(),
+        },
+        frame_end(2),
+    ]);
+    let f = gfx.frame();
+    assert_eq!(
+        f.text[0].style.color,
+        0x00FF_FFFF,
+        "槽 0 未被槽 1 的写入污染"
+    );
+    assert_eq!(f.text[0].style.font_no, Some(3), "槽 0 的 NO 仍在");
     let js = json::to_json(&f);
     assert!(js.contains("\"font_no\":3"));
-    assert!(js.contains("\"font_bno\":1"));
+    assert!(
+        !gfx.diagnostics()
+            .iter()
+            .any(|d| d.detail.contains("BNO")),
+        "BNO 归类后不得再挂未实现:{:?}",
+        gfx.diagnostics()
+    );
 }
 
 #[test]

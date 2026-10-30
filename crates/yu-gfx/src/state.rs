@@ -154,7 +154,19 @@ pub struct GfxState {
     /// COPY + 图像加工的共同命令序(EVID-T-15;`frame()` 交错输出)。
     texture_seq: u64,
     frame: u64,
+    /// 当前文字样式(= `style_slots[style_slot]` 的活副本)。
+    ///
+    /// 引擎有 **8 套**文字样式(`FUN_00464fac` 的初始化循环 `CMP ECX,8`),
+    /// `FONT[BNO=n]`/`CGACT[BNO=n]` 切换"当前槽"(REA:setter
+    /// `FUN_004039d0` = `MOV [0x5d1684],arg`;其余 FONT 参数写
+    /// `[EDX*4 + 数组]`、`EDX = [0x5d1684]`)。这里的 `style` 恒为当前槽,
+    /// 切换时把当前槽存回 `style_slots[旧]`、取出 `style_slots[新]`,
+    /// 保证所有既有读写点语义不变。
     style: TextStyle,
+    /// 8 套文字样式的存档(`style_slots[0]` = 默认样式)。
+    style_slots: [TextStyle; 8],
+    /// 当前文字样式槽号(`[0x5d1684]`;缺省 0)。
+    style_slot: usize,
     /// 跨帧文本缓冲(按 `TEXT[ID]`;引擎只有一个文本状态,实际最多一条)。
     ///
     /// DIV-GFX-034:不再每帧清空;清空只由 `TEXT[CLEAR]`(经
@@ -294,6 +306,8 @@ impl GfxState {
             texture_seq: 0,
             frame: 0,
             style: TextStyle::default(),
+            style_slots: std::array::from_fn(|_| TextStyle::default()),
+            style_slot: 0,
             text_layers: BTreeMap::new(),
             current_text: LayerId::new(Vec::new()),
             text_revision_seq: 0,
@@ -1896,6 +1910,12 @@ impl GfxState {
         let set2 = find_value(&params, "SET2");
         let set_str = find_str(&params, "SETSTR");
         let bno = find_int(&params, "BNO");
+        // `CGACT[BNO]` 与 `FONT[BNO]` 同一个选择器(REA:CGACT 处理体在
+        // 参数 62 出现时 `PUSH [slot*8+0x683740]; CALL FUN_004039d0`,随后
+        // 才处理参数 63 `TEXT`)。所以要在任何绘制动作之前切槽。
+        if let Some(n) = bno {
+            self.select_style_slot(n);
+        }
         // 区域坐标按**像素取整**读:`es.CGACT_SIZE` 的源区域是缩放后的实际
         // 范围,实测 `CGACT[… SIZE=1 X=0 Y=0 X2=1100 Y2=824.5 …]` —— 带
         // 小数。旧实现用 `find_int`(`as_int` 要求 `fract()==0`)会让
@@ -2804,11 +2824,11 @@ impl GfxState {
                         // ,查不到(pin 空串必然查不到)落到**槽默认 family**
                         // (REA FONT 表:NAME 默认值 = 槽默认 family;回退表
                         // `0x403b8e..0x403bdc`,docs/font-provenance.md §6)。
-                        // 名字槽一旦出现就覆盖全局字体索引 ⇒ 同时清 NO/BNO
-                        // (DIV-GFX-059)。
+                        // 名字槽一旦出现就覆盖全局字体索引 ⇒ 同时清 NO
+                        // (DIV-GFX-059)。`BNO` 不是字体身份(是样式槽号
+                        // 选择器),不受影响。
                         self.style.name = None;
                         self.style.font_no = None;
-                        self.style.font_bno = None;
                     }
                     Value::Str(b) => self.style.name = Some(b.clone()),
                     _ => self.arg_type("FONT", name, "字符串", &r.value),
@@ -2869,16 +2889,20 @@ impl GfxState {
                     }
                     None => self.arg_type("FONT", name, "整数", &r.value),
                 },
+                // `BNO` = **文字样式槽号选择器**,不是字体序号(手册
+                // `font/font.html` 无页,REA 定案):
+                // - setter `FUN_004039d0` = `MOV [0x5d1684],arg; RET`;
+                // - FONT 处理体(`0x444428` 起)在 BNO 出现时
+                //   `PUSH [slot*8+0x683740]; CALL FUN_004039d0`,然后才处理
+                //   `NO`/`NAME`/`SX`…;
+                // - 其余参数写 `[EDX*4 + 数组]`,`EDX = [0x5d1684]`
+                //   (槽 0 额外镜像到全局样式结构);
+                // - 8 槽由 `FUN_00464fac` 初始化(`CMP ECX,8`);编译器
+                //   checker=3 把脚本值域限在 0/1。
                 "BNO" => {
-                    // 手册 font/font.html 无 BNO;真实脚本只用它做调试字体槽。
-                    self.style.font_bno = int_arg(&r.value);
-                    self.push_diag(
-                        "FONT",
-                        error::unimplemented(
-                            error::code::TEXT_UNSUPPORTED,
-                            "FONT[BNO] 无手册页/字体列表语义未取证;值已保留",
-                        ),
-                    );
+                    if let Some(n) = int_arg(&r.value) {
+                        self.select_style_slot(n);
+                    }
                 }
                 _ => self.push_diag(
                     "FONT",
@@ -2896,6 +2920,21 @@ impl GfxState {
     }
 
     // ------------------------------------------------------------ 内部
+
+    /// 切换当前文字样式槽(`FONT[BNO]` / `CGACT[BNO]`;REA `FUN_004039d0`)。
+    ///
+    /// 槽号越界时 clamp 到 `0..=7`(引擎数组是 8 槽、自己不校验;编译器
+    /// checker=3 把脚本值域限在 0/1,所以越界只可能来自手工改过的 ysc)。
+    fn select_style_slot(&mut self, slot: i64) {
+        let n = slot.clamp(0, (self.style_slots.len() - 1) as i64) as usize;
+        if n == self.style_slot {
+            return;
+        }
+        // 当前槽是活副本:先存回旧槽,再取出新槽。
+        self.style_slots[self.style_slot] = self.style.clone();
+        self.style = self.style_slots[n].clone();
+        self.style_slot = n;
+    }
 
     /// 层像素被重写:清空该层文本内容并发全局新修订号(后端缓存随之失效)。
     /// 不删条目 —— 删除后重建会让修订号从头开始,和旧缓存撞键。

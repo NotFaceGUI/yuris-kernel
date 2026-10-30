@@ -576,11 +576,6 @@ fn text(out: &mut String, t: &crate::text::TextRun) {
         Some(v) => out.push_str(&v.to_string()),
         None => out.push_str("null"),
     }
-    out.push_str(",\"font_bno\":");
-    match t.style.font_bno {
-        Some(v) => out.push_str(&v.to_string()),
-        None => out.push_str("null"),
-    }
     out.push_str(",\"color\":");
     out.push_str(&t.style.color.to_string());
     out.push_str(",\"color2\":");
