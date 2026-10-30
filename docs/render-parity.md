@@ -280,8 +280,24 @@ pass 映射为:
 - 本语料 `_DXMODE=0` 走固定管线;`_DXMODE≠0` 的脚本分支才会产生 HLSL
   转场。内核把 `dx_mode` 作为显式宿主契约(默认 0),非 0 时后端用
   psC/psD 独立 WGSL;详见 `docs/shader-parity.md`。
-- **MODE 4/8/10..18 仍 `Unimplemented`**:这 4 个 pass 不是 Photoshop
-  混合模式;不得拿它们冒充除算/差分/Overlay 等。
+- **MODE 4/8/10..18:官方引擎没有实现(2026-10-30 定案)**。
+  绘制体 `FUN_00414ba4` 按 MODE(第 5 个栈参数)走 if/else 链,分支只有
+  `0/1/2/3/5/6/7/9`;其余 11 个值落进最后的 `else` —— 那条分支**只把几个
+  局部变量拷回去,一条 `SetTextureStageState` / `SetRenderState` 都不设**
+  (早期分派链 `0x4155dd` 的 `CMP EAX,1/2/3/5/6/7/9` 比较集合与此一致)。
+  TFACTOR 选择链(`0x414d05` 起)同样只认 `{1,2,3,5,6,7,9,100,98}`
+  (MODE 0 由 `TEST EDX,EDX; JNZ` 单独走 A 灰度分支),其余值取
+  `0xFF000000`。
+- 手册 `cg/cg.html` 写的是 `MODE=値(0～18)` 并列出除算/差分/Overlay..
+  PinLight 名字,但那是**脚本语言的参数域**(编译器接受该值),不等于引擎
+  画得出来;同一页还注了 `※覆い焼きリニア＝加算モード`(模式名之间存在
+  同义关系)。exe 内 D3DX 编译器签名共 5 处(编译后的 shader blob),已映射的
+  4 个 pass(psA/psB/psC/psD)见 `docs/shader-parity.md` §3,没有一个是这 11
+  种混合模式,不得拿来冒充。分类 = `unsupported-by-official`。
+- 因此内核按官方**实际行为**对齐:`BlendMode::engine_effective` 把这 11 个
+  值归约到通常路径(层照常绘制,不再整层丢失),`confidence()` 标
+  `Unsupported`。官方那层的真实像素取决于**上一层留下的 D3D 状态**
+  (顺序相关),不可复现也不应复现。
 
 ### 5.4 实现状态
 
@@ -290,7 +306,7 @@ pass 映射为:
 | 0 | 有 | 可执行;先按手册 α 混合,像素对拍后再转正 |
 | 1/2 | 有 | 可执行(MODE 2 的 RGB 已按 `T·A` 修正) |
 | 3/5/6/7/9 | 有 | soft 与 wgpu 全部可执行(源色归约 + D3D9 因子;wgpu 用 `Src/OneMinusDst/OneMinusSrc` 对应颜色因子) |
-| 4/8/10..18 | 无 | 后端必须跳过 |
+| 4/8/10..18 | 有(归约为通常) | 可执行;官方无 case,按通常路径对齐 |
 
 `yu-gfx` 的 `BlendMode::confidence()` 与 `docs/render-parity.md` 本表一一对应;
 `json::blend_table_json()` 输出完整状态表供后端初始化。

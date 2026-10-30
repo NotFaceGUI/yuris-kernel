@@ -120,7 +120,7 @@ oC0.a   = tex1.a * saturate((YS_FadeVal - 0.5*tex2.r) * YS_FadeVal2) * YS_AlphaV
 |---|---|---|
 | 固定管线 MODE 0/1/2 | 接近 | J3 在 ERIS `_DXMODE=0` 下 600 帧 soft/wgpu 0 差异;MODE 0 仍标 Likely(stage1 NULL 行为未逐像素取证) |
 | MODE 3/5/6/7/9 | **未 1:1** | gfx 有 `fixed_state()` 状态表,Backend 只支持 0/1/2;这些模式被跳过(状态未对拍) |
-| MODE 4/8/10..18 | **未实现** | 11 个模式依赖引擎 shader;当前一律 Unimplemented |
+| MODE 4/8/10..18 | **未实现(2026-10-30 定案为官方无实现)** | 本行原判断"依赖引擎 shader"已被推翻:`FUN_00414ba4` 全函数体无对应 `CMP`,官方不设任何 D3D 状态 ⇒ `unsupported-by-official`,内核归约到通常路径(`BlendMode::engine_effective`),见 `docs/shader-parity.md` §3.2 |
 | 转场(固定管线) | 近似 1:1 | ERIS 路径对拍通过;TA≠128 残差 DIV-045 |
 | 转场(HLSL) | **未实现** | 引擎 ps4 公式已取证,未移植;`_DXMODE≠0` 时错误 |
 | 顶点 DIFFUSE RGB | **未建模** | MODE 2/3/5/6/7/9 的 stage0 依赖 diffuse;当前按白/纹理处理(DIV-GFX-019) |

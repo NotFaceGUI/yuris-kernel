@@ -2,8 +2,8 @@
 
 > 会话 F 续。原则:**未取证 = 不实现 + 显式 `Unimplemented` + 本清单/DIV**。
 > 本清单与 `crates/yu-gfx/docs/divergences/README.md`、`docs/render-parity.md`
-> 同步;当前覆盖 DIV-GFX-001..059(含 decision/note/withdrawn 项;
-> 058/059 于 P8 落地)。
+> 同步;当前覆盖 DIV-GFX-001..071(含 decision/note/withdrawn 项;
+> 058/059 于 P8 落地,069/070/071 于 2026-10-30 新增)。
 > 任务 J2 关闭 006/007/017/029、撤回 044、新增 043(跨 crate blocked)/045。
 > 任务 J3 关闭 043(`yu-rt FILEINFO[EXIST]`,title `asset.missing=0`),
 > 045 保持 open 但 soft/wgpu 已同式/同量化(title 不触发 TA≠128)。
@@ -21,7 +21,7 @@
 | ID | 模块 | 状态 | 当前行为 | 解除条件 |
 |---|---|---|---|---|
 | DIV-GFX-001 | MODE 3/5/6/7/9 固定管线 | **fixed(J4)** | 辅助纹理=白/黑;stage1=BLENDCURRENTALPHA;soft/wgpu 全部执行(颜色因子见 047) | 状态表 + 单元向量;官方微场景待 YSCom 恢复 |
-| DIV-GFX-002 | MODE 4/8/10..18 着色器 | unimplemented | shader 集合已定位(4 个 ps_2_0:交叉淡化/mask/两种缩放),4 个 pass 均已移植 WGSL;MODE 4/8/10..18 的 Photoshop 公式仍无对应 blob/调用点;层标 Unimplemented | 找到 MODE 公式的调用点/blob + 像素对拍 |
+| DIV-GFX-002 | MODE 4/8/10..18 | **unsupported-by-official** | 官方绘制体 `FUN_00414ba4` 的 MODE 分支(第 5 个栈参数 if/else 链)只有 `0/1/2/3/5/6/7/9`;其余 11 个值落进最后的 `else`,**一条 D3D 纹理阶段/混合状态都不设**(早期分派链 `0x4155dd` 的比较集合相同)。手册 `cg/cg.html` 列了除算/差分/Overlay..PinLight 名字(属脚本语言参数域,同页还注 `覆い焼きリニア＝加算モード`),引擎未实现 ⇒ 不是"手册缺页",是官方无实现。内核按 `BlendMode::engine_effective` 归约到通常路径绘制(不再丢层),置信度标 `Unsupported`。exe 内 D3DX 编译器签名共 5 处(编译后的 shader blob),已映射的 4 个 pass(psA/psB/psC/psD)是转场/缩放,没有一个是混合模式 | `docs/render-parity.md` §5.3/§5.4;`crates/yu-gfx/tests/blend_table.rs` |
 | DIV-GFX-003 | `FX/FY/FBX/.../F` 仿射/滤镜 | **fixed(绑定;公式归 070)** | 逐项落到 `Transform.affine`(引擎 `+0x1b0..+0x214`),`FX/FY` 即图层位置 | 见 `docs/divergences/DIV-GFX-069-cg-affine-binding.md` |
 | DIV-GFX-004 | 多部件层 | unimplemented | `Part.raw` 原样保存 | `+0xa6/+0xa7/+0xb0/+0x130` 几何语义 |
 | DIV-GFX-005 | `MID` 外部掩码 | unimplemented | 层标 Unimplemented | 掩码取值通道(α/亮度)/尺寸/采样 |
@@ -32,7 +32,7 @@
 | DIV-GFX-010 | 帧清屏 | open | `default_black` | 引擎帧入口/设备初始化观测 |
 | DIV-GFX-011 | `LINT/LINT2/TSX/TSY/MIPMAP/TEX/DXBUF/DXDRAW/RID/MFILE/CASH` | **fixed(no-manual)** | 逐项定案:`LINT/LINT2`=按钮号字段、`TSX/TSY/MFILE/CASH` CG 从不读取、`DXDRAW` 只受全局开关门控、`MIPMAP` 无 mip 链、`DXBUF` 是全局开关、`RID`=资源图(缺 provider) | DIV-GFX-069 §2 |
 | DIV-GFX-012 | 文本字形栅格化/排版 | **fixed(P2)** | 两条路径都执行:①`CGACT[TEXT]`→`TextDraw`→图层基图合成(ERIS 正文);②`TEXT[ID]` 自动层→`_TEXT_FLAG` 逐字 `'1'/'2'` 排版(`layout_text`)→屏幕/图层覆盖。字形用 `yu-font`;soft/wgpu 同帧逐像素一致 | 行距/基线/GDI 栅格差异见 DIV-GFX-056、DIV-FONT-002 |
-| DIV-GFX-013 | `CGACT` 图像加工像素 | partial | RECTPAINT/2/3(EVID-J-02..05)+ REVERSE/HORIZONTAL(EVID-T-13)已实现;SIZE/ROTATION/MONO/BLUR/... 仍 Unimplemented | 逐动作定位像素算法 + 官微场景对拍 |
+| DIV-GFX-013 | `CGACT` 图像加工像素 | partial | **soft 全量实现**(手册有页的全族 + 无页 `SIZE3/4/5`/`BLUR2..6`/`ROTATION2` 按同族);wgpu 缺 `BLUR*`/`DIFFUSION`/`WHIRLPOOL`/`RASTER*` 的 GPU 路径(报 skip,待 `gpu.cpu_fallback.<action>` 或 shader);`TEXCOPY/TEXSSCOPY` 手册无页,ERIS 3 处全为自复制,保持 Unimplemented | 两后端逐动作对拍 + wgpu 滤镜 shader/回退标注 |
 | DIV-GFX-016 | `CG` 无 `FILE` 的 get-or-create | open | 建无纹理层(不绘制) | 重新锚定 CG 处理体 |
 | DIV-GFX-017 | COPY 属性复制范围 | fixed | REA 块明确 A/E/MODE/T/TA/X/Y/尺寸/TID/MID/滤镜,未见 Z;当前保持复制 Z(Likely),调用点未定位前不改 | 重新锚定 Z 字段/调用点 |
 | DIV-GFX-043 | 按钮状态后缀 `_na/_off/_on/_over` | **fixed(J3)** | 脚本用 `FILEINFO[EXIST=1]` 探测后拼名;`yu-rt` 已实现 FILE+EXIST+LET(EVID-J3-01,REA `0x44286c`)。title `asset.missing=0`,`ops 27/27/0` | `docs/title-motion-ledger.md` §9.1 |
@@ -58,7 +58,8 @@
 | DIV-GFX-034 | 文本跨帧持久 + CLEAR 传播到 gfx | **fixed(P2)** | `GfxState` 持跨帧文本缓冲;`FrameStart` 不再清空;CLEAR = 宿主同步空 `TextSnapshot`(VM `TEXT[CLEAR]` 无事件)或 `clear_text()`;`CGEND`/`CG(FILE)` 重建清目标层 | `tests/text_pipeline.rs` |
 | DIV-GFX-035 | `FONT NO/BNO` 解析、GRADATION/ROTATION/PITCH/LANG、默认字体 | partial(P2) | `GRADATION/ROTATION/COLOR/COLOR2/SX/SY/BOLD/AA/DRAWMODE` 全量保存 + clamp;默认值按 `FUN_00464fac`;字体身份经 `TextStyle::font_request()` 交 `yu-font`(`NAME`>`NO`>`BNO`→默认回退表);BNO/PITCH/LANG 只留值 | DIV-FONT-007;H-P2-03 |
 | DIV-GFX-036 | FONTINFO 字体列表字段/未设置默认值 | partial(P2) | `COLOR/COLOR2/SX/SY/BOLD/AA/DRAWMODE/GRADATION/ROTATION` 经 `GfxHost` 写回 LET;`NAME`(未设置)/`NO` 列表/`NUM/PITCH/LANG` 仍 Unimplemented(需要系统字体列表) | `tests/info_query.rs` |
-| DIV-GFX-037 | WINDOW host 属性/主窗口 A 透明度/SX-SY 视口 | open | gfx 只消费 CGID/E/A 显隐 | 窗口 host + 0.495 A 语义 |
+| DIV-GFX-037 | WINDOW host 属性/主窗口 A 透明度/SX-SY 视口 | partial(no-manual) | `CAPTION/FULLSCREEN/FULLSCREENBUTTON/MAXMODE/MINMODE` 存 `WindowState` 并由 `WINDOWINFO` 读回;`MAXMODE/MINMODE` = 每窗口按钮开关(WINDOW 槽 16/17 ↔ WINDOWINFO 槽 18/19,创建时落 `WS_MIN/MAXIMIZEBOX`,REA `FUN_00457d8c`);`MENUID/REGIONID/DRAGID/FLASH/FLASHTIME` 只归类不实现 | 窗口 host + 0.495 A 语义 |
+| DIV-GFX-071 | `WINDOW[MINIMIZE/CLOSEMODE/ACTIVE/WSX/WSY]` 读写配对 | **fixed(手册有页)** | 手册 `window/window.html`/`windowinfo.html`:`MINIMIZE` = 切换动作(写 `minimized`)、`CLOSEMODE` = 0..2(写 `close_mode`)、`ACTIVE=0` 无副作用、`WSX/WSY` = `outer_size` 写侧;`FULLSCREENBUTTON` 与 `FULLSCREEN2` 互为别名 | `MAXIMIZE` 的窗口动作仍交宿主 |
 | DIV-GFX-038 | INFO 缺失目标非 EXIST / 未分类字段 | unimplemented | 不写 LET | 引擎缺失返回语义 |
 | DIV-GFX-039 | `CGACT RASTER1/FSX/FSY/FX2/FY2/Z2` | **fixed(no-manual)** | `RASTER1` 不在 0.495 参数表(已删);`FX/FY/X2/Y2/FX2/FY2/FSX/FSY` 像素/百分位双口径已实现;`Z2` 无副作用 | DIV-GFX-069 §2 |
 | DIV-GFX-040 | `TEXTINFO` 只读文本状态 | **fixed(M-2,P2 复核)** | `yu-rt` `op_textinfo` 按参数存在性回答 OUTPUTMODE/CX/CY/CLICK/AUTO*(手册 + REA `0x4538cc`);gfx 文本模型已消费同源 `_TEXT_FLAG` | `fixture::textinfo_*` |

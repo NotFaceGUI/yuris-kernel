@@ -108,7 +108,7 @@ pass3 → object id 10 → 1432 B → psA(16-tap)
 | 无多部件或 `TA<1`,有过渡配对 | `BeginPass(0)` → **psD 交叉淡化** | vtable `+0x108`,地址 `0x416b80` |
 | 多部件且 `TA>=1` | `BeginPass(1)` → **psC mask 转场** | `0x416b..` |
 | MODE ∈ {0,1,2,3,5,6,7,9,100,98} | 固定管线状态表(不走 effect) | 同函数 0x415..0x417.. |
-| MODE 4/8/10..18 | 落到 HLSL 参数设置块 | `0x416ad1..0x416e86` |
+| MODE 4/8/10..18 | **无分支**:既不走固定管线状态表,也不因 MODE 进入 effect 块 | 全函数体(`0x414ba4..0x4171f0`,9804 B)字节扫描:只有对 `1/2/3/5/6/7/9` 的 `CMP`,没有任何对 `4/8/10..18` 的比较;`0x416ad1` 是 `MOV EDX,[0x801e7c]`(effect 指针),按转场条件(TID/TA)进入,与 MODE 无关(2026-10-30 更正) |
 
 HLSL 参数设置(REA 地址,均在 `0x416a..0x416e`):
 `YS_Texture1`、`YS_Texture2`、`YS_AlphaVal=A/256`、`YS_FadeVal`、
@@ -169,7 +169,7 @@ psA 的像素 shader 把 `YS_TexDiffU` 加到 t0..t7,等价于把 4 组行 UV �
 | `ps_1_4` 三个 blob ↔ `CGACT MONO/BLUR2..6` | **Refuted**:不存在 ps_1_4 blob;`CGACT` 的图像加工是 CPU 像素路径(`FUN_0042f809` 动作分派),不引用 `DAT_00801e7c` | 全 exe 扫描 §1;`0x801e7c` 的 34 个 xref 无 `0x42f809` |
 | 图像处理 shader 在 effect 里 | **部分成立但用途不同**:psA/psB 是**显示缩放滤镜**(pass2/3),不是 `CGACT` BLUR/SHARP | §3.3;`FUN_004195ec` 的 pass 选择 |
 | `vs_1_1` 用于 E-mote/变形/2D title | **Refuted**:无 vertex shader;顶点由 CPU 生成后 `DrawPrimitiveUP`,固定 FVF | §1;`0x41a308` 顶点写入 + `0x462e40` `SetFVF` |
-| 11 个“着色器模式”(MODE 4/8/10..18) 各有一个 blob | **未成立**:只有 4 个 pass;MODE 4/8/10..18 走同一个 effect,但 pass 只有交叉淡化/mask 两种转场 + 两种缩放滤镜。MODE 的 Photoshop 混合公式本体仍未定位 | FXO pass 表;`FUN_00414ba4` 的 MODE 分派 |
+| 11 个“着色器模式”(MODE 4/8/10..18) 各有一个 blob | **未成立**:effect 只有 4 个 pass(交叉淡化 / mask 转场 + 两种缩放滤镜),没有一个是混合模式;而且这 11 个 MODE 值在 `FUN_00414ba4` 里**根本没有分支**(全函数体扫描无对应 `CMP`),既不走固定管线也不进 effect 块 ⇒ 官方未实现,不是"公式未定位" | FXO pass 表;`FUN_00414ba4` 全函数体扫描(2026-10-30 更正) |
 | 本语料 `_DXMODE=0` | 与引擎无关的**脚本分支**:`@_DXMODE` 决定脚本走 `CGACT[TRANSITION]`/`TID`(0)还是 `DXBUF` 分支(≠0);引擎 effect 始终创建 | `es_first/es_Sprite` 脚本;EVID-T-08 |
 
 ## 5. 实现状态(本任务)
@@ -198,8 +198,11 @@ psA 的像素 shader 把 `YS_TexDiffU` 加到 t0..t7,等价于把 4 组行 UV �
    `GfxConfig`(一行);当前示例用 `YURIS_DX_MODE` 环境变量做 A/B。
    **示例验收**:`YURIS_DX_MODE=0/1` 各跑 600 帧,soft/wgpu 稳态同哈希;
    dx1 有 1 帧(max 3/255,量化)soft/wgpu 差异,阈值声明见 §7。
-2. MODE 4/8/10..18 的 Photoshop 公式本体仍无 blob/调用点证据;保持
-   `Unimplemented`,不猜公式。
+2. **MODE 4/8/10..18:官方无实现(2026-10-30 定案,`unsupported-by-official`)**。
+   `FUN_00414ba4` 全函数体只有 `1/2/3/5/6/7/9` 的 `CMP`,这 11 个值不设任何
+   D3D 状态、也不进 effect 块 ⇒ 不存在"待定位的 Photoshop 公式",不要再按
+   `Unimplemented` 挂账。内核按官方行为对齐:归约到通常路径绘制
+   (`BlendMode::engine_effective`),置信度 `Unsupported`。
 3. **组(layer set)上的 TID**:gfx 已输出 `Op::Transition { from: Offscreen }`,
    配对可为图像/组;引擎按层表统一解析。标 `Likely`,待官方微场景。
 4. psA/psB 已按 `DAT_00801334` 的 pass2/pass3 接线(`render_frame_scaled`);

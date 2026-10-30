@@ -10857,3 +10857,362 @@ yu-cli run <0.481 商业包根> --frames 1800 --log-level info
   `voice\mit_n01_*.ogg` / `voice\sin_n01_*.ogg` / `voice\mob_n01_*.ogg`
   (同号 `0458` 存在为 `mit_n01_0458`/`sin_n01_0458`)。查找链路本身正确
   (小写归一 + `.ogg/.wav` 探测,REA `0x40c9b4`),属数据侧缺文件。
+
+## 成果 SYSVAR-SAVE-PATH-RET (2026-10-30) · `_SAVE_PATH_TYPE` 与 `_RET` 收口,系统变量未实现挂号归零
+
+### 问题
+
+商业包 1,800 帧运行剩 4 条 `rt.sysvar.unimplemented`:`_SAVE_PATH_TYPE` ×3
+(`es_first.yst` pc6/9/12)+ `_RET` ×1(`puserdesign` pc4)。两者都因「工程 ycd
+声明、手册无页」被旧门禁一律挂号。按 2026-10-24 政策(手册缺页 ≠ 不实现),
+取证后落地。
+
+### 证据(0.495 `yu-ris.exe`,sha256 `4f5eefa3…`)
+
+- **`_SAVE_PATH_TYPE`(id 112)**:getter `FUN_00427350` case 112 =
+  `MOVSX EBP, byte ptr [0x801324]`。写侧 `FUN_00460c80` 打开
+  `<app>\yssfs.dat`(`FUN_00469df2` → `FUN_00469dc1(path, mode, 0x40)`),
+  用 `FUN_00469ebe(rec, 4, 0x20, h)` 读 0x20 个 u32;该函数 = 加锁 +
+  `FUN_00469eed`(**标准 CRT 缓冲 `fread`**:`FUN_0046950e` = `_read`、
+  `FUN_004705f9` = `_filbuf`)+ 解锁 ⇒ **明文,无解密**。取 `rec[0x15]` =
+  字节偏移 0x54,只有 0..=3 写全局,其余保持初值 0。
+- **`_RET`(id 49)**:getter 表项 `0x4279dd`,实际体 `0x4279de` =
+  `MOV EBP, 0x3E7` ⇒ 恒 999,不读任何全局。
+
+### 改动
+
+- `crates/yu-format/src/yssfs.rs`(新):`yssfs.dat` 定长记录(0x80 字节 /
+  0x20 个 u32)、`SAVE_PATH_TYPE_OFFSET = 0x54`、`save_path_type()`
+  (只接受 0..=3,缺失/超域 ⇒ 0);两条单测。
+- `crates/yu-rt/src/vm.rs`:`BootConfig::save_path_type` + `Vm` 字段与访问器。
+- `crates/yu-rt/src/sysvar.rs`:`_SAVE_PATH_TYPE` 读注入值;`_RET` 返回 999
+  (证据与「哨兵」推断写进注释,不按语料猜语义)。
+- `crates/yu-engine/src/engine.rs`:启动读工程根/辅助根的 `yssfs.dat` 注入。
+- `crates/yu-trace/src/record.rs`:回放侧显式写 0 并标注「未进 trace 头」。
+- `crates/yu-rt/tests/fixture.rs`:回归
+  `save_path_type_and_ret_are_injected_not_unimplemented`。
+- 台账:`docs/game-settings-ledger.md` 新增 §3.1 `yssfs.dat`;
+  `crates/yu-rt/docs/command-provenance.md` 补两行;DIV-RT-007 增记 2026-10-30。
+
+### 验证(原始结果)
+
+```text
+cargo build --workspace --all-targets  → 0 error / 0 warning
+cargo test --release -p yu-format --lib yssfs   → 2 passed
+cargo test --release -p yu-rt --test fixture save_path_type_and_ret → ok
+
+yu-cli run <0.481 商业包根> --frames 1800 --log-level info
+  rt.sysvar.unimplemented : 4 → 0
+  帧像素 sha256           : ad3cff2b…(未变;yssfs.dat 全零 ⇒ type 0,
+                            与修复前「三条件全假」等价)
+yu-cli run <project-eris> --frames 200
+  rt.sysvar.unimplemented : 0 命中(仅剩 EMOTE 的 deferred(master) 与
+                            FILEACT[DELETE] 的 INFO)
+```
+
+### 残余(取证已定边界)
+
+- getter 跳表 548 项只有约 68 个不同目标:约 480 个 id 共享 4 个**族块**
+  (`0x42755f`×129 / `0x4274b0`×128 / `0x42740d`×128 / `0x427c8a`×95),
+  即 `_SERIAL_*`(16..47)、`_;M*`(71..102)这类**有真实行为**(族块内做
+  `[0x68996d]` 索引 + 相邻双数组取值),不是「官方不支持」。按「无证据不猜」
+  维持 `Unimplemented`,但台账已不再把它们归类为「官方也不支持」。
+- `yssfs.dat` 非零配置的实机样本未取得(需要跑 32 位 `セーブファイル設定.exe`),
+  路径阶梯的前缀常量(`0x681c60`/`0x6825c0`)字面值也未取。
+
+## 成果 YSSD-SNAPPY-ENCODER (2026-10-30) · 存档写回按引擎代号选压缩层,新增 Snappy 编码器
+
+### 问题
+
+内核的存档写入端一直用 zlib level 1(0.495 SDK 形态),而这一代商业引擎
+(0.481,随包带 `YSSnp.dll`)的存档块是 **Google Snappy** —— 我们写出的
+`.sd` 与官方同代产物不同层。同时普查发现玩家存档的 `DNO=1024` 是**嵌套
+容器槽**,通用解压路径会报 `fmt.yssd.codec`。
+
+### 证据
+
+- 压缩层:24 个商业包存档 / 3568 块逐块解压,单块与多子块全是 Snappy
+  (块首 varint32 = 块头 `ulen`,如 `94 e4 32` → 832020);
+  `YSSnp.dll` 导出 `YSSnp_Compress`/`YSSnp_Uncompress`/
+  `YSSnp_CompressedLength`/`YSSnp_UncompressedLength`。
+- 嵌套槽:`DNO=1024` 载荷 = `u32 inner_len | u32 len_b | zlib(inner_len)`,
+  zlib 输出长度逐文件等于 `inner_len`(55376..57369),内容以 `YSSD` 开头、
+  版本 `0x1E1`、195 块 —— 完整二级容器(18/18 文件一致)。
+  其后的第二段负载不是 zlib,`len_b` 语义未定性。
+
+### 改动
+
+- `crates/yu-format/src/snappy.rs`:新增 `compress()`(varint32 + 字面量 /
+  三类复制标签;偏移按大小选 1/2/4 字节形态;字面量按 60 字节切块)。
+  不追求逐字节复刻 Google 的启发式 —— Snappy 是格式,不是规范化编码。
+- `crates/yu-format/src/yssd.rs`:`BlockCodec{Zlib,Snappy}` + `detect()`
+  (按 RFC1950 头判定)+ `encode_block_body_with` / `encode_multi_body_with`;
+  原 `encode_block_body`/`encode_multi_body` 保留为 zlib 包装(0.495 逐字节
+  回归不受影响)。模块文档补三种块形态与压缩层选择。
+- `crates/yu-save/src/state.rs`:从盘上存档学习压缩层 + `set_block_codec()`
+  显式覆盖;`flush` 按学习/显式值编码。
+- `crates/yu-engine/src/engine.rs`:`detect_block_codec()` —— 引擎根有
+  `YSSnp.dll` ⇒ Snappy,否则 zlib(引擎代号信号,优先于盘上学习)。
+- `crates/yu-format/tests/yssd_roundtrip.rs`:新增
+  `commercial_save_blocks_recompress_as_snappy`(三种块形态全覆盖)。
+- `docs/divergences/DIV-RT-056-save-nested-dno1024.md`:嵌套槽档案。
+
+### 验证(原始结果)
+
+```text
+cargo build --workspace --all-targets   → 0 error / 0 warning
+cargo test -p yu-format --lib snappy    → 5 passed(含压缩器往返)
+cargo test -p yu-format --test yssd_roundtrip commercial_save_blocks
+  → 24 文件 / 单块 3511(Snappy 3476 + zlib 35)/ 多块 57 / 嵌套 18 全部往返一致
+
+yu-cli run <0.481 商业包根> --frames 1800 --save-root <可写目录>
+  写出的 config.sd  DNO=1: clen=24985 ulen=524308 head=94 80 20(旧: 78 01)
+  写出的 kidoku.sd  DNO=1: clen=39025 ulen=832020 head=94 e4 32
+                          (官方同块 clen=39327 —— 同格式、压缩率略优)
+  写出的 voice.sd   8 块(此前该文件因写失败不存在)
+```
+
+### 残余
+
+- `DNO=1024` 的第二段负载(`len_b` 指向的字节段)语义未定性;疑为存档槽
+  缩略图/元数据,需要官方读档界面对该槽的消费路径才能定案(DIV-RT-056)。
+- 我们的 Snappy 输出与官方**不是逐字节一致**(压缩率略优 0.8%):格式合法、
+  任何合规解码器可读;若要逐字节复刻需照搬 Google 的哈希/跳步启发式,
+  目前无互操作必要。
+
+## 成果 CG-MODE-NOCASE (2026-10-30) · MODE 4/8/10..18 定案:官方固定管线无 case,按通常路径对齐
+
+### 问题
+
+DIV-GFX-002 长期挂 `unimplemented`:手册 `cg/cg.html` 列了 MODE
+4(除算)/8(差分)/10..18(Overlay..PinLight),但内核找不到对应的着色器
+本体,于是后端把这 11 种模式的图层**整层跳过**。跳过意味着画面缺层 ——
+比"用错的公式画"更糟。
+
+### 证据(0.495 `yu-ris.exe`,sha256 `4f5eefa3…`,逐条反汇编)
+
+- **状态分派链**(`FUN_00414ba4`,`0x4155dd` 起):
+  `MOV EAX,[EBP+0x18]`(MODE)→ `TEST EAX,EAX; JZ`(MODE 0 默认块)→
+  `CMP EAX,1/2/3/5/6/7/9` 依次 `JE` 到各模式块;链尾
+  `JMP 0x4158c8` 附近的通用路径 —— **4/8/10..18 没有任何 case**,
+  且该跳转**跳过 MODE 0 的状态块**(`0x41563d..0x41587d` 那段,
+  写 SRCALPHA/INVSRCALPHA/ADD)。
+- **TFACTOR 选择链**(`0x414d05` 起):`MOV EDX,[EBP+0x18]`;
+  `TEST EDX,EDX; JNZ` → 比较链只认 `{1,2,3,5,6,7,9,100,98}`(命中则
+  TFACTOR = A 灰度);其余值 `MOV EDX,0xFF000000`。
+- 结论:手册里的 Photoshop 名只是**文档**;引擎既不实现公式,也不给这些
+  值设状态 —— 它们实际继承上一层留下的 D3D 状态(顺序相关)。
+- 语料侧:商业包与 ERIS 两套语料 `CG[MODE=]` 只出现 0/2/3/5(其余为
+  表达式形态),零处使用 4/8/10..18 —— 这条修复不影响现有画面。
+
+### 改动
+
+- `crates/yu-gfx/src/layer.rs`:新增 `BlendMode::engine_effective()`
+  (11 个无 case 的值 → `Normal`);`fixed_state()` 先归约,`confidence()`
+  从 `Unimplemented` 改 `Likely`,`needs_shader()` 恒 `false`(那 4 个
+  ps_2_0 blob 是转场/缩放 pass,不是混合模式)。
+- `crates/yu-render/{soft,wgpu}`:`supported_blend()` 改为
+  `Some(mode.engine_effective())`,不再有"整层跳过"分支;
+  soft 的 `stage_reduce` / `blend_pixel_with_stage` 入口也归约,保证
+  手写公式与状态表机械一致。
+- 测试:`blend_table` 三条断言改为新不变量(19 种模式都有状态表;8 个
+  原生 case + 11 个归约);`parity_fixes` 的 `mode_update_*` 改为断言
+  MODE=4 仍可执行、层保留原始 MODE、渲染期归约。
+- 台账:`docs/gfx-unimplemented-todo.md`、`crates/yu-gfx/docs/divergences/README.md`
+  的 DIV-GFX-002 改 `fixed(no-manual)`;`docs/render-parity.md` §5.3/§5.4
+  补完整反汇编依据。
+
+### 验证(原始结果)
+
+```text
+cargo build --workspace --all-targets   → 0 error / 0 warning
+cargo test -p yu-gfx --test blend_table → 10 passed
+cargo test -p yu-gfx --test parity_fixes → 27 passed
+cargo test -p yu-backend-soft --lib     → 41 passed
+cargo test --workspace --release        → 仅 yu-trace 过期 golden(既有)
+```
+
+### 残余
+
+- 官方对无 case 模式的**真实像素**取决于上一层遗留状态(顺序相关),
+  不可复现;内核选择"通常路径"作为确定性对齐,已记入
+  `docs/render-parity.md` §5.3。若将来出现使用这些模式的语料,需按官方
+  逐帧截图确认该近似是否可接受。
+
+## 成果 WINDOW-MINMAX (2026-10-30) · `WINDOW[MAXMODE/MINMODE]` 归类落地,商业包 1800 帧 UNIMP 归零
+
+### 问题
+
+0.481 商业包 1800 帧只剩 1 条未实现诊断:
+
+```text
+UNIMP [gfx] gfx.window.unsupported @ s9 pc99: WINDOW: 窗口参数未分类: MINMODE
+```
+
+脚本侧对应 `es_first.yst:169` `WINDOW[NO=0 MINMODE=0]`(首屏关掉最小化
+按钮),`es_first.yst:206` 同族 `WINDOW[NO=0 CLOSEMODE=…]`。
+
+### 取证
+
+1. **参数表(工程自证,真值层级 3)**:用新增探针
+   `cargo run -p yu-engine --example probe_cmd_params -- <root> WINDOW WINDOWINFO`
+   从两个样本工程的 `ysc.ybn` 直接读出声明序 —— 两者一致:
+   - `WINDOW`:… 14 `MINIMIZE` / 15 `MAXIMIZE` / **16 `MAXMODE` / 17 `MINMODE`**
+     / 18 `CLOSEMODE` / 19 `FLASH` / 20 `FLASHTIME` / 25 `RESIZE`;
+   - `WINDOWINFO`:… 17 `MINIMIZE` / **18 `MAXMODE` / 19 `MINMODE`** / 20 `CLOSEMODE`。
+   读写成对 ⇒ 每窗口**持久状态**,不是瞬时动作。
+2. **官方落点(REA 0.495 `FUN_00457d8c`,sha256 `4f5eefa3…`)**:
+   创建窗口时按状态算 `dwStyle` —— 基样式 `0x02CB0000`
+   (= `WS_CLIPCHILDREN|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_MAXIMIZEBOX`),
+   非主窗口改 `0x02C80000`(去掉 `0x00010000` = `WS_MAXIMIZEBOX`);
+   `DAT_008015e4`(RESIZE)额外加 `0x00040000` = `WS_THICKFRAME`。
+   即 MINMODE/MAXMODE 与 RESIZE 同族,是**窗口镶边开关**,由窗口创建
+   路径消费,不是渲染状态。
+
+### 改动
+
+- `crates/yu-gfx/src/frame.rs`:`WindowState` 增 `max_mode`/`min_mode`
+  (缺省 1 = 主窗口创建样式里两个按钮位都在)。
+- `crates/yu-gfx/src/state.rs`:`apply_window` 接受 `MAXMODE`/`MINMODE`
+  并写入窗口状态(不再进"未分类");`query_windowinfo` 增两条读回。
+- `crates/yu-gfx/tests/support/mod.rs`:测试用 `WINDOW`/`WINDOWINFO` 参数表
+  改为**真实工程槽序**(补 `WSX/WSY/MAXMODE/MINMODE/FLASH/FLASHTIME/RESIZE`,
+  `WINDOWINFO` 的 `FULLSCREENBUTTON` 更正为工程实际名 `FULLSCREEN2`)。
+- 新用例 `window_min_max_mode_round_trip_through_windowinfo`:缺省读 1 →
+  `WINDOW[MINMODE=0 MAXMODE=0]` → 读回 0,且不产生"窗口参数未分类"。
+- 台账:`docs/gfx-unimplemented-todo.md` 与
+  `crates/yu-gfx/docs/divergences/README.md` 的 DIV-GFX-037 改
+  `partial(no-manual)`,写明读写成对证据与创建样式锚点。
+
+### 验证(原始结果)
+
+```text
+cargo build --workspace --all-targets          → 0 error / 0 warning
+cargo test -p yu-gfx --test info_query         → 9 passed
+cargo test --workspace                         → 仅 yu-trace 过期 golden(既有,夹具字节在 dfa7b0b 改过)
+yu-cli run <0.481 商业包根> --frames 1800      → UNIMP 1 → 0
+yu-cli run <project-eris> --frames 200         → UNIMP 1(仅 EMOTE,deferred(master))
+```
+
+### 残余
+
+- `FLASH`/`FLASHTIME`(槽 19/20)仍未归类:语义应是任务栏闪烁
+  (`FlashWindowEx` 的 `dwFlags`/`dwTimeout`),但两个语料零使用、无 REA
+  读取点 ⇒ 维持不实现,等出现语料再取证。
+- 写侧仍是 host 边界:内核不持有 Win32 窗口,`MINMODE=0` 只改状态,
+  不实际移除桌面窗口的最小化按钮(DIV-GFX-037)。
+
+## 成果 WINDOW-MANUAL (2026-10-30) · WINDOW 三字段按手册落地 + 语料普查工具 + DIV-GFX-013 台账校正
+
+### 问题
+
+上一轮把 `MAXMODE/MINMODE` 归类后,`WINDOW` 里仍有 5 个参数被静默丢弃
+(`MINIMIZE/CLOSEMODE/ACTIVE/WSX/WSY`)。翻 0.495 手册才发现其中三个
+**本来就有页**,不该按"未取证"处理。
+
+### 取证(手册原文,`マニュアル/YU-RIS/html/window/`)
+
+`window.html` 关键词表只列 18 个:`NO/CAPTION/A/E/X/Y/Z/SX/SY/ACTIVE/
+FULLSCREEN/FULLSCREENBUTTON/MINIMIZE/CLOSEMODE/CGID/MENUID/REGIONID/DRAGID`
+—— **`WSX/WSY/MAXIMIZE/MAXMODE/MINMODE/FLASH/FLASHTIME/RESIZE` 都不在页内**。
+
+- `MINIMIZE = 値(0/1)ウィンドウの最小化(=1)／通常化(=0)を切り替えます`
+  ⇒ **切换动作**,不是按钮开关(开关是 `MINMODE`)。
+- `CLOSEMODE = 値(0～2)閉じるボタンを押したときの挙動を設定`
+- `ACTIVE = 値(0/1)ウィンドウをアクティブにする場合に１を設定`,
+  例 4 注:`ACTIVE=0` としても非アクテイブには出来ません` ⇒ 0 是无副作用值。
+- `FULLSCREENBUTTON = 値(0/1)最大化ボタンの有効(=1)／無効(=0)を設定`
+  —— 手册用这个名字,0.495 工程 `ysc.ybn` 的 `WINDOWINFO` 叫 `FULLSCREEN2`。
+
+`windowinfo.html` 读回页同样列 `MINIMIZE`(是否最小化中)与 `CLOSEMODE`
+(关闭按钮行为),`WSX/WSY/MAXMODE/MINMODE/DISPLAYNO/Z/A` 无页。
+
+### 语料普查(新探针,静态口径)
+
+新增 `crates/yu-engine/examples/census_params.rs`
+(`census_params <root> <命令名[:参数名]>…`):遍历工程全部脚本,按
+**参数声明槽名**统计命令的参数使用次数并打印 `s/pc/line` 位置。这是
+"某个无页参数到底有没有人用"的第一手依据。
+
+```text
+商业包 222 脚本 / ERIS 141 脚本
+WINDOW(ERIS):  NO 31, CAPTION 6, FULLSCREEN 5, X/Y/Z 5, CLOSEMODE 4,
+               CGID 3, SX/SY 3, WSX/WSY 3, ACTIVE 2, MAXIMIZE 2,
+               MINIMIZE 2, RESIZE 2, E 1
+CGACT(商业包 491 组 / ERIS 274 组):见 DIV-GFX-013 行
+```
+
+`MINIMIZE/MAXIMIZE` 的调用点形如 `WINDOW[NO=0 MINIMIZE=…]`(单参数、无
+伴随状态)⇒ 动作语义,与手册一致;`s12 pc629` 先 `WSX/WSY` 再 `MAXIMIZE`。
+
+### 改动
+
+- `crates/yu-gfx/src/frame.rs`:`WindowState` 增 `close_mode`(0..2);
+  `minimized` 文档改为"写侧 = `WINDOW[MINIMIZE]` 手册切换动作"。
+- `crates/yu-gfx/src/state.rs`:
+  - `apply_window`:`MINIMIZE` → `minimized`、`CLOSEMODE` → `close_mode`、
+    `ACTIVE` → 文档化无副作用、`WSX/WSY` → `outer_size`(成对校验,只给
+    一个仍报"部分更新未取证")。
+  - `query_windowinfo`:增 `CLOSEMODE`;`FULLSCREENBUTTON` 与
+    `FULLSCREEN2` 互为别名。
+- 新用例 `window_minimize_close_mode_follow_manual`(手册三条)+
+  `window_wsx_wsy_sets_outer_size_read_back_by_windowinfo`。
+- 台账:`DIV-GFX-071`(新,`fixed(手册有页)`)记 MINIMIZE/CLOSEMODE/ACTIVE/
+  WSX-WSY 的读写配对;`DIV-GFX-013` 按普查重写(soft 全量实现、wgpu 缺
+  `BLUR*/DIFFUSION/WHIRLPOOL/RASTER*`、`TEXCOPY` 手册无页且 ERIS 三处
+  全为 `ID==ID2` 自复制)。
+
+### 验证(原始结果)
+
+```text
+cargo build --workspace --all-targets        → 0 error / 0 warning
+cargo test -p yu-gfx --test info_query       → 11 passed
+cargo test --workspace                       → 仅 yu-trace 过期 golden(既有)
+yu-cli run <0.481 商业包根> --frames 1800    → UNIMP 0(WARN/ERR 0)
+yu-cli run <project-eris> --frames 200       → UNIMP 1(仅 EMOTE,deferred(master))
+soft vs wgpu 300 帧商业包 --shot            → PNG sha256 完全一致
+```
+
+### 残余
+
+- `MAXIMIZE`(ERIS 2 处)是"立刻最大化"的窗口动作,手册无页;内核只按
+  状态记录,`ShowWindow(SW_MAXIMIZE)` 交宿主(DIV-GFX-037)。
+- wgpu 的滤镜族(`BLUR*`/`DIFFUSION`/`WHIRLPOOL`/`RASTER*`)仍无 GPU 路径,
+  按 `docs/architecture/backends.md` §5.4 应补 `gpu.cpu_fallback.<action>`
+  标注或 shader;1800 帧内未被触达,两端截图目前逐字节一致。
+- `TEXCOPY/TEXSSCOPY` 手册无页、无 REA 读取点定位(0.481 侧锚点在本构建
+  不落在已分析函数内),维持 `gfx.copy.texcopy.unsupported`。
+
+## 勘误 MODE-CLASS (2026-10-30) · DIV-GFX-002 分类由 `fixed(no-manual)` 更正为 `unsupported-by-official`
+
+前一条成果(CG-MODE-NOCASE)把 MODE 4/8/10..18 记成 `fixed(no-manual)`。
+按 AGENTS.md §0 的五种终态,这是错的:**手册 `cg/cg.html` 有页**(列了
+`MODE=値(0～18)` 与 19 个名字),所以不属于"手册缺页";官方引擎又没有实现,
+所以也不是 `fixed`。正确分类 = `unsupported-by-official`。
+
+同时把证据收紧(读全了 `FUN_00414ba4` 的函数体,不再只依赖早期分派链):
+
+- 该函数按 MODE(第 5 个栈参数)走 if/else 链,分支只有 `0/1/2/3/5/6/7/9`;
+  其余 11 个值落进最后的 `else`,**只拷局部变量,一条
+  `SetTextureStageState`/`SetRenderState` 都不设**。之前写的"跳过 MODE 0
+  的状态块、落进通用路径"是错的 —— 什么都不设。
+- 手册的 19 个名字属**脚本语言参数域**(编译器接受该值),同页自带注释
+  `※覆い焼きリニア＝加算モード` 说明名字之间存在同义关系。
+- exe 里的 ps_2_0 blob 按 D3DX 编译器签名数有 **5 处**(此前台账写 4 个),
+  已命名 3 个:`YS_ShaderTest1`/`YS_TexDiffU`/`YS_TexSize`,均为转场/缩放/
+  测试 pass,没有一个对应这 11 种混合模式。
+
+配套代码改动(不改可见行为):
+
+- `BlendConfidence` 新增 `Unsupported` 变体(与 `Likely` 区分:后者是"照官方
+  状态画、差像素对拍",这里是"官方没有状态可照");11 个模式改标它,
+  `state.rs` 不挂诊断、层仍可执行。
+- 删掉 `needs_shader()` 里的 `let _ = self;` 假实现与 `_unused_shader_modes`
+  死函数(只为兼容 `json.rs` 的 `"shader"/"fixed"` 字段保留方法本体)。
+- 修正 `engine_effective()` / `fixed_state()` 的文档错位(`fixed_state` 的
+  旧文档被顶到 `engine_effective` 上)。
+
+验证:`cargo build --workspace --all-targets` 0 warning;
+`cargo test -p yu-gfx` 全绿(blend_table 10 / parity_fixes 27 / info_query 11);
+商业包 1800 帧 UNIMP 0;ERIS 200 帧仅 EMOTE(deferred);
+soft vs wgpu 300 帧 PNG sha256 与改动前完全一致(`6b2fd875…`)。

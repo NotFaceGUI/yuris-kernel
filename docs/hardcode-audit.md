@@ -23,6 +23,8 @@
 | `yu-platform/host-desktop` `TIMER_PERIOD_MS` | 1 | 实测默认 15.6ms → ~41fps;Win32 `timeBeginPeriod` 文档语义 | 命名常量 + 实测记录(`docs/perf-report.md`) |
 | `yu-platform/host-desktop` `WAIT_LEAD_US` | 800 | 实测 `WaitUntil` 晚 ~0.3ms;提前量使 p50 落在 16.66ms | 命名常量 + 实测记录 |
 | `yu-rt/src/vm.rs` `GLOBAL_RESTORE_KEYS` | `1<<12` | 掩码编码:3 族 × 4 位(`G_*1..4`) | 命名常量 + 推导注释 |
+| `yu-rt/src/sysvar.rs` `_RET` | `999` | 官方 getter `FUN_00427350` case 49 的块(`0x4279dd`,体 `0x4279de`)= `MOV EBP,0x3E7`,不读任何全局 ⇒ 恒 999 | 注释(附 REA 锚点);DIV-RT-007 |
+| `yu-format/src/yssfs.rs` `SAVE_PATH_TYPE_OFFSET` | `0x54` | 0.495 `FUN_00460c80` 取 `rec[0x15]`(0x20 个 u32 记录);只接受 0..=3 | 命名常量 + 注释 |
 
 ## 2. 无出处(命名常量 / 挂账,不改行为)
 
@@ -43,6 +45,8 @@
 | `yu-render/soft` `CacheLimits::default()` | 库默认 | 字符缓存尺寸无官方数据 | 挂账 DIV-GFX-056 相关;不改 |
 | `yu-font` `FontConfig` 默认 | SX/SY=20、color2 白 | `FUN_00464fac` | 已注释 |
 | `yu-gfx/src/text.rs` `line_height` | `SY=0 → 20` | 行距未单独取证(DIV-GFX-056) | 保留;文档已标 `Unverified` |
+| `yu-gfx/src/frame.rs` `WindowState::max_mode/min_mode` 初值 | `1` | 由创建样式含 `WS_MIN/MAXIMIZEBOX` 推得,引擎窗口结构字段初值未直接读到 | 保留;文档标 `Likely`(DIV-GFX-037) |
+| `yu-gfx/src/frame.rs` `WindowState::close_mode` 初值 | `0` | 手册 `window/window.html` 只给 0..2 与"挙動",未写初值 | 保留;文档标 `Likely`(DIV-GFX-071) |
 
 ## 3. 明确不动的“魔法数”
 

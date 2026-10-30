@@ -161,9 +161,11 @@ fixed(现 Likely 项全部定论)。
   合成微场景,绕开 attach 阻塞)。
 - 005 MID 外部掩码(通道/尺寸 REA);004 多部件几何(`+0xa6/+0xa7/+0xb0/+0x130`);
   003 FX/FY 仿射(槽位 `+0x1b0..+0x200` 绑定 + 公式)。
-- **002 MODE 4/8/10..18**:REA MODE 分发点——官方仅 4 个 ps_2_0 blob,若这些
-  MODE 分发到默认/回退 ⇒ `unsupported-by-official` 对齐;若有隐藏路径 ⇒ 实现。
-  不留悬案。
+- **002 MODE 4/8/10..18**:**已结案(2026-10-30)** —— `FUN_00414ba4`
+  全函数体(9804 B)扫描:只有对 `1/2/3/5/6/7/9` 的 `CMP`,这 11 个值不设任何
+  D3D 状态、也不因 MODE 进入 HLSL effect 块(`0x416ad1` 是 effect 指针读取,
+  按转场条件进入)⇒ `unsupported-by-official`,内核归约到通常路径。
+  证据见 `docs/shader-parity.md` §3.2 / `docs/render-parity.md` §5.3。
 终态:DIV-GFX 全表归五种终态。
 
 ### B13 · ypf 容器全分支 + 格式收口

@@ -226,10 +226,17 @@ root(空名) → S0(容器, vol=256, E=1)
     SAVE[FILE="gsd.sd"]
 ```
 
-- 块格式:`YSSD v0x1E0` + 0x400 项偏移表 + 块(`dno u32 + btype u8 +
-  strict u8 + var u16 + clen u32 + ulen u32 + zlib[clen]`);`btype 0` =
-  单变量(含数组),`btype 2` = 多变量组块(外层不压缩)。**官方 7 个
-  `.sd` 产物 parse→rebuild 逐字节一致**(`yu-format` `tests/yssd_roundtrip.rs`)。
+- 块格式:`YSSD v0x1E0` + 偏移表(容量取头 `+0x0C`,不写死 0x400)+ 块
+  (`dno u32 + btype u8 + strict u8 + var u16 + clen u32 + ulen u32 +
+  压缩载荷`);`btype 0` = 单变量(含数组),`btype 2` = 多变量组块
+  (外层裸子块流、内层子块各自压缩),`DNO=1024` = 嵌套容器
+  (`u32 inner_len | u32 len_b | zlib(内层 YSSD)`,见 DIV-RT-056)。
+  压缩层两代并存:**0.495 SDK 语料 = zlib level 1(`78 01`)**,
+  **0.481 商业包 = Google Snappy**(随包带 `YSSnp.dll`);读侧按实际流分流,
+  写侧按引擎代号(`YSSnp.dll` 存在 ⇒ Snappy)或同目录存档学到的层。
+  **官方 0.495 的 7 个 `.sd` 产物 parse→rebuild 逐字节一致**
+  (`yu-format` `tests/yssd_roundtrip.rs`);商业包 Snappy 块往返一致但
+  **不逐字节等同**(编码器是自写 LZ77,压缩率与官方实现略有差异)。
 - 读写闭环已用官方 `gsd.sd` 做端到端验证(`crates/yu-cli/tests/
   settings_persist.rs`,两个 `#[ignore]` 测试):
   1. `gsd_master_volume_is_loaded_and_applied`:把 `GSD(001,01)` 改成
@@ -288,6 +295,29 @@ root(空名) → S0(容器, vol=256, E=1)
   控件逐项对号(手册无页)。
 - 注意:运行时 `yscfg.dat` 的取值(如 `0100 0000` = 1)是**玩家设置**,
   不能当作工程编译配置写进 `yscfg.ybn` 的解析。
+
+## 3.1 存档路径设置 `yssfs.dat`
+
+- 文件:根目录 128 B = 32 × int32;`セーブファイル設定.exe` 写。
+- 读取链(0.495):`FUN_00460c80` 打开 `<app>\yssfs.dat`(`FUN_00469df2` →
+  `FUN_00469dc1(path, mode, 0x40)`)→ `FUN_00469ebe(rec, 4, 0x20, h)` →
+  `FUN_00469eed`,而它是标准 CRT 缓冲 `fread`(`FUN_0046950e` = `_read`,
+  `FUN_004705f9` = `_filbuf`)——**无解密**,明文定长记录。
+
+| 偏移 | 语义 |
+|---|---|
+| 0x54(`rec[0x15]`) | **`_SAVE_PATH_TYPE`**(0..=3;其余值不写全局,保持初值 0) |
+
+- 组路径阶梯(同函数):默认 `save\`;`1` ⇒ `%APPDATA%` 类前缀 +
+  `\<name>_SaveData\<name>\save\`;`2` ⇒ 用户文档类前缀 + 同上;
+  `3` ⇒ 文档类前缀 + `\My Games` + 同上。
+- getter:`FUN_00427350` case 112 = `MOVSX EBP,byte ptr [0x801324]`。
+- 内核:`yu_format::yssfs::save_path_type`(偏移与 0..=3 域)+
+  `BootConfig::save_path_type`(`yu-engine` 启动时读工程根,缺失/超域 ⇒ 0)。
+  实机样本 `yssfs.dat` 全零 ⇒ 0 ⇒ `es_first.yst` 的三个分支全不命中,
+  保留宿主注入的 `$_SAVE_PATH`(与官方一致)。
+- 残余:非零配置的实机样本未取得(改设置需要跑 32 位 `セーブファイル設定.exe`),
+  路径阶梯的前缀常量(`0x681c60`/`0x6825c0`)字面值也未取。
 
 ## 4. 未决/挂账
 

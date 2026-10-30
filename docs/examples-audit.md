@@ -54,6 +54,18 @@
   (`YURIS_SAMPLE_SDK0479/0495`);缺样本时必须显式报错/跳过计数,
   不要改成静默空跑(与 `AGENTS.md` §2 一致)。
 
+## D2. 样本环境变量一览(测试/探针共用)
+
+缺样本的用例必须显式报错或显式跳过并计数;`YURIS_REQUIRE_SAMPLES=1` 时
+禁止跳过(直接失败)。
+
+| 变量 | 指向 | 用途 |
+|---|---|---|
+| `YURIS_SAMPLE_ERIS_YSBIN` | `<project-eris>/data/ysbin` | `yu-rt` 表/脚本一致性对拍 |
+| `YURIS_SAMPLE_ERIS_ROOT` | `<project-eris>` | 存档 golden(`save/*.sd`)、工程级用例 |
+| `YURIS_SAMPLE_SDK0479` / `_SDK0495` | SDK 安装目录 | 系统变量 ABI / 命令表跨版本核对 |
+| `YURIS_SAMPLE_PAC481` | 商业包根(`pac/` 多包布局) | `yu-engine` 包布局断言;`yu-format` 存档块压缩层往返(0.481 = Snappy) |
+
 ## E. 不动的宿主证据工具
 
 `crates/yu-platform/host-desktop/examples/{scenario_probe,serve_probe}.rs`
