@@ -1,6 +1,6 @@
 //! 真实商业包布局回归(封包在文件夹里的分布形态)。
 //!
-//! 样本由 `YURIS_SAMPLE_NATSU_PAC` 指向游戏根(实测形态:`pac/` 下 7 个按
+//! 样本由 `YURIS_SAMPLE_PAC481` 指向游戏根(实测形态:`pac/` 下 7 个按
 //! 内容命名的基础包 + `update1/2` 增量层 + `ed01..04.ypf`(MPEG-PS,不是
 //! YPF))。缺样本**显式跳过并计数**,不静默通过(AGENTS.md §2)。
 
@@ -10,7 +10,7 @@ use yu_engine::project::{Project, CODEC};
 use yu_vfs::LookupKey;
 
 fn sample_root() -> Option<PathBuf> {
-    let raw = std::env::var_os("YURIS_SAMPLE_NATSU_PAC")?;
+    let raw = std::env::var_os("YURIS_SAMPLE_PAC481")?;
     let path = PathBuf::from(raw);
     path.is_dir().then_some(path)
 }
@@ -18,7 +18,7 @@ fn sample_root() -> Option<PathBuf> {
 #[test]
 fn real_game_pac_layout_is_discovered() {
     let Some(root) = sample_root() else {
-        eprintln!("SKIP[count=1] YURIS_SAMPLE_NATSU_PAC 不可用,跳过真实商业包布局断言");
+        eprintln!("SKIP[count=1] YURIS_SAMPLE_PAC481 不可用,跳过真实商业包布局断言");
         return;
     };
 

@@ -656,7 +656,7 @@ mod tests {
     }
 
     /// 商业发行版的真实布局:`pac/` 下按内容命名的多包 + 增量层 + 伪装成
-    /// `.ypf` 的影片(实测 夏ノ鎖: `pac/bn.ypf` … `pac/ed01.ypf`)。
+    /// `.ypf` 的影片(实测 0.481 商业包: `pac/bn.ypf` … `pac/ed01.ypf`)。
     #[test]
     fn pac_directory_multipack_is_discovered_and_non_ypf_is_skipped() {
         let root = temp_root("pac-multi");
