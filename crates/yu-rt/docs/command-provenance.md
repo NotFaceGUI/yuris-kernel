@@ -98,6 +98,8 @@
 | `_WINDOW_EXEC_MAX/CLOSE` | (ycd 序) | 8 读/8 帧 | `basic/svariable.html`(○) | ✅ | 内核状态,宿主窗口推入 | ✅(2026-10-19) |
 | `_WINDOW_EXEC_MIN` | 118 | 多帧(`es_scenario.yst` pc246 起) | ⛔ 手册无页(0.479/0.495 字节级) | ✅ 最小化ボタン押下状態(与 MAX 同族) | REA 0.495 getter `FUN_00427350` case 118 → `MOVSX EBP,byte [0x80191c]`;写侧 `0x446fa4` `MOV byte [0x80191c],DL`;窗口过程 `FUN_0045acdc` `SC_MINIMIZE(0xF020)` → `(char)槽号+1` | ✅ `fixed(no-manual)`(2026-10-30) |
 | `_WINDOW_EXEC_CAPTION` | 120 | 600 读(无输入普查) | ⛔ 手册无页(0.479/0.495 字节级) | ✅ `es_Scenario`:窗口尺寸再初始化的一次性标志 | REA `0x45a9d0`/`0x45a9e7`(WM_SYSCOMMAND 写 `[0x801924]`) | ✅ 宿主 setter(2026-10-23 P3;DIV-RT-047) |
+| `_SAVE_PATH_TYPE` | 112 | 3 读/1800 帧(`es_first.yst` pc6/9/12) | ⛔ 手册无页(0.479/0.495 字节级) | ✅ 存档路径策略 0..3 | REA getter `FUN_00427350` case 112 → `MOVSX EBP,byte [0x801324]`;写侧 `FUN_00460c80` 从 `yssfs.dat` 偏移 0x54 读(CRT fread 明文,只收 0..=3) | ✅ `fixed(no-manual)`(2026-10-30) |
+| `_RET` | 49 | 1 读/1800 帧 | ⛔ 手册无页(字节级) | ✅ 恒 999(「无返回值」哨兵,与 `_INT` 门限 0x3E8 相邻) | REA getter case 49 块 = `MOV EBP,0x3E7`,不读任何全局 | ✅ `fixed(no-manual)`(2026-10-30) |
 | `_KEYLAST/_MOUSELAST` | 145/146 | 0 | ⛔ 手册无页(字节级核对) | ⛔ | InputState 内部记录,读取挂号 | ⛔(DIV-RT-033) |
 | `_MOUSE_X/Y` | 133/138 | 232/234 | `basic/svariable.html` | ✅ | 输入层 | ✅(注入光标) |
 | `_KEY_*`/`_MOUSE_L..D` | 167..275 | 高 | `basic/input.html`(带符号计数器) | ✅ | 输入层 | ✅ |

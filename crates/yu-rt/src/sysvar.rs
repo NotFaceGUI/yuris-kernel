@@ -364,6 +364,17 @@ pub fn read(vm: &Vm, st: &ExecState, var: VarRef, indices: &[i64]) -> Result<Val
         // `[0x80133c]`,该字节由 `yscfg.dat` 第 10 项写入(`0x460b74` 路径),
         // 由宿主注入(缺省 0;DIV-RT-047)。
         "_WINDOW_INIT_POS" => Ok(Value::Int(vm.window_init_pos())),
+        // `_SAVE_PATH_TYPE`:手册无页;引擎 int getter `FUN_00427350` case 112
+        // 读 `[0x801324]`(`MOVSX`,有符号字节)。该全局由 `FUN_00460c80`
+        // 从 `<app>\yssfs.dat` 偏移 0x54 的 u32 写入(只接受 0..=3,其余保持
+        // 初值 0),格式与读取链见 `yu_format::yssfs`。
+        "_SAVE_PATH_TYPE" => Ok(Value::Int(vm.save_path_type())),
+        // `_RET`:手册无页;引擎 int getter `FUN_00427350` case 49 的块
+        // (表项 `0x4279dd`,实际体 `0x4279de`)是 **`MOV EBP,0x3E7`** ——
+        // 恒返回 999,不读任何全局。999 与 `_INT`/`_VARTYPE` 的分派门限
+        // `0x3E8`(变量号 ≥1000 走变量表)相邻,像是「无返回值」哨兵;
+        // 官方读侧就是这么给的,照抄,不按语料猜语义。
+        "_RET" => Ok(Value::Int(999)),
 
         // ---- 其余:手册无页或无注入来源 -----------------------------------
         _ => Err(undoc(name)),

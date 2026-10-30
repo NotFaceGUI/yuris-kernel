@@ -4430,6 +4430,57 @@ fn window_exec_caption_is_a_host_setter_round_trip() {
     );
 }
 
+/// `@_SAVE_PATH_TYPE` / `@_RET`:手册无页,但官方 getter 有确定取值。
+///
+/// - `_SAVE_PATH_TYPE`:宿主从游戏根 `yssfs.dat` 偏移 0x54 读入(官方 0.495
+///   `FUN_00460c80`,只接受 0..=3),getter 读 `[0x801324]`;
+/// - `_RET`:getter case 49 的块恒 `MOV EBP,0x3E7`,即 999,不读任何全局。
+#[test]
+fn save_path_type_and_ret_are_injected_not_unimplemented() {
+    let mut b = ProjectBuilder::new();
+    let v = with_int_var(&mut b, 0, -1);
+    let v2 = with_int_var(&mut b, 1, -1);
+    let spt = b
+        .sysvars
+        .iter()
+        .position(|(n, _, _)| *n == "_SAVE_PATH_TYPE")
+        .expect("_SAVE_PATH_TYPE") as u16;
+    let ret = b
+        .sysvars
+        .iter()
+        .position(|(n, _, _)| *n == "_RET")
+        .expect("_RET") as u16;
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, v.id))
+            .window(1, ex::get(0x40, spt)),
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, v2.id))
+            .window(1, ex::get(0x40, ret)),
+        GroupSpec::new(OP_END),
+    ]];
+    let src = b.build();
+    let cfg = BootConfig {
+        save_path_type: 3,
+        ..BootConfig::default()
+    };
+    let mut vm = Vm::boot(Box::new(src), cfg).expect("boot");
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        vm.store().read(v, &[]).unwrap(),
+        Value::Int(3),
+        "宿主注入的存档路径类型原样读回"
+    );
+    assert_eq!(
+        vm.store().read(v2, &[]).unwrap(),
+        Value::Int(999),
+        "官方 getter 恒返回 999"
+    );
+}
+
 /// `@_WINDOW_EXEC_MIN`:手册无页,但官方是真实状态变量 —— 宿主 setter 置 1,
 /// 脚本读 1 后写回 0(`fixed(no-manual)`)。
 ///

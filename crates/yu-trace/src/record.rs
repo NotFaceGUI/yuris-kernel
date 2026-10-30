@@ -668,6 +668,9 @@ impl BootSummary {
             os_sound: self.host.os_sound,
             dx_mode: self.host.dx_mode,
             window_init_pos: self.host.window_init_pos,
+            // `_SAVE_PATH_TYPE` 尚未进入 trace 头(现有样本恒 0,回放取默认值;
+            // 非零 `yssfs.dat` 的回放闭环待补)。
+            save_path_type: 0,
             rng_seed: self.host.rng_seed,
             record_events: true,
         })

@@ -17,7 +17,7 @@
 | DIV-RT-005 | 脚本执行错误后的引擎继续策略 | open | 默认槽路径已取证(DIV-RT-043:报一次+让出,任务不终止);内核现行 = Unimplemented/Recoverable 挂号后继续、Fatal 结束+记录;官方其余错误路径仍无 trace |
 | DIV-RT-006 | 输入键码 `_CODE_*` / `_INP` / `_PAD` 的码值 | fixed | REA 证结构(VK 计数表)+ 手册不变量定值;`_KEYLAST/_MOUSELAST` 已另证(DIV-RT-033) |
 | DIV-RT-007 | 工程 ycd 声明但手册无页的系统变量 | open | `_WINDOW_EXEC_CAPTION` 已收口(DIV-RT-047);**`_WINDOW_EXEC_MIN` 已收口(2026-10-30,fixed(no-manual))**:0.495 getter `FUN_00427350` case 118 → `MOVSX EBP,byte [0x80191c]`,写侧 `0x446fa4` `MOV byte [0x80191c],DL`,窗口过程 `FUN_0045acdc` 在 `WM_SYSCOMMAND & 0xFFF0 == SC_MINIMIZE(0xF020)` 写 `(char)槽号+1`;与 MAX(`0x801918`)/CLOSE(`0x801920`)/CAPTION(`0x801924`)是**连续四字节**同族、存储宽度 1 字节 ⇒ 内核按 `i8` 截断读写,新增宿主 setter `Vm::request_window_minimize`。**`_CHR` 已收口(2026-10-25,fixed(no-manual))**:按语料用法+REA `0x446b93` 取值链实现为「单字节构造」——`$_CHR(n)` 返回字节 `n` 的 1 字节字符串(非码位再编码);证据:es_Text.yst:878 用 `$_CHR(0xEF)+$_CHR(0xF3)` 匹配文本流控制码 `C`,而编译器把 `
-` 展开成 `$_TEXT(239)+$_TEXT(240)`(原始字节 0xEF 0xF0),按 Unicode 再编码恒不匹配(桌面会话实测 46,696 次挂号清零)。`_DXMODE`/`_VARTYPE`/`_SYSTEM_FRAME` 等仍 `Unimplemented` |
+` 展开成 `$_TEXT(239)+$_TEXT(240)`(原始字节 0xEF 0xF0),按 Unicode 再编码恒不匹配(桌面会话实测 46,696 次挂号清零)。**`_SAVE_PATH_TYPE` 与 `_RET` 已收口(2026-10-30,fixed(no-manual))**:前者由 `yssfs.dat` 偏移 0x54 注入(CRT fread 明文,只收 0..=3),后者 getter 恒 999。`_DXMODE`/`_VARTYPE`/`_SYSTEM_FRAME` 等仍 `Unimplemented` |
 | DIV-RT-008 | `_`(文本输出)手册无页 | fixed | 手册 basic.html ●テキスト表示有页(`_[式]`);已实现,撤销旧挂账 |
 | DIV-RT-009 | `_TIME`/`_OS_TIME` 的时区与纪元 | fixed/partial | 真实运行宿主注入本地时间基准(`_TIME` 全字段,存档现实日期);`_OS_TIME(0)` 与跨 DST 漂移仍 open |
 | DIV-RT-010 | 路径类系统变量(`_SAVE_PATH` 等) | fixed | `BootConfig::paths` + yu-cli `host_paths()` 注入;`$_PROJECT_PATH` 手册无页保持 `None` |
@@ -315,6 +315,32 @@
     `yssfs.dat` 容器格式 ⇒ 仍 `Unimplemented`(宿主注入 `$_SAVE_PATH` 为
     现行口径)。`_RET`(id 49)getter 命中 `MOV EDX,2`/`MOV EBP,0x3e7`
     常量块(不读任何全局),说明它不是状态变量,待语料语义定案。
+- **2026-10-30(`_SAVE_PATH_TYPE` / `_RET` 收口,`fixed(no-manual)`)**:两款
+  语料实测各 3 次 / 1 次挂号;取证结论:
+  - **`_SAVE_PATH_TYPE`**(id 112):getter `FUN_00427350` case 112 =
+    `MOVSX EBP,byte ptr [0x801324]`。写侧 `FUN_00460c80` 打开
+    `<app>\yssfs.dat`(`FUN_00469df2` → `FUN_00469dc1(path,mode,0x40)`),
+    用 `FUN_00469ebe(rec,4,0x20,h)` 读 0x20 个 u32 —— 该函数是加锁 +
+    `FUN_00469eed`(标准 CRT 缓冲 `fread`:`FUN_0046950e`=`_read`、
+    `FUN_004705f9`=`_filbuf`)+ 解锁,**无解密**;取 `rec[0x15]` = 偏移
+    0x54,只有 0..=3 写全局(其余保持初值 0)。组路径阶梯:默认 `save\`;
+    1/2/3 前置 `%APPDATA%`/文档类前缀 + `\<name>_SaveData\<name>\save\`,
+    3 再插 `\My Games`。落地:`yu_format::yssfs` + `BootConfig::save_path_type`
+    (启动读工程根,缺失/超域 ⇒ 0)。实机 `yssfs.dat` 全零 ⇒ 0 ⇒ 三个分支
+    全不命中,保留宿主注入的 `$_SAVE_PATH`(帧像素与修复前逐字节一致)。
+  - **`_RET`**(id 49):getter 表项 `0x4279dd`,实际体 `0x4279de` =
+    **`MOV EBP,0x3E7`** —— 恒返回 999,不读任何全局。999 与
+    `_INT`/`_VARTYPE` 的分派门限 `0x3E8`(变量号 ≥1000 走变量表 `[0x801724]`)
+    相邻,像「无返回值」哨兵;官方读侧如此,照抄。
+  - **剩余 88 个名字的取证结论(重要)**:getter 跳表 548 项里只有约 68 个
+    不同目标,~480 个 id 共享 4 个**族块**(`0x42755f`×129 / `0x4274b0`×128 /
+    `0x42740d`×128 / `0x427c8a`×95)。也就是说 `_SERIAL_*`(16..47)、
+    `_;M*`(71..102)这类**不是「没有行为」,而是走族块**(族块做
+    `[0x68996d]` 索引 + 相邻双数组取值等)。按「无证据不猜」维持
+    `Unimplemented`,但台账不再把它们当「官方也不支持」。
+  - 回归:`yu-rt` fixture `save_path_type_and_ret_are_injected_not_unimplemented`;
+    商业包 1,800 帧 `rt.sysvar.unimplemented` 由 4 → **0**;ERIS 语料 200 帧
+    该码 0 命中。
 - **复核**:`crates/yu-rt/src/sysvar.rs::undoc`;频度见 `docs/coverage-matrix.md` §3。
 
 ---

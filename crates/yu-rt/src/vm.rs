@@ -162,6 +162,14 @@ pub struct BootConfig {
     /// `yscfg.dat` 是「エンジン設定.exe」的外部设置文件,不属于 `data.ypf`;
     /// 内核不读它 ⇒ 由宿主注入(缺省 0,与 ERIS 工程一致)。DIV-RT-047。
     pub window_init_pos: i64,
+    /// `@_SAVE_PATH_TYPE`(手册无页;引擎读 `[0x801324]`)。
+    ///
+    /// 来源 = 游戏根 `yssfs.dat` 偏移 0x54 的 u32(只接受 0..=3,其余 0),
+    /// 由宿主读文件后注入:0.495 `FUN_00460c80` 打开 `<app>\yssfs.dat` 用
+    /// CRT `fread` 读 0x20 个 u32,取 `puVar2[0x15]` 写全局。int getter
+    /// `FUN_00427350` case 112 = `MOVSX EBP,byte [0x801324]`。
+    /// 缺省 0 = 文件缺失/全零(两种在官方都等价于 0)。
+    pub save_path_type: i64,
     /// `MATH[RND]` 的 MT19937 种子(引擎用 `GetTickCount`,非确定)。
     /// 缺省 5489 = MT19937 参考种子,保证同输入同输出(DIV-RT-014)。
     pub rng_seed: u32,
@@ -202,6 +210,7 @@ impl Default for BootConfig {
             os_sound: true,
             dx_mode: 0,
             window_init_pos: 0,
+            save_path_type: 0,
             rng_seed: 5489,
             // 事件流记录开关(默认开;结构体字段文档有完整说明)。
             record_events: true,
@@ -431,6 +440,8 @@ pub struct Vm {
     os_sound: bool,
     dx_mode: u32,
     window_init_pos: i64,
+    /// `@_SAVE_PATH_TYPE`(宿主从 `yssfs.dat` 读入;见 `BootConfig`)。
+    save_path_type: i64,
     /// `MATH[RND]` 的 MT19937(DIV-RT-014)。
     rng: crate::rng::Mt19937,
     record_events: bool,
@@ -696,6 +707,7 @@ impl Vm {
             os_sound: cfg.os_sound,
             dx_mode: cfg.dx_mode,
             window_init_pos: cfg.window_init_pos,
+            save_path_type: cfg.save_path_type,
             rng: crate::rng::Mt19937::new(cfg.rng_seed),
             record_events: cfg.record_events,
             handler_of,
@@ -1137,6 +1149,11 @@ impl Vm {
     /// `@_WINDOW_INIT_POS`(宿主从 `yscfg.dat` 第 10 项注入;DIV-RT-047)。
     pub fn window_init_pos(&self) -> i64 {
         self.window_init_pos
+    }
+
+    /// `@_SAVE_PATH_TYPE`(宿主从 `yssfs.dat` 偏移 0x54 读入)。
+    pub fn save_path_type(&self) -> i64 {
+        self.save_path_type
     }
 
     /// `@_TEXT_NUM`:工程文本总数。
