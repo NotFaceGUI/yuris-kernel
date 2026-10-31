@@ -12021,3 +12021,47 @@ cargo test -p yu-backend-wgpu -- --test-threads=1              # 9+14+34+1+1 全
 - `X/Y` 是否参与对齐、`ratio*0.06` 的每部件缩放语义:现按整面合成处理,
   **无 RE 锚点**。
 - `XOR`/`AND` 的 alpha 通道:当前只作用 RGB、alpha 保留下层,公式未反出。
+
+## 成果 THUMB-BGRA (2026-10-31) · 官方存档缩略图偏蓝根因:DNO3 图像块 B 段是 BGRA8,读档通道序修正
+
+现象:主人实机目检 `<game-b>` 读档界面,官方 exe 存的槽缩略图整体偏蓝,
+本内核自存自读的槽正常(DIV-GFX-071)。
+
+### 取证(真值层级 3,官方存档字节自证)
+
+解 `<game-b>` save00001–5 的 DNO3 块(探针:`workbench/tmp/yssd_img_probe.py`,
+双通道序 PNG 逐张目检):
+
+```text
+save00001 顶部1/3 均值 ch0=240.6 ch1=197.1 ch2=114.7  → BGRA=淡蓝天/RGBA=橙天
+save00003 整图 ch2>ch0 7416/7444 px                    → BGRA=暖卧室/RGBA=蓝移
+save00004 中部 600 px ch0>ch2                          → BGRA=蓝選択肢框/RGBA=橙框
+五张按 BGRA 全部自然色,按 RGBA 全部错色 → 官方 B 段 = BGRA8
+alpha:行 0/37/74 = 255、其余恒 254(全黑截图与校园场景同模式 → 采集管线痕迹)
+```
+
+旁证:官方引擎内存表面本就是 BGRA(DIV-GFX-063 滤镜矩阵权重按 B/G/R)。
+此前通道序没被钉住的原因:0.495 SDK 取证样本是纯黑屏,黑像素 R/B 互换不变。
+
+### 修法
+
+- `yu-save::image_block`:新增自逆 `swap_rb`,encode/decode 各走一次
+  (磁盘 = 官方 BGRA8,内部 `CapturedImage` 恒 RGBA8);模块文档补证据锚点
+  +「手册无页」;
+- 新增单测 `disk_pixel_order_is_official_bgra` 钉磁盘字节序;
+  `decode_accepts_0479_descriptor_layout` 手工 B 段改为官方序;
+- 端到端:生产路径 `SaveState::load_image` 解官方存档落 PNG 目检,
+  save00002/00004/00005 恢复自然色(探针 `tests/tmp_probe.rs` 用后即删)。
+
+### 验证(原始结果)
+
+```bash
+cargo test -p yu-save     # 15 passed(含 official_dno3_thumbnail_decodes_as_100x75)
+```
+
+### 残留
+
+- 写盘 alpha 与官方差 1(官方 254/行 0,37,74=255;本内核写 255):
+  渲染不可见,机理未反不照抄魔数,见 DIV-GFX-071 §残余;
+- 修复前由本内核写出的存档 B 段是 RGBA,修复后读取会互换显色,
+  开发期产物重新存档即覆盖。

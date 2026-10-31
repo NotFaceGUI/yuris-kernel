@@ -9,13 +9,19 @@
 //!   [u32 1536][u32 4][A: 1536B][B: 4B]
 //! ```
 //!
-//! - `B` = `w*h*4` 的 RGBA8(0.495 样本 100x75,即保存瞬间的画面);
+//! - `B` = `w*h*4` 的 **BGRA8**(0.495 样本 100x75,即保存瞬间的画面)。
+//!   手册无页。证据(真值层级 3,2026-10-31):`<game-b>` v494 官方
+//!   save00001–5 的 DNO=3 块按 BGRA 解释是自然色(暖色卧室/蓝天校园/
+//!   肤色),按 RGBA 解释整图红蓝互换(读档界面缩略图整体偏蓝,即
+//!   `DIV-GFX-071` 的现象);官方 alpha 行 0/37/74 = 255、其余恒 254
+//!   (与场景无关的采集痕迹),本内核落盘 alpha 仍写 255,见台账残余;
 //! - `A` = 表面描述:**0.495 的 w/h 在 +0x78/+0x7c,0.479 在 +0x68/+0x6c**
 //!   (A 长度同时从 1536 长到 1600 字节)。其余字节是两个样本共有的常量与
 //!   未初始化空洞;读取端以 `lenB == w*h*4` 定案,不依赖单一版本的偏移。
 //! - 段长表就是前两个 u32;两段紧接其后。
 //!
-//! 写入端跟随 0.495(A=1600、w/h 在 +0x78),即本内核对齐的引擎版本。
+//! 写入端跟随 0.495(A=1600、w/h 在 +0x78、像素序 BGRA),即本内核对齐的
+//! 引擎版本。内部表示(`CapturedImage`)恒为 RGBA8,编解码各做一次 R/B 互换。
 
 use yu_rt::event::CapturedImage;
 
@@ -31,7 +37,16 @@ const DESCRIPTOR_CONST: [u8; 16] = [
     0x00,
 ];
 
-/// 组装图像块 raw 载荷(`[lenA][lenB][A][B]`)。
+/// R/B 互换(自逆):磁盘 B 段是官方 BGRA8,内部表示是 RGBA8,编解码各走一次。
+fn swap_rb(pixels: &[u8]) -> Vec<u8> {
+    let mut out = pixels.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    out
+}
+
+/// 组装图像块 raw 载荷(`[lenA][lenB][A][B]`;B 段按官方像素序落 BGRA)。
 pub fn encode(image: &CapturedImage) -> Vec<u8> {
     let mut descriptor = vec![0u8; DESCRIPTOR_LEN];
     descriptor[WH_495..WH_495 + 4].copy_from_slice(&image.width.to_le_bytes());
@@ -41,7 +56,7 @@ pub fn encode(image: &CapturedImage) -> Vec<u8> {
     out.extend_from_slice(&(descriptor.len() as u32).to_le_bytes());
     out.extend_from_slice(&(image.rgba.len() as u32).to_le_bytes());
     out.extend_from_slice(&descriptor);
-    out.extend_from_slice(&image.rgba);
+    out.extend_from_slice(&swap_rb(&image.rgba));
     out
 }
 
@@ -82,7 +97,7 @@ pub fn decode(raw: &[u8]) -> Result<CapturedImage, String> {
             return Ok(CapturedImage {
                 width: w,
                 height: h,
-                rgba: b.to_vec(),
+                rgba: swap_rb(b),
             });
         }
         // 0.495 偏移命中但长度不符:继续试 0.479(表头布局不同)。
@@ -121,7 +136,7 @@ mod tests {
 
     #[test]
     fn decode_accepts_0479_descriptor_layout() {
-        // 0.479: A=1536、w/h 在 +0x68/+0x6c。
+        // 0.479: A=1536、w/h 在 +0x68/+0x6c。B 段同 0.495,按官方 BGRA 落盘。
         let img = sample(3, 2);
         let mut a = vec![0u8; 1536];
         a[WH_479..WH_479 + 4].copy_from_slice(&3u32.to_le_bytes());
@@ -130,7 +145,25 @@ mod tests {
         raw.extend_from_slice(&1536u32.to_le_bytes());
         raw.extend_from_slice(&24u32.to_le_bytes());
         raw.extend_from_slice(&a);
-        raw.extend_from_slice(&img.rgba);
+        raw.extend_from_slice(&swap_rb(&img.rgba));
+        assert_eq!(decode(&raw).unwrap(), img);
+    }
+
+    /// 磁盘像素序 = 官方 BGRA(`DIV-GFX-071`;此前官方样本是黑屏,
+    /// 通道序从未被钉过,按 RGBA 落盘导致读官方存档整图红蓝互换)。
+    #[test]
+    fn disk_pixel_order_is_official_bgra() {
+        let img = CapturedImage {
+            width: 2,
+            height: 1,
+            rgba: vec![0x10, 0x20, 0x30, 0xFF, 0x40, 0x50, 0x60, 0x80],
+        };
+        let raw = encode(&img);
+        let b_at = 8 + DESCRIPTOR_LEN;
+        assert_eq!(
+            &raw[b_at..b_at + 8],
+            &[0x30, 0x20, 0x10, 0xFF, 0x60, 0x50, 0x40, 0x80]
+        );
         assert_eq!(decode(&raw).unwrap(), img);
     }
 
