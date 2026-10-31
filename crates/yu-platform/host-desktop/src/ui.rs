@@ -1014,12 +1014,12 @@ mod tests {
     #[test]
     fn attention_banner_paints_amber_with_hint() {
         let (_actions, texts, fills) = run_ui(|ctx| {
-            attention_banner(ctx, "画面像素连续 120 宿主帧相同");
+            attention_banner(ctx, "逻辑帧停在 12 已 60 宿主帧:主任务在等待输入或阻塞");
             UiActions::default()
         });
         assert!(fills.contains(&ATTENTION_AMBER));
         assert!(
-            texts.iter().any(|text| text.contains("画面像素连续")),
+            texts.iter().any(|text| text.contains("逻辑帧停在")),
             "{texts:?}"
         );
     }

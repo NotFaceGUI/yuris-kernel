@@ -1577,16 +1577,13 @@ impl App {
         }
         let snapshot = self.diagnostics.snapshot();
         let stuck = &snapshot.stuck;
-        // 静态标题/静态场景是正常的“等输入”,只在**刚点过**且画面仍不变时
-        // 才把它当成“点了没反应”;否则琥珀横幅会一直盖在标题上。
-        let clicked_recently = snapshot
-            .input
-            .last_press_frame
-            .is_some_and(|frame| self.engine.frame().saturating_sub(frame) < 300);
+        // 画面像素静止不进横幅:静态等待界面(标题/读档/文本等点击)可以
+        // 无限期不变,窗口聚焦点击也会被记进输入计数器,“点了没命中”
+        // 的推断误报(2026-10-31 主人令剔除)。像素停帧仍作为原始读数
+        // 留在 F1 面板,不当报警。
         let notable = stuck.last_fatal.is_some()
             || stuck.logic_stall_frames >= 60
-            || (!stuck.drawable && stuck.logic_stall_frames > 5)
-            || (stuck.pixel_stall_frames >= 120 && clicked_recently);
+            || (!stuck.drawable && stuck.logic_stall_frames > 5);
         if notable {
             Some(stuck.hint())
         } else {

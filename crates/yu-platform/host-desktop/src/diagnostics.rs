@@ -21,8 +21,6 @@ use yu_log::{Diag, Loc, Severity};
 pub const MAX_DIAG_ROWS: usize = 50;
 /// 最近 Diag 明细保留条数。
 const RECENT_EVENTS: usize = 200;
-/// “画面连续 N 帧不变”进入提示的阈值(60fps ≈ 2 秒)。
-const STUCK_PIXEL_FRAMES: u64 = 120;
 /// “逻辑帧连续 N 帧未推进”的阈值。
 const STUCK_LOGIC_FRAMES: u64 = 60;
 
@@ -134,7 +132,8 @@ impl StuckReport {
     /// 人话提示:为什么画面不动 / 为什么点了没反应。
     ///
     /// 证据优先级:Fatal > 逻辑帧未推进 > 无可绘制输出 > 主任务结束 >
-    /// 画面未变化 > skipped > 正常。
+    /// skipped > 正常。画面像素静止**不是**异常信号:静态等待界面
+    /// (标题/读档/文本停着等点击)可以无限期不变,不在这里报警。
     pub fn hint(&self) -> String {
         if let Some((code, frame, where_)) = &self.last_fatal {
             return format!(
@@ -153,12 +152,6 @@ impl StuckReport {
         }
         if self.main_finished {
             return "主任务已 END:引擎不再推进(宿主应退出)".to_string();
-        }
-        if self.pixel_stall_frames >= STUCK_PIXEL_FRAMES {
-            return format!(
-                "画面像素连续 {} 宿主帧相同(逻辑帧仍在推进):在等输入;若刚点击过,说明该点击没有命中按钮",
-                self.pixel_stall_frames
-            );
         }
         if let Some(error) = &self.last_script_error {
             return format!("执行器报错:{error}");
