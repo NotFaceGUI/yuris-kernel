@@ -7,7 +7,7 @@
    │  WebSocket: RGBA 帧 / 输入 / 控制
    ▼
 本地服务  yu-cli serve(或 yu-engine serve)
-   │  同一份 native 读取路径:data.ypf 优先,散盘 data/ 为备
+   │  同一份 native 读取路径:按官方挂载规则发现数据入口
    ▼
 yu-rt(运行核) → yu-gfx(CompositorFrame) → yu-backend-soft / yu-backend-wgpu
 ```

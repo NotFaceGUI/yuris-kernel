@@ -282,7 +282,7 @@ max channel diff = 178, mean abs channel diff = 73.88
 
 ```bash
 export TEMP="<side-repo>/workbench/tmp"; TMP="$TEMP"
-export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"   # 数据入口:data.ypf 优先,data/ 为备
+export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"   # 数据入口:官方挂载规则
 export YURIS_SAMPLE_ERIS_YPF="<side-repo>/workbench/project-eris/data.ypf"
 cargo run -p yu-font --example scan_evidence
 cargo run -p yu-font --example render_reference

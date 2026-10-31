@@ -15,7 +15,7 @@
 
 ```bash
 export TEMP="<side-repo>/workbench/tmp"; TMP="$TEMP"
-export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"   # 数据入口:data.ypf 优先,data/ 为备
+export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"   # 数据入口:官方挂载规则
 export YURIS_REQUIRE_SAMPLES=1
 
 UPDATE_GFX_GOLDEN=1 cargo test -p yu-gfx --test eris_first_screen --test display_list_golden

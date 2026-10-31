@@ -176,7 +176,7 @@ wasm32-unknown-unknown` 通过。
 ```bash
 export TEMP="<side-repo>/workbench/tmp"; export TMP="$TEMP"
 export YURIS_REQUIRE_SAMPLES=1
-export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"   # 数据入口:data.ypf 优先
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"   # 数据入口:官方挂载规则
 export YURIS_WGPU_BACKEND=dx12                   # 可选
 ```
 

@@ -4,7 +4,7 @@ YU-RIS 兼容运行时，开发中。
 
 ## 状态
 
-当前主线是 4xx（0.49x）；2xx（0.292）适配中；5xx 未计划。
+当前主线是 4xx；2xx 适配中；5xx 未计划。
 
 | 版本线 | 状态           | 说明                                                                                            |
 | ------ | -------------- | ----------------------------------------------------------------------------------------------- |
@@ -21,6 +21,10 @@ YU-RIS 兼容运行时，开发中。
 | 浏览器呈现端        | 可用（调试期） |
 | Android             | 未开始         |
 
+| ![](docs/assets/case/1_t.png) | ![](docs/assets/case/1_d.png) | ![](docs/assets/case/2_d.png) |
+| ----------------------------- | ----------------------------- | ----------------------------- |
+| 0.481                         | 0.481                         | 0.494                         |
+
 ## 构建
 
 ```bash
@@ -31,23 +35,14 @@ Windows 下生成 `yu-cli.exe`；桌面宿主已实现，其他平台的完整�
 
 ## 运行
 
-数据入口：`<project>/data.ypf` 优先；没有封包时读 `<project>/data/`。
-`update1..9.ypf` 依次叠加。
+数据入口按官方挂载规则：工程根下有 `data/` 目录即开发工程布局
+（数据根 = `data/`），否则为发行版布局（数据根 = 工程根）。
+数据根及其 `pac/` 下的全部 `*.ypf` 按文件名挂载，后挂覆写先挂；
+`update1..9.ypf` 依次叠加为增量层；散盘内容目录叠在包之上。
 
 ```bash
-# headless：300 帧，写 PNG 与显示列表 JSON
-target/release/yu-cli run "<project>" --backend wgpu --frames 300 \
-  --shot target/tmp/frame.png --json target/tmp/frame.json
-
 # Windows 桌面窗口
 target/release/yu-cli run "<project>" --mode desktop --backend wgpu --debug-ui
-
-# 帧步进器:定步推进到第 348 帧停住,每帧落盘证据(JSONL + PNG)
-target/release/yu-cli run "<project>" --mode desktop --backend wgpu --debug-ui \
-  --step-to 348 --capture-dir target/tmp/blink
-
-# 帧步进器:实时跑并录制,看到问题按 F9 回溯落盘(退出也会补写)
-target/release/yu-cli run "<project>" --mode desktop --backend wgpu --debug-ui --record
 
 # 本地服务 + 浏览器呈现；默认打开浏览器，--no-open 只起服务
 target/release/yu-cli serve "<project>" --backend wgpu --port 4173
@@ -57,6 +52,10 @@ target/release/yu-cli dev "<project>" --backend wgpu --port 4173
 
 # 用例
 target/release/yu-cli case "<project>" --all
+
+# 换钥作品:显式指定脚本密钥(8 位十六进制;缺省自动探测);存档写盘压缩
+target/release/yu-cli run "<project>" --mode desktop --backend wgpu \
+  --script-key 0x1A2B3C4D --save-codec snappy
 ```
 
 ## 测试
@@ -75,7 +74,7 @@ cargo test --workspace
 
 ```mermaid
 flowchart TD
-    PROJ["工程根<br/>data.ypf 优先 / data/ 为备"]
+    PROJ["工程根<br/>发行版:*.ypf + pac/*.ypf<br/>开发工程:data/"]
     UPD["update1..9.ypf<br/>叠加挂载"]
     VFS["yu-vfs<br/>DirSource / YpfSource / Mount"]
     FMT["yu-format<br/>ysc · ysl · ysv · yst_list · yst%05d · yscfg"]
@@ -165,7 +164,6 @@ flowchart TD
   YSCOM Loader。
 - [YU-RIS-Script-Editor](https://github.com/Aionfatedio/YU-RIS-Script-Editor) —
   YSTB V5 段序、V2 版本带判定、编码自检测；未声明许可，仅事实参考，未复制代码。
-
 
 ## 相关仓库
 

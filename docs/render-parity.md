@@ -606,7 +606,7 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 
 ```bash
 export TEMP="<side-repo>/workbench/tmp"; TMP="$TEMP"
-export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"   # 数据入口:data.ypf 优先,data/ 为备
+export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"   # 数据入口:官方挂载规则
 export YURIS_REQUIRE_SAMPLES=1
 
 cargo run -p yu-rt --example gfx_census -- 2 8     # 命令/参数 census

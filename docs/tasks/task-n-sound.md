@@ -280,7 +280,7 @@ N0 证据;无证据项保持 Unimplemented + DIV。官方示例 1..12 各配一�
 ```bash
 export TEMP="<side-repo>/workbench/tmp"; export TMP="$TEMP"
 export YURIS_REQUIRE_SAMPLES=1
-export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"   # 数据入口:data.ypf 优先
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"   # 数据入口:官方挂载规则
 # REA:ghidra 在 <side-repo>/tools;分析对象 0.495 yu-ris.exe(sha256 4f5eefa3…)
 ```
 

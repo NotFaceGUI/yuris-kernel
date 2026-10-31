@@ -146,7 +146,7 @@
 ```bash
 export TEMP="<side-repo>/workbench/tmp"; export TMP="$TEMP"
 export YURIS_REQUIRE_SAMPLES=1
-export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"   # data.ypf 优先
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"   # 数据入口:官方挂载规则
 cargo test -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu
 cargo run -p yu-backend-soft  --example first_frame
 cargo run -p yu-backend-wgpu --example first_frame

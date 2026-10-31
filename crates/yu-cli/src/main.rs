@@ -213,8 +213,10 @@ yu-cli · 桌面唯一入口(headless + --mode desktop)+ 本地服务 + 用例�
                   CLICOLOR_FORCE=1 强制 on,NO_COLOR 非空强制 off)。
                   也可 --color=X 形式。
 
-数据入口(唯一约定):
-  <project-root>/data.ypf 优先;否则 <project-root>/data/;
+数据入口(官方挂载规则):
+  工程根下有 data/ 目录 = 开发工程(数据根 = data/);
+  否则 = 发行版(数据根 = 工程根)。数据根及其 pac/ 下的全部
+  *.ypf 按文件名挂载,后挂覆写先挂;update1..9.ypf 依次叠加。
   <project-root> 也可以直接是 .ypf 文件。
 
 声音:
@@ -234,7 +236,9 @@ yu-cli run · 跑工程(缺省 headless;--mode desktop 开原生窗口)
 
 共用参数(两种模式):
   --entry LABEL        入口标签(缺省 SYSTEM_START)
-  --data PATH          数据入口覆盖(缺省 data.ypf 优先,退 data/)
+  --data PATH          数据入口覆盖(文件 = 显式基础包,目录 = 数据根)
+  --script-key HEX     换钥作品显式指定脚本密钥(8 位十六进制,允许 0x
+                       前缀与分隔符;缺省 = 启动时自动探测)
   --backend soft|wgpu  渲染后端(headless 缺省 soft;desktop 缺省 wgpu,
                        wgpu 失败自动回退 soft)
   --frames N           跑 N 帧停(desktop = 验收模式,到帧关窗)
