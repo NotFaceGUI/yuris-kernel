@@ -1591,9 +1591,11 @@ fn text_on_snapshot_layer_matches_soft() {
 
 /// `CGACT[MERGE]/[MERGE2]` 走 GPU 合成,与 soft 逐像素一致。
 ///
-/// 官方 `FUN_004405a4` 把上层**表面**用通配绘制原语
-/// `DAT_00801458(surface, …, X, Y, ratio, 0)` 画到目标表面 —— 是 D3D9 的
-/// 一次带纹理 quad,不是逐像素循环。`es_SPExec.yst:341` 的
+/// 合并模型:上层**表面**画到目标表面(一次带纹理 quad,不是逐像素循环)。
+/// **勘误(2026-10-31)**:此处曾把这个模型归给 `FUN_004405a4`(0x4405a4),
+/// 那是 `EMOTE` 域处理体(依赖 YSEmote.dll),不是 CGACT 的 MERGE;CGACT
+/// 合并族的真实执行体尚未取证,当前依据是像素实测 + 手册文字。
+/// `es_SPExec.yst:341` 的
 /// `CGACT[ID=UP ID2=<快照层> MERGE=1]` 的 GPU 整数合成必须与 soft **逐字节**一致。
 ///
 /// 半透明上下层(160/128)覆盖完整公式;断言 `layer_composites≥1` 证明走的是
@@ -1978,12 +1980,9 @@ fn merge_after_rectpaint_clear_on_snapshot_writes_alpha() {
     assert_eq!(gpu_out.report.ops_drawn, soft_out.report.ops_drawn);
     assert_eq!(gpu_out.report.skipped, soft_out.report.skipped);
 
-    // 官方合并执行体(`FUN_004405a4`,REA 0.495 `0x4405a4`)把**上层**的每
-    // 部件纹理按**下层**的每部件位置 `dev->Draw(...)` 画到当前渲染目标
-    // (= 下层表面),**不读下层旧像素**;不透明度由设备固定管线混合决定。
-    // D3D9 未启用独立 alpha 混合 ⇒ alpha 也按 `a² + dst·(1−a)` 写入:
+    // 归一口径(见 `merge.wgsl` 头注;依据像素实测,非 RE):
     //   COPY2 → RECTPAINT3 SET=0(目标 alpha=0) → MERGE(上层不透明红)
-    // ⇒ 结果 alpha = 255、RGB = 红,**整层可见**。
+    // ⇒ out.a = a + la·(1−a) = 255、RGB = 红,**整层可见**。
     // 旧实现「MERGE 保留目标 alpha」会让清空后的整层 alpha=0,经 SRCALPHA
     // 混合整层消失 —— 实机表现就是眨眼/换差分闪屏(skipped=0、只有 alpha 全零)。
     let actual = pixel(&gpu_out, 8, 8);

@@ -167,9 +167,16 @@ frames >=16.7ms     p95 39.6ms       p95 11.1ms
 
 ### 3.5 `MERGE` 走 GPU
 
-**证据**:REA `FUN_004405a4` 调通配绘制原语
-`DAT_00801458(surface, …, X, Y, ratio, 0)` —— 一次带纹理 quad,不是逐像素循环;
-`X/Y` 是**绘制偏移**,不是源区域(所以只给 `X/Y` 是合法的,不该判 region.partial)。
+**证据(❌ 已推翻,2026-10-31 勘误)**:此处原写「REA `FUN_004405a4` 调通配
+绘制原语 `DAT_00801458(...)`」。`FUN_004405a4` 是 `EMOTE` 域处理体(入口检查
+`DAT_00801750` = YSEmote.dll 加载标志,`DAT_00801458` 是
+`GetProcAddress(YSEmote.dll, 0xe9)`),**不是** CGACT 的 `MERGE`。
+CGACT 合并族的真实执行体**现已定位**:`MERGE` = `FUN_0043b33c`、
+`MERGE2` = `FUN_0043b8ec`(逐行 CPU 循环,非 GPU draw),混合内核
+`0x402828` / `0x402654`,公式见 `DIV-GFX-063` §2.5「已定案公式」。
+
+仍然成立的部分(无 RE 锚点,仅手册 + 实测):合并按「一次带纹理 quad」建模,
+`X/Y` 是**绘制偏移**而非源区域(所以只给 `X/Y` 合法,不该判 region.partial)。
 
 **修法**:
 - `crates/yu-render/wgpu/src/pipelines.rs`:新增 `ensure_merge_pipeline(write_alpha)`。

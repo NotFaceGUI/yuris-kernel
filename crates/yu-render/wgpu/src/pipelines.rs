@@ -429,6 +429,18 @@ impl PipelineCache {
                         },
                         count: None,
                     },
+                    // binding 2 = 层不透明度 uniform(`[srcLayerAlpha, dstLayerAlpha]`)。
+                    // REA: MERGE `FUN_0043b33c` 只用上层,MERGE2 `FUN_0043b8ec` 两层都用。
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
         let layer_merge_pipeline_layout =
@@ -1136,8 +1148,10 @@ impl PipelineCache {
         lower: &wgpu::TextureView,
         upper: &wgpu::TextureView,
         mode: u32,
+        src_layer_alpha: u32,
+        dst_layer_alpha: u32,
     ) -> Result<wgpu::BindGroup, Diag> {
-        let uniform = [mode, 0u32, 0, 0];
+        let uniform = [mode, src_layer_alpha, dst_layer_alpha, 0];
         let buffer = wgpu::util::DeviceExt::create_buffer_init(
             &ctx.device,
             &wgpu::util::BufferInitDescriptor {
@@ -1329,13 +1343,28 @@ impl PipelineCache {
     }
 
 
-    /// 双纹理 MERGE 的 bind group(lower + upper)。
+    /// 双纹理 MERGE 的 bind group(lower + upper + 层不透明度)。
+    ///
+    /// `src_layer_alpha` / `dst_layer_alpha` 是两张源层在命令时刻的
+    /// `[层+0x80]`(0..256)。REA:`MERGE` 只用上层,`MERGE2` 两层都用;
+    /// shader 侧按 `round(a·L/256)` 折进有效像素 alpha。
     pub fn create_layer_merge_bind_group(
         &mut self,
         ctx: &GpuContext,
         lower: &wgpu::TextureView,
         upper: &wgpu::TextureView,
+        src_layer_alpha: u32,
+        dst_layer_alpha: u32,
     ) -> Result<wgpu::BindGroup, Diag> {
+        let uniform = [src_layer_alpha, dst_layer_alpha, 0u32, 0u32];
+        let buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &ctx.device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("yu-backend-wgpu merge layer alpha"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            },
+        );
         let group = ctx.checked(code::TARGET, "merge bind group", || {
             ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("yu-backend-wgpu merge bind group"),
@@ -1348,6 +1377,10 @@ impl PipelineCache {
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: wgpu::BindingResource::TextureView(upper),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buffer.as_entire_binding(),
                     },
                 ],
             })
@@ -1403,16 +1436,18 @@ impl PipelineCache {
         Ok(())
     }
 
-    /// `CGACT[MERGE/MERGE2]` 合成管线。
+    /// `CGACT[MERGE/MERGE2]` 的**旧**合成管线(2b53786 之后的帧契约不再使用)。
     ///
-    /// 官方 `FUN_004405a4` 把上层**表面**用通配绘制原语画到目标表面
-    /// (`DAT_00801458(surface, …, X, Y, ratio, 0)`),是 D3D9 的一次带纹理
-    /// quad,不是逐像素循环。这里用与图层相同的 QUAD shader + `Normal`
-    /// 混合(`SRCALPHA/INVSRCALPHA`,与引擎未开 SEPARATEALPHABLENDENABLE
-    /// 时一致):
-    /// - `MERGE`:只写 RGB ⇒ 目标 alpha 保持不变(与官方「保留下层 alpha」
-    ///   的可观测结果一致);
-    /// - `MERGE2`:连 alpha 一起写。
+    /// ⚠️ **已废弃,无调用点**。合并族现在走两个专用像素 shader:
+    /// `merge.wgsl`(MERGE,归一化 over)与 `composite.wgsl`(MERGE2/XOR/AND)。
+    /// 之所以保留这个函数而没有删除:它记录的「上层表面用一次带纹理 quad
+    /// 画到目标表面」这个**模型**在 2b 之前是对的;但函数本身用
+    /// `Normal` 混合 + 可选 alpha 写出,与现在的整数量化实现**不一致**,
+    /// 任何人接回去都会引入偏差。要么一并删除,要么先按 shader 重写。
+    ///
+    /// **勘误(2026-10-31)**:此注释曾把该模型归给官方 `FUN_004405a4`
+    /// (0x4405a4);那是 `EMOTE` 域处理体(依赖 YSEmote.dll),**不是**
+    /// CGACT 的 MERGE。合并族的真实执行体**尚未取证**。
     pub fn ensure_merge_pipeline(
         &mut self,
         ctx: &GpuContext,

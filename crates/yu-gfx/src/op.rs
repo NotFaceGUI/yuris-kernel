@@ -397,5 +397,20 @@ pub struct ImageOp {
     /// `FUN_00431d28`/`43265c`/`432e58`/`433718`/`434748`/`434b7c`
     /// (`0x430191`:`movsx ecx, byte [<层>+0x86]`)。
     pub alpha_aware: bool,
+    /// 命令时刻**上层**(`ID`)的图层不透明度 `[层+0x80]`,单位 0..256。
+    ///
+    /// 只有合并族(`MERGE`/`MERGE2`)消费它。REA 0.495:
+    /// - `MERGE` 执行体 `FUN_0043b33c` 一般路径为
+    ///   `blend(dst, src, srcLayerAlpha, span)`(`DAT_005d161c`);
+    /// - `MERGE2` 执行体 `FUN_0043b8ec` 一般路径为
+    ///   `blend(dst, src, dstLayerAlpha, srcLayerAlpha, span)`(`DAT_005d1624`)
+    ///   —— **多一个下层的层 alpha**。
+    ///
+    /// 命令到达时快照:回放期层状态可能已被 `CG[A=…]` 改写。
+    pub source_alpha: i16,
+    /// 命令时刻**下层**(`ID2`;缺省 = 目标)的图层不透明度 `[层+0x80]`。
+    ///
+    /// 仅 `MERGE2` 消费;`MERGE` 不吃(见 [`Self::source_alpha`])。
+    pub target_alpha: i16,
     pub status: OpStatus,
 }

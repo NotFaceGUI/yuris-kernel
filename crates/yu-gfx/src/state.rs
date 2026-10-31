@@ -2327,6 +2327,10 @@ impl GfxState {
             y2: None,
             region_from_fixed: false,
             alpha_aware: false,
+            // `TRANSITION` 不是合并族,层 alpha 不参与它的 lerp
+            // (`SET` 就是混合比例);显式写 256 表示恒等,避免下游误用。
+            source_alpha: 256,
+            target_alpha: 256,
             status: OpStatus::Executable,
         });
     }
@@ -2743,6 +2747,22 @@ impl GfxState {
             .nodes
             .get(&source)
             .is_some_and(|n| n.layer.alpha_aware);
+        // 合并族的层不透明度(`[层+0x80]`):命令到达时快照。
+        // `MERGE` `FUN_0043b33c` 只用上层的;`MERGE2` `FUN_0043b8ec` 两层都用。
+        // 层不存在时取 256(官方 `[层+0x80]` 的「不透明」缺省):合并族在
+        // 层被 `CGEND` 删掉后仍会拿到未实现状态,缺省值只影响那条已废弃的
+        // 记录,不改变任何可见像素。// 缺省
+        let source_layer_alpha = self
+            .nodes
+            .get(&source)
+            .map(|n| n.layer.alpha)
+            .unwrap_or(256); // 缺省
+        let target_layer_alpha = target
+            .as_ref()
+            .or(Some(&source))
+            .and_then(|id| self.nodes.get(id))
+            .map(|n| n.layer.alpha)
+            .unwrap_or(256); // 缺省
         // 官方 `RECTPAINT/2/3` 处理块在参数值 `>= 2` 时置 `[层+0x86]=1`
         // (`0x42df4b` 的 64 位比较 + `0x42df5b` 的 `c6 80 86..01`),
         // `RESIZE` 执行体改尺寸后也置 1 —— 两者都让该层像素从此带有效 alpha。
@@ -2769,6 +2789,8 @@ impl GfxState {
             y2,
             region_from_fixed,
             alpha_aware,
+            source_alpha: source_layer_alpha,
+            target_alpha: target_layer_alpha,
             status,
         });
         if marks_alpha {

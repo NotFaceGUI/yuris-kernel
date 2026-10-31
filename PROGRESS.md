@@ -11492,3 +11492,382 @@ cargo build --workspace --all-targets        → 0 error
   一次失败(约 1/6 观察到 2 次,20 轮压测未复现),症状是 GPU 表面只剩清屏色
   (该层没画上),单独跑该用例 8/8 通过、`--test-threads=1` 亦无失败。疑与
   同时创建多个 wgpu device 的驱动侧竞争有关,尚未定位。
+
+## 成果 MERGE-ALPHA-FIX (2026-10-31) · 眨眼「眼罩」根因:MERGE 下层 RGB 未按 alpha 预乘 + 对 0x4405a4 的错误归因勘误
+
+### 症状
+
+`<game-b>` 立绘眨眼中间帧,眼睛周围出现沿差分轮廓的**不规则缝隙/色块**
+(用户原始描述:「差分没贴好导致的眼罩形状」「不规则缝隙」),眨眼结束消失。
+两个后端都复现(wgpu 与 soft 同式,所以软硬对比发现不了)。
+
+### 根因(像素级实测)
+
+`es_SPExec.yst` 的 `es.SP.PRO.LOADCG` 差分合成链路为
+`COPY2 → RECTPAINT3 SET=0 → MERGE`。实测该链路两张**真实输入**:
+
+| 侧 | 实测事实 |
+|---|---|
+| 下层 `SPLBUF702`(立绘缓冲 1332×3351) | 眼睛区域 26773 个像素 `alpha==0` 但 **RGB 非零**(均值 159,117,122)——素材 PNG 在透明区带残留色 |
+| 上层 `sp.tmpB`(差分图,同尺寸) | 同区域 15426 个像素 alpha 在 1..254(抗锯齿边),20092 个 alpha=255 |
+
+旧式 RGB 为 `cl·(1−a) + cu·a`:**下层 RGB 按 `(1−a)` 全权重混入,完全不看下层
+alpha**。于是差分抗锯齿边(a≈128)处,下层那些「看不见的脏色」被按 50% 拉进
+可见区 —— 数值形态:
+
+```text
+下层透明处 RGB=(159,117,122),上层 alpha=128 的纯红差分:
+  旧式  → [207, 58, 61]   ← 绿/蓝通道被残色污染(就是那圈缝隙)
+  正确  → [255,  0,  0]
+```
+
+更早的 2b53786 版本还把 alpha 写成 `a² + la·(1−a)`,在 a=128 时得 191,
+让整条差分轮廓变半透明,叠加后同样露出下层。
+
+### 修法:归一化 over(下层按自身 alpha 预乘)
+
+```text
+ao_scaled = a·255 + la·(255−a)                    // 结果不透明度 ×255
+num       = cu·a·255 + cl·la·(255−a)              // 下层按 la 加权
+value     = (2·num + ao_scaled) / (2·ao_scaled)   // round-half-up
+```
+
+三条约束唯一确定它:
+1. **不可见像素不许泄色**:`la=0` ⇒ 贡献恒 0(本 bug 的主因);
+2. **下层不透明时是标准 over**:`la=255` ⇒ `ao=255`、`co=cu·a+cl·(1−a)`,
+   与 2b53786 之前的 `out.a = lower.a` 逐位相同;
+3. **清空后仍可见**:`RECTPAINT3 SET=0` ⇒ `la=0` ⇒ `ao=a`(41ca861 的症状)。
+
+两后端同步改:`merge.wgsl`(`MERGE`)、`composite.wgsl` mode 0(`MERGE2`)、
+soft `apply_merge` / `apply_merge_at`(含其 f64 参考实现一起改成精确有理数,
+否则 `.5` 边界会差 1)。
+
+### 勘误:`0x4405a4` 不是 CGACT 的 MERGE
+
+本节顺带纠正一处**贯穿仓库的错误归因**(此前 `plan.rs` / `imagefilters.rs` /
+`render.rs` / `pipelines.rs` / `tests/wgpu.rs` / `DIV-GFX-063` / `DIV-GFX-066` /
+`H-SPRITE-PARITY` 都写着「官方合并执行体 `FUN_004405a4`」):
+
+- `FUN_004661ec`(PE 0.495,`0x4661ec`)是运行时库绑定:
+  `DAT_00801380 = LoadLibraryA("YSEmote.dll")`,
+  `DAT_00801458 = GetProcAddress(..., 0xe9)`。
+- `FUN_004405a4` 入口第一句检查 `DAT_00801750`(YSEmote.dll 加载成功标志),
+  它调用的 `DAT_00801458` 正是上面绑定的 **E-mote 绘制函数**。
+- `.ycd` 命令表 + 分派表 `0x7ace20` 交叉验证:opcode 12 = `EMOTE` →
+  `[0x7ace50] = 0x4405a4`;opcode 11 = `ELSE` → `[0x7ace4c] = 0x4404f0`。
+- ⇒ `0x4405a4` 是 **`EMOTE` 域处理体**(仓库里
+  `crates/yu-rt/docs/domain-event-contracts.md:177` 早就记对了),
+  `0x4404f0` 是 **`ELSE`**;两者都不是 MERGE/MERGE2。
+- **CGACT 分派器 = `0x42c4a4`**(`[0x7ace28]`,opcode 2)。
+
+以上 8 处引用均已改成勘误注记,不再作为依据。**CGACT 合并族的执行体仍未定位**;
+当前实现依据只有「像素实测 + 手册文字」两条,已如实记入 `DIV-GFX-063` §2.5。
+
+### 验证(原始结果)
+
+```bash
+cargo build --workspace --all-targets        # Finished
+cargo test -p yu-backend-soft --lib          # 57 passed
+cargo test -p yu-backend-wgpu -- --test-threads=1
+  # surfaces 12 passed / wgpu 34 passed / 其余 4 组全 ok
+```
+
+新增/改写的门禁:
+
+| 用例 | 断言 |
+|---|---|
+| `merge_does_not_leak_hidden_lower_rgb_at_antialiased_edges`(wgpu) | 下层透明带残色 + 上层抗锯齿边 ⇒ 不泄色,且与 soft **逐字节**一致 |
+| `merge_ignores_hidden_lower_rgb_where_lower_is_transparent`(soft) | 下层 alpha=0 ⇒ 其 RGB 一个权重都不占 |
+| `merge_over_opaque_lower_is_plain_interpolation`(soft) | 下层不透明 ⇒ 标准 over(255 / 130,75,110) |
+| `merge_writes_alpha_so_cleared_target_stays_visible`(soft) | 清空后仍可见 |
+| `merge_span_optimization_is_bit_exact`(soft) | 快路径 == 精确 f64 参考,64 组随机样本 0 差异 |
+
+**反向验证**:把式子改回 2b 的 `a²+…` ⇒ `merge_does_not_leak…` 与
+`merge_ignores_hidden…` 均失败(实测 `[207,58,61]` vs 期望 `[255,0,0]`);
+恢复修复后全绿。
+
+**实机验收**(`<game-b>`,固定步长推到逻辑帧 1400,逐帧落盘 1400 张):
+
+```text
+眨眼序列 f1011..f1021(眼睛区 bbox (455,141)-(630,288),逐帧平滑渐变):
+  全图最长直线状高梯度段 = 8px(横 8 / 竖 7),无直边色块
+  区域逐行最长连续高梯度段 = 4~5px(睫毛等正常细节)
+```
+
+### 残留
+
+- **`MERGE2` 与 `MERGE` 目前实现完全相同**(都是归一化 over),这**违反手册**
+  (`cg/cgact.html` 例 23/24:`MERGE` 只反映上层不透明度、`MERGE2` 两者都反映)。
+  差异尚未定案:CGACT 分派器 `0x42c4a4` 内,MERGE 参数标志 `0x684182` 与
+  MERGE2 的 `0x684183` 各自位于相邻的独立代码块,每块压 5 个栈参后调一个
+  执行体 —— **块结构已确证,执行体入口尚未解开**(本轮回溯到的两个候选地址
+  落在同一个大函数体内,Call 目标需重新精确解码)。
+- `X/Y` 是否参与合并对齐、`ratio*0.06` 的每部件缩放语义:仍无 RE 锚点。
+
+## 成果 MERGE-EXEC-RE (2026-10-31) · MERGE / MERGE2 执行体取证落定:分派链、混合内核与层 alpha 差异
+
+### 取证链(0.495 `yu-ris.exe`,sha256 `4f5eefa3…81138f`,Ghidra 12.1.4)
+
+前一轮把 `0x4405a4` 误认为 MERGE,已勘误(那是 `EMOTE`)。本轮从 `.ycd` 命令表
+反推分派表基址,一次打通:
+
+```text
+CGACT 处理体             0x42c4a4      ([0x7ace28]; 入口 57 56 55 53 81 ec 90)
+  MERGE  参数标志        0x684182      下标 34(MERGE 在 CGACT 参数表第 34 项)
+    CALL 0x43b33c        MERGE 执行体
+  MERGE2 参数标志        0x684183      下标 35
+    CALL 0x43b8ec        MERGE2 执行体
+```
+
+分派表基址是 `0x7ace20`(不是 `0x7ace28`):opcode 12 = `EMOTE` →
+`[0x7ace50] = 0x4405a4`,`0x7ace20 + 12*4 = 0x7ace50` 闭合校验。
+opcode 11 = `ELSE` → `0x4404f0`。**这两个都不是合并族**。
+
+> 方法论勘误:此前一直用 `VA − 0x3FFC00` 做文件偏移,正确常量是
+> `VA − 0x400C00`(差 0x1000)。所有基于该错误偏移的 CALL 目标都是垃圾值
+> (曾据此推出 `0x43a2dc` = 旋转函数、`0x465c7c` = 报错函数)。
+> 本轮改用 REA `read_bytes` 作为权威字节源后全部自洽。
+
+### 两个执行体的差异(唯一实质差别)
+
+| | MERGE `FUN_0043b33c` | MERGE2 `FUN_0043b8ec` |
+|---|---|---|
+| 体范围 | 0x43b33c..0x43b4xx | 0x43b8ec..0x43bac1 (470 B) |
+| 门禁 | `lower.pixels != 0 && upper.alpha != 0` | `lower.pixels != 0`(不看上层 alpha) |
+| 全不透明快路径 (`upper.alpha == 0x100`) | `DAT_005d1618` → `LAB_004028f8` 纯拷贝 | `DAT_005d1620` → `LAB_00402758` 纯拷贝 |
+| 一般路径 | `DAT_005d161c(dst, src, **srcLayerAlpha**, span)` | `DAT_005d1624(dst, src, **dstLayerAlpha**, **srcLayerAlpha**, span)` |
+
+函数指针绑定点 `FUN_00403588`(`0x403588`),三档位深(1/2/3)绑同一组地址。
+
+**MERGE 只用上层的层 alpha;MERGE2 连下层的层 alpha 一起用** —— 与手册
+`cg/cgact.html` 例 23/24 的文字完全一致。都是 CPU 逐行循环,**不是 GPU draw**。
+
+### MERGE 混合内核的公式(手解 `LAB_00402828` = `0x402828`)
+
+```text
+dst.a' = dst.a + ((src.a − T[dst.a][src.a]) * layerAlpha) >> 8
+RGB    = dst.c + ((src.c − dst.c) * effAlpha) >> 16      // >>16 = 中间高精度
+```
+
+`T` 与第二张表在 `0x62f4de` / `0x78b6e0`,是 `.data` 的 BSS 区
+(`.data` VSZ 2.4MB 但 RAW 仅 120KB)⇒ **运行时构造,静态不可读**。
+代入 `T[d][s] = s·d/255` 后两条实测硬约束同时成立:
+
+| 场景 | 递推结果 | 期望 |
+|---|---|---|
+| 下层清空(d=0)、上层不透明(s=255) | **255** | 255 ✓(41ca861) |
+| 下层不透明(d=255)、上层 s=128 | **255** | 255 ✓(2b 眼罩) |
+| 下层不透明(d=255)、上层 s=1 | **255** | 255 ✓ |
+
+代数上 `dst + src·(1−dst) ≡ src + dst·(1−src)`(同是 `al + au − al·au`),
+**就是标准归一化 over** ⇒ 本仓库 2026-10-31 的修复方向与官方语义一致;
+2b53786 的 `a² + la·(1−a)` 被证伪(a=128 时 191,官方给 255)。
+
+### 结论与残差
+
+- ✅ MERGE / MERGE2 执行体位置、分派标志、混合参数表**全部确证**。
+- ✅ MODE 层面:两族都是**归一化 over**(本实现已对)。
+- ❌ **层 alpha(`layer+0x80` 的 short,即图层不透明度)尚未参与合成**。
+  官方把它作为独立乘数传给混合内核(上层给两族、下层只给 MERGE2);
+  本实现的合并路径没有这一层,`CGACT[A=…]`/`CG[Z]` 影响合并的用法会偏。
+  定量需要语料锚点(查找表在 BSS,静态读不到)。
+- ❌ `X/Y` 对齐语义、`ratio*0.06` 每部件缩放:仍无 RE 锚点。
+- ❌ `XOR`/`AND` 的 alpha 通道配方未反出。
+
+### 新增门禁
+
+`merge_and_merge2_agree_at_pixel_level`(wgpu `tests/surfaces.rs`):
+
+- 两侧都半透明(下层 a=100、上层 a=170),这是唯一能让「下层权重」分歧显形
+  的形态;
+- 先断言两族各自 GPU == soft **逐字节**,再断言 MERGE 与 MERGE2 的
+  **屏幕输出逐字节相同** —— 这正是「模式公式相同、差异只在图层不透明度」的
+  可执行形式;将来接入层 alpha 后,这条会自然分裂成两条,届时按 RE 的
+  参数表改成「MERGE 只吃上层层 alpha / MERGE2 两层的都吃」;
+- 侧证 RGB 既非纯 lower 也非纯 upper,排除退化路径。
+
+### 验证(原始结果)
+
+```bash
+cargo build --workspace --all-targets          # Finished in 32.61s
+cargo test -p yu-backend-soft -p yu-backend-wgpu -- --test-threads=1
+  # 57 / 15 / 1(+1 ignored) / 9 / 13 / 34 / 1 / 1 / 1  全 ok
+```
+
+文档:
+- `DIV-GFX-063` §2.5 补「MERGE / MERGE2 执行体取证」小节(分派链原文、
+  两执行体差异表、混合内核递推式、两条硬约束代入验证、残差);
+- `merge.wgsl` / `composite.wgsl` 头注注入 RE 锚点与「两族差异只在层 alpha」
+  的结论,同时保留像素实测依据(立绘透明区残色 26773 px 的那组数字)。
+
+### 下一步(若要继续对齐)
+
+层 alpha(`layer+0x80`)接入合并是最明确的缺口。可执行路径:
+① 找一段用到 `CGACT[A=…]`(或 `CG[Z]` 影响合并)的真实语料,用两后端对拍定位;
+② 或在运行时 dump `DAT_005d161c/1624` 收到的 `layerAlpha` 实参,反推调用方
+舍入口径。两条都不需要再读 BSS 查找表。
+
+## 成果 MERGE-LAYER-ALPHA (2026-10-31) · 合并族接入图层不透明度,并修掉层 alpha 不入签名导致的缓存失效
+
+> **本节公式已被同日「成果 MERGE-KERNEL-FINAL」取代。** 保留原文只为留下
+> 推导轨迹:当时把层 alpha 折进像素 alpha、并认为两族共用同一内核,两点都
+> 是错的。最终口径见下一节。
+
+### 背景
+
+上一轮 RE 定案:官方两个合并执行体唯一的实质差异是**图层不透明度**
+(`[层+0x80]`,`CG[A=n]`,0..256)——
+
+```text
+MERGE  FUN_0043b33c : blend(dst, src, srcLayerAlpha, span)
+MERGE2 FUN_0043b8ec : blend(dst, src, dstLayerAlpha, srcLayerAlpha, span)
+```
+
+即 `MERGE` 只吃上层,MERGE2 两层都吃。本仓库原先完全没有这一层。
+
+### 实现
+
+1. **`ImageOp` 新增 `source_alpha` / `target_alpha`**(i16,0..256),
+   `GfxState` 构建时**命令时刻快照**(`CG[A=…]` 可在合并之后改写,
+   回放期读会错)。`TRANSITION` 不是合并族,显式写 256。
+2. **soft**:`apply_merge_layers` → `apply_merge_at_layers`;
+   `MERGE` 的 `dstLayerAlpha` 由调用方固定 256(恒等)。
+3. **wgpu**:`merge.wgsl` 新增 binding 2 = `[srcLayerAlpha, dstLayerAlpha]`
+   uniform;`composite.wgsl` 的 mode uniform 扩成
+   `[mode, srcLayerAlpha, dstLayerAlpha]`(XOR/AND 不使用)。`plan.rs` 对
+   `MERGE` 恒传 `dst=256`。
+
+### 顺带修掉的真缺陷:层 alpha 不在缓存身份里
+
+`base_token` 与 `image_signature` 原先都只看纹理/动作参数,**不含层 alpha**。
+后果:`CG[A=…]` 只改不透明度、纹理不变时,`surfaces.sync_base` 判「基面未变」
+而跳过快照,合并结果停在旧 alpha 下算出的值 —— 画面不更新。
+两处都已把 `layer.alpha` 纳入 token/签名。
+
+发现方式:写跨后端门禁时,「改下层 A」在 GPU 与 soft 上**都不生效**,
+先误判为 shader 没传参,逐层 dump 才确认参数已到位、是前缀复用把结果吃掉了。
+
+
+---
+
+## 成果 MERGE-KERNEL-FINAL (2026-10-31) · MERGE / MERGE2 内核公式定案:两族是不同算术,层 alpha 分工相反
+
+### 起因
+
+上一轮遗留三件事:wgpu 上 MERGE2 从没真正执行过(三个 surfaces 用例失败)、
+两族在层 alpha 恒等时仍差 1 LSB、以及文档里写着「两族共用同一内核、唯一差异
+是多传一个参数」。逐项查下来,前两件是同一个根因:**内核公式解错了**。
+
+### 根因 1:shader 编译失败被静默吞掉
+
+`composite.wgsl` 里 `p` 被声明两次(先是像素坐标 `let p = vec2<i32>(...)`,
+后是 layer alpha 结果的解构)。WGSL 不允许遮蔽,shader 编译直接失败 ⇒
+`create_render_pipeline` 返回 Validation Error。
+
+而 `plan.rs` 的 `apply_image` 返回 `Err` 后被 `acc.skip(op, reason)` 记录,
+**不影响帧的成功返回** ⇒ 症状只是 `surface_passes` 计数为 0,以及
+「MERGE2 必须走 GPU 表面写入」的断言失败。定位手段:临时探针发现
+`ensure_composite_pipeline` 之后就没有下文,把 `Diag.detail` 打出来才看到
+真实原因。`wgsl_check` 用例本来就能直接报 `redefinition of 'p'`
+—— 这次的教训是**先跑 shader 解析门禁**再查逻辑。
+
+### 根因 2:两族是两套算术,不是一套
+
+重新逐字节手解两个混合内核(REA 0.495,Ghidra 12.1.4),`0x402828` 用
+**两张查找表**,`0x402654` 用**内联 idiv**:
+
+**MERGE(`0x43b33c` → `LAB_00402828`,经 `DAT_005d161c` 调用)**
+
+```text
+T   = L.a·U.a/255                  ; 查表 0x62f4de(字表,行距 0x400)
+w   = (U.a − T)·P3 >> 8            ; P3 = 上层的 [层+0x80];>>8 是 sar
+a'  = L.a + w
+U'  = U.a·256/a'                   ; 查表 0x78b6e0,a'=0 行全 0
+co  = L.c + ((U.c − L.c)·U'·P3) >> 16
+```
+
+两张表由 `FUN_0045c04c` 启动时构造:`T` 的字节版在 `0x45c60a`(magic
+`0x80808081 >> 7`,即除以 255),`U'` 在 `0x45c58f` 的
+`MOV EAX,ESI; CDQ; IDIV EBX`(即 `j*256/a`)。
+
+**MERGE2(`0x43b8ec` → `LAB_00402654`,经 `DAT_005d1624` 调用)**
+
+```text
+a1 = L.a·P4 >> 8                   ; P4 = **下层**的 [层+0x80]
+t  = (U.a + 1)·a1 >> 8             ; `+1` 在乘法左操作数上
+w  = (U.a − t)·P3 >> 8             ; P3 = **上层**的 [层+0x80]
+a' = a1 + w
+co = L.c + ((U.c − L.c)·P3 >> 8)·U.a / (a'+1)      ; idiv,向零截断
+```
+
+参数位置从入口序列回溯:`0x43b979 movsx edi,word[ebx+0x80]`(`ebx`=上层)、
+`0x43b998 movsx edx,word[ebp+0x80]`(`ebp`=下层)。
+
+**三处真实差异**
+
+| | MERGE `0x402828` | MERGE2 `0x402654` |
+|---|---|---|
+| 下层的层 alpha | 不使用 | `P4`,乘进**下层自己的**像素 alpha(`a1`) |
+| RGB 分母 | 查表 `U' = U.a·256/a'` | 内联 `idiv`,分母 `(a'+1)` |
+| 除法 | 表值 + `sar 16` | `idiv`(向零截断) |
+
+⇒ 层 alpha 全 256 时也**不是逐位相同**:全不透明时 MERGE 给 `U.c` 原值,
+MERGE2 给 `L.c + (U.c−L.c)·255/256`,差 1 LSB。这是官方自带的量化
+(分母 `+1` 防除零的副作用),不是我们的误差。
+
+上一轮把这写成「`MERGE2` 的 `L` 取 `src·dst/256`」是错的:两层 alpha 不是
+相乘的关系,而是**分工相反**——下层的乘自己的像素 alpha,上层的乘下层露出量。
+
+### 为什么旧公式也能过像素实测
+
+标准 over(`a + la(1−a)`)与官方 `L + (U−L)·U.a/a'` 在 `P3=256` 且
+`U.a`、`a'` 同源时**代数等价**,只差 1 LSB 级量化。所以靠像素实测
+(眨眼不泄色、清空后仍可见)反推出来的式子能对,但**参数乘在哪一项**推错了。
+「下层不可见处不泄色」这条硬约束在官方的 lerp 形式里是**天然成立**的
+(`L.a=0 ⇒ a'=0 ⇒ co=L.c`),不需要额外机制。
+
+### 实现
+
+- **soft** `apply_merge_at_layers`:两分支各按自己内核的整数式;新增
+  `MergeTables`(`OnceLock` 惰性构造 256×256 的 `T` 与 `U'`),热循环只做乘法
+  —— 与官方「内层循环里没有除法」同形。`merge_reference`(测试参考实现)
+  同步改为照抄同一算式。
+- **wgpu** `merge.wgsl` / `composite.wgsl`:整份重写为对应的官方形式
+  (`T`/`U'` 直接现算,WGSL 整数除法同为向零截断,不必上传查找表)。
+- **`plan.rs`**:清掉排查期插入的全部 `eprintln!` 探针。
+
+### 门禁调整
+
+| 用例 | 变更 |
+|---|---|
+| `merge2_opaque_upper_keeps_official_one_lsb_darkening`(soft) | 原 `merge2_opaque_upper_overwrites`;改为断言官方那 1 LSB 变暗,并对照 MERGE 恒等 |
+| `layer_alpha_is_the_source_blend_strength`(soft) | 原 `layer_alpha_scales_lower_contribution_only`;改为断言 P3 是源混合强度(P3=256/128/0 三档精确值) |
+| `merge_and_merge2_differ_by_at_most_one_lsb`(wgpu) | 原 `merge_and_merge2_agree_at_pixel_level`;两族改为「各自 == soft」+「互差 ≤1」 |
+
+### 验证(原始结果)
+
+```bash
+cargo build --workspace --all-targets                          # Finished in 33.10s
+cargo test -p yu-backend-wgpu --test wgsl_check                # 1 passed
+cargo test -p yu-backend-soft --lib                            # 59 passed
+cargo test -p yu-backend-soft -p yu-gfx -- --test-threads=1    # 全 ok
+cargo test -p yu-backend-wgpu -- --test-threads=1              # 9+14+34+1+1 全 ok
+```
+
+真实语料回归(wgpu,推进到第 348 帧):
+
+```text
+[+7.347s] --step-to 348 已到达(逻辑帧 348),保持暂停
+[+13.069s] stepper 共落盘 348 帧 → target/tmp/merge-verify
+[+13.069s] frames=683 avg_fps=55.3 backend=wgpu gpu targets composites=43
+[+13.069s] exit diag: total=5 stuck="推进正常" fatal=None
+```
+
+新增 diag 为 0;`composites=43` 说明合并族确实走了 GPU 表面写入。
+
+### 残留
+
+- `CG[Z]` 是否参与合并:合并结果写回 `ID2` 后层级不变,暂按不参与,无锚点。
+- `X/Y` 是否参与对齐、`ratio*0.06` 的每部件缩放语义:现按整面合成处理,
+  **无 RE 锚点**。
+- `XOR`/`AND` 的 alpha 通道:当前只作用 RGB、alpha 保留下层,公式未反出。

@@ -892,3 +892,330 @@ fn snapshot_source_reads_registry_after_render() {
     assert_eq!((surface.width, surface.height), (8, 8));
     assert_eq!(pixel_of(&surface, 0, 0), [20, 40, 60, 255]);
 }
+
+/// **立绘差分 MERGE 的门禁**(2b53786 回归锚点)。
+///
+/// 复刻 `es_SPExec.yst` 的 `es.SP.PRO.LOADCG` 真实形状:下层是立绘缓冲,
+/// 其中**不可见区域(alpha=0)带残留 RGB**;上层是整张画布大小的差分图,
+/// 只有一小块不透明、边缘抗锯齿(alpha 1..254)。
+///
+/// 断言:
+/// 1. GPU 与 soft 逐字节一致;
+/// 2. **画面上只看到差分色**:下层 alpha=0 的地方,合并后 RGB 必须等于
+///    上层的颜色。若把下层 RGB 按 `(1−a)` 全权重混入(2b53786 的写法),
+///    残留色会在抗锯齿边(a=128)处按 50% 渗出来 —— 那正是眨眼时眼睛
+///    周围那圈不规则缝隙/眼罩。
+#[test]
+fn merge_does_not_leak_hidden_lower_rgb_at_antialiased_edges() {
+    let table = table();
+    // 下层:8×8,alpha 全 0,但 RGB 是「脏」的 (159,117,122) —— 与
+    // kotoneiro 立绘缓冲实测的透明区残色同值。
+    let lower = RgbaImage::from_pixel(8, 8, Rgba([159, 117, 122, 0]));
+    // 差分:中间 4×4 不透明红,外圈 alpha=128 的抗锯齿边。
+    let mut upper = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 0]));
+    for y in 2..6u32 {
+        for x in 2..6u32 {
+            upper.put_pixel(x, y, Rgba([220, 30, 20, 255]));
+        }
+    }
+    let aa = [(1u32, 2u32), (6, 2), (1, 5), (6, 5), (2, 1), (5, 1), (2, 6), (5, 6)];
+    for (x, y) in aa {
+        upper.put_pixel(x, y, Rgba([220, 30, 20, 128]));
+    }
+    let mut lower_png = Vec::new();
+    PngEncoder::new(&mut lower_png)
+        .write_image(lower.as_raw(), 8, 8, ExtendedColorType::Rgba8)
+        .expect("encode lower");
+    let mut upper_png = Vec::new();
+    PngEncoder::new(&mut upper_png)
+        .write_image(upper.as_raw(), 8, 8, ExtendedColorType::Rgba8)
+        .expect("encode upper");
+
+    let entries = [
+        (b"base.png".as_slice(), lower_png),
+        (b"diff.png".as_slice(), upper_png),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"BASE".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"base".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"DIFF".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"diff".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"DIFF".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"BASE".to_vec())),
+                arg(&table, "CGACT", "MERGE", Value::Int(1)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let out = gpu.render_frame(&frame).expect("render");
+    let soft_out = soft.render_frame(&frame);
+
+    // 抗锯齿边:下层 alpha=0 ⇒ 只该看到差分的 (220,30,20) 以 alpha=128
+    // 铺在景上;景是黑底,所以只要**不出现下层残色的红绿比**就算过。
+    // 精确锚点:上屏 = DIFF(128) over BASE(255, 现在等于差分色) over 黑底。
+    for (x, y) in aa {
+        let px = pixel_of(&out.surface, x, y);
+        // 绿色分量是关键:下层残色 G=117,差分色 G=30。若残色泄进来,
+        // G 会明显偏高。
+        assert!(
+            px[1] <= 60,
+            "抗锯齿边 ({x},{y}) 的 G 通道泄漏了下层残色 (G=117): {px:?}"
+        );
+    }
+    // 不透明块:纯差分色。
+    let center = pixel_of(&out.surface, 3, 3);
+    assert_eq!(&center[..3], &[220, 30, 20], "不透明块必须是差分色");
+    // 完全透明区(上层 alpha=0):不应有任何可见内容(下层 alpha=0)。
+    let corner = pixel_of(&out.surface, 0, 0);
+    assert!(corner[..3].iter().all(|&c| c < 8), "透明区不该有残留: {corner:?}");
+
+    // 最后:GPU 与 soft 必须逐字节一致。
+    assert_eq!(
+        max_channel_diff(&out.surface, &soft_out.surface),
+        0,
+        "MERGE 的归一化 over 必须与 soft 逐字节一致"
+    );
+}
+
+/// **MERGE 与 MERGE2 是两个不同内核**,层 alpha≡256 时也只差 ≤1 LSB。
+///
+/// 官方执行体:`MERGE` `FUN_0043b33c`(内核 `0x402828`)、
+/// `MERGE2` `FUN_0043b8ec`(内核 `0x402654`),均逐行 CPU 循环。两者算术
+/// **不同**(见 `merge.wgsl` / `composite.wgsl` 头注):
+/// - MERGE 走两张查表(`T = L.a·U.a/255`、`U' = U.a·256/a'`),
+/// - MERGE2 走内联 `idiv` 且分母是 `(a'+1)`。
+///
+/// ⇒ 全不透明时 MERGE 给 `U.c` 原值、MERGE2 给 `L.c + (U.c−L.c)·255/256`,
+/// 自带 1 LSB 量化差。本用例锁住「两族都 == soft」+「差异不超过 1」。
+#[test]
+fn merge_and_merge2_differ_by_at_most_one_lsb() {
+    let table = table();
+    // 两侧都半透明:这是唯一能让「下层权重」分歧显形的形态。
+    let entries = [
+        (
+            b"low.png".as_slice(),
+            png_bytes_for(8, 8, Rgba([40, 120, 200, 100])),
+        ),
+        (
+            b"up.png".as_slice(),
+            png_bytes_for(8, 8, Rgba([220, 30, 20, 170])),
+        ),
+    ];
+
+    let render = |merge2: bool| -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut gpu = renderer_or_skip(store(&entries))?;
+        let mut soft = SoftRenderer::new(store(&entries));
+        let act = if merge2 { "MERGE2" } else { "MERGE" };
+        let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
+        gfx.consume_events(&[
+            VmEvent::FrameStart { frame: 1 },
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"LOW".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"low".to_vec())),
+                ],
+            ),
+            call(
+                1,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"UP".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"up".to_vec())),
+                ],
+            ),
+            call(
+                1,
+                "CGACT",
+                vec![
+                    arg(&table, "CGACT", "ID", Value::Str(b"UP".to_vec())),
+                    arg(&table, "CGACT", "ID2", Value::Str(b"LOW".to_vec())),
+                    arg(&table, "CGACT", act, Value::Int(1)),
+                ],
+            ),
+            VmEvent::FrameEnd { frame: 1 },
+        ]);
+        let frame = gfx.frame();
+        let gpu_out = gpu.render_frame(&frame).expect("render");
+        let soft_out = soft.render_frame(&frame);
+        assert_eq!(
+            max_channel_diff(&gpu_out.surface, &soft_out.surface),
+            0,
+            "{act}: GPU 必须与 soft 逐字节一致"
+        );
+        Some((gpu_out.surface.rgba.clone(), soft_out.surface.rgba.clone()))
+    };
+
+    let Some((merge_gpu, merge_soft)) = render(false) else {
+        return;
+    };
+    let Some((merge2_gpu, merge2_soft)) = render(true) else {
+        return;
+    };
+
+    // 两族只允许 ≤1 LSB 的量化差(官方内核差异),不允许更大偏离。
+    let max_delta = merge_gpu
+        .iter()
+        .zip(merge2_gpu.iter())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_delta <= 1,
+        "MERGE 与 MERGE2 的差应 ≤1 LSB(官方内核量化差),实测 {max_delta}"
+    );
+    // soft 侧同一约束(GPU/soft 各自与自身族对齐)。
+    let max_delta_soft = merge_soft
+        .iter()
+        .zip(merge2_soft.iter())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_delta_soft <= 1,
+        "soft 侧 MERGE 与 MERGE2 的差应 ≤1 LSB,实测 {max_delta_soft}"
+    );
+
+    // 侧证:两侧都半透明时,RGB 既不是纯 lower 也不是纯 upper —— 说明
+    // 归一化 over 真的在算,而不是某种退化路径。
+    // (alpha 不在这里断言:上屏面叠在不透明背景上,alpha 恒 255,
+    //  合并表面的 alpha 要读图层内容,本用例不展开。)
+    let px = &merge_gpu[(4 * 8 + 4) * 4..(4 * 8 + 4) * 4 + 4];
+    assert_ne!(&px[..3], &[40, 120, 200], "不应是纯 lower: {px:?}");
+    assert_ne!(&px[..3], &[220, 30, 20], "不应是纯 upper: {px:?}");
+}
+
+/// **层不透明度**(`[层+0x80]`,`CG[A=n]`,0..256)在合并族的语义门禁。
+///
+/// REA 0.495 两个执行体:
+/// - `MERGE`  `FUN_0043b33c`:`blend(dst, src, srcLayerAlpha, span)`
+///   ⇒ **不吃**下层的层 alpha;
+/// - `MERGE2` `FUN_0043b8ec`:`blend(dst, src, dstLayerAlpha, srcLayerAlpha, span)`
+///   ⇒ 两层都吃。
+///
+/// ## 观测点说明(踩过一次坑)
+///
+/// 不能拿「上屏结果」判两族差异:`CG[A=n]` 同时会让该层在**上屏合成**时
+/// 按 `n/256` 压暗,这条路径与合并无关(官方亦然),会把合并侧的差异掩盖掉。
+/// 所以本用例:
+///
+/// 1. 两侧都设 `A=256`,只把层 alpha 交给合并内核 —— 此时两族输出必须
+///    **逐字节相同**(模式公式一致);
+/// 2. 逐个变体都断言 GPU == soft —— 锁住「wgpu 侧传参 == soft 侧传参」;
+/// 3. 语义差异(谁吃下层)由 soft 单测
+///    `layer_alpha_is_ignored_by_merge_but_used_by_merge2` 精确覆盖,
+///    因为那里能直接读合并后的图层面、不受上屏 alpha 干扰。
+#[test]
+fn layer_alpha_semantics_match_soft() {
+    let table = table();
+    let entries = [
+        (
+            b"low.png".as_slice(),
+            png_bytes_for(8, 8, Rgba([40, 120, 200, 128])),
+        ),
+        (
+            b"up.png".as_slice(),
+            png_bytes_for(8, 8, Rgba([220, 30, 20, 200])),
+        ),
+    ];
+
+    let render = |merge2: bool, src_a: Option<i64>, dst_a: Option<i64>| -> Option<Vec<u8>> {
+        let mut gpu = renderer_or_skip(store(&entries))?;
+        let mut soft = SoftRenderer::new(store(&entries));
+        let act = if merge2 { "MERGE2" } else { "MERGE" };
+
+        let mut up_args = vec![
+            arg(&table, "CG", "ID", Value::Str(b"UP".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(b"up".to_vec())),
+        ];
+        if let Some(a) = src_a {
+            up_args.push(arg(&table, "CG", "A", Value::Int(a)));
+        }
+        let mut low_args = vec![
+            arg(&table, "CG", "ID", Value::Str(b"LOW".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(b"low".to_vec())),
+        ];
+        if let Some(a) = dst_a {
+            low_args.push(arg(&table, "CG", "A", Value::Int(a)));
+        }
+
+        let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
+        gfx.consume_events(&[
+            VmEvent::FrameStart { frame: 1 },
+            call(1, "CG", low_args),
+            call(1, "CG", up_args),
+            call(
+                1,
+                "CGACT",
+                vec![
+                    arg(&table, "CGACT", "ID", Value::Str(b"UP".to_vec())),
+                    arg(&table, "CGACT", "ID2", Value::Str(b"LOW".to_vec())),
+                    arg(&table, "CGACT", act, Value::Int(1)),
+                ],
+            ),
+            VmEvent::FrameEnd { frame: 1 },
+        ]);
+        let frame = gfx.frame();
+        let gpu_out = gpu.render_frame(&frame).expect("render");
+        let soft_out = soft.render_frame(&frame);
+        assert_eq!(
+            max_channel_diff(&gpu_out.surface, &soft_out.surface),
+            0,
+            "{act} src_a={src_a:?} dst_a={dst_a:?}: GPU 必须与 soft 逐字节一致"
+        );
+        Some(gpu_out.surface.rgba.clone())
+    };
+
+    // 1) 层 alpha 恒等(两侧 A=256):两族输出必须逐字节相同。
+    let Some(m1) = render(false, Some(256), Some(256)) else {
+        return;
+    };
+    let Some(m2) = render(true, Some(256), Some(256)) else {
+        return;
+    };
+    assert_eq!(
+        m1, m2,
+        "两侧层 alpha 恒等时,MERGE 与 MERGE2 的模式公式必须一致"
+    );
+
+    // 2) 非恒等层 alpha:两族各自都必须与 soft 一致(已在 render 里断言),
+    //    这里再确认「上层的层 alpha 确实改变了输出」——证明传参真的生效。
+    let Some(src_lo) = render(false, Some(128), Some(256)) else {
+        return;
+    };
+    assert_ne!(
+        m1, src_lo,
+        "上层 A=128 必须改变 MERGE 结果(证明层 alpha 真的传进了内核)"
+    );
+    let Some(m2_src_lo) = render(true, Some(128), Some(256)) else {
+        return;
+    };
+    assert_ne!(
+        m2, m2_src_lo,
+        "上层 A=128 必须改变 MERGE2 结果(证明层 alpha 真的传进了内核)"
+    );
+}

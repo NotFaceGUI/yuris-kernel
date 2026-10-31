@@ -875,9 +875,19 @@ fn apply_image_pixels(
 
     // ---------------- 两图层合成(MERGE/MERGE2/XOR/AND) ----------------
     if image.action.is_layer_composite() {
-        // `X/Y` 是**落点**语义,但官方合并执行体(`FUN_004405a4`,REA 0.495
-        // `0x4405a4`)按「上层 `[+0x38]` 纹理 × 下层 `[+0x34]` 部件位置」
-        // 逐部件画进下层表面,命令里的 `X/Y` 不参与对齐。
+        // `X/Y` 是**落点**语义,不参与源区域解析:合并只覆盖「上层尺寸」那块
+        // 矩形(与 CPU 参考实现 `apply_merge_at` 的循环上界一致)。
+        //
+        // **勘误(2026-10-31)**:此处曾写「官方合并执行体 `FUN_004405a4`
+        // (0x4405a4)按部件位置画、X/Y 不参与对齐」——那是**误记**。
+        // `0x4405a4` 是 `EMOTE` 域的 opcode 处理体(见
+        // `crates/yu-rt/docs/domain-event-contracts.md:177`):入口第一句
+        // 检查 `DAT_00801750`(YSEmote.dll 加载成功标志),它调用的
+        // `DAT_00801458` 是运行时 `GetProcAddress(YSEmote.dll, 0xe9)` 绑定的
+        // E-mote 绘制函数(绑定点 `FUN_004661ec`,PE 0.495)。**CGACT 的
+        // MERGE 不在那里**。CGACT 合并族的 `X/Y` 与 alpha 口径目前**都没有
+        // RE 级证据**,依据只有 ①像素实测(见 `merge.wgsl` 头注的残色泄漏
+        // 约束)②手册 `cg/cgact.html` 例 23/24 的文字。
         //
         // 2b53786 之前 wgpu 的 CPU 合并路径**完全不看 `X/Y`**,直接
         // `apply_merge` 整面合成。2b53786 引入了「非零即跳过」
@@ -887,75 +897,26 @@ fn apply_image_pixels(
         // 清掉的矩形再也没人填回 ⇒ 立绘沿轮廓出现缝隙、眨眼帧眼部留下
         // 条带。这里恢复 2b 之前的行为:忽略 `X/Y`,整面合成。
         let _ = (image.x, image.y);
-        // 下层 = 目标层**当前**表面。官方合并执行体只把上层的每部件纹理
-        // 按下层的每部件位置画到当前渲染目标,不读下层旧像素;清空是否
-        // 可见由 alpha 的混合口径决定(见 `merge.wgsl` 头注)。
+        // 下层 = 目标层**当前**表面。清空是否可见由 alpha 的混合口径决定
+        // (见 `merge.wgsl` 头注)。
         let lower_content = match contents.get(target).cloned() {
             Some(content) => content,
             None => resolve_target_base(ctx, frame, textures, gpu, targets, target, bases)?,
         };
         let upper_content = materialize(ctx, pipelines, surfaces, writes, &source, "merge upper")?;
-
-        // **诊断开关**:`YURIS_MERGE_CPU=1` 时合并族整条走 CPU(oracle)
-        // —— 读回下层/上层像素,直接调 soft 的 `apply_merge`,再上传成新
-        // 表面。用于判定「wgpu 的 GPU 合并实现是否与 soft 有偏差」。
-        if std::env::var_os("YURIS_MERGE_CPU").is_some() {
-            let (lw, lh) = (lower_content.width, lower_content.height);
-            let lower_surface =
-                crate::readback::read_texture(ctx, &lower_content.tex.texture, lw, lh)
-                    .map_err(|diag| diag.code.to_string())?;
-            let (uw, uh) = (upper_content.width, upper_content.height);
-            let upper_surface =
-                crate::readback::read_texture(ctx, &upper_content.tex.texture, uw, uh)
-                    .map_err(|diag| diag.code.to_string())?;
-            surfaces.stats_mut().cpu_fallbacks += 1;
-            let mut lower_tex = yu_render_core::Texture {
-                width: lw,
-                height: lh,
-                rgba: lower_surface.rgba.clone(),
-            };
-            let upper_tex = yu_render_core::Texture {
-                width: uw,
-                height: uh,
-                rgba: upper_surface.rgba.clone(),
-            };
-            match image.action {
-                ImageAction::Merge => {
-                    yu_backend_soft::apply_merge(&mut lower_tex, &upper_tex, false)
-                }
-                ImageAction::Merge2 => {
-                    yu_backend_soft::apply_merge(&mut lower_tex, &upper_tex, true)
-                }
-                ImageAction::Other("xor") => {
-                    yu_backend_soft::apply_bitwise(&mut lower_tex, &upper_tex, true)
-                }
-                _ => yu_backend_soft::apply_bitwise(&mut lower_tex, &upper_tex, false),
-            }
-            let id = gpu
-                .upload(ctx, lw, lh, &lower_tex.rgba, "merge cpu fallback")
-                .map_err(|diag| diag.code.to_string())?;
-            let uploaded = gpu
-                .get(id)
-                .ok_or_else(|| "gpu.upload_missing".to_string())?;
-            let tex = Rc::new(TexRef {
-                id: uploaded.id,
-                width: uploaded.width,
-                height: uploaded.height,
-                texture: uploaded.texture.clone(),
-                view: uploaded.view.clone(),
-            });
-            let content = finish_content(surfaces, tex, lw, lh, lower_content.display, None);
-            surfaces.set_content(target, content.clone());
-            contents.insert(target.clone(), content);
-            return Ok(());
-        }
-
         let lower = materialize(ctx, pipelines, surfaces, writes, &lower_content, "merge lower")?;
         let (width, height) = (lower.width, lower.height);
         if width == 0 || height == 0 {
             return Ok(());
         }
         let out = surfaces.acquire(ctx, width, height, "merge surface")?;
+        // 层不透明度(`[层+0x80]`,0..256),命令时刻快照。REA 0.495:
+        // - `MERGE`  `FUN_0043b33c`:`blend(dst, src, srcLayerAlpha, span)`
+        //   ⇒ **只用上层的**;这里给下层传 256(恒等),不让它影响结果。
+        // - `MERGE2` `FUN_0043b8ec`:`blend(dst, src, dstLayerAlpha, srcLayerAlpha, span)`
+        //   ⇒ 两层都用。
+        let src_la = u32::try_from(image.source_alpha.clamp(0, 256)).unwrap_or(256);
+        let dst_la = u32::try_from(image.target_alpha.clamp(0, 256)).unwrap_or(256);
         // `MERGE` 用已验证逐位一致的专用 shader(`merge.wgsl`);`MERGE2`/
         // `XOR`/`AND` 走 `composite.wgsl`(mode 0/1/2)。
         let (bind, pipeline) = if image.action == ImageAction::Merge {
@@ -964,7 +925,13 @@ fn apply_image_pixels(
                 .map_err(|d| d.code.to_string())?;
             (
                 pipelines
-                    .create_layer_merge_bind_group(ctx, &lower.tex.view, &upper_content.tex.view)
+                    .create_layer_merge_bind_group(
+                        ctx,
+                        &lower.tex.view,
+                        &upper_content.tex.view,
+                        src_la,
+                        256,
+                    )
                     .map_err(|diag| diag.code.to_string())?,
                 AuxPipeline::LayerMerge,
             )
@@ -977,17 +944,17 @@ fn apply_image_pixels(
             pipelines
                 .ensure_composite_pipeline(ctx)
                 .map_err(|d| d.code.to_string())?;
-            (
-                pipelines
-                    .create_composite_bind_group(
-                        ctx,
-                        &lower.tex.view,
-                        &upper_content.tex.view,
-                        mode,
-                    )
-                    .map_err(|diag| diag.code.to_string())?,
-                AuxPipeline::Composite,
-            )
+            let bg = pipelines
+                .create_composite_bind_group(
+                    ctx,
+                    &lower.tex.view,
+                    &upper_content.tex.view,
+                    mode,
+                    src_la,
+                    dst_la,
+                )
+                .map_err(|diag| diag.code.to_string())?;
+            (bg, AuxPipeline::Composite)
         };
         writes.fullscreen(&out, bind, pipeline);
         surfaces.stats_mut().surface_passes += 1;
@@ -2279,6 +2246,10 @@ fn image_signature(image: &ImageOp, source: u64, source2: u64) -> u64 {
     fnv_mix(&mut hash, source);
     fnv_mix(&mut hash, source2);
     fnv_mix(&mut hash, u64::from(image.region_from_fixed));
+    // 层不透明度参与签名:`CG[A=…]` 改它必须让前缀复用失效,否则合并结果
+    // 会停在旧值(实测:同一 `<game>` 场景里改下层 A 后画面不更新)。
+    fnv_mix(&mut hash, image.source_alpha as u16 as u64);
+    fnv_mix(&mut hash, image.target_alpha as u16 as u64);
     hash
 }
 
@@ -2354,10 +2325,15 @@ fn base_token(
 ) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     fnv_bytes(&mut hash, id.as_bytes());
-    let texture = frame
-        .layers
-        .iter()
-        .find(|layer| &layer.id == id)
+    let layer = frame.layers.iter().find(|layer| &layer.id == id);
+    // 图层不透明度是基面身份的一部分:`CG[A=…]` 只改 alpha、不改纹理,若
+    // 不入 token,`sync_base` 会认为基面没变而跳过快照 ⇒ 该层的像素动作
+    // 全部停在旧 alpha 下算出的结果。
+    fnv_mix(
+        &mut hash,
+        layer.map_or(256, |layer| layer.alpha as u16 as u64),
+    );
+    let texture = layer
         .map(|layer| &layer.texture)
         .filter(|texture| !matches!(texture, TextureRef::None))
         .or(fallback);

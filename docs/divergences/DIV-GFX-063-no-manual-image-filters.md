@@ -27,8 +27,8 @@
 | `RASTER3` | 同上(两向叠加) | 同上 | 同上 |
 | `SEPIA` | 无 | `apply_sepia` | **REA 已反编译**(见 §2.2) |
 | `XOR` / `AND` | `ID`(上层) | `apply_bitwise` | `partial(no-manual)`:RGB 逐通道,alpha 规则未取证 |
-| `MERGE` | `ID`(上层) | `apply_merge(upper,false)` | `partial`:alpha 公式仅手册文字依据 |
-| `MERGE2` | `ID`(上层) | `apply_merge(upper,true)` | `partial`:同上 |
+| `MERGE` | `ID`(上层) | `apply_merge_layers(upper,false)` | **REA 已手解内核**(§2.5 已定案) |
+| `MERGE2` | `ID`(上层) | `apply_merge_layers(upper,true)` | **REA 已手解内核**(§2.5 已定案) |
 | `RESIZE` | `X/Y/X2/Y2` | `imageop::apply_resize` | 几何已对 REA,滤波未取证 |
 | `TRIM` | `SET` | `imageop::apply_trim` | 手册有页 |
 | `MEIDO` | `SET` | `imageop::apply_meido` | `partial(no-manual)` |
@@ -192,41 +192,229 @@
    - 因此两后端在这三族(以及 §2.2 的三个)上的整数公式是逐位可对齐的,
      跨后端对拍用例在册(`saido_akarusa_sepia_match_soft`)。
    - 仍属「模型」而非取证的部分:`ROTATION`(官方 `CGACT` 链里没有像素
-     旋转执行体,应是绘制期变换)、`MERGE`/`MERGE2`(官方是 D3D9 绘制)、
-     `TRANSITION`(D3D 混合)、`SIZE/SIZE2/RESIZE`(D3D StretchRect)。
+     旋转执行体,应是绘制期变换)、`TRANSITION`(D3D 混合)、
+     `SIZE/SIZE2/RESIZE`(D3D StretchRect)。
+   - `MERGE`/`MERGE2` **不再是模型**:两者都定位到逐行 CPU 循环执行体
+     (`0x43b33c` / `0x43b8ec`)并逐字节手解了混合内核,公式已定案
+     (见 §2.5)。这也是本节旧版「官方是 D3D9 绘制」判断的勘误。
 
 4. **`XOR`/`AND` 的 alpha 通道**:当前只作用于 RGB,alpha 保留下层。
    引擎侧的混合公式未反出。
-5. **`MERGE`/`MERGE2` 的 alpha 公式**:目前依据手册文字(`MERGE` 按
-   上层 alpha 插值,`MERGE2` 直接覆盖)。缺 REA 级验证。
-   - **2026-10-28 收口(REA 证据)**:官方合并执行体 `FUN_004405a4`
-     (0.495 `yu-ris.exe`,sha256 `4f5eefa3…81138f`,Ghidra 12.1.4)的合并
-     分支(`DAT_00684174` / `DAT_00684175` 两块图层表)是:
-     ```text
-     list[i].ptr = layer[upper]->+0x38[i]      // 上层的每部件纹理
-     list[i].val = layer[lower]->+0x34[i]      // 下层的每部件位置
-     for each: dev->Draw(ptr, val, ratio*0.06, 0)   // 画到当前渲染目标
-     ```
-     `dev` = `[iVar9+0x61c]`,渲染目标由命令处理器在此前选定(即**下层
-     表面**)。⇒ **`MERGE` 只把上层“画”进下层表面,不读下层的旧像素**;
-     不透明度由 D3D9 固定管线的混合状态给出。D3D9 未启用
-     `SEPARATEALPHABLENDENABLE` ⇒ alpha 与 RGB 同因子,即
-     `a' = a² + lower_a·(1−a)`(与 `quad.wgsl` 的 Normal 同式)。
-   - 由此解释并修掉实机问题:立绘换差分的命令序
-     `COPY2 → RECTPAINT3 SET=0 → MERGE`,清空后下层 alpha=0,但 MERGE 的
-     alpha 是**写回**的(不是保留旧值)⇒ 结果 alpha = 上层 alpha,
-     整层可见。旧实现「MERGE 保留目标 alpha」会让整层 alpha=0,经 SRCALPHA
-     混合整层不可见 —— 实机症状正是眨眼/换差分闪屏(**skipped=0、RGB 正常,
-     只有 alpha 全零**)。
-   - 实现:wgpu `merge.wgsl` 的 `out.a = (a·a + la·(255−a) + 127)/255`;
-     soft `apply_merge(…, false)` 同一整数式。两后端仍逐位一致。
-   - 门禁:`merge_after_rectpaint_clear_on_snapshot_writes_alpha`(跨后端
-     一致 + 清空后仍可见)、soft 单测
+5. **`MERGE`/`MERGE2` 的 alpha 公式与执行体**:**已定案(RE 级)**。
+   两个执行体 `FUN_0043b33c` / `FUN_0043b8ec` 与两套混合内核都已逐字节
+   手解,公式见本节末尾「已定案公式」。手册 `cg/cgact.html` 例 23/24
+   (`MERGE` 只反映上层不透明度、`MERGE2` 两者都反映)与内核实际的参数
+   传递一致。
+
+   #### 勘误(2026-10-31):`0x4405a4` 不是 MERGE
+
+   本节此前把「官方合并执行体」定为 `FUN_004405a4`(0.495 `0x4405a4`),
+   并据此把 alpha 写成 `a² + la·(1−a)`。**这条归因是错的**:
+
+   - `FUN_004661ec`(PE 0.495,`0x4661ec`)是运行时库绑定,它做
+     `DAT_00801380 = LoadLibraryA("YSEmote.dll")`,`DAT_00801458 =
+     GetProcAddress(DAT_00801380, (LPCSTR)0xe9)`。
+   - `FUN_004405a4` 入口第一句就检查 `DAT_00801750`(YSEmote.dll 加载
+     成功标志),为假时直接 `return 0`;它的合并分支调用的
+     `DAT_00801458` 正是上面绑定的 **E-mote 绘制函数**。
+   - 仓库里的域事件契约也早记对了:`crates/yu-rt/docs/domain-event-contracts.md`
+     §「`EMOTE` 处理体 `0x4405a4`」。⇒ `0x4405a4` 是 **`EMOTE` 域**的
+     opcode 处理体,**不是 CGACT 的 `MERGE`**。
+   - CGACT 分派表在 `0x7ace28`(`MOV [0x7ace28+i*4], <handler>`,初始化代码
+     `0x45d1e0` 起)。表里 `0x4404f0` / `0x4405a4` 只是恰好相邻的两个槽位,
+     两者都在 E-mote 分支后面(同样以 `DAT_00801750` 为门)。
+   - **结论:CGACT 合并族的真实执行体尚未定位。** 现有实现没有任何 RE 锚点。
+
+   #### 当前实现的依据(只有两条,且都不是 RE)
+
+   1. **像素实测**(主因)。实测 kotoneiro 立绘链路
+      (`es_SPExec.yst` 的 `es.SP.PRO.LOADCG`):下层立绘缓冲 `SPLBUF702`
+      在眼睛区域有 26773 个像素 `alpha==0` 但 **RGB 非零**(均值 159,117,122;
+      素材 PNG 在透明区带残留色),上层差分图 `sp.tmpB` 在同区域有 15426 个
+      抗锯齿边像素(alpha 1..254)。若 RGB 按 `cl·(1−a)` 全权重混下层,这些
+      「看不见的脏色」会在 a≈128 处按 50% 被拉进可见区 —— 观感正是眨眼时
+      眼睛周围那圈不规则缝隙/眼罩。官方的 **lerp 形式**(见下 `co = L.c +
+      (U.c−L.c)·强度`)在 `L.a=0` 时强度恒为 0 ⇒ `co = L.c`,脏色进不了
+      可见区;这条性质是后来从内核汇编直接读出来的,与像素实测互相印证。
+   2. **两条硬约束**同时成立才唯一确定式子:
+      - 下层不透明(la=255)⇒ `ao = 255`,与 2b53786 之前的 `out.a = lower.a`
+        逐位相同;
+      - `RECTPAINT3 SET=0` 清空后(la=0)⇒ `ao = a`,差分不透明处仍可见
+        (41ca861 要修的症状)。
+      两者只有**归一化 over** 同时满足:
+      ```text
+      ao = a + la·(1−a)
+      co = (cu·a + cl·la·(1−a)) / ao
+      ```
+
+   #### 实现与门禁(2026-10-31 按内核汇编重写后)
+
+   - wgpu:`merge.wgsl`(`MERGE`)/ `composite.wgsl` mode 0(`MERGE2`),
+     两族各按自己内核的整数式(见下「已定案公式」),不再共用一套。
+   - soft:`apply_merge_at_layers` 同一组式子;`MergeTables`(`OnceLock`
+     惰性构造)复刻官方两张查找表,热循环里只剩乘法。
+   - 门禁:wgpu `merge_does_not_leak_hidden_lower_rgb_at_antialiased_edges`
+     (下层透明带残色 + 上层抗锯齿边,断言不泄色且与 soft 逐字节一致)、
+     `merge2_matches_soft`、`layer_alpha_semantics_match_soft`、
+     `merge_and_merge2_differ_by_at_most_one_lsb`;
+     soft `merge_ignores_hidden_lower_rgb_where_lower_is_transparent` /
+     `merge_over_opaque_lower_is_plain_interpolation` /
      `merge_writes_alpha_so_cleared_target_stays_visible` /
-     `merge_alpha_uses_same_factor_blend`。
-   - 残留:`MERGE2` 的 `/ao` 归一化仍按手册 + 既有实现(语料未在快照清空
-     形态下用到);`ratio*0.06` 的每部件缩放因子语义未取证(与本内核
-     X/Y=0 的用法无关)。
+     `layer_alpha_is_the_source_blend_strength` /
+     `merge2_opaque_upper_keeps_official_one_lsb_darkening`。
+
+   #### MERGE / MERGE2 执行体取证(2026-10-31,已定位)
+
+   分派链全部打通(0.495 `yu-ris.exe`,Ghidra 12.1.4):
+
+   ```text
+   CGACT 处理体          FUN 0x42c4a4   ([0x7ace28], opcode 2)
+     MERGE  参数标志      0x684182 (CGACT 参数下标 34)
+       → CALL 0x43b33c   (MERGE 执行体)
+     MERGE2 参数标志      0x684183 (CGACT 参数下标 35)
+       → CALL 0x43b8ec   (MERGE2 执行体)
+   ```
+
+   两个执行体都**不是** GPU draw,而是**逐行 CPU 循环**(与 `FUN_0043b518`
+   预处理后按跨度循环),混合内核经函数指针间接调用:
+
+   | | MERGE `FUN_0043b33c` | MERGE2 `FUN_0043b8ec` |
+   |---|---|---|
+   | 门禁 | `lower.pixels != 0 && upper.alpha != 0` | `lower.pixels != 0`(不看上层 alpha) |
+   | 全不透明快路径 (`upper.alpha == 0x100`) | `DAT_005d1618` = `LAB_004028f8`(纯拷贝) | `DAT_005d1620` = `LAB_00402758`(纯拷贝) |
+   | 一般路径 | `DAT_005d161c(dst, src, **srcLayerAlpha**, span)` | `DAT_005d1624(dst, src, **dstLayerAlpha**, **srcLayerAlpha**, span)` |
+
+   **唯一实质差异:MERGE 只传上层的层 alpha,MERGE2 连下层的层 alpha 一起传**
+   —— 与手册 `cg/cgact.html` 例 23/24 完全一致。
+
+   MERGE 混合内核(`LAB_00402828`)的 alpha 递推(手解 `0x402828` 汇编):
+
+   ```text
+   dst.a' = dst.a + ((src.a − T[dst.a][src.a]) * layerAlpha) >> 8
+   RGB    = dst.c + ((src.c − dst.c) * effAlpha) >> 16     // 高精度中间量
+   ```
+
+   其中 `T` / 第二张表是运行时构造的 256×512 查找表(*.data 的 BSS 区,
+   `0x62f4de` / `0x78b6e0`,静态不可读)。代入 `T[d][s] = s·d/255` 后,
+   两条实测硬约束**同时成立**:
+
+   | 场景 | 递推结果 | 期望 |
+   |---|---|---|
+   | 下层清空(d=0)、上层不透明(s=255) | 255 | 255 ✓(41ca861 的症状) |
+   | 下层不透明(d=255)、上层 alpha=128 | 255 | 255 ✓(2b 的眼罩症状) |
+
+   且代数上 `dst + src·(1−dst) ≡ src + dst·(1−src)`(两者都是
+   `al + au − al·au`),即**标准归一化 over**。⇒ 本仓库 2026-10-31 的修复
+   (归一化 over)与官方语义一致;2b53786 的 `a² + la·(1−a)` 被证伪
+   (a=128 时 191,而官方给 255)。
+
+   #### 已定案公式(2026-10-31,逐字节手解两套内核)
+
+   `CGACT` 处理体 `0x42c4a4` 分派后,两个执行体各自把**图层不透明度**
+   `[层+0x80]`(`CG[A=n]`,0..256)作为独立参数压给混合内核。参数位置已从
+   入口序列回溯(`0x43b979 movsx edi,word[ebx+0x80]` 中 `ebx` = 上层、
+   `0x43b998 movsx edx,word[ebp+0x80]` 中 `ebp` = 下层),记作:
+
+   | 记号 | 含义 |
+   |---|---|
+   | `srcA` | **上层**(`ID`)的 `[层+0x80]`,0..256 |
+   | `dstA` | **下层**(`ID2`)的 `[层+0x80]`,0..256 |
+
+   > 两个内核的**形参位置不同**,不要用「第 3 参」这种说法跨族套用:
+   > `MERGE` 是 `blend(dst, src, srcA, span)`(3 参);
+   > `MERGE2` 是 `blend(dst, src, dstA, srcA, span)`(4 参)——
+   > 同一个位置在 `MERGE2` 里装的是**下层**的 alpha。本节统一用 `srcA`/
+   > `dstA` 指代**角色**,与实现里的 `image.source_alpha` / `image.target_alpha`
+   > 一一对应。
+
+   ##### MERGE —— 内核 `LAB_00402828`(`DAT_005d161c`)
+
+   ```text
+   T   = L.a·U.a/255                  ; 查表 0x62f4de(字表,行距 0x400)
+   w   = (U.a − T)·srcA >> 8          ; >>8 是 sar 截断
+   a'  = L.a + w
+   U'  = U.a·256/a'                   ; 查表 0x78b6e0,a'=0 的行全 0
+   co  = L.c + ((U.c − L.c)·U'·srcA) >> 16
+   ```
+
+   两张表由 `FUN_0045c04c` 在启动时构造:
+
+   - `T`:同一算式 `la·ua/255` 的字节版在 `0x45c60a` 生成(magic
+     `0x80808081 >> 7` = 除以 255),字表 `0x62f4de` 与之同源;
+   - `U'`:`0x45c58f` 循环 `MOV EAX,ESI; CDQ; IDIV EBX`,即 `j*256/a`,
+     `ESI` 按 0x100 步进、`EBX` = 行号 1..255。
+
+   三处必须照抄的细节:
+
+   1. **RGB 是 lerp 而非加权平均**。这条天然满足「下层不可见处不泄色」:
+      `L.a=0 ⇒ w=U.a ⇒ a'=U.a ⇒ U'=256 ⇒ co=U.c`。
+   2. **`srcA` 是源混合强度**:256 = 全混合、0 = 完全不动。`dstA`
+      **完全不参与 MERGE**(执行体不传这个参数)。
+   3. **`U'` 用整数除法截断**。所以 `U.a=128` 且下层不透明时强度是
+      `128/256` 而不是 `128/255` —— 与「按 255 归一化」的直觉差一点点,
+      但这是官方的值。
+
+   两个直接推论(已写成门禁 `layer_alpha_is_the_source_blend_strength`):
+
+   - 两层都不透明 ⇒ `w=0` ⇒ `a'=255`、`U'=U.a` ⇒ 输出 = 上层原值;
+   - `srcA=0` ⇒ `co=L.c` 且 `a'=L.a` ⇒ 下层完全原样。
+
+   ##### MERGE2 —— 内核 `LAB_00402654`(`DAT_005d1624`)
+
+   ```text
+   a1 = L.a·dstA >> 8                 ; **下层**的层 alpha 乘下层像素 alpha
+   t  = (U.a + 1)·a1 >> 8             ; `+1` 在乘法左操作数上
+   w  = (U.a − t)·srcA >> 8           ; **上层**的层 alpha 乘下层露出量
+   a' = a1 + w
+   co = L.c + ((U.c − L.c)·srcA >> 8)·U.a / (a'+1)    ; idiv,向零截断
+   ```
+
+   与 MERGE 是**三处不同的算术**,不是同一内核的变体:
+
+   | | MERGE `0x402828` | MERGE2 `0x402654` |
+   |---|---|---|
+   | 下层的层 alpha(`dstA`) | 不使用 | 乘进**下层自己的**像素 alpha(`a1`) |
+   | RGB 分母 | 查表 `U' = U.a·256/a'`,再 `>>16` | 内联 `idiv`,分母 `(a'+1)` |
+   | 除法方式 | 表值 + 算术右移 | `idiv`(向零截断) |
+
+   ⇒ **层 alpha 全 256 时两者也不是逐位相同**:全不透明上层 + 不透明下层
+   时 MERGE 给 `U.c` 原值,MERGE2 给 `L.c + (U.c−L.c)·255/256`,差 1 LSB。
+   这是官方自带的量化(分母 `(a'+1)` 防除零的副作用),回归按 ≤1 放宽
+   (`merge_and_merge2_differ_by_at_most_one_lsb`)。
+
+   「下层不可见处不泄色」同样成立:`L.a=0 ⇒ a1=0 ⇒ t=0 ⇒ w=0 ⇒ a'=0 ⇒
+   den=1 ⇒ co=L.c`;叠 `dstA` 也不会把残色放大。
+
+   ##### 为什么早先的「归一化 over」也能过像素实测
+
+   标准 over(`a + la(1−a)`,`(cu·a + cl·la(1−a))/ao`)与官方的
+   `L + (U−L)·U.a/a'` 在 `srcA=256`、`U.a` 与 `a'` 同源时**代数等价**,
+   只差 1 LSB 级量化。所以早期靠像素实测(眨眼不泄色、清空后仍可见)
+   反推出来的式子能对,但推导出的「参数乘在哪一项」是错的 —— 那版把层
+   alpha 折进**像素 alpha**,会同时改变上层权重,与官方的「只缩小下层露出」
+   方向不同。现已改成内核原式。
+
+   ##### 接入方式
+
+   `ImageOp` 新增 `source_alpha` / `target_alpha`,在**命令时刻**快照
+   (`CG[A=…]` 可在合并之后改写层,回放期读会错)。映射:
+
+   - `source_alpha` = `srcA`(上层),`target_alpha` = `dstA`(下层);
+   - 宿主对 `MERGE` 只传 `srcA`(`dstA` 槽填 256,内核不读);
+     `MERGE2` 两个都传真值。
+
+   **同时修掉一个真实缺陷**:`base_token` 与 `image_signature` 原先都不含
+   层 alpha ⇒ `CG[A=…]` 只改不透明度、不改纹理时,`sync_base` 判「基面未变」
+   而跳过快照,合并结果停在旧 alpha 下的值(实测:同场景改下层 A 后画面不
+   更新)。两处都已纳入。
+
+   #### 残留(明确未完成)
+
+   - **`CG[Z]` 是否也参与**:`Z` 是图层序,合并结果写回 `ID2` 后层级不变,
+     暂按不参与处理。无锚点。
+   - `X/Y` 是否参与对齐、`ratio*0.06` 的每部件缩放语义:现按「整面合成、
+     忽略 X/Y」处理(2b 之前的既有行为),**无 RE 锚点**。
+   - `XOR`/`AND` 的 alpha 通道:当前只作用 RGB、alpha 保留下层,公式未反出。
 
 6. **`RESIZE` 的缩放滤波**:`SIZE` 族用最近邻/双线性区分,`RESIZE` 走
    双线性;官方是否另有滤波选择未取证。
@@ -239,15 +427,18 @@
 ## 4. 验证
 
 ```text
-cargo test -p yu-backend-soft --lib          # 53 passed(含 20 条滤镜像素单测)
-cargo test -p yu-backend-wgpu --test wgpu    # 35 passed(含 4 条模糊 + 6 条滤镜对拍)
+cargo test -p yu-backend-soft --lib          # 59 passed(含 22 条滤镜/合并像素单测)
+cargo test -p yu-backend-wgpu --test wgpu    # 34 passed(含 4 条模糊 + 6 条滤镜对拍)
+cargo test -p yu-backend-wgpu --test surfaces # 14 passed(含 3 条合并族门禁)
 ```
 
 单测锚点(`crates/yu-render/soft/src/imagefilters.rs`):
 `saido_64_is_half_saturation`、`akarusa_192_is_1_5x`、
 `mono_threshold_splits_black_white`、`mosaic_fills_blocks_uniformly`、
 `blur_preserves_uniform_color`、`zero_params_are_identity`、
-`merge_transparent_upper_keeps_lower`、`merge2_opaque_upper_overwrites`、
+`merge_transparent_upper_keeps_lower`、
+`merge2_opaque_upper_keeps_official_one_lsb_darkening`、
+`layer_alpha_is_the_source_blend_strength`、
 `bitwise_applies_to_rgb_only`、`blur2_is_horizontal_only`、
 `blur3_is_vertical_only_and_keeps_source_alpha`、`blur4_is_two_pass_box`、
 `blur5_is_alpha_only_mask`、`alpha_aware_blur_averages_alpha_too`、

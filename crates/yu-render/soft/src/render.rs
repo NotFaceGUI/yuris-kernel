@@ -398,12 +398,11 @@ fn apply_image_op(
     }
     // `MERGE/MERGE2/XOR/AND`:`ID`(上层)合成到 `ID2`(下层),结果写 `ID2`。
     //
-    // `X/Y` 是**绘制偏移**(wgpu 侧 `push_quad` 直接用它;证据见
-    // `passes.rs` 的 `FUN_004405a4`),不是源区域 —— 因此必须先于区域解析
-    // 处理,否则 `X=0 Y=0`(语料存读档的缩略图合成)会被误判成
-    // `gfx.imageop.region.partial` 整条跳过。
+    // `X/Y` 是**绘制偏移**(wgpu 侧 `push_quad` 直接用它),不是源区域 ——
+    // 因此必须先于区域解析处理,否则 `X=0 Y=0`(语料存读档的缩略图合成)
+    // 会被误判成 `gfx.imageop.region.partial` 整条跳过。
     if image.action.is_layer_composite() {
-        // `X/Y` 不参与合并对齐(官方按部件位置画,见 wgpu 侧同处注释)。
+        // `X/Y` 不参与合并对齐(见 wgpu 侧同处注释与那里的勘误)。
         // 2b53786 之前这里也不检查 `X/Y`;「非零即跳过」会让
         // `RECTPAINT3 SET=0` 清掉的矩形填不回来。忽略之。
         let _ = (image.x, image.y);
@@ -427,13 +426,27 @@ fn apply_image_op(
             height: upper.height,
             rgba: upper.rgba,
         };
+        // 层不透明度(`[层+0x80]`,0..256)作为独立乘数。REA 0.495:
+        // - `MERGE`  `FUN_0043b33c`:`blend(dst, src, srcLayerAlpha, span)`
+        // - `MERGE2` `FUN_0043b8ec`:`blend(dst, src, dstLayerAlpha, srcLayerAlpha, span)`
+        // 即 `MERGE` **不吃下层的层 alpha**,`MERGE2` 两层都吃。
+        let src_layer_alpha = u32::from(image.source_alpha.clamp(0, 256) as u16);
+        let dst_layer_alpha = u32::from(image.target_alpha.clamp(0, 256) as u16);
         match &image.action {
-            ImageAction::Merge => {
-                crate::imagefilters::apply_merge(&mut lower, &upper, false)
-            }
-            ImageAction::Merge2 => {
-                crate::imagefilters::apply_merge(&mut lower, &upper, true)
-            }
+            ImageAction::Merge => crate::imagefilters::apply_merge_layers(
+                &mut lower,
+                &upper,
+                false,
+                src_layer_alpha,
+                256, // MERGE 不使用下层的层 alpha
+            ),
+            ImageAction::Merge2 => crate::imagefilters::apply_merge_layers(
+                &mut lower,
+                &upper,
+                true,
+                src_layer_alpha,
+                dst_layer_alpha,
+            ),
             ImageAction::Other("xor") => {
                 crate::imagefilters::apply_bitwise(&mut lower, &upper, true)
             }

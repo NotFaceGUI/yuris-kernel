@@ -53,15 +53,31 @@
 快照表在本实现里只读:所有像素写入都落在**层表面内容**上(写入永不原地),
 所以 COPY 冻结的像素不会被同帧 `RECTPAINT` 改写。
 
-`MERGE` 系列的 alpha 口径按官方执行体定案(REA 0.495 `0x4405a4`,详见
-`DIV-GFX-063` §2.4):官方只把**上层**的每部件纹理按**下层**的每部件位置
-`dev->Draw(...)` 画到当前渲染目标,不读下层旧像素;alpha 由 D3D9 固定管线
-同因子混合写回(`a² + la·(1−a)`)。因此:
+`MERGE` 系列按官方两个内核的**整数 lerp** 合成(公式已逐字节手解,
+见 `DIV-GFX-063` §2.5 的「已定案公式」):
+
+```text
+MERGE : co = L.c + ((U.c − L.c)·U'·srcA) >> 16 ,  U' = U.a·256/a'
+MERGE2: co = L.c + (((U.c − L.c)·srcA) >> 8)·U.a / (a'+1)
+```
+
+两族是**不同算术**(MERGE 走查表、MERGE2 走 idiv),层 alpha 分工也不同;
+层 alpha 全 256 时也差 1 LSB。
+
+> **勘误(2026-10-31)**:此段此前写「按官方执行体定案(REA 0.495
+> `0x4405a4`)…alpha 由 D3D9 固定管线同因子混合写回(`a² + la·(1−a)`）」,
+> 归因与式子**都是错的**。`0x4405a4` 是 `EMOTE` 域处理体(依赖
+> YSEmote.dll),不是 CGACT 的 MERGE;真正的执行体是 `0x43b33c` /
+> `0x43b8ec`(逐行 CPU 循环),`a²` 那条式子在抗锯齿差分边上会把立绘
+> 「眼罩化」(实测整圈缝隙)。
+
+因此:
 
 - `COPY2 → RECTPAINT3 SET=0 → MERGE` 清空后仍然可见(alpha 被写回),
   立绘换差分/眨眼不再整层消失;
 - 旧 wgpu「MERGE 保留目标 alpha」是错的,已删;
-- 两后端同一公式(`merge.wgsl` / soft `apply_merge`),逐位一致。
+- 两后端各自与自己的内核公式逐字节一致(`merge.wgsl` / `composite.wgsl`
+  vs soft `apply_merge_at_layers`),由 `surfaces.rs` 的对拍用例锁住。
 
 ## 4. 实测(`<game-b>` v494,1200 帧,桌面 wgpu,`--no-sound`)
 

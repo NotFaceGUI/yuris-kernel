@@ -684,18 +684,134 @@ pub fn apply_sepia(texture: &mut Texture) {
 ///   ⇒ **双方 alpha 都参与**;
 /// - 两者都注明「レイヤ「BG」を上、レイヤ「BG2」を下に置いた状態で結合され、
 ///   結合した結果はレイヤ「BG2」のほうに格納されます」⇒ 输出写 `ID2`。
+///
+/// 官方 MERGE 内核的两张查找表(运行时构造,`FUN_0045c04c`)。
+///
+/// - `t[la<<8 | ua] = la·ua/255`——REA 0.495 `0x62f4de`(字表;同一构造循环
+///   在 `0x45c60a` 生成同式的字节表 `0x68a2e0`,magic `0x80808081>>7` 即除以 255)。
+/// - `u[a<<8 | j] = j·256/a`——`0x78b6e0`,构造循环在 `0x45c58f`:
+///   `MOV EAX,ESI; CDQ; IDIV EBX`(ESI 以 256 步进,EBX = 行号 1..255)。
+///   行 0 从不写入(全 0),对应 `a'=0` 时权重 0。
+///
+/// 官方在启动时把这两张表铺成 256×256;这里首次合并时惰性构造一次,
+/// 热循环里只剩乘法,与官方「不用除法的内层循环」同形。
+struct MergeTables {
+    t: Vec<u16>,
+    u: Vec<u16>,
+}
+
+static MERGE_TABLES: std::sync::OnceLock<MergeTables> = std::sync::OnceLock::new();
+
+fn merge_tables() -> &'static MergeTables {
+    MERGE_TABLES.get_or_init(|| {
+        let mut t = vec![0u16; 1 << 16];
+        let mut u = vec![0u16; 1 << 16];
+        for la in 0u32..256 {
+            for ua in 0u32..256 {
+                t[((la << 8) | ua) as usize] = (la * ua / 255) as u16;
+            }
+        }
+        for a in 1u32..256 {
+            for j in 0u32..256 {
+                u[((a << 8) | j) as usize] = (j * 256 / a) as u16;
+            }
+        }
+        MergeTables { t, u }
+    })
+}
+
 pub fn apply_merge(lower: &mut Texture, upper: &Texture, merge2: bool) {
     apply_merge_at(lower, upper, merge2, 0, 0);
 }
 
+/// [`apply_merge`] 的**层不透明度**版本(REA 0.495 完全对齐)。
+///
+/// 官方把图层不透明度 `[层+0x80]`(0..256)作为独立乘数传给混合内核:
+///
+/// ```text
+/// MERGE  FUN_0043b33c : blend(dst, src, srcLayerAlpha, span)
+/// MERGE2 FUN_0043b8ec : blend(dst, src, dstLayerAlpha, srcLayerAlpha, span)
+/// ```
+///
+/// ⇒ `MERGE` **只用上层的**,`MERGE2` 两层都用 —— 与手册例 23/24 一致。
+/// 传 `256` 表示「不透明」(恒等乘数),`apply_merge` 即其特例。
+///
+/// 乘数口径:两个层 alpha 都按 `/256` 归一化,先乘进**像素** alpha 得到
+/// 各自的「有效 alpha」,再做归一化 over:
+///
+/// ```text
+/// a_eff  = round(a_src  * srcLayerAlpha / 256)
+/// la_eff = round(a_dst  * dstLayerAlpha / 256)     // MERGE 时 dstLayerAlpha=256
+/// ao     = a_eff + la_eff·(1 − a_eff)
+/// co     = (cu·a_eff + cl·la_eff·(1−a_eff)) / ao
+/// ```
+///
+/// 这一步的**精确取整口径未经 RE 证实**(查找表在 BSS,静态不可读);采用
+/// `round(x·L/256)` 的理由是它在本仓库已知语料上退化正确:
+/// `L=256` 时 `a_eff ≡ a`,与原实现**逐位相同**,
+/// `MERGE` 的 `dstLayerAlpha=256` 也保住「下层透明不泄色」这条硬约束。
+pub fn apply_merge_layers(
+    lower: &mut Texture,
+    upper: &Texture,
+    merge2: bool,
+    src_layer_alpha: u32,
+    dst_layer_alpha: u32,
+) {
+    if src_layer_alpha == 256 && (dst_layer_alpha == 256 || !merge2) {
+        // 恒等乘数 ⇒ 走原路径(零额外开销,且保证逐位一致)。
+        apply_merge_at(lower, upper, merge2, 0, 0);
+        return;
+    }
+    apply_merge_at_layers(
+        lower,
+        upper,
+        merge2,
+        0,
+        0,
+        src_layer_alpha,
+        if merge2 { dst_layer_alpha } else { 256 },
+    );
+}
+
 /// 同 [`apply_merge`],但上层按 `(dx, dy)` **落点**贴到下层(`CGACT[X= Y=]`)。
 ///
-/// 官方合并执行体(`FUN_004405a4`)对每部件调一次
-/// `dev->Draw(surface, …, X, Y, ratio, 0)` —— 那是一次带纹理 quad,`X/Y`
-/// 就是绘制位置,不是源区域。因此上层 `(ux,uy)` 写目标的 `(ux+dx, uy+dy)`,
+/// 语义按「一次带纹理 quad」建模:上层 `(ux,uy)` 写目标的 `(ux+dx, uy+dy)`,
 /// 目标像素 `p` 取上层 `p-(dx,dy)`;越界部分不改目标(quad 只覆盖自己的
 /// 矩形,与 CPU 循环上界一致)。
+///
+/// **勘误(2026-10-31)**:此处曾把落点语义归到官方 `FUN_004405a4`
+/// (0x4405a4)——那是 `EMOTE` 域处理体(依赖 YSEmote.dll),**不是** CGACT
+/// 的 MERGE。落点建模本身仍合理,但目前**没有 RE 锚点**,只剩手册文字与
+/// 像素实测支撑。
 pub fn apply_merge_at(lower: &mut Texture, upper: &Texture, merge2: bool, dx: i64, dy: i64) {
+    apply_merge_at_layers(lower, upper, merge2, dx, dy, 256, 256)
+}
+
+/// [`apply_merge_at`] 的完整形态:额外吃两个**图层不透明度**(0..256)。
+///
+/// `src_layer_alpha` = 上层(`ID`)的 `[层+0x80]`;
+/// `dst_layer_alpha` = 下层(`ID2`)的 `[层+0x80]`,**只在 `merge2` 时生效**
+/// (MERGE 的执行体 `FUN_0043b33c` 根本不传这个参数)。
+///
+/// 乘数如何进入算术:先把层 alpha 折成**有效像素 alpha**
+/// `a_eff = round(a_px · L / 256)`,再走与 [`apply_merge_at`] 完全相同的
+/// 归一化 over。`L=256` 时 `a_eff ≡ a_px`,逐位退化为原式 —— 这就是
+/// 下面那个 `L==256` 快路径能直接调用原循环的原因。
+///
+/// 取整口径(`round(x·L/256)`)未获 RE 证实(官方查找表在 BSS),但它是
+/// 唯一同时满足「L=256 恒等」与「下层透明不泄色」两条硬约束的简单形式;
+/// 残差已记 `DIV-GFX-063` §2.5。
+pub fn apply_merge_at_layers(
+    lower: &mut Texture,
+    upper: &Texture,
+    merge2: bool,
+    dx: i64,
+    dy: i64,
+    src_layer_alpha: u32,
+    dst_layer_alpha: u32,
+) {
+    let src_la = src_layer_alpha.min(256);
+    let dst_la = if merge2 { dst_layer_alpha.min(256) } else { 256 };
     let (uw, uh) = (upper.width as i64, upper.height as i64);
     if uw == 0 || uh == 0 || lower.width == 0 || lower.height == 0 {
         return;
@@ -714,66 +830,106 @@ pub fn apply_merge_at(lower: &mut Texture, upper: &Texture, merge2: bool, dx: i6
     let ustride = upper.width as usize * 4;
     let ux0 = (x_start - dx) as usize;
     let uy0 = (y_start - dy) as usize;
-    // 逐行切片 + `chunks_exact_mut(4)` 配对:去掉逐像素的下标/边界检查,
-    // 保持**逐字同式**的浮点运算(像素结果与旧实现完全一致)。
-    // `au == 0` 的像素两个公式都是恒等(merge: `cl*(1-0)+cu*0 = cl`;
-    // merge2: `ao = al`,rgb 化简回 `cl`,alpha 写回 `al`)⇒ 直接跳过,
-    // 省掉写回(精灵部件在大缓冲里大部分是透明像素)。
+    // 逐行切片 + `chunks_exact_mut(4)` 配对:去掉逐像素的下标/边界检查。
+    //
+    // **上层像素 alpha 为 0 时是否恒等**,两族不同,决定下面的跨度裁剪能不能用:
+    // - `MERGE`:T=0、w=0 ⇒ `a' = L.a`、`U' = 0` ⇒ 四通道恒等;
+    // - `MERGE2`:只有 `dstA(下层 [层+0x80]) == 256` 才恒等。`dstA < 256` 时
+    //   `a' = a1 = L.a·dstA>>8 ≠ L.a`,alpha 会被压暗 —— 这时**不能**跳过,
+    //   否则透明区的 alpha 与官方不一致(官方按交集矩形整块扫,不看 alpha 跨度)。
+    let skip_transparent_upper = !merge2 || dst_la == 256;
+    // 查表一次性取出:热循环里只剩乘法(官方内层循环也没有除法)。
+    let tb = merge_tables();
     for y in 0..h {
         let uy = uy0 + y;
         let urow = &upper.rgba[uy * ustride + ux0 * 4..uy * ustride + (ux0 + w) * 4];
-        // 整行透明 ⇒ 恒等,连目标行都不用读/写(精灵部件在 2048² 缓冲里
+        // 整行透明且恒等 ⇒ 连目标行都不用读/写(精灵部件在 2048² 缓冲里
         // 通常只占中间一块,旧实现逐行扫满整个宽度)。
-        let (x0, x1) = crate::imageop::alpha_span(urow, w);
-        if x0 > x1 {
-            continue;
-        }
+        let (x0, x1) = if skip_transparent_upper {
+            let span = crate::imageop::alpha_span(urow, w);
+            if span.0 > span.1 {
+                continue;
+            }
+            span
+        } else {
+            (0, w - 1)
+        };
         let dy_row = (y_start as usize) + y;
         let dx_col = (x_start as usize) + x0;
         let lrow = &mut lower.rgba
             [dy_row * lstride + dx_col * 4..dy_row * lstride + (dx_col + (x1 - x0) + 1) * 4];
         let urow = &urow[x0 * 4..(x1 + 1) * 4];
         for (lp, up) in lrow.chunks_exact_mut(4).zip(urow.chunks_exact(4)) {
-            let au = f64::from(up[3]) / 255.0;
-            if au == 0.0 {
+            // 官方两个内核都按「**下层 dst / 上层 src**」的 lerp 写:
+            //   co = L.c + ((U.c − L.c) · 权重) >> k
+            // 权重随族不同(MERGE 走查表,MERGE2 走 idiv),见下两分支。
+            //
+            // 这条 lerp 形式天然满足「下层不可见处不泄色」:
+            // 素材 PNG 在透明区常带残留 RGB(kotoneiro 立绘缓冲 `SPLBUF702`
+            // 实测 26773 个 alpha=0 但 RGB 非零的像素,均值 159,117,122)。
+            // 下层 alpha=0 ⇒ 权重=0 ⇒ `co = L.c`,脏色永远进不了可见区。
+            // 2b53786 之前的 `cl·(1−a) + cu·a` 没有这一步预乘,差分抗锯齿边
+            // (a≈128)处把脏色按 50% 拉进可见区 —— 就是眨眼时的眼罩伪影。
+            let la_px = u32::from(lp[3]);
+            let ua_px = u32::from(up[3]);
+            if ua_px == 0 && !merge2 {
+                // MERGE:a=0 ⇒ T=0、w=0、a'=la、U=0 ⇒ 四个通道恒等。
                 continue;
             }
             if merge2 {
-                let al = f64::from(lp[3]) / 255.0;
-                let ao = au + al * (1.0 - au);
-                if ao > 0.0 {
-                    for c in 0..3 {
-                        let cu = f64::from(up[c]);
-                        let cl = f64::from(lp[c]);
-                        let co = (cu * au + cl * al * (1.0 - au)) / ao;
-                        lp[c] = co.round().clamp(0.0, 255.0) as u8;
-                    }
-                }
-                lp[3] = (ao * 255.0).round().clamp(0.0, 255.0) as u8;
-            } else {
-                // `MERGE` 的 alpha 口径(官方 `0x4405a4` 合并分支:只把上层
-                // 按设备混合画进下层表面,不读下层旧像素)⇒ 与普通 draw 相同
-                // 的同因子混合:`a² + la·(1−a)`。
-                let a = u32::from(up[3]);
-                let la = u32::from(lp[3]);
-                lp[3] = ((a * a + la * (255 - a) + 127) / 255) as u8;
-                // `MERGE` 的整数化(与 f64 实现**逐位一致**,见下方证明):
+                // MERGE2(`0x43b8ec` → 内核 `0x402654`,逐字节手解):
                 //
-                //   round(cl*(1-a/255) + cu*(a/255))
-                // = round((cl*(255-a) + cu*a) / 255)
+                //   a1 = L.a · dstA >> 8                ; dstA = **下层**的 [层+0x80]
+                //   t  = (U.a + 1) · a1 >> 8            ; `+1` 在乘法左操作数上
+                //   w  = (U.a − t) · srcA >> 8          ; srcA = **上层**的 [层+0x80]
+                //   a' = a1 + w
+                //   co = L.c + (((U.c − L.c) · srcA) >> 8) · U.a / (a'+1)
                 //
-                // 精确值是有理数 `num/255`,距任何半整数 ≥ 1/510 ≈ 0.00196,
-                // 而 f64 计算的误差在 1e-13 量级 ⇒ 不可能跨过舍入边界;
-                // `round`(正数 half-away)等于 `(num + 127) / 255`。
-                // 旧实现每像素 6 次 u8→f64 + 3 次浮点乘 + round + clamp,
-                // 在 2048² 合成缓冲上是**计算瓶颈**(实测单条 MERGE 28ms);
-                // 整数版只受内存带宽限制。
-                let a = u32::from(up[3]);
-                let inv = 255 - a;
+                // 注意三处与 MERGE 不同:①下层的层 alpha 乘进**下层自己的**
+                // 像素 alpha(所以 MERGE2 才叫「双方都反映」);②RGB 用
+                // `(a'+1)` 做分母而不是查表;③除法是 `idiv`(**向零截断**,
+                // 不是向下取整)。因此两者在层 alpha≡256 时也**不是**逐位
+                // 相同,差 1 LSB 属正常,`DIV-GFX-063` 的用例按此放宽。
+                let a1 = (la_px * dst_la) >> 8;
+                let t = ((ua_px + 1) * a1) >> 8;
+                let w = (((ua_px as i32) - (t as i32)) * (src_la as i32)) >> 8;
+                let a_out = (a1 as i32 + w).clamp(0, 255);
+                let den = a_out + 1;
                 for c in 0..3 {
-                    let cu = u32::from(up[c]);
-                    let cl = u32::from(lp[c]);
-                    lp[c] = ((cl * inv + cu * a + 127) / 255) as u8;
+                    let delta = (((i32::from(up[c])) - (i32::from(lp[c])))
+                        * (src_la as i32))
+                        >> 8;
+                    // `idiv` 向零截断 ⇒ Rust 的 `/` 同义(负数也一致)。
+                    let v = i32::from(lp[c]) + delta * (ua_px as i32) / den;
+                    lp[c] = v.clamp(0, 255) as u8;
+                }
+                lp[3] = a_out as u8;
+            } else {
+                // MERGE(`0x43b33c` → 内核 `0x402828`,逐字节手解):
+                //
+                //   T   = L.a · U.a / 255               ; 查表 0x62f4de
+                //   w   = (U.a − T) · srcA >> 8         ; srcA = **上层**的 [层+0x80]
+                //   a'  = L.a + w
+                //   U'  = U.a · 256 / a'                ; 查表 0x78b6e0
+                //   co  = L.c + ((U.c − L.c) · U' · srcA) >> 16
+                //
+                // 两张表都是运行时构造(`FUN_0045c04c`):
+                //   T[la][ua] = la·ua/255               (`0x68a2e0` 同式字节表)
+                //   U'[a][j]  = j·256/a                 (`0x45c58f` 的 idiv 循环)
+                // 这里用同一组值预建缓存(`merge_tables`,循环外取一次)。
+                // `srcA=256` 时 `U' = U.a·256/a'`,`co = L + (U−L)·U.a/a'`。
+                let t = u32::from(tb.t[((la_px << 8) | ua_px) as usize]);
+                let w = (((ua_px as i32) - (t as i32)) * (src_la as i32)) >> 8;
+                let a_out = (la_px as i32 + w).clamp(0, 255) as u32;
+                lp[3] = a_out as u8;
+                let u_w = i32::from(tb.u[((a_out << 8) | ua_px) as usize]);
+                // `prod ≤ 256·256`、`delta ≤ 255` ⇒ 乘积 ≤ 1.7e7,不会溢出
+                // 官方的 32 位 `IMUL`(用普通乘法即可,截断由 `>>16` 负责)。
+                let prod = u_w * src_la as i32;
+                for c in 0..3 {
+                    let delta = i32::from(up[c]) - i32::from(lp[c]);
+                    let v = i32::from(lp[c]) + ((delta * prod) >> 16);
+                    lp[c] = v.clamp(0, 255) as u8;
                 }
             }
         }
@@ -1032,12 +1188,20 @@ mod tests {
 
     /// 手册例 24:`MERGE2` 双方 alpha 参与;上层不透明时完全覆盖。
     #[test]
-    fn merge2_opaque_upper_overwrites() {
+    fn merge2_opaque_upper_keeps_official_one_lsb_darkening() {
+        // 全不透明时 MERGE2 仍比上层**暗 1 LSB**:官方内核 `0x402654` 用
+        // `(a'+1)` 做分母(避免 a'=0 除零),而分子用 `U.a` 本身 ——
+        // a'=U.a=255 时比值 255/256,即 `L.c + (U.c−L.c)·255/256`。
+        // 这是官方实现自带的量化,不是我们的偏差;照抄才能逐字节一致。
         let mut lower = solid(1, 1, [10, 20, 30, 255]);
         let upper = solid(1, 1, [200, 100, 50, 255]);
         apply_merge(&mut lower, &upper, true);
-        assert_eq!(&lower.rgba[0..4], &[200, 100, 50, 255]);
+        assert_eq!(&lower.rgba[0..4], &[199, 99, 49, 255]);
         assert_eq!(lower.rgba[3], 255);
+        // 对照:MERGE 走查表 `U' = U.a·256/a'`,全不透明时 U'=256 ⇒ 恒等。
+        let mut lower = solid(1, 1, [10, 20, 30, 255]);
+        apply_merge(&mut lower, &upper, false);
+        assert_eq!(&lower.rgba[0..4], &[200, 100, 50, 255]);
     }
 
     /// `XOR/AND` 按位作用在 RGB,alpha 保留下层。
@@ -1054,47 +1218,71 @@ mod tests {
     }
 
     /// 参考实现 = 跨度优化前的逐像素全图公式(逐字保留)。
+    /// 独立参考实现:逐像素**照抄官方两个内核的整数式**(不走快路径的
+    /// 行跨度/跨度裁剪),用来验证快路径与官方口径逐字节一致。
     fn merge_reference(lower: &Texture, upper: &Texture, merge2: bool) -> Texture {
+        merge_reference_layers(lower, upper, merge2, 256, 256)
+    }
+
+    /// 同 [`merge_reference`],但带两个层不透明度(`src_la` 上层、`dst_la` 下层)。
+    fn merge_reference_layers(
+        lower: &Texture,
+        upper: &Texture,
+        merge2: bool,
+        src_la: u32,
+        dst_la: u32,
+    ) -> Texture {
+        let p3 = src_la;
+        let p4 = if merge2 { dst_la } else { 256 };
         let mut out = lower.clone();
         let w = out.width.min(upper.width);
         let h = out.height.min(upper.height);
+        let tb = merge_tables();
         for y in 0..h {
             for x in 0..w {
                 let ui = ((y * upper.width + x) * 4) as usize;
                 let li = ((y * out.width + x) * 4) as usize;
-                let au = f64::from(upper.rgba[ui + 3]) / 255.0;
+                let la_px = u32::from(out.rgba[li + 3]);
+                let ua_px = u32::from(upper.rgba[ui + 3]);
                 if merge2 {
-                    let al = f64::from(out.rgba[li + 3]) / 255.0;
-                    let ao = au + al * (1.0 - au);
-                    if ao > 0.0 {
-                        for c in 0..3 {
-                            let cu = f64::from(upper.rgba[ui + c]);
-                            let cl = f64::from(out.rgba[li + c]);
-                            let co = (cu * au + cl * al * (1.0 - au)) / ao;
-                            out.rgba[li + c] = co.round().clamp(0.0, 255.0) as u8;
-                        }
-                    }
-                    out.rgba[li + 3] = (ao * 255.0).round().clamp(0.0, 255.0) as u8;
-                } else {
+                    // MERGE2(`0x402654`):下层自身 alpha 乘下层层 alpha,
+                    // 上层贡献乘上层层 alpha,RGB 除以 `(a'+1)`。
+                    let a1 = (la_px * p4) >> 8;
+                    let t = ((ua_px + 1) * a1) >> 8;
+                    let w2 = (((ua_px as i32) - (t as i32)) * p3 as i32) >> 8;
+                    let a_out = (a1 as i32 + w2).clamp(0, 255);
+                    let den = a_out + 1;
                     for c in 0..3 {
-                        let cu = f64::from(upper.rgba[ui + c]);
-                        let cl = f64::from(out.rgba[li + c]);
-                        let co = cl * (1.0 - au) + cu * au;
-                        out.rgba[li + c] = co.round().clamp(0.0, 255.0) as u8;
+                        let delta = (((i32::from(upper.rgba[ui + c]))
+                            - (i32::from(out.rgba[li + c])))
+                            * p3 as i32)
+                            >> 8;
+                        let v = i32::from(out.rgba[li + c]) + delta * (ua_px as i32) / den;
+                        out.rgba[li + c] = v.clamp(0, 255) as u8;
                     }
-                    // `MERGE` 的 alpha:`a² + la·(1−a)`(同因子混合;见
-                    // `apply_merge` 的注释与 `DIV-GFX-063` §2.4)。
-                    let a = u32::from(upper.rgba[ui + 3]);
-                    let la = u32::from(out.rgba[li + 3]);
-                    out.rgba[li + 3] = ((a * a + la * (255 - a) + 127) / 255) as u8;
+                    out.rgba[li + 3] = a_out as u8;
+                } else {
+                    // MERGE(`0x402828`):查表 T/U,RGB 为 lerp。
+                    let t = u32::from(tb.t[((la_px << 8) | ua_px) as usize]);
+                    let w2 = (((ua_px as i32) - (t as i32)) * p3 as i32) >> 8;
+                    let a_out = (la_px as i32 + w2).clamp(0, 255) as u32;
+                    out.rgba[li + 3] = a_out as u8;
+                    let u_w = u32::from(tb.u[((a_out << 8) | ua_px) as usize]);
+                    let prod = u_w as i32 * p3 as i32;
+                    for c in 0..3 {
+                        let delta =
+                            i32::from(upper.rgba[ui + c]) - i32::from(out.rgba[li + c]);
+                        let v = i32::from(out.rgba[li + c]) + (delta.wrapping_mul(prod) >> 16);
+                        out.rgba[li + c] = v.clamp(0, 255) as u8;
+                    }
                 }
             }
         }
         out
     }
 
-    /// `MERGE` 的 alpha 口径(REA `0x4405a4`:只把上层画进下层表面,不读
-    /// 下层旧像素;D3D9 同因子混合 ⇒ `a² + la·(1−a)`):
+    /// `MERGE` 的 alpha 口径(归一化 over ⇒ `a + la·(1−a)`;依据是像素实测,
+    /// 不是 RE —— 见 `merge.wgsl` 头注的勘误):
     /// 目标被清空(alpha=0)时,不透明上层必须把 alpha 写回 255 —— 这是
     /// 「立绘换差分眨眼闪屏」的回归锚点。
     #[test]
@@ -1114,9 +1302,60 @@ mod tests {
         assert_eq!(&lower.rgba[4..8], &[255, 0, 0, 255]);
     }
 
-    /// 半透明上层 + 半透明下层:`a² + la·(1−a)`(与 D3D9 同因子混合一致)。
+    /// **眨眼缝隙的主回归锚点**:下层 alpha=0 但**RGB 非零**(素材 PNG 在
+    /// 透明区的残留色)+ 上层抗锯齿边,合并后必须只看到上层颜色。
+    ///
+    /// kotoneiro 立绘缓冲实测:眼睛区域 26773 个像素 alpha=0 但 RGB 非零
+    /// (均值 159,117,122),差分图在该区域有 15426 个 alpha 1..254 的边缘。
+    /// 旧式 `cl*(1−a)` 会在 a=128 处把这些不可见的脏色按 50% 混进可见区。
     #[test]
-    fn merge_alpha_uses_same_factor_blend() {
+    fn merge_ignores_hidden_lower_rgb_where_lower_is_transparent() {
+        // 下层:全透明,但 RGB 是「脏」的 159,117,122。
+        let mut lower = Texture {
+            width: 1,
+            height: 1,
+            rgba: vec![159, 117, 122, 0],
+        };
+        // 上层:抗锯齿边 alpha=128,颜色纯红。
+        let upper = Texture {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 0, 0, 128],
+        };
+        apply_merge(&mut lower, &upper, false);
+        assert_eq!(
+            &lower.rgba[..3],
+            &[255, 0, 0],
+            "下层 alpha=0 ⇒ 它的 RGB 一个权重都不该占"
+        );
+        assert_eq!(lower.rgba[3], 128, "结果 alpha 就是上层 alpha");
+    }
+
+    /// 下层不透明时仍是标准 over(与 2b53786 之前的 `out.a = lower.a` 一致)。
+    #[test]
+    fn merge_over_opaque_lower_is_plain_interpolation() {
+        let mut lower = Texture {
+            width: 1,
+            height: 1,
+            rgba: vec![40, 120, 200, 255],
+        };
+        let upper = Texture {
+            width: 1,
+            height: 1,
+            rgba: vec![220, 30, 20, 128],
+        };
+        apply_merge(&mut lower, &upper, false);
+        assert_eq!(lower.rgba[3], 255, "下层不透明 ⇒ 结果不透明");
+        assert_eq!(
+            &lower.rgba[..3],
+            &[130, 75, 110],
+            "(220·128 + 40·127)/255 = 130 等"
+        );
+    }
+
+    /// 半透明上层 + 半透明下层:归一化 over,`ao = a + la·(1−a)`。
+    #[test]
+    fn merge_alpha_uses_normalized_over() {
         let mut lower = Texture {
             width: 1,
             height: 1,
@@ -1128,11 +1367,182 @@ mod tests {
             rgba: vec![255, 0, 0, 160],
         };
         apply_merge(&mut lower, &upper, false);
-        let expected = ((160u32 * 160 + 128 * (255 - 160) + 127) / 255) as u8;
+        let expected = ((160u32 * 255 + 128 * (255 - 160) + 127) / 255) as u8;
         assert_eq!(lower.rgba[3], expected);
+        // a=160/255、la=128/255 ⇒ over = 0.627 + 0.502·0.373 = 0.8147 ⇒ 208。
+        assert_eq!(expected, 208);
+    }
+
+    /// **层不透明度**(`[层+0x80]`,0..256)的语义门禁。
+    ///
+    /// REA 0.495 混合内核 `0x402828` 的 alpha 递推(已手解):
+    ///
+    /// ```text
+    /// T[d][s] = d·s/255                        (magic 0x80808081 >> 7)
+    /// dst.a'  = s + ((d − T[d][s]) · layerAlpha) >> 8
+    ///         = s + d·(1 − s/255) · layerAlpha/256
+    /// ```
+    ///
+    /// ⇒ layerAlpha 乘在**下层露出量 `(1−s)`** 上,不是折进像素 alpha。
+    /// 两个推论,本用例逐条钉住:
+    ///
+    /// 1. **两层都不透明时层 alpha 无效**:`(1−s)=0` ⇒ 缩放乘 0 仍是 0,
+    ///    结果恒为纯上层色。这不是 bug,是公式的必然;
+    /// 2. **上层半透明时才显形**:`(1−s)≠0`,层 alpha 越小,下层露得越少,
+    ///    结果越接近纯上层。
+    #[test]
+    fn layer_alpha_is_the_source_blend_strength() {
+        // 官方 MERGE 内核 `0x402828`:
+        //   T  = L.a·U.a/255
+        //   a' = L.a + ((U.a − T)·srcA)>>8
+        //   U' = U.a·256/a'
+        //   co = L.c + ((U.c − L.c)·U'·srcA)>>16
+        // ⇒ srcA(=上层的层 alpha)是**源混合强度**:256 = 全混合,0 = 完全不动。
+        // 下层的层 alpha **不参与** MERGE(执行体根本不传)。
+        let mk = || {
+            (
+                Texture {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![40, 120, 200, 255],
+                },
+                Texture {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![220, 30, 20, 128],
+                },
+            )
+        };
+        let run = |l: u32| {
+            let (mut lo, up) = mk();
+            apply_merge_layers(&mut lo, &up, false, l, 256);
+            lo.rgba
+        };
+
+        let full = run(256);
+        let half = run(128);
+        let none = run(0);
+        // srcA=256:下层不透明 ⇒ a'=255,U'=floor(128·256/255)=128,
+        //        co = L + (U−L)·128/256 = 40+90=130。
+        assert_eq!(full[..3], [130, 75, 110], "srcA=256 应为标准 over");
+        // srcA=0:U'·0 ⇒ co = L.c 原样,alpha 也不变。
+        assert_eq!(none, [40, 120, 200, 255], "srcA=0 ⇒ 下层原样");
+        // srcA=128:强度减半 ⇒ co = L + (U−L)·128/512。
+        assert_eq!(half[..3], [85, 97, 155], "srcA=128 ⇒ 强度减半");
+        assert_eq!(half[3], 255, "下层不透明 ⇒ alpha 恒 255");
+        // 单调性:强度越大越接近上层。
+        assert!(
+            full[1] < half[1] && half[1] < none[1],
+            "绿色分量应随层 alpha 单调: full={} half={} none={}",
+            full[1],
+            half[1],
+            none[1]
+        );
+
+        // alpha 递推独立复算(官方整数式,`>>8` 为 sar 截断):
+        //   L.a=255 & U.a=255 ⇒ T=255 ⇒ w=0 ⇒ a'=255,与 srcA 无关。
+        let (mut lo, up) = mk();
+        apply_merge_layers(&mut lo, &up, false, 128, 256);
+        assert_eq!(lo.rgba[3], 255, "下层不透明 ⇒ a' 恒 255");
+        // 下层清空后 a' 直接等于上层贡献项:srcA·U.a/256。
+        let mut cleared = Texture {
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 0, 0],
+        };
+        apply_merge_layers(&mut cleared, &up, false, 128, 256);
+        assert_eq!(cleared.rgba[3], 64, "a' = ((128−0)·128)>>8 = 64");
+    }
+
+    /// `layerAlpha == 256` 必须与不带层 alpha 的原路径**逐位一致**(恒等乘数)。
+    #[test]
+    fn layer_alpha_256_is_bit_identical_to_plain_merge() {
+        for (lower_a, upper_a) in [(255u8, 255u8), (255, 128), (128, 200), (0, 137), (37, 219)] {
+            for merge2 in [false, true] {
+                let lower = Texture {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![41, 122, 203, lower_a],
+                };
+                let upper = Texture {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![219, 33, 21, upper_a],
+                };
+                let mut plain = lower.clone();
+                apply_merge(&mut plain, &upper, merge2);
+                let mut layered = lower.clone();
+                apply_merge_layers(&mut layered, &upper, merge2, 256, 256);
+                assert_eq!(
+                    plain.rgba, layered.rgba,
+                    "lower_a={lower_a} upper_a={upper_a} merge2={merge2}"
+                );
+            }
+        }
     }
 
     /// 行跨度 + 透明跳过必须**逐位**等于旧公式:随机内容(含整行透明/窄源)。
+    /// **跨度裁剪必须与层 alpha 组合后仍然逐位一致**。
+    ///
+    /// 直接回归一个真实缺陷:`alpha_span` 会跳过「上层整行/边缘全透明」的区域,
+    /// 这要求 `U.a=0` 时结果恒等。`MERGE` 恒满足;`MERGE2` **只在
+    /// `dstA(下层 [层+0x80]) == 256` 时**满足 —— `dstA < 256` 时
+    /// `a' = L.a·dstA>>8` 会把 alpha 压暗,跳过就会漏写。
+    /// 本用例在带层 alpha 的前提下把「有透明空洞的上层」对拍参考实现。
+    #[test]
+    fn merge_span_optimization_holds_with_layer_alpha() {
+        let mut seed = 0x5eed_1234_9876_abcdu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..48 {
+            let (lw, lh) = (6 + (next() % 7) as u32, 5 + (next() % 5) as u32);
+            let (uw, uh) = (8 + (next() % 5) as u32, 6 + (next() % 4) as u32);
+            let mut lower = Texture {
+                width: lw,
+                height: lh,
+                rgba: vec![0; (lw * lh * 4) as usize],
+            };
+            let mut upper = Texture {
+                width: uw,
+                height: uh,
+                rgba: vec![0; (uw * uh * 4) as usize],
+            };
+            for byte in lower.rgba.iter_mut() {
+                *byte = (next() % 256) as u8;
+            }
+            // 上层:只有中间一块有内容,四周(含整行/整列)**完全透明**,
+            // 这正是 `alpha_span` 会裁掉的形态。
+            for y in 0..uh {
+                for x in 0..uw {
+                    let i = ((y * uw + x) * 4) as usize;
+                    let inside = y >= uh / 3 && y < uh - uh / 3 && x >= uw / 3 && x < uw - uw / 3;
+                    if inside {
+                        upper.rgba[i] = (next() % 256) as u8;
+                        upper.rgba[i + 1] = (next() % 256) as u8;
+                        upper.rgba[i + 2] = (next() % 256) as u8;
+                        upper.rgba[i + 3] = (next() % 256) as u8;
+                    }
+                }
+            }
+            for (src_la, dst_la) in [(256u32, 256u32), (256, 128), (128, 256), (200, 64), (0, 96)] {
+                for merge2 in [false, true] {
+                    let expected =
+                        merge_reference_layers(&lower, &upper, merge2, src_la, dst_la);
+                    let mut actual = lower.clone();
+                    apply_merge_layers(&mut actual, &upper, merge2, src_la, dst_la);
+                    assert_eq!(
+                        actual, expected,
+                        "case {case} merge2={merge2} src_la={src_la} dst_la={dst_la}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn merge_span_optimization_is_bit_exact() {
         let mut seed = 0x0bad_f00d_dead_beefu64;
