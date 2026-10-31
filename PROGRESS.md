@@ -11493,6 +11493,156 @@ cargo build --workspace --all-targets        → 0 error
   (该层没画上),单独跑该用例 8/8 通过、`--test-threads=1` 亦无失败。疑与
   同时创建多个 wgpu device 的驱动侧竞争有关,尚未定位。
 
+## 成果 DEBUG-STEPPER (2026-10-31) · debug-ui 帧步进推进器:两个暂停 + 定步推进 + 录制 + 抓取取证
+
+**动机(主人)**:眨眼这类缺陷只出现在中间某几帧,实时跑按不住;需要
+「有录制 / 暂停 / 推进几帧 / 抓取信息(有效信息都要抓)」的推进器,
+两个暂停分开:录制按钮开始后的暂停、以及用于指定推进帧数的游戏暂停,
+默认推进 10 帧、可配置。
+
+### 实现
+
+新增 `crates/yu-platform/host-desktop/src/stepper.rs`(独立模块,可脱离窗口
+做单测),面板 `ui::stepper_window`(独立 egui 窗口,随 F1/`--debug-ui`),
+宿主接线在 `lib.rs` 的 `about_to_wait` / `window_event` / `finish`。
+
+**两个暂停是两条独立通路**,任一为真引擎就不 tick:
+
+| 暂停 | 触发 | 语义 |
+|---|---|---|
+| 手动暂停 `paused` | 面板勾选 / F5 / `--paused` | 「先别动」,随时可用 |
+| 录制暂停 `record_pause` | 点「录制」(F8)自动进入 | 「要取现场但还没到那一刻」,取消它 = 结束录制 |
+
+面板分别显示 `LIVE` / `STEP` / `HALT` 三态,`--paused` 与 `--step-to` 都不会
+被「卡住」横幅误报(`attention_hint` 在 `stepper.halted()` 时直接返回 `None`)。
+
+**推进帧数**默认 10(`stepper::DEFAULT_STEP_FRAMES`),面板可改,或用
+`--step-frames N` 给启动值;单次硬上限 600(手滑输 100000 不许卡死宿主)。
+「推进 N 帧」**必然落在暂停态**——否则推完的帧会被下一宿主帧的实时推进
+瞬间冲走,等于没停。
+
+**推进走固定步长**(`Engine::tick()`,每帧 `1000/fps` 逻辑毫秒),不是墙钟:
+同一脚本在任何机器上的第 N 帧都是同一个画面。这正是复现中间帧需要的
+可复现性。从暂停恢复实时时宿主调 `Engine::reset_realtime_clock()`,暂停
+期间的墙钟不会被一次性灌进下一帧(否则动画瞬移)。
+
+**HALT 时引擎完全不 tick**:逻辑帧号、逻辑时钟、脚本任务全部冻住,只重绘
+最后一帧;暂停帧同样进录制环形缓冲(主人按「抓取」时想取的往往正是
+停住的那一帧)。
+
+**抓取(有效信息)** —— 每帧一行 JSONL(`frames.jsonl`,单行、键序稳定):
+
+| 段 | 内容 |
+|---|---|
+| 顶层 | `host_frame` / `engine_frame` / `gfx_frame` / `clock_ms` / `interval` / `tick` / `render` / `draw` |
+| `frame_report` | ops/drawn/skipped/passes/layers/visible/drawable/lag_ms |
+| `preload` | 预热耗时/资产数/失败数 + `capture_ms` + `frame_build_ms` |
+| `render_report` | 跳过项(kind:reason×count)、缺资产、文本绘制/字形/缺字与失败原因、滤镜口径 |
+| `gfx_diags` | gfx 帧诊断:码/严重级/命令/detail/count/**脚本位置 `at`** |
+| `diags` | 本帧新挂号(码/严重级/位置/detail) |
+| `input` | 按住集合、光标、**本帧按下沿增量**、点击/滚轮增量与累计 |
+| `sound` | 声音层快照(id/file/state/ms/total/volume/effective_volume/pan/paused) |
+| `ops_top` | 本帧 op 目标层 top-12 + 各类 op 计数(哪几个层在吃 op) |
+| `gfx_gpu` | GPU 目标占用/计数/对账(soft 后端为 `null`,不猜) |
+| `render_phases` | wgpu 规划/快照/图像/文本/编码/读回/收尾各阶段微秒 |
+| `screen` | 宽高 + 采样指纹 + PNG 文件名 |
+| `display` | 合成帧 JSON(可选,体积大,默认关) |
+
+外加每帧整屏 PNG;会话头 `session.json`(schema/启动参数)。`engine_frame`
+(每次 tick +1,脚本与 `--frames` 用它)与 `gfx_frame`(合成帧序号)**分开记**,
+避免对现场时把口径搞混——实测两者并不逐帧相等(首轮冒烟是 1,3,4,6…)。
+
+**落盘策略**:推进帧立即写(推进本身就是取证动作,每行 flush,崩溃不丢);
+录制中的实时帧进内存环形缓冲(默认 60 帧、可调,每帧持 `Arc<Surface>`
+共享不复制),F9/「抓取」回溯落盘;退出时把环形缓冲里还没写的补写出去
+(看到问题直接关窗口也不丢现场)。
+
+**新增开关**(`--mode desktop`):
+
+| 旗标 | 作用 |
+|---|---|
+| `--debug-ui` | 开面板(F1 切换);步进器窗口随之显隐 |
+| `--step-frames N` | 「推进 N 帧」的默认 N(默认 10) |
+| `--capture-dir DIR` | 取证输出目录(默认 `target/tmp/debug-ui/s<unix>`) |
+| `--paused` | 启动即暂停 |
+| `--step-to N` | 固定步长推进到逻辑帧 N 后暂停(每帧取证;`--paused` 的自动化版) |
+| `--record` | 启动即录制(实时帧进环形缓冲,不停住;F9/退出时落盘) |
+
+快捷键(`--debug-ui` 下,不吃 repeat):F5 暂停/恢复 · F6 推进 N 帧 ·
+F7 推进 1 帧 · F8 录制开关 · F9 抓取。
+
+`yu-engine::json` 新增 `to_compact`(单行输出,与 `to_pretty` 共用转义与
+数值口径),JSONL 每行一条靠它。
+
+### 验证(原始结果)
+
+```bash
+$ cargo build --workspace --all-targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.13s
+
+$ cargo test -p yu-host-desktop --lib
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+$ cargo test --workspace --lib          # 带样本环境变量
+17 个 test binary 全 ok(含 yu-save 14/14)
+```
+
+冒烟一(`--step-to`,定步推进取证):
+
+```bash
+$ ./target/debug/yu-cli.exe run <project-eris> --mode desktop --backend wgpu \
+    --debug-ui --step-to 20 --frames 26 --no-sound \
+    --capture-dir target/tmp/stepper-smoke2 --log-level quiet
+[+0.724s] INFO yu-desktop: --step-to 20: 固定步长推进到逻辑帧 20 后暂停(每帧取证)
+[+4.061s] INFO yu-desktop: --step-to 20 已到达(逻辑帧 20),保持暂停
+[+4.149s] INFO yu-desktop: stepper 共落盘 20 帧 → target/tmp/stepper-smoke2
+```
+
+产物核对:`frames.jsonl` 20 行,`f000001.png`..`f000020.png` 20 张 800×600
+真图(末帧 590KB,解出 1.92MB 原始像素);`engine_frame` 严格 +1(1..20),
+`clock_ms` 每帧 +16ms(60fps 固定步长),`phase` 全为 `step`。
+单帧记录原文节选:
+
+```json
+{"clock_ms":304,"draw_ms":18.2,"engine_frame":20,"frame_report":{"drawable":true,
+ "drawn":88,"lag_ms":0,"layers":377,"ms":22.8,"ops":88,"passes":85,"skipped":0,
+ "visible":107},"gfx_frame":22,"gfx_gpu":{"composites":14,"offscreen":1,
+ "reconciled":null,"snapshots":68,"target_bytes":8578092},"host_frame":20,
+ "ops_top":{"copy_ops":68,"image_ops":15,"layer_ops":4,"screen_passes":1,
+ "texture_passes":83,"top":[[":/W0/SPL401",3],…]},"phase":"step",
+ "render_phases":{"encode_us":126,"image_us":133,"plan_us":2124,
+ "readback_us":1289,"rest_us":1480,"tail_us":5321,"text_us":464},
+ "screen":{"fingerprint":"1227310d614a54ec","h":600,"png":"f000020.png","w":800}}
+```
+
+冒烟二(`--record` 环形缓冲 + 退出补写):
+
+```bash
+$ ./target/debug/yu-cli.exe run <project-eris> --mode desktop --backend wgpu \
+    --debug-ui --record --frames 18 --no-sound \
+    --capture-dir target/tmp/stepper-rec --log-level quiet
+[+4.260s] INFO yu-desktop: stepper 退出补写 18 帧 → target/tmp/stepper-rec
+[+4.260s] INFO yu-desktop: stepper 共落盘 18 帧 → target/tmp/stepper-rec
+```
+
+`frames.jsonl` 18 行 + 18 张 PNG,`phase` 为 `live`,`--frames 18` 一到就
+退出、退出补写把整个环形缓冲写出。
+
+单测覆盖(38 项里的 12 项):两个暂停互相独立不覆盖 / 步进走完自动落回
+暂停 / 从实时推进自动进暂停 / 帧数夹取与替换 / 停止录制清空缓冲 /
+面板编辑值回写 / **JSONL 真落盘且 PNG 名回填进同一行** / 第二帧追加不覆盖 /
+`dump_ring` 顺序与计数 / 环形缓冲按容量丢最旧 / 面板同时暴露两个暂停与
+推进控件 / `LIVE`↔`HALT` 标签随状态变。
+
+### 已知边界
+
+- 推进帧的时基是固定步长,`@_OS_TIME(1)` 看到的是 `frame*1000/fps`;
+  要复现「墙钟驱动的补间与真实时间的关系」仍需实时跑(面板 F5 恢复)。
+- 环形缓冲每帧持一张整屏 `Arc`,默认 60 帧 ≈ 800×600×4×60 ≈ 110MB 上限;
+  高分辨率场景请调小 `ring_frames`。
+- `yu-trace --test golden` 在本次改动前后均失败(`sysvars` 表 sha256
+  基线漂移,`39ba92ef…` vs `997b5b63…`),**与本次改动无关**,未修。
+
 ## 成果 MERGE-ALPHA-FIX (2026-10-31) · 眨眼「眼罩」根因:MERGE 下层 RGB 未按 alpha 预乘 + 对 0x4405a4 的错误归因勘误
 
 ### 症状

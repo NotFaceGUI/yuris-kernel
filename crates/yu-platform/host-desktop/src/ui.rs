@@ -15,6 +15,7 @@
 use egui::{Color32, RichText};
 
 use crate::diagnostics::Diagnostics;
+use crate::stepper::{StepperActions, StepperUi, TickKind};
 
 /// 红色横幅(panic)。
 pub const PANIC_RED: Color32 = Color32::from_rgb(176, 24, 24);
@@ -81,6 +82,8 @@ pub struct UiSnapshot<'a> {
     pub show_attention: bool,
     /// 统一控制台的最近行快照(明文无色;Q1 R4「日志」页签)。
     pub log_lines: Vec<String>,
+    /// 帧步进器读数(面板可编辑项也走这里:改完由 `apply_ui` 回写)。
+    pub stepper: StepperUi,
 }
 
 /// 面板上可触发的动作(宿主在 UI 闭包外执行)。
@@ -138,6 +141,140 @@ pub fn debug_window(ctx: &egui::Context, snap: &UiSnapshot<'_>) -> UiActions {
             });
             ui.separator();
             ui.label(format!("GPU: {}", snap.gpu));
+        });
+    actions
+}
+
+/// 帧步进器窗口(独立窗口:`--debug-ui`/F1 同开关)。
+///
+/// 两个暂停分开显示、分开控制,因为它们回答的是两个不同问题:
+///
+/// - **录制暂停**:「我要取现场,但还没到那一刻」—— 点录制自动进入,
+///   停住后由「推进 N 帧」一帧帧走到目标帧;
+/// - **游戏暂停**:「先别动」—— 随时可用,不依赖录制。
+///
+/// 任一为真引擎都不推进(缓存见 [`crate::stepper::Stepper::tick_kind`])。
+/// 推进用固定步长,所以第 N 帧的画面在任何机器上都一致 —— 这才是复现
+/// 中间帧(如眨眼)需要的口径。
+pub fn stepper_window(ctx: &egui::Context, stepper: &mut StepperUi) -> StepperActions {
+    let mut actions = StepperActions::default();
+    egui::Window::new("帧步进器")
+        .default_pos([470.0, 170.0])
+        .default_width(430.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let (color, tag) = match stepper.tick_kind {
+                    TickKind::Live => (Color32::from_rgb(64, 160, 64), "LIVE"),
+                    TickKind::Step => (Color32::from_rgb(200, 150, 40), "STEP"),
+                    TickKind::Halt => (Color32::from_rgb(200, 80, 60), "HALT"),
+                };
+                ui.colored_label(color, RichText::new(tag).strong());
+                ui.monospace(format!(
+                    "engine frame {} · clock {} ms",
+                    stepper.engine_frame, stepper.clock_ms
+                ));
+            });
+            ui.horizontal(|ui| {
+                ui.label("暂停");
+                if ui.checkbox(&mut stepper.paused, "手动 (F5)").changed() {
+                    actions.toggle_pause = true;
+                }
+                if ui
+                    .checkbox(&mut stepper.record_pause, "录制 (自动)")
+                    .on_hover_text("点「录制」自动进入;取消它等于结束录制")
+                    .changed()
+                {
+                    // 显式设值:勾上 = 开始录制并暂停,取消 = 结束录制。
+                    actions.record_pause = Some(stepper.record_pause);
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("⏵ 推进 N 帧 (F6)").clicked() {
+                    actions.step = true;
+                }
+                if ui.button("⏵ 1 帧 (F7)").clicked() {
+                    actions.step_one = true;
+                }
+                if stepper.pending_steps > 0 {
+                    ui.colored_label(
+                        Color32::from_rgb(200, 150, 40),
+                        format!("剩 {}", stepper.pending_steps),
+                    );
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("每次推进");
+                ui.add(
+                    egui::DragValue::new(&mut stepper.step_frames)
+                        .speed(1.0)
+                        .range(1..=crate::stepper::MAX_STEP_FRAMES),
+                );
+                ui.label("帧(默认 10)");
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                let record_label = if stepper.recording {
+                    "⏹ 停止录制 (F8)"
+                } else {
+                    "⏺ 录制 (F8)"
+                };
+                if ui.button(record_label).clicked() {
+                    actions.toggle_record = true;
+                }
+                if ui
+                    .add_enabled(stepper.ring_len > 0, egui::Button::new("⤓ 抓取 (F9)"))
+                    .on_hover_text("把环形缓冲里的帧全部落盘")
+                    .clicked()
+                {
+                    actions.capture_now = true;
+                }
+                if ui
+                    .add_enabled(stepper.ring_len > 0, egui::Button::new("清空缓冲"))
+                    .clicked()
+                {
+                    actions.clear_ring = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("环形缓冲");
+                ui.add(
+                    egui::DragValue::new(&mut stepper.ring_frames)
+                        .speed(1.0)
+                        .range(1..=600usize),
+                );
+                ui.label("帧");
+                ui.monospace(format!(
+                    "· 现有 {} · 已落盘 {} · 静态跳过 {}",
+                    stepper.ring_len, stepper.captured, stepper.live_skipped
+                ));
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut stepper.save_png, "每帧存 PNG");
+                ui.checkbox(&mut stepper.include_display, "含 display JSON")
+                    .on_hover_text("合成帧 JSON;体积大,只在需要逐 op 复盘时开");
+            });
+            ui.horizontal(|ui| {
+                ui.label("输出目录");
+                ui.add(
+                    egui::TextEdit::singleline(&mut stepper.dir)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("target/tmp/debug-ui/s<unix>"),
+                );
+            });
+            if let Some(file) = &stepper.last_file {
+                ui.monospace(format!("最近: {file}"));
+            }
+            if let Some(error) = &stepper.last_error {
+                let error = error.clone();
+                ui.colored_label(PANIC_RED, format!("抓取失败: {error}"));
+            }
+            ui.separator();
+            ui.weak(
+                "HALT 时引擎不 tick、逻辑帧与时钟都不走;推进用固定步长 \
+                 (1000/fps)保证第 N 帧可复现。",
+            );
         });
     actions
 }
@@ -802,6 +939,7 @@ mod tests {
                 "[   +0.102s] INFO  [host] data.ypf mounted".to_string(),
                 "[  +12.345s] UNIMP [gfx] gfx.command.unimplemented @ s66 pc6028: …".to_string(),
             ],
+            stepper: crate::stepper::StepperUi::default(),
         }
     }
 
@@ -809,11 +947,14 @@ mod tests {
     ///
     /// 跑**两遍**:egui 0.37 的 `Window` 在首遍只测量尺寸,第二遍才落
     /// 绘制指令(与宿主真实帧一致 —— 面板晚一帧出现,不影响诊断)。
-    fn run_ui(
-        snapshot: &dyn Fn(&egui::Context) -> UiActions,
-    ) -> (UiActions, Vec<String>, Vec<Color32>) {
+    ///
+    /// 动作类型泛型化:主面板给 [`UiActions`],步进器窗口给
+    /// [`StepperActions`],两者都要求 `Default`(未点击 = 空动作)。
+    fn run_ui<T: Default, F: FnMut(&egui::Context) -> T>(
+        mut snapshot: F,
+    ) -> (T, Vec<String>, Vec<Color32>) {
         let ctx = egui::Context::default();
-        let mut actions = UiActions::default();
+        let mut actions = T::default();
         // `RawInput::default()` 没有 screen_rect:Window 会被裁成 0 面积。
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -855,7 +996,7 @@ mod tests {
 
     #[test]
     fn panic_banner_paints_red_and_quit_button() {
-        let (actions, texts, fills) = run_ui(&|ctx| {
+        let (actions, texts, fills) = run_ui(|ctx| {
             let quit = panic_banner(ctx, "PANIC 捕获于 tick", "boom @ src/lib.rs:1:1");
             UiActions {
                 quit,
@@ -872,7 +1013,7 @@ mod tests {
 
     #[test]
     fn attention_banner_paints_amber_with_hint() {
-        let (_actions, texts, fills) = run_ui(&|ctx| {
+        let (_actions, texts, fills) = run_ui(|ctx| {
             attention_banner(ctx, "画面像素连续 120 宿主帧相同");
             UiActions::default()
         });
@@ -910,7 +1051,7 @@ mod tests {
         };
         diag.total_diags = 11;
         let snapshot = base_snapshot(&diag);
-        let (_actions, texts, _fills) = run_ui(&|ctx| debug_window(ctx, &snapshot));
+        let (_actions, texts, _fills) = run_ui(|ctx| debug_window(ctx, &snapshot));
         let joined = texts.join("\n");
         assert!(joined.contains("rt.cmd.unimplemented"), "{joined}");
         assert!(
@@ -930,7 +1071,7 @@ mod tests {
         // 真实点击路径由 egui 的交互状态驱动(窗口级人工验收)。
         let diag = Diagnostics::default();
         let snapshot = base_snapshot(&diag);
-        let (actions, _texts, _fills) = run_ui(&|ctx| debug_window(ctx, &snapshot));
+        let (actions, _texts, _fills) = run_ui(|ctx| debug_window(ctx, &snapshot));
         assert_eq!(actions, UiActions::default());
     }
 
@@ -941,6 +1082,55 @@ mod tests {
             last_button(&Some(("MOUSE_L".to_string(), 300))),
             "MOUSE_L @ frame 300"
         );
+    }
+
+    // ------------------------------------------------------ 帧步进器面板
+
+    /// 面板必须同时暴露**两个暂停**(手动 / 录制自动)、推进控件、帧数
+    /// 配置与抓取按钮 —— 少一个就说明接线掉了。
+    #[test]
+    fn stepper_panel_shows_both_pauses_and_step_controls() {
+        let mut stepper = crate::stepper::StepperUi {
+            engine_frame: 348,
+            clock_ms: 5800,
+            ..crate::stepper::StepperUi::default()
+        };
+        let (actions, texts, _fills) = run_ui(|ctx| stepper_window(ctx, &mut stepper));
+        assert_eq!(actions, StepperActions::default(), "未点击时不产生动作");
+        let all = texts.join("\n");
+        for needle in [
+            "手动 (F5)",
+            "录制 (自动)",
+            "推进 N 帧 (F6)",
+            "1 帧 (F7)",
+            "录制 (F8)",
+            "抓取 (F9)",
+            "环形缓冲",
+            "每帧存 PNG",
+            "输出目录",
+            "HALT",
+        ] {
+            assert!(all.contains(needle), "面板缺少 `{needle}`: {all}");
+        }
+        assert!(
+            all.contains("engine frame 348"),
+            "必须显示当前逻辑帧(定帧排查要看它): {all}"
+        );
+    }
+
+    /// HALT 与 LIVE 的标签必须能区分:暂停时读数不能还写着 LIVE。
+    #[test]
+    fn stepper_panel_tag_follows_tick_kind() {
+        let mut stepper = crate::stepper::StepperUi::default();
+        let (_a, texts, _f) = run_ui(|ctx| stepper_window(ctx, &mut stepper));
+        assert!(texts.iter().any(|t| t.contains("LIVE")), "{texts:?}");
+
+        stepper.paused = true;
+        stepper.tick_kind = TickKind::Halt;
+        let (_a, texts, _f) = run_ui(|ctx| stepper_window(ctx, &mut stepper));
+        let all = texts.join("\n");
+        assert!(all.contains("HALT"), "{all}");
+        assert!(!all.contains("LIVE"), "暂停时不该还报 LIVE: {all}");
     }
 
     // -------------------------------------------------- DIALOG 模态(H-P1-04)

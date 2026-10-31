@@ -37,6 +37,7 @@ pub mod diagnostics;
 pub mod panic_guard;
 pub mod script;
 pub mod sound_device;
+pub mod stepper;
 pub mod ui;
 
 pub use sound_device::SoundSink;
@@ -251,6 +252,24 @@ pub struct HostOptions {
     /// 统一控制台(Q1 R2):宿主 observe 的诊断同步出控制台行(与 egui
     /// 面板同源、两路消费);`None` = 保持旧只进面板行为(测试/嵌入)。
     pub console: Option<yu_log::console::ConsoleHandle>,
+    /// 「推进 N 帧」的默认 N(`--step-frames`;面板里改完即生效)。
+    pub step_frames: u32,
+    /// 步进器取证输出目录(`--capture-dir`);`None` = `target/tmp/debug-ui/s<unix>`。
+    pub capture_dir: Option<PathBuf>,
+    /// 启动即暂停(`--paused`;配合步进器/脚本定帧排查)。
+    pub start_paused: bool,
+    /// 启动后用**固定步长**推进到该逻辑帧就停住(`--step-to`)。
+    ///
+    /// 这是 `--paused` 的自动化版本:不必手按 F6 就能到「第 348 帧」这种
+    /// 现场;每一帧都按 [`HostOptions::step_frames`] 口径落盘。到达后保持
+    /// 暂停,由主人继续手推或按 F5 恢复实时。
+    pub step_to: Option<u64>,
+    /// 启动即开始录制(`--record`)。
+    ///
+    /// 录制只把帧放进内存环形缓冲,不写盘;按 F9/「抓取」才回溯落盘。
+    /// **不与录制自动暂停叠加**:命令行显式要录制,意思是「先跑起来,
+    /// 看到问题再抓」,所以启动时不停住(面板上按 F8 才走「录即暂停」)。
+    pub record: bool,
 }
 
 impl Default for HostOptions {
@@ -277,6 +296,11 @@ impl Default for HostOptions {
             max_step_ms: None,
             fixed_step: false,
             console: None,
+            step_frames: stepper::DEFAULT_STEP_FRAMES,
+            capture_dir: None,
+            start_paused: false,
+            step_to: None,
+            record: false,
         }
     }
 }
@@ -765,6 +789,10 @@ struct App {
     presented_dialogs: std::collections::BTreeSet<u64>,
     /// 渲染耗时曲线样本(`--debug-ui` 的独立窗口;每宿主帧一个)。
     render_samples: std::collections::VecDeque<f32>,
+    /// 帧步进推进器(暂停/推进 N 帧/录制/抓取)。
+    stepper: stepper::Stepper,
+    /// `--step-to`:还要推进到的逻辑帧(`None` = 没有待办)。
+    step_to: Option<u64>,
 }
 
 impl App {
@@ -843,6 +871,23 @@ impl App {
         let console = opts.console.take();
         let mut diagnostics = DiagnosticsHost::default();
         diagnostics.set_console(console.clone());
+        let mut step = stepper::Stepper::new();
+        step.set_step_frames(opts.step_frames);
+        if let Some(dir) = opts.capture_dir.clone() {
+            step.set_dir(dir);
+        }
+        let step_to = opts.step_to;
+        if opts.start_paused || step_to.is_some() {
+            step.set_paused(true);
+        }
+        if opts.record {
+            step.start_recording_live();
+        }
+        if let Some(target) = step_to {
+            host_line!(
+                "yu-desktop: --step-to {target}: 固定步长推进到逻辑帧 {target} 后暂停(每帧取证)"
+            );
+        }
         Ok(Self {
             engine,
             opts,
@@ -882,6 +927,8 @@ impl App {
             dialog_inputs: Default::default(),
             presented_dialogs: Default::default(),
             render_samples: std::collections::VecDeque::with_capacity(ui::RENDER_GRAPH_SAMPLES),
+            stepper: step,
+            step_to,
         })
     }
 
@@ -890,6 +937,24 @@ impl App {
         self.fatal = Some(message);
         self.stopping = true;
         event_loop.exit();
+    }
+
+    /// 执行上一帧 UI/快捷键提出的「抓取」请求(环形缓冲 → 磁盘)。
+    ///
+    /// 放在帧边界而不是 UI 闭包里:一次可能写几十帧 PNG/JSONL,不该卡在
+    /// egui 的绘制路径中间。失败显式报错(不静默吞)。
+    fn pump_capture(&mut self) {
+        if !self.stepper.take_capture_request() {
+            return;
+        }
+        match self.stepper.dump_ring() {
+            Ok(0) => host_line!("yu-desktop: stepper 抓取: 环形缓冲为空,未写文件"),
+            Ok(count) => host_line!(
+                "yu-desktop: stepper 抓取 {count} 帧 → {}",
+                self.stepper.dir().display()
+            ),
+            Err(error) => host_error!("yu-desktop: stepper 抓取失败: {error}"),
+        }
     }
 
     fn window_size(&self) -> (u32, u32) {
@@ -1442,6 +1507,9 @@ impl App {
             .unwrap_or((None, None));
         let cursor_visible = self.cursor_visible;
         let diagnostics = self.diagnostics.snapshot();
+        let mut stepper_ui = self.stepper.ui();
+        stepper_ui.engine_frame = report.frame;
+        stepper_ui.clock_ms = report.clock_ms;
         let snapshot = ui::UiSnapshot {
             backend: self.engine.backend().to_string(),
             frame: report.frame,
@@ -1477,9 +1545,14 @@ impl App {
                 .as_ref()
                 .map(|c| c.recent_snapshot())
                 .unwrap_or_default(),
+            stepper: stepper_ui,
         };
         let actions = ui::debug_window(ctx, &snapshot);
         ui::render_graph_window(ctx, &self.render_samples);
+        // 步进器面板:读数来自 `snapshot.stepper`,动作/编辑值在闭包外回写。
+        let mut stepper_ui = snapshot.stepper;
+        let stepper_actions = ui::stepper_window(ctx, &mut stepper_ui);
+        self.stepper.apply_ui(&stepper_ui, stepper_actions);
         if actions.clear_log {
             if let Some(console) = &self.console {
                 console.clear_recent();
@@ -1491,6 +1564,10 @@ impl App {
     /// 卡住横幅的触发条件(不是 panic;引擎仍在跑,只是不推进)。
     fn attention_hint(&self) -> Option<String> {
         if !self.show_attention || self.freeze.is_some() {
+            return None;
+        }
+        // 步进器暂停是**主人要求的停住**,不是卡住:琥珀横幅会误报。
+        if self.stepper.halted() {
             return None;
         }
         // DIALOG 模态本身就在解释「为什么不动」;琥珀横幅会盖在模态上,
@@ -2130,6 +2207,24 @@ impl App {
     }
 
     fn finish(&mut self) {
+        // 步进器:退出前把环形缓冲里还没落盘的帧写出去 —— 主人看到问题
+        // 直接关窗口,现场也不能丢。
+        if self.stepper.has_ring() {
+            match self.stepper.dump_ring() {
+                Ok(count) => host_line!(
+                    "yu-desktop: stepper 退出补写 {count} 帧 → {}",
+                    self.stepper.dir().display()
+                ),
+                Err(error) => host_error!("yu-desktop: stepper 退出补写失败: {error}"),
+            }
+        }
+        if self.stepper.ui().captured > 0 {
+            host_line!(
+                "yu-desktop: stepper 共落盘 {} 帧 → {}",
+                self.stepper.ui().captured,
+                self.stepper.dir().display()
+            );
+        }
         if let Some(path) = self.opts.shot.clone() {
             // 流式模式下 last_surface 是上一帧后缓冲;截图前同步读回当前帧。
             let _ = self.engine.refresh_screen_surface();
@@ -2436,6 +2531,44 @@ impl ApplicationHandler for App {
                     self.show_debug = !self.show_debug;
                     return;
                 }
+                // 步进器快捷键:只在调试面板启用时归宿主,且不吃 repeat
+                // (按住不放不该连续推进几百帧)。
+                if self.opts.debug_ui && pressed && !event.repeat {
+                    match code {
+                        KeyCode::F5 => {
+                            self.stepper.toggle_pause();
+                            host_line!(
+                                "yu-desktop: stepper 手动暂停={}",
+                                self.stepper.paused()
+                            );
+                            return;
+                        }
+                        KeyCode::F6 => {
+                            let frames = self.stepper.step_frames();
+                            self.stepper.request_step(frames);
+                            host_line!("yu-desktop: stepper 推进 {frames} 帧");
+                            return;
+                        }
+                        KeyCode::F7 => {
+                            self.stepper.request_step(1);
+                            return;
+                        }
+                        KeyCode::F8 => {
+                            self.stepper.toggle_record();
+                            host_line!(
+                                "yu-desktop: stepper 录制={} (目录 {})",
+                                self.stepper.recording(),
+                                self.stepper.dir().display()
+                            );
+                            return;
+                        }
+                        KeyCode::F9 => {
+                            self.stepper.request_capture();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 if egui_consumed
                     || (egui_ui_active
                         && (self.egui_ctx.egui_wants_keyboard_input()
@@ -2461,6 +2594,7 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
+        self.pump_capture();
         let now = Instant::now();
         let wait_target = self.wait_target();
         if now < wait_target {
@@ -2520,6 +2654,76 @@ impl ApplicationHandler for App {
             return;
         }
 
+        // ---- 帧步进器:本帧推进 / 定步推进 / 停住 ----
+        //
+        // HALT 时**不 tick**:逻辑帧号、逻辑时钟、脚本任务全部冻住,只重绘
+        // 最后一帧。这跟「卡住」不是一回事(诊断横幅由 `attention_hint`
+        // 抑制),是主人明确要求停住。
+        //
+        // `--step-to` 是同一套机制的自动化:还没到目标帧就喂一帧步进,
+        // 到了就把待办清掉、保持暂停(之后由主人 F5/F6 接管)。
+        if let Some(target) = self.step_to {
+            if self.engine.frame() < target {
+                if self.stepper.pending_steps() == 0 {
+                    self.stepper.request_step(1);
+                }
+            } else {
+                host_line!(
+                    "yu-desktop: --step-to {target} 已到达(逻辑帧 {}),保持暂停",
+                    self.engine.frame()
+                );
+                self.step_to = None;
+            }
+        }
+        let tick_kind = self.stepper.tick_kind();
+        if tick_kind == stepper::TickKind::Halt {
+            let draw_started = Instant::now();
+            if let Err(record) =
+                panic_guard::catch(Phase::Draw, self.frames, self.engine.frame(), || {
+                    self.draw(event_loop)
+                })
+            {
+                self.enter_freeze(record);
+            }
+            let draw_ms = draw_started.elapsed().as_secs_f64() * 1000.0;
+            self.frames = self.frames.saturating_add(1);
+            let work_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
+            // 暂停帧也进录制环形缓冲:主人按「抓取」时想取的往往正是
+            // 「停在这一帧」的样子。
+            let paused_surface = self.last_surface.clone();
+            if let Some(surface) = paused_surface {
+                self.stepper.observe(
+                    &self.engine,
+                    self.diagnostics.snapshot(),
+                    self.frames,
+                    stepper::Timings {
+                        interval_ms,
+                        draw_ms,
+                    },
+                    stepper::Phase::Live,
+                    Some(surface),
+                );
+            }
+            self.record_frame(interval_ms, work_ms, 0.0, 0.0, draw_ms);
+            if let Some(limit) = self.frames_limit() {
+                if self.frames >= limit {
+                    host_line!("yu-desktop: frame limit {limit} reached while paused");
+                    self.stopping = true;
+                    event_loop.exit();
+                    return;
+                }
+            }
+            self.schedule_next_frame(event_loop);
+            return;
+        }
+
+        // 从暂停恢复(或从推进切回实时)时丢弃暂停期间的墙钟:恢复后的
+        // 第一帧不该一次吃掉几十秒时间差(那会把动画瞬移过去)。
+        if self.stepper.take_resumed() {
+            self.engine.reset_realtime_clock();
+            host_line!("yu-desktop: 步进器恢复实时,已重置实时时钟");
+        }
+
         // `--profile-frames` 的窗口 = 这一帧(否则第一次打印会把此前
         // 所有帧的累计都算进来,曾把設定点击误读成 1.8s)。
         if !self.profile_frames.is_empty() || self.profile_commands {
@@ -2528,6 +2732,7 @@ impl ApplicationHandler for App {
         let tick_started = Instant::now();
         let selftest = self.opts.panic_selftest == Some(self.frames);
         let engine_frame = self.engine.frame();
+        let stepped = tick_kind == stepper::TickKind::Step;
         let outcome = panic_guard::catch(Phase::Tick, self.frames, engine_frame, || {
             if selftest {
                 panic!(
@@ -2535,7 +2740,10 @@ impl ApplicationHandler for App {
                     self.frames
                 );
             }
-            if self.opts.fixed_step {
+            // 推进帧用**固定步长**(每帧 `1000/fps` 逻辑毫秒):同一脚本在
+            // 任何机器上的第 N 帧都是同一个画面 —— 这是复现中间帧(眨眼)
+            // 需要的口径。实时帧仍走墙钟(`@_OS_TIME` 语义)。
+            if stepped || self.opts.fixed_step {
                 self.engine.tick()
             } else {
                 self.engine.tick_realtime()
@@ -2545,6 +2753,9 @@ impl ApplicationHandler for App {
             Ok(Ok(rendered)) => {
                 self.last_surface = Some(rendered.surface);
                 self.frames += 1;
+                if stepped {
+                    self.stepper.after_tick();
+                }
             }
             Ok(Err(error)) => {
                 self.fail(event_loop, format!("tick 失败: {error}"));
@@ -2604,6 +2815,28 @@ impl ApplicationHandler for App {
         self.flush_input_latency();
         self.observe_spike(interval_ms, work_ms, engine_tick_ms, engine_render_ms, draw_ms);
         self.observe_tick_profile(engine_tick_ms);
+        // 帧步进器取证:推进帧逐帧立即落盘;实时帧在录制中才进环形缓冲。
+        let capture_phase = if stepped {
+            stepper::Phase::Step
+        } else {
+            stepper::Phase::Live
+        };
+        let capture_surface = self.last_surface.clone();
+        if let Some(surface) = capture_surface {
+            // 环形缓冲只持有 `Arc<Surface>`,不复制整屏像素;证据体在入环
+            // 时就冻结(见 `stepper::Stepper::observe`)。
+            self.stepper.observe(
+                &self.engine,
+                self.diagnostics.snapshot(),
+                self.frames,
+                stepper::Timings {
+                    interval_ms,
+                    draw_ms,
+                },
+                capture_phase,
+                Some(surface),
+            );
+        }
         if self.frames <= 8 || self.frames.is_multiple_of(60) {
             let report = self.engine.last_report();
             // 周期采样是**进度**不是告警:走 Verbose,默认不显示,

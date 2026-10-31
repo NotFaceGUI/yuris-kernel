@@ -42,6 +42,13 @@ target/release/yu-cli run "<project>" --backend wgpu --frames 300 \
 # Windows 桌面窗口
 target/release/yu-cli run "<project>" --mode desktop --backend wgpu --debug-ui
 
+# 帧步进器:定步推进到第 348 帧停住,每帧落盘证据(JSONL + PNG)
+target/release/yu-cli run "<project>" --mode desktop --backend wgpu --debug-ui \
+  --step-to 348 --capture-dir target/tmp/blink
+
+# 帧步进器:实时跑并录制,看到问题按 F9 回溯落盘(退出也会补写)
+target/release/yu-cli run "<project>" --mode desktop --backend wgpu --debug-ui --record
+
 # 本地服务 + 浏览器呈现；默认打开浏览器，--no-open 只起服务
 target/release/yu-cli serve "<project>" --backend wgpu --port 4173
 

@@ -271,6 +271,26 @@ desktop 专有(--mode desktop;需默认 feature 构建):
   --spike-ms 20                    长帧阈值(ms,work 口径;默认 20)
   --pump-cap N                     每任务每泵命令上限(DIV-HOST-002,诊断用)
   --panic-selftest N               panic 防线自测
+  --step-frames N                  「推进 N 帧」的默认 N(默认 10;面板可改)
+  --capture-dir DIR                步进器取证输出目录
+                                   (默认 target/tmp/debug-ui/s<unix>)
+  --paused                         启动即暂停(配合帧步进器定帧排查)
+  --step-to N                      固定步长推进到逻辑帧 N 后暂停(--paused 的
+                                   自动化版,每帧取证;排查「第 348 帧才出现」
+                                   的现场用它)
+  --record                         启动即录制:实时帧进内存环形缓冲(不写盘),
+                                   F9 或退出时回溯落盘。适合「跑起来看到问题
+                                   再按键」,不会因为晚按而丢现场
+
+帧步进器(--debug-ui 下):
+  F5 暂停/恢复   F6 推进 N 帧   F7 推进 1 帧
+  F8 录制开关(自动暂停)        F9 抓取(环形缓冲落盘)
+  两个暂停分开:手动暂停 + 录制自动暂停;任一为真引擎不 tick(逻辑帧
+  与逻辑时钟都不走)。推进用固定步长(1000/fps),同一脚本第 N 帧在
+  任何机器上画面一致 —— 复现眨眼这类中间帧就靠这个口径。
+  证据:frames.jsonl 每行一帧(帧报告/渲染报告与跳过项/gfx 诊断含脚本
+  pc/输入按下沿/声音层/op 目标分布/GPU 占用/渲染阶段微秒/屏幕指纹)
+  + 整屏 PNG;录制中实时帧进环形缓冲,F9 回溯落盘,退出时补写。
 
 宿主注入(BootConfig,全部显式给值):
   screen_color=32   @_SCREEN_COLOR(浏览器/桌面 32bpp)

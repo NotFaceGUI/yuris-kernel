@@ -331,6 +331,54 @@ pub fn to_pretty(value: &Value) -> String {
     out
 }
 
+/// 单行输出(JSONL:debug-ui 帧抓取流)。
+///
+/// 与 [`to_pretty`] 共用同一份转义与数值口径,只是不缩进、不换行 ——
+/// 一行一条记录才能被 `jq -c`/流式读取消费。返回值**不含**行尾换行
+/// (调用方负责逐行拼接)。
+pub fn to_compact(value: &Value) -> String {
+    let mut out = String::new();
+    write_flat(&mut out, value);
+    out
+}
+
+fn write_flat(out: &mut String, value: &Value) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+        Value::Number(value) => {
+            if value.fract() == 0.0 && value.abs() < 9e15 {
+                out.push_str(&format!("{}", *value as i64));
+            } else {
+                out.push_str(&format!("{value}"));
+            }
+        }
+        Value::String(text) => write_string(out, text),
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_flat(out, item);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (index, (key, value)) in map.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_string(out, key);
+                out.push(':');
+                write_flat(out, value);
+            }
+            out.push('}');
+        }
+    }
+}
+
 fn write_value(out: &mut String, value: &Value, indent: usize) {
     match value {
         Value::Null => out.push_str("null"),
@@ -440,5 +488,18 @@ mod tests {
         let again = parse(&pretty).unwrap();
         assert_eq!(value, again);
         assert!(pretty.contains("\"a\": {"));
+    }
+
+    /// JSONL 每行一条:必须是**单行**、可被同一解析器读回、转义口径一致。
+    #[test]
+    fn compact_is_single_line_and_roundtrips() {
+        let text = r#"{"b":[1,2.5,null],"a":{"x":true,"y":"q\"z\n"},"c":[]}"#;
+        let value = parse(text).unwrap();
+        let compact = to_compact(&value);
+        assert!(!compact.contains('\n'), "多行会破坏 JSONL: {compact}");
+        assert_eq!(parse(&compact).unwrap(), value);
+        // 与 pretty 是同一份数据,只是空白不同。
+        assert_eq!(parse(&to_pretty(&value)).unwrap(), value);
+        assert!(compact.contains(r#""y":"q\"z\n""#), "{compact}");
     }
 }

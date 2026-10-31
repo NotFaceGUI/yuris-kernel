@@ -65,6 +65,17 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let max_step_ms = parse_opt::<u32>(&mut args, "max-step-ms")?.filter(|ms| *ms > 0);
     // 固定步长回放:性能/像素对拍专用(牺牲墙钟语义,换可复现)。
     let fixed_step = args.switch("fixed-step");
+    // 帧步进器(debug-ui):默认推进帧数 / 取证目录 / 启动即暂停。
+    // 帧数在面板里也能改;这里只是启动值。
+    let step_frames = parse_opt::<u32>(&mut args, "step-frames")?
+        .unwrap_or(yu_host_desktop::stepper::DEFAULT_STEP_FRAMES)
+        .clamp(1, yu_host_desktop::stepper::MAX_STEP_FRAMES);
+    let capture_dir = args.flag("capture-dir").map(PathBuf::from);
+    let start_paused = args.switch("paused");
+    // 定步推进到指定逻辑帧(`--step-to`):`--paused` 的自动化版本。
+    let step_to = parse_opt::<u64>(&mut args, "step-to")?;
+    // 启动即录制(实时帧进环形缓冲,不写盘;F9/退出时落盘)。
+    let record = args.switch("record");
     let profile_frames = match args.flag("profile-frames") {
         Some(list) => list
             .split(',')
@@ -286,6 +297,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             max_step_ms,
             fixed_step,
             console: Some(console),
+            step_frames,
+            capture_dir,
+            start_paused,
+            step_to,
+            record,
         },
     )
     .map_err(|error| Failure::runtime(error))
@@ -351,6 +367,15 @@ fn usage() -> String {
      \x20      [--frames N] [--shot PNG] [--fullscreen] [--pixel] [--debug-ui]\n\
      \x20      [--no-sound] [--reconcile] [--script case.json] [--save-root DIR]\n\
      \x20      [--log-file PATH] [--frame-stats CSV] [--profile-frames 1,4,340] [--pump-cap N]\n\
-     \x20      [--spike-log PATH] [--spike-ms 20] [--max-step-ms N] [--fixed-step]"
+     \x20      [--spike-log PATH] [--spike-ms 20] [--max-step-ms N] [--fixed-step]\n\
+     \x20      [--step-frames N] [--capture-dir DIR] [--paused] [--step-to N] [--record]\n\
+     \n\
+     \x20 --debug-ui 下帧步进器快捷键: F5 暂停/恢复 · F6 推进 N 帧 · F7 推进 1 帧\n\
+     \x20 · F8 录制开关(自动暂停)· F9 抓取(环形缓冲落盘)\n\
+     \x20 --step-frames  N 的默认值(默认 10,--debug-ui 面板里也能改)\n\
+     \x20 --capture-dir  取证输出目录(默认 target/tmp/debug-ui/s<unix>)\n\
+     \x20 --paused       启动即暂停(配合快捷键定帧排查)\n\
+     \x20 --step-to N    固定步长推进到逻辑帧 N 后暂停(每帧取证;--paused 的自动化版)\n\
+     \x20 --record       启动即录制(实时帧进环形缓冲,F9/退出时落盘;不停住)"
         .to_string()
 }
