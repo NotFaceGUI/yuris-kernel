@@ -38,7 +38,8 @@ import java.util.List;
  */
 public final class SetupActivity extends AppCompatActivity {
     private static final String TAG = "yu-android";
-    private static final String PREFS = "yu_kernel";
+    /** 首选项文件名(壳内共享:选目录页与游戏页都读写它)。 */
+    static final String PREFS = "yu_kernel";
     private static final int REQUEST_GAME_DIR = 1001;
     private static final int REQUEST_FONT = 1002;
     private static final int REQUEST_PLAY = 1003;
@@ -51,7 +52,6 @@ public final class SetupActivity extends AppCompatActivity {
 
     private TextView gameLabel;
     private TextView saveLabel;
-    private TextView fontLabel;
     private TextView status;
     private Spinner fontSpinner;
     private Button startButton;
@@ -67,7 +67,11 @@ public final class SetupActivity extends AppCompatActivity {
     private String gpuBackend = "auto";
     /** 写调试日志到游戏目录(debug/*.jsonl)。 */
     private boolean debugLog;
+    /** 状态浮层(HUD)。发布默认关:浮层每秒还要拼状态串。 */
+    private boolean showHud;
     private List<String> systemFonts = new ArrayList<>();
+    /** 上次选中的字体(持久化;下拉加载完成后恢复选中)。 */
+    private String savedFontFamily = "";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -77,9 +81,16 @@ public final class SetupActivity extends AppCompatActivity {
         gameDir = prefs.getString("game_dir", null);
         saveDir = prefs.getString("save_dir", null);
         fontPath = prefs.getString("font_path", null);
+        savedFontFamily = prefs.getString("font_family", "");
+        // 从已持久化的字体路径重建导入项的名字:下拉最后一项靠它存在,
+        // 否则重启后这一项消失、恢复选中必然失败(用户看到的就是"没记住")。
+        if (fontPath != null && !fontPath.isEmpty()) {
+            importedFontName = new File(fontPath).getName();
+        }
         backend = prefs.getString("backend", "soft");
         gpuBackend = prefs.getString("gpu_backend", "auto");
         debugLog = prefs.getBoolean("debug_log", false);
+        showHud = prefs.getBoolean("show_hud", false);
 
         ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(BG);
@@ -136,10 +147,6 @@ public final class SetupActivity extends AppCompatActivity {
                 new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46));
         spinnerParams.topMargin = dp(6);
         fontCard.addView(fontSpinner, spinnerParams);
-
-        fontLabel = bodyText();
-        fontLabel.setTextSize(12f);
-        fontCard.addView(fontLabel);
 
         Button importFont = secondaryButton("导入字体文件(ttf / otf / ttc)");
         importFont.setOnClickListener(v -> pickFont());
@@ -207,6 +214,21 @@ public final class SetupActivity extends AppCompatActivity {
         runCard.addView(gpuRow);
         refreshGpuButtons(autoButton, glesButton, vulkanButton);
 
+        // 状态浮层:只在需要看帧率/计数时打开。关闭时壳完全不调
+        // nativeStatus(),也就没有每秒一次的状态串拼装与 logcat 写入。
+        Button hudToggle = secondaryButton("状态浮层:关");
+        hudToggle.setTextColor(TEXT);
+        hudToggle.setOnClickListener(v -> {
+            showHud = !showHud;
+            hudToggle.setText(showHud ? "状态浮层:开(帧率/计数)" : "状态浮层:关");
+            hudToggle.setTextColor(showHud ? ACCENT : TEXT);
+        });
+        runCard.addView(hudToggle, buttonParams());
+        if (showHud) {
+            hudToggle.setText("状态浮层:开(帧率/计数)");
+            hudToggle.setTextColor(ACCENT);
+        }
+
         Button debugToggle = secondaryButton("调试日志:关");
         debugToggle.setOnClickListener(v -> {
             debugLog = !debugLog;
@@ -248,6 +270,8 @@ public final class SetupActivity extends AppCompatActivity {
         root.addView(status, statusParams);
 
         refreshLabels();
+        // 字体枚举要调 native:先把 NDK 上下文备好(与 MainActivity 同序)。
+        NativeHost.nativeInitAndroidContext(this);
         loadSystemFonts();
         playEntrance(root);
     }
@@ -327,7 +351,10 @@ public final class SetupActivity extends AppCompatActivity {
             refreshLabels();
         } else if (requestCode == REQUEST_FONT) {
             fontPath = picked.getAbsolutePath();
-            refreshLabels();
+            importedFontName = picked.getName();
+            // 导入即选中:重新加载下拉后直接定位到它。
+            savedFontFamily = importedFontName;
+            loadSystemFonts();
         }
     }
 
@@ -432,9 +459,6 @@ public final class SetupActivity extends AppCompatActivity {
             saveLabel.setText(saveDir == null ? "游戏目录/save" : saveDir);
             saveLabel.setTextColor(MUTED);
         }
-        if (fontLabel != null) {
-            fontLabel.setText(fontPath == null ? "" : new File(fontPath).getName());
-        }
         if (startButton != null) {
             boolean ready = gameDir != null;
             startButton.setEnabled(ready);
@@ -485,32 +509,66 @@ public final class SetupActivity extends AppCompatActivity {
                 List<String> entries = new ArrayList<>();
                 entries.add("系统默认");
                 entries.addAll(systemFonts);
+                // 已导入的字体作为下拉里的最后一项(选中即生效,不再单独显示)。
+                if (importedFontName != null) {
+                    entries.add(importedFontName);
+                }
                 ArrayAdapter<String> adapter = new ArrayAdapter<>(
                         this, android.R.layout.simple_spinner_dropdown_item, entries);
                 fontSpinner.setAdapter(adapter);
-                fontSpinner.setEnabled(!systemFonts.isEmpty());
-                fontSpinner.setSelection(0);
+                fontSpinner.setEnabled(true);
+                // 恢复上次选择(游戏目录同级持久化)。
+                int restore = indexOfFamily(savedFontFamily, entries);
+                fontSpinner.setSelection(restore);
             });
         }, "yu-font-list").start();
+    }
+
+    /** 已导入字体的显示名(下拉最后一项);`null` = 没有导入过。 */
+    private String importedFontName;
+
+    /** 在下拉条目里找 family 的索引;找不到回 0(系统默认)。 */
+    private int indexOfFamily(String family, List<String> entries) {
+        if (family == null || family.isEmpty()) {
+            return 0;
+        }
+        for (int i = 1; i < entries.size(); i++) {
+            if (family.equals(entries.get(i))) {
+                return i;
+            }
+        }
+        return 0;
     }
 
     private void launchGame() {
         if (gameDir == null) {
             return;
         }
+        // 下拉索引 0 = 系统默认;1..N = 系统字体;最后一项(若有)= 导入字体。
         String family = "";
+        String chosenFontFile = null;
         int position = fontSpinner.getSelectedItemPosition();
         if (position > 0 && position - 1 < systemFonts.size()) {
             family = systemFonts.get(position - 1);
+        } else if (importedFontName != null && position == systemFonts.size() + 1) {
+            // 选了导入字体:把它当作 family 交给内核内部加载的文件路径。
+            chosenFontFile = fontPath;
+        }
+        if (position >= 0) {
+            savedFontFamily = family.isEmpty()
+                    ? (importedFontName != null && position == systemFonts.size() + 1
+                        ? importedFontName : "")
+                    : family;
         }
         String effectiveSave = saveDir != null ? saveDir : new File(gameDir, "save").getAbsolutePath();
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putString("game_dir", gameDir)
                 .putString("save_dir", saveDir)
-                .putString("font_family", family)
+                .putString("font_family", savedFontFamily)
                 .putString("backend", backend)
                 .putString("gpu_backend", gpuBackend)
                 .putBoolean("debug_log", debugLog)
+                .putBoolean("show_hud", showHud)
                 .apply();
         Intent intent = new Intent(this, MainActivity.class);
         intent.putExtra(MainActivity.EXTRA_GAME_DIR, gameDir);
@@ -519,8 +577,10 @@ public final class SetupActivity extends AppCompatActivity {
         intent.putExtra(MainActivity.EXTRA_BACKEND, backend);
         intent.putExtra(MainActivity.EXTRA_GPU_BACKEND, gpuBackend);
         intent.putExtra(MainActivity.EXTRA_DEBUG_LOG, debugLog);
-        if (fontPath != null) {
-            intent.putExtra(MainActivity.EXTRA_FONT_PATH, fontPath);
+        intent.putExtra(MainActivity.EXTRA_SHOW_HUD, showHud);
+        String fontFileToUse = chosenFontFile != null ? chosenFontFile : fontPath;
+        if (fontFileToUse != null) {
+            intent.putExtra(MainActivity.EXTRA_FONT_PATH, fontFileToUse);
         }
         // 用 forResult:GPU 等启动失败时把原因带回来显示(不必重开配置界面)。
         startActivityForResult(intent, REQUEST_PLAY);

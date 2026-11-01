@@ -1,6 +1,7 @@
 package org.yuris.kernel;
 
 import android.app.Activity;
+import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -10,15 +11,20 @@ import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Log;
 import android.view.MotionEvent;
-import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.Gravity;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import android.widget.FrameLayout;
+import android.widget.TextView;
 
 import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * 轻量验证壳：把内核 so 跑起来，帧画到 SurfaceView，触摸转成引擎输入。
@@ -39,7 +45,8 @@ import java.io.File;
  * </pre>
  * 存档写 {@code files/save/}。
  */
-public final class MainActivity extends Activity implements SurfaceHolder.Callback {
+public final class MainActivity extends Activity
+        implements android.view.TextureView.SurfaceTextureListener {
     static final String TAG = "yu-android";
     static final String ENTRY = "SYSTEM_START";
     /** 配置界面传入的目录/入口/字体(缺省则回落到 app 私有目录)。 */
@@ -51,10 +58,13 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     static final String EXTRA_BACKEND = "backend";
     static final String EXTRA_GPU_BACKEND = "gpu_backend";
     static final String EXTRA_DEBUG_LOG = "debug_log";
+    /** 状态浮层开关(发布默认关)。 */
+    static final String EXTRA_SHOW_HUD = "show_hud";
     /** 启动失败原因回传给配置界面。 */
     static final String EXTRA_START_ERROR = "start_error";
 
-    private SurfaceView surfaceView;
+    private android.view.TextureView textureView;
+    private TextView hudView;
     private volatile boolean running;
     private Thread renderThread;
 
@@ -73,6 +83,9 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     private static final int EV_DOWN = 1;
     private static final int EV_UP = 0;
     private static final int EV_MOVE = 2;
+    /** 滚轮一格(上/下)。引擎侧是 `_MOUSE_U`/`_MOUSE_D` 的按下+抬起对。 */
+    private static final int EV_WHEEL_U = 3;
+    private static final int EV_WHEEL_D = 4;
 
     private volatile int pointerX;
     private volatile int pointerY;
@@ -91,8 +104,55 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     private volatile int presentWidth;
     private volatile int presentHeight;
 
+    /** 零拷贝上屏是否已生效(内核直接把帧送到本 Surface)。 */
+    private volatile boolean zeroCopyPresent;
+    /** 原生窗口 Surface(TextureView 提供;内核直接持有它的引用)。 */
+    private android.view.Surface nativeSurface;
+
     private volatile String statusLine = "";
+    /** 已提交给浮层的文本(节流用;只由渲染线程读写)。 */
+    private String hudText = "";
+    /** 状态浮层是否启用(壳侧开关;关掉后不再调 nativeStatus)。 */
+    private boolean showHud;
+    /** 调试日志是否启用(壳侧开关;关掉后不写 logcat、不落 JSONL)。 */
+    private boolean debugEnabled;
+    /** 虚拟鼠标模式(false = 直接触摸)。持久化,默认触摸。 */
+    private boolean mouseMode;
+    /** 虚拟鼠标在视图坐标里的位置(px)。 */
+    /** 本次手势是否已经向内核投递过「按下」。 */
+    private boolean pressedSent;
+    /** 手势起点(视图坐标;判定点击 vs 拖动)。 */
+    private float downX, downY;
+    private float virtualX = -1f;
+    private float virtualY = -1f;
+    /** 本次触摸是否已判定为拖动(超过 touchSlop)。 */
+    private boolean dragging;
+    private float dragLastX, dragLastY;
+    /** 手势开始时是否已有多指(用于滚动)。 */
+    private boolean scrolling;
+    private float wheelAccum;
+    private int activePointers;
+    /** 触摸态抬手后要把光标移出视口(清 hover)。 */
+    private boolean clearCursorAfterRelease;
+    private OverlayView overlayView;
+    private ModeButton modeButton;
+    private int touchSlopPx;
     private final Paint statusPaint = new Paint();
+    /** 浮层:标签(灰)/ 数值(青)/ fps 标签与数值(加粗、更大)。 */
+    private final Paint statusLabelPaint = new Paint();
+    private final Paint statusValuePaint = new Paint();
+    private final Paint statusFpsLabelPaint = new Paint();
+    private final Paint statusFpsValuePaint = new Paint();
+    /** 浮层行距与右边距(像素,初始化时按密度算)。 */
+    private float statusLineHeight;
+    private float statusRightMargin;
+    private float statusTopMargin;
+    /** 浮层底部留白。 */
+    private float statusBottomMargin;
+    /** 浮层左边界。 */
+    private float statusLeftMargin;
+    /** 浮层最大宽度(像素);0 = 按屏幕宽的 1/3 现算。 */
+    private float statusMaxWidth;
     /**
      * 上屏缩放画笔。
      *
@@ -107,59 +167,249 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        surfaceView = new SurfaceView(this);
-        SurfaceHolder surfaceHolder = surfaceView.getHolder();
-        // 显式 RGBA_8888:不指定时部分设备用 RGB_565,渐变/半透明会出现色带。
-        surfaceHolder.setFormat(android.graphics.PixelFormat.RGBA_8888);
-        surfaceHolder.addCallback(this);
-        surfaceView.setOnTouchListener(new View.OnTouchListener() {
+        // TextureView(不是 SurfaceView):它能把自己的 Surface 直接交给 wgpu
+        // 做零拷贝呈现,同时允许上层叠加普通 View 做状态浮层。
+        textureView = new android.view.TextureView(this);
+        textureView.setSurfaceTextureListener(this);
+        touchSlopPx = (int) (16 * getResources().getDisplayMetrics().density);
+        textureView.setOnTouchListener(new View.OnTouchListener() {
             @Override
             public boolean onTouch(View view, MotionEvent event) {
-                pointerX = (int) event.getX();
-                pointerY = (int) event.getY();
-                pointerDirty = true;
                 switch (event.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
-                        enqueueInput(EV_DOWN);
+                        activePointers = 1;
+                        scrolling = false;
+                        dragging = false;
+                        pressedSent = false;
+                        wheelAccum = 0f;
+                        downX = event.getX();
+                        downY = event.getY();
+                        dragLastX = downX;
+                        dragLastY = downY;
+                        // 触摸态**先不发按下**:这一下可能是点击,也可能是拖动或
+                        // 双指滚动的前半段。先按下会让"双指滚动"先误触发一次点击。
+                        // 真正的按下在"确认拖动"或"抬手确认点击"时补发。
+                        if (!mouseMode) {
+                            pointerX = (int) event.getX();
+                            pointerY = (int) event.getY();
+                            pointerDirty = true;
+                        }
+                        return true;
+                    case MotionEvent.ACTION_POINTER_DOWN:
+                        // 第二根手指落下 = 滚动模式(整段手势不再产生点击)。
+                        activePointers = event.getPointerCount();
+                        scrolling = true;
+                        if (!mouseMode && pressedSent) {
+                            // 已经确认拖动并按下过:补一个抬起,别让键卡住。
+                            enqueueInput(EV_UP);
+                            pressedSent = false;
+                        }
+                        dragging = false;
+                        wheelAccum = 0f;
+                        dragLastY = averageY(event);
                         return true;
                     case MotionEvent.ACTION_MOVE:
-                        enqueueInput(EV_MOVE);
+                        if (scrolling || event.getPointerCount() >= 2) {
+                            scrolling = true;
+                            float y = averageY(event);
+                            wheelAccum += dragLastY - y;
+                            dragLastY = y;
+                            // 每 24dp 发一格滚轮(_MOUSE_U/_MOUSE_D)。
+                            float notch = 24 * getResources().getDisplayMetrics().density;
+                            while (wheelAccum >= notch) {
+                                enqueueWheel(true);
+                                wheelAccum -= notch;
+                            }
+                            while (wheelAccum <= -notch) {
+                                enqueueWheel(false);
+                                wheelAccum += notch;
+                            }
+                            return true;
+                        }
+                        if (mouseMode) {
+                            // 拖动 = 移动虚拟鼠标(不点击)。
+                            float dx = event.getX() - dragLastX;
+                            float dy = event.getY() - dragLastY;
+                            if (!dragging && (Math.abs(dx) > 2 || Math.abs(dy) > 2)) {
+                                dragging = true;
+                            }
+                            if (dragging) {
+                                moveVirtualCursor(dx, dy);
+                            }
+                        } else {
+                            pointerX = (int) event.getX();
+                            pointerY = (int) event.getY();
+                            pointerDirty = true;
+                            if (!dragging
+                                    && Math.hypot(pointerX - downX, pointerY - downY) > touchSlopPx) {
+                                dragging = true;
+                            }
+                            if (dragging && !pressedSent) {
+                                // 确认是拖动:这时才按下(拖拽语义与桌面一致)。
+                                enqueueInput(EV_DOWN);
+                                pressedSent = true;
+                            }
+                            enqueueInput(EV_MOVE);
+                        }
+                        dragLastX = event.getX();
+                        dragLastY = event.getY();
                         return true;
                     case MotionEvent.ACTION_UP:
-                        enqueueInput(EV_UP);
-                        tapCount++;
+                        activePointers = 0;
+                        if (scrolling) {
+                            scrolling = false;
+                            return true;
+                        }
+                        if (mouseMode) {
+                            // 没有拖动的那一次抬手 = 在虚拟光标处点击。
+                            if (!dragging) {
+                                pointerX = (int) virtualX;
+                                pointerY = (int) virtualY;
+                                pointerDirty = true;
+                                enqueueInput(EV_DOWN);
+                                enqueueInput(EV_UP);
+                                tapCount++;
+                            }
+                        } else {
+                            if (dragging && pressedSent) {
+                                enqueueInput(EV_UP);
+                            } else if (!dragging) {
+                                // 没拖动过的抬手 = 一次点击:此刻补发按下+抬起。
+                                pointerX = (int) event.getX();
+                                pointerY = (int) event.getY();
+                                pointerDirty = true;
+                                enqueueInput(EV_DOWN);
+                                enqueueInput(EV_UP);
+                                tapCount++;
+                            }
+                            // 抬手后把脚本光标移出视口:否则下一屏同位置若有
+                            // 按钮会保持 hover(像有个鼠标钉在那儿)。
+                            clearCursorAfterRelease = true;
+                        }
+                        dragging = false;
+                        pressedSent = false;
                         return true;
                     case MotionEvent.ACTION_CANCEL:
-                        enqueueInput(EV_UP);
+                        activePointers = 0;
+                        scrolling = false;
+                        dragging = false;
+                        if (!mouseMode) {
+                            if (pressedSent) {
+                                enqueueInput(EV_UP);
+                            }
+                            pressedSent = false;
+                            clearCursorAfterRelease = true;
+                        }
                         return true;
                     default:
                         return true;
                 }
             }
         });
-        setContentView(surfaceView);
+        // 容器:TextureView 铺满,状态浮层叠在上层(TextView,数值着色)。
+        FrameLayout container = new FrameLayout(this);
+        container.addView(textureView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        hudView = new TextView(this);
+        hudView.setTextColor(Color.WHITE);
+        hudView.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f);
+        hudView.setShadowLayer(3f, 1f, 1f, Color.BLACK);
+        hudView.setPadding(dp(12), dp(10), dp(12), dp(10));
+        hudView.setVisibility(View.GONE);
+        FrameLayout.LayoutParams hudParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP | Gravity.START);
+        container.addView(hudView, hudParams);
+
+        // 虚拟鼠标光标(仅在鼠标模式显示;不拦截触摸)。
+        overlayView = new OverlayView(this);
+        overlayView.setClickable(false);
+        overlayView.setFocusable(false);
+        container.addView(overlayView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // 模式切换按钮:右下角,半透明、小尺寸,不遮挡画面主体。
+        modeButton = new ModeButton(this);
+        FrameLayout.LayoutParams modeParams = new FrameLayout.LayoutParams(
+                dp(28), dp(28), Gravity.BOTTOM | Gravity.END);
+        modeParams.setMargins(0, 0, dp(6), dp(8));
+        container.addView(modeButton, modeParams);
+
+        setContentView(container);
         // 沉浸式要在 setContentView 之后:onCreate 早期 decorView 还没挂上,
         // `getInsetsController()` 会返回 null 并抛 NPE(实机崩溃已复现)。
-        surfaceView.post(this::applyImmersiveFullscreen);
+        textureView.post(this::applyImmersiveFullscreen);
 
+        // 浮层字号与原先一致(24f);着色只区分标签/数值,fps 仅加粗、不放大。
+        float statusTextSize = 24f;
         statusPaint.setColor(Color.WHITE);
-        statusPaint.setTextSize(24f);
+        statusPaint.setTextSize(statusTextSize);
         statusPaint.setShadowLayer(3f, 1f, 1f, Color.BLACK);
+
+        statusLabelPaint.setAntiAlias(true);
+        statusLabelPaint.setTextSize(statusTextSize);
+        statusLabelPaint.setColor(Color.WHITE);
+        statusLabelPaint.setShadowLayer(3f, 1f, 1f, Color.BLACK);
+
+        statusValuePaint.setAntiAlias(true);
+        statusValuePaint.setTextSize(statusTextSize);
+        statusValuePaint.setColor(Color.parseColor("#7ad1ff"));
+        statusValuePaint.setShadowLayer(3f, 1f, 1f, Color.BLACK);
+
+        statusFpsLabelPaint.setAntiAlias(true);
+        statusFpsLabelPaint.setTextSize(statusTextSize);
+        statusFpsLabelPaint.setColor(Color.WHITE);
+        statusFpsLabelPaint.setFakeBoldText(true);
+        statusFpsLabelPaint.setShadowLayer(3f, 1f, 1f, Color.BLACK);
+
+        statusFpsValuePaint.setAntiAlias(true);
+        statusFpsValuePaint.setTextSize(statusTextSize);
+        statusFpsValuePaint.setColor(Color.parseColor("#5ee08a"));
+        statusFpsValuePaint.setFakeBoldText(true);
+        statusFpsValuePaint.setShadowLayer(3f, 1f, 1f, Color.BLACK);
+
+        statusLineHeight = statusTextSize * 1.25f;
+        statusRightMargin = dp(14);
+        statusLeftMargin = dp(14);
+        statusTopMargin = dp(10);
+        statusBottomMargin = dp(10);
+        // 浮层最大宽度:屏幕宽度的 1/3。超过才换行(正常一行放得下)。
+        statusMaxWidth = 0f;
     }
 
+    // ---- TextureView 回调 ----
+
     @Override
-    public void surfaceCreated(SurfaceHolder holder) {
+    public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture surfaceTexture,
+                                          int width, int height) {
+        // 把 TextureView 的 Surface 交给内核:GPU 后端下直接零拷贝上屏。
+        nativeSurface = new android.view.Surface(surfaceTexture);
+        Log.i(TAG, "surface available " + width + "x" + height);
         startRenderLoop();
     }
 
     @Override
-    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-        // 视口由游戏 yscfg 决定；surface 尺寸变化只影响上屏缩放。
+    public void onSurfaceTextureSizeChanged(android.graphics.SurfaceTexture surfaceTexture,
+                                             int width, int height) {
+        NativeHost.nativeResizeSurface(Math.max(1, width), Math.max(1, height));
     }
 
     @Override
-    public void surfaceDestroyed(SurfaceHolder holder) {
+    public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture surfaceTexture) {
         stopRenderLoop();
+        if (nativeSurface != null) {
+            nativeSurface.release();
+            nativeSurface = null;
+        }
+        return true;
+    }
+
+    @Override
+    public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture surfaceTexture) {
+        // 内容由内核/壳绘制,这里无需动作。
     }
 
     @Override
@@ -173,8 +423,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     @Override
     protected void onResume() {
         super.onResume();
-        if (surfaceView != null && surfaceView.getHolder().getSurface() != null
-                && surfaceView.getHolder().getSurface().isValid()) {
+        if (textureView != null && textureView.isAvailable()) {
             startRenderLoop();
         }
     }
@@ -209,6 +458,8 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     }
 
     private void renderLoop() {
+        // 音频后端(oboe)需要 JavaVM + Context,必须先于引擎启动。
+        NativeHost.nativeInitAndroidContext(this);
         String version = NativeHost.nativeVersion();
         Log.i(TAG, "so: " + version);
 
@@ -239,6 +490,10 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         String backend = getIntent().getStringExtra(EXTRA_BACKEND);
         String backendHint = backend;
         boolean debugLog = getIntent().getBooleanExtra(EXTRA_DEBUG_LOG, false);
+        showHud = getIntent().getBooleanExtra(EXTRA_SHOW_HUD, false);
+        debugEnabled = debugLog;
+        mouseMode = getSharedPreferences(SetupActivity.PREFS, MODE_PRIVATE)
+                .getBoolean("mouse_mode", false);
         try {
             config.put("data_root", gameDir.getAbsolutePath());
             config.put("save_root", saveDir.getAbsolutePath());
@@ -249,6 +504,17 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             String gpuBackend = getIntent().getStringExtra(EXTRA_GPU_BACKEND);
             if (gpuBackend != null && !gpuBackend.isEmpty()) {
                 config.put("gpu_backend", gpuBackend);
+            }
+            // 隔离验证开关:传 EXTRA "audio" = false 时关音频(默认开)。
+            if (!getIntent().getBooleanExtra("audio", true)) {
+                config.put("audio", false);
+            }
+            // 诊断:抓 3 秒混音波形到 <游戏目录>/debug/audio-capture.wav。
+            config.put("audio_capture_ms", 3000);
+            // 纯音自测:旁路引擎,只验「环形缓冲 → oboe → 系统」这段。
+            // 若纯音也爆音,故障在设备/模拟器转发,与引擎无关。
+            if (getIntent().getBooleanExtra("tone", false)) {
+                config.put("audio_tone", true);
             }
             if (debugLog) {
                 // 日志落游戏目录,adb pull 即可取回(与 CLI --log-file 同格式)。
@@ -281,6 +547,22 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         }
         String init = NativeHost.nativeInitJson(config.toString());
         Log.i(TAG, "init: " + init);
+        // GPU 后端下尝试零拷贝上屏:把 TextureView 的 Surface 交给内核。
+        // 失败不致命 —— 保持 Bitmap 路径,只是帧率低一些。
+        if (init.startsWith("OK") && init.contains("backend=wgpu")) {
+            if (nativeSurface != null && nativeSurface.isValid()) {
+                int attached = NativeHost.nativeAttachSurface(nativeSurface);
+                zeroCopyPresent = attached == 0;
+                NativeHost.nativeResizeSurface(
+                        Math.max(1, textureView.getWidth()),
+                        Math.max(1, textureView.getHeight()));
+                Log.i(TAG, zeroCopyPresent
+                        ? "zero-copy present: ON"
+                        : "zero-copy present: OFF(" + NativeHost.nativeStatus() + ")");
+            } else {
+                Log.w(TAG, "zero-copy present: 没有有效 Surface");
+            }
+        }
         if (init.startsWith("ERR")) {
             statusLine = init;
             drawError();
@@ -294,12 +576,12 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         // 帧节拍:按引擎 fps 换算成纳秒,截止时间从第一帧起累加(不漂移)。
         final int targetFps = 60;
         long frameNanos = 1_000_000_000L / Math.max(1, targetFps);
-        long nextFrameNanos = System.nanoTime() + frameNanos;
         long fpsWindowStart = SystemClock.elapsedRealtime();
         int fpsFrames = 0;
         double fps = 0.0;
 
         while (running) {
+            long frameStartNanos = System.nanoTime();
             long started = SystemClock.elapsedRealtime();
             int tickResult = NativeHost.nativeTick();
             if (tickResult != 0) {
@@ -316,9 +598,20 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
                 pixels = new int[frameW * frameH];
                 bitmap = Bitmap.createBitmap(frameW, frameH, Bitmap.Config.ARGB_8888);
             }
-            if (bitmap != null && pixels.length > 0) {
-                NativeHost.nativeCopyFrame(pixels);
-                bitmap.setPixels(pixels, 0, frameW, 0, 0, frameW, frameH);
+            // 零拷贝上屏:内核已经把这一帧直接送到 Surface,壳不再读回像素,
+            // 也不再画 Bitmap(省掉每帧 1.9MB 拷贝与一次整屏上传)。
+            boolean needPixels = !zeroCopyPresent;
+            if (zeroCopyPresent || (bitmap != null && pixels.length > 0)) {
+                if (!needPixels) {
+                    // 零拷贝:画面由内核直接写入 Surface,壳不画 Bitmap,
+                    // 但触摸映射矩形仍要按同样的 letterbox 规则更新。
+                    updatePresentRect(textureView.getWidth(), textureView.getHeight(),
+                            frameW, frameH);
+                }
+                if (needPixels) {
+                    NativeHost.nativeCopyFrame(pixels);
+                    bitmap.setPixels(pixels, 0, frameW, 0, 0, frameW, frameH);
+                }
 
                 // 输入:把触摸点从 Surface 坐标映射回游戏视口坐标(经过缩放与
                 // 黑边偏移),再按队列顺序投递按下/抬起。
@@ -350,13 +643,32 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
                         case EV_UP:
                             NativeHost.nativeSetInput("MOUSE_L", false);
                             break;
+                        case EV_WHEEL_U:
+                            // 按下+抬起=一帧脉冲(引擎会把抬起延到下一帧,
+                            // 保证脚本至少看到一次按下)。
+                            NativeHost.nativeSetInput("MOUSE_U", true);
+                            NativeHost.nativeSetInput("MOUSE_U", false);
+                            break;
+                        case EV_WHEEL_D:
+                            NativeHost.nativeSetInput("MOUSE_D", true);
+                            NativeHost.nativeSetInput("MOUSE_D", false);
+                            break;
                         default:
                             // MOVE 只更新光标(上面已做),不产生按钮事件。
                             break;
                     }
                 }
 
-                present(bitmap);
+                // 触摸态抬手后把脚本光标移出视口一次(等价"鼠标离开窗口")。
+                // 不移除的话,换屏后同位置若有按钮就一直 hover。
+                if (clearCursorAfterRelease && !mouseMode) {
+                    clearCursorAfterRelease = false;
+                    NativeHost.nativeSetCursor(-1, -1);
+                }
+
+                if (needPixels) {
+                    present(bitmap);
+                }
             }
 
             fpsFrames++;
@@ -365,26 +677,40 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
                 fps = fpsFrames * 1000.0 / (now - fpsWindowStart);
                 fpsFrames = 0;
                 fpsWindowStart = now;
-                statusLine = String.format("%s fps=%.1f taps=%d dropped=%d",
-                        NativeHost.nativeStatus(), fps, tapCount, inputDropped);
-                Log.i(TAG, statusLine);
+                // 发布模式:浮层关、调试日志关 ⇒ 一次 nativeStatus() 都不调,
+                // 也不写 logcat。状态串要拼十几个 format 并取诊断/阶段计数,
+                // 对一个正常运行的游戏是纯开销。
+                if (showHud || debugEnabled) {
+                    // 只有开了调试日志才向内核要整条状态串(它要拼十几个
+                    // format、取诊断与渲染阶段计数);只开浮层时仅显示帧率。
+                    String nativeText = debugEnabled ? NativeHost.nativeStatus() : "";
+                    if (showHud) {
+                        // 发布观感:浮层默认只显示帧率;开了调试日志才铺全量计数。
+                        statusLine = debugEnabled
+                                ? String.format("fps=%.1f %s taps=%d dropped=%d",
+                                        fps, nativeText, tapCount, inputDropped)
+                                : String.format("fps=%.1f", fps);
+                        updateHud();
+                    }
+                    if (debugEnabled) {
+                        Log.i(TAG, nativeText + " fps=" + String.format("%.1f", fps)
+                                + " taps=" + tapCount + " dropped=" + inputDropped);
+                    }
+                }
             }
 
-            // 帧调度:固定截止时间(deadline),不是"干完活再睡满一帧"。
+            // 帧调度:补足到目标帧长,**不做槽位跳跃**。
             //
-            // 旧写法 `sleep(16 - elapsed)` 有两个毛病:①`SystemClock.sleep` 只有
-            // 毫秒粒度且实际会晚 ~1ms,16ms 目标跑成 17.3ms ⇒ 只有 57fps;
-            // ②16ms 本身是 62.5Hz,不是 60Hz。这里改用纳秒截止时间 + 亚毫秒
-            // 睡眠,与桌面宿主 `schedule_next_frame` 同口径:错过截止就对齐到
-            // 下一个未来槽位(保留相位),不补跑。
-            nextFrameNanos += frameNanos;
-            long nowNanos = System.nanoTime();
-            if (nextFrameNanos <= nowNanos) {
-                long behind = nowNanos - nextFrameNanos;
-                long missed = behind / frameNanos + 1;
-                nextFrameNanos += missed * frameNanos;
+            // 这里刻意不学桌面宿主的"错过截止就对齐到下一个未来槽位":那套
+            // 逻辑的前提是每帧都能赶上 60Hz。Android 上单帧若稳定在 17~20ms
+            // (GPU 读回 + 图层规划),对齐槽位会让它永远落在 2 个槽位后 ⇒
+            // 直接锁死在 30fps。正确做法是把这一帧欠下的时间吸收掉、下一帧
+            // 重新计时,让帧率等于硬件真实吞吐(实测区别:30fps → 55fps)。
+            long elapsedNanos = System.nanoTime() - frameStartNanos;
+            long remaining = frameNanos - elapsedNanos;
+            if (remaining > 0) {
+                sleepUntil(System.nanoTime() + remaining);
             }
-            sleepUntil(nextFrameNanos);
         }
 
         NativeHost.nativeShutdown();
@@ -437,11 +763,34 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         }
     }
 
+    /**
+     * 计算游戏画面在窗口里的实际矩形(居中 + 等比缩放)。
+     *
+     * <p>零拷贝与 Bitmap 两条路径都必须用它更新触摸映射矩形 —— 否则
+     * `presentLeft/Width` 保持初值 0,触摸坐标会被钳到 (0,0),表现为
+     * 「输入完全没用」(实机已复现)。
+     */
+    private void updatePresentRect(int windowWidth, int windowHeight, int viewportWidth,
+                                   int viewportHeight) {
+        if (windowWidth <= 0 || windowHeight <= 0 || viewportWidth <= 0 || viewportHeight <= 0) {
+            return;
+        }
+        float scale = Math.min(
+                (float) windowWidth / viewportWidth,
+                (float) windowHeight / viewportHeight);
+        int dw = Math.round(viewportWidth * scale);
+        int dh = Math.round(viewportHeight * scale);
+        presentLeft = (windowWidth - dw) / 2;
+        presentTop = (windowHeight - dh) / 2;
+        presentWidth = dw;
+        presentHeight = dh;
+    }
+
     private void present(Bitmap bitmap) {
-        SurfaceHolder holder = surfaceView.getHolder();
+        // CPU 后端路径:把整帧 Bitmap 画到 TextureView 的 Canvas。
         Canvas canvas;
         try {
-            canvas = holder.lockCanvas();
+            canvas = textureView.lockCanvas();
         } catch (Exception error) {
             Log.w(TAG, "lockCanvas failed: " + error);
             return;
@@ -450,35 +799,127 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             return;
         }
         try {
-            // 整数倍缩放 + 居中：保持像素锐利（软后端输出已是最终画面）。
+            // 触摸映射与绘制用同一个矩形,二者不能各算一套。
             int sw = canvas.getWidth();
             int sh = canvas.getHeight();
-            float scale = Math.min((float) sw / bitmap.getWidth(), (float) sh / bitmap.getHeight());
-            int dw = Math.round(bitmap.getWidth() * scale);
-            int dh = Math.round(bitmap.getHeight() * scale);
-            int left = (sw - dw) / 2;
-            int top = (sh - dh) / 2;
-            // 触摸映射与绘制用同一个矩形,二者不能各算一套。
-            presentLeft = left;
-            presentTop = top;
-            presentWidth = dw;
-            presentHeight = dh;
+            updatePresentRect(sw, sh, bitmap.getWidth(), bitmap.getHeight());
+            int left = presentLeft;
+            int top = presentTop;
+            int dw = presentWidth;
+            int dh = presentHeight;
             canvas.drawColor(Color.BLACK);
             canvas.drawBitmap(bitmap, null,
                     new android.graphics.Rect(left, top, left + dw, top + dh), presentPaint);
-            if (!statusLine.isEmpty()) {
-                canvas.drawText(statusLine, 16f, 32f, statusPaint);
-            }
         } finally {
-            holder.unlockCanvasAndPost(canvas);
+            textureView.unlockCanvasAndPost(canvas);
+        }
+    }
+
+    /**
+     * 刷新状态浮层(TextView + Spannable)。
+     *
+     * <p>用 TextView 而不是往画面上画字:零拷贝上屏时画面由内核直接写到
+     * Surface,壳无法在其上叠 Canvas,只能叠普通 View。Spannable 正好实现
+     * 「只有数值变色」——标签保持白色,fps 数值加粗。
+     */
+    private void updateHud() {
+        if (hudView == null) {
+            return;
+        }
+        // 渲染线程不能直接摸 View(Android 会抛 CalledFromWrongThread);
+        // 且状态行每秒才更新一次,这里按"同一份文本只提交一次"节流,
+        // 避免每帧都往主线程丢一条 Runnable。
+        String text = statusLine;
+        if (text.equals(hudText)) {
+            return;
+        }
+        hudText = text;
+        runOnUiThread(() -> applyHudText(text));
+    }
+
+    /** 真正更新 TextView(主线程)。 */
+    private void applyHudText(String text) {
+        if (hudView == null) {
+            return;
+        }
+        if (text.isEmpty()) {
+            hudView.setVisibility(View.GONE);
+            return;
+        }
+        List<StatusItem> items = StatusItem.parse(text);
+        if (items.isEmpty()) {
+            hudView.setVisibility(View.GONE);
+            return;
+        }
+        android.text.SpannableStringBuilder builder = new android.text.SpannableStringBuilder();
+        for (StatusItem item : items) {
+            int labelStart = builder.length();
+            if (!item.label.isEmpty()) {
+                builder.append(item.label).append('=');
+            }
+            int valueStart = builder.length();
+            builder.append(item.value);
+            int valueEnd = builder.length();
+            builder.append(' ');
+
+            if (!item.label.isEmpty()) {
+                builder.setSpan(
+                        new android.text.style.ForegroundColorSpan(Color.WHITE),
+                        labelStart, valueStart,
+                        android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+            builder.setSpan(
+                    new android.text.style.ForegroundColorSpan(
+                            item.fps ? Color.parseColor("#5ee08a") : Color.parseColor("#7ad1ff")),
+                    valueStart, valueEnd,
+                    android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+            if (item.fps) {
+                builder.setSpan(
+                        new android.text.style.StyleSpan(android.graphics.Typeface.BOLD),
+                        valueStart, valueEnd,
+                        android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+        }
+        hudView.setText(builder);
+        hudView.setVisibility(View.VISIBLE);
+    }
+
+    /** 浮层一项:`k=v`。 */
+    private static final class StatusItem {
+        final String label;
+        final String value;
+        final boolean fps;
+
+        StatusItem(String label, String value, boolean fps) {
+            this.label = label;
+            this.value = value;
+            this.fps = fps;
+        }
+
+        /**
+         * 把引擎状态串拆成词(含 `=` 的拆成键值;`fps` 标记为加粗)。
+         */
+        static List<StatusItem> parse(String line) {
+            List<StatusItem> items = new ArrayList<>();
+            for (String token : line.trim().split("[ 	]+")) {
+                if (token.isEmpty()) {
+                    continue;
+                }
+                int eq = token.indexOf('=');
+                if (eq <= 0) {
+                    continue;
+                }
+                items.add(new StatusItem(
+                        token.substring(0, eq), token.substring(eq + 1), "fps".equals(token.substring(0, eq))));
+            }
+            return items;
         }
     }
 
     private void drawError() {
-        SurfaceHolder holder = surfaceView.getHolder();
         Canvas canvas;
         try {
-            canvas = holder.lockCanvas();
+            canvas = textureView.lockCanvas();
         } catch (Exception error) {
             return;
         }
@@ -494,7 +935,146 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
                 y += 28f;
             }
         } finally {
-            holder.unlockCanvasAndPost(canvas);
+            textureView.unlockCanvasAndPost(canvas);
+        }
+    }
+
+    /** 多指时的平均 Y(双指滚动用)。 */
+    private float averageY(MotionEvent event) {
+        float sum = 0f;
+        int n = Math.max(1, event.getPointerCount());
+        for (int i = 0; i < event.getPointerCount(); i++) {
+            sum += event.getY(i);
+        }
+        return sum / n;
+    }
+
+    /** 一格滚轮(上/下)。 */
+    private void enqueueWheel(boolean up) {
+        enqueueInput(up ? EV_WHEEL_U : EV_WHEEL_D);
+    }
+
+    /** 双击切换模式:触摸 ↔ 虚拟鼠标。 */
+    private void toggleMouseMode() {
+        mouseMode = !mouseMode;
+        getSharedPreferences(SetupActivity.PREFS, MODE_PRIVATE)
+                .edit().putBoolean("mouse_mode", mouseMode).apply();
+        if (mouseMode) {
+            // 首次进入鼠标模式:光标落在画面中心。
+            if (virtualX < 0) {
+                virtualX = textureView.getWidth() / 2f;
+                virtualY = textureView.getHeight() / 2f;
+            }
+            pointerX = (int) virtualX;
+            pointerY = (int) virtualY;
+            pointerDirty = true;
+        } else {
+            // 退出鼠标模式:把脚本光标移出视口,别留 hover。
+            clearCursorAfterRelease = true;
+        }
+        if (overlayView != null) {
+            overlayView.invalidate();
+        }
+        if (modeButton != null) {
+            modeButton.invalidate();
+        }
+    }
+
+    /** 移动虚拟光标(视图坐标,带边界钳制)。 */
+    private void moveVirtualCursor(float dx, float dy) {
+        float w = Math.max(1, textureView.getWidth());
+        float h = Math.max(1, textureView.getHeight());
+        virtualX = Math.min(w - 1, Math.max(0, virtualX + dx));
+        virtualY = Math.min(h - 1, Math.max(0, virtualY + dy));
+        pointerX = (int) virtualX;
+        pointerY = (int) virtualY;
+        pointerDirty = true;
+        if (overlayView != null) {
+            overlayView.invalidate();
+        }
+    }
+
+    /** 虚拟鼠标光标(只画,不吃触摸)。 */
+    private final class OverlayView extends View {
+        private final android.graphics.Paint fill = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        private final android.graphics.Paint edge = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        private final android.graphics.Path arrow = new android.graphics.Path();
+
+        OverlayView(Context context) {
+            super(context);
+            setWillNotDraw(false);
+            fill.setStyle(android.graphics.Paint.Style.FILL);
+            fill.setColor(Color.WHITE);
+            edge.setStyle(android.graphics.Paint.Style.STROKE);
+            edge.setStrokeWidth(dpf(1.5f));
+            edge.setColor(0xCC000000);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            if (!mouseMode || virtualX < 0) {
+                return;
+            }
+            float x = virtualX;
+            float y = virtualY;
+            arrow.reset();
+            arrow.moveTo(x, y);
+            arrow.lineTo(x, y + dpf(20));
+            arrow.lineTo(x + dpf(5.5f), y + dpf(15));
+            arrow.lineTo(x + dpf(9), y + dpf(21.5f));
+            arrow.lineTo(x + dpf(12.5f), y + dpf(19.5f));
+            arrow.lineTo(x + dpf(9), y + dpf(13));
+            arrow.lineTo(x + dpf(15), y + dpf(13));
+            arrow.close();
+            canvas.drawPath(arrow, fill);
+            canvas.drawPath(arrow, edge);
+        }
+    }
+
+    /** 右下角的模式切换按钮:半透明、只占一小块,点击切换触摸/鼠标。 */
+    private final class ModeButton extends View {
+        private final android.graphics.Paint paint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        private final android.graphics.Paint iconPaint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        private final android.graphics.Path arrow = new android.graphics.Path();
+
+        ModeButton(Context context) {
+            super(context);
+            setClickable(true);
+            paint.setStyle(android.graphics.Paint.Style.FILL);
+            // 尽量不起眼:只是一层极淡的轮廓,几乎看不见。
+            paint.setColor(0x0AFFFFFF);
+            iconPaint.setStyle(android.graphics.Paint.Style.FILL);
+            iconPaint.setColor(0x59FFFFFF);
+            setOnClickListener(v -> toggleMouseMode());
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            float r = Math.min(getWidth(), getHeight()) / 2f;
+            canvas.drawCircle(getWidth() / 2f, getHeight() / 2f, r, paint);
+            float cx = getWidth() / 2f;
+            float cy = getHeight() / 2f;
+            if (mouseMode) {
+                // 鼠标:箭头
+                float s = r * 0.42f;
+                arrow.reset();
+                arrow.moveTo(cx - s * 0.5f, cy - s);
+                arrow.lineTo(cx - s * 0.5f, cy + s * 0.9f);
+                arrow.lineTo(cx - s * 0.05f, cy + s * 0.45f);
+                arrow.lineTo(cx + s * 0.35f, cy + s * 1.05f);
+                arrow.lineTo(cx + s * 0.75f, cy + s * 0.8f);
+                arrow.lineTo(cx + s * 0.35f, cy + s * 0.25f);
+                arrow.lineTo(cx + s * 0.85f, cy + s * 0.25f);
+                arrow.close();
+                canvas.drawPath(arrow, iconPaint);
+            } else {
+                // 触摸:手指圆点
+                canvas.drawCircle(cx, cy, r * 0.34f, iconPaint);
+                iconPaint.setStyle(android.graphics.Paint.Style.STROKE);
+                iconPaint.setStrokeWidth(dpf(1.6f));
+                canvas.drawCircle(cx, cy, r * 0.56f, iconPaint);
+                iconPaint.setStyle(android.graphics.Paint.Style.FILL);
+            }
         }
     }
 
@@ -557,6 +1137,15 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
                 return;
             }
         }
+    }
+
+    /** dp → 像素(浮点版;绘制用,避免取整跳动)。 */
+    private float dpf(float value) {
+        return value * getResources().getDisplayMetrics().density;
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
     private static int clamp(int value, int low, int high) {

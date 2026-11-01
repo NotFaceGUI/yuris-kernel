@@ -50,8 +50,31 @@ public final class NativeHost {
     public static native String nativeInit(
             String dataRoot, String saveRoot, String entry, String fontPath, String fontFamily);
 
+    /**
+     * 初始化 NDK 上下文(JavaVM + Context)。
+     *
+     * <p><b>必须在任何音频调用之前调用一次</b>。oboe(cpal 的 Android 音频
+     * 后端)通过它取 JavaVM/Context 来建 AudioTrack;不初始化会在打开音频
+     * 设备时 panic(`android context was not initialized`)。
+     *
+     * @param activity 传 Activity 实例(其 Context 可拿到 AudioManager)。
+     */
+    public static native int nativeInitAndroidContext(android.app.Activity activity);
+
     /** 本机可用字体族(换行分隔;空串 = 没有可枚举字体)。 */
     public static native String nativeListFonts();
+
+    /**
+     * 绑定 {@link android.view.Surface} 做<b>零拷贝上屏</b>:内核把渲染结果
+     * 直接送到这个窗口,不再每帧把整帧读回 CPU。
+     *
+     * <p>必须在 {@code nativeInitJson} 之后、且 GPU 后端下调用。返回 0 成功;
+     * 非 0 时壳继续用 {@link #nativeCopyFrame} 的 Bitmap 路径(不致命)。
+     */
+    public static native int nativeAttachSurface(android.view.Surface surface);
+
+    /** 窗口尺寸变化时调用(重建交换链)。 */
+    public static native int nativeResizeSurface(int width, int height);
 
     /** 推进一帧。返回 0 成功 / -1 未初始化 / -2 tick 失败。 */
     public static native int nativeTick();

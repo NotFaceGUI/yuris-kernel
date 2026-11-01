@@ -120,6 +120,33 @@ JSONL 走 `BufWriter`,内核在启动收尾、`nativeStatus()` 与 `nativeShutdo
 不自动降级是有意的:自动降级会让"GPU 模式画错"永远对不上号(用户看到的是
 CPU 结果,却以为在看 GPU)。
 
+## 性能:帧时间构成与已知瓶颈
+
+`nativeStatus()` 现在带逐阶段耗时(单位 µs),排查掉帧先看这里:
+
+```
+render_ms=18.51 phases[plan=6995 encode=2062 readback=8145 tail=69]us
+```
+
+| 阶段 | 典型耗时 | 性质 |
+|---|---|---|
+| `tick_ms` | 1.8-2.0ms | 脚本逻辑 |
+| `plan` | 4-9ms | CPU 遍历图层、生成顶点 |
+| `encode` | 1.8-5ms | 命令编码(每 clear 目标一个 render pass) |
+| **`readback`** | **6.8-13ms** | **GPU→CPU 整帧读回(1.9MB/帧)** |
+
+**`readback` 是最大单项**,原因是当前壳用 `nativeCopyFrame(int[])` 取像素再画
+Bitmap —— 每帧都要把整帧从 GPU 拷回 CPU。桌面宿主不这么做:它把 GPU 纹理
+直接上屏。
+
+**要跑满 60fps,需要零拷贝上屏**:把 wgpu 渲染直接输出到 SurfaceView 的
+原生窗口(ANativeWindow + wgpu::Surface),跳过 CPU 读回。这是后续优化项,
+当前未实现。
+
+另外注意:模拟器是**软件模拟的 x86_64**,单核跑满(实测 CPU 96%)时
+`plan`/`encode` 波动很大。真机上这两项会明显下降,同样的场景帧率更高。
+评估性能请在真机上看 `phases` 数据,不要以模拟器为准。
+
 ## 输入坐标约定
 
 `nativeSetCursor(x, y)` 收的是**游戏视口像素坐标**(`nativeFrameSize` 那个

@@ -34,6 +34,43 @@ tools/android/build.sh arm64-v8a            # 只打真机
 反斜杠会被 Java properties 当转义吃掉)。若要完全离线构建,`gradle.properties`
 里的 `android.aapt2FromMavenOverride` 指向 SDK 里已有的 aapt2。
 
+**若 `gradle` 启动即报 `Could not initialize native services /
+Failed to load native library 'native-platform.dll'`**:那是 `~/.gradle/native`
+下的产物在本机加载失败(常见于被 IDE/沙箱改过权限),与项目无关。处置是给它一个
+独立的 `GRADLE_USER_HOME`,只把依赖缓存拷/链接过去,不动原有 `~/.gradle`:
+
+```bash
+export GRADLE_USER_HOME=/some/writable/ghome
+mkdir -p "$GRADLE_USER_HOME/caches"
+cp -r ~/.gradle/caches/modules-2 "$GRADLE_USER_HOME/caches/"
+cp -r ~/.gradle/caches/jars-9    "$GRADLE_USER_HOME/caches/" 2>/dev/null
+cp -r ~/.gradle/caches/transforms-4 "$GRADLE_USER_HOME/caches/" 2>/dev/null
+gradle --offline --no-daemon assembleRelease
+```
+
+同理,若出现 `modules-2.lock ... 拒绝访问`,说明有 IDE 正在使用同一份缓存;
+独立 home 可绕开。
+
+## 壳侧开关(发布 / 诊断)
+
+`SetupActivity` 的两个开关都会持久化并传给游戏页:
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| 状态浮层 | 关 | 开:左上角显示 `fps=`;再开「调试日志」才铺全量计数 |
+| 调试日志 | 关 | 开:每帧状态行写 logcat + `<游戏目录>/debug/yu-kernel.jsonl`,并启用混音抓取 |
+
+两者都关时,壳**完全不调** `nativeStatus()`,内核也处于发布模式
+(`RunConfig::quiet`):logcat 只放 `warn` 以上、不抓音频、状态串最小化。
+
+## 手机化输入
+
+- **触摸(默认)**:点哪里点哪里;抬手后把脚本光标移出视口,避免"下一屏同位置
+  按钮一直 hover"。
+- **双指上下滑**:滚轮(`_MOUSE_U`/`_MOUSE_D`),用于回看文本。
+- **虚拟鼠标**:右下角半透明小圆钮切换(状态记忆)。鼠标态下拖动移动光标、
+  抬手在光标处点击。
+
 ## 安装与验证
 
 ```bash

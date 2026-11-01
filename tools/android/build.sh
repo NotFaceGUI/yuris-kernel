@@ -81,8 +81,11 @@ for abi in "${ABIS[@]}"; do
   export "AR_${upper}=${TOOLCHAIN}/llvm-ar"
   export "CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER=${cc}"
   printf '==> cargo build %s (%s)\n' "$target" "$abi"
-  cargo build -p yu-host-android --release --target "$target" \
-    --manifest-path "$REPO_ROOT/Cargo.toml"
+  # cpal 在 Android 上走 oboe(C++ 实现):so 必须链 libc++_shared,否则
+  # 运行时 dlopen 报 `cannot locate symbol "__cxa_pure_virtual"`。
+  RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-lc++_shared" \
+    cargo build -p yu-host-android --release --target "$target" \
+      --manifest-path "$REPO_ROOT/Cargo.toml"
 done
 
 for abi in "${ABIS[@]}"; do
@@ -90,6 +93,8 @@ for abi in "${ABIS[@]}"; do
   dst="$REPO_ROOT/android/app/src/main/jniLibs/$abi"
   mkdir -p "$dst"
   cp "$REPO_ROOT/target/$target/release/libyu_host_android.so" "$dst/"
+  # oboe 依赖的动态 C++ 运行库必须随 APK 分发。
+  cp "$NDK/sysroot/usr/lib/$target/libc++_shared.so" "$dst/"
   "$TOOLCHAIN/llvm-strip" --strip-unneeded "$dst/libyu_host_android.so"
   printf '==> %s: %s\n' "$abi" "$(du -h "$dst/libyu_host_android.so" | cut -f1)"
 done
