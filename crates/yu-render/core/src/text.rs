@@ -114,6 +114,8 @@ pub struct TextComposer {
     base_cache_bytes: u64,
     /// `YURIS_TEXT_BASE_CACHE=0` 关闭基面缓存(性能 A/B 用;默认开)。
     base_cache_enabled: bool,
+    /// 宿主提供的字体字节(跨平台注入口;空 = 只用系统枚举)。
+    host_font_bytes: Vec<Vec<u8>>,
     /// LRU 时钟(每次合成触碰/插入时递增)。
     cache_clock: u64,
     /// 帧内合成统计(`YU_RENDER_TIMING` 诊断;`begin_frame_stats` 清零)。
@@ -321,6 +323,7 @@ impl TextComposer {
                 .unwrap_or(true),
             cache_clock: 0,
             frame_stats: ComposeFrameStats::default(),
+            host_font_bytes: Vec::new(),
         }
     }
 
@@ -345,6 +348,7 @@ impl TextComposer {
                 .unwrap_or(true),
             cache_clock: 0,
             frame_stats: ComposeFrameStats::default(),
+            host_font_bytes: Vec::new(),
         }
     }
 
@@ -438,6 +442,49 @@ impl TextComposer {
             .filter(|b| !b.is_empty())
     }
 
+    /// 追加宿主提供的字体字节(跨平台注入口)。
+    ///
+    /// 必须在首次文本解析前调用:有字体源时重建它(系统字体 ∪ `extra`),
+    /// 无字体源时只记下待并入 —— `ensure()` 首次枚举时一并装载。
+    /// 无系统字体的目标(浏览器)只有这一条字体来源,因此这里不是锦上添花,
+    /// 而是可用性前提。
+    pub fn add_font_bytes(&mut self, bytes: &[Vec<u8>]) {
+        self.host_font_bytes.extend(bytes.iter().cloned());
+        self.rebuild_source();
+    }
+
+    /// 用注入的字体字节重建字体源(保留系统枚举结果)。
+    fn rebuild_source(&mut self) {
+        if self.host_font_bytes.is_empty() {
+            return;
+        }
+        match yu_font::FontSource::load_with_extra_bytes(&self.host_font_bytes) {
+            Ok(source) => {
+                let summary = font_source_summary(&source, 0);
+                log::info!(target: "yu-font", "{}", summary);
+                self.source_summary = Some(summary);
+                self.renderer = Some(FontRenderer::new(source, CacheLimits::default()));
+                self.failure = None;
+                // 字体身份变了,已解析/已合成的缓存全部失效。
+                self.faces.clear();
+                self.real_bold.clear();
+                self.compose_cache.clear();
+                self.base_cache.clear();
+                self.cache_bytes = 0;
+                self.base_cache_bytes = 0;
+            }
+            Err(diag) => {
+                log::error!(
+                    target: "yu-font",
+                    "[font] host font bytes unusable: {} {}",
+                    diag.code,
+                    diag.detail
+                );
+                self.failure = Some(format!("{}: {}", diag.code, diag.detail));
+            }
+        }
+    }
+
     fn ensure(&mut self) -> bool {
         if self.renderer.is_some() {
             return true;
@@ -453,6 +500,7 @@ impl TextComposer {
                 log::info!(target: "yu-font", "{}", summary);
                 self.source_summary = Some(summary);
                 self.renderer = Some(FontRenderer::new(source, CacheLimits::default()));
+                self.failure = None;
                 self.load_ms = Some(started.elapsed().as_millis());
                 true
             }

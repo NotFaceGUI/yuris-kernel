@@ -12065,3 +12065,81 @@ cargo test -p yu-save     # 15 passed(含 official_dno3_thumbnail_decodes_as_100
   渲染不可见,机理未反不照抄魔数,见 DIV-GFX-071 §残余;
 - 修复前由本内核写出的存档 B 段是 RGBA,修复后读取会互换显色,
   开发期产物重新存档即覆盖。
+
+---
+
+## 成果 CROSSPLAT-BASE (2026-11-01) · 跨平台基础:存档文件系统端口 + 宿主路径注入 + Android 宿主
+
+> 分支:`feat/cross-platform`(以 `master` 为基线)。目标 = **能力等价**的
+> 跨平台扩展,不是按平台复制引擎。wasm 仅作占位考虑(不实现)。
+
+### 做了什么
+
+1. **`yu-save::SaveFs` 文件系统端口**(`crates/yu-save/src/fs.rs`)
+   - 8 处 `std::fs` 直连收口为 trait:`read/read_prefix/write/list/copy/
+     remove_file/remove_dir/create_dir_all/exists/canonicalize`;
+   - `NativeSaveFs` = 旧行为逐语义对齐(含 `ErrorKind::NotFound` 幂等删除判据);
+   - `SaveState::new` 走原生端口,新增 `SaveState::with_fs` 供宿主注入;
+   - `ensure_save_root` / `ensure_save_root_with`:物化目录不再有
+     `cfg(target_arch = "wasm32")` 平台分支。
+2. **`yu_engine::host_paths` 模块**(`crates/yu-engine/src/host_paths.rs`)
+   - `PlatformHome` 平台默认解析:Windows `USERPROFILE`(退 `HOMEDRIVE`+
+     `HOMEPATH`),其余 `HOME`;拿不到 = `None`,不编兜底目录;
+   - `HostPathOverrides` 宿主覆盖 + `EngineOptions::path_overrides` 注入口;
+   - 桌面路径输出与旧实现逐字节一致(`$_PROJECT_PATH` 仍 `None`)。
+3. **字体能力等价**(DIV-AND-001)
+   - `fontdb` 在 Android 上 `load_system_fonts()` 是**空操作**(上游无 android
+     分支)⇒ 补 `/system/fonts`、`/product/fonts` 扫描;
+   - 新增 `FontSource::load_with_extra_bytes` + `TextComposer::add_font_bytes`
+     + `EngineOptions::font_bytes`:宿主字体字节注入(浏览器唯一来源、
+     Android 补游戏点名日文字体)。
+4. **`yu-sound/src/acm.rs` 门控修正**:`build_pcm`/`attach`/`display` 未按
+   `cfg(windows)` 门控 ⇒ 非 Windows 目标**编译中断**;已修。
+5. **Android 宿主**(`crates/yu-platform/host-android`):
+   - NDK cdylib,9 个 JNI 导出(`nativeInit/nativeTick/nativeFrameSize/
+     nativeCopyFrame/nativeSetInput/nativeSetCursor/nativeStatus/
+     nativeVersion/nativeShutdown`);
+   - 会话逻辑(`init_session/tick/frame_rgba/...`)是纯 Rust,可在开发机测试;
+   - 数据/存档走**真实文件系统**(Android 有 fs,不需要 AAsset 内存映射),
+     与桌面 A1/A2 同义;
+   - soft 后端出帧,RGBA → ARGB_8888 换算集中在一处。
+6. **轻量 UI 壳**(`android/`,纯 Java 无 AndroidX):SurfaceView 上屏、
+   触摸 → `MOUSE_L`、生命周期挂起/恢复、状态浮层 + logcat 每帧一行。
+7. **构建脚本** `tools/android/build.sh`(cargo 交叉编译 → jniLibs → gradle)。
+
+### 验证(原始结果)
+
+```text
+$ cargo test -p yu-save
+test result: ok. 18 passed; 0 failed          (含官方 seld.sd / save00001.sd)
+
+$ cargo test -p yu-host-android --test session -- --nocapture --test-threads=1
+init: OK backend=soft entry=SYSTEM_START viewport=800x600 boot_ms=118.7
+      data=packed:.../project-eris/data.ypf (31501753 bytes, packs=1 updates=0 skipped=0)
+status: status=running backend=soft entry=SYSTEM_START frame=14 ticks=12
+        viewport=800x600 layers=377 ops=88 skipped=0 drawable=true boot_ms=118.7 diags=6
+test result: ok. 2 passed
+
+$ cargo build -p yu-host-android --target aarch64-linux-android --release
+Finished `release` profile   → libyu_host_android.so 14,426,624 B
+$ cargo build -p yu-host-android --target x86_64-linux-android --release
+Finished `release` profile   → libyu_host_android.so 14,546,488 B
+
+$ llvm-nm -D --defined-only .../libyu_host_android.so | grep Java_org_yuris
+（9 个符号全部导出）
+
+$ gradle --offline assembleDebug            (JDK 21 + AGP 8.13.0 + SDK 36)
+BUILD SUCCESSFUL → app-debug.apk 22,233,056 B(arm64-v8a + x86_64)
+```
+
+### 残留 / 未完成
+
+- **模拟器不可用**:本机 emulator 36.2.12 的图形栈起不来(Vulkan loader
+  `vkGetDeviceQueue` invalid device、`opengl32sw` 缺失),`-gpu off` 与
+  `-gpu swiftshader_indirect` 均在 QEMU 后端启动阶段退出 ⇒ **真机/模拟器上
+  的 APK 运行未取证**。已用同一份会话逻辑在开发机跑通真实语料(上表)。
+- Android 侧 wgpu(Surface/Vulkan)未接;当前固定 soft(设计选择,见
+  `android/README.md`)。
+- 触摸只映射单点 = 鼠标左键;虚拟按键/手势未取证(架构 §2.5.9 问题 9)。
+- `yu-vfs::YpfSource` 仍要求封包落在文件系统上;浏览器目标需要内存构造
+  (`from_bytes`),由 wasm 分支负责 —— **wasm 本轮只作占位,不实现**。

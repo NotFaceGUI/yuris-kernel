@@ -212,6 +212,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         os_sound: true,
         media_readonly: false,
         reconcile,
+        // GPU 上下文由宿主自建(桌面不注入,走引擎内默认创建)。
+        gpu_context: None,
         save_root,
         // 桌面宿主:启动时预枚举系统字体,避免第一次打开テキスト页签
         // 付 ~130ms 的 fontdb 枚举(实测)。
@@ -230,6 +232,10 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         } else {
             crate::clock::local_now()
         },
+        // 桌面有真实文件系统与系统字体:两个跨平台注入口保持默认(空),
+        // 路径系统变量走平台默认解析(HOME/USERPROFILE)。
+        font_bytes: Vec::new(),
+        path_overrides: Default::default(),
     };
     // **不做 GPU→CPU 自动回退**:soft 与 wgpu 是两条独立实现,自动降级会让
     // 「GPU 模式变慢/画错」永远对不上号(用户看到的是 CPU 结果,却以为在

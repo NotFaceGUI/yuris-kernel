@@ -13,6 +13,8 @@ use std::time::Instant;
 use yu_backend_soft::{frame_has_drawable_output, SoftRenderer};
 use yu_render_core::{png, RenderPhases, RenderReport, Surface, TextureStore};
 use yu_backend_wgpu::{DeviceOptions, WgpuRenderer};
+use crate::host_paths::{HostPathOverrides, PlatformHome as HostPlatformHome};
+use yu_save::NativeSaveFs;
 use yu_gfx::{
     json, probe_order_from_codes, CompositorFrame, GfxConfig, GfxHost, GfxState, Op, PassTarget,
     SizeU32, TextureRef, TextureSampler, Viewport,
@@ -153,8 +155,7 @@ pub use yu_format::yssd::BlockCodec;
 
 /// 引擎运行参数(全部由宿主给值;内核不猜)。
 #[derive(Clone, Debug)]
-pub struct EngineOptions {
-    pub backend: Backend,
+pub struct EngineOptions {    pub backend: Backend,
     pub entry: String,
     pub record_events: bool,
     pub fps: u32,
@@ -179,10 +180,25 @@ pub struct EngineOptions {
     /// 用例/服务注入的可写根(存档域宿主在该目录下允许 FILEACT 落盘;
     /// SAVE 刷盘仍受 DIV-RT-042 契约门禁)。
     pub save_root: Option<std::path::PathBuf>,
+    /// 宿主预建的 GPU 上下文(跨平台注入口)。
+    ///
+    /// `Some` = 直接用(宿主决定底层接口与回退顺序:Android 模拟器的
+    /// gfxstream Vulkan 会在 `vkQueueSubmit` 内崩溃,需要由宿主选 GLES);
+    /// `None` = 按 `YURIS_WGPU_BACKEND`/默认在引擎内创建。
+    pub gpu_context: Option<yu_backend_wgpu::GpuContext>,
+    /// 宿主附加字体字节(跨平台注入口,见
+    /// [`yu_render_core::TextComposer::add_font_bytes`])。无系统字体的目标
+    /// (浏览器)靠它才有字;Android 用它补游戏指定 family。默认空 =
+    /// 走平台系统枚举,行为与旧版一致。
+    pub font_bytes: Vec<Vec<u8>>,
     /// 启动时预枚举系统字体(桌面/serve 宿主;默认 false = 首次文本绘制
     /// 才懒加载)。`fontdb` 枚举在本机实测 ~130ms,预热可消除“第一次打开
     /// テキスト页签”的停顿;headless 用例不需要。
     pub warm_text: bool,
+    /// 宿主路径系统变量的覆盖(跨平台注入口,见 [`crate::host_paths`])。
+    /// `None` 项走平台默认解析;Android 这类没有 `USERPROFILE` 的宿主
+    /// 用它把 app 私有目录 / 外置卡目录喂进来。
+    pub path_overrides: HostPathOverrides,
     /// 强制字体 family(诊断/换字体):`Some` 时所有 `FONT` 请求都解析到它,
     /// 忽略脚本给的 `NAME`/`NO`/`BNO`。查不到 family 就显式失败,不回落
     /// 引擎默认表 —— 否则会“以为换上了其实没换”。
@@ -215,7 +231,10 @@ impl Default for EngineOptions {
             media_readonly: false,
             reconcile: false,
             save_root: None,
+            gpu_context: None,
+            font_bytes: Vec::new(),
             warm_text: false,
+            path_overrides: HostPathOverrides::default(),
             force_font: None,
             script_key: None,
             save_codec: None,
@@ -432,6 +451,24 @@ impl Renderer {
         }
     }
 
+    /// 追加宿主字体字节(跨平台注入口,见 [`EngineOptions::font_bytes`])。
+    ///
+    /// 两个后端都要注入:对账时软后端是基线,字体不同会直接造成文本像素
+    /// 分歧。
+    fn add_font_bytes(&mut self, bytes: &[Vec<u8>]) {
+        match self {
+            Renderer::Soft(renderer) => renderer.text_composer().add_font_bytes(bytes),
+            Renderer::Wgpu {
+                renderer, check, ..
+            } => {
+                renderer.text_composer().add_font_bytes(bytes);
+                if let Some(soft) = check.as_mut() {
+                    soft.text_composer().add_font_bytes(bytes);
+                }
+            }
+        }
+    }
+
     /// 预枚举系统字体(见 [`EngineOptions::warm_text`])。
     ///
     /// 可重复调用(已加载即 no-op),因此 `run` 里按需补预热是安全的。
@@ -606,8 +643,16 @@ impl Engine {
         let mut renderer = match opts.backend {
             Backend::Soft => Renderer::Soft(SoftRenderer::new(store)),
             Backend::Wgpu => {
-                let device = device_options_from_env();
-                let wgpu = WgpuRenderer::new_with_options(store, &device).map_err(|d| {
+                // 宿主预建上下文优先(它知道该用 GLES 还是 Vulkan);
+                // 否则按环境变量/默认创建。
+                let wgpu = match &opts.gpu_context {
+                    Some(context) => WgpuRenderer::new_with_context(store, context.clone()),
+                    None => {
+                        let device = device_options_from_env();
+                        WgpuRenderer::new_with_options(store, &device)
+                    }
+                }
+                .map_err(|d| {
                     Failure::runtime(format!(
                         "wgpu 初始化失败: {d};可设 YURIS_WGPU_BACKEND/YURIS_WGPU_ADAPTER,或改用 --backend soft"
                     ))
@@ -634,6 +679,12 @@ impl Engine {
                 }
                 Renderer::Soft(_) => bridge.set_eager(true),
             }
+        }
+        // 宿主附加字体字节(跨平台注入口):必须在任何字体枚举/文本解析前
+        // 注入 —— 无系统字体的目标(浏览器)只有这一条来源;Android 用它
+        // 补游戏指定 family。空 = 走平台默认枚举,行为与旧版一致。
+        if !opts.font_bytes.is_empty() {
+            renderer.add_font_bytes(&opts.font_bytes);
         }
         let text_warm_ms = if opts.warm_text {
             let started = Instant::now();
@@ -1863,8 +1914,9 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         Some(dir) => dir.clone(),
         None => project.root().join("save"),
     };
-    std::fs::create_dir_all(&save_root)
-        .map_err(|e| Failure::runtime(format!("创建 save 根 {} 失败: {e}", save_root.display())))?;
+    yu_save::ensure_save_root_with(&save_root, &NativeSaveFs::default()).map_err(|e| {
+        Failure::runtime(format!("创建 save 根 {} 失败: {e}", save_root.display()))
+    })?;
     let source = project.open_source()?;
     let aux = project.open_aux()?;
     // 脚本密钥:显式优先,否则按 exe 扫描 → 数据自举 → 默认值解析
@@ -1891,7 +1943,7 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         script_key: script_key.bytes,
         // 路径类系统变量由宿主注入(手册 `basic/svariable.html`)。
         // 缺失会让 `es_First.yst` 的 `$_SAVE_PATH` 走 Unimplemented(DIV-RT-010)。
-        paths: host_paths(&save_root),
+        paths: host_paths(&save_root, &opts.path_overrides),
         // `@_SAVE_PATH_TYPE`:游戏根 `yssfs.dat` 偏移 0x54(官方 0.495
         // `FUN_00460c80` 读 `<app>\yssfs.dat`,CRT fread 明文,只接受 0..=3)。
         // 文件缺失/全零 ⇒ 0,与官方等价。
@@ -2107,37 +2159,14 @@ fn device_options_from_env() -> DeviceOptions {
 
 /// 宿主注入的路径系统变量(手册 `basic/svariable.html`)。
 ///
-/// - `$_SYSTEM_PATH` = YU-RIS 起動パス → 工程根(官方 exe 所在目录);
-/// - `$_SAVE_PATH` = YU-RIS セーブデータパス → 存档根(P4 M-C:显式重定向
-///   时为注入目录,默认工程根下 `save/`;原版数据自证:`save/*.sd`、
-///   `save/data/` 由官方 exe 生成);
-/// - `$_APPDATA_PATH` = ユーザのホームディレクトリパス;
-/// - `$_PERSONAL_PATH` = マイドキュメントのパス;
-/// - `$_PROJECT_PATH` 手册无页(DIV-RT-010),不猜值 ⇒ `None`。
-fn host_paths(save_root: &std::path::Path) -> yu_rt::vm::HostPaths {
-    const BS: char = '\\';
-    let root = save_root
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(save_root);
-    let mut sys = root.to_string_lossy().replace(BS, "/");
-    if !sys.ends_with('/') {
-        sys.push('/');
-    }
-    let mut save = save_root.to_string_lossy().replace(BS, "/");
-    if !save.ends_with('/') {
-        save.push('/');
-    }
-    let home = std::env::var("USERPROFILE").ok();
-    yu_rt::vm::HostPaths {
-        system_path: Some(sys.into_bytes()),
-        save_path: Some(save.into_bytes()),
-        appdata_path: home.as_ref().map(|h| h.clone().into_bytes()),
-        personal_path: home
-            .as_ref()
-            .map(|h| format!("{h}{BS}Documents").into_bytes()),
-        project_path: None,
-    }
+/// 平台默认解析与宿主覆盖合成见 [`crate::host_paths`]:桌面读环境变量,
+/// Android 等无环境变量的平台由宿主显式给目录。
+fn host_paths(save_root: &std::path::Path, overrides: &HostPathOverrides) -> yu_rt::vm::HostPaths {
+    crate::host_paths::resolve_host_paths(
+        save_root,
+        overrides,
+        &HostPlatformHome::resolve(),
+    )
 }
 
 /// 读游戏根的 `yssfs.dat`(「セーブファイル設定.exe」写出的存档路径设置)。

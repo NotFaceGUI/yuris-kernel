@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- AppCompatActivity 需要 AppCompat 主题;全屏 + 深色底色与配置界面一致。 -->
+    <style name="Theme.YuKernel" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">#0e1014</item>
+        <item name="android:statusBarColor">#0e1014</item>
+        <item name="android:navigationBarColor">#0e1014</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

@@ -286,9 +286,22 @@ impl WgpuRenderer {
         })
     }
 
+    /// 用宿主预建的 GPU 上下文初始化(跨平台注入口)。
+    ///
+    /// 宿主自己决定底层接口(GLES/Vulkan)与回退顺序 —— Android 模拟器的
+    /// gfxstream Vulkan 会在 `vkQueueSubmit` 内空指针崩溃,需要宿主选 GLES。
+    pub fn new_with_context(textures: TextureStore, ctx: GpuContext) -> Result<Self, Diag> {
+        Self::from_context(textures, ctx)
+    }
+
     /// 指定后端/适配器名称子串等选项初始化。
     pub fn new_with_options(textures: TextureStore, options: &DeviceOptions) -> Result<Self, Diag> {
         let ctx = GpuContext::new(options)?;
+        Self::from_context(textures, ctx)
+    }
+
+    /// 实际构造(`new_with_options` 与 `new_with_context` 共用)。
+    fn from_context(textures: TextureStore, ctx: GpuContext) -> Result<Self, Diag> {
         let pipelines = PipelineCache::new(&ctx)?;
         let gpu_text_enabled = std::env::var("YURIS_TEXT_GPU")
             .map(|v| {

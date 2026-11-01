@@ -25,6 +25,7 @@ use yu_rt::tables::YscmTable;
 use yu_rt::value::{ElemType, Value, VarRef, VarSpace};
 
 use crate::error::{self, code};
+use crate::fs::{NativeSaveFs, SaveFsHandle};
 
 /// 一个存档槽文件(`save/*.sd`)的盘上事实。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +79,8 @@ pub struct SaveSnapshot {
 pub struct SaveState {
     /// save 根(唯一的盘上事实来源与写盘根)。
     root: PathBuf,
+    /// 文件系统端口(平台注入口;默认 [`NativeSaveFs`] = 旧 `std::fs` 行为)。
+    fs: SaveFsHandle,
     /// 是否允许 SAVE 刷盘 / FILEACT 落盘(真值边界 3)。
     writable: bool,
     /// 盘上槽表(按文件名排序;`refresh_slots` 重建)。
@@ -104,9 +107,19 @@ pub const MAX_DIAGS: usize = 8192;
 
 impl SaveState {
     /// 构造。`writable = false` 时 FILEACT 的删除/复制被拒绝并挂号。
+    ///
+    /// 文件系统走平台原生实现（桌面 / Android 均有真实文件系统，行为与
+    /// 旧直连 `std::fs` 逐字节一致）；无文件系统的宿主用
+    /// [`Self::with_fs`] 注入自己的端口。
     pub fn new(root: impl Into<PathBuf>, writable: bool) -> Self {
+        Self::with_fs(root, writable, SaveFsHandle::new(NativeSaveFs))
+    }
+
+    /// 构造并注入文件系统端口（跨平台注入口）。
+    pub fn with_fs(root: impl Into<PathBuf>, writable: bool, fs: SaveFsHandle) -> Self {
         Self {
             root: root.into(),
+            fs,
             writable,
             slots: BTreeMap::new(),
             container_version: None,
@@ -119,6 +132,11 @@ impl SaveState {
             saveend_calls: 0,
             fileact_calls: 0,
         }
+    }
+
+    /// 文件系统端口句柄（宿主诊断/复用）。
+    pub fn fs(&self) -> &SaveFsHandle {
+        &self.fs
     }
 
     /// save 根。
@@ -177,18 +195,17 @@ impl SaveState {
     /// 不影响其余槽。
     pub fn refresh_slots(&mut self) {
         self.slots.clear();
-        let Ok(entries) = std::fs::read_dir(&self.root) else {
+        let Ok(entries) = self.fs.list(&self.root) else {
             return;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("sd") {
+        for entry in entries {
+            // 与旧 `path.extension() == Some("sd")` 同口径（大小写敏感）。
+            if entry.is_dir || !entry.name.ends_with(".sd") {
                 continue;
             }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let Ok(bytes) = std::fs::read(&path) else {
+            let name = entry.name.clone();
+            let path = self.root.join(&name);
+            let Ok(bytes) = self.fs.read(&path) else {
                 self.push_diag(error::recoverable(
                     code::FILE_READ,
                     format!("槽文件不可读: {name}"),
@@ -431,7 +448,11 @@ impl SaveState {
             ));
         }
         let path = self.confined_path(file)?;
-        let version = existing_container_version(&path)
+        let version = self
+            .fs
+            .read_prefix(&path, 8)
+            .ok()
+            .and_then(|head| container_version_of(&head))
             .or(self.container_version)
             .ok_or_else(|| {
                 error::recoverable(
@@ -497,7 +518,7 @@ impl SaveState {
             }
         }
         let bytes = writer.build();
-        std::fs::write(&path, &bytes).map_err(|e| {
+        self.fs.write(&path, &bytes).map_err(|e| {
             // 诊断必须带**解析后的绝对路径**:只报 `config.sd` 时「写到哪、
             // 目录存不存在、是否被别的进程占着」全都看不出来(实测
             // `os error 5` 就是靠这条路径定位的)。
@@ -525,7 +546,7 @@ impl SaveState {
     pub fn load_block(&mut self, file: &str, dno: u32) -> Result<LoadedBlock, Diag> {
         self.load_calls += 1;
         let path = self.confined_path(file)?;
-        let bytes = match std::fs::read(&path) {
+        let bytes = match self.fs.read(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(error::recoverable(
@@ -601,7 +622,7 @@ impl SaveState {
     pub fn load_image(&mut self, file: &str, dno: u32) -> Result<yu_rt::event::CapturedImage, Diag> {
         self.load_calls += 1;
         let path = self.confined_path(file)?;
-        let bytes = match std::fs::read(&path) {
+        let bytes = match self.fs.read(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(error::recoverable(
@@ -743,7 +764,7 @@ impl SaveState {
                 return;
             }
         };
-        match std::fs::copy(&src, &dst) {
+        match self.fs.copy(&src, &dst) {
             Ok(n) => {
                 self.refresh_slots();
                 self.push_diag(error::at_command(
@@ -805,7 +826,7 @@ impl SaveState {
                 return;
             }
         };
-        match std::fs::remove_file(&path) {
+        match self.fs.remove_file(&path) {
             Ok(()) => {
                 self.refresh_slots();
                 self.push_diag(error::at_command(
@@ -861,7 +882,7 @@ impl SaveState {
             }
         };
         // 手册:只删**空**文件夹;非空由 remove_dir 原生失败,不递归。
-        match std::fs::remove_dir(&path) {
+        match self.fs.remove_dir(&path) {
             Ok(()) => {
                 self.push_diag(error::at_command(
                     error::info(
@@ -928,7 +949,7 @@ impl SaveState {
             // (`D:/.../project-eris` 之于 `.../project-eris/save`),
             // 等于允许脚本从上层目录读删。
             let lexical_ok = raw == self.root.as_path() || raw.starts_with(&self.root);
-            let (Ok(root), Ok(resolved)) = (self.root.canonicalize(), raw.canonicalize()) else {
+            let (Some(root), Some(resolved)) = (self.fs.canonicalize(&self.root), self.fs.canonicalize(raw)) else {
                 return if lexical_ok {
                     Ok(raw.to_path_buf())
                 } else {
@@ -954,7 +975,7 @@ impl SaveState {
             ));
         }
         let joined = self.root.join(raw);
-        let Ok(resolved) = joined.canonicalize() else {
+        let Some(resolved) = self.fs.canonicalize(&joined) else {
             // 目标不存在时退化为词法归一化(仍拒绝 `..` 分量)。
             for comp in raw.components() {
                 if matches!(comp, std::path::Component::ParentDir) {
@@ -966,7 +987,7 @@ impl SaveState {
             }
             return Ok(joined);
         };
-        let Ok(root) = self.root.canonicalize() else {
+        let Some(root) = self.fs.canonicalize(&self.root) else {
             return Err(error::recoverable(
                 code::PATH_ESCAPE,
                 "save 根不存在(无法核界)",
@@ -1015,11 +1036,8 @@ fn snapshot_payload(snap: &VarSnapshot) -> Result<yu_format::yssd::YssdValue, Di
 
 /// 已存在存档的容器版本:只读文件头 8 字节(`YSSD` + u32 版本);
 /// 非 YSSD / 太短 / 打不开 ⇒ `None`(由调用方决定回退来源)。
-fn existing_container_version(path: &std::path::Path) -> Option<u32> {
-    use std::io::Read;
-    let mut head = [0u8; 8];
-    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
-    if &head[..4] != b"YSSD" {
+fn container_version_of(head: &[u8]) -> Option<u32> {
+    if head.len() < 8 || &head[..4] != b"YSSD" {
         return None;
     }
     Some(u32::from_le_bytes([head[4], head[5], head[6], head[7]]))

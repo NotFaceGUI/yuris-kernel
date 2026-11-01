@@ -1,0 +1,28 @@
+[package]
+name = "yu-host-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Android host: NDK cdylib + JNI entry, engine on a real filesystem, RGBA frames to Java"
+
+[lib]
+name = "yu_host_android"
+path = "src/lib.rs"
+# cdylib = JNI 入口(libyu_host_android.so);rlib 供宿主的 Rust 侧测试/示例链接。
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+jni = "0.21"
+log = "0.4"
+yu-engine = { path = "../../yu-engine" }
+yu-backend-wgpu = { path = "../../yu-render/wgpu" }
+yu-render-core = { path = "../../yu-render/core" }
+wgpu = "30.0.1"
+yu-font = { path = "../../yu-font" }
+yu-log = { path = "../../yu-log" }
+yu-rt = { path = "../../yu-rt" }
+yu-save = { path = "../../yu-save" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# logcat 后端(需 JavaVM/Context 已由 Java 侧交给 ndk-context)。
+android_logger = "0.11"

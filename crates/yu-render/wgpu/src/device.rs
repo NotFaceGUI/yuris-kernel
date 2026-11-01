@@ -97,6 +97,16 @@ pub struct GpuContext {
     pub text_storage: bool,
 }
 
+impl std::fmt::Debug for GpuContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuContext")
+            .field("adapter", &self.adapter_info.name)
+            .field("backend", &self.backend)
+            .field("text_storage", &self.text_storage)
+            .finish()
+    }
+}
+
 impl GpuContext {
     /// 按 `options` 建 instance → adapter → device。
     ///

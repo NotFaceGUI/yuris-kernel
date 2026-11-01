@@ -90,11 +90,13 @@ pub fn convert(_src: &[u8], _dst: &[u8], _data: &[u8]) -> Result<Vec<u8>, Diag> 
     ))
 }
 
+#[cfg(windows)]
 fn attach(name: &[u8], mut d: Diag) -> Diag {
     d.detail = format!("{}: {}", display(name), d.detail);
     d
 }
 
+#[cfg(windows)]
 fn display(bytes: &[u8]) -> String {
     let mut s = String::new();
     for &b in bytes {
@@ -108,6 +110,10 @@ fn display(bytes: &[u8]) -> String {
 }
 
 /// 组装解码结果。位深/声道/采样率取 ACM 建议格式；PCM 样本统一压到 i16。
+///
+/// 只有 win32 ACM 转换路径（`imp`）会产生建议格式，因此随平台门控：非
+/// Windows 构建没有 `WinFormat` 可言（Android/Linux 走装载失败对齐）。
+#[cfg(windows)]
 fn build_pcm(name: &[u8], fmt: &WinFormat, out: &[u8]) -> Result<Pcm, Diag> {
     let channels = fmt.n_channels;
     let rate = fmt.n_samples_per_sec;

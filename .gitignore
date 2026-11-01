@@ -26,3 +26,10 @@ www/pkg/
 www/node_modules/
 
 .VsCodeCounter/
+
+# Android 构建产物:K2 的 so 与 Gradle 输出不入库(so 由 cargo 现场构建)
+android/app/src/main/jniLibs/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties

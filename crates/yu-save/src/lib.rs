@@ -28,9 +28,28 @@
 #![allow(clippy::result_large_err)]
 
 pub mod error;
+pub mod fs;
 pub mod host;
 pub mod image_block;
 pub mod state;
 
+pub use fs::{FsEntry, NativeSaveFs, SaveFs, SaveFsHandle};
 pub use host::SaveHost;
 pub use state::{ReservedFact, SaveSnapshot, SaveState, SlotFile};
+
+/// 存档根物化(平台端口):目标平台有真实文件系统时实际建目录
+/// (缺目录 = SAVE 刷盘与 kidoku 副档写入全部静默失败,2026-10-25 实测)。
+///
+/// 走注入的 [`SaveFs`] 端口,因此不依赖 `std::fs` 是否可用:
+/// - 桌面 / Android:`NativeSaveFs` 建目录(与旧行为一致);
+/// - 无文件系统的宿主(浏览器 wasm)由宿主注入自己的实现,或在此 no-op
+///   后按落盘失败对齐(平台分歧 `docs/divergences/DIV-WEB-002`)。
+pub fn ensure_save_root(dir: &std::path::Path) -> Result<(), String> {
+    ensure_save_root_with(dir, &NativeSaveFs)
+}
+
+/// [`ensure_save_root`] 的端口版本。
+pub fn ensure_save_root_with(dir: &std::path::Path, fs: &dyn SaveFs) -> Result<(), String> {
+    fs.create_dir_all(dir)
+        .map_err(|e| format!("create_dir_all({}) 失败: {e}", dir.display()))
+}

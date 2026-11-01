@@ -44,6 +44,13 @@ pub const ENGINE_DEFAULT_FAMILIES: &[&str] = &[
     "標準明朝",
 ];
 
+/// Android 系统字体目录(与桌面「枚举已装字体」同能力,不是内置兜底)。
+///
+/// `fontdb` 上游没有 android 分支,`load_system_fonts()` 在该目标上是空
+/// 操作;AOSP 与主流 ROM 的系统字体落在这两处(后者为 OEM 追加目录)。
+#[cfg(target_os = "android")]
+pub const ANDROID_FONT_DIRS: &[&str] = &["/system/fonts", "/product/fonts"];
+
 /// Where a face came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FaceOrigin {
@@ -204,12 +211,110 @@ impl FontSource {
         Self::from_bytes(bytes, FaceOrigin::Embedded)
     }
 
+    /// 系统字体 + 宿主附加字节(跨平台字体注入口)。
+    ///
+    /// 字体能力是**宿主能力**:桌面枚举系统字体;Android 除系统目录外还可
+    /// 从 APK assets 补字体;无系统字体的目标(浏览器)只靠宿主供字节。
+    /// 这是「同一入口、能力等价」的实现点,不是内置兜底 —— 空输入在
+    /// 无系统字体的目标上仍显式失败。
+    ///
+    /// - 有系统枚举的目标(桌面/Android):系统字体 ∪ `extra`;`extra` 用于
+    ///   补齐游戏指定的 family。
+    /// - wasm:仅 `extra`(浏览器无系统字体)。
+    pub fn load_with_extra_bytes(extra: &[Vec<u8>]) -> Result<Self, Diag> {
+        let mut db = fontdb::Database::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            db.load_system_fonts();
+            #[cfg(target_os = "android")]
+            for dir in ANDROID_FONT_DIRS {
+                if std::path::Path::new(dir).is_dir() {
+                    db.load_fonts_dir(dir);
+                }
+            }
+        }
+        for bytes in extra {
+            db.load_font_data(bytes.clone());
+        }
+        if db.is_empty() {
+            return Err(Self::empty_source_error());
+        }
+        let mut faces = Vec::new();
+        let mut by_db = HashMap::new();
+        for info in db.faces() {
+            let families: Vec<String> = info.families.iter().map(|(n, _)| n.clone()).collect();
+            let family_key = families
+                .first()
+                .map(|n| normalize_name(n))
+                .unwrap_or_default();
+            by_db.insert(info.id, FaceId(faces.len() as u32));
+            faces.push(FaceRecord {
+                db_id: info.id,
+                families,
+                family_key,
+                post_script_name: info.post_script_name.clone(),
+                weight: info.weight.0,
+                style: match info.style {
+                    fontdb::Style::Normal => FaceStyle::Normal,
+                    fontdb::Style::Italic => FaceStyle::Italic,
+                    fontdb::Style::Oblique => FaceStyle::Oblique,
+                },
+                index: info.index,
+                // 逐 face 标来源:系统枚举出来的有文件路径,宿主注入的是字节。
+                #[cfg(not(target_arch = "wasm32"))]
+                origin: if matches!(info.source, fontdb::Source::File(_)) {
+                    FaceOrigin::System
+                } else {
+                    FaceOrigin::Embedded
+                },
+                #[cfg(target_arch = "wasm32")]
+                origin: FaceOrigin::Embedded,
+                source_path: source_path_of(&info.source),
+            });
+        }
+        if faces.is_empty() {
+            return Err(Diag::fatal(code::font::BAD_FACE, Boundary::Data)
+                .with_detail("fontdb exposed no usable face"));
+        }
+        Ok(Self {
+            db,
+            faces,
+            by_db,
+            origin: FaceOrigin::System,
+            data_cache: Mutex::new(HashMap::new()),
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn empty_source_error() -> Diag {
+        Diag::fatal(code::font::SYSTEM_UNAVAILABLE, Boundary::Platform)
+            .with_detail("no host-supplied font bytes on wasm32")
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn empty_source_error() -> Diag {
+        Diag::fatal(code::font::MISSING, Boundary::Platform)
+            .with_detail("system font enumeration returned zero faces")
+    }
+
     /// Enumerate system fonts. Explicitly unavailable on wasm; never silently
     /// falls back to a bundled face.
+    ///
+    /// **Android**: `fontdb::Database::load_system_fonts()` is a no-op there
+    /// (upstream has no android branch), which would yield zero faces and a
+    /// blank screen. Scan the system font directories instead — same
+    /// capability as desktop, still "fonts the system actually ships", never
+    /// a bundled fallback.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_system_fonts() -> Result<Self, Diag> {
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
+        #[cfg(target_os = "android")]
+        for dir in ANDROID_FONT_DIRS {
+            if std::path::Path::new(dir).is_dir() {
+                db.load_fonts_dir(dir);
+            }
+        }
         if db.is_empty() {
             return Err(Diag::fatal(code::font::MISSING, Boundary::Platform)
                 .with_detail("system font enumeration returned zero faces"));
