@@ -9,6 +9,8 @@ log = "0.4"
 bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "0.4"
 wgpu = "30.0.1"
+# DeviceOptions::display(GLES 上屏必需)。
+raw-window-handle = "0.6"
 yu-backend-soft = { path = "../soft" }
 yu-render-core = { path = "../core" }
 yu-font = { path = "../../yu-font" }

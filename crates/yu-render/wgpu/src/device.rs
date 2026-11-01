@@ -41,6 +41,13 @@ pub struct DeviceOptions {
     pub force_fallback_adapter: bool,
     /// 请求的 limits;默认 [`wgpu::Limits::default`]。
     pub limits: wgpu::Limits,
+    /// 平台 display 连接(仅 **GLES 必需**)。
+    ///
+    /// `InstanceDescriptor::display` 为 `None` 时,wgpu 拒绝用
+    /// `create_surface()` 建窗口 surface,错误是
+    /// 「No `DisplayHandle` is available」——Android 的 GLES 后端正是这种情况,
+    /// 所以宿主在要上屏时必须提供。
+    pub display: Option<AndroidNdkDisplay>,
 }
 
 impl Default for DeviceOptions {
@@ -51,6 +58,7 @@ impl Default for DeviceOptions {
             adapter_name: None,
             force_fallback_adapter: false,
             limits: wgpu::Limits::default(),
+            display: None,
         }
     }
 }
@@ -78,6 +86,27 @@ impl AdapterSummary {
             vendor: info.vendor,
             device: info.device,
         }
+    }
+}
+
+/// Android 的 display 句柄(零大小标记,给 wgpu 建窗口 surface 用)。
+///
+/// wgpu 要求 `InstanceDescriptor::display` 是
+/// `HasDisplayHandle + Debug + Send + Sync + 'static`。raw-window-handle
+/// 为 Android 提供了**完全安全**的零大小构造器
+/// [`raw_window_handle::DisplayHandle::android`],这里包一层以满足该约束。
+///
+/// 为什么需要:Android 的 GLES 后端必须能从 instance 拿到 display 才允许
+/// `create_surface()`;不提供时 wgpu 报
+/// 「No `DisplayHandle` is available to create this surface」。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AndroidNdkDisplay;
+
+impl raw_window_handle::HasDisplayHandle for AndroidNdkDisplay {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Ok(raw_window_handle::DisplayHandle::android())
     }
 }
 
@@ -115,10 +144,12 @@ impl GpuContext {
     /// 崩溃或空跑。
     pub fn new(options: &DeviceOptions) -> Result<Self, Diag> {
         let backends = options.backends.unwrap_or(wgpu::Backends::PRIMARY);
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = backends;
+        if let Some(display) = options.display {
+            descriptor = descriptor.with_display_handle(Box::new(display));
+        }
+        let instance = wgpu::Instance::new(descriptor);
 
         let adapter = if let Some(wanted) = options.adapter_name.as_deref() {
             select_adapter_by_name(&instance, backends, wanted)?

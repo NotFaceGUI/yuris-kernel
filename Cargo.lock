@@ -4133,6 +4133,7 @@ dependencies = [
  "log",
  "naga",
  "pollster",
+ "raw-window-handle",
  "sha2",
  "wgpu",
  "yu-backend-soft",
@@ -4226,8 +4227,13 @@ name = "yu-host-android"
 version = "0.1.0"
 dependencies = [
  "android_logger",
+ "bytemuck",
+ "cpal",
  "jni 0.21.1",
  "log",
+ "ndk-context",
+ "ndk-sys 0.6.0+11769913",
+ "raw-window-handle",
  "wgpu",
  "yu-backend-wgpu",
  "yu-engine",
@@ -4236,6 +4242,7 @@ dependencies = [
  "yu-render-core",
  "yu-rt",
  "yu-save",
+ "yu-sound",
 ]
 
 [[package]]

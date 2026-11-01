@@ -41,6 +41,9 @@
 #![deny(unsafe_code)]
 #![allow(clippy::result_large_err)]
 
+pub mod present;
+pub mod sound;
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 
@@ -55,6 +58,23 @@ struct Session {
     frame_h: u32,
     frame_pixels: Vec<u8>,
     ticks: u64,
+    /// 零拷贝上屏器。`Some` = 已绑定原生窗口,`tick` 时直接上屏(不读回
+    /// CPU);`None` = 走 `nativeCopyFrame` 的旧路径(CPU 后端必须如此)。
+    presenter: Option<present::NativePresenter>,
+    /// 建上屏器要用的 GPU 上下文(GPU 后端才 `Some`;与引擎共享同一 device)。
+    gpu: Option<yu_backend_wgpu::GpuContext>,
+    /// 音频输出设备(持有 stream 即出声;drop 即停)。
+    audio: Option<sound::SoundSink>,
+    /// 上屏失败计数(诊断;nativeStatus 可见)。
+    present_failures: u64,
+    /// 是否渲染上屏(归因实验开关)。
+    video: bool,
+    /// 发布模式(状态串最小化)。
+    quiet: bool,
+    /// 音频抓取:已启动时的目标样本数(诊断爆音)。
+    audio_capture_target: usize,
+    /// 抓取结果的落盘路径(数据目录下 debug/audio-capture.wav)。
+    capture_path: Option<PathBuf>,
 }
 
 /// 日志控制台句柄(文件日志开启时非空;`flush_logs` 用它把 JSONL 缓冲落盘)。
@@ -63,8 +83,13 @@ static LOG_CONSOLE: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<yu_l
 
 thread_local! {
     /// 单线程会话槽(见模块文档「线程模型」)。
+    ///
+    /// 初始化器**已经**是 `const {}`;`missing_const_for_thread_local` 在多条目
+    /// 宏里对已 const 的项仍会报一次(clippy 误报),逐项关掉。
+    #[allow(clippy::missing_const_for_thread_local)]
     static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
     /// 最近一次失败原因(供 `nativeStatus` 报告;成功初始化时清空)。
+    #[allow(clippy::missing_const_for_thread_local)]
     static LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
@@ -199,6 +224,24 @@ pub struct RunConfig {
     pub log_file: Option<PathBuf>,
     /// 日志门槛:`"quiet"|"error"|"warn"|"info"|"verbose"`。缺省 `"info"`。
     pub log_level: String,
+    /// 抓取混音输出到 `<data_root>/debug/audio-capture.wav`(诊断爆音)。
+    /// 值 = 抓取多少毫秒(0 = 不抓)。
+    pub audio_capture_ms: u32,
+    /// 纯音自测:旁路引擎输出,直接给设备灌 1kHz 正弦(诊断爆音)。
+    pub audio_tone: bool,
+    /// 强制输出采样率(设备支持才生效;`None` = 用设备默认)。
+    pub audio_rate: Option<u32>,
+    /// 是否渲染上屏(默认 true)。`false` = 只跑 VM + 声音,用于归因实验:
+    /// 把合成/上屏整条链路从时序里摘掉,单独判断卡顿是否由渲染抢 CPU 引起。
+    pub render: bool,
+    /// **发布模式**(默认 true):关掉一切只为排查存在的开销。
+    ///
+    /// - logcat 只放 `warn` 以上(不再每帧/每秒写 info);
+    /// - 不启用混音抓取(WAV 落盘 = 1MB 内存 + 写 /sdcard);
+    /// - `nativeStatus()` 只算最小字段(不再每秒拼整条状态串、取诊断、读阶段计数)。
+    ///
+    /// 诊断时置 `false`(或 `log_level=verbose`,会自动置 false)。
+    pub quiet: bool,
 }
 
 impl Default for RunConfig {
@@ -224,6 +267,11 @@ impl Default for RunConfig {
             gpu_backend: "auto".to_string(),
             log_file: None,
             log_level: "info".to_string(),
+            audio_capture_ms: 0,
+            audio_tone: false,
+            audio_rate: None,
+            render: true,
+            quiet: true,
         }
     }
 }
@@ -236,11 +284,21 @@ impl RunConfig {
     /// `font_file` `os_sound` `audio` `backend` `fps` `screen_color` `dx_mode`
     /// `save_codec` `media_readonly` `record_events` `log_file` `log_level`
     pub fn from_json(text: &str) -> Result<Self, String> {
+        let mut config = Self::default();
+        config.apply_json(text)?;
+        Ok(config)
+    }
+
+    /// 把一段 JSON 铺到已有配置上(未出现的键保持原值)。
+    ///
+    /// 宿主用它做 `<训练目录>/debug/run-config.json` 覆盖:调壳不方便时
+    /// 直接改文件即可打开诊断开关(纯音、关渲染、指定采样率等)。
+    pub fn apply_json(&mut self, text: &str) -> Result<(), String> {
         let value = yu_engine::json::parse(text)?;
         let Some(object) = value.as_object() else {
             return Err("配置必须是 JSON 对象".to_string());
         };
-        let mut config = Self::default();
+        let config = self;
         // `data_root` / `save_root` 是路径键(不是字符串开关),必须先解析,
         // 否则 `start_session_json` 的必填校验永远看到空路径。
         if let Some(v) = object.get("data_root").and_then(|v| v.as_str()) {
@@ -300,6 +358,23 @@ impl RunConfig {
                 config.gpu_backend = lowered;
             }
         }
+        if let Some(v) = object.get("audio_capture_ms").and_then(|v| v.as_u64()) {
+            config.audio_capture_ms = v.min(u64::from(u32::MAX)) as u32;
+        }
+        // 纯音自测:旁路引擎,直接给设备灌 1kHz 正弦。用来把「引擎/混音」与
+        // 「环 → oboe → 系统」两段彻底分开(爆音定位的决定性手段)。
+        if let Some(v) = object.get("audio_tone").and_then(|v| v.as_bool()) {
+            config.audio_tone = v;
+        }
+        if let Some(v) = object.get("render").and_then(|v| v.as_bool()) {
+            config.render = v;
+        }
+        let quiet_explicit = object.get("quiet").and_then(|v| v.as_bool());
+        if let Some(v) = object.get("audio_rate").and_then(|v| v.as_u64()) {
+            if v > 0 {
+                config.audio_rate = Some(v.min(u64::from(u32::MAX)) as u32);
+            }
+        }
         if let Some(v) = object.get("log_file").and_then(|v| v.as_str()) {
             if !v.trim().is_empty() {
                 config.log_file = Some(PathBuf::from(v));
@@ -343,7 +418,17 @@ impl RunConfig {
         if let Some(v) = object.get("record_events").and_then(|v| v.as_bool()) {
             config.record_events = v;
         }
-        Ok(config)
+        // 显式 `quiet` 优先;否则只在本次真的给了 `log_level` 时才推断
+        // —— `apply_json` 会被调用两次(壳的 JSON + 调试覆盖文件),
+        // 无条件按 `log_level` 重算会把上一次的显式设置冲掉。
+        if let Some(quiet) = quiet_explicit {
+            config.quiet = quiet;
+        } else if object.get("log_level").is_some() {
+            // `log_level=verbose`(壳打开「调试日志」时设置)= 明确要诊断,
+            // 自动退出发布模式。
+            config.quiet = config.log_level != "verbose";
+        }
+        Ok(())
     }
 }
 
@@ -398,15 +483,31 @@ pub fn init_session_with_fonts(
         ..RunConfig::default()
     };
     config.font_bytes.extend(load_host_fonts(&config.data_root));
-    let (engine, summary) = start_engine(config, path_overrides)?;
-    let viewport = engine.viewport();
+    let started = start_engine(config, path_overrides)?;
+    store_session(started)
+}
+
+/// 把启动产物装进线程本地会话,返回摘要。
+fn store_session(started: StartedEngine) -> Result<String, String> {
+    let viewport = started.engine.viewport();
+    let summary = started.summary.clone();
+    let capture = started.audio_capture;
+    let capture_path = started.capture_path.clone();
     SESSION.with(|slot| {
         *slot.borrow_mut() = Some(Session {
-            engine,
+            engine: started.engine,
             frame_w: viewport.width,
             frame_h: viewport.height,
             frame_pixels: Vec::new(),
             ticks: 0,
+            presenter: None,
+            gpu: started.gpu,
+            audio: started.audio,
+            present_failures: 0,
+            video: started.render,
+            quiet: started.quiet,
+            audio_capture_target: capture,
+            capture_path,
         });
     });
     Ok(summary)
@@ -427,17 +528,22 @@ fn create_gpu_context(gpu_backend: &str) -> Result<yu_backend_wgpu::GpuContext, 
     };
     let mut failures = Vec::new();
     for (name, backends) in ladder {
+        log_line("gpu", &format!("尝试后端 {name}"));
         let options = DeviceOptions {
             backends: Some(backends),
+            // GLES 建窗口 surface 必须能从 instance 取到 display handle;
+            // Android 是零大小标记,构造完全安全。
+            display: Some(yu_backend_wgpu::AndroidNdkDisplay),
             ..DeviceOptions::default()
         };
+        log_line("gpu", "creating instance/adapter/device...");
         match yu_backend_wgpu::GpuContext::new(&options) {
             Ok(context) => {
                 log_line(
                     "yu-host-android",
                     &format!(
-                        "gpu: requested={name} actual={:?} adapter={}",
-                        context.backend, context.adapter_info.name
+                        "gpu: requested={name} actual={:?} adapter={} text_storage={}                          (text_storage=false ⇒ 文本走 CPU 合成,plan 会明显变慢)",
+                        context.backend, context.adapter_info.name, context.text_storage
                     ),
                 );
                 return Ok(context);
@@ -455,6 +561,88 @@ fn create_gpu_context(gpu_backend: &str) -> Result<yu_backend_wgpu::GpuContext, 
         "GPU 后端都不可用({});该设备不支持 GPU 加速,请改用 CPU",
         failures.join("; ")
     ))
+}
+
+/// 把交错 f32 样本写成 16-bit PCM WAV(诊断:拉回电脑做波形分析)。
+fn write_wav_f32(
+    path: &std::path::Path,
+    samples: &[f32],
+    rate: u32,
+    channels: u16,
+) -> Result<usize, String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建目录 {} 失败: {e}", parent.display()))?;
+        }
+    }
+    let data_bytes = samples.len() * 2;
+    let mut out = Vec::with_capacity(44 + data_bytes);
+    let ch = u32::from(channels);
+    let byte_rate = rate * ch * 2;
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&((36 + data_bytes) as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    // 16-bit PCM 的 block align = 声道数 × 2 字节。
+    out.extend_from_slice(&(channels * 2).to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(data_bytes as u32).to_le_bytes());
+    for sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        out.extend_from_slice(&((clamped * 32767.0) as i16).to_le_bytes());
+    }
+    std::fs::write(path, &out).map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
+    Ok(out.len())
+}
+
+/// 安装 panic hook:Rust panic 会直接 abort 进程,而默认 hook 的输出在
+/// Android 上不一定进 logcat。这里显式把 panic 位置与消息写到日志通道,
+/// 否则现场只剩一个 SIGABRT 栈、看不到原因(实测:只有 `Fatal signal 6`)。
+/// 初始化 `log` 门面(Android 上直通 logcat)。
+///
+/// 不做这步的话,引擎内部所有 `log::info!/warn!/error!` 都会被静默丢弃 ——
+/// 排查时只能看到我们自己手写的行,看不到引擎/字体/渲染的诊断(实测教训)。
+#[cfg(target_os = "android")]
+fn init_logcat(quiet: bool) {
+    use std::sync::Once;
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        // 发布模式只留 warn 以上:logcat 每条都要走 JNI + 内核日志缓冲,
+        // 稳态每帧/每秒写 info 是白白付出的 IPC。
+        let level = if quiet {
+            log::Level::Warn
+        } else {
+            log::Level::Info
+        };
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_min_level(level)
+                .with_tag("yu-kernel"),
+        );
+    });
+}
+
+#[cfg(not(target_os = "android"))]
+fn init_logcat(_quiet: bool) {}
+
+fn install_panic_hook() {
+    use std::sync::Once;
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let message = info.to_string();
+            // 同时走 logcat 与文件日志(若已开启)。
+            log::error!(target: "yu-host-android", "[panic] {message}");
+            log_line("yu-host-android", &format!("[panic] {message}"));
+            flush_logs();
+        }));
+    });
 }
 
 /// 初始化文件日志(JSONL):`log_file` 指向的文件 + 门槛。
@@ -508,6 +696,9 @@ pub fn flush_logs() {
 
 /// 向文件日志写一行宿主标记(没有开启文件日志时静默忽略)。
 fn log_line(target: &str, message: &str) {
+    // 同时走 `log` 门面(Android 上打到 logcat):崩溃前最后一条诊断必须
+    // 在 logcat 里可见,不能只留在尚未 flush 的文件日志中。
+    log::info!(target: "yu-android", "{message}");
     if let Ok(slot) = LOG_CONSOLE.lock() {
         if let Some(console) = slot.as_ref() {
             if let Ok(mut console) = console.lock() {
@@ -529,23 +720,26 @@ pub fn start_session_json(json: &str) -> Result<String, String> {
     if config.save_root.as_os_str().is_empty() {
         config.save_root = config.data_root.join("save");
     }
+    // 调试覆盖:壳(JAVA)不方便重编时,把 `<游戏目录>/debug/run-config.json`
+    // 铺在启动参数之上即可打开诊断开关(纯音/关渲染/指定采样率…)。
+    // 文件不存在是常态,不报错、不留日志噪声。
+    let override_path = config.data_root.join("debug").join("run-config.json");
+    if let Ok(text) = std::fs::read_to_string(&override_path) {
+        config
+            .apply_json(&text)
+            .map_err(|error| format!("{} 解析失败: {error}", override_path.display()))?;
+        log_line(
+            "yu-host-android",
+            &format!("已应用调试覆盖: {}", override_path.display()),
+        );
+    }
     let path_overrides = yu_engine::host_paths::HostPathOverrides {
         appdata_path: Some(config.save_root.clone()),
         personal_path: Some(config.data_root.clone()),
         ..Default::default()
     };
-    let (engine, summary) = start_engine(config, path_overrides)?;
-    let viewport = engine.viewport();
-    SESSION.with(|slot| {
-        *slot.borrow_mut() = Some(Session {
-            engine,
-            frame_w: viewport.width,
-            frame_h: viewport.height,
-            frame_pixels: Vec::new(),
-            ticks: 0,
-        });
-    });
-    Ok(summary)
+    let started = start_engine(config, path_overrides)?;
+    store_session(started)
 }
 
 /// 按 [`RunConfig`] 启动引擎,返回 `(Engine, 摘要)`。
@@ -555,7 +749,7 @@ pub fn start_session_json(json: &str) -> Result<String, String> {
 pub fn start_engine(
     config: RunConfig,
     path_overrides: yu_engine::host_paths::HostPathOverrides,
-) -> Result<(Engine, String), String> {
+) -> Result<StartedEngine, String> {
     let RunConfig {
         data_root,
         save_root,
@@ -577,6 +771,11 @@ pub fn start_engine(
         record_events,
         log_file,
         log_level,
+        audio_capture_ms,
+        audio_tone,
+        audio_rate,
+        render,
+        quiet,
     } = config;
 
     // 日志:非空 `log_file` 即开启。相对路径落游戏目录,便于 adb pull。
@@ -602,6 +801,8 @@ pub fn start_engine(
             .map_err(|e| format!("字体读取失败 {}: {e}", path.display()))?;
         font_bytes.push(bytes);
     }
+    init_logcat(quiet);
+    install_panic_hook();
     // 存档根必须存在:缺目录会让 SAVE 与既读记录全部静默失败。
     std::fs::create_dir_all(&save_root)
         .map_err(|e| format!("创建存档目录失败 {}: {e}", save_root.display()))?;
@@ -627,6 +828,8 @@ pub fn start_engine(
     } else {
         None
     };
+    // 引擎与上屏器必须共用同一个 device,所以这里留一份克隆给宿主。
+    let gpu_for_present = gpu_context.clone();
     let options = EngineOptions {
         backend: chosen_backend,
         gpu_context,
@@ -641,6 +844,8 @@ pub fn start_engine(
         os_sound,
         media_readonly,
         record_events,
+        // 归因实验:关掉渲染时引擎复用首帧呈现面,VM/声音照常推进。
+        render,
         script_key,
         save_codec: codec,
         save_root: Some(save_root.clone()),
@@ -649,9 +854,35 @@ pub fn start_engine(
         force_font,
         ..EngineOptions::default()
     };
-    let audio_note = if audio_output { "" } else { " audio=off" };
     let mut engine =
         Engine::new(project, options).map_err(|failure| format!("引擎启动失败: {failure}"))?;
+    // 音频输出:与 `@_OS_SOUND` 解耦 —— `os_sound` 决定 VM 可见变量,
+    // `audio_output` 才决定是否真的打开设备(架构 §2.5 R5)。
+    //
+    // 打不开设备不致命:静音继续跑,但必须留痕(否则用户只会觉得"没声音"
+    // 而查不到原因)。
+    let mut audio_sink = None;
+    let audio_note = if !audio_output {
+        " audio=off".to_string()
+    } else {
+        match sound::SoundSink::open_with_rate(audio_rate) {
+            Ok(sink) => {
+                let description = sink.describe();
+                // 纯音自测:旁路引擎,只验「环 → oboe → 系统」这段。
+                if audio_tone {
+                    sink.set_tone(true);
+                }
+                engine.attach_audio(Box::new(sink.handle()));
+                // 真正的 sink 留在这里(它持有 stream,drop 即停声)。
+                audio_sink = Some(sink);
+                format!(" audio={description}")
+            }
+            Err(error) => {
+                log_line("yu-host-android", &format!("音频设备打开失败: {error}"));
+                format!(" audio=FAILED({error})")
+            }
+        }
+    };
     if engine.font_summary().is_none() {
         engine.warm_text();
     }
@@ -679,7 +910,40 @@ pub fn start_engine(
     };
     log_line("yu-host-android", &summary);
     flush_logs();
-    Ok((engine, summary))
+    // 发布模式下忽略抓取请求(壳无条件传 3000ms,那是诊断用的)。
+    let audio_capture_ms = if quiet { 0 } else { audio_capture_ms };
+    let capture_samples = (u64::from(audio_capture_ms) * 44100 / 1000 * 2) as usize;
+    let capture_path = (capture_samples > 0)
+        .then(|| data_root.join("debug").join("audio-capture.wav"));
+    Ok(StartedEngine {
+        engine,
+        summary,
+        render,
+        quiet,
+        gpu: gpu_for_present,
+        audio: audio_sink,
+        audio_capture: capture_samples,
+        capture_path,
+    })
+}
+
+/// [`start_engine`] 的产物:引擎 + 摘要 + 可复用的 GPU 上下文。
+pub struct StartedEngine {
+    pub engine: Engine,
+    pub summary: String,
+    /// 是否渲染上屏(`false` = 纯音频归因模式)。
+    pub render: bool,
+    /// 发布模式(见 [`RunConfig::quiet`])。
+    pub quiet: bool,
+    /// GPU 后端时为 `Some`,零拷贝上屏用它建 surface(必须同一 device)。
+    pub gpu: Option<yu_backend_wgpu::GpuContext>,
+    /// 音频输出设备。`Some` 时引擎已挂上,回调驱动播放位置。
+    /// 必须在会话存活期间持有(drop 即停声)。
+    pub audio: Option<sound::SoundSink>,
+    /// 音频抓取目标样本数(`RunConfig::audio_capture` 非 0 时)。
+    pub audio_capture: usize,
+    /// 抓取落盘路径。
+    pub capture_path: Option<PathBuf>,
 }
 
 
@@ -694,9 +958,64 @@ pub fn tick() -> i32 {
         match session.engine.tick_realtime() {
             Ok(rendered) => {
                 session.ticks += 1;
+                // 音频抓取:启动满 2 秒后抓 3 秒,再落盘供数值分析。
+                if session.audio_capture_target > 0
+                    && session.ticks == 120
+                {
+                    session.engine.start_audio_capture(session.audio_capture_target);
+                }
+                if session.audio_capture_target > 0 && session.ticks == 300 {
+                    if let Some(samples) = session.engine.take_audio_capture() {
+                        let path = session.capture_path.clone();
+                        if let Some(path) = path {
+                            match write_wav_f32(&path, &samples, 44100, 2) {
+                                Ok(bytes) => log_line(
+                                    "yu-host-android",
+                                    &format!("audio capture: {} samples -> {} ({} bytes)", samples.len(), path.display(), bytes),
+                                ),
+                                Err(error) => log_line("yu-host-android", &format!("audio capture 写盘失败: {error}")),
+                            }
+                        }
+                    }
+                    session.audio_capture_target = 0;
+                }
                 session.frame_w = rendered.surface.width;
                 session.frame_h = rendered.surface.height;
-                session.frame_pixels = rendered.surface.rgba.clone();
+                // 零拷贝路径:GPU 后端 + 已绑定原生窗口时,直接把引擎屏幕
+                // 纹理呈现到窗口,**不做 CPU 读回**(省掉整帧 1.9MB 拷贝)。
+                // CPU 后端没有 GPU 纹理,仍走 `frame_pixels` 给壳画 Bitmap。
+                let mut presented = false;
+                if !session.video {
+                    // 纯音频归因:不做任何上屏工作(呈现面复用首帧)。
+                    presented = true;
+                }
+                if session.presenter.is_some() && !presented {
+                    // 借出 presenter 与 engine 的屏幕纹理(不同字段,可同时借用)。
+                    // 分别借用两个字段(不该用裸指针):engine 只读取纹理,
+                    // presenter 可变。Rust 允许对不同字段同时借用。
+                    let (engine, presenter_slot) = (&session.engine, &mut session.presenter);
+                    let screen = engine.screen_texture();
+                    if let (Some(presenter), Some((id, w, h, texture))) =
+                        (presenter_slot.as_mut(), screen)
+                    {
+                        match presenter.present(texture, id, w, h) {
+                            Ok(()) => presented = true,
+                            Err(error) => {
+                                session.present_failures += 1;
+                                if session.present_failures <= 3 {
+                                    let message = format!("上屏失败: {error}");
+                                    log_line("yu-host-android", &message);
+                                    set_error(message);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !presented && session.video {
+                    // 回退:保留 CPU 像素供壳按旧路径绘制。GPU 路径下这只是
+                    // 诊断副本,不影响上屏。
+                    session.frame_pixels = rendered.surface.rgba.clone();
+                }
                 0
             }
             Err(failure) => {
@@ -704,6 +1023,35 @@ pub fn tick() -> i32 {
                 -2
             }
         }
+    })
+}
+
+/// 用 Java `Surface` 建立零拷贝上屏(由 `jni_entry` 内的 unsafe 包装调用)。
+///
+/// `attach` 是「把 JNI 句柄转成 presenter」的闭包:把 unsafe 隔离在
+/// [`jni_entry`] 里,本函数保持安全 Rust。
+///
+/// # Errors
+///
+/// 未初始化、CPU 后端、或窗口/surface 创建失败时返回错误文本。
+pub fn attach_surface(
+    attach: impl FnOnce(&yu_backend_wgpu::GpuContext) -> Result<present::NativePresenter, String>,
+) -> Result<String, String> {
+    SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(session) = slot.as_mut() else {
+            return Err("attachSurface 在 nativeInit 之前被调用".to_string());
+        };
+        // CPU 后端没有 GPU 纹理可上屏,直接拒绝(壳据此继续用 Bitmap 路径)。
+        let Some(context) = session.gpu.as_ref() else {
+            return Err("当前是 CPU 后端,零拷贝上屏需要 GPU".to_string());
+        };
+        let presenter = attach(context)?;
+        let (width, height) = presenter.size();
+        session.presenter = Some(presenter);
+        let summary = format!("surface attached: {}x{}", width, height);
+        log_line("yu-host-android", &summary);
+        Ok(summary)
     })
 }
 
@@ -773,11 +1121,23 @@ pub fn status_text() -> String {
         let mut slot = slot.borrow_mut();
         match slot.as_mut() {
             Some(session) => {
+                // 发布模式:只算两个廉价字段。整条状态串要拼十几个 format、
+                // 取诊断、读渲染阶段原子量 —— 每秒一次对帧时间没意义,对一个
+                // 要上架的产品却是纯噪声。
+                if session.quiet {
+                    out.push_str(&format!(
+                        "frame={} fps=60",
+                        session.engine.last_report().frame
+                    ));
+                    return;
+                }
                 let report = session.engine.last_report().clone();
                 let diags = session.engine.take_diags().len();
+                let clipped = session.engine.sound_clipped_samples();
+                let rt_silence = session.engine.sound_rt_silence_samples();
                 out.push_str(&format!(
                     "status=running backend={} entry={} frame={} ticks={} viewport={}x{} \
-                     layers={} ops={} skipped={} drawable={} boot_ms={:.1} diags={}                      tick_ms={:.2} render_ms={:.2}",
+                     layers={} ops={} skipped={} drawable={} boot_ms={:.1} diags={}                      tick_ms={:.2} render_ms={:.2} snd[underrun={} clipped={} rtsil={} dec_ms={:.2}]",
                     session.engine.backend(),
                     session.engine.entry(),
                     report.frame,
@@ -792,7 +1152,15 @@ pub fn status_text() -> String {
                     diags,
                     report.tick_ms,
                     report.render_ms,
+                    report.sound_underruns,
+                    clipped,
+                    rt_silence,
+                    report.sound_stream_ms,
                 ));
+                // 设备侧交付:short>0 = 环被抽干(我们补了静音)。
+                if let Some(audio) = session.audio.as_ref() {
+                    out.push_str(&format!(" dev[{}]", audio.stats_line()));
+                }
                 // 渲染阶段拆解:`readback_us` 是 GPU→CPU 整帧读回的耗时,
                 // 也是 Android 上能否跑满 60fps 的关键项。
                 if let Some(phases) = session.engine.render_phases() {
@@ -800,6 +1168,9 @@ pub fn status_text() -> String {
                         " phases[plan={} encode={} readback={} tail={}]us",
                         phases.plan_us, phases.encode_us, phases.readback_us, phases.tail_us
                     ));
+                }
+                if !session.video {
+                    out.push_str(" video=off");
                 }
                 if session.engine.main_finished() {
                     out.push_str(" main_finished=1");
@@ -1046,6 +1417,94 @@ mod jni_entry {
                 to_jstring(&mut env, format!("ERR: {message}"))
             }
         }
+    }
+
+    /// 初始化 NDK 上下文(JavaVM + Application Context)。
+    ///
+    /// **必须在任何音频调用之前**由壳调用一次。oboe(cpal 的 Android 后端)
+    /// 通过 `ndk-context` 取 JavaVM/Context 来创建 AudioTrack;不初始化就在
+    /// 打开音频设备时 panic(`android context was not initialized`,已实测)。
+    ///
+    /// `activity` 传 Activity 实例即可(它的 Context 能拿到 AudioManager)。
+    #[cfg(target_os = "android")]
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeInitAndroidContext<'local>(
+        env: JNIEnv<'local>,
+        _class: JClass<'local>,
+        activity: jni::objects::JObject<'local>,
+    ) -> jint {
+        let java_vm = env.get_java_vm();
+        let Ok(vm) = java_vm else {
+            set_error("取 JavaVM 失败");
+            return -1;
+        };
+        let raw_vm = vm.get_java_vm_pointer() as *mut std::ffi::c_void;
+        let raw_context = activity.as_raw() as *mut std::ffi::c_void;
+        // `initialize_android_context` 内部 `assert!(previous.is_none())` ——
+        // 调两次会 panic。配置界面与游戏界面都会调用,所以这里自己去重。
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            // SAFETY: 句柄来自当前 JNIEnv/Activity 参数,进程内只在首次调用时
+            // 交给 ndk-context;它只保存指针供 oboe 使用,不接管所有权。
+            unsafe {
+                ndk_context::initialize_android_context(raw_vm, raw_context);
+            }
+        });
+        0
+    }
+
+    /// 绑定 Java 的 `Surface` 做零拷贝上屏。
+    ///
+    /// 必须在 `nativeInitJson` 之后、且 GPU 后端下调用;失败时壳继续用
+    /// `nativeCopyFrame` 的 Bitmap 路径(不致命)。
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeAttachSurface<'local>(
+        env: JNIEnv<'local>,
+        _class: JClass<'local>,
+        surface: jni::objects::JObject<'local>,
+    ) -> jint {
+        let raw_env = env.get_native_interface();
+        let raw_surface = surface.as_raw();
+        // SAFETY: `raw_env` 来自当前线程的 JNIEnv;`raw_surface` 是本调用
+        // 参数里的 `android.view.Surface`,在调用期间有效。`attach_surface`
+        // 内部只在构造期间使用这两个句柄。
+        let result = attach_surface(|gpu| unsafe {
+            super::present::NativePresenter::from_java_surface(raw_env, raw_surface, gpu)
+                .map_err(|error| error.to_string())
+        });
+        match result {
+            Ok(_) => 0,
+            Err(message) => {
+                set_error(message);
+                -1
+            }
+        }
+    }
+
+    /// 窗口尺寸变化(壳在 `surfaceChanged` 里调用)。
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeResizeSurface<'local>(
+        _env: JNIEnv<'local>,
+        _class: JClass<'local>,
+        width: jint,
+        height: jint,
+    ) -> jint {
+        SESSION.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(session) = slot.as_mut() else {
+                return -1;
+            };
+            let Some(presenter) = session.presenter.as_mut() else {
+                return -1;
+            };
+            match presenter.resize(width.max(1) as u32, height.max(1) as u32) {
+                Ok(()) => 0,
+                Err(error) => {
+                    set_error(format!("调整上屏尺寸失败: {error}"));
+                    -1
+                }
+            }
+        })
     }
 
     /// 列出本机可用字体族(换行分隔;空 = 一个都没有)。

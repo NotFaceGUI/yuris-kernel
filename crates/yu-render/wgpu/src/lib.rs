@@ -79,7 +79,7 @@ pub mod surfaces;
 mod text_gpu;
 pub mod textures;
 
-pub use device::{AdapterSummary, DeviceOptions, GpuContext};
+pub use device::{AdapterSummary, AndroidNdkDisplay, DeviceOptions, GpuContext};
 pub use readback::ReadbackCache;
 pub use textures::{GpuTexture, RenderTarget, TextureCache};
 
