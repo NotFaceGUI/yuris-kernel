@@ -125,10 +125,10 @@
 ## 4. 环境
 
 ```bash
-export TEMP="<side-repo>/workbench/tmp"; export TMP="$TEMP"
+export TEMP="<tmp>"; export TMP="$TEMP"
 export YURIS_REQUIRE_SAMPLES=1
-export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"
-export YURIS_SAMPLE_ERIS_YPF="<side-repo>/workbench/project-eris/data.ypf"
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
+export YURIS_SAMPLE_ERIS_YPF="<project-eris>/data.ypf"
 export YURIS_WGPU_BACKEND=dx12          # native
 # 浏览器宿主按 K2 的 README;J3 只读其 /api/report 与帧哈希
 ```

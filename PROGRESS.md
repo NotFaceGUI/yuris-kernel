@@ -104,8 +104,8 @@ yu-trace: vfs/vm/frame 边界录制、回放、跨 producer diff
 ### 验证命令与原始结果
 
 ```bash
-export TEMP="D:/Art/ai/projects/YurisDroid/workbench/tmp"
-export YURIS_SAMPLE_ERIS_ROOT="D:/Art/ai/projects/YurisDroid/workbench/project-eris"
+export TEMP="<tmp>"
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
 cargo test -p yu-sound
 # → test result: ok. 51 passed; 0 failed
 cargo run -p yu-cli --example sound_census -- 300
@@ -210,7 +210,7 @@ YURIS_SAMPLE_ERIS_ROOT=<project-eris>   cargo test -p yu-cli --test sysvar_write
 新增 `crates/yu-cli/tests/settings_persist.rs`(两个 `#[ignore]`,需语料):
 
 ```bash
-export YURIS_SAMPLE_ERIS_ROOT="D:/Art/ai/projects/YurisDroid/workbench/project-eris"
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
 cargo test -p yu-cli --test settings_persist -- --ignored --nocapture
 # → gsd_master_volume_is_loaded_and_applied ... ok
 #   gsd_settings_survive_resave ... ok
@@ -507,7 +507,7 @@ Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.27s
 ## 成果 8 (2026-10-19) · ERIS 官方编译打通(143 产物 + 引擎验收)
 
 - 内容: 以引擎侧协议(命名映射握手 + CreateProcess)驱动官方 YSCom 0.495 完成 ERIS 全量编译,
-  产物落 `workbench/project-eris/data/ysbin/`(137 个 YSTB 脚本 + ysc/yscfg/yse/ysl/yst/yst_list/ysv),
+  产物落 `<project-eris>/data/ysbin/`(137 个 YSTB 脚本 + ysc/yscfg/yse/ysl/yst/yst_list/ysv),
   **官方 yu-ris.exe 直接启动并显示标题画面** = 编译链验收通过。
 - 一手事实(已并入 `docs/sdk-eris-analysis.md` §8): 映射名精确无空格;项目路径必须带尾部反斜杠;
   PowerShell Start-Process(ShellExecuteEx) 不给这个 VC6 程序传 argv(秒退主因);
@@ -1734,7 +1734,7 @@ $ cargo clippy -p yu-rt -p yu-format --all-targets
   - 非样本套件 lib 35 / fixture 38 / golden 3 全过;
   - `yu-format` 真语料 1 过(`ysc=119 / ysl=1941 / ysv=2568 / yst_list=141 / yst=136`);
   - `yu-vfs` 官方 `data.ypf` 4 过。
-- 环境说明:当前封包为 `<side-repo>/workbench/project-eris/data.ypf`;
+- 环境说明:当前封包为 `<project-eris>/data.ypf`;
   `project-eris/data` 已不存在,散盘在 `project-eris/save/data`(用户故意放置)。
   测试的工程根推导 `data_root.parent()` 因此找不到 `system/YSCom/YSCom.ycd`;
   按用户指示未搭临时根、未改 `save/data`,ycd 相关用例本次跳过。
@@ -1907,10 +1907,10 @@ $ grep -rn "HashMap" crates/yu-gfx/src                          # 0(全部 BTree
 
 ### 7. 环境勘误
 
-任务书给的 `YURIS_SAMPLE_ERIS_YSBIN=<side-repo>/workbench/project-eris/data/ysbin`
+任务书给的 `YURIS_SAMPLE_ERIS_YSBIN=<project-eris>/data/ysbin`
 已不存在(E3 已记语料迁到 `project-eris/save/data`)。本次用
-`<side-repo>/workbench/project-eris/save/data/ysbin`;`data.ypf` 仍在
-`<side-repo>/workbench/project-eris/data.ypf`。测试缺样本时:
+`<project-eris>/save/data/ysbin`;`data.ypf` 仍在
+`<project-eris>/data.ypf`。测试缺样本时:
 `YURIS_REQUIRE_SAMPLES=1` 显式失败,否则打印 `SKIP` 可见跳过。
 
 ## 成果 20 (2026-10-20) · gfx 复核修复任务书(验证优先)
@@ -4355,7 +4355,7 @@ M4(官方 DLL 对拍)。
 ### 1. AU2 产出独立复验(不看结论,重跑命令)
 
 ```text
-$ export TEMP=<side-repo>/workbench/tmp  YURIS_SAMPLE_ERIS_YSBIN / ERIS_ROOT=…
+$ export TEMP=<tmp>  YURIS_SAMPLE_ERIS_YSBIN / ERIS_ROOT=…
 $ cargo test --tests -p yu-gfx -p yu-backend-soft -p yu-cli
   yu-gfx 10 目标 + soft 22+10 + yu-cli 10 全部 ok;0 FAILED
 $ cargo test -p yu-cli --test restart -- --ignored
@@ -4676,7 +4676,7 @@ snd_diags=0
 
 > 接续 E1-M1。目标:把 `yu-emote` 从“能解析”推进到“schema/atlas 确定、
 > 时间线可求值、58 个 shader 有 WGSL 映射”,并把官方 DLL 的事实写进台账。
-> 零 git 写操作;证据产物只在 `<side-repo>/workbench/tmp/`。
+> 零 git 写操作;证据产物只在 `<tmp>/`。
 
 ### 1. 官方二进制取证(REA + 离线 capstone)
 
@@ -5559,7 +5559,7 @@ $ cargo clippy -p yu-save -p yu-log --all-targets
 ### 4. 验证原始输出
 
 ```text
-$ export TEMP=<side-repo>/workbench/tmp YURIS_SAMPLE_ERIS_ROOT=<project-eris>
+$ export TEMP=<tmp> YURIS_SAMPLE_ERIS_ROOT=<project-eris>
 $ cargo test -p yu-gfx -p yu-font -p yu-backend-soft -p yu-backend-wgpu
 28 个 test result: ok;0 个 FAILED(含新用例:
   text_pipeline 10、soft render 12(新增 2)、wgpu text_layout_frames_match_soft_exactly、
@@ -6419,7 +6419,7 @@ test sdk_0479_loose_directory_indexes_every_file_including_japanese_names ... ok
 
 ### 4. 口径与残留
 
-- **无带更新包的样本工程**(注明): `<side-repo>/workbench/project-eris`
+- **无带更新包的样本工程**(注明): `<project-eris>`
   为封包无 `update*.ypf`、`project-479` 为散盘、`<games>` 不存在(AGENTS §2)
   —— 按任务书 B5 预案,以**自造 update 包往返测试**覆盖:`project.rs` 三个
   单测用最小 v495 写入器构造 基础包+update1+update2,断言枚举序
@@ -10836,19 +10836,19 @@ yu-cli run <0.481 商业包根> --frames 1800 --log-level info
   权限问题 —— 是**按 exe 所在路径生效的文件系统沙箱**。对照矩阵(同一份
   二进制字节、同一令牌、同一目标 `D:\Download`):
 
-  | exe 位置 | 写 `D:\Download` | 写 `C:\Users\…\Temp` | 写 `D:\Art\ai\projects\…` |
+  | exe 位置 | 写 `D:\Download` | 写 `<home>\…\Temp` | 写 `<repo-parent>/…` |
   |---|---|---|---|
   | `<repo>/target/release/yu-cli.exe` | 拒绝 | 拒绝 | 成功 |
-  | `D:\Art\ai\projects\YurisDroid\…\wp.exe` | 拒绝 | — | 成功 |
-  | `D:\Art\wp3.exe` | 成功 | — | — |
+  | `<side-repo>\…\wp.exe` | 拒绝 | — | 成功 |
+  | `<repo-parent>\wp3.exe` | 成功 | — | — |
   | `D:\wp4.exe` | 成功 | — | — |
-  | `C:\Users\…\Temp\wp2.exe` | 成功 | — | — |
+  | `<home>\…\Temp\wp2.exe` | 成功 | — | — |
 
-  即:**exe 位于 `D:\Art\ai\projects\` 之下时,进程只能写该子树之内**;
+  即:**exe 位于 `<repo-parent>\` 之下时,进程只能写该子树之内**;
   写到外面任何位置都是 ACCESS_DENIED。同一时刻 `cmd.exe`/PowerShell/Python
   都能写 `D:\Download`(ACL 为 `Authenticated Users:(M)`,令牌也带该组),
   所以目标目录本身可写。验证:把 `yu-cli.exe` 复制到
-  `C:\Users\…\Temp\` 后跑同一命令,4 条 `sv.file.write` 全部消失,
+  `<home>\…\Temp\` 后跑同一命令,4 条 `sv.file.write` 全部消失,
   `save/config.sd`(7054B)/`extra.sd`(6542B)正常落盘;`--save-root` 指到
   工程子树内同样 5 个 `.sd` 全写成功 ⇒ 写入链路正确。规避方式:从普通终端
   运行、或把 exe 放到项目树外、或 `--save-root` 指向可写目录。
@@ -12029,7 +12029,7 @@ cargo test -p yu-backend-wgpu -- --test-threads=1              # 9+14+34+1+1 全
 
 ### 取证(真值层级 3,官方存档字节自证)
 
-解 `<game-b>` save00001–5 的 DNO3 块(探针:`workbench/tmp/yssd_img_probe.py`,
+解 `<game-b>` save00001–5 的 DNO3 块(探针:`<tmp>/yssd_img_probe.py`,
 双通道序 PNG 逐张目检):
 
 ```text
@@ -12143,3 +12143,169 @@ BUILD SUCCESSFUL → app-debug.apk 22,233,056 B(arm64-v8a + x86_64)
 - 触摸只映射单点 = 鼠标左键;虚拟按键/手势未取证(架构 §2.5.9 问题 9)。
 - `yu-vfs::YpfSource` 仍要求封包落在文件系统上;浏览器目标需要内存构造
   (`from_bytes`),由 wasm 分支负责 —— **wasm 本轮只作占位,不实现**。
+
+## 成果 AUDIO-ANDROID-DEVICE (2026-11-01) · 安卓音频交付:补流监督(换设备自动重建) + 三类欠载分开计量 + 模拟器爆音归因
+
+### 现象
+
+- 安卓(模拟器)持续「电流声 + 卡顿」,桌面正常;
+- 插上耳机后**彻底没声音**,拔掉再插也不恢复。
+
+### 根因(两条,都是交付侧,不是混音)
+
+1. **换输出设备时 AAudio 会断开流,我们不重建**。真机 logcat 原文:
+
+   ```text
+   D AudioStreamLegacy: onAudioDeviceUpdate(deviceId = 462)
+   D AudioStreamLegacy: onAudioDeviceUpdate() request DISCONNECT in data callback, device 3 => 462
+   D AAudioStream: setDisconnected setting disconnected, current disconnected: 0, current state: 4
+   W AudioStreamLegacy: onMoreData() data, stream disconnected
+   E AudioTrack: processAudioBuffer(461): EVENT_MORE_DATA requested 28288 bytes but callback returned -1 bytes
+   D AAudio  : AAudioStream_requestStop(s#1) called
+   ```
+
+   旧实现只在错误回调里 `log::warn!`,流一死就永久静音 —— 这就是「戴耳机没声音」。
+   参考实现 `siglus_rs`(kira 0.9)的 `StreamManager` 正是靠轮询设备名/采样率
+   并在错误后重启流来兜住这一类;本次照该口径补齐。
+
+2. **模拟器的音频转发不可信**。同一份 so、同一份数据:
+
+   | 指标 | 模拟器(x86_64) | 真机(arm64) |
+   |---|---|---|
+   | fps | 50~57 | **59.9** |
+   | readback | 2232~5588 µs | **556~865 µs** |
+   | `dev[short]` | 0 | **0** |
+   | `snd[rtsil]` | 0 | **0** |
+   | 听感 | 电流 + 卡顿 | **不爆音** |
+
+   即两边交付侧计量都干净,只有模拟器出声异常 ⇒ 归因于模拟器虚拟 HAL +
+   主机音频转发(CPU 满载时更明显),不是引擎/混音/解码。
+
+### 改动
+
+- `crates/yu-platform/host-android/src/sound.rs` 重写交付层:
+  - **音频监督线程**(`yu-audio-out`):持流、每 300ms 轮询设备签名
+    (name/rate/channels/format),签名变化或错误回调置位即**重建流**;
+    另加**僵死看门狗**(累计回调数 2.4s 不增长 ⇒ 强制重建);
+  - 回调侧仍是零锁 SPSC 环,不分配、不在回调内解码;
+  - 目标水位 150→**300ms**,环形容量 600→**900ms**;补货改**批量**
+    (迟滞 `target − 60ms` 触发,单次最多 60ms),唤醒频率从每秒上千次
+    降到约 20 次,减少与渲染/VM 抢 CPU;
+  - mixer / 音频线程都提到 `THREAD_PRIORITY_AUDIO`(JNI 调
+    `android.os.Process.setThreadPriority(-16)`);
+  - 新增纯音自测通道(`audio_tone`:旁路引擎灌 1kHz 正弦)与
+    `audio_rate`(强制采样率)。
+- **三类欠载分开计量**(此前只有一个 `underrun`,根本区分不出故障归属):
+  - `clipped`(yu-sound):混音叠加过量硬削波;
+  - `rtsil` / 逐帧 `rtmiss`(yu-sound):源解码窗口未就绪导致静音;
+  - `short`(宿主):环形缓冲被抽干、回调补静音 —— 真实设备侧断供。
+  - 设备侧统计按**每秒窗口**清零输出(`short/cbs/out/lvlmin/gapmax/re`)。
+- `EngineOptions::render`(默认 true):`false` 时完全跳过合成/上屏、复用首帧
+  呈现面,只跑 VM + 声音 —— **归因开关**,用来判断卡顿是否由渲染抢 CPU 引起。
+- `RunConfig::apply_json` + `<游戏目录>/debug/run-config.json` 覆盖入口:
+  壳不方便重编时直接改文件即可打开上述诊断开关。
+
+### 验证(原始结果)
+
+```text
+# 真机 Redmi 24117RK2CC (arm64-v8a),GPU=GLES
+status=running backend=wgpu frame=2657 ticks=2651 viewport=800x600 layers=480 ops=117
+  tick_ms=6.46 render_ms=2.62 snd[underrun=0 clipped=0 rtsil=0 dec_ms=0.00]
+  dev[short=0.0ms cbs=26 out=1072ms lvlmin=195.3ms gapmax=89.7ms re=2 tone=off]
+  phases[plan=1426 encode=62 readback=865 tail=247]us fps=59.5
+
+[sound] 音频流就绪: device=default rate=44100 ch=2 fmt=F32
+[sound] mixer 线程优先级已提升到 THREAD_PRIORITY_AUDIO
+[sound] 音频流已重建: device=default rate=44100 ch=2 fmt=F32(路由变化/设备断开)
+        ↑ 切输出设备时由监督线程自动重建(旧实现此处永久静音)
+[sound] first non-silent block: peak=0.0064
+
+$ cargo test -p yu-sound -p yu-engine
+test result: ok. 27 passed / 4 / 1 / 12 / 51 passed; 0 failed
+$ cargo test -p yu-host-android
+test result: ok. 10 passed + session 2 passed
+$ cargo check --workspace --all-targets        （0 error,0 warning）
+```
+
+### 采集侧交叉验证(排除「我们产出的 PCM 有问题」)
+
+```text
+引擎输出抓取(3.0s, 44100/2ch):
+  rms=-12.8 dBFS  peak=-0.0 dBFS  L/R corr=0.624
+  spectral flatness=0.0000            ← 不是噪声
+  200–1000Hz 占 89.4%,主峰 441Hz + 谐波 880Hz   ← 真实音乐
+  相邻样本最大跳变 0.18 满幅,>5ms 静音段仅首段 1.54s
+
+模拟器主机回环(扬声器端点,6s):
+  相邻样本最大跳变 0.019,孤立尖峰(>25×邻域)= 0
+模拟器 AudioFlinger:
+  Our track: SRate 44100, format PCM_FLOAT, Underruns 0
+  Normal mixer raw underrun counters: partial=0 empty=0
+```
+
+### 残留
+
+- **模拟器音频不可信**:定位爆音时不要在模拟器上判定听感;以真机为准。
+  代码侧已无未闭合的交付路径问题。
+- 44.1k 源在系统侧被 AudioFlinger 重采样到 48k(HAL 采样率),这是 Android
+  常规路径;`audio_rate=48000` 可绕过,但会改用我们的线性插值重采样(质量
+  更差),默认不开。
+
+## 成果 ANDROID-RELEASE-SHELL (2026-11-01) · 发布模式(壳侧开关 + 内核静默)与手机化输入(触摸/虚拟鼠标/双指滚轮)
+
+### 背景
+
+真机验收后暴露三类"桌面壳照搬"的问题:调试开销默认常开、状态浮层与日志无法配置、
+触摸被当成"把鼠标钉在触点上"(抬手后光标留在原地,换屏后同位置按钮一直 hover)。
+
+### 改动
+
+**1. 发布模式(默认开,性能优先)**
+
+| 位置 | 行为 |
+|---|---|
+| 壳 `SetupActivity` | 新增「状态浮层」开关(默认关),与既有「调试日志」并列;两者都入 SharedPreferences,随启动传给游戏页 |
+| 壳 `MainActivity` | 浮层关且日志关 ⇒ **一次 `nativeStatus()` 都不调**,也不写 logcat;只开浮层时仅显示 `fps=`(加粗绿色);开日志才铺全量计数 |
+| 内核 `RunConfig::quiet` | 默认 **true**:logcat 只放 `warn` 以上、不启用混音抓取(WAV 落盘)、`nativeStatus()` 返回最小串(不拼十几个 format、不取诊断、不读阶段计数) |
+| 联动 | `log_level=verbose`(壳打开调试日志时设置)自动退出发布模式 |
+
+**2. 手机化输入**
+
+- **触摸态(默认)**:按下把脚本光标放到触点并按下,抬起后立即 `nativeSetCursor(-1,-1)`
+  —— 等价「鼠标离开窗口」,消除"下一屏同位置按钮一直 hover"的假象。
+- **双指上下滑 = 滚轮**(按 24dp 一格发 `_MOUSE_U`/`_MOUSE_D` 单帧脉冲),用于回看文本。
+- **虚拟鼠标模式**:右下角半透明小圆钮点击切换(尺寸 28dp、底色 4% 白、图标 35% 白;
+  模式记忆在 SharedPreferences)。鼠标态下拖动 = 移动虚拟光标(带边界钳制),
+  未拖动的抬手 = 在虚拟光标处点击;光标用 Canvas 画成箭头,叠在画面之上且不吃触摸。
+
+**3. 构建环境**
+
+`~/.gradle/native` 的 `native-platform.dll` 在本机加载失败(访问被拒),导致
+`gradle` 无法启动。处置:**独立 `GRADLE_USER_HOME` + 拷贝 `caches/modules-2`
+(与 `jars-9`、`transforms-4`)**,离线构建即可成功;不改动用户原有的 `~/.gradle`。
+
+```bash
+export GRADLE_USER_HOME=<tmp>/ghome      # 内含 caches/{modules-2,jars-9,transforms-4}
+gradle --offline --no-daemon assembleRelease
+```
+
+### 验证(原始结果)
+
+```text
+$ gradle --offline --no-daemon assembleRelease
+BUILD SUCCESSFUL in 16s
+   → app-release.apk 28,894,180 B(arm64-v8a + x86_64,debug key 签名)
+
+$ adb -s <phone> install -r app-release.apk
+Success
+
+# 发布模式:开浮层、关日志 ⇒ logcat 无任何 yu-* 输出
+$ adb -s <phone> logcat -d | grep -E "yu-kernel|yu-android|status=running"
+（空）
+```
+
+### 残留
+
+- `render()` 的 `--no-render` 归因开关只在 Rust 侧(`RunConfig::render`),壳未接按钮;
+  需要时用 `<游戏目录>/debug/run-config.json`。
+- 虚拟鼠标的"长按拖动灵敏度/边界回弹"未做(当前是直接钳制)。

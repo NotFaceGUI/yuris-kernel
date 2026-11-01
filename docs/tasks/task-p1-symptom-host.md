@@ -18,8 +18,8 @@
 ## 0. 基线(动手前必做)
 
 ```bash
-export TEMP="D:/Art/ai/projects/YurisDroid/workbench/tmp"; export TMP="$TEMP"
-export YURIS_SAMPLE_ERIS_ROOT="D:/Art/ai/projects/YurisDroid/workbench/project-eris"
+export TEMP="<tmp>"; export TMP="$TEMP"
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
 cargo test --workspace        # 工作区含未提交 AU1–AU4 改动,必须先全绿
 ```
 

@@ -279,7 +279,7 @@ $ diff -q sha-soft8.csv sha-wgpu8.csv → 无输出(0 差异;与上一轮逐帧�
 ## 6. 复现命令
 
 ```bash
-export TEMP="<side-repo>/workbench/tmp" TMP="$TEMP"
+export TEMP="<tmp>" TMP="$TEMP"
 export YURIS_SAMPLE_ERIS_YSBIN="<project-eris>/save/data/ysbin"
 # 基线/修复后 600 帧 + 逐帧 CSV + 前两帧命令耗时
 yu-desktop <project-eris> --frames 600 \

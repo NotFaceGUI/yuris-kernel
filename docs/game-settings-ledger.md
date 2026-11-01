@@ -338,8 +338,8 @@ root(空名) → S0(容器, vol=256, E=1)
 ## 5. 验证命令(原始结果见 PROGRESS 成果 SND-LAYER-TREE / SETTINGS-PERSIST)
 
 ```bash
-export TEMP="D:/Art/ai/projects/YurisDroid/workbench/tmp"
-export YURIS_SAMPLE_ERIS_ROOT="D:/Art/ai/projects/YurisDroid/workbench/project-eris"
+export TEMP="<tmp>"
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
 cargo test -p yu-sound                       # 51 passed
 cargo run -p yu-cli --bin yu-cli -- case "$YURIS_SAMPLE_ERIS_ROOT" --all
 cargo run -p yu-cli --example sound_census -- 300   # 层树 + eff 音量

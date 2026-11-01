@@ -17,11 +17,11 @@
 | 0-4 | OGG 静态链接（ogg/vorbis/vorbisfile_static） | ✅ 字符串 `vorbis` @ `0x5b8e5c`；**OGG 装载 `0x422ab0` 只做 `ov_open` 族 + `ov_time_total`（`0x4806c5` 返回秒 ×`1000.0` 写 `+0x120/+0x134`），没有任何 `ov_read`/整段解码**；尾部 `0x422c65` 只写格式字段并 `malloc(0x1000)` + `malloc(bytes_per_sec/2 + 0x1000)` 后 `CreateSoundBuffer`（**0.5 秒环**）。2026-10-28 按 `procedure_pseudo_code` 逐行复核（旧表述「同步整段解码」已勘误，见 N0-13） | REA 字符串 + 反编译 `0x422ab0` / `0x422c65` / `0x4806c5` |
 | 0-5 | `"fmod"` 与 FMOD 音频库无关 | ✅ 仅命中 CRT 文案：`fmodl`/`fmod`/`fmodf: DOMAIN error`（`0x80ce18..0x80ce60`） | REA `search_strings` |
 | 0-6 | 语料音频全 OGG（bgm/se/voice） | ✅ 包内 `bgm/bgm01..03.ogg` 等；`bgm01.ogg` 907,689 字节（官方 exe 解包副本） | `data.ypf` / `save/data/bgm` |
-| 0-7 | 600 帧运行期 SOUND 531 / SOUNDINFO 7,200 / SOUNDEND 1 | ✅ 本次重跑 `coverage_census 600 8`：531 / 7,200 / 1（总命令 7,735,670；与本次改动前逐项一致，见 §6） | `workbench/tmp/snd-rea/census2.log` |
+| 0-7 | 600 帧运行期 SOUND 531 / SOUNDINFO 7,200 / SOUNDEND 1 | ✅ 本次重跑 `coverage_census 600 8`：531 / 7,200 / 1（总命令 7,735,670；与本次改动前逐项一致，见 §6） | `<tmp>/snd-rea/census2.log` |
 | 0-8 | `@_OS_SOUND` 是声音域唯一系统变量 | ✅ `sysvar.rs` 已有；宿主不装时行为不变 | `crates/yu-rt/src/sysvar.rs` |
 | 0-9 | MIDI 族 + CDDA 无手册页 | ✅ 0.495 处理体是**空桩**：`0x44aa40/0x44aa60/0x44aa80` 仅 `FUN_00429fd1` 守卫后 `return 0`；`0x429fb0` 同。**B6 终态 aligned-stub**：内核同型对齐（域事件照发、无媒体输出、诊断归属 `rt.cmd.aligned_stub`、不计挂号） | REA 反编译（各 26–29 字节）；`yu-rt/src/vm/handlers.rs` |
 | 0-10 | 旧线 `FILETYPE OGG=1/WAVE=2` 与手册 `CODEC 0=WAVE/1=OGG` 冲突 | ✅ **两个不同字段**：`+0x105` 内部 FILETYPE（OGG=1/WAVE=2），`+0x107` 对外 CODEC（WAVE=0/OGG=1/ACM=2） | REA `0x422ab0`/`0x422e04` 写入点；SOUNDINFO 查询读点 |
-| 0-11 | B6 收口复核（2026-10-24，REA/Ghidra 12.1.4 重开 `yu-ris.exe` 同哈希） | ✅ ① SOUND 处理体只读 `0x684160..0x68416c`（参数 0..12），**从不读 `0x68416d`（槽 13=SPEED）** ⇒ 官方静默忽略；② WAVE 装载 `0x422e04`：`fmt tag==1` 走 PCM，**其余全部 tag 走 ACM**（7 个 acm* 导入的全部调用点 `0x423086..0x4232a4`，IAT 跳板 `0x47f86e..0x47f892`）；`acmFormatSuggest(NULL,src,dst=PCM,0x12,WFORMATTAG)` → `StreamOpen(…,NONREALTIME)` → `Size` → `PrepareHeader` → 一次 `Convert` → `Unprepare` → `Close`，失败=装载失败，`+0x107=2`；③ 延迟累加器（`0x423f9c`/`0x424424` 反编译）：`+0x190/+0x194 += |param|*bps/1000` 后按 block align **向下取整**，WAVE 填充位置 `+0x184` 从字节 0 重灌、`+0x17c` 保留负起始字节；④ **DATARIGHT 16-bit 立体声读 `word [ptr+4]`＝下一帧左声道**（越 4 字节锁区，官方怪癖；8-bit 立体声读 `ptr[1]`）——勘误 N0-12 旧表述 | REA `procedure_pseudo_code 0x422e04/0x423f9c/0x424424`；原始字节 `0x44ff58..0x4500d0` 手工解码（IAT/节表脚本，`workbench/tmp/snd-rea/acm_iat.json`） |
+| 0-11 | B6 收口复核（2026-10-24，REA/Ghidra 12.1.4 重开 `yu-ris.exe` 同哈希） | ✅ ① SOUND 处理体只读 `0x684160..0x68416c`（参数 0..12），**从不读 `0x68416d`（槽 13=SPEED）** ⇒ 官方静默忽略；② WAVE 装载 `0x422e04`：`fmt tag==1` 走 PCM，**其余全部 tag 走 ACM**（7 个 acm* 导入的全部调用点 `0x423086..0x4232a4`，IAT 跳板 `0x47f86e..0x47f892`）；`acmFormatSuggest(NULL,src,dst=PCM,0x12,WFORMATTAG)` → `StreamOpen(…,NONREALTIME)` → `Size` → `PrepareHeader` → 一次 `Convert` → `Unprepare` → `Close`，失败=装载失败，`+0x107=2`；③ 延迟累加器（`0x423f9c`/`0x424424` 反编译）：`+0x190/+0x194 += |param|*bps/1000` 后按 block align **向下取整**，WAVE 填充位置 `+0x184` 从字节 0 重灌、`+0x17c` 保留负起始字节；④ **DATARIGHT 16-bit 立体声读 `word [ptr+4]`＝下一帧左声道**（越 4 字节锁区，官方怪癖；8-bit 立体声读 `ptr[1]`）——勘误 N0-12 旧表述 | REA `procedure_pseudo_code 0x422e04/0x423f9c/0x424424`；原始字节 `0x44ff58..0x4500d0` 手工解码（IAT/节表脚本，`<tmp>/snd-rea/acm_iat.json`） |
 
 ## 1. N0 必取证项
 
@@ -308,16 +308,16 @@ M-2 的通用域路径，诊断文案保持 `域命令未接线:语义属宿主�
 
 ## 8. 证据文件
 
-- `workbench/tmp/snd-rea/0044e1e8.c`（SOUND 处理体）
-- `workbench/tmp/snd-rea/0044f4bc.c`（SOUNDINFO）
-- `workbench/tmp/snd-rea/0044f308.c`（SOUNDEND）
-- `workbench/tmp/snd-rea/00464960.c`（位置/循环）
-- `workbench/tmp/snd-rea/00423718.c`（淡变）
-- `workbench/tmp/snd-rea/00424fbc.c` / `00423614.c` / `00424e4c.c`
-- `workbench/tmp/snd-rea/decomp6.log`（REA 原始输出）
-- `workbench/tmp/snd-rea/census2.log`（600 帧回归）
+- `<tmp>/snd-rea/0044e1e8.c`（SOUND 处理体）
+- `<tmp>/snd-rea/0044f4bc.c`（SOUNDINFO）
+- `<tmp>/snd-rea/0044f308.c`（SOUNDEND）
+- `<tmp>/snd-rea/00464960.c`（位置/循环）
+- `<tmp>/snd-rea/00423718.c`（淡变）
+- `<tmp>/snd-rea/00424fbc.c` / `00423614.c` / `00424e4c.c`
+- `<tmp>/snd-rea/decomp6.log`（REA 原始输出）
+- `<tmp>/snd-rea/census2.log`（600 帧回归）
 - B6 复核（2026-10-24,REA/Ghidra 12.1.4 会话内证据,ephemeral）：
   `0x422e04`/`0x423f9c`/`0x424424` 反编译（Evidence
   `ev_d3033121…`/`ev_f6ff2703…`/`ev_44fb7c6f…`）；MSACM32 IAT 地址表
-  `workbench/tmp/snd-rea/acm_iat.json`；DATARIGHT 原始字节
+  `<tmp>/snd-rea/acm_iat.json`；DATARIGHT 原始字节
   `0x44ff58..0x4500d0` 手工解码（PE 节表脚本,结论见 0-11④）

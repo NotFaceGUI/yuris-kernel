@@ -11,7 +11,7 @@
 > (Ghidra 12.1.4 + REA;本会话只读,未 annotate)。
 > 手册 = `<side-repo>/target/sdk/0.495/yu-ris_0495_032/マニュアル/YU-RIS/html/`,
 > CP932 逐页解码读取。
-> 脚本 = `<side-repo>/workbench/project-eris/save/data/script/ERIS/`。
+> 脚本 = `<project-eris>/save/data/script/ERIS/`。
 > 反编译树 = `<side-repo>/workbench/analysis/decomp/`。
 
 ## 0. 结论统计

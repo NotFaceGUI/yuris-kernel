@@ -1,6 +1,6 @@
 # YPF 封包格式(官方 YSPac 0.495 实测)
 
-> 证据: `workbench/project-eris/data.ypf`(官方 YSPac 0.495 产出,1407 条目,31,501,753 字节)
+> 证据: `<project-eris>/data.ypf`(官方 YSPac 0.495 产出,1407 条目,31,501,753 字节)
 > 逐字节解析 + 引擎加载器反编译(`yu-ris.exe` sha256 `4f5eefa3…`:`FUN_0045e3b8` 建表 /
 > `FUN_0045eda0` 目录扫描 / 读序见 §5)。旧接手线 `yuris-format/src/ypf.rs` 的 `LenEncNot`
 > 解析器**字段切分与索引起点与官方包不符**(见 §6),以本文为准。
@@ -28,7 +28,7 @@
 | **LenEncNot**(本 demo 包 = 官方 YSPac 0.495 产出) | 显式 `u8 lenEnc`,`nameLen=T[(0xFF-lenEnc)&0xFF]` | 逐字节取反 `~b` | `nameLen+27` | **已实证**(本文 §2/§3;1407/1407) |
 | **NulXor**(部分更早/其他发行包) | `NUL` 结尾,步长按名字实际长度 | 逐字节 `XOR key`(逐游戏不同;旧线观察到 `0xC9`/`0xFF`) | `nameLen+26` | **未验证**;遇包即显式报"未验证方言"并挂 DIV-002,**禁止猜测 key** |
 
-> 本次 A 的重启范围: **只做 LenEncNot**,语料 = `workbench/project-eris/data.ypf`。
+> 本次 A 的重启范围: **只做 LenEncNot**,语料 = `<project-eris>/data.ypf`。
 > NulXor 在拿到真实样本与官方对照之前不实现(旧线 DIV-002 保持 open)。
 
 ## 2. 索引条目(步长 = nameLen + 27)

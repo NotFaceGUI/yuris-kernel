@@ -30,7 +30,7 @@
 
 - **手册**:`<side-repo>/target/sdk/0.495/yu-ris_0495_032/マニュアル/YU-RIS/html/`
   用 CP932 解码读取相关页;记录页面路径+原文句子。
-- **真实脚本**:`<side-repo>/workbench/project-eris`(数据入口 = `data.ypf` 优先,
+- **真实脚本**:`<project-eris>`(数据入口 = `data.ypf` 优先,
   散盘 `data/` 为备;脚本在包内 `script/ERIS/`,编译产物在 `ysbin/`)。
   记录文件:行号、命令、参数、上下文注释。
 - **REA**:官方 `yu-ris.exe`(sha256 `4f5eefa3…`)。
@@ -171,12 +171,12 @@ WINDOW 域;CGINFO/FONTINFO/WINDOWINFO;TEXT 管线;图像层 SX/SY;SIZE/RESIZE/TR
 ## 8. 环境
 
 ```bash
-export TEMP="D:/Art/ai/projects/YurisDroid/workbench/tmp"; TMP="$TEMP"
-export YURIS_TEST_TMP="D:/Art/ai/projects/yuris-kernel/target/test-tmp"
+export TEMP="<tmp>"; TMP="$TEMP"
+export YURIS_TEST_TMP="<repo>/target/test-tmp"
 export YURIS_REQUIRE_SAMPLES=1
-export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"   # 数据入口:官方挂载规则
-export YURIS_SAMPLE_ERIS_YPF="D:/Art/ai/projects/YurisDroid/workbench/project-eris/data.ypf"
-export YURIS_SAMPLE_SDK0495="D:/Art/ai/projects/YurisDroid/target/sdk/0.495/yu-ris_0495_032"
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"   # 数据入口:官方挂载规则
+export YURIS_SAMPLE_ERIS_YPF="<project-eris>/data.ypf"
+export YURIS_SAMPLE_SDK0495="<side-repo>/target/sdk/0.495/yu-ris_0495_032"
 ```
 
 开工前先跑 `find crates -type f -newermt "-10 minutes"`;有活跃写者的 crate 只读不写。

@@ -29,8 +29,8 @@
   `0x459e90`。锚点是**处理体地址**,不等于语义已逐条复核。
 
 ```bash
-export TEMP="<side-repo>/workbench/tmp"
-export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"
+export TEMP="<tmp>"
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
 cargo run -p yu-rt --example coverage_census -- 600 8
 ```
 

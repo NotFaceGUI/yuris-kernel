@@ -23,8 +23,8 @@
 官方微场景编译/采集命令(J2 实测可复现):
 
 ```bash
-export TEMP="<side-repo>/workbench/tmp"; export TMP="$TEMP"
-<side-repo>/workbench/tmp/cargo-target/release/yscom_harvest.exe \
+export TEMP="<tmp>"; export TMP="$TEMP"
+<tmp>/cargo-target/release/yscom_harvest.exe \
   <repo>/target/tmp/j2-micro-<name> \
   <repo>/target/tmp/j2-micro-<name>/system/YSCom/YSCom.exe 495
 python tools/official_trace/capture_screen.py \
@@ -40,8 +40,8 @@ python tools/official_trace/capture_screen.py \
 ### 1.1 复现命令
 
 ```bash
-export TEMP="<side-repo>/workbench/tmp"; export TMP="$TEMP"
-export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"
+export TEMP="<tmp>"; export TMP="$TEMP"
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
 # 三张清单(逐 tick;资产按 key 去重解析)
 cargo run -p yu-backend-soft --example title_probe -- 600 \
   > target/tmp/j2-title-probe-600.tsv
@@ -282,7 +282,7 @@ FILEINFO[EXIST=1 FILE=<bytes> LET=@x]
 ### 8.1 命令与锚点
 
 ```bash
-export TEMP="<side-repo>/workbench/tmp"; export TMP="$TEMP"
+export TEMP="<tmp>"; export TMP="$TEMP"
 export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
 
 # native soft / wgpu:600 tick 逐帧

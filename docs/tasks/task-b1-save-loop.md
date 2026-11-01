@@ -85,8 +85,8 @@ boot 链在 `es_First` 之前由宿主/内核谁发起 LOAD?——按官方启�
 ## 3. 验收标准(全过才算完成)
 
 ```bash
-export TEMP="D:/Art/ai/projects/YurisDroid/workbench/tmp"; export TMP="$TEMP"
-export YURIS_SAMPLE_ERIS_ROOT="D:/Art/ai/projects/YurisDroid/workbench/project-eris"
+export TEMP="<tmp>"; export TMP="$TEMP"
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
 export YURIS_SAMPLE_ERIS_YSBIN="$YURIS_SAMPLE_ERIS_ROOT/save/data/ysbin"
 cargo test -p yu-rt -p yu-trace -p yu-save -p yu-format
 cargo run -p yu-cli -- case --all   # 含新 save-load-loop,全绿

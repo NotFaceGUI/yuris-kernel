@@ -159,10 +159,10 @@ soft/wgpu/browser 同帧一致。
 ## 4. 环境
 
 ```bash
-export TEMP="<side-repo>/workbench/tmp"; export TMP="$TEMP"
+export TEMP="<tmp>"; export TMP="$TEMP"
 export YURIS_REQUIRE_SAMPLES=1
-export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"
-export YURIS_SAMPLE_ERIS_YPF="<side-repo>/workbench/project-eris/data.ypf"
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
+export YURIS_SAMPLE_ERIS_YPF="<project-eris>/data.ypf"
 ```
 
 引擎 shader 证据:`target/tmp/j2-shaders/`(已有 8 blob);

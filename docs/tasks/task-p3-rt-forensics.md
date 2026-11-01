@@ -18,8 +18,8 @@
 ## 0. 基线(动手前必做)
 
 ```bash
-export TEMP="D:/Art/ai/projects/YurisDroid/workbench/tmp"; export TMP="$TEMP"
-export YURIS_SAMPLE_ERIS_ROOT="D:/Art/ai/projects/YurisDroid/workbench/project-eris"
+export TEMP="<tmp>"; export TMP="$TEMP"
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
 cargo test -p yu-rt
 cargo run -p yu-rt --example coverage_census -- 600 8   # 记录改动前计数
 ```

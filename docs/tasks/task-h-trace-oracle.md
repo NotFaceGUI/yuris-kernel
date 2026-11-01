@@ -81,10 +81,10 @@
 ## 6. 环境
 
 ```bash
-export TEMP="D:/Art/ai/projects/YurisDroid/workbench/tmp"; TMP="$TEMP"
-export YURIS_TEST_TMP="D:/Art/ai/projects/yuris-kernel/target/test-tmp"
+export TEMP="<tmp>"; TMP="$TEMP"
+export YURIS_TEST_TMP="<repo>/target/test-tmp"
 export YURIS_REQUIRE_SAMPLES=1
-export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"   # 数据入口:官方挂载规则
-export YURIS_SAMPLE_ERIS_YPF="D:/Art/ai/projects/YurisDroid/workbench/project-eris/data.ypf"
-export YURIS_SAMPLE_SDK0495="D:/Art/ai/projects/YurisDroid/target/sdk/0.495/yu-ris_0495_032"
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"   # 数据入口:官方挂载规则
+export YURIS_SAMPLE_ERIS_YPF="<project-eris>/data.ypf"
+export YURIS_SAMPLE_SDK0495="<side-repo>/target/sdk/0.495/yu-ris_0495_032"
 ```

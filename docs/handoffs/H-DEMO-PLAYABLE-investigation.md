@@ -2,7 +2,7 @@
 
 - 日期:2026-10-25
 - 状态:**调查中途交接**。未完成修复,已落地的 3 处改动见 §6,其余为证据与判断。
-- 语料:`D:\Art\ai\projects\YurisDroid\workbench\project-eris`(data.ypf,官方 0.495 全量编译)
+- 语料:`<side-repo>\workbench\project-eris`(data.ypf,官方 0.495 全量编译)
 - 断言口径:✅ = 有实测/反汇编证据;⚠️ = 我的判断但未闭环;❌ = 已排除
 
 ---
@@ -21,7 +21,7 @@
 ### 2.1 桌面(用户实测,最接近真实)
 
 ```bash
-export TEMP="D:/Art/ai/projects/YurisDroid/workbench/tmp"; export TMP="$TEMP"
+export TEMP="<tmp>"; export TMP="$TEMP"
 ./target/release/yu-cli.exe run "<project-eris>" --mode desktop \
     --log-level info --log-file target/tmp/desk.jsonl \
     --frame-stats target/tmp/frames.csv

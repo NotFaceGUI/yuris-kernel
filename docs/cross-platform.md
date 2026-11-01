@@ -25,9 +25,50 @@ L3 宿主                 yu-cli(--mode desktop / headless) · host-android
 | 系统字体枚举 | `fontdb` 系统枚举 | `fontdb` 空操作 ⇒ 补 `/system/fonts` + `/product/fonts` | 无系统字体 |
 | 宿主字体注入 | 可用 | 可用(`<data>/fonts/`) | **必需**(唯一来源) |
 | 路径系统变量 | `USERPROFILE`/`HOME` | 宿主显式给(app 私有目录) | 宿主显式给 |
-| 声音设备 | cpal | cpal(oboe 后端,已验证编译) | 暂不出声(架构决定) |
+| 声音设备 | cpal | cpal(oboe 后端;真机 59.9fps 出声,欠载 0) | 暂不出声(架构决定) |
 | 渲染 | soft / wgpu | soft(第一期) | 待做 |
 | 输入 | winit → `yu-platform-input` | 触摸 → `MOUSE_L` | DOM 事件 → 同层 |
+
+## 音频交付:为什么安卓要单独一层
+
+桌面 cpal 回调是普通线程、缓冲大,阻塞几毫秒也不出事;安卓 oboe/AAudio 回调
+跑在实时优先级、预算几毫秒,**等锁/分配/解码就是爆音**。因此安卓宿主的
+交付层(`host-android/src/sound.rs`)与桌面不同构,但语义等价:
+
+```text
+mixer 线程(THREAD_PRIORITY_AUDIO)    oboe 回调(实时线程)
+  lock(SoundState) → render_and_advance      pop(无锁 SPSC 环) → 设备
+  → push(无锁 SPSC 环)                       不足补静音,绝不阻塞
+```
+
+三条硬约束,全部有实测依据(见 `DIV-AND-003`):
+
+1. **回调零锁、零分配、零解码**(参考 `siglus_rs` 用的 kira 0.9:它的
+   cpal 后端同样在回调里跑无锁 mixer,解码在独立 resource 线程)。
+2. **必须有流监督者**:AAudio 在音频路由变化(插拔耳机/蓝牙)时**会断开并
+   关闭流**,不重建就永久静音 —— 这是实测到的真 bug,kira 的
+   `StreamManager` 正是干这个的。
+3. **三类欠载分开计数**,否则无法归因:
+
+   | 计数 | 含义 | 归属 |
+   |---|---|---|
+   | `clipped` | 混音叠加过量,硬削波 | 混音(音量结构) |
+   | `rtsil` / `rtmiss` | 源解码窗口未就绪 | 预取(LEAD_MS/解码耗时) |
+   | `short` | 环形缓冲被抽干 | 交付(线程调度/水位/宿主) |
+
+   三者全 0 而仍有杂音 ⇒ 故障在 oboe 之后(设备驱动/模拟器转发)。
+
+**模拟器音频不可作为听感判据**:同一份 APK/数据,模拟器有电流声与卡顿、真机
+完全正常,而两边 `short`/`rtsil` 都是 0(读回耗时 2232~5588µs vs 556~865µs)。
+听感判定只在真机做。
+
+诊断开关(无需重编壳,写 `<游戏目录>/debug/run-config.json` 即可):
+
+```json
+{ "audio_tone": true }     // 旁路引擎,直接灌 1kHz 正弦(纯音也炸 ⇒ 设备侧)
+{ "render": false }        // 跳过合成/上屏,只跑 VM+声音(归因渲染抢 CPU)
+{ "audio_rate": 48000 }    // 强制输出采样率(默认 44100,与 OGG 源一致)
+```
 
 ## 已收口的硬编码(见 DIV-AND-002)
 

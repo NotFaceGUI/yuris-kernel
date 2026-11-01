@@ -1,7 +1,7 @@
 //! 真实语料集成测试:官方 YSCom 编译的 ERIS 产物(137 YSTB + 7 表)。
 //!
 //! 语料路径由 `YURIS_SAMPLE_ERIS_YSBIN` 给出(AGENTS.md §2):
-//! `<side-repo>/workbench/project-eris/data/ysbin`。
+//! `<project-eris>/data/ysbin`。
 //!
 //! **缺样本 = 显式跳过并计数**,不静默通过(AGENTS.md §2 军规)。
 //!

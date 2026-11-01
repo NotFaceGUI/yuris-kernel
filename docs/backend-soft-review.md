@@ -682,7 +682,7 @@ Op::Image(image) => image.source.display(),
 ## 10. 附录:复现命令与原始结果
 
 ```bash
-export TEMP="<side-repo>/workbench/tmp"; export TMP="$TEMP"
+export TEMP="<tmp>"; export TMP="$TEMP"
 export YURIS_REQUIRE_SAMPLES=1
 export YURIS_SAMPLE_ERIS_YSBIN="<side-repo>/workbench/<project-eris>/save/data/ysbin"
 export YURIS_SAMPLE_ERIS_YPF="<side-repo>/workbench/<project-eris>/data.ypf"

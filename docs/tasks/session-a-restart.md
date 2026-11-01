@@ -6,7 +6,7 @@
 
 ## 语料与范围(先看这条)
 
-- **语料 = 你编译出来的 ERIS demo 包**:`<work-root>/projects/<side-repo>/workbench/project-eris/data.ypf`
+- **语料 = 你编译出来的 ERIS demo 包**:`<work-root>/projects/<project-eris>/data.ypf`
   (官方 YSPac 0.495 产出,1407 条目)。旧的商业样本(`bn.ypf`、0.479 SDK 散盘等)**不在本计划范围**。
 - **方言范围 = 只做 `LenEncNot`**(本 demo 包所属方言,`docs/formats/ypf.md` §1.1)。
   `NulXor`(NUL 结尾 + 名字 XOR key、步长 nameLen+26)未验证:读取器遇到应显式报
@@ -41,7 +41,7 @@ u32 dataOffset | u32 unknown(0) | u32 unknown(非零)
 
 ## 2. 验收(必须跑真实包)
 
-样本: `<work-root>/projects/<side-repo>/workbench/project-eris/data.ypf`
+样本: `<work-root>/projects/<project-eris>/data.ypf`
 (官方 YSPac 0.495,1407 条目,31,501,753 字节)。
 
 - [ ] 索引行走恰好 1407 条,终点 == 头部 `+0x0C` 的值;

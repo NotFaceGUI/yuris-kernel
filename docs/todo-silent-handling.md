@@ -395,7 +395,7 @@ ERIS 120 帧 `game_diag_probe` 输出
    (actual sha 与本轮构建逐字节一致 ⇒ 非本轮引入);demo 修复
    (62f9898)后的行为需要主人实机确认后 `--update` 重生成。
 
-## 7.5 本轮验证锚点(真实语料 ERIS;`D:\Art\ai\games` 不存在,<game-a>
+## 7.5 本轮验证锚点(真实语料 ERIS;`<games>` 不存在,<game-a>
 f86 场景无法复现,以 ERIS 主语料等价机制验证)
 
 ```text

@@ -7,7 +7,7 @@
 ## 1. 语料位置
 
 ```
-<work-root>/projects/<side-repo>/workbench/project-eris/
+<work-root>/projects/<project-eris>/
 ├── yu-ris.exe  system/  yscfg.dat  エンジン設定.exe   ← 官方引擎与配置
 ├── data/                            ← 工作副本(散盘;含编译产物 data/ysbin/)
 └── data.ypf                         ← 官方 YSPac 打出的基础包(发布形态)

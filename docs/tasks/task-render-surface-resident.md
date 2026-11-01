@@ -132,7 +132,7 @@ plan       p95 ≤ 4ms                  (现 16.4ms)
 ### 测量口径(必须原样使用)
 
 ```bash
-export TEMP=TMP=D:/Art/ai/projects/YurisDroid/workbench/tmp
+export TEMP=TMP=<tmp>
 export YURIS_SAMPLE_ERIS_ROOT=<project-eris>
 export YURIS_SAMPLE_ERIS_YSBIN=<project-eris>/data/ysbin
 export YURIS_SAMPLE_SDK0479=<sdk-0479>; export YURIS_SAMPLE_SDK0495=<sdk-0495>

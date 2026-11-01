@@ -1,7 +1,7 @@
 //! 真实语料验收(任务书 B §2):官方 YSCom 编译的 ERIS 产物。
 //!
 //! 环境变量(缺样本 = 打印 skip 并计数,不许空跑通过):
-//! - `YURIS_SAMPLE_ERIS_YSBIN` = `…/workbench/project-eris/data/ysbin`
+//! - `YURIS_SAMPLE_ERIS_YSBIN` = `…/<project-eris>/data/ysbin`
 //! - `YURIS_SAMPLE_SDK0495`   = `…/yu-ris_0495_032`(取 YSCom.ycd 与手册)
 //!
 //! 全部断言跑在真实字节上;钉死的期望值全部来自本次实测

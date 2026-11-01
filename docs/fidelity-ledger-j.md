@@ -28,7 +28,7 @@
 #    <repo>/target/tmp/fidelity-micro4 由 project-eris 的 save/data + system 复制而来
 # 2) 写 data/script/micro.yst（内容见 §4），并在 system_start.yst 把 GO[#=es.ERIS] 改为 GO[#=MICRO]
 # 3) YSCom 编译（项目协议；输出 data/ysbin）
-<side-repo>/workbench/tmp/cargo-target/release/yscom_harvest.exe \
+<tmp>/cargo-target/release/yscom_harvest.exe \
   <repo>/target/tmp/fidelity-micro4 \
   <repo>/target/tmp/fidelity-micro4/system/YSCom/YSCom.exe 495
 # 4) 官方引擎截图

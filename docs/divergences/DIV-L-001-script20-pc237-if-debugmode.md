@@ -33,7 +33,7 @@ B4 取证定案并修复:
 ## 复现
 
 - 语料: `<project-eris>/data.ypf`（官方 YSCom 0.495 **debug 构建**）
-- 官方: `<side-repo>/workbench/project-eris/yu-ris.exe`（sha256 `4f5eefa3…`），
+- 官方: `<project-eris>/yu-ris.exe`（sha256 `4f5eefa3…`），
   正常启动到标题，点击「スタート」后采集。
 - 内核: `cargo run -p yu-trace --example emit_kernel_events -- … --debug-mode true`
 - 锚点: script 20, pc 237, `IF`

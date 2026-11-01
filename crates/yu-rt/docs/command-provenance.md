@@ -6,7 +6,7 @@
 > 旁线 `<side-repo>/docs/format-vm-opcodes.md` 的地址级证据)。
 >
 > 手册根:`<side-repo>/target/sdk/0.495/yu-ris_0495_032/マニュアル/YU-RIS/html\`
-> 语料根:`<side-repo>/workbench/project-eris/data/ysbin`
+> 语料根:`<project-eris>/data/ysbin`
 > 引擎:0.495 官方 `yu-ris.exe`(sha256 `4f5eefa3…`);0.479 可执行版见 AGENTS §5。
 
 ## 1. 控制流

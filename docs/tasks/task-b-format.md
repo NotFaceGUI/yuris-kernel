@@ -69,7 +69,7 @@
 
 ## 2. 真实对照(验收核心)
 
-语料 = **官方 YSCom 编译的 ERIS 产物**(`workbench/project-eris/data/ysbin/`:137 个 YSTB 脚本 +
+语料 = **官方 YSCom 编译的 ERIS 产物**(`<project-eris>/data/ysbin/`:137 个 YSTB 脚本 +
 YSCM/YSCF/YSER/YSLB/YSTD/YSTL/YSVR 七张元数据表;引擎启动验收通过)。
 **不使用 <game-b> 语料(用户决定,那是旧线项目所用)。** 所有断言跑在**真实字节**上:
 
@@ -79,7 +79,7 @@ YSCM/YSCF/YSER/YSLB/YSTD/YSTL/YSVR 七张元数据表;引擎启动验收通过)�
    **YSTB 磁盘形态已实测确证**:明文头 `"YSTB"`+版本(495),代码/参数段各自从密钥下标 0 重启
    异或(密钥 CRC32("Yu-ris")=0x96AC6FD3,LE 字节序;V5 四段=inst index/args index/args data/
    line numbers),见 `docs/sdk-eris-analysis.md` §8——解码器必须复现该形态。
-   同一语料还含官方 `.ypf`(`workbench/project-eris/data.ypf`),包内可直接取出
+   同一语料还含官方 `.ypf`(`<project-eris>/data.ypf`),包内可直接取出
    `ysbin\*.ybn` 做交叉验证;YPF 布局见 `docs/formats/ypf.md`。
 2. **标签闭环**:解码全部 `yst%05d`,收集 GO/GOSUB 目标标签 ⇒ 必须全部能在 `ysl` 表解析。
    解析失败的标签 = 容器解码有 bug 或理解有误,**必须查到根因**,不许跳过。

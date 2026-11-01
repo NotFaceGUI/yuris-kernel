@@ -442,8 +442,8 @@ pub fn mouse_last(&self) -> Option<(u32, u32)>;
 ### 5.0 会话环境(2026-10-23)
 
 ```bash
-export TEMP/TMP=<side-repo>/workbench/tmp
-export YURIS_SAMPLE_ERIS_ROOT=<side-repo>/workbench/project-eris
+export TEMP/TMP=<tmp>
+export YURIS_SAMPLE_ERIS_ROOT=<project-eris>
 # 勘误后的真实散盘 / SDK 根(见 §7.1)
 export YURIS_SAMPLE_ERIS_YSBIN=<project-eris>/save/data/ysbin
 export YURIS_SAMPLE_SDK0479=<side-repo>/target/sdk/0.479/yu-ris_0479_014

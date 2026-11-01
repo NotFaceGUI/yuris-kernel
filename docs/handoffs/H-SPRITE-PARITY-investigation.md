@@ -24,7 +24,7 @@
 ## 2. 复现方式
 
 ```bash
-export TEMP="D:/Art/ai/projects/YurisDroid/workbench/tmp"; export TMP="$TEMP"
+export TEMP="<tmp>"; export TMP="$TEMP"
 cargo build --release -p yu-host-desktop --example scenario_probe
 cargo build --release -p yu-host-desktop --example probe_layers
 ```

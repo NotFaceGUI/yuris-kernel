@@ -51,7 +51,7 @@ license GPL-3.0-or-later)、`workspace.dependencies = { flate2 = "1" }`。
 
 ## 4. 真实对照(本任务的验收核心,不许空跑)
 
-1. **真包验证(已有真实语料)**:`workbench/project-eris/data.ypf`(官方 YSPac 0.495 产出,
+1. **真包验证(已有真实语料)**:`<project-eris>/data.ypf`(官方 YSPac 0.495 产出,
    1407 条目)作为 YpfSource 实测样本:逐个条目读出负载,zlib 条目解压后字节数==索引 usize,
    裸存条目首字节为已知图像/文件魔数;**不使用 <game-b> 语料(用户决定)**。
 2. **等价性测试(架构自证,永久)**:同一棵临时文件树,DirSource 与"用自实现的 ypf 写入器

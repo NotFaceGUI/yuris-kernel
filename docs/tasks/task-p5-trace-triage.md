@@ -17,7 +17,7 @@
 ## 0. 基线
 
 ```bash
-export TEMP="D:/Art/ai/projects/YurisDroid/workbench/tmp"; export TMP="$TEMP"
+export TEMP="<tmp>"; export TMP="$TEMP"
 cargo test -p yu-trace
 ```
 
