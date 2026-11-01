@@ -60,6 +60,22 @@ impl SoundState {
     /// 纯函数：不推进状态。调用方先 [`SoundState::advance`] 再渲染
     /// `delta_ms` 对应的帧数。
     pub fn render(&self, out: &mut [f32], out_rate: u32, channels: usize) {
+        self.render_with(out, out_rate, channels, true)
+    }
+
+    /// [`SoundState::render`] 的内部形态。
+    ///
+    /// `allow_decode = false` = 硬实时路径(设备回调):**绝不解码**,窗口没
+    /// 准备好就静音,靠 tick 侧 `prefetch` 补齐。
+    /// `allow_decode = true` = 离线路径(headless/单测):可以直接解码,因为
+    /// 调用方不在实时线程上。
+    pub fn render_with(
+        &self,
+        out: &mut [f32],
+        out_rate: u32,
+        channels: usize,
+        allow_decode: bool,
+    ) {
         for v in out.iter_mut() {
             *v = 0.0;
         }
@@ -72,13 +88,51 @@ impl SoundState {
             // （主音量 `:/S0/` → 频道 `BGM/` → 单条声音）；这里按同一
             // 公式取有效音量，容器/父层改音量对全部后代即时生效。
             let gain = volume_gain(self.effective_for_key(id));
-            mix_layer(layer, gain, out, frames, out_rate, channels);
+            mix_layer(
+                layer,
+                gain,
+                out,
+                frames,
+                out_rate,
+                channels,
+                allow_decode,
+                &self.rt_silence_samples,
+            );
+        }
+        // 调试抓取:把限幅**之前**的原始混音结果留一份(爆音分析用)。
+        if let Ok(mut slot) = self.debug_capture.lock() {
+            if let Some(buffer) = slot.as_mut() {
+                buffer.extend_from_slice(out);
+            }
         }
         // Unverified：引擎最终由 DirectSound 混音器限幅；这里只做 [-1,1] 钳制。
+        //
+        // 硬削波会把叠加过量的波形切成方波 —— 听感就是刺耳爆音。计数出来
+        // 才能区分"没声音问题"与"增益结构不对"(后者要查各层音量/主音量)。
+        let mut clipped = 0u64;
         for v in out.iter_mut() {
+            if *v > 1.0 || *v < -1.0 {
+                clipped += 1;
+            }
             *v = v.clamp(-1.0, 1.0);
         }
+        if clipped > 0 {
+            self.clipped_samples
+                .fetch_add(clipped, std::sync::atomic::Ordering::Relaxed);
+        }
     }
+}
+
+/// 记账:硬实时路径整块静音(源窗口未覆盖)。
+fn note_rt_silence(
+    counter: &std::sync::atomic::AtomicU64,
+    frames: usize,
+    channels: usize,
+) {
+    counter.fetch_add(
+        frames.saturating_mul(channels) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 fn mix_layer(
@@ -88,6 +142,8 @@ fn mix_layer(
     frames: usize,
     out_rate: u32,
     channels: usize,
+    allow_decode: bool,
+    rt_silence: &std::sync::atomic::AtomicU64,
 ) {
     if !layer.state().audible() || layer.paused() {
         return;
@@ -123,24 +179,78 @@ fn mix_layer(
         0
     };
 
+    // ---- 硬实时前置条件:本块需要的源样本必须**已在已解码窗口内** ----
+    //
+    // 音频回调绝不解码。历史教训:调用 `Stream::sample()` 会在窗口不足时
+    // 就地解码(lewton 解一个 packet 是毫秒级),在 128~1024 帧的块预算里
+    // 直接超时 ⇒ 欠载 ⇒ 爆音。浏览器(AudioWorklet 128 帧)与安卓(oboe
+    // 小块)因此必爆,桌面(cpal 大缓冲)侥幸不爆 —— 这正是"桌面不爆音、
+    // 其它平台爆音、刚开始最严重(窗口空)"的统一解释。
+    //
+    // 现在:窗口没准备好就整块静音,由 tick 线程的 `prefetch` 补齐;解码
+    // 永远不在回调里发生。代价只是启动/定位后极短的静音,不会有噪声。
+    if !allow_decode && silent_frames < frames {
+        // 整块都是延迟静音时不需要任何样本(位置也不推进),跳过检查。
+        if stream.seek_pending() {
+            note_rt_silence(rt_silence, frames - silent_frames, channels);
+            return;
+        }
+        let sounded = frames - silent_frames;
+        let last_pos_ms = pos_ms + step_ms * pitch * sounded as f64;
+        let need_frame = (last_pos_ms.max(0.0) * src_rate as f64 / 1000.0).ceil() as u64 + 2;
+        if need_frame < total && !stream.covers(need_frame) {
+            // 窗口不够覆盖到本块结尾:静音本块,等预取。
+            note_rt_silence(rt_silence, sounded, channels);
+            return;
+        }
+    }
+
     for f in 0..frames {
         if f < silent_frames {
             continue;
         }
-        // 循环边界（与状态机相同的 END/RESTART 规则；只在本块内回绕）。
+        // 循环边界（与状态机相同的 END/RESTART 规则）。
+        //
+        // 这里**不能**就地 seek:seek 会重建解码器,必须在 tick 线程做。
+        // 本块读到 END 就停(余下静音),下一块由预取在 restart 位置重新填。
         if end_ms > 0.0 && pos_ms >= end_ms {
-            pos_ms = restart_ms;
-            stream.request_seek_ms(restart_ms as i64);
+            if allow_decode {
+                pos_ms = restart_ms;
+                stream.request_seek_ms(restart_ms as i64);
+            } else {
+                break;
+            }
         }
         let src_pos = pos_ms * src_rate as f64 / 1000.0;
         if src_pos >= total as f64 {
+            // 到文件尾:本块剩余留静音(正常收尾),但**不能**无限累加位置 ——
+            // 交给状态机在下一个 advance 里按 END/LOOP 规则处理。
             break;
         }
         let i0 = src_pos.floor() as u64;
         let frac = (src_pos - i0 as f64) as f32;
         let i1 = (i0 + 1).min(total - 1);
-        let Some(l0) = stream.sample(i0, 0) else { break };
-        let Some(l1) = stream.sample(i1, 0) else { break };
+        // 实时路径只读已解窗口(不解码);离线路径允许按需解码。
+        let (l0, l1) = if allow_decode {
+            match (stream.sample(i0, 0), stream.sample(i1, 0)) {
+                (Some(a), Some(b)) => (a, b),
+                _ => {
+                    pos_ms += step_ms * pitch;
+                    continue;
+                }
+            }
+        } else {
+            match (stream.peek(i0, 0), stream.peek(i1, 0)) {
+                (Some(a), Some(b)) => (a, b),
+                _ => {
+                    // 逐帧落窗(未被上面的整块前置检查拦住):这是**不可闻单帧
+                    // 缺口**的来源,必须单独计数,否则整块静音为 0 时会漏判。
+                    note_rt_silence(rt_silence, 1, channels);
+                    pos_ms += step_ms * pitch;
+                    continue;
+                }
+            }
+        };
         let o = f * channels;
         if channels == 1 {
             let s = lerp(l0, l1, frac);
@@ -148,7 +258,7 @@ fn mix_layer(
         } else {
             let l = lerp(l0, l1, frac);
             let r = if src_channels >= 2 {
-                match (stream.sample(i0, 1), stream.sample(i1, 1)) {
+                match (stream.peek(i0, 1), stream.peek(i1, 1)) {
                     (Some(r0), Some(r1)) => lerp(r0, r1, frac),
                     _ => l,
                 }
@@ -160,8 +270,15 @@ fn mix_layer(
         }
         pos_ms += step_ms * pitch;
     }
-    // 有界窗口:丢已消费前缀(官方环 0.5s;backward seek 由 request_seek 重建)。
-    stream.discard_before((pos_ms.max(0.0) * src_rate as f64 / 1000.0).floor() as u64);
+    // 有界窗口:丢已消费前缀,但**保留约 0.25s 余量**。
+    //
+    // 原来按 pos_ms 精确丢弃:音频回调(44100Hz 连续吃样本)与 tick 侧预取
+    // (60Hz 才跑一次)节奏不同,精确丢到播放头会让下一次回调在窗口头部
+    // 找不到样本 —— 每块都可能触发,听感就是持续爆音。留余量后回调始终能
+    // 命中已解窗口,预取只需覆盖新增部分。
+    let keep_from = (pos_ms.max(0.0) * src_rate as f64 / 1000.0).floor() as u64;
+    let safety_margin = (src_rate as u64) / 4; // 0.25s
+    stream.discard_before(keep_from.saturating_sub(safety_margin));
 }
 
 fn lerp(a: i16, b: i16, frac: f32) -> f32 {

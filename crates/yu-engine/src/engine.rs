@@ -155,7 +155,8 @@ pub use yu_format::yssd::BlockCodec;
 
 /// 引擎运行参数(全部由宿主给值;内核不猜)。
 #[derive(Clone, Debug)]
-pub struct EngineOptions {    pub backend: Backend,
+pub struct EngineOptions {
+    pub backend: Backend,
     pub entry: String,
     pub record_events: bool,
     pub fps: u32,
@@ -195,6 +196,12 @@ pub struct EngineOptions {    pub backend: Backend,
     /// 才懒加载)。`fontdb` 枚举在本机实测 ~130ms,预热可消除“第一次打开
     /// テキスト页签”的停顿;headless 用例不需要。
     pub warm_text: bool,
+    /// 是否执行渲染(默认 true)。
+    ///
+    /// `false` = 完全跳过合成/上屏,只跑 VM 与声音(复用首帧的呈现面)。
+    /// 安卓宿主用它做**归因实验**:把上屏链路从时序里摘掉,单独判断卡顿
+    /// 是否由渲染抢 CPU 引起。headless 用例必须保持 true。
+    pub render: bool,
     /// 宿主路径系统变量的覆盖(跨平台注入口,见 [`crate::host_paths`])。
     /// `None` 项走平台默认解析;Android 这类没有 `USERPROFILE` 的宿主
     /// 用它把 app 私有目录 / 外置卡目录喂进来。
@@ -219,6 +226,7 @@ pub struct EngineOptions {    pub backend: Backend,
 impl Default for EngineOptions {
     fn default() -> Self {
         Self {
+            render: true,
             backend: Backend::Soft,
             entry: "SYSTEM_START".to_string(),
             record_events: false,
@@ -595,6 +603,11 @@ pub struct Engine {
     /// 上一帧被显式 `max_step` 上限丢弃的毫秒(0 = 未丢;进帧报告 `lag_ms`)。
     last_clock_drop_ms: u32,
     renderer: Renderer,
+    /// 上一次真正渲染的三元组(`Surface`, 报告, 屏幕标记)。
+    ///
+    /// `EngineOptions::render == false` 时逐帧复用它(引用计数克隆,不是
+    /// 整帧拷贝),从而在不改 VM 语义的前提下把渲染整条链路摘掉。
+    last_render_out: Option<(Arc<Surface>, RenderReport, Option<(u64, u32, u32)>)>,
     viewport: Viewport,
     frame: u64,
     timeline: InputTimeline,
@@ -740,6 +753,7 @@ impl Engine {
             clock: RealtimeClock::new(Instant::now()),
             last_clock_drop_ms: 0,
             renderer,
+            last_render_out: None,
             viewport,
             frame: 0,
             timeline: InputTimeline::new(),
@@ -1174,7 +1188,20 @@ impl Engine {
         let drawable = frame_has_drawable_output(&frame);
 
         let render_started = Instant::now();
-        let (surface, report, screen) = self.renderer.render(&frame)?;
+        // `--no-render`(安卓诊断):完全跳过渲染,复用上一帧的呈现面。
+        // 用途:把上屏链路从时序里摘掉,单独验证"卡顿是否由渲染抢 CPU 引起"。
+        // 首帧必须真渲染一次,否则后续没有可复用的三元组。
+        let (surface, report, screen) = if self.opts.render || self.last_render_out.is_none() {
+            let out = self.renderer.render(&frame)?;
+            self.last_render_out = Some(out.clone());
+            out
+        } else {
+            // `Arc` 克隆是引用计数,不是整帧拷贝。
+            self.last_render_out
+                .as_ref()
+                .map(Clone::clone)
+                .ok_or_else(|| Failure::runtime("no cached render output"))?
+        };
         self.last_screen = screen;
         let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
         if let Renderer::Wgpu { renderer, .. } = &self.renderer {
@@ -1571,6 +1598,60 @@ impl Engine {
     }
 
     /// 当前声音层快照（真实语料验证/诊断用）。
+    /// 开始抓取混音输出(诊断;最多 `samples` 个交错样本)。
+    pub fn start_audio_capture(&self, samples: usize) {
+        if let Some(sound) = &self.sound {
+            if let Ok(state) = sound.lock() {
+                let _ = state.start_debug_capture(samples);
+            }
+        }
+    }
+
+    /// 取走抓到的混音样本。
+    #[must_use]
+    pub fn take_audio_capture(&self) -> Option<Vec<f32>> {
+        self.sound
+            .as_ref()
+            .and_then(|sound| sound.lock().ok().and_then(|state| state.take_debug_capture()))
+    }
+
+    /// 累计被硬削波(超出 ±1.0)的声音样本数。
+    ///
+    /// 非零 = 混音增益结构过量。听感是刺耳爆音,但成因与欠载/解码失败
+    /// 完全不同 —— 分开暴露才能判断该调增益还是修调度。
+    #[must_use]
+    pub fn sound_clipped_samples(&self) -> u64 {
+        self.sound
+            .as_ref()
+            .and_then(|sound| sound.lock().ok().map(|state| state.clipped_samples()))
+            .unwrap_or(0)
+    }
+
+    /// 硬实时路径「源窗口未就绪 ⇒ 整块静音」的累计样本数。
+    ///
+    /// 与削波、设备侧断供并列,是爆音归因的三个不同类别之一。
+    #[must_use]
+    pub fn sound_rt_silence_samples(&self) -> u64 {
+        self.sound
+            .as_ref()
+            .and_then(|sound| {
+                sound
+                    .lock()
+                    .ok()
+                    .map(|state| state.rt_silence_samples())
+            })
+            .unwrap_or(0)
+    }
+
+    /// 硬实时路径逐帧落到窗口外而跳过的累计样本数。
+    #[must_use]
+    pub fn sound_rt_miss_samples(&self) -> u64 {
+        self.sound
+            .as_ref()
+            .and_then(|sound| sound.lock().ok().map(|state| state.rt_miss_samples()))
+            .unwrap_or(0)
+    }
+
     pub fn sound_snapshot(&self) -> Vec<yu_sound::state::SoundSnapshot> {
         self.sound
             .as_ref()

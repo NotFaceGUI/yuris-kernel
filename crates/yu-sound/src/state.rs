@@ -456,6 +456,27 @@ pub struct SoundState {
     frame: u64,
     /// 流解码计数(所有层共享;`render` 是 `&self`,用原子量跨线程记账)。
     stream_counters: Arc<StreamCounters>,
+    /// 被硬削波(超出 ±1.0)的样本数累计。
+    ///
+    /// 非零 = 混音增益结构不对(多层叠加过量)。直接听感是刺耳爆音,与
+    /// 欠载/解码失败是**不同**的故障类别,必须分开计数才不会互相掩盖。
+    pub(crate) clipped_samples: std::sync::atomic::AtomicU64,
+    /// 硬实时路径因「已解码窗口未覆盖」而整块静音的样本数累计。
+    ///
+    /// 与 `clipped`、设备侧断供是三个**互不相同**的故障类别:
+    /// - `clipped` = 混音叠加过量(削波);
+    /// - 本计数 = 源未就绪(预取跟不上 ⇒ 块边界静音 ⇒ 听感断续);
+    /// - 设备侧短供 = 环形缓冲被抽干(线程调度/宿主转发)。
+    ///
+    /// 三者必须分开计量,否则无法判断爆音究竟出在混音还是交付。
+    pub(crate) rt_silence_samples: std::sync::atomic::AtomicU64,
+    /// 硬实时路径「单帧落到窗口外」而跳过的样本数累计(逐帧静音)。
+    ///
+    /// 与 `rt_silence_samples`(整块静音)分开:单帧丢失在块内不被察觉,
+    /// 但每帧都是 20µs 的缺口,密集出现就是持续的"刺啦"。
+    pub(crate) rt_miss_samples: std::sync::atomic::AtomicU64,
+    /// 调试用:混音输出的原始样本(诊断爆音时抓波形分析;`None` = 未抓取)。
+    pub(crate) debug_capture: std::sync::Mutex<Option<Vec<f32>>>,
     /// WAVE/ACM 整段装载次数(逐帧增量)。
     full_decodes: u64,
     /// 本帧落在 tick 线程的解码耗时(装载 + 预取;逐帧增量)。
@@ -486,6 +507,10 @@ impl SoundState {
             diags: Vec::new(),
             frame: 0,
             stream_counters: Arc::new(StreamCounters::default()),
+            debug_capture: std::sync::Mutex::new(None),
+            clipped_samples: std::sync::atomic::AtomicU64::new(0),
+            rt_silence_samples: std::sync::atomic::AtomicU64::new(0),
+            rt_miss_samples: std::sync::atomic::AtomicU64::new(0),
             full_decodes: 0,
             tick_decode_us: 0,
         }
@@ -723,7 +748,9 @@ impl SoundState {
     /// 这是音频线程唯一的写入口;渲染与推进在同一把锁内完成,
     /// 不会出现“块渲染了但位置没走/位置走了但块没渲染”的漂移。
     pub fn render_and_advance(&mut self, out: &mut [f32], out_rate: u32, channels: usize) {
-        self.render(out, out_rate, channels);
+        // 硬实时路径:**绝不解码**(解码在音频回调里会超时 ⇒ 欠载 ⇒ 爆音)。
+        // 窗口没准备好就静音,由 tick 侧 `prefetch` 补齐。
+        self.render_with(out, out_rate, channels, false);
         if channels > 0 {
             self.advance_samples(out.len() / channels, out_rate);
         }
@@ -939,7 +966,27 @@ impl SoundState {
             // 装载/解码失败时保持 Stopped（没有可播放数据）。
             layer.state = PlayState::Loaded;
         }
-        self.layers.insert(key, layer);
+        let should_prefetch = layer.state.audible() && !layer.paused;
+        let position = layer.position_ms;
+        self.layers.insert(key.clone(), layer);
+        // 命令时刻就填解码窗口:否则要等下一个 tick(最多 16ms),而音频回调
+        // 每 2.9ms 就消费一块 —— 启动/首播必然先欠载一段(实测"刚开始
+        // 爆音最严重")。这里同步补一次,回调立刻有数据可读。
+        if should_prefetch {
+            self.prefetch_layer_at(&key, position);
+        }
+    }
+
+    /// 给单个层按给定位置预取(tick/命令时刻共用)。
+    fn prefetch_layer_at(&mut self, id: &[u8], position_ms: i64) {
+        let started = std::time::Instant::now();
+        if let Some(layer) = self.layers.get(id) {
+            if let Some(stream) = layer.stream.borrow_mut().as_mut() {
+                stream.prefetch(position_ms, LEAD_MS);
+            }
+        }
+        let us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.tick_decode_us = self.tick_decode_us.saturating_add(us);
     }
 
     /// 装载。返回“文件解析是否成功”（不代表解码成功）。
@@ -1119,6 +1166,48 @@ impl SoundState {
 
     /// tick 侧预解码:给每个可听层保留 [`LEAD_MS`](官方 0.5s 环)的已解码
     /// 窗口,正常播放时音频回调不再解码。返回本 tick 的预取耗时(微秒)。
+    /// 累计被硬削波的样本数(诊断:非零 = 增益结构问题,听感是爆音)。
+    #[must_use]
+    /// 开始抓取混音输出(最多 `samples` 个交错样本;诊断爆音用)。
+    pub fn start_debug_capture(&self, samples: usize) {
+        if let Ok(mut slot) = self.debug_capture.lock() {
+            *slot = Some(Vec::with_capacity(samples.min(1 << 22)));
+        }
+    }
+
+    /// 取走抓到的样本(未抓取时 `None`)。
+    #[must_use]
+    pub fn take_debug_capture(&self) -> Option<Vec<f32>> {
+        self.debug_capture.lock().ok()?.take()
+    }
+
+    pub fn clipped_samples(&self) -> u64 {
+        self.clipped_samples.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 硬实时路径「源未就绪 ⇒ 整块静音」的累计样本数。
+    ///
+    /// 正常播放恒为 0;持续增长说明预取跟不上播放头(窗口缺口),
+    /// 听感是块边界的断续/爆音,与设备侧断供应分开判断。
+    pub fn rt_silence_samples(&self) -> u64 {
+        self.rt_silence_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 硬实时路径逐帧落到窗口外而跳过的累计样本数。
+    pub fn rt_miss_samples(&self) -> u64 {
+        self.rt_miss_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 立即补齐所有可听层的解码窗口(tick 线程调用)。
+    ///
+    /// 设备回调只读窗口不解码,所以**必须在渲染前**由这里把数据准备好。
+    /// 公开给宿主/测试复现真实循环(tick 预取 → 回调消费)。
+    pub fn prefetch_now(&mut self) {
+        self.prefetch_layers();
+    }
+
     fn prefetch_layers(&mut self) {
         let started = std::time::Instant::now();
         for layer in self.layers.values() {

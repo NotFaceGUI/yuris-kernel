@@ -40,7 +40,13 @@ use crate::error::{self, code};
 use crate::meta::AudioMeta;
 
 /// 预解码提前量:官方 `0x422c65` 的 `bytes_per_sec/2` = 0.5 秒。
-pub(crate) const LEAD_MS: i64 = 500;
+///
+/// 这里用 **1.5 秒**:官方环是 0.5s,但它由**同一线程**的音量回调自己填充;
+/// 本实现把解码放在 tick 线程(60Hz)而消费在音频回调(44100Hz),两者速率
+/// 差 700 倍 —— 只留 0.5s 会在启动/定位后迅速耗尽,表现为"刚开始猛爆音,
+/// 过一会儿才缓过来"(实测)。1.5s 给 tick 留出足够追赶余量,内存代价
+/// (44.1kHz 立体声 i16)约 265KB/层,可接受。
+pub(crate) const LEAD_MS: i64 = 1500;
 
 /// 流解码计数(跨线程:`render` 是 `&self`,用原子量记账)。
 #[derive(Default)]
@@ -119,7 +125,13 @@ pub(crate) struct Stream {
     total_ms: i64,
     kind: Kind,
     /// OGG 已解码窗口:`[window_start, window_start + window_frames)`。
+    ///
+    /// 已消费的前缀**不立刻搬内存**:用 `window_read` 记偏移。音频回调每秒
+    /// 要跑几十次,在里面做 `Vec::drain`(几十 KB 的 memmove)会造成周期性
+    /// 卡顿与刺啦声(实机复现)。真正的压缩只在安全点(丢弃阈值过半)做。
     window: Vec<i16>,
+    /// `window[0]` 已消费的样本数(交错样本计)。索引要加上它。
+    window_read: usize,
     window_start: u64,
     eof: bool,
     pending_seek: Option<u64>,
@@ -170,6 +182,7 @@ impl Stream {
             total_ms: meta.total_ms().unwrap_or(0),
             kind: Kind::Ogg { bytes, reader },
             window: Vec::new(),
+            window_read: 0,
             window_start: 0,
             eof: false,
             pending_seek: None,
@@ -202,6 +215,7 @@ impl Stream {
             total_ms,
             kind: Kind::Pcm(pcm),
             window: Vec::new(),
+            window_read: 0,
             window_start: 0,
             eof: false,
             pending_seek: None,
@@ -292,7 +306,7 @@ impl Stream {
         if self.channels == 0 {
             0
         } else {
-            (self.window.len() / usize::from(self.channels)) as u64
+            (self.window.len().saturating_sub(self.window_read) / usize::from(self.channels)) as u64
         }
     }
 
@@ -329,16 +343,84 @@ impl Stream {
         }
         let drop = (keep_from - self.window_start) as usize;
         let samples = drop * usize::from(self.channels);
-        if samples >= self.window.len() {
+        let unread = self.window.len().saturating_sub(self.window_read);
+        if samples >= unread {
             self.window.clear();
-            self.window_start = keep_from;
+            self.window_read = 0;
         } else {
-            self.window.drain(..samples);
-            self.window_start = keep_from;
+            // 只移动读游标:音频回调里绝不能做 memmove(会卡顿/刺啦)。
+            self.window_read += samples;
+            // 过半才压缩一次,把已消费前缀真正丢掉(均摊到调用方)。
+            if let Some(compact) = self.compact_if_needed() {
+                let _ = compact;
+            }
+        }
+        self.window_start = keep_from;
+    }
+
+    /// 已消费前缀超过一半时压缩缓冲(把 memmove 摊到低频调用上)。
+    fn compact_if_needed(&mut self) -> Option<()> {
+        if self.window_read == 0 || self.window_read * 2 < self.window.len() {
+            return None;
+        }
+        self.window.drain(..self.window_read);
+        self.window_read = 0;
+        Some(())
+    }
+
+    /// 已解码窗口是否覆盖到 `frame`(**纯查询,不解码**)。
+    ///
+    /// 音频回调必须用这个判断:回调在硬实时线程上,任何解码都可能超出
+    /// 块预算 ⇒ 欠载 ⇒ 爆音。解码只允许发生在 tick 线程的 [`Self::prefetch`]。
+    #[must_use]
+    pub fn covers(&self, frame: u64) -> bool {
+        match &self.kind {
+            // WAVE/ACM:整段样本常驻,只要有这个帧就算覆盖。
+            Kind::Pcm(_) => frame < self.total_frames,
+            // OGG:只看已解码窗口(窗口外需要解码,回调里不许做)。
+            Kind::Ogg { .. } => frame >= self.window_start && frame < self.window_end(),
+        }
+    }
+
+    /// 是否还有未执行的定位请求(tick 侧 `prefetch` 会消费掉它)。
+    ///
+    /// 音频回调见到 `true` 就应当整块静音:此刻窗口还是旧位置的数据,
+    /// 混出来就是错位噪声。
+    #[must_use]
+    pub fn seek_pending(&self) -> bool {
+        self.pending_seek.is_some()
+    }
+
+    /// 从已解码窗口读样本(**不触发解码**);不在窗口内返回 `None`。
+    ///
+    /// 与 [`Self::sample`] 的区别:后者会 `ensure()`(可能解码),只适合
+    /// tick 线程;本方法可安全用于音频回调。
+    #[must_use]
+    pub fn peek(&self, frame: u64, ch: usize) -> Option<i16> {
+        let channels = usize::from(self.channels);
+        if channels == 0 || ch >= channels || frame >= self.total_frames {
+            return None;
+        }
+        match &self.kind {
+            // WAVE/ACM:整段样本常驻,随时可读。
+            Kind::Pcm(pcm) => {
+                let idx = (frame as usize).checked_mul(channels)?.checked_add(ch)?;
+                pcm.samples.get(idx).copied()
+            }
+            // OGG:只读已解码窗口。
+            Kind::Ogg { .. } => {
+                if frame < self.window_start || frame >= self.window_end() {
+                    return None;
+                }
+                let idx = (frame - self.window_start) as usize * channels + ch + self.window_read;
+                self.window.get(idx).copied()
+            }
         }
     }
 
     /// 取 `frame` 处的样本;越界/解码失败返回 `None`(越界 = 文件尾)。
+    ///
+    /// **会按需解码**,只应在 tick 线程使用(见 [`Self::peek`])。
     pub fn sample(&mut self, frame: u64, ch: usize) -> Option<i16> {
         if frame >= self.total_frames {
             return None;
@@ -365,7 +447,9 @@ impl Stream {
                     self.note_underrun(frame);
                     return None;
                 }
-                let idx = (frame - self.window_start) as usize * usize::from(self.channels) + ch;
+                let idx = (frame - self.window_start) as usize * usize::from(self.channels)
+                    + ch
+                    + self.window_read;
                 self.window.get(idx).copied()
             }
         }
@@ -453,6 +537,7 @@ impl Stream {
                 };
                 *reader = fresh;
                 self.window.clear();
+                self.window_read = 0;
                 self.window_start = 0;
                 self.eof = false;
                 // 解码并丢弃到 target;target 通常 = START/RESTART(多为 0)。

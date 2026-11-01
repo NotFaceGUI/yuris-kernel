@@ -212,6 +212,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         os_sound: true,
         media_readonly: false,
         reconcile,
+        // 桌面宿主始终渲染(窗口就是产品本身)。
+        render: true,
         // GPU 上下文由宿主自建(桌面不注入,走引擎内默认创建)。
         gpu_context: None,
         save_root,

@@ -1069,12 +1069,16 @@ fn delay_window_renders_silence_on_device_path() {
     c.play = Some(1);
     s.apply_sound(&c);
     let mut buf = vec![0.0f32; 800]; // 8000Hz × 800 帧 = 100ms
+    // 设备回调只消费已解窗口:按真实循环先预取(tick 线程)。
+    s.prefetch_now();
     s.render_and_advance(&mut buf, 8000, 1);
     assert!(buf.iter().all(|v| *v == 0.0), "延迟前 100ms 应为静音");
     // 烧完剩余 900ms 延迟后再取一块，应已出声。
     for _ in 0..9 {
+        s.prefetch_now();
         s.render_and_advance(&mut buf, 8000, 1);
     }
+    s.prefetch_now();
     s.render_and_advance(&mut buf, 8000, 1);
     assert!(
         buf.iter().any(|v| *v != 0.0),
