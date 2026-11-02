@@ -595,6 +595,27 @@ impl Planner<'_> {
                 )
             }
             TextureRef::Snapshot(copy_id) => {
+                // 零拷贝区域切片:直接用采样窗绘制(快照合成时 `contents`
+                // 未必含该层,例如同帧稍后会被 `BT.END` 删除的菜单按钮)。
+                if let Some(content) = self.targets.snapshot_content(*copy_id).cloned() {
+                    let (draw_w, draw_h) = match explicit_size {
+                        Some(size) => (f64::from(size.width), f64::from(size.height)),
+                        None => (f64::from(content.width), f64::from(content.height)),
+                    };
+                    let view = content.tex.view.clone();
+                    return self.draw_uv(
+                        out,
+                        blend,
+                        content.tex.id,
+                        &view,
+                        FilterKind::Point,
+                        (x, y),
+                        (draw_w, draw_h),
+                        alpha,
+                        DrawKind::Quad,
+                        content.uv,
+                    );
+                }
                 let Some(target) = self.targets.snapshot(*copy_id) else {
                     self.skip(op, "snapshot.unsupported");
                     return Ok(());

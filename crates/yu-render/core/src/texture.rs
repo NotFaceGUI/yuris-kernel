@@ -89,6 +89,9 @@ impl AssetIssue {
     }
 }
 
+/// 失败缓存条数上限(失败条目字节 0,不受像素预算约束)。
+const MAX_FAILED_CACHE_ENTRIES: usize = 4096;
+
 /// 缓存条目。
 struct Cached {
     /// 实际命中的探测路径(缺失时 `None`)。
@@ -223,11 +226,35 @@ impl TextureStore {
         // 预算在帧边界统一执行(`begin_frame` / `set_budget_bytes`)。
     }
 
+    /// 失败条目只保留最近 `MAX_FAILED_CACHE_ENTRIES` 条,避免坏/缺失
+    /// 资产 key 在长会话里无界累积(它们字节为 0,不受像素预算约束)。
+    fn enforce_failed_cap(&mut self) {
+        let mut failed: Vec<(Vec<u8>, u64)> = self
+            .meta
+            .iter()
+            .filter(|(_, (bytes, _))| *bytes == 0)
+            .map(|(key, (_, used))| (key.clone(), *used))
+            .collect();
+        if failed.len() <= MAX_FAILED_CACHE_ENTRIES {
+            return;
+        }
+        failed.sort_by_key(|(_, used)| *used);
+        let excess = failed.len() - MAX_FAILED_CACHE_ENTRIES;
+        for (key, _) in failed.into_iter().take(excess) {
+            self.cache.remove(&key);
+            self.meta.remove(&key);
+            self.fresh.remove(&key);
+        }
+    }
+
     /// 超预算时按 LRU 回收**只有缓存引用**的条目(`Rc::strong_count == 1`)。
     /// 仍在图层/快照里的纹理跳过;`skip_fresh` = 本帧新插入的条目也跳过
     /// (预热/本帧刚解析的资产必须活到渲染结束)。实在没有可回收的就保持
     /// 超预算并留痕。
     fn enforce_budget(&mut self, skip_fresh: bool) {
+        // 失败条目字节为 0,永远不参与字节预算;单独限条数,避免缺失/坏
+        // 资产 key 在长时间游玩里只增不减(每帧探测一次就留一条)。
+        self.enforce_failed_cap();
         if self.budget_bytes == 0 {
             return;
         }

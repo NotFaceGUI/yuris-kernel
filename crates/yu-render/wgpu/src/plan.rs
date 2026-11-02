@@ -77,7 +77,11 @@ pub(crate) fn plan(
         }
         targets.prune_offscreen(&live_offscreen, pipelines);
     }
-    text_uploads.retain(&frame.layers.iter().map(|l| l.id.clone()).collect());
+    let live_text_layers: BTreeSet<LayerId> =
+        frame.layers.iter().map(|l| l.id.clone()).collect();
+    for id in text_uploads.retain(&live_text_layers) {
+        gpu.remove(id, pipelines);
+    }
     let timing = std::env::var("YU_RENDER_TIMING").is_ok();
     let trace_geometry = std::env::var("YU_RENDER_TRACE_GEOMETRY").is_ok();
 
@@ -141,6 +145,15 @@ pub(crate) fn plan(
                             .entry(dest.clone())
                             .or_default()
                             .push(image.seq);
+                        // 历史项已在之前的帧执行完,它的读取不再要求本帧从
+                        // 基图重放中间像素;只有本帧新追加的读取才可能把
+                        // 消费点卡在已应用前缀中间。
+                        if surfaces
+                            .last_applied_seq(dest)
+                            .is_some_and(|last| image.seq <= last)
+                        {
+                            continue;
+                        }
                         if &image.source != dest {
                             first_read.entry(image.source.clone()).or_insert(image.seq);
                         }
@@ -285,6 +298,7 @@ pub(crate) fn plan(
         frame,
         textures,
         gpu,
+        pipelines,
         surfaces,
         &mut contents,
         &mut bases,
@@ -592,14 +606,25 @@ fn apply_image(
     };
     let signature = image_signature(image, source_hash, source2_hash);
     let index = *chain_index.entry(target.clone()).or_insert(0);
-    if !force_materialize && surfaces.applied_at(target, index) == Some((image.seq, signature)) {
+    // 已应用前缀按 **命令序号** 命中即可,不再比签名。
+    //
+    // 官方 `CGACT` 是命令到达时立即写层表面(REA `0x42f809`):历史项的
+    // 结果已经烘进表面。若源层内容之后变化,签名会漂移;此时用新源去重放
+    // 旧项既不符合官方语义,也会让文字窗口的 `MERGE2` 链每帧整条重算
+    // (实测 `MESW.TX` 累积 197 条后 render 线性上涨)。基图变化由
+    // `sync_base` 清空前缀,结构变化由下面的 seq 不匹配分支兜底。
+    if !force_materialize
+        && surfaces
+            .applied_at(target, index)
+            .is_some_and(|(seq, _)| seq == image.seq)
+    {
         *chain_index.get_mut(target).expect("inserted above") += 1;
         surfaces.note_reused_layer();
         return Ok(());
     }
     if surfaces.applied_len(target) > index {
-        // 结构核对已在帧首做过;走到这里说明签名在中间漂移(源内容变化),
-        // 表面不再是「当前前缀」的结果 ⇒ 回到基面整条重放。
+        // 结构核对已在帧首做过;走到这里说明命令序号在中间漂移(日志被
+        // 折叠/CG 重建),表面不再是「当前前缀」的结果 ⇒ 回到基面整条重放。
         surfaces.truncate_applied(target, 0);
         surfaces.clear_content(target);
         contents.remove(target);
@@ -629,7 +654,20 @@ fn resolve_target_base(
     bases: &mut BTreeMap<(LayerId, u64), Rc<TexRef>>,
     fallback: Option<&TextureRef>,
 ) -> Result<Content, String> {
-    let layer = frame.layers.iter().find(|layer| &layer.id == id);
+    let layer = frame
+        .layers
+        .iter()
+        .find(|layer| &layer.id == id)
+        .or_else(|| {
+            // 目标层已被本帧 `CGEND` 删除,但命令时刻屏幕快照里还留着它
+            // (存档缩略图的 `MERGE2` 写 `BT...THUMB`,随后 `BT.END`):
+            // 用快照里的图层表恢复命令时刻的基图,才能重放出缩略图。
+            frame
+                .screen_snapshots
+                .values()
+                .rev()
+                .find_map(|snapshot| snapshot.layers.iter().find(|layer| &layer.id == id))
+        });
     if let Some(layer) = layer {
         if layer.is_group() {
             return Err("gfx.imageop.target.group".to_string());
@@ -655,6 +693,10 @@ fn resolve_target_base(
     };
     match texture {
         TextureRef::Snapshot(copy_id) if targets.snapshot(*copy_id).is_none() => {
+            // 区域切片是零拷贝 UV 别名(无物化纹理):直接返回采样窗。
+            if let Some(content) = targets.snapshot_content(*copy_id) {
+                return Ok(content.clone());
+            }
             Err("gfx.imageop.copy_source.unsupported".to_string())
         }
         texture => {
@@ -713,6 +755,12 @@ fn resolve_source(
         (None, Some(fallback)) => fallback,
         (None, None) => return Err(missing.to_string()),
     };
+    if let TextureRef::Snapshot(copy_id) = texture {
+        // 区域切片是零拷贝 UV 别名:消费者直接拿采样窗。
+        if let Some(content) = targets.snapshot_content(*copy_id) {
+            return Ok(content.clone());
+        }
+    }
     let tex = resolve_ref(ctx, textures, gpu, targets, id, texture, bases)?;
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     fnv_bytes(&mut hash, id.as_bytes());
@@ -1483,7 +1531,7 @@ fn apply_copy(
     if &copy.dest != pass_target {
         return Err("gfx.copy.target.mismatch".to_string());
     }
-    if targets.snapshot(copy.id).is_some() {
+    if targets.has_snapshot(copy.id) {
         // 已冻结(EVID-T-12)。
         return Ok(());
     }
@@ -1521,14 +1569,18 @@ fn apply_copy(
                         let uploaded = gpu
                             .get(id_upload)
                             .ok_or_else(|| "gpu.upload_missing".to_string())?;
+                        let tex = Rc::new(TexRef {
+                            id: id_upload,
+                            width: uploaded.width,
+                            height: uploaded.height,
+                            texture: uploaded.texture.clone(),
+                            view: uploaded.view.clone(),
+                        });
+                        // 只在本次复制里消费;像素由 `TexRef` 持有,缓存项
+                        // 与 bind group 不必跨帧保留。
+                        gpu.remove(id_upload, pipelines);
                         Content {
-                            tex: Rc::new(TexRef {
-                                id: id_upload,
-                                width: uploaded.width,
-                                height: uploaded.height,
-                                texture: uploaded.texture.clone(),
-                                view: uploaded.view.clone(),
-                            }),
+                            tex,
                             uv: [0.0, 0.0, 1.0, 1.0],
                             width: composed.width,
                             height: composed.height,
@@ -1561,7 +1613,7 @@ fn apply_copy(
                     )
                 } else {
                     backbuffer_content(
-                        ctx, frame, gpu, backbuffer, backbuffer_gpu, writes,
+                        ctx, frame, gpu, pipelines, backbuffer, backbuffer_gpu, writes,
                     )?
                 }
             } else {
@@ -1594,6 +1646,47 @@ fn apply_copy(
     let clip_y1 = y1.min(i64::from(sh) - 1);
     let clip_w = (clip_x1 - clip_x0 + 1).max(0) as u32;
     let clip_h = (clip_y1 - clip_y0 + 1).max(0) as u32;
+    // 区域切片零拷贝:源是恒等内容时,快照可直接引用源纹理的 UV 子窗口。
+    // ERIS 菜单一次构造 260+ 个按钮状态切片,逐张新建纹理约 86µs/张
+    // (`image_us≈25ms`);图层绘制与文本烘焙都消费 `Content.uv`,不必物化。
+    // 文本层不走别名:文本基面读回按整张纹理,别名会把小图变成整图读回。
+    if !full
+        && source.is_identity()
+        && copy.texts.is_empty()
+        && !frame.text_revisions.contains_key(&copy.dest)
+        && clip_w == width
+        && clip_h == height
+        && clip_w > 0
+        && clip_h > 0
+    {
+        let uv = [
+            clip_x0 as f32 / sw as f32,
+            clip_y0 as f32 / sh as f32,
+            (clip_x1 + 1) as f32 / sw as f32,
+            (clip_y1 + 1) as f32 / sh as f32,
+        ];
+        let hash = surfaces.bump_hash();
+        let content = Content {
+            tex: source.tex.clone(),
+            uv,
+            width: clip_w,
+            height: clip_h,
+            bilinear: false,
+            display: None,
+            hash,
+        };
+        targets.set_snapshot_content(copy.id, content.clone());
+        // 基面身份也要切到别名:`sync_base` 在帧首按旧纹理设过 base,
+        // 不更新的话下一帧会把别名内容当「换了图」清掉,而别名没有
+        // 物化纹理可回退 ⇒ 图层整片消失(只在下一次屏幕快照里暴露)。
+        let alias_ref = TextureRef::Snapshot(copy.id);
+        let token = base_token(frame, targets, &copy.dest, Some(&alias_ref));
+        surfaces.sync_base(&copy.dest, token);
+        contents.insert(copy.dest.clone(), content.clone());
+        surfaces.set_content(&copy.dest, content);
+        surfaces.note_alias_hit();
+        return Ok(());
+    }
     let tex = if full && source.is_identity() && width == sw && height == sh {
         // 别名:快照 = 源内容句柄(零拷贝)。内容纹理永不原地改写
         // (surfaces 不变量 1)⇒ 冻结语义天然成立。
@@ -1603,12 +1696,17 @@ fn apply_copy(
         let materialized = materialize(ctx, pipelines, surfaces, writes, &source, "copy source")?;
         let out = surfaces.acquire(ctx, width, height, "copy snapshot")?;
         writes.remember(&out);
-        let mut pass = PlannedPass {
-            target: Some(PlannedTarget::Commands),
-            ..PlannedPass::default()
-        };
-        pass.clear_targets.push(out.id);
-        writes.passes.push(pass);
+        // 区域在源内时 blit 覆盖整张目标(宽高 = 裁剪后尺寸)⇒ 不需要先清屏。
+        // ERIS 菜单构造一次产生 260+ 个按钮状态切片,逐个开 render pass 清屏
+        // 是构造帧的主要 CPU/GPU 尖峰(2026-11-02 实测 image_us≈25ms)。
+        if clip_w < width || clip_h < height {
+            let mut pass = PlannedPass {
+                target: Some(PlannedTarget::Commands),
+                ..PlannedPass::default()
+            };
+            pass.clear_targets.push(out.id);
+            writes.passes.push(pass);
+        }
         let (sx, sy) = if full { (0, 0) } else { (clip_x0 as u32, clip_y0 as u32) };
         push_blit(
             writes,
@@ -1640,6 +1738,7 @@ fn backbuffer_content(
     ctx: &GpuContext,
     frame: &CompositorFrame,
     gpu: &mut TextureCache,
+    pipelines: &mut PipelineCache,
     backbuffer: Option<&Surface>,
     backbuffer_gpu: &mut Option<(u64, u64)>,
     writes: &mut SurfaceWrites<'_>,
@@ -1669,6 +1768,8 @@ fn backbuffer_content(
             texture: uploaded.texture.clone(),
             view: uploaded.view.clone(),
         });
+        // 只在首帧兜底使用;像素由 `TexRef` 持有。
+        gpu.remove(id, pipelines);
         writes.remember(&tex);
         return Ok(Content::identity(tex, 0));
     };
@@ -1697,6 +1798,11 @@ fn backbuffer_content(
             "backbuffer",
         )
         .map_err(|diag| diag.code.to_string())?;
+    // 后缓冲内容每变一次就换一张上传纹理;旧 id 必须从 GPU 缓存与 bind
+    // group 里移除,否则逐帧变化的画面(对话/菜单淡入)会累积整屏纹理。
+    if let Some((_, old_id)) = *backbuffer_gpu {
+        gpu.remove(old_id, pipelines);
+    }
     *backbuffer_gpu = Some((hash, id));
     let uploaded = gpu
         .get(id)
@@ -1766,6 +1872,20 @@ fn screen_snapshot_content(
     // 用独立的 contents/bases 副本,避免污染本帧的真实绘制。
     let mut snap_contents = contents.clone();
     let mut snap_bases = bases.clone();
+    // 命令时刻的屏幕快照里,有些层本帧的图像加工排在截图命令之后/被
+    // 本帧的系统命令作废(存档缩略图的 `MERGE2` 就是这种):`contents`
+    // 没有它们,但 `surfaces` 里还留着上一帧的成品像素。快照必须用
+    // 这份成品,否则缩略图会在淡出时先消失(只剩按钮底图)。
+    for id in &snapshot.layer_ids {
+        if snap_contents.contains_key(id) {
+            continue;
+        }
+        if let Some(raw) = surfaces.raw_content(id) {
+            snap_contents.insert(id.clone(), raw);
+        } else if let Some(content) = surfaces.content(id) {
+            snap_contents.insert(id.clone(), content.clone());
+        }
+    }
     {
         let mut local = Accum::new(&snap_frame);
         let mut uploads = TextUploads::default();
@@ -1776,6 +1896,7 @@ fn screen_snapshot_content(
             &snap_frame,
             textures,
             gpu,
+            pipelines,
             surfaces,
             &mut snap_contents,
             &mut snap_bases,
@@ -1786,6 +1907,11 @@ fn screen_snapshot_content(
             &mut no_gpu,
             &mut jobs,
         );
+        // 快照文本的纹理只服务本次合成;`TextUploads` 是临时表,
+        // 不清理会把它上传的整层/整屏纹理永久留在 GPU 缓存。
+        for id in uploads.clear() {
+            gpu.remove(id, pipelines);
+        }
     }
     compose_group_content(
         ctx,
@@ -1882,13 +2008,28 @@ pub(crate) struct TextUploads {
 }
 
 impl TextUploads {
-    pub fn clear(&mut self) {
+    /// 清空并返回被释放的纹理 id(调用方需要作废 GPU 缓存与 bind group)。
+    pub fn clear(&mut self) -> Vec<u64> {
+        let mut removed = Vec::new();
+        removed.extend(self.layers.values().map(|(_, tex)| tex.id));
+        removed.extend(self.screen.iter().map(|(_, tex)| tex.id));
         self.layers.clear();
         self.screen = None;
+        removed
     }
 
-    pub fn retain(&mut self, live: &BTreeSet<LayerId>) {
-        self.layers.retain(|id, _| live.contains(id));
+    /// 只保留仍存活的层,返回被释放的纹理 id。
+    pub fn retain(&mut self, live: &BTreeSet<LayerId>) -> Vec<u64> {
+        let mut removed = Vec::new();
+        self.layers.retain(|id, (_, tex)| {
+            if live.contains(id) {
+                true
+            } else {
+                removed.push(tex.id);
+                false
+            }
+        });
+        removed
     }
 }
 
@@ -2079,6 +2220,7 @@ fn apply_text(
     frame: &CompositorFrame,
     textures: &mut TextureStore,
     gpu: &mut TextureCache,
+    pipelines: &mut PipelineCache,
     surfaces: &mut LayerSurfaces,
     contents: &mut Contents,
     bases: &mut BTreeMap<(LayerId, u64), Rc<TexRef>>,
@@ -2304,6 +2446,7 @@ fn apply_text(
                 tex.clone()
             }
             _ => {
+                let old_upload = text_uploads.layers.get(&id).map(|(_, tex)| tex.id);
                 let id_upload = match gpu.upload(
                     ctx,
                     composed.texture.width,
@@ -2330,6 +2473,12 @@ fn apply_text(
                     texture: uploaded.texture.clone(),
                     view: uploaded.view.clone(),
                 });
+                // 文本每变一次(逐字显示)就换一张上传纹理;旧的必须从
+                // GPU 缓存与 bind group 里移除,否则一局游戏会累积数千张
+                // 整层/整屏纹理,render 从 ~1ms 涨到几十 ms。
+                if let Some(old_id) = old_upload {
+                    gpu.remove(old_id, pipelines);
+                }
                 text_uploads
                     .layers
                     .insert(id.clone(), (composed.hash, tex.clone()));
@@ -2375,6 +2524,7 @@ fn plan_screen_overlay_text(
             tex.id
         }
         _ => {
+            let old_upload = text_uploads.screen.as_ref().map(|(_, tex)| tex.id);
             let mut overlay = Texture {
                 width,
                 height,
@@ -2395,6 +2545,10 @@ fn plan_screen_overlay_text(
                 texture: uploaded.texture.clone(),
                 view: uploaded.view.clone(),
             });
+            // 逐字显示时每次 reveal 都换一整张视口纹理;旧上传必须释放。
+            if let Some(old_id) = old_upload {
+                gpu.remove(old_id, pipelines);
+            }
             text_uploads.screen = Some((signature, tex));
             id
         }
@@ -2551,10 +2705,14 @@ fn base_token(
         Some(TextureRef::Snapshot(copy_id)) => {
             fnv_mix(&mut hash, 3);
             fnv_mix(&mut hash, copy_id.0);
-            fnv_mix(
-                &mut hash,
-                targets.snapshot(*copy_id).map_or(0, |target| target.id),
-            );
+            // 零拷贝 UV 别名没有自己的纹理:身份取源纹理 id。缺了它,
+            // `sync_base` 每帧都会把别名内容判成「基面变了」并丢掉
+            // (屏幕上按钮整片消失,只在淡出合成里暴露)。
+            let snapshot_tex = targets
+                .snapshot(*copy_id)
+                .map(|target| target.id)
+                .or_else(|| targets.snapshot_content(*copy_id).map(|content| content.tex.id));
+            fnv_mix(&mut hash, snapshot_tex.unwrap_or(0));
         }
         Some(TextureRef::Offscreen(group)) => {
             fnv_mix(&mut hash, 4);

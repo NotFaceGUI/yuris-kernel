@@ -20,7 +20,7 @@ use yu_gfx::{
     SizeU32, TextureRef, TextureSampler, Viewport,
 };
 use yu_rt::input::{InputFrame, InputTimeline};
-use yu_rt::{BootConfig, Vm};
+use yu_rt::{BootConfig, HostClock, Vm};
 use yu_save::{SaveHost, SaveState};
 use yu_sound::{SoundHost, SoundLoader, SoundState};
 
@@ -1030,6 +1030,10 @@ impl Engine {
     pub fn tick(&mut self) -> CliResult<RenderedFrame> {
         let now_ms = (self.frame as u32).saturating_mul(self.opts.frame_ms());
         self.last_clock_drop_ms = 0;
+        // 确定性路径:脚本只看到固定 tick 时钟(用例/golden 可复现)。
+        if let Some(vm) = self.vm.as_mut() {
+            vm.set_live_clock(None);
+        }
         self.tick_inner(now_ms, 0)
     }
 
@@ -1058,6 +1062,12 @@ impl Engine {
                 self.clock.dropped_total_ms,
                 self.clock.dropped_frames
             );
+        }
+        // 命令时刻墙钟:以本 tick 的逻辑毫秒为底,查询时按真实流逝补足。
+        // 官方 `@_OS_TIME` 每次读 `GetTickCount`;淡出/补间用 `now - t0`,
+        // 不能把本 tick 内先跑完的装载/解构耗时算进下一次查询。
+        if let Some(vm) = self.vm.as_mut() {
+            vm.set_live_clock(Some(HostClock::new(now, now_ms)));
         }
         self.tick_inner(now_ms, delta_ms)
     }

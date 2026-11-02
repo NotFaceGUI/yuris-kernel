@@ -208,7 +208,22 @@ impl TextGpuRenderer {
         }
         let width = base.width;
         let height = base.height;
-        let target = surfaces.acquire(ctx, width, height, "text_gpu")?;
+        // 同一层文本逐字变化时复用上一张目标表面(encode 会先整面拷贝基面,
+        // 再写新字形);否则每显示一个字都 `acquire` 一张层尺寸纹理,
+        // 一局游戏累积数千张,render 从 ~1ms 涨到几十 ms。
+        let reused = self
+            .cache
+            .get(layer)
+            .filter(|entry| {
+                entry.target.width == width
+                    && entry.target.height == height
+                    && entry.target.id != base.id
+            })
+            .map(|entry| Rc::clone(&entry.target));
+        let target = match reused {
+            Some(target) => target,
+            None => surfaces.acquire(ctx, width, height, "text_gpu")?,
+        };
         // 同一字形(Arc 相同)只打包一次。
         let mut packed: BTreeMap<usize, u32> = BTreeMap::new();
         let mut pixels: Vec<u32> = Vec::new();

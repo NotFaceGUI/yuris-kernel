@@ -389,6 +389,37 @@ pub struct LabelTarget {
     pub base_a: u8,
 }
 
+/// 实时宿主的命令时刻墙钟锚点。
+///
+/// `base_ms` = 本 tick 开始时的逻辑毫秒(与 [`Vm::now_ms`] 的 tick 起点一致),
+/// `anchor` = 该逻辑时刻对应的宿主单调时刻。查询时返回
+/// `base_ms + (Instant::now() - anchor)`,使同一 tick 内执行的命令也能看到
+/// 真实流逝的毫秒(官方 `@_OS_TIME(1)` 每次调用 `GetTickCount`)。
+///
+/// 每 tick 由宿主重新锚定,因此上一 tick 解构/装载的耗时不会被算进淡出
+/// 的第一次 `now - t0`(这正是设定/存档淡出被跳过的根因);确定性路径
+/// (`Engine::tick`)不注入,保持固定步长。
+#[derive(Clone, Copy, Debug)]
+pub struct HostClock {
+    anchor: std::time::Instant,
+    base_ms: u32,
+}
+
+impl HostClock {
+    pub fn new(anchor: std::time::Instant, base_ms: u32) -> Self {
+        Self { anchor, base_ms }
+    }
+
+    /// 锚点以来的实时毫秒(饱和到 `u32`;锚点在未来时按 0 计)。
+    pub fn now_ms(&self) -> u32 {
+        let elapsed = std::time::Instant::now()
+            .saturating_duration_since(self.anchor)
+            .as_millis();
+        self.base_ms
+            .saturating_add(u32::try_from(elapsed).unwrap_or(u32::MAX))
+    }
+}
+
 pub struct Vm {
     src: Box<dyn yu_vfs::DataSource>,
     /// 编译器表回退源(工程根/SDK);脚本与其余表仍从 `src` 读。
@@ -424,6 +455,15 @@ pub struct Vm {
     script_errors: Vec<String>,
     frame: u64,
     now_ms: u32,
+    /// 实时路径的命令时刻墙钟(见 [`HostClock`])。
+    ///
+    /// 官方 `@_OS_TIME` 是每次查询即读 `GetTickCount`,同一条命令批里也会
+    /// 前进;`now_ms` 只是本 tick 的起始值,不能代表长脚本执行到某条命令时
+    /// 的真实时间(ERIS `es.CGFADEEXEC` 用 `@_OS_TIME` 的差值推进淡出,
+    /// 关闭设定/存档时 `SS.RETURN` 的解构在同一 tick 内先跑完,差值会把
+    /// 整段解构算进去 ⇒ 淡出一步跳完)。实时宿主在每 tick 起点注入锚点,
+    /// 查询时按 `anchor.elapsed()` 前进;headless `tick()` 保持确定性注入钟。
+    live_clock: Option<HostClock>,
     start_ms: u32,
     /// 宿主本地时间基准(`@_TIME`;`None` = 确定性注入时钟)。
     local_time: Option<HostLocalTime>,
@@ -692,6 +732,7 @@ impl Vm {
             script_errors: Vec::new(),
             frame: 0,
             now_ms: cfg.start_ms,
+            live_clock: None,
             start_ms: cfg.start_ms,
             local_time: cfg.local_time,
             frame_ms: cfg.frame_ms,
@@ -1071,6 +1112,16 @@ impl Vm {
     }
 
     pub fn now_ms(&self) -> u32 {
+        self.live_clock.map_or(self.now_ms, |clock| clock.now_ms())
+    }
+
+    /// 实时宿主注入命令时刻墙钟;`None` = 确定性 tick 起点(`Engine::tick`)。
+    pub fn set_live_clock(&mut self, clock: Option<HostClock>) {
+        self.live_clock = clock;
+    }
+
+    /// 本 tick 起点(确定性时钟值;诊断/调度比较用)。
+    pub fn tick_now_ms(&self) -> u32 {
         self.now_ms
     }
 
@@ -2509,5 +2560,16 @@ mod tests {
         assert_eq!(st.frames.len(), 1);
         assert_eq!(st.pc, 7);
         assert_eq!(st.script_id, 3);
+    }
+
+    #[test]
+    fn host_clock_advances_with_wall_time() {
+        let anchor = std::time::Instant::now() - std::time::Duration::from_millis(50);
+        let clock = HostClock::new(anchor, 1_000);
+        let now = clock.now_ms();
+        assert!(
+            (1_050..1_500).contains(&now),
+            "锚点应把 50ms 墙钟加到 base_ms 上,实际 {now}"
+        );
     }
 }

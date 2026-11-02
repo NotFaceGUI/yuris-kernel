@@ -437,13 +437,19 @@ impl WgpuRenderer {
         self.backbuffer = None;
         self.backbuffer_gpu = None;
         self.surfaces.reset();
-        self.text_uploads.clear();
+        for id in self.text_uploads.clear() {
+            self.gpu_textures.remove(id, &mut self.pipelines);
+        }
         if let Some(text_gpu) = &mut self.text_gpu {
             text_gpu.clear();
         }
         self.snapshot_registry.borrow_mut().clear();
         self.targets.clear_snapshots(&mut self.pipelines);
         self.targets.clear_offscreen(&mut self.pipelines);
+        // 重启 = 新运行代际:文本/回缓冲等临时上传与 bind group 全部作废。
+        // 资产纹理保留(只依赖游戏数据),避免重启后重新解码。
+        self.gpu_textures.clear_transient(&mut self.pipelines);
+        self.pipelines.clear_runtime_groups();
         self.readback = ReadbackCache::new();
     }
 

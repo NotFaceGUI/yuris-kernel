@@ -12427,3 +12427,28 @@ $ scenario_probe <project-eris> cases/symptom-enter-story.json
 diags: 仅 EMOTE(deferred);无 VARINFO/STRTYPE Unimplemented
 script_errors: []
 ```
+
+## 成果 DEBUG-FPS (2026-11-02) · render 调试窗新增真实 FPS 读数
+
+### 改动
+
+- `host-desktop/src/ui.rs::render_graph_window`:标题行新增 `xx FPS`
+  (数字加粗,与耗时同一套黄绿红分级 `≥55 / 30–55 / <30`)。
+- 同一绘图区**叠加 FPS 采样折线**(右轴 0–max(65, 窗口峰值),标注 1s 窗口):
+  `fps_samples` 与耗时曲线同容量滚动;青色 1.5px 细线、无面积填充,按步长
+  抽稀到最多 60 个采样点,末端用 4px 定位点标出最新样本;读数仍是逐帧真实值。
+- FPS 为**独立墙钟口径**:`App::note_frame_presented` 在 `queue.present`
+  成功后记时间戳,`fps_now` 统计最近 1 秒内实际呈现的帧数;不从引擎
+  tick/render 或帧间隔反算。停帧超过 1 秒,恢复后的首帧即显示 0,随后
+  按真实出帧数逐帧回升。
+- 冻结但不重绘的循环不计入(只认 present 成功)。
+
+### 验证(原始结果)
+
+```text
+$ cargo check -p yu-host-desktop --all-targets
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.50s
+```
+
+注:`cargo build --all-targets` 的 example 链接因 `scenario_probe.exe`
+正在运行、文件被占用(LNK1104)失败,非代码问题。

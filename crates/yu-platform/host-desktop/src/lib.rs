@@ -167,6 +167,10 @@ const TIMER_PERIOD_MS: u32 = 1;
 const WAIT_LEAD_US: u64 = 800;
 /// 逐帧统计保留上限(约 55 分钟@60fps)。
 const FRAME_STATS_CAP: usize = 200_000;
+/// FPS 统计窗口(墙钟):最近 1 秒内**实际呈现**的宿主帧数。
+const FPS_WINDOW: Duration = Duration::from_secs(1);
+/// 帧时间戳保留时长(窗口的 2 倍,给窗口过滤留余量)。
+const FPS_STAMP_KEEP: Duration = Duration::from_secs(2);
 /// 未结算输入事件上限(异常情况下也不无界增长)。
 const PENDING_INPUT_CAP: usize = 4096;
 /// 输入延迟样本上限(超出丢弃前一半)。
@@ -789,6 +793,10 @@ struct App {
     presented_dialogs: std::collections::BTreeSet<u64>,
     /// 渲染耗时曲线样本(`--debug-ui` 的独立窗口;每宿主帧一个)。
     render_samples: std::collections::VecDeque<f32>,
+    /// FPS 曲线样本(与 `render_samples` 同容量、同窗口,独立风格绘制)。
+    fps_samples: std::collections::VecDeque<f32>,
+    /// 宿主帧**呈现完成**的墙钟时间戳(FPS 独立统计;不依赖引擎读数)。
+    frame_stamps: std::collections::VecDeque<Instant>,
     /// 帧步进推进器(暂停/推进 N 帧/录制/抓取)。
     stepper: stepper::Stepper,
     /// `--step-to`:还要推进到的逻辑帧(`None` = 没有待办)。
@@ -927,6 +935,8 @@ impl App {
             dialog_inputs: Default::default(),
             presented_dialogs: Default::default(),
             render_samples: std::collections::VecDeque::with_capacity(ui::RENDER_GRAPH_SAMPLES),
+            fps_samples: std::collections::VecDeque::with_capacity(ui::RENDER_GRAPH_SAMPLES),
+            frame_stamps: std::collections::VecDeque::with_capacity(240),
             stepper: step,
             step_to,
         })
@@ -1314,6 +1324,7 @@ impl App {
                         self.diagnostics = DiagnosticsHost::default();
                         self.diagnostics.set_console(self.console.clone());
                         self.render_samples.clear();
+                        self.fps_samples.clear();
                         if let Some(freeze) = self.freeze.take() {
                             host_line!(
                                 "yu-desktop: restart 已恢复冻结运行(原 panic: {})",
@@ -1467,6 +1478,8 @@ impl App {
         for id in &free_ids {
             egui_renderer.free_texture(id);
         }
+        // 只有**真正呈现**的帧才计入 FPS(冻结但不重绘的循环不算出帧)。
+        self.note_frame_presented();
         if let Some(freeze) = self.freeze.as_mut() {
             freeze.drawn_frames = freeze.drawn_frames.saturating_add(1);
         }
@@ -1475,6 +1488,31 @@ impl App {
             self.stopping = true;
             event_loop.exit();
         }
+    }
+
+    /// 记录一次真实呈现并修剪过老的时间戳(FPS 滑动窗口)。
+    fn note_frame_presented(&mut self) {
+        let now = Instant::now();
+        self.frame_stamps.push_back(now);
+        let cutoff = now - FPS_STAMP_KEEP;
+        while self
+            .frame_stamps
+            .front()
+            .is_some_and(|stamp| *stamp < cutoff)
+        {
+            self.frame_stamps.pop_front();
+        }
+    }
+
+    /// 真实帧率:最近 1 秒墙钟内**实际呈现**的宿主帧数。
+    ///
+    /// 独立于引擎 tick/render 读数,也不由最近帧间隔反算:卡顿期间窗口里
+    /// 没有样本,恢复后的第一帧就显示 0,随后按实际出帧数逐帧回升。
+    /// (主循环被卡住时面板本身也无法重绘,停住的是最后绘制的读数;
+    /// 一旦恢复重绘,窗口过滤会立即把停滞的时长反映出来。)
+    fn fps_now(&self) -> f32 {
+        let cutoff = Instant::now() - FPS_WINDOW;
+        self.frame_stamps.iter().filter(|stamp| **stamp >= cutoff).count() as f32
     }
 
     /// 构造 F1 面板快照并交给 `ui::debug_window`。
@@ -1548,7 +1586,12 @@ impl App {
             stepper: stepper_ui,
         };
         let actions = ui::debug_window(ctx, &snapshot);
-        ui::render_graph_window(ctx, &self.render_samples);
+        ui::render_graph_window(
+            ctx,
+            &self.render_samples,
+            self.fps_now(),
+            &self.fps_samples,
+        );
         // 步进器面板:读数来自 `snapshot.stepper`,动作/编辑值在闭包外回写。
         let mut stepper_ui = snapshot.stepper;
         let stepper_actions = ui::stepper_window(ctx, &mut stepper_ui);
@@ -1906,6 +1949,12 @@ impl App {
         self.render_samples.push_back(render_ms as f32);
         while self.render_samples.len() > ui::RENDER_GRAPH_SAMPLES {
             self.render_samples.pop_front();
+        }
+        // FPS 曲线:同一滚动窗口;数值来自独立的 1 秒实际呈现统计。
+        let fps = self.fps_now();
+        self.fps_samples.push_back(fps);
+        while self.fps_samples.len() > ui::RENDER_GRAPH_SAMPLES {
+            self.fps_samples.pop_front();
         }
         self.frame_rows.push(FrameRow {
             host_frame,

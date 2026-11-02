@@ -30,11 +30,27 @@ const GRAPH_RED_MS: f32 = 16.7;
 const GRAPH_GREEN: Color32 = Color32::from_rgb(72, 190, 96);
 const GRAPH_YELLOW: Color32 = Color32::from_rgb(226, 184, 64);
 const GRAPH_RED: Color32 = Color32::from_rgb(226, 72, 64);
+/// FPS 叠加折线的固定色(与耗时曲线的黄绿红区分;右轴刻度)。
+const FPS_LINE: Color32 = Color32::from_rgb(96, 190, 255);
+
+/// FPS 分级阈值:≥55 绿、30–55 黄、<30 红(60fps 节拍下留抖动余量)。
+const FPS_GREEN: f32 = 55.0;
+const FPS_YELLOW: f32 = 30.0;
 
 fn graph_color(ms: f32) -> Color32 {
     if ms < GRAPH_GREEN_MS {
         GRAPH_GREEN
     } else if ms < GRAPH_RED_MS {
+        GRAPH_YELLOW
+    } else {
+        GRAPH_RED
+    }
+}
+
+fn fps_color(fps: f32) -> Color32 {
+    if fps >= FPS_GREEN {
+        GRAPH_GREEN
+    } else if fps >= FPS_YELLOW {
         GRAPH_YELLOW
     } else {
         GRAPH_RED
@@ -283,8 +299,14 @@ pub fn stepper_window(ctx: &egui::Context, stepper: &mut StepperUi) -> StepperAc
 ///
 /// 每个宿主帧一个样本,横轴按固定容量滚动、最新样本贴右边;线色按
 /// 当前样本耗时分级:绿 < 8ms、黄 < 16.7ms、红 ≥ 16.7ms。曲线下方
-/// 是同色到透明的渐变面积。
-pub fn render_graph_window(ctx: &egui::Context, samples: &std::collections::VecDeque<f32>) {
+/// 是同色到透明的渐变面积。标题行同时显示实测帧率(同色分级、加粗);
+/// FPS 折线叠加在同一绘图区,固定青色粗线 + 右轴刻度,与耗时曲线区分。
+pub fn render_graph_window(
+    ctx: &egui::Context,
+    samples: &std::collections::VecDeque<f32>,
+    fps: f32,
+    fps_samples: &std::collections::VecDeque<f32>,
+) {
     egui::Window::new("render time (ms)")
         .default_pos([470.0, 12.0])
         .default_width(430.0)
@@ -304,6 +326,18 @@ pub fn render_graph_window(ctx: &egui::Context, samples: &std::collections::VecD
                         .color(graph_color(last))
                         .strong(),
                 );
+                if fps > 0.0 {
+                    ui.label(
+                        RichText::new(format!("{fps:.0} FPS"))
+                            .color(fps_color(fps))
+                            .strong(),
+                    )
+                    .on_hover_text("最近 1 秒墙钟内实际呈现的宿主帧数");
+                } else {
+                    // 窗口内一帧都没呈现(启动首帧/卡顿恢复首帧):真实读数就是 0。
+                    ui.label(RichText::new("0 FPS").color(fps_color(fps)).strong())
+                        .on_hover_text("最近 1 秒墙钟内没有呈现任何帧");
+                }
                 ui.weak(format!(
                     "avg {avg:.2} · max {max:.2} · {} frames",
                     samples.len()
@@ -373,6 +407,46 @@ pub fn render_graph_window(ctx: &egui::Context, samples: &std::collections::VecD
                     graph_color(*last),
                 );
             }
+
+            // FPS 折线**叠加**在同一绘图区(右轴 0–fps_top):固定青色细线、
+            // 无面积填充;按采样步长抽稀成折线(数字仍是逐帧真实值),
+            // 末端用更大的定位点标出当前样本。
+            let fps_max = fps_samples.iter().copied().fold(0.0_f32, f32::max);
+            let fps_top = fps_max.max(65.0);
+            let fps_y = |value: f32| rect.bottom() - (value / fps_top) * rect.height();
+            // 采样大小:窗口内最多画 60 个点(与耗时曲线共用横轴,抽稀不改时间跨度)。
+            let fps_step = (fps_samples.len() / 60).max(1);
+            let mut prev: Option<egui::Pos2> = None;
+            for i in (0..fps_samples.len()).step_by(fps_step) {
+                let pos = egui::pos2(
+                    rect.right() - (fps_samples.len() - 1 - i) as f32 * dx,
+                    fps_y(fps_samples[i]),
+                );
+                if let Some(prev) = prev {
+                    painter.line_segment([prev, pos], egui::Stroke::new(1.5, FPS_LINE));
+                }
+                prev = Some(pos);
+            }
+            // 抽稀不会一定落在最后一帧上:补一段到最新样本。
+            let last_pos = fps_samples
+                .len()
+                .checked_sub(1)
+                .map(|i| egui::pos2(rect.right(), fps_y(fps_samples[i])));
+            if let (Some(prev), Some(last_pos)) = (prev, last_pos) {
+                if prev != last_pos {
+                    painter.line_segment([prev, last_pos], egui::Stroke::new(1.5, FPS_LINE));
+                }
+            }
+            if let Some(last) = fps_samples.back() {
+                painter.circle_filled(egui::pos2(rect.right(), fps_y(*last)), 4.0, FPS_LINE);
+            }
+            painter.text(
+                egui::pos2(rect.right() - 4.0, rect.top() + 2.0),
+                egui::Align2::RIGHT_TOP,
+                format!("0–{fps_top:.0} fps · 1s"),
+                egui::FontId::monospace(10.0),
+                FPS_LINE,
+            );
             painter.text(
                 egui::pos2(rect.left() + 4.0, rect.top() + 2.0),
                 egui::Align2::LEFT_TOP,
@@ -385,6 +459,7 @@ pub fn render_graph_window(ctx: &egui::Context, samples: &std::collections::VecD
                 ui.colored_label(GRAPH_GREEN, format!("< {GRAPH_GREEN_MS:.0} ms"));
                 ui.colored_label(GRAPH_YELLOW, format!("< {GRAPH_RED_MS:.1} ms"));
                 ui.colored_label(GRAPH_RED, format!("≥ {GRAPH_RED_MS:.1} ms"));
+                ui.colored_label(FPS_LINE, "fps (右轴 · 1s)");
             });
         });
 }

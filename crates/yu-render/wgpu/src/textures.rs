@@ -16,11 +16,11 @@ use bytemuck::Pod;
 use yu_render_core::TextureStore;
 use yu_gfx::{CopyId, LayerId};
 
-use crate::surfaces::TexRef;
+use crate::surfaces::{Content, TexRef};
 use yu_log::Diag;
 
 use crate::device::{code, GpuContext};
-use crate::pipelines::TARGET_FORMAT;
+use crate::pipelines::{PipelineCache, TARGET_FORMAT};
 
 /// 纹理身份必须跨“资产缓存”和“渲染目标缓存”唯一,否则 bind group 缓存
 /// 会用 `(id, filter)` 把两个不同的 view 混在一起。用进程级单调计数器
@@ -53,6 +53,8 @@ pub struct GpuTexture {
 pub struct TextureCache {
     textures: BTreeMap<u64, GpuTexture>,
     asset_ids: BTreeMap<Vec<u8>, u64>,
+    /// 资产纹理 id 集合(反向判定用;逐字符清理文本纹理时不能扫资产表)。
+    asset_texture_ids: std::collections::BTreeSet<u64>,
     solid_id: Option<u64>,
     /// 累计上传字节(解码后的 RGBA8 字节数,不含 wgpu 内部行填充)。
     pub total_upload_bytes: u64,
@@ -68,6 +70,7 @@ impl TextureCache {
         Self {
             textures: BTreeMap::new(),
             asset_ids: BTreeMap::new(),
+            asset_texture_ids: std::collections::BTreeSet::new(),
             solid_id: None,
             total_upload_bytes: 0,
             asset_upload_bytes: 0,
@@ -105,6 +108,7 @@ impl TextureCache {
         let uploaded = self.upload(ctx, width, height, &texture.rgba, "asset texture")?;
         let upload_us = started.elapsed().as_micros() as u64;
         self.asset_ids.insert(key.to_vec(), uploaded);
+        self.asset_texture_ids.insert(uploaded);
         self.asset_upload_bytes = self.asset_upload_bytes.saturating_add(bytes as u64);
         if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
             log::warn!(
@@ -199,6 +203,40 @@ impl TextureCache {
         Ok(id)
     }
 
+    /// 该纹理是否是长期缓存(资产或 1×1 黑图),不可被临时上传回收。
+    fn is_pinned(&self, id: u64) -> bool {
+        self.solid_id == Some(id) || self.asset_texture_ids.contains(&id)
+    }
+
+    /// 删除一张临时上传并作废引用它的 bind group。
+    ///
+    /// 纹理像素可能仍被 `LayerSurfaces` 的 `Rc<TexRef>` 持有(跨帧内容),
+    /// 这里只从缓存表摘除并释放 bind group,不会提前销毁正在使用的纹理。
+    pub fn remove(&mut self, id: u64, pipelines: &mut PipelineCache) {
+        if self.is_pinned(id) {
+            return;
+        }
+        if self.textures.remove(&id).is_some() {
+            pipelines.forget_texture(id);
+        }
+    }
+
+    /// 重启/回收:清掉所有非资产上传(文本覆盖、回缓冲、复制文字等)。
+    ///
+    /// 资产纹理与 1×1 黑图保留:它们只依赖游戏数据,重启后仍可复用。
+    pub fn clear_transient(&mut self, pipelines: &mut PipelineCache) {
+        let stale: Vec<u64> = self
+            .textures
+            .keys()
+            .filter(|id| !self.is_pinned(**id))
+            .copied()
+            .collect();
+        for id in stale {
+            if self.textures.remove(&id).is_some() {
+                pipelines.forget_texture(id);
+            }
+        }
+    }
 }
 
 impl Default for TextureCache {
@@ -230,6 +268,13 @@ pub struct TargetSet {
     /// 快照纹理:COPY 时刻冻结。**可以别名源内容纹理**(零拷贝;W3 第一态),
     /// 也可以是自己的一张区域拷贝。按 `CopyId` 跨帧复用。
     snapshots: BTreeMap<CopyId, std::rc::Rc<TexRef>>,
+    /// 区域截图的**零拷贝采样窗**(`TextureRef::Snapshot` 的 UV 别名)。
+    ///
+    /// ERIS 菜单构造一次做 260+ 个按钮状态 `COPY2` 切片;每个都新建一张
+    /// 小纹理(实测 ~86µs/张,构造帧 `image_us≈25ms`)。源内容不可变,切片
+    /// 可直接引用源纹理的 UV 子窗口,由图层绘制/文本烘焙按采样窗消费。
+    /// 与 `snapshots` 同生命周期(按 `CopyId` 剪枝)。
+    snapshot_contents: BTreeMap<CopyId, Content>,
     scale: Option<RenderTarget>,
 }
 
@@ -250,6 +295,7 @@ impl TargetSet {
             offscreen: BTreeMap::new(),
             composites: BTreeMap::new(),
             snapshots: BTreeMap::new(),
+            snapshot_contents: BTreeMap::new(),
             scale: None,
         }
     }
@@ -271,6 +317,16 @@ impl TargetSet {
         self.snapshots.get(&id)
     }
 
+    /// 零拷贝区域截图的采样窗(没有物化纹理时存在)。
+    pub fn snapshot_content(&self, id: CopyId) -> Option<&Content> {
+        self.snapshot_contents.get(&id)
+    }
+
+    /// 快照是否已冻结(物化纹理或 UV 别名都算)。
+    pub fn has_snapshot(&self, id: CopyId) -> bool {
+        self.snapshots.contains_key(&id) || self.snapshot_contents.contains_key(&id)
+    }
+
     /// 当前存活快照的句柄表(按需读回端口跨帧使用;只克隆 `Rc`)。
     pub(crate) fn snapshot_refs(&self) -> BTreeMap<CopyId, std::rc::Rc<TexRef>> {
         self.snapshots.clone()
@@ -280,6 +336,13 @@ impl TargetSet {
     /// 或本模块新建,这里只登记句柄。
     pub fn set_snapshot(&mut self, id: CopyId, tex: std::rc::Rc<TexRef>) {
         self.snapshots.insert(id, tex);
+        self.snapshot_contents.remove(&id);
+    }
+
+    /// 冻结一张零拷贝区域截图(源纹理 + UV 窗口)。
+    pub fn set_snapshot_content(&mut self, id: CopyId, content: Content) {
+        self.snapshot_contents.insert(id, content);
+        self.snapshots.remove(&id);
     }
 
     pub fn offscreen_count(&self) -> usize {
@@ -347,15 +410,18 @@ impl TargetSet {
         let stale: Vec<CopyId> = self
             .snapshots
             .keys()
+            .chain(self.snapshot_contents.keys())
             .filter(|id| !live.contains(id))
             .copied()
             .collect();
         for id in stale {
             if let Some(tex) = self.snapshots.remove(&id) {
-                if std::rc::Rc::strong_count(&tex) == 1 {
-                    pipelines.forget_texture(tex.id);
-                }
+                // bind group 可能仍持有 view;即使 `Rc` 还被层内容引用,
+                // 这里的快照登记已经失效,必须作废旧 group(需要时从
+                // `TexRef` 的 view 按需重建)。
+                pipelines.forget_texture(tex.id);
             }
+            self.snapshot_contents.remove(&id);
         }
     }
 
@@ -364,12 +430,11 @@ impl TargetSet {
     /// 引擎重启 = 新设备 ⇒ 快照不再有效;`CopyId` 在新 `GfxState` 里从头
     /// 分配,旧纹理若保留会与同 id 的新快照冲突。
     pub fn clear_snapshots(&mut self, pipelines: &mut crate::pipelines::PipelineCache) -> usize {
-        let removed = self.snapshots.len();
+        let removed = self.snapshots.len() + self.snapshot_contents.len();
         for (_, target) in std::mem::take(&mut self.snapshots) {
-            if std::rc::Rc::strong_count(&target) == 1 {
-                pipelines.forget_texture(target.id);
-            }
+            pipelines.forget_texture(target.id);
         }
+        self.snapshot_contents.clear();
         removed
     }
 

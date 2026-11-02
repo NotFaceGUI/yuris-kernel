@@ -146,6 +146,19 @@ fn run() -> Result<(), String> {
             ledger.closes += 1;
         }
         let rendered = engine.tick().map_err(|e| e.message)?;
+        if std::env::var("YU_PROBE_STATE").is_ok() && host_frame % 100 == 0 {
+            let p = engine.render_phases();
+            let g = engine.gfx_state().map(|g| (g.copies().len(), g.images().len()));
+            eprintln!(
+                "state host={host_frame} layers={} passes={} ops={} render={:.2} gfx={:?} phases={:?}",
+                rendered.report.layers,
+                rendered.report.passes,
+                rendered.report.ops,
+                rendered.report.render_ms,
+                g,
+                p
+            );
+        }
         let sha = yu_engine::sha::sha256_hex(&rendered.surface.rgba);
         let report = &rendered.report;
         ledger.observe(

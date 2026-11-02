@@ -348,6 +348,8 @@ pub struct ScreenSnapshot {
     pub snapshot_textures: std::collections::BTreeSet<crate::layer::CopyId>,
     /// 快照里出现过的图层 ID(加工链保活用)。
     pub layer_ids: std::collections::BTreeSet<LayerId>,
+    /// 采集时的屏幕契约指纹(同帧多次截图去重用;见 `GfxState`)。
+    pub contract_key: u64,
 }
 
 impl CompositorFrame {

@@ -1563,6 +1563,11 @@ impl PipelineCache {
         if self.paint_groups.contains_key(&key) {
             return Ok(());
         }
+        // 颜色是脚本给的,长会话可能组合出很多不同值;没有淘汰会永久累积
+        // uniform + bind group。超过上限整体清空(下一次绘制按需重建)。
+        if self.paint_groups.len() >= 512 {
+            self.paint_groups.clear();
+        }
         let uniform = wgpu::util::DeviceExt::create_buffer_init(
             &ctx.device,
             &wgpu::util::BufferInitDescriptor {
@@ -1627,6 +1632,17 @@ impl PipelineCache {
     pub fn forget_texture(&mut self, texture_id: u64) {
         self.bind_groups.retain(|(id, _), _| *id != texture_id);
         self.scale_groups.retain(|(id, _, _), _| *id != texture_id);
+    }
+
+    /// 重启时清空所有持有纹理 view / 颜色的运行时 bind group。
+    ///
+    /// 管线对象只依赖设备与着色器,保留;bind group 按需重建。不清空时,
+    /// 即使纹理缓存已释放,旧 `TextureView` 仍被 bind group 钉住,显存会
+    /// 随重启/换场景只增不减。
+    pub fn clear_runtime_groups(&mut self) {
+        self.bind_groups.clear();
+        self.scale_groups.clear();
+        self.paint_groups.clear();
     }
 }
 
