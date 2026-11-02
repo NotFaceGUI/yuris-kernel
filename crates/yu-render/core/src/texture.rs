@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use yu_gfx::{ImageFormat, TextureRef};
 use yu_log::{Boundary, Diag, Severity};
-use yu_vfs::{Codec, DataSource, LookupKey};
+use yu_vfs::{Codec, DataSource, EntryKind, LookupKey};
 
 /// `asset.*` 诊断码。
 pub mod code {
@@ -130,6 +130,11 @@ pub struct TextureStore {
     evicted: u64,
     /// 超预算且无可回收条目时只告警一次(回落到预算内后复位)。
     budget_warned: bool,
+    /// 编码不一致时的唯一同名回退(默认开;`YURIS_ASSET_NAME_FALLBACK=off`
+    /// 可关)。只影响“原始字节 miss 且 Unicode 唯一匹配”的情形。
+    name_fallback: bool,
+    /// 走了名称编码回退的解析次数(诊断)。
+    name_fallback_hits: u64,
 }
 
 impl TextureStore {
@@ -145,6 +150,8 @@ impl TextureStore {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(512);
+        let name_fallback = std::env::var("YURIS_ASSET_NAME_FALLBACK")
+            .map_or(true, |v| !matches!(v.trim(), "0" | "off" | "false"));
         Self {
             source,
             codec,
@@ -162,7 +169,20 @@ impl TextureStore {
             fresh: std::collections::BTreeSet::new(),
             evicted: 0,
             budget_warned: false,
+            name_fallback,
+            name_fallback_hits: 0,
         }
+    }
+
+    /// 开关名称编码回退(测试/宿主诊断)。
+    pub fn set_name_fallback(&mut self, enabled: bool) {
+        self.name_fallback = enabled;
+    }
+
+    /// 名称编码回退命中次数。
+    #[must_use]
+    pub fn name_fallback_hits(&self) -> u64 {
+        self.name_fallback_hits
     }
 
     /// 覆盖缓存预算(字节;0 = 不限制)。测试/宿主诊断用。
@@ -394,12 +414,104 @@ impl TextureStore {
         cached
     }
 
+    /// 编码不一致时的**唯一同名**回退:脚本 key 按本工程 codec 解码,
+    /// 目录内候选按本 codec 与另一 codec 各试一次;两边 Unicode 全名相等
+    /// (含扩展名)且只有一个候选时返回其真实字节路径,否则 `None`。
+    ///
+    /// 只用于原始字节 miss 之后;原始命中永远优先。歧义(两个不同字节名
+    /// 指向同一 Unicode)不猜,保持 `asset.missing`。
+    fn name_encoding_fallback(&self, candidate: &[u8]) -> Option<Vec<u8>> {
+        if candidate.iter().all(|b| *b < 0x80) {
+            return None;
+        }
+        let script = match self.codec {
+            Codec::Cp932 => yu_format::Codec::Cp932,
+            Codec::Gbk => yu_format::Codec::Gbk,
+        };
+        let other = match script {
+            yu_format::Codec::Cp932 => yu_format::Codec::Gbk,
+            yu_format::Codec::Gbk => yu_format::Codec::Cp932,
+        };
+        let (dir, name) = split_dir_name(candidate, self.codec);
+        let want = script.decode(name, name).ok()?;
+        let dir_key = LookupKey::new(dir, self.codec).ok()?;
+        let entries = self.source.list(&dir_key).ok()?;
+        let mut hit: Option<Vec<u8>> = None;
+        for entry in entries {
+            if entry.kind != EntryKind::File || entry.name == name {
+                continue;
+            }
+            let matched = [script, other].iter().any(|codec| {
+                codec
+                    .decode(&entry.name, &entry.name)
+                    .ok()
+                    .is_some_and(|text| text.eq_ignore_ascii_case(&want))
+            });
+            if matched {
+                if hit.is_some() {
+                    return None; // 歧义:宁可 miss 也不猜
+                }
+                hit = Some(entry.name.clone());
+            }
+        }
+        let entry = hit?;
+        let mut full = dir.to_vec();
+        full.extend_from_slice(&entry);
+        Some(full)
+    }
+
+    /// 诊断:同目录里是否存在**同一 Unicode 名、不同字节编码**的条目。
+    ///
+    /// 只拼进 `asset.missing` 的 detail,不改变查找结果。脚本字面量是
+    /// CP932;若 YPF/散盘在非日语区打包,文件名会按主机 ACP(GBK)落盘,
+    /// 两边 Unicode 相同、字节不同 —— 本地重打包/汉化后资源“消失”的
+    /// 典型形态。官方查找按原始字节哈希,同样不会命中。
+    fn encoding_mismatch_hint(&self, key: &[u8]) -> Option<String> {
+        if key.iter().all(|b| *b < 0x80) {
+            return None;
+        }
+        let script = match self.codec {
+            Codec::Cp932 => yu_format::Codec::Cp932,
+            Codec::Gbk => yu_format::Codec::Gbk,
+        };
+        let other = match script {
+            yu_format::Codec::Cp932 => yu_format::Codec::Gbk,
+            yu_format::Codec::Gbk => yu_format::Codec::Cp932,
+        };
+        let key_text = script.decode(key, key).ok()?;
+        let (dir, name) = split_dir_name(key, self.codec);
+        let name_text = script.decode(name, name).ok()?;
+        let name_stem = strip_image_ext(&name_text);
+        let dir_key = LookupKey::new(dir, self.codec).ok()?;
+        let entries = self.source.list(&dir_key).ok()?;
+        for entry in entries {
+            if entry.kind != EntryKind::File || entry.name == name {
+                continue;
+            }
+            for codec in [script, other] {
+                let Ok(text) = codec.decode(&entry.name, &entry.name) else {
+                    continue;
+                };
+                if strip_image_ext(&text).eq_ignore_ascii_case(name_stem) {
+                    return Some(format!(
+                        ";同名条目存在但编码不同: 脚本 {} `{}` ↔ 数据源 {} `{}`",
+                        script.as_str(),
+                        key_text,
+                        codec.as_str(),
+                        text
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     /// 读包内字节（不做图像解码）。返回 `(命中候选, 原始字节)`；失败时
     /// 返回可直接入缓存的 `Cached`（与 `load_inner` 同诊断）。
     fn read_source(&mut self, key: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Cached> {
         let candidates = self.candidates(key);
         for (candidate, format) in candidates {
-            let lookup = match LookupKey::new(&candidate, self.codec) {
+            let mut lookup = match LookupKey::new(&candidate, self.codec) {
                 Ok(lookup) => lookup,
                 Err(diag) => {
                     return Err(Cached {
@@ -416,19 +528,40 @@ impl TextureStore {
                     });
                 }
             };
+            let mut resolved = candidate.clone();
             if !self.source.exists(&lookup) {
-                continue;
+                if !self.name_fallback {
+                    continue;
+                }
+                let Some(actual) = self.name_encoding_fallback(&candidate) else {
+                    continue;
+                };
+                let Ok(actual_key) = LookupKey::new(&actual, self.codec) else {
+                    continue;
+                };
+                if !self.source.exists(&actual_key) {
+                    continue;
+                }
+                log::info!(
+                    target: "yu-render",
+                    "[asset] name-encoding fallback: {} -> {}",
+                    display_bytes(&candidate),
+                    display_bytes(&actual)
+                );
+                self.name_fallback_hits = self.name_fallback_hits.saturating_add(1);
+                resolved = actual;
+                lookup = actual_key;
             }
             if let Some(format) = format {
                 if format == ImageFormat::Psb || matches!(format, ImageFormat::Other(_)) {
                     return Err(Cached {
-                        resolved: Some(candidate.clone()),
+                        resolved: Some(resolved.clone()),
                         result: Err(unimplemented(
                             code::UNSUPPORTED,
                             key.to_vec(),
                             format!(
                                 "命中 {}:引擎格式码 {} 没有解码器",
-                                display_bytes(&candidate),
+                                display_bytes(&resolved),
                                 format.as_str()
                             ),
                         )),
@@ -439,26 +572,27 @@ impl TextureStore {
                 Ok(bytes) => bytes,
                 Err(diag) => {
                     return Err(Cached {
-                        resolved: Some(candidate.clone()),
+                        resolved: Some(resolved.clone()),
                         result: Err(Diag::recoverable(code::MISSING, Boundary::Data)
-                            .at_data(candidate.clone(), 0)
+                            .at_data(resolved.clone(), 0)
                             .with_detail(format!(
                                 "命中 {} 但读取失败: {}",
-                                display_bytes(&candidate),
+                                display_bytes(&resolved),
                                 diag.detail
                             ))),
                     });
                 }
             };
-            return Ok((candidate, bytes));
+            return Ok((resolved, bytes));
         }
         let tried = self.candidates(key).len();
+        let hint = self.encoding_mismatch_hint(key).unwrap_or_default();
         Err(Cached {
             resolved: None,
             result: Err(Diag::recoverable(code::MISSING, Boundary::Data)
                 .at_data(key.to_vec(), 0)
                 .with_detail(format!(
-                    "资产 {} 不存在;已尝试 {tried} 个候选",
+                    "资产 {} 不存在;已尝试 {tried} 个候选{hint}",
                     display_bytes(key)
                 ))),
         })
@@ -637,6 +771,28 @@ fn last_component(key: &[u8], codec: Codec) -> &[u8] {
         i += step;
     }
     &key[start..]
+}
+
+/// 按编解码器把路径劈成 `(父目录含尾部分隔符, 文件名)`。
+fn split_dir_name(key: &[u8], codec: Codec) -> (&[u8], &[u8]) {
+    let name = last_component(key, codec);
+    let dir_len = key.len() - name.len();
+    (&key[..dir_len], name)
+}
+
+/// 去掉已知图像扩展名(ASCII,大小写不敏感)。
+fn strip_image_ext(text: &str) -> &str {
+    const EXTS: [&str; 6] = [".png", ".bmp", ".jpg", ".jpeg", ".gif", ".psb"];
+    let bytes = text.as_bytes();
+    for ext in EXTS {
+        if bytes.len() > ext.len()
+            && bytes[bytes.len() - ext.len()..].eq_ignore_ascii_case(ext.as_bytes())
+        {
+            // 后缀首字节 `.` 是 ASCII ⇒ 切点在字符边界。
+            return &text[..bytes.len() - ext.len()];
+        }
+    }
+    text
 }
 
 /// 尾部 ASCII 后缀比较（大小写不敏感）。
@@ -900,6 +1056,60 @@ mod tests {
         assert_eq!(issues[0].key, b"nope");
         assert_eq!(issues[0].code, code::MISSING);
         assert!(issues[0].detail.contains("已尝试 2 个候选"));
+    }
+
+    /// 包内名字按主机 ACP(GBK)落盘、脚本字面量是 CP932 时,原始字节
+    /// miss 后按“同名 Unicode 唯一”回退到真实条目。
+    #[test]
+    fn resolves_same_name_in_other_encoding() {
+        // 包内: cgsys/x/tip_s_／.png(GBK: A3 AF)
+        // 脚本:cgsys/x/tip_s_／(CP932: 81 5E)
+        let mut store = store(
+            &[(b"cgsys/x/tip_s_\xa3\xaf.png", png_2x1())],
+            vec![ImageFormat::Png],
+        );
+        let tex = store.resolve(b"cgsys/x/tip_s_\x81\x5e").expect("回退命中");
+        assert_eq!(tex.width, 2);
+        assert_eq!(
+            store.resolved_path(b"cgsys/x/tip_s_\x81\x5e"),
+            Some(b"cgsys/x/tip_s_\xa3\xaf.png".as_slice())
+        );
+        assert_eq!(store.name_fallback_hits(), 1);
+    }
+
+    /// 关掉兼容回退(或出现歧义)时,`asset.missing` 必须把“同名异码”
+    /// 的条目指出来,便于当场识别坏包。
+    #[test]
+    fn missing_asset_reports_same_name_in_other_encoding_when_fallback_off() {
+        let mut store = store(
+            &[(b"cgsys/x/tip_s_\xa3\xaf.png", png_2x1())],
+            vec![ImageFormat::Png],
+        );
+        store.set_name_fallback(false);
+        let err = store
+            .resolve(b"cgsys/x/tip_s_\x81\x5e")
+            .expect_err("回退关闭时必须 miss");
+        assert_eq!(err.code, code::MISSING);
+        let detail = &store.issues()[0].detail;
+        assert!(
+            detail.contains("编码不同") && detail.contains("gbk"),
+            "detail 必须指出 GBK 同名条目: {detail}"
+        );
+    }
+
+    /// 原始字节命中优先:同名的 CP932/GBK 两条并存时,不得走回退。
+    #[test]
+    fn exact_bytes_win_over_encoding_fallback() {
+        let mut store = store(
+            &[
+                (b"cgsys/x/tip_s_\xa3\xaf.png", png_solid([1, 2, 3, 255])),
+                (b"cgsys/x/tip_s_\x81\x5e.png", png_solid([4, 5, 6, 255])),
+            ],
+            vec![ImageFormat::Png],
+        );
+        let tex = store.resolve(b"cgsys/x/tip_s_\x81\x5e").expect("exact");
+        assert_eq!(tex.pixel(0, 0), Some([4, 5, 6, 255]));
+        assert_eq!(store.name_fallback_hits(), 0);
     }
 
     #[test]

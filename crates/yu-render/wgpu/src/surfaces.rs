@@ -269,6 +269,41 @@ impl LayerSurfaces {
         self.layers.get(id).and_then(|state| state.content.as_ref())
     }
 
+    /// 已应用前缀里最后一条 `seq`(无状态 = `None`)。
+    ///
+    /// 帧首用于判断「上一帧留下的加工链是否越过本帧的消费命令点」:
+    /// 越过 ⇒ 常驻表面是**端点像素**,不能当中间前缀;该层本帧必须逐条
+    /// 重放以在 `contents` 里建出命令点像素。
+    pub fn last_applied_seq(&self, id: &LayerId) -> Option<u64> {
+        self.layers.get(id)?.applied.last().map(|(seq, _)| *seq)
+    }
+
+    /// 基面身份匹配、已应用过图像加工链、未烘文本,且最后一条加工在
+    /// `consumer_seq` **之前**的常驻像素。
+    ///
+    /// 供 COPY/图像加工的**源**读取:加工链命中缓存时本帧不会再写
+    /// `contents`,源像素只存在于这里(否则 MERGE2 会退回未加工的基图)。
+    /// `consumer_seq` 是消费命令的序号:上一帧遗留的加工链可能包含命令点
+    /// **之后**的项,不能拿来当该命令时刻的像素(此时返回 `None`,由调用方
+    /// 按命令时刻基图重放)。`raw.is_some()` 表示内容已烘进文本
+    /// (DIV-GFX-058):COPY 不带实时文本,不能把它当源。
+    pub fn applied_content_before(
+        &self,
+        id: &LayerId,
+        base: u64,
+        consumer_seq: u64,
+    ) -> Option<&Content> {
+        let state = self.layers.get(id)?;
+        if state.base != base || state.raw.is_some() {
+            return None;
+        }
+        let (last_seq, _) = *state.applied.last()?;
+        if last_seq >= consumer_seq {
+            return None;
+        }
+        state.content.as_ref()
+    }
+
     /// 该层是否已有“已应用前缀 + 物化内容”的状态。
     pub fn has_state(&self, id: &LayerId) -> bool {
         self.layers

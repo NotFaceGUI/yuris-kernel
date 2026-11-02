@@ -12,7 +12,7 @@
 |---|---|---|---|
 | DIV-RT-001 | 引擎 0.479/0.495 的 opcode 编号整体错位 | fixed | 运行核从不内置序号表;真实 0.495 语料 corpus 实测通过 |
 | DIV-RT-002 | 表达式类型提升/溢出/字符串↔数值细节 | open | 已按确定性规则实现,逐位未对齐 |
-| DIV-RT-003 | 整数除零/取模 0 | open | 引擎为硬件异常;内核 Fatal。P7 续已修现语料的真实根因(`op_math` 丢弃 LET 下标 ⇒ POW2 表全 0),S2/S3d/S4/S7 的 Fatal 全部消失;「官方 Fatal 策略」本身仍待 trace |
+| DIV-RT-003 | 整数除零/取模 0 | **fixed(2026-11-01)** | 证据推翻「硬件异常」旧结论:opcode 47/37 处理体对除数为 0 走显式分支 —— 整数写 0、浮点保持被除数、取模写 0(REA `expr_handlers.txt` `0x4294ec`/`0x4295a0`)。内核 `div`/`rem` 已按官方语义重写,不再产生 Fatal;CG 鉴赏空组(03/04)复验通过 |
 | DIV-RT-004 | 「实参缺席」的运算符缺右操作数形态 | fixed | 语料 20 窗口统计(19 掩码 + 1 真缺席);`expr.rs` 容忍一次;语料全量跑通 |
 | DIV-RT-005 | 脚本执行错误后的引擎继续策略 | open | 默认槽路径已取证(DIV-RT-043:报一次+让出,任务不终止);内核现行 = Unimplemented/Recoverable 挂号后继续、Fatal 结束+记录;官方其余错误路径仍无 trace |
 | DIV-RT-006 | 输入键码 `_CODE_*` / `_INP` / `_PAD` 的码值 | fixed | REA 证结构(VK 计数表)+ 手册不变量定值;`_KEYLAST/_MOUSELAST` 已另证(DIV-RT-033) |
@@ -29,7 +29,7 @@
 | DIV-RT-057 | Save/File 域事件在帧末才应用(`FILEACT[DELETE]` 晚于同帧 `SAVE[FILE]` 刷盘) | **fixed(2026-10-27)** | 根因:`Vm::emit` 只对 Graphics/Window/Sound 同步 `apply_event`,Save/File 仅入队,由 `Engine::tick` 帧末 `apply_events`;`es_SaveLoad.yst` 的存档流程是「pc315 先删旧槽 → pc341 `SAVE[FILE]` 同步刷盘」,延迟的删除落在刷盘之后,刚写出的存档被删,`SAVEEND` 再清预约 ⇒ 无文件、无报错。修法:统一为命令时刻同步(`Vm::emit` 对 `Domain::Save|File` 也调用 `apply_event`,Engine 帧末不再重复喂),与官方 `FILEACT` 就地执行一致。复核 `fixture::fileact_is_applied_before_save_file_flush_in_same_frame`;桌面复现 `save30002.sd` 25608 字节保留 |
 | DIV-RT-058 | 命令参数的复合赋值算子 `+=` / `-=` 被合并成加法 | **fixed(2026-10-27)** | 根因:窗口 `slot` 的高字节是算子(**1 = `+=`,2 = `-=`**),`eval_arg_windows` 只置 `offset = 高字节!=0`,gfx 一律按「当前值 + 增量」处理。`es_SaveLoad.yst:623 CG[ID=$id A-=8]` 因此变成 `A+=8`:全屏截图幕布 `CGS999` 的 alpha 从 256 一路加到 512(超出 0..256 不 clamp),32 帧淡出后仍是 256 全不透明 ⇒ 读档确认后逻辑帧继续推进、图层已切换,画面却永远停在读档界面(用户报「点击读档直接卡死」)。证据:`dump_pc_cmds 19` 的 `pc368 L623 CG … A~2(len4)=i8`(=`-=`);`dump_pc_cmds 66` 的 `pc5659 L8173 CG … X~1`(=`+=`)。修法:新增 `compose_window_arg`(`comp==2` 先取负,`offset=comp!=0`),单测 `window_ops_tests::plus_and_minus_operators_are_distinct`。复核:`CGS999` alpha 256→112→0;headless 与桌面 wgpu 读档后均回到游戏(宿主 `stuck="推进正常"`) |
 | DIV-RT-059 | `SAVE[ID]` / `LOAD[ID]` 图层缩略图长期 `Unimplemented`(DNO 3 缺失) | **fixed(2026-10-27)** | 块格式(官方 0.495 `save00001.sd` DNO=3,btype 1,ulen=31608):`[u32 1600][u32 30000][A 1600B][B 30000B]`;B = 100×75 RGBA 画面,A 的 w/h 在 `+0x78/+0x7c`(0.479 样本 A=1536、w/h 在 `+0x68/+0x6c`,读取端按 `lenB == w*h*4` 自证)。实现:`yu-save::image_block` 编解码 + `SaveHost::reserve_image/load_image`;`GraphicsHost::capture_layer/restore_layer`;`yu-engine::capture::GfxCapture`(离屏软渲,`observe` 在出现新 COPY 的帧与主渲染器同刻冻结快照;SAVE 时回放当前帧取目标层快照并按图层声明尺寸重采样;LOAD 时 PNG 写入 `SharedMem` 合成资产叠层并 `set_layer_asset`)。沿途修三条渲染语义:① COPY 表面尺寸 = 源/区域尺寸,不看目标层显示尺寸(soft+wgpu;否则 800×600 截图被裁成左上 100×75 全黑);② soft `MERGE/MERGE2` 必须先于区域解析(`X/Y` 是绘制偏移,原来 `MERGE2 X=0 Y=0` 被判 `region.partial` 整条跳过,缩略图合不进存档盘);③ VM `resolve_asset_size` 候选序与渲染器一致。复核:`yu-save` 14 通过(含官方 save00001 DNO3→100×75);fixture 98;存档 DNO3 `ulen=31608 / w=100 / h=75 / 24956 非零字节`;读档界面缩略图为真实游戏画面(headless soft/wgpu 与桌面 wgpu 截图)。限制:抓帧的 `:/W0/` 后缓冲与主渲染器同源;目标层无可序列化表面(空层/离屏组/未取证加工)时返回 `None` 并报 Unimplemented,不猜内容 |
-| DIV-RT-011 | 手册有页但语义未取证的命令(VARINFO SEARCH / VARACT INIT·G_* / F_* / ERROR) | open | 仅剩 VARINFO `STRTYPE/SJISCODE/UTF8CODE`(无手册例)、`VAR`/`CSVINFO`(无页/未取证,AU5 补录)与 `CDDA`(空桩,见 sound-ledger N0-10);SEARCH/INIT·G_*/RETURNCODE/WORD/F_*/PREP 已另证实现 |
+| DIV-RT-011 | 手册有页但语义未取证的命令(VARINFO SEARCH / VARACT INIT·G_* / F_* / ERROR) | open | 仅剩 `VARINFO[VAR]`(无页/无官方体)与 `CSVINFO`;`STRTYPE` 已按 REA 处理体实现,fixed(no-manual);`SJISCODE/UTF8CODE` 官方零引用 ⇒ 对齐 no-op(2026-11-01) |
 | DIV-RT-012 | `SAVE`/`LOAD` 的盘上存档格式 | fixed | `yu-format::yssd` 官方 5 文件 269 块逐字节 roundtrip;`yu-save` 宿主消费域事件(忠实写盘受 DIV-RT-042 门禁) |
 | DIV-RT-013 | `HANTOZEN`/`ZENTOHAN` 转换表 | fixed | 三张表已自 0.495 exe 取出落 `data/case-tables-0495.tsv`;算法逐条对照 REA |
 | DIV-RT-014 | `MATH[RND]` 的 MT19937 种子来源 | fixed | 种子 = `GetTickCount`(REA `0x461f98`),内核 `BootConfig::rng_seed` 注入(缺省 5489);`rng.rs` MT19937 |
@@ -185,6 +185,25 @@
   - 同判 S4 的 `es_number.yst:56` 除零:同为 MATH 填表消费行,随本修复一并
     恢复(待用户桌面复验)。取证工具:`yu-rt/examples/dump_var_int.rs`、
     `dump_label_cmds.rs`(标签反汇编 / `scan:<sid>` 全脚本命令扫描)。
+- **2026-11-01 收口(勘误:上一轮「官方 Fatal 策略」结论被反汇编推翻)**:
+  - 证据:`<side-repo>/workbench/analysis/expr_handlers.txt` opcode 47
+    (`0x004294ec`)/ opcode 37(`0x004295a0`)处理体:
+    - 整数:`mov ecx/edx = 除数低/高; or eax,edx; je 0x42954e` →
+      `xor eax,eax` 把**结果写 0**,不调用 `__alldiv`;
+    - 浮点:`fld 除数; fcom [0x58ecf8](0.0); je 出口` → 结果槽保持
+      **被除数**,不产生 ±Inf/NaN;
+    - 取模与除法同构(`je 0x429602` → 结果 0)。
+  - 结论:官方**不会**触发 #DE/Fatal;旧实现的 `rt.expr.div_zero` Fatal
+    是**内核误判**,不是对齐项。`crates/yu-rt/src/value.rs` 的 `div`/`rem`
+    已按上述语义重写(整数 0/0→0、浮点 x/0→x),删掉两条 Fatal 分支。
+  - 现场复验:`project-eris` CG 鉴赏点「キャラクター03/04」(该语料只定义
+    1/2 组,`@FlagMax=0`)不再崩溃;`es_cgmode.yst` pc1172
+    `INT[@VAL=@Num1*100/@Num2]` 得 0,画面显示 `0000/0000/000%`。
+  - 回归:`value::tests::string_concat_and_int_div_zero`、
+    `value::tests::float_div_zero_keeps_dividend`;`cargo test -p yu-rt`
+    全绿(含语料)。
+  - 状态:`fixed`(DIV-RT-003 不再是 open;错误码 `rt.expr.div_zero` 保留
+    给宿主/其他域使用,但表达式求值不再产生它)。
 
 ---
 
@@ -416,8 +435,26 @@
   (DIV-RT-043:静态命中全在 `global_f.yst` 声明段,600 帧运行期 0 次);
   `CSV`/`PLUG`/`ERRORINFO` = 官方「参数求值+返回 0」(`NoopEval`,
   REA `0x43e640`/`0x44bd10`/`0x46356c`);`ERROR` 启用表见 DIV-RT-046。
-  **仍挂号**:`VARINFO` 的 `STRTYPE/SJISCODE/UTF8CODE`(手册无例,引擎
-  §3.21 只证到分支地址)与 `VAR`(无页、无官方体)⇒ 本条保持 open。
+  **仍挂号**:`VAR`(无页、无官方体)、`CSVINFO`与 `CDDA`(空桩,见
+  sound-ledger N0-10);`STRTYPE/SJISCODE/UTF8CODE` 已按 2026-11-01 的 REA
+  结论收口(见下)。
+- **2026-11-01 收口(VARINFO STRTYPE / SJISCODE / UTF8CODE;fixed(no-manual))**:
+  - 处理体 `0x456050`(handler,0x770 字节);判定链 `2,3,4,...,13,14,20`。
+  - `STRTYPE` 分支 `0x4563b7`:取 SET 字符串**首字节**,查 CP932 类表
+    `0x5b40c0` 后 `+1` 得到字符字节宽;
+    - 宽 1(半角/ASCII)→ 向 LET 写 **1**;
+    - 宽 >1(lead byte,全角)→ 向 LET 写 **2**;
+    - 写入按 LET **当前类型**分派(INT→整数 / FLT→浮点,`0x4563e8` 起);
+    - 空串(首字节 0)→ 报错 `0x18c4a` 并返回 -1(`0x45674e`)。
+    语料自证:`ERIS/stdlib/ystdlib.yst:489` 的 `_strtype` 注释即
+    「1=半角 / 2=全角」,调用点 `es_Text.yst:941` 等。
+  - `SJISCODE`(槽 15)/`UTF8CODE`(槽 16):处理体 `0x456050..0x456ae4`
+    对标志数组 `0x68416f`/`0x684170` **零引用** ⇒ 官方空操作;只给它们时
+    不写 LET,与真实查询项并存时被忽略。内核按 `aligned-stub` 对齐并发
+    一条 Info 取证。
+  - 实现:`handlers.rs` `op_varinfo` + 目标类型转换;回归
+    `fixture::varinfo_strtype_reports_first_char_width`、
+    `fixture::varinfo_inert_sjiscode_is_noop`。
 
 ---
 

@@ -113,9 +113,17 @@ pub(crate) fn plan(
         }
     }
 
-    // 命令序结构核对:同一层的 op **序号前缀**必须与已应用前缀一致。
-    // 日志被折叠(`supersede_*`)或 `CG[FILE]` 重建时,表面反映的是旧序列,
-    // 不能从中间续接 ⇒ 回到基面重放(官方命令只执行一次,重放是幂等的)。
+    // 命令序结构核对 + 消费点采集(一次遍历):
+    //
+    // 1. 同一层的 op **序号前缀**必须与已应用前缀一致。日志被折叠
+    //    (`supersede_*`)或 `CG[FILE]` 重建时,表面反映的是旧序列,不能从
+    //    中间续接 ⇒ 回到基面重放(官方命令只执行一次,重放是幂等的)。
+    // 2. `first_read`:本帧第一次把某层当**源**读取的命令号(自读自不算)。
+    //    若上一帧的加工链越过了这个命令点,常驻表面是端点像素,不能当中间
+    //    前缀(否则槽位 1 的 MERGE2 会读到槽位 2 的滤镜结果 —— 缩略图全部
+    //    变成最后一张)。只有这类层本帧放弃缓存逐条重放,避免把立绘缩放等
+    //    「读源在所有加工之后」的链路整体退回逐帧重算。
+    let mut first_read: BTreeMap<LayerId, u64> = BTreeMap::new();
     {
         let mut chain_seqs: BTreeMap<LayerId, Vec<u64>> = BTreeMap::new();
         for pass in &frame.passes {
@@ -123,11 +131,33 @@ pub(crate) fn plan(
                 continue;
             };
             for op in &pass.ops {
-                if let Op::Image(image) = op {
-                    if op.status() == OpStatus::Executable {
+                if op.status() != OpStatus::Executable {
+                    continue;
+                }
+                match op {
+                    Op::Image(image) => {
                         let dest = image.target.as_ref().unwrap_or(&image.source);
-                        chain_seqs.entry(dest.clone()).or_default().push(image.seq);
+                        chain_seqs
+                            .entry(dest.clone())
+                            .or_default()
+                            .push(image.seq);
+                        if &image.source != dest {
+                            first_read.entry(image.source.clone()).or_insert(image.seq);
+                        }
+                        if let Some(source2) = &image.source2 {
+                            if source2 != dest {
+                                first_read.entry(source2.clone()).or_insert(image.seq);
+                            }
+                        }
                     }
+                    Op::Copy(copy) => {
+                        if let CopySource::Layer(id) = &copy.source {
+                            if id != &copy.dest {
+                                first_read.entry(id.clone()).or_insert(copy.seq);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -150,6 +180,15 @@ pub(crate) fn plan(
             }
         }
     }
+    let force_materialize: BTreeSet<LayerId> = first_read
+        .into_iter()
+        .filter(|(id, seq)| {
+            surfaces
+                .last_applied_seq(id)
+                .is_some_and(|last| last >= *seq)
+        })
+        .map(|(id, _)| id)
+        .collect();
 
     // ---- 1. 纹理 pass:严格命令序(COPY 与图像加工交错) ----
     let mark_ops = started.elapsed();
@@ -183,6 +222,7 @@ pub(crate) fn plan(
                         &mut writes,
                         &mut chain_index,
                         pass_target,
+                        force_materialize.contains(pass_target),
                         image,
                     );
                     match result {
@@ -484,13 +524,25 @@ fn apply_image(
     writes: &mut SurfaceWrites<'_>,
     chain_index: &mut BTreeMap<LayerId, usize>,
     pass_target: &LayerId,
+    force_materialize: bool,
     image: &ImageOp,
 ) -> Result<(), String> {
     let target = image.target.as_ref().unwrap_or(&image.source);
     if target != pass_target {
         return Err("gfx.imageop.target.mismatch".to_string());
     }
-    let token = base_token(frame, targets, target, None);
+    let token = base_token(
+        frame,
+        targets,
+        target,
+        // 原地加工且目标层已被 `CGEND` 删除:基面身份按命令时刻纹理算,
+        // 与重放时 `resolve_target_base` 的 fallback 保持一致。
+        if target == &image.source {
+            image.source_texture.as_ref()
+        } else {
+            None
+        },
+    );
     if surfaces.sync_base(target, token) {
         contents.remove(target);
         chain_index.insert(target.clone(), 0);
@@ -512,6 +564,7 @@ fn apply_image(
     let source = resolve_source(
         ctx, frame, textures, gpu, targets, surfaces, contents, bases, &image.source,
         image.source_texture.as_ref(),
+        image.seq,
         if image.action.is_scale() {
             "gfx.copy.source.missing"
         } else {
@@ -520,7 +573,7 @@ fn apply_image(
     )?;
     let source2 = match &image.source2 {
         Some(id) => Some(resolve_source(
-            ctx, frame, textures, gpu, targets, surfaces, contents, bases, id, None,
+            ctx, frame, textures, gpu, targets, surfaces, contents, bases, id, None, image.seq,
             "gfx.copy.source.gone",
         )?),
         None => None,
@@ -539,7 +592,7 @@ fn apply_image(
     };
     let signature = image_signature(image, source_hash, source2_hash);
     let index = *chain_index.entry(target.clone()).or_insert(0);
-    if surfaces.applied_at(target, index) == Some((image.seq, signature)) {
+    if !force_materialize && surfaces.applied_at(target, index) == Some((image.seq, signature)) {
         *chain_index.get_mut(target).expect("inserted above") += 1;
         surfaces.note_reused_layer();
         return Ok(());
@@ -562,6 +615,9 @@ fn apply_image(
 }
 
 /// 目标层的基面(像素动作的“下层”):组/空纹理按 soft 同一原因拒绝。
+///
+/// `fallback` 只在原地加工(源=目标)且目标层已被 `CGEND` 删除时使用:
+/// 官方命令到达时已写进层表面,删除不撤销;重放用命令时刻的基图。
 #[allow(clippy::too_many_arguments)]
 fn resolve_target_base(
     ctx: &GpuContext,
@@ -571,15 +627,33 @@ fn resolve_target_base(
     targets: &TargetSet,
     id: &LayerId,
     bases: &mut BTreeMap<(LayerId, u64), Rc<TexRef>>,
+    fallback: Option<&TextureRef>,
 ) -> Result<Content, String> {
-    let Some(layer) = frame.layers.iter().find(|layer| &layer.id == id) else {
-        return Err("gfx.imageop.target.unsupported".to_string());
-    };
-    if layer.is_group() {
-        return Err("gfx.imageop.target.group".to_string());
+    let layer = frame.layers.iter().find(|layer| &layer.id == id);
+    if let Some(layer) = layer {
+        if layer.is_group() {
+            return Err("gfx.imageop.target.group".to_string());
+        }
     }
-    match &layer.texture {
-        TextureRef::None => Err("gfx.imageop.texture.none".to_string()),
+    // 与 `resolve_source` 同一口径:活层纹理与命令时刻不一致时以命令时刻
+    // 为准;一致时沿用活层,让同帧加工链继续生效。
+    let live = layer
+        .map(|layer| &layer.texture)
+        .filter(|texture| !matches!(texture, TextureRef::None));
+    let texture = match (live, fallback) {
+        (Some(live), Some(fallback)) if *live != *fallback => fallback,
+        (Some(live), _) => live,
+        (None, Some(fallback)) => fallback,
+        (None, None) => {
+            return Err(if layer.is_some() {
+                "gfx.imageop.texture.none"
+            } else {
+                "gfx.imageop.target.unsupported"
+            }
+            .to_string())
+        }
+    };
+    match texture {
         TextureRef::Snapshot(copy_id) if targets.snapshot(*copy_id).is_none() => {
             Err("gfx.imageop.copy_source.unsupported".to_string())
         }
@@ -606,21 +680,38 @@ fn resolve_source(
     bases: &mut BTreeMap<(LayerId, u64), Rc<TexRef>>,
     id: &LayerId,
     fallback: Option<&TextureRef>,
+    consumer_seq: u64,
     missing: &'static str,
 ) -> Result<Content, String> {
     let layer = frame.layers.iter().find(|layer| &layer.id == id);
-    if layer.is_none() && fallback.is_some() {
-        // 源层已被本帧 `CGEND` 删除(`DIV-GFX-053`):常驻内容属于**上一个**
-        // 图层实例(`CG[FILE]` 每按钮重建模板后 COPY 再删),必须按命令时刻
-        // 记录的纹理引用重放,否则所有快照都会拿到最后一次的像素。
-    } else if let Some(content) = contents.get(id) {
-        return Ok(content.clone());
+    // 命令时刻的纹理与活层不一致(被 `CGEND` 删除,或被同名 `CG[X]`
+    // 重建成空层):官方 COPY 已经读走旧像素 ⇒ 必须按 fallback 重放。
+    let replaced = match (layer, fallback) {
+        (Some(layer), Some(fallback)) => layer.texture != *fallback,
+        _ => false,
+    };
+    if !replaced {
+        if let Some(content) = contents.get(id) {
+            return Ok(content.clone());
+        }
+        // 上一帧已应用的同一条加工链(seq+签名命中)不会重写本帧 `contents`,
+        // 但消费点位于整条链之后时,常驻表面就是命令时刻像素,从这里取回;
+        // 若加工链越过消费点,帧首的 `force_materialize` 会改为逐条重建,
+        // 这里的 `consumer_seq` 只是最后一道防线(DIV-GFX-053 的读侧)。
+        let base = base_token(frame, targets, id, fallback);
+        if let Some(content) = surfaces.applied_content_before(id, base, consumer_seq) {
+            return Ok(content.clone());
+        }
     }
-    let _ = surfaces;
-    let texture = match layer {
-        Some(layer) if !layer.is_group() => &layer.texture,
-        Some(_) => return Err("gfx.copy.source.group_unsupported".to_string()),
-        None => fallback.ok_or_else(|| missing.to_string())?,
+    let texture = match (layer, fallback) {
+        // 命令时刻纹理与活层不一致 ⇒ 用命令时刻的;组源保持原有拒绝。
+        (Some(layer), Some(fallback)) if !layer.is_group() && layer.texture != *fallback => {
+            fallback
+        }
+        (Some(layer), _) if !layer.is_group() => &layer.texture,
+        (Some(_), _) => return Err("gfx.copy.source.group_unsupported".to_string()),
+        (None, Some(fallback)) => fallback,
+        (None, None) => return Err(missing.to_string()),
     };
     let tex = resolve_ref(ctx, textures, gpu, targets, id, texture, bases)?;
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -766,6 +857,13 @@ fn apply_image_pixels(
     source: Content,
     source2: Option<Content>,
 ) -> Result<(), String> {
+    // 原地加工(源=目标)的目标层可能已被 `CGEND` 删除;官方命令到达时
+    // 已把结果写进层表面,删除不撤销 ⇒ 用命令时刻记录的基图重放。
+    let target_fallback = if target == &image.source {
+        image.source_texture.as_ref()
+    } else {
+        None
+    };
     let uses_region = image.action.is_scale()
         || image.action.is_resize()
         || matches!(
@@ -901,7 +999,7 @@ fn apply_image_pixels(
         // (见 `merge.wgsl` 头注)。
         let lower_content = match contents.get(target).cloned() {
             Some(content) => content,
-            None => resolve_target_base(ctx, frame, textures, gpu, targets, target, bases)?,
+            None => resolve_target_base(ctx, frame, textures, gpu, targets, target, bases, target_fallback)?,
         };
         let upper_content = materialize(ctx, pipelines, surfaces, writes, &source, "merge upper")?;
         let lower = materialize(ctx, pipelines, surfaces, writes, &lower_content, "merge lower")?;
@@ -974,7 +1072,7 @@ fn apply_image_pixels(
         };
         let current = match contents.get(target).cloned() {
             Some(content) => content,
-            None => resolve_target_base(ctx, frame, textures, gpu, targets, target, bases)?,
+            None => resolve_target_base(ctx, frame, textures, gpu, targets, target, bases, target_fallback)?,
         };
         let alpha_only = matches!(image.action, ImageAction::RectPaint2);
         let replaces = int_region.is_none() && !alpha_only;
@@ -1069,7 +1167,7 @@ fn apply_image_pixels(
     // ---------------- 其余:需要整块像素的原地动作 ----------------
     let current = match contents.get(target).cloned() {
         Some(content) => content,
-        None => resolve_target_base(ctx, frame, textures, gpu, targets, target, bases)?,
+        None => resolve_target_base(ctx, frame, textures, gpu, targets, target, bases, target_fallback)?,
     };
     // `DIFFUSION` 的 `SET/2 <= 0` 在官方只做一次整面 memcpy ⇒ 恒等;
     // 提前返回,连基面都不必物化。
@@ -1399,7 +1497,7 @@ fn apply_copy(
         CopySource::Layer(id) => {
             let content = resolve_source(
                 ctx, frame, textures, gpu, targets, surfaces, contents, bases, id,
-                copy.source_texture.as_ref(), "gfx.copy.source.gone",
+                copy.source_texture.as_ref(), copy.seq, "gfx.copy.source.gone",
             )?;
             if copy.texts.is_empty() {
                 content
@@ -1924,7 +2022,7 @@ fn apply_text(
             Some(content) => content,
             None => match resolve_source(
                 ctx, frame, textures, gpu, targets, surfaces, contents, bases, &id, None,
-                "gfx.copy.source.gone",
+                u64::MAX, "gfx.copy.source.gone",
             ) {
                 Ok(content) => content,
                 Err(reason) => {
@@ -2333,10 +2431,16 @@ fn base_token(
         &mut hash,
         layer.map_or(256, |layer| layer.alpha as u16 as u64),
     );
-    let texture = layer
+    // 活层纹理与命令时刻不一致(删除后重建/换图)⇒ 以命令时刻的为准;
+    // 否则沿用活层,让同帧加工结果(`chain_index`)继续链式生效。
+    let live = layer
         .map(|layer| &layer.texture)
-        .filter(|texture| !matches!(texture, TextureRef::None))
-        .or(fallback);
+        .filter(|texture| !matches!(texture, TextureRef::None));
+    let texture = match (live, fallback) {
+        (Some(live), Some(fallback)) if *live != *fallback => Some(fallback),
+        (Some(live), _) => Some(live),
+        (None, fallback) => fallback,
+    };
     match texture {
         Some(TextureRef::Asset(key)) => {
             fnv_mix(&mut hash, 1);

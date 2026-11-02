@@ -396,6 +396,31 @@ fn apply_image_op(
     if target != pass_target {
         return Err("gfx.imageop.target.mismatch".to_string());
     }
+    // 原地加工(源=目标)的目标层可能已被 `CGEND` 删除。官方在命令到达时
+    // 已把结果写进层表面,删除不撤销 ⇒ 重放时用命令时刻记录的基图。
+    let target_fallback = if target == &image.source {
+        image.source_texture.as_ref()
+    } else {
+        None
+    };
+    // 同一层 ID 在一帧内被 `CG[FILE]` 换图时(缩略图 `_TMP_OF` 逐槽复用),
+    // 上一槽的加工结果属于旧基图,必须丢弃后从新基图重算;否则三个缩略图
+    // 都会显示第一张 CG。
+    if target == &image.source {
+        if let Some(base) = &image.source_texture {
+            if st
+                .override_bases
+                .get(target)
+                .is_some_and(|prev| prev != base)
+            {
+                st.texture_overrides.remove(target);
+            }
+            st.override_bases.insert(target.clone(), base.clone());
+        }
+    } else {
+        // 非原地加工的结果是“派生面”,后续原地加工应当链式接上它。
+        st.override_bases.remove(target);
+    }
     // `MERGE/MERGE2/XOR/AND`:`ID`(上层)合成到 `ID2`(下层),结果写 `ID2`。
     //
     // `X/Y` 是**绘制偏移**(wgpu 侧 `push_quad` 直接用它),不是源区域 ——
@@ -411,7 +436,7 @@ fn apply_image_op(
         // 清空后是否可见取决于 alpha 的混合口径(见 `apply_merge` 的注释)。
         let mut lower = match st.texture_overrides.remove(target) {
             Some(t) => Rc::try_unwrap(t).unwrap_or_else(|rc| (*rc).clone()),
-            None => base_texture(textures, snapshots, frame, target)?,
+            None => base_texture(textures, snapshots, frame, target, target_fallback)?,
         };
         let upper = layer_surface(
             textures,
@@ -593,7 +618,7 @@ fn apply_image_op(
                     return Ok(());
                 }
             }
-            let mut texture = base_texture(textures, snapshots, frame, target)?;
+            let mut texture = base_texture(textures, snapshots, frame, target, target_fallback)?;
             match image.action {
                 ImageAction::Reverse => apply_reverse(&mut texture),
                 ImageAction::Vertical => apply_vertical(&mut texture),
@@ -638,7 +663,7 @@ fn apply_image_op(
     // (MERGE/MERGE2/XOR/AND 在函数入口已按绘制偏移处理,不会走到这里。)
     let mut texture = match st.texture_overrides.remove(target) {
         Some(texture) => Rc::try_unwrap(texture).unwrap_or_else(|rc| (*rc).clone()),
-        None => base_texture(textures, snapshots, frame, target)?,
+        None => base_texture(textures, snapshots, frame, target, target_fallback)?,
     };
     match image.action {
         ImageAction::RectPaint | ImageAction::RectPaint2 | ImageAction::RectPaint3 => {
@@ -907,8 +932,11 @@ fn compose_group(
 
 /// 图层源:当前基图(帧内加工副本优先)。
 ///
-/// 源层可能已被 `CGEND` 删除(`DIV-GFX-053`):此时回退到 `CopyOp` 在命令
-/// 时刻记录的 `source_texture` 重放。
+/// 源层可能已被 `CGEND` 删除(`DIV-GFX-053`),或者同名层被后续 `CG[X]`
+/// **重建**成空纹理(`_CGTMP999` 的预览链):两种情况下命令时刻的
+/// `source_texture` 才是官方 COPY 真正读到的像素。活层纹理与命令时刻
+/// 不一致(或被清空)时一律回退到它,否则快照会拿到 `None` 而整条
+/// `COPY2 → CGEND → MERGE` 链丢图(2026-11-01 CG 预览实测)。
 fn layer_surface(
     textures: &mut TextureStore,
     snapshots: &Snapshots,
@@ -917,19 +945,30 @@ fn layer_surface(
     st: &mut RenderState,
     fallback: Option<&TextureRef>,
 ) -> Result<Surface, String> {
+    let layer = frame.layers.iter().find(|layer| &layer.id == id);
+    // 活层被重建/换图 ⇒ 当前纹理不是命令时刻那一份,不能再用本帧加工
+    // 结果(那是新层的像素),直接按命令时刻基图重放。
+    let replaced = matches!(
+        (layer, fallback),
+        (Some(layer), Some(fallback)) if layer.texture != *fallback
+    );
     // 文本覆盖纹理不作为 COPY 源(DIV-GFX-058):快照面 = 基图(+图像加工)
     // + `copy.texts` 在命令时刻冻结的文本,不带帧末实时文本。
-    if let Some(texture) = st
-        .texture_overrides
-        .get(id)
-        .filter(|_| !st.text_override_ids.contains(id))
-    {
-        return Ok(Surface::from_texture(texture));
+    if !replaced {
+        if let Some(texture) = st
+            .texture_overrides
+            .get(id)
+            .filter(|_| !st.text_override_ids.contains(id))
+        {
+            return Ok(Surface::from_texture(texture));
+        }
     }
-    let layer = frame.layers.iter().find(|layer| &layer.id == id);
-    let texture = match layer {
-        Some(layer) => &layer.texture,
-        None => fallback.ok_or_else(|| "gfx.copy.source.gone".to_string())?,
+    let texture = match (layer, fallback) {
+        // 命令时刻纹理与活层不一致 ⇒ 用命令时刻的。
+        (Some(layer), Some(fallback)) if layer.texture != *fallback => fallback,
+        (Some(layer), _) => &layer.texture,
+        (None, Some(fallback)) => fallback,
+        (None, None) => return Err("gfx.copy.source.gone".to_string()),
     };
     match texture {
         TextureRef::Asset(key) => textures
@@ -947,16 +986,37 @@ fn layer_surface(
 }
 
 /// 取目标图层的基图副本(资产/1×1 黑/快照)。
+///
+/// `fallback` 只在**原地加工**(源=目标)且目标层已被 `CGEND` 删除时使用:
+/// 官方命令到达时已把结果写进层表面,删除不撤销;重放需要命令时刻记录的
+/// 基图(`ImageOp::source_texture`)。
 fn base_texture(
     textures: &mut TextureStore,
     snapshots: &Snapshots,
     frame: &CompositorFrame,
     target: &LayerId,
+    fallback: Option<&TextureRef>,
 ) -> Result<Texture, String> {
-    let Some(layer) = frame.layers.iter().find(|layer| &layer.id == target) else {
-        return Err("gfx.imageop.target.unsupported".to_string());
+    let layer = frame.layers.iter().find(|layer| &layer.id == target);
+    // 与 `layer_surface` 同一口径:活层纹理与命令时刻不一致时以命令时刻为准;
+    // 一致时沿用活层,让同帧加工结果继续链式生效。
+    let live = layer
+        .map(|layer| &layer.texture)
+        .filter(|texture| !matches!(texture, TextureRef::None));
+    let texture = match (live, fallback) {
+        (Some(live), Some(fallback)) if *live != *fallback => fallback,
+        (Some(live), _) => live,
+        (None, Some(fallback)) => fallback,
+        (None, None) => {
+            return Err(if layer.is_some() {
+                "gfx.imageop.texture.none"
+            } else {
+                "gfx.imageop.target.unsupported"
+            }
+            .to_string())
+        }
     };
-    match &layer.texture {
+    match texture {
         TextureRef::Asset(key) => textures
             .resolve(key)
             .map(|texture| Texture {
@@ -1502,6 +1562,10 @@ struct RenderState<'a> {
     diffusion_seed: &'a mut u32,
     /// 帧内图像加工后的图层纹理(基图副本);只影响本帧。
     texture_overrides: BTreeMap<LayerId, Rc<Texture>>,
+    /// `texture_overrides` 每一项对应的**命令时刻基图**。同一层 ID 在一帧内
+    /// 被 `CG[FILE]` 换成另一张图(缩略图 `_TMP_OF` 逐槽复用)时,旧加工结果
+    /// 不能接到新基图上 —— 否则所有缩略图都会变成第一张。
+    override_bases: BTreeMap<LayerId, TextureRef>,
     /// `texture_overrides` 中由文本合成产生的层(DIV-GFX-058):COPY 取源面
     /// 时必须跳过 —— 快照只携带命令时刻冻结的 `copy.texts`,不带帧末实时文本。
     text_override_ids: BTreeSet<LayerId>,
@@ -1526,6 +1590,7 @@ impl<'a> RenderState<'a> {
             offscreens: BTreeMap::new(),
             diffusion_seed,
             texture_overrides: BTreeMap::new(),
+            override_bases: BTreeMap::new(),
             text_override_ids: BTreeSet::new(),
             text_composed: BTreeSet::new(),
             skipped: BTreeMap::new(),

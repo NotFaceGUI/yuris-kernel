@@ -12309,3 +12309,121 @@ $ adb -s <phone> logcat -d | grep -E "yu-kernel|yu-android|status=running"
 - `render()` 的 `--no-render` 归因开关只在 Rust 侧(`RunConfig::render`),壳未接按钮;
   需要时用 `<游戏目录>/debug/run-config.json`。
 - 虚拟鼠标的"长按拖动灵敏度/边界回弹"未做(当前是直接钳制)。
+
+## 成果 CGMODE-FIX (2026-11-01) · CG 鉴赏 hover/预览链路修复 + 整数除零语义勘误
+
+### 目标与证据
+
+1. **hover 缩略图被底板盖住 / 普通缩略图没有明暗差**
+   - 脚本 `ES_CgMode.yst` REF:`_TMP_OF/_TMP_OV` 先 `COPY2`、再 `AKARUSA`
+     (96/128)、再 `MERGE2` 进 `BT.OFF/BT.OVER`,最后 `CGEND` 两个临时层。
+   - 官方命令到达即执行;内核把像素动作留到帧末。旧实现两处漏:
+     a) `prune_copy_log` / `frame()` 的存活快照闭包只跟 `copy_log`,
+        没跟 `image_log` 的 `source_texture` ⇒ `_TMP_OV` 的 COPY2 快照
+        被当成不可达删掉,MERGE2 报 `snapshot_missing`(hover 只剩底板);
+     b) `drop_ops_for` 在 `CGEND` 时把目标层已删的 AKARUSA 项整条丢弃
+        ⇒ 普通缩略图不再压暗 32(观感「没有 mask」)。
+   - 修法:`needed_snapshots` / `prune_copy_log` 纳入图像加工的源快照;
+     `drop_ops_for` 做反向依赖闭包(仍被后续 COPY/MERGE 读取的加工链保留);
+     soft/wgpu 的原地加工允许目标层已删时用 `source_texture` 重放;
+     soft 增加 `override_bases`,同层 ID 被 `CG[FILE]` 换图时丢弃旧加工结果。
+
+2. **点击 CG 预览闪一下后消失**
+   - 现场:预览链 `COPY2(_CGTMP999→_CGTMP1) → CGEND(_CGTMP999)`,随后
+     `VIEW.SCROLL` 的 `CG[... X=0]` 把同名层重建成空纹理;帧末重放 COPY2
+     时旧实现优先取「活层当前纹理 = None」⇒ `texture_none` 跳过,
+     `_CGTMP1` 永远拿不到快照。
+   - 修法:源层当前纹理与命令时刻的 `source_texture` 不一致(或为空)时,
+     以命令时刻纹理重放(soft `layer_surface` / wgpu `resolve_source`、
+     `base_token`)。列表截图 CGS2 的删除是脚本本意,不再误判。
+
+3. **点击「キャラクター03/04」崩溃 `rt.expr.div_zero`**
+   - `es_cgmode.yst` pc1172 `INT[@VAL=@Num1*100/@Num2]`;该语料只定义 1/2 组,
+     空组 `@FlagMax=0` ⇒ 0/0。官方 opcode 47(`0x004294ec`)/37(`0x004295a0`)
+     对除数为 0 走显式分支:**整数写 0、浮点保持被除数**,不是 x87 硬件异常。
+   - 修法:`Value::div/rem` 按官方语义重写;DIV-RT-003 状态改 fixed。
+     复验空组显示 `0000/0000/000%`,无 Fatal。
+
+4. **`tip_s_／` 等 5 条预载失败**
+   - 不是解码器 bug:包内这 5 个名字是按**主机 ACP(GBK)** 编码的
+     (`tip_\xa3\xaf` 等),脚本字面量是 CP932(`tip_\x81\x5e`)。
+   - 官方 `FUN_0040d828` 对查找名做原始字节 MurmurHash2 + `_mbsicmp`
+     比较,调用链上没有代码页转换;名字从表达式字符串字面量原样传入
+     (opcode 77 `0x42694c` 只做反斜杠转义)。因此**这份 GBK 名字的
+     `data.ypf` 在官方引擎里同样按字节匹配不上**。
+   - 官方能显示这些图,是因为官方 SDK 样本是**散盘** `data/`(Unicode
+     文件名);散盘路径由文件系统层按 CP932→UTF-16 访问。本仓库的
+     `DirSource` 已对齐并在 0.479 SDK 上验收:1424 文件、0 skipped、
+     `tip_再生時間.png` 可按 CP932 字节键读出(`yu-vfs` real_sample)。
+   - 结论:正常游戏(日语环境打包的 CP932/ASCII 名,或散盘 Unicode 名)
+     读取正确;本地在中文 ACP 下重打 YPF 才会把名字写成 GBK 而失配。
+   - 处置(兼容回退):`TextureStore` 在**原始字节命中优先**的前提下,
+     对非 ASCII key 做“同名 Unicode 唯一”回退 —— 脚本 key 按工程 codec
+     解码,目录内候选按本 codec 与另一 codec 各解一次,Unicode 全名相等
+     且只有一个候选才采用;歧义保持 miss。默认开启
+     (`YURIS_ASSET_NAME_FALLBACK=off` 可关),命中计入
+     `name_fallback_hits()`,不回写 YPF 索引、不改字节语义。
+   - 诊断保留:`asset.missing` 的 detail 会指出“同名条目存在但编码
+     不同”(脚本 cp932 ↔ 数据源 gbk),用于回退关闭/歧义场景。
+
+### 验证(原始结果)
+
+```text
+$ cargo test -p yu-rt -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu
+... 全部 test result: ok(新增 group::thumbnail_merge_chain_*、value::*)
+
+$ scenario_probe <project-eris> cgmode.json --shots 420,455,560 --backend soft
+frame 455：thumb01(=hover) 绿=254，thumb02/03=222（AKARUSA 96 → -32）
+frame 560/700：SHA eac0c62a… 稳定（CG 预览不再消失）
+skipped: 0；missing_assets: []（tip_s_／、鑑賞数、鑑賞率、／、％ 全部按
+GBK 同名条目回退加载，画面标签与斜杠可见）
+script_errors: []
+
+$ scenario_probe ... --backend wgpu
+frame 455 SHA 89a3b7ae…（与 soft 逐像素一致）；frame 560 eac0c62a…（同上）
+skipped: 0；missing_assets: []
+
+$ scenario_probe groups.json（点 03/04 空组）
+script_errors: []；diags 无 rt.expr.div_zero
+```
+
+## 成果 VARINFO-STRTYPE (2026-11-01) · STRTYPE 按官方处理体实现;SJISCODE/UTF8CODE 对齐空操作
+
+### 证据
+
+- `VARINFO` handler `0x456050`(0.495,`handlers.txt` opcode 101);
+  判定链 `2,3,4,...,13,14,20`。
+- `STRTYPE` 分支 `0x4563b7`:
+  - `0x44e018(SET 槽)` 取字符串;首字节为 0 → 报错 `0x18c4a`、返回 -1
+    (`0x45674e`);
+  - 首字节查 CP932 类表 `0x5b40c0` 后 `+1` 得字节宽;
+  - 宽 1 → 向 LET 写 1;宽 >1(lead byte)→ 写 2;写入按 LET 当前
+    类型分派(INT→整数 / FLT→浮点,`0x4563e8` 起)。
+  - 语料自证:`ERIS/stdlib/ystdlib.yst:489` `_strtype` 注释「1=半角/
+    2=全角」;调用点 `es_Text.yst:941` 等。
+- `SJISCODE`(15)/`UTF8CODE`(16):`0x456050..0x456ae4` 对
+  `0x68416f`/`0x684170` **零引用** ⇒ 官方惰性参数、空操作。
+
+### 改动
+
+- `crates/yu-rt/src/vm/handlers.rs::op_varinfo`:
+  - 新增 `STRTYPE`(空串 Fatal、非字符串 Fatal、lead byte→2/否则→1);
+  - `SJISCODE`/`UTF8CODE` 从查询项排除;只给它们时 `aligned-stub` 留痕并
+    不写 LET;
+  - VARINFO 整数结果按目标变量当前类型转 `Float`(对齐官方按 LET 类型写入)。
+- 回归:`fixture::varinfo_strtype_reports_first_char_width`(全角→2、半角→1、
+  FLT 目标→2.0)、`fixture::varinfo_inert_sjiscode_is_noop`(不报错、不改值、
+  有 aligned-stub)。
+
+### 验证(原始结果)
+
+```text
+$ cargo test -p yu-rt --test fixture varinfo_
+4 passed; 0 failed
+  varinfo_strtype_reports_first_char_width ... ok
+  varinfo_inert_sjiscode_is_noop ... ok
+
+$ scenario_probe <project-eris> cases/symptom-enter-story.json
+diags: 仅 EMOTE(deferred);无 VARINFO/STRTYPE Unimplemented
+script_errors: []
+```

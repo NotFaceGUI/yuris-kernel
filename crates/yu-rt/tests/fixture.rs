@@ -2171,6 +2171,161 @@ fn var_add_macro_chain_appends() {
     );
 }
 
+/// `VARINFO[STRTYPE]`:REA 0.495 handler `0x456050` 分支 `0x4563b7` ——
+/// 首字符的 CP932 字节宽度:单字节 = 1,lead byte = 2;空串报错。
+/// `ystdlib.yst:489` `_strtype` 的「1=半角/2=全角」注释与之一致。
+#[test]
+fn varinfo_strtype_reports_first_char_width() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        // $zen = "あ"(CP932 82 A0,双字节)
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b"\x82\xa0"),
+        },
+        // $han = "｡"(CP932 A1,半角片假名,单字节)
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b"\xa1"),
+        },
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys + 2,
+            value_type: 1,
+            dims: vec![4],
+            init: Init::Int(0),
+        },
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys + 3,
+            value_type: 1,
+            dims: vec![4],
+            init: Init::Int(0),
+        },
+        // FLT 目标:官方按 LET 当前类型写 2.0
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys + 4,
+            value_type: 2,
+            dims: vec![],
+            init: Init::Float(0.0),
+        },
+    ];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let zen = ex::r#ref(0x24, sys);
+    let han = ex::r#ref(0x24, sys + 1);
+    let r_zen = ex::r#ref(0x40, sys + 2);
+    let r_han = ex::r#ref(0x40, sys + 3);
+    let r_flt = ex::r#ref(0x40, sys + 4);
+    b.scripts = vec![vec![
+        GroupSpec::new(101)
+            .window(0, zen.clone())
+            .window(3, ex::i8_(1))
+            .window(1, ex::cat(&[r_zen, ex::i8_(0), ex::aload()])),
+        GroupSpec::new(101)
+            .window(0, han)
+            .window(3, ex::i8_(1))
+            .window(1, ex::cat(&[r_han, ex::i8_(0), ex::aload()])),
+        GroupSpec::new(101)
+            .window(0, zen)
+            .window(3, ex::i8_(1))
+            .window(1, r_flt),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 2), &[0])
+            .unwrap(),
+        Value::Int(2),
+        "全角首字符 → 2"
+    );
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 3), &[0])
+            .unwrap(),
+        Value::Int(1),
+        "半角首字符 → 1"
+    );
+    assert_eq!(
+        vm.store().read(VarRef::new(VarSpace::At, sys + 4), &[]).unwrap(),
+        Value::Float(2.0),
+        "FLT 目标按官方写 2.0"
+    );
+}
+
+/// `SJISCODE`/`UTF8CODE` 槽在官方 0.495 处理体里零引用 ⇒ 无操作。
+/// 只给它们时不得报 Unimplemented,也不得改 LET。
+#[test]
+fn varinfo_inert_sjiscode_is_noop() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b"yuu"),
+        },
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(7),
+        },
+    ];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(101)
+            .window(0, ex::r#ref(0x24, sys))
+            .window(15, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, sys + 1)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        vm.store().read(VarRef::new(VarSpace::At, sys + 1), &[]).unwrap(),
+        Value::Int(7),
+        "惰性槽不得改写 LET"
+    );
+    let stub = vm.events().iter().any(|e| {
+        matches!(
+            e,
+            yu_rt::VmEvent::Diag { code, .. } if code.to_string() == "rt.cmd.aligned_stub"
+        )
+    });
+    assert!(stub, "应留一条 aligned-stub 取证");
+}
+
 /// `VARINFO[SEARCH]` 的针值槽 / `NO=` 槽**必须按参数名解析**。
 ///
 /// 背景(2026-10-25,官方 v494 取证):`VARINFO` 的参数表随版本新增条目

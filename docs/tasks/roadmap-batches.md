@@ -132,7 +132,7 @@ fixed(现 Likely 项全部定论)。
 | TEXT[ID] 事件字节契约 | `VmEvent::Text.id → Vec<u8>`(跨 yu-trace/gfx) | DIV-GFX-021、H-P2-01 |
 | DIALOG 扩展参数族(STR2..8/A/E/CHECK*/FILEOPEN/FOLDER/CHECKBOX/SLIDER/NOWAIT) | `0x43fc74` + 手册 dialog.html(宿主框接 B7) | DIV-RT-044 残项归零 |
 | FILEINFO FOLDER/SIZE/RELATION | `0x44286c` | — |
-| VARINFO STRTYPE/SJISCODE/UTF8CODE | var getter 反汇编 | DIV-RT-011 余项 |
+| VARINFO STRTYPE/SJISCODE/UTF8CODE | `0x456050` handler;STRTYPE 分支 `0x4563b7` | ✅ fixed(no-manual):首字符字节宽 1/2;SJISCODE/UTF8CODE 官方零引用 → no-op(DIV-RT-011) |
 | `_CHR/_VARTYPE/_SYSTEM_FRAME/_SYSTEM_TIME` 族 + 系统变量写入语义 | `0x4276xx` getter 分发表(`_CHR` 静态 560) | DIV-RT-007 归零(no-manual) |
 | `_OS_TIME(0)`、`$_PROJECT_PATH` | REA 取值链 | DIV-RT-009/010 余项 |
 | ERROR 启用表消费者 | REA 定位读取点 | DIV-RT-046 |

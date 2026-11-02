@@ -563,10 +563,9 @@ impl GfxState {
         //
         // 可达性:
         // - 复制目标必须仍引用该快照(否则快照无人可见);
-        // - 或者该快照被**后续复制的 `source_texture`** 引用:中间层
-        //   (`sp.tmpA` 这类)在 `CGEND` 删除后,其快照仍是下一跳的源;
-        //   丢掉它会让下游 copy/image 报 snapshot.unsupported,立绘在
-        //   换表情/眨眼的帧闪一下(2026-10-26 β4 演出实测);
+        // - 或者该快照被**后续复制/图像加工的 `source_texture`** 引用:中间层
+        //   (`sp.tmpA`/`_TMP_OV` 这类)在 `CGEND` 删除后,其快照仍是下一跳
+        //   MERGE2 的源;丢掉它会让 hover 缩略图只剩底板(2026-11-01 实测);
         // - 源层仍存在 → 按层自合成;源层已被 `CGEND` 删除 → 用命令时刻
         //   记录的 `source_texture` 重放(`DIV-GFX-053`:ERIS 按钮快照的
         //   源 `BT.OFF.TMP` 在同一批命令末尾被删,官方复制已经完成)。
@@ -578,6 +577,10 @@ impl GfxState {
                 Some(TextureRef::Snapshot(id)) => Some(*id),
                 _ => None,
             })
+            .chain(self.image_log.iter().filter_map(|i| match &i.source_texture {
+                Some(TextureRef::Snapshot(id)) => Some(*id),
+                _ => None,
+            }))
             .collect();
         let mut texture_ops: Vec<(u64, Op)> = Vec::new();
         for c in &self.copy_log {
@@ -599,11 +602,18 @@ impl GfxState {
         }
         for i in &self.image_log {
             let source_live = self.nodes.contains_key(&i.source);
-            let target_live = i.target.as_ref().is_none_or(|t| self.nodes.contains_key(t));
+            let target = i.target.as_ref().unwrap_or(&i.source);
+            let target_live = self.nodes.contains_key(target);
             // 源层已被 `CGEND` 删除但命令时刻记了基图 ⇒ 仍可重放
             // (`ImageOp::source_texture`;`sp.tmpB` 的 MERGE 是真实用法)。
             let replayable = source_live || i.source_texture.is_some();
-            if replayable && target_live {
+            // 原地加工(源=目标)的目标层被 `CGEND` 删除,但加工链仍被后续
+            // MERGE2 当源读取:官方在命令到达时就已写进层表面,删除不会撤销。
+            // 只有 `source_texture` 能提供基面时才可重放;跨层 ID2 加工缺
+            // 目标基面快照,保持跳过(不猜)。
+            let in_place_replay =
+                !target_live && target == &i.source && i.source_texture.is_some();
+            if replayable && (target_live || in_place_replay) {
                 let mut op = i.clone();
                 if op.region_from_fixed {
                     // `FX/FY/FX2/FY2` 是「源坐标 − 位置小数部分」:
@@ -3193,16 +3203,57 @@ impl GfxState {
         // 为 `source_texture`(sprite 的 `sp.tmpA` 中转层),依赖闭包见
         // `prune_copy_log`。
         self.prune_copy_log(|c| removed.contains(&c.dest));
-        // 图像加工同理:只要目标还在,操作历史仍描述目标纹理。
-        self.image_log
-            .retain(|i| i.target.as_ref().is_none_or(|t| !removed.contains(t)));
+        if removed.is_empty() {
+            return;
+        }
+        // 图像加工:官方在命令到达时就把结果写进层表面,目标层随后被
+        // `CGEND` 删除**不会撤销**已产生的像素。因此只要还有后续项把它
+        // 当源读取(COPY 或 MERGE/MERGE2),这条加工链就要保留到帧末重放;
+        // 否则 CG 缩略图的 AKARUSA 明暗差会丢(hover 只剩底板,2026-11-01)。
+        let mut needed: BTreeSet<LayerId> = BTreeSet::new();
+        // 复制在命令时刻已取像素:源层若是被删层,它的加工前缀同样需要。
+        for copy in &self.copy_log {
+            if let CopySource::Layer(id) = &copy.source {
+                if removed.contains(id) {
+                    needed.insert(id.clone());
+                }
+            }
+        }
+        let mut keep = vec![true; self.image_log.len()];
+        for i in (0..self.image_log.len()).rev() {
+            let op = &self.image_log[i];
+            let target = op.target.as_ref().unwrap_or(&op.source).clone();
+            if removed.contains(&target) && !needed.contains(&target) {
+                keep[i] = false;
+                continue;
+            }
+            if removed.contains(&op.source) {
+                needed.insert(op.source.clone());
+            }
+        }
+        let mut index = 0usize;
+        self.image_log.retain(|_| {
+            let result = keep.get(index).copied().unwrap_or(true);
+            index += 1;
+            result
+        });
+        // 第二遍:此时 `image_log` 只剩真正会被重放的项,快照依赖闭包收紧
+        // 一步 —— 第一遍可能为「随后被丢弃的加工项」保留了生产者。两遍都是
+        // 保守的(只多留、不漏留),日志上限 `MAX_OP_LOG` 兜底。
+        self.prune_copy_log(|c| removed.contains(&c.dest));
     }
 
-    /// 删除满足 `remove` 的复制项,但保留仍被后续复制 `source_texture`
-    /// 引用的快照生产者(从新到旧扫描,建立依赖闭包)。
+    /// 删除满足 `remove` 的复制项,但保留仍被后续复制/图像加工
+    /// `source_texture` 引用的快照生产者(从新到旧扫描,建立依赖闭包)。
     fn prune_copy_log(&mut self, remove: impl Fn(&CopyOp) -> bool) {
         let mut keep = vec![true; self.copy_log.len()];
         let mut needed: BTreeSet<CopyId> = BTreeSet::new();
+        // 图像加工的源快照也是消费者(`_TMP_OV` → MERGE2)。
+        for image in &self.image_log {
+            if let Some(TextureRef::Snapshot(id)) = &image.source_texture {
+                needed.insert(*id);
+            }
+        }
         for i in (0..self.copy_log.len()).rev() {
             let copy = &self.copy_log[i];
             if remove(copy) && !needed.contains(&copy.id) {

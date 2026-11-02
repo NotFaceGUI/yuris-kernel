@@ -1436,6 +1436,11 @@ impl Vm {
         let mut target: Option<crate::expr::LValue> = None;
         let mut set: Option<crate::expr::LValue> = None;
         let mut op: Option<(u8, i64)> = None;
+        // 官方 0.495 处理体**不读** `SJISCODE`(15)/`UTF8CODE`(16) 槽
+        // (`0x456050..0x456ae4` 对 `0x68416f/0x684170` 零引用)。它们只是
+        // ysc 表里的惰性参数:若脚本只给它们,官方是什么都不做;和真实查询
+        // 项并存时被忽略。按 `aligned-stub` 对齐并留一条 Info。
+        let mut inert_stub: Option<&'static str> = None;
         // 全部数值槽(SEARCH 的针值与 `NO=` 起始下标要用)。
         let mut flags: Vec<(u8, i64)> = Vec::new();
         for w in &cmd.windows {
@@ -1453,10 +1458,18 @@ impl Vm {
                         // (`INT`/`FLT`/`STR` 是 SEARCH 的针值,`NO` 是起始
                         // 下标)。按名字排除,不按槽号区间 —— 后者的区间
                         // 在版本间会位移(`17..=20` 在 v494 上是错的)。
+                        let name = varinfo_names.get(usize::from(slot)).map(String::as_str);
                         let is_helper = matches!(
-                            varinfo_names.get(usize::from(slot)).map(String::as_str),
-                            Some("INT" | "FLT" | "STR" | "NO")
+                            name,
+                            Some("INT" | "FLT" | "STR" | "NO" | "SJISCODE" | "UTF8CODE")
                         );
+                        if n != 0 {
+                            match name {
+                                Some("SJISCODE") => inert_stub = Some("VARINFO.SJISCODE"),
+                                Some("UTF8CODE") => inert_stub = Some("VARINFO.UTF8CODE"),
+                                _ => {}
+                            }
+                        }
                         if op.is_none() && n != 0 && !is_helper {
                             op = Some((slot, n));
                         }
@@ -1464,13 +1477,26 @@ impl Vm {
                 }
             }
         }
-        let (slot, _) = op.ok_or_else(|| {
-            diag::fatal(
-                code::rt::CMD_SLOT,
-                Boundary::Script,
-                "VARINFO 无查询项(手册:至少给 TYPE/LENGTH/DIMNUM/DIMSIZE*)",
-            )
-        })?;
+        let (slot, _) = match op {
+            Some(op) => op,
+            None => {
+                if let Some(name) = inert_stub {
+                    self.report_aligned_stub(
+                        name,
+                        "VARINFO: 官方 0.495 处理体不读该槽(0x456050..0x456ae4 对 \
+                         0x68416f/0x684170 零引用),按无操作对齐(no-manual;REA)"
+                            .into(),
+                    );
+                    return Ok(StepOutcome::Continue);
+                }
+                return Err(diag::fatal(
+                    code::rt::CMD_SLOT,
+                    Boundary::Script,
+                    "VARINFO 无查询项(手册:至少给 TYPE/LENGTH/DIMNUM/DIMSIZE*)",
+                )
+                .into());
+            }
+        };
         let set = set.ok_or_else(|| {
             diag::fatal(
                 code::rt::CMD_SLOT,
@@ -1495,7 +1521,7 @@ impl Vm {
         // v494/0.495 之间就移过位),而参数名稳定;写死数字会让某一边
         // 静默落到错误分支。
         let query = varinfo_names.get(usize::from(slot)).map(String::as_str);
-        let result_val = match query {
+        let mut result_val = match query {
             Some("TYPE") => Value::Int(match shape.0 {
                 ElemType::Int => 1,
                 ElemType::Float => 2,
@@ -1546,6 +1572,48 @@ impl Vm {
                     }
                 }
             }
+            // `STRTYPE`:REA 0.495 `0x4563b7`(handler `0x456050`)——
+            // 取字符串**首字符**的 CP932 字节宽度:单字节(半角)→ 1,
+            // lead byte(全角)→ 2(处理体对 class+1 > 1 一律写 2)。
+            // 空串:首字节为 0 → 报错 `0x18c4a` 并返回 -1(`0x45674e`);
+            // 非字符串 → 同 LENGTH 报类型错误。`ystdlib.yst:489`
+            // `_strtype` 的注释与返回值(1=半角/2=全角)与此一致。
+            // 手册无页 ⇒ fixed(no-manual)。
+            Some("STRTYPE") => {
+                let idx: Vec<i64> = if set.indices.is_empty() {
+                    vec![0; shape.1.len()]
+                } else {
+                    set.indices.to_vec()
+                };
+                let v = self.read_var(st, set_var, &idx)?;
+                match v {
+                    Value::Str(bytes) if bytes.is_empty() => {
+                        return Err(diag::fatal(
+                            code::rt::VAR_TYPE,
+                            Boundary::Script,
+                            "VARINFO STRTYPE: 字符串为空(官方处理体首字节为 0 时报错 \
+                             0x18c4a 并返回 -1;REA 0x45674e)",
+                        )
+                        .into())
+                    }
+                    Value::Str(bytes) => Value::Int(if crate::cp932_text::is_lead(bytes[0]) {
+                        2
+                    } else {
+                        1
+                    }),
+                    other => {
+                        return Err(diag::fatal(
+                            code::rt::VAR_TYPE,
+                            Boundary::Script,
+                            format!(
+                                "VARINFO STRTYPE 需要字符串变量,得到 {}",
+                                other.type_name()
+                            ),
+                        )
+                        .into())
+                    }
+                }
+            }
             // `SEARCH`:手册 `variable/varinfo.html` 例 5/6/7 ——
             // 从 NO 号元素开始在一维数组里找第一个相等的元素,返回下标,
             // 找不到返回 -1。要搜索的值由 `INT=`/`FLT=`/`STR=` 参数给出。
@@ -1582,14 +1650,22 @@ impl Vm {
                     code::rt::CMD_UNIMPLEMENTED,
                     Boundary::Script,
                     format!(
-                        "VARINFO 参数 `{}`(槽 {slot})未实现\
-                         (STRTYPE/SJISCODE/UTF8CODE 无手册例;DIV-RT-011)",
+                        "VARINFO 参数 `{}`(槽 {slot})未实现(无手册页/无 REA 证据)",
                         other.unwrap_or("<不在工程 ysc 表>")
                     ),
                 )
                 .into())
             }
         };
+        // 官方 `STRTYPE` 分支按 **LET 当前类型**写回(0x4563e8:INT→整数、
+        // FLT→浮点);其余查询项走同一公共出口。内核 `Value` 是动态类型,
+        // 这里按目标变量当前类型把整数结果转成浮点,避免把 FLT 目标重标成
+        // INT(0.495 处理体逐分支核对)。
+        if let (Value::Int(n), Some(t)) = (&result_val, &target) {
+            if matches!(self.var_shape(t.var), Some((ElemType::Float, _))) {
+                result_val = Value::Float(*n as f64);
+            }
+        }
         if let Some(t) = target {
             self.write_target(st, &t, &result_val)?;
         }

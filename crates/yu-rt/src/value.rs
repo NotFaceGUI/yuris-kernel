@@ -235,40 +235,36 @@ impl Value {
         }
     }
 
-    /// `/`。整数除零:引擎为硬件异常(旁线 §3.9.2 记录 `0x46a590` 调用;
-    /// 旧线观测为进程级崩溃)。本内核按 **Fatal** 报错——不静默返回 0。
+    /// `/`。官方 opcode 47(`0x004294ec`)的除零分支**不是**硬件异常:
+    ///
+    /// - 整数:`or eax,edx; je 0x42954e` → `xor eax,eax` 把结果写 0,
+    ///   根本不调用 `__alldiv`(`expr_handlers.txt` opcode 47);
+    /// - 浮点:`fcom [0x58ecf8]; je 0x429589` 直接跳到出口,结果保持
+    ///   被除数不变(既不产生 ±Inf 也不产生 NaN)。
+    ///
+    /// 旧实现按 x87/CRT 硬件异常报 Fatal 是误判(DIV-RT-003 勘误,
+    /// 2026-11-01 依 REA 反汇编收口)。
     pub fn div(&self, rhs: &Value) -> Result<Value, yu_log::Diag> {
         match (self, rhs) {
-            (Value::Int(a), Value::Int(0)) => Err(diag::fatal(
-                code::rt::EXPR_DIV_ZERO,
-                Boundary::Script,
-                format!(
-                    "整数除以 0:被除数 {a},除数 0(引擎走 x87/CRT 硬件异常路径;内核按 Fatal 处理,DIV-RT-003)。操作数在 detail 内,便于定位上游变量"
-                ),
-            )),
+            (Value::Int(_), Value::Int(0)) => Ok(Value::Int(0)),
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_div(*b))),
             _ => match (self.as_f64(), rhs.as_f64()) {
-                // 官方浮点走 x87(除零异常默认掩蔽):x/0 = ±Inf(符号随
-                // 被除数)、0/0 = NaN(IEEE-754;DIV-RT-002 族)。曾错误地
-                // 返回 0.0,2026-10-23 勘误。
+                (Some(a), Some(0.0)) => Ok(Value::Float(a)),
                 (Some(a), Some(b)) => Ok(Value::Float(a / b)),
                 _ => Err(type_mix("/", self, rhs)),
             },
         }
     }
 
-    /// `%`。整数/0 同 `/`(Fatal);浮点用 `%` 运算(未取证舍入 → DIV-RT-003)。
+    /// `%`。opcode 37(`0x004295a0`)与 `/` 同构:整数除数为 0 时直接写 0
+    /// (`je 0x429602`);浮点模式直接跳到出口(保持被除数)。
     pub fn rem(&self, rhs: &Value) -> Result<Value, yu_log::Diag> {
         match (self, rhs) {
-            (Value::Int(a), Value::Int(0)) => Err(diag::fatal(
-                code::rt::EXPR_DIV_ZERO,
-                Boundary::Script,
-                format!("整数取模 0:被除数 {a},除数 0(同除零,DIV-RT-003)"),
-            )),
+            (Value::Int(_), Value::Int(0)) => Ok(Value::Int(0)),
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_rem(*b))),
             _ => match (self.as_f64(), rhs.as_f64()) {
-                (Some(a), Some(b)) if b != 0.0 => Ok(Value::Float(a % b)),
-                (Some(_), Some(_)) => Ok(Value::Float(f64::NAN)),
+                (Some(a), Some(0.0)) => Ok(Value::Float(a)),
+                (Some(a), Some(b)) => Ok(Value::Float(a % b)),
                 _ => Err(type_mix("%", self, rhs)),
             },
         }
@@ -893,15 +889,21 @@ mod tests {
     }
 
     #[test]
-    fn float_div_zero_follows_ieee754() {
-        // 官方浮点走 x87(除零异常默认掩蔽):x/0 = ±Inf、0/0 = NaN。
-        // 曾错误地返回 0.0(2026-10-23 勘误;DIV-RT-002 族)。
-        let inf = Value::Float(5.0).div(&Value::Float(0.0)).unwrap();
-        assert!(matches!(inf, Value::Float(x) if x.is_infinite() && x > 0.0));
-        let neg_inf = Value::Float(-5.0).div(&Value::Float(0.0)).unwrap();
-        assert!(matches!(neg_inf, Value::Float(x) if x.is_infinite() && x < 0.0));
-        let nan = Value::Float(0.0).div(&Value::Float(0.0)).unwrap();
-        assert!(matches!(nan, Value::Float(x) if x.is_nan()));
+    fn float_div_zero_keeps_dividend() {
+        // 官方 opcode 47 浮点分支:`fcom 0; je 出口` ⇒ 除数为 0 时结果槽
+        // 原样保留,即被除数(不是 IEEE 的 ±Inf/NaN;DIV-RT-003 勘误)。
+        assert_eq!(
+            Value::Float(5.0).div(&Value::Float(0.0)).unwrap(),
+            Value::Float(5.0)
+        );
+        assert_eq!(
+            Value::Float(-5.0).div(&Value::Float(0.0)).unwrap(),
+            Value::Float(-5.0)
+        );
+        assert_eq!(
+            Value::Float(0.0).div(&Value::Float(0.0)).unwrap(),
+            Value::Float(0.0)
+        );
     }
 
     #[test]
@@ -909,8 +911,15 @@ mod tests {
         let a = Value::Str(b"ABC".to_vec());
         let b = Value::Str(b".BMP".to_vec());
         assert_eq!(a.add(&b).unwrap(), Value::Str(b"ABC.BMP".to_vec()));
-        let d = Value::Int(1).div(&Value::Int(0)).unwrap_err();
-        assert_eq!(d.code.as_ref(), code::rt::EXPR_DIV_ZERO);
+        // 官方整数分支除数 0 → 结果写 0(`0x42954e`),不是 Fatal。
+        assert_eq!(
+            Value::Int(1).div(&Value::Int(0)).unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            Value::Int(7).rem(&Value::Int(0)).unwrap(),
+            Value::Int(0)
+        );
     }
 
     #[test]

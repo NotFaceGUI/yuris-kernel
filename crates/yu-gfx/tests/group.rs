@@ -2,6 +2,8 @@
 
 mod support;
 
+use std::collections::BTreeSet;
+
 use support::*;
 use yu_gfx::{
     CopyKind, CopyRegion, CopySource, CopyTiming, GfxState, LayerStatus, Op, OpStatus, PassTarget,
@@ -76,9 +78,126 @@ fn copy2_records_snapshot_and_texture_pass() {
     }
 }
 
+/// CG 缩略图链:`_TMP_OF`/`_TMP_OV` 在 MERGE2 之后被 `CGEND` 删除。
+///
+/// 官方命令立即执行,AKARUSA/COPY2 的结果已经进入 MERGE2 的输入;帧末重放
+/// 必须保留这些中间产物。槽位 2 复用同名 `_TMP_*` 时,槽位 1 的 COPY2 快照
+/// 仍被槽位 1 的 MERGE2 引用,不能被 `prune_copy_log` 删掉 —— 否则 hover
+/// 缩略图只剩底板(2026-11-01 实测)。
 #[test]
-fn copy_with_region_keeps_raw_bounds() {
+fn thumbnail_merge_chain_survives_cg_end_and_reused_tmp_layers() {
     let table = table();
+    let mut gfx = state();
+    let mut events = vec![
+        frame_start(1),
+        create(&table, "BT.OFF1", "plate", 10, 256),
+        create(&table, "BT.OVER1", "plate", 11, 256),
+        create(&table, "BT.OFF2", "plate", 12, 256),
+        create(&table, "BT.OVER2", "plate", 13, 256),
+    ];
+    for (thumb, off, over) in [
+        ("yuu_01", "BT.OFF1", "BT.OVER1"),
+        ("yuu_02", "BT.OFF2", "BT.OVER2"),
+    ] {
+        events.push(create(&table, "_TMP_OF", thumb, 1, 256));
+        events.push(create(&table, "_TMP_OV", "", 1, 256));
+        events.push(call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("_TMP_OF")),
+                arg(&table, "CGACT", "ID2", s("_TMP_OV")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ));
+        events.push(call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("_TMP_OF")),
+                arg(&table, "CGACT", "AKARUSA", i(1)),
+                arg(&table, "CGACT", "SET", i(96)),
+            ],
+        ));
+        events.push(call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("_TMP_OF")),
+                arg(&table, "CGACT", "ID2", s(off)),
+                arg(&table, "CGACT", "MERGE2", i(1)),
+            ],
+        ));
+        events.push(call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("_TMP_OV")),
+                arg(&table, "CGACT", "ID2", s(over)),
+                arg(&table, "CGACT", "MERGE2", i(1)),
+            ],
+        ));
+        events.push(call(
+            1,
+            "CGEND",
+            vec![arg(&table, "CGEND", "ID", s("_TMP_OF"))],
+        ));
+        events.push(call(
+            1,
+            "CGEND",
+            vec![arg(&table, "CGEND", "ID", s("_TMP_OV"))],
+        ));
+    }
+    events.push(frame_end(1));
+    gfx.consume_events(&events);
+    let f = gfx.frame();
+
+    let copies: BTreeSet<u64> = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .filter_map(|o| match o {
+            Op::Copy(c) => Some(c.id.0),
+            _ => None,
+        })
+        .collect();
+    let images: Vec<&yu_gfx::ImageOp> = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .filter_map(|o| match o {
+            Op::Image(i) => Some(i),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        images
+            .iter()
+            .filter(|i| i.action.name() == "akarusa")
+            .count(),
+        2,
+        "两个槽位的 AKARUSA 都必须保留({images:?})"
+    );
+    let merges: Vec<&yu_gfx::ImageOp> = images
+        .iter()
+        .copied()
+        .filter(|i| i.action.name() == "merge2")
+        .collect();
+    assert_eq!(merges.len(), 4, "每槽 OFF/OVER 各一条 MERGE2");
+    for merge in merges {
+        let Some(TextureRef::Snapshot(snap)) = &merge.source_texture else {
+            continue;
+        };
+        assert!(
+            copies.contains(&snap.0),
+            "MERGE2 引用的快照 {} 必须由帧内 COPY2 生产(实际 {copies:?})",
+            snap.0
+        );
+    }
+}
+
+#[test]
+fn copy_with_region_keeps_raw_bounds() {    let table = table();
     let mut gfx = state();
     gfx.consume_events(&[
         frame_start(1),

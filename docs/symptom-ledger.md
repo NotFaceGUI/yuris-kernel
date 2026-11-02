@@ -117,6 +117,11 @@ cargo test -p yu-host-desktop -p yu-platform-input   → 24 passed, 0 failed
   复验(P7 续 3)。本条假设链与 H-P1-07 的取证请求就此关闭。
 - 归类:引擎语义缺失/取证阻塞(官方 x87 整数除 0 行为未采集,DIV-RT-003)。
   **不在宿主层绕过。**
+- **2026-11-01 勘误**:官方 x87 除零行为已从处理体反汇编取证 —— opcode 47/37
+  对除数为 0 走显式分支(整数写 0、浮点保持被除数),**不是**硬件异常。
+  内核 `Value::div/rem` 已按该语义修正,不再返回 `rt.expr.div_zero`
+  (详见 `crates/yu-rt/docs/divergences/README.md` DIV-RT-003 末节)。本症状
+  (S2)的 POW2 根因修复仍然有效,两者不冲突。
 
 ### S3 本篇按钮(矩阵)
 
