@@ -634,3 +634,64 @@ fn swap_exchanges_layer_texts() {
         "{moved:?}"
     );
 }
+
+/// `COPY2 ID=:/W0/` 的快照必须取**命令时刻**的层状态:同一帧内先截屏
+/// (SRC 可见)、隐藏 SRC、再截屏(CGS1 里 SRC 不可见)。ERIS 的旧屏 →
+/// 隐藏 UI → 新屏交叉叠化依赖这个差异;取上一帧会让两张完全相同。
+#[test]
+fn main_group_screen_snapshot_uses_command_time_layer_state() {
+    let table = table();
+    let mut gfx = state();
+    let copy_from_screen = |table: &yu_gfx::ParamTable, to: &str| {
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(table, "CGACT", "ID", s(":/W0/")),
+                arg(table, "CGACT", "ID2", s(to)),
+                arg(table, "CGACT", "COPY2", i(1)),
+            ],
+        )
+    };
+    gfx.consume_events(&[
+        frame_start(1),
+        create(&table, "SRC", "src", 1, 256),
+        copy_from_screen(&table, "CGS100"),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SRC")),
+                arg(&table, "CG", "E", i(0)),
+            ],
+        ),
+        copy_from_screen(&table, "CGS1"),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let copy_id = |dest: &str| {
+        f.passes
+            .iter()
+            .flat_map(|pass| pass.ops.iter())
+            .find_map(|op| match op {
+                Op::Copy(copy) if copy.dest.display() == dest => Some(copy.id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{dest} copy"))
+    };
+    let visible_in = |dest: &str| {
+        let id = copy_id(dest);
+        let snapshot = f
+            .screen_snapshots
+            .get(&id)
+            .unwrap_or_else(|| panic!("{dest} screen snapshot"));
+        snapshot
+            .layers
+            .iter()
+            .find(|layer| layer.id.display() == ":/W0/SRC")
+            .unwrap_or_else(|| panic!("SRC in {dest}"))
+            .visible
+    };
+    assert!(visible_in(":/W0/CGS100"), "第一张截屏应在隐藏之前");
+    assert!(!visible_in(":/W0/CGS1"), "第二张截屏应在隐藏之后");
+}

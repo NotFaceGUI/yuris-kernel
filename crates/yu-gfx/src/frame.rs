@@ -320,6 +320,34 @@ pub struct CompositorFrame {
     pub text_revisions: BTreeMap<LayerId, u64>,
     /// 本帧诊断(按 `(code, command, detail)` 稳定排序)。
     pub diagnostics: Vec<FrameDiag>,
+    /// `COPY ID=:/W0/` 的**命令时刻**屏幕快照(按 `CopyId`)。
+    ///
+    /// 官方主窗口截屏读的是窗口画布在该命令执行时的内容:同帧先后两次
+    /// 截屏(`es.CGTSS` → 隐藏 UI → `es.CGSSS`)内容不同,后者是隐藏后的
+    /// 画面;`es.SS.FADE` 让前一张淡出,形成「旧屏 → 新屏」的交叉叠化。
+    /// 内核原先读上一呈现帧,两次截屏完全相同 ⇒ 淡出没有可见变化
+    /// (消去/菜单无法隐藏)。这里保存命令时刻的绘制契约,由后端合成。
+    pub screen_snapshots: BTreeMap<crate::layer::CopyId, std::sync::Arc<ScreenSnapshot>>,
+}
+
+/// 命令时刻的主窗口屏幕快照(见 `CompositorFrame::screen_snapshots`)。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScreenSnapshot {
+    /// 命令时刻的完整图层状态(含随后被 `CGEND` 删除的层)。
+    pub layers: Vec<Layer>,
+    /// 命令时刻的组离屏 pass + 最后的屏幕 pass。
+    pub passes: Vec<Pass>,
+    /// 命令时刻已烘焙的 `CGACT[TEXT]` 绘制项。
+    pub text_draws: Vec<TextDraw>,
+    /// 命令时刻的文本修订号(后端文本缓存键)。
+    pub text_revisions: BTreeMap<LayerId, u64>,
+    /// 命令时刻的自动文本层排版。
+    pub text_layout: Option<TextLayoutFrame>,
+    /// 快照 pass 里引用的快照纹理(采集时算好;帧构建每帧都要用它保住
+    /// 生产者复制项,避免逐帧扫全部 op)。
+    pub snapshot_textures: std::collections::BTreeSet<crate::layer::CopyId>,
+    /// 快照里出现过的图层 ID(加工链保活用)。
+    pub layer_ids: std::collections::BTreeSet<LayerId>,
 }
 
 impl CompositorFrame {
@@ -340,6 +368,7 @@ impl CompositorFrame {
             text_draws: Vec::new(),
             text_revisions: BTreeMap::new(),
             diagnostics: Vec::new(),
+            screen_snapshots: BTreeMap::new(),
         }
     }
 }

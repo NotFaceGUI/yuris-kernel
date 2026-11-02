@@ -22,7 +22,7 @@ use std::rc::Rc;
 
 use yu_gfx::{
     BlendMode, Clear, CompositorFrame, CopyOp, CopySource, ImageAction, ImageOp, LayerId,
-    Op, OpStatus, PassTarget, TextureRef,
+    Op, OpStatus, Pass, PassTarget, ScreenSnapshot, TextureRef,
 };
 use yu_log::Diag;
 use yu_render_core::{RenderPhases, RenderReport, Surface, Texture, TextureStore, TextComposer};
@@ -1548,9 +1548,22 @@ fn apply_copy(
                 .find(|w| w.number == 0)
                 .and_then(|w| w.layer_set.as_ref());
             if Some(group) == main_group {
-                backbuffer_content(
-                    ctx, frame, gpu, backbuffer, backbuffer_gpu, writes,
-                )?
+                // 主窗口截屏读**命令执行时**的画面(同帧两次截屏可以不同:
+                // CGTSS 旧屏 → 隐藏 UI → CGSSS 新屏)。gfx 记录了命令时刻
+                // 的绘制契约;没有快照时(首帧/旧帧)回退后缓冲。
+                if let Some(snapshot) = frame.screen_snapshots.get(&copy.id) {
+                    Content::identity(
+                        screen_snapshot_content(
+                            ctx, frame, snapshot, textures, gpu, pipelines, targets, surfaces,
+                            contents, bases, writes, text, copy.id,
+                        )?,
+                        0,
+                    )
+                } else {
+                    backbuffer_content(
+                        ctx, frame, gpu, backbuffer, backbuffer_gpu, writes,
+                    )?
+                }
             } else {
                 let tex = compose_group_content(
                     ctx, frame, textures, gpu, pipelines, targets, surfaces, contents, bases,
@@ -1701,6 +1714,94 @@ fn backbuffer_content(
 
 /// 组源的“当前内容”:按组 pass 现绘到一个离屏目标(EVID-T-12)。
 #[allow(clippy::too_many_arguments)]
+/// 合成命令时刻的主窗口屏幕快照(`COPY2 ID=:/W0/`)。
+///
+/// 快照自带命令时刻的图层表/组 pass/屏幕 pass;这里把它包成一个临时
+/// 离屏组合,走与普通组相同的 `compose_group_content` 路径(报告计数由
+/// 该函数回滚)。
+#[allow(clippy::too_many_arguments)]
+fn screen_snapshot_content(
+    ctx: &GpuContext,
+    frame: &CompositorFrame,
+    snapshot: &ScreenSnapshot,
+    textures: &mut TextureStore,
+    gpu: &mut TextureCache,
+    pipelines: &mut PipelineCache,
+    targets: &mut TargetSet,
+    surfaces: &mut LayerSurfaces,
+    contents: &mut Contents,
+    bases: &mut BTreeMap<(LayerId, u64), Rc<TexRef>>,
+    writes: &mut SurfaceWrites<'_>,
+    text: &mut TextComposer,
+    copy_id: yu_gfx::CopyId,
+) -> Result<Rc<TexRef>, String> {
+    let mut snap_frame = CompositorFrame::new(frame.frame, frame.viewport);
+    snap_frame.dx_mode = frame.dx_mode;
+    snap_frame.clear = frame.clear;
+    snap_frame.color_space = frame.color_space;
+    snap_frame.filter = frame.filter;
+    snap_frame.image_probe_order = frame.image_probe_order.clone();
+    snap_frame.layers = snapshot.layers.clone();
+    snap_frame.passes = snapshot.passes.clone();
+    snap_frame.text_draws = snapshot.text_draws.clone();
+    snap_frame.text_revisions = snapshot.text_revisions.clone();
+    snap_frame.text_layout = snapshot.text_layout.clone();
+    let screen_ops = snapshot
+        .passes
+        .iter()
+        .find(|pass| matches!(pass.target, PassTarget::Screen))
+        .map(|pass| pass.ops.clone())
+        .ok_or_else(|| "gfx.copy.screen_snapshot.pass_missing".to_string())?;
+    // 合成目标用内部 ID;不会与脚本图层冲突(路径以 `__` 开头且只在
+    // 本函数内使用)。
+    let synth = LayerId::new(format!("__screen_snapshot_{}", copy_id.0).into_bytes());
+    snap_frame.passes.push(Pass {
+        target: PassTarget::Offscreen(synth.clone()),
+        ops: screen_ops,
+        clear: None,
+    });
+    // 快照里的文本要按**命令时刻**的 `text_draws` 重新烘焙:实时
+    // `contents` 只含本帧最终状态;被弹窗盖住的背景按钮文字若在本帧
+    // 被隐藏(`apply_text` 跳过),快照会只剩按钮底图(字体空白)。
+    // 用独立的 contents/bases 副本,避免污染本帧的真实绘制。
+    let mut snap_contents = contents.clone();
+    let mut snap_bases = bases.clone();
+    {
+        let mut local = Accum::new(&snap_frame);
+        let mut uploads = TextUploads::default();
+        let mut no_gpu: Option<crate::text_gpu::TextGpuRenderer> = None;
+        let mut jobs = Vec::new();
+        apply_text(
+            ctx,
+            &snap_frame,
+            textures,
+            gpu,
+            surfaces,
+            &mut snap_contents,
+            &mut snap_bases,
+            &mut uploads,
+            text,
+            &mut local,
+            targets,
+            &mut no_gpu,
+            &mut jobs,
+        );
+    }
+    compose_group_content(
+        ctx,
+        &snap_frame,
+        textures,
+        gpu,
+        pipelines,
+        targets,
+        surfaces,
+        &mut snap_contents,
+        &mut snap_bases,
+        writes,
+        &synth,
+    )
+}
+
 fn compose_group_content(
     ctx: &GpuContext,
     frame: &CompositorFrame,

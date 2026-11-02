@@ -221,6 +221,23 @@ pub struct GfxState {
     /// 0 = 保留该字体)。未注入时 NUM=0/NAME=空串,脚本走「无字体可选」
     /// 路径(不再挂号;DIV-GFX-036 的宿主清单部分由此收口)。
     font_families: Vec<Vec<u8>>,
+    /// 主窗口 `COPY2 ID=:/W0/` 的**命令时刻**屏幕快照(后端合成用)。
+    ///
+    /// 与 `snapshot_sizes`/`snapshot_files` 同生命周期:只保留 `copy_log`
+    /// 里仍存在的复制项;复制结果在首帧冻结后不再重放,快照此后无副作用。
+    ///
+    /// `Arc`:快照在复制项存活期间每帧随 `CompositorFrame` 交给后端;直接
+    /// 克隆整套图层/pass 会让帧成本随场景复杂度线性增长(菜单打开越复杂
+    /// 越卡)。快照内容在采集后不可变,共享句柄即可。
+    screen_snapshots: BTreeMap<CopyId, std::sync::Arc<crate::frame::ScreenSnapshot>>,
+    /// 本帧主窗口截图(`COPY2 ID=:/W0/`)的序号(FrameStart 清零)。
+    ///
+    /// 第一张截图取**上一呈现帧**(官方 COPY 读后缓冲;`SS.GO`/`SS.GOSUB`
+    /// 的第一个 `CGTSS` 就是玩家当前看到的画面,命令时刻同帧的隐藏命令
+    /// 不应进这张旧屏);同帧后续截图(隐藏 UI 后的 `CGSSS`/`CGSCOPY`)
+    /// 才重建命令时刻画面。这样交叉叠化的旧屏侧不需要额外合成,打开
+    /// 复杂场景时少一次整屏 pass。
+    screen_copies_frame: u32,
     /// `COPY/COPY2` 生成的快照纹理尺寸(创建时从源层继承)。
     snapshot_sizes: BTreeMap<CopyId, SizeU32>,
     /// 快照对应的源资产键(`CGINFO[MFILE]` 透传)。
@@ -322,6 +339,8 @@ impl GfxState {
             windows,
             asset_sizes: BTreeMap::new(),
             font_families: Vec::new(),
+            screen_snapshots: BTreeMap::new(),
+            screen_copies_frame: 0,
             snapshot_sizes: BTreeMap::new(),
             snapshot_files: BTreeMap::new(),
             preload_pending: BTreeSet::new(),
@@ -502,6 +521,8 @@ impl GfxState {
                 // 表面,画一次即常驻);`FrameStart` 不再清空。
                 // 诊断是“本帧”诊断:每帧清空,防止跨帧无界增长。
                 self.diags.clear();
+                // 主窗口截图序号:第一张 = 上一呈现帧,后续 = 命令时刻。
+                self.screen_copies_frame = 0;
                 // 复制/图像操作是**状态生产**(快照/纹理修改),不是逐帧易失;
                 // 保留日志,frame() 只输出仍被现存图层引用的项。
             }
@@ -581,6 +602,7 @@ impl GfxState {
                 Some(TextureRef::Snapshot(id)) => Some(*id),
                 _ => None,
             }))
+            .chain(self.snapshot_texture_ids())
             .collect();
         let mut texture_ops: Vec<(u64, Op)> = Vec::new();
         for c in &self.copy_log {
@@ -717,8 +739,17 @@ impl GfxState {
                 frame: b.frame,
             })
             .collect();
-        // 自动文本层的排版:只接受 `_TEXT_FLAG` 一手证据;缺失 ⇒ 不产出。
-        f.text_layout = self.text_layers.iter().find_map(|(id, b)| {
+        f.text_layout = self.text_layout_now();
+        f.text_draws = self.text_draws_now();
+        f.text_revisions = self.text_revisions_now();
+        f.diagnostics = self.diags.values().cloned().collect();
+        f.screen_snapshots = self.screen_snapshots.clone();
+        f
+    }
+
+    /// 自动文本层的排版:只接受 `_TEXT_FLAG` 一手证据;缺失 ⇒ 不产出。
+    fn text_layout_now(&self) -> Option<TextLayoutFrame> {
+        self.text_layers.iter().find_map(|(id, b)| {
             if b.bytes.is_empty() {
                 return None;
             }
@@ -742,22 +773,106 @@ impl GfxState {
                 glyphs,
                 flags_source: TextFlagsSource::TextFlag,
             })
-        });
-        // `CGACT[TEXT]` 绘制项(按目标层 ID 稳定排序;层内保持命令序;
-        // 跨帧持久,DIV-GFX-058)。
-        f.text_draws = self
-            .text_draws
+        })
+    }
+
+    /// `CGACT[TEXT]` 绘制项(按目标层 ID 稳定排序;层内保持命令序)。
+    fn text_draws_now(&self) -> Vec<crate::text::TextDraw> {
+        self.text_draws
             .values()
             .flat_map(|t| t.draws.iter().cloned())
-            .collect();
-        // 每层文本修订号(后端合成缓存键;内容不变不重烤)。
-        f.text_revisions = self
-            .text_draws
+            .collect()
+    }
+
+    /// 每层文本修订号(后端合成缓存键;内容不变不重烤)。
+    fn text_revisions_now(&self) -> BTreeMap<LayerId, u64> {
+        self.text_draws
             .iter()
             .map(|(id, t)| (id.clone(), t.revision))
-            .collect();
-        f.diagnostics = self.diags.values().cloned().collect();
-        f
+            .collect()
+    }
+
+    /// 命令时刻的主窗口屏幕快照(`COPY2 ID=:/W0/` 用)。
+    ///
+    /// 与 [`GfxState::frame`] 的最终帧同构:组离屏 pass(命令时刻状态)+
+    /// 屏幕 pass;图层表也取命令时刻(含随后被 `CGEND` 删除的层)。后端
+    /// 用它在复制命令处重放「当时的画面」,同帧两次截屏因此可以不同
+    /// (ERIS 的旧屏 → 隐藏后画面交叉叠化)。
+    fn capture_screen_snapshot(&self) -> std::sync::Arc<crate::frame::ScreenSnapshot> {
+        let mut passes = Vec::new();
+        let mut emitted_groups = BTreeSet::new();
+        self.build_group_passes(&mut passes, &mut emitted_groups);
+        let mut screen_ops = Vec::new();
+        if self.windows.get(&0).is_none_or(|w| w.visible) {
+            let main = self
+                .windows
+                .get(&0)
+                .and_then(|w| w.layer_set.clone())
+                .unwrap_or_else(|| self.config.main_layer_set.clone());
+            if self.nodes.get(&main).is_some_and(|n| n.layer.is_group()) {
+                self.emit_children_ops(&main, &mut screen_ops, &emitted_groups);
+            } else {
+                let produced = self.surface_producers();
+                self.emit_node_ops(&main, &mut screen_ops, &emitted_groups, &produced);
+            }
+        }
+        passes.push(Pass {
+            target: PassTarget::Screen,
+            ops: screen_ops,
+            clear: Some(self.config.clear),
+        });
+        let mut layers: Vec<Layer> = self.nodes.values().map(|n| n.layer.clone()).collect();
+        layers.sort_by(|a, b| (a.z, a.seq, &a.id).cmp(&(b.z, b.seq, &b.id)));
+        // 依赖集合在采集时一次算好:这些集合每帧都要参与复制/加工链的
+        // 保留判定,逐帧扫全部 pass 会让开销随场景复杂度线性增长。
+        let mut snapshot_textures = BTreeSet::new();
+        let mut add = |texture: &TextureRef| {
+            if let TextureRef::Snapshot(id) = texture {
+                snapshot_textures.insert(*id);
+            }
+        };
+        for pass in &passes {
+            for op in &pass.ops {
+                match op {
+                    Op::Layer(layer) => add(&layer.texture),
+                    Op::Group(group) => add(&group.layer.texture),
+                    Op::Transition(t) => {
+                        add(&t.from);
+                        if let Some(to) = &t.to {
+                            add(to);
+                        }
+                    }
+                    Op::Mask(mask) => add(&mask.layer.texture),
+                    Op::Copy(_) | Op::Image(_) => {}
+                }
+            }
+        }
+        let layer_ids = layers.iter().map(|layer| layer.id.clone()).collect();
+        std::sync::Arc::new(crate::frame::ScreenSnapshot {
+            layers,
+            passes,
+            text_draws: self.text_draws_now(),
+            text_revisions: self.text_revisions_now(),
+            text_layout: self.text_layout_now(),
+            snapshot_textures,
+            layer_ids,
+        })
+    }
+
+    /// 屏幕快照里引用到的快照纹理(生产者复制项必须保留到冻结完成)。
+    fn snapshot_texture_ids(&self) -> BTreeSet<CopyId> {
+        self.screen_snapshots
+            .values()
+            .flat_map(|snap| snap.snapshot_textures.iter().copied())
+            .collect()
+    }
+
+    /// 屏幕快照里出现的图层 ID(其加工链仍需重放)。
+    fn snapshot_layer_ids(&self) -> BTreeSet<LayerId> {
+        self.screen_snapshots
+            .values()
+            .flat_map(|snap| snap.layer_ids.iter().cloned())
+            .collect()
     }
 
     // ------------------------------------------------------------ INFO 查询
@@ -2098,6 +2213,11 @@ impl GfxState {
             return;
         }
         let copy_id = CopyId(self.next_copy());
+        // 主窗口截屏:记录命令时刻的屏幕契约(见 frame.rs）。
+        // 必须在改写目标层纹理之前采集 —— `CG[ID=CGS…]` 此时还是空白层;
+        // 也要早于 `prune_copy_log`(它按 dest 清理旧复制项)。
+        let screen_snapshot = (source_is_group && self.is_main_group(source))
+            .then(|| self.capture_screen_snapshot());
         let seq = self.next_texture_seq();
         // COPY 是像素切片(整数矩形),在这里显式取整;图像加工的 `SIZE`
         // 保持浮点(亚像素采样),两者不共用量化点。
@@ -2171,6 +2291,9 @@ impl GfxState {
             timing: CopyTiming::CommandCurrent,
             status,
         });
+        if let Some(snapshot) = screen_snapshot {
+            self.screen_snapshots.insert(copy_id, snapshot);
+        }
         if kind == CopyKind::Copy {
             let attrs = self.nodes[source].layer.clone();
             if let Some(node) = self.nodes.get_mut(dest) {
@@ -3013,6 +3136,15 @@ impl GfxState {
         LayerId::new(b":/W0".to_vec())
     }
 
+    /// 主窗口图层组(`WINDOW[NO=0] CGID`,缺省 `:/W0`)。
+    fn is_main_group(&self, id: &LayerId) -> bool {
+        self.windows
+            .get(&0)
+            .and_then(|w| w.layer_set.as_ref())
+            .unwrap_or(&self.config.main_layer_set)
+            == id
+    }
+
     fn resolved_owned(&self, command: &str, args: &[ArgValue]) -> Vec<OwnedArg> {
         self.params
             .resolve(command, args)
@@ -3211,6 +3343,11 @@ impl GfxState {
         // 当源读取(COPY 或 MERGE/MERGE2),这条加工链就要保留到帧末重放;
         // 否则 CG 缩略图的 AKARUSA 明暗差会丢(hover 只剩底板,2026-11-01)。
         let mut needed: BTreeSet<LayerId> = BTreeSet::new();
+        // 命令时刻屏幕快照里出现过的层:其加工链决定快照像素,删除不撤销。
+        // 无快照时不做集合构造(常见路径:每个 `CGEND` 都会走到这里)。
+        if !self.screen_snapshots.is_empty() {
+            needed.extend(self.snapshot_layer_ids());
+        }
         // 复制在命令时刻已取像素:源层若是被删层,它的加工前缀同样需要。
         for copy in &self.copy_log {
             if let CopySource::Layer(id) = &copy.source {
@@ -3254,6 +3391,11 @@ impl GfxState {
                 needed.insert(*id);
             }
         }
+        // 命令时刻屏幕快照引用的快照纹理:复制结果要在首帧物化,
+        // 生产者必须先于它执行。无快照时跳过集合构造(复制高频路径)。
+        if !self.screen_snapshots.is_empty() {
+            needed.extend(self.snapshot_texture_ids());
+        }
         for i in (0..self.copy_log.len()).rev() {
             let copy = &self.copy_log[i];
             if remove(copy) && !needed.contains(&copy.id) {
@@ -3274,6 +3416,9 @@ impl GfxState {
             index += 1;
             result
         });
+        // 快照随复制项消亡(复制冻结后不再重放,快照数据不再被后端读取)。
+        let live: BTreeSet<CopyId> = self.copy_log.iter().map(|c| c.id).collect();
+        self.screen_snapshots.retain(|id, _| live.contains(id));
     }
 
     fn sorted_children(&self, parent: Option<&LayerId>) -> Vec<LayerId> {

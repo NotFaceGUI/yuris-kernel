@@ -26,7 +26,8 @@ use std::sync::Arc;
 
 use yu_gfx::{
     transition_coverage, BlendMode, Clear, CompositorFrame, CopyId, CopyOp, CopySource, FilterMode,
-    ImageAction, ImageOp, Layer, LayerId, Op, OpStatus, PassTarget, TextDraw, TextureRef,
+    ImageAction, ImageOp, Layer, LayerId, Op, OpStatus, PassTarget, ScreenSnapshot, TextDraw,
+    TextureRef,
 };
 
 use yu_render_core::{
@@ -375,6 +376,11 @@ fn prune_snapshots(snapshots: &mut Snapshots, frame: &CompositorFrame) {
                 }
             }
         }
+    }
+    // 命令时刻屏幕快照的图层/过渡纹理也可能是快照(按钮切片等):
+    // 主窗口截屏在首帧物化前,这些生产者不能回收。集合在采集时算好。
+    for snapshot in frame.screen_snapshots.values() {
+        live.extend(snapshot.snapshot_textures.iter().copied());
     }
     snapshots.retain(|id, _| live.contains(id));
 }
@@ -815,15 +821,16 @@ fn apply_copy_op(
         // 已捕获:快照冻结,不再从当前状态重算。
         return Ok(());
     }
-    // 引擎 `COPY ID=:/W0/` 复制的是**当前后缓冲**,即上一帧呈现结果
-    // (`es_Scenario`/`es_ERIS` 的 CGS1/CGS100 截屏盖屏机制)。若按“命令执行
-    // 时已消费过本帧事件”的组内容重绘,会把本帧新出现的 title 层也截进去,
-    // 导致 fade 起点错位(EVID-J3-06)。
+    // `COPY ID=:/W0/` 读**该命令执行时**的窗口画面,不是上一呈现帧:
+    // ERIS 的 `es.CGTSS`(拍旧屏)→ 隐藏 UI → `es.CGSSS`(拍隐藏后的屏)
+    // 在同一帧内完成,随后 `es.SS.FADE` 让第一张淡出,形成「旧屏 → 新屏」
+    // 的交叉叠化。若两次都取上一帧,淡出目标与底下那张完全相同,画面
+    // 不会变化(消去/菜单无法隐藏)。gfx 在复制命令处记录了命令时刻的
+    // 绘制契约(`CompositorFrame::screen_snapshots`),这里按它合成。
     //
-    // **首帧没有后缓冲**(DIV-GFX-051):D3D9 设备创建后后缓冲即存在,内容
-    // 是初始化清屏色(DIV-GFX-010:`Clear::default_black` 的来源)。主组已
-    // 直绘、不再有离屏 RT,因此这里用 `frame.clear` 合成一张视口大小的
-    // 后缓冲初值——与“官方首帧截图 = 启动黑屏”一致,而不是报
+    // **首帧没有快照/后缓冲**(DIV-GFX-051):D3D9 设备创建后后缓冲即存在,
+    // 内容是初始化清屏色;主组已直绘,因此回退用 `frame.clear` 合成一张
+    // 视口大小的初值——与“官方首帧截图 = 启动黑屏”一致,而不是报
     // `offscreen_missing` 跳过。
     let main_group = frame
         .windows
@@ -831,14 +838,20 @@ fn apply_copy_op(
         .find(|w| w.number == 0)
         .and_then(|w| w.layer_set.as_ref());
     let source = match &copy.source {
-        CopySource::Group(id) if Some(id) == main_group => match last_screen {
-            Some(surface) => surface.clone(),
-            None => Surface::new(
-                frame.viewport.width,
-                frame.viewport.height,
-                frame.clear.rgba,
-            ),
-        },
+        CopySource::Group(id) if Some(id) == main_group => {
+            if let Some(snapshot) = frame.screen_snapshots.get(&copy.id) {
+                compose_screen_snapshot(textures, snapshots, frame, snapshot, st)?
+            } else {
+                match last_screen {
+                    Some(surface) => surface.clone(),
+                    None => Surface::new(
+                        frame.viewport.width,
+                        frame.viewport.height,
+                        frame.clear.rgba,
+                    ),
+                }
+            }
+        }
         CopySource::Group(id) => compose_group(textures, snapshots, frame, id, st)?,
         CopySource::Layer(id) => {
             let mut surface = layer_surface(textures, snapshots, frame, id, st, copy.source_texture.as_ref())?;
@@ -894,6 +907,79 @@ fn compose_copy_texts(surface: &mut Surface, copy: &CopyOp, st: &mut RenderState
 /// 快照 CPU 镜像的构造(wgpu 端 DIV-GFX-058)复用同一裁剪规则。
 
 /// 组源:按当前子层状态重绘组的离屏内容(EVID-T-12 的“命令执行时当前状态”)。
+/// 合成命令时刻的主窗口屏幕快照(`COPY2 ID=:/W0/`)。
+///
+/// 快照自带命令时刻的图层表、组离屏 pass 与屏幕 pass;这里用一份临时
+/// `CompositorFrame` 走与正常帧相同的 `draw_op` 路径。组 pass 先画进临时
+/// `offscreens`(不进报告),再画屏幕 pass —— 与正常帧的 pass 顺序一致。
+/// 临时合成对文本/加工缓存的影响全部回滚,不改变本帧随后真实绘制的状态。
+fn compose_screen_snapshot(
+    textures: &mut TextureStore,
+    snapshots: &Snapshots,
+    frame: &CompositorFrame,
+    snapshot: &ScreenSnapshot,
+    st: &mut RenderState,
+) -> Result<Surface, String> {
+    let mut snap_frame = CompositorFrame::new(frame.frame, frame.viewport);
+    snap_frame.dx_mode = frame.dx_mode;
+    snap_frame.clear = frame.clear;
+    snap_frame.color_space = frame.color_space;
+    snap_frame.filter = frame.filter;
+    snap_frame.image_probe_order = frame.image_probe_order.clone();
+    snap_frame.layers = snapshot.layers.clone();
+    snap_frame.passes = snapshot.passes.clone();
+    snap_frame.text_draws = snapshot.text_draws.clone();
+    snap_frame.text_revisions = snapshot.text_revisions.clone();
+    snap_frame.text_layout = snapshot.text_layout.clone();
+
+    // 临时合成的副作用隔离:真实帧随后还要按最终状态绘制。
+    let saved_offscreens = std::mem::take(&mut st.offscreens);
+    let saved_overrides = std::mem::take(&mut st.texture_overrides);
+    let saved_bases = std::mem::take(&mut st.override_bases);
+    let saved_text_ids = std::mem::take(&mut st.text_override_ids);
+    let saved_composed = std::mem::take(&mut st.text_composed);
+    let saved_report = st.report.clone();
+    let saved_skipped = st.skipped.clone();
+
+    let result = (|| {
+        for pass in &snap_frame.passes {
+            let PassTarget::Offscreen(id) = &pass.target else {
+                continue;
+            };
+            let (width, height) = group_surface_size(&snap_frame, id);
+            if width == 0 || height == 0 {
+                continue;
+            }
+            let clear = pass.clear.unwrap_or(Clear::explicit([0, 0, 0, 0]));
+            let mut surface = Surface::new(width, height, clear.rgba);
+            for op in &pass.ops {
+                draw_op(textures, snapshots, &snap_frame, op, &mut surface, st);
+            }
+            st.offscreens.insert(id.clone(), surface);
+        }
+        let screen_pass = snap_frame
+            .passes
+            .iter()
+            .find(|pass| matches!(pass.target, PassTarget::Screen))
+            .ok_or_else(|| "gfx.copy.screen_snapshot.pass_missing".to_string())?;
+        let mut surface =
+            Surface::new(frame.viewport.width, frame.viewport.height, frame.clear.rgba);
+        for op in &screen_pass.ops {
+            draw_op(textures, snapshots, &snap_frame, op, &mut surface, st);
+        }
+        Ok(surface)
+    })();
+
+    st.offscreens = saved_offscreens;
+    st.texture_overrides = saved_overrides;
+    st.override_bases = saved_bases;
+    st.text_override_ids = saved_text_ids;
+    st.text_composed = saved_composed;
+    st.report = saved_report;
+    st.skipped = saved_skipped;
+    result
+}
+
 fn compose_group(
     textures: &mut TextureStore,
     snapshots: &Snapshots,

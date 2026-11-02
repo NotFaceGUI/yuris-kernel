@@ -254,9 +254,10 @@ fn same_tick_copy_then_save_uses_source_chain() {
     assert_eq!(capture.snapshot_replays, 0);
 }
 
-/// 源是组/后缓冲(命令时刻无法从资产链裁剪)时,才整帧软回放。
+/// 源是组/后缓冲(命令时刻无法从资产链裁剪):同一 tick 内直接用上一帧
+/// 呈现面(整帧软回放会吃掉同帧开始的淡入/淡出,见 `screen_frame_for`)。
 #[test]
-fn same_tick_group_copy_then_save_replays_last_screen() {
+fn same_tick_group_copy_then_save_uses_last_screen() {
     let table = table();
     let store = TextureStore::new(
         Box::new(MemSource::new(Codec::Cp932)),
@@ -301,5 +302,5 @@ fn same_tick_group_copy_then_save_replays_last_screen() {
         .expect("整帧回放必须产出快照");
     assert_eq!((image.width, image.height), (4, 4));
     assert_eq!(&image.rgba[..4], [9, 8, 7, 255]);
-    assert_eq!(capture.snapshot_replays, 1);
+    assert_eq!(capture.snapshot_replays, 0, "上一帧屏幕直取,不再整帧回放");
 }

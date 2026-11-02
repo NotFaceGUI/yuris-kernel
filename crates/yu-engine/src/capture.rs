@@ -149,6 +149,41 @@ impl GfxCapture {
         self.last_screen = screen;
     }
 
+    /// 主窗口整屏快照(`COPY2 ID=:/W0/`)的**同 tick** 回退:上一帧呈现面。
+    ///
+    /// 沿层复制链找到根;根是主组拷贝时,命令时刻还没有 GPU 像素可用
+    /// (复制要到帧末才执行),整帧软回放又太慢(debug 1.5s,会吃掉同一帧
+    /// 开始的淡入/淡出)。上一帧屏幕是玩家此刻看到的画面,缩略图语义足够。
+    fn screen_frame_for(&self, id: CopyId, state: &GfxState) -> Option<Rc<Texture>> {
+        let main = &state.config().main_layer_set;
+        let mut current = id;
+        for _ in 0..8 {
+            let copy = state
+                .copies()
+                .iter()
+                .rev()
+                .find(|copy| copy.id == current && copy.status == yu_gfx::OpStatus::Executable)?;
+            match &copy.source {
+                CopySource::Group(group) if group == main => {
+                    let screen = self.last_screen.as_ref()?;
+                    return Some(Rc::new(Texture {
+                        width: screen.width,
+                        height: screen.height,
+                        rgba: screen.rgba.clone(),
+                    }));
+                }
+                CopySource::Layer(_) => {
+                    current = match copy.source_texture.as_ref()? {
+                        TextureRef::Snapshot(prev) => *prev,
+                        _ => return None,
+                    };
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// 取快照像素:先查镜像;wgpu 端口存在时按需读上一帧快照并缓存。
     fn snapshot_pixels(&mut self, id: CopyId) -> Option<Rc<Texture>> {
         if let Some(mirror) = self.pixels.get(&id) {
@@ -190,6 +225,12 @@ impl GfxCapture {
                 TextureRef::Snapshot(prev) => {
                     // 源快照已物化(上一帧注册表/软镜像)⇒ 直接作为基面。
                     if let Some(pixels) = self.snapshot_pixels(*prev) {
+                        base = Some(pixels);
+                        break;
+                    }
+                    // 同 tick 的主窗口整屏截图:用上一帧呈现面(见
+                    // `screen_frame_for`),避免整帧软回放。
+                    if let Some(pixels) = self.screen_frame_for(*prev, state) {
                         base = Some(pixels);
                         break;
                     }
@@ -285,10 +326,22 @@ impl LayerCapture for GfxCapture {
         let size = intended_size(state, layer);
         let surface = match &texture {
             TextureRef::Snapshot(copy_id) => {
+                // 主窗口整屏截图(`COPY2 ID=:/W0/`)在**同一 tick** 内被
+                // `SAVE[ID]` 读取时(存档缩略图:`es.SCENARIO.SS` 截屏 →
+                // 打开菜单 → `es.Save` 存 `SLTEMP`),命令时刻像素还没被
+                // 主渲染器画出来;wgpu 读回拿不到、`chain_snapshot` 也没有
+                // 源层纹理,只能 `replay_snapshot` 整帧软回放(debug 实测
+                // 1.5s)。这段停顿发生在菜单淡入的同一帧,按墙钟计时的
+                // `es.SS.FADE` 会直接跳过整段淡入。
+                //
+                // 上一帧呈现面就是玩家按下菜单前看到的画面,与官方在
+                // `ES.SCENARIO.SS` 处截到的缩略图同源(只差同一 tick 的
+                // 隐藏 UI 命令);用它替代整帧回放,避免存档尖峰吃掉淡入。
                 // 快路径:上一帧已渲染的镜像/注册表;同 tick 新建的快照
                 // 优先用源快照裁剪,最后才整帧回放。
                 let mirror = self
-                    .snapshot_pixels(*copy_id)
+                    .screen_frame_for(*copy_id, state)
+                    .or_else(|| self.snapshot_pixels(*copy_id))
                     .or_else(|| self.chain_snapshot(*copy_id, state))
                     .or_else(|| self.replay_snapshot(*copy_id, state));
                 if mirror.is_none() {
