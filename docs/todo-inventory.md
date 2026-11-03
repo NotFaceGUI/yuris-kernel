@@ -157,8 +157,9 @@
   `unsupported-by-official`(DIV-GFX-002),不是"未取证"。
 - rt(AU5 勘误:此行多为旧口径):`F_INT`/`F_FLT`/`F_STR`/`DEBUGLIST` **已由
   DIV-RT-043 收口**(脚本错误槽/no-op);`MATH3D` **已实现**(DIV-GFX-046);
-  `DIALOG` **已实现**(DIV-RT-044)。剩余:`YMV/YMVINFO/YMVEND`(宿主媒体,
-  路线图 B14)、`ERROR` 消费者(046,路线图 B10)、`TRAY/CLIPACT 写/REGINFO`
+  `DIALOG` **已实现**(DIV-RT-044);`YMV/YMVINFO/YMVEND` **已实现**
+  (B14,2026-11-03:影片=普通图层的帧动画,`YSMV` 双平面 JPEG;DIV-GFX-073)。
+  剩余:`ERROR` 消费者(046,路线图 B10)、`TRAY/CLIPACT 写/REGINFO`
   (宿主能力,路线图 B7)、`CLIPINFO/LABEL/MACRO`。全量清零计划见
   `docs/tasks/roadmap-batches.md` B10。
 - rt 部分:INFO 类(1598/129/3 次)是“未安装 GraphicsHost”的普查口径,装了宿主

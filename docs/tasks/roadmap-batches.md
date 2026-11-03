@@ -43,7 +43,7 @@
 | B11 | gfx 命令面收口 | CGACT 加工剩余、031/039、TEXCOPY、022/016/027/030/032/028、011 extra 分类、037 | — | 大 |
 | B12 | gfx 合成/像素取证收口 | 041/048/045/005/004/003/002(MODE 分发取证) | B8 取证 | 中 |
 | B13 | ypf 容器全分支 + 格式收口 | NUL-XOR、ypf 边缘分支 ×5、YSTB v2、SNP、YSSD 配置块/pad | — | 中 |
-| B14 | 媒体宿主(MOVIE/YMV 族) | 先取证空桩与否 → aligned-stub 或 MF 实现 | — | 中 |
+| B14 | 媒体宿主(MOVIE/YMV 族) | **YMV + MOVIE 已落地**(2026-11-03);MOVIE 宏路径的 es 影片态调度待修(见 §B14 待办) | — | 中 |
 | B15 | trace/工程终局 + **AU6 清空复核** | Platform 边界、CI、audit_hardcode 全仓、examples-audit、台账模板统一、清空宣告 | 全部批次 | 小 |
 
 **波次建议**(可并行的分到不同会话):
@@ -179,9 +179,41 @@ fixed(现 Likely 项全部定论)。
 终态:fmt/vfs 零 unsupported(no-manual 均标注)。
 
 ### B14 · 媒体宿主(MOVIE/YMV 族)
-先取证 0.495 的 `MOVIE(0x44b134)/YMV(0x458ee0)/YMVEND/YMVINFO(0x459b98)`:
-空桩/外挂 DLL ⇒ aligned-stub(标注);真播放 ⇒ Windows Media Foundation 宿主
-实现(手册 movie.html 有页)。DIV-RT-045 媒体侧收尾。
+
+**YMV 族:已完成(2026-11-03,DIV-GFX-073,`fixed(no-manual)`)**。
+取证推翻旧口径:YMV **不是全屏视频**,而是「帧动画挂到普通图层」
+(`es_Sprite.yst` `FTYPE==6`:建层 → `YMV[FILE]` → `YMVINFO[NUM/SX/SY/FPS]`
+→ `CGACT[SIZE]` → `YMV[FRAME=n]` → `YMVEND`)。容器 `YSMV` = 头部 +
+三张 u32 表 + 逐帧两段(颜色 JPEG / alpha 灰度 JPEG,各按
+`byte[i]^=(i&0xf)+0x10` 解混淆);无音轨、最高 30fps、帧推进由脚本做。
+实现:`yu-format::ymv` + `yu-gfx::TextureRef::Movie` +
+`yu-render-core::resolve_movie`(soft 直采样 / wgpu 每资产 4 槽环形复用)。
+
+**MOVIE(MPEG/AVI)语义层已落地(2026-11-03,DIV-GFX-074)**:
+`MOVIE(0x44b134)`/`MOVIEEND(0x44b9d8)`/`MOVIEINFO(0x44ba2c)` 三页手册 +
+REA;内核持全屏影片状态(文件名/播放位/几何/音量/影片模式),
+`MOVIEINFO[CODEC]` 按官方 5 字节规则探测;解码与呈现经**跨平台**
+`MovieHost` 端口交宿主(官方用 MCI + COM `IBasicAudio`)。
+
+**播放后端**:已选型 `southstar-codecs::plmpeg`(纯 Rust MPEG-1 PS,跨平台),
+`yu-platform/movie-plmpeg` 实现 `MovieHost`;`yu-engine` 每 tick 取帧注入
+`:movie/current` 并由 `GfxState::set_movie_overlay` 进入影片模式。soft/wgpu
+均实测逐帧上屏;wgpu 资产纹理缓存按 `TextureStore::generation` 失效
+(见 DIV-GFX-074 §6)。
+
+**待办(2026-11-03 审查)**:
+- **es 影片态调度缺口**:`\MOVIE(...)` 宏只设 `@es.SCENARIOSTOP=2`,
+  真正播放由 `ES.GAMEMAIN.LOOP`(`es_Scenario.yst:127..162`)在下一帧
+  `IF[@es.SCENARIOSTOP==@e.MOVIE]` 调 `es.S.GOSUB("es.MOVIEPLAY")`。
+  实测该消费未发生:场景任务(`es.SCENARIO.FLOW`)在 `WAIT[FRAME=1]` 后
+  先于系统任务继续,`\TITLE` 宏把 `SCENARIOSTOP` 改回 1。需按手册
+  「Z 高先执行」(系统任务默认 100)复核任务链顺序与 `WAIT[FRAME=N]`
+  让出语义。修好后宏路径应直接播片,不再需要脚本侧绕行。
+- 脚本侧临时绕行(已实测):启动即播放在 `system_start.yst` 的
+  `GO[#=es.ERIS]` 之前;场景内播片在 `MOVIEEND` 后补 `\UI.RELOAD`
+  重建 `ES.GAMEMAIN` 按钮组。
+
+DIV-RT-045 媒体侧已在 B14 收尾(YMV 行);`MOVIE` 语义层见 DIV-GFX-074,播放后端待选型。
 
 ### B15 · trace/工程终局 + AU6 清空复核
 - Platform 命令边界记录(yu-trace M3)。

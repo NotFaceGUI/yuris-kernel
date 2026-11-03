@@ -118,6 +118,7 @@ YPF_Tool、YPF-Manager、ypf-repacker、YurisKeyFinder 等。
 | `crates/yu-format/src/ysvr.rs` | 旧接手线 `<repo-old>/crates/yuris-format/src/ysvr.rs` | `ty=0` = 仅声明无初值段(其 v555 商业游戏 3362/3362 闭合;本仓库 495 语料 2568/2568 闭合,双语料互证) | 全语料字节级闭合 |
 | 密钥自检测(`YSTB_GuessXorKey`/Script-Editor/YurisKeyFinder)、YURIS_TOOLS 新版解密 | (未采用,登记备用) | 本次语料均为默认键/495;换密钥场景留待真实作品 | — |
 
+| `crates/yu-platform/movie-plmpeg` | [`southstar-codecs`](https://crates.io/crates/southstar-codecs) 1.0.5 的 `plmpeg` 模块([pl_mpeg](https://phoboslab.org) 的纯 Rust 移植) | `MOVIE` 全屏影片的 **MPEG-1 program stream 拆包 + MPEG-1 视频 + MP2 音频**解码(上游 MIT;crates.io 依赖,未改源码) | 官方样例 `data/pac/op_movie.mpg` 解码 60 帧 / 800×600 / 30fps / 1.933s,与 `ffprobe` 一致 |
 > 采用纪律执行情况:算法级采用、逐处文件头注明来源;未整段复用任何代码
 > (Script-Editor 未声明许可,按"仅事实参考"处理);编码自检测的确定性裁决、
 > 评分权重为原创实现(参考 `docs/architecture.md` §7)。

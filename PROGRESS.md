@@ -12452,3 +12452,202 @@ Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.50s
 
 注:`cargo build --all-targets` 的 example 链接因 `scenario_probe.exe`
 正在运行、文件被占用(LNK1104)失败,非代码问题。
+
+## 成果 B14-YMV (2026-11-03) · YMV 影片图层落地(容器解码 + 图层帧驱动)
+
+### 结论(取证推翻旧口径)
+
+`YMV` **不是全屏视频**,而是「把一串帧动画挂到**普通图层**上」。证据:
+ERIS 演示 `es_Sprite.yst` 的 `L.FTYPE==6` 分支(`CG[ID FILE=""]` 建层 →
+`YMV[FILE]` 挂片 → `YMVINFO[NUM/SX/SY/FPS]` → `CGACT[SIZE]` →
+`YMV[ID FRAME=n]` 换帧 → `YMVEND[ID]` 释放)、SDK 说明
+(`UserScript/演出機能.txt` `#=BETA4_MOVIE`「映像のみ・音声なし・最高
+30fps」「普通のスプライトとして利用」)、官方 0.495 处理体
+`YMV 0x458ee0` / `YMVEND 0x459a64` / `YMVINFO 0x459b98`。
+⇒ 无音轨、无播放时钟:帧推进由脚本按 `YMVINFO[FPS]` 自己算。
+
+### 格式(`YSMV`,官方解析体 `0x459094`)
+
+头部 `{magic, version, frames, alpha标志, w, h, fps, 未用}` + 三张
+`u32[frames]` 表(帧偏移 / 颜色段长 / alpha 段长),逐帧两段各按
+`byte[i] ^= (i & 0x0f) + 0x10` 解混淆,解后是**基线 JPEG**(颜色 RGB +
+alpha 灰度)。样例实测:`rain` 800×600/24fps/20 帧、`sample2/3`
+400×300/30fps/306 帧。
+
+### 实现
+
+- `yu-format::ymv`:容器切分 + 解混淆(纯字节;表/段越界类型化诊断)。
+- `yu-rt`:`YMV` → 读包(原 key → `+".ymv"`)解析头部 →
+  `GraphicsHost::note_movie` → 照发 `Domain::Movie`;`YMVINFO` 走
+  `op_info` 查询写 `LET`;`Domain::Movie` 纳入同步宿主通道。
+- `yu-gfx`:图层 `movie` 状态 + `TextureRef::Movie{asset, frame}`;
+  `FRAME` 钳位 `[0,帧数-1]`;置 `alpha_aware`;`YMVEND` 释放;`YMVINFO`
+  查询(缺层/缺片写 0,官方 `0x459d63`/`0x459de2`)。
+- `yu-render-core`:按 `(资产,帧)` 解两段 JPEG → RGBA8 合成并缓存;
+  soft 直采样,wgpu 每资产 4 槽环形复用(`write_texture` 就地覆写)。
+- **勘误**:`IDNO` 键真形式 = `<ID>.<十进制>`(`0x808354` = `"."` +
+  `__ultoa`);DIV-GFX-027 早前把点追加循环误读成 itoa 追加,已改回带点。
+- 顺手修 `silent_fallback_audit` 存量红:8 处未标注 `unwrap_or` 补分类
+  (`yu-gfx/state.rs` 26→18、`yu-rt/vm.rs` 5→4,回到白名单)。
+
+### 验证(原始结果)
+
+```text
+$ cargo build --workspace --all-targets
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.01s   # 0 warnings
+
+$ YURIS_SAMPLE_SDK0495=... cargo test -p yu-format --lib ymv
+running 6 tests ... test result: ok. 6 passed
+
+$ cargo test -p yu-gfx --test ymv_movie
+running 7 tests ... test result: ok. 7 passed
+
+$ cargo test -p yu-rt --test fixture ymv
+test ymv_pushes_movie_metadata_and_ymvinfo_writes_let ... ok
+
+$ cargo test -p yu-render-core --lib movie
+test result: ok. 2 passed
+
+$ YURIS_SAMPLE_SDK0495=... cargo test -p yu-backend-soft --test ymv_movie
+test ymv_frames_render_distinct_pixels ... ok   # 真实 sample2.ymv:400×300,
+                                                # 帧 0 颜色 >64 种,帧 150 差异 >1000 px
+
+$ cargo test -p yu-cli --test logging_guards
+test result: ok. 3 passed
+
+$ cargo test --workspace --all-targets
+106 个测试二进制通过;两条既有红与本次改动无关:
+① wgpu `diffusion_permutes_blocks_on_gpu_and_matches_soft` 偶发(GPU 读回,
+   单跑通过);
+② `yu-host-android --test session runs_real_corpus_and_emits_frames`
+   (本机无音频端点;已在 HEAD worktree 复现同样失败)
+```
+
+### 已知限制
+
+`MOVIE`(MPEG/AVI 全屏宿主,`0x44b134`)是另一条路径,仍未实现(路线图 B14
+剩余项)。YMV 的同资产多帧并发在 wgpu 端取 4 槽环形(见
+`docs/divergences/DIV-GFX-073-ymv-movie-layer.md` §5)。
+### 复核(2026-11-03,主人反馈「影片不显示 + 疯狂抛 SIZE2 未实现 + FPS 掉半」)
+
+1. **影片不显示的真因**:gfx 的图像加工**源层白名单**(6 处 `matches!` 只放行
+   `Asset/Snapshot/SolidBlack1x1`)漏了 `TextureRef::Movie` ⇒ 精灵框架每帧的
+   `CGACT[SIZE2]`(把影片层缩放拷进显示层,`es_Sprite.yst:8666`)整条被判
+   `gfx.imageop.copy_source.unsupported`,图层永远没像素;诊断按帧重发即
+   「疯狂抛」。已把 `Movie` 纳入全部源白名单 + 后端像素解析,并补**回归测试**
+   `ymv_scaled_blit_reaches_display_layer`(复刻该行命令,断言显示层像素)。
+2. **三处语义对齐**:`YMVINFO` 多字段同时置位 ⇒ 官方是顺序 `if`+`ret`
+   (**槽号最小者生效**),不是「未取证 ⇒ 不写」;`YMV[FRAME]` 在未挂影片时
+   官方**静默**无操作;`YMVEND` 不重置 `[层+0x86]`。均按官方改回。
+3. **性能**:探针 `probe_ymv_timing` 实测——容器载入+解混淆 debug 22ms /
+   release 0.65ms;换帧解码 debug 27ms(优化后 5.3ms)/ **release 0.6ms**;
+   同帧命中 0.1µs。FPS 掉半的主因是 **debug 构建下 JPEG 解码**,已给
+   `zune-jpeg`/`image` 单独加 `opt-level = 3`(与 `libz-sys` 同型)。
+   同时删掉每帧回包重读(改为官方形态:容器常驻 + 已解混淆)。
+4. **内存**:CPU 端影片帧每资产只保留最近一帧(换帧摘掉旧帧),长片不再
+   按帧累积;容器字节每资产一份(`Rc` 共享);wgpu 每资产 4 个环形槽位。
+
+
+## 成果 B14-MOVIE (2026-11-03) · MOVIE 族语义层 + 跨平台播放端口
+
+### 取证
+
+- 手册三页(0.495 `マニュアル/YU-RIS/html/movie/`):`MOVIE[FILE/PLAY/X/Y/SX/SY/
+  VOLUME]` 全屏、**不能当图层**、盖在所有层之上;`MOVIE[PLAY=0]` 停止后仍遮住
+  图层直到 `MOVIEEND`;`MOVIEINFO[PLAY/X/Y/SX/SY/VOLUME LET]`。
+- 官方处理体:`MOVIE 0x44b134` / `MOVIEEND 0x44b9d8` / `MOVIEINFO 0x44ba2c`
+  (分发表槽 71/72/73)。几何先落 `0x801764/68/6c/70`(缺省 X/Y=0、SX/SY=影片
+  原始宽高 ⇒ 铺满);`FILE` 先 `fopen` 成功才进影片模式;`VOLUME` 落 `0x5b48a0`;
+  `MOVIEEND` 清文件名/播放位并**重置音量 256**(`0x44ba0f`),几何不清。
+- `MOVIEINFO[CODEC]`(`0x44bac9..0x44bcfc`):只读头 5 字节 ——
+  `00 00 01 BA` + 第 5 字节 `&0xF0==0x20` ⇒ 1(MPEG-1)、`&0xC0==0x40` ⇒ 2
+  (MPEG-2)、其余 0xFF;打不开 = 0。官方样例 `op_movie.mpg`(`.. 21`)→ 1。
+- **官方把解码交给系统媒体栈**:导入 `winmm!mciSendStringA`,字符串
+  `" ysmcimovie volume to %d"`/`MPEGVideo`;另有 COM 路径
+  (`0x44b664` → 音量按 1/100 dB,`IBasicAudio::put_Volume`),`[0x5b4874]`
+  是 COM/MCI 开关。
+
+### 实现(内核只有语义,零平台代码)
+
+- `yu-format::movie`:`probe_codec` + `MovieCodec`(官方 5 字节规则)。
+- `yu-rt`:`MovieState`(文件名/播放位/几何/音量)、`MOVIE`/`MOVIEEND`/
+  `MOVIEINFO` 处理器(七字段顺序 if、槽号最小者生效、缺字段不写 LET)、
+  `Vm::movie_mode()`(影片模式 = 文件名非空)与 `Vm::movie_state()`。
+- `yu-rt::event::MovieHost`(**跨平台端口**,不绑定任何平台 API):
+  `open/set_playing/set_volume/set_geometry/is_playing/close`。桌面可用系统栈
+  (MCI/MF)或 FFmpeg;Android 可用 MediaPlayer/MediaCodec;无后端返回诊断。
+- `yu-gfx` 明确不参与(事件忽略,它不是图层)。
+
+### 验证(原始结果)
+
+```text
+$ cargo test -p yu-format --lib movie
+test result: ok. 5 passed        # 含官方 op_movie.mpg → Mpeg1
+
+$ cargo test -p yu-rt --test fixture movie_
+test result: ok. 3 passed        # 状态机 / MOVIEINFO 查询 / 端口契约 / 缺文件
+
+$ cargo build --workspace --all-targets   → 0 warning
+$ cargo test --workspace --all-targets    → 106 个二进制通过
+                                          (仅既有 android 音频环境红)
+```
+
+### 未做(等主人选型)
+
+播放后端与"影片模式遮图层"的引擎接线。理由:引入 FFmpeg 是**构建级
+依赖决策**(Android 需交叉编译),而各平台系统栈实现是平台矩阵工作;
+内核语义已就绪,换后端不改语义。当前 demo 的 `MOVIE` 调用点是注释状态
+(`SCENARIO_START.txt:42 //\MOVIE(pac/op_movie.mpg)`),无点击验收路径。
+
+### 后端落地(2026-11-03,主人拍板:内嵌 pl_mpeg 移植)
+
+**选型**:`southstar-codecs` 1.0.5 的 `plmpeg` 模块(pl_mpeg 的纯 Rust 移植,
+MIT 血统,crates.io 正式依赖,`#![forbid(unsafe_code)]`)。理由:只播 MPEG-1
+时业界用小型专用解码器(ONScripter 的 SMPEG/libmpeg2、pl_mpeg),FFmpeg
+(10–80MB + bindgen/clang 构建链)在本机还卡在 `cl D8018`,不划算。
+
+**实测**:官方样例 `data/pac/op_movie.mpg` → 60 帧 / 800×600 / 30fps /
+1.933s,与 `ffprobe` 一致;YUV→RGBA 后颜色数 >64;暂停保留最后一帧;
+`close` 后不再出帧;非 MPEG-1 输入显式失败(`movie.decode`)。
+
+**接线**:
+- `crates/yu-platform/movie-plmpeg`:`PlmMovieHost` 实现 `yu_rt::event::MovieHost`
+  (`open/set_playing/set_volume/set_geometry/is_playing/close` + `media_size`/`frame`);
+- `yu-rt`:端口新增 `movie_host_mut()`;`MOVIE[FILE]` 只在装了后端时读整份影片;
+- `yu-gfx`:`GfxState::set_movie_overlay` —— 影片模式只投影「清屏 + 影片层」,
+  其他层一律不显示(官方手册 `movie/movie.html` 例 3);
+- `yu-engine`:`sync_movie_overlay()` 每 tick 取帧 → `TextureStore::insert_rgba`
+  注入合成资产 `:movie/current` → 交 `GfxState`;显示尺寸按官方
+  `0x44b418`(`目标宽 = SX * 窗口宽 / 影片宽`,缺省铺满)。
+
+**验证**:`cargo build --workspace --all-targets` 0 warning;
+`cargo test --workspace --all-targets` **全绿**(含新增 `yu-movie-plmpeg` 2 项、
+gfx overlay 1 项)。
+
+**限制**:只解 MPEG-1 PS;音频(MP2)待接 `yu-sound`;AVI/MP4 需另加
+`MovieHost` 实现(FFmpeg 可作可选 feature,内核不变)。
+
+### 实机验收与后续修正(2026-11-03 深夜)
+
+- 副本(散盘 `data/`,无 `data.ypf`)用内核 desktop/wgpu 启动,OP 影片
+  `op_movie.mpg` 正常解码并逐帧上屏;`--frames 300` 抓帧为影片画面。
+- 修复 **wgpu 影片静止**:资产纹理缓存原按 key 永久复用,现按
+  `TextureStore::generation` 比较(内容变即 `write_texture` 覆写);
+  soft/wgpu 均已验证帧间像素不同。
+- 修复 **`asset.size.unsupported`**:手册 `cgact.html` 例 3 证明
+  `CGACT[SIZE]` 是缩放;`CG[SX/SY]` 仅对图层组有效(gfx 已按 `is_group`
+  分派),普通图像层不受影响。
+- 修复 **首次 `SAVE` 因无参照 `.sd` 被拒**:容器版本改用工程 `yscfg`
+  版本兜底(`sv.container` 警告消失,存档正常写盘)。
+- 既有缺口记录:按钮条/存档缩略图的 `CGACT[COPY]` 快照(`snapshot.unsupported
+  x3`、`复制源 :/W0/SLTEMP 不存在`)属快照域,与 MOVIE 无关,另案处理。
+
+### 审查与清理(2026-11-03 审查)
+
+- 修 soft `layer_predict_drawable`:`Asset + 显式 SX/SY` 预测不可绘制,
+  与已放开的缩放渲染矛盾(整帧可绘制判定会被误判)。
+- 清理临时探针(`DBG GOSUB` 等);`src/` 无 `DBG`,stderr 输出仅存于 examples。
+- 回归:yu-gfx/yu-rt/yu-backend-soft/yu-backend-wgpu 测试全过;
+  `cargo build --workspace --all-targets` 通过。
+- 待办:`\MOVIE(...)` 宏路径的 es 影片态调度(`docs/tasks/roadmap-batches.md`
+  B14「待办」+ DIV-GFX-074 §7);脚本侧绕行见同处。

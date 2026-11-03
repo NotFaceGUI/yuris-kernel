@@ -48,7 +48,7 @@
 | DIV-GFX-024 | `CGINFO[SX/SY]` 资源图尺寸 | partial(J3) | 图像头 provider 已落地(`GraphicsHost::note_asset_size`);组/黑图/快照/已注入资产可答,未注入资产仍 `gfx.info.asset_size` 不写 LET | PSB/E-mote 资产头 provider |
 | DIV-GFX-025 | INFO 多字段写回顺序 | unimplemented | `gfx.info.multi`,不写 LET | 引擎多字段查询顺序 |
 | DIV-GFX-026 | INFO `COLOR/ONMOUSE*/CAPTION/...` | partial | `ONMOUSE/ONMOUSE2/ONMOUSE3` 已实现(样本/快照源资产);`COLOR` 等仍 `gfx.info.unsupported` | 组/离屏快照真实像素面;COLOR 显式坐标 |
-| DIV-GFX-027 | `IDNO` 十进制后缀拼接 | **fixed(no-manual)** | `ID + 十进制`(引擎 `__itoa` 直接追加,无分隔符) | DIV-GFX-069 §2 |
+| DIV-GFX-027 | `IDNO` 十进制后缀拼接 | **fixed(no-manual),2026-11-03 勘误** | `<ID>.<十进制>`(点分隔:官方先追加常量 `0x808354` = `"."` 再 `__ultoa`;锚点见 DIV-GFX-073 §1) | — |
 | DIV-GFX-028 | 图像层下挂子层目标 | open | 按后序扁平绘制 | 官方引擎合成脚本确认目标 RT |
 | DIV-GFX-029 | pass 复制/图像交错序 | fixed | 按 `CopyOp::seq`/`ImageOp::seq` 交错输出(EVID-T-15) | — |
 | DIV-GFX-030 | `CG[TIDNO]` | open | 忽略并留档 | 确认是否 `TID + "." + N` |
