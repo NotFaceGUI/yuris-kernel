@@ -222,7 +222,7 @@ fn cgend_removes_subtree() {
 }
 
 #[test]
-fn idno_appends_decimal_suffix() {
+fn idno_appends_dot_decimal_suffix() {
     let table = table();
     let mut gfx = state();
     gfx.consume_events(&[
@@ -239,7 +239,7 @@ fn idno_appends_decimal_suffix() {
         frame_end(1),
     ]);
     let f = gfx.frame();
-    assert!(f.layers.iter().any(|l| l.id.display() == ":/W0/bg/title2"));
+    assert!(f.layers.iter().any(|l| l.id.display() == ":/W0/bg/title.2"));
 }
 
 #[test]

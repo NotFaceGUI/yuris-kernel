@@ -129,8 +129,51 @@ pub enum TextureRef {
     Offscreen(LayerId),
     /// `CGACT[COPY/COPY2]` 或 `CGACT[TEXCOPY]` 产生的纹理快照。
     Snapshot(CopyId),
+    /// `YMV[FRAME]`:影片的某一帧(颜色 + alpha 双平面),像素由资产管线
+    /// 按 `(资产, 帧号)` 物化。
+    ///
+    /// 证据:官方 `0x45934c` 把 `YSMV` 的逐帧双段 JPEG 解到图层表面
+    /// (`0x4593f4` 颜色 / `0x459964` alpha);本内核不在 gfx 里解码。
+    Movie {
+        /// `YMV[FILE]` 原字节(CP932;扩展名探测归渲染端资产管线)。
+        asset: Vec<u8>,
+        /// 已钳位的帧号(`0 ..= 帧数-1`)。
+        frame: u32,
+    },
     /// 尚未解析(例如只给了 `RID`/`MID` 的层)。
     None,
+}
+
+/// `YMV` 影片元数据(官方图层影片结构 `+0x00..+0x10`)。
+///
+/// 由 VM 解析 `YSMV` 容器后经 `GraphicsHost::note_movie` 推入 gfx
+/// (gfx 不读文件);`YMVINFO` 的 `NUM/SX/SY/FPS` 直接回读这四个字段。
+///
+/// 类型定义在 `yu-rt`(宿主契约层),此处重导出便于 gfx 调用方使用。
+pub use yu_rt::event::MovieInfo;
+
+/// `MOVIE` 全屏影片画面(宿主注入,见 `docs/divergences/DIV-GFX-074`).
+///
+/// `MOVIE` 不是图层:官方把它画在**所有层之上**,进入影片模式后其他层一律
+/// 不显示,直到 `MOVIEEND`(手册 `movie/movie.html` 例 3)。内核因此不新建
+/// 脚本可见图层,只把这个 overlay 投影成「清屏 + 一张全屏纹理」的一帧。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MovieOverlay {
+    /// 宿主注入的合成资产 key(像素经 `TextureStore::insert_rgba` 提供)。
+    pub asset: Vec<u8>,
+    /// 画面在窗口坐标系里的目标矩形(官方 `SX*win_w/movie_w` 已由宿主换算)。
+    pub rect: RectI,
+}
+
+/// 图层当前挂接的影片(官方 `[层+0xa0]` 指向的 0x24 字节结构)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MovieState {
+    /// 影片资产 key(`YMV[FILE]` 原字节)。
+    pub asset: Vec<u8>,
+    /// 容器元数据。
+    pub info: MovieInfo,
+    /// 当前帧(已钳位)。
+    pub frame: u32,
 }
 
 /// 纹理快照编号(稳定、单调;只在本帧内有效)。
@@ -1080,6 +1123,11 @@ pub struct Layer {
     /// 未设置 = 0:官方层对象零初始化,`CG[FILE=...]` 新建的层在画字/上色
     /// 之前该位为 0。
     pub alpha_aware: bool,
+    /// 当前挂接的 `YMV` 影片(官方 `[层+0xa0]`;`None` = 未挂接)。
+    ///
+    /// 生命周期:官方 `YMV[FILE]` 解析后挂上、`YMV[FRAME]` 只换帧、
+    /// `YMVEND` 释放(变回 `None`),`CGEND` 删层时随层一起消失。
+    pub movie: Option<MovieState>,
     /// 有效状态(= `texture_status` 优先,否则 `param_status`)。
     pub status: LayerStatus,
     /// 纹理级状态(`CGACT` 复制/图像加工留下)。

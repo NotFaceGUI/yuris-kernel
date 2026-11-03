@@ -36,7 +36,7 @@ use crate::frame::{
 };
 use crate::layer::{
     BlendConfidence, BlendMode, CopyId, EngineValue, ImageFormat, Layer, LayerId, LayerKind,
-    LayerStatus, SizeU32, TextureRef, Transition,
+    LayerStatus, MovieInfo, MovieOverlay, MovieState, SizeU32, TextureRef, Transition,
 };
 use crate::op::{
     CopyKind, CopyOp, CopyRegion, CopySource, CopyTiming, ImageAction, ImageOp, MaskDraw, Op,
@@ -213,6 +213,16 @@ pub struct GfxState {
     /// gfx 自己不做文件 I/O,但 `CGINFO` 必须与引擎一样在**脚本执行期**
     /// 回答尺寸,否则精灵脚本的 `SX/SY` 布局全为 0(EVID-J3-03)。
     asset_sizes: BTreeMap<Vec<u8>, SizeU32>,
+    /// `YMV[FILE]` 影片元数据缓存(键 = `FILE` 原始字节)。
+    ///
+    /// 与 [`Self::asset_sizes`] 同型:gfx 不读文件,VM 解析 `YSMV` 容器头后
+    /// 经 `GraphicsHost::note_movie` 推入;`YMV` 挂接与 `YMVINFO` 查询都只读
+    /// 这份缓存,因此**同一 tick 内** `YMV[FILE]` → `YMVINFO` 能立即取到值
+    /// (官方 `0x459b98` 读的就是图层上挂好的结构)。
+    movie_metas: BTreeMap<Vec<u8>, MovieInfo>,
+    /// `MOVIE` 全屏影片画面(宿主每帧注入;`Some` = **影片模式**,其他层
+    /// 一律不显示,见 [`MovieOverlay`] 与 DIV-GFX-074)。
+    movie_overlay: Option<MovieOverlay>,
     /// 已安装字体族清单(CP932 字节,序号 = `FONTINFO[NO]`,1 基)。
     ///
     /// 宿主注入(桌面/serve 用 fontdb 的 family 列表;与渲染器实际可解析的
@@ -379,6 +389,8 @@ impl GfxState {
             cur_call_cmd: String::new(),
             windows,
             asset_sizes: BTreeMap::new(),
+            movie_metas: BTreeMap::new(),
+            movie_overlay: None,
             font_families: Vec::new(),
             screen_snapshots: BTreeMap::new(),
             last_screen_key: std::cell::Cell::new(None),
@@ -427,6 +439,35 @@ impl GfxState {
     pub fn set_asset_size(&mut self, key: &[u8], size: SizeU32) {
         self.invalidate_frame();
         self.asset_sizes.insert(key.to_vec(), size);
+    }
+
+    /// 注入 `YMV` 影片元数据(VM 解析 `YSMV` 容器头后调用;键为 `FILE` 原字节)。
+    pub fn set_movie_meta(&mut self, key: &[u8], info: MovieInfo) {
+        self.invalidate_frame();
+        self.movie_metas.insert(key.to_vec(), info);
+    }
+
+    /// 已注入的影片元数据(诊断/测试用)。
+    pub fn movie_meta(&self, key: &[u8]) -> Option<MovieInfo> {
+        self.movie_metas.get(key).copied()
+    }
+
+    /// 注入/清除 `MOVIE` 全屏影片画面。
+    ///
+    /// `Some` 进入**影片模式**:`frame()` 只投影「清屏 + 影片层」,所有脚本
+    /// 图层都不显示(官方手册 `movie/movie.html` 例 3:`MOVIE` 后其他层一律
+    /// 不可见,`MOVIE[PLAY=0]` 停止也不恢复,直到 `MOVIEEND`)。
+    pub fn set_movie_overlay(&mut self, overlay: Option<MovieOverlay>) {
+        if self.movie_overlay == overlay {
+            return;
+        }
+        self.movie_overlay = overlay;
+        self.invalidate_frame();
+    }
+
+    /// 当前影片 overlay(诊断/测试用)。
+    pub fn movie_overlay(&self) -> Option<&MovieOverlay> {
+        self.movie_overlay.as_ref()
     }
 
     /// `LOAD[ID]`:把图像作为资产挂到图层表面(存档缩略图恢复)。
@@ -627,6 +668,7 @@ impl GfxState {
                 match domain {
                     Domain::Graphics => self.dispatch(name, args),
                     Domain::Window => self.dispatch_window(name, args),
+                    Domain::Movie => self.dispatch_movie(name, args),
                     // Sound/Save/System 域各有自己的宿主消费(事件只消费一次),
                     // gfx 不看它们 —— 有意的分域,不是丢事件(Q1 自查 b 类)。
                     _ => {}
@@ -637,11 +679,65 @@ impl GfxState {
         }
     }
 
+    /// 影片模式的整帧契约:清屏 + 一张全屏纹理,不投影任何脚本图层。
+    ///
+    /// 语义来自手册 `movie/movie.html`:`MOVIE` 的画面盖在所有层之上,
+    /// 不能当图层操作;`MOVIE[PLAY=0]` 只停止播放,画面仍在(由宿主保留
+    /// 最后一帧),直到 `MOVIEEND` 才恢复图层显示。
+    fn movie_only_frame(&self, overlay: &MovieOverlay) -> CompositorFrame {
+        let mut f = CompositorFrame::new(self.frame, self.config.viewport);
+        f.clear = Clear::default_black();
+        f.dx_mode = self.config.dx_mode;
+        f.filter = self.config.filter;
+        f.image_probe_order = self.config.image_probe_order.clone();
+        f.color_space = ColorSpace::GammaEncodedSrgb8;
+        let layer = Layer {
+            id: LayerId::new(b":/MOVIE".to_vec()),
+            seq: 0,
+            z: 0,
+            alpha: 256,
+            blend: BlendMode::Normal,
+            visible: true,
+            kind: LayerKind::Image {
+                size: Some(SizeU32 {
+                    width: overlay.rect.width.max(1) as u32,
+                    height: overlay.rect.height.max(1) as u32,
+                }),
+            },
+            texture: TextureRef::Asset(overlay.asset.clone()),
+            parts: Vec::new(),
+            transform: crate::layer::Transform {
+                x: overlay.rect.x as f64,
+                y: overlay.rect.y as f64,
+                affine: Default::default(),
+            },
+            mask: None,
+            transition: None,
+            clip: None,
+            tex: 0,
+            alpha_aware: false,
+            movie: None,
+            status: LayerStatus::Executable,
+            texture_status: LayerStatus::Executable,
+            param_status: LayerStatus::Executable,
+            extra: BTreeMap::new(),
+        };
+        f.layers.push(layer.clone());
+        let mut pass = Pass::new(PassTarget::Screen);
+        pass.ops.push(Op::Layer(layer));
+        f.passes.push(pass);
+        f
+    }
+
     /// 构建当前帧的合成契约(只读;可重复调用,字节稳定)。
     pub fn frame(&self) -> CompositorFrame {
         if let Some(cached) = self.frame_cache.borrow().as_ref() {
             // 事件批次未变 ⇒ 投影必须逐位一致(见字段注释)。
             return cached.clone();
+        }
+        // 影片模式:`MOVIE` 画面盖住所有层(官方手册 movie/movie.html 例 3)。
+        if let Some(overlay) = &self.movie_overlay {
+            return self.movie_only_frame(overlay);
         }
         let mut f = CompositorFrame::new(self.frame, self.config.viewport);
         f.dx_mode = self.config.dx_mode;
@@ -686,7 +782,8 @@ impl GfxState {
                     _ => None,
                 })
                 .chain(self.image_log.iter().filter_map(|i| {
-                    let target = i.target.as_ref().unwrap_or(&i.source);
+                    // 缺 target = 原地加工(`CGACT` 只给 ID 时源即目标)。
+                    let target = i.target.as_ref().unwrap_or(&i.source); // silent-ok: 缺 target = 原地加工
                     let node = self.nodes.get(target)?;
                     // 已烘焙进常驻表面的历史项本帧不会重放,不再需要它的源快照;
                     // 否则每次存档合成都会把上一轮的缩略图快照永久钉住
@@ -791,7 +888,8 @@ impl GfxState {
             self.image_log
                 .iter()
                 .map(|i| {
-                    let target = i.target.as_ref().unwrap_or(&i.source);
+                    // 缺 target = 原地加工(同上)。
+                    let target = i.target.as_ref().unwrap_or(&i.source); // silent-ok: 缺 target = 原地加工
                     match self.nodes.get(target) {
                         Some(node) => baked.get(target).is_some_and(|(texture, alpha, seq)| {
                             *texture == node.layer.texture
@@ -812,7 +910,8 @@ impl GfxState {
             if baked_flags[idx] {
                 continue;
             }
-            let target = i.target.as_ref().unwrap_or(&i.source);
+            // 缺 target = 原地加工(同上)。
+            let target = i.target.as_ref().unwrap_or(&i.source); // silent-ok: 缺 target = 原地加工
             let target_live = self.nodes.contains_key(target) || snapshot_layers.contains(target);
             let replayable = self.nodes.contains_key(&i.source) || i.source_texture.is_some();
             // 目标已删:只有原地项能用 `source_texture` 提供基面(`in_place`),
@@ -827,7 +926,8 @@ impl GfxState {
             }
         }
         for (idx, i) in self.image_log.iter().enumerate() {
-            let target = i.target.as_ref().unwrap_or(&i.source);
+            // 缺 target = 原地加工(同上)。
+            let target = i.target.as_ref().unwrap_or(&i.source); // silent-ok: 缺 target = 原地加工
             // 已经烘进常驻表面且基图未变的旧加工项不再产生 pass。
             // 目标层可能已被 `CGEND` 删除(外字临时层 `TX.GAIJI*` 的
             // `SIZE2/MEIDO/MERGE2` 链):只要它不在本帧屏幕快照里,
@@ -1287,11 +1387,84 @@ impl GfxState {
             "CGINFO" => self.query_cginfo(args, sampler),
             "FONTINFO" => self.query_fontinfo(args),
             "WINDOWINFO" => self.query_windowinfo(args),
+            "YMVINFO" => self.query_ymvinfo(args),
             other => Err(error::unimplemented(
                 error::code::INFO_UNSUPPORTED,
                 format!("未知 INFO 命令 `{other}`"),
             )),
         }
+    }
+
+    /// `YMVINFO[ID, IDNO, LET, NUM|SX|SY|FPS]`(官方 `0x459b98`)。
+    ///
+    /// 官方语义:按 `ID[.IDNO]` 取层 → 取 `[层+0xa0]` 的影片结构 →
+    /// 把 `NUM=[+0] / SX=[+8] / SY=[+0xc] / FPS=[+0x10]` 写到 LET;
+    /// **层或影片不存在时向 LET 写 0**(int 0 / float 0.0,`0x459d63`/
+    /// `0x459de2`)。精灵脚本用 `IF[@L.YMFPS(@No)==0]` 判「不是 YMV 层」,
+    /// 因此这里不能改成“不写 LET”。
+    fn query_ymvinfo(&self, args: &[ArgValue]) -> Result<Value, Diag> {
+        let resolved = self.params.resolve("YMVINFO", args);
+        let mut id: Option<Vec<u8>> = None;
+        let mut idno: Option<i64> = None;
+        let mut flags: BTreeMap<&str, i64> = BTreeMap::new();
+        for r in resolved {
+            match r.name {
+                Some("ID") => match r.value {
+                    Value::Str(b) => id = Some(b.clone()),
+                    _ => return Err(arg_type_diag("YMVINFO", "ID", "字符串")),
+                },
+                Some("IDNO") => match int_arg(r.value) {
+                    Some(n) => idno = Some(n),
+                    None => return Err(arg_type_diag("YMVINFO", "IDNO", "整数")),
+                },
+                // `LET` 是答案目标,不进查询参数(由 VM 写回)。
+                Some("LET") => {}
+                Some(name) => {
+                    let Some(v) = int_arg(r.value) else {
+                        return Err(arg_type_diag("YMVINFO", name, "整数"));
+                    };
+                    if v != 0 {
+                        flags.insert(name, v);
+                    }
+                }
+                None => {
+                    return Err(error::unimplemented(
+                        error::code::ARG_MISSING,
+                        format!("YMVINFO 槽 {} 不在 ysc 参数表内", r.slot),
+                    ));
+                }
+            }
+        }
+        // 官方 `0x459b98` 对 `NUM/SX/SY/FPS` 是**顺序 if + 各自 ret**:
+        // 多个字段同时置位时**槽号最小的那个生效**(不是报错,也不是全写)。
+        // 这里按同一顺序取第一个存在的字段。
+        let flag = ["NUM", "SX", "SY", "FPS"]
+            .into_iter()
+            .find(|name| flags.contains_key(name));
+        let Some(flag) = flag else {
+            return Err(error::unimplemented(
+                error::code::INFO_MULTI,
+                "YMVINFO 未给出查询字段",
+            ));
+        };
+        let Some(id) = id else {
+            return Err(error::recoverable(
+                error::code::ARG_MISSING,
+                "YMVINFO 缺 ID",
+            ));
+        };
+        // 官方:层查不到 → 写 0;层存在但没挂影片 → 也写 0。
+        let value = self
+            .nodes
+            .get(&path::normalize(&id, idno, false).path)
+            .and_then(|n| n.layer.movie.as_ref())
+            .map_or(0i64, |m| match flag {
+                "NUM" => i64::from(m.info.frames),
+                "SX" => i64::from(m.info.width),
+                "SY" => i64::from(m.info.height),
+                _ => i64::from(m.info.fps),
+            });
+        Ok(Value::Int(value))
     }
 
     fn query_cginfo(
@@ -1394,7 +1567,9 @@ impl GfxState {
             "MFILE" => Value::Str(match &layer.texture {
                 TextureRef::Asset(key) => key.clone(),
                 TextureRef::Snapshot(id) => {
-                    self.snapshot_files.get(id).cloned().unwrap_or_default()
+                    // 快照没有源文件名(不是资产载入):`MFILE` 回空串,
+                    // 与官方「无文件名 = 零初始化」一致,不是吞错误。
+                    self.snapshot_files.get(id).cloned().unwrap_or_default() // silent-ok: 快照无源文件名
                 }
                 _ => Vec::new(),
             }),
@@ -1584,6 +1759,19 @@ impl GfxState {
                     format!("快照纹理 {} 尺寸未记录(源层无尺寸元数据)", id.0),
                 )),
             },
+            // 影片帧的自然尺寸 = 容器头 `width/height`(与 `Asset` 的
+            // 「资源图自然尺寸」同一条规则;脚本惯例随后用 `CGACT[SIZE]`
+            // 显式写图层矩形)。
+            TextureRef::Movie { asset, .. } => match self.movie_metas.get(asset) {
+                Some(info) => Ok(i64::from(if width { info.width } else { info.height })),
+                None => Err(error::unimplemented(
+                    error::code::INFO_ASSET_SIZE,
+                    format!(
+                        "影片元数据尚未注入(资产缺失或非 YSMV):{}",
+                        display_key(asset)
+                    ),
+                )),
+            },
             TextureRef::Offscreen(id) => {
                 let Some(n) = self.nodes.get(id) else {
                     return Err(error::unimplemented(
@@ -1661,8 +1849,9 @@ impl GfxState {
                 if let Some(n) = no {
                     // 1 基;0/负数/越界 = 空串(枚举失败即空,不报错)。
                     let idx = if n >= 1 { (n - 1) as usize } else { usize::MAX };
+                    // 字体编号 0/负数/越界 = 空串(枚举失败即空,手册口径)。
                     return Ok(Value::Str(
-                        self.font_families.get(idx).cloned().unwrap_or_default(),
+                        self.font_families.get(idx).cloned().unwrap_or_default() // silent-ok: 越界 = 空串
                     ));
                 }
                 match &self.style.name {
@@ -1725,7 +1914,8 @@ impl GfxState {
                 "WINDOWINFO 未给出查询字段",
             ));
         };
-        let no = no.unwrap_or(0);
+        // 缺 NO = 主窗口 0(引擎窗口表零初始化)。
+        let no = no.unwrap_or(0); // silent-ok: 缺 NO = 主窗口 0
         if !(0..=3).contains(&no) {
             return Err(error::unimplemented(
                 error::code::INFO_UNSUPPORTED,
@@ -1855,6 +2045,236 @@ impl GfxState {
                 error::unimplemented(error::code::COMMAND_UNIMPLEMENTED, "窗口域命令未接线"),
             ),
         }
+    }
+
+    // ------------------------------------------------------------ MOVIE(YMV)
+
+    /// `YMV` 族分派。
+    ///
+    /// 证据(0.495):`YMV`=`0x458ee0`、`YMVEND`=`0x459a64`;
+    /// `YMVINFO`=`0x459b98` 由 VM 的 `op_info` 经 `GraphicsHost::query` 同步读
+    /// (与 `CGINFO` 同型),事件本身只作事实记录。
+    fn dispatch_movie(&mut self, name: &str, args: &[ArgValue]) {
+        if !self.params.known(name) {
+            self.push_diag(
+                name,
+                error::unimplemented(
+                    error::code::COMMAND_UNKNOWN,
+                    format!("影片域命令 `{name}` 不在工程 ysc 表中"),
+                ),
+            );
+            return;
+        }
+        match name {
+            "YMV" => self.apply_ymv(args),
+            "YMVEND" => self.apply_ymvend(args),
+            "YMVINFO" => {}
+            // `MOVIE` 族是**全屏宿主**影片(手册 `movie/movie.html`:不能当
+            // 图层、盖在所有层之上):状态与解码归 `yu-rt` 与宿主的
+            // `MovieHost` 端口,gfx 不参与;事件只作事实记录。
+            "MOVIE" | "MOVIEEND" | "MOVIEINFO" => {}
+            other => self.push_diag(
+                other,
+                error::unimplemented(error::code::COMMAND_UNIMPLEMENTED, "影片域命令未接线"),
+            ),
+        }
+    }
+
+    /// 影片族共用的图层键解析:`ID[.IDNO]` → 规范化路径 + 其余参数。
+    ///
+    /// 官方 `YMV`(`0x458ee0`)/`YMVEND`(`0x459a64`)/`YMVINFO`(`0x459b98`)
+    /// 三处用同一段拼接(`0x808354` 的 `"."` + `__ultoa` 基数 10,
+    /// 见 DIV-GFX-027)。缺 `ID` 记可恢复诊断并返回 `None`;
+    /// 其余参数原样交回,由调用方各自消费(不静默丢)。
+    fn movie_layer(
+        &mut self,
+        command: &str,
+        args: &[ArgValue],
+    ) -> Option<(LayerId, Vec<(String, Value)>)> {
+        let mut id: Option<Vec<u8>> = None;
+        let mut idno: Option<i64> = None;
+        let mut rest: Vec<(String, Value)> = Vec::new();
+        for r in self.resolved_owned(command, args) {
+            match r.name.as_deref() {
+                Some("ID") => match &r.value {
+                    Value::Str(b) => id = Some(b.clone()),
+                    _ => self.arg_type(command, "ID", "字符串", &r.value),
+                },
+                Some("IDNO") => match int_arg(&r.value) {
+                    Some(n) => idno = Some(n),
+                    None => self.arg_type(command, "IDNO", "整数", &r.value),
+                },
+                Some(name) => rest.push((name.to_string(), r.value.clone())),
+                None => self.arg_slot_missing(command, r.slot),
+            }
+        }
+        let Some(id) = id else {
+            self.push_diag(
+                command,
+                error::recoverable(
+                    error::code::ARG_MISSING,
+                    format!("{command} 缺 ID(无法定位图层)"),
+                ),
+            );
+            return None;
+        };
+        Some((path::normalize(&id, idno, false).path, rest))
+    }
+
+    /// 从 `rest` 里取影片族的字符串/整数参数(类型不符记诊断)。
+    fn movie_value(
+        &mut self,
+        command: &str,
+        rest: &[(String, Value)],
+        name: &str,
+        want_str: bool,
+    ) -> Option<Value> {
+        let Some((_, value)) = rest.iter().find(|(n, _)| n == name) else {
+            return None;
+        };
+        if want_str && !matches!(value, Value::Str(_)) {
+            self.arg_type(command, name, "字符串", value);
+            return None;
+        }
+        if !want_str && int_arg(value).is_none() {
+            self.arg_type(command, name, "整数", value);
+            return None;
+        }
+        Some(value.clone())
+    }
+
+    /// 影片占用的层表面被整体重写 ⇒ 作废该层上的复制快照/加工/文本。
+    ///
+    /// 官方 `0x4593f4` 把整帧 JPEG 解进**同一个** D3D 表面(全图覆写),
+    /// 于是 `CGACT[TEXT]`/`RECTPAINT` 之类的旧绘制在下一帧就不可见。
+    /// 内核把这类记录留在日志里,必须同步清掉,否则会重放到新帧上。
+    fn reset_movie_surface(&mut self, path: &LayerId) {
+        self.prune_copy_log(|c| c.dest == *path);
+        self.image_log
+            .retain(|i| i.source != *path && i.target.as_ref() != Some(path));
+        self.baked_images.borrow_mut().remove(path);
+        self.clear_layer_texts(path);
+        self.invalidate_frame();
+    }
+
+    /// `YMV[ID, IDNO, FILE, FRAME]`(官方 `0x458ee0`)。
+    ///
+    /// - `FILE`:解析并挂接影片(元数据由 VM 推入,见
+    ///   [`Self::set_movie_meta`]);换片按 `CG[FILE]` 同型作废旧快照/加工。
+    /// - `FRAME`:帧号 <0 → 0、≥ 帧数 → 帧数-1(官方 `0x45934c` 的两处钳位),
+    ///   并置层 `alpha_aware` = 影片有 alpha(官方 `[层+0x86] = (标志==1)`)。
+    ///
+    /// 图层必须已存在(官方按 `ID[.IDNO]` 查层表,查不到走错误弹窗路径
+    /// `0x45905e`);本内核记可恢复诊断,不代建图层。
+    fn apply_ymv(&mut self, args: &[ArgValue]) {
+        let Some((path, rest)) = self.movie_layer("YMV", args) else {
+            return;
+        };
+        // `FILE=""`:官方只对 `CG` 定义过「1×1 黑」,YMV 没有这条语义 ⇒
+        // 按「未给 FILE」处理,不猜文件名。
+        let file = match self.movie_value("YMV", &rest, "FILE", true) {
+            Some(Value::Str(b)) if !b.is_empty() => Some(b),
+            _ => None,
+        };
+        let frame = self
+            .movie_value("YMV", &rest, "FRAME", false)
+            .as_ref()
+            .and_then(int_arg);
+        if !self.nodes.contains_key(&path) {
+            self.push_diag(
+                "YMV",
+                error::recoverable(
+                    error::code::LAYER_MISSING,
+                    format!("YMV 目标图层 `{}` 不存在", path.display()),
+                ),
+            );
+            return;
+        }
+
+        if let Some(asset) = file {
+            let Some(info) = self.movie_metas.get(&asset).copied() else {
+                // 数据源里没有/不是合法 YSMV:VM 已按资产缺失报过诊断;这里只
+                // 标注「挂接未发生」,不改图层现状(官方装载失败同样保留旧结构)。
+                self.push_diag(
+                    "YMV",
+                    error::recoverable(
+                        error::code::TEXTURE_MISSING,
+                        format!(
+                            "YMV 影片 `{}` 元数据未注入(资产缺失或非 YSMV)",
+                            LayerId::new(asset.clone()).display()
+                        ),
+                    ),
+                );
+                return;
+            };
+            // 缺 FRAME:官方 `YMV[FILE]` 不换帧(结构里帧号零初始化)⇒ 第 0 帧。
+            let frame_idx = clamp_frame(frame.unwrap_or(0), info.frames); // silent-ok: 缺 FRAME = 第 0 帧
+            let node = self.nodes.get_mut(&path).expect("layer checked above");
+            node.layer.movie = Some(MovieState {
+                asset: asset.clone(),
+                info,
+                frame: frame_idx,
+            });
+            node.layer.texture = TextureRef::Movie {
+                asset,
+                frame: frame_idx,
+            };
+            node.layer.alpha_aware = info.has_alpha;
+            node.layer.reset_status();
+            self.reset_movie_surface(&path);
+            return;
+        }
+
+        let Some(frame) = frame else {
+            // 只有 ID:官方按 `ID` 查层后原样返回(无可见变化)。
+            return;
+        };
+        let Some(node) = self.nodes.get_mut(&path) else {
+            return;
+        };
+        // 官方 `0x45934c` 在影片结构为空时**静默返回**(不报错):框架只在
+        // `YMVINFO[FPS] > 0` 时才发 `FRAME`,这里跟随官方保持安静。
+        let Some(movie) = node.layer.movie.as_mut() else {
+            return; // silent-ok: 官方对未挂影片的层是空操作
+        };
+        let idx = clamp_frame(frame, movie.info.frames);
+        movie.frame = idx;
+        let asset = movie.asset.clone();
+        let has_alpha = movie.info.has_alpha;
+        node.layer.texture = TextureRef::Movie {
+            asset,
+            frame: idx,
+        };
+        node.layer.alpha_aware = has_alpha;
+        self.reset_movie_surface(&path);
+    }
+
+    /// `YMVEND[ID, IDNO]`(官方 `0x459a64`):释放影片结构,保留图层本身。
+    ///
+    /// 官方只释放 `[层+0xa0]` 的结构(表面随结构释放),**不改** `[层+0x86]`
+    /// 等属性位,因此这里也不重置 `alpha_aware`。
+    fn apply_ymvend(&mut self, args: &[ArgValue]) {
+        let Some((path, _rest)) = self.movie_layer("YMVEND", args) else {
+            return;
+        };
+        let Some(node) = self.nodes.get_mut(&path) else {
+            self.push_diag(
+                "YMVEND",
+                error::recoverable(
+                    error::code::LAYER_MISSING,
+                    format!("YMVEND 目标图层 `{}` 不存在", path.display()),
+                ),
+            );
+            return;
+        };
+        if node.layer.movie.take().is_none() {
+            // 官方对未挂影片的层同样走释放入口(结构为空 = 无操作)。
+            return; // silent-ok: 结构为空时官方也是空操作
+        }
+        // 影片表面随结构释放 ⇒ 该层不再有图;位置/Z/alpha 等属性保留。
+        node.layer.texture = TextureRef::None;
+        node.layer.reset_status();
+        self.reset_movie_surface(&path);
     }
 
     fn apply_window(&mut self, args: &[ArgValue]) {
@@ -2228,7 +2648,8 @@ impl GfxState {
             // 引擎处理体是“取/建节点”:即使没有 FILE 也建一个无纹理图层,
             // 绘制遍历按 `+0x90 == 0` 跳过。手册例 4 称“图层不存在 = 错误”,
             // 这里按引擎实际 get-or-create 处理(留档,不改变可见结果)。
-            let texture = file.clone().unwrap_or(TextureRef::None);
+            // `CG` 未给 FILE = 无纹理层(get-or-create;官方遍历按纹理空跳过)。
+            let texture = file.clone().unwrap_or(TextureRef::None); // silent-ok: 无 FILE = 无纹理
             self.create_image(&parsed.path, texture, None);
             if file.is_none() {
                 self.push_diag(
@@ -2728,6 +3149,13 @@ impl GfxState {
                 }
                 TextureRef::Snapshot(id) => self.snapshot_sizes.get(id).copied(),
                 TextureRef::Offscreen(id) => self.nodes.get(id).and_then(|n| n.layer.group_size()),
+                TextureRef::Movie { asset, .. } => self
+                    .movie_metas
+                    .get(asset)
+                    .map(|m| SizeU32 {
+                        width: m.width,
+                        height: m.height,
+                    }),
                 TextureRef::None | TextureRef::SolidBlack1x1 => src_node.layer.image_size(),
             };
         }
@@ -2833,7 +3261,10 @@ impl GfxState {
             let ok = self.nodes.get(id).is_some_and(|n| {
                 matches!(
                     n.layer.texture,
-                    TextureRef::Asset(_) | TextureRef::Snapshot(_) | TextureRef::SolidBlack1x1
+                    TextureRef::Asset(_)
+                        | TextureRef::Snapshot(_)
+                        | TextureRef::SolidBlack1x1
+                        | TextureRef::Movie { .. }
                 ) && n.layer.texture_status == LayerStatus::Executable
             });
             if !ok {
@@ -3182,7 +3613,9 @@ impl GfxState {
                     Some(n)
                         if matches!(
                             n.layer.texture,
-                            TextureRef::Asset(_) | TextureRef::SolidBlack1x1
+                            TextureRef::Asset(_)
+                                | TextureRef::SolidBlack1x1
+                                | TextureRef::Movie { .. }
                         ) && n.layer.texture_status == LayerStatus::Executable =>
                     {
                         OpStatus::Executable
@@ -3201,6 +3634,7 @@ impl GfxState {
                             TextureRef::Asset(_)
                                 | TextureRef::Snapshot(_)
                                 | TextureRef::SolidBlack1x1
+                                | TextureRef::Movie { .. }
                         ) && n.layer.texture_status == LayerStatus::Executable =>
                     {
                         OpStatus::Executable
@@ -3223,12 +3657,14 @@ impl GfxState {
                             TextureRef::Asset(_)
                                 | TextureRef::Snapshot(_)
                                 | TextureRef::SolidBlack1x1
+                                | TextureRef::Movie { .. }
                         )
                         && matches!(
                             upper.layer.texture,
                             TextureRef::Asset(_)
                                 | TextureRef::Snapshot(_)
                                 | TextureRef::SolidBlack1x1
+                                | TextureRef::Movie { .. }
                         ) =>
                 {
                     OpStatus::Executable
@@ -3265,6 +3701,7 @@ impl GfxState {
                             TextureRef::Asset(_)
                                 | TextureRef::Snapshot(_)
                                 | TextureRef::SolidBlack1x1
+                                | TextureRef::Movie { .. }
                         ) && n.layer.texture_status == LayerStatus::Executable =>
                     {
                         OpStatus::Executable
@@ -3618,6 +4055,7 @@ impl GfxState {
             clip: None,
             tex: 0,
             alpha_aware: false,
+            movie: None,
             status: LayerStatus::Executable,
             texture_status: LayerStatus::Executable,
             param_status: LayerStatus::Executable,
@@ -3655,6 +4093,7 @@ impl GfxState {
             clip: None,
             tex: 0,
             alpha_aware: false,
+            movie: None,
             status: LayerStatus::Executable,
             texture_status: LayerStatus::Executable,
             param_status: LayerStatus::Executable,
@@ -3699,6 +4138,7 @@ impl GfxState {
             clip: None,
             tex: 0,
             alpha_aware: false,
+            movie: None,
             status: LayerStatus::Executable,
             texture_status: LayerStatus::Executable,
             param_status: LayerStatus::Executable,
@@ -4626,6 +5066,22 @@ fn find_f64(params: &[(String, EngineValue, bool)], name: &str) -> Option<f64> {
     find_value(params, name).and_then(|v| v.as_f64())
 }
 
+/// `YMV` 帧号钳位(官方 `0x45934c`:`<0 → 0`、`>= 帧数 → 帧数-1`)。
+///
+/// 帧数为 0 理论上不会出现(容器校验拒绝 0 帧),这里按 0 兜底。
+fn clamp_frame(frame: i64, frames: u32) -> u32 {
+    if frames == 0 {
+        return 0;
+    }
+    let max = i64::from(frames - 1);
+    frame.clamp(0, max) as u32
+}
+
+/// 资产 key 的稳定显示形式(可打印 ASCII 原样,其余 `\xNN`)。
+fn display_key(key: &[u8]) -> String {
+    LayerId::new(key.to_vec()).display()
+}
+
 /// 取**像素坐标**参数:接受整数与浮点(浮点四舍五入成整数像素)。
 ///
 /// 与 [`find_int`] 的区别:后者要求 `fract()==0`,会把
@@ -4735,7 +5191,11 @@ fn rect_paint_precheck(
     }
     let node = node.ok_or("gfx.imageop.target.unsupported")?;
     match &node.layer.texture {
-        TextureRef::Asset(_) | TextureRef::SolidBlack1x1 | TextureRef::Snapshot(_) => {}
+        // 影片帧与资源图同型:后端按 `(资产, 帧)` 物化后作为可加工基面。
+        TextureRef::Asset(_)
+        | TextureRef::SolidBlack1x1
+        | TextureRef::Snapshot(_)
+        | TextureRef::Movie { .. } => {}
         TextureRef::Offscreen(_) => return Err("gfx.imageop.target.group"),
         TextureRef::None => return Err("gfx.imageop.texture.none"),
     }
@@ -4877,6 +5337,12 @@ fn hash_texture(h: &mut impl Hasher, texture: &TextureRef) {
         TextureRef::Snapshot(id) => {
             3u8.hash(h);
             id.hash(h);
+        }
+        // 影片帧:资产 + 帧号都参与(换帧即换画面,必须让屏幕契约失效)。
+        TextureRef::Movie { asset, frame } => {
+            5u8.hash(h);
+            asset.hash(h);
+            frame.hash(h);
         }
         TextureRef::None => 4u8.hash(h),
     }

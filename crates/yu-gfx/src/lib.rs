@@ -64,8 +64,9 @@ pub use host::{GfxHost, LayerCapture};
 pub use layer::{
     fixed_pipeline_alpha, shader_alpha, transition_coverage, Affine, BlendConfidence, BlendFactor,
     BlendMode, BlendOp, CopyId, EngineValue, FixedPipelineState, ImageFormat, Layer, LayerId,
-    LayerKind, LayerStatus, RectI, SizeU32, StageArg, StageOp, StageState, TextureFactorRule,
-    TextureRef, Transform, Transition,
+    LayerKind, LayerStatus, MovieInfo, MovieOverlay, MovieState, RectI, SizeU32, StageArg,
+    StageOp, StageState,
+    TextureFactorRule, TextureRef, Transform, Transition,
 };
 pub use op::{
     CopyKind, CopyOp, CopyRegion, CopySource, CopyTiming, ImageAction, ImageOp, MaskDraw, Op,

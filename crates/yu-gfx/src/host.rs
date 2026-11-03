@@ -103,6 +103,10 @@ impl GraphicsHost for GfxHost {
             .set_asset_size(key, crate::layer::SizeU32 { width, height });
     }
 
+    fn note_movie(&mut self, key: &[u8], info: yu_rt::event::MovieInfo) {
+        self.state.borrow_mut().set_movie_meta(key, info);
+    }
+
     fn set_pointer(&mut self, x: i64, y: i64) {
         self.state.borrow_mut().set_pointer(x, y);
     }

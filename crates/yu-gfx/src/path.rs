@@ -7,12 +7,8 @@
 //!
 //! 引擎证据(会话 F 重新锚定):`FUN_004141e4` 把“基准路径 + ID”规范化
 //! (`:` 根、`/` 层级、`.`/`..`、空串),`FUN_00414559` 用 MurmurHash 查层表;
-//! `FUN_00413dc8` 对 `TID`/`MID` 走同一套解析。`IDNO` 的十进制后缀拼接
-//! 仍来自旁线笔记(旧地址 `0x43d334/0x43d4a4` 在本地反编译树不存在,
-//! 已从引用中移除;该拼接方式保持 **Uncertain**,见验证台账 B12)。
-//!
-//! TODO(DIV-GFX-027):`IDNO` 十进制后缀拼接未重新锚定;若引擎实际用
-//! 其他分隔/编号方式,路径会不同。
+//! `FUN_00413dc8` 对 `TID`/`MID` 走同一套解析。`IDNO` 的拼接方式已重新
+//! 锚定:**`<ID>.<十进制>`**(见 [`normalize`] 的锚点;DIV-GFX-027 勘误)。
 //!
 //! 规范化结果以 `:/` 开头、无尾部 `/`;组/层的区别由调用方单独记录。
 
@@ -32,15 +28,22 @@ pub struct ParsedPath {
 
 /// 规范化一个图层 ID。
 ///
-/// `idno` 存在时把十进制**直接接在 ID 尾部**(无分隔符)。证据:官方
-/// `CG`/`CGACT` 的 ID 解析块先把 ID 拷进缓冲,再用
-/// `lea edx,[eax+buf]`(指向字符串 NUL)作为目标调用 `__itoa`(基数 10)
-/// 追加数字 —— `0x42c765..0x42c77c`(CGACT ID3)、`0x42c542..0x42c54c`
-/// (CGACT ID)以及 CG 的同型块。旧实现拼的是 `ID + "." + 十进制`
-/// (DIV-GFX-027),多了一个点。
+/// `idno` 存在时拼成 `<ID>.<十进制>`——**点分隔**(DIV-GFX-027 勘误,
+/// 2026-11-03)。证据(0.495 官方处理体,capstone 线性反汇编):
+///
+/// - `YMV`(`0x458f51..0x458f96`)、`YMVEND`(`0x459ad5..0x459b14`)、
+///   `YMVINFO`(`0x459c06..0x459c41`)三处同型:先把 ID 拷进缓冲,再从
+///   常量 `0x808354`(字节 `2e 00 00 00`,即 `"."`)追加一个点,最后
+///   以缓冲 NUL 位置为目标调用 `0x46a7c0`(`__ultoa`,基数 10)追加十进制;
+/// - `CGACT` 的同型块 `0x42c533..0x42c576`(点常量同址)与
+///   `0x42c735..0x42c77c` 亦同。
+///
+/// 早前把 `0x42c542..0x42c54c` 那段**点追加循环**误读成 itoa 追加,因而
+/// 去掉了点(旧口径「多了一个点」不成立;语料 0 次使用 IDNO,差异未暴露)。
 pub fn normalize(id: &[u8], idno: Option<i64>, trailing_slash: bool) -> ParsedPath {
     let mut bytes = id.to_vec();
     if let Some(n) = idno {
+        bytes.push(b'.');
         bytes.extend_from_slice(n.to_string().as_bytes());
     }
     normalize_bytes(&bytes, trailing_slash)
@@ -185,10 +188,14 @@ mod tests {
     }
 
     #[test]
-    fn idno_is_decimal_suffix() {
+    fn idno_is_dot_decimal_suffix() {
+        // 官方 `0x808354` 的 `"."` + `__ultoa(10)`(DIV-GFX-027 勘误)。
         let p = normalize(b"bg/title", Some(2), false);
-        assert_eq!(p.path.display(), ":/W0/bg/title2");
+        assert_eq!(p.path.display(), ":/W0/bg/title.2");
         assert!(!p.is_dir);
+        // 负数沿用 `__ultoa` 的十进制写法,不做特殊处理。
+        let p = normalize(b"id", Some(-1), false);
+        assert_eq!(p.path.display(), ":/W0/id.-1");
     }
 
     #[test]

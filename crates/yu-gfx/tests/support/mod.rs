@@ -157,6 +157,11 @@ fn command_list() -> Vec<FmtCommand> {
             ],
         ),
         string_cmd("CGEND", &["ID", "IDNO"]),
+        // 影片族(0.495 ysc 声明序:YMV(ID,IDNO,FILE,FRAME)、
+        // YMVEND(ID,IDNO)、YMVINFO(ID,IDNO,LET,NUM,SX,SY,FPS))。
+        string_cmd("YMV", &["ID", "IDNO", "FILE", "FRAME"]),
+        string_cmd("YMVEND", &["ID", "IDNO"]),
+        string_cmd("YMVINFO", &["ID", "IDNO", "LET", "NUM", "SX", "SY", "FPS"]),
         // 槽序 = 工程 `ysc.ybn` 的 WINDOW 声明序(两个样本工程一致;
         // `cargo run -p yu-engine --example probe_cmd_params -- <root> WINDOW`)。
         string_cmd(

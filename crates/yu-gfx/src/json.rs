@@ -169,6 +169,13 @@ fn texture(out: &mut String, t: &TextureRef) {
             out.push_str(&id.0.to_string());
             out.push('}');
         }
+        TextureRef::Movie { asset, frame } => {
+            out.push_str("{\"kind\":\"movie\",\"asset\":");
+            esc_bytes(out, asset);
+            out.push_str(",\"frame\":");
+            out.push_str(&frame.to_string());
+            out.push('}');
+        }
         TextureRef::None => out.push_str("{\"kind\":\"none\"}"),
     }
 }
@@ -1060,6 +1067,7 @@ mod tests {
             clip: None,
             tex: 0,
             alpha_aware: false,
+            movie: None,
             status: LayerStatus::Executable,
             texture_status: LayerStatus::Executable,
             param_status: LayerStatus::Executable,
