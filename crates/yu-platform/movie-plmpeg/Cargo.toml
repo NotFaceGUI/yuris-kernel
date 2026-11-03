@@ -1,0 +1,13 @@
+[package]
+name = "yu-movie-plmpeg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MOVIE 播放后端:内嵌 pl_mpeg 移植(Rust),纯软件解码,桌面/Android 同构"
+
+[dependencies]
+yu-log = { path = "../../yu-log" }
+yu-rt = { path = "../../yu-rt" }
+# pl_mpeg 的纯 Rust 移植(MPEG-1 program stream demux + MPEG-1 视频 + MP2 音频)。
+# 只取 plmpeg 模块,不启用 av(FFmpeg 声明)等可选模块。
+southstar-codecs = { version = "1.0.5", default-features = false }

@@ -2819,6 +2819,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "southstar-build"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae475b9d1f1ce65f0fb0f7438948f0fa4e38b57b11cd36bc3881fa69628669e2"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "southstar-codecs"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4db934e3f06ab7add39a68ff975656daa3ea681575ec3681a71393264233a31"
+dependencies = [
+ "southstar-build",
+]
+
+[[package]]
 name = "spirv"
 version = "0.4.0+sdk-1.4.341.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4182,6 +4200,7 @@ dependencies = [
  "yu-format",
  "yu-gfx",
  "yu-log",
+ "yu-movie-plmpeg",
  "yu-render-core",
  "yu-rt",
  "yu-save",
@@ -4285,6 +4304,15 @@ name = "yu-log"
 version = "0.1.0"
 dependencies = [
  "log",
+]
+
+[[package]]
+name = "yu-movie-plmpeg"
+version = "0.1.0"
+dependencies = [
+ "southstar-codecs",
+ "yu-log",
+ "yu-rt",
 ]
 
 [[package]]

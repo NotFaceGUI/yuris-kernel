@@ -249,6 +249,16 @@ impl GfxCapture {
                     base = Some(self.soft.textures_mut().resolve_shared(key).ok()?);
                     break;
                 }
+                TextureRef::Movie { asset, frame } => {
+                    // 影片帧与资产同型:走同一像素缓存(DIV-GFX-073)。
+                    base = Some(
+                        self.soft
+                            .textures_mut()
+                            .resolve_movie_shared(asset, *frame)
+                            .ok()?,
+                    );
+                    break;
+                }
                 TextureRef::SolidBlack1x1 => {
                     base = Some(Rc::new(Texture::solid_black_1x1()));
                     break;
@@ -357,6 +367,17 @@ impl LayerCapture for GfxCapture {
                 self.soft
                     .textures_mut()
                     .resolve(key)
+                    .ok()
+                    .map(|texture| Surface {
+                        width: texture.width,
+                        height: texture.height,
+                        rgba: texture.rgba.clone(),
+                    })
+            }
+            TextureRef::Movie { asset, frame } => {
+                self.soft
+                    .textures_mut()
+                    .resolve_movie(asset, *frame)
                     .ok()
                     .map(|texture| Surface {
                         width: texture.width,

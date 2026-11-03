@@ -15,6 +15,7 @@ members = [
     "crates/yu-platform/host-desktop",
     "crates/yu-platform/host-wasm",
     "crates/yu-platform/host-android",
+    "crates/yu-platform/movie-plmpeg",
     "crates/yu-platform/input",
     "crates/yu-render/core",
     "crates/yu-render/soft",
@@ -37,3 +38,19 @@ debug = false
 
 [profile.test.package.libz-sys]
 debug = false
+
+# 图像解码同理:zune-jpeg 是纯计算密集的第三方实现,dev 档未优化时单帧
+# 400×300 解码要 ~27 ms,release 只要 0.6 ms(B14 实测,45×)。影片播放每换
+# 一帧都解两张 JPEG,dev 档会把 60 fps 直接打到 30 fps —— 与实现无关,只是
+# 构建档位。这里只给解码器提优化级别,本仓库代码仍按 dev 档调试。
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.test.package.zune-jpeg]
+opt-level = 3
+
+[profile.test.package.image]
+opt-level = 3

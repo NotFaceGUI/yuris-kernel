@@ -517,6 +517,14 @@ impl Renderer {
     /// family 若缺假名字形,日文会整体不渲染 —— 单选项 = 默认字体,设定页
     /// 字体列表可渲染、选择写入 GSD 的也是安全值,不会再除零
     /// (`es_config_font` 的 `@mFontNum=0` 分支)。
+    /// 纹理缓存(`MOVIE` 影片帧注入等宿主合成资产用)。
+    fn textures_mut(&mut self) -> &mut TextureStore {
+        match self {
+            Renderer::Soft(renderer) => renderer.textures_mut(),
+            Renderer::Wgpu { renderer, .. } => renderer.textures_mut(),
+        }
+    }
+
     fn font_families(&mut self) -> Vec<Vec<u8>> {
         match self {
             Renderer::Soft(renderer) => renderer
@@ -1188,6 +1196,7 @@ impl Engine {
                 );
             }
         }
+        self.sync_movie_overlay();
         let build_started = Instant::now();
         let frame = self
             .state
@@ -1537,6 +1546,60 @@ impl Engine {
                 )
             })
             .collect()
+    }
+
+    /// `MOVIE` 全屏影片:每 tick 从端口取当前帧、注入纹理缓存,并把
+    /// **投影尺寸**交给图形域(官方 `0x44b418` 的换算)。
+    ///
+    /// 官方规则:`目标宽 = SX * 窗口宽 / 影片宽`(缺省 `SX = 影片宽`
+    /// ⇒ 铺满窗口),`X/Y` 直接加在客户区原点。播放时钟用逻辑帧时钟
+    /// (`frame * frame_ms`),与其它内核状态同一条可复现时间轴。
+    fn sync_movie_overlay(&mut self) {
+        /// 影片帧的合成资产 key(每帧覆盖;不进 VFS)。
+        const MOVIE_KEY: &[u8] = b":movie/current";
+        let Some(state) = self.state.clone() else {
+            return;
+        };
+        let Some(vm) = self.vm.as_mut() else {
+            state.borrow_mut().set_movie_overlay(None);
+            return;
+        };
+        if !vm.movie_mode() {
+            state.borrow_mut().set_movie_overlay(None);
+            return;
+        }
+        let now_ms = u64::from(self.frame as u32).saturating_mul(u64::from(self.opts.frame_ms()));
+        let mut media = None;
+        let mut pixels = None;
+        if let Some(host) = vm.movie_host_mut() {
+            media = host.media_size();
+            if let Some(frame) = host.frame(now_ms) {
+                pixels = Some((frame.width, frame.height, frame.rgba.to_vec()));
+            }
+        }
+        if let Some((width, height, rgba)) = pixels {
+            self.renderer
+                .textures_mut()
+                .insert_rgba(MOVIE_KEY, width, height, rgba);
+        }
+        let geometry = vm.movie_state().geometry;
+        let (win_w, win_h) = (self.viewport.width as f64, self.viewport.height as f64);
+        let (movie_w, movie_h) = media.map_or((win_w, win_h), |(w, h)| (w as f64, h as f64));
+        // 缺省 SX/SY = 影片原始宽高 ⇒ 满屏(官方缺省值)。
+        let sx = if geometry.sx > 0.0 { geometry.sx } else { movie_w };
+        let sy = if geometry.sy > 0.0 { geometry.sy } else { movie_h };
+        let width = (sx * win_w / movie_w.max(1.0)).round() as i64;
+        let height = (sy * win_h / movie_h.max(1.0)).round() as i64;
+        let rect = yu_gfx::RectI {
+            x: geometry.x.round() as i64,
+            y: geometry.y.round() as i64,
+            width: width.max(1),
+            height: height.max(1),
+        };
+        state.borrow_mut().set_movie_overlay(Some(yu_gfx::MovieOverlay {
+            asset: MOVIE_KEY.to_vec(),
+            rect,
+        }));
     }
 
     fn accumulate_frame_diags(&mut self, frame: &CompositorFrame) {
@@ -2127,6 +2190,9 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         None
     };
     vm.set_graphics_host(Box::new(gfx_host));
+    // `MOVIE` 全屏影片:内嵌 pl_mpeg 移植(纯软件 MPEG-1;桌面/Android 同构)。
+    // 内核只做语义,解码/呈现全在端口之后(见 DIV-GFX-074)。
+    vm.set_movie_host(Box::new(yu_movie_plmpeg::PlmMovieHost::new()));
     let sound_state = if opts.os_sound {
         // 声音初始化跟随 `@_OS_SOUND` 开关：关时不装宿主（行为与 M-2 一致）。
         let loader = VfsSoundLoader {
@@ -2156,6 +2222,11 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         // 依据:该 DLL 导出 `YSSnp_Compress`/`YSSnp_Uncompress`,实机存档块
         // 逐块解出即 Snappy;0.495 SDK 存档块首为 `78 01`(zlib level 1)。
         if let Ok(mut state) = save_state.lock() {
+            // 容器版本兜底:**工程 yscfg 版本**(0.481=481 / 0.495=495)。
+            // 盘上已有同名存档时 `flush` 仍优先沿用该文件自己的版本;
+            // 没有可参照的 `.sd` 时不再拒绝写盘(此前会让新工程首次
+            // SAVE 直接报 `sv.container`)。块压缩层见下。
+            state.set_container_version(vm.tables().boot.config.version);
             // 宿主显式指定的层优先于引擎代号信号(`--save-codec`)。
             state.set_block_codec(
                 opts.save_codec
