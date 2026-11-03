@@ -233,6 +233,11 @@ pub fn text_base_key(texture: &TextureRef, override_hash: Option<u64>) -> u64 {
             feed(key);
         }
         TextureRef::SolidBlack1x1 => feed(b"B"),
+        TextureRef::Movie { asset, frame } => {
+            feed(b"Y");
+            feed(asset);
+            feed(&frame.to_le_bytes());
+        }
         TextureRef::Snapshot(id) => {
             feed(b"S");
             feed(&id.0.to_le_bytes());

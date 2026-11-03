@@ -28,6 +28,8 @@ pub mod code {
     pub const DECODE: &str = "asset.decode";
     /// 格式已识别但没有解码器(PSB/未知码)。
     pub const UNSUPPORTED: &str = "asset.unsupported";
+    /// `YMV` 影片容器/帧不合法(魔数、表越界、帧号越界)。
+    pub const MOVIE: &str = "asset.movie";
 }
 
 /// 一张已解码的 RGBA8 纹理(行优先、无预乘)。
@@ -127,6 +129,13 @@ pub struct TextureStore {
     clock: u64,
     /// `key → (字节, 最近访问序)`(预算记账;与 `cache` 同步增删)。
     meta: BTreeMap<Vec<u8>, (usize, u64)>,
+    /// `key → 最近一次内容写入的序号`(与 LRU 的 `clock` 分开)。
+    ///
+    /// `insert_cached` 每次覆盖条目都会推进;`touch` 只动 LRU,不改这里。
+    /// 后端用它判断「同一 key 的 CPU 侧像素是否被替换」——不能用
+    /// `Rc::as_ptr`(旧 `Rc` 释放后新分配可能复用同一地址)或 `meta` 的
+    /// LRU 时钟(`touch` 会推进)。
+    inserted: BTreeMap<Vec<u8>, u64>,
     /// 本帧新插入的 key(预算执行时豁免;防止预热批次在渲染前被回收)。
     fresh: std::collections::BTreeSet<Vec<u8>>,
     /// 已回收条目数(诊断)。
@@ -138,6 +147,33 @@ pub struct TextureStore {
     name_fallback: bool,
     /// 走了名称编码回退的解析次数(诊断)。
     name_fallback_hits: u64,
+    /// `YMV` 每个资产**最近解析的帧号**(只保留一帧,见 [`Self::movie_frame`])。
+    movie_keeper: BTreeMap<Vec<u8>, u32>,
+    /// `YMV` **常驻容器**缓存(键 = `YMV[FILE]` 原字节)。
+    ///
+    /// 官方在 `YMV[FILE]` 时一次性读入并解混淆全部平面,之后换帧只切段;
+    /// 这里同样只读一次包。`Rc` 共享,克隆 O(1);缺失/坏容器也缓存,
+    /// 避免每帧重读重解析。
+    movies: BTreeMap<Vec<u8>, MovieSlot>,
+}
+
+/// 一个影片资产的常驻状态(见 [`TextureStore::movie_container`])。
+#[derive(Clone)]
+enum MovieSlot {
+    /// 资产不存在(两种候选都没命中)。
+    Missing,
+    /// 已解析并解混淆的容器。
+    Ready {
+        /// 命中的资产路径(诊断用)。
+        path: Vec<u8>,
+        container: std::rc::Rc<yu_format::ymv::DecryptedYmv>,
+    },
+    /// 文件存在但不是合法 `YSMV`(诊断随槽位缓存,只报一次)。
+    Broken {
+        path: Vec<u8>,
+        code: String,
+        detail: String,
+    },
 }
 
 impl TextureStore {
@@ -169,11 +205,14 @@ impl TextureStore {
             resident_bytes: 0,
             clock: 0,
             meta: BTreeMap::new(),
+            inserted: BTreeMap::new(),
             fresh: std::collections::BTreeSet::new(),
             evicted: 0,
             budget_warned: false,
             name_fallback,
             name_fallback_hits: 0,
+            movie_keeper: BTreeMap::new(),
+            movies: BTreeMap::new(),
         }
     }
 
@@ -208,6 +247,7 @@ impl TextureStore {
 
     fn insert_cached(&mut self, key: Vec<u8>, cached: Cached) {
         self.clock = self.clock.wrapping_add(1);
+        self.inserted.insert(key.clone(), self.clock);
         let bytes = cached
             .result
             .as_ref()
@@ -243,6 +283,7 @@ impl TextureStore {
         for (key, _) in failed.into_iter().take(excess) {
             self.cache.remove(&key);
             self.meta.remove(&key);
+            self.inserted.remove(&key);
             self.fresh.remove(&key);
         }
     }
@@ -290,6 +331,7 @@ impl TextureStore {
             };
             self.cache.remove(&key);
             self.fresh.remove(&key);
+            self.inserted.remove(&key);
             if let Some((bytes, _)) = self.meta.remove(&key) {
                 self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
                 self.evicted += 1;
@@ -337,6 +379,16 @@ impl TextureStore {
         }
     }
 
+    /// `key` 最近一次内容写入的版本序号。
+    ///
+    /// 由 [`Self::insert_cached`] 推进;`touch` 的 LRU 更新不改它。GPU 后端
+    /// 用它判断同一个 key 的 CPU 侧像素是否被替换(影片帧每帧经
+    /// `insert_rgba` 覆盖 `:movie/current`)。
+    #[must_use]
+    pub fn generation(&self, key: &[u8]) -> Option<u64> {
+        self.inserted.get(key).copied()
+    }
+
     /// 解析资产并共享缓存纹理(`Rc` 克隆,O(1))。
     ///
     /// GPU 后端的 CPU 图像加工(`MERGE` 的上层源)用它:旧实现每次解析都把
@@ -381,6 +433,8 @@ impl TextureStore {
     pub fn resolve_ref(&mut self, texture: &TextureRef) -> Result<&Texture, Diag> {
         match texture {
             TextureRef::Asset(key) => self.resolve(key),
+            // `YMV[FRAME]`:按 `(资产, 帧)` 物化(颜色 JPEG + alpha 灰度 JPEG)。
+            TextureRef::Movie { asset, frame } => self.resolve_movie(asset, *frame),
             TextureRef::SolidBlack1x1 => Ok(&self.solid),
             TextureRef::Offscreen(id) => Err(unimplemented(
                 code::UNSUPPORTED,
@@ -393,6 +447,136 @@ impl TextureStore {
                 "快照纹理:COPY 时序未取证,后端不物化",
             )),
             TextureRef::None => Err(unimplemented(code::UNSUPPORTED, Vec::new(), "图层没有纹理")),
+        }
+    }
+
+    /// 物化 `YMV` 影片的某一帧(颜色平面 + alpha 平面 → RGBA8)。
+    ///
+    /// 缓存键是 `(资产, 帧)` 的合成键(以 NUL 开头,不可能与真实资产路径
+    /// 冲突),因此同帧的重绘只解码一次。每个资产**只保留最近一帧**(见
+    /// [`Self::ensure_movie`]):影片一次只显示一帧,若把 306 帧全留在缓存
+    /// 里,一部 400×300 影片会占到 ~147MB 并与普通资产抢 LRU 预算。
+    ///
+    /// 官方语义(0.495 `0x45934c`):帧号已在 gfx 侧钳位;颜色段解到图层
+    /// 表面、`alpha 标志 == 1` 时灰度段作 alpha(`0x4593f4`/`0x459964`)。
+    /// 本实现在这里合成一张 RGBA 纹理,后端两类(soft/wgpu)都按普通资产
+    /// 消费,不感知影片。
+    pub fn resolve_movie(&mut self, asset: &[u8], frame: u32) -> Result<&Texture, Diag> {
+        self.movie_frame(asset, frame)?;
+        let key = movie_cache_key(asset, frame);
+        let entry = self.cache.get(&key).expect("movie frame ensured above");
+        Ok(entry
+            .result
+            .as_ref()
+            .expect("movie_frame 只在该帧成功时返回 Ok"))
+    }
+
+    /// 同 [`Self::resolve_movie`],返回共享句柄(`Rc` 克隆,O(1))。
+    pub fn resolve_movie_shared(
+        &mut self,
+        asset: &[u8],
+        frame: u32,
+    ) -> Result<std::rc::Rc<Texture>, Diag> {
+        self.movie_frame(asset, frame)
+    }
+
+    /// 注入一张**由宿主解码**的纹理(键 = 合成资产 key)。
+    ///
+    /// 用于 `MOVIE` 全屏影片:解码在平台端口之后(pl_mpeg/系统媒体栈),
+    /// 像素按帧送进来,渲染端只负责当普通资产采样 —— 与 `LOAD[ID]` 的
+    /// 合成资产同一模式。同键重复注入 = 覆盖(帧在变),不新增缓存项。
+    pub fn insert_rgba(&mut self, key: &[u8], width: u32, height: u32, rgba: Vec<u8>) {
+        debug_assert_eq!(rgba.len(), width as usize * height as usize * 4);
+        let texture = std::rc::Rc::new(Texture {
+            width,
+            height,
+            rgba,
+        });
+        let cached = Cached {
+            resolved: Some(key.to_vec()),
+            result: Ok(texture),
+        };
+        self.insert_cached(key.to_vec(), cached);
+    }
+
+    /// 取影片**常驻容器**(按 `YMV[FILE]` 原字节缓存;缺失/坏容器也缓存)。
+    ///
+    /// 官方 `0x459094` 在 `YMV[FILE]` 命令内把整份影片读进内存并**解混淆
+    /// 全部平面**,之后 `YMV[FRAME]`(`0x45934c`)只在这份缓冲上切段 ⇒
+    /// 播放期每帧只有两张 JPEG 解码。若每帧回包重读 + 重做 XOR,6MB 读取
+    /// 与 zlib 解压会把 30fps 打穿(`Rc` 共享同一份,克隆 O(1))。
+    fn movie_container(&mut self, asset: &[u8]) -> MovieSlot {
+        if let Some(hit) = self.movies.get(asset) {
+            return hit.clone();
+        }
+        let mut candidates: Vec<Vec<u8>> = vec![asset.to_vec()];
+        let mut with_ext = asset.to_vec();
+        with_ext.extend_from_slice(b".ymv");
+        candidates.push(with_ext);
+        let mut slot = MovieSlot::Missing;
+        for candidate in candidates {
+            let Ok(lookup) = LookupKey::new(&candidate, self.codec) else {
+                continue;
+            };
+            if !self.source.exists(&lookup) {
+                continue;
+            }
+            let Ok(bytes) = self.source.open(&lookup) else {
+                continue;
+            };
+            slot = match yu_format::ymv::DecryptedYmv::parse(&bytes, &candidate) {
+                Ok(container) => MovieSlot::Ready {
+                    path: candidate,
+                    container: std::rc::Rc::new(container),
+                },
+                Err(diag) => MovieSlot::Broken {
+                    path: candidate,
+                    code: diag.code.to_string(),
+                    detail: diag.detail.clone(),
+                },
+            };
+            break;
+        }
+        self.movies.insert(asset.to_vec(), slot.clone());
+        slot
+    }
+
+    /// 物化影片帧并返回共享句柄(两个 `resolve_movie*` 的共同实现)。
+    ///
+    /// 换到新帧时把该资产的**上一帧**从缓存摘掉(已交给图层/快照的 `Rc`
+    /// 不受影响,只是不再命中);失败的帧同样缓存,避免每帧重探。
+    fn movie_frame(&mut self, asset: &[u8], frame: u32) -> Result<std::rc::Rc<Texture>, Diag> {
+        let key = movie_cache_key(asset, frame);
+        if !self.cache.contains_key(&key) {
+            let cached = self.load_movie(asset, frame);
+            self.insert_cached(key.clone(), cached);
+            if let Some(previous) = self.movie_keeper.insert(asset.to_vec(), frame) {
+                if previous != frame {
+                    let stale = movie_cache_key(asset, previous);
+                    self.cache.remove(&stale);
+                    self.inserted.remove(&stale);
+                    if let Some((bytes, _)) = self.meta.remove(&stale) {
+                        self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
+                    }
+                    self.fresh.remove(&stale);
+                }
+            }
+        }
+        self.touch(&key);
+        let entry = self.cache.get(&key).expect("cache entry inserted above");
+        match &entry.result {
+            Ok(tex) => Ok(std::rc::Rc::clone(tex)),
+            Err(diag) => {
+                // 问题清单按**资产** key 记(合成键对使用者无意义)。
+                let issue = AssetIssue {
+                    key: asset.to_vec(),
+                    code: diag.code.to_string(),
+                    detail: diag.detail.clone(),
+                };
+                self.issues
+                    .insert((asset.to_vec(), issue.code.clone()), issue);
+                Err(diag.clone())
+            }
         }
     }
 
@@ -651,6 +835,158 @@ impl TextureStore {
         }
     }
 
+    /// 解码 `YMV` 影片的一帧(失败也计时/记字节,口径与 [`Self::load`] 一致)。
+    fn load_movie(&mut self, asset: &[u8], frame: u32) -> Cached {
+        let started = std::time::Instant::now();
+        let cached = self.load_movie_inner(asset, frame);
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        self.decode_us = self.decode_us.saturating_add(elapsed_us);
+        if let Ok(texture) = &cached.result {
+            self.decode_bytes = self.decode_bytes.saturating_add(texture.rgba.len() as u64);
+            if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
+                log::warn!(
+                    target: "yu-render",
+                    "[movie] asset={} frame={} size={}x{} bytes={} decode={}us",
+                    display_bytes(asset),
+                    frame,
+                    texture.width,
+                    texture.height,
+                    texture.rgba.len(),
+                    elapsed_us
+                );
+            }
+        }
+        cached
+    }
+
+    /// 读影片资产 → 解析容器 → 解该帧两段 JPEG → 合成 RGBA8。
+    ///
+    /// 候选序:`YMV[FILE]` 原字节 → `原字节 + ".ymv"`(语料两种写法都有;
+    /// 见 `yu-rt` 的 `resolve_movie_meta`,两处必须同口径,否则会出现
+    /// 「VM 量到元数据、渲染端却找不到资产」)。
+    ///
+    /// **容器字节按资产缓存**(见 [`Self::movie_bytes`]):官方 `0x459094`
+    /// 在 `YMV[FILE]` 时把整份影片读进内存,之后换帧只在该缓冲上切段
+    /// (`0x45934c`);若每帧回包重读,单是 6MB 读取+解压就能把 30fps 打穿
+    /// (实测掉到 30fps、render 1.35ms→10ms)。
+    fn load_movie_inner(&mut self, asset: &[u8], frame: u32) -> Cached {
+        let container = match self.movie_container(asset) {
+            MovieSlot::Missing => {
+                return Cached {
+                    resolved: None,
+                    result: Err(unimplemented(
+                        code::MISSING,
+                        asset.to_vec(),
+                        format!("影片资产不存在: {}", display_bytes(asset)),
+                    )),
+                };
+            }
+            MovieSlot::Broken {
+                path,
+                code,
+                detail,
+            } => {
+                return Cached {
+                    resolved: Some(path),
+                    result: Err(Diag::recoverable(code::MOVIE, Boundary::Data)
+                        .at_data(asset.to_vec(), 0)
+                        .with_detail(format!("{code}: {detail}"))),
+                };
+            }
+            MovieSlot::Ready { path, container } => (path, container),
+        };
+        let (candidate, container) = container;
+        let ymv = &container;
+        let info = ymv.info();
+        if frame >= info.frames {
+            return Cached {
+                resolved: Some(candidate),
+                result: Err(Diag::recoverable(code::MOVIE, Boundary::Data)
+                    .at_data(asset.to_vec(), 0)
+                    .with_detail(format!(
+                        "帧号 {frame} 越界(影片共 {} 帧;gfx 侧应已钳位)",
+                        info.frames
+                    ))),
+            };
+        }
+        let Some((color_jpeg, alpha_jpeg)) = ymv.frame_planes(frame) else {
+            return Cached {
+                resolved: Some(candidate),
+                result: Err(Diag::recoverable(code::MOVIE, Boundary::Data)
+                    .at_data(asset.to_vec(), 0)
+                    .with_detail(format!("第 {frame} 帧段区间不可读"))),
+            };
+        };
+        let color = match image::load_from_memory(color_jpeg) {
+            Ok(img) => img.to_rgb8(),
+            Err(err) => {
+                return Cached {
+                    resolved: Some(candidate),
+                    result: Err(Diag::recoverable(code::DECODE, Boundary::Data)
+                        .at_data(asset.to_vec(), 0)
+                        .with_detail(format!("颜色平面 JPEG 解码失败(帧 {frame}): {err}"))),
+                };
+            }
+        };
+        let (width, height) = (color.width(), color.height());
+        if width == 0 || height == 0 {
+            return Cached {
+                resolved: Some(candidate),
+                result: Err(Diag::recoverable(code::DECODE, Boundary::Data)
+                    .at_data(asset.to_vec(), 0)
+                    .with_detail(format!("颜色平面尺寸为 0(帧 {frame})"))),
+            };
+        }
+        // alpha 平面:只有 `标志 == 1` 且段存在时才合成;尺寸不一致时按
+        // 「无 alpha」处理(畸形容器不猜,记诊断)。
+        let mut alpha_note = None;
+        let alpha = alpha_jpeg.and_then(|jpeg| match image::load_from_memory(jpeg) {
+            Ok(img) => {
+                let luma = img.to_luma8();
+                if luma.width() == width && luma.height() == height {
+                    Some(luma.into_raw())
+                } else {
+                    alpha_note = Some(format!(
+                        "alpha 平面 {}x{} 与颜色平面 {}x{} 不一致;按不透明处理",
+                        luma.width(),
+                        luma.height(),
+                        width,
+                        height
+                    ));
+                    None
+                }
+            }
+            Err(err) => {
+                alpha_note = Some(format!("alpha 平面 JPEG 解码失败: {err};按不透明处理"));
+                None
+            }
+        });
+        let mut rgba = Vec::with_capacity(color.as_raw().len() / 3 * 4);
+        let rgb = color.as_raw();
+        for (i, px) in rgb.chunks_exact(3).enumerate() {
+            rgba.extend_from_slice(px);
+            rgba.push(alpha.as_ref().map_or(255, |a| a[i]));
+        }
+        if let Some(note) = alpha_note {
+            log::warn!(
+                target: "yu-render",
+                "[movie] {} 帧 {}:{}",
+                display_bytes(asset),
+                frame,
+                note
+            );
+        }
+        self.decoded += 1;
+        Cached {
+            resolved: Some(candidate),
+            result: Ok(std::rc::Rc::new(Texture {
+                width,
+                height,
+                rgba,
+            })),
+        }
+    }
+
     /// 并行预热一批尚未缓存的资产：顺序读包 + 多线程图像解码，最后按输入
     /// 顺序写回缓存。互不依赖的资产解码可并行；帧边界/插入顺序不变。
     ///
@@ -859,12 +1195,129 @@ fn display_bytes(bytes: &[u8]) -> String {
     out
 }
 
+/// 影片帧的合成缓存键。
+///
+/// 以 NUL 开头 ⇒ 不可能与真实资产 key 冲突(资产 key 是 CP932/ASCII 路径);
+/// 同一 `(资产, 帧)` 解码一次,换帧才产生新条目。
+fn movie_cache_key(asset: &[u8], frame: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(asset.len() + 8);
+    key.extend_from_slice(b"\x00ymv\x00");
+    key.extend_from_slice(asset);
+    key.push(0);
+    key.extend_from_slice(&frame.to_le_bytes());
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::codecs::png::PngEncoder;
     use image::{ExtendedColorType, ImageEncoder, Rgba, RgbaImage};
     use yu_vfs::MemSource;
+
+    /// 造一个 `frames` 帧的 `YSMV` 容器(与官方产物同布局、同 XOR):
+    /// 颜色段 = 3×2 的纯色 RGB JPEG,alpha 段 = 同尺寸灰度 JPEG。
+    fn ymv_fixture(frames: u32, color: [u8; 3], alpha: u8) -> Vec<u8> {
+        use yu_format::ymv::{decrypt_in_place, MAGIC};
+        let mut color_jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut color_jpeg, 90)
+            .encode(
+                &image::RgbImage::from_pixel(3, 2, image::Rgb(color)).into_raw(),
+                3,
+                2,
+                image::ExtendedColorType::Rgb8,
+            )
+            .expect("encode color jpeg");
+        let mut alpha_jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut alpha_jpeg, 90)
+            .encode(
+                &image::GrayImage::from_pixel(3, 2, image::Luma([alpha])).into_raw(),
+                3,
+                2,
+                image::ExtendedColorType::L8,
+            )
+            .expect("encode alpha jpeg");
+        let n = frames as usize;
+        let tables_end = 0x20 + n * 12;
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC);
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&frames.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes()); // alpha 标志
+        out.extend_from_slice(&3u32.to_le_bytes()); // 宽
+        out.extend_from_slice(&2u32.to_le_bytes()); // 高
+        out.extend_from_slice(&30u32.to_le_bytes()); // fps
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let mut off = tables_end;
+        for _ in 0..n {
+            out.extend_from_slice(&(off as u32).to_le_bytes());
+            off += color_jpeg.len() + alpha_jpeg.len();
+        }
+        for _ in 0..n {
+            out.extend_from_slice(&(color_jpeg.len() as u32).to_le_bytes());
+        }
+        for _ in 0..n {
+            out.extend_from_slice(&(alpha_jpeg.len() as u32).to_le_bytes());
+        }
+        for _ in 0..n {
+            let mut c = color_jpeg.clone();
+            let mut a = alpha_jpeg.clone();
+            decrypt_in_place(&mut c);
+            decrypt_in_place(&mut a);
+            out.extend_from_slice(&c);
+            out.extend_from_slice(&a);
+        }
+        out
+    }
+
+    /// `YMV[FRAME]`:颜色 JPEG + alpha 灰度 JPEG → RGBA8(官方 `0x45934c`)。
+    #[test]
+    fn movie_frame_composes_color_with_alpha_plane() {
+        let mut store = store(
+            &[(b"pac/sample2.ymv", ymv_fixture(3, [10, 200, 30], 64))],
+            vec![ImageFormat::Png],
+        );
+        // 原 key 不带扩展名 ⇒ 走 `+.ymv` 探测(与 VM 侧同口径)。
+        let tex = store.resolve_movie(b"pac/sample2", 0).expect("frame 0");
+        assert_eq!((tex.width, tex.height), (3, 2));
+        let px = tex.pixel(1, 1).expect("pixel");
+        assert!((px[0] as i32 - 10).abs() <= 2, "R={}", px[0]);
+        assert!((px[1] as i32 - 200).abs() <= 3, "G={}", px[1]);
+        assert!((px[2] as i32 - 30).abs() <= 3, "B={}", px[2]);
+        assert!((px[3] as i32 - 64).abs() <= 2, "A={}", px[3]);
+        assert_eq!(
+            store.resolved_path(b"\x00ymv\x00pac/sample2\x00\x00\x00\x00\x00"),
+            Some(b"pac/sample2.ymv".as_slice())
+        );
+        // 同帧第二次命中缓存。
+        let _ = store.resolve_movie(b"pac/sample2", 0).expect("cached");
+        assert_eq!(store.decoded_count(), 1);
+        // 换帧:新帧解码,旧帧从缓存摘掉(每资产只留最近一帧,防长片无界增长)。
+        let _ = store.resolve_movie(b"pac/sample2", 2).expect("frame 2");
+        assert_eq!(store.decoded_count(), 2);
+        assert_eq!(store.cache_len(), 1, "影片每资产只保留最近一帧");
+        // 回到旧帧:已不在缓存,重新解码(结果一致)。
+        let back = store.resolve_movie(b"pac/sample2", 0).expect("frame 0 again");
+        assert_eq!((back.width, back.height), (3, 2));
+        assert_eq!(store.cache_len(), 1);
+        // 越界帧不猜。
+        let err = store
+            .resolve_movie(b"pac/sample2", 3)
+            .expect_err("frame out of range");
+        assert_eq!(err.code, code::MOVIE);
+    }
+
+    #[test]
+    fn movie_missing_asset_reports_missing() {
+        let mut store = store(&[], vec![ImageFormat::Png]);
+        let err = store
+            .resolve_movie(b"pac/none", 0)
+            .expect_err("missing movie");
+        assert_eq!(err.code, code::MISSING);
+        let issues = store.issues();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].key, b"pac/none".to_vec());
+    }
 
     fn png_2x1() -> Vec<u8> {
         let img = RgbaImage::from_fn(2, 1, |x, _| {

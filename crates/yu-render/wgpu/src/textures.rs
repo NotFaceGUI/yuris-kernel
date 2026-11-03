@@ -49,12 +49,42 @@ pub struct GpuTexture {
     pub view: wgpu::TextureView,
 }
 
+/// 影片帧槽位数(每资产)。`帧号 % MOVIE_SLOTS` 决定槽;4 足以覆盖
+/// 「同帧内多图层引用同一影片的相邻帧」,且与影片长度无关。
+const MOVIE_SLOTS: usize = 4;
+
+/// 影片帧的一个 GPU 槽位(`id == 0` = 未使用)。
+#[derive(Clone, Copy, Default)]
+struct MovieSlot {
+    /// 当前槽里的帧号;`None` = 空槽。
+    frame: Option<u32>,
+    id: u64,
+    width: u32,
+    height: u32,
+}
+
 /// 资产 key → GPU 纹理 + 1×1 黑图;按身份缓存,不逐帧重传。
 pub struct TextureCache {
     textures: BTreeMap<u64, GpuTexture>,
-    asset_ids: BTreeMap<Vec<u8>, u64>,
+    /// 资产 key → (GPU 纹理 id, CPU 侧内容版本)。
+    ///
+    /// 版本来自 [`TextureStore::generation`](yu_render_core::TextureStore::generation)
+    /// (`insert_cached` 推进,`touch` 不动)。影片帧每帧由宿主
+    /// `insert_rgba` 覆盖 `:movie/current`,版本不变才复用 GPU 纹理;
+    /// 版本变了就 `write_texture` 就地覆写,画面才会逐帧更新。
+    ///
+    /// 不能用 `Rc::as_ptr`:旧 `Rc` 释放后新分配可能复用同一地址,
+    /// 会把「内容已换」误判成「未变」⇒ 影片静止。
+    asset_ids: BTreeMap<Vec<u8>, (u64, u64)>,
     /// 资产纹理 id 集合(反向判定用;逐字符清理文本纹理时不能扫资产表)。
     asset_texture_ids: std::collections::BTreeSet<u64>,
+    /// `YMV` 影片帧的 GPU 纹理槽(每资产固定 [`MOVIE_SLOTS`] 个,环形复用)。
+    ///
+    /// 影片帧数无上界(样例 306 帧 × 400×300),若按 `(资产, 帧)` 建纹理,
+    /// bind group 缓存会持有旧 view ⇒ GPU 内存随播放时长线性增长。改为一帧
+    /// 一个槽位、按 `帧号 % MOVIE_SLOTS` 复用同一张纹理(`write_texture`
+    /// 就地覆写),槽数与帧数无关;同帧内相邻几帧并存也不会互相覆盖。
+    movie_slots: BTreeMap<Vec<u8>, Vec<MovieSlot>>,
     solid_id: Option<u64>,
     /// 累计上传字节(解码后的 RGBA8 字节数,不含 wgpu 内部行填充)。
     pub total_upload_bytes: u64,
@@ -71,6 +101,7 @@ impl TextureCache {
             textures: BTreeMap::new(),
             asset_ids: BTreeMap::new(),
             asset_texture_ids: std::collections::BTreeSet::new(),
+            movie_slots: BTreeMap::new(),
             solid_id: None,
             total_upload_bytes: 0,
             asset_upload_bytes: 0,
@@ -87,27 +118,75 @@ impl TextureCache {
     }
 
     pub fn asset_id(&self, key: &[u8]) -> Option<u64> {
-        self.asset_ids.get(key).copied()
+        self.asset_ids.get(key).map(|(id, _)| *id)
     }
 
-    /// 解析并上传一个资产;已上传时直接返回 id。
+    /// 解析并上传一个资产;已上传且内容未变时直接返回 id。
     ///
-    /// `resolve` 的成功结果由 [`TextureStore`] 缓存,失败也缓存(不重复探测)。
+    /// `resolve_shared` 的成功结果由 [`TextureStore`] 缓存,失败也缓存
+    /// (不重复探测)。宿主每帧用 `insert_rgba` 替换 `:movie/current` 的
+    /// `Rc<Texture>`;这里比较 `Rc` 身份,变了就**就地覆写同一张 GPU 纹理**
+    /// (`write_texture`),旧 view/bind group 继续有效——否则影片会静止在
+    /// 第一帧。
     pub fn ensure_asset(
         &mut self,
         ctx: &GpuContext,
         store: &mut TextureStore,
         key: &[u8],
     ) -> Result<u64, Diag> {
-        if let Some(id) = self.asset_ids.get(key) {
-            return Ok(*id);
+        let texture = store.resolve_shared(key)?;
+        let generation = store.generation(key).unwrap_or(0);
+        let (width, height) = (texture.width, texture.height);
+        if let Some((id, cached)) = self.asset_ids.get(key).copied() {
+            if cached == generation {
+                return Ok(id);
+            }
+            // CPU 侧内容已换:尺寸相同就覆写,否则摘除重建。
+            let overwritten = self
+                .textures
+                .get(&id)
+                .is_some_and(|entry| entry.width == width && entry.height == height);
+            if overwritten {
+                let entry = self.textures.get(&id).expect("checked above");
+                let upload = wgpu::TexelCopyTextureInfo {
+                    texture: &entry.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                };
+                ctx.queue.write_texture(
+                    upload,
+                    &texture.rgba,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(width * 4),
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                self.total_upload_bytes = self
+                    .total_upload_bytes
+                    .saturating_add(texture.rgba.len() as u64);
+                self.total_uploads = self.total_uploads.saturating_add(1);
+                self.asset_ids.insert(key.to_vec(), (id, generation));
+                return Ok(id);
+            }
+            // 尺寸变了(同一 key 的合成资产换了分辨率):旧纹理不再被
+            // `asset_ids` 引用,从 pinned 集合摘除后它就是 transient,
+            // `clear_transient` 会删除并 `forget_texture` 作废旧 view;
+            // 本次直接上传新纹理,不在这里动 bind group 缓存。
+            self.asset_texture_ids.remove(&id);
+            self.asset_ids.remove(key);
         }
-        let texture = store.resolve(key)?;
-        let (width, height, bytes) = (texture.width, texture.height, texture.rgba.len());
+        let bytes = texture.rgba.len();
         let started = std::time::Instant::now();
         let uploaded = self.upload(ctx, width, height, &texture.rgba, "asset texture")?;
         let upload_us = started.elapsed().as_micros() as u64;
-        self.asset_ids.insert(key.to_vec(), uploaded);
+        self.asset_ids.insert(key.to_vec(), (uploaded, generation));
         self.asset_texture_ids.insert(uploaded);
         self.asset_upload_bytes = self.asset_upload_bytes.saturating_add(bytes as u64);
         if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
@@ -122,6 +201,93 @@ impl TextureCache {
             );
         }
         Ok(uploaded)
+    }
+
+    /// `YMV` 影片帧:确保该 `(资产, 帧)` 的像素已在其槽位纹理里。
+    ///
+    /// 槽位 = `帧号 % MOVIE_SLOTS`;同槽换帧时用 `write_texture` 就地覆写
+    /// (纹理 id / view / bind group 全部复用),因此播放任意长影片 GPU
+    /// 纹理数恒定 ≤ `MOVIE_SLOTS × 影片数`。像素解码走
+    /// [`TextureStore::resolve_movie`](yu_render_core::TextureStore::resolve_movie),
+    /// 与软后端同源。
+    pub fn ensure_movie(
+        &mut self,
+        ctx: &GpuContext,
+        store: &mut TextureStore,
+        asset: &[u8],
+        frame: u32,
+    ) -> Result<u64, Diag> {
+        let index = (frame as usize) % MOVIE_SLOTS;
+        if let Some(slot) = self.movie_slots.get(asset).and_then(|s| s.get(index)) {
+            if slot.frame == Some(frame) {
+                return Ok(slot.id);
+            }
+        }
+        let pixels = store.resolve_movie(asset, frame)?;
+        let (width, height, bytes) = (pixels.width, pixels.height, pixels.rgba.as_slice());
+        let reusable = self
+            .movie_slots
+            .get(asset)
+            .and_then(|s| s.get(index))
+            .filter(|s| s.width == width && s.height == height)
+            .map(|s| s.id);
+        let id = match reusable {
+            Some(id) => {
+                let texture = self
+                    .textures
+                    .get(&id)
+                    .expect("movie slot texture tracked");
+                let upload = wgpu::TexelCopyTextureInfo {
+                    texture: &texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                };
+                ctx.queue.write_texture(
+                    upload,
+                    bytes,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(width * 4),
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                id
+            }
+            None => {
+                let new_id = self.upload(ctx, width, height, bytes, "movie frame")?;
+                self.total_upload_bytes = self
+                    .total_upload_bytes
+                    .saturating_add(bytes.len() as u64);
+                if let Some(old) = self
+                    .movie_slots
+                    .get(asset)
+                    .and_then(|s| s.get(index))
+                    .filter(|s| s.id != 0 && s.id != new_id)
+                    .map(|s| s.id)
+                {
+                    // 尺寸变化:旧槽纹理不再被引用(同 id 不复用)。
+                    self.textures.remove(&old);
+                }
+                new_id
+            }
+        };
+        let slots = self.movie_slots.entry(asset.to_vec()).or_default();
+        while slots.len() <= index {
+            slots.push(MovieSlot::default());
+        }
+        slots[index] = MovieSlot {
+            frame: Some(frame),
+            id,
+            width,
+            height,
+        };
+        Ok(id)
     }
 
     /// `FILE=""` 的 1×1 不透明黑图;首次使用时上传。

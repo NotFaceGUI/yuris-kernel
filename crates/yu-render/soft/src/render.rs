@@ -516,6 +516,10 @@ fn apply_image_op(
                 TextureRef::Asset(key) => Some(SizeSource::Asset(key.clone())),
                 TextureRef::SolidBlack1x1 => Some(SizeSource::Solid),
                 TextureRef::Snapshot(id) => Some(SizeSource::Snapshot(id.0)),
+                TextureRef::Movie { asset, frame } => Some(SizeSource::Movie {
+                    asset: asset.clone(),
+                    frame: *frame,
+                }),
                 _ => None,
             }
         };
@@ -606,6 +610,10 @@ fn apply_image_op(
                 TextureRef::Asset(key) => Some(ImageSource::Asset(key.clone())),
                 TextureRef::SolidBlack1x1 => Some(ImageSource::Solid),
                 TextureRef::Snapshot(id) => Some(ImageSource::Snapshot(id.0)),
+                TextureRef::Movie { asset, frame } => Some(ImageSource::Movie {
+                    asset: asset.clone(),
+                    frame: *frame,
+                }),
                 _ => None,
             };
             let key = source_id.map(|source| ImageCacheKey {
@@ -1111,6 +1119,10 @@ fn layer_surface(
             .resolve(key)
             .map(Surface::from_texture)
             .map_err(|diag| diag.code.to_string()),
+        TextureRef::Movie { asset, frame } => textures
+            .resolve_movie(asset, *frame)
+            .map(Surface::from_texture)
+            .map_err(|diag| diag.code.to_string()),
         TextureRef::SolidBlack1x1 => Ok(Surface::from_texture(&Texture::solid_black_1x1())),
         TextureRef::Snapshot(copy_id) => snapshots
             .get(copy_id)
@@ -1155,6 +1167,14 @@ fn base_texture(
     match texture {
         TextureRef::Asset(key) => textures
             .resolve(key)
+            .map(|texture| Texture {
+                width: texture.width,
+                height: texture.height,
+                rgba: texture.rgba.clone(),
+            })
+            .map_err(|diag| diag.code.to_string()),
+        TextureRef::Movie { asset, frame } => textures
+            .resolve_movie(asset, *frame)
             .map(|texture| Texture {
                 width: texture.width,
                 height: texture.height,
@@ -1491,6 +1511,14 @@ fn resolve_source(
                 rgba: texture.rgba.clone(),
             })
             .map_err(|diag| diag.code.to_string()),
+        TextureRef::Movie { asset, frame } => textures
+            .resolve_movie(asset, *frame)
+            .map(|texture| OwnedImage {
+                width: texture.width,
+                height: texture.height,
+                rgba: texture.rgba.clone(),
+            })
+            .map_err(|diag| diag.code.to_string()),
         TextureRef::SolidBlack1x1 => Ok(OwnedImage {
             width: 1,
             height: 1,
@@ -1573,17 +1601,50 @@ fn draw_layer(
     };
 
     match &layer.texture {
-        TextureRef::Asset(key) => {
-            if explicit_width.is_some() || explicit_height.is_some() {
-                // 资源图 + SX/SY 的缩放/裁剪未取证;gfx 已把层标
-                // Unimplemented,这里再显式挡一次,防止上游变化。
-                st.skip_op(op, "asset.size.unsupported");
-                return;
+        // `YMV[FRAME]`:与快照同型 —— 显式 `CGACT[SIZE]` 存在时按图层矩形
+        // 缩放绘制(官方把影片表面画进图层矩形),否则按纹理自然尺寸。
+        TextureRef::Movie { asset, frame: movie_frame } => {
+            match textures.resolve_movie(asset, *movie_frame) {
+                Ok(texture) => {
+                    let (src_w, src_h) = (texture.width, texture.height);
+                    let (width, height) = match layer.image_size() {
+                        Some(size) => (size.width, size.height),
+                        None => (src_w, src_h),
+                    };
+                    let filter = pick_filter(frame, src_w, src_h, width, height);
+                    let (x, y) = (layer.transform.x, layer.transform.y);
+                    {
+                        let image = ImageRef::from_texture(texture);
+                        draw_image(
+                            dst,
+                            image,
+                            x,
+                            y,
+                            width,
+                            height,
+                            layer_alpha(layer.alpha),
+                            mode,
+                            filter,
+                            None,
+                        );
+                    }
+                    st.report.ops_drawn += 1;
+                }
+                Err(diag) => st.skip_op(op, diag.code.to_string()),
             }
+        }
+        TextureRef::Asset(key) => {
             match textures.resolve(key) {
                 Ok(texture) => {
-                    let (width, height) = (texture.width, texture.height);
-                    let filter = pick_filter(frame, width, height, width, height);
+                    let (natural_width, natural_height) = (texture.width, texture.height);
+                    // 显式目标尺寸(`CGACT[SIZE]`/`MOVIE` 投影矩形)⇒ 按矩形
+                    // 缩放绘制,与 [`TextureRef::Movie`] 同型;缺省用纹理
+                    // 自然尺寸。
+                    let (width, height) = match layer.image_size() {
+                        Some(size) => (size.width, size.height),
+                        None => (natural_width, natural_height),
+                    };
+                    let filter = pick_filter(frame, natural_width, natural_height, width, height);
                     let (x, y) = (layer.transform.x, layer.transform.y);
                     {
                         let image = ImageRef::from_texture(texture);
@@ -1810,7 +1871,9 @@ fn op_predict_drawable(op: &Op, offscreens: &BTreeMap<&LayerId, bool>) -> bool {
                 && supported_blend(transition.layer.blend).is_some()
                 && matches!(
                     transition.from,
-                    TextureRef::Asset(_) | TextureRef::SolidBlack1x1
+                    TextureRef::Asset(_)
+                        | TextureRef::SolidBlack1x1
+                        | TextureRef::Movie { .. }
                 )
         }
         // Copy/Image 在 Texture pass 内执行,不直接产出屏幕像素。
@@ -1823,7 +1886,9 @@ fn layer_predict_drawable(layer: &Layer, offscreens: &BTreeMap<&LayerId, bool>) 
         return false;
     }
     match &layer.texture {
-        TextureRef::Asset(_) => layer.image_size().is_none(),
+        // 影片帧与资源图同规则:显式 SX/SY 是缩放目标(手册 `cgact.html`
+        // 例 3),照样可绘制;缺省按纹理自然尺寸。
+        TextureRef::Asset(_) | TextureRef::Movie { .. } => true,
         TextureRef::SolidBlack1x1 => true,
         TextureRef::Offscreen(id) => offscreens.get(id).copied().unwrap_or(false),
         TextureRef::Snapshot(_) | TextureRef::None => false,

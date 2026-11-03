@@ -18,6 +18,10 @@ pub fn layer_base(
     layer: &yu_gfx::Layer,
 ) -> Result<Texture, String> {
     match &layer.texture {
+        yu_gfx::TextureRef::Movie { asset, frame } => textures
+            .resolve_movie(asset, *frame)
+            .cloned()
+            .map_err(|d| d.code.to_string()),
         yu_gfx::TextureRef::Asset(key) => textures
             .resolve(key)
             .cloned()
@@ -55,6 +59,10 @@ pub fn layer_base_dims(
     layer: &yu_gfx::Layer,
 ) -> Result<(u32, u32), String> {
     match &layer.texture {
+        yu_gfx::TextureRef::Movie { asset, frame } => textures
+            .resolve_movie(asset, *frame)
+            .map(|t| (t.width, t.height))
+            .map_err(|d| d.code.to_string()),
         yu_gfx::TextureRef::Asset(key) => textures
             .resolve(key)
             .map(|t| (t.width, t.height))

@@ -9,6 +9,8 @@ pub enum ImageSource {
     Asset(Vec<u8>),
     Solid,
     Snapshot(u64),
+    /// `YMV` 影片帧(`(资产, 帧)` 决定像素;`TextureStore` 按同键合并同帧)。
+    Movie { asset: Vec<u8>, frame: u32 },
 }
 
 /// 图像加工的确定性签名(同一源 + 同一签名 ⇒ 同一结果)。

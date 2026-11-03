@@ -512,21 +512,60 @@ impl Planner<'_> {
         }
 
         match &layer.texture {
-            TextureRef::Asset(key) => {
-                if explicit_size.is_some() {
-                    // 资源图 + SX/SY 的缩放/裁剪未取证;gfx 已标 Unimplemented,
-                    // 这里再显式挡一次(与 soft 同一理由码)。
-                    self.skip(op, "asset.size.unsupported");
-                    return Ok(());
+            // `YMV[FRAME]`:与快照同型 —— 显式 `CGACT[SIZE]` 存在时按图层矩形
+            // 缩放绘制(官方把影片表面画进图层矩形),否则按自然尺寸。
+            TextureRef::Movie { asset, frame } => {
+                let gpu = &mut *self.gpu;
+                let textures = &mut *self.textures;
+                let resolved = gpu.ensure_movie(self.ctx, textures, asset, *frame);
+                match resolved {
+                    Ok(texture_id) => {
+                        let texture = gpu.get(texture_id).expect("uploaded movie frame exists");
+                        let (natural_width, natural_height) = (texture.width, texture.height);
+                        let view = texture.view.clone();
+                        let width = explicit_size.map_or(natural_width, |size| size.width);
+                        let height = explicit_size.map_or(natural_height, |size| size.height);
+                        let filter = pick_filter(
+                            self.frame,
+                            natural_width,
+                            natural_height,
+                            width,
+                            height,
+                        );
+                        self.draw(
+                            out,
+                            blend,
+                            texture_id,
+                            &view,
+                            filter,
+                            x as f64,
+                            y as f64,
+                            width,
+                            height,
+                            alpha,
+                            DrawKind::Quad,
+                        )
+                    }
+                    Err(diag) if diag.code.starts_with("asset.") => {
+                        self.skip(op, diag.code.to_string());
+                        Ok(())
+                    }
+                    Err(diag) => Err(diag),
                 }
+            }
+            TextureRef::Asset(key) => {
                 let gpu = &mut *self.gpu;
                 let textures = &mut *self.textures;
                 match gpu.ensure_asset(self.ctx, textures, key) {
                     Ok(texture_id) => {
                         let texture = gpu.get(texture_id).expect("uploaded texture exists");
-                        let (width, height) = (texture.width, texture.height);
+                        let (natural_width, natural_height) = (texture.width, texture.height);
                         let view = texture.view.clone();
-                        let filter = pick_filter(self.frame, width, height, width, height);
+                        // 显式目标尺寸(`CGACT[SIZE]`/`MOVIE` 投影矩形)⇒
+                        // 按矩形缩放绘制;缺省用纹理自然尺寸。
+                        let width = explicit_size.map_or(natural_width, |size| size.width);
+                        let height = explicit_size.map_or(natural_height, |size| size.height);
+                        let filter = pick_filter(self.frame, natural_width, natural_height, width, height);
                         self.draw(
                             out,
                             blend,
@@ -746,6 +785,15 @@ impl Planner<'_> {
     /// 纹理引用 → `(纹理 id, 宽, 高)`。
     fn image_ref(&mut self, texture: &TextureRef) -> Result<(u64, u32, u32), String> {
         match texture {
+            TextureRef::Movie { asset, frame } => {
+                let gpu = &mut *self.gpu;
+                let textures = &mut *self.textures;
+                let id = gpu
+                    .ensure_movie(self.ctx, textures, asset, *frame)
+                    .map_err(|diag| diag.code.to_string())?;
+                let t = gpu.get(id).expect("uploaded movie frame exists");
+                Ok((id, t.width, t.height))
+            }
             TextureRef::Asset(_) | TextureRef::SolidBlack1x1 => {
                 let layer_like = TextureRef::SolidBlack1x1;
                 let _ = layer_like;

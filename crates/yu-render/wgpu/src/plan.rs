@@ -801,6 +801,21 @@ pub(crate) fn resolve_ref(
         return Ok(hit.clone());
     }
     let tex: Rc<TexRef> = match texture {
+        TextureRef::Movie { asset, frame } => {
+            let gpu_id = gpu
+                .ensure_movie(ctx, textures, asset, *frame)
+                .map_err(|diag| diag.code.to_string())?;
+            let uploaded = gpu
+                .get(gpu_id)
+                .ok_or_else(|| "gpu.asset_missing".to_string())?;
+            Rc::new(TexRef {
+                id: uploaded.id,
+                width: uploaded.width,
+                height: uploaded.height,
+                texture: uploaded.texture.clone(),
+                view: uploaded.view.clone(),
+            })
+        }
         TextureRef::Asset(key) => {
             let gpu_id = gpu
                 .ensure_asset(ctx, textures, key)
@@ -851,6 +866,11 @@ pub(crate) fn resolve_ref(
 fn texref_token(texture: &TextureRef) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     match texture {
+        TextureRef::Movie { asset, frame } => {
+            fnv_mix(&mut hash, 6);
+            fnv_bytes(&mut hash, asset);
+            fnv_mix(&mut hash, u64::from(*frame));
+        }
         TextureRef::Asset(key) => {
             fnv_mix(&mut hash, 1);
             fnv_bytes(&mut hash, key);
@@ -2298,6 +2318,16 @@ fn content_cpu(
                 info.asset_bytes = texture.rgba.len() as u64;
                 texture
             }
+            Some(TextureRef::Movie { asset, frame }) => {
+                let t = std::time::Instant::now();
+                let texture = textures
+                    .resolve_movie(asset, *frame)
+                    .cloned()
+                    .map_err(|diag| diag.code.to_string())?;
+                info.asset_us = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX);
+                info.asset_bytes = texture.rgba.len() as u64;
+                texture
+            }
             Some(TextureRef::SolidBlack1x1) => Texture::solid_black_1x1(),
             _ => {
                 let t = std::time::Instant::now();
@@ -2827,6 +2857,11 @@ fn base_token(
         (None, fallback) => fallback,
     };
     match texture {
+        Some(TextureRef::Movie { asset, frame }) => {
+            fnv_mix(&mut hash, 6);
+            fnv_bytes(&mut hash, asset);
+            fnv_mix(&mut hash, u64::from(*frame));
+        }
         Some(TextureRef::Asset(key)) => {
             fnv_mix(&mut hash, 1);
             fnv_bytes(&mut hash, key);
