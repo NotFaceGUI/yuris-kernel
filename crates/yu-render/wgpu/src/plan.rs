@@ -21,17 +21,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use yu_gfx::{
-    BlendMode, Clear, CompositorFrame, CopyOp, CopySource, ImageAction, ImageOp, LayerId,
-    Op, OpStatus, Pass, PassTarget, ScreenSnapshot, TextureRef,
+    BlendMode, Clear, CompositorFrame, CopyOp, CopySource, ImageAction, ImageOp, LayerId, Op,
+    OpStatus, Pass, PassTarget, ScreenSnapshot, TextureRef,
 };
 use yu_log::Diag;
-use yu_render_core::{RenderPhases, RenderReport, Surface, Texture, TextureStore, TextComposer};
+use yu_render_core::{RenderPhases, RenderReport, Surface, TextComposer, Texture, TextureStore};
 
 use crate::device::{code, GpuContext};
 use crate::passes::{
     clear_color, group_surface_size, hash_rgba, live_snapshots, merge_text_stats, note_text_diag,
-    push_quad, Accum, AuxPipeline, BlitCmd, Draw, DrawKind, FramePlan, PaintCmd,
-    PlannedPass, PlannedTarget, Planner, SurfaceWrites,
+    push_quad, Accum, AuxPipeline, BlitCmd, Draw, DrawKind, FramePlan, PaintCmd, PlannedPass,
+    PlannedTarget, Planner, SurfaceWrites,
 };
 use crate::pipelines::{FilterKind, PipelineCache};
 use crate::surfaces::{Content, Contents, LayerSurfaces, TexRef};
@@ -57,7 +57,8 @@ pub(crate) fn plan(
 ) -> Result<(FramePlan, RenderReport, RenderPhases), Diag> {
     let started = std::time::Instant::now();
     surfaces.begin_frame(frame.frame);
-    targets.prune_snapshots(&live_snapshots(frame), pipelines);
+    let materialized = targets.materialized_ids();
+    targets.prune_snapshots(&live_snapshots(frame, &materialized), pipelines);
     {
         let live_layers: BTreeSet<LayerId> =
             frame.layers.iter().map(|layer| layer.id.clone()).collect();
@@ -77,8 +78,7 @@ pub(crate) fn plan(
         }
         targets.prune_offscreen(&live_offscreen, pipelines);
     }
-    let live_text_layers: BTreeSet<LayerId> =
-        frame.layers.iter().map(|l| l.id.clone()).collect();
+    let live_text_layers: BTreeSet<LayerId> = frame.layers.iter().map(|l| l.id.clone()).collect();
     for id in text_uploads.retain(&live_text_layers) {
         gpu.remove(id, pipelines);
     }
@@ -141,10 +141,7 @@ pub(crate) fn plan(
                 match op {
                     Op::Image(image) => {
                         let dest = image.target.as_ref().unwrap_or(&image.source);
-                        chain_seqs
-                            .entry(dest.clone())
-                            .or_default()
-                            .push(image.seq);
+                        chain_seqs.entry(dest.clone()).or_default().push(image.seq);
                         // 历史项已在之前的帧执行完,它的读取不再要求本帧从
                         // 基图重放中间像素;只有本帧新追加的读取才可能把
                         // 消费点卡在已应用前缀中间。
@@ -218,6 +215,8 @@ pub(crate) fn plan(
                         passes: &mut passes,
                         vertices: &mut vertices,
                         aux: &mut aux,
+                        transition: &mut transition_bind_groups,
+                        transition_buffers: &mut transition_buffers,
                         views: &mut views,
                         textures: &mut textures_map,
                         keepalive: &mut keepalive,
@@ -249,6 +248,8 @@ pub(crate) fn plan(
                         passes: &mut passes,
                         vertices: &mut vertices,
                         aux: &mut aux,
+                        transition: &mut transition_bind_groups,
+                        transition_buffers: &mut transition_buffers,
                         views: &mut views,
                         textures: &mut textures_map,
                         keepalive: &mut keepalive,
@@ -576,7 +577,15 @@ fn apply_image(
         }
     }
     let source = resolve_source(
-        ctx, frame, textures, gpu, targets, surfaces, contents, bases, &image.source,
+        ctx,
+        frame,
+        textures,
+        gpu,
+        targets,
+        surfaces,
+        contents,
+        bases,
+        &image.source,
         image.source_texture.as_ref(),
         image.seq,
         if image.action.is_scale() {
@@ -587,7 +596,17 @@ fn apply_image(
     )?;
     let source2 = match &image.source2 {
         Some(id) => Some(resolve_source(
-            ctx, frame, textures, gpu, targets, surfaces, contents, bases, id, None, image.seq,
+            ctx,
+            frame,
+            textures,
+            gpu,
+            targets,
+            surfaces,
+            contents,
+            bases,
+            id,
+            None,
+            image.seq,
             "gfx.copy.source.gone",
         )?),
         None => None,
@@ -616,7 +635,7 @@ fn apply_image(
     if !force_materialize
         && surfaces
             .applied_at(target, index)
-            .is_some_and(|(seq, _)| seq == image.seq)
+            .is_some_and(|(seq, sig)| seq == image.seq && sig == signature)
     {
         *chain_index.get_mut(target).expect("inserted above") += 1;
         surfaces.note_reused_layer();
@@ -864,7 +883,9 @@ fn materialize(
     }
     let (x0, y0, x1, y1) = content_region(content);
     let target = surfaces.acquire(ctx, content.width, content.height, what)?;
-    pipelines.ensure_resample_pipeline(ctx).map_err(|d| d.code.to_string())?;
+    pipelines
+        .ensure_resample_pipeline(ctx)
+        .map_err(|d| d.code.to_string())?;
     let bind = pipelines
         .create_resample_bind_group(
             ctx,
@@ -975,7 +996,10 @@ fn apply_image_pixels(
     }
 
     // ---------------- 镜像(纯采样修饰) ----------------
-    if matches!(image.action, ImageAction::Horizontal | ImageAction::Vertical) {
+    if matches!(
+        image.action,
+        ImageAction::Horizontal | ImageAction::Vertical
+    ) {
         let mut uv = source.uv;
         match image.action {
             ImageAction::Horizontal => uv.swap(0, 2),
@@ -1001,13 +1025,19 @@ fn apply_image_pixels(
         let Some(to) = source2 else {
             return Err("gfx.imageop.source.missing".to_string());
         };
-        let blend = image.set.as_ref().and_then(|value| value.as_int()).unwrap_or(0);
+        let blend = image
+            .set
+            .as_ref()
+            .and_then(|value| value.as_int())
+            .unwrap_or(0);
         let f = blend.clamp(0, 256) as u32;
         if to.width == 0 || to.height == 0 {
             return Ok(());
         }
         let out = surfaces.acquire(ctx, to.width, to.height, "transition surface")?;
-        pipelines.ensure_lerp_pipeline(ctx).map_err(|d| d.code.to_string())?;
+        pipelines
+            .ensure_lerp_pipeline(ctx)
+            .map_err(|d| d.code.to_string())?;
         let bind = pipelines
             .create_lerp_bind_group(ctx, &source.tex.view, &to.tex.view, f)
             .map_err(|diag| diag.code.to_string())?;
@@ -1047,10 +1077,26 @@ fn apply_image_pixels(
         // (见 `merge.wgsl` 头注)。
         let lower_content = match contents.get(target).cloned() {
             Some(content) => content,
-            None => resolve_target_base(ctx, frame, textures, gpu, targets, target, bases, target_fallback)?,
+            None => resolve_target_base(
+                ctx,
+                frame,
+                textures,
+                gpu,
+                targets,
+                target,
+                bases,
+                target_fallback,
+            )?,
         };
         let upper_content = materialize(ctx, pipelines, surfaces, writes, &source, "merge upper")?;
-        let lower = materialize(ctx, pipelines, surfaces, writes, &lower_content, "merge lower")?;
+        let lower = materialize(
+            ctx,
+            pipelines,
+            surfaces,
+            writes,
+            &lower_content,
+            "merge lower",
+        )?;
         let (width, height) = (lower.width, lower.height);
         if width == 0 || height == 0 {
             return Ok(());
@@ -1120,7 +1166,16 @@ fn apply_image_pixels(
         };
         let current = match contents.get(target).cloned() {
             Some(content) => content,
-            None => resolve_target_base(ctx, frame, textures, gpu, targets, target, bases, target_fallback)?,
+            None => resolve_target_base(
+                ctx,
+                frame,
+                textures,
+                gpu,
+                targets,
+                target,
+                bases,
+                target_fallback,
+            )?,
         };
         let alpha_only = matches!(image.action, ImageAction::RectPaint2);
         let replaces = int_region.is_none() && !alpha_only;
@@ -1215,7 +1270,16 @@ fn apply_image_pixels(
     // ---------------- 其余:需要整块像素的原地动作 ----------------
     let current = match contents.get(target).cloned() {
         Some(content) => content,
-        None => resolve_target_base(ctx, frame, textures, gpu, targets, target, bases, target_fallback)?,
+        None => resolve_target_base(
+            ctx,
+            frame,
+            textures,
+            gpu,
+            targets,
+            target,
+            bases,
+            target_fallback,
+        )?,
     };
     // `DIFFUSION` 的 `SET/2 <= 0` 在官方只做一次整面 memcpy ⇒ 恒等;
     // 提前返回,连基面都不必物化。
@@ -1329,7 +1393,9 @@ fn apply_image_pixels(
         let set = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0) as i32;
         let set2 = image.set2.as_ref().and_then(|v| v.as_int()).unwrap_or(0) as i32;
         let out = surfaces.acquire(ctx, width, height, "filter surface")?;
-        pipelines.ensure_transform_pipeline(ctx).map_err(|d| format!("{}: {}", d.code, d.detail))?;
+        pipelines
+            .ensure_transform_pipeline(ctx)
+            .map_err(|d| format!("{}: {}", d.code, d.detail))?;
         // 旋涡的半径表长度 trunc((hypot(w,h)+1)*0.5+1)(着色器无 f64)。
         let n = if mode == 19 {
             let hyp = (f64::from(width)).powi(2) + (f64::from(height)).powi(2);
@@ -1544,8 +1610,18 @@ fn apply_copy(
     let mut source = match &copy.source {
         CopySource::Layer(id) => {
             let content = resolve_source(
-                ctx, frame, textures, gpu, targets, surfaces, contents, bases, id,
-                copy.source_texture.as_ref(), copy.seq, "gfx.copy.source.gone",
+                ctx,
+                frame,
+                textures,
+                gpu,
+                targets,
+                surfaces,
+                contents,
+                bases,
+                id,
+                copy.source_texture.as_ref(),
+                copy.seq,
+                "gfx.copy.source.gone",
             )?;
             if copy.texts.is_empty() {
                 content
@@ -1613,7 +1689,13 @@ fn apply_copy(
                     )
                 } else {
                     backbuffer_content(
-                        ctx, frame, gpu, pipelines, backbuffer, backbuffer_gpu, writes,
+                        ctx,
+                        frame,
+                        gpu,
+                        pipelines,
+                        backbuffer,
+                        backbuffer_gpu,
+                        writes,
                     )?
                 }
             } else {
@@ -1633,10 +1715,7 @@ fn apply_copy(
         width = sw;
         height = sh;
     }
-    let full = x0 == 0
-        && y0 == 0
-        && x1 == i64::from(sw) - 1
-        && y1 == i64::from(sh) - 1;
+    let full = x0 == 0 && y0 == 0 && x1 == i64::from(sw) - 1 && y1 == i64::from(sh) - 1;
     // 显式区域可能超出源表面(脚本给 `X2=263` 而源只有 200 宽)。soft 的
     // `blit` 按源边界裁剪、落点仍在 (0,0);这里同样裁剪 —— 越界范围交给
     // `copy_texture_to_texture` 会让整条命令缓冲失效。
@@ -1707,7 +1786,11 @@ fn apply_copy(
             pass.clear_targets.push(out.id);
             writes.passes.push(pass);
         }
-        let (sx, sy) = if full { (0, 0) } else { (clip_x0 as u32, clip_y0 as u32) };
+        let (sx, sy) = if full {
+            (0, 0)
+        } else {
+            (clip_x0 as u32, clip_y0 as u32)
+        };
         push_blit(
             writes,
             "copy",
@@ -1790,13 +1873,7 @@ fn backbuffer_content(
         }
     }
     let id = gpu
-        .upload(
-            ctx,
-            buffer.width,
-            buffer.height,
-            &buffer.rgba,
-            "backbuffer",
-        )
+        .upload(ctx, buffer.width, buffer.height, &buffer.rgba, "backbuffer")
         .map_err(|diag| diag.code.to_string())?;
     // 后缓冲内容每变一次就换一张上传纹理;旧 id 必须从 GPU 缓存与 bind
     // group 里移除,否则逐帧变化的画面(对话/菜单淡入)会累积整屏纹理。
@@ -1860,17 +1937,46 @@ fn screen_snapshot_content(
         .ok_or_else(|| "gfx.copy.screen_snapshot.pass_missing".to_string())?;
     // 合成目标用内部 ID;不会与脚本图层冲突(路径以 `__` 开头且只在
     // 本函数内使用)。
-    let synth = LayerId::new(format!("__screen_snapshot_{}", copy_id.0).into_bytes());
+    // 合成组用内部 ID;若脚本恰好有同名层,追加下划线直到不撞名。
+    let mut synth_name = format!("__screen_snapshot_{}", copy_id.0);
+    while snapshot
+        .layer_ids
+        .iter()
+        .any(|layer| layer.display() == synth_name)
+        || frame
+            .layers
+            .iter()
+            .any(|layer| layer.id.display() == synth_name)
+    {
+        synth_name.push('_');
+    }
+    let synth = LayerId::new(synth_name.into_bytes());
     snap_frame.passes.push(Pass {
         target: PassTarget::Offscreen(synth.clone()),
         ops: screen_ops,
-        clear: None,
+        // `:/W0/` 拷贝的是窗口后缓冲,包含引擎默认清屏色(黑)。若用透明底,
+        // 没有满屏图层的场景(选择支/黑背景)会得到 alpha=0 的缩略图,在存档
+        // 界面显示成“没有背景”(2026-11-03 实测:黑屏场景缩略图 6970/7500
+        // 像素 alpha=0;官方同场景 alpha=254/255)。软后端同处用
+        // `frame.clear.rgba` 建屏幕面,语义一致。
+        clear: Some(frame.clear),
     });
     // 快照里的文本要按**命令时刻**的 `text_draws` 重新烘焙:实时
     // `contents` 只含本帧最终状态;被弹窗盖住的背景按钮文字若在本帧
     // 被隐藏(`apply_text` 跳过),快照会只剩按钮底图(字体空白)。
     // 用独立的 contents/bases 副本,避免污染本帧的真实绘制。
     let mut snap_contents = contents.clone();
+    // 快照层在同一帧里被 `CG[FILE]`/新 COPY 重新绑定后,`contents` 里已是
+    // **新层**的像素;命令时刻旧层的像素不能再用它。纹理身份不一致的层
+    // 一律退回快照自己记录的纹理/快照像素,禁止把新场景内容灌进旧快照
+    // (2026-11-03 真机:旧 CGS 幕布闪出当前场景不存在的立绘)。
+    for snap_layer in &snapshot.layers {
+        if let Some(live) = frame.layers.iter().find(|live| live.id == snap_layer.id) {
+            if live.texture != snap_layer.texture {
+                snap_contents.remove(&snap_layer.id);
+            }
+        }
+    }
     let mut snap_bases = bases.clone();
     // 命令时刻的屏幕快照里,有些层本帧的图像加工排在截图命令之后/被
     // 本帧的系统命令作废(存档缩略图的 `MERGE2` 就是这种):`contents`
@@ -1880,12 +1986,29 @@ fn screen_snapshot_content(
         if snap_contents.contains_key(id) {
             continue;
         }
+        // 同名层已换图/重建 ⇒ 常驻表面/旧内容属于新基面,不能补给旧快照。
+        let Some(snap_layer) = snapshot.layers.iter().find(|layer| &layer.id == id) else {
+            continue;
+        };
+        if frame
+            .layers
+            .iter()
+            .find(|live| live.id == *id)
+            .is_some_and(|live| live.texture != snap_layer.texture)
+        {
+            continue;
+        }
         if let Some(raw) = surfaces.raw_content(id) {
             snap_contents.insert(id.clone(), raw);
         } else if let Some(content) = surfaces.content(id) {
             snap_contents.insert(id.clone(), content.clone());
         }
     }
+    // 快照合成必须使用**私有**的图层表面账:快照图层带的是捕获时刻的
+    // alpha/texture,若写进活 `LayerSurfaces`,`sync_base` 会让同名活层
+    // 在两套 base token 之间反复清空(读档丢背景的直接根因)。私有账按
+    // `CopyId` 跨帧保留,快照自己的文本/加工缓存仍然生效。
+    let mut snap_surfaces = targets.take_snapshot_surfaces(copy_id);
     {
         let mut local = Accum::new(&snap_frame);
         let mut uploads = TextUploads::default();
@@ -1897,7 +2020,7 @@ fn screen_snapshot_content(
             textures,
             gpu,
             pipelines,
-            surfaces,
+            &mut snap_surfaces,
             &mut snap_contents,
             &mut snap_bases,
             &mut uploads,
@@ -1913,19 +2036,21 @@ fn screen_snapshot_content(
             gpu.remove(id, pipelines);
         }
     }
-    compose_group_content(
+    let result = compose_group_content(
         ctx,
         &snap_frame,
         textures,
         gpu,
         pipelines,
         targets,
-        surfaces,
+        &mut snap_surfaces,
         &mut snap_contents,
         &mut snap_bases,
         writes,
         &synth,
-    )
+    );
+    targets.put_snapshot_surfaces(copy_id, snap_surfaces);
+    result
 }
 
 fn compose_group_content(
@@ -1978,8 +2103,8 @@ fn compose_group_content(
             contents,
             bases,
             views: writes.views,
-            transition_bind_groups: &mut Vec::new(),
-            transition_buffers: &mut Vec::new(),
+            transition_bind_groups: writes.transition,
+            transition_buffers: writes.transition_buffers,
             dst_width: width,
             dst_height: height,
             counted: false,
@@ -2044,7 +2169,11 @@ fn text_gpu_identity(revision: u64, signature: u64, raw_hash: u64, base_key: u64
 }
 
 /// 文本绘制的身份(内容 + 排版 + 修订号):不变则不重烤、不重传。
-fn text_signature(draws: &[&yu_gfx::TextDraw], layout: Option<&yu_gfx::TextLayoutFrame>, dims: (u32, u32)) -> u64 {
+fn text_signature(
+    draws: &[&yu_gfx::TextDraw],
+    layout: Option<&yu_gfx::TextLayoutFrame>,
+    dims: (u32, u32),
+) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     fnv_mix(&mut hash, u64::from(dims.0));
     fnv_mix(&mut hash, u64::from(dims.1));
@@ -2068,7 +2197,10 @@ fn text_signature(draws: &[&yu_gfx::TextDraw], layout: Option<&yu_gfx::TextLayou
     }
     if let Some(layout) = layout {
         fnv_mix(&mut hash, layout.glyphs.len() as u64);
-        fnv_mix(&mut hash, layout.reveal.map_or(u64::MAX, |value| value as u64));
+        fnv_mix(
+            &mut hash,
+            layout.reveal.map_or(u64::MAX, |value| value as u64),
+        );
         fnv_mix(&mut hash, layout.origin.0 as u64);
         fnv_mix(&mut hash, layout.origin.1 as u64);
         for glyph in &layout.glyphs {
@@ -2248,11 +2380,8 @@ fn apply_text(
         if !layer.visible {
             continue;
         }
-        let draws: Vec<&yu_gfx::TextDraw> = frame
-            .text_draws
-            .iter()
-            .filter(|d| d.target == id)
-            .collect();
+        let draws: Vec<&yu_gfx::TextDraw> =
+            frame.text_draws.iter().filter(|d| d.target == id).collect();
         let layout = frame
             .text_layout
             .as_ref()
@@ -2264,8 +2393,18 @@ fn apply_text(
         {
             Some(content) => content,
             None => match resolve_source(
-                ctx, frame, textures, gpu, targets, surfaces, contents, bases, &id, None,
-                u64::MAX, "gfx.copy.source.gone",
+                ctx,
+                frame,
+                textures,
+                gpu,
+                targets,
+                surfaces,
+                contents,
+                bases,
+                &id,
+                None,
+                u64::MAX,
+                "gfx.copy.source.gone",
             ) {
                 Ok(content) => content,
                 Err(reason) => {
@@ -2313,14 +2452,14 @@ fn apply_text(
                 if collected && !placements.is_empty() {
                     let identity = text_gpu_identity(revision, signature, raw.hash, base_key);
                     if let Some(target) = gpu_text.cached(&id, identity) {
-                    merge_text_stats(
-                        acc,
-                        yu_render_core::TextPaintStats {
-                            draws: draws.len(),
-                            glyphs: gpu_glyphs as usize,
-                            ..yu_render_core::TextPaintStats::default()
-                        },
-                    );
+                        merge_text_stats(
+                            acc,
+                            yu_render_core::TextPaintStats {
+                                draws: draws.len(),
+                                glyphs: gpu_glyphs as usize,
+                                ..yu_render_core::TextPaintStats::default()
+                            },
+                        );
                         gpu_stats.cached += 1;
                         let content = finish_content(
                             surfaces,
@@ -2344,14 +2483,14 @@ fn apply_text(
                         &placements,
                     ) {
                         Ok((target, job)) => {
-                    merge_text_stats(
-                        acc,
-                        yu_render_core::TextPaintStats {
-                            draws: draws.len(),
-                            glyphs: gpu_glyphs as usize,
-                            ..yu_render_core::TextPaintStats::default()
-                        },
-                    );
+                            merge_text_stats(
+                                acc,
+                                yu_render_core::TextPaintStats {
+                                    draws: draws.len(),
+                                    glyphs: gpu_glyphs as usize,
+                                    ..yu_render_core::TextPaintStats::default()
+                                },
+                            );
                             gpu_stats.layers += 1;
                             gpu_stats.glyphs += u64::from(job.glyphs);
                             gpu_stats.draws += u64::from(job.draw_count);
@@ -2379,52 +2518,45 @@ fn apply_text(
             }
         }
         let cpu_started = std::time::Instant::now();
-        let cpu_base: Result<Rc<Texture>, String> =
-            if let Some(hit) = text.cached_base(&id, base_key) {
-                Ok(hit)
-            } else if let Some(asset) = asset_identity_base(
-                ctx, frame, textures, gpu, targets, bases, &id, &raw,
-            ) {
-                text.store_base(&id, base_key, Rc::clone(&asset));
-                Ok(asset)
-            } else {
-                match content_cpu(ctx, frame, textures, contents, &id, &raw) {
-                    Ok((texture, info)) => {
-                        if info.readbacks > 0 {
-                            log::debug!(
-                                target: "yu-render",
-                                "[text-base] layer={} raw={}x{} base_key={:#x} raw_hash={:#x} readback={}us",
-                                id.display(),
-                                raw.width,
-                                raw.height,
-                                base_key,
-                                raw.hash,
-                                info.readback_us
-                            );
-                        }
-                        cpu_info.readback_us = cpu_info.readback_us.saturating_add(info.readback_us);
-                        cpu_info.readbacks = cpu_info.readbacks.saturating_add(info.readbacks);
-                        cpu_info.asset_us = cpu_info.asset_us.saturating_add(info.asset_us);
-                        cpu_info.asset_bytes = cpu_info.asset_bytes.saturating_add(info.asset_bytes);
-                        let texture = Rc::new(texture);
-                        text.store_base(&id, base_key, Rc::clone(&texture));
-                        Ok(texture)
+        let cpu_base: Result<Rc<Texture>, String> = if let Some(hit) =
+            text.cached_base(&id, base_key)
+        {
+            Ok(hit)
+        } else if let Some(asset) =
+            asset_identity_base(ctx, frame, textures, gpu, targets, bases, &id, &raw)
+        {
+            text.store_base(&id, base_key, Rc::clone(&asset));
+            Ok(asset)
+        } else {
+            match content_cpu(ctx, frame, textures, contents, &id, &raw) {
+                Ok((texture, info)) => {
+                    if info.readbacks > 0 {
+                        log::debug!(
+                            target: "yu-render",
+                            "[text-base] layer={} raw={}x{} base_key={:#x} raw_hash={:#x} readback={}us",
+                            id.display(),
+                            raw.width,
+                            raw.height,
+                            base_key,
+                            raw.hash,
+                            info.readback_us
+                        );
                     }
-                    Err(reason) => Err(reason),
+                    cpu_info.readback_us = cpu_info.readback_us.saturating_add(info.readback_us);
+                    cpu_info.readbacks = cpu_info.readbacks.saturating_add(info.readbacks);
+                    cpu_info.asset_us = cpu_info.asset_us.saturating_add(info.asset_us);
+                    cpu_info.asset_bytes = cpu_info.asset_bytes.saturating_add(info.asset_bytes);
+                    let texture = Rc::new(texture);
+                    text.store_base(&id, base_key, Rc::clone(&texture));
+                    Ok(texture)
                 }
-            };
-        cpu_base_us = cpu_base_us.saturating_add(
-            u64::try_from(cpu_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-        );
-        let composed = text.compose_layer_cached(
-            &id,
-            revision,
-            raw.hash,
-            dims,
-            &draws,
-            layout,
-            || cpu_base,
-        );
+                Err(reason) => Err(reason),
+            }
+        };
+        cpu_base_us = cpu_base_us
+            .saturating_add(u64::try_from(cpu_started.elapsed().as_micros()).unwrap_or(u64::MAX));
+        let composed =
+            text.compose_layer_cached(&id, revision, raw.hash, dims, &draws, layout, || cpu_base);
         let (composed, stats) = match composed {
             Ok(value) => value,
             Err(reason) => {
@@ -2463,9 +2595,7 @@ fn apply_text(
                         continue;
                     }
                 };
-                let uploaded = gpu
-                    .get(id_upload)
-                    .expect("uploaded text texture exists");
+                let uploaded = gpu.get(id_upload).expect("uploaded text texture exists");
                 let tex = Rc::new(TexRef {
                     id: id_upload,
                     width: uploaded.width,
@@ -2530,7 +2660,8 @@ fn plan_screen_overlay_text(
                 height,
                 rgba: vec![0; (width as usize) * (height as usize) * 4],
             };
-            let stats = text.paint_layout_with(&mut overlay.rgba, width, height, layout, Some(true));
+            let stats =
+                text.paint_layout_with(&mut overlay.rgba, width, height, layout, Some(true));
             let painted = stats.glyphs;
             merge_text_stats(acc, stats);
             if painted == 0 {
@@ -2667,7 +2798,6 @@ fn fnv_bytes(hash: &mut u64, bytes: &[u8]) {
     }
 }
 
-
 /// 层基面的**身份**(只看纹理引用,不做 GPU 解析):基图或快照目标变化 ⇒
 /// 旧内容与操作前缀作废。
 fn base_token(
@@ -2711,7 +2841,11 @@ fn base_token(
             let snapshot_tex = targets
                 .snapshot(*copy_id)
                 .map(|target| target.id)
-                .or_else(|| targets.snapshot_content(*copy_id).map(|content| content.tex.id));
+                .or_else(|| {
+                    targets
+                        .snapshot_content(*copy_id)
+                        .map(|content| content.tex.id)
+                });
             fnv_mix(&mut hash, snapshot_tex.unwrap_or(0));
         }
         Some(TextureRef::Offscreen(group)) => {

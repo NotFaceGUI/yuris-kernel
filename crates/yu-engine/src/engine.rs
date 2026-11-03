@@ -10,17 +10,17 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use yu_backend_soft::{frame_has_drawable_output, SoftRenderer};
-use yu_render_core::{png, RenderPhases, RenderReport, Surface, TextureStore};
-use yu_backend_wgpu::{DeviceOptions, WgpuRenderer};
 use crate::host_paths::{HostPathOverrides, PlatformHome as HostPlatformHome};
-use yu_save::NativeSaveFs;
+use yu_backend_soft::{frame_has_drawable_output, SoftRenderer};
+use yu_backend_wgpu::{DeviceOptions, WgpuRenderer};
 use yu_gfx::{
     json, probe_order_from_codes, CompositorFrame, GfxConfig, GfxHost, GfxState, Op, PassTarget,
     SizeU32, TextureRef, TextureSampler, Viewport,
 };
+use yu_render_core::{png, RenderPhases, RenderReport, Surface, TextureStore};
 use yu_rt::input::{InputFrame, InputTimeline};
 use yu_rt::{BootConfig, HostClock, Vm};
+use yu_save::NativeSaveFs;
 use yu_save::{SaveHost, SaveState};
 use yu_sound::{SoundHost, SoundLoader, SoundState};
 
@@ -393,8 +393,8 @@ struct FrameDiagTotal {
 /// 把 gfx 帧诊断(含 S1 位置)转成统一格式的 `Diag`,供控制台/汇总与
 /// 桌面面板同源消费(yu-cli 与 host-desktop 共用,不经 yu-cli 中转)。
 pub fn frame_total_to_diag(frame_diag: &yu_gfx::FrameDiag) -> yu_log::Diag {
-    let severity = yu_log::Severity::parse_str(frame_diag.severity)
-        .unwrap_or(yu_log::Severity::Recoverable);
+    let severity =
+        yu_log::Severity::parse_str(frame_diag.severity).unwrap_or(yu_log::Severity::Recoverable);
     let where_ = match frame_diag.at.first() {
         Some(at) => yu_log::Loc::script(at.script.clone(), None, at.pc, at.cmd.clone()),
         None => yu_log::Loc::None,
@@ -646,7 +646,8 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(project: Project, opts: EngineOptions) -> CliResult<Self> {        let boot_started = Instant::now();
+    pub fn new(project: Project, opts: EngineOptions) -> CliResult<Self> {
+        let boot_started = Instant::now();
         let (vm, state, sound, save_host, viewport, probe_order, mut capture_bridge, identity) =
             boot(&project, &opts)?;
         let boot_ms = boot_started.elapsed().as_secs_f64() * 1000.0;
@@ -1053,7 +1054,8 @@ impl Engine {
     pub fn tick_realtime_at(&mut self, now: Instant) -> CliResult<RenderedFrame> {
         let (now_ms, delta_ms, dropped_ms) = self.clock.advance(now);
         self.last_clock_drop_ms = dropped_ms;
-        if dropped_ms > 0 && (self.clock.dropped_frames <= 3 || self.clock.dropped_frames % 600 == 0)
+        if dropped_ms > 0
+            && (self.clock.dropped_frames <= 3 || self.clock.dropped_frames % 600 == 0)
         {
             log::warn!(
                 target: "yu-cli::engine",
@@ -1201,17 +1203,35 @@ impl Engine {
         // `--no-render`(安卓诊断):完全跳过渲染,复用上一帧的呈现面。
         // 用途:把上屏链路从时序里摘掉,单独验证"卡顿是否由渲染抢 CPU 引起"。
         // 首帧必须真渲染一次,否则后续没有可复用的三元组。
-        let (surface, report, screen) = if self.opts.render || self.last_render_out.is_none() {
-            let out = self.renderer.render(&frame)?;
-            self.last_render_out = Some(out.clone());
-            out
-        } else {
-            // `Arc` 克隆是引用计数,不是整帧拷贝。
-            self.last_render_out
-                .as_ref()
-                .map(Clone::clone)
-                .ok_or_else(|| Failure::runtime("no cached render output"))?
-        };
+        let (surface, report, screen, rendered_now) =
+            if self.opts.render || self.last_render_out.is_none() {
+                let out = self.renderer.render(&frame)?;
+                self.last_render_out = Some(out.clone());
+                (out.0, out.1, out.2, true)
+            } else {
+                // `Arc` 克隆是引用计数,不是整帧拷贝。
+                (
+                    self.last_render_out
+                        .as_ref()
+                        .map(|out| out.0.clone())
+                        .ok_or_else(|| Failure::runtime("no cached render output"))?,
+                    self.last_render_out
+                        .as_ref()
+                        .map(|out| out.1.clone())
+                        .ok_or_else(|| Failure::runtime("no cached render output"))?,
+                    self.last_render_out.as_ref().and_then(|out| out.2.clone()),
+                    false,
+                )
+            };
+        // 烘焙前缀只在**真实执行成功**后提交;failed_targets 对应后端 skip 的
+        // 图像/复制目标,下一帧保留重试。`--no-render` 复用旧报告,不提交本帧。
+        if let Some(state) = &self.state {
+            if rendered_now {
+                state.borrow().commit_baked(&report.failed_targets);
+            } else {
+                state.borrow().discard_baked();
+            }
+        }
         self.last_screen = screen;
         let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
         if let Renderer::Wgpu { renderer, .. } = &self.renderer {
@@ -1279,8 +1299,7 @@ impl Engine {
             sound_decode_ms: sound_stats.tick_decode_us as f64 / 1000.0,
             sound_stream_ms: sound_stats.decode_us as f64 / 1000.0,
             sound_decodes: u32::try_from(sound_stats.full_decodes).unwrap_or(u32::MAX),
-            sound_stream_frames: u32::try_from(sound_stats.decoded_frames)
-                .unwrap_or(u32::MAX),
+            sound_stream_frames: u32::try_from(sound_stats.decoded_frames).unwrap_or(u32::MAX),
             sound_underruns: u32::try_from(sound_stats.underruns).unwrap_or(u32::MAX),
             sound_seeks: u32::try_from(sound_stats.seeks).unwrap_or(u32::MAX),
             sound_slow_seeks: u32::try_from(sound_stats.slow_seeks).unwrap_or(u32::MAX),
@@ -1620,9 +1639,12 @@ impl Engine {
     /// 取走抓到的混音样本。
     #[must_use]
     pub fn take_audio_capture(&self) -> Option<Vec<f32>> {
-        self.sound
-            .as_ref()
-            .and_then(|sound| sound.lock().ok().and_then(|state| state.take_debug_capture()))
+        self.sound.as_ref().and_then(|sound| {
+            sound
+                .lock()
+                .ok()
+                .and_then(|state| state.take_debug_capture())
+        })
     }
 
     /// 累计被硬削波(超出 ±1.0)的声音样本数。
@@ -1644,12 +1666,7 @@ impl Engine {
     pub fn sound_rt_silence_samples(&self) -> u64 {
         self.sound
             .as_ref()
-            .and_then(|sound| {
-                sound
-                    .lock()
-                    .ok()
-                    .map(|state| state.rt_silence_samples())
-            })
+            .and_then(|sound| sound.lock().ok().map(|state| state.rt_silence_samples()))
             .unwrap_or(0)
     }
 
@@ -2005,9 +2022,8 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         Some(dir) => dir.clone(),
         None => project.root().join("save"),
     };
-    yu_save::ensure_save_root_with(&save_root, &NativeSaveFs::default()).map_err(|e| {
-        Failure::runtime(format!("创建 save 根 {} 失败: {e}", save_root.display()))
-    })?;
+    yu_save::ensure_save_root_with(&save_root, &NativeSaveFs::default())
+        .map_err(|e| Failure::runtime(format!("创建 save 根 {} 失败: {e}", save_root.display())))?;
     let source = project.open_source()?;
     let aux = project.open_aux()?;
     // 脚本密钥:显式优先,否则按 exe 扫描 → 数据自举 → 默认值解析
@@ -2253,11 +2269,7 @@ fn device_options_from_env() -> DeviceOptions {
 /// 平台默认解析与宿主覆盖合成见 [`crate::host_paths`]:桌面读环境变量,
 /// Android 等无环境变量的平台由宿主显式给目录。
 fn host_paths(save_root: &std::path::Path, overrides: &HostPathOverrides) -> yu_rt::vm::HostPaths {
-    crate::host_paths::resolve_host_paths(
-        save_root,
-        overrides,
-        &HostPlatformHome::resolve(),
-    )
+    crate::host_paths::resolve_host_paths(save_root, overrides, &HostPlatformHome::resolve())
 }
 
 /// 读游戏根的 `yssfs.dat`(「セーブファイル設定.exe」写出的存档路径设置)。
@@ -2319,8 +2331,7 @@ mod realtime_clock_tests {
         clock.cap_ms = Some(500);
         clock.advance(t0 + Duration::from_millis(700));
         clock.cap_ms = None;
-        let (now_ms, delta_ms, dropped_ms) =
-            clock.advance(t0 + Duration::from_millis(1400));
+        let (now_ms, delta_ms, dropped_ms) = clock.advance(t0 + Duration::from_millis(1400));
         assert_eq!((now_ms, delta_ms, dropped_ms), (1200, 700, 0));
         assert_eq!(clock.dropped_total_ms, 200, "清掉上限后不再新增丢弃");
     }

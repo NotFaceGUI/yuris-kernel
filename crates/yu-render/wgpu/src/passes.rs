@@ -19,14 +19,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 // 共享契约与平台设施(两个后端同源)。
-use yu_render_core::{
-    AssetIssue, RenderReport, SkippedOp, TextPaintStats, TextureStore,
-};
 use yu_gfx::{
     fixed_pipeline_alpha, shader_alpha, BlendMode, Clear, CompositorFrame, CopyId, Layer, LayerId,
     Op, OpStatus, TextureRef,
 };
 use yu_log::Diag;
+use yu_render_core::{AssetIssue, RenderReport, SkippedOp, TextPaintStats, TextureStore};
 
 use crate::device::{code, GpuContext};
 use crate::pipelines::{FilterKind, PipelineCache};
@@ -943,6 +941,15 @@ fn op_target(op: &Op) -> String {
     }
 }
 
+/// 只有图像/复制会写层表面;失败时把目标原始字节回传 gfx,撤回烘焙。
+fn texture_target_bytes(op: &Op) -> Option<&[u8]> {
+    match op {
+        Op::Copy(copy) => Some(copy.dest.as_bytes()),
+        Op::Image(image) => Some(image.target.as_ref().unwrap_or(&image.source).as_bytes()),
+        _ => None,
+    }
+}
+
 pub(crate) struct Accum {
     // 计数由 plan.rs 直接推进(与 soft 的 RenderReport 逐字段对齐)。
     pub(crate) frame: u64,
@@ -956,6 +963,8 @@ pub(crate) struct Accum {
     pub(crate) ops_drawn: usize,
     pub(crate) skipped_ops_total: u32,
     pub(crate) skipped: BTreeMap<(&'static str, String, String), u32>,
+    /// 失败图像/复制目标原始字节(回传 gfx 撤回烘焙;见 `RenderReport`).
+    pub(crate) failed_targets: BTreeSet<Vec<u8>>,
     pub(crate) skipped_text: usize,
     pub(crate) text_draws: usize,
     pub(crate) text_glyphs: usize,
@@ -982,6 +991,7 @@ impl Accum {
             ops_drawn: 0,
             skipped_ops_total: 0,
             skipped: BTreeMap::new(),
+            failed_targets: BTreeSet::new(),
             skipped_text: frame.text.iter().filter(|t| t.flags.is_none()).count(),
             text_draws: 0,
             text_glyphs: 0,
@@ -997,6 +1007,9 @@ impl Accum {
 
     pub(crate) fn skip(&mut self, op: &Op, reason: impl Into<String>) {
         self.skipped_ops_total += 1;
+        if let Some(target) = texture_target_bytes(op) {
+            self.failed_targets.insert(target.to_vec());
+        }
         let key = (op_kind(op), reason.into(), op_target(op));
         *self.skipped.entry(key).or_insert(0) += 1;
     }
@@ -1028,6 +1041,7 @@ impl Accum {
                     count,
                 })
                 .collect(),
+            failed_targets: self.failed_targets.into_iter().collect(),
             missing_assets,
             skipped_text: self.skipped_text,
             text_draws: self.text_draws,
@@ -1071,6 +1085,12 @@ pub(crate) struct SurfaceWrites<'a> {
     pub(crate) passes: &'a mut Vec<PlannedPass>,
     pub(crate) vertices: &'a mut Vec<Vertex>,
     pub(crate) aux: &'a mut Vec<wgpu::BindGroup>,
+    /// 过渡 draw 的绑定:`DrawKind::Transition*` 的 `bind_index` 指向
+    /// **最终 Plan** 的这张表。按需合成组(`compose_group_content`)曾用
+    /// 临时 `Vec::new()`,组内 `TRANSITION` 会把索引指向一张被丢弃的表 ⇒
+    /// 渲染时越界 panic(wgpu/lib.rs:1031,2026-11-02 ERIS demo)。
+    pub(crate) transition: &'a mut Vec<wgpu::BindGroup>,
+    pub(crate) transition_buffers: &'a mut Vec<wgpu::Buffer>,
     pub(crate) views: &'a mut std::collections::BTreeMap<u64, wgpu::TextureView>,
     pub(crate) textures: &'a mut std::collections::BTreeMap<u64, wgpu::Texture>,
     pub(crate) keepalive: &'a mut std::collections::BTreeMap<u64, std::rc::Rc<TexRef>>,
@@ -1102,7 +1122,10 @@ impl SurfaceWrites<'_> {
             blend: BlendMode::Normal,
             texture_id: target.id,
             filter: FilterKind::Point,
-            kind: DrawKind::Aux { bind_index: index, pipeline },
+            kind: DrawKind::Aux {
+                bind_index: index,
+                pipeline,
+            },
         });
         self.passes.push(pass);
     }
@@ -1130,10 +1153,26 @@ pub(crate) fn push_quad_uv(
     let (top, bottom) = (top as f32, bottom as f32);
     let [u0, v0, u1, v1] = uv;
 
-    let tl = Vertex { position: [left, top], uv: [u0, v0], alpha };
-    let tr = Vertex { position: [right, top], uv: [u1, v0], alpha };
-    let bl = Vertex { position: [left, bottom], uv: [u0, v1], alpha };
-    let br = Vertex { position: [right, bottom], uv: [u1, v1], alpha };
+    let tl = Vertex {
+        position: [left, top],
+        uv: [u0, v0],
+        alpha,
+    };
+    let tr = Vertex {
+        position: [right, top],
+        uv: [u1, v0],
+        alpha,
+    };
+    let bl = Vertex {
+        position: [left, bottom],
+        uv: [u0, v1],
+        alpha,
+    };
+    let br = Vertex {
+        position: [right, bottom],
+        uv: [u1, v1],
+        alpha,
+    };
     vertices.extend_from_slice(&[tl, tr, bl, tr, br, bl]);
 }
 
@@ -1167,10 +1206,26 @@ pub(crate) fn push_quad(
     let (left, right) = (left as f32, right as f32);
     let (top, bottom) = (top as f32, bottom as f32);
 
-    let tl = Vertex { position: [left, top], uv: [0.0, 0.0], alpha };
-    let tr = Vertex { position: [right, top], uv: [1.0, 0.0], alpha };
-    let bl = Vertex { position: [left, bottom], uv: [0.0, 1.0], alpha };
-    let br = Vertex { position: [right, bottom], uv: [1.0, 1.0], alpha };
+    let tl = Vertex {
+        position: [left, top],
+        uv: [0.0, 0.0],
+        alpha,
+    };
+    let tr = Vertex {
+        position: [right, top],
+        uv: [1.0, 0.0],
+        alpha,
+    };
+    let bl = Vertex {
+        position: [left, bottom],
+        uv: [0.0, 1.0],
+        alpha,
+    };
+    let br = Vertex {
+        position: [right, bottom],
+        uv: [1.0, 1.0],
+        alpha,
+    };
     vertices.extend_from_slice(&[tl, tr, bl, tr, br, bl]);
 }
 
@@ -1183,28 +1238,59 @@ pub(crate) fn clear_color(clear: Clear) -> wgpu::Color {
     }
 }
 
-/// 存活快照的**传递闭包**(层引用 + 本帧 COPY 产出 + COPY 命令时刻的源快照)。
-pub(crate) fn live_snapshots(frame: &CompositorFrame) -> BTreeSet<CopyId> {
+/// 存活快照的**传递闭包**(层引用 + 本帧 COPY 产出 + COPY 命令时刻的源快照
+/// + 命令时刻屏幕快照内部引用的纹理)。
+///
+/// 最后一项是 2026-11-03 真机取证补上的:旧 CGS 屏幕快照内部还引用着它
+/// 录制时刻的层快照(例如 `CGS1 → Snapshot(346)`),这些 id 不在本帧的
+/// 层/COPY pass 里,却仍是**已冻结屏幕画面**的一部分。只看前两项会把它们
+/// 当垃圾清掉;下一帧 CGS 层重新可见时 `apply_copy` 只能拿当前场景重算
+/// 旧 copy,于是淡出幕布里闪出「当前场景并不存在」的立绘/旧画面。
+///
+/// 闭包只沿 `frame.screen_snapshots` 展开;gfx 已用同一套不动点把不可达的
+/// 屏幕快照/复制项裁掉,所以这里不会把长会话里的死快照全部钉住。
+pub(crate) fn live_snapshots(
+    frame: &CompositorFrame,
+    materialized: &BTreeSet<CopyId>,
+) -> BTreeSet<CopyId> {
     let mut live = BTreeSet::new();
     for layer in &frame.layers {
         if let TextureRef::Snapshot(id) = &layer.texture {
             live.insert(*id);
         }
     }
-    let mut pending: Vec<CopyId> = Vec::new();
     for pass in &frame.passes {
         for op in &pass.ops {
             let Op::Copy(copy) = op else { continue };
             live.insert(copy.id);
-            pending.push(copy.id);
             if let Some(TextureRef::Snapshot(id)) = &copy.source_texture {
-                if live.insert(*id) {
-                    pending.push(*id);
-                }
+                live.insert(*id);
             }
         }
     }
+    // 最终屏幕快照纹理必须一直存活到 gfx 契约释放它:CGS 栈层可能在很多帧
+    // 之后才恢复引用(读档→菜单的 CGS1/CGS2)。内部复制链可以在物化后释放,
+    // 但最终那张屏幕纹理不能丢,否则栈恢复时只能拿当前场景重算。
+    for id in frame.screen_snapshots.keys() {
+        live.insert(*id);
+    }
+    let mut pending: Vec<CopyId> = live.iter().copied().collect();
     while let Some(id) = pending.pop() {
+        // 屏幕快照内部引用的快照纹理(含嵌套屏幕快照),整链保活。
+        //
+        // **已物化**的屏幕快照跳过展开:它的最终屏幕纹理已经冻结,内部
+        // 复制链不再服务显示;继续展开会让每开一次存档/菜单就多钉住约
+        // 29 个历史复制,`pin_snap_tex`/`copy_emit` 随次数单调上涨。
+        if !materialized.contains(&id) {
+            if let Some(snapshot) = frame.screen_snapshots.get(&id) {
+                for texture in &snapshot.snapshot_textures {
+                    if live.insert(*texture) {
+                        pending.push(*texture);
+                    }
+                }
+            }
+        }
+        // COPY 命令时刻源快照链(中间层被 CGEND 后仍由 source_texture 引用)。
         for pass in &frame.passes {
             for op in &pass.ops {
                 let Op::Copy(copy) = op else { continue };

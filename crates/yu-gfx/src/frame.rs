@@ -350,6 +350,13 @@ pub struct ScreenSnapshot {
     pub layer_ids: std::collections::BTreeSet<LayerId>,
     /// 采集时的屏幕契约指纹(同帧多次截图去重用;见 `GfxState`)。
     pub contract_key: u64,
+    /// 采集时的逻辑帧号。
+    ///
+    /// 屏幕快照必须在**采集当帧**整链物化:后端把它冻成最终屏幕纹理后,
+    /// 内部引用的复制链不再是显示依赖。`snapshot_texture_ids` 只对
+    /// 采集帧(+1 帧发射宽限)返回内部纹理,避免每次开存档/菜单都把旧
+    /// CGS 快照的整条复制链永久钉住(`pin_snap_tex` 随打开次数单调上涨)。
+    pub frame: u64,
 }
 
 impl CompositorFrame {

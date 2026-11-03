@@ -16,7 +16,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use yu_backend_soft::{png, scale_region, SoftRenderer, Surface, Texture, TextureStore};
-use yu_gfx::{CompositorFrame, CopyId, CopySource, GfxState, Layer, LayerCapture, Op, SizeU32, TextureRef};
+use yu_gfx::{
+    CompositorFrame, CopyId, CopySource, GfxState, Layer, LayerCapture, Op, SizeU32, TextureRef,
+};
 use yu_log::Diag;
 use yu_rt::event::CapturedImage;
 use yu_vfs::SharedMem;
@@ -76,8 +78,7 @@ impl GfxCapture {
         if !self.eager {
             // wgpu:按需端口在 SAVE 命令时刻读上一帧快照;渲染后只补
             // “本帧 SAVE 已登记、但当帧尚未渲染”的 wanted 快照。
-            self.wanted
-                .retain(|id| !self.pixels.contains_key(id));
+            self.wanted.retain(|id| !self.pixels.contains_key(id));
             return self.wanted.iter().copied().collect();
         }
         // soft:快照是 CPU 表面,渲染后镜像全部新快照(旧语义;成本是
@@ -98,8 +99,7 @@ impl GfxCapture {
             return Vec::new();
         }
         self.pixels.retain(|id, _| self.seen.contains(id));
-        self.wanted
-            .retain(|id| !self.pixels.contains_key(id));
+        self.wanted.retain(|id| !self.pixels.contains_key(id));
         for id in &self.wanted {
             if !fresh.contains(id) {
                 fresh.push(*id);
@@ -117,10 +117,15 @@ impl GfxCapture {
                 Op::Copy(copy) => Some(copy.id),
                 _ => None,
             })
-            .chain(frame.layers.iter().filter_map(|layer| match &layer.texture {
-                TextureRef::Snapshot(id) => Some(*id),
-                _ => None,
-            }))
+            .chain(
+                frame
+                    .layers
+                    .iter()
+                    .filter_map(|layer| match &layer.texture {
+                        TextureRef::Snapshot(id) => Some(*id),
+                        _ => None,
+                    }),
+            )
             .collect();
         self.seen.retain(|id| live.contains(id));
         self.pixels.retain(|id, _| live.contains(id));
@@ -130,8 +135,14 @@ impl GfxCapture {
     /// 写入一张从渲染器读回的快照像素(宿主在 `observe` 之后调用)。
     pub fn insert_mirror(&mut self, id: CopyId, width: u32, height: u32, rgba: Vec<u8>) {
         self.wanted.remove(&id);
-        self.pixels
-            .insert(id, Rc::new(Texture { width, height, rgba }));
+        self.pixels.insert(
+            id,
+            Rc::new(Texture {
+                width,
+                height,
+                rgba,
+            }),
+        );
     }
 }
 
@@ -158,11 +169,10 @@ impl GfxCapture {
         let main = &state.config().main_layer_set;
         let mut current = id;
         for _ in 0..8 {
-            let copy = state
-                .copies()
-                .iter()
-                .rev()
-                .find(|copy| copy.id == current && copy.status == yu_gfx::OpStatus::Executable)?;
+            let copy =
+                state.copies().iter().rev().find(|copy| {
+                    copy.id == current && copy.status == yu_gfx::OpStatus::Executable
+                })?;
             match &copy.source {
                 CopySource::Group(group) if group == main => {
                     let screen = self.last_screen.as_ref()?;
@@ -210,11 +220,10 @@ impl GfxCapture {
         let mut current = id;
         let mut base: Option<Rc<Texture>> = None;
         for _ in 0..MAX_DEPTH {
-            let copy = state
-                .copies()
-                .iter()
-                .rev()
-                .find(|copy| copy.id == current && copy.status == yu_gfx::OpStatus::Executable)?;
+            let copy =
+                state.copies().iter().rev().find(|copy| {
+                    copy.id == current && copy.status == yu_gfx::OpStatus::Executable
+                })?;
             // 文本是渲染期覆盖层,裁剪不会带上;交给整帧回放保证内容完整。
             if !copy.texts.is_empty() {
                 return None;
@@ -274,7 +283,6 @@ impl GfxCapture {
     fn replay_snapshot(&mut self, id: CopyId, state: &GfxState) -> Option<Rc<Texture>> {
         let frame = state.frame();
         self.soft.set_last_screen(self.last_screen.clone());
-        let started = std::time::Instant::now();
         self.soft.render_frame(&frame);
         let Some(surface) = self.soft.snapshot_surface(id) else {
             log::warn!(
@@ -291,16 +299,6 @@ impl GfxCapture {
         });
         self.pixels.insert(id, Rc::clone(&mirror));
         self.snapshot_replays += 1;
-        if std::env::var("YURIS_CAPTION_TIMING").is_ok() {
-            log::debug!(
-                target: "yu-engine",
-                "[caption] SAVE[ID] replay snapshot={} {}x{} {}us",
-                id.0,
-                surface.width,
-                surface.height,
-                started.elapsed().as_micros()
-            );
-        }
         Some(mirror)
     }
 }
@@ -326,23 +324,19 @@ impl LayerCapture for GfxCapture {
         let size = intended_size(state, layer);
         let surface = match &texture {
             TextureRef::Snapshot(copy_id) => {
-                // 主窗口整屏截图(`COPY2 ID=:/W0/`)在**同一 tick** 内被
-                // `SAVE[ID]` 读取时(存档缩略图:`es.SCENARIO.SS` 截屏 →
-                // 打开菜单 → `es.Save` 存 `SLTEMP`),命令时刻像素还没被
-                // 主渲染器画出来;wgpu 读回拿不到、`chain_snapshot` 也没有
-                // 源层纹理,只能 `replay_snapshot` 整帧软回放(debug 实测
-                // 1.5s)。这段停顿发生在菜单淡入的同一帧,按墙钟计时的
-                // `es.SS.FADE` 会直接跳过整段淡入。
+                // 解析顺序按语义优先级:
+                // 1. 已物化的冻结镜像/注册表(命令时刻像素);
+                // 2. 沿复制链从上游冻结快照裁剪(`SLTEMP2 ← SLTEMP ← :/W0/`);
+                // 3. 主组拷贝的上一帧呈现面(同 tick 兜底);
+                // 4. 整帧软回放。
                 //
-                // 上一帧呈现面就是玩家按下菜单前看到的画面,与官方在
-                // `ES.SCENARIO.SS` 处截到的缩略图同源(只差同一 tick 的
-                // 隐藏 UI 命令);用它替代整帧回放,避免存档尖峰吃掉淡入。
-                // 快路径:上一帧已渲染的镜像/注册表;同 tick 新建的快照
-                // 优先用源快照裁剪,最后才整帧回放。
+                // 旧顺序把 3 放在最前:玩家在存档界面停留后,上一帧呈现面
+                // 已经是存档 UI 本身,缩略图因此存成 UI 截图(2026-11-02
+                // 实测)。冻结快照可用时必须优先于呈现面。
                 let mirror = self
-                    .screen_frame_for(*copy_id, state)
-                    .or_else(|| self.snapshot_pixels(*copy_id))
+                    .snapshot_pixels(*copy_id)
                     .or_else(|| self.chain_snapshot(*copy_id, state))
+                    .or_else(|| self.screen_frame_for(*copy_id, state))
                     .or_else(|| self.replay_snapshot(*copy_id, state));
                 if mirror.is_none() {
                     self.wanted.insert(*copy_id);
@@ -359,16 +353,17 @@ impl LayerCapture for GfxCapture {
                     rgba: mirror.rgba.clone(),
                 })
             }
-            TextureRef::Asset(key) => self
-                .soft
-                .textures_mut()
-                .resolve(key)
-                .ok()
-                .map(|texture| Surface {
-                    width: texture.width,
-                    height: texture.height,
-                    rgba: texture.rgba.clone(),
-                }),
+            TextureRef::Asset(key) => {
+                self.soft
+                    .textures_mut()
+                    .resolve(key)
+                    .ok()
+                    .map(|texture| Surface {
+                        width: texture.width,
+                        height: texture.height,
+                        rgba: texture.rgba.clone(),
+                    })
+            }
             TextureRef::SolidBlack1x1 => {
                 // `CG[FILE=""]` 的占位面:如果 SAVE 落到它,说明该层没有拿到
                 // 真正的拷贝(常见于 COPY2 源缺失)。显式留痕,不静默存 1×1。
@@ -395,12 +390,7 @@ impl LayerCapture for GfxCapture {
                     height: surface.height,
                     rgba: surface.rgba,
                 };
-                let region = (
-                    0,
-                    0,
-                    i64::from(src.width) - 1,
-                    i64::from(src.height) - 1,
-                );
+                let region = (0, 0, i64::from(src.width) - 1, i64::from(src.height) - 1);
                 let scaled = scale_region(&src, width, height, Some(region), true);
                 Surface {
                     width: scaled.width,
@@ -431,26 +421,12 @@ impl LayerCapture for GfxCapture {
             height: image.height,
             rgba: image.rgba.clone(),
         };
-        let encode_started = std::time::Instant::now();
         let png = png::png_bytes(&surface).map_err(|e| {
             yu_gfx::error::recoverable(
                 yu_gfx::error::code::INFO_UNSUPPORTED,
                 format!("LOAD[ID] 缩略图 PNG 编码失败: {e}"),
             )
         })?;
-        let encode_us = encode_started.elapsed().as_micros() as u64;
-        if std::env::var("YURIS_CAPTION_TIMING").is_ok() {
-            // 缩略图编码是命令时刻的一次性成本:留在统一控制台(debug),
-            // 回答「存档/读档这一帧有没有编码尖峰」。
-            log::debug!(
-                target: "yu-engine",
-                "[caption] LOAD[ID] PNG {}x{} {}B encode={}us",
-                image.width,
-                image.height,
-                png.len(),
-                encode_us
-            );
-        }
         let key = synthetic_key(&png);
         self.overlay.insert(&key, png).map_err(|d| {
             yu_gfx::error::recoverable(
@@ -527,7 +503,8 @@ fn crop_texture(src: &Texture, x: u32, y: u32, width: u32, height: u32) -> Textu
 }
 
 /// 内容哈希键:同名资产必然同字节,渲染器缓存无需失效。
-fn synthetic_key(png: &[u8]) -> Vec<u8> {    use sha2::{Digest, Sha256};
+fn synthetic_key(png: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
     let digest = Sha256::digest(png);
     let mut key = b"__synth/thumb-".to_vec();
     for byte in &digest[..8] {
@@ -556,12 +533,7 @@ fn intended_size(state: &GfxState, layer: &Layer) -> Option<(u32, u32)> {
         let TextureRef::Snapshot(copy_id) = texture else {
             break;
         };
-        let Some(copy) = state
-            .copies()
-            .iter()
-            .rev()
-            .find(|copy| copy.id == copy_id)
-        else {
+        let Some(copy) = state.copies().iter().rev().find(|copy| copy.id == copy_id) else {
             break;
         };
         let CopySource::Layer(source) = &copy.source else {
@@ -577,7 +549,6 @@ fn intended_size(state: &GfxState, layer: &Layer) -> Option<(u32, u32)> {
     }
     None
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -9,14 +9,14 @@
 //!
 //! 所有纹理格式固定 [`wgpu::TextureFormat::Rgba8Unorm`],不做 sRGB 解码。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::Pod;
-use yu_render_core::TextureStore;
 use yu_gfx::{CopyId, LayerId};
+use yu_render_core::TextureStore;
 
-use crate::surfaces::{Content, TexRef};
+use crate::surfaces::{Content, LayerSurfaces, TexRef};
 use yu_log::Diag;
 
 use crate::device::{code, GpuContext};
@@ -275,6 +275,13 @@ pub struct TargetSet {
     /// 可直接引用源纹理的 UV 子窗口,由图层绘制/文本烘焙按采样窗消费。
     /// 与 `snapshots` 同生命周期(按 `CopyId` 剪枝)。
     snapshot_contents: BTreeMap<CopyId, Content>,
+    /// 屏幕快照合成专用的图层表面账。
+    ///
+    /// `screen_snapshot_content` 用**捕获时**的 alpha/texture 合成冻结画面;
+    /// 若写进活的 `LayerSurfaces`,`sync_base` 会把同名活层在两套 base
+    /// token 之间来回清空(读档时背景层被反复重建,烘焙跳过永远补不回来)。
+    /// 每个 `CopyId` 一份,保留跨帧缓存但绝不污染活层。
+    snapshot_surfaces: BTreeMap<CopyId, LayerSurfaces>,
     scale: Option<RenderTarget>,
 }
 
@@ -296,8 +303,18 @@ impl TargetSet {
             composites: BTreeMap::new(),
             snapshots: BTreeMap::new(),
             snapshot_contents: BTreeMap::new(),
+            snapshot_surfaces: BTreeMap::new(),
             scale: None,
         }
+    }
+
+    /// 取/还屏幕快照合成专用的表面账(见字段注释)。
+    pub(crate) fn take_snapshot_surfaces(&mut self, id: CopyId) -> LayerSurfaces {
+        self.snapshot_surfaces.remove(&id).unwrap_or_default()
+    }
+
+    pub(crate) fn put_snapshot_surfaces(&mut self, id: CopyId, surfaces: LayerSurfaces) {
+        self.snapshot_surfaces.insert(id, surfaces);
     }
 
     pub fn screen(&self) -> Option<&RenderTarget> {
@@ -325,6 +342,15 @@ impl TargetSet {
     /// 快照是否已冻结(物化纹理或 UV 别名都算)。
     pub fn has_snapshot(&self, id: CopyId) -> bool {
         self.snapshots.contains_key(&id) || self.snapshot_contents.contains_key(&id)
+    }
+
+    /// 已冻结的快照 id 集合(供 `live_snapshots` 停止展开其内部复制链)。
+    pub(crate) fn materialized_ids(&self) -> BTreeSet<CopyId> {
+        self.snapshots
+            .keys()
+            .chain(self.snapshot_contents.keys())
+            .copied()
+            .collect()
     }
 
     /// 当前存活快照的句柄表(按需读回端口跨帧使用;只克隆 `Rc`)。
@@ -360,11 +386,7 @@ impl TargetSet {
                 return Some(&target.view);
             }
         }
-        for target in self
-            .offscreen
-            .values()
-            .chain(self.composites.values())
-        {
+        for target in self.offscreen.values().chain(self.composites.values()) {
             if target.id == id {
                 return Some(&target.view);
             }
@@ -384,11 +406,7 @@ impl TargetSet {
                 return Some(&target.texture);
             }
         }
-        for target in self
-            .offscreen
-            .values()
-            .chain(self.composites.values())
-        {
+        for target in self.offscreen.values().chain(self.composites.values()) {
             if target.id == id {
                 return Some(&target.texture);
             }
@@ -423,6 +441,7 @@ impl TargetSet {
             }
             self.snapshot_contents.remove(&id);
         }
+        self.snapshot_surfaces.retain(|id, _| live.contains(id));
     }
 
     /// 丢弃全部快照纹理(渲染器 `reset()` 用;DIV-HOST-001)。
@@ -435,6 +454,7 @@ impl TargetSet {
             pipelines.forget_texture(target.id);
         }
         self.snapshot_contents.clear();
+        self.snapshot_surfaces.clear();
         removed
     }
 
@@ -577,7 +597,11 @@ impl TargetSet {
     /// 当前图层级 GPU 合成目标数(诊断:证明 GPU 合成路径确实生效)。
     /// `(合成目标, 组离屏, 快照)` 计数(诊断/退出摘要)。
     pub fn resource_counts(&self) -> (usize, usize, usize) {
-        (self.composites.len(), self.offscreen.len(), self.snapshots.len())
+        (
+            self.composites.len(),
+            self.offscreen.len(),
+            self.snapshots.len(),
+        )
     }
 
     pub fn composite_count(&self) -> usize {

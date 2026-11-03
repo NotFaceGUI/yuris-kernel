@@ -217,7 +217,11 @@ fn repeated_frame_reuses_resident_surface() {
     let frame = gfx.frame();
     let first = gpu.render_frame(&frame).expect("first");
     // 第一帧:一次填充 + 一次屏幕 blit。
-    assert_eq!(gpu.render_phases().surface_passes, 1, "第一帧应执行一次填充");
+    assert_eq!(
+        gpu.render_phases().surface_passes,
+        1,
+        "第一帧应执行一次填充"
+    );
     let first_surface = first.surface.clone();
 
     // 同一 frame 再渲染一次:操作前缀相同 ⇒ 表面写入 0、上传 0。
@@ -232,14 +236,20 @@ fn repeated_frame_reuses_resident_surface() {
         "同前缀操作必须复用(实际 reused_layers={})",
         phases.reused_layers
     );
-    assert_eq!(second.surface.rgba, first_surface.rgba, "复用的表面像素不变");
+    assert_eq!(
+        second.surface.rgba, first_surface.rgba,
+        "复用的表面像素不变"
+    );
 }
 
 /// `SIZE`(无区域)是纯采样修饰:不产生表面写入,像素随层声明尺寸拉伸。
 #[test]
 fn size_without_region_is_sampling_only() {
     let table = table();
-    let entries = [(b"p.png".as_slice(), png_bytes_for(2, 2, Rgba([200, 100, 50, 255])))];
+    let entries = [(
+        b"p.png".as_slice(),
+        png_bytes_for(2, 2, Rgba([200, 100, 50, 255])),
+    )];
     let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
         return;
     };
@@ -285,7 +295,10 @@ fn size_without_region_is_sampling_only() {
 #[test]
 fn full_copy_aliases_and_region_copy_blits() {
     let table = table();
-    let entries = [(b"a.png".as_slice(), png_bytes_for(4, 4, Rgba([10, 20, 30, 255])))];
+    let entries = [(
+        b"a.png".as_slice(),
+        png_bytes_for(4, 4, Rgba([10, 20, 30, 255])),
+    )];
     let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
         return;
     };
@@ -353,7 +366,14 @@ fn full_copy_aliases_and_region_copy_blits() {
     let frame = gfx.frame();
     let out = gpu.render_frame(&frame).expect("render");
     let phases = gpu.render_phases();
-    assert!(phases.blits >= 1, "区域 COPY 必须做区域复制");
+    // 区域 COPY 可以是真实 blit,也可以零拷贝别名源纹理的 UV 子窗口
+    // (2b53786/934f73f 的菜单按钮切片优化)。两者语义等价:源内容纹理
+    // 不可变,绘制/文本烘焙都按 `Content.uv` 消费。这里只钉住「区域必须
+    // 被处理」与像素一致,不把实现路径钉死成 blit。
+    assert!(
+        phases.blits >= 1 || phases.alias_hits >= 1,
+        "区域 COPY 必须物化或零拷贝别名"
+    );
     let mut soft = SoftRenderer::new(store(&entries));
     let soft_out = soft.render_frame(&frame);
     assert_eq!(
@@ -368,8 +388,14 @@ fn full_copy_aliases_and_region_copy_blits() {
 fn merge2_matches_soft() {
     let table = table();
     let entries = [
-        (b"low.png".as_slice(), png_bytes_for(8, 8, Rgba([40, 120, 200, 128]))),
-        (b"up.png".as_slice(), png_bytes_for(8, 8, Rgba([220, 30, 20, 160]))),
+        (
+            b"low.png".as_slice(),
+            png_bytes_for(8, 8, Rgba([40, 120, 200, 128])),
+        ),
+        (
+            b"up.png".as_slice(),
+            png_bytes_for(8, 8, Rgba([220, 30, 20, 160])),
+        ),
     ];
     let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
         return;
@@ -472,7 +498,10 @@ fn in_place_transforms_match_soft() {
 #[test]
 fn surfaces_are_pruned_when_layers_die() {
     let table = table();
-    let entries = [(b"a.png".as_slice(), png_bytes_for(4, 4, Rgba([1, 2, 3, 255])))];
+    let entries = [(
+        b"a.png".as_slice(),
+        png_bytes_for(4, 4, Rgba([1, 2, 3, 255])),
+    )];
     let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
         return;
     };
@@ -523,7 +552,10 @@ fn surfaces_are_pruned_when_layers_die() {
 #[test]
 fn resident_surface_sequence_is_deterministic() {
     let table = table();
-    let entries = [(b"a.png".as_slice(), png_bytes_for(8, 8, Rgba([90, 40, 10, 200])))];
+    let entries = [(
+        b"a.png".as_slice(),
+        png_bytes_for(8, 8, Rgba([90, 40, 10, 200])),
+    )];
     let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
     let mut frames = Vec::new();
     for frame in 1..=6u64 {
@@ -552,7 +584,12 @@ fn resident_surface_sequence_is_deterministic() {
                 vec![
                     arg(&table, "CGACT", "ID", Value::Str(b"A".to_vec())),
                     arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
-                    arg(&table, "CGACT", "SET", Value::Int(0xFF000000 | frame as i64)),
+                    arg(
+                        &table,
+                        "CGACT",
+                        "SET",
+                        Value::Int(0xFF000000 | frame as i64),
+                    ),
                     arg(&table, "CGACT", "X", Value::Int(0)),
                     arg(&table, "CGACT", "Y", Value::Int(0)),
                     arg(&table, "CGACT", "X2", Value::Int(0)),
@@ -680,9 +717,18 @@ fn text_layer_is_stable_across_frames() {
 fn sixty_frame_scene_matches_soft() {
     let table = table();
     let entries = [
-        (b"bg.png".as_slice(), png_bytes_for(16, 16, Rgba([10, 60, 120, 255]))),
-        (b"a.png".as_slice(), png_bytes_for(8, 8, Rgba([220, 40, 30, 200]))),
-        (b"b.png".as_slice(), png_bytes_for(8, 8, Rgba([30, 200, 80, 160]))),
+        (
+            b"bg.png".as_slice(),
+            png_bytes_for(16, 16, Rgba([10, 60, 120, 255])),
+        ),
+        (
+            b"a.png".as_slice(),
+            png_bytes_for(8, 8, Rgba([220, 40, 30, 200])),
+        ),
+        (
+            b"b.png".as_slice(),
+            png_bytes_for(8, 8, Rgba([30, 200, 80, 160])),
+        ),
     ];
     let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
         return;
@@ -918,7 +964,16 @@ fn merge_does_not_leak_hidden_lower_rgb_at_antialiased_edges() {
             upper.put_pixel(x, y, Rgba([220, 30, 20, 255]));
         }
     }
-    let aa = [(1u32, 2u32), (6, 2), (1, 5), (6, 5), (2, 1), (5, 1), (2, 6), (5, 6)];
+    let aa = [
+        (1u32, 2u32),
+        (6, 2),
+        (1, 5),
+        (6, 5),
+        (2, 1),
+        (5, 1),
+        (2, 6),
+        (5, 6),
+    ];
     for (x, y) in aa {
         upper.put_pixel(x, y, Rgba([220, 30, 20, 128]));
     }
@@ -990,7 +1045,10 @@ fn merge_does_not_leak_hidden_lower_rgb_at_antialiased_edges() {
     assert_eq!(&center[..3], &[220, 30, 20], "不透明块必须是差分色");
     // 完全透明区(上层 alpha=0):不应有任何可见内容(下层 alpha=0)。
     let corner = pixel_of(&out.surface, 0, 0);
-    assert!(corner[..3].iter().all(|&c| c < 8), "透明区不该有残留: {corner:?}");
+    assert!(
+        corner[..3].iter().all(|&c| c < 8),
+        "透明区不该有残留: {corner:?}"
+    );
 
     // 最后:GPU 与 soft 必须逐字节一致。
     assert_eq!(

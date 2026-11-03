@@ -223,7 +223,11 @@ fn cginfo_color_samples_pixel_at_set_coordinates() {
         )
         .expect("CGINFO[COLOR]")
     };
-    assert_eq!(color(0, 0), Value::Int(0x0080_8080), "1×1 灰 = r|g<<8|b<<16");
+    assert_eq!(
+        color(0, 0),
+        Value::Int(0x0080_8080),
+        "1×1 灰 = r|g<<8|b<<16"
+    );
     assert_eq!(color(5, 5), Value::Int(-1), "越界返回 -1");
 }
 
@@ -427,11 +431,7 @@ fn window_minimize_close_mode_follow_manual() {
     let call = |gfx: &mut yu_gfx::GfxState, params: Vec<yu_rt::event::ArgValue>| {
         let mut args = vec![arg(&table, "WINDOW", "NO", i(0))];
         args.extend(params);
-        gfx.consume_events(&[
-            frame_start(1),
-            window_call(1, "WINDOW", args),
-            frame_end(1),
-        ]);
+        gfx.consume_events(&[frame_start(1), window_call(1, "WINDOW", args), frame_end(1)]);
     };
     call(
         &mut gfx,
@@ -494,4 +494,38 @@ fn window_wsx_wsy_sets_outer_size_read_back_by_windowinfo() {
     // 客户区尺寸不受影响。
     assert_eq!(info(&gfx, "SX"), Value::Int(800));
     assert_eq!(info(&gfx, "SY"), Value::Int(600));
+}
+
+/// 主窗口组 `COPY2 :/W0/` 的快照尺寸 = 窗口/后缓冲尺寸;脚本会立刻用
+/// `CGINFO[SX/SY]` 做布局,缺失会让整层按 0 处理。
+#[test]
+fn main_group_copy_snapshot_reports_viewport_size() {
+    let table = table();
+    let mut gfx = state();
+    let viewport = gfx.config().viewport;
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s(":/W0/")),
+                arg(&table, "CGACT", "ID2", s("CGS100")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let info = |flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("CGS100")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info("SX"), Value::Int(i64::from(viewport.width)));
+    assert_eq!(info("SY"), Value::Int(i64::from(viewport.height)));
 }

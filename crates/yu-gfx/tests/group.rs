@@ -197,7 +197,8 @@ fn thumbnail_merge_chain_survives_cg_end_and_reused_tmp_layers() {
 }
 
 #[test]
-fn copy_with_region_keeps_raw_bounds() {    let table = table();
+fn copy_with_region_keeps_raw_bounds() {
+    let table = table();
     let mut gfx = state();
     gfx.consume_events(&[
         frame_start(1),
@@ -694,4 +695,160 @@ fn main_group_screen_snapshot_uses_command_time_layer_state() {
     };
     assert!(visible_in(":/W0/CGS100"), "第一张截屏应在隐藏之前");
     assert!(!visible_in(":/W0/CGS1"), "第二张截屏应在隐藏之后");
+}
+
+/// 屏幕快照在**采集当帧**必须物化,即使目标层同一 tick 稍后被 `CGEND`:
+/// CGS 栈把快照 id 存进脚本变量,若等到栈恢复才首次发射 copy,后端只能
+/// 用当前场景重算旧 id(2026-11-03 真机:淡出幕布闪出当前不存在的立绘)。
+#[test]
+fn screen_snapshot_materializes_on_capture_frame_even_if_target_dies() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        create(&table, "SRC", "src", 1, 256),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s(":/W0/")),
+                arg(&table, "CGACT", "ID2", s("CGS100")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        call(1, "CGEND", vec![arg(&table, "CGEND", "ID", s("CGS100"))]),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let synthetic = f.passes.iter().find_map(|pass| {
+        let PassTarget::Texture(target) = &pass.target else {
+            return None;
+        };
+        if !target.display().starts_with("__copy_screen_snapshot_") {
+            return None;
+        }
+        pass.ops.iter().find_map(|op| match op {
+            Op::Copy(copy) => Some(copy),
+            _ => None,
+        })
+    });
+    let copy = synthetic.expect("采集帧应有一条内部合成 copy");
+    assert!(
+        f.screen_snapshots.contains_key(&copy.id),
+        "内部合成 copy 必须对应命令时刻屏幕快照"
+    );
+}
+
+/// `frame()` 是事件批次的纯投影:同一批事件重复取帧必须逐位一致。
+/// 旧实现会在第一次取帧时写 `baked_images`,第二次把刚发射的加工项跳过,
+/// 导致 soft/wgpu 两个消费者拿到不同 pass 集(立绘 `COPY→SIZE2` 丢层)。
+#[test]
+fn frame_projection_is_idempotent_within_event_batch() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        create(&table, "SRC", "src", 1, 256),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "SIZE", i(1)),
+                arg(&table, "CGACT", "SX", i(32)),
+                arg(&table, "CGACT", "SY", i(32)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let first = gfx.frame();
+    let second = gfx.frame();
+    assert_eq!(first, second, "同一批事件的 frame() 必须相同");
+    assert!(
+        first
+            .passes
+            .iter()
+            .any(|pass| matches!(pass.target, PassTarget::Texture(_))),
+        "加工项必须在两次投影里都保留"
+    );
+}
+
+/// 烘焙前缀只能在后端确认成功后提交;失败目标下一帧必须重新发射。
+#[test]
+fn baked_prefix_waits_for_backend_ack_and_retries_failed_target() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        create(&table, "SRC", "src", 1, 256),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "SIZE", i(1)),
+                arg(&table, "CGACT", "SX", i(32)),
+                arg(&table, "CGACT", "SY", i(32)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let has_image = |gfx: &GfxState| {
+        gfx.frame()
+            .passes
+            .iter()
+            .any(|pass| matches!(pass.target, PassTarget::Texture(_)))
+    };
+    assert!(has_image(&gfx));
+    // 只投影、不 commit:下一批事件后仍须发射。
+    gfx.consume_events(&[frame_start(2), frame_end(2)]);
+    assert!(has_image(&gfx), "未 commit 的投影不能当作已烘焙");
+    // 后端回传失败目标:该目标不提交,下一帧仍发射。
+    gfx.commit_baked(&[b":/W0/SRC".to_vec()]);
+    gfx.consume_events(&[frame_start(3), frame_end(3)]);
+    assert!(has_image(&gfx), "失败目标必须保留重试");
+    // 成功回执:提交后下一帧不再发射。
+    gfx.commit_baked(&[]);
+    gfx.consume_events(&[frame_start(4), frame_end(4)]);
+    assert!(!has_image(&gfx), "成功执行后才可跳过历史烘焙前缀");
+}
+
+/// 已成功冻结、且目标层仍持有该快照的 COPY 不再逐帧重放;失败回执则重试。
+#[test]
+fn frozen_copy_is_not_replayed_every_frame() {
+    let table = table();
+    let mut gfx = state();
+    let build = |gfx: &mut GfxState, frame: u64| {
+        gfx.consume_events(&[
+            frame_start(frame),
+            create(&table, "SRC", "src", 1, 256),
+            call(
+                frame,
+                "CGACT",
+                vec![
+                    arg(&table, "CGACT", "ID", s("SRC")),
+                    arg(&table, "CGACT", "ID2", s("DST")),
+                    arg(&table, "CGACT", "COPY2", i(1)),
+                ],
+            ),
+            frame_end(frame),
+        ]);
+    };
+    let copy_to_dst = |gfx: &GfxState| {
+        gfx.frame().passes.iter().any(|pass| {
+            pass.ops
+                .iter()
+                .any(|op| matches!(op, Op::Copy(copy) if copy.dest.display() == ":/W0/DST"))
+        })
+    };
+    build(&mut gfx, 1);
+    assert!(copy_to_dst(&gfx), "首帧必须发射 COPY");
+    // 失败回执:不冻结,下一帧重试(后续帧不再重发 COPY 命令)。
+    gfx.commit_baked(&[b":/W0/DST".to_vec()]);
+    gfx.consume_events(&[frame_start(2), frame_end(2)]);
+    assert!(copy_to_dst(&gfx), "失败目标必须重试");
+    // 成功回执:目标层仍持有 Snapshot,命令已执行完,不再重放。
+    gfx.commit_baked(&[]);
+    gfx.consume_events(&[frame_start(3), frame_end(3)]);
+    assert!(!copy_to_dst(&gfx), "已冻结 COPY 不应逐帧重放");
 }

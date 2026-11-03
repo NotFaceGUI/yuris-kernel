@@ -975,3 +975,60 @@ fn text_on_snapshot_layer_persists_across_frames() {
         "标签文本跨帧常驻(不再逐帧清空)"
     );
 }
+
+#[test]
+fn screen_snapshot_carries_image_processed_layer() {
+    let table = table();
+    let mut backend = SoftRenderer::new(texture_store(&[(
+        b"blue.png",
+        png_bytes_for_wh(4, 4, Rgba([0, 0, 255, 255])),
+    )]));
+    let mut gfx = state(Viewport::new(4, 4), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"SRC".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"blue".to_vec())),
+                arg(&table, "CG", "Z", Value::Int(1)),
+                arg(&table, "CG", "A", Value::Int(256)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"SRC".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0xff0000)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b":/W0/".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"SNAP".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"SNAP".to_vec())),
+                arg(&table, "CG", "Z", Value::Int(10)),
+                arg(&table, "CG", "A", Value::Int(256)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let out = backend.render_frame(&gfx.frame());
+    assert_eq!(
+        out.surface.pixel(0, 0),
+        Some([255, 0, 0, 255]),
+        "COPY2 :/W0/ 必须携带命令时刻已经 RECTPAINT 的层像素"
+    );
+}

@@ -30,9 +30,6 @@ use yu_gfx::{
     TextureRef,
 };
 
-use yu_render_core::{
-    blit, ImageCacheKey, ImageOpSig, ImageSource, RenderReport, SizeSource, SkippedOp, Surface,
-};
 use crate::imageop::{
     apply_horizontal, apply_meido, apply_rect_paint, apply_resize, apply_reverse, apply_trim,
     apply_vertical,
@@ -41,12 +38,9 @@ use crate::text::{
     layer_base, layer_base_dims, text_base_key, texture_content_hash, TextComposer, TextPaintStats,
 };
 use crate::texture::{Texture, TextureStore};
-
-
-
-
-
-
+use yu_render_core::{
+    blit, ImageCacheKey, ImageOpSig, ImageSource, RenderReport, SizeSource, SkippedOp, Surface,
+};
 
 /// `render_frame` 的输出。
 ///
@@ -86,8 +80,6 @@ pub struct SoftRenderer {
     /// `LayerSurfaces::diffusion_blocks` 同口径)。
     diffusion_seed: u32,
 }
-
-
 
 impl SoftRenderer {
     pub fn new(textures: TextureStore) -> Self {
@@ -493,9 +485,12 @@ fn apply_image_op(
     // 在这里显式取整。产品路径(wgpu)保留浮点并用 UV 子矩形做亚像素采样
     // —— 精灵系统的位置小数部分正是靠那条路径才不抖。
     let region = match (image.x, image.y, image.x2, image.y2) {
-        (Some(x), Some(y), Some(x2), Some(y2)) => {
-            Some((x.round() as i64, y.round() as i64, x2.round() as i64, y2.round() as i64))
-        }
+        (Some(x), Some(y), Some(x2), Some(y2)) => Some((
+            x.round() as i64,
+            y.round() as i64,
+            x2.round() as i64,
+            y2.round() as i64,
+        )),
         (None, None, None, None) => None,
         _ => return Err("gfx.imageop.region.partial".to_string()),
     };
@@ -646,7 +641,14 @@ fn apply_image_op(
             .source2
             .as_ref()
             .ok_or_else(|| "gfx.imageop.source.missing".to_string())?;
-        let from = layer_surface(textures, snapshots, frame, from_id, st, image.source_texture.as_ref())?;
+        let from = layer_surface(
+            textures,
+            snapshots,
+            frame,
+            from_id,
+            st,
+            image.source_texture.as_ref(),
+        )?;
         let to = layer_surface(textures, snapshots, frame, to_id, st, None)?;
         let blend = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
         let blended = crate::imageop::blend_transition(
@@ -723,9 +725,11 @@ fn apply_image_op(
             let deg = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
             crate::imagefilters::apply_rotation(&mut texture, deg);
         }
-        ImageAction::Other(name @ ("saido" | "akarusa" | "mono" | "mosaic" | "blur" | "diffusion"
-        | "whirlpool" | "raster" | "raster2" | "raster3" | "blur2" | "blur3" | "blur4"
-        | "blur5" | "blur6" | "rotation2")) => {
+        ImageAction::Other(
+            name @ ("saido" | "akarusa" | "mono" | "mosaic" | "blur" | "diffusion" | "whirlpool"
+            | "raster" | "raster2" | "raster3" | "blur2" | "blur3" | "blur4" | "blur5"
+            | "blur6" | "rotation2"),
+        ) => {
             let set = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
             let set2 = image.set2.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
             match name {
@@ -854,7 +858,14 @@ fn apply_copy_op(
         }
         CopySource::Group(id) => compose_group(textures, snapshots, frame, id, st)?,
         CopySource::Layer(id) => {
-            let mut surface = layer_surface(textures, snapshots, frame, id, st, copy.source_texture.as_ref())?;
+            let mut surface = layer_surface(
+                textures,
+                snapshots,
+                frame,
+                id,
+                st,
+                copy.source_texture.as_ref(),
+            )?;
             if !copy.texts.is_empty() {
                 compose_copy_texts(&mut surface, copy, st);
             }
@@ -868,10 +879,7 @@ fn apply_copy_op(
     // 缩到 100×75;若按目标层当时的显示尺寸(100×75)裁剪,只会截到画面
     // 左上角(实测整张缩略图变黑)。
     let (x0, y0, x1, y1) = copy.region.resolve(source.width, source.height);
-    let (width, height) = (
-        (x1 - x0 + 1).max(0) as u32,
-        (y1 - y0 + 1).max(0) as u32,
-    );
+    let (width, height) = ((x1 - x0 + 1).max(0) as u32, (y1 - y0 + 1).max(0) as u32);
     let (width, height) = if width > 0 && height > 0 {
         (width, height)
     } else {
@@ -940,6 +948,45 @@ fn compose_screen_snapshot(
     let saved_composed = std::mem::take(&mut st.text_composed);
     let saved_report = st.report.clone();
     let saved_skipped = st.skipped.clone();
+    // 快照必须携带**命令时刻已经加工**的层像素(官方 COPY 读层表面
+    // `+0x90`,RECTPAINT/MERGE 结果已经写入)。旧实现把 `texture_overrides`
+    // 整表 take 走,快照里的加工层退回基图:soft 实测 RECTPAINT 红色层在
+    // `COPY2 :/W0/` 后仍显示蓝色原图。这里只把快照层的加工结果临时放回
+    // `st`(同名层已换图的结果丢弃),合成后整体还原真实帧状态。
+    st.texture_overrides = {
+        let mut filtered = std::collections::BTreeMap::new();
+        for (id, texture) in &saved_overrides {
+            let Some(snap_layer) = snapshot.layers.iter().find(|layer| &layer.id == id) else {
+                continue;
+            };
+            let replaced = frame
+                .layers
+                .iter()
+                .find(|live| &live.id == id)
+                .is_some_and(|live| live.texture != snap_layer.texture);
+            if !replaced {
+                filtered.insert(id.clone(), texture.clone());
+            }
+        }
+        filtered
+    };
+    st.override_bases = {
+        let mut filtered = std::collections::BTreeMap::new();
+        for (id, base) in &saved_bases {
+            let Some(snap_layer) = snapshot.layers.iter().find(|layer| &layer.id == id) else {
+                continue;
+            };
+            let replaced = frame
+                .layers
+                .iter()
+                .find(|live| &live.id == id)
+                .is_some_and(|live| live.texture != snap_layer.texture);
+            if !replaced {
+                filtered.insert(id.clone(), base.clone());
+            }
+        }
+        filtered
+    };
 
     let result = (|| {
         for pass in &snap_frame.passes {
@@ -962,8 +1009,11 @@ fn compose_screen_snapshot(
             .iter()
             .find(|pass| matches!(pass.target, PassTarget::Screen))
             .ok_or_else(|| "gfx.copy.screen_snapshot.pass_missing".to_string())?;
-        let mut surface =
-            Surface::new(frame.viewport.width, frame.viewport.height, frame.clear.rgba);
+        let mut surface = Surface::new(
+            frame.viewport.width,
+            frame.viewport.height,
+            frame.clear.rgba,
+        );
         for op in &screen_pass.ops {
             draw_op(textures, snapshots, &snap_frame, op, &mut surface, st);
         }
@@ -1243,11 +1293,9 @@ fn apply_layer_text(
                 dims,
                 &draws,
                 layout,
-                || {
-                    match overrides.get(&layer.id) {
-                        Some(t) => Ok(t.clone()),
-                        None => layer_base(textures, snapshots, layer).map(Rc::new),
-                    }
+                || match overrides.get(&layer.id) {
+                    Some(t) => Ok(t.clone()),
+                    None => layer_base(textures, snapshots, layer).map(Rc::new),
                 },
             )
         }
@@ -1660,6 +1708,8 @@ struct RenderState<'a> {
     /// 的重复合成加深。
     text_composed: BTreeSet<LayerId>,
     skipped: BTreeMap<(&'static str, String, String), u32>,
+    /// 本帧执行失败的图像/复制目标原始字节(回传 gfx 以保留烘焙重试)。
+    failed_targets: BTreeSet<Vec<u8>>,
     report: RenderReport,
     /// 文本栅格化/合成(两条文本路径共用)。
     text: &'a mut TextComposer,
@@ -1680,6 +1730,7 @@ impl<'a> RenderState<'a> {
             text_override_ids: BTreeSet::new(),
             text_composed: BTreeSet::new(),
             skipped: BTreeMap::new(),
+            failed_targets: BTreeSet::new(),
             text,
             report: RenderReport {
                 frame: frame.frame,
@@ -1693,6 +1744,7 @@ impl<'a> RenderState<'a> {
                 ops_drawn: 0,
                 skipped_ops_total: 0,
                 skipped: Vec::new(),
+                failed_targets: Vec::new(),
                 missing_assets: Vec::new(),
                 skipped_text: frame.text.iter().filter(|t| t.flags.is_none()).count(),
                 text_draws: 0,
@@ -1710,6 +1762,9 @@ impl<'a> RenderState<'a> {
 
     fn skip_op(&mut self, op: &Op, reason: impl Into<String>) {
         self.report.skipped_ops_total += 1;
+        if let Some(target) = texture_target_bytes(op) {
+            self.failed_targets.insert(target.to_vec());
+        }
         let key = (op_kind(op), reason.into(), op_target(op));
         *self.skipped.entry(key).or_insert(0) += 1;
     }
@@ -1725,6 +1780,7 @@ impl<'a> RenderState<'a> {
                 count,
             })
             .collect();
+        self.report.failed_targets = self.failed_targets.into_iter().collect();
         self.report
     }
 }
@@ -1836,6 +1892,15 @@ fn op_target(op: &Op) -> String {
         Op::Mask(mask) => mask.layer.id.display(),
         Op::Copy(copy) => copy.dest.display(),
         Op::Image(image) => image.target.as_ref().unwrap_or(&image.source).display(),
+    }
+}
+
+/// 只有图像/复制会写层表面;失败时把目标原始字节回传 gfx,撤回烘焙。
+fn texture_target_bytes(op: &Op) -> Option<&[u8]> {
+    match op {
+        Op::Copy(copy) => Some(copy.dest.as_bytes()),
+        Op::Image(image) => Some(image.target.as_ref().unwrap_or(&image.source).as_bytes()),
+        _ => None,
     }
 }
 

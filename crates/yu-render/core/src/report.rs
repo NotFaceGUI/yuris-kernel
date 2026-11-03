@@ -138,6 +138,13 @@ pub struct RenderReport {
     pub ops_drawn: usize,
     pub skipped_ops_total: u32,
     pub skipped: Vec<SkippedOp>,
+    /// 本帧执行失败的图像/复制**目标层原始字节**(`LayerId::as_bytes`)。
+    ///
+    /// gfx 的 `baked_images` 只能在命令成功写进常驻层表面后提交;失败目标
+    /// 必须保留到下一帧重新发射,否则一次源缺失/纹理缺失会让该层加工链
+    /// 永久停止(官方 `CGACT` 处理体不会“失败后当作已执行”)。
+    /// 按字节去重、稳定排序;soft/wgpu 同口径。
+    pub failed_targets: Vec<Vec<u8>>,
     /// 本帧解析失败的资产(`asset.*`)。
     pub missing_assets: Vec<AssetIssue>,
     /// 本帧 `TextRun` 数量(全部未栅格化)。
