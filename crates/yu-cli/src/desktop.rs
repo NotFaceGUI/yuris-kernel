@@ -242,16 +242,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     // **不做 GPU→CPU 自动回退**:soft 与 wgpu 是两条独立实现,自动降级会让
     // 「GPU 模式变慢/画错」永远对不上号(用户看到的是 CPU 结果,却以为在
     // 看 GPU)。要 CPU 模式请显式 `--backend soft`。
-    let mut engine = Engine::new(project.clone(), options.clone()).map_err(|error| {
-        if backend == Backend::Wgpu {
-            format!(
-                "wgpu 后端启动失败:{error}
-                 本内核不会自动回退到 CPU 模式;确需 CPU 渲染请显式加 --backend soft。"
-            )
-        } else {
-            error.to_string()
-        }
-    })?;
+    //
+    // 注意:**不要**把 `Engine::new` 的错误统一包装成「wgpu 后端启动失败」——
+    // boot(表/数据入口)也在这条路径上,缺 `ysbin/*.ybn` 与 GPU 无关;
+    // wgpu 初始化失败自带「wgpu 初始化失败 + 可改用 --backend soft」文案。
+    let mut engine = Engine::new(project.clone(), options.clone())?;
     // 平台音频端口:cpal 回调即时钟(`AudioOut`;headless 从不注入)。
     if !no_sound {
         match yu_host_desktop::SoundSink::open() {
