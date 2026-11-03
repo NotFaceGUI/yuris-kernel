@@ -301,9 +301,19 @@ EMOTEINFO:静态 3 处,本窗口 0 次
 | `CLIPACT` | 保存 `SET` 字节镜像;发 `DomainCall` | 写入 OS 剪贴板(CF_TEXT) |
 | `CLIPINFO` | 读镜像,过滤 `<0x20`,写 `LET`;发 `DomainCall` | 可先 `Vm::set_clipboard()` 注入外部剪贴板 |
 | `TRAY` | 只发 `Domain::System` 事件 | 托盘图标/菜单 |
-| `YMV`/`YMVEND` | 只发 `Domain::Movie` 事件 | 媒体对象生命周期 |
-| `YMVINFO` | `Unimplemented` | 需宿主媒体元数据(帧数/尺寸/FPS) |
+| `MOVIE` | 全屏影片状态机(文件名/播放位/几何/音量),经 `MovieHost` 端口下发;**不创建图层** | 解码与呈现(系统媒体栈/FFmpeg 等);`Vm::movie_mode()` 为真时**只呈现影片**、遮住所有图层 |
+| `MOVIEEND` | 退出影片模式,清文件名/播放位、音量重置 256 | 释放播放器 |
+| `MOVIEINFO` | VM 本地查询(含 `CODEC` 头探测),写 `LET`;不经过宿主 | 无 |
+| `YMV` | `FILE` 存在时**读包解析 `YSMV` 头**(`yu_format::ymv`,只读头部与三张表),经 `GraphicsHost::note_movie(asset, MovieInfo)` 同步推给图形域;**随后**照发 `Domain::Movie` 事件(脚本原始参数不变) | 图形域按 `YMV[ID/IDNO/FILE/FRAME]` 把影片挂到目标图层(图层必须已由 `CG[ID]` 建好) |
+| `YMVEND` | 只发 `Domain::Movie` 事件 | 释放图层上的影片结构(图层保留、纹理归 `None`) |
+| `YMVINFO` | 走 `op_info` → `GraphicsHost::query("YMVINFO", …)` 写 `LET` | 回 `NUM/SX/SY/FPS`;层或影片缺失一律 **0**(官方 `0x459b98` 的 `0x459d63`/`0x459de2`) |
 | `REGINFO` | `Unimplemented` | 需宿主注册表读取 |
+
+`YMV` 族不是全屏视频:官方把它当**普通图层**用(`es_Sprite.yst` 的
+`L.FTYPE==6`:建层 → `YMV[FILE]` → `YMVINFO` 取尺寸/帧率 → `CGACT[SIZE]`
+→ `CGACT[FRAME]` 逐帧换图),SDK 说明写明「映像のみ・音声なし・最高
+30fps」。因此内核**不实现播放时钟**:帧推进由脚本按 `YMVINFO[FPS]` 自己
+算(`es.L.YMV.MAIN` 用 `_OS_TIME`)。
 
 剪贴板过滤规则来自 REA `0x43e4d2..0x43e54d`:逐字符按 CP932 前导字节
 表定长拷贝,并丢弃所有 `< 0x20` 的字节。

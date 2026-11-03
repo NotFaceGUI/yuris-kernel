@@ -85,26 +85,26 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `EMOTE` | emote | 13 | — | `0x4405a4` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `TASK` | vm | 10 | `control/task.html` | `0x4506f4` | ✅ 实现 | 保持 |
 | `FONTINFO` | graphics | 8 | `font/fontinfo.html` | `0x444cfc` | 🔁 部分(3 次未实现) | 主路径实现;未实现路径见 §2 |
-| `MOVIE` | movie | 6 | `movie/movie.html` | `0x44b134` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
+| `MOVIE` | movie | 6 | `movie/movie.html` | `0x44b134` | ✅ fixed(no-manual) | 内核持状态 + 影片模式遮罩;解码经 `MovieHost` 端口,默认后端内嵌 pl_mpeg 移植(MPEG-1);见 DIV-GFX-074 |
 | `SYSTEMINFO` | system | 5 | — | `0x4505e4` | ✅ 实现 | 保持 |
 | `SAVEEND` | save | 5 | `file/saveend.html` | `0x44e1a0` | ✅ 实现(B1) | 装存档宿主时清预约(官方 flush 不清表,语料 es_GSD 刷盘后显式 SAVEEND 同型);未装宿主仍只发 `DomainCall` |
 | `DEBUGLIST` | system | 5 | — | `0x4634d8` | ✅ no-op | 官方 `xor eax,eax; ret`(DIV-RT-043) |
 | `IFBREAK` | vm | 5 | `control/ifbreak.html` | `0x446408` | ✅ 实现 | 本 600 帧未触发;静态语料有 5 处 |
 | `MOUSE` | system | 4 | `system/mouse.html` | `0x44aaa0` | ✅ 实现 | 内核输入状态(MODE/TIME/MOVE/CLICK/WHEEL/X/Y/CURSOR/HX/HY/ID);光标显示/形状归宿主 |
 | `MENU` | menu | 4 | `menu/menu.html` | `0x449df8` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `MOVIEINFO` | movie | 4 | `movie/movieinfo.html` | `0x44ba2c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `YMVINFO` | vm | 4 | — | `0x459b98` | ⛔ 宿主能力 | YMV 元数据查询(需宿主媒体层;DIV-RT-045) |
+| `MOVIEINFO` | movie | 4 | `movie/movieinfo.html` | `0x44ba2c` | ✅ fixed(no-manual) | `PLAY/X/Y/SX/SY/VOLUME/CODEC` 顺序 if + 槽号最小者生效;缺字段不写 LET;见 DIV-GFX-074 |
+| `YMVINFO` | vm | 4 | — | `0x459b98` | ✅ fixed(no-manual) | 影片元数据查询:`NUM/SX/SY/FPS` 走 `GraphicsHost::query` 写 `LET`;层/影片缺失写 **0**(官方 `0x459d63`/`0x459de2`);gfx 侧 `query_ymvinfo`(DIV-GFX-073) |
 | `EMOTEINFO` | emote | 3 | — | `0x441014` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `YMV` | vm | 3 | — | `0x458ee0` | ➖ 域事件 | 媒体对象生命周期;只发 `Domain::Movie`(DIV-RT-045) |
+| `YMV` | vm | 3 | — | `0x458ee0` | ✅ fixed(no-manual) | 影片**图层**挂接/换帧:VM 读包解析 `YSMV` 头(`yu_format::ymv`)→ `note_movie` 推给图形域 → 照发 `Domain::Movie` 事件;图层侧挂片/帧号钳位/纹理引用归 `yu-gfx`(DIV-GFX-073) |
 | `SYSTEM` | system | 2 | — | `0x45023c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `FPS` | system | 2 | `system/fps.html` | `0x4457a8` | ✅ 实现 | 保持 |
 | `INPUT` | system | 2 | `system/input.html` | `0x446564` | ✅ 实现 | KEY/MOUSE/PAD 源开关;关闭时整源计数器冻结(`FUN_0041a4b8`) |
 | `SOUNDEND` | sound | 2 | `sound/soundend.html` | `0x44f308` | ✅ 宿主 | `yu-sound` 删层(§8) |
 | `TEXT` | vm | 2 | `text/text.html` | `0x453448` | ✅ 实现 | COV-M-02 M-2 重写:OUTPUTMODE/WAIT/CLICK/RETURN/PAGE/CLICKRETURN/CLICKPAGE/CLEAR/AUTO*;CLICK 自动模式让出(REA 0x453448) |
-| `MOVIEEND` | movie | 2 | `movie/movieend.html` | `0x44b9d8` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
+| `MOVIEEND` | movie | 2 | `movie/movieend.html` | `0x44b9d8` | ✅ fixed | 退出影片模式:清文件名/播放位、音量重置 256,几何保留;见 DIV-GFX-074 |
 | `TASKEND` | vm | 2 | `control/taskend.html` | `0x4521dc` | ✅ 实现 | 本 600 帧未触发;静态语料有 2 处 |
 | `TRAY` | system | 2 | `other/tray.html` | `0x453a4c` | ➖ 域事件 | 托盘图标属宿主;只发 `Domain::System` 事件(DIV-RT-045) |
-| `YMVEND` | vm | 2 | — | `0x459a64` | ➖ 域事件 | 同 YMV(DIV-RT-045) |
+| `YMVEND` | vm | 2 | — | `0x459a64` | ✅ fixed(no-manual) | 释放影片结构(图层保留、纹理归 `None`);`Domain::Movie` 事件由 gfx 消费(DIV-GFX-073) |
 | `LABELINFO` | vm | 1 | `other/labelinfo.html` | `0x44674c` | ✅ 实现 | 保持 |
 | `ERROR` | system | 1 | — | `0x46358c` | ✅ 实现 | 写逐命令启用表 `[0x689b00+opcode]`(默认全 1);消费者未定位(DIV-RT-046) |
 | `CLIPACT` | graphics | 1 | `clip/clipact.html` | `0x43e2d0` | ✅ 实现 | 内核镜像 + `DomainCall`;TEXT/SET 都存在才生效(DIV-RT-045) |
@@ -372,7 +372,8 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 ### 9.3 新增实现一览
 
 `DIALOG`(VM 状态机)、`CLIPACT`/`CLIPINFO`(剪贴板镜像)、`ERROR`
-(逐命令启用表)、`TRAY`/`YMV`/`YMVEND`(宿主域事件)、`CSV`/`PLUG`/
+(逐命令启用表)、`TRAY`(宿主域事件)、`YMV`/`YMVINFO`/`YMVEND`(影片
+图层,B14;DIV-GFX-073)、`CSV`/`PLUG`/
 `ERRORINFO`(官方 no-op)、`LABEL`/`PREP`/`RETURNBREAK`/`DEBUGLIST`/
 `S_*`(官方 no-op)、`F_*`/`G_*`/`S_VAR`/`MACRO`/`_IF*`/`);`/
 `SYSTEMMODE`/`COMPILEMODE`/`RELEASEMODE`/`PROJECTFOLDER`(默认槽错误)、

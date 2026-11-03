@@ -81,6 +81,12 @@ pub mod rt {
     pub const INTERNAL: &str = "rt.internal";
     /// 未取证的语义细节(类型提升/溢出/格式等),已按确定性规则实现。
     pub const UNDETERMINED: &str = "rt.undetermined";
+    /// `YMV[FILE]` 影片资产不可用(缺失 / 非 `YSMV` / 容器校验失败)。
+    pub const MOVIE_ASSET: &str = "rt.movie.asset";
+    /// `MOVIE[FILE]` 影片不存在或不可读(官方 `fopen` 失败)。
+    pub const MOVIE_FILE: &str = "rt.movie.file";
+    /// `MOVIE` 播放端口失败(平台媒体后端缺失/拒绝)。
+    pub const MOVIE_PLAYBACK: &str = "rt.movie.playback";
 }
 
 /// 全部已登记错误码(顺序稳定)。唯一性由单元测试守卫。
@@ -116,6 +122,9 @@ pub const ALL_CODES: &[&str] = &[
     rt::SCRIPT_ERROR,
     rt::INTERNAL,
     rt::UNDETERMINED,
+    rt::MOVIE_ASSET,
+    rt::MOVIE_FILE,
+    rt::MOVIE_PLAYBACK,
 ];
 
 /// 码是否已登记。

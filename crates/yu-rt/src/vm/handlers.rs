@@ -117,6 +117,16 @@ pub enum HandlerKind {
     Cginfo,
     Fontinfo,
     Windowinfo,
+    /// `MOVIE`:全屏影片(状态机 + 宿主播放端口;REA `0x44b134`)。
+    Movie,
+    /// `MOVIEEND`:退出影片模式(REA `0x44b9d8`)。
+    Movieend,
+    /// `MOVIEINFO`:影片状态/编解码查询,`LET` 写回(REA `0x44ba2c`)。
+    Movieinfo,
+    /// `YMVINFO`:`YMV` 影片元数据查询(`LET` 同步写回;REA `0x459b98`)。
+    Ymvinfo,
+    /// `YMV`:影片挂接/换帧(解析容器头推给图形域后照发域事件;REA `0x458ee0`)。
+    Ymv,
     Text,
     TextOut,
     Word,
@@ -267,11 +277,22 @@ pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> 
                 // REA:只调参数求值器后返回 0(`0x43e640`/`0x44bd10`/`0x46356c`)。
                 "CSV" | "PLUG" | "ERRORINFO" => HandlerKind::NoopEval,
                 "ERROR" => HandlerKind::ErrorTable,
-                // 需要宿主:Windows 注册表 / YMV 媒体元数据。
+                // 需要宿主:Windows 注册表。
                 "REGINFO" => HandlerKind::HostRequired("Windows 注册表读取"),
-                "YMVINFO" => HandlerKind::HostRequired("YMV 媒体元数据查询"),
-                // YMV/YMVEND 只控制媒体对象生命周期,无脚本可见返回。
-                "YMV" | "YMVEND" => HandlerKind::Domain(Domain::Movie),
+                // `YMVINFO` 走与 `CGINFO` 同一条 LET 查询路径(REA `0x459b98`:
+                // 读图层上挂好的影片结构,缺层/缺影片时写 0)。
+                "YMVINFO" => HandlerKind::Ymvinfo,
+                // `YMV`(REA `0x458ee0`)在命令处理体内解析容器并把影片挂到
+                // 图层上;内核由 VM 解析容器头后推给图形域(事件契约不变)。
+                // `YMVEND`(`0x459a64`)只有释放语义,维持域事件。
+                "YMV" => HandlerKind::Ymv,
+                "YMVEND" => HandlerKind::Domain(Domain::Movie),
+                // `MOVIE` 族(全屏影片,手册 `movie/movie.html`):内核持状态,
+                // 解码/呈现经 `MovieHost` 端口交给宿主(官方也是交给系统
+                // 媒体栈:MCI + COM,见 `MovieHost` 文档)。
+                "MOVIE" => HandlerKind::Movie,
+                "MOVIEEND" => HandlerKind::Movieend,
+                "MOVIEINFO" => HandlerKind::Movieinfo,
                 other => {
                     let domain = domain_of(other);
                     if domain != Domain::Other {
@@ -422,6 +443,11 @@ impl Vm {
             HandlerKind::Cginfo => self.op_info(st, cmd, "CGINFO"),
             HandlerKind::Fontinfo => self.op_info(st, cmd, "FONTINFO"),
             HandlerKind::Windowinfo => self.op_info(st, cmd, "WINDOWINFO"),
+            HandlerKind::Ymvinfo => self.op_info(st, cmd, "YMVINFO"),
+            HandlerKind::Ymv => self.op_ymv(st, cmd),
+            HandlerKind::Movie => self.op_movie(st, cmd),
+            HandlerKind::Movieend => self.op_movieend(st, cmd),
+            HandlerKind::Movieinfo => self.op_movieinfo(st, cmd),
             HandlerKind::Text => self.op_text(st, cmd),
             HandlerKind::TextOut => self.op_text_out(st, cmd),
             HandlerKind::Word => self.op_word(st, cmd),
@@ -3117,7 +3143,7 @@ impl Vm {
             let name = names
                 .get(usize::from(w.rec.kind))
                 .map(String::as_str)
-                .unwrap_or("");
+                .unwrap_or(""); // silent-ok: 槽号越界 = 无名(按名判断自然落空)
             match name {
                 "LET" => {
                     let lv = self.eval_lvalue_window(st, w)?;
@@ -3800,6 +3826,366 @@ impl Vm {
         }
     }
 
+    // ------------------------------------------------------------ MOVIE(全屏)
+
+    /// 取本命令声明里的参数名(按槽号)。
+    fn command_params(&self, cmd: &Cmd) -> Vec<String> {
+        self.tables()
+            .boot
+            .yscm
+            .command(cmd.opcode)
+            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default() // silent-ok: 表里没有该命令 = 无参数名(按名解析自然失败)
+    }
+
+    /// 取已求值参数里的整数(`name` 按工程 ysc 表匹配,不写死槽号)。
+    fn movie_int_arg(&self, params: &[String], args: &[ArgValue], name: &str) -> Option<i64> {
+        let slot = params.iter().position(|p| p == name)?;
+        args.iter()
+            .find(|a| usize::from(a.slot) == slot)
+            .and_then(|a| match &a.value {
+                Value::Int(v) => Some(*v),
+                Value::Float(v) => Some(v.round() as i64),
+                _ => None,
+            })
+    }
+
+    /// 取已求值参数里的浮点(`X/Y/SX/SY` 是 F 槽,整数原值也接受)。
+    fn movie_float_arg(&self, params: &[String], args: &[ArgValue], name: &str) -> Option<f64> {
+        let slot = params.iter().position(|p| p == name)?;
+        args.iter()
+            .find(|a| usize::from(a.slot) == slot)
+            .and_then(|a| match &a.value {
+                Value::Int(v) => Some(*v as f64),
+                Value::Float(v) => Some(*v),
+                _ => None,
+            })
+    }
+
+    /// 探测影片容器的编解码(官方 `MOVIEINFO[CODEC]` 的同一判定)。
+    fn probe_movie_codec(&mut self, file: &[u8]) -> yu_format::movie::MovieCodec {
+        match self.open_asset(file) {
+            Some(bytes) => {
+                let head = &bytes[..bytes.len().min(yu_format::movie::PROBE_BYTES)];
+                yu_format::movie::probe_codec(head)
+            }
+            None => yu_format::movie::MovieCodec::Missing,
+        }
+    }
+
+    /// `MOVIEINFO[PLAY, X, Y, SX, SY, VOLUME, CODEC, LET]`(REA `0x44ba2c`)。
+    ///
+    /// 官方七字段是**顺序 `if` + 各自写 `LET` + `ret`**(`0x44ba60..0x44bbde`):
+    /// 多字段同时置位时**槽号最小的字段生效**;一个字段都没给时直接返回,
+    /// 不写 `LET`。`CODEC` 是文件头探测(`0x44bac9..0x44bcfc`,见
+    /// [`yu_format::movie`]),其余字段读内核/宿主的影片状态。
+    fn op_movieinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let params = self.command_params(cmd);
+        let mut targets: Vec<crate::expr::LValue> = Vec::new();
+        let mut event_args: Vec<ArgValue> = Vec::new();
+        let mut flags: Vec<&str> = Vec::new();
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let pname = params
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or("");
+            if pname == "LET" {
+                let lv = self.eval_lvalue_window(st, w)?;
+                let var = self.canonical_var(lv.var);
+                if let Ok(v) = self.read_var(st, var, &lv.indices) {
+                    event_args.push(ArgValue::with_ref(w.rec.kind, v, var));
+                }
+                targets.push(lv);
+                continue;
+            }
+            if let Ok(v) = self.eval_window(st, w) {
+                if matches!(&v, Value::Int(n) if *n != 0) || matches!(&v, Value::Float(f) if *f != 0.0)
+                {
+                    flags.push(pname);
+                }
+                event_args.push(ArgValue::new(w.rec.kind, v));
+            }
+        }
+        self.emit_domain(Domain::Movie, cmd.name.clone(), event_args);
+        if targets.is_empty() {
+            self.report(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                "MOVIEINFO 缺 LET 目标".to_string(),
+            ));
+            return Ok(StepOutcome::Continue);
+        }
+        // 官方判定顺序 = 槽号顺序;取第一个置位字段。
+        let flag = ["PLAY", "X", "Y", "SX", "SY", "VOLUME", "CODEC"]
+            .into_iter()
+            .find(|name| flags.contains(name));
+        let Some(flag) = flag else {
+            // 一个查询字段都没给:官方什么都不写(`0x44bbe3` 直接返回)。
+            return Ok(StepOutcome::Continue);
+        };
+        let value = match flag {
+            "PLAY" => Value::Int(i64::from(self.movie_playing())),
+            "X" => Value::Int(self.movie.geometry.x.round() as i64),
+            "Y" => Value::Int(self.movie.geometry.y.round() as i64),
+            "SX" => Value::Int(self.movie.geometry.sx.round() as i64),
+            "SY" => Value::Int(self.movie.geometry.sy.round() as i64),
+            "VOLUME" => Value::Int(self.movie.volume),
+            _ => {
+                // `CODEC`:文件不存在 = 0,MPEG-1 = 1,MPEG-2 = 2,其它 = 255。
+                let code = match self.movie.file.clone() {
+                    Some(file) => self.probe_movie_codec(&file).official_code(),
+                    None => 0,
+                };
+                Value::Int(code)
+            }
+        };
+        for t in &targets {
+            self.write_target(st, t, &value)?;
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    /// 当前是否在播放:优先问播放端口(官方 `[0x801760]` 由播放器结束事件
+    /// 清 0),没有端口时退回内核记录的播放意图。
+    fn movie_playing(&mut self) -> bool {
+        match self.movie_host.as_mut() {
+            Some(host) => host.is_playing(),
+            None => self.movie.playing,
+        }
+    }
+
+    /// `MOVIE[FILE, PLAY, X, Y, SX, SY, VOLUME]`(REA `0x44b134`)。
+    ///
+    /// 官方处理顺序(逐段锚点):
+    /// 1. `X/Y/SX/SY` 先落全局(`0x44b2b0..0x44b302`),**缺省也会覆盖**:
+    ///    `X/Y` 缺省 0,`SX/SY` 缺省用影片原始宽高(播放时再按窗口等比换算);
+    /// 2. `FILE`:`fopen` 成功才记文件名并清播放位(`0x44b302..0x44b322`),
+    ///    失败则原状返回;
+    /// 3. `VOLUME` 落 `0x5b48a0` 并下发播放器(`0x44b329..`);
+    /// 4. `PLAY`:1 = 开始播放,0 = 停止(并清播放位)。
+    ///
+    /// 解码与呈现全在 [`crate::event::MovieHost`] 之后(官方交给系统媒体栈)。
+    fn op_movie(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let args = self.eval_arg_windows(st, cmd);
+        let params = self.command_params(cmd);
+        // 1. 几何:每条命令都按本次参数重写(官方缺省值见文档)。
+        // 官方缺省值(0x44b2b0..0x44b2fc):X/Y 缺省 0;SX/SY 缺省取影片
+        // 原尺寸 ⇒ 等价于铺满窗口,内核不解码,用 0 表示「未指定」交给宿主
+        // 按同一规则换算。这里没有错误吞掉,只是官方默认值。
+        let geometry = crate::event::MovieGeometry {
+            x: self.movie_float_arg(&params, &args, "X").unwrap_or(0.0), // silent-ok: 缺省 X=0
+            y: self.movie_float_arg(&params, &args, "Y").unwrap_or(0.0), // silent-ok: 缺省 Y=0
+            sx: self.movie_float_arg(&params, &args, "SX").unwrap_or(0.0), // silent-ok: 未指定 = 铺满
+            sy: self.movie_float_arg(&params, &args, "SY").unwrap_or(0.0), // silent-ok: 未指定 = 铺满
+        };
+        self.movie.geometry = geometry;
+        if let Some(host) = self.movie_host.as_mut() {
+            host.set_geometry(geometry);
+        }
+
+        // 2. FILE:先验证可读(官方 `fopen`),成功才进入影片模式。
+        if let Some(slot) = params.iter().position(|p| p == "FILE") {
+            let file = args
+                .iter()
+                .find(|a| usize::from(a.slot) == slot)
+                .and_then(|a| match &a.value {
+                    Value::Str(bytes) if !bytes.is_empty() => Some(bytes.clone()),
+                    _ => None,
+                });
+            if let Some(file) = file {
+                match self.probe_movie_codec(&file) {
+                    yu_format::movie::MovieCodec::Missing => {
+                        self.report(diag::recoverable(
+                            code::rt::MOVIE_FILE,
+                            Boundary::Script,
+                            format!(
+                                "MOVIE 影片不存在或不可读:{}",
+                                String::from_utf8_lossy(&file)
+                            ),
+                        ));
+                    }
+                    _ => {
+                        self.movie.file = Some(file.clone());
+                        self.movie.playing = false;
+                        if self.movie_host.is_some() {
+                            // 只有装了播放后端才把整份影片读进内存(官方
+                            // `MOVIE` 也是此时打开文件);无后端时零额外 IO。
+                            let bytes = self.open_asset(&file);
+                            let result = match (self.movie_host.as_mut(), bytes) {
+                                (Some(host), Some(bytes)) => host.open(&file, &bytes),
+                                _ => Err(diag::recoverable(
+                                    code::rt::MOVIE_FILE,
+                                    Boundary::Script,
+                                    format!(
+                                        "MOVIE 影片读取失败:{}",
+                                        String::from_utf8_lossy(&file)
+                                    ),
+                                )),
+                            };
+                            if let Err(d) = result {
+                                let d = self.locate(d);
+                                self.report(d);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. VOLUME
+        if let Some(volume) = self.movie_int_arg(&params, &args, "VOLUME") {
+            self.movie.volume = volume;
+            if let Some(host) = self.movie_host.as_mut() {
+                host.set_volume(volume);
+            }
+        }
+
+        // 4. PLAY
+        if let Some(play) = self.movie_int_arg(&params, &args, "PLAY") {
+            let playing = play != 0;
+            self.movie.playing = playing;
+            if let Some(host) = self.movie_host.as_mut() {
+                if let Err(d) = host.set_playing(playing) {
+                    let d = self.locate(d);
+                    self.report(d);
+                }
+            }
+        }
+        self.emit_domain(Domain::Movie, cmd.name.clone(), args);
+        Ok(StepOutcome::Continue)
+    }
+
+    /// `MOVIEEND[]`(REA `0x44b9d8`):停止并退出影片模式。
+    ///
+    /// 官方清文件名(`0x7fab00`)、播放位(`0x801760`),并把音量重置为 256
+    /// (`0x44ba0f`);几何(X/Y/SX/SY)**不清**。
+    fn op_movieend(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let args = self.eval_arg_windows(st, cmd);
+        self.emit_domain(Domain::Movie, cmd.name.clone(), args);
+        if let Some(host) = self.movie_host.as_mut() {
+            host.close();
+        }
+        self.movie.file = None;
+        self.movie.playing = false;
+        self.movie.volume = 256;
+        Ok(StepOutcome::Continue)
+    }
+
+    /// `YMV[ID, IDNO, FILE, FRAME]`(REA 0.495 `0x458ee0`)。
+    ///
+    /// 官方处理体在命令内完成三件事:按 `ID[.IDNO]` 取层(`0x4141e4`/
+    /// `0x414559`)、`FILE` 存在时解析 `YSMV` 并把影片结构挂到 `[层+0xa0]`
+    /// (`0x459094`)、`FRAME` 存在时换帧(`0x45934c`)。分层后:容器解析留在
+    /// VM(它持数据源),结果经 [`crate::event::GraphicsHost::note_movie`]
+    /// 同步推给图形域;图层查找/帧钳位/纹理引用归 `yu-gfx`。域事件照发,
+    /// 事件契约(脚本原始参数)不变。
+    ///
+    /// 影片资产缺失或不是 `YSMV` 时只记可恢复诊断,不阻断脚本:官方在
+    /// `FILE` 装载失败时走错误弹窗路径(`0x45905e`),图层保持原状。
+    fn op_ymv(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let args = self.eval_arg_windows(st, cmd);
+        // `FILE` 槽按工程 ysc 参数名定位,不写死槽号。
+        let file_slot = self
+            .tables()
+            .boot
+            .yscm
+            .command(cmd.opcode)
+            .and_then(|c| c.params.iter().position(|p| p.name == "FILE"))
+            .map(|i| i as u8);
+        if let Some(slot) = file_slot {
+            let key = args.iter().find(|a| a.slot == slot).and_then(|a| match &a.value {
+                Value::Str(bytes) if !bytes.is_empty() => Some(bytes.clone()),
+                _ => None,
+            });
+            if let Some(key) = key {
+                match self.resolve_movie_meta(&key) {
+                    Some(info) => {
+                        if let Some(host) = self.graphics_host.as_mut() {
+                            host.note_movie(&key, info);
+                        }
+                    }
+                    None => {
+                        self.report(diag::recoverable(
+                            code::rt::MOVIE_ASSET,
+                            Boundary::Script,
+                            format!(
+                                "YMV 影片 `{}` 不可用(资产缺失或非 YSMV);图层保持原状",
+                                String::from_utf8_lossy(&key)
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        self.emit_domain(Domain::Movie, cmd.name.clone(), args);
+        Ok(StepOutcome::Continue)
+    }
+
+    /// 按给定路径读资产字节:工程包优先,散盘(`aux`)作备。
+    ///
+    /// `CGINFO[SX/SY]` 的图像头探测与 `YMV[FILE]` 的容器解析共用这一步;
+    /// 候选序(扩展名)由调用方决定,不在这里猜。
+    fn open_asset(&mut self, path: &[u8]) -> Option<Vec<u8>> {
+        let lookup = yu_vfs::LookupKey::new(path, yu_vfs::Codec::Cp932).ok()?;
+        match self.src.open(&lookup) {
+            Ok(bytes) => Some(bytes),
+            Err(_) => self.aux.as_ref().and_then(|aux| aux.open(&lookup).ok()),
+        }
+    }
+
+    /// 解析 `YMV[FILE]` 的影片元数据(只读容器头与三张表,不复制平面)。
+    ///
+    /// 候选序:`原样` → `原字节 + ".ymv"`(脚本两种写法都在语料里出现:
+    /// `es_Sprite` 显式带 `.ymv`,`演出機能.txt` 的 `\SP.ANMV(sample2)` 由框架补)。
+    /// 结果(含失败)缓存,避免重复读 6 MB 包内文件。
+    fn resolve_movie_meta(&mut self, key: &[u8]) -> Option<crate::event::MovieInfo> {
+        if let Some(hit) = self.movie_meta_cache.get(key) {
+            return *hit;
+        }
+        let mut candidates: Vec<Vec<u8>> = vec![key.to_vec()];
+        let mut with_ext = key.to_vec();
+        with_ext.extend_from_slice(b".ymv");
+        candidates.push(with_ext);
+        let mut found = None;
+        'probe: for path in candidates {
+            let Some(bytes) = self.open_asset(&path) else {
+                continue;
+            };
+            match yu_format::ymv::Ymv::parse(&bytes, &path) {
+                Ok(ymv) => {
+                    let info = ymv.info();
+                    found = Some(crate::event::MovieInfo {
+                        frames: info.frames,
+                        width: info.width,
+                        height: info.height,
+                        fps: info.fps,
+                        has_alpha: info.has_alpha,
+                    });
+                    break 'probe;
+                }
+                Err(err) => {
+                    // 找到文件但不是合法 YSMV:把解析诊断带出来(不再试扩展名)。
+                    self.report(diag::recoverable(
+                        code::rt::MOVIE_ASSET,
+                        Boundary::Script,
+                        format!(
+                            "`{}`:{} {}",
+                            String::from_utf8_lossy(&path),
+                            err.code,
+                            err.detail
+                        ),
+                    ));
+                    break 'probe;
+                }
+            }
+        }
+        self.movie_meta_cache.insert(key.to_vec(), found);
+        found
+    }
+
     /// 解析 `CG[FILE]` 的像素尺寸:按工程 `yscfg` 扩展名序尝试 `.png/.bmp/
     /// .jpg/.gif`,只读图像头。结果(含失败)缓存,避免每帧重读。
     ///
@@ -3835,18 +4221,12 @@ impl Vm {
             candidates.push(path);
         }
         'probe: for path in candidates {
-            let Ok(lookup) = yu_vfs::LookupKey::new(&path, yu_vfs::Codec::Cp932) else {
+            let Some(bytes) = self.open_asset(&path) else {
                 continue;
             };
-            let bytes = match self.src.open(&lookup) {
-                Ok(b) => Some(b),
-                Err(_) => self.aux.as_ref().and_then(|aux| aux.open(&lookup).ok()),
-            };
-            if let Some(bytes) = bytes {
-                if let Some(size) = crate::image::pixel_size(&bytes) {
-                    found = Some(size);
-                    break 'probe;
-                }
+            if let Some(size) = crate::image::pixel_size(&bytes) {
+                found = Some(size);
+                break 'probe;
             }
         }
         self.asset_size_cache.insert(key.to_vec(), found);

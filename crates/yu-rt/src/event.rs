@@ -324,6 +324,25 @@ impl VmEvent {
     }
 }
 
+/// `YMV` 影片元数据(官方图层影片结构 `+0x00..+0x10`)。
+///
+/// 由 VM 解析 `YSMV` 容器头(`yu-format::ymv`)后经
+/// [`GraphicsHost::note_movie`] 推给图形域:gfx 不读文件,`YMVINFO` 直接
+/// 回读这四个字段(官方 `0x459b98` 读的就是挂好的结构)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MovieInfo {
+    /// `+0x08` 帧数。
+    pub frames: u32,
+    /// `+0x10` 宽。
+    pub width: u32,
+    /// `+0x14` 高。
+    pub height: u32,
+    /// `+0x18` fps(官方上限 30,由制作工具约束;引擎原样返回)。
+    pub fps: u32,
+    /// `+0x0C == 1`:第二平面存在且为 alpha(官方置层 `+0x86`)。
+    pub has_alpha: bool,
+}
+
 /// 图形域同步宿主。
 ///
 /// 为什么需要它:`CGINFO/FONTINFO/WINDOWINFO` 的 `LET` 必须在**脚本执行期**
@@ -353,6 +372,13 @@ pub trait GraphicsHost {
     /// 供后续同键查询与 COPY 快照继承(DIV-GFX-024 / EVID-J3-03)。
     fn note_asset_size(&mut self, _key: &[u8], _width: u32, _height: u32) {}
 
+    /// VM 解析出 `YSMV` 影片元数据后回填宿主(默认忽略)。
+    ///
+    /// 与 [`Self::note_asset_size`] 同型,但必须在 `YMV` 域事件**之前**调用:
+    /// 官方 `YMV[FILE]` 在命令处理体内就挂好了影片结构,同一 tick 紧随的
+    /// `YMVINFO` 能立即读到 `NUM/SX/SY/FPS`(`0x459b98`)。
+    fn note_movie(&mut self, _key: &[u8], _info: MovieInfo) {}
+
     /// 每个逻辑帧开始时的光标逻辑坐标(供 `CGINFO[ONMOUSE*]` 命中测试)。
     ///
     /// 引擎的 `ONMOUSE*` 直接读窗口的鼠标位置(`app+0x5b8/0x5bc`),不是一个
@@ -375,6 +401,91 @@ pub trait GraphicsHost {
     fn restore_layer(&mut self, _id: &[u8], _image: &CapturedImage) -> Result<bool, Diag> {
         Ok(false)
     }
+}
+
+/// 影片画面在**窗口坐标系**下的位置与尺寸(官方 `0x801764..0x801770`)。
+///
+/// `sx/sy == 0` = 该 MOVIE 命令没给 SX/SY:官方此时用**影片原始宽高**再按窗口
+/// 等比换算(`0x44b418`:`目标宽 = SX * 窗口宽 / 影片宽`),等价于「铺满窗口」。
+/// 内核不解码、不知道影片尺寸,因此把「未指定」原样交给宿主换算。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MovieGeometry {
+    /// `+X`(官方缺省 0)。
+    pub x: f64,
+    /// `+Y`(官方缺省 0)。
+    pub y: f64,
+    /// `SX`;`0` = 未指定(宿主按影片原尺寸铺满窗口)。
+    pub sx: f64,
+    /// `SY`;`0` = 未指定。
+    pub sy: f64,
+}
+
+/// 影片的一帧画面(RGBA8,行优先,`width * height * 4` 字节)。
+#[derive(Clone, Copy, Debug)]
+pub struct MovieFrame<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: &'a [u8],
+}
+
+/// 影片播放端口:**宿主实现,内核只做语义**。
+///
+/// 取证结论(0.495):官方 `MOVIE` 把解码与呈现整体交给**系统媒体栈** ——
+/// `winmm!mciSendString`(别名 `ysmcimovie`,类型 `MPEGVideo`,`setaudio …
+/// volume to`)与 COM(`IBasicAudio::put_Volume`,`0x44b664` 的 `[ecx+0x1c]`)。
+/// 因此本 trait **不绑定任何平台 API**:
+///
+/// - 桌面可用系统栈(MCI / Media Foundation)或统一解码库(FFmpeg 等);
+/// - Android 可用 `MediaPlayer`/`MediaCodec`(JNI);
+/// - 无可用后端时返回 [`Diag`] 说明能力缺失,内核记诊断而不是假装播放。
+///
+/// 内核职责:状态机(`MOVIE`/`MOVIEEND`/`MOVIEINFO`)、`CODEC` 探测、
+/// 影片模式标志;呈现与解码全在本端口之后。
+pub trait MovieHost {
+    /// 装载影片(`MOVIE[FILE]`)。`Ok(())` 表示可以进入影片模式。
+    ///
+    /// 官方先 `fopen` 验证文件存在(`0x44b308`),成功才记文件名;失败时
+    /// 文件名保持原值、不进入影片模式。
+    ///
+    /// `bytes` 是 VM 从工程数据源(封包/散盘)读出的完整影片;**后端不碰
+    /// VFS**(跨平台后端只需解码,Android 可写临时文件或直接喂 fd)。
+    fn open(&mut self, file: &[u8], bytes: &[u8]) -> Result<(), Diag>;
+
+    /// `MOVIE[PLAY=1/0]`。
+    fn set_playing(&mut self, playing: bool) -> Result<(), Diag>;
+
+    /// `MOVIE[VOLUME=n]`(官方 0..256,原值传入不裁剪)。
+    fn set_volume(&mut self, volume: i64);
+
+    /// 画面几何;每次 `MOVIE` 命令都下发一次(官方缺省值同样覆盖)。
+    fn set_geometry(&mut self, geometry: MovieGeometry);
+
+    /// 当前是否在播放。
+    ///
+    /// 官方 `MOVIEINFO[PLAY]` 读 `[0x801760]`,该标志在播放器结束事件里被
+    /// 清 0(`es_MoviePlay` 靠它判断「播完了」)⇒ **真实状态以后端为准**。
+    /// 默认实现返回内核记录的播放意图(后端不回报时仍自洽)。
+    fn is_playing(&mut self) -> bool {
+        true
+    }
+
+    /// 影片原始尺寸(打开成功后才可知;宿主按官方 `0x44b418` 的规则
+    /// 「目标宽 = SX * 窗口宽 / 影片宽」换算显示尺寸)。默认未知。
+    fn media_size(&mut self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// 取本 tick 应显示的帧;`now_ms` 是宿主单调时钟(同一条时间轴即可)。
+    ///
+    /// 返回 `None` = 还没有画面(未播放/未打开)。暂停时应返回最后一帧
+    /// (官方 `MOVIE[PLAY=0]` 停止后画面仍在,直到 `MOVIEEND`)。
+    /// 默认不产帧(后端只做控制、不做呈现时使用)。
+    fn frame(&mut self, _now_ms: u64) -> Option<MovieFrame<'_>> {
+        None
+    }
+
+    /// 退出影片模式并释放资源(`MOVIEEND`)。
+    fn close(&mut self);
 }
 
 /// 声音域同步宿主（SOUND / SOUNDEND 消费 + SOUNDINFO 查询）。

@@ -63,7 +63,8 @@
 | DIV-RT-042 | `DomainCall` 的变量引用身份丢失 | fixed(B1) | `ArgValue.reference`(裁 1-A)+ `SaveHost` 同步契约(裁 2-A);SAVE 预约即值快照/LOAD 按 var_id 写回,`save-load-loop` 用例闭环 |
 | DIV-RT-043 | 官方默认槽 `0x459e90` 的语义(脚本执行错误) | fixed | `F_*`/`G_*`/`MACRO`/`S_VAR`/`_IF*`/`);`/`SYSTEMMODE` 等不再静默 Unimplemented |
 | DIV-RT-044 | `DIALOG` 的 VM 侧契约与宿主回答 | fixed | 任务挂起/回答、LET/LETSTR 写回、扩展参数挂账 |
-| DIV-RT-045 | `TRAY`/`CLIPACT`/`CLIPINFO`/`REGINFO`/`YMV*` 的域边界 | fixed/partial | 剪贴板镜像实现;托盘/媒体归宿主;注册表挂账 |
+| DIV-RT-046B | `MOVIE`/`MOVIEEND`/`MOVIEINFO` 全屏影片 | 语义 fixed / 后端待选型 | 手册三页 + REA;解码经 `MovieHost` 端口(官方 MCI+COM);见 `docs/divergences/DIV-GFX-074-movie-family.md` |
+| DIV-RT-045 | `TRAY`/`CLIPACT`/`CLIPINFO`/`REGINFO`/`YMV*` 的域边界 | fixed | 剪贴板镜像实现;托盘归宿主;`YMV*` 已由 B14 落地(影片图层,见 DIV-GFX-073);注册表挂账(DIV-RT-045 §REGINFO) |
 | DIV-RT-046 | `ERROR` 的逐命令启用表 | open | 表已按 REA 写入,消费者未定位 |
 | DIV-RT-047 | `_WINDOW_INIT_POS` / `_WINDOW_EXEC_CAPTION` 的宿主注入面 | fixed | 两个宿主 setter/注入值;手册仍无页 |
 | DIV-RT-048 | `_TEXT_NUM` 的数据源 | fixed | `yst.ybn` 头部 text_total == `yst_list` 求和(ERIS 396) |
@@ -1162,8 +1163,8 @@ packed = ([1290322, 329227, 26, 249, 8765, 8765], 0, "cd1790…4bd2e")  ... ok
 | `CLIPACT` | `0x43e2d0` | 内核镜像 + 事件;需 TEXT+SET 都存在 | 手册;REA(CF_TEXT 写入) |
 | `CLIPINFO` | `0x43e410` | 读镜像写 LET;仅 TEXT 存在时动作;过滤 `<0x20` | 手册;REA `0x43e4d2..` |
 | `REGINFO` | `0x44bd30` | `Unimplemented`(需宿主注册表) | 手册 `reg/reginfo.html` |
-| `YMV`/`YMVEND` | `0x458ee0`/`0x459a64` | `Domain::Movie` 事件 | 分发表;无手册页 |
-| `YMVINFO` | `0x459b98` | `Unimplemented`(需宿主媒体元数据) | 分发表;写 LET |
+| `YMV`/`YMVEND` | `0x458ee0`/`0x459a64` | **B14 已落地**(影片图层;VM 解析容器头推元数据 + 域事件,绘制归 gfx) | 分发表;`0x459094` 解析体;官方样例;见 DIV-GFX-073 |
+| `YMVINFO` | `0x459b98` | **B14 已落地**:`query_ymvinfo` 回 `NUM/SX/SY/FPS`,缺层/缺片写 0 | 分发表;`0x459d63`/`0x459de2` 的零写回 |
 
 - 剪贴板镜像 API:`Vm::clipboard()` / `Vm::set_clipboard(bytes)`;宿主可
   注入外部剪贴板内容(内核不访问 OS 剪贴板)。

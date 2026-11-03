@@ -243,6 +243,41 @@ impl std::fmt::Display for VmError {
     }
 }
 
+/// `MOVIE` 族状态(官方全局逐一对应)。
+///
+/// - `file` 非空 = **影片模式**(官方 `0x7fab00` 的文件名缓冲):此时其他层
+///   一律不显示;`MOVIE[PLAY=0]` 只是停止,仍然遮住图层,直到 `MOVIEEND`
+///   (手册 `movie/movie.html` 例 3 明示);
+/// - `playing` = 官方 `0x801760`(`MOVIEINFO[PLAY]` 的数据源;播放结束时由
+///   播放器事件清 0);
+/// - `geometry` = 官方 `0x801764/68/6c/70`,**每条 `MOVIE` 都按本次参数
+///   重写**(缺省 X/Y=0;缺省 SX/SY 官方取影片原始宽高再按窗口等比换算,
+///   等价于铺满 —— 内核不解码,故以 `0` 表示「未指定」交给宿主换算);
+/// - `volume` = 官方 `0x5b48a0`;`MOVIEEND` 把它重置为 256(`0x44ba0f`),
+///   因此缺省值取 256。
+#[derive(Clone, Debug, PartialEq)]
+pub struct MovieState {
+    /// 已装载的影片路径(非空 = 影片模式)。
+    pub file: Option<Vec<u8>>,
+    /// 播放中。
+    pub playing: bool,
+    /// 画面几何(窗口坐标系)。
+    pub geometry: crate::event::MovieGeometry,
+    /// 音量(官方 0..256,原值保存不裁剪)。
+    pub volume: i64,
+}
+
+impl Default for MovieState {
+    fn default() -> Self {
+        Self {
+            file: None,
+            playing: false,
+            geometry: crate::event::MovieGeometry::default(),
+            volume: 256,
+        }
+    }
+}
+
 /// `GOSUB` 一层(引擎命令对象 §3.12 的可执行投影)。
 #[derive(Clone, Debug, Default)]
 pub struct GosubFrame {
@@ -604,6 +639,15 @@ pub struct Vm {
     task_view: Vec<TaskView>,
     /// 资产像素尺寸缓存(键 = `CG[FILE]`;`None` = 探测失败也缓存)。
     asset_size_cache: BTreeMap<Vec<u8>, Option<(u32, u32)>>,
+    /// `YMV` 影片元数据缓存(键 = `YMV[FILE]` 原字节;`None` = 资产缺失/
+    /// 非 `YSMV`,同样缓存,避免每条命令重复读 6 MB 包内文件)。
+    ///
+    /// 解析只读容器头与三张表(`yu_format::ymv::Ymv::parse`),不复制平面。
+    movie_meta_cache: BTreeMap<Vec<u8>, Option<crate::event::MovieInfo>>,
+    /// `MOVIE` 族状态(官方全局 `0x7fab00`/`0x801760`/`0x801764..`/`0x5b48a0`)。
+    movie: MovieState,
+    /// `MOVIE` 播放端口(宿主实现;解码/呈现全在宿主侧,内核不含平台代码)。
+    movie_host: Option<Box<dyn crate::event::MovieHost>>,
 }
 
 /// 一个已解码的命令窗口(表达式解码缓存的值)。
@@ -801,6 +845,9 @@ impl Vm {
             cur_task_seq: u64::MAX,
             task_view: Vec::new(),
             asset_size_cache: BTreeMap::new(),
+            movie_meta_cache: BTreeMap::new(),
+            movie: MovieState::default(),
+            movie_host: None,
         };
         vm.apply_global_initial_values();
         let restore = vm.build_globals_restore();
@@ -1023,6 +1070,39 @@ impl Vm {
     /// 取走图形宿主(便于宿主自己持有 `Rc` 状态)。
     pub fn take_graphics_host(&mut self) -> Option<Box<dyn crate::event::GraphicsHost>> {
         self.graphics_host.take()
+    }
+
+    /// 安装影片播放端口(宿主实现;内核只做语义,见
+    /// [`crate::event::MovieHost`])。
+    ///
+    /// 未安装时 `MOVIE` 仍更新内核状态(脚本可见的 `MOVIEINFO` 全部可答),
+    /// 只是没有画面;`MOVIEINFO[PLAY]` 退回内核记录的播放意图。
+    pub fn set_movie_host(&mut self, host: Box<dyn crate::event::MovieHost>) {
+        self.movie_host = Some(host);
+    }
+
+    /// 取走影片播放端口。
+    pub fn take_movie_host(&mut self) -> Option<Box<dyn crate::event::MovieHost>> {
+        self.movie_host.take()
+    }
+
+    /// 借用影片播放端口(宿主每帧取帧用;端口仍由 VM 持有)。
+    pub fn movie_host_mut(&mut self) -> Option<&mut (dyn crate::event::MovieHost + 'static)> {
+        self.movie_host.as_deref_mut()
+    }
+
+    /// 是否处于**影片模式**(官方 `0x7fab00` 非空)。
+    ///
+    /// 影片模式下其他层一律不显示;`MOVIE[PLAY=0]` 只停止播放,仍遮住图层,
+    /// 直到 `MOVIEEND`(手册 `movie/movie.html` 例 3)。宿主据此决定是否
+    /// 只呈现影片画面。
+    pub fn movie_mode(&self) -> bool {
+        self.movie.file.is_some()
+    }
+
+    /// 影片族当前状态(宿主/诊断用;`MOVIEINFO` 的数据源)。
+    pub fn movie_state(&self) -> &MovieState {
+        &self.movie
     }
 
     /// 安装声音域同步宿主。安装后 `Domain::Sound` 事件同步进入宿主；
@@ -1712,7 +1792,8 @@ impl Vm {
         let mut sched = std::mem::take(&mut self.scheduler);
         let report = sched.tick_frame(self, now);
         self.scheduler = sched;
-        let step = 1000u32.checked_div(self.fps).unwrap_or(self.frame_ms);
+        // 帧时长:0 fps 时退回配置的 frame_ms(引擎除零守护)。
+        let step = 1000u32.checked_div(self.fps).unwrap_or(self.frame_ms); // silent-ok: 0 fps 用 frame_ms
         self.now_ms = self.now_ms.wrapping_add(step);
         report
     }
@@ -1783,7 +1864,13 @@ impl Vm {
                 | VmEvent::FrameEnd { .. }
                 | VmEvent::Text { .. }
                 | VmEvent::DomainCall {
-                    domain: crate::event::Domain::Graphics | crate::event::Domain::Window,
+                    // `Movie` 域(`YMV`/`YMVEND`)改的是**图层画面**
+                    // (纹理引用 + 影片状态),与 Graphics 同一条同步通道:
+                    // 官方 `YMV[FRAME]` 之后同 tick 的 `CGINFO`/`YMVINFO`
+                    // 必须读到新画面(REA `0x45934c` 命令内即写层表面)。
+                    domain: crate::event::Domain::Graphics
+                        | crate::event::Domain::Window
+                        | crate::event::Domain::Movie,
                     ..
                 }
         );
