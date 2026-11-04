@@ -267,6 +267,24 @@ pub struct TextDraw {
     pub set: i64,
     /// `CGACT[BNO]`(调试字体槽;原值保留,语义未取证 DIV-FONT-007)。
     pub bno: Option<i64>,
+    /// `Some` = **图像字形**:脚本用 `CG[图]→SIZE2→MEIDO→MERGE2` 把一张
+    /// 小图当字符画进文本层(外字)。渲染层把这条链降级为本项;文本合成器
+    /// 在层末把它和字一起画一次,不经过层表面的命令序加工(DIV-GFX-076)。
+    pub image: Option<TextImage>,
+}
+
+/// 外字链降级后的图像字形(asset 由后端在合成前解析成像素)。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TextImage {
+    /// `CG[FILE]` 的资产键(脚本给出的原始字节)。
+    pub asset: Vec<u8>,
+    /// `SIZE2` 的目标尺寸(字形单元,像素)。
+    pub width: u32,
+    pub height: u32,
+    /// `MEIDO SET` 的颜色(0xRRGGBB;`None` = 未着色)。
+    ///
+    /// 引擎 `MEIDO` 每通道 `×(byte/128)`(0x80=100%,0xFF≈200%)。
+    pub tint: Option<u32>,
 }
 
 impl TextDraw {
@@ -327,6 +345,7 @@ impl TextDraw {
             set: self.set,
             bno: self.bno,
             style: self.style.clone(),
+            image: self.image.clone(),
         }
     }
 }
@@ -340,6 +359,7 @@ pub struct TextDrawKey {
     set: i64,
     bno: Option<i64>,
     style: TextStyle,
+    image: Option<TextImage>,
 }
 
 impl TextDrawKey {
@@ -355,6 +375,7 @@ impl TextDrawKey {
             && self.set == draw.set
             && self.bno == draw.bno
             && self.style == draw.style
+            && self.image == draw.image
     }
 }
 
@@ -515,6 +536,7 @@ mod tests {
             style: style(),
             set: 0,
             bno: None,
+            image: None,
         };
         // SET=0 → 1 次,偏移 (0,0)
         assert_eq!(d.composite_passes(), 1);

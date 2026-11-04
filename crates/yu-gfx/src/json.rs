@@ -724,6 +724,22 @@ fn text_frame_extras(out: &mut String, f: &crate::frame::CompositorFrame) {
                 Some(v) => out.push_str(&v.to_string()),
                 None => out.push_str("null"),
             }
+            // 非图像字形的 JSON 逐字节保持旧格式(既有 golden 的
+            // `display_json_sha256` 不因新增字段变化);只有外字项带 `image`。
+            if let Some(img) = &d.image {
+                out.push_str(",\"image\":{\"asset\":");
+                esc_bytes(out, &img.asset);
+                out.push_str(",\"width\":");
+                out.push_str(&img.width.to_string());
+                out.push_str(",\"height\":");
+                out.push_str(&img.height.to_string());
+                out.push_str(",\"tint\":");
+                match img.tint {
+                    Some(v) => out.push_str(&v.to_string()),
+                    None => out.push_str("null"),
+                }
+                out.push('}');
+            }
             out.push('}');
         }
         out.push(']');

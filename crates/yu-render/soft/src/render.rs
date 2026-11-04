@@ -875,7 +875,7 @@ fn apply_copy_op(
                 copy.source_texture.as_ref(),
             )?;
             if !copy.texts.is_empty() {
-                compose_copy_texts(&mut surface, copy, st);
+                compose_copy_texts(textures, &mut surface, copy, st);
             }
             surface
         }
@@ -901,13 +901,22 @@ fn apply_copy_op(
 
 /// 在 COPY 源面上合成命令时刻冻结的文本(DIV-GFX-058:官方 `CGACT[TEXT]`
 /// 写层表面,COPY 天然携带已画文本)。
-fn compose_copy_texts(surface: &mut Surface, copy: &CopyOp, st: &mut RenderState) {
+fn compose_copy_texts(
+    textures: &mut TextureStore,
+    surface: &mut Surface,
+    copy: &CopyOp,
+    st: &mut RenderState,
+) {
     let base = Texture {
         width: surface.width,
         height: surface.height,
         rgba: std::mem::take(&mut surface.rgba),
     };
-    let (composed, stats) = st.text.compose_layer(&base, &copy.texts, None);
+    let refs: Vec<&TextDraw> = copy.texts.iter().collect();
+    let images = text_images_for_draws(textures, &refs);
+    let (composed, stats) = st
+        .text
+        .compose_layer_assets(&base, &copy.texts, None, &images);
     merge_text_stats(&mut st.report, stats);
     if let Some(texture) = composed {
         surface.width = texture.width;
@@ -1303,16 +1312,18 @@ fn apply_layer_text(
         Some(t) => Ok((t.width, t.height)),
         None => layer_base_dims(textures, snapshots, layer),
     };
+    let images = text_images_for_draws(textures, &draws);
     let composed = match dims {
         Ok(dims) => {
             let overrides = &st.texture_overrides;
-            st.text.compose_layer_cached(
+            st.text.compose_layer_cached_assets(
                 &layer.id,
                 revision,
                 base_key,
                 dims,
                 &draws,
                 layout,
+                &images,
                 || match overrides.get(&layer.id) {
                     Some(t) => Ok(t.clone()),
                     None => layer_base(textures, snapshots, layer).map(Rc::new),
@@ -1340,6 +1351,27 @@ fn apply_layer_text(
             .insert(layer.id.clone(), composed.texture);
         st.text_override_ids.insert(layer.id.clone());
     }
+}
+
+/// 解析文本绘制项里的图像字形资产(外字图)。缺资产时留空,合成器按
+/// `text.image_missing` 诊断,不猜。
+fn text_images_for_draws(
+    textures: &mut TextureStore,
+    draws: &[&TextDraw],
+) -> std::collections::BTreeMap<Vec<u8>, Texture> {
+    let mut images = std::collections::BTreeMap::new();
+    for draw in draws {
+        let Some(image) = &draw.image else {
+            continue;
+        };
+        if images.contains_key(&image.asset) {
+            continue;
+        }
+        if let Ok(texture) = textures.resolve(&image.asset) {
+            images.insert(image.asset.clone(), texture.clone());
+        }
+    }
+    images
 }
 
 fn merge_text_stats(report: &mut RenderReport, stats: TextPaintStats) {

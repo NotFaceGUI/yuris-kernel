@@ -1649,7 +1649,10 @@ fn apply_copy(
                 // 冻结文本:命令时刻已画的字形进快照(DIV-GFX-058)。
                 let raw = surfaces.raw_content(id).unwrap_or_else(|| content.clone());
                 let (cpu, _info) = content_cpu(ctx, frame, textures, contents, id, &raw)?;
-                let (composed, stats) = text.compose_layer(&cpu, &copy.texts, None);
+                let refs: Vec<&yu_gfx::TextDraw> = copy.texts.iter().collect();
+                let images = text_images_for_draws(textures, &refs);
+                let (composed, stats) =
+                    text.compose_layer_assets(&cpu, &copy.texts, None, &images);
                 merge_text_stats(acc, stats);
                 match composed {
                     Some(composed) => {
@@ -2214,6 +2217,12 @@ fn text_signature(
             fnv_bytes(&mut hash, name);
         }
         fnv_mix(&mut hash, draw.style.font_no.map_or(u64::MAX, |v| v as u64));
+        if let Some(image) = &draw.image {
+            fnv_bytes(&mut hash, &image.asset);
+            fnv_mix(&mut hash, u64::from(image.width));
+            fnv_mix(&mut hash, u64::from(image.height));
+            fnv_mix(&mut hash, image.tint.map_or(u64::MAX, u64::from));
+        }
     }
     if let Some(layout) = layout {
         fnv_mix(&mut hash, layout.glyphs.len() as u64);
@@ -2375,6 +2384,27 @@ fn read_back(ctx: &GpuContext, content: &Content) -> Result<Texture, String> {
     })
 }
 
+/// 解析文本绘制项里的图像字形资产(外字图)。缺资产时留空,合成器按
+/// `text.image_missing` 诊断,不猜。
+fn text_images_for_draws(
+    textures: &mut TextureStore,
+    draws: &[&yu_gfx::TextDraw],
+) -> BTreeMap<Vec<u8>, Texture> {
+    let mut images = BTreeMap::new();
+    for draw in draws {
+        let Some(image) = &draw.image else {
+            continue;
+        };
+        if images.contains_key(&image.asset) {
+            continue;
+        }
+        if let Ok(texture) = textures.resolve(&image.asset) {
+            images.insert(image.asset.clone(), texture.clone());
+        }
+    }
+    images
+}
+
 /// 文本阶段:把 `CGACT[TEXT]`/`TextRun` 合成进图层常驻表面(W4)。
 #[allow(clippy::too_many_arguments)]
 fn apply_text(
@@ -2461,8 +2491,12 @@ fn apply_text(
         // 纹理池 id 的 `raw.hash`:同一基面换池后仍应命中。
         let base_key = surfaces.raw_identity(&id).unwrap_or(raw.hash);
         // GPU 文本:恒等基面 + 非 layout 时,字形直接 compute 写进层表面。
+        //
+        // 图像字形(外字)不能走这条路径:compute 只收字形,图像项会被静默
+        // 跳过并把“无图”结果写进缓存。带图像项时一律走 CPU 合成。
+        let has_image_glyph = draws.iter().any(|draw| draw.image.is_some());
         if let Some(gpu_text) = text_gpu.as_mut() {
-            if layout.is_none() && raw.is_identity() && !draws.is_empty() {
+            if !has_image_glyph && layout.is_none() && raw.is_identity() && !draws.is_empty() {
                 let mut placements: Vec<yu_render_core::GlyphPlacement> = Vec::new();
                 let mut collected = true;
                 let mut gpu_glyphs = 0u32;
@@ -2585,8 +2619,27 @@ fn apply_text(
         };
         cpu_base_us = cpu_base_us
             .saturating_add(u64::try_from(cpu_started.elapsed().as_micros()).unwrap_or(u64::MAX));
-        let composed =
-            text.compose_layer_cached(&id, revision, raw.hash, dims, &draws, layout, || cpu_base);
+        let images = text_images_for_draws(textures, &draws);
+        // 缺图时不记 baked 签名:下一帧会重新合成,资产晚到时还能补上。
+        let image_missing = draws.iter().any(|draw| {
+            draw.image
+                .as_ref()
+                .is_some_and(|image| !images.contains_key(&image.asset))
+        });
+        let image_draws = draws.iter().filter(|draw| draw.image.is_some()).count();
+        if image_draws > 0 {
+            log::debug!(
+                target: "yu-render",
+                "[text-image] layer={} draws={} image_draws={} assets={}",
+                id.display(),
+                draws.len(),
+                image_draws,
+                images.len()
+            );
+        }
+        let composed = text.compose_layer_cached_assets(
+            &id, revision, raw.hash, dims, &draws, layout, &images, || cpu_base,
+        );
         let (composed, stats) = match composed {
             Ok(value) => value,
             Err(reason) => {
@@ -2594,9 +2647,22 @@ fn apply_text(
                 continue;
             }
         };
+        if image_draws > 0 {
+            log::debug!(
+                target: "yu-render",
+                "[text-image] composed={} draws={} glyphs={} missing={} diags={:?}",
+                composed.is_some(),
+                stats.draws,
+                stats.glyphs,
+                stats.missing,
+                stats.diags
+            );
+        }
         merge_text_stats(acc, stats);
         let Some(composed) = composed else {
-            surfaces.note_text_baked(&id, revision, signature, raw.hash);
+            if !image_missing {
+                surfaces.note_text_baked(&id, revision, signature, raw.hash);
+            }
             continue;
         };
         let tex = match text_uploads.layers.get(&id) {
@@ -2647,7 +2713,9 @@ fn apply_text(
         };
         let content = finish_content(surfaces, tex, dims.0, dims.1, raw.display, None);
         surfaces.set_text_content(&id, content.clone(), raw.clone());
-        surfaces.note_text_baked(&id, revision, signature, raw.hash);
+        if !image_missing {
+            surfaces.note_text_baked(&id, revision, signature, raw.hash);
+        }
         contents.insert(id, content);
     }
     (cpu_base_us, cpu_info, gpu_stats)

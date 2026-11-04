@@ -451,3 +451,75 @@ fn two_style_slots_produce_shadow_and_body_draws() {
     assert_eq!(shadow.composite_passes(), 9, "SET=3 → 9 遍");
     assert_eq!(body.composite_passes(), 1, "SET=0 → 1 遍");
 }
+
+#[test]
+fn gaiji_chain_lowers_to_text_image_glyph() {
+    // DIV-GFX-076 方案 E:`CG[图]→SIZE2→MEIDO→MERGE2 到文本层` 必须降级成
+    // 文本图像字形,而不是层表面 MERGE2(后者会清掉前缀字)。
+    let mut gfx = state();
+    let t = table();
+    gfx.on_event(&frame_start(0));
+    for (id, file) in [("TX", "dark"), ("IMG.SRC", "glyph")] {
+        gfx.on_event(&call(
+            0,
+            "CG",
+            vec![arg(&t, "CG", "ID", s(id)), arg(&t, "CG", "FILE", s(file))],
+        ));
+    }
+    gfx.on_event(&call(
+        0,
+        "CG",
+        vec![arg(&t, "CG", "ID", s("IMG.DST")), arg(&t, "CG", "FILE", s(""))],
+    ));
+    gfx.on_event(&call(
+        0,
+        "CGACT",
+        vec![
+            arg(&t, "CGACT", "ID", s("IMG.SRC")),
+            arg(&t, "CGACT", "ID2", s("IMG.DST")),
+            arg(&t, "CGACT", "SIZE2", i(1)),
+            arg(&t, "CGACT", "SX", i(22)),
+            arg(&t, "CGACT", "SY", i(22)),
+        ],
+    ));
+    gfx.on_event(&call(
+        0,
+        "CGACT",
+        vec![
+            arg(&t, "CGACT", "ID", s("IMG.DST")),
+            arg(&t, "CGACT", "MEIDO", i(1)),
+            arg(&t, "CGACT", "SET", i(0x00_FF0000)),
+        ],
+    ));
+    gfx.on_event(&call(
+        0,
+        "CGACT",
+        vec![
+            arg(&t, "CGACT", "ID", s("IMG.DST")),
+            arg(&t, "CGACT", "ID2", s("TX")),
+            arg(&t, "CGACT", "MERGE2", i(1)),
+            arg(&t, "CGACT", "X", i(40)),
+            arg(&t, "CGACT", "Y", i(10)),
+        ],
+    ));
+
+    let frame = gfx.frame();
+    let image = frame
+        .text_draws
+        .iter()
+        .find(|d| d.image.is_some())
+        .expect("外字链应降级为图像字形");
+    assert_eq!(image.target.display(), ":/W0/TX");
+    assert_eq!((image.x, image.y), (40, 10));
+    let img = image.image.as_ref().unwrap();
+    assert_eq!(img.asset, b"glyph");
+    assert_eq!((img.width, img.height), (22, 22));
+    assert_eq!(img.tint, Some(0x00_FF0000));
+    assert!(
+        !frame.passes.iter().any(|p| p.ops.iter().any(|op| matches!(
+            op,
+            Op::Image(i) if i.action == yu_gfx::ImageAction::Merge2
+        ))),
+        "降级后不得再记录 MERGE2 图像加工"
+    );
+}

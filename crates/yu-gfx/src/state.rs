@@ -145,6 +145,19 @@ impl LayerTexts {
     }
 }
 
+/// 外字链(`CG[图] → SIZE2 → MEIDO → MERGE2 到文本层`)的降级候选。
+///
+/// 这不是按层名识别:只跟踪“单个资产被缩放到字形尺寸、单色 MEIDO、
+/// 再合并进目标层”的数据流。最终 `MERGE2` 降级成 [`TextDraw::image`],
+/// 由文本合成器在层末画一次。
+#[derive(Clone, Debug)]
+struct GlyphChain {
+    asset: Vec<u8>,
+    width: u32,
+    height: u32,
+    tint: Option<u32>,
+}
+
 /// 图形域状态机。
 pub struct GfxState {
     params: ParamTable,
@@ -194,6 +207,8 @@ pub struct GfxState {
     /// (DIV-GFX-055 预登记的演进)。清除只发生在层像素被重写时:
     /// `CGEND`/`CG(FILE)`/`CGACT[COPY]` 目标/Executable 图像加工/`SWAP`。
     text_draws: BTreeMap<LayerId, LayerTexts>,
+    /// 外字链候选(`SIZE2` 目标层 → 资产/尺寸/MEIDO 颜色)。
+    glyph_chains: BTreeMap<LayerId, GlyphChain>,
     copy_log: Vec<CopyOp>,
     image_log: Vec<ImageOp>,
     /// 被上限丢弃的最旧操作数(审计用)。
@@ -386,6 +401,7 @@ impl GfxState {
             text_clear_seq: 0,
             text_revision_seq: 0,
             text_draws: BTreeMap::new(),
+            glyph_chains: BTreeMap::new(),
             copy_log: Vec::new(),
             image_log: Vec::new(),
             copy_log_dropped: 0,
@@ -1129,6 +1145,33 @@ impl GfxState {
         f.text_draws = self.text_draws_now();
         f.text_revisions = self.text_revisions_now();
         f.diagnostics = self.diags.values().cloned().collect();
+        // 方案 E 诊断:文本层在**本帧**携带多少条图像字形。用于区分
+        // “被清掉/没进列表”和“进了列表但合成未画”。
+        for (id, texts) in &self.text_draws {
+            let images = texts
+                .draws
+                .iter()
+                .filter(|draw| draw.image.is_some())
+                .count();
+            if images > 0 {
+                f.diagnostics.push(crate::error::FrameDiag::new(
+                    "gfx.text.image_draws",
+                    yu_log::Severity::Verbose,
+                    "CGACT",
+                    format!(
+                        "文本层 {} 携带 {} 条图像字形(共 {} 条)",
+                        id.display(),
+                        images,
+                        texts.draws.len()
+                    ),
+                ));
+            }
+        }
+        // `CompositorFrame.diagnostics` 的稳定顺序约定:按
+        // `(code, command, detail)` 排序,追加项不能破坏 golden。
+        f.diagnostics.sort_by(|a, b| {
+            (&a.code, &a.command, &a.detail).cmp(&(&b.code, &b.command, &b.detail))
+        });
         f.screen_snapshots = self.screen_snapshots.clone();
         // 下一帧主窗口截屏的对照基准 = 本帧最终画面契约。
         self.last_screen_key.set(Some(Self::screen_contract_key(
@@ -3532,7 +3575,13 @@ impl GfxState {
             style: self.style.clone(),
             set,
             bno,
+            image: None,
         };
+        self.push_text_draw(target, draw);
+    }
+
+    /// 把一条绘制项(字或图像字形)登记到目标层,维护去重/修订号/上限诊断。
+    fn push_text_draw(&mut self, target: &LayerId, draw: TextDraw) {
         let (dropped, changed) = {
             let texts = self.text_draws.entry(target.clone()).or_default();
             let before = texts.dropped;
@@ -3557,6 +3606,130 @@ impl GfxState {
                 ),
             );
         }
+    }
+
+    /// 外字链降级:返回 `true` 表示该 `CGACT` 已被消费为文本图像字形,
+    /// 调用方不得再记录成图像加工。
+    ///
+    /// 数据流规则(不看层名):
+    /// 1. `SIZE2/SIZE*` 的源是单个资产、目标是空层(`FILE=""` 的 1×1 黑
+    ///    或未物化)、目标尺寸 ≤256 → 记为字形候选;
+    /// 2. 候选层上的 `MEIDO` → 记 `tint`;
+    /// 3. `MERGE2` 的源是候选层、目标存在 → 向目标文本列表追加
+    ///    [`TextDraw::image`];候选层自身状态不改(可见性由脚本 `E` 决定)。
+    #[allow(clippy::too_many_arguments)]
+    fn lower_glyph_chain(
+        &mut self,
+        action: &ImageAction,
+        source: &LayerId,
+        target: Option<&LayerId>,
+        set: Option<&EngineValue>,
+        sx: Option<f64>,
+        sy: Option<f64>,
+        x: Option<f64>,
+        y: Option<f64>,
+    ) -> bool {
+        if action.is_scale() {
+            let Some(t) = target else { return false };
+            // 重新缩放 = 新数据流:旧候选一律作废(避免保留过期资产)。
+            self.glyph_chains.remove(t);
+            let Some((w, h)) = sx.zip(sy) else {
+                return false;
+            };
+            if !(w > 0.0 && h > 0.0 && w <= 256.0 && h <= 256.0) {
+                return false;
+            }
+            let Some(src) = self.nodes.get(source) else {
+                return false;
+            };
+            let TextureRef::Asset(asset) = &src.layer.texture else {
+                return false;
+            };
+            let empty = self.nodes.get(t).is_some_and(|n| {
+                matches!(
+                    n.layer.texture,
+                    TextureRef::SolidBlack1x1 | TextureRef::None
+                )
+            });
+            if !empty {
+                return false;
+            }
+            self.glyph_chains.insert(
+                t.clone(),
+                GlyphChain {
+                    asset: asset.clone(),
+                    width: w.round() as u32,
+                    height: h.round() as u32,
+                    tint: None,
+                },
+            );
+            // 仍记录这条缩放:目标层像素按官方语义参与后续层绘制。
+            return false;
+        }
+        if action.is_meido() {
+            let t = target.unwrap_or(source);
+            if let Some(chain) = self.glyph_chains.get_mut(t) {
+                chain.tint = set
+                    .and_then(EngineValue::as_int)
+                    .map(|v| (v as u32) & 0x00FF_FFFF);
+            }
+            return false;
+        }
+        if matches!(action, ImageAction::Merge2) {
+            let Some(chain) = self.glyph_chains.get(source).cloned() else {
+                return false;
+            };
+            let Some(t) = target else { return false };
+            // 目标层不存在时 MERGE2 本身无可见结果:不消费这条链,交回
+            // 普通图像加工路径去报 `gfx.layer.missing`。
+            if t == source || !self.nodes.contains_key(t) {
+                return false;
+            }
+            let draw = TextDraw {
+                target: t.clone(),
+                bytes: Vec::new(),
+                x: x.map(|v| v.round() as i64).unwrap_or(0),
+                y: y.map(|v| v.round() as i64).unwrap_or(0),
+                style: self.style.clone(),
+                set: 0,
+                bno: None,
+                image: Some(crate::text::TextImage {
+                    asset: chain.asset,
+                    width: chain.width,
+                    height: chain.height,
+                    tint: chain.tint,
+                }),
+            };
+            self.push_text_draw(t, draw.clone());
+            if let Some(image) = &draw.image {
+                self.push_diag(
+                    "CGACT",
+                    error::verbose(
+                        error::code::TEXT_IMAGE_GLYPH,
+                        format!(
+                            "外字链降级: {} -> {} asset={} {}x{} tint={:?} at ({},{})",
+                            source.display(),
+                            t.display(),
+                            String::from_utf8_lossy(&image.asset),
+                            image.width,
+                            image.height,
+                            image.tint,
+                            draw.x,
+                            draw.y
+                        ),
+                    ),
+                );
+            }
+            return true;
+        }
+        // 候选层被其它图像加工改写后,不能再按“纯资产字形”降级:去掉
+        // 候选,后续 MERGE2 照常记录为图像加工,不猜被改写后的像素。
+        if let Some(t) = target {
+            self.glyph_chains.remove(t);
+        } else {
+            self.glyph_chains.remove(source);
+        }
+        false
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3602,6 +3775,12 @@ impl GfxState {
                 );
                 return;
             }
+        }
+        // 外字链降级(DIV-GFX-076 方案 E):`CG[图]→SIZE2→MEIDO→MERGE2`
+        // 的最终合并变成文本层的图像字形绘制项,不进入层表面命令序。
+        // 识别看数据流,不看层名;命中即返回,不记录该图像加工。
+        if self.lower_glyph_chain(&action, source, target.as_ref(), set.as_ref(), sx, sy, x, y) {
+            return;
         }
         // 图像加工的可执行性门禁(像素算法本身在 soft/wgpu 两个后端里;
         // 全部 17 个执行体已逐个取证,见 `DIV-GFX-063`)。
@@ -4015,9 +4194,34 @@ impl GfxState {
     /// 层像素被重写:清空该层文本内容并发全局新修订号(后端缓存随之失效)。
     /// 不删条目 —— 删除后重建会让修订号从头开始,和旧缓存撞键。
     fn clear_layer_texts(&mut self, id: &LayerId) {
-        let has = self.text_draws.get(id).is_some_and(|t| !t.draws.is_empty());
-        if !has {
+        let Some((draws, images)) = self.text_draws.get(id).map(|texts| {
+            (
+                texts.draws.len(),
+                texts
+                    .draws
+                    .iter()
+                    .filter(|draw| draw.image.is_some())
+                    .count(),
+            )
+        }) else {
             return;
+        };
+        if draws == 0 {
+            return;
+        }
+        if images > 0 {
+            self.push_diag(
+                "CGACT",
+                error::verbose(
+                    error::code::TEXT_IMAGE_GLYPH,
+                    format!(
+                        "清文本层 {}: 丢弃 {} 条图像字形(共 {} 条)",
+                        id.display(),
+                        images,
+                        draws
+                    ),
+                ),
+            );
         }
         self.text_revision_seq = self.text_revision_seq.wrapping_add(1);
         let seq = self.text_revision_seq;
@@ -4154,6 +4358,8 @@ impl GfxState {
         if self.nodes.contains_key(path) {
             return;
         }
+        // 同名层重建:旧实例的外字链候选作废。
+        self.glyph_chains.remove(path);
         // `CG` 重建同名层 = 官方新建一个层实例,旧实例的像素与加工链全部
         // 作废。除了清烘焙记录,还要把引用该层名的历史加工项从日志里丢掉:
         // 存档界面每次打开都用 `CG[ID="_TMP_OF" FILE=""]` + `CGEND` 重建
@@ -4245,6 +4451,7 @@ impl GfxState {
                 p.children.remove(path);
             }
         }
+        self.glyph_chains.retain(|id, _| !removed.contains(id));
         removed
     }
 
@@ -5528,6 +5735,7 @@ fn hash_text_draw(h: &mut impl Hasher, draw: &crate::text::TextDraw) {
     draw.style.hash(h);
     draw.set.hash(h);
     draw.bno.hash(h);
+    draw.image.hash(h);
 }
 
 fn hash_text_layout(h: &mut impl Hasher, layout: &crate::text::TextLayoutFrame) {

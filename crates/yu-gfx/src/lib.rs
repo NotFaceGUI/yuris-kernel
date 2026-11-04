@@ -77,6 +77,6 @@ pub use state::{GfxConfig, GfxState, TextView, TextureSampler};
 pub use table::{ParamTable, ResolvedArg};
 pub use text::{
     layout_text, GlyphAtlasRef, TextDraw, TextDrawKey, TextFlagsSource, TextFontRequest,
-    TextGlyph, TextLayoutFrame, TextRun, TextStroke, TextStyle,
+    TextGlyph, TextImage, TextLayoutFrame, TextRun, TextStroke, TextStyle,
 };
 pub use transition::TransitionDraw;

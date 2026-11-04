@@ -1,6 +1,6 @@
 # DIV-GFX-076 · `CGACT[TEXT]` 与图像加工的命令序(外字链根因)
 
-- 状态: **open(已定位;修复需主人拍板架构)**
+- 状态: **open(通用命令序);外字链已由方案 E 修复(2026-11-04)**
 - 影响面: `crates/yu-gfx/src/state.rs`、`crates/yu-render/{core,soft,wgpu}`、
   ERIS 外字链(`es_font.yst` s11)、`BT.CGCLEAR` 标签清屏
 - 关联: `DIV-GFX-072` §9、`DIV-GFX-055`、`DIV-GFX-058`
@@ -88,10 +88,12 @@ ERIS 外字链(s11 `es_font.yst`,s135 文本):
 - 合成微场景: `CGACT[TEXT]` 在 (10,10) 画 `A` → `CGACT[MERGE2]` 在
   (20,10) 叠图 → `CGACT[TEXT]` 在 (40,10) 画 `B`;三者都必须可见,
   且 `RECTPAINT3 SET=0` 覆盖 (0,0)-(31,31) 时 `A` 被清掉。
+  **该微场景仍属 A/B 的验收;方案 E 只覆盖外字字形链,见 §7。**
 - 真实语料: ERIS s135 外字页,截图对照:
   行首必须是 `あ、ちなみにこの「` + 外字 `＃`/`＠` + `」などの…`;
-  不是从 `」` 开始。
-- 现有 `text_pipeline` / soft / wgpu 文本测试不回归。
+  不是从 `」` 开始。**方案 E 已满足**(2026-11-04,soft `shot-f860-soft.png`、
+  wgpu `shot-f1000-wgpu.png`,外字 `?`/`~` 可见)。
+- 现有 `text_pipeline` / soft / wgpu 文本测试不回归。**已通过。**
 
 ## 6. 当前动作
 
@@ -104,3 +106,68 @@ ERIS 外字链(s11 `es_font.yst`,s135 文本):
 - 临时 `YURIS_TRACE_TEXT_OPS=1` 诊断钩子已删除(不属于行为改动)。
 - 等主人选 A/B/C;选 A 需先拍板 gfx↔renderer bake 端口契约,并解决
   “隐藏哨兵坐标/空基图层”这一类真实文本层的处理,不能复用本次失败实现。
+
+## 7. 方案 E(2026-11-04 落地,主人批准)
+
+方案 E 不重构层表面的命令序,只把**外字字形链**从“图像加工”降级为
+“文本图像字形绘制项”:文字与字形都由文本合成器在层末画一次,既避免
+B+ 的多遍合成闪烁/锯齿,也保住 MERGE2 之前的前缀字。
+
+### 7.1 官方链(逐命令)
+
+`es_Font.yst:573..616`(0.495 散盘,`es_font.yst` s11)每个外字字符:
+
+```text
+CG[ID=TX.GAIJI.BUF E=0 FILE=g01_XX{22,36,48}]   // 单资产源层
+CG[ID=TX.GAIJI1 E=0 FILE=""]                    // 空目标层
+CGACT[ID=TX.GAIJI.BUF ID2=TX.GAIJI1 SIZE2=1 SX/SY=@FONT.SIZE]
+CGACT[ID=TX.GAIJI1 MEIDO=1 SET=@FONT.COLOR]
+... 同形状的 GAIJI2(阴影)6 次 MERGE2、GAIJI3(描边)6 次 MERGE2 ...
+CGACT[MERGE2=1 ID=TX.GAIJI1 ID2=$ID X=@FONT.X Y=@FONT.Y]  // 主字形
+CGEND[TX.GAIJI.BUF/GAIJI1/GAIJI2/GAIJI3]
+```
+
+- 源层/目标层都显式 `E=0`(不可见),`CGEND` 立即回收;字形位置就是
+  `@FONT.X/Y`(文本层绝对坐标)。
+- 官方 `MERGE2` 与 `SIZE2/MEIDO` 都在 `FUN_0042f809` 的同一层表面上执行
+  (§1),因此这是一条“临时层加工 + 合并进文本层”的数据流。
+
+### 7.2 内核实现
+
+- `yu_gfx::TextDraw.image: Option<TextImage>`(`asset/width/height/tint`);
+  `dedup_key`/`hash_text_draw`/display JSON 都含该字段(旧格式逐字节不变)。
+- `GfxState::lower_glyph_chain` 在可执行性门禁**之前**按数据流识别:
+  1. `SIZE2/SIZE*`:源层是单个 `TextureRef::Asset`、目标层是空层
+     (`SolidBlack1x1|None`)、`0<SX,SY<=256` → 记候选(缩放仍照常记录);
+  2. 候选层 `MEIDO` → `SET & 0xFFFFFF` 记 tint;
+  3. `MERGE2` 源=候选、目标层存在 → 向目标文本列表追加
+     `TextDraw::image`,并 `return true` 跳过 MERGE2 图像加工(不触发
+     `clear_layer_texts`,前缀字保留)。
+  其它图像加工落到候选层 → 候选作废,回退普通图像加工,不猜像素。
+- 后端:`text_images_for_draws` 用 `TextureStore.resolve(asset)` 解析像素;
+  `TextComposer::paint_image` 按 `SIZE2` 尺寸最近邻采样、`MEIDO` 每通道
+  `×(byte/128)`、source-over 写入文本层表面,超出表面裁剪(隐藏哨兵
+  `99999+X/Y` 不扩大表面)。
+- wgpu 的 GPU 字形快路径只收字形,遇 `image` 项强制走 CPU 合成
+  (`has_image_glyph`),避免把“无图”结果写进缓存。
+- 图像资产缺失时**不写**合成缓存/文本 baked 签名,下一帧重试。
+
+### 7.3 证据锚点
+
+- REA:`FUN_0042f809`(`0x42f809`)层表面 `[+0x34]+0x90`、`MERGE2` 分派;
+  `CGACT[TEXT]` = `FUN_004056b8`(`0x4056b8`,调用点 `0x42e22f`)。
+- 手册:`cg/cg.html`、`cg/cgact.html`(SIZE2/MEIDO/MERGE2 语义);
+  外字链本身无单页手册,由脚本自证 + 引擎行为锚定。
+- 真实语料:`<project-eris>` s11/s135;测试
+  `crates/yu-gfx/tests/text_pipeline.rs::gaiji_chain_lowers_to_text_image_glyph`、
+  `yu-render-core::text::image_glyph_tests::{image_glyph_paints_and_tints,
+  missing_image_is_not_cached_and_retries}`。
+
+### 7.4 与官方仍存的差异
+
+- 图像字形在**层末**与文字一起合成,不在 MERGE2 命令时刻写表面。若
+  后续命令对同一文本层再做 `RECTPAINT*/COPY/SIZE/滤镜`,仍走既有的
+  “保守清文字”(§2),不会把字形当作表面像素参与那些加工 —— 这部分
+  通用命令序差异保持 open。
+- 若第三方脚本在候选层上叠加候选链之外的图像加工,候选会作废并回退
+  普通 MERGE2 路径(宁可丢字形也不猜被改写后的像素)。

@@ -18,6 +18,7 @@ fn draw(color: u32, set: i64) -> TextDraw {
         },
         set,
         bno: None,
+        image: None,
     }
 }
 

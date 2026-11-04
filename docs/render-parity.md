@@ -440,6 +440,11 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 - 官方 `TEXT[CLEAR]`(`0x4638e4`)只清待显示缓冲,不清图层表面;
   `'P'` 才清表面,自动模式默认一行一页。内核以累积显示缓冲近似,
   差异见 DIV-GFX-075。
+- 外字(图像字形):`CG[图]→SIZE2→MEIDO→MERGE2 到文本层` 降级为
+  `TextDraw.image`(`TextImage{asset,width,height,tint}`),由文本合成器
+  在层末与文字一起画一次;`MEIDO` = 每通道 `×(byte/128)`。官方链见
+  `es_Font.yst:573..616`,REA `FUN_0042f809`;与官方“命令时刻写表面”的
+  剩余差异见 DIV-GFX-076 §7。
 - `FONTINFO`/`CGINFO`/`WINDOWINFO` 的 `LET`:已实现
   `yu_rt::event::GraphicsHost` + `yu_gfx::GfxHost` 同步链路。`Vm` 在产生
   图形/窗口/文本/帧事件时**同步**送入 `GfxState`,`INFO` 命令在脚本执行期

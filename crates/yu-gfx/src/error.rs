@@ -54,6 +54,11 @@ pub mod code {
     pub const IMAGEOP_UNSUPPORTED: &str = "gfx.imageop.unsupported";
     /// 文本模型缺项(字形栅格化/窗口定位/描边)。
     pub const TEXT_UNSUPPORTED: &str = "gfx.text.unsupported";
+    /// 外字链(`CG→SIZE2→MEIDO→MERGE2`)降级为文本图像字形。
+    ///
+    /// 这是**正常路径**(DIV-GFX-076 方案 E),不是缺项:后端在层末把图像
+    /// 字形与文字一起画一次,避免层表面按命令序重复合成。仅 Verbose 留痕。
+    pub const TEXT_IMAGE_GLYPH: &str = "gfx.text.image_glyph";
     /// 非视觉参数(如 `LINT`)已原样保留但未解释。
     pub const PARAM_NONVISUAL: &str = "gfx.param.nonvisual";
     /// 图像层显式尺寸:黑图可执行,资源图缩放语义未取证。

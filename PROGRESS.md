@@ -12792,3 +12792,61 @@ $ cargo test -p yu-trace --test golden
 图层表面/页清屏/折行/每字符样式);H-P2-01/02/04 交接件、
 coverage-matrix TEXT/WORD/`_`/RETURNCODE/TEXTINFO 行、render-parity
 文本节、gfx-unimplemented-todo 同步勘误。**未执行任何 git 写操作。**
+
+## 成果 GAIJI-PLANE (2026-11-04) · 外字链降级为文本图像字形(方案 E)
+
+**结论**:ERIS 外字链 `CG[图]→SIZE2→MEIDO→MERGE2 到文本层` 不再当普通
+图像加工处理。`GfxState::lower_glyph_chain` 按数据流识别:单资产缩放到
+空层(≤256)→`MEIDO` 着色→`MERGE2` 到已存在目标层;最终合并降级为
+`TextDraw.image=Some(TextImage{asset,width,height,tint})`,由文本合成器
+在层末与文字一起画一次。前缀文字不再被 `clear_layer_texts` 清掉,
+也不会像 B+ 那样逐命令合成导致描边/阴影闪烁。
+
+**改动**:
+- `yu-gfx`:`TextImage` 公共契约、`TextDraw.image`(进入 dedup key、JSON、
+  帧快照哈希);`lower_glyph_chain` 候选/失效规则;`gfx.text.image_glyph`
+  Verbose 诊断;缺图重试与清层诊断。
+- `yu-render-core`:`paint_image`(SIZE2 采样、MEIDO `×(byte/128)`、
+  source-over、表面裁剪);`*_assets` 组合接口;缺图不写合成缓存;
+  `collect_glyphs` 拒绝图像项。
+- `yu-backend-soft`/`yu-backend-wgpu`:资产解析接入;wgpu GPU 字形快路径
+  遇图像项强制 CPU 合成,缺图不记 baked 签名。
+
+**证据锚点**:
+- 官方链:`es_Font.yst:573..616`(0.495 散盘;主字形 + 阴影 6 次 + 描边
+  6 次 MERGE2,`E=0`,`CGEND` 回收)。
+- REA:`FUN_0042f809`(`0x42f809`,层表面 `[+0x34]+0x90`)/
+  `FUN_004056b8`(`0x4056b8`,调用点 `0x42e22f`)。
+- 手册:`cg/cgact.html`(SIZE2/MEIDO/MERGE2);外字链无单页手册,
+  按「手册缺页 ≠ 不实现」用脚本+引擎证据实现。
+
+**验证**:
+
+```text
+$ cargo test -p yu-gfx
+    lib 17 passed;text_pipeline 14 passed;其余套件全绿
+$ cargo test -p yu-render-core
+    20 passed(含 image_glyph_paints_and_tints /
+    missing_image_is_not_cached_and_retries)
+$ cargo test -p yu-backend-soft
+    34 passed
+$ cargo test -p yu-backend-wgpu
+    全绿(含 wgsl_check)
+$ cargo test -p yu-engine --test text_sync
+    2 passed
+$ cargo check --workspace --all-targets
+    Finished
+$ cargo build --workspace --all-targets
+    Finished
+```
+
+**实机对照**(先前会话留存):soft `target/tmp/shot-f860-soft.png`、
+wgpu `target/tmp/shot-f1000-wgpu.png`,外字 `?`/`~` 均可见。
+
+**已知剩余差异**:图像字形在层末合成,不在 MERGE2 命令时刻写表面;
+后续对同一文本层做 `RECTPAINT*/COPY/SIZE/滤镜` 仍走保守清文字
+(通用命令序差异保持 open,见 `DIV-GFX-076` §7)。若候选层被链外图像
+加工改写,候选作废并回退普通 MERGE2,不猜像素。
+
+**台账**:`DIV-GFX-076` 更新(状态/§5/§7)、`gfx-unimplemented-todo`
+DIV-GFX-076 行、`render-parity` 文本节。**未执行任何 git 写操作。**

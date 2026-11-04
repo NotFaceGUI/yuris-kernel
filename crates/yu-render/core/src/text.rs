@@ -788,6 +788,10 @@ impl TextComposer {
     /// 与 [`TextComposer::paint_one`] 同一套字体/样式/偏移语义;失败返回
     /// 人读原因(调用方回退 CPU 合成,由 CPU 路径补诊断)。
     pub fn collect_glyphs(&mut self, draw: &TextDraw) -> Result<Vec<GlyphPlacement>, String> {
+        if draw.image.is_some() {
+            // 图像字形只走 CPU 合成;禁止 GPU 字形路径静默丢掉它。
+            return Err("text.image_glyph_not_gpu".to_string());
+        }
         if !self.ensure() {
             return Err(self
                 .failure
@@ -846,6 +850,19 @@ impl TextComposer {
         self.paint_draw_refs(dst, w, h, &refs)
     }
 
+    /// 同 [`Self::paint_draws`],但带图像字形资产(外字图)。
+    pub fn paint_draws_assets(
+        &mut self,
+        dst: &mut [u8],
+        w: u32,
+        h: u32,
+        draws: &[TextDraw],
+        images: &BTreeMap<Vec<u8>, Texture>,
+    ) -> TextPaintStats {
+        let refs: Vec<&TextDraw> = draws.iter().collect();
+        self.paint_draw_refs_assets(dst, w, h, &refs, images)
+    }
+
     /// 同 [`Self::paint_draws`],但借用绘制项(增量烘焙免深拷贝)。
     pub fn paint_draw_refs(
         &mut self,
@@ -854,14 +871,129 @@ impl TextComposer {
         h: u32,
         draws: &[&TextDraw],
     ) -> TextPaintStats {
+        self.paint_draw_refs_assets(dst, w, h, draws, &BTreeMap::new())
+    }
+
+    /// 同 [`Self::paint_draw_refs`],但带图像字形资产(外字图)。
+    pub fn paint_draw_refs_assets(
+        &mut self,
+        dst: &mut [u8],
+        w: u32,
+        h: u32,
+        draws: &[&TextDraw],
+        images: &BTreeMap<Vec<u8>, Texture>,
+    ) -> TextPaintStats {
         let mut stats = TextPaintStats::default();
         if w == 0 || h == 0 || dst.len() < (w as usize) * (h as usize) * 4 {
             return stats;
         }
         for draw in draws {
-            self.paint_one(dst, w, h, draw, &mut stats);
+            if let Some(image) = &draw.image {
+                self.paint_image(dst, w, h, draw, image, images, &mut stats);
+            } else {
+                self.paint_one(dst, w, h, draw, &mut stats);
+            }
         }
         stats
+    }
+
+    /// 画一个图像字形:按 `SIZE2` 尺寸采样、按 `MEIDO` 着色、source-over
+    /// 写到文本层表面;超出表面的部分裁剪(隐藏哨兵不会扩大表面)。
+    #[allow(clippy::too_many_arguments)]
+    fn paint_image(
+        &mut self,
+        dst: &mut [u8],
+        w: u32,
+        h: u32,
+        draw: &TextDraw,
+        image: &yu_gfx::TextImage,
+        images: &BTreeMap<Vec<u8>, Texture>,
+        stats: &mut TextPaintStats,
+    ) {
+        stats.draws += 1;
+        let Some(src) = images.get(&image.asset) else {
+            stats.missing += 1;
+            stats.note("text.image_missing");
+            log::debug!(
+                target: "yu-render",
+                "[text-image] 缺图像字形资产: {}",
+                String::from_utf8_lossy(&image.asset)
+            );
+            return;
+        };
+        let tw = if image.width == 0 {
+            src.width
+        } else {
+            image.width
+        };
+        let th = if image.height == 0 {
+            src.height
+        } else {
+            image.height
+        };
+        if tw == 0 || th == 0 || src.width == 0 || src.height == 0 {
+            stats.missing += 1;
+            stats.note("text.image_size_unknown");
+            return;
+        }
+        log::debug!(
+            target: "yu-render",
+            "[text-image] paint asset={} src={}x{} dst={}x{} at ({},{}) tint={:?}",
+            String::from_utf8_lossy(&image.asset),
+            src.width,
+            src.height,
+            tw,
+            th,
+            draw.x,
+            draw.y,
+            image.tint
+        );
+        let tint = image
+            .tint
+            .map(|c| ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff));
+        let mut painted = false;
+        for dy in 0..th as i64 {
+            let y = draw.y + dy;
+            if y < 0 || y >= h as i64 {
+                continue;
+            }
+            let sy = (dy as u64 * src.height as u64 / th as u64) as u32;
+            for dx in 0..tw as i64 {
+                let x = draw.x + dx;
+                if x < 0 || x >= w as i64 {
+                    continue;
+                }
+                let sx = (dx as u64 * src.width as u64 / tw as u64) as u32;
+                let si = ((sy as usize) * (src.width as usize) + sx as usize) * 4;
+                let a = src.rgba[si + 3] as u32;
+                if a == 0 {
+                    continue;
+                }
+                let (mut r, mut g, mut b) = (
+                    src.rgba[si] as u32,
+                    src.rgba[si + 1] as u32,
+                    src.rgba[si + 2] as u32,
+                );
+                if let Some((tr, tg, tb)) = tint {
+                    // MEIDO:每通道 ×(byte/128);0x80=100%,0xFF≈200%。
+                    r = (r * tr / 128).min(255);
+                    g = (g * tg / 128).min(255);
+                    b = (b * tb / 128).min(255);
+                }
+                let di = ((y as usize) * (w as usize) + x as usize) * 4;
+                let inv = 255 - a;
+                dst[di] = ((r * a + dst[di] as u32 * inv + 127) / 255) as u8;
+                dst[di + 1] = ((g * a + dst[di + 1] as u32 * inv + 127) / 255) as u8;
+                dst[di + 2] = ((b * a + dst[di + 2] as u32 * inv + 127) / 255) as u8;
+                dst[di + 3] = (a + dst[di + 3] as u32 * inv / 255).min(255) as u8;
+                painted = true;
+            }
+        }
+        if painted {
+            stats.glyphs += 1;
+        } else {
+            stats.note("text.image_blank");
+        }
     }
 
     /// 按 `gfx` 已排版的 `_TEXT_FLAG` 单元在 RGBA8 缓冲上合成(原地)。
@@ -961,8 +1093,19 @@ impl TextComposer {
         draws: &[TextDraw],
         layout: Option<&TextLayoutFrame>,
     ) -> (Option<Texture>, TextPaintStats) {
+        self.compose_layer_assets(base, draws, layout, &BTreeMap::new())
+    }
+
+    /// 同 [`Self::compose_layer`],但带图像字形资产(外字图)。
+    pub fn compose_layer_assets(
+        &mut self,
+        base: &Texture,
+        draws: &[TextDraw],
+        layout: Option<&TextLayoutFrame>,
+        images: &BTreeMap<Vec<u8>, Texture>,
+    ) -> (Option<Texture>, TextPaintStats) {
         let refs: Vec<&TextDraw> = draws.iter().collect();
-        self.compose_layer_refs(base, &refs, layout)
+        self.compose_layer_refs_assets(base, &refs, layout, images)
     }
 
     /// 同 [`Self::compose_layer`],但借用绘制项(调用方可免去深拷贝)。
@@ -972,11 +1115,23 @@ impl TextComposer {
         draws: &[&TextDraw],
         layout: Option<&TextLayoutFrame>,
     ) -> (Option<Texture>, TextPaintStats) {
+        self.compose_layer_refs_assets(base, draws, layout, &BTreeMap::new())
+    }
+
+    /// 同 [`Self::compose_layer_refs`],但带图像字形资产(外字图)。
+    pub fn compose_layer_refs_assets(
+        &mut self,
+        base: &Texture,
+        draws: &[&TextDraw],
+        layout: Option<&TextLayoutFrame>,
+        images: &BTreeMap<Vec<u8>, Texture>,
+    ) -> (Option<Texture>, TextPaintStats) {
         if draws.is_empty() && layout.is_none() {
             return (None, TextPaintStats::default());
         }
         let mut out = base.clone();
-        let mut stats = self.paint_draw_refs(&mut out.rgba, out.width, out.height, draws);
+        let mut stats =
+            self.paint_draw_refs_assets(&mut out.rgba, out.width, out.height, draws, images);
         if let Some(layout) = layout {
             stats.merge(self.paint_layout(&mut out.rgba, out.width, out.height, layout));
         }
@@ -1005,9 +1160,34 @@ impl TextComposer {
         layout: Option<&TextLayoutFrame>,
         resolve_base: impl FnOnce() -> Result<Rc<Texture>, String>,
     ) -> Result<(Option<ComposedLayer>, TextPaintStats), String> {
+        self.compose_layer_cached_assets(
+            layer,
+            revision,
+            base_key,
+            base_dims,
+            draws,
+            layout,
+            &BTreeMap::new(),
+            resolve_base,
+        )
+    }
+
+    /// 同 [`Self::compose_layer_cached`],但带图像字形资产(外字图)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn compose_layer_cached_assets(
+        &mut self,
+        layer: &LayerId,
+        revision: u64,
+        base_key: u64,
+        base_dims: (u32, u32),
+        draws: &[&TextDraw],
+        layout: Option<&TextLayoutFrame>,
+        images: &BTreeMap<Vec<u8>, Texture>,
+        resolve_base: impl FnOnce() -> Result<Rc<Texture>, String>,
+    ) -> Result<(Option<ComposedLayer>, TextPaintStats), String> {
         if let Some(layout) = layout {
             let base = resolve_base()?;
-            let (out, stats) = self.compose_layer_refs(&base, &[], Some(layout));
+            let (out, stats) = self.compose_layer_refs_assets(&base, &[], Some(layout), images);
             return Ok((
                 out.map(|texture| {
                     let hash = content_hash_rgba(texture.width, texture.height, &texture.rgba);
@@ -1022,6 +1202,13 @@ impl TextComposer {
         if draws.is_empty() {
             return Ok((None, TextPaintStats::default()));
         }
+        // 图像字形资产缺失时不写缓存:资产可能晚一帧才解析出来,缓存
+        // “缺图”结果会让它永远不再重试。已在缓存里的前缀像素不受影响。
+        let image_missing = draws.iter().any(|draw| {
+            draw.image
+                .as_ref()
+                .is_some_and(|image| !images.contains_key(&image.asset))
+        });
         // 命中:同修订 + 同基面身份 + 同尺寸 ⇒ 零重烤、零哈希、零克隆。
         if let Some(hit) = self.compose_cache.get_mut(layer) {
             if hit.revision == revision
@@ -1058,11 +1245,12 @@ impl TextComposer {
                     Ok(texture) => texture,
                     Err(rc) => (*rc).clone(),
                 };
-                let stats = self.paint_draw_refs(
+                let stats = self.paint_draw_refs_assets(
                     &mut texture.rgba,
                     texture.width,
                     texture.height,
                     &draws[hit.baked.len()..],
+                    images,
                 );
                 let paint_t = t0.elapsed();
                 let h0 = Instant::now();
@@ -1073,6 +1261,10 @@ impl TextComposer {
                 let baked = draws.iter().map(|d| d.dedup_key()).collect();
                 let bytes = texture.rgba.len() as u64;
                 let texture = Rc::new(texture);
+                if image_missing {
+                    self.cache_bytes = self.cache_bytes.saturating_sub(hit.bytes);
+                    return Ok((Some(ComposedLayer { texture, hash }), stats));
+                }
                 self.cache_bytes = self.cache_bytes + bytes - hit.bytes;
                 self.cache_clock += 1;
                 self.compose_cache.insert(
@@ -1097,7 +1289,7 @@ impl TextComposer {
         let r0 = Instant::now();
         let base = resolve_base()?;
         self.frame_stats.base_ms += r0.elapsed().as_secs_f64() * 1e3;
-        let (out, stats) = self.compose_layer_refs(&base, draws, None);
+        let (out, stats) = self.compose_layer_refs_assets(&base, draws, None, images);
         let Some(texture) = out else {
             return Ok((None, stats));
         };
@@ -1112,6 +1304,9 @@ impl TextComposer {
         }
         let bytes = texture.rgba.len() as u64;
         let texture = Rc::new(texture);
+        if image_missing {
+            return Ok((Some(ComposedLayer { texture, hash }), stats));
+        }
         self.cache_bytes += bytes;
         self.cache_clock += 1;
         self.compose_cache.insert(
@@ -1273,5 +1468,115 @@ mod tests {
         assert!(text.cached_base(&layer, 8).is_none());
         text.forget_compose_cache(&layer);
         assert!(text.cached_base(&layer, 7).is_none());
+    }
+}
+
+#[cfg(test)]
+mod image_glyph_tests {
+    use super::*;
+    use yu_gfx::{LayerId, TextDraw, TextImage, TextStyle};
+
+    fn image_draw(x: i64, y: i64, tint: Option<u32>) -> TextDraw {
+        TextDraw {
+            target: LayerId::new(b"T".to_vec()),
+            bytes: Vec::new(),
+            x,
+            y,
+            style: TextStyle::default(),
+            set: 0,
+            bno: None,
+            image: Some(TextImage {
+                asset: b"g".to_vec(),
+                width: 2,
+                height: 2,
+                tint,
+            }),
+        }
+    }
+
+    #[test]
+    fn image_glyph_paints_and_tints() {
+        let mut composer = TextComposer::new();
+        let base = Texture {
+            width: 8,
+            height: 8,
+            rgba: vec![0; 8 * 8 * 4],
+        };
+        let glyph = Texture {
+            width: 2,
+            height: 2,
+            rgba: vec![255; 2 * 2 * 4],
+        };
+        let mut assets = BTreeMap::new();
+        assets.insert(b"g".to_vec(), glyph);
+        let (out, stats) = composer.compose_layer_assets(
+            &base,
+            &[image_draw(2, 2, Some(0x40_4040))],
+            None,
+            &assets,
+        );
+        let out = out.expect("composed");
+        let px = &out.rgba[((2 * 8 + 2) * 4)..((2 * 8 + 2) * 4 + 4)];
+        assert_eq!(px, [127, 127, 127, 255], "MEIDO 0x40 = 50%(整数除法)");
+        assert_eq!(&out.rgba[0..4], [0, 0, 0, 0], "图像外保持透明");
+        assert_eq!(stats.glyphs, 1);
+        assert!(!stats.diags.iter().any(|d| d.contains("missing")));
+    }
+
+    #[test]
+    fn missing_image_is_not_cached_and_retries() {
+        let mut composer = TextComposer::new();
+        let base = Rc::new(Texture {
+            width: 8,
+            height: 8,
+            rgba: vec![0; 8 * 8 * 4],
+        });
+        let layer = LayerId::new(b"T".to_vec());
+        let draw = image_draw(2, 2, None);
+        let draws = [&draw];
+
+        // 首帧:资产未到 ⇒ 缺图诊断,不写合成缓存。
+        let (out, stats) = composer
+            .compose_layer_cached_assets(
+                &layer,
+                1,
+                42,
+                (8, 8),
+                &draws,
+                None,
+                &BTreeMap::new(),
+                || Ok(Rc::clone(&base)),
+            )
+            .expect("compose");
+        assert!(out.is_some());
+        assert_eq!(stats.missing, 1);
+        assert!(composer.compose_cache.is_empty(), "缺图结果不得进缓存");
+
+        // 资产晚到:下一帧必须重烤并画上,而不是命中缺图缓存。
+        let mut assets = BTreeMap::new();
+        assets.insert(
+            b"g".to_vec(),
+            Texture {
+                width: 2,
+                height: 2,
+                rgba: vec![255; 2 * 2 * 4],
+            },
+        );
+        let (out, stats) = composer
+            .compose_layer_cached_assets(
+                &layer,
+                1,
+                42,
+                (8, 8),
+                &draws,
+                None,
+                &assets,
+                || Ok(Rc::clone(&base)),
+            )
+            .expect("compose");
+        assert_eq!(stats.glyphs, 1);
+        let out = out.expect("composed");
+        let px = &out.texture.rgba[((2 * 8 + 2) * 4)..((2 * 8 + 2) * 4 + 4)];
+        assert_eq!(px, [255, 255, 255, 255]);
     }
 }
