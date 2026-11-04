@@ -42,7 +42,7 @@
 | DIV-GFX-018 | 子窗口叠放/位置 | unimplemented | 只输出窗口状态/离屏 pass | window/host 会话 |
 | DIV-GFX-019 | 顶点 DIFFUSE RGB | **fixed(J4)** | 顶点色=`A` 灰度(asm `0x414d09..0x414d21`);以 `T·A`/`T·A+(1−C.a)` 建模,不补顶点 RGB | — |
 | DIV-GFX-020 | INFO `LET` 同步查询 | partial | `GfxHost` 已接通已取证字段 | — |
-| DIV-GFX-021 | `TEXT[ID]` 非 UTF-8 CP932 | unimplemented | 清空并报告 | 事件 ID 改字节类型 |
+| DIV-GFX-021 | `TEXT[ID]` 非 UTF-8 CP932 | **fixed** | `VmEvent::Text.id`/`TextState.layer_id` 改 `Vec<u8>`;`op_text` 不再 `from_utf8`;gfx 路径规范化 + `LayerId` 字节精确 | 合成样本(ERIS `TEXT[ID]`=0) |
 | DIV-GFX-022 | 资源图 `SX/SY` | unimplemented | 层标 Unimplemented | 真实样本确认缩放/裁剪 |
 | DIV-GFX-023 | 复制/图像日志上限 | note | 16,384 + `dropped_ops()` | — |
 | DIV-GFX-024 | `CGINFO[SX/SY]` 资源图尺寸 | partial(J3) | 图像头 provider 已落地(`GraphicsHost::note_asset_size`);组/黑图/快照/已注入资产可答,未注入资产仍 `gfx.info.asset_size` 不写 LET | PSB/E-mote 资产头 provider |
@@ -54,8 +54,10 @@
 | DIV-GFX-030 | `CG[TIDNO]` | open | 忽略并留档 | 确认是否 `TID + "." + N` |
 | DIV-GFX-031 | `CGACT ID3/ID4` 多图层、`Z2/BNO` 修饰 | partial | 四个并列图层引用(可带 `IDNO*` 后缀);`Z2` 引擎从不读取(合法无副作用),`BNO` 只被 `TEXT` 消费 | 非 TRANSITION 的多图层动作 |
 | DIV-GFX-032 | `SWAP/SWAP2` 与引擎模式 1/2 对应 | open | 当前按手册实现 | `FUN_0042f57d` 调用点确认 |
-| DIV-GFX-033 | `TEXT` 显示节奏/OUTPUTMODE/按钮 | partial(P2) | VM 记录命令事实与 `_TEXT_FLAG`(M-2);gfx 已有 `set_text_reveal` + 后端截断入口;VM reveal 查询待 H-P2-02(WAIT/CLICK 计时未取证,不用墙钟猜) | H-P2-02 |
-| DIV-GFX-034 | 文本跨帧持久 + CLEAR 传播到 gfx | **fixed(P2)** | `GfxState` 持跨帧文本缓冲;`FrameStart` 不再清空;CLEAR = 宿主同步空 `TextSnapshot`(VM `TEXT[CLEAR]` 无事件)或 `clear_text()`;`CGEND`/`CG(FILE)` 重建清目标层 | `tests/text_pipeline.rs` |
+| DIV-GFX-033 | `TEXT` 显示节奏/OUTPUTMODE/按钮 | **fixed** | `TextState.advance_reveal(now_ms)` 复刻 `+0x6c` 标志游标/`+0x48` 延迟(全角 WAIT、半角 WAIT/2);`TextSnapshot.reveal_chars` → Engine `set_text_reveal`;遇 `'C'` 停、点击 `finish_line` 提交;后端不自建计时器 | 官方行完成清空/`'P'` 清页/折行见 DIV-GFX-075 |
+| DIV-GFX-034 | 文本跨帧持久 + CLEAR 传播到 gfx | **fixed** | `GfxState` 持跨帧文本缓冲;`FrameStart` 不再清空;CLEAR = `TextSnapshot.clear_seq` 变化(空 `bytes` 不再隐式清理)或 `clear_text()`;`CGEND`/`CG(FILE)` 重建清目标层。官方 `0x4638e4` 不清图层表面,见 DIV-GFX-075 | `tests/text_pipeline.rs`, `yu-engine/tests/text_sync.rs` |
+| DIV-GFX-075 | 文本待显示行缓冲 vs 图层表面/页清屏/折行/每字符样式 | **open(已登记)** | 官方 `+0x38` 行完成清空、`'P'` 清表面、`FUN_00404c60` 宽度折行、每字符样式快照;内核为累积显示缓冲 + flag 换行 + 单样式 | 官方最小脚本 + 截图/trace(H-P2-03) |
+| DIV-GFX-076 | `CGACT[TEXT]` 与图像加工的命令序(ERIS 外字链) | **open(已定位,待主人裁决 A/B)** | 官方 `FUN_0042f809` 直接在 `[层+0x34]+0x90` 表面执行,`CGACT[TEXT]` 也写同一表面 ⇒ 命令序=像素序;内核延迟文字 + 图像加工清文字。动作类型例外不成立(RECTPAINT3/COPY/SIZE/MEIDO/MERGE 覆盖都会坏)。修复需 `TextDraw.seq` + 命令时刻烘焙(A)或后端按 seq 重放(B) | 主人拍板;真实外字页截图对照 |
 | DIV-GFX-035 | `FONT NO/BNO` 解析、GRADATION/ROTATION/PITCH/LANG、默认字体 | **partial(BNO 已定案)** | `GRADATION/ROTATION/COLOR/COLOR2/SX/SY/BOLD/AA/DRAWMODE` 全量保存 + clamp;默认值按 `FUN_00464fac`;字体身份经 `TextStyle::font_request()` 交 `yu-font`(`NAME`>`NO`→默认回退表)。**`BNO` = 文字样式槽号选择器**(REA `FUN_004039d0` 写 `[0x5d1684]`;8 槽;`CGACT[BNO]` 同源),已实现为 8 套样式 + 当前槽;PITCH/LANG 仍只留值 | H-P2-03 |
 | DIV-GFX-036 | FONTINFO 字体列表字段/未设置默认值 | partial(P2) | `COLOR/COLOR2/SX/SY/BOLD/AA/DRAWMODE/GRADATION/ROTATION` 经 `GfxHost` 写回 LET;`NAME`(未设置)/`NO` 列表/`NUM/PITCH/LANG` 仍 Unimplemented(需要系统字体列表) | `tests/info_query.rs` |
 | DIV-GFX-037 | WINDOW host 属性/主窗口 A 透明度/SX-SY 视口 | partial(no-manual) | `CAPTION/FULLSCREEN/FULLSCREENBUTTON/MAXMODE/MINMODE` 存 `WindowState` 并由 `WINDOWINFO` 读回;`MAXMODE/MINMODE` = 每窗口按钮开关(WINDOW 槽 16/17 ↔ WINDOWINFO 槽 18/19,创建时落 `WS_MIN/MAXIMIZEBOX`,REA `FUN_00457d8c`);`MENUID/REGIONID/DRAGID/FLASH/FLASHTIME` 只归类不实现 | 窗口 host + 0.495 A 语义 |
@@ -101,7 +103,8 @@
 - `crates/yu-gfx/src/text.rs`:字形栅格化/排版。
 - `crates/yu-gfx/src/transition.rs`:双纹理契约(已实现)。
 - `crates/yu-gfx/src/path.rs`:`IDNO` 十进制后缀(已按 `__itoa` 定案)。
-- `crates/yu-rt/src/vm/handlers.rs`:`TEXT` 显示节奏属性、非 UTF-8 ID。
+- `crates/yu-rt/src/vm/handlers.rs`:`TEXT` 显示节奏属性、非 UTF-8 ID
+  **已落地**(H-P2-01/02:字节 ID + `advance_reveal`;表面/页语义见 DIV-GFX-075)。
   `FILEINFO[EXIST]` 已于 J3 实现(DIV-GFX-043 fixed);FOLDER/SIZE/RELATION
   仍按手册页挂号。
 

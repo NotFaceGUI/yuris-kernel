@@ -23,7 +23,7 @@
 | 6 | 已删临时层加工链的发射 | 官方命令时刻就地写层;链的最终消费者一旦烘焙,临时层中间像素不再被读 | 934f73f 改为“仅当本帧存在未烘焙消费者才重放”;外字 `TX.GAIJI*` 每字 +3 条永久 pass 的爬升消失 | **fixed**(像素抽样 7 帧 SHA 与修复前逐位相同) |
 | 7 | 屏幕快照契约未变时跳过合成 | 契约键相等 ⇒ 命令时刻画面 == 上一呈现帧,可直接用后缓冲 | 返回 `None`,由渲染器用 backbuffer;上游 `screen_frame_for` 同样只用上一帧 | **sound**(有判定依据);保留 `last_screen` 仅作“契约未变/首帧”兜底 |
 | 8 | 已删源层被 COPY 读取时的加工链 | 官方 COPY 在命令时刻取层当前像素(含此前加工) | 复制项的 `source_texture` 只记录**基图**;源层同帧被 `CGEND` 时,渲染端回放可能丢中间加工。934f73f 的消费者闭包只覆盖图像项,不覆盖 COPY 消费者 | **open / needs evidence**: 构造“加工链 → COPY → CGEND”用例,对齐 wgpu/soft 像素后再改 |
-| 9 | 文字与图像的命令序 | `CGACT[TEXT]` 在命令位置写入层表面;后续 `MERGE2` 读取的是**含文字的层像素** | gfx 把所有图像/复制 pass 排在前,`apply_text` 统一在层末;`cgact_image` 执行后还会 `clear_layer_texts(target)` | **open**: 外字缺字段的直接嫌疑,见字体待办(不是 677/934 引入,但被这两条路径放大) |
+| 9 | 文字与图像的命令序 | `CGACT[TEXT]` 在命令位置写入层表面;后续 `MERGE2` 读取的是**含文字的层像素**(REA `FUN_0042f809` 直接读写 `[层+0x34]+0x90` 表面) | gfx 把所有图像/复制 pass 排在前,`apply_text` 统一在层末;`cgact_image` 执行后还会 `clear_layer_texts(target)` | **open(已定位,2026-11-04 实机复现)**:ERIS s135 外字页行首 `」` 之前的 `CGACT[TEXT]` 前缀被 `MERGE2` 清掉。动作类型例外不成立(`RECTPAINT3 SET=0`/COPY/SIZE/MEIDO/MERGE 覆盖都会坏);修复需按命令序烘焙/重放,见 `DIV-GFX-076` |
 
 ## 2. 残留风险(明确不当作已修)
 

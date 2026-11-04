@@ -1,9 +1,9 @@
 # H-P2-04 · 宿主每帧同步 `Vm::text_state()` 到 `GfxState`(yu-cli 一行)
 
-- 状态: **待主人裁决**(`yu-cli` 属其他任务线,本任务未改)
+- 状态: **fixed(2026-11-04;主人裁决:不重构,按现有实现统一语义)**
 - 来源: 任务 P2 §M-A/§M-D;`GfxState::sync_text_state` 的契约注释
   (`yu_rt::Vm::text_state` 已标注"宿主/gfx 桥读取")
-- 影响面: `yu-cli::engine::Engine::tick_inner`(以及任何自建宿主)
+- 影响面: `crates/yu-engine/src/engine.rs::tick_inner`(以及任何自建宿主)
 
 ## 背景
 
@@ -47,3 +47,29 @@ cargo run -p yu-cli -- <project-eris>   # 进本篇后文本可见
 # 或 headless:
 YURIS_ENTRY_LABEL=RP_101 cargo run -p yu-backend-soft --example text_probe -- 130
 ```
+
+## 落地(2026-11-04)
+
+- `TextState` / `TextSnapshot` 增 `layer_id: Vec<u8>`(权威层键)与
+  `clear_seq: u64`(CLEAR 代数);`Vm::text_layer_id: String` 删除,
+  `op_text` 直接保存 `TEXT[ID]` 原始字节。
+- `Engine::tick_inner` 在 `vm.tick_at(...)` 之后、`frame()` 之前同步:
+  `sync_text_state(&vm.text_state())` + 自动模式 `set_text_reveal(Some(reveal_chars))`。
+  快照在 VM 输入同步后取(避免 `vm` 借用跨到 `self.sync_input()`)。
+- `GfxState::sync_text_state`:
+  - 层 ID 经 `path::normalize`(`TEXT[ID]` 与 `CG[ID]` 同一套路径语义);
+  - 只在 `clear_seq` 变化时清显示层;**空 `bytes` 不再隐式当 CLEAR**;
+  - `text_layout_now` 只排当前层(旧实现取 BTreeMap 第一个非空层)。
+- 回归:`cargo test -p yu-engine --test text_sync`(2 项):
+  - `engine_manual_mode_does_not_draw_auto_text_layer`
+    (2026-11-04 实机回归:ERIS 手动模式左上角重复正文);
+  - `engine_auto_mode_reveals_and_clears_text_layer`
+    (自动层 reveal + CLEAR,含点击推进)。
+- **模式门控**:`Engine::tick_inner` 只在 `output_mode == 1` 同步自动层;
+  手动模式 `clear_text()`(官方 `FUN_004046fc` 对手动模式直接清+恢复,
+  不调用 `FUN_00404914`)。`text_probe` 仍强制同步,是合成诊断探针,
+  不代表官方手动路径。
+- 已知分歧(已登记 `DIV-GFX-075`):官方 `+0x38` 是**待显示行缓冲**,
+  行完成/手动恢复时清空且不清图层表面;内核为累积显示缓冲。`TEXT[CLEAR]`
+  的“清显示层”是内核近似,不是官方像素语义。自动模式页/行表面、折行
+  与每字符样式快照仍未对齐(详见任务书 C1/C2/C4/C6/C7)。

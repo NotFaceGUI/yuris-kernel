@@ -50,9 +50,9 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `CG` | graphics | 534 | `cg/cg.html` | `0x42a514` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `LOOPEND` | vm | 522 | `control/loopend.html` | `0x4481d8` | ✅ 实现 | 保持 |
 | `LOOP` | vm | 522 | `control/loop.html` | `0x447ef0` | ✅ 实现 | 保持 |
-| `WORD` | vm | 464 | `basic/basic.html` | `0x458d44` | ✅ 实现 | 本 600 帧未触发;静态语料有 464 处;COV-M-03 M-2:每字符写 '1'/'2' 到 _TEXT_FLAG(REA 0x458d44) |
+| `WORD` | vm | 464 | `basic/basic.html` | `0x458d44` | ✅ 实现 | 本 600 帧未触发;静态语料有 464 处;COV-M-03 M-2:每字符写 '1'/'2' 到 _TEXT_FLAG(REA 0x458d44)。**H-P2-02 补**:每字符同时快照 `+0x40` 宽/`+0x44` 高/`+0x48` 延迟;延迟 = `WAIT/(全角?1:半角?2)`(`0x458e78 idiv`) |
 | `STR` | vm | 431 | `variable/str.html` | `0x4500d8` | ✅ 实现 | 保持 |
-| `RETURNCODE` | vm | 396 | — | `0x44c390` | ✅ 实现 | 本 600 帧未触发;静态语料有 396 处;COV-M-02 M-2:自动模式追加 C/R/P,恒追加 E;让出点(REA 0x44c390 `MOV byte[task+9],1` **无条件**)。**AU5 勘误**:恢复判据分模式 —— `FUN_004046fc` `0x404711 CMP byte[state+0x1c],1` / `0x404715 JNE` ⇒ 手动(`OUTPUTMODE≠1`)**一帧即恢复、不经按钮表**;仅自动(`==1`)才读 CLICKBUTTON/SKIPBUTTON(`0x5b48ac..0x5b48bc`)。v494 同构(`0x44c20c`)。DIV-RT-035 已勘误 |
+| `RETURNCODE` | vm | 396 | — | `0x44c390` | ✅ 实现 | 本 600 帧未触发;静态语料有 396 处;COV-M-02 M-2:自动模式追加 C/R/P,恒追加 E;让出点(REA 0x44c390 `MOV byte[task+9],1` **无条件**)。**AU5 勘误**:恢复判据分模式 —— `FUN_004046fc` `0x404711 CMP byte[state+0x1c],1` / `0x404715 JNE` ⇒ 手动(`OUTPUTMODE≠1`)**一帧即恢复、不经按钮表**;仅自动(`==1`)才读 CLICKBUTTON/SKIPBUTTON(`0x5b48ac..0x5b48bc`)。v494 同构(`0x44c20c`)。DIV-RT-035 已勘误。**H-P2-02 补**:自动行尾 `C/R/P/E` 的每标志宽/高表在 `0x44c3df..0x44c42c` 写入;`+0x6c` 由 `FUN_004046fc` 按 WAIT 推进,遇 `C` 停 |
 | `F_INT` | vm | 337 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 官方默认体报「スクリプト実行エラー」(yse 0xdbbd2)+ 返回 -1;静态 337 处全在 `global_f.yst` 声明段,600 帧 0 执行(DIV-RT-043) |
 | `VARACT` | vm | 310 | `variable/varact.html` | `0x453fa8` | ✅ 实现 | 保持 |
 | `SAVE` | save | 290 | `file/save.html` | `0x44c45c` | ✅ 实现(B1) | 装存档宿主时命令时刻预约(值快照)/刷盘;`SET` 槽事件携带变量引用;未装宿主仍只发 `DomainCall`。REA 锚勘误:`0x44e1c8` 是 SAVEINFO(DIV-RT-042) |
@@ -72,7 +72,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `FONT` | graphics | 42 | `font/font.html` | `0x444428` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `LOOPCONTINUE` | vm | 40 | `control/loopcontinue.html` | `0x448144` | ✅ 实现 | 保持 |
 | `SOUND` | sound | 34 | `sound/sound.html` | `0x44e1e8` | ✅ 宿主 | `yu-sound` 已接线(§8);不装宿主时仍只发 `DomainCall` |
-| `_` | vm | 33 | `basic/basic.html` | `0x4567c0` | ✅ 实现 | 本 600 帧未触发;静态语料有 33 处;COV-M-03 M-2:式值追加文本并按字符写 '1'/'2'(REA 0x4567c0) |
+| `_` | vm | 33 | `basic/basic.html` | `0x4567c0` | ✅ 实现 | 本 600 帧未触发;静态语料有 33 处;COV-M-03 M-2:式值追加文本并按字符写 '1'/'2'(REA 0x4567c0)。**H-P2-02 补**:半角延迟 `WAIT/2`(`0x45697f sar`)、全角 `WAIT`(`0x456a8e`);控制字节折空格(`0x4568c9`) |
 | `WINDOWINFO` | window | 31 | `window/windowinfo.html` | `0x4586ec` | 🔁 部分(129 次未实现) | 主路径实现;未实现路径见 §2 |
 | `WINDOW` | window | 31 | `window/window.html` | `0x456b70` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `SOUNDINFO` | sound | 25 | `sound/soundinfo.html` | `0x44f4bc` | ✅ 宿主 | 装宿主时 `op_soundinfo` → `SoundHost::query` → LET;未装时保持 M-2 |
@@ -100,7 +100,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `FPS` | system | 2 | `system/fps.html` | `0x4457a8` | ✅ 实现 | 保持 |
 | `INPUT` | system | 2 | `system/input.html` | `0x446564` | ✅ 实现 | KEY/MOUSE/PAD 源开关;关闭时整源计数器冻结(`FUN_0041a4b8`) |
 | `SOUNDEND` | sound | 2 | `sound/soundend.html` | `0x44f308` | ✅ 宿主 | `yu-sound` 删层(§8) |
-| `TEXT` | vm | 2 | `text/text.html` | `0x453448` | ✅ 实现 | COV-M-02 M-2 重写:OUTPUTMODE/WAIT/CLICK/RETURN/PAGE/CLICKRETURN/CLICKPAGE/CLEAR/AUTO*;CLICK 自动模式让出(REA 0x453448) |
+| `TEXT` | vm | 2 | `text/text.html` | `0x453448` | ✅ 实现 | COV-M-02 M-2 重写:OUTPUTMODE/WAIT/CLICK/RETURN/PAGE/CLICKRETURN/CLICKPAGE/CLEAR/AUTO*;CLICK 自动模式让出(REA 0x453448)。**H-P2-01/04 补**:`ID` = CP932 字节,先 `FUN_004141e4` 路径规范化、再 `0x414559` MurmurHash2+逐字节查层;未命中 = `0x4538a7` 错误路径。`CLEAR` `0x453894` → `0x4638e4` 只清 `+0x60/+0x64/+0x68/+0x6c` 与十块堆数组,**不清图层表面**;`WAIT` 存 `+0x04` |
 | `MOVIEEND` | movie | 2 | `movie/movieend.html` | `0x44b9d8` | ✅ fixed | 退出影片模式:清文件名/播放位、音量重置 256,几何保留;见 DIV-GFX-074 |
 | `TASKEND` | vm | 2 | `control/taskend.html` | `0x4521dc` | ✅ 实现 | 本 600 帧未触发;静态语料有 2 处 |
 | `TRAY` | system | 2 | `other/tray.html` | `0x453a4c` | ➖ 域事件 | 托盘图标属宿主;只发 `Domain::System` 事件(DIV-RT-045) |
@@ -151,7 +151,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `SAVEINFO` | save | 0 | — | `0x44e1c8` | ⛔ 挂账(B7) | 查询处理体未取证、语料 0 次;REA 锚勘误:`0x44e1c8` 是 SAVEINFO 本体(SAVE=`0x44c45c`,B1) |
 | `SYSTEMMODE` | system | 0 | `projectconfig/systemmode.html` | `0x459e90(默认)` | ✅ 脚本错误槽 | 仅 `projectconfig.txt` 编译期有效;运行时官方默认槽报错(DIV-RT-043) |
 | `S_VAR` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;出现在 yst 即官方脚本错误(DIV-RT-043) |
-| `TEXTINFO` | vm | 0 | `text/textinfo.html` | `0x4538cc` | ✅ 实现 | 语料未使用;M-2 按手册 + REA 实现,单测覆盖(COV-M-02) |
+| `TEXTINFO` | vm | 0 | `text/textinfo.html` | `0x4538cc` | ✅ 实现 | 语料未使用;M-2 按手册 + REA 实现,单测覆盖(COV-M-02)。**H-P2-02 补**:`CLICK` 读 `+0x35`(`FUN_00404914` 遇 `'C'` 置位),`CX/CY` 读 `+0x14/+0x18` |
 | `VAR` | vm | 0 | — | `0x453f88` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
 | `WINDOWEND` | window | 0 | `window/windowend.html` | `0x45866c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `_IFDEF` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 预处理器指令;运行时同默认槽(DIV-RT-043) |
@@ -236,8 +236,12 @@ cargo run -p yu-rt --example coverage_census -- 600 8
   (2026-10-24):`ArgValue.reference`(白名单槽:SAVE[SET]/LOAD[LET]/
   FILEINFO[LET]/SOUNDINFO[LET]);宿主另有 `SaveHost` 同步契约(预约/刷盘/
   拉取),三条存档命令不再依赖异步事件做语义。旧 trace 缺字段按 `None` 读。
-- `VmEvent::Text.id` 仍是 UTF-8 `String`;非 UTF-8 CP932 ID 保持空并
-  挂号(DIV-GFX-021)。修复需要改事件字段类型,跨 crate 契约变更。
+- ~~`VmEvent::Text.id` 仍是 UTF-8 `String`;非 UTF-8 CP932 ID 保持空并
+  挂号(DIV-GFX-021)。~~ **H-P2-01 已解决(2026-11-04,方案 B)**:
+  `VmEvent::Text.id` / `TextState.layer_id` = `Vec<u8>`;gfx 路径规范化 +
+  `LayerId` 字节匹配;trace schema 5 的 `id` 用可逆字节编码。
+  H-P2-04 的层 ID/CLEAR 代数与 H-P2-02 的 reveal 游标见
+  `docs/tasks/task-text-auto-pipeline.md`;官方表面/页语义见 DIV-GFX-075。
 
 ## 6. 台账索引
 

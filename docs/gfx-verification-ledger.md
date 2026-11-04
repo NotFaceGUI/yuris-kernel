@@ -186,8 +186,8 @@ D6/D7/D10/D11/D12/D13 外,其余按“Confirmed → 修复/保持”处理
 | DIV-GFX-030 | `CG[TIDNO]` 未处理 | 真实 ysc 表有 `TIDNO`;其与 `TID` 的组合规则未重新锚定 | 原样留档 + Unimplemented |
 | DIV-GFX-031 | `CGACT ID3/ID4` 多图层、`Z2/BNO` 修饰 | REA:`ID/ID2/ID3/ID4` 是四个并列图层引用(`0x42c4ed/0x42c622/0x42c6df/0x42c798`);`Z2` 下标 8 **无读取点**;`BNO` 只被 `TEXT` 消费 | `Z2` 静默接受;非 TRANSITION 的 ID3/ID4 仍挂号 |
 | DIV-GFX-032 | `SWAP/SWAP2` 与引擎模式 1/2 对应 | `FUN_0042f57d` 已读,但调用点模式值未逐项确认;现按手册实现 | 保持 Likely,不改 |
-| DIV-GFX-033 | `TEXT OUTPUTMODE/WAIT/RETURN/PAGE/CLICK/AUTO*/BUTTON` | 手册 `text/text.html` 有页;属显示节奏/宿主输入 | 只记录事实,未实现 |
-| DIV-GFX-034 | 文本跨帧持久 + `TEXT[CLEAR]` 传播到 gfx | `GfxState` 每帧清空 `text`;VM 的 CLEAR 未变成 gfx 事件 | Unimplemented(当前无文本栅格化,暂不可见) |
+| DIV-GFX-033 | `TEXT OUTPUTMODE/WAIT/RETURN/PAGE/CLICK/AUTO*/BUTTON` | 手册 `text/text.html`;REA `FUN_004046fc`/`FUN_00404914` 逐指令复核 | **fixed**:`advance_reveal(now_ms)` 按 `+0x48` 每字符延迟推进(全角 WAIT、半角 WAIT/2),`'C'` 停、点击 `finish_line`;官方页/表面见 DIV-GFX-075 |
+| DIV-GFX-034 | 文本跨帧持久 + `TEXT[CLEAR]` 传播到 gfx | REA `0x4638e4`:只清 `+0x60..+0x6c` 与十数组,不清图层表面 | **fixed**:跨帧 `TextBuffer`;空 `bytes` 不再隐式当 CLEAR;官方表面语义见 DIV-GFX-075 |
 | DIV-GFX-035 | `FONT NO/BNO` 解析、GRADATION/ROTATION/PITCH/LANG、默认字体 | 手册只覆盖 NO/NAME 等;默认字体/颜色/AA 无一手证据 | 保存原值;解析归 `yu-font` |
 | DIV-GFX-036 | FONTINFO 字体列表字段/未设置默认值 | `NUM/LANG/...` 需安装字体列表;COLOR2/NAME 未设置默认值未取证 | 不写 LET |
 | DIV-GFX-037 | WINDOW host 属性、主窗口 A 透明度/SX-SY 视口 | 手册 `window/window.html`;0.495 的 A 是否仍仅显隐未实测 | 只消费 CGID/E/A 显隐 |

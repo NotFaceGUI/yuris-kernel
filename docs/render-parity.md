@@ -44,7 +44,7 @@
 | 6 | 多部件层 / `FILE` 探测 / 1×1 黑 | `cg/cg.html`:「FILE="" で1x1サイズの黒画像生成」「拡張子…「.PNG」「.BMP」「.JPG」「.GIF」の順」 | ERIS 首屏 552 次 `FILE`(`FILE=""` 与 `cgsys/...` 资产);源 `CG[FILE=...]` | `FUN_0040c9b4`(`0x40c9b4`)按 `yscfg+0x1c` 码探测:`1→.png,2→.bmp,3→.jpg,4→.gif,5→.psb`;多部件 `+0xa6/+0xa7` 计数、`+0xb0/+0x130` 两表(`FUN_00414ba4` 155-156/200/219/985) | `FILE`/扩展名 Confirmed;多部件几何 Unimplemented(DIV-GFX-004) |
 | 7 | 组/离屏/COPY | `cg/cg.html`:「レイヤセット…レイヤ合成したもの」「COPY キーワード…複製（スクリーンショット機能）」;`basic/layer.html`:`CG[ID=ABC/ ...]`、`CGACT[COPY2=1 ID=:/W0/ ID2=TMP]` | ERIS 首屏 `CG[ID=":/W3/" SX=..]`、`CGACT[COPY2=1 ID=:/W0/ ID2=CGS100]` | `FUN_00413dc8` 行 34-36(递归)、51-102(调试 RT/`+0x61c`);`FUN_00462e40`(离屏创建族);`FUN_0043cd6c` 行 118-169(帧末读回) | 机制 Confirmed;主组直绘已实现(DIV-GFX-008);COPY 时序/区域/冻结已实现(DIV-GFX-007);**首帧主组 COPY 无后缓冲源仍 open(DIV-GFX-051)** |
 | 8 | 过渡 T/TA/TID | `cg/cg.html`:「T=トランジション進行度」「TA=精度」「TID=トランジションレイヤID」 | ERIS 源 `T/TID/TA` 少量(首屏 0 次);`TID=""` 用于结束过渡(`es_Button.yst:4526/4540`、`es_Sprite.yst:4238`) | `FUN_00414ba4` 行 166-188(TA<1 门控)、881-971(`YS_Texture1/2`、`YS_FadeVal` 公式 905-909、`YS_FadeVal2`);`FUN_00413dc8` `0x413e7b`:TID 空串直接跳过配对查询,非空才 `FUN_004141e4`+`FUN_00414559` | 公式 Confirmed;**TID 空串=无配对 Confirmed**;推进者仍未定位(DIV-GFX-006) |
-| 9 | 文本 | `font/font.html`:NAME/NO/COLOR/COLOR2/SX/SY/BOLD/ANTIALIASING/DRAWMODE;`text/text.html`:ID/OUTPUTMODE/CLEAR/…;`font/fontinfo.html` | ERIS 首屏 `FONT` 3 次;`TEXT[OUTPUTMODE=0]`(`es_First.yst:22`)、`TEXT[CLEAR=1]`(`es_Text.yst:154`)、`FONT[NO/BNO]` | 文本为引擎内部绘制种类 98/100(旧线 03 §1,REA 复用绘制函数);`TextStyle` 现保存 NO/BNO,`TEXT[ID]` 进入后续 `VmEvent::Text.id`,`CLEAR` 清 VM 文本缓冲 | 属性模型 Confirmed;字形栅格化/定位 Unimplemented(DIV-GFX-012);非 UTF-8 TEXT ID 见 DIV-GFX-021 |
+| 9 | 文本 | `font/font.html`:NAME/NO/COLOR/COLOR2/SX/SY/BOLD/ANTIALIASING/DRAWMODE;`text/text.html`:ID/OUTPUTMODE/CLEAR/…;`font/fontinfo.html` | ERIS 首屏 `FONT` 3 次;`TEXT[OUTPUTMODE=0]`(`es_First.yst:22`)、`TEXT[CLEAR=1]`(`es_Text.yst:154`)、`FONT[NO/BNO]` | 文本为引擎内部绘制种类 98/100(旧线 03 §1,REA 复用绘制函数);`TextStyle` 保存 NO/BNO;`TEXT[ID]`/`VmEvent::Text.id` 为 CP932 字节(2026-11-04 fixed,DIV-GFX-021);`CLEAR` 清 VM 文本缓冲,`FUN_004046fc` 按 WAIT 推进 reveal | 属性模型/字形栅格化 Confirmed(DIV-GFX-012 fixed);行距/基线见 056;官方表面/页清屏/折行见 DIV-GFX-075 |
 | 10 | 颜色空间 | 无手册页 | 官方截图未采集 | 反编译全树无 `D3DRS_SRGBWRITEENABLE`(state 194)调用;D3D9 默认在存储值空间混合 | Likely:8-bit sRGB 编码存储、gamma 空间混合(DIV-GFX-009) |
 | 11 | `CGACT` 图像加工 | `cg/cgact.html`:SIZE/SIZE2/ROTATION/TRIM/RESIZE/SAIDO/MEIDO/AKARUSA/MONO/REVERSE/MOSAIC/BLUR/DIFFUSION/RASTER*/RECTPAINT* | ERIS 首屏 `RECTPAINT*` + `SET/SET2`;源 `CGACT[SIZE/REVERSE/HORIZONTAL]` | 动作分派 `FUN_0042f809`(`0x42f809`,按 AL=动作码;`0x42d5fb` 等 25 个调用点);RECTPAINT/2/3 处理体 `FUN_0043185c`(`0x43185c`)模式 1/2/3;RESIZE 几何 `FUN_0043c971`(`w+X+X2-1`,`h+Y+Y2-1`);其余像素算法未定位 | 参数/命令 Confirmed;`RECTPAINT/2/3`(EVID-J-02..05)、`REVERSE`/`HORIZONTAL`(EVID-T-13)、`SIZE`/`SIZE2`(EVID-J3-04)已实现并逐像素对拍;`ROTATION/TRIM/RESIZE/MONO/BLUR*` 仍 Unimplemented(DIV-GFX-013) |
 | 12 | `WINDOW` 域 | `window/window.html`:NO=0 主窗口/CGID 显示图层组/E 显示隐藏/A(β4 仅显隐)/X/Y/SX/SY;`windowend.html`:不能删主窗口 | `es_First.yst:97/98/140`、`es_ERIS.yst:22`(子窗口 CGID) | `yu-rt` 发 `Domain::Window`;gfx 消费主窗口状态,Screen pass 用 `CGID` 与 `E/A`;子窗口状态输出给 host | Confirmed;主窗口 gfx 消费,叠放归 host(DIV-GFX-018) |
@@ -430,11 +430,16 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 - `FONT` 属性来自手册 `font/font.html`;`NO` 保存字体列表序号;
   `BNO` 无手册页(真实脚本只用于调试槽),保存原值并挂
   `gfx.text.unsupported`。
-- `TEXT[ID]` 由 `yu-rt` 保存并写入后续 `WORD`/`_` 的
-  `VmEvent::Text.id`;`TEXT[CLEAR=1]` 清空 VM 文本缓冲。WAIT/RETURN/
-  PAGE/CLICK/AUTO*/BUTTON 属显示节奏/宿主输入,不伪造。
-- 事件 `id` 是 `String`;非 UTF-8 的 CP932 ID 不做有损替换,清空并显式
-  报告(DIV-GFX-021)。
+- `TEXT[ID]` 由 `yu-rt` 保存原始字节并写入后续 `WORD`/`_` 的
+  `VmEvent::Text.id`;`TEXT[CLEAR=1]` 清 VM 文本缓冲并递增
+  `TextSnapshot.clear_seq`。官方 `FUN_004046fc` 按 `TEXT[WAIT]` 逐字推进
+  (`+0x6c` 标志游标),已实现;手动模式不自动绘制。
+- 事件 `id` 是 `Vec<u8>`(CP932 等原始字节);官方按
+  `FUN_004141e4` 路径规范化 + `FUN_00414559` 逐字节查层,不做 UTF-8
+  转换(2026-11-04 fixed,DIV-GFX-021)。
+- 官方 `TEXT[CLEAR]`(`0x4638e4`)只清待显示缓冲,不清图层表面;
+  `'P'` 才清表面,自动模式默认一行一页。内核以累积显示缓冲近似,
+  差异见 DIV-GFX-075。
 - `FONTINFO`/`CGINFO`/`WINDOWINFO` 的 `LET`:已实现
   `yu_rt::event::GraphicsHost` + `yu_gfx::GfxHost` 同步链路。`Vm` 在产生
   图形/窗口/文本/帧事件时**同步**送入 `GfxState`,`INFO` 命令在脚本执行期

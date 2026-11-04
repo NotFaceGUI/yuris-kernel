@@ -129,7 +129,8 @@ fixed(现 Likely 项全部定论)。
 |---|---|---|
 | TASK[TEXTPOS/RESTART]、序号>35 | `0x4506f4` | ✅ fixed(no-manual):RESTART 已实现(`0x450c46/0x450c55`);TEXTPOS(槽 36)官方无分支 → 对齐 no-op(DIV-RT-015) |
 | TASKINFO 序号>19 | `0x4523fc` | ✅ fixed(no-manual):A(4)/FILE0/FILENO0/LINE0/TEXTLINE/NEXTVOICE 已实现;FILENO0→SCRIPTPOS fallthrough;SCRIPTPOS 引擎字节格式(`0x452a54`/`0x450fe0`);GOLABEL/GOSUBLABEL/TEXTPOS 官方无分支 → no-op(DIV-RT-025) |
-| TEXT[ID] 事件字节契约 | `VmEvent::Text.id → Vec<u8>`(跨 yu-trace/gfx) | DIV-GFX-021、H-P2-01 |
+| TEXT[ID] 事件字节契约 | `VmEvent::Text.id → Vec<u8>`(跨 yu-trace/gfx) | ✅ fixed(2026-11-04,方案 B):`id: Vec<u8>` + `TextState.layer_id`;trace schema 5;DIV-GFX-021、H-P2-01 |
+| TEXT 自动层宿主同步 / WAIT reveal | `Engine::tick_inner` + `FUN_004046fc` | ✅ fixed(内核显示模型):H-P2-04/H-P2-02;表面/页语义见 DIV-GFX-075 |
 | DIALOG 扩展参数族(STR2..8/A/E/CHECK*/FILEOPEN/FOLDER/CHECKBOX/SLIDER/NOWAIT) | `0x43fc74` + 手册 dialog.html(宿主框接 B7) | DIV-RT-044 残项归零 |
 | FILEINFO FOLDER/SIZE/RELATION | `0x44286c` | — |
 | VARINFO STRTYPE/SJISCODE/UTF8CODE | `0x456050` handler;STRTYPE 分支 `0x4563b7` | ✅ fixed(no-manual):首字符字节宽 1/2;SJISCODE/UTF8CODE 官方零引用 → no-op(DIV-RT-011) |

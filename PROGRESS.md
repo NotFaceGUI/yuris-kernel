@@ -12651,3 +12651,144 @@ gfx overlay 1 项)。
   `cargo build --workspace --all-targets` 通过。
 - 待办:`\MOVIE(...)` 宏路径的 es 影片态调度(`docs/tasks/roadmap-batches.md`
   B14「待办」+ DIV-GFX-074 §7);脚本侧绕行见同处。
+
+## 成果 TEXT-PIPELINE (2026-11-04) · 文本三缺口:H-P2-04 宿主同步 / H-P2-01 字节 ID / H-P2-02 reveal
+
+**取证**:官方 0.495 `yu-ris.exe`(sha256 `4f5eefa3…`,Ghidra 12.1.4)
+逐指令复核 `TEXT 0x453448`、`WORD 0x458d44`、`_ 0x4567c0`、
+`RETURNCODE 0x44c390`、`TEXTINFO 0x4538cc`、`FUN_004046fc`/`00404914`/
+`00404c0c`/`00404c60`、`FUN_004638e4`、`FUN_00414559`;手册
+`text/text.html`/`textinfo.html`/`basic/svariable.html`。详见
+`docs/tasks/task-text-auto-pipeline.md`。
+
+**勘误(与旧任务书假设相反)**:
+- `+0x6c` 是 `_TEXT_FLAG` 消耗游标(含控制标志),`+0x68` 才是文本字节
+  游标;已显字符数 = 前缀 `'1'/'2'` 个数。
+- `TEXT[WAIT]` 是每字符毫秒:`WORD 0x458e78 idiv` / `_ 0x45697f sar` ⇒
+  **全角 = WAIT,半角 = WAIT/2**;时间源 `timeGetTime()`(0x404c21),
+  `last += delay`,u32 回绕;一字之首立即显示(`+0x68==0` 门)。
+- `TEXT[CLEAR]`(`0x453894`→`FUN_004638e4`)只清 `+0x60/+0x64/+0x68/+0x6c`
+  与十块堆数组,**不清图层表面**;`'P'`(`FUN_00404914` case `0x50/0x70`)
+  才清表面。默认 `AUTOPAGE=1` ⇒ 自动模式一行一页。
+- `TEXT[ID]` 是 CP932 字节:先 `FUN_004141e4` 路径规范化,再
+  `FUN_00414559` MurmurHash2 + 逐字节查层;未命中 = `0x4538a7` 错误,
+  不自动建层。无 UTF-8 校验。
+- 手动模式 `FUN_004046fc` 直接清+恢复,不调用 `FUN_00404914`
+  (无引擎自动绘制);ERIS 真实正文走 `CGACT[TEXT]`。
+
+**H-P2-04(主人裁决:不重构,按现有实现统一语义)**:
+- `TextState`/`TextSnapshot` 增 `layer_id: Vec<u8>`、`clear_seq: u64`;
+  删除 `Vm::text_layer_id: String`。
+- `GfxState::sync_text_state` 用快照层 ID(`path::normalize`,与 `CG[ID]`
+  同语义);只有 `clear_seq` 变化才清层;**空 `bytes` 不再隐式当 CLEAR**;
+  `text_layout_now` 只排当前层(旧实现取 BTreeMap 首个非空层)。
+- `Engine::tick_inner` 在 `vm.tick_at` 后、`frame()` 前同步;
+  **仅 `output_mode == 1`** 同步自动层 + `set_text_reveal`;
+  手动模式 `clear_text()`。实机回归(2026-11-04):ERIS 手动模式曾在
+  左上角 `(0,0)` 多画一行正文——宿主无条件同步 `_TEXT` 到自动层,
+  而官方手动模式不调用 `FUN_00404914`;已按模式门控修掉,新增
+  `engine_manual_mode_does_not_draw_auto_text_layer`。
+- 新增 `crates/yu-engine/tests/text_sync.rs`:手动模式不得出现自动层;
+  自动模式用合成 `CG[ID=MSG]` + `TEXT[ID=MSG]` + 两行 `WORD` +
+  `RETURNCODE` + `TEXT[CLEAR]` 走真实 `Engine::tick()` + 点击输入,
+  逐 tick 断言 reveal 与 CLEAR。
+
+**H-P2-01(主人拍板方案 B)**:
+- `VmEvent::Text.id: Vec<u8>`;`op_text` 直接保存 `TEXT[ID]` 字节。
+- gfx 事件/快照层 ID 都规范化后按字节命中;trace `Payload::VmText.id`
+  改 `Vec<u8>`,JSON 用可逆字节编码;`SCHEMA_VERSION` 4→5。
+- 回归:`fixture::text_id_keeps_cp932_bytes_without_utf8_conversion`;
+  `text_pipeline::non_ascii_text_layer_id_targets_exact_layer`
+  (CP932 `0x82A0` + 非法 CP932 `0xFFFE`);trace roundtrip `0x82A0`。
+- golden `synthetic_frame.jsonl` 重生成:schema 4→5;另因 `dfa7b0b` 改过
+  合成命令表后 HEAD golden 未刷新,`ysc.ybn`/`yscom.ycd` 的 bytes/sha256
+  一并校正(其余记录不变;该 golden 无 text 事件)。旧 trace 按协议以
+  `trace.schema` 拒绝。
+
+**H-P2-02**:
+- `TextState` 复刻 `+0x6c`/`+0x68`/`+0x48`:`advance_reveal(now_ms)`、
+  `finish_line()`、`line_complete()`;`Vm::tick_at` 只在
+  `Scheduler::text_waiting()` 时推进;调度器 gate 增
+  `text_reveal_complete`(无 `'C'` 的自动行无需输入即可恢复)。
+- 回归:`text::tests::reveal_uses_full_half_delays_and_resets_on_clear`、
+  `manual_mode_does_not_advance_reveal`;
+  `fixture::text_reveal_advances_by_wait_and_full_half_delay`
+  (WAIT=15:A=7ms、あ=15ms)、`text_reveal_autoclick_off_resumes_without_input`;
+  soft `reveal=0` 不画;wgpu `reveal=1` 两端各 1 glyph。
+
+**外字取证(未修,2026-11-04)**:
+- ERIS s11 `es_font.yst` 外字链:`CGACT[TEXT]` 画前缀 →
+  `CG[FILE=g01_48]` → `CGACT[SIZE2]` → `CGACT[MEIDO]` → 多次
+  `CGACT[MERGE2]` 叠进文本层 → 继续 `CGACT[TEXT]` 后缀(s135 文本)。
+- 官方 `FUN_0042f809` 一进来取 `[层+0x34]+0x90` 层表面,直接在表面执行
+  图像加工并换新表面;`CGACT[TEXT]` 通过 `FUN_004056b8` 写同一表面 ⇒
+  **命令序 = 像素序**,官方没有“待合成文字列表”。
+- 内核把文字延迟到层末合成,并在图像加工时 `clear_layer_texts(target)`
+  保守清文字;外字页 `MERGE2` 清掉了 `」` 之前的 `CGACT[TEXT]` 前缀
+  (2026-11-04 实机截图复现)。
+- **动作类型例外不成立**:`RECTPAINT3 SET=0`(BT.CGCLEAR)/COPY 整面/
+  SIZE/RESIZE/TRIM/ROTATION/MEIDO/BLUR*/MERGE 覆盖分别要求“清文字”
+  或“文字随表面变换/被覆盖”;已撤销 `MERGE2` 例外补丁。
+- 正确修复:`TextDraw.seq` + 命令时刻烘焙(A,gfx↔renderer 端口)或
+  后端按 seq 重放(B);等主人拍板。档案 `DIV-GFX-076`,同时更新
+  `DIV-GFX-072` §9。
+
+**验证命令与结果**:
+
+```text
+$ cargo build --workspace --all-targets
+    Finished `dev` profile ... 0 warning
+
+$ cargo test -p yu-rt --test fixture text_
+    test result: ok. 13 passed; 0 failed; 0 ignored
+
+$ cargo test -p yu-gfx --test text_pipeline
+    test result: ok. 13 passed; 0 failed; 0 ignored
+
+$ cargo test -p yu-engine --test text_sync
+    test result: ok. 2 passed; 0 failed; 0 ignored
+
+$ cargo test -p yu-backend-soft --test render text
+    test result: ok. 8 passed; 0 failed; 0 ignored
+
+$ cargo test -p yu-backend-wgpu --test wgpu text_layout_frames_match_soft_exactly
+    test result: ok. 1 passed; 0 failed; 0 ignored
+
+$ cargo test -p yu-trace --test golden
+    test result: ok. 2 passed; 0 failed; 0 ignored
+```
+
+**语料/跳过计数**:
+- `<project-eris>` 141 脚本:`TEXT` 2 组(`CLEAR` 1、`OUTPUTMODE` 1)、
+  `TEXTINFO` 0、`TEXT[ID]` **0**、`WAIT` **0**(`census_params` 实测);
+  `TEXT[ID]`/非 ASCII ID/WAIT 曲线全部为**合成样本**,已在测试注释标注。
+- 商业包语料不可用(`<games>` 不存在),无法证明真实工程是否使用非 ASCII
+  `TEXT[ID]`;REA 已证明字节语义本身。
+
+**已知非本轮红(不掩盖)**:
+- `yu-host-android --test session runs_real_corpus_and_emits_frames`:
+  本机无音频端点,HEAD 同样失败(`docs/tasks/task-b14-ymv.md` 已记)。
+- `yu-sound --test state gated_ogg_*` 在设 `YURIS_SAMPLE_SDK0495` 时失败
+  (装载当帧解码 67008 / 循环回绕未 seek);未设时 4 个 gated 用例显式
+  SKIP。与本轮文本改动无关。
+- `yu-format --test yssd_roundtrip`:live `<project-eris>/save` 已被官方 exe
+  改写(`save50001.sd` → `save00001/save30002`);用
+  `YURIS_SAVE_CORPUS=<save-backup-.../root>` 可全绿。
+- wgpu `diffusion_permutes_blocks_on_gpu_and_matches_soft` 并行全量跑偶发
+  1 像素差,单独重跑通过(非文本路径)。
+
+**推送前审查(2026-11-04)**:
+- 外字命令序烘焙(A)试接后已整体回退:真实主文本层是隐藏哨兵坐标/空基图,
+  烘焙移走待合成文字后整块文本框空白;回退后 desktop wgpu 截图恢复
+  「それではまず、背景を拡大してみます。」。详见 `DIV-GFX-076` §6。
+- 删除临时 `YURIS_TRACE_TEXT_OPS` 诊断钩子;gfx 只剩正式行为改动。
+- `crates/yu-trace/SCHEMA.md` 升至 schema 5,补 `vm/text.id` 字节编码说明;
+  `DIV-GFX-021/033/034` 台账状态标签统一为 `fixed`。
+- 复审结论:生产代码无未锚定魔数;WAIT 全/半角、CLEAR 代数、ID 路径
+  规范化均有 REA 锚点;剩余差异(页清屏/折行/每字符样式/光标)已登记
+  `DIV-GFX-075`,不伪装为已对齐。
+
+**台账**:`DIV-GFX-021/033/034` 更新,新增 `DIV-GFX-075`(待显示缓冲 vs
+图层表面/页清屏/折行/每字符样式);H-P2-01/02/04 交接件、
+coverage-matrix TEXT/WORD/`_`/RETURNCODE/TEXTINFO 行、render-parity
+文本节、gfx-unimplemented-todo 同步勘误。**未执行任何 git 写操作。**

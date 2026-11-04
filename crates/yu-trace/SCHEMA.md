@@ -1,4 +1,4 @@
-# yu-trace 记录格式(schema 4)
+# yu-trace 记录格式(schema 5)
 
 > 本文件是本 crate 协议的**唯一定义**。`docs/oracle.md` 是方法论草案,冲突以本文件为准
 > (差异见文末)。任何字段增删或语义变化都必须递增 `schema` 并在此留痕。
@@ -16,12 +16,12 @@
 ## 2. 封套(固定六字段,顺序固定)
 
 ```json
-{"schema":4,"seq":0,"frame":42,"sub":"vfs","kind":"open","payload":{...}}
+{"schema":5,"seq":0,"frame":42,"sub":"vfs","kind":"open","payload":{...}}
 ```
 
 | 字段 | 类型 | 含义 |
 |---|---|---|
-| `schema` | u32 | 协议版本,当前 `4`。未知版本 = `trace.schema`(Fatal,拒绝猜测)。v3 及更早文件不迁移、直接拒绝。 |
+| `schema` | u32 | 协议版本,当前 `5`。未知版本 = `trace.schema`(Fatal,拒绝猜测)。v4 及更早文件不迁移、直接拒绝。 |
 | `seq` | u64 | 从 0 起严格连续递增,是**同一 producer 内**录制顺序的唯一序;不按时间排序。跨 producer 对齐不得使用 `seq`。 |
 | `frame` | u64 \| null | 逻辑帧号;边界①在帧外(启动链)为 `null`;边界②/③必为整数。 |
 | `sub` | string | `meta` / `vfs` / `vm` / `frame`;`platform` 为 ④ 保留。 |
@@ -37,7 +37,7 @@
 5. `frame = null` 只允许 `meta` 与 `vfs`;
 6. 未知字段、未知 kind、未知 sub、未知 jump/domain/level/mode 字符串 = `trace.schema`;
 7. 缺字段、类型不符 = `trace.parse`;
-8. ④ `platform` 子系统的记录在 schema 4 中仍被拒绝(平台后端未定义);
+8. ④ `platform` 子系统的记录在 schema 5 中仍被拒绝(平台后端未定义);
 9. ③ `frame_description` 的封套 `frame` 与 payload `frame` 必须相等。
 
 ## 3. 通用值编码
@@ -215,7 +215,8 @@
 {"id":"","bytes":"…"}
 ```
 
-`bytes` 为 CP932 原始字节(§3 字节串编码)。
+`id` 与 `bytes` 都是 CP932 原始字节(§3 字节串编码)。`id` 是 `TEXT[ID]`
+指定的文本层键,官方按字节哈希 + 逐字节比较查层,不能先转 UTF-8/字符串。
 
 #### `kind = "return_code"`
 
@@ -256,7 +257,7 @@
 {"code":"rt.cmd.unknown","detail":"…"}
 ```
 
-### 4.4 `frame` 子系统(边界③,schema 4 实现)
+### 4.4 `frame` 子系统(边界③,schema 5 实现)
 
 #### `kind = "frame_description"`
 
@@ -352,7 +353,7 @@ repeat for frame in 0..frames:
 | `expected` / `actual` | 该位置的值;缺失字段一侧为 `null` |
 
 - 不做容差、归一化、模糊匹配;唯一例外是 header 中显式 `"volatile":true` 的字段——
-  schema 4 **没有**此类字段。
+  schema 5 **没有**此类字段。
 
 ### 6.2 逻辑对齐 diff(`diff_aligned` / `diff_aligned_logs`)
 
@@ -393,7 +394,7 @@ repeat for frame in 0..frames:
 `TraceRecorder`(ring 模式)保留最近 N tick 的 {命令流摘要, Diag, 输入,
 frame_description};`dump_on_fault(path)` 原子写出两份文件:
 
-1. `<path>`:schema 4 trace。header 的 `input` 摘要与 `clock` 序列按**故障帧**
+1. `<path>`:schema 5 trace。header 的 `input` 摘要与 `clock` 序列按**故障帧**
    重算;`producer.sample_sha256` 由宿主机在启动时写入。记录来自 ring:
    保留 tick 的 `vm/diag`、`frame/frame_description`、失败的 vfs 读取;
    启动链(帧外)vfs 记录按 `max_boot_records` 保留。
@@ -401,7 +402,7 @@ frame_description};`dump_on_fault(path)` 原子写出两份文件:
    `TraceLog::parse`)。包含故障类别/原因、每 tick 摘要(命令摘要、事件摘要与
    种类计数、Diag、输入、frame_description 摘要)、**原始输入时间线**与 clock。
 
-为什么时间线在伴生文件:schema 4 没有"原始输入值"字段;为了不把工具级数据
+为什么时间线在伴生文件:schema 5 没有"原始输入值"字段;为了不把工具级数据
 塞进记录协议(会让所有 producer 跟着变),原始时间线只放在 dump 伴生文件。
 `FaultDump::read` 校验 `trace_sha256`、manifest producer、header input 摘要,
 任一不符 = `trace.schema`。
@@ -444,6 +445,7 @@ ring 必须在第一 tick 前挂上;若 mid-run 才挂、或 tick 被容量淘�
 
 | schema | 日期 | 变更 |
 |---|---|---|
+| 5 | 2026-11-04 | 文本层 ID 字节化:`vm/text` 的 `id` 从 UTF-8 JSON 字符串改为与 `bytes` 同一可逆字节编码;`VmEvent::Text.id` 为 CP932 原始字节(REA `0x414559` 按字节查层)。v4 文件直接拒绝。 |
 | 1 | 2026-10-19 | 初版:边界①(vfs open/exists/list)、边界②(全部 13 个 `VmEvent` 变体)、header、严格 diff |
 | 2 | 2026-10-19 | 审查修订:header 补全启动配置(`script_key`/`debug_mode`/`argv` 摘要)与宿主注入项(`screen_color`/`media_readonly`/`os_sound`/`dx_mode`/`paths` 摘要),使"用 header 重跑"可闭合;输入摘要改为覆盖 VM 实际消费的帧 `[1, 1+N)`;`trace.length`、`trace.replay` 单列;`vfs/list` 失败态强制 `entries` 为空 |
 | 4 | 2026-10-23 | 回放闭包:header `boot.host` 增加 `window_init_pos`(`@_WINDOW_INIT_POS`)与 `rng_seed`(MT19937 种子);两者都是宿主注入且影响脚本行为,不记录就无法重放。③ 帧描述增加显式字段投影策略(`FrameFieldPolicy::Screen`),屏幕级跨 producer 不再比较占位计数;新增故障快照(fault dump,工具级伴生文件)。v3 文件直接拒绝。 |

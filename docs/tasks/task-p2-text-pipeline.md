@@ -89,7 +89,10 @@ cargo test --workspace
 - H-P2-01:`VmEvent::Text.id` 为 UTF-8 `String`,非 UTF-8 CP932 ID 被清空
   (DIV-GFX-021,coverage-matrix §5):需改事件字段类型(字节),跨 crate
   契约变更 ⇒ 等主人裁决,本任务只保证模型不丢字节(留 raw 备用);
+  **后续(2026-11-04)已按方案 B 落地**:`id: Vec<u8>`,见
+  `H-P2-01-text-id-bytes.md` 与 `task-text-auto-pipeline.md`;
 - H-P2-02:VM 侧 reveal/已显字符数查询 API(若 M-D 需要);
+  **后续(2026-11-04)已落地**:`TextSnapshot.reveal_*` + `advance_reveal`;
 - H-P2-03:官方文本窗口截图对拍(oracle 挂账,YSCom attach 恢复后做)。
 
 ## 5. 停止/上报条件
