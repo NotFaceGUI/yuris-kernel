@@ -534,7 +534,7 @@ mod tests {
             },
             VmEvent::Text {
                 frame: 1,
-                id: String::new(),
+                id: Vec::new(),
                 bytes: b"abc".to_vec(),
             },
             VmEvent::Fps {

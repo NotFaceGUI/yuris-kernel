@@ -1152,6 +1152,10 @@ impl Engine {
         // 的光标与脚本看到的一致(引擎同时 SetCursorPos)。
         let warp = vm.input_state_mut().take_cursor_warp();
         let (cursor_x, cursor_y) = vm.input().cursor();
+        // 文本状态快照在本 tick 的 VM 语义全部结束后取(之后只同步宿主
+        // 光标/事件,不再改 VM 文本);放到这里也避免 `vm` 借用跨到
+        // `self.sync_input()`/`self.sync_movie_overlay()`。
+        let text_snapshot = vm.text_state();
         if let Some((x, y)) = warp {
             self.cursor = (x.unwrap_or(cursor_x), y.unwrap_or(cursor_y));
             self.sync_input();
@@ -1197,6 +1201,30 @@ impl Engine {
             }
         }
         self.sync_movie_overlay();
+        // 文本缓冲必须每逻辑帧在**本 tick 最后一条 Text/CLEAR 之后、
+        // frame() 之前**同步。证据:手册 `text/text.html`;REA
+        // `FUN_004046fc`(每帧推进)`0x4046fc`、`TEXT[CLEAR]` `0x453894`
+        // → `FUN_004638e4`。
+        {
+            let state = self
+                .state
+                .as_ref()
+                .ok_or_else(|| Failure::runtime("engine 未启动"))?;
+            let mut gfx = state.borrow_mut();
+            if text_snapshot.output_mode == 1 {
+                // 自动模式:引擎自己绘制 `+0x38`;按 WAIT 逐字推进
+                // (`FUN_004046fc`/`FUN_00404914`),宿主/后端不自建计时器。
+                gfx.sync_text_state(&text_snapshot);
+                gfx.set_text_reveal(Some(text_snapshot.reveal_chars));
+            } else {
+                // 手动模式:官方 `FUN_004046fc` 直接清+恢复,不调用
+                // `FUN_00404914` ⇒ **没有引擎自动绘制**。ERIS 正文由脚本
+                // `CGACT[TEXT]` 画到文本框;若这里仍同步自动层,同一行会
+                // 在 (0,0) 多画一遍(2026-11-04 实测左上角多余文本)。
+                // 清掉内核自动层,不触碰 `text_draws`(CGACT 路径)。
+                gfx.clear_text();
+            }
+        }
         let build_started = Instant::now();
         let frame = self
             .state

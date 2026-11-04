@@ -282,6 +282,15 @@ pub trait TaskExecutor {
     /// `0x404828 call 0x4638e4`:请求在位 ⇒ 清空 `$_TEXT`/`$_TEXT_FLAG`)。
     /// 默认空实现;[`crate::Vm`] 覆写。
     fn consume_text_clear_request(&mut self) {}
+    /// 自动模式下当前文本显示段是否已推进到末尾(`FUN_004046fc` 收尾判据
+    /// `0x404818`:游标 `+0x6c` >= 标志总数 `+0x64`)。
+    ///
+    /// 停在 `'C'`(点击等待)时返回 false,调度器继续等推进输入;没有
+    /// `'C'` 的行(如 `AUTOCLICK=0`)则无需输入即可恢复。默认 false =
+    /// 维持旧行为(等输入)。[`crate::Vm`] 覆写。
+    fn text_reveal_complete(&self) -> bool {
+        false
+    }
     /// 该任务是否在等待一条 DIALOG 回答(内核模态;DIV-RT-044)。
     fn dialog_pending(&self, _task: &str) -> bool {
         false
@@ -396,6 +405,13 @@ impl Scheduler {
         self.frame
     }
 
+    /// 是否有任务停在文本让出(`task+9`)。官方 `FUN_004046fc` 只对这类
+    /// 任务推进文本;内核 `advance_reveal` 也只在此时跑,避免任务未让出
+    /// 时提前显示。
+    pub fn text_waiting(&self) -> bool {
+        self.nodes.iter().any(|n| n.text_rest)
+    }
+
     pub fn tick_frame(&mut self, exec: &mut dyn TaskExecutor, now_ms: u32) -> ChainReport {
         let mut report = ChainReport::default();
         loop {
@@ -450,7 +466,14 @@ impl Scheduler {
             // 手动模式 = 一帧休憩(手册 basic/task.html「一旦休憩します」);
             // 把它当成"等点击"会让没有输入驱动的初始化链永久停住。
             if nodes[i].text_rest {
-                if exec.text_auto_mode() && !exec.text_advance_requested() {
+                // 自动模式:先按 WAIT 推进文本(`advance_reveal` 在
+                // `tick_at` 入口已跑);只有“推进输入”或“本段已推进到
+                // 末尾”才恢复。停在 `'C'` 时必须等输入(REA
+                // `FUN_004046fc` `0x404818`;`0x4047ee` 按钮路径)。
+                if exec.text_auto_mode()
+                    && !exec.text_advance_requested()
+                    && !exec.text_reveal_complete()
+                {
                     continue;
                 }
                 nodes[i].text_rest = false;

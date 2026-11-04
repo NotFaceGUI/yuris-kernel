@@ -29,7 +29,10 @@ use crate::json::{self, FieldError, Fields, Json};
 ///   `frame/frame_description` 成为真实记录;④ `platform/platform_call` 继续拒绝。
 /// - v4:2026-10-23 回放闭包 —— `boot.host` 增加 `window_init_pos`
 ///   (`@_WINDOW_INIT_POS`;宿主注入,影响脚本行为,必须进 header 才能重放)。
-pub const SCHEMA_VERSION: u32 = 4;
+/// - v5:2026-11-04 文本层 ID 字节化 —— `text.id` 从 JSON 字符串改为
+///   与 `text.bytes` 同一可逆字节编码(每字节 `\u00xx`);`VmEvent::Text.id`
+///   是 CP932 原始字节(REA `0x414559` 逐字节匹配图层)。
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// 子系统。③(`frame`)已实现;④(`platform`)仍为占位,本版本拒绝其记录。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -862,7 +865,8 @@ pub enum Payload {
         time_ms: Option<u32>,
     },
     VmText {
-        id: String,
+        /// 文本层 ID(CP932 原始字节;与 `VmEvent::Text.id` 一致)。
+        id: Vec<u8>,
         bytes: Vec<u8>,
     },
     /// 一行文本结束(`RETURNCODE`;`line` = 编译器写入的本脚本内改行计数)。
@@ -1563,7 +1567,7 @@ fn parse_payload(line: u64, kind: Kind, frame: Option<u64>, value: &Json) -> Res
             }
         }
         Kind::VmText => {
-            let id = take_str(&mut fields, line, "id")?.to_string();
+            let id = take_bytes(&mut fields, line, "id")?;
             let bytes = take_bytes(&mut fields, line, "bytes")?;
             Payload::VmText { id, bytes }
         }
@@ -2180,7 +2184,7 @@ pub(crate) fn payload_to_json(payload: &Payload) -> Json {
             ),
         ]),
         Payload::VmText { id, bytes } => Json::Obj(vec![
-            ("id".to_string(), Json::Str(id.clone())),
+            ("id".to_string(), bytes_json(id)),
             ("bytes".to_string(), bytes_json(bytes)),
         ]),
         Payload::VmReturnCode { line } => {
@@ -2345,7 +2349,8 @@ mod tests {
         log.push(
             Some(3),
             Payload::VmText {
-                id: String::new(),
+                // CP932「あ」:层 ID 必须按字节往返(不是 UTF-8 字符串)。
+                id: vec![0x82, 0xa0],
                 bytes: vec![0x83, 0x5c, 0x0a, 0xff],
             },
         );

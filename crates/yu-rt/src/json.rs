@@ -180,7 +180,9 @@ pub fn event_line(ev: &VmEvent) -> String {
         }
         VmEvent::Text { id, bytes, .. } => {
             o.push_str(",\"id\":");
-            esc_str(&mut o, id);
+            // 层 ID 是 CP932 字节;与 `bytes` 同一可逆编码(每字节一个
+            // `\u00xx`),不能写成 UTF-8 字符串后丢信息(REA 0x414559)。
+            esc_bytes(&mut o, id);
             o.push_str(",\"bytes\":");
             esc_bytes(&mut o, bytes);
         }

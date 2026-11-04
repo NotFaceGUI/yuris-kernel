@@ -4582,18 +4582,11 @@ impl Vm {
                 .map(|(_, v)| v.clone())
         };
 
-        // p0 ID:目标文本层(事件字段是 String;非 UTF-8 保持空并挂号)。
+        // p0 ID:目标文本层(CP932 原始字节)。
+        // REA 0x453467 求值到字节缓冲后交 0x414559 解析图层:MurmurHash2 +
+        // 逐字节比较,不校验 UTF-8;非 ASCII ID 合法(手册 text/text.html ID)。
         if let Some(Value::Str(b)) = get("ID") {
-            match std::str::from_utf8(&b) {
-                Ok(s) => self.text_layer_id = s.to_string(),
-                Err(_) => {
-                    self.text_layer_id.clear();
-                    self.report_unimplemented(
-                        "TEXT",
-                        "TEXT[ID] 为非 UTF-8 CP932 ID:事件字符串无法承载,保持空".to_string(),
-                    );
-                }
-            }
+            self.text.layer_id = b;
         }
         // p1 OUTPUTMODE(引擎只存 AL)。
         if let Some(v) = get("OUTPUTMODE") {
@@ -4762,7 +4755,7 @@ impl Vm {
             self.append_text(&bytes);
             self.emit(VmEvent::Text {
                 frame: self.frame(),
-                id: self.text_layer_id.clone(),
+                id: self.text.layer_id.clone(),
                 bytes,
             });
         }
@@ -4789,7 +4782,7 @@ impl Vm {
         self.append_text(&w.payload);
         self.emit(VmEvent::Text {
             frame: self.frame(),
-            id: self.text_layer_id.clone(),
+            id: self.text.layer_id.clone(),
             bytes: w.payload.clone(),
         });
         Ok(StepOutcome::Continue)

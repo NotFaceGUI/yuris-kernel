@@ -3254,7 +3254,7 @@ fn text_id_sets_following_run_id_and_clear_empties_buffer() {
     let report = vm.tick_at(0, &no_input());
     assert!(report.errors.is_empty(), "{:?}", report.errors);
 
-    let texts: Vec<String> = vm
+    let texts: Vec<Vec<u8>> = vm
         .events()
         .iter()
         .filter_map(|e| match e {
@@ -3262,9 +3262,44 @@ fn text_id_sets_following_run_id_and_clear_empties_buffer() {
             _ => None,
         })
         .collect();
-    assert_eq!(texts, vec!["MSG".to_string(), "MSG".to_string()]);
+    assert_eq!(texts, vec![b"MSG".to_vec(), b"MSG".to_vec()]);
     assert_eq!(vm.current_text(), b"B", "CLEAR 清掉前面的 A");
     assert_eq!(vm.text_flags(), b"1", "CLEAR 同时清标志流(只剩 B)");
+}
+
+#[test]
+fn text_id_keeps_cp932_bytes_without_utf8_conversion() {
+    // 合成样本:<project-eris> 141 脚本里 `TEXT[ID]` 为 0 次(2026-11-04
+    // census),此处显式造「あ」= CP932 0x82 0xA0。
+    // REA 0x453467 求值字节后交 0x414559:MurmurHash2 + 逐字节比较,
+    // 不校验 UTF-8;事件 ID 与快照层 ID 必须字节精确。
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let id: &[u8] = b"\x82\xa0";
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TEXT).window(0, ex::sb(id)),
+        GroupSpec::new(OP_WORD).window(0, b"A".to_vec()),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let ids: Vec<Vec<u8>> = vm
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            yu_rt::VmEvent::Text { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec![id.to_vec()], "事件 ID 必须是 CP932 原字节");
+    assert_eq!(
+        vm.text_state().layer_id,
+        id,
+        "快照层 ID 必须是同一份字节(不经过 String/UTF-8)"
+    );
 }
 
 #[test]
@@ -3764,6 +3799,92 @@ fn manual_outputmode_returncode_resumes_without_input() {
         vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
         "手动模式:继续自动推进"
     );
+}
+
+#[test]
+fn text_reveal_advances_by_wait_and_full_half_delay() {
+    // H-P2-02 合成样本:WAIT=15;半角 A + 全角 あ。
+    // REA `FUN_00404c0c`(0x404c0c):行首字符立即显示(+0x68==0 门),
+    // 之后 `now-last < +0x48[+0x6c]` 则停;`last += delay`(u32 回绕)。
+    // `WORD 0x458e78`:全角 WAIT,半角 WAIT/2 ⇒ A=7ms、あ=15ms。
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    const OP_RETURNCODE: u8 = 79;
+    const OP_WORD: u8 = 106;
+    const OP_TEXT: u8 = 96;
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TEXT).window(10, ex::i32_(15)), // WAIT=15
+        GroupSpec::new(OP_WORD).window(0, b"A\x82\xa0".to_vec()),
+        GroupSpec::new(OP_RETURNCODE).window(1, Vec::new()),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+
+    // tick 1(0ms):命令执行到 RETURNCODE 让出;本 tick 尚无显示段推进。
+    vm.tick_at(0, &no_input());
+    let s = vm.text_state();
+    assert_eq!(s.output_mode, 1);
+    assert_eq!((s.reveal_flags, s.reveal_bytes, s.reveal_chars), (0, 0, 0));
+
+    // tick 2(16ms):行首 A 立即显示;あ 的 15ms 未到。
+    vm.tick_at(16, &no_input());
+    let s = vm.text_state();
+    assert_eq!((s.reveal_flags, s.reveal_bytes, s.reveal_chars), (1, 1, 1));
+    assert!(!s.click);
+
+    // tick 3(30ms):now-last=14 < 15,仍只 A。
+    vm.tick_at(30, &no_input());
+    assert_eq!(vm.text_state().reveal_chars, 1, "全角延迟 15ms 未到");
+
+    // tick 4(31ms):满 15ms,あ 显示;随后遇到 'C' 停。
+    vm.tick_at(31, &no_input());
+    let s = vm.text_state();
+    assert_eq!((s.reveal_flags, s.reveal_bytes, s.reveal_chars), (2, 3, 2));
+    assert!(s.click, "'C' = 点击等待");
+
+    // tick 5(47ms):点击恢复 → finish_line 提交 → END。
+    let mut tl = InputTimeline::new();
+    tl.set(5, InputFrame::new(["MOUSE_L"]));
+    vm.tick_at(47, &tl);
+    let s = vm.text_state();
+    assert_eq!(s.reveal_chars, 2, "恢复后可见字符数不倒退");
+    assert!(!s.click);
+}
+
+#[test]
+fn text_reveal_autoclick_off_resumes_without_input() {
+    // H-P2-02:自动模式但 `AUTOCLICK=0` 时行尾没有 'C';官方
+    // `FUN_004046fc` 在 +0x6c 消费完 +0x64 后直接恢复(0x404818),
+    // 不需要输入。内核 gate 用 `text_reveal_complete` 复刻。
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    const OP_RETURNCODE: u8 = 79;
+    const OP_WORD: u8 = 106;
+    const OP_TEXT: u8 = 96;
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TEXT)
+            .window(19, ex::i32_(0)) // AUTOCLICK=0(0.495 slot 19)
+            .window(10, ex::i32_(15)), // WAIT=15
+        GroupSpec::new(OP_WORD).window(0, b"A".to_vec()),
+        GroupSpec::new(OP_RETURNCODE).window(1, Vec::new()),
+        GroupSpec::new(OP_WORD).window(0, b"B".to_vec()),
+        GroupSpec::new(OP_RETURNCODE).window(2, Vec::new()),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+
+    // tick 1:第一行让出。
+    vm.tick_at(0, &no_input());
+    assert_eq!(vm.text_state().reveal_chars, 0);
+    // tick 2(16ms):A 显示 + R/P/E 消费完 → 无输入恢复 → WORD B 让出。
+    vm.tick_at(16, &no_input());
+    let s = vm.text_state();
+    assert_eq!(s.reveal_chars, 1, "A 已提交;B 尚未显示");
+    // tick 3(32ms):B 显示 + 行尾消费完 → 恢复 → END。
+    vm.tick_at(32, &no_input());
+    assert_eq!(vm.text_state().reveal_chars, 2);
 }
 
 /// R9 回归:`GOSUB` 允许 64 次嵌套,第 65 次 Fatal。

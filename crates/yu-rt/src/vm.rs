@@ -538,9 +538,6 @@ pub struct Vm {
     /// 显示文本层状态(`$_TEXT`/`$_TEXT_FLAG`/`TEXTINFO` 的数据源;
     /// 引擎 `[0x801800]` 的已取证字段,见 [`crate::text`])。
     text: crate::text::TextState,
-    /// `TEXT[ID=...]`:后续文本事件的目标文本层 ID(手册 `text/text.html`)。
-    /// 事件字段是 `String`;非 UTF-8 的 CP932 ID 会显式报告并保持为空。
-    text_layer_id: String,
     /// `@_MENUCODE`(手册:最後に選択されたメニュー項目の CODE 値;○ 可赋值)。
     menu_code: i64,
     /// `@_WINDOW_EXEC_MAX/MIN/CLOSE/CAPTION`:窗口按钮/尺寸事件的按下状态。
@@ -802,7 +799,6 @@ impl Vm {
             decode_cache_entries: 0,
             texts: BTreeMap::new(),
             text: crate::text::TextState::default(),
-            text_layer_id: String::new(),
             menu_code: 0,
             window_exec_max: 0,
             window_exec_min: 0,
@@ -1406,6 +1402,8 @@ impl Vm {
     /// 标志流不在此重建:引擎写入路径未取证(`DIV-RT-032` 仍挂写入)。
     pub(crate) fn set_text(&mut self, bytes: Vec<u8>) {
         self.text.bytes = bytes;
+        // 整体替换后逐字延迟表不再对应;不猜新节奏,新内容全显。
+        self.text.reset_reveal_all();
     }
 
     /// 替换 `$_TEXT_FLAG` 控制字节流。
@@ -1415,6 +1413,8 @@ impl Vm {
     /// 不按字符重算标志。P3 收口 DIV-RT-032 的写入路径。
     pub(crate) fn set_text_flags(&mut self, bytes: Vec<u8>) {
         self.text.flags = bytes;
+        // 标志流被整体替换:显示段边界失效,新内容全显(见 DIV-RT-032)。
+        self.text.reset_reveal_all();
     }
 
     /// `@_MENUCODE` 读取(菜单域宿主选中项后应经 [`Vm::set_menu_code`] 推入)。
@@ -1812,6 +1812,12 @@ impl Vm {
         self.now_ms = now_ms;
         if let Some(host) = self.sound_host.as_mut() {
             host.advance(now_ms);
+        }
+        // 官方 `FUN_004046fc`(0x4046fc)在每帧调度前推进文本;只对停在
+        // `task+9` 的文本任务调用。内核用 `tick_at(now_ms)` 的毫秒做时钟
+        // (与 `timeGetTime()` 同单位,REA 0x404c21),不读墙钟。
+        if self.scheduler.text_waiting() {
+            self.text.advance_reveal(now_ms);
         }
         let mut sched = std::mem::take(&mut self.scheduler);
         let report = sched.tick_frame(self, now_ms);
@@ -2524,9 +2530,22 @@ impl TaskExecutor for Vm {
     /// `[+0x36]`(RETURNCODE 手动模式 `0x44c437` 置位)在位 ⇒ 清空
     /// `$_TEXT`(`[+0x38]`)/`$_TEXT_FLAG`(`[+0x3c]`)与内部读位。
     fn consume_text_clear_request(&mut self) {
-        if self.text.clear_pending {
+        if self.text.output_mode == 1 {
+            // 自动模式:恢复点 = `FUN_004046fc` 的按钮/完成路径。先把当前
+            // 显示段快进到末尾并提交(点击跳过/行尾 R/P/E),像素留在
+            // 内核累积缓冲里(对应官方表面保留)。
+            self.text.finish_line();
+        } else if self.text.clear_pending {
+            // 手动模式:引擎 `0x404828 call 0x4638e4`,清 `$_TEXT`/
+            // `$_TEXT_FLAG` 与内部读位(`RETURNCODE 0x44c437` 置位)。
             self.text.clear();
         }
+    }
+
+    /// 自动模式当前显示段是否已推进到缓冲末尾(`FUN_004046fc` 收尾判据
+    /// `0x404818`:游标 >= 标志总数)。停在 `'C'` 时返回 false,等点击。
+    fn text_reveal_complete(&self) -> bool {
+        self.text.line_complete()
     }
 
     fn dialog_pending(&self, task: &str) -> bool {

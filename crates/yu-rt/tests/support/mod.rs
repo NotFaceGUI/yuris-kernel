@@ -123,8 +123,12 @@ pub mod ex {
     }
     /// 字符串字面量(载荷含界定符,引擎 0x4d 语义)。
     pub fn s(text: &str) -> Vec<u8> {
+        sb(text.as_bytes())
+    }
+    /// 字节串字面量(CP932 原样;与 [`s`] 同布局)。
+    pub fn sb(bytes: &[u8]) -> Vec<u8> {
         let mut body = vec![b'"'];
-        body.extend_from_slice(text.as_bytes());
+        body.extend_from_slice(bytes);
         body.push(b'"');
         let mut out = vec![0x4d];
         out.extend_from_slice(&(body.len() as u16).to_le_bytes());

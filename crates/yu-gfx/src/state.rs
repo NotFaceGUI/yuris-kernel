@@ -178,6 +178,11 @@ pub struct GfxState {
     text_layers: BTreeMap<LayerId, TextBuffer>,
     /// 最近一次 `TEXT[ID]`(文本事件落点)。
     current_text: LayerId,
+    /// 已应用的 VM `TEXT[CLEAR]` 代数(`TextSnapshot::clear_seq`)。
+    ///
+    /// CLEAR 在引擎里是显式状态迁移(REA `0x453894` → `0x4638e4`),
+    /// 不是“空 bytes”。宿主用它触发一次显式清层,避免把空缓冲误当 CLEAR。
+    text_clear_seq: u64,
     /// 文本修订号发号器(全局单调;后端合成缓存键必须全局唯一,
     /// 不能因层重建/内容清除而复用旧号)。
     text_revision_seq: u64,
@@ -378,6 +383,7 @@ impl GfxState {
             style_slot: 0,
             text_layers: BTreeMap::new(),
             current_text: LayerId::new(Vec::new()),
+            text_clear_seq: 0,
             text_revision_seq: 0,
             text_draws: BTreeMap::new(),
             copy_log: Vec::new(),
@@ -533,16 +539,31 @@ impl GfxState {
     /// 用 VM 的文本状态快照**替换**当前文本层(权威字节 + `_TEXT_FLAG`)。
     ///
     /// 这是 `_TEXT_FLAG` 逐字 `'1'/'2'` 流进入 gfx 的唯一入口(契约见
-    /// `yu_rt::Vm::text_state` 的“宿主/gfx 桥”注释)。`TEXT[CLEAR]` 在 VM 里
-    /// 没有事件,宿主每帧(或至少在 `TEXT` 命令后)调用本方法即可同步;
-    /// `bytes` 为空即等于 CLEAR(DIV-GFX-034 的传播路径)。
+    /// `yu_rt::Vm::text_state` 的“宿主/gfx 桥”注释)。层 ID 取自快照
+    /// (`TEXT[ID]` 的 CP932 原始字节),不依赖宿主是否消费了 Text 事件。
     ///
-    /// 标志流与字节不对齐时**不猜**:挂 `gfx.text.flag_mismatch` 诊断并把
+    /// `TEXT[CLEAR]` 在 VM 里没有事件;快照的 `clear_seq` 变化表示本帧
+    /// 发生过 CLEAR,此时显式清该层显示缓冲,而不是把空 `bytes` 当 CLEAR
+    /// (REA `0x453894`/`0x4638e4`;任务书 `task-text-auto-pipeline.md` C1)。
+    ///
+    /// 标志流与字节不对齐时**不猜**:挂 `gfx.text.unsupported` 诊断并把
     /// 标志置 `None`(后端不排版)。
     pub fn sync_text_state(&mut self, snapshot: &yu_rt::text::TextSnapshot) {
         self.invalidate_frame();
-        let id = self.current_text.clone();
-        self.write_text_state(&id, &snapshot.bytes, &snapshot.flags);
+        let id = text_layer_path(&snapshot.layer_id);
+        let cleared = snapshot.clear_seq != self.text_clear_seq;
+        if cleared {
+            self.text_clear_seq = snapshot.clear_seq;
+            self.clear_text_layer(&id);
+        }
+        self.current_text = id.clone();
+        // 空 `bytes` 不是 CLEAR 信号:官方 CLEAR 是显式状态迁移
+        // (`+0x36` → `FUN_004638e4`),不是“缓冲刚好为空”。没有 CLEAR
+        // 代数变化时空缓冲保持显示层原样(已画像素仍在表面,REA 0x4638e4
+        // 不触碰表面)。新层/首次同步仍建空缓冲,便于后续写入。
+        if !snapshot.bytes.is_empty() || cleared || !self.text_layers.contains_key(&id) {
+            self.write_text_state(&id, &snapshot.bytes, &snapshot.flags);
+        }
         let buf = self.text_layers.entry(id).or_default();
         buf.origin = (snapshot.cursor_x, snapshot.cursor_y);
     }
@@ -550,7 +571,14 @@ impl GfxState {
     /// 同上,但显式指定文本层(宿主若自行维护层 ID)。
     pub fn sync_text_state_for(&mut self, id: &LayerId, snapshot: &yu_rt::text::TextSnapshot) {
         self.invalidate_frame();
-        self.write_text_state(id, &snapshot.bytes, &snapshot.flags);
+        let cleared = snapshot.clear_seq != self.text_clear_seq;
+        if cleared {
+            self.text_clear_seq = snapshot.clear_seq;
+            self.clear_text_layer(id);
+        }
+        if !snapshot.bytes.is_empty() || cleared || !self.text_layers.contains_key(id) {
+            self.write_text_state(id, &snapshot.bytes, &snapshot.flags);
+        }
         let buf = self.text_layers.entry(id.clone()).or_default();
         buf.origin = (snapshot.cursor_x, snapshot.cursor_y);
     }
@@ -577,9 +605,15 @@ impl GfxState {
     pub fn clear_text(&mut self) {
         self.invalidate_frame();
         let id = self.current_text.clone();
-        if let Some(buf) = self.text_layers.get_mut(&id) {
+        self.clear_text_layer(&id);
+    }
+
+    /// 清指定层的显示缓冲(保留样式/原点,等下一次同步写入)。
+    fn clear_text_layer(&mut self, id: &LayerId) {
+        if let Some(buf) = self.text_layers.get_mut(id) {
             buf.bytes.clear();
             buf.flags = Some(Vec::new());
+            buf.reveal = None;
         }
     }
 
@@ -641,7 +675,7 @@ impl GfxState {
             }
             VmEvent::Text { frame, id, bytes } => {
                 self.frame = *frame;
-                let id = LayerId::new(id.as_bytes().to_vec());
+                let id = text_layer_path(id);
                 self.current_text = id.clone();
                 let buf = self.text_layers.entry(id).or_default();
                 buf.bytes.extend_from_slice(bytes);
@@ -1152,31 +1186,36 @@ impl GfxState {
     }
 
     /// 自动文本层的排版:只接受 `_TEXT_FLAG` 一手证据;缺失 ⇒ 不产出。
+    ///
+    /// 引擎只有一个全局文本状态(`[0x801800]`)和一个当前层
+    /// (`[state+0x00]`,`TEXT[ID]` 解析);旧层只保留已画到表面的像素,
+    /// 不参与本帧自动排版。故这里**只取当前层**,不再从 `BTreeMap` 里
+    /// 取第一个非空层(REA `FUN_00404914` `0x404921..0x404925`)。
     fn text_layout_now(&self) -> Option<TextLayoutFrame> {
-        self.text_layers.iter().find_map(|(id, b)| {
-            if b.bytes.is_empty() {
-                return None;
-            }
-            let flags = b.flags.as_deref()?;
-            let glyphs = layout_text(&b.bytes, flags, b.origin, &b.style)?;
-            if glyphs.is_empty() {
-                return None;
-            }
-            let target = if !id.0.is_empty() && self.nodes.contains_key(id) {
-                Some(id.clone())
-            } else {
-                None
-            };
-            Some(TextLayoutFrame {
-                target,
-                origin: b.origin,
-                style: b.style.clone(),
-                chars: glyphs.len(),
-                reveal: b.reveal,
-                line_height: b.style.line_height(),
-                glyphs,
-                flags_source: TextFlagsSource::TextFlag,
-            })
+        let id = &self.current_text;
+        let b = self.text_layers.get(id)?;
+        if b.bytes.is_empty() {
+            return None;
+        }
+        let flags = b.flags.as_deref()?;
+        let glyphs = layout_text(&b.bytes, flags, b.origin, &b.style)?;
+        if glyphs.is_empty() {
+            return None;
+        }
+        let target = if !id.0.is_empty() && self.nodes.contains_key(id) {
+            Some(id.clone())
+        } else {
+            None
+        };
+        Some(TextLayoutFrame {
+            target,
+            origin: b.origin,
+            style: b.style.clone(),
+            chars: glyphs.len(),
+            reveal: b.reveal,
+            line_height: b.style.line_height(),
+            glyphs,
+            flags_source: TextFlagsSource::TextFlag,
         })
     }
 
@@ -3830,6 +3869,15 @@ impl GfxState {
             // DIV-GFX-058:已执行的图像加工重写目标层像素(引擎命令处理器
             // 立即执行)⇒ 目标层已画文本作废(`BT.CGCLEAR` 的
             // `RECTPAINT3 SET=0` 清标签面正是这条路径,es_Button.yst:4547)。
+            //
+            // 已知语义缺口(不是补丁能解决的):官方 `CGACT[TEXT]` 在命令
+            // 时刻把字形写进层表面,后续 `MERGE2`/`SIZE2`/`MEIDO` 作用于
+            // **含文字的表面**;内核把文字延迟到层末合成,只能用“图像加工
+            // 即清文字”的保守近似。ERIS 外字链
+            // `es_font.yst`(s11)先 `CGACT[TEXT]` 画前缀/后缀、中间
+            // `CGACT[MERGE2]` 叠外字图;保守近似会清掉前缀(实机行首
+            // `」` 之前缺失)。正确修复需要按 `seq` 重放文本/图像命令序
+            // (DIV-GFX-072 §9 / DIV-GFX-076),不能按动作类型例外。
             if let Some(t) = target {
                 self.clear_layer_texts(&t);
             }
@@ -6104,4 +6152,21 @@ fn apply_layer_params(
     }
     layer.refresh_status();
     diags
+}
+
+/// `TEXT[ID]` 的脚本 ID → gfx 图层路径。
+///
+/// 官方 `TEXT` 处理体先把 ID 过 `FUN_004141e4`(路径规范化:相对 ID 落在
+/// 默认根组 `W0` 下,`:/` 绝对路径保持,`/` 分隔层级),再交
+/// `FUN_00414559` 按字节哈希 + 逐字节比较查层表。gfx 的 `CG` 已用同一套
+/// `path::normalize` 建层,故文本层也必须规范化后才能命中。
+///
+/// 空 ID(脚本没给 `TEXT[ID]` 或显式空串)保留空键:内核旧行为是屏幕
+/// 坐标叠加;官方此时 `[state+0x00]` 不改变/解析不到层,是否绘制属
+/// `docs/tasks/task-text-auto-pipeline.md` C6 的后续收口。
+fn text_layer_path(raw: &[u8]) -> LayerId {
+    if raw.is_empty() {
+        return LayerId::new(Vec::new());
+    }
+    crate::path::normalize(raw, None, raw.ends_with(b"/")).path
 }

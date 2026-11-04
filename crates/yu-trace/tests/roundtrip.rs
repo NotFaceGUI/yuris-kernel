@@ -128,7 +128,7 @@ fn sample_log() -> TraceLog {
     log.push(
         Some(1),
         Payload::VmText {
-            id: String::new(),
+            id: Vec::new(),
             bytes: Vec::new(),
         },
     );

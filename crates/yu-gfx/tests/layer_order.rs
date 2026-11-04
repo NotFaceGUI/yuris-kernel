@@ -339,7 +339,7 @@ fn text_model_keeps_style_and_bytes() {
         ),
         yu_rt::VmEvent::Text {
             frame: 1,
-            id: "MSG".to_string(),
+            id: b"\x82\xa0".to_vec(),
             bytes: b"\x82\xa0".to_vec(),
         },
         frame_end(1),

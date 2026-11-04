@@ -1261,12 +1261,13 @@ fn text_layout_frames_match_soft_exactly() {
         VmEvent::FrameStart { frame: 1 },
         VmEvent::Text {
             frame: 1,
-            id: String::new(),
+            id: Vec::new(),
             bytes: b"A\x82\xB1B".to_vec(),
         },
     ]);
     // 权威 `_TEXT_FLAG`:半角/全角/半角(SX=SY=20 默认)。
     gfx.sync_text_state(&yu_rt::text::TextSnapshot {
+        layer_id: Vec::new(),
         bytes: b"A\x82\xB1B".to_vec(),
         flags: b"121".to_vec(),
         output_mode: 1,
@@ -1276,6 +1277,11 @@ fn text_layout_frames_match_soft_exactly() {
         autoclick: 1,
         click: false,
         clear_pending: false,
+        clear_seq: 0,
+        reveal_flags: 0,
+        reveal_bytes: 0,
+        reveal_chars: 0,
+        skip_mode: false,
         cursor_x: 0,
         cursor_y: 0,
         click_buttons: [1, 13, 0x3ff, 0x3ff],
@@ -1297,6 +1303,14 @@ fn text_layout_frames_match_soft_exactly() {
         soft_out.surface.rgba, gpu_out.surface.rgba,
         "text frame must be pixel-identical across backends"
     );
+
+    // H-P2-02:reveal 截断后 soft/wgpu 同一帧可见 glyph 数一致。
+    gfx.set_text_reveal(Some(1));
+    let truncated = gfx.frame();
+    let soft_one = soft.render_frame(&truncated);
+    let gpu_one = gpu.render_frame(&truncated).expect("render");
+    assert_eq!(soft_one.report.text_glyphs, 1);
+    assert_eq!(gpu_one.report.text_glyphs, 1);
 }
 
 #[test]

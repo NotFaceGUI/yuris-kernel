@@ -253,7 +253,7 @@ fn font_no_is_recorded_and_bno_selects_style_slot() {
         ),
         yu_rt::VmEvent::Text {
             frame: 1,
-            id: "MSG".to_string(),
+            id: b"MSG".to_vec(),
             bytes: b"abc".to_vec(),
         },
         frame_end(1),
@@ -272,7 +272,7 @@ fn font_no_is_recorded_and_bno_selects_style_slot() {
         call(2, "FONT", vec![arg(&table, "FONT", "BNO", i(0))]),
         yu_rt::VmEvent::Text {
             frame: 2,
-            id: "MSG".to_string(),
+            id: b"MSG".to_vec(),
             bytes: b"abc".to_vec(),
         },
         frame_end(2),

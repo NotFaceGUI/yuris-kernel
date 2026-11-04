@@ -10,6 +10,7 @@ use yu_rt::text::TextSnapshot;
 
 fn snapshot(bytes: &[u8], flags: &[u8]) -> TextSnapshot {
     TextSnapshot {
+        layer_id: Vec::new(),
         bytes: bytes.to_vec(),
         flags: flags.to_vec(),
         output_mode: 1,
@@ -19,6 +20,11 @@ fn snapshot(bytes: &[u8], flags: &[u8]) -> TextSnapshot {
         autoclick: 1,
         click: false,
         clear_pending: false,
+        clear_seq: 0,
+        reveal_flags: 0,
+        reveal_bytes: 0,
+        reveal_chars: 0,
+        skip_mode: false,
         cursor_x: 0,
         cursor_y: 0,
         click_buttons: [1, 13, 0x3ff, 0x3ff],
@@ -32,7 +38,7 @@ fn text_buffer_persists_across_frames() {
     gfx.on_event(&frame_start(0));
     gfx.on_event(&yu_rt::VmEvent::Text {
         frame: 0,
-        id: String::new(),
+        id: Vec::new(),
         bytes: b"A".to_vec(),
     });
     assert_eq!(gfx.frame().text.len(), 1);
@@ -83,12 +89,103 @@ fn clear_sync_clears_cross_frame_text() {
     gfx.on_event(&frame_start(0));
     gfx.sync_text_state(&snapshot(b"A", b"2"));
     assert_eq!(gfx.frame().text.len(), 1);
-    // `TEXT[CLEAR]` 在 VM 里没有事件;宿主同步空快照 = CLEAR。
+
+    // 空 bytes **不是** CLEAR:官方 CLEAR 是显式状态迁移(REA 0x453894 →
+    // 0x4638e4),而 `FUN_004638e4` 不触碰图层表面。没有 clear_seq 变化时
+    // 显示层保留(任务书 `task-text-auto-pipeline.md` C1)。
     gfx.on_event(&frame_start(1));
     gfx.sync_text_state(&snapshot(b"", b""));
+    assert_eq!(gfx.frame().text.len(), 1, "空缓冲不隐式清层");
+
+    // `TEXT[CLEAR]` 经 `TextSnapshot::clear_seq` 显式传播。
+    let mut cleared = snapshot(b"", b"");
+    cleared.clear_seq = 1;
+    gfx.sync_text_state(&cleared);
     let frame = gfx.frame();
     assert!(frame.text.is_empty());
     assert!(frame.text_layout.is_none());
+}
+
+#[test]
+fn non_ascii_text_layer_id_targets_exact_layer() {
+    // 合成样本(ERIS 141 脚本里 TEXT[ID] = 0 次)。
+    // 关键:层 ID 是**不透明字节**,不是 CP932/UTF-8 字符串。
+    // - 0x82 0xA0 = CP932「あ」(真实语料编码样本);
+    // - 0xFF 0xFE 不是合法 CP932 前缀,必须原样透传(证明没有解码)。
+    // REA 0x4141e4 先做路径规范化,0x414559 再按字节哈希+比较查层;
+    // gfx 的 LayerId 也是字节,故目标层必须精确命中。
+    for raw in [b"\x82\xa0".as_slice(), b"\xff\xfe".as_slice()] {
+        let mut gfx = state();
+        let t = table();
+        gfx.on_event(&frame_start(0));
+        gfx.on_event(&call(
+            0,
+            "CG",
+            vec![
+                arg(&t, "CG", "ID", yu_rt::value::Value::Str(raw.to_vec())),
+                arg(&t, "CG", "FILE", yu_rt::value::Value::Str(Vec::new())),
+            ],
+        ));
+        let mut snap = snapshot(b"A", b"1");
+        snap.layer_id = raw.to_vec();
+        gfx.sync_text_state(&snap);
+        let layout = gfx.frame().text_layout.expect("layout");
+        assert_eq!(
+            layout.target,
+            Some(yu_gfx::path::normalize(raw, None, false).path),
+            "层 ID 必须按字节规范化后精确命中"
+        );
+    }
+}
+
+#[test]
+fn text_layout_tracks_current_layer_and_keeps_reveal() {
+    // 引擎只有一个当前文本层(`[state+0x00]`);旧 `text_layout_now` 用
+    // BTreeMap 的 `find_map` 取第一个非空层,层 ID 切换后会画错层。
+    // 本用例让 A/B 都非空,B 后同步 ⇒ 必须选 B(排序上 A 在前)。
+    let mut gfx = state();
+    let t = table();
+    gfx.on_event(&frame_start(0));
+    for id in [b"A".as_slice(), b"B".as_slice()] {
+        gfx.on_event(&call(
+            0,
+            "CG",
+            vec![
+                arg(&t, "CG", "ID", yu_rt::value::Value::Str(id.to_vec())),
+                arg(&t, "CG", "FILE", yu_rt::value::Value::Str(Vec::new())),
+            ],
+        ));
+    }
+    let mut a = snapshot(b"A", b"1");
+    a.layer_id = b"A".to_vec();
+    gfx.sync_text_state(&a);
+    assert_eq!(
+        gfx.frame().text_layout.expect("A").target,
+        Some(yu_gfx::path::normalize(b"A", None, false).path)
+    );
+
+    let mut b = snapshot(b"B", b"1");
+    b.layer_id = b"B".to_vec();
+    gfx.sync_text_state(&b);
+    gfx.set_text_reveal(Some(1));
+    let layout = gfx.frame().text_layout.expect("B");
+    assert_eq!(
+        layout.target,
+        Some(yu_gfx::path::normalize(b"B", None, false).path),
+        "只排当前层,不取 map 里的第一个非空层"
+    );
+    assert_eq!(layout.reveal, Some(1), "reveal 由宿主显式设置");
+
+    // 同一层再同步(clear_seq 未变)不得重置 reveal。
+    gfx.sync_text_state(&b);
+    assert_eq!(gfx.frame().text_layout.expect("B2").reveal, Some(1));
+
+    // CLEAR 代数变化才清,并重置 reveal。
+    let mut cleared = snapshot(b"", b"");
+    cleared.layer_id = b"B".to_vec();
+    cleared.clear_seq = 1;
+    gfx.sync_text_state(&cleared);
+    assert!(gfx.frame().text_layout.is_none());
 }
 
 #[test]

@@ -10,6 +10,11 @@
 //! 关键点:VM 的 `_TEXT_FLAG` 只在 `Vm::text_state()` 里;宿主每帧同步到 gfx
 //! (`GfxState::sync_text_state`),gfx 按逐字 `'1'/'2'` 排版,后端只栅格化。
 //!
+//! 注意:本探针**强制**同步自动层,用于验证 gfx/后端字形路径;
+//! 官方手动模式(ERIS `OUTPUTMODE=0`)不自动绘制,生产 `Engine` 已按
+//! `output_mode == 1` 门控(见 `DIV-GFX-075` C6)。不要用本探针判断
+//! 真实游戏是否多画了自动层。
+//!
 //! 用法:
 //!
 //! ```text

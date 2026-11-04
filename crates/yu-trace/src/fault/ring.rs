@@ -285,7 +285,7 @@ fn feed_event(hasher: &mut Sha256, event: &VmEvent) {
         VmEvent::Text { frame, id, bytes } => {
             hasher.update(b"txt");
             put_u64(hasher, *frame);
-            put_bytes(hasher, id.as_bytes());
+            put_bytes(hasher, id);
             put_bytes(hasher, bytes);
         }
         VmEvent::ReturnCode { frame, line } => {

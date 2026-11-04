@@ -255,7 +255,7 @@ fn text_without_flags_is_counted_but_not_rasterized() {
         VmEvent::FrameStart { frame: 1 },
         VmEvent::Text {
             frame: 1,
-            id: "T".to_string(),
+            id: b"T".to_vec(),
             bytes: b"hello".to_vec(),
         },
         call(
@@ -285,13 +285,14 @@ fn synced_text_flags_rasterize_glyphs() {
         VmEvent::FrameStart { frame: 1 },
         VmEvent::Text {
             frame: 1,
-            id: String::new(),
+            id: Vec::new(),
             bytes: b"A".to_vec(),
         },
     ]);
     // 权威 `_TEXT_FLAG`(VM `[state+0x3c]`):'2' = 全角单元。
     let mut snapshot = yu_rt::text::TextSnapshot {
         // 全角「こ」(CP932 0x82B1)配 '2';对齐必须成功。
+        layer_id: Vec::new(),
         bytes: b"\x82\xB1".to_vec(),
         flags: b"2".to_vec(),
         output_mode: 1,
@@ -301,6 +302,11 @@ fn synced_text_flags_rasterize_glyphs() {
         autoclick: 1,
         click: false,
         clear_pending: false,
+        clear_seq: 0,
+        reveal_flags: 0,
+        reveal_bytes: 0,
+        reveal_chars: 0,
+        skip_mode: false,
         cursor_x: 0,
         cursor_y: 0,
         click_buttons: [1, 13, 0x3ff, 0x3ff],
@@ -318,6 +324,12 @@ fn synced_text_flags_rasterize_glyphs() {
     let out = backend.render_frame(&frame);
     assert_eq!(out.report.skipped_text, 0, "synced run is not skipped");
     assert_eq!(out.report.text_glyphs, 1);
+
+    // H-P2-02:reveal 是唯一截断入口(后端不自建计时器)。
+    gfx.set_text_reveal(Some(0));
+    let hidden = backend.render_frame(&gfx.frame());
+    assert_eq!(hidden.report.text_glyphs, 0, "reveal=0 不画字形");
+    gfx.set_text_reveal(None);
     let ink = out
         .surface
         .rgba
@@ -336,6 +348,7 @@ fn synced_text_flags_rasterize_glyphs() {
     // 清空同步(CLEAR)后文本消失。
     snapshot.bytes.clear();
     snapshot.flags.clear();
+    snapshot.clear_seq += 1; // CLEAR 是显式代数,不是空缓冲(DIV-GFX-034/C1)
     gfx.consume_events(&[VmEvent::FrameStart { frame: 2 }]);
     gfx.sync_text_state(&snapshot);
     let cleared = backend.render_frame(&gfx.frame());
