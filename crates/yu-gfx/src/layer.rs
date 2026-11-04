@@ -835,14 +835,24 @@ pub struct Affine {
     /// `FBX`/`FBY`:基准缩放百分位(`+0x1c0`/`+0x1c8`)。
     pub bx: f64,
     pub by: f64,
-    /// `FCX`/`FCY`:旋转中心(`+0x1d0`/`+0x1d8`)。
+    /// `FCX`/`FCY`:旋转枢轴(`+0x1d0`/`+0x1d8`)。
+    ///
+    /// 普通图层网格只做 `-C/+C` 两次平移(0x415462/0x41551b),无旋转
+    /// 矩阵介于其间 ⇒ 净效果为零;主窗口分支才把它当旋转/缩放中心。
     pub cx: f64,
     pub cy: f64,
-    /// `FRX`/`FRY`/`FRZ`:旋转角(度;`+0x1f8/1fc/200`,引擎存 f32)。
+    /// `FRX`/`FRY`/`FRZ`:角度原值(度×100;`+0x1f8/1fc/200`,引擎存 f32)。
+    ///
+    /// 0.495 全 `.text` 偏移扫描:普通图层网格(`FUN_00414ba4`)只载入
+    /// `FRX/FRY` 后不再读取;`FRZ` 只在 `+0xa4==2` 主窗口分支按
+    /// `*π/180/100` 旋转。见 `docs/tasks/task-end-dialog-affine.md` §3.1。
     pub rx: f64,
     pub ry: f64,
     pub rz: f64,
     /// `FEX`/`FEY`/`FEZ`:附加偏移(`+0x1e0/1e8/1f0`)。
+    ///
+    /// 0.495 绘制只在 `+0xa4==2` 主窗口分支读 `FEX/FEY`(`0x414031/3b`);
+    /// 普通图层不读,`FEZ` 绘制不读。
     pub ex: f64,
     pub ey: f64,
     pub ez: f64,
@@ -882,6 +892,21 @@ impl Affine {
     /// 是否仍是引擎初值(用于判断本层是否带仿射/滤镜)。
     pub fn is_default(&self) -> bool {
         *self == Self::engine_default()
+    }
+
+    /// 是否含**普通图层绘制未实现**的效果字段。
+    ///
+    /// 0.495 `FUN_00414ba4` 的普通图层网格只消费 X/Y + `FBX/FBY`;
+    /// `rz`/`ex`/`ey` 属主窗口 `+0xa4==2` 分支,`sd`/`md` 属滤镜,
+    /// `flags` 是 MODE 3 fade。`rx/ry` 全二进制无绘制读取,`cx/cy` 平移相消,
+    /// `ez/qu` 绘制不读 ⇒ 这些不算「未实现」。
+    pub fn has_unimplemented_effect_fields(&self) -> bool {
+        self.rz != 0.0
+            || self.ex != 0.0
+            || self.ey != 0.0
+            || self.sd != 0x80
+            || self.md != 0x0080_8080
+            || self.flags != 0
     }
 }
 
@@ -1155,6 +1180,20 @@ impl Layer {
             LayerKind::Image { size } => size,
             LayerKind::Group { .. } => None,
         }
+    }
+
+    /// 引擎普通图层的有效缩放:`FBX/10000`、`FBY/10000`。
+    ///
+    /// 证据:0.495 `FUN_00414ba4` 网格循环
+    /// `x1 = x0 + (FBX/10000) * tileWidth`、`y1` 同型;tile 表由
+    /// `FUN_0040af1c` 按层宽高(像素)切分,`FUN_0040ae99` 用
+    /// `width*0.5` 写 `FCX/FCY`。默认 10000 = 1.0;0 = 零尺寸。
+    /// `FRX/FRY/FRZ` 不参与普通图层绘制(§3.1 偏移扫描)。
+    pub fn affine_scale(&self) -> (f64, f64) {
+        (
+            self.transform.affine.bx / 10000.0,
+            self.transform.affine.by / 10000.0,
+        )
     }
 
     /// 属性更新后重算有效状态。纹理级 Unimplemented 优先(后端不能跳过纹理

@@ -787,6 +787,13 @@ fn spawn_mixer(shared: Shared) {
                     continue;
                 }
                 let samples = frames * channels;
+                // 设备采样率/声道数不是固定 48k/2:cpal 在桌面可能给出
+                // 96k/4ch,`burst_samples` 会超过按 `RING_RATE`/2ch 预留的
+                // scratch。mixer 线程不是实时回调,扩容安全;只增不减,
+                // 避免每次换流都重新分配。
+                if scratch.len() < samples {
+                    scratch.resize(samples, 0.0);
+                }
 
                 if shared.tone.load(Ordering::Acquire) {
                     // 自测通道:完全不碰引擎,直接灌正弦。

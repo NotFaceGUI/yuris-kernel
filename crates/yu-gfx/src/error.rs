@@ -42,8 +42,12 @@ pub mod code {
     pub const MASK_UNSUPPORTED: &str = "gfx.mask.unsupported";
     /// `RID` 资源图取图路径(缺资源 provider)。
     pub const IMAGE_RID_UNSUPPORTED: &str = "gfx.image.rid.unsupported";
-    /// 仿射/滤镜字段已按引擎偏移落地,但绘制侧合成公式未对拍。
+    /// 历史码:仿射绘制合成公式未对拍。2026-11-04 起普通图层 scale 已实现,
+    /// 不再发此码;保留常量供旧 trace/golden 读取。
     pub const AFFINE_UNVERIFIED: &str = "gfx.affine.unverified";
+    /// 普通图层几何已实现(X/Y+FBX/FBY),但该层带主窗口/滤镜字段;
+    /// 只出可恢复诊断,**不**整层丢弃(0.495 普通绘制不读这些字段)。
+    pub const AFFINE_EFFECT_UNVERIFIED: &str = "gfx.affine.effect-unverified";
     /// 图层组/离屏语义缺项。
     pub const GROUP_UNSUPPORTED: &str = "gfx.group.unsupported";
     /// `CGACT[COPY/COPY2/SWAP...]` 的时序/区域语义缺项。

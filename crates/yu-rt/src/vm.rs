@@ -2441,7 +2441,12 @@ impl TaskExecutor for Vm {
 
         match res {
             Ok(out) => {
-                let finishing = matches!(out, StepOutcome::Finish);
+                // `END` 也结束执行者本身(全程序退出由调度器收束整条链),
+                // 执行位与 `TaskFinish` 事件口径与基帧 RETURN 一致。
+                let finishing = matches!(
+                    out,
+                    StepOutcome::Finish | StepOutcome::ExitProgram { .. }
+                );
                 if !finishing {
                     self.exec_slot = Some((id, st));
                     // 文本行尾让出:任务级等待(引擎 `task+9`)由调度器记录,

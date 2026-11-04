@@ -360,13 +360,15 @@ fn persistent_unsupported_attributes_keep_layer_unimplemented() {
                 arg(&table, "CG", "ID", s("L")),
                 arg(&table, "CG", "FILE", s("l")),
                 arg(&table, "CG", "MODE", i(3)),
-                // 旋转角:绑定已取证,但绘制侧公式未对拍 ⇒ 持久「未对拍」标记。
-                arg(&table, "CG", "FRZ", i(3000)),
+                // 外部掩码:取值通道(α/亮度)未取证 ⇒ 持久不可执行标记。
+                // 不用 FRZ:0.495 普通绘制体不读 `+0x200`(只走主窗口分支),
+                // 带 FRZ 的普通层仍按已实现几何绘制,不再整层挂号。
+                arg(&table, "CG", "MID", s("mask")),
             ],
         ),
         frame_end(1),
     ]);
-    // 只做一次无参数更新,不得把持久 MODE/FRZ 的不可执行状态洗掉。
+    // 只做一次无参数更新,不得把持久 MODE/MID 的不可执行状态洗掉。
     gfx.consume_events(&[
         frame_start(2),
         call(2, "CG", vec![arg(&table, "CG", "ID", s("L"))]),

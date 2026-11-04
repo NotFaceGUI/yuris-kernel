@@ -2412,6 +2412,7 @@ impl GfxState {
                 // 语义未取证,维持原状。
                 "CAPTION" => {
                     if let Some(v) = int_arg(&r.value) {
+                        // silent-ok: 缺 NO = 主窗口 0(同 `WINDOWINFO`)
                         if let Some(w) = self.windows.get_mut(&(no.unwrap_or(0) as u8)) {
                             w.caption = v;
                         }
@@ -2419,6 +2420,7 @@ impl GfxState {
                 }
                 "FULLSCREEN" => {
                     if let Some(v) = int_arg(&r.value) {
+                        // silent-ok: 缺 NO = 主窗口 0(同 `WINDOWINFO`)
                         if let Some(w) = self.windows.get_mut(&(no.unwrap_or(0) as u8)) {
                             w.fullscreen = v;
                         }
@@ -2426,6 +2428,7 @@ impl GfxState {
                 }
                 "FULLSCREENBUTTON" => {
                     if let Some(v) = int_arg(&r.value) {
+                        // silent-ok: 缺 NO = 主窗口 0(同 `WINDOWINFO`)
                         if let Some(w) = self.windows.get_mut(&(no.unwrap_or(0) as u8)) {
                             w.fullscreen_button = v;
                         }
@@ -5917,6 +5920,9 @@ fn apply_layer_params(
     let mut sy: Option<i64> = None;
     // 本命令是否给出仿射/滤镜参数(诊断只在参数出现时发,避免无参更新刷屏)。
     let mut affine_touched = false;
+    // 主窗口/滤镜字段只在「首次由默认变非默认」时留诊断,避免每帧
+    // `CG[FRZ=…]` 刷屏。
+    let effect_fields_before = layer.transform.affine.has_unimplemented_effect_fields();
     for (name, value, offset) in params {
         // `offset` = 「相对当前值」而不是赋值。窗口高字节的官方编码
         // (0.495 编译产物实测):`0` = 赋值、`1` = `+=`、`2` = `-=`;
@@ -6278,17 +6284,19 @@ fn apply_layer_params(
             _ => {}
         }
     }
-    // 仿射/滤镜字段已按引擎偏移逐项落地(DIV-GFX-003 绑定部分已闭),
-    // 但**绘制侧公式**(缩放/旋转/中心如何合成)仍未取证 ⇒ 非默认值时
-    // 只标「未对拍」,不再声称「槽位绑定未取证」。
-    if !layer.transform.affine.is_default() {
-        mark_param_unimplemented(layer, "gfx.affine.unverified");
-        if affine_touched {
-            diags.push(error::unimplemented(
-                error::code::AFFINE_UNVERIFIED,
-                "仿射/滤镜字段已按引擎偏移落地,但绘制侧合成公式未对拍",
-            ));
-        }
+    // 普通图层几何已实现:`x0=X-0.5`、`y0=Y-0.5`,
+    // `w=(FBX/10000)*tileW`、`h=(FBY/10000)*tileH`(REA 0x414ba4/0x40af1c)。
+    // `FRX/FRY` 全二进制无绘制读取,`FCX/FCY` 平移相消 ⇒ 不再整层丢弃。
+    // 仅当层带主窗口/滤镜字段(rz/ex/ey/sd/md/flags)时留一条**可恢复**
+    // 诊断;后端仍按已实现几何绘制。
+    if affine_touched
+        && !effect_fields_before
+        && layer.transform.affine.has_unimplemented_effect_fields()
+    {
+        diags.push(error::recoverable(
+            error::code::AFFINE_EFFECT_UNVERIFIED,
+            "仿射几何已实现;该层带主窗口/滤镜字段(rz/ex/ey/sd/md/F),普通绘制按 no-op",
+        ));
     }
     if layer.mask.is_some() {
         mark_param_unimplemented(layer, "gfx.mask.unsupported");

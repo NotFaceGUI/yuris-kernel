@@ -226,6 +226,7 @@ impl Planner<'_> {
                 }
                 let view = target.view.clone();
                 let (x, y) = (group.layer.transform.x, group.layer.transform.y);
+                let (scale_x, scale_y) = group.layer.affine_scale();
                 let alpha = fixed_pipeline_alpha(group.layer.alpha) as f32;
                 let filter = FilterKind::from_mode(self.frame.filter.mag);
                 self.draw(
@@ -236,8 +237,8 @@ impl Planner<'_> {
                     filter,
                     x,
                     y,
-                    width,
-                    height,
+                    f64::from(width) * scale_x,
+                    f64::from(height) * scale_y,
                     alpha,
                     DrawKind::Quad,
                 )
@@ -397,13 +398,16 @@ impl Planner<'_> {
             Variant::Fixed => fixed_pipeline_alpha(layer.alpha) as f32,
             Variant::Psc | Variant::Psd => sa,
         };
-        if draw_w > 0.0 && draw_h > 0.0 {
+        let (scale_x, scale_y) = layer.affine_scale();
+        let draw_w = draw_w * scale_x;
+        let draw_h = draw_h * scale_y;
+        if draw_w != 0.0 && draw_h != 0.0 {
             push_quad_uv(
                 self.vertices,
                 self.dst_width,
                 self.dst_height,
-                x as f64,
-                y as f64,
+                x,
+                y,
                 draw_w,
                 draw_h,
                 alpha,
@@ -444,6 +448,8 @@ impl Planner<'_> {
         };
         let explicit_size = layer.image_size();
         let (x, y) = (layer.transform.x, layer.transform.y);
+        // 普通图层缩放(`FBX/FBY` ÷10000);0 维度由 `draw_uv` 跳过。
+        let (scale_x, scale_y) = layer.affine_scale();
         let alpha = fixed_pipeline_alpha(layer.alpha) as f32;
         if self.trace_geometry {
             log::trace!(
@@ -503,8 +509,8 @@ impl Planner<'_> {
                 tex_id,
                 &view,
                 filter,
-                (x as f64, y as f64),
-                (draw_w, draw_h),
+                (x, y),
+                (draw_w * scale_x, draw_h * scale_y),
                 alpha,
                 DrawKind::Quad,
                 content.uv,
@@ -538,10 +544,10 @@ impl Planner<'_> {
                             texture_id,
                             &view,
                             filter,
-                            x as f64,
-                            y as f64,
-                            width,
-                            height,
+                            x,
+                            y,
+                            f64::from(width) * scale_x,
+                            f64::from(height) * scale_y,
                             alpha,
                             DrawKind::Quad,
                         )
@@ -572,10 +578,10 @@ impl Planner<'_> {
                             texture_id,
                             &view,
                             filter,
-                            x as f64,
-                            y as f64,
-                            width,
-                            height,
+                            x,
+                            y,
+                            f64::from(width) * scale_x,
+                            f64::from(height) * scale_y,
                             alpha,
                             DrawKind::Quad,
                         )
@@ -603,8 +609,8 @@ impl Planner<'_> {
                     filter,
                     x,
                     y,
-                    width,
-                    height,
+                    f64::from(width) * scale_x,
+                    f64::from(height) * scale_y,
                     alpha,
                     DrawKind::Quad,
                 )
@@ -625,8 +631,8 @@ impl Planner<'_> {
                     filter,
                     x,
                     y,
-                    width,
-                    height,
+                    f64::from(width) * scale_x,
+                    f64::from(height) * scale_y,
                     alpha,
                     DrawKind::Quad,
                 )
@@ -647,7 +653,7 @@ impl Planner<'_> {
                         &view,
                         FilterKind::Point,
                         (x, y),
-                        (draw_w, draw_h),
+                        (draw_w * scale_x, draw_h * scale_y),
                         alpha,
                         DrawKind::Quad,
                         content.uv,
@@ -672,8 +678,8 @@ impl Planner<'_> {
                     filter,
                     x,
                     y,
-                    width,
-                    height,
+                    f64::from(width) * scale_x,
+                    f64::from(height) * scale_y,
                     alpha,
                     DrawKind::Quad,
                 )
@@ -838,8 +844,8 @@ impl Planner<'_> {
         filter: FilterKind,
         x: f64,
         y: f64,
-        width: u32,
-        height: u32,
+        width: f64,
+        height: f64,
         alpha: f32,
         kind: DrawKind,
     ) -> Result<(), Diag> {
@@ -850,7 +856,7 @@ impl Planner<'_> {
             view,
             filter,
             (x, y),
-            (f64::from(width), f64::from(height)),
+            (width, height),
             alpha,
             kind,
             [0.0, 0.0, 1.0, 1.0],
@@ -881,7 +887,7 @@ impl Planner<'_> {
         }
         self.pipelines
             .ensure_bind_group(self.ctx, texture_id, view, filter)?;
-        if width > 0.0 && height > 0.0 {
+        if width != 0.0 && height != 0.0 {
             push_quad_uv(
                 self.vertices,
                 self.dst_width,
@@ -1191,6 +1197,20 @@ pub(crate) fn push_quad_uv(
     alpha: f32,
     uv: [f32; 4],
 ) {
+    // 负缩放(`FBX/FBY<0`)= 镜像:折成「左/上边界 + 正宽高」并翻转 UV。
+    let (x, width, uv) = if width < 0.0 {
+        (x + width, -width, [uv[2], uv[1], uv[0], uv[3]])
+    } else {
+        (x, width, uv)
+    };
+    let (y, height, uv) = if height < 0.0 {
+        (y + height, -height, [uv[0], uv[3], uv[2], uv[1]])
+    } else {
+        (y, height, uv)
+    };
+    if width == 0.0 || height == 0.0 {
+        return;
+    }
     let target_w = f64::from(dst_width);
     let target_h = f64::from(dst_height);
     let left = 2.0 * x / target_w - 1.0;

@@ -311,8 +311,8 @@ impl SoftRenderer {
                             image,
                             0.0,
                             0.0,
-                            overlay.width,
-                            overlay.height,
+                            f64::from(overlay.width),
+                            f64::from(overlay.height),
                             255,
                             BlendMode::Normal,
                             frame.filter.mag,
@@ -1245,7 +1245,8 @@ fn draw_op(
             let filter = frame.filter.mag;
             {
                 let image = ImageRef::from_surface(surface);
-                draw_image(dst, image, x, y, width, height, alpha, mode, filter, None);
+                let (draw_w, draw_h) = scaled_dims(&group.layer, width, height);
+                draw_image(dst, image, x, y, draw_w, draw_h, alpha, mode, filter, None);
             }
             st.report.ops_drawn += 1;
         }
@@ -1464,13 +1465,14 @@ fn draw_transition(
     } else {
         layer_alpha(layer.alpha)
     };
+    let (draw_w, draw_h) = scaled_dims(layer, width, height);
     draw_image(
         dst,
         from_ref,
         x,
         y,
-        width,
-        height,
+        draw_w,
+        draw_h,
         alpha,
         mode,
         filter,
@@ -1602,6 +1604,8 @@ fn draw_layer(
         st.skip_op(op, format!("blend.{}", layer.blend.name()));
         return;
     };
+    // 普通图层缩放(`FBX/FBY` ÷10000);0 维度由 draw_image 直接跳过。
+    let (scale_x, scale_y) = layer.affine_scale();
     if let Some(texture) = st.texture_overrides.get(&layer.id) {
         let (width, height) = match layer.image_size() {
             Some(size) => (size.width, size.height),
@@ -1611,13 +1615,14 @@ fn draw_layer(
         let (x, y) = (layer.transform.x, layer.transform.y);
         {
             let image = ImageRef::from_texture(texture);
+            let (draw_w, draw_h) = scaled_dims(layer, width, height);
             draw_image(
                 dst,
                 image,
                 x,
                 y,
-                width,
-                height,
+                draw_w,
+                draw_h,
                 layer_alpha(layer.alpha),
                 mode,
                 filter,
@@ -1652,8 +1657,8 @@ fn draw_layer(
                             image,
                             x,
                             y,
-                            width,
-                            height,
+                            f64::from(width) * scale_x,
+                            f64::from(height) * scale_y,
                             layer_alpha(layer.alpha),
                             mode,
                             filter,
@@ -1685,8 +1690,8 @@ fn draw_layer(
                             image,
                             x,
                             y,
-                            width,
-                            height,
+                            f64::from(width) * scale_x,
+                            f64::from(height) * scale_y,
                             layer_alpha(layer.alpha),
                             mode,
                             filter,
@@ -1714,8 +1719,8 @@ fn draw_layer(
                     image,
                     x,
                     y,
-                    width,
-                    height,
+                    f64::from(width) * scale_x,
+                    f64::from(height) * scale_y,
                     layer_alpha(layer.alpha),
                     mode,
                     filter,
@@ -1738,8 +1743,8 @@ fn draw_layer(
                     image,
                     x,
                     y,
-                    width,
-                    height,
+                    f64::from(width) * scale_x,
+                    f64::from(height) * scale_y,
                     layer_alpha(layer.alpha),
                     mode,
                     frame.filter.mag,
@@ -1766,8 +1771,8 @@ fn draw_layer(
                     image,
                     x,
                     y,
-                    width,
-                    height,
+                    f64::from(width) * scale_x,
+                    f64::from(height) * scale_y,
                     layer_alpha(layer.alpha),
                     mode,
                     filter,
@@ -2054,21 +2059,29 @@ struct TransitionMask<'a> {
     crossfade: bool,
 }
 
+/// 图层绘制尺寸:引擎 `FBX/FBY` 缩放 × 基础宽高。
+///
+/// 缩放公式见 [`Layer::affine_scale`];`0` 保持为 0(零尺寸不画)。
+fn scaled_dims(layer: &Layer, width: u32, height: u32) -> (f64, f64) {
+    let (sx, sy) = layer.affine_scale();
+    (f64::from(width) * sx, f64::from(height) * sy)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_image(
     dst: &mut Surface,
     image: ImageRef<'_>,
     x: f64,
     y: f64,
-    dest_width: u32,
-    dest_height: u32,
+    dest_width: f64,
+    dest_height: f64,
     alpha: u8,
     blend: BlendMode,
     filter: FilterMode,
     transition: Option<TransitionMask<'_>>,
 ) {
-    if dest_width == 0
-        || dest_height == 0
+    if dest_width == 0.0
+        || dest_height == 0.0
         || image.width == 0
         || image.height == 0
         || dst.width == 0
@@ -2076,34 +2089,58 @@ fn draw_image(
     {
         return;
     }
-    // 位置是**亚像素**(引擎顶点为 float)。覆盖的整数像素范围取
-    // `[floor(x), floor(x)+w+]`,取样相位由 `x` 的小数部分承担 ——
-    // 与官方 D3D9 光栅化 + 纹理坐标口径一致。
-    let x0i = x.floor() as i64;
-    let y0i = y.floor() as i64;
-    let clip_x0 = x0i.max(0);
-    let clip_y0 = y0i.max(0);
-    // 亚像素时最多多覆盖 1 个像素;整数时严格 `[x, x+w)`(与旧行为逐位相同)。
-    let extra = i64::from(!(x.fract() == 0.0 && y.fract() == 0.0));
-    let clip_x1 = x0i
-        .saturating_add(i64::from(dest_width) + extra)
-        .min(i64::from(dst.width));
-    let clip_y1 = y0i
-        .saturating_add(i64::from(dest_height) + extra)
-        .min(i64::from(dst.height));
+    // 负缩放(`FBX/FBY<0`)是镜像:官方顶点 `x1=x0+(FBX/10000)*w` 会
+    // 反向,纹理 u 也反向。这里把负尺寸折成「左边界 + 正宽」并在取样
+    // 时翻相位,保持与正缩放同一套光栅化。
+    let flip_x = dest_width < 0.0;
+    let flip_y = dest_height < 0.0;
+    let (left, top) = if flip_x {
+        (x + dest_width, y)
+    } else {
+        (x, y)
+    };
+    let (left, top) = if flip_y {
+        (left, top + dest_height)
+    } else {
+        (left, top)
+    };
+    let width = dest_width.abs();
+    let height = dest_height.abs();
+    // 位置/尺寸是**亚像素**(引擎顶点为 float/16.16)。覆盖的整数像素
+    // 范围取 `[left, left+width)` 向上取整;取样相位由 `left/top` 与
+    // `width/height` 的小数部分共同承担。
+    let clip_x0 = (left.floor() as i64).max(0);
+    let clip_y0 = (top.floor() as i64).max(0);
+    let clip_x1 = ((left + width).ceil() as i64).min(i64::from(dst.width));
+    let clip_y1 = ((top + height).ceil() as i64).min(i64::from(dst.height));
     if clip_x1 <= clip_x0 || clip_y1 <= clip_y0 {
         return;
     }
-    // 相位为零且尺寸一致时走整像素快路径(逐位与旧实现相同)。
-    let integral = x.fract() == 0.0 && y.fract() == 0.0;
-    let direct = integral && dest_width == image.width && dest_height == image.height;
+    // 整数位置 + 整数尺寸才走旧的整像素路径(逐位与旧实现相同);
+    // 任一维度带小数则走 `sample_subpixel`。
+    let integral = left.fract() == 0.0
+        && top.fract() == 0.0
+        && width.fract() == 0.0
+        && height.fract() == 0.0;
+    let dest_w_u = width as u32;
+    let dest_h_u = height as u32;
+    let direct = integral && dest_w_u == image.width && dest_h_u == image.height;
     // psC/psD 由像素着色器接管源色;固定管线才做 stage0/stage1 归约。
     let shader_stage = transition.is_some_and(|mask| mask.hlsl_mask || mask.crossfade);
     for py in clip_y0..clip_y1 {
         for px in clip_x0..clip_x1 {
-            // 目标像素中心相对层原点的**浮点**偏移(可能为负,取样时钳到 0)。
-            let dxf = (px as f64 + 0.5) - x;
-            let dyf = (py as f64 + 0.5) - y;
+            // 目标像素中心相对层原点的**浮点**偏移(可能为负,取样时钳到 0);
+            // 负缩放时从右/下边界反算,使 u/v 镜像。
+            let dxf = if flip_x {
+                x - (px as f64 + 0.5)
+            } else {
+                (px as f64 + 0.5) - x
+            };
+            let dyf = if flip_y {
+                y - (py as f64 + 0.5)
+            } else {
+                (py as f64 + 0.5) - y
+            };
             let mut src = if direct {
                 let sx = (dxf.max(0.0) as u32).min(image.width - 1);
                 let sy = (dyf.max(0.0) as u32).min(image.height - 1);
@@ -2113,8 +2150,8 @@ fn draw_image(
                     image,
                     dxf.max(0.0) as u32,
                     dyf.max(0.0) as u32,
-                    dest_width,
-                    dest_height,
+                    dest_w_u,
+                    dest_h_u,
                     filter,
                 )
             } else {
@@ -2124,8 +2161,8 @@ fn draw_image(
             let alpha = match transition {
                 Some(mask) => {
                     let mask_px = if integral
-                        && dest_width == mask.image.width
-                        && dest_height == mask.image.height
+                        && dest_w_u == mask.image.width
+                        && dest_h_u == mask.image.height
                     {
                         let mx = (dxf.max(0.0) as u32).min(mask.image.width - 1);
                         let my = (dyf.max(0.0) as u32).min(mask.image.height - 1);
@@ -2135,8 +2172,8 @@ fn draw_image(
                             mask.image,
                             dxf.max(0.0) as u32,
                             dyf.max(0.0) as u32,
-                            dest_width,
-                            dest_height,
+                            dest_w_u,
+                            dest_h_u,
                             filter,
                         )
                     } else {
@@ -2247,15 +2284,15 @@ fn sample_subpixel(
     image: ImageRef<'_>,
     dxf: f64,
     dyf: f64,
-    dest_width: u32,
-    dest_height: u32,
+    dest_width: f64,
+    dest_height: f64,
     filter: FilterMode,
 ) -> [u8; 4] {
-    if image.width == 0 || image.height == 0 || dest_width == 0 || dest_height == 0 {
+    if image.width == 0 || image.height == 0 || dest_width <= 0.0 || dest_height <= 0.0 {
         return [0, 0, 0, 0];
     }
-    let sx = dxf * f64::from(image.width) / f64::from(dest_width) - 0.5;
-    let sy = dyf * f64::from(image.height) / f64::from(dest_height) - 0.5;
+    let sx = dxf * f64::from(image.width) / dest_width - 0.5;
+    let sy = dyf * f64::from(image.height) / dest_height - 0.5;
     let max_x = (image.width - 1) as f64;
     let max_y = (image.height - 1) as f64;
     match filter {

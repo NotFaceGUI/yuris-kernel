@@ -38,7 +38,9 @@ fn table() -> ParamTable {
         commands: vec![
             command(
                 "CG",
-                &["ID", "FILE", "E", "A", "X", "Y", "Z", "SX", "SY", "MODE"],
+                &[
+                    "ID", "FILE", "E", "A", "X", "Y", "Z", "SX", "SY", "MODE", "FBX", "FBY",
+                ],
             ),
             command("CGEND", &["ID"]),
             command(
@@ -125,6 +127,17 @@ fn png_bytes_for(color: Rgba<u8>) -> Vec<u8> {
     out
 }
 
+fn png_strip_red_blue() -> Vec<u8> {
+    let mut image = RgbaImage::new(2, 1);
+    image.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+    image.put_pixel(1, 0, Rgba([0, 0, 255, 255]));
+    let mut out = Vec::new();
+    PngEncoder::new(&mut out)
+        .write_image(image.as_raw(), 2, 1, ExtendedColorType::Rgba8)
+        .expect("encode fixture");
+    out
+}
+
 fn texture_store(entries: &[(&[u8], Vec<u8>)]) -> TextureStore {
     let mut source = MemSource::new(Codec::Cp932);
     for (path, bytes) in entries {
@@ -181,6 +194,72 @@ fn asset_layer_composites_to_screen() {
     let decoded = image::load_from_memory(&first_png).expect("decode png");
     assert_eq!(decoded.width(), 8);
     assert_eq!(decoded.height(), 8);
+}
+
+/// 0.495 `FUN_00414ba4`:普通图层宽度 = `(FBX/10000) * 自然宽`
+/// (同 y/FBY)。2×2 图缩到 50% 后应只覆盖 1×1。
+#[test]
+fn affine_scale_scales_layer_quad() {
+    let table = table();
+    let mut gfx = state(Viewport::new(8, 8), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"S".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"red".to_vec())),
+                arg(&table, "CG", "X", Value::Int(2)),
+                arg(&table, "CG", "Y", Value::Int(2)),
+                arg(&table, "CG", "FBX", Value::Int(5000)),
+                arg(&table, "CG", "FBY", Value::Int(5000)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let mut backend = SoftRenderer::new(texture_store(&[(
+        b"red.png",
+        png_bytes_for(Rgba([255, 0, 0, 255])),
+    )]));
+    let out = backend.render_frame(&frame);
+
+    assert_eq!(out.surface.pixel(2, 2), Some([255, 0, 0, 255]));
+    assert_eq!(out.surface.pixel(3, 3), Some([255, 255, 255, 255]));
+    assert_eq!(out.surface.pixel(1, 1), Some([255, 255, 255, 255]));
+    assert_eq!(out.report.ops_drawn, 1);
+    assert_eq!(out.report.skipped_ops_total, 0);
+}
+
+/// 负 `FBX` 是镜像:2×1(左红右蓝)以 `X=2, FBX=-10000` 画到 [0,2),
+/// 左像素应取源右(蓝),右像素取源左(红)。
+#[test]
+fn negative_affine_scale_mirrors_layer() {
+    let table = table();
+    let mut gfx = state(Viewport::new(4, 1), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"M".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"strip".to_vec())),
+                arg(&table, "CG", "X", Value::Int(2)),
+                arg(&table, "CG", "Y", Value::Int(0)),
+                arg(&table, "CG", "FBX", Value::Int(-10000)),
+                arg(&table, "CG", "FBY", Value::Int(10000)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let mut backend = SoftRenderer::new(texture_store(&[(b"strip.png", png_strip_red_blue())]));
+    let out = backend.render_frame(&frame);
+    assert_eq!(out.surface.pixel(0, 0), Some([0, 0, 255, 255]));
+    assert_eq!(out.surface.pixel(1, 0), Some([255, 0, 0, 255]));
+    assert_eq!(out.surface.pixel(2, 0), Some([255, 255, 255, 255]));
 }
 
 #[test]

@@ -109,14 +109,14 @@ fn affine_params_land_on_engine_fields() {
     // 未给出的字段保持引擎初值(`FUN_00465730`)。
     assert_eq!(a.md, 0x0080_8080);
     assert_eq!(a.flags, 0);
-    assert!(matches!(
-        l.status,
-        LayerStatus::Unimplemented("gfx.affine.unverified")
-    ));
+    // 普通图层几何已实现(0.495 0x414ba4):缩放 = FBX/10000、FBY/10000;
+    // rz/ex/sd 属主窗口/滤镜,只留可恢复诊断,不再整层 Unimplemented。
+    assert_eq!(l.affine_scale(), (0.5, 0.25));
+    assert!(!matches!(l.status, LayerStatus::Unimplemented(_)));
     assert!(f
         .diagnostics
         .iter()
-        .any(|d| d.code == "gfx.affine.unverified"));
+        .any(|d| d.code == "gfx.affine.effect-unverified"));
     let ops = f.passes.iter().flat_map(|p| p.ops.iter());
     assert!(ops
         .into_iter()

@@ -26,9 +26,12 @@
 //! - 模态期间 `0x440370/0x440398` 暂停/恢复宿主计时器 ⇒ 引擎是**同步阻塞**;
 //!   内核改为「任务挂起 + 宿主回答」,见 [`DialogRequest`]。
 //!
-//! 未取证参数(`STR2..8`、`A/A2..8`、`E/E2..8`、`FILEOPEN`、`FOLDER`、
-//! `CHECKBOX`、`SLIDER`、`CHECK..`、`NOWAIT`)一律不猜:命中即 `Unimplemented`,
-//! 不弹窗、不写回(DIV-RT-044)。
+//! 扩展参数(`STR2..8`、`A/A2..8`、`E/E2..8`、`FILEOPEN`、`FILEEXT`、
+//! `FOLDER`、`CHECKBOX`、`SLIDER`、`CHECK..`、`NOWAIT`)在 0.495/0.479
+//! 处理体与对话框过程里**没有任何读取点**(全函数扫描;`0x43fc74`/
+//! `0x4403d0`,0.479 `0x439cd8`)⇒ 官方行为是「接受命令、完全忽略」。
+//! 内核不猜语义、不生成假控件:只记录名字到
+//! [`DialogRequest::ignored_params`],不弹新控件、不写回(DIV-RT-044)。
 
 use crate::expr::LValue;
 
@@ -140,6 +143,14 @@ pub struct DialogRequest {
     pub let_target: Option<LValue>,
     /// `LETSTR` 目标(仅 INPUT 模式写回输入文本;None = 脚本没给)。
     pub letstr_target: Option<LValue>,
+    /// 官方 0.495/0.479 处理体**从不读取**的已声明参数名(按命令窗口顺序)。
+    ///
+    /// 这些槽位在 `ysc.ybn` 里存在(`STR2..8`、`A*`、`E*`、`CHECK*`、
+    /// `FILEOPEN`、`FILEEXT`、`FOLDER`、`CHECKBOX`、`SLIDER`、`NOWAIT`),
+    /// 但官方处理体 `0x43fc74` 与对话框过程 `0x4403d0` 没有任何读取点,
+    /// 也不求值表达式(REA 0.495;0.479 `0x439cd8` 同构)。内核按官方行为
+    /// 接受并忽略,只在请求里保留名字供诊断/trace 使用。
+    pub ignored_params: Vec<String>,
 }
 
 impl DialogRequest {

@@ -58,7 +58,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `SAVE` | save | 290 | `file/save.html` | `0x44c45c` | ✅ 实现(B1) | 装存档宿主时命令时刻预约(值快照)/刷盘;`SET` 槽事件携带变量引用;未装宿主仍只发 `DomainCall`。REA 锚勘误:`0x44e1c8` 是 SAVEINFO(DIV-RT-042) |
 | `LOAD` | save | 289 | `file/load.html` | `0x44708c` | ✅ 实现(B1) | 装存档宿主时块类型 2 按 var_id 直接恢复、块类型 0 写 `LET` 整组;`LET` 槽事件携带变量引用(DIV-RT-042) |
 | `CGACT` | graphics | 274 | `cg/cgact.html` | `0x42c4a4` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `END` | system | 205 | `control/end.html` | `0x441334` | ✅ 实现 | 本 600 帧未触发;静态语料有 205 处 |
+| `END` | system | 205 | `control/end.html` | `0x441334` | ✅ 实现 | 全程序退出(非单任务):`StepOutcome::ExitProgram{restart}` → `ChainReport.program_exit` → `Engine::restart_requested()`;`RESTART` 取低 8 位;REA 0x441334/0x403bfc/0x403e78(DIV-RT-052) |
 | `GO` | vm | 195 | `control/go.html` | `0x445830` | ✅ 实现 | 保持 |
 | `FLT` | vm | 173 | `variable/flt.html` | `0x4442ec` | ✅ 实现 | 保持 |
 | `LOOPBREAK` | vm | 159 | `control/loopbreak.html` | `0x44808c` | ✅ 实现 | 保持 |
@@ -80,7 +80,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `MATH` | vm | 21 | `math/math.html` | `0x4482c4` | ✅ 实现 | 保持 |
 | `FILEACT` | file | 20 | `file/fileact.html` | `0x441370` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `TASKINFO` | vm | 19 | `control/taskinfo.html` | `0x4523fc` | ✅ 实现 | 21 槽:A/FILE0/FILENO0/LINE0/TEXTLINE/NEXTVOICE 按 0.495 逐分支补齐(2026-10-26);SCRIPTPOS 用 `0x452a54`/`0x450fe0` 引擎字节格式(三栈+text_line/pc/脚本名);FILENO0→SCRIPTPOS fallthrough;GOLABEL/GOSUBLABEL/TEXTPOS 官方无分支 → 对齐 no-op(DIV-RT-025) |
-| `DIALOG` | system | 17 | `other/dialog.html` | `0x43fc74` | ✅ 实现 | VM 状态机:任务挂起 + `Vm::answer_dialog`;LET=1 基按钮序号,LETSTR=输入文本(DIV-RT-044) |
+| `DIALOG` | system | 17 | `other/dialog.html` | `0x43fc74` | ✅ 实现 | VM 状态机:任务挂起 + `Vm::answer_dialog`;LET=1 基按钮序号,LETSTR=输入文本;扩展参数(STR2..8/A*/E*/CHECK*/FILEOPEN/FILEEXT/FOLDER/CHECKBOX/SLIDER/NOWAIT)官方 0.495/0.479 零读取 ⇒ 对齐 no-op,名字入 `DialogRequest.ignored_params`(DIV-RT-044) |
 | `S_FLT` | vm | 17 | `variable/s_flt.html` | `0x4634d8` | ✅ no-op | 同 S_INT(DIV-RT-043) |
 | `EMOTE` | emote | 13 | — | `0x4405a4` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `TASK` | vm | 10 | `control/task.html` | `0x4506f4` | ✅ 实现 | 保持 |

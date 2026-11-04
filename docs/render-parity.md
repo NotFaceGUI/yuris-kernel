@@ -338,12 +338,21 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 
 ## 7. 变换与几何
 
-- `X/Y` 存 i64 引擎像素;gfx 不做 16.16、不做半像素、不做缩放原点。
-- 引擎绘制函数(`FUN_00414ba4` 行 117-125)把 `+0x1b0/1b8/1c0/1c8/1d0/1d8`
-  除以 100.0,把 `+0x1f8/1fc/200` 的 f32 除以 100.0;行 220-275 用
-  `ROUND(v * 65536)` 转 16.16 再拆分;行 322-336 构建旋转矩阵
-  (`×π/180`,常量 0x58ebf8)。半像素:行 157/190/214 等有 `-0.5`
-  (常量 0x58ebd0)。
+- `X/Y` 存 f64 引擎像素;gfx 已接 `FBX/FBY` 缩放(`Layer::affine_scale`);
+  官方顶点的 `-0.5` 半像素与 16.16 截断口径仍未落地(见下)。
+- **2026-11-04 续证修正**:`FUN_00414ba4` 的普通图层网格只消费
+  `X/Y +0x1b0/1b8`、`FBX/FBY +0x1c0/1c8`、`FCX/FCY +0x1d0/1d8`;
+  四角为 `(X-0.5, Y-0.5)` 到 `(X-0.5+(FBX/10000)*tileW,
+  Y-0.5+(FBY/10000)*tileH)`(tile 表 `+0xb0/+0x130` 来自
+  `FUN_0040af1c` 的 X/Y tile 切分)。16.16 是 **FPU 截断(CW OR 0xC00)
+  + 负数 +0xFFFF 修正**,不是 round;半像素 `-0.5` 在 x/y 初值上。
+  `FCX/FCY` 只做 `-C/+C` 两次平移(0x415462/0x41551b),普通图层相消。
+- **`FRX/FRY` 在 0.495 全 `.text` 无绘制读取点**;`FRZ` 只在
+  `+0xa4==2` 主窗口分支(`0x414075`,`*π/180/100`)旋转;`FEX/FEY`
+  同分支(`0x414031/3b`),`FSD` 在图像加工 `0x40e109`,`FMD` 在主窗口
+  `0x413f6f`,`FEZ/FQU` 绘制不读,`F` 只在 MODE 3 作 `YS_FadeVal`。
+  初版「D3DXMatrixRotationYawPitchRoll(FRY,FRZ,FRX)」读法作废
+  (实参经 x87 栈修正为 `(Y-0.5, FCX, FCY)`,且目标是平移/compose)。
 - `FX/FY/FBX/FBY/FRX/FRY/FRZ/FCX/FCY/FEX/FEY/FEZ/FSD/FMD/FQU/F`
   在 ERIS 里以 ×100 整数出现(例 `FX=@fx*100`、`FBX=10000`、`FCX=5000`)。
   **槽位→字段绑定已闭**(DIV-GFX-069):`X/FX` 都写 `+0x1b0`(`X` 另写
@@ -351,8 +360,15 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
   `FBX/FBY`→`+0x1c0/1c8`,`FRX/FRY/FRZ`→`+0x1f8/1fc/200`(f32),
   `FCX/FCY`→`+0x1d0/1d8`,`FEX/FEY/FEZ`→`+0x1e0/1e8/1f0`,
   `FSD/FMD/FQU/F`→`+0x204/208/20c/214`。gfx 落到 `Transform.affine`
-  (引擎原值)并把 `FX/FY` 换算进 `transform.x/y`;绘制侧合成公式仍未对拍
-  (DIV-GFX-070),非默认值时图层标 `gfx.affine.unverified`。
+  (引擎原值)并把 `FX/FY` 换算进 `transform.x/y`。
+- **单位**:`FUN_0040ae99` 把 `+0x78/+0x7c` 直接写 tile 源并
+  `FCX=width*0.5` ⇒ 宽高/tile 表/FCX 都是像素;有效缩放 =
+  `FBX/10000`(10000 = 1.0)。
+- **已落地**:soft `draw_image` 改 f64 尺寸 + 亚像素采样,soft/wgpu
+  共用 `Layer::affine_scale()`;整层 `Unimplemented` 移除,主窗口/滤镜
+  字段只出 `gfx.affine.effect-unverified`。**未落地**:官方 `-0.5`
+  半像素与 16.16 的最终像素口径待官方截图对拍;主窗口 `+0xa4==2` 的
+  FRZ/FEX/FEY/FMD 变换另案。
 - UV 平铺/镜像(全局 `DAT_00801334` 1/2/3)未实现;`CGACT` 的
   `SIZE/ROTATION/...` 是图像加工,不是合成变换(DIV-GFX-013)。
 

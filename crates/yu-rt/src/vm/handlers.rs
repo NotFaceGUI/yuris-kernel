@@ -1182,6 +1182,13 @@ impl Vm {
     }
 
     /// `END[RESTART]`:手册 `control/end.html`。
+    ///
+    /// 引擎语义是**全程序退出**,不是结束当前任务(REA 0.495 `0x441334`):
+    /// 处理体把 `RESTART` 参数值的**低 8 位**写入 `[0x80152c]`,再把
+    /// `[0x80186c]` 置 1;主循环看到后者就不再跑帧泵(0x403bfc/0x4040f8),
+    /// 由宿主层 `WM_CLOSE` 关窗。`RESTART=1` 在进程收尾时用
+    /// `CreateProcessA` 重启自身(0x403e78)。因此这里返回
+    /// [`StepOutcome::ExitProgram`],由调度器终止整条任务链;内核不重启进程。
     fn op_end(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         let mut restart = false;
         for w in &cmd.windows {
@@ -1190,7 +1197,8 @@ impl Vm {
             }
             let v = self.eval_window(st, w)?;
             if w.rec.kind == 0 {
-                restart = v.as_int().unwrap_or(0) != 0;
+                // 官方 `mov [0x80152c], al` ⇒ 只保留低 8 位。
+                restart = (v.as_int().unwrap_or(0) as u8) != 0;
             }
         }
         self.emit(VmEvent::End {
@@ -1198,7 +1206,7 @@ impl Vm {
             restart,
         });
         let _ = st;
-        Ok(StepOutcome::Finish)
+        Ok(StepOutcome::ExitProgram { restart })
     }
 
     // ---------------------------------------------------------- 变量
@@ -5042,7 +5050,8 @@ impl Vm {
         let mut input_limit = 0u32;
         let mut default_button = 0u8;
         let mut icon = crate::dialog::DialogIcon::None;
-        let mut unsupported: Option<String> = None;
+        // 官方处理体不读取的声明参数:不猜语义、不求值,只记名字。
+        let mut ignored_params: Vec<String> = Vec::new();
         let mut event_args: Vec<ArgValue> = Vec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
@@ -5139,27 +5148,22 @@ impl Vm {
                     event_args.push(ArgValue::new(w.rec.kind, v));
                 }
                 other => {
-                    // STR2..8 / A / E / CHECK / FILEOPEN / FOLDER / CHECKBOX /
-                    // SLIDER / NOWAIT:官方处理体未定位消费点,禁止猜(DIV-RT-044)。
-                    unsupported = Some(if other.is_empty() {
-                        format!("@{}(工程 ysc 无参数名)", w.rec.kind)
+                    // `STR2..8` / `A*` / `E*` / `CHECK*` / `FILEOPEN` /
+                    // `FILEEXT` / `FOLDER` / `CHECKBOX` / `SLIDER` / `NOWAIT`:
+                    // 官方 0.495 `0x43fc74` + 过程 `0x4403d0`(0.479
+                    // `0x439cd8` 同构)对这些槽位**零读取**,也不求值表达式。
+                    // 官方行为 = 接受命令并忽略;内核不生成假控件、不写回。
+                    ignored_params.push(if other.is_empty() {
+                        format!("@{}", w.rec.kind)
                     } else {
                         other.to_string()
                     });
                 }
             }
         }
-        // 事件是事实通知(即使参数未取证也记录这次调用);权威状态在
-        // `Vm::pending_dialogs`(不可重放)。
+        // 事件是事实通知;权威状态在 `Vm::pending_dialogs`(不可重放)。
+        // 被忽略的扩展参数不做求值,因此不会进入 event_args(官方同样不读)。
         self.emit_domain(Domain::System, "DIALOG", event_args);
-        if let Some(p) = unsupported {
-            return Err(diag::unimplemented(
-                code::rt::CMD_UNIMPLEMENTED,
-                Boundary::Script,
-                format!("DIALOG 参数 {p} 的语义未取证(不弹窗、不写回;DIV-RT-044)"),
-            )
-            .into());
-        }
         // 回答时才写回 ⇒ 现在就把目标变量校验掉,避免宿主回答后才发现
         // 未声明/类型不符(官方 LET 只接受 int/float 变量,LETSTR 只接受
         // 字符串变量;错误消息 0x18b14)。
@@ -5231,6 +5235,7 @@ impl Vm {
             default_input,
             let_target,
             letstr_target,
+            ignored_params,
         });
         Ok(StepOutcome::Yield)
     }

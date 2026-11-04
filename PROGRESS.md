@@ -12850,3 +12850,167 @@ wgpu `target/tmp/shot-f1000-wgpu.png`,外字 `?`/`~` 均可见。
 
 **台账**:`DIV-GFX-076` 更新(状态/§5/§7)、`gfx-unimplemented-todo`
 DIV-GFX-076 行、`render-parity` 文本节。**未执行任何 git 写操作。**
+
+## 成果 END-DIALOG (2026-11-04) · END 全程序退出 + DIALOG 扩展参数对齐官方 no-op
+
+**证据**:见 `docs/tasks/task-end-dialog-affine.md` §1/§2。0.495 `END`
+处理体 `0x441334` 只写 restart 低 8 位 `[0x80152c]` 与退出字节
+`[0x80186c]`;主循环 `0x403bfc`/帧泵 `0x4040f8` 停泵,`0x41ae3c` 发
+`WM_CLOSE`,收尾 `0x403e78` 用 `CreateProcessA` 重启自身。0.479
+`0x43a619`(声明序号 12)同构。`DIALOG` `0x43fc74` + 过程 `0x4403d0`
+(0.479 `0x439cd8` 同构)对 `STR2..8`/`A*`/`E*`/`CHECK*`/`FILEOPEN`/
+`FILEEXT`/`FOLDER`/`CHECKBOX`/`SLIDER`/`NOWAIT` 零读取、不求值。
+
+**改动**:
+- `yu-rt::task`:`StepOutcome::ExitProgram { restart }`、`ProgramExit`、
+  `ChainReport.program_exit`;`pump_node`/`step_frame`/`tick_frame` 收到后
+  立即停泵并终止全部任务,`main_finished = true`;`TASKEND` 不变。
+- `yu-rt::vm`:`op_end` 返回 `ExitProgram`,restart 取参数低 8 位;
+  `step_command` 对 `ExitProgram` 与 `Finish` 同口径回收执行位/发
+  `TaskFinish`。
+- `yu-engine`:`tick_inner` 消费 `program_exit`;新增
+  `restart_requested()`,不自行重启进程。
+- `yu-rt::dialog`:`DialogRequest.ignored_params`;`op_dialog` 对官方不读的
+  参数跳过求值、不报 `Unimplemented`,只记名字。
+
+**验证**:
+```text
+cargo test -p yu-rt --test fixture -- end_ taskend_   → 6 passed
+cargo test -p yu-rt --test fixture -- dialog_        → 4 passed
+cargo test -p yu-rt --test fixture                   → 115 passed
+cargo check --workspace --all-targets                → Finished
+cargo test --workspace --all-targets                 → 唯一失败:
+  yu-cli logging_guards::silent_fallback_audit
+  (yu-gfx/src/state.rs 未标注 unwrap_or 21 > 白名单 18;本轮未改该文件,
+   非本轮引入)
+```
+
+**夹具勘误**(旧断言基于「END 只停当前任务」的错误前提):
+- `taskend_without_id_ends_only_self_and_main_continues`:子任务标签
+  `SUB.BODY` 由组 4 修正为组 5(TASKINFO 插在主 LET 前,组 4 是主线 END)。
+- `taskend_stops_neighbor_commands_and_rebuild_uses_new_entry`、
+  `higher_z_task_runs_before_lower_z`:主线用 `WAIT[FRAME=100]` 保持存活
+  以观察子任务,不再用 `END` 充当「停主线」。
+- `dialog_unsupported_param_is_unimplemented` 改为
+  `dialog_unsupported_param_is_aligned_noop`(官方证据:扩展参数忽略)。
+
+## 成果 AFFINE-RE (2026-11-04) · 仿射绘制公式取证(0.495 全偏移扫描)
+
+**证据**:
+- `FUN_0040af1c` 反编译:网格表构造器。`+0xa6`/`+0xb0` = X 方向
+  tile 数与每 tile 宽度,`+0xa7`/`+0x130` = Y 方向 tile 数与每 tile 高度;
+  阈值 0x2000/0x1000/…/0x10 切分;`+0xa4==2` 主窗口直接写屏宽/屏高单 tile。
+  旧「部件×分块」口径应更名为 X/Y tile。
+- `FUN_00414ba4` 逐指令 + x87 栈修正(推栈使 `[esp+0x1a8]/[esp+0x1b0]`
+  偏移 8 字节,初版读错):普通图层四角 = `(X-0.5, Y-0.5)` +
+  `(FBX/10000)*tileW` / `(FBY/10000)*tileH`;4 个 fixed 值分别对应
+  x0/y0/x1/y1,FPU 截断(CW 0xC00)+ 负数 `+0xFFFF` 拆 16.16;
+  每格 5 顶点 triangle strip(`DrawPrimitiveUP(5,2,0x54)` @0x41590f)。
+- 全 `.text` disp32 扫描(`target/tmp/rea/scan_disp.py`):
+  `+0x1f8/+0x1fc`(FRX/FRY)除 `FUN_00414ba4` 载入外无读取;
+  `+0x200`(FRZ)只在 `0x414075` 主窗口分支;
+  `+0x1e0/+0x1e8`(FEX/FEY)只在 `0x414031/3b` 主窗口分支;
+  `+0x204`(FSD)在 `0x40e109` 图像加工;`+0x208`(FMD)在 `0x413f6f`;
+  `+0x20c`(FQU)无绘制读取;`+0x214`(F)只在 `0x416bcb` MODE 3 fade。
+- `FCX/FCY` 的 `-C/+C` 平移(0x415462/0x41551b)在普通图层相消;
+  初版「D3DXMatrixRotationYawPitchRoll(FRY,FRZ,FRX)」读法作废
+  (`0x4ca3fd` 实参为 `(Y-0.5, FCX, FCY)`;`0x4ca416` 是 7 参 compose)。
+
+**单位已定**:`FUN_0040ae99` 把 `layer+0x78/+0x7c` 直接写 tile 源,
+并 `FCX=width*0.5`、`FCY=height*0.5` ⇒ 宽高/tile 表/FCX 都是像素;
+有效缩放 = `FBX/10000`(10000 = 1.0)。
+
+**仍未闭**:soft `draw_image` 收 `u32` 宽高,任意比例会取整,需先改
+浮点/16.16 四角;主窗口 `+0xa4==2` 的 FRZ/FEX/FEY/FMD 变换另案。
+本机官方引擎无可枚举窗口(EnumWindows 0 个),运行时层 dump 不可用;
+本成果为纯静态 REA,未改绘制行为。
+
+**复核**:
+```text
+python tools/official_trace/dump_layer.py ...  → 进程启动但 hits=0(无可见窗口,环境限制)
+Ghidra headless: func_414ba4.c / func_40af1c / func_4ca416 / func_4ca2e9 落盘
+python target/tmp/rea/scan_disp.py <exe> 0x1b0 … 0x214 → 见上表
+```
+
+## 成果 AFFINE-SCALE (2026-11-04) · 普通图层 FBX/FBY 缩放落地(soft/wgpu 共用)
+
+**实现**:
+- `yu-gfx::Layer::affine_scale()`:`(FBX/10000, FBY/10000)`;默认
+  `10000` = 1.0,0 = 零尺寸。证据:0.495 `FUN_00414ba4` 网格
+  `x1=x0+(FBX/10000)*tileW`;`FUN_0040ae99` 证明宽高/tile/FCX 为像素。
+- soft `draw_image`:`dest_width/height` 由 `u32` 改 `f64`;整数尺寸走
+  原整像素快路径,小数尺寸走 `sample_subpixel`;裁剪窗改
+  `ceil(x+w)`。所有层/组/过渡/快照绘制点接入 `affine_scale`。
+- wgpu:`draw`/`draw_uv` 尺寸改 f64;组、普通层、过渡、快照绘制点
+  同步乘 scale。
+- `yu-gfx::state`:移除「非默认 affine ⇒ 整层 `LayerStatus::Unimplemented`」;
+  仅当层带主窗口/滤镜字段(`rz/ex/ey/sd/md/F`)时出可恢复诊断
+  `gfx.affine.effect-unverified`,后端照常绘制已实现的几何。
+
+**验证**:
+```text
+cargo check --workspace --all-targets                    → ok
+cargo test -p yu-gfx --test transform                    → 9 passed
+cargo test -p yu-backend-soft --test render              → 18 passed
+  (含 affine_scale_scales_layer_quad:2×2→1×1、
+   negative_affine_scale_mirrors_layer:负 FBX 左右镜像)
+cargo test -p yu-backend-wgpu --test wgpu affine_scale_matches_soft
+                                                         → 1 passed
+cargo test --workspace --all-targets                     → 唯一失败仍为
+  yu-cli logging_guards::silent_fallback_audit(yu-gfx state.rs 未标注
+  unwrap_or 21>18,本轮未改该文件,非本轮引入)
+```
+
+**未落地**:官方顶点 `-0.5` 半像素与 16.16 最终像素口径需官方截图
+对拍;主窗口 `+0xa4==2` 的 FRZ/FEX/FEY/FMD 变换另案。
+
+## 成果 PRE-PUSH-REVIEW (2026-11-04) · 推送前审查与全量验收
+
+**审查结论**:END/DIALOG/仿射 scale 的实现与台账一致;本轮未发现
+「跳过未知字段」「整层丢弃」「改测试期望换绿」类补丁。修正项:
+
+- `yu-gfx/tests/parity_fixes.rs::persistent_unsupported_attributes_keep_layer_unimplemented`:
+  旧夹具用 `MODE=3 + FRZ` 期待整层 `Unimplemented`。0.495 普通绘制体不读
+  `FRZ`(只属 `+0xa4==2` 主窗口分支),旧期望已失效;改用真正未取证的
+  `MID` 外部掩码继续验证「持久不可执行状态不被无参更新洗掉」,不是放宽断言。
+- `yu-gfx/src/state.rs`:3 处 `WINDOW[NO]` 缺省(主窗口 0,同 `WINDOWINFO`)
+  补 `silent-ok` 分类;`yu-cli logging_guards::silent_fallback_audit`
+  由存量红转绿(白名单未改)。
+- `yu-render/wgpu/src/passes.rs`:删除改为 f64 后残留的 `x as f64` 冗余转换。
+- 顺带修 `yu-platform/host-android` 两个存量红:
+  - `sound.rs` mixer `scratch` 按 48k/2ch 预留,设备为 96k 时
+    `scratch[..samples]` 越界 panic 并毒化 `SoundState`;改为 mixer 线程
+    按当前 `samples` 只增扩容(非实时回调,安全)。
+  - `lib.rs` `status_text()` 发布模式补回 `status=running`;只省字段,
+    不丢会话状态判据。
+- 文档:`DIV-GFX-069` 状态改为「绑定 + 普通图层缩放」;仿射公式中的
+  `FBX/100` 笔误统一为 `FBX/10000`;任务书顶部「soft 仍收 u32」等旧状态
+  改为已落地;`render-parity §7` 首条与 §7 后续半像素结论对齐。
+
+**验证命令与原始结果**:
+```text
+cargo build --workspace --all-targets                    → Finished
+cargo test -p yu-rt --test fixture end_                  → 6 passed
+cargo test -p yu-rt --test fixture dialog_               → 4 passed
+cargo test -p yu-rt --test fixture                       → 115 passed
+cargo test -p yu-gfx --test transform                    → 9 passed
+cargo test -p yu-gfx --test parity_fixes                 → 27 passed
+cargo test -p yu-gfx --test eris_first_screen            → 4 passed
+cargo test -p yu-backend-soft --test render              → 18 passed
+cargo test -p yu-backend-wgpu --test wgpu                → 35 passed(单独套件连跑 3 次)
+cargo test -p yu-host-android --test session             → 2 passed
+cargo test -p yu-cli --test logging_guards               → 3 passed
+```
+
+`cargo test --workspace --all-targets`(设 `YURIS_SAMPLE_ERIS_ROOT` /
+`YURIS_SAMPLE_ERIS_YSBIN`)全量跑到 wgpu 套件时仍偶发
+`blur_is_two_pass_box_and_matches_soft` 或
+`diffusion_matches_soft_across_sizes` 的 1 像素差;两用例单独重跑及
+wgpu 套件连跑 3 次均通过,属既有已知并行偶发(PROGRESS B14 段已记),
+非本轮仿射改动路径(默认 scale=1.0,两用例不设 FBX/FBY)。
+另设 `YURIS_SAMPLE_SDK0495` 时 `yu-sound gated_ogg_*` 的 2 条既有失败
+(装载当帧解码 / 回绕未 seek)仍在,与本轮无关;未设时按设计显式 SKIP。
+
+**未完成项**(未在本次审查中偷改):官方 `-0.5` 半像素、16.16 最终像素
+口径、主窗口 `+0xa4==2` 的 FRZ/FEX/FEY/FMD 变换仍归 DIV-GFX-070;
+E-mote 家族保持 `deferred(master)`。

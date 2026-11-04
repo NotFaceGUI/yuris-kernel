@@ -78,8 +78,26 @@ pub enum StepOutcome {
     /// (REA 0x44c451 / 0x4046fc)。与 [`StepOutcome::Yield`] 的区别是恢复
     /// 条件不同(输入推进 vs `+0x18`/`+0x1c` 计时)。
     TextYield,
-    /// 任务体走到 END / 基帧 RETURN:任务结束(手册 `basic/task.html`)。
+    /// 任务体走到基帧 RETURN:任务结束(手册 `basic/task.html`)。
     Finish,
+    /// `END`:全程序退出(手册 `control/end.html`;REA 0x441334)。
+    ///
+    /// 官方处理体只把 `RESTART` 的低 8 位写入全局 restart 字节、把全局退出
+    /// 字节置 1(0.495 `[0x80152c]` / `[0x80186c]`);主循环据此停帧泵,
+    /// 宿主层再 `WM_CLOSE`。因此它**不是**「结束当前任务」,调度器收到后
+    /// 必须停掉整条任务链,而不是只把执行者标 finished。
+    ExitProgram {
+        /// `RESTART` 低 8 位非 0(官方 `mov [restart], al` + 字节判零)。
+        restart: bool,
+    },
+}
+
+/// 一次全程序退出请求(官方 `END` 的内核投影)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgramExit {
+    /// 官方进程收尾时以 `CreateProcessA` 重启自身(REA 0x403e78)。
+    /// 内核只暴露标志;是否重启由宿主决定。
+    pub restart: bool,
 }
 
 /// 处理器产生的调度副作用(引擎:TASK/TASKEND 处理器直接写全局)。
@@ -230,6 +248,8 @@ pub struct ChainReport {
     /// 执行器报错(官方错误路径未取证 → 让出 + 结束 + 记录;DIV-RT-005)。
     pub errors: Vec<String>,
     pub main_finished: bool,
+    /// 本链收到 `END`(全程序退出);`Some` 时 `main_finished` 同时为真。
+    pub program_exit: Option<ProgramExit>,
 }
 
 /// 命令执行器抽象。由 `Vm` 实现(分派 + 求值 + 事件发射)。
@@ -422,13 +442,25 @@ impl Scheduler {
             self.step_frame(exec, now_ms, &mut report);
             exec.end_logical_frame(self.frame);
             report.logical_frames += 1;
+            // `END`:官方主循环在下一轮看到全局退出字节即不再跑帧泵
+            // (REA 0x403bfc/0x4040f8);续帧标志也不得再开新逻辑帧。
+            if report.program_exit.is_some() {
+                break;
+            }
             if !self.extra_frame {
                 break;
             }
         }
-        // 主线正常走到 END / 基帧 RETURN 也算结束(节点在 retain 前还带着标记)。
+        // 主线正常走到基帧 RETURN 也算结束(节点在 retain 前还带着标记)。
         if let Some(m) = self.nodes.iter().find(|n| n.main) {
             report.main_finished |= m.finished;
+        }
+        if report.program_exit.is_some() {
+            // 全程序退出不是「主任务单独结束」:所有任务一并终止。
+            report.main_finished = true;
+            for n in &mut self.nodes {
+                n.finished = true;
+            }
         }
         self.nodes.retain(|n| !n.finished);
         report
@@ -445,6 +477,7 @@ impl Scheduler {
             extra: false,
             pending: Vec::new(),
             next_seq: self.next_seq,
+            program_exit: None,
         };
         let mut visited = 0usize;
         while visited < end {
@@ -509,14 +542,26 @@ impl Scheduler {
             let seq = nodes[i].seq;
             pump_node(exec, &mut nodes, seq, &mut ctx, report);
             report.tasks_stepped += 1;
+            if ctx.program_exit.is_some() {
+                break;
+            }
         }
         self.next_seq = ctx.next_seq;
         let extra = ctx.extra;
         let mut pending = std::mem::take(&mut ctx.pending);
+        if ctx.program_exit.is_some() {
+            // 全程序退出:本帧新建但尚未入链的任务也一并终止;不能让它们
+            // 在退出后继续出现在 TASKINFO/下一帧。
+            for n in pending.iter_mut() {
+                n.finished = true;
+            }
+            pending.clear();
+        }
         nodes.append(&mut pending);
         sort_nodes(&mut nodes);
         self.nodes = nodes;
         self.extra_frame |= extra;
+        report.program_exit = ctx.program_exit;
     }
 }
 
@@ -558,6 +603,8 @@ struct PumpCtx {
     extra: bool,
     pending: Vec<TaskNode>,
     next_seq: u64,
+    /// 本帧收到 `END` 后置位;所有泵循环据此立即收束。
+    program_exit: Option<ProgramExit>,
 }
 
 fn pump_node(
@@ -660,6 +707,16 @@ fn pump_node(
                 pumped += 1;
                 nodes[cur].finished = true;
                 nodes[cur].steps += 1;
+                break;
+            }
+            Ok(StepOutcome::ExitProgram { restart }) => {
+                // 官方 END 不结束单个任务,而是置全程序退出字节并让主循环
+                // 停泵(REA 0x441334 / 0x403bfc)。执行者这一步的 TaskFinish
+                // 事件已由 Vm::step_command 落;这里立即收束整条链。
+                pumped += 1;
+                nodes[cur].finished = true;
+                nodes[cur].steps += 1;
+                ctx.program_exit = Some(ProgramExit { restart });
                 break;
             }
             Err(e) => {

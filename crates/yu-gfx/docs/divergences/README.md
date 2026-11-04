@@ -9,7 +9,7 @@
 |---|---|---|---|
 | DIV-GFX-001 | MODE 3/5/6/7/9 的辅助纹理/两阶段归约 | **fixed(J4)** | 辅助纹理已定案:`DAT_00801d98`=白(`WHITETEXBUF ERROR.`)、`DAT_00801d9c`=黑(`BLACKTEXBUF ERROR.`);stage1 = `BLENDCURRENTALPHA`(值 16)。源色归约:`0/1=T`、`2/5/6/9=T·A`、`3/7=T·A+(1−C.a)`。soft 全部执行;wgpu 同样执行 3/5/6/7/9(DIV-GFX-047 已复核) |
 | DIV-GFX-002 | MODE 4/8/10..18 | **unsupported-by-official** | 官方绘制体 `FUN_00414ba4` 的 MODE 分支只有 `0/1/2/3/5/6/7/9`,其余 11 个值落进最后的 `else`、**一条 D3D 状态都不设**(继承上一层遗留状态,顺序相关);手册 `cg/cg.html` 列名字属脚本语言参数域(同页注 `覆い焼きリニア＝加算モード`),exe 内 D3DX 编译器签名共 5 处,已映射的 4 个 pass(psA/psB/psC/psD)是转场/缩放 ⇒ 不是手册缺页,是官方无实现。内核 `BlendMode::engine_effective` 归约到通常路径,置信度 `Unsupported`;证据见 `docs/render-parity.md` §5.3 与 `docs/shader-parity.md` §3.2 |
-| DIV-GFX-003 | `FX/FY/FBX/FBY/FRX/FRY/FRZ/FCX/FCY/FEX/FEY/FEZ/FSD/FMD/FQU/F` 的槽位→结构体偏移 | **fixed(no-manual)** | 绑定已闭:0.495 CG 处理体(`0x42a514`)属性块逐项写入点见 `docs/divergences/DIV-GFX-069-cg-affine-binding.md` §2.2;`Transform.affine` 按引擎 `+0x1b0..+0x214` 落地,`FX/FY` 就是图层位置(`+0x68`)。绘制侧合成公式仍未对拍 ⇒ 图层标 `gfx.affine.unverified`(DIV-GFX-070) |
+| DIV-GFX-003 | `FX/FY/FBX/FBY/FRX/FRY/FRZ/FCX/FCY/FEX/FEY/FEZ/FSD/FMD/FQU/F` 的槽位→结构体偏移 | **fixed(no-manual)** | 绑定已闭:0.495 CG 处理体(`0x42a514`)属性块逐项写入点见 `docs/divergences/DIV-GFX-069-cg-affine-binding.md` §2.2;`Transform.affine` 按引擎 `+0x1b0..+0x214` 落地,`FX/FY` 就是图层位置(`+0x68`)。普通图层缩放已实现(`FBX/10000`、`FBY/10000`);`FRX/FRY` 绘制不读,`FRZ/FEX/FEY/FMD` 只主窗口分支 ⇒ 不再整层丢弃(DIV-GFX-070) |
 | DIV-GFX-004 | 多部件层(`+0xa6/+0xa7/+0xb0/+0x130`)几何语义未取证 | unimplemented | 契约保留 `Part` 位置,首屏未出现 |
 | DIV-GFX-005 | 外部掩码 `MID` 的取值通道(α/亮度)/尺寸要求未取证 | unimplemented | 带 `MID` 图层标 Unimplemented |
 | DIV-GFX-006 | 过渡 `TID` 配对层缺失时的第二纹理来源、`T` 的推进者(`+0x82` vs `+0x1e8`) | fixed(J2) | EVID-T-01..09:配对缺失/`TA<1` = 单纹理普通层(asm `0x415558→0x416f8d`);`T` 由脚本推进;mask = 配对纹理 G 通道;覆盖度模型见 `transition_coverage`。两端执行 `Op::Transition` |
@@ -71,7 +71,7 @@
 | DIV-GFX-056 | 文本行距/基线:`line_height()`/`ascent_px` 的引擎值未逐位取证 | open(Likely) | P2 落地的 `TextStyle::line_height()`/`FontSource::ascent_px` 为 Likely 口径;对话正文视觉可读,无官方截图 oracle ⇒ 与 H-P2-03 一并取 |
 | DIV-GFX-057 | 无图层屏幕的文本叠加(屏幕级自动文本) | open(Likely) | P2:屏幕级文本走全视口覆盖 quad(与 wgpu 同公式);无图层时的层序/裁剪未取证 |
 | DIV-GFX-069 | `CG` 仿射/滤镜参数的槽位绑定 | **fixed(no-manual)** | 绑定逐项定案(写入点/类型宽度/默认值/算子见 `docs/divergences/DIV-GFX-069-cg-affine-binding.md`);`Transform.affine` 落地,`FX/FY` 即图层位置 |
-| DIV-GFX-070 | 仿射字段的**绘制侧合成公式**(缩放/旋转/中心/附加偏移如何组合、16.16 与半像素位置) | unimplemented | 字段已存,后端只消费 `x/y`;非默认值时图层标 `gfx.affine.unverified`。解除条件:`FUN_00414ba4` 行 117-336 逐行还原 + 官方微场景像素对拍 |
+| DIV-GFX-070 | 仿射字段的**绘制侧合成公式**(缩放/旋转/中心/附加偏移如何组合、16.16 与半像素位置) | **部分 fixed / 半像素 open** | 0.495 逐指令+全偏移扫描:普通图层 = `(X-0.5,Y-0.5)+(FBX/10000)*tileW/(FBY/10000)*tileH`;scale 已落地(soft f64 尺寸,soft/wgpu 共用 `Layer::affine_scale`)。`FRX/FRY` 绘制不读,`FCX/FCY` 平移相消;未落地仅官方 `-0.5` 半像素/16.16 最终口径(需官方截图对拍)与主窗口 `+0xa4==2` 分支 |
 
 
 ---

@@ -1125,8 +1125,10 @@ pub fn status_text() -> String {
                 // 取诊断、读渲染阶段原子量 —— 每秒一次对帧时间没意义,对一个
                 // 要上架的产品却是纯噪声。
                 if session.quiet {
+                    // 发布模式仍保留状态判据:壳/自动化用 `status=running`
+                    // 判断会话是否活着,不能因为省字段就把它删掉。
                     out.push_str(&format!(
-                        "frame={} fps=60",
+                        "status=running frame={} fps=60",
                         session.engine.last_report().frame
                     ));
                     return;

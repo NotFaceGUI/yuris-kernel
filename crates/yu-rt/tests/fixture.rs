@@ -1548,18 +1548,20 @@ fn main_task_id_is_system_and_script_visible() {
 /// ```text
 /// 0  TASK[ID="SUB" #="SUB.BODY"]        生成子任务
 /// 1  WAIT[FRAME=2]                       让子任务先跑完
-/// 2  LET[@v = 7]                         主线继续写变量
-/// 3  END
-/// 4  SUB.BODY: LET[@v = 1]
-/// 5           TASKEND[]                  只结束自己
-/// 6           LET[@v = 2]                不应执行(R2 同时验证)
-/// 7           END
+/// 2  TASKINFO[ID="SYSTEM" EXIST=1 …]     主线仍可见
+/// 3  LET[@v = 7]                         主线继续写变量
+/// 4  END
+/// 5  SUB.BODY: LET[@v = 1]
+/// 6           TASKEND[]                  只结束自己
+/// 7           LET[@v = 2]                不应执行(R2 同时验证)
+/// 8           END
 /// ```
 #[test]
 fn taskend_without_id_ends_only_self_and_main_continues() {
     let mut b = ProjectBuilder::new();
     let v = with_int_var(&mut b, 0, 0);
-    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("SUB.BODY", 4, 0, 0)];
+    // 组 4 是主线的 END;子任务体从组 5 开始(TASKINFO 插在主 LET 之前)。
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("SUB.BODY", 5, 0, 0)];
     b.entry(0, 0);
     const OP_TASK: u8 = 93;
     const OP_TASKEND: u8 = 94;
@@ -1578,13 +1580,13 @@ fn taskend_without_id_ends_only_self_and_main_continues() {
             .window(0, ex::r#ref(0x40, v.id))
             .window(0, ex::i8_(7)),
         GroupSpec::new(OP_END),
-        // 4: SUB.BODY
+        // 5: SUB.BODY
         GroupSpec::new(OP_LET)
             .window(0, ex::r#ref(0x40, v.id))
             .window(0, ex::i8_(1)),
-        // 5: TASKEND[](无 ID = 自身)
+        // 6: TASKEND[](无 ID = 自身)
         GroupSpec::new(OP_TASKEND),
-        // 6: 不应执行
+        // 7: 不应执行
         GroupSpec::new(OP_LET)
             .window(0, ex::r#ref(0x40, v.id))
             .window(0, ex::i8_(2)),
@@ -1615,6 +1617,93 @@ fn taskend_without_id_ends_only_self_and_main_continues() {
         "TASKINFO[ID=\"SYSTEM\" EXIST=1] 命中主线"
     );
     assert!(vm.scheduler().find_by_id("SUB").is_none(), "子任务已摘链");
+}
+
+/// `END` 是**全程序退出**,不是只结束执行者(手册 `control/end.html`;
+/// REA 0.495 `0x441334` 置 `[0x80186c]`,主循环 `0x403bfc` 停帧泵)。
+///
+/// 组布局:
+/// ```text
+/// 0  TASK[ID="SUB" #="SUB.BODY"]
+/// 1  WAIT[FRAME=5]         子任务先跑
+/// 2  LET[@v = 7]           不应执行(程序已退)
+/// 3  END
+/// 4  SUB.BODY: END[RESTART=0]
+/// 5           LET[@v = 2]  不应执行
+/// ```
+#[test]
+fn end_in_child_task_stops_program() {
+    let mut b = ProjectBuilder::new();
+    let v = with_int_var(&mut b, 0, 0);
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("SUB.BODY", 4, 0, 0)];
+    b.entry(0, 0);
+    const OP_TASK: u8 = 93;
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TASK)
+            .window(0, ex::s("SUB"))
+            .window(34, ex::s("SUB.BODY")),
+        GroupSpec::new(OP_WAIT).window(0, ex::i8_(5)),
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, v.id))
+            .window(0, ex::i8_(7)),
+        GroupSpec::new(OP_END),
+        // 4: SUB.BODY
+        GroupSpec::new(OP_END).window(0, ex::i8_(0)),
+        // 5: 不应执行
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, v.id))
+            .window(0, ex::i8_(2)),
+    ]];
+    let mut vm = boot(b);
+    let mut chain = None;
+    for f in 0..8u32 {
+        let r = vm.tick_at(f * 16, &no_input());
+        if r.program_exit.is_some() {
+            chain = Some(r);
+            break;
+        }
+    }
+    let chain = chain.expect("子任务 END 必须触发全程序退出");
+    assert_eq!(
+        chain.program_exit,
+        Some(yu_rt::task::ProgramExit { restart: false }),
+        "子任务 END[RESTART=0] 触发全程序退出"
+    );
+    assert!(chain.main_finished, "全程序退出同时满足宿主 exit 判据");
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(0),
+        "END 后主任务/子任务后续 LET 都不再执行"
+    );
+    assert!(vm.scheduler().find_by_id("SUB").is_none(), "子任务已终止");
+    assert!(
+        vm.scheduler().find_by_id(MAIN_TASK_ID).is_none(),
+        "主任务也随全程序退出终止"
+    );
+    // 退出后的 tick 不得再泵任何命令(官方主循环不再跑帧泵)。
+    let after = vm.tick_at(8 * 16, &no_input());
+    assert_eq!(after.commands_pumped, 0, "退出后不再执行命令");
+    assert_eq!(after.logical_frames, 1, "退出后 flow 仍可 tick,但只有空帧");
+}
+
+/// 官方 `mov [0x80152c], al` 只保存 `RESTART` 的**低 8 位**(REA 0x441358);
+/// 消费侧按字节判零。`256` 不得被当成 restart。
+#[test]
+fn end_restart_uses_low_byte() {
+    for (value, expected) in [(0i32, false), (1, true), (256, false), (257, true)] {
+        let mut b = ProjectBuilder::new();
+        b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+        b.entry(0, 0);
+        b.scripts = vec![vec![GroupSpec::new(OP_END).window(0, ex::i32_(value))]];
+        let mut vm = boot(b);
+        let chain = vm.tick_at(0, &no_input());
+        assert_eq!(
+            chain.program_exit,
+            Some(yu_rt::task::ProgramExit { restart: expected }),
+            "RESTART={value} 的低 8 位语义"
+        );
+        assert!(chain.main_finished);
+    }
 }
 
 /// `TASKINFO[TEXTLINE/NEXTVOICE]`:引擎 `0x44c390`(RETURNCODE)把当前指令
@@ -2353,7 +2442,8 @@ fn taskend_stops_neighbor_commands_and_rebuild_uses_new_entry() {
             .window(0, ex::s("T"))
             .window(34, ex::s("T.ONE")),
         GroupSpec::new(OP_WAIT).window(0, ex::i8_(1)),
-        GroupSpec::new(OP_END),
+        // 主线保持存活(R1 的 END 是全程序退出,不能再用它“停主线”)。
+        GroupSpec::new(OP_WAIT).window(0, ex::i8_(100)),
         // 3: T.ONE
         GroupSpec::new(OP_LET)
             .window(0, ex::r#ref(0x40, v.id))
@@ -2390,7 +2480,7 @@ fn taskend_stops_neighbor_commands_and_rebuild_uses_new_entry() {
 /// ```text
 /// 0 TASK[ID="A" #="A.BODY" Z=10]
 /// 1 TASK[ID="B" #="B.BODY" Z=300]
-/// 2 END
+/// 2 WAIT[FRAME=100]          主线保持存活(END 是全程序退出)
 /// 3 A.BODY: LET[@v=1]
 /// 4 END
 /// 5 (占位 LET,不执行)
@@ -2427,7 +2517,8 @@ fn higher_z_task_runs_before_lower_z() {
             .window(0, ex::s("B"))
             .window(3, ex::i16_(300))
             .window(34, ex::s("B.BODY")),
-        GroupSpec::new(OP_END),
+        // 主线保持存活:END 是全程序退出(REA 0x441334),不能再用它“停主线”。
+        GroupSpec::new(OP_WAIT).window(0, ex::i8_(100)),
     ];
     groups.extend(body(1)); // 3..5
                             // 6..8 = B 体(与标签 B.BODY=6 对齐)
@@ -4568,6 +4659,81 @@ fn dialog_blocks_task_until_answered_and_writes_let() {
     assert!(r1.main_finished);
 }
 
+/// 扩展参数对齐 no-op:官方 0.495 `0x43fc74` + 过程 `0x4403d0` 对
+/// `STR2..8/A*/E*/CHECK*/FILEOPEN/FILEEXT/FOLDER/CHECKBOX/SLIDER/NOWAIT`
+/// **零读取**(0.479 `0x439cd8` 同构),也不求值表达式。
+///
+/// 夹具故意给 `CHECKBOX` 一个**未声明变量引用**:若内核还按旧逻辑求值,
+/// 会先报 `rt.var.undeclared`。正确行为是跳过求值、接受命令、只记名字。
+#[test]
+fn dialog_extended_params_are_ignored_without_eval() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(0),
+    }];
+    let groups = vec![
+        GroupSpec::new(OP_DIALOG)
+            .window(1, ex::s("q"))
+            .window(2, ex::s("line2"))
+            .window(23, ex::r#ref(0x40, sys + 77)) // CHECKBOX:未声明,求值即错
+            .window(22, ex::s("dir"))
+            .window(49, ex::i8_(1))
+            .window(24, ex::i8_(50))
+            .window(11, ex::r#ref(0x40, sys)),
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, sys))
+            .window(1, ex::i8_(99)),
+        GroupSpec::new(OP_END),
+    ];
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let mut vm = boot(b);
+    let r0 = vm.tick_at(0, &no_input());
+    assert!(r0.errors.is_empty(), "{:?}", r0.errors);
+    assert!(
+        !vm.events()
+            .iter()
+            .any(|e| matches!(e, yu_rt::VmEvent::Diag { code, .. } if code == "rt.cmd.unimplemented")),
+        "扩展参数不得再报 Unimplemented"
+    );
+    let pending = vm.pending_dialogs().to_vec();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].ignored_params,
+        vec!["STR2", "CHECKBOX", "FOLDER", "NOWAIT", "SLIDER"],
+        "官方不读的参数按窗口顺序记录名字"
+    );
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(0),
+        "未回答前不写 LET"
+    );
+
+    let id = pending[0].id;
+    vm.answer_dialog(id, 1, None).expect("answer");
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(1),
+        "扩展参数不改变基础 LET 写回"
+    );
+    let r1 = vm.tick_at(16, &no_input());
+    assert!(r1.errors.is_empty(), "{:?}", r1.errors);
+    assert_eq!(
+        vm.store().read(user_var(&vm, 0), &[]).unwrap(),
+        Value::Int(99),
+        "回答后正常执行下一条"
+    );
+}
+
 /// INPUT=1:按钮固定 OK(LET=1),文本写回 LETSTR;缺文本的回答被拒绝。
 #[test]
 fn dialog_input_writes_letstr_and_let() {
@@ -4637,9 +4803,10 @@ fn dialog_input_writes_letstr_and_let() {
     assert!(r.main_finished);
 }
 
-/// 未取证参数(NOWAIT 等)⇒ Unimplemented,不弹窗、不写回。
+/// 官方不读取的参数(`NOWAIT` 等)对齐 no-op:命令照常弹基础框,
+/// 不挂号、不改变写回(REA 0.495 `0x43fc74`;0.479 `0x439cd8`)。
 #[test]
-fn dialog_unsupported_param_is_unimplemented() {
+fn dialog_unsupported_param_is_aligned_noop() {
     let groups = vec![
         GroupSpec::new(OP_DIALOG)
             .window(1, ex::s("q"))
@@ -4654,18 +4821,23 @@ fn dialog_unsupported_param_is_unimplemented() {
     let mut vm = boot(b);
     let r = vm.tick_at(0, &no_input());
     assert!(r.errors.is_empty(), "{:?}", r.errors);
-    assert!(vm.pending_dialogs().is_empty());
+    let pending = vm.pending_dialogs().to_vec();
+    assert_eq!(pending.len(), 1, "基础 DIALOG 正常挂起");
+    assert_eq!(pending[0].ignored_params, vec!["NOWAIT"]);
     assert_eq!(
-        vm.unimplemented_cmds().get("DIALOG").copied(),
-        Some(1),
-        "未取证参数按命令挂号"
+        vm.unimplemented_cmds().get("DIALOG").copied().unwrap_or(0),
+        0,
+        "官方不读的参数不再挂号"
     );
-    // 事件流仍记录 DomainCall 事实,但不产生待回答请求。
+    // 事件流仍记录 DomainCall 事实;参数不进入 event_args(未求值)。
     assert!(vm.events().iter().any(|e| matches!(
         e,
         yu_rt::VmEvent::DomainCall { name, .. } if name == "DIALOG"
     )));
-    assert!(r.main_finished, "未取证参数不阻塞,END 同帧执行");
+    assert!(!r.main_finished, "DIALOG 挂起时任务不推进到下一条");
+    vm.answer_dialog(pending[0].id, 1, None).expect("answer");
+    let r = vm.tick_at(16, &no_input());
+    assert!(r.main_finished, "回答后执行 END");
 }
 
 // ---------------------------------------------------------------- P3 系统变量收口

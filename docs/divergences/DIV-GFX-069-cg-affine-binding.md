@@ -1,6 +1,6 @@
 # DIV-GFX-069 · `CG` 仿射/滤镜参数的槽位绑定与绘制缺口
 
-- 状态:**fixed(绑定)**(绘制侧合成公式仍 open,见 §5)
+- 状态:**fixed(绑定 + 普通图层缩放)**(半像素/主窗口分支仍 open,见 §5)
 - 关联:DIV-GFX-003(绑定)、DIV-GFX-011(参数分类)、DIV-GFX-027(IDNO)、
   DIV-GFX-031/039(CGACT 参数分类)
 - 证据等级:REA 0.495 静态反汇编 + 运行时结构体默认值(`shipped-artifact`)
@@ -103,20 +103,48 @@ CG 处理体入口 `0x42a514`(`mov eax,1; call 0x429fd1`),体长到
 - `FX/FY` 写入 `transform.x/y`(= 引擎 `+0x68`,像素口径,`value/100`);
   `X/FX` 是同一物理量的两种单位,后写覆盖先写(与引擎同序)。
 - 其余字段存**引擎原值**(百分位/角度×100/位掩码),绘制侧统一 ÷100。
-- 诊断:`gfx.filter.unsupported`(绑定未取证)退役,改为
-  `gfx.affine.unverified`(**绘制合成公式**未对拍),且只在命令真的给了
-  仿射参数时发一条(无参更新不再刷屏)。
+- 诊断:`gfx.filter.unsupported`(绑定未取证)退役。普通图层 scale 已实现,
+  整层 `gfx.affine.unverified` 标记退役;仅当层首次出现主窗口/滤镜字段
+  (`rz/ex/ey/sd/md/F`)时发一条可恢复 `gfx.affine.effect-unverified`,
+  后端仍按已实现几何绘制。`AFFINE_UNVERIFIED` 常量保留给旧 trace 兼容。
 - `FQU` 按引擎语义直接赋值(不参与算子)。
 
 ## 5. 仍未闭
 
 ### 5.1 绘制侧合成公式(DIV-GFX-070)
 
-后端目前只用 `transform.x/y` 做轴对齐矩形绘制,尚未应用
-`FBX/FBY/FRX/FRY/FRZ/FCX/FCY/FEX/FEY`。缺口是**合成公式**
-(缩放/旋转/中心的组合顺序、16.16 定点与半像素偏移的精确位置),
-不是绑定 —— 需要在 `FUN_00414ba4` 上做逐行还原 + 官方微场景像素对拍。
-在此之前图层标 `gfx.affine.unverified`,后端不得声称已对齐。
+**2026-11-04 续证(修正)**:`FUN_00414ba4` 普通图层网格的四角是
+
+```text
+x0 = X/100 - 0.5
+y0 = Y/100 - 0.5
+x1 = x0 + (FBX/10000) * tileWidth
+y1 = y0 + (FBY/10000) * tileHeight
+```
+
+tile 表来自 `FUN_0040af1c`(`+0xa6/+0xa7` = X/Y tile 数,
+`+0xb0/+0x130` = 每 tile 宽/高);每格 5 顶点 triangle strip,
+坐标按 FPU **截断**(CW OR 0xC00)+ 负数 `+0xFFFF` 修正式拆 16.16。
+`FCX/FCY` 只做 `-C/+C` 两次平移(0x415462/0x41551b),普通图层相消。
+
+**全二进制偏移扫描**:`FRX/FRY(+0x1f8/1fc)` 除本函数载入外无读取点;
+`FRZ(+0x200)` 只在 `+0xa4==2` 主窗口分支(`0x414075`)按
+`*π/180/100` 旋转;`FEX/FEY(+0x1e0/1e8)` 同分支;`FMD` 同分支;
+`FSD` 在图像加工 `0x40e109`;`FEZ/FQU` 绘制不读;`F` 只在 MODE 3 作
+`YS_FadeVal`。初版「D3DXMatrixRotationYawPitchRoll(FRY,FRZ,FRX)」
+读法作废:实参经 x87 栈修正为 `(Y-0.5, FCX, FCY)`,目标是平移/compose。
+
+**单位**:`FUN_0040ae99` 把 `+0x78/+0x7c` 直接写 tile 源并
+`FCX=width*0.5` ⇒ 宽高/tile 表/FCX 都是像素;有效缩放 =
+`FBX/10000`(10000 = 1.0)。
+
+**已落地(2026-11-04)**:soft `draw_image` 改 f64 尺寸 + 亚像素采样,
+soft/wgpu 共用 `w=(FBX/10000)*baseW`、`h=(FBY/10000)*baseH`;
+`Layer::affine_scale()` 是唯一入口;整层 `Unimplemented` 已移除,
+主窗口/滤镜字段只出 `gfx.affine.effect-unverified` 可恢复诊断。
+
+**仍未闭**:官方顶点初值的 `-0.5` 半像素与 16.16 截断的最终像素口径
+需官方截图对拍;主窗口 `+0xa4==2` 的 FRZ/FEX/FEY/FMD 变换另案。
 
 ### 5.2 `+0x68` 与 `+0x1b0` 是两个字段(COPY 后查询口径差异)
 

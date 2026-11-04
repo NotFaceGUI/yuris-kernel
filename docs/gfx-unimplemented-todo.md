@@ -22,7 +22,7 @@
 |---|---|---|---|---|
 | DIV-GFX-001 | MODE 3/5/6/7/9 固定管线 | **fixed(J4)** | 辅助纹理=白/黑;stage1=BLENDCURRENTALPHA;soft/wgpu 全部执行(颜色因子见 047) | 状态表 + 单元向量;官方微场景待 YSCom 恢复 |
 | DIV-GFX-002 | MODE 4/8/10..18 | **unsupported-by-official** | 官方绘制体 `FUN_00414ba4` 的 MODE 分支(第 5 个栈参数 if/else 链)只有 `0/1/2/3/5/6/7/9`;其余 11 个值落进最后的 `else`,**一条 D3D 纹理阶段/混合状态都不设**(早期分派链 `0x4155dd` 的比较集合相同)。手册 `cg/cg.html` 列了除算/差分/Overlay..PinLight 名字(属脚本语言参数域,同页还注 `覆い焼きリニア＝加算モード`),引擎未实现 ⇒ 不是"手册缺页",是官方无实现。内核按 `BlendMode::engine_effective` 归约到通常路径绘制(不再丢层),置信度标 `Unsupported`。exe 内 D3DX 编译器签名共 5 处(编译后的 shader blob),已映射的 4 个 pass(psA/psB/psC/psD)是转场/缩放,没有一个是混合模式 | `docs/render-parity.md` §5.3/§5.4;`crates/yu-gfx/tests/blend_table.rs` |
-| DIV-GFX-003 | `FX/FY/FBX/.../F` 仿射/滤镜 | **fixed(绑定;公式归 070)** | 逐项落到 `Transform.affine`(引擎 `+0x1b0..+0x214`),`FX/FY` 即图层位置 | 见 `docs/divergences/DIV-GFX-069-cg-affine-binding.md` |
+| DIV-GFX-003 | `FX/FY/FBX/.../F` 仿射/滤镜 | **fixed(绑定+缩放;半像素归 070)** | 逐项落到 `Transform.affine`(引擎 `+0x1b0..+0x214`),`FX/FY` 即图层位置;0.495 普通绘制只消费 X/Y+FBX/FBY+FCX/FCY,FRX/FRY/FEZ/FQU 绘制不读;`Layer::affine_scale` 已接 soft/wgpu | 见 `docs/divergences/DIV-GFX-069-cg-affine-binding.md` |
 | DIV-GFX-004 | 多部件层 | unimplemented | `Part.raw` 原样保存 | `+0xa6/+0xa7/+0xb0/+0x130` 几何语义 |
 | DIV-GFX-005 | `MID` 外部掩码 | unimplemented | 层标 Unimplemented | 掩码取值通道(α/亮度)/尺寸/采样 |
 | DIV-GFX-006 | 过渡配对缺失/推进者 | fixed | 双纹理可执行;配对缺失/TA<1=普通层;T 由脚本推进;mask=配对 G 通道 | EVID-T-01..09(`docs/title-motion-ledger.md`) |
@@ -90,8 +90,12 @@
   TID 分支旁);`CGACT` 的 `ID3/ID4` 只在非 `TRANSITION` 动作上挂号
   (`Z2` 已确认引擎无读取点 ⇒ 静默接受)。~~TEXT 持久缺失~~ **已修(P2/058)**。
 - `crates/yu-gfx/src/state.rs`:`Transform.affine` 已按引擎偏移落地
-  (DIV-GFX-069),绘制侧合成公式未对拍(DIV-GFX-070)⇒ 非默认值图层标
-  `gfx.affine.unverified`。
+  (DIV-GFX-069),普通图层 scale 已实现:`Layer::affine_scale()` =
+  `FBX/10000`/`FBY/10000`,soft/wgpu 共用,soft 已支持 f64 尺寸与
+  亚像素采样;整层 `Unimplemented` 移除,主窗口/滤镜字段只出
+  `gfx.affine.effect-unverified`。FRX/FRY/FEZ/FQU 绘制不读,
+  FRZ/FEX/FEY/FMD 只属主窗口分支。**仍缺**:官方 `-0.5` 半像素与
+  16.16 最终像素口径的官方截图对拍(DIV-GFX-070)。
 - `crates/yu-gfx/src/layer.rs`:`BlendMode::fixed_state()` / `confidence()` 的
   Unverified/Unimplemented 分支。
 - `crates/yu-gfx/src/state.rs`:`MID`、`RECTPAINT` 之外的图像加工、资源图尺寸、

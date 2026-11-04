@@ -62,7 +62,7 @@
 | DIV-RT-041 | `Diag` 的脚本定位(task/script/pc/cmd) | fixed | architecture §8;`Loc::Script.label` 承载任务 ID |
 | DIV-RT-042 | `DomainCall` 的变量引用身份丢失 | fixed(B1) | `ArgValue.reference`(裁 1-A)+ `SaveHost` 同步契约(裁 2-A);SAVE 预约即值快照/LOAD 按 var_id 写回,`save-load-loop` 用例闭环 |
 | DIV-RT-043 | 官方默认槽 `0x459e90` 的语义(脚本执行错误) | fixed | `F_*`/`G_*`/`MACRO`/`S_VAR`/`_IF*`/`);`/`SYSTEMMODE` 等不再静默 Unimplemented |
-| DIV-RT-044 | `DIALOG` 的 VM 侧契约与宿主回答 | fixed | 任务挂起/回答、LET/LETSTR 写回、扩展参数挂账 |
+| DIV-RT-044 | `DIALOG` 的 VM 侧契约与宿主回答 | fixed | 任务挂起/回答、LET/LETSTR 写回;扩展参数按官方 0.495/0.479 证据对齐 no-op(不求值/不弹新控件/不写回),名字记入 `DialogRequest.ignored_params` |
 | DIV-RT-046B | `MOVIE`/`MOVIEEND`/`MOVIEINFO` 全屏影片 | 语义 fixed / 后端待选型 | 手册三页 + REA;解码经 `MovieHost` 端口(官方 MCI+COM);见 `docs/divergences/DIV-GFX-074-movie-family.md` |
 | DIV-RT-045 | `TRAY`/`CLIPACT`/`CLIPINFO`/`REGINFO`/`YMV*` 的域边界 | fixed | 剪贴板镜像实现;托盘归宿主;`YMV*` 已由 B14 落地(影片图层,见 DIV-GFX-073);注册表挂账(DIV-RT-045 §REGINFO) |
 | DIV-RT-046 | `ERROR` 的逐命令启用表 | open | 表已按 REA 写入,消费者未定位 |
@@ -70,7 +70,7 @@
 | DIV-RT-048 | `_TEXT_NUM` 的数据源 | fixed | `yst.ybn` 头部 text_total == `yst_list` 求和(ERIS 396) |
 | DIV-RT-049 | 旗标/目标形态判定族(MATH 捕获、INIT 守卫、LABELINFO 下标)——P7 续审查轮的三个同族潜伏点 | fixed | 旁线 §3.20/§3.26 反汇编判据 + 语料形态扫描(scanmath:21 处 MATH 旗标全 =1、无 INIT=0);回归 ×3 |
 | DIV-RT-050 | CGS 场景截图栈:进菜单/存档弹窗背景透出上一亮帧,官方为黑底 | open | 档案在仓库根 `docs/divergences/DIV-RT-050-cgs-scene-screenshot-stack.md`(跨 crate 编号,AU5 起在此交叉引用);候选根因含 WINDOWINFO 字段族缺口 |
-| DIV-RT-052 | `END` 由**非 main 任务**执行时只 Finish 该任务,主任务继续 ⇒ 程序不退出(`\es.END` → `END[RESTART=0]` 后 `main_finished` 不亮) | open | B2 实测(`yu-cli tests/dialog.rs`):はい 后 `\es.END`→`GSD.SAVE` 落盘(执行链通),但 `END`(REA `0x441334`)语义待取证——官方是「结束整个程序」还是「结束当前任务」;影响所有退出确认流程。归 B10 rt campaign;修复前宿主以 `main_finished`/`VmEvent::End` 判退出需自行取或 |
+| DIV-RT-052 | `END` 由**非 main 任务**执行时只 Finish 该任务,主任务继续 ⇒ 程序不退出 | fixed | REA `0x441334`:读 `RESTART` 低 8 位 → `[0x80152c]`,置 `[0x80186c]`;主循环 `0x403bfc`/帧泵 `0x4040f8` 停泵,`0x41ae3c` 发 `WM_CLOSE`,收尾 `0x403e78` 按 restart 用 `CreateProcessA` 重启自身。0.479 `0x43a619`(声明序号 12)同构。内核:`StepOutcome::ExitProgram{restart}` → `ChainReport.program_exit` → `Engine::restart_requested()`;`TASKEND` 保持只结束任务 |
 
 ---
 
@@ -1147,13 +1147,18 @@ packed = ([1290322, 329227, 26, 249, 8765, 8765], 0, "cd1790…4bd2e")  ... ok
 - **内核**:`Vm::pending_dialogs()` / `Vm::answer_dialog(id, button, text)`;
   `DomainCall{System,DIALOG}` 是通知,权威状态在 pending 队列;回答前
   调度器不推进该任务;回答后下一逻辑帧从 DIALOG 的下一条继续。
-- **未取证参数**:`STR2..8`/`A*`/`E*`/`CHECK*`/`FILEOPEN`/`FILEEXT`/
-  `FOLDER`/`CHECKBOX`/`SLIDER`/`NOWAIT` ⇒ `Unimplemented`,不弹窗、不写回。
+- **扩展参数**:`STR2..8`/`A*`/`E*`/`CHECK*`/`FILEOPEN`/`FILEEXT`/
+  `FOLDER`/`CHECKBOX`/`SLIDER`/`NOWAIT` 在官方 0.495 `0x43fc74` 与
+  对话框过程 `0x4403d0`(0.479 `0x439cd8` 同构)中**零读取**,也不求值
+  ⇒ 对齐 no-op:接受命令、不弹新控件、不写回;名字记入
+  `DialogRequest.ignored_params` 供诊断/trace。不再报 `Unimplemented`。
 - **宿主呈现面**:交接件(P1/P4)。与 `_WINDOW_EXEC_CLOSE` 的交互:
   DIALOG 挂起期间宿主应把窗口关闭请求当作对话框取消(最后按钮),
   不要再推 `_WINDOW_EXEC_CLOSE`。
 - **复核**:`fixture::dialog_blocks_task_until_answered_and_writes_let`、
-  `dialog_input_writes_letstr_and_let`、`dialog_unsupported_param_is_unimplemented`。
+  `dialog_input_writes_letstr_and_let`、
+  `dialog_extended_params_are_ignored_without_eval`、
+  `dialog_unsupported_param_is_aligned_noop`。
 
 ## DIV-RT-045 · 托盘/剪贴板/注册表/YMV 的域边界(2026-10-23,P3)
 
@@ -1344,3 +1349,30 @@ packed = ([1290322, 329227, 26, 249, 8765, 8765], 0, "cd1790…4bd2e")  ... ok
 - **限制**:抓帧的 `:/W0/` 后缓冲与主渲染器同源(流式 wgpu 为上一帧读回);
   目标层没有可序列化表面(空层/离屏组/未取证的图像加工链)时 `capture_layer`
   返回 `None`,VM 按 `Unimplemented` 挂号,**不猜内容**。
+
+## DIV-RT-052 · `END` 是全程序退出(2026-11-04,B10)
+
+- **官方证据**(0.495 `yu-ris.exe`,sha256 `4f5eefa3…`):
+  - 处理体 `0x441334`:预扫 §14 参数 → 读 `[0x684160]`(RESTART 存在性);
+    值 `[slot*8+0x683740]` 的**低 8 位**写 `[0x80152c]`;随后
+    `[0x80186c]=1`。不碰任务链、不让出、不直接关窗。
+  - 主循环 `0x403bfc` 每轮查 `[0x80186c]`;非 0 时不再调帧泵
+    `FUN_004040f8`(`0x4040f8` 自身也先查该字节,非 0 立即返回)。
+  - `0x41ae3c` 置同一字节并向主窗口 `PostMessageA(WM_CLOSE)`。
+  - 收尾 `0x403e78`:restart 字节非 0 → `CreateProcessA(NULL, 0x67fe00…)`
+    重启自身 ⇒ **进程级重启**,不是引擎内重置。
+- **跨版本**:0.479 END 在 `0x43a619`(声明序号 12;0.495 在 END 前插了
+  `EMOTE`/`EMOTEINFO`,序号变为 14),指令形态同构。
+- **与 `TASKEND` 的区别**:`0x4521dc` 只做 ID 校验 + `0x452364` 摘链,
+  无全局退出写入。
+- **内核处置**:
+  - `StepOutcome::ExitProgram { restart }`(restart = 低 8 位非 0);
+  - `TaskChain` 收到后立即停本帧/后续续帧,所有任务置 finished,
+    `ChainReport.program_exit = Some(ProgramExit{restart})` 且
+    `main_finished = true`;
+  - `yu-engine` 映射到 `main_finished` 并暴露 `restart_requested()`;
+    不自行重启进程;
+  - `VmEvent::End { restart }` 保留;`TASKEND` 行为不变。
+- **复核**:`fixture::end_in_child_task_stops_program`、
+  `fixture::end_restart_uses_low_byte`、
+  `fixture::taskend_without_id_ends_only_self_and_main_continues`。

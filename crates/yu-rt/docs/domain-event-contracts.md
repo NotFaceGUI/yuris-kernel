@@ -244,7 +244,7 @@ EMOTEINFO:静态 3 处,本窗口 0 次
 |---:|---|---|---|---|
 | 0 | `CAPTION` | 字符串 | 标题 | ✅ 手册 + REA `0x43fcf0` |
 | 1 | `STR` | 字符串 | 正文 | ✅ 手册 + REA |
-| 2..8 | `STR2..STR8` | 字符串 | 附加文本 | ⛔ 处理体未定位消费点 |
+| 2..8 | `STR2..STR8` | 字符串 | 附加文本 | ⚪ 官方不读(0.495 `0x43fc74`/`0x4403d0` 零读取;0.479 `0x439cd8` 同构)⇒ 对齐 no-op |
 | 9 | `DEFSTR` | 字符串 | 输入框初值 | ✅ REA `0x43fd2a` |
 | 10 | `LETSTR` | `$变量` | 输入文本写回 | ✅ REA `0x440001`(仅 INPUT) |
 | 11 | `LET` | `@变量` | 按钮序号写回 | ✅ REA `0x43fe7a` |
@@ -256,10 +256,16 @@ EMOTEINFO:静态 3 处,本窗口 0 次
 | 17 | `INPUTLIMIT` | 整数 | >0 时 EM_SETLIMITTEXT | ✅ REA `0x43ff14` |
 | 18 | `DEFBUTTON` | 1..4 | MB_DEFBUTTON1..4;其它 = 0 | ✅ REA `0x43fd70` |
 | 19 | `ICON` | 1..4 | 1=Info、2=Question、3=Warning、4=Error | ✅ REA `0x43fd8d` |
-| 20..49 | `FILEOPEN`/`FILEEXT`/`FOLDER`/`CHECKBOX`/`SLIDER`/`A*`/`E*`/`CHECK*`/`NOWAIT` | — | 未取证 | ⛔ 命中即 `Unimplemented`,不弹窗、不写回 |
+| 20..49 | `FILEOPEN`/`FILEEXT`/`FOLDER`/`CHECKBOX`/`SLIDER`/`A*`/`E*`/`CHECK*`/`NOWAIT` | — | 官方处理体与对话框过程**零读取**,也不求值表达式 | ⚪ 对齐 no-op:接受命令、不弹新控件、不写回;名字记入 `DialogRequest.ignored_params` |
 
 **存在性而非值**:`OKCANCEL=0` 仍然算「存在」(REA 只测参数索引非零)——
 与手册「値(0/1)」字面不同,以引擎为准。
+
+**扩展参数 = 官方不读**:上表 2..8/20..49 在 0.495 处理体 `0x43fc74`、
+输入框过程 `0x4403d0` 与 0.479 处理体 `0x439cd8` 中没有任何读取点;预扫
+只建参数索引,不执行表达式。内核因此**不猜语义**:不生成文件框/复选/滑杆,
+不产生多行/非模态行为,也不会写回;`DialogRequest.ignored_params` 只保留
+名字供诊断/trace。B7 的文件选择框是独立宿主能力,不由这些参数驱动。
 
 ### 8.2 按钮与写回
 
@@ -277,7 +283,8 @@ EMOTEINFO:静态 3 处,本窗口 0 次
 ### 8.3 VM 生命周期
 
 1. `DIALOG` 求值 → 发 `DomainCall{System,"DIALOG",args}`(不带 LET/LETSTR
-   的求值结果)→ 生成 `DialogRequest`(id 单调);
+   的求值结果)→ 生成 `DialogRequest`(id 单调);官方不读的扩展参数**不求值**
+   (与预扫只建索引一致),只把名字放进 `ignored_params`;
 2. 任务在调度器里挂起(`TaskExecutor::dialog_pending`),pc 已前进;
 3. 宿主轮询 `Vm::pending_dialogs()`,呈现后调用
    `Vm::answer_dialog(id, button, text)`:

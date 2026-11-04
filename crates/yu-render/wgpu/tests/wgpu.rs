@@ -46,6 +46,7 @@ fn table() -> ParamTable {
                 "CG",
                 &[
                     "ID", "FILE", "E", "A", "X", "Y", "Z", "SX", "SY", "MODE", "T", "TA", "TID",
+                    "FBX", "FBY",
                 ],
             ),
             command(
@@ -296,6 +297,55 @@ fn asset_layer_composites_with_padded_rows() {
     assert_eq!(out.report.ops_drawn, 1);
     assert_eq!(out.stats.draw_calls, 1);
     assert_eq!(out.stats.readback_bytes, 3 * 2 * 4);
+}
+
+/// 0.495 `FUN_00414ba4`:普通图层宽度 = `(FBX/10000) * 自然宽`
+/// (同 y/FBY)。2×2 图缩到 50% 后只覆盖 1×1;GPU 与 soft 同像素。
+#[test]
+fn affine_scale_matches_soft() {
+    let table = table();
+    let mut gfx = state(Viewport::new(8, 8), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"S".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"red".to_vec())),
+                arg(&table, "CG", "X", Value::Int(2)),
+                arg(&table, "CG", "Y", Value::Int(2)),
+                arg(&table, "CG", "FBX", Value::Int(5000)),
+                arg(&table, "CG", "FBY", Value::Int(5000)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let assets: [(&[u8], Vec<u8>); 1] =
+        [(b"red.png".as_slice(), png_bytes_for(2, 2, Rgba([255, 0, 0, 255])))];
+    let Some(mut renderer) = renderer_or_skip(store(&assets)) else {
+        return;
+    };
+    let out = renderer.render_frame(&frame).expect("render");
+
+    assert_close(pixel(&out, 2, 2), [255, 0, 0, 255], 1, "scaled red 2,2");
+    assert_close(
+        pixel(&out, 3, 3),
+        [255, 255, 255, 255],
+        1,
+        "scaled does not cover 3,3",
+    );
+    let soft = SoftRenderer::new(store(&assets)).render_frame(&frame);
+    for y in 0..8 {
+        for x in 0..8 {
+            assert_eq!(
+                pixel(&out, x, y),
+                pixel_of_surface(&soft.surface, x, y),
+                "gpu/soft mismatch at {x},{y}"
+            );
+        }
+    }
 }
 
 #[test]

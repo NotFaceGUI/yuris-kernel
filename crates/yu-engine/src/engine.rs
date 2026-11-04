@@ -648,6 +648,9 @@ pub struct Engine {
     events_drained: u64,
     /// 主任务已 `END`/走完(宿主据此退出窗口)。
     main_finished: bool,
+    /// 最后一次全程序退出的 `RESTART` 标志(官方进程收尾据此重启自身;
+    /// 内核只暴露,不自行拉起进程)。
+    restart_requested: bool,
     /// 上一帧呈现画面(`SAVE[ID]` 抓帧渲染器的 `:/W0/` 后缓冲)。
     /// `SAVE[ID]` 的离屏抓帧器(逐帧 `observe`,在与主渲染器同刻冻结快照)。
     capture_bridge: Option<crate::capture::SharedCapture>,
@@ -786,6 +789,7 @@ impl Engine {
             boot_ms,
             events_drained: 0,
             main_finished: false,
+            restart_requested: false,
             capture_bridge,
         })
     }
@@ -1125,6 +1129,12 @@ impl Engine {
         let tick_started = Instant::now();
         let chain = vm.tick_at(now_ms, &self.timeline);
         self.main_finished |= chain.main_finished;
+        if let Some(exit) = chain.program_exit {
+            // `END`:程序级退出。`main_finished` 供宿主关窗;`restart` 只暴露,
+            // 内核不重启进程(官方在进程收尾用 CreateProcessA 重启自身)。
+            self.main_finished = true;
+            self.restart_requested = exit.restart;
+        }
         let mut sound_stats = yu_sound::DecodeStats::default();
         if let Some(sound) = &self.sound {
             // 音频线程是时钟:这里只取诊断/解码统计,不生产 PCM。
@@ -1421,6 +1431,14 @@ impl Engine {
     /// 主任务已结束(脚本 `END` 或主脚本走完);宿主据此关闭窗口。
     pub fn main_finished(&self) -> bool {
         self.main_finished
+    }
+
+    /// 最近一次全程序 `END` 的 `RESTART` 标志(官方 `[0x80152c]`)。
+    ///
+    /// 官方在进程收尾时据此用 `CreateProcessA` 重启自身(REA 0x403e78);
+    /// 内核不自行重启,宿主决定是否重新拉起进程/重建会话。
+    pub fn restart_requested(&self) -> bool {
+        self.restart_requested
     }
 
     /// 脚本执行错误(执行器结束的任务;诊断用)。
@@ -1915,6 +1933,7 @@ impl Engine {
         self.cursor = (0, 0);
         self.frame = 0;
         self.main_finished = false;
+        self.restart_requested = false;
         self.last_frame = None;
         self.last_surface = None;
         self.last_report = FrameReport::empty(0);
