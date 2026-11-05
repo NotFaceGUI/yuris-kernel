@@ -563,7 +563,9 @@ impl Planner<'_> {
                 }
             }
             TextureRef::SolidBlack1x1 => {
-                let texture_id = self.gpu.ensure_solid_black(self.ctx)?;
+                let texture_id = self
+                    .gpu
+                    .ensure_solid_color(self.ctx, layer.fill.unwrap_or([0, 0, 0, 255]))?;
                 let texture = self.gpu.get(texture_id).expect("solid texture exists");
                 let (natural_width, natural_height) = (texture.width, texture.height);
                 let view = texture.view.clone();
@@ -752,6 +754,7 @@ impl Planner<'_> {
             self.targets,
             id,
             texture,
+            layer.and_then(|layer| layer.fill),
             self.bases,
         )?;
         Ok((tex.id, tex.width, tex.height))

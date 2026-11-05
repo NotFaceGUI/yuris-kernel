@@ -26,7 +26,25 @@ pub fn layer_base(
             .resolve(key)
             .cloned()
             .map_err(|d| d.code.to_string()),
-        yu_gfx::TextureRef::SolidBlack1x1 => Ok(Texture::solid_black_1x1()),
+        // `CG[FILE=""]` 的 1×1 符号表面可能是整层 `RECTPAINT*` 后的实色
+        // (`Layer.fill`,EVID-J-02..04);没有填充时才是官方 1×1 黑。
+        // 引擎按 `SX/SY` 把它铺成显式尺寸,文字也写在这块表面上;若拿
+        // 1×1 基面,`x=50/y=50` 等字符会全部落到图外(字体预览空白)。
+        yu_gfx::TextureRef::SolidBlack1x1 => {
+            let px = layer.fill.unwrap_or([0, 0, 0, 255]);
+            match layer.image_size() {
+                Some(size) if size.width > 0 && size.height > 0 => Ok(Texture {
+                    width: size.width,
+                    height: size.height,
+                    rgba: px.repeat((size.width as usize) * (size.height as usize)),
+                }),
+                _ => Ok(Texture {
+                    width: 1,
+                    height: 1,
+                    rgba: px.to_vec(),
+                }),
+            }
+        }
         yu_gfx::TextureRef::None => {
             let size = layer
                 .image_size()
@@ -67,7 +85,10 @@ pub fn layer_base_dims(
             .resolve(key)
             .map(|t| (t.width, t.height))
             .map_err(|d| d.code.to_string()),
-        yu_gfx::TextureRef::SolidBlack1x1 => Ok((1, 1)),
+        yu_gfx::TextureRef::SolidBlack1x1 => Ok(layer
+            .image_size()
+            .map(|size| (size.width, size.height))
+            .unwrap_or((1, 1))),
         yu_gfx::TextureRef::None => layer
             .image_size()
             .map(|size| (size.width, size.height))

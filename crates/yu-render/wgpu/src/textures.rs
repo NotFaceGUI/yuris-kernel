@@ -86,6 +86,8 @@ pub struct TextureCache {
     /// 就地覆写),槽数与帧数无关;同帧内相邻几帧并存也不会互相覆盖。
     movie_slots: BTreeMap<Vec<u8>, Vec<MovieSlot>>,
     solid_id: Option<u64>,
+    /// 整层 `RECTPAINT*` 后的实色 1×1 纹理(按 RGBA 去重)。
+    solid_fills: BTreeMap<[u8; 4], u64>,
     /// 累计上传字节(解码后的 RGBA8 字节数,不含 wgpu 内部行填充)。
     pub total_upload_bytes: u64,
     /// 其中**资产首次解码**带来的字节(`ensure_asset`)。与覆盖/合成上传分开
@@ -103,6 +105,7 @@ impl TextureCache {
             asset_texture_ids: std::collections::BTreeSet::new(),
             movie_slots: BTreeMap::new(),
             solid_id: None,
+            solid_fills: BTreeMap::new(),
             total_upload_bytes: 0,
             asset_upload_bytes: 0,
             total_uploads: 0,
@@ -293,6 +296,20 @@ impl TextureCache {
         }
         let id = self.upload(ctx, 1, 1, &[0, 0, 0, 255], "solid black 1x1")?;
         self.solid_id = Some(id);
+        Ok(id)
+    }
+
+    /// 1×1 实色纹理(`CG[FILE=""]` + 整层 `RECTPAINT*`;`Layer.fill`)。
+    pub fn ensure_solid_color(
+        &mut self,
+        ctx: &GpuContext,
+        rgba: [u8; 4],
+    ) -> Result<u64, Diag> {
+        if let Some(id) = self.solid_fills.get(&rgba) {
+            return Ok(*id);
+        }
+        let id = self.upload(ctx, 1, 1, &rgba, "solid color 1x1")?;
+        self.solid_fills.insert(rgba, id);
         Ok(id)
     }
 

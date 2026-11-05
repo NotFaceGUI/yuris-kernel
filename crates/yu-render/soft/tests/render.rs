@@ -1358,3 +1358,233 @@ fn subgroup_rt_alpha_is_opaque_in_parent_composite() {
         "子组 RT alpha 必须按不透明处理(EVID-J-08)"
     );
 }
+
+/// `CG[FILE=""] SX/SY` 的 1×1 黑层在引擎里是 `SX×SY` 的黑色表面;
+/// `CGACT[TEXT]` 的字符坐标相对这块表面。若文本基面仍按 1×1 算,
+/// x=24 等字符全部落到图外 —— 字体预览(SMTX/FONTL1)整块空白。
+#[test]
+fn cgact_text_on_fileless_solid_layer_uses_explicit_surface_size() {
+    let table = table();
+    let mut gfx = state(Viewport::new(48, 24), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(48)),
+                arg(&table, "CG", "SY", Value::Int(24)),
+            ],
+        ),
+        call(
+            1,
+            "FONT",
+            vec![
+                arg(&table, "FONT", "SX", Value::Int(16)),
+                arg(&table, "FONT", "SY", Value::Int(16)),
+                arg(&table, "FONT", "COLOR", Value::Int(0x00_FF00)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CGACT", "TEXT", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0)),
+                arg(&table, "CGACT", "SETSTR", Value::Str(b"A".to_vec())),
+                arg(&table, "CGACT", "X", Value::Int(24)),
+                arg(&table, "CGACT", "Y", Value::Int(4)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    assert_eq!(frame.text_draws.len(), 1);
+
+    let mut backend = SoftRenderer::new(texture_store(&[]));
+    if !backend.text_composer().available() {
+        println!(
+            "SKIP cgact_text_on_fileless_solid_layer_uses_explicit_surface_size: no system font"
+        );
+        return;
+    }
+    let out = backend.render_frame(&frame);
+    assert_eq!(out.report.text_draws, 1);
+    assert_eq!(out.report.text_glyphs, 1);
+    let green_right = out
+        .surface
+        .rgba
+        .chunks_exact(4)
+        .enumerate()
+        .filter(|(i, px)| {
+            // 只统计 x>=24 的像素:1×1 基面时这里必为纯黑。
+            (i % 48) >= 24 && px[1] > 0 && px[1] >= px[0] && px[1] >= px[2]
+        })
+        .count();
+    assert!(
+        green_right > 0,
+        "text at x=24 must land on the 48x24 solid layer"
+    );
+}
+
+/// `COPY2` 局部区域:快照表面保持**源表面尺寸**,区域外清空。
+///
+/// 证据 EVID-T-11/`j2-micro-copy`;反例是 2026-11-05 商業包 環境設定:
+/// 18×18 状态标被 `SIZE` 按 50×18 裁剪时横向拉伸,盖住背景图里的 on/off。
+#[test]
+fn partial_copy_keeps_source_surface_size() {
+    let table = table();
+    let mut gfx = state(Viewport::new(64, 24), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"SRC".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"sheet".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"DST".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"SRC".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"DST".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+                arg(&table, "CGACT", "X", Value::Int(0)),
+                arg(&table, "CGACT", "X2", Value::Int(17)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let copy_id = frame
+        .passes
+        .iter()
+        .flat_map(|pass| pass.ops.iter())
+        .find_map(|op| match op {
+            yu_gfx::Op::Copy(copy) => Some(copy.id),
+            _ => None,
+        })
+        .expect("COPY2 pass");
+
+    let mut sheet = RgbaImage::new(54, 18);
+    for y in 0..18 {
+        for x in 0..18 {
+            sheet.put_pixel(x, y, Rgba([255, 0, 0, 255]));
+        }
+    }
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(sheet.as_raw(), 54, 18, ExtendedColorType::Rgba8)
+        .expect("encode fixture");
+
+    let mut backend = SoftRenderer::new(texture_store(&[(b"sheet.png", png)]));
+    let out = backend.render_frame(&frame);
+    assert_eq!(out.report.skipped_ops_total, 0, "COPY2 应执行");
+    let snapshot = backend
+        .snapshot_surface(copy_id)
+        .expect("partial copy snapshot");
+    assert_eq!((snapshot.width, snapshot.height), (54, 18));
+    assert_eq!(snapshot.pixel(0, 0), Some([255, 0, 0, 255]));
+    assert_eq!(
+        snapshot.pixel(30, 0),
+        Some([0, 0, 0, 0]),
+        "区域外必须清空为透明"
+    );
+}
+
+/// `CG[FILE=""]` + `RECTPAINT3 SET=0` 后是**透明**表面(`Layer.fill`);
+/// 文本仍按 `SX/SY` 的图层尺寸落位并可见。这是環境設定字体预览的真实
+/// 链路:旧实现要么画成整块黑幕(忽略表面填充),要么用 1×1 基面把字裁掉。
+#[test]
+fn cgact_text_on_painted_transparent_solid_layer_is_visible() {
+    let table = table();
+    let mut gfx = state(Viewport::new(48, 24), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(48)),
+                arg(&table, "CG", "SY", Value::Int(24)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "FONT",
+            vec![
+                arg(&table, "FONT", "SX", Value::Int(16)),
+                arg(&table, "FONT", "SY", Value::Int(16)),
+                arg(&table, "FONT", "COLOR", Value::Int(0x00_FF00)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CGACT", "TEXT", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0)),
+                arg(&table, "CGACT", "SETSTR", Value::Str(b"A".to_vec())),
+                arg(&table, "CGACT", "X", Value::Int(24)),
+                arg(&table, "CGACT", "Y", Value::Int(4)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    assert_eq!(
+        frame
+            .layers
+            .iter()
+            .find(|layer| layer.id.display() == ":/W0/TX")
+            .and_then(|layer| layer.fill),
+        Some([0, 0, 0, 0])
+    );
+    let mut backend = SoftRenderer::new(texture_store(&[]));
+    if !backend.text_composer().available() {
+        println!("SKIP cgact_text_on_painted_transparent_solid_layer_is_visible: no system font");
+        return;
+    }
+    let out = backend.render_frame(&frame);
+    assert_eq!(out.report.text_draws, 1);
+    assert_eq!(out.report.text_glyphs, 1);
+    let green = out
+        .surface
+        .rgba
+        .chunks_exact(4)
+        .enumerate()
+        .filter(|(i, px)| (i % 48) >= 24 && px[1] > 0 && px[1] >= px[0] && px[1] >= px[2])
+        .count();
+    assert!(green > 0, "text must be visible on the transparent layer");
+    assert_eq!(
+        out.surface.pixel(0, 0),
+        Some([255, 255, 255, 255]),
+        "RECTPAINT3 SET=0 后不得残留黑幕"
+    );
+}

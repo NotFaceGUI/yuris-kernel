@@ -512,6 +512,7 @@ impl GfxState {
             return false;
         };
         node.layer.texture = TextureRef::Asset(key);
+        node.layer.fill = None;
         node.layer.reset_status();
         true
     }
@@ -763,6 +764,7 @@ impl GfxState {
                 }),
             },
             texture: TextureRef::Asset(overlay.asset.clone()),
+            fill: None,
             parts: Vec::new(),
             transform: crate::layer::Transform {
                 x: overlay.rect.x as f64,
@@ -1667,8 +1669,20 @@ impl GfxState {
             // `CGINFO[... TEX=1 LET=@texchk]` + `IF[@texchk==2]`,其分支
             // 注释为「E-moteレイヤなら」;这些 ID 由 `$LIDBUF+槽号` 拼出,
             // 未装载的槽自然不存在。
-            if flag == "TEX" {
-                return Ok(Value::Int(0));
+            match flag {
+                // 类型探测:不存在的层不是 E-mote。
+                "TEX" => return Ok(Value::Int(0)),
+                // 尺寸探测:官方直接读层 `+0x78/+0x7c`;层没创建 ⇒ 0×0。
+                // 证据:`DIV-GFX-070` 残留(资产装载失败时矩形保持 0)与
+                // 按钮脚本 `es_button.yst` 对可选 MASK 层的尺寸守卫。
+                "SX" | "SY" => return Ok(Value::Int(0)),
+                // 像素/鼠标探测:层不存在 = 没有命中点。
+                // 手册 `cg/cginfo.html` 例 8..10:未命中写 -1;
+                // `DIV-GFX-070` 已确认越界 COLOR 也返回 -1。
+                "COLOR" | "ONMOUSE" | "ONMOUSE2" | "ONMOUSE3" => {
+                    return Ok(Value::Int(-1))
+                }
+                _ => {}
             }
             return Err(error::unimplemented(
                 error::code::INFO_MISSING,
@@ -2352,6 +2366,7 @@ impl GfxState {
                 asset,
                 frame: frame_idx,
             };
+            node.layer.fill = None;
             node.layer.alpha_aware = info.has_alpha;
             node.layer.reset_status();
             self.reset_movie_surface(&path);
@@ -2375,6 +2390,7 @@ impl GfxState {
         let asset = movie.asset.clone();
         let has_alpha = movie.info.has_alpha;
         node.layer.texture = TextureRef::Movie { asset, frame: idx };
+        node.layer.fill = None;
         node.layer.alpha_aware = has_alpha;
         self.reset_movie_surface(&path);
     }
@@ -2403,6 +2419,7 @@ impl GfxState {
         }
         // 影片表面随结构释放 ⇒ 该层不再有图;位置/Z/alpha 等属性保留。
         node.layer.texture = TextureRef::None;
+        node.layer.fill = None;
         node.layer.reset_status();
         self.reset_movie_surface(&path);
     }
@@ -2817,6 +2834,7 @@ impl GfxState {
             // 手册:FILE 替换只换图,不重置 A/位置等属性。
             if let Some(node) = self.nodes.get_mut(&parsed.path) {
                 node.layer.texture = texture;
+                node.layer.fill = None;
                 // 新纹理没有旧快照/图像加工的状态;属性随后重算。
                 node.layer.reset_status();
             }
@@ -3465,6 +3483,7 @@ impl GfxState {
         }
         if let Some(node) = self.nodes.get_mut(dest) {
             node.layer.texture = TextureRef::Snapshot(copy_id);
+            node.layer.fill = None;
             node.layer.set_texture_status(match status {
                 OpStatus::Executable => LayerStatus::Executable,
                 OpStatus::Unimplemented(why) => LayerStatus::Unimplemented(why),
@@ -3653,6 +3672,7 @@ impl GfxState {
                 return;
             };
             s.layer.texture = dst.texture.clone();
+            s.layer.fill = dst.fill;
             s.layer.texture_status = dst.texture_status;
             s.layer.alpha_aware = dst.alpha_aware;
             s.layer.transform.x = dst.transform.x;
@@ -3671,6 +3691,7 @@ impl GfxState {
                 return;
             };
             d.layer.texture = src.texture.clone();
+            d.layer.fill = src.fill;
             d.layer.texture_status = src.texture_status;
             d.layer.alpha_aware = src.alpha_aware;
             d.layer.transform.x = src.transform.x;
@@ -4185,6 +4206,29 @@ impl GfxState {
             .and_then(EngineValue::as_int)
             .is_some_and(|v| v >= 2))
             || image_action.is_resize();
+        // 整层 RECTPAINT* 把 1×1 符号表面变成**实色表面**(EVID-J-02..04)。
+        // 记录成 `Layer.fill`,后续绘制/文本基面不再依赖“这张图加工结果
+        // 是否被烘焙在某个后端表面里”;也避免每帧重放清屏造成快照闪烁。
+        if executable
+            && target.as_ref() == Some(source)
+            && x.is_none()
+            && y.is_none()
+            && x2.is_none()
+            && y2.is_none()
+            && !region_from_fixed
+        {
+            if let Some(node) = self.nodes.get_mut(&source) {
+                if matches!(node.layer.texture, TextureRef::SolidBlack1x1) {
+                    if let Some(px) = rect_paint_fill(
+                        &image_action,
+                        set.as_ref().and_then(EngineValue::as_int),
+                        node.layer.fill,
+                    ) {
+                        node.layer.fill = Some(px);
+                    }
+                }
+            }
+        }
         self.push_image_log(ImageOp {
             seq,
             source: source.clone(),
@@ -4512,6 +4556,7 @@ impl GfxState {
                 size: Some(viewport_to_size(self.config.viewport)),
             },
             texture: TextureRef::None,
+            fill: None,
             parts: Vec::new(),
             transform: Default::default(),
             mask: None,
@@ -4551,6 +4596,7 @@ impl GfxState {
             visible: true,
             kind: LayerKind::Group { size: None },
             texture: TextureRef::None,
+            fill: None,
             parts: Vec::new(),
             transform: Default::default(),
             mask: None,
@@ -4599,6 +4645,7 @@ impl GfxState {
             visible: true,
             kind: LayerKind::Image { size },
             texture,
+            fill: None,
             parts: Vec::new(),
             transform: Default::default(),
             mask: None,
@@ -5680,6 +5727,38 @@ fn copy_attributes(src: &Layer, dst: &mut Layer) {
     dst.refresh_status();
 }
 
+/// 整层 `RECTPAINT`/`2`/`3` 之后的均匀表面颜色(RGBA)。
+///
+/// EVID-J-02..04:`RECTPAINT` 写 RGB 并强制 alpha=255;`RECTPAINT2` 只写
+/// alpha;`RECTPAINT3` 写整个 `0xAARRGGBB`。`current` 是原表面色,供
+/// `RECTPAINT2` 保留 RGB。
+fn rect_paint_fill(
+    action: &ImageAction,
+    set: Option<i64>,
+    current: Option<[u8; 4]>,
+) -> Option<[u8; 4]> {
+    let set = set? as u32;
+    Some(match action {
+        ImageAction::RectPaint => [
+            ((set >> 16) & 0xFF) as u8,
+            ((set >> 8) & 0xFF) as u8,
+            (set & 0xFF) as u8,
+            255,
+        ],
+        ImageAction::RectPaint2 => {
+            let rgb = current.unwrap_or([0, 0, 0, 255]);
+            [rgb[0], rgb[1], rgb[2], (set & 0xFF) as u8]
+        }
+        ImageAction::RectPaint3 => [
+            ((set >> 16) & 0xFF) as u8,
+            ((set >> 8) & 0xFF) as u8,
+            (set & 0xFF) as u8,
+            ((set >> 24) & 0xFF) as u8,
+        ],
+        _ => return None,
+    })
+}
+
 /// RECTPAINT/2/3 的可执行前置条件(EVID-J-02..05 / EVID-T-11)。
 ///
 /// 只放行已取证的组合:原地加工、SET 为整数、无 SET2/SETSTR/SX/SY、
@@ -5961,6 +6040,13 @@ fn hash_layer(h: &mut impl Hasher, layer: &Layer) {
         }
     }
     hash_texture(h, &layer.texture);
+    match layer.fill {
+        Some(px) => {
+            1u8.hash(h);
+            px.hash(h);
+        }
+        None => 0u8.hash(h),
+    }
     layer.parts.len().hash(h);
     for part in &layer.parts {
         hash_texture(h, &part.texture);

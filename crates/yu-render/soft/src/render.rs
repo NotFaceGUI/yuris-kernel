@@ -896,18 +896,34 @@ fn apply_copy_op(
             surface
         }
     };
-    // 表面尺寸 = 源表面(有区域时 = 区域尺寸),**不看**目标层的显示尺寸。
+    // 表面尺寸 = 源表面(区域只决定复制哪一块),**不看**目标层的显示尺寸。
     //
     // 证据:官方 COPY 替换目标表面(尺寸随源);`CG`/`CGACT` 的尺寸只是
     // 绘制拉伸。语料 `es_SaveLoad` 的缩略图链:COPY2 800×600 → `SIZE2`
     // 缩到 100×75;若按目标层当时的显示尺寸(100×75)裁剪,只会截到画面
     // 左上角(实测整张缩略图变黑)。
     let (x0, y0, x1, y1) = copy.region.resolve(source.width, source.height);
-    let (width, height) = ((x1 - x0 + 1).max(0) as u32, (y1 - y0 + 1).max(0) as u32);
-    let (width, height) = if width > 0 && height > 0 {
-        (width, height)
-    } else {
+    // 局部复制(EVID-T-11 “裁剪块写到目标 (0,0),其余清空”)的**图层源**
+    // 目标表面仍是源表面尺寸:区域外像素清空,而不是把区域缩放到目标层。
+    // 组源(主窗口截屏)保持区域尺寸,避免改变既有截图裁剪语义。
+    //
+    // 反例(2026-11-05 商業包 環境設定):按钮状态层由 `CG[FILE=""]` 建立、
+    // `COPY2 X=36 X2=53` 取 18×18 状态标,随后 `SIZE` 按按钮尺寸 50×18
+    // 裁剪 `X=0 X2=50`。若快照只有 18×18,`SIZE` 会把状态标横向拉伸
+    // ≈2.8 倍,盖住背景图里烤好的 “on/off” 标签(红框症状)。
+    // 保留 54×18 源表面后,区域标落在 (0,0),`SIZE` 只是 51→50 的
+    // 近似无缩放裁剪。
+    let layer_source = matches!(copy.source, yu_gfx::CopySource::Layer(_));
+    let (width, height) = if layer_source {
         (source.width, source.height)
+    } else {
+        let region_w = (x1 - x0 + 1).max(0) as u32;
+        let region_h = (y1 - y0 + 1).max(0) as u32;
+        if region_w > 0 && region_h > 0 {
+            (region_w, region_h)
+        } else {
+            (source.width, source.height)
+        }
     };
     let mut surface = Surface::new(width, height, [0, 0, 0, 0]);
     blit(&source, &mut surface, x0, y0, x1, y1);
@@ -1099,6 +1115,24 @@ fn compose_group(
     Ok(surface)
 }
 
+/// `CG[FILE=""]` 符号表面的当前实色(整层 `RECTPAINT*` 结果),按 `SX/SY`
+/// 铺开。没有 `fill` 时是官方 1×1 黑。
+fn solid_fill_texture(layer: Option<&Layer>) -> Texture {
+    let px = layer.and_then(|layer| layer.fill).unwrap_or([0, 0, 0, 255]);
+    match layer.and_then(|layer| layer.image_size()) {
+        Some(size) if size.width > 0 && size.height > 0 => Texture {
+            width: size.width,
+            height: size.height,
+            rgba: px.repeat((size.width as usize) * (size.height as usize)),
+        },
+        _ => Texture {
+            width: 1,
+            height: 1,
+            rgba: px.to_vec(),
+        },
+    }
+}
+
 /// 图层源:当前基图(帧内加工副本优先)。
 ///
 /// 源层可能已被 `CGEND` 删除(`DIV-GFX-053`),或者同名层被后续 `CG[X]`
@@ -1148,7 +1182,7 @@ fn layer_surface(
             .resolve_movie(asset, *frame)
             .map(Surface::from_texture)
             .map_err(|diag| diag.code.to_string()),
-        TextureRef::SolidBlack1x1 => Ok(Surface::from_texture(&Texture::solid_black_1x1())),
+        TextureRef::SolidBlack1x1 => Ok(Surface::from_texture(&solid_fill_texture(layer))),
         TextureRef::Snapshot(copy_id) => snapshots
             .get(copy_id)
             .cloned()
@@ -1206,7 +1240,7 @@ fn base_texture(
                 rgba: texture.rgba.clone(),
             })
             .map_err(|diag| diag.code.to_string()),
-        TextureRef::SolidBlack1x1 => Ok(Texture::solid_black_1x1()),
+        TextureRef::SolidBlack1x1 => Ok(solid_fill_texture(layer)),
         TextureRef::Snapshot(copy_id) => snapshots
             .get(copy_id)
             .map(|surface| Texture {
@@ -1323,7 +1357,18 @@ fn apply_layer_text(
     let override_hash = st
         .texture_overrides
         .get(&layer.id)
-        .map(|t| texture_content_hash(t));
+        .map(|t| texture_content_hash(t))
+        .or_else(|| {
+            // 整层 RECTPAINT* 后的实色也是基面身份;颜色变了必须重烤。
+            layer.fill.map(|px| {
+                let mut h = 0xcbf2_9ce4_8422_2325u64;
+                for b in px {
+                    h ^= u64::from(b);
+                    h = h.wrapping_mul(0x100_0000_01b3);
+                }
+                h
+            })
+        });
     let base_key = text_base_key(&layer.texture, override_hash);
     let dims = match st.texture_overrides.get(&layer.id) {
         Some(t) => Ok((t.width, t.height)),
@@ -1716,11 +1761,12 @@ fn draw_layer(
             let height = explicit_height.unwrap_or(1);
             let filter = pick_filter(frame, 1, 1, width, height);
             let (x, y) = (layer.transform.x, layer.transform.y);
+            let px = layer.fill.unwrap_or([0, 0, 0, 255]);
             {
                 let image = ImageRef {
                     width: 1,
                     height: 1,
-                    rgba: SOLID_BLACK,
+                    rgba: &px,
                 };
                 draw_image(
                     dst,

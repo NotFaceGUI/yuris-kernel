@@ -1067,6 +1067,14 @@ pub struct Layer {
     pub visible: bool,
     pub kind: LayerKind,
     pub texture: TextureRef,
+    /// `CG[FILE=""]` 的 1×1 符号表面被**整层** `RECTPAINT*` 改写后的实色
+    /// (RGBA)。`Some` = 该层表面是均匀色,渲染器不再按 `texture` 的 1×1
+    /// 黑绘制;文本基面也用这个颜色。区域填充仍走 `ImageOp`,不改本字段。
+    ///
+    /// 证据:EVID-J-04,官方 `RECTPAINT3` 把 32 位 `SET` 直接写进层表面,
+    /// 之后读取的都是这块表面(手册 `cg/cgact.html`);ERIS 環境設定用
+    /// `CG[FILE=""] SX/SY` + `RECTPAINT3 SET=0` 做透明样例窗。
+    pub fill: Option<[u8; 4]>,
     /// 基图之外的部件(首屏为空;引擎多部件几何未取证)。
     pub parts: Vec<Part>,
     pub transform: Transform,

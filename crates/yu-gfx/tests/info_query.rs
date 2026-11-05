@@ -559,3 +559,39 @@ fn main_group_copy_snapshot_reports_viewport_size() {
     assert_eq!(info("SX"), Value::Int(i64::from(viewport.width)));
     assert_eq!(info("SY"), Value::Int(i64::from(viewport.height)));
 }
+
+/// 不存在的层:尺寸/像素探测按官方中性值返回,不再制造
+/// `gfx.info.missing` UNIMP(按钮 MASK/SLIDER 的可选层每帧探测会刷屏)。
+#[test]
+fn cginfo_missing_layer_returns_neutral_probe_values() {
+    let table = table();
+    let gfx = state();
+    let ask = |flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("MISSING")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(ask("EXIST"), Value::Int(0));
+    assert_eq!(ask("TEX"), Value::Int(0));
+    assert_eq!(ask("SX"), Value::Int(0));
+    assert_eq!(ask("SY"), Value::Int(0));
+    assert_eq!(ask("COLOR"), Value::Int(-1));
+    assert_eq!(ask("ONMOUSE"), Value::Int(-1));
+    assert_eq!(ask("ONMOUSE2"), Value::Int(-1));
+    assert_eq!(ask("ONMOUSE3"), Value::Int(-1));
+    // 未取证中性值的字段仍显式挂号,不 blanket 成 0。
+    let err = q_err(
+        &gfx,
+        "CGINFO",
+        vec![
+            arg(&table, "CGINFO", "ID", s("MISSING")),
+            arg(&table, "CGINFO", "E", i(1)),
+        ],
+    );
+    assert_eq!(err.code, "gfx.info.missing");
+}

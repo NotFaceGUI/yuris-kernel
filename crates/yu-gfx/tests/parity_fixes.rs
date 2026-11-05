@@ -1575,3 +1575,61 @@ fn cg_missing_layer_poll_is_reported_once_as_verbose() {
         "层删除后的新探测必须重新留痕"
     );
 }
+
+/// 整层 `RECTPAINT3` 把 `CG[FILE=""]` 的 1×1 符号表面变成实色表面:
+/// `Layer.fill` 必须记录 `SET` 的 32 位值(EVID-J-04),后续绘制/文本
+/// 基面用它,而不是每帧重放清屏(那会让快照闪烁)。
+#[test]
+fn full_layer_rectpaint_updates_layer_fill() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("T")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(8)),
+                arg(&table, "CG", "SY", i(4)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("T")),
+                arg(&table, "CGACT", "RECTPAINT3", i(1)),
+                arg(&table, "CGACT", "SET", i(0)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    assert_eq!(
+        layer(&f, ":/W0/T").fill,
+        Some([0, 0, 0, 0]),
+        "RECTPAINT3 SET=0 = 透明表面"
+    );
+
+    gfx.consume_events(&[
+        frame_start(2),
+        call(
+            2,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("T")),
+                arg(&table, "CGACT", "RECTPAINT3", i(1)),
+                arg(&table, "CGACT", "SET", i(0x80FF8000)),
+            ],
+        ),
+        frame_end(2),
+    ]);
+    let f = gfx.frame();
+    assert_eq!(
+        layer(&f, ":/W0/T").fill,
+        Some([255, 128, 0, 128]),
+        "0xAARRGGBB → RGBA"
+    );
+}

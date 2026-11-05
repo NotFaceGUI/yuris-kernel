@@ -719,7 +719,16 @@ fn resolve_target_base(
             Err("gfx.imageop.copy_source.unsupported".to_string())
         }
         texture => {
-            let tex = resolve_ref(ctx, textures, gpu, targets, id, texture, bases)?;
+            let tex = resolve_ref(
+                ctx,
+                textures,
+                gpu,
+                targets,
+                id,
+                texture,
+                layer.and_then(|layer| layer.fill),
+                bases,
+            )?;
             let mut hash = 0xcbf2_9ce4_8422_2325u64;
             fnv_bytes(&mut hash, id.as_bytes());
             fnv_mix(&mut hash, tex.id);
@@ -780,11 +789,38 @@ fn resolve_source(
             return Ok(content.clone());
         }
     }
-    let tex = resolve_ref(ctx, textures, gpu, targets, id, texture, bases)?;
+    let tex = resolve_ref(
+        ctx,
+        textures,
+        gpu,
+        targets,
+        id,
+        texture,
+        layer.and_then(|layer| layer.fill),
+        bases,
+    )?;
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     fnv_bytes(&mut hash, id.as_bytes());
     fnv_mix(&mut hash, tex.id);
-    Ok(Content::identity(tex, hash))
+    // `CG[FILE=""]` 的 1×1 黑在引擎里按 `SX/SY` 铺成显式尺寸的表面;
+    // 文本基面也必须按这块表面计算,否则 `CGACT[TEXT]` 的字符坐标
+    // (x=50/y=50 等)会落到 1×1 图外,字体预览整块空白。
+    let (width, height) = match texture {
+        TextureRef::SolidBlack1x1 => layer
+            .and_then(|layer| layer.image_size())
+            .map(|size| (size.width, size.height))
+            .unwrap_or((tex.width, tex.height)),
+        _ => (tex.width, tex.height),
+    };
+    Ok(Content {
+        tex,
+        uv: [0.0, 0.0, 1.0, 1.0],
+        width,
+        height,
+        bilinear: false,
+        display: None,
+        hash,
+    })
 }
 
 pub(crate) fn resolve_ref(
@@ -794,9 +830,10 @@ pub(crate) fn resolve_ref(
     targets: &TargetSet,
     id: &LayerId,
     texture: &TextureRef,
+    fill: Option<[u8; 4]>,
     bases: &mut BTreeMap<(LayerId, u64), Rc<TexRef>>,
 ) -> Result<Rc<TexRef>, String> {
-    let key = (id.clone(), texref_token(texture));
+    let key = (id.clone(), texref_token(texture) ^ fill_token(fill));
     if let Some(hit) = bases.get(&key) {
         return Ok(hit.clone());
     }
@@ -833,7 +870,7 @@ pub(crate) fn resolve_ref(
         }
         TextureRef::SolidBlack1x1 => {
             let gpu_id = gpu
-                .ensure_solid_black(ctx)
+                .ensure_solid_color(ctx, fill.unwrap_or([0, 0, 0, 255]))
                 .map_err(|diag| diag.code.to_string())?;
             let uploaded = gpu
                 .get(gpu_id)
@@ -859,6 +896,17 @@ pub(crate) fn resolve_ref(
     };
     bases.insert(key, tex.clone());
     Ok(tex)
+}
+
+/// `Layer.fill` 的身份 token(与 `texref_token` 一起组成基面缓存键)。
+fn fill_token(fill: Option<[u8; 4]>) -> u64 {
+    let Some(px) = fill else { return 0 };
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in px {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
 }
 
 /// 纹理引用的身份(基面缓存键的一部分;同一层可在同一帧内被 `CG[FILE]`
@@ -1758,60 +1806,32 @@ fn apply_copy(
     let clip_y1 = y1.min(i64::from(sh) - 1);
     let clip_w = (clip_x1 - clip_x0 + 1).max(0) as u32;
     let clip_h = (clip_y1 - clip_y0 + 1).max(0) as u32;
-    // 区域切片零拷贝:源是恒等内容时,快照可直接引用源纹理的 UV 子窗口。
-    // ERIS 菜单一次构造 260+ 个按钮状态切片,逐张新建纹理约 86µs/张
-    // (`image_us≈25ms`);图层绘制与文本烘焙都消费 `Content.uv`,不必物化。
-    // 文本层不走别名:文本基面读回按整张纹理,别名会把小图变成整图读回。
-    if !full
-        && source.is_identity()
-        && copy.texts.is_empty()
-        && !frame.text_revisions.contains_key(&copy.dest)
-        && clip_w == width
-        && clip_h == height
-        && clip_w > 0
-        && clip_h > 0
-    {
-        let uv = [
-            clip_x0 as f32 / sw as f32,
-            clip_y0 as f32 / sh as f32,
-            (clip_x1 + 1) as f32 / sw as f32,
-            (clip_y1 + 1) as f32 / sh as f32,
-        ];
-        let hash = surfaces.bump_hash();
-        let content = Content {
-            tex: source.tex.clone(),
-            uv,
-            width: clip_w,
-            height: clip_h,
-            bilinear: false,
-            display: None,
-            hash,
-        };
-        targets.set_snapshot_content(copy.id, content.clone());
-        // 基面身份也要切到别名:`sync_base` 在帧首按旧纹理设过 base,
-        // 不更新的话下一帧会把别名内容当「换了图」清掉,而别名没有
-        // 物化纹理可回退 ⇒ 图层整片消失(只在下一次屏幕快照里暴露)。
-        let alias_ref = TextureRef::Snapshot(copy.id);
-        let token = base_token(frame, targets, &copy.dest, Some(&alias_ref));
-        surfaces.sync_base(&copy.dest, token);
-        contents.insert(copy.dest.clone(), content.clone());
-        surfaces.set_content(&copy.dest, content);
-        surfaces.note_alias_hit();
-        return Ok(());
-    }
-    let tex = if full && source.is_identity() && width == sw && height == sh {
+    // 局部复制的快照表面保持**源表面尺寸**(EVID-T-11:区域块写到 (0,0),
+    // 其余清空),不能把区域放大到目标层尺寸。按钮状态层是典型:
+    // `COPY2 X=36 X2=53` 取 18×18 状态标,随后 `SIZE` 按 50×18 裁剪
+    // `X=0 X2=50`;若快照只有 18×18,`SIZE` 会把状态标横向拉伸 ≈2.8 倍,
+    // 盖住背景图里烤好的 “on/off” 标签(2026-11-05 商業包 環境設定)。
+    //
+    // 组源(主窗口截屏)保持区域尺寸,避免改变既有截图裁剪语义。
+    // 因此图层源的局部复制不再走 UV 零拷贝别名(别名只有区域尺寸);
+    // 区域外像素由下面的清屏保证透明。全幅复制的零拷贝快路径保持不变。
+    let layer_source = matches!(copy.source, CopySource::Layer(_));
+    let (out_w, out_h) = if layer_source {
+        (sw, sh)
+    } else {
+        (width, height)
+    };
+    let tex = if full && source.is_identity() && out_w == sw && out_h == sh {
         // 别名:快照 = 源内容句柄(零拷贝)。内容纹理永不原地改写
         // (surfaces 不变量 1)⇒ 冻结语义天然成立。
         surfaces.note_alias_hit();
         source.tex.clone()
     } else {
         let materialized = materialize(ctx, pipelines, surfaces, writes, &source, "copy source")?;
-        let out = surfaces.acquire(ctx, width, height, "copy snapshot")?;
+        let out = surfaces.acquire(ctx, out_w, out_h, "copy snapshot")?;
         writes.remember(&out);
-        // 区域在源内时 blit 覆盖整张目标(宽高 = 裁剪后尺寸)⇒ 不需要先清屏。
-        // ERIS 菜单构造一次产生 260+ 个按钮状态切片,逐个开 render pass 清屏
-        // 是构造帧的主要 CPU/GPU 尖峰(2026-11-02 实测 image_us≈25ms)。
-        if clip_w < width || clip_h < height {
+        // 区域未铺满目标表面时先清屏,保证区域外像素为透明。
+        if clip_w < out_w || clip_h < out_h {
             let mut pass = PlannedPass {
                 target: Some(PlannedTarget::Commands),
                 ..PlannedPass::default()
@@ -2276,7 +2296,7 @@ fn asset_identity_base(
     let TextureRef::Asset(key) = &layer.texture else {
         return None;
     };
-    let tex = resolve_ref(ctx, textures, gpu, targets, id, &layer.texture, bases).ok()?;
+    let tex = resolve_ref(ctx, textures, gpu, targets, id, &layer.texture, None, bases).ok()?;
     if raw.tex.id != tex.id {
         // 像素 op 产出了新纹理:内容已不是资产,必须读回。
         return None;
@@ -2457,7 +2477,7 @@ fn apply_text(
             .as_ref()
             .filter(|l| l.target.as_ref() == Some(&id));
         let revision = frame.text_revisions.get(&id).copied().unwrap_or(0);
-        let raw = match surfaces
+        let mut raw = match surfaces
             .raw_content(&id)
             .or_else(|| contents.get(&id).cloned())
         {
@@ -2483,6 +2503,20 @@ fn apply_text(
                 }
             },
         };
+        // 1×1 黑层(`CG[FILE=""]`)的文本基面是 `SX/SY` 大小的表面,
+        // 而不是那 1 个像素;绘制阶段缓存的 1×1 content 在这里纠正。
+        if matches!(layer.texture, yu_gfx::TextureRef::SolidBlack1x1) {
+            if let Some(size) = layer.image_size() {
+                if size.width > 0
+                    && size.height > 0
+                    && (raw.width != size.width || raw.height != size.height)
+                {
+                    raw.width = size.width;
+                    raw.height = size.height;
+                    raw.bilinear = false;
+                }
+            }
+        }
         if raw.width == 0 || raw.height == 0 {
             note_text_diag(acc, "text.layer_base: text.layer_size_unknown".to_string());
             continue;
@@ -2951,7 +2985,15 @@ fn base_token(
             fnv_mix(&mut hash, 1);
             fnv_bytes(&mut hash, key);
         }
-        Some(TextureRef::SolidBlack1x1) => fnv_mix(&mut hash, 2),
+        Some(TextureRef::SolidBlack1x1) => {
+            fnv_mix(&mut hash, 2);
+            if let Some(px) = layer.and_then(|layer| layer.fill) {
+                fnv_mix(&mut hash, 7);
+                for b in px {
+                    fnv_mix(&mut hash, u64::from(b));
+                }
+            }
+        }
         Some(TextureRef::Snapshot(copy_id)) => {
             fnv_mix(&mut hash, 3);
             fnv_mix(&mut hash, copy_id.0);

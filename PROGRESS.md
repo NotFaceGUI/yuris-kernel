@@ -13356,3 +13356,97 @@ cargo test -p yu-rt(带 YURIS_SAMPLE_* 环境)
 **审阅结论**:本轮 gfx 改动未发现新的硬编码路径/绝对路径/调试输出;
 保留项仍是 042/060/024/026/038/072§9 等 evidence 项(见
 `docs/tasks/task-gfx-closeout-audit.md` §12)。
+
+## 成果 CONFIG-UI (2026-11-05) · 環境設定按钮状态标记与字体预览文本修复
+
+**症状(主人截图)**:
+- 右侧 on/off 两列的状态标记横向拉宽,盖住背景图里烤好的标签;
+  左侧 full/window 与字体区复选标记同样被拉宽。
+- 「フォント設定」预览窗只有黑底,字体名与样例文字全部不可见。
+
+**根因(证据链见 `docs/divergences/DIV-GFX-077-config-ui-copy-solid.md`)**:
+1. `es_button.yst` 先 `COPY2 X=36 X2=53` 从 54×18 状态表切 18×18
+   标记,再用 `SIZE X=0 X2=@BT.SRCSX SX=50 SY=18` 按按钮尺寸裁剪。
+   内核旧实现把 COPY2 快照做成区域尺寸(18×18),`SIZE` 为对齐 50×18
+   把标记横向拉伸 ≈2.8 倍。官方按 EVID-T-11 保留**源表面尺寸**、区域
+   外清空,`SIZE` 只是一次近似 1:1 裁剪;背景图 `back_easy.png` 里的
+   on/off 标签因此不会被盖住。
+2. `SMTX/FONTL1` 是 `CG[FILE=""] SX=600/210 SY=180/19` 的 1×1 黑层;
+   文本合成旧实现拿 1×1 基面,`CGACT[TEXT]` 的 `x=50/y=50` 等字符
+   全部落到图外。官方按 `SX/SY` 把 1×1 铺成显式尺寸表面后再写字。
+
+**改动**:
+- soft:`layer_base`/`layer_base_dims` 对 `SolidBlack1x1` 使用
+  `layer.image_size()` 生成/测量 `SX×SY` 黑基面。
+- wgpu:`resolve_source` 对 `SolidBlack1x1` 返回显式尺寸 `Content`;
+  `apply_text` 对绘制阶段缓存的 1×1 content 再校正尺寸。
+- soft/wgpu:`COPY2` 图层源局部复制快照保持源表面尺寸,区域块写
+  `(0,0)`、区域外清空;组源截屏保持区域尺寸。wgpu 图层源局部复制
+  不再走 UV 零拷贝别名(别名只有区域尺寸)。
+- **黑幕根因(2026-11-05 主人提供官方截图后复核)**:`SMTX`/
+  `SMTX_BG`/`FONTL1` 三块 `CG[FILE=""]` 表面随后被整层
+  `RECTPAINT3 SET=0` 写成**透明表面**(EVID-J-04:`FUN_0043185c` 模式 3
+  直接写 32 位 `SET`)。旧模型始终按 `SolidBlack1x1` 绘制,soft 又没有
+  持久层表面,烘焙后的透明结果下一帧丢失 ⇒ 预览区整块黑幕,并遮住
+  右侧声音面板。新增 `Layer.fill: Option<[u8;4]>`:整层
+  `RECTPAINT`/`2`/`3`(无区域、原地、基面为 1×1 符号)在命令时刻
+  记录实色表面;soft/wgpu 的绘制、复制源、文本基面统一使用它。
+  **不做每帧重放**——重放会让屏幕契约帧间翻转(频闪)并清掉快照里
+  一次性写入的底栏说明文字;本轮先用过该错误方向,已撤除。
+  另:排查时发现残留 `yu-cli.exe` 进程会叠窗,也会造成“频闪”假象;
+  复测前须确认无旧进程。
+
+**验证**:
+```text
+cargo test -p yu-backend-soft --test render
+  → 25 passed(新增 3 条回归:fileless 黑层文本、局部 COPY2 表面尺寸、
+     RECTPAINT3 透明层文本)
+cargo test -p yu-gfx -p yu-backend-wgpu
+  → gfx parity 32 passed;wgpu 39/14/9 + shaders_parse 1 passed
+cargo build --workspace --all-targets
+  → exit 0
+商業包環境設定:soft(1152×720)与桌面 wgpu 截图
+  → on/off 标签完整、状态点落在背景白圆;预览区为页面背景+两行样例
+     文字(无黑幕);字体名、縦文字/影复选框、底栏说明均可见
+帧稳定性(soft/wgpu 各 1150/1200/1250 帧)
+  → 两后端各自三帧整屏 SHA-256 完全相同(无频闪)
+```
+
+**注**:
+- `cargo test --workspace` 的 `yu-gfx --test eris_first_screen` 两条
+  golden 断言 `layers 199 vs 272`。该测试只依赖 `yu-gfx`/`yu-rt`,不依赖
+  本轮改动的 `yu-render`,属于当前 `<project-eris>` 语料与既有 golden
+  的差异;未改 golden,待主人复核语料后另行处理。
+- 确定性用例 golden(`cases/*.json`)未 `--update`;本次像素修复后
+  相关界面用例需要人工过目再重基线。
+
+## 成果 CGINFO-MISS (2026-11-05) · CGINFO 缺失可选层的探测值收口
+
+**症状**:商業包启动/标题阶段大量
+`UNIMP [gfx] gfx.info.missing ... CGINFO[SX/SY/COLOR] 目标
+:/W0/BT.MASKES...SLIDER=0=1 不存在`;同类还有 `BT.OFF1`、`BT.ON1`。
+
+**根因(证据见 `docs/divergences/DIV-GFX-078-cginfo-missing-probe.md`)**:
+- 目标层确实不在 `GfxState.nodes` 中:按钮 MASK 层只在
+  `IF[$BT.MASK(@mLC)!=""]` 内创建,没有 MASK 图的按钮不建层;
+- 按钮几何/重绘例程仍无条件用 `CGINFO[SX/SY/COLOR]` 探测该层作守卫
+  (`es_button.yst` s0 pc2241..2243 / 2271..2273);
+- 官方 `CGINFO[SX/SY]` 直接读层矩形(缺失=0),`ONMOUSE*` 未命中=
+  -1,`DIV-GFX-070` 已确认 `COLOR` 越界=-1;旧内核把“层不存在”一律
+  记 `INFO_MISSING`(Unimplemented),所以刷屏且不写 LET。
+
+**改动**:
+- `query_cginfo` 缺失层分支:`EXIST/TEX` 仍 0;`SX/SY` → 0;
+  `COLOR/ONMOUSE/ONMOUSE2/ONMOUSE3` → -1;其它字段仍显式
+  `gfx.info.missing`(未取证不猜)。
+- 不创建鬼层;`CG` 无 FILE/RID 的官方 -1 语义保持不变。
+
+**验证**:
+```text
+cargo test -p yu-gfx --test info_query
+  → 13 passed(新增 cginfo_missing_layer_returns_neutral_probe_values)
+商業包 300 帧(--log-level info)
+  → gfx.info.missing 计数 0(修复前同入口数百条)
+桌面 wgpu 環境設定截图
+  → 预览无黑幕、on/off 标签完整、底栏说明可见(与上一成果一致)
+```
