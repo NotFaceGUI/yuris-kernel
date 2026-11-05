@@ -8,16 +8,23 @@
 //! 格内先用 `RECTPAINT` 涂成绿色再 `CG[TID=mask T=.. TA=..]`。
 //! 参考帧上 α = 绿色通道 / 255(底色纯黑)。
 //!
-//! # 这张表为什么可信
+//! # 这张表为什么可信,以及它对应哪条路径
 //!
 //! 表里 `mask=0, T=255` 的四点精确等于 `(256 - TA/2)/256`
 //! (0.996 / 0.875 / 0.749 / 0.624,误差 ≤0.004),不是随手拟合能凑出来的。
 //!
-//! # 用法
+//! 官方固定管线(`_DXMODE=0`)在“有配对且 `TA>=1`”时走 effect **Pass1
+//! (psC)**(`FUN_00414ba4` `0x414dfa` BeginPass(1)、`0x416c8a` 设 uniform):
 //!
-//! 本表**不解释**官方为何如此(见 `docs/divergences/DIV-GFX-065-transition-coverage-model.md`
-//! §7/§8:官方是等值线几何 + 常量 α,不是逐像素公式),只用它约束「我们的近似
-//! 至少要在整张表上落进 2/255」。允许近似,不允许偏离到硬边/黑幕。
+//! ```text
+//! oC0.a = tex1.a * saturate((YS_FadeVal - 0.5*tex2.r) * YS_FadeVal2) * YS_AlphaVal
+//! ```
+//!
+//! 且遮罩按 **/256** 归一化、使用精灵系统反色后的缓冲。这两点合起来对整张
+//! 40 格表逐点成立(≤2/255),也解释了 `mask=0,T=255`:
+//! `fade(256)=0.5+1/TA`,反色后的 `mask=0` 是 1.0,故
+//! `sat((0.5+1/TA - 0.5)*TA)=1` 附近,单块几何边界上的取值就是
+//! `1-TA/512`。
 
 use yu_backend_soft::{SoftRenderer, TextureStore};
 use yu_format::yscm::{Arg as FmtArg, Command as FmtCommand, CommandTable};
@@ -64,6 +71,7 @@ fn table() -> ParamTable {
                     "RECTPAINT",
                     "RECTPAINT2",
                     "RECTPAINT3",
+                    "REVERSE",
                     "SET",
                     "X",
                     "Y",
@@ -170,6 +178,16 @@ fn render_alpha(ta: i64, t: i64, mask_set: i64) -> f64 {
             arg(&table, "CGACT", "ID", Value::Str(b"M".to_vec())),
             arg(&table, "CGACT", "RECTPAINT", Value::Int(1)),
             arg(&table, "CGACT", "SET", Value::Int(mask_set)),
+        ],
+    ));
+    // 官方精灵系统的过渡缓冲在进入转场前被 `CGACT[REVERSE=1]` 反色
+    // (`es_Sprite.yst` LOADTR);micro 参考帧测到的就是反色后的缓冲。
+    events.push(call(
+        1,
+        "CGACT",
+        vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"M".to_vec())),
+            arg(&table, "CGACT", "REVERSE", Value::Int(1)),
         ],
     ));
     // 测试层:绿色,再挂过渡
@@ -290,14 +308,13 @@ fn transition_alpha_matches_official_mask_sweep() {
     );
 }
 
-/// TA 维度(官方 `j2-micro-trans8`:TA{2,64,128,192} × T × mask{0,128})。
+/// TA 维度(官方 `j2-micro-trans8`:TA{2,64,192} × T × mask{0,128})。
 ///
-/// 现实现带宽固定(`1/(30+70f)`),TA 只通过 `YS_FadeVal` 进入;官方 TA 越小
-/// 带宽越宽(TA=4 的时钟幕就是"柔和"),见 DIV-GFX-065 §11.1。此表还有一个
-/// 未解的几何因素:每格只有单块遮罩,`mask=0,T=255` 的四点恰为
-/// `(256−TA/2)/256`,说明残差由**推进量化**而非带宽产生。
-/// 该测试留作实现目标,等 TA 语义从引擎侧定出后去掉 `#[ignore]`。
-#[ignore = "TA→带宽/推进量化未定(现实现带宽固定,仅 TA=128 的边界点成立)"]
+/// 官方固定管线路径实际走 effect Pass1(psC):
+/// `α = sat((FadeVal - 0.5*mask/256) * TA)`,遮罩是精灵系统反色后的缓冲。
+/// 该式对整张 40 格表逐点成立(≤2/255),包括此前无法解释的
+/// `mask=0,T=255 → 1-TA/512` —— 它是 `fade(256)=0.5+1/TA` 在那个
+/// 单块的几何边界上的取值,不是额外的覆盖率公式。
 #[test]
 fn transition_alpha_matches_official_grid() {
     let mut failures = Vec::new();

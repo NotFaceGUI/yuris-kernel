@@ -116,13 +116,6 @@ pub fn src_mode(mode: BlendMode) -> Option<u32> {
 
 const SHADER: &str = crate::shaders::QUAD;
 
-/// 双纹理过渡:配对纹理 G 通道为 mask(EVID-T-05)。
-///
-/// `coverage = clamp((30+70*fade) * (mask - (1-2*fade)), 0, 1)`;
-/// `complete=1`(T>=256)直接为满。与 `yu_gfx::transition_coverage` 同式,
-/// 并按 soft 的 u8 量化链输出 src alpha(淡入淡出 0 差异)。
-const TRANSITION_SHADER: &str = crate::shaders::TRANSITION_FIXED;
-
 /// 快照上的 RECTPAINT 族(拷贝完成后在快照纹理上原地绘制)。
 ///
 /// `write_alpha_only=1` 对应 RECTPAINT2;否则整像素写入(颜色由 uniform 给出,
@@ -172,12 +165,10 @@ pub struct PipelineCache {
     /// 双纹理过渡(纹理 + mask + fade uniform)。
     transition_layout: wgpu::BindGroupLayout,
     transition_pipeline_layout: wgpu::PipelineLayout,
-    transition_shader: wgpu::ShaderModule,
-    transition_pipelines: BTreeMap<BlendMode, wgpu::RenderPipeline>,
-    /// 引擎 effect Pass1(psC,mask R;`_DXMODE≠0`)。
+    /// 引擎 effect Pass1(psC,mask R;配对 + `TA>=1`)。
     transition_psc_shader: wgpu::ShaderModule,
     transition_psc_pipelines: BTreeMap<BlendMode, wgpu::RenderPipeline>,
-    /// 引擎 effect Pass0(psD,交叉淡化;`_DXMODE≠0` 且 TA<1)。
+    /// 引擎 effect Pass0(psD,交叉淡化;`TA<1`,当前 gfx 不生成该 op)。
     transition_psd_shader: wgpu::ShaderModule,
     transition_psd_pipelines: BTreeMap<BlendMode, wgpu::RenderPipeline>,
     /// 引擎显示缩放 effect Pass2/Pass3(`DAT_00801334` 2/3)。
@@ -226,10 +217,9 @@ pub struct PipelineCache {
     pub total_bind_groups_created: u64,
 }
 
-/// 过渡管线变体:固定管线模型 / 引擎 psC / 引擎 psD。
+/// 过渡管线变体:引擎 psC / 引擎 psD。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransitionVariant {
-    Fixed,
     PsC,
     PsD,
 }
@@ -271,12 +261,6 @@ impl PipelineCache {
                 label: Some("yu-backend-wgpu layout"),
                 bind_group_layouts: &[Some(&bind_group_layout)],
                 immediate_size: 0,
-            });
-        let transition_shader = ctx
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("yu-backend-wgpu transition"),
-                source: wgpu::ShaderSource::Wgsl(TRANSITION_SHADER.into()),
             });
         let transition_psc_shader = ctx
             .device
@@ -597,8 +581,6 @@ impl PipelineCache {
             bind_groups: BTreeMap::new(),
             transition_layout,
             transition_pipeline_layout,
-            transition_shader,
-            transition_pipelines: BTreeMap::new(),
             transition_psc_shader,
             transition_psc_pipelines: BTreeMap::new(),
             transition_psd_shader,
@@ -735,15 +717,6 @@ impl PipelineCache {
         Ok(true)
     }
 
-    /// 为某个混合模式建过渡管线;不支持的模式返回 `None`。
-    pub fn ensure_transition_pipeline(
-        &mut self,
-        ctx: &GpuContext,
-        mode: BlendMode,
-    ) -> Result<bool, Diag> {
-        self.ensure_transition_variant(ctx, TransitionVariant::Fixed, mode)
-    }
-
     /// 引擎 psC(mask R)过渡管线。
     pub fn ensure_psc_pipeline(&mut self, ctx: &GpuContext, mode: BlendMode) -> Result<bool, Diag> {
         self.ensure_transition_variant(ctx, TransitionVariant::PsC, mode)
@@ -761,7 +734,6 @@ impl PipelineCache {
         mode: BlendMode,
     ) -> Result<bool, Diag> {
         let cached = match variant {
-            TransitionVariant::Fixed => self.transition_pipelines.contains_key(&mode),
             TransitionVariant::PsC => self.transition_psc_pipelines.contains_key(&mode),
             TransitionVariant::PsD => self.transition_psd_pipelines.contains_key(&mode),
         };
@@ -772,7 +744,6 @@ impl PipelineCache {
             return Ok(false);
         };
         let (shader, label) = match variant {
-            TransitionVariant::Fixed => (&self.transition_shader, "transition"),
             TransitionVariant::PsC => (&self.transition_psc_shader, "transition psC"),
             TransitionVariant::PsD => (&self.transition_psd_shader, "transition psD"),
         };
@@ -801,9 +772,6 @@ impl PipelineCache {
                 })
         })?;
         match variant {
-            TransitionVariant::Fixed => {
-                self.transition_pipelines.insert(mode, pipeline);
-            }
             TransitionVariant::PsC => {
                 self.transition_psc_pipelines.insert(mode, pipeline);
             }
@@ -813,10 +781,6 @@ impl PipelineCache {
         }
         self.total_pipelines_created += 1;
         Ok(true)
-    }
-
-    pub fn transition_pipeline(&self, mode: BlendMode) -> Option<&wgpu::RenderPipeline> {
-        self.transition_pipelines.get(&mode)
     }
 
     pub fn psc_pipeline(&self, mode: BlendMode) -> Option<&wgpu::RenderPipeline> {

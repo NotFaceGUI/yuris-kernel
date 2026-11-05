@@ -31,8 +31,8 @@
 //!    方程里完成,不预乘;
 //! 7. 只执行 `MODE 0/1/2`;其余模式或 `OpStatus::Unimplemented` 的操作跳过并
 //!    计数,不近似;
-//! 8. 双纹理过渡:配对纹理的 G 通道为 mask,覆盖度见
-//!    `yu_gfx::transition_coverage`(EVID-T-05);
+//! 8. 双纹理过渡 = 官方 effect Pass1(psC):配对基图 R 通道为 mask,
+//!    覆盖度 `sat((YS_FadeVal - 0.5*mask/256) * TA)`(DIV-GFX-065);
 //! 9. 文本两条路径都执行:`CGACT[TEXT]` 绘制项合成到图层基图副本;
 //!    自动文本层按 `_TEXT_FLAG` 逐字排版后画到目标层/屏幕覆盖层。没有
 //!    `_TEXT_FLAG` 的 `TextRun` 仍然不猜排版(`skipped_text` 计数);

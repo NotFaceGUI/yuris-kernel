@@ -13,9 +13,9 @@
 //!   alpha 源项是 `a²` 而不是 `a`:D3D9 未启用 `SEPARATEALPHABLENDENABLE`
 //!   时 alpha 通道复用同一组因子(`SRCALPHA` 因子为 `(As,As,As,As)`)。
 //!   证据:`EVID-J-01`(`docs/fidelity-ledger-j.md`)。
-//! - 双纹理过渡(`EVID-T-05`):RGB 取本层纹理;覆盖度 =
-//!   [`yu_gfx::transition_coverage`](mask = 配对纹理 G 通道,fade = YS_FadeVal,
-//!   `T>=256` 为满),再乘纹理 α 与层 `A`。
+//! - 双纹理过渡 = 官方 effect Pass1(psC):RGB 取本层纹理;覆盖度 =
+//!   `sat((YS_FadeVal - 0.5*mask/256) * TA)`(mask = 配对基图 R 通道),
+//!   再乘纹理 α 与层 `A/256`;`T>=256` 时 `YS_FadeVal` 恰好让覆盖度为满。
 //! - `Point` 最近邻,`Linear/Anisotropic` 双线性;缩放采样全部用整数
 //!   16.16 定点,避免浮点跨平台差异;
 //! - 颜色空间按存储值直接混合,不做 sRGB↔线性转换。
@@ -25,9 +25,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use yu_gfx::{
-    transition_coverage, BlendMode, Clear, CompositorFrame, CopyId, CopyOp, CopySource, FilterMode,
-    ImageAction, ImageOp, Layer, LayerId, Op, OpStatus, PassTarget, ScreenSnapshot, TextDraw,
-    TextureRef,
+    BlendMode, Clear, CompositorFrame, CopyId, CopyOp, CopySource, FilterMode, ImageAction,
+    ImageOp, Layer, LayerId, Op, OpStatus, PassTarget, ScreenSnapshot, TextDraw, TextureRef,
 };
 
 use crate::imageop::{
@@ -1432,13 +1431,20 @@ fn draw_transition(
             return;
         }
     };
-    let mask = match resolve_source_with_override(
-        textures,
-        snapshots,
-        st,
-        transition.to_layer.as_ref(),
-        to,
-    ) {
+    // 官方 `YS_Texture2` 取配对层**基图**(层 `+0x21c`),不是 `CGACT`
+    // 加工表面(`+0x90`)。脚本对遮罩缓冲做的 `REVERSE` 等显示加工不进入
+    // 转场,因此优先用 gfx 追溯出的 `to_base`;没有基图时才回退加工表面。
+    let mask = match transition.to_base.as_ref() {
+        Some(base) => resolve_source_with_override(textures, snapshots, st, None, base),
+        None => resolve_source_with_override(
+            textures,
+            snapshots,
+            st,
+            transition.to_layer.as_ref(),
+            to,
+        ),
+    };
+    let mask = match mask {
         Ok(image) => image,
         Err(reason) => {
             st.skip_op(op, reason);
@@ -1453,18 +1459,10 @@ fn draw_transition(
     };
     let filter = pick_filter(frame, from_ref.width, from_ref.height, width, height);
     let (x, y) = (layer.transform.x, layer.transform.y);
-    // `_DXMODE≠0`:引擎 effect 的两个转场 pass(EVID-T-09/台账 §2)。
-    // pass1(psC)=mask R 通道;pass0(psD)=交叉淡化。固定管线路径
-    // (`dx_mode=0`)保持 G 通道拟合模型(J3 600 帧基线)。
-    let hlsl_mask = frame.dx_mode != 0 && transition.ta >= 1;
-    let crossfade = frame.dx_mode != 0 && transition.ta < 1;
-    let alpha = if frame.dx_mode != 0 {
-        // `YS_AlphaVal = A/256`;draw_image 的 alpha 走 u8/255 链,
-        // 这里等价量化到 round(A*255/256)。
-        ((f64::from(layer.alpha.clamp(0, 256)) * 255.0) / 256.0).round() as u8
-    } else {
-        layer_alpha(layer.alpha)
-    };
+    // 官方转场 = effect Pass1(psC):配对且 `TA>=1` 即走此路径,与
+    // `_DXMODE` 无关(`FUN_00414ba4` `0x414dfa` BeginPass(1))。
+    // `oC0.a = tex1.a * sat((FadeVal - 0.5*mask.r) * TA) * (A/256)`。
+    let alpha = ((f64::from(layer.alpha.clamp(0, 256)) * 255.0) / 256.0).round() as u8;
     let (draw_w, draw_h) = scaled_dims(layer, width, height);
     draw_image(
         dst,
@@ -1479,11 +1477,7 @@ fn draw_transition(
         Some(TransitionMask {
             image: mask_ref,
             fade: transition.fade,
-            ta: transition.ta,
             fade2: f64::from(transition.ta),
-            complete: transition.complete(),
-            hlsl_mask,
-            crossfade,
         }),
     );
     st.report.ops_drawn += 1;
@@ -2043,20 +2037,12 @@ impl<'a> ImageRef<'a> {
 
 #[derive(Clone, Copy)]
 struct TransitionMask<'a> {
-    /// 配对纹理。固定管线用 G 通道(EVID-T-05);psC 用 R 通道。
+    /// 配对纹理基图。psC 取 **R** 通道。
     image: ImageRef<'a>,
     /// `YS_FadeVal`。
     fade: f64,
-    /// `TA`(软硬;进入 `transition_coverage` 的带宽 `2/TA`)。
-    ta: i16,
-    /// `YS_FadeVal2`(HLSL psC 的 TA;固定管线不用)。
+    /// `YS_FadeVal2` = `TA`。
     fade2: f64,
-    /// `T >= 256`。
-    complete: bool,
-    /// `_DXMODE≠0`:psC(mask R)路径。
-    hlsl_mask: bool,
-    /// `_DXMODE≠0`:psD(交叉淡化)路径。
-    crossfade: bool,
 }
 
 /// 图层绘制尺寸:引擎 `FBX/FBY` 缩放 × 基础宽高。
@@ -2126,7 +2112,7 @@ fn draw_image(
     let dest_h_u = height as u32;
     let direct = integral && dest_w_u == image.width && dest_h_u == image.height;
     // psC/psD 由像素着色器接管源色;固定管线才做 stage0/stage1 归约。
-    let shader_stage = transition.is_some_and(|mask| mask.hlsl_mask || mask.crossfade);
+    let shader_stage = transition.is_some();
     for py in clip_y0..clip_y1 {
         for px in clip_x0..clip_x1 {
             // 目标像素中心相对层原点的**浮点**偏移(可能为负,取样时钳到 0);
@@ -2141,7 +2127,7 @@ fn draw_image(
             } else {
                 (py as f64 + 0.5) - y
             };
-            let mut src = if direct {
+            let src = if direct {
                 let sx = (dxf.max(0.0) as u32).min(image.width - 1);
                 let sy = (dyf.max(0.0) as u32).min(image.height - 1);
                 image.pixel(sx, sy)
@@ -2179,30 +2165,19 @@ fn draw_image(
                     } else {
                         sample_subpixel(mask.image, dxf, dyf, dest_width, dest_height, filter)
                     };
-                    if mask.crossfade {
-                        // pass0(psD):`oC0 = tex1*(1-FadeVal) + tex2*FadeVal`,
-                        // 再乘 `YS_AlphaVal`(由本函数的 alpha 承担)。
-                        let f = mask.fade.clamp(0.0, 1.0);
-                        let inv = 1.0 - f;
-                        for c in 0..4 {
-                            src[c] = (f64::from(src[c]) * inv + f64::from(mask_px[c]) * f)
-                                .round()
-                                .clamp(0.0, 255.0) as u8;
-                        }
-                        alpha
-                    } else {
-                        let coverage = if mask.hlsl_mask {
-                            // pass1(psC):mask = 配对纹理 **R**,
-                            // `saturate((FadeVal - 0.5*tex2.r) * FadeVal2)`。
-                            let c = (mask.fade - 0.5 * f64::from(mask_px[0]) / 255.0)
-                                .mul_add(mask.fade2, 0.0)
-                                .clamp(0.0, 1.0);
-                            (c * 255.0).round().clamp(0.0, 255.0) as u8
-                        } else {
-                            transition_coverage(mask_px[1], mask.fade, mask.ta, mask.complete)
-                        };
-                        mul255(alpha, coverage)
-                    }
+                    // 官方 effect Pass1(psC):
+                    // `saturate((FadeVal - 0.5*tex2.r) * TA)`。
+                    //
+                    // 遮罩采样约定:`(texel + 1) / 256`,不是 UNORM 的
+                    // `/255`。官方 `j2-micro-trans8/6` 的 40 格 α 表只有该
+                    // 约定能逐点落进 2/255(TA=128,T=128,mask=0x80 →
+                    // 0.5;TA=128,T=255,mask=0 → 0.75)。
+                    let mask_value = (f64::from(mask_px[0]) + 1.0) / 256.0;
+                    let coverage = (mask.fade - 0.5 * mask_value)
+                        .mul_add(mask.fade2, 0.0)
+                        .clamp(0.0, 1.0);
+                    let coverage = (coverage * 255.0).round().clamp(0.0, 255.0) as u8;
+                    mul255(alpha, coverage)
                 }
                 None => alpha,
             };
@@ -2659,28 +2634,6 @@ mod tests {
             .map(|dx| sample(image, dx, 0, 3, 1, FilterMode::Point)[1])
             .collect();
         assert_eq!(sampled, vec![0, 255, 255]);
-    }
-
-    #[test]
-    fn transition_coverage_matches_official_micro_scene() {
-        // TA=128 的官方 T 扫描(docs/title-motion-ledger.md §2.1)。
-        // 模型在三个中点上的官方残差 ≤ 8/255(DIV-GFX-045)。
-        // 官方 `j2-micro-trans6` 原始扫描(TA=128),逐点核对。
-        let near = |actual: u8, expected: i32| (i32::from(actual) - expected).abs() <= 8;
-        let fade = |t: i16| f64::from(t) / (256.0 / (256.0 / 128.0 + 128.0)) * (1.0 / 256.0);
-        // T=64: mask 192 → 63,mask 224 → 255
-        assert!(near(transition_coverage(192, fade(64), 128, false), 63));
-        assert!(near(transition_coverage(224, fade(64), 128, false), 255));
-        assert!(near(transition_coverage(160, fade(64), 128, false), 0));
-        // T=128: mask 128 → 127,mask 160 → 255
-        assert!(near(transition_coverage(128, fade(128), 128, false), 127));
-        assert!(near(transition_coverage(160, fade(128), 128, false), 255));
-        assert!(near(transition_coverage(96, fade(128), 128, false), 0));
-        // T=192: mask 64 → 191,mask 96 → 255,mask 32 → 0
-        assert!(near(transition_coverage(64, fade(192), 128, false), 191));
-        assert!(near(transition_coverage(96, fade(192), 128, false), 255));
-        assert!(near(transition_coverage(32, fade(192), 128, false), 0));
-        assert_eq!(transition_coverage(0, fade(256), 128, true), 255);
     }
 
     #[test]

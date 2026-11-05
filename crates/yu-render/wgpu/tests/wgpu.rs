@@ -842,9 +842,12 @@ fn semi_transparent_pixels_match_soft_within_one() {
     );
 }
 
-/// `_DXMODE` 双路径:psC(mask R)与固定管线 G-mask 产生不同覆盖度。
+/// 转场始终走官方 effect Pass1(psC),与 `_DXMODE` 无关。
+///
+/// `FUN_00414ba4` `0x414dfa` 的门控只看“配对 + `TA>=1`”;
+/// `_DXMODE` 只是脚本变量,不是渲染开关。
 #[test]
-fn dx_mode_selects_engine_psc_transition() {
+fn transition_always_uses_engine_psc() {
     let build = |dx_mode: u32| {
         let table = table();
         let mut config = GfxConfig::new(Viewport::new(4, 4));
@@ -913,22 +916,124 @@ fn dx_mode_selects_engine_psc_transition() {
             );
         }
     }
-    // psC 公式(TA=256,A=256,mask.r=127/255):
-    // fade=128/(256/(256/256+128))/256 ≈ 0.25195;
-    // coverage=(0.25195-0.5*127/255)*256 ≈ 0.751。
-    // 源色 = from * 0.751 => [150,75,38]。
+    // psC 公式(TA=256,A=256,mask texel=127):
+    // fade = 128/(256/(256/256+128))/256 ≈ 0.251953;
+    // mask = (127+1)/256 = 0.5;
+    // coverage = (0.251953 - 0.5*0.5)*256 = 0.5。
+    // 源色 = from * 0.5 => [100,50,25]。
     let center = pixel(&gpu1, 2, 2);
     assert!(
-        (145..=155).contains(&center[0])
-            && (70..=80).contains(&center[1])
-            && (33..=43).contains(&center[2]),
+        (96..=104).contains(&center[0])
+            && (46..=54).contains(&center[1])
+            && (21..=29).contains(&center[2]),
         "psC center {center:?} not in expected band"
     );
 
+    // `_DXMODE=0` 也必须走同一条 psC 路径(`_DXMODE` 不是渲染开关)。
     let frame0 = build(0);
     let gpu0 = wgpu.render_frame(&frame0).expect("render dx0");
-    // 固定管线 G 通道 = 0,fade<1 => 覆盖度 0,图层不可见。
-    assert_eq!(pixel(&gpu0, 2, 2), [0, 0, 0, 255]);
+    let soft0 = soft.render_frame(&frame0);
+    for (gpu_px, soft_px) in gpu0
+        .surface
+        .rgba
+        .chunks_exact(4)
+        .zip(soft0.surface.rgba.chunks_exact(4))
+    {
+        for i in 0..4 {
+            assert!(
+                gpu_px[i].abs_diff(soft_px[i]) <= 2,
+                "dx0 soft/wgpu mismatch: {gpu_px:?} vs {soft_px:?}"
+            );
+        }
+    }
+    let center0 = pixel(&gpu0, 2, 2);
+    assert!(
+        (96..=104).contains(&center0[0])
+            && (46..=54).contains(&center0[1])
+            && (21..=29).contains(&center0[2]),
+        "psC center at dx0 {center0:?} not in expected band"
+    );
+}
+
+/// psC 的顶点 UV 必须使用本层内容的采样窗,不能直接 0..1 采整张共享纹理。
+///
+/// 立绘转场(`SP.TR(11)` 百叶窗)的层表面是共享缓冲上的子矩形;若 psC 忽略
+/// `Content.uv`,整张缓冲会被压进立绘四边形(立绘高度/比例被压扁)。
+#[test]
+fn psc_transition_respects_source_uv_window() {
+    let table = table();
+    let assets = [
+        (b"from.png".as_slice(), pattern_png(8, 8)),
+        (
+            b"mask.png".as_slice(),
+            png_bytes_for(8, 8, Rgba([0, 0, 0, 255])),
+        ),
+    ];
+    let Some(mut wgpu) = renderer_or_skip(store(&assets)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&assets));
+    let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"B".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"from".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"M".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"mask".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        // 水平镜像 = 纯采样修饰:内容 UV 窗变成 [1,0,0,1],层尺寸不变。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"B".to_vec())),
+                arg(&table, "CGACT", "HORIZONTAL", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"B".to_vec())),
+                arg(&table, "CG", "TID", Value::Str(b"M".to_vec())),
+                arg(&table, "CG", "T", Value::Int(128)),
+                arg(&table, "CG", "TA", Value::Int(256)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let gpu = wgpu.render_frame(&frame).expect("render psC uv");
+    let soft_out = soft.render_frame(&frame);
+    for (gpu_px, soft_px) in gpu
+        .surface
+        .rgba
+        .chunks_exact(4)
+        .zip(soft_out.surface.rgba.chunks_exact(4))
+    {
+        for i in 0..4 {
+            assert!(
+                gpu_px[i].abs_diff(soft_px[i]) <= 1,
+                "psC 镜像内容 soft/wgpu mismatch: {gpu_px:?} vs {soft_px:?}"
+            );
+        }
+    }
+    // 水平镜像后 (0,0) 应取源右端 (7,0):(7*37)%251 = 8;
+    // 若忽略 UV 窗会取到源 (0,0)=0。
+    let out = pixel(&gpu, 0, 0);
+    assert_eq!(out[0], 8, "psC 必须使用内容 UV 窗,实得 {out:?}");
 }
 
 /// MODE 3/5/6/7/9:soft 与 wgpu 的 blend 因子/两阶段归约逐像素一致。

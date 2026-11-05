@@ -46,15 +46,15 @@ pub(crate) enum PlannedTarget {
 #[derive(Clone, Debug)]
 pub(crate) enum DrawKind {
     Quad,
-    /// 固定管线双纹理过渡:`transition_bind_groups[bind_index]`。
-    Transition {
-        bind_index: u32,
-    },
-    /// 引擎 psC(mask R)过渡;`_DXMODE≠0`。
+    /// 引擎 psC(mask R)过渡;配对 + `TA>=1` 的官方路径。
     TransitionPsc {
         bind_index: u32,
     },
-    /// 引擎 psD(交叉淡化)过渡;`_DXMODE≠0` 且 TA<1。
+    /// 引擎 psD(交叉淡化)过渡(`TA<1`)。
+    ///
+    /// 当前 gfx 对 `TA<1` 不生成 `Op::Transition`(回退普通层),该路径尚未
+    /// 接通;保留管线/着色器作为官方纯淡入淡出的实现位。
+    #[allow(dead_code)]
     TransitionPsd {
         bind_index: u32,
     },
@@ -292,9 +292,14 @@ impl Planner<'_> {
         };
         let mask = match &transition.to {
             Some(to) => {
-                let resolved = match transition.to_layer.as_ref() {
-                    Some(id) => self.transition_source(Some(id), to),
-                    None => self.transition_source(None, to),
+                // 官方 `YS_Texture2` 取配对层**基图**(层 `+0x21c`),
+                // 不是 `CGACT` 加工表面(`+0x90`)。
+                let resolved = match transition.to_base.as_ref() {
+                    Some(base) => self.transition_source(None, base),
+                    None => match transition.to_layer.as_ref() {
+                        Some(id) => self.transition_source(Some(id), to),
+                        None => self.transition_source(None, to),
+                    },
                 };
                 match resolved {
                     Ok(value) => value,
@@ -314,24 +319,10 @@ impl Planner<'_> {
             None => (from.1, from.2),
         };
         let filter = pick_filter(self.frame, from.1, from.2, width, height);
-        #[derive(Clone, Copy, PartialEq, Eq)]
-        enum Variant {
-            Fixed,
-            Psc,
-            Psd,
-        }
-        let variant = if self.frame.dx_mode == 0 {
-            Variant::Fixed
-        } else if transition.ta >= 1 {
-            Variant::Psc
-        } else {
-            Variant::Psd
-        };
-        let ok = match variant {
-            Variant::Fixed => self.pipelines.ensure_transition_pipeline(self.ctx, blend)?,
-            Variant::Psc => self.pipelines.ensure_psc_pipeline(self.ctx, blend)?,
-            Variant::Psd => self.pipelines.ensure_psd_pipeline(self.ctx, blend)?,
-        };
+        // 官方 effect Pass1(psC):配对且 `TA>=1` 即走此路径,与 `_DXMODE`
+        // 无关(`FUN_00414ba4` `0x414dfa` BeginPass(1))。`Op::Transition`
+        // 只在 `TA>=1` 时生成。
+        let ok = self.pipelines.ensure_psc_pipeline(self.ctx, blend)?;
         if !ok {
             self.skip(op, format!("blend.{}", layer.blend.name()));
             return Ok(());
@@ -345,34 +336,22 @@ impl Planner<'_> {
             },
             None => (f64::from(width), f64::from(height)),
         };
-        let (draw_uv, mask_uv) = match variant {
-            Variant::Fixed => (from.3, mask.3),
-            Variant::Psc | Variant::Psd => ([0.0f32, 0.0, 1.0, 1.0], [0.0f32, 0.0, 1.0, 1.0]),
-        };
-        let (draw_uv, mask_uv) = (clamp_uv_max(draw_uv), clamp_uv_max(mask_uv));
-        let uniform_values: Vec<f32> = match variant {
-            Variant::Fixed => vec![
-                transition.fade as f32,
-                if transition.complete() { 1.0 } else { 0.0 },
-                if transition.ta >= 1 {
-                    let ta = transition.ta as f32;
-                    0.16 / (ta * ta)
-                } else {
-                    0.0
-                },
-                0.0,
-                draw_uv[0],
-                draw_uv[1],
-                draw_uv[2],
-                draw_uv[3],
-                mask_uv[0],
-                mask_uv[1],
-                mask_uv[2],
-                mask_uv[3],
-            ],
-            Variant::Psc => vec![transition.fade as f32, f32::from(transition.ta), sa, 0.0],
-            Variant::Psd => vec![transition.fade as f32, sa, 0.0, 0.0],
-        };
+        // 顶点 UV = 本层内容的采样窗;遮罩按层内 [0,1] 映射到自己的窗。
+        let (draw_uv, mask_uv) = (clamp_uv_max(from.3), clamp_uv_max(mask.3));
+        let uniform_values: Vec<f32> = vec![
+            transition.fade as f32,
+            f32::from(transition.ta),
+            sa,
+            0.0,
+            draw_uv[0],
+            draw_uv[1],
+            draw_uv[2],
+            draw_uv[3],
+            mask_uv[0],
+            mask_uv[1],
+            mask_uv[2],
+            mask_uv[3],
+        ];
         let uniform = wgpu::util::DeviceExt::create_buffer_init(
             &self.ctx.device,
             &wgpu::util::BufferInitDescriptor {
@@ -394,10 +373,6 @@ impl Planner<'_> {
         self.transition_bind_groups.push(group);
         self.transition_buffers.push(uniform);
         let (x, y) = (layer.transform.x, layer.transform.y);
-        let alpha = match variant {
-            Variant::Fixed => fixed_pipeline_alpha(layer.alpha) as f32,
-            Variant::Psc | Variant::Psd => sa,
-        };
         let (scale_x, scale_y) = layer.affine_scale();
         let draw_w = draw_w * scale_x;
         let draw_h = draw_h * scale_y;
@@ -410,19 +385,14 @@ impl Planner<'_> {
                 y,
                 draw_w,
                 draw_h,
-                alpha,
+                sa,
                 draw_uv,
             );
-            let kind = match variant {
-                Variant::Fixed => DrawKind::Transition { bind_index },
-                Variant::Psc => DrawKind::TransitionPsc { bind_index },
-                Variant::Psd => DrawKind::TransitionPsd { bind_index },
-            };
             out.draws.push(Draw {
                 blend,
                 texture_id: from.0,
                 filter,
-                kind,
+                kind: DrawKind::TransitionPsc { bind_index },
             });
         }
         self.drawn();
@@ -1112,11 +1082,13 @@ impl Accum {
 }
 
 pub(crate) fn clamp_uv_max(uv: [f32; 4]) -> [f32; 4] {
+    // 逐分量钳到 [0,1];**不能**强制 `u1>=u0`/`v1>=v0` —— 镜像
+    // (`HORIZONTAL`/`VERTICAL`)与负缩放的采样窗本来就是反向的。
     [
-        uv[0].min(1.0),
-        uv[1].min(1.0),
-        uv[2].min(1.0).max(uv[0].min(1.0)),
-        uv[3].min(1.0).max(uv[1].min(1.0)),
+        uv[0].clamp(0.0, 1.0),
+        uv[1].clamp(0.0, 1.0),
+        uv[2].clamp(0.0, 1.0),
+        uv[3].clamp(0.0, 1.0),
     ]
 }
 

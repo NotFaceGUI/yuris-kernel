@@ -4,9 +4,8 @@
 //! 参数与触发条件。文件名对应引擎 pass,不是语料名。
 //!
 //! - `quad.wgsl`:普通图层 quad(含固定管线 stage0/stage1 源色归约)
-//! - `transition_fixed.wgsl`:固定管线双纹理过渡(mask G,`_DXMODE=0`)
-//! - `transition_psc.wgsl`:引擎 effect Pass1(psC,mask R)
-//! - `transition_psd.wgsl`:引擎 effect Pass0(psD,交叉淡化)
+//! - `transition_psc.wgsl`:引擎 effect Pass1(psC,mask R;配对 + `TA>=1`)
+//! - `transition_psd.wgsl`:引擎 effect Pass0(psD,交叉淡化;`TA<1`)
 //! - `scale_psb.wgsl`:引擎 effect Pass2(4-tap 锐利双线性缩放)
 //! - `scale_psa.wgsl`:引擎 effect Pass3(16-tap 双三次缩放)
 //! - `paint.wgsl`:快照 RECTPAINT 族
@@ -15,9 +14,6 @@
 /// 0 = `T`(MODE 0/1),1 = `T·A`(MODE 2/5/6/9),
 /// 2 = `T·A + (1−C.a)`(MODE 3/7 的两阶段白混)。
 pub const QUAD: &str = include_str!("quad.wgsl");
-
-/// 固定管线双纹理过渡(配对纹理 G 通道覆盖度模型)。
-pub const TRANSITION_FIXED: &str = include_str!("transition_fixed.wgsl");
 
 /// 引擎 effect Pass1:mask = 配对纹理 R,`saturate((FadeVal-0.5*mask.r)*FadeVal2)`。
 pub const TRANSITION_PSC: &str = include_str!("transition_psc.wgsl");

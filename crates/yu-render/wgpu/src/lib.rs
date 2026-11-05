@@ -993,9 +993,6 @@ impl WgpuRenderer {
             for (index, draw) in pass.draws.iter().enumerate() {
                 let (pipeline, pipe_kind) = match &draw.kind {
                     passes::DrawKind::Quad => (pipelines.pipeline(draw.blend), 0u8),
-                    passes::DrawKind::Transition { .. } => {
-                        (pipelines.transition_pipeline(draw.blend), 1)
-                    }
                     passes::DrawKind::TransitionPsc { .. } => {
                         (pipelines.psc_pipeline(draw.blend), 2)
                     }
@@ -1025,8 +1022,7 @@ impl WgpuRenderer {
                     current_pipeline = Some(key);
                 }
                 let bind = match &draw.kind {
-                    passes::DrawKind::Transition { bind_index }
-                    | passes::DrawKind::TransitionPsc { bind_index }
+                    passes::DrawKind::TransitionPsc { bind_index }
                     | passes::DrawKind::TransitionPsd { bind_index } => {
                         &plan.transition_bind_groups[*bind_index as usize]
                     }
@@ -1044,8 +1040,7 @@ impl WgpuRenderer {
                         })?,
                 };
                 let bind_key = match &draw.kind {
-                    passes::DrawKind::Transition { bind_index }
-                    | passes::DrawKind::TransitionPsc { bind_index }
+                    passes::DrawKind::TransitionPsc { bind_index }
                     | passes::DrawKind::TransitionPsd { bind_index } => {
                         (u64::MAX - u64::from(*bind_index), draw.filter)
                     }

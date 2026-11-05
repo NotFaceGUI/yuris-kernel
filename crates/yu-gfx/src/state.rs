@@ -4747,6 +4747,7 @@ impl GfxState {
         Some(Op::Transition(TransitionDraw {
             from: TextureRef::Offscreen(id.clone()),
             to: Some(to),
+            to_base: None,
             fade,
             t: t.t,
             ta: t.ta,
@@ -4880,6 +4881,10 @@ impl GfxState {
                     return Op::Transition(TransitionDraw {
                         from,
                         to: Some(to),
+                        // 官方 `YS_Texture2` 取配对层**基图**(`+0x21c`),
+                        // 不是 CGACT 加工表面(`+0x90`)。配对层是空壳、
+                        // 图案由 SIZE 从另一层做进表面时,基图 = 图案资产。
+                        to_base: self.transition_mask_base(tid),
                         fade,
                         t: t.t,
                         ta: t.ta,
@@ -4918,12 +4923,41 @@ impl GfxState {
                 //
                 // `es_Sprite.yst:4608` 用 `CG[ID=$TR1 … FILE=""]` 建过渡 mask 层,
                 // 之后 `CGACT[ID=$TRBUF1 ID2=$TR1 SIZE=1 …]` 把图案做进它的
-                // **表面**;引擎的 `YS_Texture2` 取的就是这个表面
-                // (`FUN_00414ba4` 行 881-971)。旧实现把 `TextureRef::None` 判成
-                // "无配对",整条过渡 op 退化成普通层绘制 —— 立绘 `SP.TR(11)`
-                // 淡出于是完全没发生(2026-10-27 实机:立绘直接消失)。
-                // 像素由后端的 `to_layer` 解析(图像加工覆盖纹理),不在这里取。
+                // **表面**。旧实现把 `TextureRef::None` 判成"无配对",整条过渡
+                // op 退化成普通层绘制 —— 立绘 `SP.TR(11)` 淡出于是完全没发生
+                // (2026-10-27 实机:立绘直接消失)。
+                // 像素由后端的 `to_base`(基图)/`to_layer`(加工表面)解析。
                 Some(n.layer.texture.clone())
+            }
+        })
+    }
+
+    /// 配对层的**基图**(引擎 `YS_Texture2 = 层+0x21c`)。
+    ///
+    /// 官方转场取样的是基图,不是 `CGACT` 加工表面(`+0x90`)——遮罩缓冲的
+    /// `REVERSE` 等加工只影响显示,不参与转场。配对层自己是 `FILE=""` 空壳、
+    /// 图案由 `CGACT[ID=$TRBUF ID2=$TR1 SIZE=1]` 做进表面时,基图取自该
+    /// SIZE 命令的 `source_texture`(图案资产本体)。没有基图时返回 `None`,
+    /// 由后端回退加工表面。
+    fn transition_mask_base(&self, tid: &LayerId) -> Option<TextureRef> {
+        let node = self.nodes.get(tid)?;
+        if !matches!(node.layer.texture, TextureRef::None | TextureRef::SolidBlack1x1) {
+            return Some(node.layer.texture.clone());
+        }
+        self.image_log.iter().rev().find_map(|op| {
+            if op.target.as_ref() != Some(tid) || op.status != OpStatus::Executable {
+                return None;
+            }
+            if !matches!(op.action, ImageAction::SizeNearest | ImageAction::SizeBilinear) {
+                return None;
+            }
+            match &op.source_texture {
+                Some(texture)
+                    if !matches!(texture, TextureRef::None | TextureRef::SolidBlack1x1) =>
+                {
+                    Some(texture.clone())
+                }
+                _ => None,
             }
         })
     }

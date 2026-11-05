@@ -318,7 +318,7 @@ pub fn read_texture(
 }
 
 
-/// 调试用:把一张纹理读成紧凑 RGBA8(`YU_TRANS_DUMP` 转场取证)。
+/// 调试用:把一张纹理读成紧凑 RGBA8(低频人工取证)。
 ///
 /// 低频诊断路径,允许同步等待。
 pub fn dump_texture(

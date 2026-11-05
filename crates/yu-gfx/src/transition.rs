@@ -3,17 +3,20 @@
 //! 手册 `cg/cg.html`:`T` 过渡进行度、`TA` 过渡精度、`TID` 过渡图层 ID。
 //! 引擎证据:`FUN_00414ba4`(`0x414ba4`)行 905-909 计算
 //! `YS_FadeVal = T / (256/(256/TA + 128)) * (1/256)`,
-//! 双纹理 `YS_Texture1`(本层)/`YS_Texture2`(配对层)在 EnterPass(1) 下取样。
+//! 双纹理 `YS_Texture1`(本层)/`YS_Texture2`(配对层)在 effect Pass1 下取样。
 //!
-//! 任务 J2 追加取证(`docs/title-motion-ledger.md` EVID-T-03..09):
+//! 官方路径(2026-11-05 定稿,`docs/divergences/DIV-GFX-065`):
 //! - 双纹理门控 = 配对层指针非空 && `TA >= 1`(asm `0x415558-0x415577`);
 //!   配对缺失或 `TA<1` 回退单纹理普通层(微场景 `j2-micro-trans1` TR7)。
 //! - `T` 由脚本推进(`es_Sprite.yst` 的 `@TP`);`+0x1e8` 只在调试组 RT
 //!   分支使用,不是过渡推进者。
-//! - 配对纹理的 **G 通道**是 mask(微场景 `j2-micro-transA`);覆盖度模型见
-//!   [`crate::layer::transition_coverage`]。
-//! - 本语料 `_DXMODE=0`,走固定管线双纹理路径;HLSL 路径(ps_2_0)公式在
-//!   EVID-T-09 备档,不在此契约内。
+//! - 引擎始终创建 effect;配对且 `TA>=1` 时 `BeginPass(1)`(psC,asm
+//!   `0x414dfa`)——`_DXMODE` 只是脚本变量,不是渲染开关。
+//! - psC 取配对纹理 **R 通道**:
+//!   `a = tex1.a * sat((YS_FadeVal - 0.5*mask) * TA) * A/256`;
+//!   `mask` 按官方 micro 表校准为 `(texel+1)/256`。
+//! - `YS_Texture2` 取配对层**基图**(`+0x21c`),不是 `CGACT` 加工表面
+//!   (`+0x90`)。
 
 pub use crate::layer::Transition;
 
@@ -27,8 +30,16 @@ pub struct TransitionDraw {
     /// 本层纹理(引擎 `YS_Texture1`)。
     pub from: TextureRef,
     /// 配对纹理(引擎 `YS_Texture2`;`TID` 解析结果,`None` = 无配对)。
-    /// 后端按 G 通道作为 mask 取样。
+    /// 后端按 **R 通道**作为 mask 取样。
     pub to: Option<TextureRef>,
+    /// 配对层的**基图**(引擎 `YS_Texture2 = 层+0x21c`)。
+    ///
+    /// 官方转场取样的是层基图,不是 `CGACT` 加工表面(`+0x90`)。
+    /// 配对层本身是 `FILE=""` 的 1×1 空层、图案由
+    /// `CGACT[ID=$TRBUF ID2=$TR1 SIZE=1]` 做进表面时,基图取自该
+    /// 加工命令的 `source_texture`(图案资产本体);没有基图时后端
+    /// 回退 `to` + `to_layer` 的加工表面。
+    pub to_base: Option<TextureRef>,
     /// `YS_FadeVal` 原式计算结果(不 clamp)。
     pub fade: f64,
     /// `T` 原值;`>= 256` 时覆盖度为满(`is_complete`)。
