@@ -244,9 +244,7 @@ impl ImageAction {
     pub fn is_scale(&self) -> bool {
         matches!(
             self,
-            Self::SizeNearest
-                | Self::SizeBilinear
-                | Self::Other("size3" | "size4" | "size5")
+            Self::SizeNearest | Self::SizeBilinear | Self::Other("size3" | "size4" | "size5")
         )
     }
 
@@ -300,10 +298,13 @@ impl ImageAction {
     }
 
     /// 两图层合成族(`ID` 上层、`ID2` 下层、结果写 `ID2`)。
+    ///
+    /// `mask_alpha` 不在 `CGACT` 参数表里,但复用同一后端路径:
+    /// `CG[MID]` 的官方语义是 `target.a = mask.R`(REA `0x42a88c`)。
     pub fn is_layer_composite(&self) -> bool {
         matches!(
             self,
-            Self::Merge | Self::Merge2 | Self::Other("xor" | "and")
+            Self::Merge | Self::Merge2 | Self::Other("xor" | "and" | "mask_alpha")
         )
     }
 

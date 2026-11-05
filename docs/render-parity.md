@@ -45,10 +45,10 @@
 | 7 | 组/离屏/COPY | `cg/cg.html`:「レイヤセット…レイヤ合成したもの」「COPY キーワード…複製（スクリーンショット機能）」;`basic/layer.html`:`CG[ID=ABC/ ...]`、`CGACT[COPY2=1 ID=:/W0/ ID2=TMP]` | ERIS 首屏 `CG[ID=":/W3/" SX=..]`、`CGACT[COPY2=1 ID=:/W0/ ID2=CGS100]` | `FUN_00413dc8` 行 34-36(递归)、51-102(调试 RT/`+0x61c`);`FUN_00462e40`(离屏创建族);`FUN_0043cd6c` 行 118-169(帧末读回) | 机制 Confirmed;主组直绘已实现(DIV-GFX-008);COPY 时序/区域/冻结已实现(DIV-GFX-007);**首帧主组 COPY 无后缓冲源仍 open(DIV-GFX-051)** |
 | 8 | 过渡 T/TA/TID | `cg/cg.html`:「T=トランジション進行度」「TA=精度」「TID=トランジションレイヤID」 | ERIS 源 `T/TID/TA` 少量(首屏 0 次);`TID=""` 用于结束过渡(`es_Button.yst:4526/4540`、`es_Sprite.yst:4238`) | `FUN_00414ba4` 行 166-188(TA<1 门控)、881-971(`YS_Texture1/2`、`YS_FadeVal` 公式 905-909、`YS_FadeVal2`);`FUN_00413dc8` `0x413e7b`:TID 空串直接跳过配对查询,非空才 `FUN_004141e4`+`FUN_00414559` | 公式 Confirmed;**TID 空串=无配对 Confirmed**;推进者仍未定位(DIV-GFX-006) |
 | 9 | 文本 | `font/font.html`:NAME/NO/COLOR/COLOR2/SX/SY/BOLD/ANTIALIASING/DRAWMODE;`text/text.html`:ID/OUTPUTMODE/CLEAR/…;`font/fontinfo.html` | ERIS 首屏 `FONT` 3 次;`TEXT[OUTPUTMODE=0]`(`es_First.yst:22`)、`TEXT[CLEAR=1]`(`es_Text.yst:154`)、`FONT[NO/BNO]` | 文本为引擎内部绘制种类 98/100(旧线 03 §1,REA 复用绘制函数);`TextStyle` 保存 NO/BNO;`TEXT[ID]`/`VmEvent::Text.id` 为 CP932 字节(2026-11-04 fixed,DIV-GFX-021);`CLEAR` 清 VM 文本缓冲,`FUN_004046fc` 按 WAIT 推进 reveal | 属性模型/字形栅格化 Confirmed(DIV-GFX-012 fixed);行距/基线见 056;官方表面/页清屏/折行见 DIV-GFX-075 |
-| 10 | 颜色空间 | 无手册页 | 官方截图未采集 | 反编译全树无 `D3DRS_SRGBWRITEENABLE`(state 194)调用;D3D9 默认在存储值空间混合 | Likely:8-bit sRGB 编码存储、gamma 空间混合(DIV-GFX-009) |
+| 10 | 颜色空间 | 无手册页 | 官方截图未采集 | 反编译全树无 `D3DRS_SRGBWRITEENABLE`(state 194)调用;D3D9 默认在存储值空间混合 | **fixed(no-manual)**:8-bit sRGB 编码存储、gamma 空间混合(DIV-GFX-009) |
 | 11 | `CGACT` 图像加工 | `cg/cgact.html`:SIZE/SIZE2/ROTATION/TRIM/RESIZE/SAIDO/MEIDO/AKARUSA/MONO/REVERSE/MOSAIC/BLUR/DIFFUSION/RASTER*/RECTPAINT* | ERIS 首屏 `RECTPAINT*` + `SET/SET2`;源 `CGACT[SIZE/REVERSE/HORIZONTAL]` | 动作分派 `FUN_0042f809`(`0x42f809`,按 AL=动作码;`0x42d5fb` 等 25 个调用点);RECTPAINT/2/3 处理体 `FUN_0043185c`(`0x43185c`)模式 1/2/3;RESIZE 几何 `FUN_0043c971`(`w+X+X2-1`,`h+Y+Y2-1`);其余像素算法未定位 | 参数/命令 Confirmed;`RECTPAINT/2/3`(EVID-J-02..05)、`REVERSE`/`HORIZONTAL`(EVID-T-13)、`SIZE`/`SIZE2`(EVID-J3-04)已实现并逐像素对拍;`ROTATION/TRIM/RESIZE/MONO/BLUR*` 仍 Unimplemented(DIV-GFX-013) |
 | 12 | `WINDOW` 域 | `window/window.html`:NO=0 主窗口/CGID 显示图层组/E 显示隐藏/A(β4 仅显隐)/X/Y/SX/SY;`windowend.html`:不能删主窗口 | `es_First.yst:97/98/140`、`es_ERIS.yst:22`(子窗口 CGID) | `yu-rt` 发 `Domain::Window`;gfx 消费主窗口状态,Screen pass 用 `CGID` 与 `E/A`;子窗口状态输出给 host | Confirmed;主窗口 gfx 消费,叠放归 host(DIV-GFX-018) |
-| 13 | 图像层显式尺寸 | 手册称 `SX/SY` 仅图层组有效,与真实脚本冲突 | `es_ERIS.yst:579/600`(全屏黑幕)、`es_First.yst:170`、`es_Font.yst:220/231` | `FUN_00465730` 层默认 `+0x78/+0x7c=1`;`FUN_0043772c` 按 SX/SY 重采样并写回;`FUN_00408724` 用层矩形 | Confirmed(引擎/脚本优先);`FILE=""` 黑图按尺寸绘制,资源图缩放挂 Unimplemented(DIV-GFX-022) |
+| 13 | 图像层显式尺寸 | 手册称 `SX/SY` 仅图层组有效,与真实脚本冲突 | `es_ERIS.yst:579/600`(全屏黑幕)、`es_First.yst:170`、`es_Font.yst:220/231` | `FUN_00465730` 层默认 `+0x78/+0x7c=1`;`FUN_00408724` 用层矩形作绘制矩形 | Confirmed(引擎/脚本优先);Asset/Snapshot/Movie 已按层矩形缩放,像素对拍 open(DIV-GFX-022) |
 
 ---
 
@@ -95,8 +95,8 @@ X 1023 | Y 1023 | A 36 | SX 13 | SY 13
   `FILEINFO[EXIST]→LET` 后换成 **27 op / 27 drawn / 0 skipped**,
   `asset.missing=0`;三端同帧 RGBA `6280eac4…b198`,600 帧逐帧哈希 0 差异
   (`docs/title-motion-ledger.md` §9)。
-  `docs/tasks` 早先的“1 个可执行复制”在 J2 已更新为 COPY/COPY2 全部可执行
-  (TEXCOPY/TEXSSCOPY 除外)。
+  `docs/tasks` 早先的“1 个可执行复制”在 J2 已更新为 COPY/COPY2 全部可执行;
+  `TEXCOPY/TEXSSCOPY` 不是纹理 blit(官方 PASTESPRITE/GETSS),见 DIV-GFX-007。
 
 ---
 
@@ -151,13 +151,13 @@ X 1023 | Y 1023 | A 36 | SX 13 | SY 13
 - `CG[ID=... SX=... SY=...]`:
   - 图层组 → 离屏尺寸(手册原文);
   - **图像层** → 引擎层矩形 `+0x78/+0x7c`。`FILE=""` 的 1×1 黑图按该尺寸
-    铺满(真实 ERIS 黑幕,`es_ERIS.yst:579`);资源图的缩放/裁剪未取证,
-    图层标 `Unimplemented`(DIV-GFX-022)。只给 SX/SY 之一保持未实现。
+    铺满(真实 ERIS 黑幕,`es_ERIS.yst:579`);Asset/Snapshot/Movie 同样按
+    层矩形缩放绘制(soft/wgpu 已接),单边尺寸缺省轴按引擎构造默认 1。
+    像素级滤波/裁剪仍待官方截图(DIV-GFX-022),但**不再整层跳过**。
 - `CG[ID=...]` 无 FILE:
   - 已存在 → 更新属性;
-  - 不存在 → 引擎处理体是“取/建节点”(`<side-repo>` §3.24),建无纹理层,
-    绘制遍历按 `+0x90==0` 跳过;手册例 4 称“图层不存在=错误”,两者张力
-    记录为 DIV-GFX-016。gfx 采用引擎 get-or-create。
+  - 不存在 → REA `0x42a63d..0x42bbef`:`ebp=0` 最终返回 -1,**不建节点**
+    (DIV-GFX-016 fixed);只有 FILE(含 `""`)或 RID 建层。手册例 4 与此一致。
 - `CGEND[ID=...]`:删层/删组;组递归删除子树。删除不存在的层 = Recoverable
   诊断 + 继续(不崩帧)。
 - 单条命令失败(缺 ID/类型错/图层不存在)= Recoverable/Unimplemented 诊断 +
@@ -386,9 +386,9 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
   未给 `SX/SY` 的组尺寸未取证(DIV-GFX-008)。
   **任务 J 微场景(EVID-J-08)**:官方主组 `W0` 的子层直接画到屏幕;
   子组离屏的 alpha 不参与父级合成(子组 `G/K2 A=128` 最终为 `(0,128,0)`,
-  而根层 `K1 A=128` 为 `(16,160,48)`)。内核当前把 `W0` 当 `Offscreen`
-  且用 RGBA8 直通 alpha,半透明结果因此不同;修正需主人确认契约
-  (DIV-GFX-008/041)。
+  而根层 `K1 A=128` 为 `(16,160,48)`)。内核已按此实现:soft 在离屏 pass
+  末把 alpha 固定为 255,wgpu group draw 用 `OPAQUE_TEX` 采样管线
+  (DIV-GFX-041 fixed)。
 - `CGACT[COPY/COPY2]`:
   - 手册:COPY=图像+属性,COPY2=仅图像;
   - 引擎时序(任务 J 受控微场景 `fidelity-micro6h` + 任务 J2 `j2-micro-copy2`):
@@ -400,7 +400,9 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
     `CopyOp::seq`/`ImageOp::seq` 交错输出纹理 pass(DIV-GFX-029 fixed);
   - 现状:`Op::Copy` 可执行;目标层纹理 = `TextureRef::Snapshot(CopyId)`;
     快照在后端按 `CopyId` **冻结一次**(目标层存活期间保持,EVID-T-12);
-    `TEXCOPY/TEXSSCOPY` 仍 `Unimplemented`。
+    `TEXCOPY/TEXSSCOPY` 是官方 PASTESPRITE/GETSS,不是纹理 blit:
+    目标层保留原纹理继续绘制,只记审计 + recoverable 诊断,不发射空快照
+    (DIV-GFX-007 档案;像素语义仍 open)。
   - `CompositorFrame.passes` 只含**目标仍引用该快照且源图层仍存在**的复制;
     源已被 `CGEND` 删除的快照无法在渲染期重放,完整历史在
     `GfxState::copies()` 审计日志里。
@@ -488,7 +490,7 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 - 证据:反编译全树无 `D3DRS_SRGBWRITEENABLE`(state 194)调用;引擎固定管线
   的 blend 因子/op 都是 D3D9 默认语义。
 - 旧线选择 `Rgba8UnormSrgb`(硬件自动线性化)与引擎行为不同;本契约**不继承**。
-  待官方截图逐像素对拍后转正(DIV-GFX-009)。
+  证据为全树 REA + D3D9 默认语义,已按 `fixed(no-manual)` 记账(DIV-GFX-009)。
 
 ---
 
@@ -568,10 +570,12 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
   `frame.passes` 里的复制是
   “仍可达”的复制;`GfxState::copies()` 是完整审计日志(含源已删除的
   历史项),不是帧执行清单。
-- Mask:`Op::Mask.status` 为 Unimplemented;不要用 α 或亮度猜。
+- Mask:`MID` = 命令时刻逐像素 `target.a = mask.R`(REA `0x42a88c`,
+  DIV-GFX-005),实现为 `mask_alpha` 合成 op;两层宽高必须相等。组图层
+  mask 仍 open(evidence),保留基图 + recoverable 诊断。
 - Image size:`LayerKind::Image{size}` 是绘制矩形。`FILE=""` 的
-  `SolidBlack1x1` 必须铺满 `size`;资源图 + `size` 的图层是
-  Unimplemented,后端跳过。
+  `SolidBlack1x1` 必须铺满 `size`;Asset/Snapshot/Movie 同样按矩形缩放
+  (soft/wgpu 已接),像素级滤波待官方截图(DIV-GFX-022)。
 - Window:`frame.windows` 是窗口状态(含子窗口);Screen 只执行主窗口
   选择,不要自行改变窗口叠放。
 - Diagnostics:`frame.diagnostics` 是**本帧**诊断,同键合并并带 `count`;
@@ -583,12 +587,15 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 
 - MODE 4/8/10..18(公式本体未定位)。MODE 3/5/6/7/9 已由状态表实现:
   soft 与 wgpu 全部执行(`Src/OneMinusDst/OneMinusSrc` 对应颜色因子)。
-- `MID` 掩码。
-- `FX/FR/FC/FEX/...` 滤镜/仿射。
+- `MID` 图像层已实现(`target.a = mask.R`,DIV-GFX-005);组图层 mask 仍
+  open(evidence),只保留基图 + recoverable 诊断。
+- 普通图层的 `FRX/FRY/FEZ/FQU` 绘制不读,`FRZ/FEX/FEY/FMD` 只属主窗口分支;
+  带这些字段的普通层仍按 X/Y+FBX/FBY 绘制(只出 recoverable 诊断)。
 - 多部件层(非空 `parts`)。
 - `CGACT[COPY/COPY2/TEXCOPY/TEXSSCOPY]`:COPY/COPY2 已可执行(DIV-GFX-007);
   **组目标复制也已实现**(soft `compose_group` / wgpu `plan_group_compose`);
-  仅 `TEXCOPY/TEXSSCOPY` 仍 `Unimplemented`(`gfx.copy.texcopy.unsupported`)。
+  `TEXCOPY/TEXSSCOPY` 不发射 pass,目标层纹理/状态保持不变
+  (`gfx.copy.unsupported`,recoverable)。
   **例外**:`SIZE`/`SIZE2` 已实现(`scale_region`,两端共用;
   无区域时按 StretchRect 透传,EVID-J3-04);`ROTATION`/`RESIZE`/`TRIM`/
   `MONO`/`BLUR*` 等仍只有参数、无像素算法。
@@ -597,10 +604,11 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
   (EVID-J-02..05、EVID-T-13)。
 - TID 非空但配对层缺失的过渡:不再 Unimplemented,gfx 回退单纹理普通层
   (EVID-T-03)。
-- 资源图 + `SX/SY` 的显式缩放/裁剪(仅 `FILE=""` 黑图可执行;DIV-GFX-022)。
+- 资源图 + `SX/SY` 的**像素级**滤波/裁剪(DIV-GFX-022)仍待官方截图;
+  层矩形缩放本身已由两后端执行,不再整层跳过。
 - `CGINFO/FONTINFO/WINDOWINFO` 的未取证字段:资源图 `SX/SY`(DIV-GFX-024)、
-  多字段顺序(DIV-GFX-025)、`COLOR/ONMOUSE*/CAPTION/...`(DIV-GFX-026)。
-  已取证字段由 `GfxHost` 同步回答。
+  `FONTINFO/WINDOWINFO` 多字段顺序(025;CGINFO 已按 REA 优先级实现)、
+  `COLOR/ONMOUSE*/CAPTION/...`(DIV-GFX-026)。已取证字段由 `GfxHost` 同步回答。
 - `FONT[BNO]` 的字体槽语义(值已保存)。
 - `TEXT` 的 WAIT/RETURN/PAGE/CLICK/AUTO*/BUTTON 显示节奏。
 - 文本字形(需字体/后端会话)。
@@ -622,7 +630,7 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 | 审查 B7:“`in_stack_00000010==0 → A=0` 未建模” | **错**:图层遍历调用点恒传 1(`0x413f29`),清零分支不属于本路径 | `FUN_00413dc8` 汇编 |
 | 审查 B2:“E 可能写 +0xa4” | **错**:E=`+0x89`,层种类=`+0xa4`(1 图像/2 组/0 死) | `0x413e34/0x413e47`、`0x42c400`、`0x40a38c`、`0x40e02c`、`0x43d4bc` |
 | 审查 B12:旧地址 `0x42c4a4/0x43d334/0x43d4a4` | 本地反编译树不存在;改用 `0x413dc8/0x4141e4/0x414559/0x43d4bc` | 会话 F 台账 B12 |
-| 审查 B11/§2“1 个可执行复制” | **J2 已更新**:`Op::Copy`(COPY/COPY2)现在全部可执行;`TEXCOPY/TEXSSCOPY` 仍 Unimplemented | `state.rs::cgact_copy`;EVID-T-11/12 |
+| 审查 B11/§2“1 个可执行复制” | **J2 已更新**:`Op::Copy`(COPY/COPY2)现在全部可执行;`TEXCOPY`=PASTESPRITE、`TEXSSCOPY`=GETSS,不发射空快照、目标层保留原纹理(DIV-GFX-007) | `state.rs::cgact_copy`;EVID-T-11/12;REA `0x42e67f/0x42e68a` |
 | 手册“SX/SY 仅图层组有效” | **与引擎/真实脚本冲突**:图像层同样保存层矩形;`FILE=""+SX/SY` 是黑幕标准写法 | `FUN_00465730/0043772c/00408724`;`es_ERIS.yst:579` |
 | 旧线“COPY 复制上一帧已渲染目标” | **Refuted(至少 group 源)**:受控微场景显示 `COPY2 ID=":/W0/"` 取命令执行时的当前状态;命令后再改图层不影响快照 | `target/tmp/fidelity-micro6h-ref/frame_0005.png`;EVID-J-11 |
 | “主组 W0 按普通组离屏合成” | **错**:官方主组 W0 的子层直接画到屏幕;子组离屏 alpha 不参与父级合成 | `target/tmp/fidelity-micro5-ref/frame_0004.png`;EVID-J-08 |

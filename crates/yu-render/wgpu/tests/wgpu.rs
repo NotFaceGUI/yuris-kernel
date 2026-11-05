@@ -46,7 +46,7 @@ fn table() -> ParamTable {
                 "CG",
                 &[
                     "ID", "FILE", "E", "A", "X", "Y", "Z", "SX", "SY", "MODE", "T", "TA", "TID",
-                    "FBX", "FBY",
+                    "FBX", "FBY", "MID",
                 ],
             ),
             command(
@@ -322,8 +322,10 @@ fn affine_scale_matches_soft() {
         VmEvent::FrameEnd { frame: 1 },
     ]);
     let frame = gfx.frame();
-    let assets: [(&[u8], Vec<u8>); 1] =
-        [(b"red.png".as_slice(), png_bytes_for(2, 2, Rgba([255, 0, 0, 255])))];
+    let assets: [(&[u8], Vec<u8>); 1] = [(
+        b"red.png".as_slice(),
+        png_bytes_for(2, 2, Rgba([255, 0, 0, 255])),
+    )];
     let Some(mut renderer) = renderer_or_skip(store(&assets)) else {
         return;
     };
@@ -637,10 +639,7 @@ fn cgact_transition_gpu_matches_soft_exactly() {
         let frame = gfx.frame();
         let make_store = || {
             store(&[
-                (
-                    b"from.png",
-                    png_bytes_for(4, 4, Rgba([200, 40, 10, 180])),
-                ),
+                (b"from.png", png_bytes_for(4, 4, Rgba([200, 40, 10, 180]))),
                 (b"to.png", png_bytes_for(4, 4, Rgba([20, 90, 240, 255]))),
             ])
         };
@@ -1846,7 +1845,10 @@ fn merge_on_snapshot_gpu_is_bit_exact() {
         max_diff = max_diff.max(d);
     }
     assert_eq!(max_diff, 0, "快照目标上的 GPU MERGE 必须与 soft 逐字节一致");
-    assert_eq!(gpu_out.report, soft_out.report, "RenderReport 必须逐字段一致");
+    assert_eq!(
+        gpu_out.report, soft_out.report,
+        "RenderReport 必须逐字段一致"
+    );
     assert!(
         gpu_out.stats.layer_composites >= 1,
         "应走 GPU 合成目标(实际 {})",
@@ -2030,7 +2032,11 @@ fn size_after_copy_in_same_frame_keeps_snapshot_dims() {
         "同一帧 COPY→SIZE2 不得报快照缺失,得到 {reasons:?}"
     );
     let actual = pixel(&gpu_out, 8, 8);
-    println!("gpu px={:?} soft px={:?}", actual, pixel_of_surface(&soft_out_surface(&soft_out), 8, 8));
+    println!(
+        "gpu px={:?} soft px={:?}",
+        actual,
+        pixel_of_surface(&soft_out_surface(&soft_out), 8, 8)
+    );
     println!("gpu report={:?}", gpu_out.report);
     println!("soft report={:?}", soft_out.report);
     assert!(
@@ -2312,9 +2318,7 @@ fn blur_is_two_pass_box_and_matches_soft() {
     ]);
     let frame = gfx.frame();
 
-    let grad = RgbaImage::from_fn(3, 1, |x, _| {
-        Rgba([(x as u8) * 100, 0, 0, 255])
-    });
+    let grad = RgbaImage::from_fn(3, 1, |x, _| Rgba([(x as u8) * 100, 0, 0, 255]));
     let mut png = Vec::new();
     PngEncoder::new(&mut png)
         .write_image(grad.as_raw(), 3, 1, ExtendedColorType::Rgba8)
@@ -2353,9 +2357,7 @@ fn blur_is_two_pass_box_and_matches_soft() {
 
 /// 唯一色夹具:`R = x*10`、`G = y*10`、`B = 7`、`A = 255`。
 fn grid_png(w: u32, h: u32) -> Vec<u8> {
-    let img = RgbaImage::from_fn(w, h, |x, y| {
-        Rgba([(x * 10) as u8, (y * 10) as u8, 7, 255])
-    });
+    let img = RgbaImage::from_fn(w, h, |x, y| Rgba([(x * 10) as u8, (y * 10) as u8, 7, 255]));
     let mut png = Vec::new();
     PngEncoder::new(&mut png)
         .write_image(img.as_raw(), w, h, ExtendedColorType::Rgba8)
@@ -2483,8 +2485,7 @@ fn raster3_combines_both_axes_on_gpu_and_matches_soft() {
 /// `WHIRLPOOL`:`FUN_00437368`,半径线性的旋涡 + 定点角度表。
 #[test]
 fn whirlpool_rotates_by_radius_on_gpu_and_matches_soft() {
-    let Some((gpu_out, soft_out)) =
-        run_filter_parity("WHIRLPOOL", vec![("SET", Value::Int(900))])
+    let Some((gpu_out, soft_out)) = run_filter_parity("WHIRLPOOL", vec![("SET", Value::Int(900))])
     else {
         return;
     };
@@ -2498,8 +2499,7 @@ fn whirlpool_rotates_by_radius_on_gpu_and_matches_soft() {
 /// `DIFFUSION`:`FUN_004358d4` 的 2×2 置换;每块消耗一个 CRT `rand()`。
 #[test]
 fn diffusion_permutes_blocks_on_gpu_and_matches_soft() {
-    let Some((gpu_out, soft_out)) =
-        run_filter_parity("DIFFUSION", vec![("SET", Value::Int(2))])
+    let Some((gpu_out, soft_out)) = run_filter_parity("DIFFUSION", vec![("SET", Value::Int(2))])
     else {
         return;
     };
@@ -2537,12 +2537,9 @@ fn diffusion_matches_soft_across_sizes() {
         (8, 8, 8),
         (9, 6, 4),
     ] {
-        let Some((gpu_out, soft_out)) = run_filter_parity_sized(
-            "DIFFUSION",
-            vec![("SET", Value::Int(set))],
-            w,
-            h,
-        ) else {
+        let Some((gpu_out, soft_out)) =
+            run_filter_parity_sized("DIFFUSION", vec![("SET", Value::Int(set))], w, h)
+        else {
             return;
         };
         assert!(
@@ -2588,4 +2585,199 @@ fn saido_akarusa_sepia_match_soft() {
         return;
     };
     assert_eq!(pixel(&gpu_out, 0, 0), [64, 64, 71, 255]);
+}
+
+/// `CG[MID]`:target.a = mask.r。GPU 与 soft 逐像素一致,且 mask R=0 的
+/// 像素被压成透明(只剩黑底),不是原图的红色。
+#[test]
+fn mid_mask_red_channel_matches_soft() {
+    let table = table();
+    let mut mask = RgbaImage::new(2, 2);
+    mask.put_pixel(0, 0, Rgba([0, 9, 9, 255]));
+    for y in 0..2 {
+        for x in 0..2 {
+            if (x, y) != (0, 0) {
+                mask.put_pixel(x, y, Rgba([255, 9, 9, 255]));
+            }
+        }
+    }
+    let mut mask_png = Vec::new();
+    PngEncoder::new(&mut mask_png)
+        .write_image(mask.as_raw(), 2, 2, ExtendedColorType::Rgba8)
+        .expect("encode mask");
+    let entries = [
+        (
+            b"red.png".as_slice(),
+            png_bytes_for(2, 2, Rgba([255, 0, 0, 255])),
+        ),
+        (b"mask.png".as_slice(), mask_png),
+    ];
+    let mut gfx = state(Viewport::new(2, 2), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"L".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"red".to_vec())),
+                arg(&table, "CG", "SX", Value::Int(2)),
+                arg(&table, "CG", "SY", Value::Int(2)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"M".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"mask".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+                arg(&table, "CG", "SX", Value::Int(2)),
+                arg(&table, "CG", "SY", Value::Int(2)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"L".to_vec())),
+                arg(&table, "CG", "MID", Value::Str(b"M".to_vec())),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let gpu_out = gpu.render_frame(&frame).expect("render");
+    let mut soft = SoftRenderer::new(store(&entries));
+    let soft_out = soft.render_frame(&frame);
+    assert_eq!(gpu_out.surface.rgba, soft_out.surface.rgba);
+    assert_eq!(gpu_out.surface.pixel(0, 0), Some([0, 0, 0, 255]));
+    assert_eq!(gpu_out.surface.pixel(1, 0), Some([255, 0, 0, 255]));
+}
+
+/// `CG[MID]` 要求两层表面宽高相等(REA `0x42a862..0x42a88c`)。
+/// 层声明尺寸未知时 gfx 不能提前判定,后端必须按实际纹理尺寸拒绝;
+/// wgpu 不得把 3×3 mask 拉伸到 2×2 目标。两后端跳过口径与像素一致。
+#[test]
+fn mid_mask_size_mismatch_is_skipped_by_both_backends() {
+    let table = table();
+    let entries = [
+        (
+            b"red.png".as_slice(),
+            png_bytes_for(2, 2, Rgba([255, 0, 0, 255])),
+        ),
+        (
+            b"mask.png".as_slice(),
+            png_bytes_for(3, 3, Rgba([0, 9, 9, 255])),
+        ),
+    ];
+    let mut gfx = state(Viewport::new(2, 2), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"L".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"red".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"M".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"mask".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"L".to_vec())),
+                arg(&table, "CG", "MID", Value::Str(b"M".to_vec())),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let mask_op = frame
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|op| match op {
+            yu_gfx::Op::Image(i) if i.action.name() == "mask_alpha" => Some(i),
+            _ => None,
+        })
+        .expect("MID 必须记录 mask_alpha 合成 op");
+    assert_eq!(
+        mask_op.status,
+        yu_gfx::OpStatus::Executable,
+        "声明尺寸未知时 gfx 不能提前判定;由后端按实际纹理拒绝"
+    );
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let gpu_out = gpu.render_frame(&frame).expect("render");
+    let mut soft = SoftRenderer::new(store(&entries));
+    let soft_out = soft.render_frame(&frame);
+    assert_eq!(
+        gpu_out.report.skipped_ops_total, soft_out.report.skipped_ops_total,
+        "两后端必须同样跳过尺寸不匹配的 MID"
+    );
+    assert_eq!(gpu_out.report.skipped_ops_total, 1);
+    assert_eq!(gpu_out.surface.rgba, soft_out.surface.rgba);
+    assert_eq!(
+        gpu_out.surface.pixel(0, 0),
+        Some([255, 0, 0, 255]),
+        "MID 跳过时目标层基图仍绘制,不得被 mask 拉伸"
+    );
+}
+
+/// EVID-J-08:子组 RT alpha 不参与父级合成;GPU 与 soft 的
+/// `(0,128,0)` 必须逐字节一致。
+#[test]
+fn subgroup_rt_alpha_is_opaque_on_gpu_and_matches_soft() {
+    let table = table();
+    let entries = [(
+        b"green.png".as_slice(),
+        png_bytes_for(4, 4, Rgba([0, 255, 0, 255])),
+    )];
+    let mut gfx = state(Viewport::new(4, 4), [32, 64, 96, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"G/".to_vec())),
+                arg(&table, "CG", "SX", Value::Int(4)),
+                arg(&table, "CG", "SY", Value::Int(4)),
+                arg(&table, "CG", "A", Value::Int(256)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"G/K".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"green".to_vec())),
+                arg(&table, "CG", "A", Value::Int(128)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let gpu_out = gpu.render_frame(&frame).expect("render");
+    let mut soft = SoftRenderer::new(store(&entries));
+    let soft_out = soft.render_frame(&frame);
+    assert_eq!(gpu_out.surface.rgba, soft_out.surface.rgba);
+    assert_eq!(gpu_out.surface.pixel(1, 1), Some([0, 128, 0, 255]));
 }

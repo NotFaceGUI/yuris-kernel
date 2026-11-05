@@ -1121,6 +1121,15 @@ fn apply_image_pixels(
         if width == 0 || height == 0 {
             return Ok(());
         }
+        // `CG[MID]` 的官方执行体要求两层表面宽高相等(REA
+        // `0x42a862..0x42a88c`);不等时不得把 mask 拉伸到目标尺寸。
+        // soft 侧在 `apply_image_op` 同样拒绝,两后端跳过口径必须一致。
+        if image.action == ImageAction::Other("mask_alpha")
+            && (lower.tex.width != upper_content.tex.width
+                || lower.tex.height != upper_content.tex.height)
+        {
+            return Err("gfx.mask.size.mismatch".to_string());
+        }
         let out = surfaces.acquire(ctx, width, height, "merge surface")?;
         // 层不透明度(`[层+0x80]`,0..256),命令时刻快照。REA 0.495:
         // - `MERGE`  `FUN_0043b33c`:`blend(dst, src, srcLayerAlpha, span)`
@@ -1151,6 +1160,8 @@ fn apply_image_pixels(
             let mode = match image.action {
                 ImageAction::Merge2 => 0,
                 ImageAction::Other("xor") => 1,
+                // `CG[MID]`:target.a = mask.r,RGB 不动(REA `0x42a88c`)。
+                ImageAction::Other("mask_alpha") => 3,
                 _ => 2,
             };
             pipelines
@@ -1651,8 +1662,7 @@ fn apply_copy(
                 let (cpu, _info) = content_cpu(ctx, frame, textures, contents, id, &raw)?;
                 let refs: Vec<&yu_gfx::TextDraw> = copy.texts.iter().collect();
                 let images = text_images_for_draws(textures, &refs);
-                let (composed, stats) =
-                    text.compose_layer_assets(&cpu, &copy.texts, None, &images);
+                let (composed, stats) = text.compose_layer_assets(&cpu, &copy.texts, None, &images);
                 merge_text_stats(acc, stats);
                 match composed {
                     Some(composed) => {
@@ -2638,7 +2648,14 @@ fn apply_text(
             );
         }
         let composed = text.compose_layer_cached_assets(
-            &id, revision, raw.hash, dims, &draws, layout, &images, || cpu_base,
+            &id,
+            revision,
+            raw.hash,
+            dims,
+            &draws,
+            layout,
+            &images,
+            || cpu_base,
         );
         let (composed, stats) = match composed {
             Ok(value) => value,
@@ -2782,7 +2799,7 @@ fn plan_screen_overlay_text(
             id
         }
     };
-    pipelines.ensure_pipeline(ctx, BlendMode::Normal)?;
+    pipelines.ensure_pipeline(ctx, BlendMode::Normal, false)?;
     let view = gpu
         .get(id)
         .ok_or_else(|| {

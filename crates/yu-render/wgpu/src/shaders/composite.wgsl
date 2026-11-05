@@ -91,6 +91,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             lower.a,
         );
     }
+    // `CG[MID]`:REA `0x42a862..0x42a88c` — 两层宽高相等时
+    // `target.a = mask.r`(RGB 保持下层原值)。
+    if (u.mode == 3u) {
+        return vec4<f32>(lower.rgb, upper.r);
+    }
 
     // ---- MERGE2 ----
     let la = l_raw.w;

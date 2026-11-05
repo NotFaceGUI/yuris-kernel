@@ -249,9 +249,7 @@ impl GpuContext {
     /// 创建里的校验错误逃逸成 panic(实测修 OOM 时引入的回归)。
     pub fn checked_oom<T>(&self, what: &str, f: impl FnOnce() -> T) -> Result<T, Diag> {
         let oom = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        let validation = self
-            .device
-            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let value = f();
         let validation_error = pollster::block_on(validation.pop());
         if let Some(error) = validation_error {

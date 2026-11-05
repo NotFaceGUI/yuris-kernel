@@ -250,6 +250,13 @@ impl SoftRenderer {
                         );
                     }
                     st.report.offscreen_passes += 1;
+                    // EVID-J-08:官方子组 RT 的 alpha 不参与父级合成
+                    // (K4 `A=128` 在组内先与黑底混合,组再按自身 A 合成;
+                    // 最终 `(0,128,0)`,不是屏幕上再乘一次 128)。等价实现:
+                    // RT 合成完后把 alpha 固定为不透明,父级只乘组 A。
+                    for px in surface.rgba.chunks_exact_mut(4) {
+                        px[3] = 255;
+                    }
                     st.offscreens.insert(id.clone(), surface);
                 }
                 PassTarget::Screen => {
@@ -474,6 +481,16 @@ fn apply_image_op(
             }
             ImageAction::Other("and") => {
                 crate::imagefilters::apply_bitwise(&mut lower, &upper, false)
+            }
+            // `CG[MID]`:REA `0x42a862..0x42a88c` 要求两层宽高相等,然后
+            // 逐像素 `target.a = mask.r`(RGB 不动),并置 `+0x86=1`。
+            ImageAction::Other("mask_alpha") => {
+                if lower.width != upper.width || lower.height != upper.height {
+                    return Err("gfx.mask.size.mismatch".to_string());
+                }
+                for i in 0..(lower.width as usize * lower.height as usize) {
+                    lower.rgba[i * 4 + 3] = upper.rgba[i * 4];
+                }
             }
             _ => return Err("gfx.imageop.unsupported".to_string()),
         }
@@ -1436,13 +1453,9 @@ fn draw_transition(
     // 转场,因此优先用 gfx 追溯出的 `to_base`;没有基图时才回退加工表面。
     let mask = match transition.to_base.as_ref() {
         Some(base) => resolve_source_with_override(textures, snapshots, st, None, base),
-        None => resolve_source_with_override(
-            textures,
-            snapshots,
-            st,
-            transition.to_layer.as_ref(),
-            to,
-        ),
+        None => {
+            resolve_source_with_override(textures, snapshots, st, transition.to_layer.as_ref(), to)
+        }
     };
     let mask = match mask {
         Ok(image) => image,
@@ -1634,36 +1647,37 @@ fn draw_layer(
     match &layer.texture {
         // `YMV[FRAME]`:与快照同型 —— 显式 `CGACT[SIZE]` 存在时按图层矩形
         // 缩放绘制(官方把影片表面画进图层矩形),否则按纹理自然尺寸。
-        TextureRef::Movie { asset, frame: movie_frame } => {
-            match textures.resolve_movie(asset, *movie_frame) {
-                Ok(texture) => {
-                    let (src_w, src_h) = (texture.width, texture.height);
-                    let (width, height) = match layer.image_size() {
-                        Some(size) => (size.width, size.height),
-                        None => (src_w, src_h),
-                    };
-                    let filter = pick_filter(frame, src_w, src_h, width, height);
-                    let (x, y) = (layer.transform.x, layer.transform.y);
-                    {
-                        let image = ImageRef::from_texture(texture);
-                        draw_image(
-                            dst,
-                            image,
-                            x,
-                            y,
-                            f64::from(width) * scale_x,
-                            f64::from(height) * scale_y,
-                            layer_alpha(layer.alpha),
-                            mode,
-                            filter,
-                            None,
-                        );
-                    }
-                    st.report.ops_drawn += 1;
+        TextureRef::Movie {
+            asset,
+            frame: movie_frame,
+        } => match textures.resolve_movie(asset, *movie_frame) {
+            Ok(texture) => {
+                let (src_w, src_h) = (texture.width, texture.height);
+                let (width, height) = match layer.image_size() {
+                    Some(size) => (size.width, size.height),
+                    None => (src_w, src_h),
+                };
+                let filter = pick_filter(frame, src_w, src_h, width, height);
+                let (x, y) = (layer.transform.x, layer.transform.y);
+                {
+                    let image = ImageRef::from_texture(texture);
+                    draw_image(
+                        dst,
+                        image,
+                        x,
+                        y,
+                        f64::from(width) * scale_x,
+                        f64::from(height) * scale_y,
+                        layer_alpha(layer.alpha),
+                        mode,
+                        filter,
+                        None,
+                    );
                 }
-                Err(diag) => st.skip_op(op, diag.code.to_string()),
+                st.report.ops_drawn += 1;
             }
-        }
+            Err(diag) => st.skip_op(op, diag.code.to_string()),
+        },
         TextureRef::Asset(key) => {
             match textures.resolve(key) {
                 Ok(texture) => {
@@ -1902,9 +1916,7 @@ fn op_predict_drawable(op: &Op, offscreens: &BTreeMap<&LayerId, bool>) -> bool {
                 && supported_blend(transition.layer.blend).is_some()
                 && matches!(
                     transition.from,
-                    TextureRef::Asset(_)
-                        | TextureRef::SolidBlack1x1
-                        | TextureRef::Movie { .. }
+                    TextureRef::Asset(_) | TextureRef::SolidBlack1x1 | TextureRef::Movie { .. }
                 )
         }
         // Copy/Image 在 Texture pass 内执行,不直接产出屏幕像素。
@@ -2080,11 +2092,7 @@ fn draw_image(
     // 时翻相位,保持与正缩放同一套光栅化。
     let flip_x = dest_width < 0.0;
     let flip_y = dest_height < 0.0;
-    let (left, top) = if flip_x {
-        (x + dest_width, y)
-    } else {
-        (x, y)
-    };
+    let (left, top) = if flip_x { (x + dest_width, y) } else { (x, y) };
     let (left, top) = if flip_y {
         (left, top + dest_height)
     } else {
@@ -2104,10 +2112,8 @@ fn draw_image(
     }
     // 整数位置 + 整数尺寸才走旧的整像素路径(逐位与旧实现相同);
     // 任一维度带小数则走 `sample_subpixel`。
-    let integral = left.fract() == 0.0
-        && top.fract() == 0.0
-        && width.fract() == 0.0
-        && height.fract() == 0.0;
+    let integral =
+        left.fract() == 0.0 && top.fract() == 0.0 && width.fract() == 0.0 && height.fract() == 0.0;
     let dest_w_u = width as u32;
     let dest_h_u = height as u32;
     let direct = integral && dest_w_u == image.width && dest_h_u == image.height;

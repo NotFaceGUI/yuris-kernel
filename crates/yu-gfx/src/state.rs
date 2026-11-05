@@ -39,8 +39,7 @@ use crate::layer::{
     LayerStatus, MovieInfo, MovieOverlay, MovieState, SizeU32, TextureRef, Transition,
 };
 use crate::op::{
-    CopyKind, CopyOp, CopyRegion, CopySource, CopyTiming, ImageAction, ImageOp, MaskDraw, Op,
-    OpStatus,
+    CopyKind, CopyOp, CopyRegion, CopySource, CopyTiming, ImageAction, ImageOp, Op, OpStatus,
 };
 use crate::pass::{Pass, PassTarget};
 use crate::path;
@@ -319,6 +318,14 @@ pub struct GfxState {
     preload_pending: BTreeSet<Vec<u8>>,
     /// 已经交给宿主预热的 key,避免每帧重复登记。
     preloaded: BTreeSet<Vec<u8>>,
+    /// 已报告过“`CG` 无 FILE/RID 且层不存在”的层。
+    ///
+    /// 官方对该路径返回 -1,脚本会把它当存在性探测逐帧轮询
+    /// (`es_scenario.yst` 的 `s66 pc245` 在 `<game-b>` 样本开场单帧可达
+    /// 2 万次;`<game-b>` 为 AGENTS.md 占位符)。
+    /// 每次调用都构造 WARN/诊断会把轮询变成日志尖峰;这里按层去重,
+    /// 层真正被创建后移除,后续删除再探测才会重新留痕。
+    missing_cg_reported: BTreeSet<LayerId>,
 }
 
 /// [`GfxState::text_state`] 的返回视图(字节 / `_TEXT_FLAG` / 样式 / 原点)。
@@ -426,6 +433,7 @@ impl GfxState {
             snapshot_files: BTreeMap::new(),
             preload_pending: BTreeSet::new(),
             preloaded: BTreeSet::new(),
+            missing_cg_reported: BTreeSet::new(),
             pointer: (0, 0),
         };
         s.ensure_w0();
@@ -891,6 +899,11 @@ impl GfxState {
         };
         let mut texture_ops: Vec<(u64, Op)> = Vec::new();
         for c in &self.copy_log {
+            // `TEXCOPY`/`TEXSSCOPY` 是官方 PASTESPRITE/GETSS,不是本后端
+            // 能执行的纹理 blit;只保留审计记录,不发射空快照 pass。
+            if matches!(c.kind, CopyKind::TexCopy | CopyKind::TexSsCopy) {
+                continue;
+            }
             // 复制的目标是**活层**时,只有它当前仍持有这条复制的快照
             // (`dest.texture == Snapshot(c.id)`)才可以重放。目标被 `CG[FILE]`
             // 或新 COPY 重新绑定后,旧 copy 的快照属于上一个场景;再写进
@@ -933,6 +946,36 @@ impl GfxState {
         //
         // 反向扫描:先看消费者(序号更大)是否需要该源;被需要才置发射位,
         // 并把自己的源继续往前传(链式依赖)。
+        let mut needed_sources: BTreeSet<LayerId> = BTreeSet::new();
+        // `DIV-GFX-072 §1-8`:源层在本帧被 `CGEND` 删除,但同帧 COPY 已经
+        // 在命令时刻读过它的像素。后端回放 COPY 时只剩 `source_texture`
+        // (基图);必须把该层的图像加工链也标为“本帧需要”,让加工 pass
+        // 先写进 `texture_overrides`,COPY 才能取到官方看到的加工后像素。
+        for copy in &self.copy_log {
+            if !matches!(copy.kind, CopyKind::Copy | CopyKind::Copy2) {
+                continue;
+            }
+            let dest_live = match self.nodes.get(&copy.dest) {
+                Some(n) => {
+                    matches!(n.layer.texture, TextureRef::Snapshot(id) if id == copy.id)
+                }
+                None => needed_snapshots.contains(&copy.id) || snapshot_layers.contains(&copy.dest),
+            };
+            if !dest_live {
+                continue;
+            }
+            let dest_holds = self.nodes.get(&copy.dest).is_some_and(
+                |n| matches!(n.layer.texture, TextureRef::Snapshot(id) if id == copy.id),
+            );
+            if dest_holds && self.baked_copies.borrow().contains(&copy.id) {
+                continue;
+            }
+            if let CopySource::Layer(id) = &copy.source {
+                if !self.nodes.contains_key(id) {
+                    needed_sources.insert(id.clone());
+                }
+            }
+        }
         let baked_flags: Vec<bool> = {
             let baked = self.baked_images.borrow();
             self.image_log
@@ -947,14 +990,16 @@ impl GfxState {
                                 && i.seq <= *seq
                         }),
                         None => {
+                            // 目标已删但 COPY 仍要读它的加工结果 ⇒ 必须重放,
+                            // 即使它曾在更早帧被烘焙过(表面已随 CGEND 消失)。
                             !snapshot_layers.contains(target)
+                                && !needed_sources.contains(target)
                                 && baked.get(target).is_some_and(|(_, _, seq)| i.seq <= *seq)
                         }
                     }
                 })
                 .collect()
         };
-        let mut needed_sources: BTreeSet<LayerId> = BTreeSet::new();
         let mut emit_flags: Vec<bool> = vec![false; self.image_log.len()];
         for (idx, i) in self.image_log.iter().enumerate().rev() {
             if baked_flags[idx] {
@@ -978,10 +1023,10 @@ impl GfxState {
         for (idx, i) in self.image_log.iter().enumerate() {
             // 缺 target = 原地加工(同上)。
             let target = i.target.as_ref().unwrap_or(&i.source); // silent-ok: 缺 target = 原地加工
-            // 已经烘进常驻表面且基图未变的旧加工项不再产生 pass。
-            // 目标层可能已被 `CGEND` 删除(外字临时层 `TX.GAIJI*` 的
-            // `SIZE2/MEIDO/MERGE2` 链):只要它不在本帧屏幕快照里,
-            // 历史项已烘进最终目标,也同样跳过。
+                                                                 // 已经烘进常驻表面且基图未变的旧加工项不再产生 pass。
+                                                                 // 目标层可能已被 `CGEND` 删除(外字临时层 `TX.GAIJI*` 的
+                                                                 // `SIZE2/MEIDO/MERGE2` 链):只要它不在本帧屏幕快照里,
+                                                                 // 历史项已烘进最终目标,也同样跳过。
             if baked_flags[idx] {
                 continue;
             }
@@ -1598,7 +1643,10 @@ impl GfxState {
                 }
             }
         }
-        let Some((flag, _)) = single_flag(&flags, "CGINFO")? else {
+        // 官方 CGINFO 是**顺序 if/else 链**(REA `0x43d758..0x43dddf`):
+        // 按下面顺序检查参数压缩槽,第一个置位的字段写 LET 后直接返回;
+        // 多个字段同时置位不是错误。旧实现一律报 `INFO_MULTI`,与官方不符。
+        let Some((flag, _)) = first_flag(&flags, CGINFO_FLAG_ORDER)? else {
             return Err(error::unimplemented(
                 error::code::INFO_MULTI,
                 "CGINFO 未给出查询字段",
@@ -1657,11 +1705,14 @@ impl GfxState {
             }),
             "SX" => Value::Int(self.query_layer_size(layer, true)?),
             "SY" => Value::Int(self.query_layer_size(layer, false)?),
-            // `TEX` = 表面类型码(`CG[TEX=]` 写入,零初始化):`2` 表示
-            // E-mote 层(`es_Sprite.yst:3455/4156/5849/7771` 的
-            // 「E-moteレイヤなら」分支按 `==2` 判定)。本内核不装载
-            // E-mote(`deferred(master)`),该值只会是脚本显式写入的。
-            "TEX" => Value::Int(layer.tex),
+            // `TEX` = **图层种类码**(REA CGINFO `0x43d962`:
+            // `movsx ecx, byte [层+0xa4]`):1 = 图像层,2 = 图层组,0 = 已删。
+            // 它不是 `CG[TEX=]` 的写入值回读;`CG[TEX=1]` 在官方是“把空层
+            // 转成图像层”的动作(0x42baa5),其它值无副作用。
+            "TEX" => Value::Int(match layer.kind {
+                LayerKind::Image { .. } => 1,
+                LayerKind::Group { .. } => 2,
+            }),
             // `CGINFO[COLOR]` = **指定坐标**的像素色,打包与 `ONMOUSE` 相同
             // (`r | g<<8 | b<<16`;越界 `-1`)。与 `ONMOUSE*` 共用同一采样器,
             // 差别只在坐标来源。
@@ -1933,7 +1984,7 @@ impl GfxState {
                     let idx = if n >= 1 { (n - 1) as usize } else { usize::MAX };
                     // 字体编号 0/负数/越界 = 空串(枚举失败即空,手册口径)。
                     return Ok(Value::Str(
-                        self.font_families.get(idx).cloned().unwrap_or_default() // silent-ok: 越界 = 空串
+                        self.font_families.get(idx).cloned().unwrap_or_default(), // silent-ok: 越界 = 空串
                     ));
                 }
                 match &self.style.name {
@@ -2323,10 +2374,7 @@ impl GfxState {
         movie.frame = idx;
         let asset = movie.asset.clone();
         let has_alpha = movie.info.has_alpha;
-        node.layer.texture = TextureRef::Movie {
-            asset,
-            frame: idx,
-        };
+        node.layer.texture = TextureRef::Movie { asset, frame: idx };
         node.layer.alpha_aware = has_alpha;
         self.reset_movie_surface(&path);
     }
@@ -2706,6 +2754,7 @@ impl GfxState {
             for d in diags {
                 self.push_diag("CG", d);
             }
+            self.record_mask_op(&parsed.path, &params);
             return;
         }
 
@@ -2730,21 +2779,40 @@ impl GfxState {
         }
 
         if existing.is_none() {
-            // 引擎处理体是“取/建节点”:即使没有 FILE 也建一个无纹理图层,
-            // 绘制遍历按 `+0x90 == 0` 跳过。手册例 4 称“图层不存在 = 错误”,
-            // 这里按引擎实际 get-or-create 处理(留档,不改变可见结果)。
-            // `CG` 未给 FILE = 无纹理层(get-or-create;官方遍历按纹理空跳过)。
-            let texture = file.clone().unwrap_or(TextureRef::None); // silent-ok: 无 FILE = 无纹理
-            self.create_image(&parsed.path, texture, None);
+            // REA(CG 处理体 `0x42a63d..0x42bbef`):层表 lookup 失败时
+            // `ebp=0`;无 FILE/RID 走到 `0x42bbef test ebp,ebp; je → -1`,
+            // **不建节点**。只有 `FILE`(含 `""` → 1×1 黑图)或 `RID`
+            // 资源取图才建层。旧实现无条件 get-or-create 会留下官方没有的
+            // 鬼层(DIV-GFX-016)。
+            let has_rid = params.iter().any(|(name, _, _)| name == "RID");
             if file.is_none() {
-                self.push_diag(
-                    "CG",
-                    error::info(
-                        error::code::TEXTURE_MISSING,
-                        "CG 未给 FILE:按引擎 get-or-create 建无纹理图层(遍历跳过)",
-                    ),
-                );
+                if has_rid {
+                    self.push_diag(
+                        "CG",
+                        error::unimplemented(
+                            error::code::IMAGE_RID_UNSUPPORTED,
+                            "CG 仅有 RID 且层不存在:资源图取图 provider 未实现,\
+                             官方会经资源树建层;本内核不建鬼层",
+                        ),
+                    );
+                } else {
+                    // 脚本把 `CG[ID=…]` 当存在性探测逐帧轮询;官方静默
+                    // 返回 -1。按层只留一条 Verbose,避免把正常轮询变成
+                    // WARN 洪峰(`<game-b>` 开场单帧 2 万次)。
+                    if self.missing_cg_reported.insert(parsed.path.clone()) {
+                        self.push_diag(
+                            "CG",
+                            error::verbose(
+                                error::code::LAYER_MISSING,
+                                "CG 无 FILE/RID 且目标层不存在:官方返回 -1,不建节点",
+                            ),
+                        );
+                    }
+                }
+                return;
             }
+            let texture = file.clone().expect("file checked above");
+            self.create_image(&parsed.path, texture, None);
         } else if let Some(texture) = file {
             // 手册:FILE 替换只换图,不重置 A/位置等属性。
             if let Some(node) = self.nodes.get_mut(&parsed.path) {
@@ -2772,9 +2840,108 @@ impl GfxState {
         for d in diags {
             self.push_diag("CG", d);
         }
+        self.record_mask_op(&parsed.path, &params);
     }
 
-    // ------------------------------------------------------------ CGEND
+    /// `CG[MID]` 的官方语义(REA `0x42a801..0x42a8a4`):
+    /// 解析 mask 层 → 宽高必须相等 → 逐像素 `target[+0x90].a = mask[+0x90].r`
+    /// → 置 target `+0x86=1`。这里记录成 `mask_alpha` 合成 op,由后端在
+    /// 命令序位置执行;重复 MID 命令按 `(action,target)` 折叠为最后一条。
+    fn record_mask_op(&mut self, target: &LayerId, params: &[(String, EngineValue, bool)]) {
+        let Some(mask_raw) = find_str(params, "MID") else {
+            return;
+        };
+        if mask_raw.is_empty() {
+            return;
+        }
+        let mask_path = path::normalize(&mask_raw, None, false).path;
+        let Some(target_node) = self.nodes.get(target) else {
+            return;
+        };
+        let target_is_group = target_node.layer.is_group();
+        let target_size = target_node.layer.image_size();
+        let target_alpha = target_node.layer.alpha;
+        if target_is_group {
+            self.push_diag(
+                "CG",
+                error::recoverable(
+                    error::code::MASK_UNSUPPORTED,
+                    "组图层 MID:组合成表面的 alpha 写入路径未实现;基图继续绘制",
+                ),
+            );
+            return;
+        }
+        let mask_texture = self
+            .nodes
+            .get(&mask_path)
+            .map(|n| n.layer.texture.clone())
+            .filter(|t| {
+                matches!(
+                    t,
+                    TextureRef::Asset(_)
+                        | TextureRef::Snapshot(_)
+                        | TextureRef::SolidBlack1x1
+                        | TextureRef::Movie { .. }
+                )
+            });
+        let status = match (mask_texture.clone(), target_size) {
+            (Some(_), _) => {
+                let mask_size = self
+                    .nodes
+                    .get(&mask_path)
+                    .and_then(|n| n.layer.image_size());
+                match (target_size, mask_size) {
+                    (Some(t), Some(m)) if t != m => {
+                        OpStatus::Unimplemented("gfx.mask.size.mismatch")
+                    }
+                    _ => OpStatus::Executable,
+                }
+            }
+            (None, _) => OpStatus::Unimplemented("gfx.mask.source.unsupported"),
+        };
+        let seq = self.next_texture_seq();
+        let source_alpha = self
+            .nodes
+            .get(&mask_path)
+            .map(|n| n.layer.alpha)
+            .unwrap_or(256); // 缺省
+        self.push_image_log(ImageOp {
+            seq,
+            source: mask_path.clone(),
+            source2: None,
+            source_texture: mask_texture,
+            target: Some(target.clone()),
+            action: ImageAction::Other("mask_alpha"),
+            set: None,
+            set2: None,
+            set_str: None,
+            sx: None,
+            sy: None,
+            x: None,
+            y: None,
+            x2: None,
+            y2: None,
+            region_from_fixed: false,
+            alpha_aware: false,
+            source_alpha,
+            target_alpha,
+            status,
+        });
+        if status == OpStatus::Executable {
+            if let Some(node) = self.nodes.get_mut(target) {
+                // 官方 `0x42a8a4`: `mov byte[层+0x86],1`。
+                node.layer.alpha_aware = true;
+            }
+        } else if let OpStatus::Unimplemented(reason) = status {
+            self.push_diag(
+                "CG",
+                error::recoverable(
+                    error::code::MASK_UNSUPPORTED,
+                    format!("MID 未合成({reason});基图继续绘制"),
+                ),
+            );
+        }
+    }
 
     fn apply_cgend(&mut self, args: &[ArgValue]) {
         let resolved = self.resolved_owned("CGEND", args);
@@ -2916,11 +3083,15 @@ impl GfxState {
         // (`Z2=8`)⇒ 引擎只当合法参数接受、无副作用。
         let is_transition = flag(&params, "TRANSITION");
         if !is_transition && (paths[2].is_some() || paths[3].is_some()) {
+            // 引擎把 ID/ID2/ID3/ID4 四个引用都解析进缓冲(`0x42c4ed..`),
+            // 但只有 TRANSITION 消费 ID3;其它动作**不读取** ID3/ID4
+            // (Z2 下标 8 同样无读取点)⇒ 合法无副作用参数。按官方对齐为
+            // verbose 留痕,不把层/命令标未实现(DIV-GFX-031)。
             self.push_diag(
                 "CGACT",
-                error::unimplemented(
-                    error::code::IMAGEOP_UNSUPPORTED,
-                    "ID3/ID4 只被多输入动作(TRANSITION)消费;该动作之外的多图层语义未取证",
+                error::verbose(
+                    error::code::PARAM_NONVISUAL,
+                    "ID3/ID4 仅被 TRANSITION 消费;该动作之外官方也不读取",
                 ),
             );
         }
@@ -3027,12 +3198,19 @@ impl GfxState {
             self.cgact_transition(&source, paths[1].clone(), paths[2].clone(), blend);
             return;
         }
+        // REA(CGACT 处理体 `0x42e661`/`0x42e670`):
+        // - slot 66 `SWAP`  → `0x42f2ac` → `call 0x42f57d` 时 `ecx=1`;
+        // - slot 67 `SWAP2` → `0x42f1e3` → `ecx=2`。
+        // `FUN_0042f57d` 模式 1 只换纹理与 `+0x68/+0x70`(X/Y),模式 2 还换
+        // `+0x89(E)/+0x80(A)/+0x82(T)/+0x84(TA)/+0x87(MODE)`。
+        // 手册把 SWAP 写成“图像+属性”、SWAP2 写成“仅图像”,与引擎**相反**;
+        // 按真值层级取引擎行为(DIV-GFX-032)。
         if flag(&params, "SWAP") {
-            self.cgact_swap(&source, &dest, false);
+            self.cgact_swap(&source, &dest, true);
             return;
         }
         if flag(&params, "SWAP2") {
-            self.cgact_swap(&source, &dest, true);
+            self.cgact_swap(&source, &dest, false);
             return;
         }
 
@@ -3112,10 +3290,13 @@ impl GfxState {
             return;
         }
         let copy_id = CopyId(self.next_copy());
+        // `TEXCOPY`/`TEXSSCOPY` 走官方 PASTESPRITE/GETSS,不是纹理 blit;
+        // 它们不产生 `Snapshot`,也不得改写目标层纹理(见下方 REA 注释)。
+        let texture_copy = matches!(kind, CopyKind::TexCopy | CopyKind::TexSsCopy);
         // 主窗口截屏:记录命令时刻的屏幕契约(见 frame.rs）。
         // 必须在改写目标层纹理之前采集 —— `CG[ID=CGS…]` 此时还是空白层;
         // 也要早于 `prune_copy_log`(它按 dest 清理旧复制项)。
-        let screen_snapshot = if source_is_group && self.is_main_group(source) {
+        let screen_snapshot = if !texture_copy && source_is_group && self.is_main_group(source) {
             self.capture_screen_snapshot()
         } else {
             None
@@ -3165,17 +3346,31 @@ impl GfxState {
                 .map(|t| t.draws.clone())
                 .unwrap_or_default()
         };
-        self.prune_copy_log(|c| c.dest == *dest);
-        self.image_log
-            .retain(|i| i.target.as_ref().is_none_or(|t| t != dest));
+        if !texture_copy {
+            self.prune_copy_log(|c| c.dest == *dest);
+            self.image_log
+                .retain(|i| i.target.as_ref().is_none_or(|t| t != dest));
+        }
         // EVID-T-11/T-12:COPY/COPY2 在命令执行时取源层当前状态;区域是源
         // 纹理坐标(含端点),裁剪块写到目标 (0,0),无区域 = 整图复制。
-        // TEXCOPY/TEXSSCOPY 是纹理句柄级操作,本内核没有对应证据,保持跳过。
+        //
+        // `TEXCOPY`/`TEXSSCOPY` **不是**纹理 blit(2026-11-05 REA):
+        // - `TEXCOPY`(CGACT 处理体 `0x42e67f`)= 官方 PASTESPRITE:
+        //   `FUN_0043ccd8` 把源/目标层指针与目标 `+0x78/+0x7c`、`FCX/FCY`
+        //   写进全局,再调 `FUN_0040af1c`(5490 B,按 `+0xa6/+0xa7` 网格
+        //   与 `+0xb0/+0x130` tile 表把源 sprite 贴到目标表面);
+        // - `TEXSSCOPY`(同处理体 `0x42e68a`)= 官方 GETSS:
+        //   `FUN_0043cd6c` 以当前表面/后缓冲为源,分配目标表面并回写
+        //   `[目标+0x90]`(错误串 `GETSS SetRenderTarget Error`)。
+        //
+        // 两者的像素语义都依赖本内核尚未落地的多部件/表面 provider。
+        // 旧实现仍把目标纹理换成空快照并标 `Unimplemented` ⇒ 目标层永久
+        // 不画。这里改为:**保留目标层原纹理与可执行状态**,只记录复制审计
+        // 项并出 recoverable 诊断,等 REA/ provider 到位再补像素。
         let status = match kind {
             CopyKind::Copy | CopyKind::Copy2 => OpStatus::Executable,
-            CopyKind::TexCopy | CopyKind::TexSsCopy => {
-                OpStatus::Unimplemented("gfx.copy.texcopy.unsupported")
-            }
+            CopyKind::TexCopy => OpStatus::Unimplemented("gfx.copy.texcopy.unsupported"),
+            CopyKind::TexSsCopy => OpStatus::Unimplemented("gfx.copy.texsscopy.unsupported"),
         };
         self.push_copy_log(CopyOp {
             seq,
@@ -3193,6 +3388,27 @@ impl GfxState {
             timing: CopyTiming::CommandCurrent,
             status,
         });
+        if texture_copy {
+            // 目标层保持原纹理/状态:官方会写表面,内核未实现时至少不丢层。
+            // 不保留 `CopyOp` 为可执行(frame() 不会发射),避免空快照覆盖。
+            self.push_diag(
+                "CGACT",
+                error::recoverable(
+                    error::code::COPY_UNSUPPORTED,
+                    match kind {
+                        CopyKind::TexCopy => {
+                            "TEXCOPY = 官方 PASTESPRITE(FUN_0043ccd8→FUN_0040af1c,\
+                             多部件/tile 粘贴);像素未取证 ⇒ 保留目标层原纹理继续绘制"
+                        }
+                        _ => {
+                            "TEXSSCOPY = 官方 GETSS(FUN_0043cd6c,截取当前表面);\
+                             像素未取证 ⇒ 保留目标层原纹理继续绘制"
+                        }
+                    },
+                ),
+            );
+            return;
+        }
         if let Some(snapshot) = screen_snapshot {
             self.last_screen_capture =
                 Some((snapshot.contract_key, std::sync::Arc::clone(&snapshot)));
@@ -3234,13 +3450,10 @@ impl GfxState {
                 }
                 TextureRef::Snapshot(id) => self.snapshot_sizes.get(id).copied(),
                 TextureRef::Offscreen(id) => self.nodes.get(id).and_then(|n| n.layer.group_size()),
-                TextureRef::Movie { asset, .. } => self
-                    .movie_metas
-                    .get(asset)
-                    .map(|m| SizeU32 {
-                        width: m.width,
-                        height: m.height,
-                    }),
+                TextureRef::Movie { asset, .. } => self.movie_metas.get(asset).map(|m| SizeU32 {
+                    width: m.width,
+                    height: m.height,
+                }),
                 TextureRef::None | TextureRef::SolidBlack1x1 => src_node.layer.image_size(),
             };
         }
@@ -3421,13 +3634,11 @@ impl GfxState {
             );
             return;
         }
-        // TODO(DIV-GFX-032):SWAP/SWAP2 与引擎模式 1/2 的精确对应仍是
-        // Likely,需 `FUN_0042f57d` 调用点确认。
-        // 引擎 FUN_0042f57d:
-        // - 总是交换纹理/图像名与 +0x68/+0x70(X/Y);
-        // - 模式 2 额外交换 +0x89(E)/+0x80(A)/+0x82(T)/+0x84(TA)/+0x87(MODE)。
-        // 手册:SWAP=图像+属性,SWAP2=仅图像。模式 1/2 与 SWAP/SWAP2 的
-        // 精确对应为 Likely;这里按“SWAP2 只换图+坐标、SWAP 再换可见属性”实现。
+        // 引擎 FUN_0042f57d 的两个调用点已定位(CGACT 处理体 `0x42e661`/
+        // `0x42e670`):SWAP(slot 66)→ 模式 1 = 纹理 + X/Y;SWAP2(slot 67)
+        // → 模式 2 = 再加 `+0x89(E)/+0x80(A)/+0x82(T)/+0x84(TA)/+0x87(MODE)`。
+        // 手册文字与引擎相反,以引擎为准(DIV-GFX-032 fixed)。调用方传入
+        // `image_only=true` 表示 SWAP 的模式 1(不换属性)。
         let src = self.nodes[source].layer.clone();
         let dst = self.nodes[dest].layer.clone();
         {
@@ -4030,21 +4241,19 @@ impl GfxState {
                 OpStatus::Unimplemented(reason) => reason,
                 OpStatus::Executable => unreachable!(),
             };
-            if let Some(node) = self.nodes.get_mut(source) {
-                node.layer
-                    .set_texture_status(LayerStatus::Unimplemented(reason));
-            }
-            if let Some(t) = target {
-                if let Some(node) = self.nodes.get_mut(&t) {
-                    node.layer
-                        .set_texture_status(LayerStatus::Unimplemented(reason));
-                }
-            }
+            // **不**把源/目标层标 `texture_status = Unimplemented`:
+            // 未取证的图像加工只跳过该 op,层仍按已有基图/先前加工结果绘制。
+            // 旧实现会让任何一次未取证动作把整层永久隐藏(违反“未取证字段
+            // 不得丢整层”);若该层本就没有基图,`emit_image_subtree` 的
+            // `has_surface` 会自然不画它,无需毒化。
             self.push_diag(
                 "CGACT",
                 error::unimplemented(
                     error::code::IMAGEOP_UNSUPPORTED,
-                    format!("图像加工 `{name}` 未执行: {reason};只记录原始参数"),
+                    format!(
+                        "图像加工 `{name}` 未执行: {reason};只记录原始参数,\
+                         保留层现有基图/加工结果继续绘制"
+                    ),
                 ),
             );
         } else {
@@ -4330,6 +4539,7 @@ impl GfxState {
         if self.nodes.contains_key(path) {
             return;
         }
+        self.missing_cg_reported.remove(path);
         self.baked_images.borrow_mut().remove(path);
         self.ensure_parents(path);
         let layer = Layer {
@@ -4361,6 +4571,7 @@ impl GfxState {
         if self.nodes.contains_key(path) {
             return;
         }
+        self.missing_cg_reported.remove(path);
         // 同名层重建:旧实例的外字链候选作废。
         self.glyph_chains.remove(path);
         // `CG` 重建同名层 = 官方新建一个层实例,旧实例的像素与加工链全部
@@ -4896,12 +5107,10 @@ impl GfxState {
                 }
             }
         }
-        if let Some(mask) = &layer.mask {
-            return Op::Mask(MaskDraw {
-                layer: layer.clone(),
-                mask: mask.clone(),
-            });
-        }
+        // `MID` 外部掩码:官方解析出配对层后由绘制体合成(`FUN_00413dc8`
+        // 111-119),但取值通道/尺寸/采样未取证。内核按普通层绘制基图,
+        // `Layer.mask` 保留在帧 JSON 中;不再产出后端必然跳过的 `Op::Mask`
+        // (旧行为会让整层消失,违反“未取证字段不得丢整层”)。
         Op::Layer(layer.clone())
     }
 
@@ -4941,14 +5150,20 @@ impl GfxState {
     /// 由后端回退加工表面。
     fn transition_mask_base(&self, tid: &LayerId) -> Option<TextureRef> {
         let node = self.nodes.get(tid)?;
-        if !matches!(node.layer.texture, TextureRef::None | TextureRef::SolidBlack1x1) {
+        if !matches!(
+            node.layer.texture,
+            TextureRef::None | TextureRef::SolidBlack1x1
+        ) {
             return Some(node.layer.texture.clone());
         }
         self.image_log.iter().rev().find_map(|op| {
             if op.target.as_ref() != Some(tid) || op.status != OpStatus::Executable {
                 return None;
             }
-            if !matches!(op.action, ImageAction::SizeNearest | ImageAction::SizeBilinear) {
+            if !matches!(
+                op.action,
+                ImageAction::SizeNearest | ImageAction::SizeBilinear
+            ) {
                 return None;
             }
             match &op.source_texture {
@@ -5059,7 +5274,9 @@ impl GfxState {
         let pure_write = op.action.is_scale()
             || matches!(
                 op.action,
-                ImageAction::Horizontal | ImageAction::Vertical | ImageAction::Other("transition")
+                ImageAction::Horizontal
+                    | ImageAction::Vertical
+                    | ImageAction::Other("transition" | "mask_alpha")
             );
         if !pure_write {
             return;
@@ -5305,6 +5522,31 @@ fn int_arg(v: &Value) -> Option<i64> {
         Value::Float(f) if f.fract() == 0.0 && f.is_finite() => Some(*f as i64),
         _ => None,
     }
+}
+
+/// 官方 `CGINFO` 处理体 `0x43d758..0x43dddf` 的字段检查顺序。
+///
+/// 每个字段是 `movzx ecx, byte [0x684160+idx]; test; je next`,第一个
+/// 置位的字段跳到公共 `0x43dde6` 写 LET 后返回 ⇒ **槽号小的先回答**,
+/// 但**不是**按声明序(例如 `T/TA` 在 `X/Y` 之前)。`MFILE` 未在该链
+/// 出现,放在末尾仅保留既有单字段查询能力。
+const CGINFO_FLAG_ORDER: &[&str] = &[
+    "EXIST", "E", "A", "T", "TID", "TA", "X", "Y", "Z", "MODE", "SX", "SY", "FX", "FY", "FBX",
+    "FBY", "FEX", "FEY", "FEZ", "TEX", "ONMOUSE", "ONMOUSE2", "ONMOUSE3", "COLOR", "TRIM", "LINT",
+    "LINT2", "MFILE",
+];
+
+/// 按官方 if/else 链的字段顺序取第一个置位项。
+fn first_flag<'a>(
+    flags: &BTreeMap<&'a str, i64>,
+    order: &[&'static str],
+) -> Result<Option<(&'static str, i64)>, Diag> {
+    for name in order {
+        if let Some(value) = flags.get(name) {
+            return Ok(Some((*name, *value)));
+        }
+    }
+    Ok(None)
 }
 
 /// INFO 查询必须只置位一个字段;多字段写回顺序未取证。
@@ -6046,7 +6288,13 @@ fn apply_layer_params(
             // 「E-moteレイヤなら」)判定 E-mote ⇒ **2 = E-mote**。
             // 它不是「未分类非视觉参数」:有明确的写入→读回语义。
             "TEX" => match value.as_int() {
-                Some(n) => layer.tex = n,
+                Some(n) => {
+                    // 官方 `CG[TEX=1]` 是“空层转图像层”的动作(`0x42baa5`),
+                    // 其它值无副作用;`CGINFO[TEX]` 读的是 `+0xa4` 层种类,
+                    // 不是这里的写入值。保留原值仅供审计/JSON。
+                    layer.extra.insert("TEX".to_string(), EngineValue::Int(n));
+                    layer.tex = n;
+                }
                 None => diags.push(error::recoverable(
                     error::code::ARG_TYPE,
                     "参数 `TEX` 期望整数",
@@ -6113,15 +6361,19 @@ fn apply_layer_params(
                     t.ta = v;
                 }
             }
-            // TODO(DIV-GFX-030):引擎可能按 `TID + "." + N` 解析 TIDNO;
-            // 未重新锚定前只留档,不当作 TID 使用。
-            "TIDNO" => {
-                layer.extra.insert("TIDNO".to_string(), value.clone());
-                diags.push(error::unimplemented(
-                    error::code::PARAM_NONVISUAL,
-                    "CG[TIDNO] 的 IDNO 变体未取证;已原样保留",
-                ));
-            }
+            // `TIDNO`:REA CG 处理体 `0x42a8e3..0x42a936` 把 TID 拷入缓冲后,
+            // 追加常量 `0x808354`(`"."`)再 `__ultoa` 基数 10 ⇒ 查表键 =
+            // `TID + "." + N`。与 `IDNO` 同型(DIV-GFX-030 fixed)。
+            "TIDNO" => match value.as_int() {
+                Some(n) => {
+                    let t = layer.transition.get_or_insert_with(Transition::default);
+                    t.tid_no = Some(n);
+                }
+                None => diags.push(error::recoverable(
+                    error::code::ARG_TYPE,
+                    "参数 `TIDNO` 期望整数",
+                )),
+            },
             "TID" => match value.as_bytes() {
                 // 引擎 `FUN_00413dc8` 0x413e7b:空串直接跳过配对查询。
                 // 脚本 `TID=""` 的意图是“结束过渡/初始化”(es_Button.yst:4526)。
@@ -6129,11 +6381,10 @@ fn apply_layer_params(
                     let t = layer.transition.get_or_insert_with(Transition::default);
                     t.tid = None;
                     t.tid_raw = Some(Vec::new());
+                    t.tid_no = None;
                 }
                 Some(b) => {
-                    let p = path::normalize(b, None, false).path;
                     let t = layer.transition.get_or_insert_with(Transition::default);
-                    t.tid = Some(p);
                     t.tid_raw = Some(b.to_vec());
                 }
                 None => diags.push(error::recoverable(
@@ -6145,13 +6396,10 @@ fn apply_layer_params(
                 // 与 TID 同法:空串 = 不设置外部掩码(+0x210 空串跳过)。
                 Some([]) => layer.mask = None,
                 Some(b) => {
-                    // TODO(DIV-GFX-005):MID 取值通道(α/亮度)/尺寸未取证。
+                    // 官方在层遍历 `FUN_00413dc8` 111-119 解析 `+0x210` 并查层表;
+                    // 真正的 mask 合成由 `record_mask_op` 按 REA `0x42a88c`
+                    // 记录为 `mask_alpha` 合成 op(命令序执行)。
                     layer.mask = Some(path::normalize(b, None, false).path);
-                    mark_param_unimplemented(layer, "gfx.mask.unsupported");
-                    diags.push(error::unimplemented(
-                        error::code::MASK_UNSUPPORTED,
-                        "外部掩码 MID 的取值通道(α/亮度)未取证",
-                    ));
                 }
                 None => diags.push(error::recoverable(
                     error::code::ARG_TYPE,
@@ -6305,6 +6553,18 @@ fn apply_layer_params(
         }
     }
 
+    // `TID`/`TIDNO` 可能在同一命令里以任意窗口顺序到达;按官方语义在
+    // 参数处理完后统一重建查表键:`TID + "." + N`(空 TID = 无配对)。
+    if let Some(t) = &mut layer.transition {
+        if let Some(raw) = &t.tid_raw {
+            t.tid = if raw.is_empty() {
+                None
+            } else {
+                Some(path::normalize(raw, t.tid_no, false).path)
+            };
+        }
+    }
+
     // 持久字段重算:本命令没重复给 FX/MID/MODE 时,旧值仍可能让本层不可执行。
     // (诊断只在参数出现时发,避免每帧重复计数。)
     if layer.extra.contains_key("MODE") {
@@ -6333,7 +6593,8 @@ fn apply_layer_params(
         ));
     }
     if layer.mask.is_some() {
-        mark_param_unimplemented(layer, "gfx.mask.unsupported");
+        // 掩码合成本身未取证,但**不**把整层标不可执行(见 MID 分支);
+        // 保留 `Layer.mask` 供 CONTRACT 审计与后续 provider 接入。
     }
 
     if is_group {
@@ -6357,14 +6618,23 @@ fn apply_layer_params(
             }
         }
     } else {
-        let size_params_present = sx.is_some() || sy.is_some();
         if let Some(v) = sx {
             layer.extra.insert("SX".to_string(), EngineValue::Int(v));
         }
         if let Some(v) = sy {
             layer.extra.insert("SY".to_string(), EngineValue::Int(v));
         }
-        match (sx, sy) {
+        // 引擎层矩形 `+0x78/+0x7c` 是**绘制目标尺寸**,绘制体按矩形缩放纹理
+        // (`FUN_00408724` 用矩形;纹理过滤沿 D3D 阶段)。两后端已按
+        // `LayerKind::Image.size` 缩放 Asset/Snapshot/Movie。旧实现在这里对
+        // “非黑图 + 显式尺寸”标 `gfx.image.size.unsupported`,会让
+        // `CGACT[SIZE]` 之后的任何 `CG[ID=…]` 属性更新把整层毒化(DIV-GFX-022)。
+        // 现按官方矩形语义直接保存:缺省轴取当前层矩形;新层两轴都没有时
+        // 才用引擎构造默认 1(`FUN_00465730`),并留 recoverable 诊断。
+        let current = layer.image_size();
+        let w = sx.or_else(|| current.map(|s| i64::from(s.width)));
+        let h = sy.or_else(|| current.map(|s| i64::from(s.height)));
+        match (w, h) {
             (Some(w), Some(h)) => match (u32::try_from(w), u32::try_from(h)) {
                 (Ok(w), Ok(h)) => {
                     layer.kind = LayerKind::Image {
@@ -6379,25 +6649,31 @@ fn apply_layer_params(
                     format!("图像层 SX={w} SY={h} 超出 u32 范围"),
                 )),
             },
-            (Some(_), None) | (None, Some(_)) => diags.push(error::unimplemented(
-                error::code::IMAGE_SIZE_UNSUPPORTED,
-                "图像层只给 SX/SY 之一:部分尺寸更新未取证",
-            )),
-            (None, None) => {}
-        }
-        // 引擎层矩形(+0x78/+0x7c)独立于纹理。`FILE=""` 的 1×1 黑图
-        // 按 SX/SY 铺满(真实脚本 es_ERIS.yst:579);资源图的缩放/裁剪
-        // 没有真实样本,保持 Unimplemented。
-        if let Some(_size) = layer.image_size() {
-            if !matches!(&layer.texture, TextureRef::SolidBlack1x1 | TextureRef::None) {
-                mark_param_unimplemented(layer, "gfx.image.size.unsupported");
-                if size_params_present {
-                    diags.push(error::unimplemented(
-                        error::code::IMAGE_SIZE_UNSUPPORTED,
-                        "资源图 + SX/SY 的缩放/裁剪语义未取证;仅 FILE=\"\" 黑图按尺寸绘制",
-                    ));
+            (Some(w), None) | (None, Some(w)) => {
+                // 引擎只写给定轴,另一轴保持构造默认 1。语料没有单边用法;
+                // 不把整层判不可执行,只留诊断。
+                let other = 1i64;
+                let (w, h) = if h.is_none() { (w, other) } else { (other, w) };
+                match (u32::try_from(w), u32::try_from(h)) {
+                    (Ok(w), Ok(h)) => {
+                        layer.kind = LayerKind::Image {
+                            size: Some(SizeU32 {
+                                width: w,
+                                height: h,
+                            }),
+                        };
+                        diags.push(error::recoverable(
+                            error::code::IMAGE_SIZE_UNSUPPORTED,
+                            "图像层只给 SX/SY 之一:缺省轴按引擎层构造默认 1",
+                        ));
+                    }
+                    _ => diags.push(error::recoverable(
+                        error::code::ARG_TYPE,
+                        format!("图像层 SX={w} SY={h} 超出 u32 范围"),
+                    )),
                 }
             }
+            (None, None) => {}
         }
     }
     layer.refresh_status();

@@ -46,6 +46,9 @@ pub(crate) enum PlannedTarget {
 #[derive(Clone, Debug)]
 pub(crate) enum DrawKind {
     Quad,
+    /// 子组 RT:官方 RT alpha 不参与父级合成(EVID-J-08),
+    /// quad 采样时按不透明处理。
+    GroupQuad,
     /// 引擎 psC(mask R)过渡;配对 + `TA>=1` 的官方路径。
     TransitionPsc {
         bind_index: u32,
@@ -240,7 +243,7 @@ impl Planner<'_> {
                     f64::from(width) * scale_x,
                     f64::from(height) * scale_y,
                     alpha,
-                    DrawKind::Quad,
+                    DrawKind::GroupQuad,
                 )
             }
             Op::Transition(transition) => self.plan_transition(op, transition, out),
@@ -501,13 +504,8 @@ impl Planner<'_> {
                         let view = texture.view.clone();
                         let width = explicit_size.map_or(natural_width, |size| size.width);
                         let height = explicit_size.map_or(natural_height, |size| size.height);
-                        let filter = pick_filter(
-                            self.frame,
-                            natural_width,
-                            natural_height,
-                            width,
-                            height,
-                        );
+                        let filter =
+                            pick_filter(self.frame, natural_width, natural_height, width, height);
                         self.draw(
                             out,
                             blend,
@@ -541,7 +539,8 @@ impl Planner<'_> {
                         // 按矩形缩放绘制;缺省用纹理自然尺寸。
                         let width = explicit_size.map_or(natural_width, |size| size.width);
                         let height = explicit_size.map_or(natural_height, |size| size.height);
-                        let filter = pick_filter(self.frame, natural_width, natural_height, width, height);
+                        let filter =
+                            pick_filter(self.frame, natural_width, natural_height, width, height);
                         self.draw(
                             out,
                             blend,
@@ -849,7 +848,11 @@ impl Planner<'_> {
         kind: DrawKind,
         uv: [f32; 4],
     ) -> Result<(), Diag> {
-        if !self.pipelines.ensure_pipeline(self.ctx, blend)? {
+        let opaque_tex = matches!(kind, DrawKind::GroupQuad);
+        if !self
+            .pipelines
+            .ensure_pipeline(self.ctx, blend, opaque_tex)?
+        {
             // 调用方已用 `supported_blend` 过滤;走到这里说明计划器与管线
             // 能力表不一致,按环境错误上报而不是静默吞掉。
             return Err(Diag::fatal(code::TARGET, yu_log::Boundary::Platform)

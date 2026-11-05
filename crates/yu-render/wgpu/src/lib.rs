@@ -71,8 +71,8 @@
 
 pub mod device;
 pub mod passes;
-pub(crate) mod plan;
 pub mod pipelines;
+pub(crate) mod plan;
 pub mod readback;
 mod shaders;
 pub mod surfaces;
@@ -503,11 +503,10 @@ impl WgpuRenderer {
     ) -> Result<StreamingFrameOutput, Diag> {
         let (out, screen) = self.render_inner(frame, None, true)?;
         let Some(screen) = screen else {
-            return Err(Diag::fatal(
-                device::code::TARGET,
-                yu_log::Boundary::Platform,
-            )
-            .with_detail("流式帧没有屏幕目标"));
+            return Err(
+                Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                    .with_detail("流式帧没有屏幕目标"),
+            );
         };
         Ok(StreamingFrameOutput {
             surface: out.surface,
@@ -567,13 +566,9 @@ impl WgpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("yu-backend-wgpu read screen now"),
             });
-        let mut surface = self.readback.read_now(
-            &self.ctx,
-            &texture,
-            width,
-            height,
-            encoder,
-        )?;
+        let mut surface = self
+            .readback
+            .read_now(&self.ctx, &texture, width, height, encoder)?;
         force_opaque(&mut surface);
         Ok(surface)
     }
@@ -822,8 +817,10 @@ impl WgpuRenderer {
             // 先清屏(池里复用的表面可能带旧内容;TRANSPARENT = 引擎空面)。
             for id in &pass.clear_targets {
                 let Some(view) = resolve_view(*id) else {
-                    return Err(Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                        .with_detail(format!("清屏目标 {id} 缺失")));
+                    return Err(
+                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                            .with_detail(format!("清屏目标 {id} 缺失")),
+                    );
                 };
                 let attachments = [Some(wgpu::RenderPassColorAttachment {
                     view,
@@ -850,18 +847,14 @@ impl WgpuRenderer {
                 // 纹理区域复制(COPY 快照/RESIZE/TRIM/保留内容)。
                 for blit in &pass.blits {
                     let source = resolve_texture(blit.source_id).ok_or_else(|| {
-                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                            .with_detail(format!(
-                            "blit({}) 源纹理 {} 缺失",
-                            blit.label, blit.source_id
-                        ))
+                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform).with_detail(
+                            format!("blit({}) 源纹理 {} 缺失", blit.label, blit.source_id),
+                        )
                     })?;
                     let dest = resolve_texture(blit.dest_id).ok_or_else(|| {
-                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                            .with_detail(format!(
-                            "blit({}) 目标纹理 {} 缺失",
-                            blit.label, blit.dest_id
-                        ))
+                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform).with_detail(
+                            format!("blit({}) 目标纹理 {} 缺失", blit.label, blit.dest_id),
+                        )
                     })?;
                     encoder.copy_texture_to_texture(
                         wgpu::TexelCopyTextureInfo {
@@ -900,8 +893,10 @@ impl WgpuRenderer {
                 // 表面上的 RECTPAINT 族:每条独立 render pass(Load 保留内容)。
                 for paint in &pass.paints {
                     let Some(view) = resolve_view(paint.target_id) else {
-                        return Err(Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                            .with_detail(format!("填充目标 {} 缺失", paint.target_id)));
+                        return Err(
+                            Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                                .with_detail(format!("填充目标 {} 缺失", paint.target_id)),
+                        );
                     };
                     let pipeline = pipelines.paint_pipeline(paint.alpha_only).ok_or_else(|| {
                         Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
@@ -922,15 +917,14 @@ impl WgpuRenderer {
                             store: wgpu::StoreOp::Store,
                         },
                     })];
-                    let mut render_pass =
-                        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("yu-backend-wgpu surface paint"),
-                            color_attachments: &attachments,
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                            multiview_mask: None,
-                        });
+                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("yu-backend-wgpu surface paint"),
+                        color_attachments: &attachments,
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
                     if let Some(buffer) = vertex_buffer {
                         render_pass.set_vertex_buffer(0, buffer.slice(..));
                     }
@@ -941,13 +935,12 @@ impl WgpuRenderer {
                 continue;
             }
             let target_view: &wgpu::TextureView = match planned_target {
-                PlannedTarget::Screen => targets
-                    .screen()
-                    .map(|target| &target.view)
-                    .ok_or_else(|| {
+                PlannedTarget::Screen => {
+                    targets.screen().map(|target| &target.view).ok_or_else(|| {
                         Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
                             .with_detail("缺少屏幕目标")
-                    })?,
+                    })?
+                }
                 PlannedTarget::Offscreen(id) => targets
                     .offscreen(id)
                     .map(|target| &target.view)
@@ -992,7 +985,8 @@ impl WgpuRenderer {
             let mut current_bind = None;
             for (index, draw) in pass.draws.iter().enumerate() {
                 let (pipeline, pipe_kind) = match &draw.kind {
-                    passes::DrawKind::Quad => (pipelines.pipeline(draw.blend), 0u8),
+                    passes::DrawKind::Quad => (pipelines.pipeline(draw.blend, false), 0u8),
+                    passes::DrawKind::GroupQuad => (pipelines.pipeline(draw.blend, true), 4u8),
                     passes::DrawKind::TransitionPsc { .. } => {
                         (pipelines.psc_pipeline(draw.blend), 2)
                     }
@@ -1029,7 +1023,7 @@ impl WgpuRenderer {
                     passes::DrawKind::Aux { bind_index, .. } => {
                         &plan.aux_bind_groups[*bind_index as usize]
                     }
-                    passes::DrawKind::Quad => pipelines
+                    passes::DrawKind::Quad | passes::DrawKind::GroupQuad => pipelines
                         .bind_group(draw.texture_id, draw.filter)
                         .ok_or_else(|| {
                             Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
@@ -1047,7 +1041,9 @@ impl WgpuRenderer {
                     passes::DrawKind::Aux { bind_index, .. } => {
                         (u64::MAX / 2 - u64::from(*bind_index), draw.filter)
                     }
-                    passes::DrawKind::Quad => (draw.texture_id, draw.filter),
+                    passes::DrawKind::Quad | passes::DrawKind::GroupQuad => {
+                        (draw.texture_id, draw.filter)
+                    }
                 };
                 if current_bind != Some(bind_key) {
                     render_pass.set_bind_group(0, bind, &[]);
@@ -1147,7 +1143,30 @@ impl WgpuRenderer {
 }
 
 fn force_opaque(surface: &mut Surface) {
-    for px in surface.rgba.chunks_exact_mut(4) {
+    // 每 64 字节一次写 16 个 alpha。`chunks_exact_mut(4)` 的迭代器与
+    // 边界检查在 debug 构建下实测 9ms/帧(1100×825),展开后 0.6ms;
+    // release 两者都接近内存带宽,结果逐字节相同。
+    let rgba = &mut surface.rgba;
+    let mut chunks = rgba.chunks_exact_mut(64);
+    for px in &mut chunks {
+        px[3] = 255;
+        px[7] = 255;
+        px[11] = 255;
+        px[15] = 255;
+        px[19] = 255;
+        px[23] = 255;
+        px[27] = 255;
+        px[31] = 255;
+        px[35] = 255;
+        px[39] = 255;
+        px[43] = 255;
+        px[47] = 255;
+        px[51] = 255;
+        px[55] = 255;
+        px[59] = 255;
+        px[63] = 255;
+    }
+    for px in chunks.into_remainder().chunks_exact_mut(4) {
         px[3] = 255;
     }
 }

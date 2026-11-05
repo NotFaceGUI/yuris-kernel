@@ -180,6 +180,7 @@ fn fade_formula_matches_engine_for_ta_256() {
         ta: 256,
         tid: None,
         tid_raw: None,
+        tid_no: None,
     };
     let fade = t.fade_value().unwrap();
     // 256 / (256/(256/256+128)) / 256 = 129/256
@@ -193,6 +194,7 @@ fn fade_formula_matches_engine_for_ta_1() {
         ta: 1,
         tid: None,
         tid_raw: None,
+        tid_no: None,
     };
     // 256 / (256/(256/1+128)) / 256 = 384/256 = 1.5(引擎不 clamp)
     assert!((t.fade_value().unwrap() - 1.5).abs() < 1e-15);
@@ -205,6 +207,7 @@ fn ta_below_one_means_no_transition() {
         ta: 0,
         tid: None,
         tid_raw: None,
+        tid_no: None,
     };
     assert_eq!(t.fade_value(), None);
 }

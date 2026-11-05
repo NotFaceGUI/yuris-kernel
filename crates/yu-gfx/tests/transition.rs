@@ -312,3 +312,61 @@ fn group_tid_emits_transition_from_offscreen() {
         .flat_map(|p| p.ops.iter())
         .any(|o| matches!(o, Op::Group(g) if g.layer.id.display() == ":/W0/G")));
 }
+
+/// `TIDNO`:REA CG 处理体 `0x42a8e3..0x42a936` 把 TID 拷入缓冲后追加
+/// 常量 `"."`(`0x808354`)再 `__ultoa` 基数 10 ⇒ 查表键 `TID.N`。
+#[test]
+fn tidno_appends_decimal_suffix_for_pairing() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "FILE", s("a")),
+                arg(&table, "CG", "T", i(128)),
+                arg(&table, "CG", "TA", i(256)),
+                arg(&table, "CG", "TID", s("B")),
+                arg(&table, "CG", "TIDNO", i(2)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("B.2")),
+                arg(&table, "CG", "FILE", s("b")),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let op = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|o| match o {
+            Op::Transition(t) => Some(t),
+            _ => None,
+        })
+        .expect("TID.N 配对应产出过渡 op");
+    assert_eq!(op.to, Some(TextureRef::Asset(b"b".to_vec())));
+    assert_eq!(
+        op.to_layer.as_ref().map(LayerId::display),
+        Some(":/W0/B.2".into())
+    );
+    // CGINFO[TID] 返回脚本原文(不含 TIDNO 后缀)。
+    let raw = gfx
+        .query_info(
+            "CGINFO",
+            &[
+                arg(&table, "CGINFO", "ID", s("A")),
+                arg(&table, "CGINFO", "TID", i(1)),
+            ],
+        )
+        .expect("TID 查询");
+    assert_eq!(raw, yu_rt::value::Value::Str(b"B".to_vec()));
+}

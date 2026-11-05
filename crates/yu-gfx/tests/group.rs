@@ -29,6 +29,125 @@ fn create(
     )
 }
 
+/// `TEXCOPY` 是官方 PASTESPRITE(`0x42e67f → FUN_0043ccd8 → FUN_0040af1c`),
+/// 不是纹理 blit。像素语义未取证时**不得**把目标层换成空快照并毒化:
+/// 目标层保留原纹理继续绘制,只出 recoverable 诊断(DIV-GFX-007)。
+#[test]
+fn texcopy_keeps_destination_texture_and_layer_drawable() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        create(&table, "SRC", "src", 1, 256),
+        create(&table, "DST", "dst", 2, 256),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "ID2", s("DST")),
+                arg(&table, "CGACT", "TEXCOPY", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let dst = f
+        .layers
+        .iter()
+        .find(|l| l.id.display() == ":/W0/DST")
+        .unwrap();
+    assert!(
+        matches!(&dst.texture, TextureRef::Asset(key) if key == b"dst"),
+        "TEXCOPY 未取证时目标层必须保留原纹理,实际 {:?}",
+        dst.texture
+    );
+    assert!(
+        matches!(dst.status, LayerStatus::Executable),
+        "TEXCOPY 不得毒化目标层(DIV-GFX-007)"
+    );
+    assert!(
+        !f.passes
+            .iter()
+            .any(|p| matches!(&p.target, PassTarget::Texture(id) if id.display() == ":/W0/DST")),
+        "TEXCOPY 不产生空快照 pass"
+    );
+    assert!(
+        f.diagnostics
+            .iter()
+            .any(|d| { d.code == "gfx.copy.unsupported" && d.detail.contains("TEXCOPY") }),
+        "必须显式诊断 PASTESPRITE 未取证,实际 {:?}",
+        f.diagnostics
+    );
+}
+
+/// `TEXSSCOPY` 是官方 GETSS(`0x42e68a → FUN_0043cd6c`),同样不得整层毒化。
+#[test]
+fn texsscopy_keeps_destination_texture_and_layer_drawable() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        create(&table, "SRC", "src", 1, 256),
+        create(&table, "DST", "dst", 2, 256),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "ID2", s("DST")),
+                arg(&table, "CGACT", "TEXSSCOPY", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let dst = f
+        .layers
+        .iter()
+        .find(|l| l.id.display() == ":/W0/DST")
+        .unwrap();
+    assert!(matches!(&dst.texture, TextureRef::Asset(key) if key == b"dst"));
+    assert!(matches!(dst.status, LayerStatus::Executable));
+    assert!(
+        f.diagnostics
+            .iter()
+            .any(|d| { d.code == "gfx.copy.unsupported" && d.detail.contains("TEXSSCOPY") }),
+        "必须显式诊断 GETSS 未取证,实际 {:?}",
+        f.diagnostics
+    );
+}
+
+/// 语料形态:`CGACT[ID=$L1 ID2=$L1 TEXCOPY=1]` 自复制
+/// (`es_Sprite.yst:5604/8884/8956`)。至少不能因命令让该层消失。
+#[test]
+fn texcopy_self_copy_keeps_layer_drawable() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        create(&table, "L1", "sprite", 1, 256),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("L1")),
+                arg(&table, "CGACT", "ID2", s("L1")),
+                arg(&table, "CGACT", "TEXCOPY", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let layer = f
+        .layers
+        .iter()
+        .find(|l| l.id.display() == ":/W0/L1")
+        .unwrap();
+    assert!(matches!(&layer.texture, TextureRef::Asset(key) if key == b"sprite"));
+    assert!(matches!(layer.status, LayerStatus::Executable));
+}
+
 #[test]
 fn copy2_records_snapshot_and_texture_pass() {
     let table = table();
@@ -270,7 +389,7 @@ fn copy_copies_attributes_and_copy2_does_not() {
 }
 
 #[test]
-fn swap2_swaps_textures_only() {
+fn swap_swaps_textures_only() {
     let table = table();
     let mut gfx = state();
     gfx.consume_events(&[
@@ -305,7 +424,7 @@ fn swap2_swaps_textures_only() {
             vec![
                 arg(&table, "CGACT", "ID", s("A")),
                 arg(&table, "CGACT", "ID2", s("B")),
-                arg(&table, "CGACT", "SWAP2", i(1)),
+                arg(&table, "CGACT", "SWAP", i(1)),
             ],
         ),
         frame_end(1),
@@ -323,12 +442,73 @@ fn swap2_swaps_textures_only() {
         .unwrap();
     assert_eq!(a.texture, TextureRef::Asset(b"b".to_vec()));
     assert_eq!(b.texture, TextureRef::Asset(b"a".to_vec()));
-    // FUN_0042f57d:SWAP/SWAP2 都交换 +0x68/+0x70(X/Y)。
+    // REA:SWAP(slot 66)→ FUN_0042f57d 模式 1 = 纹理 + X/Y。
     assert_eq!((a.transform.x, a.transform.y), (33.0, 44.0));
     assert_eq!((b.transform.x, b.transform.y), (11.0, 22.0));
-    // SWAP2 只换图像(+坐标),不换 A。
+    // 模式 1 不换可见属性。
     assert_eq!(a.alpha, 128);
     assert_eq!(b.alpha, 64);
+}
+
+#[test]
+fn swap2_also_swaps_visibility_attributes() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "FILE", s("a")),
+                arg(&table, "CG", "A", i(128)),
+                arg(&table, "CG", "MODE", i(1)),
+                arg(&table, "CG", "T", i(100)),
+                arg(&table, "CG", "TA", i(10)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("B")),
+                arg(&table, "CG", "FILE", s("b")),
+                arg(&table, "CG", "A", i(64)),
+                arg(&table, "CG", "MODE", i(5)),
+                arg(&table, "CG", "T", i(200)),
+                arg(&table, "CG", "TA", i(20)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("A")),
+                arg(&table, "CGACT", "ID2", s("B")),
+                arg(&table, "CGACT", "SWAP2", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let a = f
+        .layers
+        .iter()
+        .find(|l| l.id.display() == ":/W0/A")
+        .unwrap();
+    let b = f
+        .layers
+        .iter()
+        .find(|l| l.id.display() == ":/W0/B")
+        .unwrap();
+    // REA:SWAP2(slot 67)→ 模式 2 = 纹理/X/Y + E/A/T/TA/MODE。
+    assert_eq!(a.alpha, 64);
+    assert_eq!(b.alpha, 128);
+    assert_eq!(a.blend.code(), 5);
+    assert_eq!(b.blend.code(), 1);
+    assert_eq!(a.transition.as_ref().map(|t| (t.t, t.ta)), Some((200, 20)));
+    assert_eq!(b.transition.as_ref().map(|t| (t.t, t.ta)), Some((100, 10)));
 }
 
 #[test]

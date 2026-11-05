@@ -160,7 +160,7 @@ pub struct PipelineCache {
     layout: wgpu::PipelineLayout,
     shader: wgpu::ShaderModule,
     samplers: [wgpu::Sampler; 2],
-    pipelines: BTreeMap<BlendMode, wgpu::RenderPipeline>,
+    pipelines: BTreeMap<(BlendMode, bool), wgpu::RenderPipeline>,
     bind_groups: BTreeMap<(u64, FilterKind), wgpu::BindGroup>,
     /// 双纹理过渡(纹理 + mask + fade uniform)。
     transition_layout: wgpu::BindGroupLayout,
@@ -388,45 +388,45 @@ impl PipelineCache {
                 label: Some("yu-backend-wgpu merge"),
                 source: wgpu::ShaderSource::Wgsl(crate::shaders::MERGE.into()),
             });
-        let layer_merge_layout = ctx
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("yu-backend-wgpu merge layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
+        let layer_merge_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("yu-backend-wgpu merge layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    // binding 2 = 层不透明度 uniform(`[srcLayerAlpha, dstLayerAlpha]`)。
-                    // REA: MERGE `FUN_0043b33c` 只用上层,MERGE2 `FUN_0043b8ec` 两层都用。
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                        // binding 2 = 层不透明度 uniform(`[srcLayerAlpha, dstLayerAlpha]`)。
+                        // REA: MERGE `FUN_0043b33c` 只用上层,MERGE2 `FUN_0043b8ec` 两层都用。
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                ],
-            });
+                    ],
+                });
         let layer_merge_pipeline_layout =
             ctx.device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -441,25 +441,25 @@ impl PipelineCache {
                 label: Some("yu-backend-wgpu composite"),
                 source: wgpu::ShaderSource::Wgsl(crate::shaders::COMPOSITE.into()),
             });
-        let composite_layout = ctx
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("yu-backend-wgpu composite layout"),
-                entries: &[
-                    texture_entry_unfilterable(0),
-                    texture_entry_unfilterable(1),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+        let composite_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("yu-backend-wgpu composite layout"),
+                    entries: &[
+                        texture_entry_unfilterable(0),
+                        texture_entry_unfilterable(1),
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                ],
-            });
+                    ],
+                });
         let composite_pipeline_layout =
             ctx.device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -474,24 +474,24 @@ impl PipelineCache {
                 label: Some("yu-backend-wgpu transform"),
                 source: wgpu::ShaderSource::Wgsl(crate::shaders::TRANSFORM.into()),
             });
-        let transform_layout = ctx
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("yu-backend-wgpu transform layout"),
-                entries: &[
-                    texture_entry_unfilterable(0),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+        let transform_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("yu-backend-wgpu transform layout"),
+                    entries: &[
+                        texture_entry_unfilterable(0),
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                ],
-            });
+                    ],
+                });
         let transform_pipeline_layout =
             ctx.device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -505,24 +505,24 @@ impl PipelineCache {
                 label: Some("yu-backend-wgpu resample"),
                 source: wgpu::ShaderSource::Wgsl(crate::shaders::RESAMPLE.into()),
             });
-        let resample_layout = ctx
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("yu-backend-wgpu resample layout"),
-                entries: &[
-                    texture_entry_unfilterable(0),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+        let resample_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("yu-backend-wgpu resample layout"),
+                    entries: &[
+                        texture_entry_unfilterable(0),
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                ],
-            });
+                    ],
+                });
         let resample_pipeline_layout =
             ctx.device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -629,8 +629,8 @@ impl PipelineCache {
         self.bind_groups.len()
     }
 
-    pub fn pipeline(&self, mode: BlendMode) -> Option<&wgpu::RenderPipeline> {
-        self.pipelines.get(&mode)
+    pub fn pipeline(&self, mode: BlendMode, opaque_tex: bool) -> Option<&wgpu::RenderPipeline> {
+        self.pipelines.get(&(mode, opaque_tex))
     }
 
     pub fn bind_group(&self, texture_id: u64, filter: FilterKind) -> Option<&wgpu::BindGroup> {
@@ -638,8 +638,16 @@ impl PipelineCache {
     }
 
     /// 为某个混合模式建管线;不支持的模式返回 `None`(调用方已跳过)。
-    pub fn ensure_pipeline(&mut self, ctx: &GpuContext, mode: BlendMode) -> Result<bool, Diag> {
-        if self.pipelines.contains_key(&mode) {
+    ///
+    /// `opaque_tex = true` 对应子组 RT:官方 RT alpha 不参与父级合成
+    /// (EVID-J-08),quad 采样时把纹理 alpha 固定为 1。
+    pub fn ensure_pipeline(
+        &mut self,
+        ctx: &GpuContext,
+        mode: BlendMode,
+        opaque_tex: bool,
+    ) -> Result<bool, Diag> {
+        if self.pipelines.contains_key(&(mode, opaque_tex)) {
             return Ok(true);
         }
         let Some(blend) = blend_state(mode) else {
@@ -648,8 +656,15 @@ impl PipelineCache {
         let Some(src_mode) = src_mode(mode) else {
             return Ok(false);
         };
-        let constants = [("SRC_MODE", f64::from(src_mode))];
-        let label = format!("yu-backend-wgpu blend {}", mode.name());
+        let constants = [
+            ("SRC_MODE", f64::from(src_mode)),
+            ("OPAQUE_TEX", if opaque_tex { 1.0 } else { 0.0 }),
+        ];
+        let label = if opaque_tex {
+            format!("yu-backend-wgpu group-opaque blend {}", mode.name())
+        } else {
+            format!("yu-backend-wgpu blend {}", mode.name())
+        };
         let pipeline = ctx.checked(code::TARGET, "渲染管线", || {
             ctx.device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -712,7 +727,7 @@ impl PipelineCache {
                     cache: None,
                 })
         })?;
-        self.pipelines.insert(mode, pipeline);
+        self.pipelines.insert((mode, opaque_tex), pipeline);
         self.total_pipelines_created += 1;
         Ok(true)
     }
@@ -1305,7 +1320,6 @@ impl PipelineCache {
         self.total_bind_groups_created += 1;
         Ok(group)
     }
-
 
     /// 双纹理 MERGE 的 bind group(lower + upper + 层不透明度)。
     ///

@@ -119,7 +119,7 @@ fn solid_black_with_sx_sy_draws_at_that_size() {
 }
 
 #[test]
-fn asset_with_sx_sy_stays_unimplemented() {
+fn asset_with_sx_sy_draws_at_layer_rect() {
     let table = table();
     let mut gfx = state();
     gfx.consume_events(&[
@@ -138,11 +138,22 @@ fn asset_with_sx_sy_stays_unimplemented() {
     ]);
     let f = gfx.frame();
     let l = layer(&f, ":/W0/PIC");
-    assert!(matches!(
-        l.status,
-        LayerStatus::Unimplemented("gfx.image.size.unsupported")
-    ));
+    // 官方 `+0x78/+0x7c` 是绘制目标矩形,纹理由绘制体按矩形缩放;
+    // 不再因“资源图 + 显式尺寸”把整层标不可执行(DIV-GFX-022)。
+    assert!(matches!(l.status, LayerStatus::Executable));
+    assert_eq!(
+        l.image_size(),
+        Some(yu_gfx::SizeU32 {
+            width: 100,
+            height: 50
+        })
+    );
     assert!(f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .any(|o| matches!(o, Op::Layer(x) if x.id.display() == ":/W0/PIC")));
+    assert!(!f
         .diagnostics
         .iter()
         .any(|d| d.code == "gfx.image.size.unsupported"));
@@ -279,17 +290,14 @@ fn font_no_is_recorded_and_bno_selects_style_slot() {
     ]);
     let f = gfx.frame();
     assert_eq!(
-        f.text[0].style.color,
-        0x00FF_FFFF,
+        f.text[0].style.color, 0x00FF_FFFF,
         "槽 0 未被槽 1 的写入污染"
     );
     assert_eq!(f.text[0].style.font_no, Some(3), "槽 0 的 NO 仍在");
     let js = json::to_json(&f);
     assert!(js.contains("\"font_no\":3"));
     assert!(
-        !gfx.diagnostics()
-            .iter()
-            .any(|d| d.detail.contains("BNO")),
+        !gfx.diagnostics().iter().any(|d| d.detail.contains("BNO")),
         "BNO 归类后不得再挂未实现:{:?}",
         gfx.diagnostics()
     );
@@ -316,7 +324,10 @@ fn mode_update_keeps_layer_executable() {
         frame_end(1),
     ]);
     let f = gfx.frame();
-    assert!(matches!(layer(&f, ":/W0/L").status, LayerStatus::Executable));
+    assert!(matches!(
+        layer(&f, ":/W0/L").status,
+        LayerStatus::Executable
+    ));
     assert_eq!(
         layer(&f, ":/W0/L").blend,
         BlendMode::Divide,
@@ -359,16 +370,14 @@ fn persistent_unsupported_attributes_keep_layer_unimplemented() {
             vec![
                 arg(&table, "CG", "ID", s("L")),
                 arg(&table, "CG", "FILE", s("l")),
-                arg(&table, "CG", "MODE", i(3)),
-                // 外部掩码:取值通道(α/亮度)未取证 ⇒ 持久不可执行标记。
-                // 不用 FRZ:0.495 普通绘制体不读 `+0x200`(只走主窗口分支),
-                // 带 FRZ 的普通层仍按已实现几何绘制,不再整层挂号。
-                arg(&table, "CG", "MID", s("mask")),
+                // 手册 MODE 域 0..18;19 超出声明域 ⇒ 无状态可照,持久不可执行。
+                // (MODE 3 走已取证固定管线;MID 自 2026-11-05 起不再毒化整层。)
+                arg(&table, "CG", "MODE", i(19)),
             ],
         ),
         frame_end(1),
     ]);
-    // 只做一次无参数更新,不得把持久 MODE/MID 的不可执行状态洗掉。
+    // 只做一次无参数更新,不得把持久 MODE 的不可执行状态洗掉。
     gfx.consume_events(&[
         frame_start(2),
         call(2, "CG", vec![arg(&table, "CG", "ID", s("L"))]),
@@ -379,6 +388,54 @@ fn persistent_unsupported_attributes_keep_layer_unimplemented() {
         layer(&f, ":/W0/L").status,
         LayerStatus::Unimplemented(_)
     ));
+}
+
+/// `MID` 外部掩码的合成本身未取证,但不得因此让整层消失:
+/// 基图按普通层绘制,`Layer.mask` 保留在帧 JSON,诊断是 recoverable。
+#[test]
+fn mid_keeps_layer_drawable_and_retains_mask() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("L")),
+                arg(&table, "CG", "FILE", s("l")),
+                arg(&table, "CG", "MID", s("mask")),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let l = layer(&f, ":/W0/L");
+    assert!(matches!(l.status, LayerStatus::Executable));
+    assert_eq!(
+        l.mask.as_ref().map(|m| m.display()),
+        Some(":/W0/mask".into())
+    );
+    let screen = f
+        .passes
+        .iter()
+        .find(|p| matches!(&p.target, yu_gfx::PassTarget::Screen))
+        .expect("screen pass");
+    assert!(
+        screen
+            .ops
+            .iter()
+            .any(|op| matches!(op, yu_gfx::Op::Layer(layer) if layer.id.display() == ":/W0/L")),
+        "MID 层必须以普通 Op::Layer 进入屏幕列表,实际 {:?}",
+        screen.ops
+    );
+    assert!(
+        f.diagnostics
+            .iter()
+            .any(|d| d.code == "gfx.mask.unsupported" && d.severity == "Recoverable"),
+        "掩码未取证必须显式诊断,实际 {:?}",
+        f.diagnostics
+    );
 }
 
 #[test]
@@ -1208,10 +1265,7 @@ fn cgend_on_absent_layer_is_idempotent_verbose() {
         frame_end(1),
     ]);
     let f = gfx.frame();
-    let has_warn = f
-        .diagnostics
-        .iter()
-        .any(|d| d.severity == "Recoverable");
+    let has_warn = f.diagnostics.iter().any(|d| d.severity == "Recoverable");
     assert!(!has_warn, "删除不存在的层不应产生 Recoverable 告警");
     let entry = f
         .diagnostics
@@ -1221,17 +1275,15 @@ fn cgend_on_absent_layer_is_idempotent_verbose() {
     assert_eq!(entry.severity, "Verbose", "幂等删除属最低档,默认不显示");
 }
 
-/// `CGINFO[TEX]` 读回 `CG[TEX=]` 写入的值;层不存在时回 0(类型探测语义)。
+/// `CGINFO[TEX]` 读**图层种类**(REA `0x43d962`:`movsx [层+0xa4]`;
+/// 1=图像,2=组);不是 `CG[TEX=]` 的写入值。层不存在时回 0(类型探测语义)。
 ///
-/// 证据:`es_Sprite.yst` 源码
-/// - `CG[ID=... TEX=@_DXMODE]` 写入(`:4091/4144/4396/5280/...`);
-/// - `CGINFO[ID=... TEX=1 LET=@texchk]` 读回(`:3454/4155/5848/7770`);
-/// - `IF[@texchk==2]` 四处的分支注释为「E-moteレイヤなら」⇒ **2 = E-mote**。
-///
+/// `es_Sprite.yst` 四处 `CGINFO[... TEX=1 LET=@texchk]` + `IF[@texchk==2]`
+/// 的注释是「E-moteレイヤなら」——官方 E-mote 层在 `+0xa4` 上也表现为组。
 /// 这四处 ID 由 `$LIDBUF+槽号` 拼出,未装载的槽自然不存在,且中间没有
 /// `EXIST` 前置检查 ⇒ 缺层必须答 0 而不是报 `gfx.info.missing`。
 #[test]
-fn cginfo_tex_reads_back_and_absent_is_zero() {
+fn cginfo_tex_reads_layer_kind_and_absent_is_zero() {
     let table = table();
     let mut gfx = state();
     gfx.consume_events(&[
@@ -1242,7 +1294,17 @@ fn cginfo_tex_reads_back_and_absent_is_zero() {
             vec![
                 arg(&table, "CG", "ID", s("SP")),
                 arg(&table, "CG", "FILE", s("cg/bg/x")),
+                // 官方 `CG[TEX=2]` 无副作用;`CGINFO[TEX]` 读 `+0xa4` 层种类。
                 arg(&table, "CG", "TEX", i(2)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("GRP/")),
+                arg(&table, "CG", "SX", i(10)),
+                arg(&table, "CG", "SY", i(10)),
             ],
         ),
         frame_end(1),
@@ -1256,7 +1318,16 @@ fn cginfo_tex_reads_back_and_absent_is_zero() {
             ],
         )
     };
-    assert_eq!(q(&gfx, "SP").expect("TEX 查询"), yu_rt::value::Value::Int(2));
+    assert_eq!(
+        q(&gfx, "SP").expect("TEX 查询"),
+        yu_rt::value::Value::Int(1),
+        "图像层种类码 = 1(REA 0x43d962 读 [+0xa4])"
+    );
+    assert_eq!(
+        q(&gfx, "GRP/").expect("组 TEX 查询"),
+        yu_rt::value::Value::Int(2),
+        "图层组种类码 = 2"
+    );
     assert_eq!(
         q(&gfx, "NOT_LOADED").expect("缺层 TEX 应回 0 而不是报错"),
         yu_rt::value::Value::Int(0)
@@ -1293,7 +1364,10 @@ fn nonvisual_cg_params_are_archived_without_unimplemented() {
     assert!(diag.is_none(), "非视觉参数不应报 Unimplemented");
     let layer = layer(&f, ":/W0/L");
     assert_eq!(layer.extra.get("LINT"), Some(&yu_gfx::EngineValue::Int(3)));
-    assert_eq!(layer.extra.get("REMALLOC"), Some(&yu_gfx::EngineValue::Int(1)));
+    assert_eq!(
+        layer.extra.get("REMALLOC"),
+        Some(&yu_gfx::EngineValue::Int(1))
+    );
 }
 
 /// `CG[… X+=v]`(参数种类 2)是**增量**,不是赋值。
@@ -1354,4 +1428,150 @@ fn cg_numeric_offset_params_accumulate() {
     assert_eq!(layer.transform.x, 241.75);
     assert_eq!(layer.transform.y, 67.75);
     assert_eq!(layer.alpha, 150);
+}
+
+/// 未取证的图像加工只跳过该 op,**不得**把整层毒化。用 `TRANSITION2`
+/// (ysc 表有槽、内核无执行体)锁住行为:层仍按基图绘制。
+#[test]
+fn unsupported_image_action_keeps_layer_drawable() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("L")),
+                arg(&table, "CG", "FILE", s("pic")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("L")),
+                arg(&table, "CGACT", "TRANSITION2", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let l = layer(&f, ":/W0/L");
+    assert!(matches!(l.status, LayerStatus::Executable));
+    assert!(
+        f.passes
+            .iter()
+            .flat_map(|p| p.ops.iter())
+            .any(|o| matches!(o, Op::Layer(x) if x.id.display() == ":/W0/L")),
+        "未取证的图像动作不得让层从屏幕列表消失"
+    );
+    assert!(f
+        .diagnostics
+        .iter()
+        .any(|d| d.code == "gfx.imageop.unsupported" && d.detail.contains("TRANSITION2")));
+}
+
+/// 官方 `CGINFO` 是顺序 if/else 链(REA `0x43d758..0x43dddf`):多个字段
+/// 同时置位时按固定优先级回答第一个,不是报 `INFO_MULTI`。
+#[test]
+fn cginfo_multi_field_uses_official_priority() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("L")),
+                arg(&table, "CG", "FILE", s("pic")),
+                arg(&table, "CG", "A", i(123)),
+                arg(&table, "CG", "T", i(200)),
+                arg(&table, "CG", "X", i(10)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let q = |flags: &[&str]| {
+        let mut args = vec![arg(&table, "CGINFO", "ID", s("L"))];
+        for name in flags {
+            args.push(arg(&table, "CGINFO", name, i(1)));
+        }
+        gfx.query_info("CGINFO", &args).expect("CGINFO 多字段查询")
+    };
+    // 优先级:E 在 A/T/X 之前。
+    assert_eq!(q(&["X", "T", "A", "E"]), yu_rt::value::Value::Int(1));
+    // A 在 T/X 之前。
+    assert_eq!(q(&["X", "T", "A"]), yu_rt::value::Value::Int(123));
+    // T 在 X/Y 之前(不是声明序)。
+    assert_eq!(q(&["X", "T"]), yu_rt::value::Value::Int(200));
+}
+
+/// `CG[ID=…]` 无 FILE/RID 且层不存在:官方返回 -1,脚本会逐帧轮询。
+/// 诊断按层生命周期只留一条 Verbose;层真正创建后再删除,下一次探测
+/// 才重新留痕。避免把正常轮询变成 WARN 洪峰(kotoneiro 开场单帧 2 万次)。
+#[test]
+fn cg_missing_layer_poll_is_reported_once_as_verbose() {
+    let table = table();
+    let mut gfx = state();
+    let missing = |frame: u64| {
+        call(
+            frame,
+            "CG",
+            vec![arg(&table, "CG", "ID", s("POLL"))],
+        )
+    };
+    gfx.consume_events(&[
+        frame_start(1),
+        missing(1),
+        missing(1),
+        missing(1),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let diag = f
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "gfx.layer.missing" && d.command == "CG")
+        .expect("缺层探测必须留一条诊断");
+    assert_eq!(diag.severity, "Verbose", "正常存在性探测不得刷 WARN");
+    assert_eq!(diag.count, 1, "同一层同帧多次轮询只记一次");
+
+    // 跨帧仍然只记一次。
+    gfx.consume_events(&[frame_start(2), missing(2), frame_end(2)]);
+    let f = gfx.frame();
+    assert!(
+        !f.diagnostics
+            .iter()
+            .any(|d| d.code == "gfx.layer.missing" && d.command == "CG"),
+        "同一层生命周期内不得每帧重复留痕"
+    );
+
+    // 层真正创建后再删除:下一次探测是新的生命周期,允许重新留痕。
+    gfx.consume_events(&[
+        frame_start(3),
+        call(
+            3,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("POLL")),
+                arg(&table, "CG", "FILE", s("p")),
+            ],
+        ),
+        frame_end(3),
+    ]);
+    gfx.consume_events(&[
+        frame_start(4),
+        call(4, "CGEND", vec![arg(&table, "CGEND", "ID", s("POLL"))]),
+        frame_end(4),
+    ]);
+    gfx.consume_events(&[frame_start(5), missing(5), frame_end(5)]);
+    let f = gfx.frame();
+    assert!(
+        f.diagnostics
+            .iter()
+            .any(|d| d.code == "gfx.layer.missing" && d.command == "CG"),
+        "层删除后的新探测必须重新留痕"
+    );
 }

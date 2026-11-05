@@ -152,20 +152,50 @@ fn cginfo_missing_layer_only_answers_exist() {
     assert_eq!(err.code, "gfx.info.missing");
 }
 
+/// 官方 CGINFO 是顺序 if/else 链(`0x43d758..0x43dddf`):多字段同时置位
+/// 时按固定优先级回答第一个,不是报错。
 #[test]
-fn cginfo_multiple_fields_are_rejected_not_guessed() {
+fn cginfo_multiple_fields_use_official_priority() {
     let table = table();
-    let gfx = state();
-    let err = q_err(
-        &gfx,
-        "CGINFO",
-        vec![
-            arg(&table, "CGINFO", "ID", s("X")),
-            arg(&table, "CGINFO", "A", i(1)),
-            arg(&table, "CGINFO", "E", i(1)),
-        ],
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("X")),
+                arg(&table, "CG", "FILE", s("x")),
+                arg(&table, "CG", "A", i(123)),
+                arg(&table, "CG", "E", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    assert_eq!(
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("X")),
+                arg(&table, "CGINFO", "A", i(1)),
+                arg(&table, "CGINFO", "E", i(1)),
+            ],
+        ),
+        Value::Int(1),
+        "E 在 A 之前(官方链顺序)"
     );
-    assert_eq!(err.code, "gfx.info.multi");
+    assert_eq!(
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("X")),
+                arg(&table, "CGINFO", "A", i(1)),
+            ],
+        ),
+        Value::Int(123)
+    );
 }
 
 /// `CGINFO[COLOR]` = **指定坐标**的像素色,打包与 `ONMOUSE` 相同

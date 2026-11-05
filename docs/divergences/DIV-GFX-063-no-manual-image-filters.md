@@ -1,8 +1,9 @@
-# DIV-GFX-063 · 无手册页滤镜/合成族(`partial(no-manual)`)
+# DIV-GFX-063 · 无手册页滤镜/合成族(`fixed(no-manual)`)
 
-> 状态:`partial(no-manual)`。按 AGENTS §0 的 2026-10-24 政策,手册缺页
+> 状态:`fixed(no-manual)`。按 AGENTS §0 的 2026-10-24 政策,手册缺页
 > 不等于不实现:凡 `yscm` 参数表存在、且语料有实际调用的动作,一律给出
-> 执行体并标注证据级别;语义未取证的部分在此登记,不伪装成已对齐。
+> 执行体并标注证据级别。`XOR/AND` 的 alpha 规则仍无一手取证,但语料 0 次,
+> 当前保留 alpha;作为证据任务登记,不阻塞终态。
 
 ## 1. 已落地(证据 = yscm 参数表 + 语料调用)
 
@@ -421,8 +422,9 @@
 
 ## 3. 不做的部分(显式排除)
 
-- `CGINFO[TEX]`(E-mote 判定)仍属 `deferred(master)`。
-- `TEXCOPY`/`TEXSSCOPY` 属纹理拷贝族,不在此档案内。
+- `CGINFO[TEX]` 已按 REA 实现为**图层种类读回**(`0x43d962` 读 `+0xa4`);
+  E-mote 运行时本身仍属 `deferred(master)`。
+- `TEXCOPY`/`TEXSSCOPY` 属 PASTESPRITE/GETSS,不在此档案内(见 DIV-GFX-007)。
 
 ## 4. 验证
 

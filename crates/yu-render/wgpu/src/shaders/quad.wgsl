@@ -23,6 +23,8 @@ struct VsOut {
 };
 
 override SRC_MODE: u32 = 0u;
+/// 1 = 子组 RT:官方 RT alpha 不参与父级合成(EVID-J-08),采样时按不透明。
+override OPAQUE_TEX: u32 = 0u;
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
@@ -35,8 +37,9 @@ fn vs_main(in: VsIn) -> VsOut {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let texel = textureSample(src_texture, src_sampler, in.uv);
+    let texel_a = select(texel.a, 1.0, OPAQUE_TEX == 1u);
     let layer8 = round(in.alpha * 255.0);
-    let texel8 = round(texel.a * 255.0);
+    let texel8 = round(texel_a * 255.0);
     let src8 = round(texel8 * layer8 / 255.0);
     let frag = src8 / 255.0;
     if (SRC_MODE == 0u) {

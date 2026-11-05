@@ -13050,3 +13050,309 @@ cargo test -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu → 全绿
 `render-parity §9/§12.5`、`architecture §5.1`、`title-motion-ledger §2.1`、
 `shader-parity`、`wgpu README` 同步勘误。psD(TA<1 交叉淡化)仍保留管线,
 当前 gfx 不生成该 op。
+
+## 成果 GFX-WAVE1 (2026-11-05) · 收口“整层消失”:TEXCOPY/MID/资源图尺寸
+
+**背景**:第 1 波先解决“未取证字段导致整层不画”。逐项按 REA/语料复核后,
+三处真缺口与一处通用毒化路径落地;像素未取证部分保留显式诊断,不冒充 fixed。
+
+**TEXCOPY/TEXSSCOPY(DIV-GFX-007)**
+- REA(CGACT `0x42c4a4`):slot 68 `0x42e67f` → `FUN_0043ccd8`
+  (**PASTESPRITE**,写全局后调 `FUN_0040af1c` 的 5490 B tile/sprite 粘贴,
+  失败串 `YS_PASTESPRITE Error.`);slot 69 `0x42e68a` → `FUN_0043cd6c`
+  (**GETSS**,BeginScene/过滤 + 分配目标表面写 `[层+0x90]/+0x78/+0x7c`,
+  失败串 `GETSS SetRenderTarget Error 1.`)。两者都不是纹理 blit。
+- 旧实现把目标层换成空 `Snapshot` 并标 `Unimplemented` ⇒ 层永久消失。
+  现保留目标层原纹理/状态,`CopyOp` 只留审计、`frame()` 不发射,
+  发 recoverable `gfx.copy.unsupported`。新档案
+  `docs/divergences/DIV-GFX-007-texcopy-paste-sprite.md`。
+- 语料 3 处自复制(`es_Sprite.yst:5604/8884/8956`)不再让精灵层消失;
+  粘贴/抓屏像素仍 `open(evidence)`。
+
+**MID(DIV-GFX-005)**
+- 不再 `mark_param_unimplemented`;`Layer.mask` 保留在帧 JSON,
+  `op_for_layer` 改按普通 `Op::Layer` 绘制基图;设置时发 recoverable
+  `gfx.mask.unsupported`。掩码合成仍待通道/尺寸/采样取证。
+
+**图像层显式尺寸(DIV-GFX-022)**
+- 删除 `apply_layer_params` 对“非黑图 + SX/SY”的
+  `gfx.image.size.unsupported` 毒化。层矩形 `+0x78/+0x7c` 直接保存,
+  Asset/Snapshot/Movie 由 soft/wgpu 按矩形缩放;单边尺寸缺省轴按当前
+  矩形/引擎构造默认 1,只留 recoverable 诊断。
+
+**通用:未取证图像动作不再毒化整层**
+- `cgact_image` 失败时不再把源/目标层 `texture_status` 置 Unimplemented;
+  只跳过该 `ImageOp` 并诊断,层按已有基图/先前加工结果继续绘制。
+  `TRANSITION2` 等无执行体动作因此不再让层从屏幕列表消失。
+
+**验证(原始结果)**
+```text
+cargo test -p yu-gfx --all-targets
+  group: 20 passed; parity_fixes: 28 passed; 其余套件原样通过
+  新增:texcopy_keeps_destination_texture_and_layer_drawable /
+        texsscopy_keeps_destination_texture_and_layer_drawable /
+        texcopy_self_copy_keeps_layer_drawable /
+        mid_keeps_layer_drawable_and_retains_mask /
+        asset_with_sx_sy_draws_at_layer_rect /
+        unsupported_image_action_keeps_layer_drawable
+cargo test -p yu-backend-soft --test render
+  19 passed(新增 asset_with_explicit_size_is_scaled_not_skipped)
+```
+
+**台账**:`docs/gfx-unimplemented-todo.md` 005/007/022、
+`crates/yu-gfx/docs/divergences/README.md` 同三行、`docs/render-parity.md`
+§3.4/§8/§12.5/§12.6 与勘误表同步;新增 DIV-GFX-007 档案。
+**未动**:`case --all` 的既有红(本轮前已存在),未改 golden;
+`RID`/多部件/组 ONMOUSE/INFO 多字段仍 `open(evidence)`。
+
+## 成果 GFX-072-8 (2026-11-05) · 已删源层的加工链随同帧 COPY 重放
+
+**根因**:`frame()` 只为“本帧仍有图像消费者”的已删层重放加工链;COPY 消费者
+不在闭包内。源层被 `CGEND` 后,COPY 回放只能取命令时刻的 `source_texture`
+(基图),丢掉同帧先做的 `RECTPAINT/SIZE/MEERGE` 等结果。
+
+**改动**(`crates/yu-gfx/src/state.rs`):
+- 在 `baked_flags` 计算前,把目标仍持有快照的 `Copy/Copy2` 的已删 `Layer`
+  源 id 播种进 `needed_sources`;
+- 已删目标的烘焙判定加入 `!needed_sources.contains(target)` ⇒ 即使该层
+  在更早帧烘焙过,只要本帧 COPY 仍要读,就重放加工链。
+- 未改动 COPY 命令时刻语义/区域/快照冻结。
+
+**验证**:
+```text
+cargo test -p yu-backend-soft --test render
+  20 passed; 新增 copy_after_processing_survives_source_cg_end
+  (SRC 红图 → RECTPAINT 绿 → COPY2 → CGEND → SNAP;断言加工 pass 发射且
+   SNAP 像素=绿,未修时为基图红)
+```
+
+## 成果 GFX-TEX-KIND (2026-11-05) · `CGINFO[TEX]` 修正为图层种类读回
+
+**勘误**:旧台账/实现把 `TEX` 当作 `CG[TEX=]` 的可写表面类型码并由
+`CGINFO[TEX]` 回读。REA 0.495:
+- `CGINFO` 的 TEX 分支 `0x43d962` 直接 `movsx ecx, byte [层+0xa4]` ⇒
+  返回**图层种类**(1=图像/2=组/0=已删);
+- `CG` 处理体 `0x42b072` 仅 `TEX == 1` 进入 `0x42baa5`(空层转图像层 +
+  `0x40ae99`),其它值无副作用。
+
+**改动**:`query_cginfo["TEX"]` 返回 `LayerKind` 码;`CG[TEX=]` 原值仅留
+`extra`/`tex` 审计;用例改为断言图像层=1、组=2、缺层=0。
+`es_Sprite` 的 `IF[@texchk==2]` 语义不变(官方 E-mote 层在 `+0xa4` 上为组),
+E-mote 运行时仍 `deferred(master)`。
+
+**验证**:`cargo test -p yu-gfx --all-targets` 全绿
+(`cginfo_tex_reads_layer_kind_and_absent_is_zero`)。
+**台账**:DIV-GFX-011、DIV-GFX-046/061/063 的 TEX 口径同步。
+
+## 成果 GFX-INFO25 (2026-11-05) · CGINFO 多字段按官方 if/else 优先级回答
+
+**REA**:CGINFO 处理体 `0x43d758..0x43dddf` 是顺序 if/else 链:每个字段
+`movzx ecx,[0x684160+idx]; test; je next`,第一个置位字段跳到公共
+`0x43dde6` 写 LET 后返回。顺序为
+`EXIST→E→A→T→TID→TA→X→Y→Z→MODE→SX→SY→FX→FY→FBX→FBY→FEX→FEY→FEZ→TEX→
+ONMOUSE→ONMOUSE2→ONMOUSE3→COLOR→TRIM→LINT→LINT2`(MFILE 不在该链)。
+**改动**:`query_cginfo` 用 `first_flag` 按该顺序取第一个置位项,不再对
+多字段一律报 `INFO_MULTI`;FONTINFO/WINDOWINFO 保持单字段拒绝。
+**验证**:`cargo test -p yu-gfx --test parity_fixes
+cginfo_multi_field_uses_official_priority` 通过(E/A/T/X 组合按优先级回答)。
+**台账**:DIV-GFX-025 改 `fixed(no-manual;CGINFO)`。
+
+## 成果 GFX-SWAP32 (2026-11-05) · SWAP/SWAP2 按引擎调用点对齐(手册相反)
+
+**REA**:CGACT 处理体 `0x42e661`/`0x42e670`:
+- slot 66 `SWAP` → `0x42f2ac` → `call 0x42f57d` 时 `ecx=1`(只换纹理与
+  `+0x68/+0x70`,不换可见属性);
+- slot 67 `SWAP2` → `0x42f1e3` → `ecx=2`(额外换
+  `+0x89(E)/+0x80(A)/+0x82(T)/+0x84(TA)/+0x87(MODE)`)。
+手册写 `SWAP=图像+属性、SWAP2=仅图像`,与引擎相反;按真值层级取引擎。
+
+**改动**:`apply_cgact` 的 SWAP/SWAP2 `image_only` 取反;`cgact_swap` 注释
+改 `fixed`。用例:
+`swap_swaps_textures_only`(A 不变)、`swap2_also_swaps_visibility_attributes`
+(A/MODE/T/TA 交换)、`swap_exchanges_layer_texts`(文本随表面交换)。
+**台账**:DIV-GFX-032 改 `fixed(no-manual)`。
+
+## 成果 GFX-TIDNO (2026-11-05) · TIDNO 按官方 `TID.N` 解析
+
+**REA**:CG 处理体 `0x42a8e3..0x42a936`:TID 字符串拷入缓冲后,追加常量
+`0x808354`(字节 `2e`,即 `"."`),再 `__ultoa` 基数 10 ⇒ 配对键 =
+`TID + "." + N`。与 IDNO(`YMV`/CGACT 同型块)一致。
+**改动**:`Transition` 增 `tid_no`;`CG[TIDNO]` 不再报 Unimplemented;
+`apply_layer_params` 在参数处理完后统一按 `tid_raw + tid_no` 重建
+`t.tid`(空 TID 清配对);`CGINFO[TID]` 仍返回原文。
+**验证**:`cargo test -p yu-gfx --test transition
+tidno_appends_decimal_suffix_for_pairing` 通过(`B` + `TIDNO=2` 命中
+`:/W0/B.2`,过渡 `to` = 该层纹理)。
+**台账**:DIV-GFX-030 改 `fixed(no-manual)`;语料 0 次使用。
+
+## 成果 GFX-MID (2026-11-05) · MID 外部掩码按官方 `target.a = mask.R` 落地
+
+**REA**(CG 处理体 `0x42a801..0x42a8a4`):
+- 解析 `MID`(slot 35,标志 `0x684183`)→ 路径规范化 + 查层表;
+- 要求 mask 层与目标层 `+0x78/+0x7c` 宽高**相等**,不等走错误分支;
+- 逐像素 `target[+0x90][i*4+3] = mask[+0x90][i*4]`(mask 的 R → target 的 A,
+  RGB 不动),最后置 target `+0x86=1`。
+
+**实现**:
+- `CG[MID]` 记录为 `mask_alpha` 合成 op(命令序、可折叠),目标层
+  `alpha_aware=true`;
+- soft:`apply_image_op` 的合成族分支检查尺寸后写 alpha;
+- wgpu:`composite.wgsl` mode 3 = `vec4(lower.rgb, upper.r)`;
+- 缺 mask/尺寸不等时保留基图 + recoverable `gfx.mask.unsupported`,不整层跳过;
+- 组图层 mask 仍 open(evidence)(与 041 同族)。
+
+**验证**:
+```text
+cargo test -p yu-backend-soft --test render mid_uses_mask
+  mid_uses_mask_red_channel_as_layer_alpha ... ok
+cargo test -p yu-backend-wgpu --test wgpu mid_mask_red
+  mid_mask_red_channel_matches_soft ... ok(GPU/soft RGBA 逐字节一致)
+cargo test -p yu-gfx --all-targets → 全绿
+```
+**台账**:DIV-GFX-005 改 `fixed(no-manual;图像层)`,新增
+`docs/divergences/DIV-GFX-005-mid-mask-alpha.md`。
+
+## 成果 GFX-VERIFY (2026-11-05) · gfx 收口批次全量验证
+
+**范围**:本轮 TEXCOPY/MID/资源图尺寸/072-8/CGINFO-TEX/多字段/TIDNO/SWAP
+改动后的构建与测试。
+
+```text
+cargo build --workspace --all-targets            → Finished(exit 0)
+cargo test -p yu-gfx --all-targets               → 全绿
+cargo test -p yu-backend-soft --test render      → 21 passed
+cargo test -p yu-backend-wgpu --test wgpu        → 37 passed
+cargo test --workspace --all-targets(全样本 env)
+  → 187 个 test result;仅既有 yu-sound 2 条 gated_ogg_* 失败
+    (PROGRESS 既有记录,非本轮 gfx 路径);未注入 SDK0495 时
+    yu-save official_dno3 按设计显式报错,注入后单跑通过。
+yu-cli case first-screen
+  → 与改动前完全一致(ops 75 / skipped 0 / 同 sha);既有失败未新增。
+```
+
+**说明**:`case --all` 基线在改动前已红(5+ 条),本轮未改 golden;
+待 041/042/060 等官方证据到位后统一处理。
+
+## 成果 GFX-041 (2026-11-05) · 子组 RT alpha 不参与父级合成
+
+**证据**:EVID-J-08 微场景(subgroup `G/K2 A=128` → `(0,128,0)`,
+根层 `K1 A=128` → `(16,160,48)`)。
+**实现**:
+- soft:每个 `Offscreen` pass 合成完后把表面 alpha 固定为 255;
+- wgpu:`DrawKind::GroupQuad` + quad shader 的 `OPAQUE_TEX=1` 管线变体;
+  管线缓存键改为 `(BlendMode, opaque_tex)`,普通图层不受影响。
+**验证**:
+```text
+cargo test -p yu-backend-soft --test render subgroup_rt_alpha
+  subgroup_rt_alpha_is_opaque_in_parent_composite ... ok
+cargo test -p yu-backend-wgpu --test wgpu subgroup_rt_alpha
+  subgroup_rt_alpha_is_opaque_on_gpu_and_matches_soft ... ok(GPU/soft 逐字节一致)
+```
+**台账**:DIV-GFX-041 改 `fixed(no-manual)`;render-parity §8 同步。
+
+## 成果 GFX-016 (2026-11-05) · CG 无 FILE 且层不存在不再建鬼层
+
+**REA**:CG 处理体 `0x42a63d` 层表查找失败 → `0x42bd1e xor ebp,ebp` →
+`0x42bbef test ebp,ebp; jne 0x42a73f`,否则 `-1` 返回。即无 FILE/RID 且
+层不存在时**不建节点**;只有 `FILE`(含 `""` 1×1 黑图)或 `RID` 建层。
+**改动**:`apply_cg` 删除无条件 get-or-create;无 FILE/RID 时只发
+recoverable `gfx.layer.missing` 并返回。`FILE=""` 路径不变。
+**验证**:`cargo test -p yu-gfx --all-targets` 全绿。
+**台账**:DIV-GFX-016 改 `fixed(no-manual)`;render-parity §3.4 同步。
+
+## 成果 GFX-CLOSE-BATCH2 (2026-11-05) · 台账终态收口(028/031/048/018/037/009/010/063/064)
+
+**代码/语义**:
+- `DIV-GFX-031`:非 TRANSITION 的 ID3/ID4 在官方**不读取**;由 Unimplemented
+  改为 verbose 留痕,不再把合法参数报成缺口。
+- `DIV-GFX-016`:`CG` 无 FILE/RID 且层不存在时不再建鬼层(REA 返回 -1);
+  `FILE=""` 路径不变。
+- `DIV-GFX-041`:子组 RT alpha 不参与父级合成(soft 末强制 255 /
+  wgpu `OPAQUE_TEX` 管线),GPU/soft 逐字节一致。
+- `DIV-GFX-028/048/018/037/009/010/063/064`:按已有 REA/手册/用例改终态,
+  明细见 `docs/tasks/task-gfx-closeout-audit.md` §9/§11。
+
+**验证**:
+```text
+cargo test -p yu-gfx --all-targets       → 全绿
+cargo test -p yu-backend-soft --test render → 22 passed
+cargo test -p yu-backend-wgpu --test wgpu   → 38 passed
+cargo build --workspace --all-targets       → Finished
+```
+
+**剩余(明确 evidence)**:042 半像素(缺官方 1px oracle)、060 空 FILE
+(缺官方微场景)、024 PSB provider、026 组 ONMOUSE 像素面、038 INFO 缺失
+语义、072 §9/056/057/075(文本线)。
+
+## 成果 GFX-CLOSEOUT (2026-11-05) · gfx 台账终态复核与全量验证
+
+**终态**:001–076 除下列明确 evidence 项外,全部落入 `fixed` /
+`fixed(no-manual)` / `aligned-stub` / `unsupported-by-official` /
+`deferred(master, E-mote)`;代码中运行期 `LayerStatus::Unimplemented`
+毒化路径已清空(仅不可达 `parts` 与非法 MODE 保留显式诊断)。
+
+**保留 open(evidence)**:
+- 042 半像素(缺官方 1px oracle;REA `x0=X-0.5` 已锚定);
+- 060 空 FILE 1×1(缺官方微场景中心像素);
+- 024 PSB/资源头 provider;026 组/离屏 ONMOUSE 像素面;
+- 038 INFO 缺失层非 EXIST 返回语义;
+- 072 §9 / 076 通用文字-图像命令序、056/057/075(文本线)。
+
+**最终验证**:
+```text
+cargo build --workspace --all-targets        → exit 0
+cargo test -p yu-gfx --all-targets           → 全绿
+cargo test -p yu-backend-soft --test render  → 22 passed
+cargo test -p yu-backend-wgpu --test wgpu    → 38 passed
+probe_skips 600(soft)                    → 无 skip;结束帧无 Unimplemented
+first-screen case                        → ops 75 / skipped 0;sha 因 016/041
+                                            的官方修正变化,未改 golden
+```
+**台账**:`docs/tasks/task-gfx-closeout-audit.md` §12;DIV-GFX-005/007 新档案;
+DIV 表与 render-parity 同步。
+
+## 成果 PERF-GFX-POLL (2026-11-05) · <game-b> 轮询日志尖峰收口 + MID 后端口径审查
+
+**症状(主人)**:<game-b> 出现性能尖峰,要求排查并做推送前代码审阅。
+
+**实测(桌面 wgpu,release,同机同口径)**:
+
+```text
+修复前 240 帧:
+  interval p50=16.66ms p95=17.06 max=149.90ms
+  gfx.layer.missing 告警行 162(含 x201 聚合,单帧实际 2 万次 CG 轮询)
+修复后 240 帧:
+  interval p50=16.64ms p95=17.07 max=116.72ms
+  gfx.layer.missing 告警行 3(每层生命周期一条 Verbose)
+```
+
+**根因与改动**:
+- `CG[ID]` 无 FILE/RID 且层不存在时,官方返回 -1;<game-b>
+  `es_scenario.yst` 把它当存在性探测逐帧轮询(`s66 pc245` 单帧 2 万次)。
+  旧实现每次都构造 WARN 诊断;改为 `missing_cg_reported` 按层去重 +
+  `error::verbose`,层真正创建后移除记录、删除后再探测才重新留痕。
+  行为不变(仍不建鬼层),只收口日志与字符串分配。
+- 审阅发现 wgpu `MID` 只做了 shader 合成,缺少 soft 已有的实际纹理宽高
+  一致性检查;层声明尺寸未知时 gfx 无法提前判定,尺寸不等会被 wgpu
+  拉伸而 soft 跳过。补 `gfx.mask.size.mismatch`,两后端统一 skipped=1。
+- debug 构建的屏幕 alpha 归一 `force_opaque` 用 `chunks_exact_mut(4)` 逐
+  像素迭代,opt-level 0 下实测 9ms/帧;改为每 64 字节一次写 16 个 alpha,
+  同机微基准 9.2ms → 0.6ms,像素结果逐字节相同。<game-b> debug
+  240 帧:interval p50 33.23 → **16.86ms**,p95 50.19 → **33.69ms**。
+
+**测试夹具修正**:`yu-engine/tests/text_sync.rs` 的自动文本层夹具原先
+依赖“`CG` 无 FILE 也建鬼层”,与 REA `0x42a63d..0x42bbef` 冲突;现改为
+显式 `CG[FILE=""]`(官方 1×1 黑图建层),断言不变。
+
+**验证**:
+```text
+cargo test -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu -p yu-engine
+  → 全绿(parity_fixes 31、wgpu 39、text_sync 2,其余各 suite 全 passed)
+cargo test -p yu-rt(带 YURIS_SAMPLE_* 环境)
+  → 89/4/11/4/115/3 全 passed
+<game-b> 复测:见上表;release p50=16.64ms,debug p50=16.86ms
+```
+
+**审阅结论**:本轮 gfx 改动未发现新的硬编码路径/绝对路径/调试输出;
+保留项仍是 042/060/024/026/038/072§9 等 evidence 项(见
+`docs/tasks/task-gfx-closeout-audit.md` §12)。

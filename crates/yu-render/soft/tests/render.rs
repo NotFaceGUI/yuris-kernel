@@ -39,7 +39,7 @@ fn table() -> ParamTable {
             command(
                 "CG",
                 &[
-                    "ID", "FILE", "E", "A", "X", "Y", "Z", "SX", "SY", "MODE", "FBX", "FBY",
+                    "ID", "FILE", "E", "A", "X", "Y", "Z", "SX", "SY", "MODE", "FBX", "FBY", "MID",
                 ],
             ),
             command("CGEND", &["ID"]),
@@ -144,6 +144,46 @@ fn texture_store(entries: &[(&[u8], Vec<u8>)]) -> TextureStore {
         source.insert(path, bytes.clone()).expect("insert");
     }
     TextureStore::new(Box::new(source), Codec::Cp932, vec![ImageFormat::Png])
+}
+
+/// `CG[FILE=资产 SX/SY]`:官方 `+0x78/+0x7c` 是绘制目标矩形,纹理按矩形
+/// 缩放(DIV-GFX-022)。旧内核会把该层标 `gfx.image.size.unsupported` 整层
+/// 跳过;本用例锁住“1×1 红图 → 4×4 红块”的可见结果。
+#[test]
+fn asset_with_explicit_size_is_scaled_not_skipped() {
+    let table = table();
+    let mut gfx = state(Viewport::new(8, 8), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"A".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"red".to_vec())),
+                arg(&table, "CG", "X", Value::Int(0)),
+                arg(&table, "CG", "Y", Value::Int(0)),
+                arg(&table, "CG", "SX", Value::Int(4)),
+                arg(&table, "CG", "SY", Value::Int(4)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let store = texture_store(&[(b"red.png", png_bytes_for(Rgba([255, 0, 0, 255])))]);
+    let mut backend = SoftRenderer::new(store);
+    let out = backend.render_frame(&frame);
+    assert_eq!(out.report.skipped_ops_total, 0, "不得整层跳过");
+    for y in 0..4 {
+        for x in 0..4 {
+            assert_eq!(
+                out.surface.pixel(x, y),
+                Some([255, 0, 0, 255]),
+                "1×1 红图应按 SX/SY 铺满 4×4,差在 ({x},{y})"
+            );
+        }
+    }
+    assert_eq!(out.surface.pixel(4, 4), Some([255, 255, 255, 255]));
 }
 
 #[test]
@@ -1122,5 +1162,199 @@ fn screen_snapshot_carries_image_processed_layer() {
         out.surface.pixel(0, 0),
         Some([255, 0, 0, 255]),
         "COPY2 :/W0/ 必须携带命令时刻已经 RECTPAINT 的层像素"
+    );
+}
+
+/// DIV-GFX-072 §1-8:源层在同帧被 `CGEND` 删除,但 COPY2 已经在命令时刻
+/// 读过它。回放 COPY 时必须取**加工后**像素(RECTPAINT 绿),不能退回基图红。
+#[test]
+fn copy_after_processing_survives_source_cg_end() {
+    let table = table();
+    let backend_textures =
+        texture_store(&[(b"red.png", png_bytes_for_wh(4, 4, Rgba([255, 0, 0, 255])))]);
+    let mut gfx = state(Viewport::new(4, 4), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"SRC".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"red".to_vec())),
+                arg(&table, "CG", "Z", Value::Int(1)),
+                arg(&table, "CG", "A", Value::Int(256)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"SRC".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0x00ff00)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"SRC".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"SNAP".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "CGEND",
+            vec![arg(&table, "CGEND", "ID", Value::Str(b"SRC".to_vec()))],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"SNAP".to_vec())),
+                arg(&table, "CG", "Z", Value::Int(10)),
+                arg(&table, "CG", "A", Value::Int(256)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    // 判别点:源层的 RECTPAINT 加工 pass 必须在帧内被发射(否则 COPY 只能
+    // 退回命令时刻的红色基图)。
+    assert!(
+        frame.passes.iter().any(|p| {
+            matches!(&p.target, yu_gfx::PassTarget::Texture(id)
+                if id.display() == ":/W0/SRC")
+                && p.ops.iter().any(|op| matches!(op, yu_gfx::Op::Image(_)))
+        }),
+        "已删源层的加工链必须为本帧 COPY 重放"
+    );
+    let mut backend = SoftRenderer::new(backend_textures);
+    let out = backend.render_frame(&frame);
+    assert_eq!(
+        out.surface.pixel(0, 0),
+        Some([0, 255, 0, 255]),
+        "源层已 CGEND 时 COPY 仍必须取命令时刻的加工后像素(绿),不是基图(红)"
+    );
+}
+
+/// `CG[MID]`:REA `0x42a862..0x42a88c` 要求两层宽高相等,逐像素
+/// `target.a = mask.r`(RGB 不动)。mask 左上 R=0 ⇒ 该像素透明;
+/// 其余 R=255 ⇒ 保持红色不透明。
+#[test]
+fn mid_uses_mask_red_channel_as_layer_alpha() {
+    let table = table();
+    let mut mask = RgbaImage::new(2, 2);
+    mask.put_pixel(0, 0, Rgba([0, 9, 9, 255]));
+    for y in 0..2 {
+        for x in 0..2 {
+            if (x, y) != (0, 0) {
+                mask.put_pixel(x, y, Rgba([255, 9, 9, 255]));
+            }
+        }
+    }
+    let mut mask_png = Vec::new();
+    PngEncoder::new(&mut mask_png)
+        .write_image(mask.as_raw(), 2, 2, ExtendedColorType::Rgba8)
+        .expect("encode mask");
+    let store = texture_store(&[
+        (b"red.png", png_bytes_for_wh(2, 2, Rgba([255, 0, 0, 255]))),
+        (b"mask.png", mask_png),
+    ]);
+    let mut gfx = state(Viewport::new(2, 2), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"L".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"red".to_vec())),
+                arg(&table, "CG", "SX", Value::Int(2)),
+                arg(&table, "CG", "SY", Value::Int(2)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"M".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"mask".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+                arg(&table, "CG", "SX", Value::Int(2)),
+                arg(&table, "CG", "SY", Value::Int(2)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"L".to_vec())),
+                arg(&table, "CG", "MID", Value::Str(b"M".to_vec())),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let mask_op = frame
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|op| match op {
+            yu_gfx::Op::Image(i) if i.action.name() == "mask_alpha" => Some(i),
+            _ => None,
+        })
+        .expect("MID 必须记录 mask_alpha 合成 op");
+    assert_eq!(mask_op.status, yu_gfx::OpStatus::Executable);
+    let mut backend = SoftRenderer::new(store);
+    let out = backend.render_frame(&frame);
+    assert_eq!(out.report.skipped_ops_total, 0);
+    assert_eq!(
+        out.surface.pixel(0, 0),
+        Some([0, 0, 0, 255]),
+        "mask R=0 ⇒ 层 alpha 0,只剩不透明黑底"
+    );
+    assert_eq!(out.surface.pixel(1, 0), Some([255, 0, 0, 255]));
+    assert_eq!(out.surface.pixel(1, 1), Some([255, 0, 0, 255]));
+}
+
+/// EVID-J-08:子组 RT 的 alpha 不参与父级合成。组内 `K A=128` 的绿色先与
+/// 黑底混合成 `(0,128,0)`,组再按自身 A(256)合成;不会在父级再乘一次 128。
+#[test]
+fn subgroup_rt_alpha_is_opaque_in_parent_composite() {
+    let table = table();
+    let store = texture_store(&[(b"green.png", png_bytes_for_wh(4, 4, Rgba([0, 255, 0, 255])))]);
+    let mut gfx = state(Viewport::new(4, 4), [32, 64, 96, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"G/".to_vec())),
+                arg(&table, "CG", "SX", Value::Int(4)),
+                arg(&table, "CG", "SY", Value::Int(4)),
+                arg(&table, "CG", "A", Value::Int(256)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"G/K".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"green".to_vec())),
+                arg(&table, "CG", "A", Value::Int(128)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let mut backend = SoftRenderer::new(store);
+    let out = backend.render_frame(&frame);
+    assert_eq!(
+        out.surface.pixel(1, 1),
+        Some([0, 128, 0, 255]),
+        "子组 RT alpha 必须按不透明处理(EVID-J-08)"
     );
 }

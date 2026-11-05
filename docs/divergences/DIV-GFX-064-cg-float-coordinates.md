@@ -1,6 +1,7 @@
 # DIV-GFX-064 · `CG`/`CGACT` 浮点坐标的规约点(亚像素 vs 取整)
 
-- 状态:**partially-confirmed**(种类 2 的序言与消费点均已由 REA 定案;浮点规约指令未定位)
+- 状态:**fixed(no-manual)**(种类 2 的序言与消费点已由 REA 定案;具体 f64→i64
+  指令未定位,但可观测位置连续性已由语料自证 + 实机 trace 对齐;内核保留 f64 到顶点)
 - 取证对象:官方 `0.495` `yu-ris.exe`(`CG` 处理体 `FUN_0042f809`),
   语料 `ERIS/Sprite/es_Sprite.yst`
 

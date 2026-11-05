@@ -947,6 +947,10 @@ pub struct Transition {
     pub tid: Option<LayerId>,
     /// 脚本原样给的 `TID` 字符串(引擎 `+0x4c` 保存原文,CGINFO 查询返回它)。
     pub tid_raw: Option<Vec<u8>>,
+    /// `TIDNO` 十进制后缀(REA CG 处理体 `0x42a8e3..0x42a936`:
+    /// 先追加常量 `0x808354` = `"."`,再 `__ultoa` 基数 10)。
+    /// 与 `TID` 组合成 `TID + "." + N` 后查配对层。
+    pub tid_no: Option<i64>,
 }
 
 impl Default for Transition {
@@ -956,6 +960,7 @@ impl Default for Transition {
             ta: 0,
             tid: None,
             tid_raw: None,
+            tid_no: None,
         }
     }
 }
@@ -1071,17 +1076,12 @@ pub struct Layer {
     pub transition: Option<Transition>,
     /// 范围裁剪(目前只由显式数据填充;组尺寸由离屏 RT 天然裁剪)。
     pub clip: Option<RectI>,
-    /// `TEX`:`CG` 写入、`CGINFO[TEX]` 读回的表面类型码。
+    /// `CG[TEX=]` 的**写入值留档**(不是 `CGINFO[TEX]` 的读回源)。
     ///
-    /// 证据(`es_Sprite.yst` **源码**,非编译产物):
-    /// - `CG[ID=... TEX=@_DXMODE]` 在建层时写入(`:4091/4144/4396/5280/...`);
-    /// - `CGINFO[ID=... TEX=1 LET=@texchk]` 随后读回(`:3454/4155/5848/7770`);
-    /// - `IF[@texchk==2]` 的四处分支注释为「E-moteレイヤなら」⇒ **2 = E-mote 层**。
-    ///
-    /// 语料里**没有任何脚本**把 `TEX` 设成 2(E-mote 由引擎装载时置位);
-    /// 本内核 E-mote 属 `deferred(master)`,故该字段只会是 `CG[TEX=]` 的显式
-    /// 值(语料中恒为 `@_DXMODE` = 0)。未设置 = 0:层对象零初始化,语义即
-    /// 「非 E-mote、非纹理化」。
+    /// REA 0.495:`CGINFO[TEX]` 分支 `0x43d962` 直接 `movsx byte [层+0xa4]`
+    /// —— 读的是**图层种类**(1=图像,2=组),不是本字段。`CG[TEX=1]` 在
+    /// 官方 CG 处理体 `0x42baa5` 是“把空层转成图像层”的动作,其它值无
+    /// 副作用。本内核保留原值仅供 trace/JSON 审计;不要用它回答 INFO。
     pub tex: i64,
     /// 官方 `[层+0x86]`:该层像素**带需要处理的 alpha**(逐层标志)。
     ///

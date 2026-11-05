@@ -548,7 +548,11 @@ impl LayerSurfaces {
     }
 
     fn drop_pool(&mut self) {
-        self.dropped_pooled += self.pool.values().map(|list| list.len() as u64).sum::<u64>();
+        self.dropped_pooled += self
+            .pool
+            .values()
+            .map(|list| list.len() as u64)
+            .sum::<u64>();
         self.pool.clear();
         self.pooled_bytes = 0;
     }
@@ -604,7 +608,6 @@ impl LayerSurfaces {
     pub fn bump_hash(&mut self) -> u64 {
         self.next_hash()
     }
-
 }
 
 /// 一帧的图层内容视图(`LayerId → Content`;命令序推进时同步更新)。

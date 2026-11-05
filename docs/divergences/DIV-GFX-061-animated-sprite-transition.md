@@ -132,5 +132,6 @@ VARACT[CUT=1 SET=$TX.TASK POS=@mPos LENGTH=@lenA]
 
 - `SIZE3/5` 与 `SIZE2` 的**滤波差异**(`partial(no-manual)`,按双线性代用);
 - `TRANSITION` 的 `SET` 在动画端取值范围实测确认(当前按 0..256 夹紧);
-- `CGINFO[TEX]`(`es_Sprite.yst:3454/4155/5848/7770` 的 E-mote 判定)仍未实现,
-  属 E-mote 家族,维持 `deferred(master)`。
+- `CGINFO[TEX]`(`es_Sprite.yst:3454/4155/5848/7770`)已按 REA 实现为
+  **图层种类读回**(`0x43d962` 读 `+0xa4`,1=图像/2=组);E-mote 运行时
+  本身维持 `deferred(master)`。

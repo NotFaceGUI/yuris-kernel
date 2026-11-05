@@ -233,10 +233,7 @@ impl TextureCache {
             .map(|s| s.id);
         let id = match reusable {
             Some(id) => {
-                let texture = self
-                    .textures
-                    .get(&id)
-                    .expect("movie slot texture tracked");
+                let texture = self.textures.get(&id).expect("movie slot texture tracked");
                 let upload = wgpu::TexelCopyTextureInfo {
                     texture: &texture.texture,
                     mip_level: 0,
@@ -261,9 +258,8 @@ impl TextureCache {
             }
             None => {
                 let new_id = self.upload(ctx, width, height, bytes, "movie frame")?;
-                self.total_upload_bytes = self
-                    .total_upload_bytes
-                    .saturating_add(bytes.len() as u64);
+                self.total_upload_bytes =
+                    self.total_upload_bytes.saturating_add(bytes.len() as u64);
                 if let Some(old) = self
                     .movie_slots
                     .get(asset)

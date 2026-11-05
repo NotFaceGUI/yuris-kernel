@@ -55,7 +55,12 @@ fn auto_project() -> ProjectBuilder {
     let mut b = base();
     let text = |slot: u8, payload: Vec<u8>| GroupSpec::new(OP_TEXT).window(slot, payload);
     b.scripts = vec![vec![
-        GroupSpec::new(OP_CG).window(0, ex::s("MSG")),
+        // 官方 `CG` 无 FILE/RID 且层不存在 ⇒ 返回 -1,不建节点
+        // (REA `0x42a63d..0x42bbef`)。文本目标层必须由脚本显式创建;
+        // `FILE=""` 是官方 1×1 黑图建层路径。
+        GroupSpec::new(OP_CG)
+            .window(0, ex::s("MSG"))
+            .window(2, ex::s("")),
         text(0, ex::s("MSG")),
         GroupSpec::new(OP_WORD).window(0, b"A".to_vec()),
         GroupSpec::new(OP_RETURNCODE).window(1, Vec::new()),

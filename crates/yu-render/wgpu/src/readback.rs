@@ -212,8 +212,9 @@ impl ReadbackCache {
             Err(mpsc::TryRecvError::Empty) => return Ok(()),
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.receiver = None;
-                return Err(Diag::fatal(code::READBACK, Boundary::Platform)
-                    .with_detail("读回映射回调丢失"));
+                return Err(
+                    Diag::fatal(code::READBACK, Boundary::Platform).with_detail("读回映射回调丢失")
+                );
             }
         }
         self.receiver = None;
@@ -225,8 +226,7 @@ impl ReadbackCache {
 
     /// 把已映射的缓冲取出来(去行填充 + unmap)。
     fn take_mapped(&mut self) -> Result<Option<Surface>, Diag> {
-        let (Some(buffer), Some((width, height, padded_row))) =
-            (self.buffer.as_ref(), self.layout)
+        let (Some(buffer), Some((width, height, padded_row))) = (self.buffer.as_ref(), self.layout)
         else {
             return Ok(None);
         };
@@ -275,8 +275,7 @@ impl ReadbackCache {
             receiver
                 .recv()
                 .map_err(|_| {
-                    Diag::fatal(code::READBACK, Boundary::Platform)
-                        .with_detail("读回映射回调丢失")
+                    Diag::fatal(code::READBACK, Boundary::Platform).with_detail("读回映射回调丢失")
                 })?
                 .map_err(|err| {
                     Diag::fatal(code::READBACK, Boundary::Platform)
@@ -316,7 +315,6 @@ pub fn read_texture(
         });
     cache.read_now(ctx, texture, width, height, encoder)
 }
-
 
 /// 调试用:把一张纹理读成紧凑 RGBA8(低频人工取证)。
 ///
