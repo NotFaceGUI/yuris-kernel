@@ -33,7 +33,7 @@
 | 图像缓存键 | `ImageCacheKey`/`ImageOpSig`/`ImageSource`/`SizeKey`/`SizeSource` | `yu-render-core`(已迁) |
 | 栅格原语 | `scale_region` | `yu-render-core`(已迁;GPU 只允许在 CPU 读回路径用) |
 | PNG | `png_bytes` | `yu-render-core`(已迁) |
-| 语义常量 | `fixed_pipeline_alpha`、`shader_alpha`、`transition_coverage` | `yu-gfx` |
+| 语义常量 | `fixed_pipeline_alpha`、`shader_alpha` | `yu-gfx` |
 
 `yu-render-core` 里**不放任何后端行为**:软后端的 `apply_*` 与 wgpu 的
 管线/目标管理各自留在自己的 crate。`yu-backend-soft` 为兼容保留了同名

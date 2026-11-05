@@ -68,8 +68,8 @@
 |---|---|---|---:|---:|---|---|---|---|---|
 | 1 | psA | `0x18c9a8` | `0x58dba8` | 1432 | Pass3 | ps_2_0 | `Samp3`(s0),`YS_TexSize`(c0),`YS_TexDiffU`(c1) | `t0..t7`;`frc(t*TexSize)` 生成 4×4 三次权重(`2/-2/1/-1` 常量),16 次 `texld`(t0..t7 及 `+TexDiffU` 偏移),加权累加;`oC0=Σ` | **16-tap 双三次缩放滤镜**(引擎放大过滤“最高”档) |
 | 2 | psB | `0x18cf58` | `0x58e158` | 604 | Pass2 | ps_2_0 | `Samp3`(s0),`YS_TexSize`(c0),`SharpN`(c1) | `t0..t3`;`frc(t*TexSize)±0.5`,`mad_sat(...,SharpN,0.5)` 生成权重,4 次 `texld`,`lrp_sat`;`oC0` | **4-tap 锐利双线性缩放滤镜**(“高”档) |
-| 3 | psC | `0x18d1cc` | `0x58e3cc` | 492 | Pass1 | ps_2_0 | `Samp1`(s0),`Samp2`(s1),`YS_AlphaVal`(c0),`YS_FadeVal`(c1),`YS_FadeVal2`(c2) | `tex1=s0`,`tex2=s1`;`a=tex1.a*saturate((FadeVal-0.5*tex2.r)*FadeVal2)*AlphaVal`;RGB=`tex1.rgb` | **TID/mask 转场(HLSL 路径)**;mask 取配对纹理 **R** 通道 |
-| 4 | psD | `0x18d3d0` | `0x58e5d0` | 792 | Pass0 | ps_2_0 + preshader | `Samp1`(s0),`Samp2`(s1),`YS_AlphaVal`(c0),`YS_FadeVal`(c1) | preshader:`c2.x=1-FadeVal`;像素:`oC0=tex1*(1-FadeVal)+tex2*FadeVal`;`oC0.a*=AlphaVal` | **交叉淡化转场**(RGB+α 线性插值) |
+| 3 | psC | `0x18d1cc` | `0x58e3cc` | 492 | Pass1 | ps_2_0 | `Samp1`(s0),`Samp2`(s1),`YS_AlphaVal`(c0),`YS_FadeVal`(c1),`YS_FadeVal2`(c2) | `tex1=s0`,`tex2=s1`;`a=tex1.a*saturate((FadeVal-0.5*tex2.r)*FadeVal2)*AlphaVal`;RGB=`tex1.rgb` | **TID/mask 转场(官方固定路径:配对 + `TA>=1`)**;mask 取配对基图 **R** 通道 |
+| 4 | psD | `0x18d3d0` | `0x58e5d0` | 792 | Pass0 | ps_2_0 + preshader | `Samp1`(s0),`Samp2`(s1),`YS_AlphaVal`(c0),`YS_FadeVal`(c1) | preshader:`c2.x=1-FadeVal`;像素:`oC0=tex1*(1-FadeVal)+tex2*FadeVal`;`oC0.a*=AlphaVal` | **交叉淡化转场**(`TA<1`;当前 gfx 不生成该 op) |
 
 反汇编原文见 `target/tmp/j4-shaders/psA..psD.asm`;FXO 内 `CTAB` 参数表列出
 `YS_Texture1/2/3`、`YS_AlphaVal`、`YS_FadeVal`、`YS_FadeVal2`、`YS_TexSize`、

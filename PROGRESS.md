@@ -13014,3 +13014,39 @@ wgpu 套件连跑 3 次均通过,属既有已知并行偶发(PROGRESS B14 段已
 **未完成项**(未在本次审查中偷改):官方 `-0.5` 半像素、16.16 最终像素
 口径、主窗口 `+0xa4==2` 的 FRZ/FEX/FEY/FMD 变换仍归 DIV-GFX-070;
 E-mote 家族保持 `deferred(master)`。
+
+## 成果 TRANS-PSC (2026-11-05) · 转场改走官方 effect psC,修复幕边模糊与立绘压缩
+
+**根因**:旧 `transition_coverage`(`1/(30+70f)+0.16/TA²` 窄带拟合)是
+行为替身。官方 0.495 在“配对 + `TA>=1`”时固定走 effect Pass1(psC,
+asm `0x414dfa`),psC blob(`0x18d1cc`)反汇编为
+`a = tex1.a * sat((FadeVal - 0.5*tex2.r) * TA) * A/256`;`YS_Texture2`
+取配对层**基图**(`+0x21c`),不是 `CGACT` 加工表面(`+0x90`)。
+TA=4 时官方带宽 `1/TA` 是旧拟合的约 10 倍,所以幕边过锐;遮罩来源错位
+还会让立绘在百叶窗时被共享表面整张压扁。
+
+**改动**:
+- `yu-gfx`:新增 `TransitionDraw.to_base`(配对基图;空壳层沿本帧
+  `SIZE/SIZE2` 的 `source_texture` 追溯),删除 `transition_coverage`。
+- soft:转场统一 psC;mask 取 `to_base` 的 R 通道,采样
+  `(texel+1)/256`(40 格官方 α 表逐点 ≤2/255);`A/256` 量化链。
+- wgpu:删除 `transition_fixed` 管线/WGSL;psC uniform 增加本层内容窗
+  与配对遮罩窗,修 `clamp_uv_max` 强制 `u1>=u0` 导致镜像内容塌成单列。
+- 测试:`transition_alpha` 40 格 + T6 36 点去 `#[ignore]` 全绿;
+  新增 `psc_transition_respects_source_uv_window`;wgpu 转场测试改为
+  「始终 psC」。
+
+**验证**:
+```text
+cargo build --workspace --all-targets                    → Finished
+cargo test -p yu-gfx -p yu-backend-soft -p yu-backend-wgpu → 全绿
+  (soft transition_alpha 2 passed;wgpu 36 passed ×3;
+   全量 workspace 时 wgpu diffusion 用例偶发 1 像素差,单独/连跑均过,
+   属既有并行 GPU 偶发,与本轮转场路径无关)
+```
+
+**实机验收**:用户确认 `\FOUT` 幕边柔化与官方一致、立绘百叶窗比例正常。
+**文档**:`DIV-GFX-065` 状态 `fixed`(新增 §13 定稿);`DIV-GFX-045` 关闭;
+`render-parity §9/§12.5`、`architecture §5.1`、`title-motion-ledger §2.1`、
+`shader-parity`、`wgpu README` 同步勘误。psD(TA<1 交叉淡化)仍保留管线,
+当前 gfx 不生成该 op。

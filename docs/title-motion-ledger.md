@@ -115,37 +115,34 @@ missing assets: 10
 | EVID-T-02 | `YS_FadeVal` 公式 | asm `0x416d1b-0x416d57`:`A/256`、`T/TA` x87 序列;常量 `0x58ec00=1/256`、`0x58ec08=256.0`、`0x58ec10=128.0`(直接读 PE `.rdata` 校验) | `render-parity.md` §9 | `trans4` 的 T 扫描与该公式一致 | **Confirmed** |
 | EVID-T-03 | 双纹理门控:配对指针非空且 `TA>=1` 才走过渡;否则单纹理回退 | asm `0x415558-0x415577`:`TEST [ESP+0x2e4]` → `JZ 0x416f8d`;`MOVSX [EAX+0x84]` → `JLE 0x416f8d`;`0x41559a/0x4155c7` 分别绑 texture1/texture2 | — | `j2-micro-trans1` TR7(`TID` 指向不存在层)输出**正常红层**,无错误 | **Confirmed**(配对缺失 = 单纹理普通层) |
 | EVID-T-04 | `T` 的推进者 = 脚本;`+0x1e8` 与过渡推进无关 | `0x413dc8` 只在 **调试组 RT** 分支读 `+0x1e8`(`0.5*v/100` 作为 RT 淡值);`0x42f809` 的 COPY 属性块复制 `+0x1e8` | `es_Sprite.yst:7844` `@TP=@L.TP+@L.CLTP`;`CGFADEEXEC` 的 `mode=1` 分支 `CG[ID=$IDName T=@mA]` | `trans4`:固定 `T` 的画面在 3 帧内不变 | **Confirmed** |
-| EVID-T-05 | 过渡 mask 取样 = 配对纹理的 **G 通道**,不是 α;α 随 `T` 推进 | 固定管线状态:asm `0x415754-0x415858`(stage0 ALPHAOP=MODULATE/TFACTOR;stage1 ALPHAOP=SELECTARG1) | `es_Sprite.yst` 把 `$TR1` 作为 `TID`(转场掩码/缓冲层) | `j2-micro-transA`:`FF0000→0`、`00FF00→255`、`0000FF→0`、`808000/008080→127`(G 通道);`trans6/8`:α = f(mask,T) 的 4×9 测量 | **Confirmed(G 通道)**;f(α) **Likely**(校准模型,见 §2.1) |
+| EVID-T-05 | 过渡 mask 取样 = 配对基图的 **R 通道**,不是 α;α 随 `T` 推进 | psC 反汇编(`0x18d1cc`):`mad r1.w, r1.x, -0.5, FadeVal`;`0x414dfa` 配对+`TA>=1` 走 BeginPass(1) | `es_Sprite.yst` 把 `$TR1` 作为 `TID`(转场掩码/缓冲层) | `j2-micro-transA` 的通道分离;`trans8` 40 格表 | **Confirmed(R 通道 + 基图 + `(texel+1)/256`)**;旧的 G 通道观察来自固定管线 stage,2026-11-05 勘误(DIV-GFX-065 §13) |
 | EVID-T-06 | `TID=""` = 不查配对(普通层);`TID` 为绝对/相对 ID 均可解析 | asm `0x413e7b` 判 `+0x4c` 首字节 0 直接跳过 `FUN_004141e4` | `es_Button.yst:4526/4540`、`es_Sprite.yst:4238` `CG[ID=$L1 TID=""]` | `trans1` TR8(`TID=""`)全红;`trans3` T6(相对 `TID="PAIR"`)全绿 | **Confirmed** |
 | EVID-T-07 | 配对层与过渡层 **尺寸必须一致** | — | 脚本在 `CG[ID=$L1 TID=$TR1]` 前用 `CGACT[ID=$TRBUF1 ID2=$TR1 SIZE=1 SX=.. SY=..]` 对齐尺寸(8128-8156) | `trans3` 首版(100×100 vs 800×600)弹 `YU-RIS Debug Info` 错误对话框;改同尺寸后正常 | **Confirmed** |
-| EVID-T-08 | 本语料的转场走 **固定管线** 双纹理路径,不走 HLSL | `_DXMODE` 由宿主注入(`yu-rt` `sysvar.rs:204`);本工程 `yscfg` 未置位 | `es_Sprite.yst:7976/8128` 只在 `_DXMODE==0` 走 `CGACT[TRANSITION]`/`TID` 路径 | `target/tmp/j2-effect-uniforms.json` 探针(RVA `0x416d7a/0x416da5/0x416dc9`)零命中 = HLSL 分支未执行 | **Confirmed** |
-| EVID-T-09 | HLSL 路径(备档,不是本语料路径) | ps_2_0 反汇编(`0x18d1cc`,fxc `/dumpbin`):`oC0.rgb=tex1.rgb`;`oC0.a=tex1.a*saturate((YS_FadeVal-0.5*tex2.r)*YS_FadeVal2)*YS_AlphaVal`;均匀量 `YS_FadeVal=fade`、`YS_FadeVal2=TA`(asm `0x416d73`/`0x416d22` 的栈槽校正) | — | 未触发(`_DXMODE=0`) | **Confirmed(逆向)**;本任务不实现该路径 |
+| EVID-T-08 | 本语料转场**始终走 effect Pass1(psC)**,`_DXMODE` 不是渲染开关 | effect 启动即建(`FUN_00410db8`→`FUN_00462d28`);配对+`TA>=1` 无条件 `BeginPass(1)`(`0x414dfa`) | `es_Sprite.yst` 的 `_DXMODE==0` 分支只选择脚本侧 TID/TRANSITION 路径 | `j2-effect-uniforms` 旧探针误读;2026-11-05 按 psC blob 与整场帧对拍复证 | **Refuted(旧“固定管线”结论作废)**;DIV-GFX-065 §13 |
+| EVID-T-09 | psC 就是本语料路径(不是备档) | ps_2_0 反汇编(`0x18d1cc`,fxc `/dumpbin`):`oC0.rgb=tex1.rgb`;`oC0.a=tex1.a*saturate((YS_FadeVal-0.5*tex2.r)*YS_FadeVal2)*YS_AlphaVal`;均匀量 `YS_FadeVal=fade`、`YS_FadeVal2=TA`(asm `0x416d73`/`0x416d22`) | — | `\FOUT` 整场帧 α 拟合 psC/基图平均误差 0.037 | **Confirmed;soft/wgpu 均已实现** |
 
-### 2.1 α 模型(固定管线,`_DXMODE=0`)
+### 2.1 α 模型(2026-11-05 定稿)
 
 官方微场景测量(`trans6`:TA=128,T∈{64,128,192,256} × mask 9 级;
 `trans8`:TA∈{2,64,128,192} × T∈{0,64,128,192,255};`trans9`:α/灰度分离;
-`transA`:通道分离):
+`transA`:通道分离)现在由 psC 闭式完整解释:
 
-- mask = 配对纹理 **G 通道**(`transA`:`FF0000/0000FF→0`、`00FF00→255`、
-  `808000/008080→127`);配对 **α 无影响**(`trans9`:α=0/64/128/192/255
-  全部输出 255);
-- `fade = T / (256/(256/TA+128)) / 256`;
-- `T >= 256` ⇒ α = 1(trans6 全部 mask);
-- 实现模型(`yu_gfx::transition_coverage`,TA=128 校准):
-  `threshold = 1 - 2*fade`、`slope = 30 + 70*fade`、
-  `α = clamp(slope * (mask - threshold), 0, 1)`;
-- 拟合残差:TA=128 的三个中点(T=64/128/192)官方 vs 模型 ≤ 8/255;
-  TA≠128 在 `T=255` 处偏差最大 ~0.12(TA=64 官方 0.875 vs 模型 1.0;
-  TA=192 官方 0.624 vs 模型 1.0),归 **DIV-GFX-045**(`open`,低风险;
-  title 用 TA=128)。
+```text
+fade     = T / (256/(256/TA + 128)) / 256
+mask_norm = (texel + 1) / 256          // 精灵系统 REVERSE 后的缓冲
+α        = saturate((fade - 0.5 * mask_norm) * TA)
+```
 
-> 采用该模型而不是“猜 cross-fade”:它同时解释了
-> ①mask=0 时 T<256 完全不可见;②mask=128 在 T=128 时 α≈0.5;
-> ③T=192 时 threshold 降到 ~0.13;④T=256 全可见。旧线“双图 cross-fade”被
-> `trans5/6/9` 直接证伪(配对 α 无影响、G 通道决定覆盖)。
-> 早先的简化式 `mask + 4*fade - 1` 在 T=192、mask=0 处给出 0.52(官方 0),
-> 已被 `trans6` 否定,不作为实现。
+- mask = 配对基图 **R 通道**;配对 α 无影响(psC 不读 tex2.a);
+- `T=256` ⇒ `fade=0.5+1/TA` ⇒ 任意 mask 恰好 α=1;
+- 40 格表(`TA{2,64,128,192} × T{0,64,128,192,255} × mask{0,0x80}`)逐点
+  ≤2/255,见 `crates/yu-render/soft/tests/transition_alpha.rs` 两个 oracle
+  (均已去掉 `#[ignore]`);
+- 整场 `\FOUT(1500,5)`(TA=4)与官方截图的 α 拟合平均误差 0.037;
+- `DIV-GFX-045`(TA 残差)、`DIV-GFX-065` 随之关闭。
+
+> 旧实现(`transition_coverage` 的 `1/(30+70f)+0.16/TA²` 窄带/宽档)是
+> 行为替身,2026-11-05 已从 soft/wgpu 删除;不要再按截图调斜率/带宽。
 
 ---
 

@@ -33,12 +33,14 @@
 | 位置 | 作用 | 备注 |
 |---|---|---|
 | `src/pipelines.rs:92` `SHADER` | 普通纹理 quad(顶点色 alpha + 采样 + blend 状态) | 所有固定管线 MODE 0/1/2 复用 |
-| `src/pipelines.rs:129` `TRANSITION_SHADER` | 双纹理转场(mask G + fade 覆盖度 + u8 量化链) | 复刻**固定管线**路径,不是引擎 HLSL |
+| `src/pipelines.rs:129` `TRANSITION_SHADER` | 双纹理转场(mask G + fade 覆盖度 + u8 量化链) | 复刻**固定管线**路径,不是引擎 HLSL —— **2026-11-05 已删除**,转场统一走 psC(DIV-GFX-065 §13) |
 | `src/pipelines.rs:188` `PAINT_SHADER` | 快照上的 RECTPAINT 族(整像素 / 只写 alpha) | COPY 目标纹理原地绘制 |
 
 没有独立的 `.wgsl` 文件、没有 shader registry、没有“引擎 shader → WGSL”映射表。
 过渡公式在 Rust(`yu_gfx::transition_coverage`, `layer.rs:893`)与 WGSL 里
 各写了一份,必须逐位同步(维护风险)。
+**2026-11-05 更新**:`transition_coverage` 与固定管线 WGSL 已删除;
+soft/wgpu 共用 psC 公式(DIV-GFX-065 §13)。
 
 ### 1.2 引擎侧(已提取 8 个 PS_2_0 字节码)
 

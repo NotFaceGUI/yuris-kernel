@@ -172,7 +172,7 @@ let out = backend.render_frame_scaled(
 | 差异 | 类别 | 处理 |
 |---|---|---|
 | soft 混合模型 | 已消除 | J3 起 soft 也按 D3D9 浮点模型(先求和再 u8 取整),两边共用 u8 alpha 量化链;600 帧 0 差异 |
-| 转场覆盖度 | 已对齐 | shader 与 `yu_gfx::transition_coverage` 同公式/同量化;title 与转场帧 0 差异 |
+| 转场 | 已对齐 | 固定走官方 effect Pass1(psC):`sat((FadeVal-0.5*mask/256)*TA)`、mask = 配对基图 R、内容/遮罩各用自身 UV 窗;title/幕/立绘帧 0 差异 |
 | 屏幕 alpha | 已对齐 | 最终屏幕按 opaque 窗口归一 alpha=255,与浏览器 `alphaMode=opaque` 读回一致 |
 | sRGB 禁用方式 | 语义对齐 | `Rgba8Unorm` 直写;采样/清屏/混合均在存储值空间,等价于 D3D9 未开 sRGB 写 |
 | `filter.source=placeholder` | 未取证 | 报告原样输出 `placeholder`;执行 point/linear,但不声称已与引擎采样器对齐 |

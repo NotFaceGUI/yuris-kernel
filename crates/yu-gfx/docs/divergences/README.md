@@ -12,7 +12,7 @@
 | DIV-GFX-003 | `FX/FY/FBX/FBY/FRX/FRY/FRZ/FCX/FCY/FEX/FEY/FEZ/FSD/FMD/FQU/F` 的槽位→结构体偏移 | **fixed(no-manual)** | 绑定已闭:0.495 CG 处理体(`0x42a514`)属性块逐项写入点见 `docs/divergences/DIV-GFX-069-cg-affine-binding.md` §2.2;`Transform.affine` 按引擎 `+0x1b0..+0x214` 落地,`FX/FY` 就是图层位置(`+0x68`)。普通图层缩放已实现(`FBX/10000`、`FBY/10000`);`FRX/FRY` 绘制不读,`FRZ/FEX/FEY/FMD` 只主窗口分支 ⇒ 不再整层丢弃(DIV-GFX-070) |
 | DIV-GFX-004 | 多部件层(`+0xa6/+0xa7/+0xb0/+0x130`)几何语义未取证 | unimplemented | 契约保留 `Part` 位置,首屏未出现 |
 | DIV-GFX-005 | 外部掩码 `MID` 的取值通道(α/亮度)/尺寸要求未取证 | unimplemented | 带 `MID` 图层标 Unimplemented |
-| DIV-GFX-006 | 过渡 `TID` 配对层缺失时的第二纹理来源、`T` 的推进者(`+0x82` vs `+0x1e8`) | fixed(J2) | EVID-T-01..09:配对缺失/`TA<1` = 单纹理普通层(asm `0x415558→0x416f8d`);`T` 由脚本推进;mask = 配对纹理 G 通道;覆盖度模型见 `transition_coverage`。两端执行 `Op::Transition` |
+| DIV-GFX-006 | 过渡 `TID` 配对层缺失时的第二纹理来源、`T` 的推进者(`+0x82` vs `+0x1e8`) | **fixed(J2;2026-11-05 勘误)** | EVID-T-01..09:配对缺失/`TA<1` = 单纹理普通层(asm `0x415558→0x416f8d`);`T` 由脚本推进;官方路径 = effect psC(mask = 配对**基图 R 通道**,`sat((FadeVal-0.5*mask/256)*TA)`,DIV-GFX-065 §13)。两端执行 `Op::Transition` |
 | DIV-GFX-007 | `CGACT[COPY/COPY2/TEXCOPY/TEXSSCOPY]` | fixed(J2;TexCopy/TexSsCopy 仍 unimplemented) | EVID-T-11/12/15:区域=源坐标含端点、裁剪块写目标(0,0)、时序=命令当前、快照按 `CopyId` 冻结;软/硬后端执行复制与快照绘制 |
 | DIV-GFX-008 | 图层组离屏尺寸/清屏/RT alpha 语义:主组 `W0` 官方直接画到屏幕,子组离屏 alpha 不参与父级合成(EVID-J-08) | **fixed(J3)** | 主组直绘已实现:主组不产出离屏 pass,`frame()` 的屏幕 pass 直接含其子层(`emit_children_ops`)。title 淡入淡出与官方逐帧一致(EVID-J3-07);首屏 census 15→14 passes / 18→17 ops |
 | DIV-GFX-009 | 颜色空间:引擎未设 `D3DRS_SRGBWRITEENABLE`,按 gamma 空间混合;未用官方截图逐像素验证 | open | 帧输出 `gamma_encoded_srgb8` |
@@ -27,7 +27,7 @@
 | DIV-GFX-043 | 按钮状态后缀 `_na/_off/_on/_over` 由脚本 `FILEINFO[EXIST=1]` 探测后拼接 | **fixed(J3)** | EVID-T-20/21/22 + EVID-J3-01:`yu-rt` 已实现 FILE+EXIST+LET(REA `0x44286c`);title `asset.missing=0`、`ops 27/27/0`。见 `docs/title-motion-ledger.md` §9.1 |
 | DIV-GFX-046 | ERIS sprite 系统的 boot logo 保持/淡出(BG 提升) | **fixed(J3)** | 根因 = `MATH3D` 未实现 ⇒ 投影缩放 0 ⇒ `es.CGACT_SIZE` 判屏幕外;`SP.BGCOPY`/`FOUT` 本身不需要新契约。已实装 MATH3D、`CGINFO[SX/SY]` 资产头回退、`CGACT[SIZE/SIZE2]` 缩放(EVID-J3-03/04)。见 `docs/divergences/DIV-GFX-046-sprite-bg-hold.md` |
 | DIV-GFX-044 | `SPLTRBUF`/分屏是否为独立引擎命令 | withdrawn(J2) | EVID-T-10:`SPLTRBUF/SPL/SPLTR` 是脚本图层名约定,由普通 `CG/CGACT(COPY/REVERSE/SIZE)` + `TID` 转场组合;无独立命令 |
-| DIV-GFX-045 | 过渡覆盖度模型的 TA 依赖残差 | open(低风险) | `transition_coverage` 按 TA=128 校准(T∈{64,128,192} 残差 ≤8/255);TA=64/192 在 T≈255 处偏差最大 ~0.12;title 用 TA=128。J3 已把同一模型/量化链同步到 wgpu shader(600 帧 0 差异);TA≠128 残差仍需固定管线 mask 纹理生成路径的 REA 取证 |
+| DIV-GFX-045 | 过渡覆盖度模型的 TA 依赖残差 | **fixed(2026-11-05)** | 官方即 effect psC:`α = sat((FadeVal - 0.5*mask/256) * TA)`,40 格官方表逐点 ≤2/255(`transition_alpha_matches_official_grid` 已去 `#[ignore]`)。旧 `transition_coverage` 拟合式已删除;见 DIV-GFX-065 §13 |
 | DIV-GFX-018 | 子窗口(`WINDOW[NO=1..3] CGID`)的叠放/位置/可见性不在 gfx | unimplemented | gfx 输出全部窗口状态;Screen 只合成主窗口(CGID/E/A),子窗口组只产出 Offscreen pass,交 window/host 会话 |
 | DIV-GFX-019 | 顶点 DIFFUSE RGB | **fixed(J4)** | `FUN_00414ba4` asm `0x414d09..0x414d21` 把顶点色写成 `A` 灰度;`0x414d72` 对 shader 模式写 `0xFF000000`。固定管线 stage0 的 `D` 因此等价于层 A,后端以 `T·A`/`T·A+(1−C.a)` 建模,无需新增顶点 RGB 属性 |
 | DIV-GFX-020 | `CGINFO/FONTINFO/WINDOWINFO` 的 `LET` 查询需要脚本执行期同步读图形状态 | partial | `yu-rt::GraphicsHost` + `yu_gfx::GfxHost` 已实现同步查询与 LET 写回;`EXIST/E/A/X/Y/Z/MODE/T/TA/TID`、组/黑图尺寸、FONTINFO 当前样式、WINDOWINFO 主窗口几何可用 |

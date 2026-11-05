@@ -438,7 +438,7 @@ Op   { Layer | Group | Transition | Mask | Copy | Image }
 - `yu-backend-soft`:CPU RGBA8,确定性参考;`apply_rect_paint`/`scale_region`/
   `apply_reverse`/`apply_horizontal` 与 `Surface`/`RenderReport` 被 wgpu 复用。
 - `yu-backend-wgpu`:GPU 执行;管线按 `BlendMode` 缓存,过渡用独立 WGSL
-  (`shaders/transition_fixed|psc|psd.wgsl`),快照用 `copy_texture_to_texture`。
+  (`shaders/transition_psc|psd.wgsl`),快照用 `copy_texture_to_texture`。
 - 两个后端必须输出**逐字段相同**的 `RenderReport`(ops/drawn/skipped/
   passes/offscreen/missing_assets);`yu-cli --reconcile` 首帧对账,
   `frame_walk`/`wgpu_frame_walk` 逐帧比对。
@@ -449,13 +449,13 @@ Op   { Layer | Group | Transition | Mask | Copy | Image }
 
 `CompositorFrame.dx_mode` **不是引擎的渲染开关**:
 
-- 官方引擎的 effect 始终创建;psC 的触发条件是“有配对且 `TA>=1`”,psD 是
-  “有配对且 `TA<1`”(`docs/shader-parity.md` §3)。
+- 官方引擎的 effect 始终创建;配对且 `TA>=1` 时固定走 effect Pass1(psC)
+  (`FUN_00414ba4` `0x414dfa`);psD 是 `TA<1` 的交叉淡化路径。
 - `@_DXMODE` 只是脚本变量(`es_first.yst` 分支决定走 `CGACT[TRANSITION]`/
   `TID` 还是 `DXBUF`)。
-- 因此 `dx_mode → psC/psD` 是**内核扩展契约**(默认 0 不改变现有行为),
-  用于 A/B 两条内核转场实现;它不声称与引擎某条路径 1:1。
-  文档旧称“引擎双路径”作废(见 `docs/audit-2026-10-22.md` §B1)。
+- **2026-11-05 定稿**:soft/wgpu 渲染器不再用 `dx_mode` 选 pass —— 配对
+  `Op::Transition` 一律走 psC(DIV-GFX-065 §13)。`dx_mode` 仅保留在 VM/
+  帧报告里用于脚本分支与审计;旧“内核 A/B 双路径”契约作废。
 
 ### 5.2 已知未对齐(2026-10-22)
 

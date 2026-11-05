@@ -264,8 +264,8 @@ pass 映射为:
 
 | pass | blob | 参数 | 功能 | 触发 |
 |---|---|---|---|---|
-| 0 | `0x18d3d0` | `Samp1/2`,`YS_AlphaVal`,`YS_FadeVal` | 交叉淡化 `mix(tex1,tex2,FadeVal)` | HLSL 分支(存在配对) |
-| 1 | `0x18d1cc` | `Samp1/2`,`YS_AlphaVal`,`YS_FadeVal`,`YS_FadeVal2` | mask 转场(R 通道) | HLSL 分支(`TA>=1`+多部件) |
+| 0 | `0x18d3d0` | `Samp1/2`,`YS_AlphaVal`,`YS_FadeVal` | 交叉淡化 `mix(tex1,tex2,FadeVal)` | `TA<1`/无配对的 psD(当前 gfx 不生成) |
+| 1 | `0x18d1cc` | `Samp1/2`,`YS_AlphaVal`,`YS_FadeVal`,`YS_FadeVal2` | mask 转场(R 通道) | **官方固定路径**:配对 + `TA>=1` |
 | 2 | `0x18cf58` | `Samp3`,`YS_TexSize`,`SharpN` | 4-tap 锐利缩放 | 显示缩放档 `DAT_00801334=2` |
 | 3 | `0x18c9a8` | `Samp3`,`YS_TexSize`,`YS_TexDiffU` | 16-tap 双三次缩放 | 显示缩放档 `DAT_00801334=3` |
 
@@ -416,25 +416,28 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
   `TA < 1` ⇒ 单纹理普通层(无过渡)。`TID` 为空 = 不查配对
   (`0x413e7b`);非空但查不到层同样回退普通层(EVID-T-03/06)。
 - uniform:
-  - `YS_Texture1` = 本层纹理;`YS_Texture2` = 配对纹理(TID 对侧);
+  - `YS_Texture1` = 本层纹理;`YS_Texture2` = 配对层**基图**(`层+0x21c`,
+    不是 `CGACT` 加工表面 `+0x90`);
   - `YS_AlphaVal = A/256`;
   - `YS_FadeVal = T / (256/(256/TA + 128)) * (1/256)`(行 905-909);
-  - `YS_FadeVal2` 来源未取证(HLSL 路径;本语料不走)。
-- **像素语义(J2 修正)**:配对纹理的 **G 通道**是 mask(微场景
-  `j2-micro-transA`:`FF0000/0000FF→0`、`00FF00→255`、`808000/008080→127`);
-  不是 cross-fade。覆盖度:
-  - `T >= 256` ⇒ 1(过渡完成);
-  - 否则 `clamp((30+70*fade) * (mask - (1-2*fade)), 0, 1)`。
-  证据:`j2-micro-trans6/8` 的 T×TA×mask 测量;TA=128 下残差 ≤8/255,
-  TA≠128 的残差见 DIV-GFX-045。J3 起 wgpu shader 使用同一公式与 u8 量化链。
+  - `YS_FadeVal2 = TA`(asm `0x416db9`)。
+- **像素语义(2026-11-05 定稿,DIV-GFX-065 §13)**:官方固定管线在“配对 &&
+  `TA>=1`”时走 effect Pass1(**psC**,asm `0x414dfa` `BeginPass(1)`),
+  **与 `_DXMODE` 无关**:
+  - `oC0.rgb = tex1.rgb`;
+  - `oC0.a = tex1.a * sat((YS_FadeVal - 0.5*tex2.r) * TA) * (A/256)`;
+  - mask 取配对基图的 **R** 通道,按官方 micro 表校准为
+    `(texel+1)/256`;
+  - `YS_FadeVal(256)=0.5+1/TA` ⇒ 任意 mask 都恰好满覆盖,无需 T 分支。
+  证据:psC blob `0x18d1cc` 的 `fxc` 反汇编;`j2-micro-trans8/6` 的
+  T×TA×mask 40 格表逐点 ≤2/255(`transition_alpha` oracle);整场
+  `\FOUT` 帧与官方截图 α 拟合平均误差 0.037。
 - `T` 由**脚本**推进(`es_Sprite.yst` `@TP`);`+0x1e8` 只在调试组 RT
   分支使用,不是过渡推进者(EVID-T-04)。
 - `Transition::fade_value()` 实现公式,不 clamp;`TA<1` 返回 `None`。
-- 本语料 `_DXMODE=0` 走固定管线双纹理路径;HLSL `ps_2_0` 的公式
-  (`oC0.rgb=tex1.rgb`;`oC0.a=tex1.a*sat((FadeVal-0.5*tex2.r)*FadeVal2)*AlphaVal`)
-  在台账 EVID-T-09 备档,不实现。
-- 后端:`Op::Transition` 可执行;soft 用整数 mask 采样,wgpu 用独立
-  transition pipeline;两端同帧像素一致(见 §14)。
+- 后端:`Op::Transition` 可执行;soft/wgpu 都走 psC,采样窗分别为本层内容
+  与配对基图;两端同帧像素一致(见 §14)。`CGACT` 的 `REVERSE` 等显示加工
+  不进入转场(官方取基图)。
 
 ---
 
@@ -548,13 +551,11 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
 
 - Group:先执行 `Offscreen` pass,再在父 pass 中把 `Op::Group.offscreen`
   当纹理,按 `layer.alpha/blend` 合成。
-- Transition:`from`/`to` 两个纹理 + 已算好的 `fade`;`to=None` 不会到达
-  (gfx 已回退普通层)。`dx_mode=0`:像素 RGB 取 `from`;alpha = 纹理 α ×
-  覆盖度 × 层 A;覆盖度用 `to` 的 **G 通道**与 `fade`/`T` 计算
-  (`yu_gfx::transition_coverage`,EVID-T-05)。`dx_mode≠0`:psC(mask = 配对
-  纹理 **R**,`saturate((FadeVal-0.5*mask.r)*TA)*A/256`)或 psD(交叉淡化)。
-  **注意**:`dx_mode` 是内核 A/B 契约,不是引擎开关;引擎 effect 始终创建,
-  psC/psD 的触发条件是“有配对 + TA”。见 `docs/architecture.md` §5.1。
+- Transition:`from`/`to`/`to_base` + 已算好的 `fade`;`to=None` 不会到达
+  (gfx 已回退普通层)。官方路径固定为 psC:RGB 取 `from`;alpha =
+  纹理 α × `sat((FadeVal - 0.5*mask/256) * TA)` × `A/256`;mask 取
+  **`to_base`(配对层基图)的 R 通道**;没有基图才回退 `to_layer` 的加工
+  表面。`dx_mode` 只影响脚本分支,不再选择渲染 pass(DIV-GFX-065 §13)。
   `to` 纹理与 `from` 同尺寸(引擎要求,尺寸不符会报调试错误,EVID-T-07)。
 - 组上的 `TID`:gfx 输出 `Op::Transition { from: Offscreen(组), to: 配对 }`,
   不再当普通组画掉;配对可以是图像层或组。引擎按层表统一解析 TID,

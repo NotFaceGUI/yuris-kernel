@@ -1,6 +1,6 @@
-# DIV-GFX-065 · 固定管线过渡(`T/TA/TID`)的覆盖度模型:官方是「顶点 α 渐变 × mask」,不是阈值
+# DIV-GFX-065 · 固定管线过渡(`T/TA/TID`)的覆盖度模型:官方是 effect psC,不是阈值
 
-- 状态:**open**(现象已定,公式待逐项对齐)
+- 状态:**fixed**(2026-11-05;定稿见 §13)
 - 取证对象:官方 0.495 `yu-ris.exe`(sha256 `4f5eefa3…`),`FUN_00414ba4`
   (`0x414ba4`-`0x4171f0`)
 - 现象(用户口径):官方过渡是**平滑半透明**;我们直接黑幕/硬边界
@@ -455,3 +455,88 @@ CG/精灵装载路径后填的。这解释了为什么我们的契约里 `parts=
 **取数现状**:断点工具已可用(`tools/official_trace/dump_layer.py`,
 入口 RVA `0x14ba4`,已用每 tick 函数 `0x4040f8` 做过命中对照);但
 `+0x414ba4` 的命中要求真的播到过渡帧,几次运行都在 5s 内被关窗,尚未取到。
+
+## 13. 定稿:官方就是 effect Pass1(psC),不是覆盖率拟合(2026-11-05)
+
+### 13.1 二进制证据(最高优先级)
+
+从官方 0.495 `yu-ris.exe` 的 FXO 容器抽出 psC blob(`0x18d1cc`,492 B),
+`fxc /dumpbin` 逐指令:
+
+```hlsl
+texld r1, t0, s1          // 配对纹理
+texld r0, t0, s0          // 本层纹理
+mov   r1.w, 0.5
+mad   r1.w, r1.x, -r1.w, c1.x    // FadeVal - 0.5*mask.r
+mul_sat r1.w, r1.w, c2.x         // * FadeVal2 (TA)
+mul   r0.w, r0.w, r1.w           // * tex1.a
+mul   r0.w, r0.w, c0.x           // * AlphaVal (A/256)
+mov   oC0, r0
+```
+
+⇒ **覆盖度** = `saturate((YS_FadeVal - 0.5*mask.r) * TA)`,mask 取配对纹理
+**R** 通道;`YS_AlphaVal = A/256`。`FUN_00414ba4` 在“配对指针非空 &&
+`TA>=1`”时 `BeginPass(1)`(asm `0x414dfa`),**与 `_DXMODE` 无关**;effect
+在启动时无条件创建(`FUN_00410db8` → `FUN_00462d28`)。
+
+`YS_FadeVal(256) = 0.5 + 1/TA`,代入上式对任意 mask∈[0,1] 恰好为 1
+——这也是 §6 表里 `T=255, mask=0 → 1-TA/512` 的来源,不需要额外分支。
+
+### 13.2 遮罩采样约定
+
+把 §6 的 40 格表(TA{2,64,128,192} × T{0,64,128,192,255} ×
+mask{0,0x80})逐点代入,只有下面这组约定全部落进 2/255:
+
+```text
+mask 缓冲 = 精灵系统 CGACT[REVERSE=1] 后的缓冲
+归一化   = (texel + 1) / 256        // 不是 UNORM 的 /255
+α        = sat((YS_FadeVal - 0.5 * mask_norm) * TA)
+```
+
+`transition_alpha_matches_official_grid`(40 格)与
+`transition_alpha_matches_official_mask_sweep`(T6 36 点)**已去掉
+`#[ignore]`,全绿**。
+
+### 13.3 `YS_Texture2` 取的是层基图(`+0x21c`),不是加工表面(`+0x90`)
+
+`FUN_00414ba4` 绑 texture1/2 用的是 `layer+0x21c`;`CGACT` 的像素结果写在
+`layer+0x90`(`FUN_0042f809` 尾部),不改 `+0x21c`。因此:
+
+- 立绘/幕的 mask 层是 `FILE=""` 空壳、图案由
+  `CGACT[ID=$TRBUF ID2=$TR1 SIZE=1]` 从缓冲层做进表面时,转场看到的是
+  **SIZE 的源基图**(图案资产本体),不是 `REVERSE` 后的表面;
+- `REVERSE` 只影响显示,不影响转场方向。
+
+gfx 契约新增 `TransitionDraw.to_base`:配对层自身有基图 → 用它;空壳层 →
+取本帧最后一次 `SIZE/SIZE2` 写该层的 `source_texture`;都没有才回退
+`to`+`to_layer` 的加工表面。soft/wgpu 都按 `to_base` 取样。
+
+### 13.4 实机对拍(整场帧)
+
+- 官方 0.495 幕帧(用户截图,`\FOUT(1500,5)`,TA=4)与 `cg/bg/bg_040.jpg`
+  解出 `α_off = 1 - pixel/scene`;用 `cg/tr/ysr005.png` 基图拟合:
+  psC/基图 = 平均 |Δα| **0.037**,`FadeVal≈0.281`(T≈96);
+  旧的 fixed/reversed 模型 = 0.127;psC/reversed = 0.345。
+- 内核自身旧帧(`f021344`)与同一背景拟合 fixed/reversed = **0.0015**
+  —— 证明拟合方法本身可靠,差异确实来自模型/遮罩来源。
+- 用户验收:幕边柔化与官方一致;立绘百叶窗比例正常。
+
+### 13.5 立绘压缩回归(同日修复)
+
+切到 psC 后曾出现“百叶窗时立绘被压扁”:psC shader 用 `UV 0..1` 直接采
+本层纹理,而立绘内容在共享表面的子矩形里。修复:
+
+- psC uniform 增加 `src_min/src_max`(本层内容窗)与
+  `mask_min/mask_max`(配对遮罩窗);shader 先还原层内 `[0,1]` 再映射;
+- `clamp_uv_max` 只逐分量钳 `[0,1]`,**不再强制 `u1>=u0`/`v1>=v0`**
+  —— 镜像/负缩放的采样窗本来就是反向的;
+- 回归测试 `psc_transition_respects_source_uv_window`(HORIZONTAL 内容窗,
+  soft/wgpu 逐像素)。
+
+### 13.6 终态
+
+- `transition_coverage`(窄带/宽档拟合)与 wgpu `transition_fixed` 管线
+  **已删除**;soft/wgpu 统一走 psC。
+- `DIV-GFX-045`(TA 残差)随之关闭:40 格表对 psC 逐点成立。
+- `DIV-GFX-006` 的“G 通道”勘误为 **R 通道 + 基图**;`DIV-GFX-065` 状态
+  改 `fixed`。
