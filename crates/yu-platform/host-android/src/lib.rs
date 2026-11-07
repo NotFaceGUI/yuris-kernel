@@ -60,6 +60,8 @@ struct Session {
     frame_h: u32,
     frame_pixels: Vec<u8>,
     ticks: u64,
+    /// 已写进 logcat 的长帧条数(上限,避免慢场景把日志刷爆)。
+    spikes_logged: u32,
     /// 零拷贝上屏器。`Some` = 已绑定原生窗口,`tick` 时直接上屏(不读回
     /// CPU);`None` = 走 `nativeCopyFrame` 的旧路径(CPU 后端必须如此)。
     presenter: Option<present::NativePresenter>,
@@ -479,6 +481,7 @@ fn store_session(started: StartedEngine) -> Result<String, String> {
             frame_h: viewport.height,
             frame_pixels: Vec::new(),
             ticks: 0,
+            spikes_logged: 0,
             presenter: None,
             gpu: started.gpu,
             audio: started.audio,
@@ -940,6 +943,63 @@ pub fn tick() -> i32 {
         match session.engine.tick_realtime() {
             Ok(rendered) => {
                 session.ticks += 1;
+                // 长帧取证:只记超过阈值的帧(logcat),正常帧零额外开销。
+                //
+                // 安卓侧此前**没有任何逐帧耗时出口**:`nativeStatus()` 只在
+                // 壳开调试时才调,发布模式完全看不到。于是「角色出场卡」
+                // 「切动作卡」只能靠猜。这里按桌面 `--spike-log` 的口径把
+                // 慢帧写进 logcat —— 修不修得动先放一边,至少要能量到。
+                //
+                // 阈值固定 20ms(= 60fps 下丢一帧),只读 `RenderedFrame.report`
+                // 里的既有字段,不做额外取数。
+                {
+                    let report = &rendered.report;
+                    if report.ms >= 8.0 && session.spikes_logged < 2000 {
+                        session.spikes_logged += 1;
+                        // 慢帧必须自带**归因**:只有 tick/render 两个数无法判断
+                        // 是 VM 慢还是渲染规划慢,更分不出 `plan` 里是图像加工、
+                        // 文本合成(含整层同步读回)还是绘制规划。
+                        // 真机实测 `render=76ms 而 ops 只有 14` —— 就是靠这
+                        // 组字段才定位到「文本基面同步读回」。
+                        let ph = session.engine.render_phases().unwrap_or_default();
+                        log::warn!(
+                            target: "yu-android",
+                            "[spike] frame={} tick={:.1}ms render={:.1}ms total={:.1}ms \
+                             preload={:.1}ms/{} err={} build={:.1}ms \
+                             cmds={} ops={} passes={} layers={} visible={} \
+                             plan[snap={} image={} text={} copy_text={} rest={}]us \
+                             text_cpu[rb={}us x{} asset={}us] rb={}us enc={}us",
+                            report.frame,
+                            report.tick_ms,
+                            report.render_ms,
+                            report.ms,
+                            // **`tick_ms` 包含 preload**:它从 `vm.tick_at()` 之前
+                            // 开始、到 `frame()` 之后结束,中间夹着
+                            // `preload_assets()`(纹理解码 + GPU 上传)。
+                            // 真机 566 层场景一次 `tick=2883ms` 里 render 只占
+                            // 257ms —— 差额就在预加载。不打出这几项无法归因。
+                            session.engine.preload_ms(),
+                            session.engine.preload_counts().0,
+                            session.engine.preload_counts().1,
+                            session.engine.frame_build_ms(),
+                            report.commands,
+                            report.ops,
+                            report.passes,
+                            report.layers,
+                            report.visible,
+                            ph.snap_us,
+                            ph.image_us,
+                            ph.text_us,
+                            ph.copy_text_us,
+                            ph.rest_us,
+                            ph.text_cpu_readback_us,
+                            ph.text_cpu_readbacks,
+                            ph.text_cpu_asset_us,
+                            ph.readback_us,
+                            ph.encode_us
+                        );
+                    }
+                }
                 // 音频抓取:启动满 2 秒后抓 3 秒,再落盘供数值分析。
                 if session.audio_capture_target > 0
                     && session.ticks == 120
@@ -1159,10 +1219,31 @@ pub fn status_text() -> String {
                 }
                 // 渲染阶段拆解:`readback_us` 是 GPU→CPU 整帧读回的耗时,
                 // 也是 Android 上能否跑满 60fps 的关键项。
+                //
+                // `plan` 必须拆开看:`plan_us` 是总时长,里面 `image`(图像
+                // 加工)/`text`(文本合成,**含整层同步读回**)/`snap`/`rest`
+                // 是完全不同的瓶颈,只看 plan 总数无法定位「角色出场 35ms」
+                // 这类尖峰(实测那一帧 ops 只有 14)。
                 if let Some(phases) = session.engine.render_phases() {
                     out.push_str(&format!(
-                        " phases[plan={} encode={} readback={} tail={}]us",
-                        phases.plan_us, phases.encode_us, phases.readback_us, phases.tail_us
+                        " phases[plan={} snap={} image={} text={} copy_text={} rest={} \
+                         encode={} readback={} tail={}]us \
+                         text_cpu[rb={}us x{} asset={}us/{}B cache={} store={}]",
+                        phases.plan_us,
+                        phases.snap_us,
+                        phases.image_us,
+                        phases.text_us,
+                        phases.copy_text_us,
+                        phases.rest_us,
+                        phases.encode_us,
+                        phases.readback_us,
+                        phases.tail_us,
+                        phases.text_cpu_readback_us,
+                        phases.text_cpu_readbacks,
+                        phases.text_cpu_asset_us,
+                        phases.text_cpu_asset_bytes,
+                        phases.text_cpu_cached,
+                        phases.text_cpu_stores
                     ));
                 }
                 if !session.video {

@@ -242,15 +242,48 @@ mod inner {
                 ndk_width(window.0).max(1),
                 ndk_height(window.0).max(1),
             );
+            // 呈现模式:**不用 vsync**。
+            //
+            // 帧节奏由壳的 `MainActivity` 自己控制(`sleepUntil` 补足到
+            // 1/60 秒,且错过截止时"吸收欠时、下一帧重新计时")。如果这里
+            // 再叠一层 `AutoVsync`,两层节拍会互相锁死:
+            // - 壳某一帧因 GPU 排队略超 16.7ms ⇒ vsync 呈现要等**下一个**
+            //   vblank ⇒ 这一帧变成 33ms;
+            // - 下一帧壳只睡到 +16.7ms,又撞在 vsync 窗口外 ⇒ 再等一个
+            //   vblank ⇒ 稳定掉到 30fps。
+            //
+            // 真机实测(`tick+render` 只有 6~11ms 却 `fps=31.8/37.5/39.8`)
+            // 就是这条:CPU 侧完全没有超时,帧率却腰斩。
+            //
+            // `Immediate` 让 `queue.present()` 不阻塞等 vblank,撕裂风险由
+            // 壳的固定 60Hz 节拍兜住(与桌面 `yu-cli run --mode desktop`
+            // 的 `PresentMode::AutoNoVsync` 同口径)。驱动不支持时回退到
+            // 能力表里的第一项。
+            let present_mode = if caps
+                .present_modes
+                .contains(&wgpu::PresentMode::Immediate)
+            {
+                wgpu::PresentMode::Immediate
+            } else if caps
+                .present_modes
+                .contains(&wgpu::PresentMode::AutoNoVsync)
+            {
+                wgpu::PresentMode::AutoNoVsync
+            } else {
+                caps.present_modes
+                    .first()
+                    .copied()
+                    .unwrap_or(wgpu::PresentMode::Fifo)
+            };
             let config = wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format,
                 color_space: wgpu::SurfaceColorSpace::Auto,
                 width,
                 height,
-                // 低延迟:游戏画面逐帧全量重绘,不需要额外的排队缓冲。
-                present_mode: wgpu::PresentMode::AutoVsync,
-                desired_maximum_frame_latency: 2,
+                present_mode,
+                // 单帧在途:不排队,降低呈现延迟(逐帧全量重绘不需要流水)。
+                desired_maximum_frame_latency: 1,
                 alpha_mode: caps.alpha_modes[0],
                 view_formats: vec![],
             };
