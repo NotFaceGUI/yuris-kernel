@@ -16,6 +16,8 @@
 //!
 //! 字形栅格化、字体回退全部留给 `yu-font`;本模块只给后端一个稳定的输入契约。
 
+use yu_format::Codec;
+
 use crate::layer::LayerId;
 
 /// 字体属性快照(`FONT` 命令的累积状态)。
@@ -207,8 +209,10 @@ pub struct TextRun {
 /// 坐标是**文本层局部**像素:原点是文本层/文本窗口左上角,`y` 是单元顶边。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextGlyph {
-    /// CP932 单字符字节(1 或 2 字节;控制标志不产生 glyph)。
+    /// 单字符字节(1 或 2 字节;控制标志不产生 glyph)。
     pub bytes: Vec<u8>,
+    /// 该字形所属显示 codec。
+    pub codec: yu_format::Codec,
     /// 是否全角(`_TEXT_FLAG == '2'`)。用于后端选择单元宽度。
     pub full: bool,
     /// 单元左上角 X(局部像素)。
@@ -254,8 +258,10 @@ pub enum TextFlagsSource {
 pub struct TextDraw {
     /// 目标图层。
     pub target: LayerId,
-    /// `SETSTR` 原始 CP932 字节(字符串整体)。
+    /// `SETSTR` 原始字节(字符串整体)。
     pub bytes: Vec<u8>,
+    /// 绘制时的显示 codec。
+    pub codec: yu_format::Codec,
     /// `X`(图层局部,缺省 0)。
     pub x: i64,
     /// `Y`(图层局部,缺省 0)。
@@ -340,6 +346,7 @@ impl TextDraw {
     pub fn dedup_key(&self) -> TextDrawKey {
         TextDrawKey {
             bytes: self.bytes.clone(),
+            codec: self.codec,
             x: self.x,
             y: self.y,
             set: self.set,
@@ -354,6 +361,7 @@ impl TextDraw {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TextDrawKey {
     bytes: Vec<u8>,
+    codec: Codec,
     x: i64,
     y: i64,
     set: i64,
@@ -370,6 +378,7 @@ impl TextDrawKey {
     #[must_use]
     pub fn matches_draw(&self, draw: &TextDraw) -> bool {
         self.bytes == draw.bytes
+            && self.codec == draw.codec
             && self.x == draw.x
             && self.y == draw.y
             && self.set == draw.set
@@ -404,6 +413,20 @@ pub fn layout_text(
     origin: (i64, i64),
     style: &TextStyle,
 ) -> Option<Vec<TextGlyph>> {
+    layout_text_with_codec(bytes, flags, origin, style, Codec::Cp932)
+}
+
+/// 按显示 codec 排版(全局 codec;官方 CHS 同构)。
+///
+/// 全角/半角仍以 `_TEXT_FLAG` 为准,codec 只决定“双字节怎么切”以及后端
+/// 如何解码字形。
+pub fn layout_text_with_codec(
+    bytes: &[u8],
+    flags: &[u8],
+    origin: (i64, i64),
+    style: &TextStyle,
+    codec: Codec,
+) -> Option<Vec<TextGlyph>> {
     let mut glyphs = Vec::new();
     let (mut pen_x, mut pen_y) = origin;
     let mut line_has_ink = false;
@@ -420,11 +443,12 @@ pub fn layout_text(
                     return None;
                 }
                 // 全角标志必须对应双字节字符;半角必须单字节。
-                if full != is_cp932_lead(bytes[i]) {
+                if full != codec.is_lead(bytes[i]) {
                     return None;
                 }
                 glyphs.push(TextGlyph {
                     bytes: bytes[i..i + len].to_vec(),
+                    codec,
                     full,
                     x: pen_x,
                     y: pen_y,
@@ -446,12 +470,13 @@ pub fn layout_text(
                 if i >= bytes.len() {
                     return None;
                 }
-                let len = if is_cp932_lead(bytes[i]) { 2 } else { 1 };
+                let len = if codec.is_lead(bytes[i]) { 2 } else { 1 };
                 if i + len > bytes.len() {
                     return None;
                 }
                 glyphs.push(TextGlyph {
                     bytes: bytes[i..i + len].to_vec(),
+                    codec,
                     full: len == 2,
                     x: pen_x,
                     y: pen_y,
@@ -466,11 +491,6 @@ pub fn layout_text(
         return None;
     }
     Some(glyphs)
-}
-
-/// CP932 首字节(= 双字节字符)。与 `yu-rt::text::is_lead` 同口径。
-fn is_cp932_lead(b: u8) -> bool {
-    (0x81..=0x9F).contains(&b) || (0xE0..=0xFC).contains(&b)
 }
 
 #[cfg(test)]
@@ -531,6 +551,7 @@ mod tests {
         let mut d = TextDraw {
             target: LayerId::new(b"T".to_vec()),
             bytes: vec![b'A'],
+            codec: yu_format::Codec::Cp932,
             x: 0,
             y: 0,
             style: style(),

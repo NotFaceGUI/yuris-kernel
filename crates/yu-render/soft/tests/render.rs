@@ -413,6 +413,7 @@ fn synced_text_flags_rasterize_glyphs() {
         // 全角「こ」(CP932 0x82B1)配 '2';对齐必须成功。
         layer_id: Vec::new(),
         bytes: b"\x82\xB1".to_vec(),
+        codec: yu_rt::Codec::Cp932,
         flags: b"2".to_vec(),
         output_mode: 1,
         wait_ms: 0,

@@ -59,6 +59,12 @@ pub struct Yscf {
     pub flag_28: u32,
     /// `+0x2C` 起的 8 个开关(原样保留)。
     pub switches: [u8; 8],
+    /// `+0x2C,+0x30,+0x34,+0x38,+0x3C,+0x40,+0x44` 七个 u32 原始值。
+    ///
+    /// REA `FUN_0045d950` 分别拷到 `DAT_00802888/802898/8028bc/8028c0/8028c4/8028c8/8028cc`;
+    /// 这些是文件优先级一类的配置，**不是** `DAT_0080288c` 模式位。
+    /// 本层只保留原始值供 trace，不据此改源顺序。
+    pub file_priority_raw: [u32; 7],
     /// `+0x34` 起的未命名开关区(原样保留)。
     pub unknown_34: [u8; 0x14],
     /// `+0x48` 未命名字段(原样保留)。
@@ -125,6 +131,15 @@ impl Yscf {
             sound_ext_order: buf[0x24..0x28].try_into().unwrap(),
             flag_28,
             switches: buf[0x2C..0x34].try_into().unwrap(),
+            file_priority_raw: [
+                u32_at(buf, 0x2C),
+                u32_at(buf, 0x30),
+                u32_at(buf, 0x34),
+                u32_at(buf, 0x38),
+                u32_at(buf, 0x3C),
+                u32_at(buf, 0x40),
+                u32_at(buf, 0x44),
+            ],
             unknown_34: buf[0x34..0x48].try_into().unwrap(),
             unknown_48: u32_at(buf, 0x48),
             title: buf[0x4E..0x4E + title_len].to_vec(),

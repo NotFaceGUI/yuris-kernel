@@ -79,8 +79,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         Some(value) => ArgReader::on_off("debug-mode", &value)?,
         None => false,
     };
-    // 强制字体(诊断/换字体):忽略脚本的 NAME/NO/BNO。
-    let force_font = args.flag("font").filter(|value| !value.trim().is_empty());
+    // 强制字体(诊断/换字体):family 名,或字体文件路径(宿主持久化入口)。
+    let font_arg = args.flag("font");
     // 强制存档块压缩层,覆盖自动判定(盘上既有存档 → 引擎代号 → zlib)。
     // 只影响**写盘**;读侧仍按实际流分流。
     let save_codec = match args.flag("save-codec") {
@@ -94,6 +94,13 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             }
         }),
         None => None,
+    };
+    // 补丁编码:缺省按工具产出自动识别;显式 `original` 关闭识别,
+    // `cp932`/`gbk` 强制三域 codec(诊断未知工具用)。
+    let patch = match args.flag("patch") {
+        Some(value) => yu_engine::patch::PatchSelection::parse(&value)
+            .map_err(|d| Failure::usage(format!("--patch: {d}")))?,
+        None => yu_engine::patch::PatchSelection::default(),
     };
     // 显式脚本密钥(换钥作品的兜底;缺省 = 启动时自动解析)。
     let script_key = match args.flag("script-key") {
@@ -122,15 +129,18 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let project = Project::discover(Path::new(&root), data.as_deref())?;
     // 数据入口决策留痕(stdout 报告行扩展;排查「行为为何不同」的第一事实)。
     let dataset = project.describe();
+    let (font, font_bytes) = crate::args::font_options(project.root(), font_arg)?;
     let opts = EngineOptions {
         backend,
         entry,
         record_events,
         debug_mode,
         save_root,
-        force_font,
+        font,
+        font_bytes,
         script_key,
         save_codec,
+        patch,
         // 真实运行:`@_TIME` 注入系统本地时间(存档菜单的现实日期)。
         local_time: crate::clock::local_now(),
         ..EngineOptions::default()

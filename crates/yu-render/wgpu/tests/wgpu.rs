@@ -1423,6 +1423,7 @@ fn text_layout_frames_match_soft_exactly() {
     gfx.sync_text_state(&yu_rt::text::TextSnapshot {
         layer_id: Vec::new(),
         bytes: b"A\x82\xB1B".to_vec(),
+        codec: yu_rt::Codec::Cp932,
         flags: b"121".to_vec(),
         output_mode: 1,
         wait_ms: 0,

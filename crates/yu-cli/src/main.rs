@@ -246,6 +246,11 @@ yu-cli run · 跑工程(缺省 headless;--mode desktop 开原生窗口)
   --save-root DIR      存档根重定向(缺省工程根 save/)
   --save-codec zlib|snappy  强制存档块压缩层(缺省 = 盘上既有存档 →
                        引擎代号 YSSnp.dll → zlib;只影响写盘)
+  --patch MODE         文本编码路线:auto(缺省,按产物识别)|
+                       original | gbk | tunnel(需 sjis_ext.bin)
+  --font FAMILY|PATH   强制字体:family 名,或字体文件(.ttf/.otf/.ttc/
+                       .otc;相对路径按工程根,文件里的 Bold/Italic 照常解析;
+                       查不到 = 硬失败,全角/半角与空格差异自动折叠)
   --debug-mode on|off  @_DEBUGMODE 注入(缺省 off;desktop 缺省时亦读
                        环境变量 YURIS_DEBUG_MODE=1,DIV-L-001)
 
@@ -254,8 +259,6 @@ headless 专有(缺省模式):
   --until-frame N      跑到引擎第 N 帧
   --json PATH          最后一帧 display JSON 写盘
   --record-events on|off  事件录制(缺省 off;对拍时 on)
-  --font FAMILY        强制字体(诊断/换字体;忽略脚本的 NAME/NO/BNO,
-                       family 查不到 = 硬失败;全角/半角与空格差异自动折叠)
   --log-file PATH      JSONL 日志(内核 Diag sub=diag + 门面行 sub=log;
                        每轮截断)
   --diag-summary on|off  末尾诊断汇总(缺省 on;off 时 stderr 不出诊断行)
@@ -315,7 +318,7 @@ yu-cli serve · 本地服务:服务端读数据并执行内核,浏览器只做�
   yu-cli serve <project-root> [--backend soft|wgpu] [--port 4173] [--no-open]
                [--entry LABEL] [--fps 60] [--record-events on|off]
                [--debug-mode on|off] [--data PATH] [--www DIR] [--diag-ws]
-               [--font FAMILY] [--log-file PATH] [--max-step-ms N]
+               [--font FAMILY|PATH] [--log-file PATH] [--max-step-ms N]
 
 说明:
   启动后打印 http://127.0.0.1:<port>/,默认打开浏览器。

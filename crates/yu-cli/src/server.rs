@@ -52,8 +52,10 @@ pub struct ServeOptions {
     pub diag_ws: bool,
     /// `@_DEBUGMODE` 注入(DIV-L-001;debug 语料对拍口径)。
     pub debug_mode: bool,
-    /// 强制字体 family(诊断/换字体;`None` = 脚本语义)。
-    pub force_font: Option<String>,
+    /// 强制字体 family 或字体文件路径(启动时统一解析)。
+    pub font_arg: Option<String>,
+    /// 文本编码路线(`auto|original|gbk|tunnel`)。
+    pub patch: yu_engine::patch::PatchKind,
     /// JSONL 日志路径(Q1 R4;`None` = 不落盘,关闭时只打 stderr 汇总)。
     pub log_file: Option<PathBuf>,
     /// 调试用:实时 tick 的单步上限(毫秒)。`None` = 不截断(默认,
@@ -108,7 +110,11 @@ impl ServeOptions {
                 })?),
                 None => None,
             };
-        let force_font = args.flag("font").filter(|value| !value.trim().is_empty());
+        let font_arg = args.flag("font");
+        let patch = match args.flag("patch") {
+            Some(value) => yu_engine::patch::PatchKind::parse(&value)?,
+            None => yu_engine::patch::PatchKind::Auto,
+        };
         let log_file = args.flag("log-file").map(PathBuf::from);
         let max_step_ms = match args.flag("max-step-ms") {
             Some(value) => Some(parse_u32("max-step-ms", &value)?.max(1)),
@@ -129,7 +135,8 @@ impl ServeOptions {
             pause_at,
             diag_ws,
             debug_mode,
-            force_font,
+            font_arg,
+            patch,
             log_file,
             max_step_ms,
         })
@@ -162,6 +169,7 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         ));
     let project = Project::discover(&opts.root, opts.data.as_deref())?;
     let dataset = project.describe();
+    let (font, font_bytes) = crate::args::font_options(project.root(), opts.font_arg.clone())?;
     let engine_opts = EngineOptions {
         backend: opts.backend,
         entry: opts.entry.clone(),
@@ -170,7 +178,9 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         debug_mode: opts.debug_mode,
         // 长跑宿主:首帧前预热字体表,避免第一次文本场景的 ~130ms 停顿。
         warm_text: true,
-        force_font: opts.force_font.clone(),
+        font,
+        font_bytes,
+        patch: yu_engine::patch::PatchSelection::new(opts.patch),
         // 真实运行:`@_TIME` 注入系统本地时间(存档菜单的现实日期)。
         local_time: crate::clock::local_now(),
         ..EngineOptions::default()

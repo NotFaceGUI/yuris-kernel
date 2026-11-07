@@ -7,6 +7,7 @@ fn draw(color: u32, set: i64) -> TextDraw {
     TextDraw {
         target: LayerId::new(b"T".to_vec()),
         bytes: b"A".to_vec(),
+        codec: yu_format::Codec::Cp932,
         x: 8,
         y: 4,
         style: TextStyle {

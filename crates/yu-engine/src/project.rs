@@ -98,6 +98,29 @@ impl DataEntry {
     }
 }
 
+/// 官方脚本源顺序(`FUN_0045177d` 的 `DAT_0080288c` 分支)。
+///
+/// 模式 0(PE 初值/常规) = `[0,1,3,2]`:散盘在包之前;
+/// 模式 1(`YS_RES`/`YSER` 检查置位) = `[0,1,2,3]`:包在散盘之前。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SourceOrder {
+    /// 官方 `DAT_0080288c=0`:散盘优先(默认)。
+    #[default]
+    LooseFirst,
+    /// 官方 `DAT_0080288c=1`:封包优先。
+    PackFirst,
+}
+
+impl SourceOrder {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SourceOrder::LooseFirst => "loose-first",
+            SourceOrder::PackFirst => "pack-first",
+        }
+    }
+}
+
 /// 已解析的工程根。
 #[derive(Clone, Debug)]
 pub struct Project {
@@ -107,8 +130,10 @@ pub struct Project {
     data_root: PathBuf,
     /// 封包层。
     packs: PackSet,
-    /// 散盘叠层(存在时位于包之上;发行版根目录/开发工程 `data/`)。
+    /// 散盘叠层(存在时参与官方四源顺序;发行版根目录/开发工程 `data/`)。
     loose: Option<PathBuf>,
+    /// 官方脚本源顺序(默认模式 0:loose-first)。
+    source_order: SourceOrder,
     /// 运行时合成资产叠层(挂载栈最高优先;`LOAD[ID]` 缩略图)。
     ///
     /// 内容哈希命名 ⇒ 重复写入幂等;所有 `open_source()`/`mount()` 出来的
@@ -288,6 +313,7 @@ impl Project {
             data_root: data_root.to_path_buf(),
             packs,
             loose,
+            source_order: SourceOrder::default(),
             overlay,
         })
     }
@@ -338,30 +364,62 @@ impl Project {
         self.packs.updates.clone()
     }
 
-    /// 打开主数据源(每次 boot 独立打开;文件句柄不复用)。
+    /// 当前官方脚本源顺序。
+    pub fn source_order(&self) -> SourceOrder {
+        self.source_order
+    }
+
+    /// 显式覆盖源顺序(CLI/测试;默认按官方模式 0)。
+    pub fn set_source_order(&mut self, order: SourceOrder) {
+        self.source_order = order;
+    }
+
+    /// 把基础包、增量层、散盘按官方顺序压入挂载栈。
     ///
-    /// 返回 `基础层 + update1..9 + 合成资产叠层` 的叠加栈([`Mount`]);
-    /// 基础层 = 全部基础包(没有包时是散盘目录)。叠层是 `LOAD[ID]`
-    /// 缩略图的写入点,必须始终在位。
-    pub fn open_source(&self) -> Result<Box<dyn DataSource>, Failure> {
-        let mut mount = Mount::new(CODEC);
-        if self.packs.base.is_empty() {
-            if let Some(dir) = &self.loose {
-                mount.push(Box::new(DirSource::open(dir, CODEC).map_err(|d| {
-                    Failure::runtime(format!("打开 {} 失败: {d}", dir.display()))
-                })?));
+    /// `Mount` 后挂覆盖:
+    /// - `LooseFirst`(模式 0):pack → loose,散盘最终在上;
+    /// - `PackFirst`(模式 1):loose → pack,包最终在上。
+    fn push_sources(&self, mount: &mut Mount) -> Result<(), Failure> {
+        match self.source_order {
+            SourceOrder::LooseFirst => {
+                self.push_packs(mount)?;
+                self.push_loose(mount)?;
             }
-        } else {
-            for path in &self.packs.base {
-                mount.push(Box::new(open_ypf(path)?));
+            SourceOrder::PackFirst => {
+                self.push_loose(mount)?;
+                self.push_packs(mount)?;
             }
+        }
+        // 合成资产叠层始终置顶(`LOAD[ID]` 缩略图)。
+        mount.push(Box::new(self.overlay.clone()));
+        Ok(())
+    }
+
+    fn push_packs(&self, mount: &mut Mount) -> Result<(), Failure> {
+        for path in &self.packs.base {
+            mount.push(Box::new(open_ypf(path)?));
         }
         for path in &self.packs.updates {
             mount.push(Box::new(open_ypf(path)?));
         }
-        // 合成资产叠层始终置顶:`LOAD[ID]` 的缩略图以内容哈希命名写入,
-        // 任何位置读取都拿到同一份字节。
-        mount.push(Box::new(self.overlay.clone()));
+        Ok(())
+    }
+
+    fn push_loose(&self, mount: &mut Mount) -> Result<(), Failure> {
+        if let Some(dir) = &self.loose {
+            if dir.is_dir() {
+                mount.push(Box::new(DirSource::open(dir, CODEC).map_err(|d| {
+                    Failure::runtime(format!("打开 {} 失败: {d}", dir.display()))
+                })?));
+            }
+        }
+        Ok(())
+    }
+
+    /// 打开主数据源(每次 boot 独立打开;文件句柄不复用)。
+    pub fn open_source(&self) -> Result<Box<dyn DataSource>, Failure> {
+        let mut mount = Mount::new(CODEC);
+        self.push_sources(&mut mount)?;
         Ok(Box::new(mount))
     }
 
@@ -377,24 +435,10 @@ impl Project {
         )?))
     }
 
-    /// 纹理挂载栈:`基础包 → update1..9 → 散盘 → 合成资产叠层`(后来者
-    /// 覆盖;叠层置顶,`LOAD[ID]` 的缩略图不会被同名的官方资产遮住)。
+    /// 纹理挂载栈:与 [`Project::open_source`] 共用官方源顺序。
     pub fn mount(&self) -> Result<Mount, Failure> {
         let mut mount = Mount::new(CODEC);
-        for path in &self.packs.base {
-            mount.push(Box::new(open_ypf(path)?));
-        }
-        for path in &self.packs.updates {
-            mount.push(Box::new(open_ypf(path)?));
-        }
-        if let Some(dir) = &self.loose {
-            if dir.is_dir() {
-                mount.push(Box::new(DirSource::open(dir, CODEC).map_err(|d| {
-                    Failure::runtime(format!("打开 {} 失败: {d}", dir.display()))
-                })?));
-            }
-        }
-        mount.push(Box::new(self.overlay.clone()));
+        self.push_sources(&mut mount)?;
         Ok(mount)
     }
 
@@ -627,6 +671,46 @@ mod tests {
             .open(&LookupKey::new(b"nope.txt", CODEC).unwrap())
             .unwrap_err();
         assert_eq!(diag.code, vfs::MISSING);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn open_source_defaults_to_official_loose_first() {
+        let root = temp_root("loose-first");
+        write_pack(
+            &root.join("data.ypf"),
+            &[(b"shared.txt".as_slice(), b"pack"), (b"pack-only.txt", b"pack")],
+        );
+        std::fs::create_dir_all(root.join("data/ysbin")).unwrap();
+        std::fs::write(root.join("data/shared.txt"), b"loose").unwrap();
+        std::fs::write(root.join("data/ysbin/a.ybn"), b"script").unwrap();
+
+        let project = Project::discover(&root, None).unwrap();
+        assert_eq!(project.source_order(), SourceOrder::LooseFirst);
+        let source = project.open_source().unwrap();
+        assert_eq!(lookup(source.as_ref(), b"shared.txt"), b"loose");
+        assert_eq!(lookup(source.as_ref(), b"pack-only.txt"), b"pack");
+        assert_eq!(lookup(source.as_ref(), b"ysbin/a.ybn"), b"script");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pack_first_source_order_puts_pack_above_loose() {
+        let root = temp_root("pack-first");
+        write_pack(
+            &root.join("data.ypf"),
+            &[(b"shared.txt".as_slice(), b"pack"), (b"pack-only.txt", b"pack")],
+        );
+        std::fs::create_dir_all(root.join("data/ysbin")).unwrap();
+        std::fs::write(root.join("data/shared.txt"), b"loose").unwrap();
+        std::fs::write(root.join("data/ysbin/a.ybn"), b"script").unwrap();
+
+        let mut project = Project::discover(&root, None).unwrap();
+        project.set_source_order(SourceOrder::PackFirst);
+        let source = project.open_source().unwrap();
+        assert_eq!(lookup(source.as_ref(), b"shared.txt"), b"pack");
+        assert_eq!(lookup(source.as_ref(), b"pack-only.txt"), b"pack");
+        assert_eq!(lookup(source.as_ref(), b"ysbin/a.ybn"), b"script");
         std::fs::remove_dir_all(&root).ok();
     }
 

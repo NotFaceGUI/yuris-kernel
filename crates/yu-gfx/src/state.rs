@@ -24,6 +24,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
 
+use yu_format::text::DisplayConfig;
+use yu_format::Codec;
 use yu_log::Diag;
 use yu_rt::event::{ArgValue, Domain, VmEvent};
 use yu_rt::tables::TableSet;
@@ -45,7 +47,7 @@ use crate::pass::{Pass, PassTarget};
 use crate::path;
 use crate::table::ParamTable;
 use crate::text::{
-    layout_text, TextDraw, TextDrawKey, TextFlagsSource, TextLayoutFrame, TextRun, TextStyle,
+    TextDraw, TextDrawKey, TextFlagsSource, TextLayoutFrame, TextRun, TextStyle,
     MAX_TEXT_DRAWS_PER_LAYER,
 };
 use crate::transition::TransitionDraw;
@@ -78,6 +80,8 @@ pub struct GfxConfig {
     /// 「NO=0 がメインウィンドウ、１～３がサブウィンドウ」「CGID=表示対象の
     /// レイヤセット」。默认 `:/W0`。
     pub main_layer_set: LayerId,
+    /// 显示层 codec(逐脚本/逐载荷/隧道)。原版默认 CP932。
+    pub display: DisplayConfig,
 }
 
 impl GfxConfig {
@@ -90,7 +94,14 @@ impl GfxConfig {
             image_probe_order: Vec::new(),
             dx_mode: 0,
             main_layer_set: LayerId::new(b":/W0".to_vec()),
+            display: DisplayConfig::default(),
         }
+    }
+
+    /// 注入显示层 codec 配置(链式构造)。
+    pub fn with_display(mut self, display: DisplayConfig) -> Self {
+        self.display = display;
+        self
     }
 
     /// 宿主注入 `_DXMODE`(链式构造)。
@@ -103,7 +114,6 @@ impl GfxConfig {
 /// 状态生产日志的硬上限。`image_log` 可能因同一层反复加工而增长;
 /// 超限时丢弃最旧项并计数,避免内存无界(行为在诊断里显式可见)。
 const MAX_OP_LOG: usize = 16_384;
-
 struct Node {
     layer: Layer,
     parent: Option<LayerId>,
@@ -608,8 +618,20 @@ impl GfxState {
         buf.origin = (snapshot.cursor_x, snapshot.cursor_y);
     }
 
+    /// `SETSTR` 载荷的显示 codec:全局显示 codec(与官方 CHS 同构)。
+    fn payload_codec(&self, _bytes: &[u8]) -> Codec {
+        self.config.display.default
+    }
+
+    /// 显示层 codec(全局)。
+    fn current_text_codec(&self) -> yu_format::Codec {
+        self.config.display.default
+    }
+
     fn write_text_state(&mut self, id: &LayerId, bytes: &[u8], flags: &[u8]) {
-        let mismatch = layout_text(bytes, flags, (0, 0), &self.style).is_none();
+        let codec = self.config.display.default;
+        let mismatch = crate::text::layout_text_with_codec(bytes, flags, (0, 0), &self.style, codec)
+            .is_none();
         let buf = self.text_layers.entry(id.clone()).or_default();
         buf.bytes = bytes.to_vec();
         buf.flags = if mismatch { None } else { Some(flags.to_vec()) };
@@ -1288,7 +1310,13 @@ impl GfxState {
             return None;
         }
         let flags = b.flags.as_deref()?;
-        let glyphs = layout_text(&b.bytes, flags, b.origin, &b.style)?;
+        let glyphs = crate::text::layout_text_with_codec(
+            &b.bytes,
+            flags,
+            b.origin,
+            &b.style,
+            self.current_text_codec(),
+        )?;
         if glyphs.is_empty() {
             return None;
         }
@@ -3799,10 +3827,15 @@ impl GfxState {
             );
             return;
         };
-        let set = set.as_ref().and_then(EngineValue::as_int).unwrap_or(0);
+        // SET 缺省 0(单次合成);引擎默认值。
+        let set = set.as_ref().and_then(EngineValue::as_int).unwrap_or(0); // 缺省
+        // `SETSTR` 常常由系统脚本 `es_Text` 转发 `$_TEXT` 的字节;来源
+        // codec 已由 `VmEvent::Text` 登记,不能按绘制脚本猜。
+        let codec = self.payload_codec(&bytes);
         let draw = TextDraw {
             target: target.clone(),
             bytes,
+            codec,
             // 字符绘制按整数像素落位(与 `CGACT[TEXT]` 的整数语义一致)。
             x: x.map(|v| v.round() as i64).unwrap_or(0),
             y: y.map(|v| v.round() as i64).unwrap_or(0),
@@ -3923,6 +3956,7 @@ impl GfxState {
             let draw = TextDraw {
                 target: t.clone(),
                 bytes: Vec::new(),
+                codec: self.current_text_codec(),
                 x: x.map(|v| v.round() as i64).unwrap_or(0),
                 y: y.map(|v| v.round() as i64).unwrap_or(0),
                 style: self.style.clone(),
@@ -5620,8 +5654,7 @@ fn arg_type_diag(command: &str, name: &str, expected: &str) -> Diag {
     )
 }
 
-fn flag_value(v: &Value) -> bool {
-    match v {
+fn flag_value(v: &Value) -> bool {    match v {
         Value::Int(i) => *i != 0,
         Value::Float(f) => *f != 0.0,
         Value::Str(b) => !b.is_empty(),

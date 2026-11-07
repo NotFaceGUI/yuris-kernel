@@ -153,6 +153,24 @@ impl Backend {
 /// 再导出 `yu_format::yssd::BlockCodec`,让宿主不必额外依赖 `yu-format`。
 pub use yu_format::yssd::BlockCodec;
 
+/// 字体选择(跨平台统一;桌面/Android/serve 同口径)。
+///
+/// 字体**字节**走 [`EngineOptions::font_bytes`],这里只决定“用哪个 face”:
+/// 脚本默认、强制 family、或强制宿主注入字节里的某个字体文件。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum FontChoice {
+    /// 按脚本 `NAME`/`NO`/`BNO` 解析(默认)。
+    #[default]
+    Script,
+    /// 强制 family 名(系统字体或已注入字体)。
+    Family(String),
+    /// 强制使用 `font_bytes[index]` 的第一个 family。
+    ///
+    /// 桌面 `--font <path>` 把文件读成字节后填 `font_bytes` 并选本项;
+    /// Android 注入 assets 字体时同样可用,不需要任何路径 API。
+    HostFont(usize),
+}
+
 /// 引擎运行参数(全部由宿主给值;内核不猜)。
 #[derive(Clone, Debug)]
 pub struct EngineOptions {
@@ -206,10 +224,8 @@ pub struct EngineOptions {
     /// `None` 项走平台默认解析;Android 这类没有 `USERPROFILE` 的宿主
     /// 用它把 app 私有目录 / 外置卡目录喂进来。
     pub path_overrides: HostPathOverrides,
-    /// 强制字体 family(诊断/换字体):`Some` 时所有 `FONT` 请求都解析到它,
-    /// 忽略脚本给的 `NAME`/`NO`/`BNO`。查不到 family 就显式失败,不回落
-    /// 引擎默认表 —— 否则会“以为换上了其实没换”。
-    pub force_font: Option<String>,
+    /// 字体选择(跨平台统一入口;与 [`Self::font_bytes`] 配合)。
+    pub font: FontChoice,
     /// 显式脚本密钥(YSTB 分段异或)。`None` = 启动时解析
     /// (`exe` 扫描 → 数据自举 → 默认值,见 [`crate::keys`])。
     pub script_key: Option<[u8; 4]>,
@@ -221,6 +237,8 @@ pub struct EngineOptions {
     /// 启动期从工程根 exe 抽取窗口图标(桌面宿主用;默认 false = 不读)。
     /// 图标是宿主资源,headless/用例不付出这次文件读取。
     pub with_icon: bool,
+    /// 文本编码路线(跨平台统一入口)。默认 `Auto`(按产物识别)。
+    pub patch: crate::patch::PatchSelection,
 }
 
 impl Default for EngineOptions {
@@ -243,10 +261,11 @@ impl Default for EngineOptions {
             font_bytes: Vec::new(),
             warm_text: false,
             path_overrides: HostPathOverrides::default(),
-            force_font: None,
+            font: FontChoice::Script,
             script_key: None,
             save_codec: None,
             with_icon: false,
+            patch: crate::patch::PatchSelection::default(),
         }
     }
 }
@@ -510,6 +529,21 @@ impl Renderer {
         }
     }
 
+    /// 注入显示层隧道表(补丁路线 C;两端都注入,对账才同口径)。
+    fn set_text_tunnel(&mut self, tunnel: Option<yu_format::text::TunnelTable>) {
+        match self {
+            Renderer::Soft(renderer) => renderer.text_composer().set_tunnel(tunnel),
+            Renderer::Wgpu {
+                renderer, check, ..
+            } => {
+                renderer.text_composer().set_tunnel(tunnel.clone());
+                if let Some(soft) = check.as_mut() {
+                    soft.text_composer().set_tunnel(tunnel);
+                }
+            }
+        }
+    }
+
     /// 宿主提供的字体清单(`FONTINFO[NUM/LANG/NAME NO=]` 的数据源)。
     ///
     /// **字体选择当前禁用**:清单只含引擎默认 family 一项。B7(宿主能力面)
@@ -659,8 +693,17 @@ pub struct Engine {
 impl Engine {
     pub fn new(project: Project, opts: EngineOptions) -> CliResult<Self> {
         let boot_started = Instant::now();
-        let (vm, state, sound, save_host, viewport, probe_order, mut capture_bridge, identity) =
-            boot(&project, &opts)?;
+        let BootBundle {
+            vm,
+            state,
+            sound,
+            save_host,
+            viewport,
+            probe_order,
+            mut capture_bridge,
+            identity,
+            display,
+        } = boot(&project, &opts)?;
         let boot_ms = boot_started.elapsed().as_secs_f64() * 1000.0;
 
         let renderer_started = Instant::now();
@@ -705,6 +748,10 @@ impl Engine {
                 Renderer::Soft(_) => bridge.set_eager(true),
             }
         }
+        // 显示层隧道表必须在首帧文本前注入;后端初始化时还没有 profile。
+        if display.tunnel.is_some() {
+            renderer.set_text_tunnel(display.tunnel.clone());
+        }
         // 宿主附加字体字节(跨平台注入口):必须在任何字体枚举/文本解析前
         // 注入 —— 无系统字体的目标(浏览器)只有这一条来源;Android 用它
         // 补游戏指定 family。空 = 走平台默认枚举,行为与旧版一致。
@@ -718,15 +765,39 @@ impl Engine {
         } else {
             0.0
         };
-        // 强制字体必须在任何文本绘制之前生效(此时还没人解析过 FONT,
+        // 字体选择必须在任何文本绘制之前生效(此时还没人解析过 FONT,
         // 所以不需要清缓存;`set_force_font` 自己会清)。
-        if let Some(family) = &opts.force_font {
-            renderer.set_force_font(Some(family.clone()));
-            log::info!(
-                target: "yu-font",
-                "[font] forced by --font: all FONT requests -> family \"{family}\" \
-                 (script NAME/NO/BNO ignored; unresolvable family = hard failure)"
-            );
+        match &opts.font {
+            FontChoice::Script => {}
+            FontChoice::Family(family) => {
+                renderer.set_force_font(Some(family.clone()));
+                log::info!(
+                    target: "yu-font",
+                    "[font] forced by host: all FONT requests -> family \"{family}\" \
+                     (script NAME/NO/BNO ignored; unresolvable family = hard failure)"
+                );
+            }
+            FontChoice::HostFont(index) => {
+                let bytes = opts.font_bytes.get(*index).ok_or_else(|| {
+                    Failure::runtime(format!(
+                        "FontChoice::HostFont({index}) 越界:font_bytes 只有 {} 项",
+                        opts.font_bytes.len()
+                    ))
+                })?;
+                let family = yu_font::families_from_bytes(bytes)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        Failure::runtime(format!(
+                            "font_bytes[{index}] 没有可用 family(fontdb 未识别)"
+                        ))
+                    })?;
+                renderer.set_force_font(Some(family.clone()));
+                log::info!(
+                    target: "yu-font",
+                    "[font] forced by host: font_bytes[{index}] -> family \"{family}\""
+                );
+            }
         }
         // 字体清单注入(手册无页;引擎语义 = EnumFontFamiliesExA 枚举,
         // 2026-10-24 政策按宿主能力实现并标注)。**选择禁用中**:只注入
@@ -1959,8 +2030,15 @@ impl Engine {
         // 重启轮把 `with_icon` 关掉(身份字段本身不覆盖)。
         let mut restart_opts = self.opts.clone();
         restart_opts.with_icon = false;
-        let (vm, state, sound, save_host, viewport, _, capture_bridge, _identity) =
-            boot(&self.project, &restart_opts)?;
+        let BootBundle {
+            vm,
+            state,
+            sound,
+            save_host,
+            viewport,
+            capture_bridge,
+            ..
+        } = boot(&self.project, &restart_opts)?;
         self.boot_ms = started.elapsed().as_secs_f64() * 1000.0;
         self.vm = Some(vm);
         self.state = Some(state);
@@ -2073,16 +2151,19 @@ impl SoundLoader for VfsSoundLoader {
 }
 
 /// boot 产物:`Vm` + 共享 `GfxState` + 声音/存档域宿主 + 视口 + 纹理探测顺序。
-type BootBundle = (
-    Vm,
-    Rc<RefCell<GfxState>>,
-    Option<Arc<Mutex<SoundState>>>,
-    Option<SaveHost>,
-    Viewport,
-    Vec<yu_gfx::ImageFormat>,
-    Option<crate::capture::SharedCapture>,
-    crate::identity::Identity,
-);
+/// boot 的完整产物(VM/GFX/声音/存档 + 宿主需要的显示配置)。
+struct BootBundle {
+    vm: Vm,
+    state: Rc<RefCell<GfxState>>,
+    sound: Option<Arc<Mutex<SoundState>>>,
+    save_host: Option<SaveHost>,
+    viewport: Viewport,
+    probe_order: Vec<yu_gfx::ImageFormat>,
+    capture_bridge: Option<crate::capture::SharedCapture>,
+    identity: crate::identity::Identity,
+    /// 显示层 codec 配置(隧道表在渲染器初始化前注入)。
+    display: yu_format::text::DisplayConfig,
+}
 
 /// `CGINFO[ONMOUSE*]` 的像素采样面。
 ///
@@ -2145,6 +2226,16 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         script_key.hex(),
         script_key.source.describe()
     );
+    // 翻译补丁识别只在这里发生一次:VM 执行层 codec 与显示层配置分开落地,
+    // 启动路径不再按文本统计猜编码。
+    let patch_profile = opts.patch.profile(project)?;
+    log::info!(
+        target: "yu-cli::engine",
+        "patch: {} evidence={:?}",
+        patch_profile.summary(),
+        patch_profile.evidence
+    );
+    let display = patch_profile.display();
     let boot = BootConfig {
         entry_label: opts.entry.clone(),
         fps: opts.fps,
@@ -2165,6 +2256,8 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         // `FUN_00460c80` 读 `<app>\yssfs.dat`,CRT fread 明文,只接受 0..=3)。
         // 文件缺失/全零 ⇒ 0,与官方等价。
         save_path_type: i64::from(read_save_path_type(project.root(), project.aux_root())),
+        codecs: patch_profile.codecs(),
+        display: display.clone(),
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(source, Some(aux), boot)
@@ -2201,8 +2294,9 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
             from_config
         }
     };
-    let mut gfx_state = GfxState::from_tables(vm.tables(), GfxConfig::new(viewport))
-        .map_err(|d| Failure::runtime(format!("GfxState 构造失败: {d}")))?;
+    let mut gfx_state =
+        GfxState::from_tables(vm.tables(), GfxConfig::new(viewport).with_display(display.clone()))
+            .map_err(|d| Failure::runtime(format!("GfxState 构造失败: {d}")))?;
     // 引擎全局纹理过滤真值:`FUN_00460924` 读完 `yscfg.dat` 后**无条件**写
     // `MAG=1`/`MIN=1`/`MIP=0`(LINEAR/LINEAR/POINT,无各向异性),不从设置
     // 文件读(docs/render-parity.md §4)。此前从未注入,后端一直用
@@ -2295,16 +2389,17 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         "startup: boot rest (gfx/sound/save)={:.1}ms",
         boot_started.elapsed().as_secs_f64() * 1000.0
     );
-    Ok((
+    Ok(BootBundle {
         vm,
         state,
-        sound_state,
+        sound: sound_state,
         save_host,
         viewport,
         probe_order,
         capture_bridge,
         identity,
-    ))
+        display,
+    })
 }
 
 fn compare_reports(soft: &RenderReport, wgpu: &RenderReport) -> Result<(), Failure> {

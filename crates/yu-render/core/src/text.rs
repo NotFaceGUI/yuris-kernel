@@ -27,6 +27,8 @@ use yu_font::{
     ENGINE_DEFAULT_FAMILIES,
 };
 use yu_font::{StylePolicy, TextStyle as FontStyle};
+use yu_format::text::{TextCodec, TunnelTable};
+use yu_format::Codec;
 use yu_gfx::{LayerId, TextDraw, TextDrawKey, TextFontRequest, TextLayoutFrame, TextureRef};
 
 use crate::texture::Texture;
@@ -87,13 +89,6 @@ pub struct TextComposer {
     /// (DIV-GFX-058),内容没变就不该每帧重烤。键 = 层 + 文本修订号 +
     /// 基面身份;自动文本层(布局每帧变化)不进缓存。
     compose_cache: BTreeMap<LayerId, ComposeCacheEntry>,
-    /// `face -> 是否存在真实粗体面`(weight>=600)。**缓存**:
-    /// `FontSource::resolve_style` 内部走 fontdb 查询,每帧每文本项调用一次
-    /// 会拖出秒级 render 尖峰(实测 1061ms),因此只在首次解析时求值。
-    real_bold: BTreeMap<yu_font::FaceId, bool>,
-    /// 「要求 BOLD 但本机无粗体面」待报告(发现时置位,发出后清除;
-    /// 不逐帧重发,避免刷帧日志)。
-    pending_bold_note: bool,
     /// 系统字体源的摘要(face 数 + 引擎默认 family 实际落到的 face/文件)。
     /// `ensure()` 成功时填一次;日志按 `YU_LOG`/`--log-level` 的 info 级输出。
     source_summary: Option<String>,
@@ -103,6 +98,8 @@ pub struct TextComposer {
     /// 查不到时不用引擎回退表兜底 —— 强制指定就该显式失败,否则用户会
     /// 以为换上了、其实画的还是默认字体。
     force_font: Option<String>,
+    /// SJIS 隧道表(`sjis_ext.bin`;补丁路线 C)。`None` = 无隧道。
+    tunnel: Option<TunnelTable>,
     /// 合成缓存当前字节占用(`ComposeCacheEntry::bytes` 之和)。
     cache_bytes: u64,
     /// 文本基面 CPU 像素缓存:键 = (层, 基面身份 `raw.hash`)。
@@ -316,10 +313,9 @@ impl TextComposer {
             faces: BTreeMap::new(),
             load_ms: None,
             compose_cache: BTreeMap::new(),
-            real_bold: BTreeMap::new(),
-            pending_bold_note: false,
             source_summary: None,
             force_font: None,
+            tunnel: None,
             cache_bytes: 0,
             base_cache: BTreeMap::new(),
             base_cache_bytes: 0,
@@ -341,10 +337,9 @@ impl TextComposer {
             faces: BTreeMap::new(),
             load_ms: None,
             compose_cache: BTreeMap::new(),
-            real_bold: BTreeMap::new(),
-            pending_bold_note: false,
             source_summary: None,
             force_font: None,
+            tunnel: None,
             cache_bytes: 0,
             base_cache: BTreeMap::new(),
             base_cache_bytes: 0,
@@ -397,6 +392,36 @@ impl TextComposer {
     pub fn set_force_font(&mut self, family: Option<String>) {
         self.force_font = family;
         self.faces.clear();
+    }
+
+    /// 注入 SJIS 隧道表(补丁路线 C);`None` = 关闭。
+    ///
+    /// 隧道改变字节→字符解释,已合成/基面缓存必须整体作废。
+    pub fn set_tunnel(&mut self, tunnel: Option<TunnelTable>) {
+        if self.tunnel == tunnel {
+            return;
+        }
+        self.tunnel = tunnel;
+        self.compose_cache.clear();
+        self.base_cache.clear();
+        self.cache_bytes = 0;
+        self.base_cache_bytes = 0;
+    }
+
+    /// 按显示 codec + 隧道解码整段文本。
+    fn decode_display(&self, codec: Codec, bytes: &[u8]) -> (Vec<char>, usize) {
+        match &self.tunnel {
+            Some(tunnel) => TextCodec::with_tunnel(codec, tunnel).decode_lossy(bytes),
+            None => TextCodec::new(codec).decode_lossy(bytes),
+        }
+    }
+
+    /// 单个字形单元(1/2 字节)按显示 codec + 隧道解码。
+    fn decode_display_char(&self, codec: Codec, bytes: &[u8]) -> Option<char> {
+        match &self.tunnel {
+            Some(tunnel) => TextCodec::with_tunnel(codec, tunnel).decode_char(bytes),
+            None => TextCodec::new(codec).decode_char(bytes),
+        }
     }
 
     /// 当前的强制字体 family。
@@ -472,7 +497,6 @@ impl TextComposer {
                 self.failure = None;
                 // 字体身份变了,已解析/已合成的缓存全部失效。
                 self.faces.clear();
-                self.real_bold.clear();
                 self.compose_cache.clear();
                 self.base_cache.clear();
                 self.cache_bytes = 0;
@@ -653,31 +677,6 @@ impl TextComposer {
         } else {
             DrawMode::Replace
         };
-        // BOLD:只接受真实粗体面。本机 family 无 weight>=600 的 face 时
-        // **不做合成加粗**(实测合成膨胀让墨迹 +70%,与官方截图不符),
-        // 按原 face 绘制并显式报告 `text.font.bold_missing`。
-        if s.bold {
-            let has_real = match self.real_bold.get(&face) {
-                Some(&v) => v,
-                None => {
-                    // 纯内存表扫描(不触发 fontdb 加载 ⇒ 无单帧尖峰)。
-                    let v = self
-                        .renderer
-                        .as_ref()
-                        .expect("ensured above")
-                        .source()
-                        .family_has_bold(face);
-                    self.real_bold.insert(face, v);
-                    if !v {
-                        self.pending_bold_note = true;
-                    }
-                    v
-                }
-            };
-            if !has_real {
-                s.bold = false;
-            }
-        }
         Some((s, sy, fallback))
     }
 
@@ -705,12 +704,6 @@ impl TextComposer {
             stats.note("text.font_missing");
             return;
         };
-        if self.pending_bold_note {
-            self.pending_bold_note = false;
-            stats.note(
-                "text.font.bold_missing: 本机 family 无粗体面(weight>=600);按原 face 绘制,不做合成加粗",
-            );
-        }
         match &fallback {
             FaceFallback::None => {}
             FaceFallback::Name(bytes) => stats.note(&format!(
@@ -734,9 +727,9 @@ impl TextComposer {
         // (REA `FUN_004056b8`;见 `TextDraw::composite_offsets`)。
         // 同位置叠 9 次会把 AA 边缘压实成实心 ⇒ 字变粗变白。
         let (offsets, passes) = draw.composite_offsets();
-        let decoded = cp932::decode(&draw.bytes);
-        if decoded.invalid > 0 {
-            stats.missing += decoded.invalid;
+        let (chars, invalid) = self.decode_display(draw.codec, &draw.bytes);
+        if invalid > 0 {
+            stats.missing += invalid;
             stats.note("text.decode_invalid");
         }
         let mut pen_x = draw.x as i32;
@@ -745,7 +738,7 @@ impl TextComposer {
         let mut drew_any = false;
         let mut dbg_glyph_ns: u128 = 0;
         let mut dbg_draw_ns: u128 = 0;
-        for ch in &decoded.chars {
+        for ch in &chars {
             let tg = std::time::Instant::now();
             let rendered = renderer.render_glyph(*ch, &font_style, StylePolicy::Reference);
             dbg_glyph_ns += tg.elapsed().as_nanos();
@@ -774,7 +767,7 @@ impl TextComposer {
             log::trace!(
                 target: "yu-render",
                 "[p8] draw chars={} glyph={}us onto={}us passes={}",
-                decoded.chars.len(),
+                chars.len(),
                 dbg_glyph_ns / 1000,
                 dbg_draw_ns / 1000,
                 passes
@@ -810,15 +803,15 @@ impl TextComposer {
         };
         let blended = font_style.draw_mode == DrawMode::Blend;
         let (offsets, passes) = draw.composite_offsets();
-        let decoded = cp932::decode(&draw.bytes);
-        if decoded.invalid > 0 {
+        let (chars, invalid) = self.decode_display(draw.codec, &draw.bytes);
+        if invalid > 0 {
             return Err("text.decode_invalid".to_string());
         }
         let mut pen_x = draw.x as i32;
         let baseline = draw.y as i32 + ascent;
         let renderer = self.renderer.as_mut().expect("ensured above");
         let mut out = Vec::new();
-        for ch in &decoded.chars {
+        for ch in &chars {
             let image = renderer
                 .render_glyph(*ch, &font_style, StylePolicy::Reference)
                 .map_err(|d| d.detail.clone())?;
@@ -1057,10 +1050,17 @@ impl TextComposer {
         };
         // 自动文本层:1 次合成(引擎未取证重复;`_TEXT_FLAG` 只控排版)。
         let blended = blend_override.unwrap_or(font_style.draw_mode == DrawMode::Blend);
-        let renderer = self.renderer.as_mut().expect("ensured above");
         let visible = layout.reveal.unwrap_or(usize::MAX);
-        for glyph in layout.glyphs.iter().take(visible) {
-            let Some(ch) = cp932::decode_char(&glyph.bytes) else {
+        // 先解码再取 `renderer` 的 &mut,避免和 `decode_display_char(&self)` 打架。
+        let decoded: Vec<Option<char>> = layout
+            .glyphs
+            .iter()
+            .take(visible)
+            .map(|glyph| self.decode_display_char(glyph.codec, &glyph.bytes))
+            .collect();
+        let renderer = self.renderer.as_mut().expect("ensured above");
+        for (glyph, ch) in layout.glyphs.iter().take(visible).zip(decoded) {
+            let Some(ch) = ch else {
                 stats.missing += 1;
                 stats.note("text.decode_invalid");
                 continue;
@@ -1480,6 +1480,7 @@ mod image_glyph_tests {
         TextDraw {
             target: LayerId::new(b"T".to_vec()),
             bytes: Vec::new(),
+            codec: yu_format::Codec::Cp932,
             x,
             y,
             style: TextStyle::default(),

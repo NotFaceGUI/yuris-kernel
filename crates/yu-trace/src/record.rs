@@ -676,6 +676,10 @@ impl BootSummary {
             save_path_type: 0,
             rng_seed: self.host.rng_seed,
             record_events: true,
+            // trace 回放固定原版编码;补丁语料需要显式携带 profile 的回放,
+            // 现有 trace 头没有该字段,按 CP932 回放(不是静默兜底,是记录缺失)。
+            codecs: yu_rt::CodecConfig::default(),
+            display: yu_rt::DisplayConfig::default(),
         })
     }
 }

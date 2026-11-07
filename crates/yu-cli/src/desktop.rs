@@ -111,6 +111,13 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         }),
         None => None,
     };
+    let patch = match args.flag("patch") {
+        Some(value) => yu_engine::patch::PatchSelection::parse(&value)
+            .map_err(|d| Failure::usage(format!("--patch: {d}")))?,
+        None => yu_engine::patch::PatchSelection::default(),
+    };
+    // 强制字体(与 headless 同一套 `font_options`:family 或字体文件)。
+    let font_arg = args.flag("font");
     args.finish()?;
 
     // 统一控制台(Q1 R2/R4):日志/panic 防线必须早于 boot;JSONL 单写者
@@ -181,6 +188,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
 
     let project =
         Project::discover(Path::new(&root), data.as_deref()).map_err(|error| error.to_string())?;
+    let (font, font_bytes) = crate::args::font_options(project.root(), font_arg)?;
     // 决策分支留痕(减少排查时间):数据入口选了哪条、调试口径、帧率——
     // 排查「为什么行为不同」时第一眼就要看的事实。
     {
@@ -220,10 +228,12 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         // 桌面宿主:启动时预枚举系统字体,避免第一次打开テキスト页签
         // 付 ~130ms 的 fontdb 枚举(实测)。
         warm_text: true,
-        force_font: None,
+        font,
         // 脚本密钥缺省由启动期解析(exe 扫描/数据自举/默认值)。
         script_key: None,
         save_codec,
+        // 补丁编码:缺省按工具产出自动识别,可用 `--patch` 覆盖。
+        patch,
         // 窗口图标:从工程根 exe 的 RT_GROUP_ICON 抽(官方 YSIcon.exe
         // 写的就是这份资源),只有桌面宿主用得到。
         with_icon: true,
@@ -236,7 +246,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         },
         // 桌面有真实文件系统与系统字体:两个跨平台注入口保持默认(空),
         // 路径系统变量走平台默认解析(HOME/USERPROFILE)。
-        font_bytes: Vec::new(),
+        font_bytes,
         path_overrides: Default::default(),
     };
     // **不做 GPU→CPU 自动回退**:soft 与 wgpu 是两条独立实现,自动降级会让

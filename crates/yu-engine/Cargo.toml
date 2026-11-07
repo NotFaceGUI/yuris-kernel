@@ -17,6 +17,7 @@ wgpu = "30.0.1"
 yu-backend-soft = { path = "../yu-render/soft" }
 yu-render-core = { path = "../yu-render/core" }
 yu-backend-wgpu = { path = "../yu-render/wgpu" }
+yu-font = { path = "../yu-font" }
 yu-format = { path = "../yu-format" }
 yu-gfx = { path = "../yu-gfx" }
 yu-movie-plmpeg = { path = "../yu-platform/movie-plmpeg" }

@@ -282,7 +282,7 @@ fn feed_event(hasher: &mut Sha256, event: &VmEvent) {
                 None => hasher.update(&[0]),
             }
         }
-        VmEvent::Text { frame, id, bytes } => {
+        VmEvent::Text { frame, id, bytes, .. } => {
             hasher.update(b"txt");
             put_u64(hasher, *frame);
             put_bytes(hasher, id);

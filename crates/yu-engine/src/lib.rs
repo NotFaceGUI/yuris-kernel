@@ -21,6 +21,7 @@ pub mod identity;
 pub mod json;
 pub mod keys;
 pub mod output;
+pub mod patch;
 pub mod project;
 pub mod sha;
 

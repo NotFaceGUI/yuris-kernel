@@ -369,7 +369,7 @@ pub fn map_event(event: &VmEvent) -> (Option<u64>, Payload) {
                 time_ms: *time_ms,
             },
         ),
-        VmEvent::Text { frame, id, bytes } => (
+        VmEvent::Text { frame, id, bytes, .. } => (
             Some(*frame),
             Payload::VmText {
                 id: id.clone(),

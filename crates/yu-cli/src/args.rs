@@ -96,3 +96,47 @@ impl ArgReader {
         }
     }
 }
+
+/// `--font` 的统一宿主映射:family 名 → `FontChoice::Family`;
+/// 字体文件路径 → 读成字节 + `FontChoice::HostFont`。
+///
+/// 相对路径按工程根解析(字体拖进游戏目录后直接写文件名即可)。
+/// 文件 IO 只发生在宿主侧;引擎只接收 `font_bytes` + `FontChoice`,
+/// 与 Android 注入 assets 字体完全同一条路径。
+pub fn font_options(
+    root: &std::path::Path,
+    value: Option<String>,
+) -> CliResult<(yu_engine::engine::FontChoice, Vec<Vec<u8>>)> {
+    use yu_engine::engine::FontChoice;
+
+    let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
+        return Ok((FontChoice::Script, Vec::new()));
+    };
+    let value = value.trim();
+    let path = std::path::Path::new(value);
+    let lower = value.to_ascii_lowercase();
+    let looks_like_file = path.is_file()
+        || value.contains('/')
+        || value.contains('\\')
+        || [".ttf", ".otf", ".ttc", ".otc"]
+            .iter()
+            .any(|ext| lower.ends_with(ext));
+    if !looks_like_file {
+        return Ok((FontChoice::Family(value.to_string()), Vec::new()));
+    }
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let bytes = std::fs::read(&resolved).map_err(|e| {
+        Failure::usage(format!("读取字体 {} 失败: {e}", resolved.display()))
+    })?;
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err(Failure::usage(format!(
+            "字体 {} 超过 64MiB",
+            resolved.display()
+        )));
+    }
+    Ok((FontChoice::HostFont(0), vec![bytes]))
+}

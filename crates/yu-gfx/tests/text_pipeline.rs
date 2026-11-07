@@ -12,6 +12,7 @@ fn snapshot(bytes: &[u8], flags: &[u8]) -> TextSnapshot {
     TextSnapshot {
         layer_id: Vec::new(),
         bytes: bytes.to_vec(),
+        codec: yu_rt::Codec::Cp932,
         flags: flags.to_vec(),
         output_mode: 1,
         wait_ms: 0,

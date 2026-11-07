@@ -1510,7 +1510,7 @@ fn cginfo_multi_field_uses_official_priority() {
 
 /// `CG[ID=…]` 无 FILE/RID 且层不存在:官方返回 -1,脚本会逐帧轮询。
 /// 诊断按层生命周期只留一条 Verbose;层真正创建后再删除,下一次探测
-/// 才重新留痕。避免把正常轮询变成 WARN 洪峰(kotoneiro 开场单帧 2 万次)。
+/// 才重新留痕。避免把正常轮询变成 WARN 洪峰(<game-b> 开场单帧 2 万次)。
 #[test]
 fn cg_missing_layer_poll_is_reported_once_as_verbose() {
     let table = table();
