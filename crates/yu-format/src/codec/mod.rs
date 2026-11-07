@@ -128,6 +128,64 @@ impl Codec {
         }
     }
 
+    /// 该编解码器下是否为双字节字符的首字节。
+    #[must_use]
+    pub const fn is_lead(self, byte: u8) -> bool {
+        match self {
+            Codec::Cp932 => matches!(byte, 0x81..=0x9F | 0xE0..=0xFC),
+            Codec::Gbk => matches!(byte, 0x81..=0xFE),
+        }
+    }
+
+    /// 从 `bytes[i]` 起的字符宽度(1 或 2;末尾截断按 1)。
+    #[must_use]
+    pub fn char_len_at(self, bytes: &[u8], i: usize) -> usize {
+        if i < bytes.len() && self.is_lead(bytes[i]) && i + 1 < bytes.len() {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// 解一个字符(无分配)。非法/截断返回 `None`。
+    #[must_use]
+    pub fn next_char(self, bytes: &[u8], i: usize) -> Option<(char, usize)> {
+        let byte = *bytes.get(i)?;
+        if byte < 0x80 {
+            return Some((byte as char, 1));
+        }
+        let (unit, width) = match self {
+            Codec::Cp932 => CP932_TABLE.step(bytes, i),
+            Codec::Gbk => GBK_TABLE.step(bytes, i),
+        }?;
+        Some((char::from_u32(u32::from(unit))?, width))
+    }
+
+    /// 宽容解码:非法/截断记一个 U+FFFD 并计数。
+    #[must_use]
+    pub fn decode_lossy(self, bytes: &[u8]) -> (Vec<char>, usize) {
+        let mut chars = Vec::with_capacity(bytes.len());
+        let mut invalid = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if let Some((ch, width)) = self.next_char(bytes, i) {
+                chars.push(ch);
+                i += width;
+            } else {
+                chars.push(char::REPLACEMENT_CHARACTER);
+                invalid += 1;
+                i += self.char_len_at(bytes, i).min(bytes.len() - i);
+            }
+        }
+        (chars, invalid)
+    }
+
+    /// 该字符能否用本 codec 表示(ASCII 恒真)。
+    #[must_use]
+    pub fn can_encode(self, ch: char) -> bool {
+        ch.is_ascii() || encode_map(self).contains_key(&ch)
+    }
+
     /// 按名取编解码器(未知名 = `fmt.codec.name`)。
     pub fn from_name(name: &str) -> Result<Self, Diag> {
         match name {

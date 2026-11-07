@@ -65,6 +65,7 @@ pub mod yssfs;
 pub mod ystd;
 pub mod ystl;
 pub mod ysvr;
+pub mod text;
 
 use std::borrow::Cow;
 
@@ -75,6 +76,7 @@ pub use ystb::Segments;
 pub use ystl::ScriptList;
 pub use ysvr::{Init, VarDecl, VarDecls};
 pub use ystd::YstdHeader;
+pub use text::{CodecConfig, DisplayConfig, StringDomain, TextCodec, TunnelTable};
 
 /// 与 yu-rt 的接口契约(冻结):一个解码后的脚本。
 ///
