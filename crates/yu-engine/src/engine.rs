@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use crate::host_paths::{HostPathOverrides, PlatformHome as HostPlatformHome};
 use yu_backend_soft::{frame_has_drawable_output, SoftRenderer};
-use yu_backend_wgpu::{DeviceOptions, WgpuRenderer};
+use yu_backend_wgpu::{DeviceOptions, GpuBackend, WgpuRenderer};
 use yu_gfx::{
     json, probe_order_from_codes, CompositorFrame, GfxConfig, GfxHost, GfxState, Op, PassTarget,
     SizeU32, TextureRef, TextureSampler, Viewport,
@@ -122,8 +122,13 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// 宿主取值 → 后端(`soft|wgpu`,大小写不敏感、允许首尾空白)。
+    ///
+    /// 桌面/headless/serve 的 `--backend` 与 Android `run-config.json` 的
+    /// `backend` 键共用这一份;各宿主不再自己 match(以前 Android 侧连
+    /// 大小写都要先自己 lower 一遍,取值集合也因此容易漂移)。
     pub fn parse(value: &str) -> Result<Self, Failure> {
-        match value {
+        match value.trim().to_ascii_lowercase().as_str() {
             "soft" => Ok(Self::Soft),
             "wgpu" => Ok(Self::Wgpu),
             other => Err(Failure::usage(format!(
@@ -145,6 +150,68 @@ impl Backend {
             Backend::Soft => 0,
             Backend::Wgpu => 1,
         }
+    }
+}
+
+/// 会话生命周期(跨平台统一;宿主据此决定"收尾并交还控制权")。
+///
+/// 这是宿主与内核之间的**唯一退出信号面**。以前每个宿主各自读
+/// `main_finished()` + `restart_requested()` 两个布尔并自己拼判断,于是
+/// Android 壳在发布模式(quiet)下根本看不到退出信号 —— 游戏 `END` 之后
+/// 画面停住、声音还在,用户只能按返回键杀进程。
+///
+/// 现在:内核给出一个枚举,宿主只做一件事 —— [`Lifecycle::is_terminal`]
+/// 为真就收尾(关窗 / `finish()` 回 launcher / 释放会话)。任何新平台
+/// 照这一个入口写,不必知道 `END`/`RESTART` 的内部细节。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// 正常推进(可继续 tick)。
+    Running,
+    /// 主任务已经走完,但**没有**收到 `END`(主脚本自然结束)。
+    ///
+    /// 内核的 `main_finished` 本来就同时覆盖"主脚本走完"与"脚本 `END`"两
+    /// 种情形;这里把它们拆开是为了让宿主能区分"脚本明确要求退出进程"
+    /// 与"主任务没了,已无内容可推进"。
+    ///
+    /// 官方 0.495 的进程收尾链只取证到 `END` 分支(`[0x80152c]` + 
+    /// `CreateProcessA`,REA 0x403e78);"主脚本走完"之后官方是否立即退出
+    /// **未取证**,因此宿主可按需处理(Android 视为可退出:已无内容推进)。
+    Finished,
+    /// 脚本 `END`:全程序退出。`restart` = 官方 `RESTART` 标志
+    /// (官方据此 `CreateProcessA` 重启自身;内核只报告,不自行拉起)。
+    Exited { restart: bool },
+}
+
+impl Lifecycle {
+    /// 是否已到终态(宿主应收尾)。
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        !matches!(self, Lifecycle::Running)
+    }
+
+    /// 稳定名(宿主状态串/诊断用)。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Lifecycle::Running => "running",
+            Lifecycle::Finished => "finished",
+            Lifecycle::Exited { .. } => "exited",
+        }
+    }
+
+    /// 官方 `RESTART` 标志(`END` 之外恒 `false`)。
+    #[must_use]
+    pub const fn restart(self) -> bool {
+        matches!(self, Lifecycle::Exited { restart: true })
+    }
+
+    /// 给宿主进程/壳用的退出码约定:`0` = 继续,`1` = 游戏已结束。
+    ///
+    /// Android 壳据此让 `nativeTick` 返回 1;桌面/headless 用
+    /// [`Lifecycle::is_terminal`] 判断关窗。
+    #[must_use]
+    pub const fn host_code(self) -> i32 {
+        if self.is_terminal() { 1 } else { 0 }
     }
 }
 
@@ -685,6 +752,11 @@ pub struct Engine {
     /// 最后一次全程序退出的 `RESTART` 标志(官方进程收尾据此重启自身;
     /// 内核只暴露,不自行拉起进程)。
     restart_requested: bool,
+    /// 收到过脚本 `END`(= [`Lifecycle::Exited`];与 `main_finished` 区分:
+    /// 主脚本自然走完也算 `main_finished`,但不是 `END`)。
+    exited: bool,
+    /// 宿主已挂起(`Engine::suspend`)。挂起期间不推进真实时钟。
+    suspended: bool,
     /// 上一帧呈现画面(`SAVE[ID]` 抓帧渲染器的 `:/W0/` 后缓冲)。
     /// `SAVE[ID]` 的离屏抓帧器(逐帧 `observe`,在与主渲染器同刻冻结快照)。
     capture_bridge: Option<crate::capture::SharedCapture>,
@@ -861,6 +933,8 @@ impl Engine {
             events_drained: 0,
             main_finished: false,
             restart_requested: false,
+            exited: false,
+            suspended: false,
             capture_bridge,
         })
     }
@@ -1205,6 +1279,7 @@ impl Engine {
             // 内核不重启进程(官方在进程收尾用 CreateProcessA 重启自身)。
             self.main_finished = true;
             self.restart_requested = exit.restart;
+            self.exited = true;
         }
         let mut sound_stats = yu_sound::DecodeStats::default();
         if let Some(sound) = &self.sound {
@@ -1510,6 +1585,68 @@ impl Engine {
     /// 内核不自行重启,宿主决定是否重新拉起进程/重建会话。
     pub fn restart_requested(&self) -> bool {
         self.restart_requested
+    }
+
+    /// 会话生命周期(跨平台统一退出信号;见 [`Lifecycle`])。
+    ///
+    /// 宿主**只该用这一个方法**判断"游戏是否结束":`main_finished()` 与
+    /// `restart_requested()` 是它的组成部分,单独用会漏掉其中一种终态。
+    #[must_use]
+    pub fn lifecycle(&self) -> Lifecycle {
+        if self.exited {
+            Lifecycle::Exited {
+                restart: self.restart_requested,
+            }
+        } else if self.main_finished {
+            Lifecycle::Finished
+        } else {
+            Lifecycle::Running
+        }
+    }
+
+    /// 挂起会话(Android `onPause` / 页面隐藏 / 窗口最小化到托盘)。
+    ///
+    /// 做两件事:
+    /// 1. 丢弃暂停期间的真实时间 —— 恢复后 `tick_realtime` 的增量从 0 起算,
+    ///    **不快进**。不这么做时后台放十分钟再回来,第一帧会一次性灌进
+    ///    600000ms 的逻辑时间,淡出/补间全部瞬移(脚本按
+    ///    `@_OS_TIME` 差值推进)。
+    /// 2. 静音音频输出(设备保持打开,恢复即续;不 drop 设备以免
+    ///    oboe/AAudio 重建时的路由抖动)。
+    ///
+    /// 挂起期间宿主**不应**调 `tick`;重复挂起是幂等 no-op。
+    pub fn suspend(&mut self) {
+        if self.suspended {
+            return;
+        }
+        self.suspended = true;
+        self.clock.reset(Instant::now());
+        if let Some(audio) = self.audio.as_mut() {
+            // 与 restart 的 boot 期同一套静音路径(槽位置空 = 输出静音)。
+            audio.detach();
+        }
+    }
+
+    /// 恢复会话(与 [`Engine::suspend`] 配对)。未挂起时是 no-op。
+    ///
+    /// 恢复后声音状态重新挂回音频端口,时钟基准重置为"现在"。
+    pub fn resume(&mut self) {
+        if !self.suspended {
+            return;
+        }
+        self.suspended = false;
+        self.clock.reset(Instant::now());
+        if let Some(sound) = self.sound.clone() {
+            if let Some(audio) = self.audio.as_mut() {
+                audio.attach(sound);
+            }
+        }
+    }
+
+    /// 当前是否处于挂起状态。
+    #[must_use]
+    pub fn is_suspended(&self) -> bool {
+        self.suspended
     }
 
     /// 脚本执行错误(执行器结束的任务;诊断用)。
@@ -2005,6 +2142,8 @@ impl Engine {
         self.frame = 0;
         self.main_finished = false;
         self.restart_requested = false;
+        self.exited = false;
+        self.suspended = false;
         self.last_frame = None;
         self.last_surface = None;
         self.last_report = FrameReport::empty(0);
@@ -2455,19 +2594,18 @@ fn average(history: &VecDeque<f64>) -> f64 {
 }
 
 /// wgpu 选卡环境变量(与 `first_frame` 示例同口径):
-/// `YURIS_WGPU_BACKEND=dx12|vulkan|gl|primary|all`、`YURIS_WGPU_ADAPTER=<子串>`。
+/// `YURIS_WGPU_BACKEND=auto|primary|dx12|vulkan|gl|all`、`YURIS_WGPU_ADAPTER=<子串>`。
+///
+/// 取值表只有 `yu_backend_wgpu::GpuBackend` 一份(Android 宿主的
+/// `gpu_backend` 配置键走同一份);这里只负责读环境变量与拼 `DeviceOptions`。
 fn device_options_from_env() -> DeviceOptions {
     let mut options = DeviceOptions::default();
     if let Ok(value) = std::env::var("YURIS_WGPU_BACKEND") {
-        let value = value.trim().to_ascii_lowercase();
-        options.backends = match value.as_str() {
-            "dx12" | "d3d12" => Some(wgpu::Backends::DX12),
-            "vulkan" => Some(wgpu::Backends::VULKAN),
-            "gl" | "gles" => Some(wgpu::Backends::GL),
-            "primary" => Some(wgpu::Backends::PRIMARY),
-            "all" => Some(wgpu::Backends::all()),
-            _ => options.backends,
-        };
+        // 非法值保持默认后端集并留痕(环境变量拼错不该静默改变行为)。
+        match GpuBackend::parse(&value) {
+            Ok(backend) => options.backends = backend.backends(),
+            Err(error) => log::warn!(target: "yu-cli::engine", "YURIS_WGPU_BACKEND: {error}"),
+        }
     }
     if let Ok(name) = std::env::var("YURIS_WGPU_ADAPTER") {
         if !name.trim().is_empty() {

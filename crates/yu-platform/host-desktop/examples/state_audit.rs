@@ -49,11 +49,9 @@ fn run() -> Result<(), String> {
                 index += 2;
             }
             "--backend" => {
-                backend = match args.get(index + 1).ok_or_else(usage)?.as_str() {
-                    "soft" => Backend::Soft,
-                    "wgpu" => Backend::Wgpu,
-                    other => return Err(format!("--backend 只接受 soft|wgpu,收到 `{other}`")),
-                };
+                // 取值解析只有 `Backend::parse` 一份(与 CLI 同一套文案)。
+                backend = Backend::parse(args.get(index + 1).ok_or_else(usage)?)
+                    .map_err(|error| error.to_string())?;
                 index += 2;
             }
             other => return Err(format!("未知参数 `{other}`\n{}", usage())),

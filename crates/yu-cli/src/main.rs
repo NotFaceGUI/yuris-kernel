@@ -78,19 +78,12 @@ fn extract_globals(tokens: &mut Vec<String>) -> Result<(), String> {
         }
     }
     if let Some(level) = log_level {
-        let level = level.trim().to_ascii_lowercase();
-        match level.as_str() {
-            // `verbose` = 最低档,额外显示 `Severity::Verbose`(幂等空操作
-            // 等「正常但值得留痕」的事实);其余档位都不显示该级别。
-            "quiet" | "error" | "warn" | "info" | "debug" | "trace" | "verbose" => {
-                std::env::set_var("YU_LOG", level);
-            }
-            other => {
-                return Err(format!(
-                    "--log-level 只接受 quiet|error|warn|info|debug|trace|verbose,收到 `{other}`"
-                ))
-            }
-        }
+        // 取值解析只有 `yu_log::LogLevel` 一份(与内核门槛/门面桥同一份)。
+        // `verbose` = 最低档,额外显示 `Severity::Verbose`(幂等空操作等
+        // 「正常但值得留痕」的事实);其余档位都不显示该级别。
+        let level = yu_log::LogLevel::parse(&level)
+            .map_err(|error| format!("--log-level: {error}"))?;
+        std::env::set_var("YU_LOG", level.as_str());
     }
     if let Some(on) = color {
         yu_log::console::set_color_override(on);

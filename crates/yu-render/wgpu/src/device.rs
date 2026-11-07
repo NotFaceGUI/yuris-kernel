@@ -89,6 +89,99 @@ impl AdapterSummary {
     }
 }
 
+/// GPU 底层接口选择(宿主/CLI/环境变量共用的**唯一**取值表)。
+///
+/// 以前这份词表存在三处,取值集合还不一致:
+///
+/// | 入口 | 旧取值 |
+/// |---|---|
+/// | 引擎 `YURIS_WGPU_BACKEND` | `dx12\|vulkan\|gl\|primary\|all` |
+/// | Android `run-config.json` `gpu_backend` | `auto\|gles\|vulkan` |
+///
+/// 现在统一在这里:`auto` = 平台最优顺序(见 [`Self::ladder`]),
+/// `gles`/`gl` 同义,`dx12`/`metal` 等按名字直接映射到 `wgpu::Backends`。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GpuBackend {
+    /// 平台最优顺序:桌面按 wgpu 默认(`PRIMARY`),Android 先 GLES 再
+    /// Vulkan(模拟器 Vulkan 不稳,见 `DIV-AND-*`)。
+    #[default]
+    Auto,
+    /// wgpu 默认后端集(`PRIMARY`:Windows DX12+Vulkan,macOS Metal)。
+    Primary,
+    Dx12,
+    Vulkan,
+    /// GL / GLES(同一 `wgpu::Backends::GL` 位)。
+    Gl,
+    /// 全部已编译后端(探针/取证用)。
+    All,
+}
+
+impl GpuBackend {
+    /// 用户取值 → 接口(大小写不敏感、允许首尾空白)。
+    ///
+    /// 取值集合 = 两个旧入口的**并集**,不新增别名:
+    /// 引擎 `YURIS_WGPU_BACKEND` 的 `dx12|d3d12|vulkan|gl|gles|primary|all`
+    /// 与 Android 配置的 `auto|gles|gl|vulkan`。
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(Self::Auto),
+            "primary" => Ok(Self::Primary),
+            "dx12" | "d3d12" => Ok(Self::Dx12),
+            "vulkan" => Ok(Self::Vulkan),
+            "gl" | "gles" => Ok(Self::Gl),
+            "all" => Ok(Self::All),
+            other => Err(format!(
+                "gpu_backend 只接受 auto|primary|dx12|vulkan|gl|gles|all,收到 `{other}`"
+            )),
+        }
+    }
+
+    /// 规范名(诊断/配置回写用;`gl` 恒写 `gl`)。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Primary => "primary",
+            Self::Dx12 => "dx12",
+            Self::Vulkan => "vulkan",
+            Self::Gl => "gl",
+            Self::All => "all",
+        }
+    }
+
+    /// 直接映射到 `wgpu::Backends`;`Auto` 返回 `None`(交调用方按平台定顺序)。
+    pub const fn backends(self) -> Option<wgpu::Backends> {
+        match self {
+            Self::Auto => None,
+            Self::Primary => Some(wgpu::Backends::PRIMARY),
+            Self::Dx12 => Some(wgpu::Backends::DX12),
+            Self::Vulkan => Some(wgpu::Backends::VULKAN),
+            Self::Gl => Some(wgpu::Backends::GL),
+            Self::All => Some(wgpu::Backends::all()),
+        }
+    }
+
+    /// 回退链 `(名字, Backends)`。
+    ///
+    /// `Some` 项 = 只试这一个(显式选择不许静默换后端);`Auto` = 按平台
+    /// 给顺序:
+    /// - `cfg(target_os = "android")`:GLES → Vulkan(模拟器 gfxstream 的
+    ///   Vulkan 在 `vkQueueSubmit` 空指针崩溃,真机 GLES 也够用);
+    /// - 其余:`PRIMARY` 单步(wgpu 自己排序)。
+    pub fn ladder(self) -> Vec<(&'static str, wgpu::Backends)> {
+        if let Some(backends) = self.backends() {
+            return vec![(self.as_str(), backends)];
+        }
+        #[cfg(target_os = "android")]
+        {
+            vec![("gles", wgpu::Backends::GL), ("vulkan", wgpu::Backends::VULKAN)]
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            vec![("primary", wgpu::Backends::PRIMARY)]
+        }
+    }
+}
+
 /// Android 的 display 句柄(零大小标记,给 wgpu 建窗口 surface 用)。
 ///
 /// wgpu 要求 `InstanceDescriptor::display` 是
@@ -345,5 +438,54 @@ fn backends_name(backends: wgpu::Backends) -> &'static str {
         "gl"
     } else {
         "custom"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_backend_accepts_both_legacy_value_sets() {
+        // 引擎 YURIS_WGPU_BACKEND 侧的取值。
+        for value in ["dx12", "d3d12", "vulkan", "gl", "gles", "primary", "all"] {
+            assert!(GpuBackend::parse(value).is_ok(), "`{value}` 应被接受");
+        }
+        // Android 配置侧的取值。
+        for value in ["auto", "gles", "gl", "vulkan"] {
+            assert!(GpuBackend::parse(value).is_ok(), "`{value}` 应被接受");
+        }
+        assert_eq!(GpuBackend::parse(""), Ok(GpuBackend::Auto));
+        assert_eq!(GpuBackend::parse(" GLES "), Ok(GpuBackend::Gl));
+    }
+
+    #[test]
+    fn gpu_backend_rejects_unknown_with_single_message() {
+        let error = GpuBackend::parse("metal").unwrap_err();
+        assert!(error.contains("auto|primary|dx12"), "文案要列全: {error}");
+    }
+
+    #[test]
+    fn gpu_backend_roundtrips_through_as_str() {
+        for backend in [
+            GpuBackend::Auto,
+            GpuBackend::Primary,
+            GpuBackend::Dx12,
+            GpuBackend::Vulkan,
+            GpuBackend::Gl,
+            GpuBackend::All,
+        ] {
+            assert_eq!(GpuBackend::parse(backend.as_str()), Ok(backend));
+        }
+    }
+
+    #[test]
+    fn explicit_backend_yields_a_single_step_ladder() {
+        // 显式选择不许静默换后端:回退链只能有它自己。
+        assert_eq!(GpuBackend::Vulkan.ladder().len(), 1);
+        assert_eq!(GpuBackend::Vulkan.ladder()[0].1, wgpu::Backends::VULKAN);
+        assert_eq!(GpuBackend::Gl.ladder()[0].1, wgpu::Backends::GL);
+        assert!(GpuBackend::Auto.backends().is_none(), "Auto 由平台定顺序");
+        assert!(!GpuBackend::Auto.ladder().is_empty());
     }
 }

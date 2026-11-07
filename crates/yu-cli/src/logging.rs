@@ -12,7 +12,7 @@ use std::path::Path;
 
 use yu_log::console::{color_auto_off_reason, Console, JsonlFile, MinLevel};
 use yu_log::Diag;
-use crate::{CliResult, Failure};
+use crate::CliResult;
 
 /// `YU_LOG`/`--log-level` 的内核诊断门槛(quiet/error/warn 压 Info)。
 pub fn min_level() -> MinLevel {
@@ -77,12 +77,8 @@ pub fn print_diag_summary(console: &mut Console, engine: &mut yu_engine::engine:
 }
 
 /// `--flag on|off` 解析(缺省值由调用方给)。
+///
+/// 直接转发 [`crate::args::parse_on_off_flag`]:同一套取值只有一份实现。
 pub fn parse_on_off(name: &str, value: &str) -> CliResult<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "on" | "true" | "1" => Ok(true),
-        "off" | "false" | "0" => Ok(false),
-        other => Err(Failure::usage(format!(
-            "--{name} 只接受 on|off,收到 `{other}`"
-        ))),
-    }
+    crate::args::parse_on_off_flag(name, value)
 }

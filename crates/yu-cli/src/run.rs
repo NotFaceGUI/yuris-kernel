@@ -83,18 +83,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let font_arg = args.flag("font");
     // 强制存档块压缩层,覆盖自动判定(盘上既有存档 → 引擎代号 → zlib)。
     // 只影响**写盘**;读侧仍按实际流分流。
-    let save_codec = match args.flag("save-codec") {
-        Some(value) => Some(match value.trim().to_ascii_lowercase().as_str() {
-            "zlib" => yu_engine::engine::BlockCodec::Zlib,
-            "snappy" => yu_engine::engine::BlockCodec::Snappy,
-            other => {
-                return Err(Failure::usage(format!(
-                    "--save-codec 只接受 zlib|snappy,收到 `{other}`"
-                )))
-            }
-        }),
-        None => None,
-    };
+    let save_codec = crate::args::save_codec_flag(args.flag("save-codec"))?;
     // 补丁编码:缺省按工具产出自动识别;显式 `original` 关闭识别,
     // `cp932`/`gbk` 强制三域 codec(诊断未知工具用)。
     let patch = match args.flag("patch") {
@@ -288,24 +277,11 @@ pub fn parse_u32(name: &str, value: &str) -> CliResult<u32> {
 }
 
 /// `--script-key`:8 位十六进制(允许空格/下划线/冒号分隔与 `0x` 前缀)。
+///
+/// 解析本体只有 [`yu_engine::keys::ScriptKey::parse_hex`] 一份(Android
+/// `run-config.json` 的 `script_key` 键走同一份);这里的差异仅是错误文案
+/// 带上 CLI 旗标名。
 pub fn parse_script_key(value: &str) -> CliResult<[u8; 4]> {
-    let cleaned: String = value
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '_' && *c != ':')
-        .collect();
-    let hex = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-        .unwrap_or(&cleaned);
-    if hex.len() != 8 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(Failure::usage(format!(
-            "--script-key 需要 8 位十六进制(4 字节),收到 `{value}`"
-        )));
-    }
-    let mut key = [0u8; 4];
-    for (i, slot) in key.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .map_err(|_| Failure::usage(format!("--script-key 解析失败:`{value}`")))?;
-    }
-    Ok(key)
+    yu_engine::keys::ScriptKey::parse_hex(value)
+        .map_err(|error| Failure::usage(format!("--script-key: {error}")))
 }

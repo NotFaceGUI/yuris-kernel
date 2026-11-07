@@ -87,13 +87,36 @@ impl ArgReader {
 
     /// 解析 `on|off`(大小写不敏感);其它值显式报错。
     pub fn on_off(name: &str, value: &str) -> CliResult<bool> {
-        match value.to_ascii_lowercase().as_str() {
-            "on" | "true" | "1" => Ok(true),
-            "off" | "false" | "0" => Ok(false),
-            other => Err(Failure::usage(format!(
-                "--{name} 只接受 on|off,收到 `{other}`"
-            ))),
-        }
+        parse_on_off_flag(name, value)
+    }
+}
+
+/// `--flag on|off|true|false|1|0` 的唯一解析(headless/desktop/serve 共用)。
+///
+/// 以前 [`ArgReader::on_off`] 与 `logging::parse_on_off` 是两份逐字相同的
+/// 实现(只差 `trim` 与错误文案里有没有 `--`);现在只有这一份。
+pub fn parse_on_off_flag(name: &str, value: &str) -> CliResult<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" => Ok(true),
+        "off" | "false" | "0" => Ok(false),
+        other => Err(Failure::usage(format!(
+            "--{name} 只接受 on|off,收到 `{other}`"
+        ))),
+    }
+}
+
+/// `--save-codec`:强制存档块压缩层(`zlib|snappy`),`None` = 不改写自动判定。
+///
+/// 取值解析只有 [`yu_engine::engine::BlockCodec::parse`] 一份(headless /
+/// desktop 两个宿主以前各写一段相同 match,Android 是第三段)。
+pub fn save_codec_flag(
+    value: Option<String>,
+) -> CliResult<Option<yu_engine::engine::BlockCodec>> {
+    match value {
+        Some(value) => yu_engine::engine::BlockCodec::parse(&value)
+            .map(Some)
+            .map_err(|error| Failure::usage(format!("--save-codec: {error}"))),
+        None => Ok(None),
     }
 }
 

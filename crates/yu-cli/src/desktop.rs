@@ -99,18 +99,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     // 存档根(P4 M-C):缺省 = 工程根 `save/`;显式给目录才重定向。
     let save_root = args.flag("save-root").map(PathBuf::from);
     // 强制存档块压缩层(与 headless 同一口径;只影响写盘)。
-    let save_codec = match args.flag("save-codec") {
-        Some(value) => Some(match value.trim().to_ascii_lowercase().as_str() {
-            "zlib" => yu_engine::engine::BlockCodec::Zlib,
-            "snappy" => yu_engine::engine::BlockCodec::Snappy,
-            other => {
-                return Err(Failure::usage(format!(
-                    "--save-codec 只接受 zlib|snappy,收到 `{other}`"
-                )))
-            }
-        }),
-        None => None,
-    };
+    let save_codec = crate::args::save_codec_flag(args.flag("save-codec"))?;
     let patch = match args.flag("patch") {
         Some(value) => yu_engine::patch::PatchSelection::parse(&value)
             .map_err(|d| Failure::usage(format!("--patch: {d}")))?,

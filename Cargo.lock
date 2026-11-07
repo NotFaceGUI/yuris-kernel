@@ -4167,7 +4167,6 @@ name = "yu-cli"
 version = "0.1.0"
 dependencies = [
  "log",
- "time",
  "wgpu",
  "yu-backend-soft",
  "yu-backend-wgpu",
@@ -4192,6 +4191,7 @@ dependencies = [
  "log",
  "sha1",
  "sha2",
+ "time",
  "wgpu",
  "yu-backend-soft",
  "yu-backend-wgpu",

@@ -75,11 +75,10 @@ fn run() -> Result<(), String> {
         match args[index].as_str() {
             "--backend" => {
                 let value = args.get(index + 1).ok_or_else(usage)?;
-                backend = Some(match value.as_str() {
-                    "soft" => Backend::Soft,
-                    "wgpu" => Backend::Wgpu,
-                    other => return Err(format!("--backend 只接受 soft|wgpu,收到 `{other}`")),
-                });
+                // 取值解析只有 `Backend::parse` 一份(与 CLI 同一套文案)。
+                backend = Some(
+                    Backend::parse(value).map_err(|error| error.to_string())?,
+                );
                 index += 2;
             }
             "--shots" => {

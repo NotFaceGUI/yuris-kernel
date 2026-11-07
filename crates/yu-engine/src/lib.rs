@@ -16,6 +16,7 @@
 
 pub mod capture;
 pub mod engine;
+pub mod host_clock;
 pub mod host_paths;
 pub mod identity;
 pub mod json;

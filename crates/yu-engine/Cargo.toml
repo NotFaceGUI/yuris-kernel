@@ -26,3 +26,8 @@ yu-rt = { path = "../yu-rt" }
 yu-save = { path = "../yu-save" }
 yu-sound = { path = "../yu-sound" }
 yu-vfs = { path = "../yu-vfs" }
+
+# `host_clock::local_now` 读本地时区(`@_TIME` 注入)。桌面与 Android 共用;
+# wasm 没有进程级本地时区,不链它(见 host_clock 模块文档)。
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+time = { version = "0.3", features = ["local-offset"] }

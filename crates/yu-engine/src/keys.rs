@@ -84,6 +84,36 @@ pub struct ScriptKey {
 }
 
 impl ScriptKey {
+    /// 宿主取值 → 4 字节密钥。
+    ///
+    /// 接受 8 位十六进制,允许空白/下划线/冒号分隔与 `0x` 前缀
+    /// (`D36FAC96` / `D3 6F AC 96` / `0xD3_6F_AC_96` 等价)。
+    ///
+    /// 全平台唯一一份:`yu-cli --script-key` 与 Android `run-config.json` 的
+    /// `script_key` 键以前各写一段一模一样的清洗+校验;现在只有这里,
+    /// 两边的可接受写法与错误文案不会再漂移。
+    pub fn parse_hex(value: &str) -> Result<[u8; 4], String> {
+        let cleaned: String = value
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '_' && *c != ':')
+            .collect();
+        let hex = cleaned
+            .strip_prefix("0x")
+            .or_else(|| cleaned.strip_prefix("0X"))
+            .unwrap_or(&cleaned);
+        if hex.len() != 8 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "script_key 需要 8 位十六进制(4 字节),收到 `{value}`"
+            ));
+        }
+        let mut key = [0u8; 4];
+        for (index, slot) in key.iter_mut().enumerate() {
+            *slot = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
+                .map_err(|_| format!("script_key 解析失败:`{value}`"))?;
+        }
+        Ok(key)
+    }
+
     /// `43 2F 06 B0` 形式的十六进制(日志用)。
     #[must_use]
     pub fn hex(&self) -> String {
@@ -412,6 +442,31 @@ fn has_extension(path: &std::path::Path, ext: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--script-key` / `run-config.json` 共用的取值解析:分隔符与 `0x` 前缀都容忍。
+    #[test]
+    fn script_key_parse_hex_accepts_all_documented_forms() {
+        let expected = [0xD3, 0x6F, 0xAC, 0x96];
+        for value in [
+            "D36FAC96",
+            "d36fac96",
+            "0xD36FAC96",
+            "0xd36fac96",
+            "D3 6F AC 96",
+            "D3_6F_AC_96",
+            "0xD3:6F:AC:96",
+        ] {
+            assert_eq!(ScriptKey::parse_hex(value), Ok(expected), "`{value}`");
+        }
+    }
+
+    #[test]
+    fn script_key_parse_hex_rejects_wrong_forms() {
+        for value in ["", "D36FAC9", "D36FAC960", "zzzzzzzz", "0x"] {
+            let error = ScriptKey::parse_hex(value).unwrap_err();
+            assert!(error.contains("8 位十六进制"), "`{value}`: {error}");
+        }
+    }
 
     /// 合成一个最小 YSTB:count=1,s1=4,s2=12(一个窗口),s3=12,s4=4。
     ///
