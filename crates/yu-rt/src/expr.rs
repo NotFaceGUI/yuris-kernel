@@ -124,11 +124,20 @@ pub trait VarAccess {
 /// 表达式求值器。
 pub struct Evaluator<'a> {
     access: &'a mut dyn VarAccess,
+    codec: yu_format::Codec,
 }
 
 impl<'a> Evaluator<'a> {
     pub fn new(access: &'a mut dyn VarAccess) -> Self {
-        Self { access }
+        Self {
+            access,
+            codec: yu_format::Codec::Cp932,
+        }
+    }
+
+    /// 按执行层全局 codec 扫描字符串字面量。
+    pub fn with_codec(access: &'a mut dyn VarAccess, codec: yu_format::Codec) -> Self {
+        Self { access, codec }
     }
 
     /// 执行整个窗口,返回剩余栈。
@@ -344,7 +353,10 @@ impl<'a> Evaluator<'a> {
             0x46 if ins.payload.len() == 8 => stack.push(Slot::Val(Value::Float(f64::from_bits(
                 read_i64(&ins.payload)? as u64,
             )))),
-            0x4d => stack.push(Slot::Val(Value::Str(decode_string_literal(&ins.payload)?))),
+            0x4d => stack.push(Slot::Val(Value::Str(decode_string_literal_with(
+                &ins.payload,
+                self.codec,
+            )?))),
             0x48 | 0x56 | 0x76 => {
                 let r = var_of(ins).ok_or_else(|| malformed(ins, "变量引用载荷不是 3 字节"))?;
                 if ins.op == 0x48 {
@@ -651,6 +663,14 @@ pub(crate) fn const_value_instrs(instrs: &[RawInstr]) -> Option<Value> {
 /// 载荷形态 `[终止符][内容…][终止符]`;`\` 转义:`\\`、`\n`(0x0A)、`\t`(0x09);
 /// CP932 前导字节吞掉后继字节(不让终止符落在双字节字符中间)。
 pub fn decode_string_literal(payload: &[u8]) -> Result<Vec<u8>, yu_log::Diag> {
+    decode_string_literal_with(payload, yu_format::Codec::Cp932)
+}
+
+/// 按指定 codec 解码字符串字面量。
+pub fn decode_string_literal_with(
+    payload: &[u8],
+    codec: yu_format::Codec,
+) -> Result<Vec<u8>, yu_log::Diag> {
     let (Some(&term), true) = (payload.first(), payload.len() >= 2) else {
         return Err(diag::fatal(
             code::rt::EXPR_MALFORMED,
@@ -684,7 +704,7 @@ pub fn decode_string_literal(payload: &[u8]) -> Result<Vec<u8>, yu_log::Diag> {
             i += 1;
             continue;
         }
-        if is_cp932_lead(b) {
+        if codec.is_lead(b) {
             if let Some(&next) = body.get(i + 1) {
                 out.push(b);
                 out.push(next);
@@ -700,10 +720,6 @@ pub fn decode_string_literal(payload: &[u8]) -> Result<Vec<u8>, yu_log::Diag> {
         Boundary::Script,
         "字符串字面量未闭合",
     ))
-}
-
-fn is_cp932_lead(b: u8) -> bool {
-    (0x81..=0x9F).contains(&b) || (0xE0..=0xFC).contains(&b)
 }
 
 #[cfg(test)]

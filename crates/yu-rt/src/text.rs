@@ -75,14 +75,11 @@ pub mod flag {
     pub const END: u8 = b'E';
 }
 
-/// CP932 首字节(= 双字节字符)。与 `handlers::str_char_count` 同口径。
-pub(crate) fn is_lead(b: u8) -> bool {
-    (0x81..=0x9F).contains(&b) || (0xE0..=0xFC).contains(&b)
-}
-
 /// 文本层状态(引擎 `[0x801800]` 的已取证字段)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextState {
+    /// 显示层文本 codec(全局;官方 CHS 同构,不逐文件/逐段区分)。
+    pub codec: yu_format::Codec,
     /// 当前文本层 ID(`TEXT[ID]`;CP932 原始字节,空 = 默认层)。
     ///
     /// 引擎 `[state+0x00]` 存的是按 ID 解析出的图层对象;解析
@@ -150,6 +147,7 @@ pub struct TextState {
 impl Default for TextState {
     fn default() -> Self {
         Self {
+            codec: yu_format::Codec::Cp932,
             layer_id: Vec::new(),
             bytes: Vec::new(),
             flags: Vec::new(),
@@ -184,17 +182,33 @@ impl Default for TextState {
 }
 
 impl TextState {
+    #[must_use]
+    pub fn with_codec(codec: yu_format::Codec) -> Self {
+        Self {
+            codec,
+            ..Self::default()
+        }
+    }
+
     /// 追加一段文本,并按字符写入 `'1'`/`'2'` 标志(REA `0x458d44`)。
     ///
     /// 同时按引擎 `+0x48` 表快照每字符延迟:`WAIT / (全角 ? 1 : 2)`
     /// (`WORD 0x458e78` 的 `idiv edi`;`_ 0x45697f/0x456a8e` 同口径)。
     /// 半角 = `WAIT/2` 是实机行为;手册“1 文字あたり 15ms”只描述全角。
     pub fn append_text(&mut self, bytes: &[u8]) {
+        self.append_text_with_codec(self.codec, bytes);
+    }
+
+    /// 按指定显示 codec 追加(全局 codec 由 VM 在启动时确定)。
+    pub fn append_text_with_codec(&mut self, codec: yu_format::Codec, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
         self.bytes.extend_from_slice(bytes);
         let wait = self.wait_ms as i32;
         let mut i = 0;
         while i < bytes.len() {
-            if is_lead(bytes[i]) && i + 1 < bytes.len() {
+            if codec.is_lead(bytes[i]) && i + 1 < bytes.len() {
                 self.flags.push(flag::FULL);
                 self.delays.push(wait as i16);
                 i += 2;
@@ -375,6 +389,8 @@ pub struct TextSnapshot {
     pub layer_id: Vec<u8>,
     pub bytes: Vec<u8>,
     pub flags: Vec<u8>,
+    /// 显示 codec(全局;官方 CHS 同构)。
+    pub codec: yu_format::Codec,
     pub output_mode: u8,
     pub wait_ms: i64,
     pub autoreturn: i64,
@@ -403,6 +419,7 @@ impl From<&TextState> for TextSnapshot {
             layer_id: s.layer_id.clone(),
             bytes: s.bytes.clone(),
             flags: s.flags.clone(),
+            codec: s.codec,
             output_mode: s.output_mode,
             wait_ms: s.wait_ms,
             autoreturn: s.autoreturn,

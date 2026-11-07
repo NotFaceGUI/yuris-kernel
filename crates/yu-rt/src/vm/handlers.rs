@@ -1595,7 +1595,10 @@ impl Vm {
                 };
                 let v = self.read_var(st, set_var, &idx)?;
                 match v {
-                    Value::Str(bytes) => Value::Int(str_char_count(&bytes) as i64),
+                    Value::Str(bytes) => Value::Int(str_char_count_with(
+                        self.script_text_codec(st.script_id),
+                        &bytes,
+                    ) as i64),
                     other => {
                         return Err(diag::fatal(
                             code::rt::VAR_TYPE,
@@ -1630,19 +1633,18 @@ impl Vm {
                         )
                         .into())
                     }
-                    Value::Str(bytes) => Value::Int(if crate::cp932_text::is_lead(bytes[0]) {
-                        2
-                    } else {
-                        1
-                    }),
+                    Value::Str(bytes) => {
+                        Value::Int(if self.script_text_codec(st.script_id).is_lead(bytes[0]) {
+                            2
+                        } else {
+                            1
+                        })
+                    }
                     other => {
                         return Err(diag::fatal(
                             code::rt::VAR_TYPE,
                             Boundary::Script,
-                            format!(
-                                "VARINFO STRTYPE 需要字符串变量,得到 {}",
-                                other.type_name()
-                            ),
+                            format!("VARINFO STRTYPE 需要字符串变量,得到 {}", other.type_name()),
                         )
                         .into())
                     }
@@ -1860,9 +1862,9 @@ impl Vm {
         // **必须看「本次指令给了哪些参数」,不能看「表里有没有这些名字」**
         // —— 后者恒真,会把每条 VARACT 都误判进 INIT/G_* 分支并提前返回。
         let any_g = flags.iter().any(|(slot, _)| {
-            names
-                .get(usize::from(*slot))
-                .is_some_and(|n| n.starts_with("G_INT") || n.starts_with("G_FLT") || n.starts_with("G_STR"))
+            names.get(usize::from(*slot)).is_some_and(|n| {
+                n.starts_with("G_INT") || n.starts_with("G_FLT") || n.starts_with("G_STR")
+            })
         });
         if flag("INIT").is_some() || any_g {
             self.varact_init_calls = self.varact_init_calls.saturating_add(1);
@@ -1973,37 +1975,38 @@ impl Vm {
             .into());
         };
         let out;
+        let codec = self.script_text_codec(st.script_id);
         self.varact_bytes = self.varact_bytes.saturating_add(bytes.len() as u64);
         if flag("COPY").is_some() || flag("CUT").is_some() {
             let pos = num("POS").max(1) as usize;
             let len = num("LENGTH").max(0) as usize;
             out = if flag("COPY").is_some() {
                 self.varact_ops[0] = self.varact_ops[0].saturating_add(1);
-                copy_chars(&bytes, pos, len)
+                copy_chars(&bytes, pos, len, codec)
             } else {
                 self.varact_ops[1] = self.varact_ops[1].saturating_add(1);
-                cut_chars(&bytes, pos, len)
+                cut_chars(&bytes, pos, len, codec)
             };
         } else if flag("UPPER").is_some() {
             self.varact_ops[2] = self.varact_ops[2].saturating_add(1);
-            out = ascii_case(&bytes, true);
+            out = ascii_case(&bytes, true, codec);
         } else if flag("UPPER2").is_some() {
             self.varact_ops[3] = self.varact_ops[3].saturating_add(1);
-            out = fullwidth_case(&bytes, true);
+            out = fullwidth_case(&bytes, true, codec);
         } else if flag("LOWER").is_some() {
             self.varact_ops[4] = self.varact_ops[4].saturating_add(1);
-            out = ascii_case(&bytes, false);
+            out = ascii_case(&bytes, false, codec);
         } else if flag("LOWER2").is_some() {
             self.varact_ops[5] = self.varact_ops[5].saturating_add(1);
-            out = fullwidth_case(&bytes, false);
+            out = fullwidth_case(&bytes, false, codec);
         } else if flag("HANTOZEN").is_some() {
             self.varact_ops[6] = self.varact_ops[6].saturating_add(1);
             // 半角→全角:表/算法逐条见 `crate::case_tables`(0x4546aa..)。
-            out = crate::case_tables::hantozen(&bytes);
+            out = crate::case_tables::hantozen_with(&bytes, codec);
         } else if flag("ZENTOHAN").is_some() {
             self.varact_ops[7] = self.varact_ops[7].saturating_add(1);
             // 全角→半角:0x4548cf.. / 0x46b395。
-            out = crate::case_tables::zentohan(&bytes);
+            out = crate::case_tables::zentohan_with(&bytes, codec);
         } else {
             return Err(diag::unimplemented(
                 code::rt::CMD_UNIMPLEMENTED,
@@ -3670,8 +3673,7 @@ impl Vm {
         self.emit_domain(Domain::Save, "LOAD", args);
         if layer_id {
             // `LOAD[DNO=n ID=图层]` = 图像块(btype 1):块内像素装回图层表面。
-            let (Some(file), Some(dno), Some(id)) =
-                (file.clone(), dno, layer_id_bytes.as_deref())
+            let (Some(file), Some(dno), Some(id)) = (file.clone(), dno, layer_id_bytes.as_deref())
             else {
                 self.report(diag::recoverable(
                     code::rt::CMD_SLOT,
@@ -3910,7 +3912,8 @@ impl Vm {
                 continue;
             }
             if let Ok(v) = self.eval_window(st, w) {
-                if matches!(&v, Value::Int(n) if *n != 0) || matches!(&v, Value::Float(f) if *f != 0.0)
+                if matches!(&v, Value::Int(n) if *n != 0)
+                    || matches!(&v, Value::Float(f) if *f != 0.0)
                 {
                     flags.push(pname);
                 }
@@ -4104,10 +4107,13 @@ impl Vm {
             .and_then(|c| c.params.iter().position(|p| p.name == "FILE"))
             .map(|i| i as u8);
         if let Some(slot) = file_slot {
-            let key = args.iter().find(|a| a.slot == slot).and_then(|a| match &a.value {
-                Value::Str(bytes) if !bytes.is_empty() => Some(bytes.clone()),
-                _ => None,
-            });
+            let key = args
+                .iter()
+                .find(|a| a.slot == slot)
+                .and_then(|a| match &a.value {
+                    Value::Str(bytes) if !bytes.is_empty() => Some(bytes.clone()),
+                    _ => None,
+                });
             if let Some(key) = key {
                 match self.resolve_movie_meta(&key) {
                     Some(info) => {
@@ -4211,7 +4217,7 @@ impl Vm {
         let mut found = None;
         let ext_order = self.tables.boot.config.image_ext_order;
         let mut candidates: Vec<Vec<u8>> = Vec::new();
-        if has_image_extension(key) {
+        if has_image_extension_with(key, self.name_text_codec()) {
             candidates.push(key.to_vec());
         }
         for &code in ext_order.iter() {
@@ -4403,9 +4409,15 @@ impl Vm {
         // 需要资产元数据回退的字段:`SX/SY`(尺寸本身)与像素查询
         // `COLOR`/`ONMOUSE*`(先要尺寸才能建命中矩形)。其余字段保持原样。
         let wanted = query_args.iter().find_map(|a| {
-            params.get(usize::from(a.slot)).map(String::as_str).filter(
-                |n| matches!(*n, "SX" | "SY" | "COLOR" | "ONMOUSE" | "ONMOUSE2" | "ONMOUSE3"),
-            )
+            params
+                .get(usize::from(a.slot))
+                .map(String::as_str)
+                .filter(|n| {
+                    matches!(
+                        *n,
+                        "SX" | "SY" | "COLOR" | "ONMOUSE" | "ONMOUSE2" | "ONMOUSE3"
+                    )
+                })
         });
         let result = host.query(name, &query_args);
         let mut value = match result {
@@ -4760,7 +4772,7 @@ impl Vm {
                 Value::Str(b) => b,
                 _ => Vec::new(),
             };
-            self.append_text(&bytes);
+            self.append_text_for_script(st.script_id, &bytes);
             self.emit(VmEvent::Text {
                 frame: self.frame(),
                 id: self.text.layer_id.clone(),
@@ -4787,7 +4799,7 @@ impl Vm {
                 diag::fatal(code::rt::CMD_WINDOWS, Boundary::Script, "WORD 缺文本窗口").into(),
             );
         };
-        self.append_text(&w.payload);
+        self.append_text_for_script(st.script_id, &w.payload);
         self.emit(VmEvent::Text {
             frame: self.frame(),
             id: self.text.layer_id.clone(),
@@ -5428,7 +5440,11 @@ fn array_needle(
         Some(ElemType::Int) => "INT",
         None => return Ok(None),
     };
-    let Some(slot) = varinfo_names.iter().position(|n| n == want).map(|i| i as u8) else {
+    let Some(slot) = varinfo_names
+        .iter()
+        .position(|n| n == want)
+        .map(|i| i as u8)
+    else {
         return Ok(None);
     };
     for w in &cmd.windows {
@@ -5537,11 +5553,16 @@ fn compose_window_arg(comp: u16, value: Value) -> (Value, bool) {
 /// 字符**位置上生效:CP932 尾字节区间(`0x40..=0x7E`)含 `\`(`0x5C`),
 /// `ソ`=`83 5C`、`表`=`95 5C` 若被当成路径分隔符,`cg/ソ.png` 就被判成
 /// “无扩展名”,原 key 不参与候选,存在的资产会报缺失。
+#[cfg(test)]
 fn has_image_extension(key: &[u8]) -> bool {
+    has_image_extension_with(key, yu_format::Codec::Cp932)
+}
+
+fn has_image_extension_with(key: &[u8], codec: yu_format::Codec) -> bool {
     let mut start = 0;
     let mut i = 0;
     while i < key.len() {
-        let step = crate::cp932_text::char_len_at(key, i);
+        let step = codec.char_len_at(key, i);
         if step == 1 && (key[i] == b'/' || key[i] == b'\\') {
             start = i + 1;
         }
@@ -5623,42 +5644,53 @@ fn target_var(w: &CmdWindow) -> Result<VarRef, yu_log::Diag> {
 }
 
 /// CP932 字符串的字符数(前导字节吞掉后继)。
-pub fn str_char_count(bytes: &[u8]) -> usize {
+pub fn str_char_count_with(codec: yu_format::Codec, bytes: &[u8]) -> usize {
     let mut i = 0;
     let mut n = 0;
     while i < bytes.len() {
-        if is_lead(bytes[i]) && i + 1 < bytes.len() {
-            i += 2;
-        } else {
-            i += 1;
-        }
+        i += codec.char_len_at(bytes, i);
         n += 1;
     }
     n
-}
-
-fn is_lead(b: u8) -> bool {
-    (0x81..=0x9F).contains(&b) || (0xE0..=0xFC).contains(&b)
 }
 
 /// 按字符位置取子串(1 起算;手册 `VARACT` 例 5)。
 ///
 /// 字符边界统一走 [`crate::cp932_text`](CP932 lead byte 跳步),不在本文件
 /// 另写一套 —— 见该模块文档里的片头 LOGO 事故。
-fn copy_chars(bytes: &[u8], pos: usize, len: usize) -> Vec<u8> {
-    let n = crate::cp932_text::char_count(bytes);
+fn copy_chars(bytes: &[u8], pos: usize, len: usize, codec: yu_format::Codec) -> Vec<u8> {
+    let n = str_char_count_with(codec, bytes);
     let start = pos.saturating_sub(1).min(n);
-    crate::cp932_text::slice_chars(bytes, start, start + len)
+    slice_chars_with(codec, bytes, start, start + len)
 }
 
 /// 挖掉 `[pos, pos+len)` 字符,保留头尾(手册 `VARACT` 例 6)。
-fn cut_chars(bytes: &[u8], pos: usize, len: usize) -> Vec<u8> {
-    let n = crate::cp932_text::char_count(bytes);
+fn cut_chars(bytes: &[u8], pos: usize, len: usize, codec: yu_format::Codec) -> Vec<u8> {
+    let n = str_char_count_with(codec, bytes);
     let start = pos.saturating_sub(1).min(n);
     let end = (start + len).min(n);
-    let mut out = crate::cp932_text::slice_chars(bytes, 0, start);
-    out.extend_from_slice(&crate::cp932_text::slice_chars(bytes, end, n));
+    let mut out = slice_chars_with(codec, bytes, 0, start);
+    out.extend_from_slice(&slice_chars_with(codec, bytes, end, n));
     out
+}
+
+fn slice_chars_with(codec: yu_format::Codec, bytes: &[u8], start: usize, end: usize) -> Vec<u8> {
+    if start >= end {
+        return Vec::new();
+    }
+    let mut spans = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let step = codec.char_len_at(bytes, i);
+        spans.push((i, i + step));
+        i += step;
+    }
+    let start = start.min(spans.len());
+    let end = end.min(spans.len());
+    if start >= end {
+        return Vec::new();
+    }
+    bytes[spans[start].0..spans[end - 1].1].to_vec()
 }
 
 /// 半角 ASCII 大小写(`VARACT[UPPER/LOWER]`;手册 `variable/varact.html`
@@ -5671,11 +5703,11 @@ fn cut_chars(bytes: &[u8], pos: usize, len: usize) -> Vec<u8> {
 /// `83 74 81 5b 83 6e 83 8b` = **`フーハル`** —— 厂商 LOGO
 /// `cg/ev/サークル.jpg`(包内实际存在,293KB)因此查不到,片头整段黑屏。
 /// 官方 `VARACT` 处理体按双字节字符推进,不会出现该改写。
-fn ascii_case(bytes: &[u8], upper: bool) -> Vec<u8> {
+fn ascii_case(bytes: &[u8], upper: bool, codec: yu_format::Codec) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        let step = crate::cp932_text::char_len_at(bytes, i);
+        let step = codec.char_len_at(bytes, i);
         if step == 2 {
             // 双字节字符原样保留(半角大小写只碰 ASCII 段)。
             out.extend_from_slice(&bytes[i..i + step]);
@@ -5699,11 +5731,11 @@ fn ascii_case(bytes: &[u8], upper: bool) -> Vec<u8> {
 /// 兜底分支同样按 [`crate::cp932_text::char_len_at`] 跳步:非 `0x82` 的双字节
 /// 字符(汉字/假名)原样保留,绝不逐字节 ASCII 化 —— 与 `ascii_case` 同一
 /// 类事故(见其文档)。
-fn fullwidth_case(bytes: &[u8], upper: bool) -> Vec<u8> {
+fn fullwidth_case(bytes: &[u8], upper: bool, codec: yu_format::Codec) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == 0x82 {
+        if codec == yu_format::Codec::Cp932 && i + 1 < bytes.len() && bytes[i] == 0x82 {
             let t = bytes[i + 1];
             let mapped = if upper && (0x81..=0x9A).contains(&t) {
                 Some(0x82u8)
@@ -5724,7 +5756,7 @@ fn fullwidth_case(bytes: &[u8], upper: bool) -> Vec<u8> {
                 continue;
             }
         }
-        let step = crate::cp932_text::char_len_at(bytes, i);
+        let step = codec.char_len_at(bytes, i);
         if step == 2 {
             out.extend_from_slice(&bytes[i..i + step]);
             i += step;

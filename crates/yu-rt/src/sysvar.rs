@@ -356,10 +356,11 @@ pub fn read(vm: &Vm, st: &ExecState, var: VarRef, indices: &[i64]) -> Result<Val
         // `MOV byte ptr [0x80191c],DL`;窗口过程 `FUN_0045acdc` 在
         // `WM_SYSCOMMAND` 分支 `SC_MINIMIZE (0xF020)` 写 `(char)槽号 + 1`。
         // 即 MIN = 最小化ボタン押下状態,与 MAX 同族、同存储宽度。
-        "_WINDOW_EXEC_MAX" | "_WINDOW_EXEC_MIN" | "_WINDOW_EXEC_CLOSE"
-        | "_WINDOW_EXEC_CAPTION" => Ok(Value::Int(
-            vm.window_exec(name.rsplit('_').next().unwrap_or("")),
-        )),
+        "_WINDOW_EXEC_MAX" | "_WINDOW_EXEC_MIN" | "_WINDOW_EXEC_CLOSE" | "_WINDOW_EXEC_CAPTION" => {
+            Ok(Value::Int(
+                vm.window_exec(name.rsplit('_').next().unwrap_or("")),
+            ))
+        }
         // `_WINDOW_INIT_POS`:手册无页;引擎 int getter `0x4276f3` 读
         // `[0x80133c]`,该字节由 `yscfg.dat` 第 10 项写入(`0x460b74` 路径),
         // 由宿主注入(缺省 0;DIV-RT-047)。

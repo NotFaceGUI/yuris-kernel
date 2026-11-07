@@ -96,8 +96,8 @@ impl CaseTables {
 ///
 /// 单一真源 = [`crate::cp932_text::is_lead`](与 `yu-format` 码表、`VARACT`
 /// 的字符步进同一口径)。
-fn char_len(b: u8) -> usize {
-    if crate::cp932_text::is_lead(b) {
+fn char_len(codec: yu_format::Codec, b: u8) -> usize {
+    if codec.is_lead(b) {
         2
     } else {
         1
@@ -146,12 +146,17 @@ fn zen_code(code: u16) -> u16 {
 
 /// `VARACT[HANTOZEN]`:半角→全角。
 pub fn hantozen(bytes: &[u8]) -> Vec<u8> {
+    hantozen_with(bytes, yu_format::Codec::Cp932)
+}
+
+/// 按执行层 codec 做半角→全角。
+pub fn hantozen_with(bytes: &[u8], codec: yu_format::Codec) -> Vec<u8> {
     let t = CaseTables::get();
     let mut out = Vec::with_capacity(bytes.len() * 2);
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
-        let len = char_len(c);
+        let len = char_len(codec, c);
         if len > 1 {
             // 2/3/4 字节字符原样拷贝(CP932 实际只有 2)。
             let end = (i + len).min(bytes.len());
@@ -181,11 +186,16 @@ pub fn hantozen(bytes: &[u8]) -> Vec<u8> {
 
 /// `VARACT[ZENTOHAN]`:全角→半角。
 pub fn zentohan(bytes: &[u8]) -> Vec<u8> {
+    zentohan_with(bytes, yu_format::Codec::Cp932)
+}
+
+/// 按执行层 codec 做全角→半角。
+pub fn zentohan_with(bytes: &[u8], codec: yu_format::Codec) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
-        if char_len(c) == 2 && i + 1 < bytes.len() {
+        if char_len(codec, c) == 2 && i + 1 < bytes.len() {
             let code = (u16::from(c) << 8) | u16::from(bytes[i + 1]);
             let mapped = zen_code(code);
             if mapped == code {

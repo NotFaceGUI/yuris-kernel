@@ -70,4 +70,6 @@ pub use task::{ChainReport, TaskSeed};
 pub use text::{TextSnapshot, TextState};
 pub use value::{ElemType, Value, VarRef, VarSpace};
 pub use vm::{BootConfig, HostClock, HostLocalTime, Vm, VmError};
+pub use yu_format::text::{CodecConfig, DisplayConfig, TunnelTable};
+pub use yu_format::Codec;
 pub use yu_log::Diag;
