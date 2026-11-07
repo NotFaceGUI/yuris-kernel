@@ -5,7 +5,7 @@
   `crates/yu-render/wgpu/src/plan.rs`
 - 关联: `DIV-GFX-058`(COPY 携带文本)、`EVID-T-11`(COPY2 区域)、
   `DIV-GFX-055/075`(文本合成基面)
-- 样本: 商業包 `<game-a>` 同目录的 `natsunokusari.exe` 環境設定
+- 样本: 商業包 `<game-a>` 同目录的 `<game-481>.exe` 環境設定
   (`CONFIGURATION`);脚本 `data/script/eris/scene/config/es_config.yst`
   (s36)、`es_button.yst`(s0)
 

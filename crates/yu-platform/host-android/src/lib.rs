@@ -187,6 +187,10 @@ pub struct RunConfig {
     pub font_bytes: Vec<Vec<u8>>,
     /// 用户导入的字体文件路径(JSON 键 `font_file`;读不到显式报错)。
     pub font_file: Option<PathBuf>,
+    /// 文本编码路线(JSON 键 `patch`:`auto|original|gbk|tunnel`)。
+    ///
+    /// 与 CLI `--patch` 同义;`auto` 才会读产物签名。
+    pub patch: yu_engine::patch::PatchKind,
     // ---- 声音 ----
     /// `@_OS_SOUND` 注入值。缺省 true(对拍口径)。
     pub os_sound: bool,
@@ -254,6 +258,7 @@ impl Default for RunConfig {
             script_key: None,
             force_font: None,
             font_bytes: Vec::new(),
+            patch: yu_engine::patch::PatchKind::Auto,
             font_file: None,
             os_sound: true,
             audio_output: true,
@@ -331,6 +336,9 @@ impl RunConfig {
             if !v.trim().is_empty() {
                 config.font_file = Some(PathBuf::from(v));
             }
+        }
+        if let Some(v) = object.get("patch").and_then(|v| v.as_str()) {
+            config.patch = yu_engine::patch::PatchKind::parse(v)?;
         }
         if let Some(v) = object.get("os_sound").and_then(|v| v.as_bool()) {
             config.os_sound = v;
@@ -759,6 +767,7 @@ pub fn start_engine(
         force_font,
         mut font_bytes,
         font_file,
+        patch,
         backend,
         gpu_backend,
         os_sound,
@@ -796,11 +805,21 @@ pub fn start_engine(
     };
     // 用户导入的字体文件:读不到就显式失败(不静默忽略 —— 否则用户会
     // 以为换上了其实没换)。
+    let mut host_font_index = None;
     if let Some(path) = font_file {
         let bytes = std::fs::read(&path)
             .map_err(|e| format!("字体读取失败 {}: {e}", path.display()))?;
+        host_font_index = Some(font_bytes.len());
         font_bytes.push(bytes);
     }
+    // 统一字体选择:显式 family 优先;只给了字体文件则强制该文件的 face。
+    let font = match force_font.filter(|name| !name.trim().is_empty()) {
+        Some(family) => yu_engine::engine::FontChoice::Family(family),
+        None => match host_font_index {
+            Some(index) => yu_engine::engine::FontChoice::HostFont(index),
+            None => yu_engine::engine::FontChoice::Script,
+        },
+    };
     init_logcat(quiet);
     install_panic_hook();
     // 存档根必须存在:缺目录会让 SAVE 与既读记录全部静默失败。
@@ -851,7 +870,8 @@ pub fn start_engine(
         save_root: Some(save_root.clone()),
         path_overrides,
         font_bytes,
-        force_font,
+        font,
+        patch: yu_engine::patch::PatchSelection::new(patch),
         ..EngineOptions::default()
     };
     let mut engine =

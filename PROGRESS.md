@@ -1088,7 +1088,7 @@ frame 2: cmds=26      errors=0
 frame 3: cmds=249     errors=0
 frame 4..11: cmds=8765 errors=0        ← 稳态
 
-$ cargo run -p yu-rt --example run_game -- <<game-b>> 8
+$ cargo run -p yu-rt --example run_game -- <game-b> 8
   ysc: v494 (119 命令)  labels=2132  vars=2568  yst_list=160  yscfg=1100x825
   ycd: 不存在(商业发行版;系统变量改用引擎 ABI 表 + ysv 校验)
 frame 0: cmds=850609 errors=0
@@ -9304,7 +9304,7 @@ cargo build --workspace --all-targets     => 通过
 
 ## 成果 PERF-SPIKE (2026-10-27) · 双游戏实测尖峰归因:内容指纹/整图 clone/抓帧器整帧回放
 
-**症状(用户)**:两款游戏都要抓渲染尖峰做优化;kotoneiro 有整段 30fps/10fps,
+**症状(用户)**:两款游戏都要抓渲染尖峰做优化;<game-b> 有整段 30fps/10fps,
 eris 场景切换有 200ms 级停顿。
 
 **取样(人工推进,非脚本)**:`yu-cli run … --mode desktop --frame-stats CSV
@@ -9322,7 +9322,7 @@ eris 场景切换有 200ms 级停顿。
 2. 每次 COPY 的镜像捕获与每次资产解析都**整图 clone**(重帧 64 COPY +
    27 加工 ⇒ 数百 MB/帧)⇒ `snap_ms=33ms` 主体;
 3. `blit` 逐像素 `Option` 调用;
-4. `SAVE` 抓帧器在出现新 CopyId 时**整帧软后端回放**;kotoneiro 精灵/按钮
+4. `SAVE` 抓帧器在出现新 CopyId 时**整帧软后端回放**;<game-b> 精灵/按钮
    场景每帧换 CopyId ⇒ 每帧 100–375ms(`capture_ms` 单独计时后才可见);
 5. VM 解释器 0.21µs/命令(未改,另线)。
 
@@ -9335,11 +9335,11 @@ eris 场景切换有 200ms 级停顿。
 **验证命令与结果**:
 
 ```text
-kotoneiro 基线(1357 帧/36.7s,三项渲染修复前):
+<game-b> 基线(1357 帧/36.7s,三项渲染修复前):
   interval avg=26.800 p50=16.695 p95=100.053 p99=216.402 max=733.711
   render avg=8.159 p95=83.044   snap avg=0.259 max=37.465
   image_composite avg=5.501 p95=77.909 max=144.276
-kotoneiro 修复后(5930 帧/108.5s):
+<game-b> 修复后(5930 帧/108.5s):
   interval avg=18.236 p50=16.660 p95=17.093 p99=66.639
   render avg=2.294 p95=2.268    snap avg=0.084 max=20.473
   image_composite avg=0.361 p95=0.000 p99=21.554 max=73.181
@@ -9365,14 +9365,14 @@ yu-cli case <project-eris> --all
 回放(非主组源/镜像被 GPU 加工失效)。
 
 报告:`docs/perf-spike-report-2026-10-27.md`。证据产物在
-`target/tmp/perf/{kotoneiro,eris}/`(不入库)。
+`target/tmp/perf/{<game-b>,eris}/`(不入库)。
 
 ## 成果 PERF-FADE (2026-10-27) · 角色出场卡顿拆分、MERGE 整数化与日志异步化
 
 **症状(用户)**:「角色一出来就卡顿」「开日志会发现更卡」;要求用 `--debug-ui`
 看尖峰图。
 
-**取证**(`--debug-ui` + `--frame-stats` + `--spike-log 20`,kotoneiro,
+**取证**(`--debug-ui` + `--frame-stats` + `--spike-log 20`,<game-b>,
 7379 帧/130.3s)。角色出场那一帧拆成三块:
 
 ```text
@@ -9410,7 +9410,7 @@ cargo test -p yu-log -p yu-backend-soft -p yu-backend-wgpu -p yu-render-core -p 
   => 29/39/15/9/21/9/6 全 passed
   新增逐位对拍:merge_span_optimization_is_bit_exact(64 组随机+整行透明)
                 blend_transition_span_optimization_is_bit_exact(64 组随机+窄源)
-kotoneiro 复测(7379 帧/130.3s,--debug-ui 常开):
+<game-b> 复测(7379 帧/130.3s,--debug-ui 常开):
   interval avg=17.616 p50=16.633 p95=17.092 p99=33.664
   render avg=1.627 p95=1.628 p99=19.662
   image_composite avg=0.385 p95=0.000 p99=16.938 max=81.476(>5ms 帧 2.6%)
@@ -9457,7 +9457,7 @@ cargo test -p yu-backend-wgpu --test wgpu cgact_transition
   => ok(GPU 路径断言 layer_composites≥1;f=0/128/256 与 soft 逐字节一致)
 cargo test -p yu-render-core -p yu-backend-soft -p yu-backend-wgpu -p yu-engine
   => 39/15/9/22/9 全 passed
-kotoneiro 复测(3034 帧/58s,--debug-ui):
+<game-b> 复测(3034 帧/58s,--debug-ui):
   interval p50=16.651 p95=17.221;render p95=2.095
   image_composite >5ms 的帧 72/3034,全部是 merge:2(21–44ms)
   剩余回退:4 条(2× from CPU-only、2× to CPU-only)
@@ -9472,16 +9472,16 @@ SAVE 抓帧器仍有 430–455ms 单帧回放;解码/脚本属 CPU 本职(预取
 
 ## 成果 SND-CP932 (2026-10-27) · 日文文件名双字节被逐字节折小写导致声音资产查不到,同类字节扫描收口三处
 
-**症状(用户)**:`kotoneiro` 片头出现
+**症状(用户)**:`<game-b>` 片头出现
 `WARN [sound] snd.file.missing @ snd@frame240 pc0: SOUND 文件未找到: voice/\x83R\x83g\x83l\x83C\x83\x8d`。
 
 **取证(先证伪"封包/查询不通用")**:
 
 ```text
-YpfSource::open(kotoneiro/data.ypf, Cp932)
+YpfSource::open(<game-b>/data.ypf, Cp932)
   version=494 entries=12212 closed=true hash=12212/12212 key=0xff
-  voice\コトネイロ.ogg  type=6(ogg) stored 54226B offset=0x958a0
-LookupKey::new(b"voice/コトネイロ.ogg", Cp932) → exists()==true
+  voice\<game-b>.ogg  type=6(ogg) stored 54226B offset=0x958a0
+LookupKey::new(b"voice/<game-b>.ogg", Cp932) → exists()==true
 ```
 
 **复现(修复前)**:`yu-sound` + 真实包,loader 依次收到
@@ -9490,7 +9490,7 @@ LookupKey::new(b"voice/コトネイロ.ogg", Cp932) → exists()==true
 
 **根因**:`yu-sound::normalize_name` 逐字节折 ASCII 小写,没有按 CP932 字符
 推进。双字节字符的尾字节可以落在 `0x41..=0x5A`:`コ`=`83 52`、`イ`=`83 43`,
-被折成 `83 72`/`83 63`(`コトネイロ` → `ビトネツロ`),包里存在的资产永远查
+被折成 `83 72`/`83 63`(`83 52 83 67...` → `83 72 83 67...`),包里存在的资产永远查
 不到。官方处理体不逐字节改写(该文件在包内且官方可装载即为证)。
 
 **同类审查(逐字节扫 CP932 串,不含 examples/tests)**:
@@ -9530,9 +9530,9 @@ cargo test -p yu-rt -p yu-sound -p yu-render-core --lib
   => yu-render-core 8/8, yu-rt 85/85, yu-sound(lib) 1/1 全 passed
 cargo test -p yu-sound
   => 集成 39/39 passed(含新增 cp932_file_name_resolves_through_probe_order)
-端到端(真实 kotoneiro/data.ypf,修复后同一探针):
-  loader.query raw="voice/コトネイロ" → 未命中(无扩展名)
-  loader.query raw="voice/コトネイロ.ogg" → 命中
+端到端(真实 <game-b>/data.ypf,修复后同一探针):
+  loader.query raw="voice/<game-b>" → 未命中(无扩展名)
+  loader.query raw="voice/<game-b>.ogg" → 命中
   state=Playing file_type=Ogg total=1842  diags=0
 ```
 
@@ -9582,7 +9582,7 @@ cargo test -p yu-backend-wgpu --test wgpu merge_on_snapshot_gpu_is_bit_exact
   => ok(快照目标、半透明上下层,逐字节)
 cargo test -p yu-render-core -p yu-backend-soft -p yu-backend-wgpu -p yu-engine
   => 39/15/9/24/9 全 passed
-kotoneiro 复测(2801 帧):939 帧含 MERGE,仅 72 帧仍有 >5ms CPU 合成
+<game-b> 复测(2801 帧):939 帧含 MERGE,仅 72 帧仍有 >5ms CPU 合成
   (回退原因 upper is CPU-only);render p95 13.6ms
 ```
 
@@ -9644,7 +9644,7 @@ interval p95 17.12ms、render p95 2.08ms;`work>60ms` 仅 49/12267 帧(0.4%),
   pc460 `@8 = @_OS_TIME(1)` → pc471 `@< = @_OS_TIME(1) - @8` →
   pc472 `@: = 256 * @< / @2` → pc502 `CG[ID=$1 A=@=]`,pc510 `WAIT[FRAME=1]`;
   内核 `_OS_TIME(1) = now_ms - start_ms`(`crates/yu-rt/src/sysvar.rs:185`)。
-- **离屏固定步长实测**(kotoneiro,`probe_layers`):片头 `MAC.EV("サークル", PINT3=2500)`
+- **离屏固定步长实测**(<game-b>,`probe_layers`):片头 `MAC.EV("サークル", PINT3=2500)`
   的 logo 淡入 157 帧 × 16ms ≈ 2512ms(与脚本 2500ms 差 0.5%);标题幕布
   `CGS100` 由同一 `es.CGFADEEXEC` 驱动,A 256→0 用 25 帧 = 400ms。**脚本时长
   没有被引擎改短**。
@@ -9691,7 +9691,7 @@ $ cargo test --workspace
 `crates/yu-cli/src/case.rs` / `crates/yu-sound/src/state.rs`(HEAD 版本无
 println!/eprintln!),与本轮改动无关,未触碰。
 
-$ ./target/debug/yu-cli.exe run <kotoneiro> --mode desktop --frames 140 --no-sound \
+$ ./target/debug/yu-cli.exe run <game-b> --mode desktop --frames 140 --no-sound \
     --frame-stats target/tmp/ktn/frames.csv --spike-log target/tmp/ktn/spikes.log --spike-ms 5
 exit=0;CSV 关键行:
   f78 interval=1249.710 work=1234.384 tick=1216.448 render=12.418
@@ -10510,7 +10510,7 @@ pc319 时新 `CopyId` 不存在 ⇒ 返回 `None`,目标层还是 `CG FILE=""` �
 ### 验证(原始结果)
 
 ```text
-# 实机脚本(kotoneiro):START(750,415)→SAVE(380,812)→槽 1(350,200)
+# 实机脚本(<game-b>):START(750,415)→SAVE(380,812)→槽 1(350,200)
 # 修复前: [caption] snapshot 336 pixels not materialized yet; deferred
 #          DNO3 ulen=1612 / B=4
 # 修复后(soft,同脚本):DNO3 btype=1 ulen=31608 A=1600 B=30000
@@ -13450,3 +13450,48 @@ cargo test -p yu-gfx --test info_query
 桌面 wgpu 環境設定截图
   → 预览无黑幕、on/off 标签完整、底栏说明可见(与上一成果一致)
 ```
+
+## 成果 ABI-TABLES (2026-11-07) · 系统变量 ABI 表扩到 27 张并按前缀选表
+
+**问题**:`<game-d>`(v486)启动失败,报
+`工程 ysv.ybn 的系统变量指纹与所有已知 ABI 族都不符(未知引擎构建)`。
+四张内嵌表(0292/0466/0479/0495)覆盖不到 v486。
+
+**取证**:
+- `ysv.ybn` 记录**没有名字**(只有 kind/flag/file_id/slot/ty/dims + 初值),
+  名字在编译期由 `YSCom.ycd` 决定,产物不保留 → 只能靠表补;
+- 同一 id 跨版本语义不同(实测 id 50:0.292 `_SYSTEM_PATH`、
+  0.466/0.479 `_PINT[11]`、0.495 `_INT[1]`)→ 不能按版本号猜;
+- `TheVNConnoisseur/YU-RIS_Guide` 归档 81 个官方 SDK,提取 **27 个唯一 ycd**;
+  `0.481` 与 `0.486` 的 ycd **sha 相同**(`f7380aba`),该 sha 覆盖
+  0.481–0.493 共 13 个版本(36 个归档)。
+
+**改动**:
+- 27 张表落在 `crates/yu-rt/data/sysvar-abi-<range>-<sha8>.tsv`,
+  表头含 `source_ycd_sha256` 与 `# covers` 区间;同名 sha 去重。
+- 校验规则改为**前缀逐项相等**:`var_id < 表长` 的 `kind=1` 必须存在且
+  `(type, dims)` 一致;`var_id >= 表长` 的追加项忽略(官方 `switch` 的
+  `default` 就是普通槽位)。
+- 兜底降级只允许 `wrong == 0 && missing <= 2 && 唯一最接近`;
+  只要有一条类型不符,该表即判为错版本,绝不降级采用。
+- 同内容表(0494/0495)按游戏 `ysv` 版本号裁决,仅影响日志显示。
+- 选表列表按**新→旧**排列,避免低版本表先命中。
+- 启动日志新增 `covers=<区间>`,可直接看出表覆盖到哪。
+- 文档:`docs/divergences/DIV-RT-017-sysvar-abi-tables.md`。
+
+**验证**:
+```text
+cargo test -p yu-rt --lib sysvar_abi
+  → 7 passed(新增 type_mismatch_table_is_never_a_fallback_candidate、
+              identical_tables_prefer_matching_version)
+cargo test -p yu-rt --test consistency(<样本 env 齐备>)
+  → 4 passed
+实机启动:
+  project-eris(v495)   → 0495  covers=0495      正常
+  <game-b>(v494)      → 0494  covers=0494      正常
+  08281142(v481)       → 0495  covers=0495      正常
+  <game-d> (v486)        → 0481-0493 covers=0481-0493  **修复前 Fatal,现正常**
+```
+
+**工具**:`crates/yu-rt/examples/gen_abi_tsv.rs`(ycd → TSV)、
+`crates/yu-rt/examples/abi_match.rs`(TSV × ysv 逐项差异),均为只读探针。

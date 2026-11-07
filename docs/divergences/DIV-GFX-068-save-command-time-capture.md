@@ -51,7 +51,7 @@ HUD 存档界面刷新后仍无图。
 ## 5. 验证(原始结果)
 
 ```text
-# soft headless(kotoneiro 实机脚本:START→SAVE→槽 1)
+# soft headless(<game-b> 实机脚本:START→SAVE→槽 1)
 [caption] SAVE[ID] replay snapshot=336 1100x825 436088us   # 首次(整帧回放)
 [caption] LOAD[ID] PNG 100x75 19340B encode=603us
 DNO3 btype=1 ulen=31608 A=1600 B=30000

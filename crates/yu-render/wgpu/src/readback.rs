@@ -13,7 +13,7 @@
 //!
 //!   旧实现在每帧开头 `poll(wait_indefinitely)`:只要 GPU 队列里还有活
 //!   (立绘换差分帧:71MB 纹理拷贝 + 数十 MB 上传),CPU 就被按在帧里等
-//!   整条队列跑完 —— 实测 kotoneiro 34fps→52fps、p95 60ms→18ms、
+//!   整条队列跑完 —— 实测 <game-b> 34fps→52fps、p95 60ms→18ms、
 //!   render max 182ms→64ms。桌面呈现本来就靠 `screen_texture`,CPU 面
 //!   只服务存档抓帧,迟一两帧完全不影响观感。
 //! - [`ReadbackCache::read_now`](精确读):同步等待当帧结果。只在

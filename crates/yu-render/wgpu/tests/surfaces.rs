@@ -955,7 +955,7 @@ fn snapshot_source_reads_registry_after_render() {
 fn merge_does_not_leak_hidden_lower_rgb_at_antialiased_edges() {
     let table = table();
     // 下层:8×8,alpha 全 0,但 RGB 是「脏」的 (159,117,122) —— 与
-    // kotoneiro 立绘缓冲实测的透明区残色同值。
+    // <game-b> 立绘缓冲实测的透明区残色同值。
     let lower = RgbaImage::from_pixel(8, 8, Rgba([159, 117, 122, 0]));
     // 差分:中间 4×4 不透明红,外圈 alpha=128 的抗锯齿边。
     let mut upper = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 0]));
