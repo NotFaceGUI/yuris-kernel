@@ -314,15 +314,25 @@ fn ymv_pushes_movie_metadata_and_ymvinfo_writes_let() {
         init: Init::Int(-1),
     }];
     // 真实参数名(默认表里三条影片命令是空参数)。
-    let set_params = |b: &mut ProjectBuilder, name: &'static str, params: Vec<(&'static str, u8, u8)>| {
-        let slot = b
-            .commands
-            .iter_mut()
-            .find(|c| c.0 == name)
-            .expect("fixture command present");
-        slot.1 = params;
-    };
-    set_params(&mut b, "YMV", vec![("ID", 1, 0), ("IDNO", 0, 0), ("FILE", 1, 0), ("FRAME", 0, 0)]);
+    let set_params =
+        |b: &mut ProjectBuilder, name: &'static str, params: Vec<(&'static str, u8, u8)>| {
+            let slot = b
+                .commands
+                .iter_mut()
+                .find(|c| c.0 == name)
+                .expect("fixture command present");
+            slot.1 = params;
+        };
+    set_params(
+        &mut b,
+        "YMV",
+        vec![
+            ("ID", 1, 0),
+            ("IDNO", 0, 0),
+            ("FILE", 1, 0),
+            ("FRAME", 0, 0),
+        ],
+    );
     set_params(
         &mut b,
         "YMVINFO",
@@ -584,7 +594,12 @@ fn movieend_clears_mode_and_resets_volume() {
     movie_params(
         &mut b,
         "MOVIE",
-        vec![("FILE", 1, 0), ("PLAY", 0, 0), ("SX", 0, 0), ("VOLUME", 0, 0)],
+        vec![
+            ("FILE", 1, 0),
+            ("PLAY", 0, 0),
+            ("SX", 0, 0),
+            ("VOLUME", 0, 0),
+        ],
     );
     let (op_movie, op_end) = (opcode_of(&b, "MOVIE"), opcode_of(&b, "MOVIEEND"));
     b.labels = vec![("SYSTEM_START", 0, 0, 0)];
@@ -2767,7 +2782,9 @@ fn varinfo_strtype_reports_first_char_width() {
         "半角首字符 → 1"
     );
     assert_eq!(
-        vm.store().read(VarRef::new(VarSpace::At, sys + 4), &[]).unwrap(),
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 4), &[])
+            .unwrap(),
         Value::Float(2.0),
         "FLT 目标按官方写 2.0"
     );
@@ -2812,7 +2829,9 @@ fn varinfo_inert_sjiscode_is_noop() {
     let r = vm.tick_at(0, &no_input());
     assert!(r.errors.is_empty(), "{:?}", r.errors);
     assert_eq!(
-        vm.store().read(VarRef::new(VarSpace::At, sys + 1), &[]).unwrap(),
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 1), &[])
+            .unwrap(),
         Value::Int(7),
         "惰性槽不得改写 LET"
     );
@@ -4700,9 +4719,9 @@ fn dialog_extended_params_are_ignored_without_eval() {
     let r0 = vm.tick_at(0, &no_input());
     assert!(r0.errors.is_empty(), "{:?}", r0.errors);
     assert!(
-        !vm.events()
-            .iter()
-            .any(|e| matches!(e, yu_rt::VmEvent::Diag { code, .. } if code == "rt.cmd.unimplemented")),
+        !vm.events().iter().any(
+            |e| matches!(e, yu_rt::VmEvent::Diag { code, .. } if code == "rt.cmd.unimplemented")
+        ),
         "扩展参数不得再报 Unimplemented"
     );
     let pending = vm.pending_dialogs().to_vec();
@@ -5605,10 +5624,7 @@ impl SaveHost for SharedHost {
         Ok(())
     }
     fn flush(&mut self, file: &str) -> Result<(), Diag> {
-        self.inner
-            .borrow_mut()
-            .order
-            .push(format!("flush:{file}"));
+        self.inner.borrow_mut().order.push(format!("flush:{file}"));
         self.inner.borrow_mut().flushes.push(file.to_string());
         Ok(())
     }
@@ -5620,19 +5636,11 @@ impl SaveHost for SharedHost {
         let reply = self.reply.borrow_mut().take();
         reply.ok_or_else(|| Diag::fatal("test", yu_log::Boundary::Domain))
     }
-    fn reserve_image(
-        &mut self,
-        dno: u32,
-        image: &yu_rt::event::CapturedImage,
-    ) -> Result<(), Diag> {
+    fn reserve_image(&mut self, dno: u32, image: &yu_rt::event::CapturedImage) -> Result<(), Diag> {
         self.inner.borrow_mut().images.push((dno, image.clone()));
         Ok(())
     }
-    fn load_image(
-        &mut self,
-        file: &str,
-        dno: u32,
-    ) -> Result<yu_rt::event::CapturedImage, Diag> {
+    fn load_image(&mut self, file: &str, dno: u32) -> Result<yu_rt::event::CapturedImage, Diag> {
         self.inner
             .borrow_mut()
             .image_loads
@@ -5659,18 +5667,11 @@ struct PixelHost {
 impl yu_rt::event::GraphicsHost for PixelHost {
     fn apply_event(&mut self, _ev: &yu_rt::event::VmEvent) {}
 
-    fn query(
-        &mut self,
-        _command: &str,
-        _args: &[yu_rt::event::ArgValue],
-    ) -> Result<Value, Diag> {
+    fn query(&mut self, _command: &str, _args: &[yu_rt::event::ArgValue]) -> Result<Value, Diag> {
         Err(Diag::fatal("test", yu_log::Boundary::Domain))
     }
 
-    fn capture_layer(
-        &mut self,
-        id: &[u8],
-    ) -> Result<Option<yu_rt::event::CapturedImage>, Diag> {
+    fn capture_layer(&mut self, id: &[u8]) -> Result<Option<yu_rt::event::CapturedImage>, Diag> {
         let image = sample_image();
         self.captured
             .borrow_mut()
@@ -5951,8 +5952,7 @@ fn save_set_on_system_variable_reserves_scalar_snapshot() {
         .sysvars
         .iter()
         .position(|(name, _, _)| *name == "_LC")
-        .expect("_LC sysvar")
-        as u16;
+        .expect("_LC sysvar") as u16;
     let op_save = b.commands.iter().position(|(n, _)| *n == "SAVE").unwrap() as u8;
     b.scripts = vec![vec![
         GroupSpec::new(op_save)

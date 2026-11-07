@@ -736,12 +736,7 @@ impl VariableStore {
     /// 写时无跨类型转换(§3.10 结论一)——只有同类型的旧值被替换。
     /// 写入。返回值：所有调用方都丢弃(旧签名返回存储值，白白多一次
     /// `Value` 克隆 —— 字符串变量就是一次堆复制)。
-    pub fn write(
-        &mut self,
-        r: VarRef,
-        indices: &[i64],
-        value: &Value,
-    ) -> Result<(), yu_log::Diag> {
+    pub fn write(&mut self, r: VarRef, indices: &[i64], value: &Value) -> Result<(), yu_log::Diag> {
         let slot = self.slots.get_mut(&(r.space, r.id)).ok_or_else(|| {
             diag::fatal(
                 code::rt::VAR_UNDECLARED,
@@ -912,14 +907,8 @@ mod tests {
         let b = Value::Str(b".BMP".to_vec());
         assert_eq!(a.add(&b).unwrap(), Value::Str(b"ABC.BMP".to_vec()));
         // 官方整数分支除数 0 → 结果写 0(`0x42954e`),不是 Fatal。
-        assert_eq!(
-            Value::Int(1).div(&Value::Int(0)).unwrap(),
-            Value::Int(0)
-        );
-        assert_eq!(
-            Value::Int(7).rem(&Value::Int(0)).unwrap(),
-            Value::Int(0)
-        );
+        assert_eq!(Value::Int(1).div(&Value::Int(0)).unwrap(), Value::Int(0));
+        assert_eq!(Value::Int(7).rem(&Value::Int(0)).unwrap(), Value::Int(0));
     }
 
     #[test]
