@@ -37,7 +37,7 @@ id 显式留空并在 `command_table.json` 记录候选,不猜。
   hits.jsonl             逐命中原始记录(含 handler/ecx/tick/线程)
   command_table.json     运行时 119 项 handler 表与歧义分组
   manifest.json          样本/引擎 hash、参数、计数、失败原因
-  <trace-out>            schema v4 trace(producer=official, vm/command)
+  <trace-out>            schema v5 trace(producer=official, vm/command)
 """
 
 import argparse
@@ -489,7 +489,7 @@ def empty_paths_digest():
 
 
 def build_trace(hits, commands, sample_sha, args, click_tick=None, tick_offset=None):
-    """把命中记录写成 schema v4 trace(producer=official, vm/command)。"""
+    """把命中记录写成 schema v5 trace(producer=official, vm/command)。"""
     names = {index: name for index, name in commands}
     records = []
     for hit in hits:
@@ -505,7 +505,7 @@ def build_trace(hits, commands, sample_sha, args, click_tick=None, tick_offset=N
         if frame is not None and tick_offset is not None:
             frame = max(0, frame - tick_offset) if tick_offset else frame
         records.append({
-            "schema": 4,
+            "schema": 5,
             "seq": len(records) + 1,
             "frame": frame,
             "sub": "vm",
@@ -556,7 +556,7 @@ def build_trace(hits, commands, sample_sha, args, click_tick=None, tick_offset=N
         "clock": {"mode": "tick", "now_ms": []},
         "kernel": "official-0.495 event probe (not the kernel)",
     }
-    lines = [json.dumps({"schema": 4, "seq": 0, "frame": None, "sub": "meta",
+    lines = [json.dumps({"schema": 5, "seq": 0, "frame": None, "sub": "meta",
                          "kind": "header", "payload": header},
                         ensure_ascii=False, separators=(",", ":"))]
     lines.extend(json.dumps(record, ensure_ascii=False, separators=(",", ":"))
