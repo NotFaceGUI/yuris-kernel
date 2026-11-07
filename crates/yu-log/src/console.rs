@@ -383,16 +383,11 @@ impl MinLevel {
     /// Verbose;info/debug/trace 显示到 Info 但仍压 Verbose;
     /// **只有 `verbose` 才显示 Verbose**(门面桥自身的级别另见
     /// `facade::level_from_env`)。
+    ///
+    /// 取值解析只有 [`crate::level::LogLevel`] 一份;未知值/`None` 落到
+    /// `info` 档(与旧实现一致,不因拼写错误静默变严)。
     pub fn from_level_value(value: Option<&str>) -> Self {
-        match value
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("quiet") | Some("error") | Some("warn") => MinLevel::Quiet,
-            Some("verbose") => MinLevel::Verbose,
-            _ => MinLevel::Normal,
-        }
+        crate::level::LogLevel::from_value_or_default(value).min_level()
     }
 }
 

@@ -14,7 +14,10 @@ pub mod code;
 pub mod console;
 pub mod facade;
 mod json;
+pub mod level;
 pub mod sink;
+
+pub use level::LogLevel;
 
 pub use sink::{JsonlSink, LogSink, MemorySink, NullSink};
 

@@ -50,17 +50,6 @@ impl FacadeLevel {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "error" => Some(FacadeLevel::Error),
-            "warn" | "quiet" => Some(FacadeLevel::Warn),
-            "info" => Some(FacadeLevel::Info),
-            "debug" => Some(FacadeLevel::Debug),
-            "trace" => Some(FacadeLevel::Trace),
-            _ => None,
-        }
-    }
-
     fn from_log(level: log::Level) -> Self {
         match level {
             log::Level::Error => FacadeLevel::Error,
@@ -82,12 +71,17 @@ impl FacadeLevel {
     }
 }
 
-/// 从 `YU_LOG` 解析级别;缺省/非法为 `warn`(`quiet` 同 `warn`)。
+/// 从 `YU_LOG` 解析门面级别。
+///
+/// 取值解析只有 [`crate::level::LogLevel`] 一份。缺省/非法值保持旧行为
+/// `warn`(**不放宽**依赖日志);`quiet`/`warn` 同 `warn`;`verbose` 落
+/// 最低档 `Trace` —— 旧实现没有这一项,会倒挂回 `warn`,把依赖日志压得
+/// 比缺省还少。
 #[must_use]
 pub fn level_from_env(value: Option<&str>) -> FacadeLevel {
     value
-        .and_then(FacadeLevel::parse)
-        .unwrap_or(FacadeLevel::Warn)
+        .and_then(|raw| crate::level::LogLevel::parse(raw).ok())
+        .map_or(FacadeLevel::Warn, |level| level.facade_level())
 }
 
 /// 一条 `sub:"log"` 记录的确定性 JSON(字段序固定;`record_json_line` 与
@@ -274,6 +268,8 @@ mod tests {
         assert_eq!(level_from_env(Some("WARN")), FacadeLevel::Warn);
         assert_eq!(level_from_env(Some("quiet")), FacadeLevel::Warn);
         assert_eq!(level_from_env(Some("nonsense")), FacadeLevel::Warn);
+        // verbose 是内核最低档,门面必须跟着到最低,不能倒挂回 warn。
+        assert_eq!(level_from_env(Some("verbose")), FacadeLevel::Trace);
     }
 
     #[test]
