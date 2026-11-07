@@ -11,6 +11,9 @@
 pub enum Codec {
     Cp932,
     Gbk,
+    /// Windows CP950 / Big5(繁中)。前导区间与 GBK 相同,尾字节区间不同
+    /// (含 0x40..=0x7E,因此 0x5C `\` 同样可能是尾字节)。
+    Big5,
 }
 
 impl Codec {
@@ -18,6 +21,7 @@ impl Codec {
         match self {
             Codec::Cp932 => "cp932",
             Codec::Gbk => "gbk",
+            Codec::Big5 => "big5",
         }
     }
 
@@ -25,7 +29,7 @@ impl Codec {
     pub const fn is_lead(self, b: u8) -> bool {
         match self {
             Codec::Cp932 => (b >= 0x81 && b <= 0x9f) || (b >= 0xe0 && b <= 0xfc),
-            Codec::Gbk => b >= 0x81 && b <= 0xfe,
+            Codec::Gbk | Codec::Big5 => b >= 0x81 && b <= 0xfe,
         }
     }
 
@@ -34,6 +38,8 @@ impl Codec {
         match self {
             Codec::Cp932 => (b >= 0x40 && b <= 0x7e) || (b >= 0x80 && b <= 0xfc),
             Codec::Gbk => b >= 0x40 && b <= 0xfe && b != 0x7f,
+            // CP950 尾字节 = 0x40..=0x7E | 0xA1..=0xFE(0x7F..=0xA0 是空洞)。
+            Codec::Big5 => (b >= 0x40 && b <= 0x7e) || (b >= 0xa1 && b <= 0xfe),
         }
     }
 
@@ -42,6 +48,7 @@ impl Codec {
         match self {
             Codec::Cp932 => yu_format::Codec::Cp932,
             Codec::Gbk => yu_format::Codec::Gbk,
+            Codec::Big5 => yu_format::Codec::Big5,
         }
     }
 }
@@ -71,5 +78,19 @@ mod tests {
     fn cp932_backslash_can_be_a_trail_byte() {
         assert!(Codec::Cp932.is_trail(0x5c));
         assert!(Codec::Gbk.is_trail(0x5c));
+        assert!(Codec::Big5.is_trail(0x5c), "Big5 尾字节含 0x40..=0x7E");
+    }
+
+    #[test]
+    fn big5_shares_gbk_lead_range_but_not_trail_holes() {
+        assert!(Codec::Big5.is_lead(0x81));
+        assert!(Codec::Big5.is_lead(0xfe));
+        assert!(!Codec::Big5.is_lead(0x80));
+        // CP950 的 0x80..=0xA0 尾字节区是空洞,GBK 在 0x80 段合法。
+        assert!(!Codec::Big5.is_trail(0x80));
+        assert!(!Codec::Big5.is_trail(0xa0));
+        assert!(Codec::Big5.is_trail(0xa1));
+        assert!(Codec::Big5.is_trail(0xfe));
+        assert_eq!(Codec::Big5.to_format(), yu_format::Codec::Big5);
     }
 }

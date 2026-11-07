@@ -3,14 +3,15 @@
 """yu-format 编解码码表生成器(一次性工具;产物已入库,改码表须重跑本脚本)。
 
 数据源 = Windows 本体 API(kernel32):
-  - 解码表: MultiByteToWideChar(932/936, MB_ERR_INVALID_CHARS, ...)
-  - 编码表: WideCharToMultiByte(932/936, ...)
+  - 解码表: MultiByteToWideChar(932/936/950, MB_ERR_INVALID_CHARS, ...)
+  - 编码表: WideCharToMultiByte(932/936/950, ...)
 理由: YU-RIS 引擎运行在 Windows 上,文本边界走系统码页;以系统行为为真值,
 避免 Python 自带 codec 的非标准扩充(cp932 把 0xA0/0xFD-0xFF 映到 PUA)。
 
 产物:
   src/codec/table_cp932.rs
   src/codec/table_gbk.rs
+  src/codec/table_big5.rs
 
 用法: python gen_tables.py   (在 crates/yu-format 目录下;仅 Windows 可用)
 """
@@ -214,6 +215,7 @@ def main():
     tables = [
         ("table_cp932.rs", 932, "Windows CP932 / Shift-JIS(NEC・IBM 选定行)"),
         ("table_gbk.rs", 936, "Windows CP936 / GBK"),
+        ("table_big5.rs", 950, "Windows CP950 / Big5"),
     ]
     for fname, cp, evidence in tables:
         data = collect(cp)

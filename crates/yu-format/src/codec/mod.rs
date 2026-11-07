@@ -1,7 +1,7 @@
-//! 文本编解码器:CP932 与 GBK 的静态码表 + decode/encode。
+//! 文本编解码器:CP932 / GBK / Big5 的静态码表 + decode/encode。
 //!
 //! - 码表由 `crates/yu-format/gen_tables.py` 从 **Windows kernel32 码页**
-//!   (932/936)生成(`MultiByteToWideChar` / `WideCharToMultiByte`),
+//!   (932/936/950)生成(`MultiByteToWideChar` / `WideCharToMultiByte`),
 //!   即引擎运行平台的系统映射;生成物入库,勿手改。
 //! - 解码严格:非法/不完整序列返回 `fmt.codec.invalid`(带字节偏移),
 //!   不做替换、不做猜测。
@@ -12,6 +12,7 @@
 
 pub mod auto;
 
+mod table_big5;
 mod table_cp932;
 mod table_gbk;
 
@@ -48,6 +49,15 @@ const GBK_TABLE: TableRef<191> = TableRef {
     lead_hi: table_gbk::LEAD_HI,
     trail_lo: table_gbk::TRAIL_LO,
     trail_hi: table_gbk::TRAIL_HI,
+};
+
+const BIG5_TABLE: TableRef<191> = TableRef {
+    single_high: &table_big5::SINGLE_HIGH,
+    rows: &table_big5::ROWS,
+    lead_lo: table_big5::LEAD_LO,
+    lead_hi: table_big5::LEAD_HI,
+    trail_lo: table_big5::TRAIL_LO,
+    trail_hi: table_big5::TRAIL_HI,
 };
 
 impl<const W: usize> TableRef<W> {
@@ -113,11 +123,13 @@ pub enum Codec {
     Cp932,
     /// Windows CP936 / GBK(简中;0x80 → U+20AC)。
     Gbk,
+    /// Windows CP950 / Big5(繁中;港台旧作与部分汉化补丁用)。
+    Big5,
 }
 
 impl Codec {
     /// 全部编解码器(顺序稳定,供 CLI 枚举)。
-    pub const ALL: [Codec; 2] = [Codec::Cp932, Codec::Gbk];
+    pub const ALL: [Codec; 3] = [Codec::Cp932, Codec::Gbk, Codec::Big5];
 
     /// 稳定名(进 trace / golden 头部)。
     #[must_use]
@@ -125,6 +137,7 @@ impl Codec {
         match self {
             Codec::Cp932 => "cp932",
             Codec::Gbk => "gbk",
+            Codec::Big5 => "big5",
         }
     }
 
@@ -133,7 +146,9 @@ impl Codec {
     pub const fn is_lead(self, byte: u8) -> bool {
         match self {
             Codec::Cp932 => matches!(byte, 0x81..=0x9F | 0xE0..=0xFC),
-            Codec::Gbk => matches!(byte, 0x81..=0xFE),
+            // GBK 与 Big5 的前导区间相同(0x81..=0xFE);差别在合法 trail
+            // (Big5 的 0x40..=0x7E 段 GBK 也有,但码位表不同)。
+            Codec::Gbk | Codec::Big5 => matches!(byte, 0x81..=0xFE),
         }
     }
 
@@ -157,6 +172,7 @@ impl Codec {
         let (unit, width) = match self {
             Codec::Cp932 => CP932_TABLE.step(bytes, i),
             Codec::Gbk => GBK_TABLE.step(bytes, i),
+            Codec::Big5 => BIG5_TABLE.step(bytes, i),
         }?;
         Some((char::from_u32(u32::from(unit))?, width))
     }
@@ -191,6 +207,7 @@ impl Codec {
         match name {
             "cp932" | "sjis" | "shift_jis" => Ok(Codec::Cp932),
             "gbk" | "cp936" | "gb2312" => Ok(Codec::Gbk),
+            "big5" | "cp950" | "big-5" => Ok(Codec::Big5),
             other => Err(Diag::fatal(code::CODEC_NAME, Boundary::Format).with_detail(format!(
                 "未知编解码器 `{other}`;可用:{}",
                 Codec::ALL
@@ -216,6 +233,7 @@ impl Codec {
             let step = match self {
                 Codec::Cp932 => CP932_TABLE.step(bytes, i),
                 Codec::Gbk => GBK_TABLE.step(bytes, i),
+                Codec::Big5 => BIG5_TABLE.step(bytes, i),
             };
             match step {
                 Some((unit, width)) => {
@@ -276,6 +294,7 @@ impl Codec {
         match self {
             Codec::Cp932 => (table_cp932::DOUBLE_ENTRIES, table_cp932::ALIASES),
             Codec::Gbk => (table_gbk::DOUBLE_ENTRIES, table_gbk::ALIASES),
+            Codec::Big5 => (table_big5::DOUBLE_ENTRIES, table_big5::ALIASES),
         }
     }
 }
@@ -290,11 +309,13 @@ fn invalid(origin: &[u8], at: usize, detail: &str) -> Diag {
 fn encode_map(codec: Codec) -> &'static HashMap<char, u16> {
     static CP932: OnceLock<HashMap<char, u16>> = OnceLock::new();
     static GBK: OnceLock<HashMap<char, u16>> = OnceLock::new();
+    static BIG5: OnceLock<HashMap<char, u16>> = OnceLock::new();
     match codec {
         Codec::Cp932 => {
             CP932.get_or_init(|| CP932_TABLE.build_map(&table_cp932::ALIAS_OVERRIDES))
         }
         Codec::Gbk => GBK.get_or_init(|| GBK_TABLE.build_map(&table_gbk::ALIAS_OVERRIDES)),
+        Codec::Big5 => BIG5.get_or_init(|| BIG5_TABLE.build_map(&table_big5::ALIAS_OVERRIDES)),
     }
 }
 
@@ -352,11 +373,18 @@ mod tests {
         roundtrip_table(Codec::Gbk, &GBK_TABLE, entries, aliases);
     }
 
+    #[test]
+    fn full_table_roundtrip_big5() {
+        let (entries, aliases) = Codec::Big5.table_audit();
+        roundtrip_table(Codec::Big5, &BIG5_TABLE, entries, aliases);
+    }
+
     /// 单字节区遍历:合法字节 decode/encode 往返,非法字节必须报错。
     fn single_byte_roundtrip(codec: Codec) {
         let high: &[u16; 0x80] = match codec {
             Codec::Cp932 => CP932_TABLE.single_high,
             Codec::Gbk => GBK_TABLE.single_high,
+            Codec::Big5 => BIG5_TABLE.single_high,
         };
         for b in 0x00u16..0x100 {
             let bytes = [b as u8];
@@ -384,5 +412,10 @@ mod tests {
     #[test]
     fn single_byte_roundtrip_gbk() {
         single_byte_roundtrip(Codec::Gbk);
+    }
+
+    #[test]
+    fn single_byte_roundtrip_big5() {
+        single_byte_roundtrip(Codec::Big5);
     }
 }

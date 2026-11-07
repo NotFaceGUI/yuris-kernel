@@ -4,6 +4,7 @@
 //!
 //! - [`PatchKind::Original`]:原版 CP932;
 //! - [`PatchKind::Gbk`]:全局 GBK(官方 `_chs` 换首字节表同构);
+//! - [`PatchKind::Big5`]:全局 Big5 / CP950(繁中旧作与部分汉化补丁);
 //! - [`PatchKind::Tunnel`]:CP932 + `sjis_ext.bin` 隧道表。
 //!
 //! [`PatchKind::Auto`] 是便利值:只在宿主没给类型时按产物识别
@@ -31,6 +32,12 @@ pub enum PatchKind {
     Original,
     /// 全局 GBK(官方 `_chs` 同构)。
     Gbk,
+    /// 全局 Big5 / CP950(繁中;港台旧作与部分汉化补丁)。
+    ///
+    /// 与 [`PatchKind::Gbk`] 同构:换掉整包文本的编码,路径/文件名仍按
+    /// CP932(官方引擎的资源命名从未随汉化改变)。**不参与 `Auto` 识别**
+    /// —— cp950 与 cp936 前导区间重叠,只能由用户/宿主显式指定。
+    Big5,
     /// CP932 + SJIS 隧道表(`sjis_ext.bin`)。
     Tunnel,
 }
@@ -42,11 +49,14 @@ impl PatchKind {
             PatchKind::Auto => "auto",
             PatchKind::Original => "original",
             PatchKind::Gbk => "gbk",
+            PatchKind::Big5 => "big5",
             PatchKind::Tunnel => "tunnel",
         }
     }
 
-    /// 解析宿主/CLI 值。`auto|original|gbk|tunnel`;`cp932` 等同 `original`。
+    /// 解析宿主/CLI 值。`auto|original|gbk|big5|tunnel`;`cp932` 等同
+    /// `original`。全平台唯一一份(CLI `--patch`、serve、Android
+    /// `run-config.json` 的 `patch` 键共用)。
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(PatchKind::Auto),
@@ -54,9 +64,10 @@ impl PatchKind {
                 Ok(PatchKind::Original)
             }
             "gbk" | "cp936" | "gb2312" => Ok(PatchKind::Gbk),
+            "big5" | "cp950" | "big-5" => Ok(PatchKind::Big5),
             "tunnel" | "sjis_ext" => Ok(PatchKind::Tunnel),
             other => Err(format!(
-                "未知补丁类型 `{other}`;可用:auto | original | gbk | tunnel"
+                "未知补丁类型 `{other}`;可用:auto | original | gbk | big5 | tunnel"
             )),
         }
     }
@@ -157,6 +168,15 @@ impl PatchSelection {
                 name: Codec::Cp932,
                 source: PatchSource::Cli,
                 evidence: vec!["cli: gbk".to_string()],
+                ..PatchProfile::default()
+            }),
+            PatchKind::Big5 => Ok(PatchProfile {
+                kind: PatchKind::Big5,
+                execution: Codec::Big5,
+                text_default: Codec::Big5,
+                name: Codec::Cp932,
+                source: PatchSource::Cli,
+                evidence: vec!["cli: big5".to_string()],
                 ..PatchProfile::default()
             }),
             PatchKind::Tunnel => {

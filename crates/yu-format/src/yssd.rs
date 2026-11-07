@@ -401,6 +401,26 @@ pub enum BlockCodec {
 }
 
 impl BlockCodec {
+    /// 宿主/CLI 值 → 压缩层(`zlib|snappy`,大小写不敏感)。
+    ///
+    /// 全平台唯一一份解析:CLI 旗标、Android `run-config.json`、以后 wasm 的
+    /// 配置键都走这里,错误文案不再各宿主各写一套。
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "zlib" => Ok(Self::Zlib),
+            "snappy" => Ok(Self::Snappy),
+            other => Err(format!("save_codec 只接受 zlib|snappy,收到 `{other}`")),
+        }
+    }
+
+    /// 规范名(诊断/配置回写用)。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Zlib => "zlib",
+            Self::Snappy => "snappy",
+        }
+    }
+
     fn compress(self, raw: &[u8]) -> Vec<u8> {
         match self {
             Self::Zlib => zlib_compress_level1(raw),
@@ -698,6 +718,19 @@ pub struct YssdSubBlockRaw<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_codec_parses_host_value() {
+        // CLI `--save-codec` / Android `run-config.json` 共用这一份解析。
+        assert_eq!(BlockCodec::parse("zlib"), Ok(BlockCodec::Zlib));
+        assert_eq!(BlockCodec::parse(" Snappy "), Ok(BlockCodec::Snappy));
+        let error = BlockCodec::parse("lz4").unwrap_err();
+        assert!(error.contains("zlib|snappy"), "文案要列全取值: {error}");
+        // 规范名可往返。
+        for codec in [BlockCodec::Zlib, BlockCodec::Snappy] {
+            assert_eq!(BlockCodec::parse(codec.as_str()), Ok(codec));
+        }
+    }
 
     /// 官方形态的最小 INT 标量块(与 save30001 DNO=1 同构:
     /// ty=1 dims=0 dlen=8 值 5)。zlib level 1 字节为固定输入的确定产物,

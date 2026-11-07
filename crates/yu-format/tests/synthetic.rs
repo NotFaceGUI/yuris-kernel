@@ -735,8 +735,11 @@ fn codec_invalid_sequences() {
     // 不可映射字符
     let err = Codec::Cp932.encode("\u{1F600}", b"t").unwrap_err();
     assert_eq!(err.code, code::CODEC_INVALID);
+    // Big5:名与别名都进来了(cp950 码表加入后的合法取值)。
+    assert_eq!(Codec::from_name("big5").unwrap(), Codec::Big5);
+    assert_eq!(Codec::from_name("cp950").unwrap(), Codec::Big5);
     // 未知名
-    assert_eq!(Codec::from_name("big5").unwrap_err().code, code::CODEC_NAME);
+    assert_eq!(Codec::from_name("euc-kr").unwrap_err().code, code::CODEC_NAME);
     assert_eq!(Codec::from_name("gbk").unwrap(), Codec::Gbk);
     assert_eq!(Codec::from_name("sjis").unwrap(), Codec::Cp932);
 }

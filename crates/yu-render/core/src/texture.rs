@@ -631,18 +631,24 @@ impl TextureStore {
     ///
     /// 只用于原始字节 miss 之后;原始命中永远优先。歧义(两个不同字节名
     /// 指向同一 Unicode)不猜,保持 `asset.missing`。
+    /// 把 vfs 的 `Codec` 映射为文本层的 `Codec`(两者是同一枚举的再导出;
+    /// 集中一处,避免每个调用点各写一遍 match)。
+    fn codec_as_format(codec: Codec) -> yu_format::Codec {
+        match codec {
+            Codec::Cp932 => yu_format::Codec::Cp932,
+            Codec::Gbk => yu_format::Codec::Gbk,
+            Codec::Big5 => yu_format::Codec::Big5,
+        }
+    }
+
     fn name_encoding_fallback(&self, candidate: &[u8]) -> Option<Vec<u8>> {
         if candidate.iter().all(|b| *b < 0x80) {
             return None;
         }
-        let script = match self.codec {
-            Codec::Cp932 => yu_format::Codec::Cp932,
-            Codec::Gbk => yu_format::Codec::Gbk,
-        };
-        let other = match script {
-            yu_format::Codec::Cp932 => yu_format::Codec::Gbk,
-            yu_format::Codec::Gbk => yu_format::Codec::Cp932,
-        };
+        // 候选编码 = 本作声明的编码 + 其余已知编码(CP932/GBK/Big5)。
+        // 汉化补丁可能把文件名按另一种码页重新打包,这里要把它们都试一遍;
+        // 用 `Codec::ALL` 而不是写死两个分支,新增码页不必回来改这里。
+        let script = Self::codec_as_format(self.codec);
         let (dir, name) = split_dir_name(candidate, self.codec);
         let want = script.decode(name, name).ok()?;
         let dir_key = LookupKey::new(dir, self.codec).ok()?;
@@ -652,7 +658,7 @@ impl TextureStore {
             if entry.kind != EntryKind::File || entry.name == name {
                 continue;
             }
-            let matched = [script, other].iter().any(|codec| {
+            let matched = yu_format::Codec::ALL.iter().any(|codec| {
                 codec
                     .decode(&entry.name, &entry.name)
                     .ok()
@@ -681,14 +687,7 @@ impl TextureStore {
         if key.iter().all(|b| *b < 0x80) {
             return None;
         }
-        let script = match self.codec {
-            Codec::Cp932 => yu_format::Codec::Cp932,
-            Codec::Gbk => yu_format::Codec::Gbk,
-        };
-        let other = match script {
-            yu_format::Codec::Cp932 => yu_format::Codec::Gbk,
-            yu_format::Codec::Gbk => yu_format::Codec::Cp932,
-        };
+        let script = Self::codec_as_format(self.codec);
         let key_text = script.decode(key, key).ok()?;
         let (dir, name) = split_dir_name(key, self.codec);
         let name_text = script.decode(name, name).ok()?;
@@ -699,7 +698,7 @@ impl TextureStore {
             if entry.kind != EntryKind::File || entry.name == name {
                 continue;
             }
-            for codec in [script, other] {
+            for codec in yu_format::Codec::ALL {
                 let Ok(text) = codec.decode(&entry.name, &entry.name) else {
                     continue;
                 };

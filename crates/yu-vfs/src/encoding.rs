@@ -59,12 +59,16 @@ impl TextEncoding {
         }
     }
 
-    /// 资源名归一可用的编解码器;UTF-8/Big5 名不进 VFS 查找键。
+    /// 资源名归一可用的编解码器;UTF-8 名不进 VFS 查找键。
+    ///
+    /// Big5 在 `yu-format` 补齐 cp950 码表后已可用于路径扫描(它与 GBK
+    /// 前导区间相同、尾字节区间不同,扫描判据已在 `codec.rs` 分开)。
     pub const fn as_codec(self) -> Option<Codec> {
         match self {
             TextEncoding::Cp932 => Some(Codec::Cp932),
             TextEncoding::Gbk => Some(Codec::Gbk),
-            TextEncoding::Utf8 | TextEncoding::Big5 => None,
+            TextEncoding::Big5 => Some(Codec::Big5),
+            TextEncoding::Utf8 => None,
         }
     }
 }
@@ -74,6 +78,7 @@ impl From<Codec> for TextEncoding {
         match codec {
             Codec::Cp932 => TextEncoding::Cp932,
             Codec::Gbk => TextEncoding::Gbk,
+            Codec::Big5 => TextEncoding::Big5,
         }
     }
 }
@@ -129,7 +134,10 @@ pub struct Decision {
 }
 
 impl Decision {
-    /// 判定结果对应的 VFS 名字编解码器(UTF-8/Big5 名不支持)。
+    /// 判定结果对应的 VFS 名字编解码器(UTF-8 名不支持)。
+    ///
+    /// Big5 自 cp950 码表入库后可用于路径扫描(与 GBK 前导区间相同、
+    /// 尾字节区间不同),因此也返回 `Some`。
     pub fn codec(&self) -> Option<Codec> {
         self.encoding.as_codec()
     }

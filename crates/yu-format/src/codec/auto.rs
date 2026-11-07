@@ -8,6 +8,13 @@
 //! - 构成统计:假名 / 半角假名 / 汉字 / 日文标点 / 控制字符;
 //! - 得分为固定次序的浮点算式,无随机、无环境依赖;
 //! - 得分差低于 [`TIE_THRESHOLD`] 或全部为零 → 缺省 [`Codec::Cp932`]。
+//!
+//! # Big5 不参与自动识别(有意)
+//!
+//! [`Codec::Big5`] 是**显式选项**:cp950 与 cp936 的前导区间重叠(都含
+//! 0x81..=0xFE),字节流层面的构成统计无法可靠区分两者,强行加进评分只会
+//! 让简中/繁中互相误判。检测仍只在 CP932 与 GBK 之间裁决;要 Big5 就由
+//! 宿主/用户显式指定(`--patch big5`、`run-config.json` 的 `patch` 键)。
 
 use super::Codec;
 
@@ -131,6 +138,8 @@ fn score_one(codec: Codec, bytes: &[u8], out: &mut Score) {
         let step = match codec {
             Codec::Cp932 => super::CP932_TABLE.step(bytes, i),
             Codec::Gbk => super::GBK_TABLE.step(bytes, i),
+            // 不参与 `detect()` 的裁决,但保持穷尽匹配(单测直接给分时会用到)。
+            Codec::Big5 => super::BIG5_TABLE.step(bytes, i),
         };
         match step {
             Some((unit, width)) => {
