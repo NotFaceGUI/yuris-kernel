@@ -28,11 +28,31 @@ tools/android/build.sh                      # arm64-v8a + x86_64
 tools/android/build.sh arm64-v8a            # 只打真机
 ```
 
-产物:`android/app/build/outputs/apk/debug/app-debug.apk`。
+产物:debug → `android/app/build/outputs/apk/debug/app-debug.apk`;
+release → `android/app/build/outputs/apk/release/app-release.apk`。
+
+脚本的环境变量(CI 与本地共用同一份):
+
+| 变量 | 作用 |
+|---|---|
+| `BUILD_TYPE=debug\|release` | 打哪个构建类型,缺省 debug |
+| `YURIS_SO_ONLY=1` | 只交叉编译 so 并落到 `jniLibs`,不跑 gradle |
+| `GRADLE_FLAGS=...` | 覆盖 gradle 参数,缺省 `--offline`;CI 传 `--no-daemon` |
+| `GRADLE_PROJECT_ARGS=...` | 追加 `-P`(`-PreleaseVersionName=… -PreleaseVersionCode=…`) |
+| `YURIS_KEYSTORE_FILE` / `YURIS_KEYSTORE_PASSWORD` / `YURIS_KEY_ALIAS` / `YURIS_KEY_PASSWORD` | 发布签名四件套 |
+
+`versionCode` / `versionName` 只有 `-PreleaseVersionName` /
+`-PreleaseVersionCode` 一个来源(CI 由 tag 与 `GITHUB_RUN_NUMBER` 注入),
+缺省 `0.1.0` / `1`。
+
+发布签名:四个变量齐备时用 `signingConfigs.release`;缺任一项则回落 debug 签名
+(自用安装,不可分发)。**在 CI 上(`GITHUB_ACTIONS=true`)缺签名会直接构建失败**,
+不会静默产出 debug key 签名的"发布版"。签名配置见 `docs/release.md`。
 
 首次用 Gradle 需生成 `android/local.properties`(`sdk.dir=...`,**用正斜杠**;
-反斜杠会被 Java properties 当转义吃掉)。若要完全离线构建,`gradle.properties`
-里的 `android.aapt2FromMavenOverride` 指向 SDK 里已有的 aapt2。
+反斜杠会被 Java properties 当转义吃掉)。若要完全离线构建,`build.sh` 会自动
+探测 `$ANDROID_HOME/build-tools/*/aapt2` 并传 `-Pandroid.aapt2FromMavenOverride`;
+手工调 gradle 时照抄同一个 `-P` 即可。
 
 **若 `gradle` 启动即报 `Could not initialize native services /
 Failed to load native library 'native-platform.dll'`**:那是 `~/.gradle/native`
@@ -54,7 +74,9 @@ gradle --offline --no-daemon assembleRelease
 `GRADLE_USER_HOME`(依赖缓存已有 178M,离线 `assembleDebug` 40s)。
 Windows 下 NDK 的 sh 版 `*-clang` 无法被 Rust exec,`build.sh` 会自动改用
 `.cmd` 包装器(也兼容 r28 起 sysroot 挪进 toolchains 的新布局)。
-```
+
+同理,若出现 `modules-2.lock ... 拒绝访问`,说明有 IDE 正在使用同一份缓存;
+独立 home 可绕开。
 
 同理,若出现 `modules-2.lock ... 拒绝访问`,说明有 IDE 正在使用同一份缓存;
 独立 home 可绕开。

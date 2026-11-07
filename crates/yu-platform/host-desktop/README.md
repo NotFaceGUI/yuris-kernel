@@ -1,18 +1,20 @@
 # yu-host-desktop
 
-Windows 原生窗口宿主(后续可跨桌面平台):**winit 0.30** 开窗,**wgpu 30** 上屏,
-**egui 0.37** 调试面板。引擎语义仍全部在 `yu-rt`/`yu-gfx`/后端;本 crate 只做
-窗口、输入转发、呈现和诊断。
+跨桌面平台的原生窗口宿主:**winit 0.30** 开窗,**wgpu 30** 上屏,
+**egui 0.37** 调试面板,**cpal** 出声。引擎语义仍全部在
+`yu-rt`/`yu-gfx`/后端;本 crate 只做窗口、输入转发、呈现、音频设备与诊断。
+
+本 crate **不单独出 exe**:由 `yu-cli` 的 `desktop` feature 内嵌,入口是
+`yu-cli run --mode desktop`。
 
 ## 运行
 
 ```bash
-cargo build --release -p yu-host-desktop
-target/release/yu-desktop.exe "<project>" --backend wgpu --debug-ui
+cargo build --release -p yu-cli
+target/release/yu-cli.exe run "<project>" --mode desktop --backend wgpu --debug-ui
 ```
 
-`--debug-ui` 启动即开面板(F1 开关);不要加 `--no-sound`(默认有声)。
-`--frames N --shot out.png` 用于无头验收。
+`--debug-ui` 启动即开面板(F1 开关)。`--frames N --shot out.png` 用于无头验收。
 
 ## 帧步进器(debug-ui)
 
@@ -64,5 +66,7 @@ pc / 输入按下沿 / 声音层 / op 目标分布 / GPU 占用 / 渲染阶段�
 
 ## 音频
 
-不是本 crate 的职责:`yu-cli` 的 `SoundSink` 用 cpal 回调直接锁
-`Arc<Mutex<SoundState>>` 渲染(音频线程是时钟),UI 线程阻塞/拖窗不影响声音。
+`SoundSink`(`src/sound_device.rs`,实现 `yu_engine::engine::AudioOut`):
+cpal 回调**直接锁 `Arc<Mutex<SoundState>>` 渲染,音频线程本身是时钟**;
+UI 线程阻塞/拖窗不影响声音。与 Android 不同构(那边回调跑在 AAudio 实时
+优先级,必须零锁零分配,见 `docs/cross-platform.md`),但语义等价。

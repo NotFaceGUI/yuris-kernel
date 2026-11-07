@@ -1,16 +1,22 @@
 # yu-log
 
-错误 + 日志一体包,所有 crate 的错误唯一出口。零第三方依赖。
+错误 + 日志一体包,所有 crate 的错误唯一出口。
 
 ## 负责
 
 - [`Diag`](src/lib.rs):结构化错误 —— 稳定命名空间错误码 + 严重级 + 边界归属 +
   位置上下文 + 因果链。错误是数据,不是字符串。
-- 严重级语义对齐官方:`Fatal` / `Recoverable` / `Unimplemented`(已知语义未实装,
-  挂号留痕)/ `Info`。
+- 严重级:`Fatal` / `Recoverable` / `Unimplemented`(已知语义未实装,挂号留痕)/
+  `Info` / `Verbose`(幂等空操作等"正常但值得留痕"的事实,最低档才显示)。
+- [`LogLevel`](src/level.rs):`quiet|error|warn|info|debug|trace|verbose` 七档,
+  全平台唯一解析入口(`LogLevel::parse` / `ALL`);CLI `--log-level`、`YU_LOG`、
+  内核 `MinLevel`、依赖门面桥、Android `run-config.json` 共用。
 - 稳定码表(`src/code.rs`):各子系统码域与唯一性有单测约束。
 - [`LogSink`](src/sink.rs):显式注入,无隐藏全局(确定性不变式 A3);
   `JsonlSink` / `MemorySink` / `NullSink`。JSONL 输出确定性、可逐字节往返。
+
+依赖只有 `log`(门面桥,消费 wgpu/winit 等第三方诊断);不引
+env_logger/tracing,级别只认 `YU_LOG`。
 
 ## 不负责
 

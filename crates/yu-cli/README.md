@@ -1,4 +1,4 @@
-# yu-cli · 原生引擎宿主 + 本地服务 + wasm 呈现端
+# yu-cli · 桌面/headless 宿主 + 本地服务 + wasm 呈现端
 
 任务书:`docs/tasks/task-k2-hosts.md`。架构按 2026-10-21 主人决定调整为 **B**:
 
@@ -6,7 +6,7 @@
 浏览器  www/index.html + app.js + yu-host-wasm(只呈现)
    │  WebSocket: RGBA 帧 / 输入 / 控制
    ▼
-本地服务  yu-cli serve(或 yu-engine serve)
+本地服务  yu-cli serve(子进程 bin 名 yu-serve)
    │  同一份 native 读取路径:按官方挂载规则发现数据入口
    ▼
 yu-rt(运行核) → yu-gfx(CompositorFrame) → yu-backend-soft / yu-backend-wgpu
@@ -27,15 +27,20 @@ yu-rt(运行核) → yu-gfx(CompositorFrame) → yu-backend-soft / yu-backend-wg
 ## 命令
 
 ```text
-yu-cli run  <project-root> [--backend soft|wgpu] [--entry LABEL] [--frames N]
+yu-cli run  <project-root> [--mode headless|desktop] [--backend soft|wgpu]
+                           [--entry LABEL] [--frames N] [--patch MODE]
                            [--until-visible] [--shot PATH] [--json PATH]
-                           [--record-events on|off]
+                           [--record-events on|off] [--script-key HEX]
 yu-cli serve <project-root> [--backend soft|wgpu] [--port 4173] [--no-open]
                            [--entry LABEL] [--fps 60] [--record-events on|off]
+                           [--patch MODE] [--pause-at N]
 yu-cli dev  <project-root> [--port 4173] [--no-open] [--backend soft|wgpu]
 yu-cli case <project-root> --all | --case NAME [--update]
 yu-cli bench <project-root>
 ```
+
+`--patch` 取值 `auto|original|gbk|big5|tunnel`，与 Android 配置界面共用
+`yu_engine::patch::PatchKind::parse`（唯一取值表见 `docs/cross-platform.md`）。
 
 数据入口唯一约定(`AGENTS.md` §2):`<project-root>/data.ypf` 优先,
 `<project-root>/data/` 为备;`<project-root>` 也可以是 `.ypf` 文件
@@ -80,8 +85,8 @@ GET /ws               WebSocket:帧下发 + 输入/控制上行
 
 ### `dev`(HMR 监督)
 
-1. `cargo build -p yu-cli --bin yu-engine`(debug);
-2. 启动子进程 `yu-engine serve <project> --port N`(stdin 作为控制通道);
+1. `cargo build -p yu-cli --bin yu-serve`(debug);
+2. 启动子进程 `yu-serve serve <project> --port N`(stdin 作为控制通道);
 3. 500ms 指纹轮询 `crates/**/*.rs` + `Cargo.toml`(排除 `target/`),300ms 去抖;
 4. Rust 变更 → 结束子进程 → 重建 → 重启(浏览器 WS 自动重连,重新出首帧);
 5. `www/**` 变更 → 向子进程 stdin 发 `reload` → SSE 广播 → 页面刷新;
@@ -261,11 +266,20 @@ Ku-ris B4 标题)。
    多 GB 包只在 Rust 侧按需读,不会进浏览器。
 4. **帧格式**:当前是未压缩 RGBA(800×600 ≈ 1.9 MB/帧,loopback 足够);
    远程/弱机需要时再加 delta/压缩,协议版本号在头部 `YUF1` 上区分。
-5. **Vite 未启用**:B 架构下页面由引擎服务同源提供、HMR 由 WebSocket 重连
-   完成,不需要 Node 构建链。任务书里的 `--vite` 随之取消;需要前端框架时
-   自行在 `www/` 里加,服务只做静态文件。
+5. **不用 Node 构建链**:B 架构下页面由引擎服务同源提供、HMR 由 WebSocket
+   重连完成。需要前端框架时自行在 `www/` 里加,服务只做静态文件。
 6. **多 GB 包**:服务端 `YpfSource::open` 惰性随机读,浏览器只收帧;
    没有整包进内存的路径。
-7. **画面缩放**:引擎按工程 `yscfg` 的 800×600 渲染,页面把 canvas 平滑
+7. **画面缩放**:引擎按工程 `yscfg` 的视口渲染,页面把 canvas 平滑
    放大到窗口(视觉小说观感)。需要看原始像素时加 `?pixel=1`(最近邻)。
-   CSS 缩放不参与像素校验:验收读的是 canvas 内部 800×600。
+   CSS 缩放不参与像素校验:验收读的是 canvas 内部原生分辨率。
+
+## 构建
+
+默认 feature 是 `desktop`(带窗口,一个 exe 两种模式)。纯 headless / CI:
+
+```bash
+cargo build --release -p yu-cli --no-default-features
+```
+
+该构建不链 winit / egui / 声卡,`run --mode desktop` 不可用。

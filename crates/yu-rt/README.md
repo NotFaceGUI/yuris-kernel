@@ -22,15 +22,19 @@ YU-RIS 运行核:把游戏工程数据变成可执行的任务系统,产出事�
 - **同步图形宿主**:`set_graphics_host` 后,图形/窗口/文本/帧事件在**产生时**
   同步进入宿主;`CGINFO`/`FONTINFO`/`WINDOWINFO` 在脚本执行期查询并写回
   `LET`。**调用方不得再把同一批事件 drain 后重喂**(双消费)。
-- **系统变量 ABI**(`sysvar_abi.rs`):按 `ysv.ybn` 指纹选族(四族数据表),
-  不写死 id。
+- **系统变量 ABI**(`sysvar_abi.rs`):按 `ysv.ybn` 前缀指纹选族,27 张内置表
+  (0.255–0.495)按新→旧匹配,不写死 id,也不按版本号分支;工程自带
+  `YSCom.ycd` 时优先用它。同名 sha 的表只留一份(如 `f7380aba` 覆盖
+  0.481–0.493)。
 
 ## 真值纪律
 
-每条已实现语义标注三层出处:①官方手册页 ②真实 ERIS 编译语料(含频度)
-③官方 0.495 引擎逆向事实。缺一层 ⇒ `Diag::Unimplemented` 挂号,
-档案在 `crates/yu-rt/docs/divergences/`,逐命令证据在
-`crates/yu-rt/docs/command-provenance.md`。
+每条已实现语义标注出处:①官方手册页 ②真实 ERIS 编译语料(含频度)
+③官方 0.495 引擎逆向事实。手册缺页但 REA/引擎证据足够时照常实现,代码与
+台账标注 `fixed(no-manual)` + REA 锚点;官方处理体本身是空桩的记
+`aligned-stub`,官方也不支持的记 `unsupported-by-official`。
+`Diag::Unimplemented` 只作过渡态。档案在 `crates/yu-rt/docs/divergences/`,
+逐命令证据在 `crates/yu-rt/docs/command-provenance.md`。
 
 ## 边界
 

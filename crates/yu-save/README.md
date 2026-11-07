@@ -12,24 +12,26 @@ YU-RIS 存档与文件域(`SAVE` / `LOAD` / `SAVEEND` / `SAVEINFO` /
 |---|---|
 | `error` | `sv.*` 稳定诊断码表(唯一性单测守卫) |
 | `state` | `SaveState`:槽表(盘上事实)+ 事件事实消费 + 诊断队列 |
-| `host` | `SaveHost`:`yu-cli` Engine 每帧 drain 事件后喂入 |
+| `host` | `SaveHost`:`yu-rt` 事件**命令时刻**同步喂入(B1 裁 1-A/裁 2-A) |
 
-与 `yu-sound` 的差别:`yu-rt` 在 P4 轮冻结,故**不加 `yu-rt` 宿主
-trait**,由 Engine 在 `Vm::take_events()` 之后驱动(事实记录容忍一帧
-延迟,见 `yu-rt/docs/domain-event-contracts.md` §6)。
+| `fs` | `SaveFs` 平台端口(`NativeSaveFs` 默认实现;宿主可注入内存实现) |
+
+与 `yu-sound` 的差别:`yu-rt` 在 P4 轮冻结,当时未加宿主 trait;B1 起改为
+`SaveHost` 同步契约(命令时刻快照),不再靠 drain 后补喂(见
+`yu-rt/docs/domain-event-contracts.md` §6)。
 
 ## 本轮硬边界(全部挂号,不猜)
 
 | 项 | 处置 | 依据 |
 |---|---|---|
-| `SAVE[FILE]` 刷盘 | **拒绝**(`sv.write.refused`),不写半忠实存档 | `SET/LET` 的变量引用身份在事件层丢失(DIV-RT-042);块的 `var_id` 与整组数组内容拿不到 |
-| `LOAD[LET/ID]` 值写回 | 容器读侧照常(槽表/解析);写回挂账 | 同上 + 图层恢复归 H-P4-02 |
+| `SAVE[FILE]` 刷盘 | **已实现**(`flush` 按 DNO 升序写预约时的字节快照;默认**可写**,只读为显式构造态,拒绝时挂号 `sv.write.refused`) | B1 裁 1-A/裁 2-A;REA `0x44d73d`/`0x44e1a0` |
+| `LOAD[LET/ID]` 值写回 | 容器读侧照常(槽表/解析);图层恢复挂账 H-P4-02 | DIV-RT-042 + H-P4-02 |
 | `SAVEINFO` 查询 | 挂账(`REA 0x44e1c8` 未取证,语料 0 次) | 手册页 + 语料实测 |
 | `FILEACT[EXEC]` | 拒绝(`sv.exec.refused`) | 无引擎语义取证 + 宿主安全策略(不执行外部程序) |
 | `FILEACT` 图层导出(BMP/PNG/JPG) | 挂账 H-P4-02(→ P2/集成轮) | 需要 gfx |
 | `FILEINFO[EXIST]` | **不双写**(内核 J3 已实现) | REA `0x44286c` |
-| SNP 压缩形态 | 不实现(本语料 7 文件全 zlib level 1) | 旧线双语料对照;0.495 产物 `78 01` 头 |
-| FILEACT 落盘 | 仅在**显式可写 save 根**下允许 | 默认只读观察,保护语料工程目录 |
+| SNP 压缩形态 | 可读可写(`BlockCodec::Snappy`,按盘上既有存档 → 引擎代号 → zlib 判定) | 0.495 产物 `78 01` 头;CLI `--save-codec` |
+| FILEACT 落盘 | 仅在**显式可写 save 根**下允许 | 保护语料工程目录 |
 
 ## 验证
 

@@ -89,11 +89,15 @@ u8 取整),与 wgpu 固定管线/本后端共用同一舍入,淡入淡出区间 
 - **资产探测**:若 key 自带扩展名先试原 key;否则按
   `frame.image_probe_order` 追加扩展名。第一个存在的候选胜出;该候选解码
   失败即终态,不回退后续扩展名。`.psb`/未知码无解码器 ⇒ `asset.unsupported`。
-- **资源图 + `SX/SY`**:跳过(`gfx.image.size.unsupported`);只有
-  `FILE=""` 的 1×1 黑图按 `SX/SY` 拉伸。
-- **未实现项**:掩码/部分图像加工/PSB 解码不近似;文本已实现两条路径
-  (`CGACT[TEXT]` 与 `_TEXT_FLAG` 自动层),缺少 `_TEXT_FLAG` 的
-  `TextRun` 仍显式跳过并计数。
+- **资源图 + `SX/SY`**:层矩形由后端按矩形缩放;单边尺寸缺省轴按 1。
+- **图像加工**:`RECTPAINT/2/3`、`REVERSE`、`HORIZONTAL/VERTICAL`、`RESIZE`、
+  `TRIM`、`ROTATION`、`MONO`/`SEPIA`、`MERGE`/`MERGE2`、`AND`/`XOR`、
+  `BLUR`~`BLUR6`、`DIFFUSION`、`WHIRLPOOL`、`RASTER`/`RASTER2`/`RASTER3`
+  全部实现(逐动作 REA 定案,见 DIV-GFX-013/063);`MID` 外部掩码走
+  `mask_alpha`(`target.a = mask.r`)。
+- **未实现项**:独立 `Op::Mask`(非 `CG[MID]` 路径)与 PSB 解码不近似,
+  显式跳过并计数。文本两条路径(`CGACT[TEXT]` 与 `_TEXT_FLAG` 自动层)
+  均已实现;无 `_TEXT_FLAG` 的 `TextRun` 仍跳过并计数。
 
 ## 确定性
 

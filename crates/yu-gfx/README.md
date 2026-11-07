@@ -21,8 +21,9 @@ yu-rt 事件流(VmEvent::DomainCall / Text)
 - `A` 保留引擎单位 0..256:固定管线 `min(A,255)/255`,着色器 `A/256`;
   坐标 i64 像素,gamma 空间混合(不线性化);
 - blend 19 模式的 D3D9 状态表见 `json::blend_table_json()`;
-  0/1/2/3/5/6/7/9 可执行(两阶段源色归约,见 `docs/render-parity.md` §5.2),
-  4/8/10..18 未实现;
+  0/1/2/3/5/6/7/9 可执行(两阶段源色归约,见 `docs/render-parity.md` §5.2);
+  4/8/10..18 官方绘制体没有分支(不是"我们没做"),按
+  `unsupported-by-official` 归约到通常路径,见 DIV-GFX-002;
 - `CompositorFrame.dx_mode`(默认 0)是宿主注入的脚本 `_DXMODE` 映射;
   非 0 时后端选择引擎 psC/psD 转场(独立 WGSL),见 `docs/shader-parity.md`;
 - `filter` 是全局采样器设置,非逐层;
@@ -32,25 +33,31 @@ yu-rt 事件流(VmEvent::DomainCall / Text)
 ## 同步宿主与查询
 
 [`GfxHost`](src/host.rs)(`Rc<RefCell<GfxState>>`)接 `yu-rt` 后,事件产生时
-同步消费;`query_info` 支持脚本期查询:CGINFO(EXIST/E/A/X/Y/Z/MODE/T/TA/TID、
-组与显式尺寸层的 SX/SY)、FONTINFO(当前样式)、WINDOWINFO(主窗口几何)。
-多字段同时置位顺序未取证 ⇒ 拒答不猜;资源图尺寸需资产元数据 ⇒ 挂账。
+同步消费;`query_info` 支持脚本期查询:CGINFO(EXIST/E/A/X/Y/Z/MODE/T/TA/TID/
+SX/SY/COLOR/ONMOUSE 族)、FONTINFO(当前样式与字体清单)、WINDOWINFO(主窗口
+几何)。CGINFO 多字段按官方 if/else 优先级取首个置位字段(REA
+`0x43d758..0x43dddf`);未分类字段与缺失目标的非 EXIST 字段仍拒答。
 
 ## 确定性
 
 无散列表迭代序、无墙钟、无线程、无绝对路径;同一输入两次
 `to_display_json` 逐字节一致。
 
-## 当前未实现(全部有编号与解除条件)
+## 当前未收口(全部有编号与解除条件)
 
-`docs/gfx-unimplemented-todo.md`(DIV-GFX-001..050):MODE 4/8/10..18 公式、
-FX 仿射族、多部件、MID、COPY 时序、`RECTPAINT` 之外的图像加工
-像素、文本栅格化、颜色空间、组 RT 尺寸/清屏与 RT alpha 等。
-`RECTPAINT/RECTPAINT2/RECTPAINT3` 已实现(EVID-J-02..05);
-`docs/shader-parity.md` 是引擎 4 个 shader blob 的完整台账。
-首屏 golden:`tests/golden/eris_first_screen_display.json`(历史 272 层 /
-15 pass / 44 op;当前 HEAD 的 boot 链为 8 visible / 18 op,见 PROGRESS J1;
-未用 UPDATE 掩盖)。
+`docs/gfx-unimplemented-todo.md`(DIV-GFX-001..080)。已关闭的包括:MODE 3/5/6/7/9
+固定管线、MODE 4/8/10..18 定性为官方无实现、`CGACT` 图像加工软后端全族、
+`MID` 外部掩码、`CG[TIDNO]`/`SWAP`/`ID3 ID4 Z2 BNO`、文本层 ID 字节化、
+`CGACT[TEXT]` 空串降噪、psC/psD 转场、屏幕快照冻结与烘焙回执。
+
+仍挂账:多部件层几何语义(004)、`CGINFO[SX/SY]` 未注入资产与部分
+`COLOR` 字段(024/026)、缺失目标的非 EXIST 字段(038)、半像素/quad
+相位与过渡覆盖度 TA 残差(042/045)、官方文本行缓冲/页清屏/折行/每字符
+样式(075)、自动换行与行高基线(056)、无文本图层时的屏幕叠加层序(057)。
+
+首屏 golden:`tests/golden/eris_first_screen_display.json`
+(272 层 / 82 pass / 85 op,`cargo test -p yu-gfx --test eris_first_screen`
+当前 4/4 通过)。
 
 ## 验证
 

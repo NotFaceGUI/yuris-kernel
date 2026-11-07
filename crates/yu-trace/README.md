@@ -12,10 +12,11 @@
 | ③ 帧描述 | `frame/frame_description` | 已实现:调用方传入规范化 display JSON 或摘要,本 crate 只做协议校验/内容寻址,不硬绑 yu-gfx 字段 |
 | ④ 平台命令 | `platform/platform_call` | **占位并显式拒绝**(等平台后端) |
 
-## schema v4(producer-neutral + 回放闭包)
+## schema v5(producer-neutral + 回放闭包)
 
 - 协议唯一定义:crate 根 `SCHEMA.md`;字段增删必须递增 `schema`,
-  旧版本文件直接拒绝、不迁移。
+  旧版本文件直接拒绝、不迁移(v5 起 `text.*` 事件带 `id: Vec<u8>`,
+  不再假定 UTF-8)。
 - header 携带 `producer`(kernel/official + 版本 + 样本 sha256)与
   `clock`(逐 tick `now_ms` 序列);`boot.host` 含 `window_init_pos` /
   `rng_seed`(宿主注入且影响脚本行为,不记录就无法重放)。
@@ -32,7 +33,7 @@
 - `EventRecorder::enable_ring` / `VmTrace::enable_fault_ring`:保留最近 N
   tick 的 {命令摘要, Diag(含 Unimplemented), 输入, frame_description};
 - `dump_on_fault(path)`:panic hook / catch_unwind / Fatal Diag 时原子写
-  `<path>`(schema v4 trace)+ `<path>.timeline.json`(工具级伴生文件,
+  `<path>`(schema 5 trace)+ `<path>.timeline.json`(工具级伴生文件,
   含原始输入时间线、clock、每 tick 摘要);
 - `FaultDump::read` 校验 `trace_sha256` 与 header input 摘要;
   `FaultDump::replay` 离线重演到故障 tick,逐 tick 精确比较运行核观测,

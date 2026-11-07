@@ -7,7 +7,10 @@ YU-RIS 字体源 + 字形栅格化 + 文本样式合成。**只管"一个字长�
 ## 它干什么
 
 - **字体发现/加载**(`source.rs`):自带字节优先;桌面/Android 走系统枚举
-  (fontdb),wasm 禁止系统枚举。引擎默认 family 回退表(ＭＳ ゴシック →
+  (fontdb),wasm 禁止系统枚举。Android 上 `fontdb` 的
+  `load_system_fonts()` 是空操作,由宿主补扫 `/system/fonts` 与
+  `/product/fonts`;游戏点名的日文字体可由宿主经 `EngineOptions::font_bytes`
+  注入(`<data>/fonts/`)。引擎默认 family 回退表(ＭＳ ゴシック →
   標準ゴシック → ＭＳ Ｐゴシック → ＭＳ 明朝 → 標準明朝)与官方
   `EnumFontFamiliesExA` 行为对齐;缺失显式 `font.missing`,无静默 fallback。
 - **栅格化**(`raster.rs`):swash/skrifa outline → 8-bit coverage。

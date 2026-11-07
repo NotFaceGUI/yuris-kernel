@@ -7,8 +7,8 @@
 
 | 等级 | 状态 | 证据 |
 |---|---|---|
-| **屏幕级（screen）** | 已达成 | `capture_screen.py` 启动官方 0.495 + ERIS 数据，截取客户区 800×600，写 schema v4 `frame/frame_description`（`level=screen`） |
-| **事件级（L1）** | **已达成（窗口级）** | `probe_dispatch.py` 在 `0x4044db` / `0x404547` 两个分派点下只读断点；命中记录 `(script, pc, handler → cmd/name)`，写 schema v4 `vm/command` |
+| **屏幕级（screen）** | 已达成 | `capture_screen.py` 启动官方 0.495 + ERIS 数据，截取客户区 800×600，写 schema 5 `frame/frame_description`（`level=screen`） |
+| **事件级（L1）** | **已达成（窗口级）** | `probe_dispatch.py` 在 `0x4044db` / `0x404547` 两个分派点下只读断点；命中记录 `(script, pc, handler → cmd/name)`，写 schema 5 `vm/command` |
 
 事件级 L1 的**明确边界**（不得外推）：
 
@@ -30,7 +30,7 @@ python tools/official_trace/capture_screen.py \
 
 ```text
 <out>/frame_0001.png ...       客户区截图(不入库)
-<out>/official_screen.jsonl    schema v4 trace(producer=official, level=screen)
+<out>/official_screen.jsonl    schema 5 trace(producer=official, level=screen)
 <out>/input_timeline.json      帧号 -> 输入(首屏为空)
 <out>/manifest.json            引擎/样本 hash、窗口尺寸、等级声明
 ```
@@ -161,7 +161,7 @@ python tools/official_trace/probe_dispatch.py \
 hits.jsonl             逐命中原始记录（含 handler/ecx/tick/线程/歧义候选）
 command_table.json     运行时 119 项 handler 表与共享分组
 manifest.json          引擎/样本/ysc hash、参数、计数、失败原因、debug_mode 证据
-<trace-out>            schema v4 trace（producer=official, sub=vm/kind=command）
+<trace-out>            schema 5 trace（producer=official, sub=vm/kind=command）
 ```
 
 ### 4.5 输入/前台约束（实测）
@@ -177,7 +177,7 @@ manifest.json          引擎/样本/ysc hash、参数、计数、失败原因�
 
 ### 4.6 trace 语义与命名
 
-- `schema=4`；记录字段顺序固定 `schema,seq,frame,sub,kind,payload`。
+- `schema=5`；记录字段顺序固定 `schema,seq,frame,sub,kind,payload`。
 - 事件记录：`sub="vm"`, `kind="command"`,
   `payload={"script":u32,"pc":u32,"name":str,"args":[]}`。
   `args` 恒为空数组：官方参数求值不可从分派点观测，未伪造。

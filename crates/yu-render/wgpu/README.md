@@ -5,9 +5,10 @@
 **互为实现,不互为真值**:像素允许舍入差,但 pass 顺序、可执行/跳过计数、
 跳过原因必须逐项对齐。
 
-本 crate 只做 **离屏 RGBA8 渲染 + 读回**。窗口、surface 呈现、winit/wasm
-事件循环不属于本会话;API 命名 (`TargetSet::screen`、`render_frame`) 为
-宿主将来的薄壳留了位置。
+本 crate 的库 API 是 **离屏 RGBA8 渲染 + 读回**(`TargetSet::screen`、
+`render_frame`)。**窗口 surface 呈现不在这里**:桌面由 `host-desktop` 上屏,
+Android 由 `host-android` 经 `AndroidNdkDisplay` + `ANativeWindow` 零拷贝
+直呈(见 `DeviceOptions::display`)。
 
 ## 用法
 
@@ -269,12 +270,18 @@ soft vs wgpu: diff_pixels=0/480000 max_channel_diff=0
 
 全部继承 `yu-gfx` 的挂账,不是本后端的近似:
 
-- MODE 4/8/10..18(公式无 blob);
-- `MID` 掩码、多部件层、`FX/FR/...` 仿射/滤镜;
-- `COPY/COPY2/TEXCOPY/TEXSSCOPY`、`SIZE*`/`ROTATION`/`RESIZE`/`TRIM`/
-  `MONO`/`BLUR*` 等图像加工;`RECTPAINT/2/3` 已实现(EVID-J-02..05),
-  `ID2`/快照源/部分区域仍挂账;
-- 资源图 + `SX/SY` 的缩放/裁剪;
-- 文本 GPU 字形 atlas(当前是 CPU 栅格 + 纹理 quad,与 soft 同源同像素;atlas 只是性能优化);
-- 组 `SX/SY` 缺失时的引擎真实尺寸/清屏(DIV-GFX-008);
-- 颜色空间逐像素对拍(DIV-GFX-009)。
+- MODE 4/8/10..18:官方绘制体没有对应分支(不是缺 shader),按
+  `unsupported-by-official` 归约到通常路径;
+- 多部件层(几何语义未取证);组 `SX/SY` 缺失时的引擎真实尺寸/清屏
+  (DIV-GFX-008);
+- 资源图 + `SX/SY` 的裁剪边界(缩放已实现,区域裁剪仍部分挂账);
+- 颜色空间逐像素对拍(DIV-GFX-009);
+- 文本 GPU 字形 atlas(当前是 CPU 栅格 + 纹理 quad,与 soft 同源同像素;
+  atlas 只是性能优化)。
+
+图像加工已实现的动作(与 soft 同式):`RECTPAINT/2/3`、`REVERSE`、
+`HORIZONTAL/VERTICAL`、`SIZE*`、`RESIZE`、`TRIM`、`ROTATION`/`ROTATION2`、
+`MONO`/`SEPIA`/`MEIDO`/`SAIDO`/`AKARUSA`/`MOSAIC`、`MERGE`/`MERGE2`、
+`AND`/`XOR`、`BLUR`~`BLUR6`(两遍盒式,`transform.wgsl` 直跳)、
+`DIFFUSION`(每轮正反两遍 pass,`SET/2` 轮)、`WHIRLPOOL`、`RASTER` 族
+(mode 16..19)。`CG[MID]` 掩码走 `mask_alpha`。

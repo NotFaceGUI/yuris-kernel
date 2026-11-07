@@ -15,8 +15,13 @@ ybn 家族容器与结构解码:**纯字节进出,不碰 IO**。ypf 包布局归
 | `ystd` | `ysbin/yst.ybn` | 变量槽位表头 |
 | `yscf` | `ysbin/yscfg.ybn` | 引擎配置(分辨率/扩展名优先序等) |
 | `yser` | `ysbin/yse.ybn` | id ↔ 名字表 |
+| `yssd` | `save/*.sd` | 存档容器(块表 + zlib/snappy 写路径) |
+| `yssfs` | `yssfs.dat` | 存档文件系统设置 |
+| `ymv` / `movie` | `*.ymv` | 影片容器与编解码头探测 |
+| `snappy` | — | snappy 块压缩(存档旧方言) |
+| `text` | — | 统一文本边界:codec 推进 / 宽容解码 / SJIS 隧道表 |
 | `key` / `container` | — | CRC-32 + 分段异或密钥;16 字节容器头工具 |
-| `codec` | — | CP932/GBK 静态码表 + auto 评分器 |
+| `codec` | — | CP932 / GBK / Big5 静态码表 + auto 评分器 |
 
 ## 冻结接口(与 yu-rt 的契约)
 
@@ -27,6 +32,17 @@ Group { command: Cow<str>, windows: Vec<Window> }   // Window = [u8; 12]
 
 窗口字节的语义(参数槽 tag 等)属运行核;格式层只忠实切分。命令序号超出
 ysc 表 = `fmt.ybn.opcode` 诊断,绝不落序号。
+
+## 文本边界
+
+全仓唯一的"字节 ↔ 字符"边界在 `text.rs`:`TextCodec` 按 codec 推进字符,
+`CodecConfig` 分 `script` / `text` / `path` 三域,`TunnelTable` 承载
+`sjis_ext.bin`(CP932 + 两字节码点查表)。VM 字符串、gfx 排版、字形栅格、
+声音文件名都走这里,禁止各自写 CP932 区间。
+
+码表由 Windows kernel32 码页(932/936/950)生成入库;解码严格(非法序列
+返回带字节偏移的 `fmt.codec.invalid`,不做替换);`decode∘encode` 恒等由
+全表往返测试守卫。
 
 ## 纪律
 
