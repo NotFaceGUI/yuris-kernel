@@ -194,6 +194,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         "ops: {} total, {} drawn, {} skipped",
         report.ops, report.executed, report.skipped
     ));
+    // 末帧像素必须是**本帧**的:实时呈现路径的 `last_surface` 是异步读回
+    // 的一份滞后值(wgpu 主帧路径已改为「只在本帧真有 `:/W0/` 兜底需求时
+    // 才读回」),所以在取哈希/写 PNG 之前显式同步刷新一次。
+    // soft 后端是 no-op;`--shot` 也依赖这一步。
+    engine.refresh_screen_surface()?;
     if let Some(surface) = engine.last_surface() {
         output::line(format!(
             "rgba sha256: {} ({} bytes)",

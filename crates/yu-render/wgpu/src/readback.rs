@@ -86,11 +86,34 @@ impl ReadbackCache {
         height: u32,
         padded_row: u64,
     ) -> Result<(), Diag> {
+        Self::record_copy_region(encoder, texture, buffer, 0, 0, width, height, padded_row)
+    }
+
+    /// 只拷贝纹理的一个子矩形(`origin_x/y` 起,`width × height` 大)。
+    ///
+    /// `padded_row` 对应**子矩形**的行跨度(调用方已按 256 对齐)。
+    /// 用于 `TRIM` 这类只需要边缘 alpha 的场景:整图 1100×825 读回在
+    /// 手机 Vulkan 上要 100~150ms,而 `trim_box` 从外向内扫,通常几圈就停。
+    #[allow(clippy::too_many_arguments)]
+    fn record_copy_region(
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+        buffer: &wgpu::Buffer,
+        origin_x: u32,
+        origin_y: u32,
+        width: u32,
+        height: u32,
+        padded_row: u64,
+    ) -> Result<(), Diag> {
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d {
+                    x: origin_x,
+                    y: origin_y,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
@@ -111,6 +134,79 @@ impl ReadbackCache {
             },
         );
         Ok(())
+    }
+
+    /// 同步读回纹理的**子矩形**(紧凑 RGBA8,行已去填充)。
+    ///
+    /// 与 [`Self::read_now`] 同语义(阻塞到本帧命令跑完),只是量更小。
+    /// `TRIM` 的包围盒只需要外圈 alpha;整图读回在移动端 TBDR 上是
+    /// 「把全部 tile 刷回主存」,代价与整屏尺寸成正比 —— 读 4 条边
+    /// 只要几十 KB。
+    pub fn read_region_now(
+        &mut self,
+        ctx: &GpuContext,
+        texture: &wgpu::Texture,
+        origin: (u32, u32),
+        width: u32,
+        height: u32,
+    ) -> Result<Surface, Diag> {
+        if width == 0 || height == 0 {
+            return Err(Diag::fatal(code::READBACK, Boundary::Platform)
+                .with_detail(format!("区域读回尺寸为 {width}x{height}")));
+        }
+        let (padded_row, size) = Self::row_layout(width, height)?;
+        // 独立缓冲:区域读回的尺寸与主路径不同,共用会反复重建。
+        let buffer = ctx.checked_oom(&format!("region readback {size}B"), || {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("yu-backend-wgpu region readback"),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        })?;
+        let mut encoder =
+            ctx.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("yu-backend-wgpu region readback"),
+                });
+        Self::record_copy_region(
+            &mut encoder,
+            texture,
+            &buffer,
+            origin.0,
+            origin.1,
+            width,
+            height,
+            padded_row,
+        )?;
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+        ctx.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|err| {
+                Diag::fatal(code::READBACK, Boundary::Platform)
+                    .with_detail(format!("等待区域读回失败: {err}"))
+            })?;
+        let mut rgba = Vec::with_capacity((u64::from(width) * 4 * u64::from(height)) as usize);
+        {
+            let slice = buffer.slice(..);
+            let mapped = slice.get_mapped_range().map_err(|err| {
+                Diag::fatal(code::READBACK, Boundary::Platform)
+                    .with_detail(format!("区域读回缓冲范围无效: {err}"))
+            })?;
+            let unpadded_row = u64::from(width) * 4;
+            for row in 0..height as usize {
+                let start = row * padded_row as usize;
+                let end = start + unpadded_row as usize;
+                rgba.extend_from_slice(&mapped[start..end]);
+            }
+            drop(mapped);
+        }
+        buffer.unmap();
+        Ok(Surface {
+            width,
+            height,
+            rgba,
+        })
     }
 
     /// 主帧路径:**不等待 GPU**。
@@ -295,6 +391,23 @@ impl ReadbackCache {
                     .with_detail(format!("等待 GPU 读回失败: {err}"))
             })
     }
+}
+
+/// 一次性同步读回纹理的一个子矩形。
+///
+/// 与 [`read_texture`] 同定位(低频路径),但只拷 `width × height` 的子矩形。
+/// `TRIM` 的包围盒扫描用它:整图读回在移动端 TBDR 上是「全部 tile 刷回
+/// 主存」,真机 1100×825 一次 100~151ms;而 `trim_box` 从外向内扫、
+/// 通常几行/几列就停,每次读的窄带只有几十 KB。
+pub fn read_region_now_cached(
+    ctx: &GpuContext,
+    texture: &wgpu::Texture,
+    origin: (u32, u32),
+    width: u32,
+    height: u32,
+) -> Result<Surface, Diag> {
+    let mut cache = ReadbackCache::new();
+    cache.read_region_now(ctx, texture, origin, width, height)
 }
 
 /// 一次性同步读回一张纹理(`TRIM`/文本基面/存档抓帧等低频路径)。

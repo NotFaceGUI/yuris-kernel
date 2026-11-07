@@ -308,6 +308,13 @@ pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> 
     table
 }
 
+/// 图像头探测读取的字节上限。
+///
+/// PNG/BMP/GIF 只需 ≤26 字节;JPEG 要沿段链走到 SOF,通常几十~几百字节。
+/// 取 4 KiB:足够覆盖所有实际文件(含带大 EXIF/ICC 的 JPEG),又远小于
+/// 按钮贴图的平均值(实测 359 KB),前缀读仍省 ~99% 的 IO。
+const IMAGE_HEADER_PROBE: usize = 4096;
+
 impl Vm {
     /// 引用型参数槽白名单(DIV-RT-042,B1 裁 1-A):该命令的哪些槽在引擎里
     /// 传**变量地址**(REA SAVE `0x44c45c`:身份经 `0x683a60/0x683c00/
@@ -1242,43 +1249,50 @@ impl Vm {
         }
         // 输入系统变量(手册标 ○ 可赋值):写入 = 设定该按钮的帧计数器。
         if lval.var.id < self.sys_count {
-            let name = self
-                .sysvars()
-                .get(lval.var.id)
-                .map(|d| d.name.clone())
-                .unwrap_or_default();
-            let button = name
-                .strip_prefix("_KEY_")
-                .or_else(|| name.strip_prefix("_MOUSE_"))
-                .filter(|rest| {
-                    // 只收按钮族(排除 _MOUSE_X/Y0..3 坐标槽与 _KEYNUM_* 等;
-                    // X/Y 后缀数字 = 窗口槽坐标族,REA `FUN_00427350`
-                    // case 0x85..0x8e,非按钮)。
-                    !matches!(*rest, "LAST")
-                        && !matches!(*rest, "X" | "Y")
-                        && !rest
-                            .strip_suffix(['0', '1', '2', '3'])
-                            .map(|base| matches!(base, "X" | "Y"))
-                            .unwrap_or(false)
-                        && !rest
-                            .chars()
-                            .next()
-                            .map(|c| c.is_ascii_digit())
-                            .unwrap_or(true)
-                })
-                .map(|rest| {
-                    if name.starts_with("_KEY_") {
-                        format!("KEY_{rest}")
-                    } else {
-                        format!("MOUSE_{rest}")
-                    }
-                });
+            // 按钮族匹配**不 clone 名字**:`LET` 是单帧 7 万次的热路径,
+            // 其中多数是 `@_INP`/`@_KEY_*` 计数器写;旧写法每次
+            // `.name.clone()` 一次堆分配 + 释放。这里只在本分支内借用,
+            // 需要 `&mut self` 的地方改用先算好的 `button`。
+            let button: Option<String> = {
+                let name = self
+                    .sysvars()
+                    .get(lval.var.id)
+                    .map(|d| d.name.as_str())
+                    .unwrap_or("");
+                name.strip_prefix("_KEY_")
+                    .map(|rest| ("KEY_", rest))
+                    .or_else(|| name.strip_prefix("_MOUSE_").map(|rest| ("MOUSE_", rest)))
+                    .filter(|(_, rest)| {
+                        // 只收按钮族(排除 _MOUSE_X/Y0..3 坐标槽与
+                        // _KEYNUM_* 等;X/Y 后缀数字 = 窗口槽坐标族,
+                        // REA `FUN_00427350` case 0x85..0x8e,非按钮)。
+                        !matches!(*rest, "LAST")
+                            && !matches!(*rest, "X" | "Y")
+                            && !rest
+                                .strip_suffix(['0', '1', '2', '3'])
+                                .map(|base| matches!(base, "X" | "Y"))
+                                .unwrap_or(false)
+                            && !rest
+                                .chars()
+                                .next()
+                                .map(|c| c.is_ascii_digit())
+                                .unwrap_or(true)
+                    })
+                    .map(|(prefix, rest)| format!("{prefix}{rest}"))
+            };
             if let Some(button) = button {
                 let rhs = self.eval_window(st, &cmd.windows[1])?;
                 let v = rhs.as_int().unwrap_or(0);
                 self.input_state_mut().set_counter(&button, v);
                 return Ok(StepOutcome::Continue);
             }
+            // 其余分支需要完整名字串(数量少,不在热路径):
+            // 只有走到这里才 clone。
+            let name: String = self
+                .sysvars()
+                .get(lval.var.id)
+                .map(|d| d.name.clone())
+                .unwrap_or_default();
             // `@_INP(n)`(手册 `basic/svariable.html` ○ 数组版)= 按引擎
             // 按钮码写**同一张** VK 计数表。REA 0x495 `0x446efc`(id 0x90)
             // → `0x447014`(下标 `n<=0` 忽略;按物理按下状态钳制,与
@@ -1457,16 +1471,10 @@ impl Vm {
 
     /// `VARINFO`:手册 `variable/varinfo.html`;引擎 §3.21。
     fn op_varinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        // 参数名表(按 opcode 从工程 ysc 取)。SEARCH 的针值槽与 `NO=` 槽
-        // **必须按名字解析**:这两组槽号在 v494/0.495 之间整体位移,写死数字
-        // 会在另一版静默失效(2026-10-25 实测,见 `array_needle`)。
-        let varinfo_names: Vec<String> = self
-            .tables()
-            .boot
-            .yscm
-            .command(cmd.opcode)
-            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default();
+        // 参数名表用 `cmd.param_names`(按调用点缓存一次的 `Rc<[String]>`)。
+        // 旧写法每次执行都重新收集 `Vec<String>`:`VARINFO` 单帧可达 2 万次
+        // × 20+ 个 `String` 克隆,纯堆分配(与 `op_info` 同一个 bug)。
+        let varinfo_names: &[String] = &cmd.param_names;
         let mut target: Option<crate::expr::LValue> = None;
         let mut set: Option<crate::expr::LValue> = None;
         let mut op: Option<(u8, i64)> = None;
@@ -4150,6 +4158,21 @@ impl Vm {
         }
     }
 
+    /// 只读资产前缀(`max` 字节);用于图像头探测。
+    ///
+    /// 数据源实现了 [`yu_vfs::DataSource::open_prefix`] 时可以只做前缀 IO;
+    /// 默认实现回退整读,语义与 [`Self::open_asset`] 一致。
+    fn open_asset_prefix(&mut self, path: &[u8], max: usize) -> Option<Vec<u8>> {
+        let lookup = yu_vfs::LookupKey::new(path, yu_vfs::Codec::Cp932).ok()?;
+        match self.src.open_prefix(&lookup, max) {
+            Ok(bytes) => Some(bytes),
+            Err(_) => self
+                .aux
+                .as_ref()
+                .and_then(|aux| aux.open_prefix(&lookup, max).ok()),
+        }
+    }
+
     /// 解析 `YMV[FILE]` 的影片元数据(只读容器头与三张表,不复制平面)。
     ///
     /// 候选序:`原样` → `原字节 + ".ymv"`(脚本两种写法都在语料里出现:
@@ -4235,10 +4258,23 @@ impl Vm {
             candidates.push(path);
         }
         'probe: for path in candidates {
-            let Some(bytes) = self.open_asset(&path) else {
-                continue;
+            // 先只读文件头:PNG/BMP/GIF 的尺寸都在前 26 字节内,JPEG 走段链
+            // 到 SOF。整读一张按钮贴图(实测平均 359 KB)只为取宽高是纯浪费
+            // ——`CGINFO[SX/SY]` 单次因此 275µs,单帧 110 次就吃掉 30ms。
+            //
+            // 前缀里算不出尺寸(JPEG 段链超长/头部格式意外)时**回退整读**:
+            // 行为与旧实现逐字节一致,只在能省的时候省。不这样做会让同一
+            // 资产在两条路径下得出不同结果(实测 ops 6 vs 7)。
+            let size = match self.open_asset_prefix(&path, IMAGE_HEADER_PROBE) {
+                Some(prefix) => match crate::image::pixel_size(&prefix) {
+                    Some(size) => Some(size),
+                    None => self
+                        .open_asset(&path)
+                        .and_then(|full| crate::image::pixel_size(&full)),
+                },
+                None => None,
             };
-            if let Some(size) = crate::image::pixel_size(&bytes) {
+            if let Some(size) = size {
                 found = Some(size);
                 break 'probe;
             }
@@ -4348,13 +4384,13 @@ impl Vm {
         name: &str,
     ) -> Result<StepOutcome, VmError> {
         // 参数名来自工程 ysc 表(opcode → 命令声明),不写死槽号。
-        let params: Vec<String> = self
-            .tables()
-            .boot
-            .yscm
-            .command(cmd.opcode)
-            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default();
+        //
+        // **用 `cmd.param_names`(按调用点缓存一次的 `Rc<[String]>`)**,
+        // 不要在这里重新收集:旧写法每次执行都 `p.name.clone()` 建成
+        // 一个全新 `Vec<String>`,`CGINFO` 在菜单帧可达 1.7 万次 × 20+ 个
+        // `String` = 单帧 35 万次堆分配(与 PERF-VM-HOTPATH 修的
+        // `VARACT` 是同一个 bug)。
+        let params: &[String] = &cmd.param_names;
         let mut targets: Vec<crate::expr::LValue> = Vec::new();
         let mut event_args: Vec<ArgValue> = Vec::new();
         let mut query_args: Vec<ArgValue> = Vec::new();

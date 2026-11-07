@@ -15,7 +15,7 @@
 //! 执行顺序上的重排是契约允许的“不改变可见结果”的缓存/pass 合并:复制读的是
 //! 组/图层当前内容,图像加工写的是快照纹理,都与屏幕绘制顺序无关。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 // 共享契约与平台设施(两个后端同源)。
@@ -164,6 +164,12 @@ impl FramePlan {
 pub(crate) struct Planner<'a> {
     pub(crate) ctx: &'a GpuContext,
     pub(crate) frame: &'a CompositorFrame,
+    /// 层表索引(`LayerId` → `&Layer`),与 `frame.layers` 在同一次规划内不变。
+    ///
+    /// 规划阶段多处要「按 ID 找活层」。逐次 `frame.layers.iter().find(...)`
+    /// 是 `op 数 × 层数` 的 `LayerId`(含 `Vec<u8>`)逐字节比较:存档界面
+    /// 541~1500 层 × 数十 op,实测占 `plan` 阶段的绝大部分。
+    pub(crate) layers: &'a HashMap<&'a LayerId, &'a Layer>,
     pub(crate) textures: &'a mut TextureStore,
     pub(crate) gpu: &'a mut TextureCache,
     pub(crate) pipelines: &'a mut PipelineCache,
@@ -736,7 +742,7 @@ impl Planner<'_> {
         if let Some(content) = self.contents.get(id) {
             return Ok((content.tex.id, content.width, content.height));
         }
-        let layer = self.frame.layers.iter().find(|layer| &layer.id == id);
+        let layer = self.layers.get(id).copied();
         if layer.is_some_and(|layer| layer.is_group()) {
             return self.group_image(id);
         }

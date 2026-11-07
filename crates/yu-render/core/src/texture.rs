@@ -136,6 +136,12 @@ pub struct TextureStore {
     /// `Rc::as_ptr`(旧 `Rc` 释放后新分配可能复用同一地址)或 `meta` 的
     /// LRU 时钟(`touch` 会推进)。
     inserted: BTreeMap<Vec<u8>, u64>,
+    /// `TRIM` 的 alpha 包围盒缓存(`(资产 key, mask) → 边界`)。
+    ///
+    /// 资产像素在解码时就在 CPU 上,边界是固有属性 ⇒ 算一次即可。
+    /// `TRIM` 因此不必把 GPU 纹理整张读回(移动端 TBDR 上那一步
+    /// 实测 100~291ms/次,是「角色一出来就卡」的直接原因)。
+    trim_bounds: BTreeMap<(Vec<u8>, i64), Option<(u32, u32, u32, u32)>>,
     /// 本帧新插入的 key(预算执行时豁免;防止预热批次在渲染前被回收)。
     fresh: std::collections::BTreeSet<Vec<u8>>,
     /// 已回收条目数(诊断)。
@@ -206,6 +212,7 @@ impl TextureStore {
             clock: 0,
             meta: BTreeMap::new(),
             inserted: BTreeMap::new(),
+            trim_bounds: BTreeMap::new(),
             fresh: std::collections::BTreeSet::new(),
             evicted: 0,
             budget_warned: false,
@@ -377,6 +384,41 @@ impl TextureStore {
                 Err(diag.clone())
             }
         }
+    }
+
+    /// `TRIM` 的 alpha 包围盒,**从资产自身的 CPU 像素算**并按
+    /// `(key, mask)` 缓存。
+    ///
+    /// # 为什么必须缓存 / 为什么不能读 GPU
+    ///
+    /// `TRIM` 只裁掉四周全透明的行/列。soft 后端纹理本就在内存,扫一遍即可;
+    /// wgpu 后端纹理在显存里,唯一"正统"的读法是 `copy_texture_to_buffer`
+    /// —— 移动端 GPU 是 TBDR,那一步等于**把全部 tile 刷回主存并强制管线
+    /// 刷新**,真机实测 1100×825 一次 100~291ms(`phases.image=291740us`)。
+    ///
+    /// 但资产的像素**在解码时就已经在 CPU 上**(`Texture.rgba`),边界是
+    /// 资产的固有属性 —— 同一张图反复被 `TRIM` 时结果完全相同。所以在这里
+    /// 算一次、按 `key` 缓存,`TRIM` 变成一次查表:零 GPU 往返、零读回。
+    ///
+    /// 返回 `(x0, y0, x1, y1)`(闭区间);全透明或空图返回 `None`
+    /// (与 [`crate::TextComposer`] 无关,纯 alpha 判据)。
+    pub fn trim_bounds(&mut self, key: &[u8], mask: i64) -> Option<(u32, u32, u32, u32)> {
+        if let Some(hit) = self.trim_bounds.get(&(key.to_vec(), mask)) {
+            return *hit;
+        }
+        let bounds = match self.resolve(key) {
+            Ok(tex) => trim_bounds_of(tex, mask),
+            Err(_) => None,
+        };
+        self.trim_bounds.insert((key.to_vec(), mask), bounds);
+        bounds
+    }
+
+    /// `resolve` 的非触摸版本:只判断该 key 当前是否已有 CPU 像素。
+    pub fn resident(&self, key: &[u8]) -> bool {
+        self.cache
+            .get(key)
+            .is_some_and(|entry| entry.result.is_ok())
     }
 
     /// `key` 最近一次内容写入的版本序号。
@@ -1632,4 +1674,55 @@ mod tests {
         }
         assert!(store.issues().is_empty(), "非资产 ref 不进入缺失清单");
     }
+}
+
+/// `TRIM` 的 alpha 包围盒(闭区间);全透明/空图返回 `None`。
+///
+/// 判据与 soft 后端 `apply_trim`、wgpu `trim_box` **逐像素同一套**:
+/// 从外向内逐行/列扫,遇到「该行/列存在非零 alpha」就停;`mask` 位
+/// 8=顶 / 4=底 / 2=左 / 1=右(手册 `cg/cgact.html` 例 22)。
+///
+/// 在资产自身的 CPU 像素上算(解码时已有),因此 wgpu 后端**不需要**
+/// 把 GPU 纹理整张读回 —— 移动端 TBDR 上那一步实测 100~291ms/次。
+#[must_use]
+pub fn trim_bounds_of(tex: &Texture, mask: i64) -> Option<(u32, u32, u32, u32)> {
+    let (w, h) = (tex.width, tex.height);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let row_clear = |y: u32| -> bool {
+        let row = (y as usize) * (w as usize) * 4;
+        (0..w as usize).all(|x| tex.rgba[row + x * 4 + 3] == 0)
+    };
+    let col_clear = |x: u32| -> bool {
+        (0..h as usize).all(|y| tex.rgba[(y * (w as usize) + x as usize) * 4 + 3] == 0)
+    };
+    let (mut top, mut bottom, mut left, mut right) = (0u32, 0u32, 0u32, 0u32);
+    if mask & 8 != 0 {
+        while top < h && row_clear(top) {
+            top += 1;
+        }
+    }
+    if mask & 4 != 0 {
+        while bottom < h - top && row_clear(h - 1 - bottom) {
+            bottom += 1;
+        }
+    }
+    if mask & 2 != 0 {
+        while left < w && col_clear(left) {
+            left += 1;
+        }
+    }
+    if mask & 1 != 0 {
+        while right < w - left && col_clear(w - 1 - right) {
+            right += 1;
+        }
+    }
+    let new_w = w.saturating_sub(left + right);
+    let new_h = h.saturating_sub(top + bottom);
+    if new_w == 0 || new_h == 0 {
+        // 全透明:官方「裁到 0」行为未取证,保守保持原样(同 soft `apply_trim`)。
+        return None;
+    }
+    Some((left, top, left + new_w - 1, top + new_h - 1))
 }

@@ -629,31 +629,59 @@ impl WgpuRenderer {
 
         // 屏幕读回:即使随后缩放也要保留缩放前的游戏画面作为 `:/W0/`
         // 后缓冲(引擎的 COPY 读内部画面,不读窗口缩放结果)。
-        // 流式模式读回是异步一帧滞后(不阻塞流水线);精确模式当帧读回。
+        //
+        // # 两条路径的语义**不同**,不能一视同仁
+        //
+        // - `streaming == false`:headless / 用例 golden / `--shot`。这里
+        //   `last_surface` 必须**每帧都是当帧像素**(像素哈希与 golden 全靠
+        //   它),所以无条件 `read_now`。**这条路径一个字节都不许动。**
+        // - `streaming == true`:桌面/安卓实时呈现。宿主走零拷贝
+        //   (`screen_texture`)上屏,`last_surface` 只是 `copy :/W0/` 的兜底
+        //   来源,允许滞后 —— 而 `read()` 本来就是异步一帧滞后。
+        //
+        // 实时路径下**只在真有 CPU 消费者时才读**:`backbuffer` 的唯一严格
+        // 消费者是主窗口截屏在**没有命令时刻快照**时的兜底分支
+        // (`backbuffer_content`);有快照时 `screen_snapshot_content` 用 GPU
+        // 侧的图层/绘制契约重合成,完全不碰 CPU 面。
+        //
+        // 真机实测(Android Vulkan 1100×825):无条件读回每帧 1~33ms
+        // (`phases[readback=33159]us`),是「立绘/镜头运动卡顿」的主因之一。
         let screen_width = frame.viewport.width;
         let screen_height = frame.viewport.height;
         let t_read0 = started.elapsed();
+        let needs_cpu_screen = !streaming || frame_needs_cpu_backbuffer(frame);
         let mut screen_surface = {
-            let screen = self.targets.screen().ok_or_else(|| {
-                Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
-                    .with_detail("帧结束时没有屏幕目标")
-            })?;
-            if streaming {
-                self.readback.read(
-                    &self.ctx,
-                    &screen.texture,
-                    screen_width,
-                    screen_height,
-                    encoder,
-                )?
+            if !needs_cpu_screen {
+                // 实时路径且本帧无 `:/W0/` 兜底需求:不提交读回拷贝。
+                // encoder 仍要提交(它带着本帧全部绘制);`last_surface`
+                // 沿用上一份 —— 本帧没有消费者读它。
+                self.ctx.queue.submit(Some(encoder.finish()));
+                match self.backbuffer.as_deref() {
+                    Some(prev) => prev.clone(),
+                    None => Surface::new(screen_width, screen_height, [0, 0, 0, 255]),
+                }
             } else {
-                self.readback.read_now(
-                    &self.ctx,
-                    &screen.texture,
-                    screen_width,
-                    screen_height,
-                    encoder,
-                )?
+                let screen = self.targets.screen().ok_or_else(|| {
+                    Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                        .with_detail("帧结束时没有屏幕目标")
+                })?;
+                if streaming {
+                    self.readback.read(
+                        &self.ctx,
+                        &screen.texture,
+                        screen_width,
+                        screen_height,
+                        encoder,
+                    )?
+                } else {
+                    self.readback.read_now(
+                        &self.ctx,
+                        &screen.texture,
+                        screen_width,
+                        screen_height,
+                        encoder,
+                    )?
+                }
             }
         };
         let t_readback = started.elapsed() - t_read0;
@@ -1143,6 +1171,34 @@ impl WgpuRenderer {
         render_pass.draw(0..6, 0..1);
         Ok(())
     }
+}
+
+/// 实时路径下,本帧是否真的需要一份 **CPU** 后缓冲(整屏读回)。
+///
+/// 唯一的严格消费者是 `COPY ID=:/W0/` 的兜底分支:该复制**没有**命令时刻
+/// 快照时,后端只能拿 CPU 后缓冲重新上传(`backbuffer_content`)。有快照时
+/// `screen_snapshot_content` 直接用快照的图层/绘制契约在 GPU 上重合成,
+/// 完全不碰 CPU 面。
+///
+/// 存档缩略图那条(`capture_bridge`)用的是「上一帧屏幕」,本身允许滞后。
+///
+/// **只用于 `streaming == true`**:headless 的像素哈希与 golden 依赖
+/// 每帧精确的 `last_surface`,那条路径必须无条件读回。
+fn frame_needs_cpu_backbuffer(frame: &yu_gfx::CompositorFrame) -> bool {
+    for pass in &frame.passes {
+        for op in &pass.ops {
+            let yu_gfx::Op::Copy(copy) = op else {
+                continue;
+            };
+            if !matches!(copy.source, yu_gfx::CopySource::Group(_)) {
+                continue;
+            }
+            if !frame.screen_snapshots.contains_key(&copy.id) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn force_opaque(surface: &mut Surface) {

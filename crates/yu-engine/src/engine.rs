@@ -364,6 +364,12 @@ pub struct FrameReport {
     pub clock_ms: u32,
     /// 本帧被显式 `max_step` 上限丢弃的墙钟毫秒(默认 0 = 未丢)。
     pub lag_ms: u32,
+    /// 本帧执行的**脚本命令条数**(`ChainReport::commands_pumped`)。
+    ///
+    /// `ops` 是**绘制操作**数,和脚本命令量不是一回事:菜单/按钮循环里
+    /// `ops` 只有十几个而命令可达十余万条。tick 慢必须先看这个数
+    /// (`tick_ms × 1e6 / commands` = 每条命令的纳秒成本)。
+    pub commands: u32,
     /// 本帧落在 **tick 线程**的声音解码耗时(毫秒;装载 + 预取)。
     /// 验收口径:任一帧的 tick 增量里解码部分 ≤8ms。
     pub sound_decode_ms: f64,
@@ -396,6 +402,7 @@ impl FrameReport {
             drawable: false,
             clock_ms: 0,
             lag_ms: 0,
+            commands: 0,
             sound_decode_ms: 0.0,
             sound_stream_ms: 0.0,
             sound_decodes: 0,
@@ -1273,6 +1280,7 @@ impl Engine {
             .ok_or_else(|| Failure::runtime("engine 未启动"))?;
         let tick_started = Instant::now();
         let chain = vm.tick_at(now_ms, &self.timeline);
+        let commands_pumped = chain.commands_pumped;
         self.main_finished |= chain.main_finished;
         if let Some(exit) = chain.program_exit {
             // `END`:程序级退出。`main_finished` 供宿主关窗;`restart` 只暴露,
@@ -1489,6 +1497,7 @@ impl Engine {
             drawable,
             clock_ms: now_ms,
             lag_ms: self.last_clock_drop_ms,
+            commands: u32::try_from(commands_pumped).unwrap_or(u32::MAX),
             sound_decode_ms: sound_stats.tick_decode_us as f64 / 1000.0,
             sound_stream_ms: sound_stats.decode_us as f64 / 1000.0,
             sound_decodes: u32::try_from(sound_stats.full_decodes).unwrap_or(u32::MAX),

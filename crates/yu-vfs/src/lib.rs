@@ -62,6 +62,18 @@ pub trait DataSource: Send {
     /// 按归一键读取完整字节。
     fn open(&self, path: &LookupKey) -> Result<Vec<u8>, Diag>;
 
+    /// 只读前 `max` 字节(图像头探测:PNG/BMP/JPEG/GIF 的尺寸都在前 64 字节内)。
+    ///
+    /// 默认实现回退到 [`Self::open`] 再截断 —— 语义等价、字节相同,只是
+    /// 仍然整读。承载封包/真实文件的实现应覆盖它:ERIS 的按钮贴图单张
+    /// 几十~几百 KB,`CGINFO[SX/SY]` 逐层查询时整读是纯浪费
+    /// (实测单次 275µs,单帧 110 次就吃掉 30ms)。
+    fn open_prefix(&self, path: &LookupKey, max: usize) -> Result<Vec<u8>, Diag> {
+        let mut bytes = self.open(path)?;
+        bytes.truncate(max);
+        Ok(bytes)
+    }
+
     /// 按归一键判断存在性。
     fn exists(&self, path: &LookupKey) -> bool;
 

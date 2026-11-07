@@ -776,11 +776,51 @@ impl TextComposer {
         stats.draws += 1;
     }
 
+    /// 收集字形 placement,缺字形即整体失败。
+    ///
+    /// 保留给「必须整批成功」的调用方;宿主排版路径用
+    /// [`Self::collect_glyphs_skipping_missing`](缺字与 CPU 路径同口径跳过)。
+    pub fn collect_glyphs(&mut self, draw: &TextDraw) -> Result<Vec<GlyphPlacement>, String> {
+        self.collect_glyphs_skipping_missing(draw)
+            .and_then(|(items, missing)| {
+                if missing > 0 {
+                    Err(format!("text.glyph_missing: {missing}"))
+                } else {
+                    Ok(items)
+                }
+            })
+    }
+
+    /// 单个字形缺失是否可以让 GPU 路径**跳过该字符**继续。
+    ///
+    /// CPU 合成([`TextComposer::paint_one`])对缺字形只记 `stats.missing`
+    /// 并继续画其余字符 —— 这是官方行为(缺字不中断整行文本)。GPU 路径
+    /// 原先只要一个字形失败就整条 `Err`,于是**整层**回退到 CPU 合成,
+    /// 而 CPU 回退要同步读回整层像素(简体汉化包实测 25~30ms/帧)。
+    ///
+    /// 这里把「缺字形」与「环境/语义失败」分开:前者跳字继续,后者
+    /// (字体不可用、样式解析失败、解码非法、图像字形)仍然回退 —— 那些
+    /// 情况 CPU 路径同样画不出来,回退不会损失内容。
+    fn is_skippable_glyph_error(reason: &str) -> bool {
+        // `FontRenderer::render_glyph` 的缺字形错误是
+        // `"U+XXXX has no glyph in face N"`(见 `yu-font` 的 `glyph_index`)。
+        reason.contains("has no glyph in face")
+            || reason.ends_with("font.glyph_missing")
+            || reason.contains("no glyph")
+    }
+
     /// 收集一条 `CGACT[TEXT]` 的字形 placement(GPU 文本 pass 用)。
     ///
     /// 与 [`TextComposer::paint_one`] 同一套字体/样式/偏移语义;失败返回
     /// 人读原因(调用方回退 CPU 合成,由 CPU 路径补诊断)。
-    pub fn collect_glyphs(&mut self, draw: &TextDraw) -> Result<Vec<GlyphPlacement>, String> {
+    ///
+    /// **缺字形不整体失败**:与 CPU 路径一致,跳过该字符继续 —
+    /// 否则汉化包里一个生僻字就会把整层文本从 GPU 路径打回 CPU 同步读回。
+    /// 返回值第三项是跳过的字形数,调用方计入 `stats.missing`。
+    pub fn collect_glyphs_skipping_missing(
+        &mut self,
+        draw: &TextDraw,
+    ) -> Result<(Vec<GlyphPlacement>, usize), String> {
         if draw.image.is_some() {
             // 图像字形只走 CPU 合成;禁止 GPU 字形路径静默丢掉它。
             return Err("text.image_glyph_not_gpu".to_string());
@@ -811,10 +851,20 @@ impl TextComposer {
         let baseline = draw.y as i32 + ascent;
         let renderer = self.renderer.as_mut().expect("ensured above");
         let mut out = Vec::new();
+        let mut missing = 0usize;
         for ch in &chars {
-            let image = renderer
-                .render_glyph(*ch, &font_style, StylePolicy::Reference)
-                .map_err(|d| d.detail.clone())?;
+            let image = match renderer.render_glyph(*ch, &font_style, StylePolicy::Reference) {
+                Ok(image) => image,
+                // 缺字形:与 CPU 路径(`paint_one`)一致 —— 跳过该字符、
+                // 继续画其余。CPU 路径对同一形态只记 `stats.missing`;
+                // GPU 路径若整条失败会让**整层**退回 CPU 同步读回
+                // (实测 25~30ms/帧,汉化包里一个生僻字即可触发)。
+                Err(d) if Self::is_skippable_glyph_error(&d.detail) => {
+                    missing += 1;
+                    continue;
+                }
+                Err(d) => return Err(d.detail.clone()),
+            };
             let gx = pen_x + image.left;
             let gy = baseline + image.top;
             for &(dx, dy) in &offsets[..passes] {
@@ -828,7 +878,7 @@ impl TextComposer {
             let step = ((image.advance as f32) / 256.0).round() as i32;
             pen_x += step.max(0);
         }
-        Ok(out)
+        Ok((out, missing))
     }
 
     /// 按 `CGACT[TEXT]` 绘制项在 RGBA8 缓冲上合成(原地)。

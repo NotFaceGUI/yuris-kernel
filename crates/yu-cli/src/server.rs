@@ -1257,6 +1257,7 @@ mod tests {
             drawable: true,
             clock_ms: 16,
             lag_ms: 0,
+            commands: 0,
             sound_decode_ms: 0.0,
             sound_decodes: 0,
             sound_stream_ms: 0.0,

@@ -1107,14 +1107,20 @@ impl GfxState {
                     _ => None,
                 })
                 .collect();
+            // `copy_log` 按 CopyId 建一次索引:下面逐快照查生产者。
+            // 旧写法对每个快照都 `copy_log.iter().find(...)` —— 存档界面
+            // 一次 10+ 缩略图 × 数千条日志 = 每帧数万次比较,是菜单/存档
+            // 打开帧 render 尖峰的一部分(行为不变:仍是同一条生产者记录)。
+            let by_id: std::collections::HashMap<CopyId, &CopyOp> =
+                self.copy_log.iter().map(|copy| (copy.id, copy)).collect();
             for (id, snapshot) in &self.screen_snapshots {
                 if snapshot.frame != self.frame || emitted.contains(id) {
                     continue;
                 }
-                let Some(original) = self.copy_log.iter().find(|copy| copy.id == *id) else {
+                let Some(original) = by_id.get(id) else {
                     continue;
                 };
-                let mut synthetic = original.clone();
+                let mut synthetic = (*original).clone();
                 // 内部复制目标不能与真实层/快照内层同名,也不能与后端
                 // `screen_snapshot_content` 的合成组 ID 撞名(旧实现两者都
                 // 用 `__screen_snapshot_<id>`,同一个 copy 会出现“复制目标
@@ -1150,7 +1156,9 @@ impl GfxState {
 
         // 2. 组离屏 pass(后序;子组先于父组;显式栈,深树不爆栈)。
         let mut emitted_groups = BTreeSet::new();
-        self.build_group_passes(&mut passes, &mut emitted_groups);
+        // 生产层集合本帧不变:算一次给全部组 pass 与屏幕 pass 共用。
+        let produced = self.surface_producers();
+        self.build_group_passes(&mut passes, &mut emitted_groups, &produced);
 
         // 3. 屏幕 pass(最后)。
         //
@@ -1173,9 +1181,8 @@ impl GfxState {
             // 主组是图层组 → 子层直绘;主组被显式指定为单个图像层 →
             // 直接画该层(手册 `WINDOW[CGID]` 允许指定任意图层)。
             if self.nodes.get(&main).is_some_and(|n| n.layer.is_group()) {
-                self.emit_children_ops(&main, &mut screen_ops, &emitted_groups);
+                self.emit_children_ops(&main, &mut screen_ops, &emitted_groups, &produced);
             } else {
-                let produced = self.surface_producers();
                 self.emit_node_ops(&main, &mut screen_ops, &emitted_groups, &produced);
             }
         }
@@ -1365,7 +1372,8 @@ impl GfxState {
     fn capture_screen_snapshot(&self) -> Option<std::sync::Arc<crate::frame::ScreenSnapshot>> {
         let mut passes = Vec::new();
         let mut emitted_groups = BTreeSet::new();
-        self.build_group_passes(&mut passes, &mut emitted_groups);
+        let produced = self.surface_producers();
+        self.build_group_passes(&mut passes, &mut emitted_groups, &produced);
         let mut screen_ops = Vec::new();
         if self.windows.get(&0).is_none_or(|w| w.visible) {
             let main = self
@@ -1374,9 +1382,8 @@ impl GfxState {
                 .and_then(|w| w.layer_set.clone())
                 .unwrap_or_else(|| self.config.main_layer_set.clone());
             if self.nodes.get(&main).is_some_and(|n| n.layer.is_group()) {
-                self.emit_children_ops(&main, &mut screen_ops, &emitted_groups);
+                self.emit_children_ops(&main, &mut screen_ops, &emitted_groups, &produced);
             } else {
-                let produced = self.surface_producers();
                 self.emit_node_ops(&main, &mut screen_ops, &emitted_groups, &produced);
             }
         }
@@ -1630,7 +1637,10 @@ impl GfxState {
         sampler: Option<&mut dyn TextureSampler>,
     ) -> Result<Value, Diag> {
         let resolved = self.params.resolve("CGINFO", args);
-        let mut id: Option<Vec<u8>> = None;
+        // 借 `args` 里的字节,不 clone:本函数是菜单帧的逐帧热路径
+        // (`CGINFO` 单帧 1.7 万次),旧写法每次 `b.clone()` 一次 `Vec<u8>`
+        // 堆分配。`resolved` 借用 `args`,两者在本函数内都只读。
+        let mut id: Option<&[u8]> = None;
         let mut idno: Option<i64> = None;
         let mut flags: BTreeMap<&str, i64> = BTreeMap::new();
         // `SET/SET2` 是查询坐标(COLOR/ONMOUSE*),不是“查询字段”。
@@ -1639,7 +1649,7 @@ impl GfxState {
         for r in resolved {
             match r.name {
                 Some("ID") => match r.value {
-                    Value::Str(b) => id = Some(b.clone()),
+                    Value::Str(b) => id = Some(b.as_slice()),
                     _ => return Err(arg_type_diag("CGINFO", "ID", "字符串")),
                 },
                 Some("IDNO") => match int_arg(r.value) {
@@ -4785,11 +4795,32 @@ impl GfxState {
             }
         }
         let mut keep = vec![true; self.image_log.len()];
+        // 快照成员集合**建一次**再查。
+        //
+        // `snapshot_has_layer` 是 `快照数 × layer_ids 线性查找`(菜单帧
+        // 快照数十个 × 每份 1400+ 个 `LayerId`),而这里原本对 `image_log`
+        // 的每一项都调一次 —— `CGEND` 因此单次 9.4µs(813 次/帧 = 7.7ms,
+        // 是所有命令里最贵的一条)。集合内容在 `drop_ops_for` 期间不变,
+        // 提到循环外语义等价。
+        let snapshot_layers: Option<std::collections::HashSet<&LayerId>> =
+            if self.screen_snapshots.is_empty() {
+                None
+            } else {
+                Some(
+                    self.screen_snapshots
+                        .values()
+                        .flat_map(|snap| snap.layer_ids.iter())
+                        .collect(),
+                )
+            };
         for i in (0..self.image_log.len()).rev() {
             let op = &self.image_log[i];
             let target = op.target.as_ref().unwrap_or(&op.source).clone();
             if removed.contains(&target) && !needed.contains(&target) {
-                if self.snapshot_has_layer(&target) {
+                let in_snapshot = snapshot_layers
+                    .as_ref()
+                    .is_some_and(|set| set.contains(&target));
+                if in_snapshot {
                     needed.insert(target);
                 } else {
                     keep[i] = false;
@@ -4952,7 +4983,17 @@ impl GfxState {
 
     /// 所有组离屏 pass,后序(子组先于父组)。显式栈遍历全树,包括
     /// 挂在图像层下面的组。
-    fn build_group_passes(&self, out: &mut Vec<Pass>, emitted: &mut BTreeSet<LayerId>) {
+    ///
+    /// `produced` 由调用方算一次传进来:[`Self::surface_producers`] 要全量扫
+    /// `image_log`(上限 16384)与 `copy_log`,而组可以有数百个 —— 逐组重算
+    /// 会退化成本帧 `组数 × 日志长度`(ERIS 菜单 282 组 ≈ 每帧数百万次迭代,
+    /// 实测 render 尖峰 8–14ms)。`frame()` 期间日志不变,提到循环外语义等价。
+    fn build_group_passes(
+        &self,
+        out: &mut Vec<Pass>,
+        emitted: &mut BTreeSet<LayerId>,
+        produced: &BTreeSet<LayerId>,
+    ) {
         // 后序:进入节点时先压“展开”标记,再压子节点;展开时记录组。
         let mut order: Vec<LayerId> = Vec::new();
         let mut stack: Vec<(LayerId, bool)> = self
@@ -4991,7 +5032,7 @@ impl GfxState {
                 continue;
             }
             let mut ops = Vec::new();
-            self.emit_children_ops(&id, &mut ops, emitted);
+            self.emit_children_ops(&id, &mut ops, emitted, produced);
             if ops.is_empty() {
                 continue;
             }
@@ -5059,10 +5100,15 @@ impl GfxState {
         }))
     }
 
-    fn emit_children_ops(&self, parent: &LayerId, out: &mut Vec<Op>, emitted: &BTreeSet<LayerId>) {
-        let produced = self.surface_producers();
+    fn emit_children_ops(
+        &self,
+        parent: &LayerId,
+        out: &mut Vec<Op>,
+        emitted: &BTreeSet<LayerId>,
+        produced: &BTreeSet<LayerId>,
+    ) {
         for child in self.sorted_children(Some(parent)) {
-            self.emit_node_ops(&child, out, emitted, &produced);
+            self.emit_node_ops(&child, out, emitted, produced);
         }
     }
 

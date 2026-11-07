@@ -522,6 +522,53 @@ impl std::fmt::Debug for YpfSource {
 }
 
 impl DataSource for YpfSource {
+    /// 只读前 `max` 字节(图像尺寸探测用)。
+    ///
+    /// **未压缩条目**:直接 seek 到 `data_offset` 只读 `max` 字节 —— 这是
+    /// 唯一能真省 IO 的形态。实测商业包 12212 条中 2542 张图未压缩、
+    /// 平均 359 KB,而 PNG/BMP/JPEG/GIF 的尺寸都在前 64 字节内;整读再
+    /// 截断是纯浪费(`CGINFO[SX/SY]` 单次实测 275µs,单帧 110 次=30ms)。
+    ///
+    /// **压缩条目 / 前缀覆盖整条负载**:回退到完整 [`Self::open`] ——
+    /// 前者需要 zlib 从头部完整解码,后者本来就等于整读。两种情况都保留
+    /// `verify_payload_hash` 的完整校验语义,不会「假装校验过」。
+    fn open_prefix(&self, path: &LookupKey, max: usize) -> Result<Vec<u8>, Diag> {
+        let Some(&idx) = self.lookup.get(path) else {
+            return Err(missing(path, self.source_name()));
+        };
+        let entry = &self.entries[idx];
+        if entry.compressed || max >= entry.compressed_size as usize {
+            let mut bytes = self.open(path)?;
+            bytes.truncate(max);
+            return Ok(bytes);
+        }
+        if entry.compressed_size != entry.uncompressed_size {
+            return Err(Diag::fatal(code::vfs::YPF_BAD_ENTRY, Boundary::Data)
+                .at_data(path.as_bytes().to_vec(), entry.data_offset)
+                .with_detail(format!(
+                    "stored entry has compressedSize {} != uncompressedSize {}",
+                    entry.compressed_size, entry.uncompressed_size
+                )));
+        }
+        let mut file = self.file.lock().map_err(|_| {
+            Diag::fatal(code::vfs::IO, Boundary::Data)
+                .at_data(entry.name.clone(), entry.data_offset)
+                .with_detail("ypf file mutex poisoned")
+        })?;
+        file.seek(SeekFrom::Start(entry.data_offset))
+            .map_err(|e| io_error(&self.path, e))?;
+        let mut raw = vec![0u8; max];
+        file.read_exact(&mut raw).map_err(|e| {
+            Diag::fatal(code::vfs::YPF_BAD_ENTRY, Boundary::Data)
+                .at_data(entry.name.clone(), entry.data_offset)
+                .with_detail(format!(
+                    "payload prefix read failed ({max} of {} bytes at {:#x}): {e}",
+                    entry.compressed_size, entry.data_offset
+                ))
+        })?;
+        Ok(raw)
+    }
+
     fn open(&self, path: &LookupKey) -> Result<Vec<u8>, Diag> {
         let Some(&idx) = self.lookup.get(path) else {
             return Err(missing(path, self.source_name()));

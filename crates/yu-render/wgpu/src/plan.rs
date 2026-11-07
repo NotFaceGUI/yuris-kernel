@@ -17,11 +17,11 @@
 //!    CPU 像素按需读回(存档抓帧)。
 //! 5. 屏幕 pass 只把可见层按 `(z, seq)` blit 到后缓冲。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use yu_gfx::{
-    BlendMode, Clear, CompositorFrame, CopyOp, CopySource, ImageAction, ImageOp, LayerId, Op,
+    BlendMode, Clear, CompositorFrame, CopyOp, CopySource, ImageAction, ImageOp, Layer, LayerId, Op,
     OpStatus, Pass, PassTarget, ScreenSnapshot, TextureRef,
 };
 use yu_log::Diag;
@@ -105,7 +105,9 @@ pub(crate) fn plan(
     // 像素(ERIS 底部按钮栏每个按钮都渲染成同一段旧文字的根因;同一机制
     // 还会让区域拷贝越界:旧内容的逻辑网格与新纹理尺寸不符)。
     for layer in &frame.layers {
-        let token = base_token(frame, targets, &layer.id, None);
+        // 免查找:这里已经持有 `&Layer`,再让 `base_token` 去 `frame.layers`
+        // 里线性搜同一个 id 就是 O(层数²)。
+        let token = base_token_of(frame, targets, &layer.id, Some(layer), None);
         if surfaces.sync_base(&layer.id, token) {
             contents.remove(&layer.id);
             continue;
@@ -199,6 +201,18 @@ pub(crate) fn plan(
         })
         .map(|(id, _)| id)
         .collect();
+
+    // 层表索引(`LayerId` → `&Layer`),本帧不变,建一次。
+    //
+    // 绘制规划里多处要「按 ID 找活层」(`resolve_source`/`layer_image`/
+    // `apply_text`/`screen_snapshot_content`…)。旧写法每次
+    // `frame.layers.iter().find(...)`,是 `op 数 × 层数` 的 `LayerId`
+    // (含 `Vec<u8>`)逐字节比较 —— 存档界面 541~1500 层 × 数十个 op,
+    // 实测 `plan` 阶段 4.8ms,是 render 尖峰的最大单项。
+    //
+    // 用 `&Layer` 而不是 clone:`frame` 在 `plan()` 期间只读。
+    let layer_index: HashMap<&LayerId, &Layer> =
+        frame.layers.iter().map(|layer| (&layer.id, layer)).collect();
 
     // ---- 1. 纹理 pass:严格命令序(COPY 与图像加工交错) ----
     let mark_ops = started.elapsed();
@@ -311,6 +325,11 @@ pub(crate) fn plan(
         &mut text_jobs,
     );
     let text_stats = text.take_frame_stats();
+    // 文本阶段到此为止。**必须在这里取边界**:旧实现在第 5 步(屏幕级
+    // 文本)之后才算 `t_text`,于是组 pass、屏幕 pass、顶点生成全被算进
+    // `phases.text_us` —— 真机日志里「角色出场 render=37ms 而 ops 只有 14」
+    // 就是这么误读的。下面 `rest_us` 用 `plan_us - image - text` 求得。
+    let mark_text_done = started.elapsed();
 
     // ---- 3. 组离屏 pass(后序;子组先于父组) ----
     for pass in &frame.passes {
@@ -337,6 +356,7 @@ pub(crate) fn plan(
             let mut planner = Planner {
                 ctx,
                 frame,
+                layers: &layer_index,
                 textures,
                 gpu,
                 pipelines,
@@ -383,6 +403,7 @@ pub(crate) fn plan(
             let mut planner = Planner {
                 ctx,
                 frame,
+                layers: &layer_index,
                 textures,
                 gpu,
                 pipelines,
@@ -430,7 +451,9 @@ pub(crate) fn plan(
         text,
         &mut acc,
     )?;
-    let t_text = started.elapsed() - mark_text;
+    // 文本阶段只算 `apply_text` 本身(`mark_text` → `mark_text_done`);
+    // 组 pass / 屏幕 pass / 屏幕级文本的耗时归入 `rest_us`。
+    let t_text = mark_text_done - mark_text;
 
     // 帧末:把不再被引用的表面纹理放回池(快照/文本持有 `Rc` ⇒ 自动钉住)。
     let live: BTreeSet<LayerId> = frame.layers.iter().map(|l| l.id.clone()).collect();
@@ -1553,12 +1576,35 @@ fn apply_image_pixels(
             return Err("gfx.imageop.set.missing".to_string());
         };
         let (width, height) = (base.width, base.height);
-        let surface = crate::readback::read_texture(ctx, &base.tex.texture, width, height)
-            .map_err(|diag| diag.code.to_string())?;
-        surfaces.stats_mut().cpu_fallbacks += 1;
-        let Some((x0, y0, x1, y1)) = trim_box(&surface, width, height, set) else {
-            return Ok(());
+        // **优先走资产 alpha 缓存**:`TRIM` 只裁四周全透明的行/列,边界是
+        // 资产的固有属性(解码时 CPU 像素就在手上)。整图读回在移动端
+        // TBDR 上等于「全部 tile 刷回主存」,真机实测 100~291ms/次
+        // (`phases.image=291740us`) —— 这是「角色一出来就卡」的直接原因。
+        //
+        // 取不到资产 key(快照/离屏/合成结果)时**回退整图读回**:那些来源
+        // 的像素只存在于 GPU,保底路径、低频。
+        let bounds = match source_asset_key(frame, target) {
+            Some(key) => match textures.trim_bounds(key, set) {
+                Some(b) => (
+                    i64::from(b.0),
+                    i64::from(b.1),
+                    i64::from(b.2),
+                    i64::from(b.3),
+                ),
+                // 资产已解析但整体全透明:官方保持原样(同 soft `apply_trim`)。
+                None => return Ok(()),
+            },
+            None => {
+                let surface = crate::readback::read_texture(ctx, &base.tex.texture, width, height)
+                    .map_err(|diag| diag.code.to_string())?;
+                surfaces.stats_mut().cpu_fallbacks += 1;
+                let Some(b) = trim_box(&surface, width, height, set) else {
+                    return Ok(());
+                };
+                b
+            }
         };
+        let (x0, y0, x1, y1) = bounds;
         let (new_w, new_h) = ((x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32);
         let out = surfaces.acquire(ctx, new_w, new_h, "trim surface")?;
         writes.remember(&out);
@@ -2144,9 +2190,14 @@ fn compose_group_content(
         // 组内 op 的计数**回滚**:这次现绘不是 CompositorFrame 的独立 pass
         // (soft `compose_group` 同口径)。
         let mut local = Accum::new(frame);
+        // 本函数可能被传入 `snap_frame`(屏幕快照的临时帧),所以索引必须
+        // 按**当前 `frame`** 建,不能借用外层的。
+        let group_layers: HashMap<&LayerId, &Layer> =
+            frame.layers.iter().map(|layer| (&layer.id, layer)).collect();
         let mut planner = Planner {
             ctx,
             frame,
+            layers: &group_layers,
             textures,
             gpu,
             pipelines,
@@ -2462,8 +2513,12 @@ fn apply_text(
             ids.insert(target.clone());
         }
     }
+    // 文本层查找一次建索引:逐 id 线性扫 `frame.layers` 是
+    // `文本层数 × 层数`(存档界面 18 个文本层 × 541 层)。
+    let text_layer_index: HashMap<&LayerId, &Layer> =
+        frame.layers.iter().map(|layer| (&layer.id, layer)).collect();
     for id in ids {
-        let Some(layer) = frame.layers.iter().find(|layer| layer.id == id) else {
+        let Some(layer) = text_layer_index.get(&id).copied() else {
             note_text_diag(acc, format!("text.layer_missing: {}", id.display()));
             continue;
         };
@@ -2544,18 +2599,43 @@ fn apply_text(
                 let mut placements: Vec<yu_render_core::GlyphPlacement> = Vec::new();
                 let mut collected = true;
                 let mut gpu_glyphs = 0u32;
+                let mut gpu_missing = 0usize;
                 for draw in &draws {
-                    match text.collect_glyphs(draw) {
-                        Ok(mut items) => {
+                    // 缺字形按 CPU 路径同口径跳过(只记 missing),不整体失败:
+                    // 整层回退到 CPU 合成会同步读回整层像素(实测 25~30ms)。
+                    match text.collect_glyphs_skipping_missing(draw) {
+                        Ok((mut items, missing)) => {
+                            gpu_missing = gpu_missing.saturating_add(missing);
                             let passes = draw.composite_passes().max(1) as usize;
                             gpu_glyphs = gpu_glyphs.saturating_add((items.len() / passes) as u32);
                             placements.append(&mut items);
                         }
-                        Err(_) => {
+                        Err(reason) => {
+                            if std::env::var_os("YURIS_TEXT_GPU_DEBUG").is_some() {
+                                log::warn!(
+                                    target: "yu-render",
+                                    "[text-gpu] collect failed layer={} err={reason} \
+                                     bytes={} set={:?} bno={:?} font_no={:?}",
+                                    id.display(),
+                                    String::from_utf8_lossy(&draw.bytes),
+                                    draw.set,
+                                    draw.bno,
+                                    draw.style.font_no
+                                );
+                            }
                             collected = false;
                             break;
                         }
                     }
+                }
+                if gpu_missing > 0 {
+                    merge_text_stats(
+                        acc,
+                        yu_render_core::TextPaintStats {
+                            missing: gpu_missing,
+                            ..yu_render_core::TextPaintStats::default()
+                        },
+                    );
                 }
                 if collected && !placements.is_empty() {
                     let identity = text_gpu_identity(revision, signature, raw.hash, base_key);
@@ -2616,11 +2696,53 @@ fn apply_text(
                             contents.insert(id.clone(), content);
                             continue;
                         }
-                        Err(_) => {
+                        Err(reason) => {
+                            // 回退到 CPU 文本合成 = 一次**同步**整层读回
+                            // (`content_cpu` → `read_back` → `read_now`),
+                            // 实测可达 25~30ms/帧。这里把原因留痕:回退本身
+                            // 是允许的(能力不足时必须回退),但静默回退会让
+                            // 「GPU 文本没生效」无从归因。
+                            if std::env::var_os("YURIS_TEXT_GPU_DEBUG").is_some() {
+                                log::warn!(
+                                    target: "yu-render",
+                                    "[text-gpu] fallback layer={} reason={reason} \
+                                     draws={} glyphs={} raw={}x{}",
+                                    id.display(),
+                                    draws.len(),
+                                    gpu_glyphs,
+                                    raw.width,
+                                    raw.height
+                                );
+                            }
                             gpu_stats.fallback += 1;
                         }
                     }
                 } else {
+                    if std::env::var_os("YURIS_TEXT_GPU_DEBUG").is_some() {
+                        let why = if has_image_glyph {
+                            "image_glyph"
+                        } else if layout.is_some() {
+                            "layout"
+                        } else if !raw.is_identity() {
+                            "raw_not_identity"
+                        } else if draws.is_empty() {
+                            "no_draws"
+                        } else if !collected {
+                            "collect_failed"
+                        } else {
+                            "no_placements"
+                        };
+                        log::warn!(
+                            target: "yu-render",
+                            "[text-gpu] skip layer={} reason={why} \
+                             draws={} glyphs={} raw={}x{}",
+                            id.display(),
+                            draws.len(),
+                            gpu_glyphs,
+                            raw.width,
+                            raw.height
+                        );
+                    }
                     gpu_stats.fallback += 1;
                 }
             }
@@ -2899,6 +3021,18 @@ fn content_region(content: &Content) -> (i64, i64, i64, i64) {
 
 /// `TRIM` 的 alpha 包围盒(与 soft `apply_trim` 同规则:位掩码 8=上/4=下/
 /// 2=左/1=右,只裁完全透明的行/列)。
+/// 该层的当前纹理是否直接来自一个**资产**(`TextureRef::Asset`)。
+///
+/// 只有这种情况能用 `TextureStore` 里那份 CPU 像素算 `TRIM` 边界;
+/// 快照/离屏/影片的像素只存在于 GPU,必须回退读回。
+fn source_asset_key<'a>(frame: &'a CompositorFrame, id: &LayerId) -> Option<&'a [u8]> {
+    let layer = frame.layers.iter().find(|layer| &layer.id == id)?;
+    match &layer.texture {
+        TextureRef::Asset(key) if !key.is_empty() => Some(key.as_slice()),
+        _ => None,
+    }
+}
+
 fn trim_box(surface: &Surface, width: u32, height: u32, mask: i64) -> Option<(i64, i64, i64, i64)> {
     if width == 0 || height == 0 {
         return None;
@@ -2955,9 +3089,24 @@ fn base_token(
     id: &LayerId,
     fallback: Option<&TextureRef>,
 ) -> u64 {
+    base_token_of(frame, targets, id, frame.layers.iter().find(|l| &l.id == id), fallback)
+}
+
+/// [`base_token`] 的**免查找**版本:调用方已经持有该层的 `&Layer`。
+///
+/// `plan()` 开头逐层取 token 时用这个 —— 否则每次都要在 `frame.layers`
+/// 里线性搜同一个 `LayerId`,退化成 O(层数²)(存档界面 541~1500 层,
+/// 实测是 `plan` 阶段的主要成本)。
+fn base_token_of(
+    frame: &CompositorFrame,
+    targets: &TargetSet,
+    id: &LayerId,
+    layer: Option<&yu_gfx::Layer>,
+    fallback: Option<&TextureRef>,
+) -> u64 {
+    let _ = frame;
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     fnv_bytes(&mut hash, id.as_bytes());
-    let layer = frame.layers.iter().find(|layer| &layer.id == id);
     // 图层不透明度是基面身份的一部分:`CG[A=…]` 只改 alpha、不改纹理,若
     // 不入 token,`sync_base` 会认为基面没变而跳过快照 ⇒ 该层的像素动作
     // 全部停在旧 alpha 下算出的结果。
