@@ -13495,3 +13495,58 @@ cargo test -p yu-rt --test consistency(<样本 env 齐备>)
 
 **工具**:`crates/yu-rt/examples/gen_abi_tsv.rs`(ycd → TSV)、
 `crates/yu-rt/examples/abi_match.rs`(TSV × ysv 逐项差异),均为只读探针。
+
+## 成果 LOG-NOISE-3 (2026-11-07) · `CGACT[TEXT]` 空串误报与预加载缺资产降噪
+
+**问题**:三款商业包演出期出现
+`WARN [gfx] gfx.arg.missing @ s11 pc331 x5: CGACT[TEXT] 缺 SETSTR`,
+以及启动期 `[asset] preload failed` WARN(2–10 条/局)。
+
+**取证**:
+- 反编译 0.486 商业包 s11(`es_Font.yst`)pc331:参数窗口**存在**
+  (`w5 SETSTR = 48 03 00 24 b8 07` → `$TX`);临时探针实跑输出
+  `SETSTR=Str([215,247])`(1 个 CP932 字),标题菜单文本正常绘制。
+- 告警帧是 `$TX` 求值为**空串**:ERIS `es_Text` 的 `es.TX.OUTPUT.ONE`
+  逐字 `\_strmid($TX,@TX.POS,1)` → `\BT.FONT.DRAW(...,$txone)`;
+  空字/无名字(`TIP.NAMEW.TX`)都会发 `CGACT[TEXT SETSTR=""]`。
+- 官方:手册 `cg/cgact.html` 说明 `SETSTR`;引擎文本合成
+  `FUN_004056b8` 对空串直接返回(不写表面、不报错)。旧实现把
+  「参数缺省空串」与「参数窗口缺失」合并报 Recoverable → 演出期刷屏。
+- 资源核实:三款包**确实没有**这些通用 cgsys 资产
+  (`btn_click_bt3`、`tip_namewindow_back`、`main/nextvoice/icon_01`、
+  `cg/face/face_back`、`exp/playstyle/02|08|09`、`exp/sound/07`、
+  `exp/voice/04`、`voice/GLO_M01_0458`);SDK 0.495 的 cgsys 有部分同名
+  文件,说明是本作未发行,不是查找路径问题。`pac/ed01..04.ypf` 是
+  MPEG-PS 影片(`00 00 01 BA`),被跳过是正确行为。
+
+**改动**:
+1. `crates/yu-gfx/src/state.rs::cgact_text`:`SETSTR` 非空才登记绘制项;
+   空串/缺省 → `error::verbose(code::TEXT_EMPTY)` 后返回(两类 detail 分开)。
+2. `crates/yu-gfx/src/error.rs`:新增稳定码 `gfx.text.empty`(Verbose 语义)。
+3. `crates/yu-render/{soft,wgpu}`:`preload_assets` 的 miss 由 `warn!` 降
+   `debug!`(文案 `[asset] preload miss`);`RenderReport` 的
+   `missing assets` / `asset.missing` 统计不变。
+4. 台账:`docs/divergences/DIV-GFX-079-cgact-text-empty-setstr.md`、
+   `docs/divergences/DIV-GFX-080-asset-preload-missing-silent.md`。
+
+**验证**:
+```text
+cargo test -p yu-gfx --test text_pipeline
+  → 15 passed(新增 cgact_text_empty_setstr_is_a_verbose_noop)
+cargo build --workspace --all-targets → 通过
+三款商业包 headless 1100 帧(修复后)
+  → gfx.arg.missing / 缺 SETSTR 计数 0
+  → [asset] preload failed 计数 0;missing assets 1/0/3(与修复前一致)
+  → 0.494 首屏 PNG sha 1d684027…dcd75d 与修复前逐字节一致
+全量 cargo test --workspace(--no-fail-fast,样本 env 齐备)
+  → 仅 4 条既有失败(与本轮无关,git stash 对照复现):
+     eris_first_screen golden 层数 199 vs 272 ×2;
+     yu-sound gated_ogg 装载即解码 ×2
+```
+
+**残留**:
+- `gfx.text.empty` 只在 `--log-level verbose` 可见;默认日志无该告警。
+- `fontdb: mstmc.ttf malformed` 为第三方字库告警(系统字体异常,已回退)。
+- 夏ノ鎖 `sv.file.write 拒绝访问` 是本机沙箱对「工作区编译产物写
+  `D:\Download`」的限制:`--save-root` 指到可写目录后写入成功、
+  文件时间戳更新,非内核缺陷。

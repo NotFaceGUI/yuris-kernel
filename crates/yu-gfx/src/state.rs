@@ -3817,15 +3817,23 @@ impl GfxState {
             );
             return;
         }
-        let Some(bytes) = set_str.filter(|b| !b.is_empty()) else {
-            self.push_diag(
-                "CGACT",
-                error::recoverable(
-                    error::code::ARG_MISSING,
-                    "CGACT[TEXT] 缺 SETSTR:引擎不绘制空字符串,但参数缺失不是同义",
-                ),
-            );
-            return;
+        // 官方 `CGACT` 对 `SETSTR` 取参数表缺省值 = 空字符串,文本合成遇空串
+        // 直接返回(**不绘制、不清面、不报错**)。ERIS `es_Text` 的逐字推进
+        // 在空字/无名字(`TIP.NAMEW.TX`)时就是这条路径;0.486/0.494 商业包
+        // 一次演出可出现数次。旧实现把「缺参」与「空串」合并报
+        // `gfx.arg.missing`(Recoverable),演出期刷屏且语义错误 —— 只有
+        // 「参数窗口缺失」才值得诊断,空串是正常数据。
+        let bytes = match set_str {
+            Some(b) if !b.is_empty() => b,
+            other => {
+                let detail = if other.is_some() {
+                    "CGACT[TEXT] SETSTR 为空字符串:官方不绘制(es_Text 逐字推进到空字/无名字时的正常路径)"
+                } else {
+                    "CGACT[TEXT] 未给 SETSTR:官方按参数表缺省空串处理(不绘制)"
+                };
+                self.push_diag("CGACT", error::verbose(error::code::TEXT_EMPTY, detail));
+                return;
+            }
         };
         // SET 缺省 0(单次合成);引擎默认值。
         let set = set.as_ref().and_then(EngineValue::as_int).unwrap_or(0); // 缺省

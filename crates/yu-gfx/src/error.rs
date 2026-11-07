@@ -58,6 +58,14 @@ pub mod code {
     pub const IMAGEOP_UNSUPPORTED: &str = "gfx.imageop.unsupported";
     /// 文本模型缺项(字形栅格化/窗口定位/描边)。
     pub const TEXT_UNSUPPORTED: &str = "gfx.text.unsupported";
+    /// `CGACT[TEXT]` 没有可绘制的字符串(参数缺省或空串)。
+    ///
+    /// **正常路径,不是缺陷**:官方 `CGACT` 处理体对 `SETSTR` 槽缺省取空
+    /// 字符串,文本合成遇到空串直接返回(不写层表面、不报错)。ERIS
+    /// `es_Text` 的逐字推进在空字/无名字(`TIP.NAMEW.TX`)时就会走到这里;
+    /// 0.486/0.494 商业包一次演出可出现数次。按 WARN 报会在演出期刷屏
+    /// (`DIV-RT-054` 同类收口),故只在 `--log-level verbose` 留痕。
+    pub const TEXT_EMPTY: &str = "gfx.text.empty";
     /// 外字链(`CG→SIZE2→MEIDO→MERGE2`)降级为文本图像字形。
     ///
     /// 这是**正常路径**(DIV-GFX-076 方案 E),不是缺项:后端在层末把图像

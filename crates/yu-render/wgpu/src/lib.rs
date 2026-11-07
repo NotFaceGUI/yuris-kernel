@@ -260,9 +260,12 @@ impl WgpuRenderer {
                 .ensure_asset(&self.ctx, &mut self.textures, key)
             {
                 errors += 1;
-                log::warn!(
+                // 与 soft 后端同口径:官方 `CG[FILE]` 装载失败静默,缺资产
+                // 由 `RenderReport`(missing assets / `asset.missing` 跳过项)
+                // 统计,不在启动时按 WARN 刷屏。
+                log::debug!(
                     target: "yu-render",
-                    "[asset] preload failed key={}: {} {}",
+                    "[asset] preload miss key={}: {} {}",
                     String::from_utf8_lossy(key),
                     diag.code,
                     diag.detail

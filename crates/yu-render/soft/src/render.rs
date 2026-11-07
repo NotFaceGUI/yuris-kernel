@@ -100,9 +100,15 @@ impl SoftRenderer {
         for key in keys {
             if let Err(diag) = self.textures.resolve(key) {
                 errors += 1;
-                log::warn!(
+                // 官方 `CG[FILE]` 装载失败**静默**(层只是没有图片):商业包里
+                // `es_Button`/`es_Config` 引用了本作没有发行的通用 cgsys
+                // 资产(`btn_click_bt3`、`tip_namewindow_back`、`exp/playstyle/02`
+                // 等),每次启动都会命中。缺资产的事实已由 `RenderReport`
+                // (`missing assets` 计数 / `asset.missing` 跳过项)统计,
+                // 这里不按 WARN 重复刷屏。
+                log::debug!(
                     target: "yu-render",
-                    "[asset] preload failed key={}: {} {}",
+                    "[asset] preload miss key={}: {} {}",
                     String::from_utf8_lossy(key),
                     diag.code,
                     diag.detail

@@ -390,6 +390,55 @@ fn cgact_text_missing_layer_is_reported() {
         .any(|d| d.code == "gfx.layer.missing"));
 }
 
+/// `SETSTR` 空串/缺省 = 官方空串短路(不绘制),**不是**参数缺失。
+///
+/// 证据:手册 `cg/cgact.html`「TEXT=レイヤに文字列を表示する」;引擎
+/// `FUN_004056b8` 文本合成对空串直接返回。ERIS `es_Text` 逐字推进
+/// (`\BT.FONT.DRAW(...,$txone)`)在空字/无名字时每行都会走到这里
+/// (0.486/0.494 商业包实测),按 Recoverable 报会在演出期刷屏。
+#[test]
+fn cgact_text_empty_setstr_is_a_verbose_noop() {
+    let mut gfx = state();
+    let t = table();
+    gfx.on_event(&frame_start(0));
+    gfx.on_event(&call(
+        0,
+        "CG",
+        vec![
+            arg(&t, "CG", "ID", s("TX")),
+            arg(&t, "CG", "FILE", s("")),
+        ],
+    ));
+    for (pc, setstr) in [(1u64, Some("")), (2, None)] {
+        let mut args = vec![
+            arg(&t, "CGACT", "ID", s("TX")),
+            arg(&t, "CGACT", "TEXT", i(1)),
+        ];
+        if let Some(v) = setstr {
+            args.push(arg(&t, "CGACT", "SETSTR", s(v)));
+        }
+        gfx.on_event(&call(pc, "CGACT", args));
+    }
+    assert!(
+        gfx.frame().text_draws.is_empty(),
+        "空串/缺省不得产出绘制项"
+    );
+    let diags = gfx.diagnostics();
+    assert!(
+        diags.iter().all(|d| d.severity != "Recoverable"),
+        "空串是正常路径,不得报 Recoverable: {diags:?}"
+    );
+    let empty_diags: Vec<_> = diags
+        .iter()
+        .filter(|d| d.code == "gfx.text.empty")
+        .collect();
+    assert_eq!(empty_diags.len(), 2, "空串与缺省各自一条 Verbose: {diags:?}");
+    assert!(
+        empty_diags.iter().all(|d| d.severity == "Verbose"),
+        "空串只留痕,不到 Recoverable: {empty_diags:?}"
+    );
+}
+
 /// 对话影子的真实形态(商业包 `s30 pc32..59`):脚本用 `FONT[BNO=0/1]` 配两套
 /// 样式(影/正文),再各发一条 `CGACT[TEXT SET=n]`。
 ///
