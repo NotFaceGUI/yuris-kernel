@@ -8,19 +8,62 @@
 
 | 方式 | 条件 |
 |---|---|
-| 推送 tag | `v[0-9]+.[0-9]+.[0-9]+*`（例如 `v0.1.0`、`v0.1.0-rc.1`） |
+| 推送 tag | `v*.*.*`（例如 `v0.1.0`、`v0.1.0-rc.1`）；触发过滤是 glob,格式校验在 workflow 内部 |
 | 手动运行 | Actions → `release` → Run workflow，填写已存在的 tag；可勾选 `dry_run` |
 
-工作流依次执行：
+工作流分四个 job：
 
-1. checkout 该 tag，`fetch-depth: 0`（更新日志需要完整历史与旧 tag）；
-2. 校验 tag 与 `Cargo.toml` 的 `[workspace.package].version` 完全一致；
-3. 运行发布工具自测（`tools/release/test_release_notes.py`）；
-4. 生成 `.release/notes.md`；
-5. `gh release create --verify-tag`；Release 已存在时改为 `gh release edit`
-   （可重复运行，不会因为重跑失败）。
+| job | runner | 产出 |
+|---|---|---|
+| `meta` | ubuntu | 校验 tag 与 Cargo.toml 一致、跑发布工具自测、生成 `notes.md` |
+| `cli` | windows-latest | `yuris-kernel-vX.Y.Z-windows-x64.zip`（`yu-cli.exe` + `yu-serve.exe` + README/LICENSE） |
+| `android` | ubuntu-latest | `yuris-kernel-vX.Y.Z-android.apk`（arm64-v8a + x86_64）、`yuris-kernel-vX.Y.Z-android-so.zip` |
+| `publish` | ubuntu-latest | 创建/更新 Release 并上传上面全部产物 |
 
-`dry_run=true` 时只跑 1–4 步并打印将执行的动作，不调用 `gh`。
+1. `meta`：checkout 该 tag，`fetch-depth: 0`（更新日志需要完整历史与旧 tag）；
+   校验 tag 与 `Cargo.toml` 的 `[workspace.package].version` 完全一致；
+   运行 `tools/release/test_release_notes.py`；生成 `.release/notes.md` 并作为
+   artifact 传给 `publish`。
+2. `cli` / `android`：并行构建，`dry_run=true` 时跳过。
+3. `publish`：先确认两个构建 job 都是 `success`（否则直接失败，不发布），
+   再 `gh release create --verify-tag`；Release 已存在时改为 `gh release edit`
+   （可重复运行，不会因为重跑失败），最后 `gh release upload --clobber` 上传产物。
+
+`dry_run=true` 时只跑 `meta` 并打印将执行的动作，不构建产物、不调用 `gh`。
+
+## 产物
+
+| 文件 | 内容 |
+|---|---|
+| `yuris-kernel-vX.Y.Z-windows-x64.zip` | `yu-cli.exe`、`yu-serve.exe`、`README.md`、`LICENSE` |
+| `yuris-kernel-vX.Y.Z-android.apk` | 正式签名 APK，包内 arm64-v8a + x86_64 |
+| `yuris-kernel-vX.Y.Z-android-so.zip` | `libyu_host_android.so` + `libc++_shared.so`（按 ABI 分目录） |
+
+APK 的 `versionName` 取 tag 去掉 `v` 前缀，`versionCode` 取 `GITHUB_RUN_NUMBER`
+（单调递增，可直接覆盖安装）。
+
+## Android 签名
+
+APK 必须正式签名才能分发。`android` job 在构建前检查四个 secret，缺任何一个就失败；
+`android/app/build.gradle.kts` 在 `GITHUB_ACTIONS=true` 且缺签名时**主动抛错**，
+不会悄悄回落到 debug key。
+
+在仓库 Settings → Secrets and variables → Actions 配置：
+
+| secret | 内容 |
+|---|---|
+| `ANDROID_KEYSTORE_BASE64` | keystore 文件的 base64（`base64 -w0 release.jks`） |
+| `ANDROID_KEYSTORE_PASSWORD` | keystore 口令 |
+| `ANDROID_KEY_ALIAS` | key alias |
+| `ANDROID_KEY_PASSWORD` | key 口令 |
+
+工作流把它们解码到 `$RUNNER_TEMP/release.jks`，再用 `keytool -list` 验证一遍，
+然后以 `YURIS_KEYSTORE_FILE` / `YURIS_KEYSTORE_PASSWORD` / `YURIS_KEY_ALIAS` /
+`YURIS_KEY_PASSWORD` 四个环境变量交给 gradle。
+
+本地不带这四个变量时仍可 `assembleDebug` / `assembleRelease`，只是用 debug 签名
+（自用安装，不可分发）；构建日志会打印一行「APK 签名: debug（本地调试用…）」。
+
 
 ## 版本纪律
 
@@ -109,6 +152,28 @@ act workflow_dispatch -W .github/workflows/release.yml \
 不能用于这一步；没有 Docker 守护进程时只能做 `act -l` 解析检查。脚本级测试
 （第 1–4 步）不依赖 Docker，是本地验证的主路径。
 
+### 本地预演产物构建
+
+两个构建 job 都是薄壳，真正的命令在仓库里，可以逐条本地跑：
+
+```bash
+# cli：与 workflow 的同一条命令
+cargo build --release -p yu-cli --locked
+
+# android：先只出 so（不碰 gradle / 不需要签名）
+YURIS_SO_ONLY=1 bash tools/android/build.sh
+
+# 再打 release APK（本地无 secrets ⇒ debug 签名，仅用于验证包能装能跑）
+BUILD_TYPE=release GRADLE_FLAGS="--offline" \
+  GRADLE_PROJECT_ARGS="-PreleaseVersionName=0.0.0-local -PreleaseVersionCode=1" \
+  bash tools/android/build.sh
+```
+
+CI 上 `GRADLE_FLAGS="--no-daemon"`（不带 `--offline`，runner 没有依赖缓存）。
+`tools/android/build.sh` 会自己探测 `$ANDROID_HOME/build-tools/*/aapt2` 并补
+`-Pandroid.aapt2FromMavenOverride`，因此 `android/gradle.properties` 里不再写死
+任何本机绝对路径。
+
 ## 设计取舍
 
 - **不用 `generate_release_notes`**：GitHub 自动日志按它自己的规则排序，不按
@@ -118,8 +183,11 @@ act workflow_dispatch -W .github/workflows/release.yml \
 - **tag 与 Cargo.toml 强校验**：Release 标题就是 tag，版本错位会误导使用者。
 - **先 notes、后 create**：notes 生成失败时不会留下空 Release；重跑时已存在则
   edit，保持幂等。
-- **只写 Release，不构建产物**：当前发布不含二进制；后续若加产物，复用同一份
-  `.release/notes.md`，用 `gh release upload` 追加附件即可。
+- **构建失败不发布**：`publish` 是独立的 job，先检查 `cli` / `android` 的
+  `result`，任一失败即中止——不会出现"Release 有正文但没有产物"。
+- **产物上传用 `--clobber`**：重跑同一 tag 时覆盖同名附件，保持幂等。
+- **APK 签名缺失即失败**：宁可发布失败，也不产出一个看起来是发布版、实际用
+  debug key 签名的 APK。
 
 ## 仓库设置
 
@@ -137,3 +205,7 @@ Settings → Actions → General → Workflow permissions 被设为只读，`GIT
 | `gh release view` 报 401/403 | `GITHUB_TOKEN` 权限不足，见上一节 |
 | Release 已存在 | 正常路径：workflow 会 `edit` 而不是报错 |
 | 首次发布没有「完整变更」 | 仓库还没有上一个 `v*` tag，日志覆盖全部历史 |
+| `缺少 secret ANDROID_KEYSTORE_*` | 按「Android 签名」一节配好四个 secret |
+| `CI 构建缺少发布签名` | 同上；这是 gradle 侧的兜底检查，防止静默用 debug key |
+| `构建阶段未全部成功（cli=… android=…）` | 看对应 job 日志；修好重跑，或手动 `dry_run` 只验证日志 |
+| Android job 报找不到 `platforms;android-36` | runner 镜像的 SDK 组件落后；`sdkmanager` 那步会自动补装 |

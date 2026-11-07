@@ -11,7 +11,17 @@
 #   - JDK 17+ 在 JAVA_HOME(AGP 8.13 要求)
 #
 # 产物:
-#   android/app/build/outputs/apk/debug/app-debug.apk
+#   debug   → android/app/build/outputs/apk/debug/app-debug.apk
+#   release → android/app/build/outputs/apk/release/app-release.apk
+#
+# 环境变量(都可选;CI 与本地共用同一份脚本):
+#   BUILD_TYPE=debug|release   打哪个构建类型(缺省 debug)
+#   YURIS_SO_ONLY=1            只交叉编译 so 并落到 jniLibs,不跑 gradle
+#   GRADLE_FLAGS=...           覆盖传给 gradle 的参数
+#                              (缺省 `--offline`;CI 无缓存可传 `--no-daemon` 不带 offline)
+#   GRADLE_PROJECT_ARGS=...    追加 -P 参数(如版本号注入、aapt2 覆盖)
+#   YURIS_KEYSTORE_FILE / YURIS_KEYSTORE_PASSWORD / YURIS_KEY_ALIAS /
+#   YURIS_KEY_PASSWORD         发布签名四件套,给 gradle 读(见 app/build.gradle.kts)
 #
 # 说明:本脚本只做「cargo 交叉编译 → 拷进 jniLibs → gradle 打包」,不含任何
 # 游戏数据;数据在验证时用 adb push 到 app 外置私有目录(见 android/README.md)。
@@ -21,6 +31,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
 NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
+BUILD_TYPE="${BUILD_TYPE:-debug}"
+SO_ONLY="${YURIS_SO_ONLY:-0}"
 
 if [[ -z "$SDK" ]]; then
   echo "错误: ANDROID_HOME / ANDROID_SDK_ROOT 未设置" >&2
@@ -33,6 +45,21 @@ fi
 if [[ -z "$NDK" || ! -d "$NDK" ]]; then
   echo "错误: 找不到 NDK(设 ANDROID_NDK_HOME,或把 NDK 装进 \$ANDROID_HOME/ndk/)" >&2
   exit 2
+fi
+
+case "$BUILD_TYPE" in
+  debug|release) ;;
+  *)
+    echo "错误: BUILD_TYPE 只接受 debug / release,收到: $BUILD_TYPE" >&2
+    exit 2
+    ;;
+esac
+if [[ "$BUILD_TYPE" == "release" ]]; then
+  GRADLE_TASK="assembleRelease"
+  APK_PATH="android/app/build/outputs/apk/release/app-release.apk"
+else
+  GRADLE_TASK="assembleDebug"
+  APK_PATH="android/app/build/outputs/apk/debug/app-debug.apk"
 fi
 
 HOST_TAG="windows-x86_64"
@@ -79,6 +106,18 @@ case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) CC_SUFFIX=".cmd" ;;
 esac
 
+# 缺少 rust 目标时给一句人话,而不是让 cargo 抛 "can't find crate for `core`"。
+if command -v rustup >/dev/null 2>&1; then
+  installed="$(rustup target list --installed 2>/dev/null || true)"
+  for abi in "${ABIS[@]}"; do
+    target="$(target_of "$abi")"
+    if ! grep -qx "$target" <<<"$installed"; then
+      echo "错误: 未安装 Rust 目标 $target;先执行 rustup target add $target" >&2
+      exit 2
+    fi
+  done
+fi
+
 for abi in "${ABIS[@]}"; do
   target="$(target_of "$abi")"
   cc_base="$(clang_of "$target")"
@@ -113,21 +152,52 @@ for abi in "${ABIS[@]}"; do
   printf '==> %s: %s\n' "$abi" "$(du -h "$dst/libyu_host_android.so" | cut -f1)"
 done
 
-printf '==> gradle assembleDebug\n'
+if [[ "$SO_ONLY" == "1" ]]; then
+  echo "==> YURIS_SO_ONLY=1:so 已落到 android/app/src/main/jniLibs,跳过 gradle"
+  exit 0
+fi
+
+printf '==> gradle %s\n' "$GRADLE_TASK"
 if [[ -z "${JAVA_HOME:-}" ]]; then
   echo "错误: JAVA_HOME 未设置(AGP 8.13 需要 JDK 17+)" >&2
   exit 2
 fi
+
+# 离线构建复用 SDK 自带的 aapt2(AGP 默认从 Maven 拉同名制品)。
+# 之前这条以绝对路径写死在 gradle.properties 里,CI 上必然失效 —— 改为
+# 按 $ANDROID_HOME 探测,只有真的找到才传,联网环境不需要。
+GRADLE_ARGS=()
+if [[ -n "${GRADLE_PROJECT_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206  # 有意按空白切分,调用方负责不要放带空格的值
+  GRADLE_ARGS+=(${GRADLE_PROJECT_ARGS})
+fi
+if [[ ! " ${GRADLE_ARGS[*]:-} " =~ aapt2FromMavenOverride ]]; then
+  AAPT2="$(ls "$SDK"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1 || true)"
+  if [[ -z "$AAPT2" ]]; then
+    AAPT2="$(ls "$SDK"/build-tools/*/aapt2.exe 2>/dev/null | sort -V | tail -1 || true)"
+  fi
+  if [[ -n "$AAPT2" ]]; then
+    GRADLE_ARGS+=("-Pandroid.aapt2FromMavenOverride=${AAPT2}")
+  fi
+fi
+
+# shellcheck disable=SC2206  # GRADLE_FLAGS 同理:由调用方给短参数列表
+GRADLE_OPTS=(${GRADLE_FLAGS---offline})
+
 # 用本地 gradle(不引 wrapper jar);有 wrapper 时优先 wrapper。
 if [[ -x "$REPO_ROOT/android/gradlew" ]]; then
-  (cd "$REPO_ROOT/android" && ./gradlew --offline assembleDebug)
+  (cd "$REPO_ROOT/android" && ./gradlew "${GRADLE_OPTS[@]}" "${GRADLE_ARGS[@]}" "$GRADLE_TASK")
 else
   gradle_bin="$(command -v gradle || true)"
   if [[ -z "$gradle_bin" ]]; then
     echo "错误: 找不到 gradle(装 Gradle 8.14+ 或生成 wrapper)" >&2
     exit 2
   fi
-  (cd "$REPO_ROOT/android" && "$gradle_bin" --offline assembleDebug)
+  (cd "$REPO_ROOT/android" && "$gradle_bin" "${GRADLE_OPTS[@]}" "${GRADLE_ARGS[@]}" "$GRADLE_TASK")
 fi
 
-echo "==> 完成: android/app/build/outputs/apk/debug/app-debug.apk"
+if [[ ! -f "$REPO_ROOT/$APK_PATH" ]]; then
+  echo "错误: gradle 报成功但产物不存在: $APK_PATH" >&2
+  exit 1
+fi
+printf '==> 完成: %s (%s)\n' "$APK_PATH" "$(du -h "$REPO_ROOT/$APK_PATH" | cut -f1)"

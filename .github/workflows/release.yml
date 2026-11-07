@@ -2,8 +2,10 @@ name: release
 
 on:
   push:
+    # 触发过滤是 glob 语义,不认正则(没有 `+` 量词);`v*.*.*` 匹配
+    # v0.1.0 / v0.1.0-rc.1 等。严格的 vX.Y.Z 格式校验在 meta job 的正则里。
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+*"
+      - "v*.*.*"
   workflow_dispatch:
     inputs:
       tag:
@@ -11,12 +13,12 @@ on:
         required: true
         type: string
       dry_run:
-        description: "只校验并生成更新日志，不创建/修改 Release"
+        description: "只校验并生成更新日志，不构建产物、不创建/修改 Release"
         required: false
         default: false
         type: boolean
 
-# 默认只读；只有 release job 需要写 Release。
+# 默认只读；只有 publish job 需要写 Release。
 permissions:
   contents: read
 
@@ -24,13 +26,20 @@ concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+  # tag 只在这里解析一次（校验在 meta job），后续 job 直接用。
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
 jobs:
-  release:
-    name: release
+  # ── 1. 校验 tag、生成更新日志 ─────────────────────────────────────────────
+  meta:
+    name: tag / notes
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7.0.1
@@ -42,11 +51,9 @@ jobs:
       - name: Resolve tag
         id: tag
         shell: bash
-        env:
-          INPUT_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          tag="$INPUT_TAG"
+          tag="$RELEASE_TAG"
           if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::'$tag' 不是 vX.Y.Z 形式的版本 tag"
             exit 1
@@ -56,6 +63,7 @@ jobs:
             exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
           echo "release tag: $tag"
 
       - name: Test release tooling
@@ -63,23 +71,252 @@ jobs:
 
       - name: Verify tag matches Cargo.toml version
         env:
-          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
-        run: python3 tools/release/release_notes.py check-version --tag "$RELEASE_TAG"
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: python3 tools/release/release_notes.py check-version --tag "$TAG"
 
       - name: Generate changelog
         env:
-          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir -p .release
-          python3 tools/release/release_notes.py notes --tag "$RELEASE_TAG" --output .release/notes.md
+          python3 tools/release/release_notes.py notes --tag "$TAG" --output .release/notes.md
           cat .release/notes.md
+
+      - name: Upload changelog
+        uses: actions/upload-artifact@v4
+        with:
+          name: notes
+          path: .release/notes.md
+          if-no-files-found: error
+
+  # ── 2. Windows CLI（yu-cli.exe + yu-serve.exe）────────────────────────────
+  cli:
+    name: cli-windows-x64
+    needs: meta
+    if: needs.meta.result == 'success' && github.event.inputs.dry_run != 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows-x64
+
+      - name: Build CLI
+        run: cargo build --release -p yu-cli --locked
+
+      - name: Package
+        shell: pwsh
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dist = "dist"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          $stage = Join-Path $dist "stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/release/yu-cli.exe"  $stage
+          Copy-Item "target/release/yu-serve.exe" $stage
+          Copy-Item "README.md" $stage
+          Copy-Item "LICENSE"   $stage
+          $zip = Join-Path $dist "yuris-kernel-$TAG-windows-x64.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
+          Get-ChildItem $zip | Select-Object Name, Length
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-windows-x64
+          path: dist/yuris-kernel-*-windows-x64.zip
+          if-no-files-found: error
+
+  # ── 3. Android so + APK ───────────────────────────────────────────────────
+  android:
+    name: android-apk
+    needs: meta
+    if: needs.meta.result == 'success' && github.event.inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-android
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+
+      - name: Ensure Android SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK"
+          echo "预装 NDK:"; ls "$SDK/ndk" 2>/dev/null || true
+          # compileSdk/targetSdk=36 对应的 platform 与 build-tools 不一定预装；
+          # 已装时 sdkmanager 是幂等的快速 no-op。
+          yes 2>/dev/null | sdkmanager --install "platforms;android-36" "build-tools;36.0.0" >/dev/null \
+            || echo "::warning::sdkmanager 安装失败，继续使用镜像预装组件"
+          ls "$SDK/platforms" 2>/dev/null || true
+
+      - name: Check signing secrets
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in KEYSTORE_B64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::缺少 secret $name（见 docs/release.md「Android 签名」一节）"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Decode keystore
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          # 只验证是合法 keystore，不打印任何口令。
+          keytool -list -keystore "$RUNNER_TEMP/release.jks" \
+            -storepass "$KEYSTORE_PASSWORD" >/dev/null
+
+      - name: Build so + release APK
+        shell: bash
+        env:
+          YURIS_KEYSTORE_FILE: ${{ runner.temp }}/release.jks
+          YURIS_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          YURIS_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          YURIS_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # CI 没有本机构建缓存：不用 --offline（依赖走镜像/官方仓库）。
+          BUILD_TYPE=release \
+          GRADLE_FLAGS="--no-daemon" \
+          GRADLE_PROJECT_ARGS="-PreleaseVersionName=$VERSION -PreleaseVersionCode=$GITHUB_RUN_NUMBER" \
+            bash tools/android/build.sh
+
+      - name: Stage assets
+        shell: bash
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk "dist/yuris-kernel-$TAG-android.apk"
+          # so 与它依赖的 libc++_shared 一起给，方便自己塞进别的壳。
+          ( cd android/app/src/main/jniLibs && zip -qr "$GITHUB_WORKSPACE/dist/yuris-kernel-$TAG-android-so.zip" . )
+          ls -l dist
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/*
+          if-no-files-found: error
+
+  # ── 4. 发布 ───────────────────────────────────────────────────────────────
+  publish:
+    name: publish
+    needs: [meta, cli, android]
+    if: always() && needs.meta.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Refuse to publish when a build failed
+        if: github.event.inputs.dry_run != 'true'
+        env:
+          CLI_RESULT: ${{ needs.cli.result }}
+          ANDROID_RESULT: ${{ needs.android.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$CLI_RESULT" != "success" ] || [ "$ANDROID_RESULT" != "success" ]; then
+            echo "::error::构建阶段未全部成功（cli=$CLI_RESULT android=$ANDROID_RESULT），拒绝发布"
+            exit 1
+          fi
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          # dry_run 时 release_notes.py 只打印将要执行的动作，不调用 gh。
           YU_RELEASE_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           set -euo pipefail
-          python3 tools/release/release_notes.py publish --tag "$RELEASE_TAG" --notes-file .release/notes.md
+          python3 tools/release/release_notes.py publish --tag "$TAG" --notes-file dist/notes.md
+
+      - name: Upload release assets
+        if: github.event.inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*.zip dist/*.apk)
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "::error::没有可上传的产物"
+            exit 1
+          fi
+          printf '上传: %s\n' "${assets[@]}"
+          # 产物可能跨 job 顺序不定；--clobber 让重跑幂等。
+          gh release upload "$TAG" "${assets[@]}" --clobber
+          gh release view "$TAG" --json assets --jq '.assets[].name'

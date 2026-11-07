@@ -356,31 +356,66 @@ class WorkflowTests(unittest.TestCase):
         # PyYAML 按 YAML 1.1 会把未加引号的 on 解析成布尔 True。
         triggers = data.get("on", data.get(True))
         self.assertIsInstance(triggers, dict)
-        self.assertEqual(triggers["push"]["tags"], ["v[0-9]+.[0-9]+.[0-9]+*"])
+        self.assertEqual(triggers["push"]["tags"], ["v*.*.*"])
         self.assertIn("workflow_dispatch", triggers)
 
         self.assertEqual(data["permissions"]["contents"], "read")
-        job = data["jobs"]["release"]
-        self.assertEqual(job["permissions"]["contents"], "write")
         self.assertIn("concurrency", data)
 
-        steps = job["steps"]
-        by_name = {step.get("name"): step for step in steps}
-        checkout = by_name["Checkout repository"]
+        jobs = data["jobs"]
+        # 四个 job：校验/日志、两个并行构建、发布。
+        self.assertEqual(set(jobs), {"meta", "cli", "android", "publish"})
+
+        # 只有 publish 能写 Release。
+        self.assertEqual(jobs["publish"]["permissions"]["contents"], "write")
+        for name in ("meta", "cli", "android"):
+            self.assertNotEqual(
+                jobs[name].get("permissions", {}).get("contents"), "write", name
+            )
+
+        # meta 必须把 tag / version 传给下游（build 与 publish 都要用）。
+        self.assertEqual(
+            set(jobs["meta"]["outputs"]), {"tag", "version"}
+        )
+
+        # 两个构建 job 都依赖 meta，且 dry_run 时跳过。
+        for name in ("cli", "android"):
+            self.assertEqual(jobs[name]["needs"], "meta")
+            self.assertIn("dry_run", jobs[name]["if"])
+
+        # publish 等全部构建，并在构建失败时拒绝发布。
+        self.assertEqual(set(jobs["publish"]["needs"]), {"meta", "cli", "android"})
+        publish_steps = jobs["publish"]["steps"]
+        publish_by_name = {step.get("name"): step for step in publish_steps}
+        guard = publish_by_name["Refuse to publish when a build failed"]
+        self.assertIn("CLI_RESULT", guard["env"])
+        self.assertIn("ANDROID_RESULT", guard["env"])
+
+        meta_steps = jobs["meta"]["steps"]
+        checkout = {step.get("name"): step for step in meta_steps}["Checkout repository"]
         self.assertEqual(checkout["with"]["fetch-depth"], 0)
         self.assertFalse(checkout["with"]["persist-credentials"])
 
-        scripts = "\n".join(step.get("run", "") for step in steps)
-        self.assertIn("release_notes.py check-version", scripts)
-        self.assertIn("release_notes.py notes", scripts)
-        self.assertIn("release_notes.py publish", scripts)
-        self.assertIn("test_release_notes.py", scripts)
+        meta_scripts = "\n".join(step.get("run", "") for step in meta_steps)
+        self.assertIn("release_notes.py check-version", meta_scripts)
+        self.assertIn("release_notes.py notes", meta_scripts)
+        self.assertIn("test_release_notes.py", meta_scripts)
+
+        publish_scripts = "\n".join(step.get("run", "") for step in publish_steps)
+        self.assertIn("release_notes.py publish", publish_scripts)
+        self.assertIn("gh release upload", publish_scripts)
+
+        # 产物上传：apk / zip 都要出现在 assets 里。
+        upload = publish_by_name["Upload release assets"]
+        self.assertIn("*.apk", upload["run"])
+        self.assertIn("*.zip", upload["run"])
 
         # run 脚本只消费 env，不直接插值表达式，避免 tag 输入造成脚本注入。
-        for step in steps:
-            self.assertNotIn("${{", step.get("run", ""), step.get("name"))
+        for job in jobs.values():
+            for step in job["steps"]:
+                self.assertNotIn("${{", step.get("run", ""), step.get("name"))
 
-        publish = by_name["Create or update GitHub release"]
+        publish = publish_by_name["Create or update GitHub release"]
         self.assertEqual(publish["env"]["GH_TOKEN"], "${{ github.token }}")
         self.assertIn("YU_RELEASE_DRY_RUN", publish["env"])
 

@@ -2,6 +2,37 @@ plugins {
     id("com.android.application")
 }
 
+// 发布注入(全部可选,本地不传即用缺省值):
+//   -PreleaseVersionName=0.1.0   APK versionName(CI 由 tag 去掉前缀得到)
+//   -PreleaseVersionCode=123     APK versionCode(CI 用 run_number 单调递增)
+// 版本只有这一个来源;不在仓库里另存一份,避免与 Cargo.toml 漂移。
+val injectedVersionName = (project.findProperty("releaseVersionName") as String?)
+    ?.trim()
+    ?.takeIf { it.isNotEmpty() }
+val injectedVersionCode = (project.findProperty("releaseVersionCode") as String?)
+    ?.trim()
+    ?.toIntOrNull()
+
+// 发布签名:四个环境变量由 CI 从 secrets 注入(见 docs/release.md)。
+// 缺任何一项就**不是**正式签名 —— 本地允许回落 debug 签名(自用安装);
+// CI 上则直接失败,绝不产出一个"看起来发布、其实是 debug key"的 APK。
+val keystoreFile = System.getenv("YURIS_KEYSTORE_FILE")?.trim()?.takeIf { it.isNotEmpty() }
+val keystorePassword = System.getenv("YURIS_KEYSTORE_PASSWORD")?.trim()
+val keyAlias = System.getenv("YURIS_KEY_ALIAS")?.trim()?.takeIf { it.isNotEmpty() }
+val keyPassword = System.getenv("YURIS_KEY_PASSWORD")?.trim()
+val hasReleaseSigning = keystoreFile != null &&
+    !keystorePassword.isNullOrEmpty() &&
+    keyAlias != null &&
+    !keyPassword.isNullOrEmpty()
+
+if (!hasReleaseSigning && System.getenv("GITHUB_ACTIONS") == "true") {
+    throw GradleException(
+        "CI 构建缺少发布签名: 需要 YURIS_KEYSTORE_FILE / YURIS_KEYSTORE_PASSWORD / " +
+            "YURIS_KEY_ALIAS / YURIS_KEY_PASSWORD 四个环境变量(由 secrets 注入)。" +
+            "拒绝用 debug key 产出 Release APK。",
+    )
+}
+
 android {
     namespace = "org.yuris.kernel"
     compileSdk = 36
@@ -10,8 +41,8 @@ android {
         applicationId = "org.yuris.kernel"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = injectedVersionCode ?: 1
+        versionName = injectedVersionName ?: "0.1.0"
         // 只打 64 位(架构文档 §2.5.9 开放问题 8:armeabi-v7a 待定):
         // arm64-v8a = 真机目标;x86_64 = 本机模拟器验证用。
         // ABI 过滤:默认两个都打;构建模拟器验证包时用 -PabiFilter=x86_64
@@ -26,12 +57,26 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(keystoreFile!!)
+                storePassword = keystorePassword
+                keyAlias = keyAlias
+                keyPassword = keyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // 未配 keystore 时用 debug 签名,保证可直接安装调试(自用分发)。
-            // 正式发布时在 signingConfigs 里换自己的 keystore。
-            signingConfig = signingConfigs.getByName("debug")
+            // 有 secrets ⇒ 正式签名;没有 ⇒ debug 签名(仅本机自用调试)。
+            signingConfig = if (hasReleaseSigning) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 
@@ -51,6 +96,13 @@ android {
         // 内置的 so 已 strip 过;不重复压缩,启动更快。
         jniLibs.useLegacyPackaging = false
     }
+}
+
+// 配置期打印一次签名来源,构建日志里能直接看出这个 APK 是不是正式签的。
+if (hasReleaseSigning) {
+    logger.lifecycle("APK 签名: release keystore ($keystoreFile, alias=$keyAlias)")
+} else {
+    logger.lifecycle("APK 签名: debug(本地调试用,不可用于分发)")
 }
 
 // 只用最通用的官方库:AppCompat(主题/控件/对话框)+ core(动画与兼容工具)。
