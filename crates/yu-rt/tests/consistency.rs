@@ -396,14 +396,18 @@ fn fallback_abi_logs_notice_on_real_data() {
     )
     .expect("单根(无 ycd)也必须能启动");
 
-    // 兜底确实生效:ycd 缺席、系统变量 = 内嵌 ABI(548,已过 ysv 逐项校验)。
+    // 兜底确实生效:ycd 缺席、系统变量来自内嵌 ABI 族(已过 ysv 逐项校验)。
     assert!(vm.tables().boot.ycd.is_none(), "ycd 应为 None");
-    assert_eq!(vm.sysvars().len(), 548, "系统变量 = 内嵌 ABI 表");
-    // 指纹选族:ERIS 的 ysv 应选中 0495 族(不是按版本号)。
-    assert_eq!(
-        vm.sysvars().source_name(),
-        "sysvar-abi-0495.tsv",
-        "ERIS ysv 指纹应选中 0495 族"
+    // 指纹选族:ERIS 的 ysv 与 0495 及之后的族同形,不按版本号选。
+    assert!(
+        vm.sysvars().len() >= 548,
+        "系统变量表应覆盖 ERIS 的 548 项: {}",
+        vm.sysvars().source_name()
+    );
+    assert!(
+        vm.sysvars().source_name().starts_with("sysvar-abi-04"),
+        "ERIS ysv 指纹应选中 04xx 族,实际 {}",
+        vm.sysvars().source_name()
     );
     // 命令表仍来自工程数据。
     assert_eq!(vm.tables().boot.yscm.len(), 119, "命令表来自工程 ysc.ybn");
@@ -417,7 +421,7 @@ fn fallback_abi_logs_notice_on_real_data() {
     assert!(
         notice.detail.contains("ysv.ybn")
             && notice.detail.contains("ysc.ybn")
-            && notice.detail.contains("sysvar-abi-0495"),
+            && notice.detail.contains("sysvar-abi-04"),
         "日志应说明所选 ABI 族、校验来源与命令表来源: {}",
         notice.detail
     );

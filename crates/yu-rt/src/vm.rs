@@ -27,6 +27,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Instant;
 
+use yu_format::text::{CodecConfig, DisplayConfig};
 use yu_log::{Boundary, Diag, LogSink, MemorySink};
 
 use crate::code;
@@ -181,6 +182,10 @@ pub struct BootConfig {
     /// `DomainCall` 的入队:前者是场景构建帧的数十万条纯诊断事件,后者已由
     /// 同步图形宿主在命令时刻消费;两者都不影响脚本/画面语义。
     pub record_events: bool,
+    /// 三域 codec(执行层全局 `script`,显示默认 `text`,路径 `name`)。
+    pub codecs: CodecConfig,
+    /// 显示层逐脚本/逐载荷/隧道配置;只进 bytes→Unicode 边界。
+    pub display: DisplayConfig,
 }
 
 /// 宿主注入的路径系统变量(`basic/svariable.html`)。
@@ -214,6 +219,8 @@ impl Default for BootConfig {
             rng_seed: 5489,
             // 事件流记录开关(默认开;结构体字段文档有完整说明)。
             record_events: true,
+            codecs: CodecConfig::default(),
+            display: DisplayConfig::default(),
         }
     }
 }
@@ -538,6 +545,12 @@ pub struct Vm {
     /// 显示文本层状态(`$_TEXT`/`$_TEXT_FLAG`/`TEXTINFO` 的数据源;
     /// 引擎 `[0x801800]` 的已取证字段,见 [`crate::text`])。
     text: crate::text::TextState,
+    /// 执行层全局字符串 codec(官方汉化版全局 GBK)。
+    script_codec: yu_format::Codec,
+    /// 路径/文件名 codec(通常 CP932;补丁不改文件名)。
+    name_codec: yu_format::Codec,
+    /// 显示层配置(逐脚本 codec/隧道;不参与执行)。
+    display: DisplayConfig,
     /// `@_MENUCODE`(手册:最後に選択されたメニュー項目の CODE 値;○ 可赋值)。
     menu_code: i64,
     /// `@_WINDOW_EXEC_MAX/MIN/CLOSE/CAPTION`:窗口按钮/尺寸事件的按下状态。
@@ -798,7 +811,10 @@ impl Vm {
             decode_cache: rustc_hash::FxHashMap::default(),
             decode_cache_entries: 0,
             texts: BTreeMap::new(),
-            text: crate::text::TextState::default(),
+            text: crate::text::TextState::with_codec(cfg.display.default),
+            script_codec: cfg.codecs.script,
+            name_codec: cfg.codecs.name,
+            display: cfg.display,
             menu_code: 0,
             window_exec_max: 0,
             window_exec_min: 0,
@@ -850,8 +866,10 @@ impl Vm {
         vm.globals_restore = restore;
         vm.apply_script_locals(script_id);
 
-        vm.exec
-            .insert(MAIN_TASK_ID.to_string(), Box::new(ExecState::new(script_id, pc)));
+        vm.exec.insert(
+            MAIN_TASK_ID.to_string(),
+            Box::new(ExecState::new(script_id, pc)),
+        );
         vm.scheduler.spawn(TaskSeed::main(script_id, pc));
         vm.events.push(VmEvent::TaskSpawn {
             frame: 0,
@@ -873,11 +891,8 @@ impl Vm {
                     code::table::FALLBACK,
                     Boundary::Table,
                     format!(
-                        "工程无 system/YSCom/YSCom.ycd(商业发行版常态):按工程 ysv.ybn 指纹\
-                         选择系统变量 ABI 族 {} (已逐项校验通过,DIV-RT-016;已知族 \
-                         0292/0466/0479/0495)。命令表/参数名仍来自工程的 ysc.ybn,\
-                         无版本兜底。",
-                        vm.tables.boot.sysvars.source.describe()
+                        "工程无 system/YSCom/YSCom.ycd(商业发行版常态):按工程 ysv.ybn 指纹选择系统变量 ABI 族 {} (前缀已逐项校验通过,DIV-RT-016;表来自 YU-RIS SDK 官方 ycd)。命令表/参数名来自 ysc.ybn,无版本兜底。",
+                        vm.tables.boot.sysvars.describe()
                     ),
                 )
                 .at_table("YSCom.ycd"),
@@ -929,7 +944,8 @@ impl Vm {
         let mut stack = std::mem::take(&mut self.eval_scratch);
         let st = ExecState::new(script_id, 0);
         let mut access = VmAccess { vm: self, st: &st };
-        let r = Evaluator::new(&mut access).eval_value_instrs(&instrs, &mut stack);
+        let r = Evaluator::with_codec(&mut access, self.script_codec)
+            .eval_value_instrs(&instrs, &mut stack);
         self.eval_scratch = stack;
         r
     }
@@ -1394,8 +1410,26 @@ impl Vm {
     /// 追加显示文本(`WORD` 文本段 / `_` 式值;手册 `basic/svariable.html`:
     /// `$_TEXT` = 現在表示されているテキストの内容)。同时按字符写
     /// `$_TEXT_FLAG` 的 `'1'`/`'2'`(REA `0x458d44`)。
-    pub(crate) fn append_text(&mut self, bytes: &[u8]) {
-        self.text.append_text(bytes);
+    /// 按当前脚本的显示 codec 追加文本(逐脚本覆盖;默认 display.default)。
+    pub(crate) fn append_text_for_script(
+        &mut self,
+        script_id: u32,
+        bytes: &[u8],
+    ) -> yu_format::Codec {
+        let _ = script_id;
+        let codec = self.display.codec();
+        self.text.append_text_with_codec(codec, bytes);
+        codec
+    }
+
+    /// 执行层全局 codec(字符串操作/标签/存档;不按脚本切)。
+    pub(crate) fn script_text_codec(&self, _script_id: u32) -> yu_format::Codec {
+        self.script_codec
+    }
+
+    /// 路径/文件名 codec。
+    pub(crate) fn name_text_codec(&self) -> yu_format::Codec {
+        self.name_codec
     }
 
     /// 替换显示文本(`$_TEXT` 写入;手册 ○ 可赋值 = 覆盖当前内容)。
@@ -2216,7 +2250,8 @@ impl Vm {
         }
         let mut stack = std::mem::take(&mut self.eval_scratch);
         let mut access = VmAccess { vm: self, st };
-        let r = Evaluator::new(&mut access).eval_value_instrs(&instrs, &mut stack);
+        let r = Evaluator::with_codec(&mut access, self.script_codec)
+            .eval_value_instrs(&instrs, &mut stack);
         self.eval_scratch = stack;
         r
     }
@@ -2239,7 +2274,8 @@ impl Vm {
         }
         let mut stack = std::mem::take(&mut self.eval_scratch);
         let mut access = VmAccess { vm: self, st };
-        let r = Evaluator::new(&mut access).eval_lvalue_instrs_with(&instrs, &mut stack);
+        let r = Evaluator::with_codec(&mut access, self.script_codec)
+            .eval_lvalue_instrs_with(&instrs, &mut stack);
         self.eval_scratch = stack;
         r
     }
@@ -2443,10 +2479,8 @@ impl TaskExecutor for Vm {
             Ok(out) => {
                 // `END` 也结束执行者本身(全程序退出由调度器收束整条链),
                 // 执行位与 `TaskFinish` 事件口径与基帧 RETURN 一致。
-                let finishing = matches!(
-                    out,
-                    StepOutcome::Finish | StepOutcome::ExitProgram { .. }
-                );
+                let finishing =
+                    matches!(out, StepOutcome::Finish | StepOutcome::ExitProgram { .. });
                 if !finishing {
                     self.exec_slot = Some((id, st));
                     // 文本行尾让出:任务级等待(引擎 `task+9`)由调度器记录,

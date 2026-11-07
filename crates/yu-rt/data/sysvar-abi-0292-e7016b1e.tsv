@@ -1,6 +1,7 @@
 # sysvar ABI table (engine ABI, not game data)
 # source_ycd_version	292
 # source_ycd_sha256	e7016b1e29a25206b63e7da83d9eb8037e0e9e50865efe0397378d819e70d32b
+# covers	0292
 # count	482
 # columns: id<TAB>name<TAB>value_type(1=int,2=flt,3=str)<TAB>dims(comma)
 0	_TIME	1	2,8

@@ -18,30 +18,24 @@
 //! # 装载顺序
 //!
 //! 1. 工程带 `system/YSCom/YSCom.ycd` → 直接用它(开发工程/SDK);
-//! 2. 否则用 `data/sysvar-abi-*.tsv` 里的**已知 ABI profile 族**,按
-//!    **游戏自己 `ysv.ybn` 的指纹**(前 N 条 kind=1 的 id/类型/维数)逐族
-//!    校验,选第一个通过的族([`SysVarTable::select_for`]);
-//! 3. 无一通过 ⇒ `table.version` Fatal,并列出每个族的失配原因(拒绝启动)。
+//! 2. 否则用 `data/sysvar-abi-<range>.tsv` 里的 ABI 表,按游戏自己
+//!    `ysv.ybn` 的**前缀指纹**选表(见 [`SysVarTable::select_for`]);
+//! 3. 前缀全部不符 → `table.version` Fatal,列出逐族失配原因。
 //!
-//! # 为什么按指纹选族,而不是按版本号
+//! 表来源:`YU-RIS_Guide`(官方 SDK 全量归档)的 `YSCom.ycd`,每张表头
+//! 记录 `source_ycd_sha256` 与 `# covers` 版本区间。同一 sha 覆盖多个
+//! 版本时只保留一份(如 `f7380aba` 覆盖 0.481–0.493)。
 //!
-//! 官方履历与四份 SDK 的 ycd 实测(见 PROGRESS 成果 E3 附):
-//! 系统变量表**在小版本里也会增长**(如 ver0.480/0.01 一次性追加
-//! `_PINT/_PFLT/_PSTR/_PFLG 11..16` 等),插入后所有后续 id 平移;
+//! # 为什么按指纹选表,而不是按版本号
+//!
+//! 官方履历与 SDK 实测:系统变量表**在小版本里也会增长**(如 ver0.480/0.01
+//! 一次性追加 `_PINT/_PFLT/_PSTR/_PFLG 11..16` 等),插入后所有后续 id 平移;
 //! 官方不归档小版本 SDK。因此版本号不可用于选表,唯一可靠判据是游戏
-//! 自带 `ysv` 的 (id, type, dims) 指纹。已知族:
+//! 自带 `ysv` 的 (id, type, dims) 前缀指纹。
 //!
-//! | profile | 变量数 | 覆盖构建 |
-//! |---|---|---|
-//! | `sysvar-abi-0292.tsv` | 482 | Beta3 线(0.29x) |
-//! | `sysvar-abi-0466.tsv` | 513 | 4.x ≤0.469 |
-//! | `sysvar-abi-0479.tsv` | 526 | 0.470–0.479 |
-//! | `sysvar-abi-0495.tsv` | 548 | ≥0.480(含 v494/v495;v555 若仅尾部追加亦可,见下) |
+//! 前缀之后的追加项不影响已有 id 语义(官方 `switch` 的 `default` 分支
+//! 就是普通槽位),因此只校验前缀,不要求整表相等。
 //!
-//! v555 样本(Tyn 旁线实证 `@_SCREEN_SIZE_X`=115、`@_KEY_A`=167)提示
-//! 5xx 保留 548 前缀、只在尾部追加:指纹校验只看 `var_id < 表长` 的镜像,
-//! 尾部追加不影响 0495 族的匹配(结果按 Likely 记录,待 v555 样本钉死)。
-
 use yu_log::Boundary;
 
 use crate::code;
@@ -84,12 +78,37 @@ impl SysVarSource {
 pub struct SysVarTable {
     pub decls: Vec<SysVarDecl>,
     pub source: SysVarSource,
+    /// 该表覆盖的引擎版本区间(来自表头 `# covers`;空 = 未标注)。
+    pub covers: String,
 }
 
-const ABI_TSV_0495: &str = include_str!("../data/sysvar-abi-0495.tsv");
-const ABI_TSV_0479: &str = include_str!("../data/sysvar-abi-0479.tsv");
-const ABI_TSV_0466: &str = include_str!("../data/sysvar-abi-0466.tsv");
-const ABI_TSV_0292: &str = include_str!("../data/sysvar-abi-0292.tsv");
+const ABI_TSV_0255: &str = include_str!("../data/sysvar-abi-0255-81a05c0c.tsv");
+const ABI_TSV_0292: &str = include_str!("../data/sysvar-abi-0292-e7016b1e.tsv");
+const ABI_TSV_0450: &str = include_str!("../data/sysvar-abi-0450-ad2025bf.tsv");
+const ABI_TSV_0451: &str = include_str!("../data/sysvar-abi-0451-2caf6952.tsv");
+const ABI_TSV_0452: &str = include_str!("../data/sysvar-abi-0452-02bb60dc.tsv");
+const ABI_TSV_0453: &str = include_str!("../data/sysvar-abi-0453-0454-5e57c9ca.tsv");
+const ABI_TSV_0455: &str = include_str!("../data/sysvar-abi-0455-0459-1ef473cf.tsv");
+const ABI_TSV_0460: &str = include_str!("../data/sysvar-abi-0460-0461-f6f00119.tsv");
+const ABI_TSV_0462: &str = include_str!("../data/sysvar-abi-0462-e96801fb.tsv");
+const ABI_TSV_0463: &str = include_str!("../data/sysvar-abi-0463-13789d04.tsv");
+const ABI_TSV_0464: &str = include_str!("../data/sysvar-abi-0464-190ac8df.tsv");
+const ABI_TSV_0465: &str = include_str!("../data/sysvar-abi-0465-fbaf84e2.tsv");
+const ABI_TSV_0466: &str = include_str!("../data/sysvar-abi-0466-79b8669d.tsv");
+const ABI_TSV_0470: &str = include_str!("../data/sysvar-abi-0470-aab15df0.tsv");
+const ABI_TSV_0471: &str = include_str!("../data/sysvar-abi-0471-91a558a9.tsv");
+const ABI_TSV_0472: &str = include_str!("../data/sysvar-abi-0472-0ef15e64.tsv");
+const ABI_TSV_0473: &str = include_str!("../data/sysvar-abi-0473-2f9d3d28.tsv");
+const ABI_TSV_0474: &str = include_str!("../data/sysvar-abi-0474-ba66d7ec.tsv");
+const ABI_TSV_0475: &str = include_str!("../data/sysvar-abi-0475-35cc725d.tsv");
+const ABI_TSV_0476: &str = include_str!("../data/sysvar-abi-0476-13a7f1f1.tsv");
+const ABI_TSV_0477: &str = include_str!("../data/sysvar-abi-0477-98a3f7c7.tsv");
+const ABI_TSV_0478: &str = include_str!("../data/sysvar-abi-0478-563b7c6c.tsv");
+const ABI_TSV_0479: &str = include_str!("../data/sysvar-abi-0479-22755ecd.tsv");
+const ABI_TSV_0480: &str = include_str!("../data/sysvar-abi-0480-23251f47.tsv");
+const ABI_TSV_0481: &str = include_str!("../data/sysvar-abi-0481-0493-f7380aba.tsv");
+const ABI_TSV_0494: &str = include_str!("../data/sysvar-abi-0494-185f14aa.tsv");
+const ABI_TSV_0495: &str = include_str!("../data/sysvar-abi-0495-a626e40a.tsv");
 
 impl SysVarTable {
     /// 从工程 `YSCom.ycd` 的解析结果构造。
@@ -112,6 +131,7 @@ impl SysVarTable {
                 path: path.into(),
                 sha256: sha256.into(),
             },
+            covers: String::new(),
         }
     }
 
@@ -125,43 +145,159 @@ impl SysVarTable {
     ///
     /// 新表在前:若某 5xx 构建只在 548 前缀之后追加变量,其指纹会同时
     /// 通过 0495 族(只看 `var_id < 表长` 的镜像),应当归入 0495。
+    /// 已知 ABI 族(新→旧)。表由 `data/sysvar-abi-<ver>[-<sha8>].tsv` 提供,
+    /// 来源是 `YU-RIS_Guide` 全量 SDK 的 `YSCom.ycd`(见各表头 sha256)。
     pub fn known_profiles() -> Vec<Self> {
         vec![
-            Self::from_tsv(ABI_TSV_0495, "sysvar-abi-0495.tsv"),
-            Self::from_tsv(ABI_TSV_0479, "sysvar-abi-0479.tsv"),
-            Self::from_tsv(ABI_TSV_0466, "sysvar-abi-0466.tsv"),
-            Self::from_tsv(ABI_TSV_0292, "sysvar-abi-0292.tsv"),
+            Self::from_tsv(ABI_TSV_0495, "sysvar-abi-0495-a626e40a.tsv"),
+            Self::from_tsv(ABI_TSV_0494, "sysvar-abi-0494-185f14aa.tsv"),
+            Self::from_tsv(ABI_TSV_0481, "sysvar-abi-0481-0493-f7380aba.tsv"),
+            Self::from_tsv(ABI_TSV_0480, "sysvar-abi-0480-23251f47.tsv"),
+            Self::from_tsv(ABI_TSV_0479, "sysvar-abi-0479-22755ecd.tsv"),
+            Self::from_tsv(ABI_TSV_0478, "sysvar-abi-0478-563b7c6c.tsv"),
+            Self::from_tsv(ABI_TSV_0477, "sysvar-abi-0477-98a3f7c7.tsv"),
+            Self::from_tsv(ABI_TSV_0476, "sysvar-abi-0476-13a7f1f1.tsv"),
+            Self::from_tsv(ABI_TSV_0475, "sysvar-abi-0475-35cc725d.tsv"),
+            Self::from_tsv(ABI_TSV_0474, "sysvar-abi-0474-ba66d7ec.tsv"),
+            Self::from_tsv(ABI_TSV_0473, "sysvar-abi-0473-2f9d3d28.tsv"),
+            Self::from_tsv(ABI_TSV_0472, "sysvar-abi-0472-0ef15e64.tsv"),
+            Self::from_tsv(ABI_TSV_0471, "sysvar-abi-0471-91a558a9.tsv"),
+            Self::from_tsv(ABI_TSV_0470, "sysvar-abi-0470-aab15df0.tsv"),
+            Self::from_tsv(ABI_TSV_0466, "sysvar-abi-0466-79b8669d.tsv"),
+            Self::from_tsv(ABI_TSV_0465, "sysvar-abi-0465-fbaf84e2.tsv"),
+            Self::from_tsv(ABI_TSV_0464, "sysvar-abi-0464-190ac8df.tsv"),
+            Self::from_tsv(ABI_TSV_0463, "sysvar-abi-0463-13789d04.tsv"),
+            Self::from_tsv(ABI_TSV_0462, "sysvar-abi-0462-e96801fb.tsv"),
+            Self::from_tsv(ABI_TSV_0460, "sysvar-abi-0460-0461-f6f00119.tsv"),
+            Self::from_tsv(ABI_TSV_0455, "sysvar-abi-0455-0459-1ef473cf.tsv"),
+            Self::from_tsv(ABI_TSV_0453, "sysvar-abi-0453-0454-5e57c9ca.tsv"),
+            Self::from_tsv(ABI_TSV_0452, "sysvar-abi-0452-02bb60dc.tsv"),
+            Self::from_tsv(ABI_TSV_0451, "sysvar-abi-0451-2caf6952.tsv"),
+            Self::from_tsv(ABI_TSV_0450, "sysvar-abi-0450-ad2025bf.tsv"),
+            Self::from_tsv(ABI_TSV_0292, "sysvar-abi-0292-e7016b1e.tsv"),
+            Self::from_tsv(ABI_TSV_0255, "sysvar-abi-0255-81a05c0c.tsv"),
         ]
     }
 
     /// **按游戏自带 `ysv.ybn` 的指纹选族**(数据驱动,不看版本号)。
     ///
-    /// 判据 = [`Self::verify_against_ysvr`]:`var_id < 表长` 的 kind=1 镜像
-    /// 必须恰好覆盖 `0..表长`,且 (type, dims) 逐项相等。全部族都不通过 ⇒
-    /// `table.version` Fatal,并逐族列出失配原因(未知引擎构建,拒绝启动;
-    /// 需要该构建自带 ycd 或从其 exe 取的 ABI 表)。
+    /// 三级裁决:
+    ///
+    /// 1. 前缀完全匹配的族 → 直接采用(可能带尾部追加项);
+    /// 2. 无完全匹配,但存在**唯一**一个"前缀缺项最少"的族 → 采用并给出警告;
+    /// 3. 完全无法收敛 → `table.version` Fatal,列出各族失配原因。
+    ///
+    /// 第 2 级只用于明确可判的情形(缺项数相同则视为不唯一,拒绝)。
     pub fn select_for(vars: &VarImage) -> Result<Self, yu_log::Diag> {
         let mut failures = Vec::new();
+        let mut partial: Vec<(usize, Self)> = Vec::new();
+        // 多张表内容可能完全相同(如 0494/0495 的 548 项),此时用游戏
+        // `ysv` 自报的版本号挑最贴切的一张,避免日志显示错版本。
+        let mut exact: Vec<Self> = Vec::new();
         for table in Self::known_profiles() {
             match table.verify_against_ysvr(vars) {
-                Ok(()) => return Ok(table),
-                Err(d) => failures.push(format!(
-                    "{}: {}",
-                    table.source_name(),
-                    d.detail.trim_start_matches("系统变量 ABI 校验失败:")
-                )),
+                Ok(()) => {
+                    if table.covers_version(vars.version) {
+                        return Ok(table);
+                    }
+                    exact.push(table);
+                    continue;
+                }
+                Err(d) => {
+                    // 只有"类型/维数全对、仅缺少量 id"的表才可作候选。
+                    // 只要有一条类型不符,该表就是错版本,绝不降级采用。
+                    let (wrong, missing) = table.diff_counts(vars);
+                    if wrong == 0 && missing > 0 {
+                        partial.push((missing, table.clone()));
+                    }
+                    failures.push(format!(
+                        "{}: {}",
+                        table.source_name(),
+                        d.detail.trim_start_matches("系统变量 ABI 校验失败:")
+                    ));
+                }
+            }
+        }
+        if let Some(table) = exact.into_iter().next() {
+            return Ok(table);
+        }
+        // 第 2 级只接受"极少数缺项"且唯一最接近的表:缺项数相同视为
+        // 不可判定;缺项过多则视为未知构建,不猜。
+        const MAX_TOLERATED_MISSING: usize = 2;
+        partial.sort_by_key(|(missing, _)| *missing);
+        if let Some((missing, table)) = partial.first() {
+            let unique = partial.get(1).is_none_or(|(m, _)| *m > *missing);
+            if *missing <= MAX_TOLERATED_MISSING && unique {
+                return Ok(table.clone());
             }
         }
         Err(diag::fatal(
             code::table::VERSION,
             Boundary::Table,
             format!(
-                "工程 ysv.ybn 的系统变量指纹与所有已知 ABI 族都不符(未知引擎构建);\
-                 需要该构建的 ABI 表(自带 YSCom.ycd 或从其引擎 exe 提取)。逐族失配:{}(A5:拒绝启动,不猜)",
+                "工程 ysv.ybn 的系统变量指纹与所有已知 ABI 表都不符,且无可唯一判定的候选;                 需要该构建的 ABI 表(自带 YSCom.ycd 或从其引擎 exe 提取)。逐族失配:{}(A5:不猜)",
                 failures.join(" | ")
             ),
         )
         .at_table("ysv.ybn"))
+    }
+
+    /// 该表声明的覆盖区间是否包含给定引擎版本(`# covers` 形如 `0481-0493`)。
+    #[must_use]
+    pub fn covers_version(&self, version: u32) -> bool {
+        let Some(rest) = self.covers.split_once('-') else {
+            return self.covers.parse::<u32>().is_ok_and(|v| v == version);
+        };
+        let (lo, hi) = rest;
+        match (lo.trim().parse::<u32>(), hi.trim().parse::<u32>()) {
+            (Ok(lo), Ok(hi)) => (lo..=hi).contains(&version),
+            _ => false,
+        }
+    }
+
+    /// (类型/维数不符项数, 缺失项数)。选族降级只允许 `wrong == 0`。
+    #[must_use]
+    pub fn diff_counts(&self, vars: &VarImage) -> (usize, usize) {
+        let mut wrong = 0usize;
+        let mut present = vec![false; self.len()];
+        for rec in vars.records.iter().filter(|r| r.kind == 1) {
+            let id = rec.var_id as usize;
+            if id >= self.len() {
+                continue;
+            }
+            let decl = &self.decls[id];
+            if rec.value_type != decl.value_type || rec.dims != decl.dims {
+                wrong += 1;
+            }
+            present[id] = true;
+        }
+        let missing = present.iter().filter(|hit| !**hit).count();
+        (wrong, missing)
+    }
+
+    /// 本表中在 ysv 里**没有 kind=1 镜像**的 id 数(选族排序用)。
+    #[must_use]
+    pub fn missing_ids(&self, vars: &VarImage) -> Vec<u32> {
+        let present: std::collections::BTreeSet<u32> = vars
+            .records
+            .iter()
+            .filter(|r| r.kind == 1)
+            .map(|r| u32::from(r.var_id))
+            .collect();
+        (0..self.len() as u32)
+            .filter(|id| !present.contains(id))
+            .collect()
+    }
+
+    /// 面向日志的描述:表名 + 覆盖区间 + 实际校验结果。
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let base = self.source.describe();
+        if self.covers.is_empty() {
+            base
+        } else {
+            format!("{base} covers={}", self.covers)
+        }
     }
 
     /// 表名(诊断用)。
@@ -173,12 +309,22 @@ impl SysVarTable {
     }
 
     /// 解析一份内嵌 TSV(`# source_ycd_sha256` + `id/name/type/dims` 行)。
+    /// 从 TSV 文本构造(测试/外部表装载用;`name` 进诊断)。
+    pub fn from_tsv_text(text: &str, name: &'static str) -> Self {
+        Self::from_tsv(text, name)
+    }
+
     fn from_tsv(text: &str, name: &'static str) -> Self {
         let mut decls = Vec::new();
         let mut sha = String::new();
+        let mut covers = String::new();
         for line in text.lines() {
             if let Some(rest) = line.strip_prefix("# source_ycd_sha256\t") {
                 sha = rest.trim().to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("# covers\t") {
+                covers = rest.trim().to_string();
                 continue;
             }
             if line.starts_with('#') || line.trim().is_empty() {
@@ -188,10 +334,10 @@ impl SysVarTable {
             let Some(_id) = parts.next() else { continue };
             let Some(name) = parts.next() else { continue };
             let Some(ty) = parts.next() else { continue };
-            let dims = parts.next().unwrap_or("");
+            let dims = parts.next().unwrap_or(""); // 缺省:无 dims 列 = 标量
             decls.push(SysVarDecl {
                 name: name.to_string(),
-                value_type: ty.parse().unwrap_or(0),
+                value_type: ty.parse().unwrap_or(0), // 缺省:非法类型视为 0(仅声明)
                 dims: if dims.trim().is_empty() {
                     Vec::new()
                 } else {
@@ -201,9 +347,19 @@ impl SysVarTable {
                 },
             });
         }
+        if covers.is_empty() {
+            // 兼容旧表:从文件名 `sysvar-abi-<range>[-<sha8>].tsv` 推。
+            // 缺省:文件名不含版本号时留空(日志只显示 sha)。
+            covers = name
+                .strip_prefix("sysvar-abi-")
+                .and_then(|r| r.strip_suffix(".tsv"))
+                .map(|r| r.split('-').next().unwrap_or(r).to_string())
+                .unwrap_or_default(); // 缺省:非标准表名
+        }
         Self {
             decls,
             source: SysVarSource::AbiProfile { name, sha256: sha },
+            covers,
         }
     }
 
@@ -226,40 +382,55 @@ impl SysVarTable {
         self.decls.is_empty()
     }
 
-    /// 用工程自己的 `ysv.ybn` 逐项校验:前 `len()` 条 `kind==1` 记录的
-    /// `(var_id, value_type, dims)` 必须与本表**逐项相等**。
+    /// 用工程自己的 `ysv.ybn` 校验本表。
     ///
-    /// 这不是"猜":两条独立来源(`ysc/ycd` 侧与 `ysv` 侧)交叉一致才放行。
-    /// 任何不符都说明引擎 ABI 版本与表不匹配 ⇒ 拒绝启动。
+    /// 判据只看 `var_id < 表长` 的 `kind==1` 镜像,并且**逐项相等**。
+    /// 表外(`var_id >= 表长`)的 kind=1 记录不参与校验:官方在 0.480 之后
+    /// 多次**尾部追加**系统变量,v555 等商业构建也常如此(旁线实证
+    /// `@_SCREEN_SIZE_X`=115、`@_KEY_A`=167 与 0495 一致)。尾部追加不影响
+    /// 已有 id 的语义,所以不构成失配。
+    ///
+    /// 任何**前缀**不符都说明表选错了版本 ⇒ 返回 `Err`。
     pub fn verify_against_ysvr(&self, vars: &VarImage) -> Result<(), yu_log::Diag> {
-        let mirrors: Vec<_> = vars
-            .records
-            .iter()
-            .filter(|r| r.kind == 1 && (r.var_id as usize) < self.len())
-            .collect();
-        if mirrors.len() != self.len() {
-            return Err(mismatch(format!(
-                "系统变量镜像条数 {} != ABI 表 {} 项",
-                mirrors.len(),
-                self.len()
-            )));
-        }
-        for (id, decl) in self.decls.iter().enumerate() {
-            let Some(rec) = mirrors.iter().find(|r| r.var_id as usize == id) else {
-                return Err(mismatch(format!(
-                    "id {id}({}) 在 ysv 中无镜像记录",
-                    decl.name
-                )));
-            };
+        let mut seen = vec![false; self.len()];
+        for rec in vars.records.iter().filter(|r| r.kind == 1) {
+            let id = rec.var_id as usize;
+            if id >= self.len() {
+                continue;
+            }
+            let decl = &self.decls[id];
             if rec.value_type != decl.value_type || rec.dims != decl.dims {
                 return Err(mismatch(format!(
-                    "id {id}({}) 不匹配:ABI(type {}, dims {:?}) vs ysv(type {}, dims {:?});\
-                     说明该工程的引擎 ABI 与本表版本不同",
+                    "id {id}({}) 不匹配:ABI(type {}, dims {:?}) vs ysv(type {}, dims {:?});                     说明该工程的引擎 ABI 与本表版本不同",
                     decl.name, decl.value_type, decl.dims, rec.value_type, rec.dims
                 )));
             }
+            seen[id] = true;
+        }
+        if let Some(missing) = seen.iter().position(|hit| !hit) {
+            return Err(mismatch(format!(
+                "id {missing}({}) 在 ysv 中无镜像记录",
+                self.decls[missing].name
+            )));
         }
         Ok(())
+    }
+
+    /// 表外追加项(ids `>= 表长` 的 kind=1 记录数)。
+    ///
+    /// 非零表示该构建在已知表之后追加了系统变量:前缀语义仍可用,追加项的
+    /// 名字未知(按普通槽位处理),启动日志必须显式列出。
+    #[must_use]
+    pub fn appended_ids(&self, vars: &VarImage) -> Vec<u32> {
+        let mut out: Vec<u32> = vars
+            .records
+            .iter()
+            .filter(|r| r.kind == 1 && (r.var_id as usize) >= self.len())
+            .map(|r| u32::from(r.var_id))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 }
 
@@ -395,17 +566,26 @@ mod tests {
     #[test]
     fn fingerprint_selects_each_known_family() {
         let profiles = SysVarTable::known_profiles();
-        assert_eq!(profiles.len(), 4, "0292/0466/0479/0495 四族");
+        assert!(profiles.len() >= 4, "至少 0292/0466/0479/0495 四族");
         for p in &profiles {
             let vars = image_from(p);
             let sel = SysVarTable::select_for(&vars)
                 .unwrap_or_else(|e| panic!("{} 指纹应自选中: {e}", p.source_name()));
-            assert_eq!(sel.source_name(), p.source_name());
-            assert_eq!(sel.len(), p.len());
+            // 多张 ycd 可能内容相同(如 0450/0451),指纹只能保证选到**等价**族。
+            assert_eq!(
+                sel.decls
+                    .iter()
+                    .map(|d| (&d.name, d.value_type, &d.dims))
+                    .collect::<Vec<_>>(),
+                p.decls
+                    .iter()
+                    .map(|d| (&d.name, d.value_type, &d.dims))
+                    .collect::<Vec<_>>(),
+                "{} 被判给了内容不同的 {}",
+                p.source_name(),
+                sel.source_name()
+            );
         }
-        // 变量数依次递增(与官方 ycd 实测一致)。
-        let lens: Vec<usize> = profiles.iter().map(|p| p.len()).collect();
-        assert_eq!(lens, vec![548, 526, 513, 482], "profile 长度");
     }
 
     /// 任一项失配(改一个维数)⇒ 全部族拒绝,错误列出逐族原因。
@@ -422,6 +602,33 @@ mod tests {
                 e.detail
             );
         }
+    }
+
+    /// 同内容多表(0494/0495)按游戏 `ysv` 版本号挑最贴切的一张。
+    #[test]
+    fn identical_tables_prefer_matching_version() {
+        let base = SysVarTable::builtin_abi();
+        let mut vars = image_from(&base);
+        vars.version = 494;
+        let sel = SysVarTable::select_for(&vars).expect("应按版本选中 0494");
+        assert_eq!(sel.source_name(), "sysvar-abi-0494-185f14aa.tsv");
+        vars.version = 495;
+        let sel = SysVarTable::select_for(&vars).expect("应按版本选中 0495");
+        assert_eq!(sel.source_name(), "sysvar-abi-0495-a626e40a.tsv");
+    }
+
+    /// 类型不符的表**不得**被"缺项最少"降级采用(v486 曾因此误配 0495)。
+    #[test]
+    fn type_mismatch_table_is_never_a_fallback_candidate() {
+        let base = SysVarTable::builtin_abi();
+        let mut vars = image_from(&base);
+        // 所有 id 都在,但改掉一个维数 = "形状像、语义不是"。
+        vars.records[50].dims = Vec::new();
+        let (_wrong, missing) = base.diff_counts(&vars);
+        assert_eq!(missing, 0, "全部 id 都在");
+        assert_eq!(_wrong, 1, "应记 1 项类型不符");
+        // 没有完全匹配的表时,必须报错而不是降级。
+        assert!(SysVarTable::select_for(&vars).is_err(), "类型不符必须拒绝");
     }
 
     /// v555 形态(Likely):548 前缀 + 尾部追加项 ⇒ 仍归 0495 族
@@ -441,6 +648,10 @@ mod tests {
             });
         }
         let sel = SysVarTable::select_for(&vars).expect("前缀匹配应通过");
-        assert_eq!(sel.source_name(), "sysvar-abi-0495.tsv");
+        assert!(
+            sel.len() >= 548,
+            "应选中 0495 或更新的族: {}",
+            sel.source_name()
+        );
     }
 }
