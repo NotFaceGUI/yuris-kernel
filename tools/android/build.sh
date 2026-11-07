@@ -72,12 +72,21 @@ clang_of() {
   esac
 }
 
+# Windows 上 NDK 的 `*-clang` 是 shell 脚本,CreateProcess 无法执行
+# (os error 193);Rust 链接器必须用 `.cmd` 包装器。其余平台保持原样。
+CC_SUFFIX=""
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) CC_SUFFIX=".cmd" ;;
+esac
+
 for abi in "${ABIS[@]}"; do
   target="$(target_of "$abi")"
-  cc="$(clang_of "$target")"
+  cc_base="$(clang_of "$target")"
+  cc="${cc_base}${CC_SUFFIX}"
+  cxx="${cc_base}++${CC_SUFFIX}"
   upper="$(echo "$target" | tr '-' '_')"
   export "CC_${upper}=${cc}"
-  export "CXX_${upper}=${cc}++"
+  export "CXX_${upper}=${cxx}"
   export "AR_${upper}=${TOOLCHAIN}/llvm-ar"
   export "CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER=${cc}"
   printf '==> cargo build %s (%s)\n' "$target" "$abi"
@@ -94,7 +103,12 @@ for abi in "${ABIS[@]}"; do
   mkdir -p "$dst"
   cp "$REPO_ROOT/target/$target/release/libyu_host_android.so" "$dst/"
   # oboe 依赖的动态 C++ 运行库必须随 APK 分发。
-  cp "$NDK/sysroot/usr/lib/$target/libc++_shared.so" "$dst/"
+  # r28 起 sysroot 挪进 toolchains/llvm/prebuilt/<host>/;两种布局都兼容。
+  CPP_SHARED="$NDK/sysroot/usr/lib/$target/libc++_shared.so"
+  if [[ ! -f "$CPP_SHARED" ]]; then
+    CPP_SHARED="$TOOLCHAIN/../sysroot/usr/lib/$target/libc++_shared.so"
+  fi
+  cp "$CPP_SHARED" "$dst/"
   "$TOOLCHAIN/llvm-strip" --strip-unneeded "$dst/libyu_host_android.so"
   printf '==> %s: %s\n' "$abi" "$(du -h "$dst/libyu_host_android.so" | cut -f1)"
 done
