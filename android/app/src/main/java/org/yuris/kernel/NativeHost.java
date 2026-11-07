@@ -76,7 +76,13 @@ public final class NativeHost {
     /** 窗口尺寸变化时调用(重建交换链)。 */
     public static native int nativeResizeSurface(int width, int height);
 
-    /** 推进一帧。返回 0 成功 / -1 未初始化 / -2 tick 失败。 */
+    /**
+     * 推进一帧。
+     *
+     * @return {@code 0} 成功继续；{@code 1} 游戏已结束（脚本 END / 主脚本走完
+     *     —— 壳应 {@code finish()} 回到自己的界面）；{@code -1} 未初始化；
+     *     {@code -2} tick 失败。
+     */
     public static native int nativeTick();
 
     /** 当前帧尺寸 {@code [width, height]}；未出帧时为 {@code [0, 0]}。 */
@@ -96,6 +102,32 @@ public final class NativeHost {
 
     /** 诊断摘要（浮层 / logcat 用）。 */
     public static native String nativeStatus();
+
+    /**
+     * 挂起会话：停时钟（恢复后不快进）、静音音频输出。
+     *
+     * <p>在 {@code onPause} 调用。**不做存档 flush** —— 存档在脚本 {@code SAVE}
+     * 命令时刻就已落盘。返回 0 成功 / -1 未初始化；重复调用幂等。
+     */
+    public static native int nativeSuspend();
+
+    /** 恢复会话（{@code onResume}）。与 {@link #nativeSuspend} 配对。 */
+    public static native int nativeResume();
+
+    /**
+     * 会话生命周期代号。
+     *
+     * <ul>
+     *   <li>{@code 0} running（可继续 tick）</li>
+     *   <li>{@code 1} finished（主脚本走完）</li>
+     *   <li>{@code 2} exited（脚本 END）</li>
+     *   <li>{@code 3} exited 且带 RESTART 标志</li>
+     *   <li>{@code -1} 未初始化</li>
+     * </ul>
+     *
+     * <p>与 {@link #nativeTick()} 的返回值同一判据：tick 返回 1 ⇔ 这里非 0/1。
+     */
+    public static native int nativeLifecycle();
 
     /** 构建目标标记，用于核对 so 与壳是否匹配。 */
     public static native String nativeVersion();

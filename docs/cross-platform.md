@@ -28,6 +28,10 @@ L3 宿主                 yu-cli(--mode desktop / headless) · host-android
 | 声音设备 | cpal | cpal(oboe 后端;真机 59.9fps 出声,欠载 0) | 暂不出声(架构决定) |
 | 渲染 | soft / wgpu | soft(第一期) | 待做 |
 | 输入 | winit → `yu-platform-input` | 触摸 → `MOUSE_L` | DOM 事件 → 同层 |
+| 退出信号 | `Engine::lifecycle()` → 关窗 | 同一判据:`nativeTick()==1` ⇒ `finish()` | 同一判据(待接) |
+| 挂起/恢复 | `suspend`/`resume`(窗口最小化) | `onPause`/`onResume` → `nativeSuspend/Resume` | 页面隐藏(待接) |
+| 文本编码 | `--patch`(auto/original/gbk/**big5**/tunnel) | 配置界面选 + `run-config.json` 同键 | 同一份 `PatchKind` |
+| `@_TIME` | 启动时注入系统本地时间 | 同(`host_clock::local_now`) | 恒确定性时钟(无本地时区 API) |
 
 ## 音频交付:为什么安卓要单独一层
 
@@ -70,6 +74,51 @@ mixer 线程(THREAD_PRIORITY_AUDIO)    oboe 回调(实时线程)
 { "audio_rate": 48000 }    // 强制输出采样率(默认 44100,与 OGG 源一致)
 ```
 
+## 宿主参数:唯一取值表(见 DIV-AND-004)
+
+平台差异只允许出现在 **端口实现**;「同一个参数的取值解析」全平台只有一份。
+宿主只负责把值传进来,不再各自 match:
+
+| 参数 | 唯一实现 | 覆盖入口 |
+|---|---|---|
+| `log_level` | `yu_log::LogLevel` | CLI `--log-level`、`YU_LOG`、内核 `MinLevel`、依赖门面桥、Android `run-config.json` |
+| `backend` | `yu_engine::engine::Backend::parse` | CLI `--backend`、Android `backend` 键、host-desktop 示例探针 |
+| `gpu_backend` | `yu_backend_wgpu::GpuBackend` | 引擎 `YURIS_WGPU_BACKEND`、Android `gpu_backend` 键 |
+| `save_codec` | `yu_format::yssd::BlockCodec::parse` | CLI `--save-codec`、Android `save_codec` 键 |
+| `script_key` | `yu_engine::keys::ScriptKey::parse_hex` | CLI `--script-key`、Android `script_key` 键 |
+| `patch` | `yu_engine::patch::PatchKind::parse` | CLI `--patch`、Android `patch` 键、serve `--patch` |
+| `on|off` 旗标 | `yu_cli::args::parse_on_off_flag` | headless / desktop / serve |
+| `@_TIME` 本地时间 | `yu_engine::host_clock::local_now` | run / serve / desktop / Android;wasm 恒 `None` |
+
+三处约束:
+
+1. **新增宿主不改取值表**:加一个平台只实现端口,参数解析直接复用上表。
+2. **新增取值只改一处**:词表与错误文案一起走,不会出现「CLI 收而 Android 拒」。
+3. **枚举化边界**:Android `RunConfig` 的 `backend`/`gpu_backend`/`save_codec`/
+   `log_level` 是枚举而非 `String`,解析发生在 JSON 边界,下游无字符串判断。
+
+## 事件与生命周期:宿主唯一接线面(见 DIV-AND-005)
+
+内核只暴露**一个**退出信号面,任何宿主照抄三条规则:
+
+```text
+1. 判断"游戏是否结束"   → Engine::lifecycle()(Lifecycle::is_terminal)
+                          Android 等价物:nativeTick() 返回 1 / nativeLifecycle() != 0
+2. 挂起(页面隐藏/后台) → Engine::suspend()   丢墙钟 + 静音;幂等
+3. 恢复                  → Engine::resume()    声音挂回;幂等
+```
+
+- 生命周期**必须在发布模式可见**:它是退出信号,不是诊断
+  (Android `nativeStatus` 在 quiet 下也带 `status=exited … restart=N`)。
+- `Lifecycle::Exited { restart }` 的 `restart` = 官方 `RESTART` 标志
+  (官方进程收尾 `CreateProcessA` 重启自身);内核只报告,宿主决定是否
+  重建会话(`Engine::restart`)。
+- 存档**不需要**在挂起时 flush:SAVE 命令时刻已落盘,再写一次只会
+  制造第二份不一致现场。
+- `suspend` 的关键语义是**丢弃暂停期间的真实时间**:否则后台几分钟回来,
+  第一帧把整段墙钟灌进 `@_OS_TIME`,淡出/补间全部瞬移(实测守护:
+  `cargo test -p yu-cli --test lifecycle -- --ignored`)。
+
 ## 已收口的硬编码(见 DIV-AND-002)
 
 | 原实现 | 现实现 |
@@ -78,6 +127,7 @@ mixer 线程(THREAD_PRIORITY_AUDIO)    oboe 回调(实时线程)
 | `ensure_save_root` 的 `cfg(target_arch = "wasm32")` 分支 | `ensure_save_root_with(&dyn SaveFs)` |
 | `host_paths` 硬编码 `USERPROFILE` + `\Documents` | `PlatformHome` + `HostPathOverrides` |
 | `acm::build_pcm` 未按平台门控(非 Windows 编译中断) | `cfg(windows)` |
+| 各宿主各写一份参数解析(含 Android `@_TIME` 漏接 ⇒ 恒 1970) | 上表「唯一取值表」 |
 
 ## 尚未端口化(有意保留)
 

@@ -62,11 +62,40 @@ public final class MainActivity extends Activity
     static final String EXTRA_SHOW_HUD = "show_hud";
     /** 启动失败原因回传给配置界面。 */
     static final String EXTRA_START_ERROR = "start_error";
+    /** 新增参数:文本编码路线(auto/original/gbk/big5/tunnel)。 */
+    static final String EXTRA_PATCH = "patch";
+    /** 新增参数:存档块压缩层(zlib/snappy;空 = 自动判定)。 */
+    static final String EXTRA_SAVE_CODEC = "save_codec";
+    /** 新增参数:强制屏幕坐标系代号(@_SCREEN_COLOR)。 */
+    static final String EXTRA_SCREEN_COLOR = "screen_color";
+    /** 新增参数:强制帧率。 */
+    static final String EXTRA_FPS = "fps";
+
+    /**
+     * {@link NativeHost#nativeTick()} 的"游戏已结束"返回码。
+     *
+     * <p>与内核 {@code Lifecycle::host_code} 同值 —— 这是跨平台统一退出信号,
+     * 壳不在这里再判 {@code main_finished}。
+     */
+    private static final int TICK_FINISHED = 1;
 
     private android.view.TextureView textureView;
     private TextView hudView;
     private volatile boolean running;
     private Thread renderThread;
+    /** 本次会话是否以"游戏正常结束"收尾(决定是否 finish 回配置界面)。 */
+    private volatile boolean gameFinished;
+    /** 内核会话已就绪(初始化成功)。会话在渲染线程的 thread_local 里,
+     *  因此**线程必须常驻**:挂起只停泵,绝不杀线程(杀线程 = 丢会话)。 */
+    private volatile boolean sessionReady;
+    /** tick 失败(区别于挂起停泵;决定收尾时是否画错误屏)。 */
+    private volatile boolean tickFailed;
+    /** 泵闸:onPause 置 false,渲染线程空转等恢复(会话不丢);onResume 置 true。 */
+    private volatile boolean pumping;
+    /** GPU 后端(初始化成功且选了 wgpu)= 支持零拷贝上屏/重建。 */
+    private volatile boolean gpuBackendChosen;
+    /** Surface 重建待挂(零拷贝:onSurfaceTextureAvailable 置位,渲染线程消费)。 */
+    private volatile boolean needsAttach;
 
     /**
      * 输入事件队列(主线程写、渲染线程取)。
@@ -134,6 +163,8 @@ public final class MainActivity extends Activity
     private int activePointers;
     /** 触摸态抬手后要把光标移出视口(清 hover)。 */
     private boolean clearCursorAfterRelease;
+    /** 光标清理已排队(下一帧执行);见帧循环里的时序说明。 */
+    private boolean cursorClearPending;
     private OverlayView overlayView;
     private ModeButton modeButton;
     private int touchSlopPx;
@@ -385,10 +416,15 @@ public final class MainActivity extends Activity
     @Override
     public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture surfaceTexture,
                                           int width, int height) {
-        // 把 TextureView 的 Surface 交给内核:GPU 后端下直接零拷贝上屏。
         nativeSurface = new android.view.Surface(surfaceTexture);
         Log.i(TAG, "surface available " + width + "x" + height);
-        startRenderLoop();
+        if (sessionReady && renderThread != null && renderThread.isAlive()) {
+            // 会话还在(只是 surface 重建):渲染线程下一帧重新挂 Surface。
+            needsAttach = true;
+            pumping = true;
+        } else {
+            startRenderLoop();
+        }
     }
 
     @Override
@@ -399,7 +435,9 @@ public final class MainActivity extends Activity
 
     @Override
     public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture surfaceTexture) {
-        stopRenderLoop();
+        // 只停泵 + 放掉 Surface;会话与渲染线程保留(下次 available 重挂)。
+        pumping = false;
+        zeroCopyPresent = false;
         if (nativeSurface != null) {
             nativeSurface.release();
             nativeSurface = null;
@@ -415,15 +453,24 @@ public final class MainActivity extends Activity
     @Override
     protected void onPause() {
         super.onPause();
-        // 挂起 = 停时钟停泵（架构 §2.5.2 ④）；恢复时重建渲染循环。
+        // 挂起 = 停时钟停泵（架构 §2.5.2 ④）。内核侧 nativeSuspend() 丢弃
+        // 暂停期间的真实时间（恢复不快进）并静音；壳侧只关泵闸 ——
+        // **渲染线程常驻**：会话在它的 thread_local 里,杀线程 = 丢会话 =
+        // 恢复时重新 nativeInitJson,即「切后台回来游戏重启」的根因。
         // 存档已在 SAVE 刷盘的命令时刻落盘，因此这里无需额外 flush。
-        stopRenderLoop();
+        NativeHost.nativeSuspend();
+        pumping = false;
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (textureView != null && textureView.isAvailable()) {
+        NativeHost.nativeResume();
+        if (sessionReady && renderThread != null && renderThread.isAlive()) {
+            // 常驻线程还在:直接开闸续跑(会话原封不动)。
+            pumping = true;
+        } else if (textureView != null && textureView.isAvailable()) {
+            // 冷启动/上一次真正结束过:走完整初始化。
             startRenderLoop();
         }
     }
@@ -440,6 +487,9 @@ public final class MainActivity extends Activity
             return;
         }
         running = true;
+        // 冷启动必须随线程一起开泵闸:pumping 的初值是 false,不开闸的话
+        // 新线程进循环就落在「挂起空转」分支,一帧都不 tick(黑屏)。
+        pumping = true;
         renderThread = new Thread(this::renderLoop, "yu-render");
         renderThread.start();
     }
@@ -458,6 +508,13 @@ public final class MainActivity extends Activity
     }
 
     private void renderLoop() {
+        // 会话只初始化一次:onPause 停泵后 onResume 会起新线程进本方法,
+        // 若不守卫就会重新 nativeInitJson ⇒ 用户看到的「切后台回来游戏重启」。
+        // 挂起/恢复期间会话一直在内核 thread-local 里,新线程直接续跑。
+        // 会话只初始化一次:onPause 停泵后 onResume 会起新线程进本方法,
+        // 若不守卫就会重新 nativeInitJson ⇒ 「切后台回来游戏重启」。
+        // 挂起/恢复期间会话一直在内核 thread-local 里,新线程直接续跑帧循环。
+        if (!sessionReady) {
         // 音频后端(oboe)需要 JavaVM + Context,必须先于引擎启动。
         NativeHost.nativeInitAndroidContext(this);
         String version = NativeHost.nativeVersion();
@@ -529,6 +586,27 @@ public final class MainActivity extends Activity
             if (!fontPath.isEmpty()) {
                 config.put("font_file", fontPath);
             }
+            // ---- 新增参数(与 CLI 旗标一一对应;缺省不写键 = 用内核缺省) ----
+            // 文本编码路线:汉化补丁的整包编码(原版/GBK/Big5/SJIS 隧道)。
+            String patch = getIntent().getStringExtra(EXTRA_PATCH);
+            if (patch != null && !patch.trim().isEmpty()) {
+                config.put("patch", patch.trim());
+            }
+            // 存档块压缩层(只影响写盘;读侧始终按实际流分流)。
+            String saveCodec = getIntent().getStringExtra(EXTRA_SAVE_CODEC);
+            if (saveCodec != null && !saveCodec.trim().isEmpty()) {
+                config.put("save_codec", saveCodec.trim());
+            }
+            // 视口像素格式代号(@_SCREEN_COLOR);0 = 不覆盖。
+            int screenColor = getIntent().getIntExtra(EXTRA_SCREEN_COLOR, 0);
+            if (screenColor > 0) {
+                config.put("screen_color", screenColor);
+            }
+            // 帧率(@_FPS 语义);0 = 不覆盖(用内核缺省 60)。
+            int fps = getIntent().getIntExtra(EXTRA_FPS, 0);
+            if (fps > 0) {
+                config.put("fps", fps);
+            }
         } catch (org.json.JSONException error) {
             Log.e(TAG, "config build failed", error);
         }
@@ -550,6 +628,7 @@ public final class MainActivity extends Activity
         // GPU 后端下尝试零拷贝上屏:把 TextureView 的 Surface 交给内核。
         // 失败不致命 —— 保持 Bitmap 路径,只是帧率低一些。
         if (init.startsWith("OK") && init.contains("backend=wgpu")) {
+            gpuBackendChosen = true;
             if (nativeSurface != null && nativeSurface.isValid()) {
                 int attached = NativeHost.nativeAttachSurface(nativeSurface);
                 zeroCopyPresent = attached == 0;
@@ -568,6 +647,8 @@ public final class MainActivity extends Activity
             drawError();
             return;
         }
+        sessionReady = true;
+        } // if (!sessionReady) —— 一次性初始化结束
 
         int[] pixels = new int[0];
         int frameW = 0;
@@ -581,13 +662,41 @@ public final class MainActivity extends Activity
         double fps = 0.0;
 
         while (running) {
+            // 泵闸关闭(挂起/无 surface):空转轻睡,不 tick —— 会话原样保留。
+            if (!pumping) {
+                if (!running) {
+                    break; // onDestroy 请求退线程:走循环后的真正收尾。
+                }
+                SystemClock.sleep(30); // 挂起空转;恢复后从这里继续 tick。
+                continue;
+            }
+            // Surface 重建(后台回来/旋转):渲染线程上重新零拷贝挂载。
+            if (needsAttach && gpuBackendChosen) {
+                needsAttach = false;
+                if (nativeSurface != null && nativeSurface.isValid()) {
+                    int attached = NativeHost.nativeAttachSurface(nativeSurface);
+                    zeroCopyPresent = attached == 0;
+                    NativeHost.nativeResizeSurface(
+                            Math.max(1, textureView.getWidth()),
+                            Math.max(1, textureView.getHeight()));
+                    Log.i(TAG, zeroCopyPresent ? "zero-copy re-attach ON" : "zero-copy re-attach OFF");
+                }
+            }
             long frameStartNanos = System.nanoTime();
             long started = SystemClock.elapsedRealtime();
             int tickResult = NativeHost.nativeTick();
+            if (tickResult == TICK_FINISHED) {
+                // 游戏正常结束(脚本 END 或主脚本走完):收尾并回到配置界面,
+                // 不把用户的进程留着空转。这是所有宿主共用的退出判据
+                // (内核 `Lifecycle::host_code`),不在这里另判 main_finished。
+                Log.i(TAG, "game finished: " + NativeHost.nativeStatus());
+                gameFinished = true;
+                break;
+            }
             if (tickResult != 0) {
                 statusLine = NativeHost.nativeStatus();
                 Log.e(TAG, "tick failed: " + statusLine);
-                drawError();
+                tickFailed = true;
                 break;
             }
 
@@ -659,11 +768,20 @@ public final class MainActivity extends Activity
                     }
                 }
 
-                // 触摸态抬手后把脚本光标移出视口一次(等价"鼠标离开窗口")。
-                // 不移除的话,换屏后同位置若有按钮就一直 hover。
+                // 触摸态抬手后把脚本光标移出视口(等价"鼠标离开窗口"),
+                // 避免换屏后同位置按钮一直 hover。
+                //
+                // **必须推迟一帧**:本帧的 DOWN/UP 是 tick 之后才投给内核的,
+                // 内核要到下一帧 tick 才消费这次点击。当场移光标会让引擎看到
+                // 「在视口外(-1,-1)按下」⇒ 按钮完全不响应(触摸点了没反应,
+                // 而虚拟鼠标模式没有这段清理所以正常)。
+                if (cursorClearPending && !mouseMode) {
+                    cursorClearPending = false;
+                    NativeHost.nativeSetCursor(-1, -1);
+                }
                 if (clearCursorAfterRelease && !mouseMode) {
                     clearCursorAfterRelease = false;
-                    NativeHost.nativeSetCursor(-1, -1);
+                    cursorClearPending = true; // 下一帧再清,让点击先被消费
                 }
 
                 if (needPixels) {
@@ -712,10 +830,25 @@ public final class MainActivity extends Activity
                 sleepUntil(System.nanoTime() + remaining);
             }
         }
-
+        // 循环退出原因分流:
+        // - stopRenderLoop()(onDestroy 等)⇒ 会话随线程终止,真正收尾。
+        // - 游戏结束 / tick 失败 ⇒ 真正收尾。
+        // (挂起不再走这里:泵闸关闭时线程只在 while 里空转,不会退出。)
+        if (!running && !gameFinished && !tickFailed) {
+            Log.i(TAG, "render loop stopped by host (session torn down)");
+        }
         NativeHost.nativeShutdown();
+        sessionReady = false;
         Log.i(TAG, "render loop stopped");
+        if (tickFailed) {
+            drawError();
+        }
+        if (gameFinished) {
+            // 回到配置界面(同一任务栈):用户可以从那里再启动或退出 app。
+            runOnUiThread(this::finish);
+        }
     }
+
 
     /**
      * 全屏沉浸:隐藏状态栏与导航栏,并允许内容延伸到系统栏区域。

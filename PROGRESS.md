@@ -13550,3 +13550,109 @@ cargo build --workspace --all-targets → 通过
 - 夏ノ鎖 `sv.file.write 拒绝访问` 是本机沙箱对「工作区编译产物写
   `D:\Download`」的限制:`--save-root` 指到可写目录后写入成功、
   文件时间戳更新,非内核缺陷。
+
+## 成果 HOST-PARAM-UNIFY (2026-11-07) · 宿主参数唯一取值表,修 Android `@_TIME` 恒 1970
+
+**问题**:DIV-AND-002 收口了文件系统与路径,但「宿主参数」这层每个宿主各写
+一份解析,取值集合与错误文案都漂移了。其中一条不是"重复"而是"漏接线":
+
+- **`@_TIME` 在 Android 恒 1970**:本地时间读取只存在于 `yu-cli::clock`,
+  Android 宿主的 `EngineOptions` 从未设 `local_time` ⇒ 脚本 `@_TIME` 恒返回
+  1970-01-01,存档菜单日期永远不对。脚本可见的行为分歧,且不报错。
+- **`verbose` 让依赖日志变少**:`--log-level verbose` 在门面桥
+  (`facade::FacadeLevel`)没有对应项 ⇒ 落回 `warn`,比缺省 `info` 更紧。
+- **Android 拒收 `debug`/`trace`**:`run-config.json` 的 `log_level` 自带一套
+  白名单,取值集比 CLI 少两档。
+- `backend` / `gpu_backend` / `save_codec` / `script_key` / `on|off`:2~4 处
+  逐字相同的实现。
+
+**处置**(详见 `docs/divergences/DIV-AND-004-host-param-parse-unify.md`):
+
+| 参数 | 唯一实现 |
+|---|---|
+| `log_level` | `yu_log::LogLevel`(`min_level()` / `facade_level()`) |
+| `backend` | `Backend::parse`(大小写/空白容错) |
+| `gpu_backend` | `yu_backend_wgpu::GpuBackend`(两套旧词表的并集 + `ladder()`) |
+| `save_codec` | `BlockCodec::parse` / `as_str` |
+| `script_key` | `ScriptKey::parse_hex` |
+| `on|off` | `yu_cli::args::parse_on_off_flag` |
+| `@_TIME` | `yu_engine::host_clock::local_now`(装配层;wasm 恒 `None`) |
+
+Android `RunConfig` 的 `backend`/`gpu_backend`/`save_codec`/`log_level` 由
+`String` 改枚举,解析落在 JSON 边界。
+
+**行为变化(有意)**:`verbose` 的依赖日志到 `Trace`;Android 接受
+`debug`/`trace` 并据此退出发布模式;Android `@_TIME` 用系统本地时间;
+`--backend` 大小写容错。`quiet|error|warn` 仍统一为内核 `MinLevel::Quiet`
+(内核不分这三档,门面各自放行),已在 `level.rs` 文档写明。
+
+**验证**:
+```text
+cargo test -p yu-log --lib          → 33 passed
+cargo test -p yu-format --lib       → 35 passed
+cargo test -p yu-engine --lib       → 31 passed
+cargo test -p yu-backend-wgpu --lib → 13 passed
+cargo test -p yu-host-android --lib → 13 passed
+cargo build --workspace --all-targets                          → 通过
+cargo check -p yu-host-android --target aarch64-linux-android  → 通过(NDK r28)
+cargo check -p yu-host-wasm --target wasm32-unknown-unknown    → 通过
+三帧 headless(project-eris)
+  → rgba sha256 a7aff0f8…d67e334e,与改动前逐字节一致
+```
+
+全量 `cargo test --workspace` 剩余失败均既有/环境性:
+`yu-gfx eris_first_screen` ×2(golden 199 vs 272,**stash 对照复现**);
+`yu-sound gated_ogg` ×2(单独带样本 env 全绿,并行争用);
+`yu-backend-wgpu diffusion_matches_soft_across_sizes`(单跑通过,GPU 争用);
+`yu-save` 两条在缺 `YURIS_SAMPLE_SDK0495` 时显式报错(约定行为)。
+
+**残留**:wasm 的 `local_now()` 恒 `None`,真 wasm 宿主接入时在
+`host_clock` 内经 JS 反查时区,不要回到各宿主各写一份。
+
+## 成果 HOST-EVENT-BIG5 (2026-11-07) · 统一退出信号/挂起恢复 + Big5 编码 + Android 壳新参数
+
+**问题**(三条真实缺陷,见 `docs/divergences/DIV-AND-005-lifecycle-events-big5.md`):
+1. **游戏结束后壳不知道**:`main_finished` 只在 Android 非 quiet 状态串可见,
+   发布模式(上架默认)下脚本 `END` 后画面停住、声音继续,用户只能杀进程。
+2. **挂起不丢时间**:Android `onPause` 只停渲染线程,没重置引擎时钟 ——
+   后台放几分钟回来,第一帧把整段墙钟灌进 `@_OS_TIME`,淡出/补间瞬移。
+3. **繁中没有编码选项**:Big5(CP950)码表缺失,港台旧作/繁中补丁无法选。
+
+**处置**:
+- `yu_engine::engine::Lifecycle { Running | Finished | Exited { restart } }`
+  = 宿主唯一退出信号面。`Engine::lifecycle()` 统一 `main_finished`/
+  `restart_requested` 两个布尔;`host_code()`(0=继续/1=终态)直通
+  Android `nativeTick` 返回值。**发布模式状态串也带生命周期**
+  (`status=exited … restart=N`)。Java 壳 tick==1 ⇒ finish 回配置界面。
+- `Engine::suspend/resume`:丢墙钟(恢复不快进)+ 静音(设备不拆);
+  幂等;JNI `nativeSuspend/nativeResume` 接进壳 `onPause/onResume`。
+  存档不在挂起时 flush(SAVE 命令时刻已落盘)。
+- **Big5**:`gen_tables.py` 增 code page 950 → `table_big5.rs`
+  (19720 双字节条目/10 别名;trail 0x7F..=0xA0 空洞);
+  `Codec::Big5`(format+vfs 双侧)/`PatchKind::Big5`(`--patch big5`)/
+  文件名编码回退改遍历 `Codec::ALL`。**不参与 auto 识别**(与 GBK 前导
+  区间重叠,构成统计无法区分;显式选择)。
+- Android 壳新参数:`patch`(文本编码)/`save_codec`/`fps`/`screen_color`
+  四个 Intent Extra → `run-config.json` 键,配置界面新增「文本编码」
+  「存档」按钮卡片,选择持久化。
+- 工具链顺带修复:`tools/android/build.sh` Windows 链接器(sh 版 clang
+  无法 exec ⇒ 改 `.cmd`)与 NDK r28 的 `libc++_shared.so` 新路径。
+
+**验证**:
+```text
+cargo test -p yu-format --lib            → 全绿(big5 全表/单字节往返 ×2 新增)
+cargo test -p yu-vfs --lib               → 全绿(big5 lead/trail 判据新增)
+cargo test -p yu-host-android --lib      → 14 passed(patch 词表对齐新增)
+cargo test -p yu-cli --test lifecycle -- --ignored
+  → starts_running_and_suspend_resumes_without_time_jump ok
+    (挂起 300ms 后恢复首帧 clock_ms < 100 ⇒ 挂起期时间确实被丢弃)
+cargo build --workspace --all-targets → 通过
+javac(android-36 + 本机缓存 appcompat 1.6.1 依赖树) → Java 壳编译通过
+  (当场发现并修复 SetupActivity 新卡片与既有 saveCard 变量重名)
+yu-cli run --patch big5(3 帧) → 启动正常;--patch euc-kr 显式报错
+tools/android/build.sh x86_64 → libyu_host_android.so 14M(release)
+三帧 headless 缺省路径 rgba sha256 不变(a7aff0f8…,本批不触渲染语义)
+```
+
+**残留**:fps/screen_color 的配置界面卡片未加(参数链路已通);
+`nativeLifecycle` 的 2/3 细分桌面向未消费;真 wasm `local_now` 仍 None。

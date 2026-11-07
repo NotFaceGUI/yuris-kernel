@@ -65,6 +65,12 @@ public final class SetupActivity extends AppCompatActivity {
     private String backend = "soft";
     /** GPU 底层接口:"auto" / "gles" / "vulkan"。 */
     private String gpuBackend = "auto";
+    /** 文本编码路线:auto / original / gbk / big5 / tunnel(与 CLI `--patch` 同口径)。 */
+    private String patch = "auto";
+    /** 存档块压缩层:"" = 自动判定 / "zlib" / "snappy"。 */
+    private String saveCodec = "";
+    /** 帧率:0 = 内核缺省(60)。 */
+    private int fps = 0;
     /** 写调试日志到游戏目录(debug/*.jsonl)。 */
     private boolean debugLog;
     /** 状态浮层(HUD)。发布默认关:浮层每秒还要拼状态串。 */
@@ -89,6 +95,9 @@ public final class SetupActivity extends AppCompatActivity {
         }
         backend = prefs.getString("backend", "soft");
         gpuBackend = prefs.getString("gpu_backend", "auto");
+        patch = prefs.getString("patch", "auto");
+        saveCodec = prefs.getString("save_codec", "");
+        fps = prefs.getInt("fps", 0);
         debugLog = prefs.getBoolean("debug_log", false);
         showHud = prefs.getBoolean("show_hud", false);
 
@@ -243,6 +252,86 @@ public final class SetupActivity extends AppCompatActivity {
         root.addView(runCard, cardParams());
         refreshRunButtons(cpuButton, gpuButton);
 
+        // ---- 文本编码 ----
+        LinearLayout textCard = card();
+        textCard.addView(sectionTitle("文本编码"));
+        // 五种路线 = `yu_engine::patch::PatchKind` 全集(与 CLI `--patch`
+        // 同一词表)。「自动」是缺省与推荐路线,整行放大置顶;其余四个
+        // 两两一行(显式选项都是"知道自己要什么"的用法,次级视觉)。
+        Button[] patchButtons = new Button[5];
+        String[] patchValues = {"auto", "original", "gbk", "big5", "tunnel"};
+        String[] patchLabels = {"自动(推荐)", "原版(CP932)", "简体(GBK)",
+                "繁体(Big5)", "隧道(sjis_ext)"};
+        // 「自动」:整行、加高(与后端行同规格),强调它是缺省选择。
+        {
+            final int index = 0;
+            Button button = secondaryButton(patchLabels[index]);
+            button.setTextSize(15f);
+            button.setOnClickListener(v -> {
+                patch = patchValues[index];
+                refreshChoiceButtons(patchButtons, patchValues, patch);
+            });
+            patchButtons[index] = button;
+            LinearLayout.LayoutParams autoParams = buttonParams();
+            autoParams.height = dp(46);
+            textCard.addView(button, autoParams);
+        }
+        // 其余四个:两两一行。
+        for (int i = 1; i < patchValues.length; i += 2) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            for (int j = i; j < Math.min(i + 2, patchValues.length); j++) {
+                final int index = j;
+                Button button = secondaryButton(patchLabels[j]);
+                button.setOnClickListener(v -> {
+                    patch = patchValues[index];
+                    refreshChoiceButtons(patchButtons, patchValues, patch);
+                });
+                patchButtons[j] = button;
+                LinearLayout.LayoutParams params =
+                        new LinearLayout.LayoutParams(0, dp(42), 1f);
+                params.topMargin = dp(6);
+                params.rightMargin = dp(4);
+                params.leftMargin = dp(4);
+                row.addView(button, params);
+            }
+            textCard.addView(row);
+        }
+        refreshChoiceButtons(patchButtons, patchValues, patch);
+        textCard.addView(hintText(
+                "汉化包整包换过编码时才需要显式选;选错会整屏乱码。"
+                        + "「隧道」需要游戏目录里有 sjis_ext.bin,缺失会显式报错。"));
+        root.addView(textCard, cardParams());
+
+        // ---- 存档 ----
+        LinearLayout saveCodecCard = card();
+        saveCodecCard.addView(sectionTitle("存档"));
+        Button[] codecButtons = new Button[3];
+        String[] codecValues = {"", "zlib", "snappy"};
+        String[] codecLabels = {"自动判定", "zlib", "snappy"};
+        LinearLayout codecRow = new LinearLayout(this);
+        codecRow.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < codecValues.length; i++) {
+            final int index = i;
+            Button button = secondaryButton(codecLabels[i]);
+            button.setOnClickListener(v -> {
+                saveCodec = codecValues[index];
+                refreshChoiceButtons(codecButtons, codecValues, saveCodec);
+            });
+            codecButtons[i] = button;
+            LinearLayout.LayoutParams params =
+                    new LinearLayout.LayoutParams(0, dp(42), 1f);
+            params.topMargin = dp(6);
+            params.leftMargin = dp(4);
+            params.rightMargin = dp(4);
+            codecRow.addView(button, params);
+        }
+        refreshChoiceButtons(codecButtons, codecValues, saveCodec);
+        saveCodecCard.addView(codecRow);
+        saveCodecCard.addView(hintText(
+                "只影响写盘;读侧始终按实际流分流。原版带 YSSnp.dll 的作品是 snappy。"));
+        root.addView(saveCodecCard, cardParams());
+
         // ---- 开始 ----
         startButton = primaryButton("开始游戏");
         startButton.setOnClickListener(v -> launchGame());
@@ -257,7 +346,11 @@ public final class SetupActivity extends AppCompatActivity {
             gameDir = null;
             saveDir = null;
             fontPath = null;
+            importedFontName = null;
+            savedFontFamily = "";
             refreshLabels();
+            // 下拉去掉「导入字体」项并回到系统默认。
+            fontSpinner.setSelection(0);
         });
         root.addView(reset, buttonParams());
 
@@ -439,6 +532,33 @@ public final class SetupActivity extends AppCompatActivity {
         gpu.setTextColor(gpuSelected ? Color.WHITE : TEXT);
     }
 
+    /**
+     * 任意「取值 → 高亮」按钮组:选中项用 ACCENT,其余用卡片底色。
+     *
+     * <p>与 {@link #refreshGpuButtons} 同一视觉语言,但取值与文案都不写死,
+     * 供编码/存档层等新增条目复用。
+     */
+    private void refreshChoiceButtons(Button[] buttons, String[] values, String selected) {
+        for (int i = 0; i < buttons.length && i < values.length; i++) {
+            if (buttons[i] == null) {
+                continue;
+            }
+            boolean on = values[i].equals(selected);
+            buttons[i].setBackground(rounded(on ? ACCENT : Color.parseColor("#252b36"), 11));
+            buttons[i].setTextColor(on ? Color.WHITE : TEXT);
+        }
+    }
+
+    /** 一行小字说明(卡片内提示)。 */
+    private TextView hintText(String text) {
+        TextView view = new TextView(this);
+        view.setText(text);
+        view.setTextSize(11f);
+        view.setTextColor(MUTED);
+        view.setPadding(0, dp(8), 0, 0);
+        return view;
+    }
+
     /** GPU 接口三选一高亮。 */
     private void refreshGpuButtons(Button auto, Button gles, Button vulkan) {
         Button[] all = {auto, gles, vulkan};
@@ -565,8 +685,14 @@ public final class SetupActivity extends AppCompatActivity {
                 .putString("game_dir", gameDir)
                 .putString("save_dir", saveDir)
                 .putString("font_family", savedFontFamily)
+                // 导入字体的文件路径必须持久化:否则重启后 importedFontName
+                // 重建不出来,下拉最后一项消失、选中恢复失败(实测)。
+                .putString("font_path", fontPath)
                 .putString("backend", backend)
                 .putString("gpu_backend", gpuBackend)
+                .putString("patch", patch)
+                .putString("save_codec", saveCodec)
+                .putInt("fps", fps)
                 .putBoolean("debug_log", debugLog)
                 .putBoolean("show_hud", showHud)
                 .apply();
@@ -578,6 +704,13 @@ public final class SetupActivity extends AppCompatActivity {
         intent.putExtra(MainActivity.EXTRA_GPU_BACKEND, gpuBackend);
         intent.putExtra(MainActivity.EXTRA_DEBUG_LOG, debugLog);
         intent.putExtra(MainActivity.EXTRA_SHOW_HUD, showHud);
+        intent.putExtra(MainActivity.EXTRA_PATCH, patch);
+        if (!saveCodec.isEmpty()) {
+            intent.putExtra(MainActivity.EXTRA_SAVE_CODEC, saveCodec);
+        }
+        if (fps > 0) {
+            intent.putExtra(MainActivity.EXTRA_FPS, fps);
+        }
         String fontFileToUse = chosenFontFile != null ? chosenFontFile : fontPath;
         if (fontFileToUse != null) {
             intent.putExtra(MainActivity.EXTRA_FONT_PATH, fontFileToUse);

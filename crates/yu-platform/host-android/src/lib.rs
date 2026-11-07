@@ -47,8 +47,10 @@ pub mod sound;
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use yu_engine::engine::{Backend, Engine, EngineOptions};
+use yu_backend_wgpu::GpuBackend;
+use yu_engine::engine::{Backend, BlockCodec, Engine, EngineOptions};
 use yu_engine::project::Project;
+use yu_log::LogLevel;
 
 /// 一个运行会话(初始化成功到 shutdown)。
 struct Session {
@@ -197,18 +199,18 @@ pub struct RunConfig {
     /// 是否真的接音频输出端口。缺省 true。`false` 只静音,不影响 `@_OS_SOUND`。
     pub audio_output: bool,
     // ---- 视频 ----
-    /// 渲染后端:`"soft"`(CPU)/ `"wgpu"`(GPU)。缺省 soft。
+    /// 渲染后端(缺省 soft)。取值解析/文案由 [`Backend::parse`] 唯一提供。
     ///
     /// GPU 是增强路径:设备不支持 Vulkan/GLES 时**显式失败**,不自动降级
     /// (自动降级会让"GPU 模式画错"永远对不上号)。
-    pub backend: String,
-    /// GPU 底层接口:`"auto"`(默认)/ `"gles"` / `"vulkan"`。
+    pub backend: Backend,
+    /// GPU 底层接口(缺省 [`GpuBackend::Auto`] = 先 GLES 再 Vulkan)。
     ///
     /// Android 模拟器的 gfxstream Vulkan 在 `vkQueueSubmit` 里空指针崩溃
     /// (实测 `vulkan.ranchu.so` SIGSEGV),所以 `auto` 先试 GLES,失败再试
     /// Vulkan。真机上两者都能用时也优先 GLES —— 对本引擎(纯 2D 图元 +
     /// 文本纹理)GLES 的驱动兼容性更好。
-    pub gpu_backend: String,
+    pub gpu_backend: GpuBackend,
     /// 视口像素格式代号(`@_SCREEN_COLOR`)。缺省 32。
     pub screen_color: u32,
     /// 渲染模式代号(`@_DX_MODE`)。缺省 0。
@@ -216,18 +218,20 @@ pub struct RunConfig {
     /// 每秒逻辑帧数。缺省 60。
     pub fps: u32,
     // ---- 存档 ---
-    /// 存档块压缩层:`"zlib"` / `"snappy"`。缺省 = 自动判定。
-    pub save_codec: Option<String>,
+    /// 存档块压缩层。缺省 `None` = 自动判定。
+    pub save_codec: Option<BlockCodec>,
     /// 媒体只读(`@_MEDIA_READONLY`)。缺省 false。
     pub media_readonly: bool,
-    // ---- 诊断 ---
+    // ---- 诊断 ----
     /// 记录事件流(占内存;对拍用)。缺省 false。
     pub record_events: bool,
     /// 调试日志文件(JSONL)。非空即开启;路径相对 `data_root` 时落游戏目录,
     /// 便于 adb pull 取回分析。缺省 `None` = 不写文件。
     pub log_file: Option<PathBuf>,
-    /// 日志门槛:`"quiet"|"error"|"warn"|"info"|"verbose"`。缺省 `"info"`。
-    pub log_level: String,
+    /// 日志门槛(缺省 [`LogLevel::Info`])。取值解析只有 `yu_log::LogLevel`
+    /// 一份 —— 与 CLI `--log-level` 完全同一组,不再有「CLI 收 debug/trace
+    /// 而 Android 拒收」的差异。
+    pub log_level: LogLevel,
     /// 抓取混音输出到 `<data_root>/debug/audio-capture.wav`(诊断爆音)。
     /// 值 = 抓取多少毫秒(0 = 不抓)。
     pub audio_capture_ms: u32,
@@ -268,10 +272,10 @@ impl Default for RunConfig {
             save_codec: None,
             media_readonly: false,
             record_events: false,
-            backend: "soft".to_string(),
-            gpu_backend: "auto".to_string(),
+            backend: Backend::Soft,
+            gpu_backend: GpuBackend::Auto,
             log_file: None,
-            log_level: "info".to_string(),
+            log_level: LogLevel::Info,
             audio_capture_ms: 0,
             audio_tone: false,
             audio_rate: None,
@@ -347,23 +351,13 @@ impl RunConfig {
             config.audio_output = v;
         }
         if let Some(v) = object.get("backend").and_then(|v| v.as_str()) {
-            let lowered = v.trim().to_ascii_lowercase();
-            if !lowered.is_empty() {
-                if lowered != "soft" && lowered != "wgpu" {
-                    return Err(format!("backend 只接受 soft|wgpu,收到 `{v}`"));
-                }
-                config.backend = lowered;
+            if !v.trim().is_empty() {
+                config.backend = Backend::parse(v).map_err(|error| error.message)?;
             }
         }
         if let Some(v) = object.get("gpu_backend").and_then(|v| v.as_str()) {
-            let lowered = v.trim().to_ascii_lowercase();
-            if !lowered.is_empty() {
-                if !matches!(lowered.as_str(), "auto" | "gles" | "gl" | "vulkan") {
-                    return Err(format!(
-                        "gpu_backend 只接受 auto|gles|vulkan,收到 `{v}`"
-                    ));
-                }
-                config.gpu_backend = lowered;
+            if !v.trim().is_empty() {
+                config.gpu_backend = GpuBackend::parse(v)?;
             }
         }
         if let Some(v) = object.get("audio_capture_ms").and_then(|v| v.as_u64()) {
@@ -389,15 +383,9 @@ impl RunConfig {
             }
         }
         if let Some(v) = object.get("log_level").and_then(|v| v.as_str()) {
-            let lowered = v.trim().to_ascii_lowercase();
-            if !matches!(lowered.as_str(), "" | "quiet" | "error" | "warn" | "info" | "verbose")
-            {
-                return Err(format!(
-                    "log_level 只接受 quiet|error|warn|info|verbose,收到 `{v}`"
-                ));
-            }
-            if !lowered.is_empty() {
-                config.log_level = lowered;
+            // 取值表与 CLI 完全同一份(含 debug/trace);空串 = 不改。
+            if !v.trim().is_empty() {
+                config.log_level = LogLevel::parse(v)?;
             }
         }
         if let Some(v) = object.get("fps").and_then(|v| v.as_u64()) {
@@ -412,12 +400,8 @@ impl RunConfig {
             config.dx_mode = v.min(u64::from(u32::MAX)) as u32;
         }
         if let Some(v) = object.get("save_codec").and_then(|v| v.as_str()) {
-            let lowered = v.trim().to_ascii_lowercase();
-            if !lowered.is_empty() {
-                if lowered != "zlib" && lowered != "snappy" {
-                    return Err(format!("save_codec 只接受 zlib|snappy,收到 `{v}`"));
-                }
-                config.save_codec = Some(lowered);
+            if !v.trim().is_empty() {
+                config.save_codec = Some(BlockCodec::parse(v)?);
             }
         }
         if let Some(v) = object.get("media_readonly").and_then(|v| v.as_bool()) {
@@ -433,32 +417,19 @@ impl RunConfig {
             config.quiet = quiet;
         } else if object.get("log_level").is_some() {
             // `log_level=verbose`(壳打开「调试日志」时设置)= 明确要诊断,
-            // 自动退出发布模式。
-            config.quiet = config.log_level != "verbose";
+            // 自动退出发布模式。`debug`/`trace` 同理(它们比缺省更松)。
+            config.quiet = !matches!(
+                config.log_level,
+                LogLevel::Debug | LogLevel::Trace | LogLevel::Verbose
+            );
         }
         Ok(())
     }
 }
 
-/// `--script-key` 同口径:8 位十六进制,允许空白/下划线/冒号分隔与 `0x` 前缀。
+/// `--script-key` 同口径(解析本体只有 `yu_engine::keys::ScriptKey::parse_hex`)。
 fn parse_script_key(value: &str) -> Result<[u8; 4], String> {
-    let cleaned: String = value
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '_' && *c != ':')
-        .collect();
-    let hex = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-        .unwrap_or(&cleaned);
-    if hex.len() != 8 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("script_key 需要 8 位十六进制(4 字节),收到 `{value}`"));
-    }
-    let mut key = [0u8; 4];
-    for (index, slot) in key.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
-            .map_err(|_| format!("script_key 解析失败:`{value}`"))?;
-    }
-    Ok(key)
+    yu_engine::keys::ScriptKey::parse_hex(value)
 }
 
 /// [`init_session`] + 宿主字体(用户导入的字体字节 / 用户选的字体族)。
@@ -521,21 +492,17 @@ fn store_session(started: StartedEngine) -> Result<String, String> {
     Ok(summary)
 }
 
-/// 按 `gpu_backend` 建 GPU 上下文,带**显式回退链**。
+/// 按 [`GpuBackend`] 建 GPU 上下文,带**显式回退链**。
 ///
-/// `auto` = GLES → Vulkan。之所以先 GLES:Android 模拟器的 gfxstream Vulkan
-/// 在 `vkQueueSubmit` 内空指针崩溃(进程级 SIGSEGV,无法 catch),而 GLES
+/// 回退链本身在 [`GpuBackend::ladder`](Android 目标下 `auto` = GLES →
+/// Vulkan):之所以先 GLES,是因为模拟器的 gfxstream Vulkan 在
+/// `vkQueueSubmit` 内空指针崩溃(进程级 SIGSEGV,无法 catch),而 GLES
 /// 路径在同一模拟器上稳定。真机两者都能跑时 GLES 也够用(本引擎是纯 2D
 /// 图元 + 纹理合成,不吃 Vulkan 的现代特性)。
-fn create_gpu_context(gpu_backend: &str) -> Result<yu_backend_wgpu::GpuContext, String> {
+fn create_gpu_context(gpu_backend: GpuBackend) -> Result<yu_backend_wgpu::GpuContext, String> {
     use yu_backend_wgpu::DeviceOptions;
-    let ladder: Vec<(&str, wgpu::Backends)> = match gpu_backend {
-        "gles" | "gl" => vec![("gles", wgpu::Backends::GL)],
-        "vulkan" => vec![("vulkan", wgpu::Backends::VULKAN)],
-        _ => vec![("gles", wgpu::Backends::GL), ("vulkan", wgpu::Backends::VULKAN)],
-    };
     let mut failures = Vec::new();
-    for (name, backends) in ladder {
+    for (name, backends) in gpu_backend.ladder() {
         log_line("gpu", &format!("尝试后端 {name}"));
         let options = DeviceOptions {
             backends: Some(backends),
@@ -657,7 +624,7 @@ fn install_panic_hook() {
 ///
 /// 与 CLI `--log-file` 同一条通道(`yu_log::facade` + `JsonlFile`),所以
 /// Android 抓到的 JSONL 与桌面完全同格式,可直接用同一套工具分析。
-fn init_file_logging(path: &std::path::Path, level: &str) -> Result<(), String> {
+fn init_file_logging(path: &std::path::Path, level: LogLevel) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -667,8 +634,7 @@ fn init_file_logging(path: &std::path::Path, level: &str) -> Result<(), String> 
     let jsonl = yu_log::console::JsonlFile::create(path)
         .map_err(|e| format!("创建日志文件 {} 失败: {e}", path.display()))?;
     // 控制台输出走 logcat(Android 侧由壳读取);门面单例重复调用时保持现状。
-    let level = yu_log::console::MinLevel::from_level_value(Some(level));
-    let console = yu_log::console::Console::stderr_live(level, 0, Some(jsonl));
+    let console = yu_log::console::Console::stderr_live(level.min_level(), 0, Some(jsonl));
     // 门面要求 `Arc<dyn Fn..>`;Console 是日志单写者,用 Mutex 串行化。
     let handle = std::sync::Arc::new(std::sync::Mutex::new(console));
     let callback_handle = std::sync::Arc::clone(&handle);
@@ -796,7 +762,7 @@ pub fn start_engine(
             } else {
                 data_root.join(path)
             };
-            match init_file_logging(&resolved, &log_level) {
+            match init_file_logging(&resolved, log_level) {
                 Ok(()) => format!(" log={}", resolved.display()),
                 Err(error) => return Err(error),
             }
@@ -828,22 +794,15 @@ pub fn start_engine(
     let project = Project::discover(&data_root, None)
         .map_err(|failure| format!("数据入口装配失败: {failure}"))?;
     let dataset = project.describe();
-    // 存档块压缩层:与 CLI `--save-codec` 同义(只影响写盘)。
-    let codec = match save_codec.as_deref() {
-        Some("zlib") => Some(yu_engine::engine::BlockCodec::Zlib),
-        Some("snappy") => Some(yu_engine::engine::BlockCodec::Snappy),
-        _ => None,
-    };
+    // 存档块压缩层:与 CLI `--save-codec` 同义(只影响写盘);`None` = 自动。
+    let codec = save_codec;
     // 后端:GPU 失败必须显式报错,不自动降级(自动降级 = 用户以为在看 GPU
     // 结果其实是 CPU)。
-    let chosen_backend = match backend.as_str() {
-        "wgpu" => Backend::Wgpu,
-        _ => Backend::Soft,
-    };
+    let chosen_backend = backend;
     // GPU 上下文由宿主建(引擎侧 `gpu_context` 注入口):这样才能控制
     // 底层接口与回退顺序,而不是交给进程级环境变量。
     let gpu_context = if chosen_backend == Backend::Wgpu {
-        Some(create_gpu_context(&gpu_backend)?)
+        Some(create_gpu_context(gpu_backend)?)
     } else {
         None
     };
@@ -872,6 +831,9 @@ pub fn start_engine(
         font_bytes,
         font,
         patch: yu_engine::patch::PatchSelection::new(patch),
+        // `@_TIME` 注入系统本地时间(存档菜单的现实日期)。以前这里缺省
+        // `None` ⇒ Android 上恒 1970,与桌面出现脚本可见的行为分歧。
+        local_time: yu_engine::host_clock::local_now(),
         ..EngineOptions::default()
     };
     let mut engine =
@@ -916,7 +878,7 @@ pub fn start_engine(
         fps,
         engine.boot_ms(),
         os_sound,
-        save_codec.as_deref().unwrap_or("auto"),
+        save_codec.map_or("auto", BlockCodec::as_str),
         dataset.summary(),
         save_root.display(),
         audio_note,
@@ -1036,7 +998,11 @@ pub fn tick() -> i32 {
                     // 诊断副本,不影响上屏。
                     session.frame_pixels = rendered.surface.rgba.clone();
                 }
-                0
+                // 退出信号(跨平台统一):`1` = 游戏已结束,壳据此
+                // `finish()` 回到自己的界面,而不是继续 tick 一个死会话。
+                // 以前只有非 quiet 状态串里带 `main_finished=1`,发布模式
+                // 永远看不到 ⇒ 游戏 END 后画面停住、音乐继续。
+                session.engine.lifecycle().host_code()
             }
             Err(failure) => {
                 set_error(format!("tick 失败: {failure}"));
@@ -1147,10 +1113,18 @@ pub fn status_text() -> String {
                 if session.quiet {
                     // 发布模式仍保留状态判据:壳/自动化用 `status=running`
                     // 判断会话是否活着,不能因为省字段就把它删掉。
+                    // 生命周期同样必须留在发布模式 —— 它是退出信号,
+                    // 不是诊断(少了它壳就不知道游戏已经结束)。
                     out.push_str(&format!(
-                        "status=running frame={} fps=60",
+                        "status={} frame={} fps=60",
+                        session.engine.lifecycle().as_str(),
                         session.engine.last_report().frame
                     ));
+                    if let yu_engine::engine::Lifecycle::Exited { restart } =
+                        session.engine.lifecycle()
+                    {
+                        out.push_str(&format!(" restart={}", u8::from(restart)));
+                    }
                     return;
                 }
                 let report = session.engine.last_report().clone();
@@ -1194,8 +1168,17 @@ pub fn status_text() -> String {
                 if !session.video {
                     out.push_str(" video=off");
                 }
-                if session.engine.main_finished() {
+                // 生命周期(统一退出信号):running / finished / exited。
+                let lifecycle = session.engine.lifecycle();
+                out.push_str(&format!(" lifecycle={}", lifecycle.as_str()));
+                if lifecycle.is_terminal() {
                     out.push_str(" main_finished=1");
+                }
+                if let yu_engine::engine::Lifecycle::Exited { restart } = lifecycle {
+                    out.push_str(&format!(" restart={}", u8::from(restart)));
+                }
+                if session.engine.is_suspended() {
+                    out.push_str(" suspended=1");
                 }
             }
             None => out.push_str("status=idle"),
@@ -1207,6 +1190,65 @@ pub fn status_text() -> String {
     // 每帧状态行都会调用 status_text;顺手 flush,避免日志长时间滞留缓冲。
     flush_logs();
     out
+}
+
+/// 挂起会话(壳 `onPause` / 页面隐藏 / 后台)。
+///
+/// 语义见 [`yu_engine::engine::Engine::suspend`]:丢弃暂停期间的真实时间
+/// (恢复后不快进)并静音音频输出。**不做存档 flush** —— 存档在 `SAVE`
+/// 命令时刻就已落盘,挂起时再写一次只会制造第二份不一致的现场。
+///
+/// 返回 `0` 成功、`-1` 会话未初始化。重复调用幂等。
+pub fn suspend() -> i32 {
+    SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(session) = slot.as_mut() else {
+            return -1;
+        };
+        session.engine.suspend();
+        log_line("yu-host-android", "session suspended");
+        0
+    })
+}
+
+/// 恢复会话(壳 `onResume`)。与 [`suspend`] 配对,未挂起时是 no-op。
+///
+/// 返回 `0` 成功、`-1` 会话未初始化。
+pub fn resume() -> i32 {
+    SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(session) = slot.as_mut() else {
+            return -1;
+        };
+        session.engine.resume();
+        log_line("yu-host-android", "session resumed");
+        0
+    })
+}
+
+/// 会话生命周期代号(供壳在 `nativeTick` 之外主动查询)。
+///
+/// - `0` = running(可继续 tick)
+/// - `1` = finished(主脚本走完)
+/// - `2` = exited(脚本 `END`)
+/// - `3` = exited 且带 `RESTART` 标志
+/// - `-1` = 会话未初始化
+///
+/// 与 `nativeTick` 的返回值同一套判据(`Lifecycle::host_code`):
+/// tick 返回 `1` ⇔ 这里返回 `1/2/3`。壳只需要看其中一个。
+pub fn lifecycle_code() -> i32 {
+    SESSION.with(|slot| {
+        let slot = slot.borrow();
+        let Some(session) = slot.as_ref() else {
+            return -1;
+        };
+        match session.engine.lifecycle() {
+            yu_engine::engine::Lifecycle::Running => 0,
+            yu_engine::engine::Lifecycle::Finished => 1,
+            yu_engine::engine::Lifecycle::Exited { restart: false } => 2,
+            yu_engine::engine::Lifecycle::Exited { restart: true } => 3,
+        }
+    })
 }
 
 /// 释放会话(可再次 `init_session`)。返回是否真的释放了一个会话。
@@ -1556,6 +1598,33 @@ mod jni_entry {
         to_jstring(&mut env, version_tag())
     }
 
+    /// 挂起会话(壳 `onPause`):停时钟、静音音频。返回 `0` 成功 / `-1` 未初始化。
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeSuspend<'local>(
+        _env: JNIEnv<'local>,
+        _class: JClass<'local>,
+    ) -> jint {
+        suspend()
+    }
+
+    /// 恢复会话(壳 `onResume`)。返回 `0` 成功 / `-1` 未初始化。
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeResume<'local>(
+        _env: JNIEnv<'local>,
+        _class: JClass<'local>,
+    ) -> jint {
+        resume()
+    }
+
+    /// 生命周期代号:0 running / 1 finished / 2 exited / 3 exited+restart / -1 未初始化。
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeLifecycle<'local>(
+        _env: JNIEnv<'local>,
+        _class: JClass<'local>,
+    ) -> jint {
+        lifecycle_code()
+    }
+
     #[no_mangle]
     pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeShutdown<'local>(
         _env: JNIEnv<'local>,
@@ -1612,7 +1681,7 @@ mod tests {
         assert_eq!(config.fps, 30);
         assert_eq!(config.screen_color, 24);
         assert_eq!(config.dx_mode, 1);
-        assert_eq!(config.save_codec.as_deref(), Some("snappy"));
+        assert_eq!(config.save_codec, Some(BlockCodec::Snappy));
         assert!(config.media_readonly);
         assert!(config.record_events);
     }
@@ -1623,20 +1692,78 @@ mod tests {
             r#"{"data_root":"/g","backend":"wgpu","log_file":"debug/run.jsonl","log_level":"verbose"}"#,
         )
         .expect("解析应成功");
-        assert_eq!(config.backend, "wgpu");
+        assert_eq!(config.backend, Backend::Wgpu);
         assert_eq!(config.log_file, Some(PathBuf::from("debug/run.jsonl")));
-        assert_eq!(config.log_level, "verbose");
+        assert_eq!(config.log_level, LogLevel::Verbose);
         // 缺省 = CPU + 不写日志文件。
         let default = RunConfig::from_json(r#"{"data_root":"/g"}"#).unwrap();
-        assert_eq!(default.backend, "soft");
+        assert_eq!(default.backend, Backend::Soft);
         assert_eq!(default.log_file, None);
-        assert_eq!(default.log_level, "info");
+        assert_eq!(default.log_level, LogLevel::Info);
     }
 
+    /// 取值集合必须与 CLI `--log-level` 完全一致:`debug`/`trace` 曾被
+    /// Android 侧单独拒收(两份解析漂移),现在共用一个解析器。
     #[test]
-    fn run_config_rejects_unknown_backend() {
+    fn run_config_log_level_matches_cli_value_set() {
+        for value in ["quiet", "error", "warn", "info", "debug", "trace", "verbose"] {
+            let json = format!(r#"{{"log_level":"{value}"}}"#);
+            let config = RunConfig::from_json(&json)
+                .unwrap_or_else(|error| panic!("`{value}` 应被接受: {error}"));
+            assert_eq!(config.log_level, yu_log::LogLevel::parse(value).unwrap());
+        }
+        assert!(RunConfig::from_json(r#"{"log_level":"loud"}"#).is_err());
+    }
+
+    /// `debug`/`trace` 与 `verbose` 一样要退出发布模式(它们比缺省更松)。
+    #[test]
+    fn run_config_debug_levels_leave_quiet_mode() {
+        for value in ["debug", "trace", "verbose"] {
+            let json = format!(r#"{{"log_level":"{value}"}}"#);
+            let config = RunConfig::from_json(&json).expect("解析应成功");
+            assert!(!config.quiet, "`{value}` 应退出发布模式");
+        }
+        let warn = RunConfig::from_json(r#"{"log_level":"warn"}"#).unwrap();
+        assert!(warn.quiet, "warn 不退出发布模式");
+    }
+
+    /// 文本编码路线与 CLI `--patch` 同一份词表(含本轮新增的 big5)。
+    #[test]
+    fn run_config_patch_matches_cli_value_set() {
+        for value in ["auto", "original", "gbk", "big5", "tunnel", "cp950"] {
+            let json = format!(r#"{{"patch":"{value}"}}"#);
+            let config = RunConfig::from_json(&json).expect("解析应成功");
+            assert_eq!(
+                config.patch,
+                yu_engine::patch::PatchKind::parse(value).expect("引擎侧同一份解析"),
+            );
+        }
+        assert!(RunConfig::from_json(r#"{"patch":"euc-kr"}"#).is_err());
+    }
+
+    /// 后端取值与 CLI 同一份解析(大小写/空白容错也一致)。
+    #[test]
+    fn run_config_backend_aliases_match_engine_parser() {
+        for value in ["soft", "wgpu", "SOFT", " Wgpu "] {
+            let json = format!(r#"{{"backend":"{value}"}}"#);
+            let config = RunConfig::from_json(&json).expect("解析应成功");
+            assert_eq!(
+                config.backend,
+                Backend::parse(value).expect("引擎侧同一份解析"),
+            );
+        }
         assert!(RunConfig::from_json(r#"{"backend":"vulkan"}"#).is_err());
-        assert!(RunConfig::from_json(r#"{"log_level":"trace"}"#).is_err());
+    }
+
+    /// GPU 接口取值与引擎 `YURIS_WGPU_BACKEND` 同一份(`GpuBackend`)。
+    #[test]
+    fn run_config_gpu_backend_parses_through_shared_table() {
+        for value in ["auto", "primary", "dx12", "vulkan", "gles", "gl", "all"] {
+            let json = format!(r#"{{"gpu_backend":"{value}"}}"#);
+            let config = RunConfig::from_json(&json).expect("解析应成功");
+            assert_eq!(config.gpu_backend, GpuBackend::parse(value).unwrap());
+        }
+        assert!(RunConfig::from_json(r#"{"gpu_backend":"metal"}"#).is_err());
     }
 
     #[test]

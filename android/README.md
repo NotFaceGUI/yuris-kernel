@@ -48,6 +48,14 @@ cp -r ~/.gradle/caches/transforms-4 "$GRADLE_USER_HOME/caches/" 2>/dev/null
 gradle --offline --no-daemon assembleRelease
 ```
 
+本机(2026-11-07 实测)可用组合:`JAVA_HOME = Android Studio 的 JBR`
+(`C:\Program Files\Android\Android Studio1\jbr`,全 JDK 反而报
+`Failed to load native library 'native-platform.dll'`)+ 上面的独立
+`GRADLE_USER_HOME`(依赖缓存已有 178M,离线 `assembleDebug` 40s)。
+Windows 下 NDK 的 sh 版 `*-clang` 无法被 Rust exec,`build.sh` 会自动改用
+`.cmd` 包装器(也兼容 r28 起 sysroot 挪进 toolchains 的新布局)。
+```
+
 同理,若出现 `modules-2.lock ... 拒绝访问`,说明有 IDE 正在使用同一份缓存;
 独立 home 可绕开。
 
@@ -109,7 +117,32 @@ files/save/             ← 存档(可写)
 `MOUSE_L` 的按下/抬起(经 `yu-platform-input` 的按钮 ABI)。虚拟按键/手势
 映射尚未取证(架构 §2.5.9 开放问题 9),当前只做单点 = 鼠标左键。
 
-## 生命周期
+## 生命周期(见 DIV-AND-005)
 
-`onPause` 停渲染线程(停时钟停泵),`onResume` 重建;`onDestroy` 释放内核会话。
-存档在 `SAVE` 刷盘的**命令时刻**落盘,因此挂起不需要额外 flush。
+`onPause` → `nativeSuspend()`:内核丢弃暂停期间的真实时间(恢复**不快进**
+—— 否则后台几分钟回来,第一帧把整段墙钟灌进 `@_OS_TIME`,淡出/补间瞬移)
+并静音音频;壳停渲染线程。`onResume` → `nativeResume()`:声音挂回、重建
+渲染循环。`onDestroy` 释放内核会话。存档在 `SAVE` 刷盘的**命令时刻**落盘,
+因此挂起不需要额外 flush。
+
+退出信号是跨平台统一的:脚本 `END`/主脚本走完后 `nativeTick()` 返回 `1`
+(内核 `Lifecycle::host_code`),壳据此收尾并回配置界面 —— 发布模式
+(quiet)下同样可见,不再依赖诊断状态串。
+
+## 启动参数(Intent Extra → run-config.json 键)
+
+| Extra | 键 | 取值 | 缺省 |
+|---|---|---|---|
+| `game_dir` / `save_dir` | 同名 | 游戏根 / 存档根 | `files/game` / `<game>/save` |
+| `backend` / `gpu_backend` | 同名 | `soft\|wgpu` / `auto\|gles\|vulkan` | soft / auto |
+| `entry` | 同名 | 入口标签 | SYSTEM_START |
+| `font_path` / `font_family` | `font_file` / `font` | 字体文件 / family | 空 |
+| `patch` | 同名 | `auto\|original\|gbk\|big5\|tunnel` | auto |
+| `save_codec` | 同名 | `zlib\|snappy` | 自动判定 |
+| `fps` | 同名 | 正整数 | 60 |
+| `screen_color` | 同名 | `@_SCREEN_COLOR` 代号 | 32 |
+| `audio` / `tone` | `audio` / `audio_tone` | 布尔(诊断) | true / false |
+| `debug_log` / `show_hud` | —(壳侧) | 布尔 | false |
+
+取值解析全部只有一份(见 `docs/cross-platform.md`「宿主参数唯一取值表」);
+配置界面的「文本编码」「存档」卡片与选择持久化在 `SetupActivity`。
