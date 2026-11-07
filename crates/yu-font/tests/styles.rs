@@ -32,27 +32,21 @@ fn setup() -> Option<(support::TestFont, FontRenderer)> {
 /// 按 AGENTS.md §0 无证据不猜:宁可按原 face 画并由后端报
 /// `text.font.bold_missing`。
 #[test]
-fn bold_adds_ink_only_with_a_real_bold_face() {
+fn bold_adds_ink_with_real_or_gdi_faux_bold() {
     let Some((font, mut r)) = setup() else { return };
     let normal = support::style(&font, 24, 24);
     let mut bold = normal;
     bold.bold = true;
     let a = r.render_glyph('漢', &normal, StylePolicy::Strict).unwrap();
     let b = r.render_glyph('漢', &bold, StylePolicy::Strict).unwrap();
-    if font.source.family_has_bold(normal.face) {
-        assert!(
-            b.alpha_mass() > a.alpha_mass(),
-            "真实粗体面必须增加墨迹 ({} -> {})",
-            a.alpha_mass(),
-            b.alpha_mass()
-        );
-    } else {
-        assert_eq!(
-            a.alpha_mass(),
-            b.alpha_mass(),
-            "无粗体面时按原 face 绘制(不合成加粗)"
-        );
-    }
+    // BOLD 走真实粗体 face;没有时按 GDI/Wine 的 faux bold 合成。
+    // 两种路径都必须增加墨迹,不能静默丢弃 BOLD。
+    assert!(
+        b.alpha_mass() > a.alpha_mass(),
+        "BOLD 必须增加墨迹 ({} -> {})",
+        a.alpha_mass(),
+        b.alpha_mass()
+    );
 }
 
 #[test]

@@ -137,6 +137,10 @@ pub struct FontSource {
     /// 一句话一帧 ~50ms 尖峰)。按需读入一次后常驻共享;只缓存实际用到的
     /// 文件,不做全库预热。
     data_cache: Mutex<HashMap<PathBuf, Arc<Vec<u8>>>>,
+    /// `FaceId → 字体自身是否声明 Bold`(OS/2 fsSelection / head macStyle)。
+    ///
+    /// 只在该 family 首次需要判定时读字体字节;不是 weight 阈值猜测。
+    bold_cache: Mutex<HashMap<FaceId, bool>>,
 }
 
 impl std::fmt::Debug for FontSource {
@@ -146,6 +150,25 @@ impl std::fmt::Debug for FontSource {
             .field("origin", &self.origin)
             .finish()
     }
+}
+
+/// 从字体字节中提取 family 名(供 `--font <path>` 强制该字体)。
+///
+/// 返回字体表里的全部 family 名(含本地化名),保持 face 顺序;空 = 没有
+/// 可用 face。调用方通常取第一个作为 `force_font`。
+#[must_use]
+pub fn families_from_bytes(bytes: &[u8]) -> Vec<String> {
+    let mut db = fontdb::Database::new();
+    db.load_font_data(bytes.to_vec());
+    let mut out = Vec::new();
+    for info in db.faces() {
+        for (name, _) in &info.families {
+            if !out.iter().any(|seen: &String| seen == name) {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
 }
 
 impl FontSource {
@@ -197,6 +220,7 @@ impl FontSource {
             by_db,
             origin,
             data_cache: Mutex::new(HashMap::new()),
+            bold_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -282,6 +306,7 @@ impl FontSource {
             by_db,
             origin: FaceOrigin::System,
             data_cache: Mutex::new(HashMap::new()),
+            bold_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -350,6 +375,7 @@ impl FontSource {
             by_db,
             origin: FaceOrigin::System,
             data_cache: Mutex::new(HashMap::new()),
+            bold_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -559,19 +585,50 @@ impl FontSource {
         sorted.get(no).map(|x| x.2)
     }
 
-    /// 该 face 所属 family 里是否存在**真实粗体面**(weight >= 600)。
+    /// 字体自身是否声明 Bold(`OS/2 fsSelection` 或 `head.macStyle`)。
     ///
-    /// 只扫本 source 的 face 表(纯内存),不走 `fontdb::Database::query` ——
-    /// 后者在首次调用时会加载字体文件,实测造成 173ms 单帧尖峰。
-    /// 用途:决定 `FONT[BOLD=1]` 能否按真粗体绘制,而不是合成膨胀。
+    /// 不按 `usWeightClass` 猜:600 是 SemiBold,GDI 的 `FW_BOLD` 是 700,
+    /// 用阈值会把“半粗”误当粗体。真实依据是字体文件里的 Bold 标志。
+    fn face_declared_bold(&self, face: FaceId) -> bool {
+        if let Some(&hit) = self
+            .bold_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&face)
+        {
+            return hit;
+        }
+        let declared = self
+            .with_face_data(face, |bytes, index| {
+                ttf_parser::Face::parse(bytes, index)
+                    .map(|f| f.is_bold())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        self.bold_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(face, declared);
+        declared
+    }
+
+    /// 该 face 所属 family 里是否存在**字体自己声明的粗体面**。
+    ///
+    /// 用途:决定 `FONT[BOLD=1]` 能否按真粗体绘制;没有声明就保持原 face,
+    /// 不做合成加粗(用户明确要求与官方字体一致,不自行加粗)。
     #[must_use]
     pub fn family_has_bold(&self, face: FaceId) -> bool {
         let Ok(base) = self.record(face) else {
             return false;
         };
-        self.faces
-            .iter()
-            .any(|f| f.family_key == base.family_key && f.weight >= 600)
+        self.faces.iter().any(|f| {
+            f.family_key == base.family_key
+                && (f.weight >= 550
+                    || self
+                        .by_db
+                        .get(&f.db_id)
+                        .is_some_and(|&fid| self.face_declared_bold(fid)))
+        })
     }
 
     /// Resolve bold/italic to an actual face, reporting synthetic fallbacks.
@@ -608,7 +665,13 @@ impl FontSource {
             }
         }
         let rec = chosen.unwrap_or(base);
-        let synthetic_bold = bold && rec.weight < 600;
+        // GDI/Wine 的 faux bold 判定:请求 >550、face 未声明 BOLD、且
+        // face 自身 weight <550。face weight ≥550 视为已有粗体(不再合成)。
+        let face_declared = self
+            .by_db
+            .get(&rec.db_id)
+            .is_some_and(|&fid| self.face_declared_bold(fid));
+        let synthetic_bold = bold && rec.weight < 550 && !face_declared;
         let synthetic_italic = match italic {
             Italic::None => false,
             Italic::Synthetic { .. } => true,

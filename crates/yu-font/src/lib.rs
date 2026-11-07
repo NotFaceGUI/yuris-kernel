@@ -65,7 +65,8 @@ pub use layout::{HorizontalLayout, PlacedGlyph, TextLayout};
 pub use raster::{RasterParams, Rasterizer};
 pub use render::{compose_glyph, render_glyph_once, FontRenderer};
 pub use source::{
-    FaceId, FaceInfo, FaceOrigin, FaceStyle, FontSource, ResolvedFace, ENGINE_DEFAULT_FAMILIES,
+    families_from_bytes, FaceId, FaceInfo, FaceOrigin, FaceStyle, FontSource, ResolvedFace,
+    ENGINE_DEFAULT_FAMILIES,
 };
 pub use style::{
     AaMode, Capability, DrawMode, Gradation, GradationScope, Italic, Kerning, Outline, OutlineJoin,

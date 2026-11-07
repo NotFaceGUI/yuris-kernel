@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["third_party/swash"]
 members = [
     "crates/yu-cli",
     "crates/yu-engine",
@@ -29,6 +30,11 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 flate2 = "1"
+
+# 本地 fork:修复 `Outline::embolden` 在「就」这类多轮廓字形上把 coverage
+# 算坏的问题(上游 0.2.10 未修)。只改 third_party/swash 内的算法,不改 API。
+[patch.crates-io]
+swash = { path = "third_party/swash" }
 
 # 本机 MSVC 环境下 libz-sys 的 vendored zlib 在 dev/test 档带 `-Z7` 编译时
 # 触发 cl D8050(无法执行 c1.dll:未能将命令行放入调试记录中);该包是

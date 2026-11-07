@@ -65,11 +65,10 @@ impl Rasterizer {
     ///
     /// * `sx`/`sy` are engine pixels; `sy == 0` or `sx == 0` yields an empty
     ///   bitmap (the engine accepts 0 and draws nothing).
-    /// * BOLD 只接受**真实粗体面**;本机 family 没有 weight>=600 的 face 时
-    ///   **不做合成加粗**,按原 face 绘制并由调用方报 `font.bold_missing`。
-    ///   合成加粗(GDI 的 bold simulation 也不是简单膨胀)会让笔画明显变粗,
-    ///   实测墨迹 212→361(+70%),与官方截图对不上;按 AGENTS.md §0 无证据
-    ///   不猜,宁可按原 face 画并显式报告。
+    /// * BOLD 优先真实粗体面;缺失时按 GDI/Wine 的 faux bold 规则合成:
+    ///   强度 `ppem / 24` 像素,advance 额外 +1px。官方引擎走
+    ///   `CreateFontIndirectA(weight=700) + TextOutA`,没有 Bold face 的
+    ///   宋体就是靠这条 GDI 合成路径出粗体。
     /// * Italic prefers a real italic face; otherwise a shear of the requested
     ///   angle is applied. The engine has no italic parameter.
     pub fn rasterize(
@@ -129,7 +128,9 @@ impl Rasterizer {
             let metrics = font.glyph_metrics(&[]).scale(sy);
             let advance_f = metrics.advance_width(gid) * x_scale;
             let t1c = t0.elapsed();
-            let advance = (advance_f * 256.0).round() as i32;
+            // GDI/Wine faux bold:advance 额外 +1px(26.6 定点 = 256)。
+            let advance = (advance_f * 256.0).round() as i32
+                + if resolved.synthetic_bold { 256 } else { 0 };
             if ch == '\0' {
                 return Ok(GlyphBitmap::empty(advance));
             }
@@ -145,6 +146,12 @@ impl Rasterizer {
                     x: 0.0,
                     y: 0.0,
                 }));
+            // GDI/Wine 传入 `FT_Outline_Embolden(ppem/24)`,FreeType 内部
+            // 会把 strength 减半;swash 不减半,所以传 ppem/48 得到同样净扩量。
+            // swash 的多轮廓绕向 bug 已在 `third_party/swash` 修复。
+            if resolved.synthetic_bold {
+                render.embolden(sy / 48.0);
+            }
             // ScaleContext 按字体字节地址+face 序号维护内部准备缓存:
             // 同一 face 的第二次 builder 命中缓存,构建退化为微秒级。
             let t2 = t0.elapsed();

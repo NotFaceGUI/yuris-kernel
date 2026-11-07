@@ -14,6 +14,8 @@ swash = { version = "0.2.10", default-features = false, features = ["std", "scal
 fontdb = { version = "0.24", default-features = false, features = ["std"] }
 # CP932 (Shift_JIS) bytes -> chars for text drawing. Pure Rust, wasm clean.
 encoding_rs = "0.8"
+# 字体自身的 Bold 声明(OS/2 fsSelection / head macStyle),不靠 weight 阈值。
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # System font discovery on desktop/Android. memmap/fontconfig stay off.
