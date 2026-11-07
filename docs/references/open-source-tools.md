@@ -81,8 +81,16 @@ README 只列**实际采用/实际参考**的项目；参考但未采用的不�
 - **RxYuris**(ZQF-ReVN): YSTB/YSCM/YSTL 解析流程、YSCOM Loader
 - **YU-RIS-Script-Editor**(Aionfatedio): YSTB V5 段序、V2 版本带判定、编码自检测
   （未声明许可，仅事实参考，未复制代码）
+- **YU-RIS_Guide**(TheVNConnoisseur): 官方工具与 SDK 全量归档(81 个官方 SDK)。
+  本仓库 27 张系统变量 ABI 表与全部 `YSCom.ycd` 语料取自该归档,每张表头记录
+  来源 sha256 与 `# covers` 版本区间(`crates/yu-rt/data/sysvar-abi-*.tsv`)。
+  仓库未声明许可证;只取其中的**官方 SDK 产物字节**,不取代码。
+- **YURIS_TOOLS**(jyxjyx1234): 隧道码点分配算法
+  (`crates/yu-format/src/text.rs::TunnelTable`,按其 `internal/ybn/tunnel.go`
+  逐字复刻);其余汉化流程仅事实参考。
+- **pl_mpeg / southstar-codecs**: `MOVIE` 的 MPEG-1 解码(crates.io 依赖,MIT,未改源码)
 
-未采用(保留在 §1，不进入 README): YURIS_TOOLS、GARbro、yuri、YuRISTools、
+未采用(保留在 §1，不进入 README): GARbro、yuri、YuRISTools、
 YPF_Tool、YPF-Manager、ypf-repacker、YurisKeyFinder 等。
 
 ## 5. 实际采用登记(yu-rt,成果 C2)
