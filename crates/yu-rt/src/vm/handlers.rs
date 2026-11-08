@@ -3091,13 +3091,10 @@ impl Vm {
         st: &mut ExecState,
         cmd: &Cmd,
     ) -> Result<Vec<(u8, String, Value)>, VmError> {
-        let names: Vec<String> = self
-            .tables()
-            .boot
-            .yscm
-            .command(cmd.opcode)
-            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default();
+        // 参数名表随调用点缓存一次(`fill_cmd` 已存进 `cmd.param_names`)。
+        // 旧写法每次执行都 `p.name.clone()` 重建整张表:SIM 的 `SAVE` 单帧
+        // 12 次 × 20+ 个 `String`,纯堆分配(与 `CGINFO`/`VARACT` 同一个 bug)。
+        let names: &[String] = &cmd.param_names;
         let mut out = Vec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
@@ -3141,13 +3138,9 @@ impl Vm {
     /// 其它查询(FOLDER/SIZE/RELATION/CGFILE/SOUNDFILE)语义未取证,
     /// 保持挂号并只发 `DomainCall`(不猜 0)。
     fn op_fileinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        let names: Vec<String> = self
-            .tables()
-            .boot
-            .yscm
-            .command(cmd.opcode)
-            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default();
+        // 参数名表随调用点缓存一次(`fill_cmd` 已存进 `cmd.param_names`);
+        // 旧写法每次执行都重建整张 `Vec<String>`(与 `CGINFO` 同一个 bug)。
+        let names: &[String] = &cmd.param_names;
         let mut file: Option<Vec<u8>> = None;
         let mut folder: Option<Vec<u8>> = None;
         let mut exist = false;
@@ -3406,13 +3399,9 @@ impl Vm {
     /// - `ID=` 图层快照 = H-P4-02(挂账,不阻塞变量保存);
     /// - FILE 缺 `.sd` 补上、含 `.sd` 超 32 字节报错(手册 + REA `0x44c663`)。
     fn op_save(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        let names: Vec<String> = self
-            .tables()
-            .boot
-            .yscm
-            .command(cmd.opcode)
-            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default();
+        // 参数名表随调用点缓存一次(`fill_cmd` 已存进 `cmd.param_names`);
+        // 旧写法每次执行都重建整张 `Vec<String>`(与 `CGINFO` 同一个 bug)。
+        let names: &[String] = &cmd.param_names;
         let mut file: Option<String> = None;
         let mut dno: Option<i64> = None;
         let mut set: Option<(LValue, Value)> = None;
@@ -3612,13 +3601,9 @@ impl Vm {
     /// 块类型 0 写 `LET` 目标整组(`0x447b3d`);`ID=` 图层恢复 = H-P4-02。
     /// 类型/维数不符官方报错(手册:「サイズが違う場合は、エラー」)。
     fn op_load(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        let names: Vec<String> = self
-            .tables()
-            .boot
-            .yscm
-            .command(cmd.opcode)
-            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default();
+        // 参数名表随调用点缓存一次(`fill_cmd` 已存进 `cmd.param_names`);
+        // 旧写法每次执行都重建整张 `Vec<String>`(与 `CGINFO` 同一个 bug)。
+        let names: &[String] = &cmd.param_names;
         let mut file: Option<String> = None;
         let mut dno: Option<i64> = None;
         let mut target: Option<LValue> = None;
@@ -4526,13 +4511,9 @@ impl Vm {
     /// - 这 7 个都不在请求里时,其余字段连续执行、最后写入者胜出;
     /// - 缺层时引擎把 LET 清零(字符串目标写空)。
     fn op_soundinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        let params: Vec<String> = self
-            .tables()
-            .boot
-            .yscm
-            .command(cmd.opcode)
-            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default();
+        // 参数名表随调用点缓存一次(`fill_cmd` 已存进 `cmd.param_names`);
+        // 旧写法每次执行都重建整张 `Vec<String>`(与 `CGINFO` 同一个 bug)。
+        let params: &[String] = &cmd.param_names;
         let mut targets: Vec<crate::expr::LValue> = Vec::new();
         let mut event_args: Vec<ArgValue> = Vec::new();
         let mut query_args: Vec<ArgValue> = Vec::new();
@@ -4612,13 +4593,9 @@ impl Vm {
     fn op_text(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         use crate::text::flag as tflag;
         // 参数名来自工程 ysc 表(opcode → 命令声明),不写死槽号。
-        let names: Vec<String> = self
-            .tables()
-            .boot
-            .yscm
-            .command(cmd.opcode)
-            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default();
+        // 参数名表随调用点缓存一次(`fill_cmd` 已存进 `cmd.param_names`);
+        // 旧写法每次执行都重建整张 `Vec<String>`(与 `CGINFO` 同一个 bug)。
+        let names: &[String] = &cmd.param_names;
         let mut vals: Vec<(String, Value)> = Vec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
@@ -4730,13 +4707,9 @@ impl Vm {
     ///
     /// 台账:`COV-M-02`。
     fn op_textinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        let names: Vec<String> = self
-            .tables()
-            .boot
-            .yscm
-            .command(cmd.opcode)
-            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default();
+        // 参数名表随调用点缓存一次(`fill_cmd` 已存进 `cmd.param_names`);
+        // 旧写法每次执行都重建整张 `Vec<String>`(与 `CGINFO` 同一个 bug)。
+        let names: &[String] = &cmd.param_names;
         let mut target: Option<crate::expr::LValue> = None;
         let mut present: Vec<String> = Vec::new();
         for w in &cmd.windows {
@@ -5079,13 +5052,9 @@ impl Vm {
     /// 写输入文本。内核把模态改成「任务挂起 + `Vm::answer_dialog` 回答」,
     /// 完整契约与逐参数证据见 `docs/domain-event-contracts.md` §7。
     fn op_dialog(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        let params: Vec<String> = self
-            .tables()
-            .boot
-            .yscm
-            .command(cmd.opcode)
-            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default();
+        // 参数名表随调用点缓存一次(`fill_cmd` 已存进 `cmd.param_names`);
+        // 旧写法每次执行都重建整张 `Vec<String>`(与 `CGINFO` 同一个 bug)。
+        let params: &[String] = &cmd.param_names;
         let mut caption = Vec::new();
         let mut text = Vec::new();
         let mut default_input = Vec::new();

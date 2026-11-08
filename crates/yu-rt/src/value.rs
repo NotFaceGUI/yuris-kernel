@@ -547,15 +547,50 @@ pub fn linear_offset_for(
     Ok(flat)
 }
 
-/// 变量域:声明、读、写。键 = `(space,id)`;`BTreeMap` 保证事件/诊断顺序确定。
+/// 变量域:声明、读、写。键 = `(space,id)`。
+///
+/// # 扁平 slab(热路径去哈希)
+///
+/// `read`/`write` 是逐命令热路径:ERIS 场景构建帧实测单帧 52.7 万次 `LET`。
+/// 旧实现每次都算 `(VarSpace, u16)` 元组的哈希再查 `FxHashMap`。
+///
+/// 变量 id 由 `ysv.ybn` 声明,实测分布很窄(ERIS 语料 548..4595,跨度 4048、
+/// 实际条目 1781)——够直接数组索引。`id` 本身就是 `u16`,所以
+/// `dense[space][id]` 可以覆盖**全部** id:
+///
+/// - `dense[space]`:`Vec<Option<Box<VarSlot>>>`,下标 = id,零哈希零探测;
+/// - `overflow`:仅为防御保留(当前 `id: u16 ⇒ DENSE_CAP = 65536` 恒覆盖),
+///   保持「任意 id 都正确」这一约束不被数组上限破坏。
+///
+/// 与单一哈希表**语义完全等价**:`declare`/`remove`/`iter` 都覆盖两级。
+/// 依据:旁线 `docs/architecture.md` §6.1「变量用扁平 slab(按域预分配),
+/// 避免哈希表查找」。数组按需增长(首次声明到该 id 才 `resize`),
+/// ERIS 实测到 4596 项 × 8 字节 = 37 KB。
 #[derive(Clone, Debug, Default)]
 pub struct VariableStore {
-    /// 热路径是逐命令读写,用 FxHashMap 代替 BTreeMap;需要稳定顺序的
-    /// [`VariableStore::iter`] 单独排序键。
-    slots: rustc_hash::FxHashMap<(VarSpace, u16), VarSlot>,
+    /// 直接索引区(按 space 分表,下标 = id)。
+    dense: [Vec<Option<Box<VarSlot>>>; 2],
+    /// `id >= DENSE_CAP` 的兜底(当前不可达,见类型文档)。
+    overflow: rustc_hash::FxHashMap<(VarSpace, u16), VarSlot>,
     /// 每次可观察状态变化 +1。`VARACT[INIT]` 的“同掩码且期间无写入”
     /// 快速路径用它判断是否需要真的重建全局槽。
     generation: u64,
+}
+
+/// `dense` 的索引上限 = `u16` 全域(`VarRef::id` 是 `u16`,故全覆盖)。
+const DENSE_CAP: usize = u16::MAX as usize + 1;
+
+/// `VarSpace` → `dense` 下标(数值域 = 0,字符串域 = 1)。
+///
+/// `LegacyNum`/`LegacyStr` 只是**编码前缀**不同,正常路径已由
+/// `canonical_var` 归一;这里再折叠一次,保证任何调用顺序都不会把同一个
+/// 变量分裂成两个槽。
+#[inline]
+fn dense_index(space: VarSpace) -> usize {
+    match space {
+        VarSpace::Dollar | VarSpace::LegacyStr => 1,
+        _ => 0,
+    }
 }
 
 impl VariableStore {
@@ -563,17 +598,48 @@ impl VariableStore {
         Self::default()
     }
 
+    #[inline]
+    fn cell(&self, r: VarRef) -> Option<&VarSlot> {
+        let index = usize::from(r.id);
+        if index >= DENSE_CAP {
+            return self.overflow.get(&(r.space, r.id));
+        }
+        self.dense[dense_index(r.space)]
+            .get(index)
+            .and_then(Option::as_deref)
+    }
+
+    #[inline]
+    fn cell_mut(&mut self, r: VarRef) -> Option<&mut VarSlot> {
+        let index = usize::from(r.id);
+        if index >= DENSE_CAP {
+            return self.overflow.get_mut(&(r.space, r.id));
+        }
+        self.dense[dense_index(r.space)]
+            .get_mut(index)
+            .and_then(Option::as_deref_mut)
+    }
+
     pub fn is_declared(&self, r: VarRef) -> bool {
-        self.slots.contains_key(&(r.space, r.id))
+        self.cell(r).is_some()
     }
 
     pub fn slot(&self, r: VarRef) -> Option<&VarSlot> {
-        self.slots.get(&(r.space, r.id))
+        self.cell(r)
     }
 
     pub fn declare(&mut self, r: VarRef, ty: ElemType, dims: &[usize], init: &Value) {
-        self.slots
-            .insert((r.space, r.id), VarSlot::new(ty, dims, init));
+        let slot = VarSlot::new(ty, dims, init);
+        let index = usize::from(r.id);
+        if index >= DENSE_CAP {
+            self.overflow.insert((r.space, r.id), slot);
+        } else {
+            let table = &mut self.dense[dense_index(r.space)];
+            if table.len() <= index {
+                table.resize_with(index + 1, || None);
+            }
+            table[index] = Some(Box::new(slot));
+        }
         self.bump();
     }
 
@@ -583,7 +649,7 @@ impl VariableStore {
     /// 同 type/dims);区别是不重新分配 Vec。`VARACT[INIT]` 在启动脚本里
     /// 被循环调用数万次,原实现每次重建所有全局槽是首帧 2s 的主因。
     pub fn reset_declared(&mut self, r: VarRef, ty: ElemType, dims: &[usize], init: &Value) {
-        if let Some(slot) = self.slots.get_mut(&(r.space, r.id)) {
+        if let Some(slot) = self.cell_mut(r) {
             if slot.ty == ty && slot.dims.as_slice() == dims {
                 for value in &mut slot.data {
                     *value = coerce_to(ty, init);
@@ -620,7 +686,7 @@ impl VariableStore {
                 format!("DIMSIZE 新长度 {new_len} 超出防御上限 {MAX_ELEMS}(畸形脚本)"),
             ));
         }
-        let Some(slot) = self.slots.get_mut(&(r.space, r.id)) else {
+        let Some(slot) = self.cell_mut(r) else {
             return Err(diag::fatal(
                 code::rt::VAR_UNDECLARED,
                 Boundary::Script,
@@ -652,7 +718,7 @@ impl VariableStore {
     /// 相同;这里用切片 rotate 原地搬运,不分配、不 clone 元素。
     /// 证据:手册 `variable/varact.html` 例 9/10 的 `PUSH/POP` 语义。
     pub fn shift_1d(&mut self, r: VarRef, pos: usize, push: bool) -> Result<(), yu_log::Diag> {
-        let slot = self.slots.get_mut(&(r.space, r.id)).ok_or_else(|| {
+        let slot = self.cell_mut(r).ok_or_else(|| {
             diag::unimplemented(
                 code::rt::VAR_UNDECLARED,
                 Boundary::Script,
@@ -683,20 +749,20 @@ impl VariableStore {
 
     /// 声明若不存在(用于 YSVR 初值镜像与声明命令)。
     pub fn declare_if_absent(&mut self, r: VarRef, ty: ElemType, dims: &[usize], init: &Value) {
-        let inserted = match self.slots.entry((r.space, r.id)) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(VarSlot::new(ty, dims, init));
-                true
-            }
-            std::collections::hash_map::Entry::Occupied(_) => false,
-        };
-        if inserted {
-            self.bump();
+        if self.cell(r).is_some() {
+            return;
         }
+        self.declare(r, ty, dims, init);
     }
 
     pub fn remove(&mut self, r: VarRef) -> Option<VarSlot> {
-        let removed = self.slots.remove(&(r.space, r.id));
+        let index = usize::from(r.id);
+        let removed = if index >= DENSE_CAP {
+            self.overflow.remove(&(r.space, r.id))
+        } else {
+            let table = &mut self.dense[dense_index(r.space)];
+            table.get_mut(index).and_then(Option::take).map(|b| *b)
+        };
         if removed.is_some() {
             self.bump();
         }
@@ -706,7 +772,7 @@ impl VariableStore {
     /// 读取(标量或数组元素)。未声明 → `rt.var.undeclared`。
     ///
     pub fn read(&self, r: VarRef, indices: &[i64]) -> Result<Value, yu_log::Diag> {
-        let slot = self.slots.get(&(r.space, r.id)).ok_or_else(|| {
+        let slot = self.cell(r).ok_or_else(|| {
             // 引擎错误文案「変数を初期化しないで使用しようとしました。」
             // (ysc.ybn 尾部消息表)。脚本错误 ⇒ Fatal(官方继续策略未取证;
             // DIV-RT-005)。
@@ -737,7 +803,7 @@ impl VariableStore {
     /// 写入。返回值：所有调用方都丢弃(旧签名返回存储值，白白多一次
     /// `Value` 克隆 —— 字符串变量就是一次堆复制)。
     pub fn write(&mut self, r: VarRef, indices: &[i64], value: &Value) -> Result<(), yu_log::Diag> {
-        let slot = self.slots.get_mut(&(r.space, r.id)).ok_or_else(|| {
+        let slot = self.cell_mut(r).ok_or_else(|| {
             diag::fatal(
                 code::rt::VAR_UNDECLARED,
                 Boundary::Script,
@@ -767,9 +833,7 @@ impl VariableStore {
 
     /// 槽位类型/维数(诊断与 `VARINFO` 用)。
     pub fn shape(&self, r: VarRef) -> Option<(ElemType, &[usize])> {
-        self.slots
-            .get(&(r.space, r.id))
-            .map(|s| (s.ty, s.dims.as_slice()))
+        self.cell(r).map(|s| (s.ty, s.dims.as_slice()))
     }
 
     /// 整组恢复(`LOAD[LET]` 写回;B1):目标槽已按同型声明时替换全部元素。
@@ -779,7 +843,7 @@ impl VariableStore {
     /// エラーとなります」——类型/维数/元素数不一致由调用方(VM)先查声明
     /// 并报错;本方法只做一致路径(引擎 `0x447b3d` 同型整写)。
     pub fn restore_elements(&mut self, r: VarRef, data: Vec<Value>) -> Result<(), yu_log::Diag> {
-        let slot = self.slots.get_mut(&(r.space, r.id)).ok_or_else(|| {
+        let slot = self.cell_mut(r).ok_or_else(|| {
             diag::fatal(
                 code::rt::VAR_UNDECLARED,
                 Boundary::Script,
@@ -815,7 +879,7 @@ impl VariableStore {
         needle: &Value,
         ty: ElemType,
     ) -> Option<usize> {
-        let slot = self.slots.get(&(r.space, r.id))?;
+        let slot = self.cell(r)?;
         for (index, value) in slot.data.iter().enumerate().skip(start) {
             let hit = match ty {
                 ElemType::Str => {
@@ -830,23 +894,48 @@ impl VariableStore {
         None
     }
 
-    /// 键的确定顺序遍历(存档/事件用)。
+    /// 键的**确定顺序**遍历(存档/事件用)。
+    ///
+    /// 顺序契约不变:按 `(space, id)` 升序。两级索引的物理顺序不同
+    /// (`dense[0]` 全部数值域、`dense[1]` 全部字符串域),这里显式合并两层
+    /// 再排序,保证与旧哈希表实现同样的输出序列。
     pub fn iter(&self) -> impl Iterator<Item = (VarRef, &VarSlot)> {
-        let mut keys: Vec<(VarSpace, u16)> = self.slots.keys().copied().collect();
-        keys.sort_unstable();
-        keys.into_iter().filter_map(|(space, id)| {
-            self.slots
-                .get(&(space, id))
-                .map(|slot| (VarRef { space, id }, slot))
-        })
+        let mut rows: Vec<(VarSpace, u16, &VarSlot)> = Vec::with_capacity(self.len());
+        for (table_index, table) in self.dense.iter().enumerate() {
+            // `dense` 的下标 0 = 数值域(`At`)、1 = 字符串域(`Dollar`)。
+            // 存的 `VarRef` 必须回填**真实 space**:`LegacyNum`/`LegacyStr`
+            // 编码的前缀不同,但归一化后进 store 的恒为 `At`/`Dollar`
+            // (`canonical_var`),与旧实现的键集合一致。
+            let space = if table_index == 1 {
+                VarSpace::Dollar
+            } else {
+                VarSpace::At
+            };
+            for (id, cell) in table.iter().enumerate() {
+                if let Some(slot) = cell.as_deref() {
+                    rows.push((space, id as u16, slot));
+                }
+            }
+        }
+        for (&(space, id), slot) in &self.overflow {
+            rows.push((space, id, slot));
+        }
+        rows.sort_unstable_by_key(|(space, id, _)| (*space, *id));
+        rows.into_iter()
+            .map(|(space, id, slot)| (VarRef { space, id }, slot))
     }
 
     pub fn len(&self) -> usize {
-        self.slots.len()
+        let dense: usize = self
+            .dense
+            .iter()
+            .map(|table| table.iter().filter(|cell| cell.is_some()).count())
+            .sum();
+        dense + self.overflow.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.len() == 0
     }
 }
 
