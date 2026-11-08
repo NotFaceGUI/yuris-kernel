@@ -42,7 +42,7 @@ android {
         minSdk = 24
         targetSdk = 36
         versionCode = injectedVersionCode ?: 1
-        versionName = injectedVersionName ?: "0.1.0"
+        versionName = injectedVersionName ?: "0.2.0"
         // 只打 64 位(架构文档 §2.5.9 开放问题 8:armeabi-v7a 待定):
         // arm64-v8a = 真机目标;x86_64 = 本机模拟器验证用。
         // ABI 过滤:默认两个都打;构建模拟器验证包时用 -PabiFilter=x86_64
