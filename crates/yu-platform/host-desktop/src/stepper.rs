@@ -174,6 +174,8 @@ pub struct StepperActions {
     /// 把环形缓冲里的帧落盘(实时录制时用)。
     pub capture_now: bool,
     pub clear_ring: bool,
+    /// 把**当前帧**的立绘层逐个导出成 PNG(分块定位用)。
+    pub dump_layers: bool,
 }
 
 /// 步进推进器。
@@ -197,6 +199,8 @@ pub struct Stepper {
     resumed: bool,
     /// 面板/快捷键请求「抓取」(在宿主帧边界执行)。
     capture_requested: bool,
+    /// 面板请求「导出当前帧图层」(一次性,在宿主帧边界执行)。
+    dump_layers: bool,
     /// 会话头是否已写。
     session_written: bool,
     last_file: Option<String>,
@@ -259,6 +263,7 @@ impl Stepper {
             halted_last: false,
             resumed: false,
             capture_requested: false,
+            dump_layers: false,
             session_written: false,
             last_file: None,
             last_error: None,
@@ -470,11 +475,32 @@ impl Stepper {
         if actions.clear_ring {
             self.clear_ring();
         }
+        if actions.dump_layers {
+            self.dump_layers = true;
+        }
+    }
+
+    /// 取走「导出当前帧图层」的一次性请求。
+    pub fn take_dump_layers_request(&mut self) -> bool {
+        std::mem::take(&mut self.dump_layers)
     }
 
     /// 上一帧是否录制了环形缓冲(退出前决定要不要补写)。
     pub fn has_ring(&self) -> bool {
         !self.ring.is_empty()
+    }
+
+    /// 本帧是否会真的取证(决定要不要为它付一次整帧读回)。
+    ///
+    /// 与 [`Self::observe`] 的入口过滤同一判据:推进帧永远抓,实时帧只在
+    /// 录制中抓。宿主据此避免在「开着 `--capture-dir` 但没在录」的实时
+    /// 路径上每帧多拷一次整屏(1100×825 是 3.6MB)。
+    #[must_use]
+    pub fn wants_capture(&self, phase: Phase) -> bool {
+        match phase {
+            Phase::Live => self.recording,
+            Phase::Step => true,
+        }
     }
 
     // ---------------------------------------------------------------- 抓取
@@ -925,6 +951,49 @@ impl Stepper {
                     ("mask_ops", num_v(summary.mask_ops as f64)),
                     ("copy_ops", num_v(summary.copy_ops as f64)),
                     ("image_ops", num_v(summary.image_ops as f64)),
+                    // 屏幕层清单(`层@alpha[纹理]`):过渡缓冲若出现在这里
+                    // 就会被直接画到屏幕上 ⇒ 旧姿态残影。
+                    (
+                        "screen_layers",
+                        Value::Array(
+                            summary
+                                .screen_layers
+                                .iter()
+                                .map(|row| str_v(row.clone()))
+                                .collect(),
+                        ),
+                    ),
+                    // 图像加工链(源→目标 动作):验证新旧差分是否同时在线。
+                    (
+                        "image_chain",
+                        Value::Array(
+                            summary
+                                .image_chain
+                                .iter()
+                                .map(|row| str_v(row.clone()))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "copy_chain",
+                        Value::Array(
+                            summary
+                                .copy_chain
+                                .iter()
+                                .map(|row| str_v(row.clone()))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "sprite_layers",
+                        Value::Array(
+                            summary
+                                .sprite_layers
+                                .iter()
+                                .map(|row| str_v(row.clone()))
+                                .collect(),
+                        ),
+                    ),
                 ]),
                 None => Value::Null,
             },

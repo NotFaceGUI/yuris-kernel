@@ -309,6 +309,7 @@ impl Default for HostOptions {
     }
 }
 
+
 /// 启动桌面窗口。返回时窗口已关闭;`Err` 表示启动/运行失败。
 ///
 /// panic 防线在 `run()` 里安装(进程级 hook),早于任何窗口/GPU 调用:
@@ -801,6 +802,10 @@ struct App {
     stepper: stepper::Stepper,
     /// `--step-to`:还要推进到的逻辑帧(`None` = 没有待办)。
     step_to: Option<u64>,
+    /// 上一帧立绘层的表面尺寸(`YURIS_SPL_PROBE` 判异基线)。
+    spl_last_sizes: Vec<(String, u32, u32)>,
+    /// 每层的退化累计次数(每 60 帧最多报一次,保留频率信息)。
+    spl_shrunk_seen: std::collections::HashMap<String, u32>,
 }
 
 impl App {
@@ -939,6 +944,8 @@ impl App {
             frame_stamps: std::collections::VecDeque::with_capacity(240),
             stepper: step,
             step_to,
+            spl_last_sizes: Vec::new(),
+            spl_shrunk_seen: std::collections::HashMap::new(),
         })
     }
 
@@ -954,6 +961,18 @@ impl App {
     /// 放在帧边界而不是 UI 闭包里:一次可能写几十帧 PNG/JSONL,不该卡在
     /// egui 的绘制路径中间。失败显式报错(不静默吞)。
     fn pump_capture(&mut self) {
+        // 「导出图层」:把当前帧的立绘分层写成 PNG,便于肉眼定位脏块。
+        if self.stepper.take_dump_layers_request() {
+            let dir = self.stepper.dir().to_path_buf();
+            match self.engine.dump_layers(&dir, "SPL") {
+                Ok(0) => host_line!("yu-desktop: 导出图层: 当前帧没有已物化的 SPL 层"),
+                Ok(count) => host_line!(
+                    "yu-desktop: 导出图层 {count} 个 → {}",
+                    dir.join("layers").display()
+                ),
+                Err(error) => host_error!("yu-desktop: 导出图层失败: {error}"),
+            }
+        }
         if !self.stepper.take_capture_request() {
             return;
         }
@@ -2736,6 +2755,17 @@ impl ApplicationHandler for App {
             let work_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
             // 暂停帧也进录制环形缓冲:主人按「抓取」时想取的往往正是
             // 「停在这一帧」的样子。
+            //
+            // 与实时路径同理:零拷贝上屏时 `last_surface` 可能是上一帧后
+            // 缓冲,必须同步读回当前屏幕再取证(否则落盘的是过期/黑色帧)。
+            if self.stepper.wants_capture(stepper::Phase::Live) {
+                if let Err(error) = self.engine.refresh_screen_surface() {
+                    host_error!("yu-desktop: 暂停帧取证读回失败: {error}");
+                }
+                if let Some(fresh) = self.engine.last_surface_shared() {
+                    self.last_surface = Some(fresh);
+                }
+            }
             let paused_surface = self.last_surface.clone();
             if let Some(surface) = paused_surface {
                 self.stepper.observe(
@@ -2859,6 +2889,78 @@ impl ApplicationHandler for App {
             draw_ms,
         );
         self.flush_input_latency();
+        // 长会话资源趋势(`YURIS_RES_PROBE=1`):每 60 帧一行全量计数。
+        //
+        // 「越玩越卡但 render 耗时不变」只能从**资源规模**和**纹理 churn** 上看:
+        // 显存/合成目标/快照单调增长,或者层表面每帧新建(`created` 高、
+        // `reused` 低)都会让 GPU 侧变慢,而 CPU 的 `render_ms` 完全反映不出来
+        // (它只量规划)。
+        if std::env::var_os("YURIS_RES_PROBE").is_some() && self.frames % 60 == 0 {
+            let (cache_bytes, evicted) = self.engine.texture_cache_bytes();
+            let cached = self.engine.textures_cached();
+            let detail = self.engine.render_resource_snapshot().unwrap_or_default();
+            let build = self.engine.frame_build_ms();
+            host_line!(
+                "yu-desktop: [res] frame={} assets={}MB/{}files/evicted={evicted} | {detail} \
+                 | tick={engine_tick_ms:.1}ms build={build:.1}ms render={engine_render_ms:.1}ms \
+                 draw={draw_ms:.1}ms interval={interval_ms:.1}ms",
+                self.frames,
+                cache_bytes / (1024 * 1024),
+                cached,
+            );
+        }
+        // 立绘层表面**退化判异**(`YURIS_SPL_PROBE=1`):只在异常时打印。
+        //
+        // 立绘基图是 `solid1x1`,像素靠加工链产出;层表面一旦退化成 1×1,
+        // 该层就"闪一下没了",而 `render_ms`/帧报告完全看不出来(它只是个
+        // 画不出来的 1×1 quad)。
+        //
+        // 判据必须对照**声明尺寸**:`SPLTR10x` 这类层的声明尺寸本来就是
+        // `1x1`(过渡临时层),它一直是 1×1 属于正常,报出来只是噪声。
+        if std::env::var_os("YURIS_SPL_PROBE").is_some() {
+            let now: Vec<(String, u32, u32)> = self.engine.sprite_surface_sizes();
+            let summary = self.engine.frame_op_summary(0);
+            let mut degraded: Vec<String> = Vec::new();
+            for (name, w, h) in &now {
+                // 声明尺寸(`Some((W, H))`):`0x0`/`None` = 未声明,不判。
+                let declared = summary.as_ref().and_then(|s| {
+                    s.sprite_layers
+                        .iter()
+                        .find(|row| row.starts_with(name))
+                        .and_then(|row| {
+                            let rest = row.split("size=Some((").nth(1)?;
+                            let nums: Vec<u32> = rest
+                                .trim_start_matches('(')
+                                .split(&[',', ')', ' '][..])
+                                .filter_map(|t| t.trim().parse::<u32>().ok())
+                                .collect();
+                            (nums.len() >= 2).then(|| (nums[0], nums[1]))
+                        })
+                });
+                let Some((dw, dh)) = declared else { continue };
+                if dw <= 8 || dh <= 8 {
+                    continue; // 声明本身就小(过渡临时层),1×1 正常
+                }
+                if *w <= 8 || *h <= 8 {
+                    degraded.push(format!("{name}={w}x{h}(decl {dw}x{dh})"));
+                } else if (*w as u64) * (*h as u64) < (dw as u64) * (dh as u64) / 4 {
+                    degraded.push(format!("{name}={w}x{h}(decl {dw}x{dh}, 缩小>4x)"));
+                }
+            }
+            for line in degraded {
+                let key = line.split('=').next().unwrap_or("").to_string();
+                // 每层每 60 帧最多报一次:闪烁可能反复发生,只报首次会漏频率。
+                let count = self.spl_shrunk_seen.entry(key).or_insert(0);
+                *count += 1;
+                if *count == 1 || self.frames % 60 == 0 {
+                    host_error!(
+                        "yu-desktop: [spl] 层表面退化 frame={} {line} 累计={count}",
+                        self.frames
+                    );
+                }
+            }
+            self.spl_last_sizes = now;
+        }
         self.observe_spike(interval_ms, work_ms, engine_tick_ms, engine_render_ms, draw_ms);
         self.observe_tick_profile(engine_tick_ms);
         // 帧步进器取证:推进帧逐帧立即落盘;实时帧在录制中才进环形缓冲。
@@ -2867,6 +2969,23 @@ impl ApplicationHandler for App {
         } else {
             stepper::Phase::Live
         };
+        // 取证**必须**先同步读回当前帧。
+        //
+        // 零拷贝上屏(wgpu streaming)时 `last_surface` 是**上一帧后缓冲**,
+        // 首帧更是空 ⇒ 直接拿它写 PNG 会得到纯黑图(实测 309 帧全黑、
+        // 屏幕指纹全同)。`--shot` 路径早就有这一步(`finish` 里调
+        // `refresh_screen_surface`),取证路径漏了。
+        //
+        // 只在真的要取证时付这次整帧读回:未开 `--capture-dir` 且无环形
+        // 缓冲时 `observe` 是 no-op,不该为它每帧多拷 3.6MB。
+        if self.stepper.wants_capture(capture_phase) {
+            if let Err(error) = self.engine.refresh_screen_surface() {
+                host_error!("yu-desktop: 取证读回屏幕失败: {error}");
+            }
+            if let Some(fresh) = self.engine.last_surface_shared() {
+                self.last_surface = Some(fresh);
+            }
+        }
         let capture_surface = self.last_surface.clone();
         if let Some(surface) = capture_surface {
             // 环形缓冲只持有 `Arc<Surface>`,不复制整屏像素;证据体在入环

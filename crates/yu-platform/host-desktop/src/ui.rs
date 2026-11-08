@@ -254,6 +254,22 @@ pub fn stepper_window(ctx: &egui::Context, stepper: &mut StepperUi) -> StepperAc
                 }
             });
             ui.horizontal(|ui| {
+                // 分块导出:把当前帧每个已物化的立绘层单独写 PNG。
+                //
+                // 立绘是「基图 + 一串 `CGACT` 加工」合成的,只看最终画面
+                // 无法判断是哪一层/哪一步脏了;逐层落盘后可以直接肉眼定位
+                // 出问题的子图,再回到加工链查那一条。
+                if ui
+                    .button("⤓ 导出图层")
+                    .on_hover_text(
+                        "把当前帧的每个已物化立绘图层单独写成 PNG\n输出到 <捕获目录>/layers/<层名>.png",
+                    )
+                    .clicked()
+                {
+                    actions.dump_layers = true;
+                }
+            });
+            ui.horizontal(|ui| {
                 ui.label("环形缓冲");
                 ui.add(
                     egui::DragValue::new(&mut stepper.ring_frames)
