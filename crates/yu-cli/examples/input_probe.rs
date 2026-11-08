@@ -65,6 +65,8 @@ struct Probe {
     shots: Vec<(u64, PathBuf)>,
     jsons: Vec<(u64, PathBuf)>,
     fulls: Vec<(u64, PathBuf)>,
+    /// 每帧打印 render_report 的跳过项(目标 + 原因);默认关。
+    skips: bool,
 }
 
 impl Probe {
@@ -110,6 +112,7 @@ impl Probe {
             Some(value) => to_u64(&value, "frames")? as u32,
             None => 400,
         };
+        let skips = args.switch("skips");
         args.finish().map_err(|error| error.to_string())?;
         Ok((
             PathBuf::from(root),
@@ -120,6 +123,7 @@ impl Probe {
                 shots,
                 jsons,
                 fulls,
+                skips,
             },
         ))
     }
@@ -199,6 +203,25 @@ fn run() -> Result<(), String> {
                 std::fs::write(path, frame_json)
                     .map_err(|error| format!("写 {} 失败: {error}", path.display()))?;
                 println!("full frame={frame} -> {}", path.display());
+            }
+        }
+        if probe.skips {
+            if let Some(rr) = engine.render_report() {
+                if !rr.skipped.is_empty() || !rr.missing_assets.is_empty() {
+                    let mut line = format!("skips frame={frame}");
+                    for s in &rr.skipped {
+                        line.push_str(&format!(
+                            " | {} {} x{}",
+                            s.target,
+                            s.reason.replace('\n', " "),
+                            s.count
+                        ));
+                    }
+                    for m in &rr.missing_assets {
+                        line.push_str(&format!(" | missing {}", m.detail.replace('\n', " ")));
+                    }
+                    println!("{line}");
+                }
             }
         }
         if frame % 60 == 0 {

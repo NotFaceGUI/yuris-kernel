@@ -415,6 +415,11 @@ impl TextureCache {
         self.solid_id == Some(id) || self.asset_texture_ids.contains(&id)
     }
 
+    /// 当前缓存里全部 GPU 纹理 id(资产/1×1/影片/临时上传)。
+    pub fn live_texture_ids(&self, out: &mut BTreeSet<u64>) {
+        out.extend(self.textures.keys().copied());
+    }
+
     /// 删除一张临时上传并作废引用它的 bind group。
     ///
     /// 纹理像素可能仍被 `LayerSurfaces` 的 `Rc<TexRef>` 持有(跨帧内容),
@@ -809,6 +814,32 @@ impl TargetSet {
             self.offscreen.len(),
             self.snapshots.len(),
         )
+    }
+
+    /// 本帧仍存活的全部目标/快照纹理 id。
+    ///
+    /// 与 `LayerSurfaces::live_texture_ids` 一并用于帧末剪枝
+    /// `PipelineCache` 的采样 bind group;漏掉任何一类都会让对应纹理
+    /// 被 bind group 永久钉住。
+    pub fn live_texture_ids(&self, out: &mut BTreeSet<u64>) {
+        for target in self
+            .screen
+            .iter()
+            .chain(self.offscreen.values())
+            .chain(self.composites.values())
+            .chain(self.scale.iter())
+        {
+            out.insert(target.id);
+        }
+        for tex in self.snapshots.values() {
+            out.insert(tex.id);
+        }
+        for content in self.snapshot_contents.values() {
+            out.insert(content.tex.id);
+        }
+        for surfaces in self.snapshot_surfaces.values() {
+            surfaces.live_texture_ids(out);
+        }
     }
 
     pub fn composite_count(&self) -> usize {

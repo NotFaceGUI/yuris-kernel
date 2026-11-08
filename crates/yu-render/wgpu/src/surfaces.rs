@@ -298,6 +298,23 @@ impl LayerSurfaces {
             .collect()
     }
 
+    /// 仍被层状态引用的纹理 id(含文本基面 `raw`)。
+    ///
+    /// 用途:帧末剪枝 `PipelineCache` 里按纹理 id 缓存的采样 bind group。
+    /// 被替换/删除的层表面不在这里,其 bind group 会随之释放,底层
+    /// D3D12 纹理才能真正回收(0.494 商业包 `transition surface` OOM 的
+    /// 根因就是缓存 bind group 长期钉住历史表面)。
+    pub fn live_texture_ids(&self, out: &mut std::collections::BTreeSet<u64>) {
+        for state in self.layers.values() {
+            if let Some(content) = &state.content {
+                out.insert(content.tex.id);
+            }
+            if let Some(raw) = &state.raw {
+                out.insert(raw.tex.id);
+            }
+        }
+    }
+
     /// 已应用前缀里最后一条 `seq`(无状态 = `None`)。
     ///
     /// 帧首用于判断「上一帧留下的加工链是否越过本帧的消费命令点」:

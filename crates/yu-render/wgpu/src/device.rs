@@ -320,16 +320,18 @@ impl GpuContext {
     /// 校验目标尺寸;超限返回 [`code::LIMIT`] 而不是让 wgpu panic。
     pub fn check_dimensions(&self, width: u32, height: u32, what: &str) -> Result<(), Diag> {
         if width == 0 || height == 0 {
-            return Err(Diag::fatal(code::TARGET, Boundary::Platform)
-                .with_detail(format!("{what} 尺寸为 {width}x{height},无法创建 GPU 目标")));
+            let detail = format!("{what} 尺寸为 {width}x{height},无法创建 GPU 目标");
+            // 尺寸为 0 会让调用方按 op 跳过;没有这条日志时只能看到
+            // `platform.gpu.target` 这个码,无法回答「是哪个目标、什么尺寸」。
+            log::warn!(target: "yu-render", "[wgpu] {detail}");
+            return Err(Diag::fatal(code::TARGET, Boundary::Platform).with_detail(detail));
         }
         let max = self.max_texture_dimension_2d();
         if width > max || height > max {
-            return Err(
-                Diag::fatal(code::LIMIT, Boundary::Platform).with_detail(format!(
-                    "{what} 尺寸 {width}x{height} 超过 max_texture_dimension_2d={max}"
-                )),
-            );
+            let detail =
+                format!("{what} 尺寸 {width}x{height} 超过 max_texture_dimension_2d={max}");
+            log::warn!(target: "yu-render", "[wgpu] {detail}");
+            return Err(Diag::fatal(code::LIMIT, Boundary::Platform).with_detail(detail));
         }
         Ok(())
     }
@@ -347,12 +349,18 @@ impl GpuContext {
         let validation_error = pollster::block_on(validation.pop());
         if let Some(error) = validation_error {
             let _ = pollster::block_on(oom.pop());
-            return Err(Diag::fatal(code::TARGET, Boundary::Platform)
-                .with_detail(format!("{what}: {error}")));
+            let detail = format!("{what}: {error}");
+            // 调用方把 Diag 只投影成错误码(`platform.gpu.target`),原始
+            // 校验/OOM 文本会丢失 —— 这里先留一条 WARN,现场才能定位。
+            log::warn!(target: "yu-render", "[wgpu] 创建失败 {detail}");
+            return Err(Diag::fatal(code::TARGET, Boundary::Platform).with_detail(detail));
         }
         match pollster::block_on(oom.pop()) {
-            Some(error) => Err(Diag::fatal(code::TARGET, Boundary::Platform)
-                .with_detail(format!("{what}: {error}"))),
+            Some(error) => {
+                let detail = format!("{what}: {error}");
+                log::warn!(target: "yu-render", "[wgpu] 分配失败 {detail}");
+                Err(Diag::fatal(code::TARGET, Boundary::Platform).with_detail(detail))
+            }
             None => Ok(value),
         }
     }
@@ -367,8 +375,13 @@ impl GpuContext {
         let guard = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let value = f();
         match pollster::block_on(guard.pop()) {
-            Some(err) => Err(Diag::fatal(code, Boundary::Platform)
-                .with_detail(format!("{what} 被 wgpu 拒绝: {err}"))),
+            Some(err) => {
+                let detail = format!("{what} 被 wgpu 拒绝: {err}");
+                // 同 `checked_oom`:调用方会把 Diag 压成错误码,原始校验
+                // 文本必须在这里留痕,否则 `platform.gpu.target` 无从定位。
+                log::warn!(target: "yu-render", "[wgpu] {detail}");
+                Err(Diag::fatal(code, Boundary::Platform).with_detail(detail))
+            }
             None => Ok(value),
         }
     }

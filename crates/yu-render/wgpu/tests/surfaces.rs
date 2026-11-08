@@ -1277,3 +1277,94 @@ fn layer_alpha_semantics_match_soft() {
         "上层 A=128 必须改变 MERGE2 结果(证明层 alpha 真的传进了内核)"
     );
 }
+
+/// 换差分/过渡动画:每帧换一张目标表面纹理时,采样 bind group 缓存必须
+/// 只保留当前存活纹理,不能随历史表面单调增长。
+///
+/// 回归 0.494 商业包第二轮 `transition surface 1332x3351: Out of Memory`:
+/// `PipelineCache::ensure_bind_group` 按 `(texture_id, filter)` 永久缓存,
+/// 图层表面纹理被替换后 bind group 仍钉住旧 `TextureView` ⇒ D3D12 纹理
+/// 无法回收,长会话最终分配失败,`SPLBUFb` 退化成 1×1,立绘/表情整层消失。
+#[test]
+fn rewritten_transition_surfaces_do_not_pin_bind_groups() {
+    let table = table();
+    let size = 64u32;
+    let entries: [(&[u8], Vec<u8>); 2] = [
+        (
+            b"from.png",
+            png_bytes_for(size, size, Rgba([200, 40, 10, 180])),
+        ),
+        (
+            b"to.png",
+            png_bytes_for(size, size, Rgba([20, 90, 240, 255])),
+        ),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
+
+    let mut counts: Vec<usize> = Vec::new();
+    for frame in 1u64..=60 {
+        let mut events = vec![VmEvent::FrameStart { frame }];
+        if frame == 1 {
+            events.extend([
+                call(
+                    1,
+                    "CG",
+                    vec![
+                        arg(&table, "CG", "ID", Value::Str(b"FROM".to_vec())),
+                        arg(&table, "CG", "FILE", Value::Str(b"from".to_vec())),
+                    ],
+                ),
+                call(
+                    1,
+                    "CG",
+                    vec![
+                        arg(&table, "CG", "ID", Value::Str(b"TO".to_vec())),
+                        arg(&table, "CG", "FILE", Value::Str(b"to".to_vec())),
+                    ],
+                ),
+                call(
+                    1,
+                    "CG",
+                    vec![
+                        arg(&table, "CG", "ID", Value::Str(b"OUT".to_vec())),
+                        arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                        arg(&table, "CG", "SX", Value::Int(size as i64)),
+                        arg(&table, "CG", "SY", Value::Int(size as i64)),
+                    ],
+                ),
+            ]);
+        }
+        events.push(call(
+            frame,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"FROM".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"TO".to_vec())),
+                arg(&table, "CGACT", "ID3", Value::Str(b"OUT".to_vec())),
+                arg(&table, "CGACT", "TRANSITION", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int((frame % 256) as i64)),
+            ],
+        ));
+        events.push(VmEvent::FrameEnd { frame });
+        gfx.consume_events(&events);
+        let frame = gfx.frame();
+        gpu.render_frame(&frame).expect("frame render");
+        counts.push(gpu.bind_group_count());
+    }
+
+    // 旧实现每帧新增至少一个目标表面 bind group(60 帧后 ≥60);新实现
+    // 帧末只保留存活纹理,数量应与层/资产规模同阶,而不是与帧数线性增长。
+    let first = counts[0];
+    let last = *counts.last().expect("counts");
+    assert!(
+        last <= 16,
+        "bind group 缓存随历史表面增长:first={first} last={last} all={counts:?}"
+    );
+    assert!(
+        last <= first + 8,
+        "bind group 缓存未随帧数收敛:first={first} last={last} all={counts:?}"
+    );
+}

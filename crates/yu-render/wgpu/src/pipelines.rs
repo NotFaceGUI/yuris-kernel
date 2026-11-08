@@ -1612,6 +1612,25 @@ impl PipelineCache {
         self.scale_groups.retain(|(id, _, _), _| *id != texture_id);
     }
 
+    /// 只保留仍存活的纹理 id 对应的 bind group。
+    ///
+    /// `ensure_bind_group` 按 `(texture_id, filter)` 永久缓存,而图层表面
+    /// 纹理会被 `LayerSurfaces` 每帧替换(过渡/差分纯写动作)。旧实现只在
+    /// `TargetSet`/`TextureCache` 释放纹理时 `forget_texture`,图层表面
+    /// 走不到这里 ⇒ 每个历史表面都被自己的 bind group 钉住,D3D12 显存在
+    /// 长会话中单调增长,最终 `transition surface 1332x3351: Out of Memory`
+    /// 把立绘/表情层打成 1×1。这里按帧末的存活集合统一剪枝。
+    pub fn retain_textures(&mut self, live: &std::collections::BTreeSet<u64>) {
+        self.bind_groups.retain(|(id, _), _| live.contains(id));
+        self.scale_groups.retain(|(id, _, _), _| live.contains(id));
+    }
+
+    /// 当前缓存的采样 bind group 数(诊断:应随存活纹理数有界,而不是
+    /// 随游玩时长/换差分次数增长)。
+    pub fn bind_group_count(&self) -> usize {
+        self.bind_groups.len()
+    }
+
     /// 重启时清空所有持有纹理 view / 颜色的运行时 bind group。
     ///
     /// 管线对象只依赖设备与着色器,保留;bind group 按需重建。不清空时,

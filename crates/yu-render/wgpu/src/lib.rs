@@ -607,7 +607,7 @@ impl WgpuRenderer {
         let (composites, offscreen, snapshots) = self.targets.resource_counts();
         format!(
             "created={} reused={} released={} mat={} passes={} blits={} \
-             live={}/{}MB pooled={}/{}MB comps={} off={} snap={} vram={}MB",
+             live={}/{}MB pooled={}/{}MB comps={} off={} snap={} bg={} vram={}MB",
             s.created,
             s.reused,
             s.released,
@@ -621,8 +621,14 @@ impl WgpuRenderer {
             composites,
             offscreen,
             snapshots,
+            self.pipelines.bind_group_count(),
             self.target_bytes() / (1024 * 1024),
         )
+    }
+
+    /// 当前缓存的采样 bind group 数(诊断/回归门禁)。
+    pub fn bind_group_count(&self) -> usize {
+        self.pipelines.bind_group_count()
     }
 
     /// 把所有**已物化**的层表面按名字过滤后逐个读回,交给调用方落盘。
@@ -747,6 +753,23 @@ impl WgpuRenderer {
         }
         self.encode_passes(&plan, &mut encoder)?;
         let t_encode = started.elapsed() - t_plan;
+
+        // 帧末剪枝采样 bind group:只保留当前仍存活的纹理。
+        //
+        // `PipelineCache::ensure_bind_group` 按 `(texture_id, filter)` 缓存。
+        // 图层表面在换差分/过渡时每帧换新纹理,旧 bind group 若不剪掉会
+        // 永久钉住旧 TextureView ⇒ D3D12 显存单调增长,最终
+        // `transition surface 1332x3351: Out of Memory`,立绘/表情退化成
+        // 1×1。这里必须在 `encode_passes` **之后**:本帧规划期的临时表面
+        // bind group 在编码时仍要被命令缓冲引用,提前清会画不出内容。
+        {
+            let mut live_tex = std::collections::BTreeSet::new();
+            self.surfaces.live_texture_ids(&mut live_tex);
+            self.targets.live_texture_ids(&mut live_tex);
+            self.gpu_textures.live_texture_ids(&mut live_tex);
+            self.text_uploads.live_texture_ids(&mut live_tex);
+            self.pipelines.retain_textures(&live_tex);
+        }
 
         // 屏幕读回:即使随后缩放也要保留缩放前的游戏画面作为 `:/W0/`
         // 后缓冲(引擎的 COPY 读内部画面,不读窗口缩放结果)。

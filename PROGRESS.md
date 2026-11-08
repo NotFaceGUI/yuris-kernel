@@ -13656,3 +13656,66 @@ tools/android/build.sh x86_64 → libyu_host_android.so 14M(release)
 
 **残留**:fps/screen_color 的配置界面卡片未加(参数链路已通);
 `nativeLifecycle` 的 2/3 细分桌面向未消费;真 wasm `local_now` 仍 None。
+
+## 成果 GFX-BINDLEAK (2026-11-08) · 采样 bind group 缓存钉住历史层表面,修复换差分/表情时立绘整层消失
+
+**症状(主人)**:0.494 商业包 <game-b> 标题→新游戏→推进到立绘→TITLE→
+再新游戏,第二轮起差分/表情切换时立绘消失,或表情消失立绘保留;
+`probe11` 截图窗口与 `SPLBUFb601/701=1x1(decl 1332x3351)` 现场。
+
+**根因(取证链)**:
+- `play3.out` engine frame≈19452 起连续
+  `[wgpu] 分配失败 transition surface 1332x3351: Out of Memory`,
+  随后 `SPLBUFb` 被 `[spl]` 探针判成 1×1;`SIZE2` 把 1 个透明像素
+  拉伸到 643×825 ⇒ 立绘/表情整层消失。
+- 同时刻 `[res]` 只有 assets=367MB / live=77MB / vram=190MB,
+  `nvidia-smi` 仍有 5GB 空闲 ⇒ 不是可见预算耗尽,而是**未被统计的
+  隐藏引用**。
+- `PipelineCache::ensure_bind_group` 按 `(texture_id, filter)` **永久缓存**
+  采样 bind group;旧实现只对 `TargetSet`/`TextureCache` 的生命周期调
+  `forget_texture`,**图层表面 `LayerSurfaces` 没有入口**。换差分时每帧
+  换一张 1332×3351 表面,屏幕 pass 为每张新纹理建 bind group,旧表面被
+  `Content` 替换后其 bind group 仍钉住 `TextureView` ⇒ D3D12 纹理无法
+  回收,显存随「换过多少张表面」增长,最终新表面分配失败。
+- 官方语义:`CGACT` 写层表面并在替换时释放旧表面,不存在按纹理句柄
+  缓存的 bind group;本分歧源于我们「常驻表面 + 命令日志重放」架构与
+  缓存失效范围的遗漏。详见 `DIV-GFX-081`。
+
+**改动**:
+- `LayerSurfaces::live_texture_ids`(content/raw)、
+  `TargetSet::live_texture_ids`(screen/offscreen/composite/snapshot/
+  snapshot_contents/snapshot_surfaces)、
+  `TextureCache::live_texture_ids`(全部上传纹理)、
+  `TextUploads::live_texture_ids`(文本层/屏幕覆盖)。
+- `PipelineCache::retain_textures` + `bind_group_count`;
+  `WgpuRenderer` 在 `encode_passes` **之后**汇总存活集合并剪枝
+  `bind_groups`/`scale_groups`。必须在编码后:规划期临时表面的 bind
+  group 在命令缓冲里仍要被引用。
+- `[res]` 增 `bg=` 计数;`device.rs` 的 GPU 校验/OOM 失败补 WARN 明细
+  (原调用方只保留 `platform.gpu.target` 错误码,看不到资源/尺寸)。
+- 回归用例 `rewritten_transition_surfaces_do_not_pin_bind_groups`:
+  60 帧连续改写同一过渡目标,断言 bind group 数有界。
+
+**验证**:
+```text
+cargo test -p yu-backend-wgpu            → 13/15/39/1/1 passed
+  (移除 retain_textures 时上述新用例 FAILED:bind group 随帧数增长)
+cargo test -p yu-engine --lib            → 32 passed
+cargo test -p yu-gfx --lib               → 15 passed
+桌面 wgpu 10 轮标题循环,22500 帧(YURIS_RES_PROBE=1):
+  → 0 次 OOM;越过旧故障点 engine frame 19452 无退化
+  → [res] bg=45..70 有界(不再随换差分次数增长)
+  → 末帧 assets=509MB/57files/evicted=202 live=22/111MB snap=71
+          bg=49 vram=224MB;frame pacing avg 16.80ms / 59.5fps
+```
+
+**同轮尖峰分析(未改代码,取证结论)**:
+- `render=11.67ms` 峰值(gfx 488):`text_us=10445µs`、170 个字形一次性
+  烘焙/上传;对应标题菜单文本首帧。菜单打开还有 260+ 个 `COPY2` 按钮
+  状态快照(每张 ~86µs)与首次解码,是「菜单打开尖峰」的主项。
+- `image_us=7.9/5.4ms` 峰值(gfx 891/4383):换差分首帧
+  `SPLBUFa` 资产解码+上传(1332×3351);`preload.assets=0` 说明该资产
+  已被 512MB 缓存淘汰/或由 `CGACT ID2` 首次引用,在 plan 内同步解码。
+  这是「角色第一次入场/换表情」5–8ms 尖峰的来源。
+- `tick=62–102ms` 长帧(gfx 4189/3269):帧构建/VM 命令批次(场景解构、
+  按钮层重建),不在 render 阶段;与显存修复无关,留待后续批次。

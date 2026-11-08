@@ -2295,6 +2295,12 @@ impl TextUploads {
         });
         removed
     }
+
+    /// 当前文本上传纹理 id(供帧末 bind group 存活集合使用)。
+    pub fn live_texture_ids(&self, out: &mut BTreeSet<u64>) {
+        out.extend(self.layers.values().map(|(_, tex)| tex.id));
+        out.extend(self.screen.iter().map(|(_, tex)| tex.id));
+    }
 }
 
 /// GPU 文本内容身份:修订 + 排版签名 + 基面像素 + 基面稳定身份。
