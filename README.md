@@ -6,22 +6,20 @@ YU-RIS 兼容运行时，开发中。
 
 当前主线是 4xx；2xx 适配中；5xx 观察中。
 
-| 版本线 | 状态           | 说明                                                                                                              |
-| ------ | -------------- | ----------------------------------------------------------------------------------------------------------------- |
-| 2xx    | 适配中         | 0.292 SDK：91 命令 / 482 系统变量；另有 0.255 表（539 变量）；YSTB V2 缺真实样本                                    |
+| 版本线 | 状态           | 说明                                                                                                                                    |
+| ------ | -------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| 2xx    | 适配中         | 0.292 SDK：91 命令 / 482 系统变量；另有 0.255 表（539 变量）；YSTB V2 缺真实样本                                                        |
 | 4xx    | 适配中（主线） | 0.466 / 0.479 / 0.495：100 / 104 / 119 命令，513 / 526 / 548 系统变量；0.494 商业包 ABI 548/548；实机验收 0.481 / 0.486 / 0.494 / 0.495 |
-| 5xx    | 观察中         | v500 封包可读（YPF 版本字段无上限）；v555 仅有旁线局部观察，系统变量按 0.495 族前缀推断                            |
+| 5xx    | 观察中         | v500 封包可读（YPF 版本字段无上限）；v555 仅有旁线局部观察，系统变量按 0.495 族前缀推断                                                 |
 
-0.450–0.493 各版本的 ABI 表已全部入册（27 张，覆盖 0.255–0.495），选表靠指纹，不靠版本号。
+0.450–0.493 各版本的 ABI 表已全部入册（27 张，覆盖 0.255–0.495）
 
-启动时按游戏自带的 `ysc` / `ysv` 校验选表；缺表或指纹不匹配拒绝启动，不按版本号分支。
-
-| 平台                | 状态           |
-| ------------------- | -------------- |
-| Windows 桌面        | 可用           |
-| headless / 本地服务 | 可用           |
-| 浏览器呈现端        | 可用（调试期） |
-| Android             | 可用           |
+| 平台                | 状态   |
+| ------------------- | ------ |
+| Windows 桌面        | 可用   |
+| headless / 本地服务 | 可用   |
+| 浏览器呈现端        | 仅调试 |
+| Android             | 可用   |
 
 | ![](docs/assets/case/1_t.png) | ![](docs/assets/case/1_d.png) | ![](docs/assets/case/2_d.png) |
 | ----------------------------- | ----------------------------- | ----------------------------- |
@@ -31,14 +29,14 @@ YU-RIS 兼容运行时，开发中。
 
 `--patch` 选汉化路线；桌面、serve、Android 配置界面用同一份取值。
 
-| 汉化类型   | 取值                        | 说明                                                                 |
-| ---------- | --------------------------- | -------------------------------------------------------------------- |
-| 原版日文   | `original`（`cp932`）       | 未汉化的原版                                                         |
-| 简体汉化   | `gbk`（`cp936` / `gb2312`） | 汉化补丁；译文放在散盘 `ysbin/`，靠「散盘先于封包」的读链生效         |
-| 繁体汉化   | `big5`（`cp950`）           | 同上，港台旧作与繁中补丁                                             |
-| SJIS 隧道  | `tunnel`（`sjis_ext`）      | 不动原编码、追加码点表的补丁；需游戏根有 `sjis_ext.bin`               |
-| 自动       | `auto`（缺省）              | 按 `codecs.json` → `sjis_ext.bin` → 工具签名识别；不认补丁名         |
-| 不支持     | —                           | exe / DLL 注入类补丁（如 `setdll` 挂 `MyDll.dll` 换字体）：不改程序，故不适用 |
+| 汉化类型  | 取值                        | 说明                                                                          |
+| --------- | --------------------------- | ----------------------------------------------------------------------------- |
+| 原版日文  | `original`（`cp932`）       | 未汉化的原版                                                                  |
+| 简体汉化  | `gbk`（`cp936` / `gb2312`） | 汉化补丁；译文放在散盘 `ysbin/`，靠「散盘先于封包」的读链生效                 |
+| 繁体汉化  | `big5`（`cp950`）           | 同上，港台旧作与繁中补丁                                                      |
+| SJIS 隧道 | `tunnel`（`sjis_ext`）      | 不动原编码、追加码点表的补丁；需游戏根有 `sjis_ext.bin`                       |
+| 自动      | `auto`（缺省）              | 按 `codecs.json` → `sjis_ext.bin` → 工具签名识别；不认补丁名                  |
+| 不支持    | —                           | exe / DLL 注入类补丁（如 `setdll` 挂 `MyDll.dll` 换字体）：不改程序，故不适用 |
 
 <table>
 <tr>
@@ -49,7 +47,7 @@ YU-RIS 兼容运行时，开发中。
 
 ## Android
 
-so + 轻量 Java 壳，与桌面共用同一份 `yu-engine` 装配。
+so + 轻量 Java 壳
 
 - 构建：`tools/android/build.sh`，产物 `app-debug.apk` / `app-release.apk`（arm64-v8a + x86_64）。
 - 安装后选游戏目录即可运行；存档写 `<游戏目录>/save/`，`.sd` 与桌面字节一致。
@@ -167,23 +165,23 @@ flowchart TD
 
 ## 目录
 
-| 路径                                              | 内容                                |
-| ------------------------------------------------- | ----------------------------------- |
-| `crates/yu-log`                                   | 诊断与日志；所有 crate 的错误出口   |
-| `crates/yu-vfs`                                   | 数据源、YPF、挂载                   |
-| `crates/yu-format`                                | ybn、YSSD、YMV、CP932/GBK/Big5      |
-| `crates/yu-rt`                                    | VM、任务、命令分派、变量域、ABI 表  |
-| `crates/yu-gfx`                                   | 渲染语义与 `CompositorFrame`        |
-| `crates/yu-sound` / `crates/yu-save`              | 声音 / 存档宿主                     |
-| `crates/yu-font`                                  | 字体发现与字形栅格                  |
-| `crates/yu-render/core`                           | 两后端共享契约                      |
-| `crates/yu-render/soft` / `crates/yu-render/wgpu` | CPU 参考 / GPU 主后端               |
-| `crates/yu-engine`                                | boot / tick / render 装配           |
-| `crates/yu-cli`                                   | CLI、服务、HMR、用例                |
-| `crates/yu-platform/*`                            | 桌面、Android、浏览器呈现、输入     |
-| `crates/yu-trace`                                 | 录制 / 回放 / diff                  |
-| `android/`                                        | Android 壳（Java）                  |
-| `tools/android/build.sh`                          | so 交叉编译 + APK 打包              |
+| 路径                                              | 内容                               |
+| ------------------------------------------------- | ---------------------------------- |
+| `crates/yu-log`                                   | 诊断与日志；所有 crate 的错误出口  |
+| `crates/yu-vfs`                                   | 数据源、YPF、挂载                  |
+| `crates/yu-format`                                | ybn、YSSD、YMV、CP932/GBK/Big5     |
+| `crates/yu-rt`                                    | VM、任务、命令分派、变量域、ABI 表 |
+| `crates/yu-gfx`                                   | 渲染语义与 `CompositorFrame`       |
+| `crates/yu-sound` / `crates/yu-save`              | 声音 / 存档宿主                    |
+| `crates/yu-font`                                  | 字体发现与字形栅格                 |
+| `crates/yu-render/core`                           | 两后端共享契约                     |
+| `crates/yu-render/soft` / `crates/yu-render/wgpu` | CPU 参考 / GPU 主后端              |
+| `crates/yu-engine`                                | boot / tick / render 装配          |
+| `crates/yu-cli`                                   | CLI、服务、HMR、用例               |
+| `crates/yu-platform/*`                            | 桌面、Android、浏览器呈现、输入    |
+| `crates/yu-trace`                                 | 录制 / 回放 / diff                 |
+| `android/`                                        | Android 壳（Java）                 |
+| `tools/android/build.sh`                          | so 交叉编译 + APK 打包             |
 
 ## 待办
 
@@ -212,7 +210,7 @@ flowchart TD
 
 ## 致谢
 
-- [**YU-RIS_Guide**](https://github.com/TheVNConnoisseur/YU-RIS_Guide) —
+- [YU-RIS_Guide](https://github.com/TheVNConnoisseur/YU-RIS_Guide) —
   官方工具与 SDK 归档；本仓库的 27 张系统变量 ABI 表与 `YSCom.ycd` 语料取自该项目，
   每张表头记录来源 sha256 与覆盖版本区间（`crates/yu-rt/data/sysvar-abi-*.tsv`）。
 - [Yuris-Tyn](https://github.com/Weiss-UltimateSavior/Yuris-Tyn) —
@@ -227,7 +225,7 @@ flowchart TD
 ## 相关仓库
 
 - [yu-emote](https://github.com/NotFaceGUI/yu-emote) — E-mote（PSB/EMT）数据层与
-  运行时；以子模块挂在 `yu-emote/`，主线暂缓。
+  运行时；以子模块挂在 `yu-emote/`，暂缓开发。
 
 ## 许可
 
