@@ -18,6 +18,9 @@
 
 pub mod cache;
 pub mod png;
+/// PNG 解码(官方 libpng;**仅 Android**,arm64 上启用 NEON 反滤波)。
+#[cfg(target_os = "android")]
+pub mod png_libpng;
 pub mod report;
 pub mod scale;
 pub mod surface;

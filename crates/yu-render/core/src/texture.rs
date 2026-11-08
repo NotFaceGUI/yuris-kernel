@@ -146,6 +146,8 @@ pub struct TextureStore {
     fresh: std::collections::BTreeSet<Vec<u8>>,
     /// 已回收条目数(诊断)。
     evicted: u64,
+    /// 待后端释放 GPU 纹理的资产 key(见 [`Self::take_evicted_keys`])。
+    evicted_keys: Vec<Vec<u8>>,
     /// 超预算且无可回收条目时只告警一次(回落到预算内后复位)。
     budget_warned: bool,
     /// 编码不一致时的唯一同名回退(默认开;`YURIS_ASSET_NAME_FALLBACK=off`
@@ -215,6 +217,7 @@ impl TextureStore {
             trim_bounds: BTreeMap::new(),
             fresh: std::collections::BTreeSet::new(),
             evicted: 0,
+            evicted_keys: Vec::new(),
             budget_warned: false,
             name_fallback,
             name_fallback_hits: 0,
@@ -250,6 +253,23 @@ impl TextureStore {
     #[must_use]
     pub fn evicted_count(&self) -> u64 {
         self.evicted
+    }
+
+    /// 取走自上次调用以来被预算回收的资产 key。
+    ///
+    /// # 为什么需要
+    ///
+    /// 预算是**这里**执行的(CPU 像素),但 GPU 侧另有一份 `asset_ids`
+    /// 映射,把 key 永久钉在一张纹理上。两边不同步时,CPU 像素已经按预算
+    /// 丢掉、GPU 纹理却一张不释放 ⇒ 显存随「见过的资产种类」单调增长。
+    /// 桌面大显存下看不出来,手机上表现为**越玩越卡**(驱动开始换页),
+    /// 最终 `Out of Memory`。
+    ///
+    /// 后端每帧取走这份清单并释放对应 GPU 纹理。被回收的条目保证
+    /// `Rc::strong_count == 1`(没有活着的图层引用),所以释放是安全的;
+    /// 已经在用的纹理不会出现在这里。
+    pub fn take_evicted_keys(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.evicted_keys)
     }
 
     fn insert_cached(&mut self, key: Vec<u8>, cached: Cached) {
@@ -350,6 +370,8 @@ impl TextureStore {
                         bytes
                     );
                 }
+                // 通知后端释放这张资产对应的 GPU 纹理(见 `take_evicted_keys`)。
+                self.evicted_keys.push(key);
             }
         }
     }
@@ -855,13 +877,13 @@ impl TextureStore {
             Ok(value) => value,
             Err(cached) => return cached,
         };
-        let decoded = image::load_from_memory(&bytes);
+        let decoded = decode_asset(&bytes);
         match decoded {
-            Ok(img) => {
+            Ok(texture) => {
                 self.decoded += 1;
                 Cached {
                     resolved: Some(candidate),
-                    result: Ok(std::rc::Rc::new(Texture::from_rgba8(img.into_rgba8()))),
+                    result: Ok(std::rc::Rc::new(texture)),
                 }
             }
             Err(err) => Cached {
@@ -1224,6 +1246,111 @@ fn known_extension_format(key: &[u8]) -> Option<ImageFormat> {
     }
 }
 
+/// 按平台选择 PNG 解码实现。
+///
+/// # 为什么分平台
+///
+/// libpng 1.6 的 SIMD 反滤波**只有 ARM NEON / MIPS / PowerPC 实现,x86 一片空白**
+/// (`vendor/` 下只有 `arm/`、`mips/`、`powerpc/`)。它的标量 Paeth 带两个数据
+/// 相关分支(`pngrutil.c` 的 `if (pb<pa)` / `if (pc<pa)`),在 x86 上无法被编译器
+/// 向量化;实测同一张 1100×825 RGBA PNG:x86 上 libpng 7627µs vs `image` 1897µs
+/// (**慢 4 倍**)。
+///
+/// 而 arm64 上 `libpng-sys` 会编译 `arm/filter_neon_intrinsics.c`,运行期由
+/// `png_init_filter_functions_neon` 把 `png_read_filter_row_{up,sub4,avg4,
+/// paeth4}_neon` 挂到函数指针上 —— 差分图(RGBA, bpp=4)走的正是 `avg4`/`paeth4`。
+///
+/// 因此:
+/// - **Android/arm64**:libpng + NEON(CPU 侧确有提升的可能);
+/// - **其它平台**:保持 `image` crate(它用 stb 的 branch-free Paeth,x86 上更快)。
+///
+/// 两条路径的输出逐字节相同(`png_libpng_parity` 用例对 1253 张语料做过对拍),
+/// 所以分平台只影响性能,不影响像素。
+fn decode_asset(bytes: &[u8]) -> Result<Texture, String> {
+    #[cfg(target_os = "android")]
+    if is_png(bytes) {
+        // 后端选择:默认 `image`(已实测稳定),libpng 需显式开启。
+        //
+        // libpng 的 NEON 反滤波在本项目语料上尚未取得正收益实测数据
+        // (x86 上无 SIMD,慢 4 倍;arm64 上有 NEON 但真机结果待定),
+        // 因此**不设默认开启**,避免把未验证的实现放上主路径。
+        // 开关:`YURIS_PNG_BACKEND=libpng`(环境变量,或 run-config 的
+        // `png_backend` 键经宿主设置)。
+        let use_libpng = std::env::var("YURIS_PNG_BACKEND")
+            .map(|v| v.eq_ignore_ascii_case("libpng"))
+            .unwrap_or(false);
+        if use_libpng {
+            let started = std::time::Instant::now();
+            let fast = crate::png_libpng::decode_texture(bytes);
+            let fast_us = started.elapsed().as_micros();
+            // 对比模式:同一份 PNG 两条路径都解,验证像素一致并给出倍率。
+            if std::env::var_os("YURIS_PNG_CMP").is_some() {
+                let t2 = std::time::Instant::now();
+                let slow = decode_with_image(bytes);
+                let slow_us = t2.elapsed().as_micros();
+                match (&fast, &slow) {
+                    (Ok(a), Ok(b)) => log::warn!(
+                        target: "yu-kernel",
+                        "[pngcmp] {}x{} libpng={}us image={}us ratio={:.2}x same={}",
+                        a.width,
+                        a.height,
+                        fast_us,
+                        slow_us,
+                        slow_us as f64 / fast_us.max(1) as f64,
+                        a.width == b.width && a.height == b.height && a.rgba == b.rgba
+                    ),
+                    _ => log::warn!(
+                        target: "yu-kernel",
+                        "[pngcmp] libpng={}us(ok={}) image={}us(ok={})",
+                        fast_us,
+                        fast.is_ok(),
+                        slow_us,
+                        slow.is_ok()
+                    ),
+                }
+            }
+            return fast.or_else(|_| decode_with_image(bytes));
+        }
+    }
+    decode_with_image(bytes)
+}
+/// `image` crate 解码(非 Android 的主路径,以及 Android 上 libpng 的回落)。
+///
+/// 在 Android 上把耗时打进 logcat(`[png]` 行):这是「立绘差分切换卡」
+/// 的第一手证据 —— `preload` 的总耗时里解码占绝大多数(实测 >95%),
+/// 只有拿到单张图的真实解码时间,才能判断瓶颈是否在解码器。
+fn decode_with_image(bytes: &[u8]) -> Result<Texture, String> {
+    #[cfg(target_os = "android")]
+    let started = std::time::Instant::now();
+    let out = image::load_from_memory(bytes)
+        .map(|img| Texture::from_rgba8(img.into_rgba8()))
+        .map_err(|e| e.to_string());
+    #[cfg(target_os = "android")]
+    {
+        let us = started.elapsed().as_micros();
+        match &out {
+            Ok(t) => log::warn!(
+                target: "yu-kernel",
+                "[png] image {}x{} {}us",
+                t.width,
+                t.height,
+                us
+            ),
+            Err(e) => log::warn!(target: "yu-kernel", "[png] image failed {}us: {e}", us),
+        }
+    }
+    out
+}
+
+/// 是否 PNG(按 8 字节签名判断,不做扩展名猜测)。
+///
+/// 只有 Android 的 libpng 分支用它;其它平台走 `image`,直接按内容嗅探,
+/// 不需要这个判断。
+#[cfg(target_os = "android")]
+fn is_png(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+}
+
 fn display_bytes(bytes: &[u8]) -> String {
     let mut out = String::new();
     for &b in bytes {
@@ -1542,11 +1669,17 @@ mod tests {
         assert_eq!(store.resolved_path(b"b/img"), Some(b"b/img.png".as_slice()));
         assert_eq!(store.evicted_count(), 1);
         assert_eq!(store.resident_bytes(), 8);
+        // 回收的 key 必须交给后端释放 GPU 纹理:两边不同步时 GPU 显存
+        // 随「见过的资产种类」单调增长(手机越玩越卡的根因之一)。
+        assert_eq!(store.take_evicted_keys(), vec![b"a/img".to_vec()]);
+        assert!(
+            store.take_evicted_keys().is_empty(),
+            "取走一次后必须清空,否则后端每帧重复释放同一 key"
+        );
     }
 
     #[test]
-    fn preload_batch_survives_budget_until_next_frame() {
-        let mut store = store(
+    fn preload_batch_survives_budget_until_next_frame() {        let mut store = store(
             &[
                 (b"a/img.png", png_solid([1, 2, 3, 255])),
                 (b"b/img.png", png_solid([4, 5, 6, 255])),

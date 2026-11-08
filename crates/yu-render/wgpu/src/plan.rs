@@ -1121,11 +1121,30 @@ fn apply_image_pixels(
             .as_ref()
             .and_then(|value| value.as_int())
             .unwrap_or(0);
-        let f = blend.clamp(0, 256) as u32;
+        // 权重 = SET+1(官方执行体 `0x43bad0` 的 `iVar6 + 1`,范围 1..=256)。
+        // 见 shaders/lerp.wgsl 与 soft 的 `blend_transition`。
+        let f = (blend.clamp(0, 255) as u32) + 1;
         if to.width == 0 || to.height == 0 {
             return Ok(());
         }
         let out = surfaces.acquire(ctx, to.width, to.height, "transition surface")?;
+        // 取证:两源尺寸与内容 hash。`from_h == to_h` 说明脚本给的 ID2
+        // 与 ID 是同一张纹理(过渡恒等),`to` 尺寸异常则输出画布会错。
+        if std::env::var_os("YURIS_TRANS_DEBUG").is_some() {
+            log::warn!(
+                target: "yu-render",
+                "[trans] id={} from={}x{} h={} to={}x{} h={} set={} k={}",
+                target.display(),
+                source.width,
+                source.height,
+                source.hash,
+                to.width,
+                to.height,
+                to.hash,
+                blend,
+                f
+            );
+        }
         pipelines
             .ensure_lerp_pipeline(ctx)
             .map_err(|d| d.code.to_string())?;
@@ -1329,36 +1348,52 @@ fn apply_image_pixels(
                     ((set >> 24) & 0xFF) as f32 / 255.0,
                 ],
             };
-            pipelines
-                .ensure_paint_pipeline(ctx, alpha_only)
-                .map_err(|d| d.code.to_string())?;
-            pipelines
-                .ensure_paint_bind_group(ctx, alpha_only, color)
-                .map_err(|diag| diag.code.to_string())?;
-            let first_vertex = writes.vertices.len() as u32;
-            push_quad(
-                writes.vertices,
-                width,
-                height,
-                f64::from(x0),
-                f64::from(y0),
-                x1 - x0 + 1,
-                y1 - y0 + 1,
-                1.0,
-            );
-            let mut pass = PlannedPass {
-                target: Some(PlannedTarget::Commands),
-                first_vertex,
-                ..PlannedPass::default()
-            };
-            pass.paints.push(PaintCmd {
-                target_id: out.id,
-                alpha_only,
-                color: color.map(f32::to_bits),
-                first_vertex,
-            });
-            writes.passes.push(pass);
-            surfaces.stats_mut().surface_passes += 1;
+            if replaces {
+                // **全图替换 = 整层填 SET 颜色** ⇒ 用硬件 `LoadOp::Clear`。
+                //
+                // 与画一个全屏 quad 逐像素等价(颜色相同、写入相同),但 clear
+                // 走 GPU 快速路径,不占采样/混合单元。立绘过渡链每帧要清
+                // 4 张 1332×3351(每张 17.8MB),旧写法是纯带宽浪费:实测
+                // `queue.submit` 被背压拖到 0.6~1.1ms,正是 `render` 抖动来源。
+                let mut pass = PlannedPass {
+                    target: Some(PlannedTarget::Commands),
+                    ..PlannedPass::default()
+                };
+                pass.clear_colors.push((out.id, color));
+                writes.passes.push(pass);
+                surfaces.stats_mut().surface_passes += 1;
+            } else {
+                pipelines
+                    .ensure_paint_pipeline(ctx, alpha_only)
+                    .map_err(|d| d.code.to_string())?;
+                pipelines
+                    .ensure_paint_bind_group(ctx, alpha_only, color)
+                    .map_err(|diag| diag.code.to_string())?;
+                let first_vertex = writes.vertices.len() as u32;
+                push_quad(
+                    writes.vertices,
+                    width,
+                    height,
+                    f64::from(x0),
+                    f64::from(y0),
+                    x1 - x0 + 1,
+                    y1 - y0 + 1,
+                    1.0,
+                );
+                let mut pass = PlannedPass {
+                    target: Some(PlannedTarget::Commands),
+                    first_vertex,
+                    ..PlannedPass::default()
+                };
+                pass.paints.push(PaintCmd {
+                    target_id: out.id,
+                    alpha_only,
+                    color: color.map(f32::to_bits),
+                    first_vertex,
+                });
+                writes.passes.push(pass);
+                surfaces.stats_mut().surface_passes += 1;
+            }
         } else {
             // 区域为空:保留拷贝结果(与 CPU 循环不写像素一致)。
             surfaces.stats_mut().surface_passes += 0;

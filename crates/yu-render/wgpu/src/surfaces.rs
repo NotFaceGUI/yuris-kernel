@@ -269,6 +269,35 @@ impl LayerSurfaces {
         self.layers.get(id).and_then(|state| state.content.as_ref())
     }
 
+    /// 遍历所有**已物化**的层表面,返回层 id 与纹理句柄。
+    ///
+    /// 调试导出用:立绘分块合成出错时,把每一层的实际像素单独写 PNG,
+    /// 就能直接看出是哪一块脏了,不必再靠加工链推断。
+    pub fn materialized_layers(&self) -> Vec<(LayerId, Rc<TexRef>)> {
+        self.layers
+            .iter()
+            .filter_map(|(id, state)| {
+                state
+                    .content
+                    .as_ref()
+                    .map(|content| (id.clone(), Rc::clone(&content.tex)))
+            })
+            .collect()
+    }
+
+    /// 同上,但返回**逻辑尺寸**(`content.width/height`)而不是纹理尺寸。
+    pub fn materialized_layer_logical(&self) -> Vec<(LayerId, u32, u32)> {
+        self.layers
+            .iter()
+            .filter_map(|(id, state)| {
+                state
+                    .content
+                    .as_ref()
+                    .map(|content| (id.clone(), content.width, content.height))
+            })
+            .collect()
+    }
+
     /// 已应用前缀里最后一条 `seq`(无状态 = `None`)。
     ///
     /// 帧首用于判断「上一帧留下的加工链是否越过本帧的消费命令点」:
@@ -501,6 +530,9 @@ impl LayerSurfaces {
         });
         self.trim_pool();
         self.stats.live_surfaces = self.live_textures();
+        // `live_bytes` 原来只算 surfaces 的常驻表面;漏了这一行会让诊断里的
+        // `live=?/0MB` 永远是 0,看不出常驻显存趋势。
+        self.stats.live_bytes = self.live_bytes();
         self.stats.pooled = self.pool.values().map(Vec::len).sum();
         self.stats.pooled_bytes = self.pooled_bytes;
     }

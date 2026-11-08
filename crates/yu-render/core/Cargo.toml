@@ -13,3 +13,15 @@ yu-format = { path = "../../yu-format" }
 yu-gfx = { path = "../../yu-gfx" }
 yu-log = { path = "../../yu-log" }
 yu-vfs = { path = "../../yu-vfs" }
+
+# PNG 解码在 **Android 上**走官方 libpng(C 库)。`libpng-sys` 的 build.rs 在
+# `CARGO_CFG_TARGET_ARCH` 为 arm/aarch64 时会编译 `vendor/arm/arm_init.c` +
+# `vendor/arm/filter_neon_intrinsics.c`,即手写 NEON 反滤波
+# (`png_read_filter_row_{up,sub4,avg4,paeth4}_neon`)—— 差分图(RGBA, bpp=4)
+# 走的正是 avg4/paeth4,而纯 Rust 无法对 Paeth 的逐字节数据依赖向量化。
+#
+# **只给 Android 启用**:libpng 1.6 没有 x86 SIMD 实现,其标量 Paeth 带两个
+# 数据相关分支,实测 x86 上比 `image` 慢 4 倍(7627µs vs 1897µs)。桌面保持
+# `image`(stb 的 branch-free Paeth,LLVM 在 x86_64 上能向量化)。
+[target.'cfg(target_os = "android")'.dependencies]
+libpng-sys = { version = "1.1", default-features = false, features = ["build", "libz-sys"] }

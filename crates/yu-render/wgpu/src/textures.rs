@@ -116,6 +116,34 @@ impl TextureCache {
         self.textures.len()
     }
 
+    /// 释放已被 CPU 预算回收的资产对应的 GPU 纹理。
+    ///
+    /// [`TextureStore::take_evicted_keys`] 给出的 key 已经不在 CPU 缓存里,
+    /// 且回收时 `Rc::strong_count == 1`(没有存活的图层/快照引用)。
+    /// 不释放它们,GPU 显存就只增不减:CPU 侧有 512MiB 预算,GPU 侧却是
+    /// 「见过的每一种资产」永久常驻 —— 手机上就是越玩越卡直至 OOM。
+    ///
+    /// 正在被图层使用的纹理**不会**出现在清单里,所以这里不会撕裂画面。
+    pub fn release_evicted(
+        &mut self,
+        keys: &[Vec<u8>],
+        pipelines: &mut crate::pipelines::PipelineCache,
+    ) -> usize {
+        let mut released = 0usize;
+        for key in keys {
+            let Some((id, _)) = self.asset_ids.remove(key) else {
+                continue;
+            };
+            self.asset_texture_ids.remove(&id);
+            // 摘掉 pin 之后 `remove` 才会真的删。
+            if self.textures.remove(&id).is_some() {
+                pipelines.forget_texture(id);
+                released += 1;
+            }
+        }
+        released
+    }
+
     pub fn get(&self, id: u64) -> Option<&GpuTexture> {
         self.textures.get(&id)
     }

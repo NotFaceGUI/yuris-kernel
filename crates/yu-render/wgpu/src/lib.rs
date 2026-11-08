@@ -576,6 +576,113 @@ impl WgpuRenderer {
         Ok(surface)
     }
 
+    /// 已物化层的**逻辑显示尺寸**(`层名, 宽, 高`),供宿主做逐帧判异。
+    ///
+    /// 用**逻辑尺寸**而不是纹理尺寸:`SIZE*` 是零拷贝 UV 别名,内容可能是
+    /// 一张 1×1 纯色纹理而逻辑尺寸是 643×825(画出来正常)。用纹理尺寸判
+    /// 会把合法的纯色别名误报成"退化成 1×1"。
+    ///
+    /// 只读元数据,不做 GPU 读回,可以每帧调用。
+    pub fn materialized_layer_sizes(&self) -> Vec<(String, u32, u32)> {
+        self.surfaces
+            .materialized_layer_logical()
+            .into_iter()
+            .map(|(id, w, h)| (id.display(), w, h))
+            .collect()
+    }
+
+    /// **全量资源快照**(诊断;每 60 帧打一次)。
+    ///
+    /// 一次给齐「会不会越来越卡」需要的所有计数,避免反复取数:
+    ///
+    /// - `created/reused/released`:本帧新建/池复用/归还的层表面纹理数。
+    ///   `created` 持续偏高而 `reused` 很低 ⇒ 纹理每帧重建(GPU 侧碎片化,
+    ///   驱动越来越慢,而 CPU 的 `render_ms` 完全看不出来)。
+    /// - `materialized`:本帧为 UV 别名重采样的次数(每次一张全尺寸纹理)。
+    /// - `pooled/pooled_bytes`:池里空闲纹理;池只增不减也会吃显存。
+    /// - `live_surfaces/live_bytes`:常驻层表面。
+    /// - `composites/offscreen/snapshots`:合成目标/离屏/快照数。
+    pub fn resource_snapshot(&self) -> String {
+        let s = self.surfaces.stats();
+        let (composites, offscreen, snapshots) = self.targets.resource_counts();
+        format!(
+            "created={} reused={} released={} mat={} passes={} blits={} \
+             live={}/{}MB pooled={}/{}MB comps={} off={} snap={} vram={}MB",
+            s.created,
+            s.reused,
+            s.released,
+            s.materialized,
+            s.surface_passes,
+            s.blits,
+            s.live_surfaces,
+            s.live_bytes / (1024 * 1024),
+            s.pooled,
+            s.pooled_bytes / (1024 * 1024),
+            composites,
+            offscreen,
+            snapshots,
+            self.target_bytes() / (1024 * 1024),
+        )
+    }
+
+    /// 把所有**已物化**的层表面按名字过滤后逐个读回,交给调用方落盘。
+    ///
+    /// 用途:立绘分块合成出问题时,把每一层的实际像素单独导成 PNG,直接
+    /// 肉眼定位「哪一块脏了」,不必再从加工链反推。
+    ///
+    /// `filter` 对 `LayerId::display()` 做子串匹配(空串 = 全部)。
+    /// `emit(name, Surface)` 每层调用一次。低频路径:每次都全量读回 GPU
+    /// 纹理,会阻塞队列,不适合逐帧调用。
+    pub fn dump_layers(
+        &mut self,
+        filter: &str,
+        mut emit: impl FnMut(&str, &Surface),
+    ) -> Result<usize, Diag> {
+        let items = self.surfaces.materialized_layers();
+        let mut written = 0usize;
+        for (id, tex) in items {
+            let name = id.display();
+            if !filter.is_empty() && !name.contains(filter) {
+                continue;
+            }
+            let encoder = self
+                .ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("yu-backend-wgpu dump layer"),
+                });
+            let surface = self
+                .readback
+                .read_now(&self.ctx, &tex.texture, tex.width, tex.height, encoder)?;
+            emit(&name, &surface);
+            written += 1;
+        }
+        // 快照也导出:过渡的 `from` 常常直接是某个 `Snapshot(CopyId)` 基图,
+        // 层本身没有物化 content。不导出快照就无法回答「from 到底是什么像素」。
+        // 只导与 `filter` 相关层的快照会漏掉(层名里没有 CopyId),所以这里
+        // 全量导出,名字带 `snap<N>` 前缀便于和层区分。
+        let snaps: Vec<(u64, Rc<crate::surfaces::TexRef>)> = self
+            .targets
+            .snapshot_refs()
+            .into_iter()
+            .map(|(id, tex)| (id.0, tex))
+            .collect();
+        for (copy_id, tex) in snaps {
+            let encoder = self
+                .ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("yu-backend-wgpu dump snapshot"),
+                });
+            let surface = self
+                .readback
+                .read_now(&self.ctx, &tex.texture, tex.width, tex.height, encoder)?;
+            emit(&format!("snap{copy_id}"), &surface);
+            written += 1;
+        }
+        Ok(written)
+    }
+
     fn render_inner(
         &mut self,
         frame: &CompositorFrame,
@@ -585,6 +692,20 @@ impl WgpuRenderer {
         let timing = std::env::var("YU_RENDER_TIMING").is_ok();
         let started = std::time::Instant::now();
         self.textures.begin_frame();
+        // CPU 预算刚回收了一批资产 ⇒ 同步释放它们的 GPU 纹理。
+        // 两边不同步时 GPU 显存随「见过的资产种类」单调增长(手机上表现为
+        // 越玩越卡、最终 OOM);详见 `TextureCache::release_evicted`。
+        let evicted = self.textures.take_evicted_keys();
+        if !evicted.is_empty() {
+            let released = self
+                .gpu_textures
+                .release_evicted(&evicted, &mut self.pipelines);
+            log::debug!(
+                target: "yu-render",
+                "[asset] gpu textures released={released} (cache evicted={})",
+                evicted.len()
+            );
+        }
         self.frame_copy_bytes = 0;
         self.frame_copy_count = 0;
         let snapshots_before = self.targets.resource_counts().2;
@@ -648,8 +769,50 @@ impl WgpuRenderer {
         // (`phases[readback=33159]us`),是「立绘/镜头运动卡顿」的主因之一。
         let screen_width = frame.viewport.width;
         let screen_height = frame.viewport.height;
-        let t_read0 = started.elapsed();
         let needs_cpu_screen = !streaming || frame_needs_cpu_backbuffer(frame);
+        // 归因(只读,`YURIS_READBACK_WHY` 开关):
+        // 真机实测 `rb` p99=15.7ms / max=719ms 且每帧都非零,必须先确定
+        // 「是走读回分支,还是仅仅在等 `queue.submit`」——两者的修法完全不同。
+        if std::env::var_os("YURIS_READBACK_WHY").is_some() {
+            let group_copies: Vec<String> = frame
+                .passes
+                .iter()
+                .flat_map(|p| p.ops.iter())
+                .filter_map(|op| match op {
+                    yu_gfx::Op::Copy(c) => Some(c),
+                    _ => None,
+                })
+                .filter(|c| matches!(c.source, yu_gfx::CopySource::Group(_)))
+                .map(|c| {
+                    format!(
+                        "copy{}snap={}",
+                        c.id.0,
+                        frame.screen_snapshots.contains_key(&c.id)
+                    )
+                })
+                .collect();
+            let total_copy = frame
+                .passes
+                .iter()
+                .flat_map(|p| p.ops.iter())
+                .filter(|op| matches!(op, yu_gfx::Op::Copy(_)))
+                .count();
+            log::warn!(
+                target: "yu-kernel",
+                "[rbwhy] frame={} need={} streaming={} copies={} groupsnap=[{}] snapshots={}",
+                frame.frame,
+                needs_cpu_screen,
+                streaming,
+                total_copy,
+                group_copies.join(","),
+                frame.screen_snapshots.len()
+            );
+        }
+        // **计时起点移到这里**:上面只做判断,不含 GPU 提交。旧实现把
+        // `t_read0` 放在判断之前,`phases.readback_us` 实际量的是
+        // 「提交 + 可能的读回」,读数被 `queue.submit` 污染(真机日志里
+        // `rb` 每帧 374µs~15.7ms 无法区分是哪个)。
+        let t_read0 = started.elapsed();
         let mut screen_surface = {
             if !needs_cpu_screen {
                 // 实时路径且本帧无 `:/W0/` 兜底需求:不提交读回拷贝。
@@ -665,7 +828,8 @@ impl WgpuRenderer {
                     Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
                         .with_detail("帧结束时没有屏幕目标")
                 })?;
-                if streaming {
+                let t_inside = started.elapsed();
+                let out = if streaming {
                     self.readback.read(
                         &self.ctx,
                         &screen.texture,
@@ -681,7 +845,19 @@ impl WgpuRenderer {
                         screen_height,
                         encoder,
                     )?
+                };
+                // 细分:判断之后到进入 read 之前的耗时(应≈0)+ read 内部耗时。
+                if std::env::var_os("YURIS_READBACK_WHY").is_some() {
+                    log::warn!(
+                        target: "yu-kernel",
+                        "[rbtime] frame={} pre={}us read={}us total={}us",
+                        frame.frame,
+                        (t_inside - t_read0).as_micros(),
+                        (started.elapsed() - t_inside).as_micros(),
+                        (started.elapsed() - t_read0).as_micros()
+                    );
                 }
+                out
             }
         };
         let t_readback = started.elapsed() - t_read0;
@@ -864,6 +1040,39 @@ impl WgpuRenderer {
                 })];
                 let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("yu-backend-wgpu clear"),
+                    color_attachments: &attachments,
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+            // 清成**指定实色**(`RECTPAINT{RectPaint,RectPaint3}` 的全图替换)。
+            // 与画一个全屏 quad 逐像素等价,但走硬件 clear 路径 —— 立绘过渡链
+            // 每帧要清 4 张 1332×3351,这是纯带宽浪费的主要来源。
+            for (id, color) in &pass.clear_colors {
+                let Some(view) = resolve_view(*id) else {
+                    return Err(
+                        Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                            .with_detail(format!("实色清屏目标 {id} 缺失")),
+                    );
+                };
+                let attachments = [Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: f64::from(color[0]),
+                            g: f64::from(color[1]),
+                            b: f64::from(color[2]),
+                            a: f64::from(color[3]),
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })];
+                let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("yu-backend-wgpu clear color"),
                     color_attachments: &attachments,
                     depth_stencil_attachment: None,
                     timestamp_writes: None,

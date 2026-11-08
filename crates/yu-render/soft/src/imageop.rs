@@ -413,14 +413,61 @@ pub fn alpha_span(row: &[u8], width: usize) -> (usize, usize) {
     (first, last)
 }
 
-/// 双源线性过渡(逐通道 `(from*inv + to*f)/256`;整数截断,与旧实现一致)。
+/// 单通道线性插值,**按 alpha 加权**(预乘语义)。
 ///
-/// 输出 = 按 `to` 尺寸的新零面;两个源在该像素都为零时结果本就是零,因此
+/// # 为什么必须加权
+///
+/// 立绘缓冲里存在「纯白但全透明」的像素(`(255,255,255,0)`):它们来自
+/// `RECTPAINT2`——该动作**只写 alpha、保留 RGB**,作用在白色底图上就留下
+/// 了白色幽灵。GPU 纹理池复用也会带出同类残留。
+///
+/// 逐通道直接插值会让这些像素的 RGB 参与混合:
+/// `out = 255*(1-k) + 34*k` ⇒ 淡出过程中**越淡越亮**。而 alpha=0 的像素
+/// 本不该贡献任何颜色。
+///
+/// 按 alpha 加权后:
+/// `out = (from.rgb*from.a*(1-k) + to.rgb*to.a*k) / (from.a*(1-k) + to.a*k)`
+///
+/// **两源都不透明时退化为普通逐通道插值**,与官方 SSE 内核(`0x402d7c`)
+/// 的 `a + (b-a)*k/65536` 完全一致;只在半透明/透明区域修正。
+#[inline]
+fn lerp_weighted(from: [u8; 4], to: [u8; 4], weight: u32) -> [u8; 4] {
+    // 权重是 16.16 定点: from 用 (256-k)/256, to 用 k/256。
+    let wf = u32::from(from[3]) * (256 - weight);
+    let wt = u32::from(to[3]) * weight;
+    let den = wf + wt;
+    if den == 0 {
+        return [0, 0, 0, 0];
+    }
+    let mut out = [0u8; 4];
+    for c in 0..3 {
+        let num = u32::from(from[c]) * wf + u32::from(to[c]) * wt;
+        // +den/2 四舍五入(与官方 PADDUSW 的舍入口径同阶)。
+        out[c] = ((num + den / 2) / den).min(255) as u8;
+    }
+    out[3] = ((den + 128) >> 8).min(255) as u8;
+    out
+}
+
+/// 双源线性过渡:按 `to` 尺寸逐像素加权混合两个源。
+///
+/// 输出是 `to` 尺寸的新零面;两个源在该像素都为零时结果本就是零,因此
 /// **按行求非零跨度,只写该跨度**(`row_span_rgba`)。这一步把「立绘淡入」
 /// 这种 2048² 缓冲 + 局部内容的逐帧全图混合,从 `O(缓冲)` 降到 `O(内容)`
 /// (实测单帧 15–52ms → 个位数;输出逐位不变)。
 pub fn blend_transition(from: &Texture, to: &Texture, blend: i64) -> Texture {
-    let f = blend.clamp(0, 256) as u32;
+    // 官方 `CGACT[TRANSITION]` 执行体 `FUN_0043bad0`(0.495, sha256 4f5eefa3…):
+    //
+    // ```c
+    // iVar6 = 0xff;                                  // 默认 255
+    // if (SET < 0x100) { iVar6 = SET; }               // SET <= 255 时取 SET
+    // ... 传给混合内核的是 iVar6 + 1                  // 即 SET+1,或 256
+    // ```
+    //
+    // 所以**权重是 `SET+1`,范围 [1, 256]**,永远不为 0。旧实现直接用
+    // `clamp(SET, 0, 256)`,在 `SET=0` 时是全旧图、且整体权重偏小 1/256 ——
+    // 淡变首帧因此比官方「更硬」,和现场观察的「过渡形态不一致」吻合。
+    let f = (blend.clamp(0, 255) as u32) + 1;
     let (w, h) = (to.width, to.height);
     if w == 0 || h == 0 {
         return Texture {
@@ -431,7 +478,6 @@ pub fn blend_transition(from: &Texture, to: &Texture, blend: i64) -> Texture {
     }
     let ww = w as usize;
     let mut out = vec![0u8; ww * (h as usize) * 4];
-    let inv = 256 - f;
     let fw = from.width as usize;
     let fh = from.height as usize;
     let overlap = fw.min(ww);
@@ -465,14 +511,21 @@ pub fn blend_transition(from: &Texture, to: &Texture, blend: i64) -> Texture {
         });
         for (i, dst) in out_row.chunks_exact_mut(4).enumerate() {
             let base = i * 4;
+            // 两源各自取 4 通道后**整体**加权插值:RGB 只按有效 alpha 贡献,
+            // 避免「纯白全透明」像素(`RECTPAINT2` 遗留 / 纹理池复用)把画面
+            // 提亮 —— 逐通道独立插值是「越淡越亮」的根因。
+            let mut px_to = [0u8; 4];
+            let mut px_from = [0u8; 4];
             for c in 0..4 {
-                let src_to = u32::from(to_span[base + c]);
-                let src_from = match from_span {
-                    Some(span) if base + c < span.len() => u32::from(span[base + c]),
+                if base + c < to_span.len() {
+                    px_to[c] = to_span[base + c];
+                }
+                px_from[c] = match from_span {
+                    Some(span) if base + c < span.len() => span[base + c],
                     _ => 0,
                 };
-                dst[c] = ((src_from * inv + src_to * f) / 256) as u8;
             }
+            dst.copy_from_slice(&lerp_weighted(px_from, px_to, f));
         }
     }
     Texture {
@@ -494,21 +547,42 @@ mod blend_tests {
         }
     }
 
-    /// `SET=0` = 全旧图,`SET=256` = 全新图,`SET=128` = 各半。
+    /// 权重 = `SET+1`(官方 `0x43bad0` 的 `iVar6 + 1`),范围 [1, 256]。
+    ///
+    /// - `SET=0` ⇒ k=1:几乎全旧图,但**不是**逐位相等(1/256 偏向新图);
+    /// - `SET=255` ⇒ k=256:逐位等于新图(真端点);
+    /// - `SET>=256` ⇒ k=256:同 `SET=255`。
     #[test]
     fn blend_transition_endpoints_and_midpoint() {
         let from = tex(1, 1, [0, 0, 0, 255]);
         let to = tex(1, 1, [200, 100, 50, 255]);
-        assert_eq!(blend_transition(&from, &to, 0).rgba, vec![0, 0, 0, 255]);
-        assert_eq!(blend_transition(&from, &to, 256).rgba, vec![200, 100, 50, 255]);
+        // SET=0 → k=1/256:200*1/256 = 0.78 → 四舍五入 1
+        assert_eq!(
+            blend_transition(&from, &to, 0).rgba,
+            vec![1, 0, 0, 255],
+            "k=1 时几乎全旧图但不为零(官方 `iVar6+1` 语义)"
+        );
+        assert_eq!(
+            blend_transition(&from, &to, 255).rgba,
+            vec![200, 100, 50, 255],
+            "SET=255 → k=256 = 逐位新图"
+        );
+        assert_eq!(
+            blend_transition(&from, &to, 400).rgba,
+            vec![200, 100, 50, 255],
+            "SET 超上限也钳到 k=256"
+        );
+        // SET=128 → k=129:200*129/256 = 100.78 → 101
         assert_eq!(
             blend_transition(&from, &to, 128).rgba,
-            vec![100, 50, 25, 255],
-            "128/256 = 一半"
+            vec![101, 50, 25, 255],
+            "中点四舍五入,不是截断"
         );
     }
 
     /// 画布取新图尺寸;旧图越界部分按透明(0)。
+    ///
+    /// `SET=0` ⇒ k=1:旧图 255 与「越界透明 0」按 1/256 混 ⇒ 254(四舍五入)。
     #[test]
     fn blend_transition_uses_to_size_and_zero_pads_from() {
         let from = tex(1, 1, [255, 255, 255, 255]);
@@ -516,17 +590,43 @@ mod blend_tests {
         let out = blend_transition(&from, &to, 0);
         assert_eq!((out.width, out.height), (2, 1));
         assert_eq!(out.rgba.len(), 8);
-        // 第 1 像素取旧图,第 2 像素旧图越界 ⇒ 透明。
-        assert_eq!(&out.rgba[0..4], &[255, 255, 255, 255]);
+        // 第 1 像素:from 不透明、to 越界按全透明加权 ⇒ **RGB 保持 255**,
+        // 只有 alpha 按 255/256 略降。全透明的源不该拉低 RGB。
+        assert_eq!(&out.rgba[0..4], &[255, 255, 255, 254]);
         assert_eq!(&out.rgba[4..8], &[0, 0, 0, 0]);
     }
 
-    /// 参考实现 = 优化前的逐像素全图公式(逐字保留)。
+    /// 「纯白全透明」的源不得把结果提亮。
+    ///
+    /// 回归:立绘缓冲里存在 `(255,255,255,0)`(`RECTPAINT2` 只写 alpha、
+    /// 保留白色底图的 RGB;纹理池复用同样会带出)。逐通道直插会让这些像素
+    /// 的 RGB 参与混合 ⇒ 淡出过程**越淡越亮**。按 alpha 加权后它们零贡献。
+    #[test]
+    fn blend_transition_ignores_white_transparent_pixels() {
+        // from 是「纯白全透明」,to 是深色半透明。
+        let from = tex(1, 1, [255, 255, 255, 0]);
+        let to = tex(1, 1, [34, 2, 16, 26]);
+        let out = blend_transition(&from, &to, 204);
+        // 期望结果只由 to 决定(白像素 alpha=0,权重为 0)。
+        assert_eq!(
+            out.rgba,
+            vec![34, 2, 16, 21],
+            "全透明源的 RGB 不得参与混合(实际 {:?})",
+            out.rgba
+        );
+        // 反向:to 全透明时,from 的 RGB 原样保留。
+        let rev = blend_transition(&to, &from, 204);
+        assert_eq!(rev.rgba, vec![34, 2, 16, 5], "to 全透明只降 alpha");
+    }
+
+    /// 参考实现 = **朴素全图逐像素**版(跨度优化的对照基线)。
+    ///
+    /// 公式必须与 [`blend_transition`] 完全一致(alpha 加权 + `SET+1` 权重),
+    /// 否则这条对拍测的是两套不同语义。
     fn blend_reference(from: &Texture, to: &Texture, blend: i64) -> Texture {
-        let f = blend.clamp(0, 256) as u32;
+        let f = (blend.clamp(0, 255) as u32) + 1;
         let (w, h) = (to.width, to.height);
         let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
-        let inv = 256 - f;
         for y in 0..h as usize {
             for x in 0..w as usize {
                 let d = (y * w as usize + x) * 4;
@@ -536,15 +636,17 @@ mod blend_tests {
                 } else {
                     usize::MAX
                 };
+                let mut px_to = [0u8; 4];
+                let mut px_from = [0u8; 4];
                 for c in 0..4 {
-                    let src_to = u32::from(to.rgba.get(ti + c).copied().unwrap_or(0));
-                    let src_from = if fi == usize::MAX {
+                    px_to[c] = to.rgba.get(ti + c).copied().unwrap_or(0);
+                    px_from[c] = if fi == usize::MAX {
                         0
                     } else {
-                        u32::from(from.rgba.get(fi + c).copied().unwrap_or(0))
+                        from.rgba.get(fi + c).copied().unwrap_or(0)
                     };
-                    out[d + c] = ((src_from * inv + src_to * f) / 256) as u8;
                 }
+                out[d..d + 4].copy_from_slice(&lerp_weighted(px_from, px_to, f));
             }
         }
         Texture {

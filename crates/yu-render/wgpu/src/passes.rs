@@ -116,6 +116,14 @@ pub(crate) struct PlannedPass {
     pub paints: Vec<PaintCmd>,
     /// 需要先清成透明的表面 id(`TargetSet`/`FramePlan::views` 解析)。
     pub clear_targets: Vec<u64>,
+    /// 需要**清成指定实色**的表面(`id`, RGBA)。
+    ///
+    /// `RECTPAINT{RectPaint,RectPaint3}` 在「全图 + 替换写入」时语义就是
+    /// 「把整层填成 SET 颜色」——用 `LoadOp::Clear(color)` 与画一个全屏
+    /// quad 逐像素等价,但 clear 走硬件快速路径。立绘过渡链每帧要清 4 张
+    /// 1332×3351(每张 17.8MB),全屏 quad 写法在这里是纯带宽浪费:实测
+    /// `queue.submit` 被 GPU 背压拖到 0.6~1.1ms,正是 `render` 抖动的来源。
+    pub clear_colors: Vec<(u64, [f32; 4])>,
     /// `true` = 保留目标现有内容(表面写入);`false` = 按 `clear` 清屏。
     pub load: bool,
 }
