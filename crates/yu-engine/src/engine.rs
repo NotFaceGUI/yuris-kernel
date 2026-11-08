@@ -437,6 +437,30 @@ pub struct FrameOpSummary {
     pub image_ops: usize,
     /// 本帧 op 目标层(`LayerId`)按 op 数降序的前 N 项。
     pub top_targets: Vec<(String, usize)>,
+    /// **Screen pass 里实际绘制的层**(`层名@alpha`,按出现顺序)。
+    ///
+    /// 诊断用:过渡缓冲(`SPLBUFa/b*`)只应出现在 `Texture` pass 作为中间
+    /// 结果,一旦出现在 Screen pass 就会被直接画到屏幕上 —— 表现为
+    /// 「旧姿态的半透明残影叠在新姿态上」。这里把屏幕层的 alpha 一并带出,
+    /// 便于一眼看出是「多画了一层」还是「层 alpha 不对」。
+    pub screen_layers: Vec<String>,
+    /// 本帧的**图像加工链**(`源→目标 动作` 摘要,按命令序)。
+    ///
+    /// 立绘基图是 `solid1x1`、像素全靠加工重放时,「旧差分残留」只能来自
+    /// 加工链里同时存在新旧两条路径。这里逐条列出已执行的加工项,用来
+    /// 区分「链上确实有两份」与「视觉叠加另有来源」。
+    pub image_chain: Vec<String>,
+    /// 本帧的**复制链**(`源→目标 kind` 摘要)。
+    ///
+    /// 与 [`Self::image_chain`] 互补:过渡的 `from` 缓冲(`SPLBUFa/b` 的无
+    /// 后缀版)只能靠 `COPY2` 写入,缺那一步 `from` 就会退化成层基图。
+    pub copy_chain: Vec<String>,
+    /// 参与本帧的**立绘层属性**(`层名 alpha= fill= tex=`)。
+    ///
+    /// `fill` 是 `CG[FILE=""]` 空壳层 `RECTPAINT*` 后的实色:基图为 1×1 时
+    /// `solid_fill_texture` 会把它铺满整层,过渡的 from 若退化成基图就会
+    /// 变成**整块纯色**,宏观表现是「画面被提亮一层」。
+    pub sprite_layers: Vec<String>,
 }
 
 /// 等待中的任务(H-P1-02;`Scheduler::nodes` 的等待面投影)。
@@ -1038,6 +1062,15 @@ impl Engine {
         self.last_surface.as_deref()
     }
 
+    /// 最近一帧呈现面的**共享句柄**(取证路径用;不复制像素)。
+    ///
+    /// 与 [`Self::last_surface`] 的区别只是返回 `Arc`:宿主把它们塞进环形
+    /// 缓冲/落盘队列时需要持有,裸借用活不过那一帧。
+    #[must_use]
+    pub fn last_surface_shared(&self) -> Option<Arc<Surface>> {
+        self.last_surface.as_ref().map(Arc::clone)
+    }
+
     /// 最近一帧的 `display` JSON(按需生成,不逐帧持有)。
     pub fn display_json(&self) -> Option<String> {
         self.last_frame.as_ref().map(json::to_display_json)
@@ -1097,7 +1130,37 @@ impl Engine {
         let frame = self.last_frame.as_ref()?;
         let mut summary = FrameOpSummary::default();
         let mut targets: BTreeMap<String, usize> = BTreeMap::new();
+        let mut screen_layers: Vec<String> = Vec::new();
+        let mut image_chain: Vec<String> = Vec::new();
+        let mut copy_chain: Vec<String> = Vec::new();
+        // 立绘层属性:fill 是「基图退化成纯色」时的实际颜色,必须看得到。
+        let mut sprite_layers: Vec<String> = Vec::new();
+        for layer in &frame.layers {
+            let name = layer.id.display();
+            if !name.contains("SPL") {
+                continue;
+            }
+            let tex = match &layer.texture {
+                yu_gfx::TextureRef::Asset(key) => format!("asset:{}", String::from_utf8_lossy(key)),
+                yu_gfx::TextureRef::Snapshot(id) => format!("snap:{}", id.0),
+                yu_gfx::TextureRef::SolidBlack1x1 => "solid1x1".to_string(),
+                yu_gfx::TextureRef::Offscreen(id) => format!("off:{}", id.display()),
+                yu_gfx::TextureRef::Movie { frame, .. } => format!("movie:{frame}"),
+                yu_gfx::TextureRef::None => "none".to_string(),
+            };
+            sprite_layers.push(format!(
+                "{name} a={} vis={} xy=({:.1},{:.1}) tex={} fill={:?} size={:?}",
+                layer.alpha,
+                layer.visible,
+                layer.transform.x,
+                layer.transform.y,
+                tex,
+                layer.fill.map(|p| (p[0], p[1], p[2], p[3])),
+                layer.image_size().map(|s| (s.width, s.height)),
+            ));
+        }
         for pass in &frame.passes {
+            let on_screen = matches!(&pass.target, PassTarget::Screen);
             match &pass.target {
                 PassTarget::Screen => summary.screen_passes += 1,
                 PassTarget::Offscreen(_) => summary.offscreen_passes += 1,
@@ -1107,6 +1170,29 @@ impl Engine {
                 let target = match op {
                     Op::Layer(layer) => {
                         summary.layer_ops += 1;
+                        if on_screen {
+                            let tex = match &layer.texture {
+                                yu_gfx::TextureRef::Asset(key) => {
+                                    format!("asset:{}", String::from_utf8_lossy(key))
+                                }
+                                yu_gfx::TextureRef::Snapshot(id) => format!("snap:{}", id.0),
+                                yu_gfx::TextureRef::SolidBlack1x1 => "solid1x1".to_string(),
+                                yu_gfx::TextureRef::Offscreen(id) => {
+                                    format!("off:{}", id.display())
+                                }
+                                yu_gfx::TextureRef::Movie { frame, .. } => {
+                                    format!("movie:{frame}")
+                                }
+                                yu_gfx::TextureRef::None => "none".to_string(),
+                            };
+                            screen_layers.push(format!(
+                                "{}@{}[{}]{}",
+                                layer.id.display(),
+                                layer.alpha,
+                                tex,
+                                if layer.fill.is_some() { "+fill" } else { "" }
+                            ));
+                        }
                         layer.id.display()
                     }
                     Op::Group(group) => {
@@ -1123,10 +1209,43 @@ impl Engine {
                     }
                     Op::Copy(copy) => {
                         summary.copy_ops += 1;
+                        copy_chain.push(format!(
+                            "{:?}→{} {:?}",
+                            copy.source, copy.dest.display(), copy.kind
+                        ));
                         copy.dest.display()
                     }
                     Op::Image(image) => {
                         summary.image_ops += 1;
+                        image_chain.push(format!(
+                            "{}→{}{}{}{}{}",
+                            image.source.display(),
+                            image
+                                .target
+                                .as_ref()
+                                .map(|t| t.display())
+                                .unwrap_or_else(|| "(in-place)".to_string()),
+                            image.action.name(),
+                            image
+                                .source2
+                                .as_ref()
+                                .map(|t| format!(" ID2={}", t.display()))
+                                .unwrap_or_default(),
+                            image
+                                .set
+                                .as_ref()
+                                .and_then(|v| v.as_int())
+                                .map(|v| format!(" set={v}"))
+                                .unwrap_or_default(),
+                            // `SIZE*` 的目标尺寸:跨场景残留时这里会带着旧尺寸,
+                            // 输出画布因此错位或整层透明。
+                            match (image.sx, image.sy) {
+                                (Some(w), Some(h)) => format!(" sx={w:.0} sy={h:.0}"),
+                                (Some(w), None) => format!(" sx={w:.0}"),
+                                (None, Some(h)) => format!(" sy={h:.0}"),
+                                (None, None) => String::new(),
+                            }
+                        ));
                         image.target.as_ref().unwrap_or(&image.source).display()
                     }
                 };
@@ -1137,6 +1256,10 @@ impl Engine {
         rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         rows.truncate(top);
         summary.top_targets = rows;
+        summary.screen_layers = screen_layers;
+        summary.image_chain = image_chain;
+        summary.copy_chain = copy_chain;
+        summary.sprite_layers = sprite_layers;
         Some(summary)
     }
 
@@ -1177,6 +1300,24 @@ impl Engine {
         match &self.renderer {
             Renderer::Soft(r) => r.textures().decoded_count() as usize,
             Renderer::Wgpu { renderer, .. } => renderer.textures().decoded_count() as usize,
+        }
+    }
+
+    /// 资产缓存常驻字节 + 已回收条目数(诊断)。
+    ///
+    /// 用来区分「越打越卡」的两种成因:常驻字节贴近预算 = 预算在工作,
+    /// 卡顿更可能来自重复解码;常驻字节停在低位而帧时间仍上涨 ⇒ 问题不在
+    /// 纹存(往 GPU 目标/快照/op 日志方向查)。
+    pub fn texture_cache_bytes(&self) -> (usize, u64) {
+        match &self.renderer {
+            Renderer::Soft(r) => {
+                let store = r.textures();
+                (store.resident_bytes(), store.evicted_count())
+            }
+            Renderer::Wgpu { renderer, .. } => {
+                let store = renderer.textures();
+                (store.resident_bytes(), store.evicted_count())
+            }
         }
     }
 
@@ -1280,6 +1421,10 @@ impl Engine {
             .ok_or_else(|| Failure::runtime("engine 未启动"))?;
         let tick_started = Instant::now();
         let chain = vm.tick_at(now_ms, &self.timeline);
+        // **tick 内部分段**(`YURIS_TICK_SPLIT`):真机出现过
+        // `tick=441ms` 而 `build=20ms`/`render=35ms`/`cmds` 与邻帧相同的情况
+        // —— 有 ~380ms 不在既有三个子项里,必须拆开定位。
+        let t_vm = tick_started.elapsed();
         let commands_pumped = chain.commands_pumped;
         self.main_finished |= chain.main_finished;
         if let Some(exit) = chain.program_exit {
@@ -1364,6 +1509,7 @@ impl Engine {
                 );
             }
         }
+        let t_after_preload = tick_started.elapsed();
         self.sync_movie_overlay();
         // 文本缓冲必须每逻辑帧在**本 tick 最后一条 Text/CLEAR 之后、
         // frame() 之前**同步。证据:手册 `text/text.html`;REA
@@ -1389,6 +1535,7 @@ impl Engine {
                 gfx.clear_text();
             }
         }
+        let t_after_text = tick_started.elapsed();
         let build_started = Instant::now();
         let frame = self
             .state
@@ -1398,6 +1545,19 @@ impl Engine {
             .frame();
         self.last_frame_build_ms = build_started.elapsed().as_secs_f64() * 1000.0;
         let tick_ms = tick_started.elapsed().as_secs_f64() * 1000.0;
+        if std::env::var_os("YURIS_TICK_SPLIT").is_some() && tick_ms >= 20.0 {
+            log::warn!(
+                target: "yu-kernel",
+                "[ticksplit] frame={} total={:.1}ms vm={:.1} post_vm={:.1} text={:.1} build={:.1} cmds={}",
+                self.frame,
+                tick_ms,
+                t_vm.as_secs_f64() * 1e3,
+                (t_after_preload - t_vm).as_secs_f64() * 1e3,
+                (t_after_text - t_after_preload).as_secs_f64() * 1e3,
+                self.last_frame_build_ms,
+                commands_pumped
+            );
+        }
         let drawable = frame_has_drawable_output(&frame);
 
         let render_started = Instant::now();
@@ -2228,6 +2388,81 @@ impl Engine {
         std::fs::write(path, &bytes)
             .map_err(|e| Failure::runtime(format!("写 {} 失败: {e}", path.display())))?;
         Ok(bytes.len())
+    }
+
+    /// 把**当前帧已物化**的立绘层逐个读回写 PNG(`<dir>/layers/`)。
+    ///
+    /// 分块定位用:立绘是「基图 + 一串 `CGACT` 加工」合成出来的,肉眼看
+    /// 最终画面只能判断"这块脏了",看不出是**哪一层/哪一步**脏。这里把
+    /// 每一层的实际表面单独落盘,文件名 = 层名(非法字符替换为 `_`)。
+    ///
+    /// `filter` 对层名做子串匹配(空 = 全部)。返回写出的文件数。
+    ///
+    /// 低频路径:逐层全量读回 GPU 纹理并同步等待,只在人工取证时调用。
+    pub fn dump_layers(&mut self, dir: &std::path::Path, filter: &str) -> CliResult<usize> {
+        let out_dir = dir.join("layers");
+        std::fs::create_dir_all(&out_dir)
+            .map_err(|e| Failure::runtime(format!("创建 {} 失败: {e}", out_dir.display())))?;
+        let mut failures: Vec<String> = Vec::new();
+        let count = {
+            let Renderer::Wgpu { renderer, .. } = &mut self.renderer else {
+                return Err(Failure::runtime("图层导出只支持 wgpu 后端"));
+            };
+            renderer
+                .dump_layers(filter, |name, surface| {
+                    let safe: String = name
+                        .chars()
+                        .map(|c| match c {
+                            '/' | ':' | '\\' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                            other => other,
+                        })
+                        .collect();
+                    let path = out_dir.join(format!("{safe}.png"));
+                    if let Err(error) = yu_render_core::png::write_png(&path, surface) {
+                        failures.push(format!("{}: {error}", path.display()));
+                    }
+                })
+                .map_err(|d| Failure::runtime(format!("读回图层失败: {d}")))?
+        };
+        if let Some(first) = failures.first() {
+            return Err(Failure::runtime(format!(
+                "{} 个图层写盘失败(首个: {first})",
+                failures.len()
+            )));
+        }
+        Ok(count)
+    }
+
+    /// 立绘层的**实际表面尺寸**(`层名 → (宽,高)`),只含已物化的层。
+    ///
+    /// 诊断用:立绘基图是 `solid1x1`、像素靠加工链产出时,层表面一旦退化成
+    /// 1×1(或极小),该层就"闪一下没了",而 `render_ms`/帧报告完全看不出来
+    /// —— 它只是个画不出来的 1×1 quad。这里把真实尺寸暴露给宿主做逐帧判异。
+    pub fn sprite_surface_sizes(&self) -> Vec<(String, u32, u32)> {
+        let Renderer::Wgpu { renderer, .. } = &self.renderer else {
+            return Vec::new();
+        };
+        renderer
+            .materialized_layer_sizes()
+            .into_iter()
+            .filter(|(name, _, _)| name.contains("SPL"))
+            .collect()
+    }
+
+    /// 全量渲染资源计数(诊断;soft 后端为 `None`)。
+    ///
+    /// 一次给齐「会不会越来越卡」需要的所有计数 —— 新建/复用/归还的层表面、
+    /// 重采样次数、池占用、合成目标/离屏/快照、显存总量。
+    pub fn render_resource_snapshot(&self) -> Option<String> {
+        match &self.renderer {
+            Renderer::Wgpu { renderer, .. } => Some(renderer.resource_snapshot()),
+            Renderer::Soft(_) => None,
+        }
+    }
+
+    /// 冻结快照的**当前数量**(诊断;soft 后端为 `None`)。
+    pub fn snapshot_count(&self) -> Option<usize> {
+        self.gpu_resource_counts().map(|(_, _, snapshots)| snapshots)
     }
 
     /// 流式呈现的屏幕纹理身份:`(代际 id, 宽, 高)`。

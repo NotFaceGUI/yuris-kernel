@@ -388,10 +388,40 @@ impl LayerCapture for GfxCapture {
             TextureRef::SolidBlack1x1 => {
                 // `CG[FILE=""]` 的占位面:如果 SAVE 落到它,说明该层没有拿到
                 // 真正的拷贝(常见于 COPY2 源缺失)。显式留痕,不静默存 1×1。
+                //
+                // 取证:把该层在复制日志里的全部痕迹打出来 —— 只报「是占位面」
+                // 无法区分「COPY2 没执行」与「COPY2 执行了但被后来的 CG 重建
+                // 覆盖」。`state.copies()` 仍是保留状态(SLTEMP2 若真被 COPY2
+                // 写过,这里必有对应项)。
+                let traces: Vec<String> = state
+                    .copies()
+                    .iter()
+                    .filter(|copy| {
+                        let source_id = match &copy.source {
+                            yu_gfx::CopySource::Layer(id) | yu_gfx::CopySource::Group(id) => id,
+                        };
+                        copy.dest == parsed.path || *source_id == parsed.path
+                    })
+                    .map(|copy| {
+                        format!(
+                            "id={} kind={:?} status={:?} source={:?} src_tex={:?} region={:?}",
+                            copy.id.0,
+                            copy.kind,
+                            copy.status,
+                            copy.source,
+                            copy.source_texture,
+                            copy.region
+                        )
+                    })
+                    .collect();
                 log::warn!(
                     target: "yu-engine",
-                    "[caption] SAVE[ID] target {} is the 1x1 black placeholder (COPY missing?)",
-                    parsed.path.display()
+                    "[caption] SAVE[ID] target {} is the 1x1 black placeholder \
+                     (COPY missing?) layer_texture={:?} copies[{}]={:?}",
+                    parsed.path.display(),
+                    texture,
+                    traces.len(),
+                    traces
                 );
                 Some(Surface::new(1, 1, [0, 0, 0, 255]))
             }

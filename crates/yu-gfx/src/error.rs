@@ -42,6 +42,8 @@ pub mod code {
     pub const MASK_UNSUPPORTED: &str = "gfx.mask.unsupported";
     /// `RID` 资源图取图路径(缺资源 provider)。
     pub const IMAGE_RID_UNSUPPORTED: &str = "gfx.image.rid.unsupported";
+    /// 性能取证(`YURIS_CG_TIMING` 开启时才产出;Verbose 级,不参与挂号)。
+    pub const PERF: &str = "gfx.perf";
     /// 历史码:仿射绘制合成公式未对拍。2026-11-04 起普通图层 scale 已实现,
     /// 不再发此码;保留常量供旧 trace/golden 读取。
     pub const AFFINE_UNVERIFIED: &str = "gfx.affine.unverified";

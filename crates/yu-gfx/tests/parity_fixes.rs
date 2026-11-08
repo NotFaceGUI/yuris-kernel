@@ -1633,3 +1633,71 @@ fn full_layer_rectpaint_updates_layer_fill() {
         "0xAARRGGBB → RGBA"
     );
 }
+
+/// 快照元数据表必须与 `copy_log` 同生命周期地收缩。
+///
+/// 回归:`snapshot_sizes`/`snapshot_files` 原来只插入、从不删除,而
+/// `CopyId` 单调递增且**永不复用** ⇒ 反复开关菜单/存档时,每轮 `COPY2`
+/// 都留下一条永不释放的陈旧条目,内存随轮次线性增长(实测一轮 2218 次
+/// 复制)。本用例按「资产层 → COPY2 → CGEND」跑多轮,断言两张表不随
+/// 轮次累积。
+///
+/// 源必须是**资产层**(`CG[FILE]` 带真文件名):只有这条路径才同时写入
+/// `snapshot_sizes` 与 `snapshot_files`;`CG[FILE=""]` 的 1x1 空壳没有
+/// 尺寸元数据,不会触发目标表(见 `state.rs` 的 `snap_size`/`snap_file`)。
+#[test]
+fn snapshot_metadata_shrinks_with_copy_log() {
+    let table = table();
+    let mut gfx = state();
+    gfx.set_asset_size(b"cgsrc.png", yu_gfx::SizeU32 { width: 64, height: 48 });
+    // 三轮「建层 -> COPY2 切快照 -> CGEND」,模拟反复开关存档/菜单。
+    for round in 1..=3u64 {
+        gfx.consume_events(&[
+            frame_start(round),
+            call(
+                round,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", s("SRC")),
+                    arg(&table, "CG", "FILE", s("cgsrc.png")),
+                ],
+            ),
+            call(
+                round,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", s("TMP")),
+                    arg(&table, "CG", "FILE", s("")),
+                ],
+            ),
+            call(
+                round,
+                "CGACT",
+                vec![
+                    arg(&table, "CGACT", "ID", s(":/W0/SRC")),
+                    arg(&table, "CGACT", "ID2", s("TMP")),
+                    arg(&table, "CGACT", "COPY2", i(1)),
+                ],
+            ),
+            call(round, "CGEND", vec![arg(&table, "CGEND", "ID", s("TMP"))]),
+            call(round, "CGEND", vec![arg(&table, "CGEND", "ID", s("SRC"))]),
+            frame_end(round),
+        ]);
+        let (sizes, files) = gfx.snapshot_meta_len();
+        assert!(
+            sizes <= gfx.copies().len() && files <= gfx.copies().len(),
+            "第 {} 轮:元数据表({}/{})不得多于存活的复制项({})",
+            round,
+            sizes,
+            files,
+            gfx.copies().len()
+        );
+    }
+    let (sizes, files) = gfx.snapshot_meta_len();
+    assert!(
+        sizes <= 4 && files <= 4,
+        "三轮后元数据表应已收缩(实际 {}/{}),否则就是只增不删的泄漏",
+        sizes,
+        files
+    );
+}

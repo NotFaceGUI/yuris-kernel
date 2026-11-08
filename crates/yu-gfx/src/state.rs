@@ -567,6 +567,15 @@ impl GfxState {
         &self.copy_log
     }
 
+    /// 快照元数据表规模(诊断/回归:`(尺寸表, 文件名表)` 条数)。
+    ///
+    /// 这两张表必须与 `copy_log` 同生命周期地收缩;只增不减时,反复开关
+    /// 菜单/存档会让内存随轮次线性增长(见 `prune_copy_log` 的裁剪说明)。
+    #[must_use]
+    pub fn snapshot_meta_len(&self) -> (usize, usize) {
+        (self.snapshot_sizes.len(), self.snapshot_files.len())
+    }
+
     /// 图像加工日志。
     pub fn images(&self) -> &[ImageOp] {
         &self.image_log
@@ -2734,7 +2743,36 @@ impl GfxState {
 
     // ------------------------------------------------------------ CG
 
+    /// `CG` 域命令入口(带差分计时包装)。
+    ///
+    /// 立绘差分切换就是 `CG[FILE=…]`;它在内部要遍历 `copy_log`/`image_log`
+    /// 作废旧内容。`YURIS_CG_TIMING` 时把整个处理体的耗时与规模打出来。
     fn apply_cg(&mut self, args: &[ArgValue]) {
+        let probe = std::env::var_os("YURIS_CG_TIMING").is_some();
+        if !probe {
+            return self.apply_cg_inner(args);
+        }
+        let t0 = std::time::Instant::now();
+        self.apply_cg_inner(args);
+        let after = (self.copy_log.len(), self.image_log.len(), self.nodes.len());
+        let us = t0.elapsed().as_micros();
+        // 只记慢的(≥200µs)且**每条命令只记一次**(诊断按 detail 去重,
+        // 耗时数字每次不同 ⇒ 不去重会按帧刷爆日志)。
+        if us >= 200 {
+            self.push_diag(
+                "CG",
+                error::verbose(
+                    error::code::PERF,
+                    format!(
+                        "[cg] slow cmd copy_log={} image_log={} nodes={}",
+                        after.0, after.1, after.2
+                    ),
+                ),
+            );
+        }
+    }
+
+    fn apply_cg_inner(&mut self, args: &[ArgValue]) {
         // 直接消费事件参数,不经 `resolved_owned` 中间层:那里会先 clone 一份
         // `Value`(字符串 = 一次堆复制),`EngineValue::from_value` 再 clone
         // 一次。`CG` 单帧 4 万次 × 12 参数,双重克隆是它单价的主成分。
@@ -2880,21 +2918,47 @@ impl GfxState {
             let texture = file.clone().expect("file checked above");
             self.create_image(&parsed.path, texture, None);
         } else if let Some(texture) = file {
+            // **立绘差分切换的路径**:`CG[FILE=…]` 对已存在的层换图。
             // 手册:FILE 替换只换图,不重置 A/位置等属性。
+            let probe = std::env::var_os("YURIS_CG_TIMING").is_some();
+            let t0 = std::time::Instant::now();
             if let Some(node) = self.nodes.get_mut(&parsed.path) {
                 node.layer.texture = texture;
                 node.layer.fill = None;
                 // 新纹理没有旧快照/图像加工的状态;属性随后重算。
                 node.layer.reset_status();
             }
+            let t_swap = t0.elapsed();
             // 旧快照/图像加工随旧纹理作废。若后续 copy 仍以旧快照为
             // `source_texture`,保留生产者(见 `prune_copy_log`)。
             self.prune_copy_log(|c| c.dest == parsed.path);
+            let t_prune = t0.elapsed();
             self.image_log
                 .retain(|i| i.source != parsed.path && i.target.as_ref() != Some(&parsed.path));
+            let t_img = t0.elapsed();
             self.baked_images.borrow_mut().remove(&parsed.path);
             // 新纹理 = 干净像素面:之前 `CGACT[TEXT]` 的绘制项随之作废。
             self.clear_layer_texts(&parsed.path);
+            if probe {
+                // `yu-gfx` 没有 `log` 依赖,诊断一律走 `push_diag` 由宿主导出。
+                self.push_diag(
+                    "CG",
+                    error::verbose(
+                        error::code::PERF,
+                        format!(
+                            "[cgdiff] id={} swap={}us prune={}us image={}us total={}us copy_log={} image_log={} nodes={}",
+                            parsed.path.display(),
+                            t_swap.as_micros(),
+                            (t_prune - t_swap).as_micros(),
+                            (t_img - t_prune).as_micros(),
+                            t0.elapsed().as_micros(),
+                            self.copy_log.len(),
+                            self.image_log.len(),
+                            self.nodes.len()
+                        ),
+                    ),
+                );
+            }
         }
 
         let diags = {
@@ -4973,6 +5037,20 @@ impl GfxState {
             .retain(|id| live.contains(id));
         self.screen_snapshots
             .retain(|id, snapshot| live.contains(id) || snapshot.frame == self.frame);
+        // **快照元数据必须同一生命周期**。
+        //
+        // `snapshot_sizes`/`snapshot_files` 原来只插入、从不删除:
+        // `CopyId` 单调递增且**永不复用**,于是每轮 `COPY2`/`CGS` 都留下
+        // 一条永不释放的陈旧条目 —— 反复开关菜单/存档/读档时随轮次线性
+        // 增长(实测一轮 2218 次复制)。它们按 id 精确查(`SX`/`SY`/`MFILE`),
+        // 陈旧条目不会被误查,只会纯粹占内存,因此按「copy_log 是否仍持有
+        // 该 id」裁剪是安全且语义等价的。
+        //
+        // 与 `screen_snapshots` 的差异:那者保留**当帧**快照(后端本帧仍要
+        // 合成),而这两张表只被命令处理体按 `TextureRef::Snapshot(id)` 查,
+        // 该引用本身只在复制项存活期间存在 ⇒ 不需要当帧豁免。
+        self.snapshot_sizes.retain(|id, _| live.contains(id));
+        self.snapshot_files.retain(|id, _| live.contains(id));
     }
 
     fn sorted_children(&self, parent: Option<&LayerId>) -> Vec<LayerId> {
