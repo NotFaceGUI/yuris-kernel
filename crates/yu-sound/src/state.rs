@@ -864,8 +864,30 @@ impl SoundState {
         };
 
         // 1) FILE：装载 + 解码（引擎在参数写回前完成文件装入）。
+        //
+        // **同文件快速路径**:`SOUND[ID=… FILE=…]` 在演出里常被逐帧重复下发
+        // (同一 BGM/SE 参数不变)。旧实现每次都重新 `loader.load()` 整读
+        // 音频流 + `meta::probe` 解析容器头,真机实测单次 **2.8~3.4ms**
+        // (60 帧内 12 次 = 33ms),是帧时间最大的单项。
+        //
+        // 跳过条件严格限定为「FILE 参数逐字节相同 **且** 已有解码流」:
+        // 此时重新读盘得到的字节与已持有的完全一致,解析结果也相同。
+        // 引擎 type 1 的状态重置(`reset_for_load`)仍然执行 —— 下面的
+        // PLAY/VOLUME/START 等参数照常生效,可观察行为不变。
+        // **必须同时满足「解码流仍在」**:`SOUNDEND`/装载失败会把
+        // `stream` 置 None(`+0x000` 释放),此时复用等于不出声 —— 那是
+        // 行为改变,不是优化。仅当流对象还活着时,重读得到的内容才与
+        // 已持有的等价。
+        let same_file_reuse = cmd.file.as_ref().is_some_and(|file| {
+            layer.file_arg == *file
+                && !layer.resolved.is_empty()
+                && layer.meta.is_some()
+                && layer.stream.borrow().is_some()
+        });
         if let Some(file) = &cmd.file {
-            if self.load_file(&mut layer, file) == LoadOutcome::NotFound {
+            if same_file_reuse {
+                reset_for_load(&mut layer);
+            } else if self.load_file(&mut layer, file) == LoadOutcome::NotFound {
                 // 引擎 `FUN_0040c9b4()==1` 时 SOUND 处理体直接 return 0，
                 // 同一命令里的 PLAY/VOLUME/START 等参数都不应用。
                 self.layers.insert(key, layer);
