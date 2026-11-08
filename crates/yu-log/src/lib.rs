@@ -152,9 +152,22 @@ impl Loc {
     }
 }
 
-/// 结构化诊断。`code` 允许 `'static` 常量,也允许从 JSONL 读回时拥有所有权。
+/// 结构化诊断的字段本体。
+///
+/// 只经 [`Diag`] 的 `Deref` 暴露;构造请走 [`Diag::new`] 一族或
+/// [`Diag::from_fields`]。
+///
+/// 之所以把字段整体装进 `Box`:诊断是**热路径的返回类型**。
+/// `Result<StepOutcome, VmError>` / `Result<Value, Diag>` 在每条命令的分派链
+/// 上各出现数次,而 `Diag` 内联 `Loc`(`Script` 变体 = 两个 `Option<String>`
+/// 加一个 `String`)时 `Diag` 有 160 字节 ⇒ `VmError` 168、`Result` 168/160。
+/// 每条命令因此在返回链上搬数百字节:ERIS 场景构建帧(130 万条命令)实测
+/// `sum_cmd=172ms`,绝大部分是这段内存来回复制。装箱后 `Diag` 8 字节,
+/// `Result<Value, Diag>` 32 字节、`Result<StepOutcome, VmError>` 24 字节。
+///
+/// 代价是**每次真正生成诊断**多一次分配(错误/挂号路径,相对罕见)。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Diag {
+pub struct DiagFields {
     pub code: Cow<'static, str>,
     pub severity: Severity,
     pub boundary: Boundary,
@@ -163,16 +176,43 @@ pub struct Diag {
     pub causes: Vec<Diag>,
 }
 
+/// 结构化诊断。`code` 允许 `'static` 常量,也允许从 JSONL 读回时拥有所有权。
+///
+/// 字段名与旧版完全一致、经 `Deref` 直达 [`DiagFields`],既有读取/改写点不必
+/// 改写;布局理由见 [`DiagFields`]。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Diag(Box<DiagFields>);
+
+impl std::ops::Deref for Diag {
+    type Target = DiagFields;
+    fn deref(&self) -> &DiagFields {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Diag {
+    fn deref_mut(&mut self) -> &mut DiagFields {
+        &mut self.0
+    }
+}
+
 impl Diag {
     pub fn new(code: &'static str, severity: Severity, boundary: Boundary) -> Self {
-        Self {
+        Self(Box::new(DiagFields {
             code: Cow::Borrowed(code),
             severity,
             boundary,
             where_: Loc::None,
             detail: String::new(),
             causes: Vec::new(),
-        }
+        }))
+    }
+
+    /// 由已有字段装箱构造(供跨 crate 的字段级构造点使用)。
+    ///
+    /// 写成函数而不是暴露元组构造,是为了保持「`Diag` 的布局是内部实现」。
+    pub fn from_fields(fields: DiagFields) -> Self {
+        Self(Box::new(fields))
     }
 
     pub fn fatal(code: &'static str, boundary: Boundary) -> Self {
@@ -325,14 +365,14 @@ impl Diag {
             .iter()
             .map(Self::from_json)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
+        Ok(Self::from_fields(DiagFields {
             code: Cow::Owned(code),
             severity,
             boundary,
             where_,
             detail,
             causes,
-        })
+        }))
     }
 }
 

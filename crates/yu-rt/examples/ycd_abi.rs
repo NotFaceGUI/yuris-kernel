@@ -6,7 +6,7 @@ fn main() {
     for p in std::env::args().skip(1) {
         match std::fs::read(&p)
             .map_err(|e| e.to_string())
-            .and_then(|b| YcdTable::parse(&b).map_err(|d| d.detail))
+            .and_then(|b| YcdTable::parse(&b).map_err(|d| d.detail.clone()))
         {
             Ok(t) => {
                 let ids: Vec<String> = [

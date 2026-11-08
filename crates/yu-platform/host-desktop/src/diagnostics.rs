@@ -243,7 +243,7 @@ impl DiagLedger {
                 frame: engine_frame,
                 code,
                 severity: diag.severity,
-                detail: diag.detail,
+                detail: diag.detail.clone(),
                 where_,
             });
         }

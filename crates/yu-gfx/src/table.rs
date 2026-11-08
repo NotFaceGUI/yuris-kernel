@@ -4,6 +4,8 @@
 //! 名字一律查工程 `ysc.ybn`(`yu_rt::tables::YscmTable`,解析自 `yu_format::yscm`)。
 //! 跨版本游戏换表即换语义(A5)。
 
+use std::rc::Rc;
+
 use crate::error;
 use yu_rt::event::ArgValue;
 use yu_rt::tables::{ParamDecl, YscmTable};
@@ -12,11 +14,36 @@ use yu_rt::tables::{ParamDecl, YscmTable};
 #[derive(Clone, Debug)]
 pub struct ParamTable {
     inner: YscmTable,
+    /// 按命令序号预生成的参数名表(空名已在生成期过滤为 `None`)。
+    ///
+    /// `CG`/`CGACT`/`CGEND` 在场景构建帧可达 4 万次,每次要把每个参数名
+    /// 交给域状态机。旧写法 `name.map(str::to_string)` 每个参数一次堆分配
+    /// (实测 41281 次 `CG` × 12 个参数 ≈ 15ms/帧,占 `CG` 单价的 44%)。
+    /// 预生成后每次只 bump 引用计数,零分配。
+    names: Vec<Vec<Option<Rc<str>>>>,
 }
 
 impl ParamTable {
     pub fn new(inner: YscmTable) -> Self {
-        Self { inner }
+        let mut names = Vec::with_capacity(inner.len());
+        for i in 0..inner.len() {
+            let row = u8::try_from(i)
+                .ok()
+                .and_then(|i| inner.command(i))
+                .map(|cmd| {
+                    cmd.params
+                        .iter()
+                        .map(|p| {
+                            // 与 `param_name` 同口径:空名视为「该槽无声明」。
+                            (!p.name.is_empty()).then(|| Rc::from(p.name.as_str()))
+                        })
+                        .collect()
+                })
+                // 良性:命令不在表内 ⇒ 空参数名表(与 `param_name` 返回 None 同口径)。
+                .unwrap_or_default();
+            names.push(row);
+        }
+        Self { inner, names }
     }
 
     pub fn from_tables(tables: &yu_rt::TableSet) -> Self {
@@ -25,6 +52,15 @@ impl ParamTable {
 
     pub fn inner(&self) -> &YscmTable {
         &self.inner
+    }
+
+    /// 该命令的参数名表(`None` = 命令不在表内)。
+    ///
+    /// 与 [`Self::param_name`] 同口径:空名/槽号越界的条目为 `None`。
+    #[must_use]
+    pub fn names_for(&self, command: &str) -> Option<&[Option<Rc<str>>]> {
+        let index = self.inner.index_of(command)?;
+        self.names.get(index).map(Vec::as_slice)
     }
 
     pub fn known(&self, command: &str) -> bool {

@@ -54,7 +54,8 @@ use crate::transition::TransitionDraw;
 
 /// 已解析参数(名字/值都取自 `self.params`,先复制出来以释放不可变借用)。
 struct OwnedArg {
-    name: Option<String>,
+    /// 参数名取自 [`ParamTable::names_for`] 的预生成表(只 bump 引用计数)。
+    name: Option<std::rc::Rc<str>>,
     slot: u8,
     value: Value,
     /// YSCM 参数种类 2(`NumericOffset`)。只表示数据编码,不改变算术语义。
@@ -2734,29 +2735,39 @@ impl GfxState {
     // ------------------------------------------------------------ CG
 
     fn apply_cg(&mut self, args: &[ArgValue]) {
-        let resolved = self.resolved_owned("CG", args);
+        // 直接消费事件参数,不经 `resolved_owned` 中间层:那里会先 clone 一份
+        // `Value`(字符串 = 一次堆复制),`EngineValue::from_value` 再 clone
+        // 一次。`CG` 单帧 4 万次 × 12 参数,双重克隆是它单价的主成分。
+        //
+        // 参数名取自启动期预生成的 `Rc<str>` 表(空名/越界 = `None`),
+        // 与 `ParamTable::param_name` 同口径。
         let mut id: Option<Vec<u8>> = None;
         let mut idno: Option<i64> = None;
-        let mut params: Vec<(String, EngineValue, bool)> = Vec::new();
-        for r in resolved {
-            let Some(name) = r.name.as_deref() else {
-                self.arg_slot_missing("CG", r.slot);
+        // 参数名表与复用缓冲都提到循环外:旧写法在每个参数上重查一次
+        // `names_for`(内含 `yscm.index_of` 哈希查找),且每命令新建一个 `Vec`。
+        let mut params: Vec<(std::rc::Rc<str>, EngineValue, bool)> =
+            Vec::with_capacity(args.len());
+        for a in args {
+            let Some(name) = self
+                .params
+                .names_for("CG")
+                .and_then(|names| names.get(usize::from(a.slot)))
+                .cloned()
+                .flatten()
+            else {
+                self.arg_slot_missing("CG", a.slot);
                 continue;
             };
-            match name {
-                "ID" => match &r.value {
+            match &*name {
+                "ID" => match &a.value {
                     Value::Str(b) => id = Some(b.clone()),
-                    _ => self.arg_type("CG", "ID", "字符串", &r.value),
+                    _ => self.arg_type("CG", "ID", "字符串", &a.value),
                 },
-                "IDNO" => match int_arg(&r.value) {
+                "IDNO" => match int_arg(&a.value) {
                     Some(n) => idno = Some(n),
-                    None => self.arg_type("CG", "IDNO", "整数", &r.value),
+                    None => self.arg_type("CG", "IDNO", "整数", &a.value),
                 },
-                _ => params.push((
-                    name.to_string(),
-                    EngineValue::from_value(&r.value),
-                    r.offset,
-                )),
+                _ => params.push((name, EngineValue::from_value(&a.value), a.offset)),
             }
         }
         let Some(id) = id else {
@@ -2839,7 +2850,7 @@ impl GfxState {
             // **不建节点**。只有 `FILE`(含 `""` → 1×1 黑图)或 `RID`
             // 资源取图才建层。旧实现无条件 get-or-create 会留下官方没有的
             // 鬼层(DIV-GFX-016)。
-            let has_rid = params.iter().any(|(name, _, _)| name == "RID");
+            let has_rid = params.iter().any(|(name, _, _)| &**name == "RID");
             if file.is_none() {
                 if has_rid {
                     self.push_diag(
@@ -2903,7 +2914,7 @@ impl GfxState {
     /// 解析 mask 层 → 宽高必须相等 → 逐像素 `target[+0x90].a = mask[+0x90].r`
     /// → 置 target `+0x86=1`。这里记录成 `mask_alpha` 合成 op,由后端在
     /// 命令序位置执行;重复 MID 命令按 `(action,target)` 折叠为最后一条。
-    fn record_mask_op(&mut self, target: &LayerId, params: &[(String, EngineValue, bool)]) {
+    fn record_mask_op(&mut self, target: &LayerId, params: &[(std::rc::Rc<str>, EngineValue, bool)]) {
         let Some(mask_raw) = find_str(params, "MID") else {
             return;
         };
@@ -3055,8 +3066,15 @@ impl GfxState {
         let removed = self.remove_subtree(&parsed.path);
         self.drop_ops_for(&removed);
         // 文本层被删除 ⇒ 文本缓冲/本帧绘制项一并清(DIV-GFX-034 的窗口删除路径)。
-        self.text_draws.retain(|id, _| !removed.contains(id));
-        self.text_layers.retain(|id, _| !removed.contains(id));
+        // 只有确实删到了文本层才扫这两张表:`text_draws` 在演出期可达
+        // 数百项,而绝大多数 `CGEND` 删的是精灵/按钮层,一个都命中不了。
+        // 判据用「刚才是否真的从这两张表里找到过键」,与 `retain` 等价。
+        if self.text_draws.keys().any(|id| removed.contains(id)) {
+            self.text_draws.retain(|id, _| !removed.contains(id));
+        }
+        if self.text_layers.keys().any(|id| removed.contains(id)) {
+            self.text_layers.retain(|id, _| !removed.contains(id));
+        }
         if parsed.path == Self::w0() && !self.nodes.contains_key(&Self::w0()) {
             // W0 是相对路径的默认基目录;删掉后立刻重建,保证后续相对 ID 可用。
             self.ensure_w0();
@@ -3069,7 +3087,7 @@ impl GfxState {
         let resolved = self.resolved_owned("CGACT", args);
         let mut ids: [Option<Vec<u8>>; 4] = [None, None, None, None];
         let mut idnos: [Option<i64>; 4] = [None, None, None, None];
-        let mut params: Vec<(String, EngineValue, bool)> = Vec::new();
+        let mut params: Vec<(std::rc::Rc<str>, EngineValue, bool)> = Vec::new();
         for r in resolved {
             let Some(name) = r.name.as_deref() else {
                 self.arg_slot_missing("CGACT", r.slot);
@@ -3104,7 +3122,7 @@ impl GfxState {
                 continue;
             }
             params.push((
-                name.to_string(),
+                r.name.clone().expect("匹配到名字 ⇒ Some"),
                 EngineValue::from_value(&r.value),
                 r.offset,
             ));
@@ -3273,7 +3291,7 @@ impl GfxState {
         // `CGACT[TEXT=1]`:手册 cg/cgact.html 例 25/26 在图层上绘制字符串。
         // 这是 ERIS 对话文本的真实路径(`es_Font.yst` 每字符一次)。
         if flag(&params, "TEXT") {
-            self.cgact_text(&source, set, set_str, x, y, bno);
+            self.cgact_text(&source, set, set_str.map(|b| b.to_vec()), x, y, bno);
             return;
         }
 
@@ -3285,7 +3303,7 @@ impl GfxState {
                 paths[1].clone(),
                 set,
                 set2,
-                set_str,
+                set_str.map(|b| b.to_vec()),
                 sx,
                 sy,
                 x,
@@ -4554,17 +4572,27 @@ impl GfxState {
             == id
     }
 
+    /// 把事件参数解析成 owned 参数表(域状态机消费)。
+    ///
+    /// 只有**一次** `Vec` 分配:参数名来自启动期预生成的 `Rc<str>` 表
+    /// (见 [`ParamTable::names_for`]),不再逐参数 `String` 分配。
     fn resolved_owned(&self, command: &str, args: &[ArgValue]) -> Vec<OwnedArg> {
-        self.params
-            .resolve(command, args)
-            .into_iter()
-            .map(|r| OwnedArg {
-                name: r.name.map(str::to_string),
-                slot: r.slot,
-                value: r.value.clone(),
-                offset: r.offset,
-            })
-            .collect()
+        // 良性:命令不在表内 ⇒ 空名表(所有参数落到 `arg_slot_missing`,
+        // 与旧 `resolved_owned` 的 `name: None` 同口径)。
+        let names = self.params.names_for(command).unwrap_or(&[]); // 良性:命令不在表内 ⇒ 空名表
+        let mut out = Vec::with_capacity(args.len());
+        for a in args {
+            out.push(OwnedArg {
+                name: names
+                    .get(usize::from(a.slot))
+                    .cloned()
+                    .flatten(),
+                slot: a.slot,
+                value: a.value.clone(),
+                offset: a.offset,
+            });
+        }
+        out
     }
 
     /// 取走本 tick 新登记的 `CG[FILE]` 资产 key(引擎在 tick 末尾预热)。
@@ -4781,7 +4809,9 @@ impl GfxState {
         // `CGEND` 删除**不会撤销**已产生的像素。因此只要还有后续项把它
         // 当源读取(COPY 或 MERGE/MERGE2),这条加工链就要保留到帧末重放;
         // 否则 CG 缩略图的 AKARUSA 明暗差会丢(hover 只剩底板,2026-11-01)。
-        let mut needed: BTreeSet<LayerId> = BTreeSet::new();
+        // 只做成员判定(不依赖顺序):`CGEND` 单帧上千次,哈希集比
+        // `BTreeSet` 少掉每个节点的堆分配与 O(log n) 比较。
+        let mut needed: rustc_hash::FxHashSet<LayerId> = rustc_hash::FxHashSet::default();
         // 命令时刻屏幕快照里出现过的层:其加工链决定快照像素,删除不撤销。
         // 这里按「被删目标」逐个查快照成员,不能把整份快照图层表克隆进
         // `needed`:菜单解构有 2000+ 次 `CGEND`,每次都克隆 1400+ 个
@@ -4815,13 +4845,16 @@ impl GfxState {
             };
         for i in (0..self.image_log.len()).rev() {
             let op = &self.image_log[i];
-            let target = op.target.as_ref().unwrap_or(&op.source).clone();
-            if removed.contains(&target) && !needed.contains(&target) {
+            // 借用而不是 clone:下面是热循环,`LayerId` 是 `Vec<u8>`,
+            // 每项一次克隆在 1184 次 `CGEND` × 上千项的日志上是纯浪费。
+            // `removed` 只含被删子树的少数层,绝大多数项在这里就被跳过。
+            let target = op.target.as_ref().unwrap_or(&op.source);
+            if removed.contains(target) && !needed.contains(target) {
                 let in_snapshot = snapshot_layers
                     .as_ref()
-                    .is_some_and(|set| set.contains(&target));
+                    .is_some_and(|set| set.contains(target));
                 if in_snapshot {
-                    needed.insert(target);
+                    needed.insert(target.clone());
                 } else {
                     keep[i] = false;
                     continue;
@@ -4848,6 +4881,18 @@ impl GfxState {
     /// 的复制项生效(不能让已删除复制项的快照把自己/D 依存链永久钉住)。
     fn prune_copy_log(&mut self, remove: impl Fn(&CopyOp) -> bool) {
         let count = self.copy_log.len();
+        // 快速返回:没有任何复制项命中 `remove` 时,后面整段(keep 向量 +
+        // 不动点循环 + 每轮两次集合重建)都是纯开销。
+        //
+        // `CGEND` 解构场景每帧上千次走这里,而 `removed` 通常只含刚删的
+        // 一层 —— 绝大多数调用一个都命中不了。旧实现无条件跑完整闭包。
+        //
+        // 语义等价:`keep` 初值 = `!remove(copy) || 当帧快照`;若 `remove`
+        // 全假则 `keep` 全真,不动点循环首轮就 `changed=false` 退出,
+        // `retain` 保留全部 —— 与直接返回逐项相同。
+        if !self.copy_log.iter().any(&remove) {
+            return;
+        }
         // 采集当帧的屏幕快照必须活到 `frame()` 发射合成 copy:目标层可能
         // 在同一个 tick 稍后被 `CGEND`(CGS 栈先把 id 存进脚本变量),
         // 此时不能把生产者复制项/契约删掉,否则后端永远拿不到冻结像素,
@@ -4865,14 +4910,18 @@ impl GfxState {
         // 不动点:keep → 存活快照 → 纹理依赖 → 生产者 keep。轮数很少
         // (每条依赖边只可能把项从 false 翻到 true),日志上限也有界。
         loop {
-            let live: BTreeSet<CopyId> = self
+            // `live`/`needed` 只做成员判定(不依赖顺序),用哈希集:每轮
+            // `insert` 摊还 O(1),而 `BTreeSet` 每个节点一次堆分配。
+            // `CGEND` 解构场景 813 次/帧 × 两遍 prune,分配数是它单次
+            // 10µs 的主成分。
+            let live: rustc_hash::FxHashSet<CopyId> = self
                 .copy_log
                 .iter()
                 .zip(&keep)
                 .filter(|(_, keep)| **keep)
                 .map(|(copy, _)| copy.id)
                 .collect();
-            let mut needed: BTreeSet<CopyId> = BTreeSet::new();
+            let mut needed: rustc_hash::FxHashSet<CopyId> = rustc_hash::FxHashSet::default();
             // 图像加工的源快照也是消费者(`_TMP_OV` → MERGE2)。
             for image in &self.image_log {
                 if let Some(TextureRef::Snapshot(id)) = &image.source_texture {
@@ -4918,7 +4967,7 @@ impl GfxState {
             result
         });
         // 快照随复制项消亡(复制冻结后不再重放,快照数据不再被后端读取)。
-        let live: BTreeSet<CopyId> = self.copy_log.iter().map(|c| c.id).collect();
+        let live: rustc_hash::FxHashSet<CopyId> = self.copy_log.iter().map(|c| c.id).collect();
         self.baked_copies
             .borrow_mut()
             .retain(|id| live.contains(id));
@@ -5335,7 +5384,7 @@ impl GfxState {
             }
             None => {
                 let mut frame_diag =
-                    error::FrameDiag::new(d.code.to_string(), d.severity, command, d.detail);
+                    error::FrameDiag::new(d.code.to_string(), d.severity, command, d.detail.clone());
                 if let Some(at) = at {
                     frame_diag.push_at(&at);
                 }
@@ -5715,14 +5764,14 @@ fn flag_value(v: &Value) -> bool {    match v {
     }
 }
 
-fn find_value(params: &[(String, EngineValue, bool)], name: &str) -> Option<EngineValue> {
+fn find_value(params: &[(std::rc::Rc<str>, EngineValue, bool)], name: &str) -> Option<EngineValue> {
     params
         .iter()
-        .find(|(n, _, _)| n == name)
+        .find(|(n, _, _)| &**n == name)
         .map(|(_, v, _)| v.clone())
 }
 
-fn find_int(params: &[(String, EngineValue, bool)], name: &str) -> Option<i64> {
+fn find_int(params: &[(std::rc::Rc<str>, EngineValue, bool)], name: &str) -> Option<i64> {
     find_value(params, name).and_then(|v| v.as_int())
 }
 
@@ -5730,7 +5779,7 @@ fn find_int(params: &[(String, EngineValue, bool)], name: &str) -> Option<i64> {
 ///
 /// `CGACT[SIZE/SIZE2]` 的 `SX/SY` 是缩放后的尺寸,实测带小数
 /// (`SY=825.5`);`find_int` 的 `fract()==0` 守卫会把它们判成「未给」。
-fn find_f64(params: &[(String, EngineValue, bool)], name: &str) -> Option<f64> {
+fn find_f64(params: &[(std::rc::Rc<str>, EngineValue, bool)], name: &str) -> Option<f64> {
     find_value(params, name).and_then(|v| v.as_f64())
 }
 
@@ -5756,11 +5805,21 @@ fn display_key(key: &[u8]) -> String {
 /// `CGACT[… Y2=824.5]` 这类真实参数判成「未给」,进而让区域只剩 3 个字段
 /// 并触发 `gfx.imageop.region.partial`(sprite 整条 SIZE 被跳过)。
 
-fn find_str(params: &[(String, EngineValue, bool)], name: &str) -> Option<Vec<u8>> {
-    find_value(params, name).and_then(|v| v.as_bytes().map(|b| b.to_vec()))
+/// 取字符串参数的**借用**(热路径不 clone)。
+///
+/// 旧签名返回 `Vec<u8>`(`as_bytes().to_vec()`),`CG` 每条命令都要为
+/// `FILE`/`MID` 各复制一次;调用方都是即时读取,借用足够。
+fn find_str<'a>(params: &'a [(std::rc::Rc<str>, EngineValue, bool)], name: &str) -> Option<&'a [u8]> {
+    params
+        .iter()
+        .find(|(n, _, _)| &**n == name)
+        .and_then(|(_, v, _)| match v {
+            EngineValue::Str(b) => Some(b.as_slice()),
+            _ => None,
+        })
 }
 
-fn flag(params: &[(String, EngineValue, bool)], name: &str) -> bool {
+fn flag(params: &[(std::rc::Rc<str>, EngineValue, bool)], name: &str) -> bool {
     find_value(params, name).is_some_and(|v| match v {
         EngineValue::Int(i) => i != 0,
         EngineValue::Float(f) => f != 0.0,
@@ -5768,9 +5827,9 @@ fn flag(params: &[(String, EngineValue, bool)], name: &str) -> bool {
     })
 }
 
-fn take_file(params: &[(String, EngineValue, bool)], diags: &mut Vec<Diag>) -> Option<TextureRef> {
+fn take_file(params: &[(std::rc::Rc<str>, EngineValue, bool)], diags: &mut Vec<Diag>) -> Option<TextureRef> {
     for (name, value, _offset) in params {
-        if name != "FILE" {
+        if &**name != "FILE" {
             continue;
         }
         return match value {
@@ -5963,15 +6022,15 @@ fn value_truthy(v: &EngineValue) -> bool {
 }
 
 /// 一次扫描得到“被置位的参数名”,避免每个动作重复全表查找。
-fn active_params(params: &[(String, EngineValue, bool)]) -> BTreeSet<&str> {
+fn active_params(params: &[(std::rc::Rc<str>, EngineValue, bool)]) -> BTreeSet<&str> {
     params
         .iter()
         .filter(|(_, v, _)| value_truthy(v))
-        .map(|(n, _, _)| n.as_str())
+        .map(|(n, _, _)| &**n)
         .collect()
 }
 
-fn count_image_actions(params: &[(String, EngineValue, bool)]) -> usize {
+fn count_image_actions(params: &[(std::rc::Rc<str>, EngineValue, bool)]) -> usize {
     let active = active_params(params);
     IMAGE_ACTIONS
         .iter()
@@ -5980,16 +6039,16 @@ fn count_image_actions(params: &[(String, EngineValue, bool)]) -> usize {
 }
 
 fn first_image_action(
-    params: &[(String, EngineValue, bool)],
+    params: &[(std::rc::Rc<str>, EngineValue, bool)],
 ) -> Option<(&'static str, ImageAction)> {
     let active = active_params(params);
     // 参数顺序即编译器窗口顺序;取第一个出现的动作。
     for (name, _, _) in params {
-        if !active.contains(name.as_str()) {
+        if !active.contains(&**name) {
             continue;
         }
         for (candidate, action) in IMAGE_ACTIONS {
-            if name == candidate {
+            if name.as_ref() == *candidate {
                 return Some((candidate, action.clone()));
             }
         }
@@ -6359,7 +6418,7 @@ fn hash_pass(h: &mut impl Hasher, pass: &Pass) {
 /// 应用 `CG` 属性参数。返回诊断(不直接写 self,避免借用冲突)。
 fn apply_layer_params(
     layer: &mut Layer,
-    params: &[(String, EngineValue, bool)],
+    params: &[(std::rc::Rc<str>, EngineValue, bool)],
     is_group: bool,
 ) -> Vec<Diag> {
     let mut diags = Vec::new();
@@ -6384,7 +6443,7 @@ fn apply_layer_params(
         // `CG[ID=$L1 X+=(@es.GSX/2)-(@WSX/2)]` 补偿旋转画布,赋值语义会
         // 把位置清成补偿值本身;`es_SaveLoad.yst:623` 的 `A-=8` 若当加法
         // 会把 256 一路加到 512(2026-10-27 实测:读档幕布淡不掉)。
-        match name.as_str() {
+        match &**name {
             "FILE" | "ID" | "IDNO" => {}
             "E" => match value.as_int() {
                 Some(n) => layer.visible = n != 0,
@@ -6528,7 +6587,7 @@ fn apply_layer_params(
                     continue;
                 };
                 let t = layer.transition.get_or_insert_with(Transition::default);
-                if name == "T" {
+                if &**name == "T" {
                     t.t = v;
                 } else {
                     t.ta = v;
@@ -6585,7 +6644,7 @@ fn apply_layer_params(
             // `RID` 都缺才报 `0x18b6e`(`0x42bb29..0x42bb43`)。本内核没有
             // 资源(PSB/E-mote)provider ⇒ 显式挂号,不当作「非视觉参数」。
             "RID" => {
-                layer.extra.insert(name.clone(), value.clone());
+                layer.extra.insert(name.to_string(), value.clone());
                 mark_param_unimplemented(layer, "gfx.image.rid.unsupported");
                 diags.push(error::unimplemented(
                     error::code::IMAGE_RID_UNSUPPORTED,
@@ -6604,7 +6663,7 @@ fn apply_layer_params(
             // - `REMALLOC`:引擎写字节字段 `+0x99`(`0x42b6a4`),消费方未定位;
             //   `es_Sprite.yst:8652` 的注释是「//メモリ再確保しない」。
             "LINT" | "LINT2" | "REMALLOC" => {
-                layer.extra.insert(name.clone(), value.clone());
+                layer.extra.insert(name.to_string(), value.clone());
             }
             // `TSX`/`TSY`/`MFILE`/`CASH`:引擎 CG 处理体(入口 `0x42a514`,
             // `mov eax,1; call 0x429fd1`)**从不读取**这四个槽位 —— 全量扫描
@@ -6613,14 +6672,14 @@ fn apply_layer_params(
             // (`TSX=9 TSY=10 MFILE=36 CASH=42`,下标即 yscm 声明序)。
             // 引擎只把它们当合法参数接受 ⇒ 本内核同样接受并留档,不报「未分类」。
             "TSX" | "TSY" | "MFILE" | "CASH" => {
-                layer.extra.insert(name.clone(), value.clone());
+                layer.extra.insert(name.to_string(), value.clone());
             }
             // `DXDRAW`:引擎读它(`0x42b6b7`),但**只看一个全局开关**:
             // `DAT_008012e4` 非零时对本层调 `0x42c400` + `0x409cd8`(强制
             // 重绘)并置脏位,否则完全跳过。不是图层属性、不改几何/像素,
             // 本内核没有对应设备路径 ⇒ 留档。
             "DXDRAW" => {
-                layer.extra.insert(name.clone(), value.clone());
+                layer.extra.insert(name.to_string(), value.clone());
             }
             // `MIPMAP`:引擎把值减 1 后留用(`0x42b064`),但引擎**从不生成
             // mip 链**(`FUN_00460924` 固定 `MIP=POINT`,render-parity §6)
@@ -6629,7 +6688,7 @@ fn apply_layer_params(
             // 不是图层字段;本内核没有对应设备路径。
             // 两者都只留档。
             "MIPMAP" | "DXBUF" => {
-                layer.extra.insert(name.clone(), value.clone());
+                layer.extra.insert(name.to_string(), value.clone());
             }
             // ---- 仿射/滤镜族(引擎 `+0x1b0..+0x214`)----
             //
@@ -6693,7 +6752,7 @@ fn apply_layer_params(
                 // (`0x42b63a` 按 `movsx word` 读回)。超宽按引擎截断。
                 affine_touched = true;
                 let a = &mut layer.transform.affine;
-                match name.as_str() {
+                match &**name {
                     "FSD" => {
                         let v = n as i32;
                         a.sd = if *offset { a.sd.wrapping_add(v) } else { v };
@@ -6714,7 +6773,7 @@ fn apply_layer_params(
             // (`0x42b5c6..0x42b5d8`,与 `MID` 共用同一块缓冲)。本内核的
             // `MID` 外部掩码链路本身未取证(DIV-GFX-005),这里同样只留档。
             "FID" => {
-                layer.extra.insert(name.clone(), value.clone());
+                layer.extra.insert(name.to_string(), value.clone());
             }
             other => {
                 layer.extra.insert(other.to_string(), value.clone());

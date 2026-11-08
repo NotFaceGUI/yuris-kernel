@@ -1482,7 +1482,11 @@ mod tests {
         for key in unique {
             sequential.resolve(key).expect("sequential");
         }
-        let missing = sequential.resolve(b"missing").expect_err("missing").code;
+        let missing = sequential
+            .resolve(b"missing")
+            .expect_err("missing")
+            .code
+            .to_string();
 
         let mut parallel = store(&files, vec![ImageFormat::Png]);
         parallel.preload_parallel(&keys);

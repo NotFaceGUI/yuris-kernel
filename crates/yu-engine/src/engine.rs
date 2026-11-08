@@ -497,14 +497,14 @@ pub fn frame_total_to_diag(frame_diag: &yu_gfx::FrameDiag) -> yu_log::Diag {
     } else {
         format!("{}: {}", frame_diag.command, frame_diag.detail)
     };
-    yu_log::Diag {
+    yu_log::Diag::from_fields(yu_log::DiagFields {
         code: std::borrow::Cow::Owned(frame_diag.code.clone()),
         severity,
         boundary: yu_log::Boundary::Domain,
         where_,
         detail,
         causes: Vec::new(),
-    }
+    })
 }
 
 enum Renderer {

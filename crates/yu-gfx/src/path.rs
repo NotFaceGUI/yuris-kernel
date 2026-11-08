@@ -41,6 +41,31 @@ pub struct ParsedPath {
 /// 早前把 `0x42c542..0x42c54c` 那段**点追加循环**误读成 itoa 追加,因而
 /// 去掉了点(旧口径「多了一个点」不成立;语料 0 次使用 IDNO,差异未暴露)。
 pub fn normalize(id: &[u8], idno: Option<i64>, trailing_slash: bool) -> ParsedPath {
+    // 快速路径:`CG`/`CGEND`/`CGINFO`/`SOUND` 的 ID 绝大多数是形如
+    // `ABC`、`sp_1_2` 的**单段相对名**(无 `IDNO`、无 `:`、无 `/`、无
+    // `.`/`..`)。这类输入规范化后必然等于 `:/W0/<id>`,而下面的通用
+    // 路径要建 `id.to_vec()` + `segs` + `out` 三个 `Vec`。
+    //
+    // 场景构建帧 `CG` 单条 1.1µs × 41281 次,三次分配是其中可观的一份。
+    // 判定条件与通用路径严格等价:`:` 开头会走绝对分支、含 `/` 会切段、
+    // 恰为 `.`/`..` 会被跳过/回退、其余含 `.` 的段原样保留 —— 这里只在
+    // 「唯一一段且不等于 `.`/`..`」时命中,结果逐字节相同。
+    if idno.is_none()
+        && !trailing_slash
+        && !id.is_empty()
+        && id != b"."
+        && id != b".."
+        && !id.contains(&b'/')
+        && id[0] != b':'
+    {
+        let mut out = Vec::with_capacity(id.len() + 4);
+        out.extend_from_slice(b":/W0/");
+        out.extend_from_slice(id);
+        return ParsedPath {
+            path: LayerId(out),
+            is_dir: false,
+        };
+    }
     let mut bytes = id.to_vec();
     if let Some(n) = idno {
         bytes.push(b'.');
