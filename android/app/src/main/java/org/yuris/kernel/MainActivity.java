@@ -79,6 +79,16 @@ public final class MainActivity extends Activity
      */
     private static final int TICK_FINISHED = 1;
 
+    /**
+     * {@link NativeHost#nativeTick()} 的"宿主请求销毁"返回码。
+     *
+     * <p>内核在渲染线程上真正释放了会话(见内核 {@code TICK_HOST_SHUTDOWN})。
+     * 必须与 {@link #TICK_FINISHED} 区分:那个要 {@code finish()} 回配置界面,
+     * 而这个只退出线程 —— 此时 Activity 通常正在 {@code onDestroy} 里,
+     * {@code finish()} 是重入。
+     */
+    private static final int TICK_HOST_SHUTDOWN = 4;
+
     private android.view.TextureView textureView;
     private TextView hudView;
     private volatile boolean running;
@@ -477,6 +487,12 @@ public final class MainActivity extends Activity
 
     @Override
     protected void onDestroy() {
+        // 顺序很重要:
+        // 1. stopRenderLoop() 只置 running=false 并派守护线程 join,
+        //    **UI 线程立即返回**(渲染线程可能正卡在 400~500ms 的 nativeTick);
+        // 2. nativeShutdown() 在 UI 线程上**不会**摸会话 —— 会话在渲染线程
+        //    的 thread_local 里。内核据此只登记一个销毁请求,由渲染线程自己
+        //    在下一帧 tick 前释放引擎(旧实现在这里静默返回 -1,会话根本没释放)。
         stopRenderLoop();
         NativeHost.nativeShutdown();
         super.onDestroy();
@@ -494,17 +510,35 @@ public final class MainActivity extends Activity
         renderThread.start();
     }
 
+    /**
+     * 请求停止渲染线程。
+     *
+     * <p><b>绝不在调用线程上 join</b>：本方法在 {@code onDestroy} 里由
+     * UI 线程调用，而渲染线程可能正卡在一次 {@code nativeTick}（真机实测
+     * 单帧可达 400~500ms）。旧的 {@code thread.join(2000)} 会让主线程
+     * 阻塞最长 2 秒，与 ANR 的输入分发超时直接冲突 —— 用户看到的就是
+     * 「程序未响应」。
+     *
+     * <p>这里只置退出标志并把线程引用交给一个守护线程去 join：UI 线程
+     * 立即返回，渲染线程自己在下一帧看到 {@code running == false} 后收尾
+     * （它会自行调用 {@code nativeShutdown}）。
+     */
     private void stopRenderLoop() {
         running = false;
-        Thread thread = renderThread;
+        final Thread thread = renderThread;
         renderThread = null;
-        if (thread != null) {
+        if (thread == null) {
+            return;
+        }
+        Thread reaper = new Thread(() -> {
             try {
-                thread.join(2000);
+                thread.join(3000);
             } catch (InterruptedException ignored) {
                 Thread.currentThread().interrupt();
             }
-        }
+        }, "yu-render-reaper");
+        reaper.setDaemon(true);
+        reaper.start();
     }
 
     private void renderLoop() {
@@ -654,6 +688,8 @@ public final class MainActivity extends Activity
         int frameW = 0;
         int frameH = 0;
         Bitmap bitmap = null;
+        /** 内核已在本线程释放会话(TICK_HOST_SHUTDOWN)⇒ 收尾不再重复 shutdown。 */
+        boolean releasedByHost = false;
         // 帧节拍:按引擎 fps 换算成纳秒,截止时间从第一帧起累加(不漂移)。
         final int targetFps = 60;
         long frameNanos = 1_000_000_000L / Math.max(1, targetFps);
@@ -666,6 +702,15 @@ public final class MainActivity extends Activity
             if (!pumping) {
                 if (!running) {
                     break; // onDestroy 请求退线程:走循环后的真正收尾。
+                }
+                // 挂起期间仍要响应销毁请求:ON_DESTROY 会先 stopRenderLoop()
+                // 置 running=false(上面已 break),但如果销毁请求是在
+                // 「已经挂起」的状态下登记的,这里靠 nativeTakeShutdownRequest()
+                // 把它消费掉 —— 否则会话永远不释放(内核的销毁请求只在 tick
+                // 里被取走,而挂起时根本不 tick)。
+                if (NativeHost.nativeTakeShutdownRequest() == TICK_HOST_SHUTDOWN) {
+                    releasedByHost = true;
+                    break;
                 }
                 SystemClock.sleep(30); // 挂起空转;恢复后从这里继续 tick。
                 continue;
@@ -685,6 +730,15 @@ public final class MainActivity extends Activity
             long frameStartNanos = System.nanoTime();
             long started = SystemClock.elapsedRealtime();
             int tickResult = NativeHost.nativeTick();
+            if (tickResult == TICK_HOST_SHUTDOWN) {
+                // 内核已在渲染线程上释放会话(壳的 onDestroy 请求)。
+                // 只退线程:此时 Activity 正在销毁,不能 finish()。
+                Log.i(TAG, "session released by host shutdown request");
+                gameFinished = false;
+                tickFailed = false;
+                releasedByHost = true;
+                break;
+            }
             if (tickResult == TICK_FINISHED) {
                 // 游戏正常结束(脚本 END 或主脚本走完):收尾并回到配置界面,
                 // 不把用户的进程留着空转。这是所有宿主共用的退出判据
@@ -837,7 +891,12 @@ public final class MainActivity extends Activity
         if (!running && !gameFinished && !tickFailed) {
             Log.i(TAG, "render loop stopped by host (session torn down)");
         }
-        NativeHost.nativeShutdown();
+        // 内核已经在本线程上释放过会话(TICK_HOST_SHUTDOWN)时不能再调一次:
+        // 那会在已空槽的线程上再登记一个销毁请求,而没有人会消费它 ⇒
+        // 下次启动的第一帧就被它销毁。
+        if (!releasedByHost) {
+            NativeHost.nativeShutdown();
+        }
         sessionReady = false;
         Log.i(TAG, "render loop stopped");
         if (tickFailed) {

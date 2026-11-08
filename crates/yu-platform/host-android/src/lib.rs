@@ -41,6 +41,7 @@
 #![deny(unsafe_code)]
 #![allow(clippy::result_large_err)]
 
+pub mod logging;
 pub mod present;
 pub mod sound;
 
@@ -71,6 +72,14 @@ struct Session {
     audio: Option<sound::SoundSink>,
     /// 上屏失败计数(诊断;nativeStatus 可见)。
     present_failures: u64,
+    /// 逐 opcode 耗时采样是否已开启(`YURIS_VM_PROFILE` 开关)。
+    ///
+    /// 真机实测 tick p50=7.7ms、每帧约 1.5 万条命令 ⇒ **每条命令 380ns**,
+    /// 而 PC 上同一份代码只要 88ns。这个 4.3 倍差距必须按 opcode 拆开看:
+    /// 是分派慢(`LET`/`IF`),还是图形命令慢(`CG`/`CGEND`),修法完全不同。
+    vm_profile: bool,
+    /// 上次 reset 到现在的帧数(每 60 帧 dump 一次)。
+    vm_profile_frames: u32,
     /// 是否渲染上屏(归因实验开关)。
     video: bool,
     /// 发布模式(状态串最小化)。
@@ -80,10 +89,6 @@ struct Session {
     /// 抓取结果的落盘路径(数据目录下 debug/audio-capture.wav)。
     capture_path: Option<PathBuf>,
 }
-
-/// 日志控制台句柄(文件日志开启时非空;`flush_logs` 用它把 JSONL 缓冲落盘)。
-static LOG_CONSOLE: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<yu_log::console::Console>>>> =
-    std::sync::Mutex::new(None);
 
 thread_local! {
     /// 单线程会话槽(见模块文档「线程模型」)。
@@ -95,7 +100,54 @@ thread_local! {
     /// 最近一次失败原因(供 `nativeStatus` 报告;成功初始化时清空)。
     #[allow(clippy::missing_const_for_thread_local)]
     static LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// `nativeCopyFrame` 的转换缓冲(容量跨帧复用,稳态零分配)。
+    ///
+    /// 只在 CPU 回退路径上用到;零拷贝上屏时壳不读像素,这里一直空着。
+    #[allow(clippy::missing_const_for_thread_local)]
+    static ARGB_SCRATCH: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
 }
+
+/// 挂起请求(跨线程)。
+///
+/// `Engine` 是 `Rc`/`RefCell` 单线程状态,只能在持有它的线程(渲染线程)上
+/// 调 `suspend()`。而 Android 的 `onPause`/`onResume` 跑在 **UI 线程**:
+/// 直接 `SESSION.with(..)` 会拿到该线程的**空槽** ⇒ 永远返回 -1、引擎根本
+/// 没被挂起。这里只置原子请求,由渲染线程在下一帧 tick 前自己执行
+/// (见 `apply_pending_lifecycle`)。
+static SUSPEND_REQUEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static RESUME_REQUEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 上屏尺寸变更请求(跨线程)。
+///
+/// 与挂起同因:`onSurfaceTextureSizeChanged` 在 **UI 线程**上跑,而
+/// presenter 属于渲染线程的会话。旧的实现直接在调用线程 `SESSION.with(..)`
+/// ⇒ 拿到空槽、返回 -1,**这次尺寸变更被静默丢弃**(旋转/分屏后交换链
+/// 停在旧尺寸)。这里只记尺寸,由渲染线程执行。
+///
+/// 上屏尺寸变更请求(跨线程)。
+///
+/// 与挂起同因:`onSurfaceTextureSizeChanged` 在 **UI 线程**上跑,而
+/// presenter 属于渲染线程的会话。旧的实现直接在调用线程 `SESSION.with(..)`
+/// ⇒ 拿到空槽、返回 -1,**这次尺寸变更被静默丢弃**(旋转/分屏后交换链
+/// 停在旧尺寸)。这里只记尺寸,由渲染线程执行。
+///
+/// 打包成一个 `u64`(宽在高 32 位、高在低 32 位)而不是两个原子量:
+/// 两次独立写入之间被消费会读到**半新半旧**的一对,交换链尺寸就错了。
+/// `0` = 无请求(调用方一律 `max(1, ..)`,宽不可能是 0)。
+static RESIZE_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 会话销毁请求(跨线程;见 [`request_shutdown`])。
+static SHUTDOWN_REQUEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `tick` 的「宿主请求销毁」返回码。
+///
+/// 与引擎的生命周期码(0 running / 1 finished / 2 exited / 3 exited+restart)
+/// 共用同一个 `int` 出口,取一个它们不用的值。壳收到它就**静默退出线程**,
+/// 不能当成「游戏结束」去 `finish()`(那会把正在销毁的 Activity 重入)。
+pub const TICK_HOST_SHUTDOWN: i32 = 4;
 
 fn set_error(message: impl Into<String>) {
     LAST_ERROR.with(|slot| *slot.borrow_mut() = Some(message.into()));
@@ -464,6 +516,8 @@ pub fn init_session_with_fonts(
         ..RunConfig::default()
     };
     config.font_bytes.extend(load_host_fonts(&config.data_root));
+    // 老接口同样要应用诊断开关(见 `apply_debug_switches` 的说明)。
+    apply_debug_switches(&config.data_root);
     let started = start_engine(config, path_overrides)?;
     store_session(started)
 }
@@ -474,6 +528,14 @@ fn store_session(started: StartedEngine) -> Result<String, String> {
     let summary = started.summary.clone();
     let capture = started.audio_capture;
     let capture_path = started.capture_path.clone();
+    // 新会话初始状态:清掉所有跨线程请求位的残留。
+    //
+    // 为什么必需:上一轮 `onDestroy` 可能登记过销毁/挂起请求,而那个线程
+    // 已经退出、没人消费。不清掉的话,新会话的**第一帧**就会被这些陈旧的
+    // 请求销毁或挂起(表现为「重进游戏立刻闪退/黑屏」)。
+    SHUTDOWN_REQUEST.store(false, std::sync::atomic::Ordering::Release);
+    SUSPEND_REQUEST.store(false, std::sync::atomic::Ordering::Release);
+    RESUME_REQUEST.store(false, std::sync::atomic::Ordering::Release);
     SESSION.with(|slot| {
         *slot.borrow_mut() = Some(Session {
             engine: started.engine,
@@ -486,6 +548,8 @@ fn store_session(started: StartedEngine) -> Result<String, String> {
             gpu: started.gpu,
             audio: started.audio,
             present_failures: 0,
+            vm_profile: std::env::var_os("YURIS_VM_PROFILE").is_some(),
+            vm_profile_frames: 0,
             video: started.render,
             quiet: started.quiet,
             audio_capture_target: capture,
@@ -587,22 +651,16 @@ fn write_wav_f32(
 /// 不做这步的话,引擎内部所有 `log::info!/warn!/error!` 都会被静默丢弃 ——
 /// 排查时只能看到我们自己手写的行,看不到引擎/字体/渲染的诊断(实测教训)。
 #[cfg(target_os = "android")]
+/// 安装安卓独立调试日志(logcat + 文件双写)。
+///
+/// 只有**一个** logger、两条出口,不存在 `log` 宏被抢占的问题
+/// (见 [`crate::logging`] 的模块文档)。
+#[cfg(target_os = "android")]
 fn init_logcat(quiet: bool) {
-    use std::sync::Once;
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        // 发布模式只留 warn 以上:logcat 每条都要走 JNI + 内核日志缓冲,
-        // 稳态每帧/每秒写 info 是白白付出的 IPC。
-        let level = if quiet {
-            log::Level::Warn
-        } else {
-            log::Level::Info
-        };
-        android_logger::init_once(
-            android_logger::Config::default()
-                .with_min_level(level)
-                .with_tag("yu-kernel"),
-        );
+    crate::logging::init(if quiet {
+        log::Level::Warn
+    } else {
+        log::Level::Info
     });
 }
 
@@ -614,10 +672,7 @@ fn install_panic_hook() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         std::panic::set_hook(Box::new(|info| {
-            let message = info.to_string();
-            // 同时走 logcat 与文件日志(若已开启)。
-            log::error!(target: "yu-host-android", "[panic] {message}");
-            log_line("yu-host-android", &format!("[panic] {message}"));
+            log::error!(target: "yu-host-android", "[panic] {info}");
             flush_logs();
         }));
     });
@@ -627,34 +682,11 @@ fn install_panic_hook() {
 ///
 /// 与 CLI `--log-file` 同一条通道(`yu_log::facade` + `JsonlFile`),所以
 /// Android 抓到的 JSONL 与桌面完全同格式,可直接用同一套工具分析。
-fn init_file_logging(path: &std::path::Path, level: LogLevel) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("创建日志目录 {} 失败: {e}", parent.display()))?;
-        }
-    }
-    let jsonl = yu_log::console::JsonlFile::create(path)
-        .map_err(|e| format!("创建日志文件 {} 失败: {e}", path.display()))?;
-    // 控制台输出走 logcat(Android 侧由壳读取);门面单例重复调用时保持现状。
-    let console = yu_log::console::Console::stderr_live(level.min_level(), 0, Some(jsonl));
-    // 门面要求 `Arc<dyn Fn..>`;Console 是日志单写者,用 Mutex 串行化。
-    let handle = std::sync::Arc::new(std::sync::Mutex::new(console));
-    let callback_handle = std::sync::Arc::clone(&handle);
-    let callback: yu_log::facade::ConsoleFn = std::sync::Arc::new(
-        move |level: yu_log::facade::FacadeLevel, channel: &str, body: &str| {
-            if let Ok(mut console) = callback_handle.lock() {
-                console.emit_facade(level, channel, body);
-            }
-        },
-    );
-    // 保存句柄:JSONL 走 `BufWriter`,不 flush 就会一直留在缓冲里
-    // (实测:文件建出来了但 0 字节)。
-    if let Ok(mut slot) = LOG_CONSOLE.lock() {
-        *slot = Some(std::sync::Arc::clone(&handle));
-    }
-    let _ = yu_log::facade::init(callback);
-    flush_logs();
+fn init_file_logging(path: &std::path::Path, _level: LogLevel) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    crate::logging::set_file(path).map_err(|e| format!("创建日志文件 {} 失败: {e}", path.display()))?;
+    #[cfg(not(target_os = "android"))]
+    let _ = path;
     Ok(())
 }
 
@@ -662,26 +694,82 @@ fn init_file_logging(path: &std::path::Path, level: LogLevel) -> Result<(), Stri
 ///
 /// 调用点:`start_engine` 收尾、`shutdown`、以及壳每次取 `status` 时。
 pub fn flush_logs() {
-    if let Ok(slot) = LOG_CONSOLE.lock() {
-        if let Some(console) = slot.as_ref() {
-            if let Ok(mut console) = console.lock() {
-                console.flush();
-            }
-        }
-    }
+    crate::logging::flush();
 }
 
-/// 向文件日志写一行宿主标记(没有开启文件日志时静默忽略)。
+/// 宿主诊断行:统一走新日志器(自动进 logcat + 文件)。
 fn log_line(target: &str, message: &str) {
-    // 同时走 `log` 门面(Android 上打到 logcat):崩溃前最后一条诊断必须
-    // 在 logcat 里可见,不能只留在尚未 flush 的文件日志中。
-    log::info!(target: "yu-android", "{message}");
-    if let Ok(slot) = LOG_CONSOLE.lock() {
-        if let Some(console) = slot.as_ref() {
-            if let Ok(mut console) = console.lock() {
-                console.emit_host(yu_log::console::HostLevel::Info, target, message);
-            }
+    log::warn!(target: "yu-kernel", "[{target}] {message}");
+}
+
+/// 应用 `<游戏目录>/debug/run-config.json` 里的**诊断开关**。
+///
+/// 两个启动入口(`nativeInit` 老接口与 `nativeInitJson`)都必须调用:
+/// 只有 `nativeInitJson` 做这件事时,壳走老接口就完全看不到这些开关
+/// (实测 `cg_timing`/`readback_debug` 写了却完全不生效就是这个原因)。
+///
+/// 只处理需要用**环境变量**传给下游 crate 的键;引擎参数本身由
+/// [`RunConfig::apply_json`] 处理。
+/// 已应用的诊断开关(等日志系统就绪后再统一打印)。
+///
+/// `apply_debug_switches` 在 `start_engine` **之前**执行,那时 JSONL sink
+/// 还没建立、logcat 也没初始化 —— 当场打日志会静默丢失。这里先攒着,
+/// 由 `init_logcat` 之后的 `[boot]` 一并输出。
+static APPLIED_SWITCHES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// 取走并清空已应用的开关清单。
+fn take_applied_switches() -> Vec<String> {
+    APPLIED_SWITCHES
+        .lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default()
+}
+
+fn apply_debug_switches(data_root: &std::path::Path) {
+    let path = data_root.join("debug").join("run-config.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(value) = yu_engine::json::parse(&text) else {
+        return;
+    };
+    let Some(obj) = value.as_object() else {
+        return;
+    };
+    let flag = |key: &str| {
+        obj.get(key)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    let mut pending: Vec<String> = Vec::new();
+    if let Some(backend) = obj.get("png_backend").and_then(|v| v.as_str()) {
+        if !backend.trim().is_empty() {
+            std::env::set_var("YURIS_PNG_BACKEND", backend.trim());
+            pending.push(format!("PNG 解码后端: {backend}"));
         }
+    }
+    if flag("readback_debug") {
+        std::env::set_var("YURIS_READBACK_WHY", "1");
+        pending.push("GPU 读回归因: 已开启".to_string());
+    }
+    if flag("cg_timing") {
+        std::env::set_var("YURIS_CG_TIMING", "1");
+        pending.push("CG 差分计时: 已开启".to_string());
+    }
+    if flag("vm_profile") {
+        std::env::set_var("YURIS_VM_PROFILE", "1");
+        pending.push("VM opcode 归因: 已开启".to_string());
+    }
+    if flag("asset_timing") {
+        std::env::set_var("YURIS_ASSET_TIMING", "1");
+        pending.push("资产装载计时: 已开启".to_string());
+    }
+    if flag("tick_split") {
+        std::env::set_var("YURIS_TICK_SPLIT", "1");
+        pending.push("tick 分段计时: 已开启".to_string());
+    }
+    if let Ok(mut guard) = APPLIED_SWITCHES.lock() {
+        guard.extend(pending);
     }
 }
 
@@ -705,10 +793,8 @@ pub fn start_session_json(json: &str) -> Result<String, String> {
         config
             .apply_json(&text)
             .map_err(|error| format!("{} 解析失败: {error}", override_path.display()))?;
-        log_line(
-            "yu-host-android",
-            &format!("已应用调试覆盖: {}", override_path.display()),
-        );
+        // 诊断开关统一由 `apply_debug_switches` 处理(与 `nativeInit` 共用)。
+        apply_debug_switches(&config.data_root);
     }
     let path_overrides = yu_engine::host_paths::HostPathOverrides {
         appdata_path: Some(config.save_root.clone()),
@@ -791,6 +877,17 @@ pub fn start_engine(
     };
     init_logcat(quiet);
     install_panic_hook();
+    // 自证:日志链路一旦装好就立刻打一条。新日志器**单一路径双写**
+    // (logcat + 文件),所以这一条必然两边都出现,不再需要「两条出口
+    // 分别验证」的绕路。
+    let applied = take_applied_switches();
+    log::warn!(
+        target: "yu-kernel",
+        "[boot] logging ready (quiet={quiet}, level={log_level:?}, png_backend={}, switches=[{}])",
+        std::env::var("YURIS_PNG_BACKEND").unwrap_or_else(|_| "image".to_string()),
+        applied.join("; ")
+    );
+    flush_logs();
     // 存档根必须存在:缺目录会让 SAVE 与既读记录全部静默失败。
     std::fs::create_dir_all(&save_root)
         .map_err(|e| format!("创建存档目录失败 {}: {e}", save_root.display()))?;
@@ -841,6 +938,15 @@ pub fn start_engine(
     };
     let mut engine =
         Engine::new(project, options).map_err(|failure| format!("引擎启动失败: {failure}"))?;
+    // 逐 opcode 耗时归因(`YURIS_VM_PROFILE`;真机排查 VM 分派用)。
+    //
+    // 采样器每条命令两次 `Instant::now()`(≈40~50ns),只在显式开启时运行。
+    // 它给出各 opcode 的**相对**占比,用来判断该优化哪条命令。
+    if std::env::var_os("YURIS_VM_PROFILE").is_some() {
+        engine.set_command_profile(true);
+        engine.set_command_profile_sample(1);
+        log::warn!(target: "yu-kernel", "[boot] VM opcode profiling ON");
+    }
     // 音频输出:与 `@_OS_SOUND` 解耦 —— `os_sound` 决定 VM 可见变量,
     // `audio_output` 才决定是否真的打开设备(架构 §2.5 R5)。
     //
@@ -940,9 +1046,57 @@ pub fn tick() -> i32 {
             set_error("nativeTick 在 nativeInit 之前被调用");
             return -1;
         };
+        // 跨线程销毁请求:壳的 `onDestroy` 在 UI 线程上请求,这里(会话所属
+        // 线程)真正释放。返回 [`TICK_HOST_SHUTDOWN`] —— **不能**复用 1:
+        // 1 是「脚本正常走完」,壳收到它会 `finish()` 回配置界面,而这时
+        // Activity 正在销毁,那是无意义的重入。
+        if SHUTDOWN_REQUEST.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            log_line("yu-host-android", "shutdown requested from another thread");
+            drop(slot.take());
+            flush_logs();
+            return TICK_HOST_SHUTDOWN;
+        }
+        // 跨线程挂起/恢复:必须在 tick 之前、在**本线程**执行。
+        if apply_pending_lifecycle(session) {
+            return 0;
+        }
         match session.engine.tick_realtime() {
             Ok(rendered) => {
                 session.ticks += 1;
+                // 逐 opcode 耗时归因(`YURIS_VM_PROFILE`):每 60 帧把本窗口
+                // 累计耗时 top-8 打进 logcat。
+                //
+                // 采样器本身有开销(每条命令两次 `Instant::now()` ≈ 40~50ns),
+                // 所以只在显式开启时运行 —— 但**结论仍有效**:它给出的是
+                // 各 opcode 的**相对**占比,正好用来判断该优化哪一条。
+                if session.vm_profile {
+                    session.vm_profile_frames += 1;
+                    if session.vm_profile_frames >= 60 {
+                        session.vm_profile_frames = 0;
+                        let (rows, total_ns) = session.engine.take_command_profile(8);
+                        let top: Vec<String> = rows
+                            .iter()
+                            .filter(|(_, _, ns)| *ns > 0)
+                            .map(|(name, hits, ns)| {
+                                format!(
+                                    "{name}={:.1}ms/{}x/{:.0}ns",
+                                    *ns as f64 / 1e6,
+                                    hits,
+                                    if *hits > 0 { *ns as f64 / *hits as f64 } else { 0.0 }
+                                )
+                            })
+                            .collect();
+                        log_line(
+                            "yu-kernel",
+                            &format!(
+                                "[vmprof] 60帧 total={:.1}ms | {}",
+                                total_ns as f64 / 1e6,
+                                top.join(" ")
+                            ),
+                        );
+                        session.engine.reset_command_profile();
+                    }
+                }
                 // 长帧取证:只记超过阈值的帧(logcat),正常帧零额外开销。
                 //
                 // 安卓侧此前**没有任何逐帧耗时出口**:`nativeStatus()` 只在
@@ -963,7 +1117,7 @@ pub fn tick() -> i32 {
                         // 组字段才定位到「文本基面同步读回」。
                         let ph = session.engine.render_phases().unwrap_or_default();
                         log::warn!(
-                            target: "yu-android",
+                            target: "yu-kernel",
                             "[spike] frame={} tick={:.1}ms render={:.1}ms total={:.1}ms \
                              preload={:.1}ms/{} err={} build={:.1}ms \
                              cmds={} ops={} passes={} layers={} visible={} \
@@ -1127,13 +1281,51 @@ pub fn frame_rgba() -> Vec<u8> {
 /// 换算放在内核侧只有一处,Java 壳不必再关心通道序。
 pub fn rgba_to_argb(rgba: &[u8]) -> Vec<u32> {
     rgba.chunks_exact(4)
-        .map(|px| {
-            (u32::from(px[3]) << 24)
-                | (u32::from(px[0]) << 16)
-                | (u32::from(px[1]) << 8)
-                | u32::from(px[2])
+        .map(|pixel| {
+            (u32::from(pixel[3]) << 24)
+                | (u32::from(pixel[0]) << 16)
+                | (u32::from(pixel[1]) << 8)
+                | u32::from(pixel[2])
         })
         .collect()
+}
+
+/// 把当前帧就地转换成 `ARGB_8888` 写进调用方给的缓冲(**复用容量**)。
+///
+/// # 为什么不是 `frame_rgba()` + [`rgba_to_argb`]
+///
+/// 旧写法每帧做 **3 次整帧分配 + 4 次全量拷贝**
+/// (`frame_pixels.clone()` → `rgba_to_argb` 新 `Vec` → `Vec<jint>` 再来一份)。
+/// 1080p 一帧是 8.3MB,三次分配四次拷贝在手机上就是每帧几毫秒的纯浪费,
+/// 还让分配器长期高位运行(GC/碎片压力直接表现为掉帧)。
+///
+/// 这里只做一次转换,目标缓冲容量跨帧复用 —— 稳态下零分配。
+///
+/// 返回写入的像素数;`0` = 还没有帧。
+pub fn fill_argb(out: &mut Vec<i32>) -> usize {
+    // 先清空:无论有没有帧,调用方拿到的都必须是「本次的结果」。
+    // 留着上一帧的像素会让壳在会话刚死掉时继续把旧画面送上屏(看着像卡住)。
+    out.clear();
+    SESSION.with(|slot| {
+        let slot = slot.borrow();
+        let Some(session) = slot.as_ref() else {
+            return 0;
+        };
+        let rgba = &session.frame_pixels;
+        let pixels = rgba.len() / 4;
+        if pixels == 0 {
+            return 0;
+        }
+        out.reserve(pixels.saturating_sub(out.capacity()));
+        for pixel in rgba.chunks_exact(4) {
+            let argb = (u32::from(pixel[3]) << 24)
+                | (u32::from(pixel[0]) << 16)
+                | (u32::from(pixel[1]) << 8)
+                | u32::from(pixel[2]);
+            out.push(argb as i32);
+        }
+        pixels
+    })
 }
 
 /// 注入输入按钮。
@@ -1261,6 +1453,17 @@ pub fn status_text() -> String {
                 if session.engine.is_suspended() {
                     out.push_str(" suspended=1");
                 }
+                // 资产缓存取证:常驻字节/预算 + 已回收数。
+                // 「越打越卡」时先看这两项 —— 常驻字节贴预算说明在反复解码,
+                // 停在低位说明卡顿另有来源(不再是纹存)。
+                let (cache_bytes, evicted) = session.engine.texture_cache_bytes();
+                out.push_str(&format!(
+                    " assets[cached={} decoded={} resident={}MB evicted={}]",
+                    session.engine.textures_cached(),
+                    session.engine.textures_decoded(),
+                    cache_bytes / (1024 * 1024),
+                    evicted
+                ));
             }
             None => out.push_str("status=idle"),
         }
@@ -1281,30 +1484,85 @@ pub fn status_text() -> String {
 ///
 /// 返回 `0` 成功、`-1` 会话未初始化。重复调用幂等。
 pub fn suspend() -> i32 {
-    SESSION.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let Some(session) = slot.as_mut() else {
-            return -1;
-        };
-        session.engine.suspend();
-        log_line("yu-host-android", "session suspended");
-        0
-    })
+    // 跨线程只置请求标志;真正的 `engine.suspend()` 由渲染线程执行
+    // (见 [`tick`] 开头的 `apply_pending_lifecycle`)。
+    SUSPEND_REQUEST.store(true, std::sync::atomic::Ordering::Release);
+    0
 }
 
 /// 恢复会话(壳 `onResume`)。与 [`suspend`] 配对,未挂起时是 no-op。
 ///
 /// 返回 `0` 成功、`-1` 会话未初始化。
 pub fn resume() -> i32 {
-    SESSION.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let Some(session) = slot.as_mut() else {
-            return -1;
-        };
+    RESUME_REQUEST.store(true, std::sync::atomic::Ordering::Release);
+    0
+}
+
+/// 渲染线程在每帧 tick 前执行挂起/恢复/改尺寸请求。
+///
+/// 返回 `true` 表示本帧已被挂起(调用方应跳过 tick)。
+fn apply_pending_lifecycle(session: &mut Session) -> bool {
+    use std::sync::atomic::Ordering;
+    // 尺寸变更先做:它与挂起无关,后台回来那次 resize 不该被丢掉。
+    let packed = RESIZE_REQUEST.swap(0, Ordering::AcqRel);
+    if packed != 0 {
+        let w = (packed >> 32) as u32;
+        let h = (packed & 0xFFFF_FFFF) as u32;
+        if let Some(presenter) = session.presenter.as_mut() {
+            match presenter.resize(w, h) {
+                Ok(()) => log_line(
+                    "yu-host-android",
+                    &format!("surface resized to {w}x{h} (on render thread)"),
+                ),
+                Err(error) => log_line(
+                    "yu-host-android",
+                    &format!("surface resize {w}x{h} 失败: {error}"),
+                ),
+            }
+        }
+    }
+    if SUSPEND_REQUEST.swap(false, Ordering::AcqRel) {
+        session.engine.suspend();
+        log_line("yu-host-android", "session suspended (on render thread)");
+        return true;
+    }
+    if RESUME_REQUEST.swap(false, Ordering::AcqRel) {
         session.engine.resume();
-        log_line("yu-host-android", "session resumed");
-        0
-    })
+        log_line("yu-host-android", "session resumed (on render thread)");
+    }
+    false
+}
+
+/// 请求调整上屏尺寸(可在任意线程调用)。
+///
+/// 只记请求,真正的 `presenter.resize` 由渲染线程在下一帧 tick 前执行
+/// (见 [`apply_pending_lifecycle`])。返回 `0` = 已登记。
+pub fn request_resize(width: u32, height: u32) -> i32 {
+    use std::sync::atomic::Ordering;
+    let w = u64::from(width.max(1));
+    let h = u64::from(height.max(1));
+    RESIZE_REQUEST.store((w << 32) | h, Ordering::Release);
+    0
+}
+
+/// 消费一次「跨线程销毁请求」,并在本线程真正释放会话。
+///
+/// 供壳在**不调用 `nativeTick`** 的空转路径上轮询(挂起/无 surface 时
+/// 壳只 sleep,不 tick;而销毁请求只在 tick 里被取走 ⇒ 那个状态下退出
+/// 应用,会话永远不会释放)。
+///
+/// 返回 `1` = 已释放(壳应退出渲染循环),`0` = 没有请求。
+pub fn take_shutdown_request() -> i32 {
+    if !SHUTDOWN_REQUEST.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return 0;
+    }
+    let released = SESSION.with(|slot| slot.borrow_mut().take().is_some());
+    log_line(
+        "yu-host-android",
+        &format!("shutdown request consumed while idle (released={released})"),
+    );
+    flush_logs();
+    TICK_HOST_SHUTDOWN
 }
 
 /// 会话生命周期代号(供壳在 `nativeTick` 之外主动查询)。
@@ -1333,9 +1591,24 @@ pub fn lifecycle_code() -> i32 {
 }
 
 /// 释放会话(可再次 `init_session`)。返回是否真的释放了一个会话。
+///
+/// **只能在本线程调用**(会话在 `thread_local` 里)。壳在 `onDestroy`
+/// (UI 线程)调用时走 [`request_shutdown`],由渲染线程自己收尾。
 pub fn shutdown() -> bool {
     flush_logs();
     SESSION.with(|slot| slot.borrow_mut().take().is_some())
+}
+
+/// 请求销毁会话(可在任意线程调用)。
+///
+/// 壳的 `onDestroy` 在 **UI 线程**上,而会话在渲染线程的 `thread_local`
+/// 里:那里直接 `nativeShutdown()` 只能拿到空槽、返回 -1,**会话根本没被
+/// 释放**(旧实现就是这样 —— 退出后引擎资源、音频设备、GPU 上下文全靠
+/// 线程结束时的析构兜底)。这里只置标志,渲染线程在下一帧 tick 前看到它
+/// 就自己收尾。
+pub fn request_shutdown() -> i32 {
+    SHUTDOWN_REQUEST.store(true, std::sync::atomic::Ordering::Release);
+    0
 }
 
 /// 构建目标标记(Java 侧版本核对用)。
@@ -1482,33 +1755,37 @@ mod jni_entry {
     /// 写入 **ARGB_8888** 打包像素,可直接交给
     /// `Bitmap.createBitmap(pixels, w, h, ARGB_8888)`。
     /// 返回写入的像素数;负值 = 失败。
+    ///
+    /// 转换缓冲是本线程的 scratch,**跨帧复用容量**:稳态下这条路径零分配
+    /// (见 [`fill_argb`])。它只在 CPU 回退路径上调用 —— 零拷贝上屏时
+    /// 壳根本不读像素。
     #[no_mangle]
     pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeCopyFrame<'local>(
         env: JNIEnv<'local>,
         _class: JClass<'local>,
         out: JIntArray<'local>,
     ) -> jint {
-        let rgba = frame_rgba();
-        if rgba.is_empty() {
-            return -1;
-        }
-        let packed = rgba_to_argb(&rgba);
-        let len = env.get_array_length(&out).unwrap_or(0) as usize;
-        if len < packed.len() {
-            set_error(format!(
-                "nativeCopyFrame 目标数组太小:需要 {},收到 {len}",
-                packed.len()
-            ));
-            return -2;
-        }
-        let raw: Vec<jint> = packed.iter().map(|px| *px as jint).collect();
-        match env.set_int_array_region(&out, 0, &raw) {
-            Ok(()) => packed.len() as jint,
-            Err(error) => {
-                set_error(format!("nativeCopyFrame 写入失败: {error}"));
-                -3
+        ARGB_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let written = fill_argb(&mut scratch);
+            if written == 0 {
+                return -1;
             }
-        }
+            let len = env.get_array_length(&out).unwrap_or(0) as usize;
+            if len < written {
+                set_error(format!(
+                    "nativeCopyFrame 目标数组太小:需要 {written},收到 {len}"
+                ));
+                return -2;
+            }
+            match env.set_int_array_region(&out, 0, &scratch) {
+                Ok(()) => written as jint,
+                Err(error) => {
+                    set_error(format!("nativeCopyFrame 写入失败: {error}"));
+                    -3
+                }
+            }
+        })
     }
 
     #[no_mangle]
@@ -1627,6 +1904,11 @@ mod jni_entry {
     }
 
     /// 窗口尺寸变化(壳在 `surfaceChanged` 里调用)。
+    ///
+    /// **可在任意线程调用**:`onSurfaceTextureSizeChanged` 跑在 UI 线程,
+    /// 而 presenter 在渲染线程的会话里。这里只登记请求,渲染线程在下一帧
+    /// 执行(见 [`request_resize`]);旧的直接 `SESSION.with` 在 UI 线程上
+    /// 必然拿到空槽 ⇒ 尺寸变更被静默丢弃。
     #[no_mangle]
     pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeResizeSurface<'local>(
         _env: JNIEnv<'local>,
@@ -1634,24 +1916,8 @@ mod jni_entry {
         width: jint,
         height: jint,
     ) -> jint {
-        SESSION.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            let Some(session) = slot.as_mut() else {
-                return -1;
-            };
-            let Some(presenter) = session.presenter.as_mut() else {
-                return -1;
-            };
-            match presenter.resize(width.max(1) as u32, height.max(1) as u32) {
-                Ok(()) => 0,
-                Err(error) => {
-                    set_error(format!("调整上屏尺寸失败: {error}"));
-                    -1
-                }
-            }
-        })
+        request_resize(width.max(1) as u32, height.max(1) as u32)
     }
-
     /// 列出本机可用字体族(换行分隔;空 = 一个都没有)。
     #[no_mangle]
     pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeListFonts<'local>(
@@ -1706,16 +1972,33 @@ mod jni_entry {
         lifecycle_code()
     }
 
+    /// 销毁会话。**可从任意线程调用**:
+    ///
+    /// - 会话在本线程(渲染线程自己收尾)⇒ 立即释放,返回 0/-1 表示成败;
+    /// - 会话不在本线程(壳在 `onDestroy` 的 UI 线程调用)⇒ 只登记请求
+    ///   (见 [`request_shutdown`]),由渲染线程在下一帧执行,返回 0。
+    ///
+    /// 旧实现无条件走 `shutdown()`,在 UI 线程上必然拿到空槽 ⇒ 返回 -1
+    /// 且**会话根本没释放**(退出时全靠线程析构兜底)。
     #[no_mangle]
     pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeShutdown<'local>(
         _env: JNIEnv<'local>,
         _class: JClass<'_>,
     ) -> jint {
-        if shutdown() {
-            0
-        } else {
-            -1
+        let owns_session = SESSION.with(|slot| slot.borrow().is_some());
+        if owns_session {
+            return if shutdown() { 0 } else { -1 };
         }
+        request_shutdown()
+    }
+
+    /// 消费跨线程销毁请求(挂起空转时壳轮询;返回 `4` = 已释放会话)。
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeTakeShutdownRequest<'local>(
+        _env: JNIEnv<'local>,
+        _class: JClass<'_>,
+    ) -> jint {
+        take_shutdown_request()
     }
 }
 
@@ -1877,6 +2160,16 @@ mod tests {
         let argb = rgba_to_argb(&rgba);
         assert_eq!(argb[0], 0x0401_0203, "A=4 R=1 G=2 B=3");
         assert_eq!(argb[1], 0xFFFF_0000, "不透明红");
+    }
+
+    /// `fill_argb` 是 `rgba_to_argb` 的零分配替身,二者必须同口径。
+    #[test]
+    fn fill_argb_without_session_is_empty() {
+        // 无会话时:返回 0,不 panic,且必须清空 —— 否则壳会拿到上一帧的
+        // 陈旧像素(看着像画面卡住)。
+        let mut out: Vec<i32> = vec![7, 7, 7];
+        assert_eq!(fill_argb(&mut out), 0);
+        assert!(out.is_empty(), "无帧时必须清空而不是留下陈旧像素");
     }
 
     #[test]

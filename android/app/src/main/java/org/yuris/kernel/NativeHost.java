@@ -134,4 +134,16 @@ public final class NativeHost {
 
     /** 释放会话。返回 0 表示确实释放了一个会话。 */
     public static native int nativeShutdown();
+
+    /**
+     * 消费一次"跨线程销毁请求",在调用线程上真正释放会话。
+     *
+     * <p>挂起/无 surface 时空转路径不调 {@link #nativeTick()},而销毁请求
+     * 正常只在那里被取走 —— 那个状态下退出应用会话就永远不释放。壳在
+     * 空转循环里轮询本方法:返回 {@code 4} 表示已释放(退出渲染循环),
+     * {@code 0} 表示没有请求。
+     *
+     * <p>必须在**持有会话的线程**(渲染线程)上调用。
+     */
+    public static native int nativeTakeShutdownRequest();
 }
