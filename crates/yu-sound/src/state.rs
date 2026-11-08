@@ -447,6 +447,18 @@ pub struct SoundState {
     /// 同文件反复装载(SE 复用)命中后共享 `Arc`,不再重复读/转换。
     pcm_cache: BTreeMap<Vec<u8>, std::sync::Arc<Pcm>>,
     pcm_cache_bytes: usize,
+    /// 候选名探测结果缓存(`SOUND[FILE]` 原字节 → 命中的候选名,`None` = 全不中)。
+    ///
+    /// `load_file` 每次都要按扩展名顺序探测(`.ogg` → `.wav` …),每次探测都是
+    /// 一次 VFS 查找(压缩条目还要整解压)。菜单开合帧 `SOUND` 可达 205 次且
+    /// 大量重复同一批音效,实测单条 17~86µs。
+    ///
+    /// 只缓存**名字解析**(哪个候选存在),不缓存文件内容 —— 内容由下面的
+    /// `pcm_cache`(WAVE/ACM)与流解码器各自负责。语义等价:同一 `FILE` 参数
+    /// 在包内解析出的候选名不会变(数据目录在本进程内不变)。
+    resolve_cache: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// `resolve_cache` 命中次数(诊断)。
+    resolve_cache_hits: u64,
     /// PCM 缓存命中次数(诊断:「重复 SOUND 只解一次」的计数证据)。
     pcm_cache_hits: u64,
     clock_ms: i64,
@@ -501,6 +513,8 @@ impl SoundState {
             loader,
             pcm_cache: BTreeMap::new(),
             pcm_cache_bytes: 0,
+            resolve_cache: BTreeMap::new(),
+            resolve_cache_hits: 0,
             pcm_cache_hits: 0,
             clock_ms: 0,
             external_clock: false,
@@ -1002,17 +1016,38 @@ impl SoundState {
         // 4. 最终候选名被复制进声音对象 `+0x000`，即 `SOUNDINFO[FILE]` 来源。
         let base = normalize_name(file);
         let candidates = probe_names(&base);
+        // 先查候选名解析缓存:命中就只读那一个,不再逐个探测。
+        let cached = self.resolve_cache.get(file).cloned();
         let mut found: Option<(Vec<u8>, Vec<u8>)> = None;
-        for name in &candidates {
-            match self.loader.load(name) {
-                Ok(Some(bytes)) => {
-                    found = Some((name.clone(), bytes));
-                    break;
+        match cached {
+            Some(Some(name)) => {
+                self.resolve_cache_hits = self.resolve_cache_hits.saturating_add(1);
+                match self.loader.load(&name) {
+                    Ok(Some(bytes)) => found = Some((name, bytes)),
+                    // 缓存里的名字这次读不出来(数据目录被外部改动):退回
+                    // 完整探测,并在下面用新结果覆盖缓存。
+                    _ => {}
                 }
-                Ok(None) => {}
-                Err(d) => {
-                    self.report(d);
+            }
+            Some(None) => {
+                // 已确认全不中:直接走「未找到」路径,不重复探测。
+                self.resolve_cache_hits = self.resolve_cache_hits.saturating_add(1);
+            }
+            None => {
+                for name in &candidates {
+                    match self.loader.load(name) {
+                        Ok(Some(bytes)) => {
+                            found = Some((name.clone(), bytes));
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(d) => {
+                            self.report(d);
+                        }
+                    }
                 }
+                self.resolve_cache
+                    .insert(file.to_vec(), found.as_ref().map(|(name, _)| name.clone()));
             }
         }
         let Some((resolved, bytes)) = found else {
