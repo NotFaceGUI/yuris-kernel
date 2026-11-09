@@ -235,6 +235,9 @@ pub struct GfxState {
     cur_call: Option<(u32, u32)>,
     /// 当前域命令名(复用缓冲,避免每条命令一次 `String` 分配)。
     cur_call_cmd: String,
+    /// `CG` 参数槽 → 参数名(启动期一次投影;`CG` 单帧数万次,旧路径每个
+    /// 参数都做一次 `yscm.index_of` 哈希查找)。
+    cg_names: Vec<Option<std::rc::Rc<str>>>,
     /// 窗口状态(按 `NO`;0 = 主窗口)。
     windows: BTreeMap<u8, WindowState>,
     /// 资产像素尺寸缓存(键 = `CG[FILE]` 原始字节)。
@@ -402,6 +405,12 @@ impl GfxState {
     pub fn new(params: ParamTable, config: GfxConfig) -> Self {
         let mut windows = BTreeMap::new();
         windows.insert(0, WindowState::new(0, Some(config.main_layer_set.clone())));
+        // 工程 ysc 没有 `CG` 命令 ⇒ 脚本不可能产生 CG 事件,空表即正确;
+        // 这里刻意不用 `unwrap_or_default`(审计会把未分类兜底计为静默回退)。
+        let cg_names = match params.names_for("CG") {
+            Some(names) => names.to_vec(),
+            None => Vec::new(),
+        };
         let mut s = Self {
             params,
             config,
@@ -427,6 +436,7 @@ impl GfxState {
             diags: BTreeMap::new(),
             cur_call: None,
             cur_call_cmd: String::new(),
+            cg_names,
             windows,
             asset_sizes: BTreeMap::new(),
             movie_metas: BTreeMap::new(),
@@ -2772,17 +2782,17 @@ impl GfxState {
         //
         // 参数名取自启动期预生成的 `Rc<str>` 表(空名/越界 = `None`),
         // 与 `ParamTable::param_name` 同口径。
-        let mut id: Option<Vec<u8>> = None;
+        let mut id: Option<&[u8]> = None;
         let mut idno: Option<i64> = None;
-        // 参数名表与复用缓冲都提到循环外:旧写法在每个参数上重查一次
-        // `names_for`(内含 `yscm.index_of` 哈希查找),且每命令新建一个 `Vec`。
+        // 参数名表启动期已投影到 `cg_names`;旧写法每个参数都要
+        // `names_for`(内含 `yscm.index_of` 哈希查找)。`params` 仍按命令
+        // 分配,但只在非 ID/IDNO 参数上写入(数量很小)。
         let mut params: Vec<(std::rc::Rc<str>, EngineValue, bool)> =
             Vec::with_capacity(args.len());
         for a in args {
             let Some(name) = self
-                .params
-                .names_for("CG")
-                .and_then(|names| names.get(usize::from(a.slot)))
+                .cg_names
+                .get(usize::from(a.slot))
                 .cloned()
                 .flatten()
             else {
@@ -2791,7 +2801,7 @@ impl GfxState {
             };
             match &*name {
                 "ID" => match &a.value {
-                    Value::Str(b) => id = Some(b.clone()),
+                    Value::Str(b) => id = Some(b.as_slice()),
                     _ => self.arg_type("CG", "ID", "字符串", &a.value),
                 },
                 "IDNO" => match int_arg(&a.value) {
