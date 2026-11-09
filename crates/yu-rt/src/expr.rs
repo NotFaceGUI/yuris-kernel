@@ -116,9 +116,241 @@ pub struct LValue {
     pub indices: smallvec::SmallVec<[i64; 4]>,
 }
 
+/// 预编译的数组下标表达式(启动后窗口字节不变,`LET` 热路径直接执行)。
+///
+/// 只覆盖编译器实际生成的最常见形态(`var` / `var±const` / 常量);
+/// 其它形态返回 `None`,运行时回退到通用栈机,语义不变。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum IndexExpr {
+    Const(i64),
+    Var(VarRef),
+    /// `var <op> const`,op ∈ + - * & | ^(与 `binary()` 同族)。
+    VarOpConst { var: VarRef, op: u8, value: i64 },
+}
+
+/// 预编译的简单值表达式(IF 条件 / LET 右值等热路径)。
+///
+/// 只覆盖 `常量`、`变量` 与一次整数二元运算的形态;数组取值、字符串、
+/// 浮点常量等仍走通用栈机。求值顺序与 `binary()` 完全一致。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SimpleExpr {
+    Const(i64),
+    Var(VarRef),
+    VarOpConst { var: VarRef, op: u8, value: i64 },
+    ConstOpVar { value: i64, op: u8, var: VarRef },
+    VarOpVar { lhs: VarRef, op: u8, rhs: VarRef },
+}
+
+/// 尝试把已解码窗口识别为 [`SimpleExpr`]。
+#[must_use]
+pub fn simple_expr(instrs: &[RawInstr]) -> Option<SimpleExpr> {
+    match instrs {
+        [one] => match int_const(one) {
+            Some(value) => Some(SimpleExpr::Const(value)),
+            None if one.op == 0x48 => Some(SimpleExpr::Var(var_of(one)?)),
+            None => None,
+        },
+        [first, second, op] if is_simple_binop(op.op) => {
+            let lhs = match int_const(first) {
+                Some(value) => SimpleExpr::Const(value),
+                None if first.op == 0x48 => SimpleExpr::Var(var_of(first)?),
+                None => return None,
+            };
+            let rhs = match int_const(second) {
+                Some(value) => SimpleExpr::Const(value),
+                None if second.op == 0x48 => SimpleExpr::Var(var_of(second)?),
+                None => return None,
+            };
+            fold_simple(op.op, lhs, rhs)
+        }
+        _ => None,
+    }
+}
+
+fn fold_simple(op: u8, lhs: SimpleExpr, rhs: SimpleExpr) -> Option<SimpleExpr> {
+    match (lhs, rhs) {
+        (SimpleExpr::Const(a), SimpleExpr::Const(b)) => Some(SimpleExpr::Const(fold_int_pair(
+            op, a, b,
+        )?)),
+        (SimpleExpr::Var(var), SimpleExpr::Const(value)) => {
+            Some(SimpleExpr::VarOpConst { var, op, value })
+        }
+        (SimpleExpr::Const(value), SimpleExpr::Var(var)) => {
+            if is_commutative(op) {
+                Some(SimpleExpr::VarOpConst { var, op, value })
+            } else {
+                Some(SimpleExpr::ConstOpVar { value, op, var })
+            }
+        }
+        (SimpleExpr::Var(lhs), SimpleExpr::Var(rhs)) => {
+            Some(SimpleExpr::VarOpVar { lhs, op, rhs })
+        }
+        _ => None,
+    }
+}
+
+fn is_simple_binop(op: u8) -> bool {
+    matches!(
+        op,
+        0x21 | 0x25 | 0x26 | 0x2a | 0x2b | 0x2d | 0x2f | 0x3c | 0x3d | 0x3e | 0x41 | 0x4f
+            | 0x53 | 0x5a | 0x5e | 0x7c
+    )
+}
+
+fn is_commutative(op: u8) -> bool {
+    matches!(op, 0x2b | 0x2a | 0x26 | 0x41 | 0x4f | 0x5e | 0x21 | 0x3d | 0x7c)
+}
+
+fn fold_int_pair(op: u8, a: i64, b: i64) -> Option<i64> {
+    Some(match op {
+        0x2b => a.wrapping_add(b),
+        0x2d => a.wrapping_sub(b),
+        0x2a => a.wrapping_mul(b),
+        0x26 => i64::from((a != 0) && (b != 0)),
+        0x41 => a & b,
+        0x4f => a | b,
+        0x5e => a ^ b,
+        0x21 => i64::from(a != b),
+        0x3d => i64::from(a == b),
+        0x3c => i64::from(a < b),
+        0x3e => i64::from(a > b),
+        0x53 => i64::from(a <= b),
+        0x5a => i64::from(a >= b),
+        0x7c => i64::from((a != 0) || (b != 0)),
+        // 除法/取余有整数除零特例,不在常量折叠里复刻。
+        _ => return None,
+    })
+}
+
+/// 整数立即数(0x42/0x57/0x49/0x4c)。
+fn int_const(ins: &RawInstr) -> Option<i64> {
+    match ins.op {
+        0x42 if ins.payload.len() == 1 => Some(i64::from(ins.payload[0] as i8)),
+        0x57 if ins.payload.len() == 2 => Some(i64::from(i16::from_le_bytes([
+            ins.payload[0],
+            ins.payload[1],
+        ]))),
+        0x49 if ins.payload.len() == 4 => Some(i64::from(i32::from_le_bytes([
+            ins.payload[0],
+            ins.payload[1],
+            ins.payload[2],
+            ins.payload[3],
+        ]))),
+        0x4c if ins.payload.len() == 8 => read_i64(&ins.payload).ok(),
+        _ => None,
+    }
+}
+
+/// 左值窗口的预编译计划(变量 + 各维下标表达式)。
+#[derive(Clone, Debug, PartialEq)]
+pub struct LValuePlan {
+    pub var: VarRef,
+    pub indices: Vec<IndexExpr>,
+}
+
+/// 尝试把已解码窗口识别为「变量引用 + 简单下标」。
+///
+/// 判定与 [`Evaluator::eval_lvalue_instrs_with`] 的通用路径严格同形:
+/// 首条必须是引用指令(`0x56/0x76`),末条 `0x29` 是左值标记;
+/// 中间只允许常量、取值引用、`0x2c` 空操作与可折叠的整数二元运算。
+#[must_use]
+pub fn lvalue_plan(instrs: &[RawInstr]) -> Option<LValuePlan> {
+    let (first, rest) = instrs.split_first()?;
+    if !matches!(first.op, 0x56 | 0x76) {
+        return None;
+    }
+    let var = var_of(first)?;
+    // 末条 `0x29` 只是「把左值交给 LET」的标记;内层 `0x29`(数组取值)
+    // 不在本快速路径覆盖范围内。
+    let body = match rest.last() {
+        Some(last) if last.op == 0x29 => &rest[..rest.len() - 1],
+        _ => rest,
+    };
+    let mut stack: Vec<IndexExpr> = Vec::new();
+    for ins in body {
+        match ins.op {
+            0x2c => {}
+            0x42 if ins.payload.len() == 1 => {
+                stack.push(IndexExpr::Const(i64::from(ins.payload[0] as i8)));
+            }
+            0x57 if ins.payload.len() == 2 => {
+                stack.push(IndexExpr::Const(i64::from(i16::from_le_bytes([
+                    ins.payload[0],
+                    ins.payload[1],
+                ]))));
+            }
+            0x49 if ins.payload.len() == 4 => {
+                stack.push(IndexExpr::Const(i64::from(i32::from_le_bytes([
+                    ins.payload[0],
+                    ins.payload[1],
+                    ins.payload[2],
+                    ins.payload[3],
+                ]))));
+            }
+            0x4c if ins.payload.len() == 8 => {
+                stack.push(IndexExpr::Const(read_i64(&ins.payload).ok()?));
+            }
+            0x48 => stack.push(IndexExpr::Var(var_of(ins)?)),
+            // 0x56/0x76 是“引用”指令:通用左值路径只把**第一条**当左值基址,
+            // 后续 Ref 落到下标表会报「下标表混入变量引用」。这里直接回退,
+            // 让通用路径给出同一条诊断。
+            0x21 | 0x25 | 0x26 | 0x2a | 0x2b | 0x2d | 0x2f | 0x3c | 0x3d | 0x3e | 0x41 | 0x4f
+            | 0x53 | 0x5a | 0x5e | 0x7c => {
+                let rhs = stack.pop()?;
+                let lhs = stack.pop()?;
+                stack.push(fold_index_binop(ins.op, lhs, rhs)?);
+            }
+            // 0x29(内层数组取值)/字符串/浮点常量/一元运算等:走通用路径。
+            _ => return None,
+        }
+    }
+    Some(LValuePlan {
+        var,
+        indices: stack,
+    })
+}
+
+fn fold_index_binop(op: u8, lhs: IndexExpr, rhs: IndexExpr) -> Option<IndexExpr> {
+    match (lhs, rhs) {
+        (IndexExpr::Const(a), IndexExpr::Const(b)) => {
+            let value = match op {
+                0x2b => a.wrapping_add(b),
+                0x2d => a.wrapping_sub(b),
+                0x2a => a.wrapping_mul(b),
+                0x41 => a & b,
+                0x4f => a | b,
+                0x5e => a ^ b,
+                _ => return None,
+            };
+            Some(IndexExpr::Const(value))
+        }
+        (IndexExpr::Var(var), IndexExpr::Const(value)) => {
+            matches!(op, 0x2b | 0x2d | 0x2a | 0x41 | 0x4f | 0x5e).then_some(IndexExpr::VarOpConst {
+                var,
+                op,
+                value,
+            })
+        }
+        // 交换律运算:`const <op> var` 与 `var <op> const` 同值。
+        (IndexExpr::Const(value), IndexExpr::Var(var)) if matches!(op, 0x2b | 0x2a | 0x41 | 0x4f | 0x5e) => {
+            Some(IndexExpr::VarOpConst { var, op, value })
+        }
+        _ => None,
+    }
+}
+
 /// 求值期变量访问。由 VM 实现(变量域 + 系统变量 + 输入快照)。
 pub trait VarAccess {
     fn read(&mut self, var: VarRef, indices: &[i64]) -> Result<Value, yu_log::Diag>;
+
+    /// 标量整数快速读取(命中返回 `Some`;非标量/非 INT 返回 `None`)。
+    ///
+    /// 默认实现回退到 [`Self::read`];VM 覆盖它以避免表达式热路径上的
+    /// `Value` 构造/克隆。返回 `None` 时调用方必须再走 `read`,类型与错误
+    /// 语义完全不变。
+    fn read_scalar_int(&mut self, var: VarRef) -> Result<Option<i64>, yu_log::Diag> {
+        Ok(self.read(var, &[])?.as_int())
+    }
 }
 
 /// 表达式求值器。
@@ -324,6 +556,83 @@ impl<'a> Evaluator<'a> {
             Slot::Val(_) => unreachable!("at 由 Ref 位置确定"),
         };
         Ok(LValue { var, indices })
+    }
+
+    /// 预编译简单表达式的执行(IF/LET 热路径;语义与通用栈机一致)。
+    pub fn eval_simple(&mut self, expr: &SimpleExpr) -> Result<Value, yu_log::Diag> {
+        match *expr {
+            SimpleExpr::Const(value) => Ok(Value::Int(value)),
+            SimpleExpr::Var(var) => match self.access.read_scalar_int(var)? {
+                Some(value) => Ok(Value::Int(value)),
+                None => self.access.read(var, &[]),
+            },
+            SimpleExpr::VarOpConst { var, op, value } => {
+                let lhs = match self.access.read_scalar_int(var)? {
+                    Some(value) => Value::Int(value),
+                    None => self.access.read(var, &[])?,
+                };
+                binary(op, &lhs, &Value::Int(value))
+            }
+            SimpleExpr::ConstOpVar { value, op, var } => {
+                let rhs = match self.access.read_scalar_int(var)? {
+                    Some(value) => Value::Int(value),
+                    None => self.access.read(var, &[])?,
+                };
+                binary(op, &Value::Int(value), &rhs)
+            }
+            SimpleExpr::VarOpVar { lhs, op, rhs } => {
+                let a = match self.access.read_scalar_int(lhs)? {
+                    Some(value) => Value::Int(value),
+                    None => self.access.read(lhs, &[])?,
+                };
+                let b = match self.access.read_scalar_int(rhs)? {
+                    Some(value) => Value::Int(value),
+                    None => self.access.read(rhs, &[])?,
+                };
+                binary(op, &a, &b)
+            }
+        }
+    }
+
+    /// 预编译左值计划的执行(与通用路径同语义,省掉槽栈与逐指令分派)。
+    ///
+    /// 先求值全部下标再统一校验整数,与 `eval_lvalue_instrs_with` 的
+    /// 「表达式错误优先、下标类型错误在后」顺序一致。
+    pub fn eval_lvalue_plan(&mut self, plan: &LValuePlan) -> Result<LValue, yu_log::Diag> {
+        let mut values: smallvec::SmallVec<[Value; 4]> = smallvec::SmallVec::new();
+        for expr in &plan.indices {
+            values.push(match *expr {
+                IndexExpr::Const(v) => Value::Int(v),
+                IndexExpr::Var(var) => match self.access.read_scalar_int(var)? {
+                    Some(value) => Value::Int(value),
+                    None => self.access.read(var, &[])?,
+                },
+                IndexExpr::VarOpConst { var, op, value } => {
+                    let lhs = match self.access.read_scalar_int(var)? {
+                        Some(value) => Value::Int(value),
+                        None => self.access.read(var, &[])?,
+                    };
+                    binary(op, &lhs, &Value::Int(value))?
+                }
+            });
+        }
+        let mut indices = smallvec::SmallVec::<[i64; 4]>::new();
+        for value in values {
+            match value {
+                Value::Int(v) => indices.push(v),
+                other => {
+                    return Err(diag::fatal(
+                        code::rt::VAR_TYPE,
+                        Boundary::Script,
+                        format!("下标必须是整数,得到 {}", other.type_name()),
+                    ))
+                }
+            }
+        }
+        Ok(LValue {
+            var: plan.var,
+            indices,
+        })
     }
 
     fn step(
@@ -790,5 +1099,79 @@ mod tests {
     #[test]
     fn malformed_record_is_error() {
         assert!(ev(&[0x42, 5, 0, 1]).is_err());
+    }
+
+    #[test]
+    fn lvalue_plan_matches_hot_array_assignment() {
+        // 真实热站点(es_Button 的 `@P.I(@mLC-1,@_LC)=0`)窗口字节:
+        // 引用基变量 → 读 @mLC → 1 → sub → nop → 读 @_LC → 数组标记。
+        let raw = [
+            0x56, 3, 0, 0x40, 0x0f, 0x05, 0x48, 3, 0, 0x40, 0x85, 0x05, 0x42, 1, 0, 1, 0x2d,
+            0, 0, 0x2c, 0, 0, 0x48, 3, 0, 0x40, 0x30, 0, 0x29, 1, 0, 0,
+        ];
+        let instrs = decode(&raw).expect("decode");
+        let plan = lvalue_plan(&instrs).expect("plan");
+        assert_eq!(
+            plan.indices,
+            vec![
+                IndexExpr::VarOpConst {
+                    var: VarRef {
+                        space: VarSpace::from_prefix(0x40),
+                        id: 0x0585,
+                    },
+                    op: 0x2d,
+                    value: 1,
+                },
+                IndexExpr::Var(VarRef {
+                    space: VarSpace::from_prefix(0x40),
+                    id: 0x0030,
+                }),
+            ]
+        );
+
+        // 执行结果与通用 `0x29` 左值路径一致。
+        let fixed = Fixed {
+            scalar: Value::Int(5),
+            array: Vec::new(),
+        };
+        let mut access = fixed;
+        let mut eval = Evaluator::new(&mut access);
+        let lv = eval.eval_lvalue_plan(&plan).expect("eval plan");
+        let mut generic = Vec::new();
+        let lv_generic = eval
+            .eval_lvalue_instrs_with(&instrs, &mut generic)
+            .expect("eval generic");
+        assert_eq!(lv, lv_generic);
+        assert_eq!(lv.indices.as_slice(), &[4, 5]);
+    }
+
+    #[test]
+    fn lvalue_plan_falls_back_on_reference_index() {
+        // 下标位置出现 0x56/0x76(引用)时通用路径会报「下标表混入变量引用」;
+        // 快速路径必须回退,不能把它当值读。
+        let raw = [
+            0x56, 3, 0, 0x40, 0x10, 0x00, 0x56, 3, 0, 0x40, 0x11, 0x00, 0x29, 1, 0, 0,
+        ];
+        let instrs = decode(&raw).expect("decode");
+        assert!(lvalue_plan(&instrs).is_none());
+    }
+
+    #[test]
+    fn simple_expr_matches_generic_for_var_compare() {
+        // @A < 5
+        let raw = [0x48, 3, 0, 0x40, 0x10, 0x00, 0x42, 1, 0, 5, 0x3c, 0, 0];
+        let instrs = decode(&raw).expect("decode");
+        let plan = simple_expr(&instrs).expect("plan");
+        let mut fixed = Fixed {
+            scalar: Value::Int(3),
+            array: Vec::new(),
+        };
+        let mut eval = Evaluator::new(&mut fixed);
+        let simplified = eval.eval_simple(&plan).expect("simple");
+        let generic = eval
+            .eval_value_instrs(&instrs, &mut Vec::new())
+            .expect("generic");
+        assert_eq!(simplified, generic);
+        assert_eq!(simplified, Value::Int(1));
     }
 }

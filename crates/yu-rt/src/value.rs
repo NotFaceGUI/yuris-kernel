@@ -624,6 +624,20 @@ impl VariableStore {
         self.cell(r).is_some()
     }
 
+    /// 标量整数快速读取(表达式热路径):非标量/非 INT 返回 `None`,
+    /// 调用方回退到通用 [`Self::read`](保持类型与错误语义)。
+    #[inline]
+    pub fn scalar_int(&self, r: VarRef) -> Option<i64> {
+        let slot = self.cell(r)?;
+        if !slot.is_scalar() {
+            return None;
+        }
+        match slot.data.first() {
+            Some(Value::Int(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
     pub fn slot(&self, r: VarRef) -> Option<&VarSlot> {
         self.cell(r)
     }

@@ -617,6 +617,9 @@ fn pump_node(
     let cap = ctx.cap;
     let mut pumped = 0usize;
     let mut finished = false;
+    // 当前节点索引缓存:一次泵里绝大多数命令不改变任务链,逐条线性扫描
+    // 整个任务表是纯浪费(场景构建帧 81 万条命令 × 上百个任务)。
+    let mut cur_index: Option<usize> = None;
     // 任务链投影只在链变化时同步(每条命令同步会克隆整条链,热路径不可接受)。
     exec.sync_task_view(&view_of(nodes, &ctx.pending));
     loop {
@@ -625,9 +628,16 @@ fn pump_node(
                 break;
             }
         }
-        // 副作用可能摘掉链中的其它节点(索引前移)⇒ 每轮按 `seq` 重新定位当前节点。
-        let Some(cur) = nodes.iter().position(|n| n.seq == seq) else {
-            break;
+        // 链只在 `drain_effects` 里变化;缓存索引命中时不必重扫。
+        let cur = match cur_index {
+            Some(index) if nodes.get(index).is_some_and(|node| node.seq == seq) => index,
+            _ => {
+                let Some(index) = nodes.iter().position(|n| n.seq == seq) else {
+                    break;
+                };
+                cur_index = Some(index);
+                index
+            }
         };
         let out = exec.step_command(&mut nodes[cur]);
         let mut chain_changed = false;
@@ -685,17 +695,34 @@ fn pump_node(
             }
         }
         if chain_changed {
+            cur_index = None;
             exec.sync_task_view(&view_of(nodes, &ctx.pending));
         }
         if finished {
             break;
         }
-        let Some(cur) = nodes.iter().position(|n| n.seq == seq) else {
-            break;
+        // `Continue` 不写节点计数,下一轮用缓存索引继续;只有
+        // Yield/Finish/Err 才需要当前节点,链变过时再按 `seq` 重定位。
+        let node_now = |nodes: &[TaskNode]| {
+            if chain_changed {
+                nodes.iter().position(|n| n.seq == seq)
+            } else {
+                Some(cur)
+            }
         };
         match out {
-            Ok(StepOutcome::Continue) => pumped += 1,
+            Ok(StepOutcome::Continue) => {
+                // 链变化时当前节点可能已被副作用摘掉;旧实现在计数前会
+                // 重定位失败即 break,这里保持一致(不把这条算进 pumped)。
+                if chain_changed && nodes.iter().position(|n| n.seq == seq).is_none() {
+                    break;
+                }
+                pumped += 1;
+            }
             Ok(StepOutcome::Yield | StepOutcome::TextYield) => {
+                let Some(cur) = node_now(nodes) else {
+                    break;
+                };
                 pumped += 1;
                 nodes[cur].steps += 1;
                 if matches!(out, Ok(StepOutcome::TextYield)) {
@@ -704,12 +731,18 @@ fn pump_node(
                 break;
             }
             Ok(StepOutcome::Finish) => {
+                let Some(cur) = node_now(nodes) else {
+                    break;
+                };
                 pumped += 1;
                 nodes[cur].finished = true;
                 nodes[cur].steps += 1;
                 break;
             }
             Ok(StepOutcome::ExitProgram { restart }) => {
+                let Some(cur) = node_now(nodes) else {
+                    break;
+                };
                 // 官方 END 不结束单个任务,而是置全程序退出字节并让主循环
                 // 停泵(REA 0x441334 / 0x403bfc)。执行者这一步的 TaskFinish
                 // 事件已由 Vm::step_command 落;这里立即收束整条链。
@@ -720,6 +753,9 @@ fn pump_node(
                 break;
             }
             Err(e) => {
+                let Some(cur) = node_now(nodes) else {
+                    break;
+                };
                 // 官方错误路径未取证 → 让出 + 结束 + 记录(DIV-RT-005)。
                 let (id, script_id, pc, main) = (
                     nodes[cur].id.clone(),

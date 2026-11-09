@@ -413,6 +413,10 @@ pub struct CmdWindow {
     pub instrs: Option<Rc<[crate::expr::RawInstr]>>,
     /// 单条字面量窗口的常量值(常量折叠;`None` = 需要正常求值)。
     pub const_value: Option<Value>,
+    /// 左值窗口的预编译下标计划(仅首条为变量引用的窗口;`None` = 走通用路径)。
+    pub lvalue_plan: Option<crate::expr::LValuePlan>,
+    /// 简单值表达式预编译(IF 条件 / LET 右值等;`None` = 走通用栈机)。
+    pub simple: Option<crate::expr::SimpleExpr>,
 }
 
 impl CmdWindow {
@@ -2119,11 +2123,15 @@ impl Vm {
                 .ok()
                 .map(Rc::<[crate::expr::RawInstr]>::from);
             let const_value = instrs.as_deref().and_then(crate::expr::const_value_instrs);
+            let lvalue_plan = instrs.as_deref().and_then(crate::expr::lvalue_plan);
+            let simple = instrs.as_deref().and_then(crate::expr::simple_expr);
             cmd.windows.push(CmdWindow {
                 rec: *rec,
                 payload: payload.to_vec(),
                 instrs,
                 const_value,
+                lvalue_plan,
+                simple,
             });
         }
         cmd.opcode = group.opcode;
@@ -2240,6 +2248,11 @@ impl Vm {
         if let Some(value) = &w.const_value {
             return Ok(value.clone());
         }
+        if let Some(simple) = w.simple {
+            let codec = self.script_codec;
+            let mut access = VmAccess { vm: self, st };
+            return Evaluator::with_codec(&mut access, codec).eval_simple(&simple);
+        }
         let instrs = match &w.instrs {
             Some(instrs) => Rc::clone(instrs),
             None => self.decoded_window(&w.payload)?,
@@ -2262,6 +2275,11 @@ impl Vm {
         st: &ExecState,
         w: &CmdWindow,
     ) -> Result<LValue, Diag> {
+        if let Some(plan) = &w.lvalue_plan {
+            let codec = self.script_codec;
+            let mut access = VmAccess { vm: self, st };
+            return Evaluator::with_codec(&mut access, codec).eval_lvalue_plan(plan);
+        }
         let instrs = match &w.instrs {
             Some(instrs) => Rc::clone(instrs),
             None => self.decoded_window(&w.payload)?,
@@ -2584,6 +2602,29 @@ impl VarAccess for VmAccess<'_> {
             return crate::sysvar::read(self.vm, self.st, var, indices);
         }
         self.vm.store.read(var, indices)
+    }
+
+    fn read_scalar_int(&mut self, var: VarRef) -> Result<Option<i64>, Diag> {
+        let var = if var.space.is_legacy() {
+            self.vm.canonical_var(var)
+        } else {
+            var
+        };
+        if matches!(var.space, VarSpace::Other(_)) {
+            return Err(diag::unimplemented(
+                code::rt::EXPR_UNSUPPORTED,
+                Boundary::Script,
+                format!(
+                    "变量空间前缀 {:#04x}({})未取证:手册只定义 `@`/`$`(DIV-RT-017)",
+                    var.space.prefix(),
+                    var.display()
+                ),
+            ));
+        }
+        if var.id < self.vm.sys_count {
+            return Ok(crate::sysvar::read(self.vm, self.st, var, &[])?.as_int());
+        }
+        Ok(self.vm.store.scalar_int(var))
     }
 }
 
