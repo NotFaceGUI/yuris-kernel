@@ -13887,3 +13887,43 @@ cargo build --workspace --all-targets  → 0 error / 0 warning
 cargo test -p yu-backend-wgpu          → 13+26+39+1+1 passed
 release APK 已安装(14:34)，等待复现 CG 模式/立绘首次出现并抓 [slowop]/[spike]
 ```
+
+## 成果 PERF-VM-TRIM (2026-11-09) · VM 表达式预编译、TRIM 窄带读回与安卓 libpng 开关
+
+**改动**:
+- **VM 热路径**:`LET` 左值下标预编译(`IndexExpr`/`LValuePlan`,覆盖
+  `var±const` 等简单形态);`IF` 条件与 `LET` 右值预编译(`SimpleExpr`,
+  常量/变量/一次整数二元运算);标量整数变量直读(`VariableStore::scalar_int`);
+  调度器缓存当前任务节点索引。所有快速路径都有通用栈机回退,未覆盖的
+  形态(数组取值、字符串/浮点常量、除法等)语义不变。
+- **TRIM**:非资产源不再整图同步读回,只读四边窄带(`readback::trim_bounds`,
+  带大小 64→512 翻倍);整幅 `COPY2` 是资产纹理零拷贝别名时用资产 CPU
+  像素直接算边界(`TextureCache::asset_keys` 反向表),零 GPU 读回。
+  顺带修复 `ReadbackCache::read_region_now` 漏 `map_async` 的旧 bug。
+- **管线预热**:启动期编译 lerp/resample/merge/composite/transform/scale/
+  paint/过渡(Normal)常用管线,`YURIS_PIPELINE_PREWARM=0` 可关;失败不阻断。
+- **诊断**:单条图像加工 ≥20ms 无条件 `[slowop]`(带 `resolve=`);安卓
+  `[spike]` 增 `dec=/up=`(仅 render 阶段;tick 末尾 preload 看 `preload=`)。
+- **安卓 PNG 解码**:新增「PNG 解码:libpng(快)/image crate(稳)」开关,
+  默认 libpng;像素一致性已有 `png_libpng_parity` 对 1253 张语料对拍。
+
+**回退记录**:尝试过「tick 中预取 + 多线程 worker + 首用等待」,实测首用仍会
+同步解码(声明点靠后、worker 来不及),且线程池把解码挪到 render 阶段;
+已整体回退,不在本次提交。预取恢复为原来的 tick 末尾/字面量前瞻 + 同步兜底。
+
+**验证**:
+```text
+cargo build --workspace --all-targets                 → 0 error / 0 warning
+cargo test -p yu-rt --lib                             → 93 passed
+cargo test -p yu-render-core --lib                    → 23 passed
+cargo test -p yu-gfx                                  → 9/7/9/2 passed
+cargo test -p yu-backend-wgpu --test surfaces         → 27 passed
+cargo test -p yu-backend-wgpu --test wgpu (串行)      → 39 passed
+cargo test -p yu-cli --test logging_guards            → 3 passed
+新用例:
+  trim_on_snapshot_matches_soft → 整幅快照 cpu_fb=0;区域快照 cpu_fb≥1;像素与 soft 全等
+  banded_trim_*                 → 单带/跨带/mask 语义
+  lvalue_plan_falls_back_on_reference_index → 引用下标回退通用诊断
+```
+**已知限制**:同帧 `区域 COPY2 → TRIM` 的 GPU 表面尚未提交,边界读回只能读到
+旧内容(用例覆盖「上一帧落地后再 TRIM」;整幅别名走资产 CPU 路径不受影响)。
