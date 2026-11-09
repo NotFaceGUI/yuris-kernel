@@ -31,6 +31,29 @@ tools/android/build.sh arm64-v8a            # 只打真机
 产物:debug → `android/app/build/outputs/apk/debug/app-debug.apk`;
 release → `android/app/build/outputs/apk/release/app-release.apk`。
 
+### 本机一键构建(2026-11-09 实测,直接照抄,不要再全盘找 gradle)
+
+本机 **不要用**逆向工具目录里的 JDK 21 跑 Gradle(会报
+`Failed to load native library 'native-platform.dll'`);用 Android Studio
+自带的 JBR。Gradle 用 `~/.gradle/wrapper/dists` 里已有的 8.14.3,不要再下载。
+本机的具体绝对路径(用户名、SDK、Gradle 缓存 hash)记在 `AGENTS.md`
+的「Android 构建」一节,不写进被跟踪文件。
+
+```bash
+export PATH="$HOME/.gradle/wrapper/dists/gradle-8.14.3-bin/<hash>/gradle-8.14.3/bin:$PATH"
+export JAVA_HOME="<Android Studio>/jbr"
+export ANDROID_HOME="<Android SDK>"
+export GRADLE_FLAGS="--offline --no-daemon"
+
+BUILD_TYPE=release tools/android/build.sh arm64-v8a
+# 产物: android/app/build/outputs/apk/release/app-release.apk
+```
+
+NDK 不用显式设:`build.sh` 会取 `$ANDROID_HOME/ndk` 下最高版本。
+`--offline` 复用默认 `~/.gradle` 的依赖缓存;**不要**再把旧
+`transforms-4` 拷进新的 `GRADLE_USER_HOME`(会报
+`Could not move temporary workspace`)。`aapt2.exe` 由 `build.sh` 自动探测。
+
 脚本的环境变量(CI 与本地共用同一份):
 
 | 变量 | 作用 |
@@ -64,14 +87,14 @@ export GRADLE_USER_HOME=/some/writable/ghome
 mkdir -p "$GRADLE_USER_HOME/caches"
 cp -r ~/.gradle/caches/modules-2 "$GRADLE_USER_HOME/caches/"
 cp -r ~/.gradle/caches/jars-9    "$GRADLE_USER_HOME/caches/" 2>/dev/null
-cp -r ~/.gradle/caches/transforms-4 "$GRADLE_USER_HOME/caches/" 2>/dev/null
 gradle --offline --no-daemon assembleRelease
 ```
 
 本机(2026-11-07 实测)可用组合:`JAVA_HOME = Android Studio 的 JBR`
-(`C:\Program Files\Android\Android Studio1\jbr`,全 JDK 反而报
+(`<Android Studio>/jbr`;全 JDK 反而报
 `Failed to load native library 'native-platform.dll'`)+ 上面的独立
 `GRADLE_USER_HOME`(依赖缓存已有 178M,离线 `assembleDebug` 40s)。
+**不要**把 `transforms-4` 一起拷过去(见下)。
 
 2026-11-09 复测:**JBR + 默认 `~/.gradle` + `GRADLE_FLAGS="--offline --no-daemon"`
 直接 `assembleRelease` 29s 成功**。不要再把旧 `transforms-4` 拷进新的
@@ -97,6 +120,7 @@ Windows 下 NDK 的 sh 版 `*-clang` 无法被 Rust exec,`build.sh` 会自动改
 | 资产预取 | 关 | 等价桌面 `YURIS_PREFETCH=1`:`CG[FILE]` 声明即交后台解码,首用命中池/同步兜底 |
 | 快照延迟 | 关 | 等价桌面 `YURIS_SNAPSHOT_DEFER=1`:无读者的 COPY2 只登记,后续被引用再物化 |
 | SIZE 双线性 | **开** | 官方 `SIZE` 是最近邻;手机高 DPI 下 CG/差分缩放锯齿,开启后按双线性采样(像素与官方有差异,见 `DIV-GFX-083`) |
+| PNG 解码 | **开** | 开:Android 走 libpng(NEON 反滤波;画面逐字节一致);关:回 `image` crate。角色首帧解码尖峰可在此 A/B |
 
 两者都关时,壳**完全不调** `nativeStatus()`,内核也处于发布模式
 (`RunConfig::quiet`):logcat 只放 `warn` 以上、不抓音频、状态串最小化。
@@ -175,6 +199,7 @@ files/save/             ← 存档(可写)
 | `prefetch` | `prefetch` | 布尔(资产异步预取) | false |
 | `snapshot_defer` | `snapshot_defer` | 布尔(COPY2 延迟物化) | false |
 | `bilinear_scale` | `bilinear_scale` | 布尔(`SIZE` 双线性;手机画质) | 壳默认 true / 内核默认 false |
+| `png_fast` | `png_backend` | 布尔(开=`libpng`,关=`image`) | 壳默认 true |
 | `debug_log` / `show_hud` | —(壳侧) | 布尔 | false |
 
 取值解析全部只有一份(见 `docs/cross-platform.md`「宿主参数唯一取值表」);

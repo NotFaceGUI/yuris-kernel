@@ -1148,13 +1148,17 @@ pub fn tick() -> i32 {
                         // 真机实测 `render=76ms 而 ops 只有 14` —— 就是靠这
                         // 组字段才定位到「文本基面同步读回」。
                         let ph = session.engine.render_phases().unwrap_or_default();
+                        // `dec/up` 只统计本帧 render 阶段的解码/上传
+                        // (tick 末尾的 preload 已在 `begin_frame` 前完成并
+                        // 被清零);preload 本身看上面的 `preload=`。
                         log::warn!(
                             target: "yu-kernel",
                             "[spike] frame={} tick={:.1}ms render={:.1}ms total={:.1}ms \
                              preload={:.1}ms/{} err={} build={:.1}ms \
                              cmds={} ops={} passes={} layers={} visible={} \
                              plan[snap={} image={} text={} copy_text={} rest={}]us \
-                             text_cpu[rb={}us x{} asset={}us] rb={}us enc={}us cpu={} res=[{}]",
+                             text_cpu[rb={}us x{} asset={}us] rb={}us enc={}us \
+                             dec={}us/{}B up={}/{}B cpu={} res=[{}]",
                             report.frame,
                             report.tick_ms,
                             report.render_ms,
@@ -1183,6 +1187,10 @@ pub fn tick() -> i32 {
                             ph.text_cpu_asset_us,
                             ph.readback_us,
                             ph.encode_us,
+                            ph.decode_us,
+                            ph.decode_bytes,
+                            ph.uploads,
+                            ph.upload_bytes,
                             ph.cpu_fallbacks,
                             session
                                 .engine

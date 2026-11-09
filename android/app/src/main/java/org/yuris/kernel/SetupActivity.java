@@ -81,6 +81,8 @@ public final class SetupActivity extends AppCompatActivity {
     private boolean snapshotDefer;
     /** `SIZE` 双线性采样(手机画质;默认开,官方是最近邻)。 */
     private boolean bilinearScale = true;
+    /** Android PNG 解码走 libpng(NEON 反滤波;默认开,可关回 image crate)。 */
+    private boolean pngFast = true;
     private List<String> systemFonts = new ArrayList<>();
     /** 上次选中的字体(持久化;下拉加载完成后恢复选中)。 */
     private String savedFontFamily = "";
@@ -109,6 +111,7 @@ public final class SetupActivity extends AppCompatActivity {
         prefetch = prefs.getBoolean("prefetch", false);
         snapshotDefer = prefs.getBoolean("snapshot_defer", false);
         bilinearScale = prefs.getBoolean("bilinear_scale", true);
+        pngFast = prefs.getBoolean("png_fast", true);
 
         ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(BG);
@@ -298,6 +301,22 @@ public final class SetupActivity extends AppCompatActivity {
         runCard.addView(bilinearToggle, buttonParams());
         if (!bilinearScale) {
             bilinearToggle.setText("SIZE 双线性:关(官方最近邻)");
+        }
+
+        // PNG 解码后端:libpng 的 arm NEON 反滤波通常快于纯 Rust;
+        // 像素一致性已由 `png_libpng_parity` 对 1253 张语料锁定。
+        Button pngToggle = secondaryButton("PNG 解码:libpng(快)");
+        pngToggle.setTextColor(pngFast ? ACCENT : TEXT);
+        pngToggle.setOnClickListener(v -> {
+            pngFast = !pngFast;
+            pngToggle.setText(pngFast
+                    ? "PNG 解码:libpng(快)"
+                    : "PNG 解码:image crate(稳)");
+            pngToggle.setTextColor(pngFast ? ACCENT : TEXT);
+        });
+        runCard.addView(pngToggle, buttonParams());
+        if (!pngFast) {
+            pngToggle.setText("PNG 解码:image crate(稳)");
         }
         root.addView(runCard, cardParams());
         refreshRunButtons(cpuButton, gpuButton);
@@ -748,6 +767,7 @@ public final class SetupActivity extends AppCompatActivity {
                 .putBoolean("prefetch", prefetch)
                 .putBoolean("snapshot_defer", snapshotDefer)
                 .putBoolean("bilinear_scale", bilinearScale)
+                .putBoolean("png_fast", pngFast)
                 .apply();
         Intent intent = new Intent(this, MainActivity.class);
         intent.putExtra(MainActivity.EXTRA_GAME_DIR, gameDir);
@@ -760,6 +780,7 @@ public final class SetupActivity extends AppCompatActivity {
         intent.putExtra(MainActivity.EXTRA_PREFETCH, prefetch);
         intent.putExtra(MainActivity.EXTRA_SNAPSHOT_DEFER, snapshotDefer);
         intent.putExtra(MainActivity.EXTRA_BILINEAR_SCALE, bilinearScale);
+        intent.putExtra(MainActivity.EXTRA_PNG_FAST, pngFast);
         intent.putExtra(MainActivity.EXTRA_PATCH, patch);
         if (!saveCodec.isEmpty()) {
             intent.putExtra(MainActivity.EXTRA_SAVE_CODEC, saveCodec);
