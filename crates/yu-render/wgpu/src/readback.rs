@@ -180,12 +180,29 @@ impl ReadbackCache {
             padded_row,
         )?;
         ctx.queue.submit(std::iter::once(encoder.finish()));
-        ctx.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|err| {
-                Diag::fatal(code::READBACK, Boundary::Platform)
-                    .with_detail(format!("等待区域读回失败: {err}"))
-            })?;
+        {
+            let slice = buffer.slice(..);
+            let (sender, receiver) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+            ctx.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|err| {
+                    Diag::fatal(code::READBACK, Boundary::Platform)
+                        .with_detail(format!("等待区域读回失败: {err}"))
+                })?;
+            receiver
+                .recv()
+                .map_err(|_| {
+                    Diag::fatal(code::READBACK, Boundary::Platform)
+                        .with_detail("区域读回映射回调丢失")
+                })?
+                .map_err(|err| {
+                    Diag::fatal(code::READBACK, Boundary::Platform)
+                        .with_detail(format!("区域读回缓冲映射失败: {err}"))
+                })?;
+        }
         let mut rgba = Vec::with_capacity((u64::from(width) * 4 * u64::from(height)) as usize);
         {
             let slice = buffer.slice(..);
@@ -429,6 +446,151 @@ pub fn read_texture(
     cache.read_now(ctx, texture, width, height, encoder)
 }
 
+/// `TRIM` 的同步读回:只读四边窄带,不再整图回刷。
+///
+/// 真机 TBDR 上整图读回(1100×825)实测 100~291ms;`TRIM` 只需要外缘
+/// 透明行/列,按 [`TRIM_BAND`] 逐带外扫即可。判据与 soft
+/// `apply_trim` 完全一致(alpha 全 0 的行/列)。
+pub fn trim_bounds(
+    ctx: &GpuContext,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    mask: i64,
+) -> Result<Option<(u32, u32, u32, u32)>, Diag> {
+    trim_bounds_with(width, height, mask, |x, y, w, h| {
+        read_region_now_cached(ctx, texture, (x, y), w, h)
+    })
+}
+
+/// `TRIM` 扫描起始带宽(像素)。够小以少读,够大以避免逐行提交。
+const TRIM_BAND: u32 = 64;
+/// 连续空带时带宽翻倍到此上限:大留白图不会因为 64px 一带而产生几十次
+/// `submit + map` 同步等待;靠近内容的那一带仍然只读窄条。
+const TRIM_BAND_MAX: u32 = 512;
+
+/// 与 [`trim_bounds`] 同逻辑;`read` 注入读回实现,CPU 单测用。
+fn trim_bounds_with<F>(
+    width: u32,
+    height: u32,
+    mask: i64,
+    mut read: F,
+) -> Result<Option<(u32, u32, u32, u32)>, Diag>
+where
+    F: FnMut(u32, u32, u32, u32) -> Result<Surface, Diag>,
+{
+    if width == 0 || height == 0 {
+        return Ok(None);
+    }
+    if mask & 0xF == 0 {
+        return Ok(Some((0, 0, width - 1, height - 1)));
+    }
+    let row_empty = |surface: &Surface, row: u32| -> bool {
+        let stride = surface.width as usize;
+        (0..surface.width).all(|x| surface.rgba[(row as usize * stride + x as usize) * 4 + 3] == 0)
+    };
+    let col_empty = |surface: &Surface, col: u32| -> bool {
+        let stride = surface.width as usize;
+        (0..surface.height).all(|y| {
+            surface.rgba[((y as usize) * stride + col as usize) * 4 + 3] == 0
+        })
+    };
+
+    let mut top = 0u32;
+    if mask & 8 != 0 {
+        let mut y = 0u32;
+        let mut band = TRIM_BAND;
+        'top: loop {
+            let band_h = (height - y).min(band);
+            let surface = read(0, y, width, band_h)?;
+            for row in 0..band_h {
+                if !row_empty(&surface, row) {
+                    top = y + row;
+                    break 'top;
+                }
+            }
+            y += band_h;
+            band = band.saturating_mul(2).min(TRIM_BAND_MAX);
+            if y >= height {
+                return Ok(None);
+            }
+        }
+    }
+
+    let mut bottom = height - 1;
+    if mask & 4 != 0 {
+        let mut end = height;
+        let mut band = TRIM_BAND;
+        'bottom: loop {
+            let start = end.saturating_sub(band);
+            let band_h = end - start;
+            let surface = read(0, start, width, band_h)?;
+            for row in (0..band_h).rev() {
+                if !row_empty(&surface, row) {
+                    bottom = start + row;
+                    break 'bottom;
+                }
+            }
+            end = start;
+            band = band.saturating_mul(2).min(TRIM_BAND_MAX);
+            if end == 0 {
+                return Ok(None);
+            }
+        }
+    }
+    if top > bottom {
+        return Ok(None);
+    }
+
+    let rows = bottom - top + 1;
+    let mut left = 0u32;
+    if mask & 2 != 0 {
+        let mut x = 0u32;
+        let mut band = TRIM_BAND;
+        'left: loop {
+            let band_w = (width - x).min(band);
+            let surface = read(x, top, band_w, rows)?;
+            for col in 0..band_w {
+                if !col_empty(&surface, col) {
+                    left = x + col;
+                    break 'left;
+                }
+            }
+            x += band_w;
+            band = band.saturating_mul(2).min(TRIM_BAND_MAX);
+            if x >= width {
+                return Ok(None);
+            }
+        }
+    }
+
+    let mut right = width - 1;
+    if mask & 1 != 0 {
+        let mut end = width;
+        let mut band = TRIM_BAND;
+        'right: loop {
+            let start = end.saturating_sub(band);
+            let band_w = end - start;
+            let surface = read(start, top, band_w, rows)?;
+            for col in (0..band_w).rev() {
+                if !col_empty(&surface, col) {
+                    right = start + col;
+                    break 'right;
+                }
+            }
+            end = start;
+            band = band.saturating_mul(2).min(TRIM_BAND_MAX);
+            if end == 0 {
+                return Ok(None);
+            }
+        }
+    }
+    if left > right {
+        return Ok(None);
+    }
+    Ok(Some((left, top, right, bottom)))
+}
+
 /// 调试用:把一张纹理读成紧凑 RGBA8(低频人工取证)。
 ///
 /// 低频诊断路径,允许同步等待。
@@ -463,5 +625,61 @@ mod tests {
         let (padded, size) = ReadbackCache::row_layout(100, 10).expect("layout");
         assert_eq!(padded, 512);
         assert_eq!(size, 5120);
+    }
+
+    fn opaque_rect(width: u32, height: u32, rect: (u32, u32, u32, u32)) -> Vec<u8> {
+        let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+        let (x0, y0, x1, y1) = rect;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                rgba[((y as usize) * (width as usize) + x as usize) * 4 + 3] = 255;
+            }
+        }
+        rgba
+    }
+
+    fn trim_of(
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        mask: i64,
+    ) -> Option<(u32, u32, u32, u32)> {
+        trim_bounds_with(width, height, mask, |x, y, w, h| {
+            let mut out = Vec::with_capacity((w as usize) * (h as usize) * 4);
+            for row in y..y + h {
+                let start = ((row as usize) * (width as usize) + x as usize) * 4;
+                out.extend_from_slice(&rgba[start..start + (w as usize) * 4]);
+            }
+            Ok(Surface {
+                width: w,
+                height: h,
+                rgba: out,
+            })
+        })
+        .expect("trim")
+    }
+
+    #[test]
+    fn banded_trim_matches_alpha_bounds() {
+        // 单带内。
+        let rgba = opaque_rect(10, 9, (3, 2, 6, 5));
+        assert_eq!(trim_of(10, 9, &rgba, 15), Some((3, 2, 6, 5)));
+        // 只裁上边:左右/下保持原尺寸。
+        assert_eq!(trim_of(10, 9, &rgba, 8), Some((0, 2, 9, 8)));
+        // 只裁右边:上/左/下保持原尺寸。
+        assert_eq!(trim_of(10, 9, &rgba, 1), Some((0, 0, 6, 8)));
+        // 全透明:保持原样(None 由调用方处理为不裁剪)。
+        let empty = vec![0u8; 10 * 9 * 4];
+        assert_eq!(trim_of(10, 9, &empty, 15), None);
+        // 内容贴边:裁掉 0 像素。
+        let full = opaque_rect(10, 9, (0, 0, 9, 8));
+        assert_eq!(trim_of(10, 9, &full, 15), Some((0, 0, 9, 8)));
+    }
+
+    #[test]
+    fn banded_trim_crosses_multiple_bands() {
+        // 200×200,内容 60×60 居中偏右下:四个方向都要跨过 64px 带。
+        let rgba = opaque_rect(200, 200, (70, 80, 129, 139));
+        assert_eq!(trim_of(200, 200, &rgba, 15), Some((70, 80, 129, 139)));
     }
 }

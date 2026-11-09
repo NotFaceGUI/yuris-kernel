@@ -76,6 +76,7 @@ fn table() -> ParamTable {
                     "SIZE2",
                     "SX",
                     "SY",
+                    "TRIM",
                 ],
             ),
             command("CGEND", &["ID"]),
@@ -137,6 +138,27 @@ fn state(viewport: Viewport, clear: [u8; 4]) -> GfxState {
 
 fn png_bytes_for(width: u32, height: u32, color: Rgba<u8>) -> Vec<u8> {
     let image = RgbaImage::from_pixel(width, height, color);
+    let mut out = Vec::new();
+    PngEncoder::new(&mut out)
+        .write_image(image.as_raw(), width, height, ExtendedColorType::Rgba8)
+        .expect("encode fixture");
+    out
+}
+
+/// 透明底 + 指定矩形不透明(测试 `TRIM` 的 alpha 边界)。
+fn png_bytes_rect(
+    width: u32,
+    height: u32,
+    rect: (u32, u32, u32, u32),
+    color: Rgba<u8>,
+) -> Vec<u8> {
+    let mut image = RgbaImage::from_pixel(width, height, Rgba([0, 0, 0, 0]));
+    let (x0, y0, x1, y1) = rect;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            image.put_pixel(x, y, color);
+        }
+    }
     let mut out = Vec::new();
     PngEncoder::new(&mut out)
         .write_image(image.as_raw(), width, height, ExtendedColorType::Rgba8)
@@ -381,6 +403,132 @@ fn full_copy_aliases_and_region_copy_blits() {
         0,
         "区域 COPY 的落点必须与 soft 一致"
     );
+}
+
+/// `TRIM` 作用在**快照**上:
+/// - 整幅 COPY2 是资产纹理的零拷贝别名 ⇒ 直接用资产 CPU 像素定边界,零读回;
+/// - 区域 COPY2 产生新纹理 ⇒ 快照在上一帧落地后,本帧四边窄带读回。
+/// 两条路径的像素/落点都必须与 soft 一致。
+#[test]
+fn trim_on_snapshot_matches_soft() {
+    let table = table();
+    let entries = [(
+        b"base.png".as_slice(),
+        png_bytes_rect(12, 12, (3, 2, 8, 7), Rgba([90, 160, 210, 255])),
+    )];
+    let create_layers = |frame: u64| {
+        vec![
+            VmEvent::FrameStart { frame },
+            call(
+                frame,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"A".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"base".to_vec())),
+                ],
+            ),
+            call(
+                frame,
+                "CG",
+                vec![
+                    arg(&table, "CG", "ID", Value::Str(b"D".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"base".to_vec())),
+                ],
+            ),
+        ]
+    };
+    let trim = |frame: u64| {
+        call(
+            frame,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"D".to_vec())),
+                arg(&table, "CGACT", "TRIM", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(15)),
+            ],
+        )
+    };
+
+    // 1) 整幅 COPY2:零拷贝别名 → 资产 CPU 边界,零读回。
+    {
+        let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+            return;
+        };
+        let mut soft = SoftRenderer::new(store(&entries));
+        let mut gfx = state(Viewport::new(12, 12), [0, 0, 0, 255]);
+        let mut events = create_layers(1);
+        events.push(call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"A".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"D".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+            ],
+        ));
+        events.push(trim(1));
+        events.push(VmEvent::FrameEnd { frame: 1 });
+        gfx.consume_events(&events);
+        let frame = gfx.frame();
+        let out = gpu.render_frame(&frame).expect("render");
+        assert_eq!(
+            gpu.render_phases().cpu_fallbacks,
+            0,
+            "整幅快照 TRIM 不得读回 GPU"
+        );
+        let soft_out = soft.render_frame(&frame);
+        assert_eq!(
+            max_channel_diff(&out.surface, &soft_out.surface),
+            0,
+            "整幅快照 TRIM 的像素与落点必须与 soft 一致"
+        );
+    }
+
+    // 2) 区域 COPY2:新纹理。第一帧让快照真实落地,第二帧再 TRIM
+    //    (同帧 COPY2→TRIM 的 GPU 表面尚未提交,读回只能读到旧内容)。
+    {
+        let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+            return;
+        };
+        let mut soft = SoftRenderer::new(store(&entries));
+        let mut gfx = state(Viewport::new(12, 12), [0, 0, 0, 255]);
+
+        let mut first = create_layers(1);
+        first.push(call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"A".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"D".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+                arg(&table, "CGACT", "X", Value::Int(1)),
+                arg(&table, "CGACT", "Y", Value::Int(1)),
+                arg(&table, "CGACT", "X2", Value::Int(10)),
+                arg(&table, "CGACT", "Y2", Value::Int(9)),
+            ],
+        ));
+        first.push(VmEvent::FrameEnd { frame: 1 });
+        gfx.consume_events(&first);
+        // 第一帧提交快照纹理(TRIM 尚未发生)。
+        let frame1 = gfx.frame();
+        gpu.render_frame(&frame1).expect("first frame");
+
+        let mut second = vec![VmEvent::FrameStart { frame: 2 }, trim(2)];
+        second.push(VmEvent::FrameEnd { frame: 2 });
+        gfx.consume_events(&second);
+        let frame2 = gfx.frame();
+        let out = gpu.render_frame(&frame2).expect("second frame");
+        assert!(
+            gpu.render_phases().cpu_fallbacks >= 1,
+            "区域快照 TRIM 必须走 GPU 边界读回"
+        );
+        let soft_out = soft.render_frame(&frame2);
+        assert_eq!(
+            max_channel_diff(&out.surface, &soft_out.surface),
+            0,
+            "区域快照 TRIM 的像素与落点必须与 soft 一致"
+        );
+    }
 }
 
 /// `MERGE2` 在 GPU 上执行并与 soft 逐像素一致(alpha 参与混合)。

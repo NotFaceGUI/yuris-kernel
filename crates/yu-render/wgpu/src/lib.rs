@@ -336,7 +336,10 @@ impl WgpuRenderer {
 
     /// 实际构造(`new_with_options` 与 `new_with_context` 共用)。
     fn from_context(textures: TextureStore, ctx: GpuContext) -> Result<Self, Diag> {
-        let pipelines = PipelineCache::new(&ctx)?;
+        let mut pipelines = PipelineCache::new(&ctx)?;
+        // 首次过渡/缩放/合成若现编译管线,在移动端会是一次可见尖峰;启动期
+        // 统一预热(失败不阻断,首次使用仍按原路径重试)。
+        pipelines.prewarm(&ctx);
         let gpu_text_enabled = std::env::var("YURIS_TEXT_GPU")
             .map(|v| {
                 !matches!(

@@ -78,6 +78,9 @@ pub struct TextureCache {
     asset_ids: BTreeMap<Vec<u8>, (u64, u64)>,
     /// 资产纹理 id 集合(反向判定用;逐字符清理文本纹理时不能扫资产表)。
     asset_texture_ids: std::collections::BTreeSet<u64>,
+    /// 纹理 id → 资产 key(反向查找;`TRIM` 遇到「资产整幅快照」时直接
+    /// 用 CPU 像素算边界,不必回读 GPU)。
+    asset_keys: BTreeMap<u64, Vec<u8>>,
     /// `YMV` 影片帧的 GPU 纹理槽(每资产固定 [`MOVIE_SLOTS`] 个,环形复用)。
     ///
     /// 影片帧数无上界(样例 306 帧 × 400×300),若按 `(资产, 帧)` 建纹理,
@@ -103,6 +106,7 @@ impl TextureCache {
             textures: BTreeMap::new(),
             asset_ids: BTreeMap::new(),
             asset_texture_ids: std::collections::BTreeSet::new(),
+            asset_keys: BTreeMap::new(),
             movie_slots: BTreeMap::new(),
             solid_id: None,
             solid_fills: BTreeMap::new(),
@@ -135,6 +139,7 @@ impl TextureCache {
                 continue;
             };
             self.asset_texture_ids.remove(&id);
+            self.asset_keys.remove(&id);
             // 摘掉 pin 之后 `remove` 才会真的删。
             if self.textures.remove(&id).is_some() {
                 pipelines.forget_texture(id);
@@ -150,6 +155,11 @@ impl TextureCache {
 
     pub fn asset_id(&self, key: &[u8]) -> Option<u64> {
         self.asset_ids.get(key).map(|(id, _)| *id)
+    }
+
+    /// 纹理 id → 资产 key(仅资产纹理;`TRIM` 免读回用)。
+    pub fn asset_key_for_id(&self, id: u64) -> Option<&[u8]> {
+        self.asset_keys.get(&id).map(Vec::as_slice)
     }
 
     /// 解析并上传一个资产;已上传且内容未变时直接返回 id。
@@ -211,6 +221,7 @@ impl TextureCache {
             // `clear_transient` 会删除并 `forget_texture` 作废旧 view;
             // 本次直接上传新纹理,不在这里动 bind group 缓存。
             self.asset_texture_ids.remove(&id);
+            self.asset_keys.remove(&id);
             self.asset_ids.remove(key);
         }
         let bytes = texture.rgba.len();
@@ -219,6 +230,7 @@ impl TextureCache {
         let upload_us = started.elapsed().as_micros() as u64;
         self.asset_ids.insert(key.to_vec(), (uploaded, generation));
         self.asset_texture_ids.insert(uploaded);
+        self.asset_keys.insert(uploaded, key.to_vec());
         self.asset_upload_bytes = self.asset_upload_bytes.saturating_add(bytes as u64);
         if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
             log::warn!(

@@ -225,6 +225,46 @@ enum TransitionVariant {
 }
 
 impl PipelineCache {
+    /// 启动期把常用管线全部编译好(首次过渡/缩放/合成的驱动编译尖峰前移)。
+    ///
+    /// 失败不阻断启动:对应路径首次使用时仍会重试,并按原逻辑记诊断。
+    /// `YURIS_PIPELINE_PREWARM=0` 可关闭(对比启动耗时用)。
+    pub fn prewarm(&mut self, ctx: &GpuContext) {
+        if std::env::var("YURIS_PIPELINE_PREWARM").is_ok_and(|v| {
+            matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")
+        }) {
+            return;
+        }
+        let mut failures = 0u32;
+        macro_rules! warm {
+            ($call:expr) => {
+                if $call.is_err() {
+                    failures += 1;
+                }
+            };
+        }
+        warm!(self.ensure_lerp_pipeline(ctx));
+        warm!(self.ensure_resample_pipeline(ctx));
+        warm!(self.ensure_layer_merge_pipeline(ctx));
+        warm!(self.ensure_composite_pipeline(ctx));
+        warm!(self.ensure_transform_pipeline(ctx));
+        warm!(self.ensure_scale_pipeline(ctx, ScaleFilter::Sharp));
+        warm!(self.ensure_scale_pipeline(ctx, ScaleFilter::Bicubic));
+        warm!(self.ensure_paint_pipeline(ctx, false));
+        warm!(self.ensure_paint_pipeline(ctx, true));
+        warm!(self.ensure_merge_pipeline(ctx, false));
+        warm!(self.ensure_merge_pipeline(ctx, true));
+        // 过渡变体按 blend 模式缓存;只预热最常用的 Normal,避免 36 条管线。
+        warm!(self.ensure_psc_pipeline(ctx, BlendMode::Normal));
+        warm!(self.ensure_psd_pipeline(ctx, BlendMode::Normal));
+        if failures > 0 {
+            log::debug!(
+                target: "yu-render",
+                "[pipeline] prewarm 有 {failures} 条失败(首次使用时会重试并照常记诊断)"
+            );
+        }
+    }
+
     pub fn new(ctx: &GpuContext) -> Result<Self, Diag> {
         let shader = ctx
             .device

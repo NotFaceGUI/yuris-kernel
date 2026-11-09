@@ -37,6 +37,11 @@ use crate::pipelines::{FilterKind, PipelineCache};
 use crate::surfaces::{Content, Contents, LayerSurfaces, TexRef};
 use crate::textures::{DeferredSnapshot, TargetSet, TextureCache, Vertex};
 
+/// 单条图像加工超过这个时长无条件留痕(约一帧,用于移动端现场)。
+const SLOW_OP_WARN_US: u64 = 20_000;
+/// `YURIS_TICK_SPLIT` 诊断档的低阈值。
+const SLOW_OP_TRACE_US: u64 = 5_000;
+
 /// 一帧的读者集合(延迟物化的门禁)。
 ///
 /// - `layers`:被屏幕/离屏绘制或当作图像/复制源/目标的层;
@@ -843,6 +848,7 @@ fn apply_image(
             sync(source2, None);
         }
     }
+    let resolve_started = std::time::Instant::now();
     let source = resolve_source(
         ctx,
         frame,
@@ -878,6 +884,7 @@ fn apply_image(
         )?),
         None => None,
     };
+    let resolve_us = resolve_started.elapsed().as_micros() as u64;
     // 自引用(`ID` == 目标)时结果由**已应用前缀**决定,而前缀本身由
     // `applied` 逐项核对;签名里必须用稳定的基面身份,不能用本帧内容的
     // 修订号(否则第一帧「基面→物化」会让签名漂移,前缀永远命中不了)。
@@ -936,15 +943,21 @@ fn apply_image(
         image, source, source2, force_bilinear_scale,
     )?;
     let op_us = op_started.elapsed().as_micros() as u64;
-    if op_us >= 5_000 && std::env::var_os("YURIS_TICK_SPLIT").is_some() {
+    // ≥20ms 无条件留痕(移动端首帧/首次 TRIM/大资产解码的现场);5ms 以上
+    // 仅在 `YURIS_TICK_SPLIT` 诊断档打印。
+    if op_us >= SLOW_OP_WARN_US
+        || resolve_us >= SLOW_OP_WARN_US
+        || (op_us >= SLOW_OP_TRACE_US && std::env::var_os("YURIS_TICK_SPLIT").is_some())
+    {
         log::warn!(
             target: "yu-kernel",
-            "[slowop] action={} target={} src={}x{} tex={} cpu_fb={} {}us",
+            "[slowop] action={} target={} src={}x{} tex={} resolve={}us cpu_fb={} total={}us",
             image.action.name(),
             target.display(),
             source_dims.0,
             source_dims.1,
             source_dims.2,
+            resolve_us,
             surfaces.stats().cpu_fallbacks.saturating_sub(cpu_before),
             op_us
         );
@@ -1930,9 +1943,17 @@ fn apply_image_pixels(
         // TBDR 上等于「全部 tile 刷回主存」,真机实测 100~291ms/次
         // (`phases.image=291740us`) —— 这是「角色一出来就卡」的直接原因。
         //
-        // 取不到资产 key(快照/离屏/合成结果)时**回退整图读回**:那些来源
-        // 的像素只存在于 GPU,保底路径、低频。
-        let bounds = match source_asset_key(frame, target) {
+        // 取不到资产 key(快照/离屏/合成结果)时先看**内容纹理本身**是否
+        // 就是一张资产纹理:整幅 COPY2 是零拷贝别名,快照图层拿到的
+        // `base.tex` 仍是资产纹理。这种情况直接用已解码的 CPU 像素算边界
+        // (免 GPU 读回);只有区域复制/合成结果才走四边窄带读回。
+        // 资产 CPU 像素已被预算回收时(`resident == false`)不重新解码,
+        // 改读 GPU —— 避免在渲染线程上再付一次解码成本。
+        let asset_key = source_asset_key(frame, target).or_else(|| {
+            let key = gpu.asset_key_for_id(base.tex.id)?;
+            textures.resident(key).then_some(key)
+        });
+        let bounds = match asset_key {
             Some(key) => match textures.trim_bounds(key, set) {
                 Some(b) => (
                     i64::from(b.0),
@@ -1953,16 +1974,35 @@ fn apply_image_pixels(
                     };
                     b
                 } else {
-                    let surface =
-                        crate::readback::read_texture(ctx, &base.tex.texture, width, height)
-                            .map_err(|diag| diag.code.to_string())?;
+                    let bounds = crate::readback::trim_bounds(
+                        ctx,
+                        &base.tex.texture,
+                        width,
+                        height,
+                        set,
+                    )
+                    .map_err(|diag| diag.code.to_string())?;
                     surfaces.stats_mut().cpu_fallbacks += 1;
-                    let bounds = trim_box(&surface, width, height, set);
-                    surfaces.set_content_trim_bounds(key, bounds);
+                    surfaces.set_content_trim_bounds(
+                        key,
+                        bounds.map(|(x0, y0, x1, y1)| {
+                            (
+                                i64::from(x0),
+                                i64::from(y0),
+                                i64::from(x1),
+                                i64::from(y1),
+                            )
+                        }),
+                    );
                     let Some(b) = bounds else {
                         return Ok(());
                     };
-                    b
+                    (
+                        i64::from(b.0),
+                        i64::from(b.1),
+                        i64::from(b.2),
+                        i64::from(b.3),
+                    )
                 }
             }
         };
@@ -3463,55 +3503,17 @@ fn content_region(content: &Content) -> (i64, i64, i64, i64) {
     (x0, y0, x1, y1)
 }
 
-/// `TRIM` 的 alpha 包围盒(与 soft `apply_trim` 同规则:位掩码 8=上/4=下/
-/// 2=左/1=右,只裁完全透明的行/列)。
 /// 该层的当前纹理是否直接来自一个**资产**(`TextureRef::Asset`)。
 ///
 /// 只有这种情况能用 `TextureStore` 里那份 CPU 像素算 `TRIM` 边界;
-/// 快照/离屏/影片的像素只存在于 GPU,必须回退读回。
+/// 快照/离屏/影片的像素只存在于 GPU,必须回退读回(见
+/// `readback::trim_bounds` 的四边窄带扫描)。
 fn source_asset_key<'a>(frame: &'a CompositorFrame, id: &LayerId) -> Option<&'a [u8]> {
     let layer = frame.layers.iter().find(|layer| &layer.id == id)?;
     match &layer.texture {
         TextureRef::Asset(key) if !key.is_empty() => Some(key.as_slice()),
         _ => None,
     }
-}
-
-fn trim_box(surface: &Surface, width: u32, height: u32, mask: i64) -> Option<(i64, i64, i64, i64)> {
-    if width == 0 || height == 0 {
-        return None;
-    }
-    let alpha = |x: u32, y: u32| -> u8 {
-        surface.rgba[((y as usize) * (width as usize) + x as usize) * 4 + 3]
-    };
-    let row_empty = |y: u32| (0..width).all(|x| alpha(x, y) == 0);
-    let col_empty = |x: u32| (0..height).all(|y| alpha(x, y) == 0);
-    let (mut x0, mut y0) = (0i64, 0i64);
-    let (mut x1, mut y1) = (i64::from(width) - 1, i64::from(height) - 1);
-    if mask & 8 != 0 {
-        while y0 <= y1 && row_empty(y0 as u32) {
-            y0 += 1;
-        }
-    }
-    if mask & 4 != 0 {
-        while y1 >= y0 && row_empty(y1 as u32) {
-            y1 -= 1;
-        }
-    }
-    if mask & 2 != 0 {
-        while x0 <= x1 && col_empty(x0 as u32) {
-            x0 += 1;
-        }
-    }
-    if mask & 1 != 0 {
-        while x1 >= x0 && col_empty(x1 as u32) {
-            x1 -= 1;
-        }
-    }
-    if x0 > x1 || y0 > y1 {
-        return None;
-    }
-    Some((x0, y0, x1, y1))
 }
 
 fn fnv_mix(hash: &mut u64, value: u64) {
