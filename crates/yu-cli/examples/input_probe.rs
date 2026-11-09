@@ -167,10 +167,24 @@ fn run() -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     engine.set_timeline(probe.timeline());
 
+    // `YURIS_PROBE_FPS=60`:按固定墙钟步长推进,让逻辑时间与桌面 60fps
+    // 一致(标题淡入/WAIT 都按真实时间走)。缺省不睡,尽快跑完。
+    let pace = std::env::var("YURIS_PROBE_FPS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|fps| *fps > 0.0);
+    let paced_start = std::time::Instant::now();
     let mut ticks = 0u32;
     for _ in 0..probe.frames {
         let rendered = engine.tick().map_err(|error| error.to_string())?;
         ticks += 1;
+        if let Some(fps) = pace {
+            let due = std::time::Duration::from_secs_f64(ticks as f64 / fps);
+            let elapsed = paced_start.elapsed();
+            if due > elapsed {
+                std::thread::sleep(due - elapsed);
+            }
+        }
         let frame = rendered.report.frame;
         for (at, path) in &probe.shots {
             if *at == frame {
@@ -221,6 +235,14 @@ fn run() -> Result<(), String> {
                         line.push_str(&format!(" | missing {}", m.detail.replace('\n', " ")));
                     }
                     println!("{line}");
+                }
+            }
+        }
+        if let Ok(every) = std::env::var("YURIS_RES_EVERY") {
+            let every = every.parse::<u64>().unwrap_or(0);
+            if every > 0 && frame % every == 0 {
+                if let Some(snapshot) = engine.render_resource_snapshot() {
+                    println!("res frame={frame} {snapshot}");
                 }
             }
         }

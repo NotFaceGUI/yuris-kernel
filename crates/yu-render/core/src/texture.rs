@@ -102,6 +102,56 @@ struct Cached {
     result: Result<std::rc::Rc<Texture>, Diag>,
 }
 
+/// 预取 worker 的一条解码请求。
+///
+/// 读包仍在主线程(`DataSource` 不是 `Send`),worker 只负责 CPU 解码 ——
+/// 解码是 `preload` 耗时的绝对大头(见 `decode_with_image` 注释:实测 >95%)。
+/// 这样既不共享 VFS,也不改变任何一帧的像素。
+struct PrefetchJob {
+    key: Vec<u8>,
+    resolved: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
+/// 预取 worker 的解码结果。
+struct PrefetchDone {
+    key: Vec<u8>,
+    resolved: Vec<u8>,
+    result: Result<Texture, String>,
+}
+
+/// 预取池条目(`Rc` 共享给缓存时零拷贝)。
+struct Prefetched {
+    tex: std::rc::Rc<Texture>,
+    resolved: Vec<u8>,
+    used: u64,
+}
+
+/// 持久解码线程 + 待完成集合。
+///
+/// `YURIS_PREFETCH=1` 时才创建;关闭时整个结构不存在,`TextureStore` 的
+/// 行为与未引入预取前完全一致。
+struct PrefetchWorker {
+    /// `Option` 只为 `Drop` 时主动断开:发送端全丢 ⇒ worker 的 `recv` 退出。
+    jobs: Option<std::sync::mpsc::Sender<PrefetchJob>>,
+    done: std::sync::mpsc::Receiver<PrefetchDone>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    /// 已提交、尚未取回结果的 key。
+    pending: std::collections::BTreeSet<Vec<u8>>,
+}
+
+impl Drop for PrefetchWorker {
+    fn drop(&mut self) {
+        self.jobs.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// 同时挂起的预取上限:防止一次脚本扫描把整章资产全塞进队列。
+const PREFETCH_MAX_PENDING: usize = 32;
+
 /// 纹理解析 + 缓存。
 ///
 /// 缓存键是原始资产 key,因此同一 key 的重复引用只解码一次。失败的条目也
@@ -163,6 +213,19 @@ pub struct TextureStore {
     /// 这里同样只读一次包。`Rc` 共享,克隆 O(1);缺失/坏容器也缓存,
     /// 避免每帧重读重解析。
     movies: BTreeMap<Vec<u8>, MovieSlot>,
+    /// 预取 worker(`YURIS_PREFETCH=1` 才存在;默认关闭)。
+    prefetch: Option<PrefetchWorker>,
+    /// 已解码、尚未被主缓存采用的纹理(独立预算,LRU 淘汰)。
+    prefetch_pool: BTreeMap<Vec<u8>, Prefetched>,
+    prefetch_bytes: usize,
+    prefetch_budget_bytes: usize,
+    prefetch_clock: u64,
+    /// 预取命中(从池提升进主缓存)次数。
+    prefetch_hits: u64,
+    /// worker 完成但结果未被采用(已缓存/超预算)的数量。
+    prefetch_dropped: u64,
+    /// worker 解码失败的数量(失败不入池,主路径照常重试并产诊断)。
+    prefetch_errors: u64,
 }
 
 /// 一个影片资产的常驻状态(见 [`TextureStore::movie_container`])。
@@ -199,6 +262,28 @@ impl TextureStore {
             .unwrap_or(512);
         let name_fallback = std::env::var("YURIS_ASSET_NAME_FALLBACK")
             .map_or(true, |v| !matches!(v.trim(), "0" | "off" | "false"));
+        // 预取默认关:`YURIS_PREFETCH=1` 才启动解码线程。预取只改变
+        // 准备时机;没赶上时 `ensure` 仍走原来的同步解码,像素不受影响。
+        let prefetch_on = std::env::var("YURIS_PREFETCH")
+            .map_or(false, |v| !matches!(v.trim(), "" | "0" | "off" | "false"));
+        let prefetch_mb = std::env::var("YURIS_PREFETCH_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(128);
+        let prefetch = if prefetch_on {
+            match Self::spawn_prefetch_worker() {
+                Ok(worker) => Some(worker),
+                Err(err) => {
+                    log::warn!(
+                        target: "yu-render",
+                        "[asset] prefetch worker 启动失败,退回全同步装载: {err}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Self {
             source,
             codec,
@@ -223,7 +308,216 @@ impl TextureStore {
             name_fallback_hits: 0,
             movie_keeper: BTreeMap::new(),
             movies: BTreeMap::new(),
+            prefetch,
+            prefetch_pool: BTreeMap::new(),
+            prefetch_bytes: 0,
+            prefetch_budget_bytes: prefetch_mb.saturating_mul(1024 * 1024),
+            prefetch_clock: 0,
+            prefetch_hits: 0,
+            prefetch_dropped: 0,
+            prefetch_errors: 0,
         }
+    }
+
+    fn spawn_prefetch_worker() -> std::io::Result<PrefetchWorker> {
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<PrefetchJob>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<PrefetchDone>();
+        let handle = std::thread::Builder::new()
+            .name("yu-asset-prefetch".to_string())
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let result = std::panic::catch_unwind(|| decode_asset(&job.bytes))
+                        .unwrap_or_else(|_| Err("预取解码线程 panic".to_string()));
+                    if done_tx
+                        .send(PrefetchDone {
+                            key: job.key,
+                            resolved: job.resolved,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })?;
+        Ok(PrefetchWorker {
+            jobs: Some(job_tx),
+            done: done_rx,
+            handle: Some(handle),
+            pending: std::collections::BTreeSet::new(),
+        })
+    }
+
+    /// 预取是否生效(`YURIS_PREFETCH=1` 且 worker 启动成功)。
+    #[must_use]
+    pub fn prefetch_enabled(&self) -> bool {
+        self.prefetch.is_some()
+    }
+
+    /// 测试/宿主显式开关预取(默认跟随 `YURIS_PREFETCH`)。
+    pub fn set_prefetch_enabled(&mut self, enabled: bool) {
+        if enabled == self.prefetch.is_some() {
+            return;
+        }
+        if enabled {
+            match Self::spawn_prefetch_worker() {
+                Ok(worker) => self.prefetch = Some(worker),
+                Err(err) => log::warn!(
+                    target: "yu-render",
+                    "[asset] prefetch worker 启动失败,保持全同步装载: {err}"
+                ),
+            }
+        } else {
+            self.prefetch = None;
+            self.prefetch_pool.clear();
+            self.prefetch_bytes = 0;
+        }
+    }
+
+    /// 预取池字节预算(0 = 不保留预取结果)。
+    pub fn set_prefetch_budget_bytes(&mut self, bytes: usize) {
+        self.prefetch_budget_bytes = bytes;
+        self.evict_prefetch();
+    }
+
+    /// 预取诊断:`(命中, 丢弃, 解码失败, 池内字节, 挂起数)`。
+    #[must_use]
+    pub fn prefetch_stats(&self) -> (u64, u64, u64, usize, usize) {
+        (
+            self.prefetch_hits,
+            self.prefetch_dropped,
+            self.prefetch_errors,
+            self.prefetch_bytes,
+            self.prefetch.as_ref().map_or(0, |w| w.pending.len()),
+        )
+    }
+
+    /// 提交一批**可能要用**的资产 key。
+    ///
+    /// 只读取原始字节并交给后台解码;不写 `cache`、不改诊断、不改 GPU。
+    /// 已缓存/已在预取池/已在队列中的 key 跳过。读包失败(缺资产/坏路径)
+    /// 直接忽略 —— 真正的 `CG[FILE]` 到来时仍按原路径产 `asset.*`。
+    /// 返回本次提交的 key 数。
+    pub fn prefetch_request(&mut self, keys: &[Vec<u8>]) -> u64 {
+        if self.prefetch.is_none() {
+            return 0;
+        }
+        self.drain_prefetch();
+        let mut queued = 0u64;
+        for key in keys {
+            if self.cache.contains_key(key) || self.prefetch_pool.contains_key(key) {
+                continue;
+            }
+            let Some(worker) = self.prefetch.as_ref() else {
+                break;
+            };
+            if worker.pending.contains(key) {
+                continue;
+            }
+            if worker.pending.len() >= PREFETCH_MAX_PENDING {
+                break;
+            }
+            let (resolved, bytes) = match self.read_source(key) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let Some(worker) = self.prefetch.as_mut() else {
+                break;
+            };
+            let sent = worker
+                .jobs
+                .as_ref()
+                .is_some_and(|jobs| jobs.send(PrefetchJob {
+                    key: key.clone(),
+                    resolved,
+                    bytes,
+                }).is_ok());
+            if sent {
+                worker.pending.insert(key.clone());
+                queued += 1;
+            }
+        }
+        queued
+    }
+
+    /// 取回已完成的后台解码结果,放进预取池(非阻塞)。
+    fn drain_prefetch(&mut self) {
+        if self.prefetch.is_none() {
+            return;
+        }
+        let mut done = Vec::new();
+        if let Some(worker) = self.prefetch.as_mut() {
+            while let Ok(result) = worker.done.try_recv() {
+                worker.pending.remove(&result.key);
+                done.push(result);
+            }
+        }
+        for result in done {
+            match result.result {
+                Ok(texture) => {
+                    if self.cache.contains_key(&result.key) {
+                        // 主路径已抢先同步解码:丢掉重复结果。
+                        self.prefetch_dropped += 1;
+                        continue;
+                    }
+                    let bytes = texture.rgba.len();
+                    if self.prefetch_budget_bytes == 0 || bytes > self.prefetch_budget_bytes {
+                        self.prefetch_dropped += 1;
+                        continue;
+                    }
+                    self.prefetch_clock = self.prefetch_clock.wrapping_add(1);
+                    let entry = Prefetched {
+                        tex: std::rc::Rc::new(texture),
+                        resolved: result.resolved,
+                        used: self.prefetch_clock,
+                    };
+                    if let Some(old) = self.prefetch_pool.insert(result.key, entry) {
+                        self.prefetch_bytes = self.prefetch_bytes.saturating_sub(old.tex.rgba.len());
+                    }
+                    self.prefetch_bytes = self.prefetch_bytes.saturating_add(bytes);
+                    self.evict_prefetch();
+                }
+                // 失败不入池:真正用到时按原路径重新解码并产出诊断,
+                // 诊断时刻与内容与未开预取时完全一致。
+                Err(_) => self.prefetch_errors += 1,
+            }
+        }
+    }
+
+    /// 预取池按 LRU + 字节预算淘汰。
+    fn evict_prefetch(&mut self) {
+        while self.prefetch_bytes > self.prefetch_budget_bytes {
+            let Some(key) = self
+                .prefetch_pool
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(entry) = self.prefetch_pool.remove(&key) {
+                self.prefetch_bytes = self.prefetch_bytes.saturating_sub(entry.tex.rgba.len());
+                self.prefetch_dropped += 1;
+            }
+        }
+    }
+
+    /// 预取池命中 ⇒ 提升进主缓存(零解码)。`false` = 未命中。
+    fn promote_prefetch(&mut self, key: &[u8]) -> bool {
+        let Some(entry) = self.prefetch_pool.remove(key) else {
+            return false;
+        };
+        self.prefetch_bytes = self.prefetch_bytes.saturating_sub(entry.tex.rgba.len());
+        self.decoded += 1;
+        self.prefetch_hits += 1;
+        self.insert_cached(
+            key.to_vec(),
+            Cached {
+                resolved: Some(entry.resolved),
+                result: Ok(entry.tex),
+            },
+        );
+        true
     }
 
     /// 开关名称编码回退(测试/宿主诊断)。
@@ -384,6 +678,8 @@ impl TextureStore {
         self.issues.clear();
         self.decode_us = 0;
         self.decode_bytes = 0;
+        // 预取结果先进池(不改变缓存的淘汰豁免窗口)。
+        self.drain_prefetch();
         self.enforce_budget(true);
         self.fresh.clear();
     }
@@ -479,8 +775,12 @@ impl TextureStore {
     /// 确保 key 已有缓存条目(成功/失败都会缓存,避免重复探测)。
     fn ensure(&mut self, key: &[u8]) -> Result<(), Diag> {
         if !self.cache.contains_key(key) {
-            let cached = self.load(key);
-            self.insert_cached(key.to_vec(), cached);
+            // 预取池命中:直接采用,免一次同步解码;没赶上就按原路径解码。
+            self.drain_prefetch();
+            if !self.promote_prefetch(key) {
+                let cached = self.load(key);
+                self.insert_cached(key.to_vec(), cached);
+            }
         }
         Ok(())
     }
@@ -1056,6 +1356,13 @@ impl TextureStore {
     /// 官方 `CG[FILE]` 在命令处理体内同步装载；这里只缩小同一命令批次的
     /// 墙钟，不改变“命令所在帧完成”的语义。
     pub fn preload_parallel(&mut self, keys: &[Vec<u8>]) {
+        // 后台已经解好的资产直接采用;其余仍按原路径并行解码。
+        self.drain_prefetch();
+        for key in keys {
+            if !self.cache.contains_key(key) {
+                self.promote_prefetch(key);
+            }
+        }
         let mut jobs = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for key in keys {
@@ -1517,6 +1824,90 @@ mod tests {
             source.insert(path, bytes.clone()).expect("insert");
         }
         TextureStore::new(Box::new(source), Codec::Cp932, order)
+    }
+
+    /// 等后台预取把已提交的 key 全部取回。超时后继续(测试断言会暴露
+    /// 预取是否真正生效;不允许"等不到就算过")。
+    fn wait_prefetch_idle(store: &mut TextureStore) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            store.drain_prefetch();
+            let idle = store
+                .prefetch
+                .as_ref()
+                .is_some_and(|worker| worker.pending.is_empty());
+            if idle {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn prefetch_decodes_off_thread_and_promotes_without_second_decode() {
+        let mut store = store(&[(b"img/foo.png", png_2x1())], vec![ImageFormat::Png]);
+        store.set_prefetch_enabled(false);
+        assert_eq!(
+            store.prefetch_request(&[b"img/foo".to_vec()]),
+            0,
+            "预取关闭时不得提交任何任务"
+        );
+        assert!(!store.prefetch_enabled());
+
+        store.set_prefetch_enabled(true);
+        assert!(store.prefetch_enabled());
+        assert_eq!(store.prefetch_request(&[b"img/foo".to_vec()]), 1);
+        wait_prefetch_idle(&mut store);
+        let (hits, dropped, errors, bytes, pending) = store.prefetch_stats();
+        assert_eq!((hits, dropped, errors, pending), (0, 0, 0, 0));
+        assert!(bytes > 0, "后台结果必须进入预取池");
+        assert_eq!(store.cache_len(), 0, "预取不得提前写主缓存");
+
+        // 主路径采用预取结果:像素与同步解码一致,且不再解码第二次。
+        let tex = store.resolve(b"img/foo").expect("resolve");
+        assert_eq!((tex.width, tex.height), (2, 1));
+        assert_eq!(tex.pixel(0, 0), Some([255, 0, 0, 255]));
+        assert_eq!(tex.pixel(1, 0), Some([0, 255, 0, 128]));
+        assert_eq!(store.resolved_path(b"img/foo"), Some(b"img/foo.png".as_slice()));
+        assert_eq!(store.decoded_count(), 1);
+        assert_eq!(store.prefetch_stats().0, 1);
+        let _ = store.resolve(b"img/foo").expect("cached");
+        assert_eq!(store.decoded_count(), 1, "第二次必须命中主缓存");
+    }
+
+    #[test]
+    fn prefetch_miss_falls_back_to_sync_load() {
+        let mut store = store(&[], vec![ImageFormat::Png]);
+        store.set_prefetch_enabled(true);
+        // 缺失/坏 key 不提交(读包失败直接忽略,不污染诊断)。
+        assert_eq!(store.prefetch_request(&[b"img/missing".to_vec()]), 0);
+        assert!(store.resolve(b"img/missing").is_err());
+        assert_eq!(store.prefetch_stats().2, 0, "读包失败不得计入解码失败");
+    }
+
+    #[test]
+    fn prefetch_budget_drops_results_but_sync_path_still_works() {
+        let mut store = store(
+            &[
+                (b"img/a.png", png_solid([1, 2, 3, 255])),
+                (b"img/b.png", png_solid([4, 5, 6, 255])),
+            ],
+            vec![ImageFormat::Png],
+        );
+        store.set_prefetch_enabled(true);
+        store.set_prefetch_budget_bytes(1);
+        assert_eq!(
+            store.prefetch_request(&[b"img/a".to_vec(), b"img/b".to_vec()]),
+            2
+        );
+        wait_prefetch_idle(&mut store);
+        assert_eq!(store.prefetch_stats().3, 0, "超预算结果不得留在池里");
+        assert!(store.prefetch_stats().1 >= 1, "超预算必须计入丢弃");
+        assert_eq!(store.cache_len(), 0);
+        // 预取被丢弃不改变正确性:主路径照常同步解码。
+        let tex = store.resolve(b"img/a").expect("sync fallback");
+        assert_eq!(tex.pixel(0, 0), Some([1, 2, 3, 255]));
+        assert_eq!(store.prefetch_stats().0, 0, "这次不是预取命中");
     }
 
     #[test]

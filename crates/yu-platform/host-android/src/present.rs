@@ -409,6 +409,16 @@ mod inner {
             _height: u32,
             bound: &mut Option<(u64, u32, u32)>,
         ) -> Result<(), PresentError> {
+            // 自愈:旋转/分屏/首帧布局完成前,Java 侧的 `nativeResizeSurface`
+            // 可能按旧尺寸(甚至 1×1)配置了交换链。每帧核对原生窗口的实际
+            // 尺寸,不一致就重配 —— 否则画面会按旧宽高比缩到屏幕一侧。
+            let window = (
+                ndk_width(self.window.0).max(1),
+                ndk_height(self.window.0).max(1),
+            );
+            if window != (self.config.width, self.config.height) {
+                self.resize(window.0, window.1)?;
+            }
             // 引擎屏幕纹理的代际键变化时才重建视图/绑定组。
             if bound.map(|(bound_id, _, _)| bound_id) != Some(id) || self.bind_group.is_none() {
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());

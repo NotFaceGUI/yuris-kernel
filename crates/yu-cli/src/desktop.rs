@@ -211,6 +211,10 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         reconcile,
         // 桌面宿主始终渲染(窗口就是产品本身)。
         render: true,
+        // 桌面性能特性走环境变量(YURIS_PREFETCH / YURIS_SNAPSHOT_DEFER)。
+        prefetch: None,
+        snapshot_defer: None,
+        bilinear_scale: None,
         // GPU 上下文由宿主自建(桌面不注入,走引擎内默认创建)。
         gpu_context: None,
         save_root,

@@ -237,6 +237,11 @@ pub struct WgpuRenderer {
     snapshot_registry: Rc<RefCell<BTreeMap<CopyId, Rc<surfaces::TexRef>>>>,
     /// 最近一帧的阶段耗时(性能取证;不进入 `RenderReport` 的对账字段)。
     last_phases: yu_render_core::RenderPhases,
+    /// 手机画质选项:把 `SIZE`(官方最近邻)也按双线性采样。
+    ///
+    /// 默认 false(与官方一致);Android 壳可在配置页开启,缓解高 DPI 屏幕
+    /// 上 CG/差分缩放的锯齿。见 `DIV-GFX-083-mobile-bilinear-size`。
+    force_bilinear_scale: bool,
 }
 
 impl WgpuRenderer {
@@ -273,6 +278,32 @@ impl WgpuRenderer {
             }
         }
         (keys.len() as u64, errors)
+    }
+
+    /// 预取(默认关闭):只解 CPU 像素进预取池,不上传 GPU。真正的
+    /// `CG[FILE]` 到来时 `preload_assets` 命中池再上传,像素与路径不变。
+    pub fn prefetch_assets(&mut self, keys: &[Vec<u8>]) -> u64 {
+        self.textures.prefetch_request(keys)
+    }
+
+    /// 预取是否生效。
+    pub fn prefetch_enabled(&self) -> bool {
+        self.textures.prefetch_enabled()
+    }
+
+    /// 开关快照延迟物化(默认跟随 `YURIS_SNAPSHOT_DEFER`;测试/宿主用)。
+    pub fn set_defer_snapshots(&mut self, enabled: bool) {
+        self.targets.set_defer_enabled(enabled);
+    }
+
+    /// 快照延迟物化是否生效。
+    pub fn defer_snapshots_enabled(&self) -> bool {
+        self.targets.defer_enabled()
+    }
+
+    /// 开启/关闭 `SIZE` 的双线性采样(手机画质选项;默认关闭 = 官方最近邻)。
+    pub fn set_force_bilinear_scale(&mut self, enabled: bool) {
+        self.force_bilinear_scale = enabled;
     }
 
     /// 刷新快照句柄表(主渲染提交之后调用;供下一次 SAVE[ID] 按需读回)。
@@ -350,6 +381,7 @@ impl WgpuRenderer {
             text_gpu,
             snapshot_registry: Rc::new(RefCell::new(BTreeMap::new())),
             last_phases: yu_render_core::RenderPhases::default(),
+            force_bilinear_scale: false,
         })
     }
 
@@ -602,18 +634,31 @@ impl WgpuRenderer {
     /// - `pooled/pooled_bytes`:池里空闲纹理;池只增不减也会吃显存。
     /// - `live_surfaces/live_bytes`:常驻层表面。
     /// - `composites/offscreen/snapshots`:合成目标/离屏/快照数。
+    /// - `dd/dfr`:同帧快照去重次数 / 延迟物化登记数(见 `DIV-GFX-082`)。
+    /// - `atlas`:字形图集 `页/字形/命中/未命中/淘汰`。
+    /// - `pf`:预取池 `命中/解码失败/占用MB/挂起`(`YURIS_PREFETCH=1` 才有值)。
     pub fn resource_snapshot(&self) -> String {
         let s = self.surfaces.stats();
         let (composites, offscreen, snapshots) = self.targets.resource_counts();
+        let atlas = self
+            .text_gpu
+            .as_ref()
+            .map_or_else(|| "-".to_string(), |text| text.atlas_stats());
+        let (pf_hits, _, pf_errors, pf_bytes, pf_pending) = self.textures.prefetch_stats();
         format!(
-            "created={} reused={} released={} mat={} passes={} blits={} \
-             live={}/{}MB pooled={}/{}MB comps={} off={} snap={} bg={} vram={}MB",
+            "created={} reused={} released={} mat={} passes={} blits={} dd={} dfr={} \
+             dsw={} tel={} live={}/{}MB pooled={}/{}MB comps={} off={} snap={} \
+             bg={} atlas={} pf={}h/{}e/{}MB/{}p vram={}MB",
             s.created,
             s.reused,
             s.released,
             s.materialized,
             s.surface_passes,
             s.blits,
+            s.snapshot_deduped,
+            s.snapshots_deferred,
+            s.dead_writes,
+            s.transitions_elided,
             s.live_surfaces,
             s.live_bytes / (1024 * 1024),
             s.pooled,
@@ -622,6 +667,11 @@ impl WgpuRenderer {
             offscreen,
             snapshots,
             self.pipelines.bind_group_count(),
+            atlas,
+            pf_hits,
+            pf_errors,
+            pf_bytes / (1024 * 1024),
+            pf_pending,
             self.target_bytes() / (1024 * 1024),
         )
     }
@@ -732,6 +782,7 @@ impl WgpuRenderer {
             &mut self.backbuffer_gpu,
             &mut self.text,
             &mut self.text_gpu,
+            self.force_bilinear_scale,
         )?;
         let t_plan = started.elapsed();
 

@@ -47,12 +47,6 @@ impl ErrBuf {
         }
     }
 
-    fn as_str(&self) -> String {
-        if self.len == 0 {
-            return "未知错误".to_string();
-        }
-        String::from_utf8_lossy(&self.text[..self.len]).into_owned()
-    }
 }
 
 /// libpng 错误回调:写入 `ErrBuf` 后不返回(longjmp 由 `setjmp` 接管)。

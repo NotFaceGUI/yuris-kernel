@@ -70,6 +70,12 @@ public final class MainActivity extends Activity
     static final String EXTRA_SCREEN_COLOR = "screen_color";
     /** 新增参数:强制帧率。 */
     static final String EXTRA_FPS = "fps";
+    /** 性能特性:资产异步预取(等价桌面 YURIS_PREFETCH=1)。 */
+    static final String EXTRA_PREFETCH = "prefetch";
+    /** 性能特性:COPY2 快照延迟物化(等价桌面 YURIS_SNAPSHOT_DEFER=1)。 */
+    static final String EXTRA_SNAPSHOT_DEFER = "snapshot_defer";
+    /** 手机画质:`SIZE`(官方最近邻)改双线性采样,缓解 CG/差分缩放锯齿。 */
+    static final String EXTRA_BILINEAR_SCALE = "bilinear_scale";
 
     /**
      * {@link NativeHost#nativeTick()} 的"游戏已结束"返回码。
@@ -640,6 +646,16 @@ public final class MainActivity extends Activity
             int fps = getIntent().getIntExtra(EXTRA_FPS, 0);
             if (fps > 0) {
                 config.put("fps", fps);
+            }
+            // 性能特性开关(默认关;壳界面显式开启才写 true)。
+            if (getIntent().getBooleanExtra(EXTRA_PREFETCH, false)) {
+                config.put("prefetch", true);
+            }
+            if (getIntent().getBooleanExtra(EXTRA_SNAPSHOT_DEFER, false)) {
+                config.put("snapshot_defer", true);
+            }
+            if (getIntent().getBooleanExtra(EXTRA_BILINEAR_SCALE, false)) {
+                config.put("bilinear_scale", true);
             }
         } catch (org.json.JSONException error) {
             Log.e(TAG, "config build failed", error);

@@ -154,6 +154,14 @@ pub struct SurfaceStats {
     pub reused: u64,
     /// 本帧释放回池的纹理数。
     pub released: u64,
+    /// 本帧快照复制与池内已有同源同区域结果合并的次数(零拷贝去重)。
+    pub snapshot_deduped: u64,
+    /// 本帧登记为延迟物化的快照数(当前帧无读者)。
+    pub snapshots_deferred: u64,
+    /// 本帧被后续整层覆盖、且中间无读者的整层写(清色/过渡)跳过数。
+    pub dead_writes: u64,
+    /// 本帧过渡因源相同或 SET=255 直接别名、未做全屏 lerp 的次数。
+    pub transitions_elided: u64,
     /// 本帧真正执行的像素 pass 数(表面写入)。
     pub surface_passes: u64,
     /// 本帧纹理区域复制次数(COPY 快照/RESIZE/TRIM)。
@@ -176,10 +184,15 @@ pub struct SurfaceStats {
 
 /// 单个尺寸的池容量上限(按纹理张数;同尺寸纹理可互相复用)。
 const POOL_PER_SIZE: usize = 4;
-/// 只缓存不超过这个尺寸的纹理:大表面(精灵缓冲 2048²=16MB)复用收益抵不上
-/// 常驻显存,直接释放更稳(重新分配只花一次 `create_texture`)。
-const POOL_MAX_TEXTURE_BYTES: usize = 4 * 1024 * 1024;
+/// 只缓存不超过这个尺寸的纹理。
+///
+/// 立绘过渡表面是 1332×3351 ≈ 17.8MB。过渡链每帧产出两张同尺寸临时
+/// 表面,一张被帧内读取/绘制钉住时,另一张在帧末可以回池;池上限必须
+/// 放行这个尺寸,下一帧的同尺寸写入才能直接从池里取回,不必向驱动
+/// 重新申请 17.8MB。24MB 覆盖 1332×3351,同时拒绝异常的超大临时表面。
+const POOL_MAX_TEXTURE_BYTES: usize = 24 * 1024 * 1024;
 /// 池内总字节上限:超出时丢弃最旧的尺寸组(不静默:计数在诊断里)。
+/// 64MB ≈ 3 张 1332×3351,覆盖过渡链的跨帧轮换并留一张余量。
 const POOL_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// 单张表面上限(4096² RGBA = 64MB;超过 128MB 一定是畸形尺寸)。
 const MAX_SURFACE_BYTES: usize = 128 * 1024 * 1024;
@@ -190,6 +203,19 @@ const MAX_SURFACE_TOTAL_BYTES: usize = 2 * 1024 * 1024 * 1024;
 pub struct LayerSurfaces {
     layers: BTreeMap<LayerId, LayerState>,
     pool: BTreeMap<(u32, u32), Vec<Rc<TexRef>>>,
+    /// `TRIM` 的非资产源裁剪边界缓存:`(纹理 id, 内容 hash, mask) → 边界`。
+    ///
+    /// 非资产源(快照/过渡/合成结果)没有 CPU 像素,旧路径每次 TRIM 都整图
+    /// 读回(TBDR 上 100~291ms)。像素内容不可变 ⇒ 同键边界稳定,缓存后
+    /// 只在首次读回。键含纹理 id,池复用不会串图。
+    content_trim: BTreeMap<(u64, u64, i64), Option<(i64, i64, i64, i64)>>,
+    /// 由本表 **acquire** 出来的表面纹理 id。
+    ///
+    /// 只有这些纹理允许进池。资产的 `TexRef`(由 `resolve_ref` 临时包
+    /// 出来)也长得一样,但绝不能入池 —— 否则池会把游戏资产当成可清写
+    /// 的画布复用,直接破坏资产像素(`SIZE2` 从资产层取图时最容易踩到)。
+    /// id 进程内单调、永不复用,集合只增不减但每项 8 字节,可接受。
+    owned_textures: std::collections::BTreeSet<u64>,
     frame: u64,
     next_revision: u64,
     pooled_bytes: usize,
@@ -212,6 +238,8 @@ impl LayerSurfaces {
         Self {
             layers: BTreeMap::new(),
             pool: BTreeMap::new(),
+            content_trim: BTreeMap::new(),
+            owned_textures: std::collections::BTreeSet::new(),
             frame: 0,
             next_revision: 1,
             pooled_bytes: 0,
@@ -312,6 +340,12 @@ impl LayerSurfaces {
             if let Some(raw) = &state.raw {
                 out.insert(raw.tex.id);
             }
+        }
+        // 池里的纹理仍由本表持有,下一帧 `acquire` 会直接复用;保留其
+        // bind group 可以避免「复用同一张纹理却每帧重建 group」。
+        // 池有 64MB 上限,随 trim/drop 淘汰后下一步自然剪掉。
+        for tex in self.pool.values().flatten() {
+            out.insert(tex.id);
         }
     }
 
@@ -416,9 +450,18 @@ impl LayerSurfaces {
 
     /// 只改采样修饰(`SIZE`/镜像):保留纹理与已应用前缀,替换窗口/网格。
     pub fn set_sampled(&mut self, id: &LayerId, content: Content) {
-        let state = self.layers.entry(id.clone()).or_default();
-        state.content = Some(content);
-        state.raw = None;
+        let (old, old_raw) = {
+            let state = self.layers.entry(id.clone()).or_default();
+            // 与旧行为一致:采样修饰替换内容并清 `raw`(文本基面只在当前
+            // 内容代有效)。
+            (state.content.replace(content), state.raw.take())
+        };
+        // 被替换的表面若已无人引用(调用方先摘掉 `contents` 视图),放回池:
+        // `SPL601/701` 每帧先整层清色、再被 `SIZE2` 换成别名,清色那张
+        // 643×825 表面可以下一帧直接复用,不必每帧重新分配。
+        for tex in old.into_iter().chain(old_raw).map(|c| c.tex) {
+            self.release(tex);
+        }
     }
 
     /// 文本阶段记账(重建条件由调用方判定)。
@@ -463,6 +506,26 @@ impl LayerSurfaces {
         self.layers.get(id).and_then(|state| state.raw.clone())
     }
 
+    /// `TRIM` 非资产源的缓存边界(`None` = 未缓存,`Some(None)` = 已算过“全透明”)。
+    pub fn content_trim_bounds(
+        &self,
+        key: (u64, u64, i64),
+    ) -> Option<Option<(i64, i64, i64, i64)>> {
+        self.content_trim.get(&key).copied()
+    }
+
+    /// 记录 `TRIM` 非资产源的裁剪边界(上限 256 条,防无界增长)。
+    pub fn set_content_trim_bounds(
+        &mut self,
+        key: (u64, u64, i64),
+        bounds: Option<(i64, i64, i64, i64)>,
+    ) {
+        if self.content_trim.len() >= 256 && !self.content_trim.contains_key(&key) {
+            self.content_trim.clear();
+        }
+        self.content_trim.insert(key, bounds);
+    }
+
     /// 为新内容申请一张纹理(池内同尺寸复用优先)。
     ///
     /// `what` 只用于 OOM 诊断定位;尺寸非法/超预算返回 `Err`(调用方按
@@ -485,6 +548,7 @@ impl LayerSurfaces {
             if let Some(tex) = list.pop() {
                 self.pooled_bytes = self.pooled_bytes.saturating_sub(tex.bytes());
                 self.stats.reused += 1;
+                self.owned_textures.insert(tex.id);
                 return Ok(tex);
             }
         }
@@ -528,8 +592,10 @@ impl LayerSurfaces {
             .map_err(|diag| diag.code.to_string())?;
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.stats.created += 1;
+        let id = crate::textures::allocate_texture_id();
+        self.owned_textures.insert(id);
         Ok(Rc::new(TexRef {
-            id: crate::textures::allocate_texture_id(),
+            id,
             width,
             height,
             texture,
@@ -556,7 +622,13 @@ impl LayerSurfaces {
 
     /// 把一张不再被层内容引用的纹理放回池(强引用 > 1 说明还有快照/别名
     /// 持有 ⇒ 不入池,等最后一个持有者释放时自然回收)。
+    ///
+    /// 只接受本表 `acquire` 出来的表面:资产/快照的 `TexRef` 长得一样,
+    /// 入池后会被当成可清写的画布复用,直接破坏游戏资产。
     pub fn release(&mut self, tex: Rc<TexRef>) {
+        if !self.owned_textures.contains(&tex.id) {
+            return;
+        }
         if Rc::strong_count(&tex) > 1 {
             return;
         }
@@ -635,6 +707,8 @@ impl LayerSurfaces {
     pub fn reset(&mut self) -> usize {
         let removed = self.layers.len();
         self.layers.clear();
+        self.content_trim.clear();
+        self.owned_textures.clear();
         self.drop_pool();
         removed
     }

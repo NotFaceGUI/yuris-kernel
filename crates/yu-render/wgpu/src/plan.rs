@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use yu_gfx::{
-    BlendMode, Clear, CompositorFrame, CopyOp, CopySource, ImageAction, ImageOp, Layer, LayerId, Op,
-    OpStatus, Pass, PassTarget, ScreenSnapshot, TextureRef,
+    BlendMode, Clear, CompositorFrame, CopyId, CopyOp, CopySource, ImageAction, ImageOp, Layer,
+    LayerId, Op, OpStatus, Pass, PassTarget, ScreenSnapshot, TextureRef,
 };
 use yu_log::Diag;
 use yu_render_core::{RenderPhases, RenderReport, Surface, TextComposer, Texture, TextureStore};
@@ -35,7 +35,182 @@ use crate::passes::{
 };
 use crate::pipelines::{FilterKind, PipelineCache};
 use crate::surfaces::{Content, Contents, LayerSurfaces, TexRef};
-use crate::textures::{TargetSet, TextureCache, Vertex};
+use crate::textures::{DeferredSnapshot, TargetSet, TextureCache, Vertex};
+
+/// 一帧的读者集合(延迟物化的门禁)。
+///
+/// - `layers`:被屏幕/离屏绘制或当作图像/复制源/目标的层;
+/// - `snapshots`:被层纹理或复制源直接引用的快照。
+///
+/// 不在这里的 COPY2 目标 = 本帧没有任何读者,可以只登记不物化。
+#[derive(Default)]
+struct PlanReads {
+    snapshots: BTreeSet<CopyId>,
+    layers: BTreeSet<LayerId>,
+}
+
+/// 快照复制去重键:源纹理 + 内容版本 + 区域 + 输出尺寸。
+///
+/// 源内容纹理不可变(不变量 1),因此相同键的复制结果逐像素相同,
+/// 可以共享同一张快照纹理。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SnapshotDedupKey {
+    source_tex: u64,
+    source_hash: u64,
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+    out_w: u32,
+    out_h: u32,
+    full: bool,
+}
+
+/// 收集本帧仍会被读取的层与快照(只按 frame 的声明/命令序,不猜运行时)。
+fn plan_reads(frame: &CompositorFrame, layers: &HashMap<&LayerId, &Layer>) -> PlanReads {
+    let mut reads = PlanReads {
+        snapshots: BTreeSet::new(),
+        layers: BTreeSet::new(),
+    };
+    for pass in &frame.passes {
+        for op in &pass.ops {
+            if op.status() != OpStatus::Executable {
+                continue;
+            }
+            match op {
+                Op::Layer(layer) => {
+                    reads.layers.insert(layer.id.clone());
+                    if let Some(mask) = &layer.mask {
+                        reads.layers.insert(mask.clone());
+                    }
+                }
+                Op::Group(group) => {
+                    reads.layers.insert(group.layer.id.clone());
+                    if let Some(mask) = &group.layer.mask {
+                        reads.layers.insert(mask.clone());
+                    }
+                }
+                Op::Transition(transition) => {
+                    reads.layers.insert(transition.layer.id.clone());
+                    if let Some(mask) = &transition.layer.mask {
+                        reads.layers.insert(mask.clone());
+                    }
+                    for texture in std::iter::once(&transition.from).chain(transition.to.iter()) {
+                        if let TextureRef::Snapshot(id) = texture {
+                            reads.snapshots.insert(*id);
+                        }
+                    }
+                }
+                Op::Mask(mask) => {
+                    reads.layers.insert(mask.layer.id.clone());
+                    reads.layers.insert(mask.mask.clone());
+                }
+                Op::Copy(copy) => {
+                    // `copy.dest` 是本 op 的**写**目标,不算读者;它若被屏幕
+                    // 绘制/后续 op 当源,会由对应的 `Layer`/`source` 分支
+                    // 收集进 `layers`。
+                    if let CopySource::Layer(id) = &copy.source {
+                        reads.layers.insert(id.clone());
+                    }
+                    if let Some(TextureRef::Snapshot(id)) = &copy.source_texture {
+                        reads.snapshots.insert(*id);
+                    }
+                }
+                Op::Image(image) => {
+                    reads.layers.insert(image.source.clone());
+                    if let Some(target) = &image.target {
+                        reads.layers.insert(target.clone());
+                    }
+                    if let Some(TextureRef::Snapshot(id)) = &image.source_texture {
+                        reads.snapshots.insert(*id);
+                    }
+                }
+            }
+        }
+    }
+    for id in frame.text_revisions.keys() {
+        reads.layers.insert(id.clone());
+    }
+    // 被读取的层如果直接以快照为纹理,该快照同样必须物化。
+    for (id, layer) in layers {
+        if reads.layers.contains(*id) {
+            if let TextureRef::Snapshot(snapshot) = &layer.texture {
+                reads.snapshots.insert(*snapshot);
+            }
+        }
+    }
+    reads
+}
+
+/// 图像加工的**整层覆盖**判定(不读目标旧像素)。
+///
+/// 与 `apply_image_pixels` 的 `replaces` 同口径:过渡由两源决定;
+/// `RECTPAINT/RECTPAINT3` 无区域时后端用 `LoadOp::Clear` 覆盖整张表面。
+/// `RECTPAINT2`(只写 alpha)与区域填充/滤镜/MERGE 都读旧像素,不算覆盖。
+fn image_full_overwrite(image: &ImageOp) -> bool {
+    if matches!(&image.action, ImageAction::Other("transition")) {
+        return image.source2.is_some();
+    }
+    if image.region_from_fixed
+        || image.x.is_some()
+        || image.y.is_some()
+        || image.x2.is_some()
+        || image.y2.is_some()
+    {
+        return false;
+    }
+    matches!(image.action, ImageAction::RectPaint | ImageAction::RectPaint3)
+}
+
+fn image_target(image: &ImageOp) -> &LayerId {
+    image.target.as_ref().unwrap_or(&image.source)
+}
+
+/// 找出"被紧接着的整层覆盖完全冲掉"的整层写(清色/过渡)。
+///
+/// 只处理**纹理 pass 里相邻的两条可执行图像加工**,且后一条不读目标层:
+/// 前一条的输出没有任何读者,跳过它不改变最终像素。保守到"必须紧邻",
+/// 因此不会跨过 COPY/文本/屏幕读取;真实的立绘链正是
+/// `RECTPAINT3(清色)` 紧接 `TRANSITION(写结果)`。
+fn dead_full_writes(frame: &CompositorFrame) -> BTreeSet<(LayerId, u64)> {
+    let mut flat: Vec<Option<&ImageOp>> = Vec::new();
+    for pass in &frame.passes {
+        let PassTarget::Texture(_) = &pass.target else {
+            continue;
+        };
+        for op in &pass.ops {
+            if op.status() != OpStatus::Executable {
+                continue;
+            }
+            match op {
+                Op::Image(image) => flat.push(Some(image)),
+                // Copy/其他可执行 op 会读/写层,作为邻接屏障。
+                _ => flat.push(None),
+            }
+        }
+    }
+    let mut dead = BTreeSet::new();
+    for pair in flat.windows(2) {
+        let (Some(current), Some(next)) = (pair[0], pair[1]) else {
+            continue;
+        };
+        if !image_full_overwrite(current) || !image_full_overwrite(next) {
+            continue;
+        }
+        let target = image_target(current);
+        if target != image_target(next) {
+            continue;
+        }
+        // 后一条若把目标层当源读(自过渡/原地),前一条的输出仍有读者。
+        if matches!(&next.action, ImageAction::Other("transition"))
+            && (next.source == *target || next.source2.as_ref() == Some(target))
+        {
+            continue;
+        }
+        dead.insert((target.clone(), current.seq));
+    }
+    dead
+}
 
 // ------------------------------------------------------------------ 公共入口
 
@@ -54,6 +229,7 @@ pub(crate) fn plan(
     backbuffer_gpu: &mut Option<(u64, u64)>,
     text: &mut TextComposer,
     text_gpu: &mut Option<crate::text_gpu::TextGpuRenderer>,
+    force_bilinear_scale: bool,
 ) -> Result<(FramePlan, RenderReport, RenderPhases), Diag> {
     let started = std::time::Instant::now();
     surfaces.begin_frame(frame.frame);
@@ -214,6 +390,65 @@ pub(crate) fn plan(
     let layer_index: HashMap<&LayerId, &Layer> =
         frame.layers.iter().map(|layer| (&layer.id, layer)).collect();
 
+    // ---- 0.5 延迟物化补账 ----
+    //
+    // 上一帧登记为"当前无读者"的快照,本帧一旦被层/复制/文本引用,就必须
+    // 在**任何 op 执行之前**按登记时冻结的源内容补齐。源 `Content` 由登记
+    // 项持有 ⇒ 版本固定,补出来的像素仍是 COPY2 命令时刻的版本。
+    let reads = if targets.defer_enabled() {
+        plan_reads(frame, &layer_index)
+    } else {
+        // 延迟物化关闭时不需要读者集合(去重不依赖它),省一遍 ops 扫描。
+        PlanReads::default()
+    };
+    if targets.defer_enabled() {
+        let pending = targets.deferred_ids();
+        for id in pending {
+            let needed = reads.snapshots.contains(&id)
+                || targets
+                    .deferred_snapshot(id)
+                    .is_some_and(|snap| reads.layers.contains(&snap.dest));
+            if !needed {
+                continue;
+            }
+            let Some(snapshot) = targets.take_deferred(id) else {
+                continue;
+            };
+            let mut writes = SurfaceWrites {
+                passes: &mut passes,
+                vertices: &mut vertices,
+                aux: &mut aux,
+                transition: &mut transition_bind_groups,
+                transition_buffers: &mut transition_buffers,
+                views: &mut views,
+                textures: &mut textures_map,
+                keepalive: &mut keepalive,
+            };
+            let tex = materialize_snapshot_copy(ctx, pipelines, surfaces, &mut writes, &snapshot)
+                .map_err(|detail| {
+                    Diag::fatal(code::TARGET, yu_log::Boundary::Platform).with_detail(format!(
+                        "延迟快照 {} 物化失败: {detail}",
+                        id.0
+                    ))
+                })?;
+            let content = snapshot_content(id, tex.clone());
+            // 只有目标层当前仍引用这张快照时才写层内容;层已重建/被删时
+            // 只登记快照,避免覆盖新内容。
+            let dest_uses_snapshot = layer_index
+                .get(&snapshot.dest)
+                .is_some_and(|layer| matches!(&layer.texture, TextureRef::Snapshot(sid) if *sid == id));
+            targets.set_snapshot(id, tex);
+            if dest_uses_snapshot {
+                surfaces.set_content(&snapshot.dest, content.clone());
+                contents.insert(snapshot.dest.clone(), content);
+            }
+        }
+    }
+    // 被紧邻整层覆盖冲掉的整层写(清色/过渡):跳过可省一次全表面写。
+    let dead_writes = dead_full_writes(frame);
+    // 同帧同源同区域的快照去重:源内容不可变 ⇒ 结果逐像素相同,可共享纹理。
+    let mut snapshot_dedup: BTreeMap<SnapshotDedupKey, Rc<TexRef>> = BTreeMap::new();
+
     // ---- 1. 纹理 pass:严格命令序(COPY 与图像加工交错) ----
     let mark_ops = started.elapsed();
     for pass in &frame.passes {
@@ -250,6 +485,8 @@ pub(crate) fn plan(
                         pass_target,
                         force_materialize.contains(pass_target),
                         image,
+                        &dead_writes,
+                        force_bilinear_scale,
                     );
                     match result {
                         Ok(()) => acc.ops_drawn += 1,
@@ -285,6 +522,8 @@ pub(crate) fn plan(
                         &mut acc,
                         pass_target,
                         copy,
+                        &reads,
+                        &mut snapshot_dedup,
                     );
                     match result {
                         Ok(()) => acc.ops_drawn += 1,
@@ -307,6 +546,9 @@ pub(crate) fn plan(
     // ---- 2. 文本:`CGACT[TEXT]`/TextRun 进层表面(修订号驱动) ----
     let mark_text = started.elapsed();
     text.begin_frame_stats();
+    if let Some(gpu_text) = text_gpu.as_mut() {
+        gpu_text.begin_frame();
+    }
     let mut text_jobs: Vec<crate::text_gpu::TextGpuJob> = Vec::new();
     let (text_cpu_base_us, text_cpu_info, text_gpu_stats) = apply_text(
         ctx,
@@ -564,6 +806,8 @@ fn apply_image(
     pass_target: &LayerId,
     force_materialize: bool,
     image: &ImageOp,
+    dead_writes: &BTreeSet<(LayerId, u64)>,
+    force_bilinear_scale: bool,
 ) -> Result<(), String> {
     let target = image.target.as_ref().unwrap_or(&image.source);
     if target != pass_target {
@@ -664,6 +908,18 @@ fn apply_image(
         surfaces.note_reused_layer();
         return Ok(());
     }
+    // 整层写被紧接着的整层覆盖冲掉:不落任何像素,只保留前缀记账。
+    // 任何中间读者都会让 `dead_full_writes` 不再把两条判为相邻,因此
+    // 这里不会吞掉被消费的中间态。
+    if !force_materialize && dead_writes.contains(&(target.clone(), image.seq)) {
+        if surfaces.applied_len(target) > index {
+            surfaces.truncate_applied(target, index);
+        }
+        surfaces.push_applied(target, (image.seq, signature));
+        *chain_index.get_mut(target).expect("inserted above") += 1;
+        surfaces.stats_mut().dead_writes += 1;
+        return Ok(());
+    }
     if surfaces.applied_len(target) > index {
         // 结构核对已在帧首做过;走到这里说明命令序号在中间漂移(日志被
         // 折叠/CG 重建),表面不再是「当前前缀」的结果 ⇒ 回到基面整条重放。
@@ -672,10 +928,27 @@ fn apply_image(
         contents.remove(target);
         *chain_index.get_mut(target).expect("inserted above") = 0;
     }
+    let source_dims = (source.width, source.height, source.tex.id);
+    let cpu_before = surfaces.stats().cpu_fallbacks;
+    let op_started = std::time::Instant::now();
     apply_image_pixels(
         ctx, frame, textures, gpu, pipelines, targets, surfaces, contents, bases, writes, target,
-        image, source, source2,
+        image, source, source2, force_bilinear_scale,
     )?;
+    let op_us = op_started.elapsed().as_micros() as u64;
+    if op_us >= 5_000 && std::env::var_os("YURIS_TICK_SPLIT").is_some() {
+        log::warn!(
+            target: "yu-kernel",
+            "[slowop] action={} target={} src={}x{} tex={} cpu_fb={} {}us",
+            image.action.name(),
+            target.display(),
+            source_dims.0,
+            source_dims.1,
+            source_dims.2,
+            surfaces.stats().cpu_fallbacks.saturating_sub(cpu_before),
+            op_us
+        );
+    }
     surfaces.push_applied(target, (image.seq, signature));
     *chain_index.get_mut(target).expect("inserted above") += 1;
     Ok(())
@@ -1016,6 +1289,7 @@ fn apply_image_pixels(
     image: &ImageOp,
     source: Content,
     source2: Option<Content>,
+    force_bilinear_scale: bool,
 ) -> Result<(), String> {
     // 原地加工(源=目标)的目标层可能已被 `CGEND` 删除;官方命令到达时
     // 已把结果写进层表面,删除不撤销 ⇒ 用命令时刻记录的基图重放。
@@ -1076,10 +1350,13 @@ fn apply_image_pixels(
             uv,
             width: dw.round() as u32,
             height: dh.round() as u32,
-            bilinear: image.action.is_bilinear_scale(),
+            bilinear: image.action.is_bilinear_scale() || force_bilinear_scale,
             display: Some((dw, dh)),
             hash,
         };
+        // 先摘掉 `contents` 的旧 clone,`set_sampled` 才能把被替换的
+        // 清色表面按引用计数放回池(下一帧整层清色直接复用)。
+        contents.remove(target);
         surfaces.set_sampled(target, content.clone());
         contents.insert(target.clone(), content);
         surfaces.stats_mut().surface_passes += 0;
@@ -1106,6 +1383,7 @@ fn apply_image_pixels(
             display: source.display,
             hash,
         };
+        contents.remove(target);
         surfaces.set_sampled(target, content.clone());
         contents.insert(target.clone(), content);
         return Ok(());
@@ -1125,6 +1403,24 @@ fn apply_image_pixels(
         // 见 shaders/lerp.wgsl 与 soft 的 `blend_transition`。
         let f = (blend.clamp(0, 255) as u32) + 1;
         if to.width == 0 || to.height == 0 {
+            return Ok(());
+        }
+        // 端点快路径:SET=255(k=256)时结果逐位等于 `to`;两源指向同一张
+        // 纹理时任何 k 都等于该纹理。`to` 为恒等采样窗时可直接别名,
+        // 省掉一次"读两源 + 写整张表面"的 lerp。非恒等 `to` 不能走
+        // 这条(过渡是整数坐标直采,不是重采样),继续走 lerp。
+        if to.is_identity() && (f >= 256 || source.tex.id == to.tex.id) {
+            let content = finish_content(
+                surfaces,
+                to.tex.clone(),
+                to.width,
+                to.height,
+                None,
+                None,
+            );
+            surfaces.set_content(target, content.clone());
+            contents.insert(target.clone(), content);
+            surfaces.stats_mut().transitions_elided += 1;
             return Ok(());
         }
         let out = surfaces.acquire(ctx, to.width, to.height, "transition surface")?;
@@ -1300,11 +1596,29 @@ fn apply_image_pixels(
         };
         let alpha_only = matches!(image.action, ImageAction::RectPaint2);
         let replaces = int_region.is_none() && !alpha_only;
-        let base = materialize(ctx, pipelines, surfaces, writes, &current, "paint base")?;
-        let (width, height) = (base.width, base.height);
+        let display = current.display;
+        // 整层替换会被 clear 全覆盖:基面像素不参与结果,不必物化
+        // (非恒等采样时这里原本会白跑一次重采样 pass)。
+        let base = if replaces {
+            None
+        } else {
+            Some(materialize(
+                ctx,
+                pipelines,
+                surfaces,
+                writes,
+                &current,
+                "paint base",
+            )?)
+        };
+        let (width, height) = base
+            .as_ref()
+            .map(|base| (base.width, base.height))
+            .unwrap_or((current.width, current.height));
         let out = surfaces.acquire(ctx, width, height, "paint surface")?;
         writes.remember(&out);
         if !replaces {
+            let base = base.as_ref().expect("非整层替换必须有基面");
             let mut pass = PlannedPass {
                 target: Some(PlannedTarget::Commands),
                 ..PlannedPass::default()
@@ -1398,7 +1712,7 @@ fn apply_image_pixels(
             // 区域为空:保留拷贝结果(与 CPU 循环不写像素一致)。
             surfaces.stats_mut().surface_passes += 0;
         }
-        let content = finish_content(surfaces, out, width, height, base.display, None);
+        let content = finish_content(surfaces, out, width, height, display, None);
         surfaces.set_content(target, content.clone());
         contents.insert(target.clone(), content);
         return Ok(());
@@ -1630,13 +1944,26 @@ fn apply_image_pixels(
                 None => return Ok(()),
             },
             None => {
-                let surface = crate::readback::read_texture(ctx, &base.tex.texture, width, height)
-                    .map_err(|diag| diag.code.to_string())?;
-                surfaces.stats_mut().cpu_fallbacks += 1;
-                let Some(b) = trim_box(&surface, width, height, set) else {
-                    return Ok(());
-                };
-                b
+                // 非资产源没有 CPU 像素:旧路径每次整图读回。像素内容不可变
+                // ⇒ 按 `(纹理 id, 内容 hash, mask)` 缓存边界,首次之后零读回。
+                let key = (base.tex.id, base.hash, set);
+                if let Some(hit) = surfaces.content_trim_bounds(key) {
+                    let Some(b) = hit else {
+                        return Ok(());
+                    };
+                    b
+                } else {
+                    let surface =
+                        crate::readback::read_texture(ctx, &base.tex.texture, width, height)
+                            .map_err(|diag| diag.code.to_string())?;
+                    surfaces.stats_mut().cpu_fallbacks += 1;
+                    let bounds = trim_box(&surface, width, height, set);
+                    surfaces.set_content_trim_bounds(key, bounds);
+                    let Some(b) = bounds else {
+                        return Ok(());
+                    };
+                    b
+                }
             }
         };
         let (x0, y0, x1, y1) = bounds;
@@ -1753,6 +2080,8 @@ fn apply_copy(
     acc: &mut Accum,
     pass_target: &LayerId,
     copy: &CopyOp,
+    reads: &PlanReads,
+    dedup: &mut BTreeMap<SnapshotDedupKey, Rc<TexRef>>,
 ) -> Result<(), String> {
     if &copy.dest != pass_target {
         return Err("gfx.copy.target.mismatch".to_string());
@@ -1767,7 +2096,7 @@ fn apply_copy(
             contents.remove(id);
         }
     }
-    let mut source = match &copy.source {
+    let source = match &copy.source {
         CopySource::Layer(id) => {
             let content = resolve_source(
                 ctx,
@@ -1902,51 +2231,123 @@ fn apply_copy(
     } else {
         (width, height)
     };
+    let snapshot = DeferredSnapshot {
+        dest: copy.dest.clone(),
+        source: source.clone(),
+        full,
+        x0,
+        y0,
+        x1,
+        y1,
+        out_w,
+        out_h,
+        clip_x0,
+        clip_y0,
+        clip_w,
+        clip_h,
+    };
+    // 同帧同源同区域去重:源内容不可变 ⇒ 结果逐像素相同,可共享纹理。
+    let dedup_key = copy.texts.is_empty().then(|| SnapshotDedupKey {
+        source_tex: source.tex.id,
+        source_hash: source.hash,
+        x0,
+        y0,
+        x1,
+        y1,
+        out_w,
+        out_h,
+        full,
+    });
+    // 延迟物化只在当前帧**没有任何读者**时登记:目标层既不绘制也不被
+    // 后续 op 当源,快照本身也不被层/复制引用。后续帧真正用到时,由
+    // `plan` 头部按登记时冻结的源内容补齐(版本固定)。
+    let may_defer = copy.texts.is_empty()
+        && !reads.snapshots.contains(&copy.id)
+        && !reads.layers.contains(&copy.dest);
     let tex = if full && source.is_identity() && out_w == sw && out_h == sh {
         // 别名:快照 = 源内容句柄(零拷贝)。内容纹理永不原地改写
         // (surfaces 不变量 1)⇒ 冻结语义天然成立。
         surfaces.note_alias_hit();
         source.tex.clone()
+    } else if let Some(hit) = dedup_key
+        .as_ref()
+        .and_then(|key| dedup.get(key).cloned())
+    {
+        surfaces.note_alias_hit();
+        surfaces.stats_mut().snapshot_deduped += 1;
+        hit
+    } else if targets.defer_enabled() && may_defer {
+        targets.defer_snapshot(copy.id, snapshot);
+        surfaces.stats_mut().snapshots_deferred += 1;
+        return Ok(());
     } else {
-        let materialized = materialize(ctx, pipelines, surfaces, writes, &source, "copy source")?;
-        let out = surfaces.acquire(ctx, out_w, out_h, "copy snapshot")?;
-        writes.remember(&out);
-        // 区域未铺满目标表面时先清屏,保证区域外像素为透明。
-        if clip_w < out_w || clip_h < out_h {
-            let mut pass = PlannedPass {
-                target: Some(PlannedTarget::Commands),
-                ..PlannedPass::default()
-            };
-            pass.clear_targets.push(out.id);
-            writes.passes.push(pass);
+        let tex = materialize_snapshot_copy(ctx, pipelines, surfaces, writes, &snapshot)?;
+        if let Some(key) = dedup_key {
+            dedup.insert(key, tex.clone());
         }
-        let (sx, sy) = if full {
-            (0, 0)
-        } else {
-            (clip_x0 as u32, clip_y0 as u32)
-        };
-        push_blit(
-            writes,
-            "copy",
-            &materialized.tex,
-            &out,
-            (sx, sy),
-            (0, 0),
-            if full { width } else { clip_w },
-            if full { height } else { clip_h },
-        )?;
-        surfaces.stats_mut().blits += 1;
-        out
+        tex
     };
     targets.set_snapshot(copy.id, tex.clone());
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    fnv_mix(&mut hash, copy.id.0);
-    fnv_mix(&mut hash, tex.id);
-    let content = Content::identity(tex, hash);
+    let content = snapshot_content(copy.id, tex);
     contents.insert(copy.dest.clone(), content.clone());
     surfaces.set_content(&copy.dest, content);
-    let _ = &mut source;
     Ok(())
+}
+
+/// 快照内容身份(与既有 `COPY` 落点一致):`CopyId + 纹理 id`。
+fn snapshot_content(id: CopyId, tex: Rc<TexRef>) -> Content {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    fnv_mix(&mut hash, id.0);
+    fnv_mix(&mut hash, tex.id);
+    Content::identity(tex, hash)
+}
+
+/// 按登记的复制参数物化一张快照(对 WGPU 和延迟补账共用)。
+fn materialize_snapshot_copy(
+    ctx: &GpuContext,
+    pipelines: &mut PipelineCache,
+    surfaces: &mut LayerSurfaces,
+    writes: &mut SurfaceWrites<'_>,
+    snapshot: &DeferredSnapshot,
+) -> Result<Rc<TexRef>, String> {
+    let materialized = materialize(
+        ctx,
+        pipelines,
+        surfaces,
+        writes,
+        &snapshot.source,
+        "copy source",
+    )?;
+    let out = surfaces.acquire(ctx, snapshot.out_w, snapshot.out_h, "copy snapshot")?;
+    writes.remember(&out);
+    // 区域未铺满目标表面时先清屏,保证区域外像素为透明。
+    if snapshot.clip_w < snapshot.out_w || snapshot.clip_h < snapshot.out_h {
+        let mut pass = PlannedPass {
+            target: Some(PlannedTarget::Commands),
+            ..PlannedPass::default()
+        };
+        pass.clear_targets.push(out.id);
+        writes.passes.push(pass);
+    }
+    let (sx, sy) = if snapshot.full {
+        (0, 0)
+    } else {
+        (snapshot.clip_x0 as u32, snapshot.clip_y0 as u32)
+    };
+    let width = (snapshot.x1 - snapshot.x0 + 1).max(0) as u32;
+    let height = (snapshot.y1 - snapshot.y0 + 1).max(0) as u32;
+    push_blit(
+        writes,
+        "copy",
+        &materialized.tex,
+        &out,
+        (sx, sy),
+        (0, 0),
+        if snapshot.full { width } else { snapshot.clip_w },
+        if snapshot.full { height } else { snapshot.clip_h },
+    )?;
+    surfaces.stats_mut().blits += 1;
+    Ok(out)
 }
 
 /// 上一帧呈现面(`COPY ID=:/W0/`;EVID-J3-06)。内容未变时复用 GPU 纹理。
@@ -2711,7 +3112,7 @@ fn apply_text(
                         Rc::clone(&raw.tex),
                         &placements,
                     ) {
-                        Ok((target, job)) => {
+                        Ok((target, jobs)) => {
                             merge_text_stats(
                                 acc,
                                 yu_render_core::TextPaintStats {
@@ -2721,9 +3122,11 @@ fn apply_text(
                                 },
                             );
                             gpu_stats.layers += 1;
-                            gpu_stats.glyphs += u64::from(job.glyphs);
-                            gpu_stats.draws += u64::from(job.draw_count);
-                            text_jobs.push(job);
+                            for job in jobs {
+                                gpu_stats.glyphs += u64::from(job.glyphs);
+                                gpu_stats.draws += u64::from(job.draw_count);
+                                text_jobs.push(job);
+                            }
                             let content = finish_content(
                                 surfaces,
                                 target,

@@ -75,6 +75,12 @@ public final class SetupActivity extends AppCompatActivity {
     private boolean debugLog;
     /** 状态浮层(HUD)。发布默认关:浮层每秒还要拼状态串。 */
     private boolean showHud;
+    /** 资产异步预取(默认关;等价桌面 YURIS_PREFETCH=1)。 */
+    private boolean prefetch;
+    /** COPY2 快照延迟物化(默认关;等价 YURIS_SNAPSHOT_DEFER=1)。 */
+    private boolean snapshotDefer;
+    /** `SIZE` 双线性采样(手机画质;默认开,官方是最近邻)。 */
+    private boolean bilinearScale = true;
     private List<String> systemFonts = new ArrayList<>();
     /** 上次选中的字体(持久化;下拉加载完成后恢复选中)。 */
     private String savedFontFamily = "";
@@ -100,6 +106,9 @@ public final class SetupActivity extends AppCompatActivity {
         fps = prefs.getInt("fps", 0);
         debugLog = prefs.getBoolean("debug_log", false);
         showHud = prefs.getBoolean("show_hud", false);
+        prefetch = prefs.getBoolean("prefetch", false);
+        snapshotDefer = prefs.getBoolean("snapshot_defer", false);
+        bilinearScale = prefs.getBoolean("bilinear_scale", true);
 
         ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(BG);
@@ -248,6 +257,47 @@ public final class SetupActivity extends AppCompatActivity {
         if (debugLog) {
             debugToggle.setText("调试日志:开(写游戏目录)");
             debugToggle.setTextColor(ACCENT);
+        }
+
+        // 性能特性(默认关;开启后与桌面环境变量同一实现)。
+        Button prefetchToggle = secondaryButton("资产预取:关");
+        prefetchToggle.setOnClickListener(v -> {
+            prefetch = !prefetch;
+            prefetchToggle.setText(prefetch ? "资产预取:开(后台解码)" : "资产预取:关");
+            prefetchToggle.setTextColor(prefetch ? ACCENT : TEXT);
+        });
+        runCard.addView(prefetchToggle, buttonParams());
+        if (prefetch) {
+            prefetchToggle.setText("资产预取:开(后台解码)");
+            prefetchToggle.setTextColor(ACCENT);
+        }
+
+        Button deferToggle = secondaryButton("快照延迟:关");
+        deferToggle.setOnClickListener(v -> {
+            snapshotDefer = !snapshotDefer;
+            deferToggle.setText(snapshotDefer ? "快照延迟:开(菜单少拷贝)" : "快照延迟:关");
+            deferToggle.setTextColor(snapshotDefer ? ACCENT : TEXT);
+        });
+        runCard.addView(deferToggle, buttonParams());
+        if (snapshotDefer) {
+            deferToggle.setText("快照延迟:开(菜单少拷贝)");
+            deferToggle.setTextColor(ACCENT);
+        }
+
+        // 手机画质:`SIZE` 官方是最近邻,高 DPI 屏幕上 CG/差分缩放会锯齿;
+        // 打开后按双线性采样(与官方像素有差异,已记 DIV-GFX-083)。
+        Button bilinearToggle = secondaryButton("SIZE 双线性:开(手机抗锯齿)");
+        bilinearToggle.setTextColor(ACCENT);
+        bilinearToggle.setOnClickListener(v -> {
+            bilinearScale = !bilinearScale;
+            bilinearToggle.setText(bilinearScale
+                    ? "SIZE 双线性:开(手机抗锯齿)"
+                    : "SIZE 双线性:关(官方最近邻)");
+            bilinearToggle.setTextColor(bilinearScale ? ACCENT : TEXT);
+        });
+        runCard.addView(bilinearToggle, buttonParams());
+        if (!bilinearScale) {
+            bilinearToggle.setText("SIZE 双线性:关(官方最近邻)");
         }
         root.addView(runCard, cardParams());
         refreshRunButtons(cpuButton, gpuButton);
@@ -695,6 +745,9 @@ public final class SetupActivity extends AppCompatActivity {
                 .putInt("fps", fps)
                 .putBoolean("debug_log", debugLog)
                 .putBoolean("show_hud", showHud)
+                .putBoolean("prefetch", prefetch)
+                .putBoolean("snapshot_defer", snapshotDefer)
+                .putBoolean("bilinear_scale", bilinearScale)
                 .apply();
         Intent intent = new Intent(this, MainActivity.class);
         intent.putExtra(MainActivity.EXTRA_GAME_DIR, gameDir);
@@ -704,6 +757,9 @@ public final class SetupActivity extends AppCompatActivity {
         intent.putExtra(MainActivity.EXTRA_GPU_BACKEND, gpuBackend);
         intent.putExtra(MainActivity.EXTRA_DEBUG_LOG, debugLog);
         intent.putExtra(MainActivity.EXTRA_SHOW_HUD, showHud);
+        intent.putExtra(MainActivity.EXTRA_PREFETCH, prefetch);
+        intent.putExtra(MainActivity.EXTRA_SNAPSHOT_DEFER, snapshotDefer);
+        intent.putExtra(MainActivity.EXTRA_BILINEAR_SCALE, bilinearScale);
         intent.putExtra(MainActivity.EXTRA_PATCH, patch);
         if (!saveCodec.isEmpty()) {
             intent.putExtra(MainActivity.EXTRA_SAVE_CODEC, saveCodec);

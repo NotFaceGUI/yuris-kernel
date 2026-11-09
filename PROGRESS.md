@@ -13719,3 +13719,171 @@ cargo test -p yu-gfx --lib               → 15 passed
   这是「角色第一次入场/换表情」5–8ms 尖峰的来源。
 - `tick=62–102ms` 长帧(gfx 4189/3269):帧构建/VM 命令批次(场景解构、
   按钮层重建),不在 render 阶段;与显存修复无关,留待后续批次。
+
+## 成果 PERF-RENDER (2026-11-09) · 删原地复用回收口 + 资产预取 / 快照去重延迟物化 / 跨层字形图集
+
+**范围**:T0–T3(`docs/tasks/task-current-branch-perf-android.md`);T4 未做。
+**基线**:`3d35ebc`;工作区未提交的“双缓冲/原地复用”一轮整体收口。
+
+### 1. T0 删除原地复用（保留表面池）
+
+- 删除 `LayerSurfaces::take_for_rewrite`、`content_is_text_free`、
+  `SurfaceStats::rewrite_reused`、`[res] rw=`；
+- 删除 `plan.rs` 的 `first_overwrites/keep_content`、TRANSITION 与整层
+  `RECTPAINT3` 的 `reused = take_for_rewrite` 分支；回到“写新表面/池取”；
+- 保留并验证：表面池（`acquire`/`release`、单张 ≤24MB、池 ≤64MB）、
+  `owned_textures` 资产守卫（资产永不入池）、`set_sampled` 释放被替换的
+  采样表面（**不动 `raw`**：文本基面与采样修饰无关）、
+  `[res] created/reused/released/pooled/live/vram`、input_probe 的
+  `YURIS_PROBE_FPS`/`YURIS_RES_EVERY`；
+- 删除只验证 `rw` 的 2 个用例；保留“池轮换 + 资产不池化 + 像素一致”用例。
+
+### 2. T1 资产预取（默认关，`YURIS_PREFETCH=1`）
+
+- `TextureStore` 增持久解码 worker + 独立预取池（默认 128MB，
+  `YURIS_PREFETCH_MB`；LRU；`PREFETCH_MAX_PENDING=32`）；读包仍在主线程，
+  worker 只做 CPU 解码（实测解码占 preload >95%）；
+- `CG[FILE]` 声明的 key 在 tick 末提交后台解码，**不再同步解码/上传**；
+  首用时 `resolve` 命中预取池（零解码），未命中按原路径同步兜底；
+- VM 另加 `prefetch_declarations`（只读、跟随常量 `GOSUB`/`GO`、每脚本
+  一次、每任务预算 4096 组、深度 ≤4），每 60 帧扫描一次；koto 样本上
+  前瞻常为空，实际生效的是“已声明 key”异步解码；
+- 关闭开关：无 worker/无池，`ensure` 路径与原来逐字节等价。
+
+### 3. T2 COPY2 去重 + 延迟物化（延迟默认关，`YURIS_SNAPSHOT_DEFER=1`）
+
+- 同帧同源同区域（源纹理 id + 内容 `hash` + 区域 + 输出尺寸）快照共享
+  一张冻结纹理：`dd=` 计数；源内容不可变 ⇒ 逐像素相同；
+- 延迟物化：当前帧无读者的 COPY2 只登记 `DeferredSnapshot`（持有源
+  `Content`，版本固定），后续帧被层/复制/文本/屏幕引用时在 `plan` 头部
+  按登记时源内容补齐；无读者的登记按 `live_snapshots` 跨帧剪枝；
+- `has_snapshot`/`materialized_ids`/`live_texture_ids`/`prune/clear`
+  全部纳入 deferred；`COPY2→SAVE` 同 tick 与存档缩略图路径未改；
+- `YURIS_SNAPSHOT_DEFER=1` 在 koto frame 77（60 次 COPY2）实测：
+  `blits 60→2`、`dd=4`、`dfr=54`、`created 61→3`；渲染报告 JSON 与
+  默认配置逐字节相同（frame 77/120）。
+
+### 4. T3 跨层字形图集
+
+- `text_gpu` 从“每层打包字形像素到 storage buffer”改为**跨层共享图集**：
+  键 = 已合成字形像素身份（宽/高/像素 FNV64；字体/字号/样式/亚像素/
+  描边/阴影/旋转/配色都已烘进像素）；
+- 页 1024²、`Rgba8Uint`、`textureLoad` 整数读取；总预算 32MB（8 页）；
+  shelf 打包；页满新建页；连续 120 帧无引用的页回收；`atlas=` 诊断；
+- 一个文本层的字形跨页时拆成多个 compute job，首 job 负责基面拷贝；
+- 回归 `glyph_atlas_is_shared_across_text_layers`：两个文本层同字形，
+  第二层命中图集且像素与 soft 全等；既有 39 项 wgpu 文本/像素用例通过。
+
+### 5. 验证（原始输出摘要）
+
+```text
+cargo build --workspace --all-targets                 → Finished, 0 error
+cargo test -p yu-backend-wgpu                         → 13+24+39+1+1 passed
+cargo test -p yu-render-core                          → 23 passed
+cargo test -p yu-engine                               → 32+4+1+2 passed
+cargo test -p yu-rt (YURIS_SAMPLE_ERIS_YSBIN=...)      → 91+4+11+4+115+3 passed
+桌面 koto 2100 帧 wgpu，默认配置                       → 0 OOM; tick_avg=7.32ms
+  max created=43（frame 77 菜单构造，去重后）；pooled=2; reused=1/帧稳态
+桌面 koto 2100 帧 wgpu，YURIS_PREFETCH=1               → 0 OOM; tick_avg=7.69ms
+  pf=16h/0e/19MB; 报告 JSON 与默认逐字节相同（77/120/500）
+桌面 koto 600 帧 wgpu，YURIS_SNAPSHOT_DEFER=1          → 0 OOM
+  frame77 blits=2 dd=4 dfr=54; 报告 JSON 与默认逐字节相同（77/120）
+```
+
+### 6. 口径与残留
+
+- `rw` 删除与新诊断字段说明：`docs/divergences/DIV-GFX-082-render-internal-optimizations.md`；
+- 不做单表面重构（T4 决策门后再评估）；
+- 预取静态前瞻在 koto 上多取不到场景声明（资产声明在运行期子任务里），
+  已保留为通用能力并默认关闭；本轮的实效来自已声明 key 的异步解码。
+
+## 成果 ANDROID-FEATURE (2026-11-09) · 壳新增资产预取/快照延迟开关,release APK+so 装机验证
+
+**改动**:
+- `EngineOptions` 新增 `prefetch` / `snapshot_defer`(`Option<bool>`;
+  `None` = 保持桌面环境变量行为),`Engine::new` 在建好渲染器后应用到
+  `TextureStore` / `TargetSet`;
+- Android `RunConfig` 新增 JSON 键 `prefetch` / `snapshot_defer`(默认 false),
+  `start_engine` 以 `Some(bool)` 注入引擎,并在启动日志打
+  `[boot] render features: prefetch=… snapshot_defer=…`;
+- 壳 `SetupActivity`「运行」卡片新增两个开关(默认关,持久化);
+  `MainActivity` 通过 extras 写进 JSON;`android/README.md` 补表;
+- `tools/android/build.sh`:Windows 上优先找 `aapt2.exe`(MSYS glob 会把
+  `aapt2` 匹配成无扩展名路径,AGP 无法执行)。
+
+**构建/装机(2026-11-09)**:
+```text
+JAVA_HOME=Android Studio JBR, GRADLE_FLAGS="--offline --no-daemon"
+BUILD_TYPE=release tools/android/build.sh
+  → arm64-v8a 12M / x86_64 14M;assembleRelease 29s;APK 30M
+adb -s c1d09694 install -r …/app-release.apk  → Success
+  versionName=0.2.0 versionCode=1 lastUpdateTime=2026-11-09 13:38
+设备 APK sha256 = 本地 APK sha256
+  231f138a07b020c93e6d500b04ffeea57211b2f337b74ed2bbfbab978638ed68
+APK 内 lib/arm64-v8a/libyu_host_android.so = jniLibs 当前产物
+  sha256 3529e87d4736fcdc58ccef4ca37ec628ae6713056f888d15c88faef64f1884d9
+SetupActivity 截图确认「资产预取:关」「快照延迟:关」两个开关在位
+```
+- 设备 `c1d09694`(24117RK2CC),数据目录按壳内持久化配置
+  `/storage/emulated/0/krkr/コトネイロver1.02/コトネイロ`。
+- 未提交、未推送。
+
+## 成果 GFX-BANDWIDTH (2026-11-09) · 立绘链死写消除/过渡端点别名 + 手机 SIZE 双线性开关 + 上屏尺寸自愈
+
+**改动**:
+- **死写消除**(`[res] dsw=`):纹理 pass 内相邻两条整层覆盖(清色/过渡),
+  且后一条不读目标层 ⇒ 前一条完全不落像素(不分配、不清屏、不写表面);
+  只认“紧邻”,中间有 COPY/文本/屏幕读取就不跳。
+- **过渡端点别名**(`[res] tel=`):`SET=255`(k=256)或两源同一纹理、且
+  `to` 为恒等采样窗 ⇒ 直接别名 `to`,不做“读两源 + 写整张表面”的 lerp。
+- 整层 `RECTPAINT*` 不再物化无用基面(全图 clear 会覆盖)。
+- **手机画质开关** `bilinear_scale`:官方 `SIZE` 是最近邻,高 DPI 屏幕上
+  CG/差分缩放锯齿;壳「SIZE 双线性」默认开,引擎默认关(严格路径不变)。
+  见 `docs/divergences/DIV-GFX-083-mobile-bilinear-size.md`。
+- **上屏尺寸自愈**:`NativePresenter::present` 每帧核对
+  `ANativeWindow` 实际宽高,与交换链配置不一致就重配 —— 修旋转/分屏/
+  首帧布局前 `nativeResizeSurface` 用旧尺寸导致画面缩到屏幕一侧。
+- 清理 3 个编译告警(`snapshot_has_layer` 死代码、`ErrBuf::as_str`、
+  `acm.rs` 非 Windows 下的 `Codec` 未用导入)。
+
+**桌面验证**:
+```text
+cargo build --workspace --all-targets                 → 0 error, 0 warning
+cargo test -p yu-backend-wgpu                         → 13+26+39+1+1 passed
+cargo test -p yu-host-android                         → 17+2 passed
+新用例:
+  transition_at_endpoint_aliases_to_source  → tel=1, 像素与 soft 全等
+  clear_read_by_copy_is_not_dead            → dsw=0, 像素与 soft 全等
+  立绘链用例                                → dsw=1, 像素与 soft 全等
+桌面 koto 2100 帧默认配置                              → tick_avg=6.72ms render_avg=3.34ms
+```
+**真机**:新 APK 已构建(`sha256 45c67279…438ab7`),设备当前 adb 离线,
+待重连后 `install -r` 并用 `[res] dsw/tel`、帧时间验证。
+
+## 成果 PERF-DEVICE (2026-11-09) · 真机 2000 帧归因:VM tick 与 TRIM 读回是尖峰主项;补 TRIM 边界缓存
+
+**真机数据**(24117RK2CC / Vulkan,debug_log+tick_split+vm_profile):
+- `[spike]` 2000 条：total p50=10.2ms / p90=13.8 / p95=16.4 / p99=49.2 / max=322.2ms
+  ⇒ p95 已顶到 60fps 预算，p99 直接掉帧。
+- 最大帧（frame 2169）：`tick=98.1ms render=224.0ms`，其中 `image=212.8ms`、
+  `rb=9.1ms`；`ops=34 passes=12`，`snap=0 text=1.5ms`。
+- 第二大帧（frame 80）：`tick=281.8ms render=3.3ms`，`cmds=811375`、
+  `preload=5.2ms/33`；是 VM/命令批次，不是渲染。
+- `vmprof`：每 60 帧 ~20–40 万 LET/IF/LOOPEND，`CGINFO` 单次 5–15µs，
+  `SAVE` 单次 ~2.4ms；VM 是持续 CPU 压力，不是带宽。
+
+**已做**:
+- `TRIM` 非资产源（快照/过渡/合成）整图读回是 `image=212ms` 的头号嫌疑
+  （代码注释实测 100–291ms/次）。新增 `LayerSurfaces::content_trim_bounds`
+  按 `(纹理 id, 内容 hash, mask)` 缓存边界：同一内容只读回一次；
+  上限 256 条，重置清空。
+- `apply_image` 增 `[slowop]` 日志（≥5ms，`YURIS_TICK_SPLIT` 时写 logcat）：
+  action/target/源尺寸/cpu_fallbacks/耗时，用于钉死剩余慢 op。
+- Android `[spike]` 行增 `cpu=` 与 `res=[created/reused/.../dsw/tel/...]`。
+
+**验证**:
+```text
+cargo build --workspace --all-targets  → 0 error / 0 warning
+cargo test -p yu-backend-wgpu          → 13+26+39+1+1 passed
+release APK 已安装(14:34)，等待复现 CG 模式/立绘首次出现并抓 [slowop]/[spike]
+```

@@ -172,9 +172,12 @@ if [[ -n "${GRADLE_PROJECT_ARGS:-}" ]]; then
   GRADLE_ARGS+=(${GRADLE_PROJECT_ARGS})
 fi
 if [[ ! " ${GRADLE_ARGS[*]:-} " =~ aapt2FromMavenOverride ]]; then
-  AAPT2="$(ls "$SDK"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1 || true)"
+  # Windows 上 MSYS 的 glob 会把 `aapt2` 匹配到 `aapt2.exe` 并返回**不带
+  # 扩展名**的路径,AGP 拿到后无法执行(`Custom AAPT2 location does not
+  # point to an AAPT2 executable`)。所以先找 `.exe`,再退回无扩展名。
+  AAPT2="$(ls "$SDK"/build-tools/*/aapt2.exe 2>/dev/null | sort -V | tail -1 || true)"
   if [[ -z "$AAPT2" ]]; then
-    AAPT2="$(ls "$SDK"/build-tools/*/aapt2.exe 2>/dev/null | sort -V | tail -1 || true)"
+    AAPT2="$(ls "$SDK"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1 || true)"
   fi
   if [[ -n "$AAPT2" ]]; then
     GRADLE_ARGS+=("-Pandroid.aapt2FromMavenOverride=${AAPT2}")

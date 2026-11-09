@@ -1,23 +1,23 @@
 // GPU 文本 pass:把一个字形写到目标表面,逐像素复刻 CPU 的
 // `Rgba::over` / `replace_with`(`yu-font/src/color.rs`)。
 //
-// 目标表面是 `Rgba8Unorm` storage read_write;字形位图以 packed u32
-// (`r | g<<8 | b<<16 | a<<24`)放在 storage buffer。整数运算,不用浮点
-// 混合,保证与 soft 后端逐像素一致。
+// 目标表面是 `Rgba8Unorm` storage read_write;字形位图放在**跨层共享**的
+// `Rgba8Uint` 图集里(draw 记录图集坐标),`textureLoad` 取整数通道,
+// 不经过 UNORM 浮点转换 ⇒ 与 soft 后端逐像素一致。
 
 struct Draw {
     x: i32,
     y: i32,
     w: u32,
     h: u32,
-    src: u32,
+    ax: u32,
+    ay: u32,
     blend: u32,
-    pad0: u32,
-    pad1: u32,
+    pad: u32,
 };
 
 @group(0) @binding(0) var dst_tex: texture_storage_2d<rgba8unorm, read_write>;
-@group(0) @binding(1) var<storage, read> glyphs: array<u32>;
+@group(0) @binding(1) var atlas_tex: texture_2d<u32>;
 @group(0) @binding(2) var<storage, read> draws: array<Draw>;
 @group(0) @binding(3) var<uniform> draw_count: u32;
 
@@ -47,11 +47,11 @@ fn main(@builtin(local_invocation_index) tid: u32) {
             if (dx < 0 || dy < 0 || u32(dx) >= dims.x || u32(dy) >= dims.y) {
                 continue;
             }
-            let s = glyphs[d.src + i];
-            let sa = (s >> 24u) & 0xffu;
-            let sr = s & 0xffu;
-            let sg = (s >> 8u) & 0xffu;
-            let sb = (s >> 16u) & 0xffu;
+            let s = textureLoad(atlas_tex, vec2<i32>(i32(d.ax + sx), i32(d.ay + sy)), 0);
+            let sa = s.a;
+            let sr = s.r;
+            let sg = s.g;
+            let sb = s.b;
             var orr = sr;
             var og = sg;
             var ob = sb;

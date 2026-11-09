@@ -24,7 +24,9 @@
 
 use yu_log::Diag;
 
-use crate::decode::{Codec, Pcm};
+use crate::decode::Pcm;
+#[cfg(windows)]
+use crate::decode::Codec;
 use crate::error::{self, code};
 
 #[cfg(windows)]

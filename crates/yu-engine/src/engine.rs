@@ -287,6 +287,14 @@ pub struct EngineOptions {
     /// 安卓宿主用它做**归因实验**:把上屏链路从时序里摘掉,单独判断卡顿
     /// 是否由渲染抢 CPU 引起。headless 用例必须保持 true。
     pub render: bool,
+    /// 资产异步预取(`None` = 跟随 `YURIS_PREFETCH` 环境变量;默认关)。
+    ///
+    /// Android 无环境变量,壳通过 `RunConfig.prefetch` 显式注入。
+    pub prefetch: Option<bool>,
+    /// COPY2 快照延迟物化(`None` = 跟随 `YURIS_SNAPSHOT_DEFER`;默认关)。
+    pub snapshot_defer: Option<bool>,
+    /// 手机画质:`SIZE`(官方最近邻)也按双线性采样(`None`/`false` = 官方语义)。
+    pub bilinear_scale: Option<bool>,
     /// 宿主路径系统变量的覆盖(跨平台注入口,见 [`crate::host_paths`])。
     /// `None` 项走平台默认解析;Android 这类没有 `USERPROFILE` 的宿主
     /// 用它把 app 私有目录 / 外置卡目录喂进来。
@@ -312,6 +320,9 @@ impl Default for EngineOptions {
     fn default() -> Self {
         Self {
             render: true,
+            prefetch: None,
+            snapshot_defer: None,
+            bilinear_scale: None,
             backend: Backend::Soft,
             entry: "SYSTEM_START".to_string(),
             record_events: false,
@@ -573,6 +584,52 @@ impl Renderer {
         match self {
             Renderer::Soft(renderer) => renderer.preload_assets(keys),
             Renderer::Wgpu { renderer, .. } => renderer.preload_assets(keys),
+        }
+    }
+
+    /// 资产预取(`YURIS_PREFETCH=1`;默认关):提交后台解码,立即返回。
+    fn prefetch_assets(&mut self, keys: &[Vec<u8>]) -> u64 {
+        match self {
+            Renderer::Soft(renderer) => renderer.prefetch_assets(keys),
+            Renderer::Wgpu { renderer, .. } => renderer.prefetch_assets(keys),
+        }
+    }
+
+    fn prefetch_enabled(&self) -> bool {
+        match self {
+            Renderer::Soft(renderer) => renderer.prefetch_enabled(),
+            Renderer::Wgpu { renderer, .. } => renderer.prefetch_enabled(),
+        }
+    }
+
+    /// 宿主显式开关资产预取(Android 壳;桌面仍可由环境变量开启)。
+    fn set_prefetch_enabled(&mut self, enabled: bool) {
+        match self {
+            Renderer::Soft(renderer) => {
+                renderer.textures_mut().set_prefetch_enabled(enabled);
+            }
+            Renderer::Wgpu {
+                renderer, check, ..
+            } => {
+                renderer.textures_mut().set_prefetch_enabled(enabled);
+                if let Some(soft) = check.as_mut() {
+                    soft.textures_mut().set_prefetch_enabled(enabled);
+                }
+            }
+        }
+    }
+
+    /// 宿主显式开关 COPY2 延迟物化(仅 wgpu 有该路径)。
+    fn set_snapshot_defer(&mut self, enabled: bool) {
+        if let Renderer::Wgpu { renderer, .. } = self {
+            renderer.set_defer_snapshots(enabled);
+        }
+    }
+
+    /// 宿主显式开关 `SIZE` 双线性采样(手机画质;仅 wgpu 生效)。
+    fn set_force_bilinear_scale(&mut self, enabled: bool) {
+        if let Renderer::Wgpu { renderer, .. } = self {
+            renderer.set_force_bilinear_scale(enabled);
         }
     }
 
@@ -842,6 +899,16 @@ impl Engine {
                 }
             }
         };
+        // 宿主显式特性开关(Android 壳;`None` = 保持环境变量/缺省行为)。
+        if let Some(enabled) = opts.prefetch {
+            renderer.set_prefetch_enabled(enabled);
+        }
+        if let Some(enabled) = opts.snapshot_defer {
+            renderer.set_snapshot_defer(enabled);
+        }
+        if let Some(enabled) = opts.bilinear_scale {
+            renderer.set_force_bilinear_scale(enabled);
+        }
         if let Some(bridge) = capture_bridge.as_mut() {
             match &renderer {
                 Renderer::Wgpu { renderer, .. } => {
@@ -1420,6 +1487,28 @@ impl Engine {
             .as_mut()
             .ok_or_else(|| Failure::runtime("engine 未启动"))?;
         let tick_started = Instant::now();
+        // 资产预取(默认关):从存活任务的脚本声明链预测**本 tick 后续**
+        // 的 `CG[FILE]`,在 VM 执行前提交后台解码。入场脚本常在一个 tick
+        // 内跑完几十条 `CG`(frame 78 实测 VM 109ms、preload 13ms),解码
+        // 与 VM 执行重叠;没赶上时 tick 末尾的同步预载照旧,像素不变。
+        // 声明链前瞻每 60 帧跑一次:场景脚本变化很慢,每 tick 全脚本扫描
+        // 会白烧 CPU(实测 +1.5ms/tick)。真正生效的是本轮 tick 末对
+        // `CG[FILE]` 实声明 key 的异步解码提交。
+        if self.renderer.prefetch_enabled() && self.frame % 60 == 0 {
+            let keys = vm.prefetch_declarations(prefetch_window());
+            if !keys.is_empty() {
+                let queued = self.renderer.prefetch_assets(&keys);
+                if queued > 0 && std::env::var_os("YURIS_ASSET_TIMING").is_some() {
+                    log::warn!(
+                        target: "yu-engine",
+                        "[prefetch] frame={} candidates={} queued={}",
+                        self.frame.wrapping_add(1),
+                        keys.len(),
+                        queued
+                    );
+                }
+            }
+        }
         let chain = vm.tick_at(now_ms, &self.timeline);
         // **tick 内部分段**(`YURIS_TICK_SPLIT`):真机出现过
         // `tick=441ms` 而 `build=20ms`/`render=35ms`/`cmds` 与邻帧相同的情况
@@ -1492,6 +1581,26 @@ impl Engine {
             self.last_preload_ms = 0.0;
             self.last_preload_assets = 0;
             self.last_preload_errors = 0;
+        } else if self.renderer.prefetch_enabled() {
+            // 预取模式(`YURIS_PREFETCH=1`):`CG[FILE]` 声明的资产只读取包
+            // 字节并交给后台解码线程,**不**在本 tick 同步解码/上传。首用
+            // 时 `resolve` 命中预取池(零解码)或按原路径同步兜底 ⇒ 像素
+            // 不变,只是把解码从"声明帧"摊到真正使用的帧。
+            let started = Instant::now();
+            let queued = self.renderer.prefetch_assets(&preloads);
+            self.last_preload_ms = started.elapsed().as_secs_f64() * 1000.0;
+            self.last_preload_assets = preloads.len() as u64;
+            self.last_preload_errors = 0;
+            if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
+                log::warn!(
+                    target: "yu-engine",
+                    "[preload] frame={} async declared={} queued={} submit_ms={:.1}",
+                    self.frame.wrapping_add(1),
+                    preloads.len(),
+                    queued,
+                    self.last_preload_ms
+                );
+            }
         } else {
             let started = Instant::now();
             let (assets, errors) = self.renderer.preload_assets(&preloads);
@@ -2865,6 +2974,21 @@ fn device_options_from_env() -> DeviceOptions {
 /// Android 等无环境变量的平台由宿主显式给目录。
 fn host_paths(save_root: &std::path::Path, overrides: &HostPathOverrides) -> yu_rt::vm::HostPaths {
     crate::host_paths::resolve_host_paths(save_root, overrides, &HostPlatformHome::resolve())
+}
+
+/// 预取前瞻的每脚本最大组数(`YURIS_PREFETCH_WINDOW`,默认 2048;只在
+/// `YURIS_PREFETCH=1` 时被查询)。
+///
+/// 前瞻窗口越大越可能提前看到下一场景的 `CG[FILE]`,也越可能扫到不会执行
+/// 的分支;预取池有独立预算与 LRU,多取只会被丢弃,不影响像素。
+fn prefetch_window() -> usize {
+    static WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        std::env::var("YURIS_PREFETCH_WINDOW")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(2048)
+    })
 }
 
 /// 读游戏根的 `yssfs.dat`(「セーブファイル設定.exe」写出的存档路径设置)。

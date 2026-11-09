@@ -1532,13 +1532,6 @@ impl GfxState {
             .collect()
     }
 
-    /// 该层是否出现在任一命令时刻屏幕快照里(加工链保留判定)。
-    fn snapshot_has_layer(&self, id: &LayerId) -> bool {
-        self.screen_snapshots
-            .values()
-            .any(|snap| snap.layer_ids.contains(id))
-    }
-
     // ------------------------------------------------------------ INFO 查询
 
     /// 回答 `CGINFO/FONTINFO/WINDOWINFO` 的只读查询(供 `GraphicsHost` 同步调用)。
@@ -4767,7 +4760,7 @@ impl GfxState {
         // `CG` 重建同名层 = 官方新建一个层实例,旧实例的像素与加工链全部
         // 作废。除了清烘焙记录,还要把引用该层名的历史加工项从日志里丢掉:
         // 存档界面每次打开都用 `CG[ID="_TMP_OF" FILE=""]` + `CGEND` 重建
-        // 同一个名字。旧项若留在日志里,屏幕快照(`snapshot_has_layer`)会把
+        // 同一个名字。旧项若留在日志里,屏幕快照成员集合会把
         // 它们永久保留并每帧重放 ⇒ 反复开关存档时 render 单调上升
         // (2026-11-03 真机 optrace:`_TMP_OF` 每次 +10 条 AKARUSA)。
         self.baked_images.borrow_mut().remove(path);
@@ -4891,7 +4884,7 @@ impl GfxState {
         let mut keep = vec![true; self.image_log.len()];
         // 快照成员集合**建一次**再查。
         //
-        // `snapshot_has_layer` 是 `快照数 × layer_ids 线性查找`(菜单帧
+        // 快照成员查询是 `快照数 × layer_ids 线性查找`(菜单帧
         // 快照数十个 × 每份 1400+ 个 `LayerId`),而这里原本对 `image_log`
         // 的每一项都调一次 —— `CGEND` 因此单次 9.4µs(813 次/帧 = 7.7ms,
         // 是所有命令里最贵的一条)。集合内容在 `drop_ops_for` 期间不变,

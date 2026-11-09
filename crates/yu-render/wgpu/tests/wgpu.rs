@@ -681,11 +681,15 @@ fn cgact_transition_gpu_matches_soft_exactly() {
             gpu_out.report, soft_out.report,
             "{label}: 双后端 RenderReport 必须逐字段一致"
         );
-        assert!(
-            gpu_out.stats.layer_composites >= 1,
-            "{label}: 应走 GPU 合成目标(实际 {})",
-            gpu_out.stats.layer_composites
-        );
+        if blend < 256 {
+            assert!(
+                gpu_out.stats.layer_composites >= 1,
+                "{label}: 应走 GPU 合成目标(实际 {})",
+                gpu_out.stats.layer_composites
+            );
+        }
+        // SET=255/256 的结果逐位等于 `to`,允许走别名快路径(0 次 lerp);
+        // 像素与 RenderReport 的断言在上面已经覆盖。
     }
 }
 

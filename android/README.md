@@ -72,6 +72,11 @@ gradle --offline --no-daemon assembleRelease
 (`C:\Program Files\Android\Android Studio1\jbr`,全 JDK 反而报
 `Failed to load native library 'native-platform.dll'`)+ 上面的独立
 `GRADLE_USER_HOME`(依赖缓存已有 178M,离线 `assembleDebug` 40s)。
+
+2026-11-09 复测:**JBR + 默认 `~/.gradle` + `GRADLE_FLAGS="--offline --no-daemon"`
+直接 `assembleRelease` 29s 成功**。不要再把旧 `transforms-4` 拷进新的
+`GRADLE_USER_HOME`:Gradle 8.14.3 会因旧 transform 工作区被占用而报
+`Could not move temporary workspace`;只复用 `caches/modules-2` 即可。
 Windows 下 NDK 的 sh 版 `*-clang` 无法被 Rust exec,`build.sh` 会自动改用
 `.cmd` 包装器(也兼容 r28 起 sysroot 挪进 toolchains 的新布局)。
 
@@ -89,6 +94,9 @@ Windows 下 NDK 的 sh 版 `*-clang` 无法被 Rust exec,`build.sh` 会自动改
 |---|---|---|
 | 状态浮层 | 关 | 开:左上角显示 `fps=`;再开「调试日志」才铺全量计数 |
 | 调试日志 | 关 | 开:每帧状态行写 logcat + `<游戏目录>/debug/yu-kernel.jsonl`,并启用混音抓取 |
+| 资产预取 | 关 | 等价桌面 `YURIS_PREFETCH=1`:`CG[FILE]` 声明即交后台解码,首用命中池/同步兜底 |
+| 快照延迟 | 关 | 等价桌面 `YURIS_SNAPSHOT_DEFER=1`:无读者的 COPY2 只登记,后续被引用再物化 |
+| SIZE 双线性 | **开** | 官方 `SIZE` 是最近邻;手机高 DPI 下 CG/差分缩放锯齿,开启后按双线性采样(像素与官方有差异,见 `DIV-GFX-083`) |
 
 两者都关时,壳**完全不调** `nativeStatus()`,内核也处于发布模式
 (`RunConfig::quiet`):logcat 只放 `warn` 以上、不抓音频、状态串最小化。
@@ -164,6 +172,9 @@ files/save/             ← 存档(可写)
 | `fps` | 同名 | 正整数 | 60 |
 | `screen_color` | 同名 | `@_SCREEN_COLOR` 代号 | 32 |
 | `audio` / `tone` | `audio` / `audio_tone` | 布尔(诊断) | true / false |
+| `prefetch` | `prefetch` | 布尔(资产异步预取) | false |
+| `snapshot_defer` | `snapshot_defer` | 布尔(COPY2 延迟物化) | false |
+| `bilinear_scale` | `bilinear_scale` | 布尔(`SIZE` 双线性;手机画质) | 壳默认 true / 内核默认 false |
 | `debug_log` / `show_hud` | —(壳侧) | 布尔 | false |
 
 取值解析全部只有一份(见 `docs/cross-platform.md`「宿主参数唯一取值表」);

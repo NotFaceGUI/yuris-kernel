@@ -494,7 +494,36 @@ pub struct TargetSet {
     /// token 之间来回清空(读档时背景层被反复重建,烘焙跳过永远补不回来)。
     /// 每个 `CopyId` 一份,保留跨帧缓存但绝不污染活层。
     snapshot_surfaces: BTreeMap<CopyId, LayerSurfaces>,
+    /// 延迟物化的快照请求(`YURIS_SNAPSHOT_DEFER=1`;默认关)。
+    ///
+    /// 登记时冻结源 `Content` 句柄(纹理不可变 ⇒ 像素即命令时刻版本),
+    /// 当前帧没有任何读者就不分配/不清屏/不复制;后续帧被层/复制/屏幕
+    /// 引用时,规划期按同一份源内容物化。
+    deferred: BTreeMap<CopyId, DeferredSnapshot>,
+    /// 是否启用延迟物化(构造时读环境变量;测试/宿主可覆盖)。
+    defer_enabled: bool,
     scale: Option<RenderTarget>,
+}
+
+/// 一条延迟物化的快照请求。
+///
+/// 字段与 [`crate::plan::apply_copy`] 的复制参数一一对应;`source` 是登记
+/// 时刻的内容句柄,**版本固定**由此保证(内容纹理永不原地改写)。
+#[derive(Clone)]
+pub(crate) struct DeferredSnapshot {
+    pub dest: LayerId,
+    pub source: Content,
+    pub full: bool,
+    pub x0: i64,
+    pub y0: i64,
+    pub x1: i64,
+    pub y1: i64,
+    pub out_w: u32,
+    pub out_h: u32,
+    pub clip_x0: i64,
+    pub clip_y0: i64,
+    pub clip_w: u32,
+    pub clip_h: u32,
 }
 
 /// 合成目标硬上限(每个约等于一张整屏/精灵缓冲)。
@@ -516,8 +545,43 @@ impl TargetSet {
             snapshots: BTreeMap::new(),
             snapshot_contents: BTreeMap::new(),
             snapshot_surfaces: BTreeMap::new(),
+            deferred: BTreeMap::new(),
+            // 默认关:延迟物化只在显式 `YURIS_SNAPSHOT_DEFER=1` 时启用。
+            defer_enabled: std::env::var("YURIS_SNAPSHOT_DEFER")
+                .map_or(false, |v| !matches!(v.trim(), "" | "0" | "off" | "false")),
             scale: None,
         }
+    }
+
+    /// 是否启用快照延迟物化。
+    pub fn defer_enabled(&self) -> bool {
+        self.defer_enabled
+    }
+
+    /// 显式开关延迟物化(测试/宿主)。
+    pub fn set_defer_enabled(&mut self, enabled: bool) {
+        self.defer_enabled = enabled;
+    }
+
+    /// 登记一条延迟物化的快照(同 id 的已物化版本作废)。
+    pub(crate) fn defer_snapshot(&mut self, id: CopyId, snapshot: DeferredSnapshot) {
+        self.snapshots.remove(&id);
+        self.snapshot_contents.remove(&id);
+        self.deferred.insert(id, snapshot);
+    }
+
+    /// 取走一条延迟物化请求(调用方随后必须物化或重新登记)。
+    pub(crate) fn take_deferred(&mut self, id: CopyId) -> Option<DeferredSnapshot> {
+        self.deferred.remove(&id)
+    }
+
+    pub(crate) fn deferred_snapshot(&self, id: CopyId) -> Option<&DeferredSnapshot> {
+        self.deferred.get(&id)
+    }
+
+    /// 当前全部延迟物化的 id(规划期检查是否已有读者)。
+    pub(crate) fn deferred_ids(&self) -> Vec<CopyId> {
+        self.deferred.keys().copied().collect()
     }
 
     /// 取/还屏幕快照合成专用的表面账(见字段注释)。
@@ -551,9 +615,11 @@ impl TargetSet {
         self.snapshot_contents.get(&id)
     }
 
-    /// 快照是否已冻结(物化纹理或 UV 别名都算)。
+    /// 快照是否已冻结(物化纹理、UV 别名或延迟物化登记都算)。
     pub fn has_snapshot(&self, id: CopyId) -> bool {
-        self.snapshots.contains_key(&id) || self.snapshot_contents.contains_key(&id)
+        self.snapshots.contains_key(&id)
+            || self.snapshot_contents.contains_key(&id)
+            || self.deferred.contains_key(&id)
     }
 
     /// 已冻结的快照 id 集合(供 `live_snapshots` 停止展开其内部复制链)。
@@ -561,6 +627,7 @@ impl TargetSet {
         self.snapshots
             .keys()
             .chain(self.snapshot_contents.keys())
+            .chain(self.deferred.keys())
             .copied()
             .collect()
     }
@@ -588,7 +655,7 @@ impl TargetSet {
     }
 
     pub fn snapshot_count(&self) -> usize {
-        self.snapshots.len()
+        self.snapshots.len() + self.deferred.len()
     }
 
     /// 按稳定的纹理 id 找 view(过渡/复制执行期用)。
@@ -641,6 +708,7 @@ impl TargetSet {
             .snapshots
             .keys()
             .chain(self.snapshot_contents.keys())
+            .chain(self.deferred.keys())
             .filter(|id| !live.contains(id))
             .copied()
             .collect();
@@ -652,6 +720,7 @@ impl TargetSet {
                 pipelines.forget_texture(tex.id);
             }
             self.snapshot_contents.remove(&id);
+            self.deferred.remove(&id);
         }
         self.snapshot_surfaces.retain(|id, _| live.contains(id));
     }
@@ -661,12 +730,13 @@ impl TargetSet {
     /// 引擎重启 = 新设备 ⇒ 快照不再有效;`CopyId` 在新 `GfxState` 里从头
     /// 分配,旧纹理若保留会与同 id 的新快照冲突。
     pub fn clear_snapshots(&mut self, pipelines: &mut crate::pipelines::PipelineCache) -> usize {
-        let removed = self.snapshots.len() + self.snapshot_contents.len();
+        let removed = self.snapshots.len() + self.snapshot_contents.len() + self.deferred.len();
         for (_, target) in std::mem::take(&mut self.snapshots) {
             pipelines.forget_texture(target.id);
         }
         self.snapshot_contents.clear();
         self.snapshot_surfaces.clear();
+        self.deferred.clear();
         removed
     }
 
@@ -836,6 +906,11 @@ impl TargetSet {
         }
         for content in self.snapshot_contents.values() {
             out.insert(content.tex.id);
+        }
+        // 延迟物化的源纹理仍被登记项持有,后续可能在别的帧被采样;保留其
+        // bind group,避免物化后重建。
+        for snapshot in self.deferred.values() {
+            out.insert(snapshot.source.tex.id);
         }
         for surfaces in self.snapshot_surfaces.values() {
             surfaces.live_texture_ids(out);

@@ -296,6 +296,14 @@ pub struct RunConfig {
     /// 是否渲染上屏(默认 true)。`false` = 只跑 VM + 声音,用于归因实验:
     /// 把合成/上屏整条链路从时序里摘掉,单独判断卡顿是否由渲染抢 CPU 引起。
     pub render: bool,
+    /// 资产异步预取(`prefetch`;默认 false)。等价桌面 `YURIS_PREFETCH=1`。
+    pub prefetch: bool,
+    /// COPY2 快照延迟物化(`snapshot_defer`;默认 false)。
+    /// 等价桌面 `YURIS_SNAPSHOT_DEFER=1`。
+    pub snapshot_defer: bool,
+    /// `SIZE` 也按双线性采样(`bilinear_scale`;手机画质选项,默认 false)。
+    /// false = 官方最近邻;true = 缓解高 DPI 屏幕上 CG/差分缩放的锯齿。
+    pub bilinear_scale: bool,
     /// **发布模式**(默认 true):关掉一切只为排查存在的开销。
     ///
     /// - logcat 只放 `warn` 以上(不再每帧/每秒写 info);
@@ -334,6 +342,9 @@ impl Default for RunConfig {
             audio_tone: false,
             audio_rate: None,
             render: true,
+            prefetch: false,
+            snapshot_defer: false,
+            bilinear_scale: false,
             quiet: true,
         }
     }
@@ -346,6 +357,7 @@ impl RunConfig {
     /// `data_root` `save_root` `entry` `debug_mode` `script_key` `font`
     /// `font_file` `os_sound` `audio` `backend` `fps` `screen_color` `dx_mode`
     /// `save_codec` `media_readonly` `record_events` `log_file` `log_level`
+    /// `prefetch` `snapshot_defer` `bilinear_scale`
     pub fn from_json(text: &str) -> Result<Self, String> {
         let mut config = Self::default();
         config.apply_json(text)?;
@@ -424,6 +436,15 @@ impl RunConfig {
         }
         if let Some(v) = object.get("render").and_then(|v| v.as_bool()) {
             config.render = v;
+        }
+        if let Some(v) = object.get("prefetch").and_then(|v| v.as_bool()) {
+            config.prefetch = v;
+        }
+        if let Some(v) = object.get("snapshot_defer").and_then(|v| v.as_bool()) {
+            config.snapshot_defer = v;
+        }
+        if let Some(v) = object.get("bilinear_scale").and_then(|v| v.as_bool()) {
+            config.bilinear_scale = v;
         }
         let quiet_explicit = object.get("quiet").and_then(|v| v.as_bool());
         if let Some(v) = object.get("audio_rate").and_then(|v| v.as_u64()) {
@@ -839,6 +860,9 @@ pub fn start_engine(
         audio_tone,
         audio_rate,
         render,
+        prefetch,
+        snapshot_defer,
+        bilinear_scale,
         quiet,
     } = config;
 
@@ -924,6 +948,10 @@ pub fn start_engine(
         record_events,
         // 归因实验:关掉渲染时引擎复用首帧呈现面,VM/声音照常推进。
         render,
+        // 性能特性开关(等价桌面 YURIS_PREFETCH / YURIS_SNAPSHOT_DEFER)。
+        prefetch: Some(prefetch),
+        snapshot_defer: Some(snapshot_defer),
+        bilinear_scale: Some(bilinear_scale),
         script_key,
         save_codec: codec,
         save_root: Some(save_root.clone()),
@@ -936,6 +964,10 @@ pub fn start_engine(
         local_time: yu_engine::host_clock::local_now(),
         ..EngineOptions::default()
     };
+    log::warn!(
+        target: "yu-kernel",
+        "[boot] render features: prefetch={prefetch} snapshot_defer={snapshot_defer} bilinear_scale={bilinear_scale}"
+    );
     let mut engine =
         Engine::new(project, options).map_err(|failure| format!("引擎启动失败: {failure}"))?;
     // 逐 opcode 耗时归因(`YURIS_VM_PROFILE`;真机排查 VM 分派用)。
@@ -1122,7 +1154,7 @@ pub fn tick() -> i32 {
                              preload={:.1}ms/{} err={} build={:.1}ms \
                              cmds={} ops={} passes={} layers={} visible={} \
                              plan[snap={} image={} text={} copy_text={} rest={}]us \
-                             text_cpu[rb={}us x{} asset={}us] rb={}us enc={}us",
+                             text_cpu[rb={}us x{} asset={}us] rb={}us enc={}us cpu={} res=[{}]",
                             report.frame,
                             report.tick_ms,
                             report.render_ms,
@@ -1150,7 +1182,12 @@ pub fn tick() -> i32 {
                             ph.text_cpu_readbacks,
                             ph.text_cpu_asset_us,
                             ph.readback_us,
-                            ph.encode_us
+                            ph.encode_us,
+                            ph.cpu_fallbacks,
+                            session
+                                .engine
+                                .render_resource_snapshot()
+                                .unwrap_or_default()
                         );
                     }
                 }
@@ -2048,6 +2085,22 @@ mod tests {
         assert_eq!(config.save_codec, Some(BlockCodec::Snappy));
         assert!(config.media_readonly);
         assert!(config.record_events);
+    }
+
+    #[test]
+    fn run_config_parses_render_feature_switches() {
+        let config = RunConfig::from_json(
+            r#"{"data_root":"/g","prefetch":true,"snapshot_defer":true,"bilinear_scale":true}"#,
+        )
+        .expect("解析应成功");
+        assert!(config.prefetch);
+        assert!(config.snapshot_defer);
+        assert!(config.bilinear_scale);
+        // 缺省关闭:老壳不传键时行为与引入前一致。
+        let default = RunConfig::from_json(r#"{"data_root":"/g"}"#).unwrap();
+        assert!(!default.prefetch);
+        assert!(!default.snapshot_defer);
+        assert!(!default.bilinear_scale);
     }
 
     #[test]

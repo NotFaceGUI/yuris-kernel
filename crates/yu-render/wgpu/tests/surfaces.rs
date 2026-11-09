@@ -708,6 +708,71 @@ fn text_layer_is_stable_across_frames() {
     );
 }
 
+/// 两个文本层使用相同字形:第二层必须命中全局图集(跨层共享),
+/// 像素仍与 soft 全等。
+#[test]
+fn glyph_atlas_is_shared_across_text_layers() {
+    let table = table();
+    let Some(mut gpu) = renderer_or_skip(store(&[(
+        b"dark.png",
+        png_bytes_for(32, 16, Rgba([0, 0, 0, 255])),
+    )])) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&[(
+        b"dark.png",
+        png_bytes_for(32, 16, Rgba([0, 0, 0, 255])),
+    )]));
+    if !soft.text_composer().available() {
+        SKIPPED.fetch_add(1, Ordering::Relaxed);
+        println!("SKIP glyph_atlas_is_shared_across_text_layers: no system font");
+        return;
+    }
+    let mut gfx = state(Viewport::new(32, 16), [0, 0, 0, 255]);
+    let mut events = vec![VmEvent::FrameStart { frame: 1 }];
+    for (name, x) in [(b"TX1".as_slice(), 0i64), (b"TX2".as_slice(), 16)] {
+        events.push(call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(name.to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(b"dark".to_vec())),
+        ]));
+        events.push(call(1, "FONT", vec![
+            arg(&table, "FONT", "SX", Value::Int(16)),
+            arg(&table, "FONT", "SY", Value::Int(16)),
+            arg(&table, "FONT", "COLOR", Value::Int(0x00_FF00)),
+        ]));
+        events.push(call(1, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(name.to_vec())),
+            arg(&table, "CGACT", "TEXT", Value::Int(1)),
+            arg(&table, "CGACT", "SET", Value::Int(0)),
+            arg(&table, "CGACT", "SETSTR", Value::Str(b"AB".to_vec())),
+            arg(&table, "CGACT", "X", Value::Int(x)),
+            arg(&table, "CGACT", "Y", Value::Int(0)),
+        ]));
+    }
+    events.push(VmEvent::FrameEnd { frame: 1 });
+    gfx.consume_events(&events);
+    let frame = gfx.frame();
+    let out = gpu.render_frame(&frame).expect("gpu");
+    let soft_out = soft.render_frame(&frame);
+    assert_eq!(
+        max_channel_diff(&out.surface, &soft_out.surface),
+        0,
+        "跨层图集共享后文本像素必须与 soft 全等"
+    );
+    let snapshot = gpu.resource_snapshot();
+    let atlas = snapshot
+        .split_whitespace()
+        .find(|part| part.starts_with("atlas="))
+        .expect("资源快照必须有 atlas 诊断");
+    let fields: Vec<&str> = atlas.trim_start_matches("atlas=").split('/').collect();
+    assert_eq!(fields[0], "1p", "两个层应共用同一页: {snapshot}");
+    let hits: u64 = fields[2]
+        .trim_end_matches('h')
+        .parse()
+        .expect("atlas 命中数");
+    assert!(hits >= 1, "第二层的同字形必须命中图集: {snapshot}");
+}
+
 /// 60 帧多场景序列:换差分(COPY)/过渡(TRANSITION)/MERGE/缩放/文本,
 /// wgpu 与 soft **逐帧**逐像素一致;同时验证前缀复用不改变像素。
 ///
@@ -1366,5 +1431,797 @@ fn rewritten_transition_surfaces_do_not_pin_bind_groups() {
     assert!(
         last <= first + 8,
         "bind group 缓存未随帧数收敛:first={first} last={last} all={counts:?}"
+    );
+}
+
+fn stat(snapshot: &str, key: &str) -> u64 {
+    snapshot
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix(&format!("{key}=")))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+/// 快照冻结的目标表面**不得**被后续写入复用改写。
+#[test]
+fn snapshot_pins_target_surface_against_reuse() {
+    let table = table();
+    let size = 8u32;
+    let entries: [(&[u8], Vec<u8>); 2] = [
+        (b"from.png", png_bytes_for(size, size, Rgba([255, 0, 0, 255]))),
+        (b"to.png", png_bytes_for(size, size, Rgba([0, 0, 255, 255]))),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut gfx = state(Viewport::new(size, size), [0, 0, 0, 255]);
+
+    // frame 1: OUT 涂红 → COPY2 冻结到 TMP;OUT 隐藏,屏幕只剩 TMP。
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"FROM".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"from".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"TO".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"to".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"OUT".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(size as i64)),
+                arg(&table, "CG", "SY", Value::Int(size as i64)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"OUT".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0xFFFF_0000u32 as i64)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"TMP".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(size as i64)),
+                arg(&table, "CG", "SY", Value::Int(size as i64)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"FROM".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"TO".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"OUT".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"TMP".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"OUT".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let first = gfx.frame();
+    let out1 = gpu.render_frame(&first).expect("frame1");
+    assert_eq!(
+        pixel_of(&out1.surface, size / 2, size / 2),
+        [255, 0, 0, 255],
+        "快照冻结后屏幕应显示 OUT 的红色拷贝"
+    );
+
+    // frame 2: 改写 OUT;快照仍持有旧表面 ⇒ 必须拒绝复用,红色保留。
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 2 },
+        call(
+            2,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"FROM".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"TO".to_vec())),
+                arg(&table, "CGACT", "ID3", Value::Str(b"OUT".to_vec())),
+                arg(&table, "CGACT", "TRANSITION", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 2 },
+    ]);
+    let second = gfx.frame();
+    let out2 = gpu.render_frame(&second).expect("frame2");
+    let snapshot = gpu.resource_snapshot();
+    assert!(
+        stat(&snapshot, "created") >= 1,
+        "快照仍持有旧表面时必须新建、不能原地改写: {snapshot}"
+    );
+    assert_eq!(
+        pixel_of(&out2.surface, size / 2, size / 2),
+        [255, 0, 0, 255],
+        "冻结快照的像素不得被后续过渡改写"
+    );
+}
+
+/// 同帧同源同区域的多个 `COPY2` 必须共享一张快照纹理(去重),
+/// 像素仍与 soft 全等。
+#[test]
+fn identical_copy2_snapshots_share_one_texture() {
+    let table = table();
+    let size = 8u32;
+    let entries = [(
+        b"a.png".as_slice(),
+        png_bytes_for(size, size, Rgba([10, 20, 30, 255])),
+    )];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(size, size), [0, 0, 0, 255]);
+    let mut events = vec![VmEvent::FrameStart { frame: 1 }];
+    events.push(call(1, "CG", vec![
+        arg(&table, "CG", "ID", Value::Str(b"A".to_vec())),
+        arg(&table, "CG", "FILE", Value::Str(b"a".to_vec())),
+        arg(&table, "CG", "E", Value::Int(0)),
+    ]));
+    for index in 0..4u32 {
+        let name = format!("C{index}").into_bytes();
+        events.push(call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(name.clone())),
+            arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+            arg(&table, "CG", "SX", Value::Int(i64::from(size))),
+            arg(&table, "CG", "SY", Value::Int(i64::from(size))),
+            arg(&table, "CG", "E", Value::Int(i64::from(u32::from(index == 0)))),
+        ]));
+        events.push(call(1, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"A".to_vec())),
+            arg(&table, "CGACT", "ID2", Value::Str(name)),
+            arg(&table, "CGACT", "COPY2", Value::Int(1)),
+            arg(&table, "CGACT", "X", Value::Int(2)),
+            arg(&table, "CGACT", "Y", Value::Int(2)),
+            arg(&table, "CGACT", "X2", Value::Int(5)),
+            arg(&table, "CGACT", "Y2", Value::Int(5)),
+        ]));
+    }
+    events.push(VmEvent::FrameEnd { frame: 1 });
+    gfx.consume_events(&events);
+    let frame = gfx.frame();
+    let out = gpu.render_frame(&frame).expect("gpu");
+    let soft_out = soft.render_frame(&frame);
+    assert_eq!(
+        max_channel_diff(&out.surface, &soft_out.surface),
+        0,
+        "去重后像素必须与 soft 全等"
+    );
+    let snapshot = gpu.resource_snapshot();
+    assert_eq!(
+        stat(&snapshot, "dd"),
+        3,
+        "4 个同源同区域快照应有 3 次去重: {snapshot}"
+    );
+    assert_eq!(
+        stat(&snapshot, "blits"),
+        1,
+        "只有首个快照产生一次真实复制: {snapshot}"
+    );
+    // 区域落点在 (0,0),区域外透明(透过可见快照层显示清屏色)。
+    assert_eq!(pixel_of(&out.surface, 0, 0), [10, 20, 30, 255]);
+    assert_eq!(pixel_of(&out.surface, 7, 7), [0, 0, 0, 255]);
+}
+
+/// 延迟物化:当前帧无读者的 `COPY2` 只登记不复制;后续帧被绘制时
+/// 按登记时刻的源内容补齐,像素与 soft 全等。
+#[test]
+fn deferred_snapshot_materializes_when_read() {
+    let table = table();
+    let size = 8u32;
+    let entries = [(
+        b"a.png".as_slice(),
+        png_bytes_for(size, size, Rgba([90, 40, 10, 255])),
+    )];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(size, size), [0, 0, 0, 255]);
+    gpu.set_defer_snapshots(true);
+
+    let mut events = vec![VmEvent::FrameStart { frame: 1 }];
+    events.push(call(1, "CG", vec![
+        arg(&table, "CG", "ID", Value::Str(b"A".to_vec())),
+        arg(&table, "CG", "FILE", Value::Str(b"a".to_vec())),
+        arg(&table, "CG", "E", Value::Int(0)),
+    ]));
+    for index in 0..4u32 {
+        let name = format!("C{index}").into_bytes();
+        events.push(call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(name.clone())),
+            arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+            arg(&table, "CG", "SX", Value::Int(i64::from(size))),
+            arg(&table, "CG", "SY", Value::Int(i64::from(size))),
+            arg(&table, "CG", "E", Value::Int(0)),
+        ]));
+        events.push(call(1, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"A".to_vec())),
+            arg(&table, "CGACT", "ID2", Value::Str(name)),
+            arg(&table, "CGACT", "COPY2", Value::Int(1)),
+            arg(&table, "CGACT", "X", Value::Int(2)),
+            arg(&table, "CGACT", "Y", Value::Int(2)),
+            arg(&table, "CGACT", "X2", Value::Int(5)),
+            arg(&table, "CGACT", "Y2", Value::Int(5)),
+        ]));
+    }
+    events.push(VmEvent::FrameEnd { frame: 1 });
+    gfx.consume_events(&events);
+    let frame = gfx.frame();
+    let out = gpu.render_frame(&frame).expect("frame1");
+    let soft_out = soft.render_frame(&frame);
+    assert_eq!(max_channel_diff(&out.surface, &soft_out.surface), 0);
+    let snapshot = gpu.resource_snapshot();
+    assert_eq!(
+        stat(&snapshot, "dfr"),
+        4,
+        "无读者的 4 个快照都必须延迟: {snapshot}"
+    );
+    assert_eq!(stat(&snapshot, "blits"), 0, "延迟期间不得复制: {snapshot}");
+
+    // frame 2:C0 变为可见 → 规划期按登记时的源内容补齐,再绘制。
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 2 },
+        call(2, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"A".to_vec())),
+            arg(&table, "CG", "E", Value::Int(0)),
+        ]),
+        call(2, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"C0".to_vec())),
+            arg(&table, "CG", "E", Value::Int(1)),
+        ]),
+        VmEvent::FrameEnd { frame: 2 },
+    ]);
+    let frame = gfx.frame();
+    let out = gpu.render_frame(&frame).expect("frame2");
+    let soft_out = soft.render_frame(&frame);
+    assert_eq!(
+        max_channel_diff(&out.surface, &soft_out.surface),
+        0,
+        "延迟快照补出来的像素必须与 soft 全等"
+    );
+    assert_eq!(pixel_of(&out.surface, 0, 0), [90, 40, 10, 255]);
+    let snapshot = gpu.resource_snapshot();
+    assert!(
+        stat(&snapshot, "blits") >= 1,
+        "被读取的延迟快照必须真实复制: {snapshot}"
+    );
+}
+
+/// 过渡端点:SET=255(k=256)结果逐位等于 `to`,必须直接别名、不做 lerp。
+#[test]
+fn transition_at_endpoint_aliases_to_source() {
+    let table = table();
+    let size = 8u32;
+    let entries: [(&[u8], Vec<u8>); 2] = [
+        (b"from.png", png_bytes_for(size, size, Rgba([200, 40, 10, 180]))),
+        (b"to.png", png_bytes_for(size, size, Rgba([20, 90, 240, 255]))),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(size, size), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"FROM".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(b"from".to_vec())),
+            arg(&table, "CG", "E", Value::Int(0)),
+        ]),
+        call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"TO".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(b"to".to_vec())),
+        ]),
+        call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+            arg(&table, "CG", "SX", Value::Int(i64::from(size))),
+            arg(&table, "CG", "SY", Value::Int(i64::from(size))),
+        ]),
+        call(1, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"FROM".to_vec())),
+            arg(&table, "CGACT", "ID2", Value::Str(b"TO".to_vec())),
+            arg(&table, "CGACT", "ID3", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "TRANSITION", Value::Int(1)),
+            arg(&table, "CGACT", "SET", Value::Int(255)),
+        ]),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let out = gpu.render_frame(&frame).expect("gpu");
+    let soft_out = soft.render_frame(&frame);
+    assert_eq!(max_channel_diff(&out.surface, &soft_out.surface), 0);
+    assert_eq!(pixel_of(&out.surface, 0, 0), [20, 90, 240, 255]);
+    let snapshot = gpu.resource_snapshot();
+    assert!(
+        stat(&snapshot, "tel") >= 1,
+        "SET=255 必须走别名、不做全屏 lerp: {snapshot}"
+    );
+}
+
+/// 清色与过渡之间有 COPY 读目标层:清色不是死写,必须执行。
+#[test]
+fn clear_read_by_copy_is_not_dead() {
+    let table = table();
+    let size = 8u32;
+    let entries: [(&[u8], Vec<u8>); 2] = [
+        (b"from.png", png_bytes_for(size, size, Rgba([200, 40, 10, 180]))),
+        (b"to.png", png_bytes_for(size, size, Rgba([20, 90, 240, 255]))),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(size, size), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"FROM".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(b"from".to_vec())),
+            arg(&table, "CG", "E", Value::Int(0)),
+        ]),
+        call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"TO".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(b"to".to_vec())),
+            arg(&table, "CG", "E", Value::Int(0)),
+        ]),
+        call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+            arg(&table, "CG", "SX", Value::Int(i64::from(size))),
+            arg(&table, "CG", "SY", Value::Int(i64::from(size))),
+            arg(&table, "CG", "E", Value::Int(0)),
+        ]),
+        call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"SNAP".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+            arg(&table, "CG", "SX", Value::Int(i64::from(size))),
+            arg(&table, "CG", "SY", Value::Int(i64::from(size))),
+        ]),
+        call(1, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
+            arg(&table, "CGACT", "SET", Value::Int(0xFFFF_0000u32 as i64)),
+        ]),
+        call(1, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "ID2", Value::Str(b"SNAP".to_vec())),
+            arg(&table, "CGACT", "COPY2", Value::Int(1)),
+        ]),
+        call(1, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"FROM".to_vec())),
+            arg(&table, "CGACT", "ID2", Value::Str(b"TO".to_vec())),
+            arg(&table, "CGACT", "ID3", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "TRANSITION", Value::Int(1)),
+            arg(&table, "CGACT", "SET", Value::Int(128)),
+        ]),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let out = gpu.render_frame(&frame).expect("gpu");
+    let soft_out = soft.render_frame(&frame);
+    assert_eq!(max_channel_diff(&out.surface, &soft_out.surface), 0);
+    assert_eq!(pixel_of(&out.surface, 4, 4), [255, 0, 0, 255]);
+    let snapshot = gpu.resource_snapshot();
+    assert_eq!(
+        stat(&snapshot, "dsw"),
+        0,
+        "中间有 COPY 读取时清色不得被当作死写: {snapshot}"
+    );
+}
+
+/// 真实立绘链:每帧 `整层 RECTPAINT3` + `TRANSITION` 写同一目标。
+/// 清色复用目标旧表面,过渡从池里取回上一帧那张;两者都不再向驱动
+/// 新建表面。
+#[test]
+fn sprite_clear_then_transition_chain_reuses_surfaces() {
+    let table = table();
+    let size = 16u32;
+    let entries: [(&[u8], Vec<u8>); 2] = [
+        (b"from.png", png_bytes_for(size, size, Rgba([200, 40, 10, 180]))),
+        (b"to.png", png_bytes_for(size, size, Rgba([20, 90, 240, 255]))),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(size, size), [0, 0, 0, 255]);
+    for frame_no in 1u64..=20 {
+        let mut events = vec![VmEvent::FrameStart { frame: frame_no }];
+        if frame_no == 1 {
+            events.extend([
+                call(1, "CG", vec![
+                    arg(&table, "CG", "ID", Value::Str(b"FROM".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"from".to_vec())),
+                ]),
+                call(1, "CG", vec![
+                    arg(&table, "CG", "ID", Value::Str(b"TO".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"to".to_vec())),
+                ]),
+                call(1, "CG", vec![
+                    arg(&table, "CG", "ID", Value::Str(b"OUT".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                    arg(&table, "CG", "SX", Value::Int(size as i64)),
+                    arg(&table, "CG", "SY", Value::Int(size as i64)),
+                ]),
+            ]);
+        }
+        events.push(call(frame_no, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
+            arg(&table, "CGACT", "SET", Value::Int(0)),
+        ]));
+        events.push(call(frame_no, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"FROM".to_vec())),
+            arg(&table, "CGACT", "ID2", Value::Str(b"TO".to_vec())),
+            arg(&table, "CGACT", "ID3", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "TRANSITION", Value::Int(1)),
+            arg(&table, "CGACT", "SET", Value::Int((frame_no % 256) as i64)),
+        ]));
+        events.push(VmEvent::FrameEnd { frame: frame_no });
+        gfx.consume_events(&events);
+        let frame = gfx.frame();
+        let gpu_out = gpu.render_frame(&frame).expect("gpu");
+        let soft_out = soft.render_frame(&frame);
+        assert_eq!(max_channel_diff(&gpu_out.surface, &soft_out.surface), 0);
+        if frame_no >= 3 {
+            let snapshot = gpu.resource_snapshot();
+            assert!(
+                stat(&snapshot, "created") <= 1,
+                "清色+过渡链稳态最多新建一张过渡表面: {snapshot}"
+            );
+            assert!(
+                stat(&snapshot, "dsw") >= 1,
+                "紧邻的整层清色应被死写消除: {snapshot}"
+            );
+        }
+    }
+}
+
+/// 真实尺寸(>4MB 池上限)的清色+过渡链:帧末释放的清色表面必须进池,
+/// 下一帧过渡从池里取回,驱动侧不再每帧 allocate 17.8MB。
+#[test]
+fn large_sprite_chain_reuses_pool_surface() {
+    let table = table();
+    let size = 1200u32;
+    let entries: [(&[u8], Vec<u8>); 2] = [
+        (b"from.png", png_bytes_for(size, size, Rgba([200, 40, 10, 180]))),
+        (b"to.png", png_bytes_for(size, size, Rgba([20, 90, 240, 255]))),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(64, 64), [0, 0, 0, 255]);
+    for frame_no in 1u64..=6 {
+        let mut events = vec![VmEvent::FrameStart { frame: frame_no }];
+        if frame_no == 1 {
+            events.extend([
+                call(1, "CG", vec![
+                    arg(&table, "CG", "ID", Value::Str(b"FROM".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"from".to_vec())),
+                ]),
+                call(1, "CG", vec![
+                    arg(&table, "CG", "ID", Value::Str(b"TO".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"to".to_vec())),
+                ]),
+                call(1, "CG", vec![
+                    arg(&table, "CG", "ID", Value::Str(b"OUT".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                    arg(&table, "CG", "SX", Value::Int(size as i64)),
+                    arg(&table, "CG", "SY", Value::Int(size as i64)),
+                ]),
+            ]);
+        }
+        events.push(call(frame_no, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
+            arg(&table, "CGACT", "SET", Value::Int(0)),
+        ]));
+        events.push(call(frame_no, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"FROM".to_vec())),
+            arg(&table, "CGACT", "ID2", Value::Str(b"TO".to_vec())),
+            arg(&table, "CGACT", "ID3", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "TRANSITION", Value::Int(1)),
+            arg(&table, "CGACT", "SET", Value::Int((frame_no % 256) as i64)),
+        ]));
+        events.push(VmEvent::FrameEnd { frame: frame_no });
+        gfx.consume_events(&events);
+        let frame = gfx.frame();
+        let gpu_out = gpu.render_frame(&frame).expect("gpu");
+        let soft_out = soft.render_frame(&frame);
+        assert_eq!(
+            max_channel_diff(&gpu_out.surface, &soft_out.surface),
+            0,
+            "frame {frame_no}: 大表面池复用后必须与 soft 逐字节一致"
+        );
+        if frame_no >= 3 {
+            let snapshot = gpu.resource_snapshot();
+            assert!(
+                stat(&snapshot, "created") <= 1,
+                "大表面链稳态最多新建一张过渡表面: {snapshot}"
+            );
+            assert!(
+                stat(&snapshot, "dsw") >= 1,
+                "大表面链的整层清色应被死写消除: {snapshot}"
+            );
+        }
+    }
+}
+
+/// `SIZE2` 从**资产层**取图后,目标内容别名的是资产纹理。下一帧整层清色
+/// 绝不能把这张资产纹理写坏 —— 资产绝不能进表面池。
+#[test]
+fn asset_alias_is_never_pooled_by_clear() {
+    let table = table();
+    let size = 1200u32;
+    let entries: [(&[u8], Vec<u8>); 1] =
+        [(b"src.png", png_bytes_for(size, size, Rgba([200, 40, 10, 255])))];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(16, 16), [0, 0, 0, 255]);
+
+    let mut events = vec![VmEvent::FrameStart { frame: 1 }];
+    events.extend([
+        call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"SRC".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(b"src".to_vec())),
+        ]),
+        call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+            arg(&table, "CG", "SX", Value::Int(size as i64)),
+            arg(&table, "CG", "SY", Value::Int(size as i64)),
+            arg(&table, "CG", "E", Value::Int(0)),
+        ]),
+        call(1, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"SRC".to_vec())),
+            arg(&table, "CGACT", "ID2", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "SIZE2", Value::Int(1)),
+            arg(&table, "CGACT", "SX", Value::Int(size as i64)),
+            arg(&table, "CGACT", "SY", Value::Int(size as i64)),
+        ]),
+    ]);
+    events.push(VmEvent::FrameEnd { frame: 1 });
+    gfx.consume_events(&events);
+    let frame = gfx.frame();
+    let first = gpu.render_frame(&frame).expect("frame1");
+    let soft1 = soft.render_frame(&frame);
+    assert_eq!(max_channel_diff(&first.surface, &soft1.surface), 0);
+
+    // frame 2: 隐藏的 OUT 整层清蓝。若资产别名被误复用,SRC 的屏幕像素会变蓝。
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 2 },
+        call(2, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
+            arg(&table, "CGACT", "SET", Value::Int(0xFFFF_0000u32 as i64)),
+        ]),
+        VmEvent::FrameEnd { frame: 2 },
+    ]);
+    let frame = gfx.frame();
+    let second = gpu.render_frame(&frame).expect("frame2");
+    let soft2 = soft.render_frame(&frame);
+    assert_eq!(
+        max_channel_diff(&second.surface, &soft2.surface),
+        0,
+        "清色不得改写 SIZE2 来源的资产纹理"
+    );
+    assert_eq!(
+        pixel_of(&second.surface, 8, 8),
+        [200, 40, 10, 255],
+        "SRC 资产像素必须保持不变"
+    );
+}
+
+/// 整层清色 + `SIZE2` 每帧交替:清色那张表面进池,下一帧复用,
+/// 不再每帧分配 643×825 / 1200×1200 级别的中间表面。
+#[test]
+fn clear_then_size_chain_reuses_pool_surface() {
+    let table = table();
+    let size = 1200u32;
+    let entries: [(&[u8], Vec<u8>); 1] =
+        [(b"src.png", png_bytes_for(size, size, Rgba([30, 120, 220, 255])))];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(16, 16), [0, 0, 0, 255]);
+    for frame_no in 1u64..=4 {
+        let mut events = vec![VmEvent::FrameStart { frame: frame_no }];
+        if frame_no == 1 {
+            events.extend([
+                call(1, "CG", vec![
+                    arg(&table, "CG", "ID", Value::Str(b"SRC".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(b"src".to_vec())),
+                    arg(&table, "CG", "E", Value::Int(0)),
+                ]),
+                call(1, "CG", vec![
+                    arg(&table, "CG", "ID", Value::Str(b"OUT".to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                    arg(&table, "CG", "SX", Value::Int(size as i64)),
+                    arg(&table, "CG", "SY", Value::Int(size as i64)),
+                ]),
+            ]);
+        }
+        events.push(call(frame_no, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
+            arg(&table, "CGACT", "SET", Value::Int(0)),
+        ]));
+        events.push(call(frame_no, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"SRC".to_vec())),
+            arg(&table, "CGACT", "ID2", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "SIZE2", Value::Int(1)),
+            arg(&table, "CGACT", "SX", Value::Int(size as i64)),
+            arg(&table, "CGACT", "SY", Value::Int(size as i64)),
+        ]));
+        events.push(VmEvent::FrameEnd { frame: frame_no });
+        gfx.consume_events(&events);
+        let frame = gfx.frame();
+        let gpu_out = gpu.render_frame(&frame).expect("gpu");
+        let soft_out = soft.render_frame(&frame);
+        assert_eq!(max_channel_diff(&gpu_out.surface, &soft_out.surface), 0);
+        if frame_no >= 3 {
+            let snapshot = gpu.resource_snapshot();
+            assert_eq!(stat(&snapshot, "created"), 0, "清色链不应再新建表面: {snapshot}");
+            assert!(stat(&snapshot, "reused") >= 1, "清色表面应从池里复用: {snapshot}");
+        }
+    }
+}
+
+/// 目标旧内容别名**资产纹理**时,过渡必须为结果新建表面,不能把
+/// 游戏资产本身当成过渡画布写坏(资产纹理永不入池)。
+#[test]
+fn asset_alias_is_never_pooled_by_transition() {
+    let table = table();
+    let size = 1200u32;
+    let entries: [(&[u8], Vec<u8>); 3] = [
+        (b"src.png", png_bytes_for(size, size, Rgba([200, 40, 10, 255]))),
+        (b"from.png", png_bytes_for(size, size, Rgba([10, 200, 40, 255]))),
+        (b"to.png", png_bytes_for(size, size, Rgba([10, 40, 200, 255]))),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(16, 16), [0, 0, 0, 255]);
+
+    let mut events = vec![VmEvent::FrameStart { frame: 1 }];
+    events.extend([
+        call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"SRC".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(b"src".to_vec())),
+        ]),
+        call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"FROM".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(b"from".to_vec())),
+            arg(&table, "CG", "E", Value::Int(0)),
+        ]),
+        call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"TO".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(b"to".to_vec())),
+            arg(&table, "CG", "E", Value::Int(0)),
+        ]),
+        call(1, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+            arg(&table, "CG", "SX", Value::Int(size as i64)),
+            arg(&table, "CG", "SY", Value::Int(size as i64)),
+            arg(&table, "CG", "E", Value::Int(0)),
+        ]),
+        call(1, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"SRC".to_vec())),
+            arg(&table, "CGACT", "ID2", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "SIZE2", Value::Int(1)),
+            arg(&table, "CGACT", "SX", Value::Int(size as i64)),
+            arg(&table, "CGACT", "SY", Value::Int(size as i64)),
+        ]),
+    ]);
+    events.push(VmEvent::FrameEnd { frame: 1 });
+    gfx.consume_events(&events);
+    let frame = gfx.frame();
+    gpu.render_frame(&frame).expect("frame1");
+
+    // frame 2: 过渡写 OUT,并让 OUT 可见、SRC 隐藏。
+    // 若资产别名被复用,OUT 的过渡结果会写进 SRC 资产纹理:要么
+    // 渲染 pass 校验失败(OUT 显示旧别名),要么资产像素被改写。
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 2 },
+        call(2, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"SRC".to_vec())),
+            arg(&table, "CG", "E", Value::Int(0)),
+        ]),
+        call(2, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CG", "E", Value::Int(1)),
+        ]),
+        call(2, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"FROM".to_vec())),
+            arg(&table, "CGACT", "ID2", Value::Str(b"TO".to_vec())),
+            arg(&table, "CGACT", "ID3", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "TRANSITION", Value::Int(1)),
+            arg(&table, "CGACT", "SET", Value::Int(128)),
+        ]),
+        VmEvent::FrameEnd { frame: 2 },
+    ]);
+    let frame = gfx.frame();
+    let second = gpu.render_frame(&frame).expect("frame2");
+    let soft2 = soft.render_frame(&frame);
+    assert_eq!(
+        max_channel_diff(&second.surface, &soft2.surface),
+        0,
+        "过渡输出必须与 soft 一致(资产别名不得被当画布)"
+    );
+    assert_ne!(
+        pixel_of(&second.surface, 8, 8),
+        [200, 40, 10, 255],
+        "OUT 显示过渡结果,不能还是被复用的 SRC 资产"
+    );
+
+    // frame 3: 切回 SRC 可见,确认资产纹理像素未被改写。
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 3 },
+        call(3, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"SRC".to_vec())),
+            arg(&table, "CG", "E", Value::Int(1)),
+        ]),
+        call(3, "CG", vec![
+            arg(&table, "CG", "ID", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CG", "E", Value::Int(0)),
+        ]),
+        VmEvent::FrameEnd { frame: 3 },
+    ]);
+    let frame = gfx.frame();
+    let third = gpu.render_frame(&frame).expect("frame3");
+    let soft3 = soft.render_frame(&frame);
+    assert_eq!(max_channel_diff(&third.surface, &soft3.surface), 0);
+    assert_eq!(
+        pixel_of(&third.surface, 8, 8),
+        [200, 40, 10, 255],
+        "SRC 资产像素必须保持不变"
     );
 }

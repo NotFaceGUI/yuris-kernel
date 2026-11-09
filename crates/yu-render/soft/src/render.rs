@@ -118,6 +118,19 @@ impl SoftRenderer {
         (keys.len() as u64, errors)
     }
 
+    /// 预取(默认关闭):把"可能要用"的资产交给后台解码线程。
+    ///
+    /// 不改变缓存/诊断/像素;未命中时 `preload_assets`/`resolve` 仍按原路径
+    /// 同步解码。返回本次提交的 key 数。
+    pub fn prefetch_assets(&mut self, keys: &[Vec<u8>]) -> u64 {
+        self.textures.prefetch_request(keys)
+    }
+
+    /// 预取是否生效。
+    pub fn prefetch_enabled(&self) -> bool {
+        self.textures.prefetch_enabled()
+    }
+
     /// 用调用方字体源构造文本合成器(测试/自带字体)。
     pub fn with_text_source(mut self, source: yu_font::FontSource) -> Self {
         self.text = TextComposer::with_source(source);

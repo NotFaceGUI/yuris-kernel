@@ -2325,6 +2325,151 @@ impl Vm {
             .and_then(|script| script.source_position(pc as usize))
     }
 
+    /// 资产预取候选:**只读**扫描存活任务的脚本及其常量 `GOSUB`/`GO`
+    /// 目标脚本,收集 `CG[FILE=字面量]` 的 key(声明链)。
+    ///
+    /// 这是宿主性能优化用的预测接口,不是命令语义:
+    ///
+    /// - 不执行命令、不改 VM 状态、不装载未装载脚本;
+    /// - 只对**字面量** `FILE` 生效(变量/表达式由运行时决定,无法预知);
+    /// - 每个脚本只扫一次、跟随常量标签(深度 ≤4),**按整个脚本**扫描
+    ///   (不做控制流求值),因此可能多取 —— 由预取池预算与 LRU 兜底;
+    /// - 真正的 `CG[FILE]` 到来时仍走原来的同步装载,未命中/多取都不改变
+    ///   任何一帧的像素。
+    ///
+    /// 空 key(`FILE=""` = 1×1 黑图)不返回。
+    #[must_use]
+    pub fn prefetch_declarations(&self, window: usize) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        if window == 0 {
+            return out;
+        }
+        let mut seen_keys = std::collections::BTreeSet::new();
+        let mut seen_scripts = std::collections::BTreeSet::new();
+        let mut seen_labels = std::collections::BTreeSet::new();
+        for node in self.scheduler.nodes() {
+            if node.finished {
+                continue;
+            }
+            // 每个任务独立预算:否则高优先级任务的扫描会把预算吃光,
+            // 后面的任务(常常才是当前场景)永远看不到。
+            let mut budget = 4096usize;
+            self.scan_prefetch(
+                node.script_id,
+                window,
+                0,
+                &mut budget,
+                &mut seen_scripts,
+                &mut seen_labels,
+                &mut seen_keys,
+                &mut out,
+            );
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_prefetch(
+        &self,
+        script_id: u32,
+        window: usize,
+        depth: u32,
+        budget: &mut usize,
+        seen_scripts: &mut std::collections::BTreeSet<u32>,
+        seen_labels: &mut std::collections::BTreeSet<(u16, u32)>,
+        seen_keys: &mut std::collections::BTreeSet<Vec<u8>>,
+        out: &mut Vec<Vec<u8>>,
+    ) {
+        if depth > 4 || *budget == 0 {
+            return;
+        }
+        let Some(script) = self.tables.script(script_id) else {
+            // 未装载的脚本不在这里做 I/O;但不能标记为已扫描,
+            // 否则该脚本稍后被装载就永远不再进入预取扫描。
+            return;
+        };
+        if !seen_scripts.insert(script_id) {
+            return;
+        }
+        let end = window.min(script.group_count());
+        for pc in 0..end {
+            if *budget == 0 {
+                break;
+            }
+            *budget -= 1;
+            let Some(group) = script.group(pc) else {
+                break;
+            };
+            let Some(decl) = self.tables.boot.yscm.command(group.opcode) else {
+                continue;
+            };
+            match decl.name.as_str() {
+                "CG" => {
+                    for rec in script.group_windows(pc) {
+                        // `rec.slot` 才是参数表下标:命令只编码实际给出的
+                        // 窗口,不能用窗口序号当参数序号。
+                        let Some(param) = decl.params.get(rec.slot as usize) else {
+                            continue;
+                        };
+                        if param.name != "FILE" {
+                            continue;
+                        }
+                        let Some(payload) = script.window_payload(rec) else {
+                            continue;
+                        };
+                        let value = crate::expr::decode(payload)
+                            .ok()
+                            .and_then(|instrs| crate::expr::const_value_instrs(&instrs));
+                        let Some(Value::Str(key)) = value else {
+                            continue;
+                        };
+                        if key.is_empty() {
+                            continue;
+                        }
+                        if seen_keys.insert(key.clone()) {
+                            out.push(key);
+                        }
+                    }
+                }
+                "GOSUB" | "GO" => {
+                    if let Some(label) = self.static_label(script, pc) {
+                        let target = (label.script_id, label.pc);
+                        if seen_labels.insert(target) {
+                            self.scan_prefetch(
+                                u32::from(label.script_id),
+                                window,
+                                depth + 1,
+                                budget,
+                                seen_scripts,
+                                seen_labels,
+                                seen_keys,
+                                out,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 静态解析 `GOSUB`/`GO` 的首窗口标签(仅字面量;变量标签返回 `None`)。
+    fn static_label(
+        &self,
+        script: &crate::tables::ScriptFile,
+        pc: usize,
+    ) -> Option<crate::tables::Label> {
+        let rec = script.group_windows(pc).first()?;
+        let payload = script.window_payload(rec)?;
+        let value = crate::expr::decode(payload)
+            .ok()
+            .and_then(|instrs| crate::expr::const_value_instrs(&instrs))?;
+        let Value::Str(name) = value else {
+            return None;
+        };
+        self.find_label(&name)
+    }
+
     /// 最近一条已执行命令的落点(诊断:脚本显示名、pc、任务名)。
     ///
     /// 长帧取证用:和 `take_command_hit_deltas` 一起回答「这一帧在跑谁」。
