@@ -76,8 +76,14 @@ public final class MainActivity extends Activity
     static final String EXTRA_SNAPSHOT_DEFER = "snapshot_defer";
     /** 手机画质:`SIZE`(官方最近邻)改双线性采样,缓解 CG/差分缩放锯齿。 */
     static final String EXTRA_BILINEAR_SCALE = "bilinear_scale";
-    /** 性能:Android PNG 解码走 libpng(NEON 反滤波);关 = image crate。 */
-    static final String EXTRA_PNG_FAST = "png_fast";
+    /** 高级诊断:VM opcode 逐条耗时归因。 */
+    static final String EXTRA_VM_PROFILE = "vm_profile";
+    /** 高级诊断:资产装载/预取计时。 */
+    static final String EXTRA_ASSET_TIMING = "asset_timing";
+    /** 高级诊断:tick 内部分段计时。 */
+    static final String EXTRA_TICK_SPLIT = "tick_split";
+    /** 高级诊断:CG 差分计时。 */
+    static final String EXTRA_CG_TIMING = "cg_timing";
 
     /**
      * {@link NativeHost#nativeTick()} 的"游戏已结束"返回码。
@@ -659,11 +665,17 @@ public final class MainActivity extends Activity
             if (getIntent().getBooleanExtra(EXTRA_BILINEAR_SCALE, false)) {
                 config.put("bilinear_scale", true);
             }
-            // PNG 解码后端:壳显式写值;缺省(image)与未写键同义。
-            if (getIntent().getBooleanExtra(EXTRA_PNG_FAST, false)) {
-                config.put("png_backend", "libpng");
-            } else {
-                config.put("png_backend", "image");
+            if (getIntent().getBooleanExtra(EXTRA_VM_PROFILE, false)) {
+                config.put("vm_profile", true);
+            }
+            if (getIntent().getBooleanExtra(EXTRA_ASSET_TIMING, false)) {
+                config.put("asset_timing", true);
+            }
+            if (getIntent().getBooleanExtra(EXTRA_TICK_SPLIT, false)) {
+                config.put("tick_split", true);
+            }
+            if (getIntent().getBooleanExtra(EXTRA_CG_TIMING, false)) {
+                config.put("cg_timing", true);
             }
         } catch (org.json.JSONException error) {
             Log.e(TAG, "config build failed", error);

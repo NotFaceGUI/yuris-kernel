@@ -69,8 +69,6 @@ public final class SetupActivity extends AppCompatActivity {
     private String patch = "auto";
     /** 存档块压缩层:"" = 自动判定 / "zlib" / "snappy"。 */
     private String saveCodec = "";
-    /** 帧率:0 = 内核缺省(60)。 */
-    private int fps = 0;
     /** 写调试日志到游戏目录(debug/*.jsonl)。 */
     private boolean debugLog;
     /** 状态浮层(HUD)。发布默认关:浮层每秒还要拼状态串。 */
@@ -81,8 +79,14 @@ public final class SetupActivity extends AppCompatActivity {
     private boolean snapshotDefer;
     /** `SIZE` 双线性采样(手机画质;默认开,官方是最近邻)。 */
     private boolean bilinearScale = true;
-    /** Android PNG 解码走 libpng(NEON 反滤波;默认开,可关回 image crate)。 */
-    private boolean pngFast = true;
+    /** 高级诊断:VM opcode 逐条耗时归因(等价 --vm-profile)。 */
+    private boolean vmProfile;
+    /** 高级诊断:资产装载/预取计时(等价 --asset-timing)。 */
+    private boolean assetTiming;
+    /** 高级诊断:tick 内部分段计时(等价 --tick-split)。 */
+    private boolean tickSplit;
+    /** 高级诊断:CG 差分计时(等价 --cg-timing)。 */
+    private boolean cgTiming;
     private List<String> systemFonts = new ArrayList<>();
     /** 上次选中的字体(持久化;下拉加载完成后恢复选中)。 */
     private String savedFontFamily = "";
@@ -102,16 +106,20 @@ public final class SetupActivity extends AppCompatActivity {
             importedFontName = new File(fontPath).getName();
         }
         backend = prefs.getString("backend", "soft");
+        // CPU 模式已停用:壳只提供 GPU 路径,CPU 按钮仅占位。
+        backend = "wgpu";
         gpuBackend = prefs.getString("gpu_backend", "auto");
         patch = prefs.getString("patch", "auto");
         saveCodec = prefs.getString("save_codec", "");
-        fps = prefs.getInt("fps", 0);
         debugLog = prefs.getBoolean("debug_log", false);
         showHud = prefs.getBoolean("show_hud", false);
         prefetch = prefs.getBoolean("prefetch", false);
         snapshotDefer = prefs.getBoolean("snapshot_defer", false);
         bilinearScale = prefs.getBoolean("bilinear_scale", true);
-        pngFast = prefs.getBoolean("png_fast", true);
+        vmProfile = prefs.getBoolean("vm_profile", false);
+        assetTiming = prefs.getBoolean("asset_timing", false);
+        tickSplit = prefs.getBoolean("tick_split", false);
+        cgTiming = prefs.getBoolean("cg_timing", false);
 
         ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(BG);
@@ -174,18 +182,17 @@ public final class SetupActivity extends AppCompatActivity {
         fontCard.addView(importFont, buttonParams());
         root.addView(fontCard, cardParams());
 
-        // ---- 运行(后端 / 调试) ----
+        // ---- 运行(后端) ----
         LinearLayout runCard = card();
         runCard.addView(sectionTitle("运行"));
 
         LinearLayout backendRow = new LinearLayout(this);
         backendRow.setOrientation(LinearLayout.HORIZONTAL);
-        Button cpuButton = secondaryButton("CPU");
+        Button cpuButton = secondaryButton("CPU(已停用)");
         Button gpuButton = secondaryButton("GPU");
-        cpuButton.setOnClickListener(v -> {
-            backend = "soft";
-            refreshRunButtons(cpuButton, gpuButton);
-        });
+        // CPU 模式已停用:保留按钮占位,不可选;Android 固定走 GPU。
+        cpuButton.setEnabled(false);
+        cpuButton.setAlpha(0.35f);
         gpuButton.setOnClickListener(v -> {
             backend = "wgpu";
             refreshRunButtons(cpuButton, gpuButton);
@@ -199,6 +206,24 @@ public final class SetupActivity extends AppCompatActivity {
         backendRow.addView(cpuButton, cpuParams);
         backendRow.addView(gpuButton, gpuParams);
         runCard.addView(backendRow);
+        runCard.addView(hintText("CPU 模式已停用,按钮仅占位;Android 固定走 GPU。"));
+        root.addView(runCard, cardParams());
+        refreshRunButtons(cpuButton, gpuButton);
+
+        // ---- 高级设置(可展开/收起) ----
+        LinearLayout advancedCard = card();
+        Button advancedHeader = secondaryButton("高级设置 ▸");
+        advancedHeader.setTextSize(14f);
+        advancedCard.addView(advancedHeader, buttonParams());
+        LinearLayout advancedBody = new LinearLayout(this);
+        advancedBody.setOrientation(LinearLayout.VERTICAL);
+        advancedBody.setVisibility(View.GONE);
+        advancedCard.addView(advancedBody);
+        advancedHeader.setOnClickListener(v -> {
+            boolean open = advancedBody.getVisibility() == View.VISIBLE;
+            advancedBody.setVisibility(open ? View.GONE : View.VISIBLE);
+            advancedHeader.setText(open ? "高级设置 ▸" : "高级设置 ▾");
+        });
 
         // GPU 底层接口三选一(GPU 模式下有意义)。Android 模拟器的 Vulkan
         // 驱动会在提交流程内崩溃,GLES 更稳;真机两者都可。
@@ -232,94 +257,32 @@ public final class SetupActivity extends AppCompatActivity {
         gpuRow.addView(autoButton, third);
         gpuRow.addView(glesButton, third2);
         gpuRow.addView(vulkanButton, third3);
-        runCard.addView(gpuRow);
+        advancedBody.addView(gpuRow);
         refreshGpuButtons(autoButton, glesButton, vulkanButton);
 
-        // 状态浮层:只在需要看帧率/计数时打开。关闭时壳完全不调
-        // nativeStatus(),也就没有每秒一次的状态串拼装与 logcat 写入。
-        Button hudToggle = secondaryButton("状态浮层:关");
-        hudToggle.setTextColor(TEXT);
-        hudToggle.setOnClickListener(v -> {
-            showHud = !showHud;
-            hudToggle.setText(showHud ? "状态浮层:开(帧率/计数)" : "状态浮层:关");
-            hudToggle.setTextColor(showHud ? ACCENT : TEXT);
-        });
-        runCard.addView(hudToggle, buttonParams());
-        if (showHud) {
-            hudToggle.setText("状态浮层:开(帧率/计数)");
-            hudToggle.setTextColor(ACCENT);
-        }
+        advancedBody.addView(toggleButton(
+                "状态浮层:开(帧率/计数)", "状态浮层:关", showHud, v -> showHud = v), buttonParams());
+        advancedBody.addView(toggleButton(
+                "调试日志:开(写游戏目录)", "调试日志:关", debugLog, v -> debugLog = v), buttonParams());
+        advancedBody.addView(toggleButton(
+                "资产预取:开(后台解码)", "资产预取:关", prefetch, v -> prefetch = v), buttonParams());
+        advancedBody.addView(toggleButton(
+                "快照延迟:开(菜单少拷贝)", "快照延迟:关", snapshotDefer, v -> snapshotDefer = v), buttonParams());
+        advancedBody.addView(toggleButton(
+                "SIZE 双线性:开(手机抗锯齿)", "SIZE 双线性:关(官方最近邻)",
+                bilinearScale, v -> bilinearScale = v), buttonParams());
 
-        Button debugToggle = secondaryButton("调试日志:关");
-        debugToggle.setOnClickListener(v -> {
-            debugLog = !debugLog;
-            debugToggle.setText(debugLog ? "调试日志:开(写游戏目录)" : "调试日志:关");
-            debugToggle.setTextColor(debugLog ? ACCENT : TEXT);
-        });
-        runCard.addView(debugToggle, buttonParams());
-        if (debugLog) {
-            debugToggle.setText("调试日志:开(写游戏目录)");
-            debugToggle.setTextColor(ACCENT);
-        }
-
-        // 性能特性(默认关;开启后与桌面环境变量同一实现)。
-        Button prefetchToggle = secondaryButton("资产预取:关");
-        prefetchToggle.setOnClickListener(v -> {
-            prefetch = !prefetch;
-            prefetchToggle.setText(prefetch ? "资产预取:开(后台解码)" : "资产预取:关");
-            prefetchToggle.setTextColor(prefetch ? ACCENT : TEXT);
-        });
-        runCard.addView(prefetchToggle, buttonParams());
-        if (prefetch) {
-            prefetchToggle.setText("资产预取:开(后台解码)");
-            prefetchToggle.setTextColor(ACCENT);
-        }
-
-        Button deferToggle = secondaryButton("快照延迟:关");
-        deferToggle.setOnClickListener(v -> {
-            snapshotDefer = !snapshotDefer;
-            deferToggle.setText(snapshotDefer ? "快照延迟:开(菜单少拷贝)" : "快照延迟:关");
-            deferToggle.setTextColor(snapshotDefer ? ACCENT : TEXT);
-        });
-        runCard.addView(deferToggle, buttonParams());
-        if (snapshotDefer) {
-            deferToggle.setText("快照延迟:开(菜单少拷贝)");
-            deferToggle.setTextColor(ACCENT);
-        }
-
-        // 手机画质:`SIZE` 官方是最近邻,高 DPI 屏幕上 CG/差分缩放会锯齿;
-        // 打开后按双线性采样(与官方像素有差异,已记 DIV-GFX-083)。
-        Button bilinearToggle = secondaryButton("SIZE 双线性:开(手机抗锯齿)");
-        bilinearToggle.setTextColor(ACCENT);
-        bilinearToggle.setOnClickListener(v -> {
-            bilinearScale = !bilinearScale;
-            bilinearToggle.setText(bilinearScale
-                    ? "SIZE 双线性:开(手机抗锯齿)"
-                    : "SIZE 双线性:关(官方最近邻)");
-            bilinearToggle.setTextColor(bilinearScale ? ACCENT : TEXT);
-        });
-        runCard.addView(bilinearToggle, buttonParams());
-        if (!bilinearScale) {
-            bilinearToggle.setText("SIZE 双线性:关(官方最近邻)");
-        }
-
-        // PNG 解码后端:libpng 的 arm NEON 反滤波通常快于纯 Rust;
-        // 像素一致性已由 `png_libpng_parity` 对 1253 张语料锁定。
-        Button pngToggle = secondaryButton("PNG 解码:libpng(快)");
-        pngToggle.setTextColor(pngFast ? ACCENT : TEXT);
-        pngToggle.setOnClickListener(v -> {
-            pngFast = !pngFast;
-            pngToggle.setText(pngFast
-                    ? "PNG 解码:libpng(快)"
-                    : "PNG 解码:image crate(稳)");
-            pngToggle.setTextColor(pngFast ? ACCENT : TEXT);
-        });
-        runCard.addView(pngToggle, buttonParams());
-        if (!pngFast) {
-            pngToggle.setText("PNG 解码:image crate(稳)");
-        }
-        root.addView(runCard, cardParams());
-        refreshRunButtons(cpuButton, gpuButton);
+        // 诊断开关:只影响日志/计时,不改画面;默认全关。
+        advancedBody.addView(toggleButton(
+                "VM 归因:开", "VM 归因:关", vmProfile, v -> vmProfile = v), buttonParams());
+        advancedBody.addView(toggleButton(
+                "资产计时:开", "资产计时:关", assetTiming, v -> assetTiming = v), buttonParams());
+        advancedBody.addView(toggleButton(
+                "tick 分段:开", "tick 分段:关", tickSplit, v -> tickSplit = v), buttonParams());
+        advancedBody.addView(toggleButton(
+                "CG 计时:开", "CG 计时:关", cgTiming, v -> cgTiming = v), buttonParams());
+        advancedBody.addView(hintText("诊断开关只影响日志/计时,不改画面;默认全关。"));
+        root.addView(advancedCard, cardParams());
 
         // ---- 文本编码 ----
         LinearLayout textCard = card();
@@ -761,13 +724,15 @@ public final class SetupActivity extends AppCompatActivity {
                 .putString("gpu_backend", gpuBackend)
                 .putString("patch", patch)
                 .putString("save_codec", saveCodec)
-                .putInt("fps", fps)
                 .putBoolean("debug_log", debugLog)
                 .putBoolean("show_hud", showHud)
                 .putBoolean("prefetch", prefetch)
                 .putBoolean("snapshot_defer", snapshotDefer)
                 .putBoolean("bilinear_scale", bilinearScale)
-                .putBoolean("png_fast", pngFast)
+                .putBoolean("vm_profile", vmProfile)
+                .putBoolean("asset_timing", assetTiming)
+                .putBoolean("tick_split", tickSplit)
+                .putBoolean("cg_timing", cgTiming)
                 .apply();
         Intent intent = new Intent(this, MainActivity.class);
         intent.putExtra(MainActivity.EXTRA_GAME_DIR, gameDir);
@@ -780,13 +745,13 @@ public final class SetupActivity extends AppCompatActivity {
         intent.putExtra(MainActivity.EXTRA_PREFETCH, prefetch);
         intent.putExtra(MainActivity.EXTRA_SNAPSHOT_DEFER, snapshotDefer);
         intent.putExtra(MainActivity.EXTRA_BILINEAR_SCALE, bilinearScale);
-        intent.putExtra(MainActivity.EXTRA_PNG_FAST, pngFast);
+        intent.putExtra(MainActivity.EXTRA_VM_PROFILE, vmProfile);
+        intent.putExtra(MainActivity.EXTRA_ASSET_TIMING, assetTiming);
+        intent.putExtra(MainActivity.EXTRA_TICK_SPLIT, tickSplit);
+        intent.putExtra(MainActivity.EXTRA_CG_TIMING, cgTiming);
         intent.putExtra(MainActivity.EXTRA_PATCH, patch);
         if (!saveCodec.isEmpty()) {
             intent.putExtra(MainActivity.EXTRA_SAVE_CODEC, saveCodec);
-        }
-        if (fps > 0) {
-            intent.putExtra(MainActivity.EXTRA_FPS, fps);
         }
         String fontFileToUse = chosenFontFile != null ? chosenFontFile : fontPath;
         if (fontFileToUse != null) {
@@ -860,6 +825,21 @@ public final class SetupActivity extends AppCompatActivity {
         button.setBackground(rounded(Color.parseColor("#252b36"), 11));
         button.setStateListAnimator(null);
         attachPressAnimation(button);
+        return button;
+    }
+
+    /** 布尔开关按钮:点击翻转并回写字段;`initial` 决定初始文案/高亮。 */
+    private Button toggleButton(String onText, String offText, boolean initial,
+                                java.util.function.Consumer<Boolean> setter) {
+        Button button = secondaryButton(initial ? onText : offText);
+        button.setTextColor(initial ? ACCENT : TEXT);
+        final boolean[] state = { initial };
+        button.setOnClickListener(v -> {
+            state[0] = !state[0];
+            setter.accept(state[0]);
+            button.setText(state[0] ? onText : offText);
+            button.setTextColor(state[0] ? ACCENT : TEXT);
+        });
         return button;
     }
 
