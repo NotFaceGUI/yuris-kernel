@@ -45,6 +45,14 @@ debug = false
 [profile.test.package.libz-sys]
 debug = false
 
+# mimalloc 的 C 静态库同理:dev/test 档带 `-Z7` 会触发同一个 cl D8050
+# (c1xx.dll 命令行调试记录溢出);它是纯 C 分配器,调试信息无价值。
+[profile.dev.package.libmimalloc-sys]
+debug = false
+
+[profile.test.package.libmimalloc-sys]
+debug = false
+
 # 图像解码同理:zune-jpeg 是纯计算密集的第三方实现,dev 档未优化时单帧
 # 400×300 解码要 ~27 ms,release 只要 0.6 ms(B14 实测,45×)。影片播放每换
 # 一帧都解两张 JPEG,dev 档会把 60 fps 直接打到 30 fps —— 与实现无关,只是

@@ -6,6 +6,12 @@
 use yu_cli::build_info;
 use yu_cli::{output, CliResult, Failure, EXIT_FAIL};
 
+// 全局分配器(默认 feature `mimalloc`;`--no-default-features --features desktop`
+// 可关)。只影响本进程的 Rust 分配,不改变任何引擎语义。
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     // 统一控制台(Q1):启动时刻戳先行,日志行才有 `[  +s]` 前缀。
     yu_log::console::init_process_start();

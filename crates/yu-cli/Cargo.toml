@@ -24,11 +24,16 @@ path = "src/engine_main.rs"
 [features]
 # 桌面窗口模式(`yu-cli run --mode desktop`)默认可用;纯 headless/CI
 # 构建用 `--no-default-features`(不依赖声卡,不链 winit/egui)。
-default = ["desktop"]
+# `mimalloc` 默认开启(全局分配器,VM/渲染大量小对象);需要 A/B 时用
+# `--no-default-features --features desktop` 关掉。
+default = ["desktop", "mimalloc"]
 desktop = ["dep:yu-host-desktop"]
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 log = "0.4"
+# 全局分配器(默认 feature `mimalloc`;入口在 main.rs / engine_main.rs)。
+mimalloc = { version = "0.1", default-features = false, optional = true }
 wgpu = "30.0.1"
 yu-backend-soft = { path = "../yu-render/soft" }
 yu-render-core = { path = "../yu-render/core" }

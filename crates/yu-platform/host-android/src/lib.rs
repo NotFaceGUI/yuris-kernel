@@ -41,6 +41,12 @@
 #![deny(unsafe_code)]
 #![allow(clippy::result_large_err)]
 
+// 全局分配器:只替换本 so 内 Rust 侧的 malloc(mimalloc),不触碰 JVM/Java 堆。
+// 依赖与 `local_dynamic_tls` 见 Cargo.toml 的 android target 段。
+#[cfg(target_os = "android")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod logging;
 pub mod present;
 pub mod sound;
@@ -1162,7 +1168,8 @@ pub fn tick() -> i32 {
                             report.ms,
                             // **`tick_ms` 包含 preload**:它从 `vm.tick_at()` 之前
                             // 开始、到 `frame()` 之后结束,中间夹着
-                            // `preload_assets()`(纹理解码 + GPU 上传)。
+                            // `preload_assets()`(纹理解码;GPU 上传已延迟到
+                            // `plan` 首绘)。
                             // 真机 566 层场景一次 `tick=2883ms` 里 render 只占
                             // 257ms —— 差额就在预加载。不打出这几项无法归因。
                             session.engine.preload_ms(),

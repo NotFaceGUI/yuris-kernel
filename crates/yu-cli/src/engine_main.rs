@@ -7,6 +7,12 @@ use yu_cli::output;
 use yu_cli::server::{self, ServeOptions};
 use yu_cli::{CliResult, Failure, EXIT_FAIL};
 
+// 与 `yu-cli` 同口径:dev 拉起的 `yu-serve` 也走 mimalloc,否则 HMR 模式
+// 测不到分配器收益。
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     // 统一控制台(Q1):启动时刻戳先行,日志行才有 `[  +s]` 前缀。
     yu_log::console::init_process_start();

@@ -28,6 +28,9 @@ yu-save = { path = "../../yu-save" }
 yu-sound = { path = "../../yu-sound" }
 
 [target.'cfg(target_os = "android")'.dependencies]
+# 全局分配器:Android so 内的 Rust 分配走 mimalloc(JVM/Java 堆不受影响)。
+# `local_dynamic_tls` 是 Android(minSdk 24)的 TLS 模型要求。
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
 # logcat 由 `src/logging.rs` 直接调 `__android_log_write`(单一日志器双写
 # logcat + 文件);不再需要 `android_logger` 这个全局 logger 后端。
 # 零拷贝上屏:ANativeWindow_fromSurface 把 Java Surface 转成原生窗口,
