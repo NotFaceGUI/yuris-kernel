@@ -187,6 +187,11 @@ impl SoftRenderer {
         &mut self.textures
     }
 
+    /// 该资产 key 是否已有缓存条目(含失败条目;引擎 tick 末 sweep 用)。
+    pub fn asset_cached(&self, key: &[u8]) -> bool {
+        self.textures.cached(key)
+    }
+
     /// 注入「上一帧屏幕」(引擎 `COPY ID=:/W0/` 读的后缓冲)。
     ///
     /// 供离屏抓帧(存档缩略图)复用主渲染路径:抓帧渲染器不参与逐帧呈现,
@@ -205,7 +210,9 @@ impl SoftRenderer {
 
     /// 执行一帧。输出表面尺寸恒为 `frame.viewport`。
     pub fn render_frame(&mut self, frame: &CompositorFrame) -> RenderOutput {
-        self.textures.begin_frame();
+        // 本帧仍被图层/文本引用的资产:预算回收硬保护(图层只存 key,
+        // 帧间 `strong_count == 1`,不保护会被误回收后重解码)。
+        self.textures.begin_frame_for(frame);
         prune_snapshots(&mut self.snapshots, frame);
         let mut st = RenderState::new(frame, &mut self.text, &mut self.diffusion_seed);
         let mut screen: Option<Surface> = None;

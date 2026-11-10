@@ -590,6 +590,14 @@ impl Renderer {
         }
     }
 
+    /// 该资产 key 是否已有缓存条目(含失败条目)。
+    fn asset_cached(&self, key: &[u8]) -> bool {
+        match self {
+            Renderer::Soft(renderer) => renderer.asset_cached(key),
+            Renderer::Wgpu { renderer, .. } => renderer.asset_cached(key),
+        }
+    }
+
     /// 资产预取(`tuning.prefetch`;默认关):提交后台解码,立即返回。
     fn prefetch_assets(&mut self, keys: &[Vec<u8>]) -> u64 {
         match self {
@@ -1650,6 +1658,48 @@ impl Engine {
             );
         }
         let drawable = frame_has_drawable_output(&frame);
+
+        // 本帧图层/文本引用的资产必须在 render 前已有 CPU 像素:漏过
+        // `CG[FILE]` 声明(例如 `CGACT ID2` 首次引用)或刚被预算回收的 key,
+        // 若留到 `plan` 里 `resolve_ref` 才解码,就是角色/差分切换的
+        // 5–8ms 级尖峰。这里补一次,plan 只做首绘 GPU 上传。
+        let sweep_started = Instant::now();
+        let mut missing_assets: Vec<Vec<u8>> = Vec::new();
+        {
+            let mut seen: std::collections::BTreeSet<&[u8]> = std::collections::BTreeSet::new();
+            for layer in &frame.layers {
+                if let TextureRef::Asset(key) = &layer.texture {
+                    if !self.renderer.asset_cached(key) && seen.insert(key.as_slice()) {
+                        missing_assets.push(key.clone());
+                    }
+                }
+            }
+            for draw in &frame.text_draws {
+                let Some(image) = &draw.image else { continue };
+                if !self.renderer.asset_cached(&image.asset)
+                    && seen.insert(image.asset.as_slice())
+                {
+                    missing_assets.push(image.asset.clone());
+                }
+            }
+        }
+        if !missing_assets.is_empty() {
+            let (assets, errors) = self.renderer.preload_assets(&missing_assets);
+            let ms = sweep_started.elapsed().as_secs_f64() * 1000.0;
+            self.last_preload_ms += ms;
+            self.last_preload_assets += assets;
+            self.last_preload_errors += errors;
+            if self.opts.tuning.asset_timing {
+                log::warn!(
+                    target: "yu-engine",
+                    "[preload] frame={} sweep={} errors={} ms={:.1}",
+                    self.frame.wrapping_add(1),
+                    assets,
+                    errors,
+                    ms
+                );
+            }
+        }
 
         let render_started = Instant::now();
         // `--no-render`(安卓诊断):完全跳过渲染,复用上一帧的呈现面。

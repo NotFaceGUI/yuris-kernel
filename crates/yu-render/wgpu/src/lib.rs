@@ -256,17 +256,17 @@ impl WgpuRenderer {
         Self::new_with_options(textures, &DeviceOptions::default())
     }
 
-    /// 在命令时刻预热资产:解码 + GPU 上传(官方 `CG[FILE]` 在命令处理体内
-    /// 同步装载纹理;渲染首用只命中缓存)。失败由 `TextureStore` 缓存,
-    /// 渲染阶段的 `asset.*` 诊断照常产出。
+    /// 在命令时刻预热资产:只解码 CPU 像素(官方 `CG[FILE]` 在命令处理体内
+    /// 同步装载纹理;GPU 上传留到本帧 `plan` 首次绘制)。
+    ///
+    /// 不在这里 `ensure_asset`:一次场景入场会声明几十个资产,逐个
+    /// `write_texture` 会把整批上传压在同一帧、且包含本帧根本不画的图。
+    /// 上传延迟后总量只按"真正绘制"计,像素与首绘时刻都不变。
     pub fn preload_assets(&mut self, keys: &[Vec<u8>]) -> (u64, u64) {
         self.textures.preload_parallel(keys);
         let mut errors = 0u64;
         for key in keys {
-            if let Err(diag) = self
-                .gpu_textures
-                .ensure_asset(&self.ctx, &mut self.textures, key)
-            {
+            if let Err(diag) = self.textures.resolve(key) {
                 errors += 1;
                 // 与 soft 后端同口径:官方 `CG[FILE]` 装载失败静默,缺资产
                 // 由 `RenderReport`(missing assets / `asset.missing` 跳过项)
@@ -523,6 +523,11 @@ impl WgpuRenderer {
         &mut self.textures
     }
 
+    /// 该资产 key 是否已有缓存条目(含失败条目;引擎 tick 末 sweep 用)。
+    pub fn asset_cached(&self, key: &[u8]) -> bool {
+        self.textures.cached(key)
+    }
+
     /// 累计 draw call 数(跨帧)。
     pub fn total_draw_calls(&self) -> u64 {
         self.total_draw_calls
@@ -774,7 +779,10 @@ impl WgpuRenderer {
     ) -> Result<(WgpuRenderOutput, Option<(u64, u32, u32)>), Diag> {
         let timing = self.tuning.render_timing;
         let started = std::time::Instant::now();
-        self.textures.begin_frame();
+        // 本帧仍被图层/文本引用的资产 = 预算回收的硬保护集合;图层只存
+        // asset key,帧间 `strong_count == 1`,不保护就会被当作"无引用"回收,
+        // 下一帧再解码 + 上传(差分切换的偶发尖峰)。
+        self.textures.begin_frame_for(frame);
         // CPU 预算刚回收了一批资产 ⇒ 同步释放它们的 GPU 纹理。
         // 两边不同步时 GPU 显存随「见过的资产种类」单调增长(手机上表现为
         // 越玩越卡、最终 OOM);详见 `TextureCache::release_evicted`。
