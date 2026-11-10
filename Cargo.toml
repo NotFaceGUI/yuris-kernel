@@ -60,3 +60,12 @@ opt-level = 3
 
 [profile.test.package.image]
 opt-level = 3
+
+# 发布档优化(跨平台通用,不绑定 CPU 指令集):
+# - fat LTO:跨 crate 内联/常量传播,消除引擎/渲染/字体之间的调用边界;
+# - codegen-units = 1:本 crate 单编译单元,LLVM 能做更激进的优化。
+# 代价是 release 构建明显变慢;dev/test 档不受影响。
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
