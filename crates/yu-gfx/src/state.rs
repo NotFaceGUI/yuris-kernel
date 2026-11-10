@@ -22,6 +22,8 @@
 //! 未取证语义的图层用 `LayerStatus::Unimplemented` 标记,由后端跳过。
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use rustc_hash::FxHashMap;
 use std::hash::{Hash, Hasher};
 
 use yu_format::text::DisplayConfig;
@@ -177,7 +179,12 @@ struct GlyphChain {
 pub struct GfxState {
     params: ParamTable,
     config: GfxConfig,
-    nodes: BTreeMap<LayerId, Node>,
+    /// 图层节点(按路径;`CG`/`CGACT` 每帧数万次查找)。
+    ///
+    /// 哈希表:层序不靠 map 迭代顺序 —— `frame()` 收集后按
+    /// `(z, seq, id)` 排序(与旧 BTreeMap 的可见顺序一致),所以这里
+    /// 只承担 O(1) 查找。
+    nodes: FxHashMap<LayerId, Node>,
     seq: u64,
     copy_seq: u64,
     /// COPY + 图像加工的共同命令序(EVID-T-15;`frame()` 交错输出)。
@@ -250,14 +257,14 @@ pub struct GfxState {
     /// 由 VM 在 `CGINFO[SX/SY]` 回退路径解析图像头后注入(DIV-GFX-024):
     /// gfx 自己不做文件 I/O,但 `CGINFO` 必须与引擎一样在**脚本执行期**
     /// 回答尺寸,否则精灵脚本的 `SX/SY` 布局全为 0(EVID-J3-03)。
-    asset_sizes: BTreeMap<Vec<u8>, SizeU32>,
+    asset_sizes: FxHashMap<Vec<u8>, SizeU32>,
     /// `YMV[FILE]` 影片元数据缓存(键 = `FILE` 原始字节)。
     ///
     /// 与 [`Self::asset_sizes`] 同型:gfx 不读文件,VM 解析 `YSMV` 容器头后
     /// 经 `GraphicsHost::note_movie` 推入;`YMV` 挂接与 `YMVINFO` 查询都只读
     /// 这份缓存,因此**同一 tick 内** `YMV[FILE]` → `YMVINFO` 能立即取到值
     /// (官方 `0x459b98` 读的就是图层上挂好的结构)。
-    movie_metas: BTreeMap<Vec<u8>, MovieInfo>,
+    movie_metas: FxHashMap<Vec<u8>, MovieInfo>,
     /// `MOVIE` 全屏影片画面(宿主每帧注入;`Some` = **影片模式**,其他层
     /// 一律不显示,见 [`MovieOverlay`] 与 DIV-GFX-074)。
     movie_overlay: Option<MovieOverlay>,
@@ -419,7 +426,7 @@ impl GfxState {
         let mut s = Self {
             params,
             config,
-            nodes: BTreeMap::new(),
+            nodes: FxHashMap::default(),
             seq: 0,
             copy_seq: 0,
             texture_seq: 0,
@@ -443,8 +450,8 @@ impl GfxState {
             cur_call_cmd: String::new(),
             cg_names,
             windows,
-            asset_sizes: BTreeMap::new(),
-            movie_metas: BTreeMap::new(),
+            asset_sizes: FxHashMap::default(),
+            movie_metas: FxHashMap::default(),
             movie_overlay: None,
             font_families: Vec::new(),
             screen_snapshots: BTreeMap::new(),
@@ -2211,16 +2218,8 @@ impl GfxState {
     // ------------------------------------------------------------ 命令分派
 
     fn dispatch(&mut self, name: &str, args: &[ArgValue]) {
-        if !self.params.known(name) {
-            self.push_diag(
-                name,
-                error::unimplemented(
-                    error::code::COMMAND_UNKNOWN,
-                    format!("命令 `{name}` 不在工程 ysc 表中,无法解析参数名"),
-                ),
-            );
-            return;
-        }
+        // 先 match 已知命令,只在未接线分支查表:旧写法对每条 `CG/CGACT`
+        // 都先做一次 `YscmTable::index_of` 哈希查找(场景帧 4 万次/帧)。
         match name {
             "CG" => self.apply_cg(args),
             "CGACT" => self.apply_cgact(args),
@@ -2229,38 +2228,52 @@ impl GfxState {
             // INFO 查询由 VM 的 op_info 在脚本执行期通过 GraphicsHost 读取;
             // 事件只是事实记录,不应在这里再挂“未实现”诊断。
             "CGINFO" | "FONTINFO" => {}
-            other => self.push_diag(
-                other,
-                error::unimplemented(
-                    error::code::COMMAND_UNIMPLEMENTED,
-                    "图形域命令未接线(首屏未使用)",
-                ),
-            ),
+            other => {
+                if !self.params.known(other) {
+                    self.push_diag(
+                        other,
+                        error::unimplemented(
+                            error::code::COMMAND_UNKNOWN,
+                            format!("命令 `{other}` 不在工程 ysc 表中,无法解析参数名"),
+                        ),
+                    );
+                    return;
+                }
+                self.push_diag(
+                    other,
+                    error::unimplemented(
+                        error::code::COMMAND_UNIMPLEMENTED,
+                        "图形域命令未接线(首屏未使用)",
+                    ),
+                );
+            }
         }
     }
 
     // ------------------------------------------------------------ WINDOW
 
     fn dispatch_window(&mut self, name: &str, args: &[ArgValue]) {
-        if !self.params.known(name) {
-            self.push_diag(
-                name,
-                error::unimplemented(
-                    error::code::COMMAND_UNKNOWN,
-                    format!("窗口域命令 `{name}` 不在工程 ysc 表中"),
-                ),
-            );
-            return;
-        }
         match name {
             "WINDOW" => self.apply_window(args),
             "WINDOWEND" => self.apply_windowend(args),
             // 同 CGINFO/FONTINFO:由 VM 的 op_info 同步查询。
             "WINDOWINFO" => {}
-            other => self.push_diag(
-                other,
-                error::unimplemented(error::code::COMMAND_UNIMPLEMENTED, "窗口域命令未接线"),
-            ),
+            other => {
+                if !self.params.known(other) {
+                    self.push_diag(
+                        other,
+                        error::unimplemented(
+                            error::code::COMMAND_UNKNOWN,
+                            format!("窗口域命令 `{other}` 不在工程 ysc 表中"),
+                        ),
+                    );
+                    return;
+                }
+                self.push_diag(
+                    other,
+                    error::unimplemented(error::code::COMMAND_UNIMPLEMENTED, "窗口域命令未接线"),
+                );
+            }
         }
     }
 
@@ -2272,16 +2285,6 @@ impl GfxState {
     /// `YMVINFO`=`0x459b98` 由 VM 的 `op_info` 经 `GraphicsHost::query` 同步读
     /// (与 `CGINFO` 同型),事件本身只作事实记录。
     fn dispatch_movie(&mut self, name: &str, args: &[ArgValue]) {
-        if !self.params.known(name) {
-            self.push_diag(
-                name,
-                error::unimplemented(
-                    error::code::COMMAND_UNKNOWN,
-                    format!("影片域命令 `{name}` 不在工程 ysc 表中"),
-                ),
-            );
-            return;
-        }
         match name {
             "YMV" => self.apply_ymv(args),
             "YMVEND" => self.apply_ymvend(args),
@@ -2290,10 +2293,22 @@ impl GfxState {
             // 图层、盖在所有层之上):状态与解码归 `yu-rt` 与宿主的
             // `MovieHost` 端口,gfx 不参与;事件只作事实记录。
             "MOVIE" | "MOVIEEND" | "MOVIEINFO" => {}
-            other => self.push_diag(
-                other,
-                error::unimplemented(error::code::COMMAND_UNIMPLEMENTED, "影片域命令未接线"),
-            ),
+            other => {
+                if !self.params.known(other) {
+                    self.push_diag(
+                        other,
+                        error::unimplemented(
+                            error::code::COMMAND_UNKNOWN,
+                            format!("影片域命令 `{other}` 不在工程 ysc 表中"),
+                        ),
+                    );
+                    return;
+                }
+                self.push_diag(
+                    other,
+                    error::unimplemented(error::code::COMMAND_UNIMPLEMENTED, "影片域命令未接线"),
+                );
+            }
         }
     }
 
@@ -2899,7 +2914,10 @@ impl GfxState {
         // **确认该层会采用 FILE 之后**登记,由引擎在本 tick 末尾预热。
         // 图层组/类型冲突分支已在上面返回,不会预热未使用的资产。
         if let Some(TextureRef::Asset(key)) = &file {
-            if !key.is_empty() && self.preloaded.insert(key.clone()) {
+            // `preloaded` 只做"本 tick 已登记"去重;先 `contains` 再插,
+            // 否则每次 `CG[FILE]` 重复声明都要 clone 一次 key。
+            if !key.is_empty() && !self.preloaded.contains(key) {
+                self.preloaded.insert(key.clone());
                 self.preload_pending.insert(key.clone());
             }
         }
@@ -2925,7 +2943,9 @@ impl GfxState {
                     // 脚本把 `CG[ID=…]` 当存在性探测逐帧轮询;官方静默
                     // 返回 -1。按层只留一条 Verbose,避免把正常轮询变成
                     // WARN 洪峰(`<game-b>` 开场单帧 2 万次)。
-                    if self.missing_cg_reported.insert(parsed.path.clone()) {
+                    // 先查再插:旧写法每次轮询都 clone 一份 path(单帧 2 万次)。
+                    if !self.missing_cg_reported.contains(&parsed.path) {
+                        self.missing_cg_reported.insert(parsed.path.clone());
                         self.push_diag(
                             "CG",
                             error::verbose(
@@ -3171,10 +3191,13 @@ impl GfxState {
 
     fn apply_cgact(&mut self, args: &[ArgValue]) {
         let resolved = self.resolved_owned("CGACT", args);
-        let mut ids: [Option<Vec<u8>>; 4] = [None, None, None, None];
+        // `ID/ID2/ID3/ID4` 只借用事件里的字节;旧实现先 `b.clone()` 再在
+        // `path::normalize` 里再分配一次。`CGACT` 是逐帧动画/差分热路径,
+        // 四个 ID 每条命令省最多四次字符串分配。
+        let mut ids: [Option<&[u8]>; 4] = [None, None, None, None];
         let mut idnos: [Option<i64>; 4] = [None, None, None, None];
         let mut params: Vec<(std::rc::Rc<str>, EngineValue, bool)> = Vec::new();
-        for r in resolved {
+        for r in &resolved {
             let Some(name) = r.name.as_deref() else {
                 self.arg_slot_missing("CGACT", r.slot);
                 continue;
@@ -3188,7 +3211,7 @@ impl GfxState {
             };
             if let Some(i) = idx {
                 match &r.value {
-                    Value::Str(b) => ids[i] = Some(b.clone()),
+                    Value::Str(b) => ids[i] = Some(b.as_slice()),
                     _ => self.arg_type("CGACT", name, "字符串", &r.value),
                 }
                 continue;
@@ -3216,9 +3239,7 @@ impl GfxState {
 
         let paths: Vec<Option<LayerId>> = (0..4)
             .map(|i| {
-                ids[i]
-                    .as_ref()
-                    .map(|b| path::normalize(b, idnos[i], b.ends_with(b"/")).path)
+                ids[i].map(|b| path::normalize(b, idnos[i], b.ends_with(b"/")).path)
             })
             .collect();
         let Some(source) = paths[0].clone() else {
