@@ -14,7 +14,7 @@
 //! | `asset.decode` | 找到字节但 `image` 解码失败 |
 //! | `asset.unsupported` | 引擎格式码有定义但无解码器(`.psb`/未知码) |
 
-use std::collections::BTreeMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use yu_gfx::{ImageFormat, TextureRef};
 use yu_log::{Boundary, Diag, Severity};
@@ -141,7 +141,7 @@ struct PrefetchWorker {
     done: std::sync::mpsc::Receiver<PrefetchDone>,
     handle: Option<std::thread::JoinHandle<()>>,
     /// 已提交、尚未取回结果的 key。
-    pending: std::collections::BTreeSet<Vec<u8>>,
+    pending: FxHashSet<Vec<u8>>,
 }
 
 impl Drop for PrefetchWorker {
@@ -164,8 +164,8 @@ pub struct TextureStore {
     source: Box<dyn DataSource>,
     codec: Codec,
     probe_order: Vec<ImageFormat>,
-    cache: BTreeMap<Vec<u8>, Cached>,
-    issues: BTreeMap<(Vec<u8>, String), AssetIssue>,
+    cache: FxHashMap<Vec<u8>, Cached>,
+    issues: FxHashMap<(Vec<u8>, String), AssetIssue>,
     solid: Texture,
     decoded: u64,
     /// 本帧解码耗时/字节(VFS 读 + 图像解码;`begin_frame` 清零)。
@@ -182,22 +182,22 @@ pub struct TextureStore {
     /// 访问/插入时钟(LRU)。
     clock: u64,
     /// `key → (字节, 最近访问序)`(预算记账;与 `cache` 同步增删)。
-    meta: BTreeMap<Vec<u8>, (usize, u64)>,
+    meta: FxHashMap<Vec<u8>, (usize, u64)>,
     /// `key → 最近一次内容写入的序号`(与 LRU 的 `clock` 分开)。
     ///
     /// `insert_cached` 每次覆盖条目都会推进;`touch` 只动 LRU,不改这里。
     /// 后端用它判断「同一 key 的 CPU 侧像素是否被替换」——不能用
     /// `Rc::as_ptr`(旧 `Rc` 释放后新分配可能复用同一地址)或 `meta` 的
     /// LRU 时钟(`touch` 会推进)。
-    inserted: BTreeMap<Vec<u8>, u64>,
+    inserted: FxHashMap<Vec<u8>, u64>,
     /// `TRIM` 的 alpha 包围盒缓存(`(资产 key, mask) → 边界`)。
     ///
     /// 资产像素在解码时就在 CPU 上,边界是固有属性 ⇒ 算一次即可。
     /// `TRIM` 因此不必把 GPU 纹理整张读回(移动端 TBDR 上那一步
     /// 实测 100~291ms/次,是「角色一出来就卡」的直接原因)。
-    trim_bounds: BTreeMap<(Vec<u8>, i64), Option<(u32, u32, u32, u32)>>,
+    trim_bounds: FxHashMap<(Vec<u8>, i64), Option<(u32, u32, u32, u32)>>,
     /// 本帧新插入的 key(预算执行时豁免;防止预热批次在渲染前被回收)。
-    fresh: std::collections::BTreeSet<Vec<u8>>,
+    fresh: FxHashSet<Vec<u8>>,
     /// 已回收条目数(诊断)。
     evicted: u64,
     /// 待后端释放 GPU 纹理的资产 key(见 [`Self::take_evicted_keys`])。
@@ -210,20 +210,20 @@ pub struct TextureStore {
     /// 走了名称编码回退的解析次数(诊断)。
     name_fallback_hits: u64,
     /// `YMV` 每个资产**最近解析的帧号**(只保留一帧,见 [`Self::movie_frame`])。
-    movie_keeper: BTreeMap<Vec<u8>, u32>,
+    movie_keeper: FxHashMap<Vec<u8>, u32>,
     /// `YMV` **常驻容器**缓存(键 = `YMV[FILE]` 原字节)。
     ///
     /// 官方在 `YMV[FILE]` 时一次性读入并解混淆全部平面,之后换帧只切段;
     /// 这里同样只读一次包。`Rc` 共享,克隆 O(1);缺失/坏容器也缓存,
     /// 避免每帧重读重解析。
-    movies: BTreeMap<Vec<u8>, MovieSlot>,
+    movies: FxHashMap<Vec<u8>, MovieSlot>,
     /// 预取 worker(`tuning.prefetch` 才存在;默认关闭)。
     prefetch: Option<PrefetchWorker>,
     /// 本实例的运行参数(预取/缓存/PNG 后端/诊断;宿主经
     /// `EngineOptions.tuning` 注入,不再读进程环境变量)。
     tuning: RenderTuning,
     /// 已解码、尚未被主缓存采用的纹理(独立预算,LRU 淘汰)。
-    prefetch_pool: BTreeMap<Vec<u8>, Prefetched>,
+    prefetch_pool: FxHashMap<Vec<u8>, Prefetched>,
     prefetch_bytes: usize,
     prefetch_budget_bytes: usize,
     prefetch_clock: u64,
@@ -294,8 +294,8 @@ impl TextureStore {
             source,
             codec,
             probe_order,
-            cache: BTreeMap::new(),
-            issues: BTreeMap::new(),
+            cache: FxHashMap::default(),
+            issues: FxHashMap::default(),
             solid: Texture::solid_black_1x1(),
             decoded: 0,
             decode_us: 0,
@@ -303,20 +303,20 @@ impl TextureStore {
             budget_bytes: tuning.asset_cache_mb.saturating_mul(1024 * 1024),
             resident_bytes: 0,
             clock: 0,
-            meta: BTreeMap::new(),
-            inserted: BTreeMap::new(),
-            trim_bounds: BTreeMap::new(),
-            fresh: std::collections::BTreeSet::new(),
+            meta: FxHashMap::default(),
+            inserted: FxHashMap::default(),
+            trim_bounds: FxHashMap::default(),
+            fresh: FxHashSet::default(),
             evicted: 0,
             evicted_keys: Vec::new(),
             budget_warned: false,
             name_fallback: tuning.asset_name_fallback,
             name_fallback_hits: 0,
-            movie_keeper: BTreeMap::new(),
-            movies: BTreeMap::new(),
+            movie_keeper: FxHashMap::default(),
+            movies: FxHashMap::default(),
             prefetch,
             tuning,
-            prefetch_pool: BTreeMap::new(),
+            prefetch_pool: FxHashMap::default(),
             prefetch_bytes: 0,
             prefetch_budget_bytes: tuning.prefetch_mb.saturating_mul(1024 * 1024),
             prefetch_clock: 0,
@@ -351,7 +351,7 @@ impl TextureStore {
             jobs: Some(job_tx),
             done: done_rx,
             handle: Some(handle),
-            pending: std::collections::BTreeSet::new(),
+            pending: FxHashSet::default(),
         })
     }
 
@@ -497,7 +497,7 @@ impl TextureStore {
             let Some(key) = self
                 .prefetch_pool
                 .iter()
-                .min_by_key(|(_, entry)| entry.used)
+                .min_by(|(ka, a), (kb, b)| a.used.cmp(&b.used).then_with(|| ka.cmp(kb)))
                 .map(|(key, _)| key.clone())
             else {
                 break;
@@ -541,7 +541,8 @@ impl TextureStore {
     /// 覆盖缓存预算(字节;0 = 不限制)。测试/宿主诊断用。
     pub fn set_budget_bytes(&mut self, bytes: usize) {
         self.budget_bytes = bytes;
-        self.enforce_budget(false);
+        let live = FxHashSet::default();
+        self.enforce_budget(false, &live);
     }
 
     /// 当前缓存像素字节。
@@ -606,7 +607,7 @@ impl TextureStore {
         if failed.len() <= MAX_FAILED_CACHE_ENTRIES {
             return;
         }
-        failed.sort_by_key(|(_, used)| *used);
+        failed.sort_by(|(ka, ua), (kb, ub)| ua.cmp(ub).then_with(|| ka.cmp(kb)));
         let excess = failed.len() - MAX_FAILED_CACHE_ENTRIES;
         for (key, _) in failed.into_iter().take(excess) {
             self.cache.remove(&key);
@@ -616,11 +617,32 @@ impl TextureStore {
         }
     }
 
+    /// 挑一个可回收条目(`Rc::strong_count == 1` 且不在 live/fresh 集合)。
+    fn budget_victim(
+        &self,
+        skip_fresh: bool,
+        live: &FxHashSet<&[u8]>,
+    ) -> Option<Vec<u8>> {
+        self.meta
+            .iter()
+            .filter(|(_, (bytes, _))| *bytes > 0)
+            .filter(|(key, _)| !(skip_fresh && self.fresh.contains(*key)))
+            .filter(|(key, _)| !live.contains(key.as_slice()))
+            .filter(|(key, _)| {
+                self.cache
+                    .get(key.as_slice())
+                    .and_then(|entry| entry.result.as_ref().ok())
+                    .is_some_and(|texture| std::rc::Rc::strong_count(texture) == 1)
+            })
+            .min_by(|(ka, (_, ua)), (kb, (_, ub))| ua.cmp(ub).then_with(|| ka.cmp(kb)))
+            .map(|(key, _)| key.clone())
+    }
+
     /// 超预算时按 LRU 回收**只有缓存引用**的条目(`Rc::strong_count == 1`)。
-    /// 仍在图层/快照里的纹理跳过;`skip_fresh` = 本帧新插入的条目也跳过
-    /// (预热/本帧刚解析的资产必须活到渲染结束)。实在没有可回收的就保持
-    /// 超预算并留痕。
-    fn enforce_budget(&mut self, skip_fresh: bool) {
+    /// `live` 是本帧仍被图层/文本引用的资产(硬保护,不回收);
+    /// `skip_fresh` = 本帧新插入的条目也跳过(预热/本帧刚解析的资产必须
+    /// 活到渲染结束)。实在没有可回收的就保持超预算并留痕。
+    fn enforce_budget(&mut self, skip_fresh: bool, live: &FxHashSet<&[u8]>) {
         // 失败条目字节为 0,永远不参与字节预算;单独限条数,避免缺失/坏
         // 资产 key 在长时间游玩里只增不减(每帧探测一次就留一条)。
         self.enforce_failed_cap();
@@ -632,20 +654,7 @@ impl TextureStore {
             return;
         }
         while self.resident_bytes > self.budget_bytes {
-            let victim = self
-                .meta
-                .iter()
-                .filter(|(_, (bytes, _))| *bytes > 0)
-                .filter(|(key, _)| !(skip_fresh && self.fresh.contains(*key)))
-                .filter(|(key, _)| {
-                    self.cache
-                        .get(key.as_slice())
-                        .and_then(|entry| entry.result.as_ref().ok())
-                        .is_some_and(|texture| std::rc::Rc::strong_count(texture) == 1)
-                })
-                .min_by_key(|(_, (_, used))| *used)
-                .map(|(key, _)| key.clone());
-            let Some(key) = victim else {
+            let Some(key) = self.budget_victim(skip_fresh, live) else {
                 if !self.budget_warned {
                     self.budget_warned = true;
                     log::warn!(
@@ -682,12 +691,42 @@ impl TextureStore {
     /// 缓存预算在这里统一执行:上一帧新插入/被引用的纹理全部豁免,只清掉
     /// 之前帧里已无引用的旧资产;预热批次因此不会被自我驱逐。
     pub fn begin_frame(&mut self) {
+        self.begin_frame_inner(None);
+    }
+
+    /// 同 [`Self::begin_frame`],但按本帧画面保护仍在场的资产。
+    ///
+    /// 图层只持有 `TextureRef::Asset(key)` 而不是 `Texture` 的 `Rc`,帧间
+    /// `strong_count` 恒为 1;旧实现会把屏幕上的大图误判成"无引用"回收,
+    /// 下一帧再解码/上传(角色差分切换的偶发尖峰)。只有真的超预算时才
+    /// 构建 live 集合,稳态零额外分配。
+    pub fn begin_frame_for(&mut self, frame: &yu_gfx::CompositorFrame) {
+        if self.budget_bytes != 0 && self.resident_bytes > self.budget_bytes {
+            let live = live_asset_keys(frame);
+            self.begin_frame_with_live(&live);
+        } else {
+            self.begin_frame();
+        }
+    }
+
+    /// 同 [`Self::begin_frame`],`live` 里的资产不会被预算回收。
+    pub fn begin_frame_with_live(&mut self, live: &FxHashSet<&[u8]>) {
+        self.begin_frame_inner(Some(live));
+    }
+
+    fn begin_frame_inner(&mut self, live: Option<&FxHashSet<&[u8]>>) {
         self.issues.clear();
         self.decode_us = 0;
         self.decode_bytes = 0;
         // 预取结果先进池(不改变缓存的淘汰豁免窗口)。
         self.drain_prefetch();
-        self.enforce_budget(true);
+        if self.budget_bytes != 0 && self.resident_bytes > self.budget_bytes {
+            let empty = FxHashSet::default();
+            self.enforce_budget(true, live.unwrap_or(&empty));
+        } else {
+            self.enforce_failed_cap();
+            self.budget_warned = false;
+        }
         self.fresh.clear();
     }
 
@@ -744,6 +783,14 @@ impl TextureStore {
         self.cache
             .get(key)
             .is_some_and(|entry| entry.result.is_ok())
+    }
+
+    /// 该 key 是否已有缓存条目(**含失败条目**)。
+    ///
+    /// 引擎的"本帧资产常驻"扫描用它:失败资产也算"已处理",不能每帧
+    /// 重新 preload/探测。
+    pub fn cached(&self, key: &[u8]) -> bool {
+        self.cache.contains_key(key)
     }
 
     /// `key` 最近一次内容写入的版本序号。
@@ -953,7 +1000,15 @@ impl TextureStore {
 
     /// 本帧已记录的资产问题(按 `(key, code)` 升序)。
     pub fn issues(&self) -> Vec<AssetIssue> {
-        self.issues.values().cloned().collect()
+        let mut out: Vec<AssetIssue> = self.issues.values().cloned().collect();
+        // FxHashMap 无序遍历;诊断输出保持稳定的 key/code/detail 顺序。
+        out.sort_by(|a, b| {
+            a.key
+                .cmp(&b.key)
+                .then_with(|| a.code.cmp(&b.code))
+                .then_with(|| a.detail.cmp(&b.detail))
+        });
+        out
     }
 
     /// 已成功解码的纹理数(缓存未命中且解码成功时 +1)。
@@ -1371,13 +1426,18 @@ impl TextureStore {
             }
         }
         let mut jobs = Vec::new();
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = FxHashSet::default();
+        let read_started = std::time::Instant::now();
+        let mut read_bytes = 0usize;
         for key in keys {
-            if self.cache.contains_key(key) || !seen.insert(key.clone()) {
+            if self.cache.contains_key(key) || !seen.insert(key.as_slice()) {
                 continue;
             }
             match self.read_source(key) {
-                Ok((candidate, bytes)) => jobs.push((key.clone(), candidate, bytes)),
+                Ok((candidate, bytes)) => {
+                    read_bytes = read_bytes.saturating_add(bytes.len());
+                    jobs.push((key.clone(), candidate, bytes));
+                }
                 Err(cached) => {
                     self.insert_cached(key.clone(), cached);
                 }
@@ -1386,7 +1446,29 @@ impl TextureStore {
         if jobs.is_empty() {
             return;
         }
+        let read_us = u64::try_from(read_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let started = std::time::Instant::now();
+        let tuning = self.tuning;
+        // 只有一张图(最常见的差分切换)时**不建线程**:`scope` + spawn + join
+        // 本身约 0.1ms,比解码小图还贵;单线程路径的像素与并行完全一致。
+        if jobs.len() == 1 {
+            let (_, _, bytes) = &jobs[0];
+            let result = std::panic::catch_unwind(|| decode_asset(bytes, tuning))
+                .unwrap_or_else(|_| Err("PNG 解码线程 panic".to_string()));
+            let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            self.decode_us = self.decode_us.saturating_add(elapsed_us);
+            if tuning.asset_timing {
+                log::warn!(
+                    target: "yu-render",
+                    "[asset] preload keys=1 read={}us decode={}us bytes={}",
+                    read_us,
+                    elapsed_us,
+                    read_bytes
+                );
+            }
+            self.store_preload_result(0, result, &jobs);
+            return;
+        }
         // 官方线程只有软件合成池 + 影片播放(REA 0.495 `0x463f50` / `0x422268`),
         // 资源解码是命令内单线程;这里的并行是登记分歧(DIV-GFX-067)。
         // 留一核给主线程/音频,上限 4;结果按输入序写回,像素与串行一致。
@@ -1403,12 +1485,8 @@ impl TextureStore {
                     part.iter()
                         .enumerate()
                         .map(|(offset, (_, _, bytes))| {
-                            let result = std::panic::catch_unwind(|| {
-                                image::load_from_memory(bytes)
-                                    .map(|img| Texture::from_rgba8(img.into_rgba8()))
-                                    .map_err(|err| err.to_string())
-                            })
-                            .unwrap_or_else(|_| Err("PNG 解码线程 panic".to_string()));
+                            let result = std::panic::catch_unwind(|| decode_asset(bytes, tuning))
+                                .unwrap_or_else(|_| Err("PNG 解码线程 panic".to_string()));
                             (base * chunk + offset, result)
                         })
                         .collect::<Vec<_>>()
@@ -1430,29 +1508,49 @@ impl TextureStore {
         });
         let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         self.decode_us = self.decode_us.saturating_add(elapsed_us);
-        for (index, result) in decoded {
-            let (key, candidate, _) = &jobs[index];
-            let cached = match result {
-                Ok(texture) => {
-                    self.decoded += 1;
-                    self.decode_bytes = self.decode_bytes.saturating_add(texture.rgba.len() as u64);
-                    Cached {
-                        resolved: Some(candidate.clone()),
-                        result: Ok(std::rc::Rc::new(texture)),
-                    }
-                }
-                Err(err) => Cached {
-                    resolved: Some(candidate.clone()),
-                    result: Err(Diag::recoverable(code::DECODE, Boundary::Data)
-                        .at_data(candidate.clone(), 0)
-                        .with_detail(format!(
-                            "命中 {} 但解码失败: {err}",
-                            display_bytes(candidate)
-                        ))),
-                },
-            };
-            self.insert_cached(key.clone(), cached);
+        if tuning.asset_timing {
+            log::warn!(
+                target: "yu-render",
+                "[asset] preload keys={} read={}us decode={}us bytes={}",
+                jobs.len(),
+                read_us,
+                elapsed_us,
+                read_bytes
+            );
         }
+        for (index, result) in decoded {
+            self.store_preload_result(index, result, &jobs);
+        }
+    }
+
+    /// 把一张预解码结果写回缓存(与 `preload_parallel` 的成功/失败口径一致)。
+    fn store_preload_result(
+        &mut self,
+        index: usize,
+        result: Result<Texture, String>,
+        jobs: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
+    ) {
+        let (key, candidate, _) = &jobs[index];
+        let cached = match result {
+            Ok(texture) => {
+                self.decoded += 1;
+                self.decode_bytes = self.decode_bytes.saturating_add(texture.rgba.len() as u64);
+                Cached {
+                    resolved: Some(candidate.clone()),
+                    result: Ok(std::rc::Rc::new(texture)),
+                }
+            }
+            Err(err) => Cached {
+                resolved: Some(candidate.clone()),
+                result: Err(Diag::recoverable(code::DECODE, Boundary::Data)
+                    .at_data(candidate.clone(), 0)
+                    .with_detail(format!(
+                        "命中 {} 但解码失败: {err}",
+                        display_bytes(candidate)
+                    ))),
+            },
+        };
+        self.insert_cached(key.clone(), cached);
     }
 
     fn candidates(&self, key: &[u8]) -> Vec<(Vec<u8>, Option<ImageFormat>)> {
@@ -1473,6 +1571,61 @@ impl TextureStore {
         }
         out
     }
+}
+
+/// 本帧仍会被绘制/当源/当文本图像使用的资产 key。
+///
+/// 缓存预算回收的**硬保护集合**(只在超预算时构建)。见
+/// [`TextureStore::begin_frame_for`]。
+fn live_asset_keys(frame: &yu_gfx::CompositorFrame) -> FxHashSet<&[u8]> {
+    use yu_gfx::Op;
+
+    fn add_texture<'a>(
+        out: &mut FxHashSet<&'a [u8]>,
+        texture: &'a TextureRef,
+    ) {
+        if let TextureRef::Asset(key) = texture {
+            out.insert(key.as_slice());
+        }
+    }
+
+    let mut out = FxHashSet::default();
+    for layer in &frame.layers {
+        add_texture(&mut out, &layer.texture);
+    }
+    for draw in &frame.text_draws {
+        if let Some(image) = &draw.image {
+            out.insert(image.asset.as_slice());
+        }
+    }
+    for pass in &frame.passes {
+        // 纹理 pass 的 copy/image 源可能属于已被 `CGEND` 删除的层
+        // (`source_texture` 是命令时刻的冻结引用),也要保护。
+        for op in &pass.ops {
+            match op {
+                Op::Layer(layer) => add_texture(&mut out, &layer.texture),
+                Op::Group(group) => add_texture(&mut out, &group.layer.texture),
+                Op::Transition(transition) => {
+                    add_texture(&mut out, &transition.from);
+                    if let Some(to) = &transition.to {
+                        add_texture(&mut out, to);
+                    }
+                }
+                Op::Mask(mask) => add_texture(&mut out, &mask.layer.texture),
+                Op::Copy(copy) => {
+                    if let Some(texture) = &copy.source_texture {
+                        add_texture(&mut out, texture);
+                    }
+                }
+                Op::Image(image) => {
+                    if let Some(texture) = &image.source_texture {
+                        add_texture(&mut out, texture);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn unimplemented(code: &'static str, path: Vec<u8>, detail: impl Into<String>) -> Diag {
@@ -2064,6 +2217,36 @@ mod tests {
             store.take_evicted_keys().is_empty(),
             "取走一次后必须清空,否则后端每帧重复释放同一 key"
         );
+    }
+
+    #[test]
+    fn live_assets_survive_budget_eviction() {
+        let mut store = store(
+            &[
+                (b"a/img.png", png_solid([1, 2, 3, 255])),
+                (b"b/img.png", png_solid([4, 5, 6, 255])),
+            ],
+            vec![ImageFormat::Png],
+        );
+        store.set_budget_bytes(8);
+        store.resolve(b"a/img").expect("a");
+        store.resolve(b"b/img").expect("b");
+        // 插入发生在"本帧":第一次 begin_frame 只清除 fresh 豁免,
+        // 让下一帧真正执行预算回收。
+        store.begin_frame();
+        // 预算 = 一张。`b` 的 LRU 时钟更新(更近),但 `a` 是本帧仍在场的
+        // 资产:必须回收 `b`,不能回收 `a` 再让下一帧重解码(差分尖峰)。
+        let live: FxHashSet<&[u8]> =
+            std::iter::once(b"a/img".as_slice()).collect();
+        store.begin_frame_with_live(&live);
+        assert_eq!(
+            store.resolved_path(b"a/img"),
+            Some(b"a/img.png".as_slice()),
+            "本帧仍在场的资产不得被预算回收"
+        );
+        assert!(store.resolved_path(b"b/img").is_none(), "非 live 资产按 LRU 回收");
+        assert_eq!(store.evicted_count(), 1);
+        assert_eq!(store.take_evicted_keys(), vec![b"b/img".to_vec()]);
     }
 
     #[test]

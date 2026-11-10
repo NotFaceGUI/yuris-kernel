@@ -24,6 +24,8 @@
 //! `<repo-old>/crates/yuris-vm/src/driver.rs` 的 `swap_exec`),不影响可观测语义。
 
 use std::collections::BTreeMap;
+
+use rustc_hash::FxHashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -654,12 +656,12 @@ pub struct Vm {
     /// 本步可见的任务链投影(`TASKINFO` 的数据源;泵期间调度器被借出)。
     task_view: Vec<TaskView>,
     /// 资产像素尺寸缓存(键 = `CG[FILE]`;`None` = 探测失败也缓存)。
-    asset_size_cache: BTreeMap<Vec<u8>, Option<(u32, u32)>>,
+    asset_size_cache: FxHashMap<Vec<u8>, Option<(u32, u32)>>,
     /// `YMV` 影片元数据缓存(键 = `YMV[FILE]` 原字节;`None` = 资产缺失/
     /// 非 `YSMV`,同样缓存,避免每条命令重复读 6 MB 包内文件)。
     ///
     /// 解析只读容器头与三张表(`yu_format::ymv::Ymv::parse`),不复制平面。
-    movie_meta_cache: BTreeMap<Vec<u8>, Option<crate::event::MovieInfo>>,
+    movie_meta_cache: FxHashMap<Vec<u8>, Option<crate::event::MovieInfo>>,
     /// `MOVIE` 族状态(官方全局 `0x7fab00`/`0x801760`/`0x801764..`/`0x5b48a0`)。
     movie: MovieState,
     /// `MOVIE` 播放端口(宿主实现;解码/呈现全在宿主侧,内核不含平台代码)。
@@ -863,8 +865,8 @@ impl Vm {
             cur_task: MAIN_TASK_ID.to_string(),
             cur_task_seq: u64::MAX,
             task_view: Vec::new(),
-            asset_size_cache: BTreeMap::new(),
-            movie_meta_cache: BTreeMap::new(),
+            asset_size_cache: FxHashMap::default(),
+            movie_meta_cache: FxHashMap::default(),
             movie: MovieState::default(),
             movie_host: None,
         };

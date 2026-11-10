@@ -8,6 +8,8 @@ description = "两个渲染后端共享的契约与平台设施(表面/报告/�
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }
 log = "0.4"
+# 热 map:资产缓存/预取池等 `Vec<u8>` 键的查找,替代 BTreeMap 的逐字节比较。
+rustc-hash = "2"
 yu-font = { path = "../../yu-font" }
 yu-format = { path = "../../yu-format" }
 yu-gfx = { path = "../../yu-gfx" }
