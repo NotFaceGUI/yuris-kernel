@@ -82,12 +82,20 @@ pub struct SoftRenderer {
 
 impl SoftRenderer {
     pub fn new(textures: TextureStore) -> Self {
+        Self::new_with_tuning(textures, yu_render_core::RenderTuning::default())
+    }
+
+    /// 用宿主给定的运行参数构造(引擎走这条;示例/测试可用 [`Self::new`])。
+    pub fn new_with_tuning(
+        textures: TextureStore,
+        tuning: yu_render_core::RenderTuning,
+    ) -> Self {
         Self {
             textures,
             snapshots: BTreeMap::new(),
             last_screen: None,
             image_cache: BTreeMap::new(),
-            text: TextComposer::new(),
+            text: TextComposer::with_tuning(tuning),
             diffusion_seed: 1,
         }
     }

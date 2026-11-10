@@ -270,7 +270,7 @@ pub struct EngineOptions {
     ///
     /// `Some` = 直接用(宿主决定底层接口与回退顺序:Android 模拟器的
     /// gfxstream Vulkan 会在 `vkQueueSubmit` 内崩溃,需要由宿主选 GLES);
-    /// `None` = 按 `YURIS_WGPU_BACKEND`/默认在引擎内创建。
+    /// `None` = 按 [`Self::gpu_backend`]/[`Self::gpu_adapter`] 在引擎内创建。
     pub gpu_context: Option<yu_backend_wgpu::GpuContext>,
     /// 宿主附加字体字节(跨平台注入口,见
     /// [`yu_render_core::TextComposer::add_font_bytes`])。无系统字体的目标
@@ -287,14 +287,17 @@ pub struct EngineOptions {
     /// 安卓宿主用它做**归因实验**:把上屏链路从时序里摘掉,单独判断卡顿
     /// 是否由渲染抢 CPU 引起。headless 用例必须保持 true。
     pub render: bool,
-    /// 资产异步预取(`None` = 跟随 `YURIS_PREFETCH` 环境变量;默认关)。
+    /// 渲染/诊断运行参数(预取、缓存预算、文本 GPU、PNG 后端、timing
+    /// 开关等)。与 `backend`/`gpu_backend` 一样是**引擎参数**:宿主解析
+    /// CLI 旗标或 Android JSON 后给值,渲染层只读字段,不再读环境变量。
+    pub tuning: yu_render_core::RenderTuning,
+    /// GPU 底层接口(仅 `backend=wgpu` 且宿主未预建上下文时使用)。
     ///
-    /// Android 无环境变量,壳通过 `RunConfig.prefetch` 显式注入。
-    pub prefetch: Option<bool>,
-    /// COPY2 快照延迟物化(`None` = 跟随 `YURIS_SNAPSHOT_DEFER`;默认关)。
-    pub snapshot_defer: Option<bool>,
-    /// 手机画质:`SIZE`(官方最近邻)也按双线性采样(`None`/`false` = 官方语义)。
-    pub bilinear_scale: Option<bool>,
+    /// 与 Android `RunConfig.gpu_backend` 同一份取值表
+    /// ([`yu_backend_wgpu::GpuBackend`]);默认 `Auto`。
+    pub gpu_backend: GpuBackend,
+    /// 适配器名称子串(仅 `backend=wgpu` 且宿主未预建上下文时使用)。
+    pub gpu_adapter: Option<String>,
     /// 宿主路径系统变量的覆盖(跨平台注入口,见 [`crate::host_paths`])。
     /// `None` 项走平台默认解析;Android 这类没有 `USERPROFILE` 的宿主
     /// 用它把 app 私有目录 / 外置卡目录喂进来。
@@ -320,9 +323,9 @@ impl Default for EngineOptions {
     fn default() -> Self {
         Self {
             render: true,
-            prefetch: None,
-            snapshot_defer: None,
-            bilinear_scale: None,
+            tuning: yu_render_core::RenderTuning::default(),
+            gpu_backend: GpuBackend::Auto,
+            gpu_adapter: None,
             backend: Backend::Soft,
             entry: "SYSTEM_START".to_string(),
             record_events: false,
@@ -587,7 +590,7 @@ impl Renderer {
         }
     }
 
-    /// 资产预取(`YURIS_PREFETCH=1`;默认关):提交后台解码,立即返回。
+    /// 资产预取(`tuning.prefetch`;默认关):提交后台解码,立即返回。
     fn prefetch_assets(&mut self, keys: &[Vec<u8>]) -> u64 {
         match self {
             Renderer::Soft(renderer) => renderer.prefetch_assets(keys),
@@ -599,37 +602,6 @@ impl Renderer {
         match self {
             Renderer::Soft(renderer) => renderer.prefetch_enabled(),
             Renderer::Wgpu { renderer, .. } => renderer.prefetch_enabled(),
-        }
-    }
-
-    /// 宿主显式开关资产预取(Android 壳;桌面仍可由环境变量开启)。
-    fn set_prefetch_enabled(&mut self, enabled: bool) {
-        match self {
-            Renderer::Soft(renderer) => {
-                renderer.textures_mut().set_prefetch_enabled(enabled);
-            }
-            Renderer::Wgpu {
-                renderer, check, ..
-            } => {
-                renderer.textures_mut().set_prefetch_enabled(enabled);
-                if let Some(soft) = check.as_mut() {
-                    soft.textures_mut().set_prefetch_enabled(enabled);
-                }
-            }
-        }
-    }
-
-    /// 宿主显式开关 COPY2 延迟物化(仅 wgpu 有该路径)。
-    fn set_snapshot_defer(&mut self, enabled: bool) {
-        if let Renderer::Wgpu { renderer, .. } = self {
-            renderer.set_defer_snapshots(enabled);
-        }
-    }
-
-    /// 宿主显式开关 `SIZE` 双线性采样(手机画质;仅 wgpu 生效)。
-    fn set_force_bilinear_scale(&mut self, enabled: bool) {
-        if let Renderer::Wgpu { renderer, .. } = self {
-            renderer.set_force_bilinear_scale(enabled);
         }
     }
 
@@ -854,7 +826,7 @@ impl Engine {
     pub fn new(project: Project, opts: EngineOptions) -> CliResult<Self> {
         let boot_started = Instant::now();
         let BootBundle {
-            vm,
+            mut vm,
             state,
             sound,
             save_host,
@@ -864,31 +836,51 @@ impl Engine {
             identity,
             display,
         } = boot(&project, &opts)?;
+        // VM opcode 归因是引擎参数(`tuning.vm_profile`;Android 壳以前在
+        // 宿主里 set_command_profile,CLI 只能靠环境变量)。采样器每条命令
+        // 两次 `Instant::now()`,只在显式开启时运行。
+        if opts.tuning.vm_profile {
+            vm.set_command_profile(true);
+            vm.set_command_profile_sample(1);
+            log::warn!(target: "yu-kernel", "[boot] VM opcode profiling ON");
+        }
         let boot_ms = boot_started.elapsed().as_secs_f64() * 1000.0;
 
         let renderer_started = Instant::now();
-        let store = TextureStore::new(Box::new(project.mount()?), CODEC, probe_order.clone());
+        let store = TextureStore::new_with_tuning(
+            Box::new(project.mount()?),
+            CODEC,
+            probe_order.clone(),
+            opts.tuning,
+        );
         let mut renderer = match opts.backend {
-            Backend::Soft => Renderer::Soft(SoftRenderer::new(store)),
+            Backend::Soft => Renderer::Soft(SoftRenderer::new_with_tuning(store, opts.tuning)),
             Backend::Wgpu => {
                 // 宿主预建上下文优先(它知道该用 GLES 还是 Vulkan);
-                // 否则按环境变量/默认创建。
+                // 否则按 `EngineOptions.gpu_backend/gpu_adapter` 创建。
                 let wgpu = match &opts.gpu_context {
-                    Some(context) => WgpuRenderer::new_with_context(store, context.clone()),
+                    Some(context) => {
+                        WgpuRenderer::new_with_context_and_tuning(store, context.clone(), opts.tuning)
+                    }
                     None => {
-                        let device = device_options_from_env();
-                        WgpuRenderer::new_with_options(store, &device)
+                        let device = device_options(&opts);
+                        WgpuRenderer::new_with_options_and_tuning(store, &device, opts.tuning)
                     }
                 }
                 .map_err(|d| {
                     Failure::runtime(format!(
-                        "wgpu 初始化失败: {d};可设 YURIS_WGPU_BACKEND/YURIS_WGPU_ADAPTER,或改用 --backend soft"
+                        "wgpu 初始化失败: {d};可用 --wgpu-backend/--wgpu-adapter,或改用 --backend soft"
                     ))
                 })?;
                 let configured = opts.reconcile;
                 let check = if opts.reconcile {
-                    let store = TextureStore::new(Box::new(project.mount()?), CODEC, probe_order);
-                    Some(SoftRenderer::new(store))
+                    let store = TextureStore::new_with_tuning(
+                        Box::new(project.mount()?),
+                        CODEC,
+                        probe_order,
+                        opts.tuning,
+                    );
+                    Some(SoftRenderer::new_with_tuning(store, opts.tuning))
                 } else {
                     None
                 };
@@ -899,16 +891,6 @@ impl Engine {
                 }
             }
         };
-        // 宿主显式特性开关(Android 壳;`None` = 保持环境变量/缺省行为)。
-        if let Some(enabled) = opts.prefetch {
-            renderer.set_prefetch_enabled(enabled);
-        }
-        if let Some(enabled) = opts.snapshot_defer {
-            renderer.set_snapshot_defer(enabled);
-        }
-        if let Some(enabled) = opts.bilinear_scale {
-            renderer.set_force_bilinear_scale(enabled);
-        }
         if let Some(bridge) = capture_bridge.as_mut() {
             match &renderer {
                 Renderer::Wgpu { renderer, .. } => {
@@ -1495,10 +1477,10 @@ impl Engine {
         // 会白烧 CPU(实测 +1.5ms/tick)。真正生效的是本轮 tick 末对
         // `CG[FILE]` 实声明 key 的异步解码提交。
         if self.renderer.prefetch_enabled() && self.frame % 60 == 0 {
-            let keys = vm.prefetch_declarations(prefetch_window());
+            let keys = vm.prefetch_declarations(self.opts.tuning.prefetch_window);
             if !keys.is_empty() {
                 let queued = self.renderer.prefetch_assets(&keys);
-                if queued > 0 && std::env::var_os("YURIS_ASSET_TIMING").is_some() {
+                if queued > 0 && self.opts.tuning.asset_timing {
                     log::warn!(
                         target: "yu-engine",
                         "[prefetch] frame={} candidates={} queued={}",
@@ -1510,7 +1492,7 @@ impl Engine {
             }
         }
         let chain = vm.tick_at(now_ms, &self.timeline);
-        // **tick 内部分段**(`YURIS_TICK_SPLIT`):真机出现过
+        // **tick 内部分段**(`tuning.tick_split`):真机出现过
         // `tick=441ms` 而 `build=20ms`/`render=35ms`/`cmds` 与邻帧相同的情况
         // —— 有 ~380ms 不在既有三个子项里,必须拆开定位。
         let t_vm = tick_started.elapsed();
@@ -1582,7 +1564,7 @@ impl Engine {
             self.last_preload_assets = 0;
             self.last_preload_errors = 0;
         } else if self.renderer.prefetch_enabled() {
-            // 预取模式(`YURIS_PREFETCH=1`):`CG[FILE]` 声明的资产只读取包
+            // 预取模式(`tuning.prefetch`):`CG[FILE]` 声明的资产只读取包
             // 字节并交给后台解码线程,**不**在本 tick 同步解码/上传。首用
             // 时 `resolve` 命中预取池(零解码)或按原路径同步兜底 ⇒ 像素
             // 不变,只是把解码从"声明帧"摊到真正使用的帧。
@@ -1591,7 +1573,7 @@ impl Engine {
             self.last_preload_ms = started.elapsed().as_secs_f64() * 1000.0;
             self.last_preload_assets = preloads.len() as u64;
             self.last_preload_errors = 0;
-            if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
+            if self.opts.tuning.asset_timing {
                 log::warn!(
                     target: "yu-engine",
                     "[preload] frame={} async declared={} queued={} submit_ms={:.1}",
@@ -1607,7 +1589,7 @@ impl Engine {
             self.last_preload_ms = started.elapsed().as_secs_f64() * 1000.0;
             self.last_preload_assets = assets;
             self.last_preload_errors = errors;
-            if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
+            if self.opts.tuning.asset_timing {
                 log::warn!(
                     target: "yu-engine",
                     "[preload] frame={} assets={} errors={} ms={:.1}",
@@ -1654,7 +1636,7 @@ impl Engine {
             .frame();
         self.last_frame_build_ms = build_started.elapsed().as_secs_f64() * 1000.0;
         let tick_ms = tick_started.elapsed().as_secs_f64() * 1000.0;
-        if std::env::var_os("YURIS_TICK_SPLIT").is_some() && tick_ms >= 20.0 {
+        if self.opts.tuning.tick_split && tick_ms >= 20.0 {
             log::warn!(
                 target: "yu-kernel",
                 "[ticksplit] frame={} total={:.1}ms vm={:.1} post_vm={:.1} text={:.1} build={:.1} cmds={}",
@@ -2794,9 +2776,10 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
             from_config
         }
     };
-    let mut gfx_state =
-        GfxState::from_tables(vm.tables(), GfxConfig::new(viewport).with_display(display.clone()))
-            .map_err(|d| Failure::runtime(format!("GfxState 构造失败: {d}")))?;
+    let mut gfx_config = GfxConfig::new(viewport).with_display(display.clone());
+    gfx_config.cg_timing = opts.tuning.cg_timing;
+    let mut gfx_state = GfxState::from_tables(vm.tables(), gfx_config)
+        .map_err(|d| Failure::runtime(format!("GfxState 构造失败: {d}")))?;
     // 引擎全局纹理过滤真值:`FUN_00460924` 读完 `yscfg.dat` 后**无条件**写
     // `MAG=1`/`MIN=1`/`MIP=0`(LINEAR/LINEAR/POINT,无各向异性),不从设置
     // 文件读(docs/render-parity.md §4)。此前从未注入,后端一直用
@@ -2814,7 +2797,7 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     // 打开数据源失败时保持 None,查询按 Unimplemented 挂号(不猜 0)。
     if let Ok(source) = project.open_source() {
         gfx_host.set_texture_sampler(Box::new(StoreSampler {
-            store: TextureStore::new(source, CODEC, probe_order.clone()),
+            store: TextureStore::new_with_tuning(source, CODEC, probe_order.clone(), opts.tuning),
         }));
     }
     // `SAVE[ID]/LOAD[ID]` 的图层像素通道:抓帧渲染器(独立 `TextureStore`,
@@ -2822,7 +2805,7 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     // 每帧写入(`COPY ID=:/W0/` 读的后缓冲)。
     let capture_bridge = if let Ok(source) = project.open_source() {
         let capture = Rc::new(RefCell::new(crate::capture::GfxCapture::new(
-            TextureStore::new(source, CODEC, probe_order.clone()),
+            TextureStore::new_with_tuning(source, CODEC, probe_order.clone(), opts.tuning),
             project.overlay().clone(),
         )));
         gfx_host.set_layer_capture(Box::new(crate::capture::SharedCapture(capture.clone())));
@@ -2954,26 +2937,22 @@ fn average(history: &VecDeque<f64>) -> f64 {
     history.iter().sum::<f64>() / history.len() as f64
 }
 
-/// wgpu 选卡环境变量(与 `first_frame` 示例同口径):
-/// `YURIS_WGPU_BACKEND=auto|primary|dx12|vulkan|gl|all`、`YURIS_WGPU_ADAPTER=<子串>`。
+/// 按宿主给定的引擎参数拼 wgpu `DeviceOptions`。
 ///
 /// 取值表只有 `yu_backend_wgpu::GpuBackend` 一份(Android 宿主的
-/// `gpu_backend` 配置键走同一份);这里只负责读环境变量与拼 `DeviceOptions`。
-fn device_options_from_env() -> DeviceOptions {
-    let mut options = DeviceOptions::default();
-    if let Ok(value) = std::env::var("YURIS_WGPU_BACKEND") {
-        // 非法值保持默认后端集并留痕(环境变量拼错不该静默改变行为)。
-        match GpuBackend::parse(&value) {
-            Ok(backend) => options.backends = backend.backends(),
-            Err(error) => log::warn!(target: "yu-cli::engine", "YURIS_WGPU_BACKEND: {error}"),
-        }
+/// `gpu_backend` 配置键走同一份);CLI 的 `--wgpu-backend/--wgpu-adapter`
+/// 与 Android JSON 都落到 [`EngineOptions::gpu_backend`]/[`EngineOptions::gpu_adapter`],
+/// 这里不再读环境变量。
+fn device_options(opts: &EngineOptions) -> DeviceOptions {
+    DeviceOptions {
+        backends: opts.gpu_backend.backends(),
+        adapter_name: opts
+            .gpu_adapter
+            .as_ref()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty()),
+        ..DeviceOptions::default()
     }
-    if let Ok(name) = std::env::var("YURIS_WGPU_ADAPTER") {
-        if !name.trim().is_empty() {
-            options.adapter_name = Some(name);
-        }
-    }
-    options
 }
 
 /// 宿主注入的路径系统变量(手册 `basic/svariable.html`)。
@@ -2982,21 +2961,6 @@ fn device_options_from_env() -> DeviceOptions {
 /// Android 等无环境变量的平台由宿主显式给目录。
 fn host_paths(save_root: &std::path::Path, overrides: &HostPathOverrides) -> yu_rt::vm::HostPaths {
     crate::host_paths::resolve_host_paths(save_root, overrides, &HostPlatformHome::resolve())
-}
-
-/// 预取前瞻的每脚本最大组数(`YURIS_PREFETCH_WINDOW`,默认 2048;只在
-/// `YURIS_PREFETCH=1` 时被查询)。
-///
-/// 前瞻窗口越大越可能提前看到下一场景的 `CG[FILE]`,也越可能扫到不会执行
-/// 的分支;预取池有独立预算与 LRU,多取只会被丢弃,不影响像素。
-fn prefetch_window() -> usize {
-    static WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *WINDOW.get_or_init(|| {
-        std::env::var("YURIS_PREFETCH_WINDOW")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(2048)
-    })
 }
 
 /// 读游戏根的 `yssfs.dat`(「セーブファイル設定.exe」写出的存档路径设置)。

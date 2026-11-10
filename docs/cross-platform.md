@@ -83,19 +83,74 @@ mixer 线程(THREAD_PRIORITY_AUDIO)    oboe 回调(实时线程)
 |---|---|---|
 | `log_level` | `yu_log::LogLevel` | CLI `--log-level`、`YU_LOG`、内核 `MinLevel`、依赖门面桥、Android `run-config.json` |
 | `backend` | `yu_engine::engine::Backend::parse` | CLI `--backend`、Android `backend` 键、host-desktop 示例探针 |
-| `gpu_backend` | `yu_backend_wgpu::GpuBackend` | 引擎 `YURIS_WGPU_BACKEND`、Android `gpu_backend` 键 |
+| `gpu_backend` | `yu_backend_wgpu::GpuBackend` | CLI `--wgpu-backend`、Android `gpu_backend` 键、`EngineOptions.gpu_backend` |
 | `save_codec` | `yu_format::yssd::BlockCodec::parse` | CLI `--save-codec`、Android `save_codec` 键 |
 | `script_key` | `yu_engine::keys::ScriptKey::parse_hex` | CLI `--script-key`、Android `script_key` 键 |
 | `patch` | `yu_engine::patch::PatchKind::parse` | CLI `--patch`、Android `patch` 键、serve `--patch` |
 | `on|off` 旗标 | `yu_cli::args::parse_on_off_flag` | headless / desktop / serve |
 | `@_TIME` 本地时间 | `yu_engine::host_clock::local_now` | run / serve / desktop / Android;wasm 恒 `None` |
 
-三处约束:
+### 运行开关:CLI 旗标是正式入口,环境变量只是兼容别名
+
+渲染/诊断开关(**预取、缓存预算、文本 GPU、PNG 后端、timing/profiling**)
+以前只有 `YURIS_*` 环境变量一条路:桌面要 `set VAR=1`,Android 则在宿主里
+`set_var` 转一手。现在统一成 `yu_render_core::RenderTuning` —— 与
+`backend`/`gpu_backend` 一样是**引擎参数**:
+
+```text
+CLI 旗标 ─┐
+          ├─→ RenderTuning ─→ EngineOptions.tuning ─→ 渲染/字体/gfx 只读字段
+Android ──┘
+JSON 键
+```
+
+- 解析只在宿主边界发生;渲染层(`yu-render-core` / `yu-backend-*` /
+  `yu-gfx` / `yu-font`)不再读这些环境变量。
+- CLI 布尔旗标:`--vm-profile` = on,`--vm-profile=off` = off;
+  **不消费**下一个 token(位置参数不会被误吃)。
+- 显式旗标 > 旧环境变量 > 默认值。环境变量只为不破坏既有 CI/脚本保留,
+  文档与帮助以旗标为准。
+- Android 的 JSON 键与 CLI 旗标同名,`RunConfig.tuning` 与
+  `EngineOptions.tuning` 是同一个结构;宿主不再 `setenv`。
+
+| JSON 键 / CLI 旗标 | 默认 | 旧环境变量 |
+|---|---|---|
+| `prefetch` / `--prefetch[=on\|off]` | off | `YURIS_PREFETCH` |
+| `prefetch_mb` / `--prefetch-mb N` | 128 | `YURIS_PREFETCH_MB` |
+| `prefetch_window` / `--prefetch-window N` | 2048 | `YURIS_PREFETCH_WINDOW` |
+| `asset_cache_mb` / `--asset-cache-mb N` | 512(0 = 不限) | `YURIS_ASSET_CACHE_MB` |
+| `asset_name_fallback` / `--asset-name-fallback[=on\|off]` | on | `YURIS_ASSET_NAME_FALLBACK` |
+| `bilinear_scale` / `--bilinear-scale[=on\|off]` | off | —(Android 专属,桌面可开) |
+| `snapshot_defer` / `--snapshot-defer[=on\|off]` | off | `YURIS_SNAPSHOT_DEFER` |
+| `text_base_cache` / `--text-base-cache[=on\|off]` | on | `YURIS_TEXT_BASE_CACHE` |
+| `text_gpu` / `--text-gpu[=on\|off]` | on | `YURIS_TEXT_GPU` |
+| `pipeline_prewarm` / `--pipeline-prewarm[=on\|off]` | on | `YURIS_PIPELINE_PREWARM` |
+| `png_backend` / `--png-backend image\|libpng` | image | `YURIS_PNG_BACKEND` |
+| `png_cmp` / `--png-cmp[=on\|off]` | off | `YURIS_PNG_CMP` |
+| `vm_profile` / `--vm-profile[=on\|off]` | off | `YURIS_VM_PROFILE` |
+| `asset_timing` / `--asset-timing[=on\|off]` | off | `YURIS_ASSET_TIMING` |
+| `tick_split` / `--tick-split[=on\|off]` | off | `YURIS_TICK_SPLIT` |
+| `cg_timing` / `--cg-timing[=on\|off]` | off | `YURIS_CG_TIMING` |
+| `readback_debug` / `--readback-debug[=on\|off]` | off | `YURIS_READBACK_WHY` |
+| `trans_debug` / `--trans-debug[=on\|off]` | off | `YURIS_TRANS_DEBUG` |
+| `text_gpu_debug` / `--text-gpu-debug[=on\|off]` | off | `YURIS_TEXT_GPU_DEBUG` |
+| `render_timing` / `--render-timing[=on\|off]` | off | `YU_RENDER_TIMING` |
+| `render_trace_geometry` / `--render-trace-geometry[=on\|off]` | off | `YU_RENDER_TRACE_GEOMETRY` |
+| `p8_timing` / `--p8-timing[=on\|off]` | off | `YU_P8_TIMING` |
+| `font_trace` / `--font-trace[=on\|off]` | off | `YU_FONT_TRACE` |
+| `wgpu_backend` / `--wgpu-backend NAME` | auto | `YURIS_WGPU_BACKEND` |
+| `wgpu_adapter` / `--wgpu-adapter NAME` | 空 | `YURIS_WGPU_ADAPTER` |
+
+四条约束:
 
 1. **新增宿主不改取值表**:加一个平台只实现端口,参数解析直接复用上表。
 2. **新增取值只改一处**:词表与错误文案一起走,不会出现「CLI 收而 Android 拒」。
 3. **枚举化边界**:Android `RunConfig` 的 `backend`/`gpu_backend`/`save_codec`/
-   `log_level` 是枚举而非 `String`,解析发生在 JSON 边界,下游无字符串判断。
+   `log_level`/`tuning.png_backend` 是枚举而非 `String`,解析发生在 JSON 边界,
+   下游无字符串判断。
+4. **环境变量不是一等入口**:新增运行开关只允许加 CLI 旗标 + Android JSON 键
+   (+ `RenderTuning` 字段);旧 `YURIS_*` 读取必须收敛到
+   `yu_cli::args::HostTuning` 这一处兼容层,宿主与渲染层不得再 `setenv`。
 
 ## 事件与生命周期:宿主唯一接线面(见 DIV-AND-005)
 

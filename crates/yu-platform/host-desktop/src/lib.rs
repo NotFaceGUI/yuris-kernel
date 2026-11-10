@@ -275,6 +275,10 @@ pub struct HostOptions {
     /// **不与录制自动暂停叠加**:命令行显式要录制,意思是「先跑起来,
     /// 看到问题再抓」,所以启动时不停住(面板上按 F8 才走「录即暂停」)。
     pub record: bool,
+    /// 长会话资源趋势(每 60 帧一行;`--res-probe`)。
+    pub res_probe: bool,
+    /// 立绘层表面退化判异(只在异常时打印;`--spl-probe`)。
+    pub spl_probe: bool,
 }
 
 impl Default for HostOptions {
@@ -306,6 +310,8 @@ impl Default for HostOptions {
             start_paused: false,
             step_to: None,
             record: false,
+            res_probe: false,
+            spl_probe: false,
         }
     }
 }
@@ -2890,13 +2896,13 @@ impl ApplicationHandler for App {
             draw_ms,
         );
         self.flush_input_latency();
-        // 长会话资源趋势(`YURIS_RES_PROBE=1`):每 60 帧一行全量计数。
+        // 长会话资源趋势(`--res-probe`):每 60 帧一行全量计数。
         //
         // 「越玩越卡但 render 耗时不变」只能从**资源规模**和**纹理 churn** 上看:
         // 显存/合成目标/快照单调增长,或者层表面每帧新建(`created` 高、
         // `reused` 低)都会让 GPU 侧变慢,而 CPU 的 `render_ms` 完全反映不出来
         // (它只量规划)。
-        if std::env::var_os("YURIS_RES_PROBE").is_some() && self.frames % 60 == 0 {
+        if self.opts.res_probe && self.frames % 60 == 0 {
             let (cache_bytes, evicted) = self.engine.texture_cache_bytes();
             let cached = self.engine.textures_cached();
             let detail = self.engine.render_resource_snapshot().unwrap_or_default();
@@ -2910,7 +2916,7 @@ impl ApplicationHandler for App {
                 cached,
             );
         }
-        // 立绘层表面**退化判异**(`YURIS_SPL_PROBE=1`):只在异常时打印。
+        // 立绘层表面**退化判异**(`--spl-probe`):只在异常时打印。
         //
         // 立绘基图是 `solid1x1`,像素靠加工链产出;层表面一旦退化成 1×1,
         // 该层就"闪一下没了",而 `render_ms`/帧报告完全看不出来(它只是个
@@ -2918,7 +2924,7 @@ impl ApplicationHandler for App {
         //
         // 判据必须对照**声明尺寸**:`SPLTR10x` 这类层的声明尺寸本来就是
         // `1x1`(过渡临时层),它一直是 1×1 属于正常,报出来只是噪声。
-        if std::env::var_os("YURIS_SPL_PROBE").is_some() {
+        if self.opts.spl_probe {
             let now: Vec<(String, u32, u32)> = self.engine.sprite_surface_sizes();
             let summary = self.engine.frame_op_summary(0);
             let mut degraded: Vec<String> = Vec::new();

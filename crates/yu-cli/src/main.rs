@@ -171,6 +171,11 @@ fn print_command_help(command: &str) -> CliResult<()> {
         }
     };
     output::raw(text);
+    // 运行参数段与 `HostTuning::from_args` 共用同一批旗标(所有跑引擎的
+    // 子命令都接受;dev 只透传给 yu-serve)。
+    if is_known_command(command) {
+        output::raw(yu_cli::args::HOST_TUNING_HELP);
+    }
     Ok(())
 }
 
@@ -338,6 +343,14 @@ yu-cli case · golden 用例执行器
 
 用法:
   yu-cli case <project-root> --all | --case NAME [--update] [--debug-mode on|off]
+              [--bench] [--profile-all] [--trace-frames FROM..TO]
+              [--shot-frames 900,1200]
+
+诊断(原 YURIS_CASE_* 环境变量):
+  --bench              逐帧 tick 耗时 + 命令成本汇总
+  --profile-all        VM 命令计时全量采样(默认 1/32 抽样;配合 --bench)
+  --trace-frames A..B  逐帧画面签名(诊断「只闪一帧」)
+  --shot-frames CSV    指定帧写 PNG 到 target/tmp
 ";
 
 const BENCH_HELP: &str = "\

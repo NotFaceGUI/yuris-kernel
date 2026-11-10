@@ -98,6 +98,8 @@ pub struct TextureCache {
     pub asset_upload_bytes: u64,
     /// 累计上传纹理数。
     pub total_uploads: u64,
+    /// 资产上传计时(`RenderTuning.asset_timing`;默认关)。
+    asset_timing: bool,
 }
 
 impl TextureCache {
@@ -113,7 +115,13 @@ impl TextureCache {
             total_upload_bytes: 0,
             asset_upload_bytes: 0,
             total_uploads: 0,
+            asset_timing: false,
         }
+    }
+
+    /// 显式开关资产上传计时(引擎装配从 `RenderTuning` 注入)。
+    pub fn set_asset_timing(&mut self, enabled: bool) {
+        self.asset_timing = enabled;
     }
 
     pub fn cached_textures(&self) -> usize {
@@ -232,7 +240,7 @@ impl TextureCache {
         self.asset_texture_ids.insert(uploaded);
         self.asset_keys.insert(uploaded, key.to_vec());
         self.asset_upload_bytes = self.asset_upload_bytes.saturating_add(bytes as u64);
-        if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
+        if self.asset_timing {
             log::warn!(
                 target: "yu-render",
                 "[asset] upload key={} size={}x{} bytes={} upload={}us",
@@ -506,7 +514,7 @@ pub struct TargetSet {
     /// token 之间来回清空(读档时背景层被反复重建,烘焙跳过永远补不回来)。
     /// 每个 `CopyId` 一份,保留跨帧缓存但绝不污染活层。
     snapshot_surfaces: BTreeMap<CopyId, LayerSurfaces>,
-    /// 延迟物化的快照请求(`YURIS_SNAPSHOT_DEFER=1`;默认关)。
+    /// 延迟物化的快照请求(`RenderTuning.snapshot_defer`;默认关)。
     ///
     /// 登记时冻结源 `Content` 句柄(纹理不可变 ⇒ 像素即命令时刻版本),
     /// 当前帧没有任何读者就不分配/不清屏/不复制;后续帧被层/复制/屏幕
@@ -558,9 +566,8 @@ impl TargetSet {
             snapshot_contents: BTreeMap::new(),
             snapshot_surfaces: BTreeMap::new(),
             deferred: BTreeMap::new(),
-            // 默认关:延迟物化只在显式 `YURIS_SNAPSHOT_DEFER=1` 时启用。
-            defer_enabled: std::env::var("YURIS_SNAPSHOT_DEFER")
-                .map_or(false, |v| !matches!(v.trim(), "" | "0" | "off" | "false")),
+            // 默认关;宿主经 `RenderTuning.snapshot_defer` 显式开启。
+            defer_enabled: false,
             scale: None,
         }
     }

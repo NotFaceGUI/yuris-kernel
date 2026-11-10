@@ -235,6 +235,7 @@ pub(crate) fn plan(
     text: &mut TextComposer,
     text_gpu: &mut Option<crate::text_gpu::TextGpuRenderer>,
     force_bilinear_scale: bool,
+    tuning: yu_render_core::RenderTuning,
 ) -> Result<(FramePlan, RenderReport, RenderPhases), Diag> {
     let started = std::time::Instant::now();
     surfaces.begin_frame(frame.frame);
@@ -263,8 +264,8 @@ pub(crate) fn plan(
     for id in text_uploads.retain(&live_text_layers) {
         gpu.remove(id, pipelines);
     }
-    let timing = std::env::var("YU_RENDER_TIMING").is_ok();
-    let trace_geometry = std::env::var("YU_RENDER_TRACE_GEOMETRY").is_ok();
+    let timing = tuning.render_timing;
+    let trace_geometry = tuning.render_trace_geometry;
 
     let mut acc = Accum::new(frame);
     let mut vertices: Vec<Vertex> = Vec::new();
@@ -492,6 +493,7 @@ pub(crate) fn plan(
                         image,
                         &dead_writes,
                         force_bilinear_scale,
+                        tuning,
                     );
                     match result {
                         Ok(()) => acc.ops_drawn += 1,
@@ -529,6 +531,7 @@ pub(crate) fn plan(
                         copy,
                         &reads,
                         &mut snapshot_dedup,
+                        tuning,
                     );
                     match result {
                         Ok(()) => acc.ops_drawn += 1,
@@ -570,6 +573,7 @@ pub(crate) fn plan(
         targets,
         text_gpu,
         &mut text_jobs,
+        tuning,
     );
     let text_stats = text.take_frame_stats();
     // 文本阶段到此为止。**必须在这里取边界**:旧实现在第 5 步(屏幕级
@@ -813,6 +817,7 @@ fn apply_image(
     image: &ImageOp,
     dead_writes: &BTreeSet<(LayerId, u64)>,
     force_bilinear_scale: bool,
+    tuning: yu_render_core::RenderTuning,
 ) -> Result<(), String> {
     let target = image.target.as_ref().unwrap_or(&image.source);
     if target != pass_target {
@@ -940,14 +945,14 @@ fn apply_image(
     let op_started = std::time::Instant::now();
     apply_image_pixels(
         ctx, frame, textures, gpu, pipelines, targets, surfaces, contents, bases, writes, target,
-        image, source, source2, force_bilinear_scale,
+        image, source, source2, force_bilinear_scale, tuning,
     )?;
     let op_us = op_started.elapsed().as_micros() as u64;
     // ≥20ms 无条件留痕(移动端首帧/首次 TRIM/大资产解码的现场);5ms 以上
     // 仅在 `YURIS_TICK_SPLIT` 诊断档打印。
     if op_us >= SLOW_OP_WARN_US
         || resolve_us >= SLOW_OP_WARN_US
-        || (op_us >= SLOW_OP_TRACE_US && std::env::var_os("YURIS_TICK_SPLIT").is_some())
+        || (op_us >= SLOW_OP_TRACE_US && tuning.tick_split)
     {
         log::warn!(
             target: "yu-kernel",
@@ -1303,6 +1308,7 @@ fn apply_image_pixels(
     source: Content,
     source2: Option<Content>,
     force_bilinear_scale: bool,
+    tuning: yu_render_core::RenderTuning,
 ) -> Result<(), String> {
     // 原地加工(源=目标)的目标层可能已被 `CGEND` 删除;官方命令到达时
     // 已把结果写进层表面,删除不撤销 ⇒ 用命令时刻记录的基图重放。
@@ -1439,7 +1445,7 @@ fn apply_image_pixels(
         let out = surfaces.acquire(ctx, to.width, to.height, "transition surface")?;
         // 取证:两源尺寸与内容 hash。`from_h == to_h` 说明脚本给的 ID2
         // 与 ID 是同一张纹理(过渡恒等),`to` 尺寸异常则输出画布会错。
-        if std::env::var_os("YURIS_TRANS_DEBUG").is_some() {
+        if tuning.trans_debug {
             log::warn!(
                 target: "yu-render",
                 "[trans] id={} from={}x{} h={} to={}x{} h={} set={} k={}",
@@ -2122,6 +2128,7 @@ fn apply_copy(
     copy: &CopyOp,
     reads: &PlanReads,
     dedup: &mut BTreeMap<SnapshotDedupKey, Rc<TexRef>>,
+    tuning: yu_render_core::RenderTuning,
 ) -> Result<(), String> {
     if &copy.dest != pass_target {
         return Err("gfx.copy.target.mismatch".to_string());
@@ -2214,7 +2221,7 @@ fn apply_copy(
                     Content::identity(
                         screen_snapshot_content(
                             ctx, frame, snapshot, textures, gpu, pipelines, targets, surfaces,
-                            contents, bases, writes, text, copy.id,
+                            contents, bases, writes, text, copy.id, tuning,
                         )?,
                         0,
                     )
@@ -2492,6 +2499,7 @@ fn screen_snapshot_content(
     writes: &mut SurfaceWrites<'_>,
     text: &mut TextComposer,
     copy_id: yu_gfx::CopyId,
+    tuning: yu_render_core::RenderTuning,
 ) -> Result<Rc<TexRef>, String> {
     let mut snap_frame = CompositorFrame::new(frame.frame, frame.viewport);
     snap_frame.dx_mode = frame.dx_mode;
@@ -2604,6 +2612,7 @@ fn screen_snapshot_content(
             targets,
             &mut no_gpu,
             &mut jobs,
+            tuning,
         );
         // 快照文本的纹理只服务本次合成;`TextUploads` 是临时表,
         // 不清理会把它上传的整层/整屏纹理永久留在 GPU 缓存。
@@ -2985,6 +2994,7 @@ fn apply_text(
     targets: &TargetSet,
     text_gpu: &mut Option<crate::text_gpu::TextGpuRenderer>,
     text_jobs: &mut Vec<crate::text_gpu::TextGpuJob>,
+    tuning: yu_render_core::RenderTuning,
 ) -> (u64, CpuBaseInfo, TextGpuStats) {
     let mut cpu_base_us = 0u64;
     let mut cpu_info = CpuBaseInfo::default();
@@ -3093,7 +3103,7 @@ fn apply_text(
                             placements.append(&mut items);
                         }
                         Err(reason) => {
-                            if std::env::var_os("YURIS_TEXT_GPU_DEBUG").is_some() {
+                            if tuning.text_gpu_debug {
                                 log::warn!(
                                     target: "yu-render",
                                     "[text-gpu] collect failed layer={} err={reason} \
@@ -3186,7 +3196,7 @@ fn apply_text(
                             // 实测可达 25~30ms/帧。这里把原因留痕:回退本身
                             // 是允许的(能力不足时必须回退),但静默回退会让
                             // 「GPU 文本没生效」无从归因。
-                            if std::env::var_os("YURIS_TEXT_GPU_DEBUG").is_some() {
+                            if tuning.text_gpu_debug {
                                 log::warn!(
                                     target: "yu-render",
                                     "[text-gpu] fallback layer={} reason={reason} \
@@ -3202,7 +3212,7 @@ fn apply_text(
                         }
                     }
                 } else {
-                    if std::env::var_os("YURIS_TEXT_GPU_DEBUG").is_some() {
+                    if tuning.text_gpu_debug {
                         let why = if has_image_glyph {
                             "image_glyph"
                         } else if layout.is_some() {

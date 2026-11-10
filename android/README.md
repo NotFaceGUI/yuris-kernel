@@ -117,8 +117,8 @@ Windows 下 NDK 的 sh 版 `*-clang` 无法被 Rust exec,`build.sh` 会自动改
 |---|---|---|
 | 状态浮层 | 关 | 开:左上角显示 `fps=`;再开「调试日志」才铺全量计数 |
 | 调试日志 | 关 | 开:每帧状态行写 logcat + `<游戏目录>/debug/yu-kernel.jsonl`,并启用混音抓取 |
-| 资产预取 | 关 | 等价桌面 `YURIS_PREFETCH=1`:`CG[FILE]` 声明即交后台解码,首用命中池/同步兜底 |
-| 快照延迟 | 关 | 等价桌面 `YURIS_SNAPSHOT_DEFER=1`:无读者的 COPY2 只登记,后续被引用再物化 |
+| 资产预取 | 关 | 等价桌面 `--prefetch`:`CG[FILE]` 声明即交后台解码,首用命中池/同步兜底 |
+| 快照延迟 | 关 | 等价桌面 `--snapshot-defer`:无读者的 COPY2 只登记,后续被引用再物化 |
 | SIZE 双线性 | **开** | 官方 `SIZE` 是最近邻;手机高 DPI 下 CG/差分缩放锯齿,开启后按双线性采样(像素与官方有差异,见 `DIV-GFX-083`) |
 | PNG 解码 | **开** | 开:Android 走 libpng(NEON 反滤波;画面逐字节一致);关:回 `image` crate。角色首帧解码尖峰可在此 A/B |
 

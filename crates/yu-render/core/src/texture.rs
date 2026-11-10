@@ -20,6 +20,10 @@ use yu_gfx::{ImageFormat, TextureRef};
 use yu_log::{Boundary, Diag, Severity};
 use yu_vfs::{Codec, DataSource, EntryKind, LookupKey};
 
+use crate::tuning::RenderTuning;
+#[cfg(target_os = "android")]
+use crate::tuning::PngBackend;
+
 /// `asset.*` 诊断码。
 pub mod code {
     /// 所有探测候选都不存在。
@@ -129,8 +133,8 @@ struct Prefetched {
 
 /// 持久解码线程 + 待完成集合。
 ///
-/// `YURIS_PREFETCH=1` 时才创建;关闭时整个结构不存在,`TextureStore` 的
-/// 行为与未引入预取前完全一致。
+/// `RenderTuning.prefetch` 时才创建;关闭时整个结构不存在,
+/// `TextureStore` 的行为与未引入预取前完全一致。
 struct PrefetchWorker {
     /// `Option` 只为 `Drop` 时主动断开:发送端全丢 ⇒ worker 的 `recv` 退出。
     jobs: Option<std::sync::mpsc::Sender<PrefetchJob>>,
@@ -200,7 +204,7 @@ pub struct TextureStore {
     evicted_keys: Vec<Vec<u8>>,
     /// 超预算且无可回收条目时只告警一次(回落到预算内后复位)。
     budget_warned: bool,
-    /// 编码不一致时的唯一同名回退(默认开;`YURIS_ASSET_NAME_FALLBACK=off`
+    /// 编码不一致时的唯一同名回退(默认开;`RenderTuning.asset_name_fallback`
     /// 可关)。只影响“原始字节 miss 且 Unicode 唯一匹配”的情形。
     name_fallback: bool,
     /// 走了名称编码回退的解析次数(诊断)。
@@ -213,8 +217,11 @@ pub struct TextureStore {
     /// 这里同样只读一次包。`Rc` 共享,克隆 O(1);缺失/坏容器也缓存,
     /// 避免每帧重读重解析。
     movies: BTreeMap<Vec<u8>, MovieSlot>,
-    /// 预取 worker(`YURIS_PREFETCH=1` 才存在;默认关闭)。
+    /// 预取 worker(`tuning.prefetch` 才存在;默认关闭)。
     prefetch: Option<PrefetchWorker>,
+    /// 本实例的运行参数(预取/缓存/PNG 后端/诊断;宿主经
+    /// `EngineOptions.tuning` 注入,不再读进程环境变量)。
+    tuning: RenderTuning,
     /// 已解码、尚未被主缓存采用的纹理(独立预算,LRU 淘汰)。
     prefetch_pool: BTreeMap<Vec<u8>, Prefetched>,
     prefetch_bytes: usize,
@@ -253,25 +260,24 @@ impl TextureStore {
     pub fn decode_stats(&self) -> (u64, u64) {
         (self.decode_us, self.decode_bytes)
     }
+    /// 用缺省运行参数构造(独立示例/测试用;引擎走
+    /// [`Self::new_with_tuning`],由 `EngineOptions.tuning` 注入)。
     pub fn new(source: Box<dyn DataSource>, codec: Codec, probe_order: Vec<ImageFormat>) -> Self {
-        // 默认 512MiB:足够覆盖常见立绘/背景工作集,同时避免长会话无限增长。
-        // `YURIS_ASSET_CACHE_MB=0` 关闭预算(取证/对照用)。
-        let mb = std::env::var("YURIS_ASSET_CACHE_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(512);
-        let name_fallback = std::env::var("YURIS_ASSET_NAME_FALLBACK")
-            .map_or(true, |v| !matches!(v.trim(), "0" | "off" | "false"));
-        // 预取默认关:`YURIS_PREFETCH=1` 才启动解码线程。预取只改变
-        // 准备时机;没赶上时 `ensure` 仍走原来的同步解码,像素不受影响。
-        let prefetch_on = std::env::var("YURIS_PREFETCH")
-            .map_or(false, |v| !matches!(v.trim(), "" | "0" | "off" | "false"));
-        let prefetch_mb = std::env::var("YURIS_PREFETCH_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(128);
-        let prefetch = if prefetch_on {
-            match Self::spawn_prefetch_worker() {
+        Self::new_with_tuning(source, codec, probe_order, RenderTuning::default())
+    }
+
+    /// 用宿主给定的运行参数构造。
+    ///
+    /// 预取 worker 必须在构造时启动(解码线程持有配置),所以预取开关、
+    /// 预算、PNG 后端等全部从 `tuning` 读取,不再有环境变量分支。
+    pub fn new_with_tuning(
+        source: Box<dyn DataSource>,
+        codec: Codec,
+        probe_order: Vec<ImageFormat>,
+        tuning: RenderTuning,
+    ) -> Self {
+        let prefetch = if tuning.prefetch {
+            match Self::spawn_prefetch_worker(tuning) {
                 Ok(worker) => Some(worker),
                 Err(err) => {
                     log::warn!(
@@ -294,7 +300,7 @@ impl TextureStore {
             decoded: 0,
             decode_us: 0,
             decode_bytes: 0,
-            budget_bytes: mb.saturating_mul(1024 * 1024),
+            budget_bytes: tuning.asset_cache_mb.saturating_mul(1024 * 1024),
             resident_bytes: 0,
             clock: 0,
             meta: BTreeMap::new(),
@@ -304,14 +310,15 @@ impl TextureStore {
             evicted: 0,
             evicted_keys: Vec::new(),
             budget_warned: false,
-            name_fallback,
+            name_fallback: tuning.asset_name_fallback,
             name_fallback_hits: 0,
             movie_keeper: BTreeMap::new(),
             movies: BTreeMap::new(),
             prefetch,
+            tuning,
             prefetch_pool: BTreeMap::new(),
             prefetch_bytes: 0,
-            prefetch_budget_bytes: prefetch_mb.saturating_mul(1024 * 1024),
+            prefetch_budget_bytes: tuning.prefetch_mb.saturating_mul(1024 * 1024),
             prefetch_clock: 0,
             prefetch_hits: 0,
             prefetch_dropped: 0,
@@ -319,14 +326,14 @@ impl TextureStore {
         }
     }
 
-    fn spawn_prefetch_worker() -> std::io::Result<PrefetchWorker> {
+    fn spawn_prefetch_worker(tuning: RenderTuning) -> std::io::Result<PrefetchWorker> {
         let (job_tx, job_rx) = std::sync::mpsc::channel::<PrefetchJob>();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<PrefetchDone>();
         let handle = std::thread::Builder::new()
             .name("yu-asset-prefetch".to_string())
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
-                    let result = std::panic::catch_unwind(|| decode_asset(&job.bytes))
+                    let result = std::panic::catch_unwind(|| decode_asset(&job.bytes, tuning))
                         .unwrap_or_else(|_| Err("预取解码线程 panic".to_string()));
                     if done_tx
                         .send(PrefetchDone {
@@ -348,19 +355,19 @@ impl TextureStore {
         })
     }
 
-    /// 预取是否生效(`YURIS_PREFETCH=1` 且 worker 启动成功)。
+    /// 预取是否生效(`RenderTuning.prefetch` 且 worker 启动成功)。
     #[must_use]
     pub fn prefetch_enabled(&self) -> bool {
         self.prefetch.is_some()
     }
 
-    /// 测试/宿主显式开关预取(默认跟随 `YURIS_PREFETCH`)。
+    /// 测试/宿主显式开关预取(默认跟随 `RenderTuning.prefetch`)。
     pub fn set_prefetch_enabled(&mut self, enabled: bool) {
         if enabled == self.prefetch.is_some() {
             return;
         }
         if enabled {
-            match Self::spawn_prefetch_worker() {
+            match Self::spawn_prefetch_worker(self.tuning) {
                 Ok(worker) => self.prefetch = Some(worker),
                 Err(err) => log::warn!(
                     target: "yu-render",
@@ -656,7 +663,7 @@ impl TextureStore {
             if let Some((bytes, _)) = self.meta.remove(&key) {
                 self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
                 self.evicted += 1;
-                if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
+                if self.tuning.asset_timing {
                     log::debug!(
                         target: "yu-render",
                         "[asset] evicted cached asset {} ({}B)",
@@ -974,7 +981,7 @@ impl TextureStore {
         self.decode_us = self.decode_us.saturating_add(elapsed_us);
         if let Ok(texture) = &cached.result {
             self.decode_bytes = self.decode_bytes.saturating_add(texture.rgba.len() as u64);
-            if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
+            if self.tuning.asset_timing {
                 log::warn!(
                     target: "yu-render",
                     "[asset] key={} size={}x{} bytes={} decode={}us",
@@ -1177,7 +1184,7 @@ impl TextureStore {
             Ok(value) => value,
             Err(cached) => return cached,
         };
-        let decoded = decode_asset(&bytes);
+        let decoded = decode_asset(&bytes, self.tuning);
         match decoded {
             Ok(texture) => {
                 self.decoded += 1;
@@ -1206,7 +1213,7 @@ impl TextureStore {
         self.decode_us = self.decode_us.saturating_add(elapsed_us);
         if let Ok(texture) = &cached.result {
             self.decode_bytes = self.decode_bytes.saturating_add(texture.rgba.len() as u64);
-            if std::env::var_os("YURIS_ASSET_TIMING").is_some() {
+            if self.tuning.asset_timing {
                 log::warn!(
                     target: "yu-render",
                     "[movie] asset={} frame={} size={}x{} bytes={} decode={}us",
@@ -1573,51 +1580,41 @@ fn known_extension_format(key: &[u8]) -> Option<ImageFormat> {
 ///
 /// 两条路径的输出逐字节相同(`png_libpng_parity` 用例对 1253 张语料做过对拍),
 /// 所以分平台只影响性能,不影响像素。
-fn decode_asset(bytes: &[u8]) -> Result<Texture, String> {
+fn decode_asset(bytes: &[u8], _tuning: RenderTuning) -> Result<Texture, String> {
     #[cfg(target_os = "android")]
-    if is_png(bytes) {
-        // 后端选择:默认 `image`(已实测稳定),libpng 需显式开启。
-        //
-        // libpng 的 NEON 反滤波在本项目语料上尚未取得正收益实测数据
-        // (x86 上无 SIMD,慢 4 倍;arm64 上有 NEON 但真机结果待定),
-        // 因此**不设默认开启**,避免把未验证的实现放上主路径。
-        // 开关:`YURIS_PNG_BACKEND=libpng`(环境变量,或 run-config 的
-        // `png_backend` 键经宿主设置)。
-        let use_libpng = std::env::var("YURIS_PNG_BACKEND")
-            .map(|v| v.eq_ignore_ascii_case("libpng"))
-            .unwrap_or(false);
-        if use_libpng {
-            let started = std::time::Instant::now();
-            let fast = crate::png_libpng::decode_texture(bytes);
-            let fast_us = started.elapsed().as_micros();
-            // 对比模式:同一份 PNG 两条路径都解,验证像素一致并给出倍率。
-            if std::env::var_os("YURIS_PNG_CMP").is_some() {
-                let t2 = std::time::Instant::now();
-                let slow = decode_with_image(bytes);
-                let slow_us = t2.elapsed().as_micros();
-                match (&fast, &slow) {
-                    (Ok(a), Ok(b)) => log::warn!(
-                        target: "yu-kernel",
-                        "[pngcmp] {}x{} libpng={}us image={}us ratio={:.2}x same={}",
-                        a.width,
-                        a.height,
-                        fast_us,
-                        slow_us,
-                        slow_us as f64 / fast_us.max(1) as f64,
-                        a.width == b.width && a.height == b.height && a.rgba == b.rgba
-                    ),
-                    _ => log::warn!(
-                        target: "yu-kernel",
-                        "[pngcmp] libpng={}us(ok={}) image={}us(ok={})",
-                        fast_us,
-                        fast.is_ok(),
-                        slow_us,
-                        slow.is_ok()
-                    ),
-                }
+    if is_png(bytes) && _tuning.png_backend == PngBackend::Libpng {
+        // 后端选择来自宿主参数(`EngineOptions.tuning.png_backend`;Android
+        // 壳经 `RunConfig.png_backend` 给值),不再读环境变量。
+        let started = std::time::Instant::now();
+        let fast = crate::png_libpng::decode_texture(bytes);
+        let fast_us = started.elapsed().as_micros();
+        // 对比模式:同一份 PNG 两条路径都解,验证像素一致并给出倍率。
+        if _tuning.png_cmp {
+            let t2 = std::time::Instant::now();
+            let slow = decode_with_image(bytes);
+            let slow_us = t2.elapsed().as_micros();
+            match (&fast, &slow) {
+                (Ok(a), Ok(b)) => log::warn!(
+                    target: "yu-kernel",
+                    "[pngcmp] {}x{} libpng={}us image={}us ratio={:.2}x same={}",
+                    a.width,
+                    a.height,
+                    fast_us,
+                    slow_us,
+                    slow_us as f64 / fast_us.max(1) as f64,
+                    a.width == b.width && a.height == b.height && a.rgba == b.rgba
+                ),
+                _ => log::warn!(
+                    target: "yu-kernel",
+                    "[pngcmp] libpng={}us(ok={}) image={}us(ok={})",
+                    fast_us,
+                    fast.is_ok(),
+                    slow_us,
+                    slow.is_ok()
+                ),
             }
-            return fast.or_else(|_| decode_with_image(bytes));
         }
+        return fast.or_else(|_| decode_with_image(bytes));
     }
     decode_with_image(bytes)
 }

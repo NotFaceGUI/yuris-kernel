@@ -138,7 +138,7 @@ export YURIS_SAMPLE_ERIS_YSBIN=<project-eris>/data/ysbin
 export YURIS_SAMPLE_SDK0479=<sdk-0479>; export YURIS_SAMPLE_SDK0495=<sdk-0495>
 
 # 逐帧分位数 + 命令成本 + 长帧构成
-YURIS_CASE_BENCH=1 ./target/release/yu-cli.exe case <game-b> --case <case> --cases target/tmp
+./target/release/yu-cli.exe case <game-b> --case <case> --cases target/tmp --bench
 
 # 桌面逐帧 CSV(关键列:plan_ms/image_ms/render_ms/upload_bytes/copy_bytes/readback_ms/memo_*)
 ./target/release/yu-cli.exe run <game-b> --mode desktop --frames 1200 --no-sound \

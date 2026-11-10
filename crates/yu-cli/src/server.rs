@@ -61,6 +61,10 @@ pub struct ServeOptions {
     /// 调试用:实时 tick 的单步上限(毫秒)。`None` = 不截断(默认,
     /// 与官方墙钟语义一致);仅用于复现“长帧截断”症状。
     pub max_step_ms: Option<u32>,
+    /// 渲染/诊断参数(与 run/desktop 同一套旗标)。
+    pub tuning: yu_render_core::RenderTuning,
+    pub gpu_backend: yu_backend_wgpu::GpuBackend,
+    pub gpu_adapter: Option<String>,
 }
 
 impl ServeOptions {
@@ -120,6 +124,7 @@ impl ServeOptions {
             Some(value) => Some(parse_u32("max-step-ms", &value)?.max(1)),
             None => None,
         };
+        let host = crate::args::HostTuning::from_args(&mut args)?;
         args.finish()?;
         Ok(Self {
             root: PathBuf::from(root),
@@ -139,6 +144,9 @@ impl ServeOptions {
             patch,
             log_file,
             max_step_ms,
+            tuning: host.render,
+            gpu_backend: host.gpu_backend,
+            gpu_adapter: host.gpu_adapter,
         })
     }
 }
@@ -181,6 +189,9 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         font,
         font_bytes,
         patch: yu_engine::patch::PatchSelection::new(opts.patch),
+        tuning: opts.tuning,
+        gpu_backend: opts.gpu_backend,
+        gpu_adapter: opts.gpu_adapter.clone(),
         // 真实运行:`@_TIME` 注入系统本地时间(存档菜单的现实日期)。
         local_time: crate::clock::local_now(),
         ..EngineOptions::default()

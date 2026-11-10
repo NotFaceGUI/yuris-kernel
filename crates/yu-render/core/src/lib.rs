@@ -26,8 +26,10 @@ pub mod scale;
 pub mod surface;
 pub mod text;
 pub mod texture;
+pub mod tuning;
 
 pub use cache::{ImageCacheKey, ImageOpSig, ImageSource, SizeKey, SizeSource};
+pub use tuning::{PngBackend, RenderTuning};
 pub use report::{RenderPhases, RenderReport, SkippedOp};
 pub use scale::scale_region;
 pub use surface::{blit, blit_rgba, Surface};

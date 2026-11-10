@@ -70,9 +70,9 @@ public final class MainActivity extends Activity
     static final String EXTRA_SCREEN_COLOR = "screen_color";
     /** 新增参数:强制帧率。 */
     static final String EXTRA_FPS = "fps";
-    /** 性能特性:资产异步预取(等价桌面 YURIS_PREFETCH=1)。 */
+    /** 性能特性:资产异步预取(等价桌面 --prefetch)。 */
     static final String EXTRA_PREFETCH = "prefetch";
-    /** 性能特性:COPY2 快照延迟物化(等价桌面 YURIS_SNAPSHOT_DEFER=1)。 */
+    /** 性能特性:COPY2 快照延迟物化(等价桌面 --snapshot-defer)。 */
     static final String EXTRA_SNAPSHOT_DEFER = "snapshot_defer";
     /** 手机画质:`SIZE`(官方最近邻)改双线性采样,缓解 CG/差分缩放锯齿。 */
     static final String EXTRA_BILINEAR_SCALE = "bilinear_scale";

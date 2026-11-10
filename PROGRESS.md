@@ -14054,3 +14054,43 @@ WINDOWINFO 的 `MAXIMIZE/RESIZE/MENUID/REGIONID/DRAGID`(不在 0.495
   `cargo build --workspace --all-targets` + 8 个 crate 的 `--lib`
   免样本测试;真实语料的 `case --all` 门禁仍需自托管/受保护样本 job,
   CI 不空跑、不伪造样本。
+
+
+## 成果 HOST-TUNING (2026-11-10) · 运行开关从环境变量改为引擎参数,CLI/Android 共用 RenderTuning
+
+**问题**:渲染/诊断开关只有 `YURIS_*` 环境变量一条路(预取、缓存预算、
+文本 GPU、PNG 后端、vm_profile、timing),桌面要 `set VAR=1`;Android 在
+宿主 `apply_debug_switches` 里 `set_var` 转一手,两套入口互不同步。
+
+**改动**:
+
+- 新增 `yu_render_core::RenderTuning`(预取/缓存/文本 GPU/PNG 后端/
+  timing 共 24 项)+ `PngBackend`;`EngineOptions.tuning` 与 Android
+  `RunConfig.tuning` 是同一个结构,`EngineOptions` 另加
+  `gpu_backend`/`gpu_adapter`。
+- 渲染层(`TextureStore`/`TextComposer`/Soft/Wgpu/`GfxConfig`/`Rasterizer`)
+  改读字段,删除 `YURIS_*` 读取;预取 worker、PNG 后端、缓存预算、
+  pipeline 预热、text_gpu 等全部经构造参数注入。
+- CLI 新增 `--prefetch` `--prefetch-mb` `--asset-cache-mb` `--png-backend`
+  `--vm-profile` `--asset-timing` `--tick-split` `--cg-timing`
+  `--readback-debug` `--render-timing` `--wgpu-backend` `--wgpu-adapter`
+  等旗标;`yu_cli::args::HostTuning` 是唯一旧 env 兼容层
+  (显式旗标 > env > 默认值),`dev` 把非默认值透传给 `yu-serve`。
+- `case` 的 `YURIS_CASE_BENCH/PROFILE_ALL/TRACE_FRAMES/SHOT_FRAMES`
+  改为 `--bench/--profile-all/--trace-frames/--shot-frames`。
+- Android 删除 `apply_debug_switches`/`APPLIED_SWITCHES`;壳 JSON 与
+  `debug/run-config.json` 都经 `RunConfig::apply_json` 落到 `tuning`。
+- 文档:`docs/cross-platform.md` 新增「运行开关:CLI 旗标是正式入口」
+  完整表;`android/NATIVE_API.md` 补 JSON 键与 CLI 对应。
+
+**验证**:
+
+```text
+cargo build --workspace --all-targets                    → 0 error / 0 warning
+cargo test -p yu-cli --lib                               → 8 passed
+cargo test -p yu-host-android --lib                      → 17 passed
+yu-cli run <project-eris> --frames 1 --vm-profile --asset-timing
+  → [boot] VM opcode profiling ON;PNG target/tmp/host-args-smoke.png
+yu-cli run <project-eris> --vm-profile=maybe             → exit 2,--vm-profile 只接受 on|off
+yu-cli help run                                          → 新增「诊断/性能参数」段
+```

@@ -52,6 +52,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         Some(value) => ArgReader::on_off("debug-mode", &value)?,
         None => false,
     };
+    // 渲染/诊断参数:dev 自己不跑引擎,解析后透传给 yu-serve 子进程。
+    let tuning = crate::args::HostTuning::from_args(&mut args)?;
     args.finish()?;
 
     let workspace = workspace_root();
@@ -82,6 +84,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         no_open,
         release,
         debug_mode,
+        tuning,
         child: None,
         stdin: None,
         first_spawn: true,
@@ -152,6 +155,8 @@ struct Supervisor {
     no_open: bool,
     release: bool,
     debug_mode: bool,
+    /// 渲染/诊断参数(透传给 `yu-serve serve`)。
+    tuning: crate::args::HostTuning,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     first_spawn: bool,
@@ -181,6 +186,7 @@ impl Supervisor {
         if self.debug_mode {
             command.arg("--debug-mode").arg("on");
         }
+        command.args(self.tuning.to_cli_args());
         let mut child = command.spawn().map_err(|e| {
             Failure::runtime(format!(
                 "启动 {} 失败: {e}(先执行 cargo build -p yu-cli --bin yu-serve?)",

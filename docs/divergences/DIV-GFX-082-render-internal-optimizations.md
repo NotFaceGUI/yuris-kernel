@@ -24,10 +24,11 @@
 | `pf=` | 新增 | 预取池：`命中h/解码失败e/占用MB/挂起p`。 |
 | `atlas=` | 新增 | 字形图集：`页p/字形g/命中h/未命中m/淘汰e`。 |
 
-关闭新开关（`YURIS_PREFETCH`、`YURIS_SNAPSHOT_DEFER` 不设）时：
+关闭新开关（不给 `--prefetch`、`--snapshot-defer`）时：
 预取 worker 不存在、延迟物化不登记；`dd` 仅影响相同不可变源纹理的共享
-（像素逐位相同）。`YURIS_PREFETCH_WINDOW` / `YURIS_PREFETCH_MB`
-只在 `YURIS_PREFETCH=1` 时有意义。
+（像素逐位相同）。`--prefetch-window` / `--prefetch-mb`
+只在 `--prefetch` 时有意义。（早期版本用 `YURIS_PREFETCH` 等环境变量，
+现在由 `yu-cli::args::HostTuning` 兼容读取，见 `docs/cross-platform.md`。）
 
 ## 3. 正确性锚点
 

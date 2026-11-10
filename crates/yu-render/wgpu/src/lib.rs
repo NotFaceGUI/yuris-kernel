@@ -242,6 +242,9 @@ pub struct WgpuRenderer {
     /// 默认 false(与官方一致);Android 壳可在配置页开启,缓解高 DPI 屏幕
     /// 上 CG/差分缩放的锯齿。见 `DIV-GFX-083-mobile-bilinear-size`。
     force_bilinear_scale: bool,
+    /// 宿主运行参数(GPU 文本/管线预热/诊断开关;经
+    /// `EngineOptions.tuning` 注入,不再读进程环境变量)。
+    tuning: yu_render_core::RenderTuning,
 }
 
 impl WgpuRenderer {
@@ -291,7 +294,7 @@ impl WgpuRenderer {
         self.textures.prefetch_enabled()
     }
 
-    /// 开关快照延迟物化(默认跟随 `YURIS_SNAPSHOT_DEFER`;测试/宿主用)。
+    /// 开关快照延迟物化(默认来自 `RenderTuning.snapshot_defer`;测试/宿主用)。
     pub fn set_defer_snapshots(&mut self, enabled: bool) {
         self.targets.set_defer_enabled(enabled);
     }
@@ -323,32 +326,48 @@ impl WgpuRenderer {
     /// 用宿主预建的 GPU 上下文初始化(跨平台注入口)。
     ///
     /// 宿主自己决定底层接口(GLES/Vulkan)与回退顺序 —— Android 模拟器的
-    /// gfxstream Vulkan 会在 `vkQueueSubmit` 内空指针崩溃,需要宿主选 GLES。
+    /// gfxstream Vulkan 在 `vkQueueSubmit` 内空指针崩溃,需要宿主选 GLES。
     pub fn new_with_context(textures: TextureStore, ctx: GpuContext) -> Result<Self, Diag> {
-        Self::from_context(textures, ctx)
+        Self::new_with_context_and_tuning(textures, ctx, Default::default())
     }
 
     /// 指定后端/适配器名称子串等选项初始化。
     pub fn new_with_options(textures: TextureStore, options: &DeviceOptions) -> Result<Self, Diag> {
-        let ctx = GpuContext::new(options)?;
-        Self::from_context(textures, ctx)
+        Self::new_with_options_and_tuning(textures, options, Default::default())
     }
 
-    /// 实际构造(`new_with_options` 与 `new_with_context` 共用)。
-    fn from_context(textures: TextureStore, ctx: GpuContext) -> Result<Self, Diag> {
+    /// 宿主预建上下文 + 运行参数(引擎主路径)。
+    pub fn new_with_context_and_tuning(
+        textures: TextureStore,
+        ctx: GpuContext,
+        tuning: yu_render_core::RenderTuning,
+    ) -> Result<Self, Diag> {
+        Self::from_context(textures, ctx, tuning)
+    }
+
+    /// 设备选项 + 运行参数(引擎主路径)。
+    pub fn new_with_options_and_tuning(
+        textures: TextureStore,
+        options: &DeviceOptions,
+        tuning: yu_render_core::RenderTuning,
+    ) -> Result<Self, Diag> {
+        let ctx = GpuContext::new(options)?;
+        Self::from_context(textures, ctx, tuning)
+    }
+
+    /// 实际构造(所有构造入口共用)。
+    fn from_context(
+        textures: TextureStore,
+        ctx: GpuContext,
+        tuning: yu_render_core::RenderTuning,
+    ) -> Result<Self, Diag> {
         let mut pipelines = PipelineCache::new(&ctx)?;
         // 首次过渡/缩放/合成若现编译管线,在移动端会是一次可见尖峰;启动期
         // 统一预热(失败不阻断,首次使用仍按原路径重试)。
-        pipelines.prewarm(&ctx);
-        let gpu_text_enabled = std::env::var("YURIS_TEXT_GPU")
-            .map(|v| {
-                !matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "0" | "off" | "false"
-                )
-            })
-            .unwrap_or(true);
-        let text_gpu = if ctx.text_storage && gpu_text_enabled {
+        if tuning.pipeline_prewarm {
+            pipelines.prewarm(&ctx);
+        }
+        let text_gpu = if ctx.text_storage && tuning.text_gpu {
             match text_gpu::TextGpuRenderer::new(&ctx) {
                 Ok(renderer) => Some(renderer),
                 Err(diag) => {
@@ -363,12 +382,16 @@ impl WgpuRenderer {
         } else {
             None
         };
+        let mut gpu_textures = TextureCache::new();
+        gpu_textures.set_asset_timing(tuning.asset_timing);
+        let mut targets = TargetSet::new();
+        targets.set_defer_enabled(tuning.snapshot_defer);
         Ok(Self {
             ctx,
             textures,
-            gpu_textures: TextureCache::new(),
+            gpu_textures,
             pipelines,
-            targets: TargetSet::new(),
+            targets,
             vertex_buffer: None,
             readback: ReadbackCache::new(),
             scale_readback: ReadbackCache::new(),
@@ -380,11 +403,12 @@ impl WgpuRenderer {
             text_uploads: plan::TextUploads::default(),
             backbuffer: None,
             backbuffer_gpu: None,
-            text: yu_render_core::TextComposer::new(),
+            text: yu_render_core::TextComposer::with_tuning(tuning),
             text_gpu,
             snapshot_registry: Rc::new(RefCell::new(BTreeMap::new())),
             last_phases: yu_render_core::RenderPhases::default(),
-            force_bilinear_scale: false,
+            force_bilinear_scale: tuning.bilinear_scale,
+            tuning,
         })
     }
 
@@ -639,7 +663,7 @@ impl WgpuRenderer {
     /// - `composites/offscreen/snapshots`:合成目标/离屏/快照数。
     /// - `dd/dfr`:同帧快照去重次数 / 延迟物化登记数(见 `DIV-GFX-082`)。
     /// - `atlas`:字形图集 `页/字形/命中/未命中/淘汰`。
-    /// - `pf`:预取池 `命中/解码失败/占用MB/挂起`(`YURIS_PREFETCH=1` 才有值)。
+    /// - `pf`:预取池 `命中/解码失败/占用MB/挂起`(`tuning.prefetch` 才有值)。
     pub fn resource_snapshot(&self) -> String {
         let s = self.surfaces.stats();
         let (composites, offscreen, snapshots) = self.targets.resource_counts();
@@ -748,7 +772,7 @@ impl WgpuRenderer {
         scale: Option<(Viewport, ScaleFilter)>,
         streaming: bool,
     ) -> Result<(WgpuRenderOutput, Option<(u64, u32, u32)>), Diag> {
-        let timing = std::env::var("YU_RENDER_TIMING").is_ok();
+        let timing = self.tuning.render_timing;
         let started = std::time::Instant::now();
         self.textures.begin_frame();
         // CPU 预算刚回收了一批资产 ⇒ 同步释放它们的 GPU 纹理。
@@ -786,6 +810,7 @@ impl WgpuRenderer {
             &mut self.text,
             &mut self.text_gpu,
             self.force_bilinear_scale,
+            self.tuning,
         )?;
         let t_plan = started.elapsed();
 
@@ -850,7 +875,7 @@ impl WgpuRenderer {
         // 归因(只读,`YURIS_READBACK_WHY` 开关):
         // 真机实测 `rb` p99=15.7ms / max=719ms 且每帧都非零,必须先确定
         // 「是走读回分支,还是仅仅在等 `queue.submit`」——两者的修法完全不同。
-        if std::env::var_os("YURIS_READBACK_WHY").is_some() {
+        if self.tuning.readback_debug {
             let group_copies: Vec<String> = frame
                 .passes
                 .iter()
@@ -924,7 +949,7 @@ impl WgpuRenderer {
                     )?
                 };
                 // 细分:判断之后到进入 read 之前的耗时(应≈0)+ read 内部耗时。
-                if std::env::var_os("YURIS_READBACK_WHY").is_some() {
+                if self.tuning.readback_debug {
                     log::warn!(
                         target: "yu-kernel",
                         "[rbtime] frame={} pre={}us read={}us total={}us",

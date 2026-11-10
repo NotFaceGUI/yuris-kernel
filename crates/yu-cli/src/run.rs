@@ -103,6 +103,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         Some(value) => crate::logging::parse_on_off("diag-summary", &value)?,
         None => true,
     };
+    // 渲染/诊断参数(与 desktop/serve/case/bench 同一套旗标)。
+    let host = crate::args::HostTuning::from_args(&mut args)?;
     args.finish()?;
 
     // 统一控制台(Q1):headless 聚合不即印,末尾汇总;JSONL 可选。
@@ -130,6 +132,9 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         script_key,
         save_codec,
         patch,
+        tuning: host.render,
+        gpu_backend: host.gpu_backend,
+        gpu_adapter: host.gpu_adapter,
         // 真实运行:`@_TIME` 注入系统本地时间(存档菜单的现实日期)。
         local_time: crate::clock::local_now(),
         ..EngineOptions::default()

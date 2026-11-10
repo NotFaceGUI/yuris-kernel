@@ -72,7 +72,7 @@ struct Session {
     audio: Option<sound::SoundSink>,
     /// 上屏失败计数(诊断;nativeStatus 可见)。
     present_failures: u64,
-    /// 逐 opcode 耗时采样是否已开启(`YURIS_VM_PROFILE` 开关)。
+    /// 逐 opcode 耗时采样是否已开启(`tuning.vm_profile`)。
     ///
     /// 真机实测 tick p50=7.7ms、每帧约 1.5 万条命令 ⇒ **每条命令 380ns**,
     /// 而 PC 上同一份代码只要 88ns。这个 4.3 倍差距必须按 opcode 拆开看:
@@ -296,14 +296,12 @@ pub struct RunConfig {
     /// 是否渲染上屏(默认 true)。`false` = 只跑 VM + 声音,用于归因实验:
     /// 把合成/上屏整条链路从时序里摘掉,单独判断卡顿是否由渲染抢 CPU 引起。
     pub render: bool,
-    /// 资产异步预取(`prefetch`;默认 false)。等价桌面 `YURIS_PREFETCH=1`。
-    pub prefetch: bool,
-    /// COPY2 快照延迟物化(`snapshot_defer`;默认 false)。
-    /// 等价桌面 `YURIS_SNAPSHOT_DEFER=1`。
-    pub snapshot_defer: bool,
-    /// `SIZE` 也按双线性采样(`bilinear_scale`;手机画质选项,默认 false)。
-    /// false = 官方最近邻;true = 缓解高 DPI 屏幕上 CG/差分缩放的锯齿。
-    pub bilinear_scale: bool,
+    /// 渲染/诊断运行参数(与桌面 `EngineOptions.tuning` 同一份结构)。
+    ///
+    /// JSON 键与 CLI 旗标同名:`prefetch` `prefetch_mb` `asset_cache_mb`
+    /// `text_gpu` `png_backend` `vm_profile` `asset_timing` … 完整列表见
+    /// [`yu_render_core::RenderTuning`] 字段;不再经宿主 setenv 转手。
+    pub tuning: yu_render_core::RenderTuning,
     /// **发布模式**(默认 true):关掉一切只为排查存在的开销。
     ///
     /// - logcat 只放 `warn` 以上(不再每帧/每秒写 info);
@@ -342,9 +340,7 @@ impl Default for RunConfig {
             audio_tone: false,
             audio_rate: None,
             render: true,
-            prefetch: false,
-            snapshot_defer: false,
-            bilinear_scale: false,
+            tuning: yu_render_core::RenderTuning::default(),
             quiet: true,
         }
     }
@@ -357,7 +353,12 @@ impl RunConfig {
     /// `data_root` `save_root` `entry` `debug_mode` `script_key` `font`
     /// `font_file` `os_sound` `audio` `backend` `fps` `screen_color` `dx_mode`
     /// `save_codec` `media_readonly` `record_events` `log_file` `log_level`
-    /// `prefetch` `snapshot_defer` `bilinear_scale`
+    /// `prefetch` `prefetch_mb` `prefetch_window` `asset_cache_mb`
+    /// `asset_name_fallback` `bilinear_scale` `snapshot_defer`
+    /// `text_base_cache` `text_gpu` `pipeline_prewarm` `png_backend`
+    /// `vm_profile` `asset_timing` `tick_split` `cg_timing` `readback_debug`
+    /// `trans_debug` `text_gpu_debug` `render_timing` `render_trace_geometry`
+    /// `p8_timing` `font_trace` `png_cmp`
     pub fn from_json(text: &str) -> Result<Self, String> {
         let mut config = Self::default();
         config.apply_json(text)?;
@@ -437,15 +438,7 @@ impl RunConfig {
         if let Some(v) = object.get("render").and_then(|v| v.as_bool()) {
             config.render = v;
         }
-        if let Some(v) = object.get("prefetch").and_then(|v| v.as_bool()) {
-            config.prefetch = v;
-        }
-        if let Some(v) = object.get("snapshot_defer").and_then(|v| v.as_bool()) {
-            config.snapshot_defer = v;
-        }
-        if let Some(v) = object.get("bilinear_scale").and_then(|v| v.as_bool()) {
-            config.bilinear_scale = v;
-        }
+        apply_tuning_json(&mut config.tuning, object)?;
         let quiet_explicit = object.get("quiet").and_then(|v| v.as_bool());
         if let Some(v) = object.get("audio_rate").and_then(|v| v.as_u64()) {
             if v > 0 {
@@ -507,6 +500,63 @@ fn parse_script_key(value: &str) -> Result<[u8; 4], String> {
     yu_engine::keys::ScriptKey::parse_hex(value)
 }
 
+/// 把 JSON 里的运行参数铺到 [`RenderTuning`](yu_render_core::RenderTuning)。
+///
+/// 键名与桌面 CLI 旗标一一对应(见 `docs/cross-platform.md` 的宿主参数表);
+/// 取值类型错(例如 `prefetch: "yes"`)直接报错,不静默忽略。
+fn apply_tuning_json(
+    tuning: &mut yu_render_core::RenderTuning,
+    object: &std::collections::BTreeMap<String, yu_engine::json::Value>,
+) -> Result<(), String> {
+    let flag = |key: &str, dst: &mut bool| {
+        if let Some(value) = object.get(key) {
+            let on = value
+                .as_bool()
+                .ok_or_else(|| format!("{key} 需要 true/false"))?;
+            *dst = on;
+        }
+        Ok::<(), String>(())
+    };
+    let number = |key: &str, dst: &mut usize| {
+        if let Some(value) = object.get(key) {
+            let n = value
+                .as_u64()
+                .ok_or_else(|| format!("{key} 需要非负整数"))?;
+            *dst = n as usize;
+        }
+        Ok::<(), String>(())
+    };
+    flag("prefetch", &mut tuning.prefetch)?;
+    number("prefetch_mb", &mut tuning.prefetch_mb)?;
+    number("prefetch_window", &mut tuning.prefetch_window)?;
+    number("asset_cache_mb", &mut tuning.asset_cache_mb)?;
+    flag("asset_name_fallback", &mut tuning.asset_name_fallback)?;
+    flag("bilinear_scale", &mut tuning.bilinear_scale)?;
+    flag("snapshot_defer", &mut tuning.snapshot_defer)?;
+    flag("text_base_cache", &mut tuning.text_base_cache)?;
+    flag("text_gpu", &mut tuning.text_gpu)?;
+    flag("pipeline_prewarm", &mut tuning.pipeline_prewarm)?;
+    if let Some(value) = object.get("png_backend") {
+        let text = value
+            .as_str()
+            .ok_or_else(|| "png_backend 需要字符串".to_string())?;
+        tuning.png_backend = yu_render_core::PngBackend::parse(text)?;
+    }
+    flag("asset_timing", &mut tuning.asset_timing)?;
+    flag("tick_split", &mut tuning.tick_split)?;
+    flag("cg_timing", &mut tuning.cg_timing)?;
+    flag("readback_debug", &mut tuning.readback_debug)?;
+    flag("trans_debug", &mut tuning.trans_debug)?;
+    flag("text_gpu_debug", &mut tuning.text_gpu_debug)?;
+    flag("render_timing", &mut tuning.render_timing)?;
+    flag("render_trace_geometry", &mut tuning.render_trace_geometry)?;
+    flag("p8_timing", &mut tuning.p8_timing)?;
+    flag("font_trace", &mut tuning.font_trace)?;
+    flag("png_cmp", &mut tuning.png_cmp)?;
+    flag("vm_profile", &mut tuning.vm_profile)?;
+    Ok(())
+}
+
 /// [`init_session`] + 宿主字体(用户导入的字体字节 / 用户选的字体族)。
 ///
 /// `font_family` 非空时走 [`EngineOptions::force_font`]:把所有 `FONT` 请求
@@ -537,8 +587,8 @@ pub fn init_session_with_fonts(
         ..RunConfig::default()
     };
     config.font_bytes.extend(load_host_fonts(&config.data_root));
-    // 老接口同样要应用诊断开关(见 `apply_debug_switches` 的说明)。
-    apply_debug_switches(&config.data_root);
+    // 老接口同样要应用 run-config.json(与 JSON 入口同一套键)。
+    apply_run_config_file(&mut config);
     let started = start_engine(config, path_overrides)?;
     store_session(started)
 }
@@ -569,7 +619,7 @@ fn store_session(started: StartedEngine) -> Result<String, String> {
             gpu: started.gpu,
             audio: started.audio,
             present_failures: 0,
-            vm_profile: std::env::var_os("YURIS_VM_PROFILE").is_some(),
+            vm_profile: started.vm_profile,
             vm_profile_frames: 0,
             video: started.render,
             quiet: started.quiet,
@@ -723,74 +773,22 @@ fn log_line(target: &str, message: &str) {
     log::warn!(target: "yu-kernel", "[{target}] {message}");
 }
 
-/// 应用 `<游戏目录>/debug/run-config.json` 里的**诊断开关**。
+/// 应用 `<游戏目录>/debug/run-config.json`(与壳 JSON 同一套键)。
 ///
-/// 两个启动入口(`nativeInit` 老接口与 `nativeInitJson`)都必须调用:
-/// 只有 `nativeInitJson` 做这件事时,壳走老接口就完全看不到这些开关
-/// (实测 `cg_timing`/`readback_debug` 写了却完全不生效就是这个原因)。
-///
-/// 只处理需要用**环境变量**传给下游 crate 的键;引擎参数本身由
-/// [`RunConfig::apply_json`] 处理。
-/// 已应用的诊断开关(等日志系统就绪后再统一打印)。
-///
-/// `apply_debug_switches` 在 `start_engine` **之前**执行,那时 JSONL sink
-/// 还没建立、logcat 也没初始化 —— 当场打日志会静默丢失。这里先攒着,
-/// 由 `init_logcat` 之后的 `[boot]` 一并输出。
-static APPLIED_SWITCHES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-/// 取走并清空已应用的开关清单。
-fn take_applied_switches() -> Vec<String> {
-    APPLIED_SWITCHES
-        .lock()
-        .map(|mut v| std::mem::take(&mut *v))
-        .unwrap_or_default()
-}
-
-fn apply_debug_switches(data_root: &std::path::Path) {
-    let path = data_root.join("debug").join("run-config.json");
+/// 两个启动入口(`nativeInit` 老接口与 `nativeInitJson`)都调用这里:
+/// 调壳不方便时直接改文件即可打开诊断开关。解析失败不静默 —— 写进
+/// logcat 一条 warn(此时文件日志可能还没装好)。
+fn apply_run_config_file(config: &mut RunConfig) {
+    let path = config.data_root.join("debug").join("run-config.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return;
     };
-    let Ok(value) = yu_engine::json::parse(&text) else {
-        return;
-    };
-    let Some(obj) = value.as_object() else {
-        return;
-    };
-    let flag = |key: &str| {
-        obj.get(key)
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-    };
-    let mut pending: Vec<String> = Vec::new();
-    if let Some(backend) = obj.get("png_backend").and_then(|v| v.as_str()) {
-        if !backend.trim().is_empty() {
-            std::env::set_var("YURIS_PNG_BACKEND", backend.trim());
-            pending.push(format!("PNG 解码后端: {backend}"));
-        }
-    }
-    if flag("readback_debug") {
-        std::env::set_var("YURIS_READBACK_WHY", "1");
-        pending.push("GPU 读回归因: 已开启".to_string());
-    }
-    if flag("cg_timing") {
-        std::env::set_var("YURIS_CG_TIMING", "1");
-        pending.push("CG 差分计时: 已开启".to_string());
-    }
-    if flag("vm_profile") {
-        std::env::set_var("YURIS_VM_PROFILE", "1");
-        pending.push("VM opcode 归因: 已开启".to_string());
-    }
-    if flag("asset_timing") {
-        std::env::set_var("YURIS_ASSET_TIMING", "1");
-        pending.push("资产装载计时: 已开启".to_string());
-    }
-    if flag("tick_split") {
-        std::env::set_var("YURIS_TICK_SPLIT", "1");
-        pending.push("tick 分段计时: 已开启".to_string());
-    }
-    if let Ok(mut guard) = APPLIED_SWITCHES.lock() {
-        guard.extend(pending);
+    if let Err(error) = config.apply_json(&text) {
+        log::warn!(
+            target: "yu-kernel",
+            "[boot] {} 解析失败: {error}",
+            path.display()
+        );
     }
 }
 
@@ -814,8 +812,6 @@ pub fn start_session_json(json: &str) -> Result<String, String> {
         config
             .apply_json(&text)
             .map_err(|error| format!("{} 解析失败: {error}", override_path.display()))?;
-        // 诊断开关统一由 `apply_debug_switches` 处理(与 `nativeInit` 共用)。
-        apply_debug_switches(&config.data_root);
     }
     let path_overrides = yu_engine::host_paths::HostPathOverrides {
         appdata_path: Some(config.save_root.clone()),
@@ -860,11 +856,10 @@ pub fn start_engine(
         audio_tone,
         audio_rate,
         render,
-        prefetch,
-        snapshot_defer,
-        bilinear_scale,
+        tuning,
         quiet,
     } = config;
+    let vm_profile = tuning.vm_profile;
 
     // 日志:非空 `log_file` 即开启。相对路径落游戏目录,便于 adb pull。
     // 门面是进程级单例,重复初始化保持首次(so 在进程内只应 init 一次)。
@@ -904,12 +899,16 @@ pub fn start_engine(
     // 自证:日志链路一旦装好就立刻打一条。新日志器**单一路径双写**
     // (logcat + 文件),所以这一条必然两边都出现,不再需要「两条出口
     // 分别验证」的绕路。
-    let applied = take_applied_switches();
     log::warn!(
         target: "yu-kernel",
-        "[boot] logging ready (quiet={quiet}, level={log_level:?}, png_backend={}, switches=[{}])",
-        std::env::var("YURIS_PNG_BACKEND").unwrap_or_else(|_| "image".to_string()),
-        applied.join("; ")
+        "[boot] logging ready (quiet={quiet}, level={log_level:?}, png_backend={}, tuning={{prefetch={} snapshot_defer={} vm_profile={} asset_timing={} tick_split={} cg_timing={}}})",
+        tuning.png_backend.as_str(),
+        tuning.prefetch,
+        tuning.snapshot_defer,
+        tuning.vm_profile,
+        tuning.asset_timing,
+        tuning.tick_split,
+        tuning.cg_timing
     );
     flush_logs();
     // 存档根必须存在:缺目录会让 SAVE 与既读记录全部静默失败。
@@ -948,10 +947,9 @@ pub fn start_engine(
         record_events,
         // 归因实验:关掉渲染时引擎复用首帧呈现面,VM/声音照常推进。
         render,
-        // 性能特性开关(等价桌面 YURIS_PREFETCH / YURIS_SNAPSHOT_DEFER)。
-        prefetch: Some(prefetch),
-        snapshot_defer: Some(snapshot_defer),
-        bilinear_scale: Some(bilinear_scale),
+        // 渲染/诊断参数与桌面同一份结构(Android 不再 setenv 转手)。
+        tuning,
+        gpu_backend,
         script_key,
         save_codec: codec,
         save_root: Some(save_root.clone()),
@@ -966,19 +964,15 @@ pub fn start_engine(
     };
     log::warn!(
         target: "yu-kernel",
-        "[boot] render features: prefetch={prefetch} snapshot_defer={snapshot_defer} bilinear_scale={bilinear_scale}"
+        "[boot] render features: prefetch={} snapshot_defer={} bilinear_scale={} text_gpu={} png_backend={}",
+        tuning.prefetch,
+        tuning.snapshot_defer,
+        tuning.bilinear_scale,
+        tuning.text_gpu,
+        tuning.png_backend.as_str()
     );
     let mut engine =
         Engine::new(project, options).map_err(|failure| format!("引擎启动失败: {failure}"))?;
-    // 逐 opcode 耗时归因(`YURIS_VM_PROFILE`;真机排查 VM 分派用)。
-    //
-    // 采样器每条命令两次 `Instant::now()`(≈40~50ns),只在显式开启时运行。
-    // 它给出各 opcode 的**相对**占比,用来判断该优化哪条命令。
-    if std::env::var_os("YURIS_VM_PROFILE").is_some() {
-        engine.set_command_profile(true);
-        engine.set_command_profile_sample(1);
-        log::warn!(target: "yu-kernel", "[boot] VM opcode profiling ON");
-    }
     // 音频输出:与 `@_OS_SOUND` 解耦 —— `os_sound` 决定 VM 可见变量,
     // `audio_output` 才决定是否真的打开设备(架构 §2.5 R5)。
     //
@@ -1047,6 +1041,7 @@ pub fn start_engine(
         audio: audio_sink,
         audio_capture: capture_samples,
         capture_path,
+        vm_profile,
     })
 }
 
@@ -1067,6 +1062,8 @@ pub struct StartedEngine {
     pub audio_capture: usize,
     /// 抓取落盘路径。
     pub capture_path: Option<PathBuf>,
+    /// 逐 opcode 耗时归因(宿主每 60 帧打印一次 top-8)。
+    pub vm_profile: bool,
 }
 
 
@@ -1095,7 +1092,7 @@ pub fn tick() -> i32 {
         match session.engine.tick_realtime() {
             Ok(rendered) => {
                 session.ticks += 1;
-                // 逐 opcode 耗时归因(`YURIS_VM_PROFILE`):每 60 帧把本窗口
+                // 逐 opcode 耗时归因(`tuning.vm_profile`):每 60 帧把本窗口
                 // 累计耗时 top-8 打进 logcat。
                 //
                 // 采样器本身有开销(每条命令两次 `Instant::now()` ≈ 40~50ns),
@@ -2098,17 +2095,35 @@ mod tests {
     #[test]
     fn run_config_parses_render_feature_switches() {
         let config = RunConfig::from_json(
-            r#"{"data_root":"/g","prefetch":true,"snapshot_defer":true,"bilinear_scale":true}"#,
+            r#"{"data_root":"/g","prefetch":true,"snapshot_defer":true,
+                "bilinear_scale":true,"text_gpu":false,"asset_cache_mb":256,
+                "png_backend":"libpng","vm_profile":true,"asset_timing":true,
+                "tick_split":true,"cg_timing":true,"readback_debug":true}"#,
         )
         .expect("解析应成功");
-        assert!(config.prefetch);
-        assert!(config.snapshot_defer);
-        assert!(config.bilinear_scale);
+        assert!(config.tuning.prefetch);
+        assert!(config.tuning.snapshot_defer);
+        assert!(config.tuning.bilinear_scale);
+        assert!(!config.tuning.text_gpu);
+        assert_eq!(config.tuning.asset_cache_mb, 256);
+        assert_eq!(
+            config.tuning.png_backend,
+            yu_render_core::PngBackend::Libpng
+        );
+        assert!(config.tuning.vm_profile);
+        assert!(config.tuning.asset_timing);
+        assert!(config.tuning.tick_split);
+        assert!(config.tuning.cg_timing);
+        assert!(config.tuning.readback_debug);
         // 缺省关闭:老壳不传键时行为与引入前一致。
         let default = RunConfig::from_json(r#"{"data_root":"/g"}"#).unwrap();
-        assert!(!default.prefetch);
-        assert!(!default.snapshot_defer);
-        assert!(!default.bilinear_scale);
+        assert!(!default.tuning.prefetch);
+        assert!(!default.tuning.snapshot_defer);
+        assert!(!default.tuning.bilinear_scale);
+        assert_eq!(
+            default.tuning.png_backend,
+            yu_render_core::PngBackend::Image
+        );
     }
 
     #[test]

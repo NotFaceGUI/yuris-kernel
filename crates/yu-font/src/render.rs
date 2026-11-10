@@ -45,6 +45,11 @@ impl FontRenderer {
         }
     }
 
+    /// 显式开关逐字形 trace(宿主经 `TextComposer` 注入)。
+    pub fn set_trace(&mut self, trace: bool) {
+        self.rasterizer.set_trace(trace);
+    }
+
     #[must_use]
     pub fn source(&self) -> &FontSource {
         &self.source

@@ -83,6 +83,10 @@ pub struct GfxConfig {
     pub main_layer_set: LayerId,
     /// 显示层 codec(逐脚本/逐载荷/隧道)。原版默认 CP932。
     pub display: DisplayConfig,
+    /// CG 差分计时(`RenderTuning.cg_timing`;默认关)。
+    ///
+    /// 由引擎装配从宿主参数写入;gfx 不再读环境变量。
+    pub cg_timing: bool,
 }
 
 impl GfxConfig {
@@ -96,6 +100,7 @@ impl GfxConfig {
             dx_mode: 0,
             main_layer_set: LayerId::new(b":/W0".to_vec()),
             display: DisplayConfig::default(),
+            cg_timing: false,
         }
     }
 
@@ -2763,9 +2768,9 @@ impl GfxState {
     /// `CG` 域命令入口(带差分计时包装)。
     ///
     /// 立绘差分切换就是 `CG[FILE=…]`;它在内部要遍历 `copy_log`/`image_log`
-    /// 作废旧内容。`YURIS_CG_TIMING` 时把整个处理体的耗时与规模打出来。
+    /// 作废旧内容。`tuning.cg_timing` 时把整个处理体的耗时与规模打出来。
     fn apply_cg(&mut self, args: &[ArgValue]) {
-        let probe = std::env::var_os("YURIS_CG_TIMING").is_some();
+        let probe = self.config.cg_timing;
         if !probe {
             return self.apply_cg_inner(args);
         }
@@ -2937,7 +2942,7 @@ impl GfxState {
         } else if let Some(texture) = file {
             // **立绘差分切换的路径**:`CG[FILE=…]` 对已存在的层换图。
             // 手册:FILE 替换只换图,不重置 A/位置等属性。
-            let probe = std::env::var_os("YURIS_CG_TIMING").is_some();
+            let probe = self.config.cg_timing;
             let t0 = std::time::Instant::now();
             if let Some(node) = self.nodes.get_mut(&parsed.path) {
                 node.layer.texture = texture;

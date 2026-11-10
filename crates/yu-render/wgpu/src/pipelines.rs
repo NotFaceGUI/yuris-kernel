@@ -228,13 +228,9 @@ impl PipelineCache {
     /// 启动期把常用管线全部编译好(首次过渡/缩放/合成的驱动编译尖峰前移)。
     ///
     /// 失败不阻断启动:对应路径首次使用时仍会重试,并按原逻辑记诊断。
-    /// `YURIS_PIPELINE_PREWARM=0` 可关闭(对比启动耗时用)。
+    /// 是否调用由宿主决定(`RenderTuning.pipeline_prewarm`;关掉用于对比
+    /// 启动耗时),本函数不再读环境变量。
     pub fn prewarm(&mut self, ctx: &GpuContext) {
-        if std::env::var("YURIS_PIPELINE_PREWARM").is_ok_and(|v| {
-            matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")
-        }) {
-            return;
-        }
         let mut failures = 0u32;
         macro_rules! warm {
             ($call:expr) => {

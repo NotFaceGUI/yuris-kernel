@@ -59,7 +59,30 @@ thread-local)。推荐用一个专用渲染线程,主线程只发输入标志。
   // ---- 诊断 ----
   "record_events": false,      // 记录完整事件流(占内存,对拍用)
   "log_file": "debug/yu-kernel.jsonl",  // 相对 data_root;同 CLI --log-file
-  "log_level": "verbose"       // quiet|error|warn|info|verbose
+  "log_level": "verbose",      // quiet|error|warn|info|verbose
+  // ---- 运行开关(与桌面 CLI 同名;同一份 RenderTuning)----
+  "prefetch": false,           // 资产异步预取(等价 --prefetch)
+  "prefetch_mb": 128,          // 预取池预算
+  "asset_cache_mb": 512,       // 资产缓存预算(0 = 不限)
+  "asset_name_fallback": true, // 编码不一致时的唯一同名回退
+  "bilinear_scale": false,     // SIZE 也按双线性采样(手机画质)
+  "snapshot_defer": false,     // COPY2 快照延迟物化
+  "text_base_cache": true,     // 文本基面 CPU 缓存
+  "text_gpu": true,            // GPU 文本 pass
+  "pipeline_prewarm": true,    // 启动期管线预热
+  "png_backend": "image",      // image | libpng
+  "vm_profile": false,         // VM opcode 逐条耗时归因
+  "asset_timing": false,       // 资产装载/预取计时
+  "tick_split": false,         // tick 内部分段计时
+  "cg_timing": false,          // CG 差分计时
+  "readback_debug": false,     // GPU 读回原因
+  "trans_debug": false,        // 过渡合成取证
+  "text_gpu_debug": false,     // GPU 文本失败/回退原因
+  "render_timing": false,      // 渲染阶段 timing
+  "render_trace_geometry": false,
+  "p8_timing": false,
+  "font_trace": false,
+  "png_cmp": false
 }
 ```
 
@@ -77,8 +100,18 @@ thread-local)。推荐用一个专用渲染线程,主线程只发输入标志。
 | `--record-events on` | `record_events` |
 | `--no-sound` | `audio: false`(不是 `os_sound`) |
 | `--backend soft` / `--backend wgpu` | `backend` |
+| `--wgpu-backend NAME` | `gpu_backend` |
 | `--log-file PATH` | `log_file`(相对路径落 `data_root`) |
 | `--log-level LVL` | `log_level` |
+| `--prefetch` / `--prefetch=off` | `prefetch` |
+| `--asset-cache-mb N` | `asset_cache_mb` |
+| `--png-backend image\|libpng` | `png_backend` |
+| `--vm-profile` / `--vm-profile=off` | `vm_profile` |
+| `--asset-timing` / `--tick-split` / `--cg-timing` | 同名键 |
+
+完整运行开关表见 `docs/cross-platform.md`「宿主参数:唯一取值表」。
+Android 与桌面共用 `yu_render_core::RenderTuning`;`debug/run-config.json`
+覆盖文件也用同一批键(不再有宿主 `setenv` 的第二套开关)。
 
 ## 最小用法
 

@@ -95,7 +95,7 @@ impl AdapterSummary {
 ///
 /// | 入口 | 旧取值 |
 /// |---|---|
-/// | 引擎 `YURIS_WGPU_BACKEND` | `dx12\|vulkan\|gl\|primary\|all` |
+/// | CLI `--wgpu-backend`(旧 `YURIS_WGPU_BACKEND`) | `dx12\|vulkan\|gl\|primary\|all` |
 /// | Android `run-config.json` `gpu_backend` | `auto\|gles\|vulkan` |
 ///
 /// 现在统一在这里:`auto` = 平台最优顺序(见 [`Self::ladder`]),
@@ -120,7 +120,7 @@ impl GpuBackend {
     /// 用户取值 → 接口(大小写不敏感、允许首尾空白)。
     ///
     /// 取值集合 = 两个旧入口的**并集**,不新增别名:
-    /// 引擎 `YURIS_WGPU_BACKEND` 的 `dx12|d3d12|vulkan|gl|gles|primary|all`
+    /// CLI `--wgpu-backend`(旧 `YURIS_WGPU_BACKEND`)的 `dx12|d3d12|vulkan|gl|gles|primary|all`
     /// 与 Android 配置的 `auto|gles|gl|vulkan`。
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn gpu_backend_accepts_both_legacy_value_sets() {
-        // 引擎 YURIS_WGPU_BACKEND 侧的取值。
+        // CLI --wgpu-backend(旧 YURIS_WGPU_BACKEND)侧的取值。
         for value in ["dx12", "d3d12", "vulkan", "gl", "gles", "primary", "all"] {
             assert!(GpuBackend::parse(value).is_ok(), "`{value}` 应被接受");
         }

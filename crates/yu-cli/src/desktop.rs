@@ -107,6 +107,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     };
     // 强制字体(与 headless 同一套 `font_options`:family 或字体文件)。
     let font_arg = args.flag("font");
+    // 渲染/诊断参数(与 headless/serve 同一套旗标)。
+    let host_tuning = crate::args::HostTuning::from_args(&mut args)?;
+    // 桌面宿主自己的取证开关(不进入引擎参数)。
+    let res_probe = args.toggle("res-probe").is_some();
+    let spl_probe = args.toggle("spl-probe").is_some();
     args.finish()?;
 
     // 统一控制台(Q1 R2/R4):日志/panic 防线必须早于 boot;JSONL 单写者
@@ -211,10 +216,10 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         reconcile,
         // 桌面宿主始终渲染(窗口就是产品本身)。
         render: true,
-        // 桌面性能特性走环境变量(YURIS_PREFETCH / YURIS_SNAPSHOT_DEFER)。
-        prefetch: None,
-        snapshot_defer: None,
-        bilinear_scale: None,
+        // 渲染/诊断参数(CLI 旗标 / 兼容环境变量 → 引擎参数)。
+        tuning: host_tuning.render,
+        gpu_backend: host_tuning.gpu_backend,
+        gpu_adapter: host_tuning.gpu_adapter,
         // GPU 上下文由宿主自建(桌面不注入,走引擎内默认创建)。
         gpu_context: None,
         save_root,
@@ -311,6 +316,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             start_paused,
             step_to,
             record,
+            res_probe,
+            spl_probe,
         },
     )
     .map_err(|error| Failure::runtime(error))

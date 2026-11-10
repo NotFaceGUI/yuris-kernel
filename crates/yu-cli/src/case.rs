@@ -18,6 +18,15 @@ use crate::project::Project;
 use crate::sha::sha256_hex;
 use crate::{CliResult, Failure};
 
+/// `case` 诊断选项(以前是 `YURIS_CASE_*` 环境变量;现在全部走参数)。
+#[derive(Clone, Debug, Default)]
+struct CaseDiag {
+    bench: bool,
+    profile_all: bool,
+    trace_frames: Option<(u64, u64)>,
+    shot_frames: Option<BTreeSet<u64>>,
+}
+
 pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let mut args = ArgReader::new(tokens);
     let root = args
@@ -34,6 +43,48 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let debug_mode = match args.flag("debug-mode") {
         Some(value) => ArgReader::on_off("debug-mode", &value)?,
         None => false,
+    };
+    // 渲染/诊断参数(与 run/serve/bench 同一套旗标)。
+    let host = crate::args::HostTuning::from_args(&mut args)?;
+    // case 专属诊断(原 YURIS_CASE_* 环境变量)。
+    let diag = CaseDiag {
+        bench: args.switch("bench"),
+        profile_all: args.switch("profile-all"),
+        trace_frames: match args.flag("trace-frames") {
+            Some(raw) => {
+                let (from, to) = raw.split_once("..").ok_or_else(|| {
+                    Failure::usage(format!(
+                        "--trace-frames 需要 FROM..TO,收到 `{raw}`"
+                    ))
+                })?;
+                Some((
+                    from.trim().parse::<u64>().map_err(|_| {
+                        Failure::usage(format!("--trace-frames 起始帧不是整数: `{from}`"))
+                    })?,
+                    to.trim().parse::<u64>().map_err(|_| {
+                        Failure::usage(format!("--trace-frames 结束帧不是整数: `{to}`"))
+                    })?,
+                ))
+            }
+            None => None,
+        },
+        shot_frames: match args.flag("shot-frames") {
+            Some(raw) => {
+                let frames: BTreeSet<u64> = raw
+                    .split(',')
+                    .filter(|part| !part.trim().is_empty())
+                    .map(|part| {
+                        part.trim().parse::<u64>().map_err(|_| {
+                            Failure::usage(format!(
+                                "--shot-frames 需要逗号分隔的帧号,收到 `{part}`"
+                            ))
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                Some(frames)
+            }
+            None => None,
+        },
     };
     args.finish()?;
     if !all && only.is_none() {
@@ -57,7 +108,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let mut passed = 0usize;
     let mut failed = 0usize;
     for path in &files {
-        match run_case(&project, path, update, debug_mode) {
+        match run_case(&project, path, update, debug_mode, &host, &diag) {
             Ok(true) => {
                 passed += 1;
                 output::line(format!("case {}: PASS", case_name(path)));
@@ -337,7 +388,14 @@ fn build_timeline(inputs: &[CaseInput]) -> InputTimeline {
     timeline
 }
 
-fn run_case(project: &Project, path: &Path, update: bool, debug_mode: bool) -> CliResult<bool> {
+fn run_case(
+    project: &Project,
+    path: &Path,
+    update: bool,
+    debug_mode: bool,
+    host: &crate::args::HostTuning,
+    diag: &CaseDiag,
+) -> CliResult<bool> {
     let spec = parse_case(path)?;
     // 存档域用例:save 根重定向到 target/tmp(产物只进 target/tmp,
     // 语料工程目录永不落盘;每轮清空重建保证确定性)。
@@ -378,39 +436,29 @@ fn run_case(project: &Project, path: &Path, update: bool, debug_mode: bool) -> C
         record_events: spec.record_events,
         debug_mode,
         save_root: save_root.clone(),
+        tuning: host.render,
+        gpu_backend: host.gpu_backend,
+        gpu_adapter: host.gpu_adapter.clone(),
         ..EngineOptions::default()
     };
     let mut engine = Engine::new(project.clone(), opts)?;
     engine.set_timeline(build_timeline(&spec.inputs));
-    // 基准口径(`YURIS_CASE_BENCH=1`):逐帧 tick 耗时 + 命令成本汇总,
-    // 只写 stderr,不进入用例判定与金标。命令计时是 VM 侧 1/32 抽样
-    // (逐条 `Instant` 的测量开销本身就有 ~0.2µs/条,会污染结论)。
-    let bench = std::env::var_os("YURIS_CASE_BENCH").is_some();
+    // 基准口径(`--bench`):逐帧 tick 耗时 + 命令成本汇总,只写 stderr,
+    // 不进入用例判定与金标。命令计时是 VM 侧 1/32 抽样(逐条 `Instant`
+    // 的测量开销本身就有 ~0.2µs/条,会污染结论)。
+    let bench = diag.bench;
     if bench {
         engine.set_command_profile(true);
-        if std::env::var_os("YURIS_CASE_PROFILE_ALL").is_some() {
+        if diag.profile_all {
             engine.set_command_profile_sample(1);
         }
     }
-    // 逐帧画面签名(`YURIS_CASE_TRACE_FRAMES=from..to`):诊断「只闪一帧」
-    // 这类时序异常——软/硬两后端跑同一段剧情,对比逐帧变化率即可。
-    let trace_frames: Option<(u64, u64)> = std::env::var("YURIS_CASE_TRACE_FRAMES")
-        .ok()
-        .and_then(|raw| {
-            let (from, to) = raw.split_once("..")?;
-            Some((from.trim().parse().ok()?, to.trim().parse().ok()?))
-        });
+    // 逐帧画面签名(`--trace-frames from..to`):诊断「只闪一帧」这类时序
+    // 异常——软/硬两后端跑同一段剧情,对比逐帧变化率即可。
+    let trace_frames = diag.trace_frames;
     let mut prev_surface: Option<Vec<u8>> = None;
-    // 定点截帧(`YURIS_CASE_SHOT_FRAMES=900,1200`):诊断用,写 target/tmp。
-    let shot_frames: Option<std::collections::BTreeSet<u64>> = std::env::var(
-        "YURIS_CASE_SHOT_FRAMES",
-    )
-    .ok()
-    .map(|raw| {
-        raw.split(',')
-            .filter_map(|item| item.trim().parse().ok())
-            .collect()
-    });
+    // 定点截帧(`--shot-frames 900,1200`):诊断用,写 target/tmp。
+    let shot_frames = diag.shot_frames.clone();
     let mut tick_ms: Vec<f64> = Vec::with_capacity(spec.frames as usize);
     let mut cmd_totals: std::collections::BTreeMap<String, (u64, u64)> =
         std::collections::BTreeMap::new();

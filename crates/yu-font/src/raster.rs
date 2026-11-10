@@ -44,6 +44,8 @@ pub struct Rasterizer {
     /// `(源 face, bold, italic 量化)` → 已解析 face。`resolve_style` 内部走
     /// fontdb 查询,逐字形调用会在大字库上累积成毫秒级;同参必同果,记一次。
     style_memo: std::collections::HashMap<(crate::source::FaceId, bool, i16), ResolvedFace>,
+    /// 逐字形阶段耗时 trace(宿主参数 `font_trace`;默认关)。
+    trace: bool,
 }
 
 impl Default for Rasterizer {
@@ -58,7 +60,13 @@ impl Rasterizer {
         Self {
             ctx: swash::scale::ScaleContext::new(),
             style_memo: std::collections::HashMap::new(),
+            trace: false,
         }
+    }
+
+    /// 显式开关逐字形 trace(宿主经 `EngineOptions.tuning.font_trace` 注入)。
+    pub fn set_trace(&mut self, trace: bool) {
+        self.trace = trace;
     }
 
     /// Rasterize one character.
@@ -106,7 +114,7 @@ impl Rasterizer {
         let sy = f32::from(params.sy);
         let aa = params.aa;
 
-        let trace = std::env::var("YU_FONT_TRACE").is_ok();
+        let trace = self.trace;
         let t_total = std::time::Instant::now();
         let inner = source.with_face_data(resolved.face, |bytes, index| {
             let t0 = std::time::Instant::now();

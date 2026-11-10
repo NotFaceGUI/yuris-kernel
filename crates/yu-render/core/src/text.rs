@@ -32,6 +32,7 @@ use yu_format::Codec;
 use yu_gfx::{LayerId, TextDraw, TextDrawKey, TextFontRequest, TextLayoutFrame, TextureRef};
 
 use crate::texture::Texture;
+use crate::tuning::RenderTuning;
 
 /// 一次文本合成的统计(进 `RenderReport`)。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -109,8 +110,11 @@ pub struct TextComposer {
     /// 角色出场帧 2 次全屏读回 = 69ms,是文本尖峰的主项。
     base_cache: BTreeMap<(LayerId, u64), BaseCacheEntry>,
     base_cache_bytes: u64,
-    /// `YURIS_TEXT_BASE_CACHE=0` 关闭基面缓存(性能 A/B 用;默认开)。
+    /// `tuning.text_base_cache=off` 关闭基面缓存(性能 A/B 用;默认开)。
     base_cache_enabled: bool,
+    /// 本实例的运行参数(基面缓存/P8 timing/字体 trace;宿主经
+    /// `EngineOptions.tuning` 注入,不再读进程环境变量)。
+    tuning: RenderTuning,
     /// 宿主提供的字体字节(跨平台注入口;空 = 只用系统枚举)。
     host_font_bytes: Vec<Vec<u8>>,
     /// LRU 时钟(每次合成触碰/插入时递增)。
@@ -307,6 +311,12 @@ impl TextComposer {
     /// 懒加载:首次绘制时才枚举系统字体(标题/无文本帧零成本)。
     #[must_use]
     pub fn new() -> Self {
+        Self::with_tuning(RenderTuning::default())
+    }
+
+    /// 用宿主给定的运行参数构造(引擎走这条;示例/测试可用 [`Self::new`])。
+    #[must_use]
+    pub fn with_tuning(tuning: RenderTuning) -> Self {
         Self {
             renderer: None,
             failure: None,
@@ -319,9 +329,8 @@ impl TextComposer {
             cache_bytes: 0,
             base_cache: BTreeMap::new(),
             base_cache_bytes: 0,
-            base_cache_enabled: std::env::var("YURIS_TEXT_BASE_CACHE")
-                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false"))
-                .unwrap_or(true),
+            base_cache_enabled: tuning.text_base_cache,
+            tuning,
             cache_clock: 0,
             frame_stats: ComposeFrameStats::default(),
             host_font_bytes: Vec::new(),
@@ -331,8 +340,16 @@ impl TextComposer {
     /// 用调用方提供的字体源构造(测试/自带字体)。
     #[must_use]
     pub fn with_source(source: FontSource) -> Self {
+        Self::with_source_and_tuning(source, RenderTuning::default())
+    }
+
+    /// 用调用方提供的字体源 + 运行参数构造。
+    #[must_use]
+    pub fn with_source_and_tuning(source: FontSource, tuning: RenderTuning) -> Self {
+        let mut renderer = FontRenderer::new(source, CacheLimits::default());
+        renderer.set_trace(tuning.font_trace);
         Self {
-            renderer: Some(FontRenderer::new(source, CacheLimits::default())),
+            renderer: Some(renderer),
             failure: None,
             faces: BTreeMap::new(),
             load_ms: None,
@@ -343,9 +360,8 @@ impl TextComposer {
             cache_bytes: 0,
             base_cache: BTreeMap::new(),
             base_cache_bytes: 0,
-            base_cache_enabled: std::env::var("YURIS_TEXT_BASE_CACHE")
-                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false"))
-                .unwrap_or(true),
+            base_cache_enabled: tuning.text_base_cache,
+            tuning,
             cache_clock: 0,
             frame_stats: ComposeFrameStats::default(),
             host_font_bytes: Vec::new(),
@@ -493,7 +509,9 @@ impl TextComposer {
                 let summary = font_source_summary(&source, 0);
                 log::info!(target: "yu-font", "{}", summary);
                 self.source_summary = Some(summary);
-                self.renderer = Some(FontRenderer::new(source, CacheLimits::default()));
+                let mut renderer = FontRenderer::new(source, CacheLimits::default());
+                renderer.set_trace(self.tuning.font_trace);
+                self.renderer = Some(renderer);
                 self.failure = None;
                 // 字体身份变了,已解析/已合成的缓存全部失效。
                 self.faces.clear();
@@ -528,7 +546,9 @@ impl TextComposer {
                 let summary = font_source_summary(&source, started.elapsed().as_millis());
                 log::info!(target: "yu-font", "{}", summary);
                 self.source_summary = Some(summary);
-                self.renderer = Some(FontRenderer::new(source, CacheLimits::default()));
+                let mut renderer = FontRenderer::new(source, CacheLimits::default());
+                renderer.set_trace(self.tuning.font_trace);
+                self.renderer = Some(renderer);
                 self.failure = None;
                 self.load_ms = Some(started.elapsed().as_millis());
                 true
@@ -763,7 +783,7 @@ impl TextComposer {
             }
         }
         let _ = drew_any;
-        if std::env::var("YU_P8_TIMING").is_ok() && dbg_glyph_ns + dbg_draw_ns > 500_000 {
+        if self.tuning.p8_timing && dbg_glyph_ns + dbg_draw_ns > 500_000 {
             log::trace!(
                 target: "yu-render",
                 "[p8] draw chars={} glyph={}us onto={}us passes={}",
@@ -1414,7 +1434,7 @@ impl TextComposer {
         self.base_cache_bytes = self.base_cache.values().map(|e| e.bytes).sum();
     }
 
-    /// 显式开关基面缓存(测试 / 性能 A-B;默认由 `YURIS_TEXT_BASE_CACHE` 决定)。
+    /// 显式开关基面缓存(测试 / 性能 A-B;默认由 `RenderTuning.text_base_cache` 决定)。
     pub fn set_base_cache_enabled(&mut self, on: bool) {
         self.base_cache_enabled = on;
     }

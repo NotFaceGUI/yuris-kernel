@@ -75,9 +75,9 @@ public final class SetupActivity extends AppCompatActivity {
     private boolean debugLog;
     /** 状态浮层(HUD)。发布默认关:浮层每秒还要拼状态串。 */
     private boolean showHud;
-    /** 资产异步预取(默认关;等价桌面 YURIS_PREFETCH=1)。 */
+    /** 资产异步预取(默认关;等价桌面 --prefetch)。 */
     private boolean prefetch;
-    /** COPY2 快照延迟物化(默认关;等价 YURIS_SNAPSHOT_DEFER=1)。 */
+    /** COPY2 快照延迟物化(默认关;等价 --snapshot-defer)。 */
     private boolean snapshotDefer;
     /** `SIZE` 双线性采样(手机画质;默认开,官方是最近邻)。 */
     private boolean bilinearScale = true;
