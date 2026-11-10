@@ -32,8 +32,9 @@
 //! "本帧没有任务引用"的旧页;页满/预算耗尽时返回错误,由调用方回退 CPU
 //! 合成(像素仍正确,只是慢),不做近似。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use yu_gfx::LayerId;
 use yu_log::Diag;
@@ -48,7 +49,7 @@ use crate::surfaces::{LayerSurfaces, TexRef};
 /// 字体/字号/样式/亚像素/描边/阴影/旋转/配色全部已烘进 `rgba`,因此
 /// 像素身份就是这些因素的最完整键(不同样式只要产出像素相同,共享
 /// 图集条目是逐像素等价的)。
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct GlyphAtlasKey {
     width: u32,
     height: u32,
@@ -78,6 +79,45 @@ impl GlyphAtlasKey {
 fn fnv_mix(hash: &mut u64, value: u64) {
     *hash ^= value;
     *hash = hash.wrapping_mul(0x100_0000_01b3);
+}
+
+/// 一次 `build` 内的字形键表。
+///
+/// 同一字形的多个 composite pass 共享同一个 `Arc<yu_font::GlyphImage>`;
+/// 按指针只算一次整张像素哈希,不逐 placement 重算。`unique` 仍按像素
+/// 身份去重,保持旧口径的「唯一字形数」统计(`job.glyphs` /
+/// `total_glyphs`)不变。
+///
+/// **生命周期只限一次 `build`**:placements 在循环期间持有强引用,指针
+/// 不会被释放或复用。跨帧/跨 `build` 缓存指针会因 `GlyphCache` 淘汰、
+/// 字体重建或 `WholeRun` gradation 产生新分配而 ABA,不能复用。
+struct GlyphKeyCache {
+    by_ptr: HashMap<usize, GlyphAtlasKey>,
+    unique: BTreeSet<GlyphAtlasKey>,
+}
+
+impl GlyphKeyCache {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            by_ptr: HashMap::with_capacity(capacity),
+            unique: BTreeSet::new(),
+        }
+    }
+
+    fn key_for(&mut self, image: &Arc<yu_font::GlyphImage>) -> GlyphAtlasKey {
+        let ptr = Arc::as_ptr(image) as usize;
+        if let Some(key) = self.by_ptr.get(&ptr) {
+            return *key;
+        }
+        let key = GlyphAtlasKey::of(image);
+        self.by_ptr.insert(ptr, key);
+        self.unique.insert(key);
+        key
+    }
+
+    fn unique_len(&self) -> usize {
+        self.unique.len()
+    }
 }
 
 /// 图集页边长(RGBA8 = 4MB/页)与总预算(8 页 = 32MB)。
@@ -189,12 +229,21 @@ impl GlyphAtlas {
     }
 
     /// 取或放入一个字形,返回 `(页下标, x, y, w, h)`。
+    ///
+    /// 键由调用方传入:同一字形位图会以多个 composite placement 重复出现
+    /// (真机实测 ~9x),整张像素哈希每个唯一位图只算一次,不逐 placement
+    /// 重算 —— 旧口径文本阶段 ~81% 耗在这些重复 FNV 上。
     fn ensure(
         &mut self,
         ctx: &GpuContext,
+        key: GlyphAtlasKey,
         image: &yu_font::GlyphImage,
     ) -> Result<(usize, u32, u32, u32, u32), String> {
-        let key = GlyphAtlasKey::of(image);
+        debug_assert_eq!(
+            (key.width, key.height),
+            (image.width, image.height),
+            "GlyphAtlasKey 与 GlyphImage 尺寸不一致"
+        );
         if let Some(entry) = self.entries.get(&key) {
             self.pages[entry.page].generation = self.generation;
             self.hits += 1;
@@ -518,11 +567,13 @@ impl TextGpuRenderer {
             None => surfaces.acquire(ctx, width, height, "text_gpu")?,
         };
         // 按图集页分组:同一页的字形进同一个 draw list / compute job。
+        // 键按 Arc 指针去重:同一字形位图在一帧内以多个 composite pass
+        // 重复出现,像素哈希每个唯一位图只算一次(不逐 placement 重算)。
         let mut by_page: BTreeMap<usize, Vec<GpuDraw>> = BTreeMap::new();
-        let mut unique_glyphs = std::collections::BTreeSet::new();
+        let mut glyph_keys = GlyphKeyCache::with_capacity(placements.len());
         for placement in placements {
-            unique_glyphs.insert(GlyphAtlasKey::of(&placement.image));
-            let (page, ax, ay, glyph_w, glyph_h) = self.atlas.ensure(ctx, &placement.image)?;
+            let key = glyph_keys.key_for(&placement.image);
+            let (page, ax, ay, glyph_w, glyph_h) = self.atlas.ensure(ctx, key, &placement.image)?;
             by_page.entry(page).or_default().push(GpuDraw {
                 x: placement.x,
                 y: placement.y,
@@ -585,7 +636,7 @@ impl TextGpuRenderer {
                 bind_group,
                 draw_count,
                 glyphs: if copy_base {
-                    unique_glyphs.len() as u32
+                    glyph_keys.unique_len() as u32
                 } else {
                     0
                 },
@@ -606,7 +657,7 @@ impl TextGpuRenderer {
         );
         self.evict();
         self.total_jobs += jobs.len() as u64;
-        self.total_glyphs += unique_glyphs.len() as u64;
+        self.total_glyphs += glyph_keys.unique_len() as u64;
         self.total_draws += placements.len() as u64;
         Ok((target, jobs))
     }
@@ -663,5 +714,40 @@ impl TextGpuRenderer {
             pass.set_bind_group(0, &job.bind_group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn glyph(rgba: [u8; 4]) -> Arc<yu_font::GlyphImage> {
+        Arc::new(yu_font::GlyphImage {
+            width: 1,
+            height: 1,
+            left: 0,
+            top: 0,
+            advance: 0,
+            rgba: rgba.to_vec(),
+        })
+    }
+
+    #[test]
+    fn glyph_key_cache_dedups_by_arc_and_keeps_pixel_identity_count() {
+        let first = glyph([0x11; 4]);
+        let same_pixels = glyph([0x11; 4]);
+        let other = glyph([0x22; 4]);
+        let mut cache = GlyphKeyCache::with_capacity(4);
+
+        let first_key = cache.key_for(&first);
+        // 同一 Arc 的多个 composite pass:不重复哈希。
+        assert_eq!(cache.key_for(&first), first_key);
+        // 不同 Arc、像素相同:各算一次,但唯一像素身份仍只计 1(旧口径)。
+        assert_eq!(cache.key_for(&same_pixels), first_key);
+        let other_key = cache.key_for(&other);
+        assert_ne!(first_key, other_key);
+
+        assert_eq!(cache.by_ptr.len(), 3);
+        assert_eq!(cache.unique_len(), 2);
     }
 }
