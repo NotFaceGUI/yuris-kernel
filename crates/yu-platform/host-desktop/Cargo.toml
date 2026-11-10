@@ -28,6 +28,10 @@ yu-platform-input = { path = "../input" }
 yu-rt = { path = "../../yu-rt" }
 yu-sound = { path = "../../yu-sound" }
 
+# `REGINFO` 的桌面注册表读取(官方 A 版 API;非 Windows 目标不启用)。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry"] }
+
 # serve_probe 示例复用 CLI 的 WS 客户端(dev 依赖允许与 yu-cli → 本 crate 的
 # desktop feature 构成环;仅示例/测试编译时生效)。
 [dev-dependencies]

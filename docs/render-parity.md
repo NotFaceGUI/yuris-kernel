@@ -80,9 +80,11 @@ X 1023 | Y 1023 | A 36 | SX 13 | SY 13
   1 个复制;复制当前**全部** `Unimplemented`)、2 个组离屏(W0 30 ops、
   W1 1 op)+ screen 1 op(W0 组)。真实 `MODE=2` 图层是 `:/W0/SPLDST2`
   (A=0、E=0);`E=0` 图层共 238 个。
-  **任务 J 复核**:当前 HEAD 的 boot 链在 tick 1 产出 8 visible / 18 ops
-  (最新 `yu-rt` 的 GOSUB/YSVR 修复改变了启动路径);34/44 是历史 golden,
-  `cargo test -p yu-gfx` 当前失败,未改 golden、未把历史值当现状。
+  **任务 J 复核**:`771cf79` 的 34 visible/44 op 是历史值,不作现状。
+  当前 HEAD 首屏(tick 1)为 **199 层 / 7 visible / 82 pass / 85 op**
+  (`9aca9fa`/DIV-GFX-016 删除 73 个无 FILE/RID 空壳层;passes/ops 不变,
+  首屏 PNG 哈希未变);`cargo test -p yu-gfx --test eris_first_screen`
+  双模式 4/4 通过。
   `FILE="" + SX/SY` 的黑幕保存显式尺寸(例 `:/W1/DBG` 260×600、
   `:/W0/FONTL2` 233×27)。
   另有 68 个按钮快照的复制源是已删除的临时层,无法在渲染期重放,

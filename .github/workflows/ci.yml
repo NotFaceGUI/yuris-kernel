@@ -1,0 +1,36 @@
+name: ci
+
+# 免样本门禁:全工作区编译 + 不依赖真实语料的 lib 测试。
+# 真实语料/官方 SDK 的集成测试(case --all、corpus、eris_first_screen、
+# yssd roundtrip)需要把 <project-eris> 放到 runner 上(自托管或受保护
+# artifact),本工作流不伪造样本、也不静默跳过。
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build all targets
+        run: cargo build --workspace --all-targets
+      - name: Library tests (no corpus)
+        # 不含 yu-backend-wgpu:hosted runner 无稳定 GPU/DX12 设备,
+        # GPU 用例留给自托管或有设备的 job。
+        run: >
+          cargo test
+          -p yu-log
+          -p yu-format
+          -p yu-render-core
+          -p yu-gfx
+          -p yu-rt
+          -p yu-engine
+          -p yu-sound
+          --lib

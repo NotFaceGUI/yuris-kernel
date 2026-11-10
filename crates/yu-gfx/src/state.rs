@@ -1748,6 +1748,17 @@ impl GfxState {
             // 内部保留浮点,读回时量化。
             "X" => Value::Int(layer.transform.x.round() as i64),
             "Y" => Value::Int(layer.transform.y.round() as i64),
+            // `FX`/`FY` 与 `X`/`Y` 是同一物理量的两种单位(见
+            // `apply_layer_params`:X 写 `+0x68=n`、FX 写 `+0x1b0=n*100`)。
+            // 查询返回引擎原始字段口径(`+0x1b0` = 百分位),不是像素。
+            "FX" => Value::Int((layer.transform.x * 100.0).round() as i64),
+            "FY" => Value::Int((layer.transform.y * 100.0).round() as i64),
+            // 仿射/滤镜字段:原值保存(百分位/角度×100),查询按原值回读。
+            "FBX" => Value::Int(layer.transform.affine.bx.round() as i64),
+            "FBY" => Value::Int(layer.transform.affine.by.round() as i64),
+            "FEX" => Value::Int(layer.transform.affine.ex.round() as i64),
+            "FEY" => Value::Int(layer.transform.affine.ey.round() as i64),
+            "FEZ" => Value::Int(layer.transform.affine.ez.round() as i64),
             "Z" => Value::Int(layer.z),
             "MODE" => Value::Int(i64::from(layer.blend.code())),
             "T" => Value::Int(i64::from(layer.transition.as_ref().map_or(256, |t| t.t))),
@@ -2071,9 +2082,12 @@ impl GfxState {
                 let _ = no;
                 Value::Int(0)
             }
+            // `PITCH`:官方处理体 `0x444e52` 读到该槽后直接
+            // `xor eax,eax; xor edx,edx` 再走公共写回 ⇒ 恒 0(REA 2026-11-10)。
+            "PITCH" => Value::Int(0),
             other => {
-                // TODO(DIV-GFX-036):PITCH/X/Y 需要未取证语义;GRADATION/
-                // ROTATION 已在上方分支按默认值/原值写回(AU5 勘误)。
+                // TODO(DIV-GFX-036):X/Y 需要 GDI TextOut 度量的逐像素语义;
+                // GRADATION/ROTATION/PITCH 已在上方分支按官方值写回。
                 return Err(error::unimplemented(
                     error::code::INFO_UNSUPPORTED,
                     format!("FONTINFO[{other}] 未取证语义"),

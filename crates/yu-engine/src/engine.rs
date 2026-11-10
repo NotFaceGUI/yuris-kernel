@@ -1943,6 +1943,14 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// 安装注册表读取宿主(`REGINFO`;桌面宿主持有 Windows 注册表能力)。
+    /// 无头/用例不安装 ⇒ 走官方失败默认值,结果确定。
+    pub fn set_registry_host(&mut self, host: Box<dyn yu_rt::event::RegistryHost>) {
+        if let Some(vm) = self.vm.as_mut() {
+            vm.set_registry_host(host);
+        }
+    }
+
     /// 宿主窗口的关闭按钮被按下:推 `@_WINDOW_EXEC_CLOSE=1` 给脚本,
     /// 由脚本决定是否 `END`(引擎语义;不直接退出进程)。
     pub fn request_window_close(&mut self) {

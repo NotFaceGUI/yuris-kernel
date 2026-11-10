@@ -34,3 +34,6 @@ android/build/
 android/app/build/
 android/local.properties
 /dist/
+
+# ZCode 会话本地状态(不属仓库)
+/.zcode/

@@ -1,13 +1,13 @@
 {
   "entry": "SYSTEM_START",
   "expect": {
-    "display_json_sha256": "974d003bf7fb450331b8b5d3492c9b1e3c486175f769566c4c496db834c72998",
+    "display_json_sha256": "e13700ea0baf43288ecf671b7cb17a7851902b4259eb6034452db1b7bbb89c31",
     "fatal_codes": [],
-    "ops_total": 159,
-    "png_sha256": "6e2ed219ab0f11f49280a92de2ffd3f6e6bad5f7f2c60baec9cab698daa80f64",
-    "skipped_ops_total": 1
+    "ops_total": 57,
+    "png_sha256": "ff5d2054ba740f627f1d8b00b5b64d6b4cfff10a85c42fe06478143d2abf2bde",
+    "skipped_ops_total": 0
   },
-  "frames": 560,
+  "frames": 1150,
   "inputs": [
     {
       "button": "MOUSE_L",
@@ -17,11 +17,29 @@
     },
     {
       "button": "MOUSE_L",
-      "frame": 440,
+      "frame": 520,
+      "x": 150,
+      "y": 100
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 640,
+      "x": 150,
+      "y": 95
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 760,
+      "x": 150,
+      "y": 122
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 900,
       "x": 45,
       "y": 585
     }
   ],
   "name": "symptom-ingame-save",
-  "note": "P1 症状回归:标题 スタート → 本篇菜单栏 セーブ(45,585)。点击后 ops 158→196(新增 CGS100/SLTEMP rectpaint2 + 8 个按钮拷贝),但像素与点击前完全相同 ⇒ 存档界面合成结果不可见(docs/symptom-ledger.md S4)。底层修复后需 --update。"
+  "note": "P1 症状回归:完整导航进本篇后点菜单栏 セーブ(45,585)。验证存档页可见(槽位/缩略图/日期/New! 标记)且可由 戻る 返回。"
 }

@@ -76,7 +76,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `WINDOWINFO` | window | 31 | `window/windowinfo.html` | `0x4586ec` | 🔁 部分(129 次未实现) | 主路径实现;未实现路径见 §2 |
 | `WINDOW` | window | 31 | `window/window.html` | `0x456b70` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `SOUNDINFO` | sound | 25 | `sound/soundinfo.html` | `0x44f4bc` | ✅ 宿主 | 装宿主时 `op_soundinfo` → `SoundHost::query` → LET;未装时保持 M-2 |
-| `FILEINFO` | file | 22 | `file/fileinfo.html` | `0x44286c` | ✅ 实现(FILE+EXIST+LET) | AU5 勘误:旧口径「➖ 域事件」未随 J3 更新。J3 起 `op_fileinfo` VFS 存在性查询写 LET(EVID-J3-01);B1 补「散盘」回退(REA `0x44316c` 文件系统支:`FILE=$es.SAVEPATH+名` ⇒ save 根判存在;存档槽判定/启动恢复闸门依赖,桌面实测暴露);FOLDER/SIZE/RELATION 变体仍挂账(B10) |
+| `FILEINFO` | file | 22 | `file/fileinfo.html` | `0x44286c` | ✅ 实现(FILE/FOLDER×EXIST/SIZE/RELATION) | AU5 勘误:旧口径「➖ 域事件」未随 J3 更新。J3 起 `op_fileinfo` VFS 存在性查询写 LET(EVID-J3-01);B1 补「散盘」回退(REA `0x44316c` 文件系统支);2026-11-10 补 `FOLDER`(REA `0x4433d6`:`FindFirstFileA` + `FILE_ATTRIBUTE_DIRECTORY`;`SIZE` 对 FOLDER 写 0、`RELATION` 写目标类型默认值、`..` 拒绝) |
 | `MATH` | vm | 21 | `math/math.html` | `0x4482c4` | ✅ 实现 | 保持 |
 | `FILEACT` | file | 20 | `file/fileact.html` | `0x441370` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `TASKINFO` | vm | 19 | `control/taskinfo.html` | `0x4523fc` | ✅ 实现 | 21 槽:A/FILE0/FILENO0/LINE0/TEXTLINE/NEXTVOICE 按 0.495 逐分支补齐(2026-10-26);SCRIPTPOS 用 `0x452a54`/`0x450fe0` 引擎字节格式(三栈+text_line/pc/脚本名);FILENO0→SCRIPTPOS fallthrough;GOLABEL/GOSUBLABEL/TEXTPOS 官方无分支 → 对齐 no-op(DIV-RT-025) |
@@ -145,14 +145,14 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `PLUG` | vm | 0 | — | `0x44bd10` | ✅ no-op | 官方只做参数求值后返回 0(DIV-RT-046) |
 | `PREP` | vm | 0 | — | `0x4634d8` | ✅ no-op | 官方 no-op(DIV-RT-043) |
 | `PROJECTFOLDER` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期;运行时同默认槽(DIV-RT-043) |
-| `REGINFO` | vm | 0 | `reg/reginfo.html` | `0x44bd30` | ⛔ 宿主能力 | 读 Windows 注册表;内核不猜(DIV-RT-045) |
+| `REGINFO` | vm | 0 | `reg/reginfo.html` | `0x44bd30` | ✅ 实现(宿主能力) | `RegistryHost` 端口 + 桌面 Windows 实现;官方失败路径写 0/0.0/空串,成功只写字符串目标(INT/FLT 保持原值,REA `0x44bf0a` 只判 type==3);根前缀不匹配不写 LET;`/`→`\` 归一(REA 2026-11-10) |
 | `RELEASEMODE` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期;运行时同默认槽(DIV-RT-043) |
 | `RETURNBREAK` | vm | 0 | — | `0x4634d8` | ✅ no-op | 官方 no-op(DIV-RT-043) |
-| `SAVEINFO` | save | 0 | — | `0x44e1c8` | ⛔ 挂账(B7) | 查询处理体未取证、语料 0 次;REA 锚勘误:`0x44e1c8` 是 SAVEINFO 本体(SAVE=`0x44c45c`,B1) |
+| `SAVEINFO` | save | 0 | — | `0x44e1c8` | ✅ no-op(官方) | 0.495 处理体在 `FUN_00429fd1` 守卫后 `xor eax,eax; pop ecx; ret`(`44e1e1 33 c0 59 c3`)——不读参数、不写 LET、无副作用;REA 2026-11-10。手册无页 |
 | `SYSTEMMODE` | system | 0 | `projectconfig/systemmode.html` | `0x459e90(默认)` | ✅ 脚本错误槽 | 仅 `projectconfig.txt` 编译期有效;运行时官方默认槽报错(DIV-RT-043) |
 | `S_VAR` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;出现在 yst 即官方脚本错误(DIV-RT-043) |
 | `TEXTINFO` | vm | 0 | `text/textinfo.html` | `0x4538cc` | ✅ 实现 | 语料未使用;M-2 按手册 + REA 实现,单测覆盖(COV-M-02)。**H-P2-02 补**:`CLICK` 读 `+0x35`(`FUN_00404914` 遇 `'C'` 置位),`CX/CY` 读 `+0x14/+0x18` |
-| `VAR` | vm | 0 | — | `0x453f88` | ⛔ 未取证 | 三层缺①(手册无页)⇒ 挂档 |
+| `VAR` | vm | 0 | — | `0x453f88` | ✅ no-op(官方) | 0.495 处理体在 `FUN_00429fd1` 守卫后 `xor eax,eax; pop ecx; ret`(`453fa1 33 c0 59 c3`)——不读参数、不写 LET;REA 2026-11-10。手册无页 |
 | `WINDOWEND` | window | 0 | `window/windowend.html` | `0x45866c` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `_IFDEF` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 预处理器指令;运行时同默认槽(DIV-RT-043) |
 | `_IFEND` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 同 _IFDEF(DIV-RT-043) |

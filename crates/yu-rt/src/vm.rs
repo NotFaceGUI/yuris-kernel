@@ -495,6 +495,8 @@ pub struct Vm {
     sound_host: Option<Box<dyn crate::event::SoundHost>>,
     /// 存档域同步宿主(可选;SAVE 预约/刷盘 + LOAD 拉取,B1 裁 1-A/2-A)。
     save_host: Option<Box<dyn crate::event::SaveHost>>,
+    /// 注册表读取宿主(可选;`REGINFO`,官方 `0x44bd30`)。
+    registry_host: Option<Box<dyn crate::event::RegistryHost>>,
     events: Vec<VmEvent>,
     diags: MemorySink,
     pending_effects: Vec<Effect>,
@@ -784,6 +786,7 @@ impl Vm {
             graphics_host: None,
             sound_host: None,
             save_host: None,
+            registry_host: None,
             events: Vec::new(),
             diags: MemorySink::new(),
             pending_effects: Vec::new(),
@@ -1146,6 +1149,11 @@ impl Vm {
     /// 取走存档宿主。
     pub fn take_save_host(&mut self) -> Option<Box<dyn crate::event::SaveHost>> {
         self.save_host.take()
+    }
+
+    /// 安装注册表读取宿主(`REGINFO`;桌面宿主持有 Windows 注册表能力)。
+    pub fn set_registry_host(&mut self, host: Box<dyn crate::event::RegistryHost>) {
+        self.registry_host = Some(host);
     }
 
     /// 因容量上限被丢弃的最旧事件数。

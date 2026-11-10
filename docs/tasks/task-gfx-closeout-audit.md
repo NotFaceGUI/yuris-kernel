@@ -522,14 +522,13 @@ first-screen case                        → ops 75 / skipped 0;display sha 因
 `cargo build --workspace --all-targets` exit 0。`case --all` 仍是既有
 golden 红(0/9,ops/display sha 未重生成),未在无主人授权下改 golden。
 
-**推送前红灯(需主人授权后处理)**:
-- `cargo test --workspace --no-fail-fast`(带真实语料)仅 5 项失败:
-  - `yu-gfx --test eris_first_screen` ×2:结构 golden 仍记 `layers=272`,
-    实际 199(016 删除 73 个官方没有的无 FILE 鬼层;passes 82 / ops 85 /
-    visible 8 均未变)。需授权后把 census 改为 199 并
-    `UPDATE_GFX_GOLDEN=1` 重生成 display golden;
-  - `yu-sound --test state` 2 项 `gated_ogg_*`:HEAD 既有,与 gfx 无关;
-  - `yu-trace --test golden` 1 项 `synthetic_trace_matches_golden`:HEAD
-    既有 synthetic ycd sha 差异。
-- `yu-cli case --all`:0/9,全部为 display/ops golden 旧值(与审计 §11.1
-  同源);未在无授权下改 golden。
+**推送前红灯(2026-11-10 更新)**:
+- `yu-gfx --test eris_first_screen` ×2:**已修**(census 272→199;
+  DIV-GFX-016 删除 73 个无 FILE 空壳层,passes 82/ops 85/visible 7 已复核,
+  display golden 已重生成)。
+- `yu-cli case --all`:**已修**,9/9 绿(旧输入只点 START;已补全
+  β4 功能菜单三级导航,并分别验证 設定/セーブ/QS/QL)。
+- `yu-sound --test state`:`gated_ogg_*` 在当前树已通过(51 passed)。
+- `yu-trace --test golden`:`synthetic_trace_matches_golden` 的
+  producer version 0.1.0→0.2.0 与内嵌 ysc/ycd 夹具字节已重生成,
+  当前通过。

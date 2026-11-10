@@ -35,6 +35,7 @@
 
 pub mod diagnostics;
 pub mod panic_guard;
+pub mod registry;
 pub mod script;
 pub mod sound_device;
 pub mod stepper;

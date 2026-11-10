@@ -56,8 +56,9 @@ SX/SY/COLOR/ONMOUSE 族)、FONTINFO(当前样式与字体清单)、WINDOWINFO(�
 样式(075)、自动换行与行高基线(056)、无文本图层时的屏幕叠加层序(057)。
 
 首屏 golden:`tests/golden/eris_first_screen_display.json`
-(272 层 / 82 pass / 85 op,`cargo test -p yu-gfx --test eris_first_screen`
-当前 4/4 通过)。
+(199 层 / 7 visible / 82 pass / 85 op;`9aca9fa`/DIV-GFX-016 删除 73 个
+无 FILE/RID 空壳层后,绘制 op 不变。`cargo test -p yu-gfx --test
+eris_first_screen` 当前 4/4 通过)。
 
 ## 验证
 

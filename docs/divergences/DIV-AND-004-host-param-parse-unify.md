@@ -74,7 +74,8 @@ cargo build --workspace --all-targets                          → 通过
 
 全量 `cargo test --workspace` 剩余失败均为既有/环境性(见 PROGRESS):
 
-- `yu-gfx eris_first_screen` ×2(golden 199 vs 272)—— stash 对照复现;
+- `yu-gfx eris_first_screen` ×2(golden 199 vs 272)—— 2026-11-10 已按
+  199/7 visible 重生成并通过(DIV-GFX-016 的无源空壳层;passes/ops 不变);
 - `yu-sound gated_ogg` ×2 —— 单独带样本 env 跑全绿,并行时争用;
 - `yu-backend-wgpu diffusion_matches_soft_across_sizes` —— 单跑通过(GPU 争用)。
 

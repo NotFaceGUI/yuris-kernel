@@ -281,15 +281,10 @@ impl SaveState {
                 self.apply_fileact(*frame, &args);
             }
             "SAVEINFO" => {
-                // 查询处理体 REA 0x44e1c8 未取证,语料 0 次 ⇒ 整体挂账 B7。
-                self.push_diag(error::at_command(
-                    error::unimplemented(
-                        code::COMMAND_UNIMPLEMENTED,
-                        "SAVEINFO 查询未取证(REA 0x44e1c8;语料 0 次);挂账".to_string(),
-                    ),
-                    *frame,
-                    command,
-                ));
+                // 官方 no-op(REA `0x44e1c8`:守卫后 `xor eax,eax;
+                // pop ecx; ret`;不读参数/不写 LET)。VM 已按 `Noop` 分派,
+                // 不会再把 SAVEINFO 送进存档域;这里保留空分支兼容旧事件流,
+                // 不再产生「未取证」误报。
             }
             "FILEINFO" => {
                 // 查询**已全部由内核实现**(`op_fileinfo`):`EXIST` 走封包/散盘

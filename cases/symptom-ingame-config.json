@@ -1,13 +1,13 @@
 {
   "entry": "SYSTEM_START",
   "expect": {
-    "display_json_sha256": "66941607ffd15835f0d2253e36d0b879ab6bba03ff0f5113b7d35b9c4f6912f3",
+    "display_json_sha256": "5bb47bea52c87d28a357a1c6b468c073245d926ba269530e8dc98b726b15129a",
     "fatal_codes": [],
-    "ops_total": 404,
-    "png_sha256": "0867a76196d0bec915c68d81cc4153d4075fb7c3370dacecc4d99d163b367a64",
+    "ops_total": 38,
+    "png_sha256": "3080475dd442ff6cc9a95abe8cede0ba758e6ea84dc75e5db8b76d8178eaa92c",
     "skipped_ops_total": 0
   },
-  "frames": 540,
+  "frames": 1100,
   "inputs": [
     {
       "button": "MOUSE_L",
@@ -17,11 +17,29 @@
     },
     {
       "button": "MOUSE_L",
-      "frame": 440,
+      "frame": 520,
+      "x": 150,
+      "y": 100
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 640,
+      "x": 150,
+      "y": 95
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 760,
+      "x": 150,
+      "y": 122
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 900,
       "x": 494,
       "y": 583
     }
   ],
   "name": "symptom-ingame-config",
-  "note": "P1 症状回归:标题 スタート → 本篇菜单栏 設定(494,583)可以打开(ops 158→450,界面完整)。“点了没反应”的是故事推进/右键/セーブ,见 docs/symptom-ledger.md S3 与 symptom-ingame-save。"
+  "note": "P1 症状回归:完整导航进本篇(见 symptom-enter-story)后点菜单栏 設定(494,583)。验证設定页可打开且内容完整(系统/文本/声音/E-mote 页签与 ON/OFF 选项)。"
 }

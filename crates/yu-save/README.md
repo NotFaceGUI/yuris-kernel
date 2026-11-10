@@ -26,7 +26,7 @@ YU-RIS 存档与文件域(`SAVE` / `LOAD` / `SAVEEND` / `SAVEINFO` /
 |---|---|---|
 | `SAVE[FILE]` 刷盘 | **已实现**(`flush` 按 DNO 升序写预约时的字节快照;默认**可写**,只读为显式构造态,拒绝时挂号 `sv.write.refused`) | B1 裁 1-A/裁 2-A;REA `0x44d73d`/`0x44e1a0` |
 | `LOAD[LET/ID]` 值写回 | 容器读侧照常(槽表/解析);图层恢复挂账 H-P4-02 | DIV-RT-042 + H-P4-02 |
-| `SAVEINFO` 查询 | 挂账(`REA 0x44e1c8` 未取证,语料 0 次) | 手册页 + 语料实测 |
+| `SAVEINFO` | **官方 no-op**(`0x44e1c8` 守卫后 `xor eax,eax; pop ecx; ret`;VM 分派为 `HandlerKind::Noop`,不再进入存档域) | REA 2026-11-10(`44e1e1 33 c0 59 c3`);`fixture::saveinfo_and_var_are_official_noops` |
 | `FILEACT[EXEC]` | 拒绝(`sv.exec.refused`) | 无引擎语义取证 + 宿主安全策略(不执行外部程序) |
 | `FILEACT` 图层导出(BMP/PNG/JPG) | 挂账 H-P4-02(→ P2/集成轮) | 需要 gfx |
 | `FILEINFO[EXIST]` | **不双写**(内核 J3 已实现) | REA `0x44286c` |

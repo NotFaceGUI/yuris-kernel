@@ -425,7 +425,7 @@
 | `VARACT[INIT]` / `G_INT..G_STR4` | `variable/varact.html`(未列 INIT/G_*) | 引擎 §3.26 给了掩码位算法,但**手册无对应页**;三明治判据缺① |
 | `RETURNCODE` / `RETURNBREAK` | 手册 `control/` 无独立页 | 语料 396 次高频使用,但零一手规格 |
 | `F_INT` / `F_FLT` / `F_STR` / `F_VAR` | 手册 `variable/` 无页 | 同上(F_INT 337 次) |
-| `WORD` / `VAR` / `PREP` / `PLUG` | 无页 | 不实现 |
+| `WORD` / `VAR` / `PREP` / `PLUG` | 无页 | `VAR` 已于 2026-11-10 定案为官方 no-op(见下);`WORD` 见 DIV-RT-028;`PREP` no-op;`PLUG` NoopEval |
 
 处置:运行到即 `Unimplemented` + 事件流留痕,执行继续。
 - **2026-10-23 复核(状态收窄)**:原表多数子项已另证实现 ——
@@ -436,9 +436,18 @@
   (DIV-RT-043:静态命中全在 `global_f.yst` 声明段,600 帧运行期 0 次);
   `CSV`/`PLUG`/`ERRORINFO` = 官方「参数求值+返回 0」(`NoopEval`,
   REA `0x43e640`/`0x44bd10`/`0x46356c`);`ERROR` 启用表见 DIV-RT-046。
-  **仍挂号**:`VAR`(无页、无官方体)、`CSVINFO`与 `CDDA`(空桩,见
-  sound-ledger N0-10);`STRTYPE/SJISCODE/UTF8CODE` 已按 2026-11-01 的 REA
-  结论收口(见下)。
+  **仍挂号**:`CSVINFO`(见下);`CDDA` 是空桩(sound-ledger N0-10,不在本条目)。
+  `STRTYPE/SJISCODE/UTF8CODE` 已按 2026-11-01 的 REA 结论收口(见下)。
+- **2026-11-10 收口(`VAR` / `SAVEINFO`;fixed / 官方 no-op)**:
+  - `VAR` 处理体 `0x453f88`:守卫 `FUN_00429fd1(opcode=0x63)` 后
+    `je 0x453fa1`,`0x453fa1` 原始字节 `33 c0 59 c3` = `xor eax,eax;
+    pop ecx; ret`。**不读参数、不写 LET、不发事件** ⇒ `HandlerKind::Noop`。
+  - `SAVEINFO` 处理体 `0x44e1c8`:守卫 `FUN_00429fd1(opcode=0x56)` 后
+    `je 0x44e1e1`,`0x44e1e1` 原始字节同上 ⇒ 同样 no-op;此前
+    `yu-save::apply_event` 报 Unimplemented 的分支随 VM 分派改为 no-op
+    后不再到达。
+  - 复核:`fixture::saveinfo_and_var_are_official_noops`(带 FILE/LET
+    参数、未声明变量都不求值;零挂号、零域事件)。
 - **2026-11-01 收口(VARINFO STRTYPE / SJISCODE / UTF8CODE;fixed(no-manual))**:
   - 处理体 `0x456050`(handler,0x770 字节);判定链 `2,3,4,...,13,14,20`。
   - `STRTYPE` 分支 `0x4563b7`:取 SET 字符串**首字节**,查 CP932 类表
@@ -1167,7 +1176,7 @@ packed = ([1290322, 329227, 26, 249, 8765, 8765], 0, "cd1790…4bd2e")  ... ok
 | `TRAY` | `0x453a4c` | `Domain::System` 事件(宿主托盘图标) | 手册 `other/tray.html`;语料 2 处 |
 | `CLIPACT` | `0x43e2d0` | 内核镜像 + 事件;需 TEXT+SET 都存在 | 手册;REA(CF_TEXT 写入) |
 | `CLIPINFO` | `0x43e410` | 读镜像写 LET;仅 TEXT 存在时动作;过滤 `<0x20` | 手册;REA `0x43e4d2..` |
-| `REGINFO` | `0x44bd30` | `Unimplemented`(需宿主注册表) | 手册 `reg/reginfo.html` |
+| `REGINFO` | `0x44bd30` | **已实现(2026-11-10)**:`RegistryHost` 端口 + 桌面 Windows 实现;官方失败路径写 0/0.0/空串,成功只写字符串目标(INT/FLT 保持原值,`0x44bf0a` 只判 type==3;手册例 1 的 DWORD→@A 与处理体不一致,按处理体对齐) | 手册 `reg/reginfo.html`;REA `0x44bd30/0x44c080`;`fixture::reginfo_reads_host_registry_and_matches_official_write_rules` |
 | `YMV`/`YMVEND` | `0x458ee0`/`0x459a64` | **B14 已落地**(影片图层;VM 解析容器头推元数据 + 域事件,绘制归 gfx) | 分发表;`0x459094` 解析体;官方样例;见 DIV-GFX-073 |
 | `YMVINFO` | `0x459b98` | **B14 已落地**:`query_ymvinfo` 回 `NUM/SX/SY/FPS`,缺层/缺片写 0 | 分发表;`0x459d63`/`0x459de2` 的零写回 |
 

@@ -112,13 +112,14 @@ fn eris_first_screen_display_list() {
     }
     let f = gfx.frame();
     if debug_mode {
-        // debug 分支首屏(独立口径;不入 golden 文件;B4 复跑实测 2026-10-24):
+        // debug 分支首屏(独立口径;不入 golden 文件;B4 复跑实测 2026-10-24;
+        // 9aca9fa/DIV-GFX-016 后与 false 模式同减 73 个无源空壳层):
         // 调试任务在 f1 建立调试窗(:/W2/* 13 层)⇒ 层/可见/pass/op 都多于
         // false 模式;screen pass 仍 4 op(主组直绘,与 false 模式同)。
-        assert_eq!(f.layers.len(), 299, "debug layers");
+        assert_eq!(f.layers.len(), 226, "debug layers");
         assert_eq!(
             f.layers.iter().filter(|l| l.visible).count(),
-            18,
+            17,
             "debug visible"
         );
         assert_eq!(f.passes.len(), 93, "debug passes");
@@ -158,9 +159,9 @@ fn eris_first_screen_display_list() {
     //
     // J3 复核:旧值(visible 34 / ops 44 / W0 30 / invisible 238)来自
     // `771cf79`,早于 `1365918` 的 YSVR 初值/GOSUB 块栈修正;现在的启动
-    // 路径生成的可见集更小(272 层不变、8 可见、18 op、W0 4 op、264 不可见)。
-    // 该 census 与 title 稳定帧对官方的像素对照同时成立(见任务 J3 台账 §9),
-    // 因此按当前实现更新 golden,而不是用 UPDATE_GFX_GOLDEN 掩盖回归。
+    // 路径生成的可见集更小。该 census 与 title 稳定帧对官方的像素对照
+    // 同时成立(见任务 J3 台账 §9),因此按当前实现更新 golden,而不是
+    // 用 UPDATE_GFX_GOLDEN 掩盖回归。
     //
     // J3 追加(DIV-GFX-008/041,主组直绘):主窗口组不再产出离屏 pass,
     // 子层直接进屏幕 pass(passes 15 → 14,total ops 18 → 17)。
@@ -168,8 +169,15 @@ fn eris_first_screen_display_list() {
     // AU1 追加(DIV-GFX-053):按钮状态快照的源层 `BT.OFF.TMP` 在同一帧末尾
     // 被 `CGEND` 删除;命令时刻捕获源纹理后,68 条 `COPY2` 不再被丢弃。
     // 因此 texture passes 12 → 80(69 copy + 11 image)、total ops 17 → 85。
-    assert_eq!(f.layers.len(), 272, "layers");
-    assert_eq!(f.layers.iter().filter(|l| l.visible).count(), 8, "visible");
+    //
+    // 9aca9fa 追加(DIV-GFX-016):`CG` 无 `FILE`/`RID` 且目标层不存在 ⇒
+    // **不建节点**(REA `0x42a63d..0x42bbef`)。首屏此前为“声明即建层”,
+    // 现只保留真正有像素来源的图层:272 → 199 层、可见 8 → 7、
+    // 不可见 264 → 192。绘制 op 总数仍为 85(texture 80 = 69 copy + 11
+    // image)、屏幕 pass 仍 4 op ⇒ 被删的 73 层没有任何绘制贡献,像素不变。
+    // 其中唯一消失的“可见”层是零尺寸空壳,不产生 op。
+    assert_eq!(f.layers.len(), 199, "layers");
+    assert_eq!(f.layers.iter().filter(|l| l.visible).count(), 7, "visible");
     assert_eq!(f.passes.len(), 82, "passes");
     let total_ops: usize = f.passes.iter().map(|p| p.ops.len()).sum();
     assert_eq!(total_ops, 85, "total ops");
@@ -235,7 +243,7 @@ fn eris_first_screen_display_list() {
     assert_eq!(mode2.texture, yu_gfx::TextureRef::SolidBlack1x1);
     assert_eq!(
         f.layers.iter().filter(|l| !l.visible).count(),
-        264,
+        192,
         "E=0 count"
     );
 
@@ -354,11 +362,13 @@ fn eris_first_screen_with_synchronous_info_queries() {
         vm.drain_events(&mut events);
     }
     let f = state.borrow().frame();
-    // census 双模式口径(golden 测试同源;B4 复跑实测):
+    // census 双模式口径(golden 测试同源;B4 复跑实测;9aca9fa 后 false
+    // 模式 272/8 → 199/7、debug 299/18 → 226/17,见
+    // `eris_first_screen_display_list` 注释)。
     let (layers, visible, passes, tex_passes, total_ops) = if debug_mode {
-        (299, 18, 93, 90, 104)
+        (226, 17, 93, 90, 104)
     } else {
-        (272, 8, 82, 80, 85)
+        (199, 7, 82, 80, 85)
     };
     assert_eq!(f.layers.len(), layers, "layers");
     assert_eq!(

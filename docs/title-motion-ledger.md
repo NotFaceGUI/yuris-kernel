@@ -415,8 +415,10 @@ P0 的基名缺失全部消失)。600 tick `missing_keys=0`、`resolved_keys=117
   - `debug_mode=true`:tick 0..1200 都不进 title(debug UI/黑帧,script 58
     `es_Title` 未执行)⇒ 当前 rt 的 debug 分支不可作为 title 锚点。
 - golden 复核:旧 census(visible 34 / ops 44 / W0 30 / invisible 238)来自
-  `771cf79`,早于 `1365918` 的 YSVR/GOSUB 修正;当前启动路径为
-  **272 layers / 8 visible / 15 passes / 18 ops / W0 4 ops / 264 invisible**。
+  `771cf79`,早于 `1365918` 的 YSVR/GOSUB 修正;`9aca9fa`/DIV-GFX-016
+  (无 FILE/RID 不建节点)后当前启动路径为
+  **199 layers / 7 visible / 82 passes / 85 ops / 192 invisible**
+  (passes/ops 与 `272 层` 时期相同,被删 73 层无绘制贡献)。
   已按该 census 更新 `eris_first_screen_display.json` 与断言(不是
   “UPDATE 掩盖”:先审 census 与 title 像素对照,再重生成)。
 - `cargo test -p yu-gfx --test eris_first_screen`(带样本)两条均绿。

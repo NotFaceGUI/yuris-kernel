@@ -1,21 +1,39 @@
 {
   "entry": "SYSTEM_START",
   "expect": {
-    "display_json_sha256": "e7bc82c972bbe5cf99df9c35eed0c3d265663b6fcf6792b6ca7570363e92fbed",
+    "display_json_sha256": "c7c522beb43abebd9a16cc3ae62978391c3925f6304f5fdb639e278a8a80129b",
     "fatal_codes": [],
-    "ops_total": 122,
-    "png_sha256": "87f4a2fe51a36e2222c388a9660d6917d37ee5a9ecb0391bd8327eba51b0827c",
+    "ops_total": 25,
+    "png_sha256": "d67d047048f00476348b573b61c7db5572a5e407be1baac5f318335b9bbbddb8",
     "skipped_ops_total": 0
   },
-  "frames": 470,
+  "frames": 1000,
   "inputs": [
     {
       "button": "MOUSE_L",
       "frame": 300,
       "x": 217,
       "y": 281
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 520,
+      "x": 150,
+      "y": 100
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 640,
+      "x": 150,
+      "y": 95
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 760,
+      "x": 150,
+      "y": 122
     }
   ],
   "name": "symptom-enter-story",
-  "note": "P1 症状回归:标题(スタート 217,281)→ 本篇。证据语义见 docs/symptom-ledger.md S2;底层 Fatal 修好后本用例需 --update 重生成。"
+  "note": "P1 症状回归:标题 スタート(217,281)→ β４機能紹介(150,100)→ 画像表示関連機能(150,95)→ フェイスウィンドウサンプル(150,122)。当前标题 START 进入 β4 功能选择菜单,需三级导航才进本篇;旧基线只点一次 START(停在选择菜单)且 ops 含修复前的重复/空壳层。证据与流程见 docs/symptom-ledger.md;画面已人工核对(文本框+底部菜单栏)。"
 }

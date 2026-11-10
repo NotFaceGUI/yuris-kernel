@@ -48,6 +48,22 @@ fn cginfo_answers_documented_attributes() {
                 arg(&table, "CG", "FILE", s("src")),
             ],
         ),
+        // 仿射字段:FX/FY 是 X/Y 的百分位口径;FBX/FBY/FEX/FEY/FEZ 原值。
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("L2")),
+                arg(&table, "CG", "FILE", s("l2")),
+                arg(&table, "CG", "FX", i(1234)),
+                arg(&table, "CG", "FY", i(5678)),
+                arg(&table, "CG", "FBX", i(5000)),
+                arg(&table, "CG", "FBY", i(6000)),
+                arg(&table, "CG", "FEX", i(100)),
+                arg(&table, "CG", "FEY", i(200)),
+                arg(&table, "CG", "FEZ", i(300)),
+            ],
+        ),
         frame_end(1),
     ]);
     let info = |flag: &str| {
@@ -71,6 +87,23 @@ fn cginfo_answers_documented_attributes() {
     assert_eq!(info("TA"), Value::Int(64));
     // CGINFO[TID] 返回脚本原样字符串(引擎 +0x4c 保存原文,不是规范化路径)。
     assert_eq!(info("TID"), Value::Str(b"SRC".to_vec()));
+    let info2 = |flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("L2")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info2("FX"), Value::Int(1234), "FX = X*100");
+    assert_eq!(info2("FY"), Value::Int(5678), "FY = Y*100");
+    assert_eq!(info2("FBX"), Value::Int(5000));
+    assert_eq!(info2("FBY"), Value::Int(6000));
+    assert_eq!(info2("FEX"), Value::Int(100));
+    assert_eq!(info2("FEY"), Value::Int(200));
+    assert_eq!(info2("FEZ"), Value::Int(300));
     // 资源图尺寸需要资产元数据:必须显式 Unimplemented。
     let err = q_err(
         &gfx,
@@ -292,6 +325,8 @@ fn fontinfo_answers_current_style_fields() {
     assert_eq!(info("ANTIALIASING"), Value::Int(0));
     assert_eq!(info("DRAWMODE"), Value::Int(1));
     assert_eq!(info("NAME"), Value::Str(b"TestFont".to_vec()));
+    // `PITCH` 官方处理体恒写 0(REA `0x444e52` xor eax/edx)。
+    assert_eq!(info("PITCH"), Value::Int(0));
 
     // `NAME NO=n` 走字体清单(1 基);清单未注入/越界 = 空串。引擎按
     // EnumFontFamiliesExA 枚举失败即空,不报错 —— 见 `query_fontinfo` 的
@@ -321,16 +356,16 @@ fn fontinfo_unset_fields_are_not_fabricated() {
     }
     // `NUM`/`LANG` 在清单未注入时显式应答 0(`query_fontinfo` 注释:脚本
     // `es_Font.yst:166` 以 LANG 非 0 过滤,清单空 ⇒ 走「无字体可选」路径,
-    // 与引擎在无字体环境的行为一致)。`NAME`(需系统字体列表)/`PITCH`
-    // 仍未取证,必须报错。
-    for flag in ["NUM", "LANG"] {
+    // 与引擎在无字体环境的行为一致)。`PITCH` 官方处理体恒 0(REA
+    // `0x444e52`);`NAME`(需系统字体列表)未设置时仍未取证,必须报错。
+    for flag in ["NUM", "LANG", "PITCH"] {
         assert_eq!(
             q(&gfx, "FONTINFO", vec![arg(&table, "FONTINFO", flag, i(1))]),
             Value::Int(0),
             "{flag}"
         );
     }
-    for flag in ["NAME", "PITCH"] {
+    for flag in ["NAME"] {
         let err = q_err(&gfx, "FONTINFO", vec![arg(&table, "FONTINFO", flag, i(1))]);
         assert_eq!(err.code, "gfx.info.unsupported", "{flag}");
     }

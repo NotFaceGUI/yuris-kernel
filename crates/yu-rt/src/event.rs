@@ -542,6 +542,39 @@ pub struct LoadedBlock {
     pub vars: Vec<LoadedVar>,
 }
 
+/// `REGINFO` 的宿主能力(Windows 注册表读取;`reg/reginfo.html`)。
+///
+/// 官方处理体 `0x44bd30` 的行为(REA 2026-11-10):
+/// - `KEY` 按 `/`→`\` 归一后匹配 `HKEY_*\` 前缀,未匹配 = 直接返回 0;
+/// - `RegOpenKeyExA(KEY_ALL_ACCESS)` + `RegQueryValueExA`(缓冲区 1024);
+/// - **失败**:按目标变量类型写 0 / 0.0 / 空串;
+/// - **成功**:仅当目标变量是字符串时把值按 C 字符串写入;INT/FLT 目标
+///   **保持原值**(官方处理体成功分支只判 `type==3`;手册例 1 的 DWORD→@A
+///   与处理体不一致,按处理体对齐并留档)。
+///
+/// 未安装宿主 = 注册表不可用 ⇒ 走官方失败路径(写 0/0.0/空串)。
+pub trait RegistryHost {
+    /// 读取 `hive`(如 `HKEY_CURRENT_USER`)+ `subkey` + `name` 的值。
+    /// `name = None` = 默认值。键/值不存在或读取失败返回 `None`。
+    /// 子键/值名按官方 A 版 API 的原始字节传入(CP932/ANSI,不转 UTF-8)。
+    fn read_value(
+        &mut self,
+        hive: &str,
+        subkey: &[u8],
+        name: Option<&[u8]>,
+    ) -> Option<RegistryValue>;
+}
+
+/// [`RegistryHost::read_value`] 观察到的值形态。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegistryValue {
+    /// `REG_SZ` / `REG_EXPAND_SZ`:已去掉结尾 NUL 的字节串。
+    String(Vec<u8>),
+    /// `REG_DWORD`:官方把 4 字节写进同一缓冲区;只有字符串目标会消费
+    /// 其原始字节(遇 NUL 截断),INT/FLT 目标按处理体保持原值。
+    Dword(u32),
+}
+
 /// 存档域同步宿主(B1 裁 1-A / 裁 2-A;与 [`GraphicsHost::query`] 同模式)。
 ///
 /// 为什么同步:`SAVE` 的预约在**命令时刻序列化当前值**(REA `0x44d73d`:

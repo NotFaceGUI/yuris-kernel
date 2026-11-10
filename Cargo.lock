@@ -4267,6 +4267,7 @@ dependencies = [
  "log",
  "pollster",
  "wgpu",
+ "windows-sys 0.61.2",
  "winit",
  "yu-backend-soft",
  "yu-backend-wgpu",

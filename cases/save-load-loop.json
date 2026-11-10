@@ -1,23 +1,65 @@
 {
   "entry": "SYSTEM_START",
   "expect": {
-    "display_json_sha256": "f7ebf441b8cd97930f65fef8d931305f39834b898a8c52f6650ed5d2a21de19e",
+    "display_json_sha256": "45dd1f0508c8bd78bb3b4b6a501626484f0d802b8c0aa273171b59bbde1e6053",
     "fatal_codes": [],
-    "ops_total": 122,
-    "png_sha256": "6f75e49f4fdc50f2f5146d08fe1be6d7f1276e7eb86c3b44df0c9e0e6795c015",
-    "save_state_sha256": "bbd607c87f0a95f5e24ff7c6eeec7edf718f8182727b0672743c48939bc3fc27",
-    "skipped_ops_total": 0
+    "ops_total": 28,
+    "png_sha256": "8454a68ba9ac21922460d1dae6eca960008796a256af553fdd2eb106ba1203e3",
+    "save_state_sha256": "11ede4e5f92d86bf6f2e504d6900e3e06a99a3c320222951ca3553ac14c04be3",
+    "skipped_ops_total": 2
   },
-  "frames": 470,
+  "frames": 1400,
   "inputs": [
     {
       "button": "MOUSE_L",
       "frame": 300,
       "x": 217,
       "y": 281
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 520,
+      "x": 150,
+      "y": 100
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 640,
+      "x": 150,
+      "y": 95
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 760,
+      "x": 150,
+      "y": 122
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 900,
+      "x": 126,
+      "y": 585
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 1000,
+      "x": 353,
+      "y": 300
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 1100,
+      "x": 176,
+      "y": 585
+    },
+    {
+      "button": "MOUSE_L",
+      "frame": 1200,
+      "x": 353,
+      "y": 300
     }
   ],
   "name": "save-load-loop",
-  "note": "B1 存档闭环(DIV-RT-042):标题スタート→本篇。GO 宏触发 \\GSD.SAVE(es_GSD.yst:558)→ SAVE 预约(值快照,REA 0x44d73d)→ SAVE[FILE] 刷盘(gsd.sd/extra.sd/seld.sd 落 target/tmp/save-cases/save-load-loop/)→ SAVEEND。写侧=save_state_sha256(槽表含产物字节事实);读侧(LOAD[LET]/组块按 var_id)由 fixture::save_load_loop_* / load_group_* 与 yu-save 官方 seld.sd golden 对拍覆盖。ops 与 symptom-enter-story 同帧位一致(存档不改画面)。 「png/display 哈希不钉:基线渲染(字体/文本)另有会话活跃改动中;像素回归归 gfx 用例。」",
+  "note": "B1 存档闭环(DIV-RT-042):完整导航进本篇 → クイックセーブ(126,585)→ はい → クイックロード(176,585)→ はい。写侧=save_state_sha256(槽表含产物字节事实);读侧(LOAD[LET]/组块按 var_id)由 fixture::save_load_loop_* / load_group_* 与 yu-save 官方 seld.sd golden 对拍覆盖。画面回到本篇文本框。skipped_ops_total=2 是既有 SPL101/SPLTR101 的 CGACT 源层在 QLOAD 后被删、image_log 回放仍引用(gfx.copy.source.missing;DIV-GFX-072 #8),与本用例的存档语义无关,已在旧基线(b95f41a)复现。",
   "save": true
 }

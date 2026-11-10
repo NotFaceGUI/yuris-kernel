@@ -250,6 +250,9 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     // boot(表/数据入口)也在这条路径上,缺 `ysbin/*.ybn` 与 GPU 无关;
     // wgpu 初始化失败自带「wgpu 初始化失败 + 可改用 --backend soft」文案。
     let mut engine = Engine::new(project.clone(), options.clone())?;
+    // `REGINFO`:只有真实桌面进程才读 Windows 注册表;headless/case 不装,
+    // 走官方失败默认值(确定性)。
+    engine.set_registry_host(Box::new(yu_host_desktop::registry::SystemRegistry));
     // 平台音频端口:cpal 回调即时钟(`AudioOut`;headless 从不注入)。
     if !no_sound {
         match yu_host_desktop::SoundSink::open() {

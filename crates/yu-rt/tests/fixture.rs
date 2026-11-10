@@ -32,6 +32,8 @@ const OP_TASKINFO: u8 = 95;
 const OP_VARACT: u8 = 100;
 const OP_WAIT: u8 = 102;
 const OP_MATH: u8 = 61;
+const OP_SAVEINFO: u8 = 86;
+const OP_VAR: u8 = 99;
 
 fn no_input() -> InputTimeline {
     InputTimeline::new()
@@ -167,13 +169,13 @@ fn fileinfo_exist_writes_one_and_zero_to_let() {
         // 脚本字面量里的 `\\` 是转义后的单个反斜杠(expr 0x4d 规则)。
         GroupSpec::new(OP_FILEINFO)
             .window(0, ex::s("DATA\\\\BG.PNG"))
-            .window(1, ex::i8_(1))
-            .window(2, ex::r#ref(0x40, sys)),
+            .window(4, ex::i8_(1))
+            .window(7, ex::r#ref(0x40, sys)),
         // FILEINFO[FILE="data/missing.png" EXIST=1 LET=@b]
         GroupSpec::new(OP_FILEINFO)
             .window(0, ex::s("data/missing.png"))
-            .window(1, ex::i8_(1))
-            .window(2, ex::r#ref(0x40, sys + 1)),
+            .window(4, ex::i8_(1))
+            .window(7, ex::r#ref(0x40, sys + 1)),
         GroupSpec::new(OP_END),
     ]];
     let mut vm = boot_with_files(b, &[(b"data/bg.png", b"\x89PNG")]);
@@ -213,8 +215,8 @@ fn fileinfo_exist_writes_float_target() {
     b.scripts = vec![vec![
         GroupSpec::new(OP_FILEINFO)
             .window(0, ex::s("save/save_001.sd"))
-            .window(1, ex::i8_(1))
-            .window(2, ex::r#ref(0x40, sys)),
+            .window(4, ex::i8_(1))
+            .window(7, ex::r#ref(0x40, sys)),
         GroupSpec::new(OP_END),
     ]];
     let mut vm = boot_with_files(b, &[(b"save/save_001.sd", b"SD")]);
@@ -228,8 +230,98 @@ fn fileinfo_exist_writes_float_target() {
     );
 }
 
-// ---------------------------------------------------------------- IF / ELSE
+/// `FILEINFO[FOLDER=...]`(手册例 2;REA `0x4433d6`):
+/// - `EXIST` 只查散盘目录(`FILE_ATTRIBUTE_DIRECTORY`),包内文件夹不可查;
+/// - `SIZE` 对 FOLDER 写 0(官方只支持 FILE);
+/// - `RELATION` 对 FOLDER 写目标类型默认值;
+/// - `..` 被拒绝。
+#[test]
+fn fileinfo_folder_checks_disk_directory() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fileinfo-folder");
+    std::fs::create_dir_all(root.join("cg")).expect("fixture dir");
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    let mut vars = Vec::new();
+    for offset in 0..3 {
+        vars.push(VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + offset,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(-1),
+        });
+    }
+    vars.push(VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys + 3,
+        value_type: 3,
+        dims: vec![],
+        init: Init::Str(b"old"),
+    });
+    b.vars = vars;
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let folder = |path: &str, query: u8, letv: Vec<u8>| {
+        GroupSpec::new(OP_FILEINFO)
+            .window(1, ex::s(path))
+            .window(query, ex::i8_(1))
+            .window(7, letv)
+    };
+    b.scripts = vec![vec![
+        folder("cg", 4, ex::r#ref(0x40, sys)),
+        folder("missing", 4, ex::r#ref(0x40, sys + 1)),
+        folder("cg", 5, ex::r#ref(0x40, sys + 2)),
+        folder("cg", 6, ex::r#ref(0x24, sys + 3)),
+        folder("../escape", 4, ex::r#ref(0x40, sys + 1)),
+        GroupSpec::new(OP_END),
+    ]];
+    let src = b.build();
+    let mut cfg = BootConfig::default();
+    let mut system = root.to_string_lossy().replace('\\', "/").into_bytes();
+    system.push(b'/');
+    cfg.paths.system_path = Some(system);
+    let mut vm = Vm::boot(Box::new(src), cfg).expect("boot");
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(1)
+    );
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 1), &[])
+            .unwrap(),
+        Value::Int(0),
+        "不存在 / `..` 都写 0"
+    );
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 2), &[])
+            .unwrap(),
+        Value::Int(0),
+        "FOLDER+SIZE 官方写 0"
+    );
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::Dollar, sys + 3), &[])
+            .unwrap(),
+        Value::Str(Vec::new()),
+        "FOLDER+RELATION 写空串"
+    );
+    assert!(
+        vm.unimplemented_cmds().is_empty(),
+        "FOLDER 不得再挂号: {:?}",
+        vm.unimplemented_cmds()
+    );
+}
 
+// ---------------------------------------------------------------- IF / ELSE
 // ------------------------------------------------------------------- YMV
 
 /// 造一个最小 `YSMV` 容器(3×2、2 帧、30fps、带 alpha 标志)。
@@ -1437,16 +1529,17 @@ fn unimplemented_command_is_recorded_once_and_execution_continues() {
     }];
     b.labels = vec![("SYSTEM_START", 0, 0, 0)];
     b.entry(0, 0);
-    // `VAR`:官方有独立处理体(0x453f88),本内核尚无处理器 ⇒ Unknown/
-    // Unimplemented。F_INT 在 P0-A 后归默认槽(脚本错误),不再走此路径。
-    let op_var = b
+    // `CSVINFO`:官方有独立处理体(0x43e660),语义尚未落地 ⇒ Unknown/
+    // Unimplemented。`VAR`/`SAVEINFO` 已于 2026-11-10 定案为官方 no-op,
+    // 不再走此路径。
+    let op_csvinfo = b
         .commands
         .iter()
-        .position(|(n, _)| *n == "VAR")
-        .expect("夹具命令表应有 VAR") as u8;
+        .position(|(n, _)| *n == "CSVINFO")
+        .expect("夹具命令表应有 CSVINFO") as u8;
     b.scripts = vec![vec![
-        GroupSpec::new(op_var),
-        GroupSpec::new(op_var),
+        GroupSpec::new(op_csvinfo),
+        GroupSpec::new(op_csvinfo),
         GroupSpec::new(OP_LET)
             .window(0, ex::r#ref(0x40, sys))
             .window(0, ex::i8_(7)),
@@ -1456,7 +1549,7 @@ fn unimplemented_command_is_recorded_once_and_execution_continues() {
     let r = vm.tick_at(0, &no_input());
     assert!(r.errors.is_empty(), "Unimplemented 不致命");
     assert_eq!(
-        vm.unimplemented_cmds().get("VAR").copied(),
+        vm.unimplemented_cmds().get("CSVINFO").copied(),
         Some(2),
         "计数 2 次"
     );
@@ -4598,8 +4691,207 @@ fn noop_slots_continue_in_the_same_pump() {
         .any(|e| matches!(e, yu_rt::VmEvent::Diag { .. })));
 }
 
-// ---------------------------------------------------------------- DIALOG(P0-B/DIV-RT-044)
+/// `REGINFO`(`0x44bd30`):宿主读取 + 官方写回口径。
+/// - 字符串目标成功 ⇒ 写值;
+/// - INT/FLT 目标成功 ⇒ **保持原值**(官方成功分支只判 `type==3`);
+/// - 键/值不存在 ⇒ 按类型写 0 / 0.0 / 空串;
+/// - 根前缀不匹配 ⇒ 不写 LET;
+/// - `KEY` 的 `/` 折成 `\` 后再交给宿主。
+#[test]
+fn reginfo_reads_host_registry_and_matches_official_write_rules() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use yu_rt::event::{RegistryHost, RegistryValue};
 
+    struct FakeRegistry {
+        seen: Rc<RefCell<Vec<(String, Vec<u8>, Option<Vec<u8>>)>>>,
+    }
+    impl RegistryHost for FakeRegistry {
+        fn read_value(
+            &mut self,
+            hive: &str,
+            subkey: &[u8],
+            name: Option<&[u8]>,
+        ) -> Option<RegistryValue> {
+            self.seen.borrow_mut().push((
+                hive.to_string(),
+                subkey.to_vec(),
+                name.map(|n| n.to_vec()),
+            ));
+            if name == Some(b"missing".as_slice()) {
+                None
+            } else {
+                Some(RegistryValue::String(b"hello".to_vec()))
+            }
+        }
+    }
+
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(42),
+        },
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(7),
+        },
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + 2,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b""),
+        },
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + 3,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(9),
+        },
+    ];
+    let op_reginfo = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "REGINFO")
+        .expect("夹具命令表应有 REGINFO") as u8;
+    let reg = |key: &str, name: &str, letv: Vec<u8>| {
+        GroupSpec::new(op_reginfo)
+            .window(0, ex::s(key))
+            .window(1, ex::s(name))
+            .window(2, letv)
+    };
+    b.scripts = vec![vec![
+        // 字符串目标:成功写 "hello"(KEY 用 `/`,宿主应收到 `\`)。
+        reg(
+            "HKEY_CURRENT_USER/Software/X",
+            "s",
+            ex::r#ref(0x24, sys + 2),
+        ),
+        // INT 目标:成功不写,保持 42。
+        reg("HKEY_CURRENT_USER/Software/X", "i", ex::r#ref(0x40, sys)),
+        // 键/值不存在:INT 目标写 0。
+        reg(
+            "HKEY_CURRENT_USER/Software/X",
+            "missing",
+            ex::r#ref(0x40, sys + 3),
+        ),
+        // 根前缀不匹配:不写,保持 7。
+        reg("NOPE/Software/X", "s", ex::r#ref(0x40, sys + 1)),
+        GroupSpec::new(OP_END),
+    ]];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let mut vm = boot(b);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    vm.set_registry_host(Box::new(FakeRegistry { seen: seen.clone() }));
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert!(
+        vm.unimplemented_cmds().is_empty(),
+        "REGINFO 不得再挂号: {:?} events={:?}",
+        vm.unimplemented_cmds(),
+        vm.events()
+            .iter()
+            .filter_map(|e| match e {
+                yu_rt::VmEvent::Diag { code, detail, .. } => Some((code.clone(), detail.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::Dollar, sys + 2), &[])
+            .unwrap(),
+        Value::Str(b"hello".to_vec())
+    );
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(42),
+        "INT 目标成功分支官方不写"
+    );
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 3), &[])
+            .unwrap(),
+        Value::Int(0),
+        "缺失值 ⇒ 0"
+    );
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 1), &[])
+            .unwrap(),
+        Value::Int(7),
+        "根前缀不匹配 ⇒ 不写"
+    );
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 3, "只在前缀匹配的 3 条命令上调用宿主");
+    assert_eq!(seen[0].0, "HKEY_CURRENT_USER");
+    assert_eq!(seen[0].1, b"Software\\X", "`/` 必须折成 `\\`");
+    assert_eq!(seen[0].2.as_deref(), Some(b"s".as_slice()));
+}
+
+/// `SAVEINFO`(`0x44e1c8`)与 `VAR`(`0x453f88`)是官方 **no-op**:
+/// 守卫 `FUN_00429fd1` 后 `xor eax,eax; pop ecx; ret`,不读参数、不写 LET、
+/// 不发域事件。REA 原始字节:`44e1e1 33 c0 59 c3`、`453fa1 33 c0 59 c3`。
+#[test]
+fn saveinfo_and_var_are_official_noops() {
+    let groups = vec![
+        // SAVEINFO 带 FILE/LET 参数:若被求值会触碰未声明变量并挂号。
+        GroupSpec::new(OP_SAVEINFO)
+            .window(0, ex::s("save_info.csv"))
+            .window(3, ex::r#ref(0x40, 0x7fff)),
+        GroupSpec::new(OP_VAR),
+        GroupSpec::new(OP_END),
+    ];
+    let mut b = ProjectBuilder::new();
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.commands_pumped, 3, "no-op 不得让出");
+    assert!(
+        vm.unimplemented_cmds().is_empty(),
+        "SAVEINFO/VAR 不得再挂号: {:?}",
+        vm.unimplemented_cmds()
+    );
+    assert!(
+        !vm.events()
+            .iter()
+            .any(|e| matches!(e, yu_rt::VmEvent::DomainCall { .. })),
+        "官方处理体不发域事件"
+    );
+    assert!(
+        !vm.events()
+            .iter()
+            .any(|e| matches!(e, yu_rt::VmEvent::Diag { .. })),
+        "不读参数 ⇒ 不产生参数诊断"
+    );
+}
+
+// ---------------------------------------------------------------- DIALOG(P0-B/DIV-RT-044)
 /// DIALOG 挂起任务;宿主回答后写 `LET`(1 基按钮序号),下一帧继续。
 #[test]
 fn dialog_blocks_task_until_answered_and_writes_let() {
@@ -6158,8 +6450,8 @@ fn fileinfo_fs_fallback_checks_save_root() {
         // FILEINFO[FILE=$es.SAVEPATH+t.sd EXIST=1 LET=@r] —— save 根内存在
         GroupSpec::new(op_fileinfo)
             .window(0, ex::s(&format!("{root_str}t.sd")))
-            .window(1, ex::i8_(1))
-            .window(2, ex::r#ref(0x40, sys)),
+            .window(4, ex::i8_(1))
+            .window(7, ex::r#ref(0x40, sys)),
         GroupSpec::new(OP_END),
     ];
     b.scripts = vec![groups];

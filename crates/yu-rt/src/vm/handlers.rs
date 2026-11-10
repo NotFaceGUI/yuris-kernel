@@ -142,10 +142,10 @@ pub enum HandlerKind {
     Clipinfo,
     /// `ERROR`:写「逐命令启用表」(`0x689b00`;REA `0x46358c`)。
     ErrorTable,
+    /// `REGINFO`:Windows 注册表读取(`0x44bd30`;宿主能力 + 官方失败默认值)。
+    Reginfo,
     /// 官方处理体只做参数求值、不产生副作用(`CSV`/`PLUG`/`ERRORINFO`)。
     NoopEval,
-    /// 需要宿主能力(注册表/媒体元数据等),内核不猜。
-    HostRequired(&'static str),
     /// 手册有页的域命令(CG/SOUND/WINDOW/…)→ DomainCall 事件。
     Domain(Domain),
     /// 官方 0.495 分发表里映射到 `0x4634d8`(`xor eax,eax; ret`)的槽:
@@ -215,6 +215,12 @@ const NOOP_COMMANDS_0495: &[&str] = &[
     "S_INT",
     "S_FLT",
     "S_STR",
+    // `SAVEINFO`(`0x44e1c8`)与 `VAR`(`0x453f88`):0.495 处理体在
+    // `FUN_00429fd1` 守卫后直接 `xor eax,eax; pop ecx; ret` —— 不读参数、
+    // 不写 LET、无任何副作用。手册无页;不是"未取证"。
+    // 证据字节:`44e1e1 33 c0 59 c3`、`453fa1 33 c0 59 c3`(REA 2026-11-10)。
+    "SAVEINFO",
+    "VAR",
 ];
 
 /// 按工程 yscm 建表(名字 → 处理器类别)。表 = 数据解析结果,不是内置命令表。
@@ -278,7 +284,7 @@ pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> 
                 "CSV" | "PLUG" | "ERRORINFO" => HandlerKind::NoopEval,
                 "ERROR" => HandlerKind::ErrorTable,
                 // 需要宿主:Windows 注册表。
-                "REGINFO" => HandlerKind::HostRequired("Windows 注册表读取"),
+                "REGINFO" => HandlerKind::Reginfo,
                 // `YMVINFO` 走与 `CGINFO` 同一条 LET 查询路径(REA `0x459b98`:
                 // 读图层上挂好的影片结构,缺层/缺影片时写 0)。
                 "YMVINFO" => HandlerKind::Ymvinfo,
@@ -465,6 +471,7 @@ impl Vm {
             HandlerKind::Clipact => self.op_clipact(st, cmd),
             HandlerKind::Clipinfo => self.op_clipinfo(st, cmd),
             HandlerKind::ErrorTable => self.op_error(st, cmd),
+            HandlerKind::Reginfo => self.op_reginfo(st, cmd),
             HandlerKind::NoopEval => {
                 // 官方处理体 = 参数求值 + `xor eax,eax; ret`。求值错误的
                 // 可恢复诊断照常记录,然后继续。
@@ -478,15 +485,6 @@ impl Vm {
                 }
                 Ok(StepOutcome::Continue)
             }
-            HandlerKind::HostRequired(what) => Err(diag::unimplemented(
-                code::rt::CMD_UNIMPLEMENTED,
-                Boundary::Script,
-                format!(
-                    "命令 `{}` 需要宿主能力({what});内核不猜(DIV-RT-045)",
-                    cmd.name
-                ),
-            )
-            .into()),
             // 官方 0.495 `0x4634d8`(xor eax,eax; ret):真的什么都不做。
             HandlerKind::Noop => Ok(StepOutcome::Continue),
             // 官方 0.495 默认槽 `0x459e90`:报一次全局「スクリプト実行エラー」
@@ -3206,13 +3204,38 @@ impl Vm {
         }
         // 事件流保持与实现前一致(File 域;宿主忽略 FILEINFO 本身)。
         self.emit_domain(Domain::File, "FILEINFO", args);
-        if folder.is_some() {
-            // 手册:「パックファイル内のフォルダの存在はまだチェックできません」
-            // —— 引擎 FOLDER 支只查散盘;语料 0 次,保持挂号。
-            self.report_unimplemented(
-                "FILEINFO",
-                "FOLDER 查询未取证(手册注明封包内文件夹不可查;REA 0x44286c)".to_string(),
-            );
+        // FOLDER(手册例 2;REA `0x4433d6`):官方 `FindFirstFileA` 查散盘目录,
+        // 只认 `FILE_ATTRIBUTE_DIRECTORY`;包内文件夹**不可查**(手册注明)。
+        // - EXIST ⇒ 1/0;
+        // - SIZE ⇒ 官方只支持 FILE(`0x4429a7` 仅 `ebx==2` 走 0x443572),
+        //   FOLDER 落 0;
+        // - RELATION ⇒ 官方对 FOLDER 写目标类型默认值(0/0.0/空串);
+        // - 三者都未给 ⇒ 不写 LET。
+        if let Some(folder) = folder {
+            let Some(target) = target else {
+                return Ok(StepOutcome::Continue);
+            };
+            if exist {
+                let present = self.disk_dir_exists(&folder);
+                self.write_target(st, &target, &Value::Int(i64::from(present)))?;
+                return Ok(StepOutcome::Continue);
+            }
+            if size {
+                self.write_target(st, &target, &Value::Int(0))?;
+                return Ok(StepOutcome::Continue);
+            }
+            if relation {
+                let ty = self
+                    .var_shape(target.var)
+                    .map(|(t, _)| t)
+                    .unwrap_or(ElemType::Int); // silent-ok: 未声明目标按 INT 默认(官方按槽类型写默认值)
+                let v = match ty {
+                    ElemType::Int => Value::Int(0),
+                    ElemType::Float => Value::Float(0.0),
+                    ElemType::Str => Value::Str(Vec::new()),
+                };
+                self.write_target(st, &target, &v)?;
+            }
             return Ok(StepOutcome::Continue);
         }
         // RELATION(手册例 4;REA `0x4429e6` → `0x442a20`:
@@ -3258,15 +3281,13 @@ impl Vm {
             }
             return Ok(StepOutcome::Continue);
         }
+        // 官方无查询项 / 无 LET / 无 FILE:处理体走到公共出口直接返回 0,
+        // 不写任何变量(不是"未实现")。
         if !exist || target.is_none() {
-            self.report_unimplemented(
-                "FILEINFO",
-                "需要 EXIST/SIZE/RELATION 之一 + LET(file/fileinfo.html;REA 0x44286c)".to_string(),
-            );
             return Ok(StepOutcome::Continue);
         }
         let Some(bytes) = file else {
-            self.report_unimplemented("FILEINFO", "EXIST=1 缺 FILE(FOLDER 查询未取证)".to_string());
+            // `EXIST` 但既无 FILE 也无 FOLDER:官方四个分支都不命中,不写。
             return Ok(StepOutcome::Continue);
         };
         let mut present = match yu_vfs::LookupKey::new(&bytes, yu_vfs::Codec::Cp932) {
@@ -3340,6 +3361,39 @@ impl Vm {
             return None;
         }
         Some(std::path::Path::new(&root).join(text))
+    }
+
+    /// `FILEINFO[FOLDER EXIST]` 的散盘目录检查(REA `0x4433d6`
+    /// `FindFirstFileA` + `FILE_ATTRIBUTE_DIRECTORY`)。
+    ///
+    /// 官方相对路径以进程 CWD(游戏根)解析 ⇒ 这里用 `$_SYSTEM_PATH`
+    /// (= 工程根)拼接;绝对路径原样查。`..` 一律拒绝,避免脚本探测根外目录。
+    /// 包内文件夹不可查(手册明示),因此不走 VFS。
+    fn disk_dir_exists(&self, path: &[u8]) -> bool {
+        // 脚本字符串是 CP932;官方 A 版 API 按系统 ANSI 码页解释。这里用
+        // 工程统一解码器还原,失败才退回 lossy(不让非 UTF-8 路径静默消失)。
+        let decoded = yu_format::Codec::Cp932
+            .decode(path, path)
+            .unwrap_or_else(|_| String::from_utf8_lossy(path).into_owned());
+        let text = decoded.replace('\\', "/");
+        if text.is_empty() || text.split('/').any(|c| c == "..") {
+            return false;
+        }
+        let candidate = std::path::Path::new(&text);
+        if candidate.is_absolute() {
+            return candidate.is_dir();
+        }
+        let Some(root) = self
+            .paths
+            .system_path
+            .as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+        else {
+            return false;
+        };
+        std::path::Path::new(&root)
+            .join(text.trim_start_matches('/'))
+            .is_dir()
     }
 
     /// 文件关联 exe 全名(`FILEINFO[RELATION]`;REA `0x442a48`
@@ -4997,6 +5051,114 @@ impl Vm {
             .filter(|b| *b >= 0x20)
             .collect();
         self.write_target(st, &target, &Value::Str(filtered))?;
+        Ok(StepOutcome::Continue)
+    }
+
+    /// `REGINFO`:手册 `reg/reginfo.html`;REA `0x44bd30`(2026-11-10)。
+    ///
+    /// 官方结构:
+    /// 1. `KEY` 的 `/` 全部折成 `\`,再按 `HKEY_*\` 前缀定根(七个根);
+    ///    前缀不匹配 ⇒ 直接返回 0(**不写 LET**);
+    /// 2. `RegOpenKeyExA(KEY_ALL_ACCESS)` + `RegQueryValueExA`(1024 字节缓冲);
+    /// 3. 失败(键/值不存在、缓冲不足)⇒ 按目标类型写 0 / 0.0 / 空串;
+    /// 4. 成功 ⇒ **只有字符串目标**写值;INT/FLT 目标保持原值
+    ///    (`0x44bf0a` 只判 `type==3`;手册例 1 的 DWORD→@A 与处理体不一致,
+    ///    按处理体对齐并记入 DIV-RT-045)。
+    fn op_reginfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let params = std::rc::Rc::clone(&cmd.param_names);
+        let mut key: Option<Vec<u8>> = None;
+        let mut name: Option<Vec<u8>> = None;
+        let mut target: Option<LValue> = None;
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let pname = params
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or(""); // silent-ok: 槽号越界 = 无名,按官方未读参数处理
+            match pname {
+                "KEY" => {
+                    if let Value::Str(s) = self.eval_window(st, w)? {
+                        key = Some(s);
+                    }
+                }
+                "NAME" => {
+                    if let Value::Str(s) = self.eval_window(st, w)? {
+                        name = Some(s);
+                    }
+                }
+                "LET" => target = Some(self.eval_lvalue_window(st, w)?),
+                // 官方处理体只按固定槽位读 KEY/NAME/LET;额外参数即使存在
+                // 也没有分支消费(0x44bd30 全函数只引用这三个槽的标志字节)。
+                // 不能报「未实现」——换版本/换工程多出参数时会被误判。
+                _other => {}
+            }
+        }
+        // LET 缺席 ⇒ 官方整条命令无写回。
+        let Some(target) = target else {
+            return Ok(StepOutcome::Continue);
+        };
+        let ty = self
+            .var_shape(target.var)
+            .map(|(t, _)| t)
+            .unwrap_or(ElemType::Int); // silent-ok: 未声明目标按 INT 默认(官方按槽类型写默认值)
+        let default = match ty {
+            ElemType::Int => Value::Int(0),
+            ElemType::Float => Value::Float(0.0),
+            ElemType::Str => Value::Str(Vec::new()),
+        };
+
+        // KEY 缺席:官方仍调 `RegOpenKeyExA(0, 0, …)` ⇒ 失败 ⇒ 默认值。
+        let Some(mut key) = key else {
+            self.write_target(st, &target, &default)?;
+            return Ok(StepOutcome::Continue);
+        };
+        for b in &mut key {
+            if *b == b'/' {
+                *b = b'\\';
+            }
+        }
+        const HIVES: &[(&[u8], &str)] = &[
+            (b"HKEY_CLASSES_ROOT\\", "HKEY_CLASSES_ROOT"),
+            (b"HKEY_CURRENT_USER\\", "HKEY_CURRENT_USER"),
+            (b"HKEY_LOCAL_MACHINE\\", "HKEY_LOCAL_MACHINE"),
+            (b"HKEY_USERS\\", "HKEY_USERS"),
+            (b"HKEY_PERFORMANCE_DATA\\", "HKEY_PERFORMANCE_DATA"),
+            (b"HKEY_CURRENT_CONFIG\\", "HKEY_CURRENT_CONFIG"),
+            (b"HKEY_DYN_DATA\\", "HKEY_DYN_DATA"),
+        ];
+        let matched = HIVES.iter().find_map(|(prefix, hive)| {
+            (key.len() >= prefix.len() && key[..prefix.len()].eq_ignore_ascii_case(prefix))
+                .then_some((*hive, prefix.len()))
+        });
+        // 前缀不匹配:官方直接返回 0,不写 LET。
+        let Some((hive, prefix_len)) = matched else {
+            return Ok(StepOutcome::Continue);
+        };
+        let subkey = &key[prefix_len..];
+        let value = self
+            .registry_host
+            .as_mut()
+            .and_then(|h| h.read_value(hive, subkey, name.as_deref()));
+        match value {
+            None => self.write_target(st, &target, &default)?,
+            Some(crate::event::RegistryValue::String(bytes)) => {
+                if ty == ElemType::Str {
+                    self.write_target(st, &target, &Value::Str(bytes))?;
+                }
+            }
+            Some(crate::event::RegistryValue::Dword(raw)) => {
+                // 官方把 4 字节原始值写进同一缓冲;字符串目标按 C 串截断。
+                if ty == ElemType::Str {
+                    let mut bytes = raw.to_le_bytes().to_vec();
+                    if let Some(nul) = bytes.iter().position(|&b| b == 0) {
+                        bytes.truncate(nul);
+                    }
+                    self.write_target(st, &target, &Value::Str(bytes))?;
+                }
+            }
+        }
         Ok(StepOutcome::Continue)
     }
 

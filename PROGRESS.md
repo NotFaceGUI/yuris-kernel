@@ -13927,3 +13927,130 @@ cargo test -p yu-cli --test logging_guards            → 3 passed
 ```
 **已知限制**:同帧 `区域 COPY2 → TRIM` 的 GPU 表面尚未提交,边界读回只能读到
 旧内容(用例覆盖「上一帧落地后再 TRIM」;整幅别名走资产 CPU 路径不受影响)。
+## 成果 PERF-TEXT-ATLAS (2026-11-09) · 字形图集键按 Arc 去重,消除文本推进逐 placement 像素哈希
+
+**现象**:剧情文本推进时出现周期性尖峰。`lag-20261109-1922` 抓取 2842 帧,
+`spikes.log` 267 条长帧中 **266 条**发生在 `es.IDSubTask2` /
+`es_scenario.yst@305`,顶层图层为 `:/W0/_FONT_TMP:<43–80>`。
+
+**根因**:`26fba6d` 的字形图集对每个 placement 调一次
+`GlyphAtlasKey::of`(整张 RGBA 逐像素 FNV64),`GlyphAtlas::ensure` 内部
+又算一次。同一字形的多个 composite pass 共享 `Arc<GlyphImage>`,真机
+placement/唯一字形 ≈ **9.3x**,两次哈希使同一像素被重复计算约 **18.6x**。
+日志回归:`text_ms ≈ 0.464 + 1.584µs × text_gpu_draws`(r=0.905),
+177 个 GPU 文本帧累计 text 432.5ms,其中约 81% 与 placement 数线性相关;
+`text_bake=0`、`text_paint=0` 排除字形栅格化与 CPU 合成。
+
+**改动**(`crates/yu-render/wgpu/src/text_gpu.rs`):
+- 新增 `GlyphKeyCache`:一次 `build` 内按 `Arc::as_ptr` 缓存
+  `GlyphAtlasKey`,同一字形只做一次像素哈希;`unique` 仍按像素身份去重,
+  `job.glyphs` / `total_glyphs` 旧口径不变。
+- `GlyphAtlas::ensure` 改收调用方预计算的 key,删除内部第二次
+  `GlyphAtlasKey::of`,加尺寸 `debug_assert`。
+- 指针缓存只限一次 `build`:placements 持有强引用;跨帧/跨 build 会因
+  `GlyphCache` 淘汰、字体重建、`WholeRun` gradation 产生 ABA,故不复用。
+- 新增 `glyph_key_cache_dedups_by_arc_and_keeps_pixel_identity_count`
+  单元测试,锁住「同 Arc 只算一次 / 不同 Arc 同像素仍只计 1」语义。
+
+**量测**(同一游戏、同一剧情文本段,release + wgpu):
+- `text_ms` 对 `text_gpu_draws` 斜率:1.5839 → **0.2152µs/draw**;
+- GPU 文本帧累计 `text_ms`:432.5 → **43.9ms**;
+- 2000–2500 placement 桶:3.841 → **1.117ms**;2500–3000 桶:4.736 → 无
+  (本次未出现该量级);
+- 单帧 text 最大值:6.50 → 1.43ms(另有首帧 3.70ms 为新字形上传,不在
+  重复哈希路径);
+- 文本帧 `interval` p50:33.05 → **16.73ms**;p90:50.13 → 33.42ms;
+  max:132.67 → 34.02ms。
+- `text_gpu_glyphs` / `text_gpu_draws` 统计口径未变;
+  `glyph_atlas_is_shared_across_text_layers` 的 `1p` / `hits>=1` 仍通过。
+
+**验证**:
+```text
+cargo test -p yu-backend-wgpu --lib glyph_key_cache   → 1 passed
+cargo test -p yu-backend-wgpu                        → 16 + 27 + 39 + 1 + 1 passed
+cargo test -p yu-render-core                         → 23 passed
+cargo build -p yu-backend-wgpu -p yu-render-core --all-targets → Finished
+cargo build --release -p yu-cli                      → Finished
+```
+
+**后续(本次未做)**:
+- 剩余文本推进帧的 33ms 已不是 `text` 阶段(text <1.4ms):同帧
+  `tick=12–21ms`(`es.IDSubTask2` 约 6.6 万命令)、`readback=2.5–8.5ms`
+  (组 COPY 的 CPU 兜底)、`image=1.4–3.9ms`。下一步应分别处理 VM 文本任务
+  与 readback 触发条件。
+- `cargo build --workspace --all-targets` 当前被工作区另一批未提交改动
+  (`yu-rt` examples 访问私有 `VarSlot.data`)阻塞,与本次改动无关。
+
+## 成果 TEST-GOLDEN + RT-EVIDENCE (2026-11-10) · golden 基线复验与首批零挂号收口
+
+**范围**:普查后按「先红测、再取证、再零挂号」推进。未做 git 提交。
+
+### 1. P0 golden 红测(2 个测试目标 + 9 条 case)
+
+- `yu-gfx --test eris_first_screen`:`layers` 期望 272、实际 **199**(debug 299→226),
+  可见 8→7、不可见 264→192;`passes/total_ops/texture_passes/screen_ops`
+  全部不变(82/85/80/4)。根因 = `9aca9fa` 落地 DIV-GFX-016(`CG` 无
+  `FILE`/`RID` 且层不存在 ⇒ 不建节点,REA `0x42a63d..0x42bbef`)后测试
+  基线未同步;被删 73 层无任何绘制贡献,`png_sha256` 在 `first-screen`
+  类用例中逐字节未变 ⇒ 判定「基线过期」,不是引擎回归。已更新两模式
+  census 与 display-list golden,并补上「199 层」的证据注释。
+- `case --all`:9/9 失败的原输入只点了标题 START(旧基线已过期):
+  START 现在进入 β4 功能选择菜单,需三级导航才进本篇。已把
+  `symptom-enter-story` / `symptom-ingame-config` / `symptom-ingame-save` /
+  `save-load-loop` 的输入补全为:
+  `START(217,281) → β４機能紹介(150,100) → 画像表示関連機能(150,95) →
+  フェイスウィンドウサンプル(150,122)`,再分别点 設定 / セーブ /
+  クイックセーブ+はい / クイックロード+はい。
+  逐条用 `input_probe --shot` 人工核对:剧情文本框+底部菜单栏、設定页
+  全部页签/ON-OFF、存档页槽位/缩略图/日期/New! 标记、QS/QL 回到剧情。
+  `first-screen`/`record-events-off`/`until-visible` 只改 display/ops
+  (85→75;像素哈希 `052951c4…` 未变——75 是引擎帧内清理掉 10 条
+  无消费者 texture pass 后的等价结果)。
+- `save-title-flow`/`title-config-back` 末帧均为标题(13 ops),PNG
+  `a6db617b…` 未变,按当前行为重生成。
+- 结果:9/9 PASS;`eris_first_screen` 双模式 4/4 PASS。
+
+### 2. P1 零挂号收口(REA 2026-11-10)
+
+| 命令 | 官方处理体 | 结论 |
+|---|---|---|
+| `SAVEINFO` | `0x44e1c8` | 守卫后 `xor eax,eax; pop ecx; ret`(`44e1e1 33 c0 59 c3`)⇒ **no-op**,不读参数/不写 LET;从 Save 域分派改为 `HandlerKind::Noop` |
+| `VAR` | `0x453f88` | 同上(`453fa1 33 c0 59 c3`)⇒ **no-op** |
+| `REGINFO` | `0x44bd30` | 新增 `RegistryHost` 端口 + 桌面 Windows 实现(`windows-sys`,`RegOpenKeyExA`/`RegQueryValueExA`,1024 缓冲);`/`→`\`、七个根前缀、失败写 0/0.0/空串、成功只写字符串目标(INT/FLT 保持原值,`0x44bf0a` 只判 type==3) |
+| `FILEINFO[FOLDER]` | `0x4433d6` | `FindFirstFileA` + `FILE_ATTRIBUTE_DIRECTORY` 查散盘目录;`SIZE` 对 FOLDER 写 0、`RELATION` 写目标类型默认值、`..` 拒绝;包内文件夹不可查(手册) |
+| `CGINFO[FX/FY/FBX/FBY/FEX/FEY/FEZ]` | `0x43d664` 字段链 | FX/FY = X/Y 的百分位口径(`*100`),FBX/FBY/FEX/FEY/FEZ 原值回读 |
+| `FONTINFO[PITCH]` | `0x444cfc` | 读到该槽后 `xor eax/edx` 再写回 ⇒ 恒 0 |
+
+- `CGINFO` 字段链勘误:槽 28/29(`LINT/LINT2`)是 ONMOUSE/COLOR 的
+  **坐标源开关**(读层 `+0x58/+0x5c`、`+0x60/+0x64`),不是独立查询字段。
+- `FILEINFO` 无查询/无 LET/无 FILE 时改为官方「直接返回 0,不写」,不再
+  报 Unimplemented。
+
+### 3. 验证
+
+```text
+cargo build --workspace --all-targets                    → 0 error / 0 warning
+cargo test -p yu-rt                                      → 94+4+11+4+118+3 passed
+cargo test -p yu-gfx --test eris_first_screen            → 4 passed(默认)
+YURIS_DEBUG_MODE=1 cargo test -p yu-gfx --test eris_first_screen → 4 passed
+cargo test -p yu-gfx --test info_query                   → 13 passed
+cargo test -p yu-gfx(全套)                               → 全绿
+cargo test -p yu-backend-wgpu                            → 16+27+39+1+1 passed
+cargo test -p yu-sound --test state                      → 51 passed
+cargo test -p yu-trace --test golden                     → 2 passed(0.1.0→0.2.0 夹具重生成)
+cargo test -p yu-save --lib(设 SDK0495)                  → 18 passed
+cargo run --release -p yu-cli --bin yu-cli -- case <project-eris> --all → 9 passed
+```
+
+**仍未收口(证据缺口)**:`CSVINFO`(CSV 表格式/解析语义未取证)、
+`CGINFO[TRIM]`(`0x43dcce` 逐像素 trim 扫描)、`FONTINFO[X/Y]`
+(GDI `FUN_004450c0` 度量)、`FONTINFO[NAME]` 未设置默认名、
+WINDOWINFO 的 `MAXIMIZE/RESIZE/MENUID/REGIONID/DRAGID`(不在 0.495
+`ysc.ybn` 参数表内,脚本无法命名)。这些不猜 0,继续挂证据。
+
+### 4. 工程
+
+- 新增 `.github/workflows/ci.yml`(windows-latest):全工作区
+  `cargo build --workspace --all-targets` + 8 个 crate 的 `--lib`
+  免样本测试;真实语料的 `case --all` 门禁仍需自托管/受保护样本 job,
+  CI 不空跑、不伪造样本。
