@@ -211,6 +211,12 @@ REA;内核持全屏影片状态(文件名/播放位/几何/音量/影片模式),
 `docs/tasks/task-b14-movie-schedule.md`、DIV-GFX-074 §2.3/§8;
 脚本侧绕行(前置播片 / `\UI.RELOAD`)不再需要。
 
+**影片音频(B16,2026-11-11)**:MP2 音轨已接入——`MovieHost::take_audio`
+交付 PCM,`yu-sound::movie` 环形缓冲/线性重采样/COM 音量曲线混音,
+桌面 cpal / Android cpal→oboe 同一路径;Android APK 已交叉编译通过。
+剩余待办(非 MPEG-1/AVI-CG/FLASH/SX-SY/PLAY=0/真机试听)见
+`docs/todo-inventory.md` §3.3 与 `docs/tasks/task-b16-movie-audio.md`。
+
 DIV-RT-045 媒体侧已在 B14 收尾(YMV 行);`MOVIE` 语义层见 DIV-GFX-074,播放后端待选型。
 
 ### B15 · trace/工程终局 + AU6 清空复核

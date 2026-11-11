@@ -99,6 +99,9 @@ impl SoundState {
                 &self.rt_silence_samples,
             );
         }
+        // 影片音频:独立于 SOUND 层树,按 `MOVIE[VOLUME]`(DSBVOLUME 曲线)
+        // 混入同一块。环形缓冲读取 + 线性插值,回调内零分配。
+        self.movie.borrow_mut().render(out, out_rate, channels);
         // 调试抓取:把限幅**之前**的原始混音结果留一份(爆音分析用)。
         if let Ok(mut slot) = self.debug_capture.lock() {
             if let Some(buffer) = slot.as_mut() {

@@ -487,6 +487,11 @@ pub struct SoundState {
     /// 与 `rt_silence_samples`(整块静音)分开:单帧丢失在块内不被察觉,
     /// 但每帧都是 20µs 的缺口,密集出现就是持续的"刺啦"。
     pub(crate) rt_miss_samples: std::sync::atomic::AtomicU64,
+    /// 影片音频(MP2 解码后的 PCM 环;设备回调零分配混音)。
+    ///
+    /// `RefCell` 与 `Layer::stream` 同理由:`render_with(&self)` 需要消费环,
+    /// 而状态机本身始终在 `SoundState` 的互斥锁内单线程执行。
+    pub(crate) movie: std::cell::RefCell<crate::movie::MovieAudio>,
     /// 调试用:混音输出的原始样本(诊断爆音时抓波形分析;`None` = 未抓取)。
     pub(crate) debug_capture: std::sync::Mutex<Option<Vec<f32>>>,
     /// WAVE/ACM 整段装载次数(逐帧增量)。
@@ -525,9 +530,47 @@ impl SoundState {
             clipped_samples: std::sync::atomic::AtomicU64::new(0),
             rt_silence_samples: std::sync::atomic::AtomicU64::new(0),
             rt_miss_samples: std::sync::atomic::AtomicU64::new(0),
+            movie: std::cell::RefCell::new(crate::movie::MovieAudio::new()),
             full_decodes: 0,
             tick_decode_us: 0,
         }
+    }
+
+    /// 追加影片音频(交错 i16;`info.sample_rate`/`channels` 由影片后端交付)。
+    ///
+    /// 与 SOUND 层树独立:音量由 `MOVIE[VOLUME]`(COM/DSBVOLUME 曲线)控制,
+    /// 混合在设备回调内完成。
+    pub fn movie_audio_push(&mut self, info: yu_rt::event::MovieAudioInfo, samples: &[i16]) {
+        self.movie
+            .get_mut()
+            .push(info.sample_rate, info.channels, samples);
+    }
+
+    /// `MOVIE[VOLUME]`(0..256)。
+    pub fn movie_audio_set_volume(&mut self, volume: i64) {
+        self.movie.get_mut().set_volume(volume);
+    }
+
+    /// `MOVIE[PLAY]`:0 停止消费(保留队列),1 继续。
+    pub fn movie_audio_set_playing(&mut self, playing: bool) {
+        self.movie.get_mut().set_playing(playing);
+    }
+
+    /// `MOVIEEND`/换片:清空队列与格式。
+    pub fn movie_audio_clear(&mut self) {
+        self.movie.get_mut().clear();
+    }
+
+    /// 影片音频统计(诊断/测试)。
+    #[must_use]
+    pub fn movie_audio_stats(&self) -> crate::movie::MovieAudioStats {
+        self.movie.borrow().stats()
+    }
+
+    /// 待消费的影片音频帧数(诊断)。
+    #[must_use]
+    pub fn movie_audio_queued_frames(&self) -> usize {
+        self.movie.borrow().queued_frames()
     }
 
     /// 取走自上次调用以来的解码增量(逐帧记账)。

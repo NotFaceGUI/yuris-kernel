@@ -431,6 +431,18 @@ pub struct MovieFrame<'a> {
     pub rgba: &'a [u8],
 }
 
+/// 影片音频格式(`MovieHost::take_audio` 的交付描述)。
+///
+/// 样本是**交错 i16**;`channels` 目前恒为 2(pl_mpeg 把单声道也写成
+/// 双声道)。混音/重采样在声音域(`yu-sound`)按输出设备格式做。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MovieAudioInfo {
+    /// 影片音轨采样率(MP2: 32000/44100/48000)。
+    pub sample_rate: u32,
+    /// 声道数(当前后端恒 2)。
+    pub channels: u16,
+}
+
 /// 影片播放端口:**宿主实现,内核只做语义**。
 ///
 /// 取证结论(0.495):官方 `MOVIE` 把解码与呈现整体交给**系统媒体栈** ——
@@ -484,6 +496,15 @@ pub trait MovieHost {
     /// (官方 `MOVIE[PLAY=0]` 停止后画面仍在,直到 `MOVIEEND`)。
     /// 默认不产帧(后端只做控制、不做呈现时使用)。
     fn frame(&mut self, _now_ms: u64) -> Option<MovieFrame<'_>> {
+        None
+    }
+
+    /// 取走自上次调用以来解码的影片音频(交错 i16,`info.channels` 声道)。
+    ///
+    /// 官方音频由系统媒体栈与画面一起播放;内核只把 PCM 交给声音域,
+    /// 由 `yu-sound` 按 `MOVIE[VOLUME]`(COM `DSBVOLUME` 曲线:
+    /// 振幅 = `(v/256)^2`)与设备格式混音。默认不产音频。
+    fn take_audio(&mut self, _out: &mut Vec<i16>) -> Option<MovieAudioInfo> {
         None
     }
 

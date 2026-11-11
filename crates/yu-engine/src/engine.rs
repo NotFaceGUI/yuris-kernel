@@ -774,6 +774,10 @@ pub struct Engine {
     frame_diag_totals: BTreeMap<(String, String, String), FrameDiagTotal>,
     /// 平台音频出口(宿主经 [`Engine::attach_audio`] 注入;`None` = 静音)。
     audio: Option<Box<dyn AudioOut>>,
+    /// 影片音频交付缓冲(每 tick 复用,不逐帧分配)。
+    movie_audio_buf: Vec<i16>,
+    /// 当前影片音频对应的文件名(换片时清空声音域队列;只在变化时存)。
+    movie_audio_file: Option<Vec<u8>>,
     /// 实时墙钟:`serve`/桌面 `tick_realtime` 用它推进逻辑/声音时间。
     /// 默认不截断(见 [`RealtimeClock`])。
     clock: RealtimeClock,
@@ -993,6 +997,8 @@ impl Engine {
             drained_diags: 0,
             frame_diag_totals: BTreeMap::new(),
             audio: None,
+            movie_audio_buf: Vec::new(),
+            movie_audio_file: None,
             clock: RealtimeClock::new(Instant::now()),
             last_clock_drop_ms: 0,
             renderer,
@@ -1610,6 +1616,7 @@ impl Engine {
         }
         let t_after_preload = tick_started.elapsed();
         self.sync_movie_overlay();
+        self.sync_movie_audio();
         // 文本缓冲必须每逻辑帧在**本 tick 最后一条 Text/CLEAR 之后、
         // frame() 之前**同步。证据:手册 `text/text.html`;REA
         // `FUN_004046fc`(每帧推进)`0x4046fc`、`TEXT[CLEAR]` `0x453894`
@@ -2129,26 +2136,38 @@ impl Engine {
     fn sync_movie_overlay(&mut self) {
         /// 影片帧的合成资产 key(每帧覆盖;不进 VFS)。
         const MOVIE_KEY: &[u8] = b":movie/current";
-        let Some(state) = self.state.clone() else {
-            return;
-        };
+        // 图形状态与影片解码解耦:音频输出(桌面/Android)不应因为
+        // `render=false`(VM-only 探针)而停止推进影片时钟。
+        let state = self.state.clone();
         let Some(vm) = self.vm.as_mut() else {
-            state.borrow_mut().set_movie_overlay(None);
+            if let Some(state) = &state {
+                state.borrow_mut().set_movie_overlay(None);
+            }
             return;
         };
         if !vm.movie_mode() {
-            state.borrow_mut().set_movie_overlay(None);
+            if let Some(state) = &state {
+                state.borrow_mut().set_movie_overlay(None);
+            }
             return;
         }
         let now_ms = u64::from(self.frame as u32).saturating_mul(u64::from(self.opts.frame_ms()));
+        let want_pixels = state.is_some();
         let mut media = None;
         let mut pixels = None;
         if let Some(host) = vm.movie_host_mut() {
             media = host.media_size();
+            // `frame()` 同时推进视频解码与音频预解码;即使无 gfx 状态,
+            // 音频也必须继续(随后由 `sync_movie_audio` 取走)。
             if let Some(frame) = host.frame(now_ms) {
-                pixels = Some((frame.width, frame.height, frame.rgba.to_vec()));
+                if want_pixels {
+                    pixels = Some((frame.width, frame.height, frame.rgba.to_vec()));
+                }
             }
         }
+        let Some(state) = state else {
+            return;
+        };
         if let Some((width, height, rgba)) = pixels {
             self.renderer
                 .textures_mut()
@@ -2172,6 +2191,64 @@ impl Engine {
             asset: MOVIE_KEY.to_vec(),
             rect,
         }));
+    }
+
+    /// 影片音频:每 tick 从影片端口取 PCM,交给声音域混音。
+    ///
+    /// 官方音频由系统媒体栈与画面一起播放(`mciSendString`/`IBasicAudio`)。
+    /// 内核只交付 PCM;`MOVIE[VOLUME]` 在声音域按 COM/DSBVOLUME 曲线
+    /// (振幅 = `(v/256)^2`)应用。换片/`MOVIEEND` 时清空队列,避免上一部
+    /// 影片的残留样本串到下一部。
+    fn sync_movie_audio(&mut self) {
+        let Some(vm) = self.vm.as_mut() else {
+            return;
+        };
+        if !vm.movie_mode() {
+            if self.movie_audio_file.take().is_some() {
+                if let Some(sound) = &self.sound {
+                    sound.lock().unwrap().movie_audio_clear();
+                }
+            }
+            return;
+        }
+        let (playing, volume, file_changed, file_now) = {
+            let state = vm.movie_state();
+            let changed = match (self.movie_audio_file.as_deref(), state.file.as_deref()) {
+                (Some(old), Some(new)) => old != new,
+                (None, None) => false,
+                _ => true,
+            };
+            (
+                state.playing,
+                state.volume,
+                changed,
+                changed.then(|| state.file.clone()).flatten(),
+            )
+        };
+        if file_changed {
+            self.movie_audio_file = file_now;
+            if let Some(sound) = &self.sound {
+                sound.lock().unwrap().movie_audio_clear();
+            }
+        }
+        let mut buf = std::mem::take(&mut self.movie_audio_buf);
+        buf.clear();
+        let info = vm
+            .movie_host_mut()
+            .and_then(|host| host.take_audio(&mut buf));
+        if let Some(sound) = &self.sound {
+            let mut state = sound.lock().unwrap();
+            if let Some(info) = info {
+                state.movie_audio_set_playing(playing);
+                state.movie_audio_set_volume(volume);
+                if !buf.is_empty() {
+                    state.movie_audio_push(info, &buf);
+                }
+            } else if !playing {
+                state.movie_audio_set_playing(false);
+            }
+        }
+        self.movie_audio_buf = buf;
     }
 
     fn accumulate_frame_diags(&mut self, frame: &CompositorFrame) {
@@ -2500,6 +2577,8 @@ impl Engine {
         self.vm = Some(vm);
         self.state = Some(state);
         self.sound = sound;
+        self.movie_audio_file = None;
+        self.movie_audio_buf.clear();
         self.save_host = save_host;
         self.capture_bridge = capture_bridge;
         if let Some(bridge) = self.capture_bridge.as_mut() {

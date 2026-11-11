@@ -172,6 +172,23 @@
 - trace:`DIV-L-002`(script 60 返回后的任务相位/调度)open;官方 L1 `args=[]`
   参数级不可观测,当前只到命令顺序级。
 
+### 3.3 影片/媒体剩余待办(2026-11-11)
+
+- **非 MPEG-1 编码**:MPEG-2/AVI/MP4 只探测并警告;需要新 `MovieHost`
+  (FFmpeg 可选 feature),不影响内核端口。
+- **AVI 作为 CG 图层**:手册 `movie/movie.html` 明示可用 `CG` 命令;
+  当前 `CG[FILE]` 只解静态图(png/bmp/jpg/gif/psb)。
+- **`FLASH`/`FLASHINFO`/`FLASHEND`**:仅 `DomainCall`,无 SWF 宿主;
+  `es_MoviePlay.yst` 的 `.swf` 分支因此不会真播。
+- **`MOVIEINFO[SX/SY]` 未指定**:内核回 0,官方回影片原始尺寸
+  (语料无此用法)。
+- **`MOVIE[PLAY=0]`**:官方 MCI `stop`(位置回起点);内核视频仍冻结在
+  末帧、音频保留队列。语料无 `PLAY=0`,未对齐。
+- **影片时钟漂移**:视频用逻辑帧时钟、音频用设备实时时钟;桌面
+  <60fps 时 2s OP 约 50ms 漂移。
+- **整段读入**:VM + `Plm` 各持一份影片字节,大影片 Android 峰值内存高。
+- **Android 真机试听**:APK 已交叉编译通过,未上设备验证。
+
 ## 4. 非缺口(不要修)
 
 - 31 个域事件命令(CG/WINDOW/SAVE/FILE/MENU/EMOTE/MOVIE/FLASH/INPUT…):

@@ -33,7 +33,7 @@ use std::rc::Rc;
 
 use southstar_codecs::plmpeg::{Frame as PlmFrame, Plm};
 use yu_log::{Boundary, Diag};
-use yu_rt::event::{MovieFrame, MovieGeometry, MovieHost};
+use yu_rt::event::{MovieAudioInfo, MovieFrame, MovieGeometry, MovieHost};
 
 /// 一次播放会话。
 pub struct PlmMovieHost {
@@ -49,7 +49,7 @@ pub struct PlmMovieHost {
     start_ms: Option<u64>,
     /// 已到结尾。
     ended: bool,
-    /// 音量(官方 0..256;音频未接前只保存)。
+    /// 音量(官方 0..256;由声音域按 DSBVOLUME 曲线应用)。
     volume: i64,
     /// 几何(原始参数,`sx/sy == 0` = 未指定)。
     geometry: MovieGeometry,
@@ -59,6 +59,16 @@ pub struct PlmMovieHost {
     size: (u32, u32),
     /// 当前帧时间(秒;`None` = 还没有帧)。
     frame_time: Option<f64>,
+    /// 是否有 MP2 音轨(`num_audio_streams() > 0` 且头部可解)。
+    has_audio: bool,
+    /// 音轨采样率(Hz;无音轨 = 0)。
+    audio_rate: u32,
+    /// 已解码音频覆盖到的媒体时间(秒)。
+    audio_time: f64,
+    /// 待交付给声音域的交错 i16 样本(立体声)。
+    audio_out: Vec<i16>,
+    /// 已解码音频包数(诊断/测试)。
+    audio_packets: u64,
 }
 
 impl Default for PlmMovieHost {
@@ -82,7 +92,36 @@ impl PlmMovieHost {
             rgba: Vec::new(),
             size: (0, 0),
             frame_time: None,
+            has_audio: false,
+            audio_rate: 0,
+            audio_time: 0.0,
+            audio_out: Vec::new(),
+            audio_packets: 0,
         }
+    }
+
+    /// 当前影片是否有可播放的 MP2 音轨。
+    #[must_use]
+    pub fn has_audio(&self) -> bool {
+        self.has_audio
+    }
+
+    /// 音轨采样率(Hz;无音轨 = 0)。
+    #[must_use]
+    pub fn audio_rate(&self) -> u32 {
+        self.audio_rate
+    }
+
+    /// 已解码音频包数(诊断/测试)。
+    #[must_use]
+    pub fn audio_packets(&self) -> u64 {
+        self.audio_packets
+    }
+
+    /// 待交付的音频样本数(诊断/测试)。
+    #[must_use]
+    pub fn pending_audio_samples(&self) -> usize {
+        self.audio_out.len()
     }
 
     /// 影片原始尺寸(打开成功后才可知)。
@@ -174,6 +213,39 @@ impl PlmMovieHost {
         }
         self.plm = Some(plm);
     }
+
+    /// 按播放时钟补充音频:解码到 `target + 200ms`,每 tick 最多 32 包。
+    ///
+    /// MP2 一包 = 1152 帧(48kHz 时 24ms)。60Hz tick 每帧约需 1 包;
+    /// 预解码 200ms 吸收 tick 抖动,同时把 A/V 延迟限制在声音域环形缓冲
+    /// 深度内。`decode_audio` 与 `decode_video` 共用 demux,视频包由
+    /// `Feed` 分流到视频环,不会丢帧。
+    fn pump_audio(&mut self, target: f64) {
+        if !self.has_audio || self.audio_rate == 0 {
+            return;
+        }
+        let Some(mut plm) = self.plm.take() else {
+            return;
+        };
+        let rate = f64::from(self.audio_rate);
+        let lead = 0.20;
+        let mut packets = 0u32;
+        while packets < 32 && self.audio_time <= target + lead {
+            let Some(samples) = plm.decode_audio() else {
+                break;
+            };
+            let frames = samples.interleaved.len() / 2;
+            self.audio_out.reserve(samples.interleaved.len());
+            for &sample in &samples.interleaved {
+                // pl_mpeg 输出 [-1, 1] f32;转交错 i16(饱和转换)。
+                self.audio_out.push((sample * 32767.0) as i16);
+            }
+            self.audio_time = samples.time + frames as f64 / rate;
+            packets += 1;
+        }
+        self.audio_packets += u64::from(packets);
+        self.plm = Some(plm);
+    }
 }
 
 impl MovieHost for PlmMovieHost {
@@ -196,6 +268,18 @@ impl MovieHost for PlmMovieHost {
         }
         let rate = plm.framerate();
         self.frame_interval = if rate > 0.0 { 1.0 / rate } else { 1.0 / 30.0 };
+        // 音轨:MP2 头部在 `has_headers()` 里已解析;采样率无效时按无音轨处理。
+        let audio_streams = plm.num_audio_streams();
+        let audio_rate = if audio_streams > 0 {
+            plm.samplerate().max(0) as u32
+        } else {
+            0
+        };
+        self.has_audio = audio_rate > 0;
+        self.audio_rate = audio_rate;
+        self.audio_time = 0.0;
+        self.audio_out.clear();
+        self.audio_packets = 0;
         self.media = Some((w as u32, h as u32));
         self.size = (0, 0);
         self.rgba.clear();
@@ -243,8 +327,21 @@ impl MovieHost for PlmMovieHost {
             let start = *self.start_ms.get_or_insert(now_ms);
             let target = now_ms.saturating_sub(start) as f64 / 1000.0;
             self.advance_to(target, 4);
+            self.pump_audio(target);
         }
         self.current()
+    }
+
+    fn take_audio(&mut self, out: &mut Vec<i16>) -> Option<MovieAudioInfo> {
+        if !self.has_audio || self.audio_rate == 0 {
+            return None;
+        }
+        out.extend_from_slice(&self.audio_out);
+        self.audio_out.clear();
+        Some(MovieAudioInfo {
+            sample_rate: self.audio_rate,
+            channels: 2,
+        })
     }
 
     fn close(&mut self) {
@@ -256,6 +353,11 @@ impl MovieHost for PlmMovieHost {
         self.playing = false;
         self.ended = false;
         self.start_ms = None;
+        self.has_audio = false;
+        self.audio_rate = 0;
+        self.audio_time = 0.0;
+        self.audio_out.clear();
+        self.audio_packets = 0;
     }
 }
 
@@ -330,5 +432,47 @@ mod tests {
             .open(b"x.avi", b"RIFF\x00\x00\x00\x00AVI LIST")
             .expect_err("非 MPEG-1 必须失败");
         assert_eq!(err.code, "movie.decode");
+    }
+
+    /// 真实 MP2 音轨:MPEG-1 PS + 48kHz 立体声(商业样本)。
+    ///
+    /// 样本路径经 `YURIS_SAMPLE_MOVIE_MP2` 注入(缺样本显式 skip 并计数;
+    /// `YURIS_REQUIRE_SAMPLES=1` 时硬失败)。
+    #[test]
+    fn decodes_mp2_audio_track() {
+        let Some(path) = std::env::var_os("YURIS_SAMPLE_MOVIE_MP2") else {
+            if std::env::var("YURIS_REQUIRE_SAMPLES").ok().as_deref() == Some("1") {
+                panic!("YURIS_REQUIRE_SAMPLES=1 但 YURIS_SAMPLE_MOVIE_MP2 缺失");
+            }
+            println!("SKIP[count=1] decodes_mp2_audio_track: 缺少 YURIS_SAMPLE_MOVIE_MP2");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("读 MP2 影片样本");
+        let mut host = PlmMovieHost::new();
+        host.open(b"trance_Ignis.mpg", &bytes).expect("open");
+        assert!(host.has_audio(), "样本应有 MP2 音轨");
+        assert_eq!(host.audio_rate(), 48_000, "样本 MP2 = 48kHz");
+        host.set_playing(true).expect("play");
+
+        let mut frames = 0usize;
+        let mut nonzero = false;
+        for tick in 0..90u64 {
+            // 1.5s @ 60Hz。
+            let _ = host.frame(tick * 16);
+            let mut pcm = Vec::new();
+            if host.take_audio(&mut pcm).is_some() {
+                frames += pcm.len() / 2;
+                nonzero |= pcm.iter().any(|s| *s != 0);
+            }
+        }
+        assert!(host.audio_packets() > 0, "应解码至少一个 MP2 包");
+        assert!(
+            frames > 40_000,
+            "1.5s 影片应交付 >0.8s 音频,实际 {frames} 帧"
+        );
+        assert!(nonzero, "音频样本不应全 0");
+
+        host.close();
+        assert!(!host.has_audio());
     }
 }

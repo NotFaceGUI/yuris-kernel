@@ -308,7 +308,7 @@ EMOTEINFO:静态 3 处,本窗口 0 次
 | `CLIPACT` | 保存 `SET` 字节镜像;发 `DomainCall` | 写入 OS 剪贴板(CF_TEXT) |
 | `CLIPINFO` | 读镜像,过滤 `<0x20`,写 `LET`;发 `DomainCall` | 可先 `Vm::set_clipboard()` 注入外部剪贴板 |
 | `TRAY` | 只发 `Domain::System` 事件 | 托盘图标/菜单 |
-| `MOVIE` | 全屏影片状态机(文件名/播放位/几何/音量),经 `MovieHost` 端口下发;**不创建图层** | 解码与呈现(系统媒体栈/FFmpeg 等);`Vm::movie_mode()` 为真时**只呈现影片**、遮住所有图层 |
+| `MOVIE` | 全屏影片状态机(文件名/播放位/几何/音量),经 `MovieHost` 端口下发;**不创建图层** | 解码与呈现(系统媒体栈/FFmpeg 等);`Vm::movie_mode()` 为真时**只呈现影片**、遮住所有图层;`MovieHost::take_audio` 每 tick 交付 MP2 PCM,`yu-sound` 按 `MOVIE[VOLUME]` 混音 |
 | `MOVIEEND` | 退出影片模式,清文件名/播放位、音量重置 256 | 释放播放器 |
 | `MOVIEINFO` | VM 本地查询(含 `CODEC` 头探测),写 `LET`;不经过宿主 | 无 |
 | `YMV` | `FILE` 存在时**读包解析 `YSMV` 头**(`yu_format::ymv`,只读头部与三张表),经 `GraphicsHost::note_movie(asset, MovieInfo)` 同步推给图形域;**随后**照发 `Domain::Movie` 事件(脚本原始参数不变) | 图形域按 `YMV[ID/IDNO/FILE/FRAME]` 把影片挂到目标图层(图层必须已由 `CG[ID]` 建好) |
@@ -321,6 +321,14 @@ EMOTEINFO:静态 3 处,本窗口 0 次
 → `CGACT[FRAME]` 逐帧换图),SDK 说明写明「映像のみ・音声なし・最高
 30fps」。因此内核**不实现播放时钟**:帧推进由脚本按 `YMVINFO[FPS]` 自己
 算(`es.L.YMV.MAIN` 用 `_OS_TIME`)。
+
+全屏影片音频(B16,2026-11-11):`MOVIE[VOLUME=n]` 的 COM 路径
+`IBasicAudio::put_Volume`(`0x44b664`)把 0..256 映射为
+`round(4000*log10(n/256))`(1/100 dB),振幅 `(n/256)^2`;MCI 回退
+(`0x44b7cc`)是 `1000*n/256`。内核与 `yu-sound` 统一用 COM/DirectSound
+曲线;`MOVIEEND` 重置 256(`0x44ba0f`)。音频解码在 `MovieHost` 后端
+(pl_mpeg MP2,48k 立体声),混音/重采样在 `yu-sound::movie`,平台只经
+`AudioOut` 输出。详见 `docs/tasks/task-b16-movie-audio.md`。
 
 剪贴板过滤规则来自 REA `0x43e4d2..0x43e54d`:逐字符按 CP932 前导字节
 表定长拷贝,并丢弃所有 `< 0x20` 的字节。

@@ -85,7 +85,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `EMOTE` | emote | 13 | — | `0x4405a4` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `TASK` | vm | 10 | `control/task.html` | `0x4506f4` | ✅ 实现 | 保持 |
 | `FONTINFO` | graphics | 8 | `font/fontinfo.html` | `0x444cfc` | 🔁 部分(3 次未实现) | 主路径实现;未实现路径见 §2 |
-| `MOVIE` | movie | 6 | `movie/movie.html` | `0x44b134` | ✅ fixed(no-manual) | 内核持状态 + 影片模式遮罩;解码经 `MovieHost` 端口,默认后端内嵌 pl_mpeg 移植(MPEG-1);见 DIV-GFX-074 |
+| `MOVIE` | movie | 6 | `movie/movie.html` | `0x44b134` | ✅ fixed(no-manual) | 内核持状态 + 影片模式遮罩;解码经 `MovieHost` 端口,默认后端内嵌 pl_mpeg 移植(MPEG-1);MP2 音轨经 `take_audio` → `yu-sound` 环形缓冲/COM 音量曲线混音;见 DIV-GFX-074 §8/§9 |
 | `SYSTEMINFO` | system | 5 | — | `0x4505e4` | ✅ 实现 | 保持 |
 | `SAVEEND` | save | 5 | `file/saveend.html` | `0x44e1a0` | ✅ 实现(B1) | 装存档宿主时清预约(官方 flush 不清表,语料 es_GSD 刷盘后显式 SAVEEND 同型);未装宿主仍只发 `DomainCall` |
 | `DEBUGLIST` | system | 5 | — | `0x4634d8` | ✅ no-op | 官方 `xor eax,eax; ret`(DIV-RT-043) |

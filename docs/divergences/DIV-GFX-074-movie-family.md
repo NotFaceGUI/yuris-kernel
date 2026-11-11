@@ -218,3 +218,37 @@ cargo test -p yu-gfx --test ymv_movie        # 9 通过(含 overlay 遮住所有
 实机(桌面 wgpu,`movie-clean`):frame 200 为 OP 影片实际帧,frame 500
 为标题 UI;debug 模式进入主菜单时底部 15 个按钮(セーブ…メニュー)与官方
 截图逐项一致。`target/tmp/movie-fix-*.png`、`shot-f1100-soft.png` 为证据。
+
+## 9. 影片音频(2026-11-11,B16)
+
+官方音频由系统媒体栈与画面一起播放:COM 路径
+`IBasicAudio::put_Volume`(`0x44b664`,`[ecx+0x1c]`)把 `MOVIE[VOLUME]`
+0..256 映射为 `round(4000*log10(n/256))`(1/100 dB),DirectSound 振幅
+即 `(n/256)^2`;MCI 回退 `0x44b7cc` 是 `volume to 1000*n/256`(线性)。
+`MOVIEEND` 重置音量 256(`0x44ba0f`)。
+
+实现分层:
+
+- `MovieHost::take_audio`(默认 `None`)交付交错 i16 PCM;
+  `PlmMovieHost` 用 pl_mpeg 解 MP2(48/44.1/32kHz,立体声),每 tick
+  预解码到 `target + 200ms`(最多 32 包),与视频共用 demux。
+- `yu-sound::movie::MovieAudio` 环形缓冲(2^18 样本 ≈ 2.7s@48k),
+  设备回调内只做线性插值 + `volume_gain`(COM/DSBVOLUME 曲线)+ 加法,
+  零分配/零解码。
+- `Engine::sync_movie_audio` 每 tick 交付,换片/`MOVIEEND` 清队列;
+  图形状态与音频解耦(`render=false` 也推进影片时钟与音频)。
+- 平台只经既有 `AudioOut`:桌面 cpal(`sound_device.rs`),Android
+  cpal→oboe(`sound.rs`,mixer 线程→无锁 SPSC 环→回调);无 Android
+  专属改动,`arm64-v8a + x86_64` APK 已交叉编译通过。
+
+回归:`yu-sound::movie` 5 项(归一化/音量 0/重采样/欠载/清队列)、
+`yu-movie-plmpeg::decodes_mp2_audio_track`(真实 48kHz MP2)。
+微基准:MP2 解码 73.3ns/帧(60Hz tick ≈0.059ms);push 0.0006ms/tick;
+render 0.0012ms/960 帧块。
+
+已知限制:线性重采样(与 `mixer` 同口径,非系统重采样器);只支持
+MPEG-1 PS/MP2;`MOVIE[PLAY=0]` 的官方 `stop` 位置语义未对齐(语料
+无 `PLAY=0`);视频用逻辑帧时钟、音频用设备实时时钟,<60fps 时轻微
+漂移;整段影片字节仍由 VM + 解码器各持一份。
+
+任务书与完整审查:`docs/tasks/task-b16-movie-audio.md`。
