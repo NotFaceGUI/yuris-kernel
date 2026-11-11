@@ -202,17 +202,14 @@ REA;内核持全屏影片状态(文件名/播放位/几何/音量/影片模式),
 均实测逐帧上屏;wgpu 资产纹理缓存按 `TextureStore::generation` 失效
 (见 DIV-GFX-074 §6)。
 
-**待办(2026-11-03 审查)**:
-- **es 影片态调度缺口**:`\MOVIE(...)` 宏只设 `@es.SCENARIOSTOP=2`,
-  真正播放由 `ES.GAMEMAIN.LOOP`(`es_Scenario.yst:127..162`)在下一帧
-  `IF[@es.SCENARIOSTOP==@e.MOVIE]` 调 `es.S.GOSUB("es.MOVIEPLAY")`。
-  实测该消费未发生:场景任务(`es.SCENARIO.FLOW`)在 `WAIT[FRAME=1]` 后
-  先于系统任务继续,`\TITLE` 宏把 `SCENARIOSTOP` 改回 1。需按手册
-  「Z 高先执行」(系统任务默认 100)复核任务链顺序与 `WAIT[FRAME=N]`
-  让出语义。修好后宏路径应直接播片,不再需要脚本侧绕行。
-- 脚本侧临时绕行(已实测):启动即播放在 `system_start.yst` 的
-  `GO[#=es.ERIS]` 之前;场景内播片在 `MOVIEEND` 后补 `\UI.RELOAD`
-  重建 `ES.GAMEMAIN` 按钮组。
+**`\MOVIE(...)` 宏路径:已修(2026-11-11)**。实测调度链本身正确
+(系统任务 Z=100 下一帧消费 `SCENARIOSTOP==@e.MOVIE`,场景任务在影片
+期间被 `_task.pause` 置 `E=0`);真正断点是 `MOVIEINFO[CODEC]` 探测了
+`MOVIE[FILE]` 当前文件名(此时为空)而非 CODEC 参数文件,导致
+`es_MoviePlay.yst` 的 `IFBREAK` 放弃播片。另修 `MOVIEEND` 后
+`baked_copies` 不重发、底部按钮快照被后端回收的问题。证据与回归见
+`docs/tasks/task-b14-movie-schedule.md`、DIV-GFX-074 §2.3/§8;
+脚本侧绕行(前置播片 / `\UI.RELOAD`)不再需要。
 
 DIV-RT-045 媒体侧已在 B14 收尾(YMV 行);`MOVIE` 语义层见 DIV-GFX-074,播放后端待选型。
 

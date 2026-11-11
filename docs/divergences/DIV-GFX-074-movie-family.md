@@ -43,7 +43,9 @@
 ### 2.3 `MOVIEINFO[PLAY, X, Y, SX, SY, VOLUME, CODEC, LET]`
 
 七个字段是**顺序 `if` + 各自写 `LET` + `ret`**(`0x44ba60..0x44bbde`):
-多字段同时置位时**槽号最小的字段生效**;一个字段都没给则什么都不写。
+多字段同时给出时**槽号最小的字段生效**;一个字段都没给则什么都不写。
+字段选择看参数**存在标志**(`0x684160..0x684166` 逐字节 `test/jne`),
+不看数值是否非零——`MOVIEINFO[PLAY=0 LET=@a]` 同样应写回 0。
 
 `CODEC`(`0x44bac9..0x44bcfc`)只读文件头 5 字节:
 
@@ -57,6 +59,24 @@
 
 证据:官方样例 `data/pac/op_movie.mpg` 头 = `00 00 01 BA 21` → 1。
 ERIS 脚本据此分流(`es_MoviePlay.yst`:`==0` 文件不存在、`>1` 非 MPEG-1)。
+
+**2026-11-11 勘误(探测对象)**:官方 `CODEC` 探测的是 **`CODEC` 参数本身**,
+不是 `MOVIE[FILE]` 的当前文件名:
+
+```text
+44bac9  mov ecx,[edx*4+0x683fc0]   ; CODEC 参数字符串
+44bad4  mov edi,0x681300           ; CWD/工程基路径
+44bad9  …把基路径拷到栈缓冲…
+44baf3  …把参数串追加到基路径尾部…
+44bb42  call 0x469df2              ; fopen(基路径 + CODEC 参数)
+```
+
+`MOVIE[FILE]` 的文件名在 `0x7fab00`,本分支不读。ERIS `es_MoviePlay.yst`
+正是在 `MOVIE[FILE]` **之前**用 `MOVIEINFO[CODEC=$FN]` 做存在性/编码预检;
+旧内核读 `self.movie.file`(此时为空)恒得 0,宏路径随即
+`IF[@codeccheck==0] IFBREAK[LV=3]` 放弃播放。内核 VFS 根即官方基路径,
+实现改为探测参数文件。回归:`yu-rt/tests/fixture.rs`
+`movie_state_machine_and_info_queries`(CODEC 查询在 `MOVIE[FILE]` 之前)。
 
 ### 2.4 官方把解码/呈现交给系统媒体栈
 
@@ -166,6 +186,35 @@ cargo test -p yu-gfx --test ymv_movie        # 9 通过(含 overlay 遮住所有
   `forget_texture`,不留悬空 view。
 - **清理**:临时 `DBG` 探针全部移除;`src/` 下无 `eprintln!/println!`,
   stderr 输出只保留在 examples。
-- **待办**:`\MOVIE(...)` 宏路径的 es 影片态调度(roadmap-batches B14
-  「待办」);脚本侧绕行为「`system_start` 前置播片」或「`MOVIEEND` 后
-  `\UI.RELOAD` 重建按钮组」。
+- **`\MOVIE(...)` 宏路径(已修,2026-11-11)**:两处根因与修法见 §8;
+  不再需要脚本侧绕行(前置播片 / `MOVIEEND` 后 `\UI.RELOAD`)。
+
+## 8. `\MOVIE(...)` 宏路径收口(2026-11-11)
+
+真实 MOV 工程 `target/tmp/movie-clean`(官方 SDK 0.495 编译,
+`SCENARIO_START → SCENARIO_LOGO → SCENARIO_OPMOVIE → \MOVIE(pac/op_movie.mpg)`)
+逐 tick 任务相位 + 画面验收:
+
+- 调度链本身正常:场景任务(Z=2)在 `WAIT[FRAME=1]` 后,系统任务(Z=100)
+  下一逻辑帧命中 `ES.GAMEMAIN.LOOP` 的 `SCENARIOSTOP==@e.MOVIE` 并
+  `es.S.GOSUB("es.MOVIEPLAY")`;影片期间场景任务被 `_task.pause` 置 `E=0`,
+  不可能先跑 `\TITLE`。**不改调度器/WAIT 语义**。
+- **断点 1:`MOVIEINFO[CODEC]` 探测错对象**。官方 `0x44bac9` 读 `CODEC`
+  参数并在其后追加到基路径 `0x681300` 后 `fopen`;旧实现读
+  `MOVIE[FILE]` 的当前文件名(`0x7fab00`),此时为空 ⇒ 恒 0 ⇒
+  `es_MoviePlay.yst` 的 `IF[@codeccheck==0] IFBREAK[LV=3]` 直接放弃播片。
+  已改为探测 `CODEC` 参数文件;字段选择也改为按参数**存在**而非值非零。
+  回归:`yu-rt/tests/fixture.rs::movie_state_machine_and_info_queries`
+  (CODEC 查询移到 `MOVIE[FILE]` 之前)。
+- **断点 2:`MOVIEEND` 后底部按钮条/UI 快照不恢复**。影片帧
+  (`movie_only_frame`)只投影影片层,后端 `prune_snapshots` 把按钮快照
+  全部回收;`GfxState.baked_copies` 仍认为 COPY 已冻结,退出影片模式后
+  `frame()` 继续跳过重发 ⇒ `BT.OFF...GAMEMAIN.BTN.*`(快照纹理)永久黑,
+  只剩 SAVE(资产纹理)。已改为 `set_movie_overlay(None)` 时清空
+  `baked_copies`,下一帧重发一次 COPY;后端按 `source_texture`(按钮
+  sprite sheet + `COPY2` 区域)重建快照。回归:
+  `yu-gfx/tests/ymv_movie.rs::movie_overlay_exit_replays_baked_copy_snapshots`。
+
+实机(桌面 wgpu,`movie-clean`):frame 200 为 OP 影片实际帧,frame 500
+为标题 UI;debug 模式进入主菜单时底部 15 个按钮(セーブ…メニュー)与官方
+截图逐项一致。`target/tmp/movie-fix-*.png`、`shot-f1100-soft.png` 为证据。

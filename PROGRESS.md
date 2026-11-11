@@ -14094,3 +14094,62 @@ yu-cli run <project-eris> --frames 1 --vm-profile --asset-timing
 yu-cli run <project-eris> --vm-profile=maybe             → exit 2,--vm-profile 只接受 on|off
 yu-cli help run                                          → 新增「诊断/性能参数」段
 ```
+
+
+## 成果 MOVIE-MACRO (2026-11-11) · `\MOVIE(...)` 宏路径真实播片 + MOVIEEND 后 UI 快照恢复
+
+**问题**:`\MOVIE(file)` 宏(`macro.yst`:GOSUB `es.MOVIEPLAY.SET` +
+`WAIT[FRAME=1]`)在真实 MOV 测试工程上不播片;此前只能靠脚本侧
+「启动前播 / MOVIEEND 后 `\UI.RELOAD`」绕行。
+
+**取证与根因(两处,均非任务书原假设的调度竞争)**:
+
+- 逐 tick 任务相位(`target/tmp/movie-clean`,官方 SDK 0.495 编译):
+  场景任务 Z=2 在 `WAIT[FRAME=1]` 后,系统任务 Z=100 下一逻辑帧确实命中
+  `ES.GAMEMAIN.LOOP` 的 `SCENARIOSTOP==@e.MOVIE` 并 GOSUB MOVIEPLAY;
+  影片期间场景任务被 `_task.pause` 置 `E=0`。调度/让出语义正确。
+- 根因 1:官方 `MOVIEINFO[CODEC]`(`0x44ba2c`,`44bac9` 读 CODEC 参数、
+  `44bad4` 基路径 `0x681300`、`44bb42 fopen`)探测的是**参数文件**;
+  旧实现读 `MOVIE[FILE]` 当前文件名(此时为空)恒 0,`es_MoviePlay.yst`
+  的 `IF[@codeccheck==0] IFBREAK[LV=3]` 直接放弃播片。
+- 根因 2:影片帧只投影影片层,后端 `prune_snapshots` 回收按钮快照;
+  `GfxState.baked_copies` 仍把 COPY 当已冻结,`MOVIEEND` 后不再重发,
+  底部 15 个按钮(快照纹理)永久黑,只剩 SAVE(资产纹理)。
+
+**改动**:
+
+- `yu-rt/src/vm/handlers.rs::op_movieinfo`:字段按参数**存在**选择
+  (`PLAY=0` 也写回 0);`CODEC` 保存参数字符串并探测该文件(不再读
+  `movie.file`);VFS 根即官方基路径。
+- `yu-gfx/src/state.rs::set_movie_overlay`:退出影片模式时清空
+  `baked_copies`,下一帧按 `copy_log` 重发一次 COPY,后端用
+  `source_texture`(按钮 sprite sheet + `COPY2` 区域)重建快照。
+- 回归:`yu-rt/tests/fixture.rs` 的 CODEC 查询移到 `MOVIE[FILE]` 之前;
+  `yu-gfx/tests/ymv_movie.rs` 新增 `movie_overlay_exit_replays_baked_copy_snapshots`。
+- 文档:`docs/tasks/task-b14-movie-schedule.md`、`docs/divergences/DIV-GFX-074-movie-family.md` §2.3/§8。
+
+**验证(原始结果)**:
+
+```text
+cargo build --workspace --all-targets                    → 0 error / 0 warning
+cargo test -p yu-rt -p yu-engine -p yu-gfx --lib         → 94 + 32 + 15 passed
+cargo test -p yu-gfx --test ymv_movie movie_overlay      → 2 passed
+cargo test -p yu-rt --test fixture movie_state_machine_and_info_queries → 1 passed
+
+movie-clean(headless, 200/320/500 帧):
+  frame 200 = OP 影片实际帧;frame 500 = SCENARIO_TITLE
+  逐 tick movie_mode=1 f94..片尾;MOVIEEND 后场景恢复
+movie-clean(desktop wgpu,debug 模式,进主菜单):
+  底部 セーブ/ロード/…/メニュー 15 按钮与官方截图一致(shot-f1100-soft.png)
+
+性能(对照 = git archive HEAD 未改动基线):
+  movie-clean bench 12 帧:ours avg 24.04ms / slowest 112.3ms;
+    baseline avg 23.19ms / slowest 108.2ms(1.3M 突发帧 ≈86ns/命令,噪声内)
+  kotoneiro bench 2100 帧:ours avg 34.93ms / p95 56.97ms;
+    baseline avg 37.31ms / p95 60.00ms(未劣化)
+```
+
+**case --all 说明**:本机当前金标与 HEAD 不一致,未改动基线同样失败
+(`first-screen`/`until-visible` 的 actual hash `f67a4150…` 与本改动构建
+逐字相同);`save-load-loop`/`save-title-flow` 通过。属既有金标/
+`until-visible` 早停漂移,未擅自 `--update`。

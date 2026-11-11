@@ -92,7 +92,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `IFBREAK` | vm | 5 | `control/ifbreak.html` | `0x446408` | ✅ 实现 | 本 600 帧未触发;静态语料有 5 处 |
 | `MOUSE` | system | 4 | `system/mouse.html` | `0x44aaa0` | ✅ 实现 | 内核输入状态(MODE/TIME/MOVE/CLICK/WHEEL/X/Y/CURSOR/HX/HY/ID);光标显示/形状归宿主 |
 | `MENU` | menu | 4 | `menu/menu.html` | `0x449df8` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
-| `MOVIEINFO` | movie | 4 | `movie/movieinfo.html` | `0x44ba2c` | ✅ fixed(no-manual) | `PLAY/X/Y/SX/SY/VOLUME/CODEC` 顺序 if + 槽号最小者生效;缺字段不写 LET;见 DIV-GFX-074 |
+| `MOVIEINFO` | movie | 4 | `movie/movieinfo.html` | `0x44ba2c` | ✅ fixed(no-manual) | `PLAY/X/Y/SX/SY/VOLUME/CODEC` 按参数**存在**顺序 if + 槽号最小者生效;缺字段不写 LET;`CODEC` 探测 `CODEC` 参数文件(基路径+参数),非 `MOVIE[FILE]` 当前名;见 DIV-GFX-074 §2.3 |
 | `YMVINFO` | vm | 4 | — | `0x459b98` | ✅ fixed(no-manual) | 影片元数据查询:`NUM/SX/SY/FPS` 走 `GraphicsHost::query` 写 `LET`;层/影片缺失写 **0**(官方 `0x459d63`/`0x459de2`);gfx 侧 `query_ymvinfo`(DIV-GFX-073) |
 | `EMOTEINFO` | emote | 3 | — | `0x441014` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `YMV` | vm | 3 | — | `0x458ee0` | ✅ fixed(no-manual) | 影片**图层**挂接/换帧:VM 读包解析 `YSMV` 头(`yu_format::ymv`)→ `note_movie` 推给图形域 → 照发 `Domain::Movie` 事件;图层侧挂片/帧号钳位/纹理引用归 `yu-gfx`(DIV-GFX-073) |
