@@ -49,6 +49,19 @@
 纹理种类,拿到 1×1 基面,`CGACT[TEXT]` 的 `x=50/y=50` 等坐标全部
 落到图外 ⇒ 预览窗有黑底、无文字。
 
+### 2.3 补充(2026-11-11):`CGINFO[SX/SY]` 是显示矩形,不是快照表面尺寸
+
+局部 `COPY/COPY2` 的目标显示矩形 = **复制块尺寸**(官方
+`FUN_0042f809` 在动作分派后无条件写 `+0x78/+0x7c = X2-X+1/Y2-Y+1`,
+COPY/COPY2 的属性块不覆盖尺寸字段),快照表面仍保持源尺寸(§2.1)。
+ERIS 按钮用 `CGINFO[ID=$off SX=1 LET=@BT.SX]`(`es_Button.yst:2657`)
+取按钮宽;旧实现把源合图宽(按钮宽 × 4)当快照尺寸,
+`es.BT.MOUSECHECK` 的命中矩形覆盖四个按钮,置灰按钮被 `@BT.N` 跳过时
+相邻按钮接住 hover(kotoneiro 2026-11-11 实测)。修复:`snapshot_sizes`
+记区域尺寸、`snapshot_origins` 记区域原点,`CGINFO`/`ONMOUSE*` 按显示
+矩形查询;绘制仍按源尺寸快照(区域在 `(0,0)`,其余透明)。见 PROGRESS
+「成果 BT-HOVER」。
+
 ## 3. 修复
 
 1. **表面实色模型**:`Layer.fill: Option<[u8;4]>`。整层

@@ -333,8 +333,20 @@ pub struct GfxState {
     baked_copies: std::cell::RefCell<BTreeSet<CopyId>>,
     /// 本帧投影候选的复制项及目标层(成功后由 `commit_baked` 提交)。
     pending_copies: std::cell::RefCell<BTreeMap<CopyId, LayerId>>,
-    /// `COPY/COPY2` 生成的快照纹理尺寸(创建时从源层继承)。
+    /// `COPY/COPY2` 生成的快照显示矩形尺寸(局部区域 = 复制块,整幅 = 源尺寸)。
+    ///
+    /// **不是源表面尺寸**:`COPY/COPY2` 的局部区域把复制块写到目标 `(0,0)`,
+    /// 目标显示矩形 = 区域尺寸(官方 `FUN_0042f809` 动作后写
+    /// `+0x78/+0x7c`;ERIS 按钮切片靠 `CGINFO[ID=$off SX]` 取回按钮宽,
+    /// 见 `es_Button.yst:2657`);表面本身仍保持源尺寸(DIV-GFX-077 的
+    /// `SIZE` 语义)。本表只供 `CGINFO[SX/SY]`/`ONMOUSE*` 使用,绘制仍按
+    /// 源尺寸快照。
     snapshot_sizes: BTreeMap<CopyId, SizeU32>,
+    /// 快照复制区域在源纹理上的原点 `(x0, y0)`。
+    ///
+    /// 局部 `COPY/COPY2` 的块被写到目标 `(0,0)`,而 `CGINFO[ONMOUSE*]` 的
+    /// 像素采样回落到源资产时,资产坐标 = 区域原点 + 层内坐标。
+    snapshot_origins: BTreeMap<CopyId, (i64, i64)>,
     /// 快照对应的源资产键(`CGINFO[MFILE]` 透传)。
     snapshot_files: BTreeMap<CopyId, Vec<u8>>,
     /// 当前光标逻辑坐标(`CGINFO[ONMOUSE*]` 的缺省查询点;VM 每帧推入)。
@@ -463,6 +475,7 @@ impl GfxState {
             baked_copies: std::cell::RefCell::new(BTreeSet::new()),
             pending_copies: std::cell::RefCell::new(BTreeMap::new()),
             snapshot_sizes: BTreeMap::new(),
+            snapshot_origins: BTreeMap::new(),
             snapshot_files: BTreeMap::new(),
             preload_pending: BTreeSet::new(),
             preloaded: BTreeSet::new(),
@@ -1885,21 +1898,29 @@ impl GfxState {
         // `COPY/COPY2` 快照层没有独立像素面可采样;若快照源是资产
         // (`snapshot_files`),按源资产采样——按钮系统正是这样缓存
         // `BT.OFF...` 图层的(REA:引擎读的是已复制表面,像素同源)。
-        let texture = match &layer.texture {
-            TextureRef::Snapshot(id) => self
-                .snapshot_files
-                .get(id)
-                .map(|key| TextureRef::Asset(key.clone()))
-                .unwrap_or_else(|| layer.texture.clone()),
-            other => other.clone(),
+        //
+        // 局部 `COPY/COPY2` 的复制块在快照表面 `(0,0)`,采样源资产时要加回
+        // 区域原点(`snapshot_origins`);显示尺寸取快照矩形(区域尺寸,不是
+        // 源合图尺寸)。
+        let snapshot = match &layer.texture {
+            TextureRef::Snapshot(id) => Some(*id),
+            _ => None,
+        };
+        let snapshot_file = snapshot.and_then(|id| self.snapshot_files.get(&id));
+        let asset_snapshot = snapshot_file.is_some();
+        let texture = match snapshot_file {
+            Some(key) => TextureRef::Asset(key.clone()),
+            None => layer.texture.clone(),
         };
         let texture_size = sampler.size(&texture);
-        // 尺寸来源优先级:图层显式尺寸 → 采样器实测 → **VM 回填的资产尺寸**。
+        // 尺寸来源优先级:图层显式尺寸 → 快照矩形 → 采样器实测 → **VM 回填的
+        // 资产尺寸**。
         // 第三条是 `query_layer_size` 用的同一张表:资产缺失时 VM 会回填
         // 0×0(官方 `CG[FILE=…]` 装载失败后矩形保持 0),这里必须同口径,
         // 否则像素查询会一直报「资产头未注入」而尺寸表里其实已经有答案。
         let display = layer
             .image_size()
+            .or_else(|| snapshot.and_then(|id| self.snapshot_sizes.get(&id).copied()))
             .or(texture_size)
             .or_else(|| match &texture {
                 TextureRef::Asset(key) => self.asset_sizes.get(key).copied(),
@@ -1940,13 +1961,24 @@ impl GfxState {
             return Ok(Value::Int(-1));
         }
         // 显示尺寸 → 纹理坐标(最近邻,与后端采样口径一致)。
-        let (tx, ty) = match texture_size {
-            Some(size) if size.width > 0 && size.height > 0 => {
-                let tx = lx * i64::from(size.width) / i64::from(display.width);
-                let ty = ly * i64::from(size.height) / i64::from(display.height);
+        let (tx, ty) = match (snapshot, asset_snapshot) {
+            (Some(id), true) => {
+                // 采样源资产:快照表面 = 源表面,复制块在 `(0,0)`;
+                // 资产坐标 = 区域原点 + 层内坐标(层矩形缩放时按比例)。
+                let region = self.snapshot_sizes.get(&id).copied().unwrap_or(display);
+                let (ox, oy) = self.snapshot_origins.get(&id).copied().unwrap_or((0, 0));
+                let tx = ox + lx * i64::from(region.width) / i64::from(display.width);
+                let ty = oy + ly * i64::from(region.height) / i64::from(display.height);
                 (tx, ty)
             }
-            _ => (lx, ly),
+            _ => match texture_size {
+                Some(size) if size.width > 0 && size.height > 0 => {
+                    let tx = lx * i64::from(size.width) / i64::from(display.width);
+                    let ty = ly * i64::from(size.height) / i64::from(display.height);
+                    (tx, ty)
+                }
+                _ => (lx, ly),
+            },
         };
         let Some(px) = sampler.sample(&texture, tx, ty) else {
             return Ok(Value::Int(-1));
@@ -3650,8 +3682,47 @@ impl GfxState {
                 TextureRef::None | TextureRef::SolidBlack1x1 => src_node.layer.image_size(),
             };
         }
+        // `COPY/COPY2` 局部区域:官方 `FUN_0042f809` 在动作执行后**无条件**
+        // 把目标 `+0x78/+0x7c` 写成 `X2-X+1 / Y2-Y+1`(区域尺寸),COPY 的
+        // 属性块并不覆盖尺寸字段(EVID-J-10 的尺寸项即这条无条件写);
+        // 表面本身按 DIV-GFX-077 保持源尺寸,`SIZE` 语义不受影响。
+        //
+        // 注意:**不改 `LayerKind::Image.size`** —— 后端把“层矩形”当作
+        // 整张表面缩放到该尺寸;若把矩形设成 66,会把 264 宽的源合图压扁
+        // 进 66px。显示矩形只用于 `CGINFO`/`ONMOUSE`(与官方“矩形是表面
+        // 的显示区域”一致),绘制仍按源尺寸快照(区域在 `(0,0)`,其余透明)。
+        //
+        // 旧实现把源表面尺寸当作快照尺寸 ⇒ `CGINFO[SX]` 返回整张状态合图
+        // (按钮宽 × 4),`es.BT.MOUSECHECK` 的命中矩形覆盖四个按钮:
+        // 置灰按钮被跳过时相邻按钮的矩形接住 hover,显示成“不能点的按钮
+        // 却高亮了旁边的按钮”(2026-11-11 kotoneiro 实测)。
+        //
+        // 区域原点对 `COPY` 同样有效(局部复制都写到目标 `(0,0)`)。
+        let mut snap_origin = None;
+        if let (Some(size), CopyRegion::Partial { .. }) = (snap_size, region) {
+            // 0×0 源(资产装载失败时 VM 回填 0×0)没有可解析的区域:
+            // 官方层矩形保持 0;不能 clamp 到 `max=-1`(min>max 会 panic)。
+            if size.width > 0 && size.height > 0 {
+                let max_x = i64::from(size.width - 1);
+                let max_y = i64::from(size.height - 1);
+                let (x0, y0, x1, y1) = region.resolve(size.width, size.height);
+                let x0 = x0.clamp(0, max_x);
+                let y0 = y0.clamp(0, max_y);
+                let x1 = x1.clamp(x0, max_x);
+                let y1 = y1.clamp(y0, max_y);
+                let width = u32::try_from(x1 - x0 + 1).unwrap_or(0);
+                let height = u32::try_from(y1 - y0 + 1).unwrap_or(0);
+                if width > 0 && height > 0 {
+                    snap_origin = Some((x0, y0));
+                    snap_size = Some(SizeU32 { width, height });
+                }
+            }
+        }
         if let Some(size) = snap_size {
             self.snapshot_sizes.insert(copy_id, size);
+        }
+        if let Some(origin) = snap_origin {
+            self.snapshot_origins.insert(copy_id, origin);
         }
         if let Some(file) = snap_file {
             self.snapshot_files.insert(copy_id, file);
@@ -5105,6 +5176,7 @@ impl GfxState {
         // 合成),而这两张表只被命令处理体按 `TextureRef::Snapshot(id)` 查,
         // 该引用本身只在复制项存活期间存在 ⇒ 不需要当帧豁免。
         self.snapshot_sizes.retain(|id, _| live.contains(id));
+        self.snapshot_origins.retain(|id, _| live.contains(id));
         self.snapshot_files.retain(|id, _| live.contains(id));
     }
 

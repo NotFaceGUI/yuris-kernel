@@ -14153,3 +14153,69 @@ movie-clean(desktop wgpu,debug 模式,进主菜单):
 (`first-screen`/`until-visible` 的 actual hash `f67a4150…` 与本改动构建
 逐字相同);`save-load-loop`/`save-title-flow` 通过。属既有金标/
 `until-visible` 早停漂移,未擅自 `--update`。
+
+## 成果 BT-HOVER (2026-11-11) · 置灰按钮不再高亮相邻按钮:`CGINFO[SX/SY]` 改读 `COPY/COPY2` 切片矩形
+
+**问题**:kotoneiro(v494 商业包)正文底栏的 VOICE 在无声行置灰
+(`@BT.N=1`);鼠标移入置灰按钮时旁边的按钮出现 OVER 高亮,像还能点。
+官方同一位置不高亮。
+
+**取证与根因**:
+
+- ERIS 按钮把多状态合图切成 OFF/OVER/ON/NA 四块:
+  `CGINFO[ID="BT.OFF.TMP" SX=1 LET=@sx];@sx/=4` →
+  `CGACT[ID2=$off COPY2=1 X=0 X2=@sx-1]`(`es_Button.yst:2377-2682`),
+  随后 `CGINFO[ID=$off SX=1 LET=@BT.SX]`(`:2657`),
+  `es.BT.MOUSECHECK`(`:3447-3454`)用 `@BT.SX/SY` 做命中矩形。
+- 官方 `COPY2` 只复制图像,但目标**显示矩形** = 复制块尺寸(官方
+  `+0x78/+0x7c`,见下条 REA);本内核快照表面按 DIV-GFX-077 保持源
+  表面尺寸(`SIZE` 语义)。旧实现把源表面尺寸当成显示矩形:
+  kotoneiro 的 `btn_voice_bt4` 合图 264 宽(4×66),`CGINFO[SX]` 返回
+  264,每个按钮命中矩形覆盖四个按钮。置灰按钮被 `@BT.N` 门控跳过,
+  相邻按钮的超大矩形接住 hover ⇒ 高亮。
+- 官方证据(REA 0.495 `FUN_0042f809`,sha256 `4f5eefa3…138f`):`ID2`
+  分支在动作分派后**无条件**写
+  `target+0x78 = X2-X+1; target+0x7c = Y2-Y+1`(COPY/COPY2 的属性块
+  不覆盖尺寸字段);`CGINFO[SX/SY]` 读同一对字段。⇒ 官方按钮切片后
+  `CGINFO SX` = 切片宽 66,与 `es_Button.yst:2657` 的用法一致。
+- 临时探针(已删除)把光标停在置灰 VOICE `(655,812)`:
+  修复前 `BT.OVERES.GAMEMAIN.BTN.QLOAD` 可见;修复后无 OVER 层。
+  同探针下 QLOAD `(587,812)` / AUTO `(722,812)` 仍各自高亮。
+- 0.495 语料(`project-eris`)同型:置灰 VOICE `(350,585)` 修复后无
+  OVER;QLOAD `(200,585)` 命中自己。
+
+**改动**:
+
+- `yu-gfx/src/state.rs`:新增 `snapshot_origins`(复制区域在源纹理上的
+  原点);`COPY/COPY2` 局部区域把 `snapshot_sizes` 记为**区域尺寸**
+  (官方同一对字段对 COPY 也写区域尺寸,属性块不覆盖);
+  `query_onmouse` 显示尺寸优先取快照矩形,采样源资产时加回区域原点。
+- **不改 `LayerKind::Image.size`**:后端把层矩形当作整张表面缩放到该
+  尺寸;快照绘制仍按源表面尺寸(区域在 `(0,0)`,其余透明),像素不变。
+  官方同时把目标表面分配为区域尺寸;本内核按 DIV-GFX-077 保持源尺寸
+  快照,`CGINFO`/`ONMOUSE` 采样结果等价,`SIZE` 语义沿用已对官方截图
+  验证的源尺寸模型。
+- 回归:`yu-gfx/tests/info_query.rs`
+  `partial_copy2_reports_copied_block_size`(SX=66,不是 264)、
+  `partial_copy2_onmouse_samples_at_region_origin`(层内 (10,5) 采样源
+  资产 (76,5))、`partial_copy2_zero_source_size_keeps_zero_rect`
+  (0×0 源不 panic)。
+
+**验证(原始结果)**:
+
+```text
+cargo build --workspace --all-targets        → 0 error / 0 warning
+cargo test -p yu-gfx --test info_query        → 16 passed(含新增 3 条)
+cargo test -p yu-gfx                          → 全部 test result: ok
+
+hover 探针(kotoneiro,约 1500 帧进正文、置灰 VOICE 行):
+  置灰 VOICE (655,812) → visible=[]            ← 修复前 = BT.OVER...QLOAD
+  QLOAD     (587,812) → visible=[BT.OVER...QLOAD]
+  AUTO      (722,812) → visible=[BT.OVER...AUTO]
+
+yu-cli case <project-eris> --all:
+  save-load-loop PASS / save-title-flow PASS
+  first-screen / record-events-off / symptom-enter-story 等 FAIL,actual
+  hash 与 target/tmp/ours-cases2.log 基线逐字相同(f67a4150… / db0ae966…),
+  属既有金标漂移,本改动未引入差异
+```

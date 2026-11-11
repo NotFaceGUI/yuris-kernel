@@ -595,6 +595,200 @@ fn main_group_copy_snapshot_reports_viewport_size() {
     assert_eq!(info("SY"), Value::Int(i64::from(viewport.height)));
 }
 
+/// `COPY2` 局部切片:目标层矩形 = **复制块**尺寸,不是源合图尺寸。
+///
+/// ERIS 按钮把多状态合图切成 OFF/OVER/ON/NA 四块后,立刻用
+/// `CGINFO[ID=$off SX/SY]` 填 `@BT.SX/SY`(`es_Button.yst:2657`),
+/// `es.BT.MOUSECHECK` 再用它做命中矩形。返回合图宽会让命中矩形覆盖四个
+/// 按钮:置灰按钮被 `@BT.N` 跳过时,相邻按钮的矩形接住 hover,显示成
+/// “不能点的按钮却高亮了旁边的按钮”(2026-11-11 kotoneiro 实测)。
+#[test]
+fn partial_copy2_reports_copied_block_size() {
+    let table = table();
+    let mut gfx = state();
+    gfx.set_asset_size(
+        b"bt4",
+        yu_gfx::SizeU32 {
+            width: 264,
+            height: 18,
+        },
+    );
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BT.OFF.TMP")),
+                arg(&table, "CG", "FILE", s("bt4")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BT.OFF.VOICE")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BT.OFF.TMP")),
+                arg(&table, "CGACT", "ID2", s("BT.OFF.VOICE")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+                arg(&table, "CGACT", "X", i(66)),
+                arg(&table, "CGACT", "X2", i(131)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let info = |flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("BT.OFF.VOICE")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info("SX"), Value::Int(66), "按钮宽 = 切片宽,不是合图宽 264");
+    assert_eq!(info("SY"), Value::Int(18));
+}
+
+/// 0×0 源(资产装载失败时 VM 回填 0×0)+ 局部 `COPY2`:不能因区域 clamp
+/// 的 `min > max` panic;层矩形保持官方 0(没有可解析的区域)。
+#[test]
+fn partial_copy2_zero_source_size_keeps_zero_rect() {
+    let table = table();
+    let mut gfx = state();
+    gfx.set_asset_size(
+        b"missing",
+        yu_gfx::SizeU32 {
+            width: 0,
+            height: 0,
+        },
+    );
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BT.OFF.TMP")),
+                arg(&table, "CG", "FILE", s("missing")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BT.OFF.VOICE")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BT.OFF.TMP")),
+                arg(&table, "CGACT", "ID2", s("BT.OFF.VOICE")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+                arg(&table, "CGACT", "X", i(0)),
+                arg(&table, "CGACT", "X2", i(65)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let info = |flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("BT.OFF.VOICE")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info("SX"), Value::Int(0));
+    assert_eq!(info("SY"), Value::Int(0));
+}
+
+/// `CGINFO[ONMOUSE*]` 对局部 `COPY2` 快照:显示矩形 = 区域尺寸,像素采样
+/// 回落到源资产时要加回区域原点(复制块写在快照 `(0,0)`)。
+#[test]
+fn partial_copy2_onmouse_samples_at_region_origin() {
+    struct OriginProbe;
+    impl yu_gfx::TextureSampler for OriginProbe {
+        fn size(&mut self, _t: &yu_gfx::TextureRef) -> Option<yu_gfx::SizeU32> {
+            Some(yu_gfx::SizeU32 {
+                width: 264,
+                height: 18,
+            })
+        }
+        fn sample(&mut self, _t: &yu_gfx::TextureRef, x: i64, y: i64) -> Option<[u8; 4]> {
+            // 只有源合图第二块 (66..131) 的 (76,5) 是不透明。
+            Some([0, 0, 0, u8::from(x == 76 && y == 5) * 255])
+        }
+    }
+
+    let table = table();
+    let mut gfx = state();
+    gfx.set_asset_size(
+        b"bt4",
+        yu_gfx::SizeU32 {
+            width: 264,
+            height: 18,
+        },
+    );
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BT.OFF.TMP")),
+                arg(&table, "CG", "FILE", s("bt4")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BT.OVER.VOICE")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BT.OFF.TMP")),
+                arg(&table, "CGACT", "ID2", s("BT.OVER.VOICE")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+                arg(&table, "CGACT", "X", i(66)),
+                arg(&table, "CGACT", "X2", i(131)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    gfx.set_pointer(10, 5);
+    let mut sampler = OriginProbe;
+    let out = gfx
+        .query_info_with(
+            "CGINFO",
+            &[
+                arg(&table, "CGINFO", "ID", s("BT.OVER.VOICE")),
+                arg(&table, "CGINFO", "ONMOUSE2", i(1)),
+            ],
+            Some(&mut sampler),
+        )
+        .expect("CGINFO[ONMOUSE2]");
+    assert_eq!(out, Value::Int(255), "层内 (10,5) 应采样源资产 (66+10,5)");
+}
+
 /// 不存在的层:尺寸/像素探测按官方中性值返回,不再制造
 /// `gfx.info.missing` UNIMP(按钮 MASK/SLIDER 的可选层每帧探测会刷屏)。
 #[test]
