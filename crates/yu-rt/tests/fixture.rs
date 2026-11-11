@@ -614,6 +614,14 @@ fn movie_state_machine_and_info_queries() {
     b.labels = vec![("SYSTEM_START", 0, 0, 0)];
     b.entry(0, 0);
     b.scripts = vec![vec![
+        // MOVIEINFO[CODEC="pac/op_movie.mpg" LET=@a]
+        // 回归(B14):`es_MoviePlay.yst` 在 `MOVIE[FILE]` **之前**用 CODEC
+        // 预检参数文件;官方 `0x44bac9` 探测的是 CODEC 参数本身,不是当前
+        // 已打开影片。旧实现读 `movie.file`(此时为空)恒得 0,宏路径随即
+        // `IFBREAK` 放弃播放。
+        GroupSpec::new(op_info)
+            .window(6, ex::s("pac/op_movie.mpg"))
+            .window(7, ex::r#ref(0x40, sys)),
         // MOVIE[FILE="pac/op_movie.mpg" PLAY=1 X=10 SY=120 VOLUME=128]
         GroupSpec::new(op_movie)
             .window(0, ex::s("pac/op_movie.mpg"))
@@ -621,10 +629,6 @@ fn movie_state_machine_and_info_queries() {
             .window(2, ex::i8_(10))
             .window(5, ex::i8_(120))
             .window(6, ex::i16_(128)),
-        // MOVIEINFO[CODEC=1 LET=@a]
-        GroupSpec::new(op_info)
-            .window(6, ex::i8_(1))
-            .window(7, ex::r#ref(0x40, sys)),
         // MOVIEINFO[X=1 LET=@b]
         GroupSpec::new(op_info)
             .window(1, ex::i8_(1))

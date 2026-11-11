@@ -3921,7 +3921,9 @@ impl Vm {
 
     /// 探测影片容器的编解码(官方 `MOVIEINFO[CODEC]` 的同一判定)。
     fn probe_movie_codec(&mut self, file: &[u8]) -> yu_format::movie::MovieCodec {
-        match self.open_asset(file) {
+        // 只读文件头(`PROBE_BYTES` 字节):CODEC 判定不需要整部影片。
+        // 旧实现走 `open_asset` 整读,预检大影片时会白占一份内存。
+        match self.open_asset_prefix(file, yu_format::movie::PROBE_BYTES) {
             Some(bytes) => {
                 let head = &bytes[..bytes.len().min(yu_format::movie::PROBE_BYTES)];
                 yu_format::movie::probe_codec(head)
@@ -3933,14 +3935,25 @@ impl Vm {
     /// `MOVIEINFO[PLAY, X, Y, SX, SY, VOLUME, CODEC, LET]`(REA `0x44ba2c`)。
     ///
     /// 官方七字段是**顺序 `if` + 各自写 `LET` + `ret`**(`0x44ba60..0x44bbde`):
-    /// 多字段同时置位时**槽号最小的字段生效**;一个字段都没给时直接返回,
-    /// 不写 `LET`。`CODEC` 是文件头探测(`0x44bac9..0x44bcfc`,见
-    /// [`yu_format::movie`]),其余字段读内核/宿主的影片状态。
+    /// 多字段同时给出时**槽号最小的字段生效**;一个字段都没给时直接返回,
+    /// 不写 `LET`。判定看的是参数**存在标志**(`0x684160..0x684166` 逐字节
+    /// `test/jne`),不是参数值是否非零——`PLAY=0` 同样应写回 0。
+    ///
+    /// `CODEC` 分支(`0x44bac9..0x44bcfc`)把 `CODEC` **参数本身**当作待探测
+    /// 文件名:官方先拷 CWD/工程基路径 `0x681300`,再把该参数字符串追加到
+    /// 尾部后 `fopen`;文件不存在写 0,MPEG-1 写 1,MPEG-2 写 2,其它写 255。
+    /// 因此它**不能**读 `MOVIE[FILE]` 的当前文件名——ERIS `es_MoviePlay.yst`
+    /// 正是在 `MOVIE[FILE]` 之前用 `MOVIEINFO[CODEC=$FN]` 做存在性/编码
+    /// 预检,旧实现读当前文件名(此时为空)恒得 0,宏路径随即
+    /// `IF[@codeccheck==0] IFBREAK[LV=3]` 放弃播放。内核的 VFS 根就是官方
+    /// 的基路径,直接探测参数即可。
     fn op_movieinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         let params = self.command_params(cmd);
         let mut targets: Vec<crate::expr::LValue> = Vec::new();
         let mut event_args: Vec<ArgValue> = Vec::new();
         let mut flags: Vec<&str> = Vec::new();
+        // `CODEC` 的参数值 = 待探测文件名(不是当前影片)。
+        let mut codec_file: Option<Vec<u8>> = None;
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
@@ -3958,11 +3971,14 @@ impl Vm {
                 targets.push(lv);
                 continue;
             }
+            // 官方按「参数存在」选择字段(`0x684160..0x684166` 的存在标志),
+            // 不看数值是否为 0。
+            flags.push(pname);
             if let Ok(v) = self.eval_window(st, w) {
-                if matches!(&v, Value::Int(n) if *n != 0)
-                    || matches!(&v, Value::Float(f) if *f != 0.0)
-                {
-                    flags.push(pname);
+                if pname == "CODEC" {
+                    if let Value::Str(bytes) = &v {
+                        codec_file = Some(bytes.clone());
+                    }
                 }
                 event_args.push(ArgValue::new(w.rec.kind, v));
             }
@@ -3976,7 +3992,7 @@ impl Vm {
             ));
             return Ok(StepOutcome::Continue);
         }
-        // 官方判定顺序 = 槽号顺序;取第一个置位字段。
+        // 官方判定顺序 = 槽号顺序;取第一个给出的字段。
         let flag = ["PLAY", "X", "Y", "SX", "SY", "VOLUME", "CODEC"]
             .into_iter()
             .find(|name| flags.contains(name));
@@ -3993,7 +4009,7 @@ impl Vm {
             "VOLUME" => Value::Int(self.movie.volume),
             _ => {
                 // `CODEC`:文件不存在 = 0,MPEG-1 = 1,MPEG-2 = 2,其它 = 255。
-                let code = match self.movie.file.clone() {
+                let code = match codec_file {
                     Some(file) => self.probe_movie_codec(&file).official_code(),
                     None => 0,
                 };
