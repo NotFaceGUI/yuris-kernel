@@ -13,7 +13,7 @@
 mod support;
 
 use support::{arg, call, frame_end, frame_start, i, s, state, table};
-use yu_gfx::{MovieInfo, TextureRef};
+use yu_gfx::{MovieInfo, Op, PassTarget, TextureRef};
 use yu_rt::event::Domain;
 use yu_rt::value::Value;
 
@@ -373,4 +373,76 @@ fn movie_overlay_replaces_all_layers() {
 
     gfx.set_movie_overlay(None);
     assert!(gfx.frame().layers.iter().any(|l| l.id.display() == ":/W0/BG"));
+}
+
+/// 影片模式帧不投影脚本图层/COPY pass,后端会按该帧回收按钮快照;
+/// `baked_copies` 若继续把 COPY 当「已冻结」而跳过重发,`MOVIEEND` 后
+/// 底部按钮条/UI 快照就永久只剩黑底。回归:退出影片模式必须重发 COPY。
+#[test]
+fn movie_overlay_exit_replays_baked_copy_snapshots() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SRC")),
+                arg(&table, "CG", "FILE", s("src")),
+                arg(&table, "CG", "Z", i(1)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "Z", i(2)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "ID2", s("DST")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let has_copy = |f: &yu_gfx::CompositorFrame| {
+        f.passes.iter().any(|p| {
+            matches!(&p.target, PassTarget::Texture(id) if id.display() == ":/W0/DST")
+                && p.ops.iter().any(|op| matches!(op, Op::Copy(_)))
+        })
+    };
+    assert!(has_copy(&gfx.frame()), "初始帧应发射 COPY");
+    // 模拟后端成功执行(引擎 tick 末 `commit_baked`),COPY 进入冻结集。
+    gfx.commit_baked(&[]);
+
+    gfx.set_movie_overlay(Some(yu_gfx::MovieOverlay {
+        asset: b":movie/current".to_vec(),
+        rect: yu_gfx::RectI {
+            x: 0,
+            y: 0,
+            width: 400,
+            height: 300,
+        },
+    }));
+    assert!(!has_copy(&gfx.frame()), "影片帧不投影 COPY pass");
+
+    gfx.set_movie_overlay(None);
+    let f = gfx.frame();
+    assert!(
+        has_copy(&f),
+        "MOVIEEND 后必须重发 COPY,否则后端已回收的快照不会重建"
+    );
+    assert!(
+        f.layers.iter().any(|l| l.id.display() == ":/W0/DST"
+            && matches!(l.texture, TextureRef::Snapshot(_))),
+        "目标层仍引用快照"
+    );
 }

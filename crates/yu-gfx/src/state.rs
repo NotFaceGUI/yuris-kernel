@@ -524,7 +524,19 @@ impl GfxState {
         if self.movie_overlay == overlay {
             return;
         }
+        // 离开影片模式时丢弃「COPY 已冻结」标记。
+        //
+        // 影片帧(`movie_only_frame`)只投影清屏 + 影片层,不带任何脚本图层/
+        // COPY pass;后端 `prune_snapshots` 按该帧把按钮/UI 的快照纹理全部
+        // 回收。`baked_copies` 若仍认为这些 COPY 已烘焙,`frame()` 会继续
+        // 跳过重发,`MOVIEEND` 后底部按钮条(BT.OFF.../TIP.MESW.TX 等)就
+        // 永久只剩黑底。清掉标记让下一帧按 `copy_log` 重发一次,后端用
+        // `source_texture` 重建快照(一次性,不进逐帧热路径)。
+        let leaving_movie = self.movie_overlay.is_some() && overlay.is_none();
         self.movie_overlay = overlay;
+        if leaving_movie {
+            self.baked_copies.borrow_mut().clear();
+        }
         self.invalidate_frame();
     }
 
