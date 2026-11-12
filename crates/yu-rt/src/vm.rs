@@ -404,6 +404,40 @@ pub struct Cmd {
     /// 每次调用克隆整张表:`VARACT` 在启动帧被调用 2.8 万次、每次约 14 个
     /// `String` 分配)。空 = 工程表里没有该命令(与旧 `unwrap_or_default` 同口径)。
     pub param_names: Rc<[String]>,
+    /// `VARACT` 站点的参数名计划(`fill_cmd` 按站点算一次;执行期零名字扫描)。
+    ///
+    /// 非 `VARACT` 恒 `None`。参数名来自工程 ysc 表,启动后不变 ⇒ 站点级
+    /// 静态事实可缓存。
+    pub varact_plan: Option<VaractPlan>,
+}
+
+/// `VARACT` 的参数名计划(按 ysc 参数名解析一次;槽号在版本间会位移,
+/// 因此解析结果按**名字**缓存,不写死槽号)。
+#[derive(Clone, Debug, Default)]
+pub struct VaractPlan {
+    pub type_slot: Option<u8>,
+    pub init_slot: Option<u8>,
+    pub dimsize_slot: Option<u8>,
+    /// `DIMSIZE` 窗口的复合赋值码(窗口 `slot` 高字节;静态)。
+    pub dimsize_code: u8,
+    pub push_slot: Option<u8>,
+    pub pop_slot: Option<u8>,
+    pub copy_slot: Option<u8>,
+    pub cut_slot: Option<u8>,
+    /// `COPY/CUT` 的 `POS` / `LENGTH` 辅助槽。
+    pub pos_slot: Option<u8>,
+    pub length_slot: Option<u8>,
+    pub upper_slot: Option<u8>,
+    pub upper2_slot: Option<u8>,
+    pub lower_slot: Option<u8>,
+    pub lower2_slot: Option<u8>,
+    pub hantozen_slot: Option<u8>,
+    pub zentohan_slot: Option<u8>,
+    /// `G_INT/G_FLT/G_STR` 族:槽号 → 掩码位(类型族 0/1/2, 位号 0..3)。
+    ///
+    /// 所有 `G_*` 前缀的名字都在表里(在场判定用);只有后缀编号可解析且
+    /// `<4` 的项带掩码位(`None` = 只用于在场的 `G_*` 名)。
+    pub g_slots: Vec<(u8, Option<(u8, u8)>)>,
 }
 
 /// 一个窗口 + 其载荷。
@@ -419,6 +453,11 @@ pub struct CmdWindow {
     pub lvalue_plan: Option<crate::expr::LValuePlan>,
     /// 简单值表达式预编译(IF 条件 / LET 右值等;`None` = 走通用栈机)。
     pub simple: Option<crate::expr::SimpleExpr>,
+    /// 静态判定:该窗口**求值必失败**(解码失败或含未实现 opcode)。
+    ///
+    /// 只用于 `eval_arg_windows` 的事件参数省略路径(那里本来就把 `Err`
+    /// 当「不产生 arg」丢弃);处理器直接求值窗口时仍走原错误路径,诊断不变。
+    pub eval_fails: bool,
 }
 
 impl CmdWindow {
@@ -489,6 +528,8 @@ pub struct Vm {
     /// 摘/插哈希表是纯开销(`IFEND` 的 ~30ns 固定成本主要就是它)。
     /// 换任务/任务结束时由 `flush_exec_slot` 还回 `exec`。
     exec_slot: Option<(String, Box<ExecState>)>,
+    /// `exec_slot` 对应任务的创建序号(按 u64 比较,替代逐命令的 ID 字符串比较)。
+    exec_slot_seq: u64,
     input: InputState,
     binding: InputBinding,
     /// 图形域同步宿主(可选;安装后负责 INFO 查询与状态同步)。
@@ -521,6 +562,8 @@ pub struct Vm {
     fps: u32,
     skip: bool,
     sys_count: u16,
+    /// `@_TEXT_NUM` 的 boot 期求和结果(`yst_list` 启动后不变)。
+    text_total: i64,
     screen: (u32, u32),
     debug_mode: bool,
     argv: Vec<Vec<u8>>,
@@ -537,6 +580,9 @@ pub struct Vm {
     record_events: bool,
     /// opcode → 处理器类别表(启动期按工程 yscm 名字解析)。
     handler_of: Vec<crate::vm::handlers::HandlerKind>,
+    /// `(opcode, 参数槽)` → (1 基编号, 目标类型):启动期从工程 ysc 表解析一次。
+    /// `GOSUB`/`RETURN` 的参数计划直接查表,不再每次扫参数名字符串。
+    param_plans: Vec<Vec<(usize, crate::expr::ParamTy)>>,
     /// 命令视图缓存:键 = `(script_id, pc)`。脚本装载后命令字节不变,
     /// 每条命令的窗口载荷只在首次执行时复制一次(Tyn 同思路优化)。
     /// 命令视图缓存:按脚本号 → pc 直接下标(脚本号/pc 都是稠密的)。
@@ -725,6 +771,7 @@ impl Vm {
     ) -> Result<Self, Diag> {
         let mut tables = TableSet::load_from(src.as_ref(), aux.as_deref(), cfg.script_key)?;
         let handler_of = crate::vm::handlers::build_handler_table(&tables.boot.yscm);
+        let param_plans = build_param_plans(&tables.boot.yscm);
 
         // 入口标签(引擎 `FUN_00451e90` 按名字查 ysl;strcmp 字节级)。
         //
@@ -770,6 +817,19 @@ impl Vm {
         let sys_count = tables.boot.sysvars.len() as u16;
         let screen = (tables.boot.config.width, tables.boot.config.height);
         let binding = InputBinding::from_sysvars(&tables.boot.sysvars);
+        // `@_TEXT_NUM`:工程文本总数在 boot 时求和一次(`yst_list` 启动后不变)。
+        // 缺产物的脚本用 `u32::MAX` 哨兵(DIV-RT-016):不计入总数。
+        let text_total: i64 = {
+            let total: u64 = tables
+                .boot
+                .scripts
+                .entries
+                .iter()
+                .map(|e| u64::from(e.text_count))
+                .filter(|n| *n != u64::from(u32::MAX))
+                .sum();
+            total.min(i64::MAX as u64) as i64
+        };
         // 逐命令命中计数按工程 yscm 的命令数开表(下标 = opcode)。
         let command_hits = vec![0u64; handler_of.len()];
         let handler_len = command_hits.len();
@@ -783,6 +843,7 @@ impl Vm {
             store: VariableStore::new(),
             exec: rustc_hash::FxHashMap::default(),
             exec_slot: None,
+            exec_slot_seq: u64::MAX,
             input: InputState::new(),
             binding,
             graphics_host: None,
@@ -802,6 +863,7 @@ impl Vm {
             fps: cfg.fps,
             skip: false,
             sys_count,
+            text_total,
             screen,
             debug_mode: cfg.debug_mode,
             argv: cfg.argv,
@@ -815,6 +877,7 @@ impl Vm {
             rng: crate::rng::Mt19937::new(cfg.rng_seed),
             record_events: cfg.record_events,
             handler_of,
+            param_plans,
             cmd_cache: Vec::new(),
             eval_scratch: Vec::new(),
             decode_cache: rustc_hash::FxHashMap::default(),
@@ -1270,6 +1333,7 @@ impl Vm {
         if let Some((id, st)) = self.exec_slot.take() {
             self.exec.insert(id, st);
         }
+        self.exec_slot_seq = u64::MAX;
     }
 
     /// 输入状态的可变借用(写入输入系统变量)。
@@ -1321,17 +1385,8 @@ impl Vm {
     /// **396**(见 DIV-RT-048)。两者若在其它工程分歧,以引擎口径为准的
     /// `yst.ybn` 头部尚未接入,按已知偏差记录。
     pub fn text_total(&self) -> i64 {
-        // 缺产物的脚本用 `u32::MAX` 哨兵(DIV-RT-016):不计入总数。
-        let total: u64 = self
-            .tables
-            .boot
-            .scripts
-            .entries
-            .iter()
-            .map(|e| u64::from(e.text_count))
-            .filter(|n| *n != u64::from(u32::MAX))
-            .sum();
-        total.min(i64::MAX as u64) as i64
+        // boot 时已求和(缺产物脚本的 `u32::MAX` 哨兵已剔除)。
+        self.text_total
     }
 
     pub fn engine_version(&self) -> u32 {
@@ -1404,9 +1459,27 @@ impl Vm {
         self.text.flags.clone()
     }
 
+    /// `$_TEXT` 的**借用**读取(只读消费者;`Value` 口径仍走 [`Self::current_text`])。
+    pub fn text_bytes(&self) -> &[u8] {
+        &self.text.bytes
+    }
+
+    /// `$_TEXT_FLAG` 的借用读取(只读消费者)。
+    pub fn text_flags_ref(&self) -> &[u8] {
+        &self.text.flags
+    }
+
     /// 文本层状态快照(宿主/gfx 桥读取;加法式 API,不改事件字段)。
     pub fn text_state(&self) -> crate::text::TextSnapshot {
         crate::text::TextSnapshot::from(&self.text)
+    }
+
+    /// 当前文本输出模式(引擎 `[state+0x1c]`):1 = 自动,其余 = 手动。
+    ///
+    /// 宿主先读它再决定是否需要 [`Self::text_state`] 的完整快照(手动
+    /// 模式只走 `clear_text()`,快照的三个 Vec 克隆完全用不到,#4)。
+    pub fn text_output_mode(&self) -> u8 {
+        self.text.output_mode
     }
 
     /// 宿主渲染器推进文本光标后推入(`TEXTINFO[CX/CY]` 的数据源)。
@@ -1897,6 +1970,36 @@ impl Vm {
         });
     }
 
+    /// 域事件的借用形态入口(#39):`record_events=false` 且 Graphics/Window
+    /// 域事件只被同步图形宿主消费时,直接走
+    /// [`GraphicsHost::apply_domain`],连命令名与事件结构都不再构造。
+    ///
+    /// 丢弃条件与 [`Vm::emit`] 完全一致(`!record_events && consumed_by_host`
+    /// 且域是 Graphics/Window);其余情形仍走 [`Vm::emit_domain`] 的入队路径。
+    pub(crate) fn emit_domain_borrowed(
+        &mut self,
+        domain: crate::event::Domain,
+        name: &str,
+        args: Vec<crate::event::ArgValue>,
+    ) {
+        if !self.record_events
+            && matches!(
+                domain,
+                crate::event::Domain::Graphics | crate::event::Domain::Window
+            )
+            && self.graphics_host.is_some()
+        {
+            let frame = self.frame;
+            let script = Some(self.cur_script);
+            let pc = Some(self.cur_pc);
+            if let Some(host) = self.graphics_host.as_mut() {
+                host.apply_domain(domain, name, &args, frame, script, pc);
+            }
+            return;
+        }
+        self.emit_domain(domain, name, args);
+    }
+
     /// 控制流事件(`Jump`):只在事件流开启时入队。
     ///
     /// `record_events=false` 时引擎只统计事件条数,不读取 `Jump`;而场景
@@ -2037,18 +2140,28 @@ impl Vm {
     }
 
     /// 未实现命令挂号(每个命令名只进事件流一次,计数全部)。
-    pub(crate) fn report_unimplemented(&mut self, name: &str, detail: String) {
-        *self.unimplemented_cmds.entry(name.to_string()).or_insert(0) += 1;
-        if self.unimplemented_reported.insert(name.to_string()) {
-            self.report(diag::cmd_unimplemented(name, detail));
+    ///
+    /// #79:计数先 `get_mut`、miss 才 insert;只报一次用 `contains(&str)`
+    /// 判断;`detail` 是借用文案,首次上报时才拼进 `Diag`。
+    pub(crate) fn report_unimplemented(&mut self, name: &str, detail: &str) {
+        match self.unimplemented_cmds.get_mut(name) {
+            Some(hit) => *hit += 1,
+            None => {
+                self.unimplemented_cmds.insert(name.to_string(), 1);
+            }
+        }
+        if !self.unimplemented_reported.contains(name) {
+            self.unimplemented_reported.insert(name.to_string());
+            self.report(diag::cmd_unimplemented(name, detail.to_string()));
         }
     }
 
     /// aligned-stub 命令(MIDI 族 `0x44aa40/60/80`、CDDA `0x429fb0`):
     /// 官方 0.495 处理体是空桩,内核同型对齐 —— **不计挂号表**(它不是
     /// 未实现),只以 Info 诊断标注归属,每个命令名只报一次(事件流不刷屏)。
-    pub(crate) fn report_aligned_stub(&mut self, name: &str, detail: String) {
-        if self.aligned_stub_reported.insert(name.to_string()) {
+    pub(crate) fn report_aligned_stub(&mut self, name: &str, detail: &str) {
+        if !self.aligned_stub_reported.contains(name) {
+            self.aligned_stub_reported.insert(name.to_string());
             self.report(diag::info(
                 code::rt::CMD_ALIGNED_STUB,
                 Boundary::Script,
@@ -2061,7 +2174,12 @@ impl Vm {
     /// 这类诊断在 `step_command` 的错误路径里发出,不经过
     /// [`Vm::report_unimplemented`],所以单独记账。
     pub(crate) fn note_unimplemented(&mut self, name: &str) {
-        *self.unimplemented_cmds.entry(name.to_string()).or_insert(0) += 1;
+        match self.unimplemented_cmds.get_mut(name) {
+            Some(hit) => *hit += 1,
+            None => {
+                self.unimplemented_cmds.insert(name.to_string(), 1);
+            }
+        }
     }
 
     // ---------------------------------------------------------- 脚本/求值
@@ -2135,6 +2253,12 @@ impl Vm {
             let const_value = instrs.as_deref().and_then(crate::expr::const_value_instrs);
             let lvalue_plan = instrs.as_deref().and_then(crate::expr::lvalue_plan);
             let simple = instrs.as_deref().and_then(crate::expr::simple_expr);
+            // 解码失败,或含「执行到必然 Err」的指令 ⇒ 事件参数求值可直接跳过
+            // (该窗口在 `eval_arg_windows` 里本来就只会被丢弃)。
+            let eval_fails = match &instrs {
+                None => !payload.is_empty(),
+                Some(instrs) => !instrs.iter().all(crate::expr::instr_supported),
+            };
             cmd.windows.push(CmdWindow {
                 rec: *rec,
                 payload: payload.to_vec(),
@@ -2142,12 +2266,16 @@ impl Vm {
                 const_value,
                 lvalue_plan,
                 simple,
+                eval_fails,
             });
         }
         cmd.opcode = group.opcode;
         cmd.name.clear();
         cmd.name.push_str(name);
         cmd.pc = st.pc;
+        // `VARACT` 的参数名计划:站点级静态事实,执行期不再逐次扫描参数名。
+        cmd.varact_plan = (name == "VARACT")
+            .then(|| handlers::build_varact_plan(&cmd.param_names, &cmd.windows));
         Ok(())
     }
 
@@ -2279,6 +2407,21 @@ impl Vm {
         r
     }
 
+    /// 只读消费者的求值入口:常量窗口直接借用 `fill_cmd` 的折叠值,不再克隆。
+    ///
+    /// 语义与 [`Vm::eval_window`] 完全一致(常量/简单表达式/通用栈机同一条
+    /// 路径);只有常量命中时省掉一次 `Value` 克隆(字符串即整段字节复制)。
+    pub(crate) fn eval_window_ref<'a>(
+        &mut self,
+        st: &ExecState,
+        w: &'a CmdWindow,
+    ) -> Result<std::borrow::Cow<'a, Value>, Diag> {
+        if let Some(value) = &w.const_value {
+            return Ok(std::borrow::Cow::Borrowed(value));
+        }
+        Ok(std::borrow::Cow::Owned(self.eval_window(st, w)?))
+    }
+
     /// 已填充命令窗口的左值解析(预解码命中路径)。
     pub(crate) fn eval_lvalue_window(
         &mut self,
@@ -2313,23 +2456,14 @@ impl Vm {
     /// 旧路径每次 `GOSUB`/`RETURN` 都 `param_name` 克隆一个 `String`,
     /// 再用 `param_index_of` 把名字尾部数字做两次 `String` 收集 + `parse`;
     /// 参数名来自工程 ysc 表(启动后不变),这些分配纯属浪费。
+    /// 现改为启动期建好的 `param_plans` 表直查(`GOSUB` 是最高频命令)。
     pub(crate) fn param_plan(&self, opcode: u8, slot: u8) -> (usize, crate::expr::ParamTy) {
-        let Some(decl) = self.tables.boot.yscm.param(opcode, slot) else {
-            // 与旧路径一致:缺声明 ⇒ 空名 ⇒ 编号 1、类型不转换。
-            return (1, crate::expr::ParamTy::Raw);
-        };
-        let name = decl.name.as_str();
-        let n = param_index_bytes(name.as_bytes());
-        let ty = if name.starts_with("PFLT") || name.starts_with("RFLT") {
-            crate::expr::ParamTy::Float
-        } else if name.starts_with("PSTR") || name.starts_with("RSTR") {
-            crate::expr::ParamTy::Str
-        } else if name.starts_with("PINT") || name.starts_with("RINT") {
-            crate::expr::ParamTy::Int
-        } else {
-            crate::expr::ParamTy::Raw
-        };
-        (n, ty)
+        self.param_plans
+            .get(usize::from(opcode))
+            .and_then(|plan| plan.get(usize::from(slot)))
+            .copied()
+            // 缺省: 与旧路径一致,缺声明 ⇒ 空名 ⇒ 编号 1、类型不转换。
+            .unwrap_or((1, crate::expr::ParamTy::Raw))
     }
 
     /// 参数声明名(工程 ysc;`None` = 该序号未声明)。诊断路径用。
@@ -2541,6 +2675,19 @@ impl Vm {
         self.tables.boot.labels.get_bytes(name).cloned()
     }
 
+    /// 标签按名解析为**无堆分配的跳转目标**(`LabelTarget` 是 `Copy`)。
+    ///
+    /// `GOSUB`/`GO`/`LABELINFO EXIST` 只需脚本号/pc/base_a;旧路径
+    /// `find_label` 会把 `Label` 的两个堆字符串各克隆一次。
+    pub(crate) fn find_label_target(&self, name: &[u8]) -> Option<LabelTarget> {
+        let label = self.tables.boot.labels.get_bytes(name)?;
+        Some(LabelTarget {
+            script_id: u32::from(label.script_id),
+            pc: label.pc,
+            base_a: label.base_a,
+        })
+    }
+
     pub(crate) fn record_command(
         &mut self,
         st: &ExecState,
@@ -2655,13 +2802,15 @@ impl TaskExecutor for Vm {
 
     fn step_command(&mut self, task: &mut TaskNode) -> Result<StepOutcome, String> {
         // 同一任务连续推进时执行位留在 `exec_slot`;首次/换任务才查表。
-        let cached = matches!(&self.exec_slot, Some((id, _)) if id == &task.id);
+        // 按调度器创建序号(`u64`)比较,不再逐命令比较 ID 字符串(#47)。
+        let cached = self.exec_slot.is_some() && self.exec_slot_seq == task.seq;
         if !cached {
             self.flush_exec_slot();
             let Some((id, st)) = self.exec.remove_entry(&task.id) else {
                 return Ok(StepOutcome::Finish);
             };
             self.exec_slot = Some((id, st));
+            self.exec_slot_seq = task.seq;
         }
         // 执行位必须临时移出 `self`,才能同时借 `&mut self` 跑脚本。
         // 装箱后这次移动只有指针 + 键,不再是 700B 整块。
@@ -2738,6 +2887,7 @@ impl TaskExecutor for Vm {
         let cached_hit = matches!(&self.exec_slot, Some((slot_id, _)) if slot_id == id);
         if cached_hit {
             self.exec_slot = None;
+            self.exec_slot_seq = u64::MAX;
         }
         if cached_hit || self.exec.remove(id).is_some() {
             self.emit(VmEvent::TaskFinish {
@@ -2787,9 +2937,9 @@ impl TaskExecutor for Vm {
         self.dialogs.iter().any(|d| d.task == task)
     }
 
-    fn sync_task_view(&mut self, view: &[TaskView]) {
-        self.task_view.clear();
-        self.task_view.extend_from_slice(view);
+    fn sync_task_view(&mut self, view: Vec<TaskView>) {
+        // 调度器产出的投影直接接管(旧实现 clear + extend_from_slice 再复制一遍)。
+        self.task_view = view;
     }
 }
 
@@ -2873,8 +3023,7 @@ impl Vm {
 /// 参数名尾部编号(字节版;`PINT2` → 2、`PINT` → 1)。
 ///
 /// 与 `handlers::param_index_of` 严格同口径:无数字尾 ⇒ 1;`parse` 溢出 ⇒ 1。
-fn param_index_bytes(name: &[u8]) -> usize {
-    let mut end = name.len();
+fn param_index_bytes(name: &[u8]) -> usize {    let mut end = name.len();
     while end > 0 && name[end - 1].is_ascii_digit() {
         end -= 1;
     }
@@ -2889,6 +3038,39 @@ fn param_index_bytes(name: &[u8]) -> usize {
         }
     }
     n as usize // silent-ok:上面已拒绝溢出(与 `param_index_of` 的 `parse` 失败同口径)
+}
+
+/// 按工程 ysc 表构建 `(opcode, 参数槽) → (编号, 类型)` 计划表(启动期一次)。
+fn build_param_plans(
+    yscm: &crate::tables::YscmTable,
+) -> Vec<Vec<(usize, crate::expr::ParamTy)>> {
+    (0..yscm.len())
+        .map(|index| {
+            let Ok(opcode) = u8::try_from(index) else {
+                return Vec::new();
+            };
+            let Some(decl) = yscm.command(opcode) else {
+                return Vec::new();
+            };
+            decl.params
+                .iter()
+                .map(|param| {
+                    let name = param.name.as_str();
+                    let n = param_index_bytes(name.as_bytes());
+                    let ty = if name.starts_with("PFLT") || name.starts_with("RFLT") {
+                        crate::expr::ParamTy::Float
+                    } else if name.starts_with("PSTR") || name.starts_with("RSTR") {
+                        crate::expr::ParamTy::Str
+                    } else if name.starts_with("PINT") || name.starts_with("RINT") {
+                        crate::expr::ParamTy::Int
+                    } else {
+                        crate::expr::ParamTy::Raw
+                    };
+                    (n, ty)
+                })
+                .collect()
+        })
+        .collect()
 }
 
 #[cfg(test)]

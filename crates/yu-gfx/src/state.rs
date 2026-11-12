@@ -21,7 +21,8 @@
 //! 对单条命令失败采用 `Recoverable` 诊断 + 跳过该命令,不终止整帧;依赖
 //! 未取证语义的图层用 `LayerStatus::Unimplemented` 标记,由后端跳过。
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 use std::hash::{Hash, Hasher};
@@ -60,8 +61,6 @@ struct OwnedArg {
     name: Option<std::rc::Rc<str>>,
     slot: u8,
     value: Value,
-    /// YSCM 参数种类 2(`NumericOffset`)。只表示数据编码,不改变算术语义。
-    offset: bool,
 }
 
 /// 图形域配置(视口/清屏/过滤/扩展名顺序/主窗口图层组)。
@@ -123,9 +122,13 @@ impl GfxConfig {
 /// 超限时丢弃最旧项并计数,避免内存无界(行为在诊断里显式可见)。
 const MAX_OP_LOG: usize = 16_384;
 struct Node {
-    layer: Layer,
+    /// 层属性。`Arc` 共享 + 写时复制:帧投影只持引用,只有真正被命令
+    /// 改写的层发生一次 `Layer` 复制(`Arc::make_mut`)。
+    layer: Arc<Layer>,
     parent: Option<LayerId>,
-    children: BTreeSet<LayerId>,
+    /// 子层集合。只做 membership/遍历;发射前统一走 `sorted_children`
+    /// 的 `(z, seq, id)` 排序,所以无需有序容器。
+    children: rustc_hash::FxHashSet<LayerId>,
 }
 
 /// 一个图层的持久 `CGACT[TEXT]` 绘制项(DIV-GFX-058)。
@@ -136,7 +139,10 @@ struct Node {
 #[derive(Clone, Debug, Default)]
 struct LayerTexts {
     draws: Vec<TextDraw>,
-    seen: HashSet<TextDrawKey>,
+    /// 去重集合:64-bit 无分配指纹 → 桶内精确键(#21)。
+    /// 桶内仍用 [`TextDrawKey::matches_draw`] 逐字段确认;哈希碰撞只会
+    /// 让这一条走完整键比较,不影响去重结果。
+    seen: rustc_hash::FxHashMap<u64, Vec<TextDrawKey>>,
     dropped: u64,
     /// 文本内容修订号:每次**实际**改动 `draws`(新绘制项/上限丢弃/交换)
     /// 递增。后端据此缓存「基图 + 文本」合成结果,内容不变不重合成
@@ -148,15 +154,33 @@ impl LayerTexts {
     /// 追加一条绘制项;重复项按 [`TextDraw::dedup_key`] 丢弃。
     /// 超限时丢最旧一条并把 `dropped` 加一(诊断由调用方汇总)。
     fn push(&mut self, draw: TextDraw) -> bool {
-        let key = draw.dedup_key();
-        if !self.seen.insert(key) {
+        // 先算无分配指纹分桶:绝大多数重复命令在这里就返回,不再构造
+        // `TextDrawKey`(bytes/style/image 克隆)。
+        let fp = draw.fingerprint();
+        if self
+            .seen
+            .get(&fp)
+            .is_some_and(|bucket| bucket.iter().any(|key| key.matches_draw(&draw)))
+        {
             return false;
         }
         if self.draws.len() >= MAX_TEXT_DRAWS_PER_LAYER {
             let oldest = self.draws.remove(0);
-            self.seen.remove(&oldest.dedup_key());
+            let ofp = oldest.fingerprint();
+            if let Some(bucket) = self.seen.get_mut(&ofp) {
+                if let Some(pos) = bucket.iter().position(|key| key.matches_draw(&oldest)) {
+                    bucket.remove(pos);
+                }
+                if bucket.is_empty() {
+                    self.seen.remove(&ofp);
+                }
+            }
             self.dropped += 1;
         }
+        self.seen
+            .entry(fp)
+            .or_default()
+            .push(draw.dedup_key());
         self.draws.push(draw);
         true
     }
@@ -229,6 +253,11 @@ pub struct GfxState {
     /// (DIV-GFX-055 预登记的演进)。清除只发生在层像素被重写时:
     /// `CGEND`/`CG(FILE)`/`CGACT[COPY]` 目标/Executable 图像加工/`SWAP`。
     text_draws: BTreeMap<LayerId, LayerTexts>,
+    /// `text_draws` 投影修订号:任何增删改(去重命中除外)+1(#3)。
+    text_draws_rev: u64,
+    /// 每帧投影缓存:(rev, 扁平化绘制项)。内容不变时整帧共享同一份。
+    text_draws_cache:
+        std::cell::RefCell<Option<(u64, std::sync::Arc<[crate::text::TextDraw]>)>>,
     /// 外字链候选(`SIZE2` 目标层 → 资产/尺寸/MEIDO 颜色)。
     glyph_chains: BTreeMap<LayerId, GlyphChain>,
     copy_log: Vec<CopyOp>,
@@ -237,7 +266,13 @@ pub struct GfxState {
     copy_log_dropped: u64,
     image_log_dropped: u64,
     /// 本帧诊断(按 `(code, command, detail)` 有序去重;`FrameStart` 清空)。
-    diags: BTreeMap<(String, String, String), error::FrameDiag>,
+    /// 本帧诊断。键 `Rc<(code, command, detail)>`:插入时构造一次,
+    /// `last_diag_key` 只共享句柄(重复诊断快路径零分配,#8)。
+    diags: BTreeMap<std::rc::Rc<(String, String, String)>, error::FrameDiag>,
+    /// 最近一次诊断键(快速判重;演出期重复诊断占绝大多数)。
+    last_diag_key: Option<std::rc::Rc<(String, String, String)>>,
+    /// 脚本号 → `"s{id}"` 标签缓存(诊断定位构造用,脚本数有限)。
+    script_labels: rustc_hash::FxHashMap<u32, std::rc::Rc<str>>,
     /// 正在消费的域事件脚本位置(todo-silent-handling S1):
     /// `DomainCall` 携带 `(script, pc)`,诊断聚合时不许再把它丢掉。
     /// 仅在事件分派窗口内非空;INFO 查询等带外路径保持 None(不猜位置)。
@@ -250,6 +285,9 @@ pub struct GfxState {
     /// `CG` 参数槽 → 参数名(启动期一次投影;`CG` 单帧数万次,旧路径每个
     /// 参数都做一次 `yscm.index_of` 哈希查找)。
     cg_names: Vec<Option<std::rc::Rc<str>>>,
+    /// `CGACT`/`CGEND` 的参数名表(同 `cg_names`:启动期投影,#7)。
+    cgact_names: Vec<Option<std::rc::Rc<str>>>,
+    cgend_names: Vec<Option<std::rc::Rc<str>>>,
     /// 窗口状态(按 `NO`;0 = 主窗口)。
     windows: BTreeMap<u8, WindowState>,
     /// 资产像素尺寸缓存(键 = `CG[FILE]` 原始字节)。
@@ -297,15 +335,19 @@ pub struct GfxState {
     last_screen_key: std::cell::Cell<Option<u64>>,
     /// 本帧已经拍下的快照及指纹:同帧多次截屏且画面未变时复用一个 `Arc`。
     last_screen_capture: Option<(u64, std::sync::Arc<crate::frame::ScreenSnapshot>)>,
-    /// `frame()` 的整帧缓存:同一批事件只投影一次。
+    /// `windows` 投影缓存:窗口状态写入是低频命令,按代次只在变化后重建。
     ///
-    /// 事件批次结束后的投影必须是纯函数:同一批事件被 soft/wgpu/存档抓帧
-    /// 多次取帧时,必须拿到逐位相同的 pass 集。旧实现在 `frame()` 里直接写
-    /// `baked_images`,第二次取帧会把第一次刚标记的加工项跳过(实测同一帧
-    /// `COPY→SIZE2` soft 3 pass / wgpu 2 pass,立绘整层消失);现在烘焙只进
-    /// `pending_baked`,由后端成功后 `commit_baked`。缓存另外避免重复构建
-    /// 1400+ 层与重复收集候选;任何状态写入都通过 `invalidate_frame` 失效。
-    frame_cache: std::cell::RefCell<Option<CompositorFrame>>,
+    /// 缓存的是按 `NO` 升序的投影,`frame()` 用 `clone_from` 复用它;
+    /// 代次只由 [`Self::apply_window`]/[`Self::apply_windowend`] 递增,
+    /// 不随普通 CG/文本事件失效。
+    windows_rev: u64,
+    windows_cache: std::cell::RefCell<Option<(u64, Vec<WindowState>)>>,
+    /// `diags` 投影缓存(按代次;`FrameStart` 清空与每次 `push_diag` 递增)。
+    ///
+    /// `diags` 的 BTreeMap 键就是最终 `(code, command, detail)` 序,缓存
+    /// 已排序;`frame()` 只需在末尾追加文本图像诊断后再排一次。
+    diags_rev: u64,
+    diags_cache: std::cell::RefCell<Option<(u64, Vec<error::FrameDiag>)>>,
     /// 后端**确认成功执行**并烘焙进层表面的图像加工前缀
     /// (`层 → (基图, 不透明度, 最大序号)`)。
     ///
@@ -383,6 +425,27 @@ struct TextBuffer {
     frame: u64,
     /// 当前应显示字符数(`None` = 全部;H-P2-02 前由宿主注入)。
     reveal: Option<usize>,
+    /// 排版输入代次(#3):bytes/flags/style/origin 任一实际写入 +1。
+    gen: u64,
+    /// 排版缓存:(gen, 显示 codec, 排版结果)。
+    /// `reveal` 与目标层在场性不参与排版,返回前按当前值覆盖。
+    layout_cache: std::cell::RefCell<Option<(u64, Codec, TextLayoutFrame)>>,
+}
+
+/// 单次帧投影的遍历缓存(T5a #20/#30)。
+///
+/// 生命周期 = 一次 `frame()` / `capture_screen_snapshot()`:构建期间
+/// 图层树与日志都不变,因此不需要失效代次;跨帧不保留(任何命令都可能
+/// 改层/子层/日志)。
+#[derive(Default)]
+struct ProbeCache {
+    /// 已排序子表(`None` = 根);键含父层名(每次查找一次小克隆,
+    /// 换来免掉「收集 + 排序 + 全部子名克隆」)。
+    sorted: rustc_hash::FxHashMap<Option<LayerId>, std::rc::Rc<[LayerId]>>,
+    /// 组可见性(显式栈 DFS 结果)。
+    visible: rustc_hash::FxHashMap<LayerId, bool>,
+    /// `transition_mask_base` 的 `tid` 记忆(帧内只扫一次 image_log)。
+    mask_base: rustc_hash::FxHashMap<LayerId, Option<TextureRef>>,
 }
 
 /// `CGINFO[ONMOUSE/ONMOUSE2/ONMOUSE3]` 需要的像素采样面。
@@ -435,6 +498,14 @@ impl GfxState {
             Some(names) => names.to_vec(),
             None => Vec::new(),
         };
+        let cgact_names = match params.names_for("CGACT") {
+            Some(names) => names.to_vec(),
+            None => Vec::new(),
+        };
+        let cgend_names = match params.names_for("CGEND") {
+            Some(names) => names.to_vec(),
+            None => Vec::new(),
+        };
         let mut s = Self {
             params,
             config,
@@ -452,15 +523,21 @@ impl GfxState {
             text_clear_seq: 0,
             text_revision_seq: 0,
             text_draws: BTreeMap::new(),
+            text_draws_rev: 0,
+            text_draws_cache: std::cell::RefCell::new(None),
             glyph_chains: BTreeMap::new(),
             copy_log: Vec::new(),
             image_log: Vec::new(),
             copy_log_dropped: 0,
             image_log_dropped: 0,
             diags: BTreeMap::new(),
+            last_diag_key: None,
+            script_labels: rustc_hash::FxHashMap::default(),
             cur_call: None,
             cur_call_cmd: String::new(),
             cg_names,
+            cgact_names,
+            cgend_names,
             windows,
             asset_sizes: FxHashMap::default(),
             movie_metas: FxHashMap::default(),
@@ -469,7 +546,10 @@ impl GfxState {
             screen_snapshots: BTreeMap::new(),
             last_screen_key: std::cell::Cell::new(None),
             last_screen_capture: None,
-            frame_cache: std::cell::RefCell::new(None),
+            windows_rev: 0,
+            windows_cache: std::cell::RefCell::new(None),
+            diags_rev: 0,
+            diags_cache: std::cell::RefCell::new(None),
             baked_images: std::cell::RefCell::new(BTreeMap::new()),
             pending_baked: std::cell::RefCell::new(BTreeMap::new()),
             baked_copies: std::cell::RefCell::new(BTreeSet::new()),
@@ -494,7 +574,7 @@ impl GfxState {
         self.invalidate_frame();
         self.config.viewport = viewport;
         if let Some(w0) = self.nodes.get_mut(&Self::w0()) {
-            w0.layer.kind = LayerKind::Group {
+            Arc::make_mut(&mut w0.layer).kind = LayerKind::Group {
                 size: Some(viewport_to_size(viewport)),
             };
         }
@@ -569,9 +649,10 @@ impl GfxState {
         let Some(node) = self.nodes.get_mut(id) else {
             return false;
         };
-        node.layer.texture = TextureRef::Asset(key);
-        node.layer.fill = None;
-        node.layer.reset_status();
+        let layer = Arc::make_mut(&mut node.layer);
+        layer.texture = TextureRef::Asset(key);
+        layer.fill = None;
+        layer.reset_status();
         true
     }
 
@@ -596,7 +677,7 @@ impl GfxState {
     }
 
     pub fn layer(&self, id: &LayerId) -> Option<&Layer> {
-        self.nodes.get(id).map(|n| &n.layer)
+        self.nodes.get(id).map(|n| n.layer.as_ref())
     }
 
     /// 本帧诊断(按 `(code, command, detail)` 升序;重复项合并为 `count`)。
@@ -657,7 +738,11 @@ impl GfxState {
             self.write_text_state(&id, &snapshot.bytes, &snapshot.flags);
         }
         let buf = self.text_layers.entry(id).or_default();
-        buf.origin = (snapshot.cursor_x, snapshot.cursor_y);
+        let origin = (snapshot.cursor_x, snapshot.cursor_y);
+        if buf.origin != origin {
+            buf.origin = origin;
+            buf.gen = buf.gen.wrapping_add(1);
+        }
     }
 
     /// 同上,但显式指定文本层(宿主若自行维护层 ID)。
@@ -672,7 +757,11 @@ impl GfxState {
             self.write_text_state(id, &snapshot.bytes, &snapshot.flags);
         }
         let buf = self.text_layers.entry(id.clone()).or_default();
-        buf.origin = (snapshot.cursor_x, snapshot.cursor_y);
+        let origin = (snapshot.cursor_x, snapshot.cursor_y);
+        if buf.origin != origin {
+            buf.origin = origin;
+            buf.gen = buf.gen.wrapping_add(1);
+        }
     }
 
     /// `SETSTR` 载荷的显示 codec:全局显示 codec(与官方 CHS 同构)。
@@ -686,14 +775,30 @@ impl GfxState {
     }
 
     fn write_text_state(&mut self, id: &LayerId, bytes: &[u8], flags: &[u8]) {
+        // 快路径(#3):自动文本模式下 VM 每 tick 都调 `sync_text_state`,
+        // 但正文缓冲通常整段不变。内容与样式都没变时直接返回:
+        // 不重写缓冲、不增排版代次,也不再为判定 mismatch 整段重排版。
+        //
+        // 只在**上次不是 mismatch**时走快路径(`flags` 存的是 `Some`):
+        // mismatch 状态旧实现每 tick 都会重新报一次诊断,这里保持原样。
+        if let Some(buf) = self.text_layers.get_mut(id) {
+            if buf.bytes == bytes
+                && buf.flags.as_deref() == Some(flags)
+                && buf.style == self.style
+            {
+                buf.frame = self.frame;
+                return;
+            }
+        }
         let codec = self.config.display.default;
-        let mismatch = crate::text::layout_text_with_codec(bytes, flags, (0, 0), &self.style, codec)
-            .is_none();
+        let mismatch =
+            crate::text::layout_text_with_codec(bytes, flags, (0, 0), &self.style, codec).is_none();
         let buf = self.text_layers.entry(id.clone()).or_default();
         buf.bytes = bytes.to_vec();
         buf.flags = if mismatch { None } else { Some(flags.to_vec()) };
         buf.style = self.style.clone();
         buf.frame = self.frame;
+        buf.gen = buf.gen.wrapping_add(1);
         if mismatch {
             self.push_diag(
                 "TEXT",
@@ -718,6 +823,7 @@ impl GfxState {
             buf.bytes.clear();
             buf.flags = Some(Vec::new());
             buf.reveal = None;
+            buf.gen = buf.gen.wrapping_add(1);
         }
     }
 
@@ -746,14 +852,44 @@ impl GfxState {
         }
     }
 
-    /// 作废整帧投影与未提交的烘焙候选。
+    /// 作废未提交的烘焙候选。
     ///
-    /// 任何状态写入(事件或宿主 setter)都必须调用;`frame()` 只在事件批次
-    /// 内缓存,烘焙候选只在后端成功执行后由 `commit_baked` 提交。
+    /// 任何状态写入(事件或宿主 setter)都必须调用;`frame()` 不再缓存整帧,
+    /// 重复调用按当前状态重建,结果逐位一致。烘焙候选只在后端成功执行后
+    /// 由 `commit_baked` 提交。
     fn invalidate_frame(&self) {
-        self.frame_cache.borrow_mut().take();
         self.pending_baked.borrow_mut().clear();
         self.pending_copies.borrow_mut().clear();
+    }
+
+    /// 借用形态的域事件入口(#39 / C-02)。
+    ///
+    /// 与 [`VmEvent::DomainCall`] 分支逐项相同(`invalidate_frame`、帧号、
+    /// 脚本定位、按域分派、`cur_call` 收尾),但命令名与参数按借用消费,
+    /// 不构造 owned 事件 —— 生产热路径(`record_events=false`)经
+    /// [`GraphicsHost::apply_domain`] 直接走到这里。
+    pub fn on_domain(
+        &mut self,
+        domain: Domain,
+        name: &str,
+        args: &[ArgValue],
+        frame: u64,
+        script: Option<u32>,
+        pc: Option<u32>,
+    ) {
+        self.invalidate_frame();
+        self.frame = frame;
+        // S1:域事件自带脚本定位,分派窗口内产生的诊断全部带上。
+        self.cur_call = script.zip(pc);
+        self.cur_call_cmd.clear();
+        self.cur_call_cmd.push_str(name);
+        match domain {
+            Domain::Graphics => self.dispatch(name, args),
+            Domain::Window => self.dispatch_window(name, args),
+            Domain::Movie => self.dispatch_movie(name, args),
+            _ => {}
+        }
+        self.cur_call = None;
     }
 
     pub fn on_event(&mut self, ev: &VmEvent) {
@@ -769,6 +905,8 @@ impl GfxState {
                 // 表面,画一次即常驻);`FrameStart` 不再清空。
                 // 诊断是“本帧”诊断:每帧清空,防止跨帧无界增长。
                 self.diags.clear();
+                self.last_diag_key = None;
+                self.diags_rev = self.diags_rev.wrapping_add(1);
                 // 本帧屏幕快照复用窗口(跨帧指纹保留到下一次 frame())。
                 self.last_screen_capture = None;
                 // 复制/图像操作是**状态生产**(快照/纹理修改),不是逐帧易失;
@@ -789,6 +927,7 @@ impl GfxState {
                 buf.flags = None;
                 buf.style = self.style.clone();
                 buf.frame = *frame;
+                buf.gen = buf.gen.wrapping_add(1);
             }
             VmEvent::DomainCall {
                 frame,
@@ -827,9 +966,10 @@ impl GfxState {
         f.clear = Clear::default_black();
         f.dx_mode = self.config.dx_mode;
         f.filter = self.config.filter;
-        f.image_probe_order = self.config.image_probe_order.clone();
+        f.image_probe_order
+            .clone_from(&self.config.image_probe_order);
         f.color_space = ColorSpace::GammaEncodedSrgb8;
-        let layer = Layer {
+        let layer = Arc::new(Layer {
             id: LayerId::new(b":/MOVIE".to_vec()),
             seq: 0,
             z: 0,
@@ -860,8 +1000,8 @@ impl GfxState {
             texture_status: LayerStatus::Executable,
             param_status: LayerStatus::Executable,
             extra: BTreeMap::new(),
-        };
-        f.layers.push(layer.clone());
+        });
+        f.layers.push(Arc::clone(&layer));
         let mut pass = Pass::new(PassTarget::Screen);
         pass.ops.push(Op::Layer(layer));
         f.passes.push(pass);
@@ -869,11 +1009,11 @@ impl GfxState {
     }
 
     /// 构建当前帧的合成契约(只读;可重复调用,字节稳定)。
+    ///
+    /// 不做整帧缓存:引擎每 tick 只取一次帧,而任何事件都会作废旧缓存;
+    /// 重复调用按其纯函数语义重建,`layers` 由唯一 `(z, seq, id)` 排序、
+    /// `passes` 按命令序发射,结果逐位一致。
     pub fn frame(&self) -> CompositorFrame {
-        if let Some(cached) = self.frame_cache.borrow().as_ref() {
-            // 事件批次未变 ⇒ 投影必须逐位一致(见字段注释)。
-            return cached.clone();
-        }
         // 影片模式:`MOVIE` 画面盖住所有层(官方手册 movie/movie.html 例 3)。
         if let Some(overlay) = &self.movie_overlay {
             return self.movie_only_frame(overlay);
@@ -882,7 +1022,10 @@ impl GfxState {
         f.dx_mode = self.config.dx_mode;
         f.clear = self.config.clear;
         f.filter = self.config.filter;
-        f.image_probe_order = self.config.image_probe_order.clone();
+        // `CompositorFrame::new` 已带默认探测序;`clone_from` 复用其容量,
+        // 不再每帧新分配一条小 Vec。
+        f.image_probe_order
+            .clone_from(&self.config.image_probe_order);
         f.color_space = ColorSpace::GammaEncodedSrgb8;
 
         let mut passes = Vec::new();
@@ -908,7 +1051,7 @@ impl GfxState {
         // 每帧被重放一次(`copy_pinned` 随读档次数增长,2026-11-03 实测
         // 23→45,基线 1ms→2–3ms)。
         let pin_snap_tex = self.snapshot_texture_ids();
-        let needed_snapshots: std::collections::BTreeSet<CopyId> =
+        let needed_snapshots: rustc_hash::FxHashSet<CopyId> =
             self.copy_log
                 .iter()
                 .filter(|c| {
@@ -952,7 +1095,7 @@ impl GfxState {
         // 复制项的 `source_texture`。不能把所有历史快照的图层并进来 ——
         // 长会话里旧菜单快照会保留,每帧重放它们的图像加工会让
         // `surface_passes`/render 单调上涨。
-        let mut consumed_snapshots: BTreeSet<CopyId> = self
+        let mut consumed_snapshots: rustc_hash::FxHashSet<CopyId> = self
             .nodes
             .values()
             .filter_map(|node| match &node.layer.texture {
@@ -969,8 +1112,8 @@ impl GfxState {
                 }
             }
         }
-        let snapshot_layers: BTreeSet<LayerId> = if consumed_snapshots.is_empty() {
-            BTreeSet::new()
+        let snapshot_layers: rustc_hash::FxHashSet<LayerId> = if consumed_snapshots.is_empty() {
+            rustc_hash::FxHashSet::default()
         } else {
             consumed_snapshots
                 .iter()
@@ -1027,7 +1170,7 @@ impl GfxState {
         //
         // 反向扫描:先看消费者(序号更大)是否需要该源;被需要才置发射位,
         // 并把自己的源继续往前传(链式依赖)。
-        let mut needed_sources: BTreeSet<LayerId> = BTreeSet::new();
+        let mut needed_sources: rustc_hash::FxHashSet<LayerId> = rustc_hash::FxHashSet::default();
         // `DIV-GFX-072 §1-8`:源层在本帧被 `CGEND` 删除,但同帧 COPY 已经
         // 在命令时刻读过它的像素。后端回放 COPY 时只剩 `source_texture`
         // (基图);必须把该层的图像加工链也标为“本帧需要”,让加工 pass
@@ -1157,7 +1300,7 @@ impl GfxState {
         // 合成 copy**:目标用 `__screen_snapshot_<id>`(不是真实图层),后端
         // 在命令序原位置物化 `targets.snapshot(id)`,不写任何真实层表面。
         {
-            let emitted: BTreeSet<CopyId> = texture_ops
+            let emitted: rustc_hash::FxHashSet<CopyId> = texture_ops
                 .iter()
                 .filter_map(|(_, op)| match op {
                     Op::Copy(copy) => Some(copy.id),
@@ -1197,7 +1340,8 @@ impl GfxState {
                 texture_ops.push((synthetic.seq, Op::Copy(synthetic)));
             }
         }
-        texture_ops.sort_by_key(|(seq, _)| *seq);
+        // `texture_seq` 全局唯一 ⇒ 键全序,不稳定排序结果相同。
+        texture_ops.sort_unstable_by_key(|(seq, _)| *seq);
         for (_, op) in texture_ops {
             let target = match &op {
                 Op::Copy(c) => c.dest.clone(),
@@ -1212,10 +1356,12 @@ impl GfxState {
         }
 
         // 2. 组离屏 pass(后序;子组先于父组;显式栈,深树不爆栈)。
-        let mut emitted_groups = BTreeSet::new();
+        let mut emitted_groups = rustc_hash::FxHashSet::default();
         // 生产层集合本帧不变:算一次给全部组 pass 与屏幕 pass 共用。
         let produced = self.surface_producers();
-        self.build_group_passes(&mut passes, &mut emitted_groups, &produced);
+        // 帧投影遍历缓存(排序子表/组可见性/过渡基图):本帧内图层树不变。
+        let mut probe = ProbeCache::default();
+        self.build_group_passes(&mut passes, &mut emitted_groups, &produced, &mut probe);
 
         // 3. 屏幕 pass(最后)。
         //
@@ -1238,9 +1384,21 @@ impl GfxState {
             // 主组是图层组 → 子层直绘;主组被显式指定为单个图像层 →
             // 直接画该层(手册 `WINDOW[CGID]` 允许指定任意图层)。
             if self.nodes.get(&main).is_some_and(|n| n.layer.is_group()) {
-                self.emit_children_ops(&main, &mut screen_ops, &emitted_groups, &produced);
+                self.emit_children_ops(
+                    &main,
+                    &mut screen_ops,
+                    &emitted_groups,
+                    &produced,
+                    &mut probe,
+                );
             } else {
-                self.emit_node_ops(&main, &mut screen_ops, &emitted_groups, &produced);
+                self.emit_node_ops(
+                    &main,
+                    &mut screen_ops,
+                    &emitted_groups,
+                    &produced,
+                    &mut probe,
+                );
             }
         }
         passes.push(Pass {
@@ -1250,15 +1408,28 @@ impl GfxState {
         });
 
         f.passes = passes;
-        f.windows = self.windows.values().cloned().collect();
+        // 窗口/诊断都是低频变化的投影:按代次重建缓存,避免每帧重扫。
+        {
+            let mut cache = self.windows_cache.borrow_mut();
+            if cache
+                .as_ref()
+                .is_none_or(|(rev, _)| *rev != self.windows_rev)
+            {
+                let view: Vec<WindowState> = self.windows.values().cloned().collect();
+                *cache = Some((self.windows_rev, view));
+            }
+            f.windows
+                .clone_from(&cache.as_ref().expect("窗口投影缓存已在上方按代次填充").1);
+        }
         f.layers = self
             .nodes
             .values()
-            .map(|n| n.layer.clone())
+            .map(|n| Arc::clone(&n.layer))
             .collect::<Vec<_>>();
-        // 比较期不分配:直接比较借用字段。
+        // 比较期不分配:直接比较借用字段。`seq` 全局唯一 ⇒ 键全序,
+        // 不稳定排序与稳定排序结果逐位相同。
         f.layers
-            .sort_by(|a, b| (a.z, a.seq, &a.id).cmp(&(b.z, b.seq, &b.id)));
+            .sort_unstable_by(|a, b| (a.z, a.seq, &a.id).cmp(&(b.z, b.seq, &b.id)));
         f.text = self
             .text_layers
             .iter()
@@ -1277,7 +1448,16 @@ impl GfxState {
         f.text_layout = self.text_layout_now();
         f.text_draws = self.text_draws_now();
         f.text_revisions = self.text_revisions_now();
-        f.diagnostics = self.diags.values().cloned().collect();
+        // 诊断按代次复用已排序投影;只有追加文本图像诊断后才需要再排一次。
+        {
+            let mut cache = self.diags_cache.borrow_mut();
+            if cache.as_ref().is_none_or(|(rev, _)| *rev != self.diags_rev) {
+                let view: Vec<error::FrameDiag> = self.diags.values().cloned().collect();
+                *cache = Some((self.diags_rev, view));
+            }
+            f.diagnostics
+                .clone_from(&cache.as_ref().expect("诊断投影缓存已在上方按代次填充").1);
+        }
         // 方案 E 诊断:文本层在**本帧**携带多少条图像字形。用于区分
         // “被清掉/没进列表”和“进了列表但合成未画”。
         for (id, texts) in &self.text_draws {
@@ -1315,7 +1495,6 @@ impl GfxState {
             &f.text_revisions,
             f.text_layout.as_ref(),
         )));
-        self.frame_cache.borrow_mut().replace(f.clone());
         f
     }
 
@@ -1374,22 +1553,27 @@ impl GfxState {
             return None;
         }
         let flags = b.flags.as_deref()?;
-        let glyphs = crate::text::layout_text_with_codec(
-            &b.bytes,
-            flags,
-            b.origin,
-            &b.style,
-            self.current_text_codec(),
-        )?;
-        if glyphs.is_empty() {
-            return None;
-        }
+        let codec = self.current_text_codec();
+        // 目标层在场性只决定叠加位置,不参与排版;每帧按当前节点表覆盖。
         let target = if !id.0.is_empty() && self.nodes.contains_key(id) {
             Some(id.clone())
         } else {
             None
         };
-        Some(TextLayoutFrame {
+        // 内容代次未变 ⇒ 复用上一次排版(只覆盖 reveal/target,#3)。
+        if let Some((gen, cached_codec, cached)) = b.layout_cache.borrow().as_ref() {
+            if *gen == b.gen && *cached_codec == codec {
+                let mut frame = cached.clone();
+                frame.target = target;
+                frame.reveal = b.reveal;
+                return Some(frame);
+            }
+        }
+        let glyphs = crate::text::layout_text_with_codec(&b.bytes, flags, b.origin, &b.style, codec)?;
+        if glyphs.is_empty() {
+            return None;
+        }
+        let frame = TextLayoutFrame {
             target,
             origin: b.origin,
             style: b.style.clone(),
@@ -1398,15 +1582,32 @@ impl GfxState {
             line_height: b.style.line_height(),
             glyphs,
             flags_source: TextFlagsSource::TextFlag,
-        })
+        };
+        *b.layout_cache.borrow_mut() = Some((b.gen, codec, frame.clone()));
+        Some(frame)
     }
 
     /// `CGACT[TEXT]` 绘制项(按目标层 ID 稳定排序;层内保持命令序)。
-    fn text_draws_now(&self) -> Vec<crate::text::TextDraw> {
-        self.text_draws
+    fn text_draws_now(&self) -> std::sync::Arc<[crate::text::TextDraw]> {
+        if let Some((rev, cached)) = self.text_draws_cache.borrow().as_ref() {
+            if *rev == self.text_draws_rev {
+                return std::sync::Arc::clone(cached);
+            }
+        }
+        let draws: std::sync::Arc<[crate::text::TextDraw]> = self
+            .text_draws
             .values()
             .flat_map(|t| t.draws.iter().cloned())
-            .collect()
+            .collect::<Vec<_>>()
+            .into();
+        *self.text_draws_cache.borrow_mut() =
+            Some((self.text_draws_rev, std::sync::Arc::clone(&draws)));
+        draws
+    }
+
+    /// `text_draws` 投影变化(增删改):使每帧共享投影失效(#3)。
+    fn bump_text_draws(&mut self) {
+        self.text_draws_rev = self.text_draws_rev.wrapping_add(1);
     }
 
     /// 每层文本修订号(后端合成缓存键;内容不变不重烤)。
@@ -1428,9 +1629,10 @@ impl GfxState {
     /// `last_screen`,不必为 1400+ 层再合成一次(菜单打开帧的主尖峰)。
     fn capture_screen_snapshot(&self) -> Option<std::sync::Arc<crate::frame::ScreenSnapshot>> {
         let mut passes = Vec::new();
-        let mut emitted_groups = BTreeSet::new();
+        let mut emitted_groups = rustc_hash::FxHashSet::default();
         let produced = self.surface_producers();
-        self.build_group_passes(&mut passes, &mut emitted_groups, &produced);
+        let mut probe = ProbeCache::default();
+        self.build_group_passes(&mut passes, &mut emitted_groups, &produced, &mut probe);
         let mut screen_ops = Vec::new();
         if self.windows.get(&0).is_none_or(|w| w.visible) {
             let main = self
@@ -1439,9 +1641,21 @@ impl GfxState {
                 .and_then(|w| w.layer_set.clone())
                 .unwrap_or_else(|| self.config.main_layer_set.clone());
             if self.nodes.get(&main).is_some_and(|n| n.layer.is_group()) {
-                self.emit_children_ops(&main, &mut screen_ops, &emitted_groups, &produced);
+                self.emit_children_ops(
+                    &main,
+                    &mut screen_ops,
+                    &emitted_groups,
+                    &produced,
+                    &mut probe,
+                );
             } else {
-                self.emit_node_ops(&main, &mut screen_ops, &emitted_groups, &produced);
+                self.emit_node_ops(
+                    &main,
+                    &mut screen_ops,
+                    &emitted_groups,
+                    &produced,
+                    &mut probe,
+                );
             }
         }
         passes.push(Pass {
@@ -1470,8 +1684,10 @@ impl GfxState {
                 return Some(std::sync::Arc::clone(cached));
             }
         }
-        let mut layers: Vec<Layer> = self.nodes.values().map(|n| n.layer.clone()).collect();
-        layers.sort_by(|a, b| (a.z, a.seq, &a.id).cmp(&(b.z, b.seq, &b.id)));
+        let mut layers: Vec<Arc<Layer>> =
+            self.nodes.values().map(|n| Arc::clone(&n.layer)).collect();
+        // `seq` 全局唯一 ⇒ 键全序,不稳定排序结果相同。
+        layers.sort_unstable_by(|a, b| (a.z, a.seq, &a.id).cmp(&(b.z, b.seq, &b.id)));
         // 依赖集合在采集时一次算好:这些集合每帧都要参与复制/加工链的
         // 保留判定,逐帧扫全部 pass 会让开销随场景复杂度线性增长。
         let mut snapshot_textures = BTreeSet::new();
@@ -1692,7 +1908,9 @@ impl GfxState {
         // 堆分配。`resolved` 借用 `args`,两者在本函数内都只读。
         let mut id: Option<&[u8]> = None;
         let mut idno: Option<i64> = None;
-        let mut flags: BTreeMap<&str, i64> = BTreeMap::new();
+        // 查询字段位集:#6 —— 官方 if/else 链顺序固定,只需「是否置位」,
+        // 用 `u64` 位集替掉 `BTreeMap<&str, i64>`(每条 CGINFO 一次树分配)。
+        let mut flags: u64 = 0;
         // `SET/SET2` 是查询坐标(COLOR/ONMOUSE*),不是“查询字段”。
         let mut set: Option<i64> = None;
         let mut set2: Option<i64> = None;
@@ -1722,7 +1940,11 @@ impl GfxState {
                         return Err(arg_type_diag("CGINFO", name, "整数"));
                     };
                     if v != 0 {
-                        flags.insert(name, v);
+                        // 顺序表之外的名字被官方 if/else 链忽略(旧实现只
+                        // 存进 map 也不参与 `first_flag`)⇒ 不置位。
+                        if let Some(pos) = CGINFO_FLAG_ORDER.iter().position(|f| *f == name) {
+                            flags |= 1u64 << pos;
+                        }
                     }
                 }
                 None => {
@@ -1736,7 +1958,12 @@ impl GfxState {
         // 官方 CGINFO 是**顺序 if/else 链**(REA `0x43d758..0x43dddf`):
         // 按下面顺序检查参数压缩槽,第一个置位的字段写 LET 后直接返回;
         // 多个字段同时置位不是错误。旧实现一律报 `INFO_MULTI`,与官方不符。
-        let Some((flag, _)) = first_flag(&flags, CGINFO_FLAG_ORDER)? else {
+        let Some(flag) = CGINFO_FLAG_ORDER
+            .iter()
+            .enumerate()
+            .find(|(i, _)| flags & (1u64 << i) != 0)
+            .map(|(_, f)| *f)
+        else {
             return Err(error::unimplemented(
                 error::code::INFO_MULTI,
                 "CGINFO 未给出查询字段",
@@ -1767,9 +1994,7 @@ impl GfxState {
                 // 像素/鼠标探测:层不存在 = 没有命中点。
                 // 手册 `cg/cginfo.html` 例 8..10:未命中写 -1;
                 // `DIV-GFX-070` 已确认越界 COLOR 也返回 -1。
-                "COLOR" | "ONMOUSE" | "ONMOUSE2" | "ONMOUSE3" => {
-                    return Ok(Value::Int(-1))
-                }
+                "COLOR" | "ONMOUSE" | "ONMOUSE2" | "ONMOUSE3" => return Ok(Value::Int(-1)),
                 _ => {}
             }
             return Err(error::unimplemented(
@@ -2486,18 +2711,19 @@ impl GfxState {
             // 缺 FRAME:官方 `YMV[FILE]` 不换帧(结构里帧号零初始化)⇒ 第 0 帧。
             let frame_idx = clamp_frame(frame.unwrap_or(0), info.frames); // silent-ok: 缺 FRAME = 第 0 帧
             let node = self.nodes.get_mut(&path).expect("layer checked above");
-            node.layer.movie = Some(MovieState {
+            let layer = Arc::make_mut(&mut node.layer);
+            layer.movie = Some(MovieState {
                 asset: asset.clone(),
                 info,
                 frame: frame_idx,
             });
-            node.layer.texture = TextureRef::Movie {
+            layer.texture = TextureRef::Movie {
                 asset,
                 frame: frame_idx,
             };
-            node.layer.fill = None;
-            node.layer.alpha_aware = info.has_alpha;
-            node.layer.reset_status();
+            layer.fill = None;
+            layer.alpha_aware = info.has_alpha;
+            layer.reset_status();
             self.reset_movie_surface(&path);
             return;
         }
@@ -2511,16 +2737,23 @@ impl GfxState {
         };
         // 官方 `0x45934c` 在影片结构为空时**静默返回**(不报错):框架只在
         // `YMVINFO[FPS] > 0` 时才发 `FRAME`,这里跟随官方保持安静。
-        let Some(movie) = node.layer.movie.as_mut() else {
+        // 先只读判空,避免无操作命令也触发写时复制。
+        if node.layer.movie.is_none() {
+            return; // silent-ok: 官方对未挂影片的层是空操作
+        }
+        let (idx, asset, has_alpha) = {
+            let layer = Arc::make_mut(&mut node.layer);
+            let Some(movie) = layer.movie.as_mut() else {
             return; // silent-ok: 官方对未挂影片的层是空操作
         };
         let idx = clamp_frame(frame, movie.info.frames);
         movie.frame = idx;
-        let asset = movie.asset.clone();
-        let has_alpha = movie.info.has_alpha;
-        node.layer.texture = TextureRef::Movie { asset, frame: idx };
-        node.layer.fill = None;
-        node.layer.alpha_aware = has_alpha;
+            (idx, movie.asset.clone(), movie.info.has_alpha)
+        };
+        let layer = Arc::make_mut(&mut node.layer);
+        layer.texture = TextureRef::Movie { asset, frame: idx };
+        layer.fill = None;
+        layer.alpha_aware = has_alpha;
         self.reset_movie_surface(&path);
     }
 
@@ -2542,14 +2775,16 @@ impl GfxState {
             );
             return;
         };
-        if node.layer.movie.take().is_none() {
+        if node.layer.movie.is_none() {
             // 官方对未挂影片的层同样走释放入口(结构为空 = 无操作)。
             return; // silent-ok: 结构为空时官方也是空操作
         }
         // 影片表面随结构释放 ⇒ 该层不再有图;位置/Z/alpha 等属性保留。
-        node.layer.texture = TextureRef::None;
-        node.layer.fill = None;
-        node.layer.reset_status();
+        let layer = Arc::make_mut(&mut node.layer);
+        layer.movie.take();
+        layer.texture = TextureRef::None;
+        layer.fill = None;
+        layer.reset_status();
         self.reset_movie_surface(&path);
     }
 
@@ -2781,6 +3016,8 @@ impl GfxState {
         if let Some(v) = close_mode {
             entry.close_mode = v;
         }
+        // 窗口状态只有这里与 `WINDOWEND` 会改;投影缓存按代次重建。
+        self.windows_rev = self.windows_rev.wrapping_add(1);
         if let Some(d) = pending {
             self.push_diag("WINDOW", d);
         }
@@ -2820,6 +3057,7 @@ impl GfxState {
             return;
         }
         self.windows.remove(&(no as u8));
+        self.windows_rev = self.windows_rev.wrapping_add(1);
     }
 
     // ------------------------------------------------------------ CG
@@ -2865,15 +3103,10 @@ impl GfxState {
         // 参数名表启动期已投影到 `cg_names`;旧写法每个参数都要
         // `names_for`(内含 `yscm.index_of` 哈希查找)。`params` 仍按命令
         // 分配,但只在非 ID/IDNO 参数上写入(数量很小)。
-        let mut params: Vec<(std::rc::Rc<str>, EngineValue, bool)> =
-            Vec::with_capacity(args.len());
+        let mut params: smallvec::SmallVec<[(std::rc::Rc<str>, EngineValue, bool); 8]> =
+            smallvec::SmallVec::new();
         for a in args {
-            let Some(name) = self
-                .cg_names
-                .get(usize::from(a.slot))
-                .cloned()
-                .flatten()
-            else {
+            let Some(name) = self.cg_names.get(usize::from(a.slot)).cloned().flatten() else {
                 self.arg_slot_missing("CG", a.slot);
                 continue;
             };
@@ -2934,7 +3167,7 @@ impl GfxState {
                     .nodes
                     .get_mut(&parsed.path)
                     .expect("group just ensured");
-                apply_layer_params(&mut node.layer, &params, true)
+                apply_layer_params(Arc::make_mut(&mut node.layer), &params, true)
             };
             for d in diags {
                 self.push_diag("CG", d);
@@ -3009,10 +3242,11 @@ impl GfxState {
             let probe = self.config.cg_timing;
             let t0 = std::time::Instant::now();
             if let Some(node) = self.nodes.get_mut(&parsed.path) {
-                node.layer.texture = texture;
-                node.layer.fill = None;
+                let layer = Arc::make_mut(&mut node.layer);
+                layer.texture = texture;
+                layer.fill = None;
                 // 新纹理没有旧快照/图像加工的状态;属性随后重算。
-                node.layer.reset_status();
+                layer.reset_status();
             }
             let t_swap = t0.elapsed();
             // 旧快照/图像加工随旧纹理作废。若后续 copy 仍以旧快照为
@@ -3052,7 +3286,7 @@ impl GfxState {
                 .nodes
                 .get_mut(&parsed.path)
                 .expect("layer just ensured");
-            apply_layer_params(&mut node.layer, &params, false)
+            apply_layer_params(Arc::make_mut(&mut node.layer), &params, false)
         };
         for d in diags {
             self.push_diag("CG", d);
@@ -3064,7 +3298,11 @@ impl GfxState {
     /// 解析 mask 层 → 宽高必须相等 → 逐像素 `target[+0x90].a = mask[+0x90].r`
     /// → 置 target `+0x86=1`。这里记录成 `mask_alpha` 合成 op,由后端在
     /// 命令序位置执行;重复 MID 命令按 `(action,target)` 折叠为最后一条。
-    fn record_mask_op(&mut self, target: &LayerId, params: &[(std::rc::Rc<str>, EngineValue, bool)]) {
+    fn record_mask_op(
+        &mut self,
+        target: &LayerId,
+        params: &[(std::rc::Rc<str>, EngineValue, bool)],
+    ) {
         let Some(mask_raw) = find_str(params, "MID") else {
             return;
         };
@@ -3147,7 +3385,7 @@ impl GfxState {
         if status == OpStatus::Executable {
             if let Some(node) = self.nodes.get_mut(target) {
                 // 官方 `0x42a8a4`: `mov byte[层+0x86],1`。
-                node.layer.alpha_aware = true;
+                Arc::make_mut(&mut node.layer).alpha_aware = true;
             }
         } else if let OpStatus::Unimplemented(reason) = status {
             self.push_diag(
@@ -3161,22 +3399,23 @@ impl GfxState {
     }
 
     fn apply_cgend(&mut self, args: &[ArgValue]) {
-        let resolved = self.resolved_owned("CGEND", args);
-        let mut id: Option<Vec<u8>> = None;
+        // #7:直接消费事件参数(名字查启动期表),不再经 `resolved_owned`
+        // 克隆每个值(字符串 = 整段堆复制)。ID 借用事件字节,归一化时才分配。
+        let mut id: Option<&[u8]> = None;
         let mut idno: Option<i64> = None;
-        for r in resolved {
-            let Some(name) = r.name.as_deref() else {
-                self.arg_slot_missing("CGEND", r.slot);
+        for a in args {
+            let Some(name) = self.cgend_names.get(usize::from(a.slot)).cloned().flatten() else {
+                self.arg_slot_missing("CGEND", a.slot);
                 continue;
             };
-            match name {
-                "ID" => match &r.value {
-                    Value::Str(b) => id = Some(b.clone()),
-                    _ => self.arg_type("CGEND", "ID", "字符串", &r.value),
+            match &*name {
+                "ID" => match &a.value {
+                    Value::Str(b) => id = Some(b.as_slice()),
+                    _ => self.arg_type("CGEND", "ID", "字符串", &a.value),
                 },
-                "IDNO" => match int_arg(&r.value) {
+                "IDNO" => match int_arg(&a.value) {
                     Some(n) => idno = Some(n),
-                    None => self.arg_type("CGEND", "IDNO", "整数", &r.value),
+                    None => self.arg_type("CGEND", "IDNO", "整数", &a.value),
                 },
                 _ => {}
             }
@@ -3221,6 +3460,7 @@ impl GfxState {
         // 判据用「刚才是否真的从这两张表里找到过键」,与 `retain` 等价。
         if self.text_draws.keys().any(|id| removed.contains(id)) {
             self.text_draws.retain(|id, _| !removed.contains(id));
+            self.bump_text_draws();
         }
         if self.text_layers.keys().any(|id| removed.contains(id)) {
             self.text_layers.retain(|id, _| !removed.contains(id));
@@ -3234,19 +3474,18 @@ impl GfxState {
     // ------------------------------------------------------------ CGACT
 
     fn apply_cgact(&mut self, args: &[ArgValue]) {
-        let resolved = self.resolved_owned("CGACT", args);
-        // `ID/ID2/ID3/ID4` 只借用事件里的字节;旧实现先 `b.clone()` 再在
-        // `path::normalize` 里再分配一次。`CGACT` 是逐帧动画/差分热路径,
-        // 四个 ID 每条命令省最多四次字符串分配。
+        // #7:与 `CGEND` 同型:名字查启动期表,值只借用,不再 `resolved_owned`
+        // 的逐值克隆。`ID/ID2/ID3/ID4` 直接借用事件字节。
         let mut ids: [Option<&[u8]>; 4] = [None, None, None, None];
         let mut idnos: [Option<i64>; 4] = [None, None, None, None];
-        let mut params: Vec<(std::rc::Rc<str>, EngineValue, bool)> = Vec::new();
-        for r in &resolved {
-            let Some(name) = r.name.as_deref() else {
-                self.arg_slot_missing("CGACT", r.slot);
+        let mut params: smallvec::SmallVec<[(std::rc::Rc<str>, EngineValue, bool); 8]> =
+            smallvec::SmallVec::new();
+        for a in args {
+            let Some(name) = self.cgact_names.get(usize::from(a.slot)).cloned().flatten() else {
+                self.arg_slot_missing("CGACT", a.slot);
                 continue;
             };
-            let idx = match name {
+            let idx = match &*name {
                 "ID" => Some(0),
                 "ID2" => Some(1),
                 "ID3" => Some(2),
@@ -3254,13 +3493,13 @@ impl GfxState {
                 _ => None,
             };
             if let Some(i) = idx {
-                match &r.value {
+                match &a.value {
                     Value::Str(b) => ids[i] = Some(b.as_slice()),
-                    _ => self.arg_type("CGACT", name, "字符串", &r.value),
+                    _ => self.arg_type("CGACT", &name, "字符串", &a.value),
                 }
                 continue;
             }
-            let idx = match name {
+            let idx = match &*name {
                 "IDNO" => Some(0),
                 "IDNO2" => Some(1),
                 "IDNO3" => Some(2),
@@ -3268,23 +3507,17 @@ impl GfxState {
                 _ => None,
             };
             if let Some(i) = idx {
-                match int_arg(&r.value) {
+                match int_arg(&a.value) {
                     Some(n) => idnos[i] = Some(n),
-                    None => self.arg_type("CGACT", name, "整数", &r.value),
+                    None => self.arg_type("CGACT", &name, "整数", &a.value),
                 }
                 continue;
             }
-            params.push((
-                r.name.clone().expect("匹配到名字 ⇒ Some"),
-                EngineValue::from_value(&r.value),
-                r.offset,
-            ));
+            params.push((name, EngineValue::from_value(&a.value), a.offset));
         }
 
         let paths: Vec<Option<LayerId>> = (0..4)
-            .map(|i| {
-                ids[i].map(|b| path::normalize(b, idnos[i], b.ends_with(b"/")).path)
-            })
+            .map(|i| ids[i].map(|b| path::normalize(b, idnos[i], b.ends_with(b"/")).path))
             .collect();
         let Some(source) = paths[0].clone() else {
             self.push_diag(
@@ -3640,9 +3873,9 @@ impl GfxState {
             self.screen_snapshots.insert(copy_id, snapshot);
         }
         if kind == CopyKind::Copy {
-            let attrs = self.nodes[source].layer.clone();
+            let attrs = Arc::clone(&self.nodes[source].layer);
             if let Some(node) = self.nodes.get_mut(dest) {
-                copy_attributes(&attrs, &mut node.layer);
+                copy_attributes(&attrs, Arc::make_mut(&mut node.layer));
             }
         }
         // DIV-GFX-058:可执行 COPY 整面覆写目标层像素 ⇒ 目标层已画文本随之
@@ -3728,9 +3961,10 @@ impl GfxState {
             self.snapshot_files.insert(copy_id, file);
         }
         if let Some(node) = self.nodes.get_mut(dest) {
-            node.layer.texture = TextureRef::Snapshot(copy_id);
-            node.layer.fill = None;
-            node.layer.set_texture_status(match status {
+            let layer = Arc::make_mut(&mut node.layer);
+            layer.texture = TextureRef::Snapshot(copy_id);
+            layer.fill = None;
+            layer.set_texture_status(match status {
                 OpStatus::Executable => LayerStatus::Executable,
                 OpStatus::Unimplemented(why) => LayerStatus::Unimplemented(why),
             });
@@ -3833,7 +4067,7 @@ impl GfxState {
             if !ok {
                 let why = "gfx.imageop.copy_source.unsupported";
                 if let Some(node) = self.nodes.get_mut(id) {
-                    node.layer
+                    Arc::make_mut(&mut node.layer)
                         .set_texture_status(LayerStatus::Unimplemented(why));
                 }
                 self.push_diag(
@@ -3904,8 +4138,8 @@ impl GfxState {
         // → 模式 2 = 再加 `+0x89(E)/+0x80(A)/+0x82(T)/+0x84(TA)/+0x87(MODE)`。
         // 手册文字与引擎相反,以引擎为准(DIV-GFX-032 fixed)。调用方传入
         // `image_only=true` 表示 SWAP 的模式 1(不换属性)。
-        let src = self.nodes[source].layer.clone();
-        let dst = self.nodes[dest].layer.clone();
+        let src = Arc::clone(&self.nodes[source].layer);
+        let dst = Arc::clone(&self.nodes[dest].layer);
         {
             let Some(s) = self.nodes.get_mut(source) else {
                 self.push_diag(
@@ -3917,13 +4151,14 @@ impl GfxState {
                 );
                 return;
             };
-            s.layer.texture = dst.texture.clone();
-            s.layer.fill = dst.fill;
-            s.layer.texture_status = dst.texture_status;
-            s.layer.alpha_aware = dst.alpha_aware;
-            s.layer.transform.x = dst.transform.x;
-            s.layer.transform.y = dst.transform.y;
-            s.layer.refresh_status();
+            let layer = Arc::make_mut(&mut s.layer);
+            layer.texture = dst.texture.clone();
+            layer.fill = dst.fill;
+            layer.texture_status = dst.texture_status;
+            layer.alpha_aware = dst.alpha_aware;
+            layer.transform.x = dst.transform.x;
+            layer.transform.y = dst.transform.y;
+            layer.refresh_status();
         }
         {
             let Some(d) = self.nodes.get_mut(dest) else {
@@ -3936,13 +4171,14 @@ impl GfxState {
                 );
                 return;
             };
-            d.layer.texture = src.texture.clone();
-            d.layer.fill = src.fill;
-            d.layer.texture_status = src.texture_status;
-            d.layer.alpha_aware = src.alpha_aware;
-            d.layer.transform.x = src.transform.x;
-            d.layer.transform.y = src.transform.y;
-            d.layer.refresh_status();
+            let layer = Arc::make_mut(&mut d.layer);
+            layer.texture = src.texture.clone();
+            layer.fill = src.fill;
+            layer.texture_status = src.texture_status;
+            layer.alpha_aware = src.alpha_aware;
+            layer.transform.x = src.transform.x;
+            layer.transform.y = src.transform.y;
+            layer.refresh_status();
         }
         if !image_only {
             let swap_attrs = |a: &mut Layer, b: &Layer| {
@@ -3961,7 +4197,7 @@ impl GfxState {
                 );
                 return;
             };
-            swap_attrs(&mut s.layer, &dst);
+            swap_attrs(Arc::make_mut(&mut s.layer), &dst);
             let Some(d) = self.nodes.get_mut(dest) else {
                 self.push_diag(
                     "CGACT",
@@ -3972,13 +4208,14 @@ impl GfxState {
                 );
                 return;
             };
-            swap_attrs(&mut d.layer, &src);
+            swap_attrs(Arc::make_mut(&mut d.layer), &src);
         }
         // DIV-GFX-058:SWAP/SWAP2 都交换纹理 ⇒ 烘焙文本随表面走。
         // (TODO DIV-GFX-032 的模式 1/2 归属为 Likely,但“面互换”两种模式
         // 一致,这里不做模式区分。)
         let src_texts = self.text_draws.remove(source);
         let dst_texts = self.text_draws.remove(dest);
+        let texts_changed = src_texts.is_some() || dst_texts.is_some();
         if let Some(mut t) = src_texts {
             for d in &mut t.draws {
                 d.target = dest.clone();
@@ -3994,6 +4231,9 @@ impl GfxState {
             self.text_revision_seq = self.text_revision_seq.wrapping_add(1);
             t.revision = self.text_revision_seq;
             self.text_draws.insert(source.clone(), t);
+        }
+        if texts_changed {
+            self.bump_text_draws();
         }
     }
 
@@ -4088,6 +4328,7 @@ impl GfxState {
             if let Some(texts) = self.text_draws.get_mut(target) {
                 texts.revision = seq;
             }
+            self.bump_text_draws();
         }
         if dropped > 0 {
             self.push_diag(
@@ -4161,6 +4402,7 @@ impl GfxState {
             return false;
         }
         if action.is_meido() {
+            // 缺省: 未指定 target 时作用源(源=目标)。
             let t = target.unwrap_or(source);
             if let Some(chain) = self.glyph_chains.get_mut(t) {
                 chain.tint = set
@@ -4484,7 +4726,7 @@ impl GfxState {
                         set.as_ref().and_then(EngineValue::as_int),
                         node.layer.fill,
                     ) {
-                        node.layer.fill = Some(px);
+                        Arc::make_mut(&mut node.layer).fill = Some(px);
                     }
                 }
             }
@@ -4513,7 +4755,7 @@ impl GfxState {
         });
         if marks_alpha {
             if let Some(node) = self.nodes.get_mut(&source) {
-                node.layer.alpha_aware = true;
+                Arc::make_mut(&mut node.layer).alpha_aware = true;
             }
         }
         // `CGACT[SIZE/SIZE2/SIZE3/SIZE4/SIZE5]` 把源区域缩放到目标层 ⇒ 目标层
@@ -4529,7 +4771,7 @@ impl GfxState {
                             // 只能是整数,`CGINFO[SX/SY]` 读回的也应是这个
                             // 取整后的层尺寸。四舍五入与 `as u32`(截断)在
                             // `.5` 上差 1 像素,选四舍五入以保持面积最接近。
-                            node.layer.kind = LayerKind::Image {
+                            Arc::make_mut(&mut node.layer).kind = LayerKind::Image {
                                 size: Some(SizeU32 {
                                     width: w.round() as u32,
                                     height: h.round() as u32,
@@ -4747,6 +4989,7 @@ impl GfxState {
             texts.dropped = 0;
             texts.revision = seq;
         }
+        self.bump_text_draws();
     }
 
     fn w0() -> LayerId {
@@ -4773,13 +5016,9 @@ impl GfxState {
         let mut out = Vec::with_capacity(args.len());
         for a in args {
             out.push(OwnedArg {
-                name: names
-                    .get(usize::from(a.slot))
-                    .cloned()
-                    .flatten(),
+                name: names.get(usize::from(a.slot)).cloned().flatten(),
                 slot: a.slot,
                 value: a.value.clone(),
-                offset: a.offset,
             });
         }
         out
@@ -4843,9 +5082,9 @@ impl GfxState {
         self.nodes.insert(
             w0,
             Node {
-                layer,
+                layer: Arc::new(layer),
                 parent: None,
-                children: BTreeSet::new(),
+                children: rustc_hash::FxHashSet::default(),
             },
         );
     }
@@ -4953,9 +5192,9 @@ impl GfxState {
         self.nodes.insert(
             path.clone(),
             Node {
-                layer,
+                layer: Arc::new(layer),
                 parent: parent.clone(),
-                children: BTreeSet::new(),
+                children: rustc_hash::FxHashSet::default(),
             },
         );
         if let Some(parent) = parent {
@@ -5038,6 +5277,7 @@ impl GfxState {
             // 借用而不是 clone:下面是热循环,`LayerId` 是 `Vec<u8>`,
             // 每项一次克隆在 1184 次 `CGEND` × 上千项的日志上是纯浪费。
             // `removed` 只含被删子树的少数层,绝大多数项在这里就被跳过。
+            // 缺省: 未指定 target 时目标就是源。
             let target = op.target.as_ref().unwrap_or(&op.source);
             if removed.contains(target) && !needed.contains(target) {
                 let in_snapshot = snapshot_layers
@@ -5180,7 +5420,15 @@ impl GfxState {
         self.snapshot_files.retain(|id, _| live.contains(id));
     }
 
-    fn sorted_children(&self, parent: Option<&LayerId>) -> Vec<LayerId> {
+    fn sorted_children(
+        &self,
+        parent: Option<&LayerId>,
+        cache: &mut ProbeCache,
+    ) -> std::rc::Rc<[LayerId]> {
+        let key = parent.cloned();
+        if let Some(hit) = cache.sorted.get(&key) {
+            return std::rc::Rc::clone(hit);
+        }
         let ids: Vec<LayerId> = if let Some(parent) = parent {
             self.nodes
                 .get(parent)
@@ -5201,12 +5449,25 @@ impl GfxState {
                 (layer.z, layer.seq, id)
             })
             .collect();
-        keyed.sort();
-        keyed.into_iter().map(|(_, _, id)| id).collect()
+        // `seq` 全局唯一 ⇒ 键全序,不稳定排序结果相同(发射顺序不变)。
+        keyed.sort_unstable();
+        let sorted: std::rc::Rc<[LayerId]> =
+            keyed.into_iter().map(|(_, _, id)| id).collect::<Vec<_>>().into();
+        cache.sorted.insert(key, std::rc::Rc::clone(&sorted));
+        sorted
     }
 
-    /// 组是否有可见内容(显式栈;深树不递归)。
-    fn group_has_visible_content(&self, id: &LayerId) -> bool {
+    /// 组是否有可见内容(显式栈;深树不递归)。帧投影内按组缓存结果。
+    fn group_has_visible_content(&self, id: &LayerId, cache: &mut ProbeCache) -> bool {
+        if let Some(hit) = cache.visible.get(id) {
+            return *hit;
+        }
+        let result = self.group_has_visible_content_uncached(id);
+        cache.visible.insert(id.clone(), result);
+        result
+    }
+
+    fn group_has_visible_content_uncached(&self, id: &LayerId) -> bool {
         let Some(node) = self.nodes.get(id) else {
             return false;
         };
@@ -5245,16 +5506,17 @@ impl GfxState {
     fn build_group_passes(
         &self,
         out: &mut Vec<Pass>,
-        emitted: &mut BTreeSet<LayerId>,
-        produced: &BTreeSet<LayerId>,
+        emitted: &mut rustc_hash::FxHashSet<LayerId>,
+        produced: &rustc_hash::FxHashSet<LayerId>,
+        cache: &mut ProbeCache,
     ) {
         // 后序:进入节点时先压“展开”标记,再压子节点;展开时记录组。
         let mut order: Vec<LayerId> = Vec::new();
         let mut stack: Vec<(LayerId, bool)> = self
-            .sorted_children(None)
-            .into_iter()
+            .sorted_children(None, cache)
+            .iter()
             .rev()
-            .map(|id| (id, false))
+            .map(|id| (id.clone(), false))
             .collect();
         while let Some((id, expanded)) = stack.pop() {
             let Some(node) = self.nodes.get(&id) else {
@@ -5269,8 +5531,8 @@ impl GfxState {
             if node.layer.is_group() {
                 stack.push((id.clone(), true));
             }
-            for child in self.sorted_children(Some(&id)).into_iter().rev() {
-                stack.push((child, false));
+            for child in self.sorted_children(Some(&id), cache).iter().rev() {
+                stack.push((child.clone(), false));
             }
         }
 
@@ -5286,7 +5548,7 @@ impl GfxState {
                 continue;
             }
             let mut ops = Vec::new();
-            self.emit_children_ops(&id, &mut ops, emitted, produced);
+            self.emit_children_ops(&id, &mut ops, emitted, produced, cache);
             if ops.is_empty() {
                 continue;
             }
@@ -5307,38 +5569,47 @@ impl GfxState {
         &self,
         id: &LayerId,
         out: &mut Vec<Op>,
-        emitted: &BTreeSet<LayerId>,
-        produced: &BTreeSet<LayerId>,
+        emitted: &rustc_hash::FxHashSet<LayerId>,
+        produced: &rustc_hash::FxHashSet<LayerId>,
+        cache: &mut ProbeCache,
     ) {
         let Some(node) = self.nodes.get(id) else {
             return;
         };
         if node.layer.is_group() {
-            if node.layer.visible && emitted.contains(id) && self.group_has_visible_content(id) {
-                if let Some(op) = self.group_transition_op(id, &node.layer) {
+            if node.layer.visible
+                && emitted.contains(id)
+                && self.group_has_visible_content(id, cache)
+            {
+                if let Some(op) = self.group_transition_op(id, &node.layer, cache) {
                     out.push(op);
                 } else {
                     out.push(Op::Group(crate::group::GroupDraw {
-                        layer: node.layer.clone(),
+                        layer: Arc::clone(&node.layer),
                         offscreen: id.clone(),
                     }));
                 }
             }
             return;
         }
-        self.emit_image_subtree(id, out, emitted, produced);
+        self.emit_image_subtree(id, out, emitted, produced, cache);
     }
 
     /// 组(layer set)上的 `T/TA/TID`:引擎按层表统一解析配对(组也是层),
     /// 把组离屏纹理当作 `YS_Texture1`;配对可以是图像层或组。
     /// 未取证到独立微场景前标 `Likely`,但不再静默当普通组画掉。
-    fn group_transition_op(&self, id: &LayerId, layer: &Layer) -> Option<Op> {
+    fn group_transition_op(
+        &self,
+        id: &LayerId,
+        layer: &Arc<Layer>,
+        cache: &mut ProbeCache,
+    ) -> Option<Op> {
         let t = layer.transition.as_ref()?;
         let fade = t.fade_value()?;
         let tid = t.tid.as_ref()?;
-        let to = self.transition_pair(tid)?;
-        let mut l = layer.clone();
-        l.set_texture_status(LayerStatus::Executable);
+        let to = self.transition_pair(tid, cache)?;
+        let mut l = Arc::clone(layer);
+        Arc::make_mut(&mut l).set_texture_status(LayerStatus::Executable);
         Some(Op::Transition(TransitionDraw {
             from: TextureRef::Offscreen(id.clone()),
             to: Some(to),
@@ -5358,17 +5629,18 @@ impl GfxState {
         &self,
         parent: &LayerId,
         out: &mut Vec<Op>,
-        emitted: &BTreeSet<LayerId>,
-        produced: &BTreeSet<LayerId>,
+        emitted: &rustc_hash::FxHashSet<LayerId>,
+        produced: &rustc_hash::FxHashSet<LayerId>,
+        cache: &mut ProbeCache,
     ) {
-        for child in self.sorted_children(Some(parent)) {
-            self.emit_node_ops(&child, out, emitted, produced);
+        for child in self.sorted_children(Some(parent), cache).iter() {
+            self.emit_node_ops(child, out, emitted, produced, cache);
         }
     }
 
     /// 本帧有可执行加工/复制把像素写进表面的层(官方 `层+0x90`)。
-    fn surface_producers(&self) -> BTreeSet<LayerId> {
-        let mut produced = BTreeSet::new();
+    fn surface_producers(&self) -> rustc_hash::FxHashSet<LayerId> {
+        let mut produced = rustc_hash::FxHashSet::default();
         for image in &self.image_log {
             if image.status == OpStatus::Executable {
                 produced.insert(image.target.clone().unwrap_or_else(|| image.source.clone()));
@@ -5388,8 +5660,9 @@ impl GfxState {
         &self,
         id: &LayerId,
         out: &mut Vec<Op>,
-        emitted: &BTreeSet<LayerId>,
-        produced: &BTreeSet<LayerId>,
+        emitted: &rustc_hash::FxHashSet<LayerId>,
+        produced: &rustc_hash::FxHashSet<LayerId>,
+        cache: &mut ProbeCache,
     ) {
         enum Frame {
             Enter(LayerId),
@@ -5404,11 +5677,11 @@ impl GfxState {
                         continue;
                     };
                     stack.push(Frame::Emit(id.clone()));
-                    for child in self.sorted_children(Some(&id)).into_iter().rev() {
-                        if self.nodes.get(&child).is_some_and(|n| n.layer.is_group()) {
-                            stack.push(Frame::Group(child));
+                    for child in self.sorted_children(Some(&id), cache).iter().rev() {
+                        if self.nodes.get(child).is_some_and(|n| n.layer.is_group()) {
+                            stack.push(Frame::Group(child.clone()));
                         } else {
-                            stack.push(Frame::Enter(child));
+                            stack.push(Frame::Enter(child.clone()));
                         }
                     }
                     let _ = node;
@@ -5419,13 +5692,13 @@ impl GfxState {
                     };
                     if node.layer.visible
                         && emitted.contains(&id)
-                        && self.group_has_visible_content(&id)
+                        && self.group_has_visible_content(&id, cache)
                     {
-                        if let Some(op) = self.group_transition_op(&id, &node.layer) {
+                        if let Some(op) = self.group_transition_op(&id, &node.layer, cache) {
                             out.push(op);
                         } else {
                             out.push(Op::Group(crate::group::GroupDraw {
-                                layer: node.layer.clone(),
+                                layer: Arc::clone(&node.layer),
                                 offscreen: id,
                             }));
                         }
@@ -5448,17 +5721,18 @@ impl GfxState {
                     let has_surface =
                         !matches!(node.layer.texture, TextureRef::None) || produced.contains(&id);
                     if node.layer.visible && has_surface {
-                        out.push(self.op_for_layer(&node.layer));
+                        out.push(self.op_for_layer(&node.layer, cache));
                     }
                 }
             }
         }
     }
 
-    fn op_for_layer(&self, layer: &Layer) -> Op {
+    fn op_for_layer(&self, layer: &Arc<Layer>, cache: &mut ProbeCache) -> Op {
         if !layer.parts.is_empty() {
-            let mut l = layer.clone();
-            l.set_texture_status(LayerStatus::Unimplemented("gfx.parts.unsupported"));
+            let mut l = Arc::clone(layer);
+            Arc::make_mut(&mut l)
+                .set_texture_status(LayerStatus::Unimplemented("gfx.parts.unsupported"));
             return Op::Layer(l);
         }
         // 空 TID = 引擎不查配对(`0x413e7b` 空串直接跳过);
@@ -5474,17 +5748,17 @@ impl GfxState {
                 // (boot logo 用 `CGACT[SIZE]`/`CGACT[REVERSE]`),因此这里只按
                 // 层状态取纹理,不含任何图层命名约定(EVID-T-10)。
                 let from = layer.texture.clone();
-                let to = self.transition_pair(tid);
+                let to = self.transition_pair(tid, cache);
                 if let Some(to) = to {
-                    let mut l = layer.clone();
-                    l.set_texture_status(LayerStatus::Executable);
+                    let mut l = Arc::clone(layer);
+                    Arc::make_mut(&mut l).set_texture_status(LayerStatus::Executable);
                     return Op::Transition(TransitionDraw {
                         from,
                         to: Some(to),
                         // 官方 `YS_Texture2` 取配对层**基图**(`+0x21c`),
                         // 不是 CGACT 加工表面(`+0x90`)。配对层是空壳、
                         // 图案由 SIZE 从另一层做进表面时,基图 = 图案资产。
-                        to_base: self.transition_mask_base(tid),
+                        to_base: self.transition_mask_base(tid, cache),
                         fade,
                         t: t.t,
                         ta: t.ta,
@@ -5500,7 +5774,7 @@ impl GfxState {
         // 111-119),但取值通道/尺寸/采样未取证。内核按普通层绘制基图,
         // `Layer.mask` 保留在帧 JSON 中;不再产出后端必然跳过的 `Op::Mask`
         // (旧行为会让整层消失,违反“未取证字段不得丢整层”)。
-        Op::Layer(layer.clone())
+        Op::Layer(Arc::clone(layer))
     }
 
     /// `TID` 配对层 → 可取样纹理(引擎 `YS_Texture2`)。
@@ -5508,10 +5782,10 @@ impl GfxState {
     /// 组 → 离屏纹理;图像层 → 该层当前纹理。空纹理(= 层不存在内容)或
     /// 无可见内容的组视为“配对不可用”,由调用方回退单纹理普通层
     /// (asm `0x415558-0x415577` 同族判定)。
-    fn transition_pair(&self, tid: &LayerId) -> Option<TextureRef> {
+    fn transition_pair(&self, tid: &LayerId, cache: &mut ProbeCache) -> Option<TextureRef> {
         self.nodes.get(tid).and_then(|n| {
             if n.layer.is_group() {
-                if self.group_has_visible_content(tid) {
+                if self.group_has_visible_content(tid, cache) {
                     Some(TextureRef::Offscreen(tid.clone()))
                 } else {
                     None
@@ -5537,7 +5811,16 @@ impl GfxState {
     /// 图案由 `CGACT[ID=$TRBUF ID2=$TR1 SIZE=1]` 做进表面时,基图取自该
     /// SIZE 命令的 `source_texture`(图案资产本体)。没有基图时返回 `None`,
     /// 由后端回退加工表面。
-    fn transition_mask_base(&self, tid: &LayerId) -> Option<TextureRef> {
+    fn transition_mask_base(&self, tid: &LayerId, cache: &mut ProbeCache) -> Option<TextureRef> {
+        if let Some(hit) = cache.mask_base.get(tid) {
+            return hit.clone();
+        }
+        let result = self.transition_mask_base_uncached(tid);
+        cache.mask_base.insert(tid.clone(), result.clone());
+        result
+    }
+
+    fn transition_mask_base_uncached(&self, tid: &LayerId) -> Option<TextureRef> {
         let node = self.nodes.get(tid)?;
         if !matches!(
             node.layer.texture,
@@ -5577,25 +5860,67 @@ impl GfxState {
     }
 
     fn push_diag(&mut self, command: &str, d: Diag) {
+        // 投影缓存按代次失效:count/at 也是输出的一部分,每次追加都递增。
+        self.diags_rev = self.diags_rev.wrapping_add(1);
+        // 快路径(#8):与上一次诊断同键时零分配。演出期重复诊断(缺层
+        // CGEND/轮询/幂等空操作)占绝大多数;旧实现每次都要
+        // `format!("s{script}")` + 键三元组分配 + `FrameDiag::new` 克隆。
+        let same_as_last = self.last_diag_key.as_ref().is_some_and(|k| {
+            k.0 == d.code.as_ref() && k.1 == command && k.2 == d.detail
+        });
+        if same_as_last {
+            // 位置标签只按脚本号缓存,已登记位置不构造 `DiagAt`。
+            let cur = self.cur_call;
+            let label = cur.map(|(script, _)| self.script_label(script));
+            if let Some(key) = self.last_diag_key.as_ref() {
+                if let Some(existing) = self.diags.get_mut(&**key) {
+                    existing.count = existing.count.saturating_add(1);
+                    // S1:聚合丢计数可以,丢位置不行。
+                    if let (Some(label), Some((_, pc))) = (label, cur) {
+                        note_at(existing, &label, pc, &self.cur_call_cmd);
+                    }
+                    return;
+                }
+            }
+        }
         let at = self.diag_at();
-        let key = (d.code.to_string(), command.to_string(), d.detail.clone());
-        match self.diags.get_mut(&key) {
+        let key: std::rc::Rc<(String, String, String)> = std::rc::Rc::new((
+            d.code.to_string(),
+            command.to_string(),
+            d.detail.clone(),
+        ));
+        match self.diags.get_mut(&*key) {
             Some(existing) => {
                 existing.count = existing.count.saturating_add(1);
-                // S1:聚合丢计数可以,丢位置不行。
                 if let Some(at) = at {
                     existing.push_at(&at);
                 }
             }
             None => {
-                let mut frame_diag =
-                    error::FrameDiag::new(d.code.to_string(), d.severity, command, d.detail.clone());
+                let mut frame_diag = error::FrameDiag::new(
+                    d.code.to_string(),
+                    d.severity,
+                    command,
+                    d.detail.clone(),
+                );
                 if let Some(at) = at {
                     frame_diag.push_at(&at);
                 }
-                self.diags.insert(key, frame_diag);
+                self.diags.insert(std::rc::Rc::clone(&key), frame_diag);
             }
         }
+        self.last_diag_key = Some(key);
+    }
+
+    /// `"s{script}"` 标签(按脚本号缓存;格式与旧 `diag_at` 逐字一致)。
+    fn script_label(&mut self, script: u32) -> std::rc::Rc<str> {
+        if let Some(hit) = self.script_labels.get(&script) {
+            return std::rc::Rc::clone(hit);
+        }
+        let label: std::rc::Rc<str> = std::rc::Rc::from(format!("s{script}").as_str());
+        self.script_labels
+            .insert(script, std::rc::Rc::clone(&label));
+        label
     }
 
     fn push_copy_log(&mut self, op: CopyOp) {
@@ -5670,6 +5995,7 @@ impl GfxState {
         if !pure_write {
             return;
         }
+        // 缺省: 未指定 target 时目标就是源。
         let target = op.target.as_ref().unwrap_or(&op.source);
         // 缩放族源=目标时是原地重采样(会叠加),不能折叠。
         //
@@ -5802,6 +6128,7 @@ impl GfxState {
             read_seqs.sort_unstable();
             let mut dropped = 0usize;
             self.image_log.retain(|old| {
+                // 缺省: 未指定 target 时目标就是源。
                 let old_target = old.target.as_ref().unwrap_or(&old.source);
                 if old_target != target || old.seq >= paint_seq {
                     return true;
@@ -5913,6 +6240,22 @@ fn int_arg(v: &Value) -> Option<i64> {
     }
 }
 
+/// 位置登记(免构造 `DiagAt`:已登记的 `(script, pc, cmd)` 零分配 no-op)。
+fn note_at(existing: &mut error::FrameDiag, script: &str, pc: u32, cmd: &str) {
+    if existing
+        .at
+        .iter()
+        .any(|a| a.pc == pc && a.script == script && a.cmd.as_deref() == Some(cmd))
+    {
+        return;
+    }
+    existing.push_at(&error::DiagAt {
+        script: script.to_string(),
+        pc,
+        cmd: Some(cmd.to_string()),
+    });
+}
+
 /// 官方 `CGINFO` 处理体 `0x43d758..0x43dddf` 的字段检查顺序。
 ///
 /// 每个字段是 `movzx ecx, byte [0x684160+idx]; test; je next`,第一个
@@ -5924,19 +6267,6 @@ const CGINFO_FLAG_ORDER: &[&str] = &[
     "FBY", "FEX", "FEY", "FEZ", "TEX", "ONMOUSE", "ONMOUSE2", "ONMOUSE3", "COLOR", "TRIM", "LINT",
     "LINT2", "MFILE",
 ];
-
-/// 按官方 if/else 链的字段顺序取第一个置位项。
-fn first_flag<'a>(
-    flags: &BTreeMap<&'a str, i64>,
-    order: &[&'static str],
-) -> Result<Option<(&'static str, i64)>, Diag> {
-    for name in order {
-        if let Some(value) = flags.get(name) {
-            return Ok(Some((*name, *value)));
-        }
-    }
-    Ok(None)
-}
 
 /// INFO 查询必须只置位一个字段;多字段写回顺序未取证。
 fn single_flag<'a>(
@@ -5962,7 +6292,8 @@ fn arg_type_diag(command: &str, name: &str, expected: &str) -> Diag {
     )
 }
 
-fn flag_value(v: &Value) -> bool {    match v {
+fn flag_value(v: &Value) -> bool {
+    match v {
         Value::Int(i) => *i != 0,
         Value::Float(f) => *f != 0.0,
         Value::Str(b) => !b.is_empty(),
@@ -6014,7 +6345,10 @@ fn display_key(key: &[u8]) -> String {
 ///
 /// 旧签名返回 `Vec<u8>`(`as_bytes().to_vec()`),`CG` 每条命令都要为
 /// `FILE`/`MID` 各复制一次;调用方都是即时读取,借用足够。
-fn find_str<'a>(params: &'a [(std::rc::Rc<str>, EngineValue, bool)], name: &str) -> Option<&'a [u8]> {
+fn find_str<'a>(
+    params: &'a [(std::rc::Rc<str>, EngineValue, bool)],
+    name: &str,
+) -> Option<&'a [u8]> {
     params
         .iter()
         .find(|(n, _, _)| &**n == name)
@@ -6032,7 +6366,10 @@ fn flag(params: &[(std::rc::Rc<str>, EngineValue, bool)], name: &str) -> bool {
     })
 }
 
-fn take_file(params: &[(std::rc::Rc<str>, EngineValue, bool)], diags: &mut Vec<Diag>) -> Option<TextureRef> {
+fn take_file(
+    params: &[(std::rc::Rc<str>, EngineValue, bool)],
+    diags: &mut Vec<Diag>,
+) -> Option<TextureRef> {
     for (name, value, _offset) in params {
         if &**name != "FILE" {
             continue;
@@ -6729,7 +7066,8 @@ fn apply_layer_params(
                     // 官方 `CG[TEX=1]` 是“空层转图像层”的动作(`0x42baa5`),
                     // 其它值无副作用;`CGINFO[TEX]` 读的是 `+0xa4` 层种类,
                     // 不是这里的写入值。保留原值仅供审计/JSON。
-                    layer.extra.insert("TEX".to_string(), EngineValue::Int(n));
+                    layer.extra
+                        .insert(std::rc::Rc::from("TEX"), EngineValue::Int(n));
                     layer.tex = n;
                 }
                 None => diags.push(error::recoverable(
@@ -6763,7 +7101,8 @@ fn apply_layer_params(
                         }
                     }
                     None => {
-                        layer.extra.insert("MODE".to_string(), EngineValue::Int(n));
+                        layer.extra
+                            .insert(std::rc::Rc::from("MODE"), EngineValue::Int(n));
                         mark_param_unimplemented(layer, "gfx.blend.unsupported");
                         diags.push(error::unimplemented(
                             error::code::BLEND_UNSUPPORTED,
@@ -6849,7 +7188,7 @@ fn apply_layer_params(
             // `RID` 都缺才报 `0x18b6e`(`0x42bb29..0x42bb43`)。本内核没有
             // 资源(PSB/E-mote)provider ⇒ 显式挂号,不当作「非视觉参数」。
             "RID" => {
-                layer.extra.insert(name.to_string(), value.clone());
+                layer.extra.insert(std::rc::Rc::clone(name), value.clone());
                 mark_param_unimplemented(layer, "gfx.image.rid.unsupported");
                 diags.push(error::unimplemented(
                     error::code::IMAGE_RID_UNSUPPORTED,
@@ -6868,7 +7207,7 @@ fn apply_layer_params(
             // - `REMALLOC`:引擎写字节字段 `+0x99`(`0x42b6a4`),消费方未定位;
             //   `es_Sprite.yst:8652` 的注释是「//メモリ再確保しない」。
             "LINT" | "LINT2" | "REMALLOC" => {
-                layer.extra.insert(name.to_string(), value.clone());
+                layer.extra.insert(std::rc::Rc::clone(name), value.clone());
             }
             // `TSX`/`TSY`/`MFILE`/`CASH`:引擎 CG 处理体(入口 `0x42a514`,
             // `mov eax,1; call 0x429fd1`)**从不读取**这四个槽位 —— 全量扫描
@@ -6877,14 +7216,14 @@ fn apply_layer_params(
             // (`TSX=9 TSY=10 MFILE=36 CASH=42`,下标即 yscm 声明序)。
             // 引擎只把它们当合法参数接受 ⇒ 本内核同样接受并留档,不报「未分类」。
             "TSX" | "TSY" | "MFILE" | "CASH" => {
-                layer.extra.insert(name.to_string(), value.clone());
+                layer.extra.insert(std::rc::Rc::clone(name), value.clone());
             }
             // `DXDRAW`:引擎读它(`0x42b6b7`),但**只看一个全局开关**:
             // `DAT_008012e4` 非零时对本层调 `0x42c400` + `0x409cd8`(强制
             // 重绘)并置脏位,否则完全跳过。不是图层属性、不改几何/像素,
             // 本内核没有对应设备路径 ⇒ 留档。
             "DXDRAW" => {
-                layer.extra.insert(name.to_string(), value.clone());
+                layer.extra.insert(std::rc::Rc::clone(name), value.clone());
             }
             // `MIPMAP`:引擎把值减 1 后留用(`0x42b064`),但引擎**从不生成
             // mip 链**(`FUN_00460924` 固定 `MIP=POINT`,render-parity §6)
@@ -6893,7 +7232,7 @@ fn apply_layer_params(
             // 不是图层字段;本内核没有对应设备路径。
             // 两者都只留档。
             "MIPMAP" | "DXBUF" => {
-                layer.extra.insert(name.to_string(), value.clone());
+                layer.extra.insert(std::rc::Rc::clone(name), value.clone());
             }
             // ---- 仿射/滤镜族(引擎 `+0x1b0..+0x214`)----
             //
@@ -6978,10 +7317,10 @@ fn apply_layer_params(
             // (`0x42b5c6..0x42b5d8`,与 `MID` 共用同一块缓冲)。本内核的
             // `MID` 外部掩码链路本身未取证(DIV-GFX-005),这里同样只留档。
             "FID" => {
-                layer.extra.insert(name.to_string(), value.clone());
+                layer.extra.insert(std::rc::Rc::clone(name), value.clone());
             }
             other => {
-                layer.extra.insert(other.to_string(), value.clone());
+                layer.extra.insert(std::rc::Rc::from(other), value.clone());
                 diags.push(error::unimplemented(
                     error::code::PARAM_NONVISUAL,
                     format!("参数 `{other}` 已原样保留,视觉语义未分类"),
@@ -7056,10 +7395,12 @@ fn apply_layer_params(
         }
     } else {
         if let Some(v) = sx {
-            layer.extra.insert("SX".to_string(), EngineValue::Int(v));
+            layer.extra
+                .insert(std::rc::Rc::from("SX"), EngineValue::Int(v));
         }
         if let Some(v) = sy {
-            layer.extra.insert("SY".to_string(), EngineValue::Int(v));
+            layer.extra
+                .insert(std::rc::Rc::from("SY"), EngineValue::Int(v));
         }
         // 引擎层矩形 `+0x78/+0x7c` 是**绘制目标尺寸**,绘制体按矩形缩放纹理
         // (`FUN_00408724` 用矩形;纹理过滤沿 D3D 阶段)。两后端已按

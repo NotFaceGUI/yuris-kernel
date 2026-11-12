@@ -48,7 +48,7 @@
 
 use crate::{missing, Codec, DataSource, DirTree, Entry, LookupKey};
 use flate2::read::ZlibDecoder;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -155,13 +155,27 @@ pub fn name_len_code(name_len: u8, version: u32) -> u8 {
 /// 官方包实测: 索引 `nameHash` = `murmur2(name, 0)`,`payloadHash` =
 /// `murmur2(存储字节, 0)`,各 1,407/1,407 相等。
 pub fn murmur2(data: &[u8], seed: u32) -> u32 {
+    murmur2_xor(data, 0, seed)
+}
+
+/// 逐字节 XOR `key` 后的 MurmurHash2,**零分配**。
+///
+/// 等价于 `murmur2(&data.iter().map(|b| b ^ key).collect::<Vec<_>>(), seed)`,
+/// 但只在读字节处异或,不构造中间缓冲。名字 key 探测要对每个候选 key
+/// (最多 256 个)重算一遍;12k 条包下逐 key 分配 Vec 是纯浪费。
+pub fn murmur2_xor(data: &[u8], key: u8, seed: u32) -> u32 {
     const M: u32 = 0x5bd1_e995;
     const R: u32 = 24;
 
     let mut h: u32 = seed ^ (data.len() as u32);
     let mut chunks = data.chunks_exact(4);
     for chunk in &mut chunks {
-        let mut k = u32::from_le_bytes(chunk.try_into().unwrap());
+        let mut k = u32::from_le_bytes([
+            chunk[0] ^ key,
+            chunk[1] ^ key,
+            chunk[2] ^ key,
+            chunk[3] ^ key,
+        ]);
         k = k.wrapping_mul(M);
         k ^= k >> R;
         k = k.wrapping_mul(M);
@@ -171,18 +185,18 @@ pub fn murmur2(data: &[u8], seed: u32) -> u32 {
     let rem = chunks.remainder();
     match rem.len() {
         3 => {
-            h ^= (rem[2] as u32) << 16;
-            h ^= (rem[1] as u32) << 8;
-            h ^= rem[0] as u32;
+            h ^= (u32::from(rem[2] ^ key)) << 16;
+            h ^= (u32::from(rem[1] ^ key)) << 8;
+            h ^= u32::from(rem[0] ^ key);
             h = h.wrapping_mul(M);
         }
         2 => {
-            h ^= (rem[1] as u32) << 8;
-            h ^= rem[0] as u32;
+            h ^= (u32::from(rem[1] ^ key)) << 8;
+            h ^= u32::from(rem[0] ^ key);
             h = h.wrapping_mul(M);
         }
         1 => {
-            h ^= rem[0] as u32;
+            h ^= u32::from(rem[0] ^ key);
             h = h.wrapping_mul(M);
         }
         _ => {}
@@ -296,7 +310,10 @@ pub struct YpfSource {
     dialect: YpfDialect,
     stats: YpfParseStats,
     entries: Vec<YpfEntryInfo>,
-    lookup: BTreeMap<LookupKey, usize>,
+    /// 精确查找表。**只做 membership/取值,从不参与输出迭代**,故用
+    /// `HashMap`(与 `DirSource.files` 同口径)。`LookupKey` 实现
+    /// `Borrow<[u8]>`,按原始字节查也行。
+    lookup: HashMap<LookupKey, usize>,
     tree: DirTree,
     file: Mutex<File>,
     warnings: Vec<Diag>,
@@ -397,24 +414,24 @@ impl YpfSource {
         let (dialect, mut entries, stats, warnings) =
             detect_layout(&block, version, entry_count, data_start, file_len, codec, &path)?;
 
-        let mut lookup = BTreeMap::new();
+        let mut lookup = HashMap::new();
         let mut tree = DirTree::new();
         for (idx, info) in entries.iter_mut().enumerate() {
             if info.normalized.is_root() && !info.name.is_empty() {
                 info.normalized = LookupKey::new(&info.name, codec)?;
             }
-            let key = info.normalized.clone();
-            if lookup.contains_key(&key) {
+            // 一次 `insert` 同时判重与登记,省掉 `contains_key` 的二次查找;
+            // 审计表不参与输出迭代,哈希顺序不影响任何结果。
+            if lookup.insert(info.normalized.clone(), idx).is_some() {
                 // 引擎的重复名处理(名称互换/后到者禁用)证据不足;静默
                 // first-wins 会让查找结果偏离引擎,故直接 Fatal。
                 return Err(Diag::fatal(code::vfs::YPF_DUPLICATE_NAME, Boundary::Data)
-                    .at_data(key.as_bytes().to_vec(), 0)
+                    .at_data(info.normalized.as_bytes().to_vec(), 0)
                     .with_detail(format!(
                         "duplicate normalized entry name (entry {idx});                          engine duplicate-name semantics are not verified"
                     )));
             }
-            lookup.insert(key.clone(), idx);
-            tree.insert_file(&key, info.uncompressed_size as u64)?;
+            tree.insert_file(&info.normalized, info.uncompressed_size as u64)?;
         }
 
         Ok(Self {
@@ -579,7 +596,10 @@ impl DataSource for YpfSource {
 
         if entry.compressed {
             let expected = entry.uncompressed_size as usize;
-            let mut out = Vec::with_capacity(expected.min(64 * 1024));
+            // 容量上限只防恶意包导致的巨量预分配;正常条目(实测均值
+            // ~359KB)一次到位,避免 64KB → 128KB → … 的倍增复制。
+            // 这只是容量提示,输出字节与校验完全不变。
+            let mut out = Vec::with_capacity(expected.min(64 * 1024 * 1024));
             let mut decoder = ZlibDecoder::new(&raw[..]).take(expected as u64 + 1);
             decoder.read_to_end(&mut out).map_err(|e| {
                 Diag::fatal(code::vfs::YPF_DECOMPRESS, Boundary::Data)
@@ -729,11 +749,21 @@ fn detect_layout(
         )));
     }
 
-    let mut entries = Vec::with_capacity(candidate.entries.len());
-    for raw in &candidate.entries {
+    // 统计与告警先取标量,随后按值消费条目(名字字节直接 move 进
+    // `YpfEntryInfo`,不再逐条 clone;`name_enc` 已在解码阶段被取空)。
+    let entry_len = candidate.entries.len();
+    let name_key = candidate.name_key;
+    let mismatches = candidate
+        .entries
+        .iter()
+        .filter(|e| !e.name_hash_ok)
+        .count();
+
+    let mut entries = Vec::with_capacity(entry_len);
+    for raw in candidate.entries {
         let normalized = LookupKey::new(&raw.name, codec)?;
         entries.push(YpfEntryInfo {
-            name: raw.name.clone(),
+            name: raw.name,
             normalized,
             name_hash: raw.name_hash,
             name_hash_ok: raw.name_hash_ok,
@@ -748,50 +778,42 @@ fn detect_layout(
         });
     }
 
-    let mismatches = candidate
-        .entries
-        .iter()
-        .filter(|e| !e.name_hash_ok)
-        .count();
     if mismatches > 0 {
         warnings.push(
             Diag::recoverable(code::vfs::YPF_HASH_MISMATCH, Boundary::Data)
                 .at_data(path_bytes(path), INDEX_START as u64)
                 .with_detail(format!(
-                    "{mismatches}/{} entries have name MurmurHash2 mismatch under key {:#04x}; official hash lookup would miss them",
-                    candidate.entries.len(),
-                    candidate.name_key
+                    "{mismatches}/{entry_len} entries have name MurmurHash2 mismatch under key {name_key:#04x}; official hash lookup would miss them"
                 )),
         );
     }
-    if candidate.name_key != 0xFF {
+    if name_key != 0xFF {
         warnings.push(
             Diag::unimplemented(code::vfs::YPF_UNSUPPORTED, Boundary::Data)
                 .at_data(path_bytes(path), INDEX_START as u64)
                 .with_detail(format!(
-                    "name key {:#04x} differs from the engine's 0xFF; layout is not verified",
-                    candidate.name_key
+                    "name key {name_key:#04x} differs from the engine's 0xFF; layout is not verified"
                 )),
         );
     }
 
     let stats = YpfParseStats {
         declared_entries: entry_count,
-        parsed_entries: candidate.entries.len(),
+        parsed_entries: entry_len,
         index_start: INDEX_START,
         index_bytes: block.len(),
         consumed_bytes: candidate.consumed,
         closed: candidate.closed,
         name_hash_matches: candidate.name_hash_matches,
-        name_key: candidate.name_key,
+        name_key,
         meta_len: ENTRY_META_LEN,
-        type_counts: candidate.type_counts.clone(),
+        type_counts: candidate.type_counts,
         compressed_entries: candidate.compressed_entries,
     };
     Ok((
         YpfDialect::HashedLen {
             index_start: INDEX_START,
-            name_key: candidate.name_key,
+            name_key,
         },
         entries,
         stats,
@@ -825,10 +847,7 @@ fn detect_name_key(entries: &[RawEntry]) -> u8 {
         seen[key as usize] = true;
         let score = entries
             .iter()
-            .filter(|e| {
-                let decoded: Vec<u8> = e.name_enc.iter().map(|b| b ^ key).collect();
-                murmur2(&decoded, 0) == e.name_hash
-            })
+            .filter(|e| murmur2_xor(&e.name_enc, key, 0) == e.name_hash)
             .count();
         let better = match best_score {
             None => true,
@@ -994,11 +1013,18 @@ fn parse_hashed_len(
     if !entries.is_empty() {
         name_key = detect_name_key(&entries);
         for entry in &mut entries {
-            entry.name = entry.name_enc.iter().map(|b| b ^ name_key).collect();
-            entry.name_hash_ok = murmur2(&entry.name, 0) == entry.name_hash;
+            // 名字哈希按「解码后字节」校验;等价于对 `name_enc` 做 XOR 版
+            // Murmur(零分配),之后再把已分配的 `name_enc` 原地 XOR 成
+            // 名字字节并 move 过去,不再分配第二个 Vec。
+            entry.name_hash_ok = murmur2_xor(&entry.name_enc, name_key, 0) == entry.name_hash;
             if entry.name_hash_ok {
                 name_hash_matches += 1;
             }
+            let mut name = std::mem::take(&mut entry.name_enc);
+            for b in &mut name {
+                *b ^= name_key;
+            }
+            entry.name = name;
         }
     }
 
@@ -1066,6 +1092,47 @@ mod tests {
         // MurmurHash2 参考实现的标准向量。
         assert_eq!(murmur2(b"", 0), 0);
         assert_eq!(murmur2(b"hello", 0), 0xe561_29cb);
+    }
+
+    /// #16:`murmur2_xor` 必须在全部 256 个 key 上与"先逐字节 XOR 再哈希"
+    /// 逐位相同(零分配只是手段,结果等价才是约束)。
+    #[test]
+    fn murmur2_xor_matches_bytewise_for_all_keys() {
+        let xor = |data: &[u8], key: u8| -> Vec<u8> {
+            data.iter().map(|b| b ^ key).collect()
+        };
+        // 覆盖余数 0/1/2/3 与官方名字形态。
+        let samples: [&[u8]; 6] = [
+            b"",
+            b"a",
+            b"ab",
+            b"abc",
+            b"abcd",
+            br"ysbin\yst00034.ybn",
+        ];
+        let long: Vec<u8> = (0..257u32).map(|i| (i * 37 + 11) as u8).collect();
+        for key in 0u16..=255 {
+            let key = key as u8;
+            for data in samples {
+                assert_eq!(
+                    murmur2_xor(data, key, 0),
+                    murmur2(&xor(data, key), 0),
+                    "key {key:#04x} len {}",
+                    data.len()
+                );
+            }
+            assert_eq!(
+                murmur2_xor(&long, key, 0),
+                murmur2(&xor(&long, key), 0),
+                "long key {key:#04x}"
+            );
+            // seed 也必须原样参与。
+            assert_eq!(
+                murmur2_xor(&long, key, 0x1234_5678),
+                murmur2(&xor(&long, key), 0x1234_5678),
+                "seeded long key {key:#04x}"
+            );
+        }
     }
 
 

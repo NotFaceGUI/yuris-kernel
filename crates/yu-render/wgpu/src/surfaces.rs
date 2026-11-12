@@ -606,7 +606,7 @@ impl LayerSurfaces {
     /// 帧末回收:只保留各层当前内容纹理(以及被快照/别名钉住的)。
     ///
     /// `live` = 本帧仍存活的层;其余层从表里删除(显存不随场景累积)。
-    pub fn end_frame(&mut self, live: &std::collections::BTreeSet<LayerId>) {
+    pub fn end_frame(&mut self, live: &rustc_hash::FxHashSet<&LayerId>) {
         self.layers.retain(|id, state| {
             state.last_frame = self.frame;
             live.contains(id)

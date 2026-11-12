@@ -263,6 +263,17 @@ pub fn decode(
     }
     let mut groups = Vec::with_capacity(count.min(4096));
     let mut labels = LabelTable::default();
+    // 命令名 → 序号:**首次出现为准**,与 `CommandTable::index_of` 的
+    // `position()` 逐项等价。`decode` 每条指令都要按名回查声明,119 项
+    // 线性扫描在 10 万级指令上是千万次字符串比较;这里按借用建一次表,
+    // 键零字符串分配(仅工具/装载路径,热解释器不经过这里)。
+    let mut by_name: std::collections::HashMap<&str, u16> =
+        std::collections::HashMap::with_capacity(table.commands.len());
+    for (index, command) in table.commands.iter().enumerate() {
+        if let Ok(index) = u16::try_from(index) {
+            by_name.entry(command.name.as_ref()).or_insert(index);
+        }
+    }
     let mut arg_at = 0usize;
     for index in 0..count {
         let base = index * 4;
@@ -296,6 +307,7 @@ pub fn decode(
             arg_at += 12;
         }
         collect_label_refs(
+            &by_name,
             table,
             name,
             &windows,
@@ -341,6 +353,7 @@ pub fn decode(
 ///   的窗口 id 无一 ≥ 对应参数表长度。
 #[allow(clippy::too_many_arguments)]
 fn collect_label_refs(
+    by_name: &std::collections::HashMap<&str, u16>,
     table: &CommandTable,
     name: &str,
     windows: &[Window],
@@ -350,7 +363,7 @@ fn collect_label_refs(
     origin: &[u8],
     labels: &mut LabelTable,
 ) -> Result<(), Diag> {
-    let Some(index) = table.index_of(name) else {
+    let Some(index) = by_name.get(name).copied() else {
         return Ok(());
     };
     let Some(command) = table.commands.get(usize::from(index)) else {

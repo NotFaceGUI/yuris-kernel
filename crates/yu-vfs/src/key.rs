@@ -5,11 +5,22 @@
 //! 不变量(禁止逃出挂载根),不是对官方路径语义的猜测。
 
 use crate::codec::Codec;
+use std::borrow::Borrow;
 use yu_log::{code, Boundary, Diag};
 
 /// 归一后的字节查找键。空键表示挂载根。
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LookupKey(Vec<u8>);
+
+/// 允许 `HashMap<LookupKey, _>::get(bytes)` 直接按归一字节查询,免去
+/// 构造临时键。`LookupKey` 的派生 `Hash` 走 `Vec<u8>`,而 `Vec<u8>` 的
+/// `Hash` 就是对 `[u8]` 的哈希(长度前缀 + 原始字节),与 `[u8]` 一致;
+/// `Eq` 同样按字节比较,满足 `Borrow` 的一致性要求。
+impl Borrow<[u8]> for LookupKey {
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 impl LookupKey {
     /// 根键(空路径)。

@@ -62,7 +62,7 @@ pub fn normalize(id: &[u8], idno: Option<i64>, trailing_slash: bool) -> ParsedPa
         out.extend_from_slice(b":/W0/");
         out.extend_from_slice(id);
         return ParsedPath {
-            path: LayerId(out),
+            path: LayerId(out.into()),
             is_dir: false,
         };
     }
@@ -115,7 +115,7 @@ pub fn normalize_bytes(bytes: &[u8], trailing_slash: bool) -> ParsedPath {
         out.extend_from_slice(seg);
     }
     ParsedPath {
-        path: LayerId(out),
+        path: LayerId(out.into()),
         is_dir,
     }
 }
@@ -128,9 +128,9 @@ pub fn parent(path: &LayerId) -> Option<LayerId> {
     }
     let pos = b.iter().rposition(|&x| x == b'/')?;
     if pos <= 1 {
-        Some(LayerId(b":/".to_vec()))
+        Some(LayerId::new(b":/".to_vec()))
     } else {
-        Some(LayerId(b[..pos].to_vec()))
+        Some(LayerId::new(b[..pos].to_vec()))
     }
 }
 
@@ -159,7 +159,7 @@ pub fn child(parent: &LayerId, name: &[u8]) -> LayerId {
         b.push(b'/');
     }
     b.extend_from_slice(name);
-    LayerId(b)
+    LayerId(b.into())
 }
 
 /// 是否为根。
@@ -229,6 +229,6 @@ mod tests {
         assert_eq!(parent(&p).unwrap().display(), ":/W0");
         assert_eq!(depth(&p), 2);
         assert_eq!(leaf(&p), b"ABC");
-        assert!(is_root(&LayerId(b":/".to_vec())));
+        assert!(is_root(&LayerId::new(b":/".to_vec())));
     }
 }

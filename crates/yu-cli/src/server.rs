@@ -240,6 +240,7 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
             dropped_frames: 0,
             paused: false,
             report_json: "{\"ok\":false}".to_string(),
+            report_json_frame: u64::MAX,
             pid: std::process::id(),
             started_ms: epoch_ms(),
         }),
@@ -322,7 +323,10 @@ struct Status {
     boot_ms: f64,
     dropped_frames: u64,
     paused: bool,
+    /// 最近一次生成的完整后端报告 JSON(#69):同一渲染帧不重复生成。
     report_json: String,
+    /// `report_json` 对应的渲染帧号(`u64::MAX` = 尚未生成)。
+    report_json_frame: u64,
     pid: u32,
     started_ms: u128,
 }
@@ -727,7 +731,14 @@ fn update_status(shared: &Shared, engine: &Engine, paused: bool) {
         status.tick_avg = engine.tick_avg_ms();
         status.render_avg = engine.render_avg_ms();
         status.paused = paused;
-        status.report_json = render_report_json(engine.render_report());
+        // #69:报告 JSON 只随渲染帧变化;同一帧反复 `update_status`(每个
+        // 客户端连接/事件)不再逐条 `format!` + `json_escape`。
+        let report = engine.render_report();
+        let report_frame = report.map_or(u64::MAX, |r| r.frame);
+        if status.report_json_frame != report_frame {
+            status.report_json = render_report_json(report);
+            status.report_json_frame = report_frame;
+        }
     }
 }
 

@@ -3,6 +3,8 @@
 //! 后端只执行本枚举;任何语义缺项都用 [`OpStatus::Unimplemented`] 显式标记,
 //! 不允许后端“猜”公式或静默跳过。
 
+use std::sync::Arc;
+
 use crate::group::GroupDraw;
 use crate::layer::{CopyId, EngineValue, Layer, LayerId, TextureRef};
 use crate::text::TextDraw;
@@ -12,7 +14,7 @@ use crate::transition::TransitionDraw;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
     /// 普通纹理层。
-    Layer(Layer),
+    Layer(Arc<Layer>),
     /// 图层组的离屏合成结果作为一层绘制。
     Group(GroupDraw),
     /// 双纹理过渡。
@@ -58,7 +60,7 @@ pub enum OpStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MaskDraw {
     /// 被掩码的层(其 `mask` 字段同时给出掩码 ID)。
-    pub layer: Layer,
+    pub layer: Arc<Layer>,
     /// 掩码层 ID。
     pub mask: LayerId,
 }

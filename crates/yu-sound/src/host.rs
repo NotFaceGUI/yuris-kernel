@@ -30,11 +30,17 @@ impl SoundHost {
         self.state.clone()
     }
 
-    fn args_of<'a>(&'a self, ev: &'a VmEvent) -> Vec<(String, &'a Value)> {
+    /// 取事件参数视图:参数名按 `Cow` **借用**(来自工程 yscm 名表),
+    /// 不再逐条 `into_owned()` 成 String。名字查不到时的 `@<slot>` 兜底
+    /// 仍由 `domain_args` 产出 owned 形态,语义不变。
+    fn args_of<'a>(
+        &'a self,
+        ev: &'a VmEvent,
+    ) -> Vec<(std::borrow::Cow<'a, str>, &'a Value)> {
         ev.domain_args(&self.yscm)
             .map(|args| {
                 args.into_iter()
-                    .map(|a| (a.name.into_owned(), a.value))
+                    .map(|a| (a.name, a.value))
                     .collect()
             })
             .unwrap_or_default()
@@ -57,7 +63,7 @@ impl SoundHostTrait for SoundHost {
                     "SOUND" => {
                         let mut cmd = SoundCommand::default();
                         for (pname, value) in &args {
-                            match pname.as_str() {
+                            match pname.as_ref() {
                                 "ID" => match value {
                                     Value::Str(s) => cmd.id = s.clone(),
                                     _ => arg_type(&self.state, "ID", value),
@@ -95,7 +101,7 @@ impl SoundHostTrait for SoundHost {
                     "SOUNDEND" => {
                         let id = args
                             .iter()
-                            .find(|(n, _)| n == "ID")
+                            .find(|(n, _)| n.as_ref() == "ID")
                             .and_then(|(_, v)| match v {
                                 Value::Str(s) => Some(s.clone()),
                                 _ => None,

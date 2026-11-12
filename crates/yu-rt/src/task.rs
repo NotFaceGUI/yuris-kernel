@@ -262,7 +262,8 @@ pub trait TaskExecutor {
     /// 泵一条命令。`task.pc` 由执行器在返回前同步。
     fn step_command(&mut self, task: &mut TaskNode) -> Result<StepOutcome, String>;
     /// 同步本步可见的任务链投影(`TASKINFO` 的数据源)。
-    fn sync_task_view(&mut self, _view: &[TaskView]) {}
+    /// 调用方把**拥有权**交给执行器(直接接管,不再复制一遍)。
+    fn sync_task_view(&mut self, _view: Vec<TaskView>) {}
     /// 取走本条命令产生的调度副作用。
     fn drain_effects(&mut self) -> Vec<Effect> {
         Vec::new()
@@ -478,6 +479,7 @@ impl Scheduler {
             pending: Vec::new(),
             next_seq: self.next_seq,
             program_exit: None,
+            view_dirty: true,
         };
         let mut visited = 0usize;
         while visited < end {
@@ -605,6 +607,9 @@ struct PumpCtx {
     next_seq: u64,
     /// 本帧收到 `END` 后置位;所有泵循环据此立即收束。
     program_exit: Option<ProgramExit>,
+    /// 任务链投影是否需要重新同步(帧首/链变化时置位;同一帧内无链变化的
+    /// 后续任务泵入口直接复用上一份投影)。
+    view_dirty: bool,
 }
 
 fn pump_node(
@@ -620,8 +625,12 @@ fn pump_node(
     // 当前节点索引缓存:一次泵里绝大多数命令不改变任务链,逐条线性扫描
     // 整个任务表是纯浪费(场景构建帧 81 万条命令 × 上百个任务)。
     let mut cur_index: Option<usize> = None;
-    // 任务链投影只在链变化时同步(每条命令同步会克隆整条链,热路径不可接受)。
-    exec.sync_task_view(&view_of(nodes, &ctx.pending));
+    // 任务链投影只在链变化时同步(每条命令同步会克隆整条链,热路径不可接受);
+    // 视图整份 `Vec` 交给执行器接管,同一帧无链变化的后续泵入口直接复用。
+    if ctx.view_dirty {
+        exec.sync_task_view(view_of(nodes, &ctx.pending));
+        ctx.view_dirty = false;
+    }
     loop {
         if let Some(cap) = cap {
             if pumped >= cap {
@@ -696,7 +705,10 @@ fn pump_node(
         }
         if chain_changed {
             cur_index = None;
-            exec.sync_task_view(&view_of(nodes, &ctx.pending));
+            // 立即同步(同一泵内后续命令可能读 `TASKINFO`),并让同帧后续
+            // 任务泵入口复用这份投影。
+            exec.sync_task_view(view_of(nodes, &ctx.pending));
+            ctx.view_dirty = false;
         }
         if finished {
             break;
@@ -737,6 +749,9 @@ fn pump_node(
                 pumped += 1;
                 nodes[cur].finished = true;
                 nodes[cur].steps += 1;
+                // 自然结束也是链变化:同逻辑帧内后续任务的泵入口必须看到
+                // `finished=true`(旧实现每泵入口同步一次)。
+                ctx.view_dirty = true;
                 break;
             }
             Ok(StepOutcome::ExitProgram { restart }) => {
@@ -750,6 +765,7 @@ fn pump_node(
                 nodes[cur].finished = true;
                 nodes[cur].steps += 1;
                 ctx.program_exit = Some(ProgramExit { restart });
+                ctx.view_dirty = true;
                 break;
             }
             Err(e) => {
@@ -771,6 +787,7 @@ fn pump_node(
                 }
                 nodes[cur].finished = true;
                 nodes[cur].steps += 1;
+                ctx.view_dirty = true;
                 break;
             }
         }
@@ -810,6 +827,12 @@ mod tests {
         effects_on_first: HashMap<String, Vec<Effect>>,
         first_seen: HashMap<String, usize>,
         calls: Vec<String>,
+        /// 当前同步过来的任务链投影(`TASKINFO` 的数据源)。
+        view: Vec<TaskView>,
+        /// 每次 `step_command` 时看到的“未结束任务 ID”清单(C-01 回归用)。
+        unfinished_at_call: Vec<(String, Vec<String>)>,
+        /// 首次执行该任务时返回错误(Err 路径回归用)。
+        fail_once: HashMap<String, String>,
     }
 
     impl MockExec {
@@ -819,6 +842,9 @@ mod tests {
                 effects_on_first: HashMap::new(),
                 first_seen: HashMap::new(),
                 calls: Vec::new(),
+                view: Vec::new(),
+                unfinished_at_call: Vec::new(),
+                fail_once: HashMap::new(),
             }
         }
         fn script(mut self, id: &str, outs: Vec<StepOutcome>) -> Self {
@@ -829,6 +855,10 @@ mod tests {
             self.effects_on_first.insert(id.to_string(), e);
             self
         }
+        fn fail_once(mut self, id: &str, msg: &str) -> Self {
+            self.fail_once.insert(id.to_string(), msg.to_string());
+            self
+        }
         fn count(&self, id: &str) -> usize {
             self.calls.iter().filter(|c| c.as_str() == id).count()
         }
@@ -837,12 +867,26 @@ mod tests {
     impl TaskExecutor for MockExec {
         fn step_command(&mut self, task: &mut TaskNode) -> Result<StepOutcome, String> {
             self.calls.push(task.id.clone());
+            let unfinished = self
+                .view
+                .iter()
+                .filter(|v| !v.finished)
+                .map(|v| v.id.clone())
+                .collect();
+            self.unfinished_at_call
+                .push((task.id.clone(), unfinished));
             task.pc += 1;
+            if let Some(msg) = self.fail_once.remove(&task.id) {
+                return Err(msg);
+            }
             Ok(self
                 .scripts
                 .get_mut(&task.id)
                 .and_then(|q| q.pop_front())
                 .unwrap_or(StepOutcome::Yield))
+        }
+        fn sync_task_view(&mut self, view: Vec<TaskView>) {
+            self.view = view;
         }
         fn drain_effects(&mut self) -> Vec<Effect> {
             let Some(id) = self.calls.last().cloned() else {
@@ -1039,5 +1083,49 @@ mod tests {
         let mut exec = MockExec::new().script("a", v);
         let r = s.tick_frame(&mut exec, 0);
         assert_eq!(r.commands_pumped, 5001);
+    }
+
+    /// C-01 回归:同一逻辑帧内 A 自然 RETURN 后,后续任务泵入口必须看到
+    /// `A.finished=true`(否则 `TASKINFO[EXIST ID=A]` 读到 1 而非 0)。
+    #[test]
+    fn natural_finish_is_visible_to_next_task_in_same_frame() {
+        let mut s = Scheduler::new();
+        s.spawn(seed_z("a", 2));
+        s.spawn(seed_z("b", 1));
+        let mut exec = MockExec::new()
+            .script("a", vec![StepOutcome::Finish])
+            .script("b", vec![StepOutcome::Yield]);
+        s.tick_frame(&mut exec, 0);
+        let (_, b_view) = exec
+            .unfinished_at_call
+            .iter()
+            .find(|(id, _)| id == "b")
+            .expect("b 必须在同一逻辑帧内被泵");
+        assert!(
+            !b_view.iter().any(|id| id == "a"),
+            "A 自然 RETURN 后同帧 B 必须看到 A 已结束(TASKINFO EXIST=0),实际视图 {b_view:?}"
+        );
+    }
+
+    /// C-01 回归:任务执行报错(Err 路径)同样立刻对同帧后续任务可见。
+    #[test]
+    fn error_finish_is_visible_to_next_task_in_same_frame() {
+        let mut s = Scheduler::new();
+        s.spawn(seed_z("a", 2));
+        s.spawn(seed_z("b", 1));
+        let mut exec = MockExec::new()
+            .fail_once("a", "boom")
+            .script("b", vec![StepOutcome::Yield]);
+        let r = s.tick_frame(&mut exec, 0);
+        assert_eq!(r.errors.len(), 1, "错误必须记录");
+        let (_, b_view) = exec
+            .unfinished_at_call
+            .iter()
+            .find(|(id, _)| id == "b")
+            .expect("b 必须在同一逻辑帧内被泵");
+        assert!(
+            !b_view.iter().any(|id| id == "a"),
+            "A 报错结束后同帧 B 必须看到 A 已结束,实际视图 {b_view:?}"
+        );
     }
 }

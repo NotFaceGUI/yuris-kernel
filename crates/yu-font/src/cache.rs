@@ -164,12 +164,13 @@ impl GlyphCache {
 
     #[must_use]
     pub fn get(&mut self, key: &GlyphKey) -> Option<Arc<GlyphImage>> {
-        if !self.entries.contains_key(key) {
+        // 先取 tick,再单次 `get_mut`:原实现 `contains_key` + `get_mut`
+        // 对同一键做两次 SipHash(键约 40B),命中路径白付一次。
+        let tick = self.next_tick();
+        let Some(entry) = self.entries.get_mut(key) else {
             self.stats.misses += 1;
             return None;
-        }
-        let tick = self.next_tick();
-        let entry = self.entries.get_mut(key)?;
+        };
         let old_tick = entry.tick;
         entry.tick = tick;
         let image = Arc::clone(&entry.image);

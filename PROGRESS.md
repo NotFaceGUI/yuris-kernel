@@ -14219,3 +14219,153 @@ yu-cli case <project-eris> --all:
   hash 与 target/tmp/ours-cases2.log 基线逐字相同(f67a4150… / db0ae966…),
   属既有金标漂移,本改动未引入差异
 ```
+
+## 成果 PERF-ABCD2 (2026-11-12) · 独立审查 P0/P1 清零 + T3/T4/T5a/T12/T13/T14 收口
+
+> 工作区改动（基线 `855a983`，未提交）。审查报告：
+> `docs/tasks/review-perf-abcd-2026-11-12.md`；台账与任务书已同步回写。
+
+**修复审查问题**
+
+- **C-01(P0)** `crates/yu-rt/src/task.rs`：自然 `Finish`/`ExitProgram{..}`/`Err`
+  三个分支在置 `finished=true` 后补 `ctx.view_dirty=true`，同逻辑帧内后续任务
+  泵入口立刻看到结束（恢复 `855a983` 的每泵同步语义）。新增回归
+  `natural_finish_is_visible_to_next_task_in_same_frame` 与
+  `error_finish_is_visible_to_next_task_in_same_frame`（MockExec 记录每步视图；
+  临时移除修复时两条均红）。
+- **C-02(P1)** `crates/yu-gfx/src/state.rs` + `host.rs`：新增
+  `GfxState::on_domain(domain,name,args,frame,script,pc)` 借用入口；
+  `GfxHost::apply_domain` 覆写为该入口。`record_events=false` 的
+  Graphics/Window 域事件不再 `name.to_string()+args.to_vec()` 深拷贝。
+- **C-03(P1)** `silent_fallback_audit` 转绿：`input.rs`×2、`value.rs`×2、
+  `vm.rs`×1 补 `// 缺省`；`state.rs` 基线既有 22 处补 4 条缺省标注降到
+  白名单 18；`handlers.rs` 白名单 92→80。
+- **C-04(P1)** record-events on/off 重跑：显示 JSON md5 三份一致
+  `e33019d72fbfe67c2972d5893b727883`；drained 计数 on=9,395,695 / off=18,296
+  与改前一致。
+
+**继续批次**
+
+- **T3(#3/#21/#22)**：`TextBuffer` 增内容代次与排版缓存（`reveal`/目标层
+  在场性每帧覆盖，不重排版）；`CompositorFrame.text_draws` 改
+  `Arc<[TextDraw]>` 按 `text_draws_rev` 共享；`LayerTexts.seen` 改
+  `FxHashMap<u64, Vec<TextDrawKey>>` 指纹分桶 + `matches_draw` 精确确认；
+  `TextGlyph.bytes` 改 `SmallVec<[u8;4]>`。
+- **T4(#5–#9)**：`CG`/`CGACT` 参数表 `SmallVec<[_;8]>`；`ParamTable::resolve`
+  返回迭代器（名字表只查一次）；`CGINFO` flags `u64` 位集；`CGEND`/`CGACT`
+  直接消费事件参数（新增启动期 `cgact_names`/`cgend_names`）；`push_diag`
+  「同上一键」零分配快路径 + `script_label` 缓存 + `note_at` 免构造
+  `DiagAt`；`Layer.extra: BTreeMap<Rc<str>, _>`。
+- **T5a(#18/#20/#30)**：新增 `ProbeCache`（排序子表/组可见性/过渡基图），
+  随 `frame()`/`capture_screen_snapshot()` 传递；membership 集合改
+  `FxHashSet`。
+- **T12(#4/#68/#69/#71/#73)**：`Vm::text_output_mode()` 新增，引擎手动文本
+  模式不再构造 `TextSnapshot`；`RenderReport` 走 `Arc`；serve `report_json`
+  按渲染帧缓存；Android `frame_pixels: Option<Arc<Surface>>`；winit
+  `KeyCode` 静态名表（194 变体，`#[non_exhaustive]` 回落 `Debug`）+
+  `button_code` HashMap 索引。
+- **T13(#74/#75/#77/#78)**：存活层集合 `FxHashSet<&LayerId>`；planner 的
+  `layer_index` 下传 `resolve_source`/`content_cpu`/`base_token`/`apply_copy`/
+  `screen_snapshot_content`；文本绘制项按目标层分桶；快照句柄表按
+  `TargetSet::snapshot_rev` 跳过整表克隆。
+- **T14(#23)**：`LayerId` 改内联 `SmallVec<[u8;24]>`（`path.rs` 5 处直接
+  构造改 `.into()`/`new`）。
+
+**验证（原始结果）**
+
+```text
+cargo build --workspace --all-targets                 → 通过
+cargo test --workspace --all-targets --no-fail-fast   → 217 套件（216 ok / 1 failed）；仅
+  yu-sound gated_ogg_* 2 条既有失败（设 YURIS_SAMPLE_SDK0495 时，2026-11-05
+  已记）；未设该变量时 52 passed / 0 failed；wgpu 套件单跑 39/39 通过两次
+scenario_probe <project-eris> cases/save-title-flow.json --backend soft
+  --hash-csv target/tmp/perf/p3-sha-soft.csv
+  → md5 39e494e4de2840ddcbddb159397cafd0 = T0（601 行）
+yu-cli run <project-eris> --mode desktop --backend wgpu --frames 600 --shot …
+  → png sha256 a6db617b896dfb8a2f478238c3ef190fe4b0e5e4e825bb19771c8a940d05fc72 = T0
+yu-cli case <project-eris> --all                      → 2 passed / 7 failed；
+  9 例 actual display/png 哈希与 ops=52 与 T0 逐字相同（失败为既有金标期望）
+record-events on/off（600 帧 headless）               → display JSON md5 相同
+同机 A/B（基线 855a983 独立构建，交替）:
+  稳态 work p50 1.88–1.94 vs 2.00–2.02
+  菜单 work p95 4.16 vs 4.50–4.78；tick p95 2.57–2.60 vs 2.87–3.02
+  对话 work p50 2.31 vs 2.39（反向顺序 2.306 vs 2.389）
+cargo test -p yu-gfx --test frame_cost --release      → 4 passed / 1 ignored
+cargo test -p yu-render-core -p yu-vfs -p yu-format -p yu-sound -p yu-font
+  → 23 套件全绿
+sound_census 300 → 17 层 / snd_diags=0；raster_bench → 248 faces
+```
+
+**边界/说明**
+
+- T0 的 41.9fps / work 1.86ms / boot 40.6ms 在本次机器状态下不可复现
+  （同机基线二进制度量也只有 35–38fps / 2.0ms / boot 134–411ms），
+  批次归因一律以同机 A/B 为准。
+- `yu-rt --test corpus` 散盘/封包等价用例的守卫改为「两侧数据源递归条目数」
+  比较，本轮显式 `SKIP[count=1]`（151 < 1461：散盘语料缺资产，与代码无关）；
+  断言本身未改。
+- #19 剩余项 `f.screen_snapshots` 逐帧 clone 评估后不做（收益有界，
+  改造需把公开字段改 `Arc<BTreeMap>` 并触及全部渲染消费者）。
+- `yu-emote` 子模块指针仍未随本批提交（与 A–D 批次无关，待主人单独确认）。
+
+## 成果 PERF-TEXT-UPLOAD (2026-11-12) · 审查遗留修复 + 逐字文本局部上传
+
+> 工作区改动（基线 `855a983`，未提交）。修复上一轮只读审查发现的两个
+> “优化未生效”，并按实测线索优化「推进剧情」时的逐字文本尖峰。
+
+**修复审查遗留**
+
+- **#78 快照表缓存无效**（`crates/yu-render/wgpu/src/textures.rs:738`）：
+  `prune_snapshots` 每帧都被 `plan()` 调用，原先在入口无条件
+  `snapshot_rev += 1`，导致 `refresh_snapshot_registry` 每帧都整表克隆。
+  现改为**只有真的删掉快照时**才递增（`:753`；`set/defer/content/clear`
+  的递增保留）。值为快照句柄表 `BTreeMap<CopyId, Rc<TexRef>>` 的成员集合，
+  注册表内容未变时跳过克隆在语义上等价。
+- **T3 排版缓存命中率 0**（`crates/yu-gfx/src/state.rs:778`）：自动文本模式
+  VM 每 tick 调 `sync_text_state`，旧 `write_text_state` 无条件重写缓冲并
+  `gen += 1`，排版缓存永不命中。现当 `bytes/flags/style` 均未变化时直接
+  返回（只更新帧号），既不重写也不递增代次；**mismatch 状态保持旧行为**
+  （每次重建诊断），不改变诊断计数。
+
+**逐字文本（含描边 SET）尖峰**
+
+- 根因不是 9 次偏移合成（`SET=1` 的 9 次 blit 只有几 µs，且字形位图缓存
+  命中），而是**每个新字符都把整层文本纹理重新上传到 GPU**：旧实现对每个
+  字符新建整层纹理 + 整张 `write_texture` + 删除旧纹理，并重算整层像素
+  哈希（`content_hash_rgba`，逐字 O(面积)）。
+- `crates/yu-render/core/src/text.rs`：`TextPaintStats.dirty`/`TextRect`
+  （`:45`、`:114`）记录本轮真正写到的像素矩形（覆盖复合偏移与图像字形）；
+  `ComposedLayer` 增加 `dirty`/`prev_hash`（`:2040`）；逐字增量改用**结构
+  身份** `incremental_identity`（`:95`，上一身份+修订号+已画字数+基面身份）
+  代替整图哈希，整体重烤仍保留像素哈希。
+- `crates/yu-render/wgpu/src/plan.rs:3383`：增量且现存 GPU 纹理正是
+  `prev_hash` 那一版时，只对脏区做 `queue.write_texture`，**不新建/不删除**
+  纹理，bind group 不失效；整体重烤/换基面仍走原来的整张上传与旧纹理回收。
+- 回归：`text.rs` 新增两条测试——增量必须报告脏区、且“只把脏区拷进旧纹理”
+  与整体结果**逐字节一致**（Layout 逐字推进 / `CGACT[TEXT]` 追加两种路径）。
+
+**验证（原始产物 `target/tmp/perf/`）**
+
+```text
+cargo build --workspace --all-targets                    → 通过
+cargo test --workspace --all-targets --no-fail-fast      → 217 套件；仅
+  yu-sound gated_ogg_* 2 条既有失败（设 SDK0495 时；未设按设计 SKIP）；
+  wgpu 并行偶发 diffusion/blur 1 像素差（单跑 39/39 连续两次通过）
+cargo test -p yu-gfx --test frame_cost --release         → 4 passed / 1 ignored
+soft 600 帧逐帧 SHA                                       → md5 39e494e4… = T0
+wgpu 600 帧末帧（基线/当前各自全新空 --save-root）
+  → 两者 sha256 均为 a6db617b…（= T0）
+yu-cli case --all                                        → 2 passed / 7 failed；
+  8/9 例 actual 与 T0 逐字一致；symptom-ingame-save 与 T0 不同，但**基线
+  与当前在该状态下 actual 完全相同**（ef7e9618… / ops 54）→ 存档状态漂移
+record-events on/off（600 帧 headless）                   → display JSON md5
+  e33019d72fbfe67c2972d5893b727883 相同；drained 计数不变
+```
+
+**边界**
+
+- 屏幕级自动文本（`text_layout.target = None`）仍走整视口重建+整张上传，
+  本轮未改（需要真实语料确认其占比；若常见，可按同一 `dirty/prev_hash`
+  机制接入）。
+- `ComposedLayer.hash` 的语义已改为“上传缓存身份”（整体=像素哈希，增量=
+  结构身份），文档已注明不得当作跨路径像素指纹；`TextRect` 为公开类型。

@@ -472,6 +472,30 @@ fn coerce_to(ty: ElemType, v: &Value) -> Value {
     }
 }
 
+/// [`coerce_to`] 的所有权版:与它逐分支同语义,串槽且值已是 `Str` 时
+/// 直接搬走字节(不复制)。`write_owned` 专用。
+fn coerce_to_owned(ty: ElemType, v: Value) -> Value {
+    match (ty, v) {
+        (ElemType::Int, Value::Int(i)) => Value::Int(i),
+        (ElemType::Int, Value::Float(f)) => Value::Int(f as i64),
+        (ElemType::Int, Value::Str(s)) => {
+            let t = String::from_utf8_lossy(&s);
+            // 缺省: 不可解析的数字串按 0(与 coerce_to 同语义)。
+            Value::Int(t.trim().parse::<i64>().unwrap_or(0))
+        }
+        (ElemType::Float, Value::Int(i)) => Value::Float(i as f64),
+        (ElemType::Float, Value::Float(f)) => Value::Float(f),
+        (ElemType::Float, Value::Str(s)) => {
+            let t = String::from_utf8_lossy(&s);
+            // 缺省: 不可解析的数字串按 0.0(与 coerce_to 同语义)。
+            Value::Float(t.trim().parse::<f64>().unwrap_or(0.0))
+        }
+        (ElemType::Str, Value::Str(s)) => Value::Str(s),
+        (ElemType::Str, Value::Int(i)) => Value::Str(i.to_string().into_bytes()),
+        (ElemType::Str, Value::Float(f)) => Value::Str(format!("{f:.6}").into_bytes()),
+    }
+}
+
 fn element_count(dims: &[usize]) -> usize {
     if dims.is_empty() {
         1
@@ -848,6 +872,45 @@ impl VariableStore {
     /// 槽位类型/维数(诊断与 `VARINFO` 用)。
     pub fn shape(&self, r: VarRef) -> Option<(ElemType, &[usize])> {
         self.cell(r).map(|s| (s.ty, s.dims.as_slice()))
+    }
+
+    /// [`Self::write`] 的所有权版:值已是 owned(`$x = <表达式>` 的 RHS、
+    /// `VARACT` 的字符串加工输出),串槽且值为 `Str` 时直接搬字节。
+    ///
+    /// 可观察状态与 [`Self::write`] 完全一致(`coerce_to_owned` 与
+    /// `coerce_to` 逐分支同语义)。
+    pub fn write_owned(
+        &mut self,
+        r: VarRef,
+        indices: &[i64],
+        value: Value,
+    ) -> Result<(), yu_log::Diag> {
+        let slot = self.cell_mut(r).ok_or_else(|| {
+            diag::fatal(
+                code::rt::VAR_UNDECLARED,
+                Boundary::Script,
+                format!(
+                    "写入未声明变量 {}(引擎同族错误;脚本先声明或用工程 ysv 初值)",
+                    r.display()
+                ),
+            )
+        })?;
+        let ty = slot.ty;
+        if slot.is_scalar() && indices.is_empty() {
+            slot.data[0] = coerce_to_owned(ty, value);
+            self.bump();
+            return Ok(());
+        }
+        let stored = coerce_to_owned(ty, value);
+        let flat = if indices.is_empty() {
+            let zeros: smallvec::SmallVec<[i64; 4]> = smallvec::smallvec![0i64; slot.dims.len()];
+            linear_offset_for(Some(r), &slot.dims, &zeros)?
+        } else {
+            linear_offset_for(Some(r), &slot.dims, indices)?
+        };
+        slot.data[flat] = stored;
+        self.bump();
+        Ok(())
     }
 
     /// 整组恢复(`LOAD[LET]` 写回;B1):目标槽已按同型声明时替换全部元素。

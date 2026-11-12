@@ -828,10 +828,36 @@ fn loose_and_packed_eris_are_execution_equivalent() {
     //
     // 在此之前不做等价断言 —— 但**必须留下可观测的差异**,不允许静默跳过:
     // 缺资产是硬事实,打印出来并显式计数,由语料修复后自动恢复。
-    let loose_missing_assets = !project_root.join("data/cg").is_dir();
-    if loose_missing_assets {
+    // 判据必须是「散盘是否**完整**」:只看 `data/cg` 目录存在与否会误判
+    // (2026-11-12 实测:data/cg/stand 只有 1 个 psb、data/ysbin 仅 144 项,
+    // 而 data.ypf 有 1264 个资产)。用两个数据源各自的目录清单递归计数,
+    // 散盘条目数 < 封包条目数 ⇒ 缺资产,显式计数跳过(不静默通过)。
+    fn count_entries(src: &dyn DataSource, path: &[u8]) -> usize {
+        let Ok(key) = yu_vfs::LookupKey::new(path, Codec::Cp932) else {
+            return 0;
+        };
+        let Ok(entries) = src.list(&key) else {
+            return 0;
+        };
+        let mut count = 0;
+        for entry in entries {
+            count += 1;
+            if entry.kind == yu_vfs::EntryKind::Dir {
+                let mut child = path.to_vec();
+                if !child.is_empty() {
+                    child.push(b'/');
+                }
+                child.extend_from_slice(&entry.name);
+                count += count_entries(src, &child);
+            }
+        }
+        count
+    }
+    let loose_count = count_entries(&DirSource::open(&data_root, Codec::Cp932).expect("data"), b"");
+    let packed_count = count_entries(&YpfSource::open(&ypf, Codec::Cp932).expect("ypf"), b"");
+    if loose_count < packed_count {
         eprintln!(
-            "SKIP[count=1] loose_and_packed_eris_are_execution_equivalent:              散盘缺资产(data/cg 不存在),本不变量不可判"
+            "SKIP[count=1] loose_and_packed_eris_are_execution_equivalent:              散盘缺资产(条目 {loose_count} < 封包 {packed_count}),本不变量不可判"
         );
         skip.0 += 1;
         return;

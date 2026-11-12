@@ -941,6 +941,46 @@ fn var_of(ins: &RawInstr) -> Option<VarRef> {
     })
 }
 
+/// 该条指令是否**必定**能被 [`Evaluator::step`] 执行成功(不判定运行时
+/// 语义错误,如未声明变量/下标越界)。
+///
+/// `false` = 执行到这条指令必然返回 `Err`(未实现 opcode,或已知 opcode 的
+/// 载荷长度不符);用于 `fill_cmd` 给窗口打「求值必失败」静态标记。
+/// **保守方向**:拿不准时返回 `true`(最多错过优化,不会改变可观察行为)。
+pub(crate) fn instr_supported(ins: &RawInstr) -> bool {
+    match ins.op {
+        0x42 => ins.payload.len() == 1,
+        0x57 => ins.payload.len() == 2,
+        0x49 => ins.payload.len() == 4,
+        0x4c | 0x46 => ins.payload.len() == 8,
+        0x4d => decode_string_literal(&ins.payload).is_ok(),
+        0x48 | 0x56 | 0x76 => ins.payload.len() == 3,
+        _ => matches!(
+            ins.op,
+            0x29 | 0x2c
+                | 0x21
+                | 0x25
+                | 0x26
+                | 0x2a
+                | 0x2b
+                | 0x2d
+                | 0x2f
+                | 0x3c
+                | 0x3d
+                | 0x3e
+                | 0x41
+                | 0x4f
+                | 0x53
+                | 0x5a
+                | 0x5e
+                | 0x7c
+                | 0x52
+                | 0x69
+                | 0x73
+        ),
+    }
+}
+
 /// 单条字面量窗口的常量值(0x42/0x57/0x49/0x4c/0x46/0x4d)。
 ///
 /// VM 在 `fill_cmd` 时用它做常量折叠;只识别**单条**字面量指令,

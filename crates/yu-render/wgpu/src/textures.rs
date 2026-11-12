@@ -500,6 +500,9 @@ pub struct TargetSet {
     /// 快照纹理:COPY 时刻冻结。**可以别名源内容纹理**(零拷贝;W3 第一态),
     /// 也可以是自己的一张区域拷贝。按 `CopyId` 跨帧复用。
     snapshots: BTreeMap<CopyId, std::rc::Rc<TexRef>>,
+    /// 快照登记表修订号(#78):任何增删改 +1。渲染器据此跳过
+    /// `snapshot_refs()` 的整表克隆(旧实现每帧一次)。
+    snapshot_rev: u64,
     /// 区域截图的**零拷贝采样窗**(`TextureRef::Snapshot` 的 UV 别名)。
     ///
     /// ERIS 菜单构造一次做 260+ 个按钮状态 `COPY2` 切片;每个都新建一张
@@ -563,6 +566,7 @@ impl TargetSet {
             offscreen: BTreeMap::new(),
             composites: BTreeMap::new(),
             snapshots: BTreeMap::new(),
+            snapshot_rev: 0,
             snapshot_contents: BTreeMap::new(),
             snapshot_surfaces: BTreeMap::new(),
             deferred: BTreeMap::new(),
@@ -584,6 +588,7 @@ impl TargetSet {
 
     /// 登记一条延迟物化的快照(同 id 的已物化版本作废)。
     pub(crate) fn defer_snapshot(&mut self, id: CopyId, snapshot: DeferredSnapshot) {
+        self.snapshot_rev = self.snapshot_rev.wrapping_add(1);
         self.snapshots.remove(&id);
         self.snapshot_contents.remove(&id);
         self.deferred.insert(id, snapshot);
@@ -651,6 +656,11 @@ impl TargetSet {
             .collect()
     }
 
+    /// 快照登记表修订号(变化才需要刷新渲染器的句柄表,#78)。
+    pub(crate) fn snapshot_rev(&self) -> u64 {
+        self.snapshot_rev
+    }
+
     /// 当前存活快照的句柄表(按需读回端口跨帧使用;只克隆 `Rc`)。
     pub(crate) fn snapshot_refs(&self) -> BTreeMap<CopyId, std::rc::Rc<TexRef>> {
         self.snapshots.clone()
@@ -659,12 +669,14 @@ impl TargetSet {
     /// 冻结一张快照(COPY 规划期)。内容纹理由 `LayerSurfaces` 的池/层内容
     /// 或本模块新建,这里只登记句柄。
     pub fn set_snapshot(&mut self, id: CopyId, tex: std::rc::Rc<TexRef>) {
+        self.snapshot_rev = self.snapshot_rev.wrapping_add(1);
         self.snapshots.insert(id, tex);
         self.snapshot_contents.remove(&id);
     }
 
     /// 冻结一张零拷贝区域截图(源纹理 + UV 窗口)。
     pub fn set_snapshot_content(&mut self, id: CopyId, content: Content) {
+        self.snapshot_rev = self.snapshot_rev.wrapping_add(1);
         self.snapshot_contents.insert(id, content);
         self.snapshots.remove(&id);
     }
@@ -723,6 +735,10 @@ impl TargetSet {
         live: &std::collections::BTreeSet<CopyId>,
         pipelines: &mut crate::pipelines::PipelineCache,
     ) {
+        // #78:每帧都会调用本函数;只有**真的删掉**了快照才递增修订号,
+        // 否则渲染器的 `refresh_snapshot_registry` 永远无法跳过整表克隆。
+        // `set_snapshot`/`set_snapshot_content`/`defer_snapshot`/
+        // `clear_snapshots` 的递增仍保留(它们直接改登记表)。
         let stale: Vec<CopyId> = self
             .snapshots
             .keys()
@@ -733,6 +749,8 @@ impl TargetSet {
             .collect();
         for id in stale {
             if let Some(tex) = self.snapshots.remove(&id) {
+                // 登记表内容变了:递增修订号(见函数入口注释)。
+                self.snapshot_rev = self.snapshot_rev.wrapping_add(1);
                 // bind group 可能仍持有 view;即使 `Rc` 还被层内容引用,
                 // 这里的快照登记已经失效,必须作废旧 group(需要时从
                 // `TexRef` 的 view 按需重建)。
@@ -749,6 +767,7 @@ impl TargetSet {
     /// 引擎重启 = 新设备 ⇒ 快照不再有效;`CopyId` 在新 `GfxState` 里从头
     /// 分配,旧纹理若保留会与同 id 的新快照冲突。
     pub fn clear_snapshots(&mut self, pipelines: &mut crate::pipelines::PipelineCache) -> usize {
+        self.snapshot_rev = self.snapshot_rev.wrapping_add(1);
         let removed = self.snapshots.len() + self.snapshot_contents.len() + self.deferred.len();
         for (_, target) in std::mem::take(&mut self.snapshots) {
             pipelines.forget_texture(target.id);
@@ -973,7 +992,7 @@ impl TargetSet {
     /// 会重建),所以按「图层本帧是否存活」剪枝 + 超限整表清空。
     pub fn prune_composites(
         &mut self,
-        live: &std::collections::BTreeSet<LayerId>,
+        live: &rustc_hash::FxHashSet<&LayerId>,
         pipelines: &mut crate::pipelines::PipelineCache,
     ) {
         let stale: Vec<(LayerId, u8)> = self

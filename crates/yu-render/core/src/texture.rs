@@ -98,12 +98,35 @@ impl AssetIssue {
 /// 失败缓存条数上限(失败条目字节 0,不受像素预算约束)。
 const MAX_FAILED_CACHE_ENTRIES: usize = 4096;
 
+/// 缓存键:`Rc<[u8]>`。插入路径只构造一次(缓存表/`fresh`/`resolved`
+/// 共享同一份句柄),克隆是 O(1);查询仍用 `&[u8]`(`Borrow<[u8]>`)。
+type CacheKey = std::rc::Rc<[u8]>;
+
 /// 缓存条目。
 struct Cached {
-    /// 实际命中的探测路径(缺失时 `None`)。
-    resolved: Option<Vec<u8>>,
+    /// 实际命中的探测路径(缺失时 `None`)。注入/影片路径与缓存键共享
+    /// 同一份 `Rc`;普通解码路径是展开后的候选名,单独一份。
+    resolved: Option<CacheKey>,
     /// 已解码纹理。存 `Rc`:CPU 图像加工的源可以零拷贝共享(`resolve_shared`)。
     result: Result<std::rc::Rc<Texture>, Diag>,
+}
+
+/// `cache` 表条目 = [`Cached`] + 预算/LRU/版本/问题摘要记账。
+///
+/// 记账与内容放在同一条目里(旧实现另有 `meta`/`inserted` 两张同键表):
+/// 命中路径一次 `get_mut` 就能同时推进 LRU 并取纹理,插入路径也只需克隆
+/// 一次 key。`bytes/used/inserted` 的语义与旧表逐项一致:
+/// - `bytes`:像素字节(失败条目 0;字节预算只回收 >0);
+/// - `used`:最近访问序(`touch`/插入推进;淘汰排序依据);
+/// - `inserted`:最近一次内容写入的序号(`touch` 不改;`generation()` 用)。
+struct Entry {
+    cached: Cached,
+    bytes: usize,
+    used: u64,
+    inserted: u64,
+    /// 失败条目的问题摘要(首次失败时构造一次,之后 `Rc` 共享给本帧
+    /// `issues`;旧实现每帧每失败项都克隆 key/code/detail)。
+    issue: Option<std::rc::Rc<AssetIssue>>,
 }
 
 /// 预取 worker 的一条解码请求。
@@ -164,8 +187,10 @@ pub struct TextureStore {
     source: Box<dyn DataSource>,
     codec: Codec,
     probe_order: Vec<ImageFormat>,
-    cache: FxHashMap<Vec<u8>, Cached>,
-    issues: FxHashMap<(Vec<u8>, String), AssetIssue>,
+    cache: FxHashMap<CacheKey, Entry>,
+    /// 本帧已记录的资产问题(`(key, code)` → 摘要)。值存 `Rc`,失败条目
+    /// 在缓存里复用同一份。
+    issues: FxHashMap<(Vec<u8>, std::borrow::Cow<'static, str>), std::rc::Rc<AssetIssue>>,
     solid: Texture,
     decoded: u64,
     /// 本帧解码耗时/字节(VFS 读 + 图像解码;`begin_frame` 清零)。
@@ -181,23 +206,23 @@ pub struct TextureStore {
     resident_bytes: usize,
     /// 访问/插入时钟(LRU)。
     clock: u64,
-    /// `key → (字节, 最近访问序)`(预算记账;与 `cache` 同步增删)。
-    meta: FxHashMap<Vec<u8>, (usize, u64)>,
-    /// `key → 最近一次内容写入的序号`(与 LRU 的 `clock` 分开)。
+    /// 缓存内“字节为 0”的条目数(失败/缺失条目)。
     ///
-    /// `insert_cached` 每次覆盖条目都会推进;`touch` 只动 LRU,不改这里。
-    /// 后端用它判断「同一 key 的 CPU 侧像素是否被替换」——不能用
-    /// `Rc::as_ptr`(旧 `Rc` 释放后新分配可能复用同一地址)或 `meta` 的
-    /// LRU 时钟(`touch` 会推进)。
-    inserted: FxHashMap<Vec<u8>, u64>,
-    /// `TRIM` 的 alpha 包围盒缓存(`(资产 key, mask) → 边界`)。
+    /// 失败条目不受像素预算约束,单独限条数;维护计数后,未超限时
+    /// [`Self::enforce_failed_cap`] 一次扫描都不做(旧实现每帧遍历
+    /// 全部缓存条目并克隆 key 才能知道是否超限)。
+    failed_entries: usize,
+    /// `TRIM` 的 alpha 包围盒缓存(`资产 key → mask → 边界`)。
     ///
     /// 资产像素在解码时就在 CPU 上,边界是固有属性 ⇒ 算一次即可。
     /// `TRIM` 因此不必把 GPU 纹理整张读回(移动端 TBDR 上那一步
     /// 实测 100~291ms/次,是「角色一出来就卡」的直接原因)。
-    trim_bounds: FxHashMap<(Vec<u8>, i64), Option<(u32, u32, u32, u32)>>,
+    ///
+    /// 外层按 `Vec<u8>` 键支持 `Borrow<[u8]>` 查询:命中路径零 key 分配
+    /// (旧实现每次命中都要 `(key.to_vec(), mask)` 各分配一次)。
+    trim_bounds: FxHashMap<Vec<u8>, FxHashMap<i64, Option<(u32, u32, u32, u32)>>>,
     /// 本帧新插入的 key(预算执行时豁免;防止预热批次在渲染前被回收)。
-    fresh: FxHashSet<Vec<u8>>,
+    fresh: FxHashSet<CacheKey>,
     /// 已回收条目数(诊断)。
     evicted: u64,
     /// 待后端释放 GPU 纹理的资产 key(见 [`Self::take_evicted_keys`])。
@@ -303,8 +328,7 @@ impl TextureStore {
             budget_bytes: tuning.asset_cache_mb.saturating_mul(1024 * 1024),
             resident_bytes: 0,
             clock: 0,
-            meta: FxHashMap::default(),
-            inserted: FxHashMap::default(),
+            failed_entries: 0,
             trim_bounds: FxHashMap::default(),
             fresh: FxHashSet::default(),
             evicted: 0,
@@ -412,7 +436,7 @@ impl TextureStore {
         self.drain_prefetch();
         let mut queued = 0u64;
         for key in keys {
-            if self.cache.contains_key(key) || self.prefetch_pool.contains_key(key) {
+            if self.cache.contains_key(key.as_slice()) || self.prefetch_pool.contains_key(key) {
                 continue;
             }
             let Some(worker) = self.prefetch.as_ref() else {
@@ -462,7 +486,7 @@ impl TextureStore {
         for result in done {
             match result.result {
                 Ok(texture) => {
-                    if self.cache.contains_key(&result.key) {
+                    if self.cache.contains_key(result.key.as_slice()) {
                         // 主路径已抢先同步解码:丢掉重复结果。
                         self.prefetch_dropped += 1;
                         continue;
@@ -517,10 +541,11 @@ impl TextureStore {
         self.prefetch_bytes = self.prefetch_bytes.saturating_sub(entry.tex.rgba.len());
         self.decoded += 1;
         self.prefetch_hits += 1;
+        let resolved: CacheKey = std::rc::Rc::from(entry.resolved.as_slice());
         self.insert_cached(
-            key.to_vec(),
+            std::rc::Rc::from(key),
             Cached {
-                resolved: Some(entry.resolved),
+                resolved: Some(resolved),
                 result: Ok(entry.tex),
             },
         );
@@ -574,21 +599,30 @@ impl TextureStore {
         std::mem::take(&mut self.evicted_keys)
     }
 
-    fn insert_cached(&mut self, key: Vec<u8>, cached: Cached) {
+    fn insert_cached(&mut self, key: CacheKey, cached: Cached) {
         self.clock = self.clock.wrapping_add(1);
-        self.inserted.insert(key.clone(), self.clock);
         let bytes = cached
             .result
             .as_ref()
             .map(|texture| texture.rgba.len())
             .unwrap_or(0);
-        if self.cache.insert(key.clone(), cached).is_some() {
-            if let Some((old_bytes, _)) = self.meta.remove(&key) {
-                self.resident_bytes = self.resident_bytes.saturating_sub(old_bytes);
+        let entry = Entry {
+            cached,
+            bytes,
+            used: self.clock,
+            inserted: self.clock,
+            issue: None,
+        };
+        if let Some(old) = self.cache.insert(key.clone(), entry) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(old.bytes);
+            if old.bytes == 0 {
+                self.failed_entries = self.failed_entries.saturating_sub(1);
             }
         }
-        self.meta.insert(key.clone(), (bytes, self.clock));
         self.resident_bytes = self.resident_bytes.saturating_add(bytes);
+        if bytes == 0 {
+            self.failed_entries = self.failed_entries.saturating_add(1);
+        }
         self.fresh.insert(key);
         // 不在插入时回收:一次 `preload_parallel` 批量里,后面的 key 会把
         // 同批尚未被图层引用的前序资产当场踢掉(→渲染时重新解码)。
@@ -598,11 +632,14 @@ impl TextureStore {
     /// 失败条目只保留最近 `MAX_FAILED_CACHE_ENTRIES` 条,避免坏/缺失
     /// 资产 key 在长会话里无界累积(它们字节为 0,不受像素预算约束)。
     fn enforce_failed_cap(&mut self) {
-        let mut failed: Vec<(Vec<u8>, u64)> = self
-            .meta
+        if self.failed_entries <= MAX_FAILED_CACHE_ENTRIES {
+            return;
+        }
+        let mut failed: Vec<(CacheKey, u64)> = self
+            .cache
             .iter()
-            .filter(|(_, (bytes, _))| *bytes == 0)
-            .map(|(key, (_, used))| (key.clone(), *used))
+            .filter(|(_, entry)| entry.bytes == 0)
+            .map(|(key, entry)| (key.clone(), entry.used))
             .collect();
         if failed.len() <= MAX_FAILED_CACHE_ENTRIES {
             return;
@@ -610,9 +647,9 @@ impl TextureStore {
         failed.sort_by(|(ka, ua), (kb, ub)| ua.cmp(ub).then_with(|| ka.cmp(kb)));
         let excess = failed.len() - MAX_FAILED_CACHE_ENTRIES;
         for (key, _) in failed.into_iter().take(excess) {
-            self.cache.remove(&key);
-            self.meta.remove(&key);
-            self.inserted.remove(&key);
+            if self.cache.remove(&key).is_some() {
+                self.failed_entries = self.failed_entries.saturating_sub(1);
+            }
             self.fresh.remove(&key);
         }
     }
@@ -622,19 +659,21 @@ impl TextureStore {
         &self,
         skip_fresh: bool,
         live: &FxHashSet<&[u8]>,
-    ) -> Option<Vec<u8>> {
-        self.meta
+    ) -> Option<CacheKey> {
+        self.cache
             .iter()
-            .filter(|(_, (bytes, _))| *bytes > 0)
-            .filter(|(key, _)| !(skip_fresh && self.fresh.contains(*key)))
-            .filter(|(key, _)| !live.contains(key.as_slice()))
-            .filter(|(key, _)| {
-                self.cache
-                    .get(key.as_slice())
-                    .and_then(|entry| entry.result.as_ref().ok())
+            .filter(|(_, entry)| entry.bytes > 0)
+            .filter(|(key, _)| !(skip_fresh && self.fresh.contains(&key[..])))
+            .filter(|(key, _)| !live.contains(&key[..]))
+            .filter(|(_, entry)| {
+                entry
+                    .cached
+                    .result
+                    .as_ref()
+                    .ok()
                     .is_some_and(|texture| std::rc::Rc::strong_count(texture) == 1)
             })
-            .min_by(|(ka, (_, ua)), (kb, (_, ub))| ua.cmp(ub).then_with(|| ka.cmp(kb)))
+            .min_by(|(ka, a), (kb, b)| a.used.cmp(&b.used).then_with(|| ka.cmp(kb)))
             .map(|(key, _)| key.clone())
     }
 
@@ -666,22 +705,23 @@ impl TextureStore {
                 }
                 break;
             };
-            self.cache.remove(&key);
             self.fresh.remove(&key);
-            self.inserted.remove(&key);
-            if let Some((bytes, _)) = self.meta.remove(&key) {
-                self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
+            if let Some(entry) = self.cache.remove(&key) {
+                self.resident_bytes = self.resident_bytes.saturating_sub(entry.bytes);
+                if entry.bytes == 0 {
+                    self.failed_entries = self.failed_entries.saturating_sub(1);
+                }
                 self.evicted += 1;
                 if self.tuning.asset_timing {
                     log::debug!(
                         target: "yu-render",
                         "[asset] evicted cached asset {} ({}B)",
                         display_bytes(&key),
-                        bytes
+                        entry.bytes
                     );
                 }
                 // 通知后端释放这张资产对应的 GPU 纹理(见 `take_evicted_keys`)。
-                self.evicted_keys.push(key);
+                self.evicted_keys.push(key.to_vec());
             }
         }
     }
@@ -731,23 +771,19 @@ impl TextureStore {
     }
 
     /// 解析一个资产 key。成功返回缓存中的纹理;失败返回 `asset.*` [`Diag`]。
+    ///
+    /// `ensure` 之后只做一次 `get_mut`:同一把借用里推进 LRU 时钟并取纹理
+    /// (旧实现 `ensure` + `touch` + `cache.get` 三次哈希查找)。
     pub fn resolve(&mut self, key: &[u8]) -> Result<&Texture, Diag> {
         self.ensure(key)?;
-        self.touch(key);
-        let entry = self.cache.get(key).expect("cache entry inserted above");
-        match &entry.result {
-            Ok(tex) => Ok(tex.as_ref()),
-            Err(diag) => {
-                let issue = AssetIssue {
-                    key: key.to_vec(),
-                    code: diag.code.to_string(),
-                    detail: diag.detail.clone(),
-                };
-                self.issues
-                    .insert((key.to_vec(), issue.code.clone()), issue);
-                Err(diag.clone())
-            }
+        let entry = Self::touched_entry(&mut self.cache, &mut self.clock, key);
+        if entry.cached.result.is_ok() {
+            let tex = entry.cached.result.as_ref().expect("checked above");
+            return Ok(tex.as_ref());
         }
+        let (diag, issue) = Self::failure_issue(entry, key);
+        self.issues.insert((key.to_vec(), diag.code.clone()), issue);
+        Err(diag)
     }
 
     /// `TRIM` 的 alpha 包围盒,**从资产自身的 CPU 像素算**并按
@@ -767,14 +803,21 @@ impl TextureStore {
     /// 返回 `(x0, y0, x1, y1)`(闭区间);全透明或空图返回 `None`
     /// (与 [`crate::TextComposer`] 无关,纯 alpha 判据)。
     pub fn trim_bounds(&mut self, key: &[u8], mask: i64) -> Option<(u32, u32, u32, u32)> {
-        if let Some(hit) = self.trim_bounds.get(&(key.to_vec(), mask)) {
+        if let Some(hit) = self
+            .trim_bounds
+            .get(key)
+            .and_then(|by_mask| by_mask.get(&mask))
+        {
             return *hit;
         }
         let bounds = match self.resolve(key) {
             Ok(tex) => trim_bounds_of(tex, mask),
             Err(_) => None,
         };
-        self.trim_bounds.insert((key.to_vec(), mask), bounds);
+        self.trim_bounds
+            .entry(key.to_vec())
+            .or_default()
+            .insert(mask, bounds);
         bounds
     }
 
@@ -782,7 +825,7 @@ impl TextureStore {
     pub fn resident(&self, key: &[u8]) -> bool {
         self.cache
             .get(key)
-            .is_some_and(|entry| entry.result.is_ok())
+            .is_some_and(|entry| entry.cached.result.is_ok())
     }
 
     /// 该 key 是否已有缓存条目(**含失败条目**)。
@@ -800,7 +843,7 @@ impl TextureStore {
     /// `insert_rgba` 覆盖 `:movie/current`)。
     #[must_use]
     pub fn generation(&self, key: &[u8]) -> Option<u64> {
-        self.inserted.get(key).copied()
+        self.cache.get(key).map(|entry| entry.inserted)
     }
 
     /// 解析资产并共享缓存纹理(`Rc` 克隆,O(1))。
@@ -809,21 +852,14 @@ impl TextureStore {
     /// 整张资产 `rgba.clone()` 到新 `Rc`,一条 2048² 的部件每帧被复制几十次。
     pub fn resolve_shared(&mut self, key: &[u8]) -> Result<std::rc::Rc<Texture>, Diag> {
         self.ensure(key)?;
-        self.touch(key);
-        let entry = self.cache.get(key).expect("cache entry inserted above");
-        match &entry.result {
-            Ok(tex) => Ok(std::rc::Rc::clone(tex)),
-            Err(diag) => {
-                let issue = AssetIssue {
-                    key: key.to_vec(),
-                    code: diag.code.to_string(),
-                    detail: diag.detail.clone(),
-                };
-                self.issues
-                    .insert((key.to_vec(), issue.code.clone()), issue);
-                Err(diag.clone())
-            }
+        let entry = Self::touched_entry(&mut self.cache, &mut self.clock, key);
+        if entry.cached.result.is_ok() {
+            let tex = entry.cached.result.as_ref().expect("checked above");
+            return Ok(std::rc::Rc::clone(tex));
         }
+        let (diag, issue) = Self::failure_issue(entry, key);
+        self.issues.insert((key.to_vec(), diag.code.clone()), issue);
+        Err(diag)
     }
 
     /// 确保 key 已有缓存条目(成功/失败都会缓存,避免重复探测)。
@@ -833,18 +869,47 @@ impl TextureStore {
             self.drain_prefetch();
             if !self.promote_prefetch(key) {
                 let cached = self.load(key);
-                self.insert_cached(key.to_vec(), cached);
+                self.insert_cached(std::rc::Rc::from(key), cached);
             }
         }
         Ok(())
     }
 
-    /// 记录一次缓存访问(LRU 预算用)。
-    fn touch(&mut self, key: &[u8]) {
-        self.clock = self.clock.wrapping_add(1);
-        if let Some((_, used)) = self.meta.get_mut(key) {
-            *used = self.clock;
-        }
+    /// 取条目并推进 LRU 时钟(在 `ensure` 之后调用;条目必然存在)。
+    fn touched_entry<'a>(
+        cache: &'a mut FxHashMap<CacheKey, Entry>,
+        clock: &mut u64,
+        key: &[u8],
+    ) -> &'a mut Entry {
+        *clock = clock.wrapping_add(1);
+        let used = *clock;
+        let entry = cache.get_mut(key).expect("cache entry inserted above");
+        entry.used = used;
+        entry
+    }
+
+    /// 失败条目的 `(Diag 副本, 本帧问题摘要)`。
+    ///
+    /// 摘要首次失败时构造并缓存在条目里(`Rc` 共享),之后每帧只做引用计数;
+    /// 旧实现每帧每失败项都克隆 key/code/detail 重建一份。
+    fn failure_issue(entry: &mut Entry, key: &[u8]) -> (Diag, std::rc::Rc<AssetIssue>) {
+        let diag = match &entry.cached.result {
+            Ok(_) => unreachable!("failure_issue 只用于失败条目"),
+            Err(diag) => diag.clone(),
+        };
+        let issue = match &entry.issue {
+            Some(issue) => std::rc::Rc::clone(issue),
+            None => {
+                let issue = std::rc::Rc::new(AssetIssue {
+                    key: key.to_vec(),
+                    code: diag.code.to_string(),
+                    detail: diag.detail.clone(),
+                });
+                entry.issue = Some(std::rc::Rc::clone(&issue));
+                issue
+            }
+        };
+        (diag, issue)
     }
 
     /// 解析 [`TextureRef`]。`Offscreen/Snapshot/None` 不归本模块物化。
@@ -880,13 +945,18 @@ impl TextureStore {
     /// 本实现在这里合成一张 RGBA 纹理,后端两类(soft/wgpu)都按普通资产
     /// 消费,不感知影片。
     pub fn resolve_movie(&mut self, asset: &[u8], frame: u32) -> Result<&Texture, Diag> {
-        self.movie_frame(asset, frame)?;
+        // 合成键只构造一次(旧实现 `movie_frame` 内部再造一次同样的 key)。
         let key = movie_cache_key(asset, frame);
-        let entry = self.cache.get(&key).expect("movie frame ensured above");
+        self.movie_frame_keyed(asset, frame, &key)?;
+        let entry = self
+            .cache
+            .get(key.as_slice())
+            .expect("movie frame ensured above");
         Ok(entry
+            .cached
             .result
             .as_ref()
-            .expect("movie_frame 只在该帧成功时返回 Ok"))
+            .expect("movie_frame_keyed 只在该帧成功时返回 Ok"))
     }
 
     /// 同 [`Self::resolve_movie`],返回共享句柄(`Rc` 克隆,O(1))。
@@ -895,7 +965,8 @@ impl TextureStore {
         asset: &[u8],
         frame: u32,
     ) -> Result<std::rc::Rc<Texture>, Diag> {
-        self.movie_frame(asset, frame)
+        let key = movie_cache_key(asset, frame);
+        self.movie_frame_keyed(asset, frame, &key)
     }
 
     /// 注入一张**由宿主解码**的纹理(键 = 合成资产 key)。
@@ -910,11 +981,13 @@ impl TextureStore {
             height,
             rgba,
         });
+        // key 只构造一次:Rc 分配后缓存表/`fresh`/`resolved` 共享同一份。
+        let key: CacheKey = std::rc::Rc::from(key);
         let cached = Cached {
-            resolved: Some(key.to_vec()),
+            resolved: Some(std::rc::Rc::clone(&key)),
             result: Ok(texture),
         };
-        self.insert_cached(key.to_vec(), cached);
+        self.insert_cached(key, cached);
     }
 
     /// 取影片**常驻容器**(按 `YMV[FILE]` 原字节缓存;缺失/坏容器也缓存)。
@@ -961,46 +1034,49 @@ impl TextureStore {
 
     /// 物化影片帧并返回共享句柄(两个 `resolve_movie*` 的共同实现)。
     ///
-    /// 换到新帧时把该资产的**上一帧**从缓存摘掉(已交给图层/快照的 `Rc`
-    /// 不受影响,只是不再命中);失败的帧同样缓存,避免每帧重探。
-    fn movie_frame(&mut self, asset: &[u8], frame: u32) -> Result<std::rc::Rc<Texture>, Diag> {
-        let key = movie_cache_key(asset, frame);
-        if !self.cache.contains_key(&key) {
+    /// `key` 由调用方按 `(资产, 帧)` 预先构造(只算一次);换到新帧时把该
+    /// 资产的**上一帧**从缓存摘掉(已交给图层/快照的 `Rc` 不受影响,只是
+    /// 不再命中);失败的帧同样缓存,避免每帧重探。
+    fn movie_frame_keyed(
+        &mut self,
+        asset: &[u8],
+        frame: u32,
+        key: &[u8],
+    ) -> Result<std::rc::Rc<Texture>, Diag> {
+        if !self.cache.contains_key(key) {
             let cached = self.load_movie(asset, frame);
-            self.insert_cached(key.clone(), cached);
+            self.insert_cached(std::rc::Rc::from(key), cached);
             if let Some(previous) = self.movie_keeper.insert(asset.to_vec(), frame) {
                 if previous != frame {
                     let stale = movie_cache_key(asset, previous);
-                    self.cache.remove(&stale);
-                    self.inserted.remove(&stale);
-                    if let Some((bytes, _)) = self.meta.remove(&stale) {
-                        self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
+                    if let Some(entry) = self.cache.remove(stale.as_slice()) {
+                        self.resident_bytes = self.resident_bytes.saturating_sub(entry.bytes);
+                        if entry.bytes == 0 {
+                            self.failed_entries = self.failed_entries.saturating_sub(1);
+                        }
                     }
-                    self.fresh.remove(&stale);
+                    self.fresh.remove(stale.as_slice());
                 }
             }
         }
-        self.touch(&key);
-        let entry = self.cache.get(&key).expect("cache entry inserted above");
-        match &entry.result {
-            Ok(tex) => Ok(std::rc::Rc::clone(tex)),
-            Err(diag) => {
-                // 问题清单按**资产** key 记(合成键对使用者无意义)。
-                let issue = AssetIssue {
-                    key: asset.to_vec(),
-                    code: diag.code.to_string(),
-                    detail: diag.detail.clone(),
-                };
-                self.issues
-                    .insert((asset.to_vec(), issue.code.clone()), issue);
-                Err(diag.clone())
-            }
+        let entry = Self::touched_entry(&mut self.cache, &mut self.clock, key);
+        if entry.cached.result.is_ok() {
+            let tex = entry.cached.result.as_ref().expect("checked above");
+            return Ok(std::rc::Rc::clone(tex));
         }
+        // 问题清单按**资产** key 记(合成键对使用者无意义)。
+        let (diag, issue) = Self::failure_issue(entry, asset);
+        self.issues.insert((asset.to_vec(), diag.code.clone()), issue);
+        Err(diag)
     }
 
     /// 本帧已记录的资产问题(按 `(key, code)` 升序)。
     pub fn issues(&self) -> Vec<AssetIssue> {
-        let mut out: Vec<AssetIssue> = self.issues.values().cloned().collect();
+        let mut out: Vec<AssetIssue> = self
+            .issues
+            .values()
+            .map(|issue| (**issue).clone())
+            .collect();
         // FxHashMap 无序遍历;诊断输出保持稳定的 key/code/detail 顺序。
         out.sort_by(|a, b| {
             a.key
@@ -1025,7 +1101,7 @@ impl TextureStore {
     pub fn resolved_path(&self, key: &[u8]) -> Option<&[u8]> {
         self.cache
             .get(key)
-            .and_then(|entry| entry.resolved.as_deref())
+            .and_then(|entry| entry.cached.resolved.as_deref())
     }
 
     /// 解码并记账(VFS 读 + 图像解码;仅缓存未命中时调用)。
@@ -1191,7 +1267,7 @@ impl TextureStore {
             if let Some(format) = format {
                 if format == ImageFormat::Psb || matches!(format, ImageFormat::Other(_)) {
                     return Err(Cached {
-                        resolved: Some(resolved.clone()),
+                        resolved: Some(std::rc::Rc::from(resolved.as_slice())),
                         result: Err(unimplemented(
                             code::UNSUPPORTED,
                             key.to_vec(),
@@ -1208,7 +1284,7 @@ impl TextureStore {
                 Ok(bytes) => bytes,
                 Err(diag) => {
                     return Err(Cached {
-                        resolved: Some(resolved.clone()),
+                        resolved: Some(std::rc::Rc::from(resolved.as_slice())),
                         result: Err(Diag::recoverable(code::MISSING, Boundary::Data)
                             .at_data(resolved.clone(), 0)
                             .with_detail(format!(
@@ -1244,12 +1320,12 @@ impl TextureStore {
             Ok(texture) => {
                 self.decoded += 1;
                 Cached {
-                    resolved: Some(candidate),
+                    resolved: Some(std::rc::Rc::from(candidate.as_slice())),
                     result: Ok(std::rc::Rc::new(texture)),
                 }
             }
             Err(err) => Cached {
-                resolved: Some(candidate.clone()),
+                resolved: Some(std::rc::Rc::from(candidate.as_slice())),
                 result: Err(Diag::recoverable(code::DECODE, Boundary::Data)
                     .at_data(candidate.clone(), 0)
                     .with_detail(format!(
@@ -1312,7 +1388,7 @@ impl TextureStore {
                 detail,
             } => {
                 return Cached {
-                    resolved: Some(path),
+                    resolved: Some(std::rc::Rc::from(path.as_slice())),
                     result: Err(Diag::recoverable(code::MOVIE, Boundary::Data)
                         .at_data(asset.to_vec(), 0)
                         .with_detail(format!("{code}: {detail}"))),
@@ -1325,7 +1401,7 @@ impl TextureStore {
         let info = ymv.info();
         if frame >= info.frames {
             return Cached {
-                resolved: Some(candidate),
+                resolved: Some(std::rc::Rc::from(candidate.as_slice())),
                 result: Err(Diag::recoverable(code::MOVIE, Boundary::Data)
                     .at_data(asset.to_vec(), 0)
                     .with_detail(format!(
@@ -1336,7 +1412,7 @@ impl TextureStore {
         }
         let Some((color_jpeg, alpha_jpeg)) = ymv.frame_planes(frame) else {
             return Cached {
-                resolved: Some(candidate),
+                resolved: Some(std::rc::Rc::from(candidate.as_slice())),
                 result: Err(Diag::recoverable(code::MOVIE, Boundary::Data)
                     .at_data(asset.to_vec(), 0)
                     .with_detail(format!("第 {frame} 帧段区间不可读"))),
@@ -1346,7 +1422,7 @@ impl TextureStore {
             Ok(img) => img.to_rgb8(),
             Err(err) => {
                 return Cached {
-                    resolved: Some(candidate),
+                    resolved: Some(std::rc::Rc::from(candidate.as_slice())),
                     result: Err(Diag::recoverable(code::DECODE, Boundary::Data)
                         .at_data(asset.to_vec(), 0)
                         .with_detail(format!("颜色平面 JPEG 解码失败(帧 {frame}): {err}"))),
@@ -1356,7 +1432,7 @@ impl TextureStore {
         let (width, height) = (color.width(), color.height());
         if width == 0 || height == 0 {
             return Cached {
-                resolved: Some(candidate),
+                resolved: Some(std::rc::Rc::from(candidate.as_slice())),
                 result: Err(Diag::recoverable(code::DECODE, Boundary::Data)
                     .at_data(asset.to_vec(), 0)
                     .with_detail(format!("颜色平面尺寸为 0(帧 {frame})"))),
@@ -1403,7 +1479,7 @@ impl TextureStore {
         }
         self.decoded += 1;
         Cached {
-            resolved: Some(candidate),
+            resolved: Some(std::rc::Rc::from(candidate.as_slice())),
             result: Ok(std::rc::Rc::new(Texture {
                 width,
                 height,
@@ -1421,7 +1497,7 @@ impl TextureStore {
         // 后台已经解好的资产直接采用;其余仍按原路径并行解码。
         self.drain_prefetch();
         for key in keys {
-            if !self.cache.contains_key(key) {
+            if !self.cache.contains_key(key.as_slice()) {
                 self.promote_prefetch(key);
             }
         }
@@ -1430,7 +1506,7 @@ impl TextureStore {
         let read_started = std::time::Instant::now();
         let mut read_bytes = 0usize;
         for key in keys {
-            if self.cache.contains_key(key) || !seen.insert(key.as_slice()) {
+            if self.cache.contains_key(key.as_slice()) || !seen.insert(key.as_slice()) {
                 continue;
             }
             match self.read_source(key) {
@@ -1439,7 +1515,7 @@ impl TextureStore {
                     jobs.push((key.clone(), candidate, bytes));
                 }
                 Err(cached) => {
-                    self.insert_cached(key.clone(), cached);
+                    self.insert_cached(std::rc::Rc::from(key.as_slice()), cached);
                 }
             }
         }
@@ -1536,12 +1612,12 @@ impl TextureStore {
                 self.decoded += 1;
                 self.decode_bytes = self.decode_bytes.saturating_add(texture.rgba.len() as u64);
                 Cached {
-                    resolved: Some(candidate.clone()),
+                    resolved: Some(std::rc::Rc::from(candidate.as_slice())),
                     result: Ok(std::rc::Rc::new(texture)),
                 }
             }
             Err(err) => Cached {
-                resolved: Some(candidate.clone()),
+                resolved: Some(std::rc::Rc::from(candidate.as_slice())),
                 result: Err(Diag::recoverable(code::DECODE, Boundary::Data)
                     .at_data(candidate.clone(), 0)
                     .with_detail(format!(
@@ -1550,7 +1626,7 @@ impl TextureStore {
                     ))),
             },
         };
-        self.insert_cached(key.clone(), cached);
+        self.insert_cached(std::rc::Rc::from(key.as_slice()), cached);
     }
 
     fn candidates(&self, key: &[u8]) -> Vec<(Vec<u8>, Option<ImageFormat>)> {
@@ -1593,7 +1669,7 @@ fn live_asset_keys(frame: &yu_gfx::CompositorFrame) -> FxHashSet<&[u8]> {
     for layer in &frame.layers {
         add_texture(&mut out, &layer.texture);
     }
-    for draw in &frame.text_draws {
+    for draw in frame.text_draws.iter() {
         if let Some(image) = &draw.image {
             out.insert(image.asset.as_slice());
         }

@@ -1397,3 +1397,46 @@ fn layer_creation_follows_official_rules() {
     s.apply_sound(&bad);
     assert_eq!(int(&mut s, "NEW/", QueryField::Volume), 200);
 }
+
+/// SOUNDINFO 多字段的引擎顺序(REA `0x44f4bc`):
+/// 前 7 个短路字段取序最小者;其余按序全部执行、最后者胜出。
+/// 位集重写的对外语义必须与"排序 + 去重"逐项一致。
+#[test]
+fn soundinfo_multi_field_follows_engine_order() {
+    let mut s = state_with(&[]);
+    let mut chan = cmd("BGM/");
+    chan.volume = Some(100);
+    chan.pan = Some(300);
+    s.apply_sound(&chan);
+    // EXIST..PITCH 都是短路字段:请求里有多个时只执行序最小的 Volume(4),
+    // 不执行 Pan(5)(与 REA 0x44f4bc 的独立 ret 一致)。
+    let v = s
+        .query(b"BGM", &[QueryField::Pan, QueryField::Volume])
+        .expect("query");
+    assert_eq!(v, Value::Int(100));
+    // 重复字段去重后与单词查询一致。
+    let v = s
+        .query(b"BGM", &[QueryField::Volume, QueryField::Volume])
+        .expect("query");
+    assert_eq!(v, Value::Int(100));
+    // 非短路字段按引擎序全部执行、最后者胜出 —— 与入参顺序无关:
+    // File(8) 在 FileType(7) 之后,所以两种入参顺序都返回 File 的空串。
+    let v = s
+        .query(b"BGM", &[QueryField::File, QueryField::FileType])
+        .expect("query");
+    assert_eq!(v, Value::Str(Vec::new()));
+    let v = s
+        .query(b"BGM", &[QueryField::FileType, QueryField::File])
+        .expect("query");
+    assert_eq!(v, Value::Str(Vec::new()));
+    // 再加一个序更大的 Loop(12):它最后写,结果回到 Int。
+    let v = s
+        .query(b"BGM", &[QueryField::Loop, QueryField::File, QueryField::FileType])
+        .expect("query");
+    assert_eq!(v, Value::Int(0));
+    // 缺层分支按"请求里有没有 FILE"(位集判定)选空串/0。
+    let v = s
+        .query(b"NOPE", &[QueryField::File, QueryField::Volume])
+        .expect("query");
+    assert_eq!(v, Value::Str(Vec::new()));
+}

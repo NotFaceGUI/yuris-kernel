@@ -20,13 +20,15 @@
 
 pub use crate::layer::Transition;
 
+use std::sync::Arc;
+
 use crate::layer::{Layer, LayerId, TextureRef};
 
 /// 一次双纹理过渡绘制。
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransitionDraw {
     /// 本层属性(纹理、alpha、blend、变换)。
-    pub layer: Layer,
+    pub layer: Arc<Layer>,
     /// 本层纹理(引擎 `YS_Texture1`)。
     pub from: TextureRef,
     /// 配对纹理(引擎 `YS_Texture2`;`TID` 解析结果,`None` = 无配对)。

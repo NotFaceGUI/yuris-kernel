@@ -235,6 +235,8 @@ pub struct WgpuRenderer {
     text_gpu: Option<text_gpu::TextGpuRenderer>,
     /// 快照句柄表(每帧刷新;供 SAVE[ID] 在命令时刻按需读回上一帧快照)。
     snapshot_registry: Rc<RefCell<BTreeMap<CopyId, Rc<surfaces::TexRef>>>>,
+    /// `snapshot_registry` 对应的 `TargetSet::snapshot_rev`(#78)。
+    snapshot_registry_rev: std::cell::Cell<u64>,
     /// 最近一帧的阶段耗时(性能取证;不进入 `RenderReport` 的对账字段)。
     last_phases: yu_render_core::RenderPhases,
     /// 手机画质选项:把 `SIZE`(官方最近邻)也按双线性采样。
@@ -310,8 +312,16 @@ impl WgpuRenderer {
     }
 
     /// 刷新快照句柄表(主渲染提交之后调用;供下一次 SAVE[ID] 按需读回)。
+    ///
+    /// #78:快照集合未变化时直接返回(旧实现每帧克隆整张
+    /// `BTreeMap<CopyId, Rc<TexRef>>` 再丢弃旧表)。
     pub fn refresh_snapshot_registry(&self) {
+        let rev = self.targets.snapshot_rev();
+        if self.snapshot_registry_rev.get() == rev {
+            return;
+        }
         *self.snapshot_registry.borrow_mut() = self.targets.snapshot_refs();
+        self.snapshot_registry_rev.set(rev);
     }
 
     /// 构造按需快照读回端口(共享同一设备/队列与快照句柄表)。
@@ -406,6 +416,7 @@ impl WgpuRenderer {
             text: yu_render_core::TextComposer::with_tuning(tuning),
             text_gpu,
             snapshot_registry: Rc::new(RefCell::new(BTreeMap::new())),
+            snapshot_registry_rev: std::cell::Cell::new(0),
             last_phases: yu_render_core::RenderPhases::default(),
             force_bilinear_scale: tuning.bilinear_scale,
             tuning,

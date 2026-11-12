@@ -210,7 +210,9 @@ pub struct TextRun {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextGlyph {
     /// 单字符字节(1 或 2 字节;控制标志不产生 glyph)。
-    pub bytes: Vec<u8>,
+    ///
+    /// `SmallVec` 内联:每字一次 `Vec` 堆分配在对话页是数千次/帧(#22)。
+    pub bytes: smallvec::SmallVec<[u8; 4]>,
     /// 该字形所属显示 codec。
     pub codec: yu_format::Codec,
     /// 是否全角(`_TEXT_FLAG == '2'`)。用于后端选择单元宽度。
@@ -337,6 +339,23 @@ impl TextDraw {
         self.composite_offsets().1 as u32
     }
 
+    /// 去重指纹(#21):只用于分桶,桶内仍用 [`TextDrawKey::matches_draw`]
+    /// 精确确认。不克隆 bytes/style/image。
+    #[must_use]
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        self.bytes.hash(&mut h);
+        self.codec.hash(&mut h);
+        self.x.hash(&mut h);
+        self.y.hash(&mut h);
+        self.set.hash(&mut h);
+        self.bno.hash(&mut h);
+        self.style.hash(&mut h);
+        self.image.hash(&mut h);
+        h.finish()
+    }
+
     /// 命令时刻去重键(不含 `target`:键控按目标层分桶)。
     ///
     /// 官方 `CGACT[TEXT]` 即时写层表面;同层同参的重复命令在像素上**不是**
@@ -447,7 +466,7 @@ pub fn layout_text_with_codec(
                     return None;
                 }
                 glyphs.push(TextGlyph {
-                    bytes: bytes[i..i + len].to_vec(),
+                    bytes: smallvec::SmallVec::from_slice(&bytes[i..i + len]),
                     codec,
                     full,
                     x: pen_x,
@@ -475,7 +494,7 @@ pub fn layout_text_with_codec(
                     return None;
                 }
                 glyphs.push(TextGlyph {
-                    bytes: bytes[i..i + len].to_vec(),
+                    bytes: smallvec::SmallVec::from_slice(&bytes[i..i + len]),
                     codec,
                     full: len == 2,
                     x: pen_x,

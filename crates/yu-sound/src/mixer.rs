@@ -84,6 +84,17 @@ impl SoundState {
         }
         let frames = out.len() / channels;
         for (id, layer) in self.layers_iter() {
+            // 先做 O(1) 判定,与 `mix_layer` 的前两个 return 等价:
+            // 已停止/暂停层不产出样本;容器层本来就没有自有解码流
+            // (`stream` 为空时 `mix_layer` 立即返回)。两者都不必再沿
+            // 祖先链折音量、也不必算声像(每块每层一次前缀查找 + 两次
+            // 对数/幂运算)。层迭代顺序与混音顺序完全不变。
+            if !layer.state().audible() || layer.paused() {
+                continue;
+            }
+            if layer.is_container() && !layer.has_stream() {
+                continue;
+            }
             // 官方在设置音量时用 `FUN_00424dfc` 把祖先链折进 DSB 音量
             // （主音量 `:/S0/` → 频道 `BGM/` → 单条声音）；这里按同一
             // 公式取有效音量，容器/父层改音量对全部后代即时生效。
@@ -103,9 +114,12 @@ impl SoundState {
         // 混入同一块。环形缓冲读取 + 线性插值,回调内零分配。
         self.movie.borrow_mut().render(out, out_rate, channels);
         // 调试抓取:把限幅**之前**的原始混音结果留一份(爆音分析用)。
-        if let Ok(mut slot) = self.debug_capture.lock() {
-            if let Some(buffer) = slot.as_mut() {
-                buffer.extend_from_slice(out);
+        // 抓取默认关闭,先读一个 relaxed 标志,避免每块都加/解一次互斥量。
+        if self.capture_active.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(mut slot) = self.debug_capture.lock() {
+                if let Some(buffer) = slot.as_mut() {
+                    buffer.extend_from_slice(out);
+                }
             }
         }
         // Unverified：引擎最终由 DirectSound 混音器限幅；这里只做 [-1,1] 钳制。

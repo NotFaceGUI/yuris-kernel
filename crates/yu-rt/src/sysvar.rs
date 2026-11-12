@@ -267,15 +267,18 @@ pub fn read(vm: &Vm, st: &ExecState, var: VarRef, indices: &[i64]) -> Result<Val
         // ---- 输入(手册 `basic/input.html`) -------------------------------
         // 按键/鼠标 = **带符号帧计数器**(本 crate `input` 模块)。
         _ if name.starts_with("_KEY_") || name.starts_with("_MOUSE_") => {
-            read_button(vm, name, indices)
+            read_button(vm, name, indices, var.id)
         }
         // 手册:`@_KEYNUM_～ / @_MOUSENUM_～` = 押された回数。
+        // 按钮码在启动期由 `InputBinding` 按 id 解析好(#42):不再每次
+        // `format!("KEY_…")` 再走按钮名 → ABI 表线性扫描。
         _ if name.starts_with("_KEYNUM_") || name.starts_with("_MOUSENUM_") => {
-            let button = match name.strip_prefix("_KEYNUM_") {
-                Some(rest) => format!("KEY_{rest}"),
-                None => format!("MOUSE_{}", name.strip_prefix("_MOUSENUM_").unwrap_or("")),
-            };
-            Ok(Value::Int(vm.input().count(&button)))
+            let count = vm
+                .binding()
+                .count_code_of_id(var.id)
+                .map(|code| vm.input().count_code(code))
+                .unwrap_or(0);
+            Ok(Value::Int(count))
         }
         // 手册:`@_INP(n)` 数组版;n = 按钮码(`@_INP(@_CODE_Z)` ≡ `@_KEY_Z`,
         // 手册 ※3)。REA:同一张 VK 计数表(`FUN_00427350` case 0x90,
@@ -382,7 +385,15 @@ pub fn read(vm: &Vm, st: &ExecState, var: VarRef, indices: &[i64]) -> Result<Val
     }
 }
 
-fn read_button(vm: &Vm, name: &str, indices: &[i64]) -> Result<Value, yu_log::Diag> {
+fn read_button(vm: &Vm, name: &str, indices: &[i64], id: u16) -> Result<Value, yu_log::Diag> {
+    // 标量按钮(`_KEY_A`/`_MOUSE_L1`…):启动期 id→按钮码表直查,
+    // 不再做名字前缀判断 + 工程绑定表查名 + ABI 表线性扫描(#12)。
+    // 坐标槽/`_KEY_ANY`/手柄族不在该表里,落到下面的专用分支。
+    if indices.is_empty() {
+        if let Some(code) = vm.binding().key_code_of_id(id) {
+            return Ok(Value::Int(vm.input().counter_code(i64::from(code))));
+        }
+    }
     // `_MOUSE_X/Y` 是坐标(标量),单独处理。
     match name {
         "_MOUSE_X" => return Ok(Value::Int(vm.input().cursor().0)),

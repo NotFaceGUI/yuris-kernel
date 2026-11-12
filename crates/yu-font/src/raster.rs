@@ -44,9 +44,19 @@ pub struct Rasterizer {
     /// `(源 face, bold, italic 量化)` → 已解析 face。`resolve_style` 内部走
     /// fontdb 查询,逐字形调用会在大字库上累积成毫秒级;同参必同果,记一次。
     style_memo: std::collections::HashMap<(crate::source::FaceId, bool, i16), ResolvedFace>,
+    /// 缺字负缓存:`(解析后 face, char)` → 同一份 `Diag`。
+    ///
+    /// 缺字在字幕/NAME 列表里常常每帧重复出现;没有负缓存时每次都要
+    /// `with_face_data` + `FontRef::from_index` + charmap 查询 + `format!`。
+    /// 字体数据与解析结果在本进程内不变,命中直接克隆诊断即可。
+    missing_memo: std::collections::HashMap<(crate::source::FaceId, char), Diag>,
     /// 逐字形阶段耗时 trace(宿主参数 `font_trace`;默认关)。
     trace: bool,
 }
+
+/// 缺字负缓存条目上限(病态字体/长文本下防无限增长;满了清空重来,
+/// 只影响性能,诊断内容不变)。
+const MISSING_MEMO_CAP: usize = 4096;
 
 impl Default for Rasterizer {
     fn default() -> Self {
@@ -60,6 +70,7 @@ impl Rasterizer {
         Self {
             ctx: swash::scale::ScaleContext::new(),
             style_memo: std::collections::HashMap::new(),
+            missing_memo: std::collections::HashMap::new(),
             trace: false,
         }
     }
@@ -114,9 +125,14 @@ impl Rasterizer {
         let sy = f32::from(params.sy);
         let aa = params.aa;
 
+        // 缺字负缓存命中:直接复用上次构造的诊断(与重新探测逐字节相同)。
+        if let Some(diag) = self.missing_memo.get(&(resolved.face, ch)) {
+            return Err(diag.clone());
+        }
+
         let trace = self.trace;
         let t_total = std::time::Instant::now();
-        let inner = source.with_face_data(resolved.face, |bytes, index| {
+        let result = source.with_face_data(resolved.face, |bytes, index| {
             let t0 = std::time::Instant::now();
             let font = swash::FontRef::from_index(bytes, index as usize).ok_or_else(|| {
                 Diag::fatal(code::font::BAD_FACE, Boundary::Data)
@@ -205,8 +221,21 @@ impl Rasterizer {
                 advance,
                 coverage,
             })
-        })?;
-        inner
+        });
+        match result {
+            Ok(inner) => inner,
+            Err(diag) => {
+                // 只缓存"该 face 无此字形"的负结果;face 数据/解析失败是
+                // 另一类错误,不能当作缺字缓存。
+                if diag.code == code::font::GLYPH_MISSING {
+                    if self.missing_memo.len() >= MISSING_MEMO_CAP {
+                        self.missing_memo.clear();
+                    }
+                    self.missing_memo.insert((resolved.face, ch), diag.clone());
+                }
+                Err(diag)
+            }
+        }
     }
 }
 

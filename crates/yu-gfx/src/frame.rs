@@ -9,6 +9,7 @@
 //! 证据与后端执行细节见 `docs/render-parity.md`。
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::error::FrameDiag;
 use crate::layer::{ImageFormat, Layer, LayerId, SizeU32};
@@ -304,7 +305,10 @@ pub struct CompositorFrame {
     /// 窗口状态(按 `NO` 升序;`NO=0` 主窗口)。
     pub windows: Vec<WindowState>,
     /// 完整图层状态(含不可见层),按 `(z, seq, id)` 稳定排序。
-    pub layers: Vec<Layer>,
+    ///
+    /// `Arc`:同一层在一帧里还出现在 `passes` 的 op 中;共享句柄让
+    /// 「整帧快照 + 绘制列表」只持引用,不再每条命令克隆一份层。
+    pub layers: Vec<Arc<Layer>>,
     /// 绘制列表(只含可见/需要执行的 op)。
     pub passes: Vec<Pass>,
     /// 本帧待显示文本(跨帧文本缓冲的快照;DIV-GFX-034)。
@@ -312,7 +316,9 @@ pub struct CompositorFrame {
     /// 自动文本层排版结果(`_TEXT_FLAG` 逐字步进;缺失 ⇒ `None`)。
     pub text_layout: Option<TextLayoutFrame>,
     /// `CGACT[TEXT=1]` 绘制项(按目标层 ID 稳定排序;层内保持命令序)。
-    pub text_draws: Vec<TextDraw>,
+    ///
+    /// `Arc<[_]>`:内容不变的帧共享同一份投影,不再逐帧克隆全部绘制项(#3)。
+    pub text_draws: std::sync::Arc<[TextDraw]>,
     /// 每层 `text_draws` 修订号(`CGACT[TEXT]` 内容每次实际改动 +1)。
     ///
     /// 后端用「层 + 修订号 + 基面身份」缓存文本合成结果:官方文本烘焙
@@ -334,11 +340,11 @@ pub struct CompositorFrame {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScreenSnapshot {
     /// 命令时刻的完整图层状态(含随后被 `CGEND` 删除的层)。
-    pub layers: Vec<Layer>,
+    pub layers: Vec<Arc<Layer>>,
     /// 命令时刻的组离屏 pass + 最后的屏幕 pass。
     pub passes: Vec<Pass>,
-    /// 命令时刻已烘焙的 `CGACT[TEXT]` 绘制项。
-    pub text_draws: Vec<TextDraw>,
+    /// 命令时刻已烘焙的 `CGACT[TEXT]` 绘制项(与帧投影共享句柄)。
+    pub text_draws: std::sync::Arc<[TextDraw]>,
     /// 命令时刻的文本修订号(后端文本缓存键)。
     pub text_revisions: BTreeMap<LayerId, u64>,
     /// 命令时刻的自动文本层排版。
@@ -374,7 +380,7 @@ impl CompositorFrame {
             passes: Vec::new(),
             text: Vec::new(),
             text_layout: None,
-            text_draws: Vec::new(),
+            text_draws: std::sync::Arc::from(Vec::new()),
             text_revisions: BTreeMap::new(),
             diagnostics: Vec::new(),
             screen_snapshots: BTreeMap::new(),

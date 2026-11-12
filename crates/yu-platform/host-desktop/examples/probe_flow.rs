@@ -160,7 +160,7 @@ fn run() -> Result<(), String> {
             }
             if std::env::var_os("PROBE_ALL_LAYERS").is_some() {
                 let visible: Vec<&yu_gfx::Layer> =
-                    frame.layers.iter().filter(|l| l.visible).collect();
+                    frame.layers.iter().filter(|l| l.visible).map(|l| l.as_ref()).collect();
                 println!("  visible_total={}", visible.len());
                 for layer in visible.iter().take(400) {
                     let id = layer.id.as_str_lossy();

@@ -130,26 +130,29 @@ impl FontRenderer {
         }
 
         let images: Vec<Arc<GlyphImage>> = if style.gradation_scope == GradationScope::WholeRun {
-            // First pass: geometry only (per-glyph gradient placeholder).
-            let mut geo = Vec::with_capacity(text.chars().count());
-            for ch in text.chars() {
-                let base = self.rasterize_base(ch, style)?;
-                geo.push(compose_glyph(base, style, None));
-            }
-            let (min_top, max_bottom) = geo.iter().fold((0i32, 0i32), |(lo, hi), g| {
+            // First pass: rasterize once and keep the base bitmaps. The
+            // per-glyph placeholder composition is only needed for the
+            // run-wide vertical span (outline/shadow geometry), not pixels.
+            let bases: Vec<GlyphBitmap> = text
+                .chars()
+                .map(|ch| self.rasterize_base(ch, style))
+                .collect::<Result<Vec<_>, _>>()?;
+            let (min_top, max_bottom) = bases.iter().fold((0i32, 0i32), |(lo, hi), base| {
+                let g = compose_glyph(base.clone(), style, None);
                 (lo.min(g.top), hi.max(g.top + g.height as i32))
             });
-            // Second pass: color with the run-wide vertical range.
-            let mut out = Vec::with_capacity(geo.len());
-            for ch in text.chars() {
-                let base = self.rasterize_base(ch, style)?;
-                out.push(Arc::new(compose_glyph(
-                    base,
-                    style,
-                    Some((min_top as f32, max_bottom as f32)),
-                )));
-            }
-            out
+            // Second pass: color with the run-wide vertical range, reusing the
+            // already rasterized bases instead of rasterizing each glyph twice.
+            bases
+                .into_iter()
+                .map(|base| {
+                    Arc::new(compose_glyph(
+                        base,
+                        style,
+                        Some((min_top as f32, max_bottom as f32)),
+                    ))
+                })
+                .collect()
         } else {
             let mut out = Vec::with_capacity(text.chars().count());
             for ch in text.chars() {

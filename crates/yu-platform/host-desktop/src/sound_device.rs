@@ -36,14 +36,18 @@ fn render_f32(slot: &Slot, data: &mut [f32], rate: u32, channels: usize, first_a
         Ok(mut state) => state.render_and_advance(data, rate, channels),
         Err(_) => data.fill(0.0),
     };
-    let peak = data.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-    if peak > 0.0 && !first_audio.swap(true, Ordering::Relaxed) {
-        // `src/` 纪律:不走 stdout/stderr 宏;经 log 门面进宿主统一 sink。
-        log::info!(
-            target: "yu-sound",
-            "[sound] first non-silent block: peak={peak:.4} frames={} rate={rate}",
-            data.len() / channels.max(1)
-        );
+    // 首次非静音块只报告一次:peak 也只在还没报过时计算 —— 之后每块
+    // 再扫全样本求峰值纯属浪费(audio 回调每块 128~2048 样本)。
+    if !first_audio.load(Ordering::Relaxed) {
+        let peak = data.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        if peak > 0.0 && !first_audio.swap(true, Ordering::Relaxed) {
+            // `src/` 纪律:不走 stdout/stderr 宏;经 log 门面进宿主统一 sink。
+            log::info!(
+                target: "yu-sound",
+                "[sound] first non-silent block: peak={peak:.4} frames={} rate={rate}",
+                data.len() / channels.max(1)
+            );
+        }
     }
 }
 

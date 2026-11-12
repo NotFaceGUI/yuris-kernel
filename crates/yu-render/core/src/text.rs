@@ -18,8 +18,11 @@
 //! - 基线 = 单元顶边 + 字体 ascent(近似 GDI 的 `lfHeight` 单元,DIV-GFX-056)。
 
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::Instant;
+
+use rustc_hash::FxHashMap;
 
 use yu_font::cache::CacheLimits;
 use yu_font::{
@@ -29,10 +32,72 @@ use yu_font::{
 use yu_font::{StylePolicy, TextStyle as FontStyle};
 use yu_format::text::{TextCodec, TunnelTable};
 use yu_format::Codec;
-use yu_gfx::{LayerId, TextDraw, TextDrawKey, TextFontRequest, TextLayoutFrame, TextureRef};
+use yu_gfx::{LayerId, TextDraw, TextDrawKey, TextLayoutFrame, TextureRef};
 
 use crate::texture::Texture;
 use crate::tuning::RenderTuning;
+
+/// 表面内像素矩形(右上开区间;已裁到目标表面之内)。
+///
+/// 增量绘制(逐字吐字)把它交给后端做**局部上传**:只把新画到的字符
+/// 区域写进 GPU 纹理,避免每个字符整层重传(那是推进剧情时的主要尖峰)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextRect {
+    pub x0: u32,
+    pub y0: u32,
+    pub x1: u32,
+    pub y1: u32,
+}
+
+impl TextRect {
+    fn union(self, other: TextRect) -> TextRect {
+        TextRect {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+}
+
+/// 把一次字形/图像绘制覆盖的矩形并入脏区(裁到表面内)。
+fn touch_rect(dirty: &mut Option<TextRect>, x: i32, y: i32, w: i32, h: i32, sw: u32, sh: u32) {
+    if w <= 0 || h <= 0 || sw == 0 || sh == 0 {
+        return;
+    }
+    let x0 = x.max(0).min(sw as i32);
+    let y0 = y.max(0).min(sh as i32);
+    let x1 = x.saturating_add(w).max(0).min(sw as i32);
+    let y1 = y.saturating_add(h).max(0).min(sh as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let r = TextRect {
+        x0: x0 as u32,
+        y0: y0 as u32,
+        x1: x1 as u32,
+        y1: y1 as u32,
+    };
+    *dirty = Some(match *dirty {
+        None => r,
+        Some(d) => d.union(r),
+    });
+}
+
+/// 增量烘焙后的内容身份:由「上一状态指纹 + 修订号 + 已画字数 + 基面身份」
+/// 推进一步。
+///
+/// 旧实现每次逐字增量都对**整层像素**重算 `content_hash_rgba`(逐字吐字时
+/// 每字符一次 O(面积) 扫描)。该哈希只用于 wgpu 的上传缓存等值判断
+/// (命中/增量/重烤路径由 `compose_cache` 自己保证语义),因此增量时用
+/// 结构身份即可;整体重烤仍保留像素哈希。`prev_hash` 会随结果返回,后端
+/// 只有在「现存 GPU 纹理 == 上一状态」时才允许局部上传。
+fn incremental_identity(prev: u64, revision: u64, visible: u64, base_key: u64) -> u64 {
+    let mut h = prev ^ 0x9e37_79b9_7f4a_7c15;
+    h = (h ^ revision).wrapping_mul(0x100_0000_01b3);
+    h = (h ^ visible).wrapping_mul(0x100_0000_01b3);
+    (h ^ base_key).wrapping_mul(0x100_0000_01b3)
+}
 
 /// 一次文本合成的统计(进 `RenderReport`)。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -45,6 +110,8 @@ pub struct TextPaintStats {
     pub missing: usize,
     /// 去重后的失败原因(稳定排序)。
     pub diags: Vec<String>,
+    /// 本次调用实际改写的像素矩形(未画任何像素 = `None`)。
+    pub dirty: Option<TextRect>,
 }
 
 impl TextPaintStats {
@@ -81,8 +148,18 @@ pub struct TextComposer {
     renderer: Option<FontRenderer>,
     /// 首次初始化失败原因(`None` = 尚未尝试)。
     failure: Option<String>,
-    /// 字体身份 → face 解析缓存(键是请求的稳定显示形式)。
-    faces: BTreeMap<String, Option<(yu_font::FaceId, FaceFallback)>>,
+    /// 字体身份 → face 解析缓存(`FxHashMap` + 本地可哈希请求键;旧实现
+    /// 每帧每个绘制项都 `format!("{request:?}")` 再查 `BTreeMap<String>`)。
+    faces: FxHashMap<FaceKey, Option<(yu_font::FaceId, FaceFallback)>>,
+    /// `(face, sy)` → ascent 像素(`None` = 取不到);每个绘制项每帧都要用,
+    /// 而 `ascent_px` 每次都要走字体源解析。
+    ascent_cache: FxHashMap<(yu_font::FaceId, u16), Option<i32>>,
+    /// `(显示 codec, 源字节指纹)` → 解码结果(源字节 + 字符 + 非法字节数)。
+    ///
+    /// `CGACT[TEXT]` 的字符串跨帧不变,每帧重解码只是白耗 `Vec<char>` 分配;
+    /// 结果与 [`Self::decode_display`] 逐项相同(纯函数,只依赖隧道表)。
+    /// 命中路径不再分配 key:`u64` 指纹 + 条目内源字节逐字节复核(防碰撞)。
+    decode_cache: FxHashMap<(Codec, u64), Rc<DecodedDisplay>>,
     /// 首次系统字体枚举耗时(毫秒)。只在加载后的第一帧报告一次
     /// (`text.font_init`),用于解释“第一次打开テキスト页签”的尖峰。
     load_ms: Option<u128>,
@@ -146,20 +223,76 @@ struct ComposeCacheEntry {
     revision: u64,
     base_key: u64,
     texture: Rc<Texture>,
-    /// 已烘焙进 `texture` 的绘制键(顺序 = 烘焙顺序)。
+    /// 已烘焙内容(决定能否增量:绘制集合按 `TextDrawKey` 前缀,布局按
+    /// 内容代次 + 已画字数)。
+    kind: CachedKind,
+    /// `texture` 内容身份(命中路径零重算)。
     ///
-    /// 官方语义是 `CGACT[TEXT]` 命令时刻直接写层表面的持久烘焙
-    /// (DIV-GFX-058):已画上去的像素不会因后续命令改变。因此新绘制集合
-    /// 若以它为**严格前缀追加**,就只增量画尾部 —— 与整体重烤逐位等价,
-    /// 成本从 O(整页) 降到 O(新字符);这是“逐字吐字越到后面越卡”的主修。
-    baked: Vec<TextDrawKey>,
-    /// `texture` 内容指纹(烘焙/增量时算一次;命中路径零重算)。
-    /// 算法 = [`content_hash_rgba`](与 wgpu `hash_rgba` 同一口径)。
+    /// 整体重烤时是 [`content_hash_rgba`](与 wgpu `hash_rgba` 同一口径);
+    /// 逐字增量时是结构身份(上一身份 + 修订号 + 已画字数 + 基面身份),
+    /// 只用于上传缓存的等值判断。后端必须同时核对
+    /// [`ComposedLayer::prev_hash`] 才允许局部上传。
     hash: u64,
     /// LRU 时钟(`compose_cache_clock` 递增;逐条淘汰的次序依据)。
     last_use: u64,
     /// `texture.rgba` 字节数(预算记账)。
     bytes: u64,
+}
+
+/// 合成缓存条目的内容种类。
+enum CachedKind {
+    /// `CGACT[TEXT]` 持久绘制集合。
+    ///
+    /// 官方语义是 `CGACT[TEXT]` 命令时刻直接写层表面的持久烘焙
+    /// (DIV-GFX-058):已画上去的像素不会因后续命令改变。因此新绘制集合
+    /// 若以它为**严格前缀追加**,就只增量画尾部 —— 与整体重烤逐位等价,
+    /// 成本从 O(整页) 降到 O(新字符);这是“逐字吐字越到后面越卡”的主修。
+    Draws { baked: Vec<TextDrawKey> },
+    /// 自动文本布局。`header`(字体/原点/行高)不变且已画字形前缀
+    /// (`prefix` = `glyphs[0..visible]` 的指纹)未变时:同 `visible` = 命中,
+    /// `visible` 变大 = 只补画新露出的尾部;`reveal` 回退或前缀变动才整体重烤。
+    Layout {
+        header: u64,
+        prefix: u64,
+        visible: usize,
+        stats: LayoutStats,
+    },
+}
+
+/// 布局路径的累计绘制统计(缓存命中/增量时按原口径重放,诊断计数不变)。
+#[derive(Clone, Default)]
+struct LayoutStats {
+    glyphs: usize,
+    missing: usize,
+    diags: Vec<String>,
+}
+
+impl LayoutStats {
+    /// 从一次绘制的统计取累计值。`text.font_init` 是一次性信息诊断(只在
+    /// 首次初始化那一帧出现),存进缓存后不得逐帧重放。
+    fn of(stats: &TextPaintStats) -> Self {
+        Self {
+            glyphs: stats.glyphs,
+            missing: stats.missing,
+            diags: stats
+                .diags
+                .iter()
+                .filter(|d| !d.starts_with("text.font_init: "))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// 还原成本次调用的统计(`draws` 始终取当前布局的字符数,与原路径一致)。
+    fn paint_stats(&self, chars: usize) -> TextPaintStats {
+        TextPaintStats {
+            draws: chars,
+            glyphs: self.glyphs,
+            missing: self.missing,
+            diags: self.diags.clone(),
+            dirty: None,
+        }
+    }
 }
 
 /// 合成缓存的**字节预算**:超过时按 LRU 逐条淘汰最旧条目。
@@ -171,6 +304,28 @@ struct ComposeCacheEntry {
 const COMPOSE_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// 条目数硬上限(元数据防无界;每条还有 `bytes` 记账)。
 const COMPOSE_CACHE_MAX_ENTRIES: usize = 8192;
+/// 显示解码缓存条目上限(超出整体清空;只影响性能)。
+const DECODE_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// 文本显示解码的缓存条目(B-01)。
+///
+/// 键是指纹,命中后必须用 `source` 逐字节确认:哈希碰撞时按未命中重新
+/// 解码,结果与缓存前完全一致(只损失这一条缓存)。
+struct DecodedDisplay {
+    source: Vec<u8>,
+    chars: Vec<char>,
+    invalid: usize,
+}
+
+/// `decode_display_cached` 的键指纹(FNV-1a;只用于分桶,不单独判等)。
+fn decode_fingerprint(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
 
 /// 「宽 + 高 + RGBA 字节」的 64 位内容指纹。
 ///
@@ -256,6 +411,32 @@ pub fn text_base_key(texture: &TextureRef, override_hash: Option<u64>) -> u64 {
     h
 }
 
+/// 布局**头部**指纹:字体快照 / 原点 / 行高。这些字段一变,已烘焙像素的
+/// 含义就变(字体/基线/位置),必须整体重烤。
+fn layout_header(layout: &TextLayoutFrame) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    layout.origin.hash(&mut hasher);
+    layout.style.hash(&mut hasher);
+    layout.line_height.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 布局**已画字形前缀**指纹(`glyphs[0..len]` 的像素相关字段)。
+///
+/// 前缀未变 ⇒ 已画上去的像素与整体重烤逐位相同,只补画尾部即可;`reveal`
+/// 与 `chars` 是显示截断/审计字段,不参与(逐字显示推进不触发重烤)。
+fn layout_prefix(layout: &TextLayoutFrame, len: usize) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    len.hash(&mut hasher);
+    for glyph in layout.glyphs.iter().take(len) {
+        glyph.bytes.hash(&mut hasher);
+        glyph.codec.hash(&mut hasher);
+        glyph.x.hash(&mut hasher);
+        glyph.y.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// 字体身份解析的回落种类(`font_style` 第三项;进 `text_diags`)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FaceFallback {
@@ -288,16 +469,46 @@ fn font_source_summary(source: &FontSource, elapsed_ms: u128) -> String {
     }
 }
 
-/// 把 `FONT` 请求渲染成人读形式(日志用):`NAME="ＭＳ ゴシック"` /
-/// `NO=3` / `Default`(脚本未指定,走引擎回退表)。
-fn describe_request(request: &TextFontRequest) -> String {
-    match request {
-        TextFontRequest::Name(bytes) => {
-            let text: String = cp932::decode(bytes).chars.into_iter().collect();
-            format!("NAME=\"{text}\"")
+/// `FONT` 字体请求的本地可哈希键。
+///
+/// [`yu_gfx::TextFontRequest`] 没有派生 `Hash`(本 crate 不改 `yu-gfx`),这里
+/// 按同一语义做一个镜像:解析结果只取决于 `NAME`/`NO`/缺省三态,与原文逐项
+/// 相等。解析缓存的键从「`format!("{request:?}")` 的 `String`」换成本枚举后,
+/// 命中路径不再格式化整段字体名(旧实现的 Debug 会把每个 CP932 字节按十进制
+/// 展开),只克隆一次小 `Vec`(或零分配)。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum FaceKey {
+    /// 显式字体名(CP932 原始字节)。
+    Name(Vec<u8>),
+    /// 字体列表序号(`FONT[NO]`)。
+    No(i64),
+    /// 未设置 → 引擎默认 family。
+    Default,
+}
+
+impl FaceKey {
+    /// 从字体快照取请求身份(`TextStyle::font_request` 的同口径:NAME 优先)。
+    fn of_style(style: &yu_gfx::TextStyle) -> Self {
+        if let Some(name) = &style.name {
+            FaceKey::Name(name.clone())
+        } else if let Some(no) = style.font_no {
+            FaceKey::No(no)
+        } else {
+            FaceKey::Default
         }
-        TextFontRequest::No(no) => format!("NO={no}"),
-        TextFontRequest::Default => "Default(script gave no font)".to_string(),
+    }
+
+    /// 把请求渲染成人读形式(日志用):`NAME="ＭＳ ゴシック"` / `NO=3` /
+    /// `Default`(脚本未指定,走引擎回退表)。文案与旧实现逐字一致。
+    fn describe(&self) -> String {
+        match self {
+            FaceKey::Name(bytes) => {
+                let text: String = cp932::decode(bytes).chars.into_iter().collect();
+                format!("NAME=\"{text}\"")
+            }
+            FaceKey::No(no) => format!("NO={no}"),
+            FaceKey::Default => "Default(script gave no font)".to_string(),
+        }
     }
 }
 
@@ -320,7 +531,9 @@ impl TextComposer {
         Self {
             renderer: None,
             failure: None,
-            faces: BTreeMap::new(),
+            faces: FxHashMap::default(),
+            ascent_cache: FxHashMap::default(),
+            decode_cache: FxHashMap::default(),
             load_ms: None,
             compose_cache: BTreeMap::new(),
             source_summary: None,
@@ -351,7 +564,9 @@ impl TextComposer {
         Self {
             renderer: Some(renderer),
             failure: None,
-            faces: BTreeMap::new(),
+            faces: FxHashMap::default(),
+            ascent_cache: FxHashMap::default(),
+            decode_cache: FxHashMap::default(),
             load_ms: None,
             compose_cache: BTreeMap::new(),
             source_summary: None,
@@ -420,6 +635,7 @@ impl TextComposer {
         self.tunnel = tunnel;
         self.compose_cache.clear();
         self.base_cache.clear();
+        self.decode_cache.clear();
         self.cache_bytes = 0;
         self.base_cache_bytes = 0;
     }
@@ -438,6 +654,50 @@ impl TextComposer {
             Some(tunnel) => TextCodec::with_tunnel(codec, tunnel).decode_char(bytes),
             None => TextCodec::new(codec).decode_char(bytes),
         }
+    }
+
+    /// [`Self::decode_display`] 的缓存版本(`(codec, 字节)` → 解码结果)。
+    ///
+    /// 同一字符串跨帧反复绘制时,免掉每帧一次 `Vec<char>` 分配与逐字解码。
+    /// 缓存有上限,满了整体清空(只影响性能,不影响结果)。
+    fn decode_display_cached(&mut self, codec: Codec, bytes: &[u8]) -> Rc<DecodedDisplay> {
+        let key = (codec, decode_fingerprint(bytes));
+        if let Some(hit) = self.decode_cache.get(&key) {
+            // 指纹碰撞保护:源字节逐字节确认后才复用。
+            if hit.source == bytes {
+                return Rc::clone(hit);
+            }
+        }
+        let (chars, invalid) = self.decode_display(codec, bytes);
+        let decoded = Rc::new(DecodedDisplay {
+            source: bytes.to_vec(),
+            chars,
+            invalid,
+        });
+        if self.decode_cache.len() >= DECODE_CACHE_MAX_ENTRIES {
+            self.decode_cache.clear();
+        }
+        self.decode_cache.insert(key, Rc::clone(&decoded));
+        decoded
+    }
+
+    /// `(face, sy)` 的 ascent 像素(`None` = 取不到)。
+    ///
+    /// 每个 `TextDraw` 每帧都要取一次;`ascent_px` 每次都要走字体源
+    /// (`FontRef::from_index` 等)。face 与 sy 都是有限集合 ⇒ 缓存一次。
+    fn ascent_px(&mut self, face: yu_font::FaceId, sy: u16) -> Option<i32> {
+        if let Some(hit) = self.ascent_cache.get(&(face, sy)) {
+            return *hit;
+        }
+        let value = {
+            let renderer = self.renderer.as_ref().expect("ensured above");
+            match renderer.source().ascent_px(face, sy) {
+                Ok(a) => Some(a.round() as i32),
+                Err(_) => None,
+            }
+        };
+        self.ascent_cache.insert((face, sy), value);
+        value
     }
 
     /// 当前的强制字体 family。
@@ -515,6 +775,7 @@ impl TextComposer {
                 self.failure = None;
                 // 字体身份变了,已解析/已合成的缓存全部失效。
                 self.faces.clear();
+                self.ascent_cache.clear();
                 self.compose_cache.clear();
                 self.base_cache.clear();
                 self.cache_bytes = 0;
@@ -572,10 +833,9 @@ impl TextComposer {
     /// 都解析到那个 family(诊断用);查不到就返回 `None` 显式失败。
     fn resolve_face(
         &mut self,
-        request: &TextFontRequest,
+        key: &FaceKey,
     ) -> Option<(yu_font::FaceId, FaceFallback)> {
-        let key = format!("{request:?}");
-        if let Some(hit) = self.faces.get(&key) {
+        if let Some(hit) = self.faces.get(key) {
             return hit.clone();
         }
         if !self.ensure() {
@@ -608,8 +868,8 @@ impl TextComposer {
                 }
                 hit.map(|face| (face, FaceFallback::None))
             }
-            None => match request {
-                TextFontRequest::Name(bytes) => {
+            None => match key {
+                FaceKey::Name(bytes) => {
                     let text: String = cp932::decode(bytes).chars.into_iter().collect();
                     match source.find_family(&text) {
                         Some(face) => Some((face, FaceFallback::None)),
@@ -621,7 +881,7 @@ impl TextComposer {
                             .map(|face| (face, FaceFallback::Name(bytes.clone()))),
                     }
                 }
-                TextFontRequest::No(no) => {
+                FaceKey::No(no) => {
                     if *no >= 0 {
                         source
                             .face_by_no(*no as usize)
@@ -630,7 +890,7 @@ impl TextComposer {
                         None
                     }
                 }
-                TextFontRequest::Default => source
+                FaceKey::Default => source
                     .default_face()
                     .ok()
                     .map(|face| (face, FaceFallback::None)),
@@ -639,7 +899,7 @@ impl TextComposer {
         self.faces.insert(key.clone(), face.clone());
         // 每个不同的 FONT 请求只在首次解析时记一条:脚本重发同一字体不刷日志。
         // 这是「游戏实际用了什么字体」的直接答案(请求 → 文件 → TTC 面)。
-        let want = describe_request(request);
+        let want = key.describe();
         match &face {
             Some((id, fallback)) => {
                 let how = match fallback {
@@ -666,8 +926,8 @@ impl TextComposer {
     /// 返回值第三项 = 是否走了 `BNO` 的“默认字体”回退(DIV-FONT-007
     /// 未取证);调用方据此发一次性报告,不静默回退。
     fn font_style(&mut self, style: &yu_gfx::TextStyle) -> Option<(FontStyle, u16, FaceFallback)> {
-        let request = style.font_request();
-        let (face, fallback) = self.resolve_face(&request)?;
+        let key = FaceKey::of_style(style);
+        let (face, fallback) = self.resolve_face(&key)?;
         // SX/SY=0 → 20:引擎默认样式(`FUN_00464fac`;见
         // `docs/font-contract.md` §3.3“引擎默认 SX=SY=20”)。
         let sx = style.size_x.clamp(0, 0x100) as u16;
@@ -731,46 +991,56 @@ impl TextComposer {
                 String::from_utf8_lossy(bytes)
             )),
         }
-        let ascent = {
-            let renderer = self.renderer.as_ref().expect("ensured above");
-            match renderer.source().ascent_px(font_style.face, sy) {
-                Ok(a) => a.round() as i32,
-                Err(_) => {
-                    stats.draws += 1;
-                    stats.note("text.metrics_unavailable");
-                    return;
-                }
-            }
+        let Some(ascent) = self.ascent_px(font_style.face, sy) else {
+            stats.draws += 1;
+            stats.note("text.metrics_unavailable");
+            return;
         };
         let blended = font_style.draw_mode == DrawMode::Blend;
         // 引擎按 **偏移** 多次合成(3×3 邻域),不是同位置重复画
         // (REA `FUN_004056b8`;见 `TextDraw::composite_offsets`)。
         // 同位置叠 9 次会把 AA 边缘压实成实心 ⇒ 字变粗变白。
         let (offsets, passes) = draw.composite_offsets();
-        let (chars, invalid) = self.decode_display(draw.codec, &draw.bytes);
+        let decoded = self.decode_display_cached(draw.codec, &draw.bytes);
+        let (chars, invalid) = (&decoded.chars, decoded.invalid);
         if invalid > 0 {
             stats.missing += invalid;
             stats.note("text.decode_invalid");
         }
         let mut pen_x = draw.x as i32;
         let baseline = draw.y as i32 + ascent;
+        // `p8_timing` 关闭时连 `Instant` 都不取(旧实现每个字形 4 次)。
+        let timing = self.tuning.p8_timing;
         let renderer = self.renderer.as_mut().expect("ensured above");
         let mut drew_any = false;
         let mut dbg_glyph_ns: u128 = 0;
         let mut dbg_draw_ns: u128 = 0;
-        for ch in &chars {
-            let tg = std::time::Instant::now();
+        for ch in chars {
+            let tg = timing.then(Instant::now);
             let rendered = renderer.render_glyph(*ch, &font_style, StylePolicy::Reference);
-            dbg_glyph_ns += tg.elapsed().as_nanos();
+            if let Some(tg) = tg {
+                dbg_glyph_ns += tg.elapsed().as_nanos();
+            }
             match rendered {
                 Ok(image) => {
                     let gx = pen_x + image.left;
                     let gy = baseline + image.top;
-                    let td = std::time::Instant::now();
+                    let td = timing.then(Instant::now);
                     for &(dx, dy) in &offsets[..passes] {
                         image.draw_onto(dst, w, h, gx + dx, gy + dy, blended);
+                        touch_rect(
+                            &mut stats.dirty,
+                            gx + dx,
+                            gy + dy,
+                            image.width as i32,
+                            image.height as i32,
+                            w,
+                            h,
+                        );
                     }
-                    dbg_draw_ns += td.elapsed().as_nanos();
+                    if let Some(td) = td {
+                        dbg_draw_ns += td.elapsed().as_nanos();
+                    }
                     let step = ((image.advance as f32) / 256.0).round() as i32;
                     pen_x += step.max(0);
                     stats.glyphs += 1;
@@ -783,7 +1053,7 @@ impl TextComposer {
             }
         }
         let _ = drew_any;
-        if self.tuning.p8_timing && dbg_glyph_ns + dbg_draw_ns > 500_000 {
+        if timing && dbg_glyph_ns + dbg_draw_ns > 500_000 {
             log::trace!(
                 target: "yu-render",
                 "[p8] draw chars={} glyph={}us onto={}us passes={}",
@@ -854,12 +1124,8 @@ impl TextComposer {
         let Some((font_style, sy, _fallback)) = self.font_style(&draw.style) else {
             return Err("text.font_missing".to_string());
         };
-        let ascent = {
-            let renderer = self.renderer.as_ref().expect("ensured above");
-            match renderer.source().ascent_px(font_style.face, sy) {
-                Ok(a) => a.round() as i32,
-                Err(_) => return Err("text.metrics_unavailable".to_string()),
-            }
+        let Some(ascent) = self.ascent_px(font_style.face, sy) else {
+            return Err("text.metrics_unavailable".to_string());
         };
         let blended = font_style.draw_mode == DrawMode::Blend;
         let (offsets, passes) = draw.composite_offsets();
@@ -1011,6 +1277,15 @@ impl TextComposer {
             draw.y,
             image.tint
         );
+        touch_rect(
+            &mut stats.dirty,
+            draw.x as i32,
+            draw.y as i32,
+            tw as i32,
+            th as i32,
+            w,
+            h,
+        );
         let tint = image
             .tint
             .map(|c| ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff));
@@ -1083,15 +1358,36 @@ impl TextComposer {
         layout: &TextLayoutFrame,
         blend_override: Option<bool>,
     ) -> TextPaintStats {
+        let visible = layout.reveal.unwrap_or(usize::MAX).min(layout.glyphs.len());
+        match self.paint_layout_range(dst, w, h, layout, blend_override, 0, visible) {
+            Ok(stats) | Err(stats) => stats,
+        }
+    }
+
+    /// 合成布局中 `glyphs[from..to)` 的字形。
+    ///
+    /// `Ok` = 环境正常,返回本段统计;`Err` = 字体/样式/度量不可用或目标缓冲
+    /// 非法(未画任何字形),统计与旧整体路径的提前返回一致。缓存路径用它做
+    /// **增量补画**(只画新露出的尾部),整体路径 `from=0`。
+    fn paint_layout_range(
+        &mut self,
+        dst: &mut [u8],
+        w: u32,
+        h: u32,
+        layout: &TextLayoutFrame,
+        blend_override: Option<bool>,
+        from: usize,
+        to: usize,
+    ) -> Result<TextPaintStats, TextPaintStats> {
         let mut stats = TextPaintStats::default();
         if w == 0 || h == 0 || dst.len() < (w as usize) * (h as usize) * 4 {
-            return stats;
+            return Err(stats);
         }
         if !self.ensure() {
             if let Some(why) = self.failure.clone() {
                 stats.note(&format!("text.font_unavailable: {why}"));
             }
-            return stats;
+            return Err(stats);
         }
         if let Some(ms) = self.load_ms.take() {
             stats.note(&format!("text.font_init: {ms}ms"));
@@ -1099,7 +1395,7 @@ impl TextComposer {
         let style = &layout.style;
         let Some((font_style, sy, fallback)) = self.font_style(style) else {
             stats.note("text.font_missing");
-            return stats;
+            return Err(stats);
         };
         match &fallback {
             FaceFallback::None => {}
@@ -1108,28 +1404,22 @@ impl TextComposer {
                 String::from_utf8_lossy(bytes)
             )),
         }
-        let ascent = {
-            let renderer = self.renderer.as_ref().expect("ensured above");
-            match renderer.source().ascent_px(font_style.face, sy) {
-                Ok(a) => a.round() as i32,
-                Err(_) => {
-                    stats.note("text.metrics_unavailable");
-                    return stats;
-                }
-            }
+        let Some(ascent) = self.ascent_px(font_style.face, sy) else {
+            stats.note("text.metrics_unavailable");
+            return Err(stats);
         };
         // 自动文本层:1 次合成(引擎未取证重复;`_TEXT_FLAG` 只控排版)。
         let blended = blend_override.unwrap_or(font_style.draw_mode == DrawMode::Blend);
-        let visible = layout.reveal.unwrap_or(usize::MAX);
         // 先解码再取 `renderer` 的 &mut,避免和 `decode_display_char(&self)` 打架。
         let decoded: Vec<Option<char>> = layout
             .glyphs
             .iter()
-            .take(visible)
+            .take(to)
+            .skip(from)
             .map(|glyph| self.decode_display_char(glyph.codec, &glyph.bytes))
             .collect();
         let renderer = self.renderer.as_mut().expect("ensured above");
-        for (glyph, ch) in layout.glyphs.iter().take(visible).zip(decoded) {
+        for (glyph, ch) in layout.glyphs.iter().take(to).skip(from).zip(decoded) {
             let Some(ch) = ch else {
                 stats.missing += 1;
                 stats.note("text.decode_invalid");
@@ -1140,6 +1430,15 @@ impl TextComposer {
                     let gx = glyph.x as i32 + image.left;
                     let gy = glyph.y as i32 + ascent + image.top;
                     image.draw_onto(dst, w, h, gx, gy, blended);
+                    touch_rect(
+                        &mut stats.dirty,
+                        gx,
+                        gy,
+                        image.width as i32,
+                        image.height as i32,
+                        w,
+                        h,
+                    );
                     stats.glyphs += 1;
                 }
                 Err(diag) => {
@@ -1149,7 +1448,22 @@ impl TextComposer {
             }
         }
         stats.draws = layout.chars;
-        stats
+        Ok(stats)
+    }
+
+    /// 在**已拥有**的基面上合成自动文本布局(原地),返回纹理与统计。
+    ///
+    /// 缓存路径把 `resolve_base()` 的 `Rc` 唯一化(`Rc::try_unwrap`)后交给
+    /// 这里,省掉 `compose_layer_refs_assets` 里 `base.clone()` 的整面复制
+    /// (旧实现:先取 owned 基面,再整张拷贝一次才画字)。
+    pub fn compose_layer_layout_owned(
+        &mut self,
+        base: Texture,
+        layout: &TextLayoutFrame,
+    ) -> (Texture, TextPaintStats) {
+        let mut out = base;
+        let stats = self.paint_layout(&mut out.rgba, out.width, out.height, layout);
+        (out, stats)
     }
 
     /// 为图层合成"基图 + 文本"的副本。
@@ -1215,11 +1529,14 @@ impl TextComposer {
     /// - `base_dims`:基图尺寸(调用方**免克隆**地窥视;命中/增量路径不碰基图)。
     /// - `resolve_base`:整体重烤/自动文本层时才调用(整图克隆只发生在真正
     ///   需要时);`Err` 原样上抛给调用方记诊断。
-    /// - 返回的 [`ComposedLayer::hash`] 供 wgpu 侧直接构造 `Override`,
-    ///   命中路径不再逐帧重扫整图(800×600 ≈ 1.9 MB FNV)。
+    /// - 返回的 [`ComposedLayer::hash`] 是上传缓存的**内容身份**:整体重烤
+    ///   = 像素哈希(与 wgpu `hash_rgba` 同算法),增量 = 结构身份(由上一
+    ///   身份 + 修订号 + 已画字数 + 基面身份推进一步),因此逐字吐字不再
+    ///   每字符整图重算哈希;`ComposedLayer::dirty/prev_hash` 让后端只把
+    ///   新增像素局部上传。
     ///
-    /// 只在 `layout.is_none()`(纯 `CGACT[TEXT]`)时缓存:自动文本层的布局
-    /// 每帧变化,缓存会读到旧内容。统计只计实际画上的字符。
+    /// `CGACT[TEXT]`(Draws)与自动文本布局(Layout)都进缓存;统计只计实际
+    /// 画上的字符。
     pub fn compose_layer_cached(
         &mut self,
         layer: &LayerId,
@@ -1256,18 +1573,189 @@ impl TextComposer {
         resolve_base: impl FnOnce() -> Result<Rc<Texture>, String>,
     ) -> Result<(Option<ComposedLayer>, TextPaintStats), String> {
         if let Some(layout) = layout {
-            let base = resolve_base()?;
-            let (out, stats) = self.compose_layer_refs_assets(&base, &[], Some(layout), images);
-            return Ok((
-                out.map(|texture| {
-                    let hash = content_hash_rgba(texture.width, texture.height, &texture.rgba);
-                    ComposedLayer {
-                        texture: Rc::new(texture),
-                        hash,
+            let visible = layout.reveal.unwrap_or(usize::MAX).min(layout.glyphs.len());
+            let header = layout_header(layout);
+            // 布局缓存:头部(字体/原点/行高)不变、且已画字形前缀逐项未变时,
+            // 同 `visible` = 纯命中,`visible` 变大 = 只补画新露出的尾部(逐字
+            // 吐字不再整页重烤);`reveal` 回退或前缀变动才从基面整体重烤。
+            if let Some(hit) = self.compose_cache.remove(layer) {
+                let dims_ok = hit.base_key == base_key
+                    && hit.texture.width == base_dims.0
+                    && hit.texture.height == base_dims.1;
+                let baked_visible = match (&hit.kind, dims_ok) {
+                    (
+                        CachedKind::Layout {
+                            header: cached_header,
+                            prefix,
+                            visible: baked,
+                            ..
+                        },
+                        true,
+                    ) if *cached_header == header
+                        && visible >= *baked
+                        && layout.glyphs.len() >= *baked
+                        && layout_prefix(layout, *baked) == *prefix =>
+                    {
+                        Some(*baked)
                     }
-                }),
-                stats,
-            ));
+                    _ => None,
+                };
+                match baked_visible {
+                    Some(baked) if visible == baked => {
+                        let mut hit = hit;
+                        self.cache_clock += 1;
+                        hit.last_use = self.cache_clock;
+                        let CachedKind::Layout { stats, .. } = &hit.kind else {
+                            unreachable!("baked_visible 只来自 Layout 条目");
+                        };
+                        let stats = stats.paint_stats(layout.chars);
+                        self.frame_stats.hits += 1;
+                        let composed = ComposedLayer {
+                            texture: Rc::clone(&hit.texture),
+                            hash: hit.hash,
+                            dirty: None,
+                            prev_hash: None,
+                        };
+                        self.compose_cache.insert(layer.clone(), hit);
+                        return Ok((Some(composed), stats));
+                    }
+                    Some(baked) if visible > baked => {
+                        self.frame_stats.incremental += 1;
+                        let CachedKind::Layout {
+                            stats: cached_stats, ..
+                        } = &hit.kind
+                        else {
+                            unreachable!("baked_visible 只来自 Layout 条目");
+                        };
+                        let mut stats = cached_stats.paint_stats(layout.chars);
+                        let bytes_before = hit.bytes;
+                        let mut texture = match Rc::try_unwrap(hit.texture) {
+                            Ok(texture) => texture,
+                            Err(rc) => (*rc).clone(),
+                        };
+                        let t0 = Instant::now();
+                        let painted = self.paint_layout_range(
+                            &mut texture.rgba,
+                            texture.width,
+                            texture.height,
+                            layout,
+                            None,
+                            baked,
+                            visible,
+                        );
+                        match painted {
+                            Ok(tail) => {
+                                stats.glyphs += tail.glyphs;
+                                stats.missing += tail.missing;
+                                // 增量尾部脏区 = 本轮真正新画的像素范围。
+                                stats.dirty = tail.dirty;
+                                for d in tail.diags {
+                                    stats.note(&d);
+                                }
+                                let paint_t = t0.elapsed();
+                                let h0 = Instant::now();
+                                // 增量只需结构身份,不再整图哈希(逐字 O(面积) 扫描)。
+                                let hash = incremental_identity(
+                                    hit.hash,
+                                    revision,
+                                    visible as u64,
+                                    base_key,
+                                );
+                                let hash_t = h0.elapsed();
+                                self.frame_stats.paint_ms += paint_t.as_secs_f64() * 1e3;
+                                self.frame_stats.hash_ms += hash_t.as_secs_f64() * 1e3;
+                                let bytes = texture.rgba.len() as u64;
+                                let texture = Rc::new(texture);
+                                self.cache_bytes = self.cache_bytes + bytes - bytes_before;
+                                self.cache_clock += 1;
+                                self.compose_cache.insert(
+                                    layer.clone(),
+                                    ComposeCacheEntry {
+                                        revision,
+                                        base_key,
+                                        texture: texture.clone(),
+                                        kind: CachedKind::Layout {
+                                            header,
+                                            prefix: layout_prefix(layout, visible),
+                                            visible,
+                                            stats: LayoutStats::of(&stats),
+                                        },
+                                        hash,
+                                        last_use: self.cache_clock,
+                                        bytes,
+                                    },
+                                );
+                                return Ok((
+                                    Some(ComposedLayer {
+                                        texture,
+                                        hash,
+                                        dirty: stats.dirty,
+                                        prev_hash: Some(hit.hash),
+                                    }),
+                                    stats,
+                                ));
+                            }
+                            Err(_) => {
+                                // 环境失败(字体/度量不可用):前缀不能续画,
+                                // 丢弃旧条目,走整体重烤(统计按原口径重算)。
+                                self.cache_bytes =
+                                    self.cache_bytes.saturating_sub(bytes_before);
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        // `reveal` 回退:截断不是可逆增量,从基面整体重烤。
+                        self.cache_bytes = self.cache_bytes.saturating_sub(hit.bytes);
+                    }
+                    None => {
+                        // 内容/基面变了,或该层缓存属于绘制集合:丢弃重烤。
+                        self.cache_bytes = self.cache_bytes.saturating_sub(hit.bytes);
+                    }
+                }
+            }
+            // 整体重烤:基面已 owned 就直接消费缓冲(省掉整面 `clone`)。
+            self.frame_stats.full_bakes += 1;
+            let b0 = Instant::now();
+            let r0 = Instant::now();
+            let base = resolve_base()?;
+            self.frame_stats.base_ms += r0.elapsed().as_secs_f64() * 1e3;
+            let base = match Rc::try_unwrap(base) {
+                Ok(texture) => texture,
+                Err(rc) => (*rc).clone(),
+            };
+            let (texture, stats) = self.compose_layer_layout_owned(base, layout);
+            let h0 = Instant::now();
+            let hash = content_hash_rgba(texture.width, texture.height, &texture.rgba);
+            let hash_t = h0.elapsed();
+            let bake_t = b0.elapsed();
+            self.frame_stats.bake_ms += bake_t.as_secs_f64() * 1e3;
+            self.frame_stats.hash_ms += hash_t.as_secs_f64() * 1e3;
+            if (texture.width, texture.height) > self.frame_stats.max_dims {
+                self.frame_stats.max_dims = (texture.width, texture.height);
+            }
+            let bytes = texture.rgba.len() as u64;
+            let texture = Rc::new(texture);
+            self.cache_bytes += bytes;
+            self.cache_clock += 1;
+            self.compose_cache.insert(
+                layer.clone(),
+                ComposeCacheEntry {
+                    revision,
+                    base_key,
+                    texture: texture.clone(),
+                    kind: CachedKind::Layout {
+                        header,
+                        prefix: layout_prefix(layout, visible),
+                        visible,
+                        stats: LayoutStats::of(&stats),
+                    },
+                    hash,
+                    last_use: self.cache_clock,
+                    bytes,
+                },
+            );
+            self.evict_compose_cache();
+            return Ok((Some(ComposedLayer { texture, hash, dirty: None, prev_hash: None }), stats));
         }
         if draws.is_empty() {
             return Ok((None, TextPaintStats::default()));
@@ -1281,7 +1769,8 @@ impl TextComposer {
         });
         // 命中:同修订 + 同基面身份 + 同尺寸 ⇒ 零重烤、零哈希、零克隆。
         if let Some(hit) = self.compose_cache.get_mut(layer) {
-            if hit.revision == revision
+            if matches!(hit.kind, CachedKind::Draws { .. })
+                && hit.revision == revision
                 && hit.base_key == base_key
                 && hit.texture.width == base_dims.0
                 && hit.texture.height == base_dims.1
@@ -1292,6 +1781,8 @@ impl TextComposer {
                 let composed = ComposedLayer {
                     texture: hit.texture.clone(),
                     hash: hit.hash,
+                    dirty: None,
+                    prev_hash: None,
                 };
                 return Ok((Some(composed), TextPaintStats::default()));
             }
@@ -1300,17 +1791,26 @@ impl TextComposer {
         // 语义与整体重烤逐位等价:烘焙顺序保持绘制顺序,已画像素不再变。
         let cached = self.compose_cache.remove(layer);
         if let Some(hit) = cached {
-            let extends = hit.base_key == base_key
-                && hit.texture.width == base_dims.0
-                && hit.texture.height == base_dims.1
-                && draws.len() > hit.baked.len()
-                && draws[..hit.baked.len()]
-                    .iter()
-                    .zip(&hit.baked)
-                    .all(|(draw, key)| key.matches_draw(draw));
+            let extends = match &hit.kind {
+                CachedKind::Draws { baked } => {
+                    hit.base_key == base_key
+                        && hit.texture.width == base_dims.0
+                        && hit.texture.height == base_dims.1
+                        && draws.len() > baked.len()
+                        && draws[..baked.len()]
+                            .iter()
+                            .zip(baked)
+                            .all(|(draw, key)| key.matches_draw(draw))
+                }
+                CachedKind::Layout { .. } => false,
+            };
             if extends {
                 self.frame_stats.incremental += 1;
                 let t0 = Instant::now();
+                let CachedKind::Draws { baked: old_baked } = hit.kind else {
+                    unreachable!("extends 只对 Draws 成立");
+                };
+                let baked_len = old_baked.len();
                 let mut texture = match Rc::try_unwrap(hit.texture) {
                     Ok(texture) => texture,
                     Err(rc) => (*rc).clone(),
@@ -1319,21 +1819,30 @@ impl TextComposer {
                     &mut texture.rgba,
                     texture.width,
                     texture.height,
-                    &draws[hit.baked.len()..],
+                    &draws[baked_len..],
                     images,
                 );
                 let paint_t = t0.elapsed();
                 let h0 = Instant::now();
-                let hash = content_hash_rgba(texture.width, texture.height, &texture.rgba);
+                // 增量只需结构身份(旧实现每字符重算整层像素哈希)。
+                let hash = incremental_identity(
+                    hit.hash,
+                    revision,
+                    draws.len() as u64,
+                    base_key,
+                );
                 let hash_t = h0.elapsed();
                 self.frame_stats.paint_ms += paint_t.as_secs_f64() * 1e3;
                 self.frame_stats.hash_ms += hash_t.as_secs_f64() * 1e3;
-                let baked = draws.iter().map(|d| d.dedup_key()).collect();
+                // 复用已烘焙前缀的键,只为新增的尾部构造 `TextDrawKey`
+                // (旧实现每次增量都重建整页键,逐字吐字时 O(n²) 深拷贝)。
+                let mut baked = old_baked;
+                baked.extend(draws[baked_len..].iter().map(|d| d.dedup_key()));
                 let bytes = texture.rgba.len() as u64;
                 let texture = Rc::new(texture);
                 if image_missing {
                     self.cache_bytes = self.cache_bytes.saturating_sub(hit.bytes);
-                    return Ok((Some(ComposedLayer { texture, hash }), stats));
+                    return Ok((Some(ComposedLayer { texture, hash, dirty: None, prev_hash: None }), stats));
                 }
                 self.cache_bytes = self.cache_bytes + bytes - hit.bytes;
                 self.cache_clock += 1;
@@ -1343,13 +1852,21 @@ impl TextComposer {
                         revision,
                         base_key,
                         texture: texture.clone(),
-                        baked,
+                        kind: CachedKind::Draws { baked },
                         hash,
                         last_use: self.cache_clock,
                         bytes,
                     },
                 );
-                return Ok((Some(ComposedLayer { texture, hash }), stats));
+                return Ok((
+                    Some(ComposedLayer {
+                        texture,
+                        hash,
+                        dirty: stats.dirty,
+                        prev_hash: Some(hit.hash),
+                    }),
+                    stats,
+                ));
             }
             // 前缀不成立(清页/中段改动/换基面):丢弃旧条目,走整体重烤。
             self.cache_bytes = self.cache_bytes.saturating_sub(hit.bytes);
@@ -1375,7 +1892,7 @@ impl TextComposer {
         let bytes = texture.rgba.len() as u64;
         let texture = Rc::new(texture);
         if image_missing {
-            return Ok((Some(ComposedLayer { texture, hash }), stats));
+            return Ok((Some(ComposedLayer { texture, hash, dirty: None, prev_hash: None }), stats));
         }
         self.cache_bytes += bytes;
         self.cache_clock += 1;
@@ -1385,14 +1902,16 @@ impl TextComposer {
                 revision,
                 base_key,
                 texture: texture.clone(),
-                baked: draws.iter().map(|d| d.dedup_key()).collect(),
+                kind: CachedKind::Draws {
+                    baked: draws.iter().map(|d| d.dedup_key()).collect(),
+                },
                 hash,
                 last_use: self.cache_clock,
                 bytes,
             },
         );
         self.evict_compose_cache();
-        Ok((Some(ComposedLayer { texture, hash }), stats))
+        Ok((Some(ComposedLayer { texture, hash, dirty: None, prev_hash: None }), stats))
     }
 
     /// 合成缓存超预算时的 LRU 淘汰(逐条,不再整体清空)。
@@ -1511,8 +2030,16 @@ pub struct GlyphPlacement {
 pub struct ComposedLayer {
     /// 合成结果(基图 + 已烘焙文本)。
     pub texture: Rc<Texture>,
-    /// 内容指纹(与 wgpu `hash_rgba` 同一算法;命中路径零重算)。
+    /// 内容身份(用于后端的文本上传缓存;命中路径零重算)。
+    ///
+    /// 整体重烤 = 整图像素哈希;增量 = 结构身份(见
+    /// [`TextComposer::compose_layer_cached`] 的说明)。**不是**逐帧可比的
+    /// 像素指纹,调用方不得用它做跨路径的像素相等判断。
     pub hash: u64,
+    /// 本次增量新写入的像素矩形(`None` = 整体结果,后端应整张上传)。
+    pub dirty: Option<TextRect>,
+    /// 增量前的身份(后端据此确认现存 GPU 纹理就是被扩展的那一版)。
+    pub prev_hash: Option<u64>,
 }
 
 
@@ -1538,6 +2065,228 @@ mod tests {
         assert!(text.cached_base(&layer, 8).is_none());
         text.forget_compose_cache(&layer);
         assert!(text.cached_base(&layer, 7).is_none());
+    }
+
+    /// 布局缓存:揭示数推进只补画尾部,结果必须与整体重烤**逐字节一致**;
+    /// 布局内容变化必须失效重烤(不能命中旧像素)。
+    #[test]
+    fn layout_cache_incremental_matches_full_rebake() {
+        use yu_gfx::{TextFlagsSource, TextGlyph, TextStyle};
+
+        fn layout_of(glyphs: &[(&[u8], i64)], reveal: Option<usize>) -> TextLayoutFrame {
+            TextLayoutFrame {
+                target: Some(LayerId::new(b"T".to_vec())),
+                origin: (0, 0),
+                style: TextStyle::default(),
+                glyphs: glyphs
+                    .iter()
+                    .map(|(bytes, x)| TextGlyph {
+                        bytes: bytes.to_vec().into(),
+                        codec: Codec::Cp932,
+                        full: true,
+                        x: *x,
+                        y: 0,
+                    })
+                    .collect(),
+                line_height: 20,
+                chars: glyphs.len(),
+                reveal,
+                flags_source: TextFlagsSource::TextFlag,
+            }
+        }
+
+        let mut text = TextComposer::new();
+        if !text.available() {
+            println!("SKIP layout_cache_incremental_matches_full_rebake: no system font");
+            return;
+        }
+        let layer = LayerId::new(b"T".to_vec());
+        let base = Texture {
+            width: 48,
+            height: 24,
+            rgba: vec![0; 48 * 24 * 4],
+        };
+        let base_rc = Rc::new(base.clone());
+        let dims = (base.width, base.height);
+        let full = layout_of(&[(b"\x82\xa0", 0), (b"\x82\xa2", 20)], None);
+        let compose = |text: &mut TextComposer, layout: &TextLayoutFrame| {
+            text.compose_layer_cached_assets(
+                &layer,
+                1,
+                42,
+                dims,
+                &[],
+                Some(layout),
+                &BTreeMap::new(),
+                || Ok(Rc::clone(&base_rc)),
+            )
+            .expect("compose")
+        };
+
+        let (out, _stats) = compose(&mut text, &full);
+        let full_pixels = out.expect("baked").texture.rgba.clone();
+
+        // 揭示数回退:从基面重烤(截断不可逆),像素不得等于全量结果。
+        let one = layout_of(&[(b"\x82\xa0", 0), (b"\x82\xa2", 20)], Some(1));
+        let (out, _) = compose(&mut text, &one);
+        assert_ne!(
+            out.expect("reveal 1").texture.rgba,
+            full_pixels,
+            "reveal=1 不得显示第二个字"
+        );
+
+        // 再推进到全量:只补画新露出的尾部,必须与首次整体重烤逐字节一致。
+        let (out, stats) = compose(&mut text, &full);
+        assert_eq!(
+            out.expect("incremental").texture.rgba,
+            full_pixels,
+            "增量补画必须与整体重烤逐字节一致"
+        );
+        assert_eq!(stats.glyphs, 2);
+        assert_eq!(stats.draws, full.chars);
+
+        // 纯命中:同布局再合成一次,统计按缓存口径重放(计数不变)。
+        let (out, stats) = compose(&mut text, &full);
+        assert_eq!(out.expect("hit").texture.rgba, full_pixels);
+        assert_eq!((stats.draws, stats.glyphs), (full.chars, 2));
+
+        // 增量脏区:必须覆盖“上一状态 → 新状态”的全部差异像素;只把
+        // 脏区拷进旧纹理,结果必须与整体结果逐字节一致(模拟 GPU 局部上传)。
+        let (out, _) = compose(&mut text, &one);
+        let reveal1 = out.expect("reveal 1 again").texture.rgba.clone();
+        let (out, _) = compose(&mut text, &full);
+        let inc = out.expect("incremental again");
+        let rel = &inc.texture.rgba;
+        let dirty = inc.dirty.expect("增量必须报告脏区");
+        let mut bx0 = u32::MAX;
+        let mut by0 = u32::MAX;
+        let mut bx1 = 0u32;
+        let mut by1 = 0u32;
+        for y in 0..dims.1 {
+            for x in 0..dims.0 {
+                let i = ((y * dims.0 + x) * 4) as usize;
+                if &rel[i..i + 4] != &reveal1[i..i + 4] {
+                    bx0 = bx0.min(x);
+                    by0 = by0.min(y);
+                    bx1 = bx1.max(x + 1);
+                    by1 = by1.max(y + 1);
+                }
+            }
+        }
+        assert!(bx1 > bx0 && by1 > by0, "两次布局必须有差异像素");
+        assert!(
+            dirty.x0 <= bx0 && dirty.y0 <= by0 && dirty.x1 >= bx1 && dirty.y1 >= by1,
+            "脏区 {dirty:?} 未覆盖实际差异 ({bx0},{by0})..({bx1},{by1})"
+        );
+        let mut patched = reveal1;
+        for y in dirty.y0..dirty.y1 {
+            let row = (y * dims.0) as usize * 4;
+            let src = &rel[row + dirty.x0 as usize * 4..row + dirty.x1 as usize * 4];
+            let dst = &mut patched[row + dirty.x0 as usize * 4..row + dirty.x1 as usize * 4];
+            dst.copy_from_slice(src);
+        }
+        assert_eq!(
+            &patched, rel,
+            "只应用脏区必须与整体结果逐字节一致(局部上传等价性)"
+        );
+
+        // 布局内容变化(第二个字移位)⇒ 代次失效,重烤结果与直接合成一致。
+        let moved = layout_of(&[(b"\x82\xa0", 0), (b"\x82\xa2", 25)], None);
+        let (out, _) = compose(&mut text, &moved);
+        let (reference, _) = text.compose_layer_layout_owned(base, &moved);
+        assert_eq!(
+            out.expect("moved").texture.rgba,
+            reference.rgba,
+            "内容变化必须重烤,且像素与直接合成一致"
+        );
+    }
+
+    /// `CGACT[TEXT]` 逐字追加:增量必须报告脏区,且“只拷脏区”的局部上传
+    /// 与整体重烤逐字节一致。
+    #[test]
+    fn draws_incremental_reports_dirty_rect_covering_changes() {
+        use yu_gfx::TextStyle;
+
+        let mut text = TextComposer::new();
+        if !text.available() {
+            println!("SKIP draws_incremental_reports_dirty_rect_covering_changes: no system font");
+            return;
+        }
+        let layer = LayerId::new(b"T".to_vec());
+        let base = Texture {
+            width: 64,
+            height: 24,
+            rgba: vec![0; 64 * 24 * 4],
+        };
+        let base_rc = Rc::new(base.clone());
+        let dims = (base.width, base.height);
+        let draw = |x: i64| TextDraw {
+            target: layer.clone(),
+            bytes: b"\x82\xa0".to_vec(),
+            codec: Codec::Cp932,
+            x,
+            y: 0,
+            style: TextStyle::default(),
+            // SET=1:推进剧情常用的 9 次偏移合成(描边/加粗)。
+            set: 1,
+            bno: None,
+            image: None,
+        };
+        let d0 = draw(0);
+        let d1 = draw(20);
+        let compose = |text: &mut TextComposer, revision: u64, draws: &[&TextDraw]| {
+            text.compose_layer_cached_assets(
+                &layer,
+                revision,
+                7,
+                dims,
+                draws,
+                None,
+                &BTreeMap::new(),
+                || Ok(Rc::clone(&base_rc)),
+            )
+            .expect("compose")
+        };
+
+        let (out, _) = compose(&mut text, 1, &[&d0]);
+        let first = out.expect("baked");
+        assert!(first.dirty.is_none(), "整体重烤不报告脏区");
+
+        let (out, _) = compose(&mut text, 2, &[&d0, &d1]);
+        let inc = out.expect("incremental");
+        assert_eq!(inc.prev_hash, Some(first.hash), "增量必须携带上一状态身份");
+        let dirty = inc.dirty.expect("增量必须报告脏区");
+        let mut bx0 = u32::MAX;
+        let mut by0 = u32::MAX;
+        let mut bx1 = 0u32;
+        let mut by1 = 0u32;
+        for y in 0..dims.1 {
+            for x in 0..dims.0 {
+                let i = ((y * dims.0 + x) * 4) as usize;
+                if &inc.texture.rgba[i..i + 4] != &first.texture.rgba[i..i + 4] {
+                    bx0 = bx0.min(x);
+                    by0 = by0.min(y);
+                    bx1 = bx1.max(x + 1);
+                    by1 = by1.max(y + 1);
+                }
+            }
+        }
+        assert!(bx1 > bx0 && by1 > by0, "追加字符必须产生差异像素");
+        assert!(
+            dirty.x0 <= bx0 && dirty.y0 <= by0 && dirty.x1 >= bx1 && dirty.y1 >= by1,
+            "脏区 {dirty:?} 未覆盖实际差异 ({bx0},{by0})..({bx1},{by1})"
+        );
+        let mut patched = first.texture.rgba.clone();
+        for y in dirty.y0..dirty.y1 {
+            let row = (y * dims.0) as usize * 4;
+            let src = &inc.texture.rgba[row + dirty.x0 as usize * 4..row + dirty.x1 as usize * 4];
+            let dst = &mut patched[row + dirty.x0 as usize * 4..row + dirty.x1 as usize * 4];
+            dst.copy_from_slice(src);
+        }
+        assert_eq!(
+            &patched, &inc.texture.rgba,
+            "只应用脏区必须与增量结果逐字节一致(局部上传等价性)"
+        );
     }
 }
 

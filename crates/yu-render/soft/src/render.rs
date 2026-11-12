@@ -1216,7 +1216,9 @@ fn layer_surface(
             .resolve_movie(asset, *frame)
             .map(Surface::from_texture)
             .map_err(|diag| diag.code.to_string()),
-        TextureRef::SolidBlack1x1 => Ok(Surface::from_texture(&solid_fill_texture(layer))),
+        TextureRef::SolidBlack1x1 => Ok(Surface::from_texture(&solid_fill_texture(
+            layer.map(|l| l.as_ref()),
+        ))),
         TextureRef::Snapshot(copy_id) => snapshots
             .get(copy_id)
             .cloned()
@@ -1274,7 +1276,7 @@ fn base_texture(
                 rgba: texture.rgba.clone(),
             })
             .map_err(|diag| diag.code.to_string()),
-        TextureRef::SolidBlack1x1 => Ok(solid_fill_texture(layer)),
+        TextureRef::SolidBlack1x1 => Ok(solid_fill_texture(layer.map(|l| l.as_ref()))),
         TextureRef::Snapshot(copy_id) => snapshots
             .get(copy_id)
             .map(|surface| Texture {

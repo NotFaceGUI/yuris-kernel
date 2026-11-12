@@ -159,6 +159,90 @@ fn every_screen_snapshot_has_its_producer_in_copy_log() {
     let _ = TextureRef::None;
 }
 
+// ---------------------------------------------------------------- 层共享护栏
+
+/// `Op::Layer` 与 `frame.layers` 必须是**同一份** `Arc`(T2 #2 的结构护栏)。
+///
+/// 共享是「每帧不再逐层克隆」的语义基础:若某条发射路径又深拷贝了层,
+/// 这里会立刻变红,而不是只体现在看不见的分配计数上。
+#[test]
+fn op_layers_share_the_frame_snapshot_handle() {
+    let gfx = build(6);
+    let frame = gfx.frame();
+    let mut op_layers = 0usize;
+    for pass in &frame.passes {
+        for op in &pass.ops {
+            if let yu_gfx::Op::Layer(layer) = op {
+                assert!(
+                    frame
+                        .layers
+                        .iter()
+                        .any(|full| std::sync::Arc::ptr_eq(full, layer)),
+                    "op 层 {} 不是 frame.layers 的同一份共享句柄",
+                    layer.id.display()
+                );
+                op_layers += 1;
+            }
+        }
+    }
+    assert!(op_layers > 0, "本用例应至少发射一个 Op::Layer");
+}
+
+/// 已发出的帧是**命令时刻快照**:后续命令改写同一层不得回写旧帧(T2 #2)。
+///
+/// 写时复制是共享句柄的正确性前提;若某条写路径漏了 `Arc::make_mut`,
+/// 旧帧(以及同帧屏幕快照)会被后续 `CG` 静默改写。
+#[test]
+fn captured_frame_survives_later_layer_writes() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "FILE", s("a")),
+                arg(&table, "CG", "X", i(10)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let captured = gfx.frame();
+    let id = yu_gfx::LayerId::new(b":/W0/A".to_vec());
+    let x_of = |frame: &yu_gfx::CompositorFrame| {
+        frame
+            .layers
+            .iter()
+            .find(|layer| layer.id == id)
+            .expect("层 A")
+            .transform
+            .x
+    };
+    assert_eq!(x_of(&captured), 10.0);
+
+    gfx.consume_events(&[
+        frame_start(2),
+        call(
+            2,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "X", i(99)),
+            ],
+        ),
+        frame_end(2),
+    ]);
+    assert_eq!(
+        x_of(&captured),
+        10.0,
+        "旧帧被后续命令改写:共享句柄漏了写时复制"
+    );
+    assert_eq!(gfx.layer(&id).expect("层 A").transform.x, 99.0);
+    assert_eq!(x_of(&gfx.frame()), 99.0);
+}
+
 // ---------------------------------------------------------------- 测量用例
 
 /// 打印 `frame()` 投影成本(组数 / op 日志长度两个维度)。

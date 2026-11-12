@@ -53,6 +53,7 @@ pub mod sound;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use yu_backend_wgpu::GpuBackend;
 use yu_engine::engine::{Backend, BlockCodec, Engine, EngineOptions};
@@ -65,7 +66,8 @@ struct Session {
     /// 最近一帧的尺寸与像素(Java 侧按需拉取;不跨界共享引用)。
     frame_w: u32,
     frame_h: u32,
-    frame_pixels: Vec<u8>,
+    /// 最近一帧的呈现面(Arc 共享;CPU 回退路径从这里取 RGBA,#71)。
+    frame_pixels: Option<Arc<yu_render_core::Surface>>,
     ticks: u64,
     /// 已写进 logcat 的长帧条数(上限,避免慢场景把日志刷爆)。
     spikes_logged: u32,
@@ -618,7 +620,7 @@ fn store_session(started: StartedEngine) -> Result<String, String> {
             engine: started.engine,
             frame_w: viewport.width,
             frame_h: viewport.height,
-            frame_pixels: Vec::new(),
+            frame_pixels: None,
             ticks: 0,
             spikes_logged: 0,
             presenter: None,
@@ -1259,7 +1261,7 @@ pub fn tick() -> i32 {
                 if !presented && session.video {
                     // 回退:保留 CPU 像素供壳按旧路径绘制。GPU 路径下这只是
                     // 诊断副本,不影响上屏。
-                    session.frame_pixels = rendered.surface.rgba.clone();
+                    session.frame_pixels = Some(Arc::clone(&rendered.surface));
                 }
                 // 退出信号(跨平台统一):`1` = 游戏已结束,壳据此
                 // `finish()` 回到自己的界面,而不是继续 tick 一个死会话。
@@ -1319,7 +1321,13 @@ pub fn frame_rgba() -> Vec<u8> {
     SESSION.with(|slot| {
         slot.borrow()
             .as_ref()
-            .map(|session| session.frame_pixels.clone())
+            .map(|session| {
+                session
+                    .frame_pixels
+                    .as_ref()
+                    .map(|surface| surface.rgba.clone())
+                    .unwrap_or_default()
+            })
             .unwrap_or_default()
     })
 }
@@ -1360,7 +1368,10 @@ pub fn fill_argb(out: &mut Vec<i32>) -> usize {
         let Some(session) = slot.as_ref() else {
             return 0;
         };
-        let rgba = &session.frame_pixels;
+        let Some(surface) = session.frame_pixels.as_ref() else {
+            return 0;
+        };
+        let rgba = surface.rgba.as_slice();
         let pixels = rgba.len() / 4;
         if pixels == 0 {
             return 0;

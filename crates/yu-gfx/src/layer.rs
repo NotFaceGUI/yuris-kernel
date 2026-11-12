@@ -15,12 +15,16 @@ use std::collections::BTreeMap;
 use yu_rt::value::Value;
 
 /// 图层 ID / 规范化后的路径(CP932 原始字节;引擎按字节比较,大小写敏感)。
+///
+/// 内联 `SmallVec<[u8; 24]>`(#23):绝大多数层路径(如 `:/W0/SP/00`)不超过
+/// 24 字节,克隆/建键不再各来一次堆分配;超过 24 字节自动溢出到堆,
+/// 相等/排序/哈希语义与 `Vec<u8>` 逐字节一致。
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LayerId(pub Vec<u8>);
+pub struct LayerId(pub smallvec::SmallVec<[u8; 24]>);
 
 impl LayerId {
     pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
-        Self(bytes.into())
+        Self(smallvec::SmallVec::from_vec(bytes.into()))
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -1122,7 +1126,10 @@ pub struct Layer {
     /// 属性级状态(`MODE`/`MID`/滤镜/部件等参数留下)。
     pub(crate) param_status: LayerStatus,
     /// 已识别但未解释/非视觉的参数(`LINT`/`LINT2`/`TEX`/...),原样保留。
-    pub extra: BTreeMap<String, EngineValue>,
+    /// 非视觉参数原值留档。键用 `Rc<str>`:参数名来自启动期 ysc 表
+    /// (`Rc<str>`),每条 `LINT/TSX/...` 不必再 `to_string()`(#9)。
+    /// `BTreeMap<Rc<str>, _>` 的排序按字符串内容,与 `String` 键完全一致。
+    pub extra: BTreeMap<std::rc::Rc<str>, EngineValue>,
 }
 
 impl Layer {

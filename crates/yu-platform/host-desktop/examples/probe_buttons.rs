@@ -87,7 +87,7 @@ fn run() -> Result<(), String> {
     // `text_draws` 是「标签画进哪个层」的权威记录;同一层可能有多段文本
     // (例如数字 + 名字),按层聚合后取层几何。
     let mut rows: Vec<(String, String, i64, i64, Option<yu_gfx::SizeU32>, i64, i64)> = Vec::new();
-    for draw in &frame.text_draws {
+    for draw in frame.text_draws.iter() {
         let Ok(text) = yu_format::Codec::Cp932.decode(&draw.bytes, &draw.bytes) else {
             continue;
         };
@@ -136,6 +136,7 @@ fn run() -> Result<(), String> {
                 && !l.id.display().contains("BT.")
                 && !l.id.display().contains("FONTL")
         })
+        .map(|l| l.as_ref())
         .collect();
     big.sort_by_key(|l| (l.z, l.seq));
     for l in big.iter().take(30) {
@@ -195,6 +196,7 @@ fn run() -> Result<(), String> {
         .layers
         .iter()
         .filter(|l| matches!(l.texture, yu_gfx::TextureRef::Asset(_)))
+        .map(|l| l.as_ref())
         .collect();
     assets.sort_by_key(|l| (l.z, l.seq));
     for l in assets.iter().take(40) {

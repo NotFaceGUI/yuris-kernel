@@ -45,7 +45,9 @@ use crate::expr::LValue;
 use crate::scriptpos;
 use crate::task::{Effect, StepOutcome, TaskSeed};
 use crate::value::{ElemType, Value, VarRef, VarSpace};
-use crate::vm::{Cmd, CmdWindow, ExecState, GosubFrame, IfFrame, LoopFrame, Vm, VmError};
+use crate::vm::{
+    Cmd, CmdWindow, ExecState, GosubFrame, IfFrame, LoopFrame, VaractPlan, Vm, VmError,
+};
 
 /// 引擎嵌套上限(手册 `control/if.html` 64 / `control/loop.html` 64 /
 /// `control/gosub.html`「GOSUBのネストは64回まで可能です」)。
@@ -368,6 +370,12 @@ impl Vm {
             if w.rec.length == 0 {
                 continue;
             }
+            // 静态「求值必失败」窗口(#40):下面两条路径都只会被丢弃
+            // (引用槽求值失败后回退的普通求值同样必失败),直接跳过,
+            // 不再逐次构造最终被丢弃的 Diag。
+            if w.eval_fails {
+                continue;
+            }
             if ref_slots.contains(&w.rec.kind) {
                 // 引用槽:保留变量身份。求值失败退回普通值求值(原形态)。
                 if let Ok(lv) = self.eval_lvalue_window(st, w) {
@@ -402,29 +410,63 @@ impl Vm {
         args
     }
 
+    /// `HandlerKind::Domain` 的通用域事件路径是否会复用顶部求值结果。
+    ///
+    /// 三个例外分支在处理器里自己求值/发事件(`INPUT`/`MOUSE`、带宿主的
+    /// `SOUNDINFO`、带宿主的 `SAVE`/`LOAD`/`SAVEEND`),`DomainCall` 不由
+    /// 通用路径发出 ⇒ 不能复用,保持旧行为。
+    fn domain_uses_generic_args(&self, kind: HandlerKind, cmd: &Cmd) -> bool {
+        let HandlerKind::Domain(domain) = kind else {
+            return false;
+        };
+        match domain {
+            Domain::System if matches!(cmd.name.as_str(), "INPUT" | "MOUSE") => false,
+            Domain::Sound if cmd.name == "SOUNDINFO" && self.sound_host.is_some() => false,
+            Domain::Save
+                if self.save_host.is_some()
+                    && matches!(cmd.name.as_str(), "SAVE" | "LOAD" | "SAVEEND") =>
+            {
+                false
+            }
+            _ => true,
+        }
+    }
+
     pub(crate) fn dispatch(
         &mut self,
         st: &mut ExecState,
         task: &mut crate::task::TaskNode,
         cmd: &Cmd,
     ) -> Result<StepOutcome, VmError> {
-        // 统一事件:尽量把每个窗口求值结果作为参数记录(失败则省略该窗口,
-        // 真正的失败会在处理器里以 Diag 报出)。控制流窗口(跳转目标)是
-        // 「length 字段 = 组号」而不是表达式,所以只记录成功求值者。
-        // `record_events=false` 时跳过(热路径最大开销;Diag 不受影响)。
-        let args = if self.record_events {
-            self.eval_arg_windows(st, cmd)
-        } else {
-            Vec::new()
-        };
-        self.record_command(st, cmd, args);
-
         // 启动期解析的 opcode → 处理器表(见 `build_handler_table`)。
         let kind = self
             .handler_of
             .get(cmd.opcode as usize)
             .copied()
             .unwrap_or(HandlerKind::Unknown);
+        // 统一事件:尽量把每个窗口求值结果作为参数记录(失败则省略该窗口,
+        // 真正的失败会在处理器里以 Diag 报出)。控制流窗口(跳转目标)是
+        // 「length 字段 = 组号」而不是表达式,所以只记录成功求值者。
+        // `record_events=false` 时跳过(热路径最大开销;Diag 不受影响)。
+        //
+        // #38:域命令的 `DomainCall` 与 `Command` 事件用的是**同一批**窗口
+        // 求值结果;两次事件之间没有状态变化,因此这里只求值一次:Command
+        // 拿一份副本,`DomainCall` 复用原件(旧实现整条命令求值两遍)。
+        let reuse_for_domain = self.domain_uses_generic_args(kind, cmd);
+        let mut domain_args: Option<Vec<ArgValue>> = None;
+        if self.record_events {
+            let args = self.eval_arg_windows(st, cmd);
+            let for_command = if reuse_for_domain {
+                domain_args = Some(args.clone());
+                args
+            } else {
+                args
+            };
+            self.record_command(st, cmd, for_command);
+        } else {
+            self.record_command(st, cmd, Vec::new());
+        }
+
         match kind {
             HandlerKind::Gosub => self.op_gosub(st, cmd),
             HandlerKind::Return => self.op_return(st, cmd),
@@ -536,8 +578,11 @@ impl Vm {
                 // 域命令的参数是宿主域状态机唯一能看到的输入;必须带上
                 // 求值结果(槽号 = 工程 ysc 表的参数序号)。`record_events`
                 // 只控制通用 Command 事件,不影响域事件。
-                let args = self.eval_arg_windows(st, cmd);
-                self.emit_domain(domain, cmd.name.clone(), args);
+                // 事件记录开启时复用顶部已求值的同一份 args(#38)。
+                let args = domain_args
+                    .take()
+                    .unwrap_or_else(|| self.eval_arg_windows(st, cmd));
+                self.emit_domain_borrowed(domain, &cmd.name, args);
                 // Graphics/Window 已由同步宿主消费时不再挂号;声音域同理。
                 let handled = (self.graphics_host.is_some()
                     && matches!(domain, Domain::Graphics | Domain::Window))
@@ -564,8 +609,7 @@ impl Vm {
                         self.report_aligned_stub(
                             &cmd.name,
                             "官方 0.495 处理体为空桩(0x44aa40/0x44aa60/0x44aa80、\
-                             CDDA 0x429fb0),同型对齐:只发域事件,无媒体输出(声音台账 N0-10)"
-                                .to_string(),
+                             CDDA 0x429fb0),同型对齐:只发域事件,无媒体输出(声音台账 N0-10)",
                         );
                     } else if domain == Domain::System {
                         // `SYSTEM`(`SCREENSAVER`/`BACKGROUNDEXEC`/`SX`/`SY`/
@@ -584,8 +628,7 @@ impl Vm {
                         self.report_aligned_stub(
                             &cmd.name,
                             "SYSTEM 参数为宿主窗口/进程策略(屏保、后台执行、客户区尺寸、\
-                             计时器),无脚本可见返回;内核只发域事件(域事件契约 §9)"
-                                .to_string(),
+                             计时器),无脚本可见返回;内核只发域事件(域事件契约 §9)",
                         );
                     } else if domain == Domain::Emote {
                         // E-mote 家族:主人明令暂缓(`deferred(master)`,B9)。
@@ -594,9 +637,8 @@ impl Vm {
                         // 不是待查项。
                         self.report_unimplemented(
                             &cmd.name,
-                            "E-mote 域:deferred(master)(路线图 B9,主人明令暂缓);\
-                             语义属 E-mote 运行时,内核边界外"
-                                .to_string(),
+                             "E-mote 域:deferred(master)(路线图 B9,主人明令暂缓);\
+                             语义属 E-mote 运行时,内核边界外",
                         );
                     } else {
                         // 挂号文案给**可执行的**锚点:域事件契约 §9 是域边界的
@@ -606,8 +648,7 @@ impl Vm {
                         self.report_unimplemented(
                             &cmd.name,
                             "域命令未接线:语义属宿主域状态机(域边界见 \
-                             crates/yu-rt/docs/domain-event-contracts.md §9)"
-                                .to_string(),
+                             crates/yu-rt/docs/domain-event-contracts.md §9)",
                         );
                     }
                 }
@@ -616,7 +657,7 @@ impl Vm {
             HandlerKind::Unknown => {
                 self.report_unimplemented(
                     &cmd.name,
-                    "命令无处理器(手册无页或语义未取证)".to_string(),
+                    "命令无处理器(手册无页或语义未取证)",
                 );
                 Ok(StepOutcome::Continue)
             }
@@ -1247,41 +1288,28 @@ impl Vm {
         }
         // 输入系统变量(手册标 ○ 可赋值):写入 = 设定该按钮的帧计数器。
         if lval.var.id < self.sys_count {
-            // 按钮族匹配**不 clone 名字**:`LET` 是单帧 7 万次的热路径,
-            // 其中多数是 `@_INP`/`@_KEY_*` 计数器写;旧写法每次
-            // `.name.clone()` 一次堆分配 + 释放。这里只在本分支内借用,
-            // 需要 `&mut self` 的地方改用先算好的 `button`。
-            let button: Option<String> = {
+            // 启动期已建 id→按钮码表(#12):命中即按码写入,不再每次
+            // `format!("KEY_…")` 再走 113 项 ABI 表线性扫描。`LET` 是单帧
+            // 7 万次的热路径。
+            if let Some(code) = self.binding().key_code_of_id(lval.var.id) {
+                let rhs = self.eval_window(st, &cmd.windows[1])?;
+                let v = rhs.as_int().unwrap_or(0);
+                self.input_state_mut()
+                    .set_counter_code(i64::from(code), v);
+                return Ok(StepOutcome::Continue);
+            }
+            // 按钮族但 ABI 表无此名(如 `_KEY_ANY`):旧路径的 `set_counter`
+            // 是空操作 —— 保留「求值 RHS 后什么也不写」的同一可观察行为。
+            let button_family = {
                 let name = self
                     .sysvars()
                     .get(lval.var.id)
                     .map(|d| d.name.as_str())
                     .unwrap_or("");
-                name.strip_prefix("_KEY_")
-                    .map(|rest| ("KEY_", rest))
-                    .or_else(|| name.strip_prefix("_MOUSE_").map(|rest| ("MOUSE_", rest)))
-                    .filter(|(_, rest)| {
-                        // 只收按钮族(排除 _MOUSE_X/Y0..3 坐标槽与
-                        // _KEYNUM_* 等;X/Y 后缀数字 = 窗口槽坐标族,
-                        // REA `FUN_00427350` case 0x85..0x8e,非按钮)。
-                        !matches!(*rest, "LAST")
-                            && !matches!(*rest, "X" | "Y")
-                            && !rest
-                                .strip_suffix(['0', '1', '2', '3'])
-                                .map(|base| matches!(base, "X" | "Y"))
-                                .unwrap_or(false)
-                            && !rest
-                                .chars()
-                                .next()
-                                .map(|c| c.is_ascii_digit())
-                                .unwrap_or(true)
-                    })
-                    .map(|(prefix, rest)| format!("{prefix}{rest}"))
+                button_family_rest(name).is_some()
             };
-            if let Some(button) = button {
-                let rhs = self.eval_window(st, &cmd.windows[1])?;
-                let v = rhs.as_int().unwrap_or(0);
-                self.input_state_mut().set_counter(&button, v);
+            if button_family {
+                let _ = self.eval_window(st, &cmd.windows[1])?;
                 return Ok(StepOutcome::Continue);
             }
             // 其余分支需要完整名字串(数量少,不在热路径):
@@ -1336,10 +1364,7 @@ impl Vm {
             // `$_TEXT`(手册 ○)= 替换当前显示文本。
             if name == "_TEXT" {
                 let rhs = self.eval_window(st, &cmd.windows[1])?;
-                let bytes = match rhs.cast_to_str()? {
-                    Value::Str(b) => b,
-                    _ => Vec::new(),
-                };
+                let bytes = into_str_bytes(rhs)?;
                 self.set_text(bytes);
                 return Ok(StepOutcome::Continue);
             }
@@ -1350,10 +1375,7 @@ impl Vm {
             // 的 `+0x38` 写入并列)。DIV-RT-032 写入路径收口。
             if name == "_TEXT_FLAG" {
                 let rhs = self.eval_window(st, &cmd.windows[1])?;
-                let bytes = match rhs.cast_to_str()? {
-                    Value::Str(b) => b,
-                    _ => Vec::new(),
-                };
+                let bytes = into_str_bytes(rhs)?;
                 self.set_text_flags(bytes);
                 return Ok(StepOutcome::Continue);
             }
@@ -1421,13 +1443,14 @@ impl Vm {
         }
         let rhs = self.eval_window(st, &cmd.windows[1])?;
         let code = (cmd.windows[0].rec.slot >> 8) as u8;
-        let value = if code == 0 {
-            rhs
+        if code == 0 {
+            // RHS 已是 owned:串槽赋值直接搬字节(#80)。
+            self.store.write_owned(lval.var, &lval.indices, rhs)?;
         } else {
             let cur = self.read_lvalue(&lval)?;
-            compound(code, &cur, &rhs)?
-        };
-        self.store.write(lval.var, &lval.indices, &value)?;
+            let value = compound(code, &cur, &rhs)?;
+            self.store.write(lval.var, &lval.indices, &value)?;
+        }
         Ok(StepOutcome::Continue)
     }
 
@@ -1446,7 +1469,8 @@ impl Vm {
             _ => unreachable!(),
         };
         let target = self.decl_target(st, &cmd.windows[0])?;
-        let dims: Vec<usize> = target.iter().map(|&d| d.max(0) as usize).collect();
+        let dims: smallvec::SmallVec<[usize; 8]> =
+            target.iter().map(|&d| d.max(0) as usize).collect();
         let init = match cmd.windows.get(1) {
             Some(w) if !w.payload.is_empty() => self.eval_window(st, w)?,
             _ => ty.default_value(),
@@ -1461,10 +1485,14 @@ impl Vm {
     }
 
     /// 声明命令的变量窗口:引用 + 可选各维长度。
-    fn decl_target(&mut self, st: &ExecState, w: &CmdWindow) -> Result<Vec<i64>, VmError> {
+    fn decl_target(
+        &mut self,
+        st: &ExecState,
+        w: &CmdWindow,
+    ) -> Result<smallvec::SmallVec<[i64; 4]>, VmError> {
         // 单条变量指令 = 标量;含 `0x29` = 数组(前导值 = 各维长度)。
         let lv = self.eval_lvalue_window(st, w)?;
-        Ok(lv.indices.into_vec())
+        Ok(lv.indices)
     }
 
     /// `VARINFO`:手册 `variable/varinfo.html`;引擎 §3.21。
@@ -1482,7 +1510,7 @@ impl Vm {
         // 项并存时被忽略。按 `aligned-stub` 对齐并留一条 Info。
         let mut inert_stub: Option<&'static str> = None;
         // 全部数值槽(SEARCH 的针值与 `NO=` 起始下标要用)。
-        let mut flags: Vec<(u8, i64)> = Vec::new();
+        let mut flags: smallvec::SmallVec<[(u8, i64); 8]> = smallvec::SmallVec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
@@ -1491,7 +1519,7 @@ impl Vm {
                 0 => set = Some(self.eval_lvalue_window(st, w)?),
                 1 => target = Some(self.eval_lvalue_window(st, w)?),
                 slot => {
-                    let v = self.eval_window(st, w)?;
+                    let v = self.eval_window_ref(st, w)?;
                     if let Some(n) = v.as_int() {
                         flags.push((slot, n));
                         // 「查询项」= 置位的旗标参数,**排除辅助参数**
@@ -1524,8 +1552,7 @@ impl Vm {
                     self.report_aligned_stub(
                         name,
                         "VARINFO: 官方 0.495 处理体不读该槽(0x456050..0x456ae4 对 \
-                         0x68416f/0x684170 零引用),按无操作对齐(no-manual;REA)"
-                            .into(),
+                         0x68416f/0x684170 零引用),按无操作对齐(no-manual;REA)",
                     );
                     return Ok(StepOutcome::Continue);
                 }
@@ -1594,10 +1621,10 @@ impl Vm {
             }
             Some("LENGTH") => {
                 // 保留 SET 里写的下标(`$_PSTR(1)` 的 `(1)`);无下标才用 0 号元素。
-                let idx: Vec<i64> = if set.indices.is_empty() {
-                    vec![0; shape.1.len()]
+                let idx: smallvec::SmallVec<[i64; 4]> = if set.indices.is_empty() {
+                    smallvec::smallvec![0; shape.1.len()]
                 } else {
-                    set.indices.to_vec()
+                    set.indices.clone()
                 };
                 let v = self.read_var(st, set_var, &idx)?;
                 match v {
@@ -1623,10 +1650,10 @@ impl Vm {
             // `_strtype` 的注释与返回值(1=半角/2=全角)与此一致。
             // 手册无页 ⇒ fixed(no-manual)。
             Some("STRTYPE") => {
-                let idx: Vec<i64> = if set.indices.is_empty() {
-                    vec![0; shape.1.len()]
+                let idx: smallvec::SmallVec<[i64; 4]> = if set.indices.is_empty() {
+                    smallvec::smallvec![0; shape.1.len()]
                 } else {
-                    set.indices.to_vec()
+                    set.indices.clone()
                 };
                 let v = self.read_var(st, set_var, &idx)?;
                 match v {
@@ -1721,23 +1748,43 @@ impl Vm {
         target: &crate::expr::LValue,
         v: &Value,
     ) -> Result<(), VmError> {
-        let target = crate::expr::LValue {
-            var: self.canonical_var(target.var),
-            indices: target.indices.clone(),
-        };
-        let target = &target;
-        if target.var.id < self.sys_count {
+        let var = self.canonical_var(target.var);
+        if var.id < self.sys_count {
             return Err(diag::unimplemented(
                 code::rt::SYSVAR_WRITE,
                 Boundary::Script,
                 format!(
                     "写入系统变量 {}(语义未取证;DIV-RT-007)",
-                    target.var.display()
+                    var.display()
                 ),
             )
             .into());
         }
-        self.store.write(target.var, &target.indices, v)?;
+        self.store.write(var, &target.indices, v)?;
+        Ok(())
+    }
+
+    /// [`Self::write_target`] 的所有权版:值 owned 时,串槽赋值直接搬字节
+    /// (不再 `coerce_to` 克隆一次;#80)。可观察状态完全一致。
+    fn write_target_owned(
+        &mut self,
+        _st: &ExecState,
+        target: &crate::expr::LValue,
+        v: Value,
+    ) -> Result<(), VmError> {
+        let var = self.canonical_var(target.var);
+        if var.id < self.sys_count {
+            return Err(diag::unimplemented(
+                code::rt::SYSVAR_WRITE,
+                Boundary::Script,
+                format!(
+                    "写入系统变量 {}(语义未取证;DIV-RT-007)",
+                    var.display()
+                ),
+            )
+            .into());
+        }
+        self.store.write_owned(var, &target.indices, v)?;
         Ok(())
     }
 
@@ -1752,7 +1799,7 @@ impl Vm {
         }
         let mut set: Option<crate::expr::LValue> = None;
         let mut letv: Option<crate::expr::LValue> = None;
-        let mut flags: Vec<(u8, i64)> = Vec::new();
+        let mut flags: smallvec::SmallVec<[(u8, i64); 8]> = smallvec::SmallVec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
@@ -1761,13 +1808,29 @@ impl Vm {
                 0 => set = Some(self.eval_lvalue_window(st, w)?),
                 1 => letv = Some(self.eval_lvalue_window(st, w)?),
                 slot => {
-                    let v = self.eval_window(st, w)?;
+                    let v = self.eval_window_ref(st, w)?;
                     if let Some(n) = v.as_int() {
                         flags.push((slot, n));
                     }
                 }
             }
         }
+        // 参数名 → 槽号的计划在 `fill_cmd` 按站点算好;未命中(理论上只有
+        // 手工构造的 `Cmd`)才现算一次,保持与旧路径相同的可观察行为。
+        let fallback_plan;
+        let plan = match &cmd.varact_plan {
+            Some(plan) => plan,
+            None => {
+                fallback_plan = build_varact_plan(&cmd.param_names, &cmd.windows);
+                &fallback_plan
+            }
+        };
+        let present = |slot: u8| flags.iter().any(|(s, _)| *s == slot);
+        let flag_slot = |slot: Option<u8>| slot.is_some_and(present);
+        let num = |slot: Option<u8>| {
+            slot.and_then(|slot| flags.iter().find(|(s, _)| *s == slot).map(|(_, v)| *v))
+                .unwrap_or(0)
+        };
         // `INIT`/`G_*` 分支不读 `SET`(引擎 §3.26 ③:`0x454d3d..0x454e00`
         // 一次都没碰 `0x683a60`),因此把「缺 SET → Fatal」的判定推到它们之后。
         let set_missing = set.is_none();
@@ -1795,18 +1858,7 @@ impl Vm {
                 .into());
             }
         }
-        // 旗标一律**按参数名**判定(槽号在版本间会位移,见 `Vm::param_slot`)。
-        let names = std::rc::Rc::clone(&cmd.param_names);
-        let slot_of = |want: &str| names.iter().position(|n| n == want).map(|i| i as u8);
-        let flag = |want: &str| {
-            slot_of(want).and_then(|slot| flags.iter().find(|(s, _)| *s == slot).map(|(_, v)| *v))
-        };
-        let num = |want: &str| {
-            slot_of(want)
-                .and_then(|slot| flags.iter().find(|(s, _)| *s == slot).map(|(_, v)| *v))
-                .unwrap_or(0)
-        };
-        if flag("TYPE").is_some() {
+        if flag_slot(plan.type_slot) {
             self.varact_type_calls = self.varact_type_calls.saturating_add(1);
             // TYPE:按目标类型转换(手册例 1/2;§3.22)。
             //
@@ -1852,37 +1904,24 @@ impl Vm {
         // 位号 = 名字尾部数字(`G_INT` ⇒ 0,`G_INT3` ⇒ 3)。
         // 掩码位 = **组号 - 1**(与 `restore_globals` 的 `1 << (group-1)` 对齐)。
         // `G_INT` ⇒ 组 1 ⇒ bit 0;`G_INT2` ⇒ 组 2 ⇒ bit 1 …… `G_INT4` ⇒ bit 3。
-        let g_mask = |want_prefix: &str, family: usize, masks: &mut [u8; 3]| {
-            for (i, name) in names.iter().enumerate() {
-                let Some(idx) = family_index(name, want_prefix) else {
-                    continue;
-                };
-                if idx >= 4 {
-                    continue;
-                }
-                if flags.iter().any(|(s, _)| usize::from(*s) == i) {
-                    masks[family] |= 1 << idx;
-                }
-            }
-        };
         // **必须看「本次指令给了哪些参数」,不能看「表里有没有这些名字」**
         // —— 后者恒真,会把每条 VARACT 都误判进 INIT/G_* 分支并提前返回。
-        let any_g = flags.iter().any(|(slot, _)| {
-            names.get(usize::from(*slot)).is_some_and(|n| {
-                n.starts_with("G_INT") || n.starts_with("G_FLT") || n.starts_with("G_STR")
-            })
-        });
-        if flag("INIT").is_some() || any_g {
+        let any_g = plan.g_slots.iter().any(|(slot, _)| present(*slot));
+        if flag_slot(plan.init_slot) || any_g {
             self.varact_init_calls = self.varact_init_calls.saturating_add(1);
-            if flag("INIT").is_none() {
+            if !flag_slot(plan.init_slot) {
                 // INIT **不在场**:引擎判定链 `je 0x454e05`(函数尾)——
                 // 什么都不做(旁线 §3.26 ③)。判据是在场,与值无关。
                 return Ok(StepOutcome::Continue);
             }
             let mut masks = [0u8; 3]; // INT / FLT / STR 三族的 4 位掩码
-            g_mask("G_INT", 0, &mut masks);
-            g_mask("G_FLT", 1, &mut masks);
-            g_mask("G_STR", 2, &mut masks);
+            for (slot, mask) in &plan.g_slots {
+                if let Some((family, bit)) = mask {
+                    if present(*slot) {
+                        masks[usize::from(*family)] |= 1 << bit;
+                    }
+                }
+            }
             self.restore_globals(st, &masks)?;
             return Ok(StepOutcome::Continue);
         }
@@ -1897,19 +1936,12 @@ impl Vm {
         // 手册 `variable/varact.html` 例 9/10:`VARACT[DIMSIZE=500 SET=@A()]`
         // 与 `VARACT[DIMSIZE+=1 SET=@A()]` —— **没有 LET**,原地改数组。
         // 同理 PUSH/POP(例未给,但参数表无 LET 语义需求)。
-        if flag("DIMSIZE").is_some() {
+        if flag_slot(plan.dimsize_slot) {
             // 手册例 9/10:`DIMSIZE=500`(绝对值)/ `DIMSIZE+=1`(相对值)。
             // 语料实测 **104/104 都是 `+=`**,复合码在窗口 `slot` 高字节
-            // (与 `LET` 同一编码:0== 1+= 2-= …)。
-            // 按名取窗口(槽号会位移);`slot >> 8` 是复合赋值码位。
-            let dimsize_slot = slot_of("DIMSIZE");
-            let code = (cmd
-                .windows
-                .iter()
-                .find(|w| Some(w.rec.kind) == dimsize_slot)
-                .map(|w| w.rec.slot >> 8)
-                .unwrap_or(0)) as u8;
-            let operand = num("DIMSIZE");
+            // (与 `LET` 同一编码:0== 1+= 2-= …),站点级静态值见计划。
+            let code = plan.dimsize_code;
+            let operand = num(plan.dimsize_slot);
             let (ty, dims) = self.var_shape(set_var).ok_or_else(|| {
                 diag::unimplemented(
                     code::rt::VAR_UNDECLARED,
@@ -1954,9 +1986,9 @@ impl Vm {
             self.resize_1d(set_var, ty, new_len.max(0) as usize)?;
             return Ok(StepOutcome::Continue);
         }
-        if flag("PUSH").is_some() || flag("POP").is_some() {
-            let push = flag("PUSH").is_some();
-            let pos = num(if push { "PUSH" } else { "POP" }).max(0) as usize;
+        if flag_slot(plan.push_slot) || flag_slot(plan.pop_slot) {
+            let push = flag_slot(plan.push_slot);
+            let pos = num(if push { plan.push_slot } else { plan.pop_slot }).max(0) as usize;
             self.shift_1d(set_var, pos, push)?;
             return Ok(StepOutcome::Continue);
         }
@@ -1983,33 +2015,33 @@ impl Vm {
         let out;
         let codec = self.script_text_codec(st.script_id);
         self.varact_bytes = self.varact_bytes.saturating_add(bytes.len() as u64);
-        if flag("COPY").is_some() || flag("CUT").is_some() {
-            let pos = num("POS").max(1) as usize;
-            let len = num("LENGTH").max(0) as usize;
-            out = if flag("COPY").is_some() {
+        if flag_slot(plan.copy_slot) || flag_slot(plan.cut_slot) {
+            let pos = num(plan.pos_slot).max(1) as usize;
+            let len = num(plan.length_slot).max(0) as usize;
+            out = if flag_slot(plan.copy_slot) {
                 self.varact_ops[0] = self.varact_ops[0].saturating_add(1);
                 copy_chars(&bytes, pos, len, codec)
             } else {
                 self.varact_ops[1] = self.varact_ops[1].saturating_add(1);
                 cut_chars(&bytes, pos, len, codec)
             };
-        } else if flag("UPPER").is_some() {
+        } else if flag_slot(plan.upper_slot) {
             self.varact_ops[2] = self.varact_ops[2].saturating_add(1);
             out = ascii_case(&bytes, true, codec);
-        } else if flag("UPPER2").is_some() {
+        } else if flag_slot(plan.upper2_slot) {
             self.varact_ops[3] = self.varact_ops[3].saturating_add(1);
             out = fullwidth_case(&bytes, true, codec);
-        } else if flag("LOWER").is_some() {
+        } else if flag_slot(plan.lower_slot) {
             self.varact_ops[4] = self.varact_ops[4].saturating_add(1);
             out = ascii_case(&bytes, false, codec);
-        } else if flag("LOWER2").is_some() {
+        } else if flag_slot(plan.lower2_slot) {
             self.varact_ops[5] = self.varact_ops[5].saturating_add(1);
             out = fullwidth_case(&bytes, false, codec);
-        } else if flag("HANTOZEN").is_some() {
+        } else if flag_slot(plan.hantozen_slot) {
             self.varact_ops[6] = self.varact_ops[6].saturating_add(1);
             // 半角→全角:表/算法逐条见 `crate::case_tables`(0x4546aa..)。
             out = crate::case_tables::hantozen_with(&bytes, codec);
-        } else if flag("ZENTOHAN").is_some() {
+        } else if flag_slot(plan.zentohan_slot) {
             self.varact_ops[7] = self.varact_ops[7].saturating_add(1);
             // 全角→半角:0x4548cf.. / 0x46b395。
             out = crate::case_tables::zentohan_with(&bytes, codec);
@@ -2021,7 +2053,7 @@ impl Vm {
             )
             .into());
         }
-        self.write_target(st, &target, &Value::Str(out))?;
+        self.write_target_owned(st, &target, Value::Str(out))?;
         Ok(StepOutcome::Continue)
     }
 
@@ -2127,7 +2159,7 @@ impl Vm {
                     // 旗标按**存在**记:官方判定链测的是窗口在场(每分支形状
                     // = 直接读 SET 载荷,不读旗标值;旁线 §3.20)。此前按
                     // 「值 ≠ 0」会让 `MATH[ABS=0 …]` 之类被静默丢参。
-                    let v = self.eval_window(st, w)?;
+                    let v = self.eval_window_ref(st, w)?;
                     if v.as_int().is_some() {
                         flags.push(slot);
                     }
@@ -2530,9 +2562,10 @@ impl Vm {
         let names = std::rc::Rc::clone(&cmd.param_names);
         let mut id: Option<String> = None;
         let mut target: Option<crate::expr::LValue> = None;
-        // 查询槽按**名字**收集存在性(引擎 0x4523fc 看窗口存在,不看值;
-        // `FILE0=0` 也算请求)。槽号在版本间会位移,名字稳定。
-        let mut present: Vec<String> = Vec::new();
+        // 查询槽按**在场性**收集(引擎 0x4523fc 看窗口存在,不看值;
+        // `FILE0=0` 也算请求)。只存槽号(#44):不再逐窗口 `name.to_string()`;
+        // 名字在下面按 ORDER 比较时现取(参数名表本身按调用点缓存)。
+        let mut present: smallvec::SmallVec<[u8; 16]> = smallvec::SmallVec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
@@ -2544,30 +2577,31 @@ impl Vm {
                     }
                 }
                 Some("LET") => target = Some(self.eval_lvalue_window(st, w)?),
-                Some(name) => {
+                Some(_) => {
                     // 与引擎参数序言一致:所有窗口都求值(未选中的查询也不
                     // 跳过),保持同一处未声明变量/表达式错误面。
                     let _ = self.eval_window(st, w)?;
-                    present.push(name.to_string());
+                    present.push(w.rec.kind);
                 }
                 None => {
                     let _ = self.eval_window(st, w)?;
-                    present.push(format!("#{}", w.rec.kind));
+                    present.push(w.rec.kind);
                 }
             }
         }
         // 缺省 = 自身(手册:「タスクＩＤを指定しなかった場合、この命令を実行した
         // 自身のタスクが対象」;REA 0x4521dc/0x4524xx 同样取当前任务记录)。
         let id = id.unwrap_or_else(|| task.id.clone());
-        // 引擎从任务链表取记录;泵期间调度器被 `Vm::tick` 借出,故读同步过来的投影。
-        let node = self
+        // 引擎从任务链表取记录;泵期间调度器被 `Vm::tick` 借出,故读同步过来的
+        // 投影。只需要 E/A/Z 三个标量,不克隆 `TaskView`(#44)。
+        let node_facts = self
             .task_view()
             .iter()
             .find(|n| n.id == id && !n.finished)
-            .cloned();
+            .map(|n| (n.enabled, n.active, n.priority));
         // 引擎 `0x452918`:ID 未命中 ⇒ 按 LET 目标类型写默认值
         // (INT 0 / FLT 0.0 / STR 空串),**不**去读当前任务状态。
-        if node.is_none() {
+        let Some((enabled, active, priority)) = node_facts else {
             if let Some(t) = &target {
                 match self.taskinfo_default(t) {
                     Some(v) => self.write_target(st, t, &v)?,
@@ -2579,12 +2613,6 @@ impl Vm {
                 }
             }
             return Ok(StepOutcome::Continue);
-        }
-        // 该任务的执行位(自身就在这里;其它任务在 exec 表里)。
-        let exec = if id == task.id {
-            Some(st.clone())
-        } else {
-            self.exec_of(&id).cloned()
         };
         // 引擎处理体的固定分派顺序(0.495 `0x4523fc`;0.466/0.479/v494
         // 的存在标志检查顺序相同,不是窗口顺序)。
@@ -2606,61 +2634,94 @@ impl Vm {
             "FILENO0",
             "SCRIPTPOS",
         ];
-        let Some(query) = ORDER
-            .iter()
-            .copied()
-            .find(|q| present.iter().any(|p| p.as_str() == *q))
-        else {
+        // 在场的槽号 → 参数名 → ORDER 位置,取最靠前的一项(引擎 `find` 语义)。
+        let mut best: Option<usize> = None;
+        for &slot in &present {
+            let Some(name) = names.get(usize::from(slot)).map(String::as_str) else {
+                continue;
+            };
+            if let Some(pos) = ORDER.iter().position(|q| *q == name) {
+                best = Some(best.map_or(pos, |cur| cur.min(pos)));
+            }
+        }
+        let Some(query) = best.map(|pos| ORDER[pos]) else {
             // `GOLABEL/GOSUBLABEL/TEXTPOS` 与未知槽:0.495 处理体没有分支,
             // 落到默认 `return 0` 且不写 LET。显式留一条对齐记录(每个槽名
             // 一次),不挂 Unimplemented。
-            for name in &present {
-                if !ORDER.contains(&name.as_str()) {
-                    self.report_aligned_stub(
-                        &format!("TASKINFO[{name}]"),
-                        "0.495 处理体 0x4523fc 无该查询槽分支;按官方 no-op(不写 LET)".to_string(),
-                    );
+            for &slot in &present {
+                match names.get(usize::from(slot)).map(String::as_str) {
+                    Some(name) => {
+                        if !ORDER.contains(&name) {
+                            self.report_aligned_stub(
+                                &format!("TASKINFO[{name}]"),
+                                "0.495 处理体 0x4523fc 无该查询槽分支;按官方 no-op(不写 LET)",
+                            );
+                        }
+                    }
+                    None => {
+                        self.report_aligned_stub(
+                            &format!("TASKINFO[#{slot}]"),
+                            "0.495 处理体 0x4523fc 无该查询槽分支;按官方 no-op(不写 LET)",
+                        );
+                    }
                 }
             }
             return Ok(StepOutcome::Continue);
         };
-        let (sid, pc) = exec.as_ref().map(|e| (e.script_id, e.pc)).unwrap_or((0, 0));
-        // 引擎 `0x4524dc/0x4525fa/0x4528b3`:GOSUB 深度 > 0 时读
-        // `task+0x144[0]`(第一层调用的返回位);内核 frames[0] 是基帧,
-        // frames[1] 才是第一层 GOSUB。
-        let origin = exec
-            .as_ref()
-            .and_then(|e| e.frames.get(1).map(|f| (f.return_script, f.return_pc)))
-            .unwrap_or((sid, pc));
+        let is_self = id == task.id;
+        // 借用执行位取出全部标量事实(不克隆 `ExecState` —— 它含 16 元素
+        // 寄存器组与三个栈,#44)。缺执行位时全 0(与旧路径同口径)。
+        let facts = {
+            let exec: Option<&ExecState> = if is_self { Some(&*st) } else { self.exec_of(&id) };
+            match exec {
+                Some(exec) => TaskinfoFacts {
+                    sid: exec.script_id,
+                    pc: exec.pc,
+                    // 引擎 `0x4524dc/0x4525fa/0x4528b3`:GOSUB 深度 > 0 时读
+                    // `task+0x144[0]`(第一层调用的返回位);内核 frames[0] 是基帧,
+                    // frames[1] 才是第一层 GOSUB。
+                    origin: exec
+                        .frames
+                        .get(1)
+                        .map(|f| (f.return_script, f.return_pc))
+                        .unwrap_or((exec.script_id, exec.pc)),
+                    text_line: exec.text_line,
+                    next_voice: exec.next_voice,
+                    if_nest: exec.if_stack.len() as i64,
+                    gosub_nest: exec.frames.len().saturating_sub(1) as i64,
+                    loop_nest: exec.loops.len() as i64,
+                },
+                None => TaskinfoFacts::default(),
+            }
+        };
         let value = match query {
             "EXIST" => Value::Int(1),
-            "E" => Value::Int(node.as_ref().map(|n| n.enabled as i64).unwrap_or(0)),
+            "E" => Value::Int(enabled as i64),
             // A:调度闸门第二字节(引擎 task+0x15;REA 0x4527b0 读)。
-            "A" => Value::Int(node.as_ref().map(|n| n.active as i64).unwrap_or(0)),
-            "Z" => Value::Int(node.as_ref().map(|n| n.priority).unwrap_or(0)),
+            "A" => Value::Int(active as i64),
+            "Z" => Value::Int(priority),
             // FILE:当前脚本文件名(手册)→ 引擎 `0x801850[script_no]` 名字表。
-            "FILE" => Value::Str(self.script_path_bytes(sid)),
-            "FILENO" => Value::Int(sid as i64),
+            "FILE" => Value::Str(self.script_path_bytes(facts.sid)),
+            "FILENO" => Value::Int(i64::from(facts.sid)),
             // LINE:当前执行行数(数据区 B 的逐 pc 源码位置)。
-            "LINE" => Value::Int(self.script_line(sid, pc)),
+            "LINE" => Value::Int(self.script_line(facts.sid, facts.pc)),
             // 以下三项 = 第一层 GOSUB 的调用点(引擎 `task+0x144[0]`)。
-            "FILE0" => Value::Str(self.script_path_bytes(origin.0)),
-            "FILENO0" => Value::Int(origin.0 as i64),
-            "LINE0" => Value::Int(self.script_line(origin.0, origin.1)),
+            "FILE0" => Value::Str(self.script_path_bytes(facts.origin.0)),
+            "FILENO0" => Value::Int(i64::from(facts.origin.0)),
+            "LINE0" => Value::Int(self.script_line(facts.origin.0, facts.origin.1)),
             // task+0xc / task+0x10:最近一次 RETURNCODE 的窗口记录。
-            "TEXTLINE" => Value::Int(exec.as_ref().map(|e| e.text_line).unwrap_or(0)),
-            "NEXTVOICE" => Value::Int(exec.as_ref().map(|e| e.next_voice).unwrap_or(0)),
-            "IFNEST" => Value::Int(exec.as_ref().map(|e| e.if_stack.len() as i64).unwrap_or(0)),
-            "GOSUBNEST" => Value::Int(
-                exec.as_ref()
-                    .map(|e| e.frames.len().saturating_sub(1) as i64)
-                    .unwrap_or(0),
-            ),
-            "LOOPNEST" => Value::Int(exec.as_ref().map(|e| e.loops.len() as i64).unwrap_or(0)),
+            "TEXTLINE" => Value::Int(facts.text_line),
+            "NEXTVOICE" => Value::Int(facts.next_voice),
+            "IFNEST" => Value::Int(facts.if_nest),
+            "GOSUBNEST" => Value::Int(facts.gosub_nest),
+            "LOOPNEST" => Value::Int(facts.loop_nest),
             // SCRIPTPOS(手册 `control/taskinfo.html`:現在実行されている
             // スクリプト位置情報)。产官方引擎线格式(见 `crate::scriptpos`;
             // 0.292/0.466/0.479/0.495/v494 五版同构)。
-            "SCRIPTPOS" => self.scriptpos_value(exec.as_ref(), sid, pc)?,
+            "SCRIPTPOS" => {
+                let exec = if is_self { Some(&*st) } else { self.exec_of(&id) };
+                self.scriptpos_value(exec, facts.sid, facts.pc)?
+            }
             _ => unreachable!("ORDER 覆盖全部分支"),
         };
         if let Some(t) = &target {
@@ -2668,8 +2729,16 @@ impl Vm {
             // 引擎 `0x4525fa/0x4528fa`:FILENO0 写完不返回,`jmp 0x452628`
             // 继续检查 SCRIPTPOS;两者同时存在时 SCRIPTPOS 二次写入覆盖。
             // 其余分支均在写后直接返回(`0x452673` 等)。
-            if query == "FILENO0" && present.iter().any(|p| p == "SCRIPTPOS") {
-                let blob = self.scriptpos_value(exec.as_ref(), sid, pc)?;
+            let scriptpos_present = names
+                .iter()
+                .position(|n| n == "SCRIPTPOS")
+                .and_then(|i| u8::try_from(i).ok())
+                .is_some_and(|slot| present.contains(&slot));
+            if query == "FILENO0" && scriptpos_present {
+                let blob = {
+                    let exec = if is_self { Some(&*st) } else { self.exec_of(&id) };
+                    self.scriptpos_value(exec, facts.sid, facts.pc)?
+                };
                 self.write_taskinfo_value(st, t, "SCRIPTPOS", &blob)?;
             }
         }
@@ -3026,16 +3095,16 @@ impl Vm {
     /// (状态冻结),不是把按键当成松开。参数名来自工程 ysc,不写死槽号。
     fn op_input(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         let vals = self.named_command_values(st, cmd)?;
-        let get = |name: &str| {
+        let get = |name: &str| -> Option<&Value> {
             vals.iter()
                 .rev()
-                .find(|(_, n, _)| n == name)
-                .map(|(_, _, v)| v.clone())
+                .find(|(_, n, _)| *n == name)
+                .map(|(_, _, v)| v)
         };
         let flag = |name: &str| get(name).and_then(|v| v.as_int()).map(|v| v != 0);
         self.input
             .apply_input(flag("KEY"), flag("PAD"), flag("MOUSE"));
-        self.emit_domain_from_values("INPUT", Domain::System, &vals);
+        self.emit_domain_from_values("INPUT", Domain::System, vals);
         Ok(StepOutcome::Continue)
     }
 
@@ -3051,16 +3120,16 @@ impl Vm {
     /// 出现在光标唤醒条件里),所以按钮判定仍读 `_MOUSE_*` 计数器。
     fn op_mouse(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         let vals = self.named_command_values(st, cmd)?;
-        let get = |name: &str| {
+        let get = |name: &str| -> Option<&Value> {
             vals.iter()
                 .rev()
-                .find(|(_, n, _)| n == name)
-                .map(|(_, _, v)| v.clone())
+                .find(|(_, n, _)| *n == name)
+                .map(|(_, _, v)| v)
         };
         let int = |name: &str| get(name).and_then(|v| v.as_int());
         let flag = |name: &str| int(name).map(|v| v != 0);
         let id = match get("ID") {
-            Some(Value::Str(bytes)) => Some(bytes),
+            Some(Value::Str(bytes)) => Some(bytes.as_slice()),
             _ => None,
         };
         self.input.apply_mouse(
@@ -3074,34 +3143,32 @@ impl Vm {
             int("Y"),
             int("HX"),
             int("HY"),
-            id.as_deref(),
+            id,
         );
-        self.emit_domain_from_values("MOUSE", Domain::System, &vals);
+        self.emit_domain_from_values("MOUSE", Domain::System, vals);
         Ok(StepOutcome::Continue)
     }
 
     /// 按 ysc 参数名求值全部窗口(空窗口跳过)。
     ///
-    /// 与 `eval_arg_windows` 的区别:保留参数名,供 INPUT/MOUSE 之类“按名
-    /// 消费、跨版本槽号会漂移”的命令使用(项目范式:不写死槽号)。
-    fn named_command_values(
+    /// 与 `eval_arg_windows` 的区别:保留参数名(借用,不 clone),供
+    /// INPUT/MOUSE 之类“按名消费、跨版本槽号会漂移”的命令使用(项目范式:
+    /// 不写死槽号)。参数名表按调用点缓存(`cmd.param_names`)。
+    fn named_command_values<'a>(
         &mut self,
         st: &mut ExecState,
-        cmd: &Cmd,
-    ) -> Result<Vec<(u8, String, Value)>, VmError> {
-        // 参数名表随调用点缓存一次(`fill_cmd` 已存进 `cmd.param_names`)。
-        // 旧写法每次执行都 `p.name.clone()` 重建整张表:SIM 的 `SAVE` 单帧
-        // 12 次 × 20+ 个 `String`,纯堆分配(与 `CGINFO`/`VARACT` 同一个 bug)。
+        cmd: &'a Cmd,
+    ) -> Result<smallvec::SmallVec<[(u8, &'a str, Value); 8]>, VmError> {
         let names: &[String] = &cmd.param_names;
-        let mut out = Vec::new();
+        let mut out = smallvec::SmallVec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
             }
             let name = names
                 .get(usize::from(w.rec.kind))
-                .cloned()
-                .unwrap_or_default();
+                .map(String::as_str)
+                .unwrap_or(""); // silent-ok: 槽号越界 = 无名
             let value = self.eval_window(st, w)?;
             out.push((w.rec.kind, name, value));
         }
@@ -3112,11 +3179,12 @@ impl Vm {
         &mut self,
         name: &str,
         domain: Domain,
-        vals: &[(u8, String, Value)],
+        vals: smallvec::SmallVec<[(u8, &str, Value); 8]>,
     ) {
+        // 值直接 move 进事件参数(#82:不再 `value.clone()`)。
         let args = vals
-            .iter()
-            .map(|(slot, _, value)| ArgValue::new(*slot, value.clone()))
+            .into_iter()
+            .map(|(slot, _, value)| ArgValue::new(slot, value))
             .collect();
         self.emit_domain(domain, name.to_string(), args);
     }
@@ -3246,7 +3314,7 @@ impl Vm {
             let Some(bytes) = file.clone() else {
                 self.report_unimplemented(
                     "FILEINFO",
-                    "RELATION=1 缺 FILE(file/fileinfo.html 例 4)".to_string(),
+                    "RELATION=1 缺 FILE(file/fileinfo.html 例 4)",
                 );
                 return Ok(StepOutcome::Continue);
             };
@@ -3266,7 +3334,7 @@ impl Vm {
             let Some(bytes) = file.clone() else {
                 self.report_unimplemented(
                     "FILEINFO",
-                    "SIZE=1 缺 FILE(file/fileinfo.html 例 3)".to_string(),
+                    "SIZE=1 缺 FILE(file/fileinfo.html 例 3)",
                 );
                 return Ok(StepOutcome::Continue);
             };
@@ -3566,7 +3634,7 @@ impl Vm {
                     }
                     None => self.report_unimplemented(
                         "SAVE",
-                        "SAVE[ID] 图层快照:图形宿主未提供图层像素(H-P4-02)".to_string(),
+                        "SAVE[ID] 图层快照:图形宿主未提供图层像素(H-P4-02)",
                     ),
                 }
             } else if let Some((ty, group)) = group_slot {
@@ -3751,7 +3819,7 @@ impl Vm {
                         Ok(true) => {}
                         Ok(false) => self.report_unimplemented(
                             "LOAD",
-                            "LOAD[ID] 图层恢复:图形宿主未接受图层像素(H-P4-02)".to_string(),
+                            "LOAD[ID] 图层恢复:图形宿主未接受图层像素(H-P4-02)",
                         ),
                         Err(d) => self.report(d),
                     }
@@ -3885,16 +3953,6 @@ impl Vm {
 
     // ------------------------------------------------------------ MOVIE(全屏)
 
-    /// 取本命令声明里的参数名(按槽号)。
-    fn command_params(&self, cmd: &Cmd) -> Vec<String> {
-        self.tables()
-            .boot
-            .yscm
-            .command(cmd.opcode)
-            .map(|c| c.params.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default() // silent-ok: 表里没有该命令 = 无参数名(按名解析自然失败)
-    }
-
     /// 取已求值参数里的整数(`name` 按工程 ysc 表匹配,不写死槽号)。
     fn movie_int_arg(&self, params: &[String], args: &[ArgValue], name: &str) -> Option<i64> {
         let slot = params.iter().position(|p| p == name)?;
@@ -3948,10 +4006,10 @@ impl Vm {
     /// `IF[@codeccheck==0] IFBREAK[LV=3]` 放弃播放。内核的 VFS 根就是官方
     /// 的基路径,直接探测参数即可。
     fn op_movieinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        let params = self.command_params(cmd);
+        let params: &[String] = &cmd.param_names;
         let mut targets: Vec<crate::expr::LValue> = Vec::new();
         let mut event_args: Vec<ArgValue> = Vec::new();
-        let mut flags: Vec<&str> = Vec::new();
+        let mut flags: smallvec::SmallVec<[&str; 8]> = smallvec::SmallVec::new();
         // `CODEC` 的参数值 = 待探测文件名(不是当前影片)。
         let mut codec_file: Option<Vec<u8>> = None;
         for w in &cmd.windows {
@@ -4044,16 +4102,16 @@ impl Vm {
     /// 解码与呈现全在 [`crate::event::MovieHost`] 之后(官方交给系统媒体栈)。
     fn op_movie(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         let args = self.eval_arg_windows(st, cmd);
-        let params = self.command_params(cmd);
+        let params: &[String] = &cmd.param_names;
         // 1. 几何:每条命令都按本次参数重写(官方缺省值见文档)。
         // 官方缺省值(0x44b2b0..0x44b2fc):X/Y 缺省 0;SX/SY 缺省取影片
         // 原尺寸 ⇒ 等价于铺满窗口,内核不解码,用 0 表示「未指定」交给宿主
         // 按同一规则换算。这里没有错误吞掉,只是官方默认值。
         let geometry = crate::event::MovieGeometry {
-            x: self.movie_float_arg(&params, &args, "X").unwrap_or(0.0), // silent-ok: 缺省 X=0
-            y: self.movie_float_arg(&params, &args, "Y").unwrap_or(0.0), // silent-ok: 缺省 Y=0
-            sx: self.movie_float_arg(&params, &args, "SX").unwrap_or(0.0), // silent-ok: 未指定 = 铺满
-            sy: self.movie_float_arg(&params, &args, "SY").unwrap_or(0.0), // silent-ok: 未指定 = 铺满
+            x: self.movie_float_arg(params, &args, "X").unwrap_or(0.0), // silent-ok: 缺省 X=0
+            y: self.movie_float_arg(params, &args, "Y").unwrap_or(0.0), // silent-ok: 缺省 Y=0
+            sx: self.movie_float_arg(params, &args, "SX").unwrap_or(0.0), // silent-ok: 未指定 = 铺满
+            sy: self.movie_float_arg(params, &args, "SY").unwrap_or(0.0), // silent-ok: 未指定 = 铺满
         };
         self.movie.geometry = geometry;
         if let Some(host) = self.movie_host.as_mut() {
@@ -4066,18 +4124,18 @@ impl Vm {
                 .iter()
                 .find(|a| usize::from(a.slot) == slot)
                 .and_then(|a| match &a.value {
-                    Value::Str(bytes) if !bytes.is_empty() => Some(bytes.clone()),
+                    Value::Str(bytes) if !bytes.is_empty() => Some(bytes),
                     _ => None,
                 });
             if let Some(file) = file {
-                match self.probe_movie_codec(&file) {
+                match self.probe_movie_codec(file) {
                     yu_format::movie::MovieCodec::Missing => {
                         self.report(diag::recoverable(
                             code::rt::MOVIE_FILE,
                             Boundary::Script,
                             format!(
                                 "MOVIE 影片不存在或不可读:{}",
-                                String::from_utf8_lossy(&file)
+                                String::from_utf8_lossy(file)
                             ),
                         ));
                     }
@@ -4087,15 +4145,15 @@ impl Vm {
                         if self.movie_host.is_some() {
                             // 只有装了播放后端才把整份影片读进内存(官方
                             // `MOVIE` 也是此时打开文件);无后端时零额外 IO。
-                            let bytes = self.open_asset(&file);
+                            let bytes = self.open_asset(file);
                             let result = match (self.movie_host.as_mut(), bytes) {
-                                (Some(host), Some(bytes)) => host.open(&file, &bytes),
+                                (Some(host), Some(bytes)) => host.open(file, &bytes),
                                 _ => Err(diag::recoverable(
                                     code::rt::MOVIE_FILE,
                                     Boundary::Script,
                                     format!(
                                         "MOVIE 影片读取失败:{}",
-                                        String::from_utf8_lossy(&file)
+                                        String::from_utf8_lossy(file)
                                     ),
                                 )),
                             };
@@ -4110,7 +4168,7 @@ impl Vm {
         }
 
         // 3. VOLUME
-        if let Some(volume) = self.movie_int_arg(&params, &args, "VOLUME") {
+        if let Some(volume) = self.movie_int_arg(params, &args, "VOLUME") {
             self.movie.volume = volume;
             if let Some(host) = self.movie_host.as_mut() {
                 host.set_volume(volume);
@@ -4118,7 +4176,7 @@ impl Vm {
         }
 
         // 4. PLAY
-        if let Some(play) = self.movie_int_arg(&params, &args, "PLAY") {
+        if let Some(play) = self.movie_int_arg(params, &args, "PLAY") {
             let playing = play != 0;
             self.movie.playing = playing;
             if let Some(host) = self.movie_host.as_mut() {
@@ -4493,7 +4551,7 @@ impl Vm {
         let Some(mut host) = self.graphics_host.take() else {
             self.report_unimplemented(
                 name,
-                "未安装 GraphicsHost:INFO 查询无法在脚本执行期读取图形状态".to_string(),
+                "未安装 GraphicsHost:INFO 查询无法在脚本执行期读取图形状态",
             );
             return Ok(StepOutcome::Continue);
         };
@@ -4623,7 +4681,7 @@ impl Vm {
         let Some(mut host) = self.sound_host.take() else {
             self.report_unimplemented(
                 "SOUNDINFO",
-                "未安装 SoundHost:声音查询无法在脚本执行期读取层状态".to_string(),
+                "未安装 SoundHost:声音查询无法在脚本执行期读取层状态",
             );
             return Ok(StepOutcome::Continue);
         };
@@ -4664,32 +4722,29 @@ impl Vm {
         use crate::text::flag as tflag;
         // 参数名来自工程 ysc 表(opcode → 命令声明),不写死槽号。
         // 参数名表随调用点缓存一次(`fill_cmd` 已存进 `cmd.param_names`);
-        // 旧写法每次执行都重建整张 `Vec<String>`(与 `CGINFO` 同一个 bug)。
+        // 这里只存槽号 + 值,`get` 返回借用(#82:不再逐次 `Value::clone`)。
         let names: &[String] = &cmd.param_names;
-        let mut vals: Vec<(String, Value)> = Vec::new();
+        let mut vals: smallvec::SmallVec<[(u8, Value); 8]> = smallvec::SmallVec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
             }
-            let name = names
-                .get(usize::from(w.rec.kind))
-                .cloned()
-                .unwrap_or_default();
             let v = self.eval_window(st, w)?;
-            vals.push((name, v));
+            vals.push((w.rec.kind, v));
         }
-        let get = |n: &str| {
+        let get = |n: &str| -> Option<&Value> {
+            let slot = names.iter().position(|name| name == n)? as u8;
             vals.iter()
                 .rev()
-                .find(|(k, _)| k == n)
-                .map(|(_, v)| v.clone())
+                .find(|(s, _)| *s == slot)
+                .map(|(_, v)| v)
         };
 
         // p0 ID:目标文本层(CP932 原始字节)。
         // REA 0x453467 求值到字节缓冲后交 0x414559 解析图层:MurmurHash2 +
         // 逐字节比较,不校验 UTF-8;非 ASCII ID 合法(手册 text/text.html ID)。
         if let Some(Value::Str(b)) = get("ID") {
-            self.text.layer_id = b;
+            self.text.layer_id = b.clone();
         }
         // p1 OUTPUTMODE(引擎只存 AL)。
         if let Some(v) = get("OUTPUTMODE") {
@@ -4781,20 +4836,17 @@ impl Vm {
         // 旧写法每次执行都重建整张 `Vec<String>`(与 `CGINFO` 同一个 bug)。
         let names: &[String] = &cmd.param_names;
         let mut target: Option<crate::expr::LValue> = None;
-        let mut present: Vec<String> = Vec::new();
+        // 只存在场槽号(#82:不再逐窗口 clone 名字)。
+        let mut present: smallvec::SmallVec<[u8; 8]> = smallvec::SmallVec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
             }
-            let name = names
-                .get(usize::from(w.rec.kind))
-                .cloned()
-                .unwrap_or_default();
-            if name == "LET" {
-                target = Some(self.eval_lvalue_window(st, w)?);
-            } else if !name.is_empty() {
+            match names.get(usize::from(w.rec.kind)).map(String::as_str) {
+                Some("LET") => target = Some(self.eval_lvalue_window(st, w)?),
+                Some("") | None => {}
                 // 引擎只检查槽位是否存在(0x4538fa..),不求值查询标志本身。
-                present.push(name);
+                Some(_) => present.push(w.rec.kind),
             }
         }
         let Some(target) = target else {
@@ -4814,7 +4866,11 @@ impl Vm {
             "AUTOPAGE",
             "AUTOCLICK",
         ] {
-            if !present.iter().any(|n| n == name) {
+            let slot = names
+                .iter()
+                .position(|n| n == name)
+                .and_then(|index| u8::try_from(index).ok());
+            if !slot.is_some_and(|slot| present.contains(&slot)) {
                 continue;
             }
             let v = match name {
@@ -4846,11 +4902,8 @@ impl Vm {
             if w.rec.length == 0 {
                 continue;
             }
-            let v = self.eval_window(st, w)?;
-            let bytes = match v.cast_to_str()? {
-                Value::Str(b) => b,
-                _ => Vec::new(),
-            };
+            // `_` 的表达式值已是 `Str` 时直接搬字节(#81)。
+            let bytes = into_str_bytes(self.eval_window(st, w)?)?;
             self.append_text_for_script(st.script_id, &bytes);
             self.emit(VmEvent::Text {
                 frame: self.frame(),
@@ -5458,7 +5511,8 @@ impl Vm {
         }
         if exist {
             if let (Some(name), Some(t)) = (name, target) {
-                let found = self.find_label(&name).is_some();
+                // 只判存在性:走无克隆的 `find_label_target`(#46)。
+                let found = self.find_label_target(&name).is_some();
                 self.write_target(st, &t, &Value::Int(found as i64))?;
             }
         }
@@ -5510,7 +5564,7 @@ impl Vm {
             )
             .into());
         };
-        let label = self.find_label(&name).ok_or_else(|| {
+        let label = self.find_label_target(&name).ok_or_else(|| {
             let d = diag::fatal(
                 code::rt::LABEL,
                 Boundary::Script,
@@ -5518,11 +5572,7 @@ impl Vm {
             );
             VmError::Fatal(d)
         })?;
-        let target = crate::vm::LabelTarget {
-            script_id: label.script_id as u32,
-            pc: label.pc,
-            base_a: label.base_a,
-        };
+        let target = label;
         if constant {
             self.label_cache.insert(site, target);
         }
@@ -5574,6 +5624,19 @@ impl Vm {
 
 // ---------------------------------------------------------------- 纯函数
 
+/// `TASKINFO` 所需的任务执行位标量投影(在借用域内取出,避免克隆 `ExecState`)。
+#[derive(Default)]
+struct TaskinfoFacts {
+    sid: u32,
+    pc: u32,
+    origin: (u32, u32),
+    text_line: i64,
+    next_voice: i64,
+    if_nest: i64,
+    gosub_nest: i64,
+    loop_nest: i64,
+}
+
 /// `TINT`/`TFLT`/`TSTR` 族的**槽位索引**:后缀数字 - 1。
 ///
 /// `TINT` ⇒ 0、`TINT2` ⇒ 1 …… `TINT10` ⇒ 9。
@@ -5590,6 +5653,63 @@ fn family_index(name: &str, prefix: &str) -> Option<usize> {
     };
     let idx = n.checked_sub(1)?;
     (idx < 16).then_some(idx)
+}
+
+/// 构建 `VARACT` 站点计划:参数名 → 槽号解析一次(`fill_cmd` 调用)。
+///
+/// 语义与旧的就地扫描逐项等价:旗标按**参数名**判定(槽号跨版本会位移),
+/// `G_*` 族按前缀 + 后缀编号取掩码位,`DIMSIZE` 的复合赋值码取该槽窗口的
+/// `slot` 高字节(静态)。
+pub(crate) fn build_varact_plan(names: &[String], windows: &[CmdWindow]) -> VaractPlan {
+    let slot_of = |want: &str| names.iter().position(|n| n == want).map(|i| i as u8);
+    let mut plan = VaractPlan {
+        type_slot: slot_of("TYPE"),
+        init_slot: slot_of("INIT"),
+        dimsize_slot: slot_of("DIMSIZE"),
+        dimsize_code: 0,
+        push_slot: slot_of("PUSH"),
+        pop_slot: slot_of("POP"),
+        copy_slot: slot_of("COPY"),
+        cut_slot: slot_of("CUT"),
+        pos_slot: slot_of("POS"),
+        length_slot: slot_of("LENGTH"),
+        upper_slot: slot_of("UPPER"),
+        upper2_slot: slot_of("UPPER2"),
+        lower_slot: slot_of("LOWER"),
+        lower2_slot: slot_of("LOWER2"),
+        hantozen_slot: slot_of("HANTOZEN"),
+        zentohan_slot: slot_of("ZENTOHAN"),
+        g_slots: Vec::new(),
+    };
+    if let Some(slot) = plan.dimsize_slot {
+        plan.dimsize_code = windows
+            .iter()
+            .find(|w| w.rec.kind == slot)
+            .map(|w| (w.rec.slot >> 8) as u8)
+            .unwrap_or(0);
+    }
+    for (index, name) in names.iter().enumerate() {
+        let Ok(slot) = u8::try_from(index) else {
+            break;
+        };
+        let family = if name.starts_with("G_INT") {
+            Some(0u8)
+        } else if name.starts_with("G_FLT") {
+            Some(1u8)
+        } else if name.starts_with("G_STR") {
+            Some(2u8)
+        } else {
+            None
+        };
+        let Some(family) = family else { continue };
+        let mask = ["G_INT", "G_FLT", "G_STR"]
+            .get(usize::from(family))
+            .and_then(|prefix| family_index(name, prefix))
+            .filter(|idx| *idx < 4)
+            .map(|idx| (family, idx as u8));
+        plan.g_slots.push((slot, mask));
+    }
+    plan
 }
 
 fn flags_get(flags: &[(u8, i64)], slot: u8) -> Option<i64> {
@@ -5801,8 +5921,17 @@ fn compound(code: u8, cur: &Value, rhs: &Value) -> Result<Value, yu_log::Diag> {
 }
 
 /// 声明窗口的目标变量(单条变量指令或数组引用)。
+///
+/// 复用 `fill_cmd` 预解码的 `instrs`(#45);只有未预解码时才回退 `decode`。
 fn target_var(w: &CmdWindow) -> Result<VarRef, yu_log::Diag> {
-    let instrs = crate::expr::decode(&w.payload)?;
+    let decoded;
+    let instrs: &[crate::expr::RawInstr] = match &w.instrs {
+        Some(instrs) => instrs,
+        None => {
+            decoded = crate::expr::decode(&w.payload)?;
+            &decoded
+        }
+    };
     let first = instrs
         .iter()
         .find(|i| matches!(i.op, 0x48 | 0x56 | 0x76))
@@ -5956,15 +6085,49 @@ fn fullwidth_case(bytes: &[u8], upper: bool, codec: yu_format::Codec) -> Vec<u8>
     out
 }
 
+/// 值 → 字符串字节(已是 `Str` 时直接搬,不再 `cast_to_str` 克隆一次;#81)。
+fn into_str_bytes(v: Value) -> Result<Vec<u8>, yu_log::Diag> {
+    match v {
+        Value::Str(bytes) => Ok(bytes),
+        other => match other.cast_to_str()? {
+            Value::Str(bytes) => Ok(bytes),
+            _ => Ok(Vec::new()),
+        },
+    }
+}
+
+/// `_KEY_<X>` / `_MOUSE_<X>` 的按钮族后缀(排除坐标槽与 `LAST`;
+/// 与旧写路径的内联过滤同口径)。非按钮族返回 `None`。
+fn button_family_rest(name: &str) -> Option<&str> {
+    let rest = name
+        .strip_prefix("_KEY_")
+        .or_else(|| name.strip_prefix("_MOUSE_"))?;
+    let excluded = matches!(rest, "LAST" | "X" | "Y")
+        // X/Y 后缀数字 = 窗口槽坐标族(REA `FUN_00427350` case 0x85..0x8e)。
+        || rest
+            .strip_suffix(['0', '1', '2', '3'])
+            .map(|base| matches!(base, "X" | "Y"))
+            .unwrap_or(false)
+        || rest
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(true);
+    (!excluded).then_some(rest)
+}
+
 /// CP932 → 显示文本(lossy;仅事件/诊断)。
 fn cp932_lossy(bytes: &[u8]) -> String {
     // 不引入码表:非 ASCII 字节按 `\xNN` 显示,保证确定性与可逆诊断。
-    let mut s = String::new();
+    // 预分配 + `write!` 直接写入(旧实现每个非 ASCII 字节一次 `format!`)。
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len());
     for &b in bytes {
         if (0x20..0x7F).contains(&b) {
             s.push(b as char);
         } else {
-            s.push_str(&format!("\\x{b:02x}"));
+            // 写入 String 不会失败(内存分配 panic 除外);忽略 Result。
+            let _ = write!(s, "\\x{b:02x}");
         }
     }
     s

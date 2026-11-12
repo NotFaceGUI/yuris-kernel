@@ -23,6 +23,9 @@
 //! 时间线,`Vm` 每逻辑帧调用 [`InputState::advance`]。内核**绝不读真实输入设备**。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
+
+use rustc_hash::FxHashMap;
 
 /// 一个物理键/鼠标键/手柄钮的逻辑名(与 ycd 系统变量名同构,不含前缀 `_`)。
 ///
@@ -48,6 +51,14 @@ pub struct InputBinding {
     /// `_CODE_<X>`(键盘/鼠标段)系统变量 id → 引擎按钮码。
     /// 键盘/手柄段算术码(`_CODE_PAD_*`)不预绑定,按需计算。
     code_ids: BTreeMap<u16, u16>,
+    /// 系统变量 id → 引擎按钮码(`_KEY_*`/`_MOUSE_*` 计数器)。
+    ///
+    /// 启动期从同一份 ABI 表解析一次;读/写路径按 id 直接取码,不再做
+    /// 名字前缀判断 + 113 项 ABI 表线性扫描(`#12/#42`)。`None` = 非按钮
+    /// (坐标槽/`_KEY_ANY` 等,仍走名字分支)。
+    key_code_by_id: Vec<Option<u16>>,
+    /// 系统变量 id → 引擎按钮码(`_KEYNUM_*`/`_MOUSENUM_*` 累计次数)。
+    count_code_by_id: Vec<Option<u16>>,
 }
 
 impl InputBinding {
@@ -60,7 +71,11 @@ impl InputBinding {
     /// `_CODE_*` 常量(输入码)不在此建模:它们只用于 `TEXT[CLICKBUTTON=…]`
     /// 之类的参数,属文本层配置(见 DIV-RT-006)。
     pub fn from_sysvars(sysvars: &crate::sysvar_abi::SysVarTable) -> Self {
-        let mut b = InputBinding::default();
+        let mut b = InputBinding {
+            key_code_by_id: vec![None; sysvars.decls.len()],
+            count_code_by_id: vec![None; sysvars.decls.len()],
+            ..InputBinding::default()
+        };
         for (id, decl) in sysvars.decls.iter().enumerate() {
             let id = id as u16;
             let name = decl.name.as_str();
@@ -81,14 +96,20 @@ impl InputBinding {
                         }
                     } else if let Some(rest) = name.strip_prefix("_KEYNUM_") {
                         b.count_ids.insert(format!("KEY_{rest}"), id);
+                        b.count_code_by_id[id as usize] = button_code(rest);
                     } else if let Some(rest) = name.strip_prefix("_MOUSENUM_") {
-                        b.count_ids.insert(format!("MOUSE_{rest}"), id);
+                        let button = format!("MOUSE_{rest}");
+                        b.count_ids.insert(button.clone(), id);
+                        b.count_code_by_id[id as usize] = button_code(&button);
                     } else if let Some(rest) = name.strip_prefix("_KEY_") {
                         b.key_ids.insert(format!("KEY_{rest}"), id);
+                        b.key_code_by_id[id as usize] = button_code(rest);
                     } else if let Some(rest) = name.strip_prefix("_MOUSE_") {
                         // `_MOUSE_X/Y` 等坐标不是按钮;只收按钮族。
                         if is_mouse_button(rest) {
-                            b.key_ids.insert(format!("MOUSE_{rest}"), id);
+                            let button = format!("MOUSE_{rest}");
+                            b.key_ids.insert(button.clone(), id);
+                            b.key_code_by_id[id as usize] = button_code(&button);
                         }
                     }
                 }
@@ -136,6 +157,19 @@ impl InputBinding {
     /// `_CODE_<X>`(键盘/鼠标段)系统变量 id → 引擎按钮码(ABI 缺省值)。
     pub fn code_of_id(&self, id: u16) -> Option<u16> {
         self.code_ids.get(&id).copied()
+    }
+
+    /// `_KEY_*`/`_MOUSE_*` 的系统变量 id → 引擎按钮码(启动期解析一次)。
+    pub fn key_code_of_id(&self, id: u16) -> Option<u16> {
+        self.key_code_by_id.get(usize::from(id)).copied().flatten()
+    }
+
+    /// `_KEYNUM_*`/`_MOUSENUM_*` 的系统变量 id → 引擎按钮码。
+    pub fn count_code_of_id(&self, id: u16) -> Option<u16> {
+        self.count_code_by_id
+            .get(usize::from(id))
+            .copied()
+            .flatten()
     }
 
     /// 全部按钮名(确定顺序),供宿主枚举。
@@ -195,8 +229,18 @@ fn parse_button_code_abi(tsv: &str) -> Vec<(String, u16)> {
 /// 鼠标 1..3 号变体(`MOUSE_L1` 等)回退到基名:ycd 415..434 每基 4 连号
 /// (L,L1,L2,L3),引擎字节表对四者存同值(计数表只有 5 个鼠标下标)。
 pub fn button_code(base: &str) -> Option<u16> {
-    let table = &*BUTTON_CODE_ABI;
-    let hit = |n: &str| table.iter().find(|(t, _)| t == n).map(|(_, c)| *c);
+    // #73:名字 → 码的哈希索引(启动期建一次;`or_insert` 保留首次出现,
+    // 与旧的 `iter().find` 同义)。宿主每次按键都要查,113 项线性扫描没必要。
+    static BUTTON_CODE_MAP: std::sync::LazyLock<std::collections::HashMap<String, u16>> =
+        std::sync::LazyLock::new(|| {
+            let mut map: std::collections::HashMap<String, u16> =
+                std::collections::HashMap::with_capacity(BUTTON_CODE_ABI.len());
+            for (name, code) in BUTTON_CODE_ABI.iter() {
+                map.entry(name.clone()).or_insert(*code);
+            }
+            map
+        });
+    let hit = |n: &str| BUTTON_CODE_MAP.get(n).copied();
     hit(base).or_else(|| {
         let trimmed = base.trim_end_matches(|c: char| c.is_ascii_digit());
         if trimmed.len() != base.len() {
@@ -278,9 +322,12 @@ impl InputFrame {
 
 /// 输入时间线:帧号 → 该帧按下的按钮集合。缺省帧 = 未按任何键
 /// (手册:未按下时计数器每帧 `-1`)。
+///
+/// 帧状态按 `Rc` 存放:`InputState::advance` 每帧只需克隆引用计数,不再复制
+/// 两个 `BTreeSet`(旧实现每帧 `effective()` 克隆 + `prev = current.clone()`)。
 #[derive(Clone, Debug, Default)]
 pub struct InputTimeline {
-    frames: BTreeMap<u64, InputFrame>,
+    frames: BTreeMap<u64, Rc<InputFrame>>,
 }
 
 impl InputTimeline {
@@ -290,19 +337,27 @@ impl InputTimeline {
 
     /// 设定某帧的按下集合。同帧重复设定 → 后者覆盖(确定性)。
     pub fn set(&mut self, frame: u64, frame_state: InputFrame) {
-        self.frames.insert(frame, frame_state);
+        self.frames.insert(frame, Rc::new(frame_state));
     }
 
     pub fn at(&self, frame: u64) -> Option<&InputFrame> {
-        self.frames.get(&frame)
+        self.frames.get(&frame).map(Rc::as_ref)
     }
 
     /// 该帧是否处于「按住」(用于片段内插值:上一次显式设定后保持)。
     pub fn effective(&self, frame: u64) -> InputFrame {
-        match self.frames.range(..=frame).next_back() {
-            Some((_, f)) => f.clone(),
-            None => InputFrame::default(),
-        }
+        // 缺省: 该帧之前无显式输入帧 ⇒ 空帧(与旧 effective 语义一致)。
+        self.effective_ref(frame).cloned().unwrap_or_default()
+    }
+
+    /// [`Self::effective`] 的借用版(热路径不复制按下集合)。
+    pub fn effective_ref(&self, frame: u64) -> Option<&InputFrame> {
+        self.frames.range(..=frame).next_back().map(|(_, f)| &**f)
+    }
+
+    /// [`Self::effective`] 的共享版:命中时只克隆 `Rc`,供 `InputState` 持有快照。
+    pub fn effective_shared(&self, frame: u64) -> Option<Rc<InputFrame>> {
+        self.frames.range(..=frame).next_back().map(|(_, f)| Rc::clone(f))
     }
 
     pub fn len(&self) -> usize {
@@ -445,9 +500,14 @@ pub struct InputState {
     counters: BTreeMap<u16, Counter>,
     counts: BTreeMap<u16, i64>,
     settings: InputSettings,
-    prev: InputFrame,
-    /// 本帧快照(供系统变量读取)。
-    current: InputFrame,
+    /// 上一帧/本帧快照(共享 `Rc`:帧间快照只需引用计数,不复制集合)。
+    prev: Rc<InputFrame>,
+    current: Rc<InputFrame>,
+    /// 空快照(`timeline.effective_shared` 未命中时的共享默认值)。
+    empty_frame: Rc<InputFrame>,
+    /// 按钮名 → 引擎按钮码的惰性缓存(`advance` 每帧按名字解析;名字集合由
+    /// 注入方固定,缓存跨帧有效,免掉 113 项 ABI 表的逐帧线性扫描)。
+    button_codes: FxHashMap<String, Option<u16>>,
     /// `_KEYLAST` / `_MOUSELAST`:最近一次按下的按钮码。
     keylast: i64,
     mouselast: i64,
@@ -478,8 +538,10 @@ impl InputState {
             counters,
             counts: BTreeMap::new(),
             settings: InputSettings::default(),
-            prev: InputFrame::default(),
-            current: InputFrame::default(),
+            prev: Rc::new(InputFrame::default()),
+            current: Rc::new(InputFrame::default()),
+            empty_frame: Rc::new(InputFrame::default()),
+            button_codes: FxHashMap::default(),
             keylast: 0,
             mouselast: 0,
             code_overrides: BTreeMap::new(),
@@ -553,11 +615,12 @@ impl InputState {
         }
         if x.is_some() || y.is_some() {
             self.settings.cursor_warp = Some((x, y));
+            let current = Rc::make_mut(&mut self.current);
             if let Some(v) = x {
-                self.current.cursor.0 = v;
+                current.cursor.0 = v;
             }
             if let Some(v) = y {
-                self.current.cursor.1 = v;
+                current.cursor.1 = v;
             }
         }
     }
@@ -569,20 +632,21 @@ impl InputState {
 
     /// 用时间线的该帧状态推进一帧。
     pub fn advance(&mut self, frame: u64, timeline: &InputTimeline) {
-        let mut now = timeline.effective(frame);
-        // 脉冲只在该帧有效(不参与“按住保持”)。
-        if let Some(exact) = timeline.at(frame) {
-            now.pulses = exact.pulses.clone();
-        }
-        let mut down: BTreeSet<u16> = BTreeSet::new();
+        // 借用/共享快照:命中时间线时只 bump 引用计数(旧实现每帧把两个
+        // `BTreeSet` 各复制一次)。
+        let now = timeline
+            .effective_shared(frame)
+            .unwrap_or_else(|| Rc::clone(&self.empty_frame));
+        // 本帧按下的按钮码(固定位图;码 < 1024 之外落小数表)。
+        let mut down = DownSet::default();
         for name in now.pressed.iter().chain(now.pulses.iter()) {
-            if let Some(code) = code_of_button_name(name) {
+            if let Some(code) = self.resolve_button_code(name) {
                 down.insert(code);
             }
         }
         // 先算键盘“任意键”本帧状态(只看已存在的键盘计数器)。
         let any_down = self.counters.iter().any(|(code, _)| {
-            source_of_code(*code) == InputSource::Keyboard && *code != 0 && down.contains(code)
+            source_of_code(*code) == InputSource::Keyboard && *code != 0 && down.contains(*code)
         });
 
         let keyboard = self.settings.keyboard;
@@ -602,7 +666,7 @@ impl InputState {
             let pressed = if *code == 0 {
                 any_down
             } else {
-                down.contains(code)
+                down.contains(*code)
             };
             let rising = pressed && !counter.down;
             counter.step(pressed);
@@ -619,8 +683,18 @@ impl InputState {
                 }
             }
         }
-        self.prev = self.current.clone();
+        self.prev = Rc::clone(&self.current);
         self.current = now;
+    }
+
+    /// 按钮名 → 引擎按钮码(惰性缓存;名字集合由注入方固定)。
+    fn resolve_button_code(&mut self, name: &str) -> Option<u16> {
+        if let Some(hit) = self.button_codes.get(name) {
+            return *hit;
+        }
+        let code = code_of_button_name(name);
+        self.button_codes.insert(name.to_string(), code);
+        code
     }
 
     /// 按钮计数器值(未出现 = 0)。
@@ -643,6 +717,12 @@ impl InputState {
         code_of_button_name(button)
             .and_then(|code| self.counts.get(&code).copied())
             .unwrap_or(0)
+    }
+
+    /// 按引擎按钮码读累计次数(`_KEYNUM_*`,启动期 id→码表直查)。
+    pub fn count_code(&self, code: u16) -> i64 {
+        // 缺省: 该按钮码没有累计计数 ⇒ 0。
+        self.counts.get(&code).copied().unwrap_or(0)
     }
 
     /// 任意键(`_KEY_ANY`):引擎下标 0,任一键盘键按住时按自己的计数器走。
@@ -743,7 +823,7 @@ impl InputState {
 
     /// 宿主/测试直接设定光标(推进前的物理状态)。
     pub fn set_cursor(&mut self, x: i64, y: i64) {
-        self.current.cursor = (x, y);
+        Rc::make_mut(&mut self.current).cursor = (x, y);
     }
 
     pub fn keylast(&self) -> i64 {
@@ -770,17 +850,47 @@ impl InputState {
 
     /// 本帧快照。
     pub fn current(&self) -> &InputFrame {
-        &self.current
+        self.current.as_ref()
     }
 
     /// 上一帧快照。
     pub fn previous(&self) -> &InputFrame {
-        &self.prev
+        self.prev.as_ref()
     }
 
     /// 全部已有计数器码(确定顺序;诊断/覆盖普查用)。
     pub fn counter_codes(&self) -> impl Iterator<Item = u16> + '_ {
         self.counters.keys().copied()
+    }
+}
+
+/// 一帧的按下码集合:码 < 1024 用固定位图(128 字节,不分配),
+/// 超出部分落小表(手柄码 `384+n*36+…` 仍在位图内;这里是防御)。
+#[derive(Default)]
+struct DownSet {
+    bits: [u64; 16],
+    high: smallvec::SmallVec<[u16; 4]>,
+}
+
+impl DownSet {
+    #[inline]
+    fn insert(&mut self, code: u16) {
+        let index = usize::from(code);
+        if index < 1024 {
+            self.bits[index >> 6] |= 1u64 << (index & 63);
+        } else if !self.high.contains(&code) {
+            self.high.push(code);
+        }
+    }
+
+    #[inline]
+    fn contains(&self, code: u16) -> bool {
+        let index = usize::from(code);
+        if index < 1024 {
+            self.bits[index >> 6] & (1u64 << (index & 63)) != 0
+        } else {
+            self.high.contains(&code)
+        }
     }
 }
 

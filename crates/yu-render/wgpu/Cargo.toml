@@ -16,6 +16,8 @@ yu-render-core = { path = "../core" }
 yu-font = { path = "../../yu-font" }
 yu-gfx = { path = "../../yu-gfx" }
 yu-log = { path = "../../yu-log" }
+# #74:存活层集合用 FxHashSet(借用 ID,零克隆)。
+rustc-hash = "2"
 
 [dev-dependencies]
 sha2 = "0.10"

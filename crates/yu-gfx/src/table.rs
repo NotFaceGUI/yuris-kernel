@@ -85,15 +85,19 @@ impl ParamTable {
 
     /// 把事件参数解析成 `(参数名, 槽号, 值)`。名字缺失时保留槽号与 `None`,
     /// 由调用方产出 `gfx.arg.missing` 诊断(不静默猜)。
-    pub fn resolve<'a>(&'a self, command: &str, args: &'a [ArgValue]) -> Vec<ResolvedArg<'a>> {
-        args.iter()
-            .map(|a| ResolvedArg {
-                name: self.param_name(command, a.slot),
-                slot: a.slot,
-                value: &a.value,
-                offset: a.offset,
-            })
-            .collect()
+    pub fn resolve<'a>(
+        &'a self,
+        command: &str,
+        args: &'a [ArgValue],
+    ) -> impl Iterator<Item = ResolvedArg<'a>> + 'a {
+        // 名字表只查一次(旧实现每参数一次 `index_of` 哈希查找 + 一个 Vec)。
+        let names = self.names_for(command);
+        args.iter().map(move |a| ResolvedArg {
+            name: names.and_then(|n| n.get(usize::from(a.slot)).and_then(|x| x.as_deref())),
+            slot: a.slot,
+            value: &a.value,
+            offset: a.offset,
+        })
     }
 
     /// 命令表自身健全性检查:必需图形命令必须存在,命令名必须非空。

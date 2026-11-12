@@ -1067,7 +1067,7 @@ mod tests {
 
     fn sample() -> CompositorFrame {
         let mut f = CompositorFrame::new(3, Viewport::new(800, 600));
-        f.layers.push(Layer {
+        f.layers.push(std::sync::Arc::new(Layer {
             id: LayerId::new(b":/W0/ABC".to_vec()),
             seq: 1,
             z: 10,
@@ -1089,7 +1089,7 @@ mod tests {
             texture_status: LayerStatus::Executable,
             param_status: LayerStatus::Executable,
             extra: Default::default(),
-        });
+        }));
         f
     }
 

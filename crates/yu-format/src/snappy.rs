@@ -106,9 +106,15 @@ pub fn decompress(src: &[u8], expected_len: u32) -> Result<Vec<u8>, String> {
                     ));
                 }
                 let start = out.len() - offset;
-                for i in 0..len {
-                    let b = out[start + i];
-                    out.push(b);
+                // 重叠复制:源区间从 `start` 起,每轮可复制的上限 = 已产出区
+                // 到 `start` 的距离(首轮即 `offset`),产出后可用区翻倍。
+                // `extend_from_within` 一次 memcpy 搬整块,语义与逐字节
+                // `out.push(out[start + i])` 完全一致(自源到目标不重叠)。
+                let mut remaining = len;
+                while remaining > 0 {
+                    let chunk = remaining.min(out.len() - start);
+                    out.extend_from_within(start..start + chunk);
+                    remaining -= chunk;
                 }
             }
         }

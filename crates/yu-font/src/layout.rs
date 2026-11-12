@@ -43,25 +43,35 @@ impl TextLayout for HorizontalLayout {
         let mut out = Vec::with_capacity(text.chars().count());
         let mut pen = 0.0f32;
         let mut prev: Option<u16> = None;
+        // upem 与字符无关:原来每字符取一次(每次走 with_face_data),
+        // 这里只在需要 legacy kern 时取一次;取不到就整行不套 kern
+        // (与原来"该字符取不到就跳过该字符 kern"同效,因为失败与字符无关)。
+        let upem = if self.kerning == Kerning::Font {
+            source
+                .units_per_em(style.face)
+                .ok()
+                .filter(|&units| units != 0)
+        } else {
+            None
+        };
         for (i, ch) in text.chars().enumerate() {
+            // 每字符只取一次 gid:原来 kern 查询、advance、下一字符的
+            // prev 各调一次 `glyph_index`(每次走 with_face_data)。
+            let gid = source.glyph_index(style.face, ch).ok().flatten();
             if i > 0 && self.kerning == Kerning::Font {
-                if let (Some(left), Ok(Some(right))) = (prev, source.glyph_index(style.face, ch)) {
+                if let (Some(left), Some(right), Some(upem)) = (prev, gid, upem) {
                     if let Ok(k) = source.kerning_units(style.face, left, right) {
-                        if let Ok(upem) = source.units_per_em(style.face) {
-                            if upem != 0 {
-                                pen += f32::from(k) * f32::from(style.sy) / f32::from(upem);
-                            }
-                        }
+                        pen += f32::from(k) * f32::from(style.sy) / f32::from(upem);
                     }
                 }
             }
             out.push(PlacedGlyph { ch, x: pen, y: 0.0 });
-            if let Ok(Some(gid)) = source.glyph_index(style.face, ch) {
+            if let Some(gid) = gid {
                 if let Ok(adv) = source.advance_px(style.face, gid, style.sx, style.sy) {
                     pen += adv;
                 }
             }
-            prev = source.glyph_index(style.face, ch).ok().flatten();
+            prev = gid;
         }
         out
     }

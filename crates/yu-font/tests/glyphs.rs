@@ -89,6 +89,21 @@ fn missing_glyph_is_a_diag_not_a_panic() {
         .render_glyph('\u{10FFFF}', &style, StylePolicy::Strict)
         .unwrap_err();
     assert_eq!(err.code, code::font::GLYPH_MISSING);
+    // 第二次起走缺字负缓存:诊断内容必须与首次逐字段一致(文案/边界/code)。
+    let again = r
+        .render_glyph('\u{10FFFF}', &style, StylePolicy::Strict)
+        .unwrap_err();
+    assert_eq!(again, err, "negative glyph cache must return the same diag");
+    // 同一字符换字号也命中同一负缓存(字体数据未变,缺失与字号无关)。
+    let bigger = yu_font::TextStyle {
+        sx: 40,
+        sy: 40,
+        ..style
+    };
+    let third = r
+        .render_glyph('\u{10FFFF}', &bigger, StylePolicy::Strict)
+        .unwrap_err();
+    assert_eq!(third, err);
 }
 
 #[test]

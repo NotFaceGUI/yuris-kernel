@@ -8,13 +8,15 @@
 //! `+0x61c` 是 D3D 渲染目标(`0x413f8b` 传给 `SetRenderTarget`),
 //! `+0x21c` 是纹理对象、`+0x90` 是纹理句柄(会话 F REA 复核)。
 
+use std::sync::Arc;
+
 use crate::layer::Layer;
 
 /// 把组的离屏合成纹理作为普通层画到父层。
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupDraw {
     /// 组自身属性(`A`/`MODE`/`E`/`Z`/变换)。组层没有 `texture`。
-    pub layer: Layer,
+    pub layer: Arc<Layer>,
     /// 组的离屏目标 ID(等于组的 `LayerId`)。
     pub offscreen: crate::layer::LayerId,
 }

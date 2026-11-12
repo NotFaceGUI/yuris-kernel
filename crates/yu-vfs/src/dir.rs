@@ -11,6 +11,7 @@
 //! 无法折回,被跳过并计数留痕(`unencodable_name`),调用方可据此显式拒绝。
 
 use crate::{missing, Codec, DataSource, DirTree, Entry, LookupKey};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -30,7 +31,10 @@ pub struct DirSkip {
 pub struct DirSource {
     root: PathBuf,
     codec: Codec,
-    files: std::collections::BTreeMap<LookupKey, PathBuf>,
+    /// 归一键 → 真实路径。**只做精确查找,不参与输出迭代**(`list` 由
+    /// [`DirTree`] 派生),故用 `HashMap`;`LookupKey: Borrow<[u8]>` 支持
+    /// 按归一字节直查。
+    files: HashMap<LookupKey, PathBuf>,
     tree: DirTree,
     skipped: Vec<DirSkip>,
 }

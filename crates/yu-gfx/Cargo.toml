@@ -11,6 +11,8 @@ yu-format = { path = "../yu-format" }
 # 热路径集合/映射:prune 循环每帧反复建 `BTreeSet<CopyId>`(每个节点一次
 # 堆分配),`CGEND` 单次分配数直接由它决定。
 rustc-hash = "2"
+# #22:单字形 1–2 字节,内联存储免掉每字符一次堆分配(TextGlyph.bytes)。
+smallvec = "1"
 
 [dev-dependencies]
 yu-vfs = { path = "../yu-vfs" }

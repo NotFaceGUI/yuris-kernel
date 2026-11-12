@@ -712,11 +712,11 @@ impl Renderer {
     fn render(
         &mut self,
         frame: &CompositorFrame,
-    ) -> Result<(Arc<Surface>, RenderReport, Option<(u64, u32, u32)>), Failure> {
+    ) -> Result<(Arc<Surface>, Arc<RenderReport>, Option<(u64, u32, u32)>), Failure> {
         match self {
             Renderer::Soft(renderer) => {
                 let out = renderer.render_frame(frame);
-                Ok((out.surface, out.report, None))
+                Ok((out.surface, Arc::new(out.report), None))
             }
             Renderer::Wgpu {
                 renderer, check, ..
@@ -733,7 +733,7 @@ impl Renderer {
                         streaming.screen_width,
                         streaming.screen_height,
                     ));
-                    return Ok((streaming.surface, streaming.report, screen));
+                    return Ok((streaming.surface, Arc::new(streaming.report), screen));
                 }
                 // 首帧(或对账帧):走精确路径,先与软后端对账。
                 let out = renderer
@@ -744,7 +744,7 @@ impl Renderer {
                     compare_reports(&soft_out.report, &out.report)?;
                     *check = None;
                 }
-                Ok((out.surface, out.report, None))
+                Ok((out.surface, Arc::new(out.report), None))
             }
         }
     }
@@ -788,7 +788,7 @@ pub struct Engine {
     ///
     /// `EngineOptions::render == false` 时逐帧复用它(引用计数克隆,不是
     /// 整帧拷贝),从而在不改 VM 语义的前提下把渲染整条链路摘掉。
-    last_render_out: Option<(Arc<Surface>, RenderReport, Option<(u64, u32, u32)>)>,
+    last_render_out: Option<(Arc<Surface>, Arc<RenderReport>, Option<(u64, u32, u32)>)>,
     viewport: Viewport,
     frame: u64,
     timeline: InputTimeline,
@@ -806,7 +806,7 @@ pub struct Engine {
     /// 宿主据此直接采样引擎屏幕纹理呈现,不再走「读回 → 重上传」。
     last_screen: Option<(u64, u32, u32)>,
     last_report: FrameReport,
-    last_render: Option<RenderReport>,
+    last_render: Option<Arc<RenderReport>>,
     /// 上一帧 `SAVE` 抓帧器回放耗时(毫秒;`tick`/`render` 之外的墙钟)。
     last_capture_ms: f64,
     /// 上一帧 `GfxState::frame()` 合成帧装配耗时(毫秒;含在 `tick_ms` 内)。
@@ -1145,7 +1145,7 @@ impl Engine {
 
     /// 最近一帧的完整后端报告(跳过项/缺失资产/文本计数,诊断用)。
     pub fn render_report(&self) -> Option<&RenderReport> {
-        self.last_render.as_ref()
+        self.last_render.as_deref()
     }
 
     /// 上一帧 `SAVE` 抓帧器回放耗时(毫秒;`tick`/`render` 之外的墙钟)。
@@ -1549,7 +1549,9 @@ impl Engine {
         // 文本状态快照在本 tick 的 VM 语义全部结束后取(之后只同步宿主
         // 光标/事件,不再改 VM 文本);放到这里也避免 `vm` 借用跨到
         // `self.sync_input()`/`self.sync_movie_overlay()`。
-        let text_snapshot = vm.text_state();
+        // #4:先读输出模式;手动模式(ERIS 正文走 CGACT[TEXT])只用
+        // `clear_text()`,不必构造 TextSnapshot 的三份 Vec 克隆。
+        let text_snapshot = (vm.text_output_mode() == 1).then(|| vm.text_state());
         if let Some((x, y)) = warp {
             self.cursor = (x.unwrap_or(cursor_x), y.unwrap_or(cursor_y));
             self.sync_input();
@@ -1627,10 +1629,10 @@ impl Engine {
                 .as_ref()
                 .ok_or_else(|| Failure::runtime("engine 未启动"))?;
             let mut gfx = state.borrow_mut();
-            if text_snapshot.output_mode == 1 {
+            if let Some(text_snapshot) = text_snapshot.as_ref() {
                 // 自动模式:引擎自己绘制 `+0x38`;按 WAIT 逐字推进
                 // (`FUN_004046fc`/`FUN_00404914`),宿主/后端不自建计时器。
-                gfx.sync_text_state(&text_snapshot);
+                gfx.sync_text_state(text_snapshot);
                 gfx.set_text_reveal(Some(text_snapshot.reveal_chars));
             } else {
                 // 手动模式:官方 `FUN_004046fc` 直接清+恢复,不调用
@@ -1681,7 +1683,7 @@ impl Engine {
                     }
                 }
             }
-            for draw in &frame.text_draws {
+            for draw in frame.text_draws.iter() {
                 let Some(image) = &draw.image else { continue };
                 if !self.renderer.asset_cached(&image.asset)
                     && seen.insert(image.asset.as_slice())
@@ -1726,7 +1728,7 @@ impl Engine {
                         .ok_or_else(|| Failure::runtime("no cached render output"))?,
                     self.last_render_out
                         .as_ref()
-                        .map(|out| out.1.clone())
+                        .map(|out| Arc::clone(&out.1))
                         .ok_or_else(|| Failure::runtime("no cached render output"))?,
                     self.last_render_out.as_ref().and_then(|out| out.2.clone()),
                     false,

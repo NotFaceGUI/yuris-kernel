@@ -246,6 +246,11 @@ impl Layer {
         self.stream.borrow_mut()
     }
 
+    /// 是否持有解码流(混音前判定容器层是否真的没有可混样本)。
+    pub(crate) fn has_stream(&self) -> bool {
+        self.stream.borrow().is_some()
+    }
+
     pub(crate) fn paused(&self) -> bool {
         self.paused
     }
@@ -412,6 +417,33 @@ impl QueryField {
     }
 }
 
+/// 引擎 SOUNDINFO 检查顺序的字段全集(`QueryField::order` 的逆映射,
+/// 下标 = 顺序号 0..=21)。查询用位集按此序迭代,见 [`SoundState::query`]。
+const QUERY_FIELDS_IN_ORDER: [QueryField; 22] = [
+    QueryField::Exist,
+    QueryField::E,
+    QueryField::Play,
+    QueryField::Pause,
+    QueryField::Volume,
+    QueryField::Pan,
+    QueryField::Pitch,
+    QueryField::FileType,
+    QueryField::File,
+    QueryField::Start,
+    QueryField::Restart,
+    QueryField::End,
+    QueryField::Loop,
+    QueryField::LoopCount,
+    QueryField::Time,
+    QueryField::TotalTime,
+    QueryField::Channel,
+    QueryField::Bit,
+    QueryField::Sampling,
+    QueryField::DataLeft,
+    QueryField::DataRight,
+    QueryField::Codec,
+];
+
 /// 声音解码计数(逐帧增量;`take_decode_stats` 取走即清零)。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DecodeStats {
@@ -494,6 +526,11 @@ pub struct SoundState {
     pub(crate) movie: std::cell::RefCell<crate::movie::MovieAudio>,
     /// 调试用:混音输出的原始样本(诊断爆音时抓波形分析;`None` = 未抓取)。
     pub(crate) debug_capture: std::sync::Mutex<Option<Vec<f32>>>,
+    /// 抓取开关的无锁快照(`debug_capture` 的伴生标志)。
+    ///
+    /// 抓取默认关闭,但音频回调每块都要加/解一次互斥量才能发现"没在抓"。
+    /// `render` 先 relaxed 读本标志,只有抓取中才去碰锁。
+    pub(crate) capture_active: std::sync::atomic::AtomicBool,
     /// WAVE/ACM 整段装载次数(逐帧增量)。
     full_decodes: u64,
     /// 本帧落在 tick 线程的解码耗时(装载 + 预取;逐帧增量)。
@@ -505,6 +542,11 @@ const DIAG_CAP: usize = 4096;
 
 /// 解码缓存上限(采样字节,含帧副本)。超出后不再插入新条目(已有命中仍生效)。
 const PCM_CACHE_CAP: usize = 96 * 1024 * 1024;
+
+/// 候选名解析缓存条目上限。键是脚本原始 `FILE` 字节;正常作品是几百条
+/// 量级,上限只防病态脚本用无限变体把表撑大。满了清空重来:命中率回落
+/// 只影响性能,探测结果与诊断文本不变。
+const RESOLVE_CACHE_CAP: usize = 4096;
 
 impl SoundState {
     pub fn new(loader: Box<dyn SoundLoader>) -> Self {
@@ -527,6 +569,7 @@ impl SoundState {
             frame: 0,
             stream_counters: Arc::new(StreamCounters::default()),
             debug_capture: std::sync::Mutex::new(None),
+            capture_active: std::sync::atomic::AtomicBool::new(false),
             clipped_samples: std::sync::atomic::AtomicU64::new(0),
             rt_silence_samples: std::sync::atomic::AtomicU64::new(0),
             rt_miss_samples: std::sync::atomic::AtomicU64::new(0),
@@ -1047,25 +1090,19 @@ impl SoundState {
         }
         let should_prefetch = layer.state.audible() && !layer.paused;
         let position = layer.position_ms;
-        self.layers.insert(key.clone(), layer);
         // 命令时刻就填解码窗口:否则要等下一个 tick(最多 16ms),而音频回调
         // 每 2.9ms 就消费一块 —— 启动/首播必然先欠载一段(实测"刚开始
-        // 爆音最严重")。这里同步补一次,回调立刻有数据可读。
+        // 爆音最严重")。
+        //
+        // 先在局部层上预取,再 move key + layer 进表:省掉一次 `key` 克隆
+        // 与一次表查找。两步都在命令处理内同步完成,外部观察不到顺序差
+        // (预取只写该层自己的解码窗口)。
         if should_prefetch {
-            self.prefetch_layer_at(&key, position);
+            self.tick_decode_us = self
+                .tick_decode_us
+                .saturating_add(prefetch_stream(&layer, position));
         }
-    }
-
-    /// 给单个层按给定位置预取(tick/命令时刻共用)。
-    fn prefetch_layer_at(&mut self, id: &[u8], position_ms: i64) {
-        let started = std::time::Instant::now();
-        if let Some(layer) = self.layers.get(id) {
-            if let Some(stream) = layer.stream.borrow_mut().as_mut() {
-                stream.prefetch(position_ms, LEAD_MS);
-            }
-        }
-        let us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        self.tick_decode_us = self.tick_decode_us.saturating_add(us);
+        self.layers.insert(key, layer);
     }
 
     /// 装载。返回“文件解析是否成功”（不代表解码成功）。
@@ -1079,43 +1116,61 @@ impl SoundState {
         // 2. 尾部已是 `.wav`/`.ogg`（`0x8079dc/0x8079e4`）则原样使用；
         // 3. 否则依次追加 `.ogg`、`.wav` 探测；
         // 4. 最终候选名被复制进声音对象 `+0x000`，即 `SOUNDINFO[FILE]` 来源。
-        let base = normalize_name(file);
-        let candidates = probe_names(&base);
-        // 先查候选名解析缓存:命中就只读那一个,不再逐个探测。
+        //
+        // 候选名构造(小写归一 + 最多 3 个候选)只在**未命中缓存**时做:
+        // 菜单帧同一批 FILE 逐帧重复,而这一步是每条 SOUND 的固定成本
+        // (实测单条 17~86µs,主要是压缩条目探测)。"未找到"诊断里的候选名
+        // 用同一函数重算,文案逐字节不变。
         let cached = self.resolve_cache.get(file).cloned();
         let mut found: Option<(Vec<u8>, Vec<u8>)> = None;
+        let mut probed: Option<Vec<Vec<u8>>> = None;
+        let mut probe = false;
         match cached {
             Some(Some(name)) => {
                 self.resolve_cache_hits = self.resolve_cache_hits.saturating_add(1);
                 match self.loader.load(&name) {
                     Ok(Some(bytes)) => found = Some((name, bytes)),
-                    // 缓存里的名字这次读不出来(数据目录被外部改动):退回
-                    // 完整探测,并在下面用新结果覆盖缓存。
-                    _ => {}
+                    _ => {
+                        // 缓存里的名字这次读不出来(数据目录被外部改动/文件
+                        // 被替换):清掉过期缓存项,按未命中重新走完整候选
+                        // 探测(旧实现同样会落到探测路径,不静默改用过期
+                        // 内容)。
+                        self.resolve_cache.remove(file);
+                        probe = true;
+                    }
                 }
             }
             Some(None) => {
                 // 已确认全不中:直接走「未找到」路径,不重复探测。
                 self.resolve_cache_hits = self.resolve_cache_hits.saturating_add(1);
             }
-            None => {
-                for name in &candidates {
-                    match self.loader.load(name) {
-                        Ok(Some(bytes)) => {
-                            found = Some((name.clone(), bytes));
-                            break;
-                        }
-                        Ok(None) => {}
-                        Err(d) => {
-                            self.report(d);
-                        }
+            None => probe = true,
+        }
+        if probe {
+            let candidates = load_candidates(file);
+            for name in &candidates {
+                match self.loader.load(name) {
+                    Ok(Some(bytes)) => {
+                        found = Some((name.clone(), bytes));
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(d) => {
+                        self.report(d);
                     }
                 }
-                self.resolve_cache
-                    .insert(file.to_vec(), found.as_ref().map(|(name, _)| name.clone()));
             }
+            // 上限只防脚本里 FILE 取无限变体;缓存清空只影响性能,
+            // 不改变下次探测的结果(数据目录在本进程内不变)。
+            if self.resolve_cache.len() >= RESOLVE_CACHE_CAP {
+                self.resolve_cache.clear();
+            }
+            self.resolve_cache
+                .insert(file.to_vec(), found.as_ref().map(|(name, _)| name.clone()));
+            probed = Some(candidates);
         }
         let Some((resolved, bytes)) = found else {
+            let candidates = probed.unwrap_or_else(|| load_candidates(file));
             // 无候选文件：引擎先执行过 type 0xe（仅当 state != 0）：
             // 清 `+0x000`、Stop、释放 PCM/缓冲、清 START/RESTART、state=0；
             // **保留** `+0x105/+0x107/+0x120/+0x118/PAN/PITCH/LOOP/LOOPCOUNT`。
@@ -1239,7 +1294,10 @@ impl SoundState {
         }
     }
 
-    /// PCM 缓存写入(WAVE/ACM;超出上限时按 key 序淘汰最旧条目)。
+    /// PCM 缓存写入(WAVE/ACM;超出上限时按归一键字典序淘汰)。
+    ///
+    /// 注:淘汰序是 **key 的字节字典序**,不是"最旧"(BTreeMap 没有插入序);
+    /// 这只是内部缓存,淘汰谁不影响任何可观察输出。
     fn cache_put(&mut self, key: Vec<u8>, pcm: Arc<Pcm>) {
         let bytes_len = pcm.samples.len() * std::mem::size_of::<i16>();
         if let Some(old) = self.pcm_cache.remove(&key) {
@@ -1251,14 +1309,14 @@ impl SoundState {
             return;
         }
         while self.pcm_cache_bytes + bytes_len > PCM_CACHE_CAP {
-            let Some(victim) = self.pcm_cache.keys().next().cloned() else {
+            // `pop_first` 直接移除并交出条目,不再 `keys().next().cloned()`
+            // 复制一份 key 再二次查找。
+            let Some((_, old)) = self.pcm_cache.pop_first() else {
                 break;
             };
-            if let Some(old) = self.pcm_cache.remove(&victim) {
-                self.pcm_cache_bytes = self
-                    .pcm_cache_bytes
-                    .saturating_sub(old.samples.len() * std::mem::size_of::<i16>());
-            }
+            self.pcm_cache_bytes = self
+                .pcm_cache_bytes
+                .saturating_sub(old.samples.len() * std::mem::size_of::<i16>());
         }
         self.pcm_cache_bytes += bytes_len;
         self.pcm_cache.insert(key, pcm);
@@ -1272,13 +1330,24 @@ impl SoundState {
     pub fn start_debug_capture(&self, samples: usize) {
         if let Ok(mut slot) = self.debug_capture.lock() {
             *slot = Some(Vec::with_capacity(samples.min(1 << 22)));
+            // 槽先就位再开门:回调看到 true 时一定拿得到新缓冲(拿不到也只
+            // 是少抓一块,不会误抓旧数据)。
+            self.capture_active
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     /// 取走抓到的样本(未抓取时 `None`)。
     #[must_use]
     pub fn take_debug_capture(&self) -> Option<Vec<f32>> {
-        self.debug_capture.lock().ok()?.take()
+        let taken = match self.debug_capture.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => None,
+        };
+        // 无论槽是否可用都关门:否则 poisoned 路径会让回调永久多锁一次。
+        self.capture_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        taken
     }
 
     pub fn clipped_samples(&self) -> u64 {
@@ -1368,20 +1437,31 @@ impl SoundState {
                 "SOUNDINFO 缺查询字段",
             ));
         }
-        let mut ordered: Vec<QueryField> = fields.to_vec();
-        ordered.sort_by_key(|f| f.order());
-        ordered.dedup();
-        // EXIST/E/PLAY/PAUSE/VOLUME/PAN/PITCH 是引擎的短路字段。
-        let effective: Vec<QueryField> = match ordered.iter().copied().find(|f| f.order() <= 6) {
-            Some(first) => vec![first],
-            None => ordered.clone(),
-        };
-        if effective.len() > 1 {
+        // 请求字段集用固定 22 位位集表示(位号 = 引擎检查顺序):去重、
+        // 排序与短路字段选择都不再分配/排序临时 Vec。`order()` 对每个
+        // 变体唯一,位集与"排序后去重"逐项等价。
+        let mut requested = [false; QUERY_FIELDS_IN_ORDER.len()];
+        for field in fields {
+            requested[usize::from(field.order())] = true;
+        }
+        // EXIST/E/PLAY/PAUSE/VOLUME/PAN/PITCH 是引擎的短路字段:
+        // 请求里有任一命中,只执行序最靠前的那个;否则按序全部执行。
+        let mut effective = [false; QUERY_FIELDS_IN_ORDER.len()];
+        let effective_count;
+        if let Some(first) = (0..=6).find(|&index| requested[index]) {
+            effective[first] = true;
+            effective_count = 1;
+        } else {
+            effective = requested;
+            effective_count = requested.iter().filter(|&&on| on).count();
+        }
+        if effective_count > 1 {
             self.report(error::info(
                 code::QUERY_MULTI,
                 "SOUNDINFO 多字段同调（无短路字段）：按引擎检查顺序逐个写 LET，最后者胜出",
             ));
         }
+        let has_file = requested[usize::from(QueryField::File.order())];
         // SOUNDINFO 处理体同样先用 `[0x801718]` 前缀规范化（`0x44f500`），
         // 所以脚本写 `BGM/A1`、`BGM/`、`:/S0/BGM/A1` 都落到同一节点。
         let Some(norm) = crate::path::normalize(id) else {
@@ -1392,7 +1472,7 @@ impl SoundState {
                     display(id)
                 ),
             ));
-            return Ok(if ordered.contains(&QueryField::File) {
+            return Ok(if has_file {
                 Value::Str(Vec::new())
             } else {
                 Value::Int(0)
@@ -1400,7 +1480,7 @@ impl SoundState {
         };
         let Some(layer) = self.layers.get(&norm.key) else {
             // 引擎缺层分支：把 LET 写成 0（字符串目标写空串）。
-            return Ok(if ordered.contains(&QueryField::File) {
+            return Ok(if has_file {
                 Value::Str(Vec::new())
             } else {
                 Value::Int(0)
@@ -1410,7 +1490,11 @@ impl SoundState {
         // DATALEFT/DATARIGHT 在播放光标按需取帧(可能触发一次懒定位);
         // 这部分是 tick 内的真实解码成本,记进 tick 账单。
         let mut query_decode_us = 0u64;
-        for field in effective {
+        for (index, &on) in effective.iter().enumerate() {
+            if !on {
+                continue;
+            }
+            let field = QUERY_FIELDS_IN_ORDER[index];
             value = Some(match field {
                 QueryField::Exist => Value::Int(i64::from(layer.file_type() != FileType::None)),
                 QueryField::E => Value::Int(i64::from(layer.enabled)),
@@ -1828,6 +1912,23 @@ pub fn probe_names(file: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+/// `load_file` 的候选名序列:先按引擎规则归一,再按扩展名探测序展开。
+///
+/// 命中 `resolve_cache` 时不调用本函数;未找到诊断需要重算同一序列,
+/// 保证文案里的"已尝试: …"逐字节一致。
+fn load_candidates(file: &[u8]) -> Vec<Vec<u8>> {
+    probe_names(&normalize_name(file))
+}
+
+/// 在单个层的流上按给定位置同步预取,返回耗时(微秒)。
+fn prefetch_stream(layer: &Layer, position_ms: i64) -> u64 {
+    let started = std::time::Instant::now();
+    if let Some(stream) = layer.stream.borrow_mut().as_mut() {
+        stream.prefetch(position_ms, LEAD_MS);
+    }
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 /// START/RESTART 的引擎边界（REA `0x4251d8/0x425238`）：
 /// 负值保留（延迟）；`>= total` 写 0；否则原值。
 fn normalize_start(value: i64, total_ms: i64) -> i64 {
@@ -1850,4 +1951,20 @@ fn display(bytes: &[u8]) -> String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `QUERY_FIELDS_IN_ORDER` 必须是 `QueryField::order()` 的逆映射:
+    /// 位集下标即引擎检查顺序,错位会让 SOUNDINFO 的执行顺序/短路判定
+    /// 与 `0x44f4bc` 不符。
+    #[test]
+    fn query_field_order_is_an_inverse_mapping() {
+        assert_eq!(QUERY_FIELDS_IN_ORDER.len(), 22);
+        for (index, field) in QUERY_FIELDS_IN_ORDER.iter().enumerate() {
+            assert_eq!(usize::from(field.order()), index, "{field:?}");
+        }
+    }
 }

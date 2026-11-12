@@ -361,6 +361,31 @@ pub trait GraphicsHost {
     /// 同步应用一条事件(仅 FrameStart/FrameEnd/Text/Graphics|Window DomainCall)。
     fn apply_event(&mut self, ev: &VmEvent);
 
+    /// 同步应用一条域事件(**借用形态**;`record_events=false` 且事件只被
+    /// 本宿主消费时,VM 走这个入口,省掉命令名与参数向量的克隆)。
+    ///
+    /// 默认实现构造与 [`VmEvent::DomainCall`] 逐字段相同的临时事件后转调
+    /// [`Self::apply_event`] —— 不覆写时行为与旧路径完全一致;镜像宿主可覆写
+    /// 以直接消费借用数据。
+    fn apply_domain(
+        &mut self,
+        domain: Domain,
+        name: &str,
+        args: &[ArgValue],
+        frame: u64,
+        script: Option<u32>,
+        pc: Option<u32>,
+    ) {
+        self.apply_event(&VmEvent::DomainCall {
+            frame,
+            domain,
+            name: name.to_string(),
+            args: args.to_vec(),
+            script,
+            pc,
+        });
+    }
+
     /// 回答一条 INFO 查询;返回写入 `LET` 的值。
     ///
     /// 单值返回:查询方必须只请求一个字段;多字段顺序未取证时返回错误,

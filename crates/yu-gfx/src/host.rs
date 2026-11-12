@@ -26,7 +26,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use yu_log::Diag;
-use yu_rt::event::{ArgValue, CapturedImage, GraphicsHost, VmEvent};
+use yu_rt::event::{ArgValue, CapturedImage, Domain, GraphicsHost, VmEvent};
 use yu_rt::value::Value;
 
 use crate::state::{GfxState, TextureSampler};
@@ -87,6 +87,23 @@ impl GfxHost {
 impl GraphicsHost for GfxHost {
     fn apply_event(&mut self, ev: &VmEvent) {
         self.state.borrow_mut().on_event(ev);
+    }
+
+    /// 零拷贝消费借用参数(C-02):`emit_domain_borrowed` 传进来的
+    /// name/args 直接分派,不再构造 owned `DomainCall` 事件。
+    /// 与默认实现的唯一差别是省掉 `name.to_string()` + `args.to_vec()`。
+    fn apply_domain(
+        &mut self,
+        domain: Domain,
+        name: &str,
+        args: &[ArgValue],
+        frame: u64,
+        script: Option<u32>,
+        pc: Option<u32>,
+    ) {
+        self.state
+            .borrow_mut()
+            .on_domain(domain, name, args, frame, script, pc);
     }
 
     fn query(&mut self, command: &str, args: &[ArgValue]) -> Result<Value, Diag> {

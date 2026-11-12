@@ -241,10 +241,11 @@ pub(crate) fn plan(
     surfaces.begin_frame(frame.frame);
     let materialized = targets.materialized_ids();
     targets.prune_snapshots(&live_snapshots(frame, &materialized), pipelines);
+    // #74:存活层集合只建一次(借用 ID,零克隆),三处消费共用。
+    let live_ids: rustc_hash::FxHashSet<&LayerId> =
+        frame.layers.iter().map(|layer| &layer.id).collect();
     {
-        let live_layers: BTreeSet<LayerId> =
-            frame.layers.iter().map(|layer| layer.id.clone()).collect();
-        targets.prune_composites(&live_layers, pipelines);
+        targets.prune_composites(&live_ids, pipelines);
         let mut live_offscreen: BTreeSet<LayerId> = frame
             .passes
             .iter()
@@ -260,8 +261,7 @@ pub(crate) fn plan(
         }
         targets.prune_offscreen(&live_offscreen, pipelines);
     }
-    let live_text_layers: BTreeSet<LayerId> = frame.layers.iter().map(|l| l.id.clone()).collect();
-    for id in text_uploads.retain(&live_text_layers) {
+    for id in text_uploads.retain(&live_ids) {
         gpu.remove(id, pipelines);
     }
     let timing = tuning.render_timing;
@@ -394,7 +394,7 @@ pub(crate) fn plan(
     //
     // 用 `&Layer` 而不是 clone:`frame` 在 `plan()` 期间只读。
     let layer_index: HashMap<&LayerId, &Layer> =
-        frame.layers.iter().map(|layer| (&layer.id, layer)).collect();
+        frame.layers.iter().map(|layer| (&layer.id, layer.as_ref())).collect();
 
     // ---- 0.5 延迟物化补账 ----
     //
@@ -479,6 +479,7 @@ pub(crate) fn plan(
                     let result = apply_image(
                         ctx,
                         frame,
+                        &layer_index,
                         textures,
                         gpu,
                         pipelines,
@@ -515,6 +516,7 @@ pub(crate) fn plan(
                     let result = apply_copy(
                         ctx,
                         frame,
+                        &layer_index,
                         textures,
                         gpu,
                         pipelines,
@@ -561,6 +563,7 @@ pub(crate) fn plan(
     let (text_cpu_base_us, text_cpu_info, text_gpu_stats) = apply_text(
         ctx,
         frame,
+        &layer_index,
         textures,
         gpu,
         pipelines,
@@ -707,8 +710,7 @@ pub(crate) fn plan(
     let t_text = mark_text_done - mark_text;
 
     // 帧末:把不再被引用的表面纹理放回池(快照/文本持有 `Rc` ⇒ 自动钉住)。
-    let live: BTreeSet<LayerId> = frame.layers.iter().map(|l| l.id.clone()).collect();
-    surfaces.end_frame(&live);
+    surfaces.end_frame(&live_ids);
     // 旧内容纹理回收:层当前内容之外、本帧写入过的纹理都交回池。
     let mut live_ids: BTreeSet<u64> = BTreeSet::new();
     for layer in &frame.layers {
@@ -803,6 +805,7 @@ pub(crate) fn plan(
 fn apply_image(
     ctx: &GpuContext,
     frame: &CompositorFrame,
+    layers: &HashMap<&LayerId, &Layer>,
     textures: &mut TextureStore,
     gpu: &mut TextureCache,
     pipelines: &mut PipelineCache,
@@ -826,6 +829,7 @@ fn apply_image(
     let token = base_token(
         frame,
         targets,
+        layers,
         target,
         // 原地加工且目标层已被 `CGEND` 删除:基面身份按命令时刻纹理算,
         // 与重放时 `resolve_target_base` 的 fallback 保持一致。
@@ -842,7 +846,7 @@ fn apply_image(
     // 源层/第二源层的基面身份:与目标同一规则(读路径也校验,不只是写路径)。
     {
         let mut sync = |id: &LayerId, fallback: Option<&TextureRef>| {
-            let token = base_token(frame, targets, id, fallback);
+            let token = base_token(frame, targets, layers, id, fallback);
             if surfaces.sync_base(id, token) {
                 contents.remove(id);
                 chain_index.insert(id.clone(), 0);
@@ -857,6 +861,7 @@ fn apply_image(
     let source = resolve_source(
         ctx,
         frame,
+        layers,
         textures,
         gpu,
         targets,
@@ -876,6 +881,7 @@ fn apply_image(
         Some(id) => Some(resolve_source(
             ctx,
             frame,
+            layers,
             textures,
             gpu,
             targets,
@@ -1056,6 +1062,7 @@ fn resolve_target_base(
 fn resolve_source(
     ctx: &GpuContext,
     frame: &CompositorFrame,
+    layers: &HashMap<&LayerId, &Layer>,
     textures: &mut TextureStore,
     gpu: &mut TextureCache,
     targets: &TargetSet,
@@ -1067,7 +1074,7 @@ fn resolve_source(
     consumer_seq: u64,
     missing: &'static str,
 ) -> Result<Content, String> {
-    let layer = frame.layers.iter().find(|layer| &layer.id == id);
+    let layer = layers.get(id).copied();
     // 命令时刻的纹理与活层不一致(被 `CGEND` 删除,或被同名 `CG[X]`
     // 重建成空层):官方 COPY 已经读走旧像素 ⇒ 必须按 fallback 重放。
     let replaced = match (layer, fallback) {
@@ -1082,7 +1089,7 @@ fn resolve_source(
         // 但消费点位于整条链之后时,常驻表面就是命令时刻像素,从这里取回;
         // 若加工链越过消费点,帧首的 `force_materialize` 会改为逐条重建,
         // 这里的 `consumer_seq` 只是最后一道防线(DIV-GFX-053 的读侧)。
-        let base = base_token(frame, targets, id, fallback);
+        let base = base_token(frame, targets, layers, id, fallback);
         if let Some(content) = surfaces.applied_content_before(id, base, consumer_seq) {
             return Ok(content.clone());
         }
@@ -2112,6 +2119,7 @@ fn finish_content(
 fn apply_copy(
     ctx: &GpuContext,
     frame: &CompositorFrame,
+    layers: &HashMap<&LayerId, &Layer>,
     textures: &mut TextureStore,
     gpu: &mut TextureCache,
     pipelines: &mut PipelineCache,
@@ -2138,7 +2146,7 @@ fn apply_copy(
         return Ok(());
     }
     if let CopySource::Layer(id) = &copy.source {
-        let token = base_token(frame, targets, id, copy.source_texture.as_ref());
+        let token = base_token(frame, targets, layers, id, copy.source_texture.as_ref());
         if surfaces.sync_base(id, token) {
             contents.remove(id);
         }
@@ -2148,6 +2156,7 @@ fn apply_copy(
             let content = resolve_source(
                 ctx,
                 frame,
+                layers,
                 textures,
                 gpu,
                 targets,
@@ -2164,7 +2173,7 @@ fn apply_copy(
             } else {
                 // 冻结文本:命令时刻已画的字形进快照(DIV-GFX-058)。
                 let raw = surfaces.raw_content(id).unwrap_or_else(|| content.clone());
-                let (cpu, _info) = content_cpu(ctx, frame, textures, contents, id, &raw)?;
+                let (cpu, _info) = content_cpu(ctx, layers, textures, contents, id, &raw)?;
                 let refs: Vec<&yu_gfx::TextDraw> = copy.texts.iter().collect();
                 let images = text_images_for_draws(textures, &refs);
                 let (composed, stats) = text.compose_layer_assets(&cpu, &copy.texts, None, &images);
@@ -2220,7 +2229,8 @@ fn apply_copy(
                 if let Some(snapshot) = frame.screen_snapshots.get(&copy.id) {
                     Content::identity(
                         screen_snapshot_content(
-                            ctx, frame, snapshot, textures, gpu, pipelines, targets, surfaces,
+                            ctx, frame, layers, snapshot, textures, gpu, pipelines, targets,
+                            surfaces,
                             contents, bases, writes, text, copy.id, tuning,
                         )?,
                         0,
@@ -2488,6 +2498,7 @@ fn backbuffer_content(
 fn screen_snapshot_content(
     ctx: &GpuContext,
     frame: &CompositorFrame,
+    layers: &HashMap<&LayerId, &Layer>,
     snapshot: &ScreenSnapshot,
     textures: &mut TextureStore,
     gpu: &mut TextureCache,
@@ -2554,7 +2565,7 @@ fn screen_snapshot_content(
     // 一律退回快照自己记录的纹理/快照像素,禁止把新场景内容灌进旧快照
     // (2026-11-03 真机:旧 CGS 幕布闪出当前场景不存在的立绘)。
     for snap_layer in &snapshot.layers {
-        if let Some(live) = frame.layers.iter().find(|live| live.id == snap_layer.id) {
+        if let Some(live) = layers.get(&snap_layer.id).copied() {
             if live.texture != snap_layer.texture {
                 snap_contents.remove(&snap_layer.id);
             }
@@ -2573,10 +2584,8 @@ fn screen_snapshot_content(
         let Some(snap_layer) = snapshot.layers.iter().find(|layer| &layer.id == id) else {
             continue;
         };
-        if frame
-            .layers
-            .iter()
-            .find(|live| live.id == *id)
+        if layers
+            .get(id)
             .is_some_and(|live| live.texture != snap_layer.texture)
         {
             continue;
@@ -2597,9 +2606,16 @@ fn screen_snapshot_content(
         let mut uploads = TextUploads::default();
         let mut no_gpu: Option<crate::text_gpu::TextGpuRenderer> = None;
         let mut jobs = Vec::new();
+        // `snap_frame` 自己的层表(与活帧不同:含快照时刻已删除的层)。
+        let snap_layers: HashMap<&LayerId, &Layer> = snap_frame
+            .layers
+            .iter()
+            .map(|layer| (&layer.id, layer.as_ref()))
+            .collect();
         apply_text(
             ctx,
             &snap_frame,
+            &snap_layers,
             textures,
             gpu,
             pipelines,
@@ -2678,7 +2694,7 @@ fn compose_group_content(
         // 本函数可能被传入 `snap_frame`(屏幕快照的临时帧),所以索引必须
         // 按**当前 `frame`** 建,不能借用外层的。
         let group_layers: HashMap<&LayerId, &Layer> =
-            frame.layers.iter().map(|layer| (&layer.id, layer)).collect();
+            frame.layers.iter().map(|layer| (&layer.id, layer.as_ref())).collect();
         let mut planner = Planner {
             ctx,
             frame,
@@ -2733,7 +2749,7 @@ impl TextUploads {
     }
 
     /// 只保留仍存活的层,返回被释放的纹理 id。
-    pub fn retain(&mut self, live: &BTreeSet<LayerId>) -> Vec<u64> {
+    pub fn retain(&mut self, live: &rustc_hash::FxHashSet<&LayerId>) -> Vec<u64> {
         let mut removed = Vec::new();
         self.layers.retain(|id, (_, tex)| {
             if live.contains(id) {
@@ -2879,7 +2895,7 @@ struct CpuBaseInfo {
 /// 文本合成的 CPU 基面像素(纯基图且可 CPU 解析时零读回)。
 fn content_cpu(
     ctx: &GpuContext,
-    frame: &CompositorFrame,
+    layers: &HashMap<&LayerId, &Layer>,
     textures: &mut TextureStore,
     contents: &Contents,
     id: &LayerId,
@@ -2887,7 +2903,7 @@ fn content_cpu(
 ) -> Result<(Texture, CpuBaseInfo), String> {
     let mut info = CpuBaseInfo::default();
     let mut texture = if !contents.contains_key(id) {
-        let layer = frame.layers.iter().find(|layer| &layer.id == id);
+        let layer = layers.get(id).copied();
         match layer.map(|layer| &layer.texture) {
             Some(TextureRef::Asset(key)) => {
                 let t = std::time::Instant::now();
@@ -2982,6 +2998,7 @@ fn text_images_for_draws(
 fn apply_text(
     ctx: &GpuContext,
     frame: &CompositorFrame,
+    layers: &HashMap<&LayerId, &Layer>,
     textures: &mut TextureStore,
     gpu: &mut TextureCache,
     pipelines: &mut PipelineCache,
@@ -3005,20 +3022,28 @@ fn apply_text(
             ids.insert(target.clone());
         }
     }
-    // 文本层查找一次建索引:逐 id 线性扫 `frame.layers` 是
-    // `文本层数 × 层数`(存档界面 18 个文本层 × 541 层)。
-    let text_layer_index: HashMap<&LayerId, &Layer> =
-        frame.layers.iter().map(|layer| (&layer.id, layer)).collect();
+    // 文本绘制项按目标层分桶一次(#77):旧写法在每个文本层上
+    // `text_draws.iter().filter(...)` 全扫(`文本层数 × draws 数`)。
+    // 层内顺序 = `frame.text_draws` 命令序(分桶只做移动,不改序)。
+    let mut draws_by_target: HashMap<&LayerId, Vec<&yu_gfx::TextDraw>> = HashMap::new();
+    for draw in frame.text_draws.iter() {
+        draws_by_target
+            .entry(&draw.target)
+            .or_default()
+            .push(draw);
+    }
     for id in ids {
-        let Some(layer) = text_layer_index.get(&id).copied() else {
+        let Some(layer) = layers.get(&id).copied() else {
             note_text_diag(acc, format!("text.layer_missing: {}", id.display()));
             continue;
         };
         if !layer.visible {
             continue;
         }
-        let draws: Vec<&yu_gfx::TextDraw> =
-            frame.text_draws.iter().filter(|d| d.target == id).collect();
+        let draws: &[&yu_gfx::TextDraw] = draws_by_target
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let layout = frame
             .text_layout
             .as_ref()
@@ -3032,6 +3057,7 @@ fn apply_text(
             None => match resolve_source(
                 ctx,
                 frame,
+                layers,
                 textures,
                 gpu,
                 targets,
@@ -3092,7 +3118,7 @@ fn apply_text(
                 let mut collected = true;
                 let mut gpu_glyphs = 0u32;
                 let mut gpu_missing = 0usize;
-                for draw in &draws {
+                for draw in draws {
                     // 缺字形按 CPU 路径同口径跳过(只记 missing),不整体失败:
                     // 整层回退到 CPU 合成会同步读回整层像素(实测 25~30ms)。
                     match text.collect_glyphs_skipping_missing(draw) {
@@ -3252,7 +3278,7 @@ fn apply_text(
             text.store_base(&id, base_key, Rc::clone(&asset));
             Ok(asset)
         } else {
-            match content_cpu(ctx, frame, textures, contents, &id, &raw) {
+            match content_cpu(ctx, layers, textures, contents, &id, &raw) {
                 Ok((texture, info)) => {
                     if info.readbacks > 0 {
                         log::debug!(
@@ -3332,16 +3358,63 @@ fn apply_text(
             }
             continue;
         };
-        let tex = match text_uploads.layers.get(&id) {
+        // 先取上传缓存条目的 owned 快照,`match` 期间不再借用 map,
+        // 便于增量分支安全写回身份。
+        let existing = text_uploads
+            .layers
+            .get(&id)
+            .map(|(hash, tex)| (*hash, Rc::clone(tex)));
+        let old_upload = existing.as_ref().map(|(_, tex)| tex.id);
+        // `(使用中的 GPU 纹理, 需要写回的缓存身份)`。
+        let (tex, cache_hash): (Rc<TexRef>, Option<u64>) = match existing {
             Some((hash, tex))
-                if *hash == composed.hash
+                if hash == composed.hash
                     && tex.width == composed.texture.width
                     && tex.height == composed.texture.height =>
             {
-                tex.clone()
+                (tex, None)
+            }
+            Some((hash, tex))
+                if composed.dirty.is_some()
+                    && composed.prev_hash == Some(hash)
+                    && tex.width == composed.texture.width
+                    && tex.height == composed.texture.height =>
+            {
+                // 逐字增量:只把新写到的像素矩形写进**现有的** GPU 纹理。
+                // 旧实现每个字符都新建整层纹理、整张上传、再删除旧纹理
+                // (推进剧情时的主要尖峰)。这里不新建/不删除纹理,
+                // bind group 也不失效;像素等价性由合成器的脏区保证。
+                let rect = composed.dirty.expect("dirty checked above");
+                let stride = composed.texture.width as usize * 4;
+                let offset = rect.y0 as usize * stride + rect.x0 as usize * 4;
+                let width = rect.x1 - rect.x0;
+                let height = rect.y1 - rect.y0;
+                ctx.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &tex.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: rect.x0,
+                            y: rect.y0,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &composed.texture.rgba[offset..],
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(stride as u32),
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                (tex, Some(composed.hash))
             }
             _ => {
-                let old_upload = text_uploads.layers.get(&id).map(|(_, tex)| tex.id);
                 let id_upload = match gpu.upload(
                     ctx,
                     composed.texture.width,
@@ -3366,18 +3439,19 @@ fn apply_text(
                     texture: uploaded.texture.clone(),
                     view: uploaded.view.clone(),
                 });
-                // 文本每变一次(逐字显示)就换一张上传纹理;旧的必须从
-                // GPU 缓存与 bind group 里移除,否则一局游戏会累积数千张
-                // 整层/整屏纹理,render 从 ~1ms 涨到几十 ms。
+                // 整体重烤/换基面:换一张上传纹理;旧的必须从 GPU 缓存与
+                // bind group 里移除,否则一局游戏会累积数千张整层纹理。
                 if let Some(old_id) = old_upload {
                     gpu.remove(old_id, pipelines);
                 }
-                text_uploads
-                    .layers
-                    .insert(id.clone(), (composed.hash, tex.clone()));
-                tex
+                (tex, Some(composed.hash))
             }
         };
+        if let Some(hash) = cache_hash {
+            text_uploads
+                .layers
+                .insert(id.clone(), (hash, Rc::clone(&tex)));
+        }
         let content = finish_content(surfaces, tex, dims.0, dims.1, raw.display, None);
         surfaces.set_text_content(&id, content.clone(), raw.clone());
         if !image_missing {
@@ -3542,10 +3616,11 @@ fn fnv_bytes(hash: &mut u64, bytes: &[u8]) {
 fn base_token(
     frame: &CompositorFrame,
     targets: &TargetSet,
+    layers: &HashMap<&LayerId, &Layer>,
     id: &LayerId,
     fallback: Option<&TextureRef>,
 ) -> u64 {
-    base_token_of(frame, targets, id, frame.layers.iter().find(|l| &l.id == id), fallback)
+    base_token_of(frame, targets, id, layers.get(id).copied(), fallback)
 }
 
 /// [`base_token`] 的**免查找**版本:调用方已经持有该层的 `&Layer`。

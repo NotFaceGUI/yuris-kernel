@@ -159,19 +159,11 @@ impl DirTree {
                 "same normalized path is both file and directory",
             ));
         }
-        let mut ancestors = Vec::new();
-        let mut cursor = path.parent();
-        while let Some(parent) = cursor {
-            ancestors.push(parent.clone());
-            if parent.is_root() {
-                break;
-            }
-            cursor = parent.parent();
-        }
-        for ancestor in ancestors.into_iter().rev() {
-            self.insert_dir(&ancestor)?;
-        }
         let parent = path.parent().unwrap_or_else(LookupKey::root);
+        // `insert_dir` 自身递归补全缺失祖先(root→…→parent),这里不再
+        // 先收集 ancestors 再逐个插入:那会为同一条路径重复构造/克隆
+        // 数万次键(12k 条包)。
+        self.insert_dir(&parent)?;
         let name = path
             .file_name()
             .map(|n| n.to_vec())

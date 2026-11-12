@@ -561,27 +561,23 @@ impl FontSource {
     /// is not portable. Callers that need parity should use `NAME`.
     #[must_use]
     pub fn face_by_no(&self, no: usize) -> Option<FaceId> {
+        // 排序键的小写形式只算一次:原来比较器里对两个 family 名各
+        // `to_lowercase()`,O(n log n) 次字符串分配(只影响首次解析)。
+        // 比较次序仍是 (小写名, face index, FaceId),不变。
         let mut sorted: Vec<(String, u32, FaceId)> = self
             .faces
             .iter()
             .enumerate()
             .map(|(i, f)| {
-                (
-                    f.families
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| f.post_script_name.clone()),
-                    f.index,
-                    FaceId(i as u32),
-                )
+                let name = f
+                    .families
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| f.post_script_name.clone());
+                (name.to_lowercase(), f.index, FaceId(i as u32))
             })
             .collect();
-        sorted.sort_by(|a, b| {
-            a.0.to_lowercase()
-                .cmp(&b.0.to_lowercase())
-                .then(a.1.cmp(&b.1))
-                .then(a.2.cmp(&b.2))
-        });
+        sorted.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
         sorted.get(no).map(|x| x.2)
     }
 
