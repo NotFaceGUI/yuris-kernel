@@ -57,6 +57,13 @@ public final class MainActivity extends Activity
     static final String EXTRA_FONT_FAMILY = "font_family";
     static final String EXTRA_BACKEND = "backend";
     static final String EXTRA_GPU_BACKEND = "gpu_backend";
+    /**
+     * 启动时的输入方式(true = 虚拟光标,false = 直接触摸)。
+     *
+     * <p>由配置界面「操作方式」显式传入;游戏内右下角小圆钮只切换本次
+     * 会话,不覆盖启动值,也不持久化。
+     */
+    static final String EXTRA_MOUSE_MODE = "mouse_mode";
     static final String EXTRA_DEBUG_LOG = "debug_log";
     /** 状态浮层开关(发布默认关)。 */
     static final String EXTRA_SHOW_HUD = "show_hud";
@@ -130,12 +137,19 @@ public final class MainActivity extends Activity
      */
     private final java.util.concurrent.ConcurrentLinkedQueue<int[]> pendingInputs =
             new java.util.concurrent.ConcurrentLinkedQueue<>();
+    /**
+     * 队列积压计数。
+     *
+     * <p>`ConcurrentLinkedQueue.size()` 是 O(n) 遍历,不能在每个触摸事件上
+     * 调用;这里用原子计数做上限保护(允许短暂偏差,只用于防失控)。
+     */
+    private final java.util.concurrent.atomic.AtomicInteger pendingCount =
+            new java.util.concurrent.atomic.AtomicInteger();
     /** 被丢弃的事件数(上限保护;正常不会触发)。 */
     private volatile int inputDropped;
 
     private static final int EV_DOWN = 1;
     private static final int EV_UP = 0;
-    private static final int EV_MOVE = 2;
     /** 滚轮一格(上/下)。引擎侧是 `_MOUSE_U`/`_MOUSE_D` 的按下+抬起对。 */
     private static final int EV_WHEEL_U = 3;
     private static final int EV_WHEEL_D = 4;
@@ -169,8 +183,8 @@ public final class MainActivity extends Activity
     private boolean showHud;
     /** 调试日志是否启用(壳侧开关;关掉后不写 logcat、不落 JSONL)。 */
     private boolean debugEnabled;
-    /** 虚拟鼠标模式(false = 直接触摸)。持久化,默认触摸。 */
-    private boolean mouseMode;
+    /** 虚拟鼠标模式(false = 直接触摸)。启动值由配置界面决定,游戏内可临时切换。 */
+    private volatile boolean mouseMode;
     /** 虚拟鼠标在视图坐标里的位置(px)。 */
     /** 本次手势是否已经向内核投递过「按下」。 */
     private boolean pressedSent;
@@ -185,14 +199,13 @@ public final class MainActivity extends Activity
     private boolean scrolling;
     private float wheelAccum;
     private int activePointers;
-    /** 触摸态抬手后要把光标移出视口(清 hover)。 */
-    private boolean clearCursorAfterRelease;
+    /** 触摸态抬手后要把光标移出视口(清 hover)。主线程写、渲染线程读。 */
+    private volatile boolean clearCursorAfterRelease;
     /** 光标清理已排队(下一帧执行);见帧循环里的时序说明。 */
     private boolean cursorClearPending;
     private OverlayView overlayView;
     private ModeButton modeButton;
     private int touchSlopPx;
-    private final Paint statusPaint = new Paint();
     /** 浮层:标签(灰)/ 数值(青)/ fps 标签与数值(加粗、更大)。 */
     private final Paint statusLabelPaint = new Paint();
     private final Paint statusValuePaint = new Paint();
@@ -221,6 +234,9 @@ public final class MainActivity extends Activity
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        // 输入方式必须在建 View 之前定下来:onSurfaceTextureAvailable 会用
+        // 它决定是否把虚拟光标放到画面中心。
+        resolveInitialInputMode();
 
         // TextureView(不是 SurfaceView):它能把自己的 Surface 直接交给 wgpu
         // 做零拷贝呈现,同时允许上层叠加普通 View 做状态浮层。
@@ -304,7 +320,8 @@ public final class MainActivity extends Activity
                                 enqueueInput(EV_DOWN);
                                 pressedSent = true;
                             }
-                            enqueueInput(EV_MOVE);
+                            // 光标位置已经通过 pointerX/Y + pointerDirty 传下去,
+                            // 不再为每个 MOVE 事件排队(旧实现排进去也没人消费)。
                         }
                         dragLastX = event.getX();
                         dragLastY = event.getY();
@@ -400,9 +417,6 @@ public final class MainActivity extends Activity
 
         // 浮层字号与原先一致(24f);着色只区分标签/数值,fps 仅加粗、不放大。
         float statusTextSize = 24f;
-        statusPaint.setColor(Color.WHITE);
-        statusPaint.setTextSize(statusTextSize);
-        statusPaint.setShadowLayer(3f, 1f, 1f, Color.BLACK);
 
         statusLabelPaint.setAntiAlias(true);
         statusLabelPaint.setTextSize(statusTextSize);
@@ -437,11 +451,36 @@ public final class MainActivity extends Activity
 
     // ---- TextureView 回调 ----
 
+    /**
+     * 读取启动时的输入方式。
+     *
+     * <p>配置界面传的 Extra 优先;缺失(adb 直接拉起 MainActivity)才回落到
+     * 旧偏好。游戏内小圆钮只改本次会话,不回写这里。
+     */
+    private void resolveInitialInputMode() {
+        mouseMode = getIntent().hasExtra(EXTRA_MOUSE_MODE)
+                ? getIntent().getBooleanExtra(EXTRA_MOUSE_MODE, false)
+                : getSharedPreferences(SetupActivity.PREFS, MODE_PRIVATE)
+                        .getBoolean("mouse_mode", false);
+    }
+
     @Override
     public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture surfaceTexture,
                                           int width, int height) {
         nativeSurface = new android.view.Surface(surfaceTexture);
         Log.i(TAG, "surface available " + width + "x" + height);
+        // 启动即虚拟光标模式:光标先落在画面中心,否则第一次拖动从左上角
+        // 起算(点击也会落到 (0,0))。
+        if (mouseMode && virtualX < 0 && width > 0 && height > 0) {
+            virtualX = width / 2f;
+            virtualY = height / 2f;
+            pointerX = (int) virtualX;
+            pointerY = (int) virtualY;
+            pointerDirty = true;
+            if (overlayView != null) {
+                overlayView.invalidate();
+            }
+        }
         if (sessionReady && renderThread != null && renderThread.isAlive()) {
             // 会话还在(只是 surface 重建):渲染线程下一帧重新挂 Surface。
             needsAttach = true;
@@ -597,8 +636,7 @@ public final class MainActivity extends Activity
         boolean debugLog = getIntent().getBooleanExtra(EXTRA_DEBUG_LOG, false);
         showHud = getIntent().getBooleanExtra(EXTRA_SHOW_HUD, false);
         debugEnabled = debugLog;
-        mouseMode = getSharedPreferences(SetupActivity.PREFS, MODE_PRIVATE)
-                .getBoolean("mouse_mode", false);
+        // 输入方式已在 onCreate 由 resolveInitialInputMode() 定好(见那里)。
         try {
             config.put("data_root", gameDir.getAbsolutePath());
             config.put("save_root", saveDir.getAbsolutePath());
@@ -726,8 +764,10 @@ public final class MainActivity extends Activity
         Bitmap bitmap = null;
         /** 内核已在本线程释放会话(TICK_HOST_SHUTDOWN)⇒ 收尾不再重复 shutdown。 */
         boolean releasedByHost = false;
-        // 帧节拍:按引擎 fps 换算成纳秒,截止时间从第一帧起累加(不漂移)。
-        final int targetFps = 60;
+        // 帧节拍:按配置界面的帧率上限换算成纳秒,截止时间从第一帧起累加
+        // (不漂移)。缺省 60;越界值按 15~240 钳制。
+        final int targetFps = Math.max(15, Math.min(240,
+                getIntent().getIntExtra(EXTRA_FPS, 60)));
         long frameNanos = 1_000_000_000L / Math.max(1, targetFps);
         long fpsWindowStart = SystemClock.elapsedRealtime();
         int fpsFrames = 0;
@@ -794,24 +834,38 @@ public final class MainActivity extends Activity
             if (size.length >= 2 && (size[0] != frameW || size[1] != frameH)) {
                 frameW = size[0];
                 frameH = size[1];
-                pixels = new int[frameW * frameH];
-                bitmap = Bitmap.createBitmap(frameW, frameH, Bitmap.Config.ARGB_8888);
+                // 尺寸变了:旧缓冲作废,按当前上屏路径按需重建(见下)。
+                pixels = new int[0];
+                bitmap = null;
             }
             // 零拷贝上屏:内核已经把这一帧直接送到 Surface,壳不再读回像素,
             // 也不再画 Bitmap(省掉每帧 1.9MB 拷贝与一次整屏上传)。
             boolean needPixels = !zeroCopyPresent;
-            if (zeroCopyPresent || (bitmap != null && pixels.length > 0)) {
-                if (!needPixels) {
-                    // 零拷贝:画面由内核直接写入 Surface,壳不画 Bitmap,
-                    // 但触摸映射矩形仍要按同样的 letterbox 规则更新。
-                    updatePresentRect(textureView.getWidth(), textureView.getHeight(),
-                            frameW, frameH);
+            if (needPixels) {
+                // 只有 CPU 回退路径才分配整帧缓冲。旧实现对零拷贝路径也
+                // 建 Bitmap + int[](1080p 约 16MB),却从不使用。
+                if (frameW > 0 && frameH > 0
+                        && (bitmap == null || bitmap.getWidth() != frameW
+                            || bitmap.getHeight() != frameH)) {
+                    pixels = new int[frameW * frameH];
+                    bitmap = Bitmap.createBitmap(frameW, frameH, Bitmap.Config.ARGB_8888);
                 }
-                if (needPixels) {
+                if (bitmap != null) {
                     NativeHost.nativeCopyFrame(pixels);
                     bitmap.setPixels(pixels, 0, frameW, 0, 0, frameW, frameH);
                 }
-
+            } else {
+                // 零拷贝生效:整帧 Java 缓冲立即释放,不占着堆等 GC。
+                if (bitmap != null || pixels.length != 0) {
+                    pixels = new int[0];
+                    bitmap = null;
+                }
+                // 画面由内核直接写入 Surface,壳不画 Bitmap,
+                // 但触摸映射矩形仍要按同样的 letterbox 规则更新。
+                updatePresentRect(textureView.getWidth(), textureView.getHeight(),
+                        frameW, frameH);
+            }
+            if (zeroCopyPresent || (bitmap != null && pixels.length > 0)) {
                 // 输入:把触摸点从 Surface 坐标映射回游戏视口坐标(经过缩放与
                 // 黑边偏移),再按队列顺序投递按下/抬起。
                 //
@@ -835,6 +889,7 @@ public final class MainActivity extends Activity
                 }
                 int[] input;
                 while ((input = pendingInputs.poll()) != null) {
+                    pendingCount.decrementAndGet();
                     switch (input[0]) {
                         case EV_DOWN:
                             NativeHost.nativeSetInput("MOUSE_L", true);
@@ -853,7 +908,7 @@ public final class MainActivity extends Activity
                             NativeHost.nativeSetInput("MOUSE_D", false);
                             break;
                         default:
-                            // MOVE 只更新光标(上面已做),不产生按钮事件。
+                            // 未知事件:忽略(光标移动不排队,见触摸处理)。
                             break;
                     }
                 }
@@ -1144,6 +1199,7 @@ public final class MainActivity extends Activity
         }
     }
 
+    /** 画失败屏:居中红色 ERROR + 清楚的原因 + 返回提示。 */
     private void drawError() {
         Canvas canvas;
         try {
@@ -1156,15 +1212,89 @@ public final class MainActivity extends Activity
         }
         try {
             canvas.drawColor(Color.BLACK);
-            statusPaint.setTextSize(20f);
-            float y = 60f;
-            for (String line : wrap(statusLine, 46)) {
-                canvas.drawText(line, 24f, y, statusPaint);
-                y += 28f;
+            int width = canvas.getWidth();
+            int height = canvas.getHeight();
+            float centerX = width / 2f;
+            float margin = dp(28);
+            float maxWidth = Math.max(dp(160), width - margin * 2);
+
+            String reason = statusLine == null ? "" : statusLine.trim();
+            // 内核错误串带 "ERR:" 前缀;正文里不再重复。
+            if (reason.startsWith("ERR:")) {
+                reason = reason.substring(4).trim();
             }
+            if (reason.isEmpty()) {
+                reason = "内核没有返回失败原因(可开调试日志查看 logcat)";
+            }
+
+            Paint titlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            titlePaint.setColor(Color.parseColor("#ff4d4f"));
+            titlePaint.setTextSize(dp(44));
+            titlePaint.setFakeBoldText(true);
+            titlePaint.setTextAlign(Paint.Align.CENTER);
+            titlePaint.setShadowLayer(3f, 1f, 1f, Color.BLACK);
+
+            Paint bodyPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            bodyPaint.setColor(Color.parseColor("#e8ecf2"));
+            bodyPaint.setTextSize(dp(17));
+            bodyPaint.setTextAlign(Paint.Align.CENTER);
+
+            Paint hintPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            hintPaint.setColor(Color.parseColor("#8b93a3"));
+            hintPaint.setTextSize(dp(13));
+            hintPaint.setTextAlign(Paint.Align.CENTER);
+
+            ArrayList<String> lines = wrapByWidth("原因: " + reason, bodyPaint, maxWidth);
+            if (lines.isEmpty()) {
+                lines.add("原因: 未知");
+            }
+            // 极长错误不把提示挤出屏幕;多余部分省略。
+            if (lines.size() > 8) {
+                lines = new ArrayList<>(lines.subList(0, 8));
+                lines.add("…");
+            }
+            float lineHeight = bodyPaint.getTextSize() * 1.5f;
+            float gapAfterTitle = dp(22);
+            float gapBeforeHint = dp(20);
+            float block = titlePaint.getTextSize() + gapAfterTitle
+                    + lines.size() * lineHeight + gapBeforeHint + hintPaint.getTextSize();
+            float y = Math.max(dp(24), (height - block) / 2f + titlePaint.getTextSize());
+            canvas.drawText("ERROR", centerX, y, titlePaint);
+            y += gapAfterTitle;
+            for (String line : lines) {
+                y += lineHeight;
+                canvas.drawText(line, centerX, y, bodyPaint);
+            }
+            y += gapBeforeHint + hintPaint.getTextSize();
+            canvas.drawText("返回配置界面检查游戏目录与运行设置", centerX, y, hintPaint);
         } finally {
             textureView.unlockCanvasAndPost(canvas);
         }
+    }
+
+    /** 按像素宽度折行(中文/英文都按字符断,不依赖空格)。 */
+    private static ArrayList<String> wrapByWidth(String text, Paint paint, float maxWidth) {
+        ArrayList<String> lines = new ArrayList<>();
+        for (String paragraph : text.split("\n", -1)) {
+            if (paragraph.isEmpty()) {
+                lines.add("");
+                continue;
+            }
+            int start = 0;
+            while (start < paragraph.length()) {
+                int end = paragraph.length();
+                while (end > start && paint.measureText(paragraph, start, end) > maxWidth) {
+                    end--;
+                }
+                if (end == start) {
+                    // 单个字符就超宽:仍前进一格,避免死循环。
+                    end = start + 1;
+                }
+                lines.add(paragraph.substring(start, end));
+                start = end;
+            }
+        }
+        return lines;
     }
 
     /** 多指时的平均 Y(双指滚动用)。 */
@@ -1182,11 +1312,11 @@ public final class MainActivity extends Activity
         enqueueInput(up ? EV_WHEEL_U : EV_WHEEL_D);
     }
 
-    /** 双击切换模式:触摸 ↔ 虚拟鼠标。 */
+    /** 双击切换模式:触摸 ↔ 虚拟鼠标(仅本次会话;启动值来自配置界面)。 */
     private void toggleMouseMode() {
         mouseMode = !mouseMode;
-        getSharedPreferences(SetupActivity.PREFS, MODE_PRIVATE)
-                .edit().putBoolean("mouse_mode", mouseMode).apply();
+        // 刻意不写 SharedPreferences:启动值由配置界面决定,游戏内切换
+        // 不持久化,避免反过来改掉外部壳的设置。
         if (mouseMode) {
             // 首次进入鼠标模式:光标落在画面中心。
             if (virtualX < 0) {
@@ -1308,8 +1438,12 @@ public final class MainActivity extends Activity
 
     /** 入队一次输入;队列积压超过上限时丢最旧(防止异常情况下无限增长)。 */
     private void enqueueInput(int kind) {
-        if (pendingInputs.size() > 512) {
-            pendingInputs.poll();
+        // 先计数再入队:渲染线程 poll 成功后才减。并发时计数最多短暂偏大,
+        // 不会漏掉任何一条事件;也不再用 O(n) 的 size() 遍历队列。
+        if (pendingCount.incrementAndGet() > 512) {
+            if (pendingInputs.poll() != null) {
+                pendingCount.decrementAndGet();
+            }
             inputDropped++;
         }
         pendingInputs.add(new int[]{kind});
@@ -1378,18 +1512,5 @@ public final class MainActivity extends Activity
 
     private static int clamp(int value, int low, int high) {
         return value < low ? low : Math.min(value, high);
-    }
-
-    private static java.util.List<String> wrap(String text, int width) {
-        java.util.List<String> lines = new java.util.ArrayList<>();
-        String rest = text;
-        while (rest.length() > width) {
-            lines.add(rest.substring(0, width));
-            rest = rest.substring(width);
-        }
-        if (!rest.isEmpty()) {
-            lines.add(rest);
-        }
-        return lines;
     }
 }

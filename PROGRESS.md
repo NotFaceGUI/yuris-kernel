@@ -14369,3 +14369,95 @@ record-events on/off（600 帧 headless）                   → display JSON md
   机制接入）。
 - `ComposedLayer.hash` 的语义已改为“上传缓存身份”（整体=像素哈希，增量=
   结构身份），文档已注明不得当作跨路径像素指纹；`TextRect` 为公开类型。
+
+## 成果 AND-SHELL (2026-11-12) · 安卓壳:目录选择、启动输入方式、后台静音
+
+**游戏目录改为目录选择**
+
+- `SetupActivity` 的「选择游戏目录」从 `ACTION_OPEN_DOCUMENT`(只能点文件、
+  再取父目录猜根)改为 `ACTION_OPEN_DOCUMENT_TREE`,直接选文件夹;tree URI
+  经 `realPathOf` 还原真实路径(`primary:` / SD 卷 / `raw:` 兜底)。
+- **tree URI 解析修复**:tree URI 的文档 ID 必须用
+  `DocumentsContract.getTreeDocumentId`;`getDocumentId` 只接受 document URI,
+  对 tree URI 抛 `IllegalArgumentException`(旧实现吞掉后返回 null,表现为
+  「明明能选却提示无法解析该目录的路径」)。另对 tree URI 的 document 形态
+  再试一次 `_data`(Downloads/MediaStore provider),并补 `downloads` 根映射。
+- 「存档目录 → 另外指定…」同样改为目录选择器;「默认」仍为
+  `<游戏目录>/save`。
+- 解析顺序:选中目录 → 向上 4 层(`findGameRoot`)→ 唯一含 `data.ypf`/`data/`
+  的直接子目录;多个候选不猜。
+- 保留「手动输入路径…」兜底(受限目录 / provider 解不出真实路径)。
+
+**启动输入方式(触摸 / 虚拟光标)**
+
+- `SetupActivity` 新增「操作方式」卡片,持久化 `launch_mouse_mode`,随
+  Intent Extra `mouse_mode` 传入 `MainActivity`。
+- `MainActivity` 以 Extra 为启动值(缺失才回落旧偏好);虚拟光标启动时落在
+  画面中心。游戏内右下角小圆钮只切换本次会话,不写偏好。
+- 启动/运行失败屏改为居中红色 `ERROR` + 自动折行的「原因: …」+ 返回配置
+  界面提示;替换旧的左上角白字。
+
+**设置分区(基础 / 高级)**
+
+- 「运行」卡片补齐渲染器相关基础项:GPU 接口(自动 / GLES / Vulkan)从高级
+  设置移出;新增「帧率上限」30 / 60 / 120(`EXTRA_FPS`,同时作为壳侧帧节拍
+  与内核 `fps` 参数)。
+- 「高级设置」并入「运行」卡片(小节标题 + 展开 ▸ / 收起 ▾),不再独立成卡。
+
+**后台静音**
+
+- 根因:壳 `onPause` 登记挂起请求后立即关泵,而 `engine.suspend()` 只在渲染
+  线程下一帧 tick 前执行 —— 泵一关就不再 tick,期间环形缓冲里已排队的
+  0.3~0.9s 音频继续播。
+- `sound.rs` 新增进程级 `OUTPUT_PAUSED` 闸门:设备回调补静音(仍计回调,
+  避免监督线程误判流僵死)、mixer 停止取数并清空环形缓冲;`nativeSuspend()`
+  / `nativeResume()` 在调用线程直接翻闸门,不依赖渲染线程。
+
+**验证**
+
+```text
+cargo check -p yu-host-android                            → Finished(通过)
+BUILD_TYPE=release tools/android/build.sh arm64-v8a x86_64
+  → BUILD SUCCESSFUL in 13s
+  → android/app/build/outputs/apk/release/app-release.apk (27M)
+  → jniLibs/{arm64-v8a,x86_64}/libyu_host_android.so 同步更新
+```
+
+## 成果 AND-PERF-AUDIT (2026-11-12) · 安卓壳 / 宿主普查:零拷贝整帧缓冲与发布模式日志开销
+
+**实施**
+
+- **零拷贝仍分配整帧 Java 缓冲**(`MainActivity`):GPU 零拷贝生效时,旧代码
+  在视口变化时仍 `new int[w*h]` + `Bitmap.createBitmap`(1080p 约 16MB),
+  但该路径从不读像素。现在只在 CPU 回退路径按需分配;零拷贝生效后立即
+  释放 `pixels`/`bitmap`。
+- **发布模式慢帧取证无门槛**(`lib.rs`):`[spike]` 对每个 ≥8ms 的帧都取
+  `render_phases`、拼 `resource_snapshot`、格式化并写 logcat,前 2000 帧
+  (约 33s)是纯诊断开销。改为 `!quiet`(开「调试日志」)才执行。
+- **输入队列热路径**(`MainActivity`):触摸拖动每个 MOVE 事件都入队一个
+  没人消费的 `EV_MOVE`;`enqueueInput` 每个事件调用 O(n) 的
+  `ConcurrentLinkedQueue.size()`。删除 MOVE 入队,改用原子计数做 512 上限。
+- **ARGB 回退路径**(`lib.rs`):`fill_argb` 的 `reserve(pixels - capacity)`
+  参数语义不对(`clear()` 后 len=0,reserve 的是“额外容量”),扩容边界会多
+  一次整帧重分配;改为 `reserve(pixels)`。
+- **logcat 写入**(`logging.rs`):`body.replace('\0', " ")` 每条日志多分配
+  一份字符串;改为 `to_vec` 后就地替换 NUL。
+
+**有意不改(风险 / 收益不划算)**
+
+- `TextureView` → `SurfaceView`:少一层合成,但浮层/光标叠放与 surface
+  生命周期要重做,收益不确定。
+- `nativeFrameSize()` 每帧一个 2 元 `int[]`:微小分配;改打包 long 要动公开
+  JNI API 与 `NATIVE_API.md`,收益不成比例。
+- 后台暂停 cpal 流(而非只补静音):省设备静音回调,但 AAudio 暂停/恢复的
+  路由抖动与看门狗误判风险更大。
+- 音频 mixer 的 5ms 轮询 / 300ms 水位与断供强相关,不动。
+
+**验证**
+
+```text
+cargo test -p yu-host-android                    → 19 passed / 0 failed
+BUILD_TYPE=release tools/android/build.sh arm64-v8a x86_64
+  → BUILD SUCCESSFUL in 8s
+  → android/app/build/outputs/apk/release/app-release.apk (27M)
+```

@@ -43,6 +43,7 @@ public final class SetupActivity extends AppCompatActivity {
     private static final int REQUEST_GAME_DIR = 1001;
     private static final int REQUEST_FONT = 1002;
     private static final int REQUEST_PLAY = 1003;
+    private static final int REQUEST_SAVE_DIR = 1004;
 
     private static final int BG = Color.parseColor("#0e1014");
     private static final int CARD = Color.parseColor("#1a1e26");
@@ -61,6 +62,16 @@ public final class SetupActivity extends AppCompatActivity {
     /** 自定义存档目录;null = 游戏目录/save。 */
     private String saveDir;
     private String fontPath;
+    /** 启动时的输入方式:true = 虚拟光标,false = 直接触摸(游戏内可临时切换)。 */
+    private boolean mouseMode;
+    /** 操作方式按钮组(重置/高亮刷新用)。 */
+    private Button[] inputModeButtons;
+    private static final String[] INPUT_MODE_VALUES = {"touch", "mouse"};
+    /** 帧率上限(壳侧节拍;同时作为内核 fps 参数)。 */
+    private int fps = 60;
+    private Button[] fpsButtons;
+    private static final int[] FPS_VALUES = {30, 60, 120};
+    private static final String[] FPS_LABELS = {"30 fps", "60 fps", "120 fps"};
     /** 渲染后端:"soft"(CPU)/ "wgpu"(GPU)。 */
     private String backend = "soft";
     /** GPU 底层接口:"auto" / "gles" / "vulkan"。 */
@@ -108,6 +119,11 @@ public final class SetupActivity extends AppCompatActivity {
         backend = prefs.getString("backend", "soft");
         // CPU 模式已停用:壳只提供 GPU 路径,CPU 按钮仅占位。
         backend = "wgpu";
+        mouseMode = prefs.getBoolean("launch_mouse_mode", false);
+        fps = prefs.getInt("fps", 60);
+        if (fps != 30 && fps != 60 && fps != 120) {
+            fps = 60;
+        }
         gpuBackend = prefs.getString("gpu_backend", "auto");
         patch = prefs.getString("patch", "auto");
         saveCodec = prefs.getString("save_codec", "");
@@ -140,6 +156,13 @@ public final class SetupActivity extends AppCompatActivity {
         Button pickGame = primaryButton("选择游戏目录");
         pickGame.setOnClickListener(v -> ensureStorageThen(this::pickDirectory));
         gameCard.addView(pickGame, buttonParams());
+        // 兜底:个别文件管理器/受限目录(如 Android 11 的 Download 根)不让选,
+        // 或者 provider 解不出真实路径时,直接输入绝对路径。
+        Button manualGame = secondaryButton("手动输入路径…");
+        manualGame.setTextSize(12f);
+        manualGame.setOnClickListener(v -> editGameDir());
+        gameCard.addView(manualGame, buttonParams());
+        gameCard.addView(hintText("选择包含 data.ypf 或 data/ 的目录"));
         root.addView(gameCard, cardParams());
 
         // ---- 存档目录 ----
@@ -156,7 +179,7 @@ public final class SetupActivity extends AppCompatActivity {
             refreshLabels();
         });
         Button saveCustom = secondaryButton("另外指定…");
-        saveCustom.setOnClickListener(v -> editSaveDir());
+        saveCustom.setOnClickListener(v -> ensureStorageThen(this::pickSaveDirectory));
         LinearLayout.LayoutParams left = new LinearLayout.LayoutParams(0, dp(48), 1f);
         left.topMargin = dp(8);
         left.rightMargin = dp(5);
@@ -182,7 +205,34 @@ public final class SetupActivity extends AppCompatActivity {
         fontCard.addView(importFont, buttonParams());
         root.addView(fontCard, cardParams());
 
-        // ---- 运行(后端) ----
+        // ---- 操作方式(启动时的输入模式) ----
+        LinearLayout inputCard = card();
+        inputCard.addView(sectionTitle("操作方式"));
+        String[] inputLabels = {"触摸", "虚拟光标"};
+        inputModeButtons = new Button[inputLabels.length];
+        LinearLayout inputRow = new LinearLayout(this);
+        inputRow.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < inputLabels.length; i++) {
+            final int index = i;
+            Button button = secondaryButton(inputLabels[i]);
+            button.setOnClickListener(v -> {
+                mouseMode = index == 1;
+                refreshChoiceButtons(inputModeButtons, INPUT_MODE_VALUES, selectedInputMode());
+            });
+            inputModeButtons[i] = button;
+            LinearLayout.LayoutParams params =
+                    new LinearLayout.LayoutParams(0, dp(42), 1f);
+            params.topMargin = dp(6);
+            params.leftMargin = dp(4);
+            params.rightMargin = dp(4);
+            inputRow.addView(button, params);
+        }
+        refreshChoiceButtons(inputModeButtons, INPUT_MODE_VALUES, selectedInputMode());
+        inputCard.addView(inputRow);
+        inputCard.addView(hintText("游戏内右下角小圆钮可切换"));
+        root.addView(inputCard, cardParams());
+
+        // ---- 运行(后端 / 渲染器 / 帧率) ----
         LinearLayout runCard = card();
         runCard.addView(sectionTitle("运行"));
 
@@ -206,27 +256,11 @@ public final class SetupActivity extends AppCompatActivity {
         backendRow.addView(cpuButton, cpuParams);
         backendRow.addView(gpuButton, gpuParams);
         runCard.addView(backendRow);
-        runCard.addView(hintText("CPU 模式已停用,按钮仅占位;Android 固定走 GPU。"));
-        root.addView(runCard, cardParams());
         refreshRunButtons(cpuButton, gpuButton);
-
-        // ---- 高级设置(可展开/收起) ----
-        LinearLayout advancedCard = card();
-        Button advancedHeader = secondaryButton("高级设置 ▸");
-        advancedHeader.setTextSize(14f);
-        advancedCard.addView(advancedHeader, buttonParams());
-        LinearLayout advancedBody = new LinearLayout(this);
-        advancedBody.setOrientation(LinearLayout.VERTICAL);
-        advancedBody.setVisibility(View.GONE);
-        advancedCard.addView(advancedBody);
-        advancedHeader.setOnClickListener(v -> {
-            boolean open = advancedBody.getVisibility() == View.VISIBLE;
-            advancedBody.setVisibility(open ? View.GONE : View.VISIBLE);
-            advancedHeader.setText(open ? "高级设置 ▸" : "高级设置 ▾");
-        });
 
         // GPU 底层接口三选一(GPU 模式下有意义)。Android 模拟器的 Vulkan
         // 驱动会在提交流程内崩溃,GLES 更稳;真机两者都可。
+        runCard.addView(fieldLabel("GPU 接口"));
         LinearLayout gpuRow = new LinearLayout(this);
         gpuRow.setOrientation(LinearLayout.HORIZONTAL);
         Button autoButton = secondaryButton("自动");
@@ -257,8 +291,45 @@ public final class SetupActivity extends AppCompatActivity {
         gpuRow.addView(autoButton, third);
         gpuRow.addView(glesButton, third2);
         gpuRow.addView(vulkanButton, third3);
-        advancedBody.addView(gpuRow);
+        runCard.addView(gpuRow);
         refreshGpuButtons(autoButton, glesButton, vulkanButton);
+
+        // 帧率上限:壳侧帧节拍与内核 fps 参数同值。
+        runCard.addView(fieldLabel("帧率上限"));
+        LinearLayout fpsRow = new LinearLayout(this);
+        fpsRow.setOrientation(LinearLayout.HORIZONTAL);
+        fpsButtons = new Button[FPS_VALUES.length];
+        for (int i = 0; i < FPS_VALUES.length; i++) {
+            final int value = FPS_VALUES[i];
+            Button button = secondaryButton(FPS_LABELS[i]);
+            button.setOnClickListener(v -> {
+                fps = value;
+                refreshFpsButtons();
+            });
+            fpsButtons[i] = button;
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(42), 1f);
+            params.topMargin = dp(6);
+            params.leftMargin = dp(4);
+            params.rightMargin = dp(4);
+            fpsRow.addView(button, params);
+        }
+        runCard.addView(fpsRow);
+        refreshFpsButtons();
+
+        // ---- 高级设置(运行卡片内,可展开/收起) ----
+        runCard.addView(fieldLabel("高级设置"));
+        Button advancedHeader = secondaryButton("展开 ▸");
+        advancedHeader.setTextSize(14f);
+        runCard.addView(advancedHeader, buttonParams());
+        LinearLayout advancedBody = new LinearLayout(this);
+        advancedBody.setOrientation(LinearLayout.VERTICAL);
+        advancedBody.setVisibility(View.GONE);
+        runCard.addView(advancedBody);
+        advancedHeader.setOnClickListener(v -> {
+            boolean open = advancedBody.getVisibility() == View.VISIBLE;
+            advancedBody.setVisibility(open ? View.GONE : View.VISIBLE);
+            advancedHeader.setText(open ? "展开 ▸" : "收起 ▾");
+        });
 
         advancedBody.addView(toggleButton(
                 "状态浮层:开(帧率/计数)", "状态浮层:关", showHud, v -> showHud = v), buttonParams());
@@ -282,7 +353,7 @@ public final class SetupActivity extends AppCompatActivity {
         advancedBody.addView(toggleButton(
                 "CG 计时:开", "CG 计时:关", cgTiming, v -> cgTiming = v), buttonParams());
         advancedBody.addView(hintText("诊断开关只影响日志/计时,不改画面;默认全关。"));
-        root.addView(advancedCard, cardParams());
+        root.addView(runCard, cardParams());
 
         // ---- 文本编码 ----
         LinearLayout textCard = card();
@@ -380,6 +451,10 @@ public final class SetupActivity extends AppCompatActivity {
             fontPath = null;
             importedFontName = null;
             savedFontFamily = "";
+            mouseMode = false;
+            refreshChoiceButtons(inputModeButtons, INPUT_MODE_VALUES, selectedInputMode());
+            fps = 60;
+            refreshFpsButtons();
             refreshLabels();
             // 下拉去掉「导入字体」项并回到系统默认。
             fontSpinner.setSelection(0);
@@ -420,17 +495,52 @@ public final class SetupActivity extends AppCompatActivity {
     }
 
     /**
-     * 选游戏目录。
+     * 选游戏目录(系统目录选择器,不是文件选择器)。
      *
-     * <p>用「打开文档」而不是 SAF 目录树:后者只给 content:// URI,内核无法
-     * 按路径读;这里要的是**真实路径**。用户从系统文件管理器里进到游戏目录,
-     * 随便点一个文件,取它的父目录作为游戏根。
+     * <p>旧实现用「打开文档」:只能点文件,再取父目录猜游戏根 —— 用户必须
+     * 先在游戏目录里随便点一个文件。现在直接用 {@code ACTION_OPEN_DOCUMENT_TREE}
+     * 让用户选文件夹,选中项经 {@link #realPathOf} 还原成真实路径交给内核
+     * (内核按真实路径读写,content:// URI 用不了)。
      */
     private void pickDirectory() {
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("*/*");
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         startActivityForResult(intent, REQUEST_GAME_DIR);
+    }
+
+    /**
+     * 手动输入游戏根路径(`/sdcard/...` 或 `/storage/...`)。
+     *
+     * <p>兜底路线:部分文件管理器不实现目录选择,或某些受限目录
+     * (Android 11+ 的 Download 根)不允许通过 SAF 选中。
+     */
+    private void editGameDir() {
+        final android.widget.EditText input = new android.widget.EditText(this);
+        input.setText(gameDir != null ? gameDir : Environment.getExternalStorageDirectory().getAbsolutePath());
+        input.setHint("/sdcard/Download/yugame");
+        input.setSingleLine(true);
+        new androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("游戏目录路径")
+                .setView(input)
+                .setPositiveButton("确定", (dialog, which) -> {
+                    String text = input.getText().toString().trim();
+                    if (text.isEmpty()) {
+                        gameDir = null;
+                        refreshLabels();
+                        return;
+                    }
+                    File picked = new File(text);
+                    String root = findGameRoot(picked.isDirectory() ? picked : picked.getParentFile());
+                    if (root == null) {
+                        status.setText("这个目录里没有 data.ypf / data/,请选游戏根目录");
+                        return;
+                    }
+                    gameDir = root;
+                    refreshLabels();
+                })
+                .setNegativeButton("取消", null)
+                .show();
     }
 
     private void pickFont() {
@@ -458,29 +568,97 @@ public final class SetupActivity extends AppCompatActivity {
             return;
         }
         Uri uri = data.getData();
+        if (requestCode == REQUEST_GAME_DIR) {
+            String root = resolveGameRoot(uri);
+            if (root == null) {
+                return;
+            }
+            gameDir = root;
+            refreshLabels();
+            return;
+        }
+        if (requestCode == REQUEST_SAVE_DIR) {
+            String realPath = realPathOf(uri);
+            if (realPath == null) {
+                status.setText("无法解析该目录的路径");
+                return;
+            }
+            File picked = new File(realPath);
+            if (!picked.isDirectory()) {
+                picked = picked.getParentFile();
+            }
+            if (picked == null) {
+                status.setText("无法解析该目录的路径");
+                return;
+            }
+            saveDir = picked.getAbsolutePath();
+            refreshLabels();
+            return;
+        }
         String realPath = realPathOf(uri);
         if (realPath == null) {
             status.setText("无法解析该位置的路径,请从「内部存储 / 下载」里选");
             return;
         }
         File picked = new File(realPath);
-        if (requestCode == REQUEST_GAME_DIR) {
-            // 选中的是文件 → 用其父目录;若父目录不像游戏根,再看它自己。
-            File candidate = picked.isDirectory() ? picked : picked.getParentFile();
-            String root = findGameRoot(candidate);
-            if (root == null) {
-                status.setText("这个目录里没有 data.ypf / data/,请选游戏根目录");
-                return;
-            }
-            gameDir = root;
-            refreshLabels();
-        } else if (requestCode == REQUEST_FONT) {
+        if (requestCode == REQUEST_FONT) {
             fontPath = picked.getAbsolutePath();
             importedFontName = picked.getName();
             // 导入即选中:重新加载下拉后直接定位到它。
             savedFontFamily = importedFontName;
             loadSystemFonts();
         }
+    }
+
+    /**
+     * 把目录选择器返回的 tree URI 解析成游戏根目录。
+     *
+     * <p>命中顺序:选中目录本身 → 向上 4 层 → 唯一一个含数据入口的直接
+     * 子目录(用户选了游戏上一级的情况)。多个候选时**不猜**,提示重新选。
+     */
+    private String resolveGameRoot(Uri uri) {
+        String realPath = realPathOf(uri);
+        if (realPath == null) {
+            status.setText("无法解析该目录的路径,请换用「手动输入路径…」");
+            return null;
+        }
+        File picked = new File(realPath);
+        if (!picked.isDirectory()) {
+            picked = picked.getParentFile();
+        }
+        if (picked == null) {
+            status.setText("无法解析该目录的路径,请换用「手动输入路径…」");
+            return null;
+        }
+        String root = findGameRoot(picked);
+        if (root != null) {
+            return root;
+        }
+        // 用户可能选的是游戏的上一级:只有一个子目录像游戏根时直接进去。
+        File only = singleChildGameRoot(picked);
+        if (only != null) {
+            return only.getAbsolutePath();
+        }
+        status.setText("这个目录里没有 data.ypf / data/,请选游戏根目录");
+        return null;
+    }
+
+    /** 直接子目录里只有**一个**含数据入口时返回它;0 个或多个都回 null。 */
+    private File singleChildGameRoot(File dir) {
+        File[] children = dir.listFiles();
+        if (children == null) {
+            return null;
+        }
+        File found = null;
+        for (File child : children) {
+            if (child.isDirectory() && isGameRoot(child)) {
+                if (found != null) {
+                    return null; // 多个候选:不替用户猜
+                }
+                found = child;
+            }
+        }
+        return found;
     }
 
     /** 从选中位置向上找游戏根(含 data.ypf 或 data/ 的目录)。 */
@@ -495,11 +673,100 @@ public final class SetupActivity extends AppCompatActivity {
         return null;
     }
 
-    /** 把 document URI 还原成真实文件路径(需要所有文件访问权限)。 */
+    /** 把 document / tree URI 还原成真实文件路径(需要所有文件访问权限)。 */
     private String realPathOf(Uri uri) {
         if ("file".equals(uri.getScheme())) {
             return uri.getPath();
         }
+        // 先问 provider 要 _data(部分 provider 直接给真实路径)。
+        String dataPath = queryDataPath(uri);
+        if (dataPath != null) {
+            return dataPath;
+        }
+        String docId;
+        try {
+            docId = documentIdOf(uri);
+        } catch (Exception ignored) {
+            return null;
+        }
+        if (docId == null) {
+            return null;
+        }
+        // 目录选择器给的是 tree URI:再对它对应的 document URI 试一次 _data
+        // (Downloads/MediaStore 一类 provider 只有 document 才认 _data)。
+        if (isTreeUri(uri)) {
+            try {
+                Uri document = android.provider.DocumentsContract
+                        .buildDocumentUriUsingTree(uri, docId);
+                String documentPath = queryDataPath(document);
+                if (documentPath != null) {
+                    return documentPath;
+                }
+            } catch (Exception ignored) {
+                // provider 不支持 document 形态,继续按 docId 拼。
+            }
+        }
+        // 旧版 DownloadsProvider 直接给 raw: 绝对路径。
+        if (docId.startsWith("raw:")) {
+            return docId.substring(4);
+        }
+        // Download 根在 DownloadsProvider 里的 ID 就是 "downloads"(无冒号)。
+        if ("downloads".equals(docId)) {
+            return Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS).getAbsolutePath();
+        }
+        int colon = docId.indexOf(':');
+        if (colon < 0) {
+            return null;
+        }
+        String volume = docId.substring(0, colon);
+        String relative = docId.substring(colon + 1);
+        if (relative.startsWith("raw:")) {
+            return relative.substring(4);
+        }
+        // "home" 等 Documents 专用卷的相对路径基准不是 /storage/<volume>,
+        // 不映射 —— 给错路径比明确报错更难排查。
+        if ("home".equals(volume)) {
+            return null;
+        }
+        File base = "primary".equals(volume)
+                ? Environment.getExternalStorageDirectory()
+                : new File("/storage", volume);
+        if (relative.isEmpty()) {
+            return base.isDirectory() ? base.getAbsolutePath() : null;
+        }
+        // "primary" = 内部共享存储;其它卷 ID(如 SD 卡的 1A2B-3C4D)在
+        // /storage/<volume> 下。
+        if (!"primary".equals(volume) && volume.length() < 2) {
+            return null;
+        }
+        File resolved = new File(base, relative);
+        return resolved.isDirectory() ? resolved.getAbsolutePath() : null;
+    }
+
+    /**
+     * 取 URI 的文档 ID。
+     *
+     * <p><b>tree URI 必须用 {@code getTreeDocumentId}</b>:{@code getDocumentId}
+     * 只接受 document URI,对 {@code .../tree/primary%3ADownload%2Fgame} 会抛
+     * {@link IllegalArgumentException} —— 旧实现把它吞掉后返回 null,用户看到
+     * 的就是「明明能选却提示无法解析该目录的路径」。
+     */
+    private static String documentIdOf(Uri uri) {
+        List<String> segments = uri.getPathSegments();
+        boolean tree = segments.size() >= 2 && "tree".equals(segments.get(0));
+        return tree
+                ? android.provider.DocumentsContract.getTreeDocumentId(uri)
+                : android.provider.DocumentsContract.getDocumentId(uri);
+    }
+
+    private static boolean isTreeUri(Uri uri) {
+        List<String> segments = uri.getPathSegments();
+        return segments.size() >= 2 && "tree".equals(segments.get(0));
+    }
+
+    /** 查 `_data` 列;provider 不支持时返回 null(不抛)。 */
+    private String queryDataPath(Uri uri) {
         try (android.database.Cursor cursor = getContentResolver().query(uri,
                 new String[]{"_data"}, null, null, null)) {
             if (cursor != null && cursor.moveToFirst()) {
@@ -509,28 +776,9 @@ public final class SetupActivity extends AppCompatActivity {
                 }
             }
         } catch (Exception ignored) {
-            // 部分 provider 不提供 _data,继续用下面的规则拼。
+            // 部分 provider 不提供 _data。
         }
-        // downloads provider 的常见形态:content://.../document/primary:Download/yugame/x
-        String docId = null;
-        try {
-            docId = android.provider.DocumentsContract.getDocumentId(uri);
-        } catch (Exception ignored) {
-            // 不是 DocumentsContract URI。
-        }
-        if (docId == null) {
-            return null;
-        }
-        int colon = docId.indexOf(':');
-        if (colon < 0) {
-            return null;
-        }
-        String volume = docId.substring(0, colon);
-        String relative = docId.substring(colon + 1);
-        File base = "primary".equals(volume)
-                ? Environment.getExternalStorageDirectory()
-                : new File("/storage", volume);
-        return new File(base, relative).getAbsolutePath();
+        return null;
     }
 
     private static boolean isGameRoot(File dir) {
@@ -564,6 +812,11 @@ public final class SetupActivity extends AppCompatActivity {
         gpu.setTextColor(gpuSelected ? Color.WHITE : TEXT);
     }
 
+    /** 当前输入方式在按钮取值里的字符串。 */
+    private String selectedInputMode() {
+        return mouseMode ? "mouse" : "touch";
+    }
+
     /**
      * 任意「取值 → 高亮」按钮组:选中项用 ACCENT,其余用卡片底色。
      *
@@ -591,6 +844,13 @@ public final class SetupActivity extends AppCompatActivity {
         return view;
     }
 
+    /** 卡片内的小节标签(与卡片标题同色,带顶部留白)。 */
+    private TextView fieldLabel(String text) {
+        TextView view = sectionTitle(text);
+        view.setPadding(0, dp(12), 0, 0);
+        return view;
+    }
+
     /** GPU 接口三选一高亮。 */
     private void refreshGpuButtons(Button auto, Button gles, Button vulkan) {
         Button[] all = {auto, gles, vulkan};
@@ -600,6 +860,18 @@ public final class SetupActivity extends AppCompatActivity {
             all[i].setBackground(rounded(on ? ACCENT : Color.parseColor("#252b36"), 11));
             all[i].setTextColor(on ? Color.WHITE : TEXT);
         }
+    }
+
+    /** 帧率按钮高亮。 */
+    private void refreshFpsButtons() {
+        if (fpsButtons == null) {
+            return;
+        }
+        String[] values = new String[FPS_VALUES.length];
+        for (int i = 0; i < FPS_VALUES.length; i++) {
+            values[i] = String.valueOf(FPS_VALUES[i]);
+        }
+        refreshChoiceButtons(fpsButtons, values, String.valueOf(fps));
     }
 
     private void refreshLabels() {
@@ -618,25 +890,12 @@ public final class SetupActivity extends AppCompatActivity {
         }
     }
 
-    private void editSaveDir() {
-        final android.widget.EditText input = new android.widget.EditText(this);
-        input.setText(saveDir != null ? saveDir : "");
-        input.setHint("留空 = 游戏目录/save");
-        input.setSingleLine(true);
-        new androidx.appcompat.app.AlertDialog.Builder(this)
-                .setTitle("另指定存档目录")
-                .setView(input)
-                .setPositiveButton("确定", (dialog, which) -> {
-                    String text = input.getText().toString().trim();
-                    saveDir = text.isEmpty() ? null : text;
-                    refreshLabels();
-                })
-                .setNegativeButton("取消", null)
-                .setNeutralButton("恢复默认", (dialog, which) -> {
-                    saveDir = null;
-                    refreshLabels();
-                })
-                .show();
+    /** 选存档目录(系统目录选择器)。 */
+    private void pickSaveDirectory() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        startActivityForResult(intent, REQUEST_SAVE_DIR);
     }
 
     private void loadSystemFonts() {
@@ -724,6 +983,9 @@ public final class SetupActivity extends AppCompatActivity {
                 .putString("gpu_backend", gpuBackend)
                 .putString("patch", patch)
                 .putString("save_codec", saveCodec)
+                // 输入方式的启动值来自本页;游戏内切换不持久化。
+                .putBoolean("launch_mouse_mode", mouseMode)
+                .putInt("fps", fps)
                 .putBoolean("debug_log", debugLog)
                 .putBoolean("show_hud", showHud)
                 .putBoolean("prefetch", prefetch)
@@ -740,6 +1002,9 @@ public final class SetupActivity extends AppCompatActivity {
         intent.putExtra(MainActivity.EXTRA_FONT_FAMILY, family);
         intent.putExtra(MainActivity.EXTRA_BACKEND, backend);
         intent.putExtra(MainActivity.EXTRA_GPU_BACKEND, gpuBackend);
+        // 输入方式:带 Extra = 壳的显式选择,MainActivity 以它为准。
+        intent.putExtra(MainActivity.EXTRA_MOUSE_MODE, mouseMode);
+        intent.putExtra(MainActivity.EXTRA_FPS, fps);
         intent.putExtra(MainActivity.EXTRA_DEBUG_LOG, debugLog);
         intent.putExtra(MainActivity.EXTRA_SHOW_HUD, showHud);
         intent.putExtra(MainActivity.EXTRA_PREFETCH, prefetch);

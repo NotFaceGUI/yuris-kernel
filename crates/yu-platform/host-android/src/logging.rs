@@ -113,8 +113,16 @@ fn write_logcat(level: log::Level, body: &str) {
         log::Level::Debug => 3,
         log::Level::Trace => 2,
     };
-    // C 字符串:正文可能含 NUL(极少),先剔除,避免 CStr 截断。
-    let mut text = body.replace('\0', " ").into_bytes();
+    // C 字符串:正文可能含 NUL(极少),就地替换。预留 +1 给结尾 NUL,
+    // 避免 `to_vec()` 恰好满容量、`push(0)` 再触发一次扩容。
+    let bytes = body.as_bytes();
+    let mut text = Vec::with_capacity(bytes.len() + 1);
+    text.extend_from_slice(bytes);
+    for byte in &mut text {
+        if *byte == 0 {
+            *byte = b' ';
+        }
+    }
     text.push(0);
     // SAFETY: 两个指针都指向本函数内/编译期有效的 NUL 结尾字节缓冲;
     // `__android_log_write` 只读取它们,不保留引用。

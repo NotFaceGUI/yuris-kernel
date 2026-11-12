@@ -74,6 +74,29 @@ const DEVICE_POLL: Duration = Duration::from_millis(300);
 const TONE_HZ: f64 = 1000.0;
 const TONE_AMP: f32 = 0.25;
 
+/// 宿主挂起闸门(壳 `onPause` / `onResume` 直接翻,任意线程)。
+///
+/// `true` 时:设备回调补静音、mixer 停止向引擎取数并清空环形缓冲。
+///
+/// **为什么不能只靠引擎 `Engine::suspend()`**:壳在 `onPause` 里先登记挂起
+/// 请求、随即关泵;而 `engine.suspend()` 只能在渲染线程的下一帧 tick 前
+/// 执行 —— 泵一关就不再 tick,请求可能要等回到前台才被消费,期间环里
+/// 已排队的 0.3~0.9s 音频照播(实机「切后台还有声音」)。这个闸门不依赖
+/// 渲染线程,`nativeSuspend()` 一返回就已经静音。
+static OUTPUT_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// 立即暂停/恢复音频输出(任意线程,幂等)。
+pub fn set_output_paused(paused: bool) {
+    let was = OUTPUT_PAUSED.swap(paused, Ordering::AcqRel);
+    if was != paused {
+        log::info!(
+            target: "yu-android",
+            "[sound] 输出{}",
+            if paused { "已暂停(后台)" } else { "已恢复(前台)" }
+        );
+    }
+}
+
 fn current(slot: &Slot) -> Option<Arc<Mutex<SoundState>>> {
     slot.lock().ok().and_then(|slot| slot.clone())
 }
@@ -137,6 +160,17 @@ impl DevStats {
             self.gap_max_us
                 .fetch_max(now.saturating_sub(last), Ordering::Relaxed);
         }
+    }
+
+    /// 挂起期间的静音块:仍计回调(监督线程的僵死看门狗靠它判断流还活着,
+    /// 否则挂后台 2.4s 后会被误判为「流僵死」反复重建),但**不计交付断供**
+    /// —— 此时本来就不该出声,记 `short` 会把诊断水位搞脏。
+    fn on_paused_block(&self, requested: usize) {
+        self.callbacks.fetch_add(1, Ordering::Relaxed);
+        self.total_callbacks.fetch_add(1, Ordering::Relaxed);
+        self.frames.fetch_add(requested as u64, Ordering::Relaxed);
+        let now = self.origin.elapsed().as_micros() as u64;
+        self.last_at_us.store(now, Ordering::Relaxed);
     }
 }
 
@@ -542,6 +576,13 @@ fn build_stream(
         cpal::SampleFormat::F32 => device.build_output_stream(
             config,
             move |data: &mut [f32], _| {
+                // 挂起:立刻补静音,不从环里取(环由 mixer 清空)。
+                // 只读一个原子量,实时线程零锁零分配。
+                if OUTPUT_PAUSED.load(Ordering::Relaxed) {
+                    data.fill(0.0);
+                    stats.on_paused_block(data.len());
+                    return;
+                }
                 // 实时线程:无锁拷贝;不分配、不拿锁、不解码。
                 let level = ring.level();
                 let take = ring.pop_into(data);
@@ -557,6 +598,11 @@ fn build_stream(
             device.build_output_stream(
                 config,
                 move |data: &mut [i16], _| {
+                    if OUTPUT_PAUSED.load(Ordering::Relaxed) {
+                        data.fill(0);
+                        stats.on_paused_block(data.len());
+                        return;
+                    }
                     let cap = scratch.len().min(data.len());
                     let (level, take) = {
                         let buf = &mut scratch[..cap];
@@ -582,6 +628,11 @@ fn build_stream(
             device.build_output_stream(
                 config,
                 move |data: &mut [u16], _| {
+                    if OUTPUT_PAUSED.load(Ordering::Relaxed) {
+                        data.fill(32768);
+                        stats.on_paused_block(data.len());
+                        return;
+                    }
                     let cap = scratch.len().min(data.len());
                     let (level, take) = {
                         let buf = &mut scratch[..cap];
@@ -753,8 +804,21 @@ fn spawn_mixer(shared: Shared) {
             let mut last_state_id: usize = 0;
             let mut tone_phase: f64 = 0.0;
             let mut tone_rate = 0u32;
+            let mut was_paused = false;
 
             while shared.running.load(Ordering::Acquire) {
+                // 挂起:不向引擎取数,并清掉环里已排队的音频。不清的话
+                // 回调虽然补静音,恢复后环里的旧声音会先播出来(与画面对不上);
+                // 清空后恢复时从当前 SoundState 位置重新补满。
+                if OUTPUT_PAUSED.load(Ordering::Acquire) {
+                    if !was_paused {
+                        was_paused = true;
+                        shared.ring.discard_all();
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                was_paused = false;
                 let rate = shared.rate.load(Ordering::Acquire).max(1);
                 let channels = usize::from(shared.channels.load(Ordering::Acquire).max(1));
                 if rate != tone_rate {

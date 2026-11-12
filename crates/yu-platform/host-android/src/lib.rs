@@ -615,6 +615,9 @@ fn store_session(started: StartedEngine) -> Result<String, String> {
     SHUTDOWN_REQUEST.store(false, std::sync::atomic::Ordering::Release);
     SUSPEND_REQUEST.store(false, std::sync::atomic::Ordering::Release);
     RESUME_REQUEST.store(false, std::sync::atomic::Ordering::Release);
+    // 新会话从「未挂起」开始:上一轮若在后台被销毁,音频闸门可能留在
+    // paused 状态;不清掉的话新会话会静音到第一次 onResume。
+    sound::set_output_paused(false);
     SESSION.with(|slot| {
         *slot.borrow_mut() = Some(Session {
             engine: started.engine,
@@ -1141,11 +1144,15 @@ pub fn tick() -> i32 {
                 // 「切动作卡」只能靠猜。这里按桌面 `--spike-log` 的口径把
                 // 慢帧写进 logcat —— 修不修得动先放一边,至少要能量到。
                 //
-                // 阈值固定 20ms(= 60fps 下丢一帧),只读 `RenderedFrame.report`
-                // 里的既有字段,不做额外取数。
+                // 阈值 8ms(约半帧;超过就算一次可感知的慢帧),只读
+                // `RenderedFrame.report` 里的既有字段,不做额外取数。
+                //
+                // **只在诊断模式(!quiet)开**:发布模式里 8ms 阈值的慢帧
+                // 很常见,每帧都要取渲染阶段 + 拼 resource_snapshot 再写
+                // logcat,前 2000 帧是纯浪费;要看时开「调试日志」即可。
                 {
                     let report = &rendered.report;
-                    if report.ms >= 8.0 && session.spikes_logged < 2000 {
+                    if !session.quiet && report.ms >= 8.0 && session.spikes_logged < 2000 {
                         session.spikes_logged += 1;
                         // 慢帧必须自带**归因**:只有 tick/render 两个数无法判断
                         // 是 VM 慢还是渲染规划慢,更分不出 `plan` 里是图像加工、
@@ -1376,7 +1383,10 @@ pub fn fill_argb(out: &mut Vec<i32>) -> usize {
         if pixels == 0 {
             return 0;
         }
-        out.reserve(pixels.saturating_sub(out.capacity()));
+        // `clear()` 后 len=0,`reserve(pixels)` 即「容量至少 pixels」。
+        // 旧写法 reserve(pixels - capacity) 在缩容/扩容边界会少要,
+        // 随后的 push 仍能靠自动扩容兜住,但会多一次整帧重分配。
+        out.reserve(pixels);
         for pixel in rgba.chunks_exact(4) {
             let argb = (u32::from(pixel[3]) << 24)
                 | (u32::from(pixel[0]) << 16)
@@ -1544,6 +1554,10 @@ pub fn status_text() -> String {
 ///
 /// 返回 `0` 成功、`-1` 会话未初始化。重复调用幂等。
 pub fn suspend() -> i32 {
+    // 音频闸门必须在**调用线程**立即生效:壳的 onPause 紧接着就关泵,
+    // 渲染线程不会再 tick,挂起请求可能要等回到前台才被消费 —— 期间
+    // 环形缓冲里已排队的音频还会继续播(实机「切后台还有声音」)。
+    sound::set_output_paused(true);
     // 跨线程只置请求标志;真正的 `engine.suspend()` 由渲染线程执行
     // (见 [`tick`] 开头的 `apply_pending_lifecycle`)。
     SUSPEND_REQUEST.store(true, std::sync::atomic::Ordering::Release);
@@ -1554,6 +1568,7 @@ pub fn suspend() -> i32 {
 ///
 /// 返回 `0` 成功、`-1` 会话未初始化。
 pub fn resume() -> i32 {
+    sound::set_output_paused(false);
     RESUME_REQUEST.store(true, std::sync::atomic::Ordering::Release);
     0
 }
