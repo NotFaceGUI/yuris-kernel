@@ -43,6 +43,13 @@ vm.set_sound_host(Box::new(SoundHost::new(state.clone(), vm.tables().boot.yscm.c
   7 个字段时其余字段连续写 `LET`，最后者胜出。
 - 未装宿主时 `yu-rt` 行为与 M-2 逐位一致（600 帧普查 531/7,200/1）。
 
+## 影片音频
+
+`MOVIE` 的 MP2 音轨也汇入本 crate：`MovieHost::take_audio` 交付交错 PCM，
+`movie` 模块用环形缓冲 + 线性重采样 + 官方 COM 音量曲线混音，桌面 cpal 与
+Android cpal→oboe 同一路径。影片视频时钟走逻辑帧、音频走设备实时时钟，
+两者漂移与 `MOVIE[PLAY=0]` 的剩余项见 `docs/todo-inventory.md` §3.3。
+
 ## 依赖
 
 | crate | 许可 | 理由 |

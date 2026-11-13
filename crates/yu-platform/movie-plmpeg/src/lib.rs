@@ -24,8 +24,9 @@
 //! # 限制
 //!
 //! - 只解 **MPEG-1 program stream**(`.mpg`/`.mpeg`);AVI/MP4 需要别的后端。
-//! - **音频暂未接入**:pl_mpeg 能解 MP2,但把 PCM 送进 `yu-sound` 的通路
-//!   属于声音域接线(下一批);`MOVIE[VOLUME]` 的语义值已由内核保存。
+//! - **MP2 音频已接入**:[`PlmMovieHost::take_audio`] 交付交错 PCM,由
+//!   `yu-sound::movie` 的环形缓冲、线性重采样与 COM 音量曲线混音;
+//!   `MOVIE[VOLUME]` 的语义值仍由内核保存。
 //! - 播放时钟由宿主每帧调用 [`PlmMovieHost::frame`] 驱动;暂停时保留最后
 //!   一帧(官方 `MOVIE[PLAY=0]` 停止后画面仍在,直到 `MOVIEEND`)。
 

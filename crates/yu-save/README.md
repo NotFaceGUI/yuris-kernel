@@ -25,10 +25,10 @@ YU-RIS 存档与文件域(`SAVE` / `LOAD` / `SAVEEND` / `SAVEINFO` /
 | 项 | 处置 | 依据 |
 |---|---|---|
 | `SAVE[FILE]` 刷盘 | **已实现**(`flush` 按 DNO 升序写预约时的字节快照;默认**可写**,只读为显式构造态,拒绝时挂号 `sv.write.refused`) | B1 裁 1-A/裁 2-A;REA `0x44d73d`/`0x44e1a0` |
-| `LOAD[LET/ID]` 值写回 | 容器读侧照常(槽表/解析);图层恢复挂账 H-P4-02 | DIV-RT-042 + H-P4-02 |
+| `LOAD[LET/ID]` 值写回 | 容器读侧照常(槽表/解析);`LOAD[ID]` 图层恢复已实现(PNG 写合成资产叠层 + 图层纹理指向 + 尺寸注入) | DIV-RT-042 + DIV-RT-059 |
 | `SAVEINFO` | **官方 no-op**(`0x44e1c8` 守卫后 `xor eax,eax; pop ecx; ret`;VM 分派为 `HandlerKind::Noop`,不再进入存档域) | REA 2026-11-10(`44e1e1 33 c0 59 c3`);`fixture::saveinfo_and_var_are_official_noops` |
 | `FILEACT[EXEC]` | 拒绝(`sv.exec.refused`) | 无引擎语义取证 + 宿主安全策略(不执行外部程序) |
-| `FILEACT` 图层导出(BMP/PNG/JPG) | 挂账 H-P4-02(→ P2/集成轮) | 需要 gfx |
+| `FILEACT` 图层导出(BMP/PNG/JPG) | 仍缺(需 gfx 提供图层像素导出面) | 与已收口的 SAVE/LOAD 缩略图是两条路径 |
 | `FILEINFO[EXIST]` | **不双写**(内核 J3 已实现) | REA `0x44286c` |
 | SNP 压缩形态 | 可读可写(`BlockCodec::Snappy`,按盘上既有存档 → 引擎代号 → zlib 判定) | 0.495 产物 `78 01` 头;CLI `--save-codec` |
 | FILEACT 落盘 | 仅在**显式可写 save 根**下允许 | 保护语料工程目录 |

@@ -50,10 +50,11 @@ SX/SY/COLOR/ONMOUSE 族)、FONTINFO(当前样式与字体清单)、WINDOWINFO(�
 `MID` 外部掩码、`CG[TIDNO]`/`SWAP`/`ID3 ID4 Z2 BNO`、文本层 ID 字节化、
 `CGACT[TEXT]` 空串降噪、psC/psD 转场、屏幕快照冻结与烘焙回执。
 
-仍挂账:多部件层几何语义(004)、`CGINFO[SX/SY]` 未注入资产与部分
-`COLOR` 字段(024/026)、缺失目标的非 EXIST 字段(038)、半像素/quad
-相位与过渡覆盖度 TA 残差(042/045)、官方文本行缓冲/页清屏/折行/每字符
-样式(075)、自动换行与行高基线(056)、无文本图层时的屏幕叠加层序(057)。
+仍挂账:多部件层几何语义(004)、`CGINFO[SX/SY]` 未注入资产(已注入资产与
+`COPY/COPY2` 切片已可答)与部分 `COLOR` 字段(024/026)、缺失目标的非
+EXIST 字段(038)、半像素 / quad 相位与过渡覆盖度 TA 残差(042/045)、
+官方文本行缓冲/页清屏/折行/每字符样式(075)、自动换行与行高基线(056)、
+无文本图层时的屏幕叠加层序(057)。
 
 首屏 golden:`tests/golden/eris_first_screen_display.json`
 (199 层 / 7 visible / 82 pass / 85 op;`9aca9fa`/DIV-GFX-016 删除 73 个

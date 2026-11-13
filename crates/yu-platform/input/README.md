@@ -24,7 +24,8 @@ yu-rt::input             ← 计数器/源开关/脚本写回钳制
 - **浏览器**:`www/app.js` 只上送 `{t:'key',code}` / `{t:'pointer',button}` /
   `{t:'wheel',dy}`;`yu-cli serve` 在本 crate 里映射,页面不再复制键表。
 - **光标**:`cursor_shape` + `cursor_visible` 是平台无关策略;桌面映射到
-  winit `CursorIcon`,后续 wasm/Android 映射到 CSS/系统光标。
+  winit `CursorIcon`,浏览器呈现端由 CSS/页面处理,Android 由壳绘制虚拟
+  光标并通过 `nativeSetCursor` 注入视口坐标。
 
 ## 为什么极短点击要延迟抬起
 

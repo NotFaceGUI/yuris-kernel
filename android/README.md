@@ -9,12 +9,16 @@ android/                             ← 轻量 UI 壳(纯 Java,无 AndroidX)
 tools/android/build.sh               ← so 交叉编译 + APK 打包
 ```
 
-## 为什么第一期用 soft 后端
+## 渲染路径:GPU 为主
 
-要验证的是**跨平台能力等价**(数据读取、存档写入、字体枚举、脚本执行),
-不是 GPU 像素性能。`--backend soft` 是确定性参考实现、零 GPU 依赖,帧以
-RGBA 交给 Java 侧 Bitmap 上屏,与桌面 `yu-cli run --backend soft` 出**同构**
-的帧。wgpu(`Surface`/Vulkan)是后续增强路径,不阻塞本阶段验证。
+壳固定以 `wgpu` 启动:Java 侧把 `TextureView` 的 Surface 交给 so,wgpu 在
+同一 device 上直接采样上屏(零拷贝,省掉 GPU→CPU 读回与重上传)。单次启动
+不会静默降级:GPU 初始化失败即显式报错并回配置界面;壳随后把重试参数切到
+`soft`,由用户手动重试(避免自动降级让「GPU 模式画错」永远对不上号)。
+
+`soft` 仍是 so 的缺省后端(不传 `backend` 时)与开发机会话测试的参考路径:
+确定性、零 GPU 依赖,帧以 RGBA 交 Java 画 Bitmap,与桌面
+`yu-cli run --backend soft` 同构。壳内的 CPU 按钮已停用,仅占位。
 
 ## 构建
 
@@ -186,8 +190,9 @@ files/save/             ← 存档(可写)
 ## 触摸 → 输入
 
 触摸坐标按 surface 尺寸映射回游戏视口像素,`ACTION_DOWN/UP` 映射
-`MOUSE_L` 的按下/抬起(经 `yu-platform-input` 的按钮 ABI)。虚拟按键/手势
-映射尚未取证(架构 §2.5.9 开放问题 9),当前只做单点 = 鼠标左键。
+`MOUSE_L` 的按下/抬起(经 `yu-platform-input` 的按钮 ABI);双指上下滑映射
+滚轮,虚拟光标模式由壳把拖动/抬手翻译成移动 + 左键。虚拟按键(菜单/存档
+快捷键)尚未取证(架构 §2.5.9 开放问题 9)。
 
 ## 生命周期(见 DIV-AND-005)
 
@@ -208,7 +213,7 @@ mixer 停止取数并清空环形缓冲),不依赖渲染线程的下一帧 tick 
 | Extra | 键 | 取值 | 缺省 |
 |---|---|---|---|
 | `game_dir` / `save_dir` | 同名 | 游戏根 / 存档根 | `files/game` / `<game>/save` |
-| `backend` / `gpu_backend` | 同名 | `soft\|wgpu` / `auto\|gles\|vulkan` | soft / auto |
+| `backend` / `gpu_backend` | 同名 | `soft\|wgpu` / `auto\|gles\|vulkan` | 壳固定 `wgpu`；so 缺省 `soft` / auto |
 | `entry` | 同名 | 入口标签 | SYSTEM_START |
 | `font_path` / `font_family` | `font_file` / `font` | 字体文件 / family | 空 |
 | `patch` | 同名 | `auto\|original\|gbk\|big5\|tunnel` | auto |

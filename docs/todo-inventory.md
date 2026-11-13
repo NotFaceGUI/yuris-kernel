@@ -1,5 +1,10 @@
 # TODO / 待办总账(2026-10-22 审查后更新)
 
+> **2026-11-13 复核**:本文件仍是历史快照,不逐条代表现状。至少以下条目
+> 已在代码中收口而本文未反映:`SAVEINFO` / `VAR` 官方 no-op、`REGINFO`
+> 桌面接线、影片 MP2 音频、`LOAD[ID]` 图层恢复、`CGINFO[SX/SY]` 的
+> `COPY/COPY2` 切片。当前状态以 `PROGRESS.md`、各 crate README 与台账为准。
+>
 > 本文件是**扫描结果**,不是新的进度真相。真相仍在 `PROGRESS.md` 与各台账。
 > 扫描对象:`docs/gfx-unimplemented-todo.md`、`crates/yu-rt/docs/coverage-matrix.md`、
 > `docs/divergences/*.md`、`crates/*/docs/divergences/README.md`、

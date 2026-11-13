@@ -51,7 +51,7 @@ fn runs_real_corpus_and_emits_frames() {
         .expect("init_session 应成功");
     eprintln!("init: {summary}");
     assert!(summary.starts_with("OK "), "初始化摘要异常: {summary}");
-    assert!(summary.contains("backend=soft"), "Android 宿主固定 soft: {summary}");
+    assert!(summary.contains("backend=soft"), "so 缺省 backend=soft: {summary}");
     assert!(save_root.is_dir(), "存档目录必须被物化: {}", save_root.display());
 
     // 跑若干帧:Android 上没有窗口,帧由 tick_realtime 推进。

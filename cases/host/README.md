@@ -1,7 +1,8 @@
 # `cases/host/` · 桌面宿主复现脚本(P1)
 
-这里的 `*.json` **不是** `yu-cli case` 的用例,而是 `yu-desktop --script`
-的场景脚本(格式见 `crates/yu-platform/host-desktop/src/script.rs`)。
+这里的 `*.json` **不是** `yu-cli case` 的用例,而是
+`yu-cli run --mode desktop --script` 的场景脚本(格式见
+`crates/yu-platform/host-desktop/src/script.rs`)。
 
 `yu-cli case` 只读 `cases/` 顶层(`list_cases` 不递归),所以本目录不会
 进入 `case --all` 门禁;真正进用例门禁的症状回归是 `cases/symptom-*.json`。
@@ -19,9 +20,9 @@
 运行(证据产物只写 `target/tmp`):
 
 ```bash
-cargo build --release -p yu-host-desktop
-target/release/yu-desktop.exe <project-eris> --backend wgpu --debug-ui \
-    --script cases/host/symptom-5-close-twice.json \
+cargo build --release -p yu-cli
+target/release/yu-cli.exe run <project-eris> --mode desktop --backend wgpu \
+    --debug-ui --script cases/host/symptom-5-close-twice.json \
     --log-file target/tmp/p1/close-twice.jsonl \
     --shot target/tmp/p1/close-twice.png
 ```

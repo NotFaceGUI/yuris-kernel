@@ -1,4 +1,4 @@
-# 跨平台能力矩阵(2026-11-01)
+# 跨平台能力矩阵(2026-11-13 更新)
 
 > 上位文档:`docs/architecture.md` §2.5(v2 跨平台目标架构)。
 > 本文件记录**实际落地**的可移植性状态,不是规划。
@@ -7,7 +7,7 @@
 
 ```text
 L0 内核(平台中立)      yu-rt / yu-gfx / yu-sound / yu-save / yu-format /
-                        yu-vfs / yu-render-soft / yu-render-wgpu / yu-font
+                        yu-vfs / yu-backend-soft / yu-backend-wgpu / yu-font
 L1 能力端口             SaveFs(存档文件系统) · HostPaths(路径注入) ·
                         FontBytes(字体字节) · AudioOut(混音出口) · DataSource(数据树)
 L2 唯一装配             yu-engine(Engine / EngineOptions / Project / boot / tick)
@@ -26,8 +26,9 @@ L3 宿主                 yu-cli(--mode desktop / headless) · host-android
 | 宿主字体注入 | 可用 | 可用(`<data>/fonts/`) | **必需**(唯一来源) |
 | 路径系统变量 | `USERPROFILE`/`HOME` | 宿主显式给(app 私有目录) | 宿主显式给 |
 | 声音设备 | cpal | cpal(oboe 后端;真机 59.9fps 出声,欠载 0) | 暂不出声(架构决定) |
-| 渲染 | soft / wgpu | soft(第一期) | 待做 |
-| 输入 | winit → `yu-platform-input` | 触摸 → `MOUSE_L` | DOM 事件 → 同层 |
+| 渲染 | soft / wgpu | 壳默认 wgpu(零拷贝 `ANativeWindow`;失败重试可切 soft) | 待做 |
+| 输入 | winit → `yu-platform-input` | 触摸/双指滑/虚拟光标 → `MOUSE_L` / 滚轮 | DOM 事件 → 同层 |
+| 影片 | MPEG-1 PS + MP2 音频(pl_mpeg 后端) | 同左 | 暂不支持 |
 | 退出信号 | `Engine::lifecycle()` → 关窗 | 同一判据:`nativeTick()==1` ⇒ `finish()` | 同一判据(待接) |
 | 挂起/恢复 | `suspend`/`resume`(窗口最小化) | `onPause`/`onResume` → `nativeSuspend/Resume` | 页面隐藏(待接) |
 | 文本编码 | `--patch`(auto/original/gbk/**big5**/tunnel) | 配置界面选 + `run-config.json` 同键 | 同一份 `PatchKind` |

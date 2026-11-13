@@ -9,26 +9,37 @@
 static { System.loadLibrary("yu_host_android"); }
 ```
 
-so 的 ABI:`arm64-v8a`(真机)、`x86_64`(模拟器)。目前固定 **soft 渲染后端**
-(CPU 出帧,零 GPU 依赖,与桌面 `--backend soft` 同构)。
+so 的 ABI:`arm64-v8a`(真机)、`x86_64`(模拟器)。so 的 `backend` 缺省是
+**`soft`**(CPU 出帧,零 GPU 依赖,与桌面 `--backend soft` 同构);随包 Java
+壳默认传 **`wgpu`** 并走零拷贝上屏,单次启动 GPU 不可用时显式失败、不降级
+(失败回配置界面后,壳把重试参数切到 `soft`)。
 
 ## 入口一览
 
 | 方法 | 作用 |
 |---|---|
 | `nativeInitJson(String json)` | **推荐**。按 JSON 配置启动会话 |
-| `nativeTick()` | 推进一帧;`0` 成功 / `-1` 未初始化 / `-2` 失败 |
+| `nativeInit(...)` | 旧接口(数据根/存档根/入口/字体),直接调 `init_session_with_fonts` |
+| `nativeInitAndroidContext()` | 注入 JavaVM / Application Context(oboe 需要) |
+| `nativeTick()` | 推进一帧;`0` 继续 / `1` 游戏结束 / `4` 宿主销毁请求 / `-1` 未初始化 / `-2` 失败 |
 | `nativeFrameSize()` | `[w, h]`;未出帧为 `[0, 0]` |
 | `nativeCopyFrame(int[] out)` | 写 ARGB_8888 像素;返回像素数,负值失败 |
+| `nativeAttachSurface(Surface)` | 绑定原生窗口,wgpu 零拷贝上屏 |
+| `nativeResizeSurface(int w, int h)` | 视口变化后登记重建(渲染线程下一帧执行) |
 | `nativeSetInput(String button, boolean pressed)` | 注入按钮(`MOUSE_L` / `KEY_ENTER` …) |
 | `nativeSetCursor(int x, int y)` | 注入光标(游戏视口像素坐标) |
 | `nativeStatus()` | 诊断摘要(状态、帧号、fps 之外的对账数字、最近错误) |
 | `nativeListFonts()` | 本机字体族名单(`\n` 分隔) |
 | `nativeVersion()` | 构建目标标记 |
-| `nativeShutdown()` | 释放会话;`0` = 确实释放了 |
+| `nativeSuspend()` / `nativeResume()` | 生命周期挂起 / 恢复 |
+| `nativeLifecycle()` | 退出细分:1 主脚本走完 / 2 脚本 `END` / 3 `END`+RESTART / 0 运行中 |
+| `nativeTakeShutdownRequest()` | 取走并清除关窗请求 |
+| `nativeShutdown()` | 释放会话(跨线程调用只登记请求);`0` 成功 |
 
-**线程**:所有方法必须在**同一线程**调用(内核单线程,会话状态在
-thread-local)。推荐用一个专用渲染线程,主线程只发输入标志。
+**线程**:除 `nativeShutdown` / `nativeResizeSurface` / `nativeSuspend` /
+`nativeResume`(只登记原子请求,可从任意线程调用)外,所有方法必须在
+**同一线程**调用(内核单线程,会话状态在 thread-local)。推荐用一个专用
+渲染线程,主线程只发输入标志。
 
 ## 启动配置(JSON)
 
@@ -49,7 +60,7 @@ thread-local)。推荐用一个专用渲染线程,主线程只发输入标志。
   "os_sound": true,   // @_OS_SOUND 注入值(对拍口径恒 true)
   "audio": true,      // 是否真的输出音频;false 只静音,不影响 os_sound
   // ---- 视频 ----
-  "backend": "soft",  // soft(CPU) | wgpu(GPU);GPU 不可用即显式失败,不降级
+  "backend": "wgpu",  // soft(CPU) | wgpu(GPU);随包壳固定 wgpu,GPU 不可用即显式失败
   "fps": 60,
   "screen_color": 32, // @_SCREEN_COLOR
   "dx_mode": 0,       // @_DX_MODE
@@ -147,8 +158,8 @@ JSONL 走 `BufWriter`,内核在启动收尾、`nativeStatus()` 与 `nativeShutdo
 
 | `backend` | 说明 |
 |---|---|
-| `soft`(默认) | CPU 出帧。零 GPU 依赖,与桌面 `--backend soft` 同构 |
-| `wgpu` | GPU 出帧。设备不支持 Vulkan/GLES 时**显式失败**,不自动降级 |
+| `soft`(so 缺省) | CPU 出帧。零 GPU 依赖,与桌面 `--backend soft` 同构;壳默认不选,GPU 失败返回配置界面后作为重试参数 |
+| `wgpu`(壳默认) | GPU 出帧,零拷贝 `ANativeWindow` 上屏。设备不支持 Vulkan/GLES 时**显式失败**,不自动降级 |
 
 不自动降级是有意的:自动降级会让"GPU 模式画错"永远对不上号(用户看到的是
 CPU 结果,却以为在看 GPU)。

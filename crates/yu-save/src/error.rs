@@ -7,7 +7,7 @@ use yu_log::{Boundary, Diag, Severity};
 
 /// 稳定错误码表(`sv.*` 命名空间)。
 pub mod code {
-    /// 存档/文件域命令未实现或未取证(SAVEINFO/图层导出等)。
+    /// 存档/文件域命令未实现或未取证(图层导出等)。
     pub const COMMAND_UNIMPLEMENTED: &str = "sv.command.unimplemented";
     /// 命令名不在工程 ysc 表里。
     pub const COMMAND_UNKNOWN: &str = "sv.command.unknown";

@@ -662,8 +662,8 @@ impl SaveState {
     }
 
     /// `FILEACT`:手册 `file/fileact.html`。已实现 COPY / DELETE(FILE 存档
-    /// 或 FOLDER 空文件夹);EXEC 拒绝;图层导出(BMP/PNG/JPG+ID)挂账
-    /// H-P4-02。
+    /// 或 FOLDER 空文件夹);EXEC 拒绝;图层导出(BMP/PNG/JPG+ID)仍缺,
+    /// 需 gfx 提供图层像素导出面。
     fn apply_fileact(&mut self, frame: u64, args: &[(String, &Value)]) {
         let mut file: Option<String> = None;
         let mut file2: Option<String> = None;
@@ -704,7 +704,7 @@ impl SaveState {
             self.push_diag(error::at_command(
                 error::unimplemented(
                     code::COMMAND_UNIMPLEMENTED,
-                    "FILEACT 图层导出(ID/BMP/PNG/JPG)未实现(H-P4-02 → P2/集成轮)".to_string(),
+                    "FILEACT 图层导出(ID/BMP/PNG/JPG)未实现(需 gfx 图层像素导出面)".to_string(),
                 ),
                 frame,
                 "FILEACT",

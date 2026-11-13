@@ -51,7 +51,7 @@ so + 轻量 Java 壳
 
 - 构建：`tools/android/build.sh`，产物 `app-debug.apk` / `app-release.apk`（arm64-v8a + x86_64）。
 - 安装后选游戏目录即可运行；存档写 `<游戏目录>/save/`，`.sd` 与桌面字节一致。
-- 输入：触摸 = 鼠标左键，双指上下滑 = 滚轮，右下角切换虚拟鼠标。
+- 输入：触摸 = 鼠标左键，双指上下滑 = 滚轮，右下角切换虚拟光标。
 - 退出：脚本 `END` 后回到配置界面。
 
 ## 构建
@@ -185,15 +185,18 @@ flowchart TD
 
 ## 待办
 
-- 渲染：多部件层几何语义、`CGINFO` 部分字段（`SX/SY` 未注入资产、`COLOR`）、
-  缺失目标的非 EXIST 字段未收口；半像素 / quad 相位与过渡覆盖度待官方截图定论。
+- 渲染：多部件层几何语义；`CGINFO[SX/SY]` 已覆盖已注入资产与 `COPY/COPY2`
+  切片，未注入资产仍缺；`COLOR` 等字段、缺失目标的非 EXIST 字段未收口；
+  半像素 / quad 相位与过渡覆盖度待官方截图定论。
 - 文本：官方「行完成清空 / `'P'` 清表面 / 宽度折行 / 每字符样式」与内核累积缓冲
   仍有差异；换行 / 行高 / 基线未与官方截图定论。
 - 格式：YSTB V2 缺样本；YPF 旧 NUL-XOR 方言无样本，显式拒绝。
-- 存档：SAVEINFO、图层导出未闭环；FILEACT[EXEC] 拒绝执行。
-- 宿主：REGINFO 需注册表能力；CSVINFO / VAR 未取证；Linux / macOS 桌面与
-  真 wasm（内存数据源 + 浏览器存档）未验证。
-- 影片：只解 MPEG-1 program stream；MP2 音频未接入。
+- 运行时：`CSVINFO` 未取证；`VAR`、`SAVEINFO` 已按官方 no-op 对齐。
+- 存档：`FILEACT` 图层导出未闭环；`FILEACT[EXEC]` 拒绝执行（宿主安全策略）。
+- 宿主：`REGINFO` 桌面已接（Windows 注册表）；Linux / macOS 桌面与真 wasm
+  （内存数据源 + 浏览器存档）未验证。
+- 影片：MPEG-1 program stream 可播（视频 + MP2 音频）；MPEG-2 / AVI / FLASH
+  等需新的媒体 / Flash 宿主；`MOVIE[PLAY=0]` 与音视频时钟漂移未对齐。
 - E-mote：子模块 `yu-emote/`，主线暂缓。
 
 ## 文档
@@ -203,10 +206,13 @@ flowchart TD
 - `docs/cross-platform.md` — 跨平台能力矩阵
 - `docs/architecture/backends.md` — soft / wgpu 边界
 - `docs/render-parity.md` — 渲染语义与证据
-- `docs/todo-inventory.md` — 缺口清单
+- `docs/todo-inventory.md` — 历史缺口快照（2026-10-22；当前状态以
+  `PROGRESS.md` 与各台账为准）
 - `docs/references/open-source-tools.md` — 工具参考
 - `docs/release.md` — tag 发布与产物
 - `android/README.md` — Android 壳构建与实机验证
+- 各 crate 的 `README.md` — 职责边界、端口与验证命令；`crates/yu-platform`、
+  `crates/yu-render` 是目录索引
 
 ## 致谢
 

@@ -91,7 +91,7 @@ instance/device 创建与一次性读回。
 ```text
 src/device.rs     instance/adapter/device/queue;platform.gpu.* 诊断码
 src/textures.rs   TextureStore RGBA8 → GPU 上传;资产/目标身份与缓存
-src/pipelines.rs  blend 管线(0/1/2/6/7 + psC/psD + psA/psB);bind group/sampler/paint 缓存
+src/pipelines.rs  blend 管线(0/1/2/3/5/6/7/9 + psC/psD + psA/psB);bind group/sampler/paint 缓存
 src/shaders/      引擎 shader 的独立 WGSL + registry(quad/fixed/psC/psD/psA/psB/paint)
 src/passes.rs     按 passes 顺序规划:跳过记账、纹理解析、顶点生成
 src/readback.rs   texture → 256 字节行对齐 buffer → 紧凑 RGBA8
@@ -187,7 +187,7 @@ let out = backend.render_frame_scaled(
 | `draw_calls` vs `ops_drawn` | 记账 | 目标尺寸为 0 时 op 算“已执行”但不产生 GPU draw;报告分别给出两个数 |
 | i64 坐标 → f32 NDC | 舍入 | 极端坐标在 f32 下损失精度;这些四边形本来就在视口外,可见区域实测一致 |
 | 组尺寸未给时回退视口 | 未取证 | 继承 gfx/soft 的 Likely 决策(DIV-GFX-008) |
-| COPY/图像加工/掩码/过渡 | 未实现 | 与 soft 同一跳过原因与计数;不近似 |
+| COPY/图像加工/掩码/过渡 | 已对齐(独立 `Op::Mask` 除外) | COPY / Image / Transition 与 soft 同式;独立 `Op::Mask` 两端都跳过并计数,不近似 |
 
 **唯一硬性检查**(不是逐像素对拍):
 - `passes / ops_total / ops_drawn / skipped_ops_total` 与

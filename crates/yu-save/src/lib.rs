@@ -18,8 +18,9 @@
 //!   构造态,拒绝时挂号 `sv.write.refused`);
 //! - 预约 = 命令时刻值快照(REA `0x44d73d`),`flush` 不清预约,
 //!   `save_end` 清(REA `0x44e1a0`/语料 es_GSD 同型);
-//! - `SAVEINFO` 查询未取证(REA `0x44e1c8`,语料 0 次)⇒ 挂账 B7;
-//! - `FILEACT[EXEC]` 拒绝执行;图层导出挂账 H-P4-02;
+//! - `SAVEINFO` 是官方 no-op(REA `0x44e1c8`:守卫后 `xor eax,eax; pop ecx;
+//!   ret`),VM 分派为 `HandlerKind::Noop`,不再进入存档域;
+//! - `FILEACT[EXEC]` 拒绝执行;`FILEACT` 图层导出仍缺(需 gfx 导出面);
 //! - FILEACT 落盘默认允许;只读为显式构造态(单测)。
 //!
 //! `#![forbid(unsafe_code)]`;src 零 println/eprintln/dbg。

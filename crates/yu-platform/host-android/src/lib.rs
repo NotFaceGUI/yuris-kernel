@@ -16,19 +16,23 @@
 //!   nativeShutdown()                       → drop Engine
 //! ```
 //!
-//! # 为什么用 soft 后端
+//! # 渲染路径
 //!
-//! 首个 Android 目标要验证的是**跨平台能力等价**(数据读取、存档写入、字体
-//! 枚举、脚本执行),不是 GPU 像素性能。soft 后端是确定性参考实现、零 GPU
-//! 依赖,帧以 RGBA 交给 Java 侧画到 Bitmap —— 这条链路能把内核整条跑通,
-//! 且与 native `--backend soft` 出**同构**的帧。wgpu(Surface/Vulkan)是后续
-//! 增强路径,不阻塞本阶段的验证目标。
+//! 壳固定走 `wgpu`:Java 侧把 `TextureView` 的 Surface 交给 so,`present`
+//! 模块经 `ANativeWindow` 在同一 device 上零拷贝上屏。单次启动 GPU 不可用
+//! 时显式失败、不静默降级;失败返回配置界面后,壳把重试参数切到 `soft`。
+//!
+//! `soft` 仍是 so 的缺省后端(不传 `backend` 时)与开发机会话测试的参考
+//! 实现:确定性、零 GPU 依赖,帧以 RGBA 交给 Java 侧画到 Bitmap,且与
+//! native `--backend soft` 出**同构**的帧。
 //!
 //! # 线程模型
 //!
-//! `Engine` 内部是 `Rc`/`RefCell`(单线程),因此所有 `native*` 调用**必须在
-//! 同一个线程**上发生(Android 侧用一个专用渲染线程)。状态放在
-//! `thread_local`,跨线程调用会拿到「未初始化」而不是未定义行为。
+//! `Engine` 内部是 `Rc`/`RefCell`(单线程),因此除
+//! `nativeShutdown` / `nativeResizeSurface` / `nativeSuspend` /
+//! `nativeResume`(只登记原子请求,可从任意线程调用)外,其余 `native*`
+//! 调用**必须在同一个线程**上发生(Android 侧用一个专用渲染线程)。状态
+//! 放在 `thread_local`,跨线程调用会拿到「未初始化」而不是未定义行为。
 //!
 //! # 数据与存档
 //!

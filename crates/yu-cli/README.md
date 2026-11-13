@@ -29,6 +29,8 @@ yu-rt(运行核) → yu-gfx(CompositorFrame) → yu-backend-soft / yu-backend-wg
 ```text
 yu-cli run  <project-root> [--mode headless|desktop] [--backend soft|wgpu]
                            [--entry LABEL] [--frames N] [--patch MODE]
+                           [--save-root DIR] [--save-codec zlib|snappy]
+                           [--wgpu-backend NAME] [--log-level LVL]
                            [--until-visible] [--shot PATH] [--json PATH]
                            [--record-events on|off] [--script-key HEX]
 yu-cli serve <project-root> [--backend soft|wgpu] [--port 4173] [--no-open]
@@ -38,6 +40,8 @@ yu-cli dev  <project-root> [--port 4173] [--no-open] [--backend soft|wgpu]
 yu-cli case <project-root> --all | --case NAME [--update]
 yu-cli bench <project-root>
 ```
+
+完整旗标(含诊断/渲染开关)以 `yu-cli help run` 为准;上表只列常用项。
 
 `--patch` 取值 `auto|original|gbk|big5|tunnel`，与 Android 配置界面共用
 `yu_engine::patch::PatchKind::parse`（唯一取值表见 `docs/cross-platform.md`）。
