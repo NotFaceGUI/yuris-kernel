@@ -673,7 +673,7 @@ public final class SetupActivity extends AppCompatActivity {
         return null;
     }
 
-    /** 把 document / tree URI 还原成真实文件路径(需要所有文件访问权限)。 */
+    /** 把 document / tree URI 还原成真实路径(文件或目录;需要所有文件访问权限)。 */
     private String realPathOf(Uri uri) {
         if ("file".equals(uri.getScheme())) {
             return uri.getPath();
@@ -741,7 +741,10 @@ public final class SetupActivity extends AppCompatActivity {
             return null;
         }
         File resolved = new File(base, relative);
-        return resolved.isDirectory() ? resolved.getAbsolutePath() : null;
+        // 目录选择器返回目录,字体选择返回文件;两者都必须接受。
+        // 旧实现只认 isDirectory(),所以导入字体时即便 URI 能还原出真实
+        // 路径也会被当成失败,提示「无法解析该位置的路径」。
+        return resolved.exists() ? resolved.getAbsolutePath() : null;
     }
 
     /**
