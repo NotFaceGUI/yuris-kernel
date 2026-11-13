@@ -143,7 +143,8 @@ fn dispatch(tokens: Vec<String>) -> CliResult<()> {
         "bench" => yu_cli::bench::from_args(rest),
         "version" | "-V" | "--version" => {
             output::line(format!(
-                "yu-cli 0.1.0 (marker {})",
+                "yu-cli {} (marker {})",
+                env!("CARGO_PKG_VERSION"),
                 build_info::ENGINE_MARKER
             ));
             Ok(())

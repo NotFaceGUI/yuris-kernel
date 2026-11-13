@@ -16,14 +16,17 @@ val injectedVersionCode = (project.findProperty("releaseVersionCode") as String?
 // 发布签名:四个环境变量由 CI 从 secrets 注入(见 docs/release.md)。
 // 缺任何一项就**不是**正式签名 —— 本地允许回落 debug 签名(自用安装);
 // CI 上则直接失败,绝不产出一个"看起来发布、其实是 debug key"的 APK。
-val keystoreFile = System.getenv("YURIS_KEYSTORE_FILE")?.trim()?.takeIf { it.isNotEmpty() }
-val keystorePassword = System.getenv("YURIS_KEYSTORE_PASSWORD")?.trim()
-val keyAlias = System.getenv("YURIS_KEY_ALIAS")?.trim()?.takeIf { it.isNotEmpty() }
-val keyPassword = System.getenv("YURIS_KEY_PASSWORD")?.trim()
-val hasReleaseSigning = keystoreFile != null &&
-    !keystorePassword.isNullOrEmpty() &&
-    keyAlias != null &&
-    !keyPassword.isNullOrEmpty()
+// 变量名刻意加上 release 前缀:在下面的 `create("release") {}` 里,局部变量
+// 与 SigningConfig 的属性同名时会被接收者属性遮蔽,曾导致 keyAlias/keyPassword
+// 被赋成 null,packageRelease 报 "missing required property"。
+val releaseKeystoreFile = System.getenv("YURIS_KEYSTORE_FILE")?.trim()?.takeIf { it.isNotEmpty() }
+val releaseKeystorePassword = System.getenv("YURIS_KEYSTORE_PASSWORD")?.trim()
+val releaseKeyAlias = System.getenv("YURIS_KEY_ALIAS")?.trim()?.takeIf { it.isNotEmpty() }
+val releaseKeyPassword = System.getenv("YURIS_KEY_PASSWORD")?.trim()
+val hasReleaseSigning = releaseKeystoreFile != null &&
+    !releaseKeystorePassword.isNullOrEmpty() &&
+    releaseKeyAlias != null &&
+    !releaseKeyPassword.isNullOrEmpty()
 
 if (!hasReleaseSigning && System.getenv("GITHUB_ACTIONS") == "true") {
     throw GradleException(
@@ -42,7 +45,7 @@ android {
         minSdk = 24
         targetSdk = 36
         versionCode = injectedVersionCode ?: 1
-        versionName = injectedVersionName ?: "0.2.0"
+        versionName = injectedVersionName ?: "0.3.0"
         // 只打 64 位(架构文档 §2.5.9 开放问题 8:armeabi-v7a 待定):
         // arm64-v8a = 真机目标;x86_64 = 本机模拟器验证用。
         // ABI 过滤:默认两个都打;构建模拟器验证包时用 -PabiFilter=x86_64
@@ -60,10 +63,10 @@ android {
     signingConfigs {
         if (hasReleaseSigning) {
             create("release") {
-                storeFile = file(keystoreFile!!)
-                storePassword = keystorePassword
-                keyAlias = keyAlias
-                keyPassword = keyPassword
+                storeFile = file(releaseKeystoreFile!!)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
             }
         }
     }
@@ -100,7 +103,7 @@ android {
 
 // 配置期打印一次签名来源,构建日志里能直接看出这个 APK 是不是正式签的。
 if (hasReleaseSigning) {
-    logger.lifecycle("APK 签名: release keystore ($keystoreFile, alias=$keyAlias)")
+    logger.lifecycle("APK 签名: release keystore ($releaseKeystoreFile, alias=$releaseKeyAlias)")
 } else {
     logger.lifecycle("APK 签名: debug(本地调试用,不可用于分发)")
 }

@@ -17,7 +17,7 @@
 |---|---|---|
 | `meta` | ubuntu | 校验 tag 与 Cargo.toml 一致、跑发布工具自测、生成 `notes.md` |
 | `cli` | windows-latest | `yuris-kernel-vX.Y.Z-windows-x64.zip`（`yu-cli.exe` + `yu-serve.exe` + README/LICENSE） |
-| `android` | ubuntu-latest | `yuris-kernel-vX.Y.Z-android.apk`（arm64-v8a + x86_64）、`yuris-kernel-vX.Y.Z-android-so.zip` |
+| `android` | ubuntu-latest | `yuris-kernel-vX.Y.Z-android-universal.apk`、`-android-arm64-v8a.apk`、`-android-x86_64.apk`、`yuris-kernel-vX.Y.Z-android-so.zip` |
 | `publish` | ubuntu-latest | 创建/更新 Release 并上传上面全部产物 |
 
 1. `meta`：checkout 该 tag，`fetch-depth: 0`（更新日志需要完整历史与旧 tag）；
@@ -36,11 +36,14 @@
 | 文件 | 内容 |
 |---|---|
 | `yuris-kernel-vX.Y.Z-windows-x64.zip` | `yu-cli.exe`、`yu-serve.exe`、`README.md`、`LICENSE` |
-| `yuris-kernel-vX.Y.Z-android.apk` | 正式签名 APK，包内 arm64-v8a + x86_64 |
+| `yuris-kernel-vX.Y.Z-android-universal.apk` | 正式签名通用包，arm64-v8a + x86_64 两套 so 都在包里 |
+| `yuris-kernel-vX.Y.Z-android-arm64-v8a.apk` | 正式签名瘦包，只含 arm64-v8a（绝大多数真机） |
+| `yuris-kernel-vX.Y.Z-android-x86_64.apk` | 正式签名瘦包，只含 x86_64（模拟器 / x86 Chromebook） |
 | `yuris-kernel-vX.Y.Z-android-so.zip` | `libyu_host_android.so` + `libc++_shared.so`（按 ABI 分目录） |
 
-APK 的 `versionName` 取 tag 去掉 `v` 前缀，`versionCode` 取 `GITHUB_RUN_NUMBER`
-（单调递增，可直接覆盖安装）。
+三个 APK 用同一把 key 签名，`versionName` 相同；`versionCode` 都取
+`GITHUB_RUN_NUMBER`。用户按设备架构下瘦包以减小下载体积，不确定时下
+`universal`。当前不支持 32 位 `armeabi-v7a`，所以没有 `armeabi-v7a` 瘦包。
 
 ## Android 签名
 
@@ -71,11 +74,11 @@ APK 必须正式签名才能分发。`android` job 在构建前检查四个 secr
 提交，再打 tag：
 
 ```bash
-# 例：准备 v0.2.0
-# 1. 修改 Cargo.toml: [workspace.package] version = "0.2.0"
+# 例：准备 v0.3.0
+# 1. 修改 Cargo.toml: [workspace.package] version = "0.3.0"
 # 2. 提交后打 tag 并推送（是否执行由主人决定）
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 tag 与 Cargo.toml 不一致时 workflow 在发布前直接失败，避免出现版本号与代码
@@ -167,6 +170,14 @@ YURIS_SO_ONLY=1 bash tools/android/build.sh
 BUILD_TYPE=release GRADLE_FLAGS="--offline" \
   GRADLE_PROJECT_ARGS="-PreleaseVersionName=0.0.0-local -PreleaseVersionCode=1" \
   bash tools/android/build.sh
+
+# 发布三份 APK：universal + arm64-v8a + x86_64
+# 产物落在 target/android-apks/（不要放 AGP 的 release 输出目录，
+# 下一次 assembleRelease 会把它清掉）
+YURIS_APK_VARIANTS=universal,arm64-v8a,x86_64 \
+BUILD_TYPE=release GRADLE_FLAGS="--offline" \
+  GRADLE_PROJECT_ARGS="-PreleaseVersionName=0.0.0-local -PreleaseVersionCode=1" \
+  bash tools/android/build.sh
 ```
 
 CI 上 `GRADLE_FLAGS="--no-daemon"`（不带 `--offline`，runner 没有依赖缓存）。
@@ -188,6 +199,9 @@ CI 上 `GRADLE_FLAGS="--no-daemon"`（不带 `--offline`，runner 没有依赖�
 - **产物上传用 `--clobber`**：重跑同一 tag 时覆盖同名附件，保持幂等。
 - **APK 签名缺失即失败**：宁可发布失败，也不产出一个看起来是发布版、实际用
   debug key 签名的 APK。
+- **一次构建三份 APK**：`YURIS_APK_VARIANTS=universal,arm64-v8a,x86_64` 让
+  `tools/android/build.sh` 复用同一份 so 和签名配置，分别产出通用包与两个
+  ABI 瘦包；只给 `universal` 时也能当单一通用包用。
 
 ## 仓库设置
 

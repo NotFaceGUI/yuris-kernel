@@ -4135,7 +4135,7 @@ dependencies = [
 
 [[package]]
 name = "yu-backend-soft"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "image",
  "log",
@@ -4151,7 +4151,7 @@ dependencies = [
 
 [[package]]
 name = "yu-backend-wgpu"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "image",
@@ -4174,7 +4174,7 @@ dependencies = [
 
 [[package]]
 name = "yu-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "log",
  "mimalloc",
@@ -4197,7 +4197,7 @@ dependencies = [
 
 [[package]]
 name = "yu-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "log",
  "sha1",
@@ -4220,7 +4220,7 @@ dependencies = [
 
 [[package]]
 name = "yu-font"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "encoding_rs",
  "fontdb",
@@ -4235,7 +4235,7 @@ dependencies = [
 
 [[package]]
 name = "yu-format"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "libz-sys",
@@ -4244,7 +4244,7 @@ dependencies = [
 
 [[package]]
 name = "yu-gfx"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rustc-hash 2.1.3",
  "smallvec",
@@ -4256,7 +4256,7 @@ dependencies = [
 
 [[package]]
 name = "yu-host-android"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "cpal",
@@ -4279,7 +4279,7 @@ dependencies = [
 
 [[package]]
 name = "yu-host-desktop"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "cpal",
@@ -4306,7 +4306,7 @@ dependencies = [
 
 [[package]]
 name = "yu-host-wasm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -4315,14 +4315,14 @@ dependencies = [
 
 [[package]]
 name = "yu-log"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "log",
 ]
 
 [[package]]
 name = "yu-movie-plmpeg"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "southstar-codecs",
  "yu-log",
@@ -4331,14 +4331,14 @@ dependencies = [
 
 [[package]]
 name = "yu-platform-input"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "yu-rt",
 ]
 
 [[package]]
 name = "yu-render-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "image",
  "libpng-sys",
@@ -4353,7 +4353,7 @@ dependencies = [
 
 [[package]]
 name = "yu-rt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rustc-hash 2.1.3",
  "smallvec",
@@ -4364,7 +4364,7 @@ dependencies = [
 
 [[package]]
 name = "yu-save"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "yu-format",
  "yu-log",
@@ -4373,7 +4373,7 @@ dependencies = [
 
 [[package]]
 name = "yu-sound"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hound",
  "lewton",
@@ -4383,7 +4383,7 @@ dependencies = [
 
 [[package]]
 name = "yu-trace"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "yu-log",
  "yu-rt",
@@ -4392,7 +4392,7 @@ dependencies = [
 
 [[package]]
 name = "yu-vfs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "yu-format",

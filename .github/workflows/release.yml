@@ -220,13 +220,14 @@ jobs:
           keytool -list -keystore "$RUNNER_TEMP/release.jks" \
             -storepass "$KEYSTORE_PASSWORD" >/dev/null
 
-      - name: Build so + release APK
+      - name: Build so + release APKs
         shell: bash
         env:
           YURIS_KEYSTORE_FILE: ${{ runner.temp }}/release.jks
           YURIS_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           YURIS_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           YURIS_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          YURIS_APK_VARIANTS: universal,arm64-v8a,x86_64
           TAG: ${{ needs.meta.outputs.tag }}
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
@@ -244,7 +245,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp android/app/build/outputs/apk/release/app-release.apk "dist/yuris-kernel-$TAG-android.apk"
+          apk_dir="target/android-apks"
+          cp "$apk_dir/app-release-universal.apk"  "dist/yuris-kernel-$TAG-android-universal.apk"
+          cp "$apk_dir/app-release-arm64-v8a.apk"  "dist/yuris-kernel-$TAG-android-arm64-v8a.apk"
+          cp "$apk_dir/app-release-x86_64.apk"     "dist/yuris-kernel-$TAG-android-x86_64.apk"
           # so 与它依赖的 libc++_shared 一起给，方便自己塞进别的壳。
           ( cd android/app/src/main/jniLibs && zip -qr "$GITHUB_WORKSPACE/dist/yuris-kernel-$TAG-android-so.zip" . )
           ls -l dist

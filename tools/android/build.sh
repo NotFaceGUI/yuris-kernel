@@ -20,6 +20,11 @@
 #   GRADLE_FLAGS=...           覆盖传给 gradle 的参数
 #                              (缺省 `--offline`;CI 无缓存可传 `--no-daemon` 不带 offline)
 #   GRADLE_PROJECT_ARGS=...    追加 -P 参数(如版本号注入、aapt2 覆盖)
+#   YURIS_APK_VARIANTS=...     逗号分隔的 APK 变体: universal,arm64-v8a,x86_64
+#                              (空 = 旧行为,只出默认 app-release.apk)
+#   YURIS_APK_OUT_DIR=...      变体 APK 的存放目录(缺省 target/android-apks);
+#                              不能放在 AGP 的 release 输出目录里,下一次 gradle
+#                              打包会把它清掉
 #   YURIS_KEYSTORE_FILE / YURIS_KEYSTORE_PASSWORD / YURIS_KEY_ALIAS /
 #   YURIS_KEY_PASSWORD         发布签名四件套,给 gradle 读(见 app/build.gradle.kts)
 #
@@ -157,7 +162,6 @@ if [[ "$SO_ONLY" == "1" ]]; then
   exit 0
 fi
 
-printf '==> gradle %s\n' "$GRADLE_TASK"
 if [[ -z "${JAVA_HOME:-}" ]]; then
   echo "错误: JAVA_HOME 未设置(AGP 8.13 需要 JDK 17+)" >&2
   exit 2
@@ -188,19 +192,86 @@ fi
 GRADLE_OPTS=(${GRADLE_FLAGS---offline})
 
 # 用本地 gradle(不引 wrapper jar);有 wrapper 时优先 wrapper。
-if [[ -x "$REPO_ROOT/android/gradlew" ]]; then
-  (cd "$REPO_ROOT/android" && ./gradlew "${GRADLE_OPTS[@]}" "${GRADLE_ARGS[@]}" "$GRADLE_TASK")
-else
+gradle_bin=""
+if [[ ! -x "$REPO_ROOT/android/gradlew" ]]; then
   gradle_bin="$(command -v gradle || true)"
   if [[ -z "$gradle_bin" ]]; then
     echo "错误: 找不到 gradle(装 Gradle 8.14+ 或生成 wrapper)" >&2
     exit 2
   fi
-  (cd "$REPO_ROOT/android" && "$gradle_bin" "${GRADLE_OPTS[@]}" "${GRADLE_ARGS[@]}" "$GRADLE_TASK")
 fi
 
-if [[ ! -f "$REPO_ROOT/$APK_PATH" ]]; then
-  echo "错误: gradle 报成功但产物不存在: $APK_PATH" >&2
-  exit 1
+run_gradle() {
+  if [[ -x "$REPO_ROOT/android/gradlew" ]]; then
+    (cd "$REPO_ROOT/android" && ./gradlew "${GRADLE_OPTS[@]}" "$@" "$GRADLE_TASK")
+  else
+    (cd "$REPO_ROOT/android" && "$gradle_bin" "${GRADLE_OPTS[@]}" "$@" "$GRADLE_TASK")
+  fi
+}
+
+# 发布分发:universal + 每个 ABI 一个瘦包。
+# 一次 cargo 交叉编译出两套 so,再用 -PabiFilter 让 AGP 分别打包;
+# 每个变体都会重新签名,产出的 APK 证书一致。
+APK_BASE="$(basename "$APK_PATH" .apk)"
+APK_OUT_DIR="${YURIS_APK_OUT_DIR:-$REPO_ROOT/target/android-apks}"
+VARIANTS_RAW="${YURIS_APK_VARIANTS:-}"
+if [[ -n "$VARIANTS_RAW" ]]; then
+  if [[ -n "${GRADLE_PROJECT_ARGS:-}" && "${GRADLE_PROJECT_ARGS}" == *abiFilter* ]]; then
+    echo "错误: YURIS_APK_VARIANTS 与 GRADLE_PROJECT_ARGS 里的 abiFilter 不能同时使用" >&2
+    exit 2
+  fi
+  # 变体 APK 不能留在 AGP 的 release 输出目录:下一次 assembleRelease 会
+  # 清掉上一次的产物(只保留当前变体的 app-release.apk)。
+  mkdir -p "$APK_OUT_DIR"
+  IFS=',' read -ra VARIANTS <<< "$VARIANTS_RAW"
+else
+  # 旧行为:只跑一次 gradle,产物仍是 app-release.apk / app-debug.apk。
+  VARIANTS=("")
 fi
-printf '==> 完成: %s (%s)\n' "$APK_PATH" "$(du -h "$REPO_ROOT/$APK_PATH" | cut -f1)"
+
+for variant in "${VARIANTS[@]}"; do
+  variant="$(printf '%s' "$variant" | tr -d '[:space:]')"
+  variant_label="${variant:-universal}"
+  extra_args=()
+  out_name=""
+
+  case "$variant" in
+    "")
+      ;;
+    universal)
+      for abi in arm64-v8a x86_64; do
+        if [[ ! -f "$REPO_ROOT/android/app/src/main/jniLibs/$abi/libyu_host_android.so" ]]; then
+          echo "错误: universal 变体需要 $abi 的 so;请让脚本构建 arm64-v8a x86_64" >&2
+          exit 2
+        fi
+      done
+      out_name="${APK_BASE}-universal.apk"
+      ;;
+    arm64-v8a|x86_64)
+      if [[ ! -f "$REPO_ROOT/android/app/src/main/jniLibs/$variant/libyu_host_android.so" ]]; then
+        echo "错误: $variant 变体缺少对应 so;请让脚本构建 $variant" >&2
+        exit 2
+      fi
+      extra_args+=("-PabiFilter=$variant")
+      out_name="${APK_BASE}-${variant}.apk"
+      ;;
+    *)
+      echo "错误: YURIS_APK_VARIANTS 只支持 universal / arm64-v8a / x86_64,收到: $variant" >&2
+      exit 2
+      ;;
+  esac
+
+  printf '==> gradle %s (%s)\n' "$GRADLE_TASK" "$variant_label"
+  run_gradle "${GRADLE_ARGS[@]}" "${extra_args[@]}"
+
+  if [[ ! -f "$REPO_ROOT/$APK_PATH" ]]; then
+    echo "错误: gradle 报成功但产物不存在: $APK_PATH" >&2
+    exit 1
+  fi
+  if [[ -n "$out_name" ]]; then
+    cp "$REPO_ROOT/$APK_PATH" "$APK_OUT_DIR/$out_name"
+    printf '==> %s (%s)\n' "$APK_OUT_DIR/$out_name" "$(du -h "$APK_OUT_DIR/$out_name" | cut -f1)"
+  else
+    printf '==> 完成: %s (%s)\n' "$APK_PATH" "$(du -h "$REPO_ROOT/$APK_PATH" | cut -f1)"
+  fi
+done
