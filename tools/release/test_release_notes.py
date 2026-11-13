@@ -29,6 +29,13 @@ import release_notes as rn  # noqa: E402
 
 class GitRepoTest(unittest.TestCase):
     def setUp(self) -> None:
+        # GitHub Actions 默认注入 GITHUB_REPOSITORY / GITHUB_SERVER_URL；
+        # 清掉它们，避免 notes 的“完整变更”断言依赖 runner 环境。
+        # 带链接的输出由 RepoUrlTests 用显式 repo_url 覆盖。
+        self._github_env: dict[str, str] = {}
+        for key in ("GITHUB_SERVER_URL", "GITHUB_REPOSITORY"):
+            if key in os.environ:
+                self._github_env[key] = os.environ.pop(key)
         self._tmp = tempfile.TemporaryDirectory(prefix="yu-release-test-")
         self.repo = Path(self._tmp.name)
         self.git("init", "-q")
@@ -40,6 +47,7 @@ class GitRepoTest(unittest.TestCase):
         self._counter = 0
 
     def tearDown(self) -> None:
+        os.environ.update(self._github_env)
         self._tmp.cleanup()
 
     def git(self, *args: str) -> str:
