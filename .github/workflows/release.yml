@@ -122,6 +122,10 @@ jobs:
           TAG: ${{ needs.meta.outputs.tag }}
         run: |
           $ErrorActionPreference = "Stop"
+          # PowerShell 不会把环境变量 TAG 暴露成 $TAG，必须走 $env:TAG；
+          # 之前直接用 $TAG 导致 zip 名变成 yuris-kernel--windows-x64.zip。
+          $tag = $env:TAG
+          if (-not $tag) { throw "TAG 为空: meta job 没有传出 tag" }
           $dist = "dist"
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
           $stage = Join-Path $dist "stage"
@@ -130,7 +134,7 @@ jobs:
           Copy-Item "target/release/yu-serve.exe" $stage
           Copy-Item "README.md" $stage
           Copy-Item "LICENSE"   $stage
-          $zip = Join-Path $dist "yuris-kernel-$TAG-windows-x64.zip"
+          $zip = Join-Path $dist "yuris-kernel-$tag-windows-x64.zip"
           Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
           Get-ChildItem $zip | Select-Object Name, Length
 

@@ -409,6 +409,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("release_notes.py notes", meta_scripts)
         self.assertIn("test_release_notes.py", meta_scripts)
 
+        # PowerShell 里环境变量必须写 $env:TAG；写成 $TAG 会让包名丢版本号。
+        cli_by_name = {step.get("name"): step for step in jobs["cli"]["steps"]}
+        package_script = cli_by_name["Package"]["run"]
+        self.assertIn("$env:TAG", package_script)
+        self.assertNotIn("yuris-kernel-$TAG", package_script)
+
         publish_scripts = "\n".join(step.get("run", "") for step in publish_steps)
         self.assertIn("release_notes.py publish", publish_scripts)
         self.assertIn("gh release upload", publish_scripts)
