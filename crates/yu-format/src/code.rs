@@ -26,6 +26,8 @@ pub const YBN_OPCODE: &str = "fmt.ybn.opcode";
 pub const YSCF_FIELD: &str = "fmt.yscf.field";
 /// ysv 记录的种类/类型字节落在已证集合之外。
 pub const YSV_FIELD: &str = "fmt.ysv.field";
+/// yst_list 记录尾布局无法闭合(两种已知布局都不匹配)。
+pub const YSTL_FIELD: &str = "fmt.ystl.field";
 /// 编码序列非法(含序列不完整)。
 pub const CODEC_INVALID: &str = "fmt.codec.invalid";
 /// 请求的编解码器不存在。
@@ -46,6 +48,7 @@ pub const ALL_CODES: &[&str] = &[
     YBN_OPCODE,
     YSCF_FIELD,
     YSV_FIELD,
+    YSTL_FIELD,
     CODEC_INVALID,
     CODEC_NAME,
     YSSD_CODEC,

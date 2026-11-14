@@ -1,8 +1,12 @@
 //! 查找键归一。
 //!
 //! 只做三件事(architecture §1): 分隔符 `\`/`/` 统一、ASCII A–Z 折叠、
-//! 多字节字符按编解码器整对跳过。`.`/`..` 组件被拒绝——这是数据源的安全
-//! 不变量(禁止逃出挂载根),不是对官方路径语义的猜测。
+//! 多字节字符按编解码器整对跳过。
+//!
+//! `.`/`..` 组件做**词法归一**(官方脚本会用 `cgsys/../system/...` 这类
+//! 写法构造包内路径):`.` 跳过,`..` 弹出上一个组件。安全不变量改为
+//! **归一后不得逃出挂载根**——栈空时遇到 `..` 仍然拒绝;归一过程中的
+//! 弹出只作用于本次路径的前缀组件,不会越过根。
 
 use crate::codec::Codec;
 use std::borrow::Borrow;
@@ -130,11 +134,19 @@ fn flush_component(
         return Ok(());
     }
     let component = std::mem::take(current);
-    if component == b"." || component == b".." {
-        return Err(path_error(
-            raw,
-            "`.`/`..` components are rejected by the VFS safety invariant",
-        ));
+    if component == b"." {
+        // 当前目录:词法上不改变路径。
+        return Ok(());
+    }
+    if component == b".." {
+        // 父目录:弹出上一个组件;栈空 ⇒ 已经越过挂载根。
+        if out.pop().is_none() {
+            return Err(path_error(
+                raw,
+                "`..` escapes the mount root after lexical normalization",
+            ));
+        }
+        return Ok(());
     }
     out.push(component);
     Ok(())
@@ -209,9 +221,40 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dot_components() {
-        assert!(LookupKey::new(b"a/../b", Codec::Cp932).is_err());
-        assert!(LookupKey::new(b"a/./b", Codec::Cp932).is_err());
+    fn normalizes_dot_components() {
+        let key = LookupKey::new(b"a/./b", Codec::Cp932).unwrap();
+        assert_eq!(key.as_bytes(), b"a/b");
+        let key = LookupKey::new(br"a\.\b", Codec::Cp932).unwrap();
+        assert_eq!(key.as_bytes(), b"a/b");
+    }
+
+    #[test]
+    fn normalizes_parent_components() {
+        assert_eq!(
+            LookupKey::new(b"a/../b", Codec::Cp932).unwrap().as_bytes(),
+            b"b"
+        );
+        assert_eq!(
+            LookupKey::new(b"cgsys/../system/window/windowbg.png", Codec::Cp932)
+                .unwrap()
+                .as_bytes(),
+            b"system/window/windowbg.png"
+        );
+        assert_eq!(
+            LookupKey::new(b"a/b/../../c", Codec::Cp932)
+                .unwrap()
+                .as_bytes(),
+            b"c"
+        );
+        // 归一结果可以正好是挂载根。
+        assert!(LookupKey::new(b"a/..", Codec::Cp932).unwrap().is_root());
+    }
+
+    #[test]
+    fn rejects_parent_escape_after_normalization() {
+        assert!(LookupKey::new(b"../a", Codec::Cp932).is_err());
+        assert!(LookupKey::new(b"a/../../b", Codec::Cp932).is_err());
+        assert!(LookupKey::new(b"..", Codec::Cp932).is_err());
     }
 
     #[test]

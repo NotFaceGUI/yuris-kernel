@@ -118,50 +118,71 @@ impl YssdSave {
         }
         let mut entries = Vec::new();
         let mut index: Vec<Option<u16>> = vec![None; capacity];
-        for (i, cell) in buf[0x10..table_end].chunks_exact(4).enumerate() {
-            let off = u32::from_le_bytes([cell[0], cell[1], cell[2], cell[3]]) as usize;
-            if off == 0 {
-                continue;
+        // 块区按文件顺序连续落盘(官方产物如此);块数来自头部 `+0x08`。
+        // **不遍历整张偏移表**:v474 写盘器只回填真实 DNO 的槽位,未使用
+        // 槽位保留未初始化垃圾(同一进程写出的多个 .sd 甚至字节相同)。
+        // 引擎按 DNO 查表,从不读未使用槽;因此这里顺序走块,只对真实
+        // DNO 交叉核对表项。
+        let block_count = header.word08 as usize;
+        let mut at = table_end;
+        for i in 0..block_count {
+            let head_end = at
+                .checked_add(0x10)
+                .ok_or_else(|| limit(origin, at as u64, "YSSD 块头"))?;
+            if head_end > buf.len() {
+                return Err(truncated(origin, head_end, buf.len(), "YSSD 块头"));
             }
-            // 块至少要有 0x10 字节头;偏移必须落在数据区内。
-            if off < table_end || off > buf.len().saturating_sub(0x10) {
+            let dno = u32_at(buf, at);
+            let slot = usize::try_from(dno)
+                .ok()
+                .and_then(|d| d.checked_sub(1))
+                .filter(|&d| d < capacity)
+                .ok_or_else(|| {
+                    Diag::fatal(code::COUNT, Boundary::Format)
+                        .at_data(origin, at as u64)
+                        .with_detail(format!("YSSD 块 {i} 的 DNO={dno} 不在 1..={capacity}"))
+                })?;
+            if index[slot].is_some() {
                 return Err(Diag::fatal(code::COUNT, Boundary::Format)
-                    .at_data(origin, (0x10 + i * 4) as u64)
+                    .at_data(origin, at as u64)
+                    .with_detail(format!("YSSD 块 {i}: DNO={dno} 重复")));
+            }
+            // 真实 DNO 的表项必须回指本块(官方容器两处一致)。
+            let table_off = u32_at(buf, 0x10 + slot * 4) as usize;
+            if table_off != at {
+                return Err(Diag::fatal(code::COUNT, Boundary::Format)
+                    .at_data(origin, (0x10 + slot * 4) as u64)
                     .with_detail(format!(
-                        "YSSD 偏移表[{}](DNO={})偏移 {off:#x} 越界(文件 {} 字节,数据区自 {table_end:#x})",
-                        i + 1,
-                        i + 1,
-                        buf.len()
+                        "YSSD 块号与偏移表不符:DNO={dno} 表项={table_off:#x},实际块偏移={at:#x}"
                     )));
             }
-            let dno = u32_at(buf, off);
-            if dno as usize != i + 1 {
-                return Err(Diag::fatal(code::COUNT, Boundary::Format)
-                    .at_data(origin, off as u64)
-                    .with_detail(format!(
-                        "YSSD 块号与偏移表不符:表项[{}]=DNO {dno}(官方容器两处一致)",
-                        i + 1
-                    )));
+            let clen = u32_at(buf, at + 8) as usize;
+            let payload_at = at + 0x10;
+            let end = payload_at
+                .checked_add(clen)
+                .ok_or_else(|| limit(origin, payload_at as u64, "YSSD 块载荷"))?;
+            if end > buf.len() {
+                return Err(truncated(origin, end, buf.len(), "YSSD 块载荷"));
             }
-            let clen = u32_at(buf, off + 8) as usize;
-            let payload_at = off + 0x10;
-            if clen > buf.len().saturating_sub(payload_at) {
-                return Err(truncated(
-                    origin,
-                    payload_at + clen,
-                    buf.len(),
-                    "YSSD 块载荷",
-                ));
-            }
-            index[i] = Some(entries.len() as u16);
+            index[slot] = Some(entries.len() as u16);
             entries.push(YssdEntry {
                 dno,
-                btype: buf[off + 4],
-                strict: buf[off + 5],
-                var_id: u16_at(buf, off + 6),
-                ulen: u32_at(buf, off + 12),
-                compressed: buf[payload_at..payload_at + clen].to_vec(),
+                btype: buf[at + 4],
+                strict: buf[at + 5],
+                var_id: u16_at(buf, at + 6),
+                ulen: u32_at(buf, at + 12),
+                compressed: buf[payload_at..end].to_vec(),
             });
+            at = end;
+        }
+        // 块区之后只允许零填充;非零尾随字节说明块数/布局判断错了。
+        if buf[at..].iter().any(|&b| b != 0) {
+            return Err(Diag::fatal(code::COUNT, Boundary::Format)
+                .at_data(origin, at as u64)
+                .with_detail(format!(
+                    "YSSD 块区之后仍有 {} 字节非零尾随(块数 {block_count})",
+                    buf.len() - at
+                )));
         }
         Ok(Self {
             version: header.version,
@@ -223,6 +244,12 @@ fn codec_diag(origin: &[u8], dno: u32, detail: String) -> Diag {
     Diag::fatal(code::YSSD_CODEC, Boundary::Format)
         .at_data(origin, 0)
         .with_detail(format!("DNO={dno}: {detail}"))
+}
+
+fn limit(origin: &[u8], at: u64, what: &str) -> Diag {
+    Diag::fatal(code::LIMIT, Boundary::Format)
+        .at_data(origin, at)
+        .with_detail(format!("{what} 超出可表示范围"))
 }
 
 /// 已解压的值载荷(块类型 0;`FUN_0044564d` 同族消费形态)。
@@ -874,6 +901,36 @@ mod tests {
         assert_eq!(save.entry(2).expect("dno2").var_id, 0x1234);
         assert!(save.entry(1).is_none());
         assert!(save.entry(5).is_none(), "超出表容量 = None");
+    }
+
+    #[test]
+    fn unused_offset_slots_may_contain_garbage() {
+        // v474 写盘器只回填真实 DNO 的表项;未使用槽位可能是未初始化垃圾。
+        // 读取必须按块数顺序走块,只核对真实 DNO 的表项。
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"YSSD");
+        bytes.extend_from_slice(&0x138u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // 块数
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // 容量 4
+        let table_at = bytes.len();
+        bytes.resize(table_at + 4 * 4, 0);
+        let block_at = bytes.len() as u32;
+        bytes[table_at..table_at + 4].copy_from_slice(&block_at.to_le_bytes());
+        for slot in 1..4 {
+            bytes[table_at + slot * 4..table_at + slot * 4 + 4]
+                .copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        }
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // dno
+        bytes.push(0); // btype
+        bytes.push(1); // strict
+        bytes.extend_from_slice(&0x0a44u16.to_le_bytes()); // var_id
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // clen
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // ulen
+
+        let save = YssdSave::parse(&bytes, b"t").expect("garbage unused slots must be ignored");
+        assert_eq!(save.entries.len(), 1);
+        assert_eq!(save.entry(1).expect("dno1").var_id, 0x0a44);
+        assert!(save.entry(2).is_none());
     }
 
     #[test]

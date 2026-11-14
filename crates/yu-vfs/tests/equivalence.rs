@@ -518,7 +518,7 @@ fn stored_size_mismatch_is_rejected() {
 }
 
 #[test]
-fn bad_magic_and_version_are_explicit() {
+fn bad_magic_is_explicit_and_version_is_not_a_gate() {
     let root = temp_dir("badsig");
     let path = root.join("bad.ypf");
     fs::write(&path, b"NOPE\0\0\0\0").unwrap();
@@ -527,13 +527,51 @@ fn bad_magic_and_version_are_explicit() {
         vfs::YPF_BAD_MAGIC
     );
 
-    let mut bytes = write_ypf(&TestPack::default(), &[]);
-    bytes[4..8].copy_from_slice(&200u32.to_le_bytes());
-    fs::write(&path, &bytes).unwrap();
-    assert_eq!(
-        YpfSource::open(&path, Codec::Cp932).unwrap_err().code,
-        vfs::YPF_BAD_VERSION
+    // 版本号不参与布局判定:version=200 但结构是已知 0.495 布局 ⇒ 必须可读。
+    let bytes = write_ypf(
+        &TestPack {
+            version: 200,
+            ..TestPack::default()
+        },
+        &[TestEntry {
+            name: b"a.txt".to_vec(),
+            data: b"v200".to_vec(),
+            compress: false,
+            file_type: 0,
+        }],
     );
+    fs::write(&path, &bytes).unwrap();
+    let source = YpfSource::open(&path, Codec::Cp932).unwrap();
+    assert_eq!(source.header().version, 200);
+    assert_eq!(source.open(&key(b"a.txt")).unwrap(), b"v200");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn relative_index_size_header_is_accepted() {
+    // v<300 的 `+0x0C` 是索引块字节数,不是绝对 dataStart。写入器固定写
+    // 绝对值,这里手工改成相对值;结构校验应选中 RelativeSize 并还原出
+    // 同一个 dataStart。
+    let root = temp_dir("relidx");
+    let mut bytes = write_ypf(
+        &TestPack::default(),
+        &[TestEntry {
+            name: b"a.txt".to_vec(),
+            data: b"relative".to_vec(),
+            compress: false,
+            file_type: 0,
+        }],
+    );
+    let absolute = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    assert!(absolute > 0x20);
+    bytes[12..16].copy_from_slice(&(absolute - 0x20).to_le_bytes());
+    let path = root.join("relative.ypf");
+    fs::write(&path, &bytes).unwrap();
+
+    let source = YpfSource::open(&path, Codec::Cp932).unwrap();
+    assert_eq!(source.header().data_start, absolute);
+    assert_eq!(source.open(&key(b"a.txt")).unwrap(), b"relative");
 
     fs::remove_dir_all(&root).ok();
 }
