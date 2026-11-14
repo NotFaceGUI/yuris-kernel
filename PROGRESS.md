@@ -14461,3 +14461,59 @@ BUILD_TYPE=release tools/android/build.sh arm64-v8a x86_64
   → BUILD SUCCESSFUL in 8s
   → android/app/build/outputs/apk/release/app-release.apk (27M)
 ```
+
+## 成果 FMT-GENERIC (2026-11-14) · 旧代格式按结构裁决:YPF/YBN/YSSD
+
+> 触发:v474 商业样本 boot 链逐层暴露旧代布局。**不按 version 硬编码**:
+> 每个容器固定候选 + 结构闭合/全量哈希/边界裁决,版本只进 header/诊断。
+> 代码只含版本号与偏移常量,不含样本名/路径。
+
+### 1. YPF
+
+- 候选 profile 固定枚举:`+0x0C` 绝对/相对 × `Meta22/Meta18` ×
+  Murmur2/CRC32+Adler32/Adler32 × 长度表 V000/V004/V010/V500;
+  名字 key 先试 0xFF/0xC9/0xBF,索引闭合后允许全量 256 兜底。
+- 删除 `MIN_ACCEPTED_VERSION` 门禁;`YpfDialect` 增 `Crc32U32/Other`。
+- `isCompressed=1` 解压先 zlib、失败再 Snappy(`yu_format::snappy`),
+  两者都必须与索引 `usize` 闭合。
+- 代码锚点:`crates/yu-vfs/src/ypf.rs`;证据:v473 包 432/432
+  CRC32+Adler32,0.495 包 1,407/1,407 Murmur2。
+
+### 2. YBN 表(v474)
+
+| 表 | 旧代布局 | 证据 |
+|---|---|---|
+| YSVR | 7 字节记录头(无 `flag`) | yuri `SVarV000` vs `SVarV481`;v474 2736/2736 闭合 |
+| YSTL | 16 字节尾(无 `text_count`) | yuri `SScrOld/New`;RxYuris `YSTL_Entry_V2/V5`;v474 232/232 闭合 |
+| YSCF | titleLen @0x40, title @0x42 | v474 引擎 `FUN_004529d4` 反编译 |
+| YSCM | opcode 0 空名/0 参数占位合法 | v474 引擎 `FUN_00451f24` 反编译 |
+
+- `yu-gfx::ParamTable::validate` 不再拒绝空命令名(仍强制 CG/CGACT/CGEND)。
+- 新错误码 `fmt.ystl.field`。
+
+### 3. YSSD
+
+- 旧写盘器只回填真实 DNO 的偏移表项,未使用槽位是未初始化垃圾
+  (同一进程写出的多份 `.sd` 甚至字节相同)。
+- 读取改为**按头部块数顺序走块**,只对真实 DNO 交叉核对表项;
+  未使用槽位忽略;块区后仅允许零填充。
+- 0.495 官方 `save/*.sd` parse→rebuild 仍逐字节一致
+  (`yssd_roundtrip` 2/2);v474 样本 gsd/kidoku/seld 分别 14/1/1 块闭合。
+
+### 验证
+
+```text
+cargo test -p yu-vfs -p yu-format -p yu-save -p yu-gfx
+  → yu-vfs 50+15+1+2+5 全绿;yu-format 44+23+2 全绿;yu-save 18 全绿
+cargo clippy -p yu-vfs -p yu-format --all-targets
+  → 本次改动文件零 warning
+v474 样本 headless --frames 1
+  → boot 通过,frame 1 1280x720,16 层/14 ops,rgba 3686400B
+```
+
+**补充(同日)**:EXE 内嵌 YPF(`MZ → YSER+header_size → YPF\0`)已接入
+`YpfSource::open`,真实 v408 installer 样本 28/28 条闭合;WZ 前 8 字节
+反变换按 RxYuris `DecodeFile_WZ` 实现为 zlib/Snappy 之后的 fallback
+(`Likely`,无真包,长度必须闭合)。YSTB V2(200<v<300)与 YCG 图像解码
+仍因无真样本/规格未实现;`--font` 与 VFS `..` 告警与本次格式无关。
+待办清单见 `docs/todo-format-generic.md`。
