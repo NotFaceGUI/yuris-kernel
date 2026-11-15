@@ -65,6 +65,20 @@ public final class NativeHost {
     public static native String nativeListFonts();
 
     /**
+     * 探测一个路径是不是引擎认得的数据入口。
+     *
+     * <p>判据与内核启动时的 {@code Project::discover} 完全同一份代码:根目录
+     * {@code *.ypf}、{@code pac/*.ypf}、{@code data/} 布局、根级散盘
+     * ({@code ysbin/}、{@code cg/} …)、{@code update1..9.ypf} 增量层,含
+     * {@code YPF\0} 魔数校验。
+     *
+     * <p>返回 JSON:{@code {"ok":true,"root":"…","kind":"packed|loose",
+     * "packs":N,"updates":N}} 或 {@code {"ok":false,"reason":"…"}}。
+     * 壳**不得**再自己判断目录里有什么 —— 手抄规则必然与引擎漂移。
+     */
+    public static native String nativeProbeGameRoot(String path);
+
+    /**
      * 绑定 {@link android.view.Surface} 做<b>零拷贝上屏</b>:内核把渲染结果
      * 直接送到这个窗口,不再每帧把整帧读回 CPU。
      *

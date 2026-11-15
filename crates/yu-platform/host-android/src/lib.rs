@@ -1902,6 +1902,38 @@ pub fn version_tag() -> String {
     )
 }
 
+/// 探测一个路径是不是引擎认得的数据入口,返回 JSON 给壳。
+///
+/// 判据就是 [`Project::discover`] 本身(官方挂载规则):根目录 `*.ypf`、
+/// `pac/*.ypf`、`data/` 布局、根级散盘(`ysbin/`、`cg/` …)、
+/// `update1..9.ypf` 增量层,含 `.ypf` 的 `YPF\0` 魔数校验。
+///
+/// 目录选择器**不再自己抄一份规则**:壳里手抄的版本只认「根目录 `*.ypf`
+/// 或 `data/`」,把 `pac/bn.ypf` 这种商业多包布局和根级散盘全判成「没有
+/// data.ypf」,引擎能跑的游戏在选目录这一步就被拒了。
+///
+/// 返回 `{"ok":true,"root":"…","kind":"packed|loose","packs":N,"updates":N}`
+/// 或 `{"ok":false,"reason":"…"}`(reason 可直接给用户看)。
+pub fn probe_game_root(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return "{\"ok\":false,\"reason\":\"路径为空\"}".to_string();
+    }
+    match Project::discover(std::path::Path::new(trimmed), None) {
+        Ok(project) => format!(
+            "{{\"ok\":true,\"root\":\"{}\",\"kind\":\"{}\",\"packs\":{},\"updates\":{}}}",
+            yu_engine::project::json_escape(&project.root().to_string_lossy()),
+            project.entry().kind(),
+            project.packs().base.len(),
+            project.packs().updates.len(),
+        ),
+        Err(failure) => format!(
+            "{{\"ok\":false,\"reason\":\"{}\"}}",
+            yu_engine::project::json_escape(&failure.to_string())
+        ),
+    }
+}
+
 // ---------------------------------------------------------------- JNI exports
 //
 // 类名固定 `org.yuris.kernel.NativeHost`;返回 `OK` / `ERR: ...` 表示成败
@@ -2208,6 +2240,20 @@ mod jni_entry {
         let families = list_font_families();
         to_jstring(&mut env, families.join("
 "))
+    }
+
+    /// 目录选择器用的数据入口探测,见 [`probe_game_root`]。
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeProbeGameRoot<'local>(
+        mut env: JNIEnv<'local>,
+        _class: JClass<'local>,
+        path: JString<'local>,
+    ) -> JString<'local> {
+        let text: String = match env.get_string(&path) {
+            Ok(value) => value.into(),
+            Err(_) => String::new(),
+        };
+        to_jstring(&mut env, probe_game_root(&text))
     }
 
     #[no_mangle]
@@ -2569,5 +2615,74 @@ mod tests {
     #[test]
     fn window_close_without_session_is_reported() {
         assert_eq!(request_window_close(), -1, "无会话时显式返回 -1");
+    }
+
+    /// 探测用的临时目录(`Project::discover` 只读目录项与 4 字节魔数)。
+    fn probe_scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("yu-probe-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("创建探测夹具目录");
+        dir
+    }
+
+    /// 写一个只有魔数的最小 YPF(`discover` 只校验 `YPF\0`)。
+    fn write_stub_ypf(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("创建包目录");
+        }
+        std::fs::write(path, b"YPF\0stub").expect("写最小 YPF");
+    }
+
+    #[test]
+    fn probe_accepts_commercial_pac_layout() {
+        // 商业发行版实测布局:没有 data.ypf、没有 data/,包全在 pac/ 下。
+        let root = probe_scratch("pac");
+        write_stub_ypf(&root.join("pac/bn.ypf"));
+        write_stub_ypf(&root.join("pac/cg.ypf"));
+        let reply = probe_game_root(&root.to_string_lossy());
+        assert!(
+            reply.contains("\"ok\":true"),
+            "pac/*.ypf 是官方挂载规则里的合法入口: {reply}"
+        );
+        assert!(reply.contains("\"packs\":2"), "两个基础包都要数到: {reply}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn probe_accepts_root_level_loose_disk() {
+        // 散盘工程:根目录直接是 ysbin/、cg/ …(没有 data/ 包装)。
+        let root = probe_scratch("loose");
+        std::fs::create_dir_all(root.join("ysbin")).expect("创建 ysbin");
+        let reply = probe_game_root(&root.to_string_lossy());
+        assert!(reply.contains("\"ok\":true"), "根级散盘要认: {reply}");
+        assert!(reply.contains("\"kind\":\"loose\""), "{reply}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn probe_rejects_plain_directory() {
+        let root = probe_scratch("plain");
+        std::fs::create_dir_all(root.join("sub")).expect("创建普通子目录");
+        let reply = probe_game_root(&root.to_string_lossy());
+        assert!(
+            reply.contains("\"ok\":false"),
+            "普通目录不能被当数据入口: {reply}"
+        );
+        assert!(reply.contains("找不到数据入口"), "要带内核原因: {reply}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn probe_rejects_fake_ypf_extension() {
+        // 商业包 `pac/ed01..04.ypf` 实为 MPEG-PS:只有后缀、没有魔数不算包。
+        let root = probe_scratch("fake");
+        std::fs::write(root.join("movie.ypf"), [0x00, 0x00, 0x01, 0xBA])
+            .expect("写伪装 .ypf");
+        let reply = probe_game_root(&root.to_string_lossy());
+        assert!(
+            reply.contains("\"ok\":false"),
+            "魔数不符的 .ypf 不能当入口(旧壳手抄版会误判为真): {reply}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
