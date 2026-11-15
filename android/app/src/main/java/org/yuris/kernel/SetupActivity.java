@@ -203,6 +203,8 @@ public final class SetupActivity extends AppCompatActivity {
         Button importFont = secondaryButton("导入字体文件(ttf / otf / ttc)");
         importFont.setOnClickListener(v -> pickFont());
         fontCard.addView(importFont, buttonParams());
+        // 官方原版排版按等宽字体设计:字宽不一致会让行宽/对齐跑掉。
+        fontCard.addView(hintText("推荐使用等宽字体"));
         root.addView(fontCard, cardParams());
 
         // ---- 操作方式(启动时的输入模式) ----
