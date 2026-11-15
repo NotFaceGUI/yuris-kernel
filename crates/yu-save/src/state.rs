@@ -85,9 +85,15 @@ pub struct SaveState {
     writable: bool,
     /// 盘上槽表(按文件名排序;`refresh_slots` 重建)。
     slots: BTreeMap<String, SlotFile>,
-    /// 存档容器版本:从盘上 `.sd` 学到的值(写回时沿用;`None` = 还没见过
-    /// 任何存档)。容器版本是格式修订号,与引擎版本无关,所以不写死常量。
+    /// 宿主注入的容器版本(官方 exe 的 LOAD 校验常量)。这是**写盘器常量**,
+    /// 不是工程 yscfg/引擎版本:实测 0.495→`0x1E0`、0.479→`0x138`、
+    /// 0.466→`0x0C0`、0.481→`0x1E1`。官方引擎 LOAD 精确比对它,不等即报
+    /// 「セーブデータのバージョンが異なります」(yse 108040),所以写盘必须
+    /// 用它;盘上只有本引擎旧产物时也要以它纠正
+    /// (见 `docs/divergences/DIV-RT-058-save-container-version.md`)。
     container_version: Option<u32>,
+    /// 从未刷新的盘上槽文件学到的容器版本(无官方 exe 可探测时的证据)。
+    learned_version: Option<u32>,
     /// 块载荷压缩层:从盘上 `.sd` 学到的值(0.495 SDK = zlib;0.481 商业包
     /// 随包带 `YSSnp.dll` = Snappy)。`None` = 还没见过存档 ⇒ 写 zlib。
     block_codec: Option<yu_format::yssd::BlockCodec>,
@@ -123,6 +129,7 @@ impl SaveState {
             writable,
             slots: BTreeMap::new(),
             container_version: None,
+            learned_version: None,
             block_codec: None,
             reservations: BTreeMap::new(),
             diags: std::collections::VecDeque::new(),
@@ -198,6 +205,8 @@ impl SaveState {
         let Ok(entries) = self.fs.list(&self.root) else {
             return;
         };
+        // 盘上容器版本样本(名字 + 版本);循环后统一选举,见 `elect_version`。
+        let mut versions: Vec<(String, u32)> = Vec::new();
         for entry in entries {
             // 与旧 `path.extension() == Some("sd")` 同口径（大小写敏感）。
             if entry.is_dir || !entry.name.ends_with(".sd") {
@@ -214,8 +223,7 @@ impl SaveState {
             };
             match yu_format::yssd::YssdSave::parse(&bytes, name.as_bytes()) {
                 Ok(save) => {
-                    // 第一次见到存档即记住容器版本;后续写盘沿用它。
-                    self.container_version.get_or_insert(save.version);
+                    versions.push((name.clone(), save.version));
                     // 压缩层同样只学一次:取**第一条能判定**的单层块
                     // (`btype 2` 的外层裸流与 `DNO=1024` 嵌套槽判不了,跳过)。
                     if self.block_codec.is_none() {
@@ -247,6 +255,12 @@ impl SaveState {
                     ));
                 }
             }
+        }
+        // 盘上没有任何可解析的 `.sd`(或目录暂时不可读)⇒ 保留旧学习值;
+        // 有样本则重算(混合目录里本引擎旧产物可能污染多数票,选举规则
+        // 见 [`elect_version`])。
+        if !versions.is_empty() {
+            self.learned_version = elect_version(&versions);
         }
     }
 
@@ -405,13 +419,18 @@ impl SaveState {
         Ok(())
     }
 
-    /// 盘上已知的存档容器版本(从 `.sd` 学习或宿主注入)。
+    /// 当前写盘将采用的存档容器版本(宿主注入优先,其次盘上学到的)。
     #[must_use]
     pub fn container_version(&self) -> Option<u32> {
-        self.container_version
+        self.container_version.or(self.learned_version)
     }
 
-    /// 宿主注入存档容器版本(盘上没有任何 `.sd` 可参照时使用)。
+    /// 宿主注入**官方引擎的写盘容器版本**(官方 exe LOAD 校验常量)。
+    ///
+    /// 这是写盘器常量,不是工程 yscfg/引擎版本(0.495 工程 yscfg 是
+    /// `0x1EF`,但官方 0.495 写/读的容器版本是 `0x1E0`)。官方 LOAD 精确
+    /// 比对它,因此它优先于盘上学到的值:混合目录(本引擎旧产物 + 官方
+    /// 存档)里只有它保证官方读得动。
     pub fn set_container_version(&mut self, version: u32) {
         self.container_version = Some(version);
     }
@@ -433,8 +452,12 @@ impl SaveState {
     /// `SAVE[FILE="x"]`:刷盘。按 DNO 升序流出**预约时**的快照
     /// (REA `0x44cd5a..0x44ceab`:写头/偏移表 + 逐块写;预约表不清)。
     ///
-    /// 容器版本:目标文件已存在 → 沿用它的;否则用同目录学到的版本;
-    /// 都没有 ⇒ 显式拒绝(不猜版本号)。
+    /// 容器版本优先级(2026-11-15 修正):
+    /// 1. 宿主注入的官方 exe 校验常量([`Self::set_container_version`]);
+    /// 2. 同目录 `.sd` 学到的版本(官方存档是盘上事实);
+    /// 3. 目标文件自己的版本(读改写兼容);
+    /// 4. 按压缩层的现代默认([`yu_format::yssd::BlockCodec::default_container_version`]),
+    ///    并记一条 verbose 诊断(这是兜底,不是取证)。
     pub fn flush(&mut self, file: &str) -> Result<(), Diag> {
         if !self.writable {
             return Err(error::recoverable(
@@ -443,24 +466,34 @@ impl SaveState {
             ));
         }
         let path = self.confined_path(file)?;
-        let version = self
+        let codec = self.block_codec.unwrap_or_default();
+        let target_version = self
             .fs
             .read_prefix(&path, 8)
             .ok()
-            .and_then(|head| container_version_of(&head))
-            .or(self.container_version)
-            .ok_or_else(|| {
-                error::recoverable(
+            .and_then(|head| container_version_of(&head));
+        let version = match self
+            .container_version
+            .or(self.learned_version)
+            .or(target_version)
+        {
+            Some(version) => version,
+            None => {
+                let version = codec.default_container_version();
+                self.push_diag(error::verbose(
                     code::CONTAINER,
                     format!(
-                        "SAVE[FILE={file}]: 无法确定存档容器版本(save 目录里没有可参照的 .sd)"
+                        "SAVE[FILE={file}]: 无可参照的 .sd 与官方 exe 常量,容器版本按 \
+                         {} 压缩层兜底为 {version:#x}",
+                        codec.as_str()
                     ),
-                )
-            })?;
+                ));
+                version
+            }
+        };
         let mut writer = yu_format::yssd::YssdWriter::new(version);
         // 压缩层沿用同目录存档(0.495 = zlib;0.481 商业包 = Snappy);
         // 还没见过任何存档时用 zlib,与 0.495 官方产物逐字节一致。
-        let codec = self.block_codec.unwrap_or_default();
         for fact in self.reservations.values() {
             match fact.btype {
                 0 => {
@@ -1029,6 +1062,53 @@ fn snapshot_payload(snap: &VarSnapshot) -> Result<yu_format::yssd::YssdValue, Di
     })
 }
 
+/// 盘上容器版本选举(确定性)。
+///
+/// 优先采信**系统槽**(非 `saveNNNNN.sd`:gsd/seld/kidoku/extra/config/…):
+/// 它们由官方脚本先于玩家槽写出,且被覆写时沿用原版本,最能代表官方写盘器
+/// 常量;系统槽版本一致时直接采用。否则按出现次数取多数,平票取较小版本
+/// (二者都只是盘上证据不足时的确定性规则)。
+fn elect_version(samples: &[(String, u32)]) -> Option<u32> {
+    if samples.is_empty() {
+        return None;
+    }
+    let is_slot_save = |name: &str| {
+        let bytes = name.as_bytes();
+        bytes.len() == 12
+            && bytes.starts_with(b"save")
+            && bytes[4..9].iter().all(u8::is_ascii_digit)
+            && bytes.ends_with(b".sd")
+    };
+    let mut system: Option<u32> = None;
+    let mut system_agree = true;
+    for (name, version) in samples {
+        if is_slot_save(name) {
+            continue;
+        }
+        match system {
+            None => system = Some(*version),
+            Some(v) if v == *version => {}
+            Some(_) => {
+                system_agree = false;
+                break;
+            }
+        }
+    }
+    if system_agree {
+        if let Some(version) = system {
+            return Some(version);
+        }
+    }
+    let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+    for (_, version) in samples {
+        *counts.entry(*version).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by_key(|&(version, count)| (count, std::cmp::Reverse(version)))
+        .map(|(version, _)| version)
+}
+
 /// 已存在存档的容器版本:只读文件头 8 字节(`YSSD` + u32 版本);
 /// 非 YSSD / 太短 / 打不开 ⇒ `None`(由调用方决定回退来源)。
 fn container_version_of(head: &[u8]) -> Option<u32> {
@@ -1289,6 +1369,119 @@ mod tests {
         assert_eq!(slots[0].name, "t.sd");
         assert_eq!(slots[0].blocks, 1);
         assert_eq!(slots[0].dnos.get(&1), Some(&0x0a43));
+    }
+
+    /// 合成一个最小官方形态 `.sd`(单块 DNO=1),版本由调用方指定。
+    fn write_minimal_sd(path: &Path, version: u32) {
+        let payload = yu_format::yssd::YssdValue {
+            ty: yu_format::yssd::YssdValueType::Int,
+            dims: Vec::new(),
+            data: 400i64.to_le_bytes().to_vec(),
+        };
+        let mut writer = yu_format::yssd::YssdWriter::new(version);
+        writer.set_block(
+            1,
+            yu_format::yssd::encode_block_body(0, 1, 0x0a43, &payload.to_bytes()),
+        );
+        std::fs::write(path, writer.build()).unwrap();
+    }
+
+    fn sd_version(path: &Path) -> u32 {
+        let bytes = std::fs::read(path).unwrap();
+        yu_format::yssd::YssdSave::parse(&bytes, b"t.sd")
+            .unwrap()
+            .version
+    }
+
+    /// 回归(2026-11-15):新建槽必须沿用在盘上学到的**官方写盘版本**。
+    ///
+    /// 旧行为把 `config.version`(工程 yscfg,0.495=0x1EF)当容器版本注入,
+    /// 高于且不等于官方 LOAD 校验常量(0.495=0x1E0),导致官方弹
+    /// yse 108040「セーブデータのバージョンが異なります」——我们写的存档
+    /// 官方读不了。盘上系统槽(gsd/seld/…)的版本才是官方事实。
+    #[test]
+    fn new_slot_uses_learned_official_version() {
+        let root = temp_root("sv-learned-version");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        write_minimal_sd(&root.join("gsd.sd"), 0x138);
+
+        let mut state = SaveState::new(&root, true);
+        state.refresh_slots();
+        assert_eq!(state.container_version(), Some(0x138));
+        state
+            .reserve(1, VarRef::new(VarSpace::At, 1), &int_snapshot(&[400], &[]))
+            .expect("reserve");
+        state.flush("save00002.sd").expect("flush");
+        assert_eq!(sd_version(&root.join("save00002.sd")), 0x138);
+    }
+
+    /// 混合目录:本引擎旧产物(`saveNNNNN.sd` = 0x1DA)不能污染系统槽
+    /// 提供的官方版本证据。
+    #[test]
+    fn system_slot_version_beats_poisoned_player_slot() {
+        let root = temp_root("sv-learned-system");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        write_minimal_sd(&root.join("gsd.sd"), 0x138);
+        write_minimal_sd(&root.join("save00002.sd"), 0x1DA);
+
+        let mut state = SaveState::new(&root, true);
+        state.refresh_slots();
+        assert_eq!(state.container_version(), Some(0x138));
+        state
+            .reserve(1, VarRef::new(VarSpace::At, 1), &int_snapshot(&[1], &[]))
+            .expect("reserve");
+        state.flush("save00003.sd").expect("flush");
+        assert_eq!(sd_version(&root.join("save00003.sd")), 0x138);
+    }
+
+    /// 空目录 + 无官方 exe 常量:按压缩层取现代默认(0.495 = 0x1E0,
+    /// 0.481 Snappy = 0x1E1),并在诊断里明确这是兜底、不是取证。
+    #[test]
+    fn empty_dir_falls_back_to_codec_default_version() {
+        for (tag, codec, want) in [
+            ("sv-default-zlib", yu_format::yssd::BlockCodec::Zlib, 0x1E0),
+            (
+                "sv-default-snappy",
+                yu_format::yssd::BlockCodec::Snappy,
+                0x1E1,
+            ),
+        ] {
+            let root = temp_root(tag);
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let mut state = SaveState::new(&root, true);
+            state.set_block_codec(codec);
+            state
+                .reserve(1, VarRef::new(VarSpace::At, 1), &int_snapshot(&[7], &[]))
+                .expect("reserve");
+            state.flush("save00001.sd").expect("flush");
+            assert_eq!(sd_version(&root.join("save00001.sd")), want);
+            assert!(
+                state.take_diags().iter().any(|d| d.detail.contains("兜底")),
+                "兜底版本必须留诊断"
+            );
+        }
+    }
+
+    /// 宿主注入的官方 exe 常量优先级最高:即使盘上旧产物是别的版本,
+    /// 覆写/新建都按官方常量写(否则官方永远读不回混合目录)。
+    #[test]
+    fn injected_official_version_wins_over_learned() {
+        let root = temp_root("sv-injected-version");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        write_minimal_sd(&root.join("gsd.sd"), 0x1DA);
+
+        let mut state = SaveState::new(&root, true);
+        state.set_container_version(0x138);
+        state.refresh_slots();
+        state
+            .reserve(1, VarRef::new(VarSpace::At, 1), &int_snapshot(&[1], &[]))
+            .expect("reserve");
+        state.flush("save00002.sd").expect("flush");
+        assert_eq!(sd_version(&root.join("save00002.sd")), 0x138);
     }
 
     #[test]

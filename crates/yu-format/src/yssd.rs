@@ -448,6 +448,21 @@ impl BlockCodec {
         }
     }
 
+    /// 无盘上存档、也探测不到官方 exe 常量时的写盘容器版本默认值。
+    ///
+    /// 容器版本是**写盘器常量**,与 yscfg/引擎版本无关;官方 LOAD 在读完
+    /// `YSSD` 魔数后精确比对它,不等即报「セーブデータのバージョンが
+    /// 異なります」(yse 108040)。REA 实测(2026-11-15):
+    /// 0.495 SDK = `0x1E0`(zlib)、0.481 商业包(`YSSnp.dll`)= `0x1E1`
+    /// (Snappy)。旧代没有统一值(0.479 = `0x138`、0.466 = `0x0C0`),
+    /// 必须靠盘上存档或官方 exe 探测,不能由这里推断。
+    pub const fn default_container_version(self) -> u32 {
+        match self {
+            Self::Zlib => 0x1E0,
+            Self::Snappy => 0x1E1,
+        }
+    }
+
     fn compress(self, raw: &[u8]) -> Vec<u8> {
         match self {
             Self::Zlib => zlib_compress_level1(raw),

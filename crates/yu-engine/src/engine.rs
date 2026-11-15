@@ -2977,16 +2977,19 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         // 依据:该 DLL 导出 `YSSnp_Compress`/`YSSnp_Uncompress`,实机存档块
         // 逐块解出即 Snappy;0.495 SDK 存档块首为 `78 01`(zlib level 1)。
         if let Ok(mut state) = save_state.lock() {
-            // 容器版本兜底:**工程 yscfg 版本**(0.481=481 / 0.495=495)。
-            // 盘上已有同名存档时 `flush` 仍优先沿用该文件自己的版本;
-            // 没有可参照的 `.sd` 时不再拒绝写盘(此前会让新工程首次
-            // SAVE 直接报 `sv.container`)。块压缩层见下。
-            state.set_container_version(vm.tables().boot.config.version);
             // 宿主显式指定的层优先于引擎代号信号(`--save-codec`)。
-            state.set_block_codec(
-                opts.save_codec
-                    .unwrap_or_else(|| detect_block_codec(project.root())),
-            );
+            let codec = opts
+                .save_codec
+                .unwrap_or_else(|| detect_block_codec(project.root()));
+            state.set_block_codec(codec);
+            // 容器版本 = **官方 exe 的 LOAD 校验常量**,不是 yscfg/引擎版本:
+            // 0.495→0x1E0、0.479→0x138、0.466→0x0C0、0.481→0x1E1(REA
+            // 2026-11-15)。写错会导致官方弹 yse 108040「セーブデータの
+            // バージョンが異なります」——我们的存档官方读不了。
+            // 探测不到 exe 时留空,由盘上 `.sd` / 压缩层默认值兜底。
+            if let Some(version) = detect_save_container_version(project.root()) {
+                state.set_container_version(version);
+            }
         }
         let yscm = vm.tables().boot.yscm.clone();
         let host = SaveHost::new(save_state, yscm);
@@ -3119,6 +3122,210 @@ fn detect_block_codec(root: &std::path::Path) -> yu_format::yssd::BlockCodec {
     } else {
         yu_format::yssd::BlockCodec::Zlib
     }
+}
+
+/// 官方引擎的写盘容器版本(LOAD 校验常量)探测。
+///
+/// 官方 LOAD 在读完 `YSSD` 魔数后立刻 `CMP reg, imm32` 精确校验容器版本,
+/// 不等即弹 yse 108040「セーブデータのバージョンが異なります」。这个立即数
+/// 就是该构建**写盘必须使用**的容器版本,与 yscfg/引擎版本无关
+/// (REA 2026-11-15:0.495 = `0x1E0`、0.479 = `0x138`、0.466 = `0x0C0`、
+/// 0.481 商业包 = `0x1E1`)。
+///
+/// 扫描工程根 `*.exe`(按体积降序,游戏本体通常远大于安装器/设置器):
+/// 定位 `81 FA 'YSSD'`(`CMP EDX, 0x44535359`),取紧随其后的版本比较
+/// 立即数。单个 exe 内候选冲突 ⇒ 跳过该 exe;全部无候选 ⇒ `None`(不猜,
+/// 由盘上 `.sd` 或压缩层默认值兜底)。
+///
+/// 安装器/设置器/宿主自身的 exe 不参与:实测 `inst.exe` 也带 YSSD 校验,
+/// 但常量是旧代的 `0x0C0`;若它比游戏本体大或被先扫到,会把存档写坏。
+fn detect_save_container_version(root: &std::path::Path) -> Option<u32> {
+    const MAGIC_CMP: [u8; 6] = [0x81, 0xFA, b'Y', b'S', b'S', b'D'];
+    const WINDOW: usize = 96;
+    const MAX_EXE_BYTES: u64 = 64 * 1024 * 1024;
+    let mut exes: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("exe"))
+                && !is_helper_exe(path)
+        })
+        .filter_map(|path| {
+            let len = path.metadata().ok()?.len();
+            (len > 0 && len <= MAX_EXE_BYTES).then_some((len, path))
+        })
+        .collect();
+    exes.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    for (_, path) in exes {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let mut candidates = Vec::new();
+        let mut at = 0usize;
+        while let Some(found) = find_subslice(&bytes[at..], &MAGIC_CMP) {
+            let start = at + found + MAGIC_CMP.len();
+            let end = (start + WINDOW).min(bytes.len());
+            if let Some(version) = first_version_cmp(&bytes[start..end]) {
+                candidates.push(version);
+            }
+            at = start;
+        }
+        if candidates.is_empty() {
+            continue;
+        }
+        let first = candidates[0];
+        if candidates.iter().all(|&version| version == first) {
+            log::debug!(
+                target: "yu-engine::save",
+                "save container version {first:#x} from {}",
+                path.display()
+            );
+            return Some(first);
+        }
+    }
+    None
+}
+
+/// 非游戏本体的辅助 exe(安装器/设置器/本仓库宿主):不参与存档版本探测。
+fn is_helper_exe(path: &std::path::Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "inst"
+            | "install"
+            | "setup"
+            | "uninst"
+            | "uninstall"
+            | "ysicon"
+            | "yu-cli"
+            | "yu-serve"
+            | "yu-engine"
+            | "エンジン設定"
+            | "セーブファイル設定"
+    )
+}
+
+/// 在窗口内找第一条「寄存器/EAX 与 16 位以内立即数比较」的指令立即数。
+fn first_version_cmp(window: &[u8]) -> Option<u32> {
+    let read = |at: usize| {
+        u32::from_le_bytes([window[at], window[at + 1], window[at + 2], window[at + 3]])
+    };
+    let mut at = 0usize;
+    while at < window.len() {
+        let imm = match window[at] {
+            // CMP r32, imm32(81 /7;常见 EDX/ECX/ESI/EDI/EBX)。
+            0x81 if at + 6 <= window.len()
+                && matches!(window[at + 1], 0xFA | 0xF9 | 0xFE | 0xFF | 0xFB | 0xFD) =>
+            {
+                Some(read(at + 2))
+            }
+            // CMP EAX, imm32。
+            0x3D if at + 5 <= window.len() => Some(read(at + 1)),
+            _ => None,
+        };
+        // 容器版本是小的格式修订号(实测 0x0C0/0x138/0x1E0/0x1E1)。
+        if let Some(version) = imm.filter(|version| (0x10..=0xFFFF).contains(version)) {
+            return Some(version);
+        }
+        at += 1;
+    }
+    None
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod save_version_probe_tests {
+    use super::{detect_save_container_version, first_version_cmp};
+
+    /// 官方 exe 的版本比较形态(0.495 实测字节):`81 FA 59 53 53 44`
+    /// (CMP EDX,'YSSD')后 29 字节处的 `81 FA E0 01 00 00`。
+    #[test]
+    fn version_cmp_reads_register_immediate() {
+        assert_eq!(
+            first_version_cmp(&[0x81, 0xFA, 0xE0, 0x01, 0x00, 0x00]),
+            Some(0x1E0)
+        );
+        assert_eq!(
+            first_version_cmp(&[0x81, 0xF9, 0x38, 0x01, 0x00, 0x00]),
+            Some(0x138)
+        );
+        // CMP EAX, imm32。
+        assert_eq!(first_version_cmp(&[0x3D, 0xC0, 0x00, 0x00, 0x00]), Some(0x0C0));
+        // 0 / 魔数自身不算版本。
+        assert_eq!(first_version_cmp(&[0x81, 0xFA, 0x00, 0x00, 0x00, 0x00]), None);
+        assert_eq!(
+            first_version_cmp(&[0x81, 0xFA, 0x59, 0x53, 0x53, 0x44]),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_skips_exe_without_pattern() {
+        let root = super::tests_support_temp_root("sv-probe-empty");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("dummy.exe"), b"not a pe").unwrap();
+        assert_eq!(detect_save_container_version(&root), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 合成一个含官方 LOAD 指令形态的最小 exe:`81 FA 'YSSD'` + `81 FA imm32`。
+    fn synthetic_exe(version: u32, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0x90u8; len.max(64)];
+        bytes[8..14].copy_from_slice(&[0x81, 0xFA, b'Y', b'S', b'S', b'D']);
+        bytes[14] = 0x81;
+        bytes[15] = 0xFA;
+        bytes[16..20].copy_from_slice(&version.to_le_bytes());
+        bytes
+    }
+
+    /// 安装器 `inst.exe` 也带 YSSD 校验(实测旧代 `0x0C0`),且可能比游戏本体
+    /// 大;必须跳过,否则会把存档写成旧代版本。
+    #[test]
+    fn detect_skips_installer_exe() {
+        let root = super::tests_support_temp_root("sv-probe-installer");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("inst.exe"), synthetic_exe(0x0C0, 4096)).unwrap();
+        std::fs::write(root.join("game.exe"), synthetic_exe(0x138, 2048)).unwrap();
+        assert_eq!(detect_save_container_version(&root), Some(0x138));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 官方 0.495 SDK exe 的真实常量(真值层级 2;缺样本环境显式报错)。
+    ///
+    /// `YURIS_SAMPLE_SDK0495` 有两种既有约定(指向包根或 `システム/`),
+    /// 两种都接受。
+    #[test]
+    fn detect_reads_official_0495_constant() {
+        let Some(sdk) = std::env::var_os("YURIS_SAMPLE_SDK0495") else {
+            panic!("YURIS_SAMPLE_SDK0495 未设置(缺样本环境必须显式报错)");
+        };
+        let sdk = std::path::PathBuf::from(&sdk);
+        let dir = [sdk.clone(), sdk.join("システム")]
+            .into_iter()
+            .find(|dir| dir.join("yu-ris.exe").is_file())
+            .unwrap_or_else(|| panic!("官方 yu-ris.exe 不可读: {}", sdk.display()));
+        assert_eq!(detect_save_container_version(&dir), Some(0x1E0));
+    }
+}
+
+#[cfg(test)]
+fn tests_support_temp_root(tag: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/tmp")
+        .join(tag)
 }
 
 #[cfg(test)]
