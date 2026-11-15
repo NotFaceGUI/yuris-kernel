@@ -14517,3 +14517,56 @@ v474 样本 headless --frames 1
 (`Likely`,无真包,长度必须闭合)。YSTB V2(200<v<300)与 YCG 图像解码
 仍因无真样本/规格未实现;`--font` 与 VFS `..` 告警与本次格式无关。
 待办清单见 `docs/todo-format-generic.md`。
+
+## 成果 GX-TEXT-FLASH (2026-11-15) · 正文文本恢复 + 转场单帧闪黑收口
+
+> 样本:v474 商业包(仅本地取证,代码/文档不含真名与路径)。
+
+### 1. 正文不显示(文本层整层被丢)
+
+- 现象:`[text-trace]` 中正文层 `draws=0 glyphs=0`,
+  diag=`text.layer_base: asset.missing`;目标层
+  `:/W0/BT.OFFES.GAMEMAIN.TIP.MESW.TX=0=1` 的 `texture=Asset("cgsys/../system/window/")`
+  —— 目录形键,永远解不出图片。
+- 裁定:官方把 `FILE` 装载失败当「该层没有图片」,层对象与 `SX/SY` 表面仍存在;
+  文本写在**空白画布**上。我们此前把整层连同字形一起丢掉。
+- 修法:目录形 `FILE` 退化为 `SolidBlack1x1` 表面 + `fill=Some([0,0,0,0])`
+  (画布透明),`CGACT[TEXT]` 正常落字。见 DIV-GFX-084。
+- 复验:`rep(draws=2 glyphs=22)`,`MESW` 层 `draws=88 glyphs=88`,
+  存档/确认框文字恢复。
+
+### 2. 转场单帧闪黑
+
+- 现象:logo/转场起点 1 帧全黑(`mean` 255→0→255),211/403/501/727/794 周期出现。
+- 证据:
+  - 黑帧多一条 `COPY2 Group(:/W0)→BUF`;同帧 `SIZE BUF→LNO_FB` 的源 BUF 仍是
+    `FILE=""` 空白 1×1;
+  - 黑 1×1 被 `SIZE` 放大成 1281×721,`LNO_FB.1`(z=8,900,000、A=256)全屏绘制;
+  - 官方空串分支把 1×1 缓冲**四字节全写 0**(REA 0.495 `FUN_0040c5f8`),
+    `SIZE` 读到的是透明;手册「1x1 の黒画像」只描述**直接绘制**口径。
+- 修法:`resolve_ref` 增加 `blank` 参数——像素运算源/文本基面用
+  `SOLID_EMPTY`([0,0,0,0]),直接绘制/过渡取样用 `SOLID_BLACK_PX`;
+  soft 的 `solid_fill_texture`、文本基面同步。1×1 像素本身不改,
+  黑幕/转场不回退。见 DIV-GFX-085 / DIV-GFX-060 §6。
+- 复验(同一 v474 样本,`--paused --step-to 798`):
+
+```text
+修复前 near-black = [1..20, 211, 403, 501, 727, 794]
+修复后 near-black = [1..20]        ← 仅启动黑屏
+790..798 mean = 255,255,255,255,255,255,252.36,249.70,247.03
+```
+
+### 验证命令与结果
+
+```text
+cargo test --release -p yu-backend-soft --test render
+  → 26 passed(新增 cgact_size_from_fileless_blank_layer_is_transparent)
+cargo test --release -p yu-gfx -p yu-render-core
+  → 27 + 16 passed
+cargo test --release -p yu-backend-wgpu
+  → 38 passed;diffusion/blur 两条软硬对拍在并行 GPU 下随机一条失败,
+    单跑必过(与本次改动无关)
+```
+
+插桩:`YU_OP_TRACE`(逐 op 绘制)、`YU_PASS_TRACE`(逐 pass 目标/纹理/命令序)
+均为 env-gated,默认路径零额外开销。

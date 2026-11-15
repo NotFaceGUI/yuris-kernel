@@ -45,4 +45,4 @@ pub use text::{
     content_hash_rgba, text_base_key, texture_content_hash, ComposedLayer, GlyphPlacement,
     TextComposer, TextPaintStats,
 };
-pub use texture::{AssetIssue, Texture, TextureStore};
+pub use texture::{AssetIssue, Texture, TextureStore, SOLID_BLACK_PX, SOLID_EMPTY};

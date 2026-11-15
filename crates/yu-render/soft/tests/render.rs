@@ -71,6 +71,9 @@ fn table() -> ParamTable {
                     "Y",
                     "X2",
                     "Y2",
+                    "SX",
+                    "SY",
+                    "SIZE",
                     "RECTPAINT",
                     "RECTPAINT2",
                     "RECTPAINT3",
@@ -324,11 +327,69 @@ fn solid_black_1x1_is_stretched_to_sx_sy() {
     let mut backend = SoftRenderer::new(texture_store(&[]));
     let out = backend.render_frame(&frame);
 
+    // `CG[FILE=""]` 是**不透明黑**的 1×1 表面,按 `SX/SY` 铺开即黑幕/
+    // 遮挡板(手册「1x1 の黒画像」)。这里同时钉住"不能透明":改成 alpha=0
+    // 会让黑幕提前消失(实测读档淡出缺失)。
     assert_eq!(out.surface.pixel(0, 0), Some([0, 0, 0, 255]));
     assert_eq!(out.surface.pixel(3, 3), Some([0, 0, 0, 255]));
+    // 层矩形之外的像素不受影响,仍是画布底色。
     assert_eq!(out.surface.pixel(4, 0), Some([255, 255, 255, 255]));
     // 主组直绘:只有那一层 op(组不再单独计数)。
     assert_eq!(out.report.ops_drawn, 1);
+}
+
+#[test]
+fn cgact_size_from_fileless_blank_layer_is_transparent() {
+    let table = table();
+    let mut gfx = state(Viewport::new(8, 8), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        // 空白源:BUF.LNO_FB.1 同型(`CG[FILE=""]`,无 fill),脚本里 E=0。
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"BUF".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(1)),
+                arg(&table, "CG", "SY", Value::Int(1)),
+            ],
+        ),
+        // 可见层:空白面 + 目标尺寸,再由 SIZE 从 BUF 取像素。
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"FADE".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(8)),
+                arg(&table, "CG", "SY", Value::Int(8)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"BUF".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"FADE".to_vec())),
+                arg(&table, "CGACT", "SIZE", Value::Int(1)),
+                arg(&table, "CGACT", "SX", Value::Int(8)),
+                arg(&table, "CGACT", "SY", Value::Int(8)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let mut backend = SoftRenderer::new(texture_store(&[]));
+    let out = backend.render_frame(&frame);
+
+    // 官方空串分支把 1×1 新缓冲四字节全写 0(REA `0x40c5f8`),`CGACT[SIZE]`
+    // 读的是这份像素 ⇒ 空白源缩放后必须**透明**。若按直接绘制口径给黑,
+    // 这里会把空白缓冲放大成不透明黑板(转场首帧单帧闪黑,2026-11-15 实测)。
+    assert_eq!(out.surface.pixel(0, 0), Some([255, 255, 255, 255]));
+    assert_eq!(out.surface.pixel(4, 4), Some([255, 255, 255, 255]));
+    assert_eq!(out.surface.pixel(7, 7), Some([255, 255, 255, 255]));
 }
 
 #[test]

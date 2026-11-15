@@ -3130,7 +3130,54 @@ impl GfxState {
             return;
         };
         let mut file_diags = Vec::new();
-        let file = take_file(&params, &mut file_diags);
+        let mut file = take_file(&params, &mut file_diags);
+        // `CG[FILE=<目录形键>]`:键以路径分隔符结尾 ⇒ 它指向一个目录,
+        // **不可能**解码成图片。官方把 `FILE` 装载失败当作"该层没有图片",
+        // 层对象与 `SX/SY` 表面照旧存在(`CGACT[TEXT]` 仍写进这块面)。
+        //
+        // 证据:ERIS 本篇正文层 `ES.GAMEMAIN.TIP.MESW.TX` 的键是脚本运行时
+        // 拼出的 `cgsys/../system/window/`(`es_button.yst` s9,`$前缀[$n]` +
+        // 分隔符);`pac/system.ypf` 的 `system/window/` 下只有具体 png,
+        // 没有名为空的东西。见 DIV-GFX-084。
+        //
+        // 这里只按**纯字符串**判定(不需要 I/O),退化成
+        // `TextureRef::SolidBlack1x1` —— 与 `CG[FILE=""]` 同一表示:
+        // "这一次给了 FILE,但没有可用的图片像素",表面按 `SX/SY` 铺开。
+        // 非目录形的键仍走原资产路径,不做任何猜测。
+        //
+        // 为什么不用 `TextureRef::None`:那是"没有纹理来源"的抽象,后端
+        // `resolve_ref` 直接拒绝(`gfx.copy.source.texture_none`),文本
+        // 基面因此拿不到画布;而 `SolidBlack1x1` 两端都已实现"按 `SX/SY`
+        // 铺成显式尺寸的表面",正是这里需要的语义。
+        //
+        // 也**不能**退化成 `file = None`:那会被下方「无 FILE/RID 且层
+        // 不存在 ⇒ 官方返回 -1,不建节点」当成"脚本没给 FILE",于是层根本
+        // 不建立、后续 `CGACT[TEXT]` 报目标层不存在。
+        let dir_shaped_file = matches!(&file, Some(TextureRef::Asset(k))
+            if k.last().is_some_and(|b| *b == b'/' || *b == 0x5c));
+        if dir_shaped_file {
+            if std::env::var_os("YU_CG_FILE_TRACE").is_some() {
+                let at = self
+                    .cur_call
+                    .map(|(script, pc)| format!("s{script}@{pc}"))
+                    .unwrap_or_else(|| "?-@?".into());
+                let key = match &file {
+                    Some(TextureRef::Asset(k)) => String::from_utf8_lossy(k).into_owned(),
+                    _ => String::new(),
+                };
+                self.push_diag(
+                    "CG",
+                    error::info(
+                        error::code::TEXTURE_MISSING,
+                        format!(
+                            "[cg-file-dir] at={at} ID=`{}` key=`{key}` ⇒ solid1x1 空白表面",
+                            String::from_utf8_lossy(&id)
+                        ),
+                    ),
+                );
+            }
+            file = Some(TextureRef::SolidBlack1x1);
+        }
         let trailing = id.ends_with(b"/");
         let parsed = path::normalize(&id, idno, trailing);
         let is_dir = parsed.is_dir;
@@ -3244,7 +3291,9 @@ impl GfxState {
             if let Some(node) = self.nodes.get_mut(&parsed.path) {
                 let layer = Arc::make_mut(&mut node.layer);
                 layer.texture = texture;
-                layer.fill = None;
+                // 目录形 `FILE` 换图同样是"没有图片像素":画布必须透明
+                // (DIV-GFX-084);其余情况沿用官方"换图清 fill"语义。
+                layer.fill = dir_shaped_file.then_some([0, 0, 0, 0]);
                 // 新纹理没有旧快照/图像加工的状态;属性随后重算。
                 layer.reset_status();
             }
@@ -3290,6 +3339,20 @@ impl GfxState {
         };
         for d in diags {
             self.push_diag("CG", d);
+        }
+        // 目录形 `FILE` 退化的空白画布必须**透明**(DIV-GFX-084):它是
+        // `CGACT[TEXT]` 的写字面,不是黑幕。用 `fill = [0,0,0,0]` 与
+        // `CG[FILE=""]` 的不透明黑区分开 —— 后者的用途是黑幕/遮挡板,
+        // 靠 `A` 淡入淡出,不能透明(实测改成透明会让读档黑幕提前消失、
+        // 淡出缺失)。放在参数应用之后,避免被 `RECTPAINT3` 之前的默认值
+        // 覆盖;脚本若随后显式 `RECTPAINT*`,仍以后者为准。
+        if dir_shaped_file {
+            if let Some(node) = self.nodes.get_mut(&parsed.path) {
+                let layer = Arc::make_mut(&mut node.layer);
+                if layer.fill.is_none() {
+                    layer.fill = Some([0, 0, 0, 0]);
+                }
+            }
         }
         self.record_mask_op(&parsed.path, &params);
     }
@@ -4487,20 +4550,64 @@ impl GfxState {
         y2: Option<f64>,
         region_from_fixed: bool,
     ) {
+        // 源层缺失时的两种"规格化"动作:
+        //
+        // 1. `SIZE` 族是**规格化写入**——脚本先 `CGINFO[SX/SY]` 读源层尺寸,
+        //    读回 0 说明这一层还没建,于是发 `CGACT[SIZE]` 想把它定成目标
+        //    尺寸(`es_sprite.yst` s36 pc6097..6101:`CGINFO ID=$TR` →
+        //    `CGACT ID=TRBUF ID2=TR SIZE=1 SX/SY`)。官方在这里把源层建出来;
+        //    若直接跳过,尺寸永远读回 0,下一帧又发同一条 ⇒ **转场缓冲层
+        //    永远建不出来**,依赖它的 `CG[TID=$TR]` 与后续 CGACT 全部落空,
+        //    表现为转场/读档黑幕后闪一下。
+        // 2. 自翻转族(`REVERSE/HORIZONTAL/VERTICAL`)只改本层像素,对空层
+        //    是无害恒等;同一条链里常紧跟在 `SIZE` 之后(`pc4263/4264`)。
+        //    同样建层,保住后续 `CGINFO[EXIST]` 的可见性。
+        //
+        // 其余动作(两图层合成/滤镜)仍按缺源跳过——它们需要真实像素来源。
         if !self.nodes.contains_key(source) {
-            self.push_diag(
-                "CGACT",
-                error::recoverable(
-                    error::code::LAYER_MISSING,
-                    format!("图像加工源 `{}` 不存在", source.display()),
-                ),
+            let explicit_size = match (sx, sy) {
+                (Some(w), Some(h)) if w > 0.0 && h > 0.0 => Some(SizeU32 {
+                    width: w.round().max(1.0) as u32,
+                    height: h.round().max(1.0) as u32,
+                }),
+                _ => None,
+            };
+            let self_only = matches!(
+                action,
+                ImageAction::Reverse | ImageAction::Horizontal | ImageAction::Vertical
             );
-            return;
+            let size_from_params = action.is_scale() && explicit_size.is_some();
+            if size_from_params || self_only {
+                // **必须是 `SolidBlack1x1` 而非 `None`**:`CGACT` 的可执行
+                // 判定白名单只收 `Asset/Snapshot/SolidBlack1x1/Movie`
+                // (`state.rs` 的 `is_scale` 分支),`None` 会让该层后续所有
+                // 加工 op 被判 `gfx.imageop.copy_source.unsupported` ——
+                // 实测一帧 751 个 op 里 740 个被跳过,画面上只剩 11 个 op,
+                // 表现为转场期间突兀的一帧黑屏。
+                // 建出来的是"有 FILE、无图片"的空表面,与 `CG[FILE=""]`
+                // 同族,但不带 `fill`。像素运算(`SIZE/COPY/MERGE` 的源)
+                // 按官方空串分支的四字节全 0 读成**透明**;只有**直接绘制**
+                // 这张空白面时才按手册呈黑(见 `resolve_ref` 的 `blank`)。
+                self.create_image(source, TextureRef::SolidBlack1x1, explicit_size);
+            }
+            if !self.nodes.contains_key(source) {
+                self.push_diag(
+                    "CGACT",
+                    error::recoverable(
+                        error::code::LAYER_MISSING,
+                        format!("图像加工源 `{}` 不存在", source.display()),
+                    ),
+                );
+                return;
+            }
         }
         let target = target.or_else(|| Some(source.clone()));
         if let Some(t) = &target {
             if !self.nodes.contains_key(t) {
-                self.create_image(t, TextureRef::None, None);
+                // 同上:`TextureRef::None` 不在任何加工动作的可执行白名单里,
+                // 补建目标层若用 `None`,后续所有写它的 op 会连带失效。
+                // 用 `SolidBlack1x1`(「有源、无图片」的空表面)保持可加工。
+                self.create_image(t, TextureRef::SolidBlack1x1, None);
             }
             if self.nodes.get(t).is_some_and(|n| n.layer.is_group()) {
                 self.push_diag(

@@ -45,13 +45,29 @@ pub struct Texture {
     pub rgba: Vec<u8>,
 }
 
+/// `CG[FILE=""]` 的 1×1 表面像素。
+///
+/// **不透明黑** `[0,0,0,255]`:这一层在本作里的用途就是**黑幕/遮挡板**
+/// (建出来即当底色,常用 `RECTPAINT3 SET=0xAARRGGBB` 再刷成别的颜色)。
+/// 若把它改成 alpha=0,黑幕会直接消失 —— 实测读档黑幕提前结束、淡出
+/// 缺失,即此。(DIV-GFX-060 的手册/REA 分歧保留原口径:手册「1x1 の黒
+/// 画像」= 不透明黑,与实机一致。)
+pub const SOLID_BLACK_PX: [u8; 4] = [0, 0, 0, 255];
+
+/// 「有 `FILE` 但没有任何图片像素」的**空白画布**像素:全 0(含 alpha)。
+///
+/// 只用于 `CG[FILE=<目录形键>]` 这类**装载必然失败**的层(DIV-GFX-084):
+/// 这类层不是黑幕,而是给 `CGACT[TEXT]` 提供写字画布,必须透明,
+/// 否则会在正文/按钮下方压出一块实色。与 [`SOLID_BLACK_PX`] **不可混用**。
+pub const SOLID_EMPTY: [u8; 4] = [0, 0, 0, 0];
+
 impl Texture {
-    /// 手册 `cg/cg.html`:`FILE=""` 生成的 1×1 黑图(不透明)。
+    /// `CG[FILE=""]` 生成的 1×1 表面纹理(不透明黑,见 [`SOLID_BLACK_PX`])。
     pub fn solid_black_1x1() -> Self {
         Self {
             width: 1,
             height: 1,
-            rgba: vec![0, 0, 0, 255],
+            rgba: SOLID_BLACK_PX.to_vec(),
         }
     }
 
@@ -2446,7 +2462,9 @@ mod tests {
             .resolve_ref(&TextureRef::SolidBlack1x1)
             .expect("solid");
         assert_eq!((black.width, black.height), (1, 1));
-        assert_eq!(black.pixel(0, 0), Some([0, 0, 0, 255]));
+        // 不透明黑:该层在本作是**黑幕/遮挡板**,靠 `A` 淡入淡出。
+        // 改成 alpha=0 会让黑幕提前消失(实测读档淡出缺失)。
+        assert_eq!(black.pixel(0, 0), Some(SOLID_BLACK_PX));
 
         for texture in [
             TextureRef::None,

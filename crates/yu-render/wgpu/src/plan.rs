@@ -25,7 +25,10 @@ use yu_gfx::{
     LayerId, Op, OpStatus, Pass, PassTarget, ScreenSnapshot, TextureRef,
 };
 use yu_log::Diag;
-use yu_render_core::{RenderPhases, RenderReport, Surface, TextComposer, Texture, TextureStore};
+use yu_render_core::{
+    RenderPhases, RenderReport, Surface, TextComposer, Texture, TextureStore, SOLID_BLACK_PX,
+    SOLID_EMPTY,
+};
 
 use crate::device::{code, GpuContext};
 use crate::passes::{
@@ -463,6 +466,29 @@ pub(crate) fn plan(
         };
         acc.passes += 1;
         for op in &pass.ops {
+            if std::env::var_os("YU_PASS_TRACE").is_some() {
+                match op {
+                    Op::Image(i) => eprintln!(
+                        "[texop] f={} seq={} IMG {} -> {} {:?}",
+                        frame.frame,
+                        i.seq,
+                        i.source.display(),
+                        i.target
+                            .as_ref()
+                            .map(|t| t.display())
+                            .unwrap_or_else(|| i.source.display()),
+                        i.action,
+                    ),
+                    Op::Copy(c) => eprintln!(
+                        "[texop] f={} seq={} COPY {:?} -> {}",
+                        frame.frame,
+                        c.seq,
+                        c.source,
+                        c.dest.display(),
+                    ),
+                    _ => {}
+                }
+            }
             match op {
                 Op::Image(image) if op.status() == OpStatus::Executable => {
                     acc.ops_total += 1;
@@ -782,6 +808,54 @@ pub(crate) fn plan(
             stats.live_bytes / (1024 * 1024),
         );
     }
+    // 取证(`YU_PASS_TRACE=1`):逐 pass 记录目标/清屏色/draw 的纹理与类型。
+    // `YU_OP_TRACE` 只看得到「规划了哪些 draw」,看不到它落在哪个 pass、
+    // 采样的是哪张纹理;单帧闪黑必须靠 pass 级顺序与目标才能定位。
+    if std::env::var_os("YU_PASS_TRACE").is_some() {
+        for (i, p) in passes.iter().enumerate() {
+            let tgt = match &p.target {
+                Some(PlannedTarget::Screen) => {
+                    let id = targets.screen().map(|t| t.id).unwrap_or(0);
+                    format!("SCREEN({id})")
+                }
+                Some(PlannedTarget::Offscreen(id)) => {
+                    let tex = targets.offscreen(id).map(|t| t.id).unwrap_or(0);
+                    format!("OFF:{}#{tex}", id.display())
+                }
+                Some(PlannedTarget::Surface(id)) => format!("SURF:{id}"),
+                Some(PlannedTarget::Commands) => "CMDS".to_string(),
+                None => "NONE".to_string(),
+            };
+            let draws: Vec<String> = p
+                .draws
+                .iter()
+                .take(16)
+                .map(|d| {
+                    let sz = gpu
+                        .get(d.texture_id)
+                        .map(|t| format!("{}x{}", t.width, t.height))
+                        .unwrap_or_else(|| "?".to_string());
+                    format!("{:?}/tex={}({})/b={:?}", d.kind, d.texture_id, sz, d.blend)
+                })
+                .collect();
+            eprintln!(
+                "[pass] f={} i={} tgt={} clear=({:.2},{:.2},{:.2},{:.2}) draws={} [{}] blits={} clrT={} clrC={} load={}",
+                frame.frame,
+                i,
+                tgt,
+                p.clear.r,
+                p.clear.g,
+                p.clear.b,
+                p.clear.a,
+                p.draws.len(),
+                draws.join(","),
+                p.blits.len(),
+                p.clear_targets.len(),
+                p.clear_colors.len(),
+                p.load,
+            );
+        }
+    }
     Ok((
         FramePlan {
             passes,
@@ -1047,6 +1121,7 @@ fn resolve_target_base(
                 id,
                 texture,
                 layer.and_then(|layer| layer.fill),
+                SOLID_EMPTY,
                 bases,
             )?;
             let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -1118,6 +1193,7 @@ fn resolve_source(
         id,
         texture,
         layer.and_then(|layer| layer.fill),
+        SOLID_EMPTY,
         bases,
     )?;
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -1152,9 +1228,23 @@ pub(crate) fn resolve_ref(
     id: &LayerId,
     texture: &TextureRef,
     fill: Option<[u8; 4]>,
+    // `blank`:`SolidBlack1x1` 且没有 `fill` 时使用的像素。
+    //
+    // 官方 `CG[FILE=""]` 的 1×1 表面**四个字节全 0**(REA `0x40c5f8`),
+    // 因此像素运算(`CGACT[SIZE]/COPY/MERGE` 的源)看到的是**透明**;
+    // 而同一张 1×1 在**直接绘制/过渡取样**时按手册呈现为黑
+    // (`cg.html`:「FILE="" で1x1サイズの黒画像生成」)。两者不是同一个
+    // 用途,不能共用一个默认像素:统一给黑会让 `SIZE` 把空白缓冲放大成
+    // 不透明黑(单帧闪黑,2026-11-15 实测),统一给透明会让黑幕/转场消失。
+    blank: [u8; 4],
     bases: &mut BTreeMap<(LayerId, u64), Rc<TexRef>>,
 ) -> Result<Rc<TexRef>, String> {
-    let key = (id.clone(), texref_token(texture) ^ fill_token(fill));
+    // 空白像素也是基面身份的一部分:同一个 `fill=None` 的 1×1 在像素运算
+    // (透明)与直接绘制/过渡(黑)下是两张不同的纹理,缓存键必须分开。
+    let key = (
+        id.clone(),
+        texref_token(texture) ^ fill_token(fill) ^ fill_token(Some(blank)).rotate_left(17),
+    );
     if let Some(hit) = bases.get(&key) {
         return Ok(hit.clone());
     }
@@ -1191,7 +1281,7 @@ pub(crate) fn resolve_ref(
         }
         TextureRef::SolidBlack1x1 => {
             let gpu_id = gpu
-                .ensure_solid_color(ctx, fill.unwrap_or([0, 0, 0, 255]))
+                .ensure_solid_color(ctx, fill.unwrap_or(blank))
                 .map_err(|diag| diag.code.to_string())?;
             let uploaded = gpu
                 .get(gpu_id)
@@ -2217,6 +2307,18 @@ fn apply_copy(
             }
         }
         CopySource::Group(group) => {
+            if std::env::var_os("YU_PASS_TRACE").is_some() {
+                let snap = frame.screen_snapshots.get(&copy.id);
+                eprintln!(
+                    "[copy] f={} id={} src=Group({}) screen_snapshot={} snap_layers={} snap_passes={}",
+                    frame.frame,
+                    copy.id.0,
+                    group.display(),
+                    snap.is_some(),
+                    snap.map(|s| s.layer_ids.len()).unwrap_or(0),
+                    snap.map(|s| s.passes.len()).unwrap_or(0),
+                );
+            }
             let main_group = frame
                 .windows
                 .iter()
@@ -2854,7 +2956,18 @@ fn asset_identity_base(
     let TextureRef::Asset(key) = &layer.texture else {
         return None;
     };
-    let tex = resolve_ref(ctx, textures, gpu, targets, id, &layer.texture, None, bases).ok()?;
+    let tex = resolve_ref(
+        ctx,
+        textures,
+        gpu,
+        targets,
+        id,
+        &layer.texture,
+        None,
+        SOLID_BLACK_PX,
+        bases,
+    )
+    .ok()?;
     if raw.tex.id != tex.id {
         // 像素 op 产出了新纹理:内容已不是资产,必须读回。
         return None;

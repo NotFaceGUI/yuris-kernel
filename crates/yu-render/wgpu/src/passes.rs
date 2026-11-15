@@ -24,7 +24,9 @@ use yu_gfx::{
     Op, OpStatus, TextureRef,
 };
 use yu_log::Diag;
-use yu_render_core::{AssetIssue, RenderReport, SkippedOp, TextPaintStats, TextureStore};
+use yu_render_core::{
+    AssetIssue, RenderReport, SkippedOp, TextPaintStats, TextureStore, SOLID_BLACK_PX,
+};
 
 use crate::device::{code, GpuContext};
 use crate::pipelines::{FilterKind, PipelineCache};
@@ -213,10 +215,80 @@ impl Planner<'_> {
         }
     }
 
+    /// 取证(`YU_OP_TRACE=1`):记录"这一帧到底画了哪些层"。
+    /// 转场闪黑这类"op 集合相同、像素不同"的现象,只有把成功绘制的层
+    /// 逐条列出来才能对比;报告里的 `ops_drawn` 只是个总数。
+    fn trace_drawn(&self, op: &Op) {
+        if std::env::var_os("YU_OP_TRACE").is_none() {
+            return;
+        }
+        let desc = match op {
+            Op::Layer(l) => format!(
+                "LY {} z={} a={} vis={} tex={} fill={:?} content={}",
+                l.id.display(),
+                l.z,
+                l.alpha,
+                u8::from(l.visible),
+                match &l.texture {
+                    yu_gfx::TextureRef::Asset(_) => "asset",
+                    yu_gfx::TextureRef::Snapshot(_) => "snap",
+                    yu_gfx::TextureRef::SolidBlack1x1 => "solid",
+                    yu_gfx::TextureRef::Offscreen(_) => "offs",
+                    yu_gfx::TextureRef::Movie { .. } => "movie",
+                    yu_gfx::TextureRef::None => "none",
+                },
+                l.fill,
+                self.contents
+                    .get(&l.id)
+                    .map(|c| format!("{}x{}@{:x}", c.width, c.height, c.tex.id))
+                    .unwrap_or_else(|| "base".to_string()),
+            ),
+            Op::Group(g) => format!(
+                "GR {} off={} z={} a={}",
+                g.layer.id.display(),
+                g.offscreen.display(),
+                g.layer.z,
+                g.layer.alpha
+            ),
+            Op::Transition(t) => format!(
+                "TR {} z={} a={} t={} ta={} to={}",
+                t.layer.id.display(),
+                t.layer.z,
+                t.layer.alpha,
+                t.t,
+                t.ta,
+                t.to.is_some()
+            ),
+            Op::Copy(c) => format!("CP {}", c.dest.display()),
+            Op::Image(i) => format!("IM {}", i.target.as_ref().map(|t| t.display()).unwrap_or_else(|| i.source.display())),
+            Op::Mask(m) => format!("MK {} mask={}", m.layer.id.display(), m.mask.display()),
+        };
+        eprintln!(
+            "[op] f={} dw={} h={} {}",
+            self.frame.frame,
+            self.dst_width,
+            self.dst_height,
+            desc
+        );
+    }
+
     pub(crate) fn plan_op(&mut self, op: &Op, out: &mut PlannedPass) -> Result<(), Diag> {
         if self.counted {
             self.acc.ops_total += 1;
         }
+        // 取证(`YU_OP_TRACE=1`):用 `out.draws` 的增量判定这一 op 是否真的
+        // 产出了绘制指令(被 skip 的分支不会 push)。逐帧对比绘制集合是定位
+        // "同输入不同像素"类闪屏的唯一直接手段。
+        let trace = std::env::var_os("YU_OP_TRACE").is_some();
+        let draws_before = out.draws.len();
+        let r = self.plan_op_inner(op, out);
+        if trace && out.draws.len() > draws_before {
+            self.trace_drawn(op);
+        }
+        r
+    }
+
+    fn plan_op_inner(&mut self, op: &Op, out: &mut PlannedPass) -> Result<(), Diag> {
         match op {
             Op::Layer(layer) => self.plan_layer(op, layer, out),
             Op::Group(group) => {
@@ -412,6 +484,7 @@ impl Planner<'_> {
                 kind: DrawKind::TransitionPsc { bind_index },
             });
         }
+        self.trace_drawn(op);
         self.drawn();
         Ok(())
     }
@@ -579,7 +652,7 @@ impl Planner<'_> {
             TextureRef::SolidBlack1x1 => {
                 let texture_id = self
                     .gpu
-                    .ensure_solid_color(self.ctx, layer.fill.unwrap_or([0, 0, 0, 255]))?;
+                    .ensure_solid_color(self.ctx, layer.fill.unwrap_or(SOLID_BLACK_PX))?;
                 let texture = self.gpu.get(texture_id).expect("solid texture exists");
                 let (natural_width, natural_height) = (texture.width, texture.height);
                 let view = texture.view.clone();
@@ -769,6 +842,9 @@ impl Planner<'_> {
             id,
             texture,
             layer.and_then(|layer| layer.fill),
+            // 过渡取样 = 直接绘制口径:空白 1×1 是黑(手册),不是像素运算
+            // 看到的四零透明(见 `resolve_ref` 的 `blank` 说明)。
+            SOLID_BLACK_PX,
             self.bases,
         )?;
         Ok((tex.id, tex.width, tex.height))

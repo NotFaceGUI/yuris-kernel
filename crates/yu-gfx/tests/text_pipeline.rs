@@ -573,3 +573,101 @@ fn gaiji_chain_lowers_to_text_image_glyph() {
         "降级后不得再记录 MERGE2 图像加工"
     );
 }
+
+#[test]
+fn dir_shaped_file_creates_blank_layer_and_keeps_text() {
+    // DIV-GFX-084:脚本运行时会把 `FILE` 拼成**目录形键**(以分隔符结尾),
+    // 例如 ERIS 本篇正文层 `ES.GAMEMAIN.TIP.MESW.TX` 实际拿到
+    // `cgsys/../system/window/`。这种键不可能解码成图片,但官方把
+    // "`FILE` 装载失败"当作"该层没有图片":层对象与 `SX/SY` 表面照旧
+    // 存在,`CGACT[TEXT]` 依旧写进这块面。
+    //
+    // 旧实现把该键原样留成 `Asset`,后端 `layer_base` 解析失败 ⇒ 整层
+    // 文本被丢弃(实机表现为对话正文与按钮文字全灭,换字体无效)。
+    let mut gfx = state();
+    let t = table();
+    gfx.on_event(&frame_start(0));
+    gfx.on_event(&call(
+        0,
+        "CG",
+        vec![
+            arg(&t, "CG", "ID", s("MESW.TX")),
+            arg(
+                &t,
+                "CG",
+                "FILE",
+                yu_rt::value::Value::Str(b"cgsys/../system/window/".to_vec()),
+            ),
+            arg(&t, "CG", "SX", i(771)),
+            arg(&t, "CG", "SY", i(95)),
+        ],
+    ));
+
+    let id = yu_gfx::path::normalize(b"MESW.TX", None, false).path;
+    let layer = gfx.layer(&id).expect("目录形 FILE 仍必须建层");
+    assert!(
+        matches!(layer.texture, yu_gfx::TextureRef::SolidBlack1x1),
+        "目录形 FILE 应退化为「有 FILE、无图片」的空白层(与 CG[FILE=\"\"] 同族),实际 {:?}",
+        layer.texture
+    );
+    assert_eq!(
+        layer.image_size().map(|s| (s.width, s.height)),
+        Some((771, 95)),
+        "SX/SY 必须保留为表面尺寸,否则文本无处可写"
+    );
+    // **画布必须透明**:这一层是 `CGACT[TEXT]` 的写字面,不是黑幕。
+    // 与 `CG[FILE=""]`(不透明黑,当黑幕/遮挡板)靠 `fill` 区分;
+    // 若这里退化成不透明黑,正文下方会压出一块实色(DIV-GFX-084)。
+    assert_eq!(
+        layer.fill,
+        Some([0, 0, 0, 0]),
+        "目录形 FILE 的空白画布必须全透明,不能是不透明黑"
+    );
+
+    // 文本绘制项必须能登记到该层(后端据此合成)。
+    gfx.on_event(&call(
+        0,
+        "CGACT",
+        vec![
+            arg(&t, "CGACT", "ID", s("MESW.TX")),
+            arg(&t, "CGACT", "TEXT", i(1)),
+            arg(&t, "CGACT", "SET", i(0)),
+            arg(&t, "CGACT", "SETSTR", s("あ")),
+            arg(&t, "CGACT", "X", i(4)),
+            arg(&t, "CGACT", "Y", i(4)),
+        ],
+    ));
+    let frame = gfx.frame();
+    let draw = frame
+        .text_draws
+        .iter()
+        .find(|d| d.target == id)
+        .expect("CGACT[TEXT] 必须落到目录形 FILE 的层上");
+    // `SETSTR` 按原样字节保留(不断言具体编码字面量,避免把测试绑死在
+    // 某一种源码编码上)。
+    assert!(!draw.bytes.is_empty(), "SETSTR 字节必须保留");
+}
+
+#[test]
+fn normal_file_key_is_not_degraded() {
+    // 反向守卫:非目录形的键必须原样保留为 `Asset`,不能被上面的退化
+    // 逻辑吞掉(否则所有图片层都会变成空白)。
+    let mut gfx = state();
+    let t = table();
+    gfx.on_event(&frame_start(0));
+    gfx.on_event(&call(
+        0,
+        "CG",
+        vec![
+            arg(&t, "CG", "ID", s("BG")),
+            arg(&t, "CG", "FILE", s("cg/bg/black")),
+        ],
+    ));
+    let id = yu_gfx::path::normalize(b"BG", None, false).path;
+    let layer = gfx.layer(&id).expect("层存在");
+    assert!(
+        matches!(&layer.texture, yu_gfx::TextureRef::Asset(k) if k == b"cg/bg/black"),
+        "普通资产键不得退化,实际 {:?}",
+        layer.texture
+    );
+}

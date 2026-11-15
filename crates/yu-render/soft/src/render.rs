@@ -39,6 +39,7 @@ use crate::text::{
 use crate::texture::{Texture, TextureStore};
 use yu_render_core::{
     blit, ImageCacheKey, ImageOpSig, ImageSource, RenderReport, SizeSource, SkippedOp, Surface,
+    SOLID_BLACK_PX, SOLID_EMPTY,
 };
 
 /// `render_frame` 的输出。
@@ -1149,10 +1150,15 @@ fn compose_group(
     Ok(surface)
 }
 
-/// `CG[FILE=""]` 符号表面的当前实色(整层 `RECTPAINT*` 结果),按 `SX/SY`
-/// 铺开。没有 `fill` 时是官方 1×1 黑。
+/// `CG[FILE=""]` 符号表面作为**像素运算源**时的当前实色(`RECTPAINT*` 结果),
+/// 按 `SX/SY` 铺开。
+///
+/// 没有 `fill` 时用**四个字节全 0** — 官方 `FILE=""` 的空串分支把 1×1
+/// 新缓冲四字节全写 0(REA `0x40c5f8`),`CGACT SIZE/COPY/MERGE` 读的就是
+/// 这份像素。**直接绘制**同一张 1×1 则按手册呈现为黑(`SOLID_BLACK_PX`,
+/// 见 `draw_layer`),两者用途不同,不能共用一个默认值。
 fn solid_fill_texture(layer: Option<&Layer>) -> Texture {
-    let px = layer.and_then(|layer| layer.fill).unwrap_or([0, 0, 0, 255]);
+    let px = layer.and_then(|layer| layer.fill).unwrap_or(SOLID_EMPTY);
     match layer.and_then(|layer| layer.image_size()) {
         Some(size) if size.width > 0 && size.height > 0 => Texture {
             width: size.width,
@@ -1797,7 +1803,7 @@ fn draw_layer(
             let height = explicit_height.unwrap_or(1);
             let filter = pick_filter(frame, 1, 1, width, height);
             let (x, y) = (layer.transform.x, layer.transform.y);
-            let px = layer.fill.unwrap_or([0, 0, 0, 255]);
+            let px = layer.fill.unwrap_or(SOLID_BLACK_PX);
             {
                 let image = ImageRef {
                     width: 1,
@@ -1875,8 +1881,9 @@ fn draw_layer(
     }
 }
 
-/// 1×1 黑图(`FILE=""`;手册 `cg/cg.html`)。
-const SOLID_BLACK: &[u8] = &[0, 0, 0, 255];
+/// `CG[FILE=""]` 的 1×1 表面像素:**全 0**(含 alpha)。
+/// 证据 REA 0.495 `0x40c5f8` 分支四字节全写 0;DIV-GFX-060 结案。
+const SOLID_BLACK: &[u8] = &SOLID_BLACK_PX;
 
 struct RenderState<'a> {
     offscreens: BTreeMap<LayerId, Surface>,

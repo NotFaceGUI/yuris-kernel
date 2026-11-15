@@ -5,6 +5,8 @@
 
 pub use yu_render_core::text::*;
 
+use yu_render_core::SOLID_EMPTY;
+
 use crate::texture::Texture;
 
 /// 解析图层的基图(文本合成的输入)。
@@ -27,11 +29,13 @@ pub fn layer_base(
             .cloned()
             .map_err(|d| d.code.to_string()),
         // `CG[FILE=""]` 的 1×1 符号表面可能是整层 `RECTPAINT*` 后的实色
-        // (`Layer.fill`,EVID-J-02..04);没有填充时才是官方 1×1 黑。
+        // (`Layer.fill`,EVID-J-02..04);没有填充时用官方空串分支写入的
+        // **四字节全 0**(REA `0x40c5f8`)。文本合成的输入是层表面像素,
+        // 不是直接绘制口径的黑(见 `solid_fill_texture` 的说明)。
         // 引擎按 `SX/SY` 把它铺成显式尺寸,文字也写在这块表面上;若拿
         // 1×1 基面,`x=50/y=50` 等字符会全部落到图外(字体预览空白)。
         yu_gfx::TextureRef::SolidBlack1x1 => {
-            let px = layer.fill.unwrap_or([0, 0, 0, 255]);
+            let px = layer.fill.unwrap_or(SOLID_EMPTY);
             match layer.image_size() {
                 Some(size) if size.width > 0 && size.height > 0 => Ok(Texture {
                     width: size.width,

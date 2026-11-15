@@ -3069,6 +3069,277 @@ impl ApplicationHandler for App {
                 return;
             }
         }
+        // 文本取证(`YU_TEXT_TRACE=1`):逐帧记录文本状态/排版/绘制项/脚本落点。
+        // 只在显式环境变量下运行,默认零开销;用于定位「剧情文本为空」的
+        // VM→gfx 断点,不属于产品行为。
+        if std::env::var_os("YU_TEXT_TRACE").is_some() {
+            // 命令级计数(TEXT/WORD/_/RETURNCODE 等):判定「脚本到底有没有
+            // 走到文本产生路径」。`text-trace` 只能看 gfx 侧结果,分不清
+            // 「脚本没执行 WORD」与「执行了但 gfx 丢弃」。取差量后立即还给
+            // 诊断账本(下面 `diagnostics.observe` 需要同一份游标)。
+            let mut deltas = self.engine.take_command_hit_deltas();
+            let mut text_cmds: Vec<String> = Vec::new();
+            for (opcode, hits) in deltas.drain(..) {
+                let name = self.engine.command_name(opcode);
+                if matches!(
+                    name.as_str(),
+                    "TEXT" | "WORD" | "_" | "RETURNCODE" | "CGACT" | "CG" | "CGEND" | "FONT"
+                ) {
+                    text_cmds.push(format!("{name}={hits}"));
+                }
+            }
+            if !text_cmds.is_empty() {
+                host_line!("[text-cmds] host={} {}", self.frames, text_cmds.join(" "));
+            }
+            let (bytes_len, flags_len, font_name, font_size, origin) = {
+                let gfx = self.engine.gfx_state().expect("gfx state");
+                let (bytes, flags, style, origin) = gfx.text_state();
+                (
+                    bytes.len(),
+                    flags.map(|f| f.len()).unwrap_or(0),
+                    style
+                        .name
+                        .as_deref()
+                        .map(|b| String::from_utf8_lossy(b).into_owned()),
+                    (style.size_x, style.size_y),
+                    origin,
+                )
+            };
+            let (layout_chars, draws, runs, layer_count, layout_target) =
+                match self.engine.last_frame() {
+                    Some(f) => (
+                        f.text_layout.as_ref().map(|l| l.chars).unwrap_or(0),
+                        f.text_draws.len(),
+                        f.text.len(),
+                        f.layers.len(),
+                        f.text_layout
+                            .as_ref()
+                            .map(|l| match &l.target {
+                                Some(t) => t.display(),
+                                None => "<screen>".to_string(),
+                            }),
+                    ),
+                    None => (0, 0, 0, 0, None),
+                };
+            // 后端报告:栅格化成功/缺字数与失败原因 —— 判定「字体问题 vs
+            // 层不可见 vs 根本没正文 draw」的第一手依据。
+            let (rep_draws, rep_glyphs, rep_missing, rep_skipped, rep_diags, rep_failed) =
+                match self.engine.render_report() {
+                    Some(r) => (
+                        r.text_draws,
+                        r.text_glyphs,
+                        r.text_missing,
+                        r.skipped_text,
+                        r.text_diags.join("|"),
+                        r.failed_targets.len(),
+                    ),
+                    None => (0, 0, 0, 0, String::new(), 0),
+                };
+            // 每条 `CGACT[TEXT]` 绘制项的目标层状态:层是否存在/可见/z。
+            // 只在有 draw 时逐条展开(演出期 draws 可达数千,避免日志爆量),
+            // 超过 8 条时只列前 8 条 + 汇总。
+            let mut draw_detail = String::new();
+            if draws > 0 {
+                let gfx = self.engine.gfx_state().expect("gfx state");
+                if let Some(f) = self.engine.last_frame() {
+                    for (i, d) in f.text_draws.iter().enumerate() {
+                        if i >= 8 {
+                            draw_detail.push_str(&format!(" +{}more", draws - 8));
+                            break;
+                        }
+                        let head: String = String::from_utf8_lossy(
+                            &d.bytes[..d.bytes.len().min(24)],
+                        )
+                        .chars()
+                        .flat_map(|c| c.escape_default())
+                        .collect();
+                        match gfx.layer(&d.target) {
+                            Some(l) => {
+                                // 基图种类决定文本合成能否拿到基面:`Asset` 解析
+                                // 失败 = `text.layer_base: asset.missing`(整层
+                                // draw 被丢弃)。`TextureRef` 走 `Debug` 打印(本
+                                // crate 只在 dev 依赖里引 yu-gfx,产品路径不新增
+                                // 依赖),资产键原始字节一并暴露。
+                                let tex = format!("seq={} {:?}", l.seq, l.texture);
+                                let tex = if tex.len() > 160 {
+                                    format!("{}…", &tex[..160])
+                                } else {
+                                    tex
+                                };
+                                let size = l
+                                    .image_size()
+                                    .map(|s| format!("{}x{}", s.width, s.height))
+                                    .unwrap_or_else(|| "-".to_string());
+                                draw_detail.push_str(&format!(
+                                    " [{} tgt={} n={} vis={} z={} xy=({},{}) size={size} fill={:?} tex={tex}]",
+                                    i,
+                                    d.target.display(),
+                                    d.bytes.len(),
+                                    l.visible,
+                                    l.z,
+                                    d.x,
+                                    d.y,
+                                    l.fill
+                                ));
+                            }
+                            None => draw_detail.push_str(&format!(
+                                " [{} tgt={} n={} MISSING xy=({},{})]",
+                                i,
+                                d.target.display(),
+                                d.bytes.len(),
+                                d.x,
+                                d.y
+                            )),
+                        }
+                        if i == 0 {
+                            draw_detail.push_str(&format!(" b0=\"{head}\""));
+                        }
+                    }
+                }
+            }
+            let pos = self.engine.current_position();
+            if bytes_len > 0 || layout_chars > 0 || draws > 0 || self.frames % 120 == 0 {
+                // 目标层基图来源链:文本合成只认 `layer.texture`,但一个
+                // `Asset` 键可能由 `CG[FILE]`/`CGACT[COPY2]`/`LOAD` 三条
+                // 路径之一写入。判「该层本该是空白表面还是图片」必须知道
+                // 谁写的、哪个 pc 写的,不能只看最终 texture。
+                let mut origin_detail = String::new();
+                if draws > 0 {
+                    let gfx = self.engine.gfx_state().expect("gfx state");
+                    if let Some(f) = self.engine.last_frame() {
+                        let mut seen: Vec<String> = Vec::new();
+                        for d in f.text_draws.iter() {
+                            let id = d.target.display();
+                            if seen.iter().any(|s| *s == id) || seen.len() >= 3 {
+                                continue;
+                            }
+                            seen.push(id.clone());
+                            let copies = gfx
+                                .copies()
+                                .iter()
+                                .filter(|c| c.dest == d.target)
+                                .count();
+                            origin_detail.push_str(&format!(
+                                " [origin {} copy_log_dest={copies}]",
+                                id
+                            ));
+                        }
+                    }
+                }
+                host_line!(
+                    "[text-trace] host={} engine={} bytes={} flags={} layout={} layout_tgt={:?} draws={} runs={} layers={} rep(draws={} glyphs={} missing={} skipped_text={} failed_tgt={}) diags={:?} font={:?} size={}x{} origin={:?} pos={:?}{}",
+                    self.frames,
+                    self.engine.frame(),
+                    bytes_len,
+                    flags_len,
+                    layout_chars,
+                    layout_target,
+                    draws,
+                    runs,
+                    layer_count,
+                    rep_draws,
+                    rep_glyphs,
+                    rep_missing,
+                    rep_skipped,
+                    rep_failed,
+                    rep_diags,
+                    font_name,
+                    font_size.0,
+                    font_size.1,
+                    origin,
+                    pos,
+                    draw_detail
+                );
+            }
+        }
+        // 屏幕层序取证(`YU_FRAME_LAYERS=1`):逐帧打印**屏幕 pass 实际发射的
+        // 层序**与后端跳过的层。转场"突然一帧黑"这类现象只有把「本帧画了
+        // 哪些层、哪些被跳过」并排看才能定位;只看 `drawn=11` 总量分不出
+        // 是少了某层还是某层像素变黑。默认零开销。
+        if std::env::var_os("YU_FRAME_LAYERS").is_some() {
+            if let Some(f) = self.engine.last_frame() {
+                // 只遍历屏幕 pass 的 op;scren 层序即最终合成序。
+                let mut order: Vec<String> = Vec::new();
+                for pass in &f.passes {
+                    if !format!("{:?}", pass.target).contains("Screen") {
+                        continue;
+                    }
+                    for op in &pass.ops {
+                        // 紧凑格式:id / z / alpha / visible / 纹理种类。
+                        // 转场"白↔黑"闪烁的判据是 alpha 或纹理种类逐帧变,
+                        // 不是 op 数量变,所以这三项必须一起打印。
+                        let mut s = format!("{op:?}");
+                        // 从 Debug 文本里抠出关键字段(避免依赖 gfx 内部字段名)。
+                        let id = s
+                            .find("id: LayerId([")
+                            .and_then(|i| {
+                                let rest = &s[i + 13..];
+                                let bytes: Vec<u8> = rest
+                                    .split(']')
+                                    .next()?
+                                    .split(',')
+                                    .filter_map(|t| t.trim().parse::<u8>().ok())
+                                    .collect();
+                                Some(String::from_utf8_lossy(&bytes).into_owned())
+                            })
+                            .unwrap_or_else(|| "?".into());
+                        let z = s
+                            .find("z: ")
+                            .map(|i| {
+                                s[i + 3..]
+                                    .split(',')
+                                    .next()
+                                    .unwrap_or("?")
+                                    .trim()
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| "?".into());
+                        let a = s
+                            .find("alpha: ")
+                            .map(|i| {
+                                s[i + 7..]
+                                    .split(',')
+                                    .next()
+                                    .unwrap_or("?")
+                                    .trim()
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| "?".into());
+                        let tex = if s.contains("snapshot") {
+                            "snap"
+                        } else if s.contains("solid_black_1x1") {
+                            "solid"
+                        } else if s.contains("asset") {
+                            "asset"
+                        } else if s.contains("offscreen") {
+                            "offs"
+                        } else {
+                            "?"
+                        };
+                        order.push(format!("{id}(z={z},a={a},{tex})"));
+                    }
+                }
+                let missing: Vec<String> = self
+                    .engine
+                    .render_report()
+                    .map(|r| {
+                        r.skipped
+                            .iter()
+                            .filter(|s| s.reason.contains("asset.missing"))
+                            .map(|s| s.target.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                host_line!(
+                    "[frame-layers] host={} eng={} screen_ops={} missing={:?} order=[{}]",
+                    self.frames,
+                    self.engine.frame(),
+                    order.len(),
+                    missing,
+                    order.join(" | ")
+                );
+            }
+        }
         // 诊断账本:取走引擎/声音诊断、聚合 skipped、更新卡住判定。
         if let Some(surface) = self.last_surface.as_ref() {
             let host_frame = self.frames;
