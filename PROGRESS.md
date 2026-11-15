@@ -14570,3 +14570,54 @@ cargo test --release -p yu-backend-wgpu
 
 插桩:`YU_OP_TRACE`(逐 op 绘制)、`YU_PASS_TRACE`(逐 pass 目标/纹理/命令序)
 均为 env-gated,默认路径零额外开销。
+
+## 成果 REVIEW-0474 (2026-11-15) · 审查收口:CSV/GO/命令表旧代语义 + 4xx README
+
+> 审查范围:未推送提交 `04f7efb` / `64ba5aa` / `8bdb98b` + 工作区未提交改动。
+> 结论:发现并修复 4 处语义/健壮性问题;其余为注释与警告清理。
+
+### 1. CSV/CSVINFO 两代处理器(修复)
+
+- 0.495 表 `CSV`=7,分发表指向空桩 `0x43e640`(只求值参数后 `ret 0`);
+  v474 表 `CSV`=8,指向真实解析器 `0x43577c`。
+- 旧实现按名字一律走解析器 ⇒ 0.495 游戏会被写入本不存在的 LET 数据。
+- 现按**工程 ysc 的序号**选择(7 → 空桩,其余 → 解析器),不写版本号。
+- 同时按 REA 复核解析器:只有 `,` 受引号保护;**CR/LF 在引号内也断行**;
+  单引号状态跨行不复位(官方 `[esp+0x148]` 行终止不清零);双引号复位。
+  见 `docs/divergences/DIV-RT-057-csv-table-generation.md`。
+- 0.495 的 `CSVINFO` 多 `DATA` 槽,语义未取证,只写 LET 计数、不消费 DATA。
+
+### 2. `GO` 空标签求值两次(修复)
+
+- 旧补丁先 `eval_window` 判空、再 `label_from_window` 求值一次 ⇒ 动态标签
+  每帧求值两次(表达式可能含 `_RND` 等有状态函数),且绕过常量标签缓存。
+- 重构 `label_from_window_opt(empty_ok)`:一次求值,常量仍走 `label_cache`;
+  `GO` 空标签 = Continue,其余命令空标签仍 `rt.label` Fatal。
+
+### 3. 命令表空名校验(收紧)
+
+- 删掉整张表的“空命令名”拒绝会放过损坏表。改为**只允许 opcode 0** 的
+  空名占位槽(v474 `ysc.ybn` 实测),其它位置空名仍 fail-fast。
+
+### 4. `YU_TEXT_TRACE` / `YU_FRAME_LAYERS`(清理)
+
+- 去掉 `let mut s` 未使用 mut 警告;命令计数差量被 trace 取走后诊断账本
+  当帧无计数,注释按实际行为改写(原注释声称“立刻还回”不实)。
+
+### 5. README 4xx
+
+- 更新为:0.450 / 0.460 / 0.470 / 0.480 / 0.490 抽样实机通过,
+  0.481 / 0.486 / 0.494 / 0.495 实机验收;状态“可用(主线)”。
+
+### 验证
+
+```text
+cargo test --release -p yu-rt                    → 101 + 4 全绿(consistency 需语料环境变量)
+cargo test --release -p yu-vfs -p yu-format      → 全部全绿(151 项)
+cargo test --release -p yu-gfx --test parity_fixes --test text_pipeline → 33 + 17 全绿
+cargo test --release -p yu-backend-soft --test render --test transition_alpha → 26 + 2 全绿
+cargo test --release -p yu-backend-wgpu          → 39 + 27 + 16 全绿
+v474 样本 headless --frames 5                    → boot 通过
+v474 桌面 --step-to 798 逐帧亮度                  → 近黑仅 [1..20](启动黑屏),794 帧 = 255
+构建警告                                          → 受影响 5 个 crate 零 warning
+```
