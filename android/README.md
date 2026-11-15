@@ -141,6 +141,20 @@ Windows 下 NDK 的 sh 版 `*-clang` 无法被 Rust exec,`build.sh` 会自动改
 - **游戏内切换**:右下角半透明小圆钮只在**本次会话**内临时切换,不落盘,
   也不覆盖配置界面的选择 —— 下次启动仍按壳的设置来。
 
+## 对话框(DIALOG)
+
+脚本的 `DIALOG`(改名输入、确认、通知等)由**壳**呈现:内核只把待答请求
+以 JSON 透出,壳回答。参考壳用平台 `AlertDialog`:
+
+- 确认/通知:OK / OK-Cancel / Yes-No / Yes-No-Cancel;返回键只对带
+  Cancel 的组合生效;
+- 输入(改名):单行输入框,DEFSTR 预填,INPUTLIMIT 限制,IME 完成键 = OK;
+- 对话框存续期间壳不向游戏投输入。
+
+其他 Android 壳可以整体替换 `DialogPresenter`,只要消费
+`nativePendingDialogs()` / `nativeAnswerDialog()` 的同一份 JSON(字段见
+`NATIVE_API.md` 与 `docs/cross-platform.md`)。
+
 ## 选择游戏目录
 
 配置界面用系统**目录选择器**(`ACTION_OPEN_DOCUMENT_TREE`)选游戏文件夹,

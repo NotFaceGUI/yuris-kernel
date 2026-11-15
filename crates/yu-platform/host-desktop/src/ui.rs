@@ -13,6 +13,7 @@
 //!    光标与按住集合。
 
 use egui::{Color32, RichText};
+use yu_engine::host_ui::{DialogButtons, DialogIcon, HostDialog, HostDialogAnswer};
 
 use crate::diagnostics::Diagnostics;
 use crate::stepper::{StepperActions, StepperUi, TickKind};
@@ -817,46 +818,23 @@ pub fn attention_banner(ctx: &egui::Context, hint: &str) {
 
 // ------------------------------------------------------------- DIALOG 模态(H-P1-04)
 
-/// 一条待回答 DIALOG 的**呈现视图**(CP932 已解码;内核语义仍是原始字节)。
-#[derive(Clone, Debug, PartialEq)]
-pub struct DialogView {
-    pub id: u64,
-    pub caption: String,
-    pub text: String,
-    /// [`yu_rt::dialog::DialogButtons::as_str`](ok/ok_cancel/yes_no/yes_no_cancel)。
-    pub buttons: &'static str,
-    /// 1 基默认按钮(0 = 未指定)。
-    pub default_button: u8,
-    /// 图标名(none/information/question/warning/error)。
-    pub icon: &'static str,
-    /// `INPUT=1`(按钮固定 OK,文本框)。
-    pub input: bool,
-    /// `INPUTLIMIT`(0 = 不限)。
-    pub input_limit: u32,
-    /// `DEFSTR`(输入框初始文本)。
-    pub default_input: String,
-}
-
-/// 用户在本帧给出的回答。
-#[derive(Clone, Debug, PartialEq)]
-pub struct DialogAnswer {
-    pub id: u64,
-    /// 1 基按钮序号(官方 MessageBox 语义,写回 `LET`)。
-    pub button: u8,
-    /// INPUT 模式的编辑文本(宿主负责 CP932 编码后交给内核)。
-    pub input_text: Option<String>,
-}
-
 /// DIALOG 模态框(对齐官方 `MessageBoxA` 的呈现面:标题/正文/图标/
 /// 按钮组/默认按钮;Esc = 含 Cancel 组合的取消)。
 ///
-/// 官方模态期间引擎计时器暂停、不收玩家输入 —— 宿主侧的“不收输入”
-/// 由 [`crate::App`] 在挂起任务层保证;这里只负责呈现与回答。
+/// 呈现视图与回答类型来自 `yu_engine::host_ui`(统一宿主 UI 契约):
+/// 桌面只负责用 egui 画,不再自己定义一套视图。官方模态期间引擎计时器
+/// 暂停、不收玩家输入 —— 内核改为任务挂起,宿主侧的「不收游戏输入」
+/// 由 [`crate::App`] 保证;这里只负责呈现与回答。
+///
+/// INPUT 的编辑缓冲在对话框存续期间跨帧保留;回答成功/对话框消失后由
+/// [`crate::App`] 清理。本函数**不**在点击时删除缓冲 —— 否则 CP932
+/// 编码失败(引擎拒绝回答、对话框仍在)时用户编辑的文本会被 DEFSTR
+/// 顶掉。
 pub fn dialog_modal(
     ctx: &egui::Context,
-    dialogs: &[DialogView],
+    dialogs: &[HostDialog],
     inputs: &mut std::collections::BTreeMap<u64, String>,
-) -> Vec<DialogAnswer> {
+) -> Vec<HostDialogAnswer> {
     let mut answers = Vec::new();
     let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
     for dialog in dialogs {
@@ -878,7 +856,7 @@ pub fn dialog_modal(
             .resizable(false)
             .default_width(420.0)
             .show(ctx, |ui| {
-                if dialog.icon != "none" {
+                if dialog.icon != DialogIcon::None {
                     ui.label(icon_text(dialog.icon));
                 }
                 ui.add(egui::Label::new(RichText::new(&dialog.text).weak()).wrap());
@@ -899,7 +877,7 @@ pub fn dialog_modal(
                                 clicked = Some(1);
                             }
                         } else {
-                            let count = button_count(dialog.buttons);
+                            let count = dialog.buttons.count();
                             for index in 1..=count {
                                 let response = ui.button(button_label(dialog.buttons, index));
                                 // 官方 MessageBox 的 DEFBUTTON:回车触发默认键。
@@ -918,16 +896,15 @@ pub fn dialog_modal(
         if clicked.is_none() && esc {
             // Esc = Cancel(仅组合里真的有 Cancel;MB_YESNO/MB_OK 官方不响应)。
             clicked = match dialog.buttons {
-                "ok_cancel" => Some(2),
-                "yes_no_cancel" => Some(3),
+                DialogButtons::OkCancel => Some(2),
+                DialogButtons::YesNoCancel => Some(3),
                 _ => None,
             };
         }
         if let Some(button) = clicked {
-            if dialog.input {
-                inputs.remove(&dialog.id);
-            }
-            answers.push(DialogAnswer {
+            // 缓冲不在这里删：回答可能被引擎拒绝（CP932 编码失败），
+            // 对话框仍在，下一帧要保留用户已编辑的文本。
+            answers.push(HostDialogAnswer {
                 id: dialog.id,
                 button,
                 input_text: text,
@@ -937,7 +914,7 @@ pub fn dialog_modal(
     answers
 }
 
-fn dialog_window_title(dialog: &DialogView) -> String {
+fn dialog_window_title(dialog: &HostDialog) -> String {
     if dialog.caption.is_empty() {
         "DIALOG".to_string()
     } else {
@@ -945,35 +922,26 @@ fn dialog_window_title(dialog: &DialogView) -> String {
     }
 }
 
-fn button_count(buttons: &str) -> u8 {
-    match buttons {
-        "ok" => 1,
-        "ok_cancel" | "yes_no" => 2,
-        "yes_no_cancel" => 3,
-        _ => 1,
-    }
-}
-
 /// 按钮的日文标签(官方 MessageBox 在日文 Windows 上的 OS 文案)。
-fn button_label(buttons: &str, index: u8) -> &'static str {
+fn button_label(buttons: DialogButtons, index: u8) -> &'static str {
     match (buttons, index) {
-        ("ok", 1) | ("ok_cancel", 1) => "OK",
-        ("ok_cancel", 2) => "キャンセル",
-        ("yes_no", 1) | ("yes_no_cancel", 1) => "はい",
-        ("yes_no", 2) | ("yes_no_cancel", 2) => "いいえ",
-        ("yes_no_cancel", 3) => "キャンセル",
+        (DialogButtons::Ok, 1) | (DialogButtons::OkCancel, 1) => "OK",
+        (DialogButtons::OkCancel, 2) => "キャンセル",
+        (DialogButtons::YesNo, 1) | (DialogButtons::YesNoCancel, 1) => "はい",
+        (DialogButtons::YesNo, 2) | (DialogButtons::YesNoCancel, 2) => "いいえ",
+        (DialogButtons::YesNoCancel, 3) => "キャンセル",
         _ => "?",
     }
 }
 
 /// 图标占位(调试字体不保证 emoji 字形;用可渲染的 ASCII 记号)。
-fn icon_text(icon: &str) -> RichText {
+fn icon_text(icon: DialogIcon) -> RichText {
     let mark = match icon {
-        "information" => "(i)",
-        "question" => "(?)",
-        "warning" => "(!)",
-        "error" => "(X)",
-        _ => "",
+        DialogIcon::Information => "(i)",
+        DialogIcon::Question => "(?)",
+        DialogIcon::Warning => "(!)",
+        DialogIcon::Error => "(X)",
+        DialogIcon::None => "",
     };
     RichText::new(mark).strong()
 }
@@ -1226,14 +1194,15 @@ mod tests {
 
     // -------------------------------------------------- DIALOG 模态(H-P1-04)
 
-    fn yes_no_view() -> DialogView {
-        DialogView {
+    fn yes_no_view() -> HostDialog {
+        HostDialog {
             id: 7,
+            task: "es_Scenario".to_string(),
             caption: "確認".to_string(),
             text: "ゲームを終了します。よろしいですか？".to_string(),
-            buttons: "yes_no",
+            buttons: DialogButtons::YesNo,
             default_button: 0,
-            icon: "question",
+            icon: DialogIcon::Question,
             input: false,
             input_limit: 0,
             default_input: String::new(),
@@ -1342,7 +1311,7 @@ mod tests {
         out.textures_delta.clear();
         assert_eq!(
             answers,
-            vec![DialogAnswer {
+            vec![HostDialogAnswer {
                 id: 7,
                 button: 2,
                 input_text: None
@@ -1354,8 +1323,8 @@ mod tests {
     #[test]
     fn dialog_modal_escape_answers_only_cancelable_groups() {
         // Esc:ok_cancel → cancel(2);yes_no → 无响应(官方 MB_YESNO 不响应 Esc)。
-        let ok_cancel = DialogView {
-            buttons: "ok_cancel",
+        let ok_cancel = HostDialog {
+            buttons: DialogButtons::OkCancel,
             ..yes_no_view()
         };
         let ctx = egui::Context::default();
@@ -1378,7 +1347,7 @@ mod tests {
         out.textures_delta.clear();
         assert_eq!(
             answers,
-            vec![DialogAnswer {
+            vec![HostDialogAnswer {
                 id: 7,
                 button: 2,
                 input_text: None
@@ -1396,7 +1365,7 @@ mod tests {
 
     #[test]
     fn dialog_modal_input_mode_buffers_text() {
-        let view = DialogView {
+        let view = HostDialog {
             input: true,
             input_limit: 5,
             default_input: "はじめ".to_string(),

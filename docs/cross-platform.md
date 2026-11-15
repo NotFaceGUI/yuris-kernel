@@ -175,6 +175,62 @@ JSON 键
   第一帧把整段墙钟灌进 `@_OS_TIME`,淡出/补间全部瞬移(实测守护:
   `cargo test -p yu-cli --test lifecycle -- --ignored`)。
 
+## 宿主 UI 契约:DIALOG(2026-11-15 落地)
+
+对话框不是平台语义,而是**内核持有事实 + 壳负责呈现**。统一入口在
+`yu_engine::host_ui`:
+
+```text
+Engine::host_dialogs() -> Vec<HostDialog>        // 呈现视图(CP932 已解码)
+Engine::answer_host_dialog(&HostDialogAnswer)    // 回答(CP932 编码在引擎侧)
+host_ui::dialogs_json(&[HostDialog]) -> String   // 非 Rust 壳的稳定 JSON
+```
+
+`HostDialog` 字段:`id / task / caption / text / buttons / default_button /
+icon / input / input_limit / default_input`。内核权威状态仍是
+`yu_rt::dialog::DialogRequest`(CP932 原始字节);呈现视图只做显示解码,
+不改变脚本语义。
+
+### JSON 契约(非 Rust 壳)
+
+```json
+{"protocol":1,"dialogs":[{
+  "id":7,"task":"es_Scenario","caption":"名前",
+  "text":"名前を入力してください",
+  "buttons":["ok"],"default_button":1,"icon":"none",
+  "input":true,"input_limit":0,
+  "default_input":"彼女のクラブはあのクラブ"
+}]}
+```
+
+- `buttons` 按 **1 基**顺序给语义角色(`ok/cancel/yes/no`);壳自己决定
+  文案与控件类型。回答回传的是序号(1..N),不是角色名。
+- `input=true` 时回答必须带文本;文本是 Unicode,由
+  `answer_host_dialog` / `nativeAnswerDialog` 统一编码回 CP932。编码失败
+  必须保持对话框打开,让用户修改。
+- `default_button` 0 = 未指定;`input_limit` 0 = 不限。
+- `icon`:`none / information / question / warning / error`。
+
+### 宿主规则
+
+1. **轮询**:内核在逻辑帧里挂起发 `DIALOG` 的任务;壳在成功 tick 后取
+   快照。Android 等价物:`nativePendingDialogs()`(空串 = 没有)。
+2. **回答**:Android `nativeAnswerDialog(id, button, text)` 可在任意线程
+   调用,内核在下一帧 tick 前应用;返回 `OK` / `ERR: ...`,ERR 时壳
+   必须保持对话框打开。
+3. **模态**:对话框存续期间壳不得把游戏输入投给引擎(桌面
+   `release_all` 同口径;Android 系统对话框天然挡住触摸,但 tick 前
+   排队的残留事件要清)。
+4. **呈现自由**:桌面用 egui,Android 参考壳用平台 `AlertDialog`;不同
+   Android 壳可以换成 Compose / 游戏画布内绘制,只要遵守上面的数据
+   契约。
+5. **一次一个**:官方 `MessageBoxA` 是模态的;多个待答请求按快照顺序
+   排队,壳逐个呈现。
+
+当前实现:桌面 `host-desktop/src/ui.rs::dialog_modal`;Android
+`host-android` 的快照/回答队列 + `android/.../DialogPresenter.java`。
+serve/wasm 尚未接(契约已留好,后续按同一 JSON 接线)。
+
 ## 已收口的硬编码(见 DIV-AND-002)
 
 | 原实现 | 现实现 |

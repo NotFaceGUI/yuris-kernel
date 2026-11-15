@@ -1485,8 +1485,8 @@ impl App {
                         host_line!(
                             "yu-desktop: DIALOG#{} 呈现 buttons={} icon={} caption={:?} text={:?}",
                             view.id,
-                            view.buttons,
-                            view.icon,
+                            view.buttons.as_str(),
+                            view.icon.as_str(),
                             view.caption,
                             view.text
                         );
@@ -1527,6 +1527,12 @@ impl App {
                 } else if let Some(hint) = &attention {
                     ui::attention_banner(ctx, hint);
                 }
+                // 对话框消失（回答成功 / 会话重建）后丢弃对应编辑缓冲，
+                // 避免长会话里按 id 无限累积。
+                let pending_ids: std::collections::BTreeSet<u64> =
+                    dialog_views.iter().map(|dialog| dialog.id).collect();
+                self.dialog_inputs
+                    .retain(|id, _| pending_ids.contains(id));
                 if has_dialogs {
                     for answer in ui::dialog_modal(ctx, &dialog_views, &mut self.dialog_inputs) {
                         self.apply_dialog_answer(answer);
@@ -1870,50 +1876,28 @@ impl App {
         !self.engine.pending_dialogs().is_empty()
     }
 
-    /// 把内核的 CP932 对话框请求转成 egui 呈现视图(H-P1-04)。
-    fn dialog_views(&self) -> Vec<ui::DialogView> {
-        self.engine
-            .pending_dialogs()
-            .iter()
-            .map(|request| ui::DialogView {
-                id: request.id,
-                caption: request.caption_display(),
-                text: request.text_display(),
-                buttons: request.buttons.as_str(),
-                default_button: request.default_button,
-                icon: request.icon.as_str(),
-                input: request.input,
-                input_limit: request.input_limit,
-                default_input: request.default_input_display(),
-            })
-            .collect()
+    /// 把内核的 CP932 对话框请求转成统一宿主 UI 视图(H-P1-04)。
+    fn dialog_views(&self) -> Vec<yu_engine::host_ui::HostDialog> {
+        self.engine.host_dialogs()
     }
 
-    /// 把用户的回答交回内核(`LET/LETSTR` 写回由内核完成)。
-    fn apply_dialog_answer(&mut self, answer: ui::DialogAnswer) {
-        let text = match answer.input_text {
-            Some(input) => match yu_rt::dialog::DialogRequest::encode_input(&input) {
-                Ok(bytes) => Some(bytes),
-                Err(diag) => {
-                    host_error!(
-                        "yu-desktop: DIALOG#{} 入力テキストを CP932 にエンコード失敗: {diag}",
-                        answer.id
-                    );
-                    return;
-                }
-            },
-            None => None,
-        };
-        match self
-            .engine
-            .answer_dialog(answer.id, answer.button, text.as_deref())
-        {
-            Ok(()) => host_line!(
-                "yu-desktop: DIALOG#{} answered button={} (task resumes next frame)",
-                answer.id,
-                answer.button
+    /// 把用户的回答交回内核(CP932 编码与 `LET/LETSTR` 写回由引擎完成)。
+    fn apply_dialog_answer(&mut self, answer: yu_engine::host_ui::HostDialogAnswer) {
+        match self.engine.answer_host_dialog(&answer) {
+            Ok(()) => {
+                // 只有回答成功才丢弃编辑缓冲；编码失败/越界时对话框仍在，
+                // 下一帧必须保留用户已编辑的文本。
+                self.dialog_inputs.remove(&answer.id);
+                host_line!(
+                    "yu-desktop: DIALOG#{} answered button={} (task resumes next frame)",
+                    answer.id,
+                    answer.button
+                );
+            }
+            Err(diag) => host_error!(
+                "yu-desktop: DIALOG#{} 回答被拒(含入力文本 CP932 编码失败): {diag}",
+                answer.id
             ),
-            Err(diag) => host_error!("yu-desktop: DIALOG#{} 回答被拒: {diag}", answer.id),
         }
     }
 

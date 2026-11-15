@@ -230,10 +230,19 @@ public final class MainActivity extends Activity
      */
     private final Paint presentPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
 
+    /**
+     * 内核 DIALOG 的呈现器（系统对话框参考实现）。
+     *
+     * <p>只消费 {@link NativeHost#nativePendingDialogs()} 的 JSON，不碰
+     * 引擎内部；其他壳（Compose / 画布内绘制）可以整体替换本类。
+     */
+    private DialogPresenter dialogPresenter;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        dialogPresenter = new DialogPresenter(this);
         // 输入方式必须在建 View 之前定下来:onSurfaceTextureAvailable 会用
         // 它决定是否把虚拟光标放到画面中心。
         resolveInitialInputMode();
@@ -546,6 +555,7 @@ public final class MainActivity extends Activity
         // 2. nativeShutdown() 在 UI 线程上**不会**摸会话 —— 会话在渲染线程
         //    的 thread_local 里。内核据此只登记一个销毁请求,由渲染线程自己
         //    在下一帧 tick 前释放引擎(旧实现在这里静默返回 -1,会话根本没释放)。
+        dialogPresenter.dismissAll();
         stopRenderLoop();
         NativeHost.nativeShutdown();
         super.onDestroy();
@@ -764,6 +774,10 @@ public final class MainActivity extends Activity
         Bitmap bitmap = null;
         /** 内核已在本线程释放会话(TICK_HOST_SHUTDOWN)⇒ 收尾不再重复 shutdown。 */
         boolean releasedByHost = false;
+        /** 上次发布的 DIALOG JSON(只在本线程读写;变化时才转 UI 线程)。 */
+        String lastDialogJson = "";
+        /** 是否有待答 DIALOG:模态期抑制游戏输入(桌面 release_all 同口径)。 */
+        boolean dialogPending = false;
         // 帧节拍:按配置界面的帧率上限换算成纳秒,截止时间从第一帧起累加
         // (不漂移)。缺省 60;越界值按 15~240 钳制。
         final int targetFps = Math.max(15, Math.min(240,
@@ -810,6 +824,7 @@ public final class MainActivity extends Activity
                 // 内核已在渲染线程上释放会话(壳的 onDestroy 请求)。
                 // 只退线程:此时 Activity 正在销毁,不能 finish()。
                 Log.i(TAG, "session released by host shutdown request");
+                dialogPresenter.dismissAll();
                 gameFinished = false;
                 tickFailed = false;
                 releasedByHost = true;
@@ -820,14 +835,37 @@ public final class MainActivity extends Activity
                 // 不把用户的进程留着空转。这是所有宿主共用的退出判据
                 // (内核 `Lifecycle::host_code`),不在这里另判 main_finished。
                 Log.i(TAG, "game finished: " + NativeHost.nativeStatus());
+                dialogPresenter.dismissAll();
                 gameFinished = true;
                 break;
             }
             if (tickResult != 0) {
                 statusLine = NativeHost.nativeStatus();
                 Log.e(TAG, "tick failed: " + statusLine);
+                dialogPresenter.dismissAll();
                 tickFailed = true;
                 break;
+            }
+
+            // 内核 DIALOG:脚本已挂起在内核侧,壳负责呈现/回答。快照是
+            // 跨线程只读副本(每次成功 tick 后刷新);这里只在 JSON 变化时
+            // 转 UI 线程,稳态每帧只有一次字符串比较。
+            String dialogJson = NativeHost.nativePendingDialogs();
+            if (!dialogJson.equals(lastDialogJson)) {
+                lastDialogJson = dialogJson;
+                boolean pending = !dialogJson.isEmpty();
+                if (pending && !dialogPending) {
+                    // 模态出现前已排队的触摸不能再落到游戏里(桌面
+                    // `release_all` 同口径);系统对话框会挡住后续触摸。
+                    pendingInputs.clear();
+                    pendingCount.set(0);
+                    pointerDirty = false;
+                    // 只记状态，不记 JSON：其中含 DEFSTR（存档名/玩家输入）
+                    // 与正文，release 构建下 logcat 也会留下这些内容。
+                    Log.i(TAG, "DIALOG pending");
+                }
+                dialogPending = pending;
+                dialogPresenter.publish(dialogJson);
             }
 
             int[] size = NativeHost.nativeFrameSize();
@@ -866,67 +904,78 @@ public final class MainActivity extends Activity
                         frameW, frameH);
             }
             if (zeroCopyPresent || (bitmap != null && pixels.length > 0)) {
-                // 输入:把触摸点从 Surface 坐标映射回游戏视口坐标(经过缩放与
-                // 黑边偏移),再按队列顺序投递按下/抬起。
-                //
-                // 顺序很关键:光标位置先更新,再投按钮事件 —— 否则内核记录的是
-                // 上一个位置的按下。
-                int pLeft = presentLeft;
-                int pTop = presentTop;
-                int pWidth = Math.max(1, presentWidth);
-                int pHeight = Math.max(1, presentHeight);
-                boolean moved = pointerDirty;
-                if (moved) {
+                if (dialogPending) {
+                    // 模态期:游戏不接受输入(桌面对 DIALOG 也是这么做的)。
+                    // 系统对话框窗口已经挡住触摸,这里再清掉 tick 前可能
+                    // 排队的残留事件,避免回答后它们突然落到游戏里。
+                    pendingInputs.clear();
+                    pendingCount.set(0);
                     pointerDirty = false;
-                }
-                boolean anyInput = moved || !pendingInputs.isEmpty();
-                if (anyInput) {
-                    int relX = pointerX - pLeft;
-                    int relY = pointerY - pTop;
-                    int vx = clamp(relX * frameW / pWidth, 0, frameW - 1);
-                    int vy = clamp(relY * frameH / pHeight, 0, frameH - 1);
-                    NativeHost.nativeSetCursor(vx, vy);
-                }
-                int[] input;
-                while ((input = pendingInputs.poll()) != null) {
-                    pendingCount.decrementAndGet();
-                    switch (input[0]) {
-                        case EV_DOWN:
-                            NativeHost.nativeSetInput("MOUSE_L", true);
-                            break;
-                        case EV_UP:
-                            NativeHost.nativeSetInput("MOUSE_L", false);
-                            break;
-                        case EV_WHEEL_U:
-                            // 按下+抬起=一帧脉冲(引擎会把抬起延到下一帧,
-                            // 保证脚本至少看到一次按下)。
-                            NativeHost.nativeSetInput("MOUSE_U", true);
-                            NativeHost.nativeSetInput("MOUSE_U", false);
-                            break;
-                        case EV_WHEEL_D:
-                            NativeHost.nativeSetInput("MOUSE_D", true);
-                            NativeHost.nativeSetInput("MOUSE_D", false);
-                            break;
-                        default:
-                            // 未知事件:忽略(光标移动不排队,见触摸处理)。
-                            break;
-                    }
-                }
-
-                // 触摸态抬手后把脚本光标移出视口(等价"鼠标离开窗口"),
-                // 避免换屏后同位置按钮一直 hover。
-                //
-                // **必须推迟一帧**:本帧的 DOWN/UP 是 tick 之后才投给内核的,
-                // 内核要到下一帧 tick 才消费这次点击。当场移光标会让引擎看到
-                // 「在视口外(-1,-1)按下」⇒ 按钮完全不响应(触摸点了没反应,
-                // 而虚拟鼠标模式没有这段清理所以正常)。
-                if (cursorClearPending && !mouseMode) {
-                    cursorClearPending = false;
-                    NativeHost.nativeSetCursor(-1, -1);
-                }
-                if (clearCursorAfterRelease && !mouseMode) {
                     clearCursorAfterRelease = false;
-                    cursorClearPending = true; // 下一帧再清,让点击先被消费
+                    cursorClearPending = false;
+                } else {
+                    // 输入:把触摸点从 Surface 坐标映射回游戏视口坐标(经过缩放与
+                    // 黑边偏移),再按队列顺序投递按下/抬起。
+                    //
+                    // 顺序很关键:光标位置先更新,再投按钮事件 —— 否则内核记录的是
+                    // 上一个位置的按下。
+                    int pLeft = presentLeft;
+                    int pTop = presentTop;
+                    int pWidth = Math.max(1, presentWidth);
+                    int pHeight = Math.max(1, presentHeight);
+                    boolean moved = pointerDirty;
+                    if (moved) {
+                        pointerDirty = false;
+                    }
+                    boolean anyInput = moved || !pendingInputs.isEmpty();
+                    if (anyInput) {
+                        int relX = pointerX - pLeft;
+                        int relY = pointerY - pTop;
+                        int vx = clamp(relX * frameW / pWidth, 0, frameW - 1);
+                        int vy = clamp(relY * frameH / pHeight, 0, frameH - 1);
+                        NativeHost.nativeSetCursor(vx, vy);
+                    }
+                    int[] input;
+                    while ((input = pendingInputs.poll()) != null) {
+                        pendingCount.decrementAndGet();
+                        switch (input[0]) {
+                            case EV_DOWN:
+                                NativeHost.nativeSetInput("MOUSE_L", true);
+                                break;
+                            case EV_UP:
+                                NativeHost.nativeSetInput("MOUSE_L", false);
+                                break;
+                            case EV_WHEEL_U:
+                                // 按下+抬起=一帧脉冲(引擎会把抬起延到下一帧,
+                                // 保证脚本至少看到一次按下)。
+                                NativeHost.nativeSetInput("MOUSE_U", true);
+                                NativeHost.nativeSetInput("MOUSE_U", false);
+                                break;
+                            case EV_WHEEL_D:
+                                NativeHost.nativeSetInput("MOUSE_D", true);
+                                NativeHost.nativeSetInput("MOUSE_D", false);
+                                break;
+                            default:
+                                // 未知事件:忽略(光标移动不排队,见触摸处理)。
+                                break;
+                        }
+                    }
+
+                    // 触摸态抬手后把脚本光标移出视口(等价"鼠标离开窗口"),
+                    // 避免换屏后同位置按钮一直 hover。
+                    //
+                    // **必须推迟一帧**:本帧的 DOWN/UP 是 tick 之后才投给内核的,
+                    // 内核要到下一帧 tick 才消费这次点击。当场移光标会让引擎看到
+                    // 「在视口外(-1,-1)按下」⇒ 按钮完全不响应(触摸点了没反应,
+                    // 而虚拟鼠标模式没有这段清理所以正常)。
+                    if (cursorClearPending && !mouseMode) {
+                        cursorClearPending = false;
+                        NativeHost.nativeSetCursor(-1, -1);
+                    }
+                    if (clearCursorAfterRelease && !mouseMode) {
+                        clearCursorAfterRelease = false;
+                        cursorClearPending = true; // 下一帧再清,让点击先被消费
+                    }
                 }
 
                 if (needPixels) {

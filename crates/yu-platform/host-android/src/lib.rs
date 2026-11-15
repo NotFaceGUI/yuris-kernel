@@ -57,10 +57,11 @@ pub mod sound;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use yu_backend_wgpu::GpuBackend;
 use yu_engine::engine::{Backend, BlockCodec, Engine, EngineOptions};
+use yu_engine::host_ui::{self, HostDialog, HostDialogAnswer};
 use yu_engine::project::Project;
 use yu_log::LogLevel;
 
@@ -153,6 +154,172 @@ static RESIZE_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// 会话销毁请求(跨线程;见 [`request_shutdown`])。
 static SHUTDOWN_REQUEST: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// DIALOG 快照(渲染线程刷新;任意线程可读)。
+///
+/// 内核的权威状态在 `Engine::pending_dialogs()`(thread-local 会话里),
+/// UI 线程碰不到;这里在每次成功 tick 后把**呈现视图**复制一份,壳按
+/// [`pending_dialogs_json`] 轮询即可。没有待答对话框时 `json` 是空串,
+/// 稳态不分配。
+static DIALOG_SNAPSHOT: Mutex<DialogSnapshot> = Mutex::new(DialogSnapshot::new());
+
+/// 跨线程 DIALOG 回答队列(UI 线程写入;渲染线程在 tick 开始时应用)。
+///
+/// 与挂起/缩放/销毁请求同一模式:UI 线程不能直接摸 `SESSION`,这里先
+/// 入队并立即从快照移除(避免下一次轮询把已回答的框再弹一次),渲染
+/// 线程在下一帧 `tick` 里把它交给引擎。
+static DIALOG_ANSWERS: Mutex<Vec<HostDialogAnswer>> = Mutex::new(Vec::new());
+
+struct DialogSnapshot {
+    dialogs: Vec<HostDialog>,
+    json: String,
+}
+
+impl DialogSnapshot {
+    const fn new() -> Self {
+        Self {
+            dialogs: Vec::new(),
+            json: String::new(),
+        }
+    }
+}
+
+/// 取锁失败(poison)时继续用内部值:对话框快照是可重建的展示状态,
+/// 不应该因为别的线程 panic 就让整个壳失效。
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// 把会话里的待答 DIALOG 复制到线程安全快照(仅在集合变化时重建 JSON)。
+fn refresh_dialog_snapshot(engine: &Engine) {
+    let pending = engine.pending_dialogs();
+    let mut snapshot = lock_or_recover(&DIALOG_SNAPSHOT);
+    if pending.is_empty() && snapshot.dialogs.is_empty() {
+        return;
+    }
+    let dialogs: Vec<HostDialog> = pending.iter().map(HostDialog::from_request).collect();
+    if dialogs != snapshot.dialogs {
+        snapshot.json = if dialogs.is_empty() {
+            String::new()
+        } else {
+            host_ui::dialogs_json(&dialogs)
+        };
+        snapshot.dialogs = dialogs;
+    }
+}
+
+/// 清空快照与未应用的回答(会话启动/销毁时调用,避免旧会话的答案
+/// 落到新会话上)。
+fn clear_dialog_state() {
+    {
+        let mut snapshot = lock_or_recover(&DIALOG_SNAPSHOT);
+        snapshot.dialogs.clear();
+        snapshot.json.clear();
+    }
+    lock_or_recover(&DIALOG_ANSWERS).clear();
+}
+
+/// 当前待回答 DIALOG 的 JSON 契约;**空串 = 没有**。
+///
+/// 可从任意线程调用(快照由渲染线程在 tick 后刷新)。有新对话框的帧
+/// 必须发生在 `nativeTick` 返回之后。
+pub fn pending_dialogs_json() -> String {
+    lock_or_recover(&DIALOG_SNAPSHOT).json.clone()
+}
+
+/// 回答一条 DIALOG(可从任意线程调用)。
+///
+/// 先用快照校验(未知 id / 按钮越界 / INPUT 必填 / `INPUTLIMIT`),
+/// 再把文本编码成 CP932;编码失败**不**入队,直接返回错误让壳保持
+/// 对话框打开。调用线程持有会话时立即应用,否则入队由渲染线程在下一
+/// 帧 `tick` 前应用。
+pub fn answer_dialog(id: u64, button: u8, text: Option<&str>) -> Result<(), String> {
+    let dialog = {
+        let snapshot = lock_or_recover(&DIALOG_SNAPSHOT);
+        snapshot
+            .dialogs
+            .iter()
+            .find(|dialog| dialog.id == id)
+            .cloned()
+            .ok_or_else(|| format!("DIALOG#{id} 不存在或已回答"))?
+    };
+    let count = dialog.buttons.count();
+    if button == 0 || button > count {
+        return Err(format!(
+            "DIALOG#{id} 按钮序号 {button} 越界(合法 1..={count})"
+        ));
+    }
+    let input_text = if dialog.input {
+        let text = text.ok_or_else(|| format!("DIALOG#{id} 是文本输入框,回答必须带文本"))?;
+        if dialog.input_limit > 0 && text.chars().count() > dialog.input_limit as usize {
+            return Err(format!(
+                "DIALOG#{id} 输入 {} 字,超过 INPUTLIMIT={}",
+                text.chars().count(),
+                dialog.input_limit
+            ));
+        }
+        // 先编码一次做校验:不可映射字符要立刻回给壳(官方自绘对话框
+        // 取控件文本后按 ANSI 保存,编码失败不存在"写一半"的分支)。
+        yu_rt::dialog::DialogRequest::encode_input(text)
+            .map_err(|diag| format!("DIALOG#{id} 输入无法编码为 CP932: {diag}"))?;
+        Some(text.to_string())
+    } else {
+        None
+    };
+    let answer = HostDialogAnswer {
+        id,
+        button,
+        input_text,
+    };
+
+    // 会话在本线程(渲染线程自己回答)⇒ 立即应用;否则入队。
+    let owns_session = SESSION.with(|slot| slot.borrow().is_some());
+    if owns_session {
+        let result = SESSION.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(session) = slot.as_mut() else {
+                return Err("会话已释放".to_string());
+            };
+            session
+                .engine
+                .answer_host_dialog(&answer)
+                .map_err(|diag| format!("{diag}"))
+        });
+        result?;
+    } else {
+        lock_or_recover(&DIALOG_ANSWERS).push(answer);
+    }
+
+    // 立即从快照移除:壳回答后不应再被下一次轮询弹一次。若引擎稍后
+    // 拒绝这条回答(例如任务已不在),下一次 tick 的 refresh 会把它补回来。
+    let mut snapshot = lock_or_recover(&DIALOG_SNAPSHOT);
+    snapshot.dialogs.retain(|dialog| dialog.id != id);
+    snapshot.json = if snapshot.dialogs.is_empty() {
+        String::new()
+    } else {
+        host_ui::dialogs_json(&snapshot.dialogs)
+    };
+    Ok(())
+}
+
+/// 把 UI 线程排队的回答应用给引擎(必须在会话线程、tick 开始时调用)。
+fn drain_dialog_answers(engine: &mut Engine) {
+    let answers = {
+        let mut queue = lock_or_recover(&DIALOG_ANSWERS);
+        std::mem::take(&mut *queue)
+    };
+    for answer in answers {
+        if let Err(diag) = engine.answer_host_dialog(&answer) {
+            log::warn!(
+                target: "yu-kernel",
+                "[dialog] DIALOG#{} 回答应用失败: {diag}",
+                answer.id
+            );
+        }
+    }
+}
 
 /// `tick` 的「宿主请求销毁」返回码。
 ///
@@ -619,6 +786,9 @@ fn store_session(started: StartedEngine) -> Result<String, String> {
     SHUTDOWN_REQUEST.store(false, std::sync::atomic::Ordering::Release);
     SUSPEND_REQUEST.store(false, std::sync::atomic::Ordering::Release);
     RESUME_REQUEST.store(false, std::sync::atomic::Ordering::Release);
+    // 上一轮的 DIALOG 快照/未应用回答不能落到新会话(旧 id 在新会话里
+    // 没有意义)。
+    clear_dialog_state();
     // 新会话从「未挂起」开始:上一轮若在后台被销毁,音频闸门可能留在
     // paused 状态;不清掉的话新会话会静音到第一次 onResume。
     sound::set_output_paused(false);
@@ -1096,10 +1266,14 @@ pub fn tick() -> i32 {
         // Activity 正在销毁,那是无意义的重入。
         if SHUTDOWN_REQUEST.swap(false, std::sync::atomic::Ordering::AcqRel) {
             log_line("yu-host-android", "shutdown requested from another thread");
+            clear_dialog_state();
             drop(slot.take());
             flush_logs();
             return TICK_HOST_SHUTDOWN;
         }
+        // UI 线程排队的 DIALOG 回答:必须在 tick 之前应用,任务才能在同一
+        // 帧从 DIALOG 的下一条继续。
+        drain_dialog_answers(&mut session.engine);
         // 跨线程挂起/恢复:必须在 tick 之前、在**本线程**执行。
         if apply_pending_lifecycle(session) {
             return 0;
@@ -1107,6 +1281,9 @@ pub fn tick() -> i32 {
         match session.engine.tick_realtime() {
             Ok(rendered) => {
                 session.ticks += 1;
+                // 快照必须在本帧结束后刷新:新挂起的 DIALOG 要让壳在
+                // `nativeTick` 返回后立刻看到。
+                refresh_dialog_snapshot(&session.engine);
                 // 逐 opcode 耗时归因(`tuning.vm_profile`):每 60 帧把本窗口
                 // 累计耗时 top-8 打进 logcat。
                 //
@@ -1426,6 +1603,22 @@ pub fn set_cursor(x: i64, y: i64) -> i32 {
     })
 }
 
+/// 宿主窗口关闭按钮被按下(会话线程)。
+///
+/// 推 `@_WINDOW_EXEC_CLOSE=1` 给脚本,由脚本决定是否弹确认 DIALOG / END
+/// (与桌面 `App` 的 CloseRequested 同语义)。当前 Java 壳没有接返回键;
+/// 这里先给测试与后续壳留入口。
+pub fn request_window_close() -> i32 {
+    SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(session) = slot.as_mut() else {
+            return -1;
+        };
+        session.engine.request_window_close();
+        0
+    })
+}
+
 /// 诊断摘要(浮层 / logcat 用)。
 pub fn status_text() -> String {
     let mut out = String::new();
@@ -1451,15 +1644,22 @@ pub fn status_text() -> String {
                     {
                         out.push_str(&format!(" restart={}", u8::from(restart)));
                     }
+                    // 待答 DIALOG 是行为状态,不是诊断:壳没有 UI 时
+                    // `dialog=1` 是「脚本正挂起在弹窗上」的唯一可见信号。
+                    let dialog_count = lock_or_recover(&DIALOG_SNAPSHOT).dialogs.len();
+                    if dialog_count > 0 {
+                        out.push_str(&format!(" dialog={dialog_count}"));
+                    }
                     return;
                 }
                 let report = session.engine.last_report().clone();
                 let diags = session.engine.take_diags().len();
+                let dialog_count = lock_or_recover(&DIALOG_SNAPSHOT).dialogs.len();
                 let clipped = session.engine.sound_clipped_samples();
                 let rt_silence = session.engine.sound_rt_silence_samples();
                 out.push_str(&format!(
                     "status=running backend={} entry={} frame={} ticks={} viewport={}x{} \
-                     layers={} ops={} skipped={} drawable={} boot_ms={:.1} diags={}                      tick_ms={:.2} render_ms={:.2} snd[underrun={} clipped={} rtsil={} dec_ms={:.2}]",
+                     layers={} ops={} skipped={} drawable={} boot_ms={:.1} diags={} dialogs={}                      tick_ms={:.2} render_ms={:.2} snd[underrun={} clipped={} rtsil={} dec_ms={:.2}]",
                     session.engine.backend(),
                     session.engine.entry(),
                     report.frame,
@@ -1472,6 +1672,7 @@ pub fn status_text() -> String {
                     report.drawable,
                     session.engine.boot_ms(),
                     diags,
+                    dialog_count,
                     report.tick_ms,
                     report.render_ms,
                     report.sound_underruns,
@@ -1675,6 +1876,7 @@ pub fn lifecycle_code() -> i32 {
 /// (UI 线程)调用时走 [`request_shutdown`],由渲染线程自己收尾。
 pub fn shutdown() -> bool {
     flush_logs();
+    clear_dialog_state();
     SESSION.with(|slot| slot.borrow_mut().take().is_some())
 }
 
@@ -1709,7 +1911,7 @@ mod jni_entry {
 
     use super::*;
     use jni::objects::{JClass, JIntArray, JString};
-    use jni::sys::{jboolean, jint};
+    use jni::sys::{jboolean, jint, jlong};
     use jni::JNIEnv;
 
     /// 把 Rust 字符串交给 Java(分配失败时给空串,调用方按返回值判错)。
@@ -2079,6 +2281,53 @@ mod jni_entry {
     ) -> jint {
         take_shutdown_request()
     }
+
+    /// 当前待回答 DIALOG 的 JSON 契约(空串 = 没有)。
+    ///
+    /// 快照在每次成功 `nativeTick` 后刷新;**可从任意线程调用**,但要看
+    /// 到新对话框必须在 tick 返回之后。字段见 `docs/cross-platform.md`
+    /// 的「宿主 UI 契约:DIALOG」。
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativePendingDialogs<'local>(
+        mut env: JNIEnv<'local>,
+        _class: JClass<'_>,
+    ) -> JString<'local> {
+        to_jstring(&mut env, pending_dialogs_json())
+    }
+
+    /// 回答一条 DIALOG(可从任意线程调用;渲染线程下一帧应用)。
+    ///
+    /// 返回 `OK` 或 `ERR: ...`。`ERR` 时壳应**保持对话框打开**(输入文本
+    /// 不可映射 CP932、按钮越界、快照里没有该 id 都会走这里)。
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeAnswerDialog<'local>(
+        mut env: JNIEnv<'local>,
+        _class: JClass<'_>,
+        id: jlong,
+        button: jint,
+        text: JString<'local>,
+    ) -> JString<'local> {
+        if id < 0 || !(0..=255).contains(&button) {
+            return to_jstring(
+                &mut env,
+                format!("ERR: DIALOG#{id} 参数越界(button={button})"),
+            );
+        }
+        let text = if text.is_null() {
+            None
+        } else {
+            match env.get_string(&text) {
+                Ok(value) => Some(String::from(value)),
+                Err(error) => {
+                    return to_jstring(&mut env, format!("ERR: 回答文本无法读取: {error}"));
+                }
+            }
+        };
+        match answer_dialog(id as u64, button as u8, text.as_deref()) {
+            Ok(()) => to_jstring(&mut env, "OK"),
+            Err(message) => to_jstring(&mut env, format!("ERR: {message}")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2298,5 +2547,27 @@ mod tests {
         assert!(frame_rgba().is_empty());
         assert!(status_text().contains("status=idle"));
         assert!(!shutdown(), "没有会话可释放");
+    }
+
+    #[test]
+    fn pending_dialogs_json_is_empty_when_idle() {
+        assert!(
+            pending_dialogs_json().is_empty(),
+            "无会话/无对话框必须是空串(壳按空串判\"没有\")"
+        );
+    }
+
+    #[test]
+    fn answering_unknown_dialog_is_rejected_without_panicking() {
+        let error = answer_dialog(1, 1, None).unwrap_err();
+        assert!(
+            error.contains("不存在或已回答"),
+            "未知 id 要显式拒绝而不是静默入队: {error}"
+        );
+    }
+
+    #[test]
+    fn window_close_without_session_is_reported() {
+        assert_eq!(request_window_close(), -1, "无会话时显式返回 -1");
     }
 }

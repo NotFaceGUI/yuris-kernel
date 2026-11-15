@@ -35,11 +35,18 @@ so 的 ABI:`arm64-v8a`(真机)、`x86_64`(模拟器)。so 的 `backend` 缺省�
 | `nativeLifecycle()` | 退出细分:1 主脚本走完 / 2 脚本 `END` / 3 `END`+RESTART / 0 运行中 |
 | `nativeTakeShutdownRequest()` | 取走并清除关窗请求 |
 | `nativeShutdown()` | 释放会话(跨线程调用只登记请求);`0` 成功 |
+| `nativePendingDialogs()` | 当前待答 DIALOG 的 JSON;**空串 = 没有** |
+| `nativeAnswerDialog(long id, int button, String text)` | 回答一条 DIALOG;`OK` / `ERR: ...` |
 
 **线程**:除 `nativeShutdown` / `nativeResizeSurface` / `nativeSuspend` /
-`nativeResume`(只登记原子请求,可从任意线程调用)外,所有方法必须在
-**同一线程**调用(内核单线程,会话状态在 thread-local)。推荐用一个专用
-渲染线程,主线程只发输入标志。
+`nativeResume` / `nativePendingDialogs` / `nativeAnswerDialog`(只读写
+快照或登记请求,可从任意线程调用)外,所有方法必须在**同一线程**调用
+(内核单线程,会话状态在 thread-local)。推荐用一个专用渲染线程,主线程
+只发输入标志。
+
+`nativePendingDialogs` 的快照在每次**成功** `nativeTick()` 后刷新,所以
+要看新对话框必须在 tick 返回之后取;`nativeAnswerDialog` 的回答由渲染
+线程在下一帧 tick 前应用。
 
 ## 启动配置(JSON)
 
@@ -141,6 +148,30 @@ while (running) {
 }
 NativeHost.nativeShutdown();
 ```
+
+## 对话框(DIALOG)
+
+脚本的 `DIALOG`(改名输入、确认、通知等)由**壳**呈现;内核只把待答请求
+透出成 JSON,并接收壳的回答。完整字段与规则见
+`docs/cross-platform.md` 的「宿主 UI 契约:DIALOG」。
+
+```json
+{"protocol":1,"dialogs":[{
+  "id":7,"task":"es_Scenario","caption":"名前",
+  "text":"名前を入力してください",
+  "buttons":["ok"],"default_button":1,"icon":"none",
+  "input":true,"input_limit":0,
+  "default_input":"彼女のクラブはあのクラブ"
+}]}
+```
+
+- `buttons` 是 1 基语义角色(`ok/cancel/yes/no`),文案由壳本地化;回答
+  回传的是序号(1..N)。
+- `input=true` 时必须把输入文本一起交回;编码失败(字符不在 CP932)
+  返回 `ERR`,壳应保持输入框打开。
+- 对话框存续期间不要向游戏投输入。
+- 随包参考实现:`MainActivity` + `DialogPresenter`(平台 `AlertDialog`);
+  其他 Android 壳可以整体替换,只要消费同一份 JSON。
 
 ## 日志
 

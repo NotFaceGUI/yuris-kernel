@@ -146,4 +146,37 @@ public final class NativeHost {
      * <p>必须在**持有会话的线程**(渲染线程)上调用。
      */
     public static native int nativeTakeShutdownRequest();
+
+    /**
+     * 当前待回答的 DIALOG（JSON 契约；**空串 = 没有**）。
+     *
+     * <p>形状（字段含义见 {@code docs/cross-platform.md} 的「宿主 UI 契约：
+     * DIALOG」）：
+     * <pre>
+     * {"protocol":1,"dialogs":[
+     *   {"id":7,"task":"...","caption":"名前","text":"名前を入力してください",
+     *    "buttons":["ok"],"default_button":1,"icon":"none",
+     *    "input":true,"input_limit":0,"default_input":"..."}
+     * ]}
+     * </pre>
+     *
+     * <p>{@code buttons} 是 1 基语义角色（ok/cancel/yes/no），文案由壳
+     * 本地化；回答时回传**序号**。快照在每次成功 {@link #nativeTick()}
+     * 后刷新，因此要看新对话框必须在 tick 返回后调用。
+     *
+     * <p><b>可从任意线程调用</b>（快照是跨线程的只读副本）。
+     */
+    public static native String nativePendingDialogs();
+
+    /**
+     * 回答一条 DIALOG。**可从任意线程调用**：内核在下一帧 tick 前应用
+     * （调用线程持有会话时立即应用）。
+     *
+     * @param id      {@link #nativePendingDialogs()} 里的 {@code id}
+     * @param button  1 基按钮序号（对应 {@code buttons} 数组的位置）
+     * @param text    {@code input=true} 时的文本；非输入型传 {@code null}
+     * @return {@code "OK"} 或 {@code "ERR: ..."}；**ERR 时壳应保持对话框
+     *         打开**（通常是字符不可映射 CP932、按钮越界或快照过期）。
+     */
+    public static native String nativeAnswerDialog(long id, int button, String text);
 }
