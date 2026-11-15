@@ -3075,8 +3075,9 @@ impl ApplicationHandler for App {
         if std::env::var_os("YU_TEXT_TRACE").is_some() {
             // 命令级计数(TEXT/WORD/_/RETURNCODE 等):判定「脚本到底有没有
             // 走到文本产生路径」。`text-trace` 只能看 gfx 侧结果,分不清
-            // 「脚本没执行 WORD」与「执行了但 gfx 丢弃」。取差量后立即还给
-            // 诊断账本(下面 `diagnostics.observe` 需要同一份游标)。
+            // 「脚本没执行 WORD」与「执行了但 gfx 丢弃」。该接口是**取走**
+            // 语义:开启 trace 的这一帧,诊断账本拿不到命令计数(调试开关
+            // 的取舍,默认路径不受影响)。
             let mut deltas = self.engine.take_command_hit_deltas();
             let mut text_cmds: Vec<String> = Vec::new();
             for (opcode, hits) in deltas.drain(..) {
@@ -3268,7 +3269,7 @@ impl ApplicationHandler for App {
                         // 紧凑格式:id / z / alpha / visible / 纹理种类。
                         // 转场"白↔黑"闪烁的判据是 alpha 或纹理种类逐帧变,
                         // 不是 op 数量变,所以这三项必须一起打印。
-                        let mut s = format!("{op:?}");
+                        let s = format!("{op:?}");
                         // 从 Debug 文本里抠出关键字段(避免依赖 gfx 内部字段名)。
                         let id = s
                             .find("id: LayerId([")
