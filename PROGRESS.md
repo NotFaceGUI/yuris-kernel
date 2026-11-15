@@ -14621,3 +14621,79 @@ v474 样本 headless --frames 5                    → boot 通过
 v474 桌面 --step-to 798 逐帧亮度                  → 近黑仅 [1..20](启动黑屏),794 帧 = 255
 构建警告                                          → 受影响 5 个 crate 零 warning
 ```
+
+## 成果 SAVE-INTEROP (2026-11-15) · 存档容器版本按官方 LOAD 常量写盘,恢复双向互换
+
+### 1. 根因(修复)
+
+- 官方 LOAD 读完 `YSSD` 魔数后**精确校验容器版本立即数**,不等即弹
+  yse `108040`「セーブデータのバージョンが異なります」。
+- 该常量是**写盘器常量**,与 yscfg/引擎版本无关:实测 0.495 = `0x1E0`、
+  0.479 = `0x138`、0.466 = `0x0C0`、0.481 = `0x1E1`、2012 旧运行时 = `0x138`。
+- `engine.rs` 原先注入 `vm.tables().boot.config.version` 并压过盘上学习值,
+  于是 0.495 工程新槽写成 `0x1EF`、v474 旧运行时写成 `0x1DA`,官方拒收
+  (旧槽因覆写沿用原版本仍可读,造成「有的能读有的不能」)。
+- 见 `docs/divergences/DIV-RT-058-save-container-version.md`。
+
+### 2. 修法(实现)
+
+- 写盘版本优先级:官方 exe 探测常量 → 盘上 `.sd` 学习值 → 目标文件版本 →
+  压缩层现代默认(zlib `0x1E0` / Snappy `0x1E1`,留 verbose 兜底诊断)。
+- 启动时扫描工程根 `*.exe`(按体积降序)定位 `81 FA 'YSSD'` 后的版本比较
+  立即数;单 exe 候选冲突即跳过,全部无候选 = 不注入。
+- 盘上学习改为确定性选举:系统槽(非 `saveNNNNN.sd`)优先,其次多数票,
+  平票取较小版本——避免本引擎旧产物污染证据。
+
+### 验证
+
+```text
+cargo test -p yu-save(带 YURIS_SAMPLE_ERIS_ROOT/SDK0495) → 22 passed; 0 failed
+cargo test -p yu-engine --lib                            → 39 passed; 0 failed
+cargo test -p yu-format --test yssd_roundtrip            → 2 passed; 0 failed
+v474 旧运行时 headless 1 帧 --log-level debug
+  → save container version 0x138 from aorio.exe
+0.495 工程 headless 1 帧 --log-level debug
+  → save container version 0x1e0 from yu-ris.exe
+```
+
+## 成果 DIALOG-HOST (2026-11-15) · DIALOG 收敛为统一宿主 UI 契约,Android 接入系统对话框
+
+### 1. 统一契约(`yu-engine::host_ui`)
+
+- 新增 `HostDialog` / `HostDialogAnswer` / `dialogs_json()`:内核只持有
+  `DialogRequest`(CP932 原始字节),壳只消费呈现视图;
+  `Engine::answer_host_dialog()` 统一编码 CP932。
+- JSON:`{"protocol":1,"dialogs":[...]}`;`buttons` 按 1 基给语义角色
+  (`ok/cancel/yes/no`),文案由壳本地化。
+- 桌面 `dialog_modal` 改用共享类型,删除私有的 `DialogView/DialogAnswer`;
+  INPUT 编辑缓冲只在回答成功后清理(编码失败保留用户输入)。
+
+### 2. Android 宿主
+
+- `host-android`:线程安全 DIALOG 快照 + 跨线程回答队列;每次成功 tick
+  后刷新,回答在下一帧 tick 前 drain(任务同帧恢复);会话启动/销毁清空。
+- JNI 新增 `nativePendingDialogs()` / `nativeAnswerDialog(long,int,String)`;
+  `nativeStatus` 增加 `dialogs=N`(quiet 下有待答时 `dialog=N`)。
+- 新增参考壳 `DialogPresenter.java`:平台 `AlertDialog`;支持
+  OK / OK-Cancel / Yes-No / Yes-No-Cancel / INPUT;返回键只取消带 Cancel
+  的组合;ERR 保持对话框打开;对话框期间壳不向游戏投输入。
+- 新增 `host-android/tests/dialog.rs`(真实 ERIS 语料):启动 →
+  `request_window_close()` → 快照 `YESNO/確認` → 回答いいえ → 快照清空、
+  主线继续。
+
+### 验证
+
+```text
+cargo build --workspace --all-targets(本机需 CL=-utf-8 规避非 ASCII
+  用户路径下 libmimalloc-sys/cl 的问题)          → 通过
+cargo test -p yu-engine host_ui                   → 3 passed
+cargo test -p yu-host-desktop --lib               → 40 passed
+cargo test -p yu-host-android --lib               → 20 passed
+YURIS_SAMPLE_ERIS_ROOT=... cargo test -p yu-host-android --test dialog -- --ignored
+  → 1 passed;快照 {"buttons":["yes","no"],"caption":"確認"}
+    → 回答いいえ → status=running
+BUILD_TYPE=release tools/android/build.sh arm64-v8a → APK 构建成功
+BUILD_TYPE=release tools/android/build.sh x86_64    → APK 构建成功
+```
+
+- 真机点验(改名输入 / 通知确认)由主人自行完成。

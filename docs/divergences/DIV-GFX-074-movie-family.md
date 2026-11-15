@@ -167,9 +167,12 @@ cargo test -p yu-gfx --test ymv_movie        # 9 通过(含 overlay 遮住所有
   `SIZE/SIZE2` 的目标尺寸就是缩放绘制。`CG[SX/SY]` 另属图层组参数
   (`cg/cg.html`「※レイヤセットに対してのみ有効」),gfx 的
   `apply_layer_params` 已按 `is_group` 分派,普通图像层不带 `image_size`。
-- **存档容器版本兜底**:`SAVE` 没有可参照 `.sd` 时,引擎用工程 `yscfg`
-  版本(`vm.tables().boot.config.version`)初始化容器版本,不再以
-  `sv.container` 拒绝写盘;盘上同名文件仍优先沿用其自身版本。
+- **存档容器版本兜底(2026-11-15 勘误)**:当时用工程 `yscfg` 版本
+  (`vm.tables().boot.config.version`)兜底是**错的**——容器版本是官方 exe
+  的写盘器常量(0.495=`0x1E0`、0.479=`0x138`、0.466=`0x0C0`、0.481=`0x1E1`),
+  与 yscfg 版本无换算关系,写错会让官方拒收存档。现行实现见
+  `docs/divergences/DIV-RT-058-save-container-version.md`(官方 exe 探测
+  > 盘上学习 > 目标文件 > 压缩层默认)。
 - **既有缺口(另案)**:按钮条/存档缩略图依赖 `CGACT[COPY]` 的
   `screen_snapshots`;实机日志出现 `snapshot.unsupported x3` 与
   `复制源 :/W0/SLTEMP 不存在`,属快照域未完成的物化路径,与 `MOVIE` 无关。
