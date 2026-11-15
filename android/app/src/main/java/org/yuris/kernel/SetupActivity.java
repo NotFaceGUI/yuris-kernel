@@ -162,7 +162,7 @@ public final class SetupActivity extends AppCompatActivity {
         manualGame.setTextSize(12f);
         manualGame.setOnClickListener(v -> editGameDir());
         gameCard.addView(manualGame, buttonParams());
-        gameCard.addView(hintText("选择包含 data.ypf 或 data/ 的目录"));
+        gameCard.addView(hintText("选游戏根目录"));
         root.addView(gameCard, cardParams());
 
         // ---- 存档目录 ----
@@ -533,12 +533,11 @@ public final class SetupActivity extends AppCompatActivity {
                         return;
                     }
                     File picked = new File(text);
-                    String root = findGameRoot(picked.isDirectory() ? picked : picked.getParentFile());
-                    if (root == null) {
-                        status.setText("这个目录里没有 data.ypf / data/,请选游戏根目录");
-                        return;
-                    }
-                    gameDir = root;
+                    File dir = picked.isDirectory() ? picked : picked.getParentFile();
+                    // 与选目录同一原则:不拒绝。能自动定位到根就用根,否则照收原样,
+                    // 内核启动时会给出具体错误。
+                    String root = dir != null ? findGameRoot(dir) : null;
+                    gameDir = root != null ? root : picked.getAbsolutePath();
                     refreshLabels();
                 })
                 .setNegativeButton("取消", null)
@@ -613,10 +612,15 @@ public final class SetupActivity extends AppCompatActivity {
     }
 
     /**
-     * 把目录选择器返回的 tree URI 解析成游戏根目录。
+     * 把目录选择器返回的 tree URI 解析成真实路径,能识别时顺带定位游戏根。
      *
-     * <p>命中顺序:选中目录本身 → 向上 4 层 → 唯一一个含数据入口的直接
-     * 子目录(用户选了游戏上一级的情况)。多个候选时**不猜**,提示重新选。
+     * <p><b>选目录不是门槛</b>:只要 URI 能还原成真实路径就接受,不做任何
+     * 准入判断 —— 能不能跑由内核启动时判定,错误会回显到状态栏。
+     *
+     * <p>自动定位只是便利:选中目录 → 向上 4 层 → 唯一一个能当数据入口的
+     * 直接子目录(用户选了游戏上一级的情况)。一个都没命中就用用户选中的
+     * 目录本身。判据交给内核({@link NativeHost#nativeProbeGameRoot},与启动时
+     * `Project::discover` 同一份代码),壳不手抄规则。
      */
     private String resolveGameRoot(Uri uri) {
         String realPath = realPathOf(uri);
@@ -632,20 +636,20 @@ public final class SetupActivity extends AppCompatActivity {
             status.setText("无法解析该目录的路径,请换用「手动输入路径…」");
             return null;
         }
+        // 便利:选中的是游戏里的子目录或游戏的上一级时自动落到根上。
         String root = findGameRoot(picked);
         if (root != null) {
             return root;
         }
-        // 用户可能选的是游戏的上一级:只有一个子目录像游戏根时直接进去。
         File only = singleChildGameRoot(picked);
         if (only != null) {
             return only.getAbsolutePath();
         }
-        status.setText("这个目录里没有 data.ypf / data/,请选游戏根目录");
-        return null;
+        // 认不出来也照收:内核启动时会给出具体错误。
+        return picked.getAbsolutePath();
     }
 
-    /** 直接子目录里只有**一个**含数据入口时返回它;0 个或多个都回 null。 */
+    /** 直接子目录里只有**一个**能当数据入口时返回它;0 个或多个都回 null。 */
     private File singleChildGameRoot(File dir) {
         File[] children = dir.listFiles();
         if (children == null) {
@@ -653,7 +657,7 @@ public final class SetupActivity extends AppCompatActivity {
         }
         File found = null;
         for (File child : children) {
-            if (child.isDirectory() && isGameRoot(child)) {
+            if (child.isDirectory() && probeGameRoot(child) != null) {
                 if (found != null) {
                     return null; // 多个候选:不替用户猜
                 }
@@ -663,14 +667,47 @@ public final class SetupActivity extends AppCompatActivity {
         return found;
     }
 
-    /** 从选中位置向上找游戏根(含 data.ypf 或 data/ 的目录)。 */
+    /** 从选中位置向上找能当数据入口的目录;找不到回 null(调用方自行兜底)。 */
     private String findGameRoot(File start) {
         File cursor = start;
         for (int depth = 0; cursor != null && depth < 4; depth++) {
-            if (isGameRoot(cursor)) {
-                return cursor.getAbsolutePath();
+            String root = probeGameRoot(cursor);
+            if (root != null) {
+                return root;
             }
             cursor = cursor.getParentFile();
+        }
+        return null;
+    }
+
+    /**
+     * 让内核判断这个目录是不是数据入口(`Project::discover` 同一判据)。
+     *
+     * <p>只用于**自动定位**,不是选择门槛;JNI 不可用时也返回 null 并记日志,
+     * 不崩溃、不拦用户。
+     *
+     * @return 数据根路径;不是数据入口时 {@code null}
+     */
+    private static String probeGameRoot(File dir) {
+        if (dir == null) {
+            return null;
+        }
+        String reply;
+        try {
+            reply = NativeHost.nativeProbeGameRoot(dir.getAbsolutePath());
+        } catch (Throwable error) {
+            Log.w(TAG, "nativeProbeGameRoot failed", error);
+            return null;
+        }
+        try {
+            org.json.JSONObject json = new org.json.JSONObject(reply == null ? "" : reply);
+            if (!json.optBoolean("ok", false)) {
+                return null;
+            }
+            String root = json.optString("root", "");
+            return root.isEmpty() ? dir.getAbsolutePath() : root;
+        } catch (Exception error) {
+            Log.w(TAG, "nativeProbeGameRoot reply is not JSON: " + reply, error);
         }
         return null;
     }
@@ -784,26 +821,6 @@ public final class SetupActivity extends AppCompatActivity {
             // 部分 provider 不提供 _data。
         }
         return null;
-    }
-
-    private static boolean isGameRoot(File dir) {
-        if (dir == null || !dir.isDirectory()) {
-            return false;
-        }
-        File[] files = dir.listFiles();
-        if (files == null) {
-            return false;
-        }
-        for (File file : files) {
-            String name = file.getName().toLowerCase();
-            if (file.isFile() && name.endsWith(".ypf")) {
-                return true;
-            }
-            if (file.isDirectory() && name.equals("data")) {
-                return true;
-            }
-        }
-        return false;
     }
 
     // ------------------------------------------------------------ 显示与样式
