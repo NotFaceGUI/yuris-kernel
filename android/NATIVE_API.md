@@ -30,6 +30,7 @@ so 的 ABI:`arm64-v8a`(真机)、`x86_64`(模拟器)。so 的 `backend` 缺省�
 | `nativeSetCursor(int x, int y)` | 注入光标(游戏视口像素坐标) |
 | `nativeStatus()` | 诊断摘要(状态、帧号、fps 之外的对账数字、最近错误) |
 | `nativeListFonts()` | 本机字体族名单(`\n` 分隔) |
+| `nativeProbeGameRoot(String path)` | 目录选择器用:探测该路径是否为数据入口(`Project::discover` 同一判据);返回 JSON,见下 |
 | `nativeVersion()` | 构建目标标记 |
 | `nativeSuspend()` / `nativeResume()` | 生命周期挂起 / 恢复 |
 | `nativeLifecycle()` | 退出细分:1 主脚本走完 / 2 脚本 `END` / 3 `END`+RESTART / 0 运行中 |
@@ -40,7 +41,8 @@ so 的 ABI:`arm64-v8a`(真机)、`x86_64`(模拟器)。so 的 `backend` 缺省�
 
 **线程**:除 `nativeShutdown` / `nativeResizeSurface` / `nativeSuspend` /
 `nativeResume` / `nativePendingDialogs` / `nativeAnswerDialog`(只读写
-快照或登记请求,可从任意线程调用)外,所有方法必须在**同一线程**调用
+快照或登记请求,可从任意线程调用)以及 `nativeProbeGameRoot`(不碰会话,
+可在 `nativeInit` 之前从 UI 线程调用)外,所有方法必须在**同一线程**调用
 (内核单线程,会话状态在 thread-local)。推荐用一个专用渲染线程,主线程
 只发输入标志。
 
@@ -48,12 +50,26 @@ so 的 ABI:`arm64-v8a`(真机)、`x86_64`(模拟器)。so 的 `backend` 缺省�
 要看新对话框必须在 tick 返回之后取;`nativeAnswerDialog` 的回答由渲染
 线程在下一帧 tick 前应用。
 
+### `nativeProbeGameRoot` 的返回
+
+```jsonc
+// 是数据入口(packs/updates 是基础包与增量层数量)
+{"ok":true, "root":"/storage/emulated/0/krkr/game", "kind":"packed", "packs":2, "updates":0}
+// 不是(reason 可直接显示给用户)
+{"ok":false, "reason":"找不到数据入口:… 下没有 YPF 包,也没有散盘数据目录(ysbin/cg/config/save/pac 等)"}
+```
+
+判据与启动时的 `Project::discover` **同一份代码**:根目录 `*.ypf`、
+`pac/*.ypf`(商业多包)、`data/` 布局、根级散盘(`ysbin/`、`cg/` …)、
+`update1..9.ypf` 增量层,`.ypf` 还必须通过 `YPF\0` 魔数校验。壳不得自己
+复写这套规则 —— 手抄版必然与引擎漂移。
+
 ## 启动配置(JSON)
 
 ```jsonc
 {
   // ---- 必填 ----
-  "data_root": "/sdcard/Download/yugame",        // 含 data.ypf 或 data/
+  "data_root": "/sdcard/Download/yugame",        // 数据入口(根 *.ypf / pac/*.ypf / 散盘)
   // ---- 存档 ----
   "save_root": "/sdcard/Download/yugame/save",   // 省略 = data_root/save
   // ---- 脚本 ----

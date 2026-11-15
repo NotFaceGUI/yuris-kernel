@@ -14698,3 +14698,56 @@ BUILD_TYPE=release tools/android/build.sh x86_64    → APK 构建成功
 ```
 
 - 真机点验(改名输入 / 通知确认)由主人自行完成。
+
+## 成果 ANDROID-DIR-PROBE (2026-11-15) · 选目录不再做准入判断,定位判据交回内核
+
+### 1. 问题
+
+`SetupActivity.isGameRoot` 是壳里手抄的一份「这个目录像不像游戏根」:
+只认根目录 `*.ypf` 或名为 `data` 的子目录。它与内核启动时用的
+`Project::discover`(官方挂载规则,`docs/formats/ypf.md` §4)不一致:
+
+| 布局 | 引擎 | 旧壳手抄版 |
+|---|---|---|
+| `<root>/pac/bn.ypf` 商业多包 | ✅ | ❌ 报「没有 data.ypf」 |
+| 根级散盘 `<root>/ysbin`、`<root>/cg` … | ✅ | ❌ 同上 |
+| `<root>/movie.ypf`(MPEG-PS,魔数不符) | ❌ 跳过 | ✅ 误判为真 |
+| 空的 `data/` 目录 | ❌ | ✅ 误判为真 |
+
+结果就是「引擎能跑的游戏在选目录这一步被拒,引擎跑不了的目录反而能选」。
+另外 `listFiles()` 返回 null(无「所有文件访问」)时也报「没有 data.ypf」,
+把没权限误报成不是游戏。
+
+### 2. 改法
+
+- `host-android` 新增 `probe_game_root(path) -> JSON`,内部直接调
+  `Project::discover`(与启动路径**同一份代码**,含 `YPF\0` 魔数校验);
+  JNI 导出 `nativeProbeGameRoot(String)`,返回
+  `{"ok":true,"root":…,"kind":…,"packs":N,"updates":N}` /
+  `{"ok":false,"reason":…}`。
+- `SetupActivity` 删除 `isGameRoot`,改由 `probeGameRoot()` 问内核。
+- **选目录不做门槛**:只要 tree URI 能还原成真实路径就接受,认不出来也照收;
+  能不能跑由内核启动时判定,错误经 `MainActivity.EXTRA_START_ERROR` 回显到
+  状态栏。探测只用于**自动定位**(选中目录 → 向上 4 层 → 唯一子目录),
+  命中就用根,一个都没命中就用用户选中的目录本身;手动输入路径同一原则。
+- 界面提示保持「选游戏根目录」。
+
+### 验证
+
+```text
+cargo test -p yu-host-android --lib probe_   → 4 passed; 0 failed
+  (pac 商业多包 / 根级散盘 / 普通目录 / 伪装 .ypf 魔数)
+cargo test -p yu-host-android --lib          → 24 passed; 0 failed
+cargo check -p yu-host-android               → 通过
+BUILD_TYPE=debug YURIS_SO_ONLY=1 tools/android/build.sh arm64-v8a
+  → so 构建成功;so 内 grep 到
+    Java_org_yuris_kernel_NativeHost_nativeProbeGameRoot
+gradle :app:compileReleaseJavaWithJavac --offline
+  -Pandroid.aapt2FromMavenOverride=<SDK>/build-tools/37.0.0/aapt2.exe
+  → BUILD SUCCESSFUL
+BUILD_TYPE=release tools/android/build.sh arm64-v8a
+  → APK 构建成功(27M)
+```
+
+- 真机点验(任意目录都能选中、跑不了的游戏在启动时把内核错误显示到状态栏)
+  由主人自行完成。
