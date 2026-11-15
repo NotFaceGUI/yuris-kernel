@@ -1,7 +1,8 @@
 // `CGACT[MERGE2/XOR/AND]` 的 GPU 合成(整面,读 lower+upper 写新表面)。
 //
-// 三者都只在两图**重叠区**改像素,其余像素按 lower 原样返回(CPU 参考实现
-// `apply_bitwise`/`apply_merge` 用 `min(width)`/`min(height)` 作循环上界)。
+// 三者都只在两图按落点 `(dx,dy)` 贴入后的**求交区**改像素,其余像素按
+// lower 原样返回(CPU 参考实现 `apply_bitwise_at`/`apply_merge_at_layers`
+// 用求交矩形作循环上界)。
 //
 // - `MODE=1` XOR / `MODE=2` AND:RGB 位运算,alpha 不变。
 // - `MODE=0` MERGE2 —— 下面详述。
@@ -41,7 +42,14 @@ struct Params {
     src_layer_alpha: u32,
     // 下层的 `[层+0x80]`(0..256)。MERGE2 里作为 dstA,乘进下层像素 alpha。
     dst_layer_alpha: u32,
+    // `CGACT[X=… Y=…]` 的落点:上层左上角在下层表面上的坐标。
+    // 官方同族 6 个执行体(含 `0x43b33c`/`0x43b8ec`)都把它交给
+    // `FUN_0043b518` 做四边裁剪(DIV-GFX-086)。
+    dx: i32,
+    dy: i32,
     _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0) var t_lower: texture_2d<f32>;
@@ -68,10 +76,14 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     if (p.x >= 0 && p.y >= 0 && p.x < lower_dim.x && p.y < lower_dim.y) {
         lower = textureLoad(t_lower, p, 0);
     }
-    if (p.x < 0 || p.y < 0 || p.x >= upper_dim.x || p.y >= upper_dim.y) {
+    // 上层按落点 `(dx,dy)` 贴入:目标像素 p 取上层 `p-(dx,dy)`;越界部分
+    // 原样返回下层(与 CPU 参考实现 `apply_bitwise_at`/`apply_merge_at_layers`
+    // 的求交上界一致)。
+    let pu = p - vec2<i32>(u.dx, u.dy);
+    if (pu.x < 0 || pu.y < 0 || pu.x >= upper_dim.x || pu.y >= upper_dim.y) {
         return lower;
     }
-    let upper = textureLoad(t_upper, p, 0);
+    let upper = textureLoad(t_upper, pu, 0);
     let l_raw = vec4<u32>(round(lower * 255.0));
     let up_raw = vec4<u32>(round(upper * 255.0));
 

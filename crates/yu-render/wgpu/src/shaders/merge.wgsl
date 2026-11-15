@@ -41,20 +41,25 @@
 // 见 `composite.wgsl` mode 0。**模式层公式并不相同**,层 alpha≡256 时也
 // 会差 1 LSB —— 这是官方的真实差异,不是我们的误差。
 //
-// 越界像素 / `U.a=0` ⇒ 原样返回下层(CPU 循环只覆盖 min 尺寸)。
+// 上层按 `CGACT[X=… Y=…]` 的落点贴入(目标 `p` 取上层 `p-(dx,dy)`);
+// 落点外/越界像素与 `U.a=0` ⇒ 原样返回下层(CPU 循环只覆盖求交矩形)。
 
 @group(0) @binding(0) var t_lower: texture_2d<f32>;
 @group(0) @binding(1) var t_upper: texture_2d<f32>;
 
 // 层不透明度 `[上层的 [层+0x80], 下层的 [层+0x80]]`,各 0..256。
 // `MERGE` 只读 `.src`;`.dst` 由宿主固定传 256(执行体不传这个参数)。
-struct LayerAlpha {
+// `dx/dy` = `CGACT[X=… Y=…]` 的**落点**:上层左上角在下层表面上的坐标。
+// 官方 `FUN_0043b33c`/`FUN_0043b8ec` 都用它做目标起点,并经 `FUN_0043b518`
+// 按四边越界裁剪(`upper.w + X` / `X<0` 等);脚本侧见 `es_SPExec.yst`
+// 的部件合成(DIV-GFX-086)。
+struct MergeParams {
     src: u32,
     dst: u32,
-    _pad0: u32,
-    _pad1: u32,
+    dx: i32,
+    dy: i32,
 };
-@group(0) @binding(2) var<uniform> u_layer: LayerAlpha;
+@group(0) @binding(2) var<uniform> u_merge: MergeParams;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
@@ -76,10 +81,14 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     if (p.x >= 0 && p.y >= 0 && p.x < lower_dim.x && p.y < lower_dim.y) {
         lower = textureLoad(t_lower, p, 0);
     }
-    if (p.x < 0 || p.y < 0 || p.x >= upper_dim.x || p.y >= upper_dim.y) {
+    // 上层按落点 `(dx,dy)` 贴入:目标像素 p 取上层 `p-(dx,dy)`;
+    // 越界部分原样返回下层(与 CPU 参考实现 `apply_merge_at_layers` 的
+    // 求交上界一致)。
+    let pu = p - vec2<i32>(u_merge.dx, u_merge.dy);
+    if (pu.x < 0 || pu.y < 0 || pu.x >= upper_dim.x || pu.y >= upper_dim.y) {
         return lower;
     }
-    let upper = textureLoad(t_upper, p, 0);
+    let upper = textureLoad(t_upper, pu, 0);
     let up = vec4<u32>(round(upper * 255.0));
     let l_raw = vec4<u32>(round(lower * 255.0));
     let ua = up.w;
@@ -88,7 +97,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         return lower;
     }
     let la = l_raw.w;
-    let layer = u_layer.src;
+    let layer = u_merge.src;
 
     // T = L.a·U.a/255;w = (U.a − T)·srcA>>8;a' = L.a + w。
     let t = la * ua / 255u;

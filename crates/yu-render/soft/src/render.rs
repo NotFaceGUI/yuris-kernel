@@ -462,14 +462,26 @@ fn apply_image_op(
     }
     // `MERGE/MERGE2/XOR/AND`:`ID`(上层)合成到 `ID2`(下层),结果写 `ID2`。
     //
-    // `X/Y` 是**绘制偏移**(wgpu 侧 `push_quad` 直接用它),不是源区域 ——
-    // 因此必须先于区域解析处理,否则 `X=0 Y=0`(语料存读档的缩略图合成)
+    // `X/Y` 是**落点**(上层左上角在下层表面上的坐标),不是源区域 ——
+    // 必须先于区域解析处理,否则 `X=0 Y=0`(语料存读档的缩略图合成)
     // 会被误判成 `gfx.imageop.region.partial` 整条跳过。
+    //
+    // 证据(REA 0.495):
+    // - `MERGE`  `0x43b33c` / `MERGE2` `0x43b8ec`、XOR/AND 等 4 个同族
+    //   执行体,都把 `X`/`Y` 当**目标落点**:`upper.width + X` 与下层宽比
+    //   (越右置剪切位 8)、`upper.height + Y` 与下层高比(位 2)、`X<0`
+    //   (位 4)、`Y<0`(位 1);
+    // - 共享落点/裁剪设置 `FUN_0043b518`(0x43b518):目标起点
+    //   `(clamp(X,0,·), clamp(Y,0,·))`,源起点 `(-X,-Y)` 截到 0,
+    //   跨度为 `min(upper, lower-X/Y)` —— 与下面的求交循环同义。
+    //
+    // 脚本侧:`es_SPExec.yst` 先把差分帧 `SIZE` 裁成小表面,再
+    // `CGACT[ID=sp.tmp ID2=<立绘缓冲> X=<部件坐标> Y=<部件坐标> MERGE=1]`。
+    // 落点被忽略时口型/眨眼差分全部贴到画布 `(0,0)`(立绘左上角出现错位
+    // 碎片)。手册本族无页,见 `DIV-GFX-086`。
     if image.action.is_layer_composite() {
-        // `X/Y` 不参与合并对齐(见 wgpu 侧同处注释与那里的勘误)。
-        // 2b53786 之前这里也不检查 `X/Y`;「非零即跳过」会让
-        // `RECTPAINT3 SET=0` 清掉的矩形填不回来。忽略之。
-        let _ = (image.x, image.y);
+        let dx = image.x.map_or(0, |v| v.round() as i64);
+        let dy = image.y.map_or(0, |v| v.round() as i64);
         // 下层 = 目标层当前表面(`st.texture_overrides` 是同帧加工结果)。
         // 官方的合并执行体只把上层“画”进这块表面、不读它的旧像素;
         // 清空后是否可见取决于 alpha 的混合口径(见 `apply_merge` 的注释)。
@@ -497,25 +509,29 @@ fn apply_image_op(
         let src_layer_alpha = u32::from(image.source_alpha.clamp(0, 256) as u16);
         let dst_layer_alpha = u32::from(image.target_alpha.clamp(0, 256) as u16);
         match &image.action {
-            ImageAction::Merge => crate::imagefilters::apply_merge_layers(
+            ImageAction::Merge => crate::imagefilters::apply_merge_at_layers(
                 &mut lower,
                 &upper,
                 false,
+                dx,
+                dy,
                 src_layer_alpha,
                 256, // MERGE 不使用下层的层 alpha
             ),
-            ImageAction::Merge2 => crate::imagefilters::apply_merge_layers(
+            ImageAction::Merge2 => crate::imagefilters::apply_merge_at_layers(
                 &mut lower,
                 &upper,
                 true,
+                dx,
+                dy,
                 src_layer_alpha,
                 dst_layer_alpha,
             ),
             ImageAction::Other("xor") => {
-                crate::imagefilters::apply_bitwise(&mut lower, &upper, true)
+                crate::imagefilters::apply_bitwise_at(&mut lower, &upper, true, dx, dy)
             }
             ImageAction::Other("and") => {
-                crate::imagefilters::apply_bitwise(&mut lower, &upper, false)
+                crate::imagefilters::apply_bitwise_at(&mut lower, &upper, false, dx, dy)
             }
             // `CG[MID]`:REA `0x42a862..0x42a88c` 要求两层宽高相等,然后
             // 逐像素 `target.a = mask.r`(RGB 不动),并置 `+0x86=1`。

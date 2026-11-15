@@ -1156,7 +1156,9 @@ impl PipelineCache {
         self.composite_pipeline.as_ref()
     }
 
-    /// MERGE2/XOR/AND 的 bind group(`mode`:0=MERGE2,1=XOR,2=AND)。
+    /// MERGE2/XOR/AND 的 bind group(`mode`:0=MERGE2,1=XOR,2=AND,3=MID)。
+    ///
+    /// `dx/dy` = 上层落点(`CGACT[X=… Y=…]`);MID(mode 3)由调用方传 0。
     pub fn create_composite_bind_group(
         &mut self,
         ctx: &GpuContext,
@@ -1165,8 +1167,20 @@ impl PipelineCache {
         mode: u32,
         src_layer_alpha: u32,
         dst_layer_alpha: u32,
+        dx: i32,
+        dy: i32,
     ) -> Result<wgpu::BindGroup, Diag> {
-        let uniform = [mode, src_layer_alpha, dst_layer_alpha, 0];
+        // 8×u32 = 32B:与 WGSL `Params`(含 dx/dy 与补齐)一致。
+        let uniform = [
+            mode,
+            src_layer_alpha,
+            dst_layer_alpha,
+            dx as u32,
+            dy as u32,
+            0,
+            0,
+            0,
+        ];
         let buffer = wgpu::util::DeviceExt::create_buffer_init(
             &ctx.device,
             &wgpu::util::BufferInitDescriptor {
@@ -1357,11 +1371,12 @@ impl PipelineCache {
         Ok(group)
     }
 
-    /// 双纹理 MERGE 的 bind group(lower + upper + 层不透明度)。
+    /// 双纹理 MERGE 的 bind group(lower + upper + 层不透明度 + 落点)。
     ///
     /// `src_layer_alpha` / `dst_layer_alpha` 是两张源层在命令时刻的
     /// `[层+0x80]`(0..256)。REA:`MERGE` 只用上层,`MERGE2` 两层都用;
     /// shader 侧按 `round(a·L/256)` 折进有效像素 alpha。
+    /// `dx/dy` = `CGACT[X=… Y=…]` 的落点(上层左上角在下层上的坐标)。
     pub fn create_layer_merge_bind_group(
         &mut self,
         ctx: &GpuContext,
@@ -1369,12 +1384,14 @@ impl PipelineCache {
         upper: &wgpu::TextureView,
         src_layer_alpha: u32,
         dst_layer_alpha: u32,
+        dx: i32,
+        dy: i32,
     ) -> Result<wgpu::BindGroup, Diag> {
-        let uniform = [src_layer_alpha, dst_layer_alpha, 0u32, 0u32];
+        let uniform = [src_layer_alpha, dst_layer_alpha, dx as u32, dy as u32];
         let buffer = wgpu::util::DeviceExt::create_buffer_init(
             &ctx.device,
             &wgpu::util::BufferInitDescriptor {
-                label: Some("yu-backend-wgpu merge layer alpha"),
+                label: Some("yu-backend-wgpu merge params"),
                 contents: bytemuck::cast_slice(&uniform),
                 usage: wgpu::BufferUsages::UNIFORM,
             },

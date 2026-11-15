@@ -72,6 +72,8 @@ fn table() -> ParamTable {
                     "BNO",
                     "MERGE",
                     "MERGE2",
+                    "XOR",
+                    "AND",
                     "SIZE",
                     "SIZE2",
                     "SX",
@@ -1268,6 +1270,185 @@ fn merge_does_not_leak_hidden_lower_rgb_at_antialiased_edges() {
         max_channel_diff(&out.surface, &soft_out.surface),
         0,
         "MERGE 的归一化 over 必须与 soft 逐字节一致"
+    );
+}
+
+/// **MERGE 的 X/Y 是落点**(`DIV-GFX-086` 回归锚点)。
+///
+/// 复刻 `es_SPExec.yst` 的部件合成:`CG[FILE=<差分条>]` → `CGACT[SIZE]`
+/// 裁出 41×41 帧 → `CGACT[ID=帧 ID2=<立绘缓冲> X=<部位坐标> Y=<部位坐标>
+/// MERGE=1]`。旧实现丢弃 X/Y、整面从 `(0,0)` 合成 ⇒ 口型/眨眼差分全部贴在
+/// 画布左上角,屏幕上表现为立绘旁的错位碎片。
+///
+/// 这里用 8×8 下层 + 3×2 上层,落点 `(5,4)`:
+/// - `(5,4)`..`(7,5)` 必须是上层色;
+/// - 落点左侧/上侧保持下层色(整面合成会污染这些像素);
+/// - GPU 与 soft 逐字节一致。
+#[test]
+fn merge_lands_upper_at_x_y_offset() {
+    let table = table();
+    let lower = RgbaImage::from_pixel(8, 8, Rgba([10, 20, 30, 255]));
+    let upper = RgbaImage::from_pixel(3, 2, Rgba([200, 100, 50, 255]));
+    let mut lower_png = Vec::new();
+    PngEncoder::new(&mut lower_png)
+        .write_image(lower.as_raw(), 8, 8, ExtendedColorType::Rgba8)
+        .expect("encode lower");
+    let mut upper_png = Vec::new();
+    PngEncoder::new(&mut upper_png)
+        .write_image(upper.as_raw(), 3, 2, ExtendedColorType::Rgba8)
+        .expect("encode upper");
+    let entries = [
+        (b"low.png".as_slice(), lower_png),
+        (b"up.png".as_slice(), upper_png),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"low".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"UP".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"up".to_vec())),
+                // 上层只是合成源,不直接上屏;否则它会以 (0,0) 姿态盖住结果。
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"UP".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CGACT", "X", Value::Int(5)),
+                arg(&table, "CGACT", "Y", Value::Int(4)),
+                arg(&table, "CGACT", "MERGE", Value::Int(1)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let out = gpu.render_frame(&frame).expect("render");
+    let soft_out = soft.render_frame(&frame);
+
+    let landed = pixel_of(&out.surface, 5, 4);
+    assert_eq!(&landed[..3], &[200, 100, 50], "落点 (5,4) 必须是上层像素");
+    assert_eq!(
+        &pixel_of(&out.surface, 7, 5)[..3],
+        &[200, 100, 50],
+        "落点右下角 (7,5) 必须是上层像素"
+    );
+    let left = pixel_of(&out.surface, 4, 4);
+    assert_eq!(&left[..3], &[10, 20, 30], "落点左侧必须保留下层");
+    let above = pixel_of(&out.surface, 5, 3);
+    assert_eq!(&above[..3], &[10, 20, 30], "落点上侧必须保留下层");
+
+    assert_eq!(
+        max_channel_diff(&out.surface, &soft_out.surface),
+        0,
+        "MERGE 落点必须与 soft 逐字节一致"
+    );
+}
+
+/// `XOR/AND` 与合并族共用落点:X/Y 同样决定上层贴入位置。
+///
+/// 官方同族执行体(REA 0.495 `0x43c1d8`/`0x43c388` 等)都走
+/// `FUN_0043b518` 的四边裁剪,落点口径与 MERGE 一致。这里用 4×4
+/// 下层 + 2×2 上层、落点 `(2,1)` 校验 XOR 只在落点矩形内生效。
+#[test]
+fn xor_lands_upper_at_x_y_offset() {
+    let table = table();
+    let lower = RgbaImage::from_pixel(4, 4, Rgba([0b1100_0000, 0, 0, 255]));
+    let upper = RgbaImage::from_pixel(2, 2, Rgba([0b1010_0000, 0, 0, 255]));
+    let mut lower_png = Vec::new();
+    PngEncoder::new(&mut lower_png)
+        .write_image(lower.as_raw(), 4, 4, ExtendedColorType::Rgba8)
+        .expect("encode lower");
+    let mut upper_png = Vec::new();
+    PngEncoder::new(&mut upper_png)
+        .write_image(upper.as_raw(), 2, 2, ExtendedColorType::Rgba8)
+        .expect("encode upper");
+    let entries = [
+        (b"low.png".as_slice(), lower_png),
+        (b"up.png".as_slice(), upper_png),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(4, 4), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"low".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"UP".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"up".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"UP".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CGACT", "X", Value::Int(2)),
+                arg(&table, "CGACT", "Y", Value::Int(1)),
+                arg(&table, "CGACT", "XOR", Value::Int(1)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let out = gpu.render_frame(&frame).expect("render");
+    let soft_out = soft.render_frame(&frame);
+
+    assert_eq!(
+        pixel_of(&out.surface, 2, 1)[0],
+        0b0110_0000,
+        "落点 (2,1) 必须执行 XOR"
+    );
+    assert_eq!(
+        pixel_of(&out.surface, 3, 2)[0],
+        0b0110_0000,
+        "落点右下角 (3,2) 必须执行 XOR"
+    );
+    assert_eq!(
+        pixel_of(&out.surface, 1, 1)[0],
+        0b1100_0000,
+        "落点左侧必须保持下层"
+    );
+    assert_eq!(
+        pixel_of(&out.surface, 2, 0)[0],
+        0b1100_0000,
+        "落点上侧必须保持下层"
+    );
+    assert_eq!(
+        max_channel_diff(&out.surface, &soft_out.surface),
+        0,
+        "XOR 落点必须与 soft 逐字节一致"
     );
 }
 

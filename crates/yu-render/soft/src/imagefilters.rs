@@ -781,8 +781,10 @@ pub fn apply_merge_layers(
 ///
 /// **勘误(2026-10-31)**:此处曾把落点语义归到官方 `FUN_004405a4`
 /// (0x4405a4)——那是 `EMOTE` 域处理体(依赖 YSEmote.dll),**不是** CGACT
-/// 的 MERGE。落点建模本身仍合理,但目前**没有 RE 锚点**,只剩手册文字与
-/// 像素实测支撑。
+/// 的 MERGE。落点语义的现有证据是脚本用法 + 官方引擎实机对齐:
+/// `es_SPExec.yst` 把差分帧裁成小表面后,用 `CGACT[... X= Y= MERGE=1]` 贴到
+/// 立绘缓冲的部件坐标;忽略 X/Y 时口型会落到画布左上角。详见
+/// `DIV-GFX-086`(手册 `cg/cgact.html` 合并族无页)。
 pub fn apply_merge_at(lower: &mut Texture, upper: &Texture, merge2: bool, dx: i64, dy: i64) {
     apply_merge_at_layers(lower, upper, merge2, dx, dy, 256, 256)
 }
@@ -1202,6 +1204,65 @@ mod tests {
         let mut lower = solid(1, 1, [10, 20, 30, 255]);
         apply_merge(&mut lower, &upper, false);
         assert_eq!(&lower.rgba[0..4], &[200, 100, 50, 255]);
+    }
+
+    /// `CGACT[ID=… ID2=… X=… Y=… MERGE=1]` 的 `X/Y` = 上层落点。
+    ///
+    /// 复刻 `es_SPExec.yst` 的部件合成:41×41 差分帧裁成 `sp.tmp` 后,
+    /// `MERGE` 必须把它贴到画布 `(635,309)`,而不是 `(0,0)`(否则立绘
+    /// 左上角出现错位口型,见 `DIV-GFX-086`)。这里用 8×8 画布 + 3×2
+    /// 小图验证落点、越界裁剪与「未覆盖像素保持原样」。
+    #[test]
+    fn merge_lands_upper_at_offset_and_clips() {
+        let mut lower = solid(8, 8, [10, 20, 30, 255]);
+        let upper = solid(3, 2, [200, 100, 50, 255]);
+        // 落点 (5,4):上层占 (5..8, 4..6),右/下边界完整落在画布内。
+        apply_merge_at_layers(&mut lower, &upper, false, 5, 4, 256, 256);
+        let px = |x: usize, y: usize| {
+            &lower.rgba[(y * 8 + x) * 4..(y * 8 + x) * 4 + 4]
+        };
+        assert_eq!(&px(5, 4)[0..3], &[200, 100, 50], "落点左上角 = 上层像素");
+        assert_eq!(&px(7, 5)[0..3], &[200, 100, 50], "落点右下角");
+        assert_eq!(&px(4, 4)[0..3], &[10, 20, 30], "落点左侧不被覆盖");
+        assert_eq!(&px(7, 3)[0..3], &[10, 20, 30], "落点上侧不被覆盖");
+
+        // 越界裁剪:(7,7) 落点只露出上层 (0,0);其余像素不变。
+        let mut lower = solid(8, 8, [10, 20, 30, 255]);
+        apply_merge_at_layers(&mut lower, &upper, false, 7, 7, 256, 256);
+        let px = |x: usize, y: usize| {
+            &lower.rgba[(y * 8 + x) * 4..(y * 8 + x) * 4 + 4]
+        };
+        assert_eq!(&px(7, 7)[0..3], &[200, 100, 50]);
+        assert_eq!(&px(6, 7)[0..3], &[10, 20, 30]);
+        assert_eq!(&px(7, 6)[0..3], &[10, 20, 30]);
+    }
+
+    /// `XOR/AND` 与合并族共用同一落点:`apply_bitwise_at` 按 `(dx,dy)` 贴入。
+    #[test]
+    fn bitwise_lands_upper_at_offset() {
+        let mut lower = solid(4, 4, [0b1100_0000, 0, 0, 255]);
+        let upper = solid(2, 2, [0b1010_0000, 0, 0, 255]);
+        apply_bitwise_at(&mut lower, &upper, true, 2, 1);
+        let px = |x: usize, y: usize| lower.rgba[(y * 4 + x) * 4];
+        // (2,1) 与 (3,2) 是落点矩形内的 XOR 结果;其余保持 0b1100_0000。
+        assert_eq!(px(2, 1), 0b0110_0000);
+        assert_eq!(px(3, 2), 0b0110_0000);
+        assert_eq!(px(1, 1), 0b1100_0000);
+        assert_eq!(px(2, 0), 0b1100_0000);
+    }
+
+    /// 负落点:上层左上角落在表面外,只写画布内的部分。
+    #[test]
+    fn merge_negative_offset_skips_upper_origin() {
+        let mut lower = solid(4, 4, [10, 20, 30, 255]);
+        let upper = solid(2, 2, [200, 100, 50, 255]);
+        apply_merge_at_layers(&mut lower, &upper, false, -1, -1, 256, 256);
+        let px = |x: usize, y: usize| {
+            &lower.rgba[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4]
+        };
+        // 上层 (1,1) 落到画布 (0,0);上层 (0,0) 被裁掉。
+        assert_eq!(&px(0, 0)[0..3], &[200, 100, 50]);
+        assert_eq!(&px(1, 1)[0..3], &[10, 20, 30]);
     }
 
     /// `XOR/AND` 按位作用在 RGB,alpha 保留下层。

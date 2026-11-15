@@ -1573,28 +1573,29 @@ fn apply_image_pixels(
 
     // ---------------- 两图层合成(MERGE/MERGE2/XOR/AND) ----------------
     if image.action.is_layer_composite() {
-        // `X/Y` 是**落点**语义,不参与源区域解析:合并只覆盖「上层尺寸」那块
-        // 矩形(与 CPU 参考实现 `apply_merge_at` 的循环上界一致)。
+        // `X/Y` 是**落点**语义:上层左上角贴到下层表面的 `(X,Y)`。合并只
+        // 覆盖「上层尺寸 ∩ 下层表面」那块矩形,越界部分原样保留下层 ——
+        // 与 CPU 参考实现 `apply_merge_at_layers`/`apply_bitwise_at` 的
+        // 循环上界一致。
         //
-        // **勘误(2026-10-31)**:此处曾写「官方合并执行体 `FUN_004405a4`
-        // (0x4405a4)按部件位置画、X/Y 不参与对齐」——那是**误记**。
-        // `0x4405a4` 是 `EMOTE` 域的 opcode 处理体(见
-        // `crates/yu-rt/docs/domain-event-contracts.md:177`):入口第一句
-        // 检查 `DAT_00801750`(YSEmote.dll 加载成功标志),它调用的
-        // `DAT_00801458` 是运行时 `GetProcAddress(YSEmote.dll, 0xe9)` 绑定的
-        // E-mote 绘制函数(绑定点 `FUN_004661ec`,PE 0.495)。**CGACT 的
-        // MERGE 不在那里**。CGACT 合并族的 `X/Y` 与 alpha 口径目前**都没有
-        // RE 级证据**,依据只有 ①像素实测(见 `merge.wgsl` 头注的残色泄漏
-        // 约束)②手册 `cg/cgact.html` 例 23/24 的文字。
+        // 证据(REA 0.495):`MERGE` `0x43b33c` / `MERGE2` `0x43b8ec`
+        // 与 XOR/AND 等 4 个同族执行体都以 `X/Y` 为目标落点——`upper.width
+        // + X` 越过下层宽置剪切位 8、`upper.height + Y` 越界置 2、`X<0`
+        // 置 4、`Y<0` 置 1;共享 `FUN_0043b518`(0x43b518)按这些位把目标
+        // 起点夹到 `[0, lower)`、源起点夹到 `[-X, -Y]`、跨度取
+        // `min(upper, lower-X/Y)`,与本 shader 的 `p-(dx,dy)` + 越界返回
+        // 下层同义。
         //
-        // 2b53786 之前 wgpu 的 CPU 合并路径**完全不看 `X/Y`**,直接
-        // `apply_merge` 整面合成。2b53786 引入了「非零即跳过」
-        // (`gfx.imageop.merge.offset.unsupported`)——而语料
-        // `<game>`/`<game-b>` 的合并普遍带非零 `X/Y`(如 `X1*100+2*1`
-        // 这类表达式),于是整条合并被丢弃:前一步 `RECTPAINT3 SET=0`
-        // 清掉的矩形再也没人填回 ⇒ 立绘沿轮廓出现缝隙、眨眼帧眼部留下
-        // 条带。这里恢复 2b 之前的行为:忽略 `X/Y`,整面合成。
-        let _ = (image.x, image.y);
+        // 脚本侧:`es_SPExec.yst` 先把差分帧 `SIZE` 裁成 41×41 的 `sp.tmp`,
+        // 再 `CGACT[ID=sp.tmp ID2=<立绘缓冲> X=635 Y=309 MERGE=1]`;落点被
+        // 忽略时口型帧会贴到画布 `(0,0)`,在屏幕左上角露出错位碎片。
+        // 手册合并族无页(`DIV-GFX-086`)。
+        //
+        // 2b53786 曾把「带非零 X/Y 的合并」整条跳过;之后为救
+        // `RECTPAINT3 SET=0` 的补洞改成「忽略 X/Y、整面合成」——那是把
+        // 定位语义整个丢了。现在按落点贴入,两边都满足。
+        let dx = image.x.map_or(0, |v| v.round() as i32);
+        let dy = image.y.map_or(0, |v| v.round() as i32);
         // 下层 = 目标层**当前**表面。清空是否可见由 alpha 的混合口径决定
         // (见 `merge.wgsl` 头注)。
         let lower_content = match contents.get(target).cloned() {
@@ -1654,6 +1655,8 @@ fn apply_image_pixels(
                         &upper_content.tex.view,
                         src_la,
                         256,
+                        dx,
+                        dy,
                     )
                     .map_err(|diag| diag.code.to_string())?,
                 AuxPipeline::LayerMerge,
@@ -1677,6 +1680,8 @@ fn apply_image_pixels(
                     mode,
                     src_la,
                     dst_la,
+                    dx,
+                    dy,
                 )
                 .map_err(|diag| diag.code.to_string())?;
             (bg, AuxPipeline::Composite)
