@@ -551,15 +551,24 @@ fn apply_image_op(
     // 软后端是**整数像素**参考实现(`scale_region` 逐 texel 重采样),区域
     // 在这里显式取整。产品路径(wgpu)保留浮点并用 UV 子矩形做亚像素采样
     // —— 精灵系统的位置小数部分正是靠那条路径才不抖。
-    let region = match (image.x, image.y, image.x2, image.y2) {
-        (Some(x), Some(y), Some(x2), Some(y2)) => Some((
-            x.round() as i64,
-            y.round() as i64,
-            x2.round() as i64,
-            y2.round() as i64,
-        )),
-        (None, None, None, None) => None,
-        _ => return Err("gfx.imageop.region.partial".to_string()),
+    // 过渡族的 `X/Y` 是**落点**,不是源区域;`X2/Y2` 官方也不读
+    // (`0x43bad0`/`0x43bca0` 只取 X/Y),因此不参与区域解析。
+    let region = if matches!(
+        &image.action,
+        ImageAction::Other("transition" | "transition2")
+    ) {
+        None
+    } else {
+        match (image.x, image.y, image.x2, image.y2) {
+            (Some(x), Some(y), Some(x2), Some(y2)) => Some((
+                x.round() as i64,
+                y.round() as i64,
+                x2.round() as i64,
+                y2.round() as i64,
+            )),
+            (None, None, None, None) => None,
+            _ => return Err("gfx.imageop.region.partial".to_string()),
+        }
     };
     if image.action.is_scale() {
         let (Some(dw), Some(dh)) = (image.sx, image.sy) else {
@@ -710,7 +719,14 @@ fn apply_image_op(
     }
     // `TRANSITION`:两源线性插值写成目标层。源是 `image.source` /
     // `image.source2`,与「目标层旧像素」无关,因此不走下面的 in-place 路径。
-    if matches!(&image.action, ImageAction::Other("transition")) {
+    //
+    // 无 `X/Y`(语料唯一形态)= 旧路径:整层 lerp、画布取 `to` 尺寸。
+    // 带 `X/Y` 或 `TRANSITION2` = 官方落点形态:只写目标层求交矩形,
+    // 矩形外保留目标旧像素(REA `FUN_0043b518`)。
+    if matches!(&image.action, ImageAction::Other("transition"))
+        && image.x.is_none()
+        && image.y.is_none()
+    {
         let from_id = &image.source;
         let to_id = image
             .source2
@@ -741,6 +757,81 @@ fn apply_image_op(
         );
         st.texture_overrides
             .insert(target.clone(), Rc::new(blended));
+        return Ok(());
+    }
+    if matches!(
+        &image.action,
+        ImageAction::Other("transition" | "transition2")
+    ) {
+        let from_id = &image.source;
+        let to_id = image
+            .source2
+            .as_ref()
+            .ok_or_else(|| "gfx.imageop.source.missing".to_string())?;
+        let is_t2 = matches!(&image.action, ImageAction::Other("transition2"));
+        let mask_id = if is_t2 {
+            Some(
+                image
+                    .source3
+                    .as_ref()
+                    .ok_or_else(|| "gfx.imageop.source.missing".to_string())?,
+            )
+        } else {
+            None
+        };
+        let from = layer_surface(
+            textures,
+            snapshots,
+            frame,
+            from_id,
+            st,
+            image.source_texture.as_ref(),
+        )?;
+        let to = layer_surface(textures, snapshots, frame, to_id, st, None)?;
+        let from = crate::texture::Texture {
+            width: from.width,
+            height: from.height,
+            rgba: from.rgba,
+        };
+        let to = crate::texture::Texture {
+            width: to.width,
+            height: to.height,
+            rgba: to.rgba,
+        };
+        // 目标底面:官方只写求交矩形,矩形外必须是目标旧像素。目标也是源
+        // (自过渡)时不能摘掉 override,否则源读到的不是当前表面。
+        let target_is_source =
+            target == from_id || target == to_id || mask_id.is_some_and(|id| target == id);
+        let base = if target_is_source {
+            match st.texture_overrides.get(target) {
+                Some(texture) => (**texture).clone(),
+                None => base_texture(textures, snapshots, frame, target, target_fallback)?,
+            }
+        } else {
+            match st.texture_overrides.remove(target) {
+                Some(texture) => {
+                    Rc::try_unwrap(texture).unwrap_or_else(|rc| (*rc).clone())
+                }
+                None => base_texture(textures, snapshots, frame, target, target_fallback)?,
+            }
+        };
+        let dx = image.x.map_or(0, |v| v.round() as i64);
+        let dy = image.y.map_or(0, |v| v.round() as i64);
+        let out = if let Some(mask_id) = mask_id {
+            let mask = layer_surface(textures, snapshots, frame, mask_id, st, None)?;
+            let mask = crate::texture::Texture {
+                width: mask.width,
+                height: mask.height,
+                rgba: mask.rgba,
+            };
+            let set = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
+            let set2 = image.set2.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
+            crate::imageop::transition2_into(base, &from, &to, &mask, dx, dy, set, set2)
+        } else {
+            let blend = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
+            crate::imageop::transition_into(base, &from, &to, dx, dy, blend)
+        };
+        st.texture_overrides.insert(target.clone(), Rc::new(out));
         return Ok(());
     }
     // (MERGE/MERGE2/XOR/AND 在函数入口已按绘制偏移处理,不会走到这里。)

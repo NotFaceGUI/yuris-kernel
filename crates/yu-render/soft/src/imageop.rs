@@ -535,6 +535,193 @@ pub fn blend_transition(from: &Texture, to: &Texture, blend: i64) -> Texture {
     }
 }
 
+/// `TRANSITION` 带落点 `(dx,dy)` 的官方形态:把两源 lerp **只写进**
+/// `base` 的求交矩形,矩形外保留 `base` 旧像素。
+///
+/// 几何与合并族同源(`FUN_0043b518`):目标起点 `(dx,dy)`、源起点 `(0,0)`、
+/// 跨度 = `from` 尺寸 ∩ `base`。`from` 尺寸决定写入区域(官方循环上界),
+/// `to` 越界按透明。
+pub fn transition_into(
+    base: Texture,
+    from: &Texture,
+    to: &Texture,
+    dx: i64,
+    dy: i64,
+    blend: i64,
+) -> Texture {
+    let dx = dx.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+    let dy = dy.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+    let mut out = base;
+    let (x_start, y_start, x_end, y_end, ux0, _uy0) = transition_rect(&out, from, dx, dy);
+    if x_start >= x_end || y_start >= y_end {
+        return out;
+    }
+    let k = (blend.clamp(0, 255) as u32) + 1;
+    let (tw, th) = (to.width as i64, to.height as i64);
+    let out_stride = out.width as usize * 4;
+    let from_stride = from.width as usize * 4;
+    let to_stride = to.width as usize * 4;
+    for ty in y_start..y_end {
+        let sy = (ty - dy) as usize;
+        let fx0 = ux0;
+        let from_row = &from.rgba[sy * from_stride + fx0 * 4..][..(x_end - x_start) as usize * 4];
+        for i in 0..(x_end - x_start) as usize {
+            let sx = fx0 as i64 + i as i64;
+            let mut px_to = [0u8; 4];
+            if sx < tw && (sy as i64) < th {
+                let ti = sy * to_stride + (sx as usize) * 4;
+                px_to.copy_from_slice(&to.rgba[ti..ti + 4]);
+            }
+            let fi = i * 4;
+            let mut px_from = [0u8; 4];
+            px_from.copy_from_slice(&from_row[fi..fi + 4]);
+            let px = lerp_weighted(px_from, px_to, k);
+            let di = (ty as usize) * out_stride + ((x_start as usize) + i) * 4;
+            out.rgba[di..di + 4].copy_from_slice(&px);
+        }
+    }
+    out
+}
+
+/// `TRANSITION2`(官方 `0x43bca0`):三源 + 遮罩的逐像素过渡,结果只写
+/// `base` 的求交矩形。
+///
+/// - `SET=0` → 原样拷贝源 A(`from`);`SET>=255` → 拷贝源 B(`to`);
+/// - 中间值:遮罩字节(内存序 BGRA 的 **B** 通道,即 RGBA 的蓝通道)查
+///   256 项权重表;`w<2` 取源 B,否则
+///   `out[c] = B[c] - ((B[c]-A[c])·w >> 8)`(8 位回绕,官方 `FUN_0043c008`)。
+/// - `SET2=256` 为硬阈值(遮罩 < SET 取 B,其余取 A);其余按
+///   `FUN_0043c110` 的整数式生成渐变表。
+#[allow(clippy::too_many_arguments)]
+pub fn transition2_into(
+    base: Texture,
+    from: &Texture,
+    to: &Texture,
+    mask: &Texture,
+    dx: i64,
+    dy: i64,
+    set: i64,
+    set2: i64,
+) -> Texture {
+    let dx = dx.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+    let dy = dy.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+    let mut out = base;
+    let (x_start, y_start, x_end, y_end, ux0, _uy0) = transition_rect(&out, from, dx, dy);
+    if x_start >= x_end || y_start >= y_end {
+        return out;
+    }
+    let set = set.clamp(0, 255);
+    let out_stride = out.width as usize * 4;
+    let from_stride = from.width as usize * 4;
+    let to_stride = to.width as usize * 4;
+    let mask_stride = mask.width as usize * 4;
+    let table = transition2_weight_table(256 - set as i32, set2);
+    let copy_from = set == 0;
+    let copy_to = set >= 255;
+    for ty in y_start..y_end {
+        let sy = (ty - dy) as usize;
+        let w = (x_end - x_start) as usize;
+        let frow = &from.rgba[sy * from_stride + ux0 * 4..][..w * 4];
+        // 官方按三源同尺寸读;尺寸不一致时源 B/遮罩越界按零,且必须按
+        // **源坐标**判断,不能把 `ux0` 一段直接切进行缓冲(会读到下一行)。
+        let trow = if sy < to.height as usize && ux0 < to.width as usize {
+            let start = sy * to_stride + ux0 * 4;
+            let avail = (to.width as usize - ux0) * 4;
+            Some(&to.rgba[start..start + avail.min(w * 4)])
+        } else {
+            None
+        };
+        let mrow = if sy < mask.height as usize && ux0 < mask.width as usize {
+            let start = sy * mask_stride + ux0 * 4;
+            let avail = (mask.width as usize - ux0) * 4;
+            Some(&mask.rgba[start..start + avail.min(w * 4)])
+        } else {
+            None
+        };
+        for i in 0..w {
+            let fi = i * 4;
+            let mut px_a = [0u8; 4];
+            px_a.copy_from_slice(&frow[fi..fi + 4]);
+            let mut px_b = [0u8; 4];
+            if let Some(row) = trow {
+                if fi + 4 <= row.len() {
+                    px_b.copy_from_slice(&row[fi..fi + 4]);
+                }
+            }
+            let px = if copy_from {
+                px_a
+            } else if copy_to {
+                px_b
+            } else {
+                let mb = mrow
+                    .and_then(|row| (fi + 4 <= row.len()).then(|| row[fi + 2]))
+                    .unwrap_or(0);
+                transition2_pixel(px_a, px_b, table[mb as usize])
+            };
+            let di = (ty as usize) * out_stride + ((x_start as usize) + i) * 4;
+            out.rgba[di..di + 4].copy_from_slice(&px);
+        }
+    }
+    out
+}
+
+/// 落点求交:返回目标矩形 `[x_start,x_end) × [y_start,y_end)` 与源起点。
+fn transition_rect(
+    base: &Texture,
+    from: &Texture,
+    dx: i64,
+    dy: i64,
+) -> (i64, i64, i64, i64, usize, usize) {
+    let x_start = dx.max(0);
+    let y_start = dy.max(0);
+    let x_end = dx
+        .saturating_add(i64::from(from.width))
+        .min(i64::from(base.width));
+    let y_end = dy
+        .saturating_add(i64::from(from.height))
+        .min(i64::from(base.height));
+    let ux0 = (x_start - dx) as usize;
+    let uy0 = (y_start - dy) as usize;
+    (x_start, y_start, x_end.max(x_start), y_end.max(y_start), ux0, uy0)
+}
+
+/// `FUN_0043c110`:256 项遮罩权重表,值域 1..=256。
+fn transition2_weight_table(k: i32, set2: i64) -> [i32; 256] {
+    let s2 = set2.clamp(0, 256) as i32;
+    let mut table = [0i32; 256];
+    if s2 == 256 {
+        // 硬阈值:遮罩 < SET(=256-k) 取源 B(0),其余取源 A(256)。
+        let set = 256 - k;
+        for (j, w) in table.iter_mut().enumerate() {
+            *w = if (j as i32) < set { 0 } else { 256 };
+        }
+        return table;
+    }
+    let mut acc = 0i32;
+    for w in table.iter_mut() {
+        let mut v = (acc >> 1) + ((s2 >> 1) * k) + (s2 * -128) + k;
+        if v > 255 {
+            v = 255;
+        }
+        *w = v + 1;
+        acc = acc.wrapping_add(s2);
+    }
+    table
+}
+
+/// 单像素:官方 `FUN_0043c008` 的整数式(8 位回绕,不 clamp)。
+fn transition2_pixel(a: [u8; 4], b: [u8; 4], w: i32) -> [u8; 4] {
+    if w < 2 {
+        return b;
+    }
+    let mut out = [0u8; 4];
+    for c in 0..4 {
+        let v = i32::from(b[c]) - (((i32::from(b[c]) - i32::from(a[c])) * w) >> 8);
+        out[c] = v as u8;
+    }
+    out
+}
+
 #[cfg(test)]
 mod blend_tests {
     use super::*;
@@ -545,6 +732,10 @@ mod blend_tests {
             height: h,
             rgba: px.iter().copied().cycle().take((w * h * 4) as usize).collect(),
         }
+    }
+
+    fn solid(w: u32, h: u32, px: [u8; 4]) -> Texture {
+        tex(w, h, px)
     }
 
     /// 权重 = `SET+1`(官方 `0x43bad0` 的 `iVar6 + 1`),范围 [1, 256]。
@@ -701,6 +892,100 @@ mod blend_tests {
                 "case {case} (to {tw}x{th}, from {fw}x{fh}, blend {blend})"
             );
         }
+    }
+
+    /// `TRANSITION` 带落点:只写求交矩形,矩形外保留目标旧像素。
+    #[test]
+    fn transition_into_writes_only_anchored_rect() {
+        let base = solid(4, 4, [10, 20, 30, 255]);
+        let from = solid(2, 2, [0, 0, 0, 255]);
+        let to = solid(2, 2, [200, 100, 50, 255]);
+        // SET=255 ⇒ k=256,矩形内逐位等于 to。
+        let out = transition_into(base.clone(), &from, &to, 1, 1, 255);
+        let px = |x: usize, y: usize| {
+            let i = (y * 4 + x) * 4;
+            &out.rgba[i..i + 4]
+        };
+        assert_eq!(px(1, 1), &[200, 100, 50, 255]);
+        assert_eq!(px(2, 2), &[200, 100, 50, 255]);
+        assert_eq!(px(0, 0), &[10, 20, 30, 255], "矩形外保持目标旧像素");
+        assert_eq!(px(3, 3), &[10, 20, 30, 255]);
+        // 负落点 + 越界:只写实际交集,源从 (-dx,-dy) 起。
+        let out = transition_into(base.clone(), &from, &to, -1, -1, 255);
+        let px = |x: usize, y: usize| {
+            let i = (y * 4 + x) * 4;
+            &out.rgba[i..i + 4]
+        };
+        assert_eq!(px(0, 0), &[200, 100, 50, 255], "源 (1,1) 落到目标 (0,0)");
+        assert_eq!(px(3, 0), &[10, 20, 30, 255], "矩形外不动");
+    }
+
+    /// `TRANSITION2` 端点:`SET=0` 拷贝源 A,`SET>=255` 拷贝源 B。
+    #[test]
+    fn transition2_endpoints_copy_sources() {
+        let base = solid(2, 2, [1, 2, 3, 4]);
+        let from = solid(2, 2, [200, 0, 0, 255]);
+        let to = solid(2, 2, [0, 100, 0, 128]);
+        let mask = solid(2, 2, [0, 0, 0, 255]);
+        let a = transition2_into(base.clone(), &from, &to, &mask, 0, 0, 0, 256);
+        assert_eq!(&a.rgba[0..4], &[200, 0, 0, 255]);
+        let b = transition2_into(base.clone(), &from, &to, &mask, 0, 0, 255, 256);
+        assert_eq!(&b.rgba[0..4], &[0, 100, 0, 128]);
+    }
+
+    /// `TRANSITION2` 硬阈值(`SET2=256`):遮罩蓝通道 < SET 取源 B,
+    /// 否则取源 A;`SET=128` 时阈值 128。
+    #[test]
+    fn transition2_hard_threshold_uses_mask_blue() {
+        let base = solid(2, 1, [0, 0, 0, 0]);
+        let from = solid(2, 1, [200, 0, 0, 255]);
+        let to = solid(2, 1, [0, 100, 0, 255]);
+        // RGBA 蓝通道:0 与 255。
+        let mask = Texture {
+            width: 2,
+            height: 1,
+            rgba: vec![0, 0, 0, 255, 0, 0, 255, 255],
+        };
+        let out = transition2_into(base.clone(), &from, &to, &mask, 0, 0, 128, 256);
+        assert_eq!(&out.rgba[0..4], &[0, 100, 0, 255], "mask=0 → 源 B");
+        assert_eq!(&out.rgba[4..8], &[200, 0, 0, 255], "mask=255 → 源 A");
+    }
+
+    /// `SET2=0` 退化为均匀混合:权重 `k+1` 与遮罩无关。
+    #[test]
+    fn transition2_zero_contrast_is_uniform_blend() {
+        let a = [200u8, 0, 0, 255];
+        let b = [0u8, 100, 0, 255];
+        let table = transition2_weight_table(128, 0); // SET=128 ⇒ k=128
+        assert_eq!(table[0], 129);
+        assert_eq!(table[255], 129);
+        let out = transition2_pixel(a, b, table[0]);
+        // 129/256 偏向源 A。
+        assert_eq!(out[0], 101);
+        assert_eq!(out[1], 50);
+    }
+
+    /// 源 B/遮罩比源 A 窄时,源坐标越界必须按零,不能读到下一行。
+    #[test]
+    fn transition2_pads_narrow_b_and_mask_with_zero() {
+        let base = solid(2, 1, [9, 9, 9, 255]);
+        let from = solid(3, 1, [100, 110, 120, 255]);
+        // 宽 1、高 2:第二行是干扰行;源坐标 x=1 越界时必须取零。
+        let to = Texture {
+            width: 1,
+            height: 2,
+            rgba: vec![10, 20, 30, 255, 200, 250, 240, 255],
+        };
+        let mask = Texture {
+            width: 1,
+            height: 2,
+            rgba: vec![0, 0, 255, 255, 0, 0, 255, 255],
+        };
+        // dx=-1 ⇒ 目标 x=0 对应源 x=1;B 宽 1 ⇒ 越界零。
+        // SET=255 ⇒ 端点直拷源 B。
+        let out = transition2_into(base, &from, &to, &mask, -1, 0, 255, 0);
+        assert_eq!(&out.rgba[0..4], &[0, 0, 0, 0], "越界 B 取零,不能读第二行");
+        assert_eq!(&out.rgba[4..8], &[0, 0, 0, 0], "源 x=2 同样越界");
     }
 }
 
