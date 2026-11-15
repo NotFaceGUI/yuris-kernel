@@ -14751,3 +14751,89 @@ BUILD_TYPE=release tools/android/build.sh arm64-v8a
 
 - 真机点验(任意目录都能选中、跑不了的游戏在启动时把内核错误显示到状态栏)
   由主人自行完成。
+
+## 成果 GFX-MERGE-OFFSET (2026-11-15) · MERGE/MERGE2 的 X/Y 按落点贴入,修立绘差分贴到画布左上角
+
+### 1. 问题
+
+v474 商业样本推进剧情、角色开口时,画面左上角出现 41×41 的嘴部碎片。
+逐像素核对(1280×720 单帧):
+
+```text
+帧 (0,0)-(40,40) 与 obj/rio/rio_n_kuti1.png 顶部 41 行  MAE = 0.00
+帧第 41 行以下与背景 bg1a.png                        MAE = 0.02(完全等于背景)
+```
+
+即口型差分的第一帧被原尺寸贴在屏幕 `(0,0)`。
+
+### 2. 根因
+
+`obj/rio/rio_n_kuti1.png` = 3 帧 × 41×41 的口型条;`yst00162` 定义该部件
+应贴在立绘画布 `(635,309)`。`es_SPExec.yst`(s35)的部件合成:
+
+```text
+pc110  CG      [ID=sp.tmp  FILE=<差分条>]
+pc111  CGACT   [ID=sp.tmp  SIZE=1 SX/SY=<帧尺寸> X/Y/X2/Y2=<帧区域>]
+pc115  CGACT   [ID=sp.tmp  ID2=<立绘缓冲> X=635 Y=309 MERGE=1]
+```
+
+`MERGE` 的 `X/Y` 是落点。本内核两个后端都丢弃了它:
+
+```text
+crates/yu-render/soft/src/render.rs:472   let _ = (image.x, image.y);
+crates/yu-render/wgpu/src/plan.rs:1597    let _ = (image.x, image.y);
+```
+
+soft 走 `apply_merge_layers`、wgpu 全屏 draw,统一按 `(0,0)` 整面合成。
+立绘画布 1280×720、内容居中,左上角透明 ⇒ 唯一可见的就是贴错位的口型帧。
+历史原因:2b53786 把「带非零 X/Y 的合并」整条跳过(`RECTPAINT3 SET=0`
+补洞失败),之后改成「忽略 X/Y、整面合成」,把定位语义丢掉了。
+手册 `cg/cgact.html` 合并族无示例页 ⇒ 按脚本用法 + 官方引擎实机对齐取证,
+记 `fixed(no-manual)`,档案 `docs/divergences/DIV-GFX-086-merge-landing-offset.md`。
+
+补证(REA 0.495,sha256 `4f5eefa3…`):`MERGE` `0x43b33c` / `MERGE2`
+`0x43b8ec` 入口按 `upper.width+X`、`upper.height+Y`、`X<0`、`Y<0` 计算四边
+剪切位(8/2/4/1),再调共享 `FUN_0043b518` 设置目标起点 `(X,Y)`(夹到
+`[0,lower)`)、源起点 `(-X,-Y)` 与跨度;同一函数还有 `0x43bad0`/`0x43bca0`/
+`0x43c1d8`/`0x43c388` 四个同族调用点(XOR/AND 等)。X/Y = 落点在 RE 层
+确认,非仅行为推断。
+
+### 3. 改法
+
+- soft:`apply_merge_at_layers(..., dx, dy, ...)` / `apply_bitwise_at(..., dx, dy)`
+  (`crates/yu-render/soft/src/render.rs`);MERGE/MERGE2/XOR/AND 同走落点,
+  `MID`(mode 3)记录时无 X/Y,行为不变。
+- wgpu:`merge.wgsl` / `composite.wgsl` 的 uniform 增加 `dx/dy`,
+  目标像素 `p` 采样上层 `p-(dx,dy)`,落点外原样返回下层;
+  `pipelines.rs` 的两个 bind group 透传 offset。
+- 结果尺寸仍为下层表面;越界按「上层矩形 ∩ 下层表面」裁剪,
+  与 CPU 参考实现一致。
+
+### 4. 验证(原始结果)
+
+```bash
+cargo test -p yu-backend-soft merge
+  → 11 passed; 0 failed
+    (含新增 merge_lands_upper_at_offset_and_clips /
+     merge_negative_offset_skips_upper_origin)
+cargo test -p yu-backend-soft bitwise_lands_upper_at_offset
+  → 1 passed; 0 failed
+cargo test -p yu-backend-wgpu --test surfaces lands_upper
+  → 2 passed; 0 failed
+    (merge_lands_upper_at_x_y_offset / xor_lands_upper_at_x_y_offset)
+cargo test -p yu-backend-wgpu --test surfaces -- --test-threads=1
+  → 29 passed; 0 failed(含上述两条、sixty_frame_scene_matches_soft)
+cargo test -p yu-backend-soft -p yu-backend-wgpu -- --test-threads=1
+  → soft 63+26+2+2;wgpu 16+0(1 ignored)+29+39+1;doc test 1+1,全部 ok
+cargo test -p yu-gfx
+  → 15+5+10+4+1+4+7+4(1 ignored)+21+16+11+33+2+2+17+9+7+10+2,全部 ok
+cargo test -p yu-backend-wgpu --test wgsl_check
+  → shaders_parse ... ok
+cargo build --workspace --all-targets
+  → Finished dev profile(本机需 CL=-utf-8;见下)
+```
+
+- 本机环境备注:`cargo` 源路径含非 ASCII(`C:\Users\鬼\...`),cc-rs 生成的
+  `mimalloc-static.cc` 用系统代码页 936 编译会 C1083;构建前设
+  `CL=-utf-8` 即可(不是本轮代码问题)。
+- 实机复验(同一剧情左上角碎片消失、口型回到脸上)待主人点验。
