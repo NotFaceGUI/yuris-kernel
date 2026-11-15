@@ -1522,11 +1522,18 @@ fn draw_transition(
     };
     // 引擎取样的是图层**当前像素**(EVID-T-05):脚本可能先对配对层做
     // `CGACT[REVERSE]` 等加工,因此优先用该层的图像加工覆盖纹理。
+    // 空白 1×1 没有覆盖纹理时按**图层 `fill`**(`RECTPAINT*` 实色)取色;
+    // 无 `fill` 才用直接绘制口径的黑 —— 与 wgpu 的 `resolve_ref` 一致。
+    let layer_fill = |id: Option<&yu_gfx::LayerId>| {
+        id.and_then(|id| frame.layers.iter().find(|l| &l.id == id))
+            .and_then(|l| l.fill)
+    };
     let from = match resolve_source_with_override(
         textures,
         snapshots,
         st,
         transition.from_layer.as_ref(),
+        layer_fill(transition.from_layer.as_ref()),
         &transition.from,
     ) {
         Ok(image) => image,
@@ -1538,11 +1545,19 @@ fn draw_transition(
     // 官方 `YS_Texture2` 取配对层**基图**(层 `+0x21c`),不是 `CGACT`
     // 加工表面(`+0x90`)。脚本对遮罩缓冲做的 `REVERSE` 等显示加工不进入
     // 转场,因此优先用 gfx 追溯出的 `to_base`;没有基图时才回退加工表面。
+    let mask_fill = layer_fill(transition.to_layer.as_ref());
     let mask = match transition.to_base.as_ref() {
-        Some(base) => resolve_source_with_override(textures, snapshots, st, None, base),
-        None => {
-            resolve_source_with_override(textures, snapshots, st, transition.to_layer.as_ref(), to)
+        Some(base) => {
+            resolve_source_with_override(textures, snapshots, st, None, mask_fill, base)
         }
+        None => resolve_source_with_override(
+            textures,
+            snapshots,
+            st,
+            transition.to_layer.as_ref(),
+            mask_fill,
+            to,
+        ),
     };
     let mask = match mask {
         Ok(image) => image,
@@ -1610,6 +1625,7 @@ fn resolve_source_with_override(
     snapshots: &Snapshots,
     st: &RenderState,
     layer: Option<&LayerId>,
+    fill: Option<[u8; 4]>,
     texture: &TextureRef,
 ) -> Result<OwnedImage, String> {
     if let Some(id) = layer {
@@ -1621,13 +1637,14 @@ fn resolve_source_with_override(
             });
         }
     }
-    resolve_source(textures, snapshots, st, texture)
+    resolve_source(textures, snapshots, st, fill, texture)
 }
 
 fn resolve_source(
     textures: &mut TextureStore,
     snapshots: &Snapshots,
     st: &RenderState,
+    fill: Option<[u8; 4]>,
     texture: &TextureRef,
 ) -> Result<OwnedImage, String> {
     match texture {
@@ -1647,10 +1664,13 @@ fn resolve_source(
                 rgba: texture.rgba.clone(),
             })
             .map_err(|diag| diag.code.to_string()),
+        // 直接绘制/过渡取样口径:空白 1×1 呈黑;`fill`(`RECTPAINT*` 实色)
+        // 优先。像素运算源的透明口径在 `solid_fill_texture`,不要混用
+        // (DIV-GFX-085)。
         TextureRef::SolidBlack1x1 => Ok(OwnedImage {
             width: 1,
             height: 1,
-            rgba: SOLID_BLACK.to_vec(),
+            rgba: fill.unwrap_or(SOLID_BLACK_PX).to_vec(),
         }),
         TextureRef::Snapshot(copy_id) => snapshots
             .get(copy_id)
@@ -1880,10 +1900,6 @@ fn draw_layer(
         TextureRef::None => st.skip_op(op, "texture.none"),
     }
 }
-
-/// `CG[FILE=""]` 的 1×1 表面像素:**全 0**(含 alpha)。
-/// 证据 REA 0.495 `0x40c5f8` 分支四字节全写 0;DIV-GFX-060 结案。
-const SOLID_BLACK: &[u8] = &SOLID_BLACK_PX;
 
 struct RenderState<'a> {
     offscreens: BTreeMap<LayerId, Surface>,
