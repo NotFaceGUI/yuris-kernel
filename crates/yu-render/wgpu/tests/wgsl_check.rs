@@ -7,6 +7,10 @@ fn shaders_parse() {
         ("transform", include_str!("../src/shaders/transform.wgsl")),
         ("composite", include_str!("../src/shaders/composite.wgsl")),
         ("resample", include_str!("../src/shaders/resample.wgsl")),
+        (
+            "transition",
+            include_str!("../src/shaders/transition.wgsl"),
+        ),
     ] {
         let module = naga::front::wgsl::parse_str(source);
         if let Err(err) = module {

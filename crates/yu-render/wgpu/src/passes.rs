@@ -79,6 +79,8 @@ pub(crate) enum AuxPipeline {
     Composite,
     /// `CGACT[TRANSITION]` 双源整数 lerp。
     Lerp,
+    /// 带落点的 `TRANSITION` / `TRANSITION2`(base + 两/三源)。
+    Transition,
     /// 逐层原地滤镜(REVERSE/镜像/MEIDO/SAIDO/AKARUSA/MONO/SEPIA/MOSAIC/ROTATION)。
     Transform,
     /// 区域重采样(物化 `SIZE` 的采样窗)。

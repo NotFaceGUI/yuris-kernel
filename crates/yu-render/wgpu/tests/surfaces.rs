@@ -54,9 +54,12 @@ fn table() -> ParamTable {
                     "ID",
                     "ID2",
                     "ID3",
+                    "ID4",
                     "TRANSITION",
+                    "TRANSITION2",
                     "COPY2",
                     "SET",
+                    "SET2",
                     "X",
                     "Y",
                     "X2",
@@ -139,10 +142,18 @@ fn state(viewport: Viewport, clear: [u8; 4]) -> GfxState {
 }
 
 fn png_bytes_for(width: u32, height: u32, color: Rgba<u8>) -> Vec<u8> {
-    let image = RgbaImage::from_pixel(width, height, color);
+    png_of(&RgbaImage::from_pixel(width, height, color))
+}
+
+fn png_of(image: &RgbaImage) -> Vec<u8> {
     let mut out = Vec::new();
     PngEncoder::new(&mut out)
-        .write_image(image.as_raw(), width, height, ExtendedColorType::Rgba8)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            ExtendedColorType::Rgba8,
+        )
         .expect("encode fixture");
     out
 }
@@ -1449,6 +1460,282 @@ fn xor_lands_upper_at_x_y_offset() {
         max_channel_diff(&out.surface, &soft_out.surface),
         0,
         "XOR 落点必须与 soft 逐字节一致"
+    );
+}
+
+/// 带落点的 `TRANSITION`:只写目标层的求交矩形,矩形外保留底面。
+///
+/// REA:`0x43bad0` → `FUN_0043b518`(目标起点 X/Y、源起点 0、跨度裁到目标)。
+#[test]
+fn transition_anchored_matches_soft() {
+    let table = table();
+    let low = RgbaImage::from_pixel(8, 8, Rgba([10, 20, 30, 255]));
+    let from = RgbaImage::from_pixel(3, 2, Rgba([200, 30, 20, 255]));
+    let to = RgbaImage::from_pixel(3, 2, Rgba([20, 180, 40, 255]));
+    let entries = [
+        (b"low.png".as_slice(), png_of(&low)),
+        (b"from.png".as_slice(), png_of(&from)),
+        (b"to.png".as_slice(), png_of(&to)),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"low".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"FROM".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"from".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"TO".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"to".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"FROM".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"TO".to_vec())),
+                arg(&table, "CGACT", "ID3", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CGACT", "TRANSITION", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(128)),
+                arg(&table, "CGACT", "X", Value::Int(5)),
+                arg(&table, "CGACT", "Y", Value::Int(4)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let out = gpu.render_frame(&frame).expect("render");
+    let soft_out = soft.render_frame(&frame);
+
+    let landed = pixel_of(&out.surface, 5, 4);
+    assert_ne!(
+        &landed[..3],
+        &[10, 20, 30],
+        "落点内必须是过渡结果,不是底面"
+    );
+    assert_eq!(
+        &pixel_of(&out.surface, 4, 4)[..3],
+        &[10, 20, 30],
+        "落点左侧保留底面"
+    );
+    assert_eq!(
+        &pixel_of(&out.surface, 5, 3)[..3],
+        &[10, 20, 30],
+        "落点上侧保留底面"
+    );
+    assert_eq!(
+        max_channel_diff(&out.surface, &soft_out.surface),
+        0,
+        "带落点 TRANSITION 必须与 soft 逐字节一致"
+    );
+}
+
+/// `TRANSITION2`:遮罩硬阈值(`SET2=256`)决定逐像素取源 A/源 B。
+#[test]
+fn transition2_masked_matches_soft() {
+    let table = table();
+    let low = RgbaImage::from_pixel(8, 8, Rgba([10, 20, 30, 255]));
+    let from = RgbaImage::from_pixel(4, 2, Rgba([200, 30, 20, 255]));
+    let to = RgbaImage::from_pixel(4, 2, Rgba([20, 180, 40, 255]));
+    // 遮罩蓝通道:前两列 0,后两列 255(官方读内存序 BGRA 的 B)。
+    let mut mask = RgbaImage::from_pixel(4, 2, Rgba([0, 0, 0, 255]));
+    for y in 0..2 {
+        for x in 2..4 {
+            mask.put_pixel(x, y, Rgba([0, 0, 255, 255]));
+        }
+    }
+    let entries = [
+        (b"low.png".as_slice(), png_of(&low)),
+        (b"from.png".as_slice(), png_of(&from)),
+        (b"to.png".as_slice(), png_of(&to)),
+        (b"mask.png".as_slice(), png_of(&mask)),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"low".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"FROM".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"from".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"TO".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"to".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"MASK".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"mask".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"FROM".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"TO".to_vec())),
+                arg(&table, "CGACT", "ID3", Value::Str(b"MASK".to_vec())),
+                arg(&table, "CGACT", "ID4", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CGACT", "TRANSITION2", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(128)),
+                arg(&table, "CGACT", "SET2", Value::Int(256)),
+                arg(&table, "CGACT", "X", Value::Int(2)),
+                arg(&table, "CGACT", "Y", Value::Int(3)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let out = gpu.render_frame(&frame).expect("render");
+    let soft_out = soft.render_frame(&frame);
+
+    assert_eq!(
+        &pixel_of(&out.surface, 2, 3)[..3],
+        &[20, 180, 40],
+        "遮罩 0 → 源 B"
+    );
+    assert_eq!(
+        &pixel_of(&out.surface, 4, 3)[..3],
+        &[200, 30, 20],
+        "遮罩 255 → 源 A"
+    );
+    assert_eq!(
+        &pixel_of(&out.surface, 1, 3)[..3],
+        &[10, 20, 30],
+        "矩形外保留底面"
+    );
+    assert_eq!(
+        max_channel_diff(&out.surface, &soft_out.surface),
+        0,
+        "TRANSITION2 必须与 soft 逐字节一致"
+    );
+}
+
+/// 同帧先改写目标表面、再跑带落点过渡:矩形外必须保留**当前表面**,
+/// 不是资产基图。soft 曾直接 `base_texture` 丢掉 `RECTPAINT3` 结果。
+#[test]
+fn transition2_preserves_same_frame_target_paint() {
+    let table = table();
+    let low = RgbaImage::from_pixel(8, 8, Rgba([10, 20, 30, 255]));
+    let from = RgbaImage::from_pixel(4, 2, Rgba([200, 30, 20, 255]));
+    let to = RgbaImage::from_pixel(4, 2, Rgba([20, 180, 40, 255]));
+    let mask = RgbaImage::from_pixel(4, 2, Rgba([0, 0, 0, 255]));
+    let entries = [
+        (b"low.png".as_slice(), png_of(&low)),
+        (b"from.png".as_slice(), png_of(&from)),
+        (b"to.png".as_slice(), png_of(&to)),
+        (b"mask.png".as_slice(), png_of(&mask)),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
+    let cg = |frame: u64, id: &str, file: &str| {
+        call(
+            frame,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(id.as_bytes().to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(file.as_bytes().to_vec())),
+            ],
+        )
+    };
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        cg(1, "LOW", "low"),
+        cg(1, "FROM", "from"),
+        cg(1, "TO", "to"),
+        cg(1, "MASK", "mask"),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0xFFFF_0000)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"FROM".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"TO".to_vec())),
+                arg(&table, "CGACT", "ID3", Value::Str(b"MASK".to_vec())),
+                arg(&table, "CGACT", "ID4", Value::Str(b"LOW".to_vec())),
+                arg(&table, "CGACT", "TRANSITION2", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(128)),
+                arg(&table, "CGACT", "SET2", Value::Int(256)),
+                arg(&table, "CGACT", "X", Value::Int(2)),
+                arg(&table, "CGACT", "Y", Value::Int(3)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let out = gpu.render_frame(&frame).expect("render");
+    let soft_out = soft.render_frame(&frame);
+    assert_eq!(
+        &pixel_of(&out.surface, 1, 3)[..3],
+        &[255, 0, 0],
+        "GPU:矩形外保留同帧 RECTPAINT3 结果"
+    );
+    assert_eq!(
+        &pixel_of(&soft_out.surface, 1, 3)[..3],
+        &[255, 0, 0],
+        "soft:矩形外保留同帧 RECTPAINT3 结果"
+    );
+    assert_eq!(
+        max_channel_diff(&out.surface, &soft_out.surface),
+        0,
+        "同帧链式基底两后端逐字节一致"
     );
 }
 

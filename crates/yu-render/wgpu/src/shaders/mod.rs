@@ -33,6 +33,9 @@ pub const PAINT: &str = include_str!("paint.wgsl");
 /// `CGACT[TRANSITION=1]` 双源整数 lerp(GPU;与 soft `blend_transition` 逐位一致)。
 pub const LERP: &str = include_str!("lerp.wgsl");
 
+/// 带落点的 `TRANSITION` / 三源遮罩 `TRANSITION2`(目标矩形外保留底面)。
+pub const TRANSITION: &str = include_str!("transition.wgsl");
+
 /// `CGACT[MERGE=1]` 的 GPU 整数合成(与 soft `apply_merge(…, false)` 逐位一致)。
 pub const MERGE: &str = include_str!("merge.wgsl");
 

@@ -126,6 +126,12 @@ fn plan_reads(frame: &CompositorFrame, layers: &HashMap<&LayerId, &Layer>) -> Pl
                 }
                 Op::Image(image) => {
                     reads.layers.insert(image.source.clone());
+                    if let Some(source2) = &image.source2 {
+                        reads.layers.insert(source2.clone());
+                    }
+                    if let Some(source3) = &image.source3 {
+                        reads.layers.insert(source3.clone());
+                    }
                     if let Some(target) = &image.target {
                         reads.layers.insert(target.clone());
                     }
@@ -157,7 +163,12 @@ fn plan_reads(frame: &CompositorFrame, layers: &HashMap<&LayerId, &Layer>) -> Pl
 /// `RECTPAINT2`(只写 alpha)与区域填充/滤镜/MERGE 都读旧像素,不算覆盖。
 fn image_full_overwrite(image: &ImageOp) -> bool {
     if matches!(&image.action, ImageAction::Other("transition")) {
-        return image.source2.is_some();
+        // 带落点的过渡只写求交矩形,矩形外保留目标旧像素,不是整层覆盖。
+        return image.source2.is_some() && image.x.is_none() && image.y.is_none();
+    }
+    // `TRANSITION2` 读目标底面且带遮罩,永远不是整层覆盖。
+    if matches!(&image.action, ImageAction::Other("transition2")) {
+        return false;
     }
     if image.region_from_fixed
         || image.x.is_some()
@@ -930,6 +941,9 @@ fn apply_image(
         if let Some(source2) = &image.source2 {
             sync(source2, None);
         }
+        if let Some(source3) = &image.source3 {
+            sync(source3, None);
+        }
     }
     let resolve_started = std::time::Instant::now();
     let source = resolve_source(
@@ -969,6 +983,24 @@ fn apply_image(
         )?),
         None => None,
     };
+    let source3 = match &image.source3 {
+        Some(id) => Some(resolve_source(
+            ctx,
+            frame,
+            layers,
+            textures,
+            gpu,
+            targets,
+            surfaces,
+            contents,
+            bases,
+            id,
+            None,
+            image.seq,
+            "gfx.copy.source.gone",
+        )?),
+        None => None,
+    };
     let resolve_us = resolve_started.elapsed().as_micros() as u64;
     // 自引用(`ID` == 目标)时结果由**已应用前缀**决定,而前缀本身由
     // `applied` 逐项核对;签名里必须用稳定的基面身份,不能用本帧内容的
@@ -982,7 +1014,11 @@ fn apply_image(
         Some(id) if id == target => token,
         _ => source2.as_ref().map_or(0, |content| content.hash),
     };
-    let signature = image_signature(image, source_hash, source2_hash);
+    let source3_hash = match &image.source3 {
+        Some(id) if id == target => token,
+        _ => source3.as_ref().map_or(0, |content| content.hash),
+    };
+    let signature = image_signature(image, source_hash, source2_hash, source3_hash);
     let index = *chain_index.entry(target.clone()).or_insert(0);
     // 已应用前缀按 **命令序号** 命中即可,不再比签名。
     //
@@ -1025,7 +1061,7 @@ fn apply_image(
     let op_started = std::time::Instant::now();
     apply_image_pixels(
         ctx, frame, textures, gpu, pipelines, targets, surfaces, contents, bases, writes, target,
-        image, source, source2, force_bilinear_scale, tuning,
+        image, source, source2, source3, force_bilinear_scale, tuning,
     )?;
     let op_us = op_started.elapsed().as_micros() as u64;
     // ≥20ms 无条件留痕(移动端首帧/首次 TRIM/大资产解码的现场);5ms 以上
@@ -1404,6 +1440,7 @@ fn apply_image_pixels(
     image: &ImageOp,
     source: Content,
     source2: Option<Content>,
+    source3: Option<Content>,
     force_bilinear_scale: bool,
     tuning: yu_render_core::RenderTuning,
 ) -> Result<(), String> {
@@ -1501,6 +1538,117 @@ fn apply_image_pixels(
         };
         contents.remove(target);
         surfaces.set_sampled(target, content.clone());
+        contents.insert(target.clone(), content);
+        return Ok(());
+    }
+
+    // ---------------- 带落点的过渡(TRANSITION X/Y / TRANSITION2) ----------------
+    let is_t2 = matches!(&image.action, ImageAction::Other("transition2"));
+    let anchored = is_t2
+        || (matches!(&image.action, ImageAction::Other("transition"))
+            && (image.x.is_some() || image.y.is_some()));
+    if anchored {
+        let Some(to) = source2.as_ref() else {
+            return Err("gfx.imageop.source.missing".to_string());
+        };
+        // 目标底面:官方只写求交矩形,矩形外保留目标旧像素。
+        let base_content = match contents.get(target).cloned() {
+            Some(content) => content,
+            None => resolve_target_base(
+                ctx,
+                frame,
+                textures,
+                gpu,
+                targets,
+                target,
+                bases,
+                target_fallback,
+            )?,
+        };
+        let base = materialize(
+            ctx,
+            pipelines,
+            surfaces,
+            writes,
+            &base_content,
+            "transition base",
+        )?;
+        if base.width == 0 || base.height == 0 {
+            return Ok(());
+        }
+        let from = materialize(
+            ctx,
+            pipelines,
+            surfaces,
+            writes,
+            &source,
+            "transition from",
+        )?;
+        let to_m = materialize(ctx, pipelines, surfaces, writes, to, "transition to")?;
+        let mask = if is_t2 {
+            let Some(mask) = source3.as_ref() else {
+                return Err("gfx.imageop.source.missing".to_string());
+            };
+            materialize(
+                ctx,
+                pipelines,
+                surfaces,
+                writes,
+                mask,
+                "transition mask",
+            )?
+        } else {
+            // mode 0 不读 binding 3;绑 `to` 作合法占位。
+            to_m.clone()
+        };
+        let dx = image.x.map_or(0, |v| v.round() as i32);
+        let dy = image.y.map_or(0, |v| v.round() as i32);
+        let set = image
+            .set
+            .as_ref()
+            .and_then(|v| v.as_int())
+            .unwrap_or(0)
+            .clamp(0, 256) as i32;
+        let set2 = image
+            .set2
+            .as_ref()
+            .and_then(|v| v.as_int())
+            .unwrap_or(0)
+            .clamp(0, 256) as i32;
+        let out = surfaces.acquire(
+            ctx,
+            base.width,
+            base.height,
+            "transition anchored surface",
+        )?;
+        pipelines
+            .ensure_anchor_transition_pipeline(ctx)
+            .map_err(|d| d.code.to_string())?;
+        let bind = pipelines
+            .create_anchor_transition_bind_group(
+                ctx,
+                &base.tex.view,
+                &from.tex.view,
+                &to_m.tex.view,
+                &mask.tex.view,
+                u32::from(is_t2),
+                dx,
+                dy,
+                set,
+                set2,
+            )
+            .map_err(|diag| diag.code.to_string())?;
+        writes.fullscreen(&out, bind, AuxPipeline::Transition);
+        surfaces.stats_mut().surface_passes += 1;
+        let content = finish_content(
+            surfaces,
+            out,
+            base.width,
+            base.height,
+            base_content.display,
+            None,
+        );
+        surfaces.set_content(target, content.clone());
         contents.insert(target.clone(), content);
         return Ok(());
     }
@@ -3669,7 +3817,7 @@ fn plan_screen_overlay_text(
 
 // ------------------------------------------------------------------ 小工具
 
-fn image_signature(image: &ImageOp, source: u64, source2: u64) -> u64 {
+fn image_signature(image: &ImageOp, source: u64, source2: u64, source3: u64) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     fnv_bytes(&mut hash, image.action.name().as_bytes());
     for value in [image.x, image.y, image.x2, image.y2, image.sx, image.sy] {
@@ -3686,6 +3834,7 @@ fn image_signature(image: &ImageOp, source: u64, source2: u64) -> u64 {
     }
     fnv_mix(&mut hash, source);
     fnv_mix(&mut hash, source2);
+    fnv_mix(&mut hash, source3);
     fnv_mix(&mut hash, u64::from(image.region_from_fixed));
     // 层不透明度参与签名:`CG[A=…]` 改它必须让前缀复用失效,否则合并结果
     // 会停在旧值(实测:同一 `<game>` 场景里改下层 A 后画面不更新)。

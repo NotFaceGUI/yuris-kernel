@@ -1358,6 +1358,7 @@ impl WgpuRenderer {
                         passes::AuxPipeline::LayerMerge => (pipelines.layer_merge_pipeline(), 10),
                         passes::AuxPipeline::Composite => (pipelines.composite_pipeline(), 6),
                         passes::AuxPipeline::Lerp => (pipelines.lerp_pipeline(), 7),
+                        passes::AuxPipeline::Transition => (pipelines.anchor_transition_pipeline(), 11),
                         passes::AuxPipeline::Transform => (pipelines.transform_pipeline(), 8),
                         passes::AuxPipeline::Resample => (pipelines.resample_pipeline(), 9),
                     },

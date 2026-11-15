@@ -213,6 +213,11 @@ pub struct PipelineCache {
     resample_layout: wgpu::BindGroupLayout,
     resample_pipeline_layout: wgpu::PipelineLayout,
     resample_pipeline: Option<wgpu::RenderPipeline>,
+    /// 带落点的 `TRANSITION` / `TRANSITION2`(base + 两/三源 + 参数)。
+    anchor_transition_shader: wgpu::ShaderModule,
+    anchor_transition_layout: wgpu::BindGroupLayout,
+    anchor_transition_pipeline_layout: wgpu::PipelineLayout,
+    anchor_transition_pipeline: Option<wgpu::RenderPipeline>,
     pub total_pipelines_created: u64,
     pub total_bind_groups_created: u64,
 }
@@ -243,6 +248,7 @@ impl PipelineCache {
         warm!(self.ensure_resample_pipeline(ctx));
         warm!(self.ensure_layer_merge_pipeline(ctx));
         warm!(self.ensure_composite_pipeline(ctx));
+        warm!(self.ensure_anchor_transition_pipeline(ctx));
         warm!(self.ensure_transform_pipeline(ctx));
         warm!(self.ensure_scale_pipeline(ctx, ScaleFilter::Sharp));
         warm!(self.ensure_scale_pipeline(ctx, ScaleFilter::Bicubic));
@@ -566,6 +572,40 @@ impl PipelineCache {
                     bind_group_layouts: &[Some(&resample_layout)],
                     immediate_size: 0,
                 });
+        let transition_anchor_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("yu-backend-wgpu transition anchored"),
+                source: wgpu::ShaderSource::Wgsl(crate::shaders::TRANSITION.into()),
+            });
+        let transition_anchor_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("yu-backend-wgpu transition anchored layout"),
+                    entries: &[
+                        texture_entry_unfilterable(0),
+                        texture_entry_unfilterable(1),
+                        texture_entry_unfilterable(2),
+                        texture_entry_unfilterable(3),
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let transition_anchor_pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("yu-backend-wgpu transition anchored pipeline layout"),
+                    bind_group_layouts: &[Some(&transition_anchor_layout)],
+                    immediate_size: 0,
+                });
         let samplers = [
             make_sampler(ctx, FilterKind::Point),
             make_sampler(ctx, FilterKind::Linear),
@@ -651,6 +691,10 @@ impl PipelineCache {
             resample_layout,
             resample_pipeline_layout,
             resample_pipeline: None,
+            anchor_transition_shader: transition_anchor_shader,
+            anchor_transition_layout: transition_anchor_layout,
+            anchor_transition_pipeline_layout: transition_anchor_pipeline_layout,
+            anchor_transition_pipeline: None,
             paint_groups: BTreeMap::new(),
             total_pipelines_created: 0,
             total_bind_groups_created: 0,
@@ -1154,6 +1198,96 @@ impl PipelineCache {
 
     pub fn composite_pipeline(&self) -> Option<&wgpu::RenderPipeline> {
         self.composite_pipeline.as_ref()
+    }
+
+    /// 带落点的 `TRANSITION` / 三源遮罩 `TRANSITION2` 管线。
+    pub fn ensure_anchor_transition_pipeline(&mut self, ctx: &GpuContext) -> Result<(), Diag> {
+        if self.anchor_transition_pipeline.is_some() {
+            return Ok(());
+        }
+        let pipeline = ctx.checked(code::TARGET, "transition anchored 管线", || {
+            fullscreen_pipeline(
+                ctx,
+                "yu-backend-wgpu transition anchored",
+                &self.anchor_transition_shader,
+                &self.anchor_transition_pipeline_layout,
+            )
+        })?;
+        self.anchor_transition_pipeline = Some(pipeline);
+        self.total_pipelines_created += 1;
+        Ok(())
+    }
+
+    pub fn anchor_transition_pipeline(&self) -> Option<&wgpu::RenderPipeline> {
+        self.anchor_transition_pipeline.as_ref()
+    }
+
+    /// `base + from + to + mask` 四纹理 + 8×u32 uniform。
+    ///
+    /// `mode`:0 = TRANSITION(带 X/Y),1 = TRANSITION2。`mask` 在 mode 0
+    /// 由调用方传 `to` 的 view 作占位(shader 不读取)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_anchor_transition_bind_group(
+        &mut self,
+        ctx: &GpuContext,
+        base: &wgpu::TextureView,
+        from: &wgpu::TextureView,
+        to: &wgpu::TextureView,
+        mask: &wgpu::TextureView,
+        mode: u32,
+        dx: i32,
+        dy: i32,
+        set: i32,
+        set2: i32,
+    ) -> Result<wgpu::BindGroup, Diag> {
+        let uniform = [
+            mode,
+            dx as u32,
+            dy as u32,
+            set.clamp(0, 256) as u32,
+            set2.clamp(0, 256) as u32,
+            0,
+            0,
+            0,
+        ];
+        let buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &ctx.device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("yu-backend-wgpu transition anchored params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            },
+        );
+        let group = ctx.checked(code::TARGET, "transition anchored bind group", || {
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("yu-backend-wgpu transition anchored bind group"),
+                layout: &self.anchor_transition_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(base),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(from),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(to),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(mask),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: buffer.as_entire_binding(),
+                    },
+                ],
+            })
+        })?;
+        self.total_bind_groups_created += 1;
+        Ok(group)
     }
 
     /// MERGE2/XOR/AND 的 bind group(`mode`:0=MERGE2,1=XOR,2=AND,3=MID)。
