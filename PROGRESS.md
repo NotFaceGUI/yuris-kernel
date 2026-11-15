@@ -14837,3 +14837,145 @@ cargo build --workspace --all-targets
   `mimalloc-static.cc` 用系统代码页 936 编译会 C1083;构建前设
   `CL=-utf-8` 即可(不是本轮代码问题)。
 - 实机复验(同一剧情左上角碎片消失、口型回到脸上)待主人点验。
+
+## 成果 SNAPSHOT-SIZE (2026-11-15) · 快照尺寸按组视口/晚到资产头回填,消除 CGINFO 尺寸缺失
+
+### 1. 问题
+
+aoiro 实跑日志 6 条:
+
+```text
+gfx.info.unsupported @ es_sprite.yst:SYSTEM@6519/6520 CGINFO
+  快照纹理 76 / 80 尺寸未记录(源层无尺寸元数据)
+```
+
+脚本用 `CGINFO[SX/SY]` 布局;失败时 `LET` 保留旧值(通常 0),后续
+`es.SP.SIZE` 会按 0 计算裁剪/缩放。
+
+### 2. 根因
+
+- 组快照:soft/wgpu 的 `group_surface_size` 是「显式组尺寸 → 视口」,
+  但 `copy_snapshot_size` 只给**主窗口组**回退视口;子组无显式尺寸时
+  快照尺寸为空。
+- 资产快照:`COPY2` 时资产头尚未注入 → `snapshot_sizes` 缺失,但
+  `snapshot_files` 已有键;VM 重试后 `query_layer_size` 对 Snapshot
+  只查 `snapshot_sizes`,不查 `asset_sizes`。
+
+### 3. 改法
+
+- 组源统一回退视口(主组/子组同口径);
+- 新增 `snapshot_regions`,保存 COPY 区域;
+- `set_asset_size` 晚到回填引用该资产的快照尺寸/原点;
+- `query_layer_size` 的 Snapshot 分支增加 `snapshot_files → asset_sizes
+  + snapshot_regions` 查询期回退;
+- 区域裁剪抽成 `snapshot_region_display`,0×0 源保持官方 0 矩形。
+
+### 4. 验证
+
+```text
+cargo test -p yu-gfx --test info_query late_asset_size_backfills
+  → 2 passed
+cargo test -p yu-gfx --test info_query subgroup_copy
+  → 1 passed
+cargo test -p yu-gfx
+  → 19 组 test result 全 ok
+```
+
+台账:`docs/divergences/DIV-GFX-087-snapshot-size-late-asset.md`。
+
+## 成果 TRANSITION-ANCHOR-T2 (2026-11-15) · TRANSITION 落点与 TRANSITION2 三源遮罩过渡
+
+### 1. 取证
+
+官方 0.495(sha256 `4f5eefa3…`):
+
+- `0x43bad0`(TRANSITION)/ `0x43bca0`(TRANSITION2)入口按
+  `src.width+X`、`src.height+Y`、`X<0`、`Y<0` 计算四边剪切位,
+  调 `FUN_0043b518`:目标起点 `(X,Y)`、源起点 0、跨度 = 源∩目标;
+  目标矩形外不写;
+- dispatcher:`TRANSITION` 下标 36 → `0x43bad0`,`TRANSITION2` 下标 37
+  → `0x43bca0`;T2 的 `ID4` 走栈参,`SET=[esp+0x58]`、
+  `SET2=[esp+0x54]`;
+- T2 角色:`ID`=源 A、`ID2`=源 B、`ID3`=遮罩、`ID4`=目标;
+- 权重表 `FUN_0043c110(k=256−SET, SET2)`;逐像素 `FUN_0043c008`:
+  `SET=0` 拷贝 A、`SET>=255` 拷贝 B,否则按遮罩 B 通道查表、
+  `out=B−((B−A)·w>>8)`(8 位回绕);
+- 脚本 `es_sprite.yst` 的 T2 `SET` 与 T1 是同一进度变量,`SET2` 独立。
+
+### 2. 改法
+
+- `ImageOp` 新增 `source3`(仅 T2 遮罩,不进 display JSON);
+- `cgact_transition` 统一两族:X/Y、SET/SET2、source3、目标 ID3/ID4;
+- soft:`transition_into` / `transition2_into`(锚定求交 + 官方整数式);
+- wgpu:新增 `transition.wgsl`(base+from+to+mask)与
+  `AuxPipeline::Transition`;
+- 无 X/Y 的 TRANSITION 保持原整层 lerp(语料唯一形态);
+- `image_signature`/`reads` 纳入 source3;锚定过渡/T2 不算整层覆盖。
+
+### 3. 验证
+
+```text
+cargo test -p yu-gfx --test parity_fixes cgact_transition
+  → 3 passed(anchor x/y、T2 mask/dst/set2、旧路径 x/y=None)
+cargo test -p yu-backend-soft transition
+  → 9 passed(锚定/裁剪、T2 端点/硬阈值/SET2=0)
+cargo test -p yu-backend-wgpu --test surfaces transition_ / transition2
+  → 2 passed(GPU==soft 逐字节)
+cargo test -p yu-backend-soft -p yu-backend-wgpu -- --test-threads=1
+  → soft 67+26+2+2;wgpu 16+0(1 ignored)+31+39+1;doc 1+1,全 ok
+cargo test -p yu-backend-wgpu --test wgsl_check → shaders_parse ok
+cargo test -p yu-gfx / -p yu-engine → 全 ok
+cargo build --workspace --all-targets → Finished
+```
+
+回归基线:`symptom-enter-story` 用例在改动前的 release 与改动后的 debug
+上 `png_sha256`/`display_json_sha256` **完全相同**
+(`608a82c8…` / `981a7188…`),说明本改动未改变该场景;golden 本身与
+期望值的漂移是既有问题,未更新。三项修复全部落地后重建 release
+(`target/release/yu-cli.exe`,22:30)并以 `scenario_probe --shots
+470,760,1000` 复跑:终帧 1000 的 PNG/display 仍为上述两值,逐字节一致。
+
+台账:`docs/divergences/DIV-GFX-088-transition-anchor-and-mask.md`。
+
+## 成果 REVIEW-FIX (2026-11-15) · 过渡/快照审查问题修复
+
+### 1. 修法
+
+- **soft 同帧基底**:锚定过渡先取 `texture_overrides`(目标也是源时保留),
+  没有才 `base_texture`;过渡函数改为按所有权接收 base,消除一次全表面拷贝。
+  修复 soft 丢失同帧 `RECTPAINT3/SIZE` 结果、与 wgpu 分歧的问题。
+- **整面覆盖折叠**:新增 `transition_covers_target`:写矩形覆盖目标整面、
+  目标不在 `source/source2/source3` 中、且源/目标没有历史 `SIZE` 时,按纯写
+  折叠旧 T2/锚定 T1;部分落点仍保留历史。逐帧 aorio T2 不再线性增长。
+- **T2 缺遮罩**:`cgact_transition` 显式接收 `is_t2`,缺 `ID3` 报
+  `ARG_MISSING`,不再静默降级成 T1。
+- **soft T2 越界**:源 B/遮罩按源坐标裁行;`ux0` 越界取零,不再读到下一行。
+- **快照尺寸**:0×0 不再回填(避免毒化);新增 `snapshot_sources`,派生快照
+  沿源链递归解析尺寸(`snapshot_display_size`),覆盖“快照的快照”。
+- 修正 `snapshot_region_display` 注释错位/0×0 文案;新增代码 clippy 清零。
+
+### 2. 回归
+
+```text
+cargo test -p yu-gfx
+  → 全部 19 组 ok(parity_fixes 39、info_query 21,含新增 6 条)
+cargo test -p yu-backend-soft -p yu-backend-wgpu -- --test-threads=1
+  → soft 68+26+2+2+16、wgpu 32+39+1、doc 1+1,全 ok
+cargo test -p yu-engine → 全 ok
+cargo build --workspace --all-targets → Finished
+```
+
+新增用例:`transition2_full_cover_supersedes_previous_frames`、
+`transition2_anchored_partial_keeps_history`、
+`transition2_target_read_as_source_blocks_supersede`、
+`cgact_transition2_missing_mask_is_rejected`、
+`transition2_pads_narrow_b_and_mask_with_zero`、
+`transition2_preserves_same_frame_target_paint`、
+`late_zero_asset_size_does_not_poison_snapshot`、
+`snapshot_of_late_snapshot_resolves_size_through_source_chain`。
+
+release 重建后 `symptom-enter-story` 终帧 1000 复跑:PNG
+`608a82c8…`、display `981a7188…`,与基线逐字节一致。
+
+台账:`DIV-GFX-087`(0×0/源链)、`DIV-GFX-088`(折叠/官方 table[0] 残留、
+越界量纲)已同步。

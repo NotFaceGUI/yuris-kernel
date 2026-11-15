@@ -135,3 +135,13 @@ VARACT[CUT=1 SET=$TX.TASK POS=@mPos LENGTH=@lenA]
 - `CGINFO[TEX]`(`es_Sprite.yst:3454/4155/5848/7770`)已按 REA 实现为
   **图层种类读回**(`0x43d962` 读 `+0xa4`,1=图像/2=组);E-mote 运行时
   本身维持 `deferred(master)`。
+
+## 6. 2026-11-15 补记:落点与 TRANSITION2
+
+- `TRANSITION` 的 `X/Y` 在官方是**落点**(`0x43bad0` → `FUN_0043b518`),
+  带落点时只写目标求交矩形、矩形外保留目标旧像素;无 `X/Y` 的旧路径
+  (整层 lerp)保持不变。
+- `TRANSITION2`(官方 `0x43bca0`):`ID`/`ID2`/`ID3` 三源(第三源是遮罩)、
+  `ID4` 为目标,`SET`=进度、`SET2`=遮罩对比;此前 `Unimplemented`。
+- 两族的实现、权重表与像素公式见
+  `DIV-GFX-088-transition-anchor-and-mask.md`。
