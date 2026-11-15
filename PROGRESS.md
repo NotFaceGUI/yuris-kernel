@@ -14649,6 +14649,7 @@ v474 桌面 --step-to 798 逐帧亮度                  → 近黑仅 [1..20](�
 ```text
 cargo test -p yu-save(带 YURIS_SAMPLE_ERIS_ROOT/SDK0495) → 22 passed; 0 failed
 cargo test -p yu-engine --lib                            → 39 passed; 0 failed
+cargo test -p yu-engine --lib(无 SDK 环境,CI 口径)      → 39 passed; 探测用例显式跳过
 cargo test -p yu-format --test yssd_roundtrip            → 2 passed; 0 failed
 v474 旧运行时 headless 1 帧 --log-level debug
   → save container version 0x138 from aorio.exe
