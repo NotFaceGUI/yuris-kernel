@@ -146,8 +146,14 @@ pub enum HandlerKind {
     ErrorTable,
     /// `REGINFO`:Windows 注册表读取(`0x44bd30`;宿主能力 + 官方失败默认值)。
     Reginfo,
-    /// 官方处理体只做参数求值、不产生副作用(`CSV`/`PLUG`/`ERRORINFO`)。
+    /// 官方处理体只做参数求值、不产生副作用(`PLUG`/`ERRORINFO`)。
     NoopEval,
+    /// `CSV`:把 CSV 文件解析成单元格串,顺序写入 LET 的字符串数组
+    /// (REA v474 `0x43577c`;命令槽 `0x65ecc0=FILE`/`0x65ecc1=LET`)。
+    Csv,
+    /// `CSVINFO[SIZE=1]`:解析 CSV 并统计单元格数,写入 LET
+    /// (REA v474 `0x435cfc`;槽 `0x65ecc0=FILE`/`0x65ecc1=SIZE`/`0x65ecc2=LET`)。
+    Csvinfo,
     /// 手册有页的域命令(CG/SOUND/WINDOW/…)→ DomainCall 事件。
     Domain(Domain),
     /// 官方 0.495 分发表里映射到 `0x4634d8`(`xor eax,eax; ret`)的槽:
@@ -282,8 +288,23 @@ pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> 
                 "TRAY" => HandlerKind::Domain(Domain::System),
                 "CLIPACT" => HandlerKind::Clipact,
                 "CLIPINFO" => HandlerKind::Clipinfo,
-                // REA:只调参数求值器后返回 0(`0x43e640`/`0x44bd10`/`0x46356c`)。
-                "CSV" | "PLUG" | "ERRORINFO" => HandlerKind::NoopEval,
+                // REA:只调参数求值器后返回 0(`0x44bd10`/`0x46356c`)。
+                "PLUG" | "ERRORINFO" => HandlerKind::NoopEval,
+                // CSV 族:**按命令表结构**区分两代引擎,不按版本号:
+                // - 0.495 表序号 7 = CSV,分发表指向空桩 `0x43e640`
+                //   (只求值参数后 `ret 0`,不读文件、不写 LET);
+                // - v474 表比它多一个槽,序号 8 = CSV,指向真实解析器
+                //   `0x43577c`。
+                // 表序号由工程 `ysc.ybn` 直接给出;其它序号未见样本,
+                // 按解析器一系处理(Likely,注释留档)。
+                "CSV" => {
+                    if i == 7 {
+                        HandlerKind::NoopEval
+                    } else {
+                        HandlerKind::Csv
+                    }
+                }
+                "CSVINFO" => HandlerKind::Csvinfo,
                 "ERROR" => HandlerKind::ErrorTable,
                 // 需要宿主:Windows 注册表。
                 "REGINFO" => HandlerKind::Reginfo,
@@ -514,6 +535,8 @@ impl Vm {
             HandlerKind::Clipinfo => self.op_clipinfo(st, cmd),
             HandlerKind::ErrorTable => self.op_error(st, cmd),
             HandlerKind::Reginfo => self.op_reginfo(st, cmd),
+            HandlerKind::Csv => self.op_csv(st, cmd),
+            HandlerKind::Csvinfo => self.op_csvinfo(st, cmd),
             HandlerKind::NoopEval => {
                 // 官方处理体 = 参数求值 + `xor eax,eax; ret`。求值错误的
                 // 可恢复诊断照常记录,然后继续。
@@ -749,8 +772,16 @@ impl Vm {
     }
 
     /// `GO`:手册 `control/go.html`(标签跳转,可跨文件;标签名全局唯一)。
+    ///
+    /// 空标签 = **不跳转**(继续执行下一条)。证据:v474 商业样本
+    /// `es_scenarioflow.yst` pc8 的 `GO[#=$es.STARTLABEL]` 在 boot 期
+    /// 变量初值为空(YSVR slot 空串),官方引擎仍能启动 ⇒ 官方对空目标
+    /// 不按“标签不存在”Fatal;此处按无操作处理,避免误杀整条任务。
+    /// 非空但查不到的标签仍走 `rt.label` Fatal。
     fn op_go(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        let label = self.label_from_window(st, cmd, 0)?;
+        let Some(label) = self.label_from_window_opt(st, cmd, 0, true)? else {
+            return Ok(StepOutcome::Continue);
+        };
         let from_pc = cmd.pc;
         self.jump_to(
             st,
@@ -3189,6 +3220,188 @@ impl Vm {
         self.emit_domain(domain, name.to_string(), args);
     }
 
+    /// `CSV`:把文件解析成单元格串,顺序写入 `LET` 的字符串数组。
+    ///
+    /// 证据(REA:本地 v474 商业样本,样本名/哈希不入库;命令表初始化器
+    /// `FUN_00451f24` 把序号 8 指向 `0x43577c`):
+    /// - 处理体先按 `FILE` 打开文件,失败返回 -1;
+    /// - 读取原始字节后**追加 CRLF**(`0x435866..0x43587f`),再按
+    ///   `,`/CR/LF 切分;引号 `"`/`'` 只保护分隔符(引号本身保留在
+    ///   单元格里);行首空格/Tab 跳过(`0x435948..0x435972`);
+    /// - 每个单元格经 `0x435c04` 写入 `LET` 字符串数组的连续下标
+    ///   (下标从 0 开始,跨行连续;不是二维表)。
+    ///
+    /// 这不是 `0.495` SDK 命令表序号 7 的 `0x43e640`(那是另一支的
+    /// 空桩);v474 的表比 SDK 多一个槽位,序号 8/9 才是 CSV/CSVINFO。
+    /// 处理器选择在 [`build_handler_table`] 按**表序号**裁决:序号 7 →
+    /// `NoopEval`(0.495 空桩),其余 → 本解析器(不写死版本号)。
+    fn op_csv(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let names: &[String] = &cmd.param_names;
+        let mut file: Option<Vec<u8>> = None;
+        let mut target: Option<crate::expr::LValue> = None;
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let name = names
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or(""); // silent-ok: 槽号越界 = 无名(按名判断自然落空)
+            match name {
+                "LET" => target = Some(self.eval_lvalue_window(st, w)?),
+                "FILE" => {
+                    if let Ok(v) = self.eval_window(st, w) {
+                        if let Value::Str(bytes) = v {
+                            file = Some(bytes);
+                        }
+                    }
+                }
+                _ => {
+                    let _ = self.eval_window(st, w);
+                }
+            }
+        }
+        let Some(target) = target else {
+            self.report(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                "CSV 缺少 LET 参数".to_string(),
+            ));
+            return Ok(StepOutcome::Continue);
+        };
+        let Some(path) = file else {
+            self.report(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                "CSV 缺少 FILE 参数".to_string(),
+            ));
+            return Ok(StepOutcome::Continue);
+        };
+        let Some(bytes) = self.open_asset(&path) else {
+            // 官方 `0x45529d` 打开失败 ⇒ 处理体返回 -1(本帧让出,不终止)。
+            self.report(diag::recoverable(
+                code::rt::CSV,
+                Boundary::Script,
+                format!(
+                    "CSV 文件 `{}` 不可读(官方 fopen 失败 ⇒ 返回 -1,本帧让出)",
+                    String::from_utf8_lossy(&path)
+                ),
+            ));
+            return Ok(StepOutcome::Yield);
+        };
+        let cells = parse_csv_cells(&bytes, self.script_codec);
+        let var = self.canonical_var(target.var);
+        let dims = self
+            .var_shape(var)
+            .map(|(_, dims)| dims)
+            .unwrap_or_default();
+        // 官方 `0x435c04` 在目标数组不够长时会 realloc 扩容;本内核的变量域
+        // 固定维长,不能静默越界。容量不足时停在最后一个可写单元格并挂一条
+        // 可恢复诊断(不 fatal,脚本继续)。
+        let capacity = dims.iter().copied().product::<usize>().max(1);
+        let total = cells.len();
+        // 消费式遍历:单元格字节直接 move 进变量值,省掉逐格 clone。
+        for (i, cell) in cells.into_iter().enumerate() {
+            if i >= capacity {
+                self.report(diag::recoverable(
+                    code::rt::CSV,
+                    Boundary::Script,
+                    format!(
+                        "CSV 单元格数 {total} 超过 LET 容量 {capacity}(官方会扩容;内核固定维长,余下忽略)"
+                    ),
+                ));
+                break;
+            }
+            let indices = flat_indices(&dims, i);
+            let lv = crate::expr::LValue {
+                var,
+                indices: indices.into_iter().collect(),
+            };
+            self.write_target_owned(st, &lv, Value::Str(cell))?;
+        }
+        Ok(StepOutcome::Continue)
+    }
+    /// `CSVINFO[SIZE=1]`:统计 CSV 的单元格数并写入 `LET`。
+    ///
+    /// 证据(REA v474 `0x435cfc`):
+    /// - `SIZE=0` 时直接返回 0,不打开文件、不写 LET;
+    /// - `SIZE` 非 0 时打开文件,按与 `CSV` 相同的分隔规则解析,但**不追加
+    ///   CRLF**;计数 = 引号外的逗号数 + 有内容的行的行终止数
+    ///   (空行不计)。实测一份 101 行 × 7 列的表 = 709(含 `ID,` 行的
+    ///   2 个单元格);
+    /// - 打开失败返回 -1(本帧让出)。
+    ///
+    /// 0.495 表的 `CSVINFO` 多一个 `DATA` 槽(`FILE/SIZE/DATA/LET`,
+    /// 0.495 `ysc.txt` [8]);该槽语义未取证,本实现只写 `LET` 计数,
+    /// 不消费 `DATA`(不猜)。
+    fn op_csvinfo(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
+        let names: &[String] = &cmd.param_names;
+        let mut file: Option<Vec<u8>> = None;
+        let mut size = false;
+        let mut target: Option<crate::expr::LValue> = None;
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let name = names
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or(""); // silent-ok: 槽号越界 = 无名(按名判断自然落空)
+            match name {
+                "LET" => target = Some(self.eval_lvalue_window(st, w)?),
+                "FILE" => {
+                    if let Ok(v) = self.eval_window(st, w) {
+                        if let Value::Str(bytes) = v {
+                            file = Some(bytes);
+                        }
+                    }
+                }
+                "SIZE" => {
+                    if let Ok(v) = self.eval_window(st, w) {
+                        size = v.as_f64().map(|n| n != 0.0).unwrap_or(false);
+                    }
+                }
+                _ => {
+                    let _ = self.eval_window(st, w);
+                }
+            }
+        }
+        if !size {
+            // 官方 `0x435d9d..0x435e69`:SIZE=0 ⇒ 不打开文件、不写 LET。
+            return Ok(StepOutcome::Continue);
+        }
+        let Some(path) = file else {
+            self.report(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                "CSVINFO[SIZE=1] 缺少 FILE 参数".to_string(),
+            ));
+            return Ok(StepOutcome::Continue);
+        };
+        let Some(bytes) = self.open_asset(&path) else {
+            self.report(diag::recoverable(
+                code::rt::CSV,
+                Boundary::Script,
+                format!(
+                    "CSVINFO 文件 `{}` 不可读(官方 fopen 失败 ⇒ 返回 -1,本帧让出)",
+                    String::from_utf8_lossy(&path)
+                ),
+            ));
+            return Ok(StepOutcome::Yield);
+        };
+        let count = count_csv_cells(&bytes, self.script_codec);
+        let Some(target) = target else {
+            self.report(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                "CSVINFO[SIZE=1] 缺少 LET 参数".to_string(),
+            ));
+            return Ok(StepOutcome::Continue);
+        };
+        self.write_target(st, &target, &Value::Int(count as i64))?;
+        Ok(StepOutcome::Continue)
+    }
+
     /// `FILEINFO`:文件域查询。**只实现 `EXIST=1 FILE=... LET=...`**。
     ///
     /// 证据(EVID-J3-01):
@@ -5537,6 +5750,31 @@ impl Vm {
         cmd: &Cmd,
         index: usize,
     ) -> Result<crate::vm::LabelTarget, VmError> {
+        // `empty_ok=false`:空标签按官方「标签不存在」Fatal 处理。
+        match self.label_from_window_opt(st, cmd, index, false)? {
+            Some(target) => Ok(target),
+            None => Err(diag::fatal(
+                code::rt::LABEL,
+                Boundary::Script,
+                "标签不存在:(空标签)".to_string(),
+            )
+            .into()),
+        }
+    }
+
+    /// [`Self::label_from_window`] 的共享实现。
+    ///
+    /// `empty_ok=true` 时空标签返回 `None`(`GO` 的 boot 期空变量语义),
+    /// 其余调用方传 `false`,保持「空标签 = 标签不存在」。
+    /// 求值只做一次:常量标签仍走 `label_cache`,动态标签不会因为空检查
+    /// 被求值两次(表达式可能含 `_RND` 等有状态函数)。
+    fn label_from_window_opt(
+        &mut self,
+        st: &ExecState,
+        cmd: &Cmd,
+        index: usize,
+        empty_ok: bool,
+    ) -> Result<Option<crate::vm::LabelTarget>, VmError> {
         let w = cmd
             .windows
             .get(index)
@@ -5552,7 +5790,7 @@ impl Vm {
         let site = (st.script_id, cmd.pc);
         if constant {
             if let Some(hit) = self.label_cache.get(&site) {
-                return Ok(*hit);
+                return Ok(Some(*hit));
             }
         }
         let value = self.eval_window(st, w)?;
@@ -5564,6 +5802,18 @@ impl Vm {
             )
             .into());
         };
+        if name.is_empty() {
+            return if empty_ok {
+                Ok(None)
+            } else {
+                Err(diag::fatal(
+                    code::rt::LABEL,
+                    Boundary::Script,
+                    "标签不存在:(空标签)".to_string(),
+                )
+                .into())
+            };
+        }
         let label = self.find_label_target(&name).ok_or_else(|| {
             let d = diag::fatal(
                 code::rt::LABEL,
@@ -5576,7 +5826,7 @@ impl Vm {
         if constant {
             self.label_cache.insert(site, target);
         }
-        Ok(target)
+        Ok(Some(target))
     }
 
     fn jump_to(
@@ -6134,6 +6384,155 @@ fn cp932_lossy(bytes: &[u8]) -> String {
 }
 
 /// 命令名 → 域(仅用于事件归属;命令名来自工程表)。
+/// 把行主序扁平下标拆成各维下标(与 `value::linear_offset_for` 同口径)。
+fn flat_indices(dims: &[usize], flat: usize) -> Vec<i64> {
+    if dims.is_empty() {
+        return Vec::new();
+    }
+    let mut idx = vec![0i64; dims.len()];
+    let mut rest = flat;
+    for k in (0..dims.len()).rev() {
+        let dim = dims[k].max(1);
+        idx[k] = (rest % dim) as i64;
+        rest /= dim;
+    }
+    idx
+}
+
+/// `CSV` 的文件解析(REA v474 `0x43577c` 的 `0x43583d..0x435bb5`)。
+///
+/// 语义要点:
+/// - 文件字节后**追加 CRLF**(官方 `len+2` 分配并写 `0x0d 0x0a`);
+/// - **只有 `,` 受引号保护**:`0x43591b` 的 CR/LF 分支在引号判断之前,
+///   换行一律终止当前行(引号内的 CR/LF 也不保护);`"`/`'` 只切换
+///   “保护”状态,**引号本身保留**在单元格里;
+/// - 单引号状态跨行**不复位**(官方 `[esp+0x148]` 在 `0x435acd/0x435b7a`
+///   的行终止路径没有清零;双引号 `esi` 会清零)——这是官方行为,照转;
+/// - 行首空格/Tab 跳过,行尾空白保留;
+/// - 每个分隔符都产生一个单元格(连续逗号产生空串);行终止只在“本行出现过
+///   逗号”或“整行为空”时产生末尾单元格 —— 这是官方 `0x4359f8`/`0x435b1b`
+///   两个标志位的直接转写;
+/// - 单元格按出现顺序写入一维字符串数组,不保留行列结构。
+fn parse_csv_cells(bytes: &[u8], codec: yu_format::Codec) -> Vec<Vec<u8>> {
+    let mut buf = Vec::with_capacity(bytes.len() + 2);
+    buf.extend_from_slice(bytes);
+    buf.extend_from_slice(b"\r\n");
+    let mut cells = Vec::new();
+    let mut pos = 0usize;
+    let mut field_start = 0usize;
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut seen_nonspace = false;
+    let mut empty = true;
+    let mut saw_comma = false;
+    while pos < buf.len() {
+        let ch = buf[pos];
+        if ch == b',' && !in_double && !in_single {
+            cells.push(buf[field_start..pos].to_vec());
+            pos += 1;
+            field_start = pos;
+            seen_nonspace = false;
+            empty = false;
+            saw_comma = true;
+            continue;
+        }
+        if ch == b'\r' || ch == b'\n' {
+            let advance = if ch == b'\r' && buf.get(pos + 1) == Some(&b'\n') {
+                2
+            } else {
+                1
+            };
+            if saw_comma {
+                cells.push(buf[field_start..pos].to_vec());
+            } else if empty {
+                cells.push(Vec::new());
+            }
+            pos += advance;
+            field_start = pos;
+            in_double = false;
+            // 单引号状态**不**在行终止复位(官方 `[esp+0x148]` 同样没有
+            // 清零);这是官方解析器的既有行为,不要“修”成按行复位。
+            seen_nonspace = false;
+            empty = true;
+            saw_comma = false;
+            continue;
+        }
+        if ch == b'"' {
+            in_double = !in_double;
+            pos += 1;
+            continue;
+        }
+        if ch == b'\'' {
+            in_single = !in_single;
+            pos += 1;
+            continue;
+        }
+        if !in_double && !in_single && !seen_nonspace && (ch == b' ' || ch == b'\t') {
+            pos += 1;
+            field_start = pos;
+            continue;
+        }
+        pos += codec.char_len_at(&buf, pos);
+        seen_nonspace = true;
+        empty = false;
+    }
+    cells
+}
+
+/// `CSVINFO[SIZE=1]` 的计数(REA v474 `0x435cfc` 的 `0x435df7..0x435f42`)。
+///
+/// 与 [`parse_csv_cells`] 共用分隔规则,但**不追加 CRLF**,且行终止只在
+/// “本行已有非空白字符/逗号”时计数(`esi` 标志);空行计 0。结果等于
+/// “按行展开后的单元格数”(文件以 CRLF 结尾时)。
+fn count_csv_cells(bytes: &[u8], codec: yu_format::Codec) -> usize {
+    let mut count = 0usize;
+    let mut pos = 0usize;
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut seen = false;
+    while pos < bytes.len() {
+        let ch = bytes[pos];
+        if ch == b',' && !in_double && !in_single {
+            count += 1;
+            pos += 1;
+            seen = true;
+            continue;
+        }
+        if ch == b'\r' || ch == b'\n' {
+            let advance = if ch == b'\r' && bytes.get(pos + 1) == Some(&b'\n') {
+                2
+            } else {
+                1
+            };
+            if seen {
+                count += 1;
+            }
+            pos += advance;
+            in_double = false;
+            // 与 `parse_csv_cells` 同一官方怪癖:单引号状态跨行保留。
+            seen = false;
+            continue;
+        }
+        if ch == b'"' {
+            in_double = !in_double;
+            pos += 1;
+            continue;
+        }
+        if ch == b'\'' {
+            in_single = !in_single;
+            pos += 1;
+            continue;
+        }
+        if !in_double && !in_single && !seen && (ch == b' ' || ch == b'\t') {
+            pos += 1;
+            continue;
+        }
+        pos += codec.char_len_at(bytes, pos);
+        seen = true;
+    }
+    count
+}
+
 fn domain_of(name: &str) -> Domain {
     if name.starts_with("CG") {
         Domain::Graphics
@@ -6352,5 +6751,52 @@ mod image_extension_tests {
             key.extend_from_slice(b".png");
             assert!(has_image_extension(&key), "lead={lead:#04x}");
         }
+    }
+}
+
+#[cfg(test)]
+mod csv_parse_tests {
+    use super::{count_csv_cells, parse_csv_cells};
+    use yu_format::Codec;
+
+    /// 引号只保护 `,`;引号本身保留在单元格里。文件尾追加 CRLF 会产生
+    /// 末尾空单元格(官方 `len+2` 的直接结果)。
+    #[test]
+    fn comma_inside_quotes_is_not_a_separator() {
+        let cells = parse_csv_cells(b"a,\"b,c\"\r\n", Codec::Cp932);
+        assert_eq!(
+            cells,
+            vec![b"a".to_vec(), b"\"b,c\"".to_vec(), Vec::new()]
+        );
+    }
+
+    /// `0x43591b` 的 CR/LF 分支在引号判断之前:换行在引号内也终止行。
+    #[test]
+    fn newline_terminates_even_inside_quotes() {
+        let cells = parse_csv_cells(b"a,\"b\nc\"\r\n", Codec::Cp932);
+        assert_eq!(
+            cells,
+            vec![b"a".to_vec(), b"\"b".to_vec(), Vec::new()],
+            "引号内的换行仍断行,第二行无逗号被丢弃"
+        );
+    }
+
+    /// 官方行终止只复位双引号状态(`esi`),单引号状态(`[esp+0x148]`)
+    /// 跨行保留 —— 未闭合的 `'` 会让后续行逗号继续被保护。
+    #[test]
+    fn single_quote_state_persists_across_lines() {
+        let cells = parse_csv_cells(b"a,'b\r\nc,d\r\n", Codec::Cp932);
+        assert_eq!(
+            cells,
+            vec![b"a".to_vec(), b"'b".to_vec(), Vec::new()],
+            "单引号未复位 ⇒ 第二行逗号不分隔"
+        );
+    }
+
+    /// CSVINFO 不追加 CRLF:末行无终止符时最后一格不计入。
+    #[test]
+    fn csvinfo_does_not_count_unterminated_last_cell() {
+        assert_eq!(count_csv_cells(b"a,b\r\nc,d", Codec::Cp932), 3);
+        assert_eq!(count_csv_cells(b"a,\"b,c\"\r\n", Codec::Cp932), 2);
     }
 }

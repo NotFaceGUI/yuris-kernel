@@ -5,7 +5,7 @@
 
 mod support;
 
-use support::{ex, with_int_var, GroupSpec, Init, ProjectBuilder, VarSpec};
+use support::{ex, with_int_var, with_v474_extra_slot, GroupSpec, Init, ProjectBuilder, VarSpec};
 use yu_rt::input::{InputFrame, InputTimeline};
 use yu_rt::json::to_jsonl;
 use yu_rt::task::MAIN_TASK_ID;
@@ -1505,6 +1505,26 @@ fn unknown_label_is_fatal_and_recorded() {
 }
 
 #[test]
+fn empty_go_label_is_noop_not_fatal() {
+    // v474 样本的 `GO[#=$es.STARTLABEL]` 在 boot 期变量为空;官方能启动,
+    // 故空目标必须是 no-op,不能按“标签不存在”Fatal。
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_GO).window(0, ex::s("")),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert!(!vm
+        .events()
+        .iter()
+        .any(|e| matches!(e, yu_rt::VmEvent::Diag { code, .. } if code == "rt.label")));
+}
+
+#[test]
 fn undeclared_variable_write_is_reported() {
     let mut b = ProjectBuilder::new();
     b.labels = vec![("SYSTEM_START", 0, 0, 0)];
@@ -1533,17 +1553,13 @@ fn unimplemented_command_is_recorded_once_and_execution_continues() {
     }];
     b.labels = vec![("SYSTEM_START", 0, 0, 0)];
     b.entry(0, 0);
-    // `CSVINFO`:官方有独立处理体(0x43e660),语义尚未落地 ⇒ Unknown/
-    // Unimplemented。`VAR`/`SAVEINFO` 已于 2026-11-10 定案为官方 no-op,
-    // 不再走此路径。
-    let op_csvinfo = b
-        .commands
-        .iter()
-        .position(|(n, _)| *n == "CSVINFO")
-        .expect("夹具命令表应有 CSVINFO") as u8;
+    // 合成一个不属于任何官方分类的未知命令:`CSV`/`CSVINFO` 已实现,
+    // 不能再拿它们验证「Unimplemented 只挂一次」。追加到表尾不影响既有序号。
+    b.commands.push(("ZZTESTUNKNOWN", vec![]));
+    let op_unknown = (b.commands.len() - 1) as u8;
     b.scripts = vec![vec![
-        GroupSpec::new(op_csvinfo),
-        GroupSpec::new(op_csvinfo),
+        GroupSpec::new(op_unknown),
+        GroupSpec::new(op_unknown),
         GroupSpec::new(OP_LET)
             .window(0, ex::r#ref(0x40, sys))
             .window(0, ex::i8_(7)),
@@ -1553,7 +1569,7 @@ fn unimplemented_command_is_recorded_once_and_execution_continues() {
     let r = vm.tick_at(0, &no_input());
     assert!(r.errors.is_empty(), "Unimplemented 不致命");
     assert_eq!(
-        vm.unimplemented_cmds().get("CSVINFO").copied(),
+        vm.unimplemented_cmds().get("ZZTESTUNKNOWN").copied(),
         Some(2),
         "计数 2 次"
     );
@@ -1573,6 +1589,221 @@ fn unimplemented_command_is_recorded_once_and_execution_continues() {
             .unwrap(),
         Value::Int(7),
         "执行继续"
+    );
+}
+
+#[test]
+fn csv_parses_cells_and_csvinfo_counts_cells() {
+    // v474 语义(REA 0x43577c/0x435cfc):
+    // - CSVINFO 统计“单元格数”(逗号 + 有内容的行终止),不是文件字节数;
+    // - CSV 把单元格按出现顺序写进 LET 字符串数组,文件尾自动补 CRLF;
+    // - 单元格保留 CP932 原始字节,行首空格/Tab 跳过。
+    // v474 表在 CSV 前多一个槽(0.495 的 CSV=7 是空桩);解析器只在 v474
+    // 形状(CSV=8)下选择。
+    let mut b = with_v474_extra_slot(ProjectBuilder::new());
+    let op_end = opcode_of(&b, "END");
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys,
+            value_type: 3,
+            dims: vec![8],
+            init: Init::Str(b""),
+        },
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(0),
+        },
+    ];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let op_csv = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "CSV")
+        .expect("夹具命令表应有 CSV") as u8;
+    let op_csvinfo = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "CSVINFO")
+        .expect("夹具命令表应有 CSVINFO") as u8;
+    b.scripts = vec![vec![
+        GroupSpec::new(op_csvinfo)
+            .window(0, ex::sb(b"data/test.csv"))
+            .window(1, ex::i8_(1))
+            .window(2, ex::r#ref(0x40, sys + 1)),
+        GroupSpec::new(op_csv)
+            .window(0, ex::sb(b"data/test.csv"))
+            .window(1, ex::r#ref(0x24, sys)),
+        GroupSpec::new(op_end),
+    ]];
+    let file = b"a,b\r\n\x83\x74\x83\x48,c\r\n".to_vec();
+    let mut src = b.build();
+    src.insert(b"data/test.csv", file).unwrap();
+    let mut vm = Vm::boot(Box::new(src), BootConfig::default()).expect("boot");
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let arr = VarRef::new(VarSpace::Dollar, sys);
+    // 文件尾 CRLF 让 CSV 再产生一个空单元格(官方 len+2 追加的直接结果)。
+    let want: &[&[u8]] = &[b"a", b"b", b"\x83\x74\x83\x48", b"c", b""];
+    for (i, cell) in want.iter().enumerate() {
+        assert_eq!(
+            vm.store().read(arr, &[i as i64]).unwrap(),
+            Value::Str(cell.to_vec()),
+            "cell[{i}]"
+        );
+    }
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 1), &[])
+            .unwrap(),
+        Value::Int(4),
+        "CSVINFO:第 1 行 2 格 + 第 2 行 2 格 = 4"
+    );
+}
+
+#[test]
+fn csvinfo_does_not_append_crlf() {
+    // 官方 CSVINFO 不补 CRLF:文件末行没有终止符时,最后一格不计入
+    // (CSV 仍会补 CRLF 并写出该格)。
+    let mut b = with_v474_extra_slot(ProjectBuilder::new());
+    let op_end = opcode_of(&b, "END");
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(0),
+    }];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let op_csvinfo = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "CSVINFO")
+        .expect("夹具命令表应有 CSVINFO") as u8;
+    b.scripts = vec![vec![
+        GroupSpec::new(op_csvinfo)
+            .window(0, ex::sb(b"data/noeol.csv"))
+            .window(1, ex::i8_(1))
+            .window(2, ex::r#ref(0x40, sys)),
+        GroupSpec::new(op_end),
+    ]];
+    let mut src = b.build();
+    src.insert(b"data/noeol.csv", b"a,b\r\nc,d".to_vec())
+        .unwrap();
+    let mut vm = Vm::boot(Box::new(src), BootConfig::default()).expect("boot");
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    // 2 个逗号 + 第 1 行终止 = 3;末行 d 没有终止符,不计入。
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(3)
+    );
+}
+
+#[test]
+fn csv_missing_file_yields_without_fatal() {
+    let mut b = with_v474_extra_slot(ProjectBuilder::new());
+    let op_end = opcode_of(&b, "END");
+    let op_let = opcode_of(&b, "LET");
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(0),
+    }];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let op_csv = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "CSV")
+        .expect("夹具命令表应有 CSV") as u8;
+    b.scripts = vec![vec![
+        GroupSpec::new(op_csv)
+            .window(0, ex::sb(b"data/missing.csv"))
+            .window(1, ex::r#ref(0x40, sys)),
+        GroupSpec::new(op_let)
+            .window(0, ex::r#ref(0x40, sys))
+            .window(0, ex::i8_(7)),
+        GroupSpec::new(op_end),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "缺文件不致命: {:?}", r.errors);
+    assert!(
+        vm.events().iter().any(
+            |e| matches!(e, yu_rt::VmEvent::Diag { code, .. } if code == "rt.csv")
+        ),
+        "应挂 rt.csv 诊断"
+    );
+    // 官方返回 -1 ⇒ 本帧让出;下一帧继续执行后续命令。
+    let r = vm.tick_at(1, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(7),
+        "让出后继续"
+    );
+}
+
+#[test]
+fn csv_at_0495_slot_is_noop() {
+    // 0.495 表序号 7 的 CSV 是空桩(REA 0x43e640:只求值参数后 `ret 0`):
+    // 不打开文件、不写 LET。解析器只在 v474 形状(CSV=8)下选择。
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 3,
+        dims: vec![],
+        init: Init::Str(b"keep"),
+    }];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let op_csv = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "CSV")
+        .expect("夹具命令表应有 CSV") as u8;
+    b.scripts = vec![vec![
+        GroupSpec::new(op_csv)
+            .window(0, ex::sb(b"data/absent.csv"))
+            .window(1, ex::r#ref(0x40, sys)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::Dollar, sys), &[])
+            .unwrap(),
+        Value::Str(b"keep".to_vec()),
+        "0.495 CSV 空桩不得写 LET / 不得打开文件"
     );
 }
 

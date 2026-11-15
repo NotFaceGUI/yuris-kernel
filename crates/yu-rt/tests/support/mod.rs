@@ -320,6 +320,17 @@ impl Default for ProjectBuilder {
     }
 }
 
+/// 把默认表改成 **v474 形状**:在 CSV 前多插一个槽。
+///
+/// 0.495 的 `ysc.ybn` 里 `CSV` 是序号 7,分发表指向空桩 `0x43e640`;
+/// v474 的表多一个槽,序号 8 才是 `CSV` 并指向真实解析器 `0x43577c`。
+/// 处理器按表序号选择(v474 解析器 / 0.495 空桩),所以 CSV 解析用例
+/// 必须用 v474 形状的表。
+pub fn with_v474_extra_slot(mut b: ProjectBuilder) -> ProjectBuilder {
+    b.commands.insert(7, ("__V474_EXTRA_SLOT", Vec::new()));
+    b
+}
+
 /// 与 0.495 实测一致的命令子集(序号来自 `ysc.ybn`;夹具专用)。
 pub fn default_commands() -> Vec<CommandSpec> {
     vec![
@@ -330,8 +341,11 @@ pub fn default_commands() -> Vec<CommandSpec> {
         ("CGINFO", vec![]),
         ("CLIPACT", vec![]),
         ("CLIPINFO", vec![]),
-        ("CSV", vec![]),
-        ("CSVINFO", vec![]),
+        ("CSV", vec![("FILE", 1, 0), ("LET", 0, 0)]),
+        (
+            "CSVINFO",
+            vec![("FILE", 1, 0), ("SIZE", 0, 3), ("LET", 0, 0)],
+        ),
         ("DEBUGLIST", vec![]),
         (
             "DIALOG",

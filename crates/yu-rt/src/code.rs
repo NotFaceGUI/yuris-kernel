@@ -87,6 +87,8 @@ pub mod rt {
     pub const MOVIE_FILE: &str = "rt.movie.file";
     /// `MOVIE` 播放端口失败(平台媒体后端缺失/拒绝)。
     pub const MOVIE_PLAYBACK: &str = "rt.movie.playback";
+    /// `CSV`/`CSVINFO` 的文件不可读(官方 `fopen` 失败 ⇒ 返回 -1)。
+    pub const CSV: &str = "rt.csv";
 }
 
 /// 全部已登记错误码(顺序稳定)。唯一性由单元测试守卫。
@@ -125,6 +127,7 @@ pub const ALL_CODES: &[&str] = &[
     rt::MOVIE_ASSET,
     rt::MOVIE_FILE,
     rt::MOVIE_PLAYBACK,
+    rt::CSV,
 ];
 
 /// 码是否已登记。

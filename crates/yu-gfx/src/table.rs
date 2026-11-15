@@ -100,12 +100,17 @@ impl ParamTable {
         })
     }
 
-    /// 命令表自身健全性检查:必需图形命令必须存在,命令名必须非空。
+    /// 命令表自身健全性检查:必需图形命令必须存在。
     ///
     /// `CG/CGACT/CGEND` 是 `GfxState` 的状态生产入口;缺任一条就说明拿错了
     /// 工程表(或表不完整),必须 fail-fast,而不是运行期逐条静默跳过。
     /// 参数名可以为空:0.495 ERIS 的 `PLUG` 等命令存在空参数槽(引擎表原样),
     /// 这类槽在解析时按“名字缺失”处理,不拒绝整张表。
+    ///
+    /// **opcode 0 的命令名允许为空**:v474 商业 `ysc.ybn` 的 opcode 0 是
+    /// 空名/0 参数的占位槽(引擎 `FUN_00451f24` 直接从 `+0x10` 读 NUL 名、
+    /// argc=0,然后正常继续到 `CDDA`);按空名拒绝会误杀整张旧表。其它
+    /// 位置的空名仍按表损坏拒绝(fail-fast),不把校验整体删掉。
     pub fn validate(&self) -> Result<(), yu_log::Diag> {
         for required in ["CG", "CGACT", "CGEND"] {
             if !self.known(required) {
@@ -119,10 +124,10 @@ impl ParamTable {
             let Some(cmd) = u8::try_from(i).ok().and_then(|i| self.inner.command(i)) else {
                 continue;
             };
-            if cmd.name.is_empty() {
+            if cmd.name.is_empty() && i != 0 {
                 return Err(error::fatal(
                     error::code::TABLE_MISSING,
-                    format!("ysc.ybn: 命令 {i} 名字为空"),
+                    format!("ysc.ybn: 命令 {i} 名字为空(仅 opcode 0 占位槽允许)"),
                 ));
             }
         }
