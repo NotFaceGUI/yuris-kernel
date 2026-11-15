@@ -391,6 +391,18 @@ pub struct GfxState {
     snapshot_origins: BTreeMap<CopyId, (i64, i64)>,
     /// 快照对应的源资产键(`CGINFO[MFILE]` 透传)。
     snapshot_files: BTreeMap<CopyId, Vec<u8>>,
+    /// 快照若复制自**另一个快照**,记录源快照 id;尺寸晚到时按链换算。
+    ///
+    /// `COPY2` 自尺寸尚未回填的快照时,派生快照既没有资产键也没有尺寸;
+    /// 只靠 `snapshot_files` 无法回填,故保留源链供查询期递归解析。
+    snapshot_sources: BTreeMap<CopyId, CopyId>,
+    /// 快照的复制区域(区域尺寸 = 显示矩形)。
+    ///
+    /// `COPY` 前源资产头尚未注入时,`snapshot_sizes` 当时算不出来;保存区域
+    /// 供 [`Self::set_asset_size`] 晚到回填与 `CGINFO[SX/SY]` 查询时换算。
+    /// 证据:`es_sprite.yst@6519/6520` 的 `CGINFO` 曾在实跑中报
+    /// 「快照纹理 76/80 尺寸未记录」。
+    snapshot_regions: BTreeMap<CopyId, CopyRegion>,
     /// 当前光标逻辑坐标(`CGINFO[ONMOUSE*]` 的缺省查询点;VM 每帧推入)。
     pointer: (i64, i64),
     /// `CG[FILE]` 在命令时刻登记、等待宿主预热的资产 key(官方在 CG
@@ -557,6 +569,8 @@ impl GfxState {
             snapshot_sizes: BTreeMap::new(),
             snapshot_origins: BTreeMap::new(),
             snapshot_files: BTreeMap::new(),
+            snapshot_sources: BTreeMap::new(),
+            snapshot_regions: BTreeMap::new(),
             preload_pending: BTreeSet::new(),
             preloaded: BTreeSet::new(),
             missing_cg_reported: BTreeSet::new(),
@@ -592,9 +606,87 @@ impl GfxState {
     }
 
     /// 注入资产像素尺寸(VM 解析图像头后调用;键为 `CG[FILE]` 原字节)。
+    ///
+    /// 同时回填**此前已创建、但 COPY 时资产头尚未注入**的快照显示矩形:
+    /// `copy_snapshot_size` 在命令时刻取不到 `asset_sizes` 时只留下区域
+    /// (`snapshot_regions`),资产尺寸晚到后按区域换算 `SX/SY`。
+    /// 证据:aoiro 实跑 `es_sprite.yst@6519/6520 CGINFO` 曾在 COPY 后
+    /// 查询尺寸,旧实现把 `LET` 留在 0。
+    ///
+    /// 0×0(装载失败)不参与回填:否则会把 `snapshot_sizes` 固定成 0,
+    /// 后续真实尺寸到达时被「已有条目」挡住,形成不可逆毒化。查询期回退
+    /// 仍会按 `asset_sizes` 返回 0,因此不影响「失败即 0」的既有语义。
     pub fn set_asset_size(&mut self, key: &[u8], size: SizeU32) {
         self.invalidate_frame();
         self.asset_sizes.insert(key.to_vec(), size);
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        // 先收集再改表:借用 `snapshot_files` 的同时要写 `snapshot_sizes`。
+        let pending: Vec<(CopyId, CopyRegion)> = self
+            .snapshot_files
+            .iter()
+            .filter(|(id, file)| {
+                file.as_slice() == key && !self.snapshot_sizes.contains_key(id)
+            })
+            .map(|(id, _)| {
+                (
+                    *id,
+                    self.snapshot_regions
+                        .get(id)
+                        .copied()
+                        .unwrap_or(CopyRegion::Full),
+                )
+            })
+            .collect();
+        for (id, region) in pending {
+            if let Some((display, origin)) = snapshot_region_display(size, region) {
+                self.snapshot_sizes.insert(id, display);
+                if let Some(origin) = origin {
+                    self.snapshot_origins.insert(id, origin);
+                }
+            }
+        }
+    }
+
+    /// 递归解析快照显示尺寸:自身尺寸 → 资产键 → 源快照链。
+    ///
+    /// `COPY2` 可以复制另一个尚未拿到资产尺寸的快照;派生快照没有资产键,
+    /// 只能沿 `snapshot_sources` 回到根快照,再按各层 `snapshot_regions`
+    /// 从内到外换算。链深上限 64(正常链表远小于此)。
+    fn snapshot_display_size(&self, id: CopyId) -> Option<SizeU32> {
+        let mut current = id;
+        let mut regions: Vec<CopyRegion> = Vec::new();
+        for _ in 0..64 {
+            let mut base = None;
+            if let Some(size) = self.snapshot_sizes.get(&current) {
+                base = Some(*size);
+            } else if let Some(file) = self.snapshot_files.get(&current) {
+                if let Some(size) = self.asset_sizes.get(file) {
+                    let region = self
+                        .snapshot_regions
+                        .get(&current)
+                        .copied()
+                        .unwrap_or(CopyRegion::Full);
+                    base = snapshot_region_display(*size, region).map(|(display, _)| display);
+                }
+            }
+            if let Some(mut size) = base {
+                for region in regions.iter().rev() {
+                    size = snapshot_region_display(size, *region)?.0;
+                }
+                return Some(size);
+            }
+            let source = self.snapshot_sources.get(&current)?;
+            regions.push(
+                self.snapshot_regions
+                    .get(&current)
+                    .copied()
+                    .unwrap_or(CopyRegion::Full),
+            );
+            current = *source;
+        }
+        None
     }
 
     /// 注入 `YMV` 影片元数据(VM 解析 `YSMV` 容器头后调用;键为 `FILE` 原字节)。
@@ -2242,7 +2334,7 @@ impl GfxState {
                     ),
                 )),
             },
-            TextureRef::Snapshot(id) => match self.snapshot_sizes.get(id) {
+            TextureRef::Snapshot(id) => match self.snapshot_display_size(*id) {
                 Some(size) => Ok(i64::from(if width { size.width } else { size.height })),
                 None => Err(error::unimplemented(
                     error::code::INFO_UNSUPPORTED,
@@ -3427,6 +3519,7 @@ impl GfxState {
             seq,
             source: mask_path.clone(),
             source2: None,
+            source3: None,
             source_texture: mask_texture,
             target: Some(target.clone()),
             action: ImageAction::Other("mask_alpha"),
@@ -3602,17 +3695,17 @@ impl GfxState {
         // `Z2` 零次调用。`Z2` 更是**从不被读取**:全量扫描
         // `0x42c000..0x431700` 的 `[0x684160+声明下标]` 读取点,缺下标 8
         // (`Z2=8`)⇒ 引擎只当合法参数接受、无副作用。
-        let is_transition = flag(&params, "TRANSITION");
+        let is_transition = flag(&params, "TRANSITION") || flag(&params, "TRANSITION2");
         if !is_transition && (paths[2].is_some() || paths[3].is_some()) {
             // 引擎把 ID/ID2/ID3/ID4 四个引用都解析进缓冲(`0x42c4ed..`),
-            // 但只有 TRANSITION 消费 ID3;其它动作**不读取** ID3/ID4
+            // 但只有 TRANSITION/TRANSITION2 消费 ID3/ID4;其它动作**不读取**
             // (Z2 下标 8 同样无读取点)⇒ 合法无副作用参数。按官方对齐为
             // verbose 留痕,不把层/命令标未实现(DIV-GFX-031)。
             self.push_diag(
                 "CGACT",
                 error::verbose(
                     error::code::PARAM_NONVISUAL,
-                    "ID3/ID4 仅被 TRANSITION 消费;该动作之外官方也不读取",
+                    "ID3/ID4 仅被 TRANSITION/TRANSITION2 消费;该动作之外官方也不读取",
                 ),
             );
         }
@@ -3716,7 +3809,38 @@ impl GfxState {
         // 与 SWAP/COPY 的「ID2=目标」不同,这里 ID2 是第二输入、ID3 是目标。
         if flag(&params, "TRANSITION") {
             let blend = set.as_ref().and_then(EngineValue::as_int).unwrap_or(0);
-            self.cgact_transition(&source, paths[1].clone(), paths[2].clone(), blend);
+            self.cgact_transition(
+                &source,
+                paths[1].clone(),
+                paths[2].clone(),
+                None,
+                blend,
+                None,
+                x,
+                y,
+                false,
+            );
+            return;
+        }
+        // `CGACT[TRANSITION2=1 SET=f SET2=g ID=ID ID2=ID2 ID3=mask ID4=dst]`:
+        // `0x43bca0` 的三源逐像素遮罩过渡。`es_Sprite.yst` 的动画分支:
+        // `SET`=进度(0..255,与 `TRANSITION` 同一变量),`SET2`=遮罩对比,
+        // `ID3`=遮罩图,`ID4`=输出。几何与 `TRANSITION` 同一落点/裁剪
+        // (`FUN_0043b518`),见 `DIV-GFX-061` 补记。
+        if flag(&params, "TRANSITION2") {
+            let blend = set.as_ref().and_then(EngineValue::as_int).unwrap_or(0);
+            let blend2 = set2.as_ref().and_then(EngineValue::as_int).unwrap_or(0);
+            self.cgact_transition(
+                &source,
+                paths[1].clone(),
+                paths[3].clone(),
+                paths[2].clone(),
+                blend,
+                Some(blend2),
+                x,
+                y,
+                true,
+            );
             return;
         }
         // REA(CGACT 处理体 `0x42e661`/`0x42e670`):
@@ -3950,26 +4074,29 @@ impl GfxState {
         // 源层尺寸来自 VM 注入的资产元数据,见 `asset_sizes`)。
         let mut snap_size = None;
         let mut snap_file = None;
+        let mut snap_source = None;
         if source_is_group {
-            // 组源:组声明尺寸优先;主窗口组直绘没有离屏 RT(`DIV-GFX-008`),
-            // 其 `COPY2 :/W0/` 的结果尺寸就是窗口/后缓冲尺寸。缺这一条时
-            // `CGINFO[SX/SY]` 对 CGS 快照返回 Unimplemented,脚本按 0 布局
-            // (2026-11-03 真机 `快照纹理 345 尺寸未记录` 实测)。
+            // 组源尺寸 = 组声明尺寸;未声明时**后端按视口尺寸**组合
+            // (`group_surface_size` 在 soft/wgpu 同式,主组与子组一致)。
+            // 旧实现只给主窗口组回退视口,子组快照因此没有尺寸:
+            // `CGINFO[SX/SY]` 报「快照纹理尺寸未记录」,脚本按 0/旧值布局
+            // (本次 aorio 实跑 `es_sprite.yst@6519/6520` 6 条实测;
+            // 2026-11-03 真机 `快照纹理 345` 同族)。
             snap_size = self
                 .nodes
                 .get(source)
                 .and_then(|n| n.layer.group_size())
-                .or_else(|| {
-                    self.is_main_group(source)
-                        .then(|| viewport_to_size(self.config.viewport))
-                });
+                .or_else(|| Some(viewport_to_size(self.config.viewport)));
         } else if let Some(src_node) = self.nodes.get(source) {
             snap_size = match &src_node.layer.texture {
                 TextureRef::Asset(key) => {
                     snap_file = Some(key.clone());
                     self.asset_sizes.get(key).copied()
                 }
-                TextureRef::Snapshot(id) => self.snapshot_sizes.get(id).copied(),
+                TextureRef::Snapshot(id) => {
+                    snap_source = Some(*id);
+                    self.snapshot_display_size(*id)
+                }
                 TextureRef::Offscreen(id) => self.nodes.get(id).and_then(|n| n.layer.group_size()),
                 TextureRef::Movie { asset, .. } => self.movie_metas.get(asset).map(|m| SizeU32 {
                     width: m.width,
@@ -3995,23 +4122,15 @@ impl GfxState {
         //
         // 区域原点对 `COPY` 同样有效(局部复制都写到目标 `(0,0)`)。
         let mut snap_origin = None;
-        if let (Some(size), CopyRegion::Partial { .. }) = (snap_size, region) {
-            // 0×0 源(资产装载失败时 VM 回填 0×0)没有可解析的区域:
-            // 官方层矩形保持 0;不能 clamp 到 `max=-1`(min>max 会 panic)。
-            if size.width > 0 && size.height > 0 {
-                let max_x = i64::from(size.width - 1);
-                let max_y = i64::from(size.height - 1);
-                let (x0, y0, x1, y1) = region.resolve(size.width, size.height);
-                let x0 = x0.clamp(0, max_x);
-                let y0 = y0.clamp(0, max_y);
-                let x1 = x1.clamp(x0, max_x);
-                let y1 = y1.clamp(y0, max_y);
-                let width = u32::try_from(x1 - x0 + 1).unwrap_or(0);
-                let height = u32::try_from(y1 - y0 + 1).unwrap_or(0);
-                if width > 0 && height > 0 {
-                    snap_origin = Some((x0, y0));
-                    snap_size = Some(SizeU32 { width, height });
+        if let Some(size) = snap_size {
+            match snapshot_region_display(size, region) {
+                Some((display, origin)) => {
+                    snap_size = Some(display);
+                    snap_origin = origin;
                 }
+                // 0×0 源(资产装载失败时 VM 回填 0×0)没有可解析的区域:
+                // 官方层矩形保持 0;不能 clamp 到 `max=-1`(min>max 会 panic)。
+                None => snap_size = None,
             }
         }
         if let Some(size) = snap_size {
@@ -4019,6 +4138,11 @@ impl GfxState {
         }
         if let Some(origin) = snap_origin {
             self.snapshot_origins.insert(copy_id, origin);
+        }
+        // 区域即使源尺寸未知也要留下:资产头晚到时按它换算显示矩形。
+        self.snapshot_regions.insert(copy_id, region);
+        if let Some(source) = snap_source {
+            self.snapshot_sources.insert(copy_id, source);
         }
         if let Some(file) = snap_file {
             self.snapshot_files.insert(copy_id, file);
@@ -4063,19 +4187,36 @@ impl GfxState {
     /// 因此按 `out = from*(256-f)/256 + to*f/256` 逐通道插值。这条一旦缺失,
     /// 立绘/背景的**动画**分支拿到的就是全透明缓冲(静态图不走这里),正是
     /// 「有动画就不显示、静止 CG 正常」的直接原因。
+    #[allow(clippy::too_many_arguments)]
     fn cgact_transition(
         &mut self,
         from: &LayerId,
         to: Option<LayerId>,
         dst: Option<LayerId>,
+        // `TRANSITION2` 的 `ID3`(逐像素遮罩);`TRANSITION` 为 `None`。
+        mask: Option<LayerId>,
         blend: i64,
+        // `TRANSITION2` 的 `SET2`;`TRANSITION` 为 `None`。
+        blend2: Option<i64>,
+        x: Option<f64>,
+        y: Option<f64>,
+        // `true` = `TRANSITION2`(三源 + 遮罩);`false` = `TRANSITION`。
+        // 不能再用 `mask.is_some()` 推断:缺 `ID3` 的 T2 会被静默降级成 T1。
+        is_t2: bool,
     ) {
+        let action = if is_t2 {
+            ImageAction::Other("transition2")
+        } else {
+            ImageAction::Other("transition")
+        };
+        let label = if is_t2 { "TRANSITION2" } else { "TRANSITION" };
+        let dst_slot = if is_t2 { "ID4" } else { "ID3" };
         let Some(to) = to else {
             self.push_diag(
                 "CGACT",
                 error::recoverable(
                     error::code::ARG_MISSING,
-                    "TRANSITION 缺 ID2(第二源);手册要求两个源图",
+                    format!("{label} 缺 ID2(第二源)"),
                 ),
             );
             return;
@@ -4085,18 +4226,32 @@ impl GfxState {
                 "CGACT",
                 error::recoverable(
                     error::code::ARG_MISSING,
-                    "TRANSITION 缺 ID3(输出层);手册要求生成第三张图",
+                    format!("{label} 缺 {dst_slot}(输出层)"),
                 ),
             );
             return;
         };
-        for id in [from, &to] {
-            if !self.nodes.contains_key(id) {
+        if is_t2 && mask.is_none() {
+            self.push_diag(
+                "CGACT",
+                error::recoverable(
+                    error::code::ARG_MISSING,
+                    "TRANSITION2 缺 ID3(遮罩);不会降级成 TRANSITION",
+                ),
+            );
+            return;
+        }
+        let mut sources = vec![from, &to];
+        if let Some(mask) = &mask {
+            sources.push(mask);
+        }
+        for id in &sources {
+            if !self.nodes.contains_key(*id) {
                 self.push_diag(
                     "CGACT",
                     error::recoverable(
                         error::code::LAYER_MISSING,
-                        format!("TRANSITION 源 `{}` 不存在", id.display()),
+                        format!("{label} 源 `{}` 不存在", id.display()),
                     ),
                 );
                 return;
@@ -4110,26 +4265,28 @@ impl GfxState {
                 "CGACT",
                 error::unimplemented(
                     error::code::IMAGEOP_UNSUPPORTED,
-                    "TRANSITION 输出为图层组:写入组合成纹理的语义未取证",
+                    format!("{label} 输出为图层组:写入组合成纹理的语义未取证"),
                 ),
             );
             return;
         }
-        // 两个源都必须可解析成像素(资产/快照/1×1 黑);否则显式跳过,
+        // 所有源都必须可解析成像素(资产/快照/1×1 黑);否则显式跳过,
         // 不把输出层标成可执行(否则后续 SIZE 会拿全透明图当有效结果)。
-        for id in [from, &to] {
-            let ok = self.nodes.get(id).is_some_and(|n| {
-                matches!(
-                    n.layer.texture,
-                    TextureRef::Asset(_)
-                        | TextureRef::Snapshot(_)
-                        | TextureRef::SolidBlack1x1
-                        | TextureRef::Movie { .. }
-                ) && n.layer.texture_status == LayerStatus::Executable
+        for id in &sources {
+            let ok = self.nodes.get(*id).is_some_and(|n| {
+                !n.layer.is_group()
+                    && matches!(
+                        n.layer.texture,
+                        TextureRef::Asset(_)
+                            | TextureRef::Snapshot(_)
+                            | TextureRef::SolidBlack1x1
+                            | TextureRef::Movie { .. }
+                    )
+                    && n.layer.texture_status == LayerStatus::Executable
             });
             if !ok {
                 let why = "gfx.imageop.copy_source.unsupported";
-                if let Some(node) = self.nodes.get_mut(id) {
+                if let Some(node) = self.nodes.get_mut(*id) {
                     Arc::make_mut(&mut node.layer)
                         .set_texture_status(LayerStatus::Unimplemented(why));
                 }
@@ -4137,33 +4294,33 @@ impl GfxState {
                     "CGACT",
                     error::unimplemented(
                         error::code::IMAGEOP_UNSUPPORTED,
-                        format!("TRANSITION 源 `{}` 无法解析像素: {why}", id.display()),
+                        format!("{label} 源 `{}` 无法解析像素: {why}", id.display()),
                     ),
                 );
                 return;
             }
         }
         let seq = self.next_texture_seq();
-        let blend = EngineValue::Int(blend.clamp(0, 256));
         self.push_image_log(ImageOp {
             seq,
             source: from.clone(),
             source2: Some(to.clone()),
+            source3: mask.clone(),
             source_texture: None,
             target: Some(dst.clone()),
-            action: ImageAction::Other("transition"),
-            set: Some(blend),
-            set2: None,
+            action,
+            set: Some(EngineValue::Int(blend.clamp(0, 256))),
+            set2: blend2.map(|v| EngineValue::Int(v.clamp(0, 256))),
             set_str: None,
             sx: None,
             sy: None,
-            x: None,
-            y: None,
+            x,
+            y,
             x2: None,
             y2: None,
             region_from_fixed: false,
             alpha_aware: false,
-            // `TRANSITION` 不是合并族,层 alpha 不参与它的 lerp
+            // 过渡族不是合并族,层 alpha 不参与它的 lerp
             // (`SET` 就是混合比例);显式写 256 表示恒等,避免下游误用。
             source_alpha: 256,
             target_alpha: 256,
@@ -4842,6 +4999,7 @@ impl GfxState {
             seq,
             source: source.clone(),
             source2: None,
+            source3: None,
             source_texture,
             target: target.clone(),
             action,
@@ -5525,6 +5683,8 @@ impl GfxState {
         self.snapshot_sizes.retain(|id, _| live.contains(id));
         self.snapshot_origins.retain(|id, _| live.contains(id));
         self.snapshot_files.retain(|id, _| live.contains(id));
+        self.snapshot_sources.retain(|id, _| live.contains(id));
+        self.snapshot_regions.retain(|id, _| live.contains(id));
     }
 
     fn sorted_children(
@@ -6065,6 +6225,82 @@ impl GfxState {
         self.image_log.push(op);
     }
 
+    /// 图层当前基面的像素尺寸(与后端 `base_texture`/`layer_surface` 同口径)。
+    ///
+    /// 只用于判断过渡写矩形是否覆盖整面;无法确定时返回 `None`(不折叠)。
+    fn layer_surface_size(&self, id: &LayerId) -> Option<SizeU32> {
+        let layer = &self.nodes.get(id)?.layer;
+        match &layer.texture {
+            TextureRef::Asset(key) => self.asset_sizes.get(key).copied(),
+            TextureRef::Snapshot(copy_id) => self.snapshot_display_size(*copy_id),
+            TextureRef::Movie { asset, .. } => self.movie_metas.get(asset).map(|meta| SizeU32 {
+                width: meta.width,
+                height: meta.height,
+            }),
+            TextureRef::Offscreen(group) => self
+                .nodes
+                .get(group)
+                .and_then(|node| node.layer.group_size())
+                .or_else(|| Some(viewport_to_size(self.config.viewport))),
+            TextureRef::SolidBlack1x1 => layer
+                .image_size()
+                .or(Some(SizeU32 { width: 1, height: 1 })),
+            TextureRef::None => None,
+        }
+    }
+
+    /// 过渡是否**整面覆盖**目标、且目标不参与三源读取。
+    ///
+    /// 满足时旧目标像素不会再被任何像素读到,可像缩放族一样折叠;带落点但
+    /// 只写求交矩形的过渡仍保留(矩形外读目标旧像素)。
+    fn transition_covers_target(&self, op: &ImageOp) -> bool {
+        let is_t2 = op.action == ImageAction::Other("transition2");
+        let anchored_t1 = op.action == ImageAction::Other("transition")
+            && (op.x.is_some() || op.y.is_some());
+        if !is_t2 && !anchored_t1 {
+            return false;
+        }
+        let target = op.target.as_ref().unwrap_or(&op.source);
+        if target == &op.source
+            || op.source2.as_ref() == Some(target)
+            || op.source3.as_ref() == Some(target)
+        {
+            return false;
+        }
+        let Some(target_size) = self.layer_surface_size(target) else {
+            return false;
+        };
+        if target_size.width == 0 || target_size.height == 0 {
+            return false;
+        }
+        // `SIZE` 会改变后端的内容逻辑尺寸(源/目标表面被重采样),`image_log`
+        // 里的资产/快照尺寸不再等于实际参与过渡的表面;此时保守不折叠。
+        for old in &self.image_log {
+            if old.action.is_scale() {
+                let old_target = old.target.as_ref().unwrap_or(&old.source);
+                if old_target == target || old_target == &op.source {
+                    return false;
+                }
+            }
+        }
+        let Some(from_size) = self.layer_surface_size(&op.source) else {
+            return false;
+        };
+        if from_size.width == 0 || from_size.height == 0 {
+            return false;
+        }
+        let dx = op.x.map_or(0, |v| v.round() as i64);
+        let dy = op.y.map_or(0, |v| v.round() as i64);
+        let x_start = dx.max(0);
+        let y_start = dy.max(0);
+        let x_end = dx.saturating_add(i64::from(from_size.width));
+        let y_end = dy.saturating_add(i64::from(from_size.height));
+        x_start == 0
+            && y_start == 0
+            && x_end >= i64::from(target_size.width)
+            && y_end >= i64::from(target_size.height)
+    }
+
     /// 丢弃被新 `SIZE/SIZE2` 完全覆盖的旧缩放项(同源同目标)。
     ///
     /// 引擎的 `CGACT` 图像加工是**破坏性立即执行**(REA `0x42f809`:分配新缓冲 →
@@ -6092,13 +6328,22 @@ impl GfxState {
         // 后两种此前没有折叠 ⇒ 转场/表情每帧追加一条 ⇒ `frame()` 每帧多出
         // 一个 pass,`render` 随游玩时长线性上涨(实测 680 层时
         // passes 128→139、render 30.8→40.8ms/帧,2026-10-26)。
+        // 带落点 `X/Y` 的 `TRANSITION` 只覆盖目标层的求交矩形、矩形外读目标
+        // 旧像素(REA `FUN_0043b518`),不是纯写;但求交矩形**覆盖整面**时
+        // 旧像素不再被读到,等价于纯写。`TRANSITION2` 同理:遮罩/两源都
+        // 不读目标时才可折叠。
+        let anchored_transition = op.action == ImageAction::Other("transition")
+            && (op.x.is_some() || op.y.is_some());
+        let full_cover = self.transition_covers_target(op);
         let pure_write = op.action.is_scale()
             || matches!(
                 op.action,
                 ImageAction::Horizontal
                     | ImageAction::Vertical
-                    | ImageAction::Other("transition" | "mask_alpha")
-            );
+                    | ImageAction::Other("mask_alpha")
+            )
+            || (op.action == ImageAction::Other("transition") && (!anchored_transition || full_cover))
+            || (op.action == ImageAction::Other("transition2") && full_cover);
         if !pure_write {
             return;
         }
@@ -6112,8 +6357,11 @@ impl GfxState {
         // `SET` 逐帧 0→131 递增)每帧一条,折叠后只保留最后一条,像素与
         // 逐帧重算完全相同。旧实现被这条规则挡掉 ⇒ 立绘渐变期
         // passes 每帧 +1、render 3.7→63ms 一路爬升(2026-10-26 实测)。
-        let is_transition = op.action == ImageAction::Other("transition");
-        if target == &op.source && !is_transition {
+        let is_transition_family = matches!(
+            op.action,
+            ImageAction::Other("transition" | "transition2")
+        );
+        if target == &op.source && !is_transition_family {
             return;
         }
         // 折叠键:**缩放族只按 `(动作族, 目标)`**,不比 `source`;过渡族按
@@ -6146,13 +6394,15 @@ impl GfxState {
         // 原地 `TRANSITION`(`ID3` = 目标 = 它自己那一层)的
         // `source` 恰好等于 `target`,若不排除就永远判成「被读了」,
         // 折叠全部失效(实测立绘淡入期 passes 每帧 +1、render 至 105ms)。
-        let is_transition = op.action == ImageAction::Other("transition");
         let read_later = self.image_log.iter().skip(pos + 1).any(|later| {
-            if &later.source != target {
+            let reads_target = &later.source == target
+                || later.source2.as_ref() == Some(target)
+                || later.source3.as_ref() == Some(target);
+            if !reads_target {
                 return false;
             }
             // 原地过渡(源=目标)自己读自己不算阻断。
-            if is_transition && later.target.as_ref() == Some(target) {
+            if is_transition_family && later.target.as_ref() == Some(target) {
                 return false;
             }
             // 折叠项是过渡时,**同帧紧接着的缩放族**是它的消费者
@@ -6160,7 +6410,7 @@ impl GfxState {
             // `GOSUB es.CGACT_SIZE`),读的正是最新结果,不构成
             // 「中间像素被引用」。旧实现把它当阻断 ⇒ 立绘淡入期
             // 单帧堆 29 条过渡 pass、render 涨到 105ms。
-            if is_transition && later.action.is_scale() {
+            if is_transition_family && later.action.is_scale() {
                 return false;
             }
             true
@@ -6520,6 +6770,37 @@ fn copy_attributes(src: &Layer, dst: &mut Layer) {
     dst.texture_status = src.texture_status;
     dst.param_status = src.param_status;
     dst.refresh_status();
+}
+
+/// 快照显示矩形 = `COPY/COPY2` 区域(含端点)的尺寸与原点。
+///
+/// - `Full` → 源整幅,原点 `None`;
+/// - `Partial` → `resolve` 后夹到源表面内,原点 = `(x0,y0)`;0×0 源保持
+///   0×0(官方层矩形不报错),只有无法换算时才返回 `None`。
+///
+/// `COPY` 命令时刻源资产头可能尚未注入(见 [`GfxState::set_asset_size`]):
+/// 此时只保存区域,等资产尺寸晚到后用本函数回填。
+fn snapshot_region_display(
+    size: SizeU32,
+    region: CopyRegion,
+) -> Option<(SizeU32, Option<(i64, i64)>)> {
+    if matches!(region, CopyRegion::Full) {
+        return Some((size, None));
+    }
+    if size.width == 0 || size.height == 0 {
+        // 0×0 源(资产装载失败时 VM 回填):官方层矩形保持 0,不是“无尺寸”。
+        return Some((SizeU32 { width: 0, height: 0 }, None));
+    }
+    let max_x = i64::from(size.width - 1);
+    let max_y = i64::from(size.height - 1);
+    let (x0, y0, x1, y1) = region.resolve(size.width, size.height);
+    let x0 = x0.clamp(0, max_x);
+    let y0 = y0.clamp(0, max_y);
+    let x1 = x1.clamp(x0, max_x);
+    let y1 = y1.clamp(y0, max_y);
+    let width = u32::try_from(x1 - x0 + 1).ok()?;
+    let height = u32::try_from(y1 - y0 + 1).ok()?;
+    (width > 0 && height > 0).then_some((SizeU32 { width, height }, Some((x0, y0))))
 }
 
 /// 整层 `RECTPAINT`/`2`/`3` 之后的均匀表面颜色(RGBA)。

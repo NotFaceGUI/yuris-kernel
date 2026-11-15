@@ -1005,6 +1005,368 @@ fn cgact_transition_blends_two_sources_into_id3() {
     assert_eq!(img.status, OpStatus::Executable);
     // 输出层必须存在且未被毒化(否则后续 SIZE 拿不到图)。
     assert_eq!(layer(&f, ":/W0/DST").status, LayerStatus::Executable);
+    // 无 X/Y 的旧路径保持不变(x/y=None,渲染端走整层 lerp)。
+    assert_eq!(img.x, None);
+    assert_eq!(img.y, None);
+    assert_eq!(img.source3, None);
+    assert_eq!(img.set2, None);
+}
+
+/// `TRANSITION` 的 `X/Y` 是落点(REA `0x43bad0` → `FUN_0043b518`),必须
+/// 原样进入 `ImageOp`,不能丢。
+#[test]
+fn cgact_transition_records_anchor_xy() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("FROM")),
+                arg(&table, "CG", "FILE", s("from")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("TO")),
+                arg(&table, "CG", "FILE", s("to")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("FROM")),
+                arg(&table, "CGACT", "ID2", s("TO")),
+                arg(&table, "CGACT", "ID3", s("DST")),
+                arg(&table, "CGACT", "TRANSITION", i(1)),
+                arg(&table, "CGACT", "SET", i(100)),
+                arg(&table, "CGACT", "X", i(10)),
+                arg(&table, "CGACT", "Y", i(20)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let img = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|o| match o {
+            Op::Image(i) if matches!(&i.action, ImageAction::Other("transition")) => Some(i),
+            _ => None,
+        })
+        .expect("transition op");
+    assert_eq!(img.x, Some(10.0));
+    assert_eq!(img.y, Some(20.0));
+}
+
+/// `TRANSITION2`:三源 + 遮罩、`SET/SET2`、落点与目标 `ID4` 全量登记。
+///
+/// 官方 `0x43bca0`:ID=源 A、ID2=源 B、ID3=遮罩、ID4=目标;`SET`=进度、
+/// `SET2`=遮罩对比。语料 `es_sprite.yst` 的动画分支有实际调用。
+#[test]
+fn cgact_transition2_records_mask_dst_and_two_sets() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("FROM")),
+                arg(&table, "CG", "FILE", s("from")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("TO")),
+                arg(&table, "CG", "FILE", s("to")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("MASK")),
+                arg(&table, "CG", "FILE", s("mask")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(64)),
+                arg(&table, "CG", "SY", i(32)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("FROM")),
+                arg(&table, "CGACT", "ID2", s("TO")),
+                arg(&table, "CGACT", "ID3", s("MASK")),
+                arg(&table, "CGACT", "ID4", s("DST")),
+                arg(&table, "CGACT", "TRANSITION2", i(1)),
+                arg(&table, "CGACT", "SET", i(128)),
+                arg(&table, "CGACT", "SET2", i(200)),
+                arg(&table, "CGACT", "X", i(3)),
+                arg(&table, "CGACT", "Y", i(4)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let img = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|o| match o {
+            Op::Image(i) if matches!(&i.action, ImageAction::Other("transition2")) => Some(i),
+            _ => None,
+        })
+        .expect("transition2 op 必须被登记(而不是判未实现)");
+    assert_eq!(img.source.display(), ":/W0/FROM");
+    assert_eq!(
+        img.source2.as_ref().map(|l| l.display()),
+        Some(":/W0/TO".to_string())
+    );
+    assert_eq!(
+        img.source3.as_ref().map(|l| l.display()),
+        Some(":/W0/MASK".to_string()),
+        "ID3 是遮罩源"
+    );
+    assert_eq!(
+        img.target.as_ref().map(|l| l.display()),
+        Some(":/W0/DST".to_string()),
+        "ID4 才是输出层"
+    );
+    assert_eq!(img.set.as_ref().and_then(|v| v.as_int()), Some(128));
+    assert_eq!(img.set2.as_ref().and_then(|v| v.as_int()), Some(200));
+    assert_eq!(img.x, Some(3.0));
+    assert_eq!(img.y, Some(4.0));
+    assert_eq!(img.status, OpStatus::Executable);
+}
+
+/// `TRANSITION2` 缺 `ID3`(遮罩)必须报错,不能静默降级成 `TRANSITION`。
+#[test]
+fn cgact_transition2_missing_mask_is_rejected() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("FROM")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(8)),
+                arg(&table, "CG", "SY", i(8)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("TO")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(8)),
+                arg(&table, "CG", "SY", i(8)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(8)),
+                arg(&table, "CG", "SY", i(8)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("FROM")),
+                arg(&table, "CGACT", "ID2", s("TO")),
+                arg(&table, "CGACT", "ID4", s("DST")),
+                arg(&table, "CGACT", "TRANSITION2", i(1)),
+                arg(&table, "CGACT", "SET", i(128)),
+                arg(&table, "CGACT", "SET2", i(0)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    assert!(gfx.images().is_empty(), "缺遮罩时不应登记任何过渡项");
+    assert!(
+        gfx.diagnostics()
+            .iter()
+            .any(|d| d.detail.contains("TRANSITION2 缺 ID3(遮罩)")),
+        "应留下 ARG_MISSING 诊断"
+    );
+}
+
+/// `TRANSITION2` 落点覆盖整个目标表面时,旧帧的同类过渡可折叠;逐帧动画
+/// 不会让 `image_log`/pass 数线性上涨。
+#[test]
+fn transition2_full_cover_supersedes_previous_frames() {
+    let table = table();
+    let mut gfx = state();
+    let mut events = vec![frame_start(1)];
+    for id in ["FROM", "TO", "MASK", "DST"] {
+        events.push(call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s(id)),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(8)),
+                arg(&table, "CG", "SY", i(8)),
+            ],
+        ));
+    }
+    events.push(frame_end(1));
+    gfx.consume_events(&events);
+    for frame in 2..=5 {
+        gfx.consume_events(&[
+            frame_start(frame),
+            call(
+                frame,
+                "CGACT",
+                vec![
+                    arg(&table, "CGACT", "ID", s("FROM")),
+                    arg(&table, "CGACT", "ID2", s("TO")),
+                    arg(&table, "CGACT", "ID3", s("MASK")),
+                    arg(&table, "CGACT", "ID4", s("DST")),
+                    arg(&table, "CGACT", "TRANSITION2", i(1)),
+                    arg(&table, "CGACT", "SET", i(128)),
+                    arg(&table, "CGACT", "SET2", i(0)),
+                ],
+            ),
+            frame_end(frame),
+        ]);
+    }
+    assert_eq!(
+        gfx.images().len(),
+        1,
+        "整面覆盖的逐帧 T2 应只保留最新一条,实际 {:?}",
+        gfx.images()
+    );
+    assert!(matches!(
+        gfx.images()[0].action,
+        ImageAction::Other("transition2")
+    ));
+}
+
+/// 带落点且只写部分矩形时不能折叠:矩形外仍依赖目标旧像素。
+#[test]
+fn transition2_anchored_partial_keeps_history() {
+    let table = table();
+    let mut gfx = state();
+    let mut events = vec![frame_start(1)];
+    for id in ["FROM", "TO", "MASK", "DST"] {
+        events.push(call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s(id)),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(8)),
+                arg(&table, "CG", "SY", i(8)),
+            ],
+        ));
+    }
+    events.push(frame_end(1));
+    gfx.consume_events(&events);
+    for frame in 2..=4 {
+        gfx.consume_events(&[
+            frame_start(frame),
+            call(
+                frame,
+                "CGACT",
+                vec![
+                    arg(&table, "CGACT", "ID", s("FROM")),
+                    arg(&table, "CGACT", "ID2", s("TO")),
+                    arg(&table, "CGACT", "ID3", s("MASK")),
+                    arg(&table, "CGACT", "ID4", s("DST")),
+                    arg(&table, "CGACT", "TRANSITION2", i(1)),
+                    arg(&table, "CGACT", "SET", i(128)),
+                    arg(&table, "CGACT", "SET2", i(0)),
+                    arg(&table, "CGACT", "X", i(1)),
+                    arg(&table, "CGACT", "Y", i(1)),
+                ],
+            ),
+            frame_end(frame),
+        ]);
+    }
+    assert_eq!(
+        gfx.images().len(),
+        3,
+        "部分落点必须保留历史,实际 {:?}",
+        gfx.images()
+    );
+}
+
+/// 中间项把旧目标当作 `source2` 读取时,不能折叠生产该目标的过渡。
+#[test]
+fn transition2_target_read_as_source_blocks_supersede() {
+    let table = table();
+    let mut gfx = state();
+    let make = |frame: u64, id: &str| {
+        call(
+            frame,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s(id)),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(8)),
+                arg(&table, "CG", "SY", i(8)),
+            ],
+        )
+    };
+    let mut events = vec![frame_start(1)];
+    for id in ["A1", "B1", "M1", "D1", "D2"] {
+        events.push(make(1, id));
+    }
+    events.push(frame_end(1));
+    gfx.consume_events(&events);
+    let t2 = |frame: u64, id2: &str, dst: &str| {
+        call(
+            frame,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("A1")),
+                arg(&table, "CGACT", "ID2", s(id2)),
+                arg(&table, "CGACT", "ID3", s("M1")),
+                arg(&table, "CGACT", "ID4", s(dst)),
+                arg(&table, "CGACT", "TRANSITION2", i(1)),
+                arg(&table, "CGACT", "SET", i(128)),
+                arg(&table, "CGACT", "SET2", i(0)),
+            ],
+        )
+    };
+    // #1 写 D1;#2 把 D1 当第二源写 D2;#3 再整面覆盖 D1。
+    gfx.consume_events(&[frame_start(2), t2(2, "B1", "D1"), frame_end(2)]);
+    gfx.consume_events(&[frame_start(3), t2(3, "D1", "D2"), frame_end(3)]);
+    gfx.consume_events(&[frame_start(4), t2(4, "B1", "D1"), frame_end(4)]);
+    assert_eq!(
+        gfx.images().len(),
+        3,
+        "#2 仍读 D1,#1 不能删除;实际 {:?}",
+        gfx.images()
+    );
 }
 
 /// `VERTICAL` 与 `HORIZONTAL` 同类(整层几何翻转),必须判可执行而不是毒化。
@@ -1430,8 +1792,8 @@ fn cg_numeric_offset_params_accumulate() {
     assert_eq!(layer.alpha, 150);
 }
 
-/// 未取证的图像加工只跳过该 op,**不得**把整层毒化。用 `TRANSITION2`
-/// (ysc 表有槽、内核无执行体)锁住行为:层仍按基图绘制。
+/// 未取证的图像加工只跳过该 op,**不得**把整层毒化。用 `SAIDO` 带区域
+/// (区域滤镜尚未接线)锁住行为:层仍按基图绘制。
 #[test]
 fn unsupported_image_action_keeps_layer_drawable() {
     let table = table();
@@ -1451,7 +1813,12 @@ fn unsupported_image_action_keeps_layer_drawable() {
             "CGACT",
             vec![
                 arg(&table, "CGACT", "ID", s("L")),
-                arg(&table, "CGACT", "TRANSITION2", i(1)),
+                arg(&table, "CGACT", "SAIDO", i(1)),
+                arg(&table, "CGACT", "SET", i(64)),
+                arg(&table, "CGACT", "X", i(1)),
+                arg(&table, "CGACT", "Y", i(1)),
+                arg(&table, "CGACT", "X2", i(2)),
+                arg(&table, "CGACT", "Y2", i(2)),
             ],
         ),
         frame_end(1),
@@ -1469,7 +1836,7 @@ fn unsupported_image_action_keeps_layer_drawable() {
     assert!(f
         .diagnostics
         .iter()
-        .any(|d| d.code == "gfx.imageop.unsupported" && d.detail.contains("TRANSITION2")));
+        .any(|d| d.code == "gfx.imageop.unsupported" && d.detail.contains("SAIDO")));
 }
 
 /// 官方 `CGINFO` 是顺序 if/else 链(REA `0x43d758..0x43dddf`):多个字段

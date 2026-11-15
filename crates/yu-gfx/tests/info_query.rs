@@ -716,6 +716,309 @@ fn partial_copy2_zero_source_size_keeps_zero_rect() {
     assert_eq!(info("SY"), Value::Int(0));
 }
 
+/// `COPY2` 时资产头尚未注入:资产尺寸晚到后回填快照 `SX/SY`。
+///
+/// aorio 实跑 `es_sprite.yst@6519/6520` 曾在 COPY 后立刻查快照尺寸;
+/// 旧实现只记 `snapshot_files`、不记尺寸,查询一直报
+/// 「快照纹理尺寸未记录」,脚本的 `LET` 留在 0。
+#[test]
+fn late_asset_size_backfills_snapshot_size() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF")),
+                arg(&table, "CG", "FILE", s("late")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("OUT")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BUF")),
+                arg(&table, "CGACT", "ID2", s("OUT")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    // COPY 之后资产尺寸才到(VM 的 `CGINFO` 回退路径解析图像头后注入)。
+    gfx.set_asset_size(
+        b"late",
+        yu_gfx::SizeU32 {
+            width: 264,
+            height: 18,
+        },
+    );
+    let info = |flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("OUT")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info("SX"), Value::Int(264));
+    assert_eq!(info("SY"), Value::Int(18));
+}
+
+/// 同上的局部切片:晚到资产尺寸也要按复制区域换算显示矩形(含端点)。
+#[test]
+fn late_asset_size_backfills_partial_snapshot_block() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF")),
+                arg(&table, "CG", "FILE", s("late")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("OUT")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BUF")),
+                arg(&table, "CGACT", "ID2", s("OUT")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+                arg(&table, "CGACT", "X", i(66)),
+                arg(&table, "CGACT", "X2", i(131)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    gfx.set_asset_size(
+        b"late",
+        yu_gfx::SizeU32 {
+            width: 264,
+            height: 18,
+        },
+    );
+    let info = |flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("OUT")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info("SX"), Value::Int(66));
+    assert_eq!(info("SY"), Value::Int(18));
+}
+
+/// 0×0 尺寸(装载失败)不能把快照尺寸永久钉死;后续真实尺寸必须能回填。
+#[test]
+fn late_zero_asset_size_does_not_poison_snapshot() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF")),
+                arg(&table, "CG", "FILE", s("late")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("OUT")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BUF")),
+                arg(&table, "CGACT", "ID2", s("OUT")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let info = |gfx: &yu_gfx::GfxState, flag: &str| {
+        q(
+            gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("OUT")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    gfx.set_asset_size(
+        b"late",
+        yu_gfx::SizeU32 {
+            width: 0,
+            height: 0,
+        },
+    );
+    assert_eq!(info(&gfx, "SX"), Value::Int(0));
+    gfx.set_asset_size(
+        b"late",
+        yu_gfx::SizeU32 {
+            width: 264,
+            height: 18,
+        },
+    );
+    assert_eq!(info(&gfx, "SX"), Value::Int(264));
+    assert_eq!(info(&gfx, "SY"), Value::Int(18));
+}
+
+/// `COPY2` 自另一个尺寸尚未回填的快照:派生快照没有资产键,必须沿源链
+/// 解析尺寸。
+#[test]
+fn snapshot_of_late_snapshot_resolves_size_through_source_chain() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF")),
+                arg(&table, "CG", "FILE", s("late")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("B")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BUF")),
+                arg(&table, "CGACT", "ID2", s("A")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("A")),
+                arg(&table, "CGACT", "ID2", s("B")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    gfx.set_asset_size(
+        b"late",
+        yu_gfx::SizeU32 {
+            width: 264,
+            height: 18,
+        },
+    );
+    let info = |gfx: &yu_gfx::GfxState, flag: &str| {
+        q(
+            gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("B")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info(&gfx, "SX"), Value::Int(264));
+    assert_eq!(info(&gfx, "SY"), Value::Int(18));
+}
+
+/// 非主窗口的**子组**快照:组未声明尺寸时,后端按视口尺寸组合
+/// (`group_surface_size` soft/wgpu 同式);快照尺寸必须同口径。
+#[test]
+fn subgroup_copy_snapshot_reports_viewport_size() {
+    let table = table();
+    let mut gfx = state();
+    let viewport = gfx.config().viewport;
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("G/")),
+                arg(&table, "CG", "A", i(256)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("G/X")),
+                arg(&table, "CG", "FILE", s("x")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("G/")),
+                arg(&table, "CGACT", "ID2", s("SHOT")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let info = |flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("SHOT")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info("SX"), Value::Int(i64::from(viewport.width)));
+    assert_eq!(info("SY"), Value::Int(i64::from(viewport.height)));
+}
+
 /// `CGINFO[ONMOUSE*]` 对局部 `COPY2` 快照:显示矩形 = 区域尺寸,像素采样
 /// 回落到源资产时要加回区域原点(复制块写在快照 `(0,0)`)。
 #[test]

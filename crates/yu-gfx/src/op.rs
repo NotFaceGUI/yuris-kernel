@@ -342,6 +342,12 @@ pub struct ImageOp {
     /// `es.CGACT_SIZE` 再从 `$LB3` 缩放到可见层。所以这个动作的
     /// 「目标」是 **ID3**,`ID2` 是第二个输入,与本结构其余动作不同。
     pub source2: Option<LayerId>,
+    /// 第三源图层(`ID3`;**仅 `TRANSITION2`** 的逐像素遮罩/权重图)。
+    ///
+    /// 内部字段,与 [`Self::source2`] 同先例不进 display JSON。官方
+    /// `TRANSITION2` 执行体 `0x43bca0`:`ID`=源 A、`ID2`=源 B、`ID3`=遮罩、
+    /// `ID4`=目标;`SET`=进度、`SET2`=遮罩对比(DIV-GFX-061 补记)。
+    pub source3: Option<LayerId>,
     /// `ID2`(复制/加工结果目标;`None` = 原地加工)。
     pub target: Option<LayerId>,
     /// 命令时刻源层的基图(`DIV-GFX-053` 的 image 版)。
