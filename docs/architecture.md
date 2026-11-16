@@ -392,7 +392,9 @@ trait PlatformSvc { /* B7:剪贴板/对话框/托盘/FONTINFO 枚举 */ }
 9. 触摸交互:点击=鼠标左键之外,虚拟按键/手势映射是否要对齐官方
    PDA 目标机语义(取证后定)。
 10. iOS 是否同模式启动(winit 有 UIKit 后端;音频 AVAudio;同
-    「新宿主 + 端口」模式,待主人排期)。
+    「新宿主 + 端口」模式,待主人排期)。**2026-11-16 骨架已落位**:
+    `crates/yu-platform/host-ios`(C ABI + soft 会话,复用 Android 宿主
+    核心);Metal `CAMetalLayer` 与 Xcode/真机验证待 Mac。
 
 ## 3. 一帧数据流(实现现状,架构 B)
 

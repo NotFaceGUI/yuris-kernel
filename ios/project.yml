@@ -1,0 +1,52 @@
+name: YuKernel
+options:
+  bundleIdPrefix: org.yuris
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+targets:
+  YuKernel:
+    type: application
+    platform: iOS
+    sources:
+      - path: YuKernel
+        excludes:
+          - Info.plist
+          - YuKernel-Bridging-Header.h
+    info:
+      path: YuKernel/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.yuris.kernel
+        PRODUCT_NAME: YuKernel
+        SWIFT_VERSION: "5.0"
+        IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_OBJC_BRIDGING_HEADER: YuKernel/YuKernel-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/../crates/yu-platform/host-ios/include"
+        "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]":
+          - "$(SRCROOT)/../dist/ios/iphoneos"
+        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]":
+          - "$(SRCROOT)/../dist/ios/iphonesimulator"
+        OTHER_LDFLAGS:
+          - "-lyu_host_ios"
+          # flate2 的 zlib 后端(yssd 逐字节一致)在 iOS 上可能以系统
+          # libz 形式解析;显式带上,避免静态库链接期缺符号。
+          - "-lz"
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
+      - sdk: CoreGraphics.framework
+      - sdk: CoreText.framework
+      - sdk: CoreAudio.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AudioUnit.framework
+      - sdk: AVFoundation.framework
+      - sdk: Security.framework
+    scheme:
+      gatherCoverageData: false

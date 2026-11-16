@@ -33,7 +33,14 @@ android/.gradle/
 android/build/
 android/app/build/
 android/local.properties
+
+# iOS 构建产物:Xcode 工程由 xcodegen 生成,静态库由 tools/ios/build.sh 产出
 /dist/
+ios/*.xcodeproj/
+ios/DerivedData/
+ios/build/
+ios/xcuserdata/
+ios/**/xcuserdata/
 
 # ZCode 会话本地状态(不属仓库)
 /.zcode/

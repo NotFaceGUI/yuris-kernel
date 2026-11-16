@@ -14979,3 +14979,84 @@ release 重建后 `symptom-enter-story` 终帧 1000 复跑:PNG
 
 台账:`DIV-GFX-087`(0×0/源链)、`DIV-GFX-088`(折叠/官方 table[0] 残留、
 越界量纲)已同步。
+
+## 成果 IOS-SCAFFOLD (2026-11-16) · iOS 宿主骨架:C ABI + soft 会话 + Swift 壳模板
+
+### 1. 改动
+
+- 新增 `crates/yu-platform/host-ios`(`yu-host-ios`,`staticlib + rlib`):
+  复用 `yu-host-android` 的平台中立会话核心(`init_session` / `tick` /
+  `frame_rgba` / `set_input` / `suspend` / `pending_dialogs_json` 等;
+  该 crate 的 JNI 导出只是薄壳),提供 `yu_ios_*` C ABI。JSON 键、返回码、
+  线程模型与 Android `native*` 同口径。启动前装同一 `log::Log` 实现
+  (iOS 上 stderr → Xcode console,`log_file` 可选),否则引擎内部
+  `log::*` 会被静默丢弃。
+- `include/yu_ios.h`:字符串两次调用(返回所需字节数,调用方给缓冲,
+  不需要 free)、RGBA 帧拉取、输入/生命周期/DIALOG/诊断;
+  `yu_ios_attach_layer` 是 Metal 预留入口,当前 `-3`(未接线)。
+- `src/present.rs`:记录 Metal 接线前置(host 先抽 `Presenter` 端口)与
+  `wgpu::SurfaceTargetUnsafe::CoreAnimationLayer` 证据;不写未验证平台代码。
+- `tests/session.rs`:开发机上用真实 ERIS 语料跑「启动 → tick → 800x600
+  RGBA → suspend/resume → shutdown」;另验证 C ABI 符号确实从 rlib 导出。
+- `ios/`:Swift + XcodeGen 壳模板(`AppDelegate` / `SetupViewController` /
+  `GameViewController` / `NativeHost` / `Info.plist` / `project.yml`)。
+  Documents 导入 + `probe_root` 扫描、`CADisplayLink` tick、RGBA→CGImage、
+  触摸→`MOUSE_L`、前后台 `suspend/resume`、DIALOG→`UIAlertController`。
+- `tools/ios/build.sh`:macOS-only;device arm64 + simulator arm64/x86_64
+  静态库,lipo 合 universal sim;可选 xcodegen + xcodebuild。
+- workspace 成员与 `.gitignore`(xcodeproj / DerivedData / dist)。
+- 顺带修正 `start_session_json` 的 `$_SYSTEM_PATH`:显式指 `data_root`,
+  不再按「存档根父目录」推导。iOS 存档在 app 容器(与游戏数据分开),
+  旧规则会把系统路径指到存档目录;Android 默认 `save_root=data_root/save`
+  时新旧行为一致,外置存档目录(`EXTRA_SAVE_DIR`)也因此得到正确的游戏根。
+
+### 2. 验证(Windows,soft 后端)
+
+```text
+cargo build -p yu-host-ios --all-targets
+  → Finished `dev` profile [unoptimized + debuginfo] target(s)
+
+cargo build -p yu-host-ios --release --all-targets
+  → Finished `release` profile [optimized] target(s) in 2m37s
+    (release 档 `lto = "fat"` + `staticlib`,与 tools/ios/build.sh 同档)
+
+YURIS_TEST_TMP=<可写目录> YURIS_SAMPLE_ERIS_ROOT=<project-eris> \
+  cargo test -p yu-host-ios -- --test-threads=1
+  → 4 passed; 0 failed
+     init: OK backend=soft entry=SYSTEM_START viewport=800x600 fps=60
+           boot_ms=195.5 ... data=packed:...data.ypf (31501753 bytes,
+           packs=1 updates=0 skipped=0) ...
+     frame: 800x600, rgba=1920000 bytes
+
+cargo clippy -p yu-host-ios --all-targets --no-deps → yu-host-ios 无告警
+  (依赖 `yu-host-android` 仍报既存 `logging.rs` borrow_deref_ref 警告)
+cargo fmt -p yu-host-ios -- --check → ok
+
+cargo test -p yu-host-android --test session -- --test-threads=1
+  → 2 passed; 0 failed
+     runs_real_corpus_and_emits_frames
+     save_write_lands_on_real_filesystem
+
+注:host-android 的 lib 单测里 4 条 probe 夹具仍用系统 TEMP;本机
+`E:\Temp` 不可写,在夹具创建处失败,与本次 `$_SYSTEM_PATH` 改动无关
+(集成 session 用例使用 YURIS_TEST_TMP,已通过)。
+```
+
+### 3. 未验证(需 macOS / 真机)
+
+- `aarch64-apple-ios` 交叉编译与 Xcode 静态库链接;
+- Metal `CoreAnimationLayer` 上屏(当前 `attach_layer` 返回 -3);
+- `AVAudioSession` 分类与真机音频;
+- 真机性能/内存(CPU 帧拷贝路径每帧 1.9MB,已知只适合 PoC)。
+
+### 4. 限制 / 下一步
+
+1. **临时桥**:`host-ios` 当前依赖 `yu-host-android` 的公开会话 API;
+   待抽 `yu-host-mobile` 公共核心后切换,不影响 C ABI / Swift 壳。
+2. **Metal**:先给 host 抽 `Presenter` 端口,再接 `CAMetalLayer`;
+   blit 管线与 `present.wgsl` 同源,建议抽共享 `present-blit`。
+3. **分发**:GPL-3.0-or-later 与 App Store 条款需单独评估;骨架按
+   自用/侧载定位,不含上架配置。
+4. **环境注记**:本机 `cargo check --workspace --all-targets` 仍在既有
+   `libmimalloc-sys` / MSVC 构建处失败(`yu-cli` 单包同样复现,与本次改动
+   无关);`yu-host-ios` 不依赖 mimalloc,单包构建/测试正常。

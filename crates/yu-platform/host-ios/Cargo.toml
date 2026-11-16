@@ -1,0 +1,22 @@
+[package]
+name = "yu-host-ios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "iOS host scaffold: C ABI over the shared mobile session core; soft frames now, CAMetalLayer presenter pending"
+
+[lib]
+name = "yu_host_ios"
+path = "src/lib.rs"
+# staticlib = Xcode 最终链接的 .a(device + simulator);rlib 供开发机上的
+# 会话测试直接链接。iOS 不需要 cdylib:app 进程内静态链接,避免 dylib
+# 加载/签名额外约束。
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+log = "0.4"
+# 平台中立会话核心(init_session / tick / frame_rgba / set_input / ...)。
+#
+# 临时桥:该 crate 的 JNI 导出只是薄壳,会话 API 与目标架构无关;等抽出
+# `yu-host-mobile` 后这里改为依赖公共核心,本 crate 的 C ABI 不变。
+yu-host-android = { path = "../host-android" }

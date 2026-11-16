@@ -4305,6 +4305,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "yu-host-ios"
+version = "0.3.2"
+dependencies = [
+ "log",
+ "yu-host-android",
+]
+
+[[package]]
 name = "yu-host-wasm"
 version = "0.3.2"
 dependencies = [

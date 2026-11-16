@@ -20,6 +20,7 @@ YU-RIS 兼容运行时，开发中。
 | headless / 本地服务 | 可用   |
 | 浏览器呈现端        | 仅调试 |
 | Android             | 可用   |
+| iOS                 | 骨架(soft;Metal 待接) |
 
 | ![](docs/assets/case/1_t.png) | ![](docs/assets/case/1_d.png) | ![](docs/assets/case/2_d.png) |
 | ----------------------------- | ----------------------------- | ----------------------------- |
@@ -53,6 +54,14 @@ so + 轻量 Java 壳
 - 安装后选游戏目录即可运行；存档写 `<游戏目录>/save/`，`.sd` 与桌面字节一致。
 - 输入：触摸 = 鼠标左键，双指上下滑 = 滚轮，右下角切换虚拟光标。
 - 退出：脚本 `END` 后回到配置界面。
+
+## iOS（骨架）
+
+C ABI + Swift 壳模板；当前 `soft` 后端（CPU 帧），Metal `CAMetalLayer` 上屏待接。
+
+- 构建（需 macOS + Xcode）：`bash tools/ios/build.sh`；`YURIS_IOS_XCODE=1` 生成 Xcode 工程并构建模拟器 app。
+- 数据：用「文件」App 或 Finder 把游戏目录拷进 app 的 `Documents/`，启动页用 `probe_root` 扫描入口。
+- 详见 `ios/README.md` 与 `crates/yu-platform/host-ios/README.md`。
 
 ## 构建
 
