@@ -15214,3 +15214,45 @@ load_system_fonts: 163.4ms faces=248 catalog=127
 - 页内换字体仍会把已提交字形按最新字体重投影(逐字字体身份未快照,既有
   残余)。
 - 本轮未执行任何 git 写操作,等待主人审阅。
+
+## 发布准备 0.3.3 (2026-11-16)
+
+- `Cargo.toml` workspace 版本 `0.3.2` → `0.3.3`;`cargo check` 同步
+  `Cargo.lock` 全部 20 个 workspace crate;Android 本地回落 `versionName`
+  同步 `0.3.3`。
+- 发布工具:`test_release_notes.py` 19 tests OK;
+  `check-version --tag v0.3.3` → `版本一致`;
+  `notes --tag v0.3.3 --to HEAD` 生成 `.release/notes.md`(v0.3.2..HEAD,
+  12 提交)。
+- `cargo build --workspace --all-targets --locked` 与
+  `cargo build --release -p yu-cli --locked` 通过;
+  `cargo test --workspace --locked` 仅 `yu-cli logging_guards` 两条既有红
+  (`state.rs` 23/18、`handlers.rs` 82/80,与 HEAD 相同);CI 同口径的
+  7 个 crate `--lib` 测试全绿。
+- 本地 Android release APK 构建成功:28M,`versionName=0.3.3`,
+  本地 debug 签名(无 release secrets)。
+- iOS 不随 0.3.3 发布;本轮未修改 iOS 代码/配置。
+- 渲染过渡专项审计(子代理)已返回:四个提交的 X/Y 落点、三源遮罩公式、
+  缓存键与现有测试均通过;发现 5 项未修语义问题,随 0.3.3 发布知悉:
+  1. 局部快照的“显示矩形”被当作“表面尺寸”用于嵌套 COPY/折叠/CGINFO 上界;
+  2. T2 `source2/source3` 未纳入同帧 `CGEND` 的快照生命周期闭包;
+  3. COPY 时已注入的 0×0 资产尺寸会永久钉死快照尺寸;
+  4. `ONMOUSE`/`COLOR` 未统一走 `snapshot_display_size`;
+  5. 缺源时共享 mask 层会被一并标成 `Unimplemented`。
+- 未打 tag、未推送;以上渲染项不阻塞本次发布,列入后续修复。
+
+## 成果 LICENSE-COMPLIANCE (2026-11-16) · 免责声明、NOTICE 与第三方许可清单
+
+- README 新增「免责声明」;「许可」段链接 `NOTICE`、`THIRD-PARTY-NOTICES.md`
+  与 `third_party/licenses/`。
+- 新增 `NOTICE`(GPL-3.0-or-later 标准声明 + 版权人);新增
+  `THIRD-PARTY-NOTICES.md`,由 `tools/release/gen_third_party_notices.py` 从
+  `cargo metadata --locked` 生成,当前覆盖 426 个第三方 crate、版权行与上游
+  NOTICE 文件。
+- 新增 `third_party/licenses/`(14 份许可证文本 + README);发布流程改为
+  Windows zip 携带 `NOTICE`/`THIRD-PARTY-NOTICES.md`/`licenses/`,并额外生成
+  `-licenses.zip` 供 Android 产物配套分发。
+- 验证:`python tools/release/gen_third_party_notices.py` 二次生成与已提交文件
+  `diff` 一致;`python -c "import yaml; yaml.safe_load(...)"` 解析 release.yml
+  通过;README 相对链接检查无缺失;`git diff --check` 干净。
+- 本轮未执行任何 git 写操作,等待主人审阅。
