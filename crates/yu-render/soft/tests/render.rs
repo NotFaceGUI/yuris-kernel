@@ -459,58 +459,71 @@ fn text_without_flags_is_counted_but_not_rasterized() {
 }
 
 #[test]
-fn synced_text_flags_rasterize_glyphs() {
-    let mut gfx = state(Viewport::new(32, 32), [0, 0, 0, 255]);
+fn committed_text_glyphs_rasterize_into_layer() {
+    let table = table();
+    let mut gfx = state(Viewport::new(64, 32), [0, 0, 0, 255]);
     gfx.consume_events(&[
         VmEvent::FrameStart { frame: 1 },
-        VmEvent::Text {
-            frame: 1,
-            id: Vec::new(),
-            bytes: b"A".to_vec(),
-        },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(64)),
+                arg(&table, "CG", "SY", Value::Int(32)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
     ]);
-    // 权威 `_TEXT_FLAG`(VM `[state+0x3c]`):'2' = 全角单元。
-    let mut snapshot = yu_rt::text::TextSnapshot {
-        // 全角「こ」(CP932 0x82B1)配 '2';对齐必须成功。
-        layer_id: Vec::new(),
-        bytes: b"\x82\xB1".to_vec(),
+    let glyph = yu_rt::text::TextGlyphDraw {
         codec: yu_rt::Codec::Cp932,
-        flags: b"2".to_vec(),
-        output_mode: 1,
-        wait_ms: 0,
-        autoreturn: 1,
-        autopage: 1,
-        autoclick: 1,
-        click: false,
-        clear_pending: false,
-        clear_seq: 0,
-        reveal_flags: 0,
-        reveal_bytes: 0,
-        reveal_chars: 0,
-        skip_mode: false,
-        cursor_x: 0,
-        cursor_y: 0,
-        click_buttons: [1, 13, 0x3ff, 0x3ff],
-        skip_buttons: [17, 0x3ff, 0x3ff, 0x3ff],
+        // 全角「こ」(CP932 0x82B1)。
+        bytes: b"\x82\xB1".iter().copied().collect(),
+        full: true,
+        x: 0,
+        y: 0,
+        width: 32,
+        height: 32,
+        style: yu_rt::text::TextGlyphStyle {
+            fg: 0x00FF_FFFF,
+            bg: 0x00FF_FFFF,
+            antialias: true,
+            gradation: 0,
+            bold: false,
+        },
+        draw_mode: 0,
+        bno: 1,
     };
-    gfx.sync_text_state(&snapshot);
+    let mut frame_data = yu_rt::text::TextFrame {
+        layer_id: b"TX".to_vec(),
+        output_mode: 1,
+        page_clear_seq: 0,
+        cursor_x: 32,
+        cursor_y: 0,
+        click: false,
+        bytes: b"\x82\xB1".to_vec(),
+        flags: b"2".to_vec(),
+        font: Default::default(),
+        first_step: 0,
+        total_steps: 1,
+        steps: vec![yu_rt::text::TextStep::Glyph(glyph)],
+    };
+    gfx.apply_text_frame(&frame_data);
     let frame = gfx.frame();
-    assert!(frame.text_layout.is_some(), "layout comes from _TEXT_FLAG");
+    assert!(
+        frame.text_layout.is_some(),
+        "layout comes from committed glyphs"
+    );
 
     let mut backend = SoftRenderer::new(texture_store(&[]));
     if !backend.text_composer().available() {
-        println!("SKIP synced_text_flags_rasterize_glyphs: no system font");
+        println!("SKIP committed_text_glyphs_rasterize_into_layer: no system font");
         return;
     }
     let out = backend.render_frame(&frame);
-    assert_eq!(out.report.skipped_text, 0, "synced run is not skipped");
+    assert_eq!(out.report.skipped_text, 0);
     assert_eq!(out.report.text_glyphs, 1);
-
-    // H-P2-02:reveal 是唯一截断入口(后端不自建计时器)。
-    gfx.set_text_reveal(Some(0));
-    let hidden = backend.render_frame(&gfx.frame());
-    assert_eq!(hidden.report.text_glyphs, 0, "reveal=0 不画字形");
-    gfx.set_text_reveal(None);
     let ink = out
         .surface
         .rgba
@@ -526,14 +539,31 @@ fn synced_text_flags_rasterize_glyphs() {
         png::png_bytes(&again.surface).expect("encode")
     );
 
-    // 清空同步(CLEAR)后文本消失。
-    snapshot.bytes.clear();
-    snapshot.flags.clear();
-    snapshot.clear_seq += 1; // CLEAR 是显式代数,不是空缓冲(DIV-GFX-034/C1)
-    gfx.consume_events(&[VmEvent::FrameStart { frame: 2 }]);
-    gfx.sync_text_state(&snapshot);
-    let cleared = backend.render_frame(&gfx.frame());
-    assert_eq!(cleared.report.text_glyphs, 0);
+    // `TEXT[CLEAR]`:同页、无新步骤、空待显示缓冲 ⇒ 已提交像素保留。
+    let mut clear = frame_data.clone();
+    clear.first_step = 1;
+    clear.total_steps = 1;
+    clear.steps.clear();
+    clear.bytes.clear();
+    clear.flags.clear();
+    gfx.apply_text_frame(&clear);
+    assert_eq!(
+        backend.render_frame(&gfx.frame()).report.text_glyphs,
+        1,
+        "TEXT[CLEAR] 不清表面"
+    );
+
+    // `'P'` 换页:清表面。
+    frame_data.page_clear_seq = 1;
+    frame_data.first_step = 0;
+    frame_data.total_steps = 1;
+    frame_data.steps = vec![yu_rt::text::TextStep::PageClear];
+    gfx.apply_text_frame(&frame_data);
+    assert_eq!(
+        backend.render_frame(&gfx.frame()).report.text_glyphs,
+        0,
+        "'P' 清页后无字形"
+    );
 }
 
 #[test]
@@ -1649,4 +1679,89 @@ fn cgact_text_on_painted_transparent_solid_layer_is_visible() {
         Some([255, 255, 255, 255]),
         "RECTPAINT3 SET=0 后不得残留黑幕"
     );
+}
+
+/// 逐字符样式必须真的应用到像素:同一行两个字形不同前景色。
+///
+/// 这条用例防的是“逐字样式只进了模型、合成器仍用整段样式”的静默回归:
+/// 若合成器忽略 `glyph.style`，两字都会用 `TextFrame.font` 的默认白色，
+/// 红/蓝通道断言失败。
+#[test]
+fn per_glyph_foreground_colors_reach_pixels() {
+    let table = table();
+    let mut gfx = state(Viewport::new(96, 32), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(96)),
+                arg(&table, "CG", "SY", Value::Int(32)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let glyph = |ch: u8, x: i64, fg: u32| {
+        yu_rt::text::TextStep::Glyph(yu_rt::text::TextGlyphDraw {
+            codec: yu_rt::Codec::Cp932,
+            bytes: [ch].into_iter().collect(),
+            full: false,
+            x,
+            y: 0,
+            width: 20,
+            height: 20,
+            style: yu_rt::text::TextGlyphStyle {
+                fg,
+                bg: 0x000000,
+                antialias: true,
+                gradation: 0,
+                bold: false,
+            },
+            draw_mode: 0,
+            bno: 1,
+        })
+    };
+    let frame_data = yu_rt::text::TextFrame {
+        layer_id: b"TX".to_vec(),
+        output_mode: 1,
+        page_clear_seq: 0,
+        cursor_x: 40,
+        cursor_y: 0,
+        click: false,
+        bytes: b"AB".to_vec(),
+        flags: b"11".to_vec(),
+        // 默认白色:如果逐字 fg 没生效,像素会是白色而不是红/蓝。
+        font: Default::default(),
+        first_step: 0,
+        total_steps: 2,
+        steps: vec![glyph(b'A', 0, 0x00FF_0000), glyph(b'B', 20, 0x0000_00FF)],
+    };
+    gfx.apply_text_frame(&frame_data);
+    let mut backend = SoftRenderer::new(texture_store(&[]));
+    if !backend.text_composer().available() {
+        println!("SKIP per_glyph_foreground_colors_reach_pixels: no system font");
+        return;
+    }
+    let out = backend.render_frame(&gfx.frame());
+    let mut max_red_left = 0u8;
+    let mut max_blue_right = 0u8;
+    let mut max_green_any = 0u8;
+    for y in 0..out.surface.height {
+        for x in 0..out.surface.width {
+            let px = out.surface.pixel(x, y).expect("pixel");
+            if x < 20 {
+                max_red_left = max_red_left.max(px[0]);
+            } else if (20..40).contains(&x) {
+                max_blue_right = max_blue_right.max(px[2]);
+            }
+            max_green_any = max_green_any.max(px[1]);
+        }
+    }
+    assert!(max_red_left > 0, "第一个字形必须用红色前景(逐字 fg 生效)");
+    assert!(max_blue_right > 0, "第二个字形必须用蓝色前景(逐字 fg 生效)");
+    // 红色字形不应出现蓝色像素,蓝色字形不应出现红色像素。
+    assert_eq!(max_green_any, 0, "红/蓝前景不应混入绿色/白色");
 }

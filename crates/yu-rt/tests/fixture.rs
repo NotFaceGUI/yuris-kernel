@@ -2074,6 +2074,9 @@ fn taskinfo_text_line_and_next_voice_come_from_returncode_window() {
         GroupSpec::new(OP_END).line(14),
     ]];
     let mut vm = boot(b);
+    // 合成样本无 gfx 层;按真实路径注入目标层表面尺寸(否则官方语义下
+    // `state+0x00 == 0` 不推进文本,任务会停在 RETURNCODE)。
+    vm.set_text_window(Some((800, 600)));
     // RETURNCODE → TextYield;TextYield 需要推进输入才恢复(引擎 `task+9`)。
     vm.tick_at(0, &no_input());
     let mut tl = InputTimeline::new();
@@ -2640,6 +2643,7 @@ fn returncode_line_keeps_full_u16_id() {
         GroupSpec::new(OP_END).line(13),
     ]];
     let mut vm = boot(b);
+    vm.set_text_window(Some((800, 600)));
     vm.tick_at(0, &no_input());
     let rc: Vec<u32> = vm
         .events()
@@ -2653,6 +2657,9 @@ fn returncode_line_keeps_full_u16_id() {
     let mut tl = InputTimeline::new();
     tl.set(1, InputFrame::new(["MOUSE_L"]));
     vm.tick_at(16, &tl);
+    // 点击与首次布局同帧:官方 `FUN_004046fc` 在 post-buttons 只消费 'C',
+    // 不再重跑布局;R/P/E 在下一帧处理完后才恢复任务。
+    vm.tick_at(32, &no_input());
     assert_eq!(
         vm.store().read(line, &[]).unwrap(),
         Value::Int(300),
@@ -2686,6 +2693,7 @@ fn task_reconfiguration_preserves_text_line_and_voice() {
         GroupSpec::new(OP_END).line(32),
     ]];
     let mut vm = boot(b);
+    vm.set_text_window(Some((800, 600)));
     vm.tick_at(0, &no_input());
     let mut tl = InputTimeline::new();
     tl.set(1, InputFrame::new(["MOUSE_L"]));
@@ -4127,6 +4135,7 @@ fn one_text_line_per_frame_until_advance_input() {
         GroupSpec::new(OP_END),
     ]];
     let mut vm = boot(b);
+    vm.set_text_window(Some((800, 600)));
     // 帧 1:只出 "A" 行。
     vm.tick_at(0, &no_input());
     let texts = |vm: &Vm| -> Vec<Vec<u8>> {
@@ -4153,10 +4162,13 @@ fn one_text_line_per_frame_until_advance_input() {
     assert_eq!(texts(&vm), vec![b"A".to_vec()], "点击前不进入下一行");
     assert_eq!(rc_count(&vm), 1);
 
-    // 帧 4:注入点击(MOUSE_L)⇒ 恢复,推进到第二行。
+    // 帧 4:注入点击(MOUSE_L)⇒ post-layout 只消费 'C';R/P/E 下一帧。
     let mut tl = InputTimeline::new();
     tl.set(4, InputFrame::new(["MOUSE_L"]));
     vm.tick_at(48, &tl);
+    assert_eq!(texts(&vm), vec![b"A".to_vec()], "点击当帧尚未进入下一行");
+    // 帧 5:R/P/E 处理完 ⇒ 恢复并执行第二行。
+    vm.tick_at(64, &no_input());
     assert_eq!(
         texts(&vm),
         vec![b"A".to_vec(), b"B".to_vec()],
@@ -4164,13 +4176,16 @@ fn one_text_line_per_frame_until_advance_input() {
     );
     assert_eq!(rc_count(&vm), 2);
 
-    // 松开若干帧后再次点击(计数器已为负数):按手册「押された瞬間から 1」
-    // 必须从 1 重新起算,否则第二次点击永远到不了正值,第三行不出现。
+    // 帧 6..8:第二行停在 'C',模拟长期松开。
+    vm.tick_at(80, &no_input());
+    vm.tick_at(96, &no_input());
+    vm.tick_at(112, &no_input());
+    // 帧 9:第二次点击;帧 10:R/P/E 后进入第三行。按手册
+    // 「押された瞬間から 1」,长期松开后的点击必须重新从 1 起算。
     let mut tl = InputTimeline::new();
-    tl.set(10, InputFrame::new(["MOUSE_L"]));
-    for f in 5..=10 {
-        vm.tick_at(f * 16, &tl);
-    }
+    tl.set(9, InputFrame::new(["MOUSE_L"]));
+    vm.tick_at(128, &tl);
+    vm.tick_at(144, &no_input());
     assert_eq!(
         texts(&vm),
         vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
@@ -4258,36 +4273,44 @@ fn text_reveal_advances_by_wait_and_full_half_delay() {
         GroupSpec::new(OP_END),
     ]];
     let mut vm = boot(b);
+    // 合成样本没有 gfx 层;注入目标层表面尺寸(引擎在 tick 前从 gfx 查询)。
+    // 真实路径要求 `TEXT[ID]` 命中已存在层(官方 `state+0x00 != 0`)。
+    vm.set_text_window(Some((800, 600)));
 
     // tick 1(0ms):命令执行到 RETURNCODE 让出;本 tick 尚无显示段推进。
     vm.tick_at(0, &no_input());
     let s = vm.text_state();
     assert_eq!(s.output_mode, 1);
-    assert_eq!((s.reveal_flags, s.reveal_bytes, s.reveal_chars), (0, 0, 0));
+    assert_eq!((s.reveal_flags, s.reveal_bytes), (0, 0));
+    assert_eq!(vm.text_steps_len(), 0);
 
     // tick 2(16ms):行首 A 立即显示;あ 的 15ms 未到。
     vm.tick_at(16, &no_input());
     let s = vm.text_state();
-    assert_eq!((s.reveal_flags, s.reveal_bytes, s.reveal_chars), (1, 1, 1));
+    assert_eq!((s.reveal_flags, s.reveal_bytes), (1, 1));
     assert!(!s.click);
 
     // tick 3(30ms):now-last=14 < 15,仍只 A。
     vm.tick_at(30, &no_input());
-    assert_eq!(vm.text_state().reveal_chars, 1, "全角延迟 15ms 未到");
+    assert_eq!(vm.text_state().reveal_bytes, 1, "全角延迟 15ms 未到");
 
     // tick 4(31ms):满 15ms,あ 显示;随后遇到 'C' 停。
     vm.tick_at(31, &no_input());
     let s = vm.text_state();
-    assert_eq!((s.reveal_flags, s.reveal_bytes, s.reveal_chars), (2, 3, 2));
+    assert_eq!((s.reveal_flags, s.reveal_bytes), (2, 3));
     assert!(s.click, "'C' = 点击等待");
 
-    // tick 5(47ms):点击恢复 → finish_line 提交 → END。
+    // tick 5(47ms):点击消费 'C' → R/P/E;默认 AUTOPAGE=1 ⇒ 'P' 清页。
     let mut tl = InputTimeline::new();
     tl.set(5, InputFrame::new(["MOUSE_L"]));
     vm.tick_at(47, &tl);
+    // 点击在 post-layout 只消费 'C';R/P/E 下一帧处理(官方 FUN_004046fc)。
+    vm.tick_at(63, &no_input());
     let s = vm.text_state();
-    assert_eq!(s.reveal_chars, 2, "恢复后可见字符数不倒退");
     assert!(!s.click);
+    assert_eq!((s.cursor_x, s.cursor_y), (0, 0), "'P' 复位光标");
+    assert_eq!(s.page_clear_seq, 1, "'P' 换页代数 +1");
+    assert_eq!(s.reveal_flags, 0, "行完成清待显示缓冲");
 }
 
 #[test]
@@ -4312,17 +4335,21 @@ fn text_reveal_autoclick_off_resumes_without_input() {
         GroupSpec::new(OP_END),
     ]];
     let mut vm = boot(b);
+    vm.set_text_window(Some((800, 600)));
 
     // tick 1:第一行让出。
     vm.tick_at(0, &no_input());
-    assert_eq!(vm.text_state().reveal_chars, 0);
-    // tick 2(16ms):A 显示 + R/P/E 消费完 → 无输入恢复 → WORD B 让出。
+    assert_eq!(vm.text_state().reveal_flags, 0);
+    // tick 2(16ms):A 显示 → R/P/E 消费完;默认 AUTOPAGE=1 ⇒ 'P' 清页,
+    // 无输入恢复 → WORD B 让出。
     vm.tick_at(16, &no_input());
     let s = vm.text_state();
-    assert_eq!(s.reveal_chars, 1, "A 已提交;B 尚未显示");
-    // tick 3(32ms):B 显示 + 行尾消费完 → 恢复 → END。
+    assert_eq!(s.page_clear_seq, 1, "第一行结束清页");
+    assert_eq!((s.cursor_x, s.cursor_y), (0, 0));
+    assert_eq!(s.reveal_flags, 0, "行完成清待显示缓冲");
+    // tick 3(32ms):B 显示 → 行尾再清页 → 恢复 → END。
     vm.tick_at(32, &no_input());
-    assert_eq!(vm.text_state().reveal_chars, 2);
+    assert_eq!(vm.text_state().page_clear_seq, 2);
 }
 
 /// R9 回归:`GOSUB` 允许 64 次嵌套,第 65 次 Fatal。
@@ -6818,4 +6845,113 @@ fn inp_keylast_mouselast_writes_are_applied() {
     );
     assert_eq!(vm.input().keylast(), 0, "_KEYLAST 直接写 0");
     assert_eq!(vm.input().mouselast(), 0, "_MOUSELAST 直接写 0");
+}
+
+/// `TEXT[ID]` 未命中:官方 `0x4538a7` 报错并返回 -1,`state+0x00` 保留旧层,
+/// 同一命令后续参数跳过。合成探针模拟“MSG 存在、NOPE 不存在”。
+#[test]
+fn text_id_unknown_keeps_previous_layer_and_reports() {
+    const OP_RETURNCODE: u8 = 79;
+    const OP_TEXT: u8 = 96;
+    const OP_WORD: u8 = 106;
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TEXT).window(0, ex::s("MSG")),
+        GroupSpec::new(OP_TEXT).window(0, ex::s("NOPE")),
+        GroupSpec::new(OP_WORD).window(0, b"A".to_vec()),
+        GroupSpec::new(OP_RETURNCODE).window(1, Vec::new()),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    vm.set_text_layer_probe(Some(Box::new(|id: &[u8]| {
+        if id == b"MSG" {
+            Some((320, 120))
+        } else {
+            None
+        }
+    })));
+    let _ = vm.tick_at(0, &no_input());
+    assert!(
+        vm.diags().iter().any(|d| d.code == "rt.text.layer"),
+        "未命中必须留诊断: {:?}",
+        vm.diags()
+    );
+    assert_eq!(vm.text_layer_id(), b"MSG", "未命中保留旧层");
+    assert_eq!(
+        vm.text_state().window,
+        Some((320, 120)),
+        "旧层表面尺寸不变"
+    );
+}
+
+/// `TEXTINFO[CX/CY]` 必须反映布局游标(官方 `0x4538cc` 读 `+0x14/+0x18`)。
+///
+/// 合成:`AUTOCLICK=0 AUTOPAGE=0 AUTORETURN=1`,一行 "AB" + `R`:
+/// 布局完成后 `R` 复位 X、`Y += SY(20)`;任务恢复后 TEXTINFO 读到 (0,20)。
+#[test]
+fn textinfo_cx_cy_follow_layout_cursor() {
+    const OP_RETURNCODE: u8 = 79;
+    const OP_TEXT: u8 = 96;
+    const OP_TEXTINFO: u8 = 97;
+    const OP_WORD: u8 = 106;
+    let mut b = ProjectBuilder::new();
+    if let Some((_, params)) = b.commands.iter_mut().find(|(n, _)| *n == "TEXTINFO") {
+        *params = vec![
+            ("ID", 1, 0),
+            ("OUTPUTMODE", 0, 3),
+            ("CX", 0, 3),
+            ("CY", 0, 3),
+            ("CLICK", 0, 3),
+            ("AUTORETURN", 0, 3),
+            ("AUTOPAGE", 0, 3),
+            ("AUTOCLICK", 0, 3),
+            ("LET", 0, 3),
+            ("SET", 0, 3),
+        ];
+    }
+    let cx = with_int_var(&mut b, 0, -1);
+    let cy = with_int_var(&mut b, 1, -1);
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let info = |slot: u8, target: VarRef| {
+        GroupSpec::new(OP_TEXTINFO)
+            .window(slot, ex::i32_(1))
+            .window(8, ex::r#ref(0x40, target.id))
+    };
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TEXT)
+            .window(19, ex::i32_(0)) // AUTOCLICK=0
+            .window(18, ex::i32_(0)) // AUTOPAGE=0
+            .window(17, ex::i32_(1)), // AUTORETURN=1
+        GroupSpec::new(OP_WORD).window(0, b"AB".to_vec()),
+        GroupSpec::new(OP_RETURNCODE).window(1, Vec::new()),
+        info(2, cx),
+        info(3, cy),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    // 合成样本没有 gfx 层;注入目标层表面尺寸(引擎在 tick 前从 gfx 查询)。
+    vm.set_text_window(Some((800, 600)));
+    vm.tick_at(0, &no_input());
+    assert_eq!(vm.text_state().flags, vec![0x31, 0x31, b'R', b'E'], "flags after tick1");
+    let after1 = vm.text_state();
+    assert_eq!(
+        (after1.cursor_x, after1.cursor_y),
+        (0, 0),
+        "tick1 尚未布局"
+    );
+    vm.tick_at(16, &no_input());
+    let dbg = vm.text_state();
+    assert_eq!(
+        (dbg.cursor_x, dbg.cursor_y, dbg.reveal_flags, dbg.bytes.len()),
+        (0, 20, 0, 0),
+        "layout cursor/flags after tick2"
+    );
+    let got = (
+        vm.store().read(cx, &[]).unwrap(),
+        vm.store().read(cy, &[]).unwrap(),
+    );
+    assert_eq!(got, (Value::Int(0), Value::Int(20)), "CX/CY after layout");
 }

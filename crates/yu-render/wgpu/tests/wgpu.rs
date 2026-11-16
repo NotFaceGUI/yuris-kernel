@@ -1414,62 +1414,86 @@ fn text_layout_frames_match_soft_exactly() {
         println!("SKIP text_layout_frames_match_soft_exactly: no system font");
         return;
     }
+    let table = table();
     let mut gfx = state(Viewport::new(64, 32), [0, 0, 0, 255]);
     gfx.consume_events(&[
         VmEvent::FrameStart { frame: 1 },
-        VmEvent::Text {
-            frame: 1,
-            id: Vec::new(),
-            bytes: b"A\x82\xB1B".to_vec(),
-        },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", yu_rt::value::Value::Str(b"TX".to_vec())),
+                arg(&table, "CG", "FILE", yu_rt::value::Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", yu_rt::value::Value::Int(64)),
+                arg(&table, "CG", "SY", yu_rt::value::Value::Int(32)),
+            ],
+        ),
     ]);
-    // 权威 `_TEXT_FLAG`:半角/全角/半角(SX=SY=20 默认)。
-    gfx.sync_text_state(&yu_rt::text::TextSnapshot {
-        layer_id: Vec::new(),
-        bytes: b"A\x82\xB1B".to_vec(),
-        codec: yu_rt::Codec::Cp932,
-        flags: b"121".to_vec(),
+    let glyph = |bytes: &[u8], x: i64, full: bool| {
+        yu_rt::text::TextStep::Glyph(yu_rt::text::TextGlyphDraw {
+            codec: yu_rt::Codec::Cp932,
+            bytes: bytes.iter().copied().collect(),
+            full,
+            x,
+            y: 0,
+            width: 20,
+            height: 20,
+            style: yu_rt::text::TextGlyphStyle {
+                fg: 0x00FF_FFFF,
+                bg: 0x00FF_FFFF,
+                antialias: true,
+                gradation: 0,
+                bold: false,
+            },
+            draw_mode: 0,
+            bno: 1,
+        })
+    };
+    let mut text_frame = yu_rt::text::TextFrame {
+        layer_id: b"TX".to_vec(),
         output_mode: 1,
-        wait_ms: 0,
-        autoreturn: 1,
-        autopage: 1,
-        autoclick: 1,
-        click: false,
-        clear_pending: false,
-        clear_seq: 0,
-        reveal_flags: 0,
-        reveal_bytes: 0,
-        reveal_chars: 0,
-        skip_mode: false,
-        cursor_x: 0,
+        page_clear_seq: 0,
+        cursor_x: 20,
         cursor_y: 0,
-        click_buttons: [1, 13, 0x3ff, 0x3ff],
-        skip_buttons: [17, 0x3ff, 0x3ff, 0x3ff],
-    });
+        click: false,
+        bytes: b"A\x82\xB1B".to_vec(),
+        flags: b"121".to_vec(),
+        font: Default::default(),
+        first_step: 0,
+        total_steps: 1,
+        steps: vec![glyph(b"A", 0, false)],
+    };
+    gfx.apply_text_frame(&text_frame);
+    let frame = gfx.frame();
+    assert_eq!(frame.text_layout.as_ref().map_or(0, |l| l.glyphs.len()), 1);
+    let soft_out = soft.render_frame(&frame);
+    let gpu_out = gpu.render_frame(&frame).expect("render");
+    assert_eq!(soft_out.report.text_glyphs, 1);
+    assert_eq!(gpu_out.report.text_glyphs, 1);
+    assert_eq!(
+        soft_out.surface.rgba, gpu_out.surface.rgba,
+        "text frame must be pixel-identical across backends"
+    );
+
+    // 增量追加(官方逐字吐字):只补画尾部,两端仍逐字节一致。
+    text_frame.first_step = 1;
+    text_frame.total_steps = 3;
+    text_frame.steps = vec![glyph(b"\x82\xB1", 10, true), glyph(b"B", 30, false)];
+    gfx.apply_text_frame(&text_frame);
     let frame = gfx.frame();
     assert_eq!(frame.text_layout.as_ref().map_or(0, |l| l.glyphs.len()), 3);
-
     let soft_out = soft.render_frame(&frame);
     let gpu_out = gpu.render_frame(&frame).expect("render");
     assert_eq!(soft_out.report.text_glyphs, 3);
     assert_eq!(gpu_out.report.text_glyphs, 3);
-    assert_eq!(soft_out.report.text_draws, gpu_out.report.text_draws);
     assert_eq!(
         comparable_text_diags(&soft_out.report.text_diags),
         comparable_text_diags(&gpu_out.report.text_diags)
     );
     assert_eq!(
         soft_out.surface.rgba, gpu_out.surface.rgba,
-        "text frame must be pixel-identical across backends"
+        "incremental text frames must stay pixel-identical"
     );
-
-    // H-P2-02:reveal 截断后 soft/wgpu 同一帧可见 glyph 数一致。
-    gfx.set_text_reveal(Some(1));
-    let truncated = gfx.frame();
-    let soft_one = soft.render_frame(&truncated);
-    let gpu_one = gpu.render_frame(&truncated).expect("render");
-    assert_eq!(soft_one.report.text_glyphs, 1);
-    assert_eq!(gpu_one.report.text_glyphs, 1);
 }
 
 #[test]

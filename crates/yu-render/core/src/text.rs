@@ -433,6 +433,11 @@ fn layout_prefix(layout: &TextLayoutFrame, len: usize) -> u64 {
         glyph.codec.hash(&mut hasher);
         glyph.x.hash(&mut hasher);
         glyph.y.hash(&mut hasher);
+        glyph.width.hash(&mut hasher);
+        glyph.height.hash(&mut hasher);
+        glyph.style.hash(&mut hasher);
+        glyph.draw_mode.hash(&mut hasher);
+        glyph.bno.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -1358,7 +1363,7 @@ impl TextComposer {
         layout: &TextLayoutFrame,
         blend_override: Option<bool>,
     ) -> TextPaintStats {
-        let visible = layout.reveal.unwrap_or(usize::MAX).min(layout.glyphs.len());
+        let visible = layout.glyphs.len();
         match self.paint_layout_range(dst, w, h, layout, blend_override, 0, visible) {
             Ok(stats) | Err(stats) => stats,
         }
@@ -1392,24 +1397,56 @@ impl TextComposer {
         if let Some(ms) = self.load_ms.take() {
             stats.note(&format!("text.font_init: {ms}ms"));
         }
-        let style = &layout.style;
-        let Some((font_style, sy, fallback)) = self.font_style(style) else {
-            stats.note("text.font_missing");
-            return Err(stats);
-        };
-        match &fallback {
-            FaceFallback::None => {}
-            FaceFallback::Name(bytes) => stats.note(&format!(
-                "text.font.name_fallback: {}",
-                String::from_utf8_lossy(bytes)
-            )),
+        let base_style = &layout.style;
+        // 预解析每个字形所需的字体样式:行内 `FONT` 变化时 `SX/SY/AA/BOLD`
+        // 逐字不同;`FaceKey` 只按字体身份解析,按 (SX,SY,AA,BOLD) 缓存。
+        let mut prepared: Vec<(FontStyle, i32)> = Vec::with_capacity(to.saturating_sub(from));
+        let mut style_cache: Vec<((u16, u16, bool, bool), FontStyle, i32)> = Vec::new();
+        let mut fallback_noted = false;
+        for glyph in layout.glyphs.iter().take(to).skip(from) {
+            let key = (
+                glyph.width.max(0) as u16,
+                glyph.height.max(0) as u16,
+                glyph.style.antialias,
+                glyph.style.bold,
+            );
+            if let Some((_, font_style, ascent)) = style_cache
+                .iter()
+                .find(|(cached, _, _)| *cached == key)
+            {
+                prepared.push((font_style.clone(), *ascent));
+                continue;
+            }
+            let mut style = base_style.clone();
+            style.size_x = i64::from(key.0);
+            style.size_y = i64::from(key.1);
+            style.antialias = key.2;
+            style.bold = key.3;
+            style.gradation = i64::from(glyph.style.gradation);
+            style.color = glyph.style.fg & 0x00FF_FFFF;
+            style.color2 = Some(glyph.style.bg & 0x00FF_FFFF);
+            style.draw_mode = i64::from(glyph.draw_mode);
+            let Some((font_style, sy, fallback)) = self.font_style(&style) else {
+                stats.note("text.font_missing");
+                return Err(stats);
+            };
+            if !fallback_noted {
+                match &fallback {
+                    FaceFallback::None => {}
+                    FaceFallback::Name(bytes) => stats.note(&format!(
+                        "text.font.name_fallback: {}",
+                        String::from_utf8_lossy(bytes)
+                    )),
+                }
+                fallback_noted = true;
+            }
+            let Some(ascent) = self.ascent_px(font_style.face, sy) else {
+                stats.note("text.metrics_unavailable");
+                return Err(stats);
+            };
+            style_cache.push((key, font_style.clone(), ascent));
+            prepared.push((font_style, ascent));
         }
-        let Some(ascent) = self.ascent_px(font_style.face, sy) else {
-            stats.note("text.metrics_unavailable");
-            return Err(stats);
-        };
-        // 自动文本层:1 次合成(引擎未取证重复;`_TEXT_FLAG` 只控排版)。
-        let blended = blend_override.unwrap_or(font_style.draw_mode == DrawMode::Blend);
         // 先解码再取 `renderer` 的 &mut,避免和 `decode_display_char(&self)` 打架。
         let decoded: Vec<Option<char>> = layout
             .glyphs
@@ -1419,12 +1456,26 @@ impl TextComposer {
             .map(|glyph| self.decode_display_char(glyph.codec, &glyph.bytes))
             .collect();
         let renderer = self.renderer.as_mut().expect("ensured above");
-        for (glyph, ch) in layout.glyphs.iter().take(to).skip(from).zip(decoded) {
+        for ((glyph, ch), (mut font_style, ascent)) in layout
+            .glyphs
+            .iter()
+            .take(to)
+            .skip(from)
+            .zip(decoded)
+            .zip(prepared)
+        {
             let Some(ch) = ch else {
                 stats.missing += 1;
                 stats.note("text.decode_invalid");
                 continue;
             };
+            // 颜色/渐变/合成模式是逐字符快照(官方 `+0x4c/+0x50/+0x5c`,
+            // 以及绘制时刻的 `+0x33` DRAWMODE)。
+            font_style.color = Rgb::from_rgb_u32(glyph.style.fg & 0x00FF_FFFF);
+            font_style.color2 = Rgb::from_rgb_u32(glyph.style.bg & 0x00FF_FFFF);
+            font_style.gradation = Gradation::from_script(i64::from(glyph.style.gradation))
+                .unwrap_or(Gradation::Direction { octant: 1 });
+            let blended = blend_override.unwrap_or(font_style.draw_mode == DrawMode::Blend);
             match renderer.render_glyph(ch, &font_style, StylePolicy::Reference) {
                 Ok(image) => {
                     let gx = glyph.x as i32 + image.left;
@@ -1573,7 +1624,9 @@ impl TextComposer {
         resolve_base: impl FnOnce() -> Result<Rc<Texture>, String>,
     ) -> Result<(Option<ComposedLayer>, TextPaintStats), String> {
         if let Some(layout) = layout {
-            let visible = layout.reveal.unwrap_or(usize::MAX).min(layout.glyphs.len());
+            // 已提交字形是 append-only(`'P'` 换页才清);尾部增长 = 逐字
+            // 吐字,只补画新增部分。
+            let visible = layout.glyphs.len();
             let header = layout_header(layout);
             // 布局缓存:头部(字体/原点/行高)不变、且已画字形前缀逐项未变时,
             // 同 `visible` = 纯命中,`visible` 变大 = 只补画新露出的尾部(逐字
@@ -2073,24 +2126,29 @@ mod tests {
     fn layout_cache_incremental_matches_full_rebake() {
         use yu_gfx::{TextFlagsSource, TextGlyph, TextStyle};
 
-        fn layout_of(glyphs: &[(&[u8], i64)], reveal: Option<usize>) -> TextLayoutFrame {
+        fn layout_of(glyphs: &[(&[u8], i64)], visible: usize) -> TextLayoutFrame {
+            let shown = glyphs.iter().take(visible).collect::<Vec<_>>();
             TextLayoutFrame {
                 target: Some(LayerId::new(b"T".to_vec())),
                 origin: (0, 0),
                 style: TextStyle::default(),
-                glyphs: glyphs
+                glyphs: shown
                     .iter()
                     .map(|(bytes, x)| TextGlyph {
-                        bytes: bytes.to_vec().into(),
+                        bytes: (*bytes).to_vec().into(),
                         codec: Codec::Cp932,
                         full: true,
                         x: *x,
                         y: 0,
+                        width: 20,
+                        height: 20,
+                        style: yu_gfx::TextGlyphStyle::default(),
+                        draw_mode: 0,
+                        bno: 1,
                     })
                     .collect(),
                 line_height: 20,
-                chars: glyphs.len(),
-                reveal,
+                chars: shown.len(),
                 flags_source: TextFlagsSource::TextFlag,
             }
         }
@@ -2108,7 +2166,7 @@ mod tests {
         };
         let base_rc = Rc::new(base.clone());
         let dims = (base.width, base.height);
-        let full = layout_of(&[(b"\x82\xa0", 0), (b"\x82\xa2", 20)], None);
+        let full = layout_of(&[(b"\x82\xa0", 0), (b"\x82\xa2", 20)], 2);
         let compose = |text: &mut TextComposer, layout: &TextLayoutFrame| {
             text.compose_layer_cached_assets(
                 &layer,
@@ -2126,8 +2184,8 @@ mod tests {
         let (out, _stats) = compose(&mut text, &full);
         let full_pixels = out.expect("baked").texture.rgba.clone();
 
-        // 揭示数回退:从基面重烤(截断不可逆),像素不得等于全量结果。
-        let one = layout_of(&[(b"\x82\xa0", 0), (b"\x82\xa2", 20)], Some(1));
+        // 前缀回退:字形列表变短不可逆,从基面重烤;像素不得等于全量结果。
+        let one = layout_of(&[(b"\x82\xa0", 0), (b"\x82\xa2", 20)], 1);
         let (out, _) = compose(&mut text, &one);
         assert_ne!(
             out.expect("reveal 1").texture.rgba,
@@ -2191,7 +2249,7 @@ mod tests {
         );
 
         // 布局内容变化(第二个字移位)⇒ 代次失效,重烤结果与直接合成一致。
-        let moved = layout_of(&[(b"\x82\xa0", 0), (b"\x82\xa2", 25)], None);
+        let moved = layout_of(&[(b"\x82\xa0", 0), (b"\x82\xa2", 25)], 2);
         let (out, _) = compose(&mut text, &moved);
         let (reference, _) = text.compose_layer_layout_owned(base, &moved);
         assert_eq!(

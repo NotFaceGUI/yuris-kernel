@@ -89,6 +89,10 @@ pub mod rt {
     pub const MOVIE_PLAYBACK: &str = "rt.movie.playback";
     /// `CSV`/`CSVINFO` 的文件不可读(官方 `fopen` 失败 ⇒ 返回 -1)。
     pub const CSV: &str = "rt.csv";
+    /// `_TEXT_FLAG` 含未取证的控制字节(官方 `FUN_00404914` 错误 `0xdbbaa`)。
+    pub const TEXT_FLAG: &str = "rt.text.flag";
+    /// `TEXT[ID]` 未命中已存在层(官方 `0x4538a7` 报错并返回 -1)。
+    pub const TEXT_LAYER: &str = "rt.text.layer";
 }
 
 /// 全部已登记错误码(顺序稳定)。唯一性由单元测试守卫。
@@ -128,6 +132,8 @@ pub const ALL_CODES: &[&str] = &[
     rt::MOVIE_FILE,
     rt::MOVIE_PLAYBACK,
     rt::CSV,
+    rt::TEXT_FLAG,
+    rt::TEXT_LAYER,
 ];
 
 /// 码是否已登记。

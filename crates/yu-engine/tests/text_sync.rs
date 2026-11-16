@@ -60,7 +60,9 @@ fn auto_project() -> ProjectBuilder {
         // `FILE=""` 是官方 1×1 黑图建层路径。
         GroupSpec::new(OP_CG)
             .window(0, ex::s("MSG"))
-            .window(2, ex::s("")),
+            .window(2, ex::s(""))
+            .window(3, ex::i32_(320))
+            .window(4, ex::i32_(120)),
         text(0, ex::s("MSG")),
         GroupSpec::new(OP_WORD).window(0, b"A".to_vec()),
         GroupSpec::new(OP_RETURNCODE).window(1, Vec::new()),
@@ -129,35 +131,33 @@ fn engine_manual_mode_does_not_draw_auto_text_layer() {
     engine.tick().expect("tick 1");
     let frame = engine.last_frame().expect("frame 1");
     assert!(
-        frame.text.is_empty() && frame.text_layout.is_none(),
-        "手动模式不得出现自动文本层(否则 CGACT[TEXT] 之外多画一遍)"
+        frame.text_layout.is_none(),
+        "手动模式不得自动绘制(否则 CGACT[TEXT] 之外多画一遍)"
     );
 
     // 手动模式下一 tick 自动恢复;仍不应出现自动层。
     engine.tick().expect("tick 2");
     let frame = engine.last_frame().expect("frame 2");
-    assert!(frame.text.is_empty() && frame.text_layout.is_none());
+    assert!(frame.text_layout.is_none());
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn engine_auto_mode_reveals_and_clears_text_layer() {
+fn engine_auto_mode_advances_one_line_per_page() {
     let (mut engine, root) = engine_for(&auto_project(), "auto");
 
-    // tick 1(0ms):CG + TEXT[ID] + WORD A + RETURNCODE 让出。自动层已同步,
-    // 但本 tick 尚未推进 reveal ⇒ 可见 0 字。
+    // tick 1:CG + TEXT[ID] + WORD A + RETURNCODE 让出;官方布局在下一
+    // 帧的 `FUN_004046fc` 才推进,本帧没有已提交字形。
     engine.tick().expect("tick 1");
     let frame = engine.last_frame().expect("frame 1");
-    let layout = frame.text_layout.as_ref().expect("auto layout 1");
+    assert!(frame.text_layout.is_none(), "布局在下一 tick 才推进");
     assert_eq!(
-        layout.target,
-        Some(yu_gfx::path::normalize(b"MSG", None, false).path),
-        "TEXT[ID] 必须命中 CG 建的规范化图层"
+        frame.text.last().map(|t| t.bytes.clone()),
+        Some(b"A".to_vec()),
+        "待显示缓冲镜像"
     );
-    assert_eq!(layout.glyphs.len(), 1);
-    assert_eq!(layout.reveal, Some(0), "行首字符下一 tick 才显示");
 
-    // tick 2(16ms):A 立即显示,随后遇 'C' 停;等待推进输入。
+    // tick 2:A 立即显示,随后遇 'C' 停。
     engine.tick().expect("tick 2");
     let layout = engine
         .last_frame()
@@ -165,36 +165,62 @@ fn engine_auto_mode_reveals_and_clears_text_layer() {
         .text_layout
         .clone()
         .expect("layout 2");
-    assert_eq!(layout.reveal, Some(1), "A 可见");
+    assert_eq!(
+        layout.target,
+        Some(yu_gfx::path::normalize(b"MSG", None, false).path),
+        "TEXT[ID] 必须命中 CG 建的规范化图层"
+    );
+    assert_eq!(layout.glyphs.len(), 1, "A 已提交");
+    assert_eq!((layout.glyphs[0].x, layout.glyphs[0].y), (0, 0));
+    // 已提交字形必须真的进入层表面像素(不只是投影)。
+    let ink = |engine: &Engine| {
+        engine.last_surface().map_or(0, |s| {
+            s.rgba
+                .chunks_exact(4)
+                .filter(|px| px[0] > 0 || px[1] > 0 || px[2] > 0)
+                .count()
+        })
+    };
+    assert!(ink(&engine) > 0, "自动文本必须可见");
 
-    // tick 3:点击恢复 → 提交 A → 执行 WORD B(新段尚未显示)。
+    // tick 3:点击在 post-layout 只消费 'C'(官方 pre-layout 只查 SKIP
+    // 按钮);本帧 A 仍留在表面,不立即清页。
     engine.set_input("MOUSE_L", true);
     engine.tick().expect("tick 3");
     engine.set_input("MOUSE_L", false);
-    let layout = engine
-        .last_frame()
-        .expect("frame 3")
-        .text_layout
-        .clone()
-        .expect("layout 3");
-    assert_eq!(layout.glyphs.len(), 2, "缓冲已有 A/B");
-    assert_eq!(layout.reveal, Some(1), "B 属于新段,尚未显示");
+    let frame = engine.last_frame().expect("frame 3");
+    assert_eq!(
+        frame.text_layout.as_ref().map(|l| l.glyphs.len()),
+        Some(1),
+        "点击当帧只消费 'C',R/P/E 下一帧"
+    );
+    assert!(ink(&engine) > 0);
 
-    // tick 4:释放后推进 B,遇 'C' 停。
+    // tick 4:R/P/E → 默认 AUTOPAGE=1 的 'P' 清页;随后恢复并执行 WORD B。
     engine.tick().expect("tick 4");
+    assert!(
+        engine.last_frame().expect("frame 4").text_layout.is_none(),
+        "默认一行一页:'P' 清掉 A 的像素"
+    );
+    assert_eq!(ink(&engine), 0, "'P' 后层表面没有文字像素");
+
+    // tick 5:B 立即显示,遇 'C' 停。
+    engine.tick().expect("tick 5");
     let layout = engine
         .last_frame()
-        .expect("frame 4")
+        .expect("frame 5")
         .text_layout
         .clone()
-        .expect("layout 4");
-    assert_eq!(layout.reveal, Some(2), "A+B 可见");
+        .expect("layout 5");
+    assert_eq!(layout.glyphs.len(), 1, "B 已提交");
 
-    // tick 5:点击恢复 → 提交 B → TEXT[CLEAR] → END;显示层清空。
+    // tick 6:点击消费 B 的 'C';tick 7:R/P/E → 'P' 清页 → TEXT[CLEAR] → END。
     engine.set_input("MOUSE_L", true);
-    engine.tick().expect("tick 5");
-    let frame = engine.last_frame().expect("frame 5");
-    assert!(frame.text.is_empty(), "TEXT[CLEAR] 后当前层为空");
+    engine.tick().expect("tick 6");
+    engine.set_input("MOUSE_L", false);
+    engine.tick().expect("tick 7");
+    let frame = engine.last_frame().expect("frame 7");
     assert!(frame.text_layout.is_none());
+    assert!(frame.text.is_empty());
     let _ = std::fs::remove_dir_all(&root);
 }

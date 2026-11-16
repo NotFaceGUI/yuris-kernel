@@ -727,8 +727,15 @@ fn eris_real_scenario_text_path_emits_expected_flags() {
         tl.set(f + 1, InputFrame::new(std::iter::empty::<&str>()));
         f += 10;
     }
+    // RP_101 是 userscript 文本测试(s133):10 行 WORD+RETURNCODE,本身
+    // 不建文本层。官方 setup 由运行环境提供目标层;合成夹具显式注入一个
+    // 足够大的表面,避免按“无目标层不推进”的官方语义停死。
+    vm.set_text_window(Some((800, 600)));
+
     let mut texts: Vec<Vec<u8>> = Vec::new();
     let mut returncodes = 0usize;
+    let mut flags_by_line: Vec<Vec<u8>> = Vec::new();
+    let mut seen_rc = 0usize;
     let mut finished = None;
     for frame in 0..120u32 {
         let r = vm.tick_at(frame * 16, &tl);
@@ -738,6 +745,11 @@ fn eris_real_scenario_text_path_emits_expected_flags() {
                 VmEvent::ReturnCode { .. } => returncodes += 1,
                 _ => {}
             }
+        }
+        if returncodes > seen_rc {
+            // RETURNCODE 当帧任务让出,待显示缓冲尚未清;取本行标志流。
+            flags_by_line.push(vm.text_flags());
+            seen_rc = returncodes;
         }
         if r.main_finished {
             finished = Some(frame);
@@ -754,11 +766,24 @@ fn eris_real_scenario_text_path_emits_expected_flags() {
         ],
         "首行 CP932 原样透传"
     );
-    let flags = vm.text_flags();
-    assert_eq!(flags.len(), 106, "66 个全角字 + 10 行 × C/R/P/E");
-    assert!(flags[..10].iter().all(|b| *b == b'2'), "首行 10 个全角标志");
-    assert_eq!(&flags[10..14], b"CRPE", "自动行尾 C/R/P/E");
-    assert_eq!(&flags[flags.len() - 4..], b"CRPE", "末行同样 C/R/P/E");
+    // 行完成清待显示缓冲(官方 `+0x36` → `FUN_004638e4`);所以按行快照,
+    // 不再断言“最后累积 106 个标志”。
+    assert_eq!(flags_by_line.len(), 10, "每行一份标志流");
+    assert_eq!(flags_by_line[0].len(), 14, "首行 10 个全角字 + C/R/P/E");
+    assert!(
+        flags_by_line[0][..10].iter().all(|b| *b == b'2'),
+        "首行 10 个全角标志"
+    );
+    assert_eq!(&flags_by_line[0][10..], b"CRPE", "自动行尾 C/R/P/E");
+    let total_chars: usize = flags_by_line.iter().map(|f| f.len().saturating_sub(4)).sum();
+    assert_eq!(total_chars, 66, "10 行共 66 个全角字");
+    assert!(
+        flags_by_line
+            .iter()
+            .filter(|f| f.len() >= 4)
+            .all(|f| f.ends_with(b"CRPE")),
+        "每行末尾都是 C/R/P/E"
+    );
     assert!(finished.is_some(), "RP_101 应在 120 帧内结束");
 }
 

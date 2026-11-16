@@ -75,7 +75,7 @@ pub use pass::{Pass, PassTarget};
 pub use state::{GfxConfig, GfxState, TextView, TextureSampler};
 pub use table::{ParamTable, ResolvedArg};
 pub use text::{
-    layout_text, GlyphAtlasRef, TextDraw, TextDrawKey, TextFlagsSource, TextFontRequest,
-    TextGlyph, TextImage, TextLayoutFrame, TextRun, TextStroke, TextStyle,
+    GlyphAtlasRef, TextDraw, TextDrawKey, TextFlagsSource, TextFontRequest, TextGlyph,
+    TextGlyphStyle, TextImage, TextLayoutFrame, TextRun, TextStroke, TextStyle,
 };
 pub use transition::TransitionDraw;

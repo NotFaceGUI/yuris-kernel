@@ -501,14 +501,11 @@ impl Scheduler {
             // 手动模式 = 一帧休憩(手册 basic/task.html「一旦休憩します」);
             // 把它当成"等点击"会让没有输入驱动的初始化链永久停住。
             if nodes[i].text_rest {
-                // 自动模式:先按 WAIT 推进文本(`advance_reveal` 在
-                // `tick_at` 入口已跑);只有“推进输入”或“本段已推进到
-                // 末尾”才恢复。停在 `'C'` 时必须等输入(REA
-                // `FUN_004046fc` `0x404818`;`0x4047ee` 按钮路径)。
-                if exec.text_auto_mode()
-                    && !exec.text_advance_requested()
-                    && !exec.text_reveal_complete()
-                {
+                // 自动模式:按钮推进已在 `Vm::tick_at` 的 `advance_reveal`
+                // 内消费(官方 `FUN_004046fc` 先处理按钮再布局);调度器只按
+                // 官方收尾判据(`0x404818`:标志游标 >= 总数)恢复。
+                // 停在 `'C'` 时游标未到末尾 ⇒ 继续等输入。
+                if exec.text_auto_mode() && !exec.text_reveal_complete() {
                     continue;
                 }
                 nodes[i].text_rest = false;

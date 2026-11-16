@@ -763,13 +763,24 @@ impl InputState {
         click_buttons: &[i64; 4],
         skip_buttons: &[i64; 4],
     ) -> bool {
-        let click = click_buttons
+        self.text_click_requested(click_buttons) || self.text_skip_requested(skip_buttons)
+    }
+
+    /// 点击按钮出现按下沿(`==1`)。
+    ///
+    /// 官方 `FUN_004046fc` 的 **post-layout** 检查才包含点击按钮
+    /// (`0x5b48ac..`);pre-layout 只检查跳过按钮(`0x5b48bc..`)。
+    pub fn text_click_requested(&self, click_buttons: &[i64; 4]) -> bool {
+        click_buttons
             .iter()
-            .any(|code| *code > 0 && *code != 0x3ff && self.counter_code(*code) == 1);
-        let skip = skip_buttons
+            .any(|code| *code > 0 && *code != 0x3ff && self.counter_code(*code) == 1)
+    }
+
+    /// 跳过按钮按住(`>0`)。
+    pub fn text_skip_requested(&self, skip_buttons: &[i64; 4]) -> bool {
+        skip_buttons
             .iter()
-            .any(|code| *code > 0 && *code != 0x3ff && self.counter_code(*code) > 0);
-        click || skip
+            .any(|code| *code > 0 && *code != 0x3ff && self.counter_code(*code) > 0)
     }
 
     /// 手柄按钮码的计数器/累计次数(无注入恒 0)。

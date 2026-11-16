@@ -599,6 +599,12 @@ pub struct Vm {
     /// 显示文本层状态(`$_TEXT`/`$_TEXT_FLAG`/`TEXTINFO` 的数据源;
     /// 引擎 `[0x801800]` 的已取证字段,见 [`crate::text`])。
     text: crate::text::TextState,
+    /// `TEXT[ID]` 解析探针(引擎 `FUN_00414559`:只解析**已存在**的层)。
+    ///
+    /// 返回该层当前表面宽高(引擎 `*(L+0x34)` 的 `+0x78/+0x7c`)。引擎
+    /// 安装后,`TEXT[ID]` 未命中按官方错误路径中止并保留旧层;未安装
+    /// (纯 VM 单测)时按旧行为接受 ID,由宿主自行判定。
+    text_layer_probe: Option<Box<dyn FnMut(&[u8]) -> Option<(i64, i64)>>>,
     /// 执行层全局字符串 codec(官方汉化版全局 GBK)。
     script_codec: yu_format::Codec,
     /// 路径/文件名 codec(通常 CP932;补丁不改文件名)。
@@ -884,6 +890,7 @@ impl Vm {
             decode_cache_entries: 0,
             texts: BTreeMap::new(),
             text: crate::text::TextState::with_codec(cfg.display.default),
+            text_layer_probe: None,
             script_codec: cfg.codecs.script,
             name_codec: cfg.codecs.name,
             display: cfg.display,
@@ -1469,24 +1476,55 @@ impl Vm {
         &self.text.flags
     }
 
-    /// 文本层状态快照(宿主/gfx 桥读取;加法式 API,不改事件字段)。
-    pub fn text_state(&self) -> crate::text::TextSnapshot {
-        crate::text::TextSnapshot::from(&self.text)
-    }
-
     /// 当前文本输出模式(引擎 `[state+0x1c]`):1 = 自动,其余 = 手动。
-    ///
-    /// 宿主先读它再决定是否需要 [`Self::text_state`] 的完整快照(手动
-    /// 模式只走 `clear_text()`,快照的三个 Vec 克隆完全用不到,#4)。
     pub fn text_output_mode(&self) -> u8 {
         self.text.output_mode
     }
 
-    /// 宿主渲染器推进文本光标后推入(`TEXTINFO[CX/CY]` 的数据源)。
-    /// 引擎里 `+0x14/+0x18` 由显示例程更新;yu-rt 不绘制,故由宿主注入。
-    pub fn set_text_cursor(&mut self, x: i64, y: i64) {
-        self.text.cursor_x = x;
-        self.text.cursor_y = y;
+    /// 文本层状态快照(诊断/探针;渲染走 [`Self::text_frame`])。
+    pub fn text_state(&self) -> crate::text::TextSnapshot {
+        crate::text::TextSnapshot::from(&self.text)
+    }
+
+    /// 文本增量(引擎 `FUN_00404914` 的 step 日志;`since` = 已应用步数)。
+    pub fn text_frame(&self, since: usize) -> crate::text::TextFrame {
+        self.text.text_frame(since)
+    }
+
+    /// 当前页已产生的 step 总数(增量拉取的游标上限)。
+    pub fn text_steps_len(&self) -> usize {
+        self.text.steps_len()
+    }
+
+    /// `'P'` 换页代数(gfx 据此重置已提交字形)。
+    pub fn text_page_clear_seq(&self) -> u64 {
+        self.text.page_clear_seq
+    }
+
+    /// 官方 `FUN_004046fc` 的按钮拆分:pre-layout 只用 skip,post 用 click|skip。
+    fn text_advance_buttons(&self) -> (bool, bool) {
+        (
+            self.input.text_click_requested(&self.text.click_buttons),
+            self.input.text_skip_requested(&self.text.skip_buttons),
+        )
+    }
+
+    /// 当前文本层 ID 原始字节(引擎 `state+0x00` 的来源;gfx 按路径规范化)。
+    pub fn text_layer_id(&self) -> &[u8] {
+        &self.text.layer_id
+    }
+
+    /// 安装 `TEXT[ID]` 解析探针(引擎在 gfx 就绪后注入)。
+    pub fn set_text_layer_probe(
+        &mut self,
+        probe: Option<Box<dyn FnMut(&[u8]) -> Option<(i64, i64)>>>,
+    ) {
+        self.text_layer_probe = probe;
+    }
+
+    /// 注入目标层表面宽高(引擎每 tick 从 gfx 当前状态查询后推入)。
+    pub fn set_text_window(&mut self, size: Option<(i64, i64)>) {
+        self.text.set_window(size);
     }
 
     /// 宿主渲染器到达点击等待标志后推入(`TEXTINFO[CLICK]` 的数据源)。
@@ -1522,9 +1560,9 @@ impl Vm {
     /// 替换显示文本(`$_TEXT` 写入;手册 ○ 可赋值 = 覆盖当前内容)。
     /// 标志流不在此重建:引擎写入路径未取证(`DIV-RT-032` 仍挂写入)。
     pub(crate) fn set_text(&mut self, bytes: Vec<u8>) {
+        // 官方 `0x446b98`(id 0x7a)只把 RHS 逐字节拷进 `[state+0x38]`,
+        // 不重建 `+0x3c/+0x40..+0x5c` 表、不动游标(DIV-RT-032)。
         self.text.bytes = bytes;
-        // 整体替换后逐字延迟表不再对应;不猜新节奏,新内容全显。
-        self.text.reset_reveal_all();
     }
 
     /// 替换 `$_TEXT_FLAG` 控制字节流。
@@ -1533,9 +1571,8 @@ impl Vm {
     /// `[state+0x3c]` 已有的标志缓冲;不改文本缓冲(`+0x38`)、不重建文本、
     /// 不按字符重算标志。P3 收口 DIV-RT-032 的写入路径。
     pub(crate) fn set_text_flags(&mut self, bytes: Vec<u8>) {
+        // 官方同族写入(0x446b98..)：只拷字节;逐字符表/游标保持原样。
         self.text.flags = bytes;
-        // 标志流被整体替换:显示段边界失效,新内容全显(见 DIV-RT-032)。
-        self.text.reset_reveal_all();
     }
 
     /// `@_MENUCODE` 读取(菜单域宿主选中项后应经 [`Vm::set_menu_code`] 推入)。
@@ -1937,8 +1974,19 @@ impl Vm {
         // 官方 `FUN_004046fc`(0x4046fc)在每帧调度前推进文本;只对停在
         // `task+9` 的文本任务调用。内核用 `tick_at(now_ms)` 的毫秒做时钟
         // (与 `timeGetTime()` 同单位,REA 0x404c21),不读墙钟。
+        // 点击/跳过按钮的“推进”语义也在这里消费(官方同函数先处理按钮)。
         if self.scheduler.text_waiting() {
-            self.text.advance_reveal(now_ms);
+            let (click, skip) = self.text_advance_buttons();
+            if let Some(bad) = self.text.advance_reveal(now_ms, click, skip) {
+                self.report(diag::recoverable(
+                    code::rt::TEXT_FLAG,
+                    Boundary::Script,
+                    format!(
+                        "`_TEXT_FLAG` 含未知控制字节 0x{bad:02x};\
+                         官方 `FUN_00404914` 报错误 0xdbbaa 并停止布局"
+                    ),
+                ));
+            }
         }
         let mut sched = std::mem::take(&mut self.scheduler);
         let report = sched.tick_frame(self, now_ms);
@@ -2902,6 +2950,7 @@ impl TaskExecutor for Vm {
             .text_advance_requested(&self.text.click_buttons, &self.text.skip_buttons)
     }
 
+
     /// `TEXT[OUTPUTMODE]`(= 引擎文本状态 `+0x1c`):1 = 自动,其余 = 手动。
     ///
     /// 调度器用它决定 `task+9` 的恢复判据(引擎 `FUN_004046fc`
@@ -2911,20 +2960,13 @@ impl TaskExecutor for Vm {
         self.text.output_mode == 1
     }
 
-    /// REA `0x4046fc` 手动路径的 `0x404828 call 0x4638e4`:请求位
-    /// `[+0x36]`(RETURNCODE 手动模式 `0x44c437` 置位)在位 ⇒ 清空
-    /// `$_TEXT`(`[+0x38]`)/`$_TEXT_FLAG`(`[+0x3c]`)与内部读位。
+    /// 释放文本任务时消费 `+0x36` 清待显示缓冲请求。
+    ///
+    /// 官方 `FUN_004046fc` 两种模式最终都走 `0x404828 call 0x4638e4`;
+    /// 该例程只在 `+0x36` 在位时清 `$_TEXT`/`$_TEXT_FLAG` 与四个游标,
+    /// **不触碰**光标/点击状态/图层表面。
     fn consume_text_clear_request(&mut self) {
-        if self.text.output_mode == 1 {
-            // 自动模式:恢复点 = `FUN_004046fc` 的按钮/完成路径。先把当前
-            // 显示段快进到末尾并提交(点击跳过/行尾 R/P/E),像素留在
-            // 内核累积缓冲里(对应官方表面保留)。
-            self.text.finish_line();
-        } else if self.text.clear_pending {
-            // 手动模式:引擎 `0x404828 call 0x4638e4`,清 `$_TEXT`/
-            // `$_TEXT_FLAG` 与内部读位(`RETURNCODE 0x44c437` 置位)。
-            self.text.clear();
-        }
+        self.text.consume_clear_request();
     }
 
     /// 自动模式当前显示段是否已推进到缓冲末尾(`FUN_004046fc` 收尾判据

@@ -758,6 +758,10 @@ pub struct Engine {
     identity: crate::identity::Identity,
     vm: Option<Vm>,
     state: Option<Rc<RefCell<GfxState>>>,
+    /// 自动文本 step 增量游标(已应用步数 / 当前层 / 换页代数)。
+    text_applied: usize,
+    text_page_seq: u64,
+    text_layer_seq: Vec<u8>,
     /// 声音域状态（与 `SoundHost` 共享；用于取走 `snd.*` 诊断）。
     sound: Option<Arc<Mutex<SoundState>>>,
     /// 存档域宿主(P4 M-C;事件事实消费,含共享 `SaveState`)。
@@ -990,6 +994,9 @@ impl Engine {
             identity,
             vm: Some(vm),
             state: Some(state),
+            text_applied: 0,
+            text_page_seq: 0,
+            text_layer_seq: Vec::new(),
             sound,
             save_host,
             sound_diags: Vec::new(),
@@ -1505,6 +1512,19 @@ impl Engine {
                 }
             }
         }
+        // 布局前注入 `TEXT[ID]` 目标层的表面尺寸(官方 `FUN_00404914`
+        // 读 `*(L+0x34)+0x78/+0x7c`);层不存在 ⇒ None,官方入口直接返回。
+        {
+            let layer = vm.text_layer_id().to_vec();
+            let size = self.state.as_ref().and_then(|state| {
+                if layer.is_empty() {
+                    None
+                } else {
+                    state.borrow().text_layer_surface(&layer)
+                }
+            });
+            vm.set_text_window(size);
+        }
         let chain = vm.tick_at(now_ms, &self.timeline);
         // **tick 内部分段**(`tuning.tick_split`):真机出现过
         // `tick=441ms` 而 `build=20ms`/`render=35ms`/`cmds` 与邻帧相同的情况
@@ -1542,16 +1562,25 @@ impl Engine {
         // 同步喂给 `SaveHost`(与 Graphics/Sound 同口径),这里不得重复消费。
         let events = vm.take_events();
         self.events_drained += events.len() as u64;
+        // 自动文本增量必须在这里取:后面会调用 `&mut self` 方法,`vm`
+        // 的借用必须在此之前结束。官方 `FUN_004046fc` 的布局已在
+        // `vm.tick_at` 内完成,这里只做增量投影。
+        let text_frame = if vm.text_output_mode() == 1 {
+            let same = vm.text_layer_id() == self.text_layer_seq.as_slice()
+                && vm.text_page_clear_seq() == self.text_page_seq;
+            let since = if same { self.text_applied } else { 0 };
+            let frame = vm.text_frame(since);
+            self.text_applied = frame.total_steps;
+            self.text_page_seq = frame.page_clear_seq;
+            self.text_layer_seq = frame.layer_id.clone();
+            Some(frame)
+        } else {
+            None
+        };
         // `MOUSE[X/Y]`:内核已改脚本可见坐标;宿主同步到时间线,下一帧
         // 的光标与脚本看到的一致(引擎同时 SetCursorPos)。
         let warp = vm.input_state_mut().take_cursor_warp();
         let (cursor_x, cursor_y) = vm.input().cursor();
-        // 文本状态快照在本 tick 的 VM 语义全部结束后取(之后只同步宿主
-        // 光标/事件,不再改 VM 文本);放到这里也避免 `vm` 借用跨到
-        // `self.sync_input()`/`self.sync_movie_overlay()`。
-        // #4:先读输出模式;手动模式(ERIS 正文走 CGACT[TEXT])只用
-        // `clear_text()`,不必构造 TextSnapshot 的三份 Vec 克隆。
-        let text_snapshot = (vm.text_output_mode() == 1).then(|| vm.text_state());
         if let Some((x, y)) = warp {
             self.cursor = (x.unwrap_or(cursor_x), y.unwrap_or(cursor_y));
             self.sync_input();
@@ -1629,18 +1658,20 @@ impl Engine {
                 .as_ref()
                 .ok_or_else(|| Failure::runtime("engine 未启动"))?;
             let mut gfx = state.borrow_mut();
-            if let Some(text_snapshot) = text_snapshot.as_ref() {
-                // 自动模式:引擎自己绘制 `+0x38`;按 WAIT 逐字推进
-                // (`FUN_004046fc`/`FUN_00404914`),宿主/后端不自建计时器。
-                gfx.sync_text_state(text_snapshot);
-                gfx.set_text_reveal(Some(text_snapshot.reveal_chars));
-            } else {
-                // 手动模式:官方 `FUN_004046fc` 直接清+恢复,不调用
-                // `FUN_00404914` ⇒ **没有引擎自动绘制**。ERIS 正文由脚本
-                // `CGACT[TEXT]` 画到文本框;若这里仍同步自动层,同一行会
-                // 在 (0,0) 多画一遍(2026-11-04 实测左上角多余文本)。
-                // 清掉内核自动层,不触碰 `text_draws`(CGACT 路径)。
-                gfx.clear_text();
+            match text_frame {
+                Some(frame) => {
+                    // 自动模式:官方 `FUN_004046fc`/`FUN_00404914` 逐字把
+                    // 文本写进 `TEXT[ID]` 层表面。VM 已维护“已提交 step
+                    // 日志”,这里只做增量应用;后端不自建计时/reveal。
+                    gfx.apply_text_frame(&frame);
+                }
+                None => {
+                    // 手动模式(ERIS 正文走 `CGACT[TEXT]`):官方不调用
+                    // `FUN_00404914`,没有自动绘制;已提交像素(若有)保留,
+                    // **不**清自动层。只清待显示诊断镜像,避免
+                    // `VmEvent::Text` 无界累积。
+                    gfx.clear_text_pending();
+                }
             }
         }
         let t_after_text = tick_started.elapsed();
@@ -2923,6 +2954,18 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         yu_gfx::MipFilter::Point,
     ));
     let state = Rc::new(RefCell::new(gfx_state));
+    // `TEXT[ID]` 只解析**已存在**层(官方 `FUN_00414559`);VM 在 TEXT 命令
+    // 时刻同步查 gfx,命中则拿到层表面宽高(引擎 `*(L+0x34)+0x78/+0x7c`)。
+    {
+        let gfx = Rc::clone(&state);
+        vm.set_text_layer_probe(Some(Box::new(move |id: &[u8]| {
+            // 命令执行期间宿主不应持有 gfx 借出;用 try_borrow 防御,
+            // 冲突按“层不可解析”处理(官方错误路径),不 panic。
+            gfx.try_borrow()
+                .ok()
+                .and_then(|g| g.text_layer_surface(id))
+        })));
+    }
     let mut gfx_host = GfxHost::new(state.clone());
     // `CGINFO[ONMOUSE*]` 需要像素;宿主用独立 `TextureStore` 提供采样面。
     // 打开数据源失败时保持 None,查询按 Unimplemented 挂号(不猜 0)。

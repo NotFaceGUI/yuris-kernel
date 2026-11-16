@@ -598,6 +598,17 @@ impl Vm {
                         _ => {}
                     }
                 }
+                // `FONT` 同时写引擎文本状态 `+0x20..+0x34`(逐字符快照的
+                // 来源)。内核 gfx 仍按域事件消费字体;VM 侧只需同步文本
+                // 子集,保证 `WORD`/`_` 追加时能按官方快照。
+                if domain == Domain::Graphics && cmd.name == "FONT" {
+                    let args = domain_args
+                        .take()
+                        .unwrap_or_else(|| self.eval_arg_windows(st, cmd));
+                    self.apply_text_font(cmd, &args);
+                    self.emit_domain_borrowed(domain, &cmd.name, args);
+                    return Ok(StepOutcome::Continue);
+                }
                 // 域命令的参数是宿主域状态机唯一能看到的输入;必须带上
                 // 求值结果(槽号 = 工程 ysc 表的参数序号)。`record_events`
                 // 只控制通用 Command 事件,不影响域事件。
@@ -4931,6 +4942,30 @@ impl Vm {
     /// 同时给 CLICK 与 CLEAR 时,引擎确实不执行 CLEAR)。
     ///
     /// 台账:`COV-M-02`(见 `docs/coverage-matrix.md`)。
+    /// `FONT`:把文本状态子集(`+0x20..+0x34`)按参数名写入。
+    ///
+    /// 槽序来自工程 ysc(`probe_cmd_params` 实测 `0 BNO 1 NO 2 NAME
+    /// 3 ANTIALIASING 4 COLOR 5 COLOR2 6 GRADATION 7 ROTATION
+    /// 8 DRAWMODE 9 SX 10 SY 11 BOLD`);`NO/NAME/ROTATION` 归字体对象,
+    /// 文本状态只保存 `+0x20..+0x34`。
+    fn apply_text_font(&mut self, cmd: &Cmd, args: &[ArgValue]) {
+        let names = &cmd.param_names;
+        for a in args {
+            let Some(name) = names.get(usize::from(a.slot)).map(String::as_str) else {
+                continue;
+            };
+            let mut v = a.value.as_int().unwrap_or(0); // silent-ok: FONT 值槽非整数按 0(官方 checker 已拒绝)
+            // `FONT[SX+=…]`/`[COLOR-=…]`:官方参数算子对当前状态做
+            // `current + v`(`-=` 的值已在 compose_window_arg 取负)。
+            if a.offset {
+                if let Some(current) = self.text.font_param(name) {
+                    v = current.wrapping_add(v);
+                }
+            }
+            self.text.apply_font_param(name, v);
+        }
+    }
+
     fn op_text(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         use crate::text::flag as tflag;
         // 参数名来自工程 ysc 表(opcode → 命令声明),不写死槽号。
@@ -4956,8 +4991,37 @@ impl Vm {
         // p0 ID:目标文本层(CP932 原始字节)。
         // REA 0x453467 求值到字节缓冲后交 0x414559 解析图层:MurmurHash2 +
         // 逐字节比较,不校验 UTF-8;非 ASCII ID 合法(手册 text/text.html ID)。
+        // 未命中:官方 0x4538a7 报错并返回 -1,**不更新 state+0x00**(保留
+        // 旧层),同一命令后续参数全部跳过。探针未安装(纯 VM 单测)时按
+        // 旧行为接受,由宿主判定。
         if let Some(Value::Str(b)) = get("ID") {
-            self.text.layer_id = b.clone();
+            let id = b.clone();
+            match self.text_layer_probe.as_mut() {
+                Some(probe) => match probe(&id) {
+                    Some((w, h)) => {
+                        if self.text.layer_id != id {
+                            // 官方只换 `state+0x00`;旧层像素留在旧层。
+                            self.text.reset_surface_epoch();
+                            self.text.layer_id = id;
+                        }
+                        self.text.set_window(Some((w, h)));
+                    }
+                    None => {
+                        self.report(diag::recoverable(
+                            code::rt::TEXT_LAYER,
+                            Boundary::Script,
+                            format!(
+                                "TEXT[ID] 未命中已存在层 {:?};\
+                                 官方 FUN_00414559 报错并返回 -1(保留旧层,\
+                                 后续参数跳过)",
+                                String::from_utf8_lossy(&id)
+                            ),
+                        ));
+                        return Ok(StepOutcome::Yield);
+                    }
+                },
+                None => self.text.layer_id = id,
+            }
         }
         // p1 OUTPUTMODE(引擎只存 AL)。
         if let Some(v) = get("OUTPUTMODE") {
@@ -4993,7 +5057,7 @@ impl Vm {
         }
         // p15 CLICK:先写 'C';自动模式返回 -1 = 本帧让出(REA 0x45383f..0x45388b)。
         if get("CLICK").and_then(|v| v.as_int()) == Some(1) {
-            self.text.push_flag(tflag::CLICK);
+            self.text.push_flag_sized(tflag::CLICK);
             if self.text.output_mode != 0 {
                 self.emit(VmEvent::SystemCall {
                     frame: self.frame(),
@@ -5011,7 +5075,9 @@ impl Vm {
             ("CLICKPAGE", tflag::CLICK_PAGE),
         ] {
             if get(name).and_then(|v| v.as_int()) == Some(1) {
-                self.text.push_flag(flag);
+                // 官方 TEXT 的 RETURN/PAGE/CLICKRETURN/CLICKPAGE 在追加前
+                // 写宽/高表(0x4536b5/0x453714/0x453765/0x4537c4)。
+                self.text.push_flag_sized(flag);
             }
         }
         // p16 CLEAR=1:清空文本与标志(REA 0x453894 → 0x4638e4)。
@@ -5199,11 +5265,12 @@ impl Vm {
         st.next_voice = i64::from(next_voice as i32);
 
         if self.text.output_mode != 0 {
+            // 官方 0x44c39x:'C'/'R' 在追加前写宽/高表;'P' 与 'E' 不写。
             if self.text.autoclick != 0 {
-                self.text.push_flag(tflag::CLICK);
+                self.text.push_flag_sized(tflag::CLICK);
             }
             if self.text.autoreturn != 0 {
-                self.text.push_flag(tflag::RETURN);
+                self.text.push_flag_sized(tflag::RETURN);
             }
             if self.text.autopage != 0 {
                 self.text.push_flag(tflag::PAGE);

@@ -328,47 +328,17 @@ impl SoftRenderer {
                 frame.clear.rgba,
             )
         });
-        // 自动文本层(`TEXT[ID]` 不存在/为空时的屏幕叠加):`_TEXT_FLAG` 已由
-        // gfx 排版;引擎在窗口 CG 之上绘制文本层(DIV-GFX-057,`Likely`)。
+        // 自动文本已提交到目标层表面(官方 `FUN_00404914` 直接写
+        // `TEXT[ID]` 层像素);没有目标层时 gfx 不产出 layout,不做屏幕叠加。
         if let Some(layout) = frame.text_layout.as_ref() {
-            match &layout.target {
-                None => {
-                    // 屏幕叠加:先画到透明覆盖层,再用与 wgpu 相同的纹理
-                    // 合成路径(MODE 0)贴上屏幕 —— 两端像素公式一致。
-                    let mut overlay = Surface::new(surface.width, surface.height, [0, 0, 0, 0]);
-                    let stats = st.text.paint_layout_with(
-                        &mut overlay.rgba,
-                        overlay.width,
-                        overlay.height,
-                        layout,
-                        Some(true),
-                    );
-                    let painted = stats.glyphs;
-                    merge_text_stats(&mut st.report, stats);
-                    if painted > 0 {
-                        let image = ImageRef::from_surface(&overlay);
-                        draw_image(
-                            &mut surface,
-                            image,
-                            0.0,
-                            0.0,
-                            f64::from(overlay.width),
-                            f64::from(overlay.height),
-                            255,
-                            BlendMode::Normal,
-                            frame.filter.mag,
-                            None,
-                        );
-                    }
-                }
-                Some(target) if !frame.layers.iter().any(|l| &l.id == target) => {
+            if let Some(target) = &layout.target {
+                if !frame.layers.iter().any(|l| &l.id == target) {
                     let why = format!("text.layout_target_missing: {}", target.display());
                     if !st.report.text_diags.contains(&why) {
                         st.report.text_diags.push(why);
                         st.report.text_diags.sort();
                     }
                 }
-                Some(_) => {}
             }
         }
         // 屏幕是 opaque 窗口:组 RT 的 alpha 只参与“组合成到屏幕”这一步,

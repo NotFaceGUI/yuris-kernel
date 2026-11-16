@@ -7,12 +7,12 @@
 //! RP_101(s133): 每 10 tick 点击, 10 行文本逐行推进
 //! ```
 //!
-//! 关键点:VM 的 `_TEXT_FLAG` 只在 `Vm::text_state()` 里;宿主每帧同步到 gfx
-//! (`GfxState::sync_text_state`),gfx 按逐字 `'1'/'2'` 排版,后端只栅格化。
+//! 关键点(2026-11-16):布局在 VM(`FUN_00404914`),每帧把
+//! `TextFrame.steps` 增量交给 gfx;自动模式才有已提交字形。ERIS 是手动
+//! 模式(`OUTPUTMODE=0`),本探针不会伪造自动层——画面里的正文来自脚本
+//! `CGACT[TEXT](text_draws)`,与生产 `Engine` 同路径。
 //!
-//! 注意:本探针**强制**同步自动层,用于验证 gfx/后端字形路径;
-//! 官方手动模式(ERIS `OUTPUTMODE=0`)不自动绘制,生产 `Engine` 已按
-//! `output_mode == 1` 门控(见 `DIV-GFX-075` C6)。不要用本探针判断
+//! 自动层验证用合成工程(`text_sync`/`text_pipeline`),不要用本探针判断
 //! 真实游戏是否多画了自动层。
 //!
 //! 用法:
@@ -148,7 +148,16 @@ fn run() -> Result<(), String> {
     let mut total_text_events = 0u64;
     let mut last_text = Vec::new();
     let mut wrote = 0u32;
+    let mut text_applied = 0usize;
+    let mut text_page = 0u64;
+    let mut text_layer: Vec<u8> = Vec::new();
     for tick in 0..ticks {
+        // 布局前注入目标层表面尺寸(官方 `FUN_00404914` 读层 `+0x78/+0x7c`)。
+        {
+            let layer = vm.text_layer_id().to_vec();
+            let size = state.borrow().text_layer_surface(&layer);
+            vm.set_text_window(size);
+        }
         let result = vm.tick_at(tick.saturating_mul(16), &timeline);
         for ev in vm.take_events() {
             if let VmEvent::Text { bytes, .. } = ev {
@@ -158,7 +167,16 @@ fn run() -> Result<(), String> {
         }
         // 权威 `_TEXT_FLAG` 流(VM 的 `[state+0x3c]`)。
         let snapshot = vm.text_state();
-        state.borrow_mut().sync_text_state(&snapshot);
+        // 自动模式才把已提交步骤交给 gfx(官方手动模式不自动绘制)。
+        if vm.text_output_mode() == 1 {
+            let same = vm.text_layer_id() == text_layer.as_slice()
+                && vm.text_page_clear_seq() == text_page;
+            let frame = vm.text_frame(if same { text_applied } else { 0 });
+            text_applied = frame.total_steps;
+            text_page = frame.page_clear_seq;
+            text_layer = frame.layer_id.clone();
+            state.borrow_mut().apply_text_frame(&frame);
+        }
         let frame = state.borrow().frame();
         let output = renderer.render_frame(&frame);
         let hash = hex(&Sha256::digest(&output.surface.rgba));
@@ -168,7 +186,13 @@ fn run() -> Result<(), String> {
         let x_extent = layout.map_or(0, |l| {
             l.glyphs
                 .last()
-                .map_or(0, |g| g.x + l.style.cell_width(g.full))
+                .map_or(0, |g| {
+                    g.x + if g.full {
+                        i64::from(g.width)
+                    } else {
+                        i64::from(g.width) / 2
+                    }
+                })
         });
         let ink = ink_pixels(&output.surface);
         println!(

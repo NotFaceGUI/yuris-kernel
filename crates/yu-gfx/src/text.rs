@@ -67,6 +67,31 @@ pub struct TextStroke {
     pub width: i64,
 }
 
+/// 一个已提交字形的逐字符样式(官方 `WORD`/`_` 追加时的快照)。
+///
+/// 映射(REA `0x458dd1..0x458e9e` / `0x4568f7..0x456a98`):
+/// `fg=-0x4c、bg=-0x50、antialias=-0x54、gradation=-0x58、bold=-0x5c`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TextGlyphStyle {
+    pub fg: u32,
+    pub bg: u32,
+    pub antialias: bool,
+    pub gradation: u8,
+    pub bold: bool,
+}
+
+impl Default for TextGlyphStyle {
+    fn default() -> Self {
+        Self {
+            fg: 0x00FF_FFFF,
+            bg: 0x00FF_FFFF,
+            antialias: true,
+            gradation: 0,
+            bold: false,
+        }
+    }
+}
+
 /// 引擎默认字号(`FUN_00464fac`;`docs/font-contract.md` §3.3:
 /// “引擎默认 SX=SY=20”)。
 const DEFAULT_FONT_SIZE: i64 = 20;
@@ -175,10 +200,10 @@ pub struct GlyphAtlasRef {
     pub version: u32,
 }
 
-/// 一段待显示的文本(`VmEvent::Text` / `$_TEXT` 的累积结果)。
+/// 待显示缓冲的诊断镜像(VM `$_TEXT` / `_TEXT_FLAG`)。
 ///
-/// **跨帧持久**(DIV-GFX-034):文本缓冲只在 `TEXT[CLEAR]`、
-/// `GfxState::clear_text`、目标图层被 `CGEND` 删除或重新 `CG` 创建时清空。
+/// 只用于 `frame.text`/JSON/探针;渲染走 `GfxState::apply_text_frame` 的
+/// 已提交字形。自动模式下由引擎每 tick 覆盖为 VM 当前行,手动模式清空。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextRun {
     /// 文本层 ID(`TEXT[ID=...]`;空 = 默认层)。
@@ -189,15 +214,10 @@ pub struct TextRun {
     /// `'1'/'2'/'R'/'P'/'r'/'p'/'C'/'E'`)。`None` = 宿主尚未同步引擎
     /// 状态(`Vm::text_state()`),排版必须视为不可用而不是自行猜测。
     pub flags: Option<Vec<u8>>,
-    /// 当前字体属性(最近一次 `FONT` 快照)。
+    /// 当前字体属性(最近一次 `FONT` 快照;诊断用)。
     pub style: TextStyle,
     /// 文本层原点(引擎像素;`None` = 未定位,等待窗口/字体会话)。
     pub origin: Option<(i64, i64)>,
-    /// 当前应显示的字符数(`TEXT[OUTPUTMODE=0]` 手动模式的 reveal 计数)。
-    ///
-    /// `None` = 全部显示。VM 侧 reveal 查询 API 尚未提供(交接件 H-P2-02);
-    /// 本字段是后端截断渲染的唯一入口,不允许后端自行计时。
-    pub reveal: Option<usize>,
     /// 字形图集(未提供 = 后端自行栅格化)。
     pub atlas: Option<GlyphAtlasRef>,
     /// 该段来自的事件帧号。
@@ -206,7 +226,8 @@ pub struct TextRun {
 
 /// 一个已排版的字符单元(后端按 `bytes` 查字体栅格化)。
 ///
-/// 坐标是**文本层局部**像素:原点是文本层/文本窗口左上角,`y` 是单元顶边。
+/// 坐标是**文本层局部**像素:原点是文本层左上角,`y` 是单元顶边。
+/// 每个字形自带追加时的样式/尺寸快照,行内 `FONT`/颜色变化逐字生效。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextGlyph {
     /// 单字符字节(1 或 2 字节;控制标志不产生 glyph)。
@@ -221,25 +242,36 @@ pub struct TextGlyph {
     pub x: i64,
     /// 单元左上角 Y(局部像素)。
     pub y: i64,
+    /// 单元请求宽/高(引擎 `+0x40/+0x44`;追加时快照 `SX/SY`)。
+    pub width: i16,
+    pub height: i16,
+    /// 逐字符样式(颜色/AA/GRADATION/BOLD)。
+    pub style: TextGlyphStyle,
+    /// 绘制时刻的状态级 `DRAWMODE`(引擎 `+0x33`)。
+    pub draw_mode: u8,
+    /// 绘制时刻的状态级 `BNO`(引擎 `+0x34`)。
+    pub bno: u8,
 }
 
-/// 自动文本层(`TEXT[ID]` + `WORD`/`_`/`RETURNCODE`)的排版结果。
+/// 自动文本层的**已提交表面**(官方 `FUN_00404914` 逐字写进 `TEXT[ID]` 层)。
+///
+/// 语义:每个 glyph 是已经画进层表面的一次绘制;`'P'` 换页会清空列表
+/// (`PageClear`),行完成/`TEXT[CLEAR]` **不会**清空。`target` 保留
+/// `Option` 仅为兼容旧结构;当前实现只产出 `Some`(官方无目标层不绘制)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextLayoutFrame {
-    /// 目标文本层(`TEXT[ID]` 且该层存在);`None` = 屏幕坐标叠加。
+    /// 目标文本层(`TEXT[ID]` 命中);`None` = 不绘制(不再有屏幕叠加)。
     pub target: Option<LayerId>,
-    /// 文本层局部原点(`target` 存在 = 层内坐标;否则 = 屏幕坐标)。
+    /// 文本层局部原点(自动布局恒为 `(0,0)`;保留字段兼容)。
     pub origin: (i64, i64),
-    /// 字体快照。
+    /// 最近一次 `FONT` 快照(字体身份/名称来源;逐字颜色在 `glyphs[].style`)。
     pub style: TextStyle,
-    /// 逐字单元(按 `_TEXT_FLAG` 的 `'1'/'2'` 步进)。
+    /// 已提交字形(按绘制顺序)。
     pub glyphs: Vec<TextGlyph>,
     /// 行高(像素;`Unverified`)。
     pub line_height: i64,
     /// 本帧可见的字节数 = `glyphs` 覆盖的字符数(审计用)。
     pub chars: usize,
-    /// 当前应显示的字符数(`None` = 全部;H-P2-02 的渲染截断入口)。
-    pub reveal: Option<usize>,
     /// 排版证据等级:`_TEXT_FLAG` 完整 = `Confirmed`;否则不产出本结构。
     pub flags_source: TextFlagsSource,
 }
@@ -413,105 +445,6 @@ impl TextDrawKey {
 /// 16 行 × ≤6 条 ≈ 768。超限丢最旧并在诊断里显式计数,不静默无界。
 pub const MAX_TEXT_DRAWS_PER_LAYER: usize = 16_384;
 
-/// 按 `_TEXT_FLAG` 逐字排版(等价于引擎逐字标志流)。
-///
-/// 规则(全部有证据或显式挂账):
-/// - `'1'` 半角 → 步进 `SX/2`;`'2'` 全角 → `SX`(ERIS `es.TX.BUFSET.SIZE`);
-/// - `'R'`/`'r'`/`'P'`/`'p'`/`'E'` = 换行,但**只在当前行已有字符时**推进
-///   (引擎一行会同时出现 `C R P E`,不能每个标志各占一行;`Unverified`,
-///   DIV-GFX-056);
-/// - `'C'` = 点击等待,不改变排版;
-/// - 其它字节按半角处理并保留(不发明语义)。
-///
-/// `flags` 必须与 `bytes` 的字符序列对齐(`'1'/'2'` 每个字符一个)。若对齐
-/// 失败(标志不足/多余、字节不是合法 CP932 前缀),返回 `None` — 调用方不得
-/// 猜测布局。
-pub fn layout_text(
-    bytes: &[u8],
-    flags: &[u8],
-    origin: (i64, i64),
-    style: &TextStyle,
-) -> Option<Vec<TextGlyph>> {
-    layout_text_with_codec(bytes, flags, origin, style, Codec::Cp932)
-}
-
-/// 按显示 codec 排版(全局 codec;官方 CHS 同构)。
-///
-/// 全角/半角仍以 `_TEXT_FLAG` 为准,codec 只决定“双字节怎么切”以及后端
-/// 如何解码字形。
-pub fn layout_text_with_codec(
-    bytes: &[u8],
-    flags: &[u8],
-    origin: (i64, i64),
-    style: &TextStyle,
-    codec: Codec,
-) -> Option<Vec<TextGlyph>> {
-    let mut glyphs = Vec::new();
-    let (mut pen_x, mut pen_y) = origin;
-    let mut line_has_ink = false;
-    let mut i = 0usize;
-    for &flag in flags {
-        match flag {
-            b'1' | b'2' => {
-                if i >= bytes.len() {
-                    return None;
-                }
-                let full = flag == b'2';
-                let len = if full { 2 } else { 1 };
-                if i + len > bytes.len() {
-                    return None;
-                }
-                // 全角标志必须对应双字节字符;半角必须单字节。
-                if full != codec.is_lead(bytes[i]) {
-                    return None;
-                }
-                glyphs.push(TextGlyph {
-                    bytes: smallvec::SmallVec::from_slice(&bytes[i..i + len]),
-                    codec,
-                    full,
-                    x: pen_x,
-                    y: pen_y,
-                });
-                pen_x += style.cell_width(full);
-                line_has_ink = true;
-                i += len;
-            }
-            b'R' | b'r' | b'P' | b'p' | b'E' => {
-                if line_has_ink {
-                    pen_x = origin.0;
-                    pen_y += style.line_height();
-                    line_has_ink = false;
-                }
-            }
-            b'C' => {}
-            _ => {
-                // 未取证的控制字节:不猜语义;按半角字符尝试消费以保持对齐。
-                if i >= bytes.len() {
-                    return None;
-                }
-                let len = if codec.is_lead(bytes[i]) { 2 } else { 1 };
-                if i + len > bytes.len() {
-                    return None;
-                }
-                glyphs.push(TextGlyph {
-                    bytes: smallvec::SmallVec::from_slice(&bytes[i..i + len]),
-                    codec,
-                    full: len == 2,
-                    x: pen_x,
-                    y: pen_y,
-                });
-                pen_x += style.cell_width(len == 2);
-                line_has_ink = true;
-                i += len;
-            }
-        }
-    }
-    if i != bytes.len() {
-        return None;
-    }
-    Some(glyphs)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,47 +455,6 @@ mod tests {
             size_y: 12,
             ..TextStyle::default()
         }
-    }
-
-    #[test]
-    fn layout_uses_text_flag_cells() {
-        // "AこB":A 半角,こ 全角(0x82B1),B 半角。
-        let bytes = b"A\x82\xB1B";
-        let flags = b"121";
-        let glyphs = layout_text(bytes, flags, (10, 20), &style()).unwrap();
-        assert_eq!(glyphs.len(), 3);
-        assert_eq!((glyphs[0].x, glyphs[0].y), (10, 20));
-        assert!(!glyphs[0].full);
-        assert_eq!((glyphs[1].x, glyphs[1].y), (16, 20), "半角 = SX/2 = 6");
-        assert!(glyphs[1].full);
-        assert_eq!((glyphs[2].x, glyphs[2].y), (28, 20), "全角 = SX = 12");
-    }
-
-    #[test]
-    fn line_break_only_after_ink() {
-        // 「エピローグ。」CP932(6 个全角)+ 自动行尾 CRPE ⇒ 恰好换 1 行。
-        let cp932: Vec<u8> = vec![
-            0x83, 0x47, 0x83, 0x73, 0x83, 0x8D, 0x81, 0x5B, 0x83, 0x4F, 0x81, 0x42,
-        ];
-        let flags = b"222222CRPE";
-        let glyphs = layout_text(&cp932, flags, (0, 0), &style()).unwrap();
-        assert_eq!(glyphs.len(), 6);
-        assert_eq!(glyphs[5].x, 60);
-        assert!(glyphs.iter().all(|g| g.y == 0), "CRPE 只换一行");
-    }
-
-    #[test]
-    fn flags_must_align_with_bytes() {
-        assert!(layout_text(b"A", b"2", (0, 0), &style()).is_none());
-        assert!(layout_text(b"A", b"11", (0, 0), &style()).is_none());
-        assert!(layout_text(b"\x82\xB1", b"1", (0, 0), &style()).is_none());
-    }
-
-    #[test]
-    fn unknown_flag_keeps_bytes_visible() {
-        // 未取证标志按半角消费,不丢字节(不猜语义)。
-        let glyphs = layout_text(b"AB", b"X1", (0, 0), &style()).unwrap();
-        assert_eq!(glyphs.len(), 2);
     }
 
     #[test]

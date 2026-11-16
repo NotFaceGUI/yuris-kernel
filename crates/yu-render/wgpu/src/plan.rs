@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use yu_gfx::{
-    BlendMode, Clear, CompositorFrame, CopyId, CopyOp, CopySource, ImageAction, ImageOp, Layer,
-    LayerId, Op, OpStatus, Pass, PassTarget, ScreenSnapshot, TextureRef,
+    Clear, CompositorFrame, CopyId, CopyOp, CopySource, ImageAction, ImageOp, Layer, LayerId, Op,
+    OpStatus, Pass, PassTarget, ScreenSnapshot, TextureRef,
 };
 use yu_log::Diag;
 use yu_render_core::{
@@ -33,10 +33,10 @@ use yu_render_core::{
 use crate::device::{code, GpuContext};
 use crate::passes::{
     clear_color, group_surface_size, hash_rgba, live_snapshots, merge_text_stats, note_text_diag,
-    push_quad, Accum, AuxPipeline, BlitCmd, Draw, DrawKind, FramePlan, PaintCmd, PlannedPass,
-    PlannedTarget, Planner, SurfaceWrites,
+    push_quad, Accum, AuxPipeline, BlitCmd, FramePlan, PaintCmd, PlannedPass, PlannedTarget,
+    Planner, SurfaceWrites,
 };
-use crate::pipelines::{FilterKind, PipelineCache};
+use crate::pipelines::PipelineCache;
 use crate::surfaces::{Content, Contents, LayerSurfaces, TexRef};
 use crate::textures::{DeferredSnapshot, TargetSet, TextureCache, Vertex};
 
@@ -729,19 +729,6 @@ pub(crate) fn plan(
         });
     }
 
-    // ---- 5. 屏幕级自动文本(`target=None`) ----
-    plan_screen_overlay_text(
-        ctx,
-        frame,
-        gpu,
-        pipelines,
-        &mut vertices,
-        &mut passes,
-        &mut views,
-        text_uploads,
-        text,
-        &mut acc,
-    )?;
     // 文本阶段只算 `apply_text` 本身(`mark_text` → `mark_text_done`);
     // 组 pass / 屏幕 pass / 屏幕级文本的耗时归入 `rest_us`。
     let t_text = mark_text_done - mark_text;
@@ -2989,7 +2976,6 @@ fn compose_group_content(
 #[derive(Default)]
 pub(crate) struct TextUploads {
     layers: BTreeMap<LayerId, (u64, Rc<TexRef>)>,
-    screen: Option<(u64, Rc<TexRef>)>,
 }
 
 impl TextUploads {
@@ -2997,9 +2983,7 @@ impl TextUploads {
     pub fn clear(&mut self) -> Vec<u64> {
         let mut removed = Vec::new();
         removed.extend(self.layers.values().map(|(_, tex)| tex.id));
-        removed.extend(self.screen.iter().map(|(_, tex)| tex.id));
         self.layers.clear();
-        self.screen = None;
         removed
     }
 
@@ -3020,7 +3004,6 @@ impl TextUploads {
     /// 当前文本上传纹理 id(供帧末 bind group 存活集合使用)。
     pub fn live_texture_ids(&self, out: &mut BTreeSet<u64>) {
         out.extend(self.layers.values().map(|(_, tex)| tex.id));
-        out.extend(self.screen.iter().map(|(_, tex)| tex.id));
     }
 }
 
@@ -3069,14 +3052,19 @@ fn text_signature(
     }
     if let Some(layout) = layout {
         fnv_mix(&mut hash, layout.glyphs.len() as u64);
-        fnv_mix(
-            &mut hash,
-            layout.reveal.map_or(u64::MAX, |value| value as u64),
-        );
         fnv_mix(&mut hash, layout.origin.0 as u64);
         fnv_mix(&mut hash, layout.origin.1 as u64);
         for glyph in &layout.glyphs {
             fnv_bytes(&mut hash, &glyph.bytes);
+            fnv_mix(&mut hash, u64::from(glyph.width as u16));
+            fnv_mix(&mut hash, u64::from(glyph.height as u16));
+            fnv_mix(&mut hash, u64::from(glyph.style.fg));
+            fnv_mix(&mut hash, u64::from(glyph.style.bg));
+            fnv_mix(&mut hash, u64::from(glyph.style.antialias as u8));
+            fnv_mix(&mut hash, u64::from(glyph.style.gradation));
+            fnv_mix(&mut hash, u64::from(glyph.style.bold as u8));
+            fnv_mix(&mut hash, u64::from(glyph.draw_mode));
+            fnv_mix(&mut hash, u64::from(glyph.bno));
             fnv_mix(&mut hash, glyph.x as u64);
             fnv_mix(&mut hash, glyph.y as u64);
             fnv_mix(&mut hash, u64::from(glyph.full));
@@ -3727,95 +3715,6 @@ fn apply_text(
     }
     (cpu_base_us, cpu_info, gpu_stats)
 }
-
-/// 屏幕级自动文本(`target=None`):全视口透明覆盖 + 一次合成 quad。
-#[allow(clippy::too_many_arguments)]
-fn plan_screen_overlay_text(
-    ctx: &GpuContext,
-    frame: &CompositorFrame,
-    gpu: &mut TextureCache,
-    pipelines: &mut PipelineCache,
-    vertices: &mut Vec<Vertex>,
-    passes: &mut Vec<PlannedPass>,
-    views: &mut BTreeMap<u64, wgpu::TextureView>,
-    text_uploads: &mut TextUploads,
-    text: &mut TextComposer,
-    acc: &mut Accum,
-) -> Result<(), Diag> {
-    let Some(layout) = frame.text_layout.as_ref().filter(|l| l.target.is_none()) else {
-        return Ok(());
-    };
-    let Some(screen) = passes
-        .iter_mut()
-        .rev()
-        .find(|p| matches!(p.target, Some(PlannedTarget::Screen)))
-    else {
-        return Ok(());
-    };
-    let (width, height) = (frame.viewport.width, frame.viewport.height);
-    let signature = text_signature(&[], Some(layout), (width, height));
-    let id = match text_uploads.screen.as_ref() {
-        Some((hash, tex)) if *hash == signature && tex.width == width && tex.height == height => {
-            tex.id
-        }
-        _ => {
-            let old_upload = text_uploads.screen.as_ref().map(|(_, tex)| tex.id);
-            let mut overlay = Texture {
-                width,
-                height,
-                rgba: vec![0; (width as usize) * (height as usize) * 4],
-            };
-            let stats =
-                text.paint_layout_with(&mut overlay.rgba, width, height, layout, Some(true));
-            let painted = stats.glyphs;
-            merge_text_stats(acc, stats);
-            if painted == 0 {
-                return Ok(());
-            }
-            let id = gpu.upload(ctx, width, height, &overlay.rgba, "text screen overlay")?;
-            let uploaded = gpu.get(id).expect("overlay exists");
-            let tex = Rc::new(TexRef {
-                id,
-                width: uploaded.width,
-                height: uploaded.height,
-                texture: uploaded.texture.clone(),
-                view: uploaded.view.clone(),
-            });
-            // 逐字显示时每次 reveal 都换一整张视口纹理;旧上传必须释放。
-            if let Some(old_id) = old_upload {
-                gpu.remove(old_id, pipelines);
-            }
-            text_uploads.screen = Some((signature, tex));
-            id
-        }
-    };
-    pipelines.ensure_pipeline(ctx, BlendMode::Normal, false)?;
-    let view = gpu
-        .get(id)
-        .ok_or_else(|| {
-            Diag::fatal(code::TARGET, yu_log::Boundary::Platform)
-                .with_detail("文本覆盖纹理上传后缺失")
-        })?
-        .view
-        .clone();
-    views.insert(id, view.clone());
-    pipelines.ensure_bind_group(ctx, id, &view, FilterKind::Point)?;
-    let expected = screen.first_vertex as usize + screen.draws.len() * 6;
-    if expected == vertices.len() {
-        push_quad(vertices, width, height, 0.0, 0.0, width, height, 1.0);
-        screen.draws.push(Draw {
-            blend: BlendMode::Normal,
-            texture_id: id,
-            filter: FilterKind::Point,
-            kind: DrawKind::Quad,
-        });
-    } else {
-        note_text_diag(acc, "text.screen_overlay_not_final".to_string());
-    }
-    Ok(())
-}
-
-// ------------------------------------------------------------------ 小工具
 
 fn image_signature(image: &ImageOp, source: u64, source2: u64, source3: u64) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;

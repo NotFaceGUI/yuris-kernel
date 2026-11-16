@@ -1,8 +1,9 @@
 //! 文本链路跨后端对拍(P2 验收):soft vs wgpu 同帧逐像素一致。
 //!
 //! 与 `yu-backend-soft --example text_probe` 相同的 boot/时钟/点击序列,
-//! 每 tick 把 `Vm::text_state()` 同步进 gfx,分别用 soft 与 wgpu 渲染并比较
-//! SHA-256。输出 TSV + 不一致帧的 DP(第一个差异像素)。
+//! 每 tick 把 VM 的 `TextFrame.steps` 增量应用进 gfx(自动模式才有),
+//! 分别用 soft 与 wgpu 渲染并比较 SHA-256。ERIS 手动模式的正文来自
+//! `CGACT[TEXT]`;输出 TSV + 不一致帧的 DP(第一个差异像素)。
 //!
 //! 用法:
 //!
@@ -107,11 +108,26 @@ fn run() -> Result<(), String> {
 
     println!("entry={entry} ticks={ticks}\ntick\tglyphs\tsoft_ink\twgpu_ink\tmatch\tsoft_hash\twgpu_hash");
     let mut mismatches = 0u32;
+    let mut text_applied = 0usize;
+    let mut text_page = 0u64;
+    let mut text_layer: Vec<u8> = Vec::new();
     for tick in 0..ticks {
+        {
+            let layer = vm.text_layer_id().to_vec();
+            let size = state.borrow().text_layer_surface(&layer);
+            vm.set_text_window(size);
+        }
         let result = vm.tick_at(tick.saturating_mul(16), &timeline);
         let _ = vm.take_events();
-        let snapshot = vm.text_state();
-        state.borrow_mut().sync_text_state(&snapshot);
+        if vm.text_output_mode() == 1 {
+            let same = vm.text_layer_id() == text_layer.as_slice()
+                && vm.text_page_clear_seq() == text_page;
+            let text_frame = vm.text_frame(if same { text_applied } else { 0 });
+            text_applied = text_frame.total_steps;
+            text_page = text_frame.page_clear_seq;
+            text_layer = text_frame.layer_id.clone();
+            state.borrow_mut().apply_text_frame(&text_frame);
+        }
         let frame = state.borrow().frame();
         let soft_out = soft.render_frame(&frame);
         let wgpu_out = wgpu

@@ -649,11 +649,6 @@ fn text(out: &mut String, t: &crate::text::TextRun) {
         Some(f) => esc_bytes(out, f),
         None => out.push_str("null"),
     }
-    out.push_str(",\"reveal\":");
-    match t.reveal {
-        Some(n) => out.push_str(&n.to_string()),
-        None => out.push_str("null"),
-    }
     out.push('}');
 }
 
@@ -681,11 +676,6 @@ fn text_frame_extras(out: &mut String, f: &crate::frame::CompositorFrame) {
         out.push_str(&l.line_height.to_string());
         out.push_str(",\"chars\":");
         out.push_str(&l.chars.to_string());
-        out.push_str(",\"reveal\":");
-        match l.reveal {
-            Some(n) => out.push_str(&n.to_string()),
-            None => out.push_str("null"),
-        }
         out.push_str(",\"flags_source\":\"text_flag\",\"glyphs\":[");
         for (i, g) in l.glyphs.iter().enumerate() {
             if i > 0 {
@@ -699,6 +689,20 @@ fn text_frame_extras(out: &mut String, f: &crate::frame::CompositorFrame) {
             out.push_str(&g.x.to_string());
             out.push_str(",\"y\":");
             out.push_str(&g.y.to_string());
+            out.push_str(",\"w\":");
+            out.push_str(&g.width.to_string());
+            out.push_str(",\"h\":");
+            out.push_str(&g.height.to_string());
+            out.push_str(",\"fg\":");
+            out.push_str(&g.style.fg.to_string());
+            out.push_str(",\"bg\":");
+            out.push_str(&g.style.bg.to_string());
+            out.push_str(",\"aa\":");
+            out.push_str(if g.style.antialias { "true" } else { "false" });
+            out.push_str(",\"gradation\":");
+            out.push_str(&g.style.gradation.to_string());
+            out.push_str(",\"bold\":");
+            out.push_str(if g.style.bold { "true" } else { "false" });
             out.push('}');
         }
         out.push_str("]}");

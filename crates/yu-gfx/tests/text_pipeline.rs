@@ -6,201 +6,175 @@ mod support;
 
 use support::{arg, call, frame_start, i, s, state, table};
 use yu_gfx::Op;
-use yu_rt::text::TextSnapshot;
+use yu_rt::text::{TextFrame, TextGlyphDraw, TextStep};
 
-fn snapshot(bytes: &[u8], flags: &[u8]) -> TextSnapshot {
-    TextSnapshot {
-        layer_id: Vec::new(),
-        bytes: bytes.to_vec(),
+fn glyph(bytes: &[u8], x: i64, y: i64, full: bool) -> TextStep {
+    TextStep::Glyph(TextGlyphDraw {
         codec: yu_rt::Codec::Cp932,
-        flags: flags.to_vec(),
+        bytes: bytes.iter().copied().collect(),
+        full,
+        x,
+        y,
+        width: 20,
+        height: 20,
+        style: yu_rt::text::TextGlyphStyle {
+            fg: 0x00FF_FFFF,
+            bg: 0x00_FF00,
+            antialias: true,
+            gradation: 2,
+            bold: true,
+        },
+        draw_mode: 0,
+        bno: 1,
+    })
+}
+
+fn text_frame(layer: &[u8], page: u64, first: usize, steps: Vec<TextStep>) -> TextFrame {
+    TextFrame {
+        layer_id: layer.to_vec(),
         output_mode: 1,
-        wait_ms: 0,
-        autoreturn: 1,
-        autopage: 1,
-        autoclick: 1,
-        click: false,
-        clear_pending: false,
-        clear_seq: 0,
-        reveal_flags: 0,
-        reveal_bytes: 0,
-        reveal_chars: 0,
-        skip_mode: false,
+        page_clear_seq: page,
         cursor_x: 0,
         cursor_y: 0,
-        click_buttons: [1, 13, 0x3ff, 0x3ff],
-        skip_buttons: [17, 0x3ff, 0x3ff, 0x3ff],
+        click: false,
+        bytes: Vec::new(),
+        flags: Vec::new(),
+        font: Default::default(),
+        total_steps: first + steps.len(),
+        first_step: first,
+        steps,
     }
 }
 
-#[test]
-fn text_buffer_persists_across_frames() {
-    let mut gfx = state();
-    gfx.on_event(&frame_start(0));
-    gfx.on_event(&yu_rt::VmEvent::Text {
-        frame: 0,
-        id: Vec::new(),
-        bytes: b"A".to_vec(),
-    });
-    assert_eq!(gfx.frame().text.len(), 1);
-
-    // DIV-GFX-034:下一帧不再清空。
-    gfx.on_event(&frame_start(1));
-    let frame = gfx.frame();
-    assert_eq!(frame.text.len(), 1);
-    assert_eq!(frame.text[0].bytes, b"A");
-    // 事件路径没有 `_TEXT_FLAG` ⇒ 不产出排版(禁止猜宽度)。
-    assert!(frame.text[0].flags.is_none());
-    assert!(frame.text_layout.is_none());
+fn cg_text_layer(gfx: &mut yu_gfx::GfxState, t: &yu_gfx::ParamTable, id: &str, w: i64, h: i64) {
+    gfx.on_event(&call(
+        0,
+        "CG",
+        vec![
+            arg(t, "CG", "ID", s(id)),
+            arg(t, "CG", "FILE", s("")),
+            arg(t, "CG", "SX", i(w)),
+            arg(t, "CG", "SY", i(h)),
+        ],
+    ));
 }
 
 #[test]
-fn synced_flags_drive_text_flag_layout() {
-    let mut gfx = state();
-    gfx.on_event(&frame_start(0));
-    // "AこB":A 半角,こ 全角,B 半角;SX=SY=20(引擎默认)。
-    gfx.sync_text_state(&snapshot(b"A\x82\xB1B", b"121"));
-    let frame = gfx.frame();
-    assert_eq!(frame.text.len(), 1);
-    assert_eq!(frame.text[0].flags.as_deref(), Some(&b"121"[..]));
-    let layout = frame.text_layout.as_ref().expect("layout from _TEXT_FLAG");
-    assert_eq!(layout.chars, 3);
-    assert_eq!(layout.glyphs.len(), 3);
-    assert_eq!((layout.glyphs[0].x, layout.glyphs[0].y), (0, 0));
-    assert_eq!(layout.glyphs[1].x, 10, "半角 = SX/2");
-    assert_eq!(layout.glyphs[2].x, 30, "全角 = SX");
-    assert!(layout.glyphs[1].full);
-}
-
-#[test]
-fn reveal_is_the_only_render_truncation_input() {
-    let mut gfx = state();
-    gfx.on_event(&frame_start(0));
-    gfx.sync_text_state(&snapshot(b"A\x82\xB1B", b"121"));
-    gfx.set_text_reveal(Some(2));
-    let layout = gfx.frame().text_layout.expect("layout");
-    assert_eq!(layout.reveal, Some(2), "后端按 reveal 截断,不自建计时器");
-    gfx.set_text_reveal(None);
-    assert_eq!(gfx.frame().text_layout.expect("layout").reveal, None);
-}
-
-#[test]
-fn clear_sync_clears_cross_frame_text() {
-    let mut gfx = state();
-    gfx.on_event(&frame_start(0));
-    gfx.sync_text_state(&snapshot(b"A", b"2"));
-    assert_eq!(gfx.frame().text.len(), 1);
-
-    // 空 bytes **不是** CLEAR:官方 CLEAR 是显式状态迁移(REA 0x453894 →
-    // 0x4638e4),而 `FUN_004638e4` 不触碰图层表面。没有 clear_seq 变化时
-    // 显示层保留(任务书 `task-text-auto-pipeline.md` C1)。
-    gfx.on_event(&frame_start(1));
-    gfx.sync_text_state(&snapshot(b"", b""));
-    assert_eq!(gfx.frame().text.len(), 1, "空缓冲不隐式清层");
-
-    // `TEXT[CLEAR]` 经 `TextSnapshot::clear_seq` 显式传播。
-    let mut cleared = snapshot(b"", b"");
-    cleared.clear_seq = 1;
-    gfx.sync_text_state(&cleared);
-    let frame = gfx.frame();
-    assert!(frame.text.is_empty());
-    assert!(frame.text_layout.is_none());
-}
-
-#[test]
-fn non_ascii_text_layer_id_targets_exact_layer() {
-    // 合成样本(ERIS 141 脚本里 TEXT[ID] = 0 次)。
-    // 关键:层 ID 是**不透明字节**,不是 CP932/UTF-8 字符串。
-    // - 0x82 0xA0 = CP932「あ」(真实语料编码样本);
-    // - 0xFF 0xFE 不是合法 CP932 前缀,必须原样透传(证明没有解码)。
-    // REA 0x4141e4 先做路径规范化,0x414559 再按字节哈希+比较查层;
-    // gfx 的 LayerId 也是字节,故目标层必须精确命中。
-    for raw in [b"\x82\xa0".as_slice(), b"\xff\xfe".as_slice()] {
-        let mut gfx = state();
-        let t = table();
-        gfx.on_event(&frame_start(0));
-        gfx.on_event(&call(
-            0,
-            "CG",
-            vec![
-                arg(&t, "CG", "ID", yu_rt::value::Value::Str(raw.to_vec())),
-                arg(&t, "CG", "FILE", yu_rt::value::Value::Str(Vec::new())),
-            ],
-        ));
-        let mut snap = snapshot(b"A", b"1");
-        snap.layer_id = raw.to_vec();
-        gfx.sync_text_state(&snap);
-        let layout = gfx.frame().text_layout.expect("layout");
-        assert_eq!(
-            layout.target,
-            Some(yu_gfx::path::normalize(raw, None, false).path),
-            "层 ID 必须按字节规范化后精确命中"
-        );
-    }
-}
-
-#[test]
-fn text_layout_tracks_current_layer_and_keeps_reveal() {
-    // 引擎只有一个当前文本层(`[state+0x00]`);旧 `text_layout_now` 用
-    // BTreeMap 的 `find_map` 取第一个非空层,层 ID 切换后会画错层。
-    // 本用例让 A/B 都非空,B 后同步 ⇒ 必须选 B(排序上 A 在前)。
+fn committed_glyphs_target_text_layer() {
     let mut gfx = state();
     let t = table();
     gfx.on_event(&frame_start(0));
-    for id in [b"A".as_slice(), b"B".as_slice()] {
-        gfx.on_event(&call(
-            0,
-            "CG",
-            vec![
-                arg(&t, "CG", "ID", yu_rt::value::Value::Str(id.to_vec())),
-                arg(&t, "CG", "FILE", yu_rt::value::Value::Str(Vec::new())),
-            ],
-        ));
-    }
-    let mut a = snapshot(b"A", b"1");
-    a.layer_id = b"A".to_vec();
-    gfx.sync_text_state(&a);
+    cg_text_layer(&mut gfx, &t, "MSG", 64, 32);
+    let mut snap = text_frame(
+        b"MSG",
+        0,
+        0,
+        vec![glyph(b"A", 0, 0, false), glyph(b"\x82\xa0", 10, 0, true)],
+    );
+    snap.bytes = b"A\x82\xa0".to_vec();
+    snap.flags = b"12".to_vec();
+    gfx.apply_text_frame(&snap);
+
+    let out = gfx.frame();
+    let layout = out.text_layout.as_ref().expect("committed layout");
+    assert_eq!(
+        layout.target,
+        Some(yu_gfx::path::normalize(b"MSG", None, false).path),
+        "自动文本只画进 TEXT[ID] 命中层"
+    );
+    assert_eq!(layout.glyphs.len(), 2);
+    assert!(!layout.glyphs[0].full);
+    assert!(layout.glyphs[1].full);
+    assert_eq!(layout.glyphs[1].x, 10);
+    // 逐字符样式/尺寸快照必须原样透出。
+    assert_eq!(layout.glyphs[0].width, 20);
+    assert_eq!(layout.glyphs[0].style.fg, 0x00FF_FFFF);
+    assert_eq!(layout.glyphs[0].style.bg, 0x00_FF00);
+    assert_eq!(layout.glyphs[0].style.gradation, 2);
+    assert!(layout.glyphs[0].style.bold);
+    // 待显示缓冲只做诊断镜像。
+    assert_eq!(out.text.len(), 1);
+    assert_eq!(out.text[0].bytes, b"A\x82\xa0");
+    assert_eq!(out.text[0].flags.as_deref(), Some(&b"12"[..]));
+}
+
+#[test]
+fn page_clear_drops_surface_but_text_clear_does_not() {
+    let mut gfx = state();
+    let t = table();
+    gfx.on_event(&frame_start(0));
+    cg_text_layer(&mut gfx, &t, "MSG", 64, 32);
+    gfx.apply_text_frame(&text_frame(b"MSG", 0, 0, vec![glyph(b"A", 0, 0, false)]));
+    assert_eq!(gfx.frame().text_layout.expect("A").glyphs.len(), 1);
+
+    // 'P' 换页:清表面,只留 PageClear。
+    gfx.apply_text_frame(&text_frame(b"MSG", 1, 0, vec![TextStep::PageClear]));
+    assert!(gfx.frame().text_layout.is_none(), "'P' 清已提交字形");
+
+    gfx.apply_text_frame(&text_frame(b"MSG", 1, 1, vec![glyph(b"B", 0, 0, false)]));
+    assert_eq!(gfx.frame().text_layout.expect("B").glyphs.len(), 1);
+
+    // TEXT[CLEAR]:同页、无新步骤、空待显示缓冲 —— 已提交像素必须保留。
+    let mut clear = text_frame(b"MSG", 1, 2, Vec::new());
+    clear.bytes.clear();
+    clear.flags.clear();
+    gfx.apply_text_frame(&clear);
+    assert_eq!(
+        gfx.frame().text_layout.expect("after CLEAR").glyphs.len(),
+        1,
+        "TEXT[CLEAR] 只清待显示缓冲,不清表面"
+    );
+}
+
+#[test]
+fn missing_target_layer_is_not_drawn() {
+    let mut gfx = state();
+    gfx.on_event(&frame_start(0));
+    gfx.apply_text_frame(&text_frame(
+        b"NOPE",
+        0,
+        0,
+        vec![glyph(b"A", 0, 0, false)],
+    ));
+    assert!(gfx.frame().text_layout.is_none(), "无目标层 = 不绘制");
+}
+
+#[test]
+fn text_layer_surface_uses_layer_pixels() {
+    let mut gfx = state();
+    let t = table();
+    gfx.on_event(&frame_start(0));
+    cg_text_layer(&mut gfx, &t, "MSG", 64, 32);
+    assert_eq!(gfx.text_layer_surface(b"MSG"), Some((64, 32)));
+    assert_eq!(gfx.text_layer_surface(b"NOPE"), None);
+    assert_eq!(gfx.text_layer_surface(b""), None);
+}
+
+#[test]
+fn switching_text_layer_replays_page_from_zero() {
+    let mut gfx = state();
+    let t = table();
+    gfx.on_event(&frame_start(0));
+    cg_text_layer(&mut gfx, &t, "A", 64, 32);
+    cg_text_layer(&mut gfx, &t, "B", 64, 32);
+    gfx.apply_text_frame(&text_frame(b"A", 0, 0, vec![glyph(b"A", 0, 0, false)]));
     assert_eq!(
         gfx.frame().text_layout.expect("A").target,
         Some(yu_gfx::path::normalize(b"A", None, false).path)
     );
-
-    let mut b = snapshot(b"B", b"1");
-    b.layer_id = b"B".to_vec();
-    gfx.sync_text_state(&b);
-    gfx.set_text_reveal(Some(1));
+    // 层切换:engine 从 0 重放新层本页日志。
+    gfx.apply_text_frame(&text_frame(
+        b"B",
+        0,
+        0,
+        vec![glyph(b"B", 0, 0, false), glyph(b"C", 10, 0, false)],
+    ));
     let layout = gfx.frame().text_layout.expect("B");
     assert_eq!(
         layout.target,
-        Some(yu_gfx::path::normalize(b"B", None, false).path),
-        "只排当前层,不取 map 里的第一个非空层"
+        Some(yu_gfx::path::normalize(b"B", None, false).path)
     );
-    assert_eq!(layout.reveal, Some(1), "reveal 由宿主显式设置");
-
-    // 同一层再同步(clear_seq 未变)不得重置 reveal。
-    gfx.sync_text_state(&b);
-    assert_eq!(gfx.frame().text_layout.expect("B2").reveal, Some(1));
-
-    // CLEAR 代数变化才清,并重置 reveal。
-    let mut cleared = snapshot(b"", b"");
-    cleared.layer_id = b"B".to_vec();
-    cleared.clear_seq = 1;
-    gfx.sync_text_state(&cleared);
-    assert!(gfx.frame().text_layout.is_none());
-}
-
-#[test]
-fn text_flag_mismatch_is_not_layouted() {
-    let mut gfx = state();
-    gfx.on_event(&frame_start(0));
-    // 全角标志配半角字节:对齐失败,不猜。
-    gfx.sync_text_state(&snapshot(b"A", b"2"));
-    let frame = gfx.frame();
-    assert!(frame.text_layout.is_none());
-    assert!(gfx
-        .diagnostics()
-        .iter()
-        .any(|d| d.code == "gfx.text.unsupported"));
+    assert_eq!(layout.glyphs.len(), 2, "不混入旧层字形");
 }
 
 #[test]
@@ -669,5 +643,38 @@ fn normal_file_key_is_not_degraded() {
         matches!(&layer.texture, yu_gfx::TextureRef::Asset(k) if k == b"cg/bg/black"),
         "普通资产键不得退化,实际 {:?}",
         layer.texture
+    );
+}
+
+/// 官方 `'P'` 是 zero_fill 整个层表面:同层的 `CGACT[TEXT]` 像素也必须清。
+#[test]
+fn page_clear_also_drops_cgact_text_on_same_layer() {
+    let mut gfx = state();
+    let t = table();
+    gfx.on_event(&frame_start(0));
+    cg_text_layer(&mut gfx, &t, "MSG", 64, 32);
+    gfx.on_event(&call(
+        0,
+        "CGACT",
+        vec![
+            arg(&t, "CGACT", "ID", s("MSG")),
+            arg(&t, "CGACT", "TEXT", i(1)),
+            arg(&t, "CGACT", "SETSTR", s("A")),
+        ],
+    ));
+    assert_eq!(gfx.frame().text_draws.len(), 1);
+    gfx.apply_text_frame(&text_frame(
+        b"MSG",
+        0,
+        0,
+        vec![glyph(b"B", 0, 0, false)],
+    ));
+    assert_eq!(gfx.frame().text_draws.len(), 1);
+    gfx.apply_text_frame(&text_frame(b"MSG", 1, 0, vec![TextStep::PageClear]));
+    let frame = gfx.frame();
+    assert!(frame.text_layout.is_none());
+    assert!(
+        frame.text_draws.is_empty(),
+        "'P' 必须清同层 CGACT 文本(官方 zero_fill 整个层表面)"
     );
 }
