@@ -16,9 +16,9 @@
 | job | runner | 产出 |
 |---|---|---|
 | `meta` | ubuntu | 校验 tag 与 Cargo.toml 一致、跑发布工具自测、生成 `notes.md` |
-| `cli` | windows-latest | `yuris-kernel-vX.Y.Z-windows-x64.zip`（`yu-cli.exe` + `yu-serve.exe` + README/LICENSE） |
+| `cli` | windows-latest | `yuris-kernel-vX.Y.Z-windows-x64.zip`（`yu-cli.exe` + `yu-serve.exe` + README/LICENSE/NOTICE + 第三方许可清单与文本） |
 | `android` | ubuntu-latest | `yuris-kernel-vX.Y.Z-android-universal.apk`、`-android-arm64-v8a.apk`、`-android-x86_64.apk`、`yuris-kernel-vX.Y.Z-android-so.zip` |
-| `publish` | ubuntu-latest | 创建/更新 Release 并上传上面全部产物 |
+| `publish` | ubuntu-latest | 创建/更新 Release 并上传全部产物，另生成 `yuris-kernel-vX.Y.Z-licenses.zip` |
 
 1. `meta`：checkout 该 tag，`fetch-depth: 0`（更新日志需要完整历史与旧 tag）；
    校验 tag 与 `Cargo.toml` 的 `[workspace.package].version` 完全一致；
@@ -26,8 +26,10 @@
    artifact 传给 `publish`。
 2. `cli` / `android`：并行构建，`dry_run=true` 时跳过。
 3. `publish`：先确认两个构建 job 都是 `success`（否则直接失败，不发布），
-   再 `gh release create --verify-tag`；Release 已存在时改为 `gh release edit`
-   （可重复运行，不会因为重跑失败），最后 `gh release upload --clobber` 上传产物。
+   再打包 `LICENSE` / `NOTICE` / `THIRD-PARTY-NOTICES.md` / `third_party/licenses/`
+   为 `-licenses.zip`，最后 `gh release create --verify-tag`；Release 已存在时改为
+   `gh release edit`（可重复运行，不会因为重跑失败），`gh release upload --clobber`
+   上传全部产物。
 
 `dry_run=true` 时只跑 `meta` 并打印将执行的动作，不构建产物、不调用 `gh`。
 
@@ -35,15 +37,28 @@
 
 | 文件 | 内容 |
 |---|---|
-| `yuris-kernel-vX.Y.Z-windows-x64.zip` | `yu-cli.exe`、`yu-serve.exe`、`README.md`、`LICENSE` |
+| `yuris-kernel-vX.Y.Z-windows-x64.zip` | `yu-cli.exe`、`yu-serve.exe`、`README.md`、`LICENSE`、`NOTICE`、`THIRD-PARTY-NOTICES.md`、`licenses/` |
 | `yuris-kernel-vX.Y.Z-android-universal.apk` | 正式签名通用包，arm64-v8a + x86_64 两套 so 都在包里 |
 | `yuris-kernel-vX.Y.Z-android-arm64-v8a.apk` | 正式签名瘦包，只含 arm64-v8a（绝大多数真机） |
 | `yuris-kernel-vX.Y.Z-android-x86_64.apk` | 正式签名瘦包，只含 x86_64（模拟器 / x86 Chromebook） |
 | `yuris-kernel-vX.Y.Z-android-so.zip` | `libyu_host_android.so` + `libc++_shared.so`（按 ABI 分目录） |
+| `yuris-kernel-vX.Y.Z-licenses.zip` | `LICENSE`、`NOTICE`、`THIRD-PARTY-NOTICES.md`、`licenses/`；Android 产物不内嵌这些文件，随此包分发 |
 
 三个 APK 用同一把 key 签名，`versionName` 相同；`versionCode` 都取
 `GITHUB_RUN_NUMBER`。用户按设备架构下瘦包以减小下载体积，不确定时下
 `universal`。当前不支持 32 位 `armeabi-v7a`，所以没有 `armeabi-v7a` 瘦包。
+
+## 第三方许可清单
+
+`THIRD-PARTY-NOTICES.md` 由 `tools/release/gen_third_party_notices.py` 从
+`cargo metadata --locked` 生成；依赖变化（`Cargo.lock` 更新）后需重新生成并提交：
+
+```bash
+python tools/release/gen_third_party_notices.py
+```
+
+`third_party/licenses/` 存放清单中出现的许可证全文或模板；新增许可证家族时同步补充。
+发布产物会带上 `NOTICE`、`THIRD-PARTY-NOTICES.md` 与 `licenses/`。
 
 ## Android 签名
 
