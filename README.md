@@ -1,18 +1,62 @@
-# yuris-kernel
+<div align="center">
 
-YU-RIS 兼容运行时，开发中。
+<h1>yuris-kernel</h1>
 
-## 状态
+<p><b>YU-RIS 兼容运行时</b><br>
+以官方引擎的可观测行为为唯一真值</p>
+
+<p>
+<a href="https://github.com/NotFaceGUI/yuris-kernel/actions/workflows/ci.yml"><img src="https://github.com/NotFaceGUI/yuris-kernel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
+<a href="https://github.com/NotFaceGUI/yuris-kernel/releases"><img src="https://img.shields.io/github/v/release/NotFaceGUI/yuris-kernel?label=release&color=blue" alt="Release"></a>
+<img src="https://img.shields.io/badge/YU--RIS%204xx-0.450--0.495-2ea44f" alt="YU-RIS 4xx">
+<img src="https://img.shields.io/badge/YU--RIS%202xx-adapting-dfb317" alt="YU-RIS 2xx">
+<img src="https://img.shields.io/badge/YU--RIS%205xx-observing-lightgrey" alt="YU-RIS 5xx">
+<img src="https://img.shields.io/badge/platform-Windows%20%7C%20Android%20%7C%20headless-8250df" alt="Platforms">
+<img src="https://img.shields.io/badge/rust-2021%20edition-orange?logo=rust" alt="Rust">
+</p>
+
+<p>
+<a href="#简介">简介</a> ·
+<a href="#支持范围">支持范围</a> ·
+<a href="#演示">演示</a> ·
+<a href="#下载">下载</a> ·
+<a href="#快速开始">快速开始</a> ·
+<a href="#android">Android</a> ·
+<a href="#架构">架构</a> ·
+<a href="#文档">文档</a> ·
+<a href="#许可">许可</a>
+</p>
+
+</div>
+
+## 简介
+
+`yuris-kernel` 是 YU-RIS 引擎的兼容运行时，仓库不包含官方引擎代码、游戏数据或存档。
+
+- **多版本覆盖** —— 主线 4xx（0.450–0.495），2xx 适配中，5xx 观察中；
+  27 张系统变量 ABI 表已入册（覆盖 0.255–0.495）。
+- **双渲染后端** —— `soft`（CPU，确定性参考）与 `wgpu`（GPU，桌面 / Android 主路径）。
+- **多宿主** —— Windows 桌面、headless / 本地服务、浏览器呈现（调试）、Android。
+- **汉化与存档** —— `original` / `gbk` / `big5` / `tunnel` 四条文本路线；
+  `.sd` 存档与桌面字节一致。
+- **可观测** —— `yu-trace` 录制 / 回放 / diff，用于和官方引擎逐帧对拍。
+
+## 支持范围
+
+### 引擎版本
 
 当前主线是 4xx；2xx 适配中；5xx 观察中。
 
-| 版本线 | 状态           | 说明                                                                                                                                    |
-| ------ | -------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| 2xx    | 适配中         | 0.292 SDK：91 命令 / 482 系统变量；另有 0.255 表（539 变量）；YSTB V2 缺真实样本                                                        |
-| 4xx    | 可用（主线）   | 0.466 / 0.479 / 0.495：100 / 104 / 119 命令，513 / 526 / 548 系统变量；0.450 / 0.460 / 0.470 / 0.480 / 0.490 抽样实机通过，0.481 / 0.486 / 0.494 / 0.495 实机验收 |
-| 5xx    | 观察中         | v500 封包可读（YPF 版本字段无上限）；v555 仅有旁线局部观察，系统变量按 0.495 族前缀推断                                                 |
+| 版本线 | 状态         | 说明                                                                                                                                                            |
+| ------ | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2xx    | 适配中       | 0.292 SDK：91 命令 / 482 系统变量；另有 0.255 表（539 变量）；YSTB V2 缺真实样本                                                                                |
+| 4xx    | 可用（主线） | 0.466 / 0.479 / 0.495：100 / 104 / 119 命令，513 / 526 / 548 系统变量；0.450 / 0.460 / 0.470 / 0.480 / 0.490 抽样实机通过，0.481 / 0.486 / 0.494 / 0.495 实机验收 |
+| 5xx    | 观察中       | v500 封包可读（YPF 版本字段无上限）；v555 仅有旁线局部观察，系统变量按 0.495 族前缀推断                                                                          |
 
-0.450–0.493 各版本的 ABI 表已全部入册（27 张，覆盖 0.255–0.495）
+0.450–0.493 各版本的 ABI 表已全部入册（27 张，覆盖 0.255–0.495）。
+
+### 宿主平台
 
 | 平台                | 状态   |
 | ------------------- | ------ |
@@ -20,11 +64,87 @@ YU-RIS 兼容运行时，开发中。
 | headless / 本地服务 | 可用   |
 | 浏览器呈现端        | 仅调试 |
 | Android             | 可用   |
-| iOS                 | 骨架(soft;Metal 待接) |
+| Linux / macOS 桌面  | 未验证 |
 
-| ![](docs/assets/case/1_t.png) | ![](docs/assets/case/1_d.png) | ![](docs/assets/case/2_d.png) |
-| ----------------------------- | ----------------------------- | ----------------------------- |
-| 0.481                         | 0.481                         | 0.494                         |
+Linux / macOS 桌面与真 wasm（内存数据源 + 浏览器存档）的缺口见[待办](#待办)。
+
+## 演示
+
+| 0.481 · 标题画面 | 0.481 · 对话 | 0.494 · 对话 |
+| :---: | :---: | :---: |
+| [![0.481 标题画面](docs/assets/case/1_t.png)](docs/assets/case/1_t.png) | [![0.481 对话](docs/assets/case/1_d.png)](docs/assets/case/1_d.png) | [![0.494 对话](docs/assets/case/2_d.png)](docs/assets/case/2_d.png) |
+
+## 下载
+
+预构建产物见 [Releases](https://github.com/NotFaceGUI/yuris-kernel/releases)：
+
+| 平台         | 产物                                             | 内容                              |
+| ------------ | ------------------------------------------------ | --------------------------------- |
+| Windows x64  | `yuris-kernel-vX.Y.Z-windows-x64.zip`            | `yu-cli.exe` + `yu-serve.exe`     |
+| Android      | `yuris-kernel-vX.Y.Z-android-universal.apk`      | 通用包（arm64-v8a + x86_64）      |
+| Android      | `...-android-arm64-v8a.apk` / `-x86_64.apk`      | 按 ABI 分包                       |
+
+桌面版解压即用；Android 安装 APK 后，在配置界面选择游戏目录即可。
+需要自己构建或调试内核时，继续看下一节。
+
+## 快速开始
+
+### 环境要求
+
+- **桌面**：Rust stable（2021 edition）；Windows x64 已验证，Linux / macOS 未验证。
+- **Android**：JDK 17+、Android SDK（`minSdk 24`，即 Android 7.0+）；
+  NDK 由 `tools/android/build.sh` 自动取 `$ANDROID_HOME/ndk` 下最高版本。
+- **运行数据**：自备合法获取的游戏数据；仓库不附带。
+
+### 构建
+
+```bash
+cargo build --release -p yu-cli
+```
+
+Windows x64 桌面已验证；Linux / macOS 桌面未验证。Android 构建见下方命令
+与 [Android](#android) 小节。
+
+```bash
+# Android：so 交叉编译 + APK 打包
+export ANDROID_HOME=/path/to/sdk ANDROID_NDK_HOME=/path/to/ndk JAVA_HOME=/path/to/jdk17
+tools/android/build.sh                  # debug
+BUILD_TYPE=release tools/android/build.sh
+YURIS_SO_ONLY=1 tools/android/build.sh  # 只出 so
+```
+
+### 运行
+
+数据入口按官方挂载规则：工程根下有 `data/` 目录即开发工程布局
+（数据根 = `data/`），否则为发行版布局（数据根 = 工程根）。
+数据根及其 `pac/` 下的全部 `*.ypf` 按文件名挂载，后挂覆写先挂；
+`update1..9.ypf` 依次叠加为增量层；散盘内容目录叠在包之上。
+
+```bash
+# 最小运行：游戏目录含 data.ypf 或 data/
+target/release/yu-cli run "<游戏目录>" --mode desktop
+
+# Windows 桌面窗口
+target/release/yu-cli run "<project>" --mode desktop --backend wgpu --debug-ui
+
+# 本地服务 + 浏览器呈现；默认打开浏览器，--no-open 只起服务
+target/release/yu-cli serve "<project>" --backend wgpu --port 4173
+
+# HMR
+target/release/yu-cli dev "<project>" --backend wgpu --port 4173
+
+# 用例
+target/release/yu-cli case "<project>" --all
+
+# 汉化
+target/release/yu-cli run "<project>" --mode desktop --patch gbk
+target/release/yu-cli run "<project>" --mode desktop --patch big5
+target/release/yu-cli run "<project>" --mode desktop --patch tunnel
+
+# 换钥作品:显式指定脚本密钥(8 位十六进制;缺省自动探测);存档写盘压缩
+target/release/yu-cli run "<project>" --mode desktop --backend wgpu \
+  --script-key 0x1A2B3C4D --save-codec snappy
+```
 
 ## 文本编码
 
@@ -55,68 +175,7 @@ so + 轻量 Java 壳
 - 输入：触摸 = 鼠标左键，双指上下滑 = 滚轮，右下角切换虚拟光标。
 - 退出：脚本 `END` 后回到配置界面。
 
-## iOS（骨架）
-
-C ABI + Swift 壳模板；当前 `soft` 后端（CPU 帧），Metal `CAMetalLayer` 上屏待接。
-
-- 构建（需 macOS + Xcode）：`bash tools/ios/build.sh`；`YURIS_IOS_XCODE=1` 生成 Xcode 工程并构建模拟器 app。
-- 数据：用「文件」App 或 Finder 把游戏目录拷进 app 的 `Documents/`，启动页用 `probe_root` 扫描入口。
-- 详见 `ios/README.md` 与 `crates/yu-platform/host-ios/README.md`。
-
-## 构建
-
-```bash
-cargo build --release -p yu-cli
-```
-
-Windows 下生成 `yu-cli.exe`；桌面宿主已实现，其他平台的完整构建未验证。
-
-```bash
-# Android：so 交叉编译 + APK 打包
-export ANDROID_HOME=/path/to/sdk ANDROID_NDK_HOME=/path/to/ndk JAVA_HOME=/path/to/jdk17
-tools/android/build.sh                  # debug
-BUILD_TYPE=release tools/android/build.sh
-YURIS_SO_ONLY=1 tools/android/build.sh  # 只出 so
-```
-
-## 运行
-
-数据入口按官方挂载规则：工程根下有 `data/` 目录即开发工程布局
-（数据根 = `data/`），否则为发行版布局（数据根 = 工程根）。
-数据根及其 `pac/` 下的全部 `*.ypf` 按文件名挂载，后挂覆写先挂；
-`update1..9.ypf` 依次叠加为增量层；散盘内容目录叠在包之上。
-
-```bash
-# Windows 桌面窗口
-target/release/yu-cli run "<project>" --mode desktop --backend wgpu --debug-ui
-
-# 本地服务 + 浏览器呈现；默认打开浏览器，--no-open 只起服务
-target/release/yu-cli serve "<project>" --backend wgpu --port 4173
-
-# HMR
-target/release/yu-cli dev "<project>" --backend wgpu --port 4173
-
-# 用例
-target/release/yu-cli case "<project>" --all
-
-# 汉化
-target/release/yu-cli run "<project>" --mode desktop --patch gbk
-target/release/yu-cli run "<project>" --mode desktop --patch big5
-target/release/yu-cli run "<project>" --mode desktop --patch tunnel
-
-# 换钥作品:显式指定脚本密钥(8 位十六进制;缺省自动探测);存档写盘压缩
-target/release/yu-cli run "<project>" --mode desktop --backend wgpu \
-  --script-key 0x1A2B3C4D --save-codec snappy
-```
-
-## 测试
-
-```bash
-cargo test --workspace
-```
-
-仓库不附带游戏数据。缺样本时相关用例显式 `SKIP` 并计数；
-`YURIS_REQUIRE_SAMPLES=1` 改为失败。
+<p align="center"><img src="docs/assets/android/title.jpg" alt="Android 宿主实机运行" width="720"></p>
 
 ## 架构
 
@@ -172,7 +231,7 @@ flowchart TD
 每帧 `Vm::tick_at` 执行任务，域宿主在命令时刻同步更新；`GfxState::frame()`
 产出 `CompositorFrame`，后端合成 RGBA8。
 
-## 目录
+## 项目结构
 
 | 路径                                              | 内容                               |
 | ------------------------------------------------- | ---------------------------------- |
@@ -191,6 +250,17 @@ flowchart TD
 | `crates/yu-trace`                                 | 录制 / 回放 / diff                 |
 | `android/`                                        | Android 壳（Java）                 |
 | `tools/android/build.sh`                          | so 交叉编译 + APK 打包             |
+
+## 测试
+
+```bash
+cargo test --workspace
+```
+
+仓库不附带游戏数据。缺样本时相关用例显式 `SKIP` 并计数；
+`YURIS_REQUIRE_SAMPLES=1` 改为失败。CI 只跑不依赖样本的 lib 测试
+（`.github/workflows/ci.yml`）；完整 `--workspace` 还会覆盖语料与 GPU 用例，
+需要本地样本与可用显卡。
 
 ## 待办
 
@@ -230,8 +300,9 @@ flowchart TD
 ## 致谢
 
 - [YU-RIS_Guide](https://github.com/TheVNConnoisseur/YU-RIS_Guide) —
-  官方工具与 SDK 归档；本仓库的 27 张系统变量 ABI 表与 `YSCom.ycd` 语料取自该项目，
-  每张表头记录来源 sha256 与覆盖版本区间（`crates/yu-rt/data/sysvar-abi-*.tsv`）。
+  官方工具与 SDK 归档（仓库未声明许可）；27 张系统变量 ABI 表由其中
+  `YSCom.ycd` 提取，仓库不附带 SDK / ycd 原文件；每张表头记录来源 sha256 与
+  覆盖版本区间（`crates/yu-rt/data/sysvar-abi-*.tsv`）。
 - [Yuris-Tyn](https://github.com/Weiss-UltimateSavior/Yuris-Tyn) —
   启动链、任务 / 驱动形态、格式事实与 golden 回归参照；只读参考。
 - [RxYuris](https://github.com/ZQF-ReVN/RxYuris) — YSTB / YSCM / YSTL 解析流程、
@@ -246,7 +317,26 @@ flowchart TD
 - [yu-emote](https://github.com/NotFaceGUI/yu-emote) — E-mote（PSB/EMT）数据层与
   运行时；以子模块挂在 `yu-emote/`，暂缓开发。
 
+## 免责声明
+
+- 本项目是独立实现的 YU-RIS 兼容运行时，与 YU-RIS 引擎的开发商、发行商无隶属、
+  授权或背书关系；相关产品名与商标归其权利人所有。
+- 仓库不包含官方引擎代码、游戏数据、存档或游戏素材文件；文档中的运行截图仅用于
+  展示兼容性，相关权利归原游戏权利人。使用者需自行合法取得游戏本体及相关素材。
+- 本项目面向个人学习、研究与兼容性测试。请遵守所在地法律与游戏许可协议，
+  不要用于盗版、未经授权的数据分发或其他侵权用途。
+- 软件按“现状”提供，不对兼容性、稳定性或存档/数据完整性作任何担保；
+  使用风险由使用者自行承担。
+
 ## 许可
 
-GPL-3.0-or-later。仓库不包含官方引擎代码、游戏数据或存档。
-使用者需自行提供合法获取的游戏数据。
+<a href="LICENSE"><img src="https://www.gnu.org/graphics/gplv3-127x51.png" alt="GPLv3 Logo" width="127" height="51"></a>
+
+本项目参考的开源项目见 [致谢](#致谢)；第三方 crate 依赖均为 MIT / Apache-2.0 / BSD / Zlib 等与 GPL-3.0 兼容的宽松许可。
+
+除另有说明外，全部源代码以 **[GPL-3.0-or-later](LICENSE)** 发布。完整许可声明见
+[NOTICE](NOTICE)；第三方组件、依赖清单与许可文本见
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) 与
+[`third_party/licenses/`](third_party/licenses/)。
+
+如需分发修改版并保留新增代码不按 GPL-3.0 发布，请通过 [@NotFaceGUI](https://github.com/NotFaceGUI) 联系作者获取单独许可。
