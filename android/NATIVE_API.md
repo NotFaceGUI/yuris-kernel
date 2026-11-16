@@ -77,7 +77,7 @@ so 的 ABI:`arm64-v8a`(真机)、`x86_64`(模拟器)。so 的 `backend` 缺省�
   "debug_mode": false,                            // @_DEBUGMODE=1
   "script_key": "0x11223344",                     // 省略 = 自动解析
   // ---- 字体 ----
-  "font": "Noto Sans CJK JP",                     // 强制 family(等价 --font)
+  "font": "Noto Sans CJK JP",                     // 宿主默认 family(等价 --font)
   "font_file": "/sdcard/fonts/msgothic.ttc",      // 导入的字体文件
   // ---- 声音 ----
   "os_sound": true,   // @_OS_SOUND 注入值(对拍口径恒 true)
@@ -129,7 +129,7 @@ so 的 ABI:`arm64-v8a`(真机)、`x86_64`(模拟器)。so 的 `backend` 缺省�
 | `--entry LABEL` | `entry` |
 | `--debug-mode on` | `debug_mode` |
 | `--script-key 0x…` | `script_key` |
-| `--font FAMILY` | `font` |
+| `--font FAMILY` | `font`(宿主默认;游戏内选择仍生效) |
 | `--save-codec zlib\|snappy` | `save_codec` |
 | `--record-events on` | `record_events` |
 | `--no-sound` | `audio: false`(不是 `os_sound`) |

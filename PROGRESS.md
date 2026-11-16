@@ -15134,3 +15134,83 @@ cargo test --workspace                                             # 仅 yu-cli 
 - 同层不同 ID 拼写被当作换层;ERIS 手动路径不受影响。
 - 行内字体身份(`FONT[NAME/NO]`)只更新状态级字体;逐字符快照覆盖
   COLOR/COLOR2/AA/GRADATION/BOLD/SX/SY。
+
+## 成果 FONT-SELECT (2026-11-16) · 宿主默认字体 + 游戏内字体选择器
+
+目标:复用游戏自带「設定→フォント」UI,只换数据 —— 宿主默认字体第一项 +
+本机系统字体;游戏内选中其它字体现即生效;不做新 UI、不写宿主设置文件、
+不做逐字形回退。证据与残余见 `docs/divergences/DIV-FONT-012-host-font-selector.md`。
+
+### 改动
+
+- `yu-font`:`FontSource` 构造时一次建 `catalog: Vec<FamilyEntry>`、
+  `normalize(alias)→face` 索引(系统/宿主注入两份)与默认 family 缓存;
+  `family_names`/`face_by_no`/`find_family`/`default_face` 全部复用;
+  `FONT[NO]` 与 `FONTINFO[NAME NO=n]` 使用同一份 CP932 过滤投影。新增
+  `find_family_prefer(Embedded)`(宿主同名字体优先)与
+  `is_engine_default_family`(按 family 身份识别 `MS Gothic`/`ＭＳ ゴシック`
+  等本地化别名)。
+- `yu-render-core`:`TextComposer` 增 `default_font` 策略(空名/引擎默认名 →
+  宿主默认,其它显式 family 原样);`catalog_cp932` 缓存(宿主默认第一 +
+  引擎默认条目改名去重);`set_default_font` 清 faces/ascent/compose/base +
+  字形缓存;`FONT`/`BNO` 变更清 gfx 布局投影缓存;会话重启
+  (`Renderer::reset`)清合成/基面缓存,避免新 `GfxState` 的修订号从 0
+  重计时复用旧字体/旧像素。
+- `yu-gfx`:`FONTINFO[NUM/NAME NO=n/LANG]` 注入全量目录;`FONTINFO[NAME]`
+  在脚本名为空/引擎默认时回报宿主默认名;新增
+  `set_font_selection_meta(default_name, engine_families)`。
+- `yu-engine`:`FontChoice::Family/HostFont` 默认走 `set_default_font`
+  (`--font-lock` 才恢复 `set_force_font`);启动注入目录 + 默认名 +
+  引擎默认 family 名单;真实 ERIS 日志 `125 entries`。
+- `yu-cli`:`--font` 文档改为宿主默认语义;新增 `--font-lock`(headless/
+  desktop/serve);Android 沿用 `FontChoice`,无需改脚本。
+
+### 验证(原始结果)
+
+```text
+cargo test -p yu-font                                    # 10 source_config + 18 lib + 12 styles 全绿
+cargo test -p yu-gfx --test info_query                   # 22 passed
+cargo test -p yu-gfx --test text_pipeline                # 17 passed
+cargo test -p yu-gfx                                     # 全绿
+cargo test -p yu-render-core --lib                       # 28 passed
+cargo test -p yu-engine --test text_sync                 # 2 passed
+cargo test -p yu-backend-soft --test render              # 28 passed(含 font_switch)
+cargo test -p yu-backend-wgpu --test wgpu text_          # 5 passed
+cargo run -p yu-cli --bin yu-cli -- run <project-eris> --frames 1 --backend soft \
+  --log-level info --font "Yu Gothic"
+  # [font] host default family "Yu Gothic"
+  # [font] host font list for FONTINFO: 125 entries (in-game selector enabled)
+```
+
+新增回归:
+
+- `fontinfo_lists_catalog_and_rewrites_engine_default_name`:`NUM`、
+  `NAME NO=1..N`、`LANG=0`;引擎默认名回报宿主默认名,显式其它原样。
+- `host_default_font_maps_engine_default_and_explicit_switch_wins`:
+  引擎默认/空名 → 宿主 face;其它 family 原样;目录第一项宿主名,引擎默认
+  条目已改名;`set_default_font` 清旧 face 缓存。
+- `font_switch_changes_pixels_and_restores_on_switch_back`:A→B→A,
+  两次 A 逐字节一致、A/B 像素不同。
+- `font_change_reprojects_committed_layout_style`:`FONT[NAME]` 变更后
+  布局投影使用新样式。
+- `uninstalled_host_default_is_not_advertised`:未安装的宿主默认名不进
+  `FONTINFO` 清单/显示名(渲染侧仍回退引擎默认并 warn)。
+
+### 性能(debug;临时探针,未入库)
+
+```text
+load_system_fonts: 163.4ms faces=248 catalog=127
+10k family_names:  70.7ms   (~7.1µs/次;旧实现每次排序+去重)
+100k find_family:  57.3ms   (~0.57µs/次;旧实现每次全表扫描+规范化)
+100k face_by_no:    1.0ms   (~10ns/次;旧实现每次排序 248 项)
+100k default_face:  0.6ms   (~6ns/次;旧实现最多 5 次全表扫描)
+```
+
+### 残余
+
+- 未做逐字形缺字回退:选到缺日文字形的系统字体仍会缺字(`DIV-FONT-012`)。
+- 游戏硬编码的 `$T(36,11)` 当前字体标签/默认列表下标仍由脚本与 GSD 决定;
+  `FONT[NO]` 与 GDI 枚举序仍不一致(DIV-FONT-001)。
+- 页内换字体仍会把已提交字形按最新字体重投影(逐字字体身份未快照,既有
+  残余)。
+- 本轮未执行任何 git 写操作,等待主人审阅。

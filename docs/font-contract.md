@@ -64,6 +64,7 @@ pub enum FaceOrigin { Embedded, System }
 pub enum FaceStyle { Normal, Italic, Oblique }
 pub struct FaceInfo { id, families, post_script_name, weight, style, index, origin }
 pub struct ResolvedFace { face, synthetic_bold, synthetic_italic }
+pub struct FamilyEntry { name: String, face: FaceId, origin: FaceOrigin }
 
 impl FontSource {
     pub fn from_bytes(bytes: Vec<u8>, origin: FaceOrigin) -> Result<Self, Diag>;
@@ -75,9 +76,12 @@ impl FontSource {
     pub fn load_system_fonts() -> Result<Self, Diag>;   // font.system_unavailable
     pub fn default_face(&self) -> Result<FaceId, Diag>;
     pub fn find_family(&self, name: &str) -> Option<FaceId>;
+    pub fn find_family_prefer(&self, name: &str, prefer: FaceOrigin) -> Option<FaceId>;
+    pub fn is_engine_default_family(&self, name: &str) -> bool;
     pub fn face_by_no(&self, no: usize) -> Option<FaceId>;
     pub fn face_info(&self, face: FaceId) -> Result<FaceInfo, Diag>;
     pub fn family_names(&self) -> Vec<String>;
+    pub fn catalog(&self) -> &[FamilyEntry];
     pub fn resolve_style(&self, face: FaceId, bold: bool, italic: Italic)
         -> Result<ResolvedFace, Diag>;
     pub fn with_face_data<T>(&self, face: FaceId, f: impl FnOnce(&[u8], u32) -> T)
@@ -96,10 +100,32 @@ impl FontSource {
 - `FaceId` 是 **source-local**；不同 `FontSource` 的 `FaceId` 不能混用。
 - 自带字体优先：调用方先 `from_bytes/from_file`，失败再 `load_system_fonts`。
 - 缺失字体**显式失败**；`default_face` 只按引擎回退表，不静默换 Noto/sans。
-- `NO` 的列表顺序是本 crate 的确定性排序（family 名 + face index），**不是**
-  GDI `EnumFontFamiliesExA` 顺序（见 §8 DIV-FONT-001）。
+- `NO` 的列表顺序是本 crate 的确定性排序（family 名排序；每个 family 一个
+  代表 face：normal/400/最早，宿主注入优先），**不是** GDI
+  `EnumFontFamiliesExA` 顺序（见 §8 DIV-FONT-001）。`FONTINFO` 是
+  `catalog` 经 CP932 过滤后的投影（编不出的名字跳过）；渲染核心的
+  `FONT[NO]` 索引同一投影，`FontSource::face_by_no` 索引原始 catalog。
+  `FONTINFO` 的 1 基换算只在其调用方发生。
 - `NAME` 支持全角 ASCII/空格/连字符折叠；`ＭＳ ゴシック` 与 fontdb 的
-  `ＭＳ ゴシック` 直接匹配。
+  `ＭＳ ゴシック` 直接匹配。`is_engine_default_family` 进一步按 **family
+  身份**识别本地化别名（`MS Gothic` 与 `ＭＳ ゴシック` 同族）。
+
+### 3.1.1 宿主默认字体与游戏内选择器
+
+- 宿主 `--font` / Android 导入字体默认走 **default** 语义
+  (`TextComposer::set_default_font`)：脚本 `FONT[NAME]` 为空、或请求的是
+  引擎默认 family（`ENGINE_DEFAULT_FAMILIES` 及其本地化别名）时解析到宿主
+  默认字体；脚本明确请求其它 family 时照常解析 —— 游戏自带
+  「設定→フォント」选中后立即生效。`--font-lock` 保留旧的全量强制语义
+  （诊断用）。
+- `FONTINFO[NUM/NAME NO=n/LANG]` 注入完整目录：宿主默认字体第一项 + 本机
+  系统字体；引擎默认 family 的目录条目改名为宿主默认名并去重。
+- `FONTINFO[NAME]`（不带 `NO`）在脚本名称为空或属于引擎默认 family 时回报
+  宿主默认名（游戏字体页的“当前字体”与实际渲染一致）。
+- 持久化仍由游戏自己完成（ERIS `$es.GSD(113)` → `gsd.sd`）；内核不写宿主
+  设置文件。
+- 残余：未做逐字形缺字回退（选中缺日文字形的字体仍会缺字）；游戏硬编码的
+  `$T(36,11)` 标签/默认下标仍由脚本与 GSD 决定（`DIV-FONT-012`）。
 
 ### 3.2 栅格化
 
@@ -327,6 +353,7 @@ release 的 1.0–1.2 倍（受 CPU/热状态影响）。
 | DIV-FONT-009 | `FONT[NAME]` 若同一 family 有多个 localized 名称，匹配使用全部别名 | 与 GDI 的 family 选择可能不同 |
 | DIV-FONT-010 | 引擎的字符宽度/字距使用 GDI 度量；本实现用 swash advance | 行宽可能有亚像素差 |
 | DIV-FONT-011 | 单元顶边→基线的 ascent 取整(GDI `lfHeight` 单元 vs hhea ascent) | `ascent_px`(`Likely`)；官方文本截图对拍(H-P2-03) |
+| DIV-FONT-012 | 游戏内字体选择器列全部系统字体，但未做逐字形缺字回退；游戏硬编码的默认标签/列表下标仍由脚本与 GSD 决定 | 选到缺日文字形的字体仍会缺字；渲染/列表数据按宿主默认字体(见 `DIV-FONT-012` 档案) |
 
 需要 REA 复核的项：
 
