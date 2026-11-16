@@ -15060,3 +15060,77 @@ cargo test -p yu-host-android --test session -- --test-threads=1
 4. **环境注记**:本机 `cargo check --workspace --all-targets` 仍在既有
    `libmimalloc-sys` / MSVC 构建处失败(`yu-cli` 单包同样复现,与本次改动
    无关);`yu-host-ios` 不依赖 mimalloc,单包构建/测试正常。
+
+## 成果 TEXT-STRICT (2026-11-16) · 文本两层模型:官方 C/R/P/E、折行禁则、逐字符样式
+
+### 改动
+
+- `yu-rt::text`:按 REA `FUN_00404914`/`FUN_00404c60`/`FUN_004046fc` 重写
+  文本状态机:待显示缓冲 + 逐字符表(宽/高/延迟/前景/背景/AA/GRADATION/
+  BOLD)+ 独立双游标 `+0x68/+0x6c`;`C/R/P/E` 逐标志语义、宽度折行与
+  行末/行头禁则、`！？` 成对特例(原样复刻官方不对称)、`'P'` 清表面复位
+  光标、行完成只清待显示缓冲;新增 step 日志供 gfx 消费。
+- `yu-gfx`:以“当前页已提交字形”(`TextSurface`)替代累积显示缓冲/`reveal`
+  截断;`TEXT[CLEAR]` 不再清表面;`TEXT[ID]` 解析探针
+  (`text_layer_surface`)按已存在层返回表面宽高;逐字符样式/尺寸透出到
+  `TextGlyph`;删除屏幕覆盖层(`DIV-GFX-057`)。
+- `yu-engine`:tick 前注入目标层表面尺寸;tick 后按
+  `(layer, page_clear_seq, applied)` 增量应用;手动模式不自动绘制、不清已
+  提交像素(只清诊断镜像);`TEXTINFO[CX/CY]` 由 VM 布局游标回答。
+- 后端:`TextComposer` 逐字形解析字体/颜色/AA/GRADATION/BOLD/SX/SY;
+  soft/wgpu 同一契约。
+- 文档:`docs/tasks/text-oracle-2026-11-16.md`(新证 + 决策)、
+  `DIV-GFX-075`(fixed)、`DIV-GFX-056`(折行/行高 fixed,基线仍 Likely)、
+  `DIV-GFX-057`(fixed)、README 待办/`gfx-unimplemented-todo`.
+
+### 验证(原始结果)
+
+```text
+cargo build --workspace --all-targets                              # Finished (1m31s)
+cargo test -p yu-rt --lib text::tests                              # 18 passed
+cargo test -p yu-rt --test fixture text_                           # 14 passed
+cargo test -p yu-rt --test corpus eris_real_scenario_text_path_emits_expected_flags  # 1 passed
+cargo test -p yu-gfx --test text_pipeline                          # 16 passed
+cargo test -p yu-engine --test text_sync                           # 2 passed
+cargo test -p yu-backend-soft --test render text                   # 10 passed
+cargo test -p yu-backend-soft --test render per_glyph_foreground_colors_reach_pixels  # 1 passed
+cargo test -p yu-backend-wgpu --test wgpu text_layout_frames_match_soft_exactly       # 1 passed
+cargo test -p yu-backend-soft -p yu-backend-wgpu -- --test-threads=1  # 全绿(68/26/2/2/16/0/32/39/1/1/1)
+cargo test --workspace                                             # 仅 yu-cli logging_guards 两条既有红
+```
+
+`yu-cli --test logging_guards` 两条既有红(与本次改动无关,已在 HEAD 复现):
+
+- `silent_fallback_audit`:白名单快照 2026-11-12;`state.rs` 在 2026-11-16
+  的过渡/快照改动后为 23 处、`handlers.rs` 为 82 处,均高于白名单
+  18/80(本次新增的 `unwrap_or` 已全部 `// silent-ok:` 标注,不再增加);
+- `src_has_no_direct_terminal_macros`:HEAD 的
+  `yu-engine/src/engine.rs` 已有 `eprintln!`(官方 SDK 样本缺失跳过)。
+
+另:wgpu `blur_is_two_pass_box_and_matches_soft` 在并行全量跑时曾偶发 1 次
+像素差,单跑与后端串行全量均通过(既有 flake,非文本路径)。
+
+### 推送前审查补记
+
+- 点击/跳过拆分:官方 `FUN_004046fc` pre-layout 只查 SKIP,post 才查
+  CLICK+SKIP;修正后点击当帧只消费 `'C'`,R/P/E 下一帧(测试时序同步
+  调整)。
+- `'P'` 同时清同层 `CGACT[TEXT]` 绘制项(官方 `zero_fill` 整个层表面);
+  层基图/图像加工像素的零填充仍归 DIV-GFX-076。
+- `FONT[SX+=…]`/`[COLOR-=…]` 按当前状态 `current + v` 处理(`offset`)。
+- 删除 wgpu `TextUploads.screen` 死字段;待显示镜像改用 gfx `TextStyle`
+  (保留 NAME/NO 诊断)。
+
+### 残余
+
+- GDI 字形 advance / 基线未与官方截图对拍(`DIV-GFX-056`,`Likely`);
+- 文字与图像加工/`CGACT` 的命令序仍按 `DIV-GFX-076` 的保守模型;
+- 空基图/0 尺寸层的官方行为未实测(内核按“无有效表面 ⇒ `TEXT[ID]`
+  未命中”处理);
+- `'P'` 的官方 `zero_fill` 覆盖整个层表面(含基图);内核清自动字形 +
+  同层 `CGACT[TEXT]`,层基图保留(文本层无基图时等价;归 DIV-GFX-076);
+- 逐字字体身份 `FONT[NAME/NO]`/BNO 未快照(颜色/字号/AA/BOLD/GRADATION
+  已逐字);页内换字体会把已提交字形按最新字体重烤;
+- 同层不同 ID 拼写被当作换层;ERIS 手动路径不受影响。
+- 行内字体身份(`FONT[NAME/NO]`)只更新状态级字体;逐字符快照覆盖
+  COLOR/COLOR2/AA/GRADATION/BOLD/SX/SY。

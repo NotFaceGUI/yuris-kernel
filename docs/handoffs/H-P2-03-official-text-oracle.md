@@ -1,6 +1,8 @@
 # H-P2-03 · 官方文本截图对拍(oracle 挂账)
 
-- 状态: **blocked**(YSCom attach 恢复后执行)
+- 状态: **partial(2026-11-16)**:REA 语义已逐指令复核并落地
+  (`docs/tasks/text-oracle-2026-11-16.md`);官方截图 oracle(字体 advance/
+  基线/SET 像素)仍未执行,方法已核实可行。
 - 来源: 任务书 P2 §4 / DIV-GFX-055/056/057
 - 影响面: 文本行距/基线、`SET` 重复次数、字体栅格
 

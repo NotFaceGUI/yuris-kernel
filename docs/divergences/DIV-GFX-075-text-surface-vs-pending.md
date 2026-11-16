@@ -1,6 +1,6 @@
 # DIV-GFX-075 · 文本“待显示行缓冲” vs 图层表面
 
-- 状态: **open(已登记;内核以累积显示缓冲近似)**
+- 状态: **fixed(2026-11-16;REA 严格模型落地,残余见 §6.5)**
 - 影响面: `crates/yu-rt/src/text.rs`、`crates/yu-gfx/src/state.rs`、
   `crates/yu-engine/src/engine.rs`、自动文本层(`TEXT[ID]`)
 - 证据基线: 官方 0.495 `yu-ris.exe` sha256 `4f5eefa3…`(Ghidra 12.1.4)、
@@ -91,5 +91,78 @@ cargo test -p yu-rt --test fixture text_
 cargo test -p yu-gfx --test text_pipeline
 cargo test -p yu-engine --test text_sync
 cargo test -p yu-backend-soft --test render text
+cargo test -p yu-backend-wgpu --test wgpu text_layout_frames_match_soft_exactly
+```
+
+
+## 6. 落地(2026-11-16,text-parity 任务)
+
+### 6.1 状态所有权
+
+| 层 | 状态 | 清空条件 |
+|---|---|---|
+| `yu-rt::text::TextState` | 官方待显示缓冲:`bytes/flags` + 逐字符表(宽/高/延迟/前景/背景/AA/GRADATION/BOLD)+ `+0x14/+0x18/+0x68/+0x6c` + `+0x35/+0x36/+0x37` + `0x801c70` + `layer_id` + `OUTPUTMODE/AUTO*/WAIT` | `TEXT[CLEAR]`、手动任务释放、行完成(`+0x36` → `FUN_004638e4`) |
+| `yu-gfx` | 当前页**已提交字形**(`TextSurface`:层 + `page_clear_seq` + glyph 列表);后端从这里合成层表面 | 只由 `'P'/'p'`(换页)、`TEXT[ID]` 换层、层删除/被图像加工重写、引擎重置 |
+| `yu-engine` | 边界同步:每 tick 前把目标层表面宽高注入 VM(`set_text_window`),tick 后按 `(layer, page_clear_seq, applied)` 增量应用 `TextFrame.steps` | 无自有计时 |
+
+不变量:
+
+1. 行完成清**待显示缓冲**,已提交像素保留;`TEXT[CLEAR]` 同样不清表面。
+2. `'P'` 才清表面并复位光标;`'R'` 只 `x=0, y += +0x44[i]`。
+3. 两个游标 `+0x68`(字节)与 `+0x6c`(标志)**独立**推进;`！？` 成对禁则
+   原样复刻官方的“画两字、字节 +4、标志 +1”不对称。
+4. 后端不自建计时/reveal;只有 `tick_at(now_ms)` 驱动推进。
+
+### 6.2 布局与折行
+
+`FUN_00404914` 逐标志语义、`FUN_00404c60` 折行/禁则按 `text-oracle-2026-11-16.md`
+§2/§3 落地(`crates/yu-rt/src/text.rs`):
+
+- 适配判断的单元宽恒为 `SX`(半角也不折半);实际 `x` 步进按
+  `全角=SX、半角=SX/2` 建模(Likely;GDI advance 的逐像素差归 DIV-FONT-002);
+- 行末禁则 `「 『 （`;行头禁则 `、 。 ） 」 』` + 小写假名/小写片假名;
+  `！？` 成对;
+- 纵向/横向边界、文本耗尽(`+0x68=+0x60`)、`'P'` 清表面均按反汇编实现。
+
+### 6.3 引擎/后端
+
+- 自动模式才应用 step;手动模式(ERIS `CGACT[TEXT]`)不自动绘制,也**不**
+  再 `clear_text` 抹掉已提交像素;
+- 无目标层 ⇒ 官方入口返回、不绘制;`DIV-GFX-057` 的屏幕覆盖层已删除;
+- 逐字符样式/尺寸透出到 `TextGlyph`(前景/背景/AA/GRADATION/BOLD/宽/高/
+  DRAWMODE/BNO),soft/wgpu 共用 `TextComposer` 逐字渲染;
+- `TEXTINFO[CX/CY]` 直接读 VM 布局游标;`set_text_cursor` 宿主注入已删除。
+
+### 6.4 `TEXT[ID]`
+
+- 引擎安装解析探针(gfx `text_layer_surface`);未命中按官方 `0x4538a7`
+  报错 + 返回 -1 + **保留旧层**;
+- 实际换层时递增表面世代并清空 step 日志(旧层像素留在旧层,新层从空表面
+  继续),避免把旧层字形重放进新层。
+
+### 6.5 残余
+
+1. **`'P'` 的 zero_fill 范围**:官方清的是 `TEXT[ID]` **整个层表面**
+   (`W+0x90, w*4*h`),含层基图与图像加工像素;内核当前清自动字形 +
+   同层 `CGACT[TEXT]` 绘制项,但**不清层基图/图像加工结果**。文本层
+   没有基图时等价;有背景图的层会保留背景。归 `DIV-GFX-076` 的表面模型。
+2. GDI advance / 基线与 `yu-font` 的逐像素差(Likely,DIV-GFX-056);
+3. 文字与图像加工/`CGACT` 的命令序(官方命令时刻写表面)仍按
+   `DIV-GFX-076` 的保守模型处理;
+4. 空基图/0 尺寸层:官方 `W+0x78/+0x7c` 未实测,内核按“无有效表面 ⇒
+   `TEXT[ID]` 未命中”处理;
+5. 行内 `FONT[NAME/NO]` 只更新状态级字体身份;逐字符快照覆盖
+   COLOR/COLOR2/AA/GRADATION/BOLD/SX/SY,字体身份逐字变化未建模。
+
+### 6.6 回归
+
+```text
+cargo test -p yu-rt --lib text::tests                  # 18 passed
+cargo test -p yu-rt --test fixture text_               # 15 passed
+cargo test -p yu-rt --test corpus eris_real_scenario_text_path_emits_expected_flags
+cargo test -p yu-gfx --test text_pipeline              # 16 passed
+cargo test -p yu-engine --test text_sync               # 2 passed
+cargo test -p yu-backend-soft --test render text       # 10 passed
+cargo test -p yu-backend-soft --test render per_glyph_foreground_colors_reach_pixels  # 1 passed
 cargo test -p yu-backend-wgpu --test wgpu text_layout_frames_match_soft_exactly
 ```

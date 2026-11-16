@@ -1,3 +1,6 @@
+> 2026-11-16 更新:严格两层模型已取代本文的 `reveal` 截断方案;
+> 现状见 `docs/divergences/DIV-GFX-075-text-surface-vs-pending.md` §6。
+
 # H-P2-02 · VM 侧 reveal / 已显字符数查询 API(M-D)
 
 - 状态: **fixed(2026-11-04;官方表面/页语义见 DIV-GFX-075)**

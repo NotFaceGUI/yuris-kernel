@@ -1,6 +1,6 @@
 # DIV-GFX-057 · 没有文本图层时的自动文本叠加
 
-- 状态: **open(Likely)**,P2 实现
+- 状态: **fixed(2026-11-16;官方无层不绘制,屏幕覆盖层已删除)**
 - 优先级: 中(仅当 `TEXT[ID]` 为空/目标层不存在时触发)
 - 发现日期 / 方式: 2026-10-23 / P0 场景 boot
 
@@ -42,3 +42,20 @@
 - 官方引擎在"无文本层"时的行为(是否丢字/画到别处)没有证据;
 - 若 YSCom attach 恢复,用最小脚本 `TEXT[OUTPUTMODE=1] + WORD`(不建层)
   对拍;若官方不显示,则本路径只在 `Reference` 模式保留。
+
+
+## 2026-11-16 收口(text-parity)
+
+REA 复核确认:`FUN_00404914`(`0x404914`)入口第一句是
+`MOV EAX,[EDX]; TEST EAX,EAX; JZ return`(EDX = `[0x801800]`,EAX =
+`state+0x00` 当前文本层对象)。`state+0x00 == 0`(从未 `TEXT[ID]` 命中)时
+**直接返回,不推进、不绘制**。因此:
+
+- 删除 soft 的屏幕覆盖层分支(`target=None` 不再产生,也不再画全视口 quad);
+- 删除 wgpu 的 `plan_screen_overlay_text` 与 `TextUploads.screen` 使用路径;
+- `TEXT[ID]` 未命中按官方错误路径(报错 + 保留旧层 + 中止本命令);
+- 合成探针若需要自动文本,必须显式建层并注入表面尺寸(或在 VM 单测里
+  `set_text_window`)。
+
+残余:官方对“层对象存在但表面尺寸为 0/空基图”的行为未实测;内核按
+“无有效表面 ⇒ 未命中”处理(`GfxState::text_layer_surface` 返回 `None`)。

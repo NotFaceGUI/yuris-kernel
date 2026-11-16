@@ -1,6 +1,6 @@
 # DIV-GFX-056 · 自动文本层的排版度量(换行 / 行高 / 基线)
 
-- 状态: **open(Likely)**,P2 实现并按此挂账
+- 状态: **open(Likely;折行/行高已 fixed 2026-11-16;基线与 GDI advance 仍 Likely)**
 - 优先级: 中(自动文本层:非 ERIS 正文,但接受 SCENARIO_EPILOGUE/RP_101 用)
 - 发现日期 / 方式: 2026-10-23 / 语料 + REA + P0 场景
 
@@ -46,3 +46,18 @@
 - 官方引擎文本窗口截图(YSCom attach 恢复后):同一文本、同一 `SX/SY`,
   逐行拟合 `line_height` 与基线;若偏差固定,改 `line_height()`/ascent
   取整规则即可,不影响 gfx/后端契约。
+
+
+## 2026-11-16 更新(text-parity)
+
+- **折行已按官方实现**:`FUN_00404c60` 的分支与禁则表已逐指令复核并落地
+  (`docs/tasks/text-oracle-2026-11-16.md` §2/§3)。适配判断的每格宽
+  **恒为 `SX`**(`WORD 0x458e26..0x458e3e` 把 `+0x20` 无条件写进 `+0x40`,
+  半角也不折半);`x` 的实际步进来自 `FUN_004056b8` 的 GDI advance,
+  内核按 `全角=SX、半角=SX/2` 建模(仍 `Likely`,归 DIV-FONT-002)。
+- **行高已确认**:`'R'` 用 `+0x44[+0x6c]`(追加时 `SY`)推进 `+0x18`;
+  `SY=0` 时按引擎默认 20。没有额外行距。
+- **基线仍 `Likely`**:`FUN_004056b8` 以单元顶 `+0x18` + 字体 ascent 绘制;
+  `yu-font` 的 ascent 取整与 GDI 的差未对拍(需官方截图 oracle)。
+- 仍待 oracle:逐字 advance 差导致的行尾折行点、行内 `FONT[SX/SY]` 变化后的
+  基线。采样方法见 `text-oracle-2026-11-16.md` §6(最小工程 + 屏幕截图)。

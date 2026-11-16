@@ -461,8 +461,8 @@ soft 已修,soft/wgpu 半透明像素逐通道差 0(测试
   `FUN_004141e4` 路径规范化 + `FUN_00414559` 逐字节查层,不做 UTF-8
   转换(2026-11-04 fixed,DIV-GFX-021)。
 - 官方 `TEXT[CLEAR]`(`0x4638e4`)只清待显示缓冲,不清图层表面;
-  `'P'` 才清表面,自动模式默认一行一页。内核以累积显示缓冲近似,
-  差异见 DIV-GFX-075。
+  `'P'` 才清表面,自动模式默认一行一页。2026-11-16 已按 REA 严格落地
+  (VM 待显示缓冲 + gfx 已提交字形),见 DIV-GFX-075。
 - 外字(图像字形):`CG[图]→SIZE2→MEIDO→MERGE2 到文本层` 降级为
   `TextDraw.image`(`TextImage{asset,width,height,tint}`),由文本合成器
   在层末与文字一起画一次;`MEIDO` = 每通道 `×(byte/128)`。官方链见
