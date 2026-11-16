@@ -999,6 +999,14 @@ pub fn start_session_json(json: &str) -> Result<String, String> {
             .map_err(|error| format!("{} 解析失败: {error}", override_path.display()))?;
     }
     let path_overrides = yu_engine::host_paths::HostPathOverrides {
+        // `$_SYSTEM_PATH` 是游戏起動パス:显式给 `data_root`。
+        //
+        // 旧规则「= 存档根父目录」只在 `save_root = data_root/save` 时成立;
+        // iOS 宿主把存档放在 app 容器(与游戏数据分开),沿用旧规则会把
+        // `$_SYSTEM_PATH` 指到存档目录,脚本按系统路径找游戏文件就会失败。
+        // Android 默认 save_root 仍是 data_root/save,本项与旧行为一致;
+        // 外置存档目录(`EXTRA_SAVE_DIR`)也因此得到正确的游戏根。
+        system_path: Some(config.data_root.clone()),
         appdata_path: Some(config.save_root.clone()),
         personal_path: Some(config.data_root.clone()),
         ..Default::default()
