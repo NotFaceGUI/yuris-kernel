@@ -105,8 +105,10 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             .map_err(|d| Failure::usage(format!("--patch: {d}")))?,
         None => yu_engine::patch::PatchSelection::default(),
     };
-    // 强制字体(与 headless 同一套 `font_options`:family 或字体文件)。
+    // 宿主默认字体(与 headless 同一套 `font_options`:family 或字体文件)。
     let font_arg = args.flag("font");
+    // 旧行为保留:--font 也锁死脚本/游戏内字体选择(诊断用)。
+    let font_lock = crate::args::switch_flag(&mut args, "font-lock")?;
     // 渲染/诊断参数(与 headless/serve 同一套旗标)。
     let host_tuning = crate::args::HostTuning::from_args(&mut args)?;
     // 桌面宿主自己的取证开关(不进入引擎参数)。
@@ -227,6 +229,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         // 付 ~130ms 的 fontdb 枚举(实测)。
         warm_text: true,
         font,
+        font_lock,
         // 脚本密钥缺省由启动期解析(exe 扫描/数据自举/默认值)。
         script_key: None,
         save_codec,

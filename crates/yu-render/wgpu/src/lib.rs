@@ -524,6 +524,8 @@ impl WgpuRenderer {
         self.gpu_textures.clear_transient(&mut self.pipelines);
         self.pipelines.clear_runtime_groups();
         self.readback = ReadbackCache::new();
+        // 同 soft:新会话文本修订号从 0 开始,清 CPU 侧合成/基面缓存。
+        self.text.clear_text_caches();
     }
 
     pub fn textures(&self) -> &TextureStore {

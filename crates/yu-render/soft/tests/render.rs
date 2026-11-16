@@ -1681,6 +1681,101 @@ fn cgact_text_on_painted_transparent_solid_layer_is_visible() {
     );
 }
 
+/// 游戏内字体切换:同一层/同一文本,`FONT[NAME]` 变化必须改变像素;
+/// 切回原字体必须逐字节还原(合成缓存不能留下旧字体)。
+#[test]
+fn font_switch_changes_pixels_and_restores_on_switch_back() {
+    let table = table();
+    let mut backend = SoftRenderer::new(texture_store(&[]));
+    if !backend.text_composer().available() {
+        println!("SKIP font_switch_changes_pixels_and_restores_on_switch_back: no system font");
+        return;
+    }
+    let families = backend.text_composer().font_families();
+    if families.len() < 2 {
+        println!("SKIP font_switch_changes_pixels_and_restores_on_switch_back: <2 families");
+        return;
+    }
+    let mut gfx = state(Viewport::new(64, 32), [0, 0, 0, 255]);
+    let render = |backend: &mut SoftRenderer,
+                  gfx: &mut yu_gfx::GfxState,
+                  name: &[u8],
+                  frame: u64,
+                  recreate: bool| {
+        let mut events = vec![VmEvent::FrameStart { frame }];
+        if recreate {
+            // 字体选择器重画时先清层:旧字体像素与绘制项都必须消失。
+            events.push(call(
+                frame,
+                "CGEND",
+                vec![arg(&table, "CGEND", "ID", Value::Str(b"TX".to_vec()))],
+            ));
+        }
+        events.push(call(
+            frame,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(64)),
+                arg(&table, "CG", "SY", Value::Int(32)),
+            ],
+        ));
+        events.push(call(
+            frame,
+            "FONT",
+            vec![
+                arg(&table, "FONT", "NAME", Value::Str(name.to_vec())),
+                arg(&table, "FONT", "SX", Value::Int(24)),
+                arg(&table, "FONT", "SY", Value::Int(24)),
+                arg(&table, "FONT", "COLOR", Value::Int(0x00FF_FFFF)),
+            ],
+        ));
+        events.push(call(
+            frame,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"TX".to_vec())),
+                arg(&table, "CGACT", "TEXT", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0)),
+                // 'A':两个字体都应有该字形,形状差异可见。
+                arg(&table, "CGACT", "SETSTR", Value::Str(b"A".to_vec())),
+                arg(&table, "CGACT", "X", Value::Int(4)),
+                arg(&table, "CGACT", "Y", Value::Int(4)),
+            ],
+        ));
+        events.push(VmEvent::FrameEnd { frame });
+        gfx.consume_events(&events);
+        backend.render_frame(&gfx.frame()).surface
+    };
+    let first = render(&mut backend, &mut gfx, &families[0], 1, false);
+    let other = render(&mut backend, &mut gfx, &families[1], 2, true);
+    let again = render(&mut backend, &mut gfx, &families[0], 3, true);
+    assert_eq!(
+        first.rgba, again.rgba,
+        "切回原字体必须逐字节还原(缓存不得残留)"
+    );
+    if first.rgba == other.rgba {
+        println!(
+            "SKIP font_switch_changes_pixels_and_restores_on_switch_back: first two families render identically"
+        );
+        return;
+    }
+    let ink = |rgba: &[u8]| rgba.chunks_exact(4).any(|px| px[..3] != [0, 0, 0]);
+    assert!(ink(&first.rgba), "第一个字体必须真的画出字形");
+    assert!(ink(&other.rgba), "第二个字体必须真的画出字形");
+
+    // 引擎 restart = 新 GfxState(修订号从 0 重计)+ 渲染器 reset。
+    // reset 必须清合成/基面缓存,否则同 (layer, revision) 会复用旧字体纹理。
+    backend.reset();
+    let mut restarted = state(Viewport::new(64, 32), [0, 0, 0, 255]);
+    let cross_session = render(&mut backend, &mut restarted, &families[1], 1, false);
+    assert_eq!(
+        cross_session.rgba, other.rgba,
+        "reset 后同修订号必须按新字体重算,不得命中旧会话纹理"
+    );
+}
+
 /// 逐字符样式必须真的应用到像素:同一行两个字形不同前景色。
 ///
 /// 这条用例防的是“逐字样式只进了模型、合成器仍用整段样式”的静默回归:

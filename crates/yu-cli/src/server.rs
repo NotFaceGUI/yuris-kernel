@@ -52,8 +52,10 @@ pub struct ServeOptions {
     pub diag_ws: bool,
     /// `@_DEBUGMODE` 注入(DIV-L-001;debug 语料对拍口径)。
     pub debug_mode: bool,
-    /// 强制字体 family 或字体文件路径(启动时统一解析)。
+    /// 宿主默认字体 family 或字体文件路径(启动时统一解析)。
     pub font_arg: Option<String>,
+    /// `--font` 强制锁(旧行为;默认 false = 宿主默认字体可被游戏内切换)。
+    pub font_lock: bool,
     /// 文本编码路线(`auto|original|gbk|tunnel`)。
     pub patch: yu_engine::patch::PatchKind,
     /// JSONL 日志路径(Q1 R4;`None` = 不落盘,关闭时只打 stderr 汇总)。
@@ -115,6 +117,7 @@ impl ServeOptions {
                 None => None,
             };
         let font_arg = args.flag("font");
+        let font_lock = crate::args::switch_flag(&mut args, "font-lock")?;
         let patch = match args.flag("patch") {
             Some(value) => yu_engine::patch::PatchKind::parse(&value)?,
             None => yu_engine::patch::PatchKind::Auto,
@@ -141,6 +144,7 @@ impl ServeOptions {
             diag_ws,
             debug_mode,
             font_arg,
+            font_lock,
             patch,
             log_file,
             max_step_ms,
@@ -187,6 +191,7 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         // 长跑宿主:首帧前预热字体表,避免第一次文本场景的 ~130ms 停顿。
         warm_text: true,
         font,
+        font_lock: opts.font_lock,
         font_bytes,
         patch: yu_engine::patch::PatchSelection::new(opts.patch),
         tuning: opts.tuning,

@@ -60,6 +60,21 @@ pub enum FaceOrigin {
     System,
 }
 
+/// One entry of the deterministic family catalogue.
+///
+/// `name` is the primary family name (or PostScript name when the font
+/// declares no family); `face` is the representative face: normal style,
+/// weight 400, lowest face index, host-injected faces first. The list is
+/// sorted by `name` and deduplicated. `FontSource::face_by_no` indexes this
+/// table; the renderer's `FONT[NO]` uses the CP932-filtered `FONTINFO`
+/// projection (same order minus names CP932 cannot encode).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FamilyEntry {
+    pub name: String,
+    pub face: FaceId,
+    pub origin: FaceOrigin,
+}
+
 /// Basic style of a face.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FaceStyle {
@@ -130,6 +145,17 @@ pub struct FontSource {
     faces: Vec<FaceRecord>,
     by_db: HashMap<fontdb::ID, FaceId>,
     origin: FaceOrigin,
+    /// 一次构建的 family 目录:`family_names()`、`face_by_no()` 共用,
+    /// 不再每次调用都全表扫描/排序。
+    catalog: Vec<FamilyEntry>,
+    /// `normalize(别名) → (代表 face, 打分)`(family / 本地化名 / PostScript 名)。
+    /// 打分按 (normal, weight 400, 更早 face) 比较,与历史全表扫描一致。
+    family_index: HashMap<String, (FaceId, (u8, u8, u32))>,
+    /// 同上,只收宿主注入(`Embedded`)的 face;同名时优先于系统字体。
+    embedded_family_index: HashMap<String, (FaceId, (u8, u8, u32))>,
+    /// 引擎默认 family 实际命中的 name 与 face(启动期多次查询,缓存)。
+    default_hit: Option<&'static str>,
+    default_face_id: Option<FaceId>,
     /// 文件面字节缓存:`路径 → 字节`。fontdb(只开 `fs`、无 `memmap`)的
     /// `Source::File` 分支在每次 `with_face_data` 时 `std::fs::read` **整个
     /// 字体文件**(日文系统字体 TTC 可达 20MB+),导致每个字形缓存 miss、
@@ -172,6 +198,93 @@ pub fn families_from_bytes(bytes: &[u8]) -> Vec<String> {
 }
 
 impl FontSource {
+    /// Build the immutable catalogue and name indexes once, after `faces` is
+    /// complete.
+    ///
+    /// Scores match the historical `find_family` scan exactly: prefer normal
+    /// style, then weight 400, then the earliest face. Keeping the score in
+    /// the index means duplicate family names (localized aliases, host and
+    /// system copies) resolve identically without rescanning.
+    fn finish(mut self) -> Self {
+        let mut best_by_name: HashMap<String, (FaceId, (u8, u8, u8, u32))> = HashMap::new();
+        let mut family_index: HashMap<String, (FaceId, (u8, u8, u32))> = HashMap::new();
+        let mut embedded_family_index: HashMap<String, (FaceId, (u8, u8, u32))> = HashMap::new();
+        for (idx, f) in self.faces.iter().enumerate() {
+            let id = FaceId(idx as u32);
+            let score = (
+                (f.style == FaceStyle::Normal) as u8,
+                (f.weight == 400) as u8,
+                u32::MAX - idx as u32,
+            );
+            // 目录代表 face:宿主注入的同名字体优先(用户显式换字体);
+            // 其余判分与 `find_family` 相同。
+            let catalog_score = (
+                (f.origin == FaceOrigin::Embedded) as u8,
+                score.0,
+                score.1,
+                score.2,
+            );
+            let primary = f
+                .families
+                .first()
+                .cloned()
+                .unwrap_or_else(|| f.post_script_name.clone());
+            match best_by_name.get(&primary) {
+                Some(&(_, seen)) if seen >= catalog_score => {}
+                _ => {
+                    best_by_name.insert(primary.clone(), (id, catalog_score));
+                }
+            }
+            let mut aliases = Vec::with_capacity(f.families.len() + 2);
+            aliases.push(f.family_key.as_str());
+            for family in &f.families {
+                aliases.push(family);
+            }
+            aliases.push(f.post_script_name.as_str());
+            for alias in aliases {
+                let key = normalize_name(alias);
+                if key.is_empty() {
+                    continue;
+                }
+                match family_index.get(&key) {
+                    Some(&(_, seen)) if seen >= score => {}
+                    _ => {
+                        family_index.insert(key.clone(), (id, score));
+                    }
+                }
+                if f.origin == FaceOrigin::Embedded {
+                    match embedded_family_index.get(&key) {
+                        Some(&(_, seen)) if seen >= score => {}
+                        _ => {
+                            embedded_family_index.insert(key, (id, score));
+                        }
+                    }
+                }
+            }
+        }
+        self.catalog = best_by_name
+            .into_iter()
+            .map(|(name, (face, _))| FamilyEntry {
+                origin: self.faces[face.0 as usize].origin,
+                name,
+                face,
+            })
+            .collect();
+        self.catalog.sort_by(|a, b| a.name.cmp(&b.name));
+        self.default_hit = ENGINE_DEFAULT_FAMILIES
+            .iter()
+            .copied()
+            .find(|name| family_index.contains_key(&normalize_name(name)));
+        self.default_face_id = self.default_hit.and_then(|name| {
+            family_index
+                .get(&normalize_name(name))
+                .map(|(face, _)| *face)
+        });
+        self.family_index = family_index;
+        self.embedded_family_index = embedded_family_index;
+        self
+    }
+
     /// Load font bytes (TrueType/OpenType/TTC). A self-contained game font is
     /// preferred over system fonts by the caller.
     pub fn from_bytes(bytes: Vec<u8>, origin: FaceOrigin) -> Result<Self, Diag> {
@@ -219,9 +332,15 @@ impl FontSource {
             faces,
             by_db,
             origin,
+            catalog: Vec::new(),
+            family_index: HashMap::new(),
+            embedded_family_index: HashMap::new(),
+            default_hit: None,
+            default_face_id: None,
             data_cache: Mutex::new(HashMap::new()),
             bold_cache: Mutex::new(HashMap::new()),
-        })
+        }
+        .finish())
     }
 
     /// Load one font file from disk (desktop/Android only).
@@ -305,9 +424,15 @@ impl FontSource {
             faces,
             by_db,
             origin: FaceOrigin::System,
+            catalog: Vec::new(),
+            family_index: HashMap::new(),
+            embedded_family_index: HashMap::new(),
+            default_hit: None,
+            default_face_id: None,
             data_cache: Mutex::new(HashMap::new()),
             bold_cache: Mutex::new(HashMap::new()),
-        })
+        }
+        .finish())
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -374,9 +499,15 @@ impl FontSource {
             faces,
             by_db,
             origin: FaceOrigin::System,
+            catalog: Vec::new(),
+            family_index: HashMap::new(),
+            embedded_family_index: HashMap::new(),
+            default_hit: None,
+            default_face_id: None,
             data_cache: Mutex::new(HashMap::new()),
             bold_cache: Mutex::new(HashMap::new()),
-        })
+        }
+        .finish())
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -447,10 +578,7 @@ impl FontSource {
     /// the current scoring, but this stays honest instead of guessing).
     #[must_use]
     pub fn default_family_hit(&self) -> Option<&'static str> {
-        ENGINE_DEFAULT_FAMILIES
-            .iter()
-            .copied()
-            .find(|name| self.find_family(name).is_some())
+        self.default_hit
     }
 
     /// 每个字符宽是否恰好等于字号(`SX`)。
@@ -484,24 +612,21 @@ impl FontSource {
         first.is_some()
     }
 
+    /// Deterministic family catalogue: primary family name, sorted,
+    /// deduplicated, each with its representative face.
+    /// This is **not** the Windows `EnumFontFamiliesExA` order; `NO` indices
+    /// documented as a divergence.
+    #[must_use]
+    pub fn catalog(&self) -> &[FamilyEntry] {
+        &self.catalog
+    }
+
     /// Deterministic family list: primary family name, sorted, deduplicated.
     /// This is **not** the Windows `EnumFontFamiliesExA` order; `NO` indices
     /// documented as a divergence.
     #[must_use]
     pub fn family_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
-            .faces
-            .iter()
-            .map(|f| {
-                f.families
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| f.post_script_name.clone())
-            })
-            .collect();
-        names.sort();
-        names.dedup();
-        names
+        self.catalog.iter().map(|e| e.name.clone()).collect()
     }
 
     /// Resolve a family by name, localized name or PostScript name.
@@ -510,75 +635,67 @@ impl FontSource {
     #[must_use]
     pub fn find_family(&self, name: &str) -> Option<FaceId> {
         let want = normalize_name(name);
-        let mut best: Option<FaceId> = None;
-        for (idx, f) in self.faces.iter().enumerate() {
-            let matched = f.family_key == want
-                || f.families.iter().any(|n| normalize_name(n) == want)
-                || normalize_name(&f.post_script_name) == want;
-            if !matched {
-                continue;
-            }
-            let id = FaceId(idx as u32);
-            let score = (
-                (f.style == FaceStyle::Normal) as u8,
-                (f.weight == 400) as u8,
-                u32::MAX - idx as u32,
-            );
-            let best_score = best.map(|b| {
-                let r = &self.faces[b.0 as usize];
-                (
-                    (r.style == FaceStyle::Normal) as u8,
-                    (r.weight == 400) as u8,
-                    u32::MAX - b.0,
-                )
-            });
-            if best_score.is_none_or(|s| score > s) {
-                best = Some(id);
-            }
+        self.family_index.get(&want).map(|(face, _)| *face)
+    }
+
+    /// Same as [`Self::find_family`], but prefers faces from the requested
+    /// origin when the same family name exists in both system and injected
+    /// bytes (host default font must win over a system font of the same name).
+    #[must_use]
+    pub fn find_family_prefer(&self, name: &str, prefer: FaceOrigin) -> Option<FaceId> {
+        let want = normalize_name(name);
+        match prefer {
+            FaceOrigin::Embedded => self
+                .embedded_family_index
+                .get(&want)
+                .or_else(|| self.family_index.get(&want))
+                .map(|(face, _)| *face),
+            FaceOrigin::System => self.family_index.get(&want).map(|(face, _)| *face),
         }
-        best
+    }
+
+    /// Whether `name` resolves to one of the engine's built-in default
+    /// families (`ＭＳ ゴシック` and its localized aliases such as
+    /// `MS Gothic`).
+    ///
+    /// Identity is the font family, not the spelling: fontdb reports the
+    /// primary family as `MS Gothic` while scripts use the Japanese alias
+    /// `ＭＳ ゴシック`, and both must be recognized as the engine default.
+    #[must_use]
+    pub fn is_engine_default_family(&self, name: &str) -> bool {
+        let Some(face) = self.find_family(name) else {
+            return false;
+        };
+        let key = &self.faces[face.0 as usize].family_key;
+        ENGINE_DEFAULT_FAMILIES
+            .iter()
+            .filter_map(|candidate| self.find_family(candidate))
+            .any(|engine| &self.faces[engine.0 as usize].family_key == key)
     }
 
     /// Engine default: try [`ENGINE_DEFAULT_FAMILIES`] in order. No silent
     /// fallback to a generic family.
     pub fn default_face(&self) -> Result<FaceId, Diag> {
-        for name in ENGINE_DEFAULT_FAMILIES {
-            if let Some(id) = self.find_family(name) {
-                return Ok(id);
-            }
-        }
-        Err(
-            Diag::fatal(code::font::MISSING, Boundary::Platform).with_detail(format!(
-                "none of the engine default families is installed: {}",
-                ENGINE_DEFAULT_FAMILIES.join(", ")
-            )),
-        )
+        self.default_face_id
+            .ok_or_else(|| {
+                Diag::fatal(code::font::MISSING, Boundary::Platform).with_detail(format!(
+                    "none of the engine default families is installed: {}",
+                    ENGINE_DEFAULT_FAMILIES.join(", ")
+                ))
+            })
     }
 
-    /// `FONT[NO=n]` lookup using this crate's deterministic family order.
+    /// Family lookup by catalogue index (deterministic family order).
     ///
-    /// Divergence: the engine's `NO` indexes the GDI enumeration order, which
-    /// is not portable. Callers that need parity should use `NAME`.
+    /// The representative face is normal weight 400. `FONTINFO[NAME NO=n]`
+    /// projects this catalogue through CP932 (unencodable names dropped), so
+    /// `FONT[NO]` resolution in the render core uses that filtered order, not
+    /// this raw index, to stay aligned with the injected list. Divergence: the
+    /// engine's `NO` indexes the GDI enumeration order, which is not
+    /// portable. Callers that need parity should use `NAME`.
     #[must_use]
     pub fn face_by_no(&self, no: usize) -> Option<FaceId> {
-        // 排序键的小写形式只算一次:原来比较器里对两个 family 名各
-        // `to_lowercase()`,O(n log n) 次字符串分配(只影响首次解析)。
-        // 比较次序仍是 (小写名, face index, FaceId),不变。
-        let mut sorted: Vec<(String, u32, FaceId)> = self
-            .faces
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                let name = f
-                    .families
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| f.post_script_name.clone());
-                (name.to_lowercase(), f.index, FaceId(i as u32))
-            })
-            .collect();
-        sorted.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-        sorted.get(no).map(|x| x.2)
+        self.catalog.get(no).map(|e| e.face)
     }
 
     /// 字体自身是否声明 Bold(`OS/2 fsSelection` 或 `head.macStyle`)。
@@ -875,6 +992,7 @@ mod tests {
         assert_eq!(normalize_name("ＭＳ Ｐゴシック"), "mspゴシック");
         assert_ne!(normalize_name("ＭＳ 明朝"), normalize_name("ＭＳ ゴシック"));
     }
+
 
     #[test]
     fn kern_format0_parser_reads_a_pair() {

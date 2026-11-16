@@ -79,8 +79,10 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         Some(value) => ArgReader::on_off("debug-mode", &value)?,
         None => false,
     };
-    // 强制字体(诊断/换字体):family 名,或字体文件路径(宿主持久化入口)。
+    // 宿主默认字体(诊断/换字体):family 名,或字体文件路径。
     let font_arg = args.flag("font");
+    // 旧行为保留:--font 也锁死脚本/游戏内字体选择(诊断用)。
+    let font_lock = crate::args::switch_flag(&mut args, "font-lock")?;
     // 强制存档块压缩层,覆盖自动判定(盘上既有存档 → 引擎代号 → zlib)。
     // 只影响**写盘**;读侧仍按实际流分流。
     let save_codec = crate::args::save_codec_flag(args.flag("save-codec"))?;
@@ -128,6 +130,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         debug_mode,
         save_root,
         font,
+        font_lock,
         font_bytes,
         script_key,
         save_codec,

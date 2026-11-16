@@ -253,9 +253,11 @@ yu-cli run · 跑工程(缺省 headless;--mode desktop 开原生窗口)
                        引擎代号 YSSnp.dll → zlib;只影响写盘)
   --patch MODE         文本编码路线:auto(缺省,按产物识别)|
                        original | gbk | tunnel(需 sjis_ext.bin)
-  --font FAMILY|PATH   强制字体:family 名,或字体文件(.ttf/.otf/.ttc/
+  --font FAMILY|PATH   宿主默认字体:family 名,或字体文件(.ttf/.otf/.ttc/
                        .otc;相对路径按工程根,文件里的 Bold/Italic 照常解析;
-                       查不到 = 硬失败,全角/半角与空格差异自动折叠)
+                       引擎默认名/空名映射到它,游戏内选其它字体仍生效;
+                       查不到 = 回退引擎默认 family)
+  --font-lock          配合 --font:恢复旧强制语义(忽略脚本/游戏内选择)
   --debug-mode on|off  @_DEBUGMODE 注入(缺省 off;desktop 缺省时亦读
                        环境变量 YURIS_DEBUG_MODE=1,DIV-L-001)
 
@@ -323,7 +325,7 @@ yu-cli serve · 本地服务:服务端读数据并执行内核,浏览器只做�
   yu-cli serve <project-root> [--backend soft|wgpu] [--port 4173] [--no-open]
                [--entry LABEL] [--fps 60] [--record-events on|off]
                [--debug-mode on|off] [--data PATH] [--www DIR] [--diag-ws]
-               [--font FAMILY|PATH] [--log-file PATH] [--max-step-ms N]
+               [--font FAMILY|PATH] [--font-lock] [--log-file PATH] [--max-step-ms N]
 
 说明:
   启动后打印 http://127.0.0.1:<port>/,默认打开浏览器。

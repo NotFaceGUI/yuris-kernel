@@ -178,6 +178,8 @@ impl SoftRenderer {
         self.snapshots.clear();
         self.last_screen = None;
         self.image_cache.clear();
+        // 新 GfxState 的文本修订号从 0 重新计数:旧合成/基面缓存键会撞。
+        self.text.clear_text_caches();
     }
 
     pub fn textures(&self) -> &TextureStore {

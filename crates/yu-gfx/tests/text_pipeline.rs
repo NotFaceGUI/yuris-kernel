@@ -60,6 +60,56 @@ fn cg_text_layer(gfx: &mut yu_gfx::GfxState, t: &yu_gfx::ParamTable, id: &str, w
 }
 
 #[test]
+fn font_change_reprojects_committed_layout_style() {
+    let mut gfx = state();
+    let t = table();
+    gfx.on_event(&frame_start(0));
+    cg_text_layer(&mut gfx, &t, "MSG", 64, 32);
+    gfx.apply_text_frame(&text_frame(
+        b"MSG",
+        0,
+        0,
+        vec![glyph(b"A", 0, 0, false)],
+    ));
+    assert!(
+        gfx.frame()
+            .text_layout
+            .expect("committed layout")
+            .style
+            .name
+            .is_none()
+    );
+    let set_name = |gfx: &mut yu_gfx::GfxState, name: &str| {
+        gfx.on_event(&call(
+            0,
+            "FONT",
+            vec![arg(&t, "FONT", "NAME", s(name))],
+        ));
+    };
+    // 行级样式参与布局投影:换字体后旧缓存必须失效。
+    set_name(&mut gfx, "Alpha");
+    assert_eq!(
+        gfx.frame()
+            .text_layout
+            .expect("after Alpha")
+            .style
+            .name
+            .as_deref(),
+        Some(b"Alpha".as_slice())
+    );
+    set_name(&mut gfx, "Beta");
+    assert_eq!(
+        gfx.frame()
+            .text_layout
+            .expect("after Beta")
+            .style
+            .name
+            .as_deref(),
+        Some(b"Beta".as_slice())
+    );
+}
+
+#[test]
 fn committed_glyphs_target_text_layer() {
     let mut gfx = state();
     let t = table();

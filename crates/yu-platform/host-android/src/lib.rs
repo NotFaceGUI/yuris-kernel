@@ -416,7 +416,8 @@ pub struct RunConfig {
     pub debug_mode: bool,
     /// 显式脚本密钥(8 位十六进制)。缺省 = 启动时自动解析。
     pub script_key: Option<[u8; 4]>,
-    /// 强制字体 family(等价 CLI `--font`)。
+    /// 宿主默认字体 family(等价 CLI `--font`)。脚本未指定/引擎默认名
+    /// 映射到它;游戏内明确选择其它字体仍生效。
     pub force_font: Option<String>,
     /// 宿主附加字体字节(用户导入的字体文件内容)。
     pub font_bytes: Vec<Vec<u8>>,
@@ -738,9 +739,10 @@ fn apply_tuning_json(
 
 /// [`init_session`] + 宿主字体(用户导入的字体字节 / 用户选的字体族)。
 ///
-/// `font_family` 非空时走 [`EngineOptions::force_font`]:把所有 `FONT` 请求
-/// 解析到该 family。这不是"兜底默认字体",而是用户显式指定的替换 ——
-/// 游戏通常点名 Windows 日文字体(ＭＳ ゴシック),Android 上没有。
+/// `font_family` 非空时走 [`EngineOptions::font`] 的默认字体语义:脚本未
+/// 指定、或点名引擎默认日文字体(ＭＳ ゴシック,Android 上没有)时解析到
+/// 它;游戏内明确选择的其它 family 仍按原名解析。需要旧“锁死所有 FONT”
+/// 行为时用 CLI `--font-lock`。
 pub fn init_session_with_fonts(
     data_root: PathBuf,
     save_root: PathBuf,

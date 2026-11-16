@@ -45,6 +45,101 @@ fn no_lookup_is_deterministic_and_bounded() {
 }
 
 #[test]
+fn host_injected_duplicate_family_wins_over_system() {
+    let Some(font) = support::load_test_font() else {
+        return;
+    };
+    let Ok(info) = font.source.face_info(font.face) else {
+        return;
+    };
+    let Some(path) = info.source_path.clone() else {
+        println!("SKIP[font:host-prefer] test font has no file path");
+        return;
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            println!("SKIP[font:host-prefer] cannot read {}: {error}", path.display());
+            return;
+        }
+    };
+    let with_extra = match FontSource::load_with_extra_bytes(&[bytes]) {
+        Ok(source) => source,
+        Err(diag) => {
+            println!("SKIP[font:host-prefer] {diag}");
+            return;
+        }
+    };
+    let Some(name) = info.families.first().cloned() else {
+        return;
+    };
+    let embedded = with_extra
+        .find_family_prefer(&name, yu_font::FaceOrigin::Embedded)
+        .expect("embedded family resolves");
+    assert_eq!(
+        with_extra.face_info(embedded).unwrap().origin,
+        yu_font::FaceOrigin::Embedded,
+        "同名宿主注入 face 必须优先"
+    );
+    // 普通 find_family 保持历史行为(系统枚举里更早的 face)。
+    let ordinary = with_extra.find_family(&name).expect("family resolves");
+    assert_eq!(
+        with_extra.face_info(ordinary).unwrap().origin,
+        yu_font::FaceOrigin::System
+    );
+    // 目录代表 face(FONT[NO])同样优先宿主注入,与 FONT[NAME] 一致。
+    if let Some(entry) = with_extra.catalog().iter().find(|e| e.name == name) {
+        assert_eq!(entry.origin, yu_font::FaceOrigin::Embedded);
+        assert_eq!(entry.face, embedded);
+    }
+}
+
+#[test]
+fn engine_default_detection_uses_family_identity() {
+    let Some(font) = support::load_test_font() else {
+        return;
+    };
+    if font.source.find_family("ＭＳ ゴシック").is_none() {
+        println!("SKIP[font:engine-default] MS Gothic is not installed");
+        return;
+    }
+    assert!(font.source.is_engine_default_family("ＭＳ ゴシック"));
+    // fontdb 的主 family 名是 ASCII 本地化别名;同一 family 必须一起识别。
+    assert!(font.source.is_engine_default_family("MS Gothic"));
+    let other = font
+        .source
+        .catalog()
+        .iter()
+        .find(|entry| !font.source.is_engine_default_family(&entry.name));
+    if let Some(entry) = other {
+        assert!(!font.source.is_engine_default_family(&entry.name));
+    }
+}
+
+#[test]
+fn catalog_and_no_lookup_share_the_same_order() {
+    let Some(font) = support::load_test_font() else {
+        return;
+    };
+    let catalog = font.source.catalog();
+    assert_eq!(
+        catalog.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
+        font.source.family_names()
+    );
+    for (index, entry) in catalog.iter().enumerate() {
+        assert_eq!(font.source.face_by_no(index), Some(entry.face));
+        // 代表 face 属于该 family(本地化名或 PostScript 名均可)。
+        let info = font.source.face_info(entry.face).unwrap();
+        assert!(
+            info.families.contains(&entry.name) || info.post_script_name == entry.name,
+            "catalog entry {:?} resolved to {:?}",
+            entry.name,
+            info
+        );
+    }
+}
+
+#[test]
 fn font_slot_applies_engine_clamps() {
     let Some(font) = support::load_test_font() else {
         return;

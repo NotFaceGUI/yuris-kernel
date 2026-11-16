@@ -372,6 +372,51 @@ fn fontinfo_unset_fields_are_not_fabricated() {
 }
 
 #[test]
+fn fontinfo_lists_catalog_and_rewrites_engine_default_name() {
+    let table = table();
+    let mut gfx = state();
+    gfx.set_font_families(vec![b"HostFont".to_vec(), b"SystemFont".to_vec()]);
+    // 引擎默认 family 名单由宿主按 CP932 注入;这里用 ASCII 等价名测试
+    // 「请求引擎默认名 ⇒ 回报宿主默认名」的分支。
+    gfx.set_font_selection_meta(Some(b"HostFont".to_vec()), vec![b"MS Gothic".to_vec()]);
+    let info = |gfx: &yu_gfx::GfxState, flag: &str, no: Option<i64>| {
+        let mut args = vec![arg(&table, "FONTINFO", flag, i(1))];
+        if let Some(no) = no {
+            args.push(arg(&table, "FONTINFO", "NO", i(no)));
+        }
+        q(gfx, "FONTINFO", args)
+    };
+    assert_eq!(info(&gfx, "NUM", None), Value::Int(2));
+    assert_eq!(info(&gfx, "LANG", Some(1)), Value::Int(0));
+    assert_eq!(
+        info(&gfx, "NAME", Some(1)),
+        Value::Str(b"HostFont".to_vec())
+    );
+    assert_eq!(
+        info(&gfx, "NAME", Some(2)),
+        Value::Str(b"SystemFont".to_vec())
+    );
+    assert_eq!(info(&gfx, "NAME", Some(3)), Value::Str(Vec::new()));
+
+    let set_name = |gfx: &mut yu_gfx::GfxState, name: &str| {
+        gfx.consume_events(&[
+            frame_start(1),
+            call(1, "FONT", vec![arg(&table, "FONT", "NAME", s(name))]),
+            frame_end(1),
+        ]);
+    };
+    // 脚本请求引擎默认名:实际渲染宿主默认字体,显示名也回报它。
+    set_name(&mut gfx, "MS Gothic");
+    assert_eq!(info(&gfx, "NAME", None), Value::Str(b"HostFont".to_vec()));
+    // 游戏内明确选择其它字体:原样回报,不被默认名覆盖。
+    set_name(&mut gfx, "SystemFont");
+    assert_eq!(
+        info(&gfx, "NAME", None),
+        Value::Str(b"SystemFont".to_vec())
+    );
+}
+
+#[test]
 fn windowinfo_answers_main_geometry() {
     let table = table();
     let mut gfx = state();

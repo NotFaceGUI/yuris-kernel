@@ -176,6 +176,17 @@ pub struct TextComposer {
     /// 查不到时不用引擎回退表兜底 —— 强制指定就该显式失败,否则用户会
     /// 以为换上了、其实画的还是默认字体。
     force_font: Option<String>,
+    /// 宿主默认字体 family(普通 `--font`/Android 导入字体)。
+    ///
+    /// 与 [`Self::force_font`] 不同:只接管「脚本没指定 / 指定的是引擎默认
+    /// family(ＭＳ ゴシック 等)」两种情况;脚本明确要求其它 family 时照常
+    /// 解析,游戏内字体选择因此可以直接生效。
+    default_font: Option<String>,
+    /// `FONTINFO` 清单缓存(CP932,宿主默认名第一项);字体源或默认字体
+    /// 变化时失效。
+    catalog_cache: Option<Vec<Vec<u8>>>,
+    /// 与 `catalog_cache` 逐项同序的代表 face(`FONT[NO]` 用)。
+    catalog_faces: Option<Vec<yu_font::FaceId>>,
     /// SJIS 隧道表(`sjis_ext.bin`;补丁路线 C)。`None` = 无隧道。
     tunnel: Option<TunnelTable>,
     /// 合成缓存当前字节占用(`ComposeCacheEntry::bytes` 之和)。
@@ -543,6 +554,9 @@ impl TextComposer {
             compose_cache: BTreeMap::new(),
             source_summary: None,
             force_font: None,
+            default_font: None,
+            catalog_cache: None,
+            catalog_faces: None,
             tunnel: None,
             cache_bytes: 0,
             base_cache: BTreeMap::new(),
@@ -576,6 +590,9 @@ impl TextComposer {
             compose_cache: BTreeMap::new(),
             source_summary: None,
             force_font: None,
+            default_font: None,
+            catalog_cache: None,
+            catalog_faces: None,
             tunnel: None,
             cache_bytes: 0,
             base_cache: BTreeMap::new(),
@@ -627,7 +644,73 @@ impl TextComposer {
     /// 兜底,解析失败并通过 `text.font_missing` 显式暴露。
     pub fn set_force_font(&mut self, family: Option<String>) {
         self.force_font = family;
+        self.invalidate_font_caches(false);
+    }
+
+    /// 设置宿主默认字体(普通 `--font`/Android 导入字体)。
+    ///
+    /// 脚本未指定字体、或指定的是引擎默认 family 时解析到它;其它明确
+    /// 字体名照常解析。`None` 恢复原语义。字体源不变,但已解析 face、
+    /// 合成/基面缓存和字形缓存必须一起作废 —— 换字体不能留下旧字形。
+    pub fn set_default_font(&mut self, family: Option<String>) {
+        if self.default_font == family {
+            return;
+        }
+        self.default_font = family;
+        self.invalidate_font_caches(true);
+    }
+
+    /// 当前的宿主默认字体 family。
+    #[must_use]
+    pub fn default_font(&self) -> Option<&str> {
+        self.default_font.as_deref()
+    }
+
+    /// 宿主默认字体名的 CP932 字节(注入 `FONTINFO[NAME]` 显示用)。
+    #[must_use]
+    pub fn host_default_cp932(&self) -> Option<Vec<u8>> {
+        let name = self.default_font.as_deref()?;
+        // 未安装的名字不冒充“当前字体”;渲染侧仍会按回退表兜底。
+        self.renderer
+            .as_ref()?
+            .source()
+            .find_family_prefer(name, yu_font::FaceOrigin::Embedded)?;
+        yu_format::Codec::Cp932
+            .encode(name, b"fontlist")
+            .ok()
+            .filter(|bytes| !bytes.is_empty())
+    }
+
+    /// 会话重启:清“层 → 合成纹理/基面”缓存。
+    ///
+    /// `GfxState` 重启后文本修订号从 0 重新计数,旧会话的 `(layer, revision)`
+    /// 可能与新内容撞键;引擎 `restart` 调渲染器 `reset` 时一并清掉。字体源
+    /// 与字形缓存保留(只依赖游戏数据/字体)。
+    pub fn clear_text_caches(&mut self) {
+        self.compose_cache.clear();
+        self.base_cache.clear();
+        self.cache_bytes = 0;
+        self.base_cache_bytes = 0;
+    }
+
+    /// 字体身份变化后的缓存失效。
+    ///
+    /// `catalog` = 默认字体名参与 `FONTINFO` 清单重建;强制家族不改变
+    /// 清单,故 `set_force_font` 不必清它。
+    fn invalidate_font_caches(&mut self, catalog: bool) {
         self.faces.clear();
+        self.ascent_cache.clear();
+        self.compose_cache.clear();
+        self.base_cache.clear();
+        self.cache_bytes = 0;
+        self.base_cache_bytes = 0;
+        if catalog {
+            self.catalog_cache = None;
+            self.catalog_faces = None;
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.clear_cache();
+        }
     }
 
     /// 注入 SJIS 隧道表(补丁路线 C);`None` = 关闭。
@@ -721,11 +804,11 @@ impl TextComposer {
         let renderer = self.renderer.as_ref().expect("ensured above");
         let mut seen = std::collections::BTreeSet::new();
         let mut out = Vec::new();
-        for family in renderer.source().family_names() {
+        for entry in renderer.source().catalog() {
             // 名字编码成 CP932 原始字节(脚本比较/写回 GSD 用的形态);
             // 编不进 CP932 的 family(罕见非日文字形名)跳过 —— 引擎的
             // EnumFontFamiliesExA 也只回报 CP932 可表达的名字。
-            let Ok(bytes) = yu_format::Codec::Cp932.encode(&family, b"fontlist") else {
+            let Ok(bytes) = yu_format::Codec::Cp932.encode(&entry.name, b"fontlist") else {
                 continue;
             };
             if seen.insert(bytes.clone()) {
@@ -735,12 +818,103 @@ impl TextComposer {
         out
     }
 
+    /// 注入游戏选择器的字体清单(CP932,缓存)。
+    ///
+    /// - 宿主默认字体存在时放**第一项**;目录中属于引擎默认 family 的条目
+    ///   改名为宿主默认名并去重,游戏的自带列表因此显示/应用我们的字体。
+    /// - 其余本机系统字体照常列出,游戏内选中后 `FONT[NAME=…]` 直接生效。
+    ///
+    /// 无宿主默认字体时退回完整系统目录(排序确定,不是 GDI 顺序)。
+    pub fn catalog_cp932(&mut self) -> Vec<Vec<u8>> {
+        if let Some(hit) = &self.catalog_cache {
+            return hit.clone();
+        }
+        if !self.ensure() {
+            return Vec::new();
+        }
+        let host_name = self.default_font.clone();
+        let renderer = self.renderer.as_ref().expect("ensured above");
+        let host_face = host_name.as_deref().and_then(|name| {
+            renderer
+                .source()
+                .find_family_prefer(name, yu_font::FaceOrigin::Embedded)
+        });
+        let host_bytes = host_name.as_deref().and_then(|name| {
+            // 未安装的名字不进清单:列表显示一个选不中的字体比回退引擎
+            // 默认更容易误导。
+            if host_face.is_none()
+            {
+                log::warn!(
+                    target: "yu-font",
+                    "[font] host default family \"{name}\" is not installed; \
+                     it will not appear in the in-game font list"
+                );
+                return None;
+            }
+            match yu_format::Codec::Cp932
+                .encode(name, b"fontlist")
+                .ok()
+                .filter(|bytes| !bytes.is_empty())
+            {
+                Some(bytes) => Some(bytes),
+                None => {
+                    log::warn!(
+                        target: "yu-font",
+                        "[font] host default family \"{name}\" cannot be encoded as                          CP932; it will not appear in the in-game font list"
+                    );
+                    None
+                }
+            }
+        });
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        let mut faces = Vec::new();
+        if let (Some(bytes), Some(face)) = (&host_bytes, host_face) {
+            if seen.insert(bytes.clone()) {
+                out.push(bytes.clone());
+                faces.push(face);
+            }
+        }
+        for entry in renderer.source().catalog() {
+            let renamed = host_bytes.is_some()
+                && renderer.source().is_engine_default_family(&entry.name);
+            let bytes = if renamed {
+                host_bytes.clone().expect("checked above")
+            } else {
+                match yu_format::Codec::Cp932.encode(&entry.name, b"fontlist") {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                }
+            };
+            if !bytes.is_empty() && seen.insert(bytes.clone()) {
+                out.push(bytes);
+                faces.push(if renamed {
+                    host_face.expect("host bytes imply face")
+                } else {
+                    entry.face
+                });
+            }
+        }
+        debug_assert_eq!(out.len(), faces.len());
+        self.catalog_cache = Some(out.clone());
+        self.catalog_faces = Some(faces);
+        out
+    }
+
+    /// `FONT[NO]` ↔ `FONTINFO[NAME NO]` 同序的代表 face(过滤掉 CP932
+    /// 不可编码项后与清单逐项对齐)。
+    fn catalog_face_at(&mut self, no: usize) -> Option<yu_font::FaceId> {
+        if self.catalog_faces.is_none() {
+            // 首次按 NO 解析时才建清单;缓存命中不克隆整份名字表。
+            let _ = self.catalog_cp932();
+        }
+        self.catalog_faces.as_ref()?.get(no).copied()
+    }
+
     /// 引擎默认 family 的 CP932 字节(fontdb 实际命中的引擎内置候选;
-    /// 未初始化/未命中 = `None`)。宿主把它作为字体清单的**唯一**条目
-    /// 注入(`FONTINFO[NUM]`=1):逐字形回退(font linking)接入前,清单
-    /// 里的其它 family 一旦被脚本选走且缺假名字形,日文会整体不渲染
-    /// (GDI 有自动回退,我们还没有)——单选项 = 默认字体,设定页字体
-    /// 列表可渲染、写入 GSD 的也是安全值。
+    /// 未初始化/未命中 = `None`)。宿主把它作为 `FONTINFO[NAME]` 的显示名:
+    /// 游戏脚本请求的 `ＭＳ ゴシック` 在渲染上已映射到宿主默认字体,列表
+    /// 数据也应显示宿主字体名。
     pub fn default_family_cp932(&mut self) -> Option<Vec<u8>> {
         if !self.ensure() {
             return None;
@@ -751,6 +925,31 @@ impl TextComposer {
             .encode(name, b"fontlist")
             .ok()
             .filter(|b| !b.is_empty())
+    }
+
+    /// 引擎默认 family 在目录里的全部 CP932 显示名(主 family/本地化别名)。
+    ///
+    /// 脚本可能写 `ＭＳ ゴシック`(ERIS)也可能写 `MS Gothic`(fontdb 主名);
+    /// `FONTINFO[NAME]` 的默认名改写需要把两种拼写都认出来。
+    pub fn engine_default_names_cp932(&mut self) -> Vec<Vec<u8>> {
+        if !self.ensure() {
+            return Vec::new();
+        }
+        let renderer = self.renderer.as_ref().expect("ensured above");
+        let source = renderer.source();
+        let mut out = Vec::new();
+        for entry in source.catalog() {
+            if !source.is_engine_default_family(&entry.name) {
+                continue;
+            }
+            let Ok(bytes) = yu_format::Codec::Cp932.encode(&entry.name, b"fontlist") else {
+                continue;
+            };
+            if !bytes.is_empty() && !out.contains(&bytes) {
+                out.push(bytes);
+            }
+        }
+        out
     }
 
     /// 追加宿主提供的字体字节(跨平台注入口)。
@@ -785,6 +984,8 @@ impl TextComposer {
                 self.base_cache.clear();
                 self.cache_bytes = 0;
                 self.base_cache_bytes = 0;
+                self.catalog_cache = None;
+                self.catalog_faces = None;
             }
             Err(diag) => {
                 log::error!(
@@ -832,6 +1033,25 @@ impl TextComposer {
         }
     }
 
+    /// 默认字体的 face:宿主默认 family(优先注入字节) → 引擎回退表。
+    fn default_face_for(
+        &self,
+        source: &FontSource,
+        host_default: Option<&str>,
+    ) -> Option<yu_font::FaceId> {
+        if let Some(name) = host_default {
+            if let Some(face) = source.find_family_prefer(name, yu_font::FaceOrigin::Embedded) {
+                return Some(face);
+            }
+            log::warn!(
+                target: "yu-font",
+                "[font] host default family \"{name}\" is not installed; \
+                 falling back to the engine default family"
+            );
+        }
+        source.default_face().ok()
+    }
+
     /// 解析 `FONT` 字体身份请求(`NAME` → `NO` → `BNO` → 引擎默认回退表)。
     ///
     /// 设了 [`TextComposer::set_force_font`] 时整段被它短路:不管脚本要什么,
@@ -846,9 +1066,18 @@ impl TextComposer {
         if !self.ensure() {
             return None;
         }
+        let forced = self.force_font.clone();
+        let no_face = if forced.is_none() {
+            match key {
+                FaceKey::No(no) if *no >= 0 => self.catalog_face_at(*no as usize),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let renderer = self.renderer.as_ref()?;
         let source = renderer.source();
-        let forced = self.force_font.clone();
+        let host_default = self.default_font.clone();
         let face = match forced {
             Some(family) => {
                 let hit = source.find_family(&family);
@@ -876,28 +1105,38 @@ impl TextComposer {
             None => match key {
                 FaceKey::Name(bytes) => {
                     let text: String = cp932::decode(bytes).chars.into_iter().collect();
-                    match source.find_family(&text) {
-                        Some(face) => Some((face, FaceFallback::None)),
-                        // 名字查不到(空串/本机未装):引擎按默认 family 回退表
-                        // 选第一个已安装 family(`0x403b8e..0x403bdc`),不是错误。
-                        None => source
-                            .default_face()
-                            .ok()
-                            .map(|face| (face, FaceFallback::Name(bytes.clone()))),
+                    if text.is_empty() {
+                        // 空 NAME = 引擎默认字体,映射到宿主默认。
+                        // 这是正常默认路径,不记 name-fallback 诊断。
+                        self.default_face_for(source, host_default.as_deref())
+                            .map(|face| (face, FaceFallback::None))
+                    } else if source.is_engine_default_family(&text) {
+                        // 脚本写的是引擎默认 family(启动/GSD 复位后最常见):
+                        // 渲染成宿主默认字体,但不算“名字缺失”回退。
+                        self.default_face_for(source, host_default.as_deref())
+                            .map(|face| (face, FaceFallback::None))
+                    } else {
+                        match source.find_family_prefer(&text, yu_font::FaceOrigin::Embedded) {
+                            Some(face) => Some((face, FaceFallback::None)),
+                            // 名字查不到(本机未装):引擎按默认 family 回退表
+                            // 选第一个已安装 family(`0x403b8e..0x403bdc`),不是错误。
+                            None => self
+                                .default_face_for(source, host_default.as_deref())
+                                .map(|face| (face, FaceFallback::Name(bytes.clone()))),
+                        }
                     }
                 }
                 FaceKey::No(no) => {
-                    if *no >= 0 {
-                        source
-                            .face_by_no(*no as usize)
-                            .map(|face| (face, FaceFallback::None))
-                    } else {
+                    if *no < 0 {
                         None
+                    } else {
+                        // 清单已过滤 CP932 不可编码项;`NO` 必须索引同一张表,
+                        // 否则列表显示与按序号选中会错位。
+                        no_face.map(|face| (face, FaceFallback::None))
                     }
                 }
-                FaceKey::Default => source
-                    .default_face()
-                    .ok()
+                FaceKey::Default => self
+                    .default_face_for(source, host_default.as_deref())
                     .map(|face| (face, FaceFallback::None)),
             },
         };
@@ -1821,6 +2060,9 @@ impl TextComposer {
                 .is_some_and(|image| !images.contains_key(&image.asset))
         });
         // 命中:同修订 + 同基面身份 + 同尺寸 ⇒ 零重烤、零哈希、零克隆。
+        // 修订号在同一 `GfxState` 内只要绘制集合/样式变化就会递增(见
+        // `bump_text_draws`/`clear_layer_texts`);跨会话由渲染器 `reset`
+        // 调 `clear_text_caches` 清空,避免新会话从 0 计数时撞旧键。
         if let Some(hit) = self.compose_cache.get_mut(layer) {
             if matches!(hit.kind, CachedKind::Draws { .. })
                 && hit.revision == revision
@@ -2344,6 +2586,151 @@ mod tests {
         assert_eq!(
             &patched, &inc.texture.rgba,
             "只应用脏区必须与增量结果逐字节一致(局部上传等价性)"
+        );
+    }
+
+    fn system_composer() -> Option<TextComposer> {
+        match FontSource::load_system_fonts() {
+            Ok(source) => Some(TextComposer::with_source(source)),
+            Err(diag) => {
+                println!("SKIP[text:host-font] {diag}");
+                None
+            }
+        }
+    }
+
+    fn cp932(text: &str) -> Vec<u8> {
+        yu_format::Codec::Cp932
+            .encode(text, b"test font name")
+            .expect("test font name encodes")
+    }
+
+    /// 宿主默认字体:引擎默认名/空名映射到它;显式其它 family 仍然生效;
+    /// 切换默认字体必须清掉旧的 face 解析缓存。
+    #[test]
+    fn host_default_font_maps_engine_default_and_explicit_switch_wins() {
+        let Some(mut text) = system_composer() else {
+            return;
+        };
+        let (host, host_face, other, other_face, engine_names) = {
+            let source = text.renderer.as_ref().expect("source").source();
+            let catalog = source.catalog();
+            let engine_names: Vec<String> = catalog
+                .iter()
+                .filter(|e| source.is_engine_default_family(&e.name))
+                .map(|e| e.name.clone())
+                .collect();
+            let Some(host) = catalog
+                .iter()
+                .find(|e| !source.is_engine_default_family(&e.name))
+                .map(|e| e.name.clone())
+            else {
+                println!("SKIP[text:host-font] no non-engine-default family installed");
+                return;
+            };
+            let host_face = source
+                .find_family_prefer(&host, yu_font::FaceOrigin::Embedded)
+                .expect("catalog face resolves");
+            let other = catalog
+                .iter()
+                .find(|e| e.name != host && !source.is_engine_default_family(&e.name))
+                .map(|e| (e.name.clone(), e.face));
+            (
+                host,
+                host_face,
+                other.as_ref().map(|(name, _)| name.clone()),
+                other.map(|(_, face)| face),
+                engine_names,
+            )
+        };
+
+        // 先按脚本原语义解析一次,确保缓存中有旧结果。
+        let engine_key = FaceKey::Name(cp932("ＭＳ ゴシック"));
+        let before = text.resolve_face(&engine_key).expect("engine default").0;
+        text.set_default_font(Some(host.clone()));
+        assert_eq!(text.default_font(), Some(host.as_str()));
+        let after = text.resolve_face(&engine_key).expect("mapped default").0;
+        assert_eq!(after, host_face, "引擎默认名必须映射到宿主默认字体");
+        assert_ne!(before, after, "set_default_font 必须清掉旧的 face 缓存");
+
+        // 空 NAME 同样是宿主默认。
+        assert_eq!(
+            text.resolve_face(&FaceKey::Name(Vec::new()))
+                .expect("empty name")
+                .0,
+            host_face
+        );
+        // 注入清单第一项是宿主默认;`FONT[NO=0]` 必须落到同一个 face
+        // (清单/NO 同序)。引擎默认条目已改名去重到这一项。
+        assert_eq!(
+            text.resolve_face(&FaceKey::No(0))
+                .expect("host-default NO")
+                .0,
+            host_face
+        );
+
+        // 显式其它 family 不被默认字体短路(游戏内切换的语义基础)。
+        if let (Some(other), Some(other_face)) = (other, other_face) {
+            let key = FaceKey::Name(cp932(&other));
+            assert_eq!(
+                text.resolve_face(&key).expect("explicit family").0,
+                other_face,
+                "显式 family \"{other}\" 必须按原名解析"
+            );
+        }
+
+        // 清单:宿主默认第一项,引擎默认条目改名后去重。
+        let host_bytes = cp932(&host);
+        let catalog = text.catalog_cp932();
+        assert_eq!(catalog.first(), Some(&host_bytes));
+        assert_eq!(
+            catalog.iter().filter(|name| **name == host_bytes).count(),
+            1,
+            "宿主默认名只能出现一次"
+        );
+        // 引擎默认 family 的目录条目全部改名为宿主默认名:列表数据换成我们的。
+        for name in engine_names {
+            if name != host {
+                assert!(
+                    !catalog.contains(&cp932(&name)),
+                    "引擎默认条目 {name:?} 应已改名"
+                );
+            }
+        }
+        assert_eq!(text.catalog_cp932(), catalog, "清单必须缓存且稳定");
+        // 逐项对拍:FONT[NO=n] 必须与 FONTINFO 清单第 n 项同 face。
+        let names = text.catalog_cp932();
+        let faces = text.catalog_faces.clone().expect("catalog faces");
+        assert_eq!(names.len(), faces.len());
+        assert_eq!(faces[0], host_face);
+        for (index, face) in faces.iter().enumerate() {
+            assert_eq!(
+                text.resolve_face(&FaceKey::No(index as i64))
+                    .expect("catalog NO")
+                    .0,
+                *face,
+                "清单第 {index} 项与 FONT[NO] 错位"
+            );
+        }
+    }
+
+    /// 未安装的宿主默认字体不能进 `FONTINFO` 清单/显示名(否则列表里
+    /// 有一个选了也不生效的条目)。
+    #[test]
+    fn uninstalled_host_default_is_not_advertised() {
+        let Some(mut text) = system_composer() else {
+            return;
+        };
+        let name = "Definitely-Not-Installed-Font-12345";
+        text.set_default_font(Some(name.to_string()));
+        assert_eq!(text.default_font(), Some(name));
+        assert!(text.host_default_cp932().is_none());
+        assert!(
+            !text
+                .catalog_cp932()
+                .iter()
+                .any(|entry| entry == &cp932(name)),
+            "未安装的宿主默认名不得出现在清单"
         );
     }
 }

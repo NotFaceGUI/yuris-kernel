@@ -480,8 +480,18 @@ pub const HOST_TUNING_HELP: &str = "\n诊断/性能参数(与 Android run-config
   --render-trace-geometry[=on|off] 渲染几何 trace
   --p8-timing[=on|off]          文本 P8 阶段 timing
   --font-trace[=on|off]         字体栅格 trace
+  --font-lock[=on|off]          --font 强制锁:忽略脚本/游戏内字体选择
   --png-cmp[=on|off]            PNG 双后端逐张对拍(Android libpng)
 ";
+
+/// 开关旗标:`--name` / `--name=on|off` / 缺省 false。
+pub fn switch_flag(args: &mut ArgReader, name: &str) -> CliResult<bool> {
+    match args.toggle(name) {
+        None => Ok(false),
+        Some(raw) if raw.trim().is_empty() => Ok(true),
+        Some(raw) => ArgReader::on_off(name, &raw),
+    }
+}
 
 /// `--font` 的统一宿主映射:family 名 → `FontChoice::Family`;
 /// 字体文件路径 → 读成字节 + `FontChoice::HostFont`。

@@ -312,6 +312,15 @@ pub struct GfxState {
     /// 0 = 保留该字体)。未注入时 NUM=0/NAME=空串,脚本走「无字体可选」
     /// 路径(不再挂号;DIV-GFX-036 的宿主清单部分由此收口)。
     font_families: Vec<Vec<u8>>,
+    /// 宿主默认字体的显示名(CP932;`None` = 未设置宿主字体)。
+    ///
+    /// `FONTINFO[NAME]`(不带 NO)在脚本的 `NAME` 为空或等于引擎默认
+    /// family(`ＭＳ ゴシック` 等)时改报这个名字:游戏字体页显示的是
+    /// 实际渲染字体,而不是脚本硬编码的旧名。
+    font_default_name: Option<Vec<u8>>,
+    /// 引擎默认 family 的 CP932 名(宿主注入;用于识别「脚本请求的是
+    /// 引擎默认字体」,不做字体名折叠)。
+    font_engine_families: Vec<Vec<u8>>,
     /// 主窗口 `COPY2 ID=:/W0/` 的**命令时刻**屏幕快照(后端合成用)。
     ///
     /// 与 `snapshot_sizes`/`snapshot_files` 同生命周期:只保留 `copy_log`
@@ -556,6 +565,8 @@ impl GfxState {
             movie_metas: FxHashMap::default(),
             movie_overlay: None,
             font_families: Vec::new(),
+            font_default_name: None,
+            font_engine_families: Vec::new(),
             screen_snapshots: BTreeMap::new(),
             last_screen_key: std::cell::Cell::new(None),
             last_screen_capture: None,
@@ -753,6 +764,16 @@ impl GfxState {
     pub fn set_font_families(&mut self, families: Vec<Vec<u8>>) {
         self.invalidate_frame();
         self.font_families = families;
+    }
+
+    /// 注入宿主默认字体名与引擎默认 family 名单(见字段注释)。
+    pub fn set_font_selection_meta(
+        &mut self,
+        default_name: Option<Vec<u8>>,
+        engine_families: Vec<Vec<u8>>,
+    ) {
+        self.font_default_name = default_name;
+        self.font_engine_families = engine_families;
     }
 
     /// 当前光标逻辑坐标(VM 每帧推入;`CGINFO[ONMOUSE*]` 缺省查询点)。
@@ -2416,13 +2437,26 @@ impl GfxState {
                     ));
                 }
                 match &self.style.name {
-                    Some(n) => Value::Str(n.clone()),
-                    None => {
-                        return Err(error::unimplemented(
-                            error::code::INFO_UNSUPPORTED,
-                            "FONTINFO[NAME] 当前未设置字体名;系统默认名未取证",
-                        ));
+                    Some(n)
+                        if !n.is_empty()
+                            && !self.font_engine_families.iter().any(|f| f == n) =>
+                    {
+                        Value::Str(n.clone())
                     }
+                    // 脚本未设置,或设置的是引擎默认 family:实际渲染的是
+                    // 宿主默认字体,显示名也应是它(游戏字体页的当前项)。
+                    other => match &self.font_default_name {
+                        Some(name) => Value::Str(name.clone()),
+                        None => match other {
+                            Some(n) => Value::Str(n.clone()),
+                            None => {
+                                return Err(error::unimplemented(
+                                    error::code::INFO_UNSUPPORTED,
+                                    "FONTINFO[NAME] 当前未设置字体名;系统默认名未取证",
+                                ));
+                            }
+                        },
+                    },
                 }
             }
             // `NUM` = 清单条数;`LANG NO=n` = 第 n 项字符集(本宿主清单统一
@@ -5185,6 +5219,9 @@ impl GfxState {
         // 颜色已在解析时按带符号 clamp 处理(COLOR/COLOR2);这里的其余
         // 字段 clamp 与官方一致(见 [`TextStyle::clamp`])。
         self.style.clamp();
+        // 行级样式(name/NO/SX/SY/颜色…)参与自动文本布局投影;字体切换
+        // 后必须重投影,否则布局缓存会用旧 face 画整页。
+        self.text_layout_cache.borrow_mut().take();
     }
 
     // ------------------------------------------------------------ 内部
@@ -5202,6 +5239,7 @@ impl GfxState {
         self.style_slots[self.style_slot] = self.style.clone();
         self.style = self.style_slots[n].clone();
         self.style_slot = n;
+        self.text_layout_cache.borrow_mut().take();
     }
 
     /// 层像素被重写:清空该层文本内容并发全局新修订号(后端缓存随之失效)。

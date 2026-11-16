@@ -223,15 +223,16 @@ pub use yu_format::yssd::BlockCodec;
 /// 字体选择(跨平台统一;桌面/Android/serve 同口径)。
 ///
 /// 字体**字节**走 [`EngineOptions::font_bytes`],这里只决定“用哪个 face”:
-/// 脚本默认、强制 family、或强制宿主注入字节里的某个字体文件。
+/// 脚本默认、宿主默认 family、或宿主注入字节里的某个字体文件。
+/// [`EngineOptions::font_lock`] 为 true 时退化为“所有 FONT 请求强制到它”。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum FontChoice {
     /// 按脚本 `NAME`/`NO`/`BNO` 解析(默认)。
     #[default]
     Script,
-    /// 强制 family 名(系统字体或已注入字体)。
+    /// 宿主默认 family(系统字体或已注入字体);`font_lock` 时强制。
     Family(String),
-    /// 强制使用 `font_bytes[index]` 的第一个 family。
+    /// 宿主默认使用 `font_bytes[index]` 的第一个 family;`font_lock` 时强制。
     ///
     /// 桌面 `--font <path>` 把文件读成字节后填 `font_bytes` 并选本项;
     /// Android 注入 assets 字体时同样可用,不需要任何路径 API。
@@ -304,6 +305,10 @@ pub struct EngineOptions {
     pub path_overrides: HostPathOverrides,
     /// 字体选择(跨平台统一入口;与 [`Self::font_bytes`] 配合)。
     pub font: FontChoice,
+    /// `--font-lock`:把 [`Self::font`] 变成强制锁(旧行为,诊断用):
+    /// 所有脚本 `FONT` 请求都解析到它,游戏内字体选择不生效。
+    /// 默认 false = 宿主默认字体语义(游戏内仍可切换)。
+    pub font_lock: bool,
     /// 显式脚本密钥(YSTB 分段异或)。`None` = 启动时解析
     /// (`exe` 扫描 → 数据自举 → 默认值,见 [`crate::keys`])。
     pub script_key: Option<[u8; 4]>,
@@ -343,6 +348,7 @@ impl Default for EngineOptions {
             warm_text: false,
             path_overrides: HostPathOverrides::default(),
             font: FontChoice::Script,
+            font_lock: false,
             script_key: None,
             save_codec: None,
             with_icon: false,
@@ -664,6 +670,34 @@ impl Renderer {
         }
     }
 
+    fn set_default_font(&mut self, family: Option<String>) {
+        match self {
+            Renderer::Soft(renderer) => renderer.text_composer().set_default_font(family),
+            Renderer::Wgpu {
+                renderer, check, ..
+            } => {
+                renderer.text_composer().set_default_font(family.clone());
+                if let Some(soft) = check.as_mut() {
+                    soft.text_composer().set_default_font(family);
+                }
+            }
+        }
+    }
+
+    fn host_default_cp932(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Renderer::Soft(renderer) => renderer.text_composer().host_default_cp932(),
+            Renderer::Wgpu { renderer, .. } => renderer.text_composer().host_default_cp932(),
+        }
+    }
+
+    fn engine_default_names_cp932(&mut self) -> Vec<Vec<u8>> {
+        match self {
+            Renderer::Soft(renderer) => renderer.text_composer().engine_default_names_cp932(),
+            Renderer::Wgpu { renderer, .. } => renderer.text_composer().engine_default_names_cp932(),
+        }
+    }
+
     /// 注入显示层隧道表(补丁路线 C;两端都注入,对账才同口径)。
     fn set_text_tunnel(&mut self, tunnel: Option<yu_format::text::TunnelTable>) {
         match self {
@@ -679,13 +713,6 @@ impl Renderer {
         }
     }
 
-    /// 宿主提供的字体清单(`FONTINFO[NUM/LANG/NAME NO=]` 的数据源)。
-    ///
-    /// **字体选择当前禁用**:清单只含引擎默认 family 一项。B7(宿主能力面)
-    /// 接入逐字形回退(GDI font linking 等价)前,全量清单里被选中的
-    /// family 若缺假名字形,日文会整体不渲染 —— 单选项 = 默认字体,设定页
-    /// 字体列表可渲染、选择写入 GSD 的也是安全值,不会再除零
-    /// (`es_config_font` 的 `@mFontNum=0` 分支)。
     /// 纹理缓存(`MOVIE` 影片帧注入等宿主合成资产用)。
     fn textures_mut(&mut self) -> &mut TextureStore {
         match self {
@@ -694,18 +721,15 @@ impl Renderer {
         }
     }
 
+    /// 宿主提供的字体清单(`FONTINFO[NUM/LANG/NAME NO=]` 的数据源)。
+    ///
+    /// 全量目录 = 宿主默认字体(第一项)+ 本机系统字体;游戏自带的
+    /// 「設定→フォント」列表因此可直接切换。逐字形回退未做,选到缺日文
+    /// 字形的字体仍会缺字(交付台账已记残余)。
     fn font_families(&mut self) -> Vec<Vec<u8>> {
         match self {
-            Renderer::Soft(renderer) => renderer
-                .text_composer()
-                .default_family_cp932()
-                .into_iter()
-                .collect(),
-            Renderer::Wgpu { renderer, .. } => renderer
-                .text_composer()
-                .default_family_cp932()
-                .into_iter()
-                .collect(),
+            Renderer::Soft(renderer) => renderer.text_composer().catalog_cp932(),
+            Renderer::Wgpu { renderer, .. } => renderer.text_composer().catalog_cp932(),
         }
     }
 
@@ -934,16 +958,25 @@ impl Engine {
             0.0
         };
         // 字体选择必须在任何文本绘制之前生效(此时还没人解析过 FONT,
-        // 所以不需要清缓存;`set_force_font` 自己会清)。
+        // 所以不需要清缓存;两个 setter 自己会清)。
         match &opts.font {
             FontChoice::Script => {}
             FontChoice::Family(family) => {
-                renderer.set_force_font(Some(family.clone()));
-                log::info!(
-                    target: "yu-font",
-                    "[font] forced by host: all FONT requests -> family \"{family}\" \
-                     (script NAME/NO/BNO ignored; unresolvable family = hard failure)"
-                );
+                if opts.font_lock {
+                    renderer.set_force_font(Some(family.clone()));
+                    log::info!(
+                        target: "yu-font",
+                        "[font] locked by host: all FONT requests -> family \"{family}\" \
+                         (script NAME/NO/BNO and in-game selection ignored)"
+                    );
+                } else {
+                    renderer.set_default_font(Some(family.clone()));
+                    log::info!(
+                        target: "yu-font",
+                        "[font] host default family \"{family}\" \
+                         (engine-default/empty names map to it; explicit in-game choice still wins)"
+                    );
+                }
             }
             FontChoice::HostFont(index) => {
                 let bytes = opts.font_bytes.get(*index).ok_or_else(|| {
@@ -960,26 +993,60 @@ impl Engine {
                             "font_bytes[{index}] 没有可用 family(fontdb 未识别)"
                         ))
                     })?;
-                renderer.set_force_font(Some(family.clone()));
-                log::info!(
-                    target: "yu-font",
-                    "[font] forced by host: font_bytes[{index}] -> family \"{family}\""
-                );
+                if opts.font_lock {
+                    renderer.set_force_font(Some(family.clone()));
+                    log::info!(
+                        target: "yu-font",
+                        "[font] locked by host: font_bytes[{index}] -> family \"{family}\""
+                    );
+                } else {
+                    renderer.set_default_font(Some(family.clone()));
+                    log::info!(
+                        target: "yu-font",
+                        "[font] host default from font_bytes[{index}] -> family \"{family}\""
+                    );
+                }
             }
         }
         // 字体清单注入(手册无页;引擎语义 = EnumFontFamiliesExA 枚举,
-        // 2026-10-24 政策按宿主能力实现并标注)。**选择禁用中**:只注入
-        // 引擎默认 family 一项(见 `Renderer::font_families` 注释)。
-        // `FONTINFO[NUM]`=1 ⇒ `es_config_font` 不再除零;`NAME NO=1` 回报
-        // 默认字体名 ⇒ 列表条目可渲染、误选也不会丢日文。
+        // 2026-10-24 政策按宿主能力实现并标注)。全量目录让游戏自带
+        // 「設定→フォント」可切换;`FONTINFO[NAME]` 在脚本请求引擎默认名时
+        // 改报宿主默认名(实际渲染字体)。
         {
             let families = renderer.font_families();
+            let default_name = renderer.host_default_cp932();
+            let mut engine_families = renderer.engine_default_names_cp932();
+            for name in yu_font::ENGINE_DEFAULT_FAMILIES {
+                let Ok(bytes) = yu_format::Codec::Cp932.encode(name, b"fontlist") else {
+                    continue;
+                };
+                if !bytes.is_empty() && !engine_families.contains(&bytes) {
+                    engine_families.push(bytes);
+                }
+            }
+            // fontdb 的主 family 名是 ASCII 本地化别名;系统未装 MS Gothic
+            // 时目录里没有它,但脚本仍可能写 ASCII 名,显示名也要认。
+            for name in ["MS Gothic", "MS PGothic", "MS Mincho", "MS PMincho"] {
+                let Ok(bytes) = yu_format::Codec::Cp932.encode(name, b"fontlist") else {
+                    continue;
+                };
+                if !bytes.is_empty() && !engine_families.contains(&bytes) {
+                    engine_families.push(bytes);
+                }
+            }
             log::info!(
                 target: "yu-font",
-                "[font] host font list for FONTINFO: {} entry (selection disabled; default family only)",
-                families.len()
+                "[font] host font list for FONTINFO: {} entries ({})",
+                families.len(),
+                if opts.font_lock {
+                    "font lock: in-game selection ignored"
+                } else {
+                    "in-game selector enabled"
+                }
             );
-            state.borrow_mut().set_font_families(families);
+            let mut state = state.borrow_mut();
+            state.set_font_families(families);
+            state.set_font_selection_meta(default_name, engine_families);
         }
         log::info!(
             target: "yu-cli::engine",
@@ -1070,6 +1137,14 @@ impl Engine {
     /// 运行期切换强制字体(`None` = 恢复脚本语义)。下一次文本绘制生效。
     pub fn set_force_font(&mut self, family: Option<String>) {
         self.renderer.set_force_font(family);
+    }
+
+    /// 运行期切换宿主默认字体(`None` = 恢复脚本语义)。下一次文本绘制生效。
+    ///
+    /// 只影响脚本未指定或指定引擎默认 family 的文本;游戏内明确选择的
+    /// 其它字体仍优先。
+    pub fn set_default_font(&mut self, family: Option<String>) {
+        self.renderer.set_default_font(family);
     }
 
     pub fn entry(&self) -> &str {
