@@ -117,3 +117,14 @@ REA 否定"空操作"这部分:**`FILE` 给了空串就一定会替换像素**�
 `CGINFO[SX/SY]` 随后返回 1(SDK `es_Sprite.yst:4064` 的透明守卫依赖它)。
 内核已在 `apply_cg_inner` 的换图分支同步空串 1×1、资产换图按新图尺寸重置;
 回归 `empty_file_on_existing_layer_resets_rect_to_1x1`。
+
+## 7. 补记(2026-11-17):资产换图同帧尺寸(任务 03 §3.4)
+
+- 资产头**已注入**:`CG[FILE=asset]` 对已存在层把 `Image.size` 置为
+  新资产尺寸,同 tick `CGINFO[SX/SY]` 返回新尺寸。
+- 资产头**未注入**:`Image.size=None`,同 tick `CGINFO[SX/SY]` 返回
+  `gfx.info.asset_size`,**不返回旧图矩形**;VM 走
+  `MFILE → 解析图像头 → note_asset_size → 重试`(DIV-GFX-024),
+  回填后返回新尺寸。
+- 回归:`cg_file_asset_replacement_updates_size`、
+  `cg_file_asset_replacement_before_header_injection_is_not_old_size`。
