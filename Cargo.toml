@@ -78,3 +78,23 @@ opt-level = 3
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+# 快速迭代档(2026-11-16):反复跑场景排查过渡/立绘时用。
+# 关掉 release 的 fat LTO 与单编译单元(构建慢的主因),保留 opt-level 2
+# 让帧率仍可玩;产物在 target/fast,不污染 target/release。
+# 用法:`cargo run --profile fast -p yu-cli --bin yu-cli -- run ...`
+# 发布仍然用 `--release`。
+[profile.fast]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+debug = 1
+
+# 与 dev/test 同因:这两个纯 C 依赖在 MSVC 下带 -Z7 会触发 cl D8050;
+# fast 档的 debug=1 会继承到它们,必须显式关掉。
+[profile.fast.package.libmimalloc-sys]
+debug = false
+
+[profile.fast.package.libz-sys]
+debug = false
