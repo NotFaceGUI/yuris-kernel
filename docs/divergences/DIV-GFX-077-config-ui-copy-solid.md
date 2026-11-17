@@ -92,6 +92,10 @@ ERIS 按钮用 `CGINFO[ID=$off SX=1 LET=@BT.SX]`(`es_Button.yst:2657`)
 - 单轴 `CG[SX/SY]`:缺省轴取**当前显示矩形**(COPY 矩形优先),不取
   COPY 前的旧 `Image.size`(官方只写 `+0x78`/`+0x7c` 中给定的那一轴)。
   回归 `single_axis_cg_size_after_copy_keeps_other_axis_from_copy_rect`。
+- **纯属性 `CG`(无 `SX/SY`)不得改矩形**。`CG[ID=$off E=0 X=… Y=…
+  MODE=…]` 这类按钮状态层更新只改属性;若把 COPY 区域尺寸当作缺省轴
+  写进 `Image.size`,会把源尺寸快照压扁(kotoneiro 底部按钮行实测
+  回归)。回归 `pure_attribute_cg_after_copy_keeps_draw_size_untouched`。
 - **绘制仍按源尺寸快照**:局部 COPY 的块在目标 `(0,0)`,其余透明;
   不把区域矩形写进 `Image.size`,避免把源合图压扁(§2.1 的 18×18
   状态标 + 后续 `SIZE X=0 X2=50` 仍按 54×18 表面近似无缩放裁剪)。

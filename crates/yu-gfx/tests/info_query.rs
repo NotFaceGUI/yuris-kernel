@@ -1224,8 +1224,9 @@ fn copy2_rect_overrides_stale_explicit_size_and_yields_to_new_cg_size() {
         "COPY 后矩形 = 区域高(含端点)"
     );
 
-    // 绘制尺寸仍是 COPY 前的显式 800×600(DIV-GFX-077 的取舍:区域矩形
-    // 不写进 `Image.size`,否则会把源合图压扁)。
+    // 绘制尺寸仍是 COPY 前的显式 800×600:这是后端分配/复用目标表面
+    // 的尺寸提示(wgpu 快照目标),不能清成 None;也**不能**写区域
+    // 尺寸,否则会把源合图压扁(DIV-GFX-077 的取舍)。
     let frame = gfx.frame();
     let dst = frame
         .layers
@@ -1238,7 +1239,7 @@ fn copy2_rect_overrides_stale_explicit_size_and_yields_to_new_cg_size() {
             width: 800,
             height: 600
         }),
-        "COPY 区域矩形不能改写绘制缩放尺寸"
+        "COPY 区域矩形不能改写绘制/目标表面尺寸"
     );
 
     // 命中矩形 = 100×50:层在 (0,0),(99,49) 命中,(100,50) 越界。
@@ -1382,6 +1383,92 @@ fn single_axis_cg_size_after_copy_keeps_other_axis_from_copy_rect() {
         Value::Int(50),
         "缺省轴取 COPY 矩形 50,不是旧 Image.size 600"
     );
+}
+
+/// 回归(kotoneiro 底部按钮实测):COPY2 后的**纯属性 `CG`**(没有
+/// `SX/SY`,例如 `CG[ID=$off E=0 X=… Y=… MODE=…]`)不得把 COPY 区域
+/// 矩形写进 `LayerKind::Image.size`。
+///
+/// 该字段是绘制缩放尺寸;写进区域尺寸会把源尺寸快照压扁,按钮状态图
+/// 出现错位(2026-11-17 桌面实机回归)。显示/命中矩形只走
+/// `display_rect`,与绘制尺寸分离。
+#[test]
+fn pure_attribute_cg_after_copy_keeps_draw_size_untouched() {
+    let table = table();
+    let mut gfx = state();
+    gfx.set_asset_size(
+        b"bt4",
+        yu_gfx::SizeU32 {
+            width: 264,
+            height: 18,
+        },
+    );
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SRC")),
+                arg(&table, "CG", "FILE", s("bt4")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "ID2", s("DST")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+                arg(&table, "CGACT", "X", i(66)),
+                arg(&table, "CGACT", "X2", i(131)),
+            ],
+        ),
+        // 按钮脚本建完状态层后的纯属性更新:无 SX/SY。
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                arg(&table, "CG", "E", i(0)),
+                arg(&table, "CG", "X", i(10)),
+                arg(&table, "CG", "Y", i(20)),
+                arg(&table, "CG", "MODE", i(0)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let frame = gfx.frame();
+    let dst = frame
+        .layers
+        .iter()
+        .find(|l| l.id.as_bytes().ends_with(b"DST"))
+        .expect("DST layer in frame");
+    assert_eq!(
+        dst.image_size(),
+        None,
+        "纯属性 CG 不得把 COPY 区域写进绘制尺寸"
+    );
+    let info = |flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("DST")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info("SX"), Value::Int(66));
+    assert_eq!(info("SY"), Value::Int(18));
 }
 
 /// 任务 01 回归 #3:全幅 `COPY2`(无区域)的目标矩形 = 源表面尺寸,

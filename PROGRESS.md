@@ -15403,9 +15403,16 @@ load_system_fonts: 163.4ms faces=248 catalog=127
   - `full_copy2_rect_is_source_surface_size`(320×200);
   - `nested_copy2_of_partial_snapshot_keeps_display_size`(100×50);
   - `resize_after_copy_uses_copy_rect_as_base`(100×50 + X/X2=5 → 110×50);
-  - `copy_rect_does_not_survive_cgend_and_recreate`(30×20)。
+  - `copy_rect_does_not_survive_cgend_and_recreate`(30×20);
+  - `pure_attribute_cg_after_copy_keeps_draw_size_untouched`
+    (COPY2 后 `CG[E/X/Y/MODE]` 无 SX/SY,`Image.size` 必须保持
+    `None`,不能被区域矩形污染)。
+- 回归修复(同日,桌面实机 kotoneiro):纯属性 `CG`(无 `SX/SY`)曾被
+  `apply_layer_params` 用 COPY 矩形作为缺省轴写进 `LayerKind::Image.size`,
+  把源尺寸按钮状态快照压扁(底部按钮行 AUTO 处错位)。现仅当至少一个
+  `SX/SY` 出现时才解析缺省轴;纯属性更新不再触碰绘制尺寸。
 - 验证:
-  - `cargo test -p yu-gfx` → 全绿(各 suite `0 failed`;info_query 28 passed);
+  - `cargo test -p yu-gfx` → 全绿(各 suite `0 failed`;info_query 29 passed);
   - `cargo test -p yu-backend-soft` → 全绿;
   - `cargo test -p yu-backend-wgpu` → 39 passed(plan_scaling 0 passed,
     1 ignored,该用例人工量化用);

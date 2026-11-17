@@ -4288,8 +4288,8 @@ impl GfxState {
             // `+0x78/+0x7c` 写成区域尺寸(0x4305f4/0x4305fe);之后
             // `CGINFO[SX/SY]`/`ONMOUSE*` 读的就是这个矩形。只记来源,
             // 查询期按 `snapshot_display_size` 解析(资产晚到可回填);
-            // `LayerKind::Image.size` 仍是绘制缩放,不在这里改
-            // (DIV-GFX-077)。
+            // `LayerKind::Image.size` 仍是绘制/目标表面尺寸,不在这里改
+            // (DIV-GFX-077;wgpu 快照分配依赖它作为目标尺寸提示)。
             layer.display_rect = Some(copy_id);
             layer.fill = None;
             layer.set_texture_status(match status {
@@ -8035,7 +8035,17 @@ fn apply_layer_params(
         // 现按官方矩形语义直接保存:缺省轴取当前层矩形(COPY 目标取区域
         // 矩形,其余取 `Image.size`);两轴都没有时才用引擎构造默认 1
         // (`FUN_00465730`),并留 recoverable 诊断。
-        let current = copy_rect.unwrap_or_else(|| layer.image_size());
+        //
+        // **没有 `SX/SY` 的纯属性 `CG` 不得改矩形**:`current` 只在显式
+        // 尺寸写入时参与缺省轴计算。否则 `CG[ID=$off E=0 X=… MODE=…]`
+        // 这类按钮状态层的属性更新会把 COPY 区域尺寸写进
+        // `LayerKind::Image.size`,把源尺寸快照压扁(DIV-GFX-077 的
+        // 回归;kotoneiro 底部按钮实测)。
+        let current = if sx.is_some() || sy.is_some() {
+            copy_rect.unwrap_or_else(|| layer.image_size())
+        } else {
+            None
+        };
         let w = sx.or_else(|| current.map(|s| i64::from(s.width)));
         let h = sy.or_else(|| current.map(|s| i64::from(s.height)));
         match (w, h) {
