@@ -58,6 +58,9 @@ pub struct ServeOptions {
     pub font_lock: bool,
     /// 文本编码路线(`auto|original|gbk|tunnel`)。
     pub patch: yu_engine::patch::PatchKind,
+    /// 全屏影片解码后端(`auto|builtin|external`;serve 当前无外置工厂,
+    /// `auto` 等价 `builtin`)。
+    pub movie_backend: yu_engine::engine::MovieBackend,
     /// JSONL 日志路径(Q1 R4;`None` = 不落盘,关闭时只打 stderr 汇总)。
     pub log_file: Option<PathBuf>,
     /// 调试用:实时 tick 的单步上限(毫秒)。`None` = 不截断(默认,
@@ -122,6 +125,7 @@ impl ServeOptions {
             Some(value) => yu_engine::patch::PatchKind::parse(&value)?,
             None => yu_engine::patch::PatchKind::Auto,
         };
+        let movie_backend = crate::args::movie_backend_flag(args.flag("movie-backend"))?;
         let log_file = args.flag("log-file").map(PathBuf::from);
         let max_step_ms = match args.flag("max-step-ms") {
             Some(value) => Some(parse_u32("max-step-ms", &value)?.max(1)),
@@ -146,6 +150,7 @@ impl ServeOptions {
             font_arg,
             font_lock,
             patch,
+            movie_backend,
             log_file,
             max_step_ms,
             tuning: host.render,
@@ -194,6 +199,7 @@ pub fn run(opts: ServeOptions) -> CliResult<()> {
         font_lock: opts.font_lock,
         font_bytes,
         patch: yu_engine::patch::PatchSelection::new(opts.patch),
+        movie_backend: opts.movie_backend,
         tuning: opts.tuning,
         gpu_backend: opts.gpu_backend,
         gpu_adapter: opts.gpu_adapter.clone(),

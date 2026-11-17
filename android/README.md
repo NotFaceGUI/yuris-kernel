@@ -232,6 +232,7 @@ mixer 停止取数并清空环形缓冲),不依赖渲染线程的下一帧 tick 
 | `font_path` / `font_family` | `font_file` / `font` | 字体文件 / family | 空 |
 | `patch` | 同名 | `auto\|original\|gbk\|big5\|tunnel` | auto |
 | `save_codec` | 同名 | `zlib\|snappy` | 自动判定 |
+| `movie_backend` | 同名(+`cache_dir`) | `auto\|builtin\|external`;外置=设备 MediaCodec,自动失败回退内置 | auto |
 | `mouse_mode` | —(壳侧) | 布尔:`true`=虚拟光标,`false`=触摸 | false |
 | `fps` | 同名 | 正整数 | 60 |
 | `screen_color` | 同名 | `@_SCREEN_COLOR` 代号 | 32 |

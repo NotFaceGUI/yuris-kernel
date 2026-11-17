@@ -30,6 +30,7 @@ yu-rt(运行核) → yu-gfx(CompositorFrame) → yu-backend-soft / yu-backend-wg
 yu-cli run  <project-root> [--mode headless|desktop] [--backend soft|wgpu]
                            [--entry LABEL] [--frames N] [--patch MODE]
                            [--save-root DIR] [--save-codec zlib|snappy]
+                           [--movie-backend auto|builtin|external]
                            [--wgpu-backend NAME] [--log-level LVL]
                            [--until-visible] [--shot PATH] [--json PATH]
                            [--record-events on|off] [--script-key HEX]

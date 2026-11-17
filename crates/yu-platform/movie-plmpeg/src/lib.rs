@@ -345,6 +345,10 @@ impl MovieHost for PlmMovieHost {
         })
     }
 
+    fn backend_label(&self) -> &'static str {
+        "builtin"
+    }
+
     fn close(&mut self) {
         self.plm = None;
         self.media = None;

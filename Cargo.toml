@@ -18,6 +18,7 @@ members = [
     "crates/yu-platform/host-android",
     "crates/yu-platform/host-ios",
     "crates/yu-platform/movie-plmpeg",
+    "crates/yu-platform/movie-android",
     "crates/yu-platform/input",
     "crates/yu-render/core",
     "crates/yu-render/soft",

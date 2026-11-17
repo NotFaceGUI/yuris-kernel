@@ -28,7 +28,7 @@ L3 宿主                 yu-cli(--mode desktop / headless) · host-android
 | 声音设备 | cpal | cpal(oboe 后端;真机 59.9fps 出声,欠载 0) | 暂不出声(架构决定) |
 | 渲染 | soft / wgpu | 壳默认 wgpu(零拷贝 `ANativeWindow`;失败重试可切 soft) | 待做 |
 | 输入 | winit → `yu-platform-input` | 触摸/双指滑/虚拟光标 → `MOUSE_L` / 滚轮 | DOM 事件 → 同层 |
-| 影片 | MPEG-1 PS + MP2 音频(pl_mpeg 后端) | 同左 | 暂不支持 |
+| 影片 | MPEG-1 PS + MP2 音频(pl_mpeg);外置后端接口已通,桌面宿主未实现 | 自动:设备 MediaExtractor/MediaCodec 优先,失败回退内置 pl_mpeg;可选仅内置/仅外置 | 暂不支持 |
 | 退出信号 | `Engine::lifecycle()` → 关窗 | 同一判据:`nativeTick()==1` ⇒ `finish()` | 同一判据(待接) |
 | 挂起/恢复 | `suspend`/`resume`(窗口最小化) | `onPause`/`onResume` → `nativeSuspend/Resume` | 页面隐藏(待接) |
 | 文本编码 | `--patch`(auto/original/gbk/**big5**/tunnel) | 配置界面选 + `run-config.json` 同键 | 同一份 `PatchKind` |
@@ -86,6 +86,7 @@ mixer 线程(THREAD_PRIORITY_AUDIO)    oboe 回调(实时线程)
 | `backend` | `yu_engine::engine::Backend::parse` | CLI `--backend`、Android `backend` 键、host-desktop 示例探针 |
 | `gpu_backend` | `yu_backend_wgpu::GpuBackend` | CLI `--wgpu-backend`、Android `gpu_backend` 键、`EngineOptions.gpu_backend` |
 | `save_codec` | `yu_format::yssd::BlockCodec::parse` | CLI `--save-codec`、Android `save_codec` 键 |
+| `movie_backend` | `yu_rt::event::MovieBackend::parse` | CLI `--movie-backend auto\|builtin\|external`、Android `movie_backend` 键、`EngineOptions.movie_backend` |
 | `script_key` | `yu_engine::keys::ScriptKey::parse_hex` | CLI `--script-key`、Android `script_key` 键 |
 | `patch` | `yu_engine::patch::PatchKind::parse` | CLI `--patch`、Android `patch` 键、serve `--patch` |
 | `on|off` 旗标 | `yu_cli::args::parse_on_off_flag` | headless / desktop / serve |

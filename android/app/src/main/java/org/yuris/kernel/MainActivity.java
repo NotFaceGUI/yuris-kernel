@@ -57,6 +57,8 @@ public final class MainActivity extends Activity
     static final String EXTRA_FONT_FAMILY = "font_family";
     static final String EXTRA_BACKEND = "backend";
     static final String EXTRA_GPU_BACKEND = "gpu_backend";
+    /** 全屏影片解码后端:auto(外置优先、失败回退内置)/ builtin / external。 */
+    static final String EXTRA_MOVIE_BACKEND = "movie_backend";
     /**
      * 启动时的输入方式(true = 虚拟光标,false = 直接触摸)。
      *
@@ -658,6 +660,14 @@ public final class MainActivity extends Activity
             if (gpuBackend != null && !gpuBackend.isEmpty()) {
                 config.put("gpu_backend", gpuBackend);
             }
+            // 全屏影片解码后端:缺省 auto(外置优先、失败回退内置 pl_mpeg)。
+            String movieBackend = getIntent().getStringExtra(EXTRA_MOVIE_BACKEND);
+            if (movieBackend != null && !movieBackend.trim().isEmpty()) {
+                config.put("movie_backend", movieBackend.trim());
+            }
+            // 外置后端要把整段影片落临时文件(extractor 只接 fd/URI);放 app
+            // cache,不污染用户可见的游戏/存档目录。
+            config.put("cache_dir", getCacheDir().getAbsolutePath());
             // 隔离验证开关:传 EXTRA "audio" = false 时关音频(默认开)。
             if (!getIntent().getBooleanExtra("audio", true)) {
                 config.put("audio", false);
@@ -778,11 +788,14 @@ public final class MainActivity extends Activity
         String lastDialogJson = "";
         /** 是否有待答 DIALOG:模态期抑制游戏输入(桌面 release_all 同口径)。 */
         boolean dialogPending = false;
-        // 帧节拍:按配置界面的帧率上限换算成纳秒,截止时间从第一帧起累加
-        // (不漂移)。缺省 60;越界值按 15~240 钳制。
+        // 帧节拍:按配置界面的帧率上限换算成纳秒。截止时间用**绝对帧时基**
+        // 逐帧累加:Thread.sleep 的唤醒误差会在下一帧被补回来,平均帧率
+        // 才能贴住目标。旧实现按“本帧工作耗时”相对补眠,每帧都重新吃一次
+        // 唤醒误差,60fps 实测只能到 56~59。
         final int targetFps = Math.max(15, Math.min(240,
                 getIntent().getIntExtra(EXTRA_FPS, 60)));
         long frameNanos = 1_000_000_000L / Math.max(1, targetFps);
+        long nextFrameNanos = System.nanoTime();
         long fpsWindowStart = SystemClock.elapsedRealtime();
         int fpsFrames = 0;
         double fps = 0.0;
@@ -817,7 +830,6 @@ public final class MainActivity extends Activity
                     Log.i(TAG, zeroCopyPresent ? "zero-copy re-attach ON" : "zero-copy re-attach OFF");
                 }
             }
-            long frameStartNanos = System.nanoTime();
             long started = SystemClock.elapsedRealtime();
             int tickResult = NativeHost.nativeTick();
             if (tickResult == TICK_HOST_SHUTDOWN) {
@@ -1011,17 +1023,18 @@ public final class MainActivity extends Activity
                 }
             }
 
-            // 帧调度:补足到目标帧长,**不做槽位跳跃**。
+            // 帧调度:绝对帧时基。每帧把 deadline 推一个 frameNanos,睡到
+            // 该时刻;sleep 唤醒晚了的误差下一帧自动补回。
             //
-            // 这里刻意不学桌面宿主的"错过截止就对齐到下一个未来槽位":那套
-            // 逻辑的前提是每帧都能赶上 60Hz。Android 上单帧若稳定在 17~20ms
-            // (GPU 读回 + 图层规划),对齐槽位会让它永远落在 2 个槽位后 ⇒
-            // 直接锁死在 30fps。正确做法是把这一帧欠下的时间吸收掉、下一帧
-            // 重新计时,让帧率等于硬件真实吞吐(实测区别:30fps → 55fps)。
-            long elapsedNanos = System.nanoTime() - frameStartNanos;
-            long remaining = frameNanos - elapsedNanos;
+            // 若落后超过一整帧(单帧工作 17~20ms、120fps 目标等),**丢弃
+            // 欠账**把 deadline 拉回 now:不累计雪崩,也不锁死在下一个槽位。
+            nextFrameNanos += frameNanos;
+            long nowNanos = System.nanoTime();
+            long remaining = nextFrameNanos - nowNanos;
             if (remaining > 0) {
-                sleepUntil(System.nanoTime() + remaining);
+                sleepUntil(nextFrameNanos);
+            } else if (-remaining > frameNanos) {
+                nextFrameNanos = System.nanoTime();
             }
         }
         // 循环退出原因分流:

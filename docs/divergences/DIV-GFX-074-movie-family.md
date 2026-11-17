@@ -102,7 +102,7 @@ ERIS 脚本据此分流(`es_MoviePlay.yst`:`==0` 文件不存在、`>1` 非 MPEG
 「不指定 SX/SY 又立刻查询 SX/SY」时可见,语料无此用法(`es_MoviePlay`
 只查 `PLAY` 与 `CODEC`)。宿主按 `sx/sy == 0` 换算为铺满。
 
-## 4. 后端选型(待定:不影响内核,换后端不改语义)
+## 4. 后端选型(2026-11-17 扩展:内置 + 外置可选)
 
 `MovieHost` 只描述"要什么",不规定"怎么解"。可行后端:
 
@@ -126,16 +126,23 @@ SMPEG/libmpeg2、pl_mpeg),而不是 10–80MB 的 FFmpeg;官方 `CODEC` 探测�
 「清屏 + 影片层」)。显示尺寸按官方 `0x44b418`:`目标宽 = SX * 窗口宽 /
 影片宽`,缺省 `SX = 影片宽` ⇒ 铺满。
 
-将来要支持 AVI/MP4 等,再加一个 `MovieHost` 实现(FFmpeg 可作可选 feature),
-内核与端口不变。
+**2026-11-17 扩展**:AVI/MP4 等不再等“换掉 pl_mpeg”,而是加**可选的
+外置后端**。内核新增跨平台设置 `movie_backend`(`auto|builtin|external`)
+与 `MovieHostFactory` 注入口;`auto` 先试宿主注入的外置后端,`open` 失败
+回退内置并记 info,`external` 不静默回退。Android 已实现系统后端
+(MediaExtractor + MediaCodec ByteBuffer YUV),见 §10;桌面当前没有注入
+外置工厂,显式 `external` 会得到可恢复诊断。`MOVIEINFO[CODEC]` 的官方
+0/1/2/255 语义不变(MP4/AVI 仍报 0xFF,与官方一致)。
 
 ## 5. 限制(显式)
 
-- 后端只解 **MPEG-1 program stream**;`MOVIEINFO[CODEC]` 为 `2`/`0xFF` 的
-  影片(MPEG-2、AVI、MP4…)会被内核诊断说明,不假装播放(官方对 `>1` 也只是
-  警告「可能播不了」)。
-- **音频未接**:pl_mpeg 能解 MP2,但 PCM → `yu-sound` 的注入通道属于声音域
-  接线(下一批);`MOVIE[VOLUME]` 的语义值已保存。
+- **内置**后端只解 **MPEG-1 program stream**;`MOVIEINFO[CODEC]` 为
+  `2`/`0xFF` 的影片(MPEG-2、AVI、MP4…)需要外置后端。Android 外置的
+  容器/编码支持取决于设备的 MediaExtractor/MediaCodec(官方保证格式表
+  不含 MPEG-PS;AVI 不保证);不支持时 `auto` 回退内置,`external` 报
+  `movie.decode` 诊断。
+- 音频已接(B16):内置后端解 MP2;外置后端解设备支持的音轨并降混为
+  立体声 i16。音频解码失败只降级为无音频,不阻断视频。
 - 影片模式下「遮住所有图层」由 `GfxState::set_movie_overlay` 实现(整帧只
   投影影片层),宿主负责每 tick 注入当前帧。
 - 影片模式下"遮住所有图层"是**宿主呈现责任**:宿主读 `Vm::movie_mode()`,
@@ -255,3 +262,87 @@ MPEG-1 PS/MP2;`MOVIE[PLAY=0]` 的官方 `stop` 位置语义未对齐(语料
 漂移;整段影片字节仍由 VM + 解码器各持一份。
 
 任务书与完整审查:`docs/tasks/task-b16-movie-audio.md`。
+
+## 10. 外置解码后端(2026-11-17)
+
+### 10.1 选择与回退
+
+- 内核:`yu_rt::event::MovieBackend`(`auto|builtin|external`)+
+  `MovieHostFactory`;`yu-engine::movie` 的 `MovieHostSelector` 负责分派。
+  `auto` 外置 `open` 失败 → 内置 pl_mpeg(记 info);`external` 失败不
+  回退;宿主未注入工厂时 `external` 返回 `movie.decode` 可恢复诊断。
+  另:`auto` 对 **MPEG-1 program stream**(`yu_format::movie::probe_codec`
+  的 5 字节规则)直接走内置,不落临时文件、不试外置 —— Android 不保证
+  MPEG-PS,这是官方 `CODEC=1` 的主路径。
+- 配置入口:CLI `--movie-backend`;Android JSON `movie_backend` + 配置
+  界面“视频解码”三档(自动/内置/外置)。缺省 `auto`。
+
+### 10.2 Android 实现(`yu-movie-android`)
+
+```text
+MOVIE[FILE] bytes
+  → cache_dir/yu-movie-<pid>-<n>.tmp(fd)
+  → AMediaExtractor:选 video/* 与可选 audio/*
+  → AMediaCodec:
+       视频 ByteBuffer(不传 Surface;线性 YUV)
+       音频 ByteBuffer
+  → 输出格式 color-format/stride/slice-height/crop → 安全转换 → RGBA
+  → PCM i16 → 立体声降混
+  → MovieHost 端口(与内置后端同一条内核路径)
+```
+
+选型过程(真机取证):最初按 Android 文档走 `AImageReader`(Surface)
+取原始帧,在高通设备上 `AImage_getFormat=0x23 / planes=3`,但
+`AImage_getPlaneData(plane1)` 的 data 指针为 null(底层实际是 UBWC
+`0x7fa30c06`),U/V 平面无法 CPU 读取,画面全黑;`AImageReader_newWithUsage`
+(CPU_READ_OFTEN)也被厂商格式覆写。改为 **ByteBuffer 视频输出**后,
+实测 `color-format=0x15`(NV12)、`stride=1280/slice=720`,
+`yuv420_buffer_to_rgba` 按输出格式转换,真机 26.7s H.264+AAC 正常;
+`mv[dropped=0 under=0]`。`flexible`/未知厂商格式先按 NV12,长度不够再按
+I420。设备能力探测:逐文件 `createDecoderByType` 判定外置是否可用;
+设备清单由 `AMediaCodec_createDecoderByType`(引擎侧
+`nativeMovieCodecs`)与 Java `MediaCodecList`(硬件/软件标记)合并展示。
+NDK `AMediaCodecInfo` 的细粒度查询要 API 36,因此不作主路径。
+
+时序:同步模式、每 tick 非阻塞(`timeout=0`);每 tick 最多喂 24 个样本、
+解复用提前 0.35s、视频排空 8 帧、音频排空 16 包并提前 0.2s 交付;
+帧队列按 PTS 升序,只显示 `pts <= target` 的最新帧。暂停冻结进度,
+恢复从暂停点继续(`start = now - position`),不复刻 pl_mpeg 的
+`start_ms` 重置问题。
+
+资源:codec/extractor/临时文件全部 RAII;`open` 中途失败由局部守卫释放。
+ByteBuffer 每个输出样本在 `releaseOutputBuffer(..., false)` 前完成转换;
+`AMediaFormat` 在 `AMediaCodec_getOutputFormat`/`getTrackFormat` 后立即
+delete。临时文件在 `close`/Drop 删除。`libmediandk` 由 `ndk-sys` 的
+`media` feature 显式链接(否则只有未定义符号、没有 DT_NEEDED)。
+
+### 10.3 验证与限制
+
+- `cargo test -p yu-engine --lib movie`:8 项(自动回退/优先外置/
+  MPEG-1 PS 直走内置/显式外置不回退/无工厂诊断/pending geometry-volume/
+  内置忽略外置)。
+- `cargo test -p yu-movie-android --lib`:14 项(I420/NV12/NV21 等价、
+  crop offset、BT.601 端点、单声道/5.1 降混、ByteBuffer I420/NV12/
+  flexible/crop/短缓冲)。
+- `YURIS_REQUIRE_SAMPLES=1 cargo test -p yu-movie-plmpeg`:3 项,含官方
+  `op_movie.mpg` 与真实 MP2 48kHz 音轨。
+- `movie-clean`(官方 0.495 编译,soft):auto 320 帧 display JSON 为
+  单层 `:/MOVIE` + `:movie/current`,与 builtin 逐字节一致;500 帧
+  回到标题 UI;显式 external 在 `es_movieplay.yst pc43` 报
+  `movie.decode` 后回到标题、不挂死。
+- **真机(Android 15,arm64)**:内置 `trance_Ignis.mpg`(MPEG-1
+  1280×720 + MP2 48k,26.7s)画面/声音正常;外置同片转 H.264+AAC
+  (1280×720/30fps + AAC 48k)正常,日志
+  `color-format=0x15 stride=1280 slice=720 crop=1280x720+0,0`,
+  `mv[pushed=1283072 played=1174824 dropped=0 under=0]`,
+  `snd[clipped=0]`。首次外置黑屏的根因是 ImageReader/UBWC,见 §10.2。
+- `YURIS_SO_ONLY=1 tools/android/build.sh arm64-v8a`:交叉编译通过;
+  `llvm-nm` 可见 `Java_..._nativeMovieCodecs`,
+  `llvm-readelf -d` 可见 `libmediandk.so`。
+- `BUILD_TYPE=debug tools/android/build.sh arm64-v8a`:Gradle 打包成功
+  (`app-debug.apk`,40MB;含链接 `libmediandk` 后的 release so)。
+- 未做:AVI/MPEG-2 等其余格式的真机验证;桌面外置后端;
+  `MOVIE[PLAY=0]` 官方 `stop` 位置语义。
+- 已知近似:外置颜色转换固定 **BT.601 limited range**(与内置 pl_mpeg
+  同口径);H.264/MP4 常见 BT.709,画面可能有轻微色偏。后续可按
+  `color-standard`/`color-range` 选择矩阵,当前不猜。

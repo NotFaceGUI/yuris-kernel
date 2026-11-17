@@ -100,6 +100,9 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let save_root = args.flag("save-root").map(PathBuf::from);
     // 强制存档块压缩层(与 headless 同一口径;只影响写盘)。
     let save_codec = crate::args::save_codec_flag(args.flag("save-codec"))?;
+    // 全屏影片解码后端;桌面当前没有外置后端,`external` 会在播片时
+    // 显式报诊断(启动与普通场景不受影响)。
+    let movie_backend = crate::args::movie_backend_flag(args.flag("movie-backend"))?;
     let patch = match args.flag("patch") {
         Some(value) => yu_engine::patch::PatchSelection::parse(&value)
             .map_err(|d| Failure::usage(format!("--patch: {d}")))?,
@@ -193,10 +196,11 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             yu_log::console::HostLevel::Info,
             "host",
             &format!(
-                "boot: entry={entry} data={} debug_mode={} fps={fps} backend={}",
+                "boot: entry={entry} data={} debug_mode={} fps={fps} backend={} movie={}",
                 dataset.summary(),
                 if debug_mode { "on" } else { "off" },
                 backend.as_str(),
+                movie_backend.as_str(),
             ),
         );
     }
@@ -235,6 +239,10 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         save_codec,
         // 补丁编码:缺省按工具产出自动识别,可用 `--patch` 覆盖。
         patch,
+        // 桌面没有注入外置影片后端:auto 等价 builtin;显式 external
+        // 时播片返回“本宿主没有外置解码”的可恢复诊断。
+        movie_backend,
+        movie_external_factory: None,
         // 窗口图标:从工程根 exe 的 RT_GROUP_ICON 抽(官方 YSIcon.exe
         // 写的就是这份资源),只有桌面宿主用得到。
         with_icon: true,

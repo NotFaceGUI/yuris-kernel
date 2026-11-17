@@ -27,6 +27,9 @@ use yu_sound::{SoundHost, SoundLoader, SoundState};
 use crate::project::{Project, CODEC};
 use crate::{CliResult, Failure};
 
+/// 宿主与 CLI 共用的影片后端设置(定义在 `yu-rt::event`,与 `MovieHost` 同处)。
+pub use yu_rt::event::{MovieBackend, MovieHostFactory};
+
 /// 平台音频出口(L1 端口,2026-10-25 架构 v2)。
 ///
 /// 混音仍在 `yu-sound`(`SoundState::render_and_advance`,逐样本一致);
@@ -322,6 +325,18 @@ pub struct EngineOptions {
     pub with_icon: bool,
     /// 文本编码路线(跨平台统一入口)。默认 `Auto`(按产物识别)。
     pub patch: crate::patch::PatchSelection,
+    /// 全屏影片解码后端(跨平台设置,见
+    /// [`yu_rt::event::MovieBackend`])。默认 `Auto`:有宿主注入的外置
+    /// 后端就优先用,`open` 失败回退内置 pl_mpeg;`Builtin` 只用内置;
+    /// `External` 只用外置且不静默回退。
+    pub movie_backend: yu_rt::event::MovieBackend,
+    /// 宿主注入的外置影片后端工厂(跨平台注入口)。
+    ///
+    /// `Some` 时由[`crate::movie::build_movie_host`]在 boot 时创建一个
+    /// 实例;`None` = 本宿主没有外置解码能力(桌面当前如此),选择
+    /// `External` 时播片会得到明确诊断。工厂必须可克隆,因为
+    /// `EngineOptions` 会被宿主与 `Engine::restart` 克隆。
+    pub movie_external_factory: Option<yu_rt::event::MovieHostFactory>,
 }
 
 impl Default for EngineOptions {
@@ -353,6 +368,8 @@ impl Default for EngineOptions {
             save_codec: None,
             with_icon: false,
             patch: crate::patch::PatchSelection::default(),
+            movie_backend: yu_rt::event::MovieBackend::Auto,
+            movie_external_factory: None,
         }
     }
 }
@@ -1163,6 +1180,17 @@ impl Engine {
         self.renderer.backend_name()
     }
 
+    /// 当前实际生效的影片后端标签(`builtin` / `external` / `none`)。
+    ///
+    /// `movie_backend=auto` 的最终选择要到第一次 `MOVIE[FILE]` 的 `open`
+    /// 才确定;在那之前返回 `"none"`。状态浮层用它回答“到底有没有走硬解”。
+    pub fn movie_backend_active(&mut self) -> &'static str {
+        match self.vm.as_mut().and_then(|vm| vm.movie_host_mut()) {
+            Some(host) => host.backend_label(),
+            None => "none",
+        }
+    }
+
     /// wgpu 渲染器(仅 `--backend wgpu`)。桌面宿主用它复用同一个
     /// instance/device/queue 创建窗口 surface,避免第二个 GPU 设备。
     pub fn wgpu_renderer(&self) -> Option<&WgpuRenderer> {
@@ -1721,7 +1749,7 @@ impl Engine {
             }
         }
         let t_after_preload = tick_started.elapsed();
-        self.sync_movie_overlay();
+        self.sync_movie_overlay(u64::from(now_ms));
         self.sync_movie_audio();
         // 文本缓冲必须每逻辑帧在**本 tick 最后一条 Text/CLEAR 之后、
         // frame() 之前**同步。证据:手册 `text/text.html`;REA
@@ -2239,9 +2267,13 @@ impl Engine {
     /// **投影尺寸**交给图形域(官方 `0x44b418` 的换算)。
     ///
     /// 官方规则:`目标宽 = SX * 窗口宽 / 影片宽`(缺省 `SX = 影片宽`
-    /// ⇒ 铺满窗口),`X/Y` 直接加在客户区原点。播放时钟用逻辑帧时钟
-    /// (`frame * frame_ms`),与其它内核状态同一条可复现时间轴。
-    fn sync_movie_overlay(&mut self) {
+    /// ⇒ 铺满窗口),`X/Y` 直接加在客户区原点。
+    ///
+    /// 播放时钟使用 tick 的 `now_ms`:实时宿主是墙钟毫秒(headless 是
+    /// `frame * frame_ms` 的确定性时间轴)。**不能用 `frame * frame_ms`
+    /// 代替实时时钟**——60fps 下它每秒只走 960ms,长片会把影片音频环
+    /// 抽干,表现为周期性欠载/爆音。
+    fn sync_movie_overlay(&mut self, now_ms: u64) {
         /// 影片帧的合成资产 key(每帧覆盖;不进 VFS)。
         const MOVIE_KEY: &[u8] = b":movie/current";
         // 图形状态与影片解码解耦:音频输出(桌面/Android)不应因为
@@ -2259,7 +2291,6 @@ impl Engine {
             }
             return;
         }
-        let now_ms = u64::from(self.frame as u32).saturating_mul(u64::from(self.opts.frame_ms()));
         let want_pixels = state.is_some();
         let mut media = None;
         let mut pixels = None;
@@ -2488,6 +2519,18 @@ impl Engine {
             .as_ref()
             .and_then(|sound| sound.lock().ok().map(|state| state.rt_silence_samples()))
             .unwrap_or(0)
+    }
+
+    /// 影片音频环的累计统计(`pushed/played/dropped/underrun` 帧数)。
+    ///
+    /// `dropped > 0` = 环满丢帧(影片时钟快于设备);`underrun > 0` = 环被
+    /// 抽干(影片时钟慢于设备)。两者都会造成爆音/断续,和混音削波是
+    /// 不同类别。
+    #[must_use]
+    pub fn movie_audio_stats(&self) -> Option<yu_sound::movie::MovieAudioStats> {
+        self.sound
+            .as_ref()
+            .and_then(|sound| sound.lock().ok().map(|state| state.movie_audio_stats()))
     }
 
     /// 硬实时路径逐帧落到窗口外而跳过的累计样本数。
@@ -3063,9 +3106,11 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         None
     };
     vm.set_graphics_host(Box::new(gfx_host));
-    // `MOVIE` 全屏影片:内嵌 pl_mpeg 移植(纯软件 MPEG-1;桌面/Android 同构)。
-    // 内核只做语义,解码/呈现全在端口之后(见 DIV-GFX-074)。
-    vm.set_movie_host(Box::new(yu_movie_plmpeg::PlmMovieHost::new()));
+    // `MOVIE` 全屏影片:后端由 `movie_backend` + 宿主工厂选择。
+    // 内置 = 内嵌 pl_mpeg(纯软件 MPEG-1);Android 外置 = MediaExtractor +
+    // MediaCodec;`Auto` 外置失败回退内置。内核只做语义,解码/呈现全在
+    // 端口之后(见 DIV-GFX-074)。
+    vm.set_movie_host(crate::movie::build_movie_host(opts));
     let sound_state = if opts.os_sound {
         // 声音初始化跟随 `@_OS_SOUND` 开关：关时不装宿主（行为与 M-2 一致）。
         let loader = VfsSoundLoader {

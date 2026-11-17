@@ -14,6 +14,9 @@
 //! 规范形式,字段集合按「官方可观测行为能表达」设计。凡是官方观测不到的
 //! 内部量一律不出现在事件里。
 
+use std::fmt;
+use std::sync::Arc;
+
 use crate::value::{ElemType, Value, VarRef};
 use yu_log::Diag;
 
@@ -468,6 +471,79 @@ pub struct MovieAudioInfo {
     pub channels: u16,
 }
 
+/// 影片解码后端选择(跨平台设置)。
+///
+/// - [`Self::Auto`]:优先宿主注入的外置后端;`open` 失败时回退内置
+///   pl_mpeg,并记一条 info 日志(官方 MPEG-1 语料仍可播)。
+/// - [`Self::Builtin`]:只用内核自带的内嵌 pl_mpeg(纯软件 MPEG-1)。
+/// - [`Self::External`]:只用宿主注入的外置后端(如 Android
+///   MediaExtractor + MediaCodec)。**不静默回退** —— 文件不受设备支持
+///   时返回诊断,由脚本/日志可见;宿主没提供后端时同样显式失败。
+///
+/// 默认 `Auto`:有外置能力就用,没有就退回既有内置路径。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MovieBackend {
+    #[default]
+    Auto,
+    Builtin,
+    External,
+}
+
+impl MovieBackend {
+    /// 取值解析(JSON 键 `movie_backend` 与 CLI `--movie-backend` 共用)。
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "builtin" => Ok(Self::Builtin),
+            "external" => Ok(Self::External),
+            other => Err(format!(
+                "movie_backend 只接受 auto|builtin|external,收到 `{other}`"
+            )),
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Builtin => "builtin",
+            Self::External => "external",
+        }
+    }
+}
+
+/// 外置影片后端的宿主注入口(跨平台)。
+///
+/// 宿主把平台能力包成工厂塞进 `EngineOptions.movie_external_factory`;
+/// 引擎在每次 boot/restart 时调用
+/// [`Self::create`] 重新建一个干净的后端。工厂本身可克隆(`Arc`),因为
+/// `EngineOptions` 需要 `Clone`(桌面宿主与 `Engine::restart` 都会克隆)。
+///
+/// 不在核心层绑定任何平台 API:Android 用 MediaCodec,桌面将来可以接
+/// FFmpeg/系统媒体栈;没有实现的宿主保持 `None`,选择 `External` 时
+/// 由[`MovieHost`]返回明确诊断。
+#[derive(Clone)]
+pub struct MovieHostFactory(Arc<dyn Fn() -> Box<dyn MovieHost>>);
+
+impl MovieHostFactory {
+    #[must_use]
+    pub fn new(create: impl Fn() -> Box<dyn MovieHost> + 'static) -> Self {
+        Self(Arc::new(create))
+    }
+
+    /// 新建一个后端实例(每次 boot/restart 都从干净状态开始)。
+    #[must_use]
+    pub fn create(&self) -> Box<dyn MovieHost> {
+        (self.0)()
+    }
+}
+
+impl fmt::Debug for MovieHostFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MovieHostFactory")
+    }
+}
+
 /// 影片播放端口:**宿主实现,内核只做语义**。
 ///
 /// 取证结论(0.495):官方 `MOVIE` 把解码与呈现整体交给**系统媒体栈** ——
@@ -531,6 +607,14 @@ pub trait MovieHost {
     /// 振幅 = `(v/256)^2`)与设备格式混音。默认不产音频。
     fn take_audio(&mut self, _out: &mut Vec<i16>) -> Option<MovieAudioInfo> {
         None
+    }
+
+    /// 实际生效的后端标签(诊断/状态用;选择器会返回被选中的那一个)。
+    ///
+    /// 默认 `"custom"`;内置后端返回 `"builtin"`,Android 外置返回
+    /// `"external"`。这不是脚本可见状态,只用于日志与壳的浮层。
+    fn backend_label(&self) -> &'static str {
+        "custom"
     }
 
     /// 退出影片模式并释放资源(`MOVIEEND`)。

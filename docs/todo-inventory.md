@@ -179,8 +179,16 @@
 
 ### 3.3 影片/媒体剩余待办(2026-11-11)
 
-- **非 MPEG-1 编码**:MPEG-2/AVI/MP4 只探测并警告;需要新 `MovieHost`
-  (FFmpeg 可选 feature),不影响内核端口。
+- ~~**非 MPEG-1 编码**:MPEG-2/AVI/MP4 只探测并警告;需要新 `MovieHost`~~
+  **fixed(外置后端,2026-11-17)**:新增跨平台 `movie_backend`
+  (`auto|builtin|external`)与宿主 `MovieHostFactory` 注入口;Android 外置
+  实现 `yu-movie-android`(MediaExtractor + MediaCodec + ImageReader,
+  见 DIV-GFX-074 §10)。缺省 `auto`:外置打不开当前文件时回退内置 pl_mpeg,
+  官方 MPEG-1 语料不回归;显式 `external` 不静默回退。
+  **仍受设备/容器限制**:Android 官方保证格式不含 MPEG-PS,AVI 是否可解
+  取决于设备 extractor;MPEG-2 只在设备有对应 decoder 时可用。桌面宿主
+  尚未注入外置后端(`external` 会报“本宿主没有外置解码”)。真机逐格式
+  验证待做。
 - **AVI 作为 CG 图层**:手册 `movie/movie.html` 明示可用 `CG` 命令;
   当前 `CG[FILE]` 只解静态图(png/bmp/jpg/gif/psb)。
 - **`FLASH`/`FLASHINFO`/`FLASHEND`**:仅 `DomainCall`,无 SWF 宿主;
@@ -192,7 +200,10 @@
 - **影片时钟漂移**:视频用逻辑帧时钟、音频用设备实时时钟;桌面
   <60fps 时 2s OP 约 50ms 漂移。
 - **整段读入**:VM + `Plm` 各持一份影片字节,大影片 Android 峰值内存高。
-- **Android 真机试听**:APK 已交叉编译通过,未上设备验证。
+  外置后端另落一份临时文件(extractor 只接 fd/URI),`close`/Drop 删除;
+  仍不减少 VM 里的整段 `Vec<u8>`。
+- **Android 真机验证**:APK 已交叉编译通过;内置/外置两条影片路径的
+  真机出帧、出音与 `Auto` 对 MPEG-1 的回退仍待上设备验证。
 
 ## 4. 非缺口(不要修)
 

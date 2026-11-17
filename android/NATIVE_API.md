@@ -32,6 +32,7 @@ so 的 ABI:`arm64-v8a`(真机)、`x86_64`(模拟器)。so 的 `backend` 缺省�
 | `nativeListFonts()` | 本机字体族名单(`\n` 分隔) |
 | `nativeProbeGameRoot(String path)` | 目录选择器用:探测该路径是否为数据入口(`Project::discover` 同一判据);返回 JSON,见下 |
 | `nativeVersion()` | 构建目标标记 |
+| `nativeMovieCodecs()` | 设备外置视频解码能力(引擎侧 NDK 实测;JSON `{"protocol":1,"codecs":[…]}`) |
 | `nativeSuspend()` / `nativeResume()` | 生命周期挂起 / 恢复 |
 | `nativeLifecycle()` | 退出细分:1 主脚本走完 / 2 脚本 `END` / 3 `END`+RESTART / 0 运行中 |
 | `nativeTakeShutdownRequest()` | 取走并清除关窗请求 |
@@ -41,8 +42,9 @@ so 的 ABI:`arm64-v8a`(真机)、`x86_64`(模拟器)。so 的 `backend` 缺省�
 
 **线程**:除 `nativeShutdown` / `nativeResizeSurface` / `nativeSuspend` /
 `nativeResume` / `nativePendingDialogs` / `nativeAnswerDialog`(只读写
-快照或登记请求,可从任意线程调用)以及 `nativeProbeGameRoot`(不碰会话,
-可在 `nativeInit` 之前从 UI 线程调用)外,所有方法必须在**同一线程**调用
+快照或登记请求,可从任意线程调用)、`nativeProbeGameRoot`(不碰会话,
+可在 `nativeInit` 之前从 UI 线程调用)以及 `nativeMovieCodecs`(不碰会话,
+只创建/立即释放一个探测用 decoder)外,所有方法必须在**同一线程**调用
 (内核单线程,会话状态在 thread-local)。推荐用一个专用渲染线程,主线程
 只发输入标志。
 
@@ -87,6 +89,12 @@ so 的 ABI:`arm64-v8a`(真机)、`x86_64`(模拟器)。so 的 `backend` 缺省�
   "fps": 60,
   "screen_color": 32, // @_SCREEN_COLOR
   "dx_mode": 0,       // @_DX_MODE
+  // ---- 全屏影片 ----
+  // auto:先试设备系统解码(MediaExtractor + MediaCodec),打不开当前文件
+  //       回退内置 pl_mpeg;builtin:只用内置;external:只用设备解码(不静默回退)。
+  "movie_backend": "auto", // auto | builtin | external
+  // 外置后端临时文件目录(extractor 只接 fd/URI);省略 = save_root/.movie-cache。
+  "cache_dir": "/data/user/0/org.yuris.kernel/cache",
   // ---- 存档/媒体 ----
   "save_codec": "zlib",        // zlib | snappy;省略 = 自动判定
   "media_readonly": false,     // @_MEDIA_READONLY
@@ -131,6 +139,7 @@ so 的 ABI:`arm64-v8a`(真机)、`x86_64`(模拟器)。so 的 `backend` 缺省�
 | `--script-key 0x…` | `script_key` |
 | `--font FAMILY` | `font`(宿主默认;游戏内选择仍生效) |
 | `--save-codec zlib\|snappy` | `save_codec` |
+| `--movie-backend auto\|builtin\|external` | `movie_backend`(+ `cache_dir`) |
 | `--record-events on` | `record_events` |
 | `--no-sound` | `audio: false`(不是 `os_sound`) |
 | `--backend soft` / `--backend wgpu` | `backend` |

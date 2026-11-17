@@ -1,6 +1,6 @@
 # yu-platform
 
-平台宿主与平台端口。这里不是单个 crate,而是按"宿主/设备"拆开的五个包;
+平台宿主与平台端口。这里不是单个 crate,而是按"宿主/设备"拆开的包;
 游戏语义仍全部在 `yu-engine` / `yu-rt` / `yu-gfx` / 后端,平台差异只允许
 出现在端口实现。
 
@@ -10,7 +10,8 @@
 | [`host-android/`](host-android) | `yu-host-android` | NDK cdylib + JNI 入口;wgpu 零拷贝上屏、oboe 音频 |
 | [`host-wasm/`](host-wasm) | `yu-host-wasm` | 浏览器呈现端(调试链路,不是最终 wasm 包) |
 | [`input/`](input) | `yu-platform-input` | 物理键码 / 指针 / 滚轮 → 引擎按钮名的唯一映射 |
-| [`movie-plmpeg/`](movie-plmpeg) | `yu-movie-plmpeg` | `MOVIE` 播放后端(MPEG-1 PS + MP2),纯 Rust |
+| [`movie-plmpeg/`](movie-plmpeg) | `yu-movie-plmpeg` | `MOVIE` 内置后端(MPEG-1 PS + MP2),纯 Rust |
+| [`movie-android/`](movie-android) | `yu-movie-android` | `MOVIE` 外置后端(Android MediaExtractor + MediaCodec ByteBuffer YUV) |
 
 分层:
 

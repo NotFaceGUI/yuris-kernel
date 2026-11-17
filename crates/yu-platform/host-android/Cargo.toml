@@ -40,3 +40,5 @@ ndk-sys = "0.6"
 raw-window-handle = "0.6"
 # oboe(cpal 的 Android 音频后端)需要 JavaVM + Context。
 ndk-context = "0.1"
+# 外置影片解码:MediaExtractor + MediaCodec + ImageReader(系统媒体栈)。
+yu-movie-android = { path = "../movie-android" }

@@ -4271,6 +4271,7 @@ dependencies = [
  "yu-engine",
  "yu-font",
  "yu-log",
+ "yu-movie-android",
  "yu-render-core",
  "yu-rt",
  "yu-save",
@@ -4326,6 +4327,16 @@ name = "yu-log"
 version = "0.3.3"
 dependencies = [
  "log",
+]
+
+[[package]]
+name = "yu-movie-android"
+version = "0.3.3"
+dependencies = [
+ "log",
+ "ndk-sys 0.6.0+11769913",
+ "yu-log",
+ "yu-rt",
 ]
 
 [[package]]

@@ -476,6 +476,17 @@ pub struct RunConfig {
     /// 是否渲染上屏(默认 true)。`false` = 只跑 VM + 声音,用于归因实验:
     /// 把合成/上屏整条链路从时序里摘掉,单独判断卡顿是否由渲染抢 CPU 引起。
     pub render: bool,
+    /// 全屏影片解码后端(JSON `movie_backend`:`auto|builtin|external`)。
+    ///
+    /// 缺省 `auto`:先试设备系统解码(MediaExtractor + MediaCodec),打不开
+    /// 当前文件时回退内置 pl_mpeg(官方 MPEG-1 语料走这条);`builtin` 只用
+    /// 内置;`external` 只用设备解码,不支持时显式报诊断、不静默回退。
+    pub movie_backend: yu_engine::engine::MovieBackend,
+    /// 外置影片后端写临时文件的目录(JSON `cache_dir`)。
+    ///
+    /// 缺省 = `save_root/.movie-cache`;Android 壳传 `getCacheDir()`,避免让
+    /// 影片临时文件出现在用户可见的游戏/存档目录。
+    pub cache_dir: Option<PathBuf>,
     /// 渲染/诊断运行参数(与桌面 `EngineOptions.tuning` 同一份结构)。
     ///
     /// JSON 键与 CLI 旗标同名:`prefetch` `prefetch_mb` `asset_cache_mb`
@@ -520,6 +531,8 @@ impl Default for RunConfig {
             audio_tone: false,
             audio_rate: None,
             render: true,
+            movie_backend: yu_engine::engine::MovieBackend::Auto,
+            cache_dir: None,
             tuning: yu_render_core::RenderTuning::default(),
             quiet: true,
         }
@@ -617,6 +630,16 @@ impl RunConfig {
         }
         if let Some(v) = object.get("render").and_then(|v| v.as_bool()) {
             config.render = v;
+        }
+        if let Some(v) = object.get("movie_backend").and_then(|v| v.as_str()) {
+            if !v.trim().is_empty() {
+                config.movie_backend = yu_engine::engine::MovieBackend::parse(v)?;
+            }
+        }
+        if let Some(v) = object.get("cache_dir").and_then(|v| v.as_str()) {
+            if !v.trim().is_empty() {
+                config.cache_dir = Some(PathBuf::from(v));
+            }
         }
         apply_tuning_json(&mut config.tuning, object)?;
         let quiet_explicit = object.get("quiet").and_then(|v| v.as_bool());
@@ -1051,6 +1074,8 @@ pub fn start_engine(
         audio_tone,
         audio_rate,
         render,
+        movie_backend,
+        cache_dir,
         tuning,
         quiet,
     } = config;
@@ -1126,7 +1151,11 @@ pub fn start_engine(
     };
     // 引擎与上屏器必须共用同一个 device,所以这里留一份克隆给宿主。
     let gpu_for_present = gpu_context.clone();
-    let options = EngineOptions {
+    // 外置影片后端的临时文件目录:壳传 app cache;缺省退回存档根下。
+    // (extractor 只接 fd/URI,整段影片字节必须先落盘。)
+    let movie_temp_dir = cache_dir.unwrap_or_else(|| save_root.join(".movie-cache"));
+    #[allow(unused_mut)] // 非 Android 构建没有外置工厂,不需要改写 options
+    let mut options = EngineOptions {
         backend: chosen_backend,
         gpu_context,
         entry: entry.clone(),
@@ -1155,8 +1184,19 @@ pub fn start_engine(
         // `@_TIME` 注入系统本地时间(存档菜单的现实日期)。以前这里缺省
         // `None` ⇒ Android 上恒 1970,与桌面出现脚本可见的行为分歧。
         local_time: yu_engine::host_clock::local_now(),
+        movie_backend,
         ..EngineOptions::default()
     };
+    // Android 注入外置后端工厂:每次 boot/restart 创建一个新的 MediaCodec
+    // 会话(Auto 模式下由引擎先试它,失败回退内置 pl_mpeg)。
+    #[cfg(target_os = "android")]
+    {
+        options.movie_external_factory = Some(yu_engine::engine::MovieHostFactory::new(move || {
+            Box::new(yu_movie_android::AndroidMovieHost::new(movie_temp_dir.clone()))
+        }));
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = movie_temp_dir;
     log::warn!(
         target: "yu-kernel",
         "[boot] render features: prefetch={} snapshot_defer={} bilinear_scale={} text_gpu={} png_backend={}",
@@ -1667,10 +1707,12 @@ pub fn status_text() -> String {
                 let dialog_count = lock_or_recover(&DIALOG_SNAPSHOT).dialogs.len();
                 let clipped = session.engine.sound_clipped_samples();
                 let rt_silence = session.engine.sound_rt_silence_samples();
+                let movie = session.engine.movie_backend_active();
                 out.push_str(&format!(
-                    "status=running backend={} entry={} frame={} ticks={} viewport={}x{} \
+                    "status=running backend={} movie={} entry={} frame={} ticks={} viewport={}x{} \
                      layers={} ops={} skipped={} drawable={} boot_ms={:.1} diags={} dialogs={}                      tick_ms={:.2} render_ms={:.2} snd[underrun={} clipped={} rtsil={} dec_ms={:.2}]",
                     session.engine.backend(),
+                    movie,
                     session.engine.entry(),
                     report.frame,
                     session.ticks,
@@ -1690,6 +1732,19 @@ pub fn status_text() -> String {
                     rt_silence,
                     report.sound_stream_ms,
                 ));
+                // 影片音频环:dropped>0 = 影片时钟快于设备;under>0 = 慢于
+                // 设备。两者都会表现为爆音/断续,先看这两项再查混音。
+                if let Some(movie) = session.engine.movie_audio_stats() {
+                    if movie.pushed_frames > 0 {
+                        out.push_str(&format!(
+                            " mv[pushed={} played={} dropped={} under={}]",
+                            movie.pushed_frames,
+                            movie.played_frames,
+                            movie.dropped_frames,
+                            movie.underrun_frames
+                        ));
+                    }
+                }
                 // 设备侧交付:short>0 = 环被抽干(我们补了静音)。
                 if let Some(audio) = session.audio.as_ref() {
                     out.push_str(&format!(" dev[{}]", audio.stats_line()));
@@ -2384,6 +2439,38 @@ mod jni_entry {
             Err(message) => to_jstring(&mut env, format!("ERR: {message}")),
         }
     }
+
+    /// 设备外置视频解码能力(JSON;壳的设置页展示用)。
+    ///
+    /// 由引擎侧 NDK 实测 `AMediaCodec_createDecoderByType` 得出,**与
+    /// `movie_backend=external` 实际会尝试的 MIME 表同一份**;硬件/软件
+    /// 标记不在这里(NDK 细粒度 API 要 Android 16),由 Java
+    /// `MovieCodecProbe` 的 `MediaCodecList` 补足。
+    ///
+    /// ```json
+    /// {"protocol":1,"codecs":[{"mime":"video/avc","decoder":true}, ...]}
+    /// ```
+    #[cfg(target_os = "android")]
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeMovieCodecs<'local>(
+        mut env: JNIEnv<'local>,
+        _class: JClass<'_>,
+    ) -> JString<'local> {
+        let codecs = yu_movie_android::probe_video_codecs();
+        let mut json = String::from("{\"protocol\":1,\"codecs\":[");
+        for (index, codec) in codecs.iter().enumerate() {
+            if index > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(
+                "{{\"mime\":\"{}\",\"decoder\":{}}}",
+                yu_engine::project::json_escape(codec.mime),
+                codec.decoder
+            ));
+        }
+        json.push_str("]}");
+        to_jstring(&mut env, json)
+    }
 }
 
 #[cfg(test)]
@@ -2466,6 +2553,27 @@ mod tests {
             default.tuning.png_backend,
             yu_render_core::PngBackend::Image
         );
+    }
+
+    #[test]
+    fn run_config_parses_movie_backend_and_cache_dir() {
+        let config = RunConfig::from_json(
+            r#"{"data_root":"/g","movie_backend":"external","cache_dir":"/data/cache"}"#,
+        )
+        .expect("解析应成功");
+        assert_eq!(
+            config.movie_backend,
+            yu_engine::engine::MovieBackend::External
+        );
+        assert_eq!(config.cache_dir, Some(PathBuf::from("/data/cache")));
+
+        // 缺省 auto:有外置后端就优先,没有就内置;老壳不传键不变。
+        let default = RunConfig::from_json(r#"{"data_root":"/g"}"#).unwrap();
+        assert_eq!(default.movie_backend, yu_engine::engine::MovieBackend::Auto);
+        assert_eq!(default.cache_dir, None);
+
+        // 取值解析只有 MovieBackend::parse 一份,未知值显式报错。
+        assert!(RunConfig::from_json(r#"{"data_root":"/g","movie_backend":"hardware"}"#).is_err());
     }
 
     #[test]

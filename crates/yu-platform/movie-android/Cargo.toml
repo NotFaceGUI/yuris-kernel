@@ -1,0 +1,21 @@
+[package]
+name = "yu-movie-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MOVIE 外置后端:Android MediaExtractor + MediaCodec(设备系统解码),ByteBuffer 线性 YUV 取帧"
+
+[lib]
+name = "yu_movie_android"
+path = "src/lib.rs"
+
+[dependencies]
+log = "0.4"
+yu-log = { path = "../../yu-log" }
+yu-rt = { path = "../../yu-rt" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# AMediaCodec / AMediaExtractor / AMediaFormat(libmediandk,API 21+)。
+# `media` feature 负责 `#[link(name = "mediandk")]`;不开会出现
+# `AMediaCodec_*` 未定义符号且 DT_NEEDED 缺 libmediandk.so。
+ndk-sys = { version = "0.6", features = ["media"] }

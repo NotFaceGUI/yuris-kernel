@@ -15436,6 +15436,128 @@ load_system_fonts: 163.4ms faces=248 catalog=127
     (临时 PNG/JSON/日志已删除)。
 - 本轮未执行任何 git 写操作,等待主人审阅。
 
+## 成果 MOVIE-BACKEND (2026-11-17) · 跨平台影片后端选择 + Android 外置系统解码
+
+> 目标:`docs/todo-inventory.md §3.3` 的“非 MPEG-1 编码”不再只能探测警告;
+> 用户可选 自动 / 内置 / 外置,Android 外置走设备 MediaExtractor +
+> MediaCodec,自动失败回退内置 pl_mpeg。本轮未执行任何 git 写操作。
+
+### 1. 跨平台设置与注入
+
+- `yu_rt::event` 新增 `MovieBackend { Auto, Builtin, External }`
+  (`parse`/`as_str`,默认 `Auto`)与 `MovieHostFactory`
+  (`Arc<dyn Fn() -> Box<dyn MovieHost>>`,手写 `Clone`/`Debug`,兼容
+  `EngineOptions: Clone, Debug` 与 `Engine::restart`);`MovieHost` 增加
+  `backend_label()` 默认实现。
+- `EngineOptions` 新增 `movie_backend`、`movie_external_factory`;
+  `crates/yu-engine/src/movie.rs` 的 `MovieHostSelector`:
+  - `Auto`:外置 `open` 成功即用;失败回退内置并记 info;
+  - `External`:只用外置,失败返回 `movie.decode` 诊断,不静默回退;
+  - `Builtin`:只用内置;宿主未注入工厂时 `External` 由
+    `UnavailableMovieHost` 明确报缺能力。
+- `boot` 改用 `crate::movie::build_movie_host(opts)`,restart 经同一工厂
+  重建;`Engine::movie_backend_active()` 暴露实际生效后端。
+- CLI:`--movie-backend auto|builtin|external`(run/desktop;取值解析
+  只有 `MovieBackend::parse` 一份)。
+
+### 2. Android 外置后端(`crates/yu-platform/movie-android`)
+
+- 临时文件(fd)→ `AMediaExtractor` 选 `video/*` + 可选 `audio/*` →
+  `AMediaCodec` 解码。
+- 视频 **ByteBuffer 输出**(不传 Surface):按输出格式
+  `color-format/stride/slice-height/crop` 转 RGBA,兼容 I420/NV12;
+  音频 ByteBuffer → i16 → 立体声降混。
+  - 最初按 Android 文档用 ImageReader,真机(高通)上
+    `AImage_getPlaneData(plane1)` 为 null(UBWC `0x7fa30c06`),黑屏;
+    `newWithUsage(CPU_READ_OFTEN)` 也无效,故改 ByteBuffer。
+- 同步模式、每 tick 非阻塞:喂 24 样本、解复用提前 0.35s、视频排空
+  8 帧、音频提前 0.2s;帧按 PTS 排到 `target` 显示。
+- 暂停冻结进度、恢复从暂停点继续;EOS 清播放位;codec/extractor/
+  临时文件全部 RAII,`close`/Drop 清理;输出 buffer 转换后立刻
+  `releaseOutputBuffer(..., false)`。
+- **影片时钟**:`sync_movie_overlay` 改用 tick 的真实 `now_ms`
+  (headless 仍 `frame*frame_ms`);旧逻辑在 60fps 下每秒只走 960ms,
+  长片会把音频环抽干造成周期性爆音。
+- Android 帧调度改为绝对帧时基(`nextFrameNanos += frameNanos`),
+  补偿 sleep 唤醒误差,目标 60/120 不再按比例掉帧。
+- `probe_video_codecs()` 对 avc/hevc/mp4v-es/3gpp/vp8/vp9/av01/mpeg2
+  逐项实测;JNI `nativeMovieCodecs` 供壳展示。`ndk-sys` 开 `media`
+  feature,确保 `libmediandk.so` 进 DT_NEEDED。
+
+### 3. Android 壳
+
+- `RunConfig` 新增 `movie_backend` / `cache_dir`;`start_engine` 在
+  Android 注入 `MovieHostFactory`(临时目录 = cache_dir,缺省
+  `save_root/.movie-cache`)。
+- 配置界面新增“视频解码”三档;新增 `MovieCodecProbe.java`(引擎侧
+  MIME 实测 + `MediaCodecList` 硬/软标记);`MainActivity` 传
+  `movie_backend` 与 `cache_dir`;`nativeStatus` 增加 `movie=`。
+
+### 4. 验证(原始结果)
+
+- `cargo test -p yu-engine --lib movie` → 8 passed,0 failed
+  (Auto 回退/优先外置/MPEG-1 PS 直走内置/显式外置不回退/无工厂/内置
+  忽略外置/pending)。
+- `cargo test -p yu-movie-android --lib` → 14 passed,0 failed
+  (I420↔NV12 等价、NV21 色相差异、crop offset、BT.601 端点、降混、
+  ByteBuffer I420/NV12/flexible/crop/短缓冲)。
+- **movie 语料**(`YURIS_REQUIRE_SAMPLES=1`,`YURIS_SAMPLE_SDK0495` +
+  `YURIS_SAMPLE_MOVIE_MP2`):`cargo test -p yu-movie-plmpeg` → 3 passed,
+  0 failed(official `op_movie.mpg` 800×600/30fps/60 帧 + 真实 MP2
+  48kHz 音轨)。
+- **movie-clean 真实场景**(官方 0.495 SDK 编译,`--backend soft`):
+  - `--movie-backend auto --frames 320`:display JSON 为单层
+    `:/MOVIE` + `:movie/current`,截图为 OP 影片;
+  - `--movie-backend builtin --frames 320`:display JSON 与 auto
+    **逐字节一致**,sha256 `ed6330e8…49bb`;
+  - `--movie-backend builtin --frames 500`:`:/MOVIE` 消失,回到
+    标题 UI(244 层),证明 `MOVIEEND` 正常退出;
+  - `--movie-backend external --frames 200`:启动即 WARN 无外置后端,
+    播片时在 `es_movieplay.yst pc43` 报
+    `movie.decode … 请改选 auto/builtin`,随后回到标题,不挂死。
+- **真机(Android 15,arm64,Xiaomi 24117RK2CC)**:
+  - 内置 `trance_Ignis.mpg`(MPEG-1 1280×720 + MP2 48k,26.7s)
+    画面/声音正常;
+  - 外置同片转 H.264+AAC(1280×720/30fps + AAC 48k)正常,日志:
+    `[movie] 外置视频 ByteBuffer: color-format=0x15 stride=1280
+    slice=720 crop=1280x720+0,0`、`[movie] 外置首帧 1280x720 pts=0.000s`、
+    `mv[pushed=1283072 played=1174824 dropped=0 under=0]`、
+    `snd[clipped=0 underrun=0]`。
+  - 设备侧 `dev[short=160.4ms]` 约 0.3%(55s 会话),用户听感正常。
+- `cargo test -p yu-host-android --lib` → 25 passed,0 failed(含新增
+  `run_config_parses_movie_backend_and_cache_dir`:三档 + cache_dir +
+  未知值报错;Windows 需把 `TEMP`/`TMP` 指到可写目录,否则 4 项
+  `probe_*` 因系统 TEMP 拒绝访问失败,与本次改动无关)。
+- `cargo check -p yu-engine --all-targets`、`-p yu-rt --all-targets`、
+  `-p yu-host-android`(Windows)、
+  `cargo check -p yu-cli --no-default-features --features desktop` → 通过。
+- `YURIS_SO_ONLY=1 tools/android/build.sh arm64-v8a` → release so 11MB;
+  `x86_64` → 13MB;两者 `llvm-nm -D` 均可见
+  `Java_org_yuris_kernel_NativeHost_nativeMovieCodecs`,`llvm-readelf -d`
+  均可见 `libmediandk.so` NEEDED。
+- `BUILD_TYPE=debug tools/android/build.sh arm64-v8a` → BUILD SUCCESSFUL,
+  `app-debug.apk` 40MB(含链接 `libmediandk` 后的 release so 与
+  Java 壳新设置项/探测)。
+- 环境注记:`cargo check --workspace --all-targets` 在本机被
+  `libmimalloc-sys` 的 CP936/中文路径问题挡住(C1083),与本次改动无关;
+  `yu-cli` 用 `--no-default-features --features desktop` 完成验证。
+- 未做:AVI/MPEG-2 等其余格式的真机验证;Android `auto` 对 MPEG-1
+  走内置快速路径的真机实测(单测覆盖);桌面外置后端(显式 `external`
+  会报缺能力);`MOVIE[PLAY=0]` 官方 `stop` 位置语义。
+- 已知近似:外置颜色转换固定 BT.601 limited;BT.709 的 H.264/MP4 可能
+  有轻微色偏(后续按 `color-standard`/`color-range` 选择矩阵)。
+
+### 5. 台账
+
+- `docs/todo-inventory.md §3.3` 非 MPEG-1 条目标 `fixed(外置后端)`,保留
+  设备/容器支持限制与真机待验。
+- `docs/divergences/DIV-GFX-074-movie-family.md` §4 更新、§5 限制修正、
+  新增 §10(选择/回退、Android 实现、验证与限制)。
+- `docs/cross-platform.md` 能力矩阵与宿主参数表补 `movie_backend`;
+  `android/NATIVE_API.md`、`android/README.md` 补 JSON/Intent 键与
+  `nativeMovieCodecs`;`crates/yu-platform/README.md` 增加新 crate;
+  `crates/yu-cli/README.md` 补 `--movie-backend`。
+
 ## 成果 TRIM-EVIDENCE (2026-11-17) · TRIM 官方执行体定位与 SET 缺失语义修复
 
 - 官方执行体已定位:0.495 `FUN_0043c539`(0x43c539–0x43c8c7,911 B),

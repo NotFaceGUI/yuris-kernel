@@ -22,6 +22,7 @@ pub mod host_ui;
 pub mod identity;
 pub mod json;
 pub mod keys;
+pub mod movie;
 pub mod output;
 pub mod patch;
 pub mod project;

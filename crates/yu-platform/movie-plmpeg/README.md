@@ -29,7 +29,7 @@
 
 | 项 | 现状 |
 |---|---|
-| 非 MPEG-1 | MPEG-2 / AVI / MP4 / FLASH 只探测并警告,需要新 `MovieHost` |
+| 非 MPEG-1 | 内置后端只解 MPEG-1;Android 可在外置后端(`yu-movie-android`,设备 MediaCodec)尝试 MP4/MKV 等,`auto` 失败回退本后端;桌面外置后端未实现 |
 | AVI 作为 CG 图层 | `CG[FILE]` 目前只解静态图 |
 | `MOVIE[PLAY=0]` | 官方 MCI `stop` 回起点;当前视频冻结末帧、音频保留队列 |
 | 影片时钟 | 视频走逻辑帧时钟、音频走设备实时时钟;桌面 <60fps 有漂移 |

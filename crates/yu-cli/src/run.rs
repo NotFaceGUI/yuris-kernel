@@ -86,6 +86,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     // 强制存档块压缩层,覆盖自动判定(盘上既有存档 → 引擎代号 → zlib)。
     // 只影响**写盘**;读侧仍按实际流分流。
     let save_codec = crate::args::save_codec_flag(args.flag("save-codec"))?;
+    // 全屏影片解码后端:auto(外置优先、回退内置)/ builtin / external。
+    let movie_backend = crate::args::movie_backend_flag(args.flag("movie-backend"))?;
     // 补丁编码:缺省按工具产出自动识别;显式 `original` 关闭识别,
     // `cp932`/`gbk` 强制三域 codec(诊断未知工具用)。
     let patch = match args.flag("patch") {
@@ -135,6 +137,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         script_key,
         save_codec,
         patch,
+        movie_backend,
         tuning: host.render,
         gpu_backend: host.gpu_backend,
         gpu_adapter: host.gpu_adapter,

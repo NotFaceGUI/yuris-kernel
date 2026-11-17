@@ -146,6 +146,19 @@ public final class NativeHost {
     /** 构建目标标记，用于核对 so 与壳是否匹配。 */
     public static native String nativeVersion();
 
+    /**
+     * 设备外置视频解码能力（引擎侧 NDK 实测，与 {@code movie_backend=external}
+     * 实际会尝试的 MIME 表同一份）。
+     *
+     * <p>返回 JSON：{@code {"protocol":1,"codecs":[
+     * {"mime":"video/avc","decoder":true}, ...]}}。硬件/软件标记不在这里
+     * （NDK 细粒度 API 要 Android 16），由 {@code MovieCodecProbe} 的
+     * {@code MediaCodecList} 补足。
+     *
+     * <p>可从任意线程调用，不依赖 {@code nativeInitJson} 会话。
+     */
+    public static native String nativeMovieCodecs();
+
     /** 释放会话。返回 0 表示确实释放了一个会话。 */
     public static native int nativeShutdown();
 

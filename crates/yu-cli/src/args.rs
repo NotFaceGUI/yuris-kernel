@@ -144,6 +144,21 @@ pub fn save_codec_flag(
     }
 }
 
+/// `--movie-backend`:全屏影片解码后端(`auto|builtin|external`)。
+///
+/// 取值解析只有 [`yu_engine::engine::MovieBackend::parse`] 一份(headless /
+/// desktop / Android JSON 共用)。缺省 `auto`:有宿主注入的外置后端就优先
+/// 用,失败回退内置 pl_mpeg。
+pub fn movie_backend_flag(
+    value: Option<String>,
+) -> CliResult<yu_engine::engine::MovieBackend> {
+    match value {
+        Some(value) => yu_engine::engine::MovieBackend::parse(&value)
+            .map_err(|error| Failure::usage(format!("--movie-backend: {error}"))),
+        None => Ok(yu_engine::engine::MovieBackend::default()),
+    }
+}
+
 /// 宿主运行参数(渲染/诊断)。与 `backend`/`gpu_backend` 一样直接进
 /// [`yu_engine::engine::EngineOptions`],不再要求用户先 export 环境变量。
 #[derive(Clone, Debug, Default)]

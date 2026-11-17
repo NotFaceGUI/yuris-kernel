@@ -80,6 +80,11 @@ public final class SetupActivity extends AppCompatActivity {
     private String patch = "auto";
     /** 存档块压缩层:"" = 自动判定 / "zlib" / "snappy"。 */
     private String saveCodec = "";
+    /** 全屏影片解码后端:"auto" / "builtin" / "external"(与内核 JSON 同词表)。 */
+    private String movieBackend = "auto";
+    /** 设备视频解码能力摘要(懒探测,选中外置/自动时显示)。 */
+    private TextView movieProbeLabel;
+    private String movieProbeText;
     /** 写调试日志到游戏目录(debug/*.jsonl)。 */
     private boolean debugLog;
     /** 状态浮层(HUD)。发布默认关:浮层每秒还要拼状态串。 */
@@ -127,6 +132,12 @@ public final class SetupActivity extends AppCompatActivity {
         gpuBackend = prefs.getString("gpu_backend", "auto");
         patch = prefs.getString("patch", "auto");
         saveCodec = prefs.getString("save_codec", "");
+        movieBackend = prefs.getString("movie_backend", "auto");
+        if (!"auto".equals(movieBackend)
+                && !"builtin".equals(movieBackend)
+                && !"external".equals(movieBackend)) {
+            movieBackend = "auto";
+        }
         debugLog = prefs.getBoolean("debug_log", false);
         showHud = prefs.getBoolean("show_hud", false);
         prefetch = prefs.getBoolean("prefetch", false);
@@ -356,6 +367,46 @@ public final class SetupActivity extends AppCompatActivity {
                 "CG 计时:开", "CG 计时:关", cgTiming, v -> cgTiming = v), buttonParams());
         advancedBody.addView(hintText("诊断开关只影响日志/计时,不改画面;默认全关。"));
         root.addView(runCard, cardParams());
+
+        // ---- 视频解码 ----
+        // 官方 MOVIE 是“系统媒体栈能播的任意格式”;Android 上对应
+        // MediaExtractor + MediaCodec。内置 pl_mpeg 只解 MPEG-1,所以给
+        // 用户三档:自动(推荐)、只用内置、只用设备解码。
+        LinearLayout movieCard = card();
+        movieCard.addView(sectionTitle("视频解码"));
+        Button[] movieButtons = new Button[3];
+        String[] movieValues = {"auto", "builtin", "external"};
+        String[] movieLabels = {"自动(推荐)", "内置", "外置"};
+        LinearLayout movieRow = new LinearLayout(this);
+        movieRow.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < movieValues.length; i++) {
+            final int index = i;
+            Button button = secondaryButton(movieLabels[i]);
+            button.setOnClickListener(v -> {
+                movieBackend = movieValues[index];
+                refreshChoiceButtons(movieButtons, movieValues, movieBackend);
+                refreshMovieProbe();
+            });
+            movieButtons[i] = button;
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(42), 1f);
+            params.topMargin = dp(6);
+            params.leftMargin = dp(4);
+            params.rightMargin = dp(4);
+            movieRow.addView(button, params);
+        }
+        movieCard.addView(movieRow);
+        refreshChoiceButtons(movieButtons, movieValues, movieBackend);
+        movieCard.addView(hintText(
+                "自动:优先设备解码,当前文件不受支持时回退内置;"
+                        + "内置只解 MPEG-1;外置只走设备 MediaCodec"
+                        + "(MP4/MKV 等,具体取决于设备和文件编码)。"));
+        movieProbeLabel = bodyText();
+        movieProbeLabel.setTextSize(11f);
+        movieProbeLabel.setTextColor(MUTED);
+        movieProbeLabel.setPadding(0, dp(8), 0, 0);
+        movieCard.addView(movieProbeLabel);
+        refreshMovieProbe();
+        root.addView(movieCard, cardParams());
 
         // ---- 文本编码 ----
         LinearLayout textCard = card();
@@ -884,6 +935,22 @@ public final class SetupActivity extends AppCompatActivity {
         }
     }
 
+    /** 视频解码能力摘要:内置不需要探测;自动/外置显示引擎与设备两侧能力。 */
+    private void refreshMovieProbe() {
+        if (movieProbeLabel == null) {
+            return;
+        }
+        if ("builtin".equals(movieBackend)) {
+            movieProbeLabel.setText("内置:MPEG-1 program stream + MP2 音频;不依赖设备解码器。");
+            return;
+        }
+        // 探测会加载 so + 枚举 codec;只做一次,避免每次点按钮都付代价。
+        if (movieProbeText == null) {
+            movieProbeText = MovieCodecProbe.summary();
+        }
+        movieProbeLabel.setText(movieProbeText);
+    }
+
     /** 帧率按钮高亮。 */
     private void refreshFpsButtons() {
         if (fpsButtons == null) {
@@ -1005,6 +1072,7 @@ public final class SetupActivity extends AppCompatActivity {
                 .putString("gpu_backend", gpuBackend)
                 .putString("patch", patch)
                 .putString("save_codec", saveCodec)
+                .putString("movie_backend", movieBackend)
                 // 输入方式的启动值来自本页;游戏内切换不持久化。
                 .putBoolean("launch_mouse_mode", mouseMode)
                 .putInt("fps", fps)
@@ -1024,6 +1092,7 @@ public final class SetupActivity extends AppCompatActivity {
         intent.putExtra(MainActivity.EXTRA_FONT_FAMILY, family);
         intent.putExtra(MainActivity.EXTRA_BACKEND, backend);
         intent.putExtra(MainActivity.EXTRA_GPU_BACKEND, gpuBackend);
+        intent.putExtra(MainActivity.EXTRA_MOVIE_BACKEND, movieBackend);
         // 输入方式:带 Extra = 壳的显式选择,MainActivity 以它为准。
         intent.putExtra(MainActivity.EXTRA_MOUSE_MODE, mouseMode);
         intent.putExtra(MainActivity.EXTRA_FPS, fps);
