@@ -4,9 +4,9 @@
 运行：
     python tools/release/test_release_notes.py -v
 
-测试用临时 git 仓库覆盖 tag 区间、首个版本、分组、破坏性变更、
-非 conventional 提交、合并提交、版本校验与 Release 创建/更新分支。
-workflow 静态检查需要 PyYAML；未安装时显式跳过那一项。
+测试用临时 git 仓库覆盖 tag 区间、首个版本、固定头（支持版本/构建平台）、
+分组 emoji、破坏性变更、非 conventional 提交、合并提交、版本校验与
+Release 创建/更新分支。workflow 静态检查需要 PyYAML；未安装时显式跳过那一项。
 """
 
 from __future__ import annotations
@@ -101,17 +101,17 @@ class NotesTests(GitRepoTest):
         text = self.notes("v0.2.0")
 
         self.assertIn("**完整变更**: v0.1.0...v0.2.0", text)
-        self.assertIn("### 破坏性变更", text)
+        self.assertIn("### 💥 破坏性变更", text)
         self.assertIn("`ui`: 重做布局", text)
         self.assertIn("BREAKING CHANGE: 布局 API 不再兼容", text)
-        self.assertIn("### 修复 (fix)", text)
+        self.assertIn("### 🐛 修复 (fix)", text)
         self.assertIn("`gfx`: 修复渲染", text)
-        self.assertIn("### 文档 (docs)", text)
-        self.assertIn("### 其他变更", text)
+        self.assertIn("### 📝 文档 (docs)", text)
+        self.assertIn("### 📦 其他变更", text)
         self.assertIn("随手提交", text)
         self.assertNotIn("首个功能", text)
         self.assertLess(
-            text.index("### 破坏性变更"), text.index("### 修复 (fix)"),
+            text.index("### 💥 破坏性变更"), text.index("### 🐛 修复 (fix)"),
             "破坏性变更必须排在普通分组之前",
         )
 
@@ -123,7 +123,7 @@ class NotesTests(GitRepoTest):
 
         self.assertIn("首个版本", text)
         self.assertNotIn("完整变更", text)
-        self.assertIn("### 新功能 (feat)", text)
+        self.assertIn("### 🚀 新功能 (feat)", text)
         self.assertIn("初始功能", text)
 
     def test_previous_tag_is_nearest_not_highest_version(self) -> None:
@@ -182,6 +182,110 @@ class NotesTests(GitRepoTest):
         text = self.notes("v0.1.0", from_ref="v0.1.0")
 
         self.assertIn("本版本没有代码变更。", text)
+
+
+class HeaderTests(GitRepoTest):
+    def test_support_and_download_tables_come_first(self) -> None:
+        self.commit("feat: 基线")
+        self.tag("v0.1.0")
+        self.commit("fix: 修复")
+        self.tag("v0.2.0")
+
+        text = self.notes("v0.2.0")
+
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "## 支持范围")
+        self.assertIn("| 版本系列 | 支持范围 |", text)
+        for series, ranges, status, color in rn.SUPPORTED_VERSIONS:
+            badge = rn.badge_url(ranges, status, color)
+            self.assertIn(f"| {series} | ![{ranges} {status}]({badge}) |", text)
+        self.assertIn("## 下载", text)
+        self.assertIn("| Windows x64 |", text)
+        self.assertIn("| Android |", text)
+        self.assertLess(
+            text.index("## 支持范围"), text.index("## 下载"),
+            "支持范围必须排在下载之前",
+        )
+        self.assertLess(
+            text.index("## 下载"), text.index("## 更新内容"),
+            "下载必须排在更新内容之前",
+        )
+
+    def test_header_survives_empty_range(self) -> None:
+        self.commit("feat: 唯一提交")
+        self.tag("v0.1.0")
+
+        text = self.notes("v0.1.0", from_ref="v0.1.0")
+
+        self.assertIn("| 版本系列 | 支持范围 |", text)
+        self.assertIn("| Windows x64 |", text)
+        self.assertIn("本版本没有代码变更。", text)
+
+    def test_every_type_group_has_an_emoji(self) -> None:
+        self.assertEqual(set(rn.TYPE_EMOJI), set(rn.TYPE_TITLES))
+        for kind, emoji in rn.TYPE_EMOJI.items():
+            self.assertTrue(emoji, f"{kind} 缺少 emoji")
+
+    def test_all_groups_render_with_emoji(self) -> None:
+        self.commit("feat: 基线")
+        self.tag("v0.1.0")
+        for kind in rn.TYPE_ORDER:
+            self.commit(f"{kind}: {kind} 变更")
+        self.tag("v0.2.0")
+
+        text = self.notes("v0.2.0")
+
+        for kind in rn.TYPE_ORDER:
+            heading = f"### {rn.TYPE_EMOJI[kind]} {rn.TYPE_TITLES[kind]} ({kind})"
+            self.assertIn(heading, text)
+
+
+class DownloadTests(GitRepoTest):
+    def test_badges_link_to_release_assets(self) -> None:
+        self.commit("feat: 基线")
+        self.tag("v0.1.0")
+
+        text = self.notes("v0.1.0", repo_url="https://github.com/example/repo")
+        base = "https://github.com/example/repo/releases/download/v0.1.0"
+
+        self.assertIn("img.shields.io/badge/Portable-x64-007ec6", text)
+        self.assertIn("img.shields.io/badge/Android-APK-3ddc84", text)
+        self.assertIn(f"{base}/yuris-kernel-v0.1.0-windows-x64.zip", text)
+        self.assertIn(f"{base}/yuris-kernel-v0.1.0-android-universal.apk", text)
+        self.assertIn(f"{base}/yuris-kernel-v0.1.0-android-arm64-v8a.apk", text)
+        self.assertIn(f"{base}/yuris-kernel-v0.1.0-android-x86_64.apk", text)
+        self.assertIn(f"{base}/yuris-kernel-v0.1.0-android-so.zip", text)
+        self.assertIn(f"{base}/yuris-kernel-v0.1.0-licenses.zip", text)
+
+    def test_without_repo_url_keeps_badges_but_drops_asset_links(self) -> None:
+        self.commit("feat: 基线")
+        self.tag("v0.1.0")
+
+        text = self.notes("v0.1.0")
+
+        self.assertIn("img.shields.io/badge/Portable-x64-007ec6", text)
+        self.assertNotIn("/releases/download/", text)
+        self.assertIn("`yuris-kernel-v0.1.0-android-so.zip`", text)
+
+    def test_badge_escaping(self) -> None:
+        self.assertEqual(
+            rn.badge_url("arm64-v8a", "APK", "3ddc84"),
+            "https://img.shields.io/badge/arm64--v8a-APK-3ddc84?style=flat-square",
+        )
+        self.assertEqual(
+            rn.badge_url("x86_64", "APK", "3ddc84"),
+            "https://img.shields.io/badge/x86__64-APK-3ddc84?style=flat-square",
+        )
+
+    def test_badge_url_percent_encodes_non_ascii(self) -> None:
+        url = rn.badge_url("0.450–0.495", "主线可用", "2ea44f")
+        self.assertTrue(
+            url.startswith(
+                "https://img.shields.io/badge/0.450%E2%80%930.495-"
+                "%E4%B8%BB%E7%BA%BF%E5%8F%AF%E7%94%A8-2ea44f"
+            ),
+            url,
+        )
 
 
 class RepoUrlTests(GitRepoTest):

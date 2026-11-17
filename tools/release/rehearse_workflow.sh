@@ -66,9 +66,16 @@ mkdir -p .release
 "$PY" "$repo_root/tools/release/release_notes.py" notes \
   --tag "$INPUT_TAG" --output .release/notes.md
 
-grep -q "完整变更" .release/notes.md
-grep -q "### 破坏性变更" .release/notes.md
-grep -q "### 修复 (fix)" .release/notes.md
+# Git Bash 自带的 GNU grep 3.0 在 C.UTF-8 下匹配不了 4 字节 emoji，
+# 统一用 LC_ALL=C 按字节比较，Linux CI 与本地行为一致。
+LC_ALL=C grep -qF "完整变更" .release/notes.md
+LC_ALL=C grep -qF "## 支持范围" .release/notes.md
+LC_ALL=C grep -qF "| 版本系列 | 支持范围 |" .release/notes.md
+LC_ALL=C grep -qF "img.shields.io/badge/0.450" .release/notes.md
+LC_ALL=C grep -qF "## 下载" .release/notes.md
+LC_ALL=C grep -qF "Portable-x64-007ec6" .release/notes.md
+LC_ALL=C grep -qF "### 💥 破坏性变更" .release/notes.md
+LC_ALL=C grep -qF "### 🐛 修复 (fix)" .release/notes.md
 
 YU_RELEASE_DRY_RUN=1 "$PY" "$repo_root/tools/release/release_notes.py" publish \
   --tag "$INPUT_TAG" --notes-file .release/notes.md

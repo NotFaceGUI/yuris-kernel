@@ -4,6 +4,16 @@
 由 `tools/release/release_notes.py` 从 conventional commits 生成。更新日志按
 `AGENTS.md` 的提交规范分组，不依赖 GitHub 自动生成的 release notes。
 
+正文开头固定是两张表：**支持范围**（版本系列 / 版本范围，范围与状态合成
+「灰色范围 + 彩色状态」的 shields.io 徽章，绿色主线、黄色适配中；数据在
+`release_notes.py` 的 `SUPPORTED_VERSIONS`）与**下载**（Windows 便携包、
+Android universal APK 用同款徽章，另附 ABI 瘦包与 so / 许可证链接），
+随后才是「更新内容」；各分组标题带 emoji。下载链接按 tag 拼成
+`releases/download/<tag>/yuris-kernel-<tag>-…`；本地预览拿不到仓库链接时
+只保留徽章与产物名，不生成死链。支持范围的事实来源是 README 的「支持范围」表，
+能力范围变化时两处同步修改。workflow checkout 的是 tag 本身，所以旧 tag
+重新发布时仍沿用当时的常量。
+
 ## 触发方式
 
 | 方式 | 条件 |
@@ -101,22 +111,22 @@ tag 与 Cargo.toml 不一致时 workflow 在发布前直接失败，避免出现
 
 提交信息必须符合 `AGENTS.md` §4.1。生成器识别的类型：
 
-| type | 分组 |
+| type | 分组（Release 标题） |
 |---|---|
-| `feat` | 新功能 |
-| `fix` | 修复 |
-| `perf` | 性能 |
-| `refactor` | 重构 |
-| `docs` | 文档 |
-| `test` | 测试 |
-| `build` | 构建 |
-| `ci` | CI |
-| `chore` | 杂项 |
-| `style` | 格式 |
-| `revert` | 回滚 |
-| 其他 / 非 conventional | 其他变更 |
+| `feat` | 🚀 新功能 |
+| `fix` | 🐛 修复 |
+| `perf` | ⚡ 性能 |
+| `refactor` | ♻️ 重构 |
+| `docs` | 📝 文档 |
+| `test` | ✅ 测试 |
+| `build` | 🔧 构建 |
+| `ci` | 👷 CI |
+| `chore` | 🧹 杂项 |
+| `style` | 💄 格式 |
+| `revert` | ⏪ 回滚 |
+| 其他 / 非 conventional | 📦 其他变更 |
 
-`!` 或提交正文里的 `BREAKING CHANGE:` / `BREAKING-CHANGE:` 会进入「破坏性变更」
+`!` 或提交正文里的 `BREAKING CHANGE:` / `BREAKING-CHANGE:` 会进入「💥 破坏性变更」
 分组并排在所有分组之前；合并提交（`--no-merges`）不计入日志。
 
 ## 本地验证（不碰 GitHub、不创建 tag）
