@@ -82,6 +82,7 @@ fn table() -> ParamTable {
                     "SX",
                     "SY",
                     "TRIM",
+                    "RESIZE",
                 ],
             ),
             command("CGEND", &["ID"]),
@@ -3135,5 +3136,58 @@ fn asset_alias_is_never_pooled_by_transition() {
         pixel_of(&third.surface, 8, 8),
         [200, 40, 10, 255],
         "SRC 资产像素必须保持不变"
+    );
+}
+
+/// `RESIZE` 的 1×1 符号基面必须按**执行前**基数重建。
+///
+/// gfx 在命令时刻已把图层矩形回写成 `1+X+X2`;wgpu 若按帧末矩形重建
+/// 1×1 表面,`RESIZE` 的增量会被再加一遍(1×1 + 1+1 = 5×1 而不是 3×1)。
+#[test]
+fn resize_empty_layer_uses_command_base_on_gpu() {
+    let table = table();
+    let Some(mut gpu) = renderer_or_skip(store(&[])) else {
+        return;
+    };
+    let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"L".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(1)),
+                arg(&table, "CG", "SY", Value::Int(1)),
+                arg(&table, "CG", "E", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"L".to_vec())),
+                arg(&table, "CGACT", "RESIZE", Value::Int(1)),
+                arg(&table, "CGACT", "X", Value::Int(1)),
+                arg(&table, "CGACT", "Y", Value::Int(0)),
+                arg(&table, "CGACT", "X2", Value::Int(1)),
+                arg(&table, "CGACT", "Y2", Value::Int(0)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let out = gpu.render_frame(&frame).expect("render");
+    assert_eq!(out.report.skipped_ops_total, 0, "RESIZE 应执行");
+    let (_, width, height) = gpu
+        .materialized_layer_sizes()
+        .into_iter()
+        .find(|(name, _, _)| name == ":/W0/L")
+        .expect("L materialized");
+    assert_eq!(
+        (width, height),
+        (3, 1),
+        "RESIZE 回放不得重复叠加增量"
     );
 }

@@ -74,6 +74,7 @@ fn table() -> ParamTable {
                     "SX",
                     "SY",
                     "SIZE",
+                    "RESIZE",
                     "RECTPAINT",
                     "RECTPAINT2",
                     "RECTPAINT3",
@@ -2134,4 +2135,77 @@ fn gallery_reused_thumbnail_slots_do_not_leak_previous_image() {
             "{label} 必须显示第二张图 blue,实际 {px:?}(上一张 red 泄漏)"
         );
     }
+}
+
+/// `RESIZE` 的 1×1 符号基面必须按**执行前**基数重建。
+///
+/// gfx 在命令时刻已把图层矩形回写成 `1+X+X2`;若后端按最终矩形重建
+/// 1×1 表面,`RESIZE` 的增量会被再加一遍。用一次 `COPY2` 把实际表面
+/// 尺寸暴露出来:1×1 + `X/X2=1` 应得到 3×1,而不是 5×1。
+#[test]
+fn resize_empty_layer_uses_command_base_for_followup_copy() {
+    let table = table();
+    let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"L".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(1)),
+                arg(&table, "CG", "SY", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"DST".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"L".to_vec())),
+                arg(&table, "CGACT", "RESIZE", Value::Int(1)),
+                arg(&table, "CGACT", "X", Value::Int(1)),
+                arg(&table, "CGACT", "Y", Value::Int(0)),
+                arg(&table, "CGACT", "X2", Value::Int(1)),
+                arg(&table, "CGACT", "Y2", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"L".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"DST".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let copy_id = frame
+        .passes
+        .iter()
+        .flat_map(|pass| pass.ops.iter())
+        .find_map(|op| match op {
+            yu_gfx::Op::Copy(copy) => Some(copy.id),
+            _ => None,
+        })
+        .expect("COPY2 pass");
+    let mut backend = SoftRenderer::new(texture_store(&[]));
+    let out = backend.render_frame(&frame);
+    assert_eq!(out.report.skipped_ops_total, 0, "RESIZE/COPY2 应执行");
+    let snapshot = backend.snapshot_surface(copy_id).expect("COPY2 snapshot");
+    assert_eq!(
+        (snapshot.width, snapshot.height),
+        (3, 1),
+        "RESIZE 回放不得重复叠加增量"
+    );
 }

@@ -1083,9 +1083,14 @@ fn apply_image(
 /// 官方命令到达时已写进层表面,删除不撤销;重放用命令时刻的基图。
 ///
 /// `recorded` 是本动作**命令时刻**的目标基面。跨层动作(`MERGE` 等)的
-/// 目标层可能在同一 tick 稍后被 `CGEND` 删除,或先被 `CG[FILE]` 换图;
-/// 官方已在命令体内写完像素,因此这里以记录值为准重建“下层”,而不是
-/// 退回 1×1 符号表面。
+/// 目标层可能在同一 tick 稍后被 `CGEND` 删除;官方已在命令体内写完像素,
+/// 因此删除后要用记录值重建“下层”,而不是退回 1×1 符号表面。
+/// 目标层仍存活(包括随后被 `CG[FILE]` 换图)时一律用活层当前像素,
+/// 避免缩略图/hover 槽位读回上一张图。
+///
+/// `solid_size` 是 `RESIZE` 专用的**执行前**基数。活目标层的
+/// `LayerKind::Image.size` 在命令时刻已回写成 RESIZE 后的最终尺寸;
+/// 若按它重建 1×1 符号表面,`RESIZE` 的增量会被再加一遍。
 #[allow(clippy::too_many_arguments)]
 fn resolve_target_base(
     ctx: &GpuContext,
@@ -1097,6 +1102,7 @@ fn resolve_target_base(
     bases: &mut BTreeMap<(LayerId, u64), Rc<TexRef>>,
     fallback: Option<&TextureRef>,
     recorded: Option<&ImageTargetBase>,
+    solid_size: Option<(u32, u32)>,
 ) -> Result<Content, String> {
     let layer = frame
         .layers
@@ -1150,11 +1156,17 @@ fn resolve_target_base(
     } else {
         recorded.and_then(|base| base.fill)
     };
-    let explicit_size = if layer.is_some() {
-        layer.and_then(|layer| layer.image_size())
-    } else {
-        recorded.and_then(|base| base.size)
-    };
+    let explicit_size = solid_size.or_else(|| {
+        if layer.is_some() {
+            layer
+                .and_then(|layer| layer.image_size())
+                .map(|size| (size.width, size.height))
+        } else {
+            recorded
+                .and_then(|base| base.size)
+                .map(|size| (size.width, size.height))
+        }
+    });
     match texture {
         TextureRef::Snapshot(copy_id) if targets.snapshot(*copy_id).is_none() => {
             // 区域切片是零拷贝 UV 别名(无物化纹理):直接返回采样窗。
@@ -1170,9 +1182,7 @@ fn resolve_target_base(
             // `CG[FILE=""]` 的 1×1 符号表面按命令时刻的显式尺寸铺开;
             // 目标层已删除时只能依赖 `recorded.size`,否则会退化成 1×1。
             let (width, height) = match texture {
-                TextureRef::SolidBlack1x1 => explicit_size
-                    .map(|size| (size.width, size.height))
-                    .unwrap_or((tex.width, tex.height)),
+                TextureRef::SolidBlack1x1 => explicit_size.unwrap_or((tex.width, tex.height)),
                 _ => (tex.width, tex.height),
             };
             let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -1620,6 +1630,7 @@ fn apply_image_pixels(
                 bases,
                 target_fallback,
                 image.target_base.as_ref(),
+                None,
             )?,
         };
         let base = materialize(
@@ -1815,6 +1826,7 @@ fn apply_image_pixels(
                 bases,
                 target_fallback,
                 image.target_base.as_ref(),
+                None,
             )?,
         };
         let upper_content = materialize(ctx, pipelines, surfaces, writes, &source, "merge upper")?;
@@ -1920,6 +1932,7 @@ fn apply_image_pixels(
                 bases,
                 target_fallback,
                 image.target_base.as_ref(),
+                None,
             )?,
         };
         let alpha_only = matches!(image.action, ImageAction::RectPaint2);
@@ -2059,6 +2072,9 @@ fn apply_image_pixels(
             bases,
             target_fallback,
             image.target_base.as_ref(),
+            // 只有 `RESIZE` 会填 `resize_base`;其余动作传 `None`,与
+            // soft 的 `base_texture(..., solid_size)` 同一口径。
+            image.resize_base,
         )?,
     };
     // `DIFFUSION` 的 `SET/2 <= 0` 在官方只做一次整面 memcpy ⇒ 恒等;
