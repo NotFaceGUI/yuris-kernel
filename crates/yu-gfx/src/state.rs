@@ -44,7 +44,8 @@ use crate::layer::{
     LayerStatus, MovieInfo, MovieOverlay, MovieState, SizeU32, TextureRef, Transition,
 };
 use crate::op::{
-    CopyKind, CopyOp, CopyRegion, CopySource, CopyTiming, ImageAction, ImageOp, Op, OpStatus,
+    CopyKind, CopyOp, CopyRegion, CopySource, CopyTiming, ImageAction, ImageOp, ImageTargetBase,
+    Op, OpStatus,
 };
 use crate::pass::{Pass, PassTarget};
 use crate::path;
@@ -1337,9 +1338,22 @@ impl GfxState {
             let target = i.target.as_ref().unwrap_or(&i.source); // silent-ok: 缺 target = 原地加工
             let target_live = self.nodes.contains_key(target) || snapshot_layers.contains(target);
             let replayable = self.nodes.contains_key(&i.source) || i.source_texture.is_some();
-            // 目标已删:只有原地项能用 `source_texture` 提供基面(`in_place`),
-            // 跨层 ID2 缺目标旧像素,仍不猜。
-            let base_ok = target_live || (target == &i.source && i.source_texture.is_some());
+            // 目标已删时,命令时刻记录的目标基面(纹理 + fill + 显式尺寸)
+            // 仍能重建“下层”。官方 `CGACT` 在命令体内已完成像素运算,
+            // 同帧稍后的 `CGEND` 不撤销结果;不能因目标层消失就丢掉整条
+            // 加工(否则 `RECTPAINT3 → MERGE → COPY2 → CGEND` 的 CG 预览
+            // 会退化成 1×1 白底)。
+            //
+            // **目标仍存活时不使用 target_base**:缩略图/hover 层会被
+            // `CG[FILE]` 逐张复用,历史加工必须作用在当前活层像素上;
+            // 用命令时刻旧基面会把上一张图写回来。
+            // TODO(refactor-trigger): 若同类“命令时刻 vs 回放”bug 再次出现
+            // （白屏 / 上一张图 / 旧 override），不要继续加特判；先读
+            // docs/tasks/silent-gaps/task-04-layer-epoch-refactor.md，
+            // 评估 LayerEpoch 第一阶段重构。
+            let base_ok = target_live
+                || i.target_base.is_some()
+                || (target == &i.source && i.source_texture.is_some());
             if replayable && base_ok && (target_live || needed_sources.contains(target)) {
                 emit_flags[idx] = true;
                 needed_sources.insert(i.source.clone());
@@ -3625,12 +3639,14 @@ impl GfxState {
             .get(&mask_path)
             .map(|n| n.layer.alpha)
             .unwrap_or(256); // 缺省
+        let target_base = self.image_target_base(&target);
         self.push_image_log(ImageOp {
             seq,
             source: mask_path.clone(),
             source2: None,
             source3: None,
             source_texture: mask_texture,
+            target_base,
             target: Some(target.clone()),
             action: ImageAction::Other("mask_alpha"),
             set: None,
@@ -4442,12 +4458,14 @@ impl GfxState {
             }
         }
         let seq = self.next_texture_seq();
+        let target_base = self.image_target_base(&dst);
         self.push_image_log(ImageOp {
             seq,
             source: from.clone(),
             source2: Some(to.clone()),
             source3: mask.clone(),
             source_texture: None,
+            target_base,
             target: Some(dst.clone()),
             action,
             set: Some(EngineValue::Int(blend.clamp(0, 256))),
@@ -4831,6 +4849,20 @@ impl GfxState {
         false
     }
 
+    /// 冻结目标层命令时刻的基面(纹理/实色填充/显式尺寸)。
+    ///
+    /// 官方 `CGACT` 在命令处理体内立即读写层表面;目标层随后被 `CGEND`
+    /// 删除或换图不会撤销已写入的像素。延迟回放需要这份命令时刻快照,
+    /// 否则 `CG[FILE=""] SX/SY → RECTPAINT3 → MERGE → COPY2 → CGEND`
+    /// 会把白底退化成 1×1,最终整屏白色(`es_cgmode.yst` CG 鉴赏)。
+    fn image_target_base(&self, target: &LayerId) -> Option<ImageTargetBase> {
+        self.nodes.get(target).map(|n| ImageTargetBase {
+            texture: n.layer.texture.clone(),
+            fill: n.layer.fill,
+            size: n.layer.image_size(),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn cgact_image(
         &mut self,
@@ -4935,6 +4967,9 @@ impl GfxState {
         // 基图为 Asset/SolidBlack1x1** 的情形;其余保持 Unimplemented。
         let explicit_target = target.is_some();
         let target = target.or_else(|| Some(source.clone()));
+        let target_base = target
+            .as_ref()
+            .and_then(|target| self.image_target_base(target));
         let status = if matches!(
             action,
             ImageAction::RectPaint | ImageAction::RectPaint2 | ImageAction::RectPaint3
@@ -5199,6 +5234,7 @@ impl GfxState {
             source2: None,
             source3: None,
             source_texture,
+            target_base,
             target: target.clone(),
             action,
             set,

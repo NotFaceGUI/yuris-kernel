@@ -68,8 +68,8 @@ pub use layer::{
     TextureFactorRule, TextureRef, Transform, Transition,
 };
 pub use op::{
-    CopyKind, CopyOp, CopyRegion, CopySource, CopyTiming, ImageAction, ImageOp, MaskDraw, Op,
-    OpStatus,
+    CopyKind, CopyOp, CopyRegion, CopySource, CopyTiming, ImageAction, ImageOp, ImageTargetBase,
+    MaskDraw, Op, OpStatus,
 };
 pub use pass::{Pass, PassTarget};
 pub use state::{GfxConfig, GfxState, TextView, TextureSampler};

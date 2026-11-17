@@ -31,9 +31,10 @@
 //!    自动钉住,计数 > 1 时不入池)。
 
 use std::collections::BTreeMap;
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
-use yu_gfx::LayerId;
+use yu_gfx::{LayerId, TextureRef};
 
 use crate::device::GpuContext;
 use crate::pipelines::TARGET_FORMAT;
@@ -734,7 +735,48 @@ impl LayerSurfaces {
 }
 
 /// 一帧的图层内容视图(`LayerId → Content`;命令序推进时同步更新)。
-pub(crate) type Contents = BTreeMap<LayerId, Content>;
+///
+/// `bases` 记录每份内容是**从哪一块命令时刻基面**算出来的。同名层被
+/// `CG[FILE]` 在一帧内逐槽复用时,旧内容不能被当成新生命周期的 COPY/
+/// MERGE 源(否则缩略图/hover 显示上一张图)。
+#[derive(Clone, Default)]
+pub(crate) struct Contents {
+    map: BTreeMap<LayerId, Content>,
+    bases: BTreeMap<LayerId, TextureRef>,
+}
+
+impl Contents {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录内容对应的命令时刻基面。
+    pub fn set_base(&mut self, id: &LayerId, base: TextureRef) {
+        self.bases.insert(id.clone(), base);
+    }
+
+    /// 当前内容是否属于 `base` 这条基面。没有记录时按兼容口径视为匹配。
+    pub fn base_matches(&self, id: &LayerId, base: Option<&TextureRef>) -> bool {
+        match base {
+            Some(base) => self.bases.get(id).is_none_or(|known| known == base),
+            None => true,
+        }
+    }
+}
+
+impl Deref for Contents {
+    type Target = BTreeMap<LayerId, Content>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl DerefMut for Contents {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
 
 fn fnv_mix(hash: &mut u64, value: u64) {
     *hash ^= value;

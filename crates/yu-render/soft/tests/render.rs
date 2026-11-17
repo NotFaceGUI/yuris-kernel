@@ -77,6 +77,8 @@ fn table() -> ParamTable {
                     "RECTPAINT",
                     "RECTPAINT2",
                     "RECTPAINT3",
+                    "MERGE",
+                    "MERGE2",
                     "TEXT",
                     "SETSTR",
                     "BNO",
@@ -1859,4 +1861,277 @@ fn per_glyph_foreground_colors_reach_pixels() {
     assert!(max_blue_right > 0, "第二个字形必须用蓝色前景(逐字 fg 生效)");
     // 红色字形不应出现蓝色像素,蓝色字形不应出现红色像素。
     assert_eq!(max_green_any, 0, "红/蓝前景不应混入绿色/白色");
+}
+
+/// CG 鉴赏预览:`RECTPAINT3 白底 → MERGE CG → COPY2 → CGEND` 同一 tick。
+///
+/// 官方 `CGACT` 命令体内立即执行;`CGEND` 删除白底不会撤销已经合成的像素。
+/// 延迟回放若因目标层消失而丢掉 `MERGE`/丢失白底的 `SX/SY`,快照会退化成
+/// 1×1 白,整屏白色(`es_cgmode.yst` pc533..536)。
+#[test]
+fn merge_into_target_deleted_same_tick_keeps_copy2_pixels() {
+    let table = table();
+    let mut gfx = state(Viewport::new(16, 16), [255, 255, 255, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"CG".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"green".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"BUF".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(16)),
+                arg(&table, "CG", "SY", Value::Int(16)),
+                arg(&table, "CG", "A", Value::Int(0)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"DST".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "SX", Value::Int(16)),
+                arg(&table, "CG", "SY", Value::Int(16)),
+                arg(&table, "CG", "E", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"BUF".to_vec())),
+                arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
+                arg(&table, "CGACT", "SET", Value::Int(0xFFFF_FFFF)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"CG".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"BUF".to_vec())),
+                arg(&table, "CGACT", "MERGE", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"BUF".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"DST".to_vec())),
+                arg(&table, "CGACT", "COPY2", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "CGEND",
+            vec![arg(&table, "CGEND", "ID", Value::Str(b"BUF".to_vec()))],
+        ),
+        call(
+            1,
+            "CGEND",
+            vec![arg(&table, "CGEND", "ID", Value::Str(b"CG".to_vec()))],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+
+    let mut backend = SoftRenderer::new(texture_store(&[(
+        b"green.png",
+        png_bytes_for_wh(16, 16, Rgba([0, 255, 0, 255])),
+    )]));
+    let out = backend.render_frame(&gfx.frame());
+    let px = out.surface.pixel(8, 8).expect("centre pixel");
+    assert_eq!(
+        px,
+        [0, 255, 0, 255],
+        "白底被 CGEND 后,MERGE 的 CG 像素仍须进入 COPY2 快照"
+    );
+}
+
+/// 活目标层被 `CG[FILE]` 换图后,历史图像加工必须作用在**当前**纹理上。
+///
+/// hover/缩略图槽位复用:旧 `MERGE2` 记录若用命令时刻的旧基面重放,
+/// 会把上一张图写回当前槽位。只有目标层已删除时才允许用 `target_base`。
+#[test]
+fn live_target_replay_uses_current_cg_file_not_recorded_base() {
+    let table = table();
+    let mut gfx = state(Viewport::new(4, 4), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"BUF".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"red".to_vec())),
+                arg(&table, "CG", "SX", Value::Int(4)),
+                arg(&table, "CG", "SY", Value::Int(4)),
+                arg(&table, "CG", "E", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"UP".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"clear".to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ),
+        // 记录一次历史加工:upper 全透明 ⇒ 下层像素应保持。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"UP".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"BUF".to_vec())),
+                arg(&table, "CGACT", "MERGE2", Value::Int(1)),
+            ],
+        ),
+        // 同 tick 换图:hover 槽位切到下一张。
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"BUF".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"blue".to_vec())),
+            ],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+
+    let mut backend = SoftRenderer::new(texture_store(&[
+        (
+            b"red.png",
+            png_bytes_for_wh(4, 4, Rgba([255, 0, 0, 255])),
+        ),
+        (
+            b"blue.png",
+            png_bytes_for_wh(4, 4, Rgba([0, 0, 255, 255])),
+        ),
+        (
+            b"clear.png",
+            png_bytes_for_wh(4, 4, Rgba([0, 0, 0, 0])),
+        ),
+    ]));
+    let out = backend.render_frame(&gfx.frame());
+    let px = out.surface.pixel(2, 2).expect("centre pixel");
+    assert_eq!(
+        px,
+        [0, 0, 255, 255],
+        "活目标层必须用换图后的 blue 基面,不能用记录里的 red"
+    );
+}
+
+/// CG 鉴赏 hover/缩略图槽位复用:`_TMP_OF`/`_TMP_OV` 每张图都同名重建。
+/// 第二张图不得复用第一张图的 `COPY2/MERGE2` 中间结果。
+#[test]
+fn gallery_reused_thumbnail_slots_do_not_leak_previous_image() {
+    let table = table();
+    let mut gfx = state(Viewport::new(4, 4), [0, 0, 0, 255]);
+    let mut events = vec![VmEvent::FrameStart { frame: 1 }];
+    for (btn, btn2) in [("BTN", "BTN2")] {
+        events.push(call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(btn.as_bytes().to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"base".to_vec())),
+                arg(&table, "CG", "SX", Value::Int(4)),
+                arg(&table, "CG", "SY", Value::Int(4)),
+                arg(&table, "CG", "E", Value::Int(1)),
+            ],
+        ));
+        events.push(call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(btn2.as_bytes().to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"base".to_vec())),
+                arg(&table, "CG", "SX", Value::Int(4)),
+                arg(&table, "CG", "SY", Value::Int(4)),
+                arg(&table, "CG", "E", Value::Int(1)),
+            ],
+        ));
+    }
+    for image in [b"red".as_slice(), b"blue".as_slice()] {
+        events.push(call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"_TMP_OF".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(image.to_vec())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ));
+        events.push(call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"_TMP_OV".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(Vec::new())),
+                arg(&table, "CG", "E", Value::Int(0)),
+            ],
+        ));
+        events.push(copy2_event(&table, b"_TMP_OF", b"_TMP_OV"));
+        for (src, dst) in [
+            (b"_TMP_OF".as_slice(), b"BTN".as_slice()),
+            (b"_TMP_OV".as_slice(), b"BTN2".as_slice()),
+        ] {
+            events.push(call(
+                1,
+                "CGACT",
+                vec![
+                    arg(&table, "CGACT", "ID", Value::Str(src.to_vec())),
+                    arg(&table, "CGACT", "ID2", Value::Str(dst.to_vec())),
+                    arg(&table, "CGACT", "MERGE2", Value::Int(1)),
+                ],
+            ));
+        }
+        events.push(call(
+            1,
+            "CGEND",
+            vec![arg(&table, "CGEND", "ID", Value::Str(b"_TMP_OF".to_vec()))],
+        ));
+        events.push(call(
+            1,
+            "CGEND",
+            vec![arg(&table, "CGEND", "ID", Value::Str(b"_TMP_OV".to_vec()))],
+        ));
+    }
+    events.push(VmEvent::FrameEnd { frame: 1 });
+    gfx.consume_events(&events);
+
+    let mut backend = SoftRenderer::new(texture_store(&[
+        (
+            b"base.png",
+            png_bytes_for_wh(4, 4, Rgba([0, 0, 0, 255])),
+        ),
+        (
+            b"red.png",
+            png_bytes_for_wh(4, 4, Rgba([255, 0, 0, 255])),
+        ),
+        (
+            b"blue.png",
+            png_bytes_for_wh(4, 4, Rgba([0, 0, 255, 255])),
+        ),
+    ]));
+    let out = backend.render_frame(&gfx.frame());
+    for (x, y, label) in [(1, 1, "BTN"), (3, 1, "BTN2")] {
+        let px = out.surface.pixel(x, y).expect("button pixel");
+        assert!(
+            px[2] > 200 && px[0] < 8,
+            "{label} 必须显示第二张图 blue,实际 {px:?}(上一张 red 泄漏)"
+        );
+    }
 }

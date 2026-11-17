@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::group::GroupDraw;
-use crate::layer::{CopyId, EngineValue, Layer, LayerId, TextureRef};
+use crate::layer::{CopyId, EngineValue, Layer, LayerId, SizeU32, TextureRef};
 use crate::text::TextDraw;
 use crate::transition::TransitionDraw;
 
@@ -324,6 +324,29 @@ impl ImageAction {
     }
 }
 
+/// 命令时刻目标层的基面状态。
+///
+/// TODO:特别的
+///
+/// 与 [`ImageOp::source_texture`] 对称:官方 `CGACT` 在命令处理体内立即执行
+/// (`FUN_0042f809`),目标层随后被 `CGEND` 删除或换图**不会撤销**已经写入
+/// 的像素。延迟回放到帧末时,活层可能已不存在或其纹理已换掉;这里冻结目标
+/// 层当时的纹理、实色填充和显式尺寸,后端才能按官方命令时刻重建基面。
+///
+/// 典型语料(CG 鉴赏预览,`es_cgmode.yst`):
+/// `CG[FILE=""] SX/SY` → `RECTPAINT3` 刷白 → `MERGE` 合成 CG → `COPY2`
+/// 拷回 → `CGEND` 删除白底。白底在 `MERGE/COPY2` 之后被删,但它的尺寸和
+/// 白色填充仍是这两条命令的输入。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageTargetBase {
+    /// 目标层命令时刻的纹理。
+    pub texture: TextureRef,
+    /// `CG[FILE=""]`/整层 `RECTPAINT*` 的实色像素(`SolidBlack1x1` 使用)。
+    pub fill: Option<[u8; 4]>,
+    /// 目标层命令时刻的显式尺寸(像素;`None` = 纹理自然尺寸)。
+    pub size: Option<SizeU32>,
+}
+
 /// 一次图像加工操作。
 ///
 /// J2 放行的动作:`RECTPAINT/2/3`(EVID-J-02..05)、`REVERSE`/`HORIZONTAL`
@@ -362,6 +385,12 @@ pub struct ImageOp {
     /// `CGEND[ID="sp.tmpB"]`;不记录会让 MERGE 整条被丢弃,动画帧层只剩
     /// 前一步的 `RECTPAINT3` 清空结果 ⇒ 立绘在眨眼/表情切换时闪空白。
     pub source_texture: Option<TextureRef>,
+    /// 命令时刻目标层的基面(纹理/实色填充/显式尺寸)。
+    ///
+    /// 目标层在后续命令里被 `CGEND` 删除或换图时,它仍是本动作的“下层”。
+    /// 官方在命令体内已经完成像素运算,删除不撤销;延迟回放必须用这份快照
+    /// 重建目标基面(见 [`ImageTargetBase`])。
+    pub target_base: Option<ImageTargetBase>,
     pub action: ImageAction,
     /// `SET` 原值。
     pub set: Option<EngineValue>,

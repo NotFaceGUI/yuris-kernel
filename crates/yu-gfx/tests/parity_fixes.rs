@@ -254,6 +254,120 @@ fn empty_file_on_existing_layer_resets_rect_to_1x1() {
     assert_eq!(q("SY"), yu_rt::value::Value::Int(1));
 }
 
+/// 任务 03 §3.4:资产换图时 `Image.size` 必须切到**新资产**尺寸,
+/// 不能保留旧图矩形。资产头已注入的顺序。
+#[test]
+fn cg_file_asset_replacement_updates_size() {
+    let table = table();
+    let mut gfx = state();
+    gfx.set_asset_size(
+        b"cg/old",
+        yu_gfx::SizeU32 {
+            width: 800,
+            height: 600,
+        },
+    );
+    gfx.set_asset_size(
+        b"cg/new",
+        yu_gfx::SizeU32 {
+            width: 320,
+            height: 200,
+        },
+    );
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF")),
+                arg(&table, "CG", "FILE", s("cg/old")),
+                arg(&table, "CG", "SX", i(800)),
+                arg(&table, "CG", "SY", i(600)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF")),
+                arg(&table, "CG", "FILE", s("cg/new")),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let q = |flag: &str| {
+        gfx.query_info(
+            "CGINFO",
+            &[
+                arg(&table, "CGINFO", "ID", s(":/W0/BUF")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+        .expect("CGINFO 尺寸查询")
+    };
+    assert_eq!(q("SX"), yu_rt::value::Value::Int(320));
+    assert_eq!(q("SY"), yu_rt::value::Value::Int(200));
+}
+
+/// 任务 03 §3.4:资产头**未注入**时,换图后的 `CGINFO[SX]` 必须返回
+/// `gfx.info.asset_size` 等待回填,不得静默返回旧图 800×600;
+/// `note_asset_size` 到达后返回新图尺寸。
+#[test]
+fn cg_file_asset_replacement_before_header_injection_is_not_old_size() {
+    let table = table();
+    let mut gfx = state();
+    gfx.set_asset_size(
+        b"cg/old",
+        yu_gfx::SizeU32 {
+            width: 800,
+            height: 600,
+        },
+    );
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF")),
+                arg(&table, "CG", "FILE", s("cg/old")),
+                arg(&table, "CG", "SX", i(800)),
+                arg(&table, "CG", "SY", i(600)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF")),
+                arg(&table, "CG", "FILE", s("cg/new")),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let ask = |gfx: &yu_gfx::GfxState, flag: &str| {
+        gfx.query_info(
+            "CGINFO",
+            &[
+                arg(&table, "CGINFO", "ID", s(":/W0/BUF")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    let err = ask(&gfx, "SX").expect_err("资产头未注入时必须等待回填");
+    assert_eq!(err.code, "gfx.info.asset_size");
+    gfx.set_asset_size(
+        b"cg/new",
+        yu_gfx::SizeU32 {
+            width: 320,
+            height: 200,
+        },
+    );
+    assert_eq!(ask(&gfx, "SX").expect("SX"), yu_rt::value::Value::Int(320));
+    assert_eq!(ask(&gfx, "SY").expect("SY"), yu_rt::value::Value::Int(200));
+}
+
 #[test]
 fn solid_black_with_sx_sy_draws_at_that_size() {
     let table = table();
@@ -2149,13 +2263,7 @@ fn cginfo_multi_field_uses_official_priority() {
 fn cg_missing_layer_poll_is_reported_once_as_verbose() {
     let table = table();
     let mut gfx = state();
-    let missing = |frame: u64| {
-        call(
-            frame,
-            "CG",
-            vec![arg(&table, "CG", "ID", s("POLL"))],
-        )
-    };
+    let missing = |frame: u64| call(frame, "CG", vec![arg(&table, "CG", "ID", s("POLL"))]);
     gfx.consume_events(&[
         frame_start(1),
         missing(1),
@@ -2283,7 +2391,13 @@ fn full_layer_rectpaint_updates_layer_fill() {
 fn snapshot_metadata_shrinks_with_copy_log() {
     let table = table();
     let mut gfx = state();
-    gfx.set_asset_size(b"cgsrc.png", yu_gfx::SizeU32 { width: 64, height: 48 });
+    gfx.set_asset_size(
+        b"cgsrc.png",
+        yu_gfx::SizeU32 {
+            width: 64,
+            height: 48,
+        },
+    );
     // 三轮「建层 -> COPY2 切快照 -> CGEND」,模拟反复开关存档/菜单。
     for round in 1..=3u64 {
         gfx.consume_events(&[
@@ -2333,5 +2447,135 @@ fn snapshot_metadata_shrinks_with_copy_log() {
         "三轮后元数据表应已收缩(实际 {}/{}),否则就是只增不删的泄漏",
         sizes,
         files
+    );
+}
+
+/// CG 鉴赏预览的命令链:白底目标层在 `MERGE/COPY2` 之后被 `CGEND`,
+/// 加工结果仍必须被重放。
+///
+/// 官方 `CGACT` 在命令体内立即执行;`CGEND` 只删层、不撤销像素。
+/// 旧实现因目标层在帧末已不存在,丢掉跨层 `MERGE`,并让 `RECTPAINT3`
+/// 的 1×1 白底失去 `SX/SY` ⇒ `COPY2` 快照退化成 1×1 白,整屏变白
+/// (`es_cgmode.yst` pc533..536)。
+#[test]
+fn merge_into_target_deleted_same_tick_is_replayed_for_copy2() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("CG")),
+                arg(&table, "CG", "FILE", s("cg")),
+                arg(&table, "CG", "E", i(0)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(16)),
+                arg(&table, "CG", "SY", i(16)),
+                arg(&table, "CG", "A", i(0)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(16)),
+                arg(&table, "CG", "SY", i(16)),
+            ],
+        ),
+        // 白底:官方 RECTPAINT3 SET=0xFFFFFFFF。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BUF")),
+                arg(&table, "CGACT", "RECTPAINT3", i(1)),
+                arg(&table, "CGACT", "SET", i(0xFFFF_FFFF)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("CG")),
+                arg(&table, "CGACT", "ID2", s("BUF")),
+                arg(&table, "CGACT", "MERGE", i(1)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BUF")),
+                arg(&table, "CGACT", "ID2", s("DST")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        // 关键时序:白底在 COPY2 之后立即删除。
+        call(1, "CGEND", vec![arg(&table, "CGEND", "ID", s("BUF"))]),
+        call(1, "CGEND", vec![arg(&table, "CGEND", "ID", s("CG"))]),
+        frame_end(1),
+    ]);
+
+    let frame = gfx.frame();
+    let ops: Vec<&Op> = frame.passes.iter().flat_map(|pass| &pass.ops).collect();
+    let rect = ops
+        .iter()
+        .find_map(|op| match op {
+            Op::Image(image)
+                if image.action == ImageAction::RectPaint3
+                    && image
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| target.display() == ":/W0/BUF") =>
+            {
+                Some(image)
+            }
+            _ => None,
+        })
+        .expect("RECTPAINT3 必须重放(白底基面)");
+    assert_eq!(
+        rect.target_base
+            .as_ref()
+            .and_then(|base| base.size)
+            .map(|size| (size.width, size.height)),
+        Some((16, 16)),
+        "白底目标层被 CGEND 后仍须保留命令时刻的 SX/SY"
+    );
+
+    let merge = ops
+        .iter()
+        .find_map(|op| match op {
+            Op::Image(image)
+                if image.action == ImageAction::Merge
+                    && image
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| target.display() == ":/W0/BUF") =>
+            {
+                Some(image)
+            }
+            _ => None,
+        })
+        .expect("跨层 MERGE 的目标被同 tick CGEND 删除后仍须重放");
+    assert_eq!(
+        merge.target_base.as_ref().and_then(|base| base.fill),
+        Some([255, 255, 255, 255]),
+        "MERGE 的下层是 RECTPAINT3 刷白后的实色面"
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, Op::Copy(copy) if copy.dest.display() == ":/W0/DST")),
+        "COPY2 必须仍把合并结果写到 DST"
     );
 }

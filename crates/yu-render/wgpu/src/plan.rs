@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use yu_gfx::{
-    Clear, CompositorFrame, CopyId, CopyOp, CopySource, ImageAction, ImageOp, Layer, LayerId, Op,
-    OpStatus, Pass, PassTarget, ScreenSnapshot, TextureRef,
+    Clear, CompositorFrame, CopyId, CopyOp, CopySource, ImageAction, ImageOp, ImageTargetBase,
+    Layer, LayerId, Op, OpStatus, Pass, PassTarget, ScreenSnapshot, TextureRef,
 };
 use yu_log::Diag;
 use yu_render_core::{
@@ -310,8 +310,10 @@ pub(crate) fn plan(
         }
         if let Some(raw) = surfaces.raw_content(&layer.id) {
             contents.insert(layer.id.clone(), raw);
+            contents.set_base(&layer.id, layer.texture.clone());
         } else if let Some(content) = surfaces.content(&layer.id) {
             contents.insert(layer.id.clone(), content.clone());
+            contents.set_base(&layer.id, layer.texture.clone());
         }
     }
 
@@ -1079,6 +1081,11 @@ fn apply_image(
 ///
 /// `fallback` 只在原地加工(源=目标)且目标层已被 `CGEND` 删除时使用:
 /// 官方命令到达时已写进层表面,删除不撤销;重放用命令时刻的基图。
+///
+/// `recorded` 是本动作**命令时刻**的目标基面。跨层动作(`MERGE` 等)的
+/// 目标层可能在同一 tick 稍后被 `CGEND` 删除,或先被 `CG[FILE]` 换图;
+/// 官方已在命令体内写完像素,因此这里以记录值为准重建“下层”,而不是
+/// 退回 1×1 符号表面。
 #[allow(clippy::too_many_arguments)]
 fn resolve_target_base(
     ctx: &GpuContext,
@@ -1089,6 +1096,7 @@ fn resolve_target_base(
     id: &LayerId,
     bases: &mut BTreeMap<(LayerId, u64), Rc<TexRef>>,
     fallback: Option<&TextureRef>,
+    recorded: Option<&ImageTargetBase>,
 ) -> Result<Content, String> {
     let layer = frame
         .layers
@@ -1109,23 +1117,43 @@ fn resolve_target_base(
             return Err("gfx.imageop.target.group".to_string());
         }
     }
-    // 与 `resolve_source` 同一口径:活层纹理与命令时刻不一致时以命令时刻
-    // 为准;一致时沿用活层,让同帧加工链继续生效。
+    // 目标层仍存活 ⇒ 用活层当前基面(缩略图/hover 槽位会被 `CG[FILE]`
+    // 逐张复用,历史加工必须作用在当前图上)。只有目标已被 `CGEND` 删除
+    // 时才用命令时刻记录,重建已消失的下层。
+    let recorded_texture = if layer.is_none() {
+        recorded.map(|base| &base.texture)
+    } else {
+        None
+    };
     let live = layer
         .map(|layer| &layer.texture)
         .filter(|texture| !matches!(texture, TextureRef::None));
-    let texture = match (live, fallback) {
-        (Some(live), Some(fallback)) if *live != *fallback => fallback,
-        (Some(live), _) => live,
-        (None, Some(fallback)) => fallback,
-        (None, None) => {
-            return Err(if layer.is_some() {
-                "gfx.imageop.texture.none"
-            } else {
-                "gfx.imageop.target.unsupported"
+    let texture = if let Some(recorded_texture) = recorded_texture {
+        recorded_texture
+    } else {
+        match (live, fallback) {
+            (Some(live), Some(fallback)) if *live != *fallback => fallback,
+            (Some(live), _) => live,
+            (None, Some(fallback)) => fallback,
+            (None, None) => {
+                return Err(if layer.is_some() {
+                    "gfx.imageop.texture.none"
+                } else {
+                    "gfx.imageop.target.unsupported"
+                }
+                .to_string())
             }
-            .to_string())
         }
+    };
+    let fill = if layer.is_some() {
+        layer.and_then(|layer| layer.fill)
+    } else {
+        recorded.and_then(|base| base.fill)
+    };
+    let explicit_size = if layer.is_some() {
+        layer.and_then(|layer| layer.image_size())
+    } else {
+        recorded.and_then(|base| base.size)
     };
     match texture {
         TextureRef::Snapshot(copy_id) if targets.snapshot(*copy_id).is_none() => {
@@ -1137,20 +1165,29 @@ fn resolve_target_base(
         }
         texture => {
             let tex = resolve_ref(
-                ctx,
-                textures,
-                gpu,
-                targets,
-                id,
-                texture,
-                layer.and_then(|layer| layer.fill),
-                SOLID_EMPTY,
-                bases,
+                ctx, textures, gpu, targets, id, texture, fill, SOLID_EMPTY, bases,
             )?;
+            // `CG[FILE=""]` 的 1×1 符号表面按命令时刻的显式尺寸铺开;
+            // 目标层已删除时只能依赖 `recorded.size`,否则会退化成 1×1。
+            let (width, height) = match texture {
+                TextureRef::SolidBlack1x1 => explicit_size
+                    .map(|size| (size.width, size.height))
+                    .unwrap_or((tex.width, tex.height)),
+                _ => (tex.width, tex.height),
+            };
             let mut hash = 0xcbf2_9ce4_8422_2325u64;
             fnv_bytes(&mut hash, id.as_bytes());
             fnv_mix(&mut hash, tex.id);
-            Ok(Content::identity(tex, hash))
+            fnv_mix(&mut hash, u64::from(width) << 32 | u64::from(height));
+            Ok(Content {
+                tex,
+                uv: [0.0, 0.0, 1.0, 1.0],
+                width,
+                height,
+                bilinear: false,
+                display: None,
+                hash,
+            })
         }
     }
 }
@@ -1179,7 +1216,7 @@ fn resolve_source(
         (Some(layer), Some(fallback)) => layer.texture != *fallback,
         _ => false,
     };
-    if !replaced {
+    if !replaced && contents.base_matches(id, fallback) {
         if let Some(content) = contents.get(id) {
             return Ok(content.clone());
         }
@@ -1438,6 +1475,38 @@ fn apply_image_pixels(
     } else {
         None
     };
+    // 同名层被 `CG[FILE]` 逐槽复用时,旧生命周期的内容/基面必须丢弃:
+    // - 目标仍存活 ⇒ 以活层纹理为基面;contents 基面不同就是上一张图;
+    // - 目标已删除 ⇒ 用命令时刻 `target_base` 重建,供 MERGE/COPY 链使用。
+    let live_texture = frame
+        .layers
+        .iter()
+        .find(|layer| &layer.id == target)
+        .map(|layer| layer.texture.clone());
+    if let Some(live) = &live_texture {
+        if !contents.base_matches(target, Some(live)) {
+            contents.remove(target);
+        }
+        contents.set_base(target, live.clone());
+    } else {
+        let command_base = image
+            .target_base
+            .as_ref()
+            .map(|base| base.texture.clone())
+            .or_else(|| {
+                if target == &image.source {
+                    image.source_texture.clone()
+                } else {
+                    None
+                }
+            });
+        if let Some(base) = command_base {
+            if !contents.base_matches(target, Some(&base)) {
+                contents.remove(target);
+            }
+            contents.set_base(target, base);
+        }
+    }
     let uses_region = image.action.is_scale()
         || image.action.is_resize()
         || matches!(
@@ -1550,6 +1619,7 @@ fn apply_image_pixels(
                 target,
                 bases,
                 target_fallback,
+                image.target_base.as_ref(),
             )?,
         };
         let base = materialize(
@@ -1744,6 +1814,7 @@ fn apply_image_pixels(
                 target,
                 bases,
                 target_fallback,
+                image.target_base.as_ref(),
             )?,
         };
         let upper_content = materialize(ctx, pipelines, surfaces, writes, &source, "merge upper")?;
@@ -1848,6 +1919,7 @@ fn apply_image_pixels(
                 target,
                 bases,
                 target_fallback,
+                image.target_base.as_ref(),
             )?,
         };
         let alpha_only = matches!(image.action, ImageAction::RectPaint2);
@@ -1986,6 +2058,7 @@ fn apply_image_pixels(
             target,
             bases,
             target_fallback,
+            image.target_base.as_ref(),
         )?,
     };
     // `DIFFUSION` 的 `SET/2 <= 0` 在官方只做一次整面 memcpy ⇒ 恒等;
@@ -2380,9 +2453,20 @@ fn apply_copy(
         return Ok(());
     }
     if let CopySource::Layer(id) = &copy.source {
-        let token = base_token(frame, targets, layers, id, copy.source_texture.as_ref());
-        if surfaces.sync_base(id, token) {
-            contents.remove(id);
+        // 源层已被 `CGEND` 删除,但本帧图像加工刚产出内容(典型:
+        // `RECTPAINT3 → MERGE → COPY2 → CGEND` 的 CG 预览)。此时
+        // `contents` 是官方命令序里 COPY 真正读到的像素,不能因为层消失
+        // 就按基面 token 清掉;清掉后只能回退到 1×1 符号表面。
+        //
+        // 但同名层会被 `CG[FILE]` 逐槽复用:contents 的基面必须与本次
+        // COPY 的命令时刻 `source_texture` 一致,否则是上一张图。
+        let current_content = contents.contains_key(id)
+            && contents.base_matches(id, copy.source_texture.as_ref());
+        if layers.contains_key(id) || !current_content {
+            let token = base_token(frame, targets, layers, id, copy.source_texture.as_ref());
+            if surfaces.sync_base(id, token) {
+                contents.remove(id);
+            }
         }
     }
     let source = match &copy.source {
@@ -2593,6 +2677,7 @@ fn apply_copy(
     targets.set_snapshot(copy.id, tex.clone());
     let content = snapshot_content(copy.id, tex);
     contents.insert(copy.dest.clone(), content.clone());
+    contents.set_base(&copy.dest, TextureRef::Snapshot(copy.id));
     surfaces.set_content(&copy.dest, content);
     Ok(())
 }
@@ -2841,6 +2926,7 @@ fn screen_snapshot_content(
         } else if let Some(content) = surfaces.content(id) {
             snap_contents.insert(id.clone(), content.clone());
         }
+        snap_contents.set_base(id, snap_layer.texture.clone());
     }
     // 快照合成必须使用**私有**的图层表面账:快照图层带的是捕获时刻的
     // alpha/texture,若写进活 `LayerSurfaces`,`sync_base` 会让同名活层

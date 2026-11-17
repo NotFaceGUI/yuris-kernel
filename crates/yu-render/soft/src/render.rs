@@ -26,7 +26,8 @@ use std::sync::Arc;
 
 use yu_gfx::{
     BlendMode, Clear, CompositorFrame, CopyId, CopyOp, CopySource, FilterMode, ImageAction,
-    ImageOp, Layer, LayerId, Op, OpStatus, PassTarget, ScreenSnapshot, TextDraw, TextureRef,
+    ImageOp, ImageTargetBase, Layer, LayerId, Op, OpStatus, PassTarget, ScreenSnapshot, TextDraw,
+    TextureRef,
 };
 
 use crate::imageop::{
@@ -415,21 +416,34 @@ fn apply_image_op(
         None
     };
     // 同一层 ID 在一帧内被 `CG[FILE]` 换图时(缩略图 `_TMP_OF` 逐槽复用),
-    // 上一槽的加工结果属于旧基图,必须丢弃后从新基图重算;否则三个缩略图
-    // 都会显示第一张 CG。
-    if target == &image.source {
-        if let Some(base) = &image.source_texture {
-            if st
-                .override_bases
-                .get(target)
-                .is_some_and(|prev| prev != base)
-            {
-                st.texture_overrides.remove(target);
+    // 上一槽的加工结果属于旧基图,必须丢弃后从新基图重算;否则 hover/
+    // 缩略图会显示上一张 CG。
+    //
+    // `target_base` 是**命令时刻**目标层基面(纹理 + fill + 尺寸);
+    // 非原地加工同样要参与:目标层被换图后,旧 override 的基面身份与
+    // 当前命令基面不一致,直接丢弃。
+    let command_base = image
+        .target_base
+        .as_ref()
+        .map(|base| base.texture.clone())
+        .or_else(|| {
+            if target == &image.source {
+                image.source_texture.clone()
+            } else {
+                None
             }
-            st.override_bases.insert(target.clone(), base.clone());
+        });
+    if let Some(base) = command_base {
+        if st
+            .override_bases
+            .get(target)
+            .is_some_and(|prev| prev != &base)
+        {
+            st.texture_overrides.remove(target);
         }
+        st.override_bases.insert(target.clone(), base);
     } else {
-        // 非原地加工的结果是“派生面”,后续原地加工应当链式接上它。
+        // 非原地加工且没有记录基面:结果是“派生面”,后续原地加工应链式接上。
         st.override_bases.remove(target);
     }
     // `MERGE/MERGE2/XOR/AND`:`ID`(上层)合成到 `ID2`(下层),结果写 `ID2`。
@@ -459,7 +473,7 @@ fn apply_image_op(
         // 清空后是否可见取决于 alpha 的混合口径(见 `apply_merge` 的注释)。
         let mut lower = match st.texture_overrides.remove(target) {
             Some(t) => Rc::try_unwrap(t).unwrap_or_else(|rc| (*rc).clone()),
-            None => base_texture(textures, snapshots, frame, target, target_fallback, None)?,
+            None => base_texture(textures, snapshots, frame, target, target_fallback, image.target_base.as_ref(), None)?,
         };
         let upper = layer_surface(
             textures,
@@ -676,7 +690,7 @@ fn apply_image_op(
                 }
             }
             let mut texture =
-                base_texture(textures, snapshots, frame, target, target_fallback, None)?;
+                base_texture(textures, snapshots, frame, target, target_fallback, image.target_base.as_ref(), None)?;
             match image.action {
                 ImageAction::Reverse => apply_reverse(&mut texture),
                 ImageAction::Vertical => apply_vertical(&mut texture),
@@ -778,14 +792,14 @@ fn apply_image_op(
         let base = if target_is_source {
             match st.texture_overrides.get(target) {
                 Some(texture) => (**texture).clone(),
-                None => base_texture(textures, snapshots, frame, target, target_fallback, None)?,
+                None => base_texture(textures, snapshots, frame, target, target_fallback, image.target_base.as_ref(), None)?,
             }
         } else {
             match st.texture_overrides.remove(target) {
                 Some(texture) => {
                     Rc::try_unwrap(texture).unwrap_or_else(|rc| (*rc).clone())
                 }
-                None => base_texture(textures, snapshots, frame, target, target_fallback, None)?,
+                None => base_texture(textures, snapshots, frame, target, target_fallback, image.target_base.as_ref(), None)?,
             }
         };
         let dx = image.x.map_or(0, |v| v.round() as i64);
@@ -816,6 +830,7 @@ fn apply_image_op(
             frame,
             target,
             target_fallback,
+            image.target_base.as_ref(),
             image.resize_base,
         )?,
     };
@@ -1245,21 +1260,22 @@ fn compose_group(
 /// 这份像素。**直接绘制**同一张 1×1 则按手册呈现为黑(`SOLID_BLACK_PX`,
 /// 见 `draw_layer`),两者用途不同,不能共用一个默认值。
 fn solid_fill_texture(layer: Option<&Layer>) -> Texture {
-    solid_fill_texture_sized(layer, None)
+    solid_fill_texture_with(
+        layer.and_then(|layer| layer.fill),
+        layer
+            .and_then(|layer| layer.image_size())
+            .map(|size| (size.width, size.height)),
+    )
 }
 
-/// `solid_fill_texture` 的显式尺寸版本。
+/// 实色符号表面的最终构造:像素与尺寸都可来自命令时刻快照。
 ///
 /// `RESIZE` 回放必须用**命令时刻**的基数(`ImageOp::resize_base`),不能用
 /// 已更新后的图层矩形:1×1 符号表面若按最终矩形铺开,后端会把增量再加
-/// 一遍。其余调用保持按图层矩形铺开。
-fn solid_fill_texture_sized(layer: Option<&Layer>, size: Option<(u32, u32)>) -> Texture {
-    let px = layer.and_then(|layer| layer.fill).unwrap_or(SOLID_EMPTY);
-    match size.or_else(|| {
-        layer
-            .and_then(|layer| layer.image_size())
-            .map(|size| (size.width, size.height))
-    }) {
+/// 一遍。其余调用按目标层命令时刻的显式尺寸铺开。
+fn solid_fill_texture_with(fill: Option<[u8; 4]>, size: Option<(u32, u32)>) -> Texture {
+    let px = fill.unwrap_or(SOLID_EMPTY);
+    match size {
         Some((width, height)) if width > 0 && height > 0 => Texture {
             width,
             height,
@@ -1303,7 +1319,20 @@ fn layer_surface(
             .get(id)
             .filter(|_| !st.text_override_ids.contains(id))
         {
-            return Ok(Surface::from_texture(texture));
+            // override 必须属于**命令时刻的同一基面**。同名层被
+            // `CG[FILE]` 逐槽复用时,上一槽的 override 基面与当前
+            // `source_texture` 不同,不能拿来当 COPY 源(否则 hover/
+            // 缩略图显示上一张 CG)。
+            let provenance_ok = match fallback {
+                Some(fallback) => st
+                    .override_bases
+                    .get(id)
+                    .is_none_or(|base| base == fallback),
+                None => true,
+            };
+            if provenance_ok {
+                return Ok(Surface::from_texture(texture));
+            }
         }
     }
     let texture = match (layer, fallback) {
@@ -1339,33 +1368,63 @@ fn layer_surface(
 /// `fallback` 只在**原地加工**(源=目标)且目标层已被 `CGEND` 删除时使用:
 /// 官方命令到达时已把结果写进层表面,删除不撤销;重放需要命令时刻记录的
 /// 基图(`ImageOp::source_texture`)。
+///
+/// `recorded` 是动作**命令时刻**的目标基面。跨层动作的目标层可能在同一
+/// tick 稍后被 `CGEND` 删除;官方像素运算已经完成,不能退回 1×1 符号面。
 fn base_texture(
     textures: &mut TextureStore,
     snapshots: &Snapshots,
     frame: &CompositorFrame,
     target: &LayerId,
     fallback: Option<&TextureRef>,
+    recorded: Option<&ImageTargetBase>,
     solid_size: Option<(u32, u32)>,
 ) -> Result<Texture, String> {
     let layer = frame.layers.iter().find(|layer| &layer.id == target);
-    // 与 `layer_surface` 同一口径:活层纹理与命令时刻不一致时以命令时刻为准;
-    // 一致时沿用活层,让同帧加工结果继续链式生效。
+    // 目标层仍存活 ⇒ 用活层当前基面(缩略图/hover 槽位会被 `CG[FILE]`
+    // 逐张复用,历史加工必须作用在当前图上)。只有目标已被 `CGEND` 删除
+    // 时才用命令时刻记录,重建已消失的下层。
+    let recorded_texture = if layer.is_none() {
+        recorded.map(|base| &base.texture)
+    } else {
+        None
+    };
     let live = layer
         .map(|layer| &layer.texture)
         .filter(|texture| !matches!(texture, TextureRef::None));
-    let texture = match (live, fallback) {
-        (Some(live), Some(fallback)) if *live != *fallback => fallback,
-        (Some(live), _) => live,
-        (None, Some(fallback)) => fallback,
-        (None, None) => {
-            return Err(if layer.is_some() {
-                "gfx.imageop.texture.none"
-            } else {
-                "gfx.imageop.target.unsupported"
+    let texture = if let Some(recorded_texture) = recorded_texture {
+        recorded_texture
+    } else {
+        match (live, fallback) {
+            (Some(live), Some(fallback)) if *live != *fallback => fallback,
+            (Some(live), _) => live,
+            (None, Some(fallback)) => fallback,
+            (None, None) => {
+                return Err(if layer.is_some() {
+                    "gfx.imageop.texture.none"
+                } else {
+                    "gfx.imageop.target.unsupported"
+                }
+                .to_string())
             }
-            .to_string())
         }
     };
+    let fill = if layer.is_some() {
+        layer.and_then(|layer| layer.fill)
+    } else {
+        recorded.and_then(|base| base.fill)
+    };
+    let explicit_size = solid_size.or_else(|| {
+        if layer.is_some() {
+            layer
+                .and_then(|layer| layer.image_size())
+                .map(|size| (size.width, size.height))
+        } else {
+            recorded
+                .and_then(|base| base.size)
+                .map(|size| (size.width, size.height))
+        }
+    });
     match texture {
         TextureRef::Asset(key) => textures
             .resolve(key)
@@ -1383,9 +1442,7 @@ fn base_texture(
                 rgba: texture.rgba.clone(),
             })
             .map_err(|diag| diag.code.to_string()),
-        TextureRef::SolidBlack1x1 => {
-            Ok(solid_fill_texture_sized(layer.map(|l| l.as_ref()), solid_size))
-        }
+        TextureRef::SolidBlack1x1 => Ok(solid_fill_texture_with(fill, explicit_size)),
         TextureRef::Snapshot(copy_id) => snapshots
             .get(copy_id)
             .map(|surface| Texture {
@@ -1823,7 +1880,13 @@ fn draw_layer(
     };
     // 普通图层缩放(`FBX/FBY` ÷10000);0 维度由 draw_image 直接跳过。
     let (scale_x, scale_y) = layer.affine_scale();
-    if let Some(texture) = st.texture_overrides.get(&layer.id) {
+    // 覆盖纹理必须属于当前活层基面:同名层被 `CG[FILE]` 换图后,
+    // 上一生命周期的加工结果不能继续显示(缩略图/hover 会停在上张图)。
+    let override_ok = st
+        .override_bases
+        .get(&layer.id)
+        .is_none_or(|base| base == &layer.texture);
+    if let Some(texture) = st.texture_overrides.get(&layer.id).filter(|_| override_ok) {
         let (width, height) = match layer.image_size() {
             Some(size) => (size.width, size.height),
             None => (texture.width, texture.height),
