@@ -109,7 +109,11 @@ REA 否定"空操作"这部分:**`FILE` 给了空串就一定会替换像素**�
 传 `SOLID_BLACK_PX`;soft 的 `solid_fill_texture` 与文本基面同步。
 完整根因、逐帧数据与验证见 **DIV-GFX-085**。
 
-**尚未裁定**:`CG[FILE=""]` 对**已存在层**是否把 `+0x78/+0x7c` 重置为 1
-(REA 显示空串分支无条件写 1),以及 `CGINFO[SX/SY]` 是否因此返回 1
-(SDK `es_Sprite.yst:4064` 的透明守卫依赖它)。该问题不影响本轮已定位的
-单帧黑;留待单独取证。
+**已裁定(2026-11-17,REA 0.486 `FUN_0042b144`)**:
+`CG[FILE]` 的装入统一走 `FUN_0042b144(EAX=层, EDX=文件名)`:
+`*EDX==0` → `FUN_0040c5f4`(无条件写 `+0x78/+0x7c=1`,表面重分 1×1);
+非空 → `FUN_0040c7c5`(按新图重建表面)。
+因此**已存在层**上的 `CG[FILE=""]` 也把矩形重置为 1×1,
+`CGINFO[SX/SY]` 随后返回 1(SDK `es_Sprite.yst:4064` 的透明守卫依赖它)。
+内核已在 `apply_cg_inner` 的换图分支同步空串 1×1、资产换图按新图尺寸重置;
+回归 `empty_file_on_existing_layer_resets_rect_to_1x1`。

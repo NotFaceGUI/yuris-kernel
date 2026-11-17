@@ -15256,3 +15256,95 @@ load_system_fonts: 163.4ms faces=248 catalog=127
   `diff` 一致;`python -c "import yaml; yaml.safe_load(...)"` 解析 release.yml
   通过;README 相对链接检查无缺失;`git diff --check` 干净。
 - 本轮未执行任何 git 写操作,等待主人审阅。
+
+## 成果 GFX-TRANSITION-PLACEHOLDER (2026-11-16) · 立绘切换目标缓冲为空的取证;撤销过渡扩容补丁
+
+- 症状(0.486 商业样本):剧情过渡后画面跳一下,角色立绘淡出直接消失;
+  0.3.3 日志 `gfx.info.unsupported @ es_sprite.yst pc6134: 快照纹理 32
+  尺寸未记录`,0.3.1 同族 snapshot 29/30/31。
+- 取证(`YU_GFX_TRACE=1`,已删除):
+  - 切换命令只带 `$L.SPID(10)="Char1"`,`$L.FCG(10)=""`
+    (s58@1349/1350 变量探针);`es.SP.LOADCGF` 的 `$lp.fn` 为空,
+    `$LIDBUF2`(目标缓冲)始终 1×1;
+  - 脚本 `CG[ID=$LIDBUF3 SX=@sx SY=@sy FILE=""]`(s58@4145)按 1×1
+    建过渡输出 `SPLBUFb1001`;
+  - `COPY2` 自 1×1 空壳生成的 snapshot 30/31/32 无显示尺寸,
+    `CGINFO[SX/SY]` 每帧 Unimplemented。
+- 保留的 REA 对齐修复:
+  - `cgact_copy`:`TextureRef::SolidBlack1x1` 无显式尺寸时按引擎层构造
+    默认 1×1 记录快照显示尺寸;
+  - `query_layer_size` Snapshot 无显示矩形时按官方 `+0x78/+0x7c` 返回 0,
+    不再 Unimplemented。
+- 已撤销的错误补丁:`cgact_transition` 曾把 1×1 占位目标按源 A 尺寸
+  扩容;REA `0x43bad0` + `FUN_0043b518` 证明官方 TRANSITION 只用目标层
+  `+0x78/+0x7c`/`+0x90`,没有扩容分支。该补丁与两个过渡回归用例已回退,
+  实机画面回到“立绘直接消失”;在官方 0.486 语义取证前不掩盖。
+- 语义状态:**open**。`$L.FCG` 为空时官方如何处理尚未取证,候选:
+  保留当前图(表情/动画切换)、把空目标当淡出透明、或按 `SPA`/SPID
+  定义解析 `Char1`;见 `DIV-GFX-089` §3/§5。
+- 验证:
+  - `cargo test --profile fast -p yu-gfx --test parity_fixes` → 40 passed
+    (保留 `copy2_from_fileless_solid_layer_reports_1x1_snapshot`);
+  - 变量探针/临时 trace 已删除。
+- 顺带:`Cargo.toml` 新增 `[profile.fast]`(关 fat LTO、CGU=16、
+  opt-level=2),`cargo build --profile fast -p yu-cli` 约 20s,产物在
+  `target/fast`;发布仍用 `--release`。
+- 本轮未执行任何 git 写操作,等待主人审阅。
+
+## 成果 GFX-RESIZE-RECT (2026-11-17) · RESIZE 未回写图层矩形导致空立绘目标 1×1 截断
+
+- 在上一成果基础上继续静态多版本交叉定位;根因闭合:
+  - 0.486 样本实际加载的是 `pac/data.ypf` 内的 `ysbin/yst00058.ybn`,
+    不是散盘 `ysbin/`;两者组数同为 6574,但以打包产物为准。
+  - `es.SP.LOADCGF` 对 `CG[FILE=""]` 的 1×1 空目标只做
+    `RECTPAINT3=1 SET=0` 清透明;真正扩容靠 `es.SP.RESIZE` 的四条
+    `CGACT[RESIZE=1]`。每条后脚本用 `CGINFO[SX/SY]` 读回尺寸再算下一边。
+  - 官方 `RESIZE` 执行体(0.495 `FUN_0043c971`)按
+    `newW = srcW+X+X2` / `newH = srcH+Y+Y2` 同时改写图层矩形
+    `+0x78/+0x7c`。内核只更新了像素加工项,没有回写
+    `LayerKind::Image.size`;`CGINFO` 在四条 RESIZE 之间始终返回 1×1,
+    过渡输出/可见层被截成 1×1 ⇒ 画面跳变、立绘瞬间消失。
+- 修复:
+  - `cgact_image` 执行 RESIZE 时按官方公式更新目标层
+    `LayerKind::Image.size`(基数取命令前尺寸;<=0 或宽 >0x2000 不更新)。
+  - `ImageOp` 新增 `resize_base`,冻结每条 RESIZE 执行前的基数;
+    soft 后端 `SolidBlack1x1` 基面按该基数铺开,避免把增量再加一遍。
+- 回归:`cargo test -p yu-gfx --test parity_fixes` → 41 passed;
+  新增 `resize_updates_layer_rect_for_cginfo`(连续两条 RESIZE 后
+  `CGINFO SX/SY = 1039×720`;两条 op 的 `resize_base` 为
+  `(1,1)`、`(1139,720)`)。
+- 验证:
+  - `cargo test -p yu-gfx`、`cargo test -p yu-backend-soft` 全绿;
+  - `cargo build --workspace --all-targets` 通过;
+  - 实机待启动 0.486 样本走同一剧情过渡确认。
+- 台账:`docs/divergences/DIV-GFX-089-snapshot-size-chain.md` 已更新为
+  `fixed(实机待验)`。
+- 本轮未执行任何 git 写操作,等待主人审阅。
+
+## 成果 SILENT-STATE-AUDIT (2026-11-17) · 静默状态缺口普查与 CG[FILE] 换图矩形修复
+
+- 按 RESIZE 同类模式普查“动作返回成功、但漏官方状态写入”的路径;
+  结论与证据分级见 `docs/tasks/silent-state-audit-2026-11-17.md`。
+- 追加修复:`CG[FILE]` 对**已存在层**换图时同步矩形。
+  - REA 0.486 `FUN_0042b144(EAX=层, EDX=文件名)`:
+    `*EDX==0` → `FUN_0040c5f4` 无条件写 `+0x78/+0x7c=1`;
+    非空 → `FUN_0040c7c5` 按新图重建表面。
+  - `apply_cg_inner` 换图分支:空串重置 1×1;资产换图按新图尺寸,
+    尺寸未注入时置空由 `asset_sizes` 回退;目录形失败路径维持原状
+    (官方失败矩形仍未取证)。
+  - 回归 `empty_file_on_existing_layer_resets_rect_to_1x1`。
+- 仍 open(高风险优先):
+  1. `COPY/COPY2` 目标矩形只记 `snapshot_sizes`,`LayerKind::Image.size`
+     保留旧值;`CGINFO`/`ONMOUSE` 先读旧矩形(DIV-GFX-077 的已知取舍)。
+  2. `TRIM` 裁纹理但不回写矩形;新尺寸依赖 alpha 包围盒,gfx 命令时刻
+     无像素,需后端回报/两阶段提交;当前源语料 0 次调用。
+  3. `ONMOUSE/COLOR` 尺寸优先级与 COPY 同根,需“矩形来源/代次”标记。
+  4. 目录形 `CG[FILE]` 失败矩形、`TRIM` 全透明、`SIZE` 单轴:证据不足,
+     登记不猜。
+- 已核对不算缺口:ROTATION 同尺寸、MERGE/XOR/AND 不改矩形、
+  SWAP 按纹理取尺寸、TRANSITION 不扩容目标。
+- 验证:
+  - `cargo test -p yu-gfx --test parity_fixes` → 42 passed;
+  - `cargo test -p yu-gfx`、`cargo test -p yu-backend-soft` 全绿;
+  - 0.486 样本实机 1614 帧未再出现 `gfx.info.unsupported`。
+- 本轮未执行任何 git 写操作,等待主人审阅。

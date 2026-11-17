@@ -459,7 +459,7 @@ fn apply_image_op(
         // 清空后是否可见取决于 alpha 的混合口径(见 `apply_merge` 的注释)。
         let mut lower = match st.texture_overrides.remove(target) {
             Some(t) => Rc::try_unwrap(t).unwrap_or_else(|rc| (*rc).clone()),
-            None => base_texture(textures, snapshots, frame, target, target_fallback)?,
+            None => base_texture(textures, snapshots, frame, target, target_fallback, None)?,
         };
         let upper = layer_surface(
             textures,
@@ -675,7 +675,8 @@ fn apply_image_op(
                     return Ok(());
                 }
             }
-            let mut texture = base_texture(textures, snapshots, frame, target, target_fallback)?;
+            let mut texture =
+                base_texture(textures, snapshots, frame, target, target_fallback, None)?;
             match image.action {
                 ImageAction::Reverse => apply_reverse(&mut texture),
                 ImageAction::Vertical => apply_vertical(&mut texture),
@@ -777,14 +778,14 @@ fn apply_image_op(
         let base = if target_is_source {
             match st.texture_overrides.get(target) {
                 Some(texture) => (**texture).clone(),
-                None => base_texture(textures, snapshots, frame, target, target_fallback)?,
+                None => base_texture(textures, snapshots, frame, target, target_fallback, None)?,
             }
         } else {
             match st.texture_overrides.remove(target) {
                 Some(texture) => {
                     Rc::try_unwrap(texture).unwrap_or_else(|rc| (*rc).clone())
                 }
-                None => base_texture(textures, snapshots, frame, target, target_fallback)?,
+                None => base_texture(textures, snapshots, frame, target, target_fallback, None)?,
             }
         };
         let dx = image.x.map_or(0, |v| v.round() as i64);
@@ -809,7 +810,14 @@ fn apply_image_op(
     // (MERGE/MERGE2/XOR/AND 在函数入口已按绘制偏移处理,不会走到这里。)
     let mut texture = match st.texture_overrides.remove(target) {
         Some(texture) => Rc::try_unwrap(texture).unwrap_or_else(|rc| (*rc).clone()),
-        None => base_texture(textures, snapshots, frame, target, target_fallback)?,
+        None => base_texture(
+            textures,
+            snapshots,
+            frame,
+            target,
+            target_fallback,
+            image.resize_base,
+        )?,
     };
     match image.action {
         ImageAction::RectPaint | ImageAction::RectPaint2 | ImageAction::RectPaint3 => {
@@ -1237,12 +1245,25 @@ fn compose_group(
 /// 这份像素。**直接绘制**同一张 1×1 则按手册呈现为黑(`SOLID_BLACK_PX`,
 /// 见 `draw_layer`),两者用途不同,不能共用一个默认值。
 fn solid_fill_texture(layer: Option<&Layer>) -> Texture {
+    solid_fill_texture_sized(layer, None)
+}
+
+/// `solid_fill_texture` 的显式尺寸版本。
+///
+/// `RESIZE` 回放必须用**命令时刻**的基数(`ImageOp::resize_base`),不能用
+/// 已更新后的图层矩形:1×1 符号表面若按最终矩形铺开,后端会把增量再加
+/// 一遍。其余调用保持按图层矩形铺开。
+fn solid_fill_texture_sized(layer: Option<&Layer>, size: Option<(u32, u32)>) -> Texture {
     let px = layer.and_then(|layer| layer.fill).unwrap_or(SOLID_EMPTY);
-    match layer.and_then(|layer| layer.image_size()) {
-        Some(size) if size.width > 0 && size.height > 0 => Texture {
-            width: size.width,
-            height: size.height,
-            rgba: px.repeat((size.width as usize) * (size.height as usize)),
+    match size.or_else(|| {
+        layer
+            .and_then(|layer| layer.image_size())
+            .map(|size| (size.width, size.height))
+    }) {
+        Some((width, height)) if width > 0 && height > 0 => Texture {
+            width,
+            height,
+            rgba: px.repeat((width as usize) * (height as usize)),
         },
         _ => Texture {
             width: 1,
@@ -1324,6 +1345,7 @@ fn base_texture(
     frame: &CompositorFrame,
     target: &LayerId,
     fallback: Option<&TextureRef>,
+    solid_size: Option<(u32, u32)>,
 ) -> Result<Texture, String> {
     let layer = frame.layers.iter().find(|layer| &layer.id == target);
     // 与 `layer_surface` 同一口径:活层纹理与命令时刻不一致时以命令时刻为准;
@@ -1361,7 +1383,9 @@ fn base_texture(
                 rgba: texture.rgba.clone(),
             })
             .map_err(|diag| diag.code.to_string()),
-        TextureRef::SolidBlack1x1 => Ok(solid_fill_texture(layer.map(|l| l.as_ref()))),
+        TextureRef::SolidBlack1x1 => {
+            Ok(solid_fill_texture_sized(layer.map(|l| l.as_ref()), solid_size))
+        }
         TextureRef::Snapshot(copy_id) => snapshots
             .get(copy_id)
             .map(|surface| Texture {

@@ -122,9 +122,11 @@ cargo test --release -p yu-backend-wgpu                  → 38 passed,1 并行�
 
 ## 残留(未在本轮改)
 
-- 官方 `FUN_0040c5f8` 把 `+0x78/+0x7c` 写成 1;`CG[FILE=""]` 在**已存在层**
-  上是否应把尺寸重置回 1×1、以及 `CGINFO[SX/SY]` 是否因此返回 1
-  (SDK `es_Sprite.yst:4064` 的「1x1 なら完全透明」守卫依赖它),尚无直接
-  引擎证据;本轮只按已证实的四零像素裁定,不改尺寸语义。
+- `CG[FILE=""]` 在**已存在层**上的矩形重置已在 2026-11-17 裁定并修复:
+  官方 `FUN_0042b144` 空串分支 `FUN_0040c5f4` 无条件写
+  `+0x78/+0x7c = 1`;非空走 `FUN_0040c7c5` 按新图重建。内核
+  `apply_cg_inner` 换图分支已同步,回归
+  `empty_file_on_existing_layer_resets_rect_to_1x1`。像素 alpha 的四零
+  语义仍按本档结论。
 - `screen_snapshot` 合成与官方后缓冲读取的差异(DIV-GFX-051)仍是独立议题;
   本轮黑帧已由空白像素语义解释,不需要动快照路径。

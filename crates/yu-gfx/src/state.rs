@@ -2336,10 +2336,11 @@ impl GfxState {
             },
             TextureRef::Snapshot(id) => match self.snapshot_display_size(*id) {
                 Some(size) => Ok(i64::from(if width { size.width } else { size.height })),
-                None => Err(error::unimplemented(
-                    error::code::INFO_UNSUPPORTED,
-                    format!("快照纹理 {} 尺寸未记录(源层无尺寸元数据)", id.0),
-                )),
+                // 官方 `CGINFO[SX/SY]` 直接读图层 `+0x78/+0x7c`；没有
+                // 显示矩形的快照这两个字段就是 0，不是错误。返回
+                // `Unimplemented` 会让 `LET` 保留旧值并每帧刷诊断，
+                // 脚本侧的过渡缓冲因此永远拿不到可用的 0/尺寸语义。
+                None => Ok(0),
             },
             // 影片帧的自然尺寸 = 容器头 `width/height`(与 `Asset` 的
             // 「资源图自然尺寸」同一条规则;脚本惯例随后用 `CGACT[SIZE]`
@@ -3258,6 +3259,12 @@ impl GfxState {
         // 也**不能**退化成 `file = None`:那会被下方「无 FILE/RID 且层
         // 不存在 ⇒ 官方返回 -1,不建节点」当成"脚本没给 FILE",于是层根本
         // 不建立、后续 `CGACT[TEXT]` 报目标层不存在。
+        // `CG[FILE=""]` 与 `CG[FILE=<非空>]` 走官方 `FUN_0042b144` 的两条
+        // 分支:空串 → `FUN_0040c5f4`(无条件把 `+0x78/+0x7c` 写 1、表面
+        // 重分 1×1);非空 → `FUN_0040c7c5` 按新图重建表面。对**已存在层**
+        // 也一样,所以换图时旧矩形不能保留。这里只对空串与资产换图重置;
+        // 目录形失败路径的矩形语义仍未取证,维持原状。
+        let empty_file = matches!(&file, Some(TextureRef::SolidBlack1x1));
         let dir_shaped_file = matches!(&file, Some(TextureRef::Asset(k))
             if k.last().is_some_and(|b| *b == b'/' || *b == 0x5c));
         if dir_shaped_file {
@@ -3390,12 +3397,27 @@ impl GfxState {
             self.create_image(&parsed.path, texture, None);
         } else if let Some(texture) = file {
             // **立绘差分切换的路径**:`CG[FILE=…]` 对已存在的层换图。
-            // 手册:FILE 替换只换图,不重置 A/位置等属性。
+            // 手册:FILE 替换只换图,不重置 A/位置等属性;尺寸由官方装载
+            // 分支重写(空串 1×1;资产按新图头),这里同步。
+            let replacement_size = match &texture {
+                _ if empty_file => Some(SizeU32 {
+                    width: 1,
+                    height: 1,
+                }),
+                TextureRef::Asset(key) => self.asset_sizes.get(key).copied(),
+                _ => None,
+            };
+            let resets_size = empty_file || matches!(&texture, TextureRef::Asset(_));
             let probe = self.config.cg_timing;
             let t0 = std::time::Instant::now();
             if let Some(node) = self.nodes.get_mut(&parsed.path) {
                 let layer = Arc::make_mut(&mut node.layer);
                 layer.texture = texture;
+                if resets_size {
+                    layer.kind = LayerKind::Image {
+                        size: replacement_size,
+                    };
+                }
                 // 目录形 `FILE` 换图同样是"没有图片像素":画布必须透明
                 // (DIV-GFX-084);其余情况沿用官方"换图清 fill"语义。
                 layer.fill = dir_shaped_file.then_some([0, 0, 0, 0]);
@@ -3549,6 +3571,7 @@ impl GfxState {
             alpha_aware: false,
             source_alpha,
             target_alpha,
+            resize_base: None,
             status,
         });
         if status == OpStatus::Executable {
@@ -4126,7 +4149,19 @@ impl GfxState {
                     width: m.width,
                     height: m.height,
                 }),
-                TextureRef::None | TextureRef::SolidBlack1x1 => src_node.layer.image_size(),
+                TextureRef::None | TextureRef::SolidBlack1x1 => src_node
+                    .layer
+                    .image_size()
+                    .or_else(|| {
+                        // 官方 `CG[FILE=""]` 的层构造默认矩形就是 1×1
+                        // (`FUN_0040c5f4` 写 `+0x78/+0x7c=1`)。`COPY2` 的
+                        // 快照显示尺寸因此是 1×1，不是“无尺寸”。
+                        matches!(src_node.layer.texture, TextureRef::SolidBlack1x1)
+                            .then_some(SizeU32 {
+                                width: 1,
+                                height: 1,
+                            })
+                    }),
             };
         }
         // `COPY/COPY2` 局部区域:官方 `FUN_0042f809` 在动作执行后**无条件**
@@ -4348,6 +4383,7 @@ impl GfxState {
             // (`SET` 就是混合比例);显式写 256 表示恒等,避免下游误用。
             source_alpha: 256,
             target_alpha: 256,
+            resize_base: None,
             status: OpStatus::Executable,
         });
     }
@@ -5019,6 +5055,45 @@ impl GfxState {
                 }
             }
         }
+        // `RESIZE` 同时改写图层矩形(官方 `FUN_0043c971`):`+0x78/+0x7c`
+        // 变成 `srcW+X+X2 / srcH+Y+Y2`。脚本紧接着用 `CGINFO[SX/SY]`
+        // 读取新尺寸(`es.SP.RESIZE` 逐边扩缩 `CG[FILE=""]` 的 1×1 空
+        // 目标,0.486 `es_Sprite.yst`),所以尺寸必须在命令时刻落到层上。
+        //
+        // 基数取**执行前**的尺寸并随 `ImageOp` 冻结:后端回放时若按已
+        // 更新的矩形重建 1×1 符号表面,会把增量再加一遍。
+        let resize_base = if executable && image_action.is_resize() {
+            let id = target.as_ref().unwrap_or(&source);
+            self.nodes.get(id).and_then(|n| {
+                let w = self.query_layer_size(&n.layer, true).ok()?;
+                let h = self.query_layer_size(&n.layer, false).ok()?;
+                (w > 0 && h > 0).then_some((w as u32, h as u32))
+            })
+        } else {
+            None
+        };
+        if executable && image_action.is_resize() {
+            if let Some((base_w, base_h)) = resize_base {
+                let new_w = i64::from(base_w)
+                    + x.unwrap_or(0.0).round() as i64
+                    + x2.unwrap_or(0.0).round() as i64;
+                let new_h = i64::from(base_h)
+                    + y.unwrap_or(0.0).round() as i64
+                    + y2.unwrap_or(0.0).round() as i64;
+                // 官方 `0x43c9da..0x43c9f1`:newW/newH <= 0 报错,
+                // 宽度 > 0x2000 报错。执行失败的 RESIZE 不改矩形。
+                if new_w >= 1 && new_h >= 1 && new_w <= 0x2000 {
+                    if let Some(node) = self.nodes.get_mut(target.as_ref().unwrap_or(&source)) {
+                        Arc::make_mut(&mut node.layer).kind = LayerKind::Image {
+                            size: Some(SizeU32 {
+                                width: new_w as u32,
+                                height: new_h as u32,
+                            }),
+                        };
+                    }
+                }
+            }
+        }
         self.push_image_log(ImageOp {
             seq,
             source: source.clone(),
@@ -5040,6 +5115,7 @@ impl GfxState {
             alpha_aware,
             source_alpha: source_layer_alpha,
             target_alpha: target_layer_alpha,
+            resize_base,
             status,
         });
         if marks_alpha {

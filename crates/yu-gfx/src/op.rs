@@ -421,5 +421,16 @@ pub struct ImageOp {
     ///
     /// 仅 `MERGE2` 消费;`MERGE` 不吃(见 [`Self::source_alpha`])。
     pub target_alpha: i16,
+    /// `RESIZE` 执行前的源表面尺寸(像素)。
+    ///
+    /// 官方 `FUN_0043c971` 同时改写图层矩形 `+0x78/+0x7c`:
+    /// `newW = srcW + X + X2`、`newH = srcH + Y + Y2`。gfx 在命令时刻已经
+    /// 用这个基数更新 `LayerKind::Image.size`,以便随后的 `CGINFO[SX/SY]`
+    /// 读到新矩形;后端回放时若按**已更新**的矩形重建 1×1 符号表面,会把
+    /// 增量再加一遍,所以这里冻结执行前的基数。
+    ///
+    /// 语料:0.486 `es_Sprite.yst` 的 `es.SP.RESIZE` 对
+    /// `CG[FILE=""]` 的空目标连续发四条 `RESIZE`,把 1×1 扩到旧立绘尺寸。
+    pub resize_base: Option<(u32, u32)>,
     pub status: OpStatus,
 }

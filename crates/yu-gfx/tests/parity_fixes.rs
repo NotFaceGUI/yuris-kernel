@@ -78,6 +78,182 @@ fn empty_tid_clears_pairing_instead_of_w0() {
         .any(|o| matches!(o, Op::Layer(l) if l.id.display() == ":/W0/A")));
 }
 
+/// `CG[FILE=""]` 的 1×1 空壳(没有显式 `SX/SY`)被 `COPY2` 整幅复制时,
+/// 快照显示尺寸必须是 1×1,不是“无尺寸”。
+#[test]
+fn copy2_from_fileless_solid_layer_reports_1x1_snapshot() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("MASK")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s(":/W0/MASK")),
+                arg(&table, "CGACT", "ID2", s("SNAP")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    assert!(matches!(
+        layer(&f, ":/W0/SNAP").texture,
+        TextureRef::Snapshot(_)
+    ));
+    let q = |flag: &str| {
+        gfx.query_info(
+            "CGINFO",
+            &[
+                arg(&table, "CGINFO", "ID", s(":/W0/SNAP")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+        .expect("CGINFO 尺寸查询")
+    };
+    assert_eq!(q("SX"), yu_rt::value::Value::Int(1));
+    assert_eq!(q("SY"), yu_rt::value::Value::Int(1));
+}
+
+#[test]
+fn resize_updates_layer_rect_for_cginfo() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        // 0.486 `es.SP.RESIZE`:空目标从 1×1 按四条边扩到旧立绘尺寸。
+        // 官方 `FUN_0043c971` 同时改写 `+0x78/+0x7c`。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s(":/W0/BUF")),
+                arg(&table, "CGACT", "RESIZE", i(1)),
+                arg(&table, "CGACT", "X", i(0)),
+                arg(&table, "CGACT", "Y", i(0)),
+                arg(&table, "CGACT", "X2", i(1138)),
+                arg(&table, "CGACT", "Y2", i(719)),
+            ],
+        ),
+        // 第二条 RESIZE 以**第一条改后的矩形**为基数(es.SP.RESIZE 逐边
+        // 调用),再缩 100 像素宽。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s(":/W0/BUF")),
+                arg(&table, "CGACT", "RESIZE", i(1)),
+                arg(&table, "CGACT", "X2", i(-100)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    assert_eq!(
+        layer(&f, ":/W0/BUF").kind,
+        LayerKind::Image {
+            size: Some(yu_gfx::SizeU32 {
+                width: 1039,
+                height: 720
+            })
+        }
+    );
+    let resized: Vec<_> = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .filter_map(|op| match op {
+            Op::Image(image) if image.action == ImageAction::Resize => Some(image),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(resized.len(), 2);
+    // 后端回放必须从每步命令前的基数起算,不能从已更新的矩形再加一遍。
+    assert_eq!(resized[0].resize_base, Some((1, 1)));
+    assert_eq!(resized[1].resize_base, Some((1139, 720)));
+    let q = |flag: &str| {
+        gfx.query_info(
+            "CGINFO",
+            &[
+                arg(&table, "CGINFO", "ID", s(":/W0/BUF")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+        .expect("CGINFO 尺寸查询")
+    };
+    assert_eq!(q("SX"), yu_rt::value::Value::Int(1039));
+    assert_eq!(q("SY"), yu_rt::value::Value::Int(720));
+}
+
+#[test]
+fn empty_file_on_existing_layer_resets_rect_to_1x1() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF")),
+                arg(&table, "CG", "FILE", s("cg/old")),
+                arg(&table, "CG", "SX", i(800)),
+                arg(&table, "CG", "SY", i(600)),
+            ],
+        ),
+        // 官方 `FUN_0042b144`:空串 → `FUN_0040c5f4` 无条件写
+        // `+0x78/+0x7c = 1`,已存在层也不保留旧矩形。
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    assert_eq!(
+        layer(&f, ":/W0/BUF").kind,
+        LayerKind::Image {
+            size: Some(yu_gfx::SizeU32 {
+                width: 1,
+                height: 1
+            })
+        }
+    );
+    let q = |flag: &str| {
+        gfx.query_info(
+            "CGINFO",
+            &[
+                arg(&table, "CGINFO", "ID", s(":/W0/BUF")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+        .expect("CGINFO 尺寸查询")
+    };
+    assert_eq!(q("SX"), yu_rt::value::Value::Int(1));
+    assert_eq!(q("SY"), yu_rt::value::Value::Int(1));
+}
+
 #[test]
 fn solid_black_with_sx_sy_draws_at_that_size() {
     let table = table();
