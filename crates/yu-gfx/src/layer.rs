@@ -1077,6 +1077,26 @@ pub struct Layer {
     pub visible: bool,
     pub kind: LayerKind,
     pub texture: TextureRef,
+    /// 显示/命中矩形的来源:`Some(id)` = 最近一次 `COPY/COPY2` 写入该层的
+    /// 快照区域矩形(`CGINFO[SX/SY]` / `ONMOUSE*` 查询用它),`None` = 用
+    /// 显式尺寸/纹理尺寸。
+    ///
+    /// **不是** `LayerKind::Image.size`:后者是绘制缩放尺寸(后端把整张
+    /// 表面缩放到该尺寸),COPY 的区域矩形若写进去会把源合图压扁
+    /// (DIV-GFX-077)。这里只存**来源**而不是冻结的宽高:快照区域尺寸由
+    /// `GfxState::snapshot_display_size` 动态解析,资产尺寸晚到
+    /// (`set_asset_size`)后仍能回填;0×0 源返回权威 0,不会回落到 COPY
+    /// 前的旧 `Image.size`;直接源资产尺寸尚未注入时仍走
+    /// `INFO_ASSET_SIZE` 的 VM 解析重试(DIV-GFX-024)。
+    ///
+    /// 失效:任何显式尺寸写入(`CG[ID SX/SY]`、`CGACT[SIZE/RESIZE]`、
+    /// `CG[FILE]` 换图)与层重建都会清成 `None`;层删除随对象消失。
+    /// `SWAP` 不交换矩形(官方只换纹理/位置/属性),保持原值。
+    ///
+    /// 证据:0.495 `FUN_0042f809` 在 COPY/COPY2 动作后无条件写目标
+    /// `+0x78/+0x7c = X2-X+1 / Y2-Y+1`(0x4305f4/0x4305fe;单层路径
+    /// 0x42fa0a/0x42fa14),`CGINFO[SX/SY]` 直接读该矩形(0x43d86d/0x43d87d)。
+    pub display_rect: Option<CopyId>,
     /// `CG[FILE=""]` 的 1×1 符号表面被**整层** `RECTPAINT*` 改写后的实色
     /// (RGBA)。`Some` = 该层表面是均匀色,渲染器不再按 `texture` 的 1×1
     /// 黑绘制;文本基面也用这个颜色。区域填充仍走 `ImageOp`,不改本字段。

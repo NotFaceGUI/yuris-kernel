@@ -14,10 +14,11 @@
 |---|---|---|
 | `RESIZE` 不改层矩形 | 0.495 `FUN_0043c971`：`newW=srcW+X+X2`、`newH=srcH+Y+Y2`，写 `+0x78/+0x7c` | `cgact_image` 命令时刻更新 `LayerKind::Image.size`；`ImageOp.resize_base` 冻结回放基数；回归 `resize_updates_layer_rect_for_cginfo`。DIV-GFX-089 |
 | `CG[FILE=""]` 对已存在层保留旧矩形 | 0.486 `FUN_0042b144(EAX=层, EDX=名)`：空串 → `FUN_0040c5f4` 无条件写 1×1；非空 → `FUN_0040c7c5` 按新图重建 | `apply_cg_inner` 换图分支：空串重置 1×1；资产换图按新图尺寸（未知则置空，由 `asset_sizes` 回退）；回归 `empty_file_on_existing_layer_resets_rect_to_1x1`。DIV-GFX-060/085 |
+| `COPY/COPY2` 目标矩形被旧显式尺寸遮住 | 0.495 `FUN_0042f809` 动作后无条件写目标 `+0x78/+0x7c = X2-X+1 / Y2-Y+1`（0x4305f4/0x4305fe；单层 0x42fa0a/0x42fa14）；`CGINFO[SX/SY]` 读该矩形（0x43d86d/0x43d87d） | `Layer.display_rect: Option<CopyId>` 记来源，查询/命中按 `display_rect → Image.size → 纹理/资产`；显式尺寸/换图/RESIZE/SIZE/重建清除；绘制仍按 `Image.size`。回归 `copy2_rect_overrides_stale_explicit_size_and_yields_to_new_cg_size` 等 5 条。DIV-GFX-077 §2.4 |
 
 ## 2. 仍 open(按风险排序)
 
-### 2.1 `COPY/COPY2` 目标矩形与 `LayerKind::Image.size`
+### 2.1 `COPY/COPY2` 目标矩形与 `LayerKind::Image.size`（fixed 2026-11-17）
 
 - 官方 `FUN_0042f809` 在动作后**无条件**写目标
   `+0x78/+0x7c = X2-X+1 / Y2-Y+1`。
@@ -42,7 +43,7 @@
 - 当前 `.yst` 源语料未见 `TRIM` 调用（动态脚本未普查），风险中低；
   未凭手册猜公式改状态。
 
-### 2.3 `CGINFO[ONMOUSE*/COLOR]` 的尺寸优先级
+### 2.3 `CGINFO[ONMOUSE*/COLOR]` 的尺寸优先级（fixed 2026-11-17,与 2.1 同修）
 
 - `query_onmouse` 依次取：`layer.image_size()` → `snapshot_sizes` →
   纹理实测 → `asset_sizes`。

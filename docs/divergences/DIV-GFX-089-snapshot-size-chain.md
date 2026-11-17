@@ -116,3 +116,15 @@ pc4089 GOSUB[#=es.SP.RESIZE ...]
 - `SolidBlack1x1` 作为过渡/遮罩取样源时仍按手册呈黑
   (`DIV-GFX-077` 残留);是否应在空目标淡出里改透明,属于后续取证范围。
 - 临时 trace 与变量探针已删除。
+
+## 7. 补记(2026-11-17):COPY 矩形成为 RESIZE 基数
+
+`RESIZE` 的基数一直走 `query_layer_size`(等价官方读目标 `+0x78/+0x7c`)。
+此前 COPY/COPY2 只写 `snapshot_sizes`,而查询先读 `LayerKind::Image.size`,
+所以“局部 COPY 后再 RESIZE”会把 COPY 前的旧显式尺寸当基数。
+
+本次 `Layer.display_rect: Option<CopyId>` 落地后,查询优先级变为
+`display_rect → Image.size → 纹理/资产`;`RESIZE` 的基数随之与官方
+`FUN_0043c971` 一致(读复制后的区域矩形)。回归
+`resize_after_copy_uses_copy_rect_as_base`:800×600 目标局部 COPY 100×50
+后 `RESIZE X=5 X2=5` → 110×50(旧实现为 810×600)。

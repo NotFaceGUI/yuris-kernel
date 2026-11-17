@@ -1086,6 +1086,7 @@ impl GfxState {
                 }),
             },
             texture: TextureRef::Asset(overlay.asset.clone()),
+            display_rect: None,
             fill: None,
             parts: Vec::new(),
             transform: crate::layer::Transform {
@@ -2235,14 +2236,35 @@ impl GfxState {
         // 第三条是 `query_layer_size` 用的同一张表:资产缺失时 VM 会回填
         // 0×0(官方 `CG[FILE=…]` 装载失败后矩形保持 0),这里必须同口径,
         // 否则像素查询会一直报「资产头未注入」而尺寸表里其实已经有答案。
-        let display = layer
-            .image_size()
-            .or_else(|| snapshot.and_then(|id| self.snapshot_sizes.get(&id).copied()))
-            .or(texture_size)
-            .or_else(|| match &texture {
-                TextureRef::Asset(key) => self.asset_sizes.get(key).copied(),
-                _ => None,
-            });
+        let display = if let Some(id) = layer.display_rect {
+            // `COPY/COPY2` 目标的矩形优先于 COPY 前遗留的显式尺寸
+            // (官方 `FUN_0042f809` 动作后无条件写目标 `+0x78/+0x7c`:
+            // 0x4305f4/0x4305fe)。区域尺寸动态解析,资产尺寸晚到仍可回填。
+            match self.snapshot_display_size(id) {
+                Some(size) => Some(size),
+                None => {
+                    // 直接源资产尺寸尚未注入:走 DIV-GFX-024 的 VM 解析重试,
+                    // 而不是把权威矩形当成“无尺寸”。0×0 资产已在
+                    // `asset_sizes` 里时不会走到这里(见 `set_asset_size`)。
+                    if self.snapshot_files.contains_key(&id) {
+                        return Err(error::unimplemented(
+                            error::code::INFO_ASSET_SIZE,
+                            "CGINFO[ONMOUSE*/COLOR] COPY 目标快照的源资产尺寸未注入",
+                        ));
+                    }
+                    None
+                }
+            }
+        } else {
+            layer
+                .image_size()
+                .or_else(|| snapshot.and_then(|id| self.snapshot_sizes.get(&id).copied()))
+                .or(texture_size)
+                .or_else(|| match &texture {
+                    TextureRef::Asset(key) => self.asset_sizes.get(key).copied(),
+                    _ => None,
+                })
+        };
         let Some(display) = display else {
             // 没有表面也没有显式尺寸 = 引擎的 0×0 矩形(与
             // `query_layer_size` 对 `TextureRef::None` 返回 0 同一取证:
@@ -2310,7 +2332,44 @@ impl GfxState {
     }
 
     fn query_layer_size(&self, layer: &Layer, width: bool) -> Result<i64, Diag> {
-        if let Some(s) = layer.group_size().or_else(|| layer.image_size()) {
+        if let Some(s) = layer.group_size() {
+            return Ok(i64::from(if width { s.width } else { s.height }));
+        }
+        // `COPY/COPY2` 目标的显示/命中矩形优先于 COPY 前遗留的显式尺寸。
+        //
+        // 官方 `FUN_0042f809` 在复制动作后**无条件**把目标 `+0x78/+0x7c`
+        // 写成区域尺寸(0x4305f4/0x4305fe),`CGINFO[SX/SY]` 直接读它
+        // (0x43d86d/0x43d87d)。内核把区域尺寸记在 `snapshot_sizes`,旧
+        // `Image.size` 只是绘制缩放;查询若先读 `Image.size` 会把 COPY 前
+        // 的矩形当结果(发布审计 0.3.3 第 1/4 项)。
+        //
+        // 源 0×0(资产尺寸已知为 0×0)返回权威 0:官方此时矩形就是 0,
+        // 不能回落到旧 `Image.size`。直接源资产的尺寸尚未注入时返回
+        // `INFO_ASSET_SIZE`,让 VM 解析图像头回填后重试(下方分支)。
+        if let Some(id) = layer.display_rect {
+            return match self.snapshot_display_size(id) {
+                Some(size) => Ok(i64::from(if width { size.width } else { size.height })),
+                None => {
+                    // 直接源资产尺寸未注入:交给 VM 解析图像头后回填并重试
+                    // (DIV-GFX-024 的同一回退链);否则一次 COPY 后的
+                    // `CGINFO[SX/SY]` 会在真实资产可读时仍返回 0。
+                    // 0×0 资产已在 `asset_sizes` 时不会走到这里。
+                    if let Some(file) = self.snapshot_files.get(&id) {
+                        Err(error::unimplemented(
+                            error::code::INFO_ASSET_SIZE,
+                            format!(
+                                "COPY 目标快照的源资产尺寸尚未注入: {}",
+                                String::from_utf8_lossy(file)
+                            ),
+                        ))
+                    } else {
+                        // 组源/派生快照没有资产键:官方矩形保持 0。
+                        Ok(0)
+                    }
+                }
+            };
+        }
+        if let Some(s) = layer.image_size() {
             return Ok(i64::from(if width { s.width } else { s.height }));
         }
         match &layer.texture {
@@ -2828,6 +2887,8 @@ impl GfxState {
                 frame: frame_idx,
             };
             layer.fill = None;
+            // 影片帧整体重写层表面 ⇒ 旧 COPY 矩形不再描述该层。
+            layer.display_rect = None;
             layer.alpha_aware = info.has_alpha;
             layer.reset_status();
             self.reset_movie_surface(&path);
@@ -2859,6 +2920,7 @@ impl GfxState {
         let layer = Arc::make_mut(&mut node.layer);
         layer.texture = TextureRef::Movie { asset, frame: idx };
         layer.fill = None;
+        layer.display_rect = None;
         layer.alpha_aware = has_alpha;
         self.reset_movie_surface(&path);
     }
@@ -2890,6 +2952,7 @@ impl GfxState {
         layer.movie.take();
         layer.texture = TextureRef::None;
         layer.fill = None;
+        layer.display_rect = None;
         layer.reset_status();
         self.reset_movie_surface(&path);
     }
@@ -3326,7 +3389,7 @@ impl GfxState {
                     .nodes
                     .get_mut(&parsed.path)
                     .expect("group just ensured");
-                apply_layer_params(Arc::make_mut(&mut node.layer), &params, true)
+                apply_layer_params(Arc::make_mut(&mut node.layer), &params, true, None)
             };
             for d in diags {
                 self.push_diag("CG", d);
@@ -3413,6 +3476,10 @@ impl GfxState {
             if let Some(node) = self.nodes.get_mut(&parsed.path) {
                 let layer = Arc::make_mut(&mut node.layer);
                 layer.texture = texture;
+                // 换图 = 新表面:此前的 COPY 矩形随旧表面作废。空串/目录形
+                // 失败面按官方写 1×1,资产按新图尺寸(未知则留给
+                // `asset_sizes` 回退),两条都由 `resets_size` 覆盖。
+                layer.display_rect = None;
                 if resets_size {
                     layer.kind = LayerKind::Image {
                         size: replacement_size,
@@ -3457,12 +3524,20 @@ impl GfxState {
             }
         }
 
+        // 单轴 `SX/SY` 的缺省轴要取 COPY 区域矩形(官方读 `+0x78/+0x7c`
+        // 的当前值),不能取 COPY 前遗留的 `Image.size`。`Some(None)` 保留
+        // “有矩形但当前不可解析”的权威性,避免回落到旧尺寸。
+        let copy_rect = self.nodes.get(&parsed.path).and_then(|n| {
+            n.layer
+                .display_rect
+                .map(|id| self.snapshot_display_size(id))
+        });
         let diags = {
             let node = self
                 .nodes
                 .get_mut(&parsed.path)
                 .expect("layer just ensured");
-            apply_layer_params(Arc::make_mut(&mut node.layer), &params, false)
+            apply_layer_params(Arc::make_mut(&mut node.layer), &params, false, copy_rect)
         };
         for d in diags {
             self.push_diag("CG", d);
@@ -4209,6 +4284,13 @@ impl GfxState {
         if let Some(node) = self.nodes.get_mut(dest) {
             let layer = Arc::make_mut(&mut node.layer);
             layer.texture = TextureRef::Snapshot(copy_id);
+            // 官方 `FUN_0042f809` 在 COPY/COPY2 动作后**无条件**把目标
+            // `+0x78/+0x7c` 写成区域尺寸(0x4305f4/0x4305fe);之后
+            // `CGINFO[SX/SY]`/`ONMOUSE*` 读的就是这个矩形。只记来源,
+            // 查询期按 `snapshot_display_size` 解析(资产晚到可回填);
+            // `LayerKind::Image.size` 仍是绘制缩放,不在这里改
+            // (DIV-GFX-077)。
+            layer.display_rect = Some(copy_id);
             layer.fill = None;
             layer.set_texture_status(match status {
                 OpStatus::Executable => LayerStatus::Executable,
@@ -5084,12 +5166,16 @@ impl GfxState {
                 // 宽度 > 0x2000 报错。执行失败的 RESIZE 不改矩形。
                 if new_w >= 1 && new_h >= 1 && new_w <= 0x2000 {
                     if let Some(node) = self.nodes.get_mut(target.as_ref().unwrap_or(&source)) {
-                        Arc::make_mut(&mut node.layer).kind = LayerKind::Image {
+                        let layer = Arc::make_mut(&mut node.layer);
+                        layer.kind = LayerKind::Image {
                             size: Some(SizeU32 {
                                 width: new_w as u32,
                                 height: new_h as u32,
                             }),
                         };
+                        // RESIZE 写 `+0x78/+0x7c`(官方 `FUN_0043c971`);
+                        // COPY 矩形随之失效,查询改读新显式尺寸。
+                        layer.display_rect = None;
                     }
                 }
             }
@@ -5136,12 +5222,15 @@ impl GfxState {
                             // 只能是整数,`CGINFO[SX/SY]` 读回的也应是这个
                             // 取整后的层尺寸。四舍五入与 `as u32`(截断)在
                             // `.5` 上差 1 像素,选四舍五入以保持面积最接近。
-                            Arc::make_mut(&mut node.layer).kind = LayerKind::Image {
+                            let layer = Arc::make_mut(&mut node.layer);
+                            layer.kind = LayerKind::Image {
                                 size: Some(SizeU32 {
                                     width: w.round() as u32,
                                     height: h.round() as u32,
                                 }),
                             };
+                            // SIZE 写目标矩形后,COPY 矩形不再代表当前层。
+                            layer.display_rect = None;
                         }
                     }
                 }
@@ -5439,6 +5528,7 @@ impl GfxState {
                 size: Some(viewport_to_size(self.config.viewport)),
             },
             texture: TextureRef::None,
+            display_rect: None,
             fill: None,
             parts: Vec::new(),
             transform: Default::default(),
@@ -5479,6 +5569,7 @@ impl GfxState {
             visible: true,
             kind: LayerKind::Group { size: None },
             texture: TextureRef::None,
+            display_rect: None,
             fill: None,
             parts: Vec::new(),
             transform: Default::default(),
@@ -5528,6 +5619,7 @@ impl GfxState {
             visible: true,
             kind: LayerKind::Image { size },
             texture,
+            display_rect: None,
             fill: None,
             parts: Vec::new(),
             transform: Default::default(),
@@ -7484,10 +7576,17 @@ fn hash_pass(h: &mut impl Hasher, pass: &Pass) {
 }
 
 /// 应用 `CG` 属性参数。返回诊断(不直接写 self,避免借用冲突)。
+///
+/// `copy_rect` 是 COPY/COPY2 目标矩形的权威当前值:
+/// - `Some(Some(size))` = 区域矩形已知(单轴 `SX/SY` 的缺省轴取它);
+/// - `Some(None)` = 该层有 COPY 矩形但当前解析不出(源 0×0/资产未注入),
+///   缺省轴不得回落到 COPY 前的旧 `Image.size`;
+/// - `None` = 没有 COPY 矩形,按 `Image.size`/构造默认。
 fn apply_layer_params(
     layer: &mut Layer,
     params: &[(std::rc::Rc<str>, EngineValue, bool)],
     is_group: bool,
+    copy_rect: Option<Option<SizeU32>>,
 ) -> Vec<Diag> {
     let mut diags = Vec::new();
     // 每次属性更新都从“本组参数”重新判定;纹理级状态保留(CGACT 之后仍有效)。
@@ -7933,9 +8032,10 @@ fn apply_layer_params(
         // `LayerKind::Image.size` 缩放 Asset/Snapshot/Movie。旧实现在这里对
         // “非黑图 + 显式尺寸”标 `gfx.image.size.unsupported`,会让
         // `CGACT[SIZE]` 之后的任何 `CG[ID=…]` 属性更新把整层毒化(DIV-GFX-022)。
-        // 现按官方矩形语义直接保存:缺省轴取当前层矩形;新层两轴都没有时
-        // 才用引擎构造默认 1(`FUN_00465730`),并留 recoverable 诊断。
-        let current = layer.image_size();
+        // 现按官方矩形语义直接保存:缺省轴取当前层矩形(COPY 目标取区域
+        // 矩形,其余取 `Image.size`);两轴都没有时才用引擎构造默认 1
+        // (`FUN_00465730`),并留 recoverable 诊断。
+        let current = copy_rect.unwrap_or_else(|| layer.image_size());
         let w = sx.or_else(|| current.map(|s| i64::from(s.width)));
         let h = sy.or_else(|| current.map(|s| i64::from(s.height)));
         match (w, h) {
@@ -7947,6 +8047,9 @@ fn apply_layer_params(
                             height: h,
                         }),
                     };
+                    // 显式尺寸覆盖 COPY 矩形(官方 `CG[SX/SY]` 直接写
+                    // `+0x78/+0x7c`,下一次 INFO 读新值)。
+                    layer.display_rect = None;
                 }
                 _ => diags.push(error::recoverable(
                     error::code::ARG_TYPE,
@@ -7966,6 +8069,8 @@ fn apply_layer_params(
                                 height: h,
                             }),
                         };
+                        // 单轴显式尺寸同样是矩形写入,覆盖 COPY 矩形。
+                        layer.display_rect = None;
                         diags.push(error::recoverable(
                             error::code::IMAGE_SIZE_UNSUPPORTED,
                             "图像层只给 SX/SY 之一:缺省轴按引擎层构造默认 1",

@@ -1080,6 +1080,7 @@ mod tests {
             visible: true,
             kind: LayerKind::Image { size: None },
             texture: TextureRef::Asset(b"cg/bg".to_vec()),
+            display_rect: None,
             fill: None,
             parts: Vec::new(),
             transform: Transform::default(),

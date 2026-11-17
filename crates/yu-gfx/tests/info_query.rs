@@ -1137,6 +1137,530 @@ fn partial_copy2_onmouse_samples_at_region_origin() {
     assert_eq!(out, Value::Int(255), "层内 (10,5) 应采样源资产 (66+10,5)");
 }
 
+/// 任务 01 回归 #1/#2:目标层在 COPY 前已有显式 `SX/SY` 时,`COPY2` 的
+/// 区域矩形必须覆盖它;之后显式 `CG[SX/SY]` 再覆盖 COPY 矩形。
+///
+/// 官方 `FUN_0042f809` 在复制动作后无条件写目标 `+0x78/+0x7c`(0x4305f4/
+/// 0x4305fe),`CGINFO`/`ONMOUSE*` 直接读该矩形。旧实现查询先读
+/// `LayerKind::Image.size` ⇒ 返回 COPY 前的 800×600。
+#[test]
+fn copy2_rect_overrides_stale_explicit_size_and_yields_to_new_cg_size() {
+    struct Probe;
+    impl yu_gfx::TextureSampler for Probe {
+        fn size(&mut self, _t: &yu_gfx::TextureRef) -> Option<yu_gfx::SizeU32> {
+            Some(yu_gfx::SizeU32 {
+                width: 800,
+                height: 600,
+            })
+        }
+        fn sample(&mut self, _t: &yu_gfx::TextureRef, _x: i64, _y: i64) -> Option<[u8; 4]> {
+            Some([0, 0, 0, 255])
+        }
+    }
+
+    let table = table();
+    let mut gfx = state();
+    gfx.set_asset_size(
+        b"big",
+        yu_gfx::SizeU32 {
+            width: 800,
+            height: 600,
+        },
+    );
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SRC")),
+                arg(&table, "CG", "FILE", s("big")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                // 任务书原场景:目标已有**资产图 + 显式 800×600**。
+                arg(&table, "CG", "FILE", s("big")),
+                arg(&table, "CG", "SX", i(800)),
+                arg(&table, "CG", "SY", i(600)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "ID2", s("DST")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+                arg(&table, "CGACT", "X", i(10)),
+                arg(&table, "CGACT", "Y", i(20)),
+                arg(&table, "CGACT", "X2", i(109)),
+                arg(&table, "CGACT", "Y2", i(69)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let info = |gfx: &yu_gfx::GfxState, flag: &str| {
+        q(
+            gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("DST")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(
+        info(&gfx, "SX"),
+        Value::Int(100),
+        "COPY 后矩形 = 区域宽(含端点)"
+    );
+    assert_eq!(
+        info(&gfx, "SY"),
+        Value::Int(50),
+        "COPY 后矩形 = 区域高(含端点)"
+    );
+
+    // 绘制尺寸仍是 COPY 前的显式 800×600(DIV-GFX-077 的取舍:区域矩形
+    // 不写进 `Image.size`,否则会把源合图压扁)。
+    let frame = gfx.frame();
+    let dst = frame
+        .layers
+        .iter()
+        .find(|l| l.id.as_bytes().ends_with(b"DST"))
+        .expect("DST layer in frame");
+    assert_eq!(
+        dst.image_size(),
+        Some(yu_gfx::SizeU32 {
+            width: 800,
+            height: 600
+        }),
+        "COPY 区域矩形不能改写绘制缩放尺寸"
+    );
+
+    // 命中矩形 = 100×50:层在 (0,0),(99,49) 命中,(100,50) 越界。
+    gfx.set_pointer(99, 49);
+    let mut probe = Probe;
+    let hit = gfx
+        .query_info_with(
+            "CGINFO",
+            &[
+                arg(&table, "CGINFO", "ID", s("DST")),
+                arg(&table, "CGINFO", "ONMOUSE2", i(1)),
+            ],
+            Some(&mut probe),
+        )
+        .expect("CGINFO[ONMOUSE2] hit");
+    assert_eq!(hit, Value::Int(255));
+    gfx.set_pointer(100, 50);
+    let miss = gfx
+        .query_info_with(
+            "CGINFO",
+            &[
+                arg(&table, "CGINFO", "ID", s("DST")),
+                arg(&table, "CGINFO", "ONMOUSE2", i(1)),
+            ],
+            Some(&mut probe),
+        )
+        .expect("CGINFO[ONMOUSE2] miss");
+    assert_eq!(miss, Value::Int(-1), "(100,50) 已在 COPY 矩形外");
+
+    // COPY 后的显式尺寸重新覆盖矩形(官方 `CG[SX/SY]` 写 +0x78/+0x7c)。
+    gfx.consume_events(&[
+        frame_start(2),
+        call(
+            2,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                arg(&table, "CG", "SX", i(200)),
+                arg(&table, "CG", "SY", i(150)),
+            ],
+        ),
+        frame_end(2),
+    ]);
+    assert_eq!(info(&gfx, "SX"), Value::Int(200));
+    assert_eq!(info(&gfx, "SY"), Value::Int(150));
+    gfx.set_pointer(199, 149);
+    let hit = gfx
+        .query_info_with(
+            "CGINFO",
+            &[
+                arg(&table, "CGINFO", "ID", s("DST")),
+                arg(&table, "CGINFO", "ONMOUSE2", i(1)),
+            ],
+            Some(&mut probe),
+        )
+        .expect("CGINFO[ONMOUSE2] 200x150 hit");
+    assert_eq!(hit, Value::Int(255));
+    gfx.set_pointer(200, 150);
+    let miss = gfx
+        .query_info_with(
+            "CGINFO",
+            &[
+                arg(&table, "CGINFO", "ID", s("DST")),
+                arg(&table, "CGINFO", "ONMOUSE2", i(1)),
+            ],
+            Some(&mut probe),
+        )
+        .expect("CGINFO[ONMOUSE2] 200x150 miss");
+    assert_eq!(miss, Value::Int(-1));
+}
+
+/// 任务 01 回归(单轴 `CG SX`):缺省轴取 COPY 区域矩形,不是 COPY 前的
+/// 旧 `Image.size`(官方 `CG[SX]` 只写 `+0x78`,`+0x7c` 保持 COPY 后的 50)。
+#[test]
+fn single_axis_cg_size_after_copy_keeps_other_axis_from_copy_rect() {
+    let table = table();
+    let mut gfx = state();
+    gfx.set_asset_size(
+        b"big5",
+        yu_gfx::SizeU32 {
+            width: 800,
+            height: 600,
+        },
+    );
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SRC")),
+                arg(&table, "CG", "FILE", s("big5")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(800)),
+                arg(&table, "CG", "SY", i(600)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "ID2", s("DST")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+                arg(&table, "CGACT", "X", i(0)),
+                arg(&table, "CGACT", "Y", i(0)),
+                arg(&table, "CGACT", "X2", i(99)),
+                arg(&table, "CGACT", "Y2", i(49)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                arg(&table, "CG", "SX", i(200)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let info = |flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("DST")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info("SX"), Value::Int(200));
+    assert_eq!(
+        info("SY"),
+        Value::Int(50),
+        "缺省轴取 COPY 矩形 50,不是旧 Image.size 600"
+    );
+}
+
+/// 任务 01 回归 #3:全幅 `COPY2`(无区域)的目标矩形 = 源表面尺寸,
+/// 即使目标层 COPY 前有别的显式尺寸。
+#[test]
+fn full_copy2_rect_is_source_surface_size() {
+    let table = table();
+    let mut gfx = state();
+    gfx.set_asset_size(
+        b"wide",
+        yu_gfx::SizeU32 {
+            width: 320,
+            height: 200,
+        },
+    );
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SRC")),
+                arg(&table, "CG", "FILE", s("wide")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(1)),
+                arg(&table, "CG", "SY", i(1)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "ID2", s("DST")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let info = |flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("DST")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info("SX"), Value::Int(320));
+    assert_eq!(info("SY"), Value::Int(200));
+}
+
+/// 任务 01 回归 #5:从局部快照再整幅复制,显示尺寸不双重换算
+/// (源链按 `snapshot_display_size` 解析,不把快照区域当源表面尺寸二次裁剪)。
+#[test]
+fn nested_copy2_of_partial_snapshot_keeps_display_size() {
+    let table = table();
+    let mut gfx = state();
+    gfx.set_asset_size(
+        b"big2",
+        yu_gfx::SizeU32 {
+            width: 200,
+            height: 100,
+        },
+    );
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SRC")),
+                arg(&table, "CG", "FILE", s("big2")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "ID2", s("A")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+                arg(&table, "CGACT", "X", i(50)),
+                arg(&table, "CGACT", "Y", i(10)),
+                arg(&table, "CGACT", "X2", i(149)),
+                arg(&table, "CGACT", "Y2", i(59)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("B")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("A")),
+                arg(&table, "CGACT", "ID2", s("B")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let info = |id: &str, flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s(id)),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info("A", "SX"), Value::Int(100));
+    assert_eq!(info("A", "SY"), Value::Int(50));
+    assert_eq!(info("B", "SX"), Value::Int(100), "整幅嵌套不变成 200");
+    assert_eq!(info("B", "SY"), Value::Int(50), "整幅嵌套不变成 100");
+}
+
+/// 任务 01 回归(RESIZE 基数):`COPY2` 后 `RESIZE` 的基数取 COPY 矩形
+/// (官方 `FUN_0043c971` 读目标 `+0x78/+0x7c`),不是 COPY 前的旧显式尺寸。
+#[test]
+fn resize_after_copy_uses_copy_rect_as_base() {
+    let table = table();
+    let mut gfx = state();
+    gfx.set_asset_size(
+        b"big3",
+        yu_gfx::SizeU32 {
+            width: 800,
+            height: 600,
+        },
+    );
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SRC")),
+                arg(&table, "CG", "FILE", s("big3")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(800)),
+                arg(&table, "CG", "SY", i(600)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "ID2", s("DST")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+                arg(&table, "CGACT", "X", i(0)),
+                arg(&table, "CGACT", "Y", i(0)),
+                arg(&table, "CGACT", "X2", i(99)),
+                arg(&table, "CGACT", "Y2", i(49)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("DST")),
+                arg(&table, "CGACT", "RESIZE", i(1)),
+                arg(&table, "CGACT", "X", i(5)),
+                arg(&table, "CGACT", "X2", i(5)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let info = |flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("DST")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info("SX"), Value::Int(110), "基数 100 + X 5 + X2 5");
+    assert_eq!(info("SY"), Value::Int(50), "Y/Y2 缺省 0,基数 50");
+}
+
+/// `CGEND` 删层后同名重建:COPY 矩形不能残留(矩形随层对象消失)。
+#[test]
+fn copy_rect_does_not_survive_cgend_and_recreate() {
+    let table = table();
+    let mut gfx = state();
+    gfx.set_asset_size(
+        b"big4",
+        yu_gfx::SizeU32 {
+            width: 264,
+            height: 18,
+        },
+    );
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SRC")),
+                arg(&table, "CG", "FILE", s("big4")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("SRC")),
+                arg(&table, "CGACT", "ID2", s("DST")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+                arg(&table, "CGACT", "X", i(66)),
+                arg(&table, "CGACT", "X2", i(131)),
+            ],
+        ),
+        call(1, "CGEND", vec![arg(&table, "CGEND", "ID", s("DST"))]),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("DST")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(30)),
+                arg(&table, "CG", "SY", i(20)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let info = |flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("DST")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info("SX"), Value::Int(30));
+    assert_eq!(info("SY"), Value::Int(20));
+}
+
 /// 不存在的层:尺寸/像素探测按官方中性值返回,不再制造
 /// `gfx.info.missing` UNIMP(按钮 MASK/SLIDER 的可选层每帧探测会刷屏)。
 #[test]

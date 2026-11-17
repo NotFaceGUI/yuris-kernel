@@ -15364,3 +15364,67 @@ load_system_fonts: 163.4ms faces=248 catalog=127
   - 两份 README 的目录锚点与相对链接逐一核对（`#overview/#support/#todo`、
     `#简介/#支持范围/#待办` 等均与标题一致）。
 - 本轮未执行任何 git 写操作,等待主人审阅。
+
+## 成果 COPY-RECT-SPLIT (2026-11-17) · COPY/COPY2 显示矩形与绘制表面分离
+
+- 根因:`cgact_copy` 只写 `snapshot_sizes`,`LayerKind::Image.size` 保留
+  COPY 前的显式尺寸;`CGINFO[SX/SY]`/`ONMOUSE*` 先读 `Image.size`
+  ⇒ 局部复制后查询/命中拿到过期矩形(发布审计 0.3.3 第 1/4 项)。
+- 官方锚点(0.495 `yu-ris.exe` sha256 `4f5eefa3…`):
+  - `FUN_0042f809` 入口算 `X2-X+1 / Y2-Y+1`(0x42f85f–0x42f876);
+  - 双层路径动作后无条件写目标 `+0x78/+0x7c`(0x4305f4/0x4305fe);
+    单层路径同型(0x42fa0a/0x42fa14);
+  - COPY 属性块(0x08)不复制尺寸字段;RECTPAINT 家族例外,用源层尺寸
+    (0x43041e–0x430433);
+  - `CGINFO[SX/SY]` 直接读 `+0x78/+0x7c`(0x43d86d/0x43d87d)。
+  - 本次本机无 0.486 exe(只有 0.292/0.466/0.479/0.495 SDK),0.486 以
+    实机回归为准,文档已如实标注。
+- 实现:
+  - `Layer` 新增 `display_rect: Option<CopyId>`,只记来源;查询期用
+    `snapshot_display_size` 动态解析(资产尺寸晚到仍可回填;0×0 源返回
+    权威 0,不回落到旧 `Image.size`)。
+  - `query_layer_size`/`query_onmouse` 优先级改为
+    `组尺寸 → display_rect → Image.size → 纹理/资产`;
+    `display_rect` 的源资产尺寸未注入时仍走 `INFO_ASSET_SIZE` 的 VM
+    解析重试(DIV-GFX-024)。
+  - `cgact_copy` 在 Copy/Copy2 可执行路径写 `dest.display_rect`;
+    `CG[ID SX/SY]`(含单轴)、`CGACT[SIZE/RESIZE]`、`CG[FILE]` 换图、
+    `YMV` 表面重写与层重建清空;`SWAP` 不交换矩形;`CGEND` 随层消失。
+  - 绘制/后端零改动:`LayerKind::Image.size` 仍是表面缩放尺寸,
+    `snapshot_sizes`/`snapshot_regions`/`snapshot_display_size` 不改
+    (DIV-GFX-077 的源尺寸快照取舍)。
+- 回归(`crates/yu-gfx/tests/info_query.rs`,新增 6 条):
+  - `copy2_rect_overrides_stale_explicit_size_and_yields_to_new_cg_size`
+    (800×600 目标 + 局部 100×50;SX/SY=100/50;ONMOUSE (99,49) 命中、
+    (100,50)=-1;随后 `CG[SX=200 SY=150]` 回到 200×150;同时断言
+    `Image.size` 仍为 800×600,证明绘制尺寸未被区域矩形改写);
+  - `single_axis_cg_size_after_copy_keeps_other_axis_from_copy_rect`
+    (`CG[SX=200]` 缺省轴取 COPY 矩形 50,不是旧 `Image.size` 600);
+  - `full_copy2_rect_is_source_surface_size`(320×200);
+  - `nested_copy2_of_partial_snapshot_keeps_display_size`(100×50);
+  - `resize_after_copy_uses_copy_rect_as_base`(100×50 + X/X2=5 → 110×50);
+  - `copy_rect_does_not_survive_cgend_and_recreate`(30×20)。
+- 验证:
+  - `cargo test -p yu-gfx` → 全绿(各 suite `0 failed`;info_query 28 passed);
+  - `cargo test -p yu-backend-soft` → 全绿;
+  - `cargo test -p yu-backend-wgpu` → 39 passed(plan_scaling 0 passed,
+    1 ignored,该用例人工量化用);
+  - `cargo build --workspace --all-targets` → 通过。环境注记:本机
+    `libmimalloc-sys` 的 cc 构建把 `C:\Users\鬼\.cargo\...` 绝对路径写进
+    `mimalloc-static.cc`,cl.exe 在 CP936 下把 `鬼` 变成 `楝?` 导致
+    C1083;本轮把该 crate 复制到 ASCII 临时路径并用命令行
+    `--config 'patch.crates-io.libmimalloc-sys.path=…'` 完成验证,
+    临时副本已删除。本任务未编辑 Cargo.toml/Cargo.lock;构建时 Cargo
+    自动把并行工作线新增的 `yu-movie-android` 成员补进 `Cargo.lock`,
+    该差异与影片后端相关文件同属并行工作线,不随本成果提交。
+- 台账:`DIV-GFX-077` 增 §2.4(最终口径与嵌套 COPY 残余)、
+  `DIV-GFX-089` 增 §7(COPY 矩形成为 RESIZE 基数)。
+- 实机(0.486 样本 `光翼戦姫エクスティアコンチェルト4`):
+  - headless 600 帧:标题屏渲染正常;`gfx.info.unsupported` 0 次,
+    仅 1 个既有 `asset.missing`(前端按钮缺图,与本修复无关);
+  - desktop 标题屏:鼠标移到 CONFIG(约 278,415)后该行出现
+    选中/高亮态(前后截图对比),ONMOUSE 命中链路工作;该次运行
+    `gfx.info.unsupported` 0 次。
+  - 局部快照的查询矩形由上述单测覆盖;实机未单独保留 trace 探针
+    (临时 PNG/JSON/日志已删除)。
+- 本轮未执行任何 git 写操作,等待主人审阅。

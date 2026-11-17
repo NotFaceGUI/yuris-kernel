@@ -62,6 +62,44 @@ ERIS 按钮用 `CGINFO[ID=$off SX=1 LET=@BT.SX]`(`es_Button.yst:2657`)
 矩形查询;绘制仍按源尺寸快照(区域在 `(0,0)`,其余透明)。见 PROGRESS
 「成果 BT-HOVER」。
 
+### 2.4 最终口径(2026-11-17):显示/命中矩形与表面尺寸分离
+
+0.495 REA 复核(`FUN_0042f809`,0x42f809):
+
+- 入口无条件算区域 `local_2c = X2-X+1`、`local_28 = Y2-Y+1`
+  (0x42f85f–0x42f876);
+- 双层路径(COPY/COPY2)动作后把**目标层** `+0x78/+0x7c` 写成
+  `local_2c/local_28`(0x4305f4/0x4305fe);COPY 的属性块
+  (0x08,0x43060d 起)不复制尺寸字段;
+- 单层路径同型写 `+0x78/+0x7c`(0x42fa0a/0x42fa14);
+- 例外:RECTPAINT/2/3 家族在双层路径改用源层尺寸
+  (0x43041e–0x430433),与 COPY 无关;
+- `CGINFO[SX/SY]` 直接读 `+0x78/+0x7c`(0x43d86d/0x43d87d);
+- 全幅复制由调用方把 `X2/Y2` 填成源宽高−1 ⇒ 矩形 = 源表面尺寸
+  (与 EVID-T-11 微场景一致)。
+
+内核最终口径:
+
+- `Layer.display_rect: Option<CopyId>` 只记**来源**(最近一次 COPY/COPY2
+  的快照 id),查询期用 `snapshot_display_size` 动态解析区域矩形;
+  `LayerKind::Image.size` 仍是后端绘制缩放尺寸,二者不合并。
+- 查询优先级:组尺寸 → `display_rect` → `Image.size` → 纹理/资产尺寸;
+  `CGINFO[ONMOUSE*/COLOR]` 同序。解析失败(0×0 源)返回权威 0/−1,
+  不回落到 COPY 前的旧 `Image.size`。
+- 失效:`CG[ID SX/SY]`(含单轴)、`CGACT[SIZE/RESIZE]`、`CG[FILE]` 换图、
+  `YMV` 表面重写与层重建都会清 `display_rect`;`SWAP` 不交换矩形
+  (官方只换纹理/位置/属性),保持原值。
+- 单轴 `CG[SX/SY]`:缺省轴取**当前显示矩形**(COPY 矩形优先),不取
+  COPY 前的旧 `Image.size`(官方只写 `+0x78`/`+0x7c` 中给定的那一轴)。
+  回归 `single_axis_cg_size_after_copy_keeps_other_axis_from_copy_rect`。
+- **绘制仍按源尺寸快照**:局部 COPY 的块在目标 `(0,0)`,其余透明;
+  不把区域矩形写进 `Image.size`,避免把源合图压扁(§2.1 的 18×18
+  状态标 + 后续 `SIZE X=0 X2=50` 仍按 54×18 表面近似无缩放裁剪)。
+- 残余:官方同一执行体按区域尺寸重新分配目标表面;内核保留源尺寸
+  表面。若脚本把区域坐标写到“超出显示矩形但仍在源表面内”的边界
+  (当前语料未见),内核按显示矩形夹取,与官方按区域表面夹取不同。
+  该边界用法待实际样本再取证,不在本次混改。
+
 ## 3. 修复
 
 1. **表面实色模型**:`Layer.fill: Option<[u8;4]>`。整层
