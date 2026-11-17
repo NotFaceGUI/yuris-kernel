@@ -15558,6 +15558,18 @@ load_system_fonts: 163.4ms faces=248 catalog=127
   `nativeMovieCodecs`;`crates/yu-platform/README.md` 增加新 crate;
   `crates/yu-cli/README.md` 补 `--movie-backend`。
 
+## 成果 README-BETA-SERIES (2026-11-17) · README 版本线改按官方 BETA 2/3/4 归档,5xx 标注第三方
+
+- 版本描述按官方系列划分（README 不引用外部归档仓库作为依据）：
+  BETA 2 = 0.255（0.55）；BETA 3 = 0.276 样本、0.292（0.92）；
+  BETA 4 = 0.450–0.495。
+- 5xx 改为「第三方魔改引擎，不属官方系列」，不写社团名；
+  `README.md` / `README.zh-CN.md` 的支持范围表与简介同步。
+- 版本标签（shields badge）改为 BETA 4（0.450–0.495，绿）、BETA 3（0.276–0.292，黄）、
+  BETA 2（0.255，黄）、5xx third-party（灰）。
+- 验证：4 个 shields.io 徽章 URL 均返回 HTTP 200；README 内 `4xx/2xx` 字样已清零。
+- 本轮未执行任何 git 写操作,等待主人审阅。
+
 ## 成果 TRIM-EVIDENCE (2026-11-17) · TRIM 官方执行体定位与 SET 缺失语义修复
 
 - 官方执行体已定位:0.495 `FUN_0043c539`(0x43c539–0x43c8c7,911 B),

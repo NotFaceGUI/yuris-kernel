@@ -9,9 +9,10 @@ The official engine's observable behavior is the single source of truth</p>
 <a href="https://github.com/NotFaceGUI/yuris-kernel/actions/workflows/ci.yml"><img src="https://github.com/NotFaceGUI/yuris-kernel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
 <a href="https://github.com/NotFaceGUI/yuris-kernel/releases"><img src="https://img.shields.io/github/v/release/NotFaceGUI/yuris-kernel?label=release&color=blue" alt="Release"></a>
-<img src="https://img.shields.io/badge/YU--RIS%204xx-0.450--0.495-2ea44f" alt="YU-RIS 4xx">
-<img src="https://img.shields.io/badge/YU--RIS%202xx-adapting-dfb317" alt="YU-RIS 2xx">
-<img src="https://img.shields.io/badge/YU--RIS%205xx-observing-lightgrey" alt="YU-RIS 5xx">
+<img src="https://img.shields.io/badge/YU--RIS%20BETA%204-0.450--0.495-2ea44f" alt="YU-RIS BETA 4">
+<img src="https://img.shields.io/badge/YU--RIS%20BETA%203-0.276--0.292-dfb317" alt="YU-RIS BETA 3">
+<img src="https://img.shields.io/badge/YU--RIS%20BETA%202-0.255-dfb317" alt="YU-RIS BETA 2">
+<img src="https://img.shields.io/badge/YU--RIS%205xx-third--party-lightgrey" alt="YU-RIS 5xx (third-party)">
 <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Android%20%7C%20headless-8250df" alt="Platforms">
 <img src="https://img.shields.io/badge/rust-2021%20edition-orange?logo=rust" alt="Rust">
 </p>
@@ -36,7 +37,8 @@ The official engine's observable behavior is the single source of truth</p>
 
 `yuris-kernel` is a compatible runtime for the YU-RIS engine. The repository contains no official engine code, game data, or save files.
 
-- **Multi-version coverage** — mainline 4xx (0.450–0.495), 2xx adapting, 5xx observing;
+- **Multi-version coverage** — official series: BETA 4 mainline (0.450–0.495),
+  BETA 3 (0.276–0.292) and BETA 2 (0.255) adapting; the third-party 5xx fork is observed;
   27 system-variable ABI tables catalogued (covering 0.255–0.495).
 - **Two render backends** — `soft` (CPU, deterministic reference) and `wgpu` (GPU, primary desktop / Android path).
 - **Multiple hosts** — Windows desktop, headless / local server, browser presentation (debug), Android.
@@ -48,13 +50,14 @@ The official engine's observable behavior is the single source of truth</p>
 
 ### Engine versions
 
-The mainline is 4xx; 2xx is adapting; 5xx is observing.
+Official releases are organized into BETA 2 / BETA 3 / BETA 4 series; 5xx is a third-party modified engine, not an official series.
 
-| Line | Status           | Notes                                                                                                                                                                                        |
-| ---- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2xx  | Adapting         | 0.292 SDK: 91 commands / 482 system variables; plus the 0.255 table (539 variables); YSTB V2 lacks real samples                                                                              |
-| 4xx  | Available (main) | 0.466 / 0.479 / 0.495: 100 / 104 / 119 commands, 513 / 526 / 548 system variables; 0.450 / 0.460 / 0.470 / 0.480 / 0.490 spot-checked on real games, 0.481 / 0.486 / 0.494 / 0.495 accepted |
-| 5xx  | Observing        | v500 packs are readable (no upper bound on the YPF version field); v555 has only partial side-channel observations, system variables inferred from the 0.495 family prefix                   |
+| Series | Status             | Notes                                                                                                                                                                                        |
+| ------ | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| BETA 2 | Adapting           | 0.255 (0.55): 539 system variables catalogued; YSTB V2 lacks real samples                                                                                                                    |
+| BETA 3 | Adapting           | 0.276 sample; 0.292 (0.92): 91 commands / 482 system variables                                                                                                                               |
+| BETA 4 | Available (main)   | 0.450–0.495: 0.466 / 0.479 / 0.495: 100 / 104 / 119 commands, 513 / 526 / 548 system variables; 0.450 / 0.460 / 0.470 / 0.480 / 0.490 spot-checked on real games, 0.481 / 0.486 / 0.494 / 0.495 accepted |
+| 5xx    | Observing          | Third-party modified engine: v500 packs are readable (no upper bound on the YPF version field); v555 has only partial side-channel observations, system variables inferred from the 0.495 family prefix |
 
 ABI tables for 0.450–0.493 are all catalogued (27 tables, covering 0.255–0.495).
 

@@ -9,9 +9,10 @@
 <a href="https://github.com/NotFaceGUI/yuris-kernel/actions/workflows/ci.yml"><img src="https://github.com/NotFaceGUI/yuris-kernel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
 <a href="https://github.com/NotFaceGUI/yuris-kernel/releases"><img src="https://img.shields.io/github/v/release/NotFaceGUI/yuris-kernel?label=release&color=blue" alt="Release"></a>
-<img src="https://img.shields.io/badge/YU--RIS%204xx-0.450--0.495-2ea44f" alt="YU-RIS 4xx">
-<img src="https://img.shields.io/badge/YU--RIS%202xx-adapting-dfb317" alt="YU-RIS 2xx">
-<img src="https://img.shields.io/badge/YU--RIS%205xx-observing-lightgrey" alt="YU-RIS 5xx">
+<img src="https://img.shields.io/badge/YU--RIS%20BETA%204-0.450--0.495-2ea44f" alt="YU-RIS BETA 4">
+<img src="https://img.shields.io/badge/YU--RIS%20BETA%203-0.276--0.292-dfb317" alt="YU-RIS BETA 3">
+<img src="https://img.shields.io/badge/YU--RIS%20BETA%202-0.255-dfb317" alt="YU-RIS BETA 2">
+<img src="https://img.shields.io/badge/YU--RIS%205xx-third--party-lightgrey" alt="YU-RIS 5xx（第三方）">
 <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Android%20%7C%20headless-8250df" alt="Platforms">
 <img src="https://img.shields.io/badge/rust-2021%20edition-orange?logo=rust" alt="Rust">
 </p>
@@ -36,8 +37,9 @@
 
 `yuris-kernel` 是 YU-RIS 引擎的兼容运行时，仓库不包含官方引擎代码、游戏数据或存档。
 
-- **多版本覆盖** —— 主线 4xx（0.450–0.495），2xx 适配中，5xx 观察中；
-  27 张系统变量 ABI 表已入册（覆盖 0.255–0.495）。
+- **多版本覆盖** —— 官方系列分为 BETA 2 / BETA 3 / BETA 4：
+  BETA 4 主线（0.450–0.495），BETA 3（0.276–0.292）/ BETA 2（0.255）适配中；
+  第三方 5xx 魔改分支观察中；27 张系统变量 ABI 表已入册（覆盖 0.255–0.495）。
 - **双渲染后端** —— `soft`（CPU，确定性参考）与 `wgpu`（GPU，桌面 / Android 主路径）。
 - **多宿主** —— Windows 桌面、headless / 本地服务、浏览器呈现（调试）、Android。
 - **汉化与存档** —— `original` / `gbk` / `big5` / `tunnel` 四条文本路线；
@@ -48,13 +50,14 @@
 
 ### 引擎版本
 
-当前主线是 4xx；2xx 适配中；5xx 观察中。
+官方版本分为 BETA 2 / BETA 3 / BETA 4 三个系列；5xx 是第三方魔改引擎，不属于官方系列。
 
-| 版本线 | 状态         | 说明                                                                                                                                                            |
-| ------ | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2xx    | 适配中       | 0.292 SDK：91 命令 / 482 系统变量；另有 0.255 表（539 变量）；YSTB V2 缺真实样本                                                                                |
-| 4xx    | 可用（主线） | 0.466 / 0.479 / 0.495：100 / 104 / 119 命令，513 / 526 / 548 系统变量；0.450 / 0.460 / 0.470 / 0.480 / 0.490 抽样实机通过，0.481 / 0.486 / 0.494 / 0.495 实机验收 |
-| 5xx    | 观察中       | v500 封包可读（YPF 版本字段无上限）；v555 仅有旁线局部观察，系统变量按 0.495 族前缀推断                                                                          |
+| 系列 | 状态         | 说明                                                                                                                                                            |
+| ---- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| BETA 2 | 适配中     | 0.255（0.55）：539 系统变量表已入册；YSTB V2 缺真实样本                                                                                                          |
+| BETA 3 | 适配中     | 0.276 样本；0.292（0.92）：91 命令 / 482 系统变量                                                                                                                |
+| BETA 4 | 可用（主线） | 0.450–0.495：0.466 / 0.479 / 0.495：100 / 104 / 119 命令，513 / 526 / 548 系统变量；0.450 / 0.460 / 0.470 / 0.480 / 0.490 抽样实机通过，0.481 / 0.486 / 0.494 / 0.495 实机验收 |
+| 5xx    | 观察中       | 第三方魔改引擎：v500 封包可读（YPF 版本字段无上限）；v555 仅有旁线局部观察，系统变量按 0.495 族前缀推断                                                          |
 
 0.450–0.493 各版本的 ABI 表已全部入册（27 张，覆盖 0.255–0.495）。
 
