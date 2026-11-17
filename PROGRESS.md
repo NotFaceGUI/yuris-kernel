@@ -15720,38 +15720,44 @@ yu-cli run <project-0495> --frames 600 --shot …
 - 0.255 样本包不含图像/音频资产,标题视觉需借用同版官方资产验证;格式/运行核
   本身已由 0.292(含资产)与 0.255(含资产临时工程)双证。
 
-## 成果 RELEASE-NOTES-HEADER (2026-11-17) · Release 正文固定头与分组 emoji
+## 成果 RELEASE-NOTES-HEADER (2026-11-17) · Release 正文支持/下载徽章表与分组 emoji
 
-- 改动:`tools/release/release_notes.py` 正文最前面固定输出支持版本范围
-  (`SUPPORT_RANGE`:BETA 4 主线 0.450–0.495;BETA 3 适配中 0.276–0.292;
-  BETA 2 适配中 0.255)与构建平台(`BUILD_PLATFORMS`:Windows x64、
-  Android arm64-v8a/x86_64 + universal);分组标题加 emoji
+- 改动:`tools/release/release_notes.py` 正文开头生成两张固定表:
+  「支持范围」(`SUPPORTED_VERSIONS`:BETA 4 0.450–0.495 主线可用;BETA 3
+  0.276–0.292 / BETA 2 0.255 适配中)把范围与状态合成两段式 shields.io 徽章
+  (灰范围 + 绿/黄状态),「下载」里 Windows 便携包、Android universal APK
+  用同款徽章并链接 release 资产,另附 arm64-v8a/x86_64 瘦包与 so/许可证链接;
+  本地拿不到仓库链接时只留徽章与产物名,不生成死链。分组标题带 emoji
   (💥 破坏性 / 🚀 feat / 🐛 fix / ⚡ perf / ♻️ refactor / 📝 docs /
   ✅ test / 🔧 build / 👷 ci / 🧹 chore / 💄 style / ⏪ revert / 📦 其他)。
+- 徽章文案里的非 ASCII 做百分号编码;`-`/`_` 双写、空格转 `_`。
 - 事实来源 README「支持范围」表;workflow checkout 的是 tag 本身,
   旧 tag 重新发布沿用当时的常量。
-- 测试:`HeaderTests` 覆盖固定头前两行、空区间保留头、全部类型 emoji 齐全与渲染。
-- 文档:`docs/release.md` 补固定头说明与 emoji 分组表。
-- `tools/release/rehearse_workflow.sh` 同步检查固定头与 emoji 标题;Git Bash 的
+- 测试:`HeaderTests` 覆盖两张表/顺序/空区间/徽章行,`DownloadTests`
+  覆盖徽章逃逸、非 ASCII 编码、release 资产链接与无仓库链接回退。
+- 文档:`docs/release.md` 补两张表与 emoji 分组说明。
+- `tools/release/rehearse_workflow.sh` 同步检查两张表与 emoji 标题;Git Bash 的
   GNU grep 3.0 在 `C.UTF-8` 下匹配不了 4 字节 emoji,检查统一加 `LC_ALL=C` 按字节比较。
-- 样例(不入库):`.release/notes-sample.md`。
+- 样例(不入库):`.release/notes-sample.md`;渲染预览 `.release/preview.png`。
 
 ### 原始结果
 
 ```text
 python tools/release/test_release_notes.py -v
-  Ran 23 tests in 12.388s
+  Ran 27 tests in 13.699s
   OK
 ```
 
 ```text
 PY=python bash tools/release/rehearse_workflow.sh
   版本一致: v0.2.0 == Cargo.toml 0.2.0
-  已写入 .release\notes.md (509 字节)
+  已写入 .release\notes.md (1209 字节)
   [dry-run] 将检查 Release v0.2.0（正式）：不存在则 create，已存在则 edit
   ===== generated notes =====
-  **支持版本**：YU-RIS BETA 4（0.450–0.495，主线）· BETA 3（0.276–0.292，适配中）· BETA 2（0.255，适配中）
-  **构建平台**：Windows x64（yu-cli / yu-serve）· Android（arm64-v8a / x86_64，另附 universal 通用包）
+  ## 支持范围
+  | YU-RIS BETA 4 | ![0.450–0.495 主线可用](https://img.shields.io/badge/…-2ea44f?style=flat-square) |
+  ## 下载
+  | Windows x64 | ![Portable x64](https://img.shields.io/badge/Portable-x64-007ec6?style=flat-square) |
   ### 💥 破坏性变更 / ### 🐛 修复 (fix)
   ===== rehearsal OK =====
   退出码 0
@@ -15760,8 +15766,7 @@ PY=python bash tools/release/rehearse_workflow.sh
 ```text
 python tools/release/release_notes.py notes --repo <demo> --tag v0.4.0 \
   --repo-url https://github.com/NotFaceGUI/yuris-kernel
-  → 首行「**支持版本**：…」、次行「**构建平台**：…」,随后「## 更新内容」
-    与 emoji 分组;写入 .release/notes-sample.md (2230 字节)
+  → 两张表 + emoji 分组;写入 .release/notes-sample.md (3464 字节)
 ```
 
 - 本轮未执行任何 git 写操作。
