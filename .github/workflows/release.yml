@@ -133,6 +133,7 @@ jobs:
           Copy-Item "target/release/yu-cli.exe"  $stage
           Copy-Item "target/release/yu-serve.exe" $stage
           Copy-Item "README.md" $stage
+          Copy-Item "README.zh-CN.md" $stage
           Copy-Item "LICENSE"   $stage
           Copy-Item "NOTICE"    $stage
           Copy-Item "THIRD-PARTY-NOTICES.md" $stage

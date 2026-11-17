@@ -15348,3 +15348,19 @@ load_system_fonts: 163.4ms faces=248 catalog=127
   - `cargo test -p yu-gfx`、`cargo test -p yu-backend-soft` 全绿;
   - 0.486 样本实机 1614 帧未再出现 `gfx.info.unsupported`。
 - 本轮未执行任何 git 写操作,等待主人审阅。
+
+## 成果 README-BILINGUAL (2026-11-17) · README 英文默认 + 中文分册,仓库 About 双语
+
+- `README.md` 改为英文全文（默认展示），原中文内容迁至 `README.zh-CN.md`；
+  两份文件顶部各加语言切换（`English` ↔ `简体中文`），锚点与相对链接随文迁移。
+- release 打包同步附带中文 README：`.github/workflows/release.yml` 的
+  Windows stage 增加 `Copy-Item "README.zh-CN.md" $stage`。
+- GitHub About 描述改为英中双语（`gh repo edit --description`）：
+  `YU-RIS compatible runtime kernel aligned to the official engine: pack parsing,
+  script VM, soft/wgpu rendering, translation text and saves — YU-RIS 引擎兼容运行时
+  内核：封包解析、脚本执行与渲染逐步对齐官方引擎，支持汉化文本与统一编码`。
+- 验证：
+  - `gh repo view NotFaceGUI/yuris-kernel --json description` → 双语描述已生效；
+  - 两份 README 的目录锚点与相对链接逐一核对（`#overview/#support/#todo`、
+    `#简介/#支持范围/#待办` 等均与标题一致）。
+- 本轮未执行任何 git 写操作,等待主人审阅。
