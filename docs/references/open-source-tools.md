@@ -14,6 +14,7 @@
 | [fengberd/YuRISTools](https://github.com/fengberd/YuRISTools) | 见仓库 | YU-RIS 工具集 | 脚本/封包辅助对照 |
 | [jyxjyx1234/YURIS_TOOLS](https://github.com/jyxjyx1234/YURIS_TOOLS) | 见仓库 | 汉化工具包 | 文本提取/回写流程、编码处理 |
 | [shimamura-sakura/yuri](https://github.com/shimamura-sakura/yuri) | Rust | Yu-Ris 反编译/编译器(并行、增量) | 命令语义与结构化反编译思路;可与我们的 yu-script/yu-rt 对照 |
+| [shimamura-sakura/yuris_decompiler](https://github.com/shimamura-sakura/yuris_decompiler) | Python/**MIT** | 0.247–0.494;V2/V5;YPF、YSCM、YSER、YSTD、YSLB、YSTL、YSVR;含官方 0.255 样本 | **V2 首选参考**:完整 decompile/recompile;`InsTyqV200/V300` 的 `$@`/`&$`/`&@` 映射按 MIT 算法级采用(出处已注明);0.255/0.488/0.494 实测 |
 | [crskycode/YPF_Tool](https://github.com/crskycode/YPF_Tool) | 见仓库 | YPF 创建 | 打包器行为对照(与我们已实证布局互证) |
 | [Xorboth/YPF-Manager](https://github.com/Xorboth/YPF-Manager) | 见仓库 | YPF 解包/重打包 | 索引遍历与重打包实践 |
 | [dreamsavior/ypf-repacker](https://github.com/dreamsavior/ypf-repacker) | 见仓库 | YPF 重打包 | 同族对照 |
@@ -54,7 +55,7 @@
 |---|---|---|
 | YPF 索引/打包 | `docs/formats/ypf.md`(本仓库实证) → YPF_Tool / YPF-Manager / ypf-repacker / Script-Editor `core/ypf.py` | 我们的布局以官方 YSPac 包为准;工具仅用于交叉验证"别人怎么解释" |
 | YSTB V5 | RxYuris `YSTB.cpp`;Script-Editor `core/ystb.py` | V5 分段异或已实证;对比文本段/参数段的读写序 |
-| YSTB **V2**(旧版本游戏) | Script-Editor `core/ystb.py`(README 明示 V2/V5) | 尚无 V2 真实样本——引入时先找语料再实现,禁止臆造 |
+| YSTB **V2**(旧版本游戏) | `yuris_decompiler`(MIT) + Script-Editor `core/ystb.py` | 已用官方 0.292/0.255 两套语料实现并逐字节验证;`$@`/`&$` 映射按 `yuris_decompiler` 的 `InsTyqV200/V300` 采用(见 DIV-013) |
 | 密钥恢复(换 key) | YurisKeyFinder;RxYuris `YSTB_GuessXorKey`;Script-Editor 自检测 | 只作策略参考;失败一律显式报错/挂账 |
 | 文本提取/回写 | Script-Editor(导出纯文本/三行对照)、YURIS_TOOLS | 用于生成"文本↔字节"对拍语料;注意编码(CP932/GBK)边界 |
 | 编码自检测 | Script-Editor(自动编码检测) | 与 `docs/architecture.md` §7 的确定性裁决策略对照;我们要求可复现 |
@@ -81,6 +82,9 @@ README 只列**实际采用/实际参考**的项目；参考但未采用的不�
 - **RxYuris**(ZQF-ReVN): YSTB/YSCM/YSTL 解析流程、YSCOM Loader
 - **YU-RIS-Script-Editor**(Aionfatedio): YSTB V5 段序、V2 版本带判定、编码自检测
   （未声明许可，仅事实参考，未复制代码）
+- **yuris_decompiler**(shimamura-sakura, **MIT**): V2 表达式类型限定符
+  `InsTyqV200/V300`(`$@`/`&$`/`&@`)映射、V2/V5 结构事实;算法级采用,
+  `crates/yu-rt` 的 V2 `$@` 读取分支按此实现(未逐字复制源码)
 - **YU-RIS_Guide**(TheVNConnoisseur): 官方工具与 SDK 全量归档(81 个官方 SDK)。
   本仓库 27 张系统变量 ABI 表与全部 `YSCom.ycd` 语料取自该归档,每张表头记录
   来源 sha256 与 `# covers` 版本区间(`crates/yu-rt/data/sysvar-abi-*.tsv`)。
@@ -109,17 +113,19 @@ YPF_Tool、YPF-Manager、ypf-repacker、YurisKeyFinder 等。
 | `scripts/audit_hardcode.py` | 本仓库(原创) | A5 零硬编码守卫 | 自有 |
 
 未采用:`shimamura-sakura/yuri` 的反编译结构(本任务只做运行核,未涉及反编译);
-`YU-RIS-Script-Editor` 的 V2 支路(未引入 V2 语料)。
+`YU-RIS-Script-Editor` 的 V2 支路代码(已转向 MIT 的 `yuris_decompiler` 作
+V2 事实/算法来源,见 §6)。
 
 ## 6. 实际采用登记(yu-format,成果 B2)
 
 > 以下为**实际采用**的条目(算法/流程/形态);一切行为真值以官方产物实测为准,
-> 与笔记/参考实现冲突处见 `docs/divergences/DIV-005/006/007/008`。
+> 与笔记/参考实现冲突处见 `docs/divergences/DIV-005/006/007/008/010..016`。
 
 | 采用处 | 来源 | 采用内容 | 验证方式 |
 |---|---|---|---|
 | `crates/yu-format/src/ystb.rs` | RxYuris `lib/YurisStaticLibrary/YSTB.cpp` | `YSTB_Coder::Xor` 分段异或语义(四段各自从密钥下标 0 重启)、`YSTB_V5::Init` 三段索引解析流程 | 136 个官方 YSTB 全量解码 + 回封逐字节一致 |
 | `crates/yu-format/src/ystb.rs` | YU-RIS-Script-Editor `core/ystb.py` | `_parse_v5` 段序/`_decrypt` 结构、V2 版本带判定(200<v<300)、`M` 引号串载荷形态 | 语料实测 + 合成单测(V2 → `Unimplemented`,DIV-007) |
+| `crates/yu-format/src/ystb.rs`(V2) | `yuris_decompiler` `fileformat.py` / `decompiler.py`(**MIT**) | V2 两段布局/6 字节指令头/12 字节窗口、`RETURNCODE` 定长、`InsTyqV200/V300` 的 `$@`/`&$`/`&@` 映射 | 官方 0.292(112 脚本/20,117 指令)+ 0.255(96/16,351)全量闭合、原字节回写;DIV-007/012/013 |
 | `crates/yu-format/src/yscm.rs` | RxYuris `YSCM.cpp` | 记录流解析流程(名\0 + argc + 参数名\0 + 2×u8)、尾段 37 消息 + 0x100 附表 | 11,156 字节官方 ysc.ybn 精确闭合 |
 | `crates/yu-format/src/ystl.rs` | RxYuris `YSTL.cpp`(`YSTL_V5`) | 记录尾五 u32 字段定性(时间戳×2 + 变量/标签/文本计数)——旁线"脚本文件号"解释被数据否定(DIV-005) | 141 条清单 ↔ 136 文件 ↔ ysl 三方一致 |
 | `crates/yu-format/src/codec/auto.rs` | YU-RIS-Script-Editor `core/encoding.py` | "双编码严格解码 + 字符构成统计"思路;裁决公式/平局规则为本仓库重造(A3 确定性,缺省 CP932) | 日/中样本判定 + 确定性断言 |

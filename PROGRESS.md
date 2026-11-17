@@ -15600,3 +15600,168 @@ load_system_fonts: 163.4ms faces=248 catalog=127
   BLUR→TRIM→BLUR5),资产级 alpha bbox 会取到加工前边界;需同步
   CPU 表面回放或后端回报 + 同 tick 时序取舍。未凭猜测实现。
 - 本轮未执行任何 git 写操作,等待主人审阅。
+
+## 成果 L-1 (2026-11-17) · 低版本 YSTB V2(0.255/0.292)格式+运行核全链路
+
+- 目标:官方 0.292 / 0.255 语料在 `<repo>` 内核跑到标题;4xx/5xx 行为不变。
+- 语料:<corpus-0292>(119 `.ybn`/112 YSTB)、<corpus-0255>(103/96)、
+  <sample-0255>(官方 0.255 YPF,103 条)。缺样本的测试显式 skip 并计数。
+- 证据锚点:官方 0.292 `yu-ris.exe` sha256 `72628dfa…`
+  (`FUN_00437da9` YSTB 走查、`FUN_0043f3a4` YSCF、`FUN_0043f5d0` YSLB)、
+  两套官方 ysc/ysl/ysv/yst_list/yst/yse/yscfg 逐字节。
+
+### 1. 改动
+
+- `crates/yu-format/src/ystb.rs`:V2 两段解码、6 字节指令头、12 字节窗口、
+  按 ysc 名识别 RETURNCODE(4/8 字节)、IF/ELSE/LOOP 偏移→pc、合成 V5 视图、
+  原字节回写、`v2_code_offsets`。
+- `crates/yu-format/src/yscf.rs`:新增 `V292`(宽高 +0x14/+0x18、标题 +0x40)
+  与 `V255`(标题 +0x30)布局;四候选结构唯一裁决;短布局安全切片。
+- `crates/yu-format/src/code.rs`:新增 `fmt.ybn.layout`。
+- `crates/yu-engine/src/keys.rs`:V2 结构自举(全零/默认/旧键/+0x2C/首行启发式;
+  多候选通过=失败);样本带版本号。
+- `crates/yu-rt/src/tables.rs`:`parse_with_table`、`YscmTable.format`、
+  V2 标签 `field_b` 偏移→pc(装载期预读)、`pc_for_code_offset`/`code_offset_at`。
+- `crates/yu-rt/src/vm.rs`:V2 `0x23` = `$@` 的读取分支(按脚本版本)。
+- `crates/yu-rt/src/vm/handlers.rs`:CGINFO 资产尺寸回退接受 `NO` 槽。
+- `crates/yu-gfx/src/state.rs`:2xx 参数名别名(CG/CGEND/CGINFO/CGACT 的
+  `NO→IDNO`、`NO2/NO3`、`TNO→TIDNO`;FONT/FONTINFO 的 `SIZE↔SX/SY`);
+  `MENU/MENUEND` 菜单层状态;V255 探测序由宿主显式注入的接线。
+- `crates/yu-engine/src/engine.rs` + `yu-gfx`:`GfxConfig::with_image_probe_order`。
+- 测试:`crates/yu-format/tests/corpus_v2.rs`、`crates/yu-rt/tests/corpus_v2.rs`、
+  `yu-vfs/tests/real_sample.rs::v255_pack_walks_and_closes`、keys/yscf 单测。
+- 文档:DIV-007/009 fixed;新增 DIV-010..016;README/参考档案致谢。
+
+### 2. 原始结果
+
+```text
+cargo test -p yu-format -p yu-rt -p yu-engine -p yu-vfs
+  yu-engine 50 + 4 + 1 + 2 passed
+  yu-format 47 + 1 + 2 + 1 + 1 + 1 + 23 + 2 passed
+  yu-rt    109 + 4 + 11 + 4 + 3 + 125 + 3 passed
+  yu-vfs   54 + 15 + 2 + 2 + 6 passed
+  0 failed
+```
+
+```text
+cargo test -p yu-format --test corpus_v2
+  0.292:112 YSTB / 20,117 指令 / 2,590 控制目标 / 1,189 标签 / 回写一致
+  0.255: 96 YSTB / 16,351 指令 / 2,279 控制目标 / 1,026 标签 / 回写一致
+cargo test -p yu-rt --test corpus_v2
+  3 passed(表装载/标签换 pc/全脚本投影/错键拒绝)
+```
+
+```text
+cargo build --workspace --all-targets
+  Finished dev profile … (本机需 ASCII CARGO_HOME;见 §4)
+```
+
+0.292(6 参数,800×600,无 Fatal/Unimplemented):
+
+```text
+identity: game="ERIS Ver0.92" yuris=0.292
+frames ticked: 600 (stop: frame limit, limit 600)
+frame: 604 viewport: 800x600
+layers: 33 (visible 9), passes: 6
+ops: 13 total, 12 drawn, 1 skipped
+missing assets: 0; text runs (not rasterized): 0
+UNIMP=0 Fatal=0
+```
+
+0.255(YPF 直接作工程根,显式旧键;包内只有 ysbin):
+
+```text
+identity: game="ERIS Ver0.55" yuris=0.255
+frames ticked: 600 (stop: frame limit, limit 600)
+frame: 603 viewport: 800x600
+layers: 24 (visible 8), passes: 1
+ops: 7 total, 2 drawn, 5 skipped(资产不在包内)
+UNIMP=0 Fatal=0
+```
+
+0.255 补同版官方标题资产(临时工程根,不入库)后:
+
+```text
+frame: 603 viewport: 800x600
+layers: 24 (visible 8), passes: 1
+ops: 7 total, 7 drawn, 0 skipped
+missing assets: 0
+UNIMP=0 Fatal=0
+```
+
+0.495 回归:
+
+```text
+cargo test -p yu-format -p yu-rt ... → 全绿(corpus_eris 1 passed)
+yu-cli run <project-0495> --frames 600 --shot …
+  layers: 244 (visible 15), passes: 2, ops: 13/13
+  PNG 与改动前基线 md5 完全一致:0a1e0118eb9b292a882f5f235c68ca48
+  UNIMP=1(EMOTE deferred(master),既有基线)
+```
+
+### 3. 结论
+
+- 0.292/0.255 均跑到标题画面(0.255 需补同版官方标题资产;样本包本身只有 ysbin)。
+- V2 格式层 208 个 YSTB 全部闭合、控制目标/标签全部换算、原字节回写一致。
+- 4xx/5xx 语料回归逐字节不变;0.495 标题截图 hash 不变。
+
+### 4. 环境注记
+
+- 本机 `cargo build`/`cargo test` 的 `libmimalloc-sys` 默认路径
+  (`C:\Users\<非 ASCII>\.cargo\...`)在 MSVC CP936 下报 C1083;用
+  `CARGO_HOME` 指向 ASCII 路径的目录联接( junction)后通过。该问题与
+  本次代码无关;`yu-cli --no-default-features` 也可绕开。
+- 本轮未执行任何 git 写操作。
+
+### 5. 未解决
+
+- `RETURNCODE` 的 0.290 8 字节形态无语料,只保留结构、不声称语义(DIV-012)。
+- `MENUACT`/`MENUINFO` 暂无宿主状态机(MENU/MENUEND 已落地;样本启动链只用 MENU)。
+- 0.255 样本包不含图像/音频资产,标题视觉需借用同版官方资产验证;格式/运行核
+  本身已由 0.292(含资产)与 0.255(含资产临时工程)双证。
+
+## 成果 RELEASE-NOTES-HEADER (2026-11-17) · Release 正文固定头与分组 emoji
+
+- 改动:`tools/release/release_notes.py` 正文最前面固定输出支持版本范围
+  (`SUPPORT_RANGE`:BETA 4 主线 0.450–0.495;BETA 3 适配中 0.276–0.292;
+  BETA 2 适配中 0.255)与构建平台(`BUILD_PLATFORMS`:Windows x64、
+  Android arm64-v8a/x86_64 + universal);分组标题加 emoji
+  (💥 破坏性 / 🚀 feat / 🐛 fix / ⚡ perf / ♻️ refactor / 📝 docs /
+  ✅ test / 🔧 build / 👷 ci / 🧹 chore / 💄 style / ⏪ revert / 📦 其他)。
+- 事实来源 README「支持范围」表;workflow checkout 的是 tag 本身,
+  旧 tag 重新发布沿用当时的常量。
+- 测试:`HeaderTests` 覆盖固定头前两行、空区间保留头、全部类型 emoji 齐全与渲染。
+- 文档:`docs/release.md` 补固定头说明与 emoji 分组表。
+- `tools/release/rehearse_workflow.sh` 同步检查固定头与 emoji 标题;Git Bash 的
+  GNU grep 3.0 在 `C.UTF-8` 下匹配不了 4 字节 emoji,检查统一加 `LC_ALL=C` 按字节比较。
+- 样例(不入库):`.release/notes-sample.md`。
+
+### 原始结果
+
+```text
+python tools/release/test_release_notes.py -v
+  Ran 23 tests in 12.388s
+  OK
+```
+
+```text
+PY=python bash tools/release/rehearse_workflow.sh
+  版本一致: v0.2.0 == Cargo.toml 0.2.0
+  已写入 .release\notes.md (509 字节)
+  [dry-run] 将检查 Release v0.2.0（正式）：不存在则 create，已存在则 edit
+  ===== generated notes =====
+  **支持版本**：YU-RIS BETA 4（0.450–0.495，主线）· BETA 3（0.276–0.292，适配中）· BETA 2（0.255，适配中）
+  **构建平台**：Windows x64（yu-cli / yu-serve）· Android（arm64-v8a / x86_64，另附 universal 通用包）
+  ### 💥 破坏性变更 / ### 🐛 修复 (fix)
+  ===== rehearsal OK =====
+  退出码 0
+```
+
+```text
+python tools/release/release_notes.py notes --repo <demo> --tag v0.4.0 \
+  --repo-url https://github.com/NotFaceGUI/yuris-kernel
+  → 首行「**支持版本**：…」、次行「**构建平台**：…」,随后「## 更新内容」
+    与 emoji 分组;写入 .release/notes-sample.md (2230 字节)
+```
+
+- 本轮未执行任何 git 写操作。

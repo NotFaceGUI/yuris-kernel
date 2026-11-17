@@ -314,6 +314,9 @@ cargo test --workspace
   YSCOM Loader。
 - [YU-RIS-Script-Editor](https://github.com/Aionfatedio/YU-RIS-Script-Editor) —
   YSTB V5 段序、V2 版本带判定、编码自检测；未声明许可，仅事实参考，未复制代码。
+- [yuris_decompiler](https://github.com/shimamura-sakura/yuris_decompiler) —
+  V2 表达式类型限定符映射（`$@` / `&$` / `&@`）与 V2/V5 结构事实；MIT，
+  算法级采用并注明出处（未逐字复制源码）。
 - [YURIS_TOOLS](https://github.com/jyxjyx1234/YURIS_TOOLS) — 汉化文本流程与
   隧道码点分配算法。
 

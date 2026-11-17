@@ -289,6 +289,9 @@ The repository ships no game data. Tests that need missing samples explicitly `S
 - [RxYuris](https://github.com/ZQF-ReVN/RxYuris) — YSTB / YSCM / YSTL parsing flow, YSCOM loader.
 - [YU-RIS-Script-Editor](https://github.com/Aionfatedio/YU-RIS-Script-Editor) —
   YSTB V5 segment order, V2 version-band detection, encoding auto-detection; no license declared, used as facts only, no code copied.
+- [yuris_decompiler](https://github.com/shimamura-sakura/yuris_decompiler) —
+  V2 expression type-qualifier mapping (`$@` / `&$` / `&@`) and V2/V5 structural facts;
+  MIT, algorithm-level adoption with attribution (no source copied verbatim).
 - [YURIS_TOOLS](https://github.com/jyxjyx1234/YURIS_TOOLS) — translation text workflow and tunnel codepoint allocation algorithm.
 
 ## Related repositories
