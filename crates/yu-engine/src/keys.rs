@@ -57,6 +57,11 @@ pub enum KeySource {
     Default,
     /// 本仓库补充:exe 字面量的 `CRC32`(工具未用此路线)。
     ExeScan { path: PathBuf, text: String },
+    /// V2(200 < version < 300)结构自举:候选键逐个过完整 V2 走查。
+    ///
+    /// `label` 是候选来源(诊断用);V2 的 RETURNCODE opcode 随 ysc 表变化,
+    /// 因此校验必须带命令表(见 `yu_format::ystb::Segments::decrypt_with_table`)。
+    V2Probe { label: &'static str },
 }
 
 impl KeySource {
@@ -72,6 +77,7 @@ impl KeySource {
                 "exe-scan:{}:{text}",
                 path.file_name().unwrap_or_default().to_string_lossy()
             ),
+            KeySource::V2Probe { label } => format!("v2-probe:{label}"),
         }
     }
 }
@@ -128,12 +134,15 @@ impl ScriptKey {
 /// 用于取钥/验证的样本脚本。
 struct Sample {
     data: Vec<u8>,
+    /// `YSTB` 头版本(255/292/495…;V2 判定用)。
+    version: u32,
 }
 
 impl Project {
     /// 解析本作的脚本密钥。
     ///
-    /// 顺序:显式 → RxYuris 首窗口 → Script-Editor 投票 → 默认值 → exe 兜底。
+    /// 顺序:显式 → V2 结构自举(版本 200<v<300)或 V5 的
+    /// RxYuris 首窗口 → Script-Editor 投票 → 默认值 → exe 兜底。
     /// 每个候选都过结构自检;全部失败显式报错(不静默用错钥启动)。
     pub fn resolve_script_key(
         &self,
@@ -146,13 +155,33 @@ impl Project {
             });
         }
 
-        let (samples, command_count) = self.load_key_samples()?;
+        let (samples, command_count, table) = self.load_key_samples()?;
         if samples.is_empty() {
             // 没有脚本可验:保持默认值(缺表/缺脚本会在 boot 阶段显式报错)。
             return Ok(ScriptKey {
                 bytes: DEFAULT_KEY_BYTES,
                 source: KeySource::Default,
             });
+        }
+
+        let v2 = samples
+            .iter()
+            .filter(|sample| yu_format::ystb::is_v2(sample.version))
+            .count();
+        if v2 > 0 {
+            if v2 != samples.len() {
+                return Err(Failure::runtime(format!(
+                    "脚本样本混合 V2/V5 版本({v2}/{}),无法用同一密钥族裁决",
+                    samples.len()
+                )));
+            }
+            let Some(table) = table.as_ref() else {
+                return Err(Failure::runtime(
+                    "V2 取钥需要 `ysbin/ysc.ybn` 命令表(按名识别 RETURNCODE);\
+                     表缺失或解析失败",
+                ));
+            };
+            return resolve_v2_key(&samples, table);
         }
 
         if let Some(bytes) = rx_yuris_key(&samples)
@@ -186,8 +215,10 @@ impl Project {
         ))
     }
 
-    /// 取验证样本(按解压大小取前 4,跳过超大文件)与命令表条数。
-    fn load_key_samples(&self) -> Result<(Vec<Sample>, Option<usize>), Failure> {
+    /// 取验证样本(按解压大小取前 4,跳过超大文件)、命令条数与命令表。
+    fn load_key_samples(
+        &self,
+    ) -> Result<(Vec<Sample>, Option<usize>, Option<yu_format::yscm::CommandTable>), Failure> {
         let source = self.open_source()?;
         let dir = LookupKey::new(b"ysbin", CODEC)
             .map_err(|d| Failure::runtime(format!("构造 ysbin 键失败: {d}")))?;
@@ -210,16 +241,26 @@ impl Project {
                 continue;
             };
             if let Ok(data) = source.open(&key) {
-                samples.push(Sample { data });
+                let version = if data.len() >= 8 && &data[..4] == b"YSTB" {
+                    u32::from_le_bytes(data[4..8].try_into().unwrap())
+                } else {
+                    0
+                };
+                samples.push(Sample { data, version });
             }
         }
 
-        let command_count = LookupKey::new(b"ysbin/ysc.ybn", CODEC)
+        let ysc_bytes = LookupKey::new(b"ysbin/ysc.ybn", CODEC)
             .ok()
             .and_then(|key| source.open(&key).ok())
-            .filter(|data| data.len() >= 12 && &data[..4] == b"YSCM")
+            .filter(|data| data.len() >= 12 && &data[..4] == b"YSCM");
+        let command_count = ysc_bytes
+            .as_ref()
             .map(|data| u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize);
-        Ok((samples, command_count))
+        let table = ysc_bytes
+            .as_deref()
+            .and_then(|data| yu_format::yscm::CommandTable::parse(data, b"ysbin/ysc.ybn").ok());
+        Ok((samples, command_count, table))
     }
 
     /// exe 字面量兜底。
@@ -257,6 +298,112 @@ impl Project {
         }
         None
     }
+}
+
+/// V2(200 < version < 300)密钥结构自举。
+///
+/// 候选(全部过**完整 V2 走查**,不是只看首窗口):
+/// 全零、默认 `D3 6F AC 96`、旧键 `07 B4 02 4A`、样本 `+0x2C` 的 u32
+/// (RxYuris 路线)、首条指令行号启发式(`line ^ 1..=3`,行号通常从 1 起)。
+///
+/// **多个候选同时通过 = 不唯一 = 失败**(不猜密钥)。
+fn resolve_v2_key(
+    samples: &[Sample],
+    table: &yu_format::yscm::CommandTable,
+) -> Result<ScriptKey, Failure> {
+    let mut candidates: Vec<([u8; 4], KeySource)> = Vec::new();
+    let push = |bytes: [u8; 4], source: KeySource, out: &mut Vec<([u8; 4], KeySource)>| {
+        if !out.iter().any(|(key, _)| *key == bytes) {
+            out.push((bytes, source));
+        }
+    };
+    push(
+        [0u8; 4],
+        KeySource::V2Probe { label: "zero" },
+        &mut candidates,
+    );
+    push(DEFAULT_KEY_BYTES, KeySource::Default, &mut candidates);
+    push(
+        [0x07, 0xB4, 0x02, 0x4A],
+        KeySource::V2Probe {
+            label: "legacy-07b4024a",
+        },
+        &mut candidates,
+    );
+    if let Some(sample) = samples.first() {
+        let data = &sample.data;
+        if data.len() >= 0x30 {
+            push(
+                [data[0x2C], data[0x2D], data[0x2E], data[0x2F]],
+                KeySource::V2Probe {
+                    label: "header-0x2c",
+                },
+                &mut candidates,
+            );
+        }
+        // 首条指令头 +0x20:op, argc, line(u32 @ +0x22)。
+        if data.len() >= 0x26 {
+            let line_cipher = u32::from_le_bytes([data[0x22], data[0x23], data[0x24], data[0x25]]);
+            for line in 1..=3u32 {
+                push(
+                    (line_cipher ^ line).to_le_bytes(),
+                    KeySource::V2Probe {
+                        label: "first-line",
+                    },
+                    &mut candidates,
+                );
+            }
+        }
+    }
+
+    let mut passed: Vec<([u8; 4], KeySource)> = Vec::new();
+    for (key, source) in &candidates {
+        let all_ok = samples.iter().all(|sample| {
+            yu_format::ystb::Segments::decrypt_with_table(
+                &sample.data,
+                key,
+                table,
+                b"key-probe",
+            )
+            .is_ok()
+        });
+        if all_ok {
+            passed.push((*key, source.clone()));
+        }
+    }
+    match passed.len() {
+        1 => {
+            let (bytes, source) = passed.pop().expect("长度 1");
+            Ok(ScriptKey { bytes, source })
+        }
+        0 => Err(Failure::runtime(format!(
+            "V2 密钥自举失败:{} 个候选全部未通过结构走查({})",
+            candidates.len(),
+            candidates
+                .iter()
+                .map(|(key, source)| format!("{}={}", hex4(key), source.describe()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+        _ => Err(Failure::runtime(format!(
+            "V2 密钥不唯一:{} 个候选同时通过结构走查({}),拒绝猜测",
+            passed.len(),
+            passed
+                .iter()
+                .map(|(key, source)| format!("{}={}", hex4(key), source.describe()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// 4 字节密钥的十六进制(诊断用)。
+fn hex4(bytes: &[u8; 4]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// RxYuris `YSTB_Coder::GetXorKey`(V5 分支):
@@ -503,7 +650,106 @@ mod tests {
     fn sample(key: [u8; 4]) -> Sample {
         Sample {
             data: synthetic_script(key),
+            version: 495,
         }
+    }
+
+    /// 最小 V2 命令表:RETURNCODE=0、IF=1、GO=2(下标即 opcode)。
+    fn v2_table(version: u32) -> yu_format::yscm::CommandTable {
+        use yu_format::yscm::Command;
+        let cmd = |name: &str| Command {
+            name: name.into(),
+            argc: 0,
+            args: Vec::new(),
+        };
+        yu_format::yscm::CommandTable {
+            version,
+            commands: vec![cmd("RETURNCODE"), cmd("IF"), cmd("GO")],
+            messages: Vec::new(),
+            key_table: Box::new([0u8; 256]),
+        }
+    }
+
+    /// 最小 V2 脚本:RETURNCODE(4 字节)+ IF(3 窗口,目标=第三条)+ GO。
+    fn synthetic_v2(key: [u8; 4], version: u32) -> Vec<u8> {
+        let xor = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ key[i & 3])
+                .collect::<Vec<u8>>()
+        };
+        let if_at = 10u32;
+        let go_at = if_at + 6 + 36;
+        let mut code = Vec::new();
+        // RETURNCODE:op=0,argc=1,line=7(行号启发式不应命中),4 字节行号 = 1。
+        code.extend_from_slice(&[0, 1, 7, 0, 0, 0]);
+        code.extend_from_slice(&1u32.to_le_bytes());
+        // IF:op=1,argc=3,line=8;窗口 1/2 的 size = 第三条指令的 code 偏移。
+        code.extend_from_slice(&[1, 3, 8, 0, 0, 0]);
+        let window = |id: u16, typ: u8, size: u32| {
+            let mut w = [0u8; 12];
+            w[0..2].copy_from_slice(&id.to_le_bytes());
+            w[2] = typ;
+            w[4..8].copy_from_slice(&size.to_le_bytes());
+            w
+        };
+        code.extend_from_slice(&window(0, 1, 4));
+        code.extend_from_slice(&window(1, 0, go_at));
+        code.extend_from_slice(&window(2, 0, go_at));
+        // GO:op=2,argc=0,line=9。
+        code.extend_from_slice(&[2, 0, 9, 0, 0, 0]);
+        assert_eq!(code.len() as u32, go_at + 6);
+        let expr = [0x42, 1, 0, 1]; // push i8 1
+        let mut out = Vec::new();
+        out.extend_from_slice(b"YSTB");
+        out.extend_from_slice(&version.to_le_bytes());
+        out.extend_from_slice(&(code.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(expr.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(0x20 + code.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0u8; 12]);
+        out.extend_from_slice(&xor(&code));
+        out.extend_from_slice(&xor(&expr));
+        out
+    }
+
+    #[test]
+    fn v2_probe_recovers_legacy_key() {
+        let key = [0x07, 0xB4, 0x02, 0x4A];
+        let table = v2_table(292);
+        let samples = vec![Sample {
+            data: synthetic_v2(key, 292),
+            version: 292,
+        }];
+        let found = resolve_v2_key(&samples, &table).expect("V2 自举应命中旧键");
+        assert_eq!(found.bytes, key);
+        assert!(matches!(found.source, KeySource::V2Probe { .. }));
+    }
+
+    #[test]
+    fn v2_probe_recovers_default_key() {
+        let table = v2_table(292);
+        let samples = vec![Sample {
+            data: synthetic_v2(DEFAULT_KEY_BYTES, 292),
+            version: 292,
+        }];
+        let found = resolve_v2_key(&samples, &table).expect("V2 自举应命中默认键");
+        assert_eq!(found.bytes, DEFAULT_KEY_BYTES);
+    }
+
+    #[test]
+    fn v2_probe_rejects_unknown_key() {
+        let table = v2_table(292);
+        let samples = vec![Sample {
+            data: synthetic_v2([0x11, 0x22, 0x33, 0x44], 292),
+            version: 292,
+        }];
+        let error = resolve_v2_key(&samples, &table).unwrap_err();
+        assert!(
+            error.to_string().contains("V2 密钥自举失败"),
+            "{}",
+            error
+        );
     }
 
     #[test]

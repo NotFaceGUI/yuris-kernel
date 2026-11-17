@@ -129,6 +129,9 @@ pub struct YscmTable {
     pub version: u32,
     pub commands: Vec<CommandDecl>,
     by_name: BTreeMap<String, usize>,
+    /// 原始 `yu-format` 命令表(V2 解码按名识别 `RETURNCODE`;
+    /// 运行核投影不丢字段的例外,只读)。
+    pub format: yu_format::yscm::CommandTable,
 }
 
 impl YscmTable {
@@ -166,6 +169,7 @@ impl YscmTable {
             version: fmt.version,
             commands,
             by_name,
+            format: fmt,
         })
     }
 
@@ -557,10 +561,15 @@ pub struct ScriptFile {
     pool: Vec<u8>,
     /// 数据区 B(旁线:任务 `+0x38` 起按 pc 做 dword 索引 = 源码位置)。
     part4: Vec<u8>,
+    /// V2 的指令起始 code 偏移(升序;下标即 pc)。V5 = 空。
+    code_offsets: Vec<u32>,
 }
 
 impl ScriptFile {
-    /// 解析单个 `yst%05d.ybn`(解密 + 区段自检由 yu-format 完成)。
+    /// 解析单个 `yst%05d.ybn`(V5 路径;解密 + 区段自检由 yu-format 完成)。
+    ///
+    /// V2 需要命令表,请用 [`Self::parse_with_table`];本函数对 V2 返回
+    /// `fmt.ybn.unsupported`(保留"V5 解码器拒绝 V2"的既有语义)。
     pub fn parse(script_id: u32, data: &[u8], key: [u8; 4]) -> Result<Self, yu_log::Diag> {
         let origin = format!("ysbin/yst{script_id:05}.ybn");
         let segs = yu_format::ystb::Segments::decrypt(data, &key, origin.as_bytes())
@@ -568,10 +577,23 @@ impl ScriptFile {
         Self::from_segments(script_id, segs)
     }
 
+    /// 解析单个脚本体(V5 或 V2;`table` 供 V2 按名识别 `RETURNCODE`)。
+    pub fn parse_with_table(
+        script_id: u32,
+        data: &[u8],
+        key: [u8; 4],
+        table: &yu_format::yscm::CommandTable,
+    ) -> Result<Self, yu_log::Diag> {
+        let origin = format!("ysbin/yst{script_id:05}.ybn");
+        let segs = yu_format::ystb::Segments::decrypt_with_table(data, &key, table, origin.as_bytes())
+            .map_err(|d| wrap_table(&origin, d))?;
+        Self::from_segments(script_id, segs)
+    }
+
     /// 从 `yu-format` 的解密区段投影:组/窗口记录、共享池与 part4。
     ///
     /// 结构自检(`Σ window_count × 12 == 参数索引区长度`、非零 type 窗口的
-    /// `offset+size` 边界)已在 `Segments::decrypt` 内完成,这里不再重复。
+    /// `offset+size` 边界)已在 `Segments::decrypt*` 内完成,这里不再重复。
     fn from_segments(
         script_id: u32,
         segs: yu_format::ystb::Segments,
@@ -596,6 +618,7 @@ impl ScriptFile {
             .chunks_exact(12)
             .map(WindowRec::from_bytes)
             .collect();
+        let code_offsets = segs.code_offsets;
         let mut pool = segs.args_data;
         pool.extend_from_slice(&segs.line_numbers);
         Ok(Self {
@@ -606,6 +629,7 @@ impl ScriptFile {
             first_window,
             pool,
             part4: segs.line_numbers,
+            code_offsets,
         })
     }
 
@@ -647,11 +671,35 @@ impl ScriptFile {
     ///
     /// 注意:该区在 0.495 语料里长度等于 part1(实测 137/137
     /// `part4_len == part1_len`),语义为「逐组源码行号/位置」——本仓库
-    /// **只原样提供**,不参与执行语义。
+    /// **只原样提供**,不参与执行语义。V2 的 `part4` = 每指令内联行号。
     pub fn source_position(&self, pc: usize) -> Option<u32> {
         let off = pc * 4;
         let b = self.part4.get(off..off + 4)?;
         Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// 是否为 V2 布局(`200 < version < 300`)。
+    #[must_use]
+    pub fn is_v2(&self) -> bool {
+        yu_format::ystb::is_v2(self.version)
+    }
+
+    /// V2:code 段字节偏移 → 组下标(`None` = 不是指令起点/非 V2)。
+    ///
+    /// 标签表(`ysl.field_b`)与控制流目标在 V2 都是 code 偏移;运行核
+    /// 在装载期就用本映射统一换算,执行期只消费 pc。
+    #[must_use]
+    pub fn pc_for_code_offset(&self, offset: u32) -> Option<u32> {
+        self.code_offsets
+            .binary_search(&offset)
+            .ok()
+            .and_then(|pc| u32::try_from(pc).ok())
+    }
+
+    /// V2:组下标 → code 段字节偏移(`None` = 超界/非 V2;测试与诊断用)。
+    #[must_use]
+    pub fn code_offset_at(&self, pc: usize) -> Option<u32> {
+        self.code_offsets.get(pc).copied()
     }
 }
 
@@ -723,13 +771,19 @@ impl TableSet {
             )
             .map_err(|d| wrap_table("ysc.ybn", d))?,
         )?;
-        let labels = LabelTable::from_format(
+        let mut labels = LabelTable::from_format(
             yu_format::yslb::YslLabels::parse(
                 &read(src, b"ysbin/ysl.ybn", "ysl")?,
                 b"ysbin/ysl.ybn",
             )
             .map_err(|d| wrap_table("ysl.ybn", d))?,
         )?;
+        // V2 的 `ysl.field_b` 是 code 段字节偏移,不是指令下标;装载期
+        // 按脚本预读 code 段(只走指令头)建立偏移集合后统一换算。
+        // 目标不是指令起点 = Fatal(不把偏移当组下标执行)。
+        if yu_format::ystb::is_v2(labels.version) {
+            convert_v2_labels(src, &mut labels, &yscm.format, key)?;
+        }
         let vars = VarImage::from_format(
             yu_format::ysvr::VarDecls::parse(
                 &read(src, b"ysbin/ysv.ybn", "ysv")?,
@@ -813,7 +867,8 @@ impl TableSet {
         if !self.scripts.contains_key(&script_id) {
             let path = format!("ysbin/yst{script_id:05}.ybn");
             let bytes = read(src, path.as_bytes(), "脚本")?;
-            let file = ScriptFile::parse(script_id, &bytes, self.key)?;
+            let file =
+                ScriptFile::parse_with_table(script_id, &bytes, self.key, &self.boot.yscm.format)?;
             self.scripts.insert(script_id, file);
         }
         Ok(self.scripts.get(&script_id).expect("刚刚插入"))
@@ -829,6 +884,46 @@ impl TableSet {
             .map(|p| String::from_utf8_lossy(p).into_owned())
             .unwrap_or_else(|| format!("yst{script_id:05}.ybn"))
     }
+}
+
+/// V2:`ysl.field_b`(code 段字节偏移)→ 组下标。
+///
+/// 标签表在脚本之前解析;这里按 `script_id` 预读 `yst%05d.ybn` 的 code 段
+/// (只走指令头,XOR 后立即释放;不完整解码),建立偏移集合后再统一换算。
+/// 目标偏移不在指令起点 = `table.incomplete` Fatal——不能把偏移当组下标
+/// 执行(那会产生"看似能跑"的错位)。
+fn convert_v2_labels(
+    src: &dyn yu_vfs::DataSource,
+    labels: &mut LabelTable,
+    table: &yu_format::yscm::CommandTable,
+    key: [u8; 4],
+) -> Result<(), yu_log::Diag> {
+    use std::collections::BTreeMap;
+    let mut offsets_by_script: BTreeMap<u16, Vec<u32>> = BTreeMap::new();
+    for label in &mut labels.labels {
+        let script_id = label.script_id;
+        if !offsets_by_script.contains_key(&script_id) {
+            let path = format!("ysbin/yst{script_id:05}.ybn");
+            let bytes = read(src, path.as_bytes(), "标签目标脚本")?;
+            let offsets = yu_format::ystb::v2_code_offsets(&bytes, &key, table, path.as_bytes())
+                .map_err(|d| wrap_table(&path, d))?;
+            offsets_by_script.insert(script_id, offsets);
+        }
+        let offsets = offsets_by_script.get(&script_id).expect("刚刚插入");
+        let pc = offsets.binary_search(&label.pc).map_err(|_| {
+            diag::fatal(
+                code::table::INCOMPLETE,
+                Boundary::Table,
+                format!(
+                    "ysl.ybn: 标签 `{}` 的偏移 {:#x} 不是脚本 {} 的指令起点",
+                    label.name, label.pc, script_id
+                ),
+            )
+            .at_table("ysl.ybn")
+        })?;
+        label.pc = u32::try_from(pc).unwrap_or(u32::MAX);
+    }
+    Ok(())
 }
 
 fn read(src: &dyn yu_vfs::DataSource, path: &[u8], what: &str) -> Result<Vec<u8>, yu_log::Diag> {

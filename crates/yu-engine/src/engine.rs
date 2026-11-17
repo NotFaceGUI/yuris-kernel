@@ -3057,6 +3057,12 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         }
     };
     let mut gfx_config = GfxConfig::new(viewport).with_display(display.clone());
+    // 0.255 的 62 字节 YSCF 短头没有扩展名优先序字段(布局已判定为
+    // "无该字段");此时把宿主自己的探测序**显式注入**,而不是让内核
+    // 在 GfxState 里静默兜底(A5)。V5/V292 仍只认工程 yscfg。
+    if !vm.tables().boot.config.layout.has_image_ext_order() {
+        gfx_config = gfx_config.with_image_probe_order(probe_order.clone());
+    }
     gfx_config.cg_timing = opts.tuning.cg_timing;
     let mut gfx_state = GfxState::from_tables(vm.tables(), gfx_config)
         .map_err(|d| Failure::runtime(format!("GfxState 构造失败: {d}")))?;

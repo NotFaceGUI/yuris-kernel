@@ -22,6 +22,8 @@ pub const YBN_KEY: &str = "fmt.ybn.key";
 pub const YBN_ARGS: &str = "fmt.ybn.args";
 /// 指令序号超出 ysc 命令表范围。
 pub const YBN_OPCODE: &str = "fmt.ybn.opcode";
+/// YSTB 布局不闭合(V2 头字段、控制流目标不在指令起点、段错位)。
+pub const YBN_LAYOUT: &str = "fmt.ybn.layout";
 /// yscfg 字段未通过引擎侧校验(宽高范围、开关取值、标题长度)。
 pub const YSCF_FIELD: &str = "fmt.yscf.field";
 /// ysv 记录的种类/类型字节落在已证集合之外。
@@ -46,6 +48,7 @@ pub const ALL_CODES: &[&str] = &[
     YBN_KEY,
     YBN_ARGS,
     YBN_OPCODE,
+    YBN_LAYOUT,
     YSCF_FIELD,
     YSV_FIELD,
     YSTL_FIELD,

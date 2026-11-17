@@ -2382,6 +2382,17 @@ impl Vm {
         VarRef::new(VarSpace::for_elem(ty), var.id)
     }
 
+    /// 脚本是否为 V2 布局(`200 < version < 300`)。
+    ///
+    /// V2 的变量引用前缀 `0x23` 是 `$@`(数值变量转字符串),与 V300+ 的
+    /// `&$`/旧式字符串空间**同字节不同义**;读取侧按脚本版本分支。
+    #[inline]
+    pub(crate) fn script_is_v2(&self, script_id: u32) -> bool {
+        self.tables
+            .script(script_id)
+            .is_some_and(crate::tables::ScriptFile::is_v2)
+    }
+
     /// 变量的形状(系统变量取工程 ABI 表声明;普通变量取变量域)。
     pub(crate) fn var_shape(&self, var: VarRef) -> Option<(crate::value::ElemType, Vec<usize>)> {
         if var.id < self.sys_count {
@@ -2786,6 +2797,14 @@ impl VarAccess for VmAccess<'_> {
         // (`@G`/`@L`/`$G`/`$L`)按 id 的声明类型归一化、未知前缀挂号继续
         // (DIV-RT-017)。旧写法先无条件调 `canonical_var` 再做一次 matches,
         // 热路径(每帧 ~1.6 万次读)上多一次函数调用。
+        //
+        // V2(200<version<300):前缀 0x23 是 `$@`(数值变量转字符串),
+        // 不是 V300+ 的旧式字符串空间;读值后按字符串返回(ID 的存储类型
+        // 仍由声明决定,转换只作用于本次读取)。
+        // 来源:`yuris_decompiler`(MIT)`InsTyqV200/V300` 的 tyq 映射;
+        // 两套官方语料的 0x23 变量 id 在 ysv 中均为 INT/FLT(见 DIV-013)。
+        let dollar_at =
+            var.space == VarSpace::LegacyStr && self.vm.script_is_v2(self.st.script_id);
         let var = if var.space.is_legacy() {
             self.vm.canonical_var(var)
         } else {
@@ -2803,13 +2822,23 @@ impl VarAccess for VmAccess<'_> {
             ));
         }
         // 引擎 §3.10 结论三:槽位 id < sys_count 走系统变量通路。
-        if var.id < self.vm.sys_count {
-            return crate::sysvar::read(self.vm, self.st, var, indices);
+        let value = if var.id < self.vm.sys_count {
+            crate::sysvar::read(self.vm, self.st, var, indices)?
+        } else {
+            self.vm.store.read(var, indices)?
+        };
+        if dollar_at {
+            Ok(Value::Str(value.to_event_repr().into_bytes()))
+        } else {
+            Ok(value)
         }
-        self.vm.store.read(var, indices)
     }
 
     fn read_scalar_int(&mut self, var: VarRef) -> Result<Option<i64>, Diag> {
+        // V2 的 `$@` 必须走 `read` 的字符串转换;快速整数路径不适用。
+        if var.space == VarSpace::LegacyStr && self.vm.script_is_v2(self.st.script_id) {
+            return Ok(None);
+        }
         let var = if var.space.is_legacy() {
             self.vm.canonical_var(var)
         } else {

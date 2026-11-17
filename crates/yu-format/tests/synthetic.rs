@@ -394,6 +394,8 @@ fn ystb_synthetic_labels_and_windows() {
     }
     let segs = Segments {
         version: 495,
+        layout: ystb::Layout::V5,
+        code_offsets: Vec::new(),
         count: 3,
         inst,
         args_index,
@@ -505,6 +507,8 @@ fn ystb_label_refs_index_by_window_slot() {
     }
     let segs = Segments {
         version: 495,
+        layout: ystb::Layout::V5,
+        code_offsets: Vec::new(),
         count: 1,
         inst: vec![93, 4, 0, 0],
         args_index,
@@ -628,6 +632,8 @@ fn ystb_error_cases() {
     // opcode 越界 → fmt.ybn.opcode
     let segs = Segments {
         version: 495,
+        layout: ystb::Layout::V5,
+        code_offsets: Vec::new(),
         count: 1,
         inst: vec![200, 0, 0, 0],
         args_index: Vec::new(),
@@ -641,6 +647,8 @@ fn ystb_error_cases() {
     // 参数索引区多余字节 → fmt.ybn.args
     let segs = Segments {
         version: 495,
+        layout: ystb::Layout::V5,
+        code_offsets: Vec::new(),
         count: 1,
         inst: vec![0, 0, 0, 0],
         args_index: vec![0u8; 13],

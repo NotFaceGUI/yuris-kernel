@@ -386,3 +386,93 @@ fn sdk_0479_loose_directory_indexes_every_file_including_japanese_names() {
     );
     eprintln!("japanese name ok: {} bytes={}", tip.display(), bytes.len());
 }
+
+// ---------------------------------------------------------------------------
+// 0.255 官方样本包(参考仓库公开的 `example-files` 中的 v255 包)
+// ---------------------------------------------------------------------------
+
+fn sample_v255_ypf() -> Option<PathBuf> {
+    let Some(path) = std::env::var_os("YURIS_SAMPLE_V2_YPF") else {
+        skip("YURIS_SAMPLE_V2_YPF is not set (official 0.255 sample pack)");
+        return None;
+    };
+    let path = PathBuf::from(path);
+    if path.is_file() {
+        Some(path)
+    } else {
+        skip(&format!(
+            "YURIS_SAMPLE_V2_YPF={} does not exist",
+            path.display()
+        ));
+        None
+    }
+}
+
+/// 0.255 包:103 条、`+0x0C` 是**索引块字节数**(相对)而不是绝对 dataStart;
+/// 名字 Adler32 + 负载 Adler32 + `V004` 长度表(`<0x100` 交换表)。
+///
+/// 这直接否证了既有计划里「<265 无哈希」的假设:官方 0.255 样本 103/103
+/// 条名字哈希都是 Adler32(见 PROGRESS 成果 L-1 的勘误)。
+#[test]
+fn v255_pack_walks_and_closes() {
+    let Some(path) = sample_v255_ypf() else {
+        return;
+    };
+    eprintln!("REAL SAMPLE V255 YPF: {}", path.display());
+    let source = YpfSource::open(&path, Codec::Cp932).unwrap();
+    let header = source.header();
+    assert_eq!(header.version, 255, "包版本");
+    assert_eq!(header.entry_count, 103, "条目数");
+    assert_eq!(header.data_start, 0x1083, "索引块结束/首负载偏移");
+    let stats = source.stats();
+    assert!(stats.closed, "索引必须闭合");
+    assert_eq!(stats.parsed_entries, 103);
+    assert_eq!(stats.name_hash_matches, 103, "全量名字哈希命中");
+    assert_eq!(stats.name_key, 0xFF, "名字 XOR key");
+    // V000 与 V004 在 0x13↔0x0D 这一对上一致;两份都是结构合法候选
+    // (候选顺序先 V000),不把"第一个能解析的"当成唯一事实。
+    assert!(
+        matches!(
+            stats.profile.len_map,
+            yu_vfs::ypf::LenMap::V000 | yu_vfs::ypf::LenMap::V004
+        ),
+        "0.255 包必须命中 V000/V004 长度表族"
+    );
+    assert_eq!(stats.profile.name_hash, yu_vfs::ypf::HashAlg::Adler32);
+    assert_eq!(stats.profile.data_hash, yu_vfs::ypf::HashAlg::Adler32);
+    assert_eq!(stats.compressed_entries, 103, "全部条目为 zlib 负载");
+    assert!(
+        matches!(source.dialect(), YpfDialect::Other { .. }),
+        "0.255 不属于已命名的 0.495/v473 方言"
+    );
+    assert_eq!(source.entries().len(), 103);
+    for entry in source.entries() {
+        assert!(
+            entry.name.starts_with(b"ysbin\\"),
+            r"条目名必须以 ysbin\ 开头: {:?}",
+            String::from_utf8_lossy(&entry.name)
+        );
+        assert!(entry.name_hash_ok, "名字哈希必须逐条命中");
+    }
+
+    // 至少一个条目与参考解包逐字节一致(0.255 语料目录本身来自该包)。
+    let ysc = source.open(&key(b"ysbin/ysc.ybn")).unwrap();
+    assert_eq!(&ysc[..4], b"YSCM");
+    let cfg = source.open(&key(b"ysbin/yscfg.ybn")).unwrap();
+    assert_eq!(&cfg[..4], b"YSCF");
+    assert_eq!(cfg.len(), 62, "0.255 的 YSCF 短布局(62 字节)");
+    if let Some(dir) = std::env::var_os("YURIS_SAMPLE_V2_255").map(PathBuf::from) {
+        if dir.is_dir() {
+            assert_eq!(
+                ysc,
+                std::fs::read(dir.join("ysc.ybn")).unwrap(),
+                "ysc.ybn 必须与参考解包逐字节一致"
+            );
+            assert_eq!(
+                cfg,
+                std::fs::read(dir.join("yscfg.ybn")).unwrap(),
+                "yscfg.ybn 必须与参考解包逐字节一致"
+            );
+        }
+    }
+}

@@ -618,8 +618,14 @@ impl Vm {
                     .unwrap_or_else(|| self.eval_arg_windows(st, cmd));
                 self.emit_domain_borrowed(domain, &cmd.name, args);
                 // Graphics/Window 已由同步宿主消费时不再挂号;声音域同理。
+                // 菜单域:MENU/MENUEND 由 gfx 的菜单层状态机消费
+                // (手册 `menu/menu.html`/`menuend.html`);MENUACT/MENUINFO
+                // 尚未接线,仍显式挂号(不按域整体吞掉)。
                 let handled = (self.graphics_host.is_some()
                     && matches!(domain, Domain::Graphics | Domain::Window))
+                    || (self.graphics_host.is_some()
+                        && domain == Domain::Menu
+                        && matches!(cmd.name.as_str(), "MENU" | "MENUEND"))
                     || (self.sound_host.is_some()
                         && domain == Domain::Sound
                         && matches!(cmd.name.as_str(), "SOUND" | "SOUNDEND"))
@@ -4806,7 +4812,9 @@ impl Vm {
                     let slot_of =
                         |want: &str| params.iter().position(|p| p == want).map(|i| i as u8);
                     if let (Some(mfile_slot), Some(id_slot)) = (slot_of("MFILE"), slot_of("ID")) {
-                        let idno_slot = slot_of("IDNO");
+                        // 0.2xx 的图层号参数名是 `NO`(0.4xx+ 才叫 `IDNO`);
+                        // 两代同名语义(见 yu-gfx `alias_legacy_layer_names`)。
+                        let idno_slot = slot_of("IDNO").or_else(|| slot_of("NO"));
                         let mut ask: Vec<ArgValue> = query_args
                             .iter()
                             .filter(|a| a.slot == id_slot || Some(a.slot) == idno_slot)

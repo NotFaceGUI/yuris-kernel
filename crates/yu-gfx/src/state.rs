@@ -112,6 +112,16 @@ impl GfxConfig {
         self
     }
 
+    /// 宿主显式注入资产探测序(链式构造)。
+    ///
+    /// 只用于工程 `yscfg` **没有**该字段的旧布局(如 0.255 的短头):
+    /// `GfxState::from_tables` 仍按 A5 拒绝"无 yscfg 字段且无宿主注入";
+    /// 本方法让宿主把自身已声明的默认序显式交进来,不是内核内置兜底。
+    pub fn with_image_probe_order(mut self, order: Vec<ImageFormat>) -> Self {
+        self.image_probe_order = order;
+        self
+    }
+
     /// 宿主注入 `_DXMODE`(链式构造)。
     pub fn with_dx_mode(mut self, dx_mode: u32) -> Self {
         self.dx_mode = dx_mode;
@@ -200,6 +210,23 @@ struct GlyphChain {
     tint: Option<u32>,
 }
 
+/// 一个菜单层(`MENU[ID=…]`;手册 `menu/menu.html`)。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MenuEntry {
+    /// `NAME`:菜单项名;`Some(空)` = 分隔线(手册)。
+    name: Option<Vec<u8>>,
+    /// `E`:0 = 暂时不存在。
+    enabled: Option<i64>,
+    /// `A`:0 = 灰色不可选,否则 0..256。
+    alpha: Option<i64>,
+    /// `Z`:优先级。
+    z: Option<i64>,
+    /// `CHECK`:复选标记。
+    check: Option<i64>,
+    /// `CODE`:被选中时写入 `@_MENUCODE` 的值(宿主消费)。
+    code: Option<i64>,
+}
+
 /// 图形域状态机。
 pub struct GfxState {
     params: ParamTable,
@@ -284,6 +311,21 @@ pub struct GfxState {
     /// `CGACT`/`CGEND` 的参数名表(同 `cg_names`:启动期投影,#7)。
     cgact_names: Vec<Option<std::rc::Rc<str>>>,
     cgend_names: Vec<Option<std::rc::Rc<str>>>,
+    /// `MENU`/`MENUEND` 参数名表(同 `cg_names`;菜单命令低频,仍按槽位投影,
+    /// 避免 `ParamTable::resolve` 的 `&self` 借用挡住菜单状态的可变写)。
+    menu_names: Vec<Option<std::rc::Rc<str>>>,
+    /// 0.2xx 的 `CG/CGEND/CGINFO/CGACT` 用 `NO/NO2/NO3` 表示图层号后缀,
+    /// 0.4xx+ 改名为 `IDNO/IDNO2/IDNO3`(官方 ysc 表逐项对照)。
+    /// 本地图层号表已归一到 `IDNO`;`CGINFO` 走 `ParamTable.resolve`,故
+    /// 读 `NO` 时要按本标志当作 `IDNO`。
+    idno_alias: bool,
+    /// `MENU` 域状态:菜单层 ID → 属性(手册 `menu/menu.html`)。
+    ///
+    /// `MENU` 只建立/修改菜单层,本身不显示;`WINDOW[MENUID=:/M0]` 才把
+    /// 菜单层集绑定为窗口菜单栏(宿主原生菜单,内核无窗口系统)。
+    /// 这里保存完整状态供宿主消费;`MENUACT`/`MENUINFO` 不走本表
+    /// (仍是显式未接线,见 VM 域分派按命令名收窄)。
+    menu: BTreeMap<Vec<u8>, MenuEntry>,
     /// 窗口状态(按 `NO`;0 = 主窗口)。
     windows: BTreeMap<u8, WindowState>,
     /// 资产像素尺寸缓存(键 = `CG[FILE]` 原始字节)。
@@ -481,6 +523,36 @@ pub trait TextureSampler {
     fn sample(&mut self, texture: &TextureRef, x: i64, y: i64) -> Option<[u8; 4]>;
 }
 
+/// 0.2xx → 0.4xx 的图层号参数名兼容(`CG/CGACT/CGEND`)。
+///
+/// 官方 0.292 `ysc.ybn`:`CG` = `ID, NO, E, …`、`CGACT` = `ID, NO, ID2,
+/// NO2, …`、`CGEND` = `ID, NO`;官方 0.495 对应位置改叫 `IDNO/IDNO2/IDNO3`。
+/// 语义相同(图层 ID 的十进制后缀,`path::normalize` 已实现)。只在表里
+/// **没有** `IDNO` 时改名,避免把将来同时出现两种名字的表误读。
+/// `CG` 的 `TNO` 与 0.495 的 `TIDNO` 同型(过渡源图层号)。
+fn alias_legacy_layer_names(
+    names: Vec<Option<std::rc::Rc<str>>>,
+) -> Vec<Option<std::rc::Rc<str>>> {
+    let has = |target: &str| names.iter().flatten().any(|n| &**n == target);
+    let idno = has("IDNO");
+    let tidno = has("TIDNO");
+    names
+        .into_iter()
+        .map(|slot| {
+            slot.map(|name| {
+                let mapped = match &*name {
+                    "NO" if !idno => Some("IDNO"),
+                    "NO2" if !idno => Some("IDNO2"),
+                    "NO3" if !idno => Some("IDNO3"),
+                    "TNO" if !tidno => Some("TIDNO"),
+                    _ => None,
+                };
+                mapped.map_or(name, std::rc::Rc::from)
+            })
+        })
+        .collect()
+}
+
 impl GfxState {
     /// 从工程表构造(命令表 = 参数名唯一来源)。
     ///
@@ -516,18 +588,29 @@ impl GfxState {
         windows.insert(0, WindowState::new(0, Some(config.main_layer_set.clone())));
         // 工程 ysc 没有 `CG` 命令 ⇒ 脚本不可能产生 CG 事件,空表即正确;
         // 这里刻意不用 `unwrap_or_default`(审计会把未分类兜底计为静默回退)。
-        let cg_names = match params.names_for("CG") {
+        let cg_names = alias_legacy_layer_names(match params.names_for("CG") {
+            Some(names) => names.to_vec(),
+            None => Vec::new(),
+        });
+        let cgact_names = alias_legacy_layer_names(match params.names_for("CGACT") {
+            Some(names) => names.to_vec(),
+            None => Vec::new(),
+        });
+        let cgend_names = alias_legacy_layer_names(match params.names_for("CGEND") {
+            Some(names) => names.to_vec(),
+            None => Vec::new(),
+        });
+        let menu_names = match params.names_for("MENU") {
             Some(names) => names.to_vec(),
             None => Vec::new(),
         };
-        let cgact_names = match params.names_for("CGACT") {
-            Some(names) => names.to_vec(),
-            None => Vec::new(),
-        };
-        let cgend_names = match params.names_for("CGEND") {
-            Some(names) => names.to_vec(),
-            None => Vec::new(),
-        };
+        let idno_alias = params.names_for("CGINFO").is_some_and(|names| {
+            names
+                .iter()
+                .flatten()
+                .any(|n| &**n == "NO")
+                && !names.iter().flatten().any(|n| &**n == "IDNO")
+        });
         let mut s = Self {
             params,
             config,
@@ -561,6 +644,9 @@ impl GfxState {
             cg_names,
             cgact_names,
             cgend_names,
+            menu_names,
+            idno_alias,
+            menu: BTreeMap::new(),
             windows,
             asset_sizes: FxHashMap::default(),
             movie_metas: FxHashMap::default(),
@@ -995,6 +1081,7 @@ impl GfxState {
             Domain::Graphics => self.dispatch(name, args),
             Domain::Window => self.dispatch_window(name, args),
             Domain::Movie => self.dispatch_movie(name, args),
+            Domain::Menu => self.dispatch_menu(name, args),
             _ => {}
         }
         self.cur_call = None;
@@ -2031,6 +2118,11 @@ impl GfxState {
                     Some(n) => idno = Some(n),
                     None => return Err(arg_type_diag("CGINFO", "IDNO", "整数")),
                 },
+                // 0.2xx 表用 `NO` 表示图层号后缀(见 `idno_alias`)。
+                Some("NO") if self.idno_alias => match int_arg(r.value) {
+                    Some(n) => idno = Some(n),
+                    None => return Err(arg_type_diag("CGINFO", "NO", "整数")),
+                },
                 Some("LET") => {}
                 Some("SET") => {
                     set = Some(
@@ -2492,6 +2584,8 @@ impl GfxState {
             ),
             "SX" => Value::Int(self.style.size_x),
             "SY" => Value::Int(self.style.size_y),
+            // 0.2xx:`SIZE` 是 SX/SY 的旧名(单值方形字号;见 FONT 处理器)。
+            "SIZE" => Value::Int(self.style.size_y),
             "BOLD" => Value::Int(i64::from(self.style.bold)),
             "ANTIALIASING" => Value::Int(i64::from(self.style.antialias)),
             "DRAWMODE" => Value::Int(self.style.draw_mode),
@@ -2664,6 +2758,96 @@ impl GfxState {
     }
 
     // ------------------------------------------------------------ 命令分派
+
+    /// `MENU`/`MENUEND` 域状态(手册 `menu/menu.html`、`menu/menuend.html`)。
+    ///
+    /// 内核没有原生窗口菜单栏;这里保留官方语义要求的菜单层状态:
+    /// `MENU` 建立/修改菜单层(NAME/E/A/Z/CHECK/CODE),`MENUEND` 删除。
+    /// `WINDOW[MENUID]` 的绑定与显示归宿主(平台原生菜单),不在本层。
+    fn dispatch_menu(&mut self, name: &str, args: &[ArgValue]) {
+        match name {
+            "MENU" => {
+                let mut id: Option<Vec<u8>> = None;
+                let mut entry = MenuEntry::default();
+                for a in args {
+                    let Some(pname) = self.menu_names.get(usize::from(a.slot)).cloned().flatten()
+                    else {
+                        self.arg_slot_missing("MENU", a.slot);
+                        continue;
+                    };
+                    match &*pname {
+                        "ID" => match &a.value {
+                            Value::Str(bytes) => id = Some(bytes.clone()),
+                            other => self.arg_type("MENU", &pname, "字符串", other),
+                        },
+                        "NAME" => match &a.value {
+                            Value::Str(bytes) => entry.name = Some(bytes.clone()),
+                            other => self.arg_type("MENU", &pname, "字符串", other),
+                        },
+                        "E" => entry.enabled = int_arg(&a.value),
+                        "A" => entry.alpha = int_arg(&a.value),
+                        "Z" => entry.z = int_arg(&a.value),
+                        "CHECK" => entry.check = int_arg(&a.value),
+                        "CODE" => entry.code = int_arg(&a.value),
+                        other => self.push_diag(
+                            "MENU",
+                            error::unimplemented(
+                                error::code::PARAM_NONVISUAL,
+                                format!("MENU 参数 `{other}` 未分类"),
+                            ),
+                        ),
+                    }
+                }
+                let Some(id) = id else {
+                    self.push_diag(
+                        "MENU",
+                        error::recoverable(error::code::ARG_MISSING, "MENU 缺 ID"),
+                    );
+                    return;
+                };
+                // 逐项覆盖:只写本次给出的属性(手册示例就是增量更新)。
+                let slot = self.menu.entry(id).or_default();
+                if entry.name.is_some() {
+                    slot.name = entry.name;
+                }
+                if entry.enabled.is_some() {
+                    slot.enabled = entry.enabled;
+                }
+                if entry.alpha.is_some() {
+                    slot.alpha = entry.alpha;
+                }
+                if entry.z.is_some() {
+                    slot.z = entry.z;
+                }
+                if entry.check.is_some() {
+                    slot.check = entry.check;
+                }
+                if entry.code.is_some() {
+                    slot.code = entry.code;
+                }
+            }
+            "MENUEND" => {
+                for a in args {
+                    let Some(pname) = self.menu_names.get(usize::from(a.slot)).cloned().flatten()
+                    else {
+                        continue;
+                    };
+                    if &*pname == "ID" {
+                        if let Value::Str(bytes) = &a.value {
+                            self.menu.remove(bytes);
+                        }
+                    }
+                }
+            }
+            other => self.push_diag(
+                other,
+                error::unimplemented(
+                    error::code::COMMAND_UNIMPLEMENTED,
+                    "菜单域命令未接线(MENU/MENUEND 之外的 MENU* 尚无宿主状态机)",
+                ),
+            ),
+        }
+    }
 
     fn dispatch(&mut self, name: &str, args: &[ArgValue]) {
         // 先 match 已知命令,只在未接线分支查表:旧写法对每条 `CG/CGACT`
@@ -5376,6 +5560,18 @@ impl GfxState {
                 },
                 "SY" => match int_arg(&r.value) {
                     Some(n) => self.style.size_y = n,
+                    None => self.arg_type("FONT", name, "整数", &r.value),
+                },
+                // 0.2xx 的 `FONT[SIZE=n]` = 0.4xx+ 的 `SX`/`SY`(官方 0.292
+                // ysc 表只有 `SIZE`;0.495 拆成两维)。单值语义是方形字号,
+                // 两维同写;`FONTINFO[SIZE]` 读回 `size_y`(高度是文字排版的
+                // 主尺寸)。证据:0.292 样本 `\FONT.SIZE(n)` 的存取对
+                // (`FONTINFO[SIZE=1 LET=@s]` / `FONT[SIZE=@_PINT(1)]`)。
+                "SIZE" => match int_arg(&r.value) {
+                    Some(n) => {
+                        self.style.size_x = n;
+                        self.style.size_y = n;
+                    }
                     None => self.arg_type("FONT", name, "整数", &r.value),
                 },
                 "BOLD" => self.style.bold = flag_value(&r.value),
