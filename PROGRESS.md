@@ -14833,7 +14833,7 @@ cargo build --workspace --all-targets
   → Finished dev profile(本机需 CL=-utf-8;见下)
 ```
 
-- 本机环境备注:`cargo` 源路径含非 ASCII(`C:\Users\鬼\...`),cc-rs 生成的
+- 本机环境备注:`cargo` 源路径含非 ASCII(`C:\Users\<user>\...`),cc-rs 生成的
   `mimalloc-static.cc` 用系统代码页 936 编译会 C1083;构建前设
   `CL=-utf-8` 即可(不是本轮代码问题)。
 - 实机复验(同一剧情左上角碎片消失、口型回到脸上)待主人点验。
@@ -15417,8 +15417,9 @@ load_system_fonts: 163.4ms faces=248 catalog=127
   - `cargo test -p yu-backend-wgpu` → 39 passed(plan_scaling 0 passed,
     1 ignored,该用例人工量化用);
   - `cargo build --workspace --all-targets` → 通过。环境注记:本机
-    `libmimalloc-sys` 的 cc 构建把 `C:\Users\鬼\.cargo\...` 绝对路径写进
-    `mimalloc-static.cc`,cl.exe 在 CP936 下把 `鬼` 变成 `楝?` 导致
+    `libmimalloc-sys` 的 cc 构建把 `C:\Users\<user>\.cargo\...` 绝对路径写进
+    `mimalloc-static.cc`,cl.exe 在 CP936 下把用户名中的非 ASCII 字符变成
+    `楝?` 导致
     C1083;本轮把该 crate 复制到 ASCII 临时路径并用命令行
     `--config 'patch.crates-io.libmimalloc-sys.path=…'` 完成验证,
     临时副本已删除。本任务未编辑 Cargo.toml/Cargo.lock;构建时 Cargo
@@ -15770,3 +15771,58 @@ python tools/release/release_notes.py notes --repo <demo> --tag v0.4.0 \
 ```
 
 - 本轮未执行任何 git 写操作。
+
+## 成果 GFX-CG-TARGETBASE-FOLLOWUP (2026-11-17) · wgpu RESIZE 基面与 Android 影片失败态收口
+
+### 关联
+
+- `DIV-GFX-090`(`2365d8c`):`CG[FILE=""] → RECTPAINT3 → MERGE → COPY2
+  → CGEND` 的 target_base 重放与 hover/缩略图 provenance 修复已在实机
+  通过;本成果补其跨后端与失败态收口。
+
+### 改动
+
+- wgpu `resolve_target_base` 新增 `solid_size`(命令时刻执行前基数);
+  `RESIZE` 分支传 `ImageOp::resize_base`。此前 wgpu 按帧末已回写的
+  `LayerKind::Image.size` 重建 1×1 符号面,会把 `X/X2` 增量再加一遍
+  (1×1 + 1+1 实测 5×1,正确 3×1)。
+- 新增 soft/wgpu 回归:
+  `resize_empty_layer_uses_command_base_for_followup_copy` /
+  `resize_empty_layer_uses_command_base_on_gpu`;测试命令表补 `RESIZE`。
+- Android `AndroidMovieHost::is_playing` 要求 `session.is_some()`:
+  `open` 失败后同一/后续 `MOVIE[PLAY=1]` 不再让 `MOVIEINFO[PLAY]` 永真,
+  播放等待循环可以退出。
+- `feed_one` 的失败路径(`getInputBuffer` 空、样本超输入缓冲、
+  `queueInputBuffer` 失败)统一 `queueInputBuffer(size=0)` 归还已出队
+  input index,避免 codec 输入池耗尽后播放永久卡住。
+- `MovieHostSelector::open` 换片前 `close_hosts()` 真正关闭内置/外置
+  两个后端,保留 pending 几何/音量;不再只清 `active` 导致旧 codec/
+  临时文件/影片字节残留。新增 `reopen_closes_previous_backend`。
+- 清理 `ImageTargetBase` 文档中的误留 TODO 与“换图也用 target_base”
+  的错误表述(实现只在目标已删除时使用);`PROGRESS` 中的真实用户路径
+  改为占位符。
+
+### 验证
+
+```text
+cargo test -p yu-gfx --test parity_fixes
+  → 47 passed; 0 failed
+cargo test -p yu-backend-soft --test render
+  → 32 passed; 0 failed
+cargo test -p yu-backend-wgpu --test surfaces
+  → 36 passed; 0 failed
+cargo test -p yu-engine --lib movie
+  → 9 passed; 0 failed(新增 reopen_closes_previous_backend)
+cargo check -p yu-movie-android --target aarch64-linux-android
+  → Finished dev profile
+cargo check --workspace --all-targets
+  → Finished dev profile(CL/CFLAGS/CXXFLAGS=-utf-8,TEMP 指到 ASCII 可写目录)
+```
+
+### 影响边界
+
+- wgpu `RESIZE` 只在 1×1 符号基面使用 `resize_base`;真实资产/快照的
+  基面尺寸不变,soft 行为不变。
+- Android 失败 open 后 `MOVIEINFO[PLAY]` 变为 0;成功播放路径不变。
+- 换片关闭旧后端会释放旧 codec/temp;pending 音量/几何仍按原逻辑补发。
+- 未修改 `yu-emote`;未执行 git 写操作。

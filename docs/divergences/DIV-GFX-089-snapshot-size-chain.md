@@ -128,3 +128,18 @@ pc4089 GOSUB[#=es.SP.RESIZE ...]
 `FUN_0043c971` 一致(读复制后的区域矩形)。回归
 `resize_after_copy_uses_copy_rect_as_base`:800×600 目标局部 COPY 100×50
 后 `RESIZE X=5 X2=5` → 110×50(旧实现为 810×600)。
+
+## 8. 补记(2026-11-17):wgpu 回放接入 `resize_base`
+
+`dc545ae` 只让 soft 消费了 `ImageOp::resize_base`。wgpu 的
+`resolve_target_base` 对活层仍按帧末 `LayerKind::Image.size` 重建 1×1
+符号基面,`Resize` 分支再加 `X/X2` ⇒ 增量重复叠加。
+
+实测(临时探针,已删除):1×1 空层 `RESIZE X=1 Y=0 X2=1 Y2=0`,
+wgpu 物化表面为 **5×1**,官方/soft 为 **3×1**。
+
+修复:wgpu `resolve_target_base` 增加 `solid_size` 参数,`RESIZE` 调用点
+传 `image.resize_base`;新增
+`resize_empty_layer_uses_command_base_on_gpu` 与 soft 对拍
+`resize_empty_layer_uses_command_base_for_followup_copy`。资产/快照基面
+不受影响,仅在 `SolidBlack1x1` 符号面使用命令时刻基数。

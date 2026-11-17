@@ -55,9 +55,10 @@ s54@480  CGEND     ID=_CGTMP999
   命令时刻冻结目标层的 `TextureRef`、`fill` 与显式 `size`。
 - `frame()` 发射门禁:目标层已删除但存在 `target_base` 且后续消费者
   需要该目标(COPY/MERGE 的源)时允许重放。
-- wgpu `resolve_target_base` / soft `base_texture`:目标层不存在、被换图
-  或 fill/size 已变化时,优先用命令时刻 `target_base` 重建基面;
-  `SolidBlack1x1` 按记录的 `fill + size` 铺开。
+- wgpu `resolve_target_base` / soft `base_texture`:**目标层已不存在**时
+  用命令时刻 `target_base` 重建基面;`SolidBlack1x1` 按记录的
+  `fill + size` 铺开。目标层仍存活(包括随后被 `CG[FILE]` 换图)时
+  一律用活层当前像素,不使用这份记录。
 - wgpu `apply_copy`:源层已删除但本帧 `contents` 已有加工结果时,不再
   按基面 token 清掉它(官方 COPY 读到的就是该结果)。
 - `TRANSITION`/`CG[MID]` 的 `ImageOp` 同样记录目标基面,避免同类问题。
