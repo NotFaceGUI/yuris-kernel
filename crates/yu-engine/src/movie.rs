@@ -105,6 +105,20 @@ impl MovieHostSelector {
         }
     }
 
+    /// 关闭两个后端并清掉“当前选中”状态,但保留 pending 几何/音量。
+    ///
+    /// 换片时只清 `active` 不够:旧后端的 codec/extractor/临时文件以及
+    /// 整份影片字节会一直活到 `MOVIEEND`,Auto 在 MPEG-1 ↔ MP4 间切换
+    /// 时尤其明显。pending 值在 `open` 成功后仍要补发,所以不能走
+    /// `close()`(它会按官方 `MOVIEEND` 语义清音量缓存)。
+    fn close_hosts(&mut self) {
+        self.builtin.close();
+        if let Some(host) = self.external.as_mut() {
+            host.close();
+        }
+        self.active = None;
+    }
+
     fn open_builtin(&mut self, file: &[u8], bytes: &[u8]) -> Result<(), Diag> {
         self.builtin.open(file, bytes)?;
         self.active = Some(Active::Builtin);
@@ -131,8 +145,9 @@ impl MovieHost for MovieHostSelector {
     fn open(&mut self, file: &[u8], bytes: &[u8]) -> Result<(), Diag> {
         // 换片/重开:上一部影片的状态不能带进新会话。官方 `FILE` 成功时
         // 清播放位;`PLAY` 在命令内排在 `FILE` 之后,因此不需要缓存/补发
-        // (几何与音量按官方语义保留,先缓存后补发)。
-        self.active = None;
+        // (几何与音量按官方语义保留,先缓存后补发)。旧后端的 codec/
+        // extractor/临时文件必须在这里真正关闭,不能只丢 active。
+        self.close_hosts();
         // Auto 的 MPEG-1 program stream 直接走内置:Android 官方保证格式
         // 不含 MPEG-PS,外置 extractor 基本必然打不开;先落临时文件再失败
         // 会让每次 OP 播放都白付一次 I/O。官方 `CODEC=1` 的判定与这里用的
@@ -155,7 +170,6 @@ impl MovieHost for MovieHostSelector {
                         String::from_utf8_lossy(file),
                         error
                     );
-                    self.active = None;
                     if self.open_external(file, bytes).is_ok() {
                         return Ok(());
                     }
@@ -173,14 +187,17 @@ impl MovieHost for MovieHostSelector {
                         Err(error) => {
                             // 外置打不开不是致命:官方 MPEG-1 语料在 Android
                             // 上正是这条路径。回退内置并留痕,便于排查“为什么
-                            // 没走硬解”。
+                            // 没走硬解”。失败后主动 close 一次,清掉部分
+                            // 初始化的 codec/extractor/临时文件。
+                            if let Some(host) = self.external.as_mut() {
+                                host.close();
+                            }
                             log::info!(
                                 target: "yu-kernel",
                                 "[movie] 外置后端打不开 {}，回退内置 pl_mpeg: {}",
                                 String::from_utf8_lossy(file),
                                 error
                             );
-                            self.active = None;
                         }
                     }
                 }
@@ -251,11 +268,7 @@ impl MovieHost for MovieHostSelector {
     }
 
     fn close(&mut self) {
-        self.builtin.close();
-        if let Some(host) = self.external.as_mut() {
-            host.close();
-        }
-        self.active = None;
+        self.close_hosts();
         // `MOVIEEND` 把官方音量重置 256;丢掉缓存,下一部影片没给 VOLUME
         // 时让后端用自己的默认值(而不是上一部的残留)。
         self.pending_volume = None;
@@ -382,13 +395,19 @@ mod tests {
 
     #[test]
     fn auto_falls_back_to_builtin_when_external_fails() {
+        let external = FakeHost::new("external", false);
+        let events = external.events();
         let mut host = selector_with(
             MovieBackend::Auto,
             FakeHost::new("builtin", true),
-            Some(FakeHost::new("external", false)),
+            Some(external),
         );
         host.open(b"a.mp4", b"data").expect("builtin 应接住");
         assert_eq!(host.backend_label(), "builtin");
+        assert!(
+            events.borrow().iter().any(|event| event == "close"),
+            "外置失败后必须 close 掉部分初始化的资源"
+        );
     }
 
     #[test]
@@ -405,7 +424,11 @@ mod tests {
         let bytes = [0x00, 0x00, 0x01, 0xBA, 0x21, 0x00];
         host.open(b"a.mpg", &bytes).expect("builtin");
         assert_eq!(host.backend_label(), "builtin");
-        assert!(events.borrow().is_empty(), "MPEG-1 PS 不应尝试外置");
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["close"],
+            "MPEG-1 PS 只应做换片前清理,不应尝试外置 open"
+        );
     }
 
     #[test]
@@ -417,6 +440,25 @@ mod tests {
         );
         host.open(b"a.mp4", b"data").expect("external");
         assert_eq!(host.backend_label(), "external");
+    }
+
+    #[test]
+    fn reopen_closes_previous_backend() {
+        let external = FakeHost::new("external", true);
+        let events = external.events();
+        let mut host = selector_with(
+            MovieBackend::Auto,
+            FakeHost::new("builtin", true),
+            Some(external),
+        );
+        host.open(b"a.mp4", b"data").expect("external");
+        assert_eq!(host.backend_label(), "external");
+        host.open(b"b.mp4", b"data").expect("external");
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["close", "open", "close", "open"],
+            "首次 open 前的清理 close 无害;真正的换片必须先 close 再 open"
+        );
     }
 
     #[test]

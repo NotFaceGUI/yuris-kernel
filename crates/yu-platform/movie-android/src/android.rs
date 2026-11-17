@@ -91,6 +91,20 @@ fn require_ptr<T>(ptr: *mut T, what: &str) -> Result<NonNull<T>, Diag> {
     NonNull::new(ptr).ok_or_else(|| fail(format!("{what} 创建失败")))
 }
 
+/// 把已出队但没能写入样本的 input buffer 以空样本归还给 codec。
+///
+/// `dequeueInputBuffer` 返回的 index 必须最终 `queueInputBuffer` 归还,
+/// 否则该 buffer 永远不会回到 codec 输入池;连续遇到 null buffer、超大
+/// 样本或 queue 失败时,输入池会被耗尽,`dequeueInputBuffer` 恒为 -1,
+/// 影片看起来仍在播放但不再前进。
+fn return_input_buffer(codec: *mut AMediaCodec, index: usize) {
+    // SAFETY: `codec` 由调用方在 Session 生命周期内持有;index 是刚由
+    // `AMediaCodec_dequeueInputBuffer` 返回、尚未归还的有效索引。
+    unsafe {
+        let _ = AMediaCodec_queueInputBuffer(codec, index, 0, 0, 0, 0);
+    }
+}
+
 /// 临时文件守卫:drop 时删除(Android app 私有 cache 目录)。
 struct TempFile {
     _file: File,
@@ -495,6 +509,8 @@ impl Session {
             let mut capacity = 0usize;
             let buffer = AMediaCodec_getInputBuffer(codec, input, &mut capacity);
             if buffer.is_null() || capacity == 0 {
+                // 已出队的 index 必须归还;否则输入池会被逐步耗尽。
+                return_input_buffer(codec, input);
                 return FeedResult::Full;
             }
             let size = AMediaExtractor_readSampleData(extractor, buffer, capacity);
@@ -519,6 +535,7 @@ impl Session {
                     target: "yu-kernel",
                     "[movie] 样本超过解码器输入缓冲({capacity}B),已跳过"
                 );
+                return_input_buffer(codec, input);
                 AMediaExtractor_advance(extractor);
                 return FeedResult::Fed;
             }
@@ -537,6 +554,9 @@ impl Session {
                     target: "yu-kernel",
                     "[movie] queueInputBuffer 失败(track={track}, size={size}, pts={pts})"
                 );
+                // queue 失败时该 index 仍在调用方手里;归还空样本,避免
+                // 下一 tick 反复重试同一样本时把输入池一并耗掉。
+                return_input_buffer(codec, input);
                 return FeedResult::Error;
             }
             if track == self.video.track_index {
@@ -1096,7 +1116,11 @@ impl MovieHost for AndroidMovieHost {
     }
 
     fn is_playing(&mut self) -> bool {
-        self.playing && !self.ended
+        // 没有 session = `open` 失败或已 `close`。此时 `frame()` 不会推进,
+        // `ended` 也就永远不会置位;若只看 `playing`,失败的 open 之后
+        // 同一/后续 `MOVIE[PLAY=1]` 会让 `MOVIEINFO[PLAY]` 永远为 1,
+        // 脚本的播放等待循环无法退出。
+        self.session.is_some() && self.playing && !self.ended
     }
 
     fn media_size(&mut self) -> Option<(u32, u32)> {
@@ -1138,5 +1162,20 @@ impl MovieHost for AndroidMovieHost {
         self.ended = false;
         self.position_ms = 0;
         self.start_ms = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `open` 失败(无 session)后 `PLAY=1` 不能报“正在播放”。
+    ///
+    /// 否则 `MOVIEINFO[PLAY]` 永远为 1,脚本的播放结束等待循环无法退出。
+    #[test]
+    fn play_without_session_is_not_playing() {
+        let mut host = AndroidMovieHost::new(std::env::temp_dir());
+        host.set_playing(true).expect("PLAY 本身不应报错");
+        assert!(!host.is_playing(), "没有 session 不能报告正在播放");
     }
 }
