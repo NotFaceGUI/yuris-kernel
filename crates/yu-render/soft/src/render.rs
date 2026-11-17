@@ -856,9 +856,9 @@ fn apply_image_op(
             apply_resize(&mut texture, x, y, x2, y2)?;
         }
         ImageAction::Trim => {
-            let Some(set) = image.set.as_ref().and_then(|v| v.as_int()) else {
-                return Err("gfx.imageop.set.missing".to_string());
-            };
+            // 官方 0.495 `FUN_0043c539` 调用点:SET 缺失时值槽为 0
+            // (0x42c998..0x42c9b6),掩码 0 = 四边都不裁。缺省 0 不是错误。
+            let set = image.set.as_ref().and_then(|v| v.as_int()).unwrap_or(0);
             apply_trim(&mut texture, set);
         }
         ImageAction::Other("meido") => {

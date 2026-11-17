@@ -31,17 +31,24 @@
 - 需要：把“表面尺寸”和“显示/命中矩形”拆开，或在 COPY 时记录矩形
   代次，查询只读 COPY 后的矩形；不能简单改 `Image.size`（会改绘制缩放）。
 
-### 2.2 `TRIM` 改表面尺寸但不回写矩形
+### 2.2 `TRIM` 改表面尺寸但不回写矩形（参数缺失已修；矩形回写待设计）
 
-- 手册例 22：`TRIM=1 SET=15` 裁掉完全透明边缘；soft `apply_trim` 已按
-  位掩码裁纹理。
-- 内核 `cgact_image` 只在 `SIZE`/`RESIZE` 更新层矩形，`TRIM` 没有；
-  `ImageAction::changes_extent()` 已存在但无消费者。
-- 与 RESIZE 不同：TRIM 的新尺寸依赖**像素 alpha 包围盒**，gfx 在命令
-  时刻没有像素（资产解码/前序图像加工都在后端回放），不能直接算。
-  需要后端回报裁后尺寸，或把 TRIM 纳入表面/矩形两阶段提交。
-- 当前 `.yst` 源语料未见 `TRIM` 调用（动态脚本未普查），风险中低；
-  未凭手册猜公式改状态。
+- 官方执行体已定位：0.495 `FUN_0043c539`（0x43c539–0x43c8c7），
+  0.479 `FUN_00436f69` 同构；掩码 8/4/2/1、alpha bbox、
+  `[+0x78/+0x7c]=newW/newH`、全透明 `SET=15` → 0×0 均已逐行取证，
+  详见 `docs/tasks/silent-gaps/task-02-trim-extent.md` §取证结果。
+- **已修（2026-11-17）**：`SET` 缺失时官方值槽为 0（0x42c998..0x42c9b6）
+  ⇒ 掩码 0 = 四边不裁 = 原地 no-op，不是 `imageop.set.missing`；
+  `SET>0xF` 官方 `cmp eax,0xf; ja` → 错误返回 -1。gfx 不再把缺失 SET
+  判未实现，soft/wgpu 缺省按 0；回归 `trim_without_set_is_executable_with_zero_mask`、
+  `trim_set_above_15_is_not_executable`、soft `trim_zero_mask_is_noop`。
+- 语料普查：project-eris 0、0.486 ExSTIA 0、kotoneiro 1 处
+  （s27 macro.yst pc5803，**无 SET**）⇒ 当前唯一实调用已被上述修复覆盖。
+- **仍 open**：非零 `SET` 的裁后矩形回写。gfx 命令时刻没有像素，且
+  TRIM 可能跟在 BLUR/COPY 之后（kotoneiro 宏即 BLUR→TRIM），资产级
+  alpha 包围盒会看到加工前边界；需同步 CPU 表面回放或后端回报 +
+  同 tick 时序取舍，设计确认后再实现。`ImageAction::changes_extent()`
+  仍无消费者。
 
 ### 2.3 `CGINFO[ONMOUSE*/COLOR]` 的尺寸优先级（fixed 2026-11-17,与 2.1 同修）
 

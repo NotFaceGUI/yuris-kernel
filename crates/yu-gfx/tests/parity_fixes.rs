@@ -421,6 +421,97 @@ fn cgact_size_keeps_sx_sy_and_resize_trim_are_recognized() {
         .any(|o| { matches!(o, Op::Image(i) if i.action == ImageAction::Trim) }));
 }
 
+/// 任务 02 取证:0.495 `FUN_0043c539` 的调用点 0x42e500..0x42e52e。
+///
+/// `SET` 缺失时值槽初始化为 0(0x42c998..0x42c9b6);TRIM=1 单独出现
+/// 是掩码 0(四边都不裁、原地 no-op),**不是** `gfx.imageop.set.missing`。
+/// kotoneiro `macro.yst` s27 pc5803 正是这种用法。
+#[test]
+fn trim_without_set_is_executable_with_zero_mask() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BG")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(10)),
+                arg(&table, "CG", "SY", i(10)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BG")),
+                arg(&table, "CGACT", "TRIM", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let trim = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|o| match o {
+            Op::Image(i) if i.action == ImageAction::Trim => Some(i),
+            _ => None,
+        })
+        .expect("TRIM 应仍记录为图像加工项");
+    assert_eq!(trim.status, OpStatus::Executable);
+    assert!(trim.set.is_none(), "缺失 SET 应保持 None,后端按 0 处理");
+}
+
+/// 0.495 `FUN_0043c539` 调用点 0x42e50b:`cmp eax,0xf; ja` ——
+/// `SET` 只允许 0..=15,越界走错误上报(0x42f12d)并返回 -1。
+#[test]
+fn trim_set_above_15_is_not_executable() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BG")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(10)),
+                arg(&table, "CG", "SY", i(10)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BG")),
+                arg(&table, "CGACT", "TRIM", i(1)),
+                arg(&table, "CGACT", "SET", i(16)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let trim = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|o| match o {
+            Op::Image(i) if i.action == ImageAction::Trim => Some(i),
+            _ => None,
+        })
+        .expect("TRIM 仍应记录审计项");
+    assert_eq!(
+        trim.status,
+        OpStatus::Unimplemented("gfx.imageop.set.range"),
+        "SET > 0xF 官方报错返回 -1,不得执行"
+    );
+}
+
 #[test]
 fn font_no_is_recorded_and_bno_selects_style_slot() {
     let table = table();

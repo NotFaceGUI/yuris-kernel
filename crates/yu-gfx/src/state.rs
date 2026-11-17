@@ -5044,11 +5044,24 @@ impl GfxState {
             // - `TRIM`:手册例 22 给位掩码 8=上/4=下/2=左/1=右。
             // - `MEIDO`:手册例 7 给 `SET=0xffff00` = 「赤200% 緑200% 青0%」
             //   ⇒ 每通道 ×(该字节/128)(0x80=100%,0xFF≈200%)。
+            // 0.495 `FUN_0043c539` 调用点 0x42e500..0x42e52e:
+            // - `SET` 缺失时值槽初始化为 0(0x42c998..0x42c9b6),即掩码 0,
+            //   **不是错误/未实现**;TRIM=1 单独出现时四边都不裁(原地 no-op)。
+            // - `SET` 为整数且 `cmp eax,0xf; ja` ⇒ 只允许 0..=15,越界走
+            //   错误上报(0x42f12d)并返回 -1。
+            let trim_mask = if action.is_trim() {
+                set.as_ref().and_then(EngineValue::as_int)
+            } else {
+                None
+            };
             if explicit_target && target.as_ref() != Some(source) {
                 // 手册例 5..17 全部是原地动作,没有 ID2 形态。
                 OpStatus::Unimplemented("gfx.imageop.id2.unsupported")
-            } else if action.is_trim() && set.is_none() {
-                OpStatus::Unimplemented("gfx.imageop.set.missing")
+            } else if action.is_trim() && set.is_some() && trim_mask.is_none() {
+                // `SET` 在 ysc 里是整数槽;给了非整数无法按官方 dword 掩码解释。
+                OpStatus::Unimplemented("gfx.imageop.set.type")
+            } else if action.is_trim() && trim_mask.is_some_and(|v| !(0..=15).contains(&v)) {
+                OpStatus::Unimplemented("gfx.imageop.set.range")
             } else if (x.is_some() || y.is_some() || x2.is_some() || y2.is_some())
                 && !action.is_resize()
             {

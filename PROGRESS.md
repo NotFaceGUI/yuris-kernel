@@ -15435,3 +15435,34 @@ load_system_fonts: 163.4ms faces=248 catalog=127
   - 局部快照的查询矩形由上述单测覆盖;实机未单独保留 trace 探针
     (临时 PNG/JSON/日志已删除)。
 - 本轮未执行任何 git 写操作,等待主人审阅。
+
+## 成果 TRIM-EVIDENCE (2026-11-17) · TRIM 官方执行体定位与 SET 缺失语义修复
+
+- 官方执行体已定位:0.495 `FUN_0043c539`(0x43c539–0x43c8c7,911 B),
+  CGACT 处理体 0x42e52e 调用;0.479 `FUN_00436f69` 同构(仅层偏移
+  0x70/0x74 vs 0x78/0x7c)。掩码 8=上/4=下/2=左/1=右
+  (0x43c684–0x43c6b7),alpha 全像素 bbox,`newW=maxX-minX+1`,
+  `newH=maxY-minY+1`,写目标 `+0x78/+0x7c`;原地且尺寸相同复用表面。
+  全透明 `SET=15` ⇒ 0×0 表面/矩形(不是保持原样);`SET>0xF` ⇒
+  0x42f12d 错误返回 -1。
+- **参数缺失取证**:`SET` 缺失时值槽初始化为 0(0x42c998..0x42c9b6)
+  ⇒ 掩码 0 = 四边都不裁 = 原地 no-op,不是 `gfx.imageop.set.missing`。
+- 语料普查(`census_params CGACT:TRIM`):project-eris 0/141、
+  0.486 ExSTIA_C4 0/260、kotoneiro 1/160(s27 macro.yst pc5803
+  line 8268,仅 `ID+TRIM`,无 SET)。唯一实调用就是无 SET。
+- 修复:
+  - gfx 移除 `trim && set.is_none()` 的 Unimplemented;缺省 SET 允许
+    执行,`SET` 非整数记 `gfx.imageop.set.type`,`SET>15` 记
+    `gfx.imageop.set.range`(官方错误路径);
+  - soft `render.rs`/wgpu `plan.rs` 的 TRIM 缺省 `unwrap_or(0)`;
+  - soft `apply_trim(0)` 补 no-op 语义回归。
+- 回归:`trim_without_set_is_executable_with_zero_mask`、
+  `trim_set_above_15_is_not_executable`、soft `trim_zero_mask_is_noop`。
+- 验证:`cargo test -p yu-gfx` 全绿(parity_fixes 44、info_query 29);
+  `cargo test -p yu-backend-soft` 69 passed;
+  `cargo test -p yu-backend-wgpu` 全绿(surfaces 32、39 主 suite)。
+- **仍 open(需设计确认)**:非零 `SET` 的裁后矩形回写。gfx 命令时刻
+  没有像素,且 TRIM 可能跟在 BLUR/COPY 之后(kotoneiro 宏为
+  BLUR→TRIM→BLUR5),资产级 alpha bbox 会取到加工前边界;需同步
+  CPU 表面回放或后端回报 + 同 tick 时序取舍。未凭猜测实现。
+- 本轮未执行任何 git 写操作,等待主人审阅。

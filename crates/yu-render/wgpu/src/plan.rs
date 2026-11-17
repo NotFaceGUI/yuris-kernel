@@ -2177,9 +2177,13 @@ fn apply_image_pixels(
         return Ok(());
     }
     if image.action.is_trim() {
-        let Some(set) = image.set.as_ref().and_then(|value| value.as_int()) else {
-            return Err("gfx.imageop.set.missing".to_string());
-        };
+        // 官方 0.495 `FUN_0043c539` 调用点:SET 缺失时值槽为 0
+        // (0x42c998..0x42c9b6),掩码 0 = 四边都不裁。缺省 0 不是错误。
+        let set = image
+            .set
+            .as_ref()
+            .and_then(|value| value.as_int())
+            .unwrap_or(0);
         let (width, height) = (base.width, base.height);
         // **优先走资产 alpha 缓存**:`TRIM` 只裁四周全透明的行/列,边界是
         // 资产的固有属性(解码时 CPU 像素就在手上)。整图读回在移动端

@@ -1153,6 +1153,28 @@ mod extent_tests {
         assert_eq!(t.width, 2, "宽度不变");
     }
 
+    /// `SET` 缺失时官方值槽为 0(0.495 `0x42c998..0x42c9b6`):
+    /// 四边都不裁,尺寸与像素保持不变。
+    #[test]
+    fn trim_zero_mask_is_noop() {
+        let mut t = Texture {
+            width: 4,
+            height: 4,
+            rgba: vec![0; 4 * 4 * 4],
+        };
+        for y in 1..3 {
+            for x in 1..3 {
+                let i = ((y * 4 + x) * 4) as usize;
+                t.rgba[i] = 9;
+                t.rgba[i + 3] = 255;
+            }
+        }
+        let before = t.rgba.clone();
+        apply_trim(&mut t, 0);
+        assert_eq!((t.width, t.height), (4, 4));
+        assert_eq!(t.rgba, before);
+    }
+
     /// 手册例 7:`SET=0xffff00` ⇒ 红 200%、绿 200%、蓝 0%。
     #[test]
     fn meido_scales_channels_by_half_byte_ratio() {
