@@ -3,6 +3,9 @@ AGENTS.md
 
 /target
 
+# 从 crates/ 工作目录运行探针/用例时的产物目录(截图、报告等)
+crates/target/
+
 # 本地预演 Release 更新日志的产物
 /.release
 
