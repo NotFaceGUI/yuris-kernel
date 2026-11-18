@@ -237,6 +237,16 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             report.missing_assets.len(),
             report.skipped_text
         ));
+        // 缺资产必须可定位到**原始 key 与尝试过的候选路径**：否则只能看到
+        // 图层名，无法判断是路径/扩展名/封包差异还是解码失败。
+        for issue in &report.missing_assets {
+            output::line(format!(
+                "  asset {:<36} {}: {}",
+                issue.key_display(),
+                issue.code,
+                issue.detail
+            ));
+        }
     }
     if let Some(reconciled) = engine.wgpu_reconciled() {
         output::line(format!(
