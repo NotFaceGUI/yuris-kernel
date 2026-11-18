@@ -71,6 +71,12 @@ pub struct RenderTuning {
     pub text_base_cache: bool,
     /// GPU 文本 pass(默认开;能力不足时后端自行回退 CPU)。
     pub text_gpu: bool,
+    /// 逐字形缺字回退(默认关):主字体缺字时,按「宿主注入字体 →
+    /// 系统字体」的确定序找一个含该字的 face 补字形。
+    ///
+    /// 官方引擎把缺字交给 GDI font linking(候选顺序由注册表
+    /// `SystemLink` 决定),无法逐项 1:1;因此默认关,由宿主显式开启。
+    pub font_fallback: bool,
     /// 启动期管线预热(默认开;关掉用于对比启动耗时)。
     pub pipeline_prewarm: bool,
     /// PNG 解码后端(默认 `image`;Android 可切 `libpng`)。
@@ -115,6 +121,7 @@ impl Default for RenderTuning {
             snapshot_defer: false,
             text_base_cache: true,
             text_gpu: true,
+            font_fallback: false,
             pipeline_prewarm: true,
             png_backend: PngBackend::Image,
             asset_timing: false,

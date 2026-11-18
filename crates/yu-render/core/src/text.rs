@@ -580,6 +580,7 @@ impl TextComposer {
     pub fn with_source_and_tuning(source: FontSource, tuning: RenderTuning) -> Self {
         let mut renderer = FontRenderer::new(source, CacheLimits::default());
         renderer.set_trace(tuning.font_trace);
+        renderer.set_fallback(tuning.font_fallback);
         Self {
             renderer: Some(renderer),
             failure: None,
@@ -975,6 +976,7 @@ impl TextComposer {
                 self.source_summary = Some(summary);
                 let mut renderer = FontRenderer::new(source, CacheLimits::default());
                 renderer.set_trace(self.tuning.font_trace);
+                renderer.set_fallback(self.tuning.font_fallback);
                 self.renderer = Some(renderer);
                 self.failure = None;
                 // 字体身份变了,已解析/已合成的缓存全部失效。
@@ -1015,6 +1017,7 @@ impl TextComposer {
                 self.source_summary = Some(summary);
                 let mut renderer = FontRenderer::new(source, CacheLimits::default());
                 renderer.set_trace(self.tuning.font_trace);
+                renderer.set_fallback(self.tuning.font_fallback);
                 self.renderer = Some(renderer);
                 self.failure = None;
                 self.load_ms = Some(started.elapsed().as_millis());
