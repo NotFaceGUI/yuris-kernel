@@ -298,6 +298,12 @@ impl HostTuning {
             Some(("YURIS_TEXT_GPU", EnvBool::ZeroOff)),
             render.text_gpu,
         )?;
+        render.font_fallback = bool_flag(
+            args,
+            "font-fallback",
+            Some(("YURIS_FONT_FALLBACK", EnvBool::EmptyOff)),
+            render.font_fallback,
+        )?;
         render.pipeline_prewarm = bool_flag(
             args,
             "pipeline-prewarm",
@@ -440,6 +446,12 @@ impl HostTuning {
         push_flag(&mut out, "text-gpu", r.text_gpu, defaults.text_gpu);
         push_flag(
             &mut out,
+            "font-fallback",
+            r.font_fallback,
+            defaults.font_fallback,
+        );
+        push_flag(
+            &mut out,
             "pipeline-prewarm",
             r.pipeline_prewarm,
             defaults.pipeline_prewarm,
@@ -480,6 +492,7 @@ pub const HOST_TUNING_HELP: &str = "\n诊断/性能参数(与 Android run-config
   --snapshot-defer[=on|off]     COPY2 快照延迟物化(默认 off)
   --text-base-cache[=on|off]    文本基面 CPU 缓存(默认 on)
   --text-gpu[=on|off]           GPU 文本 pass(默认 on)
+  --font-fallback[=on|off]      逐字形缺字回退(默认 off;宿主字体优先)
   --pipeline-prewarm[=on|off]   启动期管线预热(默认 on)
   --png-backend image|libpng    PNG 解码后端(默认 image;libpng 仅 Android)
   --wgpu-backend NAME           GPU 接口:auto|primary|dx12|vulkan|gl|all
@@ -573,6 +586,7 @@ mod tests {
             "--vm-profile",
             "--prefetch",
             "--text-gpu=off",
+            "--font-fallback",
             "--asset-cache-mb",
             "256",
             "--png-backend=libpng",
@@ -584,6 +598,7 @@ mod tests {
         assert!(tuning.render.vm_profile);
         assert!(tuning.render.prefetch);
         assert!(!tuning.render.text_gpu);
+        assert!(tuning.render.font_fallback);
         assert_eq!(tuning.render.asset_cache_mb, 256);
         assert_eq!(
             tuning.render.png_backend,
@@ -612,6 +627,7 @@ mod tests {
             "--prefetch",
             "--prefetch-mb=64",
             "--text-gpu=off",
+            "--font-fallback",
             "--png-backend=libpng",
             "--vm-profile",
             "--wgpu-backend=gl",
