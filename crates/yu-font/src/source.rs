@@ -860,6 +860,34 @@ impl FontSource {
         })
     }
 
+    /// Whether `face` has a glyph for `ch`, **without** retaining the font
+    /// bytes in [`Self::data_cache`].
+    ///
+    /// 逐字形缺字回退要扫描几十上百个候选 face;若都走 `with_face_data`,
+    /// 命中前读过的每个字体文件都会永久留在内存里(Android 的 Noto CJK
+    /// 单个就 ~20MB)。探测路径只读当前文件、解析 charmap、立即丢弃;
+    /// 真正命中的 face 到栅格化时才走 `with_face_data` 缓存。
+    ///
+    /// 读取/解析失败按「没有该字形」处理(与可选回退的语义一致,不把
+    /// 候选字体的坏文件升级成主路径错误)。
+    #[must_use]
+    pub fn face_has_char(&self, face: FaceId, ch: char) -> bool {
+        let Ok(record) = self.record(face) else {
+            return false;
+        };
+        if let Some(path) = &record.source_path {
+            let Ok(bytes) = std::fs::read(path) else {
+                return false;
+            };
+            let Some(font) = swash::FontRef::from_index(&bytes, record.index as usize) else {
+                return false;
+            };
+            let gid = font.charmap().map(ch);
+            return gid != 0 || ch == '\0';
+        }
+        matches!(self.glyph_index(face, ch), Ok(Some(gid)) if gid != 0)
+    }
+
     /// Horizontal advance in pixels for an explicit glyph id.
     pub fn advance_px(&self, face: FaceId, gid: u16, sx: u16, sy: u16) -> Result<f32, Diag> {
         if sy == 0 {

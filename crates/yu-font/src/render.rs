@@ -25,14 +25,25 @@ use crate::code;
 use crate::color::{Rgb, Rgba};
 use crate::image::{GlyphBitmap, GlyphImage, GlyphRun};
 use crate::raster::{RasterParams, Rasterizer};
-use crate::source::{FaceId, FontSource};
+use crate::source::{FaceId, FaceOrigin, FontSource};
 use crate::style::{DrawMode, Gradation, GradationScope, Outline, Shadow, StylePolicy, TextStyle};
+
+/// 逐字形回退缓存条目上限(病态字体/长文本下防无限增长;满了清空重来,
+/// 只影响性能,选择结果不变)。
+const FALLBACK_MEMO_CAP: usize = 4096;
 
 /// Owns a font source, a reusable rasterizer and a bounded cache.
 pub struct FontRenderer {
     source: FontSource,
     rasterizer: Rasterizer,
     cache: GlyphCache,
+    /// 逐字形缺字回退开关(宿主参数 `font_fallback`;默认关 = 官方缺字即不画)。
+    fallback: bool,
+    /// `(主 face, char)` → 回退 face(`None` = 本字体源里没有候选)。
+    ///
+    /// 字形缓存键仍按主 face 记:同一 `FontSource` 内字符→face 的选择是
+    /// 确定的,不会出现同键不同字形。
+    fallback_memo: std::collections::HashMap<(FaceId, char), Option<FaceId>>,
 }
 
 impl FontRenderer {
@@ -42,12 +53,33 @@ impl FontRenderer {
             source,
             rasterizer: Rasterizer::new(),
             cache: GlyphCache::new(limits),
+            fallback: false,
+            fallback_memo: std::collections::HashMap::new(),
         }
     }
 
     /// 显式开关逐字形 trace(宿主经 `TextComposer` 注入)。
     pub fn set_trace(&mut self, trace: bool) {
         self.rasterizer.set_trace(trace);
+    }
+
+    /// 显式开关逐字形缺字回退(宿主经 `RenderTuning.font_fallback` 注入)。
+    ///
+    /// 默认关:官方引擎把缺字交给 GDI font linking,候选顺序取决于注册表
+    /// `SystemLink`,本实现无法逐项复刻;开启后按本 crate 的确定序补字形
+    /// (宿主注入字体优先,其次系统字体目录)。
+    pub fn set_fallback(&mut self, fallback: bool) {
+        if self.fallback != fallback {
+            self.fallback = fallback;
+            // 关掉后不能让上一模式合成的回退字形继续从缓存里命中。
+            self.cache.clear();
+        }
+    }
+
+    /// 当前回退开关(诊断/测试)。
+    #[must_use]
+    pub fn fallback(&self) -> bool {
+        self.fallback
     }
 
     #[must_use]
@@ -86,18 +118,86 @@ impl FontRenderer {
     }
 
     fn rasterize_base(&mut self, ch: char, style: &TextStyle) -> Result<GlyphBitmap, Diag> {
-        self.rasterizer.rasterize(
-            &self.source,
-            style.face,
-            ch,
-            RasterParams {
-                sx: style.sx,
-                sy: style.sy,
-                bold: style.bold,
-                italic: style.italic,
-                aa: style.aa,
-            },
-        )
+        let params = RasterParams {
+            sx: style.sx,
+            sy: style.sy,
+            bold: style.bold,
+            italic: style.italic,
+            aa: style.aa,
+        };
+        match self
+            .rasterizer
+            .rasterize(&self.source, style.face, ch, params)
+        {
+            Ok(base) => Ok(base),
+            // 只对「该 face 无此字形」回退;字体数据损坏/尺寸非法等错误
+            // 换字体也救不了,保持原诊断。
+            Err(diag) if self.fallback && diag.code == code::font::GLYPH_MISSING => {
+                let Some(face) = self.fallback_face(style.face, ch) else {
+                    return Err(diag);
+                };
+                // 基线/字号沿用主样式;回退 face 自己的 advance 与 bearing
+                // 由栅格器给出(`RasterParams` 不变,bold/italic 按新 face
+                // 解析)。脚本按 SX 假设居中的偏移属比例字体固有风险
+                // (DIV-FONT-001),不在这里强行改字宽。
+                self.rasterizer.rasterize(&self.source, face, ch, params)
+            }
+            Err(diag) => Err(diag),
+        }
+    }
+
+    /// 在字体源里替 `primary` 找一个含 `ch` 的 face。
+    ///
+    /// 顺序(确定性):
+    /// 1. 宿主注入字体(`FaceOrigin::Embedded`)—— 汉化/发行方补字体;
+    /// 2. 系统字体;
+    /// 3. 同类按 `FontSource::catalog` 的 family 序,取每族代表 face。
+    ///
+    /// 每一对 `(primary, ch)` 只扫描一次;失败也缓存,避免每帧重扫。
+    fn fallback_face(&mut self, primary: FaceId, ch: char) -> Option<FaceId> {
+        if let Some(hit) = self.fallback_memo.get(&(primary, ch)) {
+            return *hit;
+        }
+        let hit = self.pick_fallback_face(primary, ch);
+        if self.fallback_memo.len() >= FALLBACK_MEMO_CAP {
+            self.fallback_memo.clear();
+        }
+        self.fallback_memo.insert((primary, ch), hit);
+        match hit {
+            Some(face) => log::info!(
+                target: "yu-font",
+                "[font] U+{:04X} missing in face {} -> fallback {}",
+                ch as u32,
+                primary.index(),
+                self.source.describe_face(face)
+            ),
+            None => log::debug!(
+                target: "yu-font",
+                "[font] U+{:04X} missing in face {} -> no fallback face",
+                ch as u32,
+                primary.index()
+            ),
+        }
+        hit
+    }
+
+    fn pick_fallback_face(&self, primary: FaceId, ch: char) -> Option<FaceId> {
+        for origin in [FaceOrigin::Embedded, FaceOrigin::System] {
+            for entry in self
+                .source
+                .catalog()
+                .iter()
+                .filter(|entry| entry.origin == origin)
+            {
+                if entry.face == primary {
+                    continue;
+                }
+                if self.source.face_has_char(entry.face, ch) {
+                    return Some(entry.face);
+                }
+            }
+        }
+        None
     }
 
     /// Layout-free horizontal run used by the reference renderer.

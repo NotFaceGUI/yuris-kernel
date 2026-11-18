@@ -106,6 +106,78 @@ fn missing_glyph_is_a_diag_not_a_panic() {
     assert_eq!(third, err);
 }
 
+/// 找一个「主 face 缺字、另一 catalog face 有字」的字符;系统字体不满足
+/// 时返回 `None`,调用方可见 skip(与其它字体样本用例同口径)。
+fn fallback_pair(font: &support::TestFont) -> Option<(char, yu_font::FaceId)> {
+    const CANDIDATES: &[char] = &['あ', '漢', 'Ω', 'é', '①', '한', 'ğ', '😀'];
+    for &ch in CANDIDATES {
+        if !matches!(font.source.glyph_index(font.face, ch), Ok(None)) {
+            continue;
+        }
+        for entry in font.source.catalog() {
+            if entry.face != font.face
+                && matches!(font.source.glyph_index(entry.face, ch), Ok(Some(gid)) if gid != 0)
+            {
+                return Some((ch, entry.face));
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn font_fallback_completes_missing_glyph_only_when_enabled() {
+    let Some(font) = support::load_test_font() else {
+        return;
+    };
+    let Some((ch, fallback_face)) = fallback_pair(&font) else {
+        println!("SKIP[font:fallback] no two system faces with disjoint coverage");
+        return;
+    };
+    println!(
+        "fallback pair: U+{:04X} primary={} fallback={}",
+        ch as u32,
+        font.face.index(),
+        fallback_face.index()
+    );
+    let style = yu_font::TextStyle::engine_default(font.face);
+    let mut r = FontRenderer::new(font.source, CacheLimits::default());
+    let err = r.render_glyph(ch, &style, StylePolicy::Strict).unwrap_err();
+    assert_eq!(
+        err.code,
+        code::font::GLYPH_MISSING,
+        "默认(回退关)必须保持官方缺字诊断"
+    );
+    r.set_fallback(true);
+    let img = r.render_glyph(ch, &style, StylePolicy::Strict).unwrap();
+    assert!(img.width > 0 && img.height > 0, "回退字形必须有墨迹");
+    assert!(img.advance > 0, "回退字形必须使用回退 face 的 advance");
+    let again = r.render_glyph(ch, &style, StylePolicy::Strict).unwrap();
+    assert_eq!(img.hash64(), again.hash64(), "回退字形必须确定性可复现");
+    r.set_fallback(false);
+    let err = r.render_glyph(ch, &style, StylePolicy::Strict).unwrap_err();
+    assert_eq!(
+        err.code,
+        code::font::GLYPH_MISSING,
+        "关闭回退后不能复用缓存里的回退字形"
+    );
+}
+
+#[test]
+fn font_fallback_still_reports_uncodable_characters() {
+    let Some(font) = support::load_test_font() else {
+        return;
+    };
+    let style = yu_font::TextStyle::engine_default(font.face);
+    let mut r = FontRenderer::new(font.source, CacheLimits::default());
+    r.set_fallback(true);
+    // U+10FFFF 不在任何 Unicode 平面内分配;任何 face 都不应有它。
+    let err = r
+        .render_glyph('\u{10FFFF}', &style, StylePolicy::Strict)
+        .unwrap_err();
+    assert_eq!(err.code, code::font::GLYPH_MISSING);
+}
+
 #[test]
 fn bad_font_is_a_diag_not_a_panic() {
     let err =
