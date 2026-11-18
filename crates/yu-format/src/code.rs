@@ -36,6 +36,10 @@ pub const CODEC_INVALID: &str = "fmt.codec.invalid";
 pub const CODEC_NAME: &str = "fmt.codec.name";
 /// YSSD 存档载荷压缩层失败(非 zlib 流/解压不闭合;P4)。
 pub const YSSD_CODEC: &str = "fmt.yssd.codec";
+/// YCG 容器(method 1 的两段 zlib)解压/长度失败。
+pub const YCG_CODEC: &str = "fmt.ycg.codec";
+/// YCG 容器的方法/字段超出官方实现(官方只写 method 0/1)。
+pub const YCG_UNSUPPORTED: &str = "fmt.ycg.unsupported";
 
 /// 全部已登记错误码(顺序稳定)。唯一性由单元测试守卫。
 pub const ALL_CODES: &[&str] = &[
@@ -55,6 +59,8 @@ pub const ALL_CODES: &[&str] = &[
     CODEC_INVALID,
     CODEC_NAME,
     YSSD_CODEC,
+    YCG_CODEC,
+    YCG_UNSUPPORTED,
 ];
 
 /// 码是否已登记。用于诊断自检与测试。

@@ -61,6 +61,7 @@ pub mod yser;
 pub mod ymv;
 pub mod snappy;
 pub mod yssd;
+pub mod ycg;
 pub mod yssfs;
 pub mod ystd;
 pub mod ystl;
