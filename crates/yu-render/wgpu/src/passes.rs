@@ -428,7 +428,17 @@ impl Planner<'_> {
             None => (f64::from(width), f64::from(height)),
         };
         // 顶点 UV = 本层内容的采样窗;遮罩按层内 [0,1] 映射到自己的窗。
-        let (draw_uv, mask_uv) = (clamp_uv_max(from.3), clamp_uv_max(mask.3));
+        //
+        // **不能用 `clamp_uv_max`**:普通层路径 (`plan_layer`) 直接把
+        // `content.uv` 交给顶点;当 `SIZE` 的显示尺寸比源纹理大 1px 时
+        // (本作 SPL201: `1153x721` over `1152x720`),普通层的 uv 是
+        // `1.000868/1.001389`,采样器按 ClampToEdge 把最后一列/行重复,
+        // 画面是 1:1;过渡层若把 uv 钳回 `[0,1]`,同一张 1152x720 纹理会
+        // 被拉伸到 1153x721,过渡结束交接给普通层的瞬间背景就跳 1px。
+        // 证据(本作 natsunokusari, engine 3120/3122 逐帧):
+        // 普通层 SPL201 UV=1.000868/1.001389,过渡层 `from` 1152x720 原先
+        // 被钳成 [0,0,1,1];钳制导致过渡期间整幅背景被拉伸 1px。
+        let (draw_uv, mask_uv) = (from.3, mask.3);
         let uniform_values: Vec<f32> = vec![
             transition.fade as f32,
             f32::from(transition.ta),
@@ -1179,16 +1189,6 @@ impl Accum {
     }
 }
 
-pub(crate) fn clamp_uv_max(uv: [f32; 4]) -> [f32; 4] {
-    // 逐分量钳到 [0,1];**不能**强制 `u1>=u0`/`v1>=v0` —— 镜像
-    // (`HORIZONTAL`/`VERTICAL`)与负缩放的采样窗本来就是反向的。
-    [
-        uv[0].clamp(0.0, 1.0),
-        uv[1].clamp(0.0, 1.0),
-        uv[2].clamp(0.0, 1.0),
-        uv[3].clamp(0.0, 1.0),
-    ]
-}
 
 /// 像素内容指纹(FNV-1a over 尺寸 + RGBA)。
 pub(crate) fn hash_rgba(width: u32, height: u32, rgba: &[u8]) -> u64 {
