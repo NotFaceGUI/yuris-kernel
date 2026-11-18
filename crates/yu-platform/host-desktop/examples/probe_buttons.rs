@@ -176,6 +176,7 @@ fn run() -> Result<(), String> {
                     let src_live = match &c.source {
                         yu_gfx::CopySource::Layer(l) => frame.layers.iter().any(|x| &x.id == l),
                         yu_gfx::CopySource::Group(g) => frame.layers.iter().any(|x| &x.id == g),
+                        yu_gfx::CopySource::Screen(_) => true,
                     };
                     println!(
                         "  COPY {:?} src_live={src_live} frozen={} dest={} status={:?}",

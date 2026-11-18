@@ -89,13 +89,46 @@ impl CopyKind {
     }
 }
 
-/// 复制源。
+/// 复制源。**类型即后端需要读取的像素来源**，后端不得再按窗口表推断。
+///
+/// 三种源对应三种互斥的读取契约：
+///
+/// | 源 | 命令时刻需要什么 | 像素来源 |
+/// |---|---|---|
+/// | `Layer` | 源层当前 `(layer, epoch)` 表面 + 冻结的 `source_texture`/`texts` | 层表面 |
+/// | `Group` | 组内成员层的命令时刻像素 | 逐成员现绘到离屏 |
+/// | `Screen` | **上次呈现帧**的真实屏幕；若 `frame.screen_snapshots[copy.id]` 存在则用它 | 屏幕表面 |
+///
+/// `Screen` 是主窗口 `:/W0/`：官方 `es_Scenario.yst:1174-1182` 的
+/// `_DXMODE=0` ELSE 分支直接 `COPY2 :/W0/`。它不是离屏组，也不能零拷贝
+/// 别名/延迟物化——屏幕表面每帧被呈现改写，别名会让快照随下一帧变化
+/// （冻结语义只允许不可变源，EVID-T-12）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopySource {
-    /// 单个图层(图像或已合成的组)。
+    /// 单个图层表面（命令时刻的层像素）。
     Layer(LayerId),
-    /// 图层组(取组离屏合成结果)。
+    /// 普通图层组：取组离屏的当前合成结果。
     Group(LayerId),
+    /// 主窗口屏幕 `:/W0/`：上次呈现帧（或命令时刻屏幕快照）。
+    ///
+    /// payload 只是主窗口组标识（诊断/JSON 兼容）；像素语义是**屏幕**，
+    /// 不是离屏组合成 —— 后端按变体匹配，不得再用这个 id 去查窗口表。
+    Screen(LayerId),
+}
+
+impl CopySource {
+    /// 是否为主窗口屏幕（后端只读屏幕表面，不组合成员层）。
+    pub const fn is_screen(&self) -> bool {
+        matches!(self, Self::Screen(_))
+    }
+
+    /// 源标识：`Layer`/`Group` 返回层/组 id；`Screen` 返回其窗口组 id
+    /// （像素语义仍是屏幕，仅用于诊断/日志定位）。
+    pub fn layer(&self) -> Option<&LayerId> {
+        match self {
+            Self::Layer(id) | Self::Group(id) | Self::Screen(id) => Some(id),
+        }
+    }
 }
 
 /// 复制区域(引擎 `X/Y/X2/Y2` 原值;`Full` = 未给区域)。

@@ -474,6 +474,13 @@ pub fn op(out: &mut String, o: &Op) {
                     wid(out, x);
                     out.push('}');
                 }
+                // 与历史输出逐字节一致：屏幕源序列化为主窗口组。
+                // （类型在 Rust 侧区分，JSON 只是诊断投影。）
+                CopySource::Screen(x) => {
+                    out.push_str("{\"kind\":\"group\",\"id\":");
+                    wid(out, x);
+                    out.push('}');
+                }
             }
             out.push_str(",\"dest\":");
             wid(out, &c.dest);

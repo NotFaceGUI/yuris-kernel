@@ -55,6 +55,7 @@ fn main() {
             let s = match &c.source {
                 yu_gfx::op::CopySource::Layer(l) => l.display(),
                 yu_gfx::op::CopySource::Group(g) => format!("group:{}", g.display()),
+                yu_gfx::op::CopySource::Screen(_) => "screen".to_string(),
             };
             if d.contains(&prefix) || s.contains(&prefix) {
                 lines.push(format!(

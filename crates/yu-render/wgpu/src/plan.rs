@@ -246,6 +246,7 @@ pub(crate) fn plan(
     text_uploads: &mut TextUploads,
     backbuffer: Option<&Surface>,
     backbuffer_gpu: &mut Option<(u64, u64)>,
+    screen_surface: Option<&TexRef>,
     text: &mut TextComposer,
     text_gpu: &mut Option<crate::text_gpu::TextGpuRenderer>,
     force_bilinear_scale: bool,
@@ -566,6 +567,7 @@ pub(crate) fn plan(
                         &mut writes,
                         backbuffer,
                         backbuffer_gpu,
+                        screen_surface,
                         text,
                         &mut acc,
                         pass_target,
@@ -2453,6 +2455,7 @@ fn apply_copy(
     writes: &mut SurfaceWrites<'_>,
     backbuffer: Option<&Surface>,
     backbuffer_gpu: &mut Option<(u64, u64)>,
+    screen_surface: Option<&TexRef>,
     text: &mut TextComposer,
     acc: &mut Accum,
     pass_target: &LayerId,
@@ -2485,6 +2488,11 @@ fn apply_copy(
             }
         }
     }
+    // 屏幕源由 `CopySource::Screen` **类型化**（gfx 在命令处定型），
+    // 后端不再按窗口表推断。屏幕表面每帧被呈现改写 ⇒ 不能零拷贝别名/
+    // 延迟物化（别名会在同一 encoder 末尾的屏幕拷贝里被下一帧像素覆盖，
+    // 点击帧 alpha 247 / 淡出黑屏的根因）。
+    let screen_source = copy.source.is_screen();
     let source = match &copy.source {
         CopySource::Layer(id) => {
             let content = resolve_source(
@@ -2550,55 +2558,42 @@ fn apply_copy(
                 }
             }
         }
-        CopySource::Group(group) => {
+        // 主窗口屏幕：读命令时刻快照（同帧两次截屏可不同：CGTSS 旧屏 →
+        // 隐藏 UI → CGSSS 新屏）；无快照 = 上次呈现帧的真实 GPU 表面，
+        // 首帧回退清屏色。
+        CopySource::Screen(_) => {
             if std::env::var_os("YU_PASS_TRACE").is_some() {
                 let snap = frame.screen_snapshots.get(&copy.id);
                 eprintln!(
-                    "[copy] f={} id={} src=Group({}) screen_snapshot={} snap_layers={} snap_passes={}",
+                    "[copy] f={} id={} src=Screen screen_snapshot={} snap_layers={} snap_passes={}",
                     frame.frame,
                     copy.id.0,
-                    group.display(),
                     snap.is_some(),
                     snap.map(|s| s.layer_ids.len()).unwrap_or(0),
                     snap.map(|s| s.passes.len()).unwrap_or(0),
                 );
             }
-            let main_group = frame
-                .windows
-                .iter()
-                .find(|w| w.number == 0)
-                .and_then(|w| w.layer_set.as_ref());
-            if Some(group) == main_group {
-                // 主窗口截屏读**命令执行时**的画面(同帧两次截屏可以不同:
-                // CGTSS 旧屏 → 隐藏 UI → CGSSS 新屏)。gfx 记录了命令时刻
-                // 的绘制契约;没有快照时(首帧/旧帧)回退后缓冲。
-                if let Some(snapshot) = frame.screen_snapshots.get(&copy.id) {
-                    Content::identity(
-                        screen_snapshot_content(
-                            ctx, frame, layers, snapshot, textures, gpu, pipelines, targets,
-                            surfaces,
-                            contents, bases, writes, text, copy.id, tuning,
-                        )?,
-                        0,
-                    )
-                } else {
-                    backbuffer_content(
-                        ctx,
-                        frame,
-                        gpu,
-                        pipelines,
-                        backbuffer,
-                        backbuffer_gpu,
-                        writes,
-                    )?
-                }
+            if let Some(snapshot) = frame.screen_snapshots.get(&copy.id) {
+                Content::identity(
+                    screen_snapshot_content(
+                        ctx, frame, layers, snapshot, textures, gpu, pipelines, targets,
+                        surfaces, contents, bases, writes, text, copy.id, tuning,
+                    )?,
+                    0,
+                )
+            } else if let Some(screen) = screen_surface {
+                Content::identity(Rc::new(screen.clone()), 0)
             } else {
-                let tex = compose_group_content(
-                    ctx, frame, textures, gpu, pipelines, targets, surfaces, contents, bases,
-                    writes, group,
-                )?;
-                Content::identity(tex, 0)
+                // 首帧没有历史呈现面(D3D9 后缓冲初值 = 清屏色)。
+                backbuffer_content(ctx, frame, gpu, pipelines, backbuffer, backbuffer_gpu, writes)?
             }
+        }
+        CopySource::Group(group) => {
+            let tex = compose_group_content(
+                ctx, frame, textures, gpu, pipelines, targets, surfaces, contents, bases,
+                writes, group,
+            )?;
+            Content::identity(tex, 0)
         }
     };
     let (sw, sh) = (source.width, source.height);
@@ -2650,7 +2645,7 @@ fn apply_copy(
         clip_h,
     };
     // 同帧同源同区域去重:源内容不可变 ⇒ 结果逐像素相同,可共享纹理。
-    let dedup_key = copy.texts.is_empty().then(|| SnapshotDedupKey {
+    let dedup_key = (copy.texts.is_empty() && !screen_source).then(|| SnapshotDedupKey {
         source_tex: source.tex.id,
         source_hash: source.hash,
         x0,
@@ -2665,9 +2660,10 @@ fn apply_copy(
     // 后续 op 当源,快照本身也不被层/复制引用。后续帧真正用到时,由
     // `plan` 头部按登记时冻结的源内容补齐(版本固定)。
     let may_defer = copy.texts.is_empty()
+        && !screen_source
         && !reads.snapshots.contains(&copy.id)
         && !reads.layers.contains(&copy.dest);
-    let tex = if full && source.is_identity() && out_w == sw && out_h == sh {
+    let tex = if !screen_source && full && source.is_identity() && out_w == sw && out_h == sh {
         // 别名:快照 = 源内容句柄(零拷贝)。内容纹理永不原地改写
         // (surfaces 不变量 1)⇒ 冻结语义天然成立。
         surfaces.note_alias_hit();

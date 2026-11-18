@@ -166,7 +166,6 @@ impl GfxCapture {
     /// (复制要到帧末才执行),整帧软回放又太慢(debug 1.5s,会吃掉同一帧
     /// 开始的淡入/淡出)。上一帧屏幕是玩家此刻看到的画面,缩略图语义足够。
     fn screen_frame_for(&self, id: CopyId, state: &GfxState) -> Option<Rc<Texture>> {
-        let main = &state.config().main_layer_set;
         let mut current = id;
         for _ in 0..8 {
             let copy =
@@ -174,7 +173,8 @@ impl GfxCapture {
                     copy.id == current && copy.status == yu_gfx::OpStatus::Executable
                 })?;
             match &copy.source {
-                CopySource::Group(group) if group == main => {
+                // 屏幕源是类型化的 `:/W0/`：上一帧呈现面即可（抓帧回退）。
+                CopySource::Screen(_) => {
                     let screen = self.last_screen.as_ref()?;
                     return Some(Rc::new(Texture {
                         width: screen.width,
@@ -397,10 +397,11 @@ impl LayerCapture for GfxCapture {
                     .copies()
                     .iter()
                     .filter(|copy| {
-                        let source_id = match &copy.source {
-                            yu_gfx::CopySource::Layer(id) | yu_gfx::CopySource::Group(id) => id,
-                        };
-                        copy.dest == parsed.path || *source_id == parsed.path
+                        copy.dest == parsed.path
+                            || copy
+                                .source
+                                .layer()
+                                .is_some_and(|source| *source == parsed.path)
                     })
                     .map(|copy| {
                         format!(

@@ -70,6 +70,7 @@ fn run() -> Result<(), String> {
     let mut hash_csv: Option<PathBuf> = None;
     // 逐帧时序 CSV(帧号/图层/op/阶段耗时):定位「越跑越慢」单调增长用。
     let mut frame_csv: Option<PathBuf> = None;
+    let mut save_root: Option<PathBuf> = None;
     let mut index = 2;
     while index < args.len() {
         match args[index].as_str() {
@@ -107,6 +108,10 @@ fn run() -> Result<(), String> {
                 frame_csv = Some(PathBuf::from(args.get(index + 1).ok_or_else(usage)?));
                 index += 2;
             }
+            "--save-root" => {
+                save_root = Some(PathBuf::from(args.get(index + 1).ok_or_else(usage)?));
+                index += 2;
+            }
             other => return Err(format!("未知参数 `{other}`\n{}", usage())),
         }
     }
@@ -123,6 +128,7 @@ fn run() -> Result<(), String> {
         entry: scenario.entry.clone(),
         fps: 60,
         record_events: false,
+        save_root,
         ..EngineOptions::default()
     };
     let mut engine = Engine::new(project, options).map_err(|e| e.message)?;

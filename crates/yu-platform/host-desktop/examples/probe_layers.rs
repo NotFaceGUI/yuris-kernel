@@ -42,6 +42,7 @@ struct Args {
     clicks: Vec<(u64, i64, i64)>,
     pixels: Vec<(i64, i64)>,
     backend: Backend,
+    save_root: Option<std::path::PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -59,6 +60,7 @@ fn parse_args() -> Result<Args, String> {
     let mut clicks = Vec::new();
     let mut pixels = Vec::new();
     let mut backend = Backend::Wgpu;
+    let mut save_root = None;
     let mut i = 4;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -105,6 +107,12 @@ fn parse_args() -> Result<Args, String> {
                 pixels.push((x, y));
                 i += 2;
             }
+            "--save-root" => {
+                save_root = Some(std::path::PathBuf::from(
+                    argv.get(i + 1).ok_or("--save-root 缺参数")?,
+                ));
+                i += 2;
+            }
             "--backend" => {
                 // 取值解析只有 `Backend::parse` 一份(与 CLI 同一套文案)。
                 backend = Backend::parse(argv.get(i + 1).ok_or("--backend 缺参数")?)
@@ -122,6 +130,7 @@ fn parse_args() -> Result<Args, String> {
         clicks,
         pixels,
         backend,
+        save_root,
     })
 }
 
@@ -161,6 +170,7 @@ fn run() -> Result<(), String> {
         EngineOptions {
             backend: args.backend,
             entry: "SYSTEM_START".to_string(),
+            save_root: args.save_root,
             ..EngineOptions::default()
         },
     )
@@ -255,6 +265,7 @@ fn run() -> Result<(), String> {
                 let src = match &copy.source {
                     yu_gfx::CopySource::Layer(id) => id.display(),
                     yu_gfx::CopySource::Group(id) => format!("group:{}", id.display()),
+                    yu_gfx::CopySource::Screen(_) => "screen".to_string(),
                 };
                 if !dest.contains(&args.prefix) && !src.contains(&args.prefix) {
                     continue;

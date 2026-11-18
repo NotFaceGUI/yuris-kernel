@@ -198,6 +198,7 @@ fn run() -> Result<(), String> {
                     format!("Layer {} live={live}", l.display())
                 }
                 yu_gfx::CopySource::Group(g) => format!("Group {}", g.display()),
+                yu_gfx::CopySource::Screen(_) => "Screen".to_string(),
             };
             let users: Vec<String> = frame
                 .layers

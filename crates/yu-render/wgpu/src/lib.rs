@@ -229,6 +229,11 @@ pub struct WgpuRenderer {
     backbuffer: Option<Arc<Surface>>,
     /// 后缓冲 GPU 纹理缓存:`(content_hash, gpu_id)`。
     backbuffer_gpu: Option<(u64, u64)>,
+    /// 上次呈现帧的**真实 GPU 像素**(`_DXMODE=0` 的 `:/W0/` 复制源)。
+    ///
+    /// 每帧呈现时从屏幕目标 GPU 拷贝；`COPY2 ID=:/W0/` 的命令时刻读它。
+    /// 桌面 streaming 路径不再依赖滞后的 CPU 后缓冲（点击帧淡出黑屏的根因）。
+    screen_surface: Option<surfaces::TexRef>,
     /// 文本栅格化/合成器(与 soft 同一实现;懒加载系统字体)。
     text: yu_render_core::TextComposer,
     /// GPU 文本 pass(字形直接写层表面;能力不支持时为 `None` → CPU 回退)。
@@ -413,6 +418,7 @@ impl WgpuRenderer {
             text_uploads: plan::TextUploads::default(),
             backbuffer: None,
             backbuffer_gpu: None,
+            screen_surface: None,
             text: yu_render_core::TextComposer::with_tuning(tuning),
             text_gpu,
             snapshot_registry: Rc::new(RefCell::new(BTreeMap::new())),
@@ -509,6 +515,7 @@ impl WgpuRenderer {
     pub fn reset(&mut self) {
         self.backbuffer = None;
         self.backbuffer_gpu = None;
+        self.screen_surface = None;
         self.surfaces.reset();
         for id in self.text_uploads.clear() {
             self.gpu_textures.remove(id, &mut self.pipelines);
@@ -828,6 +835,7 @@ impl WgpuRenderer {
             &mut self.text_uploads,
             self.backbuffer.as_deref(),
             &mut self.backbuffer_gpu,
+            self.screen_surface.as_ref(),
             &mut self.text,
             &mut self.text_gpu,
             self.force_bilinear_scale,
@@ -852,6 +860,10 @@ impl WgpuRenderer {
             text_gpu.encode(&plan.text_jobs, &mut encoder);
         }
         self.encode_passes(&plan, &mut encoder)?;
+        // 呈现前把屏幕目标拷进 `screen_surface`：下一 tick 的
+        // `COPY2 ID=:/W0/` 在命令时刻读到的就是这一帧的真实像素。
+        // 与绘制同一次提交，不引入额外 submit。
+        self.capture_screen_surface(&mut encoder, frame.viewport.width, frame.viewport.height)?;
         let t_encode = started.elapsed() - t_plan;
 
         // 帧末剪枝采样 bind group:只保留当前仍存活的纹理。
@@ -1422,6 +1434,90 @@ impl WgpuRenderer {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// 把本帧屏幕目标拷进 `screen_surface`（上次呈现帧的真实像素）。
+    ///
+    /// 证据：官方 ERIS `es_Scenario.yst:1174-1182` 的 `_DXMODE=0` ELSE 分支
+    /// 用 `COPY2 ID=:/W0/` 读**当前屏幕**。gfx 在“命令时刻屏幕契约 ==
+    /// 上一呈现帧契约”时不再构造整屏快照（主尖峰优化）；这要求后端始终
+    /// 有一张**真实的上次呈现表面**。soft 有 `last_screen`，而桌面 wgpu
+    /// streaming 的 CPU 后缓冲是滞后的（读回可跳过）——点击帧据此退化成
+    /// 清屏黑，CGS 幕布整段淡出无内容（2026-11-18 实机复现）。
+    ///
+    /// 每帧在**同一 encoder 末尾**做 GPU→GPU 拷贝：本帧更早编码的
+    /// `:/W0/` 复制读到的是上一帧内容，本帧结束时才更新为当帧像素。
+    fn capture_screen_surface(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Diag> {
+        if width == 0 || height == 0 {
+            return Err(Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                .with_detail("屏幕表面尺寸为 0"));
+        }
+        let needs_new = self
+            .screen_surface
+            .as_ref()
+            .is_none_or(|s| s.width != width || s.height != height);
+        if needs_new {
+            let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("yu screen surface (last presented)"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: crate::pipelines::TARGET_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.screen_surface = Some(surfaces::TexRef {
+                id: 0,
+                width,
+                height,
+                texture,
+                view,
+            });
+        }
+        let screen_texture = {
+            let screen = self.targets.screen().ok_or_else(|| {
+                Diag::fatal(device::code::TARGET, yu_log::Boundary::Platform)
+                    .with_detail("帧结束时没有屏幕目标")
+            })?;
+            screen.texture.clone()
+        };
+        let dst = self
+            .screen_surface
+            .as_ref()
+            .expect("screen surface just ensured");
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &screen_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &dst.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
         Ok(())
     }
 

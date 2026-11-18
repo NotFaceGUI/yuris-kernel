@@ -1342,6 +1342,8 @@ impl GfxState {
             }
             let source_live = match &c.source {
                 CopySource::Layer(id) | CopySource::Group(id) => self.nodes.contains_key(id),
+                // 主窗口屏幕始终存在（窗口在引擎启动时建立）。
+                CopySource::Screen(_) => true,
             };
             if c.status == OpStatus::Executable && !source_live && c.source_texture.is_none() {
                 continue;
@@ -4242,6 +4244,9 @@ impl GfxState {
             return;
         }
         let source_is_group = self.nodes[source].layer.is_group();
+        // 主窗口 `:/W0/` = 屏幕表面，不是离屏组：类型在这里定型，后端不再
+        // 按窗口表推断（`CopySource::Screen`）。
+        let source_is_screen = source_is_group && self.is_main_group(source);
         if !self.nodes.contains_key(dest) {
             // 手册 cg/cgact.html 例 30:目标层可作为复制结果出现。
             self.create_image(dest, TextureRef::None, None);
@@ -4294,6 +4299,8 @@ impl GfxState {
         // `COPY2` 切片 → 全部按钮建完后 `CGEND[BT.OFF.TMP]`)。本内核的纹理
         // pass 在帧末回放,那时源节点已不存在;记录当时的 `TextureRef` 才能
         // 按官方语义重放。组源不需要(它按组 id 自合成)。
+        // `Layer` 才有命令时刻基础纹理；`Group`/`Screen` 由后端按各自
+        // 契约取像素（组=成员现绘，屏幕=上次呈现帧/命令时刻快照）。
         let source_texture = if source_is_group {
             None
         } else {
@@ -4343,7 +4350,9 @@ impl GfxState {
             seq,
             id: copy_id,
             kind,
-            source: if source_is_group {
+            source: if source_is_screen {
+                CopySource::Screen(source.clone())
+            } else if source_is_group {
                 CopySource::Group(source.clone())
             } else {
                 CopySource::Layer(source.clone())
@@ -7726,6 +7735,10 @@ fn hash_copy_op(h: &mut impl Hasher, copy: &CopyOp) {
         }
         CopySource::Group(id) => {
             1u8.hash(h);
+            id.hash(h);
+        }
+        CopySource::Screen(id) => {
+            2u8.hash(h);
             id.hash(h);
         }
     }

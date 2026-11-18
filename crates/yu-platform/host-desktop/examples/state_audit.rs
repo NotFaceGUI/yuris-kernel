@@ -91,6 +91,7 @@ fn run() -> Result<(), String> {
                     let source = match &copy.source {
                         yu_gfx::op::CopySource::Layer(id) => id.display(),
                         yu_gfx::op::CopySource::Group(id) => format!("{}(group)", id.display()),
+                        yu_gfx::op::CopySource::Screen(_) => "screen".to_string(),
                     };
                     if source.contains("SPL") {
                         println!("    COPY(SPL) {source} -> {}", copy.dest.display());
