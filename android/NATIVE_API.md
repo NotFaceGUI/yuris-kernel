@@ -111,6 +111,7 @@ so 的 ABI:`arm64-v8a`(真机)、`x86_64`(模拟器)。so 的 `backend` 缺省�
   "snapshot_defer": false,     // COPY2 快照延迟物化
   "text_base_cache": true,     // 文本基面 CPU 缓存
   "text_gpu": true,            // GPU 文本 pass
+  "font_fallback": false,      // 逐字形缺字回退(宿主字体优先)
   "pipeline_prewarm": true,    // 启动期管线预热
   "png_backend": "image",      // image | libpng
   "vm_profile": false,         // VM opcode 逐条耗时归因

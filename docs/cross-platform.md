@@ -126,6 +126,7 @@ JSON 键
 | `snapshot_defer` / `--snapshot-defer[=on\|off]` | off | `YURIS_SNAPSHOT_DEFER` |
 | `text_base_cache` / `--text-base-cache[=on\|off]` | on | `YURIS_TEXT_BASE_CACHE` |
 | `text_gpu` / `--text-gpu[=on\|off]` | on | `YURIS_TEXT_GPU` |
+| `font_fallback` / `--font-fallback[=on\|off]` | off | `YURIS_FONT_FALLBACK` |
 | `pipeline_prewarm` / `--pipeline-prewarm[=on\|off]` | on | `YURIS_PIPELINE_PREWARM` |
 | `png_backend` / `--png-backend image\|libpng` | image | `YURIS_PNG_BACKEND` |
 | `png_cmp` / `--png-cmp[=on\|off]` | off | `YURIS_PNG_CMP` |

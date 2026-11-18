@@ -1,6 +1,6 @@
 # DIV-FONT-012 · 宿主默认字体与游戏内字体选择器
 
-- 状态: **fixed(2026-11-16;逐字形缺字回退仍挂账)**
+- 状态: **fixed(2026-11-16;逐字形缺字回退提供可选开关,默认关)**
 - 影响面: `crates/yu-font/src/source.rs`、`crates/yu-render/core/src/text.rs`、
   `crates/yu-gfx/src/state.rs`、`crates/yu-engine/src/engine.rs`、
   `crates/yu-cli/src/{args,run,desktop,server}.rs`
@@ -82,8 +82,11 @@ cargo test -p yu-backend-wgpu --test wgpu text_
 
 ## 5. 残余
 
-- **无逐字形缺字回退**:选到缺日文字形的系统字体会整段缺字(GDI 有 font
-  linking;本轮按主人“别复杂”要求不做)。风险已在此登记。
+- **逐字形缺字回退默认关**:官方 GDI font linking 的候选顺序由注册表
+  `SystemLink` 决定,无法 1:1;开启 `font_fallback`(CLI
+  `--font-fallback` / Android `run-config.json` 同名键)后,按「宿主注入字体
+  → 系统字体」的确定序补字形,回退 face 自己的 advance/bearing 生效。
+  未复刻 GDI 的候选顺序;关掉时保持官方「缺字即不画」的行为。
 - 游戏硬编码的当前字体名标签(`$T(36,11)`)/默认列表下标仍由脚本与 GSD
   决定;首次运行且 GSD 为空时,列表首项已是宿主字体,但部分游戏可能仍把
   “默认”标签画成旧名。按游戏单独播种 GSD 不在本轮。

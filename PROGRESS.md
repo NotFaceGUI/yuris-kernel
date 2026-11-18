@@ -15826,3 +15826,137 @@ cargo check --workspace --all-targets
 - Android 失败 open 后 `MOVIEINFO[PLAY]` 变为 0;成功播放路径不变。
 - 换片关闭旧后端会释放旧 codec/temp;pending 音量/几何仍按原逻辑补发。
 - 未修改 `yu-emote`;未执行 git 写操作。
+
+## 成果 FONT-FALLBACK (2026-11-18) · 跨平台逐字形缺字回退开关
+
+### 关联
+
+- `DIV-FONT-012` §5「无逐字形缺字回退」挂账项;官方在 Windows 上由 GDI
+  font linking 补字,候选顺序来自注册表 `SystemLink`,无法逐项 1:1。
+- 因此做成 **显式 opt-in**:默认关 = 保持官方「缺字即不画」的现有行为,
+  宿主参数开启后按本 crate 的确定序补字形。
+
+### 改动
+
+- `yu-font::FontSource::face_has_char`:缺字回退的探测入口。系统字体
+  逐文件读取 charmap 后立即丢弃,不写入 `data_cache` —— 否则扫描几十个
+  候选 face 会把每个字体文件永久留在内存(Android Noto CJK 单个 ~20MB)。
+- `yu-font::FontRenderer::set_fallback`:逐字形回退开关 + `(主 face, char)`
+  → 回退 face 的缓存(失败也缓存);只在主 face 返回
+  `font.glyph_missing` 时触发,坏字体/非法尺寸仍按原诊断失败。回退 face
+  的 advance/bearing 生效,基线仍用主 face 的 ascent;切换开关清字形缓存,
+  避免关掉后继续命中回退字形。
+- 候选序:宿主注入字体(`FaceOrigin::Embedded`,汉化/发行方补字体)→ 系统
+  字体;同类按 `FontSource::catalog` 的 family 序取代表 face。
+- `RenderTuning::font_fallback`(默认 `false`)接入 `TextComposer` 三个
+  `FontRenderer` 构造点;CPU 合成与 GPU 字形收集共用 `render_glyph`,
+  两条路径同时生效。
+- CLI `--font-fallback[=on|off]`(兼容别名 `YURIS_FONT_FALLBACK`)、
+  `--help`、`to_cli_args` 透传;Android `run-config.json` 同名键
+  `font_fallback`。
+- Android Java 壳:`SetupActivity` 高级设置新增「缺字补全」开关(默认关,
+  SharedPreferences 键 `font_fallback`),`MainActivity` 经
+  `EXTRA_FONT_FALLBACK` 写入 run-config JSON;`debug/run-config.json`
+  调试覆盖同样生效。Rust 启动日志 `tuning={... font_fallback=...}`
+  可直接确认取值。
+- 文档:`docs/cross-platform.md` 参数表、`docs/font-contract.md` §3.1.1、
+  `DIV-FONT-012` 状态/残余、`android/NATIVE_API.md`、`yu-font/README.md`。
+- 测试:`font_fallback_completes_missing_glyph_only_when_enabled`(默认关
+  报缺字;开启后出墨迹、advance 用回退 face、重复渲染一致;关闭后不再命中)
+  与 `font_fallback_still_reports_uncodable_characters`。
+
+### 验证
+
+```text
+cargo check --workspace --all-targets
+  → Finished dev profile(CL/CFLAGS/CXXFLAGS=-utf-8,TEMP 指到 ASCII 可写目录)
+cargo test -p yu-font
+  → 全部通过;glyphs: 7 passed(回退对 U+D55C primary=119 fallback=106)
+cargo test -p yu-render-core --lib
+  → 28 passed; 0 failed
+cargo test -p yu-gfx --test text_pipeline
+  → 17 passed; 0 failed
+cargo test -p yu-cli --lib args
+  → 4 passed; 0 failed(含 --font-fallback 解析与 to_cli_args 往返)
+cargo test -p yu-host-android --lib --tests
+  → lib 25 passed(含 run_config_parses_render_feature_switches);
+    session 2 passed;dialog 1 ignored(需真实语料)
+yu-cli run --help
+  → 列出 --font-fallback[=on|off]
+BUILD_TYPE=release tools/android/build.sh arm64-v8a x86_64
+  → BUILD SUCCESSFUL in 28s;app-release.apk 28M
+unzip -p app-release.apk classes.dex | grep font_fallback
+  → 命中(Java 壳意图/JSON 键已进 APK)
+unzip -p app-release.apk lib/arm64-v8a/libyu_host_android.so | grep font_fallback
+  → 命中(so 已重编)
+```
+
+CLI 日志纪律测试 `cargo test -p yu-cli` 仍有既有失败(与本轮无关):
+`silent_fallback_audit` 报 `yu-gfx/src/state.rs` 29>18、`yu-rt/src/tables.rs`
+白名单缺项、`yu-rt/src/vm/handlers.rs` 82>80;`src_has_no_direct_terminal_macros`
+报 `yu-engine/src/engine.rs` 含 `println!`/`eprintln!`。这些文件本轮未改动。
+
+### 影响边界
+
+- 默认关:桌面/Android 都不开启时诊断/像素/性能与之前一致,继续按官方
+  缺字行为。Android 壳的开关持久化在同一份 SharedPreferences,
+  「清除已保存的选择」会把它一并复位。
+- 开启后只补 `font.glyph_missing`;回退字形不做跨 face kerning,脚本
+  「每字宽 = SX」的居中假设对比例回退字体仍可能偏移(归 DIV-FONT-001)。
+- 首个缺字会按 catalog 扫描候选字体;每个 `(主 face, char)` 只扫一次,
+  未命中同样缓存。GDI `SystemLink` 的候选顺序没有复刻。
+- 未执行 git 写操作。
+
+## 成果 YCG-HEADER (2026-11-18) · YCG 尺寸头解析,修复首幕 logo 与按钮命中区退化 1×1
+
+### 背景与根因
+
+47x 商业包（0.474–0.488）的 `.png` 条目是 YCG 容器（DIV-GFX-091 已修
+像素解码）。但 `yu-rt/src/image.rs::pixel_size` 仍只认 PNG/BMP/GIF/JPEG，
+`CGINFO[SX/SY]` 对 YCG 资产解析失败并按 0/1×1 回填：
+
+- `es_sprite.yst` 的暂存/裁剪层按 1×1 放样，可见层停在屏幕外哨兵
+  `(999999999, 999999999)`，首幕品牌 logo 不出现；
+- 0.479 `es_button.yst::es.IDBtnTask` 的矩形判定 `w/h` 来自层尺寸，
+  命中区退化成 1×1，点击已进 VM 也进不了 `CGINFO[ONMOUSE*]` 分支，
+  表现为“能显示画面但不能交互”。
+
+### 改动
+
+- `crates/yu-rt/src/image.rs`：`pixel_size` 增加 YCG 分支
+  （`YCG\0`、`+0x04=width`、`+0x08=height`，LE）；尺寸 0/截断返回
+  `None`。字段与官方 0.479 `FUN_004254e4` 一致。
+- 新增 `image::tests::ycg_header`。
+- 清理本轮临时取证开关（`YU_TRACE_SCRIPT` / `YU_TRACE_LABEL` /
+  `YU_TRACE_INPUT` / `YU_TRACE_ONMOUSE` / `YU_TRACE_GFX_QUERY` /
+  `YU_TRACE_CG` / `YU_TRACE_PC` / `YU_TRACE_TEX`）。
+
+### 验证
+
+```text
+cargo test -p yu-rt --lib image::tests
+  → 5 passed; 0 failed（含 ycg_header）
+
+0.479 样本 A（全新存档，soft）
+  probe_layers 20..300 --px 544,384 --px 640,480
+  → (544,384) 144→255 淡入；(640,480) 19,18,18→34,31,32；
+    与直接解码 cg/bg/logo.png 的中心 BGRA (32,31,34) 一致。
+
+0.479 样本 A 点击确认框（engine frame 1601，cursor 500,390）
+  → [onmouse] layer=:/W0/BT.OFFES.CSEL.BTN.SEL=1=1
+    flag=ONMOUSE2 pointer=(500,390)
+  → CSEL 层组从下一帧消失（ops 18→3），确认框关闭。
+
+0.479 样本 B（全新存档，soft）
+  → 同点位 89→158 淡入，logo 出现。
+
+0.474 样本（PNG 资产）不经过 YCG 分支，启动流程不变。
+```
+
+### 影响边界
+
+- 只影响图像头尺寸解析与依赖它的 `CGINFO[SX/SY]`、COPY/COPY2 快照
+  矩形、精灵/按钮命中区；不改解码像素、调度、输入时序。
+- wgpu headless 探针在本轮 `probe_layers` 采样中未复现 logo（软渲染
+  已复现，实机 wgpu 正常）；暂按探针采样面差异记录，未改后端。
+- 未执行 git 写操作。

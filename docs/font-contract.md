@@ -124,8 +124,15 @@ impl FontSource {
   宿主默认名（游戏字体页的“当前字体”与实际渲染一致）。
 - 持久化仍由游戏自己完成（ERIS `$es.GSD(113)` → `gsd.sd`）；内核不写宿主
   设置文件。
-- 残余：未做逐字形缺字回退（选中缺日文字形的字体仍会缺字）；游戏硬编码的
-  `$T(36,11)` 标签/默认下标仍由脚本与 GSD 决定（`DIV-FONT-012`）。
+- 逐字形缺字回退：默认关（官方把缺字交给 GDI font linking，候选顺序由注册表
+  `SystemLink` 决定，无法逐项 1:1）。宿主参数 `font_fallback`（CLI
+  `--font-fallback[=on|off]`、Android `run-config.json` 同名键）开启后，主
+  face 缺字时按「宿主注入字体 → 系统字体」的确定序选一个含该字的 catalog
+  face 补字形；只对 `font.glyph_missing` 生效，坏字体/非法尺寸仍按原诊断
+  失败。回退字形用回退 face 自己的 advance/bearing，基线仍按主 face 的
+  ascent。
+- 残余：游戏硬编码的 `$T(36,11)` 标签/默认下标仍由脚本与 GSD 决定
+  （`DIV-FONT-012`）。
 
 ### 3.2 栅格化
 

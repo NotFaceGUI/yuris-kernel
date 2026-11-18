@@ -124,6 +124,7 @@ Windows 下 NDK 的 sh 版 `*-clang` 无法被 Rust exec,`build.sh` 会自动改
 | 调试日志 | 关 | 开:每帧状态行写 logcat + `<游戏目录>/debug/yu-kernel.jsonl`,并启用混音抓取 |
 | 资产预取 | 关 | 等价桌面 `--prefetch`:`CG[FILE]` 声明即交后台解码,首用命中池/同步兜底 |
 | 快照延迟 | 关 | 等价桌面 `--snapshot-defer`:无读者的 COPY2 只登记,后续被引用再物化 |
+| 缺字补全 | 关 | 等价桌面 `--font-fallback`:主字体缺字时按「宿主注入字体→系统字体」补字形;默认关保持官方缺字不画 |
 | SIZE 双线性 | **开** | 官方 `SIZE` 是最近邻;手机高 DPI 下 CG/差分缩放锯齿,开启后按双线性采样(像素与官方有差异,见 `DIV-GFX-083`) |
 | PNG 解码 | **开** | 开:Android 走 libpng(NEON 反滤波;画面逐字节一致);关:回 `image` crate。角色首帧解码尖峰可在此 A/B |
 
@@ -239,6 +240,7 @@ mixer 停止取数并清空环形缓冲),不依赖渲染线程的下一帧 tick 
 | `audio` / `tone` | `audio` / `audio_tone` | 布尔(诊断) | true / false |
 | `prefetch` | `prefetch` | 布尔(资产异步预取) | false |
 | `snapshot_defer` | `snapshot_defer` | 布尔(COPY2 延迟物化) | false |
+| `font_fallback` | `font_fallback` | 布尔(逐字形缺字回退) | false |
 | `bilinear_scale` | `bilinear_scale` | 布尔(`SIZE` 双线性;手机画质) | 壳默认 true / 内核默认 false |
 | `png_fast` | `png_backend` | 布尔(开=`libpng`,关=`image`) | 壳默认 true |
 | `debug_log` / `show_hud` | —(壳侧) | 布尔 | false |

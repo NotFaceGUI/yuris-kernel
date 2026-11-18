@@ -12,7 +12,8 @@ YU-RIS 字体源 + 字形栅格化 + 文本样式合成。**只管"一个字长�
   `/product/fonts`;游戏点名的日文字体可由宿主经 `EngineOptions::font_bytes`
   注入(`<data>/fonts/`)。引擎默认 family 回退表(ＭＳ ゴシック →
   標準ゴシック → ＭＳ Ｐゴシック → ＭＳ 明朝 → 標準明朝)与官方
-  `EnumFontFamiliesExA` 行为对齐;缺失显式 `font.missing`,无静默 fallback。
+  `EnumFontFamiliesExA` 行为对齐;缺失显式 `font.missing`,无静默 fallback
+  (逐字形缺字回退是**可选**的 `font_fallback`,默认关,见 `render.rs`)。
 - **栅格化**(`raster.rs`):swash/skrifa outline → 8-bit coverage。
   对齐官方 GDI 路径的行为:BOLD 优先 bold face、否则固定合成加粗;
   ANTIALIASING 1=灰度 / 0=阈值 128;SX/SY 每轴 0..=256px(默认 20,
