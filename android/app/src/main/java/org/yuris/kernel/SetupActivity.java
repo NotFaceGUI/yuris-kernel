@@ -95,6 +95,8 @@ public final class SetupActivity extends AppCompatActivity {
     private boolean snapshotDefer;
     /** `SIZE` 双线性采样(手机画质;默认开,官方是最近邻)。 */
     private boolean bilinearScale = true;
+    /** 逐字形缺字回退(默认关;等价桌面 --font-fallback)。 */
+    private boolean fontFallback;
     /** 高级诊断:VM opcode 逐条耗时归因(等价 --vm-profile)。 */
     private boolean vmProfile;
     /** 高级诊断:资产装载/预取计时(等价 --asset-timing)。 */
@@ -143,6 +145,7 @@ public final class SetupActivity extends AppCompatActivity {
         prefetch = prefs.getBoolean("prefetch", false);
         snapshotDefer = prefs.getBoolean("snapshot_defer", false);
         bilinearScale = prefs.getBoolean("bilinear_scale", true);
+        fontFallback = prefs.getBoolean("font_fallback", false);
         vmProfile = prefs.getBoolean("vm_profile", false);
         assetTiming = prefs.getBoolean("asset_timing", false);
         tickSplit = prefs.getBoolean("tick_split", false);
@@ -355,6 +358,9 @@ public final class SetupActivity extends AppCompatActivity {
         advancedBody.addView(toggleButton(
                 "SIZE 双线性:开(手机抗锯齿)", "SIZE 双线性:关(官方最近邻)",
                 bilinearScale, v -> bilinearScale = v), buttonParams());
+        advancedBody.addView(toggleButton(
+                "缺字补全:开(其它字体补字形)", "缺字补全:关(官方缺字不画)",
+                fontFallback, v -> fontFallback = v), buttonParams());
 
         // 诊断开关:只影响日志/计时,不改画面;默认全关。
         advancedBody.addView(toggleButton(
@@ -1081,6 +1087,7 @@ public final class SetupActivity extends AppCompatActivity {
                 .putBoolean("prefetch", prefetch)
                 .putBoolean("snapshot_defer", snapshotDefer)
                 .putBoolean("bilinear_scale", bilinearScale)
+                .putBoolean("font_fallback", fontFallback)
                 .putBoolean("vm_profile", vmProfile)
                 .putBoolean("asset_timing", assetTiming)
                 .putBoolean("tick_split", tickSplit)
@@ -1101,6 +1108,7 @@ public final class SetupActivity extends AppCompatActivity {
         intent.putExtra(MainActivity.EXTRA_PREFETCH, prefetch);
         intent.putExtra(MainActivity.EXTRA_SNAPSHOT_DEFER, snapshotDefer);
         intent.putExtra(MainActivity.EXTRA_BILINEAR_SCALE, bilinearScale);
+        intent.putExtra(MainActivity.EXTRA_FONT_FALLBACK, fontFallback);
         intent.putExtra(MainActivity.EXTRA_VM_PROFILE, vmProfile);
         intent.putExtra(MainActivity.EXTRA_ASSET_TIMING, assetTiming);
         intent.putExtra(MainActivity.EXTRA_TICK_SPLIT, tickSplit);

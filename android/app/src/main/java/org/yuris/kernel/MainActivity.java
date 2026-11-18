@@ -85,6 +85,8 @@ public final class MainActivity extends Activity
     static final String EXTRA_SNAPSHOT_DEFER = "snapshot_defer";
     /** 手机画质:`SIZE`(官方最近邻)改双线性采样,缓解 CG/差分缩放锯齿。 */
     static final String EXTRA_BILINEAR_SCALE = "bilinear_scale";
+    /** 字体缺字补全:主字体缺字时用宿主注入/系统字体补字形。 */
+    static final String EXTRA_FONT_FALLBACK = "font_fallback";
     /** 高级诊断:VM opcode 逐条耗时归因。 */
     static final String EXTRA_VM_PROFILE = "vm_profile";
     /** 高级诊断:资产装载/预取计时。 */
@@ -722,6 +724,9 @@ public final class MainActivity extends Activity
             }
             if (getIntent().getBooleanExtra(EXTRA_BILINEAR_SCALE, false)) {
                 config.put("bilinear_scale", true);
+            }
+            if (getIntent().getBooleanExtra(EXTRA_FONT_FALLBACK, false)) {
+                config.put("font_fallback", true);
             }
             if (getIntent().getBooleanExtra(EXTRA_VM_PROFILE, false)) {
                 config.put("vm_profile", true);

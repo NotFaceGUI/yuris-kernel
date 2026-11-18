@@ -548,7 +548,7 @@ impl RunConfig {
     /// `save_codec` `media_readonly` `record_events` `log_file` `log_level`
     /// `prefetch` `prefetch_mb` `prefetch_window` `asset_cache_mb`
     /// `asset_name_fallback` `bilinear_scale` `snapshot_defer`
-    /// `text_base_cache` `text_gpu` `pipeline_prewarm` `png_backend`
+    /// `text_base_cache` `text_gpu` `font_fallback` `pipeline_prewarm` `png_backend`
     /// `vm_profile` `asset_timing` `tick_split` `cg_timing` `readback_debug`
     /// `trans_debug` `text_gpu_debug` `render_timing` `render_trace_geometry`
     /// `p8_timing` `font_trace` `png_cmp`
@@ -738,6 +738,7 @@ fn apply_tuning_json(
     flag("snapshot_defer", &mut tuning.snapshot_defer)?;
     flag("text_base_cache", &mut tuning.text_base_cache)?;
     flag("text_gpu", &mut tuning.text_gpu)?;
+    flag("font_fallback", &mut tuning.font_fallback)?;
     flag("pipeline_prewarm", &mut tuning.pipeline_prewarm)?;
     if let Some(value) = object.get("png_backend") {
         let text = value
@@ -1121,10 +1122,11 @@ pub fn start_engine(
     // 分别验证」的绕路。
     log::warn!(
         target: "yu-kernel",
-        "[boot] logging ready (quiet={quiet}, level={log_level:?}, png_backend={}, tuning={{prefetch={} snapshot_defer={} vm_profile={} asset_timing={} tick_split={} cg_timing={}}})",
+        "[boot] logging ready (quiet={quiet}, level={log_level:?}, png_backend={}, tuning={{prefetch={} snapshot_defer={} font_fallback={} vm_profile={} asset_timing={} tick_split={} cg_timing={}}})",
         tuning.png_backend.as_str(),
         tuning.prefetch,
         tuning.snapshot_defer,
+        tuning.font_fallback,
         tuning.vm_profile,
         tuning.asset_timing,
         tuning.tick_split,
@@ -2525,15 +2527,17 @@ mod tests {
     fn run_config_parses_render_feature_switches() {
         let config = RunConfig::from_json(
             r#"{"data_root":"/g","prefetch":true,"snapshot_defer":true,
-                "bilinear_scale":true,"text_gpu":false,"asset_cache_mb":256,
-                "png_backend":"libpng","vm_profile":true,"asset_timing":true,
-                "tick_split":true,"cg_timing":true,"readback_debug":true}"#,
+                "bilinear_scale":true,"text_gpu":false,"font_fallback":true,
+                "asset_cache_mb":256,"png_backend":"libpng","vm_profile":true,
+                "asset_timing":true,"tick_split":true,"cg_timing":true,
+                "readback_debug":true}"#,
         )
         .expect("解析应成功");
         assert!(config.tuning.prefetch);
         assert!(config.tuning.snapshot_defer);
         assert!(config.tuning.bilinear_scale);
         assert!(!config.tuning.text_gpu);
+        assert!(config.tuning.font_fallback);
         assert_eq!(config.tuning.asset_cache_mb, 256);
         assert_eq!(
             config.tuning.png_backend,
@@ -2549,6 +2553,7 @@ mod tests {
         assert!(!default.tuning.prefetch);
         assert!(!default.tuning.snapshot_defer);
         assert!(!default.tuning.bilinear_scale);
+        assert!(!default.tuning.font_fallback);
         assert_eq!(
             default.tuning.png_backend,
             yu_render_core::PngBackend::Image
