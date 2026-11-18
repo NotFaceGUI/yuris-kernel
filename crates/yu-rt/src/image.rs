@@ -2,11 +2,31 @@
 //!
 //! 引擎 `CGINFO[SX/SY]` 读的是已装载纹理的尺寸;本内核的 `yu-gfx` 不读文件,
 //! 由持有数据源的 VM 在查询回退路径解析图像头并回填宿主(DIV-GFX-024 /
-//! EVID-J3-03)。只支持工程 `yscfg` 探测序里的四种格式:
+//! EVID-J3-03)。工程 `yscfg` 探测序里的四种格式:
 //! `1=.png / 2=.bmp / 3=.jpg / 4=.gif`(见 `ImageFormat` 注释中的引擎证据)。
+//!
+//! **4.7x/4.8x 的 `.png` 条目实际是 YCG 容器**(见 `yu_format::ycg` 与
+//! DIV-GFX-091):扩展名仍是 `.png`,字节以 `YCG\0` 开头。这里必须识别它的
+//! 头部,否则 `CGINFO[SX/SY]` 对整代资产返回“尺寸未知”→ 精灵/按钮矩形
+//! 退化成 1×1:logo 被按 1×1 放样且停在屏幕外,按钮命中区也只剩 1×1,
+//! 表现为“有画面但点击无反应”。尺寸字段与官方 0.479 `FUN_004254e4`
+//! 一致:`+0x04=width`、`+0x08=height`(LE)。
 
 /// 从图像字节头返回 `(width, height)`;无法识别/截断返回 `None`。
 pub(crate) fn pixel_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() >= 12 && bytes.starts_with(b"YCG\0") {
+        let w = le32(&bytes[4..8]);
+        let h = le32(&bytes[8..12]);
+        // 与官方装载体同口径:超过 0x2000 的文件在 `CG[FILE]` 阶段就被拒,
+        // 这里也不能回填一个“看似可用”的尺寸。
+        if w > 0
+            && h > 0
+            && w <= yu_format::ycg::MAX_DIMENSION
+            && h <= yu_format::ycg::MAX_DIMENSION
+        {
+            return Some((w, h));
+        }
+    }
     if bytes.len() >= 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") && &bytes[12..16] == b"IHDR" {
         return Some((be32(&bytes[16..20]), be32(&bytes[20..24])));
     }
@@ -109,6 +129,23 @@ mod tests {
         b.extend_from_slice(&800u16.to_le_bytes());
         b.extend_from_slice(&600u16.to_le_bytes());
         assert_eq!(pixel_size(&b), Some((800, 600)));
+    }
+
+    #[test]
+    fn ycg_header() {
+        // 4.7x/4.8x:扩展名 `.png`,字节是 `YCG\0` + width@0x04 + height@0x08
+        // (官方 0.479 `FUN_004254e4`;真实样本 `cg/bg/logo.png` 为 1280×960)。
+        let mut b = vec![0u8; 0x38];
+        b[..4].copy_from_slice(b"YCG\0");
+        b[0x04..0x08].copy_from_slice(&1280u32.to_le_bytes());
+        b[0x08..0x0c].copy_from_slice(&960u32.to_le_bytes());
+        assert_eq!(pixel_size(&b), Some((1280, 960)));
+        // 头不足 12 字节 / 尺寸为 0 / 超过官方 0x2000 时不得误判。
+        assert_eq!(pixel_size(b"YCG\0"), None);
+        b[0x04..0x08].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(pixel_size(&b), None);
+        b[0x04..0x08].copy_from_slice(&0x2001u32.to_le_bytes());
+        assert_eq!(pixel_size(&b), None);
     }
 
     #[test]
