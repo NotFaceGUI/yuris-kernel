@@ -640,6 +640,95 @@ fn main_group_copy_snapshot_reports_viewport_size() {
     assert_eq!(info("SY"), Value::Int(i64::from(viewport.height)));
 }
 
+/// 复用 `CG[FILE=""]` 层(读档黑幕 `CGS<n>` 的实际形态)再 `COPY2`:
+/// COPY 替换目标表面与矩形(官方 `FUN_0042f809` 无条件写
+/// `+0x78/+0x7c = 区域尺寸`,`+0x90` 换成区域尺寸新表面),所以 COPY 前
+/// 遗留的 `FILE=""` 1×1 矩形必须失效;内核快照表面保持源尺寸
+/// (DIV-GFX-077 残留),绘制尺寸应回到快照自然尺寸。`CGINFO[SX/SY]`
+/// 仍按复制区域回答。
+///
+/// 回归:菜单打开时建过 `CGS100`,读档时再次 `CG CGS100 FILE="" A=0`
+/// 把绘制尺寸写成 1×1(`dc545ae`),若 COPY 不清掉它,整幅冻结屏幕会缩
+/// 成 1 个像素 ⇒ 读档淡出直接黑屏(2026-11-19 kotoneiro 实测)。
+#[test]
+fn copy2_after_reused_fileless_layer_draws_snapshot_at_natural_size() {
+    let table = table();
+    let mut gfx = state();
+    let viewport = gfx.config().viewport;
+    // 菜单打开:首次建立黑幕层。
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("CGS100")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "A", i(0)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let first = f
+        .layers
+        .iter()
+        .find(|l| l.id.display() == ":/W0/CGS100")
+        .expect("CGS100");
+    assert_eq!(first.image_size(), None, "首建空壳不写绘制尺寸");
+
+    // 读档:复用同一层,再 COPY2 主窗口。
+    gfx.consume_events(&[
+        frame_start(2),
+        call(
+            2,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("CGS100")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "A", i(0)),
+            ],
+        ),
+        call(
+            2,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s(":/W0/")),
+                arg(&table, "CGACT", "ID2", s("CGS100")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        frame_end(2),
+    ]);
+    let f = gfx.frame();
+    let layer = f
+        .layers
+        .iter()
+        .find(|l| l.id.display() == ":/W0/CGS100")
+        .expect("CGS100");
+    assert!(matches!(
+        layer.texture,
+        yu_gfx::TextureRef::Snapshot(_)
+    ));
+    assert_eq!(
+        layer.image_size(),
+        None,
+        "COPY 后绘制尺寸必须回到快照自然尺寸,不能保留 FILE=\"\" 的 1×1"
+    );
+    let info = |flag: &str| {
+        q(
+            &gfx,
+            "CGINFO",
+            vec![
+                arg(&table, "CGINFO", "ID", s("CGS100")),
+                arg(&table, "CGINFO", flag, i(1)),
+            ],
+        )
+    };
+    assert_eq!(info("SX"), Value::Int(i64::from(viewport.width)));
+    assert_eq!(info("SY"), Value::Int(i64::from(viewport.height)));
+}
+
 /// `COPY2` 局部切片:目标层矩形 = **复制块**尺寸,不是源合图尺寸。
 ///
 /// ERIS 按钮把多状态合图切成 OFF/OVER/ON/NA 四块后,立刻用
@@ -1224,9 +1313,12 @@ fn copy2_rect_overrides_stale_explicit_size_and_yields_to_new_cg_size() {
         "COPY 后矩形 = 区域高(含端点)"
     );
 
-    // 绘制尺寸仍是 COPY 前的显式 800×600:这是后端分配/复用目标表面
-    // 的尺寸提示(wgpu 快照目标),不能清成 None;也**不能**写区域
-    // 尺寸,否则会把源合图压扁(DIV-GFX-077 的取舍)。
+    // 绘制尺寸:COPY 后回到快照自然尺寸。官方 `FUN_0042f809` 释放目标旧
+    // `+0x90` 表面、挂上按区域尺寸新分配的表面并写 `+0x78/+0x7c = 区域
+    // 尺寸` ⇒ COPY 前的显式 800×600 不再代表目标层。内核快照表面按
+    // DIV-GFX-077 保持源尺寸(区域块在 (0,0),其余透明),自然尺寸绘制
+    // 才与官方“区域尺寸表面 1:1”逐像素一致;写区域尺寸会把源合图压扁
+    // (DIV-GFX-077 的取舍),所以这里清成 None 而不是 100×50。
     let frame = gfx.frame();
     let dst = frame
         .layers
@@ -1235,11 +1327,8 @@ fn copy2_rect_overrides_stale_explicit_size_and_yields_to_new_cg_size() {
         .expect("DST layer in frame");
     assert_eq!(
         dst.image_size(),
-        Some(yu_gfx::SizeU32 {
-            width: 800,
-            height: 600
-        }),
-        "COPY 区域矩形不能改写绘制/目标表面尺寸"
+        None,
+        "COPY 后绘制尺寸 = 快照自然尺寸(官方替换目标表面与矩形)"
     );
 
     // 命中矩形 = 100×50:层在 (0,0),(99,49) 命中,(100,50) 越界。

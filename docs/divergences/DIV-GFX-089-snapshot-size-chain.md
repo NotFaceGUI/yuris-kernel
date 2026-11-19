@@ -143,3 +143,35 @@ wgpu 物化表面为 **5×1**,官方/soft 为 **3×1**。
 `resize_empty_layer_uses_command_base_on_gpu` 与 soft 对拍
 `resize_empty_layer_uses_command_base_for_followup_copy`。资产/快照基面
 不受影响,仅在 `SolidBlack1x1` 符号面使用命令时刻基数。
+
+## 9. 补记(2026-11-19):COPY/COPY2 覆盖目标矩形与表面(读档黑幕回归)
+
+官方 0.495 `FUN_0042f809` 复核(REA Ghidra 12.1.4,产物
+`4f5eefa3…`,evidence `ev_ff12409d…`):
+
+- 入口无条件算区域:`local_2c = X2-X+1`、`local_28 = Y2-Y+1`
+  (`0x42f85f..0x42f876`);
+- 单层路径(0x42f9ef..0x42fa14)与双层 COPY/COPY2 路径
+  (0x4305f4/0x4305fe)在动作分派后都执行同一段:
+  `FUN_00468e10([dst+0x90])` 释放旧表面 → `[dst+0x90] = 新分配的
+  区域尺寸表面` → `[dst+0x78] = local_2c`、`[dst+0x7c] = local_28`
+  (`MOV [EAX+0x78],ESI` @0x4305f4、`MOV [EAX+0x7c],EDI` @0x4305fe)。
+- ⇒ `CG[FILE=""]`(0.495 `FUN_0040c5f4`,写 `+0x78/+0x7c = 1`、表面
+  重分 1×1)留下的 1×1 矩形,在随后的 COPY/COPY2 之后**不再代表目标
+  层**:表面与矩形都被复制区域替换。
+
+内核快照表面保持**源尺寸**(`DIV-GFX-077` 的既有残留:区域块在
+(0,0),其余透明),与官方“区域尺寸表面 1:1 绘制”逐像素等价。因此
+`cgact_copy` 现在把目标 `LayerKind::Image.size` 清成 `None`(后端按
+快照自然尺寸绘制),`display_rect` 仍记录复制区域供
+`CGINFO`/`ONMOUSE*` 查询;COPY 之后脚本写 `SIZE/RESIZE/SX/SY` 会重新
+写 `Image.size` 并清 `display_rect`。
+
+回归:`dc545ae` 给**复用**的 `CG[FILE=""]` 层回写 1×1 矩形后,读档
+`es.CGTSS` 的 CGS 幕布层(菜单打开时已创建)再次 `CG CGS<n> FILE=""`
+被重置成 1×1,`COPY2 ID=:/W0/` 的整幅冻结屏幕被缩成 1 个像素 ⇒ 读档
+淡出直接黑屏(kotoneiro 2026-11-19 实测)。
+
+回归测试:`copy2_after_reused_fileless_layer_draws_snapshot_at_natural_size`
+(`crates/yu-gfx/tests/info_query.rs`),同时断言 `CGINFO[SX/SY]` 仍按
+复制区域(视口)回答。

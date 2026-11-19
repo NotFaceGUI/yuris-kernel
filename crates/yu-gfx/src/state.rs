@@ -4493,12 +4493,26 @@ impl GfxState {
         if let Some(node) = self.nodes.get_mut(dest) {
             let layer = Arc::make_mut(&mut node.layer);
             layer.texture = TextureRef::Snapshot(copy_id);
-            // 官方 `FUN_0042f809` 在 COPY/COPY2 动作后**无条件**把目标
-            // `+0x78/+0x7c` 写成区域尺寸(0x4305f4/0x4305fe);之后
-            // `CGINFO[SX/SY]`/`ONMOUSE*` 读的就是这个矩形。只记来源,
-            // 查询期按 `snapshot_display_size` 解析(资产晚到可回填);
-            // `LayerKind::Image.size` 仍是绘制/目标表面尺寸,不在这里改
-            // (DIV-GFX-077;wgpu 快照分配依赖它作为目标尺寸提示)。
+            // 官方 `FUN_0042f809` 在 COPY/COPY2 动作后**无条件**替换目标
+            // 表面并改写矩形:旧 `+0x90` 表面释放,挂上按区域尺寸新分配的
+            // 表面,再写 `+0x78/+0x7c = 区域尺寸`(单层 0x42f9ef..0x42fa14,
+            // 双层 0x4305f4/0x4305fe:`MOV [EAX+0x78],ESI` / `MOV [EAX+0x7c],EDI`)。
+            // 因此 COPY 前遗留的矩形(典型是 `CG[FILE=""]` 写下的 1×1,
+            // `FUN_0040c5f4`)不再代表目标层。
+            //
+            // 内核快照表面保持**源表面尺寸**(DIV-GFX-077 的既有残留:区域
+            // 块写在 (0,0),其余透明),与官方“区域尺寸表面”逐像素等价;
+            // 对应的绘制尺寸就是表面自然尺寸,所以这里必须清掉 COPY 前的
+            // `LayerKind::Image.size`。否则跨界面复用的 CGS 幕布层(菜单
+            // 打开时建过,读档时再次 `CG CGS<n> FILE="" A=0` 被重置成
+            // 1×1)会把整幅冻结屏幕缩成 1 个像素:读档淡出直接黑屏
+            // (2026-11-19 回归,引入自 `dc545ae` 的 FILE="" 矩形回写)。
+            //
+            // 显示/命中矩形仍由 `display_rect` 表达(`CGINFO`/`ONMOUSE*`
+            // 查询期按 `snapshot_display_size` 解析,资产晚到可回填);
+            // COPY 之后脚本写 `SIZE/RESIZE/SX/SY` 会重新写 `Image.size`
+            // 并清掉 `display_rect`(官方同一 `+0x78/+0x7c`)。
+            layer.kind = LayerKind::Image { size: None };
             layer.display_rect = Some(copy_id);
             layer.fill = None;
             layer.set_texture_status(match status {
