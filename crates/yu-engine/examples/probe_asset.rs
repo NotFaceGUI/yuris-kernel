@@ -1,23 +1,36 @@
-//! 取证探针:按工程数据入口逐个查资产是否存在(封包/散盘同一口径)。
-//!
-//! 用法:`cargo run -p yu-engine --example probe_asset -- <project-root> <path>...`
+//! 临时探针:工程 VFS 资产查找(按渲染器候选扩展名)。
+//! 用法:`probe_asset <project-root> <key> [key...]`
+use std::path::Path;
 use yu_engine::project::Project;
+use yu_vfs::{Codec, LookupKey};
 
 fn main() {
-    let root = std::env::args().nth(1).expect("project root");
-    let project = Project::discover(std::path::Path::new(&root), None).expect("project");
-    let src = project.open_source().expect("data source");
-    for path in std::env::args().skip(2) {
-        let key = match yu_vfs::LookupKey::new(path.as_bytes(), yu_vfs::Codec::Cp932) {
-            Ok(k) => k,
-            Err(d) => {
-                println!("{path:<44} key-error {d:?}");
+    let mut args = std::env::args().skip(1);
+    let root = args.next().expect("project root");
+    let project = Project::discover(Path::new(&root), None).expect("project");
+    let src = project.open_source().expect("source");
+    let aux = project.open_aux().expect("aux");
+    for key in args {
+        let mut found = false;
+        for ext in ["", ".png", ".bmp", ".jpg", ".gif", ".webp", ".psb"] {
+            let mut name = key.clone().into_bytes();
+            name.extend_from_slice(ext.as_bytes());
+            let Ok(lookup) = LookupKey::new(&name, Codec::Cp932) else {
                 continue;
+            };
+            if let Ok(bytes) = src.open(&lookup) {
+                println!("FOUND {key}{ext} {} B (src)", bytes.len());
+                found = true;
+                break;
             }
-        };
-        match src.open(&key) {
-            Ok(bytes) => println!("{path:<44} HIT {} bytes", bytes.len()),
-            Err(_) => println!("{path:<44} MISS"),
+            if let Ok(bytes) = aux.open(&lookup) {
+                println!("FOUND {key}{ext} {} B (aux)", bytes.len());
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            println!("MISS  {key}");
         }
     }
 }
