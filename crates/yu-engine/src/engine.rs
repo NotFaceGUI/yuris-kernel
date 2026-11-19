@@ -2173,6 +2173,38 @@ impl Engine {
         self.held.iter().cloned().collect()
     }
 
+    /// 临时取证:当前文本层 `(原始字节, 控制标志)`。
+    ///
+    /// `#[doc(hidden)]`,不承诺稳定 API;仅探针
+    /// (`examples/probe_dialog_engine`)用于把脚本级“テキスト内部エラー”
+    /// 落回 `_TEXT`/`_TEXT_FLAG` 的实际内容。
+    #[doc(hidden)]
+    pub fn debug_text_state(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.vm
+            .as_ref()
+            .map(|vm| (vm.text_bytes().to_vec(), vm.text_flags()))
+    }
+
+    /// 临时取证:按脚本变量 id 读数值(`@` 空间;探针用)。
+    #[doc(hidden)]
+    pub fn debug_var_int(&self, id: u16) -> Option<i64> {
+        self.vm.as_ref().and_then(|vm| {
+            vm.store().scalar_int(yu_rt::value::VarRef::new(
+                yu_rt::value::VarSpace::At,
+                id,
+            ))
+        })
+    }
+
+    /// 临时取证:按脚本变量 id 读字符串/浮点元素的原始值(`$` 空间;探针用)。
+    #[doc(hidden)]
+    pub fn debug_var_value(&self, id: u16) -> Option<yu_rt::value::Value> {
+        self.vm.as_ref().and_then(|vm| {
+            let r = yu_rt::value::VarRef::new(yu_rt::value::VarSpace::Dollar, id);
+            vm.store().slot(r).and_then(|s| s.data.first().cloned())
+        })
+    }
+
     fn sync_input(&mut self) {
         let next = self.frame.saturating_add(1);
         let mut frame =
