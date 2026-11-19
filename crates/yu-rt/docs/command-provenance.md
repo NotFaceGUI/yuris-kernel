@@ -65,7 +65,9 @@
 | `CLIPACT` | 1 | `clip/clipact.html` | ✅ 1 次 | REA `0x43e2d0`:TEXT+SET 都存在才写 CF_TEXT | ✅ 实现(镜像;DIV-RT-045) |
 | `CLIPINFO` | 0 | `clip/clipinfo.html` | ⛔ 0 次 | REA `0x43e410`:TEXT 存在才读,过滤 `<0x20`,写 LET | ✅ 实现(DIV-RT-045) |
 | `ERROR` | 1 | ⛔ 手册无页 | ✅ 1 次 | REA `0x46358c`:写 `[0x689b00+opcode]` 启用表;消费者未定位 | ✅ 实现(表;DIV-RT-046) |
-| `CSV`/`PLUG`/`ERRORINFO` | 0 | ⛔ 无页 | ⛔ 0 次 | REA:仅参数求值后返回 0 | ✅ no-op(DIV-RT-046) |
+| `CSV` | 0 | ⛔ 无页 | ⛔ 0 次 | 0.479/0.495 序号 7 = 空桩(`0x43e640`);0.466 序号 7 但表含 `LINE` = 读取器 `0x431970`;v474 序号 8 = `0x43577c` | ✅ 按表结构(DIV-RT-057) |
+| `CSVINFO` | 0 | ⛔ 无页 | ⛔ 0 次 | 0.466 `0x432050`(`LINE`/`SIZE`);0.495 `0x43e660`(`DATA` 写数组 / `SIZE` 计数) | ✅ 实现(DIV-RT-057) |
+| `PLUG`/`ERRORINFO` | 0 | ⛔ 无页 | ⛔ 0 次 | REA:仅参数求值后返回 0 | ✅ no-op(DIV-RT-046) |
 | `TASKINFO` | 19 | `control/taskinfo.html`(含 SCRIPTPOS 页) | ✅ 19 次 | §3.2 任务记录 + REA `0x4523fc` 逐槽;`0x44c390` 写 `task+0xc/+0x10`;SCRIPTPOS `0x452a54`/`0x450fe0` | ✅ 实现(21 槽含 A/FILE0/FILENO0/LINE0/TEXTLINE/NEXTVOICE;SCRIPTPOS 引擎字节格式;DIV-RT-025) |
 | `SYSTEMINFO` | 5 | ⛔ **手册无页** | ✅ 5 次 | v494 `0x450478` 逐槽反汇编 | ⚠ 实现但手册缺页(DIV-RT-023) |
 | `FONT`/`FONTINFO` | 42/— | `font/font.html` | ✅ | — | ➖ 域(图形) |

@@ -55,8 +55,8 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `RETURNCODE` | vm | 396 | — | `0x44c390` | ✅ 实现 | 本 600 帧未触发;静态语料有 396 处;COV-M-02 M-2:自动模式追加 C/R/P,恒追加 E;让出点(REA 0x44c390 `MOV byte[task+9],1` **无条件**)。**AU5 勘误**:恢复判据分模式 —— `FUN_004046fc` `0x404711 CMP byte[state+0x1c],1` / `0x404715 JNE` ⇒ 手动(`OUTPUTMODE≠1`)**一帧即恢复、不经按钮表**;仅自动(`==1`)才读 CLICKBUTTON/SKIPBUTTON(`0x5b48ac..0x5b48bc`)。v494 同构(`0x44c20c`)。DIV-RT-035 已勘误。**H-P2-02 补**:自动行尾 `C/R/P/E` 的每标志宽/高表在 `0x44c3df..0x44c42c` 写入;`+0x6c` 由 `FUN_004046fc` 按 WAIT 推进,遇 `C` 停 |
 | `F_INT` | vm | 337 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 官方默认体报「スクリプト実行エラー」(yse 0xdbbd2)+ 返回 -1;静态 337 处全在 `global_f.yst` 声明段,600 帧 0 执行(DIV-RT-043) |
 | `VARACT` | vm | 310 | `variable/varact.html` | `0x453fa8` | ✅ 实现 | 保持 |
-| `SAVE` | save | 290 | `file/save.html` | `0x44c45c` | ✅ 实现(B1) | 装存档宿主时命令时刻预约(值快照)/刷盘;`SET` 槽事件携带变量引用;未装宿主仍只发 `DomainCall`。REA 锚勘误:`0x44e1c8` 是 SAVEINFO(DIV-RT-042) |
-| `LOAD` | save | 289 | `file/load.html` | `0x44708c` | ✅ 实现(B1) | 装存档宿主时块类型 2 按 var_id 直接恢复、块类型 0 写 `LET` 整组;`LET` 槽事件携带变量引用(DIV-RT-042) |
+| `SAVE` | save | 290 | `file/save.html` | `0x44c45c` | ✅ 实现(B1) | 装存档宿主时命令时刻预约(值快照)/刷盘;`SET` 槽事件携带变量引用;未装宿主仍只发 `DomainCall`。REA 锚勘误:`0x44e1c8` 是 SAVEINFO(DIV-RT-042)。**`IDNO` 在场时层名 = `ID.N`**(`0x44c4aa`;DIV-RT-061) |
+| `LOAD` | save | 289 | `file/load.html` | `0x44708c` | ✅ 实现(B1) | 装存档宿主时块类型 2 按 var_id 直接恢复、块类型 0 写 `LET` 整组;`LET` 槽事件携带变量引用(DIV-RT-042)。**`IDNO` 在场时层名 = `ID.N`**(`0x4470d1`;DIV-RT-061) |
 | `CGACT` | graphics | 274 | `cg/cgact.html` | `0x42c4a4` | ➖ 域事件 | 只发 `DomainCall`;子系统语义归宿主(契约见 `domain-event-contracts.md`) |
 | `END` | system | 205 | `control/end.html` | `0x441334` | ✅ 实现 | 全程序退出(非单任务):`StepOutcome::ExitProgram{restart}` → `ChainReport.program_exit` → `Engine::restart_requested()`;`RESTART` 取低 8 位;REA 0x441334/0x403bfc/0x403e78(DIV-RT-052) |
 | `GO` | vm | 195 | `control/go.html` | `0x445830` | ✅ 实现 | 保持 |
@@ -117,8 +117,8 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `CDDA` | sound | 0 | — | `0x429fb0` | 🔵 aligned-stub | 官方空桩(B6,声音台账 0-9);B2 起域归类 = Sound(与 MIDI 族一致),诊断 `rt.cmd.aligned_stub` |
 | `CLIPINFO` | graphics | 0 | `clip/clipinfo.html` | `0x43e410` | ✅ 实现 | 读镜像写入 LET;丢弃 `<0x20` 字节(DIV-RT-045) |
 | `COMPILEMODE` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期;运行时同默认槽(DIV-RT-043) |
-| `CSV` | vm | 0 | — | `0x43e640` | ✅ no-op | 官方只做参数求值后返回 0(DIV-RT-046) |
-| `CSVINFO` | vm | 0 | — | `0x43e660` | ⛔ 未取证 | 读 CSV 文件并写 LET;文件/解析语义未取证 |
+| `CSV` | vm | 0 | — | `0x43e640` | ✅ 实现(按表结构) | 0.479/0.495 序号 7 = 空桩(`0x43e640`);**0.466 序号 7 但表含 `LINE` = 真实读取器 `0x431970`**;v474 序号 8 = `0x43577c`;DIV-RT-057 §3/§6 |
+| `CSVINFO` | vm | 0 | — | `0x43e660` | ✅ 实现 | 0.495 `DATA=1` 把单元格写入 LET 字符串数组(`0x43f0d8`),`SIZE=1` 计数;0.466 `0x432050` 的 `LINE` 过滤计数/纯行数;v474 `0x435cfc` 计数;DIV-RT-057 §4/§5 |
 | `ERRORINFO` | vm | 0 | — | `0x46356c` | ✅ no-op | 官方只做参数求值后返回 0(DIV-RT-046) |
 | `F_VAR` | vm | 0 | — | `0x459e90(默认)` | ✅ 脚本错误槽 | 同 F_INT(DIV-RT-043) |
 | `G_FLT` | vm | 0 | `variable/g_flt.html` | `0x459e90(默认)` | ✅ 脚本错误槽 | 编译期声明;初值/数组经 `VARACT[INIT]`(DIV-RT-024);运行时落在默认槽(DIV-RT-043) |
@@ -202,6 +202,7 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 | `_TEXT_NUM` | 0 | — | 读 `0x4276e3` ← `0x80174c`;装载 `yst.ybn` 时写 `0x45d73f` | ✅ 实现 | = 工程文本总数;ERIS 396(yst.ybn 头部 == yst_list 求和;DIV-RT-048) |
 | `_WINDOW_INIT_POS` | 1 次 | — | 读 `0x4276f3` ← `[0x80133c]`;写 `0x460b74/0x460b87`(← `yscfg.dat` 第 10 项) | ✅ 宿主注入 | `BootConfig::window_init_pos`(ERIS 工程 = 0;DIV-RT-047) |
 | `_SAVE_PATH` | 1 次 | `basic/svariable.html` | — | ⛔ 宿主注入 | 路径由宿主给值;示例未注入(DIV-RT-010) |
+| `__SAVE_PATH_TYPE` | 0 | —(0.466 手册也无) | 0.466 ycd id 77;0.466 二进制无 `yssfs.dat` | ⛔ open(evidence) | 不能按 0.495 `_SAVE_PATH_TYPE`(`0x801324`/`yssfs.dat`)直接别名;待 0.466 getter REA(DIV-RT-060) |
 | `_MOUSE_X0..3`/`_MOUSE_Y0..3` | debug 口径运行期读(s66 调试 UI);false 口径 0 次 | —(手册无页) | 读 `FUN_00427350` case 0x85..0x8e = 4 窗口槽客户区坐标(槽表 `DAT_008019c0..cc`;每槽 HWND@+0x5b0、X@+0x5b8、Y@+0x5bc;case 0x85/0x86 同槽 ⇒ `_MOUSE_X`≡`_MOUSE_X0`);每帧 `FUN_00403ee0`:槽无窗口 ⇒ 坐标 0,不报错 | ✅ fixed(no-manual) | 2026-10-24 政策:按 REA 实现并标注。旧实现误当 ycd 按钮查绑定 → Fatal 杀主任务 = debug 口径黑帧根因(DIV-L-001 复核;`yu-rt/src/sysvar.rs`) |
 
 ## 4. 与 `command-provenance.md` 的交叉核对(勘误留痕)

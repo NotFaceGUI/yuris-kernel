@@ -29,7 +29,7 @@
 | DIV-RT-057 | Save/File 域事件在帧末才应用(`FILEACT[DELETE]` 晚于同帧 `SAVE[FILE]` 刷盘) | **fixed(2026-10-27)** | 根因:`Vm::emit` 只对 Graphics/Window/Sound 同步 `apply_event`,Save/File 仅入队,由 `Engine::tick` 帧末 `apply_events`;`es_SaveLoad.yst` 的存档流程是「pc315 先删旧槽 → pc341 `SAVE[FILE]` 同步刷盘」,延迟的删除落在刷盘之后,刚写出的存档被删,`SAVEEND` 再清预约 ⇒ 无文件、无报错。修法:统一为命令时刻同步(`Vm::emit` 对 `Domain::Save|File` 也调用 `apply_event`,Engine 帧末不再重复喂),与官方 `FILEACT` 就地执行一致。复核 `fixture::fileact_is_applied_before_save_file_flush_in_same_frame`;桌面复现 `save30002.sd` 25608 字节保留 |
 | DIV-RT-058 | 命令参数的复合赋值算子 `+=` / `-=` 被合并成加法 | **fixed(2026-10-27)** | 根因:窗口 `slot` 的高字节是算子(**1 = `+=`,2 = `-=`**),`eval_arg_windows` 只置 `offset = 高字节!=0`,gfx 一律按「当前值 + 增量」处理。`es_SaveLoad.yst:623 CG[ID=$id A-=8]` 因此变成 `A+=8`:全屏截图幕布 `CGS999` 的 alpha 从 256 一路加到 512(超出 0..256 不 clamp),32 帧淡出后仍是 256 全不透明 ⇒ 读档确认后逻辑帧继续推进、图层已切换,画面却永远停在读档界面(用户报「点击读档直接卡死」)。证据:`dump_pc_cmds 19` 的 `pc368 L623 CG … A~2(len4)=i8`(=`-=`);`dump_pc_cmds 66` 的 `pc5659 L8173 CG … X~1`(=`+=`)。修法:新增 `compose_window_arg`(`comp==2` 先取负,`offset=comp!=0`),单测 `window_ops_tests::plus_and_minus_operators_are_distinct`。复核:`CGS999` alpha 256→112→0;headless 与桌面 wgpu 读档后均回到游戏(宿主 `stuck="推进正常"`) |
 | DIV-RT-059 | `SAVE[ID]` / `LOAD[ID]` 图层缩略图长期 `Unimplemented`(DNO 3 缺失) | **fixed(2026-10-27)** | 块格式(官方 0.495 `save00001.sd` DNO=3,btype 1,ulen=31608):`[u32 1600][u32 30000][A 1600B][B 30000B]`;B = 100×75 RGBA 画面,A 的 w/h 在 `+0x78/+0x7c`(0.479 样本 A=1536、w/h 在 `+0x68/+0x6c`,读取端按 `lenB == w*h*4` 自证)。实现:`yu-save::image_block` 编解码 + `SaveHost::reserve_image/load_image`;`GraphicsHost::capture_layer/restore_layer`;`yu-engine::capture::GfxCapture`(离屏软渲,`observe` 在出现新 COPY 的帧与主渲染器同刻冻结快照;SAVE 时回放当前帧取目标层快照并按图层声明尺寸重采样;LOAD 时 PNG 写入 `SharedMem` 合成资产叠层并 `set_layer_asset`)。沿途修三条渲染语义:① COPY 表面尺寸 = 源/区域尺寸,不看目标层显示尺寸(soft+wgpu;否则 800×600 截图被裁成左上 100×75 全黑);② soft `MERGE/MERGE2` 必须先于区域解析(`X/Y` 是绘制偏移,原来 `MERGE2 X=0 Y=0` 被判 `region.partial` 整条跳过,缩略图合不进存档盘);③ VM `resolve_asset_size` 候选序与渲染器一致。复核:`yu-save` 14 通过(含官方 save00001 DNO3→100×75);fixture 98;存档 DNO3 `ulen=31608 / w=100 / h=75 / 24956 非零字节`;读档界面缩略图为真实游戏画面(headless soft/wgpu 与桌面 wgpu 截图)。限制:抓帧的 `:/W0/` 后缓冲与主渲染器同源;目标层无可序列化表面(空层/离屏组/未取证加工)时返回 `None` 并报 Unimplemented,不猜内容 |
-| DIV-RT-011 | 手册有页但语义未取证的命令(VARINFO SEARCH / VARACT INIT·G_* / F_* / ERROR) | open | 仅剩 `VARINFO[VAR]`(无页/无官方体)与 `CSVINFO`;`STRTYPE` 已按 REA 处理体实现,fixed(no-manual);`SJISCODE/UTF8CODE` 官方零引用 ⇒ 对齐 no-op(2026-11-01) |
+| DIV-RT-011 | 手册有页但语义未取证的命令(VARINFO SEARCH / VARACT INIT·G_* / F_* / ERROR) | open | 仅剩 `VARINFO[VAR]`(无页/无官方体);`CSVINFO` 已于 2026-11-19 按 0.466/0.479/0.495 三版 REA 收口(`LINE`/`DATA`/`SIZE`;DIV-RT-057);`STRTYPE` 已按 REA 处理体实现,fixed(no-manual);`SJISCODE/UTF8CODE` 官方零引用 ⇒ 对齐 no-op(2026-11-01) |
 | DIV-RT-012 | `SAVE`/`LOAD` 的盘上存档格式 | fixed | `yu-format::yssd` 官方 5 文件 269 块逐字节 roundtrip;`yu-save` 宿主消费域事件(忠实写盘受 DIV-RT-042 门禁) |
 | DIV-RT-013 | `HANTOZEN`/`ZENTOHAN` 转换表 | fixed | 三张表已自 0.495 exe 取出落 `data/case-tables-0495.tsv`;算法逐条对照 REA |
 | DIV-RT-014 | `MATH[RND]` 的 MT19937 种子来源 | fixed | 种子 = `GetTickCount`(REA `0x461f98`),内核 `BootConfig::rng_seed` 注入(缺省 5489);`rng.rs` MT19937 |
@@ -434,9 +434,12 @@
   `RETURNBREAK`/`PREP` = 官方 no-op 槽(REA `0x7acf58`/`0x7acf4c`,
   `NOOP_COMMANDS_0495`);`F_INT/F_FLT/F_STR/F_VAR` = 默认槽 ScriptError
   (DIV-RT-043:静态命中全在 `global_f.yst` 声明段,600 帧运行期 0 次);
-  `CSV`/`PLUG`/`ERRORINFO` = 官方「参数求值+返回 0」(`NoopEval`,
-  REA `0x43e640`/`0x44bd10`/`0x46356c`);`ERROR` 启用表见 DIV-RT-046。
-  **仍挂号**:`CSVINFO`(见下);`CDDA` 是空桩(sound-ledger N0-10,不在本条目)。
+  `CSV`/`PLUG`/`ERRORINFO` 在 0.479/0.495 = 官方「参数求值+返回 0」
+  (`NoopEval`,REA `0x43e640`/`0x44bd10`/`0x46356c`);但 **0.466 的
+  `CSV`(序号 7)是真实读取器 `0x431970`**,内核按表里有无 `LINE` 区分
+  (DIV-RT-057);`ERROR` 启用表见 DIV-RT-046。
+  **CSVINFO 已收口**(0.466 `LINE` / 0.495 `DATA`;DIV-RT-057);
+  `CDDA` 是空桩(sound-ledger N0-10,不在本条目)。
   `STRTYPE/SJISCODE/UTF8CODE` 已按 2026-11-01 的 REA 结论收口(见下)。
 - **2026-11-10 收口(`VAR` / `SAVEINFO`;fixed / 官方 no-op)**:
   - `VAR` 处理体 `0x453f88`:守卫 `FUN_00429fd1(opcode=0x63)` 后
