@@ -1,11 +1,14 @@
 package org.yuris.kernel;
 
+import android.Manifest;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.Settings;
@@ -21,6 +24,9 @@ import android.widget.Spinner;
 import android.widget.TextView;
 
 import androidx.appcompat.app.AppCompatActivity;
+
+import org.json.JSONException;
+import org.json.JSONObject;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -44,6 +50,35 @@ public final class SetupActivity extends AppCompatActivity {
     private static final int REQUEST_FONT = 1002;
     private static final int REQUEST_PLAY = 1003;
     private static final int REQUEST_SAVE_DIR = 1004;
+    private static final int REQUEST_STORAGE = 1005;
+
+    /**
+     * Tyranor-Next 第三方 APK 运行时模块协议。
+     *
+     * <p>宿主按 applicationId 前缀 {@code com.tyranor.runtime.*} 发现模块,
+     * 再用显式 ComponentName 派发 {@code LAUNCH};只传游戏根目录绝对路径,
+     * 不传 SAF URI,也不代授存储权限。协议版本当前为 1。
+     */
+    private static final String TYRANOR_ACTION_LAUNCH = "com.tyranor.runtime.action.LAUNCH";
+    private static final String TYRANOR_EXTRA_FOLDER_PATH =
+            "com.tyranor.runtime.extra.FOLDER_PATH";
+    private static final String TYRANOR_EXTRA_GAME_TITLE =
+            "com.tyranor.runtime.extra.GAME_TITLE";
+    private static final String TYRANOR_EXTRA_PROTOCOL_VERSION =
+            "com.tyranor.runtime.extra.PROTOCOL_VERSION";
+    private static final String TYRANOR_EXTRA_SETTINGS =
+            "com.tyranor.runtime.extra.SETTINGS";
+    private static final int TYRANOR_PROTOCOL_VERSION = 1;
+
+    /** Android 10 及以下的存储权限回调;授权后接着跑用户刚才点的动作。 */
+    private Runnable pendingStorageAction;
+
+    /** Tyranor 派发后待自动启动;权限或字体任一项没就绪都不抢跑。 */
+    private boolean pendingExternalLaunch;
+    /** 字体枚举是后台线程;外部启动要等它恢复上次选中项后再进游戏。 */
+    private Runnable pendingAfterFonts;
+    /** 本次启动是否由 Tyranor 派发(正常退出后把用户还给宿主)。 */
+    private boolean externalSession;
 
     private static final int BG = Color.parseColor("#0e1014");
     private static final int CARD = Color.parseColor("#1a1e26");
@@ -215,7 +250,8 @@ public final class SetupActivity extends AppCompatActivity {
         fontCard.addView(fontSpinner, spinnerParams);
 
         Button importFont = secondaryButton("导入字体文件(ttf / otf / ttc)");
-        importFont.setOnClickListener(v -> pickFont());
+        // 字体路径同样以真实路径交给内核,先确保存储权限。
+        importFont.setOnClickListener(v -> ensureStorageThen(this::pickFont));
         fontCard.addView(importFont, buttonParams());
         // 官方原版排版按等宽字体设计:字宽不一致会让行宽/对齐跑掉。
         fontCard.addView(hintText("推荐使用等宽字体"));
@@ -496,7 +532,8 @@ public final class SetupActivity extends AppCompatActivity {
 
         // ---- 开始 ----
         startButton = primaryButton("开始游戏");
-        startButton.setOnClickListener(v -> launchGame());
+        // 启动同样走权限闸:手动输入路径/恢复旧配置时可能从未授权过。
+        startButton.setOnClickListener(v -> ensureStorageThen(this::launchGame));
         LinearLayout.LayoutParams startParams = buttonParams();
         startParams.topMargin = dp(22);
         root.addView(startButton, startParams);
@@ -533,23 +570,300 @@ public final class SetupActivity extends AppCompatActivity {
         NativeHost.nativeInitAndroidContext(this);
         loadSystemFonts();
         playEntrance(root);
+        // Tyranor-Next 模块入口放在 UI 建好之后:自动启动复用本页已有的
+        // 权限闸与启动路径,桌面直接从图标进来时这里是无操作。
+        handleExternalLaunch(getIntent());
     }
 
     // ------------------------------------------------------------ 权限与目录
 
-    /** 没有「所有文件访问」时先去申请;已授权才打开目录选择。 */
+    /**
+     * 访问游戏目录前先确保存储权限,已授权才执行 {@code next}。
+     *
+     * <p>Android 11+ 用「所有文件访问」;Android 10 及以下没有这个权限,
+     * {@link Environment#isExternalStorageManager()} 也是 API 30 才有的方法 ——
+     * 无条件调用会在 Android 10 上抛 {@link NoSuchMethodError},按钮直接失效,
+     * 表现为「点了没反应/闪退且从不弹权限」。那里改走旧存储模型:
+     * 运行时申请 READ/WRITE,配合清单里的 requestLegacyExternalStorage。
+     */
     private void ensureStorageThen(Runnable next) {
-        if (Environment.isExternalStorageManager()) {
-            next.run();
-        } else {
-            status.setText("需要「所有文件访问」权限才能直接读写游戏目录");
-            try {
-                Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
-                intent.setData(Uri.parse("package:" + getPackageName()));
-                startActivity(intent);
-            } catch (Exception error) {
-                startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (Environment.isExternalStorageManager()) {
+                next.run();
+            } else {
+                status.setText("需要「所有文件访问」权限才能直接读写游戏目录");
+                try {
+                    Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                    intent.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(intent);
+                } catch (Exception error) {
+                    try {
+                        startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                    } catch (Exception fallbackError) {
+                        status.setText("请到系统设置里为本应用开启「所有文件访问」");
+                    }
+                }
             }
+            return;
+        }
+        // Android 10 及以下:旧存储模型,内核按真实路径读写共享存储需要运行时权限。
+        if (checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            pendingStorageAction = next;
+            status.setText("需要存储权限才能直接读写游戏目录");
+            requestPermissions(new String[] {
+                    Manifest.permission.READ_EXTERNAL_STORAGE,
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE,
+            }, REQUEST_STORAGE);
+            return;
+        }
+        next.run();
+    }
+
+    // ------------------------------------------------------------ Tyranor 模块入口
+
+    /**
+     * Tyranor-Next 第三方运行时模块的启动入口。
+     *
+     * <p>宿主只传游戏根目录绝对路径(不传 SAF URI),与本壳「按真实路径读写」
+     * 的模型天然一致;这里把路径落到与手动选目录相同的状态,再走同一套
+     * 权限闸和启动路径。协议版本不认识时忽略 extras,停在配置页。
+     */
+    private void handleExternalLaunch(Intent intent) {
+        if (intent == null || !TYRANOR_ACTION_LAUNCH.equals(intent.getAction())) {
+            return;
+        }
+        int protocol = intent.getIntExtra(
+                TYRANOR_EXTRA_PROTOCOL_VERSION, TYRANOR_PROTOCOL_VERSION);
+        if (protocol != TYRANOR_PROTOCOL_VERSION) {
+            status.setText("不支持的 Tyranor 模块协议版本: " + protocol);
+            return;
+        }
+        String folder = intent.getStringExtra(TYRANOR_EXTRA_FOLDER_PATH);
+        if (folder == null || folder.trim().isEmpty()) {
+            status.setText("Tyranor 未提供游戏目录");
+            return;
+        }
+        File dir = new File(folder);
+        if (!dir.isAbsolute() || !dir.isDirectory()) {
+            status.setText("Tyranor 指定的游戏目录不存在: " + folder);
+            return;
+        }
+        String nextGameDir = dir.getAbsolutePath();
+        // 换游戏时不要把上一个游戏的自定义存档目录带过来。
+        if (gameDir != null && !gameDir.equals(nextGameDir)) {
+            saveDir = null;
+        }
+        gameDir = nextGameDir;
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString("game_dir", gameDir)
+                .putString("save_dir", saveDir)
+                .apply();
+        String title = intent.getStringExtra(TYRANOR_EXTRA_GAME_TITLE);
+        if (title != null && !title.isEmpty()) {
+            status.setText("来自 Tyranor: " + title);
+        }
+        // 宿主按游戏保存的「引擎设置」以完整生效值下发;未声明的 key 忽略。
+        applyTyranorSettings(intent.getStringExtra(TYRANOR_EXTRA_SETTINGS));
+        refreshLabels();
+        pendingExternalLaunch = true;
+        // 首次运行还没授「所有文件访问」:这里拉起系统授权页,回来后 onResume 重试。
+        ensureStorageThen(this::requestExternalLaunch);
+    }
+
+    /** 权限与字体都就绪后才真正进游戏;字体还在后台枚举时挂起等待。 */
+    private void requestExternalLaunch() {
+        if (!pendingExternalLaunch) {
+            return;
+        }
+        if (fontSpinner.getAdapter() == null) {
+            pendingAfterFonts = this::launchExternalGame;
+            return;
+        }
+        launchExternalGame();
+    }
+
+    private void launchExternalGame() {
+        if (!pendingExternalLaunch) {
+            return;
+        }
+        pendingExternalLaunch = false;
+        pendingAfterFonts = null;
+        externalSession = true;
+        launchGame();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // 从「所有文件访问」授权页返回:权限到手就继续 Tyranor 派发的启动。
+        if (pendingExternalLaunch && hasStorageAccess()) {
+            requestExternalLaunch();
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleExternalLaunch(intent);
+    }
+
+    /** 当前是否已拿到内核读写真实路径所需的存储权限。 */
+    private boolean hasStorageAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return Environment.isExternalStorageManager();
+        }
+        return checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /**
+     * 消费 Tyranor 下发的单游戏「引擎设置」。
+     *
+     * <p>payload 形如 {@code {"version":1,"values":{...}}};只认白名单 key
+     * 与合法类型,未知 key 忽略,版本不认识时整份忽略。字符串枚举再按声明
+     * 值白名单校验,避免把任意字符串塞进内核参数。
+     */
+    private void applyTyranorSettings(String raw) {
+        if (raw == null || raw.isEmpty()) {
+            return;
+        }
+        JSONObject payload;
+        try {
+            payload = new JSONObject(raw);
+        } catch (JSONException error) {
+            return;
+        }
+        if (payload.optInt("version", -1) != 1) {
+            return;
+        }
+        JSONObject values = payload.optJSONObject("values");
+        if (values == null) {
+            return;
+        }
+        String fpsValue = optString(values, "fps");
+        if ("30".equals(fpsValue) || "60".equals(fpsValue) || "120".equals(fpsValue)) {
+            fps = Integer.parseInt(fpsValue);
+            refreshFpsButtons();
+        }
+        if (values.opt("mouse_mode") instanceof Boolean) {
+            mouseMode = values.optBoolean("mouse_mode", mouseMode);
+            refreshChoiceButtons(inputModeButtons, INPUT_MODE_VALUES, selectedInputMode());
+        }
+        if (values.opt("bilinear_scale") instanceof Boolean) {
+            bilinearScale = values.optBoolean("bilinear_scale", bilinearScale);
+        }
+        if (values.opt("font_fallback") instanceof Boolean) {
+            fontFallback = values.optBoolean("font_fallback", fontFallback);
+        }
+        if (values.opt("debug_log") instanceof Boolean) {
+            debugLog = values.optBoolean("debug_log", debugLog);
+        }
+        if (values.opt("show_hud") instanceof Boolean) {
+            showHud = values.optBoolean("show_hud", showHud);
+        }
+        String patchValue = optString(values, "patch");
+        if (isOneOf(patchValue, "auto", "original", "gbk", "big5", "tunnel")) {
+            patch = patchValue;
+        }
+        String gpuValue = optString(values, "gpu_backend");
+        if (isOneOf(gpuValue, "auto", "gles", "vulkan")) {
+            gpuBackend = gpuValue;
+        }
+        String movieValue = optString(values, "movie_backend");
+        if (isOneOf(movieValue, "auto", "builtin", "external")) {
+            movieBackend = movieValue;
+        }
+        String fontValue = optString(values, "font");
+        if (fontValue != null) {
+            applyFontSetting(fontValue);
+        }
+    }
+
+    private static String optString(JSONObject values, String key) {
+        Object value = values.opt(key);
+        return value instanceof String ? (String) value : null;
+    }
+
+    private static boolean isOneOf(String value, String... allowed) {
+        if (value == null) {
+            return false;
+        }
+        for (String item : allowed) {
+            if (item.equals(value)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 字体设置:空 = 系统默认(本游戏 {@code fonts/} 下导入的字体仍由内核
+     * 自动加载);含路径分隔符或字体扩展名 = 显式字体文件;其余按字体族名。
+     */
+    private void applyFontSetting(String value) {
+        String trimmed = value.trim();
+        if (trimmed.isEmpty()) {
+            // 宿主没有 per-game 覆盖(声明默认值 ""):保留模块自己的字体选择。
+            // 以前这里清空 fontPath/importedFontName,导致从 Tyranor 启动后
+            // 配置页字体下拉的最后一项(已导入字体)消失,也覆盖了用户在模块内
+            // 做的全局选择;`fonts/` 的自动默认仍由内核侧处理。
+            restoreFontSelection();
+            return;
+        } else if (trimmed.endsWith(".ttf") || trimmed.endsWith(".otf")
+                || trimmed.endsWith(".ttc") || trimmed.contains("/")
+                || trimmed.contains("\\")) {
+            File file = new File(trimmed);
+            if (file.isFile()) {
+                fontPath = file.getAbsolutePath();
+                importedFontName = file.getName();
+                savedFontFamily = importedFontName;
+            } else {
+                // 坏路径不交给内核:退回系统默认,避免启动即报字体错误。
+                savedFontFamily = "";
+                fontPath = null;
+                importedFontName = null;
+            }
+        } else {
+            savedFontFamily = trimmed;
+            fontPath = null;
+            importedFontName = null;
+        }
+        restoreFontSelection();
+    }
+
+    /** 字体枚举可能已/尚未完成:能恢复就立即恢复,否则等 loadSystemFonts 回调。 */
+    private void restoreFontSelection() {
+        if (fontSpinner == null || fontSpinner.getAdapter() == null) {
+            return;
+        }
+        List<String> entries = new ArrayList<>();
+        entries.add("系统默认");
+        entries.addAll(systemFonts);
+        if (importedFontName != null) {
+            entries.add(importedFontName);
+        }
+        fontSpinner.setSelection(indexOfFamily(savedFontFamily, entries));
+    }
+
+    @Override
+    public void onRequestPermissionsResult(
+            int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQUEST_STORAGE) {
+            return;
+        }
+        Runnable next = pendingStorageAction;
+        pendingStorageAction = null;
+        boolean granted = grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        if (!granted) {
+            status.setText("没有存储权限:内核无法按真实路径读写游戏目录");
+            return;
+        }
+        if (next != null) {
+            next.run();
         }
     }
 
@@ -612,13 +926,20 @@ public final class SetupActivity extends AppCompatActivity {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQUEST_PLAY) {
+            boolean failed = false;
             if (data != null) {
                 String error = data.getStringExtra(MainActivity.EXTRA_START_ERROR);
                 if (error != null && !error.isEmpty()) {
+                    failed = true;
                     status.setText(error);
                     // 失败后自动切回 CPU,避免用户反复踩同一个坑。
                     backend = "soft";
                 }
+            }
+            if (externalSession && !failed) {
+                // 正常退出游戏:关掉配置页,把用户还给 Tyranor。
+                externalSession = false;
+                finish();
             }
             return;
         }
@@ -1026,6 +1347,12 @@ public final class SetupActivity extends AppCompatActivity {
                 // 恢复上次选择(游戏目录同级持久化)。
                 int restore = indexOfFamily(savedFontFamily, entries);
                 fontSpinner.setSelection(restore);
+                // 外部启动若在等字体枚举,恢复完成后再进游戏,避免丢字体选择。
+                Runnable afterFonts = pendingAfterFonts;
+                pendingAfterFonts = null;
+                if (afterFonts != null) {
+                    afterFonts.run();
+                }
             });
         }, "yu-font-list").start();
     }
@@ -1050,6 +1377,9 @@ public final class SetupActivity extends AppCompatActivity {
         if (gameDir == null) {
             return;
         }
+        // 手动点「开始游戏」同样消费掉待处理的外部启动,避免从游戏返回后重入。
+        pendingExternalLaunch = false;
+        pendingAfterFonts = null;
         // 下拉索引 0 = 系统默认;1..N = 系统字体;最后一项(若有)= 导入字体。
         String family = "";
         String chosenFontFile = null;

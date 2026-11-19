@@ -246,6 +246,26 @@ jobs:
           GRADLE_PROJECT_ARGS="-PreleaseVersionName=$VERSION -PreleaseVersionCode=$GITHUB_RUN_NUMBER" \
             bash tools/android/build.sh
 
+      - name: Build Tyranor-Next runtime module APK
+        shell: bash
+        env:
+          YURIS_KEYSTORE_FILE: ${{ runner.temp }}/release.jks
+          YURIS_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          YURIS_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          YURIS_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          YURIS_APK_CHANNEL: tyranor
+          YURIS_APK_VARIANTS: universal,arm64-v8a
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 额外发布:同一个壳以 com.tyranor.runtime.yuris.kernel 为
+          # applicationId 再打一份,供 Tyranor-Next「引擎模块管理」识别。
+          BUILD_TYPE=release \
+          GRADLE_FLAGS="--no-daemon" \
+          GRADLE_PROJECT_ARGS="-PreleaseVersionName=$VERSION -PreleaseVersionCode=$GITHUB_RUN_NUMBER" \
+            bash tools/android/build.sh
+
       - name: Stage assets
         shell: bash
         env:
@@ -257,6 +277,10 @@ jobs:
           cp "$apk_dir/app-release-universal.apk"  "dist/yuris-kernel-$TAG-android-universal.apk"
           cp "$apk_dir/app-release-arm64-v8a.apk"  "dist/yuris-kernel-$TAG-android-arm64-v8a.apk"
           cp "$apk_dir/app-release-x86_64.apk"     "dist/yuris-kernel-$TAG-android-x86_64.apk"
+          cp "$apk_dir/app-tyranor-release-universal.apk" \
+             "dist/yuris-kernel-$TAG-android-tyranor-module.apk"
+          cp "$apk_dir/app-tyranor-release-arm64-v8a.apk" \
+             "dist/yuris-kernel-$TAG-android-tyranor-module-arm64-v8a.apk"
           # so 与它依赖的 libc++_shared 一起给，方便自己塞进别的壳。
           ( cd android/app/src/main/jniLibs && zip -qr "$GITHUB_WORKSPACE/dist/yuris-kernel-$TAG-android-so.zip" . )
           ls -l dist

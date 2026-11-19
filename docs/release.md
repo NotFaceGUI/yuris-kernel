@@ -51,11 +51,14 @@ Android universal APK 用同款徽章，另附 ABI 瘦包与 so / 许可证链�
 | `yuris-kernel-vX.Y.Z-android-universal.apk` | 正式签名通用包，arm64-v8a + x86_64 两套 so 都在包里 |
 | `yuris-kernel-vX.Y.Z-android-arm64-v8a.apk` | 正式签名瘦包，只含 arm64-v8a（绝大多数真机） |
 | `yuris-kernel-vX.Y.Z-android-x86_64.apk` | 正式签名瘦包，只含 x86_64（模拟器 / x86 Chromebook） |
+| `yuris-kernel-vX.Y.Z-android-tyranor-module.apk` | Tyranor-Next 第三方运行时模块（universal）；`applicationId = com.tyranor.runtime.yuris.kernel`，`versionName` 带 `-tyranor` 后缀 |
+| `yuris-kernel-vX.Y.Z-android-tyranor-module-arm64-v8a.apk` | 同上，只含 `arm64-v8a` 的模块瘦包 |
 | `yuris-kernel-vX.Y.Z-android-so.zip` | `libyu_host_android.so` + `libc++_shared.so`（按 ABI 分目录） |
 | `yuris-kernel-vX.Y.Z-licenses.zip` | `LICENSE`、`NOTICE`、`THIRD-PARTY-NOTICES.md`、`licenses/`；Android 产物不内嵌这些文件，随此包分发 |
 
-三个 APK 用同一把 key 签名，`versionName` 相同；`versionCode` 都取
-`GITHUB_RUN_NUMBER`。用户按设备架构下瘦包以减小下载体积，不确定时下
+三个普通 APK 用同一把 key 签名，`versionName` 相同；Tyranor 模块包也用
+同一把 key，但 `versionName` 追加 `-tyranor`，以便和普通包区分。`versionCode`
+都取 `GITHUB_RUN_NUMBER`。用户按设备架构下瘦包以减小下载体积，不确定时下
 `universal`。当前不支持 32 位 `armeabi-v7a`，所以没有 `armeabi-v7a` 瘦包。
 
 ## 第三方许可清单
@@ -200,6 +203,13 @@ BUILD_TYPE=release GRADLE_FLAGS="--offline" \
 # 产物落在 target/android-apks/（不要放 AGP 的 release 输出目录，
 # 下一次 assembleRelease 会把它清掉）
 YURIS_APK_VARIANTS=universal,arm64-v8a,x86_64 \
+BUILD_TYPE=release GRADLE_FLAGS="--offline" \
+  GRADLE_PROJECT_ARGS="-PreleaseVersionName=0.0.0-local -PreleaseVersionCode=1" \
+  bash tools/android/build.sh
+
+# 额外：Tyranor-Next 第三方运行时模块（applicationId
+# com.tyranor.runtime.yuris.kernel，versionName 自动加 -tyranor）
+YURIS_APK_CHANNEL=tyranor YURIS_APK_VARIANTS=universal \
 BUILD_TYPE=release GRADLE_FLAGS="--offline" \
   GRADLE_PROJECT_ARGS="-PreleaseVersionName=0.0.0-local -PreleaseVersionCode=1" \
   bash tools/android/build.sh

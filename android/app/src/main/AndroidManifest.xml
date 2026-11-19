@@ -4,18 +4,31 @@
 
     <!-- 直接读写用户所选的游戏目录(存档写在同一棵树的 save/)。
          内核是原生 Rust、按真实文件路径读写,无法消费 SAF 的 content:// URI,
-         所以这里要「所有文件访问」权限。仅自用分发,不上 Play 商店。 -->
+         所以这里要「所有文件访问」权限。仅自用分发,不上 Play 商店。
+
+         Android 11+ 走 MANAGE_EXTERNAL_STORAGE;Android 10 及以下不认识这个
+         权限,走旧存储模型:READ/WRITE 运行时权限 + requestLegacyExternalStorage。
+         maxSdkVersion=29 以免在 Android 11+ 与「所有文件访问」重复申请。 -->
     <uses-permission
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
 
+    <!-- requestLegacyExternalStorage 只在 Android 10 生效(Android 11+ 忽略);
+         Android 10 上内核才能按 /sdcard/... 真实路径读写任意游戏目录。 -->
     <application
-        android:label="YU-RIS Kernel"
+        android:label="${appLabel}"
         android:hardwareAccelerated="true"
         android:largeHeap="true"
         android:theme="@style/Theme.YuKernel"
         android:allowBackup="false"
-        android:extractNativeLibs="false">
+        android:extractNativeLibs="false"
+        android:requestLegacyExternalStorage="true">
 
         <!-- 启动即选游戏目录;选中后直接在该目录运行。 -->
         <activity
@@ -26,6 +39,19 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- Tyranor-Next 第三方 APK 运行时模块入口。
+                 宿主只按 applicationId 前缀 com.tyranor.runtime.* 发现模块,
+                 所以普通 org.yuris.kernel 包即使带着这个过滤器也不会被列出;
+                 模块构建(-PyurisChannel=tyranor)才改变 applicationId。
+                 一个包只允许一个带 MANIFEST 的启动 Activity。 -->
+            <intent-filter>
+                <action android:name="com.tyranor.runtime.action.LAUNCH" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <meta-data
+                android:name="com.tyranor.runtime.MANIFEST"
+                android:resource="@raw/tyranor_runtime" />
         </activity>
 
         <activity

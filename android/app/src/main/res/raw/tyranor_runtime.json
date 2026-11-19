@@ -1,0 +1,113 @@
+{
+  "protocol": 1,
+  "label": "YU-RIS Kernel",
+  "scan": {
+    "match": "any",
+    "extensions": [".ypf"],
+    "markers": ["data.ypf", "data/ysbin", "ysbin"]
+  },
+  "settings": {
+    "version": 1,
+    "items": [
+      {
+        "key": "fps",
+        "type": "enum",
+        "title": "帧率",
+        "default": "60",
+        "options": [
+          { "value": "30", "title": "30 fps" },
+          { "value": "60", "title": "60 fps" },
+          { "value": "120", "title": "120 fps" }
+        ]
+      },
+      {
+        "key": "mouse_mode",
+        "type": "boolean",
+        "title": "虚拟光标",
+        "default": false,
+        "description": "关 = 直接触摸；开 = 虚拟光标"
+      },
+      {
+        "key": "bilinear_scale",
+        "type": "boolean",
+        "title": "双线性缩放",
+        "default": true,
+        "description": "手机画质更平滑；官方原版是最近邻采样"
+      },
+      {
+        "key": "font_fallback",
+        "type": "boolean",
+        "title": "缺字回退",
+        "default": false,
+        "description": "逐字形回退到宿主字体，缺字时打开"
+      },
+      {
+        "key": "patch",
+        "type": "enum",
+        "title": "文本编码",
+        "default": "auto",
+        "options": [
+          { "value": "auto", "title": "自动（推荐）" },
+          { "value": "original", "title": "原版（CP932）" },
+          { "value": "gbk", "title": "简体（GBK）" },
+          { "value": "big5", "title": "繁体（Big5）" },
+          { "value": "tunnel", "title": "隧道（sjis_ext）" }
+        ],
+        "description": "汉化包整包换过编码时才需要显式选择"
+      },
+      {
+        "key": "gpu_backend",
+        "type": "enum",
+        "title": "GPU 后端",
+        "default": "auto",
+        "options": [
+          { "value": "auto", "title": "自动" },
+          { "value": "gles", "title": "GLES" },
+          { "value": "vulkan", "title": "Vulkan" }
+        ]
+      },
+      {
+        "key": "movie_backend",
+        "type": "enum",
+        "title": "影片解码",
+        "default": "auto",
+        "options": [
+          { "value": "auto", "title": "自动（推荐）" },
+          { "value": "builtin", "title": "内置" },
+          { "value": "external", "title": "外置" }
+        ]
+      },
+      {
+        "key": "font",
+        "type": "text",
+        "title": "字体",
+        "default": "",
+        "maxLength": 1024,
+        "description": "留空 = 自动（优先使用本游戏 fonts/ 下导入的字体）；可填字体族名或 .ttf/.otf/.ttc 绝对路径"
+      },
+      {
+        "key": "debug_log",
+        "type": "boolean",
+        "title": "调试日志",
+        "default": false
+      },
+      {
+        "key": "show_hud",
+        "type": "boolean",
+        "title": "状态浮层",
+        "default": false
+      }
+    ]
+  },
+  "fileImports": {
+    "version": 1,
+    "items": [
+      {
+        "key": "fonts",
+        "title": "导入字体",
+        "directory": "fonts",
+        "multiple": true
+      }
+    ]
+  }
+}

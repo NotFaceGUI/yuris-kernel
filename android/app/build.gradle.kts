@@ -13,6 +13,24 @@ val injectedVersionCode = (project.findProperty("releaseVersionCode") as String?
     ?.trim()
     ?.toIntOrNull()
 
+// 发布渠道:
+//   standard(缺省) = 普通 APK,applicationId = org.yuris.kernel
+//   tyranor        = Tyranor-Next 第三方 APK 运行时模块。宿主要求包名落在
+//                    com.tyranor.runtime.* 命名空间(前缀是发现条件,不是
+//                    安全边界),因此只能改 applicationId,不能只改清单。
+// 用法: gradle -PyurisChannel=tyranor assembleRelease
+val releaseChannel = (project.findProperty("yurisChannel") as String?)
+    ?.trim()
+    ?.lowercase()
+    ?.takeIf { it.isNotEmpty() }
+    ?: "standard"
+if (releaseChannel != "standard" && releaseChannel != "tyranor") {
+    throw GradleException(
+        "yurisChannel 只接受 standard / tyranor,收到: $releaseChannel",
+    )
+}
+val isTyranorModule = releaseChannel == "tyranor"
+
 // 发布签名:四个环境变量由 CI 从 secrets 注入(见 docs/release.md)。
 // 缺任何一项就**不是**正式签名 —— 本地允许回落 debug 签名(自用安装);
 // CI 上则直接失败,绝不产出一个"看起来发布、其实是 debug key"的 APK。
@@ -41,11 +59,24 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "org.yuris.kernel"
+        // Tyranor-Next 只按 com.tyranor.runtime.* 前缀识别第三方运行时模块;
+        // 两个包名可以并存安装,互不影响。
+        applicationId = if (isTyranorModule) {
+            "com.tyranor.runtime.yuris.kernel"
+        } else {
+            "org.yuris.kernel"
+        }
         minSdk = 24
         targetSdk = 36
         versionCode = injectedVersionCode ?: 1
-        versionName = injectedVersionName ?: "0.3.3"
+        versionName = (injectedVersionName ?: "0.3.3") +
+            if (isTyranorModule) "-tyranor" else ""
+        // 模块 APK 与普通 APK 同时装在一台设备上时,桌面名称要能区分。
+        manifestPlaceholders["appLabel"] = if (isTyranorModule) {
+            "YU-RIS Kernel (Tyranor)"
+        } else {
+            "YU-RIS Kernel"
+        }
         // 只打 64 位(架构文档 §2.5.9 开放问题 8:armeabi-v7a 待定):
         // arm64-v8a = 真机目标;x86_64 = 本机模拟器验证用。
         // ABI 过滤:默认两个都打;构建模拟器验证包时用 -PabiFilter=x86_64

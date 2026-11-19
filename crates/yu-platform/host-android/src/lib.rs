@@ -782,6 +782,8 @@ pub fn init_session_with_fonts(
     };
     // 宿主字体字节:游戏通常点名 Windows 日文字体(ＭＳ ゴシック),Android
     // 系统里没有。用户导入的与 `dataRoot/fonts/` 下的都作为宿主能力注入。
+    // `dataRoot/fonts/` 的装载与默认 family 选择统一在 `start_engine`;
+    // 这里只传显式字体参数,两个启动入口行为一致。
     let font_bytes = extra_fonts;
     let mut config = RunConfig {
         data_root,
@@ -791,7 +793,6 @@ pub fn init_session_with_fonts(
         force_font: font_family.filter(|name| !name.trim().is_empty()),
         ..RunConfig::default()
     };
-    config.font_bytes.extend(load_host_fonts(&config.data_root));
     // 老接口同样要应用 run-config.json(与 JSON 入口同一套键)。
     apply_run_config_file(&mut config);
     let started = start_engine(config, path_overrides)?;
@@ -1107,14 +1108,35 @@ pub fn start_engine(
         host_font_index = Some(font_bytes.len());
         font_bytes.push(bytes);
     }
-    // 统一字体选择:显式 family 优先;只给了字体文件则强制该文件的 face。
-    let font = match force_font.filter(|name| !name.trim().is_empty()) {
+    // 宿主字体:`dataRoot/fonts/` 必须对**所有**启动入口生效。JSON 入口
+    // (`nativeInitJson`) 不经过 `init_session_with_fonts`,以前只有老接口
+    // 会装载它,Tyranor 的「导入字体」因此在 JSON 路径上完全不生效。
+    let host_fonts = load_host_fonts(&data_root);
+    let host_font_count = host_fonts.len();
+    font_bytes.extend(host_fonts);
+    // 统一字体选择:显式 family 优先;只给了字体文件则强制该文件的 face;
+    // 两者都没有时,把首个已注入字体的第一 family 设为默认 —— 否则脚本
+    // 未点名时 Default 解析失败(`Default(script gave no font) ->
+    // unresolvable`),导入的字体不会成为正文默认字体。
+    let mut force_font = force_font.filter(|name| !name.trim().is_empty());
+    if force_font.is_none() && host_font_index.is_none() && !font_bytes.is_empty() {
+        force_font = font_bytes
+            .iter()
+            .find_map(|bytes| yu_font::families_from_bytes(bytes).into_iter().next());
+    }
+    let font = match force_font {
         Some(family) => yu_engine::engine::FontChoice::Family(family),
         None => match host_font_index {
             Some(index) => yu_engine::engine::FontChoice::HostFont(index),
             None => yu_engine::engine::FontChoice::Script,
         },
     };
+    let font_note = match &font {
+        yu_engine::engine::FontChoice::Family(name) => format!(" font={name}"),
+        yu_engine::engine::FontChoice::HostFont(index) => format!(" font=host[{index}]"),
+        yu_engine::engine::FontChoice::Script => " font=script".to_string(),
+    };
+    let font_bytes_count = font_bytes.len();
     init_logcat(quiet);
     install_panic_hook();
     // 自证:日志链路一旦装好就立刻打一条。新日志器**单一路径双写**
@@ -1242,7 +1264,7 @@ pub fn start_engine(
     }
     let viewport = engine.viewport();
     let summary = format!(
-        "OK backend={} entry={} viewport={}x{} fps={} boot_ms={:.1} os_sound={}          save_codec={} data={} save={}{}{}",
+        "OK backend={} entry={} viewport={}x{} fps={} boot_ms={:.1} os_sound={}          save_codec={} data={} save={}{}{} font_bytes={} host_fonts={}{}",
         engine.backend(),
         engine.entry(),
         viewport.width,
@@ -1255,6 +1277,9 @@ pub fn start_engine(
         save_root.display(),
         audio_note,
         log_note,
+        font_bytes_count,
+        host_font_count,
+        font_note,
     );
     let summary = if chosen_backend == Backend::Wgpu {
         let gpu = engine.wgpu_renderer().map(|r| r.adapter().backend.clone());

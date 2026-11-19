@@ -191,6 +191,105 @@ adb logcat -s yu-android                    # 每帧一行 status(含 fps)
 `/sdcard/Android/data/org.yuris.kernel/files/save/`),与桌面 `save/` 语义一致,
 `.sd` 字节级同构。
 
+## Tyranor-Next 第三方运行时模块(额外 APK)
+
+同一个壳可以再打一份 `applicationId = com.tyranor.runtime.yuris.kernel` 的
+APK,作为 Tyranor-Next 的第三方运行时模块。宿主按包名前缀
+`com.tyranor.runtime.*` 发现模块,再用显式 Intent 派发:
+
+- action `com.tyranor.runtime.action.LAUNCH`;
+- extra `com.tyranor.runtime.extra.FOLDER_PATH`(游戏根目录绝对路径);
+- 可选 `GAME_TITLE` / `PROTOCOL_VERSION`(当前 1)/ `SETTINGS`。
+
+宿主不传 SAF URI,也不代授存储权限;本壳本来就按真实路径读写,首次启动
+仍需用户自己授「所有文件访问」。模块入口在 `SetupActivity`;收到
+`FOLDER_PATH` 后落到与手动选目录相同的状态,权限与字体就绪即自动进游戏,
+正常退出游戏会关掉配置页回到 Tyranor。
+
+构建(不影响普通 `org.yuris.kernel` 包):
+
+```bash
+# 模拟器(x86_64)
+YURIS_APK_CHANNEL=tyranor BUILD_TYPE=release YURIS_APK_VARIANTS=x86_64 \
+  tools/android/build.sh x86_64
+
+# 真机(arm64-v8a)
+YURIS_APK_CHANNEL=tyranor BUILD_TYPE=release YURIS_APK_VARIANTS=arm64-v8a \
+  tools/android/build.sh arm64-v8a
+```
+
+通用包(arm64-v8a + x86_64)用 `YURIS_APK_VARIANTS=universal` 且不传 ABI
+参数:
+
+```bash
+YURIS_APK_CHANNEL=tyranor BUILD_TYPE=release YURIS_APK_VARIANTS=universal \
+  tools/android/build.sh
+```
+
+产物在 `target/android-apks/app-tyranor-release-<abi>.apk`。安装后在
+Tyranor-Next 的「工具 → 引擎模块管理」里**手动启用**(默认禁用),再重扫
+游戏库;扫描/设置/导入声明都在
+`app/src/main/res/raw/tyranor_runtime.json`:
+
+```json
+{
+  "protocol": 1,
+  "label": "YU-RIS Kernel",
+  "scan": {
+    "match": "any",
+    "extensions": [".ypf"],
+    "markers": ["data.ypf", "data/ysbin", "ysbin"]
+  },
+  "settings": {
+    "version": 1,
+    "items": [
+      { "key": "fps", "type": "enum", "title": "帧率", "default": "60",
+        "options": [{ "value": "60", "title": "60 fps" }] },
+      { "key": "font", "type": "text", "title": "字体", "default": "", "maxLength": 1024 }
+    ]
+  },
+  "fileImports": {
+    "version": 1,
+    "items": [
+      { "key": "fonts", "title": "导入字体", "directory": "fonts", "multiple": true }
+    ]
+  }
+}
+```
+
+当前暴露的单游戏设置(完整声明以 JSON 为准):`fps`、`mouse_mode`、
+`bilinear_scale`、`font_fallback`、`patch`、`gpu_backend`、`movie_backend`、
+`font`、`debug_log`、`show_hud`。Tyranor 在游戏抽屉的「引擎设置」里按声明
+渲染;模块只能控制 title/description/type/default,卡片间距与样式由宿主决定。
+
+字体链路:
+
+- 「导入字体」把文件复制到 `<游戏目录>/fonts/`;
+- 内核启动时加载 `<游戏目录>/fonts/*.ttf|otf|ttc|otc`(按文件名排序);
+- `font` 留空 = 自动:首个已加载字体的第一 family 作为默认
+  (实测日志 `font_bytes=1 host_fonts=1 font=SimSun`);
+- `font` 也可填字体族名或 `.ttf/.otf/.ttc` 绝对路径。
+
+说明:
+
+- 普通 APK 的清单里也有同一个过滤器,但宿主的包名前缀检查会把它排除,
+  因此不会被误识别;两包可并存安装。
+- 模块卡片引擎名显示为 `Plugin`;`label` 只出现在模块管理里。
+- 暂未声明 `saves` 托管:本壳允许自定义存档目录,声明后会和宿主托管冲突。
+- 改包名等于换模块身份,已有绑定不会迁移。
+
+模拟宿主派发(设备上已有游戏目录时):
+
+```bash
+adb install -r target/android-apks/app-tyranor-release-x86_64.apk
+adb shell appops set --uid com.tyranor.runtime.yuris.kernel \
+  MANAGE_EXTERNAL_STORAGE allow
+adb shell am start -a com.tyranor.runtime.action.LAUNCH \
+  -n com.tyranor.runtime.yuris.kernel/org.yuris.kernel.SetupActivity \
+  --ei com.tyranor.runtime.extra.PROTOCOL_VERSION 1 \
+  --es com.tyranor.runtime.extra.FOLDER_PATH /sdcard/Download/yugame
+```
+
 ## 数据布局
 
 ```text
