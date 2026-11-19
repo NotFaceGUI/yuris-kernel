@@ -15960,3 +15960,239 @@ cargo test -p yu-rt --lib image::tests
 - wgpu headless 探针在本轮 `probe_layers` 采样中未复现 logo（软渲染
   已复现，实机 wgpu 正常）；暂按探针采样面差异记录，未改后端。
 - 未执行 git 写操作。
+
+## 成果 CSV-XVER (2026-11-19) · BETA4 命令参数跨版本残项:CSV/CSVINFO 与 SAVE/LOAD IDNO
+
+### 背景
+
+BETA4 普查留下四类命令参数残项:0.466 的 `CSV[LINE]`/`CSVINFO[LINE]`、
+0.495 的 `CSVINFO[DATA]`、`SAVE/LOAD[IDNO]`、0.466 的
+`__SAVE_PATH_TYPE`。本轮按「先 REA、后改码」逐项收口。
+
+### 取证(官方 0.466/0.479/0.495 `yu-ris.exe`)
+
+- **0.466 `CSV` = 真实读取器**,不是 0.495 的空桩:
+  入口 `0x431970`(`mov eax,7; call 0x41d56d`),`[0x650201]` 读 `LINE`
+  (1 基行号),`0x431c03`/`0x431d9c` 按行过滤,单元格写 `0x431f58`。
+- **0.466 `CSVINFO` = `0x432050`**:`SIZE=1` 计数(`0x432224` 逗号、
+  `0x432360/0x432388` 行终止、`0x43225a` EOF 最后一格);`SIZE=0` 且
+  `LINE` 在场时 `0x4322f2` 写行数。
+- **0.495 `CSVINFO[DATA]` = `0x43e660`**:`DATA` 非 0 → `0x43e7e3`
+  解析 CSV,逐格经 `0x43f0d8(var,index,cell)` 写入 `LET` **字符串数组**
+  (类型字节 `+1==3`;容量不足 realloc);`SIZE` 非 0 走 `0x43e71f`
+  计数;两者同时在场先 DATA 后 SIZE。
+- **0.479 `CSV` 序号 7 仍是短桩**(候选入口 `0x43869c`),与 0.495 同形。
+- **`SAVE/LOAD[IDNO]`**:0.495 `SAVE 0x44c4aa..0x44c51c` 与
+  `LOAD 0x4470d1..0x447145` 在同构代码里把 `ID` 拷到临时缓冲,追加
+  `.`(`0x808354`),再经 `0x46a7c0` 追加十进制 `IDNO`,最后交
+  `0x4141e4` 路径规范化 / `0x414559` 层查找。`IDNO` 缺省时层名 = `ID`。
+- **0.466 `__SAVE_PATH_TYPE`(id 77)**:0.466 二进制**不含** `yssfs.dat`,
+  不能按 0.495 `_SAVE_PATH_TYPE` 的 `[0x801324]`/`yssfs.dat` 语义直接
+  别名;0.466 getter 未定位 ⇒ 保持 open(新档 DIV-RT-060)。
+
+### 改动
+
+- `crates/yu-rt/src/vm/handlers.rs`
+  - `build_handler_table` 的 `CSV` 改为**按参数表结构**裁决:
+    表含 `LINE`(0.466)或序号 != 7(v474)→ `HandlerKind::Csv`;
+    否则(0.479/0.495 序号 7)→ `NoopEval`。
+  - `op_csv` 读取 `LINE`,用新增 `parse_csv_cells_lined` 按 1 基行号过滤。
+  - `op_csvinfo` 读取 `DATA`/`LINE`,按表是否含 `LINE` 选 0.466 口径;
+    `DATA` 走新增 `write_csv_cells` 写入字符串数组,`SIZE` 计数,
+    `SIZE=0+LINE` 写行数。
+  - 新增 `count_csv_cells_0466`(EOF 计入最后一格)、`csv_line_count_0466`。
+  - `op_save`/`op_load` 读取 `IDNO`;新增 `compose_layer_id(id,idno)` 生成
+    `ID.N` 后交 `capture_layer`/`restore_layer`。
+- 文档:`DIV-RT-057` 重写为四代 CSV/CSVINFO 对照;新增 `DIV-RT-061`
+  (SAVE/LOAD IDNO)与 `DIV-RT-060`(`__SAVE_PATH_TYPE` open);
+  `coverage-matrix.md` 的 CSV/CSVINFO/SAVE/LOAD 行与 §3 同步。
+
+### 验证
+
+```text
+cargo test -p yu-rt --lib csv_parse_tests
+  → 7 passed(引号/换行/单引号跨行/行号/0.466 计数/行数)
+cargo test -p yu-rt --test fixture csv
+  → 7 passed(0.495 空桩 / v474 解析 / 0.466 LINE 过滤 /
+            CSVINFO[DATA] 写数组 / 0.466 LINE 计数与行数)
+cargo test -p yu-rt --test fixture save_load_idno
+  → 1 passed(captured/restored 层名均为 THUMB.3)
+cargo test -p yu-rt
+  → 113 lib + 129 fixture + consistency 等全绿
+cargo check --workspace --all-targets
+  → 通过
+project-0466 (0.466) game_diag_probe 300 帧
+  → unimplemented_cmds 空;script_errors=0;missing_assets=0
+project-eris (0.495) game_diag_probe 300 帧
+  → 仅 EMOTE:12(deferred);script_errors=0
+```
+
+### 影响边界与残留
+
+- `CSVINFO[DATA]` 的官方 realloc 扩容在本内核受固定变量维长限制:
+  超出 `LET` 容量时停在最后可写下标并挂 `rt.csv`,不静默越界。
+- `CSV` 的处理器选择不再只看序号;0.466 表(含 `LINE`)与 0.479/0.495
+  表(无 `LINE`)走不同分支,均为数据驱动,不写死版本号。
+- `__SAVE_PATH_TYPE` 仍 open(DIV-RT-060);0.466 无 `yssfs.dat`,
+  需 getter REA 或真实引用后再定案。
+- 未执行 git 写操作。
+
+## 成果 ANDROID-10-STORAGE (2026-11-19) · Android 10 及以下补上存储权限,修复选目录无反应
+
+### 1. 问题
+
+Android 10 真机上「选择游戏目录」点了没反应,也从不弹权限框。
+
+根因:`SetupActivity.ensureStorageThen` 无条件调用
+`Environment.isExternalStorageManager()`。该方法是 API 30 才加入的;
+Android 10(API 29)执行到这一行直接抛 `NoSuchMethodError`,后续选目录
+代码根本走不到。另外清单里只有 `MANAGE_EXTERNAL_STORAGE`(Android 11+
+才存在),没有 `READ/WRITE_EXTERNAL_STORAGE`,也没有
+`requestLegacyExternalStorage`:旧系统没有运行时权限可授,内核按
+`/sdcard/...` 真实路径读写仍然会失败。
+
+### 2. 改法
+
+- `android/app/src/main/AndroidManifest.xml`
+  - 新增 `READ_EXTERNAL_STORAGE` / `WRITE_EXTERNAL_STORAGE`,
+    `maxSdkVersion=29`(Android 11+ 由 MANAGE 接管,不重复申请);
+  - `<application>` 加 `requestLegacyExternalStorage="true"`
+    (Android 10 旧存储模型生效;Android 11+ 忽略)。
+- `SetupActivity`
+  - `ensureStorageThen` 按 `Build.VERSION.SDK_INT` 分流:API 30+ 维持
+    「所有文件访问」设置页;API 29 及以下运行时申请 READ/WRITE,
+    在 `onRequestPermissionsResult` 授权后继续刚才的动作;
+  - 选游戏目录、另存目录、导入字体、开始游戏统一走同一道权限闸;
+  - Android 11+ 设置页跳转补兜底:系统没有对应 Activity 时只回显提示,
+    不再抛 `ActivityNotFoundException`。
+
+### 3. 验证
+
+```text
+cd android && gradle :app:compileReleaseJavaWithJavac --no-daemon
+  → 通过(EXIT=0;仅有既有 deprecation 注释)
+```
+
+- 真机点验(Android 10 权限弹框 → 选目录 → 启动读写)由主人完成。
+
+
+## 成果 AND-TYRANOR (2026-11-19) · Tyranor-Next 第三方运行时模块(额外 APK)
+
+> 目标:同一个 Android 壳除普通 `org.yuris.kernel` 外,再发布一份
+> `com.tyranor.runtime.yuris.kernel` 模块 APK,由 Tyranor-Next 的
+> 「引擎模块管理」发现、扫描、派发。未执行 git 写操作。
+
+### 1. 实现
+
+- 构建渠道:`android/app/build.gradle.kts` 增加
+  `-PyurisChannel=standard|tyranor`;tyranor 渠道 applicationId =
+  `com.tyranor.runtime.yuris.kernel`,versionName 追加 `-tyranor`,
+  label = `YU-RIS Kernel (Tyranor)`。
+- 模块入口:`AndroidManifest.xml` 的 `SetupActivity` 声明
+  `com.tyranor.runtime.action.LAUNCH` + `DEFAULT`,并挂
+  `com.tyranor.runtime.MANIFEST = @raw/tyranor_runtime`。
+- `SetupActivity`:消费 `FOLDER_PATH` / `GAME_TITLE` /
+  `PROTOCOL_VERSION` / `SETTINGS`;路径落到与手动选目录同一状态,权限与
+  字体就绪后自动启动;正常退出游戏关闭配置页回到 Tyranor;换游戏时不
+  沿用上一个游戏的自定义存档目录。
+- 声明:`res/raw/tyranor_runtime.json` 增加 `settings`(10 项)与
+  `fileImports`(fonts → `<游戏目录>/fonts/`)。
+- 字体根因修复:`crates/yu-platform/host-android/src/lib.rs` 的
+  `start_engine` 统一加载 `<data_root>/fonts/*.ttf|otf|ttc|otc`
+  (JSON 入口以前不加载),并在没有显式 family / font_file 时把首个已注入
+  字体的第一 family 设为默认。修复前日志
+  `Default(script gave no font) -> unresolvable`,Tyranor「导入字体」
+  实际不会成为正文默认字体。
+- 构建脚本:`tools/android/build.sh` 增加 `YURIS_APK_CHANNEL`;非标准渠道
+  产物落 `target/android-apks/app-tyranor-<type>-<abi>.apk`。
+- CI:`release.yml` 额外构建并归档
+  `yuris-kernel-<tag>-android-tyranor-module.apk`。
+
+### 2. 验证(emulator-5700, x86_64)
+
+```text
+aapt2 dump badging app-release-universal.apk
+  → package org.yuris.kernel versionCode=10 versionName=0.4.1
+    native-code arm64-v8a x86_64
+aapt2 dump badging app-tyranor-release-universal.apk
+  → package com.tyranor.runtime.yuris.kernel versionCode=10
+    versionName=0.4.1-tyranor native-code arm64-v8a x86_64
+
+adb install -r app-tyranor-release-universal.apk → Success
+adb install -r app-tyranor-release-arm64-v8a.apk → Success
+adb shell am start -a com.tyranor.runtime.action.LAUNCH \
+  -n com.tyranor.runtime.yuris.kernel/org.yuris.kernel.SetupActivity \
+  --ei ...PROTOCOL_VERSION 1 \
+  --es ...FOLDER_PATH /sdcard/Download/yugame
+  → yu-android: init: OK ... data=packed:/sdcard/Download/yugame/data.ypf
+    ... font_bytes=1 host_fonts=1 font=SimSun gpu=gl
+  → 无 Default(script gave no font) -> unresolvable
+
+Tyranor-Next 模块管理:
+  → YU-RIS Kernel
+    com.tyranor.runtime.yuris.kernel · 0.3.3-tyranor (1) · 协议 1 · 支持扫描
+  → 游戏抽屉「引擎设置」列出:帧率/虚拟光标/双线性缩放/缺字回退/文本编码/
+    GPU 后端/影片解码/字体/调试日志/状态浮层 + 导入字体
+  → 扫描 /sdcard/TyranorGames 子目录得到 ERIS_demo 卡片
+```
+
+### 3. 发布产物
+
+- `target/android-apks/app-release-universal.apk`(28M,普通包)
+- `target/android-apks/app-release-arm64-v8a.apk`(15M,普通 arm64 瘦包)
+- `target/android-apks/app-tyranor-release-universal.apk`(28M,Tyranor 模块)
+- `target/android-apks/app-tyranor-release-arm64-v8a.apk`(15M,模块 arm64 瘦包)
+- arm64 瘦包已在 emulator-5700(带 ARM 转译)安装并启动成功,
+  `font=SimSun` 一致;`aapt2 dump badging` 的 `native-code` 为
+  `'arm64-v8a'`。
+- 本机无 `YURIS_KEYSTORE_*` 四件套 → 以上 APK 均为 **Android Debug**
+  证书;CI release job 用 secrets 正式签名。
+
+### 4. 补丁 v11:字体下拉最后一项消失
+
+- 现象:从 Tyranor 启动过游戏后,本壳配置页字体下拉的最后一项
+  (已导入字体)消失。
+- 根因:`font` 的声明默认值是 `""`;`applyFontSetting("")` 把
+  `fontPath` / `importedFontName` 清空,`launchGame` 又把空值持久化,
+  下次打开配置页自然重建不出最后一项。
+- 修复:空值视为“宿主没有 per-game 覆盖”,保留模块自己的字体选择;
+  `<游戏目录>/fonts/` 的自动默认仍由内核侧处理。
+- 模块包重打:arm64-v8a / universal,`versionCode=11`,
+  `versionName=0.4.1-tyranor`。已被清掉的旧偏好需要重新导入/选择一次字体。
+
+
+## 成果 CGS-FADE (2026-11-19) · COPY/COPY2 覆盖目标矩形,修复读档黑幕淡出变直接黑屏
+
+**症状**:0.3.3 正常、0.4.0 起读档时「淡出到黑屏」变成直接黑屏并闪烁;
+桌面抓帧(`target/tmp/debug-ui/s1795097882`)显示 `CGS100/CGS999` 幕布层
+在 A=256 时整屏已黑,后续 32 帧 `A-=8` 肉眼不可见。
+
+**根因(回归链)**:
+- `dc545ae`(v0.4.0)在 `CG[FILE=""]` 作用于**已存在**层时把
+  `LayerKind::Image.size` 回写成 1×1(`DIV-GFX-089` 的 RESIZE 修复);
+- 黑幕层 `CGS<n>` 跨界面复用(菜单打开时已建立);读档 `es.CGTSS` 再次
+  `CG CGS100 FILE="" A=0` ⇒ 绘制尺寸 1×1;`CGACT COPY2 ID=:/W0/` 只换
+  texture,绘制仍按 `Image.size` ⇒ 整幅冻结屏幕缩成 1 个像素;菜单层
+  随后被删,屏幕直接黑,32 步淡出全打在该像素上。
+
+**官方取证**(REA Ghidra 12.1.4,0.495 `4f5eefa3…`,
+`ev_ff12409d569c8310749c5aba0eec83c44d24f3f5016376fd14aee71c8438f1c5`):
+`FUN_0042f809` 在动作分派后**无条件**释放目标 `+0x90` 旧表面、挂上按
+区域(`X2-X+1 × Y2-Y+1`)新分配的表面并写 `+0x78/+0x7c`(单层
+0x42f9ef..0x42fa14;双层 0x4305d0..0x4305fe,`MOV [EAX+0x78],ESI`
+@0x4305f4)⇒ `CG[FILE=""]`(`FUN_0040c5f4`)写下的 1×1 矩形在 COPY
+之后不再代表目标层。
+
+**修复**:`cgact_copy` 在把目标纹理换成 `Snapshot` 时清
+`LayerKind::Image.size = None`(内核快照表面按 DIV-GFX-077 保持源尺寸,
+自然尺寸绘制 = 官方「区域尺寸表面 1:1」);`display_rect` 仍记录区域供
+`CGINFO`/`ONMOUSE*`;COPY 之后的 `SIZE/RESIZE/SX/SY` 照旧写回。
+
+**验证**:
+- `cargo test -p yu-gfx` → 全绿;新增
+  `copy2_after_reused_fileless_layer_draws_snapshot_at_natural_size`;
+  `copy2_rect_overrides_stale_explicit_size_and_yields_to_new_cg_size`
+  的绘制尺寸断言更新为 `None`(官方 COPY 覆盖矩形)。
+- `cargo test -p yu-backend-soft` → 全绿。
+- `cargo test -p yu-backend-wgpu` → 39 + 1 + 1 全绿。
+- 桌面实测(0.4.1+kotoneiro 读档淡出)待主人验收。
