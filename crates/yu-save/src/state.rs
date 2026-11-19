@@ -537,7 +537,6 @@ impl SaveState {
                     );
                 }
                 other => {
-                    let _ = other;
                     return Err(error::recoverable(
                         code::INTERNAL,
                         format!("未知预约块类型 {other}"),
@@ -977,7 +976,9 @@ impl SaveState {
             // (`D:/.../project-eris` 之于 `.../project-eris/save`),
             // 等于允许脚本从上层目录读删。
             let lexical_ok = raw == self.root.as_path() || raw.starts_with(&self.root);
-            let (Some(root), Some(resolved)) = (self.fs.canonicalize(&self.root), self.fs.canonicalize(raw)) else {
+            let (Some(root), Some(resolved)) =
+                (self.fs.canonicalize(&self.root), self.fs.canonicalize(raw))
+            else {
                 return if lexical_ok {
                     Ok(raw.to_path_buf())
                 } else {
