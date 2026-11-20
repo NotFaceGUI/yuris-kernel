@@ -21,6 +21,10 @@
 (`decode` / `decode_char`,WHATWG `shift_jis`);两个渲染后端共用它,保证
 字符流一致。
 
+补充(2026-11-20):补丁自带的重映射字体(`hook.ini` + ttf,CP932 载体字
+方案)由 **`yu-engine` 在启动时检测并强制注入**,不属于 `yu-font` 的自动
+发现;规则与取证见 `docs/patch-font-remap.md`。
+
 ## 2. 证据等级与策略
 
 ```rust

@@ -16212,6 +16212,59 @@ Tyranor-Next 模块管理:
 - 勘误：`README-BETA-SERIES`(2026-11-17) 的「第三方」表述作废。
 - 本轮只改文档；源码/探针改动不随此提交。
 
+## 成果 PATCH-FONT (2026-11-20) · 字体重映射补丁自动加载并强制全部 FONT 请求
+
+**症状**:汉化补丁(`hook.ini` + `qiandong.ttf` + `ysbin/`,浅冬/FONTCHANGER
+同型)在引擎里“一部分乱码、一部分汉化”;手动 `--font` 选该 ttf 仍然混合。
+
+**取证**(样本 `42802_…`,YSTB v466,8 个 `ystNNNNN.ybn`):
+- 标准异或密钥 `D3 6F AC 96`(`CRC32("Yu-ris")`),无换钥/二次加密;
+- 正文**严格 CP932 全部可解**,严格 GBK 在 700+ 段失败——不能按 GBK 解;
+- 解出的不是目标字,而是“载体字”:CP932 解 `髮髮髮髮髮髮。哢釿，鮠釿。`
+  → `qiandong.ttf` 渲染 = `咚咚咚咚咚咚。咔嗒，啪嗒。`;
+- 字体里 **2997 个汉字码位与其他码位共用同一 glyph**:
+  `髮 U+9AEE ↔ 咚 U+549A`、`哢 U+54E2 ↔ 咔 U+5494`、
+  `釿 U+91FF ↔ 嗒 U+55D2`、`鮠 U+9BA0 ↔ 啪 U+556A`。
+- 结论:编码路线是原版 CP932;缺的是**补丁字体**。只设默认字体不够
+  (脚本点名其它 family / `FONT NO` 会绕过),必须像 FONTCHANGER 一样
+  替换全部字体;手动 `--font` 未加 `--font-lock` 时正是“默认字体”语义,
+  所以用户看到混合。
+
+**实现**:
+- `crates/yu-engine/src/patch.rs`:`PatchFont` + `detect_patch_font`
+  (游戏根/`data/` 的 `hook.ini`;`[FONT] FONTFILENAME` 相对 hook 目录、
+  同目录 `fonts/`、游戏根、根 `fonts/` 查找;段/键大小写不敏感;声明了
+  字体但缺失/空文件/超 64MiB 显式报错);`PatchProfile.font` 进
+  `summary()` 与 evidence,编码与字体正交。
+- `crates/yu-engine/src/engine.rs`:`BootBundle` 携带 `PatchFont`,
+  `apply_patch_font` 在渲染器创建前落到字体选择——未指定字体或同 family
+  → 注入并**强制全部 FONT 请求**;选了别的 family 且未锁 → 补丁字体
+  接管;显式 `--font-lock` → 尊重宿主(诊断)。
+- CLI `--font` 帮助补充自动加载说明。
+- `yu-render-soft/wgpu` 暴露 `force_font()` 只读视图;`Engine::forced_font()`
+  供宿主/诊断确认补丁字体是否生效。
+- 新增 `crates/yu-engine/tests/patch_font_boot.rs`(合成工程 + 真实
+  `qiandong.ttf`):启动链端到端断言 `forced_font() == "qiandong"` 与
+  三条优先级分支(默认/未锁覆盖/显式锁)。
+
+**验证**:
+- `cargo test -p yu-engine --lib` → `63 passed; 0 failed`。
+- `cargo test -p yu-engine` → 集成 `capture_snapshot 4` +
+  `patch_font_boot 1` + `project_layout 1` + `text_sync 2` 全绿;
+  `patch_font_boot` 在 `YURIS_SAMPLE_FONT_PATCH` 下实测
+  `family = qiandong`(无样本时用系统字体,两者都无则显式跳过)。
+- `YURIS_SAMPLE_FONT_PATCH=<补丁根> cargo test -p yu-engine --lib patch_font`
+  → `11 passed`(真实 `qiandong.ttf`:family=`qiandong`,三条优先级分支
+  全部断言;未设样本时显式跳过)。
+- `cargo run -p yu-engine --example patch_probe -- target/tmp/fontpatch-proj auto`
+  → `kind=original … font=target/tmp/fontpatch-proj\qiandong.ttf`
+  `evidence=["hook.ini: FONTFILENAME=qiandong.ttf FONTNAME=qiandong"]`。
+- `cargo build --workspace --all-targets` → 通过。注:本机用户目录含中文
+  (`C:\Users\鬼`),mimalloc 生成的 `mimalloc-static.cc` 按 GBK 读源文件会
+  把 include 路径弄坏(`c1xx C1083`,与本改动无关);构建时加
+  `CFLAGS=-utf-8 CXXFLAGS=-utf-8` 即通过。
+- 待主人用实际游戏验收:`auto` 下静态 UI/正文全部使用补丁字体。
+
 ## 成果 VER-BADGE (2026-11-20) · 安卓左下角版本名角标(支持绿/不支持红)
 
 **需求**:高级设置新增默认开启的「版本名角标」,在游戏画面**左下角**

@@ -163,6 +163,12 @@ impl SoftRenderer {
         self.text.source_summary()
     }
 
+    /// 当前强制字体 family(`None` = 脚本语义;补丁字体/诊断用)。
+    #[must_use]
+    pub fn force_font(&self) -> Option<&str> {
+        self.text.force_font()
+    }
+
     /// 强制所有 `FONT` 请求使用指定 family(`None` = 恢复脚本语义)。
     pub fn set_force_font(&mut self, family: Option<String>) {
         self.text.set_force_font(family);

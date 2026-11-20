@@ -256,7 +256,9 @@ yu-cli run · 跑工程(缺省 headless;--mode desktop 开原生窗口)
   --font FAMILY|PATH   宿主默认字体:family 名,或字体文件(.ttf/.otf/.ttc/
                        .otc;相对路径按工程根,文件里的 Bold/Italic 照常解析;
                        引擎默认名/空名映射到它,游戏内选其它字体仍生效;
-                       查不到 = 回退引擎默认 family)
+                       查不到 = 回退引擎默认 family)。
+                       补丁 hook.ini 的 FONTFILENAME 会自动加载并强制全部
+                       FONT 请求(FONTCHANGER 同型),无需本参数
   --font-lock          配合 --font:恢复旧强制语义(忽略脚本/游戏内选择)
   --debug-mode on|off  @_DEBUGMODE 注入(缺省 off;desktop 缺省时亦读
                        环境变量 YURIS_DEBUG_MODE=1,DIV-L-001)

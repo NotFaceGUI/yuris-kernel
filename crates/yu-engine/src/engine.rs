@@ -680,6 +680,14 @@ impl Renderer {
         }
     }
 
+    /// 当前强制字体 family(`None` = 脚本语义)。
+    fn force_font(&self) -> Option<&str> {
+        match self {
+            Renderer::Soft(renderer) => renderer.force_font(),
+            Renderer::Wgpu { renderer, .. } => renderer.force_font(),
+        }
+    }
+
     fn set_force_font(&mut self, family: Option<String>) {
         match self {
             Renderer::Soft(renderer) => renderer.set_force_font(family),
@@ -880,7 +888,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(project: Project, opts: EngineOptions) -> CliResult<Self> {
+    pub fn new(project: Project, mut opts: EngineOptions) -> CliResult<Self> {
         let boot_started = Instant::now();
         let BootBundle {
             mut vm,
@@ -892,7 +900,14 @@ impl Engine {
             mut capture_bridge,
             identity,
             display,
+            patch_font,
         } = boot(&project, &opts)?;
+        // 补丁字体必须在渲染器创建/任何文字绘制前落入字体选择:补丁正文是
+        // CP932 载体字,只有随包字体能映射到目标字形。FONTCHANGER 同型 =
+        // 强制全部 FONT 请求,不能只设默认(脚本点名字体/`FONT NO` 会绕过)。
+        if let Some(font) = patch_font.as_ref() {
+            apply_patch_font(&mut opts, font)?;
+        }
         // VM opcode 归因是引擎参数(`tuning.vm_profile`;Android 壳以前在
         // 宿主里 set_command_profile,CLI 只能靠环境变量)。采样器每条命令
         // 两次 `Instant::now()`,只在显式开启时运行。
@@ -1149,6 +1164,15 @@ impl Engine {
     #[must_use]
     pub fn font_summary(&self) -> Option<&str> {
         self.renderer.font_summary()
+    }
+
+    /// 当前强制字体 family(补丁字体 / `--font-lock`;`None` = 脚本语义)。
+    ///
+    /// 与 [`Engine::set_force_font`] 同一状态的只读视图,供宿主/诊断确认
+    /// “补丁字体到底有没有生效”。
+    #[must_use]
+    pub fn forced_font(&self) -> Option<&str> {
+        self.renderer.force_font()
     }
 
     /// 运行期切换强制字体(`None` = 恢复脚本语义)。下一次文本绘制生效。
@@ -2944,6 +2968,104 @@ impl SoundLoader for VfsSoundLoader {
     }
 }
 
+/// 把补丁自带字体落到宿主字体选择上(FONTCHANGER 同型)。
+///
+/// 优先级:
+/// - 宿主没指定字体(`FontChoice::Script`):注入补丁字体并**强制**全部
+///   FONT 请求——只设默认会让脚本点名/`FONT NO` 的文本继续用系统字体,
+///   载体字就会“一部分乱码”;
+/// - 宿主已选的就是同一 family:补注入字节(若缺)并提升为强制;
+/// - 宿主选了别的 family **且显式 `--font-lock`**:尊重宿主(诊断用途);
+/// - 宿主选了别的 family 但没有锁:补丁字体仍优先——载体字只有它能解码,
+///   `fonts/` 自动注入或旧配置不应把可读文本变成错形。
+fn apply_patch_font(
+    opts: &mut EngineOptions,
+    font: &crate::patch::PatchFont,
+) -> CliResult<()> {
+    let bytes = font.load()?;
+    let family = yu_font::families_from_bytes(&bytes)
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            Failure::runtime(format!(
+                "补丁字体 {} 没有可用 family(fontdb 未识别)",
+                font.path.display()
+            ))
+        })?;
+    match host_font_family(opts) {
+        None => {
+            let index = opts.font_bytes.len();
+            opts.font_bytes.push(bytes);
+            opts.font = FontChoice::HostFont(index);
+            opts.font_lock = true;
+            log::info!(
+                target: "yu-font",
+                "[patch] 补丁字体 {} -> family \"{family}\";FONTCHANGER 同型,强制全部 FONT 请求",
+                font.path.display()
+            );
+        }
+        Some(chosen) if same_font_family(&chosen, &family) => {
+            // 宿主按 family 名选了同一字体,但可能只是名字(字体没装/没注入);
+            // 补上补丁字体字节,保证强制后一定有 face 可解析。
+            if !font_bytes_has_family(opts, &family) {
+                opts.font_bytes.push(bytes);
+            }
+            opts.font_lock = true;
+            log::info!(
+                target: "yu-font",
+                "[patch] 宿主字体 \"{chosen}\" 即补丁字体 \"{family}\";提升为强制全部 FONT 请求"
+            );
+        }
+        Some(chosen) if opts.font_lock => {
+            log::warn!(
+                target: "yu-font",
+                "[patch] 检测到补丁字体 \"{family}\" ({}),但宿主 `--font-lock` 指定了 \
+                 \"{chosen}\";保留宿主强制字体(载体字可能显示为错形)",
+                font.path.display()
+            );
+        }
+        Some(chosen) => {
+            // 未锁的宿主默认/家庭选择不足以解码载体字:补丁字体接管。
+            let index = opts.font_bytes.len();
+            opts.font_bytes.push(bytes);
+            opts.font = FontChoice::HostFont(index);
+            opts.font_lock = true;
+            log::warn!(
+                target: "yu-font",
+                "[patch] 宿主字体 \"{chosen}\" 未锁,被补丁字体 \"{family}\" 接管 \
+                 ({});要保留宿主字体请加 `--font-lock`/显式锁定",
+                font.path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 宿主当前选择的字体 family(`Script` = 没有选择)。
+fn host_font_family(opts: &EngineOptions) -> Option<String> {
+    match &opts.font {
+        FontChoice::Script => None,
+        FontChoice::Family(name) => Some(name.clone()),
+        FontChoice::HostFont(index) => opts
+            .font_bytes
+            .get(*index)
+            .and_then(|bytes| yu_font::families_from_bytes(bytes).into_iter().next()),
+    }
+}
+
+fn same_font_family(a: &str, b: &str) -> bool {
+    yu_font::source::normalize_name(a) == yu_font::source::normalize_name(b)
+}
+
+/// 已注入的字体字节里是否已经有该 family。
+fn font_bytes_has_family(opts: &EngineOptions, family: &str) -> bool {
+    opts.font_bytes.iter().any(|bytes| {
+        yu_font::families_from_bytes(bytes)
+            .iter()
+            .any(|candidate| same_font_family(candidate, family))
+    })
+}
+
 /// boot 产物:`Vm` + 共享 `GfxState` + 声音/存档域宿主 + 视口 + 纹理探测顺序。
 /// boot 的完整产物(VM/GFX/声音/存档 + 宿主需要的显示配置)。
 struct BootBundle {
@@ -2957,6 +3079,8 @@ struct BootBundle {
     identity: crate::identity::Identity,
     /// 显示层 codec 配置(隧道表在渲染器初始化前注入)。
     display: yu_format::text::DisplayConfig,
+    /// 补丁自带的重映射字体(FONTCHANGER 同型;渲染器初始化前强制注入)。
+    patch_font: Option<crate::patch::PatchFont>,
 }
 
 /// `CGINFO[ONMOUSE*]` 的像素采样面。
@@ -3030,6 +3154,9 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         patch_profile.evidence
     );
     let display = patch_profile.display();
+    // 补丁字体与编码路线正交(FONTCHANGER 同型):由宿主在渲染器初始化前
+    // 强制注入;profile 只带路径与证据,不在这里读 9MiB 字体。
+    let patch_font = patch_profile.font.clone();
     let boot = BootConfig {
         entry_label: opts.entry.clone(),
         fps: opts.fps,
@@ -3217,6 +3344,7 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         capture_bridge,
         identity,
         display,
+        patch_font,
     })
 }
 
@@ -3593,5 +3721,62 @@ mod realtime_clock_tests {
         }
         assert_eq!(clock.last_ms, 1000, "60×16.667ms 应取整到 1000ms");
         assert_eq!(sum, 1000, "逐帧增量之和必须等于总推进,不能丢毫秒");
+    }
+}
+
+#[cfg(test)]
+mod patch_font_engine_tests {
+    use super::*;
+
+    /// 真实字体补丁样本(环境变量指向补丁根:含 `hook.ini` + ttf)。
+    /// 缺样本时显式跳过(与官方 SDK 样本测试同口径,禁止空跑冒充通过)。
+    #[test]
+    fn real_patch_font_is_detected_and_forced() {
+        let Some(root) = std::env::var_os("YURIS_SAMPLE_FONT_PATCH") else {
+            eprintln!("skip: YURIS_SAMPLE_FONT_PATCH 未设置(无字体补丁样本,显式跳过)");
+            return;
+        };
+        let font = crate::patch::detect_patch_font_in(std::path::Path::new(&root))
+            .unwrap()
+            .expect("应检测到补丁字体");
+        let actual = yu_font::families_from_bytes(&font.load().unwrap())
+            .into_iter()
+            .next()
+            .expect("字体应有 family");
+
+        // 默认(宿主未选字体):注入 + 强制全部 FONT 请求。
+        let mut opts = EngineOptions::default();
+        apply_patch_font(&mut opts, &font).unwrap();
+        assert!(opts.font_lock, "补丁字体必须强制,否则脚本点名的文本错形");
+        assert_eq!(opts.font_bytes.len(), 1);
+        assert!(matches!(opts.font, FontChoice::HostFont(0)));
+
+        // 宿主按名字选了同一 family:提升为强制,并保证字体字节可用。
+        let mut opts = EngineOptions {
+            font: FontChoice::Family(actual.clone()),
+            ..EngineOptions::default()
+        };
+        apply_patch_font(&mut opts, &font).unwrap();
+        assert!(opts.font_lock, "同 family 的宿主选择也要提升为强制");
+        assert_eq!(opts.font_bytes.len(), 1, "只有名字没有字节时必须补注入");
+
+        // 宿主选了别的 family 但没有锁:补丁字体接管(载体字只有它能解码)。
+        let mut opts = EngineOptions {
+            font: FontChoice::Family("MS Gothic".to_string()),
+            ..EngineOptions::default()
+        };
+        apply_patch_font(&mut opts, &font).unwrap();
+        assert!(opts.font_lock, "未锁的宿主字体不足以解码载体字");
+        assert_eq!(opts.font_bytes.len(), 1);
+
+        // 宿主显式 `--font-lock` 指定别的字体:尊重宿主。
+        let mut opts = EngineOptions {
+            font: FontChoice::Family("MS Gothic".to_string()),
+            font_lock: true,
+            ..EngineOptions::default()
+        };
+        apply_patch_font(&mut opts, &font).unwrap();
+        assert!(opts.font_lock);
+        assert!(opts.font_bytes.is_empty(), "显式锁定的宿主字体优先");
     }
 }
