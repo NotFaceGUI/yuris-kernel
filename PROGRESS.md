@@ -16381,3 +16381,81 @@ Tyranor-Next 模块管理:
 - `YURIS_SAMPLE_*` 全设:`cargo test -p yu-rt -p yu-save -p yu-gfx
   --no-fail-fast` → 全部 `ok`(yu-rt 131、yu-save 30、yu-gfx 各套件)。
 - 待主人实机:0.47x 内核 qsave → 官方 QLOAD;官方 0.47x 存档 → 内核 LOAD。
+
+## 成果 STRUCT-REFACTOR-V555 (2026-11-20) · 为 v555 差异改造做结构化拆分（行为保持）
+
+**目标**:按 `docs/architecture/optimization-2026-11-20.md` 的 O1/O2/O3 先做结构
+拆分,不引入 v555 语义、不改现有可观测行为;同时把存档写/读的容器路径抽成
+文件与**内存槽**共用,给 v555 `LOAD/SAVE[MEM]` 留出直接落点。
+
+**基线（拆分前实测）**:
+- `cargo test -p yu-rt -p yu-save --no-default-features`：
+  `yu-rt` lib **119**、consistency **4**、corpus **11**、corpus_golden **4**、
+  corpus_v2 **3**、fixture **131**、golden **3**；`yu-save` **30**。
+- 样本环境变量按 `AGENTS.md` §2 设置(`YURIS_SAMPLE_ERIS_YSBIN`/
+  `YURIS_SAMPLE_ERIS_ROOT`/`YURIS_SAMPLE_SDK0479`/`YURIS_SAMPLE_SDK0495`)。
+
+**改动**:
+1. **O1 `SemanticProfile`（新 `crates/yu-rt/src/semantics.rs`）**
+   - `SemanticProfile { ysc_version, varinfo_sjis }` + `SjisCodeMode`
+     (`Inert` / `FirstChar`);由 `TableSet::load_from` 后的 `Vm::boot_inner`
+     派生一次,存 `Vm` 新字段,提供只读 `Vm::semantics()`。
+   - 证据锚点写进模块文档:0.495 处理体 `0x456050..0x456ae4` 不读
+     `SJISCODE`;v555 `0x455200/0x4554a9` 才计算首字符码。
+   - `_SYSTEM_VERSION` 走的 `Vm::engine_version()` 也改为读本快照;
+     `tables_mut()` 文档明确只能预装载脚本/诊断,不得替换 `boot.yscm`
+     (否则门控快照与表事实脱节)。
+   - **本批不改 handler 行为**:`VARINFO` 仍按 0.495 惰性参数处理;
+     v555 批次再把门控切到 `semantics().varinfo_sjis`。
+2. **O2 handlers 拆分（纯搬运）**
+   - `src/vm/handlers.rs`（7,228 行）→ `handlers/mod.rs`（718 行,分派/表/
+     dispatch）+ `control` / `variables` / `file_io` / `media_info` / `text` /
+     `system` / `helpers` 七个子模块。
+   - 103 个 `impl Vm` 方法逐一机械比对:**函数体逐字一致**,只加
+     `pub(super)` 与模块头;`build_varact_plan` 保留 `handlers::` 再导出。
+3. **O3 fixture 拆分（纯搬运）**
+   - `tests/fixture.rs`（7,306 行）根文件缩到 17 行;子模块在
+     `tests/fixture/`: `common` / `control` / `variables` / `text` /
+     `file_save` / `media` / `system`。
+   - 用内联 `mod fixture { mod ...; }` 让标准模块解析指向 `tests/fixture/`,
+     不用 `#[path]`;`support` 仍为 `tests/support/mod.rs`,common 以
+     `crate::support::...` 再导出。
+   - 132 个测试逐块比对:除两处 `use support::Init;` →
+     `use crate::support::Init;`（模块路径变化）外,函数体逐字一致。
+4. **yu-save 容器路径抽取（行为保持）**
+   - `SaveState::flush` 抽出 `build_container(target_version, source, diags)`:
+     版本选择、版本档案(布局/var_id)、预约块序列化集中一处;诊断仍在
+     落盘成功后按旧顺序挂号。
+   - `load_block` / `load_image` 抽出 `read_save_file` + `decode_block` /
+     `decode_image`;错误文案保持逐字一致（`source` 为不含末尾 `]` 的命令
+     前缀,以兼容旧括号位置）。
+   - `profile.rs` 补记:**v555 存档容器实测仍为 `0x1E0`**,容器/块布局不变;
+     v555 差异在命令面（`LOAD/SAVE[MEM]` 内存槽、MEM 的 DNO 0 基）,下一批
+     只需在 `SaveState` 加内存槽表并复用上述容器路径。
+
+**验证（拆分后实测）**:
+```bash
+export TEMP="<side-repo>/workbench/tmp"; export TMP="$TEMP"
+export YURIS_SAMPLE_ERIS_YSBIN="<project-eris>/data/ysbin"
+export YURIS_SAMPLE_ERIS_ROOT="<project-eris>"
+export YURIS_SAMPLE_SDK0479="<sdk0479>/システム"
+export YURIS_SAMPLE_SDK0495="<sdk0495>/システム"
+cargo test -p yu-rt -p yu-save --no-default-features
+# → yu-rt lib 120、consistency 4、corpus 11、corpus_golden 4、corpus_v2 3、
+#   fixture 132、golden 3；yu-save 30；全部 ok
+cargo check --workspace --all-targets --no-default-features
+# → Finished(默认特性档受本机 mimalloc cl D8050 影响,按 AGENTS.md 既有办法)
+cargo fmt --all -- --check | grep <改动文件>
+# → 改动文件无格式差异(仓库其它文件有既有差异,未顺手格式化)
+```
+- `yu-rt` lib/fixture 各 +1:都是本次新增的
+  `boot_derives_semantic_profile_from_project_tables`;不是行为变化。
+- 机械校验脚本(一次性,产物在 `<side-repo>/workbench/tmp`):
+  handlers `orig methods: 103 new methods: 103`,missing/extra/mismatch 全空;
+  fixture `orig items: 153 new items: 153`,仅上述两处 import 路径差异。
+
+**未做(明确留给后续批次)**:
+- 未实现 `LOAD/SAVE[MEM]`、`VARINFO[SJISCODE]` 的 v555 首字符分支、
+  `PRODUCT`、v555 词法器/多语言;本批严格行为保持。
+- 未执行任何 git 写操作;`yu-emote` 子模块指针变化是进入本轮前的既有状态,
+  未触碰。
