@@ -29,6 +29,15 @@ pub const KERNEL_NAME: &str = "yuris-kernel";
 /// 内核版本(工作区包版本)。
 pub const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// 官方 BETA 4 主线可用版本带(0.450–0.495)。
+///
+/// 见 README「支持范围」:BETA 2/3 适配中,官方商业 5xx(如 v555)适配中。
+/// 宿主只拿这个判据着色,不自己比较版本号。
+#[must_use]
+pub fn supported_engine_version(version: u32) -> bool {
+    (450..=495).contains(&version)
+}
+
 /// 已解码的窗口图标(RGBA8,逐行从上到下)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IconImage {
@@ -102,6 +111,16 @@ impl Identity {
             self.engine_version / 1000,
             self.engine_version % 1000
         )
+    }
+
+    /// 引擎版本是否在「可用」范围内(宿主角标着色用)。
+    ///
+    /// 与 README「支持范围」同一口径:官方 BETA 4 主线 0.450–0.495 可用;
+    /// BETA 2/3 仍在适配,官方商业 5xx 分支适配中(v555 已推进到标题选择循环),
+    /// 均不算支持。规则只此一处,壳不自行判断版本号。
+    #[must_use]
+    pub fn engine_supported(&self) -> bool {
+        supported_engine_version(self.engine_version)
     }
 
     /// 窗口标题:游戏真名 · YU-RIS 版本 · 内核版本。
@@ -565,4 +584,20 @@ fn read_u32(data: &[u8], at: usize) -> Option<u32> {
 
 fn read_i32(data: &[u8], at: usize) -> Option<i32> {
     Some(i32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 支持范围与 README「支持范围」一致:BETA 4 主线绿,其余(含 555)红。
+    #[test]
+    fn supported_range_matches_readme() {
+        for version in [450, 466, 481, 486, 495] {
+            assert!(supported_engine_version(version), "{version} 应在支持带内");
+        }
+        for version in [255, 276, 292, 500, 555] {
+            assert!(!supported_engine_version(version), "{version} 不在支持带内");
+        }
+    }
 }

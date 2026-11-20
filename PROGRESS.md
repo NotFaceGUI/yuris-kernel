@@ -16211,3 +16211,29 @@ Tyranor-Next 模块管理:
   `config.sd` 语言号，CP932/GBK/Big5；当前 `--patch gbk` 收口见优化计划 O5。
 - 勘误：`README-BETA-SERIES`(2026-11-17) 的「第三方」表述作废。
 - 本轮只改文档；源码/探针改动不随此提交。
+
+## 成果 VER-BADGE (2026-11-20) · 安卓左下角版本名角标(支持绿/不支持红)
+
+**需求**:高级设置新增默认开启的「版本名角标」,在游戏画面**左下角**
+显示 `YU-RIS <版本名>`(右下角已有虚拟鼠标模式按钮);内核支持=绿,
+不支持=红(如 v555)。
+
+**改动**:
+- `crates/yu-engine/src/identity.rs`:新增
+  `supported_engine_version()` / `Identity::engine_supported()`,
+  支持带 = 官方 BETA 4 主线 `0.450–0.495`(README「支持范围」同一口径);
+  BETA 2/3 适配中、第三方 5xx(含 v555)判为不支持。规则只在核内一处。
+- `crates/yu-platform/host-android/src/lib.rs`:启动摘要追加
+  `yuris=<版本名> yuris_supported=<0|1>`(壳不自行比较版本号)。
+- `MainActivity.java`:左下角 TextView,初始化成功后按摘要着色显示;
+  开关关闭时不显示。`SetupActivity.java`:高级设置新增
+  `版本名角标:开/关`,默认开,持久化 `version_badge` 并随 Intent 下发。
+- `android/README.md`:壳侧开关表补一行。
+
+**验证**:
+- `cargo test -p yu-engine --lib supported_range` → `1 passed; 0 failed`。
+- `YURIS_SO_ONLY=1 BUILD_TYPE=release tools/android/build.sh arm64-v8a x86_64`
+  → 两个 ABI 的 so 均编译通过。
+- `BUILD_TYPE=release tools/android/build.sh arm64-v8a` → `BUILD SUCCESSFUL`,
+  产物 `android/app/build/outputs/apk/release/app-release.apk`。
+- 本机无 adb 设备,角标在实机上的位置/颜色待主人验收。

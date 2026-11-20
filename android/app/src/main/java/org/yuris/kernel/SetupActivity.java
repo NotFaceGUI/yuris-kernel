@@ -124,6 +124,8 @@ public final class SetupActivity extends AppCompatActivity {
     private boolean debugLog;
     /** 状态浮层(HUD)。发布默认关:浮层每秒还要拼状态串。 */
     private boolean showHud;
+    /** 左下角版本角标(默认开):显示引擎版本名,支持绿/不支持红。 */
+    private boolean versionBadge = true;
     /** 资产异步预取(默认关;等价桌面 --prefetch)。 */
     private boolean prefetch;
     /** COPY2 快照延迟物化(默认关;等价 --snapshot-defer)。 */
@@ -177,6 +179,7 @@ public final class SetupActivity extends AppCompatActivity {
         }
         debugLog = prefs.getBoolean("debug_log", false);
         showHud = prefs.getBoolean("show_hud", false);
+        versionBadge = prefs.getBoolean("version_badge", true);
         prefetch = prefs.getBoolean("prefetch", false);
         snapshotDefer = prefs.getBoolean("snapshot_defer", false);
         bilinearScale = prefs.getBoolean("bilinear_scale", true);
@@ -385,6 +388,8 @@ public final class SetupActivity extends AppCompatActivity {
 
         advancedBody.addView(toggleButton(
                 "状态浮层:开(帧率/计数)", "状态浮层:关", showHud, v -> showHud = v), buttonParams());
+        advancedBody.addView(toggleButton(
+                "版本名角标:开", "版本名角标:关", versionBadge, v -> versionBadge = v), buttonParams());
         advancedBody.addView(toggleButton(
                 "调试日志:开(写游戏目录)", "调试日志:关", debugLog, v -> debugLog = v), buttonParams());
         advancedBody.addView(toggleButton(
@@ -1414,6 +1419,7 @@ public final class SetupActivity extends AppCompatActivity {
                 .putInt("fps", fps)
                 .putBoolean("debug_log", debugLog)
                 .putBoolean("show_hud", showHud)
+                .putBoolean("version_badge", versionBadge)
                 .putBoolean("prefetch", prefetch)
                 .putBoolean("snapshot_defer", snapshotDefer)
                 .putBoolean("bilinear_scale", bilinearScale)
@@ -1435,6 +1441,7 @@ public final class SetupActivity extends AppCompatActivity {
         intent.putExtra(MainActivity.EXTRA_FPS, fps);
         intent.putExtra(MainActivity.EXTRA_DEBUG_LOG, debugLog);
         intent.putExtra(MainActivity.EXTRA_SHOW_HUD, showHud);
+        intent.putExtra(MainActivity.EXTRA_VERSION_BADGE, versionBadge);
         intent.putExtra(MainActivity.EXTRA_PREFETCH, prefetch);
         intent.putExtra(MainActivity.EXTRA_SNAPSHOT_DEFER, snapshotDefer);
         intent.putExtra(MainActivity.EXTRA_BILINEAR_SCALE, bilinearScale);

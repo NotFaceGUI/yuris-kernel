@@ -1263,13 +1263,17 @@ pub fn start_engine(
         engine.warm_text();
     }
     let viewport = engine.viewport();
+    // 版本角标:引擎版本名 + 内核支持判据(壳只显示,不自行比较版本号)。
+    let identity = engine.identity();
     let summary = format!(
-        "OK backend={} entry={} viewport={}x{} fps={} boot_ms={:.1} os_sound={}          save_codec={} data={} save={}{}{} font_bytes={} host_fonts={}{}",
+        "OK backend={} entry={} viewport={}x{} fps={} yuris={} yuris_supported={} boot_ms={:.1} os_sound={}          save_codec={} data={} save={}{}{} font_bytes={} host_fonts={}{}",
         engine.backend(),
         engine.entry(),
         viewport.width,
         viewport.height,
         fps,
+        identity.engine_version_text(),
+        u8::from(identity.engine_supported()),
         engine.boot_ms(),
         os_sound,
         save_codec.map_or("auto", BlockCodec::as_str),

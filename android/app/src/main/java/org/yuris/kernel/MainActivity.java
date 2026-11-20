@@ -69,6 +69,8 @@ public final class MainActivity extends Activity
     static final String EXTRA_DEBUG_LOG = "debug_log";
     /** 状态浮层开关(发布默认关)。 */
     static final String EXTRA_SHOW_HUD = "show_hud";
+    /** 左下角版本角标(默认开;壳只看内核给出的版本与支持判据)。 */
+    static final String EXTRA_VERSION_BADGE = "version_badge";
     /** 启动失败原因回传给配置界面。 */
     static final String EXTRA_START_ERROR = "start_error";
     /** 新增参数:文本编码路线(auto/original/gbk/big5/tunnel)。 */
@@ -116,6 +118,10 @@ public final class MainActivity extends Activity
 
     private android.view.TextureView textureView;
     private TextView hudView;
+    /** 左下角版本角标(初始化拿到引擎版本后才显示)。 */
+    private TextView versionBadgeView;
+    /** 版本角标开关(配置界面「高级设置」,默认开)。 */
+    private boolean showVersionBadge = true;
     private volatile boolean running;
     private Thread renderThread;
     /** 本次会话是否以"游戏正常结束"收尾(决定是否 finish 回配置界面)。 */
@@ -422,6 +428,19 @@ public final class MainActivity extends Activity
                 dp(28), dp(28), Gravity.BOTTOM | Gravity.END);
         modeParams.setMargins(0, 0, dp(6), dp(8));
         container.addView(modeButton, modeParams);
+
+        // 左下角版本角标:右下角已被模式按钮占用;初始化拿到引擎版本前保持隐藏。
+        showVersionBadge = getIntent().getBooleanExtra(EXTRA_VERSION_BADGE, true);
+        versionBadgeView = new TextView(this);
+        versionBadgeView.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f);
+        versionBadgeView.setShadowLayer(3f, 1f, 1f, Color.BLACK);
+        versionBadgeView.setVisibility(View.GONE);
+        FrameLayout.LayoutParams badgeParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM | Gravity.START);
+        badgeParams.setMargins(dp(12), 0, 0, dp(8));
+        container.addView(versionBadgeView, badgeParams);
 
         setContentView(container);
         // 沉浸式要在 setContentView 之后:onCreate 早期 decorView 还没挂上,
@@ -781,6 +800,9 @@ public final class MainActivity extends Activity
             return;
         }
         sessionReady = true;
+        // 版本角标:内核摘要带 yuris=<版本名> yuris_supported=<0|1>,
+        // 支持绿/不支持红;开关关掉时不显示。
+        updateVersionBadge(init);
         } // if (!sessionReady) —— 一次性初始化结束
 
         int[] pixels = new int[0];
@@ -1232,6 +1254,44 @@ public final class MainActivity extends Activity
         }
         hudView.setText(builder);
         hudView.setVisibility(View.VISIBLE);
+    }
+
+    /**
+     * 左下角版本角标:显示内核给出的 YU-RIS 版本名。
+     *
+     * <p>支持判据来自内核(启动摘要 {@code yuris_supported=0|1}),壳只负责
+     * 着色:支持绿、不支持红。旧 so 没有该字段时保持隐藏。
+     */
+    private void updateVersionBadge(String init) {
+        if (!showVersionBadge || versionBadgeView == null) {
+            return;
+        }
+        String version = summaryField(init, "yuris");
+        if (version == null || version.isEmpty()) {
+            return;
+        }
+        int color = "1".equals(summaryField(init, "yuris_supported"))
+                ? Color.parseColor("#5ee08a")
+                : Color.parseColor("#ff4d4f");
+        runOnUiThread(() -> {
+            versionBadgeView.setText("YU-RIS " + version);
+            versionBadgeView.setTextColor(color);
+            versionBadgeView.setVisibility(showVersionBadge ? View.VISIBLE : View.GONE);
+        });
+    }
+
+    /** 从内核 `key=value` 摘要串里取一个字段(空白分隔)。 */
+    private static String summaryField(String line, String key) {
+        if (line == null) {
+            return null;
+        }
+        String prefix = key + "=";
+        for (String token : line.trim().split("[ \t]+")) {
+            if (token.startsWith(prefix)) {
+                return token.substring(prefix.length());
+            }
+        }
+        return null;
     }
 
     /** 浮层一项:`k=v`。 */
