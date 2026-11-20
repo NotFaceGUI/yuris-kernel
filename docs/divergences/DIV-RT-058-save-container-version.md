@@ -25,7 +25,7 @@
 | 0.481 商业包(随包 `YSSnp.dll`) | `0x1E1` | `natsunokusari.exe` `0x462fb`/`0x465dd`/`0x4d54d` 三处;实机存档头 `0x1E1` |
 | 0.479 SDK | `0x138` | `0x3fac4`/`0x454e1` |
 | 0.466 SDK | `0x0C0` | `0x38271`/`0x3dee4` |
-| 2012 旧运行时(アオリオ) | `0x138` | `aorio.exe` `0x3bdf8`/`0x4188c` 两处 |
+| 2012 旧运行时(<0.474 旧运行时样本>) | `0x138` | `<0.474 exe>` `0x3bdf8`/`0x4188c` 两处 |
 
 **关键事实:容器版本是写盘器常量,不是 yscfg/引擎版本。** 旧运行时数据由
 0.474 编译器产出(`ysc/yscfg/yse` 头 = `0x1DA`),但运行时 LOAD 只认 `0x138`;
@@ -85,7 +85,7 @@ cargo test -p yu-save (带语料环境变量)      → 22 passed; 0 failed
 cargo test -p yu-engine --lib              → 39 passed; 0 failed
 cargo test -p yu-format --test yssd_roundtrip → 2 passed; 0 failed
 内核 headless 启动 v474 旧运行时, --log-level debug
-  → save container version 0x138 … from aorio.exe
+  → save container version 0x138 … from <0.474 exe>
 内核 headless 启动 0.495 工程, --log-level debug
   → save container version 0x1e0 … from yu-ris.exe
 ```

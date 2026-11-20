@@ -48,7 +48,10 @@ DNO3 块解压后 B 段(30000B = 100×75×4)的像素序是 **BGRA8**:
 
 - 新增单测 `image_block::tests::disk_pixel_order_is_official_bgra`
   (钉磁盘字节序,黑样本钉不住的东西这次钉死);
-- `decode_accepts_0479_descriptor_layout` 的手工 B 段改为按官方序构造;
+- 原 `decode_accepts_0479_descriptor_layout` 已由
+  `roundtrip_0479_uses_official_descriptor` 取代:0.479 的 w/h 实际在
+  **+0x70**(旧注释 +0x68 是误读,官方 0.479 LOAD 机器码见
+  `DIV-RT-062`);
 - 端到端(生产路径 `SaveState::load_image` + PNG 落图目检,探针用后即删):
   `<game-b>` save00002/00004/00005 均恢复自然色,選択肢框回到本作蓝色系。
 

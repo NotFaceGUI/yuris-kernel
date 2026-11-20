@@ -169,7 +169,7 @@ movie-clean bench --frames 12
   baseline: steady avg 23.19 ms, slowest frame 6 = 108.2 ms
   ⇒ 1.3M 命令突发帧 ~86 ns/命令(基线 ~83–84 ns),差异在噪声内
 
-kotoneiro bench --frames 2100
+<game-b> bench --frames 2100
   ours:     avg 34.93 ms(28.6 fps),p95 56.97 ms,slowest 249 = 226.0 ms
   baseline: avg 37.31 ms(26.8 fps),p95 60.00 ms,slowest 249 = 249.1 ms
   ⇒ 未劣化(本次改动不在逐命令/逐帧热路径)

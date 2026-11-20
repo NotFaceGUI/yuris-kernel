@@ -86,8 +86,8 @@ SET >= 255 → 原样拷贝源 B
 
 ## 3. 语料用量
 
-- `TRANSITION`:官方 ERIS 1 次、aorio 1 次,**均不带 X/Y** → 旧路径不变;
-- `TRANSITION2`:aorio `es_sprite.yst` pc6111 1 次(SET/SET2 + 4 ID),
+- `TRANSITION`:官方 ERIS 1 次、<0.474 样本> 1 次,**均不带 X/Y** → 旧路径不变;
+- `TRANSITION2`:<0.474 样本> `es_sprite.yst` pc6111 1 次(SET/SET2 + 4 ID),
   官方 ERIS 0 次;此前被 `gfx.imageop.unsupported` 跳过,现在执行。
 
 ## 4. 回归

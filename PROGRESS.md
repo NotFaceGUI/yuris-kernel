@@ -13825,7 +13825,7 @@ APK 内 lib/arm64-v8a/libyu_host_android.so = jniLibs 当前产物
 SetupActivity 截图确认「资产预取:关」「快照延迟:关」两个开关在位
 ```
 - 设备 `c1d09694`(24117RK2CC),数据目录按壳内持久化配置
-  `/storage/emulated/0/krkr/コトネイロver1.02/コトネイロ`。
+  `/storage/emulated/0/krkr/<game-b>ver1.02/<game-b>`。
 - 未提交、未推送。
 
 ## 成果 GFX-BANDWIDTH (2026-11-09) · 立绘链死写消除/过渡端点别名 + 手机 SIZE 双线性开关 + 上屏尺寸自愈
@@ -14145,7 +14145,7 @@ movie-clean(desktop wgpu,debug 模式,进主菜单):
 性能(对照 = git archive HEAD 未改动基线):
   movie-clean bench 12 帧:ours avg 24.04ms / slowest 112.3ms;
     baseline avg 23.19ms / slowest 108.2ms(1.3M 突发帧 ≈86ns/命令,噪声内)
-  kotoneiro bench 2100 帧:ours avg 34.93ms / p95 56.97ms;
+  <game-b> bench 2100 帧:ours avg 34.93ms / p95 56.97ms;
     baseline avg 37.31ms / p95 60.00ms(未劣化)
 ```
 
@@ -14156,7 +14156,7 @@ movie-clean(desktop wgpu,debug 模式,进主菜单):
 
 ## 成果 BT-HOVER (2026-11-11) · 置灰按钮不再高亮相邻按钮:`CGINFO[SX/SY]` 改读 `COPY/COPY2` 切片矩形
 
-**问题**:kotoneiro(v494 商业包)正文底栏的 VOICE 在无声行置灰
+**问题**:<game-b>(v494 商业包)正文底栏的 VOICE 在无声行置灰
 (`@BT.N=1`);鼠标移入置灰按钮时旁边的按钮出现 OVER 高亮,像还能点。
 官方同一位置不高亮。
 
@@ -14170,7 +14170,7 @@ movie-clean(desktop wgpu,debug 模式,进主菜单):
 - 官方 `COPY2` 只复制图像,但目标**显示矩形** = 复制块尺寸(官方
   `+0x78/+0x7c`,见下条 REA);本内核快照表面按 DIV-GFX-077 保持源
   表面尺寸(`SIZE` 语义)。旧实现把源表面尺寸当成显示矩形:
-  kotoneiro 的 `btn_voice_bt4` 合图 264 宽(4×66),`CGINFO[SX]` 返回
+  <game-b> 的 `btn_voice_bt4` 合图 264 宽(4×66),`CGINFO[SX]` 返回
   264,每个按钮命中矩形覆盖四个按钮。置灰按钮被 `@BT.N` 门控跳过,
   相邻按钮的超大矩形接住 hover ⇒ 高亮。
 - 官方证据(REA 0.495 `FUN_0042f809`,sha256 `4f5eefa3…138f`):`ID2`
@@ -14208,7 +14208,7 @@ cargo build --workspace --all-targets        → 0 error / 0 warning
 cargo test -p yu-gfx --test info_query        → 16 passed(含新增 3 条)
 cargo test -p yu-gfx                          → 全部 test result: ok
 
-hover 探针(kotoneiro,约 1500 帧进正文、置灰 VOICE 行):
+hover 探针(<game-b>,约 1500 帧进正文、置灰 VOICE 行):
   置灰 VOICE (655,812) → visible=[]            ← 修复前 = BT.OVER...QLOAD
   QLOAD     (587,812) → visible=[BT.OVER...QLOAD]
   AUTO      (722,812) → visible=[BT.OVER...AUTO]
@@ -14652,7 +14652,7 @@ cargo test -p yu-engine --lib                            → 39 passed; 0 failed
 cargo test -p yu-engine --lib(无 SDK 环境,CI 口径)      → 39 passed; 探测用例显式跳过
 cargo test -p yu-format --test yssd_roundtrip            → 2 passed; 0 failed
 v474 旧运行时 headless 1 帧 --log-level debug
-  → save container version 0x138 from aorio.exe
+  → save container version 0x138 from <0.474 exe>
 0.495 工程 headless 1 帧 --log-level debug
   → save container version 0x1e0 from yu-ris.exe
 ```
@@ -14946,7 +14946,7 @@ cargo build --workspace --all-targets → Finished
   修复 soft 丢失同帧 `RECTPAINT3/SIZE` 结果、与 wgpu 分歧的问题。
 - **整面覆盖折叠**:新增 `transition_covers_target`:写矩形覆盖目标整面、
   目标不在 `source/source2/source3` 中、且源/目标没有历史 `SIZE` 时,按纯写
-  折叠旧 T2/锚定 T1;部分落点仍保留历史。逐帧 aorio T2 不再线性增长。
+  折叠旧 T2/锚定 T1;部分落点仍保留历史。逐帧 <0.474 样本> T2 不再线性增长。
 - **T2 缺遮罩**:`cgact_transition` 显式接收 `is_t2`,缺 `ID3` 报
   `ARG_MISSING`,不再静默降级成 T1。
 - **soft T2 越界**:源 B/遮罩按源坐标裁行;`ux0` 越界取零,不再读到下一行。
@@ -15407,7 +15407,7 @@ load_system_fonts: 163.4ms faces=248 catalog=127
   - `pure_attribute_cg_after_copy_keeps_draw_size_untouched`
     (COPY2 后 `CG[E/X/Y/MODE]` 无 SX/SY,`Image.size` 必须保持
     `None`,不能被区域矩形污染)。
-- 回归修复(同日,桌面实机 kotoneiro):纯属性 `CG`(无 `SX/SY`)曾被
+- 回归修复(同日,桌面实机 <game-b>):纯属性 `CG`(无 `SX/SY`)曾被
   `apply_layer_params` 用 COPY 矩形作为缺省轴写进 `LayerKind::Image.size`,
   把源尺寸按钮状态快照压扁(底部按钮行 AUTO 处错位)。现仅当至少一个
   `SX/SY` 出现时才解析缺省轴;纯属性更新不再触碰绘制尺寸。
@@ -15427,7 +15427,7 @@ load_system_fonts: 163.4ms faces=248 catalog=127
     该差异与影片后端相关文件同属并行工作线,不随本成果提交。
 - 台账:`DIV-GFX-077` 增 §2.4(最终口径与嵌套 COPY 残余)、
   `DIV-GFX-089` 增 §7(COPY 矩形成为 RESIZE 基数)。
-- 实机(0.486 样本 `光翼戦姫エクスティアコンチェルト4`):
+- 实机(0.486 样本 `<game-d>`):
   - headless 600 帧:标题屏渲染正常;`gfx.info.unsupported` 0 次,
     仅 1 个既有 `asset.missing`(前端按钮缺图,与本修复无关);
   - desktop 标题屏:鼠标移到 CONFIG(约 278,415)后该行出现
@@ -15584,7 +15584,7 @@ load_system_fonts: 163.4ms faces=248 catalog=127
 - **参数缺失取证**:`SET` 缺失时值槽初始化为 0(0x42c998..0x42c9b6)
   ⇒ 掩码 0 = 四边都不裁 = 原地 no-op,不是 `gfx.imageop.set.missing`。
 - 语料普查(`census_params CGACT:TRIM`):project-eris 0/141、
-  0.486 ExSTIA_C4 0/260、kotoneiro 1/160(s27 macro.yst pc5803
+  0.486 <game-d>_C4 0/260、<game-b> 1/160(s27 macro.yst pc5803
   line 8268,仅 `ID+TRIM`,无 SET)。唯一实调用就是无 SET。
 - 修复:
   - gfx 移除 `trim && set.is_none()` 的 Unimplemented;缺省 SET 允许
@@ -15598,7 +15598,7 @@ load_system_fonts: 163.4ms faces=248 catalog=127
   `cargo test -p yu-backend-soft` 69 passed;
   `cargo test -p yu-backend-wgpu` 全绿(surfaces 32、39 主 suite)。
 - **仍 open(需设计确认)**:非零 `SET` 的裁后矩形回写。gfx 命令时刻
-  没有像素,且 TRIM 可能跟在 BLUR/COPY 之后(kotoneiro 宏为
+  没有像素,且 TRIM 可能跟在 BLUR/COPY 之后(<game-b> 宏为
   BLUR→TRIM→BLUR5),资产级 alpha bbox 会取到加工前边界;需同步
   CPU 表面回放或后端回报 + 同 tick 时序取舍。未凭猜测实现。
 - 本轮未执行任何 git 写操作,等待主人审阅。
@@ -16196,7 +16196,7 @@ Tyranor-Next 模块管理:
   的绘制尺寸断言更新为 `None`(官方 COPY 覆盖矩形)。
 - `cargo test -p yu-backend-soft` → 全绿。
 - `cargo test -p yu-backend-wgpu` → 39 + 1 + 1 全绿。
-- 桌面实测(0.4.1+kotoneiro 读档淡出)待主人验收。
+- 桌面实测(0.4.1+<game-b> 读档淡出)待主人验收。
 
 ## 成果 README-V555-OFFICIAL (2026-11-20) · README 默认中文,校正 5xx 为官方商业分支
 
@@ -16290,3 +16290,94 @@ Tyranor-Next 模块管理:
 - `BUILD_TYPE=release tools/android/build.sh arm64-v8a` → `BUILD SUCCESSFUL`,
   产物 `android/app/build/outputs/apk/release/app-release.apk`。
 - 本机无 adb 设备,角标在实机上的位置/颜色待主人验收。
+
+## 成果 SAVE-VER-LAYOUT (2026-11-20) · 存档缩略图块布局按容器版本切换 + SAVE/LOAD 带下标左值修复
+
+**需求**:两个 0.479 商业游戏(`<0.479 商业样本 A>`、`<v479-x>`)qsave 后官方 QLOAD
+读不了;存档页缩略图/hover 异常。主人指出应按目标版本动态选布局,不能写死。
+
+**定位(官方 0.479 exe `0x440490` + 真实存档逐块对照)**:
+- 0.479 图像块(DNO3/btype1)硬校验 `A==0x600`,w/h 在描述符 **+0x70**;
+  本内核旧写端固定 0.495 布局(A=1600、+0x78),官方直接拒收;
+  旧读端还试了误读的 +0x68,官方 0.479 存档缩略图也解不出。
+  版本对照(0.450–0.495 全系列 77 个官方 SDK 包逐一扫 exe):
+  0x0C0 / 0.450–0.466(21 个)= **1520/+0x68**(0.459 `FUN_004382d0` /
+  0.466 `FUN_00438b78` 硬校验 A==0x5F0);0x138 / 0.470–0.479(0.13)
+  = 1536/+0x70;0x1E0 / 0.479(0.14)–0.495 = 1600/+0x78;
+  0x1E1(0.481 商业)/0x1E6(0.49x 商业)同 0x1E0。官方只有这三套布局;
+  0x1DA/0x1EF 是旧内核把 yscfg 版本误当容器版本的历史产物。
+  旧注释把 0.450–0.466 的 +0x68 误记到 0.479,本轮按全系列机器码归位。
+- `SAVE[SET=@x[i][j]]` 旧实现忽略下标,把整组 Int[256,128] 写进 DNO2;
+  官方 `save00001.sd` DNO2 是 Int **标量 14**。官方 LOAD 严格比对
+  块 dims 与 LET 目标 → 维数不符读档失败。`LOAD[LET=@x[i][j]]`
+  的写回同样忽略下标,本内核读回也丢该块。
+
+**改动**:
+- `yu-save/src/profile.rs`(新):**版本档案表** `profile_for(version)`,
+  集中维护图像块布局与块类型 0 var_id;`image_block::layout_for_container_version`
+  只做委托(唯一来源,不再两处 match)。加新版本 = 加一行 + 一条断言。
+  已覆盖 0x0C0(0.459/0.466)=1520/+0x68、0x138=1536/+0x70、
+  0x1DA/0x1E0/0x1E1/0x1E6/0x1EF=1600/+0x78。
+- `yu-save/src/image_block.rs`:`Layout{descriptor_len,wh_offset}`;
+  `encode(image, layout)`;`decode` 以 A 段长度做版本指纹并按
+  `w*h*4==B` 自证;删除 +0x68 误读。
+- `yu-save/src/state.rs`:`flush` 按档案表选布局/var_id;
+  未知版本跳过图像块并挂号 `sv.image.layout`(变量块照常写盘);
+  新增 `error::code::IMAGE_LAYOUT`。
+- `yu-rt/src/vm/handlers.rs`:`var_snapshot_at`(完整下标→标量块、
+  无下标→整组、部分下标不猜);`restore_snapshot` 接收 LET 下标,
+  完整下标只写该元素;op_load 块类型 2 仍按 var_id 恢复整组。
+- 新增 `docs/divergences/DIV-RT-062-save-image-block-version-layout.md`、
+  `docs/divergences/DIV-RT-063-save-indexed-lvalue.md`;
+  `DIV-GFX-071` 校正 0.479 w/h 偏移说明。
+
+**验证**:
+- `YURIS_SAMPLE_SAVE0479=<<0.479 商业样本 A>/save> cargo test -p yu-save --lib`
+  → `30 passed; 0 failed`(含官方 0.479 `save00001.sd` DNO3 实际解码、
+  0.459/0.466 布局往返与档案表覆盖断言)。
+- `cargo test -p yu-rt --test fixture` → `131 passed`(新增
+  `save_set_on_array_element_reserves_scalar_snapshot`、
+  `load_into_array_element_writes_only_that_element`)。
+- `YURIS_SAMPLE_ERIS_YSBIN=<project-eris/data/ysbin> cargo test -p yu-rt
+  --test consistency` → `4 passed`。
+- `cargo test -p yu-format --lib` → `52 passed`;`cargo test -p yu-engine
+  --lib` → `63 passed`;`cargo check -p yu-save -p yu-engine` 通过。
+- 待主人实机:内核 QSAVE → 官方 QLOAD;官方存档 → 内核存档页缩略图/hover。
+
+## 成果 SAVE-SCRIPTPOS-WIRE(2026-11-20)· 存档任务块线格式按版本分代
+
+**问题**:0.47x 商业游戏里内核 qsave 后官方 QLOAD 报
+「スクリプト位置設定先のスクリプトファイル『2\script\...』が存在しません」
+(脚本名首 4 字节 `kuro` 被吃);反向官方 0.47x 存档内核读不了。
+
+**定案**(官方装载器逐指令 + 官方存档逐字节):
+`TASKINFO[SCRIPTPOS]` 串骨架跨版本一致,但 GOSUB 帧计数宽度与尾部 u8
+分代 —— 0.450–0.479(0.13)(容器 `0x0C0`/`0x138`)为 **u16 计数 +
+尾部 u8**(0.450 `0x440515`、0.466 `0x4420bd`、0.470 `0x4428e9`、
+0.474 `0x448f69`、0.479 `0x449f3d/0x449f58`、尾部 `0x44a355`);
+0.480–0.495 / v494(`0x1E0` 系)为 **u8 + 无尾部**(0.480 `0x44fa3a`
+一带、0.495 `0x4511cc`)。官方 0.479 存档两份与 0.495 存档一份均按
+对应代**精确消耗且再编码字节全等**。旧内核只实现了 0.495 代。
+
+**改动**:
+- `yu-rt/src/scriptpos.rs`:`ScriptPosWire`(gosub U8/U16 + tail 开关)、
+  `WIRE_GOSUB_U16`/`WIRE_GOSUB_U8`、`encode_with_wire`/`decode_for_wire`
+  (严格消耗校验;先当前代→另一代→旧内核布局回退)。模块文档重写为
+  已验证的两代表格。
+- `yu-rt/src/vm.rs`:新增 `scriptpos_wire` 字段与 `set/get_scriptpos_wire`。
+- `yu-rt/src/vm/handlers.rs`:`TASKINFO[SCRIPTPOS]` 编码与 LOAD 解码
+  改用注入的线格式。
+- `yu-save/src/profile.rs`:`SaveProfile` 新增 `scriptpos` 列
+  (`0x0C0`/`0x138` → U16;`0x1E0`/`0x1E1`/`0x1E6`/`0x1DA`/`0x1EF` → U8),
+  档案测试加断言。
+- `yu-engine/src/engine.rs`:开机探测到容器版本后按档案表注入 VM。
+- 移除临时探针(`YURIS_DEBUG_LAYER_SIZE`/`YURIS_DEBUG_ONMOUSE`、
+  `probe_map_a`/`probe_save_hover`、`Engine::debug_var_ints`)。
+- 新增 `docs/divergences/DIV-RT-064-save-scriptpos-wire.md`。
+
+**验证**:
+- `cargo test -p yu-rt --lib scriptpos::` → `13 passed`
+  (含官方 0.479 ×2、0.495 ×1 的**逐字节**往返与错代拒绝)。
+- `YURIS_SAMPLE_*` 全设:`cargo test -p yu-rt -p yu-save -p yu-gfx
+  --no-fail-fast` → 全部 `ok`(yu-rt 131、yu-save 30、yu-gfx 各套件)。
+- 待主人实机:0.47x 内核 qsave → 官方 QLOAD;官方 0.47x 存档 → 内核 LOAD。

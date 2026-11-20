@@ -1,7 +1,7 @@
 # DIV-GFX-086 · `CGACT[MERGE/MERGE2]` 的 `X/Y` 是落点:忽略它会把立绘差分贴到画布 `(0,0)`
 
 - 状态:**fixed(no-manual)**(2026-11-15)
-- 取证对象:v474 商业样本 `[ad：lib] アオリオ`(YU-RIS 0.474)实机逐帧捕获;
+- 取证对象:v474 商业样本 `<0.474 旧运行时样本>`(YU-RIS 0.474)实机逐帧捕获;
   SDK 0.479 `マニュアル/YU-RIS/html/cg/cgact.html`
 - 相关:DIV-GFX-063(图像加工族手工页与 alpha 口径)、
   DIV-GFX-076(`CGACT[TEXT]` 与图像加工的命令序)

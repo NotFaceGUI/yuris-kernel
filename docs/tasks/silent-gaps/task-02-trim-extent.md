@@ -72,8 +72,8 @@
 | 工程 | 脚本数 | TRIM 组 | 位置/参数 |
 |---|---:|---:|---|
 | `project-eris`（0.495 官方编译） | 141 | 0 | — |
-| kotoneiro（v494） | 160 | 1 | s27 `data/script/eris/macro.yst` pc5803 line 8268，仅 `ID + TRIM`，**无 SET** |
-| 0.486 样本 ExSTIA_C4 | 260 | 0 | — |
+| <game-b>（v494） | 160 | 1 | s27 `data/script/eris/macro.yst` pc5803 line 8268，仅 `ID + TRIM`，**无 SET** |
+| 0.486 样本 <game-d>_C4 | 260 | 0 | — |
 
 ⇒ 当前全部语料中唯一的 TRIM 就是「无 SET」；官方掩码 0 = no-op。
 本次已按证据修复该路径（gfx 不再报 `gfx.imageop.set.missing`；
@@ -82,7 +82,7 @@ soft/wgpu 缺省按 0 执行），并补了 `SET>0xF` 的拒绝回归。
 ### 仍未实现（需设计确认）
 
 非零 `SET` 的「裁后回写 `+0x78/+0x7c`」：gfx 命令时刻没有像素，且
-TRIM 可能跟在 `BLUR`/`COPY` 等后端回放项之后（kotoneiro 宏就是
+TRIM 可能跟在 `BLUR`/`COPY` 等后端回放项之后（<game-b> 宏就是
 BLUR→TRIM→BLUR5），从资产直接取 alpha 会看到**加工前**的边界，
 不能作为终态。需要同步 CPU 表面回放或后端回报 + 同 tick 时序取舍，
 见下方设计方向。
@@ -113,7 +113,7 @@ BLUR→TRIM→BLUR5），从资产直接取 alpha 会看到**加工前**的边�
 - [ ] **P1 · 全透明语义**：0.495 `SET=15` 全透明 → `newW=newH=0`、
   8 字节最小表面、矩形 0×0；当前 soft `apply_trim` 与 wgpu
   `trim_bounds` 都保持原样，与 REA 不符。需与矩形回写同批修。
-- [ ] **P1 · 链式 TRIM**：kotoneiro `macro.yst` s27 pc5803 是
+- [ ] **P1 · 链式 TRIM**：<game-b> `macro.yst` s27 pc5803 是
   `BLUR → TRIM(无 SET) → BLUR5`；非零 SET 版本必须验证 TRIM 看到的是
   **BLUR 后**的像素，不能用资产原图 bbox。
 - [ ] **P2 · partial mask + 全透明**：官方未 clamp，enabled 边的 -1

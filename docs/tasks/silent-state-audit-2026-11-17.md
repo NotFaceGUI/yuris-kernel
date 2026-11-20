@@ -42,10 +42,10 @@
   `SET>0xF` 官方 `cmp eax,0xf; ja` → 错误返回 -1。gfx 不再把缺失 SET
   判未实现，soft/wgpu 缺省按 0；回归 `trim_without_set_is_executable_with_zero_mask`、
   `trim_set_above_15_is_not_executable`、soft `trim_zero_mask_is_noop`。
-- 语料普查：project-eris 0、0.486 ExSTIA 0、kotoneiro 1 处
+- 语料普查：project-eris 0、0.486 <game-d> 0、<game-b> 1 处
   （s27 macro.yst pc5803，**无 SET**）⇒ 当前唯一实调用已被上述修复覆盖。
 - **仍 open**：非零 `SET` 的裁后矩形回写。gfx 命令时刻没有像素，且
-  TRIM 可能跟在 BLUR/COPY 之后（kotoneiro 宏即 BLUR→TRIM），资产级
+  TRIM 可能跟在 BLUR/COPY 之后（<game-b> 宏即 BLUR→TRIM），资产级
   alpha 包围盒会看到加工前边界；需同步 CPU 表面回放或后端回报 +
   同 tick 时序取舍，设计确认后再实现。`ImageAction::changes_extent()`
   仍无消费者。

@@ -2,7 +2,7 @@
 
 > 审查对象：当前工作区未提交改动（基线 `855a983`，`855a983..HEAD` 无提交）。
 > 范围：T0、T1、T2、T6、T7、T8a、T8b、T8c、T9、T10、T11（A/B/C/D 四组）。
-> 语料：本轮按主人指定用 `kotoneiro`（只读）+ `--debug-ui`；未运行 `yu-cli case`。
+> 语料：本轮按主人指定用 `<game-b>`（只读）+ `--debug-ui`；未运行 `yu-cli case`。
 > 结论先行：**C 组 fail（1 条 P0 语义破坏 + 1 条 P1 性能回退），A/B/D 组 pass-with-issues
 > （实现基本对齐，但验证产物大面积缺失，见 §5）。**
 
@@ -15,7 +15,7 @@
 | A | T0 / T1 / T2 | **pass-with-issues** | #1/#19/#83/#2/#31 均已落地；600 帧 soft 逐帧 SHA 与 T0 逐字节一致（`t0/t1/t2-sha-soft.csv` md5 全为 `39e494e4…`）；T1 的 `case` 实际哈希 9/9 与 T0 一致。缺口：T2 没有 `--frame-stats` 实测；T2 的 `case --all` 只跑了 4/9 例。 |
 | B | T6 | **pass-with-issues** | 纹理记账/LRU/失败条目/文本布局缓存均按语义等价实现；布局缓存新增单测通过。缺口：T6 无任何独立验证产物；`#37` 只部分达成；解码缓存每次查询都要分配 key。 |
 | C | T7 / T8a / T8b / T8c | **fail** | **C-01（P0）**：`TASKINFO`/`TASK` 读到的任务链投影在同一逻辑帧内“自然结束”后陈旧，返回值变化。**C-02（P1）**：`GraphicsHost::apply_domain` 默认实现深拷贝 args，生产热路径比旧实现更慢。**C-04**：record-events on/off 的“证据”四个文件全是 CLI 参数错误，护栏从未真正执行。 |
-| D | T9 / T10 / T11 | **pass-with-issues** | 静态逐项核对等价（含 256 key Murmur 对拍、CRC 表对拍、SOUNDINFO 位集单测）；kotoneiro 实测 BGM 流式 74 万帧样本、`underruns=0`。缺口：T9/T10/T11 **没有任何** 验证产物（无 CSV/日志/开包耗时）；`resolve_cache` 命中但装载失败时不再回退探测。 |
+| D | T9 / T10 / T11 | **pass-with-issues** | 静态逐项核对等价（含 256 key Murmur 对拍、CRC 表对拍、SOUNDINFO 位集单测）；<game-b> 实测 BGM 流式 74 万帧样本、`underruns=0`。缺口：T9/T10/T11 **没有任何** 验证产物（无 CSV/日志/开包耗时）；`resolve_cache` 命中但装载失败时不再回退探测。 |
 
 ---
 
@@ -257,12 +257,12 @@
 
 ---
 
-## 4. 运行验证（kotoneiro，release，wgpu）
+## 4. 运行验证（<game-b>，release，wgpu）
 
 命令：
 
 ```bash
-target/release/yu-cli.exe run "D:/Art/ai/projects/YurisDroid/workbench/games/kotoneiro" \
+target/release/yu-cli.exe run "D:/Art/ai/projects/YurisDroid/workbench/games/<game-b>" \
   --mode desktop --debug-ui --frames 900 \
   --save-root …/target/tmp/review/koto-save \
   --frame-stats …/koto-frames.csv --log-file …/koto.jsonl \
@@ -303,8 +303,8 @@ target/release/yu-cli.exe run "D:/Art/ai/projects/YurisDroid/workbench/games/kot
 ### 4.2 与 T0 基线对比
 
 **不可直接比较**：T0 基线语料是 `<project-eris>`（`data.ypf`，headless + desktop），
-本轮按要求用 `kotoneiro`；宿主/窗口尺寸/后端均不同。只能用 T0 的 ERIS CSV 复核本批
-自身前后（见 §4.3），不能拿 kotoneiro 数字对 T0 做归因。
+本轮按要求用 `<game-b>`；宿主/窗口尺寸/后端均不同。只能用 T0 的 ERIS CSV 复核本批
+自身前后（见 §4.3），不能拿 <game-b> 数字对 T0 做归因。
 
 ### 4.3 仓库内已有产物的对照（只做复核，不代替本次实测）
 
@@ -341,14 +341,14 @@ target/release/yu-cli.exe run "D:/Art/ai/projects/YurisDroid/workbench/games/kot
    `--debug-ui` 窗口内操作**，我只能观察 CSV/日志。当前证据不足以判定这些场景的
    `work/tick/render/snap`。
 2. **T2 的性能收益未实测**：无 `t2-*` frame-stats；无法确认 `Arc<Layer>` 在
-   kotoneiro 菜单（本轮未打开菜单）上的分配下降幅度。
+   <game-b> 菜单（本轮未打开菜单）上的分配下降幅度。
 3. **T6/T9/T10/T11 的验收口径未跑**：缺 `--frame-stats`、开包耗时、`sound_census`、
    `raster_bench`、`case --all`（本轮禁跑 case）等产物；只能给出静态等价结论 +
-   kotoneiro 的“无崩溃/无欠载”观察。
+   <game-b> 的“无崩溃/无欠载”观察。
 4. **T8a record-events golden 未验证**：证据文件是 CLI 用法错误（C-04）。
 5. **性能回退疑点需静默机复测**：T8a bench 最终值 35.5 fps vs T0 41.9 fps；
    本轮无法区分系统负载、C-02 与其它批次的影响。
-6. **kotoneiro 的 `preload_err=10` / `sv.command.unimplemented(FILEACT[COPY])`**：
+6. **<game-b> 的 `preload_err=10` / `sv.command.unimplemented(FILEACT[COPY])`**：
    需要与官方引擎同场景对照，才能判断是商业包缺资产/既有边界还是本批回归；
    本批 diff 不含 `yu-save`/资产预取逻辑，倾向既有，但未取证。
 7. **`frame()` 连续两次调用的自动化断言缺失**：静态判断一致，建议补一个

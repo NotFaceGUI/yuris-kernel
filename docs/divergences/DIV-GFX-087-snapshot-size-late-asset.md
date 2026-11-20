@@ -1,7 +1,7 @@
 # DIV-GFX-087 · 快照尺寸缺失:组快照按视口、资产快照按晚到资产头回填
 
 - 状态:**fixed(no-manual)**(2026-11-15)
-- 取证对象:v474 商业样本 `[ad：lib] アオリオ` 实跑 trace;soft/wgpu
+- 取证对象:v474 商业样本 `<0.474 旧运行时样本>` 实跑 trace;soft/wgpu
   `group_surface_size`;官方 0.495 行为按层矩形 `+0x78/+0x7c`
 - 相关:DIV-GFX-024(资产尺寸 provider)、DIV-GFX-061(快照/过渡)、
   DIV-GFX-086(合并落点)
@@ -73,4 +73,4 @@ cargo test -p yu-gfx
 
 - `partial_copy2_zero_source_size_keeps_zero_rect` 仍保持 0×0 矩形(官方
   矩形为 0,不是“无尺寸错误”)。
-- aorio 的 6 条运行期诊断应由本修复消除(待实机复验)。
+- <0.474 样本> 的 6 条运行期诊断应由本修复消除(待实机复验)。

@@ -1,7 +1,7 @@
 # DIV-GFX-089 · 立绘切换的目标缓冲为空,过渡输出被 1×1 占位截断
 
 - 状态:**fixed(实机待验)** — 根因 = `CGACT[RESIZE]` 未回写图层矩形
-- 目标样本:`光翼戦姫エクスティアコンチェルト4`(YU-RIS 0.486,
+- 目标样本:`<game-d>`(YU-RIS 0.486,
   `pac/data.ypf`)
 - 症状:剧情过渡后画面跳一下;角色立绘淡出直接消失。
 - 日志锚点(修复前):
@@ -170,7 +170,7 @@ wgpu 物化表面为 **5×1**,官方/soft 为 **3×1**。
 回归:`dc545ae` 给**复用**的 `CG[FILE=""]` 层回写 1×1 矩形后,读档
 `es.CGTSS` 的 CGS 幕布层(菜单打开时已创建)再次 `CG CGS<n> FILE=""`
 被重置成 1×1,`COPY2 ID=:/W0/` 的整幅冻结屏幕被缩成 1 个像素 ⇒ 读档
-淡出直接黑屏(kotoneiro 2026-11-19 实测)。
+淡出直接黑屏(<game-b> 2026-11-19 实测)。
 
 回归测试:`copy2_after_reused_fileless_layer_draws_snapshot_at_natural_size`
 (`crates/yu-gfx/tests/info_query.rs`),同时断言 `CGINFO[SX/SY]` 仍按
