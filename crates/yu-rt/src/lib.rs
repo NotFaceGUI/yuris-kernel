@@ -54,6 +54,7 @@ pub mod input;
 pub mod json;
 pub mod rng;
 pub mod scriptpos;
+pub mod semantics;
 pub mod sysvar;
 pub mod sysvar_abi;
 pub mod tables;

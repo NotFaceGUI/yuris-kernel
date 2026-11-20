@@ -512,6 +512,11 @@ pub struct Vm {
     /// 编译器表回退源(工程根/SDK);脚本与其余表仍从 `src` 读。
     aux: Option<Box<dyn yu_vfs::DataSource>>,
     tables: TableSet,
+    /// 已装载表的语义形态(启动时派生一次;行为门控的唯一来源)。
+    ///
+    /// 处理器不得直接比较 `tables.boot.yscm.version`(见
+    /// [`crate::semantics::SemanticProfile`])。
+    semantics: crate::semantics::SemanticProfile,
     /// `GOSUB`/`GO` 常量标签按调用点缓存(`(script_id, pc)` → 目标)。
     /// 标签表在启动装载后不变,窗口内无变量引用 ⇒ 每次结果相同。
     pub(crate) label_cache: rustc_hash::FxHashMap<(u32, u32), LabelTarget>,
@@ -779,6 +784,7 @@ impl Vm {
         cfg: BootConfig,
     ) -> Result<Self, Diag> {
         let mut tables = TableSet::load_from(src.as_ref(), aux.as_deref(), cfg.script_key)?;
+        let semantics = crate::semantics::SemanticProfile::from_boot(&tables.boot);
         let handler_of = crate::vm::handlers::build_handler_table(&tables.boot.yscm);
         let param_plans = build_param_plans(&tables.boot.yscm);
 
@@ -847,6 +853,7 @@ impl Vm {
             src,
             aux,
             tables,
+            semantics,
             label_cache: rustc_hash::FxHashMap::default(),
             scheduler: Scheduler::new(),
             store: VariableStore::new(),
@@ -1127,7 +1134,18 @@ impl Vm {
         &self.tables
     }
 
+    /// 已装载表的语义形态(启动时派生一次;行为门控的唯一来源)。
+    ///
+    /// 处理器/宿主判断跨版本语义时用本访问器,不要直接比较
+    /// `tables().boot.yscm.version`。
+    pub fn semantics(&self) -> crate::semantics::SemanticProfile {
+        self.semantics
+    }
+
     /// 可变表集合(预装载脚本 / 诊断用)。
+    ///
+    /// **不要替换 `boot.yscm`**:`semantics()` 是 boot 时按 `yscm` 头版本
+    /// 派生的快照,替换命令表会让门控与表事实脱节。需要换表请重新 boot。
     pub fn tables_mut(&mut self) -> &mut TableSet {
         &mut self.tables
     }
@@ -1410,8 +1428,12 @@ impl Vm {
         self.text_total
     }
 
+    /// `@_SYSTEM_VERSION` 的引擎版本号。
+    ///
+    /// 与行为门控共用 [`Self::semantics`] 的派生值(同一来源),不另行
+    /// 读取 `tables.boot.yscm.version`。
     pub fn engine_version(&self) -> u32 {
-        self.tables.boot.yscm.version
+        self.semantics.ysc_version
     }
 
     /// 系统变量 ABI 表(名字/类型/维数)。
