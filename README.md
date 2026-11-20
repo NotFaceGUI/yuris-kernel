@@ -2,8 +2,8 @@
 
 <h1>yuris-kernel</h1>
 
-<p><b>A YU-RIS compatible runtime</b><br>
-The official engine's observable behavior is the single source of truth</p>
+<p><b>YU-RIS 兼容运行时</b><br>
+以官方引擎的可观测行为为唯一真值</p>
 
 <p>
 <a href="https://github.com/NotFaceGUI/yuris-kernel/actions/workflows/ci.yml"><img src="https://github.com/NotFaceGUI/yuris-kernel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -12,203 +12,228 @@ The official engine's observable behavior is the single source of truth</p>
 <img src="https://img.shields.io/badge/YU--RIS%20BETA%204-0.450--0.495-2ea44f" alt="YU-RIS BETA 4">
 <img src="https://img.shields.io/badge/YU--RIS%20BETA%203-0.276--0.292-dfb317" alt="YU-RIS BETA 3">
 <img src="https://img.shields.io/badge/YU--RIS%20BETA%202-0.255-dfb317" alt="YU-RIS BETA 2">
-<img src="https://img.shields.io/badge/YU--RIS%205xx-third--party-lightgrey" alt="YU-RIS 5xx (third-party)">
+<img src="https://img.shields.io/badge/YU--RIS%205xx-official--commercial-lightgrey" alt="YU-RIS 5xx（官方商业）">
 <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Android%20%7C%20headless-8250df" alt="Platforms">
 <img src="https://img.shields.io/badge/rust-2021%20edition-orange?logo=rust" alt="Rust">
 </p>
 
-<p><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
+<p><b>简体中文</b> · <a href="README.en.md">English</a></p>
 
 <p>
-<a href="#overview">Overview</a> ·
-<a href="#support">Support</a> ·
-<a href="#demo">Demo</a> ·
-<a href="#download">Download</a> ·
-<a href="#quick-start">Quick start</a> ·
+<a href="#简介">简介</a> ·
+<a href="#支持范围">支持范围</a> ·
+<a href="#演示">演示</a> ·
+<a href="#下载">下载</a> ·
+<a href="#快速开始">快速开始</a> ·
 <a href="#android">Android</a> ·
-<a href="#architecture">Architecture</a> ·
-<a href="#documentation">Documentation</a> ·
-<a href="#license">License</a>
+<a href="#架构">架构</a> ·
+<a href="#文档">文档</a> ·
+<a href="#许可">许可</a>
 </p>
 
 </div>
 
-## Overview
+## 简介
 
-`yuris-kernel` is a compatible runtime for the YU-RIS engine. The repository contains no official engine code, game data, or save files.
+`yuris-kernel` 是 YU-RIS 引擎的兼容运行时，仓库不包含官方引擎代码、游戏数据或存档。
 
-- **Multi-version coverage** — official series: BETA 4 mainline (0.450–0.495),
-  BETA 3 (0.276–0.292) and BETA 2 (0.255) adapting; the third-party 5xx fork is observed;
-  27 system-variable ABI tables catalogued (covering 0.255–0.495).
-- **Two render backends** — `soft` (CPU, deterministic reference) and `wgpu` (GPU, primary desktop / Android path).
-- **Multiple hosts** — Windows desktop, headless / local server, browser presentation (debug), Android.
-- **Text patches and saves** — four text routes `original` / `gbk` / `big5` / `tunnel`;
-  `.sd` saves are byte-identical with the desktop build.
-- **Observable** — `yu-trace` records / replays / diffs for frame-by-frame comparison against the official engine.
+- **多版本覆盖** —— 官方系列 BETA 2 / BETA 3 / BETA 4：
+  BETA 4 主线（0.450–0.495），BETA 3（0.276–0.292）/ BETA 2（0.255）适配中；
+  官方商业 5xx 分支（v500 封包 / v555 七表）适配中；27 张 0.255–0.495
+  系统变量 ABI 表已入册，另有 v555 1000 槽实测表（在 `v555-support` 分支）。
+- **双渲染后端** —— `soft`（CPU，确定性参考）与 `wgpu`（GPU，桌面 / Android 主路径）。
+- **多宿主** —— Windows 桌面、headless / 本地服务、浏览器呈现（调试）、Android。
+- **汉化与存档** —— `original` / `gbk` / `big5` / `tunnel` 四条文本路线；
+  `.sd` 存档与桌面字节一致。
+- **可观测** —— `yu-trace` 录制 / 回放 / diff，用于和官方引擎逐帧对拍。
 
-## Support
+## 支持范围
 
-### Engine versions
+### 引擎版本
 
-Official releases are organized into BETA 2 / BETA 3 / BETA 4 series; 5xx is a third-party modified engine, not an official series.
+官方版本分为 BETA 2 / BETA 3 / BETA 4 三个主线系列；5xx 是 YU-RIS 官方商业分支（商业发行版），不属于这三条主线。个别商业样本的发行包可能带重打包/汉化处理，但那是样本层面的处理，不是引擎本身。
 
-| Series | Status             | Notes                                                                                                                                                                                        |
-| ------ | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| BETA 2 | Adapting           | 0.255 (0.55): 539 system variables catalogued; YSTB V2 lacks real samples                                                                                                                    |
-| BETA 3 | Adapting           | 0.276 sample; 0.292 (0.92): 91 commands / 482 system variables                                                                                                                               |
-| BETA 4 | Available (main)   | 0.450–0.495: 0.466 / 0.479 / 0.495: 100 / 104 / 119 commands, 513 / 526 / 548 system variables; 0.450 / 0.460 / 0.470 / 0.480 / 0.490 spot-checked on real games, 0.481 / 0.486 / 0.494 / 0.495 accepted |
-| 5xx    | Observing          | Third-party modified engine: v500 packs are readable (no upper bound on the YPF version field); v555 has only partial side-channel observations, system variables inferred from the 0.495 family prefix |
+| 系列 | 状态         | 说明                                                                                                                                                            |
+| ---- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| BETA 2 | 适配中     | 0.255（0.55）：539 系统变量表已入册；YSTB V2 缺真实样本                                                                                                          |
+| BETA 3 | 适配中     | 0.276 样本；0.292（0.92）：91 命令 / 482 系统变量                                                                                                                |
+| BETA 4 | 可用（主线） | 0.450–0.495：0.466 / 0.479 / 0.495：100 / 104 / 119 命令，513 / 526 / 548 系统变量；0.450 / 0.460 / 0.470 / 0.480 / 0.490 抽样实机通过，0.481 / 0.486 / 0.494 / 0.495 实机验收 |
+| 5xx    | 适配中（v555） | 官方商业分支：v500 封包可读；v555 七表/剧本链已实测；已落地 `TEXT[FILE]`、`PRODUCT`、`SAVE/LOAD[MEM]`、`_DROPFILE*`、`VARINFO`；剩余 P0 标题画面（`_STR`/按钮纹理/SPL/背景 CG） |
 
-ABI tables for 0.450–0.493 are all catalogued (27 tables, covering 0.255–0.495).
+0.450–0.493 各版本的 ABI 表已全部入册（27 张，覆盖 0.255–0.495）。
 
-### Host platforms
+### 5xx / v555 现状
 
-| Platform                  | Status             |
-| ------------------------- | ------------------ |
-| Windows desktop           | Available          |
-| headless / local server   | Available          |
-| Browser presentation      | Debug only         |
-| Android                   | Available          |
-| Linux / macOS desktop     | Unverified         |
+- **官方商业分支**：v500 封包、v555 七表（YSCM/YSLB/YSVR/YSTL/YSER/YSCF/YSTD）均已实测；
+  剧本密钥 = CRC32(作品 ID)，启动链、剧本 DSL 词法/宏、标签表、品牌影片、
+  GAMEMain UI 图层已打通，headless 已到标题选择循环。
+- **原生多语言**：v555 剧情文本外置为 `scenario/`（基准）、`sc_cn_scenario/`（简中）、
+  `sc_tw_scenario/`（繁中）三份变体，由 `config.sd` 里的语言号选择；
+  实测编码分别为 CP932 / GBK / Big5。当前内核对多语言仍依赖全局 `--patch gbk`，
+  正在按语言变体收口（优化计划 O5）。
+- **仍缺**：P0-1 `_STR`、P0-2 按钮纹理状态机、P0-3 SPL 过渡、P0-4 背景 CG；
+  `MEM=99999`、`PRODUCT` 其它 COM、正文逐字对拍。
+- **文档**：v555 普查/差距/ABI 与多语言调研在 `v555-support` 分支的
+  `docs/formats/v555-commercial.md`、`v555-gap-2026-11-19.md`，待合并。
 
-Gaps for Linux / macOS desktop and true wasm (in-memory data source + browser saves) are tracked in [Todo](#todo).
+### 宿主平台
 
-## Demo
+| 平台                | 状态   |
+| ------------------- | ------ |
+| Windows 桌面        | 可用   |
+| headless / 本地服务 | 可用   |
+| 浏览器呈现端        | 仅调试 |
+| Android             | 可用   |
+| Linux / macOS 桌面  | 未验证 |
 
-| 0.481 · Title screen | 0.481 · Dialogue | 0.494 · Dialogue |
+Linux / macOS 桌面与真 wasm（内存数据源 + 浏览器存档）的缺口见[待办](#待办)。
+
+## 演示
+
+| 0.481 · 标题画面 | 0.481 · 对话 | 0.494 · 对话 |
 | :---: | :---: | :---: |
-| [![0.481 title screen](docs/assets/case/1_t.png)](docs/assets/case/1_t.png) | [![0.481 dialogue](docs/assets/case/1_d.png)](docs/assets/case/1_d.png) | [![0.494 dialogue](docs/assets/case/2_d.png)](docs/assets/case/2_d.png) |
+| [![0.481 标题画面](docs/assets/case/1_t.png)](docs/assets/case/1_t.png) | [![0.481 对话](docs/assets/case/1_d.png)](docs/assets/case/1_d.png) | [![0.494 对话](docs/assets/case/2_d.png)](docs/assets/case/2_d.png) |
 
-## Download
+## 下载
 
-Prebuilt artifacts are on [Releases](https://github.com/NotFaceGUI/yuris-kernel/releases):
+预构建产物见 [Releases](https://github.com/NotFaceGUI/yuris-kernel/releases)：
 
-| Platform    | Artifact                                        | Contents                          |
-| ----------- | ----------------------------------------------- | --------------------------------- |
-| Windows x64 | `yuris-kernel-vX.Y.Z-windows-x64.zip`           | `yu-cli.exe` + `yu-serve.exe`     |
-| Android     | `yuris-kernel-vX.Y.Z-android-universal.apk`     | Universal (arm64-v8a + x86_64)    |
-| Android     | `...-android-arm64-v8a.apk` / `-x86_64.apk`     | Per-ABI packages                  |
+| 平台         | 产物                                             | 内容                              |
+| ------------ | ------------------------------------------------ | --------------------------------- |
+| Windows x64  | `yuris-kernel-vX.Y.Z-windows-x64.zip`            | `yu-cli.exe` + `yu-serve.exe`     |
+| Android      | `yuris-kernel-vX.Y.Z-android-universal.apk`      | 通用包（arm64-v8a + x86_64）      |
+| Android      | `...-android-arm64-v8a.apk` / `-x86_64.apk`      | 按 ABI 分包                       |
 
-The desktop build is unpack-and-run. On Android, install the APK and pick a game directory in the configuration screen. To build or debug the kernel yourself, continue to the next section.
+桌面版解压即用；Android 安装 APK 后，在配置界面选择游戏目录即可。
+需要自己构建或调试内核时，继续看下一节。
 
-## Quick start
+## 快速开始
 
-### Requirements
+### 环境要求
 
-- **Desktop**: Rust stable (2021 edition); Windows x64 verified, Linux / macOS unverified.
-- **Android**: JDK 17+, Android SDK (`minSdk 24`, i.e. Android 7.0+);
-  `tools/android/build.sh` automatically picks the highest version under `$ANDROID_HOME/ndk`.
-- **Runtime data**: you must supply legally obtained game data; the repository ships none.
+- **桌面**：Rust stable（2021 edition）；Windows x64 已验证，Linux / macOS 未验证。
+- **Android**：JDK 17+、Android SDK（`minSdk 24`，即 Android 7.0+）；
+  NDK 由 `tools/android/build.sh` 自动取 `$ANDROID_HOME/ndk` 下最高版本。
+- **运行数据**：自备合法获取的游戏数据；仓库不附带。
 
-### Build
+### 构建
 
 ```bash
 cargo build --release -p yu-cli
 ```
 
-Windows x64 desktop is verified; Linux / macOS desktop is unverified. Android build commands are below and in the [Android](#android) section.
+Windows x64 桌面已验证；Linux / macOS 桌面未验证。Android 构建见下方命令
+与 [Android](#android) 小节。
 
 ```bash
-# Android: cross-compile .so + package APK
+# Android：so 交叉编译 + APK 打包
 export ANDROID_HOME=/path/to/sdk ANDROID_NDK_HOME=/path/to/ndk JAVA_HOME=/path/to/jdk17
 tools/android/build.sh                  # debug
 BUILD_TYPE=release tools/android/build.sh
-YURIS_SO_ONLY=1 tools/android/build.sh  # .so only
+YURIS_SO_ONLY=1 tools/android/build.sh  # 只出 so
 ```
 
-### Run
+### 运行
 
-Data entry follows the official mount rules: if the project root has a `data/` directory, it is a development project layout (data root = `data/`); otherwise it is a release layout (data root = project root). All `*.ypf` files under the data root and its `pac/` are mounted by file name, later mounts overriding earlier ones; `update1..9.ypf` stack as incremental layers; loose-file content directories are layered on top of packs.
+数据入口按官方挂载规则：工程根下有 `data/` 目录即开发工程布局
+（数据根 = `data/`），否则为发行版布局（数据根 = 工程根）。
+数据根及其 `pac/` 下的全部 `*.ypf` 按文件名挂载，后挂覆写先挂；
+`update1..9.ypf` 依次叠加为增量层；散盘内容目录叠在包之上。
 
 ```bash
-# Minimal run: game directory with data.ypf or data/
-target/release/yu-cli run "<game-dir>" --mode desktop
+# 最小运行：游戏目录含 data.ypf 或 data/
+target/release/yu-cli run "<游戏目录>" --mode desktop
 
-# Windows desktop window
+# Windows 桌面窗口
 target/release/yu-cli run "<project>" --mode desktop --backend wgpu --debug-ui
 
-# Local server + browser presentation; opens the browser by default, --no-open serves only
+# 本地服务 + 浏览器呈现；默认打开浏览器，--no-open 只起服务
 target/release/yu-cli serve "<project>" --backend wgpu --port 4173
 
 # HMR
 target/release/yu-cli dev "<project>" --backend wgpu --port 4173
 
-# Cases
+# 用例
 target/release/yu-cli case "<project>" --all
 
-# Translation patches
+# 汉化
 target/release/yu-cli run "<project>" --mode desktop --patch gbk
 target/release/yu-cli run "<project>" --mode desktop --patch big5
 target/release/yu-cli run "<project>" --mode desktop --patch tunnel
 
-# Rekeyed titles: specify the script key explicitly (8 hex digits; auto-detected by default); compress saves on write
+# 换钥作品:显式指定脚本密钥(8 位十六进制;缺省自动探测);存档写盘压缩
 target/release/yu-cli run "<project>" --mode desktop --backend wgpu \
   --script-key 0x1A2B3C4D --save-codec snappy
 ```
 
-## Text encoding
+## 文本编码
 
-`--patch` selects the translation route; desktop, serve, and the Android configuration screen share the same values.
+`--patch` 选汉化路线；桌面、serve、Android 配置界面用同一份取值。
 
-| Patch type        | Value                       | Notes                                                                                              |
-| ----------------- | --------------------------- | -------------------------------------------------------------------------------------------------- |
-| Original Japanese | `original` (`cp932`)        | Untranslated original                                                                              |
-| Simplified Chinese| `gbk` (`cp936` / `gb2312`)  | Translation patch; the translated text lives in loose `ysbin/`, taking effect via "loose before pack" |
-| Traditional Chinese | `big5` (`cp950`)          | Same as above, for Hong Kong / Taiwan releases and traditional patches                             |
-| SJIS tunnel       | `tunnel` (`sjis_ext`)       | Patch that keeps the original encoding and appends a codepoint table; requires `sjis_ext.bin` in the game root |
-| Auto              | `auto` (default)            | Detected via `codecs.json` → `sjis_ext.bin` → tool signatures; patch names are not recognized      |
-| Unsupported       | —                           | exe / DLL injection patches (e.g. `setdll` loading `MyDll.dll` to swap fonts): the program is not modified, so they do not apply |
+| 汉化类型  | 取值                        | 说明                                                                          |
+| --------- | --------------------------- | ----------------------------------------------------------------------------- |
+| 原版日文  | `original`（`cp932`）       | 未汉化的原版                                                                  |
+| 简体汉化  | `gbk`（`cp936` / `gb2312`） | 汉化补丁；译文放在散盘 `ysbin/`，靠「散盘先于封包」的读链生效                 |
+| 繁体汉化  | `big5`（`cp950`）           | 同上，港台旧作与繁中补丁                                                      |
+| SJIS 隧道 | `tunnel`（`sjis_ext`）      | 不动原编码、追加码点表的补丁；需游戏根有 `sjis_ext.bin`                       |
+| 自动      | `auto`（缺省）              | 按 `codecs.json` → `sjis_ext.bin` → 工具签名识别；不认补丁名                  |
+| 不支持    | —                           | exe / DLL 注入类补丁（如 `setdll` 挂 `MyDll.dll` 换字体）：不改程序，故不适用 |
+
+> v555 原生多语言不是 `--patch` 汉化路线：`scenario/`、`sc_cn_scenario/`、
+> `sc_tw_scenario/` 三份变体由 `config.sd` 的语言号选择，codec 分别为
+> CP932 / GBK / Big5；`--patch gbk` 只用于汉化补丁/旧工程。
 
 <table>
 <tr>
-<td align="center"><img src="docs/assets/patch/gbk.png" alt="GBK patch"><br><sub><b>GBK patch</b></sub></td>
-<td align="center"><img src="docs/assets/patch/tunnel.png" alt="SJIS tunnel"><br><sub><b>SJIS tunnel</b></sub></td>
+<td align="center"><img src="docs/assets/patch/gbk.png" alt="GBK 汉化"><br><sub><b>GBK 汉化</b></sub></td>
+<td align="center"><img src="docs/assets/patch/tunnel.png" alt="SJIS 隧道"><br><sub><b>SJIS 隧道</b></sub></td>
 </tr>
 </table>
 
 ## Android
 
-.so + lightweight Java shell
+so + 轻量 Java 壳
 
-- Build: `tools/android/build.sh`, producing `app-debug.apk` / `app-release.apk` (arm64-v8a + x86_64).
-- After installation, pick a game directory to run; saves go to `<game-dir>/save/`, and `.sd` files are byte-identical with desktop.
-- Input: touch = left mouse button, two-finger vertical swipe = wheel, bottom-right corner toggles the virtual cursor.
-- Exit: after the script `END`, return to the configuration screen.
+- 构建：`tools/android/build.sh`，产物 `app-debug.apk` / `app-release.apk`（arm64-v8a + x86_64）。
+- 安装后选游戏目录即可运行；存档写 `<游戏目录>/save/`，`.sd` 与桌面字节一致。
+- 输入：触摸 = 鼠标左键，双指上下滑 = 滚轮，右下角切换虚拟光标。
+- 退出：脚本 `END` 后回到配置界面。
 
-<p align="center"><img src="docs/assets/android/title.jpg" alt="Android host running on a real device" width="720"></p>
+<p align="center"><img src="docs/assets/android/title.jpg" alt="Android 宿主实机运行" width="720"></p>
 
-## Architecture
+## 架构
 
-`yu-engine` owns boot assembly and each frame's `Vm::tick_at` / render calls. The diagram shows data flow, not the crate dependency graph; `yu-trace` is a side attachment.
+`yu-engine` 负责 boot 装配与每帧 `Vm::tick_at` / render 调用。下图是数据流，
+不是 crate 依赖图；`yu-trace` 是旁挂。
 
 ```mermaid
 flowchart TD
-    PROJ["Project root<br/>Release: *.ypf + pac/*.ypf<br/>Dev project: data/"]
-    UPD["update1..9.ypf<br/>stacked mounts"]
-    PATCH["Text encoding<br/>original / gbk / big5 / tunnel"]
+    PROJ["工程根<br/>发行版:*.ypf + pac/*.ypf<br/>开发工程:data/"]
+    UPD["update1..9.ypf<br/>叠加挂载"]
+    PATCH["文本编码<br/>original / gbk / big5 / tunnel"]
     VFS["yu-vfs<br/>DirSource / YpfSource / Mount"]
     FMT["yu-format<br/>ysc · ysl · ysv · yst_list · yst%05d · yscfg"]
-    RT["yu-rt<br/>TableSet → Vm::boot_with_aux<br/>tasks / commands / expressions / variable domains"]
+    RT["yu-rt<br/>TableSet → Vm::boot_with_aux<br/>任务 / 命令 / 表达式 / 变量域"]
     GFX["yu-gfx<br/>GfxHost → GfxState"]
     SND["yu-sound<br/>SoundHost"]
     SAV["yu-save<br/>SaveHost"]
     CF["CompositorFrame<br/>passes / layers / text"]
     CORE["yu-render-core<br/>TextureStore / TextComposer"]
-    FONT["yu-font<br/>font rasterization"]
-    SOFT["yu-backend-soft<br/>CPU mode / reference"]
-    WGPU["yu-backend-wgpu<br/>GPU mode"]
+    FONT["yu-font<br/>字体栅格"]
+    SOFT["yu-backend-soft<br/>CPU 模式 / 参考"]
+    WGPU["yu-backend-wgpu<br/>GPU 模式"]
     SURF["RGBA8 Surface"]
-    HOST["Host<br/>headless / desktop / Android / browser presentation"]
+    HOST["宿主<br/>headless / 桌面 / Android / 浏览器呈现"]
     ENG["yu-engine<br/>boot / tick / render"]
-    TRACE["yu-trace<br/>side-channel recording"]
+    TRACE["yu-trace<br/>旁挂录制"]
 
     PROJ --> VFS
     UPD --> VFS
     PATCH -.-> FMT
     VFS --> FMT --> RT
-    RT -->|"sync at command time"| GFX
-    RT -->|"sync at command time"| SND
-    RT -->|"sync at command time"| SAV
+    RT -->|"命令时刻同步"| GFX
+    RT -->|"命令时刻同步"| SND
+    RT -->|"命令时刻同步"| SAV
     GFX --> CF
     CF --> SOFT
     CF --> WGPU
@@ -218,103 +243,127 @@ flowchart TD
     SOFT --> SURF
     WGPU --> SURF
     SURF --> HOST
-    ENG -.->|"boot assembly"| RT
+    ENG -.->|"boot 装配"| RT
     ENG -.->|"tick / render"| CF
     TRACE -.-> VFS
     TRACE -.-> RT
     TRACE -.-> CF
 ```
 
-Boot sequence: `Project` discovers the data entry → `Vm::boot_with_aux` loads tables and entry → `GfxState::from_tables` → `GfxHost` / `SoundHost` / `SaveHost` are installed into the VM. Each frame, `Vm::tick_at` runs tasks and domain hosts update synchronously at command time; `GfxState::frame()` produces a `CompositorFrame`, and the backend composites RGBA8.
+启动顺序：`Project` 发现数据入口 → `Vm::boot_with_aux` 装载表与入口 →
+`GfxState::from_tables` → 把 `GfxHost` / `SoundHost` / `SaveHost` 装进 VM。
+每帧 `Vm::tick_at` 执行任务，域宿主在命令时刻同步更新；`GfxState::frame()`
+产出 `CompositorFrame`，后端合成 RGBA8。
 
-## Project structure
+## 项目结构
 
-| Path                                              | Contents                                   |
-| ------------------------------------------------- | ------------------------------------------ |
-| `crates/yu-log`                                   | Diagnostics and logging; error exit for all crates |
-| `crates/yu-vfs`                                   | Data sources, YPF, mounts                  |
-| `crates/yu-format`                                | ybn, YSSD, YMV, CP932/GBK/Big5             |
-| `crates/yu-rt`                                    | VM, tasks, command dispatch, variable domains, ABI tables |
-| `crates/yu-gfx`                                   | Render semantics and `CompositorFrame`     |
-| `crates/yu-sound` / `crates/yu-save`              | Sound / save hosts                         |
-| `crates/yu-font`                                  | Font discovery and glyph rasterization     |
-| `crates/yu-render/core`                           | Shared contract for both backends          |
-| `crates/yu-render/soft` / `crates/yu-render/wgpu` | CPU reference / primary GPU backend        |
-| `crates/yu-engine`                                | boot / tick / render assembly              |
-| `crates/yu-cli`                                   | CLI, server, HMR, cases                    |
-| `crates/yu-platform/*`                            | Desktop, Android, browser presentation, input |
-| `crates/yu-trace`                                 | Record / replay / diff                     |
-| `android/`                                        | Android shell (Java)                       |
-| `tools/android/build.sh`                          | .so cross-compilation + APK packaging      |
+| 路径                                              | 内容                               |
+| ------------------------------------------------- | ---------------------------------- |
+| `crates/yu-log`                                   | 诊断与日志；所有 crate 的错误出口  |
+| `crates/yu-vfs`                                   | 数据源、YPF、挂载                  |
+| `crates/yu-format`                                | ybn、YSSD、YMV、CP932/GBK/Big5     |
+| `crates/yu-rt`                                    | VM、任务、命令分派、变量域、ABI 表 |
+| `crates/yu-gfx`                                   | 渲染语义与 `CompositorFrame`       |
+| `crates/yu-sound` / `crates/yu-save`              | 声音 / 存档宿主                    |
+| `crates/yu-font`                                  | 字体发现与字形栅格                 |
+| `crates/yu-render/core`                           | 两后端共享契约                     |
+| `crates/yu-render/soft` / `crates/yu-render/wgpu` | CPU 参考 / GPU 主后端              |
+| `crates/yu-engine`                                | boot / tick / render 装配          |
+| `crates/yu-cli`                                   | CLI、服务、HMR、用例               |
+| `crates/yu-platform/*`                            | 桌面、Android、浏览器呈现、输入    |
+| `crates/yu-trace`                                 | 录制 / 回放 / diff                 |
+| `android/`                                        | Android 壳（Java）                 |
+| `tools/android/build.sh`                          | so 交叉编译 + APK 打包             |
 
-## Testing
+## 测试
 
 ```bash
 cargo test --workspace
 ```
 
-The repository ships no game data. Tests that need missing samples explicitly `SKIP` and count it; `YURIS_REQUIRE_SAMPLES=1` turns that into a failure. CI runs only sample-independent lib tests (`.github/workflows/ci.yml`); a full `--workspace` run also covers corpus and GPU cases, which need local samples and a usable GPU.
+仓库不附带游戏数据。缺样本时相关用例显式 `SKIP` 并计数；
+`YURIS_REQUIRE_SAMPLES=1` 改为失败。CI 只跑不依赖样本的 lib 测试
+（`.github/workflows/ci.yml`）；完整 `--workspace` 还会覆盖语料与 GPU 用例，
+需要本地样本与可用显卡。
 
-## Todo
+## 待办
 
-- Rendering: multi-part layer geometry semantics; `CGINFO[SX/SY]` already covers injected assets and `COPY/COPY2` slices, but non-injected assets are still missing; fields such as `COLOR` and non-EXIST fields for missing targets are not closed out; half-pixel / quad phase and transition coverage await final verdicts from official screenshots.
-- Text: the official two-layer model (pending display buffer + committed surface), `C/R/P/E`, width wrapping / kinsoku, and per-character styling are landed per REA; `TEXTINFO[CX/CY]` too. Remaining: GDI glyph ink/baseline not yet settled against official screenshots (DIV-GFX-056), and command ordering between text and image processing (DIV-GFX-076).
-- Fonts: the game's own "Settings → Font" screen is wired to the full catalogue (host default font first + local system fonts), and switching in-game takes effect immediately; `--font` now means the default font, `--font-lock` keeps the old forced behavior. Remaining: per-glyph missing-glyph fallback and the game's hardcoded default label (DIV-FONT-012).
-- Formats: YSTB V2 lacks samples; the legacy YPF NUL-XOR dialect has no samples and is explicitly rejected.
-- Runtime: `CSVINFO` not yet evidenced; `VAR` and `SAVEINFO` aligned with the official no-op behavior.
-- Saves: `FILEACT` layer export not closed out; `FILEACT[EXEC]` refuses to execute (host security policy).
-- Hosts: `REGINFO` is wired on desktop (Windows registry); Linux / macOS desktop and true wasm (in-memory data source + browser saves) are unverified.
-- Movies: MPEG-1 program streams play (video + MP2 audio); MPEG-2 / AVI / FLASH and others need new media / Flash hosts; `MOVIE[PLAY=0]` and A/V clock drift are not aligned.
-- E-mote: submodule `yu-emote/`, mainline deferred.
+- 渲染：多部件层几何语义；`CGINFO[SX/SY]` 已覆盖已注入资产与 `COPY/COPY2`
+  切片，未注入资产仍缺；`COLOR` 等字段、缺失目标的非 EXIST 字段未收口；
+  半像素 / quad 相位与过渡覆盖度待官方截图定论。
+- 文本：官方两层模型（待显示缓冲 + 已提交表面）、`C/R/P/E`、宽度折行/禁则、
+  逐字符样式、`TEXTINFO[CX/CY]` 已按 REA 落地；残余：GDI 字迹/基线未与官方
+  截图定论（DIV-GFX-056）、文字与图像加工的命令序（DIV-GFX-076）。
+- 字体：游戏自带「設定→フォント」已接全量目录（宿主默认字体第一 + 本机
+  系统字体），游戏内切换即时生效；`--font` 改为默认字体语义，`--font-lock`
+  保留旧强制行为。残余：逐字形缺字回退、游戏硬编码默认标签（DIV-FONT-012）。
+- 格式：YSTB V2 缺样本；YPF 旧 NUL-XOR 方言无样本，显式拒绝。
+- 运行时：`CSVINFO` 未取证；`VAR`、`SAVEINFO` 已按官方 no-op 对齐。
+- 存档：`FILEACT` 图层导出未闭环；`FILEACT[EXEC]` 拒绝执行（宿主安全策略）。
+- 宿主：`REGINFO` 桌面已接（Windows 注册表）；Linux / macOS 桌面与真 wasm
+  （内存数据源 + 浏览器存档）未验证。
+- 影片：MPEG-1 program stream 可播（视频 + MP2 音频）；MPEG-2 / AVI / FLASH
+  等需新的媒体 / Flash 宿主；`MOVIE[PLAY=0]` 与音视频时钟漂移未对齐。
+- E-mote：子模块 `yu-emote/`，主线暂缓。
 
-## Documentation
+## 文档
 
-- `PROGRESS.md` — progress, errata, verification results
-- `docs/architecture.md` — architecture
-- `docs/cross-platform.md` — cross-platform capability matrix
-- `docs/architecture/backends.md` — soft / wgpu boundary
-- `docs/render-parity.md` — render semantics and evidence
-- `docs/todo-inventory.md` — historical gap snapshot (2026-10-22; current status is tracked in `PROGRESS.md` and the individual ledgers)
-- `docs/references/open-source-tools.md` — tool references
-- `docs/release.md` — tag releases and artifacts
-- `android/README.md` — Android shell build and on-device verification
-- Each crate's `README.md` — responsibility boundary, ports, and verification commands; `crates/yu-platform` and `crates/yu-render` are directory indexes
+- `PROGRESS.md` — 进度、勘误、验证结果
+- `docs/architecture.md` — 架构
+- `docs/cross-platform.md` — 跨平台能力矩阵
+- `docs/architecture/backends.md` — soft / wgpu 边界
+- `docs/render-parity.md` — 渲染语义与证据
+- `docs/todo-inventory.md` — 历史缺口快照（2026-10-22；当前状态以
+  `PROGRESS.md` 与各台账为准）
+- `docs/references/open-source-tools.md` — 工具参考
+- `docs/release.md` — tag 发布与产物
+- `android/README.md` — Android 壳构建与实机验证
+- 各 crate 的 `README.md` — 职责边界、端口与验证命令；`crates/yu-platform`、
+  `crates/yu-render` 是目录索引
 
-## Acknowledgements
+## 致谢
 
 - [YU-RIS_Guide](https://github.com/TheVNConnoisseur/YU-RIS_Guide) —
-  archive of official tools and SDKs (no license declared); the 27 system-variable ABI tables were extracted from its `YSCom.ycd`, and the repository ships no SDK / ycd originals; each table header records the source sha256 and covered version range (`crates/yu-rt/data/sysvar-abi-*.tsv`).
+  官方工具与 SDK 归档（仓库未声明许可）；27 张系统变量 ABI 表由其中
+  `YSCom.ycd` 提取，仓库不附带 SDK / ycd 原文件；每张表头记录来源 sha256 与
+  覆盖版本区间（`crates/yu-rt/data/sysvar-abi-*.tsv`）。
 - [Yuris-Tyn](https://github.com/Weiss-UltimateSavior/Yuris-Tyn) —
-  boot chain, task / driver shape, format facts, and golden regression reference; read-only.
-- [RxYuris](https://github.com/ZQF-ReVN/RxYuris) — YSTB / YSCM / YSTL parsing flow, YSCOM loader.
+  启动链、任务 / 驱动形态、格式事实与 golden 回归参照；只读参考。
+- [RxYuris](https://github.com/ZQF-ReVN/RxYuris) — YSTB / YSCM / YSTL 解析流程、
+  YSCOM Loader。
 - [YU-RIS-Script-Editor](https://github.com/Aionfatedio/YU-RIS-Script-Editor) —
-  YSTB V5 segment order, V2 version-band detection, encoding auto-detection; no license declared, used as facts only, no code copied.
+  YSTB V5 段序、V2 版本带判定、编码自检测；未声明许可，仅事实参考，未复制代码。
 - [yuris_decompiler](https://github.com/shimamura-sakura/yuris_decompiler) —
-  V2 expression type-qualifier mapping (`$@` / `&$` / `&@`) and V2/V5 structural facts;
-  MIT, algorithm-level adoption with attribution (no source copied verbatim).
-- [YURIS_TOOLS](https://github.com/jyxjyx1234/YURIS_TOOLS) — translation text workflow and tunnel codepoint allocation algorithm.
+  V2 表达式类型限定符映射（`$@` / `&$` / `&@`）与 V2/V5 结构事实；MIT，
+  算法级采用并注明出处（未逐字复制源码）。
+- [YURIS_TOOLS](https://github.com/jyxjyx1234/YURIS_TOOLS) — 汉化文本流程与
+  隧道码点分配算法。
 
-## Related repositories
+## 相关仓库
 
-- [yu-emote](https://github.com/NotFaceGUI/yu-emote) — E-mote (PSB/EMT) data layer and
-  runtime; mounted as a submodule at `yu-emote/`, development deferred.
+- [yu-emote](https://github.com/NotFaceGUI/yu-emote) — E-mote（PSB/EMT）数据层与
+  运行时；以子模块挂在 `yu-emote/`，暂缓开发。
 
-## Disclaimer
+## 免责声明
 
-- This project is an independently implemented YU-RIS compatible runtime and is not affiliated with, authorized by, or endorsed by the developer or publisher of the YU-RIS engine; product names and trademarks belong to their respective owners.
-- The repository contains no official engine code, game data, saves, or game assets. Screenshots in the documentation are only for demonstrating compatibility; rights belong to the respective game rights holders. Users must obtain the game and related assets legally on their own.
-- This project is for personal study, research, and compatibility testing. Please comply with local laws and game license agreements, and do not use it for piracy, unauthorized data distribution, or other infringing purposes.
-- The software is provided "as is", without any warranty of compatibility, stability, or save/data integrity; use is at your own risk.
+- 本项目是独立实现的 YU-RIS 兼容运行时，与 YU-RIS 引擎的开发商、发行商无隶属、
+  授权或背书关系；相关产品名与商标归其权利人所有。
+- 仓库不包含官方引擎代码、游戏数据、存档或游戏素材文件；文档中的运行截图仅用于
+  展示兼容性，相关权利归原游戏权利人。使用者需自行合法取得游戏本体及相关素材。
+- 本项目面向个人学习、研究与兼容性测试。请遵守所在地法律与游戏许可协议，
+  不要用于盗版、未经授权的数据分发或其他侵权用途。
+- 软件按“现状”提供，不对兼容性、稳定性或存档/数据完整性作任何担保；
+  使用风险由使用者自行承担。
 
-## License
+## 许可
 
 <a href="LICENSE"><img src="https://www.gnu.org/graphics/gplv3-127x51.png" alt="GPLv3 Logo" width="127" height="51"></a>
 
-Open-source projects referenced by this project are listed in [Acknowledgements](#acknowledgements); third-party crate dependencies are all MIT / Apache-2.0 / BSD / Zlib or other permissive licenses compatible with GPL-3.0.
+本项目参考的开源项目见 [致谢](#致谢)；第三方 crate 依赖均为 MIT / Apache-2.0 / BSD / Zlib 等与 GPL-3.0 兼容的宽松许可。
 
-Unless otherwise stated, all source code is released under **[GPL-3.0-or-later](LICENSE)**. See
-[NOTICE](NOTICE) for the full licensing statement; third-party components, dependency lists, and license texts are in
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) and
-[`third_party/licenses/`](third_party/licenses/).
+除另有说明外，全部源代码以 **[GPL-3.0-or-later](LICENSE)** 发布。完整许可声明见
+[NOTICE](NOTICE)；第三方组件、依赖清单与许可文本见
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) 与
+[`third_party/licenses/`](third_party/licenses/)。
 
-To distribute a modified version while keeping added code non-GPL-3.0, contact the author via [@NotFaceGUI](https://github.com/NotFaceGUI) for a separate license.
+如需分发修改版并保留新增代码不按 GPL-3.0 发布，请通过 [@NotFaceGUI](https://github.com/NotFaceGUI) 联系作者获取单独许可。

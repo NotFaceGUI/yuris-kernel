@@ -15559,15 +15559,16 @@ load_system_fonts: 163.4ms faces=248 catalog=127
   `nativeMovieCodecs`;`crates/yu-platform/README.md` 增加新 crate;
   `crates/yu-cli/README.md` 补 `--movie-backend`。
 
-## 成果 README-BETA-SERIES (2026-11-17) · README 版本线改按官方 BETA 2/3/4 归档,5xx 标注第三方
+## 成果 README-BETA-SERIES (2026-11-17) · README 版本线改按官方 BETA 2/3/4 归档;5xx 商业分支(2026-11-20 勘误)
 
 - 版本描述按官方系列划分（README 不引用外部归档仓库作为依据）：
   BETA 2 = 0.255（0.55）；BETA 3 = 0.276 样本、0.292（0.92）；
   BETA 4 = 0.450–0.495。
-- 5xx 改为「第三方魔改引擎，不属官方系列」，不写社团名；
-  `README.md` / `README.zh-CN.md` 的支持范围表与简介同步。
+- 5xx 改为「YU-RIS 官方商业分支（商业发行版），不属 BETA 2/3/4 主线」，
+  不写社团名；`README.md` / `README.zh-CN.md` 的支持范围表与简介同步。
+  **2026-11-20 勘误：旧表述「第三方魔改引擎」错误，作废。**
 - 版本标签（shields badge）改为 BETA 4（0.450–0.495，绿）、BETA 3（0.276–0.292，黄）、
-  BETA 2（0.255，黄）、5xx third-party（灰）。
+  BETA 2（0.255，黄）、5xx official-commercial（灰）。
 - 验证：4 个 shields.io 徽章 URL 均返回 HTTP 200；README 内 `4xx/2xx` 字样已清零。
 - 本轮未执行任何 git 写操作,等待主人审阅。
 
@@ -16196,3 +16197,17 @@ Tyranor-Next 模块管理:
 - `cargo test -p yu-backend-soft` → 全绿。
 - `cargo test -p yu-backend-wgpu` → 39 + 1 + 1 全绿。
 - 桌面实测(0.4.1+kotoneiro 读档淡出)待主人验收。
+
+## 成果 README-V555-OFFICIAL (2026-11-20) · README 默认中文,校正 5xx 为官方商业分支
+
+- `README.md` 改为默认简体中文；英文移到 `README.en.md`；
+  `README.zh-CN.md` 保留为跳转页，避免旧链接失效。
+- 5xx 描述从「第三方魔改引擎」校正为「YU-RIS 官方商业分支（商业发行版）」；
+  个别商业样本的第三方重打包/汉化痕迹与引擎归属分开表述。
+- 5xx 支持表更新：v500 封包、v555 七表、剧本链到标题循环；
+  `TEXT[FILE]`、`PRODUCT`、`SAVE/LOAD[MEM]`、`_DROPFILE*`、`VARINFO` 已落地；
+  P0 剩余项（`_STR`/按钮纹理/SPL/背景 CG）列在 README。
+- 增加 v555 原生多语言说明：`scenario/` + `sc_cn_scenario/` + `sc_tw_scenario/`，
+  `config.sd` 语言号，CP932/GBK/Big5；当前 `--patch gbk` 收口见优化计划 O5。
+- 勘误：`README-BETA-SERIES`(2026-11-17) 的「第三方」表述作废。
+- 本轮只改文档；源码/探针改动不随此提交。
