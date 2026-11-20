@@ -817,24 +817,30 @@ fn binary(op: u8, lhs: &Value, rhs: &Value) -> Result<Value, yu_log::Diag> {
     }
 }
 
-/// 切分表达式记录流。
-/// `decode` 的复用外层缓冲版(逐条 payload 仍按 `RawInstr` 所有权拷贝;
-/// 语义与 `decode` 一致)。
-pub fn decode_pooled(window: &[u8], out: &mut Vec<RawInstr>) -> Result<(), yu_log::Diag> {
-    out.clear();
-    let mut p = 0usize;
-    while p < window.len() {
-        if p + 3 > window.len() {
-            return Err(diag::fatal(
-                code::rt::EXPR_MALFORMED,
-                Boundary::Script,
-                format!("记录头截断:窗口偏移 {p},剩 {} 字节", window.len() - p),
-            ));
-        }
-        let op = window[p];
-        let len = u16::from_le_bytes([window[p + 1], window[p + 2]]) as usize;
-        let end = p + 3 + len;
-        if end > window.len() {
+/// 切一条 `[op][len:u16][payload]` 记录,返回 `(下一条偏移, 指令)`。
+///
+/// 0x4d 字符串字面量的 `len` 只用于走查前进,内容由终止符界定
+/// (旁线 §3.11)。部分 GBK 汉化 ybn 重写文本后保留了旧 CP932 串的
+/// `len`,新串更短但**终止符仍在窗口内**;官方按指针扫到终止符就停,
+/// 故这里同样放宽:载荷裁到窗口末尾,终止符必须在窗口内。其余操作码
+/// 仍按越界报错 —— 缺的是窗口外数据,不能猜。
+fn split_record(window: &[u8], p: usize) -> Result<(usize, RawInstr), yu_log::Diag> {
+    if p + 3 > window.len() {
+        return Err(diag::fatal(
+            code::rt::EXPR_MALFORMED,
+            Boundary::Script,
+            format!("记录头截断:窗口偏移 {p},剩 {} 字节", window.len() - p),
+        ));
+    }
+    let op = window[p];
+    let len = u16::from_le_bytes([window[p + 1], window[p + 2]]) as usize;
+    let end = p + 3 + len;
+    if end > window.len() {
+        let body = &window[p + 3..];
+        let terminated = body
+            .first()
+            .is_some_and(|&term| body[1..].contains(&term));
+        if op != 0x4d || !terminated {
             return Err(diag::fatal(
                 code::rt::EXPR_MALFORMED,
                 Boundary::Script,
@@ -844,12 +850,35 @@ pub fn decode_pooled(window: &[u8], out: &mut Vec<RawInstr>) -> Result<(), yu_lo
                 ),
             ));
         }
-        out.push(RawInstr {
+        return Ok((
+            end,
+            RawInstr {
+                offset: p,
+                op,
+                payload: body.to_vec(),
+            },
+        ));
+    }
+    Ok((
+        end,
+        RawInstr {
             offset: p,
             op,
             payload: window[p + 3..end].to_vec(),
-        });
-        p = end;
+        },
+    ))
+}
+
+/// 切分表达式记录流。
+/// `decode` 的复用外层缓冲版(逐条 payload 仍按 `RawInstr` 所有权拷贝;
+/// 语义与 `decode` 一致)。
+pub fn decode_pooled(window: &[u8], out: &mut Vec<RawInstr>) -> Result<(), yu_log::Diag> {
+    out.clear();
+    let mut p = 0usize;
+    while p < window.len() {
+        let (next, ins) = split_record(window, p)?;
+        out.push(ins);
+        p = next;
     }
     Ok(())
 }
@@ -858,32 +887,9 @@ pub fn decode(window: &[u8]) -> Result<Vec<RawInstr>, yu_log::Diag> {
     let mut out = Vec::new();
     let mut p = 0usize;
     while p < window.len() {
-        if p + 3 > window.len() {
-            return Err(diag::fatal(
-                code::rt::EXPR_MALFORMED,
-                Boundary::Script,
-                format!("记录头截断:窗口偏移 {p},剩 {} 字节", window.len() - p),
-            ));
-        }
-        let op = window[p];
-        let len = u16::from_le_bytes([window[p + 1], window[p + 2]]) as usize;
-        let end = p + 3 + len;
-        if end > window.len() {
-            return Err(diag::fatal(
-                code::rt::EXPR_MALFORMED,
-                Boundary::Script,
-                format!(
-                    "操作数越界:op={op:#04x} 偏移 {p} 声明 {len} 字节,窗口共 {}",
-                    window.len()
-                ),
-            ));
-        }
-        out.push(RawInstr {
-            offset: p,
-            op,
-            payload: window[p + 3..end].to_vec(),
-        });
-        p = end;
+        let (next, ins) = split_record(window, p)?;
+        out.push(ins);
+        p = next;
     }
     Ok(out)
 }
@@ -1194,6 +1200,28 @@ mod tests {
         ];
         let instrs = decode(&raw).expect("decode");
         assert!(lvalue_plan(&instrs).is_none());
+    }
+
+    #[test]
+    fn string_literal_tolerates_stale_operand_len() {
+        // 汉化 ybn 常见形态:0x4d 的 u16 仍是旧 CP932 串长度,新 GBK 串
+        // 更短,但终止符在窗口内。走查按声明长度前进(越过窗口即结束),
+        // 内容按终止符取。
+        let raw = [0x4d, 0x0c, 0x00, 0x22, b'a', 0x22];
+        let instrs = decode(&raw).expect("stale len accepted");
+        assert_eq!(instrs.len(), 1);
+        assert_eq!(instrs[0].op, 0x4d);
+        assert_eq!(instrs[0].payload, b"\"a\"");
+        assert_eq!(
+            decode_string_literal(&instrs[0].payload).unwrap(),
+            b"a".to_vec()
+        );
+    }
+
+    #[test]
+    fn string_literal_still_requires_terminator_in_window() {
+        let raw = [0x4d, 0x0c, 0x00, 0x22, b'a'];
+        assert!(decode(&raw).is_err());
     }
 
     #[test]
