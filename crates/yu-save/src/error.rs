@@ -30,6 +30,10 @@ pub mod code {
     pub const CONTAINER: &str = "sv.container";
     /// 图像块形状不符(SAVE[ID] 像素数 ≠ w*h*4,或块内段长自证失败)。
     pub const IMAGE_SHAPE: &str = "sv.image.shape";
+
+    /// 目标容器版本的图像块描述符布局未取证(不猜布局写盘;该图像块跳过,
+    /// 变量块照常落盘)。
+    pub const IMAGE_LAYOUT: &str = "sv.image.layout";
     /// 路径越界:目标解析后不在 save 根内(安全拒绝,不猜)。
     pub const PATH_ESCAPE: &str = "sv.path.escape";
     /// 写盘拒绝:`SAVE[SET/LET]` 的变量引用身份在 `DomainCall` 事件层丢失
@@ -57,6 +61,7 @@ pub const ALL_CODES: &[&str] = &[
     code::FILE_DELETED,
     code::CONTAINER,
     code::IMAGE_SHAPE,
+    code::IMAGE_LAYOUT,
     code::PATH_ESCAPE,
     code::WRITE_REFUSED,
     code::EXEC_REFUSED,

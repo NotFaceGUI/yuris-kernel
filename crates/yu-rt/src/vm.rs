@@ -538,6 +538,9 @@ pub struct Vm {
     sound_host: Option<Box<dyn crate::event::SoundHost>>,
     /// 存档域同步宿主(可选;SAVE 预约/刷盘 + LOAD 拉取,B1 裁 1-A/2-A)。
     save_host: Option<Box<dyn crate::event::SaveHost>>,
+    /// `TASKINFO[SCRIPTPOS]` 的线上格式(按目标存档容器版本由宿主注入;
+    /// 版本→格式的**唯一表**在 `yu_save::profile`)。缺省 = 0.480+ 形态。
+    scriptpos_wire: crate::scriptpos::ScriptPosWire,
     /// 注册表读取宿主(可选;`REGINFO`,官方 `0x44bd30`)。
     registry_host: Option<Box<dyn crate::event::RegistryHost>>,
     events: Vec<VmEvent>,
@@ -854,6 +857,7 @@ impl Vm {
             binding,
             graphics_host: None,
             sound_host: None,
+            scriptpos_wire: crate::scriptpos::WIRE_GOSUB_U8,
             save_host: None,
             registry_host: None,
             events: Vec::new(),
@@ -1201,6 +1205,16 @@ impl Vm {
     /// **调用方不得再把同一批事件 drain 后喂给同一个宿主**。
     pub fn set_sound_host(&mut self, host: Box<dyn crate::event::SoundHost>) {
         self.sound_host = Some(host);
+    }
+
+    /// 注入 `TASKINFO[SCRIPTPOS]` 的线格式(宿主按存档容器版本选定)。
+    pub fn set_scriptpos_wire(&mut self, wire: crate::scriptpos::ScriptPosWire) {
+        self.scriptpos_wire = wire;
+    }
+
+    /// 当前 `TASKINFO[SCRIPTPOS]` 线格式。
+    pub fn scriptpos_wire(&self) -> crate::scriptpos::ScriptPosWire {
+        self.scriptpos_wire
     }
 
     /// 取走声音宿主(便于宿主自己持有 `Rc` 状态)。

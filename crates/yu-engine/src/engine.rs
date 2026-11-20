@@ -3317,6 +3317,13 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
             // 探测不到 exe 时留空,由盘上 `.sd` / 压缩层默认值兜底。
             if let Some(version) = detect_save_container_version(project.root()) {
                 state.set_container_version(version);
+                // `TASKINFO[SCRIPTPOS]` 线格式与容器版本同源(0.450–0.479(0.13)
+                // = u16 GOSUB 计数,0.480+ = u8):必须与写盘档案一起注入 VM,
+                // 否则写出的任务块官方读档时脚本名错位(「417」)。
+                let wire = yu_save::profile::profile_for(version)
+                    .map(|p| p.scriptpos)
+                    .unwrap_or(yu_rt::scriptpos::WIRE_GOSUB_U8);
+                vm.set_scriptpos_wire(wire);
             }
         }
         let yscm = vm.tables().boot.yscm.clone();

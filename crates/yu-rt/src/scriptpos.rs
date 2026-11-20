@@ -1,11 +1,27 @@
 //! `SCRIPTPOS` 执行位快照:与官方引擎**线格式逐字节兼容**的编解码。
 //!
-//! # 跨版本证据(五个官方 exe 的序列化器 + 装载器)
+//! # 线格式分代(2026-11-20 以官方存档逐字节定案)
 //!
-//! 线格式不是某一版的私产:0.292 / 0.466 / 0.479 / 0.495 / v494 五版
-//! 的序列化器推进量都是 IF `0x12`、GOSUB `0x14`、LOOP `0x22` 字符,
-//! 装载器也按同一节奏消费(各版只在**任务结构体内偏移**上不同,
-//! 线上字节完全一致):
+//! 两代共有的骨架(帧宽跨版本一致,各版装载器推进量相同):
+//!
+//! ```text
+//! [magic 8B "01..08"]
+//! [if 计数 2 字符][IF 帧 ×18 字符:loop 深度 u8、entry pc u32、end pc u32]
+//! [GOSUB 计数][GOSUB 帧 ×20 字符:IF 深度 u8、loop 深度 u8、返回 pc u32、
+//!              返回脚本号 u32(装载器只取低 16 位)]
+//! [LOOP 计数 2 字符][LOOP 帧 ×34 字符:IF 深度 u8、body pc u32、end pc u32、
+//!                    counter 低 32 位、limit 低 32 位(装载器符号扩展)]
+//! [0.47x 代专属:尾部 u8 2 字符][text_line u32][pc u32][name_len u32][名字原始字节]
+//! ```
+//!
+//! **两代差异**(GOSUB 计数宽度 + 尾部 u8):
+//!
+//! | 代 | GOSUB 计数 | 尾部 u8 | 覆盖版本 | 官方证据 |
+//! |---|---|---|---|---|
+//! | [`WIRE_GOSUB_U16`] | **u16**(4 字符,高字节在前) | **有** | 0.450–0.479(0.13)(容器 `0x0C0`/`0x138`) | 0.450 `0x440515`、0.466 `0x4420bd`、0.470 `0x4428e9`、0.474 `0x448f69`、0.479 `0x449f3d/0x449f58` 均「两组 2 字符计数 + `add ecx/ebp,4`」,随后 `0x44a355` 读尾部 u8;官方 0.479 存档 2 份逐字节验证 |
+//! | [`WIRE_GOSUB_U8`] | u8(2 字符) | **无** | 0.480–0.495 / v494(容器 `0x1E0` 系) | 0.480 `0x44fa3a` 一带、0.495 `0x4511cc`(`add ebp,2`)、v494 同构;官方 0.495 存档(`data/save/save00001.sd`)按「u8 + 3×u32 + 名」精确消耗 |
+//!
+//! 装载器地址(桌面 exe,`imagebase 0x400000`):
 //!
 //! | 版本 | 序列化器 | 装载器 |
 //! |---|---|---|
@@ -15,22 +31,13 @@
 //! | 0.495 | `0x452a54` | `0x450fe0` |
 //! | v494 | `0x4528c8` | `0x450e74` |
 //!
-//! 布局(0.495 `0x452a54` 逐指令;其余版本同构):
-//! - 先写 8 字节魔数(`0x5b4090` = `01..08`);
-//! - IF 计数(1 字节)+ 每帧 18 字符:loop 深度、entry pc、end pc;
-//! - GOSUB 计数(1 字节)+ 每项 20 字符:IF 深度、loop 深度、返回 pc、
-//!   返回脚本号。**返回脚本号在线上是 4 字节**:引擎把运行期 u16 零
-//!   扩展到 u32 写出(高 2 字节恒为 `aa`),装载器消费 8 字符但只取
-//!   低 16 位写回 `+8`;
-//! - LOOP 计数(1 字节)+ 每项 34 字符:IF 深度、body pc、end pc、
-//!   counter 低 32 位、limit 低 32 位(装载器符号扩展到 i64);
-//! - `task+0xc`(文本行,u32)、`task+0x20`(pc,u32)、脚本名长度(u32)
-//!   + 原始脚本名字节。装载器把超过 `0x106` 的名字长度截到 `0x106`。
+//! # 为什么分代必须显式
 //!
-//! 0.495 的帧字段来源:IF `0x4462d0` / LOOP `0x447ef0` / GOSUB `0x4459c4`;
-//! 写回字段:`task+0x3e`(IF 深度)、`task+0x140`(GOSUB 深度)、
-//! `task+0x244`(LOOP 深度)、三个帧数组、`task+0xc`、`task+0x20`,
-//! 并用脚本名在 `0x801850` 名字表里 strcmp 找回 `task+0x3c`。
+//! 旧内核只实现了「u8 计数 + 无尾部」:对 0.495 恰好正确,但写 0.479
+//! 工程时官方读档会在脚本名处错位 4 字符(报「`2\script\...` が
+//! 存在しません」—— `kuro` 被吃掉),反向读 0.479 官方档同样错位。
+//! 版本→格式的**唯一表**在 `yu_save::profile`(`SaveProfile::scriptpos`),
+//! 由宿主在开机时注入 [`crate::vm::Vm::set_scriptpos_wire`]。
 //!
 //! # 字符编码
 //!
@@ -86,6 +93,44 @@ pub struct LoopEntry {
     pub limit: i64,
 }
 
+/// SCRIPTPOS 线格式代数(两代只有 GOSUB 计数宽度不同)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScriptPosWire {
+    /// GOSUB 帧计数的线上宽度。
+    pub gosub_count: GosubCount,
+    /// `text_line` 之前是否有尾部 u8(2 字符)。全部已取证版本都有;
+    /// 保留开关以便将来遇到缺此字节的极老版本。
+    pub tail_byte: bool,
+}
+
+/// GOSUB 帧计数的线上宽度。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GosubCount {
+    /// 2 字符(1 字节):0.480 起(0.480 `0x44fa3a` 一带 `add ebp,2`)、
+    /// 0.495 `0x4511cc`、v494 同构。
+    U8,
+    /// 4 字符(2 字节,u16 高字节在前):0.450 `0x440515`、0.466
+    /// `0x4420bd`、0.470 `0x4428e9`、0.474 `0x448f69`、0.479
+    /// `0x449f3d/0x449f58` 均为「读两组 2 字符 + `add ecx/ebp,4`」。
+    U16,
+}
+
+/// 0.450–0.479(0.13)(容器 `0x0C0`/`0x138`):u16 GOSUB 计数 + 尾部 u8。
+pub const WIRE_GOSUB_U16: ScriptPosWire = ScriptPosWire {
+    gosub_count: GosubCount::U16,
+    tail_byte: true,
+};
+
+/// 0.480–0.495 / v494(容器 `0x1E0` 系):u8 GOSUB 计数、**无**尾部 u8。
+///
+/// 证据:0.495 官方存档(`target/sdk/0.495/.../data/save/save00001.sd`,
+/// 容器 `0x1E0`)的 DNO=11 任务块按「u8 计数 + 3×u32 + 名」恰好精确
+/// 消耗;加尾部 u8 会读出错误 name_len。旧内核的线格式本就匹配这一代。
+pub const WIRE_GOSUB_U8: ScriptPosWire = ScriptPosWire {
+    gosub_count: GosubCount::U8,
+    tail_byte: false,
+};
+
 /// 一个任务的完整执行位快照。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScriptPos {
@@ -98,11 +143,35 @@ pub struct ScriptPos {
     pub pc: u32,
     /// 引擎 `0x801850[task+0x3c]` 的脚本路径原始字节(CP932)。
     pub script_name: Vec<u8>,
+    /// 线上 `text_line` 之前的尾部 u8(2 字符)。
+    ///
+    /// 0.495 装载器 `0x451380` 先读 2 字符存入 `[eax]`,0.479 装载器
+    /// `0x44a369` 存入 `+0xa70`;**两版都有**,官方样本该值恒 0。语义
+    /// 未取证(旧内核漏写这一字节,导致写出的档官方读取时整体错位 4 字符,
+    /// 脚本名首 4 字节被吃掉 —— 「417」)。
+    pub tail_byte: u8,
 }
 
 impl ScriptPos {
-    /// 按引擎 `0x452a54` 的布局编码。
+    /// 按引擎 `0x452a54` 的布局编码(0.495/u8 GOSUB 计数,旧默认)。
     pub fn encode(&self) -> Result<Vec<u8>, String> {
+        self.encode_with(WIRE_GOSUB_U8)
+    }
+
+    /// 按目标写盘档案的线格式编码。
+    ///
+    /// 版本→线格式的**唯一表**在 `yu_save::profile`(取值即本模块的
+    /// [`WIRE_GOSUB_U16`] / [`WIRE_GOSUB_U8`])。
+    ///
+    /// 两代共有:magic(8B)→if 计数(2 字符)→IF 帧(18 字符)→ GOSUB 计数
+    /// →GOSUB 帧(20 字符)→LOOP 计数(2 字符)→LOOP 帧(34 字符)→
+    /// 尾部 u8(2 字符)→`text_line`/`pc`/`name_len`(各 4 字节)→脚本名。
+    #[must_use]
+    pub fn encode_with_wire(&self, wire: ScriptPosWire) -> Result<Vec<u8>, String> {
+        self.encode_with(wire)
+    }
+
+    fn encode_with(&self, wire: ScriptPosWire) -> Result<Vec<u8>, String> {
         if self.if_entries.len() > u8::MAX as usize
             || self.gosub_entries.len() > u8::MAX as usize
             || self.loop_entries.len() > u8::MAX as usize
@@ -134,7 +203,16 @@ impl ScriptPos {
             push_u32(&mut out, e.entry_pc);
             push_u32(&mut out, e.end_pc);
         }
-        push_byte(&mut out, self.gosub_entries.len() as u8);
+        match wire.gosub_count {
+            GosubCount::U16 => {
+                // GOSUB 计数按 u16 写(4 字符,高字节在前;0.479 序列化器
+                // `0x44b924`/`0x44b948` 对应 task+0x24c/+0x24d)。
+                let n = self.gosub_entries.len() as u16;
+                push_byte(&mut out, (n >> 8) as u8);
+                push_byte(&mut out, n as u8);
+            }
+            GosubCount::U8 => push_byte(&mut out, self.gosub_entries.len() as u8),
+        }
         for e in &self.gosub_entries {
             push_byte(&mut out, e.if_depth);
             push_byte(&mut out, e.loop_depth);
@@ -153,6 +231,12 @@ impl ScriptPos {
             push_u32(&mut out, e.counter as u32);
             push_u32(&mut out, e.limit as u32);
         }
+        // 尾部 u8:0.495 装载器 `0x451380` / 0.479 装载器 `0x44a369`
+        // 在 text_line 之前先读 2 字符。旧内核漏写此字节,官方读出的
+        // 脚本名整体前移 4 字符(「417」的根因)。
+        if wire.tail_byte {
+            push_byte(&mut out, self.tail_byte);
+        }
         push_u32(&mut out, self.text_line);
         push_u32(&mut out, self.pc);
         push_u32(&mut out, self.script_name.len() as u32);
@@ -169,6 +253,48 @@ impl ScriptPos {
                 "SCRIPTPOS: 旧内核 8 字节 blob 不兼容;需要用 0.495 引擎串或重新生成存档".into(),
             );
         }
+        Self::decode_for_wire(blob, WIRE_GOSUB_U8).map(|(sp, _)| sp)
+    }
+
+    /// 优先按给定线格式解析,失败再试另一代;返回识别出的线格式。
+    ///
+    /// 最后回退旧内核布局(缺尾部 u8;2026-11 前写出的自家档)。
+    /// 判定依据是**严格消耗完整个 blob**(官方串无填充)。
+    pub fn decode_for_wire(
+        blob: &[u8],
+        preferred: ScriptPosWire,
+    ) -> Result<(Self, Option<ScriptPosWire>), String> {
+        if blob.len() == 8 && blob != MAGIC {
+            return Err(
+                "SCRIPTPOS: 旧内核 8 字节 blob 不兼容;需要用 0.495 引擎串或重新生成存档".into(),
+            );
+        }
+        // 显式尝试**两代规范线格式**(计数宽度与尾部字节成套,不能只换宽度),
+        // 当前版本对应的代优先。
+        let order: [ScriptPosWire; 2] = if preferred == WIRE_GOSUB_U16 {
+            [WIRE_GOSUB_U16, WIRE_GOSUB_U8]
+        } else {
+            [WIRE_GOSUB_U8, WIRE_GOSUB_U16]
+        };
+        let mut first_err: Option<String> = None;
+        for wire in order {
+            match Self::decode_with(blob, wire) {
+                Ok(sp) => return Ok((sp, Some(wire))),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        // 旧内核布局(缺尾部 u8):自家旧档兼容读。
+        if let Ok(sp) = Self::decode_legacy(blob) {
+            return Ok((sp, None));
+        }
+        Err(first_err.unwrap_or_else(|| "SCRIPTPOS: 无法识别线格式".into()))
+    }
+
+    fn decode_with(blob: &[u8], wire: ScriptPosWire) -> Result<Self, String> {
         let mut cur = Reader { data: blob, pos: 0 };
         if cur.take(MAGIC.len())? != MAGIC {
             return Err("SCRIPTPOS: 魔数不符(不是引擎执行位快照)".into());
@@ -182,7 +308,15 @@ impl ScriptPos {
                 end_pc: cur.u32()?,
             });
         }
-        let gosub_n = cur.byte()? as usize;
+        // 0.479:gosub 计数是 u16(4 字符);高字节在装载器里只落
+        // `task+0x24c`(无对应帧),这里与引擎一致丢弃,只取低字节作帧数。
+        let gosub_n = match wire.gosub_count {
+            GosubCount::U16 => {
+                let _hi = cur.byte()?;
+                cur.byte()? as usize
+            }
+            GosubCount::U8 => cur.byte()? as usize,
+        };
         let mut gosub_entries = Vec::with_capacity(gosub_n);
         for _ in 0..gosub_n {
             gosub_entries.push(GosubEntry {
@@ -205,6 +339,7 @@ impl ScriptPos {
                 limit: i64::from(cur.u32()? as i32),
             });
         }
+        let tail_byte = if wire.tail_byte { cur.byte()? } else { 0 };
         let text_line = cur.u32()?;
         let pc = cur.u32()?;
         let mut name_len = cur.u32()? as usize;
@@ -213,6 +348,13 @@ impl ScriptPos {
             name_len = MAX_SCRIPT_NAME;
         }
         let script_name = cur.take(name_len)?.to_vec();
+        if cur.pos != blob.len() {
+            return Err(format!(
+                "SCRIPTPOS: 线格式({wire:?})未精确消耗:读 {} / 总 {}",
+                cur.pos,
+                blob.len()
+            ));
+        }
         Ok(Self {
             if_entries,
             gosub_entries,
@@ -220,6 +362,69 @@ impl ScriptPos {
             text_line,
             pc,
             script_name,
+            tail_byte,
+        })
+    }
+
+    /// 旧内核布局(缺尾部 u8,2026-11 前写出的自家档):无严格校验,
+    /// 仅在严格格式都失败时兜底。
+    fn decode_legacy(blob: &[u8]) -> Result<Self, String> {
+        let mut cur = Reader { data: blob, pos: 0 };
+        if cur.take(MAGIC.len())? != MAGIC {
+            return Err("SCRIPTPOS: 魔数不符".into());
+        }
+        let if_n = cur.byte()? as usize;
+        let mut if_entries = Vec::with_capacity(if_n);
+        for _ in 0..if_n {
+            if_entries.push(IfEntry {
+                loop_depth: cur.byte()?,
+                entry_pc: cur.u32()?,
+                end_pc: cur.u32()?,
+            });
+        }
+        let gosub_n = cur.byte()? as usize;
+        let mut gosub_entries = Vec::with_capacity(gosub_n);
+        for _ in 0..gosub_n {
+            gosub_entries.push(GosubEntry {
+                if_depth: cur.byte()?,
+                loop_depth: cur.byte()?,
+                return_pc: cur.u32()?,
+                return_script: cur.u32()? as u16,
+            });
+        }
+        let loop_n = cur.byte()? as usize;
+        let mut loop_entries = Vec::with_capacity(loop_n);
+        for _ in 0..loop_n {
+            loop_entries.push(LoopEntry {
+                if_depth: cur.byte()?,
+                body_pc: cur.u32()?,
+                end_pc: cur.u32()?,
+                counter: i64::from(cur.u32()? as i32),
+                limit: i64::from(cur.u32()? as i32),
+            });
+        }
+        let text_line = cur.u32()?;
+        let pc = cur.u32()?;
+        let mut name_len = cur.u32()? as usize;
+        if name_len > MAX_SCRIPT_NAME {
+            name_len = MAX_SCRIPT_NAME;
+        }
+        let script_name = cur.take(name_len)?.to_vec();
+        if cur.pos != blob.len() {
+            return Err(format!(
+                "SCRIPTPOS: 旧内核布局未精确消耗:读 {} / 总 {}",
+                cur.pos,
+                blob.len()
+            ));
+        }
+        Ok(Self {
+            if_entries,
+            gosub_entries,
+            loop_entries,
+            text_line,
+            pc,
+            script_name,
+            tail_byte: 0,
         })
     }
 }
@@ -283,7 +488,7 @@ mod tests {
         let sp = ScriptPos::default();
         let blob = sp.encode().expect("encode");
         let mut expect = MAGIC.to_vec();
-        // IF/GOSUB/LOOP 三个深度字节 0 → 各 "aa"。
+        // IF/GOSUB/LOOP 三个计数 0 → 各 "aa"。
         expect.extend_from_slice(b"aaaaaa");
         // text_line / pc / name_len 三个 u32 0 → 各 8 个 'a'。
         expect.extend(std::iter::repeat_n(b'a', 24));
@@ -308,7 +513,7 @@ mod tests {
         // loop_depth 0("aa") + entry_pc 0x0000000A("aaaaaaak") = 9 个 'a' + 'k'
         expect.extend_from_slice(b"aaaaaaaaak");
         expect.extend_from_slice(b"aaaaaaal"); // end pc 0x0B
-        expect.extend_from_slice(b"aaaa"); // GOSUB/LOOP 深度 0
+        expect.extend_from_slice(b"aaaa"); // GOSUB/LOOP 计数 0
         expect.extend(std::iter::repeat_n(b'a', 24)); // 三个 u32 0
         assert_eq!(blob, expect);
         assert_eq!(ScriptPos::decode(&blob).unwrap(), sp);
@@ -345,6 +550,7 @@ mod tests {
             text_line: 0x7fff_ffff,
             pc: 0x8000_0000,
             script_name: b"data\\script\\eris\\stdlib\\ystdlib.yst".to_vec(),
+            tail_byte: 0,
         };
         let blob = sp.encode().expect("encode");
         assert_eq!(
@@ -480,5 +686,99 @@ mod tests {
             ..Default::default()
         };
         assert!(sp.encode().is_err());
+    }
+
+    /// **官方 0.479 存档逐字节回归**(黒獣2 `save00001.sd` DNO=11):
+    /// u16 GOSUB 计数 + 尾部 u8 的线格式;解码字段与再编码字节必须全等。
+    ///
+    /// 证据:0.479 装载器 `0x449d7c`(`0x449f3d/0x449f58` 两组 2 字符计数
+    /// →`task+0x24c/+0x24d`,`0x44a369` 尾部 u8,`0x44a36f..` 三 u32,
+    /// 最后原样拷脚本名到 `+0x106` 上限缓冲)。
+    #[test]
+    fn official_0479_task_blob_roundtrips_byte_exact() {
+        const BLOB: [u8; 82] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+            0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x6d, 0x61, 0x61,
+            0x61, 0x61, 0x61, 0x61, 0x65, 0x64, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x63, 0x69,
+            0x6b, 0x75, 0x72, 0x6f, 0x32, 0x5c, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x5c, 0x75,
+            0x73, 0x65, 0x72, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x5c, 0x6e, 0x65, 0x77, 0x5c,
+            0x30, 0x30, 0x5f, 0x6f, 0x70, 0x30, 0x30, 0x31, 0x2e, 0x74, 0x78, 0x74,
+        ];
+        let (sp, wire) =
+            ScriptPos::decode_for_wire(&BLOB, WIRE_GOSUB_U16).expect("官方 0.479 任务块");
+        assert_eq!(wire.map(|w| w.gosub_count), Some(GosubCount::U16));
+        assert!(sp.if_entries.is_empty());
+        assert!(sp.gosub_entries.is_empty());
+        assert!(sp.loop_entries.is_empty());
+        assert_eq!(sp.tail_byte, 0);
+        assert_eq!(sp.text_line, 12);
+        assert_eq!(sp.pc, 67);
+        assert_eq!(sp.script_name, br"kuro2\script\userscript\new\00_op001.txt");
+        assert_eq!(sp.encode_with_wire(WIRE_GOSUB_U16).unwrap(), BLOB);
+    }
+
+    /// 官方 0.479 存档(黒獣2 `save00002.sd` DNO=11):GOSUB 栈非空
+    /// (2 帧,u16 计数);解码与再编码全等。
+    #[test]
+    fn official_0479_task_blob_with_gosub_frames_roundtrips() {
+        const BLOB: [u8; 115] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x61, 0x61, 0x61, 0x61, 0x61, 0x63,
+            0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x62, 0x6c, 0x61, 0x61,
+            0x61, 0x61, 0x61, 0x61, 0x69, 0x66, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+            0x62, 0x64, 0x70, 0x70, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x62, 0x6c, 0x61, 0x61,
+            0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+            0x61, 0x62, 0x65, 0x6b, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x63, 0x62, 0x6b, 0x75,
+            0x72, 0x6f, 0x32, 0x5c, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x5c, 0x65, 0x72, 0x69,
+            0x73, 0x5c, 0x65, 0x73, 0x5f, 0x73, 0x63, 0x65, 0x6e, 0x61, 0x72, 0x69, 0x6f, 0x2e,
+            0x79, 0x73, 0x74,
+        ];
+        let (sp, _) = ScriptPos::decode_for_wire(&BLOB, WIRE_GOSUB_U16).expect("官方 0.479 任务块");
+        assert_eq!(sp.gosub_entries.len(), 2);
+        assert_eq!(sp.pc, 330);
+        assert_eq!(sp.script_name, br"kuro2\script\eris\es_scenario.yst");
+        assert_eq!(sp.encode_with_wire(WIRE_GOSUB_U16).unwrap(), BLOB);
+    }
+
+    /// 写错代(GOSUB 宽度)必须被严格消耗校验拒绝,不能静默读出垃圾。
+    #[test]
+    fn wrong_wire_generation_is_rejected() {
+        const BLOB: [u8; 115] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x61, 0x61, 0x61, 0x61, 0x61, 0x63,
+            0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x62, 0x6c, 0x61, 0x61,
+            0x61, 0x61, 0x61, 0x61, 0x69, 0x66, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+            0x62, 0x64, 0x70, 0x70, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x62, 0x6c, 0x61, 0x61,
+            0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+            0x61, 0x62, 0x65, 0x6b, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x63, 0x62, 0x6b, 0x75,
+            0x72, 0x6f, 0x32, 0x5c, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x5c, 0x65, 0x72, 0x69,
+            0x73, 0x5c, 0x65, 0x73, 0x5f, 0x73, 0x63, 0x65, 0x6e, 0x61, 0x72, 0x69, 0x6f, 0x2e,
+            0x79, 0x73, 0x74,
+        ];
+        assert!(ScriptPos::decode_with(&BLOB, WIRE_GOSUB_U8).is_err());
+    }
+
+    /// **官方 0.495 存档逐字节回归**(SDK `data/save/save00001.sd`,容器
+    /// `0x1E0`,DNO=11):u8 GOSUB 计数、**无**尾部 u8;解码与再编码全等。
+    ///
+    /// 证据:0.495 装载器 `0x450fe0`(`add ebp,2` 单计数,`add ebp,0x14`
+    /// GOSUB 帧,`add ebp,0x22` LOOP 帧);样本精确消耗反证无尾部字节。
+    #[test]
+    fn official_0495_task_blob_roundtrips_byte_exact() {
+        const BLOB: [u8; 90] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x61, 0x61, 0x61, 0x62, 0x61, 0x61,
+            0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x63, 0x61, 0x61, 0x61, 0x61,
+            0x61, 0x61, 0x69, 0x63, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+            0x61, 0x61, 0x61, 0x61, 0x61, 0x62, 0x65, 0x6b, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+            0x63, 0x61, 0x64, 0x61, 0x74, 0x61, 0x5c, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x5c,
+            0x65, 0x72, 0x69, 0x73, 0x5c, 0x65, 0x73, 0x5f, 0x73, 0x63, 0x65, 0x6e, 0x61, 0x72,
+            0x69, 0x6f, 0x2e, 0x79, 0x73, 0x74,
+        ];
+        let (sp, wire) =
+            ScriptPos::decode_for_wire(&BLOB, WIRE_GOSUB_U8).expect("官方 0.495 任务块");
+        assert_eq!(wire.map(|w| w.gosub_count), Some(GosubCount::U8));
+        assert!(sp.if_entries.is_empty());
+        assert_eq!(sp.gosub_entries.len(), 1);
+        assert_eq!(sp.pc, 330);
+        assert_eq!(sp.script_name, br"data\script\eris\es_scenario.yst");
+        assert_eq!(sp.encode_with_wire(WIRE_GOSUB_U8).unwrap(), BLOB);
     }
 }

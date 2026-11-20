@@ -2718,6 +2718,7 @@ fn task_scrip_pos_restores_full_exec_state() {
         text_line: 7,
         pc: 0,
         script_name: b"data\\script\\fixture0000.yst".to_vec(),
+        tail_byte: 0,
     };
     let raw = synthetic.encode().expect("encode synthetic SCRIPTPOS");
     let mut vm = boot(b);
@@ -6666,6 +6667,125 @@ fn save_load_loop_records_reserve_flush_and_writes_back() {
     assert_eq!(let_ref.reference, Some(VarRef::new(VarSpace::At, sys + 1)));
 }
 
+/// `SAVE[DNO SET=@x[i][j]]`:块内容 = 该下标处的**标量元素**,不是整组。
+///
+/// 0.479 官方 save00001 DNO=2 实证:脚本目标 `@0x45d[0x8d][1]` 存成
+/// Int 标量 14,而变量本身是 Int[256,128]。旧实现忽略 `lv.indices`、
+/// 快照整组 → 块变 Int[256,128],官方 QLOAD 的严格维数比对失败
+/// (`FUN_00440490` 0x440c22..),qsave 官方读不了。
+#[test]
+fn save_set_on_array_element_reserves_scalar_snapshot() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![3, 4],
+        init: Init::Int(5),
+    }];
+    let op_save = b.commands.iter().position(|(n, _)| *n == "SAVE").unwrap() as u8;
+    let op_saveend = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "SAVEEND")
+        .unwrap() as u8;
+    // `@x[1][2]` 的真实字节形:ref, 1, 0x2c(组分隔), 2, 0x29(取值)。
+    let elem = ex::cat(&[
+        ex::r#ref(0x40, sys),
+        ex::i8_(1),
+        ex::op(0x2c),
+        ex::i8_(2),
+        ex::aload(),
+    ]);
+    let groups = vec![
+        GroupSpec::new(op_save)
+            .window(1, ex::i8_(2))
+            .window(2, elem),
+        GroupSpec::new(op_saveend),
+        GroupSpec::new(OP_END),
+    ];
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let recorder = SaveRecorder::new();
+    let reply = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let mut vm = boot(b);
+    vm.set_save_host(Box::new(SharedHost {
+        inner: recorder.clone(),
+        reply,
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let rec = recorder.borrow();
+    assert_eq!(rec.reserves.len(), 1, "{:?}", rec.reserves);
+    let (dno, var, snap) = &rec.reserves[0];
+    assert_eq!(*dno, 2);
+    assert_eq!(*var, VarRef::new(VarSpace::At, sys));
+    assert!(
+        snap.dims.is_empty(),
+        "数组元素必须写标量块,实际 dims={:?}",
+        snap.dims
+    );
+    assert_eq!(snap.data, vec![Value::Int(5)]);
+}
+
+/// `LOAD[LET=@x[i][j]]`:标量块只写该元素,其余元素保持原值。
+/// 与 `save_set_on_array_element_reserves_scalar_snapshot` 成对;旧实现
+/// 把整块写回整个变量(元素数不符 → 恢复被拒),qload 丢变量。
+#[test]
+fn load_into_array_element_writes_only_that_element() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![3, 4],
+        init: Init::Int(5),
+    }];
+    let op_load = b.commands.iter().position(|(n, _)| *n == "LOAD").unwrap() as u8;
+    let elem = ex::cat(&[
+        ex::r#ref(0x40, sys),
+        ex::i8_(1),
+        ex::op(0x2c),
+        ex::i8_(2),
+        ex::aload(),
+    ]);
+    let groups = vec![
+        GroupSpec::new(op_load)
+            .window(0, ex::s("elem.sd"))
+            .window(1, ex::i8_(1))
+            .window(2, elem),
+        GroupSpec::new(OP_END),
+    ];
+    b.scripts = vec![groups];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let recorder = SaveRecorder::new();
+    let reply = std::rc::Rc::new(std::cell::RefCell::new(Some(LoadedBlock {
+        vars: vec![LoadedVar {
+            var: None,
+            snap: int_snap(&[42], &[]),
+        }],
+    })));
+    let mut vm = boot(b);
+    vm.set_save_host(Box::new(SharedHost {
+        inner: recorder.clone(),
+        reply,
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let var = VarRef::new(VarSpace::At, sys);
+    assert_eq!(vm.store().read(var, &[1, 2]).unwrap(), Value::Int(42));
+    assert_eq!(vm.store().read(var, &[0, 0]).unwrap(), Value::Int(5));
+    assert_eq!(vm.store().read(var, &[2, 3]).unwrap(), Value::Int(5));
+}
+
 /// 存档脚本的「先删旧槽(pc315)、再 `SAVE[FILE]`(pc341)」必须在同一帧里
 /// 保持**命令顺序**:`FILEACT` 事件由 `Vm::emit` 在命令时刻同步喂宿主,
 /// 不能落到帧末 drain;否则删除晚于同步刷盘,刚写出的存档会被删
@@ -7157,17 +7277,22 @@ fn textinfo_cx_cy_follow_layout_cursor() {
     // 合成样本没有 gfx 层;注入目标层表面尺寸(引擎在 tick 前从 gfx 查询)。
     vm.set_text_window(Some((800, 600)));
     vm.tick_at(0, &no_input());
-    assert_eq!(vm.text_state().flags, vec![0x31, 0x31, b'R', b'E'], "flags after tick1");
-    let after1 = vm.text_state();
     assert_eq!(
-        (after1.cursor_x, after1.cursor_y),
-        (0, 0),
-        "tick1 尚未布局"
+        vm.text_state().flags,
+        vec![0x31, 0x31, b'R', b'E'],
+        "flags after tick1"
     );
+    let after1 = vm.text_state();
+    assert_eq!((after1.cursor_x, after1.cursor_y), (0, 0), "tick1 尚未布局");
     vm.tick_at(16, &no_input());
     let dbg = vm.text_state();
     assert_eq!(
-        (dbg.cursor_x, dbg.cursor_y, dbg.reveal_flags, dbg.bytes.len()),
+        (
+            dbg.cursor_x,
+            dbg.cursor_y,
+            dbg.reveal_flags,
+            dbg.bytes.len()
+        ),
         (0, 20, 0, 0),
         "layout cursor/flags after tick2"
     );

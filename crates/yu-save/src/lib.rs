@@ -7,6 +7,7 @@
 //! | [`error`] | 诊断码 | `sv.*` 稳定码表 |
 //! | [`state`] | 状态机 | 槽表(盘上事实)+ SAVE/LOAD/SAVEEND/FILEACT 事实消费 |
 //! | [`host`] | 接线 | `SaveHost`(Engine 侧驱动,不加 `yu-rt` trait) |
+//! | [`profile`] | 版本档案 | 容器版本 → 写盘策略(图像块布局/var_id/SCRIPTPOS)的**唯一表** |
 //!
 //! 字节级事实归 [`yu_format::yssd`](yu_format::yssd)(存档容器,官方
 //! 产物逐字节 roundtrip);本 crate 只做域状态与事件事实。
@@ -32,10 +33,12 @@ pub mod error;
 pub mod fs;
 pub mod host;
 pub mod image_block;
+pub mod profile;
 pub mod state;
 
 pub use fs::{FsEntry, NativeSaveFs, SaveFs, SaveFsHandle};
 pub use host::SaveHost;
+pub use profile::{Btype0VarId, SaveProfile};
 pub use state::{ReservedFact, SaveSnapshot, SaveState, SlotFile};
 
 /// 存档根物化(平台端口):目标平台有真实文件系统时实际建目录

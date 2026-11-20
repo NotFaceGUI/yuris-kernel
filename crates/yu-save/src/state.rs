@@ -494,18 +494,35 @@ impl SaveState {
         let mut writer = yu_format::yssd::YssdWriter::new(version);
         // 压缩层沿用同目录存档(0.495 = zlib;0.481 商业包 = Snappy);
         // 还没见过任何存档时用 zlib,与 0.495 官方产物逐字节一致。
+        // 版本相关写盘策略的**唯一来源**是 `profile` 表:
+        // 图像块布局(0.479 = A1536/w·h@+0x70;0.474/0.495/0.481 系 =
+        // A1600/w·h@+0x78)与块类型 0 的 var_id 策略。官方 0.479 LOAD 会
+        // 硬校验 A==0x600,写错布局的缩略图会让整份存档被拒收。
+        // 未取证版本不猜:跳过图像块并挂号,变量块照常落盘。
+        let save_profile = crate::profile::profile_for(version);
+        let image_layout = save_profile.and_then(|p| p.image_layout);
+        let btype0_var_id = save_profile.map(|p| p.btype0_var_id);
+        let mut image_layout_diags: Vec<Diag> = Vec::new();
         for fact in self.reservations.values() {
             match fact.btype {
                 0 => {
                     let Some(snap) = &fact.snap else { continue };
                     let payload = snapshot_payload(snap)?;
+                    // 块类型 0 的 var_id 按版本档案:0.479 官方写 0,
+                    // 0.495 系写实际变量 id(真实存档逐块对照)。
+                    // LOAD 不消费该字段,但对齐后与官方产物同形。
+                    // 未取证版本保守写实际 id(不丢信息,官方 LOAD 仍忽略)。
+                    let var_id = match btype0_var_id {
+                        Some(crate::profile::Btype0VarId::Zero) => 0,
+                        _ => fact.var_id,
+                    };
                     writer.set_block(
                         fact.dno,
                         yu_format::yssd::encode_block_body_with(
                             codec,
                             0,
                             1,
-                            fact.var_id,
+                            var_id,
                             &payload.to_bytes(),
                         ),
                     );
@@ -530,7 +547,18 @@ impl SaveState {
                 }
                 1 => {
                     let Some(image) = &fact.image else { continue };
-                    let raw = crate::image_block::encode(image);
+                    let Some(layout) = image_layout else {
+                        image_layout_diags.push(error::recoverable(
+                            code::IMAGE_LAYOUT,
+                            format!(
+                                "SAVE[FILE={file}] DNO={}: 容器版本 {version:#x} 的图像块 \
+                                 描述符布局未取证,跳过该缩略图块(变量块照常写盘)",
+                                fact.dno
+                            ),
+                        ));
+                        continue;
+                    };
+                    let raw = crate::image_block::encode(image, layout);
                     writer.set_block(
                         fact.dno,
                         yu_format::yssd::encode_block_body_with(codec, 1, 1, 0, &raw),
@@ -555,6 +583,9 @@ impl SaveState {
             )
         })?;
         self.refresh_slots();
+        for diag in image_layout_diags {
+            self.push_diag(diag);
+        }
         Ok(())
     }
 
@@ -645,8 +676,14 @@ impl SaveState {
     /// `LOAD[FILE DNO=n ID=图层]`:读回图像块(btype 1)。
     ///
     /// 载荷格式见 [`crate::image_block`];读取端同时接受 0.495 与 0.479 的
-    /// 表头偏移(以段长自证),官方读取端 `0x4477c0` 校验首 u32 是 `0x640`。
-    pub fn load_image(&mut self, file: &str, dno: u32) -> Result<yu_rt::event::CapturedImage, Diag> {
+    /// 描述符布局(以 A 段长度做版本指纹 + `w*h*4 == B` 自证):
+    /// 0.479 官方读取端校验首 u32 是 `0x600`、w/h 在 `+0x70`
+    /// (`FUN_00440490` 0x440894..);0.495 是 `0x640`、`+0x78`。
+    pub fn load_image(
+        &mut self,
+        file: &str,
+        dno: u32,
+    ) -> Result<yu_rt::event::CapturedImage, Diag> {
         self.load_calls += 1;
         let path = self.confined_path(file)?;
         let bytes = match self.fs.read(&path) {
@@ -1570,6 +1607,110 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/tmp")
             .join(name)
+    }
+    /// 官方 0.479(0x138)的缩略图块布局必须跟着容器版本走:
+    /// A=1536、w/h 在 +0x70,且块类型 0 的 var_id 按官方写 0。
+    /// 官方 0.479 LOAD 硬校验 `payload[0] == 0x600`(exe 0x440894)。
+    #[test]
+    fn image_block_uses_0479_layout_when_container_is_0138() {
+        let root = temp_root("sv-unit-image-0479");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut state = SaveState::new(&root, true);
+        state.set_container_version(0x0138);
+        let image = yu_rt::event::CapturedImage {
+            width: 137,
+            height: 102,
+            rgba: vec![0x11; 137 * 102 * 4],
+        };
+        state.reserve_image(3, &image).expect("reserve");
+        state
+            .reserve(
+                1,
+                VarRef::new(VarSpace::At, 2264),
+                &int_snapshot(&[7], &[1]),
+            )
+            .expect("reserve int");
+        state.flush("thumb0479.sd").expect("flush");
+        let bytes = std::fs::read(root.join("thumb0479.sd")).unwrap();
+        let save = yu_format::yssd::YssdSave::parse(&bytes, b"thumb0479.sd").unwrap();
+        let entry = save.entry(3).expect("DNO3");
+        assert_eq!(entry.btype, 1);
+        let raw = entry.decompress(b"thumb0479.sd").unwrap();
+        assert_eq!(&raw[0..4], &1536u32.to_le_bytes());
+        assert_eq!(&raw[4..8], &(137u32 * 102 * 4).to_le_bytes());
+        let a = &raw[8..8 + 1536];
+        assert_eq!(u32::from_le_bytes(a[0x70..0x74].try_into().unwrap()), 137);
+        assert_eq!(u32::from_le_bytes(a[0x74..0x78].try_into().unwrap()), 102);
+        assert_eq!(
+            save.entry(1).expect("DNO1").var_id,
+            0,
+            "0.479 官方块类型 0 的 var_id 写 0"
+        );
+        let back = state.load_image("thumb0479.sd", 3).expect("load_image");
+        assert_eq!(back, image);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 未取证版本的图像块不猜布局:跳过缩略图并挂号,变量块仍写盘。
+    #[test]
+    fn image_block_is_skipped_for_unknown_container_version() {
+        let root = temp_root("sv-unit-image-unknown");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut state = SaveState::new(&root, true);
+        state.set_container_version(0x0555);
+        let image = yu_rt::event::CapturedImage {
+            width: 2,
+            height: 2,
+            rgba: vec![0x22; 16],
+        };
+        state.reserve_image(3, &image).expect("reserve");
+        state
+            .reserve(
+                1,
+                VarRef::new(VarSpace::At, 2264),
+                &int_snapshot(&[7], &[1]),
+            )
+            .expect("reserve int");
+        state.flush("thumb-unknown.sd").expect("flush");
+        let bytes = std::fs::read(root.join("thumb-unknown.sd")).unwrap();
+        let save = yu_format::yssd::YssdSave::parse(&bytes, b"thumb-unknown.sd").unwrap();
+        assert!(save.entry(1).is_some(), "变量块必须照常落盘");
+        assert!(save.entry(3).is_none(), "未知布局的图像块必须跳过");
+        assert!(
+            state
+                .take_diags()
+                .iter()
+                .any(|d| d.code == code::IMAGE_LAYOUT),
+            "跳过图像块必须挂号 sv.image.layout"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 官方 0.479(0x138)`save00001.sd` 的 DNO=3 必须解成真实尺寸。
+    /// 样本来源:`YURIS_SAMPLE_SAVE0479` = 含 `save00001.sd` 的 `save/` 目录
+    /// (本机实测 `<0.479 商业样本 A>` 与 `<0.474 旧运行时样本>` 均为 137×102 / 152×114)。缺样本显式
+    /// skip 并打印,不空跑通过。
+    #[test]
+    fn official_0479_thumbnail_honours_descriptor_wh_offset() {
+        let Some(dir) = std::env::var_os("YURIS_SAMPLE_SAVE0479") else {
+            println!("SKIP[yssd] 未设置 YURIS_SAMPLE_SAVE0479(0.479 官方存档样本目录)");
+            return;
+        };
+        let path = PathBuf::from(dir).join("save00001.sd");
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("0.479 官方 save00001.sd 不可读({e}): {}", path.display()));
+        let root = temp_root("sv-official-thumb-0479");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("save00001.sd"), &bytes).unwrap();
+        let mut state = SaveState::new(&root, false);
+        let image = state.load_image("save00001.sd", 3).expect("DNO3");
+        // A=1536 的官方描述符 w/h 在 +0x70;旧读端按 +0x68/+0x78 找会失败。
+        assert!(image.width > 0 && image.height > 0);
+        assert_eq!(image.rgba.len(), (image.width * image.height * 4) as usize);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

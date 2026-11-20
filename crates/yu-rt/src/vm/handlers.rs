@@ -699,10 +699,7 @@ impl Vm {
                 Ok(StepOutcome::Continue)
             }
             HandlerKind::Unknown => {
-                self.report_unimplemented(
-                    &cmd.name,
-                    "命令无处理器(手册无页或语义未取证)",
-                );
+                self.report_unimplemented(&cmd.name, "命令无处理器(手册无页或语义未取证)");
                 Ok(StepOutcome::Continue)
             }
         }
@@ -2870,16 +2867,23 @@ impl Vm {
             text_line: exec.text_line as i32 as u32,
             pc: exec.pc,
             script_name: name,
+            tail_byte: 0,
         };
-        sp.encode().map_err(|e| -> VmError {
-            diag::fatal(code::rt::SCRIPT_POS, Boundary::Script, e).into()
-        })
+        // 线格式由宿主按**存档容器版本**注入(版本→格式的唯一表在
+        // yu_save::profile;0.450–0.479(0.13) = u16 GOSUB 计数,0.480+ = u8)。
+        // 写错宽度会让官方读档时脚本名错位(「417」)。
+        sp.encode_with_wire(self.scriptpos_wire())
+            .map_err(|e| -> VmError {
+                diag::fatal(code::rt::SCRIPT_POS, Boundary::Script, e).into()
+            })
     }
 
     fn decode_scriptpos(&self, blob: &[u8]) -> Result<scriptpos::ScriptPos, VmError> {
-        scriptpos::ScriptPos::decode(blob).map_err(|e| -> VmError {
-            diag::fatal(code::rt::SCRIPT_POS, Boundary::Script, e).into()
-        })
+        scriptpos::ScriptPos::decode_for_wire(blob, self.scriptpos_wire())
+            .map(|(sp, _)| sp)
+            .map_err(|e| -> VmError {
+                diag::fatal(code::rt::SCRIPT_POS, Boundary::Script, e).into()
+            })
     }
 
     /// 解码 SCRIPTPOS:优先引擎线格式;旧内核 8 字节 blob 走兼容路径。
@@ -3646,10 +3650,7 @@ impl Vm {
         // 查不到大小(手册注明),内核与官方一致:只查散盘/宿主路径。
         if size {
             let Some(bytes) = file.clone() else {
-                self.report_unimplemented(
-                    "FILEINFO",
-                    "SIZE=1 缺 FILE(file/fileinfo.html 例 3)",
-                );
+                self.report_unimplemented("FILEINFO", "SIZE=1 缺 FILE(file/fileinfo.html 例 3)");
                 return Ok(StepOutcome::Continue);
             };
             let len = self
@@ -3805,6 +3806,35 @@ impl Vm {
         })
     }
 
+    /// `SAVE[SET=@x[i][j]]` 的块内容 = **该下标处的元素**(标量块),
+    /// 不是整个变量。
+    ///
+    /// 官方 0.479 存档实证:`es_saveload.yst` 的 DNO=2 目标
+    /// `@0x45d[0x8d][1]` 写成 Int 标量 14;变量本身是 Int[256,128]。
+    /// 旧实现忽略 `lv.indices`、用 [`Self::var_snapshot`] 快照整组,块变成
+    /// Int[256,128] → 官方 LOAD 的严格维数比对失败(`0x440c22..`),
+    /// qsave 官方读不了。完整下标 = 标量;无下标 = 整组(原语义);
+    /// 部分下标(读子数组)官方语义未取证,返回 `None` 不猜块形状。
+    fn var_snapshot_at(
+        &self,
+        var: VarRef,
+        indices: &[i64],
+        value: &Value,
+    ) -> Option<crate::event::VarSnapshot> {
+        if indices.is_empty() {
+            return self.var_snapshot(var);
+        }
+        let slot = self.store.slot(var)?;
+        if indices.len() != slot.dims.len() {
+            return None;
+        }
+        Some(crate::event::VarSnapshot {
+            ty: slot.ty,
+            dims: Vec::new(),
+            data: vec![value.clone()],
+        })
+    }
+
     /// `(值类型, 组号)` 匹配的全局变量快照,顺序 = 工程变量表(ysv 记录序;
     /// 与 `VARACT[INIT]` 的恢复序同源)。
     fn globals_of_group(&self, ty: ElemType, group: u8) -> Vec<(u16, crate::event::VarSnapshot)> {
@@ -3823,9 +3853,11 @@ impl Vm {
     ///
     /// 参数序(官方 ycd):FILE(0)/DNO(1)/SET(2)/ID(3)/IDNO(4)/
     /// G_INT(5)..G_STR4(16)。取证要点:
-    /// - `SET=@x`/`SET=@x()` = 变量引用;块内容 = 该变量**当前全部元素**
+    /// - `SET=@x`/`SET=@x()` = 变量引用;无下标 = 该变量**当前全部元素**
     ///   (尺寸式 `0x44d5dd`;官方 seld.sd Int[2001]、save50001 标量
-    ///   dims=[] 自证);
+    ///   dims=[] 自证);带完整下标 `@x[i][j]` = **该元素标量块**
+    ///   (0.479 官方 save00001 DNO=2:`@0x45d[0x8d][1]` 存 Int 标量 14,
+    ///   变量本身 Int[256,128];旧实现存整组导致官方 QLOAD 维数不符);
     /// - **预约即快照**:`SAVE[DNO]` 时刻 `0x44d73d` 序列化当前值(zlib 压缩
     ///   后入预约表),`SAVE[FILE]` 只写文件头/偏移表并流出预约块
     ///   (`0x44cd5a..`);同 DNO 重复预约 = 替换(`0x44c740`);
@@ -3977,7 +4009,7 @@ impl Vm {
                 // 普通变量 = 整组槽位快照;系统变量(`@_RINT(1)` 等)没有
                 // VarSlot,但 SET 窗口已在命令时刻按引用求值 —— 官方把该值
                 // 写成**标量块**(DNO 90 实测:type=Int、dims=[]、data=[0])。
-                let snap = self.var_snapshot(var).or_else(|| {
+                let snap = self.var_snapshot_at(var, &lv.indices, &v).or_else(|| {
                     (var.id < self.sys_count).then(|| {
                         let ty = match &v {
                             Value::Int(_) => ElemType::Int,
@@ -4205,15 +4237,17 @@ impl Vm {
             }
         };
         for item in block.vars {
-            // 块类型 2:块自带 var_id;块类型 0:写 LET 目标。
-            let var = match item.var {
-                Some(var) => self.canonical_var(var),
+            // 块类型 2:块自带 var_id,恢复**整个变量**;块类型 0:写 LET
+            // 目标——目标可带下标(`LOAD[LET=@x[i][j]]` 只写该元素,官方
+            // 0.479 save00001 DNO=2 的标量块就是这种目标)。
+            let (var, indices) = match item.var {
+                Some(var) => (self.canonical_var(var), Vec::new()),
                 None => match &target {
-                    Some(lv) => self.canonical_var(lv.var),
+                    Some(lv) => (self.canonical_var(lv.var), lv.indices.to_vec()),
                     None => continue, // 官方:无处可写即读后丢弃(0x44760c 路径)
                 },
             };
-            if let Err(d) = self.restore_snapshot(var, &item.snap) {
+            if let Err(d) = self.restore_snapshot(var, &indices, &item.snap) {
                 self.report(d);
             }
         }
@@ -4221,9 +4255,13 @@ impl Vm {
     }
 
     /// 把一份快照写回变量槽(类型/维数校验;手册 load.html 尺寸不符 = 错误)。
+    ///
+    /// `indices` 非空 = `LOAD[... LET=@x[i][j]]`:官方只写该**元素**,
+    /// 块必须是标量同型;空 = 块类型 0 写整组 / 块类型 2 按 var_id 写整组。
     fn restore_snapshot(
         &mut self,
         var: VarRef,
+        indices: &[i64],
         snap: &crate::event::VarSnapshot,
     ) -> Result<(), yu_log::Diag> {
         let Some((ty, dims)) = self.var_shape(var) else {
@@ -4236,6 +4274,37 @@ impl Vm {
                 ),
             ));
         };
+        if !indices.is_empty() {
+            // 部分下标(恢复子数组)官方语义未取证:显式挂账,不猜。
+            if indices.len() != dims.len() {
+                return Err(diag::recoverable(
+                    code::rt::VAR_SHAPE,
+                    Boundary::Script,
+                    format!(
+                        "LOAD 目标 {} 给了 {} 个下标,变量 {} 维(部分下标恢复未取证)",
+                        var.display(),
+                        indices.len(),
+                        dims.len()
+                    ),
+                ));
+            }
+            if ty != snap.ty || !snap.dims.is_empty() || snap.data.len() != 1 {
+                return Err(diag::recoverable(
+                    code::rt::VAR_SHAPE,
+                    Boundary::Script,
+                    format!(
+                        "LOAD 元素块类型/形状不符:目标 {} = {}(下标 {indices:?}),\
+                         块 = {}{:?}[{} 个元素](手册 load.html)",
+                        var.display(),
+                        ty.as_str(),
+                        snap.ty.as_str(),
+                        snap.dims,
+                        snap.data.len()
+                    ),
+                ));
+            }
+            return self.store.write(var, indices, &snap.data[0]);
+        }
         let dims_match = dims.len() == snap.dims.len()
             && dims.iter().zip(&snap.dims).all(|(&a, &b)| a as u32 == b);
         if ty != snap.ty || !dims_match {
