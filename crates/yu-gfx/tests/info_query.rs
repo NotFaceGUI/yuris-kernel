@@ -649,7 +649,7 @@ fn main_group_copy_snapshot_reports_viewport_size() {
 ///
 /// 回归:菜单打开时建过 `CGS100`,读档时再次 `CG CGS100 FILE="" A=0`
 /// 把绘制尺寸写成 1×1(`dc545ae`),若 COPY 不清掉它,整幅冻结屏幕会缩
-/// 成 1 个像素 ⇒ 读档淡出直接黑屏(2026-11-19 kotoneiro 实测)。
+/// 成 1 个像素 ⇒ 读档淡出直接黑屏(2026-11-19 <game-b> 实测)。
 #[test]
 fn copy2_after_reused_fileless_layer_draws_snapshot_at_natural_size() {
     let table = table();
@@ -735,7 +735,7 @@ fn copy2_after_reused_fileless_layer_draws_snapshot_at_natural_size() {
 /// `CGINFO[ID=$off SX/SY]` 填 `@BT.SX/SY`(`es_Button.yst:2657`),
 /// `es.BT.MOUSECHECK` 再用它做命中矩形。返回合图宽会让命中矩形覆盖四个
 /// 按钮:置灰按钮被 `@BT.N` 跳过时,相邻按钮的矩形接住 hover,显示成
-/// “不能点的按钮却高亮了旁边的按钮”(2026-11-11 kotoneiro 实测)。
+/// “不能点的按钮却高亮了旁边的按钮”(2026-11-11 <game-b> 实测)。
 #[test]
 fn partial_copy2_reports_copied_block_size() {
     let table = table();
@@ -852,7 +852,7 @@ fn partial_copy2_zero_source_size_keeps_zero_rect() {
 
 /// `COPY2` 时资产头尚未注入:资产尺寸晚到后回填快照 `SX/SY`。
 ///
-/// aorio 实跑 `es_sprite.yst@6519/6520` 曾在 COPY 后立刻查快照尺寸;
+/// <0.474 样本> 实跑 `es_sprite.yst@6519/6520` 曾在 COPY 后立刻查快照尺寸;
 /// 旧实现只记 `snapshot_files`、不记尺寸,查询一直报
 /// 「快照纹理尺寸未记录」,脚本的 `LET` 留在 0。
 #[test]
@@ -1474,7 +1474,7 @@ fn single_axis_cg_size_after_copy_keeps_other_axis_from_copy_rect() {
     );
 }
 
-/// 回归(kotoneiro 底部按钮实测):COPY2 后的**纯属性 `CG`**(没有
+/// 回归(<game-b> 底部按钮实测):COPY2 后的**纯属性 `CG`**(没有
 /// `SX/SY`,例如 `CG[ID=$off E=0 X=… Y=… MODE=…]`)不得把 COPY 区域
 /// 矩形写进 `LayerKind::Image.size`。
 ///

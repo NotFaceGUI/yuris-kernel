@@ -1,7 +1,7 @@
 //! 点击帧回归：桌面 streaming 路径无 CPU 读回时，`COPY2 ID=:/W0/`
 //! 必须读到**上一呈现帧**（屏幕表面），不得退回清屏色。
 //!
-//! 复现链（kotoneiro v494 s51 pc161..177）：
+//! 复现链（<game-b> v494 s51 pc161..177）：
 //! 1. 帧 1 呈现标题；
 //! 2. 帧 2 `CG SSSSS E=0 FILE=""` → `CGACT COPY2 ID=:/W0/ ID2=SSSSS`
 //!    （屏幕契约与上一帧相同 ⇒ `capture_screen_snapshot` 返回 `None`）；
@@ -285,7 +285,7 @@ fn wgpu_main_window_copy_reads_last_presented_screen_without_cpu_readback() {
 /// P2 任务书验收 1：点击帧之后 CGS 幕布 25 帧淡出，逐帧内容变化，
 /// 首帧是上一帧标题而不是黑。
 ///
-/// 合成场景与 kotoneiro `s51 pc161..177` 同形：
+/// 合成场景与 <game-b> `s51 pc161..177` 同形：
 /// 标题帧 → `CG CGS E=0` → `COPY2 :/W0/ CGS` → `CG CGS E=1 A=256`
 /// → 隐藏标题（让幕布淡出到黑）→ 每帧 `CG CGS A=256-10k`。
 #[test]

@@ -539,7 +539,7 @@ fn cgact_size_keeps_sx_sy_and_resize_trim_are_recognized() {
 ///
 /// `SET` 缺失时值槽初始化为 0(0x42c998..0x42c9b6);TRIM=1 单独出现
 /// 是掩码 0(四边都不裁、原地 no-op),**不是** `gfx.imageop.set.missing`。
-/// kotoneiro `macro.yst` s27 pc5803 正是这种用法。
+/// <game-b> `macro.yst` s27 pc5803 正是这种用法。
 #[test]
 fn trim_without_set_is_executable_with_zero_mask() {
     let table = table();
