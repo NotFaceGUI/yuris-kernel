@@ -466,12 +466,48 @@ impl SaveState {
             ));
         }
         let path = self.confined_path(file)?;
-        let codec = self.block_codec.unwrap_or_default();
         let target_version = self
             .fs
             .read_prefix(&path, 8)
             .ok()
             .and_then(|head| container_version_of(&head));
+        let mut image_layout_diags: Vec<Diag> = Vec::new();
+        let bytes = self.build_container(
+            target_version,
+            &format!("SAVE[FILE={file}]"),
+            &mut image_layout_diags,
+        )?;
+        self.fs.write(&path, &bytes).map_err(|e| {
+            // 诊断必须带**解析后的绝对路径**:只报 `config.sd` 时「写到哪、
+            // 目录存不存在、是否被别的进程占着」全都看不出来(实测
+            // `os error 5` 就是靠这条路径定位的)。
+            error::recoverable(
+                code::FILE_WRITE,
+                format!("SAVE[FILE={file}] 写入失败: {e}(目标 {})", path.display()),
+            )
+        })?;
+        self.refresh_slots();
+        for diag in image_layout_diags {
+            self.push_diag(diag);
+        }
+        Ok(())
+    }
+
+    /// 按预约表构造 YSSD 容器(文件存档与将来的内存槽共用同一序列化)。
+    ///
+    /// 版本选择:宿主注入常量 → 盘上学到的版本 → 目标文件版本 →
+    /// 压缩层默认(最后一级留 verbose 诊断,标明是兜底不是取证)。
+    ///
+    /// 图像块布局/var_id 策略来自 [`crate::profile`](版本档案表);未知版本
+    /// 跳过图像块并通过 `diags` 返回挂号,**变量块照常序列化**。诊断由
+    /// 调用方在目标落定后统一 `push_diag`,保持与旧 `flush` 相同的时序。
+    fn build_container(
+        &mut self,
+        target_version: Option<u32>,
+        source: &str,
+        diags: &mut Vec<Diag>,
+    ) -> Result<Vec<u8>, Diag> {
+        let codec = self.block_codec.unwrap_or_default();
         let version = match self
             .container_version
             .or(self.learned_version)
@@ -483,7 +519,7 @@ impl SaveState {
                 self.push_diag(error::verbose(
                     code::CONTAINER,
                     format!(
-                        "SAVE[FILE={file}]: 无可参照的 .sd 与官方 exe 常量,容器版本按 \
+                        "{source}: 无可参照的 .sd 与官方 exe 常量,容器版本按 \
                          {} 压缩层兜底为 {version:#x}",
                         codec.as_str()
                     ),
@@ -502,7 +538,6 @@ impl SaveState {
         let save_profile = crate::profile::profile_for(version);
         let image_layout = save_profile.and_then(|p| p.image_layout);
         let btype0_var_id = save_profile.map(|p| p.btype0_var_id);
-        let mut image_layout_diags: Vec<Diag> = Vec::new();
         for fact in self.reservations.values() {
             match fact.btype {
                 0 => {
@@ -548,10 +583,10 @@ impl SaveState {
                 1 => {
                     let Some(image) = &fact.image else { continue };
                     let Some(layout) = image_layout else {
-                        image_layout_diags.push(error::recoverable(
+                        diags.push(error::recoverable(
                             code::IMAGE_LAYOUT,
                             format!(
-                                "SAVE[FILE={file}] DNO={}: 容器版本 {version:#x} 的图像块 \
+                                "{source} DNO={}: 容器版本 {version:#x} 的图像块 \
                                  描述符布局未取证,跳过该缩略图块(变量块照常写盘)",
                                 fact.dno
                             ),
@@ -572,21 +607,7 @@ impl SaveState {
                 }
             }
         }
-        let bytes = writer.build();
-        self.fs.write(&path, &bytes).map_err(|e| {
-            // 诊断必须带**解析后的绝对路径**:只报 `config.sd` 时「写到哪、
-            // 目录存不存在、是否被别的进程占着」全都看不出来(实测
-            // `os error 5` 就是靠这条路径定位的)。
-            error::recoverable(
-                code::FILE_WRITE,
-                format!("SAVE[FILE={file}] 写入失败: {e}(目标 {})", path.display()),
-            )
-        })?;
-        self.refresh_slots();
-        for diag in image_layout_diags {
-            self.push_diag(diag);
-        }
-        Ok(())
+        Ok(writer.build())
     }
 
     /// `SAVEEND[]`:丢弃全部未刷盘预约(REA `0x44e1a0`;官方 flush 不清,
@@ -604,29 +625,43 @@ impl SaveState {
     pub fn load_block(&mut self, file: &str, dno: u32) -> Result<LoadedBlock, Diag> {
         self.load_calls += 1;
         let path = self.confined_path(file)?;
-        let bytes = match self.fs.read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(error::recoverable(
-                    code::FILE_MISSING,
-                    format!("LOAD 目标不存在: {file}"),
-                ));
-            }
-            Err(e) => {
-                return Err(error::recoverable(
-                    code::FILE_READ,
-                    format!("LOAD 读取失败: {file}: {e}"),
-                ));
-            }
-        };
-        let origin = file.as_bytes();
-        let save = yu_format::yssd::YssdSave::parse(&bytes, origin)
-            .map_err(|d| error::recoverable(code::CONTAINER, format!("LOAD[FILE={file}] {d}")))?;
+        let bytes = self.read_save_file(file, &path)?;
+        self.decode_block(&bytes, file.as_bytes(), &format!("LOAD[FILE={file}"), dno)
+    }
+
+    fn read_save_file(&self, file: &str, path: &Path) -> Result<Vec<u8>, Diag> {
+        match self.fs.read(path) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(error::recoverable(
+                code::FILE_MISSING,
+                format!("LOAD 目标不存在: {file}"),
+            )),
+            Err(e) => Err(error::recoverable(
+                code::FILE_READ,
+                format!("LOAD 读取失败: {file}: {e}"),
+            )),
+        }
+    }
+
+    /// 容器 → 块(文件与内存来源共用)。
+    ///
+    /// `source` 是命令标签**不含末尾 `]`** 的前缀(`LOAD[FILE=x` /
+    /// `LOAD[MEM=3`):三种诊断的括号位置不同(解析/缺块把 `]` 放 DNO 前,
+    /// 块类型错误把 DNO 裹进方括号),这样能逐字保持旧 `LOAD[FILE]` 文案。
+    fn decode_block(
+        &self,
+        bytes: &[u8],
+        origin: &[u8],
+        source: &str,
+        dno: u32,
+    ) -> Result<LoadedBlock, Diag> {
+        let save = yu_format::yssd::YssdSave::parse(bytes, origin)
+            .map_err(|d| error::recoverable(code::CONTAINER, format!("{source}] {d}")))?;
         let Some(entry) = save.entry(dno) else {
             return Err(error::recoverable(
                 code::FILE_MISSING,
                 format!(
-                    "LOAD[FILE={file}] DNO={dno} 不在容器(共 {} 块)",
+                    "{source}] DNO={dno} 不在容器(共 {} 块)",
                     save.entries.len()
                 ),
             ));
@@ -664,11 +699,11 @@ impl SaveState {
             }
             1 => Err(error::recoverable(
                 code::COMMAND_UNIMPLEMENTED,
-                format!("LOAD[FILE={file} DNO={dno}] 配置块(btype 1)不解释(DIV-RT-012/B13)"),
+                format!("{source} DNO={dno}] 配置块(btype 1)不解释(DIV-RT-012/B13)"),
             )),
             other => Err(error::recoverable(
                 code::CONTAINER,
-                format!("LOAD[FILE={file} DNO={dno}] 未知块类型 {other}"),
+                format!("{source} DNO={dno}] 未知块类型 {other}"),
             )),
         }
     }
@@ -686,35 +721,32 @@ impl SaveState {
     ) -> Result<yu_rt::event::CapturedImage, Diag> {
         self.load_calls += 1;
         let path = self.confined_path(file)?;
-        let bytes = match self.fs.read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(error::recoverable(
-                    code::FILE_MISSING,
-                    format!("LOAD 目标不存在: {file}"),
-                ));
-            }
-            Err(e) => {
-                return Err(error::recoverable(
-                    code::FILE_READ,
-                    format!("LOAD 读取失败: {file}: {e}"),
-                ));
-            }
-        };
-        let origin = file.as_bytes();
-        let save = yu_format::yssd::YssdSave::parse(&bytes, origin)
-            .map_err(|d| error::recoverable(code::CONTAINER, format!("LOAD[FILE={file}] {d}")))?;
+        let bytes = self.read_save_file(file, &path)?;
+        self.decode_image(&bytes, file.as_bytes(), &format!("LOAD[FILE={file}"), dno)
+    }
+
+    /// 容器 → 图像块(文件与内存来源共用;`source` 约定同
+    /// [`Self::decode_block`])。
+    fn decode_image(
+        &self,
+        bytes: &[u8],
+        origin: &[u8],
+        source: &str,
+        dno: u32,
+    ) -> Result<yu_rt::event::CapturedImage, Diag> {
+        let save = yu_format::yssd::YssdSave::parse(bytes, origin)
+            .map_err(|d| error::recoverable(code::CONTAINER, format!("{source}] {d}")))?;
         let Some(entry) = save.entry(dno) else {
             return Err(error::recoverable(
                 code::FILE_MISSING,
-                format!("LOAD[FILE={file}] DNO={dno} 不在容器"),
+                format!("{source}] DNO={dno} 不在容器"),
             ));
         };
         if entry.btype != 1 {
             return Err(error::recoverable(
                 code::CONTAINER,
                 format!(
-                    "LOAD[FILE={file} DNO={dno}] 不是图像块(btype={})",
+                    "{source} DNO={dno}] 不是图像块(btype={})",
                     entry.btype
                 ),
             ));
@@ -725,7 +757,7 @@ impl SaveState {
         crate::image_block::decode(&raw).map_err(|detail| {
             error::recoverable(
                 code::IMAGE_SHAPE,
-                format!("LOAD[FILE={file} DNO={dno}] 图像块解析失败: {detail}"),
+                format!("{source} DNO={dno}] 图像块解析失败: {detail}"),
             )
         })
     }

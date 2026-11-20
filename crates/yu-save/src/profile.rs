@@ -78,6 +78,11 @@ pub fn profile_for(version: u32) -> Option<SaveProfile> {
         // 0.479(0.14)–0.495 全系:官方 LOAD 版本常量 0x1E0、
         // A=0x640、w/h 在 +0x78(0.495 exe 0x44734e/0x4477de;
         // 0.48x/0.49x 全系 exe 同一常量;0.495 官方存档样本逐块实测)。
+        //
+        // v555 商业样本(2026-11-19 启动探测)**同样写 0x1E0**:存档容器
+        // 没有随引擎版本升到 555 而改变。v555 的存档差异在**命令面**
+        // (`LOAD/SAVE[MEM]` 内存槽、MEM 的 DNO 0 基),容器与块布局仍走
+        // 本档案,不需要新版本行。
         0x01E0 => Some(SaveProfile {
             image_layout: Some(image_block::LAYOUT_0495),
             btype0_var_id: Btype0VarId::Actual,
