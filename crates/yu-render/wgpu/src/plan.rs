@@ -3150,6 +3150,15 @@ fn text_signature(
             fnv_mix(&mut hash, u64::from(image.width));
             fnv_mix(&mut hash, u64::from(image.height));
             fnv_mix(&mut hash, image.tint.map_or(u64::MAX, u64::from));
+            // v555 抠格单元参与缓存键:同一字形页不同单元是不同字形。
+            if let Some((cx, cy, cw, ch)) = image.cell {
+                fnv_mix(&mut hash, u64::from(cx));
+                fnv_mix(&mut hash, u64::from(cy));
+                fnv_mix(&mut hash, u64::from(cw));
+                fnv_mix(&mut hash, u64::from(ch));
+            } else {
+                fnv_mix(&mut hash, u64::MAX);
+            }
         }
     }
     if let Some(layout) = layout {

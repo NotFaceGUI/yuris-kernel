@@ -728,3 +728,141 @@ fn page_clear_also_drops_cgact_text_on_same_layer() {
         "'P' 必须清同层 CGACT 文本(官方 zero_fill 整个层表面)"
     );
 }
+
+/// v555 多语言字形页链(<v555-4> 正文取证,2026-11-22):
+/// `CG[FILE=字形页] → CGACT[COPY2 抠格] → MEIDO → MERGE2 盖章` 必须
+/// **每轮重新抠格**降级成 `TextDraw::image`(cell = 本轮源区)。
+///
+/// 回归点:首次抠格后暂存层纹理变成继承自字形页的 `Asset(键)`
+/// (`cgact_copy` 的快照继承),若识别门仍要求"空纹理",候选会停在第一格
+/// —— 实机表现为整行变成第一个字(「山山山」)。
+///
+/// 官方内容锚点:run3 日志第一行 `n41@(395,39)`=山、`n1@(395,9)`=…、
+/// `n46@(245,99)`=呜、`n25@(425,39)`=咕,拼出「呼……呜、呜呜……咕……」。
+#[test]
+fn v555_cell_chain_relowers_each_copy_with_fresh_cell() {
+    let t = table();
+    let mut gfx = state();
+    gfx.on_event(&frame_start(1557));
+    // 正文层:MESW.TX.BT.OFF 的近义空面(尺寸不限,只为承载文本项)。
+    gfx.on_event(&call(
+        1557,
+        "CG",
+        vec![
+            arg(&t, "CG", "ID", s("MESW.TX.BT.OFF")),
+            arg(&t, "CG", "FILE", s("")),
+            arg(&t, "CG", "SX", i(500)),
+            arg(&t, "CG", "SY", i(48)),
+        ],
+    ));
+    // 暂存层**每行只建一次**(实测 s49@73:`CG[ID=TX.TMP FILE="" SX=80 SY=80]`,
+    // 行首 RECTPAINT3 清面)。此后每轮只搜格/盖章 —— 不得每轮重建,否则
+    // 掩盖「首次抠格后 `cgact_copy` 把目标 kind 尺寸清成 None」的真实状态。
+    gfx.on_event(&call(
+        1557,
+        "CG",
+        vec![
+            arg(&t, "CG", "ID", s("TX.TMP")),
+            arg(&t, "CG", "FILE", s("")),
+            arg(&t, "CG", "SX", i(80)),
+            arg(&t, "CG", "SY", i(80)),
+        ],
+    ));
+    // 每轮:页层 CG → COPY2 抠格进暂存层 → MEIDO → MERGE2。
+    fn round(
+        gfx: &mut yu_gfx::GfxState,
+        t: &yu_gfx::ParamTable,
+        sheet: &str,
+        key: &str,
+        (x, y, x2, y2): (i64, i64, i64, i64),
+        at_x: i64,
+    ) {
+        gfx.on_event(&call(
+            1557,
+            "CG",
+            vec![
+                arg(t, "CG", "ID", s(sheet)),
+                arg(t, "CG", "FILE", s(key)),
+            ],
+        ));
+        gfx.on_event(&call(
+            1557,
+            "CGACT",
+            vec![
+                arg(t, "CGACT", "ID", s(sheet)),
+                arg(t, "CGACT", "ID2", s("TX.TMP")),
+                arg(t, "CGACT", "X", i(x)),
+                arg(t, "CGACT", "Y", i(y)),
+                arg(t, "CGACT", "X2", i(x2)),
+                arg(t, "CGACT", "Y2", i(y2)),
+                arg(t, "CGACT", "COPY2", i(1)),
+            ],
+        ));
+        gfx.on_event(&call(
+            1557,
+            "CGACT",
+            vec![
+                arg(t, "CGACT", "ID", s("TX.TMP")),
+                arg(t, "CGACT", "MEIDO", i(1)),
+                arg(t, "CGACT", "SET", i(0x808080)),
+            ],
+        ));
+        gfx.on_event(&call(
+            1557,
+            "CGACT",
+            vec![
+                arg(t, "CGACT", "ID", s("TX.TMP")),
+                arg(t, "CGACT", "ID2", s("MESW.TX.BT.OFF")),
+                arg(t, "CGACT", "MERGE2", i(1)),
+                arg(t, "CGACT", "X", i(at_x)),
+                arg(t, "CGACT", "Y", i(3)),
+            ],
+        ));
+    }
+    round(
+        &mut gfx,
+        &t,
+        "TX.0.1.41",
+        "cgsys_cn/font/font_c20/fnt_s20_n41",
+        (395, 39, 425, 69),
+        3,
+    );
+    round(
+        &mut gfx,
+        &t,
+        "TX.0.1.46",
+        "cgsys_cn/font/font_c20/fnt_s20_n46",
+        (245, 99, 275, 129),
+        25,
+    );
+
+    let frame = gfx.frame();
+    let glyphs: Vec<(Vec<u8>, Option<(u32, u32, u32, u32)>, i64, i64)> = frame
+        .text_draws
+        .iter()
+        .filter(|d| d.image.is_some() && d.target.display().contains("MESW"))
+        .map(|d| {
+            let img = d.image.as_ref().expect("image");
+            (img.asset.clone(), img.cell, d.x, d.y)
+        })
+        .collect();
+    assert_eq!(glyphs.len(), 2, "两轮各一条降级字形: {glyphs:?}");
+    assert!(
+        glyphs.contains(&(
+            b"cgsys_cn/font/font_c20/fnt_s20_n41".to_vec(),
+            Some((395, 39, 31, 31)),
+            3,
+            3
+        )),
+        "首轮单元必须来自 n41: {glyphs:?}"
+    );
+    assert!(
+        glyphs.contains(&(
+            b"cgsys_cn/font/font_c20/fnt_s20_n46".to_vec(),
+            Some((245, 99, 31, 31)),
+            25,
+            3
+        )),
+        "第二轮单元必须换成 n46(不得停在首格): {glyphs:?}"
+    );
+}

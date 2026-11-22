@@ -1872,3 +1872,42 @@ fn cginfo_missing_layer_returns_neutral_probe_values() {
     );
     assert_eq!(err.code, "gfx.info.missing");
 }
+
+/// `CGINFO[LINT2]` 回读 `CG[LINT2]` 写入的按钮号(图层 `+0x60`)。
+///
+/// 证据:官方 `CG` 处理体 `0x42b760` 写入、`CGINFO` 同字段回读;
+/// 按钮脚本每帧按按钮号分发(`es_Button.yst:2422/3131/3290`)。
+/// 层不存在时返回 0(没有按钮),不再是 `INFO_MISSING` —— 旧实现
+/// 在 v555 启动/菜单帧刷出数万条 missing/unsupported 诊断。
+#[test]
+#[ignore = "v555 other 模块: LINT2 由中性 gfx 策略/扩展接管,用例随策略迁入"]
+fn cginfo_lint2_reads_layer_button_number() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BT")),
+                arg(&table, "CG", "FILE", s("bt")),
+                arg(&table, "CG", "LINT2", i(23)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let query = |id: &str| {
+        gfx.query_info_with(
+            "CGINFO",
+            &[
+                arg(&table, "CGINFO", "ID", s(id)),
+                arg(&table, "CGINFO", "LINT2", i(1)),
+            ],
+            None,
+        )
+        .expect("CGINFO[LINT2]")
+    };
+    assert_eq!(query("BT"), Value::Int(23), "写入的按钮号应回读");
+    assert_eq!(query("NO.SUCH.LAYER"), Value::Int(0), "缺层 = 没有按钮");
+}

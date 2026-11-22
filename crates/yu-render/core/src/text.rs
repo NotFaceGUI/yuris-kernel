@@ -1473,8 +1473,9 @@ impl TextComposer {
         stats
     }
 
-    /// 画一个图像字形:按 `SIZE2` 尺寸采样、按 `MEIDO` 着色、source-over
-    /// 写到文本层表面;超出表面的部分裁剪(隐藏哨兵不会扩大表面)。
+    /// 画一个图像字形:按 `SIZE2` 尺寸(或 v555 抠格 `cell` 子矩形)采样、
+    /// 按 `MEIDO` 着色、source-over 写到文本层表面;超出表面的部分裁剪
+    /// (隐藏哨兵不会扩大表面)。
     #[allow(clippy::too_many_arguments)]
     fn paint_image(
         &mut self,
@@ -1497,27 +1498,42 @@ impl TextComposer {
             );
             return;
         };
+        // 采样区:`None` = 整图(0.495 `SIZE2` 单字小图);`Some` = 字形页
+        // 子矩形(v555 `COPY2` 抠格单元,坐标已按含端点换算成宽高)。
+        // 越界部分夹到源图内,夹空 ⇒ 无可画像素。
+        let (cell_x, cell_y, cell_w, cell_h) = match image.cell {
+            Some((cx, cy, cw, ch)) => {
+                let cw = cw.min(src.width.saturating_sub(cx));
+                let ch = ch.min(src.height.saturating_sub(cy));
+                (cx, cy, cw, ch)
+            }
+            None => (0, 0, src.width, src.height),
+        };
         let tw = if image.width == 0 {
-            src.width
+            cell_w
         } else {
             image.width
         };
         let th = if image.height == 0 {
-            src.height
+            cell_h
         } else {
             image.height
         };
-        if tw == 0 || th == 0 || src.width == 0 || src.height == 0 {
+        if tw == 0 || th == 0 || cell_w == 0 || cell_h == 0 {
             stats.missing += 1;
             stats.note("text.image_size_unknown");
             return;
         }
         log::debug!(
             target: "yu-render",
-            "[text-image] paint asset={} src={}x{} dst={}x{} at ({},{}) tint={:?}",
+            "[text-image] paint asset={} src={}x{} cell=({},{})+{}x{} dst={}x{} at ({},{}) tint={:?}",
             String::from_utf8_lossy(&image.asset),
             src.width,
             src.height,
+            cell_x,
+            cell_y,
+            cell_w,
+            cell_h,
             tw,
             th,
             draw.x,
@@ -1542,13 +1558,13 @@ impl TextComposer {
             if y < 0 || y >= h as i64 {
                 continue;
             }
-            let sy = (dy as u64 * src.height as u64 / th as u64) as u32;
+            let sy = cell_y + (dy as u64 * cell_h as u64 / th as u64) as u32;
             for dx in 0..tw as i64 {
                 let x = draw.x + dx;
                 if x < 0 || x >= w as i64 {
                     continue;
                 }
-                let sx = (dx as u64 * src.width as u64 / tw as u64) as u32;
+                let sx = cell_x + (dx as u64 * cell_w as u64 / tw as u64) as u32;
                 let si = ((sy as usize) * (src.width as usize) + sx as usize) * 4;
                 let a = src.rgba[si + 3] as u32;
                 if a == 0 {
@@ -2744,6 +2760,15 @@ mod image_glyph_tests {
     use yu_gfx::{LayerId, TextDraw, TextImage, TextStyle};
 
     fn image_draw(x: i64, y: i64, tint: Option<u32>) -> TextDraw {
+        image_draw_with(x, y, tint, None)
+    }
+
+    fn image_draw_with(
+        x: i64,
+        y: i64,
+        tint: Option<u32>,
+        cell: Option<(u32, u32, u32, u32)>,
+    ) -> TextDraw {
         TextDraw {
             target: LayerId::new(b"T".to_vec()),
             bytes: Vec::new(),
@@ -2755,11 +2780,53 @@ mod image_glyph_tests {
             bno: None,
             image: Some(TextImage {
                 asset: b"g".to_vec(),
+                cell,
                 width: 2,
                 height: 2,
                 tint,
             }),
         }
+    }
+
+    /// v555 抠格单元:`cell` 只采样字形页的指定子矩形,单元外像素不进
+    /// 文本层(<v555-4> 正文 `COPY2` 30×30 单元取证)。
+    #[test]
+    fn image_glyph_cell_samples_subrect_only() {
+        let mut composer = TextComposer::new();
+        let base = Texture {
+            width: 8,
+            height: 8,
+            rgba: vec![0; 8 * 8 * 4],
+        };
+        // 字形页 4×4:左上 2×2 全透明,右下 2×2 白色;cell 指向右下。
+        let mut rgba = vec![0u8; 4 * 4 * 4];
+        for y in 2..4 {
+            for x in 2..4 {
+                let i = (y * 4 + x) * 4;
+                rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+        let sheet = Texture {
+            width: 4,
+            height: 4,
+            rgba,
+        };
+        let mut assets = BTreeMap::new();
+        assets.insert(b"g".to_vec(), sheet);
+        let draw = image_draw_with(0, 0, None, Some((2, 2, 2, 2)));
+        let (out, stats) = composer.compose_layer_assets(&base, &[draw], None, &assets);
+        let out = out.expect("composed");
+        // cell 内的白字落到 (0,0)-(1,1)。
+        for y in 0..2 {
+            for x in 0..2 {
+                let i = (y * 8 + x) * 4;
+                assert_eq!(&out.rgba[i..i + 4], &[255, 255, 255, 255], "cell 单元像素");
+            }
+        }
+        // cell 外保持透明(2×2 单元,不扩大到整页 4×4)。
+        let i = (2 * 8) * 4;
+        assert_eq!(&out.rgba[i..i + 4], &[0, 0, 0, 0], "cell 外保持透明");
+        assert_eq!(stats.glyphs, 1);
     }
 
     #[test]

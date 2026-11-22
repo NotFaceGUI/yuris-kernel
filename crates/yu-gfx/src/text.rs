@@ -318,7 +318,15 @@ pub struct TextDraw {
 pub struct TextImage {
     /// `CG[FILE]` 的资产键(脚本给出的原始字节)。
     pub asset: Vec<u8>,
-    /// `SIZE2` 的目标尺寸(字形单元,像素)。
+    /// 字形页上的采样子矩形 `(x, y, w, h)`(像素)。
+    ///
+    /// - `None` = 整图(0.495 外字链 `SIZE2` 形态:单字小图直接缩放);
+    /// - `Some` = v555 多语言预制字形页形态(<v555-4> 正文,
+    ///   `CG[FILE=fnt_s20_nN]` 整页字形图,`CGACT[COPY2]` 按源区抠
+    ///   30×30 单元;`EVID-T-11/T-12`:区域是源纹理坐标含端点、
+    ///   裁剪块写到目标 `(0,0)`)。合成时只采样该单元。
+    pub cell: Option<(u32, u32, u32, u32)>,
+    /// `SIZE2` 的目标尺寸(字形单元,像素);cell 形态下 = 单元尺寸。
     pub width: u32,
     pub height: u32,
     /// `MEIDO SET` 的颜色(0xRRGGBB;`None` = 未着色)。
