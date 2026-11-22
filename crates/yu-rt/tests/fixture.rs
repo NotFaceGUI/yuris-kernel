@@ -12,6 +12,8 @@ mod fixture {
     mod control;
     mod file_save;
     mod media;
+    mod other;
+    mod product;
     mod system;
     mod text;
     mod variables;

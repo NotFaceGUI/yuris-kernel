@@ -920,3 +920,90 @@ fn bare_wait_yields_one_frame() {
 
 // ---------------------------------------------------------------- 存档闭环(B1/DIV-RT-042)
 
+
+/// 手册 `control/gosub.html`:同编号的 `PINT1` / `PFLT1` / `PSTR1` 是
+/// **三组独立参数**(分别落 `@_PINT(1)`/`@_PFLT(1)`/`$_PSTR(1)`),不是同一
+/// 槽位的三种类型。v555 剧本链 `GOSUB[#=… PSTR="CSEL" PINT=1 …]` 依赖这一点;
+/// 早期单一 `args[16]` 会让 PINT 覆盖 PSTR,命令名永远读到整数。
+#[test]
+#[ignore = "v555 other 模块: 共享 GosubFrame 已回退,三组用例随 other/gosub 迁入"]
+fn gosub_keeps_pint_and_pstr_groups_apart() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(0),
+        },
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b""),
+        },
+    ];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("SUB", 3, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        // 0: GOSUB[#="SUB" PINT=21 PSTR="CMD"]
+        GroupSpec::new(OP_GOSUB)
+            .window(0, ex::s("SUB"))
+            .window(1, ex::i8_(21))
+            .window(33, ex::s("CMD")),
+        GroupSpec::new(OP_END),
+        GroupSpec::new(OP_END),
+        // 3: SUB: LET[@a = @_PINT(1)]; LET[$b = $_PSTR(1)]; RETURN
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, sys))
+            .window(1, ex::cat(&[ex::r#ref(0x40, 0), ex::i8_(1), ex::aload()])),
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x24, sys + 1))
+            .window(1, ex::cat(&[ex::r#ref(0x24, 0), ex::i8_(1), ex::aload()])),
+        GroupSpec::new(OP_RETURN),
+    ]];
+    let probe_src = {
+        let mut p = ProjectBuilder::new();
+        p.sysvars = b.sysvars.clone();
+        p.build()
+    };
+    let tables = yu_rt::TableSet::load(&probe_src, yu_rt::tables::DEFAULT_SCRIPT_KEY).unwrap();
+    let pint = tables.boot.sysvars.id("_PINT").unwrap();
+    let pstr = tables.boot.sysvars.id("_PSTR").unwrap();
+    // 被调方:@_PINT(1) / $_PSTR(1) 的数组取值(引用 + 下标 + aload)。
+    b.scripts[0][3].windows[1].4 = ex::cat(&[
+        ex::r#ref(0x40, pint),
+        ex::i8_(1),
+        ex::aload(),
+    ]);
+    b.scripts[0][4].windows[1].4 = ex::cat(&[
+        ex::r#ref(0x24, pstr),
+        ex::i8_(1),
+        ex::aload(),
+    ]);
+
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(21),
+        "@_PINT(1) 保持 21"
+    );
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::Dollar, sys + 1), &[])
+            .unwrap(),
+        Value::Str(b"CMD".to_vec()),
+        "$_PSTR(1) 保持 \"CMD\"(不被同编号 PINT 覆盖)"
+    );
+}

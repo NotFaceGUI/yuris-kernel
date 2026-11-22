@@ -161,6 +161,56 @@ impl Vm {
         // 条件求值:可恢复失败(Unimplemented)⇒ 记诊断并按「假」处理;
         // Fatal 照常抛出(任务终止)。
         let truthy = self.eval_condition(st, &cmd.windows[0])?;
+        // 临时取证(`YU_SLOT_TRACE`):3DAYS 文本循环断点排查。取证完删除。
+        if std::env::var_os("YU_SLOT_TRACE").is_some()
+            && (st.script_id == 105 || st.script_id == 104)
+        {
+            let probe = match (st.script_id, cmd.pc) {
+                (105, 29) => {
+                    let a = self
+                        .store
+                        .read(crate::value::VarRef::new(crate::value::VarSpace::At, 5709), &[])
+                        .ok();
+                    let b = self
+                        .store
+                        .read(crate::value::VarRef::new(crate::value::VarSpace::At, 5710), &[])
+                        .ok();
+                    format!(" @5709={a:?} @5710={b:?}")
+                }
+                (104, _) => {
+                    let c = self
+                        .store
+                        .read(crate::value::VarRef::new(crate::value::VarSpace::Dollar, 5682), &[])
+                        .ok();
+                    let pos = self
+                        .store
+                        .read(crate::value::VarRef::new(crate::value::VarSpace::At, 5674), &[])
+                        .ok();
+                    let live_text = self.text_bytes().len();
+                    let live_flags = self.text_flags_ref().len();
+                    let copy = self
+                        .store
+                        .read(crate::value::VarRef::new(crate::value::VarSpace::Dollar, 5590), &[])
+                        .ok();
+                    let copy_len = match &copy {
+                        Some(crate::value::Value::Str(b)) => Some(b.len()),
+                        _ => None,
+                    };
+                    format!(
+                        " $5682={c:?} pos={pos:?} live_text={live_text} live_flags={live_flags} copy5590={copy_len:?}"
+                    )
+                }
+                _ => String::new(),
+            };
+            eprintln!(
+                "[if] s{} pc{} truthy={} end={} else={}{probe}",
+                st.script_id,
+                cmd.pc,
+                truthy,
+                cmd.windows[2].rec.length,
+                cmd.windows[1].rec.length
+            );
+        }
         if truthy {
             return Ok(StepOutcome::Continue);
         }
@@ -618,7 +668,7 @@ impl Vm {
         }
     }
 
-    pub(super) fn label_from_window(
+    pub(crate) fn label_from_window(
         &mut self,
         st: &ExecState,
         cmd: &Cmd,
@@ -642,7 +692,7 @@ impl Vm {
     /// 其余调用方传 `false`,保持「空标签 = 标签不存在」。
     /// 求值只做一次:常量标签仍走 `label_cache`,动态标签不会因为空检查
     /// 被求值两次(表达式可能含 `_RND` 等有状态函数)。
-    pub(super) fn label_from_window_opt(
+    pub(crate) fn label_from_window_opt(
         &mut self,
         st: &ExecState,
         cmd: &Cmd,
@@ -703,7 +753,7 @@ impl Vm {
         Ok(Some(target))
     }
 
-    pub(super) fn jump_to(
+    pub(crate) fn jump_to(
         &mut self,
         st: &mut ExecState,
         to_script: u32,

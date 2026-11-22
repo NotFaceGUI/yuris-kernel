@@ -188,13 +188,30 @@ pub(super) fn array_needle(
 
 /// `VARINFO[NO=]`:SEARCH 的起始下标;按参数名解析(理由同 [`array_needle`])。
 pub(super) fn varinfo_no_slot(varinfo_names: &[String]) -> Option<u8> {
+    varinfo_slot(varinfo_names, "NO")
+}
+
+/// 参数名 → 0 基槽位(`VARINFO` 的 `NO`/`NO2` 等辅助参数)。
+pub(super) fn varinfo_slot(varinfo_names: &[String], name: &str) -> Option<u8> {
     varinfo_names
         .iter()
-        .position(|n| n == "NO")
+        .position(|n| n == name)
         .map(|i| i as u8)
 }
 
-pub(super) fn windows_error(cmd: &Cmd, detail: &str) -> yu_log::Diag {
+/// 555 `VARINFO[STRFIRST]` 的字符串比较:ASCII 大小写不敏感、逐字节。
+///
+/// 官方 `FUN_00471840` 默认分支把 `A..Z` 降为小写后逐字节比较;CP932
+/// 尾字节落在 `0x41..0x5A` 时同样会被降格,这里保持一致(不做 lead-byte
+/// 跳过 —— 官方也没有跳)。
+pub(super) fn str_less_ci(a: &[u8], b: &[u8]) -> bool {
+    a.iter()
+        .map(u8::to_ascii_lowercase)
+        .cmp(b.iter().map(u8::to_ascii_lowercase))
+        .is_lt()
+}
+
+pub(crate) fn windows_error(cmd: &Cmd, detail: &str) -> yu_log::Diag {
     diag::fatal(
         code::rt::CMD_WINDOWS,
         Boundary::Script,
@@ -211,7 +228,7 @@ pub(super) fn windows_error(cmd: &Cmd, detail: &str) -> yu_log::Diag {
 /// 故抽成本函数统一口径。
 /// `GOSUB`/`RETURN` 参数编号守卫(1..=16)。零分配快路径:编号合法就直接
 /// 返回 0 基下标;不合法才回到旧路径取参数名生成**原文案**(含 ysc 表异常)。
-pub(super) fn checked_param_index(
+pub(crate) fn checked_param_index(
     n: usize,
     opcode: u8,
     slot: u8,
@@ -225,7 +242,7 @@ pub(super) fn checked_param_index(
     param_slot_index(&pname, slot, command)
 }
 
-pub(super) fn param_slot_index(name: &str, slot: u8, command: &str) -> Result<usize, VmError> {
+pub(crate) fn param_slot_index(name: &str, slot: u8, command: &str) -> Result<usize, VmError> {
     let n = param_index_of(name).unwrap_or(1);
     if !(1..=16).contains(&n) {
         return Err(diag::fatal(

@@ -57,7 +57,7 @@ const NEST_LIMIT: usize = 64;
 /// → `CMP EAX, 0x40; JE <报错>`。即**新深度 == 64** 就报错,允许的最大深度
 /// 是 63 层调用栈帧;`task+0x140` 初值 0(只有调用帧计数,基帧不在其中)。
 /// 故允许的 GOSUB 次数 = 64,对应本实现 `frames.len() == 65`(基帧 + 64 帧)。
-const GOSUB_MAX_CALLS: usize = 64;
+pub(crate) const GOSUB_MAX_CALLS: usize = 64;
 
 /// 运行核依赖的命令名(处理器注册表;缺任一 ⇒ 工程表不完整 ⇒ 拒绝启动)。
 ///
@@ -83,7 +83,7 @@ pub fn required_commands(yscm: &crate::tables::YscmTable) -> Result<(), yu_log::
 
 /// 分派热路径的处理器类别(启动期按工程 `ysc.ybn` 名字解析成 opcode 下标表;
 /// 每条命令一次数组取下标,替代逐名字符串比较)。
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandlerKind {
     Gosub,
     Return,
@@ -230,19 +230,89 @@ const NOOP_COMMANDS_0495: &[&str] = &[
     "VAR",
 ];
 
+/// v555 分发表中**未被覆盖**的槽(默认体 `0x45c63c` 型)。
+///
+/// 2026-11-21 全量反编译:6 个 555 构建(2.1MB 族 / <v555-pc> / <v555-1> /
+/// <v555-2>)的 121 槽表在此集合上完全一致。默认体是
+/// `FUN_0046c0cc(0xdbbd2, 1); return -1`,即脚本执行错误,不是空操作。
+const DEFAULT_SLOT_COMMANDS_0555: &[&str] = &[
+    "F_FLT",
+    "F_INT",
+    "F_STR",
+    "F_VAR",
+    "G_FLT",
+    "G_FLT2",
+    "G_FLT3",
+    "G_FLT4",
+    "G_INT",
+    "G_INT2",
+    "G_INT3",
+    "G_INT4",
+    "G_STR",
+    "G_STR2",
+    "G_STR3",
+    "G_STR4",
+    "G_VAR",
+    "MACRO",
+    "S_VAR",
+    "_IFDEF",
+    "_IFNDEF",
+    "_IFEND",
+    "SYSTEMMODE",
+    "COMPILEMODE",
+    "RELEASEMODE",
+    "PROJECTFOLDER",
+];
+
+/// v555 分发表中映射到共享空操作体(`0x423168` 型,`xor eax,eax; ret`)
+/// 的命令。与 0.495 的差异:**ALIAS 在 555 是空操作**;
+/// `LABEL`/`SAVEINFO`/`VAR` 在 555 是真实处理体(但仅 guard/return 0),
+/// 因此不在本清单里。
+const NOOP_COMMANDS_0555: &[&str] = &[
+    "ALIAS",
+    "DEBUGLIST",
+    "PREP",
+    "RETURNBREAK",
+    "S_INT",
+    "S_FLT",
+    "S_STR",
+];
+
+/// v555 分发表里是**真实地址**、但语义等价于 no-op 的三条。
+///
+/// 2026-11-21 反编译:
+/// - `LABEL` `0x4437e8`(12B):`XOR EAX,EAX; RET`;
+/// - `SAVEINFO` `0x44dc44`(29B) / `VAR` `0x4532b8`(29B):
+///   `FUN_004254cd` 守卫后 `return 0`,正常路径无副作用。
+///
+/// 它们不在 `0x423168` 共享空操作体里,所以不能放进
+/// [`NOOP_COMMANDS_0555`];单列一张“guard/return 0”表。
+const GUARD_NOOP_COMMANDS_0555: &[&str] = &["LABEL", "SAVEINFO", "VAR"];
+
 /// 按工程 yscm 建表(名字 → 处理器类别)。表 = 数据解析结果,不是内置命令表。
 /// 注意:默认槽/无操作槽是 **0.495 引擎分发表**的属性;命令名与序号仍来自
 /// 工程 `ysc.ybn`(DIV-RT-001 的版本隔离不因此改变)。
 pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> {
+    // 555 是独立商业分支:默认槽/共享空操作清单来自 555 exe 的分发表,
+    // 不能把 0.495 清单当成 555 的充分依据。556/600 没有样本,继续走
+    // legacy 清单(不自动继承 555)。
+    let v555 = yscm.version == 555;
+    let (default_slots, noop_slots) = if v555 {
+        (DEFAULT_SLOT_COMMANDS_0555, NOOP_COMMANDS_0555)
+    } else {
+        (DEFAULT_SLOT_COMMANDS_0495, NOOP_COMMANDS_0495)
+    };
     let mut table = Vec::with_capacity(yscm.len());
     for i in 0..yscm.len() {
         // 良性:未声明命令名只影响诊断显示,不参与分派语义。
         let name = yscm.command(i as u8).map(|c| c.name.as_str()).unwrap_or("");
         // 官方槽位判定先于域分类:`SYSTEMMODE` 虽以 SYSTEM 开头,但分发表
         // 未覆盖它 ⇒ 执行到就是脚本执行错误,不能当域事件静默放过。
-        let kind = if DEFAULT_SLOT_COMMANDS_0495.contains(&name) {
+        let kind = if default_slots.contains(&name) {
             HandlerKind::ScriptError
-        } else if NOOP_COMMANDS_0495.contains(&name) {
+        } else if noop_slots.contains(&name)
+            || (v555 && GUARD_NOOP_COMMANDS_0555.contains(&name))
+        {
             HandlerKind::Noop
         } else {
             match name {
@@ -298,10 +368,14 @@ pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> 
                 // 表序号/参数名由工程 `ysc.ybn` 直接给出;其它序号未见样本,
                 // 按解析器一系处理(Likely,注释留档)。
                 "CSV" => {
+                    // 0.466/v474 是真实解析器;0.479/0.495 同序号 7 无 LINE 时
+                    // 是空桩。v555 也是序号 7 且无 LINE,但处理体是真实 CSV
+                    // 解析器(`0x43c3a0`,1148B;<v555-1> 变体 1682B)。因此版本
+                    // 555 必须走 Csv,不能再套 0.495 的空桩判据。
                     let has_line = yscm
                         .command(i as u8)
                         .is_some_and(|c| c.params.iter().any(|p| p.name == "LINE"));
-                    if has_line || i != 7 {
+                    if v555 || has_line || i != 7 {
                         HandlerKind::Csv
                     } else {
                         HandlerKind::NoopEval
@@ -349,7 +423,7 @@ const IMAGE_HEADER_PROBE: usize = 4096;
 
 mod control;
 mod file_io;
-mod helpers;
+pub(crate) mod helpers;
 mod media_info;
 mod system;
 mod text;
@@ -501,6 +575,11 @@ impl Vm {
             self.record_command(st, cmd, for_command);
         } else {
             self.record_command(st, cmd, Vec::new());
+        }
+
+        // 独立运行面(精确 555 安装):先拦截商业分支命令;None 交回共享旧路径。
+        if let Some(result) = self.other_intercept_command(st, cmd) {
+            return result;
         }
 
         match kind {
@@ -714,5 +793,72 @@ impl Vm {
                 Ok(StepOutcome::Continue)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tables::YscmTable;
+    use yu_format::yscm::{Arg, Command, CommandTable};
+
+    fn synthetic(version: u32) -> YscmTable {
+        let mut commands = Vec::with_capacity(121);
+        for i in 0..121u8 {
+            let name = match i {
+                0 => "ALIAS".to_string(),
+                7 => "CSV".to_string(),
+                117 => "SYSTEMMODE".to_string(),
+                _ => format!("X{i}"),
+            };
+            // v555 CSV 无 LINE 参数(与 0.495 同形);ALIAS/SYSTEMMODE 无参。
+            let args: Vec<Arg> = if i == 7 {
+                vec![
+                    Arg {
+                        name: "FILE".into(),
+                        flag: 1,
+                        kind: 0,
+                    },
+                    Arg {
+                        name: "LET".into(),
+                        flag: 0,
+                        kind: 0,
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            commands.push(Command {
+                name: name.into(),
+                argc: args.len() as u8,
+                args,
+            });
+        }
+        YscmTable::from_format(CommandTable {
+            version,
+            commands,
+            messages: vec![Vec::new(); 37],
+            key_table: Box::new([0u8; 256]),
+        })
+        .expect("synthetic yscm")
+    }
+
+    #[test]
+    fn v555_routes_alias_and_csv_from_555_dispatch_table() {
+        let t = build_handler_table(&synthetic(555));
+        assert_eq!(t[0], HandlerKind::Noop, "v555 ALIAS = 0x423168 no-op");
+        assert_eq!(t[7], HandlerKind::Csv, "v555 CSV = 真实解析器");
+        assert_eq!(
+            t[117],
+            HandlerKind::ScriptError,
+            "v555 SYSTEMMODE 仍是默认错误槽"
+        );
+    }
+
+    #[test]
+    fn legacy_routes_keep_0495_stub_semantics() {
+        let t = build_handler_table(&synthetic(495));
+        assert_eq!(t[0], HandlerKind::Unknown, "0.495 表没有 ALIAS");
+        assert_eq!(t[7], HandlerKind::NoopEval, "0.495 CSV 是空桩");
     }
 }

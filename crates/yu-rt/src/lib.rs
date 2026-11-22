@@ -53,6 +53,7 @@ mod image;
 pub mod input;
 pub mod json;
 pub mod rng;
+mod other;
 pub mod scriptpos;
 pub mod semantics;
 pub mod sysvar;

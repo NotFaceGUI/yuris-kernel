@@ -173,6 +173,12 @@ pub struct BootConfig {
     /// `FUN_00427350` case 112 = `MOVSX EBP,byte [0x801324]`。
     /// 缺省 0 = 文件缺失/全零(两种在官方都等价于 0)。
     pub save_path_type: i64,
+    /// 存档盘剩余字节数(v555 `PRODUCT[COM=34]` 的宿主能力)。
+    ///
+    /// 官方 `0x45c1d0` 是 `GetDiskFreeSpaceExA(path, &free, …)`,结果写 LET。
+    /// 该值不是引擎状态,必须由宿主按存档根计算;`None` = 宿主未提供,
+    /// `PRODUCT[COM=34]` 写 0 并留 aligned-stub(不猜磁盘容量)。
+    pub disk_free_bytes: Option<u64>,
     /// `MATH[RND]` 的 MT19937 种子(引擎用 `GetTickCount`,非确定)。
     /// 缺省 5489 = MT19937 参考种子,保证同输入同输出(DIV-RT-014)。
     pub rng_seed: u32,
@@ -218,6 +224,7 @@ impl Default for BootConfig {
             dx_mode: 0,
             window_init_pos: 0,
             save_path_type: 0,
+            disk_free_bytes: None,
             rng_seed: 5489,
             // 事件流记录开关(默认开;结构体字段文档有完整说明)。
             record_events: true,
@@ -583,6 +590,8 @@ pub struct Vm {
     window_init_pos: i64,
     /// `@_SAVE_PATH_TYPE`(宿主从 `yssfs.dat` 读入;见 `BootConfig`)。
     save_path_type: i64,
+    /// 存档盘剩余字节数(v555 `PRODUCT[COM=34]`;宿主注入)。
+    disk_free_bytes: Option<u64>,
     /// `MATH[RND]` 的 MT19937(DIV-RT-014)。
     rng: crate::rng::Mt19937,
     record_events: bool,
@@ -692,6 +701,15 @@ pub struct Vm {
     /// 剪贴板文本镜像(CP932 原始字节)。`CLIPACT` 写、`CLIPINFO` 读;
     /// 宿主可经 [`Vm::set_clipboard`] 注入外部剪贴板内容。
     clipboard: Vec<u8>,
+    /// 独立商业分支运行面状态（仅在精确 555 安装；旧版 None）。
+    pub(crate) other: Option<crate::other::State>,
+    /// v555 `_DROPFILE` / `_DROPFILE_NUM`:`PRODUCT[COM=21/24]` 的枚举结果
+    /// (只有文件名,不含 `PSTR` 目录前缀)。555 的场景加载器用这对系统
+    /// 变量把 `scenario/` 下的文件逐个交给 `TEXT[FILE]`/标签表。
+    drop_files: Vec<Vec<u8>>,
+    /// 最近一次 `TEXT[FILE]` 写入的行数(v555 `PRODUCT[COM=23]` 的行数
+    /// 来源;555 的 label lexer 在每份文件后调用 `COM=23` 取行数)。
+    last_text_lines: usize,
     /// `ERROR` 的逐命令启用表(引擎 `0x689b00`;默认全 1,REA `0x462124`)。
     command_enable: Vec<u8>,
     unimplemented_cmds: BTreeMap<String, u64>,
@@ -701,6 +719,9 @@ pub struct Vm {
     /// `TASKINFO` LET 类型不符诊断的「只报一次」去重集(按 query + 目标类型)。
     /// 引擎每次都会打印错误(`0x465cdc`),但脚本热循环里重复报告只会刷屏。
     taskinfo_type_reported: std::collections::BTreeSet<String>,
+    /// v555 自定界补读的分歧记录「只报一次」去重集
+    /// (`(script_id, pc, 参数槽)`;见 `SemanticProfile::window_payload`)。
+    window_payload_reported: std::collections::BTreeSet<(u32, u32, u16)>,
     /// 事件队列容量上限(任务书 E R10:长跑不得无界增长)。
     event_capacity: usize,
     /// 因容量上限被丢弃的最旧事件数(可观测,不静默)。
@@ -856,7 +877,11 @@ impl Vm {
             semantics,
             label_cache: rustc_hash::FxHashMap::default(),
             scheduler: Scheduler::new(),
-            store: VariableStore::new(),
+            store: {
+                let mut store = VariableStore::new();
+                store.partial_index = semantics.partial_index;
+                store
+            },
             exec: rustc_hash::FxHashMap::default(),
             exec_slot: None,
             exec_slot_seq: u64::MAX,
@@ -891,6 +916,7 @@ impl Vm {
             dx_mode: cfg.dx_mode,
             window_init_pos: cfg.window_init_pos,
             save_path_type: cfg.save_path_type,
+            disk_free_bytes: cfg.disk_free_bytes,
             rng: crate::rng::Mt19937::new(cfg.rng_seed),
             record_events: cfg.record_events,
             handler_of,
@@ -934,11 +960,15 @@ impl Vm {
             dialogs: Vec::new(),
             next_dialog_id: 1,
             clipboard: Vec::new(),
+            other: None,
+            drop_files: Vec::new(),
+            last_text_lines: 0,
             command_enable: vec![1u8; 128],
             unimplemented_cmds: BTreeMap::new(),
             unimplemented_reported: std::collections::BTreeSet::new(),
             aligned_stub_reported: std::collections::BTreeSet::new(),
             taskinfo_type_reported: std::collections::BTreeSet::new(),
+            window_payload_reported: std::collections::BTreeSet::new(),
             event_capacity: DEFAULT_EVENT_CAPACITY,
             events_dropped: 0,
             cur_script: script_id,
@@ -1250,6 +1280,16 @@ impl Vm {
         self.save_host = Some(host);
     }
 
+    /// 安装独立运行面（仅精确 555 由引擎调用；旧版不调用）。
+    pub fn install_other_runtime(&mut self) {
+        crate::other::install(self);
+        crate::other::apply_initial_script_statics(self);
+    }
+
+    pub(crate) fn main_script_id(&self) -> Option<u32> {
+        self.exec.get(MAIN_TASK_ID).map(|st| st.script_id)
+    }
+
     /// 取走存档宿主。
     pub fn take_save_host(&mut self) -> Option<Box<dyn crate::event::SaveHost>> {
         self.save_host.take()
@@ -1337,6 +1377,17 @@ impl Vm {
         self.start_ms
     }
 
+    /// 只读系统变量(证据/诊断用;不执行脚本、不改状态)。
+    pub fn debug_sysvar(&self, id: u16, indices: &[i64]) -> Result<Value, yu_log::Diag> {
+        let st = ExecState::new(0, 0);
+        crate::sysvar::read(
+            self,
+            &st,
+            crate::value::VarRef::new(crate::value::VarSpace::At, id),
+            indices,
+        )
+    }
+
     /// 宿主注入的本地时间基准(`@_TIME`;`None` = 确定性注入时钟)。
     pub fn local_time(&self) -> Option<HostLocalTime> {
         self.local_time
@@ -1348,6 +1399,74 @@ impl Vm {
 
     pub fn argv(&self) -> &[Vec<u8>] {
         &self.argv
+    }
+
+    /// v555 `_DROPFILE_NUM`:最近一次 `PRODUCT[COM=21/24]` 枚举的文件数。
+    #[must_use]
+    pub fn drop_files_len(&self) -> usize {
+        self.other
+            .as_ref()
+            .map_or(self.drop_files.len(), |state| state.drop_files.len())
+    }
+
+    /// v555 `_DROPFILE(i)`:枚举结果第 `i` 个**文件名**(不含目录前缀)。
+    #[must_use]
+    pub fn drop_file(&self, index: usize) -> Option<&[u8]> {
+        match self.other.as_ref() {
+            Some(state) => state.drop_files.get(index).map(Vec::as_slice),
+            None => self.drop_files.get(index).map(Vec::as_slice),
+        }
+    }
+
+    /// 最近一次 `TEXT[FILE]` 的行数(v555 `PRODUCT[COM=23]` 来源)。
+    #[must_use]
+    pub fn last_text_lines(&self) -> usize {
+        self.other
+            .as_ref()
+            .map_or(self.last_text_lines, |state| state.last_text_lines)
+    }
+
+    /// 仍在链上、可被调度的任务数(宿主判“主任务走完但子任务仍在跑”用)。
+    #[must_use]
+    pub fn live_tasks(&self) -> usize {
+        self.scheduler.live_tasks()
+    }
+
+    /// 当前正在执行的任务 id(独立运行面按任务分栈用)。
+    pub(crate) fn current_task(&self) -> &str {
+        &self.cur_task
+    }
+
+    /// v555 `PRODUCT[COM=21/24]`:按 VFS 目录前缀填充 `_DROPFILE` 表。
+    ///
+    /// 官方处理体在宿主文件系统/引擎路径表上枚举(COM 21 `FindFirstFileA`、
+    /// COM 24 扫描引擎文件表);本内核把同一语义落到**已挂载数据源**
+    /// (`src` → `aux`),这样封包内的 `scenario/` 与散盘覆盖层都能看到。
+    /// 只返回直接子文件的名字(与官方 `cFileName` 一致;目录项按官方
+    /// COM 21 的写法带 `/` 后缀,本函数保留,调用方自会拼接)。
+    ///
+    /// 上限 0x2000 与官方拖放表一致(`FUN_0045a785` 的比较常量)。
+    /// 读取已挂载数据源(`src` → `aux`)某前缀下的直接子文件。
+    ///
+    /// 中性能力:旧版不调用;独立运行面 `PRODUCT[COM=21/24]` 用它填充
+    /// `_DROPFILE`。上限 0x2000 与官方拖放表一致。
+    pub(crate) fn list_asset_dir(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
+        let Ok(key) = yu_vfs::LookupKey::new(prefix, yu_vfs::Codec::Cp932) else {
+            return Vec::new();
+        };
+        let entries = match self.src.list(&key) {
+            Ok(entries) => entries,
+            Err(_) => match self.aux.as_ref().map(|aux| aux.list(&key)) {
+                Some(Ok(entries)) => entries,
+                _ => return Vec::new(),
+            },
+        };
+        entries
+            .into_iter()
+            .filter(|e| !matches!(e.kind, yu_vfs::EntryKind::Dir))
+            .map(|e| e.name)
+            .take(0x2000)
+            .collect()
     }
 
     pub fn screen(&self) -> (u32, u32) {
@@ -1414,6 +1533,11 @@ impl Vm {
     /// `@_SAVE_PATH_TYPE`(宿主从 `yssfs.dat` 偏移 0x54 读入)。
     pub fn save_path_type(&self) -> i64 {
         self.save_path_type
+    }
+
+    /// 存档盘剩余字节数(宿主注入;`None` = 未提供)。
+    pub fn disk_free_bytes(&self) -> Option<u64> {
+        self.disk_free_bytes
     }
 
     /// `@_TEXT_NUM`:工程文本总数。
@@ -1518,6 +1642,14 @@ impl Vm {
     }
 
     /// 文本层状态快照(诊断/探针;渲染走 [`Self::text_frame`])。
+    pub(crate) fn text_window_none(&self) -> bool {
+        self.text.window().is_none()
+    }
+
+    pub(crate) fn text_line_complete_now(&self) -> bool {
+        self.text.line_complete()
+    }
+
     pub fn text_state(&self) -> crate::text::TextSnapshot {
         crate::text::TextSnapshot::from(&self.text)
     }
@@ -1599,6 +1731,12 @@ impl Vm {
         // 官方 `0x446b98`(id 0x7a)只把 RHS 逐字节拷进 `[state+0x38]`,
         // 不重建 `+0x3c/+0x40..+0x5c` 表、不动游标(DIV-RT-032)。
         self.text.bytes = bytes;
+    }
+
+    /// 清系统文本缓冲(`TEXT[CLEAR=1]` 的通用能力;独立运行面的
+    /// `TEXT[FILE,CLEAR]` 也复用同一状态操作)。
+    pub(crate) fn clear_text(&mut self) {
+        self.text.clear();
     }
 
     /// 替换 `$_TEXT_FLAG` 控制字节流。
@@ -2240,6 +2378,26 @@ impl Vm {
         }
     }
 
+    /// 同一条命令的**不同变体**(如 `PRODUCT` 的 `COM=`)各只报一次,
+    /// 但命令计数仍记在原命令名下。
+    pub(crate) fn report_unimplemented_variant(
+        &mut self,
+        command: &str,
+        variant: &str,
+        detail: &str,
+    ) {
+        match self.unimplemented_cmds.get_mut(command) {
+            Some(hit) => *hit += 1,
+            None => {
+                self.unimplemented_cmds.insert(command.to_string(), 1);
+            }
+        }
+        let key = format!("{command}/{variant}");
+        if self.unimplemented_reported.insert(key) {
+            self.report(diag::cmd_unimplemented(command, detail.to_string()));
+        }
+    }
+
     /// aligned-stub 命令(MIDI 族 `0x44aa40/60/80`、CDDA `0x429fb0`):
     /// 官方 0.495 处理体是空桩,内核同型对齐 —— **不计挂号表**(它不是
     /// 未实现),只以 Info 诊断标注归属,每个命令名只报一次(事件流不刷屏)。
@@ -2270,10 +2428,16 @@ impl Vm {
 
     fn ensure_script(&mut self, script_id: u32) -> Result<(), Diag> {
         if self.tables.script(script_id).is_some() {
+            if let Some(result) = self.other_on_script_loaded(script_id) {
+                result?;
+            }
             return Ok(());
         }
         self.tables.load_script(self.src.as_ref(), script_id)?;
         self.apply_script_locals(script_id);
+        if let Some(result) = self.other_on_script_loaded(script_id) {
+            result?;
+        }
         Ok(())
     }
 
@@ -2320,8 +2484,13 @@ impl Vm {
             }
         };
         cmd.windows.clear();
+        let record_delimited = self.semantics.window_payload
+            == crate::semantics::WindowPayloadMode::RecordDelimited;
+        let window_codec = self.script_codec;
+        // 555 自定界补读的窗口(只报一次;记录 (参数槽, 声明长度, 实际长度))。
+        let mut stale_windows: Vec<(u8, u32, u32)> = Vec::new();
         for rec in script.group_windows(st.pc as usize) {
-            let payload = script.window_payload(rec).ok_or_else(|| {
+            let strict = script.window_payload(rec).ok_or_else(|| {
                 diag::fatal(
                     code::fmt::OUT_OF_BOUNDS,
                     Boundary::Format,
@@ -2331,9 +2500,37 @@ impl Vm {
                     ),
                 )
             })?;
-            let instrs = crate::expr::decode(payload)
+            let mut instrs = crate::expr::decode(strict)
                 .ok()
                 .map(Rc::<[crate::expr::RawInstr]>::from);
+            let mut extended: Option<Vec<u8>> = None;
+            if record_delimited {
+                // 只在“窗口首记录就是字符串”时走自定界重解:过期长度/被截短
+                // 的字符串参数都是这种形态;跳转槽等非表达式窗口保持原样,
+                // 避免把目标组号当载荷去补读。
+                let retry = strict.first() == Some(&0x4d)
+                    && match &instrs {
+                        Some(_) => crate::expr::window_literal_unclosed(strict, window_codec),
+                        None => true,
+                    };
+                if retry {
+                    if let Some((window, tail)) = script.window_payload_with_tail(rec) {
+                        if let Some((records, new_len)) =
+                            crate::expr::decode_self_delimited(window, tail, window_codec)
+                        {
+                            if new_len > window.len() {
+                                let start = rec.offset as usize;
+                                if let Some(bytes) = script.pool().get(start..start + new_len) {
+                                    extended = Some(bytes.to_vec());
+                                    stale_windows.push((rec.kind, rec.length, new_len as u32));
+                                }
+                            }
+                            instrs = Some(Rc::<[crate::expr::RawInstr]>::from(records));
+                        }
+                    }
+                }
+            }
+            let payload: &[u8] = extended.as_deref().unwrap_or(strict);
             let const_value = instrs.as_deref().and_then(crate::expr::const_value_instrs);
             let lvalue_plan = instrs.as_deref().and_then(crate::expr::lvalue_plan);
             let simple = instrs.as_deref().and_then(crate::expr::simple_expr);
@@ -2360,6 +2557,21 @@ impl Vm {
         // `VARACT` 的参数名计划:站点级静态事实,执行期不再逐次扫描参数名。
         cmd.varact_plan = (name == "VARACT")
             .then(|| handlers::build_varact_plan(&cmd.param_names, &cmd.windows));
+        for (kind, declared, actual) in stale_windows {
+            let key = (st.script_id, st.pc, u16::from(kind));
+            if self.window_payload_reported.insert(key) {
+                self.report(diag::verbose(
+                    code::rt::WINDOW_LENGTH_STALE,
+                    Boundary::Format,
+                    format!(
+                        "s{} pc={}:窗口参数 {kind} 的 length={declared} 小于记录自定界 \
+                         {actual} 字节;已按界定符补读(v555;汉化/重打包遗留元数据,\
+                         见 DIV-RT-068)",
+                        st.script_id, st.pc
+                    ),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -2863,6 +3075,12 @@ impl VarAccess for VmAccess<'_> {
         } else {
             self.vm.store.read(var, indices)?
         };
+        if std::env::var_os("YU_MACRO_TRACE").is_some() && var.id == 0x0499 {
+            eprintln!(
+                "[read1177] indices={indices:?} partial={} -> {:?}",
+                self.vm.store.partial_index, value
+            );
+        }
         if dollar_at {
             Ok(Value::Str(value.to_event_repr().into_bytes()))
         } else {
@@ -3037,6 +3255,9 @@ impl TaskExecutor for Vm {
     /// 自动模式当前显示段是否已推进到缓冲末尾(`FUN_004046fc` 收尾判据
     /// `0x404818`:游标 >= 标志总数)。停在 `'C'` 时返回 false,等点击。
     fn text_reveal_complete(&self) -> bool {
+        if let Some(v) = self.other_text_reveal_complete() {
+            return v;
+        }
         self.text.line_complete()
     }
 
@@ -3062,6 +3283,19 @@ impl Vm {
         // (取指缓存已有),不逐条复制字符串;任务名只在任务切换时重写。
         self.cur_script = st.script_id;
         self.cur_pc = cmd.pc;
+        if std::env::var_os("YU_PC_TRACE").is_some()
+            && st.script_id == 65
+            && (150..=185).contains(&cmd.pc)
+        {
+            let name = self
+                .tables
+                .boot
+                .yscm
+                .command(cmd.opcode)
+                .map(|c| c.name.as_str())
+                .unwrap_or("?");
+            eprintln!("[pc65] pc={} op={} cmd={name}", cmd.pc, cmd.opcode);
+        }
         if self.cur_task_seq != task.seq {
             self.cur_task_seq = task.seq;
             self.cur_task.clear();

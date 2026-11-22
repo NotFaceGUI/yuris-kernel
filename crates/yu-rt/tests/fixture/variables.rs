@@ -2289,3 +2289,211 @@ fn varact_cut_without_let_writes_back_to_set() {
     );
 }
 
+
+/// 0.495 工程(ysc 495):官方处理体不读 `SJISCODE`,必须保持无操作。
+/// 这是跨版本隔离的负用例;v555 正用例见下一条。
+#[test]
+fn varinfo_sjiscode_is_inert_on_495_projects() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b"yuu"),
+        },
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(7),
+        },
+    ];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(101)
+            .window(0, ex::r#ref(0x24, sys))
+            .window(15, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, sys + 1)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 1), &[])
+            .unwrap(),
+        Value::Int(7),
+        "0.495 的 SJISCODE 是惰性槽,不得改写 LET"
+    );
+    let stub = vm.events().iter().any(|e| {
+        matches!(
+            e,
+            yu_rt::VmEvent::Diag { code, .. } if code.to_string() == "rt.cmd.aligned_stub"
+        )
+    });
+    assert!(stub, "应留一条 aligned-stub 取证");
+}
+
+/// `VARINFO[SJISCODE]` = `SET` 字符串**首字符**的 Shift-JIS 码。
+///
+/// 证据(v555 处理体 `0x455200`):`0x4554a9` 分支读 `SET` 首字节;
+/// 单字节直接写字节值,lead byte 走 `0x455b9c`(`SHL EAX,8` +
+/// `MOVZX ECX,[EDX+1]` + `ADD`)⇒ `(lead << 8) | trail`。555 的剧本词法器
+/// (`es_scenario_lexer.yst`)把每一行按字符送进来做分类,是整条剧本链的
+/// 前置条件;0.495 处理体不读该槽,故旧版语料不受影响。
+#[test]
+fn varinfo_sjiscode_returns_first_char_code() {
+    let mut b = ProjectBuilder::new();
+    // v555 工程(ysc 头 555)才计算 SJISCODE;0.495 见下一条负用例。
+    b.ysc_version = 555;
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b"yuu"),
+        },
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(7),
+        },
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys + 2,
+            value_type: 3,
+            dims: vec![],
+            init: Init::Str(b"\x82\xa0"),
+        },
+        VarSpec {
+            kind: 1,
+            group: 1,
+            script_id: 0,
+            var_id: sys + 3,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(7),
+        },
+    ];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        // 半角:首字符 'y' ⇒ 0x79。
+        GroupSpec::new(101)
+            .window(0, ex::r#ref(0x24, sys))
+            .window(15, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, sys + 1)),
+        // 全角:CP932 0x82A0 ⇒ 0x82A0。
+        GroupSpec::new(101)
+            .window(0, ex::r#ref(0x24, sys + 2))
+            .window(15, ex::i8_(1))
+            .window(1, ex::r#ref(0x40, sys + 3)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 1), &[])
+            .unwrap(),
+        Value::Int(0x79),
+        "半角首字符 'y' → 0x79"
+    );
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 3), &[])
+            .unwrap(),
+        Value::Int(0x82A0),
+        "全角 0x82A0 → (lead<<8)|trail"
+    );
+}
+
+/// v555 `VARINFO[STRFIRST]`:在 `[NO, NO2]` 闭区间内找字典序最小元素,
+/// 返回其下标(ASCII 大小写不敏感;REA `0x455200`)。
+#[test]
+fn varinfo_strfirst_returns_smallest_index_case_insensitively() {
+    let mut b = ProjectBuilder::new();
+    // 自定 555 参数表:SET/LET/STRFIRST/NO/NO2。
+    let varinfo = &mut b
+        .commands
+        .iter_mut()
+        .find(|(n, _)| *n == "VARINFO")
+        .expect("fixture VARINFO")
+        .1;
+    *varinfo = vec![
+        ("SET", 0, 0),
+        ("LET", 0, 0),
+        ("STRFIRST", 0, 3),
+        ("NO", 0, 0),
+        ("NO2", 0, 0),
+    ];
+    let op_let = b.commands.iter().position(|(n, _)| *n == "LET").unwrap() as u8;
+    let op_varinfo = b.commands.iter().position(|(n, _)| *n == "VARINFO").unwrap() as u8;
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys,
+            value_type: 3,
+            dims: vec![3],
+            init: Init::Str(b""),
+        },
+        VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + 1,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(-1),
+        },
+    ];
+    let elem = |i: i8| ex::cat(&[ex::r#ref(0x24, sys), ex::i8_(i), ex::aload()]);
+    b.scripts = vec![vec![
+        GroupSpec::new(op_let).window(0, elem(0)).window(1, ex::sb(b"B")),
+        GroupSpec::new(op_let).window(0, elem(1)).window(1, ex::sb(b"a")),
+        GroupSpec::new(op_let).window(0, elem(2)).window(1, ex::sb(b"c")),
+        GroupSpec::new(op_varinfo)
+            .window(0, ex::r#ref(0x24, sys))
+            .window(1, ex::r#ref(0x40, sys + 1))
+            .window(2, ex::i8_(1))
+            .window(3, ex::i8_(0))
+            .window(4, ex::i8_(2)),
+        GroupSpec::new(OP_END),
+    ]];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + 1), &[])
+            .unwrap(),
+        Value::Int(1),
+        "大小写不敏感:'a' < 'B' < 'c' ⇒ 下标 1"
+    );
+}

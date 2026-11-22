@@ -189,6 +189,8 @@ pub struct ProjectBuilder {
     pub sysvars_abi: bool,
     /// 故意省略的表(测"缺表拒启"):`"ysc" | "ysl" | "ysv" | "yst_list" | "yscfg" | "ycd"`。
     pub omit: Vec<&'static str>,
+    /// YSCM 头里的工程版本(默认 495;v555 用例设 555,供按版本裁决的语义分支使用)。
+    pub ysc_version: u32,
 }
 
 impl ProjectBuilder {
@@ -205,6 +207,7 @@ impl ProjectBuilder {
             entry_pc: 0,
             sysvars_abi: false,
             omit: Vec::new(),
+            ysc_version: 495,
         }
     }
 
@@ -277,8 +280,11 @@ impl ProjectBuilder {
         let mut src = MemSource::new(Codec::Cp932);
         let omit = |k: &str| self.omit.contains(&k);
         if !omit("ysc") {
-            src.insert(b"ysbin/ysc.ybn", build_yscm(&self.commands))
-                .unwrap();
+            src.insert(
+                b"ysbin/ysc.ybn",
+                build_yscm_with_version(&self.commands, self.ysc_version),
+            )
+            .unwrap();
         }
         if !omit("ysl") {
             src.insert(b"ysbin/ysl.ybn", build_yslb(&self.labels))
@@ -1044,9 +1050,13 @@ pub fn default_sysvars() -> Vec<(&'static str, u8, Vec<u32>)> {
 // ---------------------------------------------------------------- 序列化
 
 pub fn build_yscm(commands: &[CommandSpec]) -> Vec<u8> {
+    build_yscm_with_version(commands, 495)
+}
+
+pub fn build_yscm_with_version(commands: &[CommandSpec], version: u32) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"YSCM");
-    out.extend_from_slice(&495u32.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&(commands.len() as u32).to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
     for (name, params) in commands {

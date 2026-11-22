@@ -317,9 +317,9 @@ impl Vm {
 
     /// 按给定路径读资产字节:工程包优先,散盘(`aux`)作备。
     ///
-    /// `CGINFO[SX/SY]` 的图像头探测与 `YMV[FILE]` 的容器解析共用这一步;
-    /// 候选序(扩展名)由调用方决定,不在这里猜。
-    pub(super) fn open_asset(&mut self, path: &[u8]) -> Option<Vec<u8>> {
+    /// `CGINFO[SX/SY]` 的图像头探测、`YMV[FILE]` 的容器解析与独立运行面的
+    /// `TEXT[FILE]` 共用这一步;候选序(扩展名)由调用方决定,不在这里猜。
+    pub(crate) fn open_asset(&mut self, path: &[u8]) -> Option<Vec<u8>> {
         let lookup = yu_vfs::LookupKey::new(path, yu_vfs::Codec::Cp932).ok()?;
         match self.src.open(&lookup) {
             Ok(bytes) => Some(bytes),

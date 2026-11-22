@@ -4,6 +4,51 @@
 
 use super::common::*;
 
+/// v555 `_STR(slot<1000, index)`:官方 `FUN_004213bc` 的字符串系统变量
+/// case(如 `_ARGV`/`_SYSTEM_PATH`)必须被 `_STR` 读到,而不是返回空串。
+#[test]
+#[ignore = "v555 other 模块: _STR 动态访问器已从共享 sysvar 移出,用例随 other/sysvar 迁入"]
+fn str_dynamic_accessor_reads_system_string_vars_below_1000() {
+    let mut b = ProjectBuilder::new();
+    b.scripts = vec![vec![GroupSpec::new(OP_END)]];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let cfg = yu_rt::BootConfig {
+        argv: vec![b"alpha".to_vec()],
+        paths: yu_rt::vm::HostPaths {
+            system_path: Some(b"C:\\sys".to_vec()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let vm = yu_rt::Vm::boot(Box::new(b.build()), cfg).expect("boot");
+    let st = yu_rt::vm::ExecState::new(0, 0);
+
+    let str_id = vm.sysvars().id("_STR").expect("_STR id");
+    let argv_id = vm.sysvars().id("_ARGV").expect("_ARGV id");
+
+    // `_STR(_ARGV, 0)` = `_ARGV[0]`。
+    let argv = yu_rt::sysvar::read(
+        &vm,
+        &st,
+        VarRef::new(VarSpace::At, str_id),
+        &[i64::from(argv_id), 0],
+    )
+    .expect("_STR(_ARGV,0)");
+    assert_eq!(argv, Value::Str(b"alpha".to_vec()));
+
+    // `_STR(_SYSTEM_PATH, 0)` = 宿主注入路径(标量字符串变量)。
+    let sys_path_id = vm.sysvars().id("_SYSTEM_PATH").expect("_SYSTEM_PATH id");
+    let path = yu_rt::sysvar::read(
+        &vm,
+        &st,
+        VarRef::new(VarSpace::At, str_id),
+        &[i64::from(sys_path_id), 0],
+    )
+    .expect("_STR(_SYSTEM_PATH)");
+    assert_eq!(path, Value::Str(b"C:\\sys".to_vec()));
+}
+
 #[test]
 fn unimplemented_command_is_recorded_once_and_execution_continues() {
     let mut b = ProjectBuilder::new();

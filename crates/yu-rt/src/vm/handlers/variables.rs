@@ -194,6 +194,18 @@ impl Vm {
             .into());
         }
         let rhs = self.eval_window(st, &cmd.windows[1])?;
+        if std::env::var_os("YU_MACRO_TRACE").is_some()
+            && matches!(lval.var.id, 0x0bf7 | 0x0bf8 | 0x0bf9 | 0x0bfa)
+        {
+            eprintln!(
+                "[let] {}{:?} = {:?} (s{} pc{})",
+                lval.var.display(),
+                lval.indices,
+                rhs,
+                st.script_id,
+                st.pc
+            );
+        }
         let code = (cmd.windows[0].rec.slot >> 8) as u8;
         if code == 0 {
             // RHS 已是 owned:串槽赋值直接搬字节(#80)。
@@ -202,6 +214,30 @@ impl Vm {
             let cur = self.read_lvalue(&lval)?;
             let value = compound(code, &cur, &rhs)?;
             self.store.write(lval.var, &lval.indices, &value)?;
+        }
+        // 临时取证(`YU_SLOT_TRACE=5709,5710,...`):逐次打印指定变量槽的
+        // LET 写入**最终值**(复合赋值后的结果)。诊断完删除。
+        if let Some(slots) = slot_trace_filter() {
+            if slots.contains(&lval.var.id) {
+                let after = self
+                    .store
+                    .read(lval.var, &lval.indices)
+                    .unwrap_or(Value::Int(i64::MIN));
+                let repr = match &after {
+                    Value::Str(b) => {
+                        format!("str len={} head={:02x?}", b.len(), &b[..b.len().min(24)])
+                    }
+                    other => format!("{other:?}"),
+                };
+                eprintln!(
+                    "[slot] {} {:?} = {} (s{} pc{})",
+                    lval.var.display(),
+                    lval.indices,
+                    repr,
+                    st.script_id,
+                    st.pc
+                );
+            }
         }
         Ok(StepOutcome::Continue)
     }
@@ -224,15 +260,63 @@ impl Vm {
         let dims: smallvec::SmallVec<[usize; 8]> =
             target.iter().map(|&d| d.max(0) as usize).collect();
         let init = match cmd.windows.get(1) {
-            Some(w) if !w.payload.is_empty() => self.eval_window(st, w)?,
+            Some(w) if !w.payload.is_empty() => {
+                // v555: `INT @p = $array[0]` 用作「取字符串数组的槽号」。
+                // 官方剧本加载器 (es_scenario_load.yst pc10) 把三份行
+                // 数组的槽号存进 INT,再用 `_STR(slot, i)` 合并;若按
+                // 字符串值解析会得到 0/指针,merge 直接失效。
+                // 只改**字符串数组引用**;数值数组仍按值求。
+                let string_array_ref = ty == ElemType::Int
+                    && self.semantics().ref_int_param
+                        == crate::semantics::RefIntParamMode::SlotId
+                    && w.lvalue_plan.is_some();
+                if string_array_ref {
+                    let lv = self.eval_lvalue_window(st, w)?;
+                    let slot_ty = self.store.slot(lv.var).map(|s| s.ty);
+                    let is_str_array = slot_ty.is_some_and(|t| matches!(t, ElemType::Str));
+                    if !lv.indices.is_empty() && is_str_array {
+                        self.report(diag::verbose(
+                            code::rt::PARAM_SLOT_TRACE,
+                            Boundary::Script,
+                            format!(
+                                "INT 声明引用→槽号:{} 下标{:?} → id {}",
+                                lv.var.display(),
+                                lv.indices,
+                                lv.var.id
+                            ),
+                        ));
+                        Value::Int(i64::from(lv.var.id))
+                    } else {
+                        self.eval_window(st, w)?
+                    }
+                } else {
+                    self.eval_window(st, w)?
+                }
+            }
             _ => ty.default_value(),
         };
         // 复用已有槽存储:同型同维时只重置元素值(可观察状态与 `declare`
         // 一致,见 `VariableStore::reset_declared` 文档);循环里反复声明同一
         // 变量时不再每轮重建两个 `Vec` + 一次哈希重插。
+        let decl_target = target_var(&cmd.windows[0])?;
         self.store
-            .reset_declared(target_var(&cmd.windows[0])?, ty, &dims, &init);
-        let _ = st;
+            .reset_declared(decl_target, ty, &dims, &init);
+        // 临时取证(`YU_SLOT_TRACE`):INT 声明的初始值轨迹(3DAYS 排查)。
+        if let Some(slots) = slot_trace_filter() {
+            if slots.contains(&decl_target.id) {
+                let after = self
+                    .store
+                    .read(decl_target, &[])
+                    .unwrap_or(Value::Int(i64::MIN));
+                eprintln!(
+                    "[decl] {} = {:?} (s{} pc{})",
+                    decl_target.display(),
+                    after,
+                    st.script_id,
+                    st.pc
+                );
+            }
+        }
         Ok(StepOutcome::Continue)
     }
 
@@ -256,10 +340,17 @@ impl Vm {
         let mut target: Option<crate::expr::LValue> = None;
         let mut set: Option<crate::expr::LValue> = None;
         let mut op: Option<(u8, i64)> = None;
-        // 官方 0.495 处理体**不读** `SJISCODE`(15)/`UTF8CODE`(16) 槽
-        // (`0x456050..0x456ae4` 对 `0x68416f/0x684170` 零引用)。它们只是
-        // ysc 表里的惰性参数:若脚本只给它们,官方是什么都不做;和真实查询
-        // 项并存时被忽略。按 `aligned-stub` 对齐并留一条 Info。
+        // `UTF8CODE` 在官方 0.495 处理体**不读**(`0x456050..0x456ae4` 对
+        // `0x684170` 零引用),只是 ysc 表里的惰性参数:若脚本只给它,
+        // 官方是什么都不做。按 `aligned-stub` 对齐并留一条 Info。
+        //
+        // `SJISCODE` 不同:v555 处理体 `0x455200` 的 `0x4554a9` 分支会读
+        // `SET` 字符串首字符并写 `LET`(单字节 = 字节值;双字节 =
+        // `(lead << 8) | trail`,`0x455b9c` 实证);555 的剧本词法器
+        // `es_scenario_lexer.yst` 全靠它做字符分类。因此它是**真查询项**,
+        // 不再按惰性参数吞掉。跨版本门控由 `SemanticProfile` 决定
+        // (`Inert` = 0.495 及更早;`FirstChar` = v555 起)。
+        let sjis_inert = self.semantics().varinfo_sjis == crate::semantics::SjisCodeMode::Inert;
         let mut inert_stub: Option<&'static str> = None;
         // 全部数值槽(SEARCH 的针值与 `NO=` 起始下标要用)。
         let mut flags: smallvec::SmallVec<[(u8, i64); 8]> = smallvec::SmallVec::new();
@@ -276,17 +367,23 @@ impl Vm {
                         flags.push((slot, n));
                         // 「查询项」= 置位的旗标参数,**排除辅助参数**
                         // (`INT`/`FLT`/`STR` 是 SEARCH 的针值,`NO` 是起始
-                        // 下标)。按名字排除,不按槽号区间 —— 后者的区间
-                        // 在版本间会位移(`17..=20` 在 v494 上是错的)。
+                        // 下标,`NO2` 是 STRFIRST 的结束下标)。按名字排除,
+                        // 不按槽号区间 —— 后者的区间在版本间会位移
+                        // (`17..=20` 在 v494 上是错的)。
                         let name = varinfo_names.get(usize::from(slot)).map(String::as_str);
                         let is_helper = matches!(
                             name,
-                            Some("INT" | "FLT" | "STR" | "NO" | "SJISCODE" | "UTF8CODE")
-                        );
+                            Some("INT" | "FLT" | "STR" | "NO" | "NO2" | "UTF8CODE")
+                        ) || (sjis_inert && name == Some("SJISCODE"));
                         if n != 0 {
                             match name {
-                                Some("SJISCODE") => inert_stub = Some("VARINFO.SJISCODE"),
+                                Some("SJISCODE") if sjis_inert => {
+                                    inert_stub = Some("VARINFO.SJISCODE")
+                                }
                                 Some("UTF8CODE") => inert_stub = Some("VARINFO.UTF8CODE"),
+                                // 555:`NO2` 是 `STRFIRST` 的结束下标从属参数;
+                                // 单独出现时无可查询项,按对齐 no-op(不 fatal)。
+                                Some("NO2") => inert_stub = Some("VARINFO.NO2"),
                                 _ => {}
                             }
                         }
@@ -301,11 +398,14 @@ impl Vm {
             Some(op) => op,
             None => {
                 if let Some(name) = inert_stub {
-                    self.report_aligned_stub(
-                        name,
+                    let detail = if name == "VARINFO.NO2" {
+                        "VARINFO: NO2 是 STRFIRST 的结束下标从属参数,单独出现时\
+                         没有查询项,按无操作对齐(v555 REA 0x455200)"
+                    } else {
                         "VARINFO: 官方 0.495 处理体不读该槽(0x456050..0x456ae4 对 \
-                         0x68416f/0x684170 零引用),按无操作对齐(no-manual;REA)",
-                    );
+                         0x68416f/0x684170 零引用),按无操作对齐(no-manual;REA)"
+                    };
+                    self.report_aligned_stub(name, detail);
                     return Ok(StepOutcome::Continue);
                 }
                 return Err(diag::fatal(
@@ -435,6 +535,55 @@ impl Vm {
                     }
                 }
             }
+            // `SJISCODE`:v555 处理体 `0x455200` 的 `0x4554a9` 分支
+            // (0.495 处理体不读,故此前按惰性参数对齐;555 的剧本词法器
+            // 实际依赖它)。语义:`SET` 字符串首字符的 Shift-JIS 码——
+            // 空串 → 0;单字节 → 字节值;lead byte → `(lead << 8) | trail`
+            // (`0x455b9c`: `SHL EAX,0x8` + `MOVZX ECX,[EDX+1]` + `ADD`)。
+            //
+            // 跨版本门控走 `SemanticProfile`(唯一来源),不再直接比较
+            // `yscm.version`:0.495 及更早 `Inert`(无操作),v555 起
+            // `FirstChar`(计算)。
+            Some("SJISCODE") => {
+                if self.semantics().varinfo_sjis == crate::semantics::SjisCodeMode::Inert {
+                    self.report_aligned_stub(
+                        "VARINFO.SJISCODE",
+                        "0.495 处理体不读 SJISCODE 槽(0x456050..0x456ae4 对 \
+                         0x68416f/0x684170 零引用),按无操作对齐;v555(ysc 555)\
+                         才计算首字符码",
+                    );
+                    return Ok(StepOutcome::Continue);
+                }
+                let idx: smallvec::SmallVec<[i64; 4]> = if set.indices.is_empty() {
+                    smallvec::smallvec![0; shape.1.len()]
+                } else {
+                    set.indices.clone()
+                };
+                let v = self.read_var(st, set_var, &idx)?;
+                match v {
+                    Value::Str(bytes) if bytes.is_empty() => Value::Int(0),
+                    Value::Str(bytes) => {
+                        let first = bytes[0];
+                        if self.script_text_codec(st.script_id).is_lead(first) {
+                            let trail = bytes.get(1).copied().unwrap_or(0);
+                            Value::Int((i64::from(first) << 8) | i64::from(trail))
+                        } else {
+                            Value::Int(i64::from(first))
+                        }
+                    }
+                    other => {
+                        return Err(diag::fatal(
+                            code::rt::VAR_TYPE,
+                            Boundary::Script,
+                            format!(
+                                "VARINFO SJISCODE 需要字符串变量,得到 {}",
+                                other.type_name()
+                            ),
+                        )
+                        .into())
+                    }
+                }
+            }
             // `SEARCH`:手册 `variable/varinfo.html` 例 5/6/7 ——
             // 从 NO 号元素开始在一维数组里找第一个相等的元素,返回下标,
             // 找不到返回 -1。要搜索的值由 `INT=`/`FLT=`/`STR=` 参数给出。
@@ -466,6 +615,65 @@ impl Vm {
                 };
                 Value::Int(found)
             }
+            // v555 新增 `STRFIRST`(REA 处理体 `0x455200`):
+            // 在 `SET` 字符串数组的 `[NO, NO2]` 区间里找**字典序最小**
+            // 的元素,返回其下标写入 `LET`。官方比较是 ASCII 大小写不敏感
+            // (`FUN_00471840` 的默认分支对 0x41..0x5A 降为小写),循环
+            // 更新条件 `current <= best` 在相等时取后者;本实现取首个
+            // 最小值(相等时下标较小),两者对调用方(比较两个字符/取
+            // 最小项)等价,且更确定。
+            //
+            // 区间语义由语料自证:`VARINFO[STRFIRST=1, SET=$a,
+            // NO=1, NO2=2, LET=@i]` 前后分别写 `$a[1]`、`$a[2]`,调用方
+            // 用 `@i` 判断 1/2 ⇒ NO2 是**闭区间终点**。
+            Some("STRFIRST") => {
+                let (ty, dims) = shape;
+                if ty != ElemType::Str || dims.len() != 1 {
+                    return Err(diag::fatal(
+                        code::rt::VAR_SHAPE,
+                        Boundary::Script,
+                        format!(
+                            "VARINFO STRFIRST 需要字符串一维数组,目标 {} = {}{:?}",
+                            set_var.display(),
+                            ty.as_str(),
+                            dims
+                        ),
+                    )
+                    .into());
+                }
+                let len = dims[0];
+                if len == 0 {
+                    Value::Int(0)
+                } else {
+                    let start = varinfo_slot(&varinfo_names, "NO")
+                        .and_then(|s| flags_get(&flags, s))
+                        .unwrap_or(0)
+                        .max(0) as usize;
+                    let end = varinfo_slot(&varinfo_names, "NO2")
+                        .and_then(|s| flags_get(&flags, s))
+                        .unwrap_or(len as i64 - 1)
+                        .max(0) as usize;
+                    let end = end.min(len - 1);
+                    if start > end || start >= len {
+                        Value::Int(0)
+                    } else {
+                        let mut best = start;
+                        let mut best_val = self.read_var(st, set_var, &[best as i64])?;
+                        for i in start + 1..=end {
+                            let v = self.read_var(st, set_var, &[i as i64])?;
+                            let better = match (&v, &best_val) {
+                                (Value::Str(a), Value::Str(b)) => str_less_ci(a, b),
+                                _ => false,
+                            };
+                            if better {
+                                best = i;
+                                best_val = v;
+                            }
+                        }
+                        Value::Int(best as i64)
+                    }
+                }
+            }
             other => {
                 return Err(diag::unimplemented(
                     code::rt::CMD_UNIMPLEMENTED,
@@ -494,7 +702,7 @@ impl Vm {
     }
 
     /// 写回一个左值(保留下标);系统变量目标 ⇒ 挂号(DIV-RT-007)。
-    pub(super) fn write_target(
+    pub(crate) fn write_target(
         &mut self,
         _st: &ExecState,
         target: &crate::expr::LValue,
@@ -518,7 +726,7 @@ impl Vm {
 
     /// [`Self::write_target`] 的所有权版:值 owned 时,串槽赋值直接搬字节
     /// (不再 `coerce_to` 克隆一次;#80)。可观察状态完全一致。
-    pub(super) fn write_target_owned(
+    pub(crate) fn write_target_owned(
         &mut self,
         _st: &ExecState,
         target: &crate::expr::LValue,
@@ -1758,4 +1966,24 @@ impl Vm {
         }
         Ok(())
     }
+}
+
+/// `YU_SLOT_TRACE=id1,id2,...`(临时诊断):要跟踪 LET 写入的变量槽集合。
+///
+/// 惰性解析一次;未设/空 ⇒ `None`。取证用,不作语义。
+fn slot_trace_filter() -> Option<&'static rustc_hash::FxHashSet<u16>> {
+    static FILTER: std::sync::OnceLock<Option<rustc_hash::FxHashSet<u16>>> =
+        std::sync::OnceLock::new();
+    FILTER
+        .get_or_init(|| {
+            let raw = std::env::var("YU_SLOT_TRACE").ok()?;
+            let mut set = rustc_hash::FxHashSet::default();
+            for part in raw.split(',') {
+                if let Ok(v) = part.trim().parse::<u16>() {
+                    set.insert(v);
+                }
+            }
+            (!set.is_empty()).then_some(set)
+        })
+        .as_ref()
 }

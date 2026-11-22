@@ -65,6 +65,11 @@ pub mod rt {
     pub const VAR_TYPE: &str = "rt.var.type";
     /// 表达式记录流损坏(操作数长度越界)。
     pub const EXPR_MALFORMED: &str = "rt.expr.malformed";
+    /// 窗口记录 `length` 小于表达式记录自声明长度(v555 自定界补读)。
+    ///
+    /// 只在 `WindowPayloadMode::RecordDelimited` 且成功按记录补读时记录;
+    /// 汉化/重打包改了内容没同步窗口记录时出现(见 DIV-RT-068)。
+    pub const WINDOW_LENGTH_STALE: &str = "rt.window.length_stale";
     /// 表达式操作码未取证。
     pub const EXPR_UNSUPPORTED: &str = "rt.expr.unsupported";
     /// 整数除零(引擎为硬件异常,内核按 Fatal 处理并留档)。
@@ -93,6 +98,18 @@ pub mod rt {
     pub const TEXT_FLAG: &str = "rt.text.flag";
     /// `TEXT[ID]` 未命中已存在层(官方 `0x4538a7` 报错并返回 -1)。
     pub const TEXT_LAYER: &str = "rt.text.layer";
+    /// v555 `TEXT[FILE]` 资源打不开(官方处理体返回 -1,调用方回退)。
+    pub const TEXT_FILE: &str = "rt.text.file";
+    /// v555 `TEXT[FILE]` 成功装载(verbose;行数/目标变量,用于排查剧本链)。
+    pub const TEXT_FILE_LINES: &str = "rt.text.file.lines";
+    /// `PRODUCT` 每次调用的参数快照(verbose 跟踪,不是未取证语义)。
+    pub const PRODUCT_TRACE: &str = "rt.product.trace";
+    /// GOSUB 整数参数按槽号传递的跟踪(verbose,不是未取证语义)。
+    pub const PARAM_SLOT_TRACE: &str = "rt.param.slot";
+    /// `SAVE`/`LOAD` 的 `MEM` 优先分支跟踪(verbose,不是未取证语义)。
+    pub const MEM_TRACE: &str = "rt.mem.trace";
+    /// `FILEINFO[CGFILE]` 存在性探测跟踪(verbose,不是未取证语义)。
+    pub const FILEINFO_TRACE: &str = "rt.fileinfo.trace";
 }
 
 /// 全部已登记错误码(顺序稳定)。唯一性由单元测试守卫。
@@ -134,6 +151,12 @@ pub const ALL_CODES: &[&str] = &[
     rt::CSV,
     rt::TEXT_FLAG,
     rt::TEXT_LAYER,
+    rt::TEXT_FILE,
+    rt::TEXT_FILE_LINES,
+    rt::PRODUCT_TRACE,
+    rt::PARAM_SLOT_TRACE,
+    rt::MEM_TRACE,
+    rt::FILEINFO_TRACE,
 ];
 
 /// 码是否已登记。

@@ -348,6 +348,19 @@ impl Scheduler {
         }
     }
 
+    /// 仍在链上、可被调度的任务数(不含已 `finished`/被 `TASKEND` 摘链)。
+    ///
+    /// 商业 555 作的 `SYSTEM_START` 主任务会在启动定义链结束后自然走完,
+    /// 此时 title/scenario 子任务仍在跑;宿主不能用 `main_finished` 单独
+    /// 判“游戏结束”,要配合本计数。
+    #[must_use]
+    pub fn live_tasks(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|n| !n.finished && n.active && n.enabled)
+            .count()
+    }
+
     /// 工程护栏(诊断/失控对拍);引擎本身无每帧泵上限。
     pub fn with_pump_cap(mut self, cap: Option<usize>) -> Self {
         self.pump_cap = cap;

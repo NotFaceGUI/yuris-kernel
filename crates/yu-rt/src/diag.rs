@@ -23,6 +23,11 @@ pub fn info(code: &'static str, boundary: Boundary, detail: impl Into<String>) -
     Diag::new(code, Severity::Info, boundary).with_detail(detail)
 }
 
+/// 最低档:只在 `--log-level verbose` 显示的正常事实(不训练用户忽略日志)。
+pub fn verbose(code: &'static str, boundary: Boundary, detail: impl Into<String>) -> Diag {
+    Diag::new(code, Severity::Verbose, boundary).with_detail(detail)
+}
+
 /// 脚本位置的诊断构造。
 pub fn at_script(mut diag: Diag, file: impl Into<String>, pc: u32, cmd: Option<String>) -> Diag {
     diag.where_ = Loc::script(file, None, pc, cmd);
