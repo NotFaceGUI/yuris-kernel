@@ -23,7 +23,8 @@ fn main() {
             println!("== {name}: 表里没有 ==");
             continue;
         };
-        println!("== {name} ==");
+        let opcode = tables.boot.yscm.commands.iter().position(|x| x.name == name);
+        println!("== {name} (opcode={opcode:?}) ==");
         for (i, p) in c.params.iter().enumerate() {
             println!("  {i:3} {:10} kind={:?} checker={}", p.name, p.kind, p.checker);
         }

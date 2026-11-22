@@ -7,6 +7,7 @@ use yu_engine::project::Project;
 use yu_format::Codec;
 use yu_rt::event::VmEvent;
 use yu_rt::input::{InputFrame, InputTimeline};
+use yu_rt::value::{VarRef, VarSpace};
 use yu_rt::{BootConfig, Vm};
 
 fn main() {
@@ -35,8 +36,16 @@ fn main() {
     let src = project.open_source().expect("source");
     let aux = project.open_aux().expect("aux");
     let save_root = project.root().join("save");
+    // 与 Engine/yu-cli 同一条编码路线:默认 Auto(原版 CP932),
+    // 只有显式 `PROBE_VM_PATCH=gbk|big5|original` 才改全局执行 codec。
+    // 不得把 GBK 写死:555 样本含 CP932/GBK/Big5 多语言语料。
+    let patch = std::env::var("PROBE_VM_PATCH")
+        .ok()
+        .and_then(|v| yu_engine::patch::PatchSelection::parse(&v).ok())
+        .unwrap_or_default();
+    let profile = patch.profile(&project).expect("patch profile");
     let cfg = BootConfig {
-        entry_label: "SYSTEM_START".into(),
+        entry_label: std::env::var("PROBE_VM_ENTRY").unwrap_or_else(|_| "SYSTEM_START".into()),
         fps: 60,
         screen_color: 32,
         dx_mode: 1,
@@ -52,9 +61,13 @@ fn main() {
             personal_path: Some(format!("{}/", project.root().display()).into_bytes()),
             project_path: Some(format!("{}/", project.root().display()).into_bytes()),
         },
+        codecs: profile.codecs(),
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(src, Some(aux), cfg).expect("boot");
+    if vm.tables().boot.yscm.version == 555 {
+        vm.install_other_runtime();
+    }
     let scripts = vm.tables().boot.scripts.clone();
     let name = |sid: u32| -> String {
         scripts
@@ -106,6 +119,16 @@ fn main() {
                         .iter()
                         .map(|a| format!("{:?}", a.value))
                         .collect();
+                    if std::env::var_os("TRACE_ALL").is_some()
+                        || (std::env::var_os("TRACE_CMD").is_some()
+                            && matches!(*script, 55 | 58 | 60 | 61 | 130 | 214))
+                    {
+                        println!(
+                            "CMD f{tick} s{script}({}) pc{pc} {cmd} [{}]",
+                            name(*script),
+                            arg_repr.join(", ")
+                        );
+                    }
                     recent.push_back(format!(
                         "f{tick} s{script} pc{pc} {cmd} [{}]",
                         arg_repr.join(", ")
@@ -115,11 +138,54 @@ fn main() {
                     }
                 }
                 VmEvent::DomainCall {
-                    name: cmd, args, ..
+                    name: cmd,
+                    args,
+                    script,
+                    pc,
+                    ..
                 } if cmd == "DIALOG" => {
                     let flags = vm.text_flags();
                     let bytes = vm.text_bytes().to_vec();
-                    println!("=== DIALOG @f{tick} args={args:?}");
+                    println!(
+                        "=== DIALOG @f{tick} s{script:?} pc{pc:?} args={args:?}",
+                    );
+                    // 标签重复取证:s58 的当前标签、token 三元组、已注册标签表。
+                    let rd = |space: VarSpace, id: u16, idx: &[i64]| {
+                        vm.store()
+                            .read(VarRef::new(space, id), idx)
+                            .ok()
+                            .and_then(|v| match v {
+                                yu_rt::value::Value::Int(i) => Some(format!("{i}")),
+                                yu_rt::value::Value::Str(b) => {
+                                    Some(Codec::Cp932.decode(&b, b"v").unwrap_or_default())
+                                }
+                                other => Some(format!("{other:?}")),
+                            })
+                            .unwrap_or_else(|| "<none>".to_string())
+                    };
+                    println!(
+                        "label $2909={} @2883={}",
+                        rd(VarSpace::Dollar, 2909, &[]),
+                        rd(VarSpace::At, 2883, &[])
+                    );
+                    let n = vm
+                        .store()
+                        .scalar_int(VarRef::new(VarSpace::At, 2883))
+                        .unwrap_or(0)
+                        .clamp(0, 16);
+                    for i in 0..n {
+                        println!(
+                            "  tok[{i}] ty={} txt={}",
+                            rd(VarSpace::At, 2915, &[i]),
+                            rd(VarSpace::Dollar, 2914, &[i])
+                        );
+                    }
+                    for i in 0..8 {
+                        let v = rd(VarSpace::Dollar, 2878, &[i]);
+                        if v != "<none>" {
+                            println!("  reg[{i}]={v}");
+                        }
+                    }
                     println!(
                         "TEXT_FLAG len={} hex={:02x?} ascii={:?}",
                         flags.len(),

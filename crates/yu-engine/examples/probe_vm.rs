@@ -21,12 +21,18 @@ fn main() {
         .nth(3)
         .unwrap_or_else(|| "SYSTEM_START".into());
     let project = Project::discover(Path::new(&root), None).expect("project");
+    // 与 `yu-cli run --mode headless` 对齐:软后端 + 可选补丁编码路线。
+    let patch = std::env::var("PROBE_VM_PATCH")
+        .ok()
+        .and_then(|v| yu_engine::patch::PatchSelection::parse(&v).ok())
+        .unwrap_or_default();
     let mut engine = Engine::new(
         project,
         EngineOptions {
-            backend: Backend::Wgpu,
+            backend: Backend::Soft,
             entry,
             record_events: false,
+            patch,
             ..EngineOptions::default()
         },
     )
@@ -49,8 +55,9 @@ fn main() {
     }
     for frame in 1..=frames {
         let rendered = engine.tick().expect("tick");
+        let report = engine.take_diag_report();
         if std::env::var_os("PROBE_VM_WAIT").is_some() {
-            for task in engine.take_diag_report().waiting_tasks {
+            for task in report.waiting_tasks {
                 println!(
                     "wait f={frame} id={} s{} pc{} frames={} deadline={:?} text={} main={}",
                     task.id,
@@ -63,18 +70,27 @@ fn main() {
                 );
             }
         }
+        if let Ok(needle) = std::env::var("PROBE_VM_DIAG") {
+            for d in &report.diags {
+                if needle.is_empty() || d.detail.contains(&needle) {
+                    println!("diag f={frame} {} {}", d.code, d.detail);
+                }
+            }
+        }
         if frame % 10 == 0 || frame <= 3 {
             let report = &rendered.report;
             let movie = engine.movie_backend_active();
             let pos = engine.current_position();
             println!(
-                "f={frame} engine={} ops={}/{} layers={} vis={} movie={} pos={:?}",
+                "f={frame} engine={} ops={}/{} layers={} vis={} movie={} main={} live={} pos={:?}",
                 report.frame,
                 report.executed,
                 report.ops,
                 report.layers,
                 report.visible,
                 movie,
+                engine.main_finished(),
+                engine.live_tasks(),
                 pos
             );
         }
