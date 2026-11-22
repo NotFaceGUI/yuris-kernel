@@ -1,0 +1,16 @@
+[package]
+name = "yu-host-disk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Read-only host disk-space query (v555 PRODUCT[COM=34])"
+
+[lib]
+name = "yu_host_disk"
+path = "src/lib.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

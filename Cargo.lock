@@ -4186,6 +4186,7 @@ dependencies = [
  "yu-gfx",
  "yu-host-desktop",
  "yu-log",
+ "yu-movie-ffmpeg",
  "yu-platform-input",
  "yu-render-core",
  "yu-rt",
@@ -4200,6 +4201,7 @@ name = "yu-engine"
 version = "0.4.2"
 dependencies = [
  "log",
+ "memchr",
  "sha1",
  "sha2",
  "time",
@@ -4209,6 +4211,7 @@ dependencies = [
  "yu-font",
  "yu-format",
  "yu-gfx",
+ "yu-host-disk",
  "yu-log",
  "yu-movie-plmpeg",
  "yu-render-core",
@@ -4306,6 +4309,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "yu-host-disk"
+version = "0.4.2"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "yu-host-ios"
 version = "0.4.2"
 dependencies = [
@@ -4335,6 +4346,14 @@ version = "0.4.2"
 dependencies = [
  "log",
  "ndk-sys 0.6.0+11769913",
+ "yu-log",
+ "yu-rt",
+]
+
+[[package]]
+name = "yu-movie-ffmpeg"
+version = "0.4.2"
+dependencies = [
  "yu-log",
  "yu-rt",
 ]

@@ -239,10 +239,13 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         save_codec,
         // 补丁编码:缺省按工具产出自动识别,可用 `--patch` 覆盖。
         patch,
-        // 桌面没有注入外置影片后端:auto 等价 builtin;显式 external
-        // 时播片返回“本宿主没有外置解码”的可恢复诊断。
+        // 桌面外置影片后端 = 系统 ffmpeg/ffprobe 子进程(WMV/H.264 等
+        // 非 MPEG-1 的开场片);ffmpeg 缺失时 open 返回可恢复诊断,
+        // `Auto` 选择器回退内置 pl_mpeg(MPEG-1 语料仍可播)。
         movie_backend,
-        movie_external_factory: None,
+        movie_external_factory: Some(yu_engine::engine::MovieHostFactory::new(|| {
+            Box::new(yu_movie_ffmpeg::FfmpegMovieHost::new())
+        })),
         // 窗口图标:从工程根 exe 的 RT_GROUP_ICON 抽(官方 YSIcon.exe
         // 写的就是这份资源),只有桌面宿主用得到。
         with_icon: true,

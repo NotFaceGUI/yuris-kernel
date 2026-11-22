@@ -27,7 +27,7 @@ path = "src/engine_main.rs"
 # `mimalloc` 默认开启(全局分配器,VM/渲染大量小对象);需要 A/B 时用
 # `--no-default-features --features desktop` 关掉。
 default = ["desktop", "mimalloc"]
-desktop = ["dep:yu-host-desktop"]
+desktop = ["dep:yu-host-desktop", "dep:yu-movie-ffmpeg"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
@@ -41,6 +41,7 @@ yu-backend-wgpu = { path = "../yu-render/wgpu" }
 yu-engine = { path = "../yu-engine" }
 yu-gfx = { path = "../yu-gfx" }
 yu-host-desktop = { path = "../yu-platform/host-desktop", optional = true }
+yu-movie-ffmpeg = { path = "../yu-platform/movie-ffmpeg", optional = true }
 yu-log = { path = "../yu-log" }
 yu-platform-input = { path = "../yu-platform/input" }
 yu-rt = { path = "../yu-rt" }

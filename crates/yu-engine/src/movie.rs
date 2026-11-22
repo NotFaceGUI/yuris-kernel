@@ -137,6 +137,11 @@ impl MovieHostSelector {
         host.open(file, bytes)?;
         self.active = Some(Active::External);
         self.apply_pending();
+        log::info!(
+            target: "yu-kernel",
+            "[movie] 外置后端已打开 {}",
+            String::from_utf8_lossy(file)
+        );
         Ok(())
     }
 }
