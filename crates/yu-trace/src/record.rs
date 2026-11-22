@@ -674,6 +674,9 @@ impl BootSummary {
             // `_SAVE_PATH_TYPE` 尚未进入 trace 头(现有样本恒 0,回放取默认值;
             // 非零 `yssfs.dat` 的回放闭环待补)。
             save_path_type: 0,
+            // 磁盘剩余空间是宿主事实,不进 trace 头;回放按未注入处理
+            // (PRODUCT[COM=34] 写 0,与“录制时宿主未提供”同型)。
+            disk_free_bytes: None,
             rng_seed: self.host.rng_seed,
             record_events: true,
             // trace 回放固定原版编码;补丁语料需要显式携带 profile 的回放,

@@ -1537,7 +1537,10 @@ impl Engine {
         if let Some(vm) = self.vm.as_mut() {
             vm.set_live_clock(None);
         }
-        self.tick_inner(now_ms, 0)
+        let result = self.tick_inner(now_ms, 0);
+        self.probe_skip_csel();
+        self.trace_csel_state();
+        result
     }
 
     /// 实时推进（`serve`/桌面用）：逻辑时钟按**真实墙钟**走，声音状态与
@@ -1573,7 +1576,10 @@ impl Engine {
         if let Some(vm) = self.vm.as_mut() {
             vm.set_live_clock(Some(HostClock::new(now, now_ms)));
         }
-        self.tick_inner(now_ms, delta_ms)
+        let result = self.tick_inner(now_ms, delta_ms);
+        self.probe_skip_csel();
+        self.trace_csel_state();
+        result
     }
 
     /// 暂停/无客户端时调用：丢弃暂停期间的真实时间，恢复时不快进。
@@ -1825,6 +1831,37 @@ impl Engine {
             );
         }
         let drawable = frame_has_drawable_output(&frame);
+        // 临时取证(`YU_FRAME_DUMP`):每 120 帧打印图层清单(3DAYS 黑屏排查)。
+        if drawable
+            && std::env::var_os("YU_FRAME_DUMP").is_some()
+            && self.frame >= 1200
+            && self.frame % 120 == 0
+        {
+            eprintln!("[frame] f={} layers={}", self.frame, frame.layers.len());
+            for layer in frame.layers.iter().take(60) {
+                let size = match layer.kind {
+                    yu_gfx::LayerKind::Image { size } => size,
+                    yu_gfx::LayerKind::Group { size } => size,
+                };
+                eprintln!(
+                    "[frame]   id={} z={} E={} A={} kind={} tex={}",
+                    layer.id.display(),
+                    layer.z,
+                    layer.visible,
+                    layer.alpha,
+                    size.map(|s| format!("{}x{}", s.width, s.height))
+                        .unwrap_or_else(|| "-".into()),
+                    match &layer.texture {
+                        yu_gfx::TextureRef::Asset(k) =>
+                            format!("Asset({})", String::from_utf8_lossy(k)),
+                        yu_gfx::TextureRef::Snapshot(id) => format!("Snapshot({})", id.0),
+                        yu_gfx::TextureRef::SolidBlack1x1 => "Solid1x1".into(),
+                        yu_gfx::TextureRef::None => "None".into(),
+                        other => format!("{other:?}"),
+                    }
+                );
+            }
+        }
 
         // 本帧图层/文本引用的资产必须在 render 前已有 CPU 像素:漏过
         // `CG[FILE]` 声明(例如 `CGACT ID2` 首次引用)或刚被预算回收的 key,
@@ -2052,8 +2089,91 @@ impl Engine {
     }
 
     /// 主任务已结束(脚本 `END` 或主脚本走完);宿主据此关闭窗口。
+    ///
+    /// **不要单独用它判“游戏结束”**:555 商业作的 `SYSTEM_START` 主任务
+    /// 会在启动定义链结束后自然走完,title/scenario 子任务仍在跑。宿主应
+    /// 配合 [`Self::live_tasks`](Self::live_tasks)(或 [`Self::lifecycle`])。
     pub fn main_finished(&self) -> bool {
         self.main_finished
+    }
+
+    /// 仍在链上的可调度任务数(主任务之外的 title/scenario 等子任务)。
+    #[must_use]
+    pub fn live_tasks(&self) -> usize {
+        self.vm.as_ref().map_or(0, Vm::live_tasks)
+    }
+
+    /// 只读取脚本变量当前值(证据/诊断用;不执行命令、不写状态)。
+    pub fn read_variable(
+        &self,
+        var: yu_rt::value::VarRef,
+        indices: &[i64],
+    ) -> Option<Result<yu_rt::value::Value, yu_log::Diag>> {
+        self.vm.as_ref().map(|vm| vm.store().read(var, indices))
+    }
+
+    /// 当前鼠标位置(证据/诊断用)。
+    pub fn input_cursor(&self) -> Option<(i64, i64)> {
+        self.vm.as_ref().map(|vm| vm.input().cursor())
+    }
+
+    /// 当前输入计数器(`@_INP` 同口径;证据/诊断用)。
+    pub fn input_inp(&self, index: i64) -> Option<Result<i64, yu_log::Diag>> {
+        self.vm.as_ref().map(|vm| vm.input().inp(index))
+    }
+
+    /// 当前 VM 时钟 `(now_ms, start_ms)`(证据/诊断用)。
+    pub fn vm_time(&self) -> Option<(u32, u32)> {
+        self.vm.as_ref().map(|vm| (vm.tick_now_ms(), vm.start_ms()))
+    }
+
+    /// 只读系统变量(证据/诊断用)。
+    pub fn read_sysvar(
+        &self,
+        id: u16,
+        indices: &[i64],
+    ) -> Option<Result<yu_rt::value::Value, yu_log::Diag>> {
+        self.vm.as_ref().map(|vm| vm.debug_sysvar(id, indices))
+    }
+
+    /// 取证用:`YU_CSEL_SKIP=1` 在第 1500 帧强制把 CSEL 选中槽写 1,
+    /// 用于绕过交互、单独观察 CSEL 之后的 logo/CAUTION 画面链。
+    fn probe_skip_csel(&mut self) {
+        if std::env::var_os("YU_CSEL_SKIP").is_none() || self.frame != 1500 {
+            return;
+        }
+        if let Some(vm) = self.vm.as_mut() {
+            let _ = vm.store_mut().write(
+                yu_rt::value::VarRef::new(yu_rt::value::VarSpace::At, 0x49b),
+                &[93, 2],
+                &yu_rt::value::Value::Int(1),
+            );
+        }
+    }
+
+    /// `YU_CSEL_TRACE=1` 时逐帧打印 CSEL 等待点相关状态(交互取证用)。
+    fn trace_csel_state(&self) {
+        if std::env::var_os("YU_CSEL_TRACE").is_none() {
+            return;
+        }
+        let Some(vm) = self.vm.as_ref() else { return };
+        let (x, y) = vm.input().cursor();
+        let read = |id: u16, indices: &[i64]| {
+            vm.store()
+                .read(
+                    yu_rt::value::VarRef::new(yu_rt::value::VarSpace::At, id),
+                    indices,
+                )
+                .ok()
+                .and_then(|v| v.as_int())
+        };
+        eprintln!(
+            "[csel] f={} cursor=({x},{y}) bt93_2={:?} c6={:?} live={}",
+            self.frame,
+            read(0x49b, &[93, 2]),
+            read(0x4c6, &[]),
+            self.live_tasks()
+        );
     }
 
     /// 最近一次全程序 `END` 的 `RESTART` 标志(官方 `[0x80152c]`)。
@@ -2074,7 +2194,11 @@ impl Engine {
             Lifecycle::Exited {
                 restart: self.restart_requested,
             }
-        } else if self.main_finished {
+        } else if self.main_finished && self.live_tasks() == 0 {
+            // 主任务走完 ≠ 会话结束:v555 的 `SYSTEM_START` 主任务在启动
+            // 定义链结束后自然走完,title/scenario 子任务仍在跑(见
+            // [`Self::main_finished`] 的注记)。只有子任务也为 0 才是
+            // "已无内容推进"。
             Lifecycle::Finished
         } else {
             Lifecycle::Running
@@ -3177,12 +3301,19 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         // `FUN_00460c80` 读 `<app>\yssfs.dat`,CRT fread 明文,只接受 0..=3)。
         // 文件缺失/全零 ⇒ 0,与官方等价。
         save_path_type: i64::from(read_save_path_type(project.root(), project.aux_root())),
+        // v555 `PRODUCT[COM=34]`:存档盘剩余字节数(官方 GetDiskFreeSpaceExA)。
+        // 只读查询;失败 ⇒ None,PRODUCT 写 0 并挂号。
+        disk_free_bytes: yu_host_disk::free_bytes(&save_root),
         codecs: patch_profile.codecs(),
         display: display.clone(),
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(source, Some(aux), boot)
         .map_err(|d| Failure::runtime(format!("boot 失败: {d}")))?;
+    // 独立商业分支运行面:只对精确 555 安装;旧版不安装,保持 c1549eb 行为。
+    if vm.tables().boot.yscm.version == 555 {
+        vm.install_other_runtime();
+    }
     // 游戏身份(窗口标题/图标/版本;宿主变量,不参与 VM 语义)。
     // 游戏名与 YU-RIS 版本都取自刚装载的表(数据自证),图标可选读 exe。
     let identity = crate::identity::Identity::from_boot(
@@ -3215,7 +3346,9 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
             from_config
         }
     };
-    let mut gfx_config = GfxConfig::new(viewport).with_display(display.clone());
+    let mut gfx_config = GfxConfig::new(viewport)
+        .with_display(display.clone())
+        .with_button_number_info(vm.tables().boot.yscm.version == 555);
     // 0.255 的 62 字节 YSCF 短头没有扩展名优先序字段(布局已判定为
     // "无该字段");此时把宿主自己的探测序**显式注入**,而不是让内核
     // 在 GfxState 里静默兜底(A5)。V5/V292 仍只认工程 yscfg。
@@ -3488,7 +3621,7 @@ fn detect_save_container_version(root: &std::path::Path) -> Option<u32> {
                 && path
                     .extension()
                     .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("exe"))
-                && !is_helper_exe(path)
+                && !crate::patch::is_helper_exe(path)
         })
         .filter_map(|path| {
             let len = path.metadata().ok()?.len();
@@ -3524,27 +3657,6 @@ fn detect_save_container_version(root: &std::path::Path) -> Option<u32> {
         }
     }
     None
-}
-
-/// 非游戏本体的辅助 exe(安装器/设置器/本仓库宿主):不参与存档版本探测。
-fn is_helper_exe(path: &std::path::Path) -> bool {
-    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-        return false;
-    };
-    matches!(
-        stem.to_ascii_lowercase().as_str(),
-        "inst"
-            | "install"
-            | "setup"
-            | "uninst"
-            | "uninstall"
-            | "ysicon"
-            | "yu-cli"
-            | "yu-serve"
-            | "yu-engine"
-            | "エンジン設定"
-            | "セーブファイル設定"
-    )
 }
 
 /// 在窗口内找第一条「寄存器/EAX 与 16 位以内立即数比较」的指令立即数。

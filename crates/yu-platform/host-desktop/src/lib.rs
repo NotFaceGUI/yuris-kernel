@@ -1346,7 +1346,7 @@ impl App {
                 ScriptAction::Close => {
                     self.close_requests += 1;
                     let decision = panic_guard::close_decision(
-                        self.engine.main_finished(),
+                        self.engine.lifecycle().is_terminal(),
                         self.close_requests,
                     );
                     match decision {
@@ -2703,8 +2703,10 @@ impl ApplicationHandler for App {
                 // 弹确认框/决定是否 END;宿主不得直接退出。脚本不处理时,
                 // 第二次关闭请求强制退出(宿主兜底,不是引擎语义)。
                 self.close_requests += 1;
-                match panic_guard::close_decision(self.engine.main_finished(), self.close_requests)
-                {
+                match panic_guard::close_decision(
+                    self.engine.lifecycle().is_terminal(),
+                    self.close_requests,
+                ) {
                     CloseAction::Exit => {
                         self.stopping = true;
                         event_loop.exit();
@@ -3531,7 +3533,10 @@ impl ApplicationHandler for App {
         }
         self.update_cursor_presentation();
         // 脚本 `END`(主任务结束)→ 正常收尾。
-        if self.engine.main_finished() {
+        // v555 的主任务走完后 title/scenario 子任务仍在跑,必须用
+        // `lifecycle()`(内部已排除 live_tasks>0);单用 `main_finished`
+        // 会让窗口在启动链刚跑完时提前退出。
+        if self.engine.lifecycle().is_terminal() {
             self.stopping = true;
             event_loop.exit();
             return;
