@@ -63,20 +63,27 @@ pub enum YscfLayout {
     V292,
     /// 官方 0.255:宽 +0x14/高 +0x18,titleLen @ 0x30。
     V255,
+    /// v500 商业包:宽 +0x10/高 +0x14,titleLen @ 0x58,title @ 0x5A。
+    ///
+    /// 证据:`<v500-sample>` 的 `ysbin/yscfg.ybn`(141B):
+    /// `+0x10=1920`、`+0x14=1080`、`+0x58 u16=51`、`+0x5A` 标题,
+    /// 文件恰好在标题末尾闭合。`+0x48..+0x58` 为新增未知 dword 区。
+    V500,
 }
 
 impl YscfLayout {
     /// 布局候选(固定顺序;只影响诊断文案,不影响裁决的唯一性)。
-    const ALL: [YscfLayout; 4] = [
+    const ALL: [YscfLayout; 5] = [
         YscfLayout::New,
         YscfLayout::Old,
         YscfLayout::V292,
         YscfLayout::V255,
+        YscfLayout::V500,
     ];
 
     fn width_off(self) -> usize {
         match self {
-            YscfLayout::New | YscfLayout::Old => 0x10,
+            YscfLayout::New | YscfLayout::Old | YscfLayout::V500 => 0x10,
             YscfLayout::V292 | YscfLayout::V255 => 0x14,
         }
     }
@@ -90,6 +97,7 @@ impl YscfLayout {
             YscfLayout::New => 0x4C,
             YscfLayout::Old | YscfLayout::V292 => 0x40,
             YscfLayout::V255 => 0x30,
+            YscfLayout::V500 => 0x58,
         }
     }
 
@@ -112,6 +120,7 @@ impl YscfLayout {
             YscfLayout::Old => "old",
             YscfLayout::V292 => "v292",
             YscfLayout::V255 => "v255",
+            YscfLayout::V500 => "v500",
         }
     }
 }
@@ -262,7 +271,7 @@ fn parse_with_layout(
     }
 
     let (file_priority_raw, switches, unknown_34, unknown_48, flag_18) = match layout {
-        YscfLayout::New => (
+        YscfLayout::New | YscfLayout::V500 => (
             [
                 u32_at(buf, 0x2C),
                 u32_at(buf, 0x30),
@@ -373,6 +382,20 @@ mod tests {
 
         let cfg = Yscf::parse(&buf, b"v495/yscfg.ybn").unwrap();
         assert_eq!(cfg.layout, YscfLayout::New);
+        assert_eq!(cfg.title, title);
+    }
+
+    /// v500 商业包:标题在 +0x58(u16 len)/+0x5A,文件尾恰好闭合。
+    #[test]
+    fn v500_layout_uses_0x58_caption() {
+        let title = b"SampleTitle";
+        let mut buf = base(0x5A + title.len());
+        buf[0x58..0x5A].copy_from_slice(&(title.len() as u16).to_le_bytes());
+        buf[0x5A..].copy_from_slice(title);
+
+        let cfg = Yscf::parse(&buf, b"v500/yscfg.ybn").unwrap();
+        assert_eq!(cfg.layout, YscfLayout::V500);
+        assert_eq!((cfg.width, cfg.height), (1280, 720));
         assert_eq!(cfg.title, title);
     }
 

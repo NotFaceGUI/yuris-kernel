@@ -335,12 +335,100 @@ fn adler32_xor(data: &[u8], key: u8) -> u32 {
     (b << 16) | a
 }
 
+/// xxHash32(v500 商业包的负载校验)。
+///
+/// 证据:`<v500-sample>` 的 `pac/bn.ypf`(YPF version 500,Meta22/V500):
+/// `nameHash` 仍是 `murmur2(name, 0)`,但 `payloadHash` 是
+/// `xxh32(存储字节, 0)`;抽验 `ysc.ybn`/`yst00034.ybn`/`yst00145.ybn`/
+/// `yscfg.ybn`/`yst00236.ybn` 5/5 相等。
+pub fn xxh32(data: &[u8], seed: u32) -> u32 {
+    xxh32_xor(data, 0, seed)
+}
+
+fn xxh32_xor(data: &[u8], key: u8, seed: u32) -> u32 {
+    const P1: u32 = 0x9E37_79B1;
+    const P2: u32 = 0x85EB_CA77;
+    const P3: u32 = 0xC2B2_AE3D;
+    const P4: u32 = 0x27D4_EB2F;
+    const P5: u32 = 0x1656_67B1;
+
+    let read = |at: usize| -> u32 {
+        u32::from_le_bytes([
+            data[at] ^ key,
+            data[at + 1] ^ key,
+            data[at + 2] ^ key,
+            data[at + 3] ^ key,
+        ])
+    };
+
+    let len = data.len();
+    let mut at = 0usize;
+    let mut h: u32;
+    if len >= 16 {
+        let mut v1 = seed.wrapping_add(P1).wrapping_add(P2);
+        let mut v2 = seed.wrapping_add(P2);
+        let mut v3 = seed;
+        let mut v4 = seed.wrapping_sub(P1);
+        while at <= len - 16 {
+            v1 = v1
+                .wrapping_add(read(at).wrapping_mul(P2))
+                .rotate_left(13)
+                .wrapping_mul(P1);
+            at += 4;
+            v2 = v2
+                .wrapping_add(read(at).wrapping_mul(P2))
+                .rotate_left(13)
+                .wrapping_mul(P1);
+            at += 4;
+            v3 = v3
+                .wrapping_add(read(at).wrapping_mul(P2))
+                .rotate_left(13)
+                .wrapping_mul(P1);
+            at += 4;
+            v4 = v4
+                .wrapping_add(read(at).wrapping_mul(P2))
+                .rotate_left(13)
+                .wrapping_mul(P1);
+            at += 4;
+        }
+        h = v1
+            .rotate_left(1)
+            .wrapping_add(v2.rotate_left(7))
+            .wrapping_add(v3.rotate_left(12))
+            .wrapping_add(v4.rotate_left(18));
+    } else {
+        h = seed.wrapping_add(P5);
+    }
+    h = h.wrapping_add(len as u32);
+    while at + 4 <= len {
+        h = h
+            .wrapping_add(read(at).wrapping_mul(P3))
+            .rotate_left(17)
+            .wrapping_mul(P4);
+        at += 4;
+    }
+    while at < len {
+        h = h
+            .wrapping_add(u32::from(data[at] ^ key).wrapping_mul(P5))
+            .rotate_left(11)
+            .wrapping_mul(P1);
+        at += 1;
+    }
+    h ^= h >> 15;
+    h = h.wrapping_mul(P2);
+    h ^= h >> 13;
+    h = h.wrapping_mul(P3);
+    h ^= h >> 16;
+    h
+}
+
 /// 索引里使用的哈希算法。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HashAlg {
     Crc32,
     Adler32,
     Murmur2,
+    Xxh32,
 }
 
 impl HashAlg {
@@ -349,6 +437,7 @@ impl HashAlg {
             HashAlg::Crc32 => "crc32",
             HashAlg::Adler32 => "adler32",
             HashAlg::Murmur2 => "murmur2",
+            HashAlg::Xxh32 => "xxh32",
         }
     }
 
@@ -357,6 +446,7 @@ impl HashAlg {
             HashAlg::Crc32 => crc32(data),
             HashAlg::Adler32 => adler32(data),
             HashAlg::Murmur2 => murmur2(data, 0),
+            HashAlg::Xxh32 => xxh32(data, 0),
         }
     }
 
@@ -365,6 +455,7 @@ impl HashAlg {
             HashAlg::Crc32 => crc32_xor(data, key),
             HashAlg::Adler32 => adler32_xor(data, key),
             HashAlg::Murmur2 => murmur2_xor(data, key, 0),
+            HashAlg::Xxh32 => xxh32_xor(data, key, 0),
         }
     }
 }
@@ -848,16 +939,28 @@ impl YpfSource {
         if actual == entry.payload_hash {
             return Ok(());
         }
+        // v500 商业包:nameHash 仍是 murmur2,payloadHash 是 xxh32。
+        // 索引字段本身没有算法标记,按结构选中的 profile 只能给出
+        // nameHash 族;这里用存储值做一次性裁决(命中才接受,不猜)。
+        let xxh = HashAlg::Xxh32.hash(stored);
+        if entry.data_hash_alg != HashAlg::Xxh32 && xxh == entry.payload_hash {
+            return Ok(());
+        }
         // WZ 包的索引哈希可能按反变换后的前 8 字节计算;只在标记命中时接受。
         if let Some(unscrambled) = wz_unscramble(stored) {
             if entry.data_hash_alg.hash(&unscrambled) == entry.payload_hash {
+                return Ok(());
+            }
+            if entry.data_hash_alg != HashAlg::Xxh32
+                && HashAlg::Xxh32.hash(&unscrambled) == entry.payload_hash
+            {
                 return Ok(());
             }
         }
         Err(Diag::unimplemented(code::vfs::YPF_CHECKSUM, Boundary::Data)
             .at_data(entry.name.clone(), entry.data_offset)
             .with_detail(format!(
-                "stored payload {} {actual:#010x} != index {:#010x}; \
+                "stored payload {} {actual:#010x} / xxh32 {xxh:#010x} != index {:#010x}; \
                  engine multi-segment fallback is unimplemented",
                 entry.data_hash_alg.as_str(),
                 entry.payload_hash
@@ -2015,6 +2118,14 @@ mod tests {
 
         let err = decompress_payload(&packed, raw.len() as u32 + 1, b"t", 0).unwrap_err();
         assert_eq!(err.code, code::vfs::YPF_DECOMPRESS);
+    }
+
+    /// v500 商业包负载校验 = xxh32(存储字节, seed 0)。
+    #[test]
+    fn xxh32_matches_reference_vectors() {
+        assert_eq!(xxh32(b"", 0), 0x02CC_5D05);
+        assert_eq!(xxh32(b"a", 0), 0x550D_7456);
+        assert_eq!(xxh32(b"abc", 0), 0x32D1_53FF);
     }
 
     /// V7:巨大 entryCount + 极小索引区不得产生放大分配。

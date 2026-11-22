@@ -62,6 +62,20 @@
 
 hash 校验:MurmurHash2(name, seed 0) 与索引存储哈希**逐条相等**(抽验 4/4)。
 
+### 3.1 v500 商业包:payloadHash = xxh32
+
+`<v500-sample>` 的 `pac/bn.ypf`(YPF version 500,Meta22/V500 长度表):
+
+- `nameHash` 仍是 `murmur2(name, 0)`;
+- `payloadHash` = **`xxh32(存储字节, seed=0)`**;
+- 抽验 `ysc.ybn`/`yst00034.ybn`/`yst00145.ybn`/`yscfg.ybn`/
+  `yst00236.ybn` 5/5 与索引值相等;
+- 例:`ysc.ybn` stored 4115B，`xxh32=0x28137fc8`，索引值
+  `0x28137fc8`。
+
+读取器按“主算法不命中再用 xxh32 裁决、命中才接受”处理；旧包主算法
+命中后不会走回退。详见 `docs/formats/v500-abi-census-2026-11-22.md`。
+
 ## 4. 引擎侧行为(反编译实证)
 
 - 包发现(`FUN_0045eda0`):从根目录 `FindFirstFileA("*.*")` 递归;子目录**只递归名为
