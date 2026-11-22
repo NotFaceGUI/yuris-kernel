@@ -1,0 +1,83 @@
+# root=<side-repo>/workbench/tmp/v555-corpus/pc
+# scripts_ok=334 scripts_failed=8 groups=125433 unknown_opcodes=0
+command	groups	params
+GOSUB	48060	#=48060;PINT3=31394;PINT4=26222;PINT=22955;PINT5=22109;PSTR2=19158;PSTR=16693;PINT6=15697;PINT2=12721;PFLT2=7659;PFLT=6282;PSTR4=3175;PSTR3=2892;PSTR5=1910;PINT7=1665;PINT8=1118;PINT9=1044;PSTR6=322;PSTR7=312;PSTR8=312;PSTR9=173;PSTR10=24;PFLT3=22;PFLT4=9;PFLT6=8;PFLT5=7;PINT10=6;PFLT7=3;PFLT8=3;PFLT9=3;PINT11=1
+WORD	18174	=18174
+RETURNCODE	17725	
+LET	12229	
+IF	6033	
+IFEND	6033	
+RETURN	2371	RINT=173;RSTR=50;RINT2=38;RFLT=16;RINT3=14;RFLT2=10;RFLT3=10;RINT6=9;RFLT4=8;RFLT5=8;RFLT7=8;RSTR2=8;RINT4=7;RSTR3=7;RINT5=5;RSTR4=4;RSTR8=4;RINT7=3;RSTR10=3;RSTR5=3;RSTR6=3;RSTR7=3;RSTR9=3;RFLT6=2;RFLT8=2;RINT8=2;RFLT9=1
+INT	1986	SET=3972
+ELSE	1771	
+IFBLEND	1771	
+S_INT	1071	
+CG	998	ID=998;E=493;Z=390;FILE=361;X=335;Y=333;A=192;SX=51;SY=51;MODE=41;TID=8;T=6;LINT2=4;LINT=3;TA=3;MIPMAP=1;REMALLOC=1;TEX=1
+GO	861	#=861
+LOOP	676	SET=1352
+LOOPEND	676	
+STR	531	SET=1062
+CGACT	514	ID=514;SET=222;ID2=215;Y=180;X=142;COPY2=136;Y2=105;RECTPAINT2=90;RECTPAINT3=85;X2=67;SX=63;SY=63;SIZE=49;MERGE2=37;SETSTR=34;TEXT=34;RESIZE=24;BNO=17;MEIDO=13;SIZE2=12;AKARUSA=7;SAIDO=7;MERGE=6;REVERSE=4;SIZE4=4;BLUR5=3;FSX=2;FSY=2;FX=2;FX2=2;FY=2;FY2=2;BLUR6=1;ID3=1;ROTATION=1;TRANSITION=1
+LOAD	440	DNO=440;LET=428;FILE=247;MEM=193;ID=3;G_FLT3=2;G_INT3=2;G_STR3=2;G_FLT2=1;G_INT2=1;G_STR2=1
+_	433	=433
+END	420	RESTART=1
+VARACT	312	SET=311;DIMSIZE=96;POP=96;PUSH=91;LENGTH=24;POS=24;LET=19;COPY=15;CUT=9;G_FLT3=1;G_INT3=1;G_STR3=1;INIT=1;LOWER=1;LOWER2=1;UPPER=1;UPPER2=1
+SAVE	250	DNO=240;SET=233;FILE=8;MEM=2;G_FLT2=1;G_FLT3=1;G_INT2=1;G_INT3=1;G_STR2=1;G_STR3=1;ID=1
+F_INT	241	
+LOOPBREAK	212	LV=2
+CGEND	183	ID=183
+CGINFO	181	ID=181;LET=181;SY=67;SX=61;EXIST=22;ONMOUSE2=16;COLOR=11;SET=11;SET2=11;ONMOUSE=2;Y=2
+S_STR	180	
+FLT	175	SET=350
+WAIT	137	FRAME=115;TIME=22
+VARINFO	115	LET=115;SET=115;DIMSIZE=96;LENGTH=15;NO=2;SEARCH=2;STR=2;STRTYPE=2
+S_FLT	100	
+FONT	74	COLOR=36;COLOR2=35;BNO=27;SX=12;SY=12;GRADATION=11;NAME=10;BOLD=9;ANTIALIASING=8;DRAWMODE=8;ROTATION=3
+LOOPCONTINUE	72	
+SOUND	51	ID=51;VOLUME=21;FILE=13;PLAY=10;FADE=8;LOOP=4;PAUSE=3;E=1;END=1;PAN=1;PITCH=1;RESTART=1;START=1
+WINDOW	42	NO=42;CAPTION=8;FULLSCREEN=8;X=6;Y=6;Z=6;CLOSEMODE=5;SX=5;SY=5;WSX=5;WSY=5;CGID=4;MINIMIZE=3;ACTIVE=2;FLASH=2;FLASHTIME=2;MAXIMIZE=2;MINMODE=1;RESIZE=1
+F_STR	38	
+WINDOWINFO	37	LET=37;NO=37;CAPTION=11;FULLSCREEN=4;FULLSCREEN2=3;X=3;Y=3;ACTIVE=2;EXIST=2;SX=2;SY=2;WSX=2;WSY=2;DISPLAYNO=1
+FILEINFO	25	FILE=25;LET=25;EXIST=24;RELATION=1
+MATH	25	LET=25;SET=25;SET2=9;COS=7;POW=5;SIN=5;SQRT=4;RND=3;ATAN2=1
+SOUNDINFO	25	ID=25;LET=25;PLAY=11;TIME=5;TOTALTIME=4;DATALEFT=2;DATARIGHT=2;CODEC=1
+FILEACT	24	FILE=23;CGCASH=6;SOUNDCASH=6;DELETE=4;EXEC=4;PARAM=3;ID=2;COPY=1;CREATE=1;FILE2=1;FOLDER=1;JPG=1;PNG=1
+MOVIE	22	SX=5;SY=5;X=5;Y=5;FILE=4;PLAY=4;VOLUME=4
+DIALOG	20	CAPTION=20;STR=20;LET=17;YESNO=15;DEFBUTTON=3;DEFSTR=1;INPUT=1;LETSTR=1;OKCANCEL=1;YESNOCANCEL=1
+TASKINFO	19	LET=19;ID=11;FILE=2;FILE0=2;FILENO=2;FILENO0=2;LINE=2;LINE0=2;NEXTVOICE=2;SCRIPTPOS=2;TEXTLINE=2;EXIST=1
+TASK	9	ID=6;E=4;#=2;SCRIPTPOS=2;TINT=2;Z=2;RESTART=1;TINT2=1;TINT3=1;TINT4=1
+FONTINFO	8	LET=8;NAME=2;NO=2;COLOR=1;COLOR2=1;LANG=1;NUM=1;SX=1;SY=1
+IFBREAK	8	LV=8
+PRODUCT	8	COM=8;PINT=6;PINT2=6;LET=2;PSTR=1
+SAVEEND	8	
+SYSTEMINFO	8	LET=8;NO=5;SCRIPTNUM=3;TEXTNUM=3;SCRIPTFILE=2
+MOVIEINFO	7	LET=7;PLAY=4;CODEC=3
+SYSTEM	5	BACKGROUNDEXEC=3;SCREENSAVER=1;SX=1;SY=1
+MENU	4	ID=4;NAME=4;Z=4;CODE=2
+MOUSE	4	CLICK=2;MODE=2;TIME=2;WHEEL=2;CURSOR=1;HX=1;HY=1;ID=1
+MOVIEEND	4	
+YMVINFO	4	ID=4;LET=4;FPS=1;NUM=1;SX=1;SY=1
+YMV	3	ID=3;FRAME=2;FILE=1
+FPS	2	SET=2;SKIP=2
+INPUT	2	KEY=2;MOUSE=2;PAD=2
+SOUNDEND	2	ID=2
+TASKEND	2	ID=1
+TRAY	2	E=2;ID=1;MENUID=1;NAME=1
+CLIPACT	1	SET=1;TEXT=1
+ERROR	1	COM_CG=1
+FLASH	1	FILE=1;PLAY=1
+FLASHEND	1	
+FLASHINFO	1	LET=1;PLAY=1
+LABELINFO	1	#=1;EXIST=1;LET=1
+MATH3D	1	FLT=1;INT=1
+MENUINFO	1	A=1;ID=1;LET=1
+TEXT	1	CLEAR=1
+YMVEND	1	ID=1
+# failed s46: Diag(DiagFields { code: "table.missing", severity: Fatal, boundary: Table, where_: None, detail: "脚本: 必需表不存在 `ysbin/yst00046.ybn`(A5:缺表拒绝启动)", causes: [Diag(DiagFields { code: "vfs.missing", severity: Recoverable, boundary: Data, where_: Data { path: [121, 115, 98, 105, 110, 47, 121, 115, 116, 48, 48, 48, 52, 54, 46, 121, 98, 110], offset: 0 }, detail: "mount: entry not found", causes: [] })] })
+# failed s47: Diag(DiagFields { code: "table.missing", severity: Fatal, boundary: Table, where_: None, detail: "脚本: 必需表不存在 `ysbin/yst00047.ybn`(A5:缺表拒绝启动)", causes: [Diag(DiagFields { code: "vfs.missing", severity: Recoverable, boundary: Data, where_: Data { path: [121, 115, 98, 105, 110, 47, 121, 115, 116, 48, 48, 48, 52, 55, 46, 121, 98, 110], offset: 0 }, detail: "mount: entry not found", causes: [] })] })
+# failed s93: Diag(DiagFields { code: "table.missing", severity: Fatal, boundary: Table, where_: None, detail: "脚本: 必需表不存在 `ysbin/yst00093.ybn`(A5:缺表拒绝启动)", causes: [Diag(DiagFields { code: "vfs.missing", severity: Recoverable, boundary: Data, where_: Data { path: [121, 115, 98, 105, 110, 47, 121, 115, 116, 48, 48, 48, 57, 51, 46, 121, 98, 110], offset: 0 }, detail: "mount: entry not found", causes: [] })] })
+# failed s95: Diag(DiagFields { code: "table.missing", severity: Fatal, boundary: Table, where_: None, detail: "脚本: 必需表不存在 `ysbin/yst00095.ybn`(A5:缺表拒绝启动)", causes: [Diag(DiagFields { code: "vfs.missing", severity: Recoverable, boundary: Data, where_: Data { path: [121, 115, 98, 105, 110, 47, 121, 115, 116, 48, 48, 48, 57, 53, 46, 121, 98, 110], offset: 0 }, detail: "mount: entry not found", causes: [] })] })
+# failed s98: Diag(DiagFields { code: "table.missing", severity: Fatal, boundary: Table, where_: None, detail: "脚本: 必需表不存在 `ysbin/yst00098.ybn`(A5:缺表拒绝启动)", causes: [Diag(DiagFields { code: "vfs.missing", severity: Recoverable, boundary: Data, where_: Data { path: [121, 115, 98, 105, 110, 47, 121, 115, 116, 48, 48, 48, 57, 56, 46, 121, 98, 110], offset: 0 }, detail: "mount: entry not found", causes: [] })] })
+# failed s99: Diag(DiagFields { code: "table.missing", severity: Fatal, boundary: Table, where_: None, detail: "脚本: 必需表不存在 `ysbin/yst00099.ybn`(A5:缺表拒绝启动)", causes: [Diag(DiagFields { code: "vfs.missing", severity: Recoverable, boundary: Data, where_: Data { path: [121, 115, 98, 105, 110, 47, 121, 115, 116, 48, 48, 48, 57, 57, 46, 121, 98, 110], offset: 0 }, detail: "mount: entry not found", causes: [] })] })
+# failed s149: Diag(DiagFields { code: "table.missing", severity: Fatal, boundary: Table, where_: None, detail: "脚本: 必需表不存在 `ysbin/yst00149.ybn`(A5:缺表拒绝启动)", causes: [Diag(DiagFields { code: "vfs.missing", severity: Recoverable, boundary: Data, where_: Data { path: [121, 115, 98, 105, 110, 47, 121, 115, 116, 48, 48, 49, 52, 57, 46, 121, 98, 110], offset: 0 }, detail: "mount: entry not found", causes: [] })] })
+# failed s150: Diag(DiagFields { code: "table.missing", severity: Fatal, boundary: Table, where_: None, detail: "脚本: 必需表不存在 `ysbin/yst00150.ybn`(A5:缺表拒绝启动)", causes: [Diag(DiagFields { code: "vfs.missing", severity: Recoverable, boundary: Data, where_: Data { path: [121, 115, 98, 105, 110, 47, 121, 115, 116, 48, 48, 49, 53, 48, 46, 121, 98, 110], offset: 0 }, detail: "mount: entry not found", causes: [] })] })

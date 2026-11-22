@@ -1,0 +1,6 @@
+# root=<side-repo>/workbench/tmp/v555-corpus/pc
+# calls=8 dynamic_com=0
+com	count
+1001	6
+10201	1
+10205	1

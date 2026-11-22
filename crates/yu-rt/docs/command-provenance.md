@@ -13,7 +13,7 @@
 
 | 命令 | 频度 | ①手册 | ②语料 | ③引擎 | 状态 |
 |---|---|---|---|---|---|
-| `GOSUB` | 10,215 | `control/gosub.html`(参数 16 槽/嵌套 64) | ✅ 语料 10,215 次;`PINT` 4,449 / `PFLT` 4,254 / `PSTR` 4,501 | 旁线 §3.16(处理体 `0x4459c4`,参数组 A `+0x10/+0x98/+0x120`,嵌套上限 0x40) | ✅ 实现 |
+| `GOSUB` | 10,215 | `control/gosub.html`(参数 16 槽/嵌套 64;三组参数独立) | ✅ 语料 10,215 次;`PINT` 4,449 / `PFLT` 4,254 / `PSTR` 4,501 | 旁线 §3.16(处理体 `0x4459c4`,参数组 A `+0x10/+0x98/+0x120`,嵌套上限 0x40) | ✅ 实现(三组分离,DIV-RT-065) |
 | `RETURN` | 1,750 | `control/return.html` | ✅ 1,750 次;`RINT` 143 / `RFLT` 39 / `RSTR` 47 | §3.16(`0x44c0fc`,写**调用方**那层后弹栈) | ✅ 实现 |
 | `GO` | 195 | `control/go.html`(跨文件、标签全局唯一) | ✅ 195 次 | §3.5/§3.6 opcode 43(`0x445830`):标签→{pc,脚本号,基址} | ✅ 实现 |
 | `IF` | 3,326 | `control/if.html` | ✅ 3,326 次(窗口恒 3) | §3.13 opcode 45(`0x4462d0`):块帧 + 假分支跳 `item[2].length` | ✅ 实现 |
@@ -44,7 +44,7 @@
 | `S_INT` | 767 | `variable/s_int.html`(静态) | ✅ 767 次 | REA 分发表 → `0x4634d8`(`xor eax,eax; ret`)= no-op | ✅ no-op(DIV-RT-043) |
 | `S_FLT` | 17 | `variable/s_flt.html` | ✅ 17 次 | 同上 | ✅ no-op(DIV-RT-043) |
 | `S_STR` | 144 | `variable/s_str.html` | ✅ 144 次 | 同上 | ✅ no-op(DIV-RT-043) |
-| `VARINFO` | 119 | `variable/varinfo.html` | ✅ 119 次(TYPE/DIMNUM/DIMSIZE/LENGTH) | §3.21(`0x456050`,判定链原序) | ✅ 部分(SEARCH 等 `Unimplemented`) |
+| `VARINFO` | 119 | `variable/varinfo.html` | ✅ 119 次(TYPE/DIMNUM/DIMSIZE/LENGTH) | §3.21(`0x456050`,判定链原序);v555 `0x455200`(SJISCODE/STRFIRST) | ✅ 实现(SEARCH/STRFIRST;SJISCODE 按 `SemanticProfile`:495 惰性 / 555 计算) |
 | `VARACT` | 310 | `variable/varact.html`(**无 INIT/G_* 页**) | ✅ 310 次 + `INIT+G_*`(s12) | §3.26(`0x456050` 族 + `0x455b60` 恢复体) | ✅ 实现(除 HANTOZEN/ZENTOHAN) |
 | `G_INT`/`G_FLT`/`G_STR` | 0(声明)/ 2(`VARACT[INIT]`) | `variable/g_int.html`(声明)/ ⛔(`VARACT` 变体无页) | ✅ 宏重定义 + `VARACT[INIT G_*]` | §3.26 `0x455b60` | ✅ `VARACT` 侧已实现(DIV-RT-024) |
 | `F_INT`/`F_FLT`/`F_STR` | 337/72/64 | ⛔ 手册 `variable/` 无页 | ✅ 高频(全在 `global_f.yst` 声明段) | REA 默认槽 `0x459e90`:报 `スクリプト実行エラー`(yse 0xdbbd2)+ 返回 -1;600 帧运行 0 次 | ✅ 脚本错误槽(DIV-RT-043) |
@@ -144,3 +144,32 @@
 - 2026-10-23(P3):600 帧命令 7,735,679;`LET` 未实现 1(`_SAVE_PATH`);
   `ERROR`/`_WINDOW_EXEC_CAPTION` 归零;默认槽/no-op 槽按 0.495 分发表定案
   (DIV-RT-043..048)。
+
+> **勘误 2026-11-20 · GOSUB/RETURN 参数是三组独立数组**:手册
+> `control/gosub.html` 的例子 `GOSUB[PFLT=12.3 PSTR2="ゲーム" PINT3=10]`
+> 要求 `@_PFLT(1)`、`$_PSTR(2)`、`@_PINT(3)` 同时成立 —— 同编号的
+> PINT/PFLT/PSTR 不互相覆盖。引擎任务记录也是三组(`+0x10/+0x98/+0x120`,
+> 旁线 §3.16)。内核旧实现用单一 `args[16]`,v555 剧本链的
+> `GOSUB[PSTR="CSEL" PINT=1 …]` 会把命令名覆盖成整数,导致宏搜索空转、
+> 标题流程无法进入。2026-11-20 已拆成 `args_int/args_flt/args_str` 与
+> `ret_int/ret_flt/ret_str`,回归见
+> `tests/fixture/control.rs::gosub_keeps_pint_and_pstr_groups_apart`,
+> 档案 `docs/divergences/DIV-RT-065-gosub-param-groups.md`。
+
+## 6. v555 商业分支(2026-11-20)
+
+555 不是官方 BETA 系列,命令名沿用但参数表/处理体是商业特化。判据统一为
+**工程 `ysc.ybn` 的参数名**,不按 `ysv`/exe 版本号猜:
+
+| 命令 | 0.495 参数 | 555 参数 | 处理体锚(<v555-4>) | 实现 |
+|---|---|---|---|---|
+| `TEXT` | `ID, OUTPUTMODE, …, AUTOCLICK` | `FILE, LET, CLEAR` | `0x452a0c` | `text.rs::op_text_file` |
+| `LOAD` | `FILE, DNO, LET, …` | `FILE, MEM, DNO, LET, …` | `0x4447c8` | `file_io.rs::op_load` MEM 分支 |
+| `SAVE` | `FILE, DNO, SET, …` | `FILE, MEM, DNO, SET, …` | `0x44b874` | `file_io.rs::op_save` MEM 分支 |
+| `PRODUCT` | 不存在 | `COM, LET, PINT…, PFLT…, PSTR…` | `0x459670` | `product.rs::op_product` |
+
+证据分级:命令/参数名 = 工程 ysc 一手;语义 = 商业 exe RE + 运行语料;
+开源工具(`yuris_decompiler`/Script-Editor/1F1E33)只覆盖 V5 结构层,
+**没有** 555 运行期语义可抄。残项:`_STR`(P0-1)、`MEM=99999`、`PRODUCT`
+文件/对话框分支、`COM=22` 位置/长度字段,均显式挂账(诊断码见
+`DIV-RT-066-v555-runtime-surface.md` §2),不猜值。

@@ -385,3 +385,26 @@ cargo run -p yu-rt --example coverage_census -- 600 8
 `MATH[RND]`(MT19937 + 注入种子)、`VARACT[HANTOZEN/ZENTOHAN]`(官方表)、
 `_TEXT_FLAG` 写、`_TEXT_NUM`、`_WINDOW_INIT_POS`、`_WINDOW_EXEC_CAPTION`
 宿主 setter、`DomainCall.script/pc`。
+
+## v555 商业分支扩展(2026-11-20)
+
+> 与 0.495 普查分开记:555 的同一命令名可能换了参数表/语义。判据是
+> **工程 ysc 参数名**,不是引擎版本号(与 CSV 的 `LINE` 判定同范式)。
+
+| 命令 | 555 形态 | 证据 | 状态 | 说明 |
+|---|---|---|---|---|
+| `TEXT` | `FILE, LET, CLEAR` | <v555-4> `0x452a0c`;语料 s60/s205 | ✅ 实现 | 文件整读 → ASCII 小写 + `/`→`\` → 追加 CRLF 切行 → 每行加 `0x0D` 写字符串数组 → 末尾两空元素;`CLEAR` 同 0.495 |
+| `SAVE` | `FILE, MEM, DNO, SET, …` | <v555-4> `0x44b874`;PC/样本 900+ 次 | ✅ 实现 | `MEM` 优先于 `FILE`;内存槽与文件存档共用 YSSD/0x1e0;`MEM=99999` 特殊分支挂账 |
+| `LOAD` | `FILE, MEM, DNO, LET, …` | <v555-4> `0x4447c8`;PC/样本 900+ 次 | ✅ 实现 | `MEM` 从同槽读;DNO 0 基;块类型 0 写 `LET`、类型 2 按 var_id 恢复 |
+| `PRODUCT` | `COM, LET, PINT…, PFLT…, PSTR…` | <v555-4> `0x459670` | ✅ 最小面 | `COM=29` 写 0;`21/24` VFS 枚举;`22` 词法器;`23` 行数;`51/52/80/81/100/110` no-op;已知 Win32 分支逐 COM 挂账;未知 COM Info 一次 |
+| `_DROPFILE`/`_DROPFILE_NUM` | 系统变量 | ysv ABI;`PRODUCT[21/24]` | ✅ | 无拖放宿主 = 空表(0/空串);内核按已挂载 VFS 枚举 |
+| `VARINFO` | 新增 `STRFIRST/NO2`、`SJISCODE` 真查询 | 555 ysc;handler `0x455200` | ✅ 实现 | `STRFIRST`=`[NO,NO2]` 闭区间最小串下标;`SJISCODE`=首字符码;`SemanticProfile` 门控(495 惰性 / 555 计算) |
+| `CGACT` | 新增 `GRADATION` | 555 ysc;`yu-gfx` `0x444713/0x4447db` | ✅ | gfx 既有渐变参数路径覆盖,未另开 VM 分支 |
+
+验证:`cargo test -p yu-rt -p yu-save --no-default-features` →
+lib 128 / consistency 4 / corpus 11 / corpus_golden 4 / corpus_v2 3 /
+fixture 140 / golden 3 / yu-save 31,全部 ok。
+
+> 跨版本修复(2026-11-20):`GOSUB/RETURN` 参数是**三组独立数组**
+> (`PINT/PFLT/PSTR` 同编号不互相覆盖;引擎 `+0x10/+0x98/+0x120`)。
+> 见 `docs/divergences/DIV-RT-065-gosub-param-groups.md`。

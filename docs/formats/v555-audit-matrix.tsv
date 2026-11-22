@@ -1,0 +1,122 @@
+opcode	name	official_class	official_handler	current_kind	verdict	used_groups	note
+0	ALIAS	shared-stub	0x00423168	Noop	match	0	v555 共享空操作 0x423168(已修:Noop)
+1	CG	real	0x0042394c	Domain(Graphics)	match-domain	7461	
+2	CGACT	real	0x0042617c	Domain(Graphics)	match-domain	3943	
+3	CGEND	real	0x0043ae14	Domain(Graphics)	match-domain	1311	
+4	CGINFO	real	0x0043b184	Cginfo	match	1345	6 构建 ~3552B 相同;当前 Cginfo
+5	CLIPACT	real	0x0043c0ec	Clipact	match	6	
+6	CLIPINFO	real	0x0043c22c	Clipinfo	match	0	
+7	CSV	real	0x0043c3a0	Csv	match	0	v555 真实解析器 0x43c3a0(已修:Csv)
+8	CSVINFO	real	0x0043c81c	Csvinfo	match	0	2.1MB 族 615B / v555-1 1143B;当前 op_csvinfo 覆盖 LINE/DATA/SIZE
+9	DEBUGLIST	shared-stub	0x00423168	Noop	match	124	
+10	DIALOG	real	0x0043ca84	Dialog	match	168	
+11	ELSE	real	0x0043d44c	Else	match	11742	
+12	EMOTE	real	0x0043d500	Domain(Emote)	match-domain	0	
+13	END	real	0x0043db44	End	match	2900	
+14	ERROR	real	0x00469bb4	ErrorTable	match	6	
+15	ERRORINFO	real	0x00469b94	NoopEval	match-stub	0	
+16	F_FLT	default	0x0045c63c	ScriptError	match	429	
+17	F_INT	default	0x0045c63c	ScriptError	match	3370	
+18	F_STR	default	0x0045c63c	ScriptError	match	573	
+19	F_VAR	default	0x0045c63c	ScriptError	match	0	
+20	FILEACT	real	0x0043db80	Domain(File)	match-host	180	2.1MB 族 2363B(v555-4 2491B)/ v555-1 2287B;SaveHost 消费; SaveHost 同步 COPY/DELETE
+21	FILEINFO	real	0x0043eca8	Fileinfo	match	166	
+22	FLASH	real	0x00440bfc	Domain(Flash)	match-domain	6	
+23	FLASHEND	real	0x00440fcc	Domain(Flash)	match-domain	6	
+24	FLASHINFO	real	0x0044101c	Domain(Flash)	PARTIAL	6	官方写 LET;当前只发 Domain(Flash)
+25	FLT	real	0x0044137c	Declare	match	1614	
+26	FONT	real	0x004414b8	Domain(Graphics)	match-domain	533	
+27	FONTINFO	real	0x00441d88	Fontinfo	match	48	
+28	FPS	real	0x00442824	Fps	match	12	
+29	G_FLT	default	0x0045c63c	ScriptError	match	0	
+30	G_FLT2	default	0x0045c63c	ScriptError	match	0	
+31	G_FLT3	default	0x0045c63c	ScriptError	match	0	
+32	G_FLT4	default	0x0045c63c	ScriptError	match	0	
+33	G_INT	default	0x0045c63c	ScriptError	match	0	
+34	G_INT2	default	0x0045c63c	ScriptError	match	0	
+35	G_INT3	default	0x0045c63c	ScriptError	match	0	
+36	G_INT4	default	0x0045c63c	ScriptError	match	0	
+37	G_STR	default	0x0045c63c	ScriptError	match	0	
+38	G_STR2	default	0x0045c63c	ScriptError	match	0	
+39	G_STR3	default	0x0045c63c	ScriptError	match	0	
+40	G_STR4	default	0x0045c63c	ScriptError	match	0	
+41	G_VAR	default	0x0045c63c	ScriptError	match	0	
+42	GO	real	0x004428ac	Go	match	4072	
+43	GOSUB	real	0x00442a40	Gosub	match	241349	
+44	IF	real	0x0044336c	If	match	48425	
+45	IFBLEND	real	0x00443464	Ifblend	match	11742	
+46	IFBREAK	real	0x004434a4	Ifbreak	match	33	
+47	IFCONTINUE	real	0x0044352c	Ifcontinue	match	0	
+48	IFEND	real	0x004435b4	Ifend	match	48425	
+49	INPUT	real	0x00443600	Domain(System)	match-domain	12	
+50	INT	real	0x004436b8	Declare	match	16504	
+51	LABEL	real	0x004437e8	Unknown	MISMATCH	0	
+52	LABELINFO	real	0x004437f4	Labelinfo	match	6	
+53	LET	real	0x00443988	Let	match	108229	
+54	LOAD	real	0x004447c8	Domain(Save)	match-domain	2891	6 构建 2806B(约)相同;当前 Domain(Save)+MEM
+55	LOOP	real	0x00445b80	Loop	match	5213	
+56	LOOPBREAK	real	0x00445d1c	Loopbreak	match	1605	
+57	LOOPCONTINUE	real	0x00445dd4	Loopcontinue	match	694	
+58	LOOPEND	real	0x00445e68	Loopend	match	5213	
+59	MACRO	default	0x0045c63c	ScriptError	match	0	
+60	MATH	real	0x00445f54	Math	match	134	
+61	MATH3D	real	0x0044683c	Math3d	match	6	
+62	MENU	real	0x00448d30	Domain(Menu)	match-domain	24	
+63	MENUACT	real	0x00449010	Domain(Menu)	match-domain	0	
+64	MENUEND	real	0x004491b4	Domain(Menu)	match-domain	0	
+65	MENUINFO	real	0x00449330	Domain(Menu)	PARTIAL	6	官方写 LET;当前只发 Domain(Menu)
+66	MIDI	real	0x00449680	Domain(Sound)	match-domain	0	
+67	MIDIEND	real	0x004496a0	Domain(Sound)	match-domain	0	
+68	MIDIINFO	real	0x004496c0	Domain(Sound)	match-domain	0	
+69	MOUSE	real	0x004496e0	Domain(System)	match-domain	32	
+70	MOVIE	real	0x00449dd0	Movie	match	77	
+71	MOVIEEND	real	0x0044a3bc	Movieend	match	19	
+72	MOVIEINFO	real	0x0044a410	Movieinfo	match	37	
+73	MOVIE2	real	0x0044a85c	Domain(Movie)	match-domain	0	
+74	MOVIE2END	real	0x0044aee8	Domain(Movie)	match-domain	0	
+75	MOVIE2INFO	real	0x0044af0c	Domain(Movie)	PARTIAL	0	官方写 LET;当前只发 Domain(Movie)
+76	PLUG	real	0x0044b1a8	NoopEval	match-stub	0	
+77	PREP	shared-stub	0x00423168	Noop	match	0	
+78	REGINFO	real	0x0044b1c8	Reginfo	match	0	
+79	RETURN	real	0x0044b59c	Return	match	20780	
+80	RETURNBREAK	shared-stub	0x00423168	Noop	match	0	
+81	RETURNCODE	real	0x0044b824	ReturnCode	match	76309	
+82	S_FLT	shared-stub	0x00423168	Noop	match	234	
+83	S_INT	shared-stub	0x00423168	Noop	match	6096	
+84	S_STR	shared-stub	0x00423168	Noop	match	1262	
+85	S_VAR	default	0x0045c63c	ScriptError	match	0	
+86	SAVE	real	0x0044b874	Domain(Save)	match-domain	1668	6 构建 4886B 相同;当前 Domain(Save)+MEM
+87	SAVEEND	real	0x0044dc1c	Domain(Save)	match-domain	44	
+88	SAVEINFO	real	0x0044dc44	Domain(Save)	match-domain	0	
+89	SOUND	real	0x0044dc64	Domain(Sound)	match-domain	306	
+90	SOUNDEND	real	0x0044eb54	Domain(Sound)	match-domain	12	
+91	SOUNDINFO	real	0x0044ed68	Domain(Sound)	match-host	144	2.1MB 族 2431B / v555-1 2031B;SoundHost::query 路径; SoundHost::query 专用路径写 LET
+92	STR	real	0x0044f988	Declare	match	4917	
+93	SYSTEM	real	0x0044faec	Domain(System)	match-domain	78	
+94	SYSTEMINFO	real	0x0044feb4	Systeminfo	match	13	
+95	TASK	real	0x0044ffc4	Task	match	50	
+96	TASKEND	real	0x0045171c	Taskend	match	12	
+97	TASKINFO	real	0x004519bc	Taskinfo	match	106	
+98	TEXT	real	0x00452a0c	Text	match	30	2.1MB 族 837B / v555-1 1404B(4 源回退);当前实现按共享核心
+99	TEXTINFO	real	0x00452d54	Textinfo	match	0	官方 0x452d54 只装载参数并返回 0(已修:空签名 no-op)
+100	TRAY	real	0x00452d74	Domain(System)	match-domain	12	
+101	VAR	real	0x004532b8	Unknown	MISMATCH	0	
+102	VARACT	real	0x004532d8	Varact	match	2102	
+103	VARINFO	real	0x00455200	Varinfo	match	859	6 构建 2775B 相同;当前 Varinfo
+104	WAIT	real	0x00455eb8	Wait	match	1028	
+105	WINDOW	real	0x00455f44	Domain(Window)	match-domain	265	
+106	WINDOWEND	real	0x00457e4c	Domain(Window)	match-domain	0	
+107	WINDOWINFO	real	0x00457ecc	Windowinfo	match	232	
+108	WORD	real	0x00458524	Word	match	76868	
+109	YMV	real	0x00458610	Ymv	match	28	
+110	YMVEND	real	0x00459018	Domain(Movie)	match-domain	11	
+111	YMVINFO	real	0x00459150	Ymvinfo	match	24	
+112	_	real	0x00455cd8	TextOut	match	507	
+113	_IFDEF	default	0x0045c63c	ScriptError	match	0	
+114	_IFNDEF	default	0x0045c63c	ScriptError	match	0	
+115	_IFEND	default	0x0045c63c	ScriptError	match	0	
+116	PRODUCT	real	0x00459670	Product	match	177	逐构建 COM 集合不同;COM=23/34/12 已补,21000/10201/10205/1001 仍宿主挂账
+117	SYSTEMMODE	default	0x0045c63c	ScriptError	match	0	
+118	COMPILEMODE	default	0x0045c63c	ScriptError	match	0	
+119	RELEASEMODE	default	0x0045c63c	ScriptError	match	0	
+120	PROJECTFOLDER	default	0x0045c63c	ScriptError	match	0	

@@ -1,6 +1,7 @@
 # v555 支持期优化计划（行为保持优先）
 
-- 状态：执行中（O1/O2/O3 已完成，2026-11-20；O0/O4/O5/O6/O7 未开始）
+- 状态：执行中（O1/O2/O3 与 v555 运行期面已完成，2026-11-20；
+  O0/O4/O5/O6/O7 与 v555 图形 P0/`_STR` 未开始）
 - 日期：2026-11-20
 - 基线：`a976d41`（`chore(release): 版本号升至 0.4.1`）
 - 关联：`docs/formats/v555-commercial.md`、`docs/formats/v555-gap-2026-11-19.md`
@@ -345,9 +346,24 @@ v555 的多语言不是“每个语言一份 exe”，而是**同一引擎 + 三
 
 **执行记录（2026-11-20）**：主人指示先做结构拆分，实际顺序为
 O1 → yu-save 容器路径抽取 → O2 → O3；基线/结果见 `PROGRESS.md`
-「成果 STRUCT-REFACTOR-V555」。本批严格行为保持：未实现任何 v555 语义，
-只建立 `SemanticProfile` 门控与内存槽可复用的容器路径。v555 批次
-（P0/MEM/SJISCODE 等）在本次拆分后的骨架上进行。
+「成果 STRUCT-REFACTOR-V555」。随后在同一天落地 v555 运行期面
+（`DIV-RT-066-v555-runtime-surface.md`）：
+
+| 面 | 状态 | 落点 |
+|---|---|---|
+| `GOSUB/RETURN` 三组参数 | ✅ 全版本修复 | `DIV-RT-065`;`control.rs`/`sysvar.rs` |
+| `TEXT[FILE,LET,CLEAR]` | ✅ | `text.rs::op_text_file`;`rt.text.file*` |
+| `SAVE/LOAD[MEM]` | ✅ | `file_io.rs`;`SaveHost`;`yu-save` 内存槽 |
+| `PRODUCT` 最小面 + `_DROPFILE*` | ✅ | `product.rs`;`scenario.rs`;VFS 枚举 |
+| `VARINFO[SJISCODE/STRFIRST/NO2]` | ✅ | `variables.rs`;`SemanticProfile` 门控 |
+| 生命周期/无窗口文本 | ✅ | `live_tasks`;`text_reveal_complete` |
+| `_STR` / 图形 P0 | ⛔ 显式挂账 | `rt.sysvar.unimplemented`;`gfx.*` |
+
+验证：`cargo test -p yu-rt -p yu-save --no-default-features` 全绿
+（lib 128 / fixture 140 / yu-save 31）；v555 样本 headless 600 帧
+`exit=0`、`fatal=0`，`PRODUCT[COM=21]` 枚举 66 文件、`TEXT[FILE]` 201 次
+成功装载；`_STR` 84 次显式未实现。仍未宣称「标题可见/能玩」，缺
+`_STR`（P0-1）与按钮纹理/过渡/背景 CG（P0-2..4）。
 
 ## 12. 验证
 

@@ -16459,3 +16459,560 @@ cargo fmt --all -- --check | grep <改动文件>
   `PRODUCT`、v555 词法器/多语言;本批严格行为保持。
 - 未执行任何 git 写操作;`yu-emote` 子模块指针变化是进入本轮前的既有状态,
   未触碰。
+
+## 成果 V555-RUNTIME (2026-11-20) · v555 运行期面落地:GOSUB 三组/MEM/TEXT[FILE]/PRODUCT/词法器
+
+**范围**:在结构重构后的骨架上落地 v555 商业分支的已取证运行期面
+（`DIV-RT-065`/`DIV-RT-066`）；未取证的 `_STR`、图形 P0 与 `MEM=99999`
+保持显式挂账,不猜值。
+
+**改动**:
+1. **GOSUB/RETURN 三组参数(全版本修复)**
+   - `GosubFrame` 拆 `args_int/args_flt/args_str` 与
+     `ret_int/ret_flt/ret_str`;`_PINT/_PFLT/_PSTR/_RINT/_RFLT/_RSTR`
+     各取本组,`_PFLG/_RFLG` 任一组置位。
+   - 根因:v555 剧本链 `GOSUB[PSTR="CSEL" PINT=1]` 的旧单一 `args[16]`
+     会让 PINT 覆盖 PSTR,宏搜索永远找不到命令名。档案 `DIV-RT-065`。
+2. **VARINFO v555**
+   - `SJISCODE`:首字符码(空串 0 / 单字节字节值 / lead `(lead<<8)|trail`);
+     门控走 `SemanticProfile.varinfo_sjis`(495 及更早 `Inert`,555 起
+     `FirstChar`),不再直接比较 `yscm.version`。
+   - `STRFIRST`:`[NO,NO2]` 闭区间最小串下标,ASCII 大小写不敏感。
+   - `NO2`:从属参数,单独出现按对齐 no-op;`UTF8CODE` 仍为惰性槽。
+3. **TEXT[FILE]**
+   - `op_text` 按参数表是否含 `FILE` 分派到 `op_text_file`(与 CSV 的
+     `LINE` 同范式)。
+   - 语义:ASCII 小写 + `/`→`\`、不补扩展名;读入 + 追加 CRLF,按
+     CRLF/CR/LF 切行,每行加 `0x0D` 写 `LET` 字符串一维数组,末尾两空元素;
+     `CLEAR` 清文本缓冲;打不开 Yield + `rt.text.file`。
+   - 新增 `rt.text.file.lines`(verbose 成功装载),避免成功/失败同码。
+4. **SAVE/LOAD[MEM]**
+   - `SaveHost` 增加 `save_mem`/`load_block_mem`/`load_image_mem` 默认
+     未实现(显式诊断);`SaveState` 增加稀疏内存槽 + `sv.mem.missing`;
+     复用 `build_container`/`decode_block`/`decode_image`。
+   - VM:`MEM` 优先于 `FILE`;MEM 的 DNO 0 基(文件仍 1..=1024);
+     `MEM=99999` 打包分支逐变体挂账;FILE+MEM 同时给时 verbose 记录
+     “MEM 优先,FILE 忽略”。
+5. **PRODUCT + 剧本词法器 + `_DROPFILE*`**
+   - `HandlerKind::Product` / `handlers/product.rs`:`COM=29`→LET 0;
+     `21/24` VFS 枚举;`22` `scenario::tokenize` 写
+     `STR[1024]+INT[1024]`;`23` 最近 `TEXT[FILE]` 行数;
+     `51/52/80/81/100/110` no-op。
+   - 已取证未实现 COM(`26/33/34/36/37/38/10201/10205/21000/21031/
+     0x2776..79`)逐 COM 挂 `rt.cmd.unimplemented`;未列出 COM 报一次
+     `rt.cmd.aligned_stub`;`COM=22` 位置/长度字段报一次 Info,
+     输出数组未定位报 `COM=22/vars`。
+   - `scenario.rs`:七个符号专用码 0x33..0x39、标识符/数字 0x20、
+     `//` 注释丢弃(消费方 `es_scenario_parser.yst` 实测)。
+   - `_DROPFILE`/`_DROPFILE_NUM` 系统变量;VFS 直接子文件枚举(上限
+     0x2000),`src`→`aux`。
+6. **生命周期/文本推进**
+   - `Scheduler::live_tasks`/`Engine::live_tasks`;桌面关闭/退出条件改为
+     `main_finished && live_tasks == 0`,避免 v555 主任务自然走完被误判结束。
+   - `text_reveal_complete`:无文本窗口即视为完成(官方 `FUN_00404914`),
+     修复 `TEXT[ID]` 之前的 `WORD/RETURNCODE` 永久停住。
+
+**诊断/可排查(未实现必留痕)**:
+- `_STR` / `_INT`:专项 `rt.sysvar.unimplemented` detail(P0-1,不猜空串/0)。
+- `SAVE/LOAD[MEM=99999]`:变体挂账;缺槽 `sv.mem.missing`。
+- `PRODUCT` 未实现 COM / 未知 COM / COM=22 字段与输出数组:分别
+  `rt.cmd.unimplemented` 或 `rt.cmd.aligned_stub`。
+- `TEXT[FILE]` 失败 `rt.text.file`,成功 `rt.text.file.lines`。
+- FILE+MEM 同时给、PRODUCT 缺 PSTR:verbose 记录优先级/空枚举。
+
+**验证**:
+```bash
+cargo test -p yu-rt -p yu-save --no-default-features
+# → lib 128 / consistency 4 / corpus 11 / corpus_golden 4 / corpus_v2 3 /
+#   fixture 140 / golden 3 / yu-save 31;全部 ok
+cargo check --workspace --all-targets --no-default-features
+# → Finished
+```
+新增回归(节选):
+`fixture::control::gosub_keeps_pint_and_pstr_groups_apart`;
+`fixture::variables::varinfo_sjiscode_{is_inert_on_495_projects,
+returns_first_char_code}`、`varinfo_strfirst_returns_smallest_index_case_insensitively`;
+`fixture::text::text_555_file_fills_let_string_array`;
+`fixture::file_save::save_and_load_mem_use_memory_slots_not_files`;
+`fixture::product::{product_com29_writes_mode_bit_zero_to_let,
+product_com21_enumerates_vfs_directory_into_dropfiles}`;
+`yu-save::state::tests::mem_save_roundtrips_container_without_disk`;
+`vm::handlers::text::text_file_tests::*`;`scenario::tests::*`。
+
+**v555 实机(headless,`<v555-2>`,GBK)**:
+```text
+yu-cli run <v555-2> --mode headless --frames 600 --patch gbk \
+  --log-file <tmp>/v555_600.jsonl --json <tmp>/v555_600_display.json
+→ exit=0; fatal=0
+→ PRODUCT[COM=21] PSTR="scenario/": 枚举 66 个文件
+→ TEXT[FILE] 201 次成功装载(67 文件 × base/cn/tw),失败 0
+→ PRODUCT[COM=22] token 文本/类型码已输出(位置/长度字段 Info 一次)
+→ rt.sysvar.unimplemented 84(_STR/_INT,显式 detail)
+→ gfx.info.missing 52,608 / gfx.info.unsupported 16,256(按钮/LINT2,
+  与 v555-gap P0-2 一致,未在本轮实现)
+→ 画面 600 帧仍只有 :/MOVIE 一层(品牌影片),未到标题;缺 _STR(P0-1)
+  与按钮纹理/过渡/背景 CG(P0-2..4)
+```
+- 结论:剧本文件列表/文本装载/词法入口/宏参数三组已通;标题不可见是
+  已挂账的 P0,不是本轮静默失败。
+
+**未做**:`_STR` getter/写入侧、`MEM=99999` 打包消费方、`PRODUCT`
+文件/对话框/注册表分支、`COM=22` 位置/长度字段、图形 P0-2..4、
+O4 词法器 oracle/O5 多语言。未执行任何 git 写操作。
+
+## 成果 V555-CGINFO-LINT2 (2026-11-21) · CGINFO 按钮号回读与启动剧本定位
+
+**问题**:v555 启动/菜单帧每帧刷出数百条
+`gfx.info.missing/unsupported @ es_buttonsearch.yst pc1 CGINFO[LINT2]`,
+按钮状态机不前进;桌面黑屏/无 logo/无 CAUTION。
+
+**根因与修复**:
+- 官方 `CG` 处理体把 `LINT`/`LINT2` 写入图层 `+0x58`/`+0x60`,
+  `CGINFO[LINT2]` 直接回读按钮号。当前实现把该查询落到
+  `INFO_UNSUPPORTED`/`INFO_MISSING`。
+  - `crates/yu-gfx/src/state.rs`:图层存在时返回 `extra["LINT"/"LINT2"]`
+    的整数;图层不存在返回 0(“没有按钮”),不再报 missing。
+  - 回归:`crates/yu-gfx/tests/info_query.rs::cginfo_lint2_reads_layer_button_number`。
+- `PRODUCT[COM=22]` 数组契约按调用点实测修正:`PINT` 是 token 文本
+  STR 数组(样本2 = 2914),类型码写入相邻 INT 数组(2915);
+  `PINT2/PINT3` 是词法状态/偏移,不是输出槽。`scenario_token_vars` 优先
+  按 `PINT`/`PINT+1`(同时接受官方运行时槽 = ysv id + 4),旧回退保留。
+- 回退 2026-11-21 曾加的桌面宿主硬编码启动画面链:官方启动画面不是
+  宿主特化,而是 `scenario/scenario_start.txt` 剧本驱动。
+
+**启动剧本证据(新增,详见 `docs/formats/v555-truth-2026-11-21.md` §11)**:
+- `scenario/scenario_start.txt`(sc.ypf)顺序:
+  `\CSEL` → `\NEXTON1` → `\DrawBG(logo_a,bg_black)` → `\WA(2200,,1,1)` →
+  fade → `\NEXTON3` → `\WA(800,,1,1)` →
+  `\DrawBG(Splashscreen_Shiravune_black,bg_black,250)` → `\WA(2000,,0,1)` →
+  `bg_effect_00` fade → `\DrawBG2(chui01,bgwipe99,1000)` → `\WA(2200,,1,0)` →
+  `\DrawBG2(chui02,bg_black,1000)` → `\WA(2200,,1,0)` → `\FOUT(800)` → `\TITLE`。
+- 当前运行时已装载该剧本(`TEXT[FILE]`/`PRODUCT[COM=23]`)、token 化
+  (`$2914/@2915`)、标签搜索/预执行(s60/s61 pc39..42)均执行;
+  `es.SCENARIO.PARSER`(s61 pc99)运行;300 tick 时 `@0x405=1`(GO 标志
+  已置位),但场景行计数停在文件尾(`@2883=106`),启动剧本的
+  `\CSEL`/`\DrawBG` 没有产出任何图层(`start60.json` 86 层中无
+  logo_a/chui0*,`CG[FILE]` 追踪也无这两个 key)。下一步用官方引擎
+  trace 对拍 `\CSEL` 宏与 `com_no.pos.SET`/`SearchLABEL` 的位置,再实现;
+  不得再用宿主特化绕过。
+
+**验证**:
+```bash
+cargo build -p yu-cli --no-default-features --features desktop
+cargo test -p yu-gfx --test info_query cginfo_lint2
+# → 1 passed
+yu-cli run <v555-2> --mode headless --frames 240 --patch gbk
+# → gfx.info.missing=0 gfx.info.unsupported=0(修前每帧数百)
+yu-cli run <v555-2> --mode headless --frames 1500 --patch gbk \
+  --json <tmp>/lint2_1500.json
+# → frame=1502 layers=108 passes=21,到达 ES.TITLE.*,无 Fatal
+```
+未执行任何 git 写操作。
+
+## 成果 V555-SCENARIO-TRIGGER (2026-11-21) · 场景启动链触发点取证与顶层 `_RINT` 修复
+
+**证据(官方 555 引擎 trace + RE)**:
+- 构建 `b02a4dc04ae`(`<main-exe>`,SHA-256
+  `9bcd33cf…`),`obj_global=0x872584`、`pc_off=0x20`、
+  `script_id_off=0x3c`;仅对 GO/GOSUB/RETURN/LABELINFO/TEXT/PRODUCT/WAIT
+  下断点,60s / 300k 事件。
+- 官方 seq 1:s281(`SYSTEM_START`)pc0 GO;seq 4:s22(`es_eris`)pc18
+  `GOSUB es.S.GO, ES.FIRST`;seq 602/605:s22 pc31/pc37
+  `GOSUB es._label.info.exist` → s193 pc475 `LABELINFO`;seq 609:
+  s22 pc42 `GOSUB ES.FIRST.LOOP` → s24(`es_first.yst`)。
+- 官方 seq 64515:s55(`es_scenario.yst`)pc13
+  `GOSUB es.SCENARIO.FLOW.INIT`;seq 105657:s57 pc15
+  `GOSUB es.Scenario.JumpLabel("SCENARIO_START_RELEASE")`;
+  seq 105666:s61 pc38 `GOSUB` → s60 pc1
+  `TEXT[FILE] scenario/scenario_start.txt`。
+- `PRODUCT`/`TEXT` 顺序:s56 pc8 COM=29 → pc19 COM=24 →
+  s60 pc6-8 `TEXT[FILE]`(逐 scenario 文件)→ s60 pc36 COM=23 →
+  s58 pc87 COM=22(逐行词法,37,735 次)→ JumpLabel → s60 pc1
+  `TEXT[FILE] scenario_start.txt`。
+- `ES.FIRST` 不是 `ysl` 标签;标签表只有 `ES.FIRST.LOOP`(s24 pc0)。
+  `ysl` 在 boot 由 `FUN_00463c7c` 一次性装载,`FUN_0046b5c8` 用
+  `FUN_0045124c` 解析硬编码 `SYSTEM_START`(exe 偏移 `0x1B799C`)。
+  `es.S.GO`/`es.SS.GO` 不走标签查询;真正的存在性检查是
+  `es._label.info.exist` = `LABELINFO[# EXIST LET]`。
+
+**根因与修复**:
+- `LABELINFO` 本身返回 1,但调用方 `IF @_RINT(1)` 恒读 0。根因在
+  `crates/yu-rt/src/other/gosub.rs`:三组 GOSUB 帧栈只存被调帧,
+  任务内第一次 GOSUB 的顶层 `RETURN` 没有调用方基帧承接
+  `ret_int/ret_flt/ret_str`。
+- 修复:任务起始的第一次 GOSUB 先清旧帧并压入一个
+  `GosubFrame::default()` 任务基帧,再压被调帧
+  (`other/gosub.rs:81-93`)。旧版不安装 `other`(精确 `yscm.version == 555`),
+  共享路径不变。
+- 回归:`crates/yu-rt/tests/fixture/other.rs::
+  other_runtime_top_level_return_survives_to_caller`。
+
+**验证**:
+```bash
+cargo test -p yu-rt --lib
+# → 131 passed; 0 failed
+cargo test -p yu-rt --test fixture
+# → 141 passed; 0 failed; 7 ignored(新增 other 用例)
+cargo test -p yu-gfx --test info_query
+# → 30 passed; 0 failed; 1 ignored
+YURIS_SAMPLE_ERIS_ROOT=<project-eris> \
+YURIS_SAMPLE_SDK0495=<sdk-0.495>/システム \
+cargo test -p yu-save --lib
+# → 31 passed; 0 failed
+PROBE_VM_DIAG= \
+cargo run -q -p yu-engine --example probe_vm -- <v555-2> 1500
+# → 无 Fatal;无 rt.cmd.unimplemented;layers=119/vis=26,
+#   停在 es_select2.yst pc130(语言选择输入循环)
+TRACE_ALL=1 \
+cargo run -q -p yu-engine --example probe_dialog -- <v555-2> 30
+# → f3 s57 pc13 → s61 pc81 → s60 pc1
+#   TEXT scenario/scenario_start.txt
+```
+> 编码:`<v555-2>` 的 ybn/引擎 lead 表是 **Big5**(见
+> §V555-ENCODING-BIG5);不再用 `PROBE_VM_PATCH=gbk`,本轮用显式
+> `PROBE_VM_PATCH=big5` 取证。**不改 `PatchKind::Auto`**:语言由游戏内
+> `\CSEL`/`ES.LANG.SET` 选择,auto 匹配是别的汉化版本用的。
+未执行任何 git 写操作。剩余未闭合见
+`docs/formats/v555-truth-2026-11-21.md` §11.6.6。
+
+## 成果 V555-TOKENIZER-CONTRACT (2026-11-21) · 官方 `PRODUCT[COM=22]` 词法器输出契约对齐
+
+**证据(REA/Ghidra,b3c02 `<main-exe>`)**:
+- `FUN_0045a874` @ `0x45a874`(4470 B)是官方剧本 DSL 词法器;逐 token
+  调 `FUN_0045baf8` @ `0x45baf8`。
+- `FUN_0045baf8` 写 INT 元素 8 字节:低 32 = 类型码,高 32 = 0
+  (`0x45b024`/`0x45b78e`/`0x45b1e0` … 均为 `[esp+8]=type,[esp+c]=0`);
+  文本写 STR 数组;token 数由 `FUN_00459490` 的 64 位返回在
+  `0x45b9cc` 写 `LET`。**没有位置/长度字段**。
+- 行尾 CR / `//` 注释 token:类型 **0**、文本 `"\r"`;空行(无 CR)
+  0 token;词/数字类型 `0x20`;`\`=0x33…`#`=0x39。
+- 本机对齐:`other/scenario.rs` 的 `EOL_CODE` 0x0d→0,空行 0 token,
+  注释 1 个 EOL token,无 CR 不再追加;`other/handlers/product.rs`
+  删除 `PRODUCT.COM=22.FIELDS` aligned-stub。
+
+**验证**:
+```bash
+cargo test -p yu-rt --lib scenario
+# → 7 passed
+cargo test -p yu-rt --lib
+# → 131 passed
+TRACE_CMD=1 \
+  cargo run -q -p yu-engine --example probe_dialog -- <v555-2> 30
+# → f3 s57 pc15 → s61 pc81 → s60 pc1
+#   TEXT scenario/scenario_start.txt;ERR=0
+PROBE_VM_DIAG= \
+  cargo run -q -p yu-engine --example probe_vm -- <v555-2> 1500
+# → 无 Fatal / 无 rt.cmd.unimplemented;aligned_stub 2→1;
+#   layers=119 vis=26,停在 es_select2 pc130(输入循环)
+```
+临时探针改动已回退(`probe_dialog` 无 `with_event_capacity`/EVENTS 打印/
+扩展过滤);未执行 git 写操作。
+
+## 成果 V555-ENCODING-BIG5 (2026-11-21) · 多语言编码:样本真值是 Big5,不是 GBK
+
+**证据(REA/Ghidra + 数据自证)**:
+- 官方 `<v555-2>`(`b3c02ab23bf`)与 `<v555-3>`(`b02a4dc04ae`)的
+  `DAT_0059b0c0` 256 字节 lead-byte 表实测为 **Big5**:
+  `0x81..=0x9F` / `0xA1..=0xFE` = 1,`0xA0`/`0xFF` = 0。
+  CP932 应为 `0x81..=0x9F`/`0xE0..=0xFC`;GBK 应为 `0x81..=0xFE`。
+- 样本 ybn 的 UI 字符串只有 Big5 能解:`A1 69 C5 40 A4 68 A1 6A`
+  →「【護士】」、`A1 69 A4 73 A5 D0 A1 6A` →「【山田】」;
+  CP932/GBK 均乱码或非法。此前 `PROBE_VM_PATCH=gbk` 是靠 GBK/Big5
+  前导区间重叠“碰巧”跑通,不是真值。
+- 场景文本按语言分目录:base `scenario/` = CP932、`sc_cn_scenario/`
+  = GBK、`sc_tw_scenario/` = Big5;Big5 构建应选 TW 数组(语言选择
+  逻辑仍待独立取证,见未闭合)。
+
+**语言选择的代码证据(脚本侧,不是 exe 推断)**:
+- `ES.LANG.SET`(s26 pc0–22)按 `@53[1]`(语言号)分三支:
+  - 0:`@1000=1,@1002=0,@1001=0`,`$1179[38][31]="cgsys/"`;
+  - 1:`@1000=0,@1002=1,@1001=0`,`$1179[38][31]="cgsys_cn/"`;
+  - 2:`@1000=0,@1002=0,@1001=1`,`$1179[38][31]="cgsys_tw/"`;
+  然后 `es.BT.TASK.INIT`。
+- 这是**游戏内可选语言**的真实入口(`\CSEL` → `ES.CSEL.SET` →
+  `es_select2` → `ES.LANG.SET`);编码/资源前缀随语言切换,不能用
+  exe lead 表替代语言选择。
+- 场景文本三数组 `$2868/$2869/$2870`(s60 pc1–3 `TEXT[FILE]`)与
+  `@1000/@1001/@1002` / `ES.LANG` 的选择路径 **尚未逐帧取证**。
+
+**通用能力改动(无 v555 特化)**:
+- **未改 `PatchKind::Auto`**(按主人裁决:auto 匹配是别的汉化版本用的;
+  本样本用显式 `PROBE_VM_PATCH=big5` 取证)。
+- `probe_dialog` 不再写死 `script/text = Gbk`,改走
+  `PatchSelection/PatchProfile`(显式 `big5|gbk|original`;Auto 保持原语义)。
+- `PRODUCT[COM=22]` 词法器 `tokenize(line, codec)` 按当前
+  `script_text_codec` 分类 lead byte;`VARINFO[SJISCODE]` 原本已按
+  script codec;表达式字符串字面量 `decode_string_literal_with(codec)`
+  已有 Big5 回归用例。
+
+**验证**:
+```bash
+cargo test -p yu-engine --lib patch
+# → 12 passed(Auto 未改,原用例不变)
+cargo test -p yu-rt --lib
+# → 131 passed(含 Big5 字面量/词法器用例)
+# 本样本显式 Big5(语言由游戏选择;此处只给执行 codec)
+PROBE_VM_PATCH=big5 TRACE_CMD=1 \
+  cargo run -q -p yu-engine --example probe_dialog -- <v555-2> 30
+# → ERR=0;f3 s57 pc15 → s61 pc81 → s60 pc1
+#   TEXT scenario/scenario_start.txt
+PROBE_VM_PATCH=big5 PROBE_VM_DIAG= \
+  cargo run -q -p yu-engine --example probe_vm -- <v555-2> 1500
+# → 无 Fatal / 无 rt.cmd.unimplemented;layers=119 vis=26
+```
+未执行 git 写操作。未闭合:三语言数组(`$2868/2869/2870`)与
+`ES.LANG.SET` 的**文本 codec 切换**路径尚未逐帧取证;`PatchKind::Auto`
+保持原样(不承担 Big5 识别)。
+
+## 成果 V555-TEXTFILE-PATH (2026-11-21) · TEXT[FILE] 路径规范化按前导表跳双字节(仅 555)
+
+**证据(REA/Ghidra)**:
+- 官方 `FUN_00464dac`(`<v555-2>` b3c02):遍历路径字节,
+  `DAT_0059b0c0[b] == 1` 时 `p += 2`(尾字节不参与任何 ASCII 变换);
+  否则仅当 `'@' < b < '['` 时加 0x20。
+- `TEXT[FILE]` 处理体 `0x452a0c` 的 `/`→`\` 使用同一张前导表跳步。
+- 旧版引擎没有多语言路径,`TEXT` 命令表也没有 `FILE` 槽;该语义只属于
+  555 独立运行面。
+
+**改动**:
+- `crates/yu-rt/src/semantics.rs`:新增 `TextMode`(`Attributes`/`FileArray`)
+  与 `TextInfoMode`(`Query`/`Inert`),由 `ysc_version == 555` 派生;
+  556/600 保持旧形态。TEXT/TEXTINFO 同名不同义只认这些语义字段,
+  不再看参数表有没有 `FILE`。
+- **共享 `text.rs` 恢复 c1549eb 原样**(`git diff` 为空):删除参数名分派、
+  `op_text_file`、`text_file_lines`、路径规范化与单测;旧版路径零改动。
+- v555 语义整体迁入 `crates/yu-rt/src/other/handlers/text.rs`:
+  `other_op_text_file`(整文件切行/字符串数组/`CLEAR`)+
+  `normalize_text_file_path`(前导字节跳 2;其余 `A..Z` 加 0x20、
+  `/`→`\`;尾字节 `0x41..=0x5A`/`0x2F` 原样)。
+- `other::handlers::dispatch` 按 `SemanticProfile::text == FileArray` 接管
+  `TEXT`,按 `textinfo == Inert` 接管 `TEXTINFO`(空处理体 no-op);
+  形态不匹配时交回共享 handler。
+- 夹具:两个 `TEXT[FILE]` 用例与 `TEXTINFO` 空签名用例迁入
+  `tests/fixture/other.rs`,并在 boot 后显式 `install_other_runtime()`;
+  共享 `fixture/text.rs` 不再保留 555 用例。
+- 共享层新增中性钩子:`Vm::clear_text()`;`open_asset` 可见性
+  `pub(super)` → `pub(crate)`(独立运行面复用同一读资产路径)。
+
+**验证**:
+```bash
+cargo test -p yu-rt --lib
+# → 137 passed
+cargo test -p yu-rt --test fixture
+# → 141 passed, 7 ignored
+cargo test -p yu-engine --lib patch
+# → 11 passed
+cargo test -p yu-gfx --test info_query
+# → 30 passed, 1 ignored
+YURIS_SAMPLE_ERIS_ROOT=... YURIS_SAMPLE_SDK0495=... cargo test -p yu-save
+# → 31 passed
+PROBE_VM_PATCH=big5 TRACE_CMD=1 \
+  cargo run -q -p yu-engine --example probe_dialog -- <v555-2> 60
+# → 无 Fatal / 无 unimplemented;f3 s60 pc1/2/3 TEXT scenario/scenario_start.txt,
+#   三数组 $2868/$2869/$2870 各 122 行
+```
+未执行 git 写操作。
+
+## 成果 V555-CSEL-PARAM (2026-11-21) · 启动链首个交互 CSEL 的参数/等待点取证
+
+**证据(脚本 + ABI)**:
+- `$0x37` = 系统变量 `_PSTR`(id 55,`dims=[17]`);`$0x3e` = `_RSTR`。
+- 病栋 2 标题宏 `es.BT.CG.SET`(s9 pc0–7)不调用 `_PSTR()`,而是把
+  `$0x37[1..7]` 原样拷进 `$0x552[btn][1..7]`;`s10 pc105` 再以
+  `CG[FILE=$0x4ce[...]]` 装载标题图。
+- 新增夹具 `other_gosub_pstr_is_visible_through_system_var_slot`:
+  `GOSUB PSTR1="HELLO"` → 被调方 `$_PSTR(1)` 读回 `"HELLO"`,证明
+  GOSUB 三组帧 → 系统变量槽位的参数链没有断。
+
+**诊断收口**:
+- 15 万条 `rt.undetermined` Verbose 是 trace 误用(PRODUCT 每次调用 /
+  COM=22 每行 / INT 槽号引用 / SAVE·LOAD MEM 优先 / FILEINFO CGFILE),
+  已改为专用码:`rt.product.trace`、`rt.param.slot`、`rt.mem.trace`、
+  `rt.fileinfo.trace`。`rt.undetermined` 只保留真正未取证的语义,
+  不再被逐调用日志淹没。
+
+**未闭合(CSEL 交互,黑屏的直接位置)**:
+- 标题场景文本 `scenario/scenario_start.txt` 第一条交互命令是 `\CSEL`
+  (第 5 行),之后才是 `\NEXTON1` / `\DrawBG` / `\CAUTION` / `\TITLE`。
+  当前 trace 停在 `es_select2.yst` 的 CSEL 等待循环(pc130),后续命令
+  未执行。
+- 调用参数已静态还原:`s70 pc918–921` 以
+  `PINT1=1,PINT2=-1,PINT3=350,PINT4=300` 调 `ES.CSEL.SET`;
+  `ES.CSEL.SET`(s36 pc113–121)把 `$_PINT(1..4)` 原样写进
+  `$0x49b[93][1..4]`,再 `BTDEF.LOAD`/`BT.DRAW`,随后进入
+  pc122–131 等待循环。循环条件要求 `$0x49b[93][2] != -1`,
+  选中分支把该格写 1 并调 `ES.CSEL.BTN.SEL.ON`。
+- 按钮任务链:`s55 pc11` 用 `es._task` 启动
+  `es.IDBtnTask` → 标签 `ES.SCENARIO.BtnLoop`(s42),
+  s42 每帧 `GOSUB es.BT.TASK.MAIN`(s13)。因此下一步不是查
+  logo/标题 CG,而是确认这个按钮任务是否在跑、是否写
+  `$0x49b[93][2]`。
+- 实参语义已加回归:`_PINT` 按**当前调用帧**读(嵌套 GOSUB 返回后
+  仍是外层 1/-1/350/300;`other_pint_survives_nested_gosub`),
+  `_PSTR` 按当前帧读(`other_gosub_pstr_is_visible_through_system_var_slot`)。
+  之前把 `$0x37` 误当全局参数区、以及“CSEL 读 PSTR”的猜测均已撤回
+  —— pc117–120 读的是 `$0x35`(`_PINT`)。
+- 待取证:`es.IDBtnTask` 的实时任务位置与 `$0x49b[93][1..4]` /
+  `@0x4c6` 实际值;`PROBE_VM_WAIT=1` 已能打印等待任务,下一步用它
+  区分“按钮任务没跑”还是“跑了但鼠标命中状态没更新”。
+
+**验证**:
+```bash
+cargo test -p yu-rt --lib
+# → 137 passed
+cargo test -p yu-rt --test fixture
+# → 143 passed, 7 ignored
+cargo test -p yu-engine --lib patch
+# → 11 passed
+cargo test -p yu-gfx --test info_query
+# → 30 passed, 1 ignored
+YURIS_SAMPLE_ERIS_ROOT=... YURIS_SAMPLE_SDK0495=... cargo test -p yu-save
+# → 31 passed
+```
+未执行 git 写操作。
+
+## 成果 V555-STARTUP-SKIP (2026-11-22) · 启动画面未发出 DrawBG/CG 的取证 + `_PINT` 可赋值
+
+**交互取证(桌面 `YU_CSEL_TRACE=1`)**:
+- 4 个任务存活:`es.IDBtnTask` s42 pc5、`es.IDSubTask` s55 pc129、
+  `es.IDSubTask2` s36 pc131、`SYSTEM` s22 pc48。
+- `@0x49b[93] = [0,1,-1,350,300,0…]`(CSEL 参数正确写入);
+  鼠标注入/人工点击后 `[93][2]` 未变,按钮任务在跑但没有命中。
+- 该现象与“CSEL 之后启动画面被跳过”是两件事;后者已用下面的
+  `YU_CSEL_SKIP` 单独隔离。
+
+**启动画面取证(`YU_CSEL_SKIP=1` 仅取证、非生产修复)**:
+- `--frames 1700/1900 --shot` 两帧都已是标题画面;说明 CSEL 之后的
+  logo/CAUTION 序列被快速穿过。
+- `YU_CG_FILE_TRACE=1` 记录 47,750 条 `CG[FILE]`,其中
+  `logo_a` / `chui` / `splashscreen` 命中 **0** 次 —— 不是纹理解码/
+  图层可见性问题,而是 `\DrawBG`/`\DrawBG2` 宏根本没被调用。
+- 300 tick 实测 `@0xb43 = 106`(行计数在文件尾),与
+  `docs/tasks/v555-startup-prompt.md` 记录的阻塞点一致;下一步修
+  `es_scenario_parser` 的行游标/`SearchLABEL`/`com_no.pos.SET`,
+  让文本从 `\CSEL` 后的 `\NEXTON1`/`\DrawBG(logo_a)` 继续执行。
+- 进一步 trace(`YU_GOSUB_TRACE=1`):`SearchLABEL("SCENARIO_START_RELEASE")`
+  返回 101;`com_no.pos.SET(-1,1,0,65)` 被调用;`s64 pc43` 分发到
+  `DrawBG`(s65 pc132);但 `DrawBG → SetParam`(s64 pc5)的 GOSUB
+  **实参全空**,`SetParam` 的 `_PINT(1..3)=0` → `$3063/$3064` 空;
+  s65 pc151 的绘制调用因此 PSTR 为空,**不发出任何 `CG[FILE]`**。
+  下一步是修宏参数槽传递(`SetParam` 的 `_PINT`/槽位来源),
+  需要官方 trace 或 REA 证据,不能靠猜。
+
+**代码修复(555 独立运行面)**:
+- `_PINT/_PFLT/_PSTR/_PFLG` 是手册 ○ 可赋值;555 剧本把它们当宏调用
+  参数区直接写(`es_eris.yst` pc245 写 `@_PINT(1)`,pc246/pc247 读回)。
+  共享路径原来“写入忽略 + 挂号”,现由 `other_sysvar_set` 接管写入
+  当前 GOSUB 帧;旧版未安装 other 时行为不变。
+- 新增夹具 `other_pint_write_updates_call_param_bank`。
+- 取证接口(不改变默认行为):`Engine::read_variable/read_sysvar/vm_time`、
+  `YU_CSEL_TRACE`、`YU_CSEL_SKIP`(仅取证)、`YU_CG_FILE_TRACE`。
+
+**验证**:
+```bash
+cargo test -p yu-rt --lib          # 137 passed
+cargo test -p yu-rt --test fixture # 144 passed, 7 ignored
+cargo test -p yu-gfx --test info_query # 30 passed, 1 ignored
+```
+未执行 git 写操作。
+
+**勘误（2026-11-22 晚）**：上文 `_PINT` 写入/`other_sysvar_set` 与
+“全局参数银行”实验已整体回退——它把 CSEL 外层实参覆盖掉，导致主任务
+提前 END/纯黑。当前语义恢复为：`_PINT/_PFLT/_PSTR` 读**当前 GOSUB 帧**，
+无全局 bank。真正修复启动宏参数的是下面两条通用改动：
+- v555 GOSUB 对 ERIS 旧式数组（`#`/`` ` ``）传**槽号**，`@` 普通数值
+  数组仍按值（`other/gosub.rs`）；
+- v555 允许前缀下标（`@1177[110,19]` 二维访问），由 `SemanticProfile`
+  门控（`value.rs`）。
+警告页 `chui01/chui02` 的分支依赖 `@1177[110,19]`，语言选择后已能进入
+`DrawBG2 → es.SP.CG`。
+
+## 成果 V500-FORMAT-CENSUS (2026-11-22) · YPF xxh32 / YSCF V500 与 0.500↔555 ABI 普查
+
+**样本**：`<v500-sample>`（真名见 `AGENTS.md` §1.2）。
+
+**YPF v500**:
+- `pac/bn.ypf`：`YPF\0` version=500，315 条，data_start=`0x3763`；
+- `ysbin/ysc.ybn` 载荷是单段 zlib（`78 DA`），csize=4115；
+- `nameHash=murmur2(name,0)`；`payloadHash=`**`xxh32(存储字节,0)`**；
+  抽验 `ysc/yst00034/yst00145/yscfg/yst00236` 5/5 与索引相等；
+- `crates/yu-vfs/src/ypf.rs` 新增 `HashAlg::Xxh32` 与 `xxh32`；
+  主算法不命中再按 xxh32 裁决，命中才接受；旧 YPF 主算法优先，行为不变。
+
+**YSCF v500**:
+- `ysbin/yscfg.ybn` 141B：宽 `+0x10`/高 `+0x14`、
+  `titleLen @ +0x58`、`title @ +0x5A`，文件恰好在标题末尾闭合；
+- `crates/yu-format/src/yscf.rs` 新增 `YscfLayout::V500`；
+  旧 New/Old/V292/V255 候选与裁决不变。
+
+**0.500 ↔ 0.555 ABI 普查**:
+- `ysc.ybn` 两者均 121 条、11102B；逐字节仅 3 处差异：
+  版本字段、`GRADATION` 参数 `kind`（500=`7`，555=`3`）；
+- `ysv.ybn` 系统槽 `0..999` **1000/1000 完全一致**
+  （kind/flag/file_id/ty/dims/init 全同）；`>=1000` 是作品变量
+  （500=3388 条，555=3373 条），不属于 ABI 差异；
+- 结论：0.500 可归入 121 槽命令表 + 0.495 系统 ABI 族，
+  但不能直接当 555；仍需独立 handler/`GRADATION` 差异覆盖。
+- 详细证据：`docs/formats/v500-abi-census-2026-11-22.md`。
+
+**运行状态**:
+- `<v500-sample>` 已能过 YPF/YSCF 装载进入 VM；
+- 仍卡在 0.500 handler 映射（`PRODUCT` 命令无处理器）；
+- 0.495 工程启动仍 `kind=original source=default`，无 Fatal。
+
+**验证**:
+```bash
+cargo test -p yu-vfs --lib          # 55 passed
+cargo test -p yu-format --lib yscf  # 6 passed
+```
+未执行 git 写操作。
+
+## 成果 V555-WINDOW (2026-11-22) · 双主 exe 编码裁决 + v555 过期窗口长度自定界
+
+**样本**：`<v555-sample>`（真名见 `AGENTS.md` §1.2；汉化数据 GBK）。
+
+**根因（两处独立）**:
+1. 工程根 `<main-exe>`（CP932 lead 表）与 `<chs-exe>`（GBK lead 表）
+   同时在位；旧 `static_codec_for_v555` 见“多主 exe 编码冲突”直接返回
+   `None` → `Auto` 回退 CP932。GBK 字面量 `d1 e0`（姓）在 CP932 下
+   `e0` 吞掉结束引号 → `s273 pc3` “字符串字面量未闭合”。
+2. 汉化把日文 3 字名改成 5 字 GBK 名时只更新了字符串记录头
+   （`4d 0c 00`，整条 15 字节），没有更新 12 字节窗口记录的
+   `length=11`；旧 `window_payload` 严格按 `length` 切片 →
+   `s273 pc13` `操作数越界 ... 窗口共 11`。pc216 同型（记录/窗口都短，
+   `b5`/`91` 悬空前导即截断证据）。
+
+**实现**:
+- `crates/yu-engine/src/patch.rs`：冲突时用工程自身 `0x4d` 字面量给
+  候选 lead 表打分（未闭合 +8、结尾悬空前导 +12；窗口内被截断的记录
+  整条跳过），唯一显著低分者生效，否则维持“不猜”；证据串列出两只
+  exe 与裁决结果。采样上限 512 脚本 / 32 MiB / 8192 条字面量。
+- `crates/yu-rt/src/semantics.rs`：新增
+  `WindowPayloadMode{Exact,RecordDelimited}`，仅精确 555 为后者；
+  556/600 与旧版保持 `Exact`。
+- `crates/yu-rt/src/tables.rs`：`window_payload_with_tail` 给出窗口 +
+  到下一窗口 offset/池尾的尾部；`window_offsets` 启动期排序去重。
+- `crates/yu-rt/src/expr.rs`：`window_literal_unclosed` 静态标记 +
+  `decode_self_delimited` 只对“首记录为 `0x4d` 且不在声明长度内闭合”
+  的窗口按界定符重解；正常记录逐字节保持严格路径。
+- `crates/yu-rt/src/vm.rs`：`fill_cmd` 在 555 门控下接入；补读成功发
+  Verbose `rt.window.length_stale`（每站点一次）；跳转槽不进入该路径。
+
+**验证**:
+```bash
+# 自动编码启动，无需 --patch gbk
+yu-cli run "<v555-sample>" --frames 90 --backend soft \
+  --shot "<tmp>/sample-f90.png" --log-level warn
+# frames ticked: 90；无 FATAL/UNIMP；截图=Whirlpool logo
+
+# 旧版 Auto 不变
+yu-cli run "<project-eris>" --frames 1 --backend soft --log-level info
+# patch: kind=original source=default execution=cp932 ...
+
+cargo test -p yu-engine --lib                                    # 70 passed
+cargo test -p yu-rt --test fixture --no-default-features         # 144 passed
+cargo test -p yu-gfx                                             # 通过
+cargo check -p yu-rt -p yu-engine --all-targets                  # 通过
+```
+档案：`docs/divergences/DIV-RT-068-v555-stale-window-length.md`。
+未执行 git 写操作。
