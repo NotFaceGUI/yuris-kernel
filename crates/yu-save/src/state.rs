@@ -99,6 +99,17 @@ pub struct SaveState {
     block_codec: Option<yu_format::yssd::BlockCodec>,
     /// 未刷盘预约(DNO → 快照;同 DNO 覆盖)。
     reservations: BTreeMap<u32, ReservedFact>,
+    /// `SAVE[MEM=n]` 的内存存档槽(n → 容器字节)。
+    ///
+    /// v555 处理体(`0x44b874`):`SAVE[MEM=n]` 把当前预约表按与
+    /// `SAVE[FILE]` **相同的 YSSD 容器**序列化到 `DAT_008670c0[n]`,
+    /// 容量 `DAT_008678a0[n]`;`LOAD[MEM=n]` 从同一槽读(读偏移
+    /// `DAT_00868860[n]`)。槽号是脚本表达式,实测覆盖 `0..=90000+`
+    /// (<v555-pc> `SAVE[MEM=@base+90000]`),所以用稀疏表,不设人为上限。
+    ///
+    /// `MEM=99999` 是独立分支(`FUN_0044d82c`:把 0..499 号槽打包到
+    /// `DAT_0086a03c`),不是普通槽;本状态机不把它塞进本表。
+    mem_slots: BTreeMap<u32, Vec<u8>>,
     /// 诊断(容量上限 [`MAX_DIAGS`],超限丢最旧并记账)。
     diags: std::collections::VecDeque<Diag>,
     diags_dropped: u64,
@@ -132,6 +143,7 @@ impl SaveState {
             learned_version: None,
             block_codec: None,
             reservations: BTreeMap::new(),
+            mem_slots: BTreeMap::new(),
             diags: std::collections::VecDeque::new(),
             diags_dropped: 0,
             save_calls: 0,
@@ -164,6 +176,19 @@ impl SaveState {
     /// 当前未刷盘预约数。
     pub fn reservations_len(&self) -> usize {
         self.reservations.len()
+    }
+
+    /// 当前内存存档槽数(`SAVE[MEM]` 写入后保留;`SAVEEND` 不清它们,
+    /// 官方 `SAVEEND` 只清预约表)。
+    #[must_use]
+    pub fn mem_slots_len(&self) -> usize {
+        self.mem_slots.len()
+    }
+
+    /// 一个内存存档槽的原始容器字节。
+    #[must_use]
+    pub fn mem_slot(&self, slot: u32) -> Option<&[u8]> {
+        self.mem_slots.get(&slot).map(Vec::as_slice)
     }
 
     /// 确定性快照(用例摘要/诊断)。
@@ -493,7 +518,23 @@ impl SaveState {
         Ok(())
     }
 
-    /// 按预约表构造 YSSD 容器(文件存档与将来的内存槽共用同一序列化)。
+    /// `SAVE[MEM=n]`:把当前预约表序列化到内存槽(REA 555 `0x44b874`
+    /// 的 MEM 分支;容器与 `SAVE[FILE]` 完全同型)。
+    ///
+    /// 与 [`Self::flush`] 的差别只有目标:不写盘、不刷新盘上槽表,也**不**
+    /// 受 `writable` 限制(那是对游戏目录的写保护,不是运行期内存状态)。
+    /// 预约表同样不清(官方 `SAVEEND` 才清)。
+    pub fn save_mem(&mut self, slot: u32) -> Result<(), Diag> {
+        let mut diags = Vec::new();
+        let bytes = self.build_container(None, &format!("SAVE[MEM={slot}]"), &mut diags)?;
+        self.mem_slots.insert(slot, bytes);
+        for diag in diags {
+            self.push_diag(diag);
+        }
+        Ok(())
+    }
+
+    /// 按预约表构造 YSSD 容器(文件存档与内存槽共用同一序列化)。
     ///
     /// 版本选择:宿主注入常量 → 盘上学到的版本 → 目标文件版本 →
     /// 压缩层默认(最后一级留 verbose 诊断,标明是兜底不是取证)。
@@ -629,6 +670,28 @@ impl SaveState {
         self.decode_block(&bytes, file.as_bytes(), &format!("LOAD[FILE={file}"), dno)
     }
 
+    /// `LOAD[MEM=n DNO=k]`:从内存槽读一块(REA 555 `0x4447c8`:校验
+    /// `YSSD` 魔数 + 版本 `0x1e0` 后按与文件存档相同的块表恢复)。
+    ///
+    /// 校验与解码走 [`Self::decode_block`],与 [`Self::load_block`] 逐字节
+    /// 同路径;差别只在容器来源。
+    pub fn load_block_mem(&mut self, slot: u32, dno: u32) -> Result<LoadedBlock, Diag> {
+        self.load_calls += 1;
+        let bytes = self.mem_slots.get(&slot).ok_or_else(|| {
+            error::recoverable(
+                code::MEM_MISSING,
+                format!("LOAD[MEM={slot}] 内存槽不存在(先 SAVE[MEM={slot}])"),
+            )
+        })?;
+        let origin = format!("mem[{slot}]");
+        self.decode_block(
+            bytes,
+            origin.as_bytes(),
+            &format!("LOAD[MEM={slot}"),
+            dno,
+        )
+    }
+
     fn read_save_file(&self, file: &str, path: &Path) -> Result<Vec<u8>, Diag> {
         match self.fs.read(path) {
             Ok(bytes) => Ok(bytes),
@@ -723,6 +786,28 @@ impl SaveState {
         let path = self.confined_path(file)?;
         let bytes = self.read_save_file(file, &path)?;
         self.decode_image(&bytes, file.as_bytes(), &format!("LOAD[FILE={file}"), dno)
+    }
+
+    /// `LOAD[MEM=n DNO=k ID=图层]`:从内存槽读图像块。
+    pub fn load_image_mem(
+        &mut self,
+        slot: u32,
+        dno: u32,
+    ) -> Result<yu_rt::event::CapturedImage, Diag> {
+        self.load_calls += 1;
+        let bytes = self.mem_slots.get(&slot).ok_or_else(|| {
+            error::recoverable(
+                code::MEM_MISSING,
+                format!("LOAD[MEM={slot}] 内存槽不存在(先 SAVE[MEM={slot}])"),
+            )
+        })?;
+        let origin = format!("mem[{slot}]");
+        self.decode_image(
+            bytes,
+            origin.as_bytes(),
+            &format!("LOAD[MEM={slot}"),
+            dno,
+        )
     }
 
     /// 容器 → 图像块(文件与内存来源共用;`source` 约定同
@@ -1780,4 +1865,50 @@ fn confined_path_rejects_save_root_ancestor() {
         .confined_path(&parent.to_string_lossy())
         .expect_err("save 根的祖先必须被拒绝");
     assert_eq!(err.code, code::PATH_ESCAPE, "祖先应报 PATH_ESCAPE");
+    }
+
+/// v555 `SAVE[MEM=n]` / `LOAD[MEM=n]`:内存槽与文件存档共用同一 YSSD
+/// 容器;不落盘,槽号稀疏(实测 90000+),`SAVEEND` 不清内存槽。
+#[test]
+fn mem_save_roundtrips_container_without_disk() {
+    let root = std::path::PathBuf::from("target/tmp/sv-mem-unit");
+    let _ = std::fs::remove_dir_all(&root);
+    let mut state = SaveState::new(&root, false);
+    state.set_container_version(0x1E0);
+    state
+        .reserve(
+            7,
+            VarRef::new(VarSpace::At, 0x0a43),
+            &VarSnapshot {
+                ty: ElemType::Int,
+                dims: vec![2],
+                data: vec![Value::Int(11), Value::Int(22)],
+            },
+        )
+        .expect("reserve");
+    // <v555-pc> 实测槽号含 90000+;稀疏表必须原样接受。
+    state.save_mem(90_001).expect("save mem");
+    assert_eq!(state.mem_slots_len(), 1);
+    assert!(!root.exists() || std::fs::read_dir(&root).unwrap().next().is_none());
+
+    let bytes = state.mem_slot(90_001).expect("slot").to_vec();
+    let save = yu_format::yssd::YssdSave::parse(&bytes, b"mem[90001]").expect("parse");
+    assert_eq!(save.version, 0x1E0);
+    assert_eq!(save.entries.len(), 1);
+    assert_eq!(save.entry(7).expect("dno7").var_id, 0x0a43);
+
+    let block = state.load_block_mem(90_001, 7).expect("load mem");
+    assert_eq!(block.vars.len(), 1);
+    assert_eq!(
+        block.vars[0].snap.data,
+        vec![Value::Int(11), Value::Int(22)]
+    );
+    // 未写过的槽是显式错误,不退化成空块。
+    let err = state.load_block_mem(90_002, 7).expect_err("missing");
+    assert_eq!(err.code, code::MEM_MISSING);
+
+    // SAVEEND 只清预约表,内存槽保留(官方 0x44e1a0 同义)。
+    state.save_end();
+    assert_eq!(state.reservations_len(), 0);
+    assert_eq!(state.mem_slots_len(), 1);
 }

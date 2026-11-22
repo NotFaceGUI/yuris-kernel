@@ -289,6 +289,10 @@ impl Vm {
         let names: &[String] = &cmd.param_names;
         let mut file: Option<Vec<u8>> = None;
         let mut folder: Option<Vec<u8>> = None;
+        // `CGFILE`:图像文件名(无扩展名)。BT 按钮宏用它探测
+        // `_off/_over/_on/_onover/_na` 是否存在(es_buttonque.yst:341..),
+        // 与 `CG[FILE]` 共用图像扩展名探测。
+        let mut cgfile: Option<Vec<u8>> = None;
         let mut exist = false;
         let mut size = false;
         let mut relation = false;
@@ -312,6 +316,14 @@ impl Vm {
                         args.push(ArgValue::with_ref(w.rec.kind, v, var));
                     }
                     target = Some(lv);
+                }
+                "CGFILE" => {
+                    if let Ok(v) = self.eval_window(st, w) {
+                        if let Value::Str(bytes) = &v {
+                            cgfile = Some(bytes.clone());
+                        }
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
                 }
                 "FILE" | "FOLDER" => {
                     if let Ok(v) = self.eval_window(st, w) {
@@ -352,6 +364,28 @@ impl Vm {
         }
         // 事件流保持与实现前一致(File 域;宿主忽略 FILEINFO 本身)。
         self.emit_domain(Domain::File, "FILEINFO", args);
+        // CGFILE(REA `0x44316c` 的图像分支;BT 按钮宏 `es_buttonque.yst`
+        // pc341 起逐后缀探测):按 `CG[FILE]` 的扩展名顺序在 VFS 内查
+        // 是否存在。官方把当前 CG 基路径(脚本已带 `cgsys/` 前缀)与
+        // 图像扩展名一起拼;这里不猜前缀,只做 exact + yscfg 扩展名序。
+        if exist && target.is_some() && self.tables().boot.yscm.version == 555 {
+            if let Some(bytes) = cgfile {
+                let present = self.cg_file_exists(&bytes);
+                self.report(diag::verbose(
+                    code::rt::FILEINFO_TRACE,
+                    Boundary::Script,
+                    format!(
+                        "FILEINFO[CGFILE] {:?} -> {}",
+                        String::from_utf8_lossy(&bytes),
+                        i32::from(present)
+                    ),
+                ));
+                if let Some(target) = target {
+                    self.write_target(st, &target, &Value::Int(i64::from(present)))?;
+                }
+                return Ok(StepOutcome::Continue);
+            }
+        }
         // FOLDER(手册例 2;REA `0x4433d6`):官方 `FindFirstFileA` 查散盘目录,
         // 只认 `FILE_ATTRIBUTE_DIRECTORY`;包内文件夹**不可查**(手册注明)。
         // - EXIST ⇒ 1/0;
@@ -457,6 +491,55 @@ impl Vm {
             self.write_target(st, &target, &value)?;
         }
         Ok(StepOutcome::Continue)
+    }
+
+    /// `FILEINFO[CGFILE EXIST]`:图像资产存在性(无扩展名时按 yscfg 顺序探测)。
+    fn cg_file_exists(&self, bytes: &[u8]) -> bool {
+        let exists = |key: &[u8]| {
+            yu_vfs::LookupKey::new(key, yu_vfs::Codec::Cp932)
+                .ok()
+                .is_some_and(|k| {
+                    self.src.exists(&k) || self.aux.as_ref().is_some_and(|aux| aux.exists(&k))
+                })
+        };
+        if exists(bytes) {
+            return true;
+        }
+        // 已带扩展名:不再拼(官方候选序列是「原 key + 各扩展名」)。
+        if bytes.iter().rev().take(5).any(|b| *b == b'.') {
+            return false;
+        }
+        let order: Vec<u8> = self
+            .tables()
+            .boot
+            .config
+            .image_ext_order
+            .iter()
+            .copied()
+            .take_while(|c| *c != 0)
+            .collect();
+        let order = if order.is_empty() {
+            vec![1, 2, 3, 4]
+        } else {
+            order
+        };
+        for code in order {
+            let ext: &[u8] = match code {
+                1 => b"png",
+                2 => b"bmp",
+                3 => b"jpg",
+                4 => b"gif",
+                5 => b"psb",
+                _ => continue,
+            };
+            let mut key = bytes.to_vec();
+            key.push(b'.');
+            key.extend_from_slice(ext);
+            if exists(&key) {
+                return true;
+            }
+        }
+        false
     }
 
     /// save 根文件系统存在性(FILEINFO 的散盘支):路径以注入的
@@ -633,6 +716,10 @@ impl Vm {
         // 旧写法每次执行都重建整张 `Vec<String>`(与 `CGINFO` 同一个 bug)。
         let names: &[String] = &cmd.param_names;
         let mut file: Option<String> = None;
+        // v555 `SAVE[MEM=n]`:n 是内存存档槽号(不是文件名),与 FILE 互斥
+        // (5 个可读样本的 LOAD 计数 FILE+MEM 恰好等于总数)。处理体
+        // `0x44b874` 的 MEM 分支优先于 FILE 分支;两者同时给时只写内存。
+        let mut mem: Option<i64> = None;
         let mut dno: Option<i64> = None;
         let mut set: Option<(LValue, Value)> = None;
         let mut layer_id = false;
@@ -669,6 +756,12 @@ impl Vm {
                                     }),
                             );
                         }
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
+                "MEM" => {
+                    if let Ok(v) = self.eval_window(st, w) {
+                        mem = v.as_int();
                         args.push(ArgValue::new(w.rec.kind, v));
                     }
                 }
@@ -714,11 +807,13 @@ impl Vm {
         self.emit_domain(Domain::Save, "SAVE", args);
         // 预约(DNO 在场;官方 DNO 与 FILE 可同条,先预约后刷盘)。
         if let Some(dno) = dno {
-            if !(1..=1024).contains(&dno) {
+            // 555 内存槽 DNO 0 基;文件存档按 0.495 手册 1..=1024。
+            let dno_min = if mem.is_some() { 0 } else { 1 };
+            if !(dno_min..=1024).contains(&dno) {
                 self.report(diag::recoverable(
                     code::rt::CMD_SLOT,
                     Boundary::Script,
-                    format!("SAVE DNO={dno} 越界(手册 file/save.html:1~1024)"),
+                    format!("SAVE DNO={dno} 越界({dno_min}..=1024)"),
                 ));
                 return Ok(StepOutcome::Continue);
             }
@@ -813,6 +908,45 @@ impl Vm {
                 ));
             }
         }
+        // v555 `SAVE[MEM]`:MEM 分支优先于 FILE(REA `0x44b874`:
+        // MEM 在场时写完内存槽就 `return 0`,不再走文件路径)。
+        if mem.is_some() && file.is_some() {
+            self.report(diag::verbose(
+                code::rt::MEM_TRACE,
+                Boundary::Script,
+                "SAVE 同时给 FILE 与 MEM:MEM 优先(官方 0x44b874),FILE 被忽略",
+            ));
+        }
+        if let Some(slot) = mem {
+            if !(0..=i64::from(u32::MAX)).contains(&slot) {
+                self.report(diag::recoverable(
+                    code::rt::CMD_SLOT,
+                    Boundary::Script,
+                    format!("SAVE MEM={slot} 非法(内存槽号必须非负 32 位整数)"),
+                ));
+                return Ok(StepOutcome::Continue);
+            }
+            let slot = slot as u32;
+            if slot == 99_999 {
+                // 独立分支 `FUN_0044d82c`:把 0..499 号槽打包到
+                // `DAT_0086a03c`(0,1,0,u32 0,u32 总长 + 每槽 原始长/
+                // 压缩长/压缩数据)。消费方尚未取证 ⇒ 显式挂账,不猜。
+                self.report_unimplemented_variant(
+                    "SAVE",
+                    "MEM=99999",
+                    "SAVE[MEM=99999] 特殊分支(FUN_0044d82c:0..499 槽打包)未实现",
+                );
+            } else {
+                let failure = match self.save_host.as_mut() {
+                    Some(host) => host.save_mem(slot).err(),
+                    None => None,
+                };
+                if let Some(d) = failure {
+                    return Err(VmError::from(self.locate(d)));
+                }
+            }
+            return Ok(StepOutcome::Continue);
+        }
         // 刷盘(FILE 在场;官方先写头/偏移表再流出预约块)。
         if let Some(file) = file {
             let name = Self::ensure_sd_ext(&file);
@@ -847,6 +981,9 @@ impl Vm {
         // 旧写法每次执行都重建整张 `Vec<String>`(与 `CGINFO` 同一个 bug)。
         let names: &[String] = &cmd.param_names;
         let mut file: Option<String> = None;
+        // v555 `LOAD[MEM=n]`:n 是内存存档槽号,与 FILE 互斥;MEM 在场时
+        // 官方 `0x4447c8` 只走内存来源(文件参数不求值也不打开)。
+        let mut mem: Option<i64> = None;
         let mut dno: Option<i64> = None;
         let mut target: Option<LValue> = None;
         let mut layer_id = false;
@@ -884,6 +1021,12 @@ impl Vm {
                         args.push(ArgValue::new(w.rec.kind, v));
                     }
                 }
+                "MEM" => {
+                    if let Ok(v) = self.eval_window(st, w) {
+                        mem = v.as_int();
+                        args.push(ArgValue::new(w.rec.kind, v));
+                    }
+                }
                 "DNO" => {
                     if let Ok(v) = self.eval_window(st, w) {
                         dno = v.as_int();
@@ -913,6 +1056,13 @@ impl Vm {
             }
         }
         self.emit_domain(Domain::Save, "LOAD", args);
+        if mem.is_some() && file.is_some() {
+            self.report(diag::verbose(
+                code::rt::MEM_TRACE,
+                Boundary::Script,
+                "LOAD 同时给 FILE 与 MEM:MEM 优先(官方 0x4447c8),FILE 被忽略",
+            ));
+        }
         if layer_id {
             // `LOAD[DNO=n ID=图层 IDNO=n]` = 图像块(btype 1):块内像素装回
             // 图层表面。`IDNO` 在场时层名 = `ID.N`(REA `0x4470d1`,与
@@ -920,24 +1070,70 @@ impl Vm {
             let composed = layer_id_bytes
                 .as_deref()
                 .map(|id| Self::compose_layer_id(id, layer_idno));
-            let (Some(file), Some(dno), Some(id)) = (file.clone(), dno, composed.as_deref()) else {
+            // 旧版路径(无 MEM)保持 c1549eb 的完整参数检查与文案。
+            if mem.is_none() && (file.is_none() || dno.is_none() || composed.is_none()) {
                 self.report(diag::recoverable(
                     code::rt::CMD_SLOT,
                     Boundary::Script,
                     "LOAD[ID] 缺 FILE/DNO/ID",
                 ));
                 return Ok(StepOutcome::Continue);
-            };
-            if !(1..=1024).contains(&dno) {
+            }
+            let (Some(dno), Some(id)) = (dno, composed.as_deref()) else {
                 self.report(diag::recoverable(
                     code::rt::CMD_SLOT,
                     Boundary::Script,
-                    format!("LOAD DNO={dno} 越界(1..=1024)"),
+                    "LOAD[ID] 缺 DNO/ID",
+                ));
+                return Ok(StepOutcome::Continue);
+            };
+            // 555 内存槽的 DNO 是 0 基(实测 `DNO=@base+0`;处理体只判
+            // `>0x400`),文件存档仍按 0.495 手册的 1..=1024。
+            let dno_min = if mem.is_some() { 0 } else { 1 };
+            if !(dno_min..=1024).contains(&dno) {
+                self.report(diag::recoverable(
+                    code::rt::CMD_SLOT,
+                    Boundary::Script,
+                    format!("LOAD DNO={dno} 越界({dno_min}..=1024)"),
                 ));
                 return Ok(StepOutcome::Continue);
             }
+            // MEM 优先于 FILE(REA `0x4447c8`:MEM 在场不再走文件来源)。
+            let mem_slot = match mem {
+                Some(slot) if (0..=i64::from(u32::MAX)).contains(&slot) => Some(slot as u32),
+                Some(slot) => {
+                    self.report(diag::recoverable(
+                        code::rt::CMD_SLOT,
+                        Boundary::Script,
+                        format!("LOAD MEM={slot} 非法(内存槽号必须非负 32 位整数)"),
+                    ));
+                    return Ok(StepOutcome::Continue);
+                }
+                None => None,
+            };
+            if mem_slot == Some(99_999) {
+                self.report_unimplemented_variant(
+                    "LOAD",
+                    "MEM=99999",
+                    "LOAD[MEM=99999] 特殊分支(FUN_0044d82c:0..499 槽打包)未实现",
+                );
+                return Ok(StepOutcome::Continue);
+            }
             let loaded = match self.save_host.as_mut() {
-                Some(host) => host.load_image(&Self::ensure_sd_ext(&file), dno as u32),
+                Some(host) => match mem_slot {
+                    Some(slot) => host.load_image_mem(slot, dno as u32),
+                    None => match file.as_deref() {
+                        Some(file) => host.load_image(&Self::ensure_sd_ext(file), dno as u32),
+                        None => {
+                            self.report(diag::recoverable(
+                                code::rt::CMD_SLOT,
+                                Boundary::Script,
+                                "LOAD[ID] 缺 FILE/MEM",
+                            ));
+                            return Ok(StepOutcome::Continue);
+                        }
+                    },
+                },
                 None => return Ok(StepOutcome::Continue),
             };
             match loaded {
@@ -959,14 +1155,15 @@ impl Vm {
             }
             return Ok(StepOutcome::Continue);
         }
-        let Some(file) = file else {
+        // 旧版路径(无 MEM)保持 c1549eb 的 FILE 前置检查与文案。
+        if mem.is_none() && file.is_none() {
             self.report(diag::recoverable(
                 code::rt::CMD_SLOT,
                 Boundary::Script,
                 "LOAD 缺 FILE",
             ));
             return Ok(StepOutcome::Continue);
-        };
+        }
         let Some(dno) = dno else {
             self.report(diag::recoverable(
                 code::rt::CMD_SLOT,
@@ -975,18 +1172,54 @@ impl Vm {
             ));
             return Ok(StepOutcome::Continue);
         };
-        if !(1..=1024).contains(&dno) {
+        // 555 内存槽 DNO 0 基;文件存档按 0.495 手册 1..=1024。
+        let dno_min = if mem.is_some() { 0 } else { 1 };
+        if !(dno_min..=1024).contains(&dno) {
             self.report(diag::recoverable(
                 code::rt::CMD_SLOT,
                 Boundary::Script,
-                format!("LOAD DNO={dno} 越界(1..=1024)"),
+                format!("LOAD DNO={dno} 越界({dno_min}..=1024)"),
             ));
+            return Ok(StepOutcome::Continue);
+        }
+        // MEM 优先于 FILE(REA `0x4447c8`);两者都缺才是参数错误。
+        let mem_slot = match mem {
+            Some(slot) if (0..=i64::from(u32::MAX)).contains(&slot) => Some(slot as u32),
+            Some(slot) => {
+                self.report(diag::recoverable(
+                    code::rt::CMD_SLOT,
+                    Boundary::Script,
+                    format!("LOAD MEM={slot} 非法(内存槽号必须非负 32 位整数)"),
+                ));
+                return Ok(StepOutcome::Continue);
+            }
+            None => None,
+        };
+        if mem_slot == Some(99_999) {
+            self.report_unimplemented_variant(
+                "LOAD",
+                "MEM=99999",
+                "LOAD[MEM=99999] 特殊分支(FUN_0044d82c:0..499 槽打包)未实现",
+            );
             return Ok(StepOutcome::Continue);
         }
         let (dno, target) = (dno as u32, target);
         // 宿主借用只包住容器读取;写回需要 &mut self 的变量域。
         let loaded = match self.save_host.as_mut() {
-            Some(host) => host.load_block(&Self::ensure_sd_ext(&file), dno),
+            Some(host) => match mem_slot {
+                Some(slot) => host.load_block_mem(slot, dno),
+                None => {
+                    let Some(file) = file else {
+                        self.report(diag::recoverable(
+                            code::rt::CMD_SLOT,
+                            Boundary::Script,
+                            "LOAD 缺 FILE/MEM(无存档来源)",
+                        ));
+                        return Ok(StepOutcome::Continue);
+                    };
+                    host.load_block(&Self::ensure_sd_ext(&file), dno)
+                }
+            },
             None => return Ok(StepOutcome::Continue),
         };
         let block = match loaded {

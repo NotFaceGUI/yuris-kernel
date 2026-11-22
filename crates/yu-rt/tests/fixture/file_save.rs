@@ -408,6 +408,52 @@ fn csv_at_0495_slot_is_noop() {
     );
 }
 
+/// v555 的 CSV 仍是序号 7 且无 LINE,但处理体是真实解析器
+/// (`0x43c3a0`,1148B;<v555-1> 变体 1682B)。不能再套 0.495 的空桩判据。
+#[test]
+fn csv_at_555_slot_is_a_real_parser() {
+    let mut b = ProjectBuilder::new();
+    b.ysc_version = 555;
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 3,
+        dims: vec![8],
+        init: Init::Str(b""),
+    }];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let op_csv = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "CSV")
+        .expect("夹具命令表应有 CSV") as u8;
+    b.scripts = vec![vec![
+        GroupSpec::new(op_csv)
+            .window(0, ex::sb(b"data/test.csv"))
+            .window(1, ex::r#ref(0x24, sys)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut src = b.build();
+    src.insert(b"data/test.csv", b"a,b\r\nc,d\r\n".to_vec())
+        .unwrap();
+    let mut vm = Vm::boot(Box::new(src), BootConfig::default()).expect("boot");
+    let r = vm.tick_at(0, &no_input());
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let arr = VarRef::new(VarSpace::Dollar, sys);
+    let want: &[&[u8]] = &[b"a", b"b", b"c", b"d", b""];
+    for (i, cell) in want.iter().enumerate() {
+        assert_eq!(
+            vm.store().read(arr, &[i as i64]).unwrap(),
+            Value::Str(cell.to_vec()),
+            "cell[{i}]"
+        );
+    }
+}
+
 /// 0.466 表:CSV 序号仍是 7,但参数表带 `LINE` ⇒ 真实解析器 + 行过滤。
 /// 证据:0.466 `0x431970`(`mov eax,7; call` 后按 `[0x650201]` LINE 过滤)。
 #[test]
@@ -634,6 +680,10 @@ struct SaveRecorder {
     images: Vec<(u32, yu_rt::event::CapturedImage)>,
     /// `LOAD[ID]` 的图像读取请求。
     image_loads: Vec<(String, u32)>,
+    /// v555 `SAVE[MEM]` 的槽号与 `LOAD[MEM]` 的 (槽号, DNO)。
+    mem_saves: Vec<u32>,
+    mem_loads: Vec<(u32, u32)>,
+    mem_image_loads: Vec<(u32, u32)>,
     /// `Vm::emit` 同步喂入的 Save/File 事件与 flush 的**先后顺序**
     /// (FILEACT 必须先于同一帧的 SAVE[FILE] 刷盘)。
     order: Vec<String>,
@@ -649,6 +699,9 @@ impl SaveRecorder {
             loads: Vec::new(),
             images: Vec::new(),
             image_loads: Vec::new(),
+            mem_saves: Vec::new(),
+            mem_loads: Vec::new(),
+            mem_image_loads: Vec::new(),
             order: Vec::new(),
         }))
     }
@@ -703,6 +756,23 @@ impl SaveHost for SharedHost {
         self.inner.borrow_mut().loads.push((file.to_string(), dno));
         let reply = self.reply.borrow_mut().take();
         reply.ok_or_else(|| Diag::fatal("test", yu_log::Boundary::Domain))
+    }
+    fn save_mem(&mut self, slot: u32) -> Result<(), Diag> {
+        self.inner.borrow_mut().mem_saves.push(slot);
+        Ok(())
+    }
+    fn load_block_mem(&mut self, slot: u32, dno: u32) -> Result<LoadedBlock, Diag> {
+        self.inner.borrow_mut().mem_loads.push((slot, dno));
+        let reply = self.reply.borrow_mut().take();
+        reply.ok_or_else(|| Diag::fatal("test", yu_log::Boundary::Domain))
+    }
+    fn load_image_mem(
+        &mut self,
+        slot: u32,
+        dno: u32,
+    ) -> Result<yu_rt::event::CapturedImage, Diag> {
+        self.inner.borrow_mut().mem_image_loads.push((slot, dno));
+        Ok(sample_image())
     }
     fn reserve_image(&mut self, dno: u32, image: &yu_rt::event::CapturedImage) -> Result<(), Diag> {
         self.inner.borrow_mut().images.push((dno, image.clone()));
@@ -1425,3 +1495,96 @@ fn fileinfo_fs_fallback_checks_save_root() {
     );
 }
 
+
+/// v555 `SAVE[MEM]` / `LOAD[MEM]`:MEM 是内存槽号,优先于 FILE,走宿主的
+/// 内存槽契约而不是文件刷盘/读盘(REA <v555-4> `0x44b874`/`0x4447c8`)。
+#[test]
+fn save_and_load_mem_use_memory_slots_not_files() {
+    let mut b = ProjectBuilder::new();
+    // 555 参数表:在 FILE 后插入 MEM(后面的 DNO/SET/LET/ID/IDNO 顺移)。
+    for name in ["SAVE", "LOAD"] {
+        let params = &mut b
+            .commands
+            .iter_mut()
+            .find(|(n, _)| *n == name)
+            .expect("fixture command")
+            .1;
+        params.insert(1, ("MEM", 3, 0));
+    }
+    let op_int = b.commands.iter().position(|(n, _)| *n == "INT").unwrap() as u8;
+    let op_save = b.commands.iter().position(|(n, _)| *n == "SAVE").unwrap() as u8;
+    let op_load = b.commands.iter().position(|(n, _)| *n == "LOAD").unwrap() as u8;
+    let op_saveend = b
+        .commands
+        .iter()
+        .position(|(n, _)| *n == "SAVEEND")
+        .unwrap() as u8;
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(0),
+    }];
+    b.scripts = vec![vec![
+        // INT[@x = 42]
+        GroupSpec::new(op_int)
+            .window(0, ex::r#ref(0x40, sys))
+            .window(0, ex::i8_(42)),
+        // SAVE[DNO=5 SET=@x] → 预约(走文件域的预约表)
+        GroupSpec::new(op_save)
+            .window(2, ex::i8_(5))
+            .window(3, ex::r#ref(0x40, sys)),
+        // SAVE[MEM=90001] → 写内存槽,不刷文件
+        GroupSpec::new(op_save).window(1, ex::i32_(90_001)),
+        GroupSpec::new(op_saveend),
+        // INT[@x = 0]
+        GroupSpec::new(op_int)
+            .window(0, ex::r#ref(0x40, sys))
+            .window(0, ex::i8_(0)),
+        // LOAD[MEM=90001 DNO=5 LET=@x]
+        GroupSpec::new(op_load)
+            .window(1, ex::i32_(90_001))
+            .window(2, ex::i8_(5))
+            .window(3, ex::r#ref(0x40, sys)),
+        GroupSpec::new(OP_END),
+    ]];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let recorder = SaveRecorder::new();
+    let reply = std::rc::Rc::new(std::cell::RefCell::new(Some(LoadedBlock {
+        vars: vec![LoadedVar {
+            var: None,
+            snap: int_snap(&[42], &[]),
+        }],
+    })));
+    let mut vm = boot(b);
+    vm.set_save_host(Box::new(SharedHost {
+        inner: recorder.clone(),
+        reply,
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let rec = recorder.borrow();
+    assert_eq!(rec.mem_saves, vec![90_001], "SAVE[MEM] 走内存槽");
+    assert_eq!(
+        rec.mem_loads,
+        vec![(90_001, 5)],
+        "LOAD[MEM] 走内存槽且 DNO 原样传给宿主"
+    );
+    assert!(rec.flushes.is_empty(), "MEM 分支不得退化成文件刷盘");
+    assert!(rec.loads.is_empty(), "MEM 分支不得退化成文件读盘");
+    drop(rec);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(42),
+        "LOAD[MEM] 的块类型 0 写回 LET 目标"
+    );
+}

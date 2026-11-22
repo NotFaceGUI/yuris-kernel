@@ -95,6 +95,22 @@ impl yu_rt::event::SaveHost for SaveHost {
         self.lock().load_block(file, dno)
     }
 
+    fn save_mem(&mut self, slot: u32) -> Result<(), Diag> {
+        self.lock().save_mem(slot)
+    }
+
+    fn load_block_mem(&mut self, slot: u32, dno: u32) -> Result<LoadedBlock, Diag> {
+        self.lock().load_block_mem(slot, dno)
+    }
+
+    fn load_image_mem(
+        &mut self,
+        slot: u32,
+        dno: u32,
+    ) -> Result<yu_rt::event::CapturedImage, Diag> {
+        self.lock().load_image_mem(slot, dno)
+    }
+
     fn reserve_image(
         &mut self,
         dno: u32,

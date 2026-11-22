@@ -19,6 +19,8 @@ pub mod code {
     pub const ARG_RANGE: &str = "sv.arg.range";
     /// 存档文件不存在(LOAD/FILEACT 目标)。
     pub const FILE_MISSING: &str = "sv.file.missing";
+    /// 内存存档槽不存在(`LOAD[MEM=n]` 之前没有同号 `SAVE[MEM=n]`)。
+    pub const MEM_MISSING: &str = "sv.mem.missing";
     /// 存档文件读取失败。
     pub const FILE_READ: &str = "sv.file.read";
     /// 存档文件写入失败(预留;当前写路径被忠实性门禁拒绝,见
@@ -56,6 +58,7 @@ pub const ALL_CODES: &[&str] = &[
     code::ARG_MISSING,
     code::ARG_RANGE,
     code::FILE_MISSING,
+    code::MEM_MISSING,
     code::FILE_READ,
     code::FILE_WRITE,
     code::FILE_DELETED,

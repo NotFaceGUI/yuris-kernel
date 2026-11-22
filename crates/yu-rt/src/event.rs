@@ -746,6 +746,34 @@ pub trait SaveHost {
     /// `LOAD[FILE DNO=n]` 读一块恢复数据(容器解析归宿主;写回归 VM)。
     fn load_block(&mut self, file: &str, dno: u32) -> Result<LoadedBlock, Diag>;
 
+    /// `SAVE[MEM=n]`:把当前预约表按与 `SAVE[FILE]` 相同的 YSSD 容器
+    /// 序列化到内存槽(v555 `0x44b874` MEM 分支;槽号是脚本表达式)。
+    fn save_mem(&mut self, slot: u32) -> Result<(), Diag> {
+        let _ = slot;
+        Err(crate::diag::cmd_unimplemented(
+            "SAVE",
+            "宿主未实现 SAVE[MEM] 内存存档槽",
+        ))
+    }
+
+    /// `LOAD[MEM=n DNO=k]`:从内存槽读一块(v555 `0x4447c8` MEM 分支)。
+    fn load_block_mem(&mut self, slot: u32, dno: u32) -> Result<LoadedBlock, Diag> {
+        let _ = (slot, dno);
+        Err(crate::diag::cmd_unimplemented(
+            "LOAD",
+            "宿主未实现 LOAD[MEM] 内存存档槽",
+        ))
+    }
+
+    /// `LOAD[MEM=n DNO=k ID=图层]`:从内存槽读图像块。
+    fn load_image_mem(&mut self, slot: u32, dno: u32) -> Result<CapturedImage, Diag> {
+        let _ = (slot, dno);
+        Err(crate::diag::cmd_unimplemented(
+            "LOAD",
+            "宿主未实现 LOAD[MEM][ID] 图像块",
+        ))
+    }
+
     /// `SAVE[DNO=n ID=图层]` 预约一块(块类型 1):`image` 是**命令时刻**
     /// 图层表面的像素(VM 已通过 [`GraphicsHost::capture_layer`] 取出)。
     ///
