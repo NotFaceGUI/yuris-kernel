@@ -322,6 +322,23 @@ impl Project {
         &self.root
     }
 
+    /// 只读 `ysbin/ysc.ybn` 头版本(`+0x04`,LE u32);不解析命令表。
+    ///
+    /// 补丁编码解析发生在 `Vm::boot` 之前,但 v555 的静态 lead 表只能
+    /// 按版本门控;这里先取 8 字节头做一次轻量判定。
+    #[must_use]
+    pub fn ysc_version(&self) -> Option<u32> {
+        let source = self.open_source().ok()?;
+        let key = yu_vfs::LookupKey::new(b"ysbin/ysc.ybn", CODEC).ok()?;
+        let bytes = source.open(&key).ok()?;
+        if bytes.len() < 8 || &bytes[..4] != b"YSCM" {
+            return None;
+        }
+        Some(u32::from_le_bytes([
+            bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
     pub fn aux_root(&self) -> &Path {
         &self.aux_root
     }
