@@ -571,6 +571,57 @@ pub fn linear_offset_for(
     Ok(flat)
 }
 
+/// 多维数组的**前缀下标**线性化:`rank = indices.len()`。
+///
+/// 官方引擎的线性化循环 rank 取自“已收下标个数”(旁线
+/// `format-vm-opcodes.md` §3.10 `0x7b4173`),因此 `[256,256]` 的
+/// `@1177` 用单下标 `@1177[129]` 时落在 flat=129,而不是行 129。
+/// 只允许下标数 ≤ 声明维数;多给仍是形状错误。
+pub fn linear_offset_prefix_for(
+    var: Option<VarRef>,
+    dims: &[usize],
+    indices: &[i64],
+) -> Result<usize, yu_log::Diag> {
+    if indices.len() > dims.len() {
+        return Err(diag::fatal(
+            code::rt::VAR_SHAPE,
+            Boundary::Script,
+            format!(
+                "数组维数不匹配:目标 {} 维,给了 {} 个下标",
+                dims.len(),
+                indices.len()
+            ),
+        ));
+    }
+    let mut flat: usize = 0;
+    for (k, &idx) in indices.iter().enumerate() {
+        let dim = dims[k];
+        if idx < 0 {
+            let who = var.map(|v| format!("{} ", v.display())).unwrap_or_default();
+            return Err(diag::unimplemented(
+                code::rt::VAR_SHAPE,
+                Boundary::Script,
+                format!(
+                    "{who}下标[{k}] 为负:{idx}(维长 {dims:?});负下标语义未取证,本次访问忽略(DIV-RT-002)"
+                ),
+            ));
+        }
+        let idx = idx as usize;
+        if idx >= dim {
+            let who = var.map(|v| format!("{} ", v.display())).unwrap_or_default();
+            return Err(diag::unimplemented(
+                code::rt::VAR_SHAPE,
+                Boundary::Script,
+                format!(
+                    "{who}下标[{k}]={idx} 越界(第 {k} 维长度 {dim},全维 {dims:?});                     引擎报 0x1a202,后续行为未取证,本次访问忽略(DIV-RT-002)"
+                ),
+            ));
+        }
+        flat = flat * dim + idx;
+    }
+    Ok(flat)
+}
+
 /// 变量域:声明、读、写。键 = `(space,id)`。
 ///
 /// # 扁平 slab(热路径去哈希)
@@ -599,6 +650,9 @@ pub struct VariableStore {
     /// 每次可观察状态变化 +1。`VARACT[INIT]` 的“同掩码且期间无写入”
     /// 快速路径用它判断是否需要真的重建全局槽。
     generation: u64,
+    /// 多维数组允许用较少下标访问(v555 商业剧本;由 VM 从
+    /// [`SemanticProfile::partial_index`] 注入,旧版保持 false)。
+    pub partial_index: bool,
 }
 
 /// `dense` 的索引上限 = `u16` 全域(`VarRef::id` 是 `u16`,故全覆盖)。
@@ -666,7 +720,50 @@ impl VariableStore {
         self.cell(r)
     }
 
+    /// 按**槽号**查找变量(不依赖表达式编码里的 `@`/`$` 前缀)。
+    ///
+    /// v555 的 `_STR(slot, index)` / `_INT(slot, index)` 只用槽号访问
+    /// 变量表(官方 `DAT_0087258c[slot]`);宏调用把 `$array[0]` 这样的
+    /// 引用作为参数传递时,`_PINT(2)` 得到的也是槽号。`prefer` 指定优先
+    /// 空间(字符串读取优先 `$`,数值读取优先 `@`),找不到再试另一侧。
+    #[must_use]
+    pub fn find_by_id(&self, id: u16, prefer: VarSpace) -> Option<VarRef> {
+        let index = usize::from(id);
+        let prefer_str = matches!(prefer, VarSpace::Dollar | VarSpace::LegacyStr);
+        let order = if prefer_str { [1usize, 0] } else { [0usize, 1] };
+        if index < DENSE_CAP {
+            for table in order {
+                if self.dense[table]
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .is_some()
+                {
+                    let space = if table == 1 {
+                        VarSpace::Dollar
+                    } else {
+                        VarSpace::At
+                    };
+                    return Some(VarRef { space, id });
+                }
+            }
+        }
+        for table in order {
+            let space = if table == 1 {
+                VarSpace::Dollar
+            } else {
+                VarSpace::At
+            };
+            if self.overflow.contains_key(&(space, id)) {
+                return Some(VarRef { space, id });
+            }
+        }
+        None
+    }
+
     pub fn declare(&mut self, r: VarRef, ty: ElemType, dims: &[usize], init: &Value) {
+        if std::env::var_os("YU_MACRO_TRACE").is_some() && r.id == 0x0499 {
+            eprintln!("[declare1177] ty={ty:?} dims={dims:?} init={init:?}");
+        }
         let slot = VarSlot::new(ty, dims, init);
         let index = usize::from(r.id);
         if index >= DENSE_CAP {
@@ -807,6 +904,23 @@ impl VariableStore {
         removed
     }
 
+    /// 数组元素的物理下标。空下标 = 全 0;v555 允许前缀下标。
+    fn flat_offset(
+        partial_index: bool,
+        r: VarRef,
+        dims: &[usize],
+        indices: &[i64],
+    ) -> Result<usize, yu_log::Diag> {
+        if indices.is_empty() {
+            let zeros: smallvec::SmallVec<[i64; 4]> = smallvec::smallvec![0i64; dims.len()];
+            linear_offset_for(Some(r), dims, &zeros)
+        } else if partial_index && indices.len() < dims.len() {
+            linear_offset_prefix_for(Some(r), dims, indices)
+        } else {
+            linear_offset_for(Some(r), dims, indices)
+        }
+    }
+
     /// 读取(标量或数组元素)。未声明 → `rt.var.undeclared`。
     ///
     pub fn read(&self, r: VarRef, indices: &[i64]) -> Result<Value, yu_log::Diag> {
@@ -826,13 +940,8 @@ impl VariableStore {
         if slot.is_scalar() && indices.is_empty() {
             return Ok(slot.data[0].clone());
         }
-        let flat = if indices.is_empty() {
-            // 引擎 opcode 0x48:数组变量不带下标时读 0 号元素(§3.10)。
-            let zeros: smallvec::SmallVec<[i64; 4]> = smallvec::smallvec![0i64; slot.dims.len()];
-            linear_offset_for(Some(r), &slot.dims, &zeros)?
-        } else {
-            linear_offset_for(Some(r), &slot.dims, indices)?
-        };
+        // 引擎 opcode 0x48:数组变量不带下标时读 0 号元素(§3.10)。
+        let flat = Self::flat_offset(self.partial_index, r, &slot.dims, indices)?;
         Ok(slot.data[flat].clone())
     }
 
@@ -841,6 +950,7 @@ impl VariableStore {
     /// 写入。返回值：所有调用方都丢弃(旧签名返回存储值，白白多一次
     /// `Value` 克隆 —— 字符串变量就是一次堆复制)。
     pub fn write(&mut self, r: VarRef, indices: &[i64], value: &Value) -> Result<(), yu_log::Diag> {
+        let partial = self.partial_index;
         let slot = self.cell_mut(r).ok_or_else(|| {
             diag::fatal(
                 code::rt::VAR_UNDECLARED,
@@ -858,12 +968,10 @@ impl VariableStore {
             return Ok(());
         }
         let stored = coerce_to(ty, value);
-        let flat = if indices.is_empty() {
-            let zeros: smallvec::SmallVec<[i64; 4]> = smallvec::smallvec![0i64; slot.dims.len()];
-            linear_offset_for(Some(r), &slot.dims, &zeros)?
-        } else {
-            linear_offset_for(Some(r), &slot.dims, indices)?
-        };
+        let flat = Self::flat_offset(partial, r, &slot.dims, indices)?;
+        if std::env::var_os("YU_MACRO_TRACE").is_some() && r.id == 0x0499 {
+            eprintln!("[write1177] indices={indices:?} flat={flat} -> {stored:?}");
+        }
         slot.data[flat] = stored;
         self.bump();
         Ok(())
@@ -885,6 +993,7 @@ impl VariableStore {
         indices: &[i64],
         value: Value,
     ) -> Result<(), yu_log::Diag> {
+        let partial = self.partial_index;
         let slot = self.cell_mut(r).ok_or_else(|| {
             diag::fatal(
                 code::rt::VAR_UNDECLARED,
@@ -902,12 +1011,7 @@ impl VariableStore {
             return Ok(());
         }
         let stored = coerce_to_owned(ty, value);
-        let flat = if indices.is_empty() {
-            let zeros: smallvec::SmallVec<[i64; 4]> = smallvec::smallvec![0i64; slot.dims.len()];
-            linear_offset_for(Some(r), &slot.dims, &zeros)?
-        } else {
-            linear_offset_for(Some(r), &slot.dims, indices)?
-        };
+        let flat = Self::flat_offset(partial, r, &slot.dims, indices)?;
         slot.data[flat] = stored;
         self.bump();
         Ok(())
@@ -1027,6 +1131,36 @@ mod tests {
         assert_eq!(linear_offset(&dims, &[0, 2]).unwrap(), 2);
         assert_eq!(linear_offset(&dims, &[1, 0]).unwrap(), 3);
         assert_eq!(linear_offset(&dims, &[1, 2]).unwrap(), 5);
+    }
+
+    #[test]
+    fn prefix_index_uses_provided_rank() {
+        let dims = [256, 256];
+        assert_eq!(linear_offset_prefix_for(None, &dims, &[129]).unwrap(), 129);
+        assert_eq!(
+            linear_offset_prefix_for(None, &dims, &[129, 0]).unwrap(),
+            129 * 256
+        );
+        assert_eq!(
+            linear_offset_prefix_for(None, &dims, &[1, 2]).unwrap(),
+            256 + 2
+        );
+        assert!(linear_offset_prefix_for(None, &dims, &[256]).is_err());
+    }
+
+    /// v555:`[256,256]` 的 `@1177[129]` 是 flat=129,不是行 129。
+    #[test]
+    fn partial_index_store_is_opt_in() {
+        let mut store = VariableStore::new();
+        let r = VarRef::new(VarSpace::At, 1177);
+        store.declare(r, ElemType::Int, &[256, 256], &Value::Int(0));
+        // 默认(旧版)仍按形状错误处理。
+        assert!(store.write(r, &[129], &Value::Int(2)).is_err());
+        store.partial_index = true;
+        store.write(r, &[129], &Value::Int(2)).unwrap();
+        assert_eq!(store.read(r, &[129]).unwrap(), Value::Int(2));
+        assert_eq!(store.read(r, &[129, 0]).unwrap(), Value::Int(0));
+        assert_eq!(store.read(r, &[0, 129]).unwrap(), Value::Int(2));
     }
 
     #[test]

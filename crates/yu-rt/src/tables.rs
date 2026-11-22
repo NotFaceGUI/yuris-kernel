@@ -563,6 +563,8 @@ pub struct ScriptFile {
     part4: Vec<u8>,
     /// V2 的指令起始 code 偏移(升序;下标即 pc)。V5 = 空。
     code_offsets: Vec<u32>,
+    /// 全部窗口载荷 offset 的有序去重表(自定界补读的边界:下一个窗口)。
+    window_offsets: Vec<u32>,
 }
 
 impl ScriptFile {
@@ -619,6 +621,9 @@ impl ScriptFile {
             .map(WindowRec::from_bytes)
             .collect();
         let code_offsets = segs.code_offsets;
+        let mut window_offsets: Vec<u32> = windows.iter().map(|w| w.offset).collect();
+        window_offsets.sort_unstable();
+        window_offsets.dedup();
         let mut pool = segs.args_data;
         pool.extend_from_slice(&segs.line_numbers);
         Ok(Self {
@@ -630,6 +635,7 @@ impl ScriptFile {
             pool,
             part4: segs.line_numbers,
             code_offsets,
+            window_offsets,
         })
     }
 
@@ -655,6 +661,34 @@ impl ScriptFile {
         let start = w.offset as usize;
         let end = start.checked_add(w.length as usize)?;
         self.pool.get(start..end)
+    }
+
+    /// 窗口载荷 + 其后到下一窗口边界的可读尾部(555 字符串自定界用)。
+    ///
+    /// 返回 `(window, tail)`:`tail` 从窗口末尾延伸到共享池内**下一个**
+    /// 窗口的 offset(没有下一个 = 池尾),只用于把被过期长度截断的
+    /// `0x4d` 字符串读到真正的界定符;不改变严格切片本身。
+    /// 取证见 `DIV-RT-068`。
+    pub fn window_payload_with_tail(&self, w: &WindowRec) -> Option<(&[u8], &[u8])> {
+        let start = w.offset as usize;
+        let end = start.checked_add(w.length as usize)?;
+        let window = self.pool.get(start..end)?;
+        let next = self
+            .next_window_offset(start)
+            .unwrap_or(self.pool.len())
+            .min(self.pool.len());
+        let tail = self.pool.get(end..next.max(end))?;
+        Some((window, tail))
+    }
+
+    /// 共享池里严格大于 `start` 的最小窗口 offset(自定界补读的硬边界)。
+    fn next_window_offset(&self, start: usize) -> Option<usize> {
+        let index = self
+            .window_offsets
+            .partition_point(|&offset| (offset as usize) <= start);
+        self.window_offsets
+            .get(index)
+            .map(|&offset| offset as usize)
     }
 
     /// 数据区 B 的原始字节。

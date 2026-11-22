@@ -894,6 +894,148 @@ pub fn decode(window: &[u8]) -> Result<Vec<RawInstr>, yu_log::Diag> {
     Ok(out)
 }
 
+/// 窗口里是否有 `0x4d` 字符串记录**没有在自己的声明长度内闭合**。
+///
+/// 555 汉化/重打包数据会出现两种坏头:
+/// - 记录自声明长度越过窗口(窗口 length 过期);
+/// - 记录/窗口长度都覆盖不到结束引号(字符串记录被截短)。
+///
+/// 两者都可能让严格解码失败或让字面量在求值时“未闭合”。这里只做
+/// 静态判定,不猜内容;命中后由 [`decode_self_delimited`] 按界定符重解。
+pub fn window_literal_unclosed(window: &[u8], codec: yu_format::Codec) -> bool {
+    let mut pos = 0usize;
+    while pos + 3 <= window.len() {
+        let op = window[pos];
+        let declared = u16::from_le_bytes([window[pos + 1], window[pos + 2]]) as usize;
+        let Some(end) = pos.checked_add(3 + declared) else {
+            return true;
+        };
+        if op == 0x4d {
+            // 字符串记录至少要有界定符;声明长度不覆盖界定符本身也按坏头处理。
+            let Some(&term) = window.get(pos + 3) else {
+                return true;
+            };
+            if end > window.len() || declared < 2 {
+                return true;
+            }
+            if scan_literal_term(window, &[], pos + 4, term, end, codec).is_none() {
+                return true;
+            }
+        } else if end > window.len() {
+            return true;
+        }
+        pos = end;
+    }
+    false
+}
+
+/// 555 自定界的窗口解码:非字符串记录按声明长度走;`0x4d` 记录以
+/// **界定符**为边界,声明长度不闭合时继续读到 `window + tail` 里的
+/// 结束引号(上限由调用方用“下一个窗口/池尾”给)。
+///
+/// 返回 `(记录, 窗口实际占用长度)`;占用长度可能大于 `window.len()`
+/// (字符串补读)。无法安全闭合、或非字符串记录越过窗口时返回 `None`,
+/// 调用方保留严格路径的错误。
+pub fn decode_self_delimited(
+    window: &[u8],
+    tail: &[u8],
+    codec: yu_format::Codec,
+) -> Option<(Vec<RawInstr>, usize)> {
+    let limit = window.len() + tail.len();
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    let mut consumed = window.len();
+    while pos < window.len() {
+        if pos + 3 > window.len() {
+            return None;
+        }
+        let op = window[pos];
+        let declared = u16::from_le_bytes([window[pos + 1], window[pos + 2]]) as usize;
+        if op == 0x4d {
+            let term = *window.get(pos + 3)?;
+            let Some(declared_end) = pos.checked_add(3 + declared) else {
+                return None;
+            };
+            // 声明长度内已闭合:与严格切片逐字节一致(记录里的尾随字节
+            // 保持原样,字面量解码器本来就会在第一个界定符处停止)。
+            if declared_end <= window.len()
+                && scan_literal_term(window, tail, pos + 4, term, declared_end, codec).is_some()
+            {
+                out.push(RawInstr {
+                    offset: pos,
+                    op,
+                    payload: window.get(pos + 3..declared_end)?.to_vec(),
+                });
+                pos = declared_end;
+                continue;
+            }
+            // 声明长度内不闭合:继续向 tail 读到真正的界定符。
+            let close = scan_literal_term(window, tail, pos + 4, term, limit, codec)?;
+            let end = close + 1;
+            let mut payload = Vec::with_capacity(end - pos - 3);
+            for index in pos + 3..end {
+                payload.push(if index < window.len() {
+                    window[index]
+                } else {
+                    *tail.get(index - window.len())?
+                });
+            }
+            out.push(RawInstr {
+                offset: pos,
+                op,
+                payload,
+            });
+            pos = end;
+            consumed = end.max(consumed);
+            continue;
+        }
+        let Some(end) = pos.checked_add(3 + declared) else {
+            return None;
+        };
+        if end > window.len() {
+            return None;
+        }
+        out.push(RawInstr {
+            offset: pos,
+            op,
+            payload: window[pos + 3..end].to_vec(),
+        });
+        pos = end;
+    }
+    Some((out, consumed))
+}
+
+/// 在 `window + tail` 的视图里从 `start` 扫到界定符 `term`。
+///
+/// 与字面量解码器同一套规则:反斜杠转义跳 2 字节;前导字节连尾字节
+/// 一起跳过(尾字节即使等于界定符也不算闭合)。
+fn scan_literal_term(
+    window: &[u8],
+    tail: &[u8],
+    start: usize,
+    term: u8,
+    limit: usize,
+    codec: yu_format::Codec,
+) -> Option<usize> {
+    let mut index = start;
+    while index < limit {
+        let byte = if index < window.len() {
+            window[index]
+        } else {
+            *tail.get(index - window.len())?
+        };
+        if byte == term {
+            return Some(index);
+        }
+        if byte == b'\\' || codec.is_lead(byte) {
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    None
+}
+
 fn malformed(ins: &RawInstr, what: &str) -> yu_log::Diag {
     diag::fatal(
         code::rt::EXPR_MALFORMED,
@@ -1224,6 +1366,20 @@ mod tests {
         assert!(decode(&raw).is_err());
     }
 
+    /// Big5 双字节 trail 可落在 0x40..=0x7E(ASCII 区);字面量扫描必须按
+    /// 当前 codec 的 lead 表跳 2 字节,不能把 trail 0x40 当普通字符。
+    /// 证据:样本 ybn 的「【護士】」= A1 69 C5 40 A4 68 A1 6A,只有 Big5
+    /// 能正确解出(CP932/GBK 均失败或乱码)。
+    #[test]
+    fn string_literal_scans_lead_bytes_with_active_codec() {
+        let raw = [
+            0x22, 0xa1, 0x69, 0xc5, 0x40, 0xa4, 0x68, 0xa1, 0x6a, 0x22,
+        ];
+        let out =
+            decode_string_literal_with(&raw, yu_format::Codec::Big5).expect("big5 literal");
+        assert_eq!(out, raw[1..9].to_vec());
+    }
+
     #[test]
     fn simple_expr_matches_generic_for_var_compare() {
         // @A < 5
@@ -1241,5 +1397,63 @@ mod tests {
             .expect("generic");
         assert_eq!(simplified, generic);
         assert_eq!(simplified, Value::Int(1));
+    }
+}
+
+#[cfg(test)]
+mod self_delimited_tests {
+    use super::*;
+
+    /// <v555-sample> `s273 pc13`:`4d 0c 00` 声明 12 字节负载,窗口只有
+    /// 11 字节;补读 4 字节(尾部路线)到结束引号后整条 15 字节。
+    #[test]
+    fn record_length_short_of_window_is_completed_from_tail() {
+        let window = b"\x4d\x0c\x00\x22\xd0\xa1\xca\xb1\xba\xf2\xb5";
+        let tail = b"\xc9\xd4\xad\x22";
+        assert!(window_literal_unclosed(window, yu_format::Codec::Gbk));
+        let (records, consumed) = decode_self_delimited(window, tail, yu_format::Codec::Gbk)
+            .expect("self-delimited decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(consumed, 15);
+        assert_eq!(
+            records[0].payload,
+            b"\x22\xd0\xa1\xca\xb1\xba\xf2\xb5\xc9\xd4\xad\x22"
+        );
+    }
+
+    /// `s273 pc216`:`4d 04 00` 声明 4 字节负载,窗口 7 字节,但 GBK
+    /// 字面量在窗口末尾仍是悬空前导;补读 2 字节后闭合。
+    #[test]
+    fn literal_dangling_lead_is_completed_from_tail() {
+        let window = b"\x4d\x04\x00\x22\x99\xe1\x91";
+        let tail = b"\x97\x22";
+        assert!(window_literal_unclosed(window, yu_format::Codec::Gbk));
+        let (records, consumed) = decode_self_delimited(window, tail, yu_format::Codec::Gbk)
+            .expect("self-delimited decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(consumed, 9);
+        assert_eq!(records[0].payload, b"\x22\x99\xe1\x91\x97\x22");
+    }
+
+    /// 结构正常的窗口:自定界结果与严格切片逐字节一致(不改变旧路径)。
+    #[test]
+    fn well_formed_window_matches_strict_decode() {
+        let window = b"\x42\x01\x00\x01\x4d\x04\x00\x22\xd1\xe0\x22";
+        assert!(!window_literal_unclosed(window, yu_format::Codec::Gbk));
+        let (records, consumed) = decode_self_delimited(window, b"", yu_format::Codec::Gbk)
+            .expect("self-delimited decode");
+        assert_eq!(consumed, window.len());
+        let strict = decode(window).expect("strict decode");
+        assert_eq!(records.len(), strict.len());
+        for (a, b) in records.iter().zip(&strict) {
+            assert_eq!((a.op, &a.payload), (b.op, &b.payload));
+        }
+    }
+
+    /// 尾部也闭合不了:返回 `None`,调用方保留严格错误(不猜内容)。
+    #[test]
+    fn unclosed_without_tail_is_none() {
+        let window = b"\x4d\x04\x00\x22\x99\xe1\x91";
+        assert!(decode_self_delimited(window, b"\x97", yu_format::Codec::Gbk).is_none());
     }
 }
