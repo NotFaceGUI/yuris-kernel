@@ -75,6 +75,7 @@ public final class MainActivity extends Activity
     static final String EXTRA_START_ERROR = "start_error";
     /** 新增参数:文本编码路线(auto/original/gbk/big5/tunnel)。 */
     static final String EXTRA_PATCH = "patch";
+    static final String EXTRA_TRANSLATE = "translate";
     /** 新增参数:存档块压缩层(zlib/snappy;空 = 自动判定)。 */
     static final String EXTRA_SAVE_CODEC = "save_codec";
     /** 新增参数:强制屏幕坐标系代号(@_SCREEN_COLOR)。 */
@@ -718,6 +719,11 @@ public final class MainActivity extends Activity
             String patch = getIntent().getStringExtra(EXTRA_PATCH);
             if (patch != null && !patch.trim().isEmpty()) {
                 config.put("patch", patch.trim());
+            }
+            // 运行时翻译文件(translate.json 绝对路径);缺省不装载。
+            String translate = getIntent().getStringExtra(EXTRA_TRANSLATE);
+            if (translate != null && !translate.trim().isEmpty()) {
+                config.put("translate", translate.trim());
             }
             // 存档块压缩层(只影响写盘;读侧始终按实际流分流)。
             String saveCodec = getIntent().getStringExtra(EXTRA_SAVE_CODEC);

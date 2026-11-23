@@ -108,6 +108,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             .map_err(|d| Failure::usage(format!("--patch: {d}")))?,
         None => yu_engine::patch::PatchSelection::default(),
     };
+    // 运行时翻译文件(与 headless 同一键)。
+    let translate = args.flag("translate").map(PathBuf::from);
     // 宿主默认字体(与 headless 同一套 `font_options`:family 或字体文件)。
     let font_arg = args.flag("font");
     // 旧行为保留:--font 也锁死脚本/游戏内字体选择(诊断用)。
@@ -239,6 +241,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         save_codec,
         // 补丁编码:缺省按工具产出自动识别,可用 `--patch` 覆盖。
         patch,
+        translate,
         // 桌面外置影片后端 = 系统 ffmpeg/ffprobe 子进程(WMV/H.264 等
         // 非 MPEG-1 的开场片);ffmpeg 缺失时 open 返回可恢复诊断,
         // `Auto` 选择器回退内置 pl_mpeg(MPEG-1 语料仍可播)。

@@ -327,22 +327,30 @@ impl Vm {
                 diag::fatal(code::rt::CMD_WINDOWS, Boundary::Script, "WORD 缺文本窗口").into(),
             );
         };
-        if self.text.bytes.len() + w.payload.len() > 0x1FFE {
+        // 运行时翻译:坐标与导出 `translate.json` 的 `word:s{sid}:pc{pc}`
+        // 完全一致。译文已由宿主按显示 codec 编码(CP932 工程可带隧道码),
+        // 所以下面的长度检查与 `_TEXT_FLAG` 重建都按译文实际字节走。
+        let translated = self
+            .translation
+            .as_mut()
+            .and_then(|table| table.lookup_word(st.script_id, cmd.pc));
+        let payload = translated.unwrap_or_else(|| w.payload.clone());
+        if self.text.bytes.len() + payload.len() > 0x1FFE {
             self.report(diag::recoverable(
                 code::rt::TEXT_OUT_LIMIT,
                 Boundary::Script,
                 format!(
                     "WORD 写入后 _TEXT 达 {} 字节 > 0x1FFE(官方 0x18e70,返回 -1 让出)",
-                    self.text.bytes.len() + w.payload.len()
+                    self.text.bytes.len() + payload.len()
                 ),
             ));
             return Ok(StepOutcome::Yield);
         }
-        self.append_text_for_script(st.script_id, &w.payload);
+        self.append_text_for_script(st.script_id, &payload);
         self.emit(VmEvent::Text {
             frame: self.frame(),
             id: self.text.layer_id.clone(),
-            bytes: w.payload.clone(),
+            bytes: payload,
         });
         Ok(StepOutcome::Continue)
     }

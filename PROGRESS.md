@@ -17349,7 +17349,8 @@ cargo run ... export <v488-x> <tmp>/v488 --format translate-json
 - 只填 `translation` / `display_translation` / `name_translation`;
   `key`/`meta`/`codec`/坐标不可改。
 - 不合并/拆分正文条目;保留 `
-`/``/`%s`/`$VAR` 等控制符;
+`/`
+`/`%s`/`$VAR` 等控制符;
   保留 `【】「」『』（）` 标记。
 - `cn` = 简体(通常 GBK),`tw` = 繁体(通常 Big5);`cp932` 条目翻中文需要
   GBK/Big5 补丁或 CP932 载体字/隧道方案,不能静默产出不可编码文本。
@@ -17439,3 +17440,155 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   - `corpus_golden` 4 passed。
 - **文档**:`docs/divergences/DIV-RT-072-text-output-fold-limit.md`、
   `DIV-RT-073-text-file-clear-order.md`;census §2.2/§4.2/§4.3 已更新。
+
+## 成果 V555-LET-SYSVAR / LOAD-DNO1024 (2026-11-23) · LET 系统变量写侧与 500 槽打包读取
+
+- **取证**:
+  - `LET` v555 `0x443988`(`b02a4dc04ae`;游戏构建同族调用 `0x4446d0`):
+    - id `0x0f _DROPFILE_NUM` → `DAT_008724ac`;
+    - id `0x32 _INT` → 校验目标变量 int 后按操作符表写变量表
+      (非 int/未声明 → `0x1a6c6`);
+    - id `0x35 _PINT` → 当前 GOSUB 帧 `+0x10 + (n-1)*8`,按操作符表写;
+    - id `0x93..0x113`(含 `_MOUSE_L`)→ `FUN_00444750` 写 64 位计数表,
+      按当前物理 down 状态钳制(与 0.495 `FUN_00447014` 同型)。
+  - `LOAD[FILE DNO=1024]` v555 `0x4447c8` 文件分支:`DNO==0x400`
+    → `FUN_004453f4`,读 12 字节头 + 500×(`raw_len|comp_len|zlib`),
+    填 `DAT_008670c0[0..500]`,不写 `LET`;缺块报 `0x18ede` 后 `return 0`。
+  - 语料实证:`<v555-1>` s70 pc410/pc502 `LET @147=3`;`es_saveload.yst`
+    (黒獣2改 s33)pc412 `LOAD FILE=$2216 DNO=1024 LET=@2218`。
+- **修法**:
+  - 按钮族 `LET` 写接 `InputState::set_counter`(`Counter::write` 钳制);
+  - `other::State.drop_file_num` 镜像;`PRODUCT[COM=21/24]` 枚举同步;
+  - `_INT`/`_PINT` 写按变量表/GOSUB 帧 + `compound` 操作符;`_INT`
+    读侧补标量元素 0;`_DROPFILE_NUM`/`_INT`/`_PINT` 仅 `other` 运行面;
+  - `SaveHost::load_mem_pack` / `SaveState::load_mem_pack`;VM 文件分支
+    `DNO==1024 && MEM 缺省` 直接走打包读取,不落通用单块,不写 `LET`。
+- **回归**:
+  - `let_mouse_button_writes_the_input_counter`;
+  - `let_dropfile_num_writes_the_sysvar_mirror`;
+  - `let_int_writes_the_target_variable_slot`;
+  - `let_pint_writes_the_current_gosub_frame_arg`;
+  - `load_mem_pack_reads_official_500_slot_layout`;
+  - `load_file_dno_1024_uses_the_mem_pack_host`;
+  - `cargo test -p yu-rt --lib` 158 passed;
+  - `cargo test -p yu-rt --test fixture` 155 passed / 7 ignored;
+  - `cargo test -p yu-save` 33 passed;
+  - `cargo test -p yu-rt --test corpus` 11 passed;`corpus_golden` 4 passed。
+- **文档**:`DIV-RT-074-let-system-var-writes.md`、
+  `DIV-RT-075-load-file-dno1024-mem-pack.md`;census §4.5/§4.7/§5 已更新。
+- **存档互通发现(未闭合)**:
+  - `<v555-1>` 官方备份 `save50001.sd` 有 DNO=1024 嵌套容器块
+    (`inner_len|compressed_len|zlib(inner YSSD)`);本内核写出的
+    `save50001.sd` 没有该块;
+  - `黒獣2改` 的 `save70000.sd` 也没有 DNO=1024;官方 `LOAD` 缺块时
+    报 `0x18ede` 后继续,但依赖该块的数据无法恢复;
+  - 本轮只实现官方 `FUN_004453f4` 的 500 槽打包读取,**SAVE 侧写
+    DNO=1024 的调用点未定位,不猜格式**。`es_saveload pc851 @2223`
+    未声明变量是否由该缺口导致,尚未证明因果。
+
+## 成果 RUNTIME-TRANSLATE (2026-11-23) · `translate.json` 运行时替换(WORD / 外置剧本 / GOSUB)
+
+- **目标**:只替换 `translate.json` 内条目,文件外文本原样;不换全局 codec、
+  不改游戏数据。证据锚点:
+  - `op_word`(v555 `0x45854d..0x458557`、0.495 `0x458d44` 同型)已有
+    `st.script_id + cmd.pc`;
+  - v555 `TEXT[FILE]`(`0x452a0c`)在写 LET 前有完整 `(file,line)` 身份;
+  - `GOSUB` 参数在 `frame.args` 写入前求值(`control.rs` / `other/gosub.rs`);
+  - 隧道分配算法以 `yu-format::text::idx_to_code_point`
+    (`YU-RIS-TOOLS/internal/ybn/tunnel.go`)为准:CP932 前导 + `0x01..0x3F`
+    低位尾字节,避开 09/0A/0D/20/2C;脚本只按前导字节步进,渲染器先查
+    隧道表,因此这不是“标准 CP932 双字节”,但确实是官方可用载体。
+- **实现**:
+  - `yu-format::text`: `TunnelTable::from_pairs/pairs/encode_char`,
+    `Codec::encode_char`;`from_pairs` 同时接受官方低位尾字节与标准 CP932 对。
+  - `yu-format::scenario`(新):codec-aware 行扫描/重写。宏只替换引号内
+    span;裸文本/命令后行内文本替换正文;按 codec 前导表跳过尾字节
+    (GBK/Big5 `0x5C`、隧道尾 `0x22/0x5C` 不会被当语法);块注释跨行;
+    行内文本译文若引入 `//`/`/*`/行首 `#`/`\` 则拒绝并保留原行。
+  - `yu-rt::translation`(新):`TranslationTable`(`words` / `scenarios` /
+    `calls`)、`ScenarioKey` 路径归一、三类命中统计。
+  - `yu-rt` 三个入口:`op_word` 按 `(sid,pc)`;`other_op_text_file` 在
+    `text_file_lines` 之后、写 LET 之前逐行重写;`op_gosub` 与
+    `other_op_gosub` 按 `(sid,pc,arg)` 替换字符串参数。
+  - `yu-engine::translation`(新):读 JSON、按目标显示 codec 编码;
+    CP932 不可表示字符分配新隧道码,保留游戏自带 `sjis_ext.bin`,扫描
+    脚本体窗口/`ysv` 字符串初值/外置剧本已出现的双字节对后追加;
+    GBK/Big5 不可编码字符装载期显式报错。多语条目按 codec 匹配排序,
+    同坐标时当前 codec 的条目后写覆盖。
+  - 装配:`EngineOptions.translate`、`--translate`(run/serve/desktop/case)、
+    Android `run-config.json`/intent `translate`、`nativeStatus` 统计;
+    翻译模式自动 `tuning.font_fallback=true`;启动日志打印
+    `translate: words=… scenario_lines=… characters=… choices=… tunnel=+… bytes=…`。
+  - 导出 schema 增量:`characters` 增加 `script_id/pc`;新增 `choices`
+    (`ES.SEL.SET`/`ES.CSEL.SET` 的字符串参数,`arg` = 标签后求值序号);
+    `counts.choices`。
+- **验证**:
+  - `cargo test -p yu-format --lib` → 67 passed;
+  - `cargo test -p yu-rt --lib` → 158 passed;
+  - `cargo test -p yu-rt --test translation_scenario` → 2 passed
+    (宏/裸文本写入 LET 前后字节、无翻译保持原文);
+  - `cargo test -p yu-rt --test translation_calls` → 1 passed
+    (`GOSUB("SUB", PSTR1="HELLO")` 被调方读到 `"WORLD"`);
+  - `YURIS_SAMPLE_ERIS_ROOT=<project-eris> YURIS_TRANSLATE_JSON=<zh> \
+    cargo test -p yu-engine --test translation` → 2 passed;
+    真实 ERIS `RP_101`:`matched="回想场景 1 开始" hits=1 tunnel=+181`;
+  - `YURIS_SAMPLE_V555_ROOT=<v555-2> cargo test -p yu-engine --test export`
+    → 3 passed(characters=4/55、choices=51/0、scenario 464/18615);
+  - v555-2 实跑(`PROBE_PATCH=big5`,Big5 繁体译文):
+    `translate: word 0/0 scen 5/306 units=5 calls 6/21 rewrite_errors=0`
+    ——`TEXT[FILE]` 的 5 条译文行在 LET 前命中,角色 `GOSUB` 命中 6 次;
+    miss 只统计有译文的文件(`scenario_files` 过滤),不把 70k 行无关剧本
+    计入噪声;
+  - `cargo check --workspace --all-targets --no-default-features` 通过
+    (仅 `probe_mpg` 既有 unused_mut 警告);
+  - `cargo check -p yu-host-android --target aarch64-linux-android` 通过
+    (NDK 28.2.13676358)。
+- **已知限制**:
+  - 仅替换 `translate.json` 内条目;UI 字面量、动态 `_` 文本、`DIALOG`
+    不在文件内,保持原文;0.500 外置 `TEXT[FILE]` 语义未启用。
+  - CP932 隧道容量约 3400 个唯一非 CP932 字符;不足装载期报错。
+  - 行内文本不能含注释/场景标记/命令前缀(运行时拒绝并保留原行)。
+  - v555 预烘焙字形页(`fnt_s20_nNN`)覆盖的字形不随隧道扩展;这类构建
+    的译文渲染仍受原字库限制(字体回退只对文本绘制路径生效)。
+  - 译文进入 `$_TEXT`/存档;旧存档与新隧道码混用需单独验证。
+  - 多语 `translate.json` 只有一套目标 codec;运行时语言切换若不经全局
+    codec 切换,不能同时正确显示 cn/tw 两套译文。
+
+## 成果 RUNTIME-TRANSLATE-UI (2026-11-23) · 按钮/选项/UI 字面量纳入运行时翻译
+
+- **问题**:上一轮 `translate.json` 只有 `characters` + `choices` + `text`;ERIS 的
+  标题/菜单按钮走 `GOSUB("es.BT.NAME.SET", "■スタート")` 这类脚本字符串常量,
+  不在 `WORD`、也不在 `choices`,所以启动后按钮仍是日文;demo 文件里的 51 条
+  `choices` 译文也全是空。
+- **实现**:
+  - 新增 `yu-format::literal`:按 YSTB `0x4D` 记录解析引号段,codec-aware 步进;
+    重写命中的段并更新每条记录 u16 长度。导出与运行时共用
+    `literal::segments`,不再把 `M` 头长度字节/非字符串记录里的引号误当段。
+  - `fill_cmd` 在命令缓存首次构建时按 `(script_id, pc, window, segment)` 重写
+    文本常量;`set_translation` 清 `cmd_cache`。之后 `GOSUB`/`DIALOG`/`MENU`/
+    `TEXT` 等所有求值路径都看到译文。
+  - 导出 `translate.json` 增加 `literals` 数组(带 `context`:
+    `es.BT.NAME.SET`/`DIALOG`/`MENU`/`LET`/`CG`/...),`counts.literals`;
+    `choices` 改为记录完整求值序号(ERIS 从 51 条增到 62 条)。
+  - 统计增加 `literal_hits/misses`;CLI/Android 状态输出。
+  - skill/schema/style-guide/validator 增加:
+    - `literals` 字段与 `context` 使用规则(只翻显示类,内部 ID 留空);
+    - 固定字格 UI 宽度规则:原文全角时译文也用全角拉丁/数字/空格;
+    - validator 对显示类 UI 的半角混排 warning。
+- **验证**:
+  - `cargo test -p yu-format --lib` 72 passed(含 literal 段解析/重写/转义测试);
+  - `cargo test -p yu-rt --lib` 158 passed;
+  - `cargo test -p yu-rt --test translation_calls` 通过:
+    `GOSUB("SUB", PSTR1="HELLO")` 的 **window 1 / segment 0** 译文替换为
+    `"WORLD"`,被调方 `$_PSTR(1)` 读到 `"WORLD"`;
+  - ERIS 实跑(demo UI 文件):装载 `choices=62 literals=282`;启动前 3 帧
+    `literal 15/0`;
+  - demo `translate.json` validator:`errors=0 warnings=0`(全角修正后);
+  - `E-mote` 居中问题根因:原标签 `Ｅ－ｍｏｔｅ機能紹介` 全角,半角
+    `E-mote 功能介绍` 实际宽度小于固定字格估算 → 左偏;改回全角后居中;
+    validator 对显示类 UI 的半角混排给 warning。
+- **仍未覆盖**:
+  - 预渲染图片按钮(底部 `セーブ/ロード/クイックセーブ/...`)没有脚本文本,
+    文本 hook 改不了;需 UI 素材替换或改按钮绘制。
+  - `literals` 中内部 ID 的自动分类仍是基于 `context` 的人工规则,不是语义
+    oracle;skill/validator 已约束,运行时只按显式译文替换。

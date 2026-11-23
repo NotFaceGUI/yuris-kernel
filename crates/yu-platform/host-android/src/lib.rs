@@ -427,6 +427,9 @@ pub struct RunConfig {
     ///
     /// 与 CLI `--patch` 同义;`auto` 才会读产物签名。
     pub patch: yu_engine::patch::PatchKind,
+    /// 运行时翻译文件(JSON 键 `translate`;`translate.json` 的绝对路径)。
+    /// 缺省 `None` = 不装载翻译。
+    pub translate: Option<PathBuf>,
     // ---- 声音 ----
     /// `@_OS_SOUND` 注入值。缺省 true(对拍口径)。
     pub os_sound: bool,
@@ -514,6 +517,7 @@ impl Default for RunConfig {
             force_font: None,
             font_bytes: Vec::new(),
             patch: yu_engine::patch::PatchKind::Auto,
+            translate: None,
             font_file: None,
             os_sound: true,
             audio_output: true,
@@ -544,7 +548,8 @@ impl RunConfig {
     ///
     /// 支持的键(全部可选):
     /// `data_root` `save_root` `entry` `debug_mode` `script_key` `font`
-    /// `font_file` `os_sound` `audio` `backend` `fps` `screen_color` `dx_mode`
+    /// `font_file` `patch` `translate` `os_sound` `audio` `backend` `fps`
+    /// `screen_color` `dx_mode`
     /// `save_codec` `media_readonly` `record_events` `log_file` `log_level`
     /// `prefetch` `prefetch_mb` `prefetch_window` `asset_cache_mb`
     /// `asset_name_fallback` `bilinear_scale` `snapshot_defer`
@@ -603,6 +608,11 @@ impl RunConfig {
         }
         if let Some(v) = object.get("patch").and_then(|v| v.as_str()) {
             config.patch = yu_engine::patch::PatchKind::parse(v)?;
+        }
+        if let Some(v) = object.get("translate").and_then(|v| v.as_str()) {
+            if !v.trim().is_empty() {
+                config.translate = Some(PathBuf::from(v));
+            }
         }
         if let Some(v) = object.get("os_sound").and_then(|v| v.as_bool()) {
             config.os_sound = v;
@@ -1060,6 +1070,7 @@ pub fn start_engine(
         mut font_bytes,
         font_file,
         patch,
+        translate,
         backend,
         gpu_backend,
         os_sound,
@@ -1205,6 +1216,7 @@ pub fn start_engine(
         font_bytes,
         font,
         patch: yu_engine::patch::PatchSelection::new(patch),
+        translate,
         // `@_TIME` 注入系统本地时间(存档菜单的现实日期)。以前这里缺省
         // `None` ⇒ Android 上恒 1970,与桌面出现脚本可见的行为分歧。
         local_time: yu_engine::host_clock::local_now(),
@@ -1731,6 +1743,13 @@ pub fn status_text() -> String {
                     if dialog_count > 0 {
                         out.push_str(&format!(" dialog={dialog_count}"));
                     }
+                    if let Some((words, scenarios, calls)) =
+                        session.engine.translation_counts()
+                    {
+                        out.push_str(&format!(
+                            " translate={words} scenario={scenarios} calls={calls}"
+                        ));
+                    }
                     return;
                 }
                 let report = session.engine.last_report().clone();
@@ -1775,6 +1794,21 @@ pub fn status_text() -> String {
                             movie.underrun_frames
                         ));
                     }
+                }
+                if let Some(stats) = session.engine.translation_stats() {
+                    out.push_str(&format!(
+                        " tr[word={}/{} scen={}/{} units={} calls={}/{} lit={}/{} err={}]",
+                        stats.word_hits,
+                        stats.word_misses,
+                        stats.scenario_line_hits,
+                        stats.scenario_line_misses,
+                        stats.scenario_units,
+                        stats.call_hits,
+                        stats.call_misses,
+                        stats.literal_hits,
+                        stats.literal_misses,
+                        stats.scenario_rewrite_errors
+                    ));
                 }
                 // 设备侧交付:short>0 = 环被抽干(我们补了静音)。
                 if let Some(audio) = session.audio.as_ref() {

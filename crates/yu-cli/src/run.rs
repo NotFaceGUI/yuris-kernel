@@ -95,6 +95,8 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
             .map_err(|d| Failure::usage(format!("--patch: {d}")))?,
         None => yu_engine::patch::PatchSelection::default(),
     };
+    // 运行时翻译文件(`translate.json`);缺省不装载。
+    let translate = args.flag("translate").map(PathBuf::from);
     // 显式脚本密钥(换钥作品的兜底;缺省 = 启动时自动解析)。
     let script_key = match args.flag("script-key") {
         Some(value) => Some(parse_script_key(&value)?),
@@ -137,6 +139,7 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         script_key,
         save_codec,
         patch,
+        translate,
         movie_backend,
         tuning: host.render,
         gpu_backend: host.gpu_backend,
@@ -264,6 +267,21 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         engine.events_drained(),
         engine.events_dropped()
     ));
+    if let Some(stats) = engine.translation_stats() {
+        output::line(format!(
+            "translate: word {}/{} scen {}/{} units={} calls {}/{} literals {}/{} rewrite_errors={}",
+            stats.word_hits,
+            stats.word_misses,
+            stats.scenario_line_hits,
+            stats.scenario_line_misses,
+            stats.scenario_units,
+            stats.call_hits,
+            stats.call_misses,
+            stats.literal_hits,
+            stats.literal_misses,
+            stats.scenario_rewrite_errors
+        ));
+    }
 
     if let Some(path) = shot.as_deref() {
         let bytes = engine.write_png(path)?;

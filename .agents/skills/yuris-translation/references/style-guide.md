@@ -97,6 +97,30 @@ box, especially in `WORD` lines with a fixed window.
   punctuation point (but keep one entry = one line).
 - Do not pad short lines with spaces or decorative characters.
 
+### Fixed-cell UI width (buttons / choices)
+
+YU-RIS select menus and button labels are laid out by full-width character
+cells. If the source label is all full-width, keep the translation all
+full-width; do not introduce half-width ASCII letters, digits, or spaces.
+
+```text
+source: Ｅ－ｍｏｔｅ機能紹介
+good:   Ｅ－ｍｏｔｅ功能介绍
+bad:    E-mote 功能介绍      (half-width E-mote + space -> off-center)
+
+source: β４機能紹介
+good:   β４功能介绍
+bad:    β4 功能介绍
+```
+
+- Only apply this to UI labels (`choices`, `es.BT.NAME.SET`, `DIALOG`/`MENU`
+  captions). Ordinary dialogue may use normal half-width Latin/digits.
+- Prefer removing a space over keeping a half-width space. Full-width space is
+  acceptable if the layout needs separation.
+- The validator warns when a full-width source label gains half-width ASCII.
+- Internal IDs (`■SAVE`, `■Page01`, layer/asset names) are not UI prose; leave
+  them untouched.
+
 ### Tone and terminology
 
 - Translate meaning, not word order. Keep the character's voice: rough/refined,
@@ -117,12 +141,13 @@ box, especially in `WORD` lines with a fixed window.
   characters; check with `text.encode("gbk")`.
 - `big5` — Traditional Chinese. Avoid Simplified-only forms, emoji, and rare
   characters; check with `text.encode("big5")`.
-- `cp932` — Japanese Shift-JIS. Most Chinese characters **cannot** be encoded.
-  A Chinese translation on a `cp932` entry requires a GBK/Big5 patch or a
-  carrier-font/tunnel project; do not silently produce text the final encoder
-  will reject.
-- `sjis_ext.bin` (`meta.text_tunnel: true`) maps the **existing** extended
-  characters to Unicode. It does not give you arbitrary new Chinese glyphs.
+- `cp932` — Japanese Shift-JIS. The runtime loader can encode Chinese directly
+  where CP932 supports it and allocate new SJIS tunnel codes for the rest
+  (extending the game's `sjis_ext.bin`). A CP932 project is therefore valid for
+  a runtime-hook translation; a data-layer rewrite is limited to the existing
+  table (`--no-cp932-tunnel` in the validator).
+- `sjis_ext.bin` (`meta.text_tunnel: true`) keeps its existing mappings; the
+  runtime loader appends new characters on top.
 
 The validator reports the first unencodable character per entry. Fix the wording
 or switch the project's codec route; never change the `codec` field.
@@ -146,4 +171,6 @@ Translate them consistently:
 - [ ] Control tokens match the source (validator checks the multiset).
 - [ ] No line merged/split; no new newline unless the source had one.
 - [ ] No Simplified in `tw`, no Traditional in `cn`.
+- [ ] Full-width UI labels stayed full-width (no half-width `E-mote`, digits, or spaces).
+- [ ] Internal IDs (`■SAVE`, `■Page01`, layer/asset names) were not translated.
 - [ ] Validator: 0 errors; every warning explained.

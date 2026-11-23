@@ -325,6 +325,12 @@ pub struct EngineOptions {
     pub with_icon: bool,
     /// 文本编码路线(跨平台统一入口)。默认 `Auto`(按产物识别)。
     pub patch: crate::patch::PatchSelection,
+    /// 运行时翻译文件(`translate.json`)。`None` = 零行为变化。
+    ///
+    /// 文件内的条目按 `(script_id, pc)` / `(file, line, seq)` /
+    /// `GOSUB` 参数坐标替换;文件外文本保持原样。译文按当前补丁显示
+    /// codec 编码,CP932 工程自动分配 SJIS 隧道码。
+    pub translate: Option<std::path::PathBuf>,
     /// 全屏影片解码后端(跨平台设置,见
     /// [`yu_rt::event::MovieBackend`])。默认 `Auto`:有宿主注入的外置
     /// 后端就优先用,`open` 失败回退内置 pl_mpeg;`Builtin` 只用内置;
@@ -368,6 +374,7 @@ impl Default for EngineOptions {
             save_codec: None,
             with_icon: false,
             patch: crate::patch::PatchSelection::default(),
+            translate: None,
             movie_backend: yu_rt::event::MovieBackend::Auto,
             movie_external_factory: None,
         }
@@ -890,6 +897,11 @@ pub struct Engine {
 impl Engine {
     pub fn new(project: Project, mut opts: EngineOptions) -> CliResult<Self> {
         let boot_started = Instant::now();
+        // 翻译模式默认打开系统字体缺字回退:CP932 隧道码解出的汉字不一定
+        // 在游戏原字体里,没有回退会画成空白。未翻译模式保持既有调参。
+        if opts.translate.is_some() {
+            opts.tuning.font_fallback = true;
+        }
         let BootBundle {
             mut vm,
             state,
@@ -2813,6 +2825,16 @@ impl Engine {
             .unwrap_or([0; 6])
     }
 
+    /// 运行时翻译命中统计(`None` = 未装载翻译文件)。
+    pub fn translation_stats(&self) -> Option<yu_rt::translation::TranslationStats> {
+        self.vm.as_ref().and_then(Vm::translation_stats)
+    }
+
+    /// 翻译表规模:`(WORD, 剧本行, GOSUB 调用点)`。
+    pub fn translation_counts(&self) -> Option<(usize, usize, usize)> {
+        self.vm.as_ref().and_then(Vm::translation_counts)
+    }
+
     /// 取走 `VARACT` 调用点(script/pc),诊断用。
     pub fn take_varact_sites(&mut self, limit: usize) -> Vec<((u32, u32), u64)> {
         self.vm
@@ -3277,7 +3299,33 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         patch_profile.summary(),
         patch_profile.evidence
     );
-    let display = patch_profile.display();
+    let mut display = patch_profile.display();
+    // 运行时翻译:在 Vm::boot 之前装载,保证启动脚本的 GOSUB(角色注册)
+    // 与第一句 WORD 都命中。表里的译文按显示 codec 编码;CP932 工程会
+    // 扩展隧道表,扩展结果必须同时交给 VM 与渲染器。
+    let translation = match &opts.translate {
+        Some(path) => {
+            let loaded = crate::translation::load(
+                path,
+                &patch_profile,
+                source.as_ref(),
+                Some(aux.as_ref()),
+                script_key.bytes,
+            )?;
+            for warning in &loaded.report.warnings {
+                log::warn!(target: "yu-cli::engine", "translate: {warning}");
+            }
+            log::info!(
+                target: "yu-cli::engine",
+                "translate: {} (source={})",
+                loaded.report.summary(),
+                path.display()
+            );
+            display = loaded.display;
+            Some(loaded.table)
+        }
+        None => None,
+    };
     // 补丁字体与编码路线正交(FONTCHANGER 同型):由宿主在渲染器初始化前
     // 强制注入;profile 只带路径与证据,不在这里读 9MiB 字体。
     let patch_font = patch_profile.font.clone();
@@ -3306,6 +3354,7 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         disk_free_bytes: yu_host_disk::free_bytes(&save_root),
         codecs: patch_profile.codecs(),
         display: display.clone(),
+        translation,
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(source, Some(aux), boot)
@@ -3443,6 +3492,13 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
                 .save_codec
                 .unwrap_or_else(|| detect_block_codec(project.root()));
             state.set_block_codec(codec);
+            // `SAVE[FILE]` 的 DNO=1024 历史块形态由 `SemanticProfile`
+            // 单点门控;宿主/引擎不直接比较版本号。
+            if vm.semantics().save_history
+                == yu_rt::semantics::SaveHistoryMode::AppendCore
+            {
+                state.set_history_enabled(true);
+            }
             // 容器版本 = **官方 exe 的 LOAD 校验常量**,不是 yscfg/引擎版本:
             // 0.495→0x1E0、0.479→0x138、0.466→0x0C0、0.481→0x1E1(REA
             // 2026-11-15)。写错会导致官方弹 yse 108040「セーブデータの

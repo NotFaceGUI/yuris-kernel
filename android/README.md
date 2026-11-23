@@ -259,7 +259,7 @@ Tyranor-Next 的「工具 → 引擎模块管理」里**手动启用**(默认禁
 ```
 
 当前暴露的单游戏设置(完整声明以 JSON 为准):`fps`、`mouse_mode`、
-`bilinear_scale`、`font_fallback`、`patch`、`gpu_backend`、`movie_backend`、
+`bilinear_scale`、`font_fallback`、`patch`、`translate`、`gpu_backend`、`movie_backend`、
 `font`、`debug_log`、`show_hud`。Tyranor 在游戏抽屉的「引擎设置」里按声明
 渲染;模块只能控制 title/description/type/default,卡片间距与样式由宿主决定。
 
@@ -332,6 +332,7 @@ mixer 停止取数并清空环形缓冲),不依赖渲染线程的下一帧 tick 
 | `entry` | 同名 | 入口标签 | SYSTEM_START |
 | `font_path` / `font_family` | `font_file` / `font` | 字体文件 / family | 空 |
 | `patch` | 同名 | `auto\|original\|gbk\|big5\|tunnel` | auto |
+| `translate` | 同名 | `translate.json` 绝对路径(运行时文本替换) | 空 |
 | `save_codec` | 同名 | `zlib\|snappy` | 自动判定 |
 | `movie_backend` | 同名(+`cache_dir`) | `auto\|builtin\|external`;外置=设备 MediaCodec,自动失败回退内置 | auto |
 | `mouse_mode` | —(壳侧) | 布尔:`true`=虚拟光标,`false`=触摸 | false |

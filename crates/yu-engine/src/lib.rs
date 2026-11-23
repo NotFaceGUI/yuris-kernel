@@ -26,6 +26,7 @@ pub mod keys;
 pub mod movie;
 pub mod output;
 pub mod patch;
+pub mod translation;
 pub mod project;
 pub mod sha;
 

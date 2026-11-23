@@ -44,6 +44,9 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         Some(value) => ArgReader::on_off("debug-mode", &value)?,
         None => false,
     };
+    // 运行时翻译文件(与 run/serve/desktop 同一键;case 的期望哈希需按
+    // 翻译后的画面重新生成)。
+    let translate = args.flag("translate").map(PathBuf::from);
     // 渲染/诊断参数(与 run/serve/bench 同一套旗标)。
     let host = crate::args::HostTuning::from_args(&mut args)?;
     // case 专属诊断(原 YURIS_CASE_* 环境变量)。
@@ -108,7 +111,15 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
     let mut passed = 0usize;
     let mut failed = 0usize;
     for path in &files {
-        match run_case(&project, path, update, debug_mode, &host, &diag) {
+        match run_case(
+            &project,
+            path,
+            update,
+            debug_mode,
+            translate.as_ref(),
+            &host,
+            &diag,
+        ) {
             Ok(true) => {
                 passed += 1;
                 output::line(format!("case {}: PASS", case_name(path)));
@@ -393,6 +404,7 @@ fn run_case(
     path: &Path,
     update: bool,
     debug_mode: bool,
+    translate: Option<&PathBuf>,
     host: &crate::args::HostTuning,
     diag: &CaseDiag,
 ) -> CliResult<bool> {
@@ -436,6 +448,7 @@ fn run_case(
         record_events: spec.record_events,
         debug_mode,
         save_root: save_root.clone(),
+        translate: translate.cloned(),
         tuning: host.render,
         gpu_backend: host.gpu_backend,
         gpu_adapter: host.gpu_adapter.clone(),

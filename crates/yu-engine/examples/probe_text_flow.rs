@@ -20,6 +20,11 @@ fn main() {
     let opts = EngineOptions {
         backend: Backend::Soft,
         patch: PatchSelection::parse(&patch).expect("patch"),
+        // 可选:PROBE_TRANSLATE=<translate.json> 与 CLI `--translate` 同义。
+        translate: std::env::var("PROBE_TRANSLATE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(std::path::PathBuf::from),
         ..Default::default()
     };
     let mut engine = Engine::new(project, opts).expect("engine");
@@ -107,6 +112,19 @@ fn main() {
             }
         }
         prev_draws = draws;
+    }
+    if let Some(stats) = engine.translation_stats() {
+        println!(
+            "translate: word {}/{} scen {}/{} units={} calls {}/{} rewrite_errors={}",
+            stats.word_hits,
+            stats.word_misses,
+            stats.scenario_line_hits,
+            stats.scenario_line_misses,
+            stats.scenario_units,
+            stats.call_hits,
+            stats.call_misses,
+            stats.scenario_rewrite_errors
+        );
     }
     println!("done frames={frames}");
 }

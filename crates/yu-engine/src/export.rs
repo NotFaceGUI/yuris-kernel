@@ -14,7 +14,7 @@
 //! | `characters_runtime.csv` | boot 后运行时 STR 数组(`--runtime-characters`) | 注册表交叉验证 |
 //!
 //! `--format translate-json` 是另一种输出:**只写一个 `translate.json`**,
-//! 内含 `characters` 与 `text`(WORD + 外置剧本),每条带空译文槽;不写
+//! 内含 `characters`、`choices` 与 `text`(WORD + 外置剧本),每条带空译文槽;不写
 //! `literals.csv`/`text.csv`/人读副本。
 //!
 //! # 坐标(给 hook 用)
@@ -144,6 +144,8 @@ pub struct ExportReport {
     pub scenario_units: u64,
     pub character_variants: u32,
     pub characters: u64,
+    /// `choices` 数组条目数(`ES.SEL.SET`/`ES.CSEL.SET` 的字符串参数)。
+    pub choices: u64,
     /// 运行时验证命中的角色名数组个数 / 值个数。
     pub runtime_character_slots: u32,
     pub runtime_character_values: u64,
@@ -168,6 +170,7 @@ impl Default for ExportReport {
             scenario_units: 0,
             character_variants: 0,
             characters: 0,
+            choices: 0,
             runtime_character_slots: 0,
             runtime_character_values: 0,
             skipped: Vec::new(),
@@ -228,7 +231,8 @@ pub fn export_project(
 
     // ---- 编译脚本文本 + 字符串常量 ----
     let mut text_rows: Vec<[String; 7]> = Vec::new();
-    let mut literal_rows: Vec<[String; 8]> = Vec::new();
+    let mut literal_rows: Vec<[String; 9]> = Vec::new();
+    let mut choice_rows: Vec<[String; 5]> = Vec::new();
     let text_dir = out.join("text");
     if options.format == ExportFormat::Csv {
         std::fs::create_dir_all(&text_dir)
@@ -330,9 +334,34 @@ pub fn export_project(
             write_text(&text_dir.join(file_name), &body)?;
         }
 
-        if options.include_literals && options.format == ExportFormat::Csv {
+        if options.format == ExportFormat::TranslateJson {
             for (pc, group) in script.groups.iter().enumerate() {
-                for (window, segment, raw) in group_literal_bytes(group, &segs.args_data) {
+                let rows = extract_choice_rows(
+                    group,
+                    pc,
+                    &segs.args_data,
+                    codec,
+                    tunnel,
+                    *sid,
+                );
+                report.choices += rows.len() as u64;
+                choice_rows.extend(rows);
+            }
+        }
+
+        if options.include_literals {
+            for (pc, group) in script.groups.iter().enumerate() {
+                // 显示上下文: GOSUB 取标签名(如 `es.BT.NAME.SET`),其余取
+                // 命令名。翻译者据此只填显示 API 的常量,不碰内部层 ID。
+                let context = if group.command.as_ref() == "GOSUB" {
+                    group_literal_bytes(group, &segs.args_data, codec)
+                        .first()
+                        .map(|(_, _, raw)| decode_text(codec, tunnel, raw).0)
+                        .unwrap_or_else(|| group.command.to_string())
+                } else {
+                    group.command.to_string()
+                };
+                for (window, segment, raw) in group_literal_bytes(group, &segs.args_data, codec) {
                     let (text, invalid) = decode_text(codec, tunnel, raw);
                     if !text_literal_ok(&text, invalid) {
                         report.literal_skipped += 1;
@@ -348,6 +377,7 @@ pub fn export_project(
                         segment.to_string(),
                         codec.as_str().to_string(),
                         text,
+                        context.clone(),
                     ]);
                 }
             }
@@ -380,6 +410,7 @@ pub fn export_project(
                     "segment",
                     "codec",
                     "text",
+                    "context",
                 ],
                 &literal_rows,
             )?;
@@ -439,6 +470,8 @@ pub fn export_project(
             &text_rows,
             &scenario_rows,
             &character_rows,
+            &choice_rows,
+            &literal_rows,
         )?;
         return Ok(report);
     }
@@ -575,7 +608,9 @@ fn resolve_text_codec(
                 continue;
             };
             for group in &script.groups {
-                for (_, _, literal) in group_literal_bytes(group, &segs.args_data) {
+                for (_, _, literal) in
+                    group_literal_bytes(group, &segs.args_data, yu_format::Codec::Cp932)
+                {
                     if looks_binary(literal) || !is_text_sample(literal) {
                         continue;
                     }
@@ -720,6 +755,7 @@ fn window_payload<'a>(window: &[u8; 12], args: &'a [u8]) -> Option<&'a [u8]> {
 fn group_literal_bytes<'a>(
     group: &yu_format::Group,
     args: &'a [u8],
+    codec: yu_format::Codec,
 ) -> Vec<(usize, usize, &'a [u8])> {
     let mut out = Vec::new();
     for (window_index, window) in group.windows.iter().enumerate() {
@@ -729,46 +765,20 @@ fn group_literal_bytes<'a>(
         if payload.first() != Some(&b'M') {
             continue;
         }
-        for (segment, bytes) in quoted_segments(payload).into_iter().enumerate() {
+        for (segment, bytes) in quoted_segments(codec, payload).into_iter().enumerate() {
             out.push((window_index, segment, bytes));
         }
     }
     out
 }
 
-/// 按 `"` 段切分一个 `M` 形载荷(只处理 `\"` 转义)。
-fn quoted_segments(payload: &[u8]) -> Vec<&[u8]> {
-    // YU-RIS 的字符串常量有三种定界符:`"…"`、反引号 `` `…` `` 与 `'…'`
-    // (旧作的人名/显示名常用后两种;vnforge `ExpressionStrings` 同样三种都收)。
-    const DELIMS: [u8; 3] = [0x22, 0x60, 0x27];
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < payload.len() {
-        let Some(open) = payload[i..].iter().position(|b| DELIMS.contains(b)) else {
-            break;
-        };
-        let open = i + open;
-        let delim = payload[open];
-        let mut j = open + 1;
-        let mut close = None;
-        while j < payload.len() {
-            if payload[j] == 0x5C && payload.get(j + 1) == Some(&delim) {
-                j += 2;
-                continue;
-            }
-            if payload[j] == delim {
-                close = Some(j);
-                break;
-            }
-            j += 1;
-        }
-        let Some(close) = close else {
-            break;
-        };
-        out.push(&payload[open + 1..close]);
-        i = close + 1;
-    }
-    out
+/// 按 `M` 记录切分字符串段(codec-aware;与运行时共用
+/// [`yu_format::literal::segments`])。
+fn quoted_segments<'a>(codec: yu_format::Codec, payload: &'a [u8]) -> Vec<&'a [u8]> {
+    yu_format::literal::segments(payload, codec)
+        .into_iter()
+        .map(|(_, bytes)| bytes)
+        .collect()
 }
 
 /// 脚本里的 `M` 形字符串常量(`'M' + u16 长度 + "…"`)。
@@ -778,7 +788,7 @@ fn group_literals(
     codec: yu_format::Codec,
     tunnel: Option<&yu_format::text::TunnelTable>,
 ) -> Vec<String> {
-    group_literal_bytes(group, args)
+    group_literal_bytes(group, args, codec)
         .into_iter()
         .map(|(_, _, raw)| decode_text(codec, tunnel, raw).0)
         .collect()
@@ -970,7 +980,7 @@ fn output_rel_prefix(project: &Project, out: &Path) -> Option<Vec<u8>> {
 }
 
 /// 递归查找剧本目录(`scenario` / `*_scenario`),返回 `(显示路径, 原始路径)`。
-fn find_scenario_dirs(
+pub(crate) fn find_scenario_dirs(
     source: &dyn DataSource,
     dir_bytes: &[u8],
     display: &str,
@@ -1034,7 +1044,7 @@ fn find_scenario_dirs(
 }
 
 /// 递归收集目录下的文件(保留相对路径与原始字节路径)。
-fn walk_files(
+pub(crate) fn walk_files(
     source: &dyn DataSource,
     dir_bytes: &[u8],
     dir_display: &str,
@@ -1724,6 +1734,59 @@ fn extract_character_rows(
     (rows, marks)
 }
 
+/// 提取 `GOSUB("ES.SEL.SET"/"ES.CSEL.SET", "选项", …)` 的选项字符串。
+///
+/// `arg` 是**求值顺序**(0 起,标签窗口不算),与运行时
+/// `TranslationTable::translate_call_arg` 的键一致;长度 0 的窗口在运行期
+/// 被跳过,这里同样不计入序号。
+fn extract_choice_rows(
+    group: &yu_format::Group,
+    pc: usize,
+    args: &[u8],
+    codec: yu_format::Codec,
+    tunnel: Option<&yu_format::text::TunnelTable>,
+    sid: u32,
+) -> Vec<[String; 5]> {
+    if group.command.as_ref() != "GOSUB" {
+        return Vec::new();
+    }
+    let label = group
+        .windows
+        .iter()
+        .find(|window| window.bytes[4..8] != [0, 0, 0, 0])
+        .and_then(|window| window_payload(&window.bytes, args))
+        .and_then(|payload| quoted_segments(codec, payload).first().copied())
+        .map(|bytes| decode_text(codec, tunnel, bytes).0)
+        .unwrap_or_default();
+    let upper = label.trim().to_ascii_uppercase();
+    if upper != "ES.SEL.SET" && upper != "ES.CSEL.SET" {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    let mut arg = 0u32;
+    for window in group.windows.iter().skip(1) {
+        if window.bytes[4..8] == [0, 0, 0, 0] {
+            continue;
+        }
+        if let Some(payload) = window_payload(&window.bytes, args) {
+            if let Some(raw) = quoted_segments(codec, payload).first() {
+                let (text, _) = decode_text(codec, tunnel, raw);
+                if !text.trim().is_empty() {
+                    rows.push([
+                        sid.to_string(),
+                        pc.to_string(),
+                        arg.to_string(),
+                        text,
+                        codec.as_str().to_string(),
+                    ]);
+                }
+            }
+        }
+        arg += 1;
+    }
+    rows
+}
+
 const CHARACTER_HEADER: [&str; 8] = [
     "variant",
     "table",
@@ -1815,6 +1878,8 @@ fn write_translate_json(
     text_rows: &[[String; 7]],
     scenario_rows: &[[String; 10]],
     character_rows: &[[String; 8]],
+    choice_rows: &[[String; 5]],
+    literal_rows: &[[String; 9]],
 ) -> Result<(), Failure> {
     let number = |value: &str| -> Value { Value::Number(value.parse::<f64>().unwrap_or(0.0)) };
 
@@ -1857,6 +1922,8 @@ fn write_translate_json(
         "text".into(),
         Value::Number((text_rows.len() + scenario_rows.len()) as f64),
     );
+    counts.insert("choices".into(), Value::Number(choice_rows.len() as f64));
+    counts.insert("literals".into(), Value::Number(literal_rows.len() as f64));
     meta.insert("counts".into(), Value::Object(counts));
     root.insert("meta".into(), Value::Object(meta));
 
@@ -1872,12 +1939,55 @@ fn write_translate_json(
         item.insert("index".into(), number(&row[2]));
         item.insert("display".into(), Value::String(row[3].clone()));
         item.insert("name".into(), Value::String(row[4].clone()));
+        item.insert("script_id".into(), number(&row[5]));
+        item.insert("pc".into(), number(&row[6]));
         item.insert("codec".into(), Value::String(row[7].clone()));
         item.insert("display_translation".into(), Value::String(String::new()));
         item.insert("name_translation".into(), Value::String(String::new()));
         characters.push(Value::Object(item));
     }
     root.insert("characters".into(), Value::Array(characters));
+
+    let mut choices = Vec::with_capacity(choice_rows.len());
+    for row in choice_rows {
+        let mut item = BTreeMap::new();
+        item.insert(
+            "key".into(),
+            Value::String(format!("choice:s{}:pc{}:arg{}", row[0], row[1], row[2])),
+        );
+        item.insert("script_id".into(), number(&row[0]));
+        item.insert("pc".into(), number(&row[1]));
+        item.insert("arg".into(), number(&row[2]));
+        item.insert("codec".into(), Value::String(row[4].clone()));
+        item.insert("text".into(), Value::String(row[3].clone()));
+        item.insert("translation".into(), Value::String(String::new()));
+        choices.push(Value::Object(item));
+    }
+    root.insert("choices".into(), Value::Array(choices));
+
+    let mut literals = Vec::with_capacity(literal_rows.len());
+    for row in literal_rows {
+        let mut item = BTreeMap::new();
+        item.insert(
+            "key".into(),
+            Value::String(format!(
+                "literal:s{}:pc{}:w{}:s{}",
+                row[0], row[2], row[4], row[5]
+            )),
+        );
+        item.insert("script_id".into(), number(&row[0]));
+        item.insert("script_path".into(), Value::String(row[1].clone()));
+        item.insert("pc".into(), number(&row[2]));
+        item.insert("command".into(), Value::String(row[3].clone()));
+        item.insert("window".into(), number(&row[4]));
+        item.insert("segment".into(), number(&row[5]));
+        item.insert("codec".into(), Value::String(row[6].clone()));
+        item.insert("text".into(), Value::String(row[7].clone()));
+        item.insert("context".into(), Value::String(row[8].clone()));
+        item.insert("translation".into(), Value::String(String::new()));
+        literals.push(Value::Object(item));
+    }
+    root.insert("literals".into(), Value::Array(literals));
 
     let mut text = Vec::with_capacity(text_rows.len() + scenario_rows.len());
     for row in text_rows {
@@ -2057,8 +2167,10 @@ pub fn summary_translate(report: &ExportReport) -> String {
         report.text_codec_source.clone()
     };
     format!(
-        "export(translate-json): characters={} text={}(word {} + scenario {}) codec={}({})",
+        "export(translate-json): characters={} choices={} literals={} text={}(word {} + scenario {}) codec={}({})",
         report.characters,
+        report.choices,
+        report.literal_units,
         report.text_units + report.scenario_units,
         report.text_units,
         report.scenario_units,
@@ -2118,15 +2230,15 @@ mod tests {
 
     #[test]
     fn literal_payload_splits_adjacent_quotes() {
-        let payload = vec![b'M', 0x12, 0x00, 0x22, b'a', 0x22, 0x22, b'b', 0x22, 0x00];
-        let segments = quoted_segments(&payload);
+        let payload = vec![b'M', 6, 0x00, 0x22, b'a', 0x22, 0x22, b'b', 0x22];
+        let segments = quoted_segments(yu_format::Codec::Cp932, &payload);
         assert_eq!(segments, vec![&b"a"[..], &b"b"[..]]);
     }
 
     #[test]
     fn literal_payload_supports_backtick_and_single_quote() {
         let payload = vec![b'M', 0x06, 0x00, 0x60, b'a', 0x60, 0x27, b'b', 0x27];
-        let segments = quoted_segments(&payload);
+        let segments = quoted_segments(yu_format::Codec::Cp932, &payload);
         assert_eq!(segments, vec![&b"a"[..], &b"b"[..]]);
     }
 

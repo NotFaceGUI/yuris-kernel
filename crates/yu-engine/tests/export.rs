@@ -102,7 +102,7 @@ fn eris_export_word_text_matches_corpus() {
 }
 
 #[test]
-fn translate_json_contains_only_characters_and_text() {
+fn translate_json_contains_only_translation_arrays() {
     let Some(root) = sample("YURIS_SAMPLE_ERIS_ROOT") else {
         return;
     };
@@ -136,9 +136,30 @@ fn translate_json_contains_only_characters_and_text() {
         Some("yuris-translate-1")
     );
     let characters = value.get("characters").and_then(|v| v.as_array()).unwrap();
+    let choices = value.get("choices").and_then(|v| v.as_array()).unwrap();
+    let literals = value
+        .get("literals")
+        .and_then(|v| v.as_array())
+        .expect("literals 数组");
     let body = value.get("text").and_then(|v| v.as_array()).unwrap();
     assert_eq!(characters.len(), report.characters as usize);
     assert_eq!(characters.len(), 4);
+    assert_eq!(choices.len(), report.choices as usize);
+    assert_eq!(literals.len(), report.literal_units as usize);
+    assert!(
+        literals.iter().all(|item| {
+            item.get("context").and_then(|v| v.as_str()).is_some()
+                && item.get("translation").and_then(|v| v.as_str()) == Some("")
+        }),
+        "literals 必须带 context 与空译文槽"
+    );
+    assert!(
+        characters.iter().all(|item| {
+            item.get("script_id").and_then(|v| v.as_u64()).is_some()
+                && item.get("pc").and_then(|v| v.as_u64()).is_some()
+        }),
+        "角色条目必须带运行期 script_id/pc"
+    );
     assert_eq!(body.len(), report.text_units as usize);
     assert_eq!(body.len(), 464);
     assert!(text.contains("優理"));

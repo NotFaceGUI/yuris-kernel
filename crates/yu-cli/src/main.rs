@@ -261,7 +261,9 @@ yu-cli run · 跑工程(缺省 headless;--mode desktop 开原生窗口)
   --save-codec zlib|snappy  强制存档块压缩层(缺省 = 盘上既有存档 →
                        引擎代号 YSSnp.dll → zlib;只影响写盘)
   --patch MODE         文本编码路线:auto(缺省,按产物识别)|
-                       original | gbk | tunnel(需 sjis_ext.bin)
+                       original | gbk | big5 | tunnel(需 sjis_ext.bin)
+  --translate PATH     运行时翻译文件(translate.json;按条目替换 WORD/
+                       角色名/选项/外置剧本,文件外文本保持原样)
   --font FAMILY|PATH   宿主默认字体:family 名,或字体文件(.ttf/.otf/.ttc/
                        .otc;相对路径按工程根,文件里的 Bold/Italic 照常解析;
                        引擎默认名/空名映射到它,游戏内选其它字体仍生效;
@@ -337,6 +339,7 @@ yu-cli serve · 本地服务:服务端读数据并执行内核,浏览器只做�
                [--entry LABEL] [--fps 60] [--record-events on|off]
                [--debug-mode on|off] [--data PATH] [--www DIR] [--diag-ws]
                [--font FAMILY|PATH] [--font-lock] [--log-file PATH] [--max-step-ms N]
+               [--patch MODE] [--translate PATH]
 
 说明:
   启动后打印 http://127.0.0.1:<port>/,默认打开浏览器。
@@ -344,6 +347,7 @@ yu-cli serve · 本地服务:服务端读数据并执行内核,浏览器只做�
   --diag-ws 额外开 /diag 通道(500ms 推诊断快照:等待任务/挂号表/域计数)。
   --log-file JSONL 日志(内核 Diag + 门面行;每轮截断;关闭时打汇总)。
   --max-step-ms 调试用:实时逻辑时钟单步上限(默认关 = 不截断,墙钟语义)。
+  --translate PATH 运行时翻译文件(translate.json;文件外文本保持原样)。
   服务端读数据并执行内核;浏览器不下载整包。
 ";
 
@@ -364,7 +368,7 @@ yu-cli case · golden 用例执行器
 用法:
   yu-cli case <project-root> --all | --case NAME [--update] [--debug-mode on|off]
               [--bench] [--profile-all] [--trace-frames FROM..TO]
-              [--shot-frames 900,1200]
+              [--shot-frames 900,1200] [--translate PATH]
 
 诊断(原 YURIS_CASE_* 环境变量):
   --bench              逐帧 tick 耗时 + 命令成本汇总

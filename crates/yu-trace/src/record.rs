@@ -683,6 +683,8 @@ impl BootSummary {
             // 现有 trace 头没有该字段,按 CP932 回放(不是静默兜底,是记录缺失)。
             codecs: yu_rt::CodecConfig::default(),
             display: yu_rt::DisplayConfig::default(),
+            // trace 回放按录制时的原始字节比较,不叠加运行时翻译。
+            translation: None,
         })
     }
 }

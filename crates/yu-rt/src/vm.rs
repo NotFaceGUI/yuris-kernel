@@ -194,6 +194,8 @@ pub struct BootConfig {
     pub codecs: CodecConfig,
     /// 显示层逐脚本/逐载荷/隧道配置;只进 bytes→Unicode 边界。
     pub display: DisplayConfig,
+    /// 运行时翻译表(宿主从 `translate.json` 装载;`None` = 零行为变化)。
+    pub translation: Option<crate::translation::TranslationTable>,
 }
 
 /// 宿主注入的路径系统变量(`basic/svariable.html`)。
@@ -230,6 +232,7 @@ impl Default for BootConfig {
             record_events: true,
             codecs: CodecConfig::default(),
             display: DisplayConfig::default(),
+            translation: None,
         }
     }
 }
@@ -628,6 +631,8 @@ pub struct Vm {
     name_codec: yu_format::Codec,
     /// 显示层配置(逐脚本 codec/隧道;不参与执行)。
     display: DisplayConfig,
+    /// 运行时翻译表(三个入口共享;见 [`crate::translation`])。
+    pub(crate) translation: Option<crate::translation::TranslationTable>,
     /// `@_MENUCODE`(手册:最後に選択されたメニュー項目の CODE 値;○ 可赋值)。
     menu_code: i64,
     /// `@_WINDOW_EXEC_MAX/MIN/CLOSE/CAPTION`:窗口按钮/尺寸事件的按下状态。
@@ -931,6 +936,7 @@ impl Vm {
             script_codec: cfg.codecs.script,
             name_codec: cfg.codecs.name,
             display: cfg.display,
+            translation: cfg.translation,
             menu_code: 0,
             window_exec_max: 0,
             window_exec_min: 0,
@@ -1690,6 +1696,36 @@ impl Vm {
         self.text_layer_probe = probe;
     }
 
+    /// 注入/替换运行时翻译表(`None` 恢复原文行为)。
+    ///
+    /// 只影响之后执行的 `WORD`/`GOSUB` 与随后装载的 `TEXT[FILE]`;已经
+    /// 进入 `$_TEXT` 的字节不回溯改写。
+    pub fn set_translation(&mut self, translation: Option<crate::translation::TranslationTable>) {
+        self.translation = translation;
+        // 文本常量在 fill_cmd 构建缓存时重写;换表后必须让缓存重建。
+        self.cmd_cache.clear();
+    }
+
+    /// 当前翻译表统计(`None` = 未装载翻译)。
+    #[must_use]
+    pub fn translation_stats(&self) -> Option<crate::translation::TranslationStats> {
+        self.translation
+            .as_ref()
+            .map(crate::translation::TranslationTable::stats)
+    }
+
+    /// 翻译表规模:`(WORD 条数, 剧本行条数, GOSUB 调用点条数)`。
+    #[must_use]
+    pub fn translation_counts(&self) -> Option<(usize, usize, usize)> {
+        self.translation.as_ref().map(|table| {
+            (
+                table.word_count(),
+                table.scenario_count(),
+                table.call_count(),
+            )
+        })
+    }
+
     /// 注入目标层表面宽高(引擎每 tick 从 gfx 当前状态查询后推入)。
     pub fn set_text_window(&mut self, size: Option<(i64, i64)>) {
         self.text.set_window(size);
@@ -2444,6 +2480,16 @@ impl Vm {
     /// 取出当前 pc 的命令视图(写入复用缓冲;每命令零次 Vec/String 分配)。
     fn fill_cmd(&mut self, st: &ExecState, cmd: &mut Cmd) -> Result<(), Diag> {
         self.ensure_script(st.script_id)?;
+        // 先取走译文:下面 `script` 借用 `self.tables` 到循环结束,期间不能再
+        // 可变借用 `self`。文本常量是站点级数据,克隆成本只在缓存首次构建。
+        let literal_entries = self
+            .translation
+            .as_ref()
+            .map(|table| table.literals_for(st.script_id, st.pc))
+            .unwrap_or_default();
+        let mut literal_applied = 0usize;
+        let mut literal_missing = 0usize;
+        let mut literal_errors: Vec<String> = Vec::new();
         let script = self.tables.script(st.script_id).expect("刚刚装载");
         let Some(group) = script.group(st.pc as usize) else {
             return Err(diag::fatal(
@@ -2489,7 +2535,7 @@ impl Vm {
         let window_codec = self.script_codec;
         // 555 自定界补读的窗口(只报一次;记录 (参数槽, 声明长度, 实际长度))。
         let mut stale_windows: Vec<(u8, u32, u32)> = Vec::new();
-        for rec in script.group_windows(st.pc as usize) {
+        for (window_index, rec) in script.group_windows(st.pc as usize).iter().enumerate() {
             let strict = script.window_payload(rec).ok_or_else(|| {
                 diag::fatal(
                     code::fmt::OUT_OF_BOUNDS,
@@ -2530,7 +2576,42 @@ impl Vm {
                     }
                 }
             }
-            let payload: &[u8] = extended.as_deref().unwrap_or(strict);
+            let mut payload: &[u8] = extended.as_deref().unwrap_or(strict);
+            // 文本常量(按钮/菜单/选项标签):按 (sid,pc,window,segment)
+            // 在**命令缓存首次构建**时重写;之后所有求值都用译文。
+            let mut rewritten_payload: Option<Vec<u8>> = None;
+            if let Some(entries) = literal_entries
+                .iter()
+                .find(|(window, _)| usize::from(*window) == window_index)
+                .map(|(_, entries)| entries)
+            {
+                let replacements: Vec<yu_format::literal::Replacement<'_>> = entries
+                    .iter()
+                    .map(|entry| yu_format::literal::Replacement {
+                        segment: entry.segment,
+                        bytes: &entry.bytes,
+                    })
+                    .collect();
+                match yu_format::literal::rewrite_payload(window_codec, payload, &replacements) {
+                    Ok(result) => {
+                        literal_applied += result.applied;
+                        literal_missing += result.missing;
+                        if let Some(bytes) = result.payload {
+                            instrs = crate::expr::decode(&bytes)
+                                .ok()
+                                .map(Rc::<[crate::expr::RawInstr]>::from);
+                            rewritten_payload = Some(bytes);
+                        }
+                    }
+                    Err(error) => literal_errors.push(format!(
+                        "s{} pc{} 窗口 {window_index} 翻译常量重写失败: {error}(保留原文)",
+                        st.script_id, st.pc
+                    )),
+                }
+            }
+            if let Some(bytes) = rewritten_payload.as_deref() {
+                payload = bytes;
+            }
             let const_value = instrs.as_deref().and_then(crate::expr::const_value_instrs);
             let lvalue_plan = instrs.as_deref().and_then(crate::expr::lvalue_plan);
             let simple = instrs.as_deref().and_then(crate::expr::simple_expr);
@@ -2557,6 +2638,18 @@ impl Vm {
         // `VARACT` 的参数名计划:站点级静态事实,执行期不再逐次扫描参数名。
         cmd.varact_plan = (name == "VARACT")
             .then(|| handlers::build_varact_plan(&cmd.param_names, &cmd.windows));
+        if literal_applied > 0 || literal_missing > 0 {
+            if let Some(table) = self.translation.as_mut() {
+                table.note_literal_rewrite(literal_applied, literal_missing);
+            }
+        }
+        for error in literal_errors {
+            self.report(diag::verbose(
+                code::rt::SCRIPT_ERROR,
+                Boundary::Script,
+                error,
+            ));
+        }
         for (kind, declared, actual) in stale_windows {
             let key = (st.script_id, st.pc, u16::from(kind));
             if self.window_payload_reported.insert(key) {

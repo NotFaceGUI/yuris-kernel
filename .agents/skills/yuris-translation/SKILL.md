@@ -16,9 +16,12 @@ yu-cli export <project-root> <out-dir> --format translate-json
 # => <out-dir>/translate.json   (schema: yuris-translate-1)
 ```
 
-`translate.json` contains exactly two arrays:
+`translate.json` contains four arrays:
 
 - `characters`: the in-game character-name table (`display` + `name`);
+- `choices`: option labels passed to `ES.SEL.SET` / `ES.CSEL.SET`;
+- `literals`: script string constants (buttons, menus, dialogs, messages, and
+  internal IDs — see §2.5);
 - `text`: compiled `WORD` text plus external-scenario text.
 
 Every entry has a stable `key`. Translation fields are:
@@ -26,6 +29,8 @@ Every entry has a stable `key`. Translation fields are:
 | Entry | Fields you fill |
 |---|---|
 | `characters[i]` | `display_translation`, `name_translation` |
+| `choices[i]` | `translation` |
+| `literals[i]` | `translation` (only display/message entries) |
 | `text[i]` | `translation` |
 
 If an entry is left empty, the game keeps the original text. Never edit `key`,
@@ -38,12 +43,16 @@ a single character:
 
 - `cn` variant → **Simplified Chinese**, target codec usually `gbk`.
 - `tw` variant → **Traditional Chinese**, target codec usually `big5`.
-- `cp932` → original Japanese; a Chinese translation needs a GBK/Big5 patch or a
-  CP932 carrier-font/tunnel project. `sjis_ext.bin` (`text_tunnel: true`) only
-  covers the **existing** table; it cannot encode arbitrary new Chinese.
-- If target Chinese and the entry is `cp932` without an explicit project decision,
-  stop and ask the user which codec route to use. The validator will flag every
-  unencodable character.
+- `cp932` → original Japanese. The runtime loader can encode Chinese with
+  CP932 where possible and allocate new SJIS tunnel codes for the rest
+  (extending the game's own `sjis_ext.bin`). So a CP932 project is a valid
+  target for a Chinese translation **when the game is played through the
+  runtime `--translate` hook**; the validator accepts it by default.
+- GBK/Big5 projects encode directly and have no tunnel fallback: any character
+  the codec cannot encode is a hard error.
+- For a **data-layer patch** (rewriting packs instead of runtime hook), CP932 can
+  only carry characters already present in its table/`sjis_ext.bin`; validate
+  with `--no-cp932-tunnel`.
 
 ## 2. Character names first (角色统一)
 
@@ -73,15 +82,51 @@ Rules:
 7. The glossary is the source of truth for speaker prefixes:
    `【Big Sister】「…」` → `【大姐姐】「…」` (cn) / `【大姊姊】「…」` (tw).
 
+## 2.5 UI literals and choices (按钮/菜单/选项)
+
+`choices` are the select-menu option labels. `literals` are script string
+constants; `context` tells you where the string is consumed:
+
+| `context` | Meaning | Action |
+|---|---|---|
+| `es.BT.NAME.SET` | button display name | translate visible Japanese labels |
+| `DIALOG` / `MENU` / `es.DIALOG.YESNO.SET` | dialog/menu text | translate |
+| `es._mes` | in-game message/error text | translate user-facing messages; leave debug-only text if unsure |
+| `ES.SEL.SET` | option label (duplicated in `choices`) | translate via `choices`; keep both consistent if you fill both |
+| `LET` / `STR` / `IF` | may build a later dialog/message | translate only human sentences, never identifiers |
+| `CG` / `CGACT` / `CGINFO` / `TEXT` / `es.SP.*` / `es.BT.KEY.SET` / `ES.SEL.GO` | asset, layer, key, or action IDs | **do not translate** |
+
+Rules:
+
+1. Buttons/options are part of the translation surface; leaving a visible
+   Japanese label empty is a defect unless it is an internal ID or a
+   pre-rendered image button (see below).
+2. Keep the original **width class**. Fixed-cell YU-RIS UIs center by full-width
+   character cells. If the source label is all full-width, write Latin letters,
+   digits, and spaces in full-width too:
+   - `Ｅ－ｍｏｔｅ機能紹介` → `Ｅ－ｍｏｔｅ功能介绍` (not `E-mote 功能介绍`)
+   - `β４機能紹介` → `β４功能介绍`
+   - `テスト１` → `测试１`
+   Mixing half-width ASCII into a full-width label shifts the text off-center.
+3. Do not translate names that are clearly internal (`■SAVE`, `■Page01`,
+   `■Check1`, `■グループ01`, asset paths, `CG`/layer IDs). They are keys, not
+   prose; changing them can break lookups.
+4. Pre-rendered image buttons (common for the bottom system bar: `セーブ`,
+   `ロード`, `クイックセーブ`, …) contain no script text. Text translation
+   cannot change their pixels; they need an asset replacement or a button-system
+   change. Do not fake entries for them.
+
 ## 3. Plot translation (剧情/台词)
 
-Translate `text` entries line by line:
+Translate `choices` first where they occur, then `text` entries line by line:
 
 - Use the surrounding entries in the same `file`/`scene` (`scenario`) or the same
   `script_path` (`word`) as context. Read before and after; do not translate a
   line in isolation when it is a continuation.
 - Keep the original meaning, tone, and character voice. Do not add exposition,
   merge lines, split lines, or reorder entries. One entry = one displayed line.
+- For `choices`, translate the option as a button label: short, natural, and
+  consistent with the character glossary when a name appears.
 - Keep speaker prefixes and quotation marks exactly as in the source:
   `【…】`, `「…」`, `『…』`, `（…）`, `“…”`. Translate the words inside; keep the
   marks and the prefix name from the glossary.
@@ -108,6 +153,14 @@ Translate `text` entries line by line:
 - If a translation is intentionally left empty, record why in your final report
   (the game will show the original).
 
+Runtime use (no game data is modified):
+
+```bash
+yu-cli run <project-root> --translate <out-dir>/translate.json
+```
+
+Android: `translate` in `run-config.json` / the `translate` intent extra.
+
 ## 5. Validate before reporting
 
 Run the bundled validator:
@@ -121,6 +174,7 @@ Options:
 ```text
 --codec cp932|gbk|big5|auto   override the per-entry codec (default: use file)
 --allow-unencodable           downgrade encoding failures to warnings
+--no-cp932-tunnel             require direct CP932 encoding (data-layer patch)
 --strict                      treat empty translations as errors (default: warning)
 --max-ratio 2.0               length-ratio warning threshold
 ```
@@ -138,10 +192,12 @@ Return a short summary:
 
 ```text
 characters translated: N/M
+choices translated: N/M
+literals translated: N/M (display/message only)
 text translated: N/M (word X, scenario Y)
 glossary: N names (cn/tw)
 validator: 0 errors, K warnings (list the important ones)
-codec: gbk (cn) / big5 (tw) / cp932 (untranslated)
+codec: gbk (cn) / big5 (tw) / cp932 (runtime tunnel)
 ```
 
 ## 7. Common mistakes
@@ -150,7 +206,11 @@ codec: gbk (cn) / big5 (tw) / cp932 (untranslated)
 - Translating `【】`/`「」` marks or dropping them → speaker/name parsing breaks.
 - Using two different Chinese names for the same `name` → breaks 角色统一.
 - Mixing Simplified into `tw` or Traditional into `cn`.
-- Writing emoji/rare CJK that the target codec cannot encode (validator catches).
+- Mixing half-width ASCII into a full-width UI label (breaks fixed-cell centering).
+- Translating internal IDs (`■SAVE`, `■Page01`, layer/asset names) instead of
+  display labels.
+- Writing emoji/rare CJK that the target codec cannot encode (validator catches;
+  CP932 runtime tunnel has a finite carrier space).
 - Merging two `scenario` entries with the same `line` but different `seq` → the
   line-level importer sees a shifted array.
 - “Improving” the source text instead of translating it.

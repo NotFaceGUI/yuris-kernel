@@ -196,6 +196,19 @@ impl Codec {
         (chars, invalid)
     }
 
+    /// 单字符 → 码位(ASCII 恒真;不可映射返回 `None`)。
+    ///
+    /// 与 [`Self::encode`] 共用同一张反查表,但不构造中间字符串;翻译加载
+    /// 时逐字编码/隧道回退用。
+    #[must_use]
+    pub fn encode_char(self, ch: char) -> Option<u16> {
+        let u = u32::from(ch);
+        if u < 0x80 {
+            return Some(u as u16);
+        }
+        encode_map(self).get(&ch).copied()
+    }
+
     /// 该字符能否用本 codec 表示(ASCII 恒真)。
     #[must_use]
     pub fn can_encode(self, ch: char) -> bool {

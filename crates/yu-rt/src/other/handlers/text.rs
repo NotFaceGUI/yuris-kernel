@@ -172,6 +172,7 @@ impl Vm {
                 var.display()
             ),
         ));
+        let lines = self.rewrite_scenario_lines(st, &path, lines);
         for (index, line) in lines.into_iter().enumerate() {
             if index >= limit {
                 // 官方:元素索引上限取自变量长度,越界即停止(不报错)。
@@ -191,6 +192,67 @@ impl Vm {
             args: Vec::new(),
         });
         Ok(StepOutcome::Continue)
+    }
+
+    /// 把 `TEXT[FILE]` 切好的行按运行时翻译表重写。
+    ///
+    /// 必须在写 `LET` 数组之前完成:下游剧本 lexer/parser 会对数组元素
+    /// 按 `script_codec` 的字节步进切词,译文必须已经是目标 codec 的
+    /// 合法字节(CP932 工程可含隧道码,仍是合法双字节步进)。
+    ///
+    /// 行号与导出侧一致(`index + 1`);文件键运行期是归一化反斜杠路径,
+    /// 表查询内部再统一成小写正斜杠。没有条目的行原样保留,但仍推进
+    /// 块注释状态。
+    fn rewrite_scenario_lines(
+        &mut self,
+        st: &ExecState,
+        path: &[u8],
+        lines: Vec<Vec<u8>>,
+    ) -> Vec<Vec<u8>> {
+        if self.translation.is_none() {
+            return lines;
+        }
+        let codec = self.script_text_codec(st.script_id);
+        let (chars, _) = codec.decode_lossy(path);
+        let file: String = chars.into_iter().collect();
+        let mut state = yu_format::scenario::LineState::default();
+        let mut out = Vec::with_capacity(lines.len());
+        for (index, line) in lines.into_iter().enumerate() {
+            let line_no = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            let units = self
+                .translation
+                .as_mut()
+                .and_then(|table| table.lookup_scenario(&file, line_no));
+            let Some(units) = units else {
+                let _ = yu_format::scenario::scan_units(codec, &line, &mut state);
+                out.push(line);
+                continue;
+            };
+            let replacements: Vec<yu_format::scenario::Replacement<'_>> = units
+                .iter()
+                .map(|unit| yu_format::scenario::Replacement {
+                    seq: unit.seq,
+                    kind: unit.kind,
+                    name: &unit.name,
+                    bytes: &unit.bytes,
+                })
+                .collect();
+            match yu_format::scenario::rewrite_line(codec, &line, &mut state, &replacements) {
+                Ok(rewritten) => out.push(rewritten),
+                Err(error) => {
+                    if let Some(table) = self.translation.as_mut() {
+                        table.note_rewrite_error();
+                    }
+                    self.report(diag::recoverable(
+                        code::rt::TEXT_FILE,
+                        Boundary::Script,
+                        format!("翻译行重写失败 {file} line {line_no}: {error}(保留原行)"),
+                    ));
+                    out.push(line);
+                }
+            }
+        }
+        out
     }
 }
 

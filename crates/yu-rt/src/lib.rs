@@ -61,6 +61,7 @@ pub mod sysvar_abi;
 pub mod tables;
 pub mod task;
 pub mod text;
+pub mod translation;
 pub mod value;
 pub mod vm;
 pub mod ycd;

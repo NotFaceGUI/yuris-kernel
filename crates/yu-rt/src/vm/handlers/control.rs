@@ -17,6 +17,7 @@ impl Vm {
         let label = self.label_from_window(st, cmd, 0)?;
         // 参数:窗口 kind ≥ 1 对应 PINT/PFLT/PSTRn(名字来自工程 ysc)。
         let mut frame = GosubFrame::new(st.script_id, st.pc, st.base_a);
+        let mut arg_ord = 0u32;
         for w in cmd.windows.iter().skip(1) {
             if w.rec.length == 0 {
                 continue;
@@ -24,6 +25,15 @@ impl Vm {
             let (n, ty) = self.param_plan(cmd.opcode, w.rec.kind);
             let idx = checked_param_index(n, cmd.opcode, w.rec.kind, self, "GOSUB")?;
             let value = self.eval_window(st, w)?;
+            // 运行时翻译:角色注册(`es.CHAR.NAME`)与选项等按调用点 +
+            // 求值顺序替换字符串参数。只改 Str;数字/浮点原样通过。
+            let value = match self.translation.as_mut() {
+                Some(table) => {
+                    table.translate_call_arg(st.script_id, cmd.pc, arg_ord, value)
+                }
+                None => value,
+            };
+            arg_ord += 1;
             frame.args[idx] = Some(ty.coerce(value));
             frame.arg_flags[idx] = true;
         }

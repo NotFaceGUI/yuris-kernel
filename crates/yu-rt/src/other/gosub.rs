@@ -36,6 +36,7 @@ impl Vm {
         }
         let label = self.label_from_window(st, cmd, 0)?;
         let mut frame = GosubFrame::default();
+        let mut arg_ord = 0u32;
         for w in cmd.windows.iter().skip(1) {
             if w.rec.length == 0 {
                 continue;
@@ -68,6 +69,14 @@ impl Vm {
             } else {
                 ty.coerce(self.eval_window(st, w)?)
             };
+            // 运行时翻译:555 分支同样按调用点 + 求值顺序替换字符串。
+            let value = match self.translation.as_mut() {
+                Some(table) => {
+                    table.translate_call_arg(st.script_id, cmd.pc, arg_ord, value)
+                }
+                None => value,
+            };
+            arg_ord += 1;
             match ty {
                 ParamTy::Float => frame.args_flt[idx] = Some(value),
                 ParamTy::Str => frame.args_str[idx] = Some(value),

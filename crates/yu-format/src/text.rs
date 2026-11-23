@@ -113,6 +113,7 @@ impl DisplayConfig {
 pub struct TunnelTable {
     chars: Vec<char>,
     map: BTreeMap<[u8; 2], char>,
+    reverse: BTreeMap<char, [u8; 2]>,
     digest: u64,
 }
 
@@ -167,12 +168,16 @@ impl TunnelTable {
             chars.push(ch);
         }
         let mut map = BTreeMap::new();
+        let mut reverse = BTreeMap::new();
         for (index, &ch) in chars.iter().enumerate() {
-            map.insert(idx_to_code_point(index), ch);
+            let pair = idx_to_code_point(index);
+            map.insert(pair, ch);
+            reverse.entry(ch).or_insert(pair);
         }
         Ok(Self {
             chars,
             map,
+            reverse,
             digest: fnv1a64(bytes),
         })
     }
@@ -195,6 +200,56 @@ impl TunnelTable {
     #[must_use]
     pub fn digest(&self) -> u64 {
         self.digest
+    }
+
+    /// 由显式 `(双字节码, 字符)` 对构造(运行时扩展隧道用)。
+    ///
+    /// 保留游戏自带 `sjis_ext.bin` 的既有映射时,把所有既有对和新分配的
+    /// 对一起传入;码对必须落在隧道可用空间(官方分配算法 = CP932 前导 +
+    /// `0x01..=0x3F` 的非保留尾字节,也接受标准 CP932 双字节对),重复
+    /// 码对/非法码对显式报错。
+    pub fn from_pairs(
+        pairs: impl IntoIterator<Item = ([u8; 2], char)>,
+    ) -> Result<Self, Diag> {
+        let mut chars = Vec::new();
+        let mut map = BTreeMap::new();
+        let mut reverse = BTreeMap::new();
+        for (pair, ch) in pairs {
+            if !valid_tunnel_pair(pair) {
+                return Err(Diag::fatal(code::CODEC_INVALID, Boundary::Format)
+                    .with_detail(format!(
+                        "隧道码对 {:02X}{:02X} 不在可用隧道空间",
+                        pair[0], pair[1]
+                    )));
+            }
+            if map.insert(pair, ch).is_some() {
+                return Err(Diag::fatal(code::CODEC_INVALID, Boundary::Format)
+                    .with_detail(format!(
+                        "隧道码对 {:02X}{:02X} 重复",
+                        pair[0], pair[1]
+                    )));
+            }
+            reverse.entry(ch).or_insert(pair);
+            chars.push(ch);
+        }
+        let digest = digest_pairs(&map);
+        Ok(Self {
+            chars,
+            map,
+            reverse,
+            digest,
+        })
+    }
+
+    /// 已分配的 `(码对, 字符)`(按码对排序;用于合并/审计)。
+    pub fn pairs(&self) -> impl Iterator<Item = ([u8; 2], char)> + '_ {
+        self.map.iter().map(|(pair, ch)| (*pair, *ch))
+    }
+
+    /// 字符 → 隧道码对(反向查表;同一字符取最小码对)。
+    #[must_use]
+    pub fn encode_char(&self, ch: char) -> Option<[u8; 2]> {
+        self.reverse.get(&ch).copied()
     }
 
     /// 2 字节隧道码点 → 字符。
@@ -300,6 +355,30 @@ impl<'a> TextCodec<'a> {
     }
 }
 
+/// 隧道码对是否可用。
+///
+/// 官方隧道分配(`idx_to_code_point`)用 CP932 前导 + **低位尾字节**
+/// `0x01..=0x3F`(跳过 09/0A/0D/20/2C):脚本只按前导字节步进,渲染器
+/// 先用隧道表查这一对,所以它不是“合法 CP932 字符”,但确实是官方可用的
+/// 双字节载体。标准 CP932 双字节对也接受(自定义隧道表)。
+fn valid_tunnel_pair(pair: [u8; 2]) -> bool {
+    let lead = matches!(pair[0], 0x81..=0x9F | 0xE0..=0xFC);
+    let standard_trail = matches!(pair[1], 0x40..=0x7E | 0x80..=0xFC);
+    let tunnel_trail = (0x01..=0x3F).contains(&pair[1])
+        && !matches!(pair[1], 0x09 | 0x0A | 0x0D | 0x20 | 0x2C);
+    lead && (standard_trail || tunnel_trail)
+}
+
+fn digest_pairs(map: &BTreeMap<[u8; 2], char>) -> u64 {
+    let mut bytes = Vec::with_capacity(map.len() * 6);
+    for (pair, ch) in map {
+        bytes.extend_from_slice(pair);
+        let mut buf = [0u8; 4];
+        bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    }
+    fnv1a64(&bytes)
+}
+
 /// 隧道码点分配算法(逐字复刻 `YU-RIS-TOOLS/internal/ybn/tunnel.go`)。
 #[must_use]
 pub fn idx_to_code_point(idx: usize) -> [u8; 2] {
@@ -372,6 +451,42 @@ mod tests {
         let table = TunnelTable::from_bytes(&utf16le(&['中', '𠀀'])).unwrap();
         assert_eq!(table.len(), 2);
         assert_eq!(table.chars(), &['中', '𠀀']);
+    }
+
+    #[test]
+    fn tunnel_from_pairs_roundtrips_encode() {
+        let pairs = [([0xF0, 0x40], '中'), ([0xF0, 0x41], '文')];
+        let table = TunnelTable::from_pairs(pairs).unwrap();
+        assert_eq!(table.encode_char('中'), Some([0xF0, 0x40]));
+        assert_eq!(table.encode_char('文'), Some([0xF0, 0x41]));
+        assert_eq!(table.char_for([0xF0, 0x41]), Some('文'));
+        assert_eq!(table.pairs().count(), 2);
+        let codec = TextCodec::with_tunnel(Codec::Cp932, &table);
+        assert_eq!(codec.decode_lossy(&[0xF0, 0x40]), (vec!['中'], 0));
+    }
+
+    #[test]
+    fn tunnel_from_pairs_rejects_bad_and_duplicate_pairs() {
+        assert!(TunnelTable::from_pairs([([0x20, 0x40], '中')]).is_err());
+        assert!(
+            TunnelTable::from_pairs([([0xF0, 0x40], '中'), ([0xF0, 0x40], '文')]).is_err()
+        );
+    }
+
+    #[test]
+    fn tunnel_from_pairs_accepts_official_low_trail() {
+        let pair = idx_to_code_point(0);
+        let table = TunnelTable::from_pairs([(pair, '这')]).unwrap();
+        assert_eq!(table.encode_char('这'), Some(pair));
+        assert_eq!(table.char_for(pair), Some('这'));
+    }
+
+    #[test]
+    fn codec_encode_char_covers_ascii_and_double_byte() {
+        assert_eq!(Codec::Cp932.encode_char('A'), Some(0x41));
+        assert!(Codec::Cp932.encode_char('あ').is_some());
+        assert!(Codec::Gbk.encode_char('中').is_some());
+        assert!(Codec::Gbk.encode_char('𠀀').is_none());
     }
 
     #[test]
