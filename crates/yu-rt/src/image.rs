@@ -80,7 +80,10 @@ fn webp_size(bytes: &[u8]) -> Option<(u32, u32)> {
     } else {
         return None;
     };
-    if w > 0 && h > 0 && w <= yu_format::ycg::MAX_DIMENSION && h <= yu_format::ycg::MAX_DIMENSION {
+    // WebP 规范上限 16383(VP8/VP8L 的 14 位、VP8X 的 24 位);不要复用
+    // YCG 容器的 0x2000 上限——8192 以上的合法 WebP 会退化成"尺寸未知"。
+    const MAX_WEBP_DIMENSION: u32 = 0x3FFF;
+    if w > 0 && h > 0 && w <= MAX_WEBP_DIMENSION && h <= MAX_WEBP_DIMENSION {
         Some((w, h))
     } else {
         None

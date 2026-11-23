@@ -55,20 +55,22 @@ impl Vm {
             // `FUN_00444750`;该函数按当前物理 down 状态钳制(与
             // `InputState::Counter::write` / 0.495 `FUN_00447014` 同型)。
             // ABI 表里没有的按钮族名(`_KEY_ANY` 等)仍保持求值后不写。
-            let (button_family, button_name) = {
+            let button_family = {
                 let name = self
                     .sysvars()
                     .get(lval.var.id)
                     .map(|d| d.name.as_str())
                     .unwrap_or("");
-                (
-                    button_family_rest(name).is_some(),
-                    name.trim_start_matches('_').to_string(),
-                )
+                button_family_rest(name).is_some()
             };
             if button_family {
+                let button_name = self
+                    .sysvars()
+                    .get(lval.var.id)
+                    .map(|d| d.name.trim_start_matches('_').to_string())
+                    .unwrap_or_default();
                 let rhs = self.eval_window(st, &cmd.windows[1])?;
-                let v = rhs.as_int().unwrap_or(0);
+                let v = rhs.to_int_lossy();
                 self.input_state_mut().set_counter(&button_name, v);
                 return Ok(StepOutcome::Continue);
             }
@@ -187,9 +189,9 @@ impl Vm {
                 // 写进 `DAT_008724ac`(不按物理状态钳制)。
                 if name == "_DROPFILE_NUM" {
                     let rhs = self.eval_window(st, &cmd.windows[1])?;
-                    let v = rhs.as_int().unwrap_or(0);
+                    let v = rhs.to_int_lossy();
                     if let Some(state) = self.other.as_mut() {
-                        state.drop_file_num = v as u32;
+                        state.drop_file_num = v as i32;
                     }
                     return Ok(StepOutcome::Continue);
                 }
@@ -264,7 +266,7 @@ impl Vm {
                         core::slice::from_ref(&index)
                     };
                     let rhs = self.eval_window(st, &cmd.windows[1])?;
-                    let rhs = Value::Int(rhs.as_int().unwrap_or(0));
+                    let rhs = Value::Int(rhs.to_int_lossy());
                     let op = (cmd.windows[0].rec.slot >> 8) as u8;
                     let cur = self.store().read(var, write_index).unwrap_or(Value::Int(0));
                     let value = if op == 0 {
@@ -295,6 +297,17 @@ impl Vm {
                         ));
                         return Ok(StepOutcome::Continue);
                     }
+                    if lval.indices.len() > 1 {
+                        self.report(diag::recoverable(
+                            code::rt::SYSVAR_WRITE,
+                            Boundary::Script,
+                            format!(
+                                "_PINT 写入只接受 1 个参数号,得到 {} 个下标",
+                                lval.indices.len()
+                            ),
+                        ));
+                        return Ok(StepOutcome::Continue);
+                    }
                     let idx = (n - 1) as usize;
                     let task = self.current_task().to_string();
                     let frame = self
@@ -312,7 +325,7 @@ impl Vm {
                     };
                     let cur = frame.args_int[idx].clone().unwrap_or(Value::Int(0));
                     let rhs = self.eval_window(st, &cmd.windows[1])?;
-                    let rhs = Value::Int(rhs.as_int().unwrap_or(0));
+                    let rhs = Value::Int(rhs.to_int_lossy());
                     let op = (cmd.windows[0].rec.slot >> 8) as u8;
                     let value = if op == 0 {
                         rhs
@@ -351,18 +364,6 @@ impl Vm {
             .into());
         }
         let rhs = self.eval_window(st, &cmd.windows[1])?;
-        if std::env::var_os("YU_MACRO_TRACE").is_some()
-            && matches!(lval.var.id, 0x0bf7 | 0x0bf8 | 0x0bf9 | 0x0bfa)
-        {
-            eprintln!(
-                "[let] {}{:?} = {:?} (s{} pc{})",
-                lval.var.display(),
-                lval.indices,
-                rhs,
-                st.script_id,
-                st.pc
-            );
-        }
         let code = (cmd.windows[0].rec.slot >> 8) as u8;
         if code == 0 {
             // RHS 已是 owned:串槽赋值直接搬字节(#80)。
@@ -371,30 +372,6 @@ impl Vm {
             let cur = self.read_lvalue(&lval)?;
             let value = compound(code, &cur, &rhs)?;
             self.store.write(lval.var, &lval.indices, &value)?;
-        }
-        // 临时取证(`YU_SLOT_TRACE=5709,5710,...`):逐次打印指定变量槽的
-        // LET 写入**最终值**(复合赋值后的结果)。诊断完删除。
-        if let Some(slots) = slot_trace_filter() {
-            if slots.contains(&lval.var.id) {
-                let after = self
-                    .store
-                    .read(lval.var, &lval.indices)
-                    .unwrap_or(Value::Int(i64::MIN));
-                let repr = match &after {
-                    Value::Str(b) => {
-                        format!("str len={} head={:02x?}", b.len(), &b[..b.len().min(24)])
-                    }
-                    other => format!("{other:?}"),
-                };
-                eprintln!(
-                    "[slot] {} {:?} = {} (s{} pc{})",
-                    lval.var.display(),
-                    lval.indices,
-                    repr,
-                    st.script_id,
-                    st.pc
-                );
-            }
         }
         Ok(StepOutcome::Continue)
     }
@@ -458,22 +435,6 @@ impl Vm {
         let decl_target = target_var(&cmd.windows[0])?;
         self.store
             .reset_declared(decl_target, ty, &dims, &init);
-        // 临时取证(`YU_SLOT_TRACE`):INT 声明的初始值轨迹(3DAYS 排查)。
-        if let Some(slots) = slot_trace_filter() {
-            if slots.contains(&decl_target.id) {
-                let after = self
-                    .store
-                    .read(decl_target, &[])
-                    .unwrap_or(Value::Int(i64::MIN));
-                eprintln!(
-                    "[decl] {} = {:?} (s{} pc{})",
-                    decl_target.display(),
-                    after,
-                    st.script_id,
-                    st.pc
-                );
-            }
-        }
         Ok(StepOutcome::Continue)
     }
 
@@ -2123,24 +2084,4 @@ impl Vm {
         }
         Ok(())
     }
-}
-
-/// `YU_SLOT_TRACE=id1,id2,...`(临时诊断):要跟踪 LET 写入的变量槽集合。
-///
-/// 惰性解析一次;未设/空 ⇒ `None`。取证用,不作语义。
-fn slot_trace_filter() -> Option<&'static rustc_hash::FxHashSet<u16>> {
-    static FILTER: std::sync::OnceLock<Option<rustc_hash::FxHashSet<u16>>> =
-        std::sync::OnceLock::new();
-    FILTER
-        .get_or_init(|| {
-            let raw = std::env::var("YU_SLOT_TRACE").ok()?;
-            let mut set = rustc_hash::FxHashSet::default();
-            for part in raw.split(',') {
-                if let Ok(v) = part.trim().parse::<u16>() {
-                    set.insert(v);
-                }
-            }
-            (!set.is_empty()).then_some(set)
-        })
-        .as_ref()
 }

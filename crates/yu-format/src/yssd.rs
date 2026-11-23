@@ -26,8 +26,8 @@
 //!   `YSSnp.dll`)。读侧按实际流分流,写侧按 [`BlockCodec`] 选;
 //! - `btype 2`(多变量):**外层裸多子块流、内层子块各自压缩**
 //!   (见 [`parse_multi_payload`]),外层不当压缩流解;
-//! - `DNO=1024`:嵌套容器槽 = `u32 inner_len | u32 len_b | zlib(内层 YSSD)`,
-//!   不是普通单层块(见 `docs/divergences/DIV-RT-056`)。
+//! - `DNO=1024`:`SAVE[MEM=99999]` 的 500 槽内存包(12 字节块头 + 500 条
+//!   `raw_len|comp_len|zlib`),不是普通单层块(见 `DIV-RT-056/075`)。
 //!
 //! 净室声明:实现为本仓库新写;flate2(双后端下 C zlib 优先)用于保证
 //! `compress2(level=1)` 逐字节复现。
@@ -489,11 +489,11 @@ impl BlockCodec {
     /// (解码始终先试 zlib 再试 snappy)。
     ///
     /// 只有**单层压缩流**的块才能判定:`btype 2` 的载荷是外层裸多子块流、
-    /// `DNO=1024` 是嵌套容器(`u32 | u32 | zlib`),两者都不该拿去做 RFC1950
-    /// 头校验 —— 那会把 zlib 存档误判成 Snappy。这两种形态返回 `None`。
+    /// `DNO=1024` 是 500 条槽表,两者都不该拿去做 RFC1950 头校验 ——
+    /// 那会把 zlib 存档误判成 Snappy。这两种形态返回 `None`。
     #[must_use]
     pub fn detect(entry: &YssdEntry) -> Option<Self> {
-        if entry.dno == NESTED_CONTAINER_DNO || entry.btype > 1 {
+        if entry.dno == MEM_PACK_DNO || entry.btype > 1 {
             return None;
         }
         Some(if looks_like_zlib(&entry.compressed) {
@@ -504,9 +504,9 @@ impl BlockCodec {
     }
 }
 
-/// `DNO=1024` 是嵌套容器槽(`u32 inner_len | u32 len_b | zlib(内层 YSSD)`),
-/// 不是普通单层块;见 `docs/divergences/DIV-RT-056`。
-pub const NESTED_CONTAINER_DNO: u32 = 1024;
+/// `DNO=1024` 是 `SAVE[MEM=99999]` 的 500 槽内存包(见 `DIV-RT-056/075`),
+/// 不是普通单层块。
+pub const MEM_PACK_DNO: u32 = 1024;
 
 /// RFC1950 头:CMF 低 4 位 = 8(deflate),且 `(CMF<<8 | FLG) % 31 == 0`。
 fn looks_like_zlib(src: &[u8]) -> bool {

@@ -811,7 +811,8 @@ impl Vm {
     ) -> Result<Self, Diag> {
         let mut tables = TableSet::load_from(src.as_ref(), aux.as_deref(), cfg.script_key)?;
         let semantics = crate::semantics::SemanticProfile::from_boot(&tables.boot);
-        let handler_of = crate::vm::handlers::build_handler_table(&tables.boot.yscm);
+        let handler_of =
+            crate::vm::handlers::build_handler_table(&tables.boot.yscm, &semantics);
         let param_plans = build_param_plans(&tables.boot.yscm);
 
         // 入口标签(引擎 `FUN_00451e90` 按名字查 ysl;strcmp 字节级)。
@@ -3168,12 +3169,6 @@ impl VarAccess for VmAccess<'_> {
         } else {
             self.vm.store.read(var, indices)?
         };
-        if std::env::var_os("YU_MACRO_TRACE").is_some() && var.id == 0x0499 {
-            eprintln!(
-                "[read1177] indices={indices:?} partial={} -> {:?}",
-                self.vm.store.partial_index, value
-            );
-        }
         if dollar_at {
             Ok(Value::Str(value.to_event_repr().into_bytes()))
         } else {
@@ -3376,19 +3371,6 @@ impl Vm {
         // (取指缓存已有),不逐条复制字符串;任务名只在任务切换时重写。
         self.cur_script = st.script_id;
         self.cur_pc = cmd.pc;
-        if std::env::var_os("YU_PC_TRACE").is_some()
-            && st.script_id == 65
-            && (150..=185).contains(&cmd.pc)
-        {
-            let name = self
-                .tables
-                .boot
-                .yscm
-                .command(cmd.opcode)
-                .map(|c| c.name.as_str())
-                .unwrap_or("?");
-            eprintln!("[pc65] pc={} op={} cmd={name}", cmd.pc, cmd.opcode);
-        }
         if self.cur_task_seq != task.seq {
             self.cur_task_seq = task.seq;
             self.cur_task.clear();

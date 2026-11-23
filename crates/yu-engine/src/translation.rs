@@ -69,6 +69,7 @@ impl TranslationReport {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PendingTarget {
     Word {
         script_id: u32,
@@ -141,6 +142,25 @@ pub fn load(
     // 多语 translate.json 可能含 base/cn/tw 三套同坐标条目:让与当前
     // 显示 codec 一致(或无 codec 字段)的条目排在最后,后写覆盖前写。
     pending.sort_by_key(|entry| u8::from(entry.codec.is_none() || entry.codec == Some(codec)));
+    // 先按坐标去重,只编码/分配隧道给最终生效的条目。否则被覆盖的旧
+    // codec 条目只要含目标 codec 表外字符,就会把整份翻译打挂(它根本
+    // 不会生效),还会污染 sjis_ext。
+    let before = pending.len();
+    let mut winners: Vec<Pending> = Vec::with_capacity(pending.len());
+    let mut seen: BTreeSet<PendingTarget> = BTreeSet::new();
+    for entry in pending.drain(..).rev() {
+        if seen.insert(entry.target.clone()) {
+            winners.push(entry);
+        }
+    }
+    winners.reverse();
+    let pending = winners;
+    if pending.len() != before {
+        report.warnings.push(format!(
+            "translate.json 有 {} 条同坐标条目被覆盖,只编码最终生效项",
+            before - pending.len()
+        ));
+    }
     let mut chars: BTreeSet<char> = BTreeSet::new();
     for entry in &pending {
         for ch in entry.text.chars() {

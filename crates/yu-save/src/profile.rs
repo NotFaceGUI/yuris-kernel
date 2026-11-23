@@ -95,7 +95,7 @@ pub fn profile_for(version: u32) -> Option<SaveProfile> {
             btype0_var_id: Btype0VarId::Actual,
             scriptpos: WIRE_GOSUB_U8,
         }),
-        // 商业 0.49x 的变体(光翼戦姫样本);布局同 0x1E0 族。
+        // 商业 0.49x 的变体(`<v49x-x>` 样本);布局同 0x1E0 族。
         0x01E6 => Some(SaveProfile {
             image_layout: Some(image_block::LAYOUT_0495),
             btype0_var_id: Btype0VarId::Actual,

@@ -1166,6 +1166,8 @@ fn save_load_loop_records_reserve_flush_and_writes_back() {
 #[test]
 fn load_file_dno_1024_uses_the_mem_pack_host() {
     let mut b = ProjectBuilder::new();
+    // 500 槽文件分支只对 v555 有取证;0.495 的 1024 仍是普通块。
+    b.ysc_version = 555;
     let op_load = b.commands.iter().position(|(n, _)| *n == "LOAD").unwrap() as u8;
     b.scripts = vec![vec![
         GroupSpec::new(op_load)
@@ -1191,6 +1193,38 @@ fn load_file_dno_1024_uses_the_mem_pack_host() {
     );
     assert!(rec.loads.is_empty(), "不得落到通用单块 load_block");
     assert!(rec.mem_loads.is_empty(), "不得当作内存槽");
+}
+
+/// 0.495:`LOAD[FILE DNO=1024]` 仍是普通块,不得被 v555 内存包分支劫持。
+#[test]
+fn load_file_dno_1024_stays_plain_block_on_legacy() {
+    let mut b = ProjectBuilder::new();
+    let op_load = b.commands.iter().position(|(n, _)| *n == "LOAD").unwrap() as u8;
+    b.scripts = vec![vec![
+        GroupSpec::new(op_load)
+            .window(0, ex::s("save70000.sd"))
+            .window(1, ex::i32_(1024)),
+        GroupSpec::new(OP_END),
+    ]];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let recorder = SaveRecorder::new();
+    let mut vm = boot(b);
+    vm.set_save_host(Box::new(SharedHost {
+        inner: recorder.clone(),
+        reply: std::rc::Rc::new(std::cell::RefCell::new(None)),
+    }));
+    let _ = vm.tick_at(0, &no_input());
+    let rec = recorder.borrow();
+    assert!(
+        rec.mem_pack_loads.is_empty(),
+        "0.495 不得走 500 槽内存包分支"
+    );
+    assert_eq!(
+        rec.loads,
+        vec![("save70000.sd".to_string(), 1024)],
+        "0.495 必须走通用单块 load_block"
+    );
 }
 
 /// `SAVE[DNO SET=@x[i][j]]`:块内容 = 该下标处的**标量元素**,不是整组。

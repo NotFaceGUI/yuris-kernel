@@ -856,6 +856,16 @@ impl Vm {
                 return Ok(StepOutcome::Continue);
             }
             let dno = dno as u32;
+            // v555 的文件 DNO=1024 归 `SAVE[MEM=99999]` 内存包所有;普通块
+            // 预约会与内存包静默同 DNO 覆盖。旧版 1024 仍是合法普通块。
+            if mem.is_none() && dno == 1024 && self.semantics().save_mem_pack {
+                self.report(diag::recoverable(
+                    code::rt::CMD_SLOT,
+                    Boundary::Script,
+                    "SAVE DNO=1024 保留给 SAVE[MEM=99999] 的 500 槽内存包;普通块预约被拒绝",
+                ));
+                return Ok(StepOutcome::Continue);
+            }
             if layer_id {
                 // `SAVE[ID IDNO]` = 图层快照(块类型 1)。官方在命令处理器里
                 // 直接读图层表面(REA `0x4477c0` 读取端);`IDNO` 在场时先把
@@ -1239,7 +1249,7 @@ impl Vm {
         // v555 `LOAD[FILE DNO=1024]` 是**文件分支的独立形态**:官方
         // `0x4447c8` 读到 DNO=1024 后跳 `FUN_004453f4`,按 12 字节头 +
         // 500 槽打包格式恢复内存槽,并忽略 `LET`。不能落到通用单块读取。
-        if mem_slot.is_none() && dno == 1024 {
+        if self.semantics().save_mem_pack && mem_slot.is_none() && dno == 1024 {
             let Some(file) = file.as_deref() else {
                 self.report(diag::recoverable(
                     code::rt::CMD_SLOT,

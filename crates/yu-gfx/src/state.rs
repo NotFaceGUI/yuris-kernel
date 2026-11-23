@@ -965,34 +965,6 @@ impl GfxState {
     /// 世代变化时重置。`TEXT[CLEAR]` 不经过这里(它只清 VM 待显示缓冲)。
     pub fn apply_text_frame(&mut self, frame: &yu_rt::text::TextFrame) {
         self.invalidate_frame();
-        // 文本取证:自动文本路径(`TextFrame` → `text_surface.glyphs`),
-        // 与 `CGACT[TEXT]` 的 `text_draws` 是两条独立路径。
-        if std::env::var_os("YU_TEXT_CLEAR_TRACE").is_some() {
-            let glyphs = frame
-                .steps
-                .iter()
-                .filter(|s| matches!(s, yu_rt::text::TextStep::Glyph(_)))
-                .count();
-            let pageclears = frame
-                .steps
-                .iter()
-                .filter(|s| matches!(s, yu_rt::text::TextStep::PageClear))
-                .count();
-            let surface = self.text_surface.glyphs.len();
-            if pageclears > 0 || glyphs > 0 || surface > 0 {
-                eprintln!(
-                    "[text-frame] f={} layer={:?} first={} total={} steps={} glyphs={} pageclears={} surface_before={}",
-                    self.frame,
-                    String::from_utf8_lossy(&frame.layer_id),
-                    frame.first_step,
-                    frame.total_steps,
-                    frame.steps.len(),
-                    glyphs,
-                    pageclears,
-                    surface
-                );
-            }
-        }
         let id = text_layer_path(&frame.layer_id);
         let changed = self.text_surface.layer.as_ref() != Some(&id)
             || self.text_surface.page_seq != frame.page_clear_seq;
@@ -1075,18 +1047,6 @@ impl GfxState {
     /// 手动模式官方不自动绘制;引擎每 tick 用它把 `VmEvent::Text` 的
     /// 事件镜像收口,避免 ERIS 长篇正文把镜像撑成无界累积。
     pub fn clear_text_pending(&mut self) {
-        if std::env::var_os("YU_TEXT_CLEAR_TRACE").is_some() {
-            if let Some(p) = &self.text_pending {
-                if !p.bytes.is_empty() {
-                    eprintln!(
-                        "[text-pending-clear] f={} bytes={:?} cmd={}",
-                        self.frame,
-                        String::from_utf8_lossy(&p.bytes),
-                        &*self.cur_call_cmd
-                    );
-                }
-            }
-        }
         self.invalidate_frame();
         self.text_pending = None;
     }
@@ -1194,15 +1154,6 @@ impl GfxState {
                 pending.flags = None;
                 pending.style = self.style.clone();
                 pending.frame = *frame;
-                if std::env::var_os("YU_TEXT_CLEAR_TRACE").is_some() {
-                    eprintln!(
-                        "[text-event] f={} id={:?} bytes={:?} pending_now={:?}",
-                        self.frame,
-                        String::from_utf8_lossy(id),
-                        String::from_utf8_lossy(bytes),
-                        String::from_utf8_lossy(&pending.bytes)
-                    );
-                }
             }
             VmEvent::DomainCall {
                 frame,
@@ -2341,21 +2292,7 @@ impl GfxState {
                 }
                 _ => Vec::new(),
             }),
-            "SX" | "SY" => {
-                let value = self.query_layer_size(layer, flag == "SX")?;
-                if let Some(since) = trace_start_frame("YU_CGINFO_TRACE") {
-                    if self.frame >= since {
-                        eprintln!(
-                            "[cginfo] f={} id={} flag={} -> {}",
-                            self.frame,
-                            parsed.path.display(),
-                            flag,
-                            value
-                        );
-                    }
-                }
-                Value::Int(value)
-            }
+            "SX" | "SY" => Value::Int(self.query_layer_size(layer, flag == "SX")?),
             // `TEX` = **图层种类码**(REA CGINFO `0x43d962`:
             // `movsx ecx, byte [层+0xa4]`):1 = 图像层,2 = 图层组,0 = 已删。
             // 它不是 `CG[TEX=]` 的写入值回读;`CG[TEX=1]` 在官方是“把空层
@@ -3728,31 +3665,6 @@ impl GfxState {
         };
         let mut file_diags = Vec::new();
         let mut file = take_file(&params, &mut file_diags);
-        // 临时取证:`YU_CG_TRACE=<起始帧>`(值为 0/1 = 全量)逐次打印每条
-        // CG(不去重、含 FILE="")。取证完删除。
-        if let Some(since) = trace_start_frame("YU_CG_TRACE") {
-            if self.frame >= since {
-                let key = match &file {
-                    Some(TextureRef::Asset(k)) => String::from_utf8_lossy(k).into_owned(),
-                    Some(TextureRef::SolidBlack1x1) => "<solid1x1>".into(),
-                    None => "<none>".into(),
-                    _ => "<other>".into(),
-                };
-                eprintln!(
-                    "[cg] f={} id=`{}` file=`{}` at={} params={:?}",
-                    self.frame,
-                    String::from_utf8_lossy(&id),
-                    key,
-                    self.cur_call
-                        .map(|(s, p)| format!("s{s}@{p}"))
-                        .unwrap_or_else(|| "?-@?".into()),
-                    params
-                        .iter()
-                        .map(|(n, v, _)| format!("{n}={v:?}"))
-                        .collect::<Vec<_>>()
-                );
-            }
-        }
         // 取证:`YU_CG_FILE_TRACE=1` 记录每条 `CG[FILE]` 的 ID/键
         // (诊断按 detail 去重;只留唯一 ID/key 组合)。
         if std::env::var_os("YU_CG_FILE_TRACE").is_some() {
@@ -4177,19 +4089,6 @@ impl GfxState {
             return;
         };
         let parsed = path::normalize(&id, idno, id.ends_with(b"/"));
-        // 临时取证(v555 正文逐字消失):`YU_CGEND_TRACE=1` 逐次打印每条
-        // CGEND(含幂等空操作),f>=900。取证完删除。
-        if self.frame >= 900 && std::env::var_os("YU_CGEND_TRACE").is_some() {
-            eprintln!(
-                "[cgend] f={} id=`{}` exists={} at={}",
-                self.frame,
-                parsed.path.display(),
-                self.nodes.contains_key(&parsed.path),
-                self.cur_call
-                    .map(|(s, p)| format!("s{s}@{p}"))
-                    .unwrap_or_else(|| "?-@?".into())
-            );
-        }
         if path::is_root(&parsed.path) {
             self.push_diag(
                 "CGEND",
@@ -4300,22 +4199,6 @@ impl GfxState {
             return;
         };
         let dest = paths[1].clone().unwrap_or_else(|| source.clone());
-        // 取证:`CGACT` 的参数名/值。`YU_CGACT_TRACE=<起始帧>`(0/1 = 全量),
-        // 不设条数上限;启动期 f1..8 的 COPY2/RECTPAINT 由帧号过滤。
-        if let Some(since) = trace_start_frame("YU_CGACT_TRACE") {
-            if self.frame >= since {
-                eprintln!(
-                    "[cgact-args] f={} id={} id2={} params={:?}",
-                    self.frame,
-                    source.display(),
-                    dest.display(),
-                    params
-                        .iter()
-                        .map(|(n, v, _)| format!("{n}={v:?}"))
-                        .collect::<Vec<_>>()
-                );
-            }
-        }
         // `ID/ID2/ID3/ID4` 在引擎里是**四个并列的图层引用**:命令处理器对
         // 每个存在的 ID 做「拷 ID 到缓冲 + 若有同名 `IDNO` 则 `__itoa`
         // 追加十进制」(`0x42c4ed`/`0x42c622`/`0x42c6df`/`0x42c798`),
@@ -5172,15 +5055,6 @@ impl GfxState {
         y: Option<f64>,
         bno: Option<i64>,
     ) {
-        if std::env::var_os("YU_TEXT_CLEAR_TRACE").is_some() {
-            eprintln!(
-                "[cgact-text] f={} target={} exists={} setstr={:?} x={x:?} y={y:?}",
-                self.frame,
-                target.display(),
-                self.nodes.contains_key(target),
-                set_str.as_deref().map(|b| String::from_utf8_lossy(b).into_owned())
-            );
-        }
         if !self.nodes.contains_key(target) {
             self.push_diag(
                 "CGACT",
@@ -5224,14 +5098,6 @@ impl GfxState {
         // `SETSTR` 常常由系统脚本 `es_Text` 转发 `$_TEXT` 的字节;来源
         // codec 已由 `VmEvent::Text` 登记,不能按绘制脚本猜。
         let codec = self.payload_codec(&bytes);
-        if std::env::var_os("YU_TEXT_CLEAR_TRACE").is_some() {
-            eprintln!(
-                "[text-draw] f={} target={} bytes={:?}",
-                self.frame,
-                target.display(),
-                String::from_utf8_lossy(&bytes)
-            );
-        }
         let draw = TextDraw {
             target: target.clone(),
             bytes,
@@ -5280,9 +5146,9 @@ impl GfxState {
     /// `COPY2` 抠格形态的外字链候选(v555 多语言字形页;取证见
     /// [`GlyphChain`] 注释)。不满足数据流条件返回 `None`:
     /// - 源 = 单资产层(整页字形图),区域四坐标齐全且为正;
-    /// - 单元 = 区域含端点宽度/高度(`EVID-T-11/T-12`),各 1..=128px
-    ///   (实测 `fnt_s20` 单元 30×30;精灵切片 ≥ 屏幕尺寸数量级,不命中);
-    /// - 目标 = 显式尺寸 ≤256 的小暂存层,纹理为空(`FILE=""`/未物化)
+    /// - 单元 = 区域含端点宽度/高度(`EVID-T-11/T-12`),各 1..=512px
+    ///   (实测 `fnt_s20` 单元 30×30;上限只防异常值,按屏幕量级留余量);
+    /// - 目标 = 显式尺寸 ≤4096 的暂存层,纹理为空(`FILE=""`/未物化)
     ///   或本就是抠格快照(同暂存层重复抠格)。
     fn glyph_cell_candidate(
         &self,
@@ -5293,18 +5159,7 @@ impl GfxState {
         x2: Option<f64>,
         y2: Option<f64>,
     ) -> Option<GlyphChain> {
-        let trace = std::env::var_os("YU_GLYPH_TRACE").is_some();
-        let reject = |why: &str| {
-            if trace {
-                eprintln!(
-                    "[glyph-gate] f={} {} -> {} reject: {why}",
-                    self.frame,
-                    source.display(),
-                    dest.display()
-                );
-            }
-            None::<GlyphChain>
-        };
+        let reject = |_why: &str| None::<GlyphChain>;
         if source == dest {
             return reject("source==dest");
         }
@@ -5314,8 +5169,8 @@ impl GfxState {
         let (cx, cy) = (x.round() as i64, y.round() as i64);
         // 区域含端点:`w = X2-X+1`(与 `snapshot_region_display` 同口径)。
         let (cw, ch) = (x2.round() as i64 - cx + 1, y2.round() as i64 - cy + 1);
-        if cx < 0 || cy < 0 || !(1..=128).contains(&cw) || !(1..=128).contains(&ch) {
-            return reject("cell size out of 1..=128");
+        if cx < 0 || cy < 0 || !(1..=512).contains(&cw) || !(1..=512).contains(&ch) {
+            return reject("cell size out of 1..=512");
         }
         let asset = match self.nodes.get(source).map(|n| &n.layer.texture) {
             Some(TextureRef::Asset(key)) => key.clone(),
@@ -5333,9 +5188,9 @@ impl GfxState {
             || dest_node
                 .layer
                 .image_size()
-                .is_some_and(|s| s.width <= 256 && s.height <= 256);
+                .is_some_and(|s| s.width <= 4096 && s.height <= 4096);
         if !small {
-            return reject("dest size >256 or unknown");
+            return reject("dest size >4096 or unknown");
         }
         // 首次识别要求暂存层是真空层(`CG[FILE=""]`/未物化)。之后的重复
         // 抠格不再看纹理:上一轮 `COPY2` 已把暂存层纹理改成继承自字形页的
@@ -5389,7 +5244,8 @@ impl GfxState {
             let Some((w, h)) = sx.zip(sy) else {
                 return false;
             };
-            if !(w > 0.0 && h > 0.0 && w <= 256.0 && h <= 256.0) {
+            // 暂存层/字形页尺寸上限,只防异常值(实测暂存 80×80)。
+            if !(w > 0.0 && h > 0.0 && w <= 4096.0 && h <= 4096.0) {
                 return false;
             }
             let Some(src) = self.nodes.get(source) else {
@@ -5461,28 +5317,6 @@ impl GfxState {
             if let Some(image) = &draw.image {
                 // 临时取证(v555 字形山排查):`YU_GLYPH_TRACE=1` 逐次打印
                 // 降级绘制项(资产/单元/落点/页尺寸)。取证完删除。
-                if std::env::var_os("YU_GLYPH_TRACE").is_some() {
-                    let sheet = image
-                        .asset
-                        .as_slice()
-                        .try_into()
-                        .ok()
-                        .and_then(|k: &[u8]| self.asset_sizes.get(k).copied());
-                    eprintln!(
-                        "[glyph] f={} {} -> {} asset={} cell={:?} draw={}x{} tint={:?} at ({},{}) sheet={:?}",
-                        self.frame,
-                        source.display(),
-                        t.display(),
-                        String::from_utf8_lossy(&image.asset),
-                        image.cell,
-                        image.width,
-                        image.height,
-                        image.tint,
-                        draw.x,
-                        draw.y,
-                        sheet
-                    );
-                }
                 self.push_diag(
                     "CGACT",
                     error::verbose(
@@ -6136,29 +5970,6 @@ impl GfxState {
     /// 层像素被重写:清空该层文本内容并发全局新修订号(后端缓存随之失效)。
     /// 不删条目 —— 删除后重建会让修订号从头开始,和旧缓存撞键。
     fn clear_layer_texts(&mut self, id: &LayerId) {
-        // 文本取证(`YU_TEXT_TRACE` 之外的最轻探针):谁在清哪一层的文本。
-        if std::env::var_os("YU_TEXT_CLEAR_TRACE").is_some() {
-            if let Some(texts) = self.text_draws.get(id) {
-                if !texts.draws.is_empty() {
-                    eprintln!(
-                        "[text-clear] f={} layer={} draws={} cmd={}",
-                        self.frame,
-                        id.display(),
-                        texts.draws.len(),
-                        &*self.cur_call_cmd
-                    );
-                }
-            }
-            if self.text_surface.layer.as_ref() == Some(id) && !self.text_surface.glyphs.is_empty() {
-                eprintln!(
-                    "[text-surface-clear] f={} layer={} glyphs={} cmd={}",
-                    self.frame,
-                    id.display(),
-                    self.text_surface.glyphs.len(),
-                    &*self.cur_call_cmd
-                );
-            }
-        }
         // 自动文本的已提交字形也是层表面像素:层被重写时必须一起清。
         if self.text_surface.layer.as_ref() == Some(id) {
             self.text_surface.glyphs.clear();
@@ -7036,11 +6847,11 @@ impl GfxState {
 
     /// 配对层的**基图**(引擎 `YS_Texture2 = 层+0x21c`)。
     ///
-    /// 官方转场取样的是基图,不是 `CGACT` 加工表面(`+0x90`)——遮罩缓冲的
-    /// `REVERSE` 等加工只影响显示,不参与转场。配对层自己是 `FILE=""` 空壳、
-    /// 图案由 `CGACT[ID=$TRBUF ID2=$TR1 SIZE=1]` 做进表面时,基图取自该
-    /// SIZE 命令的 `source_texture`(图案资产本体)。没有基图时返回 `None`,
-    /// 由后端回退加工表面。
+    /// 官方转场取样的是基图,不是 `CGACT` 加工表面(`+0x90`)。配对层自己是
+    /// `FILE=""` 空壳、图案由 `CGACT[ID=$TRBUF ID2=$TR1 SIZE=1]` 做进表面时,
+    /// 基图取自该 SIZE 命令的 `source_texture`(图案资产本体);配对层自身与
+    /// 源层的 `REVERSE`/镜像算子都参与采样(engine frame 762)。没有基图时
+    /// 返回 `None`,由后端回退加工表面。
     fn transition_mask_base(&self, tid: &LayerId, cache: &mut ProbeCache) -> Option<TextureRef> {
         if let Some(hit) = cache.mask_base.get(tid) {
             return hit.clone();
@@ -7104,8 +6915,9 @@ impl GfxState {
                 }
             }
         };
+        // 配对层自身的 REVERSE/镜像与 SIZE 源层的算子都参与采样(3e67e11
+        // 逐帧证据);其它改像素的加工不猜。
         apply(tid, &mut transform);
-        // 配对层是空壳、mask 由 SIZE 从缓冲层做进表面时,变换来自源层。
         if let Some(op) = self.image_log.iter().rev().find(|op| {
             op.target.as_ref() == Some(tid)
                 && op.status == OpStatus::Executable
@@ -7577,38 +7389,6 @@ impl GfxState {
 
 // ---------------------------------------------------------------- 参数应用
 
-/// 诊断环境变量的起始帧:`None` = 未启用;值解析失败或 0/1 = 从 1 开始。
-///
-/// `YU_CG_TRACE` / `YU_CGACT_TRACE` / `YU_CGINFO_TRACE` 用:交互取证时
-/// 可直接给 `1` 抓全量,给 `600` 只抓正文阶段,避免启动期刷屏。
-///
-/// 结果**缓存一次**:`CGINFO[SX/SY]` 是单帧上万次的热路径,不能每次都
-/// 查环境。
-fn trace_start_frame(var: &str) -> Option<u64> {
-    use std::sync::OnceLock;
-    static CG: OnceLock<Option<u64>> = OnceLock::new();
-    static CGACT: OnceLock<Option<u64>> = OnceLock::new();
-    static CGINFO: OnceLock<Option<u64>> = OnceLock::new();
-    let cell = match var {
-        "YU_CG_TRACE" => &CG,
-        "YU_CGACT_TRACE" => &CGACT,
-        "YU_CGINFO_TRACE" => &CGINFO,
-        _ => return parse_trace_start(var),
-    };
-    *cell.get_or_init(|| parse_trace_start(var))
-}
-
-fn parse_trace_start(var: &str) -> Option<u64> {
-    std::env::var(var).ok().map(|v| {
-        let n: u64 = v.parse().unwrap_or(0);
-        if n <= 1 {
-            1
-        } else {
-            n
-        }
-    })
-}
-
 fn viewport_to_size(v: Viewport) -> SizeU32 {
     SizeU32 {
         width: v.width,
@@ -7764,11 +7544,6 @@ fn take_file(
     for (name, value, _offset) in params {
         if &**name != "FILE" {
             continue;
-        }
-        if std::env::var_os("YU_CG_FILE_TRACE").is_some() {
-            if let EngineValue::Str(b) = value {
-                eprintln!("[cgfile] {}", String::from_utf8_lossy(b));
-            }
         }
         return match value {
             EngineValue::Str(b) if b.is_empty() => Some(TextureRef::SolidBlack1x1),

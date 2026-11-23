@@ -2089,7 +2089,9 @@ pub fn export_text_to_paths(
     let options = ExportOptions {
         text_codec,
         script_key,
-        include_literals: format == ExportFormat::Csv,
+        // translate.json 与 CLI 一致包含 literals(按钮/菜单/对话框);
+        // 之前按 CSV 判定会让安卓产物缺 UI 字面量,与桌面不可互换。
+        include_literals: true,
         format,
         runtime_characters: false,
         runtime_ticks: 600,

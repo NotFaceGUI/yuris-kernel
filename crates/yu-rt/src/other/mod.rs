@@ -1,5 +1,5 @@
-//! 独立商业分支运行面(中性目录名 `other`;只在精确 `yscm.version == 555`
-//! 安装)。
+//! 独立商业分支运行面(中性目录名 `other`;只在 `SemanticProfile::is_v555()`
+//! 为真时安装)。
 //!
 //! 共享 `yu-rt` 只保留通用 VM 核与旧版 handler;本模块承载 555 商业分支的
 //! 命令、系统变量、剧本/启动编排。旧版不安装,行为保持 `c1549eb`。
@@ -19,7 +19,10 @@ use yu_log::Diag;
 pub(crate) struct State {
     pub(crate) drop_files: Vec<Vec<u8>>,
     /// `_DROPFILE_NUM` 的脚本可写镜像(官方 v555 `DAT_008724ac`)。
-    pub(crate) drop_file_num: u32,
+    ///
+    /// 用 i32 保留负数(`LET @_DROPFILE_NUM=-1` 不应静默变 4294967295);
+    /// 官方宽度/符号未逐位取证,读写两侧共用本字段。
+    pub(crate) drop_file_num: i32,
     pub(crate) last_text_lines: usize,
     pub(crate) gosub_frames: std::collections::BTreeMap<String, Vec<gosub::GosubFrame>>,
     /// 已执行装载期静态声明的脚本(避免重复 reset)。

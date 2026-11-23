@@ -1549,10 +1549,7 @@ impl Engine {
         if let Some(vm) = self.vm.as_mut() {
             vm.set_live_clock(None);
         }
-        let result = self.tick_inner(now_ms, 0);
-        self.probe_skip_csel();
-        self.trace_csel_state();
-        result
+        self.tick_inner(now_ms, 0)
     }
 
     /// 实时推进（`serve`/桌面用）：逻辑时钟按**真实墙钟**走，声音状态与
@@ -1588,10 +1585,7 @@ impl Engine {
         if let Some(vm) = self.vm.as_mut() {
             vm.set_live_clock(Some(HostClock::new(now, now_ms)));
         }
-        let result = self.tick_inner(now_ms, delta_ms);
-        self.probe_skip_csel();
-        self.trace_csel_state();
-        result
+        self.tick_inner(now_ms, delta_ms)
     }
 
     /// 暂停/无客户端时调用：丢弃暂停期间的真实时间，恢复时不快进。
@@ -1843,38 +1837,6 @@ impl Engine {
             );
         }
         let drawable = frame_has_drawable_output(&frame);
-        // 临时取证(`YU_FRAME_DUMP`):每 120 帧打印图层清单(3DAYS 黑屏排查)。
-        if drawable
-            && std::env::var_os("YU_FRAME_DUMP").is_some()
-            && self.frame >= 1200
-            && self.frame % 120 == 0
-        {
-            eprintln!("[frame] f={} layers={}", self.frame, frame.layers.len());
-            for layer in frame.layers.iter().take(60) {
-                let size = match layer.kind {
-                    yu_gfx::LayerKind::Image { size } => size,
-                    yu_gfx::LayerKind::Group { size } => size,
-                };
-                eprintln!(
-                    "[frame]   id={} z={} E={} A={} kind={} tex={}",
-                    layer.id.display(),
-                    layer.z,
-                    layer.visible,
-                    layer.alpha,
-                    size.map(|s| format!("{}x{}", s.width, s.height))
-                        .unwrap_or_else(|| "-".into()),
-                    match &layer.texture {
-                        yu_gfx::TextureRef::Asset(k) =>
-                            format!("Asset({})", String::from_utf8_lossy(k)),
-                        yu_gfx::TextureRef::Snapshot(id) => format!("Snapshot({})", id.0),
-                        yu_gfx::TextureRef::SolidBlack1x1 => "Solid1x1".into(),
-                        yu_gfx::TextureRef::None => "None".into(),
-                        other => format!("{other:?}"),
-                    }
-                );
-            }
-        }
-
         // 本帧图层/文本引用的资产必须在 render 前已有 CPU 像素:漏过
         // `CG[FILE]` 声明(例如 `CGACT ID2` 首次引用)或刚被预算回收的 key,
         // 若留到 `plan` 里 `resolve_ref` 才解码,就是角色/差分切换的
@@ -2146,46 +2108,6 @@ impl Engine {
         indices: &[i64],
     ) -> Option<Result<yu_rt::value::Value, yu_log::Diag>> {
         self.vm.as_ref().map(|vm| vm.debug_sysvar(id, indices))
-    }
-
-    /// 取证用:`YU_CSEL_SKIP=1` 在第 1500 帧强制把 CSEL 选中槽写 1,
-    /// 用于绕过交互、单独观察 CSEL 之后的 logo/CAUTION 画面链。
-    fn probe_skip_csel(&mut self) {
-        if std::env::var_os("YU_CSEL_SKIP").is_none() || self.frame != 1500 {
-            return;
-        }
-        if let Some(vm) = self.vm.as_mut() {
-            let _ = vm.store_mut().write(
-                yu_rt::value::VarRef::new(yu_rt::value::VarSpace::At, 0x49b),
-                &[93, 2],
-                &yu_rt::value::Value::Int(1),
-            );
-        }
-    }
-
-    /// `YU_CSEL_TRACE=1` 时逐帧打印 CSEL 等待点相关状态(交互取证用)。
-    fn trace_csel_state(&self) {
-        if std::env::var_os("YU_CSEL_TRACE").is_none() {
-            return;
-        }
-        let Some(vm) = self.vm.as_ref() else { return };
-        let (x, y) = vm.input().cursor();
-        let read = |id: u16, indices: &[i64]| {
-            vm.store()
-                .read(
-                    yu_rt::value::VarRef::new(yu_rt::value::VarSpace::At, id),
-                    indices,
-                )
-                .ok()
-                .and_then(|v| v.as_int())
-        };
-        eprintln!(
-            "[csel] f={} cursor=({x},{y}) bt93_2={:?} c6={:?} live={}",
-            self.frame,
-            read(0x49b, &[93, 2]),
-            read(0x4c6, &[]),
-            self.live_tasks()
-        );
     }
 
     /// 最近一次全程序 `END` 的 `RESTART` 标志(官方 `[0x80152c]`)。
@@ -3360,7 +3282,7 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     let mut vm = Vm::boot_with_aux(source, Some(aux), boot)
         .map_err(|d| Failure::runtime(format!("boot 失败: {d}")))?;
     // 独立商业分支运行面:只对精确 555 安装;旧版不安装,保持 c1549eb 行为。
-    if vm.tables().boot.yscm.version == 555 {
+    if vm.semantics().is_v555() {
         vm.install_other_runtime();
     }
     // 游戏身份(窗口标题/图标/版本;宿主变量,不参与 VM 语义)。
@@ -3397,7 +3319,7 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     };
     let mut gfx_config = GfxConfig::new(viewport)
         .with_display(display.clone())
-        .with_button_number_info(vm.tables().boot.yscm.version == 555);
+        .with_button_number_info(vm.semantics().is_v555());
     // 0.255 的 62 字节 YSCF 短头没有扩展名优先序字段(布局已判定为
     // "无该字段");此时把宿主自己的探测序**显式注入**,而不是让内核
     // 在 GfxState 里静默兜底(A5)。V5/V292 仍只认工程 yscfg。
@@ -3497,6 +3419,9 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
             if vm.semantics().save_image == yu_rt::semantics::SaveImageMode::V555 {
                 state.set_image_layout_override(Some(yu_save::image_block::LAYOUT_V555));
             }
+            // v555 的文件 DNO=1024 归 `SAVE[MEM=99999]` 内存包所有;
+            // 旧版的 1024 仍是普通块,不能一并保留。
+            state.set_mem_pack_reserved_dno(vm.semantics().save_mem_pack);
             // 容器版本 = **官方 exe 的 LOAD 校验常量**,不是 yscfg/引擎版本:
             // 0.495→0x1E0、0.479→0x138、0.466→0x0C0、0.481→0x1E1(REA
             // 2026-11-15)。写错会导致官方弹 yse 108040「セーブデータの

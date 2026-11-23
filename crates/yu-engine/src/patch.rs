@@ -411,7 +411,8 @@ pub(crate) fn is_helper_exe(path: &Path) -> bool {
 /// 生效;数据也说不出唯一解才放弃。发行包与 exe 是配套的:数据是 GBK
 /// 时,带 GBK 表的那只 exe 胜出。
 fn static_codec_for_v555(project: &Project) -> Option<(Codec, String)> {
-    if project.ysc_version() != Some(555) {
+    let version = project.ysc_version()?;
+    if !yu_rt::semantics::SemanticProfile::from_yscm_version(version).is_v555() {
         return None;
     }
     let entries = std::fs::read_dir(project.root()).ok()?;

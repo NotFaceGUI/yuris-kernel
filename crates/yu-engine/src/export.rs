@@ -31,7 +31,8 @@
 //! 误胜);平局或 CP932 出现全角假名时回退 CP932。CP932 路线若工程根有
 //! `sjis_ext.bin`,自动用隧道表回解扩展字。外置剧本按目录变体固定:
 //! `sc_cn_` = GBK、`sc_tw_` = Big5。
-//! 所有输出是 **UTF-8 + BOM**;解码失败逐字节计数并写进清单,不静默替换。
+//! CSV/人读副本是 **UTF-8 + BOM**;`translate.json`/`manifest.json` 是
+//! UTF-8 无 BOM(JSON 规范)。解码失败逐字节计数并写进清单,不静默替换。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -82,7 +83,7 @@ pub enum ExportFormat {
     /// CSV 表 + 人读副本(默认;诊断/批量处理)。
     #[default]
     Csv,
-    /// 单个 `translate.json`:只含角色表与正文,带空 `translation` 字段。
+    /// 单个 `translate.json`:角色/选项/UI 字面量/正文,带空 `translation` 字段。
     TranslateJson,
 }
 
@@ -908,6 +909,8 @@ fn export_scenarios(
             if file_rows > 0 && format == ExportFormat::Csv {
                 // 人读副本:整文件按本变体 codec 解码成 UTF-8,保留原行结构。
                 let (file_text, invalid) = decode_text(variant_codec, file_tunnel, &bytes);
+                // 归档条目名来自不可信游戏数据:逐分量拒绝 `..`/盘符/绝对路径,
+                // 防止 `scenario_dir.join(rel)` 逃逸输出目录。
                 if invalid > 0 {
                     report.warnings.push(format!(
                         "{rel_path}: {} 字节在 {} 下解码失败(人读副本含 U+FFFD;CSV 只含台词行)",
@@ -918,7 +921,7 @@ fn export_scenarios(
                 decoded.push_str(&file_text);
                 let dest = scenario_dir
                     .join(&variant)
-                    .join(rel_path.replace('\\', "/"));
+                    .join(sanitized_rel_path(&rel_path));
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| {
                         Failure::runtime(format!("建 {} 失败: {e}", parent.display()))
@@ -1864,7 +1867,7 @@ fn write_csv<const N: usize>(
     write_text(path, &text)
 }
 
-/// `translate.json` 写出:只含角色表与正文(不含字符串常量),每条带空译文槽。
+/// `translate.json` 写出:角色/选项/UI 字面量/正文,每条带空译文槽。
 ///
 /// 坐标与 CSV 模式一致:
 /// - 角色:`variant + table + index`;
@@ -2194,6 +2197,28 @@ pub fn output_layout() -> [&'static str; 6] {
 /// 供宿主直接写盘的工具(Android 也在用同一份目录构造)。
 pub fn default_output_dir(project_root: &Path) -> PathBuf {
     project_root.join("export-text")
+}
+
+/// 把归档条目/剧本变体的相对路径转成安全输出路径。
+///
+/// 只保留普通分量:`..`、空分量、含 `:` 的盘符/ADS 形态一律替换为 `_`,
+/// 防止 `join` 逃出目标目录。目录层级仍按原结构保留。
+fn sanitized_rel_path(rel: &str) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in rel.split(['/', '\\']) {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." || part.contains(':') {
+            out.push("_");
+        } else {
+            out.push(part);
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push("_");
+    }
+    out
 }
 
 #[cfg(test)]

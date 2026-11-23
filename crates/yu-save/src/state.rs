@@ -100,6 +100,11 @@ pub struct SaveState {
     /// 图像块布局覆盖:v555 与 0.495 共用容器 `0x1E0`,但描述符分别为
     /// A=1680/+0x88 与 A=1600/+0x78;由引擎按 `SemanticProfile` 注入。
     image_layout_override: Option<crate::image_block::Layout>,
+    /// DNO=1024 是否已被 `SAVE[MEM=99999]` 500 槽内存包占用(仅 v555)。
+    ///
+    /// 置位后普通 `SAVE[DNO=1024]` 预约被拒绝;未置位(0.495 及更早)时
+    /// 1024 仍是合法普通块。由引擎按 `SemanticProfile::save_mem_pack` 注入。
+    mem_pack_reserved_dno: bool,
     /// 未刷盘预约(DNO → 快照;同 DNO 覆盖)。
     reservations: BTreeMap<u32, ReservedFact>,
     /// `SAVE[MEM=n]` 的内存存档槽(n → 容器字节)。
@@ -136,6 +141,13 @@ pub struct SaveState {
 /// 诊断上限(与 `Engine` 侧 sound 诊断同量级)。
 pub const MAX_DIAGS: usize = 8192;
 
+/// 单个 `SAVE[MEM]` 内存槽容器的原始长度上限。
+///
+/// `LOAD[FILE DNO=1024]` 会按 500 个槽头声明的 `raw_len` 逐个解压;伪造存档
+/// 可把放大倍数拉到 ×500。正常槽是完整 YSSD 容器(样本最大 1 MB 级),
+/// 64 MiB 足够且能挡住 OOM。
+pub const MAX_MEM_SLOT_BYTES: u32 = 64 * 1024 * 1024;
+
 impl SaveState {
     /// 构造。`writable = false` 时 FILEACT 的删除/复制被拒绝并挂号。
     ///
@@ -157,6 +169,7 @@ impl SaveState {
             learned_version: None,
             block_codec: None,
             image_layout_override: None,
+            mem_pack_reserved_dno: false,
             reservations: BTreeMap::new(),
             mem_slots: BTreeMap::new(),
             packed_mem: None,
@@ -370,12 +383,7 @@ impl SaveState {
     /// (REA `0x44d73d`;同 DNO = 替换 `0x44c740`)。
     pub fn reserve(&mut self, dno: u32, var: VarRef, snap: &VarSnapshot) -> Result<(), Diag> {
         self.save_calls += 1;
-        if !(1..=1024).contains(&dno) {
-            return Err(error::recoverable(
-                code::ARG_RANGE,
-                format!("SAVE DNO={dno} 越界(1..=1024)"),
-            ));
-        }
+        self.check_reservable_dno(dno)?;
         self.reservations.insert(
             dno,
             ReservedFact {
@@ -400,12 +408,7 @@ impl SaveState {
         vars: &[(u16, VarSnapshot)],
     ) -> Result<(), Diag> {
         self.save_calls += 1;
-        if !(1..=1024).contains(&dno) {
-            return Err(error::recoverable(
-                code::ARG_RANGE,
-                format!("SAVE DNO={dno} 越界(1..=1024)"),
-            ));
-        }
+        self.check_reservable_dno(dno)?;
         self.reservations.insert(
             dno,
             ReservedFact {
@@ -428,12 +431,7 @@ impl SaveState {
         image: &yu_rt::event::CapturedImage,
     ) -> Result<(), Diag> {
         self.save_calls += 1;
-        if !(1..=1024).contains(&dno) {
-            return Err(error::recoverable(
-                code::ARG_RANGE,
-                format!("SAVE DNO={dno} 越界(1..=1024)"),
-            ));
-        }
+        self.check_reservable_dno(dno)?;
         let expected = image.len_bytes();
         if image.rgba.len() != expected || expected == 0 {
             return Err(error::recoverable(
@@ -499,6 +497,31 @@ impl SaveState {
         self.image_layout_override = layout;
     }
 
+    /// 声明 DNO=1024 已被 500 槽内存包占用(v555 `SemanticProfile`)。
+    pub fn set_mem_pack_reserved_dno(&mut self, reserved: bool) {
+        self.mem_pack_reserved_dno = reserved;
+    }
+
+    /// 预约 DNO 的统一校验。
+    ///
+    /// 下界交给 VM(`FILE` 1 基、`MEM` 0 基);宿主接受 0..=1024,避免
+    /// `SAVE[MEM=n DNO=0]` 被宿主误判致命。v555 的 1024 归内存包所有。
+    fn check_reservable_dno(&self, dno: u32) -> Result<(), Diag> {
+        if !(0..=1024).contains(&dno) {
+            return Err(error::recoverable(
+                code::ARG_RANGE,
+                format!("SAVE DNO={dno} 越界(0..=1024)"),
+            ));
+        }
+        if self.mem_pack_reserved_dno && dno == 1024 {
+            return Err(error::recoverable(
+                code::ARG_RANGE,
+                "SAVE DNO=1024 保留给 SAVE[MEM=99999] 的 500 槽内存包".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// `SAVE[FILE="x"]`:刷盘。按 DNO 升序流出**预约时**的快照
     /// (REA `0x44cd5a..0x44ceab`:写头/偏移表 + 逐块写;预约表不清)。
     ///
@@ -532,7 +555,26 @@ impl SaveState {
             None
         };
         let had_pack = mem_pack_block.is_some();
-        let preserved = self.existing_blocks(&path);
+        if had_pack && !Self::is_player_save_name(file) {
+            // 官方消费时机仍按「下一次 SAVE[FILE]」建模(DIV-RT-075 §5);
+            // 系统存档先到时显式留痕,便于实机发现包写错文件。
+            image_layout_diags.push(error::verbose(
+                code::CONTAINER,
+                format!(
+                    "SAVE[FILE={file}] 带走了 SAVE[MEM=99999] 内存包(文件名不是 save*;\
+                     官方消费时机未逐分支取证)"
+                ),
+            ));
+        }
+        // 旧容器读/解析失败只挂号并走“从零重建”(保持既有可玩性);
+        // 只有 NotFound 才是真正的空表。
+        let preserved = match self.existing_blocks(&path) {
+            Ok(preserved) => preserved,
+            Err(d) => {
+                image_layout_diags.push(d);
+                BTreeMap::new()
+            }
+        };
         let bytes = self.build_container(
             target_version,
             &source,
@@ -717,6 +759,15 @@ impl SaveState {
                 }
                 continue;
             }
+            if raw_len > MAX_MEM_SLOT_BYTES {
+                return Err(error::recoverable(
+                    code::CONTAINER,
+                    format!(
+                        "LOAD[FILE={file} DNO=1024] 槽 {slot} raw_len={raw_len} 超过上限 \
+                         {MAX_MEM_SLOT_BYTES}"
+                    ),
+                ));
+            }
             let comp_len = usize::try_from(comp_len).map_err(|_| {
                 error::recoverable(
                     code::CONTAINER,
@@ -771,26 +822,57 @@ impl SaveState {
     /// 证据:`es_textkidoku.yst` 的 `INFO.SAVE` 只预约 1001..1004,
     /// 但官方 `kidoku.sd` 仍有 `DNO=4`(上次阅读位置);若从零重建,
     /// 官方读档在 `es_textkidoku.yst:477` 报 `LOAD[DNO]` 不存在。
-    fn existing_blocks(&self, path: &Path) -> BTreeMap<u32, Vec<u8>> {
-        let Ok(bytes) = self.fs.read(path) else {
-            return BTreeMap::new();
+    ///
+    /// 只有目标文件**不存在**才静默返回空表;读/解析失败返回诊断,由调用方
+    /// 挂号后走“从零重建”。不把失败升级成 SAVE 失败——旧档格式不合时
+    /// 让游戏继续能存(代价是旧块不保留),可玩性优先。
+    fn existing_blocks(&self, path: &Path) -> Result<BTreeMap<u32, Vec<u8>>, Diag> {
+        let bytes = match self.fs.read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(e) => {
+                return Err(error::recoverable(
+                    code::FILE_READ,
+                    format!(
+                        "SAVE[FILE] 读取旧容器失败,拒绝覆盖(目标 {}): {e}",
+                        path.display()
+                    ),
+                ));
+            }
         };
-        let Ok(save) = yu_format::yssd::YssdSave::parse(&bytes, b"existing") else {
-            return BTreeMap::new();
-        };
-        save.entries
+        let save = yu_format::yssd::YssdSave::parse(&bytes, b"existing").map_err(|d| {
+            error::recoverable(
+                code::CONTAINER,
+                format!(
+                    "SAVE[FILE] 旧容器解析失败,拒绝覆盖(目标 {}): {d}",
+                    path.display()
+                ),
+            )
+        })?;
+        Ok(save
+            .entries
             .iter()
             .map(|entry| {
                 let mut body = Vec::with_capacity(12 + entry.compressed.len());
                 body.push(entry.btype);
                 body.push(entry.strict);
                 body.extend_from_slice(&entry.var_id.to_le_bytes());
-                body.extend_from_slice(&(entry.compressed.len() as u32).to_le_bytes());
+                body.extend_from_slice(
+                    &u32::try_from(entry.compressed.len())
+                        .unwrap_or(u32::MAX)
+                        .to_le_bytes(),
+                );
                 body.extend_from_slice(&entry.ulen.to_le_bytes());
                 body.extend_from_slice(&entry.compressed);
                 (entry.dno, body)
             })
-            .collect()
+            .collect())
+    }
+
+    /// 玩家存档文件名(`save*.sd`)判定,只用于 `MEM=99999` 消费时机留痕。
+    fn is_player_save_name(file: &str) -> bool {
+        let stem = file.strip_suffix(".sd").unwrap_or(file);
+        stem.to_ascii_lowercase().starts_with("save")
     }
 
     /// 按预约表构造 YSSD 容器(文件存档与内存槽共用同一序列化)。
@@ -809,6 +891,12 @@ impl SaveState {
         preserved: BTreeMap<u32, Vec<u8>>,
         mem_pack_block: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, Diag> {
+        if mem_pack_block.is_some() && self.reservations.contains_key(&1024) {
+            return Err(error::recoverable(
+                code::ARG_RANGE,
+                format!("{source}: DNO=1024 同时被预约块与 SAVE[MEM=99999] 内存包占用"),
+            ));
+        }
         let codec = self.block_codec.unwrap_or_default();
         let version = match self
             .container_version
@@ -907,7 +995,7 @@ impl SaveState {
                     let raw = crate::image_block::encode(image, layout);
                     // v555 缩略图块固定 zlib level 9(`78 da`),与容器
                     // 变量块的 Snappy 层相互独立;官方样本逐字节验证。
-                    let body = if layout.descriptor_len == 1680 {
+                    let body = if layout.is_v555() {
                         yu_format::yssd::encode_block_body_zlib9(1, 1, 0, &raw)
                     } else {
                         yu_format::yssd::encode_block_body_with(codec, 1, 1, 0, &raw)
@@ -2208,6 +2296,42 @@ fn mem_99999_pack_matches_official_layout() {
     assert_eq!(u64::from(packed_total), sum_packed);
     assert_eq!(u64::from(unpacked_total), sum_unpacked);
     assert!(packed_total < unpacked_total, "zlib 压缩应小于原始长度");
+}
+
+/// `SAVE[MEM=n DNO=0]`:内存槽 DNO 0 基(VM 已放宽),宿主不得再按 1 基拒绝。
+#[test]
+fn mem_save_accepts_dno_zero() {
+    let root = std::path::PathBuf::from("target/tmp/sv-mem-dno0");
+    let mut state = SaveState::new(&root, false);
+    let snap = VarSnapshot {
+        ty: ElemType::Int,
+        dims: Vec::new(),
+        data: vec![Value::Int(7)],
+    };
+    state
+        .reserve(0, VarRef::new(VarSpace::At, 0x0a43), &snap)
+        .expect("MEM 的 DNO=0 必须被接受");
+}
+
+/// v555 的文件 DNO=1024 归 `SAVE[MEM=99999]` 内存包所有,普通预约被拒绝。
+#[test]
+fn mem_pack_reserves_dno_1024_only_on_v555() {
+    let root = std::path::PathBuf::from("target/tmp/sv-dno1024-reserved");
+    let snap = VarSnapshot {
+        ty: ElemType::Int,
+        dims: Vec::new(),
+        data: vec![Value::Int(7)],
+    };
+    let mut legacy = SaveState::new(&root, false);
+    legacy
+        .reserve(1024, VarRef::new(VarSpace::At, 0x0a43), &snap)
+        .expect("旧版 1024 仍是普通块");
+    let mut v555 = SaveState::new(&root, false);
+    v555.set_mem_pack_reserved_dno(true);
+    let err = v555
+        .reserve(1024, VarRef::new(VarSpace::At, 0x0a43), &snap)
+        .expect_err("v555 的 1024 必须被内存包占用");
+    assert_eq!(err.code, code::ARG_RANGE);
 }
 
 /// 官方 `SAVE[FILE]` 是更新已有容器:未预约的旧块必须保留。

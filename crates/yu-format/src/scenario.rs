@@ -12,7 +12,7 @@
 use crate::Codec;
 
 /// 一条可替换单元的类别。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnitKind {
     /// `\LC("…")` / `\LE("…")` / `\LT("…")` 等台词宏。
     Macro,

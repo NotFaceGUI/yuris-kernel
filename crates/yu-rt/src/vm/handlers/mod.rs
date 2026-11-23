@@ -292,11 +292,14 @@ const GUARD_NOOP_COMMANDS_0555: &[&str] = &["LABEL", "SAVEINFO", "VAR"];
 /// 按工程 yscm 建表(名字 → 处理器类别)。表 = 数据解析结果,不是内置命令表。
 /// 注意:默认槽/无操作槽是 **0.495 引擎分发表**的属性;命令名与序号仍来自
 /// 工程 `ysc.ybn`(DIV-RT-001 的版本隔离不因此改变)。
-pub fn build_handler_table(yscm: &crate::tables::YscmTable) -> Vec<HandlerKind> {
+pub fn build_handler_table(
+    yscm: &crate::tables::YscmTable,
+    semantics: &crate::semantics::SemanticProfile,
+) -> Vec<HandlerKind> {
     // 555 是独立商业分支:默认槽/共享空操作清单来自 555 exe 的分发表,
     // 不能把 0.495 清单当成 555 的充分依据。556/600 没有样本,继续走
-    // legacy 清单(不自动继承 555)。
-    let v555 = yscm.version == 555;
+    // legacy 清单(不自动继承 555)。门控走语义层,不再比较 yscm.version。
+    let v555 = semantics.is_v555();
     let (default_slots, noop_slots) = if v555 {
         (DEFAULT_SLOT_COMMANDS_0555, NOOP_COMMANDS_0555)
     } else {
@@ -845,7 +848,10 @@ mod tests {
 
     #[test]
     fn v555_routes_alias_and_csv_from_555_dispatch_table() {
-        let t = build_handler_table(&synthetic(555));
+        let t = build_handler_table(
+            &synthetic(555),
+            &crate::semantics::SemanticProfile::from_yscm_version(555),
+        );
         assert_eq!(t[0], HandlerKind::Noop, "v555 ALIAS = 0x423168 no-op");
         assert_eq!(t[7], HandlerKind::Csv, "v555 CSV = 真实解析器");
         assert_eq!(
@@ -857,7 +863,10 @@ mod tests {
 
     #[test]
     fn legacy_routes_keep_0495_stub_semantics() {
-        let t = build_handler_table(&synthetic(495));
+        let t = build_handler_table(
+            &synthetic(495),
+            &crate::semantics::SemanticProfile::from_yscm_version(495),
+        );
         assert_eq!(t[0], HandlerKind::Unknown, "0.495 表没有 ALIAS");
         assert_eq!(t[7], HandlerKind::NoopEval, "0.495 CSV 是空桩");
     }

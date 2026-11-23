@@ -15,14 +15,117 @@
 //! (`-an`);画面是 v555 启动链的可见部分。
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use yu_log::{Boundary, Diag};
 use yu_rt::event::{MovieAudioInfo, MovieFrame, MovieGeometry, MovieHost};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 影片尺寸上限(防 `w*h*4` 溢出/超大分配)。4K 有充足余量。
+const MAX_MOVIE_DIMENSION: u32 = 8192;
+
+/// 解析 `ffmpeg`/`ffprobe` 的绝对路径。
+///
+/// Windows `CreateProcess` 的搜索顺序含应用目录与当前目录,而**游戏目录是
+/// 不可信数据目录**:不能直接 `Command::new("ffmpeg")`。这里：
+/// 1. 显式 `YURIS_FFMPEG` / `YURIS_FFPROBE` 覆盖(要求存在);
+/// 2. 否则只搜 PATH 的**绝对目录**项,跳过空项/相对项;
+/// 3. 找不到就报可恢复诊断,由 `Auto` 回落内置后端。
+fn resolve_tool(name: &str) -> Result<PathBuf, Diag> {
+    let env_key = format!("YURIS_{}", name.to_ascii_uppercase());
+    if let Some(value) = std::env::var_os(&env_key) {
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(Diag::recoverable("movie.decode", Boundary::Data).with_detail(format!(
+            "{env_key}={} 不存在或不是文件",
+            path.display()
+        )));
+    }
+    let exe = format!("{name}.exe");
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            if dir.as_os_str().is_empty() || !dir.is_absolute() {
+                continue;
+            }
+            for candidate in [dir.join(&exe), dir.join(name)] {
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+    Err(Diag::recoverable("movie.decode", Boundary::Data).with_detail(format!(
+        "未找到 {name}:请安装并加入 PATH 的绝对目录,或设置 {env_key}=<绝对路径>"
+    )))
+}
+
+/// 运行 ffprobe 并带 10s 超时(畸形容器可能让 ffprobe 永不返回)。
+fn run_probe(tool: &Path, path: &Path) -> Result<std::process::Output, Diag> {
+    let mut command = Command::new(tool);
+    command
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,avg_frame_rate,r_frame_rate",
+            "-of",
+            "csv=p=0:s=,",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| {
+        Diag::recoverable("movie.decode", Boundary::Data)
+            .with_detail(format!("ffprobe 启动失败({}): {e}", tool.display()))
+    })?;
+    let mut stdout = child.stdout.take().expect("ffprobe stdout piped");
+    let mut stderr = child.stderr.take().expect("ffprobe stderr piped");
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Diag::recoverable("movie.decode", Boundary::Data)
+                    .with_detail("ffprobe 超过 10s 未返回(畸形容器?)"));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Diag::recoverable("movie.decode", Boundary::Data)
+                    .with_detail(format!("ffprobe 等待失败: {e}")));
+            }
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out_thread.join().unwrap_or_default(),
+        stderr: err_thread.join().unwrap_or_default(),
+    })
+}
 
 /// ffmpeg/ffprobe 子进程后端。
 pub struct FfmpegMovieHost {
@@ -110,23 +213,8 @@ impl FfmpegMovieHost {
     }
 
     fn probe(path: &PathBuf) -> Result<(u32, u32, u32, u32), Diag> {
-        let output = Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=width,height,avg_frame_rate,r_frame_rate",
-                "-of",
-                "csv=p=0:s=,",
-            ])
-            .arg(path)
-            .output()
-            .map_err(|e| {
-                Diag::recoverable("movie.decode", Boundary::Data)
-                    .with_detail(format!("ffprobe 启动失败(外置解码需要 PATH 中有 ffprobe): {e}"))
-            })?;
+        let tool = resolve_tool("ffprobe")?;
+        let output = run_probe(&tool, path)?;
         if !output.status.success() {
             return Err(Diag::recoverable("movie.decode", Boundary::Data).with_detail(format!(
                 "ffprobe 无法解析影片容器: {}",
@@ -161,7 +249,8 @@ impl FfmpegMovieHost {
     }
 
     fn spawn_ffmpeg(path: &PathBuf, num: u32, den: u32) -> Result<Child, Diag> {
-        Command::new("ffmpeg")
+        let tool = resolve_tool("ffmpeg")?;
+        Command::new(tool)
             .args(["-v", "error", "-nostdin", "-i"])
             .arg(path)
             .args([
@@ -188,11 +277,7 @@ impl FfmpegMovieHost {
 }
 
 fn write_temp(bytes: &[u8], ext: &str) -> Result<PathBuf, Diag> {
-    let name = format!(
-        "yk-movie-{}-{}{ext}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    );
+    // 只在系统临时目录落盘:游戏目录/工作目录是不可信数据区,不应写入。
     let mut candidates = vec![std::env::temp_dir()];
     for key in ["TEMP", "TMP", "LOCALAPPDATA", "USERPROFILE"] {
         if let Some(value) = std::env::var_os(key) {
@@ -206,31 +291,46 @@ fn write_temp(bytes: &[u8], ext: &str) -> Result<PathBuf, Diag> {
             });
         }
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(".yk-movie-tmp"));
-    }
     let mut last = String::new();
     for dir in candidates {
         if std::fs::create_dir_all(&dir).is_err() {
             continue;
         }
-        let path = dir.join(&name);
-        match std::fs::File::create(&path) {
-            Ok(mut out) => {
-                if let Err(e) = out.write_all(bytes) {
-                    last = format!("{}: {e}", path.display());
-                    let _ = out.flush();
-                    drop(out);
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
-                return Ok(path);
+        for _ in 0..4 {
+            let name = format!(
+                "yk-movie-{}-{}{ext}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            );
+            let path = dir.join(name);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
             }
-            Err(e) => last = format!("{}: {e}", path.display()),
+            match options.open(&path) {
+                Ok(mut out) => {
+                    if let Err(e) = out.write_all(bytes) {
+                        last = format!("{}: {e}", path.display());
+                        let _ = out.flush();
+                        drop(out);
+                        let _ = std::fs::remove_file(&path);
+                        break;
+                    }
+                    return Ok(path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    last = format!("{}: {e}", path.display());
+                    break;
+                }
+            }
         }
     }
     Err(Diag::recoverable("movie.decode", Boundary::Data).with_detail(format!(
-        "创建影片临时文件失败(已试 TEMP/TMP/LOCALAPPDATA/工作目录): {last}"
+        "创建影片临时文件失败(只在系统临时目录尝试): {last}"
     )))
 }
 
@@ -270,9 +370,24 @@ impl MovieHost for FfmpegMovieHost {
         };
         self.width = width;
         self.height = height;
+        if width > MAX_MOVIE_DIMENSION || height > MAX_MOVIE_DIMENSION {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&path);
+            return Err(Diag::recoverable("movie.decode", Boundary::Data).with_detail(format!(
+                "影片尺寸 {width}x{height} 超过上限 {MAX_MOVIE_DIMENSION}"
+            )));
+        }
+        let frame_size = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| {
+                Diag::recoverable("movie.decode", Boundary::Data)
+                    .with_detail(format!("影片尺寸 {width}x{height} 的帧缓冲溢出"))
+            })?;
         self.fps_num = num;
         self.fps_den = den;
-        self.frame_size = width as usize * height as usize * 4;
+        self.frame_size = frame_size;
         self.last_frame = vec![0u8; self.frame_size];
         self.has_frame = false;
         self.produced = 0;

@@ -193,7 +193,7 @@ impl Vm {
                         let n = files.len();
                         if let Some(state) = self.other.as_mut() {
                             state.drop_files = files;
-                            state.drop_file_num = n as u32;
+                            state.drop_file_num = n as i32;
                         }
                         n
                     }
@@ -492,6 +492,14 @@ impl Vm {
     }
 
     /// `PRODUCT[COM=22]` 的 token 输出数组定位(独立运行面内固定按 555 形态)。
+    ///
+    /// 先按 `PINT`/`PINT2`/`PINT3` 找 `STR[] + INT[]` 对;v555 商业样本里
+    /// PINT2/PINT3 不一定回填(实测 `<v555-2>` 启动链为空),仍需 PINT 侧
+    /// 的相邻槽兜底,否则标签表为空、主任务提前 END(窗口闪退)。
+    /// 最后的"相邻 1024 数组对"只在 ysv 里唯一时使用。
+    ///
+    /// **挂账**:PINT 侧的 `+1/+4/+5` 尚无 REA/trace 证据,是让现有商业样本
+    /// 跑通的形状启发式;待取证档案见 `DIV-RT-076`,取证前不删。
     fn scenario_token_vars(
         &mut self,
         pint: i64,

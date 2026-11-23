@@ -167,6 +167,18 @@ impl Value {
         }
     }
 
+    /// 与变量表写入相同的 Int 强转:浮点截断、字符串解析、失败 0。
+    ///
+    /// 供 `_INT`/`_PINT`/`_DROPFILE_NUM` 这类"按 LET 语义写 int"的分支使用;
+    /// 不要用 [`Self::as_int`] 的 `unwrap_or(0)`,那会把浮点/字符串静默写成 0。
+    #[must_use]
+    pub fn to_int_lossy(&self) -> i64 {
+        match coerce_to(ElemType::Int, self) {
+            Value::Int(v) => v,
+            _ => 0,
+        }
+    }
+
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Int(v) => Some(*v as f64),
@@ -761,9 +773,6 @@ impl VariableStore {
     }
 
     pub fn declare(&mut self, r: VarRef, ty: ElemType, dims: &[usize], init: &Value) {
-        if std::env::var_os("YU_MACRO_TRACE").is_some() && r.id == 0x0499 {
-            eprintln!("[declare1177] ty={ty:?} dims={dims:?} init={init:?}");
-        }
         let slot = VarSlot::new(ty, dims, init);
         let index = usize::from(r.id);
         if index >= DENSE_CAP {
@@ -969,9 +978,6 @@ impl VariableStore {
         }
         let stored = coerce_to(ty, value);
         let flat = Self::flat_offset(partial, r, &slot.dims, indices)?;
-        if std::env::var_os("YU_MACRO_TRACE").is_some() && r.id == 0x0499 {
-            eprintln!("[write1177] indices={indices:?} flat={flat} -> {stored:?}");
-        }
         slot.data[flat] = stored;
         self.bump();
         Ok(())

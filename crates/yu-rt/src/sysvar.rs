@@ -339,33 +339,12 @@ pub fn read(vm: &Vm, st: &ExecState, var: VarRef, indices: &[i64]) -> Result<Val
         // 内容恒为空,按手册「空文本」返回空串,不猜其它字段。
         // 手册 `basic/svariable.html`:`$_TEXT` = 現在表示されているテキストの内容。
         // 缓冲由 `WORD`/`_` 追加、`$_TEXT` 写入替换(见 handlers)。
-        "_TEXT" => {
-            // 临时取证(`YU_SLOT_TRACE`):3DAYS 文本链路空串排查。取证完删除。
-            if std::env::var_os("YU_SLOT_TRACE").is_some() {
-                let b = vm.text_bytes();
-                eprintln!(
-                    "[sysvar] _TEXT len={} head={:02x?}",
-                    b.len(),
-                    &b[..b.len().min(24)]
-                );
-            }
-            Ok(Value::Str(vm.current_text()))
-        }
+        "_TEXT" => Ok(Value::Str(vm.current_text())),
         // 手册:`$_TEXT_FLAG` = 半角全角情報や改行改頁クリック待ち情報(有页)。
         // 三层已齐(REA 0.495 `0x446b93` id 0x7b → `[state+0x3c]`;字节表见
         // `crate::text::flag`),返回与 `$_TEXT` 并行的控制字节流。
         // 台账:`COV-M-01`。
-        "_TEXT_FLAG" => {
-            if std::env::var_os("YU_SLOT_TRACE").is_some() {
-                let b = vm.text_flags_ref();
-                eprintln!(
-                    "[sysvar] _TEXT_FLAG len={} head={:02x?}",
-                    b.len(),
-                    &b[..b.len().min(24)]
-                );
-            }
-            Ok(Value::Str(vm.text_flags()))
-        }
+        "_TEXT_FLAG" => Ok(Value::Str(vm.text_flags())),
         // `_TEXT_NUM`:手册无页;引擎 int getter `0x4276e3` 读装载期全局
         // `0x80174c`,该值在 `ysbin/yst.ybn` 装载时由头部 text_total 写入
         // (`0x45d73f`)。内核用 `yst_list` 逐脚本 text_count 求和(ERIS 396,

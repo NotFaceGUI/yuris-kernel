@@ -208,6 +208,11 @@ pub struct SemanticProfile {
     pub partial_index: bool,
     /// 存档缩略图块描述符布局。
     pub save_image: SaveImageMode,
+    /// `SAVE[MEM=99999]` / `LOAD[FILE DNO=1024]` 的 500 槽内存包形态。
+    ///
+    /// 证据只覆盖 v555 文件分支(`0x4447c8` → `FUN_004453f4`);0.495 及更早
+    /// 的 `DNO=1024` 仍是普通块,不得无条件改道。
+    pub save_mem_pack: bool,
 }
 
 impl SemanticProfile {
@@ -264,6 +269,7 @@ impl SemanticProfile {
             } else {
                 SaveImageMode::ContainerProfile
             },
+            save_mem_pack: v555,
         }
     }
 
@@ -271,6 +277,14 @@ impl SemanticProfile {
     #[must_use]
     pub fn from_boot(boot: &crate::tables::BootTables) -> Self {
         Self::from_yscm_version(boot.yscm.version)
+    }
+
+    /// 555 独立商业分支(字面匹配;556/600 不继承)。
+    ///
+    /// 处理器/宿主统一用本方法,不再各自比较 `yscm.version == 555`。
+    #[must_use]
+    pub fn is_v555(&self) -> bool {
+        self.ysc_version == 555
     }
 }
 
@@ -293,6 +307,7 @@ mod tests {
             assert_eq!(p.script_decls, ScriptDeclMode::Runtime, "{version}");
             assert_eq!(p.ref_int_param, RefIntParamMode::Value, "{version}");
             assert_eq!(p.save_image, SaveImageMode::ContainerProfile, "{version}");
+            assert!(!p.save_mem_pack, "{version}");
         }
         let p = SemanticProfile::from_yscm_version(555);
         assert_eq!(p.ysc_version, 555);
@@ -304,6 +319,7 @@ mod tests {
         assert_eq!(p.script_decls, ScriptDeclMode::LoadTime);
         assert_eq!(p.ref_int_param, RefIntParamMode::SlotId);
         assert_eq!(p.save_image, SaveImageMode::V555);
+        assert!(p.save_mem_pack);
 
         // 555 是独立分支;556/600 没有证据,不得自动继承。
         for version in [556, 600] {
@@ -317,6 +333,7 @@ mod tests {
             assert_eq!(p.script_decls, ScriptDeclMode::Runtime, "{version}");
             assert_eq!(p.ref_int_param, RefIntParamMode::Value, "{version}");
             assert_eq!(p.save_image, SaveImageMode::ContainerProfile, "{version}");
+            assert!(!p.save_mem_pack, "{version}");
         }
     }
 }

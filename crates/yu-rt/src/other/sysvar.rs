@@ -78,19 +78,6 @@ fn read_pint(
             .and_then(|f| f.args_str[n].clone())
             .unwrap_or_else(|| Value::Str(Vec::new()))),
     };
-    // 临时取证(`YU_SLOT_TRACE`):3DAYS `_strmid` 空串排查。取证完删除。
-    if std::env::var_os("YU_SLOT_TRACE").is_some() {
-        match &out {
-            Ok(Value::Str(b)) => eprintln!(
-                "[sysvar] {name}({n}) -> str len={} head={:02x?} frames={}",
-                b.len(),
-                &b[..b.len().min(16)],
-                frames.len()
-            ),
-            Ok(v) => eprintln!("[sysvar] {name}({n}) -> {v:?} frames={}", frames.len()),
-            Err(_) => {}
-        }
-    }
     out
 }
 
@@ -117,19 +104,6 @@ fn read_rint(
             .and_then(|f| f.ret_str[n].clone())
             .unwrap_or_else(|| Value::Str(Vec::new()))),
     };
-    // 临时取证(`YU_SLOT_TRACE`):3DAYS `_strmid` 空串排查。取证完删除。
-    if std::env::var_os("YU_SLOT_TRACE").is_some() {
-        match &out {
-            Ok(Value::Str(b)) => eprintln!(
-                "[sysvar] {name}({n}) -> str len={} head={:02x?} frames={}",
-                b.len(),
-                &b[..b.len().min(16)],
-                frames.len()
-            ),
-            Ok(v) => eprintln!("[sysvar] {name}({n}) -> {v:?} frames={}", frames.len()),
-            Err(_) => {}
-        }
-    }
     out
 }
 
@@ -169,19 +143,12 @@ fn read_str(vm: &Vm, st: &ExecState, indices: &[i64]) -> Result<Value, yu_log::D
         };
     }
     let Some(var) = vm.store().find_by_id(slot, VarSpace::Dollar) else {
-        if std::env::var_os("YU_MACRO_TRACE").is_some() && (2911..=2913).contains(&slot) {
-            eprintln!("[sysvar] _STR({slot},{index}) -> <no slot>");
-        }
         return Ok(Value::Str(Vec::new()));
     };
-    let out = match vm.store().read(var, &[index]) {
+    Ok(match vm.store().read(var, &[index]) {
         Ok(Value::Str(bytes)) => Value::Str(bytes),
         Ok(_) | Err(_) => Value::Str(Vec::new()),
-    };
-    if std::env::var_os("YU_MACRO_TRACE").is_some() && (2911..=2913).contains(&slot) {
-        eprintln!("[sysvar] _STR({slot},{index}) -> {out:?}");
-    }
-    Ok(out)
+    })
 }
 
 fn read_int(vm: &Vm, indices: &[i64]) -> Result<Value, yu_log::Diag> {

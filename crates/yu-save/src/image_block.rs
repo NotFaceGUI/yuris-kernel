@@ -81,6 +81,18 @@ pub const LAYOUT_V555: Layout = Layout {
     wh_offset: 0x88,
 };
 
+impl Layout {
+    /// 是否为 v555 布局(A=1680/+0x88)。
+    ///
+    /// v555 与 0.495 共用容器版本,但常量区/w-h 镜像/缩略图压缩层都不同;
+    /// 用布局身份判定,避免散落的 `descriptor_len == 1680`。
+    #[must_use]
+    pub fn is_v555(self) -> bool {
+        self.descriptor_len == LAYOUT_V555.descriptor_len
+            && self.wh_offset == LAYOUT_V555.wh_offset
+    }
+}
+
 /// 由存档容器版本选图像块布局。
 ///
 /// **唯一版本表在 [`crate::profile::profile_for`]**(图像布局与块类型 0
@@ -116,9 +128,9 @@ fn swap_rb(pixels: &[u8]) -> Vec<u8> {
 /// 组装图像块 raw 载荷(`[lenA][lenB][A][B]`;B 段按官方像素序落 BGRA)。
 pub fn encode(image: &CapturedImage, layout: Layout) -> Vec<u8> {
     let mut descriptor = vec![0u8; layout.descriptor_len];
-    // 先写常量区,再写 w/h:v555 的 w/h 在 +0x88,与 0x80..0x90 常量区
-    // 重叠,后写 w/h 才不会被旧 16 字节常量覆盖。
-    if layout.descriptor_len == 1680 {
+    // v555 的常量区是 8 字节(0x80..0x88),w/h 紧接在 0x88..0x90;0.495
+    // 的常量区是 16 字节(0x80..0x90),w/h 在 +0x78,互不重叠。
+    if layout.is_v555() {
         descriptor[0x80..0x88].copy_from_slice(&DESCRIPTOR_CONST_V555);
     } else {
         descriptor[0x80..0x90].copy_from_slice(&DESCRIPTOR_CONST);
@@ -126,7 +138,7 @@ pub fn encode(image: &CapturedImage, layout: Layout) -> Vec<u8> {
     let wh = layout.wh_offset;
     descriptor[wh..wh + 4].copy_from_slice(&image.width.to_le_bytes());
     descriptor[wh + 4..wh + 8].copy_from_slice(&image.height.to_le_bytes());
-    if layout.descriptor_len == 1680 {
+    if layout.is_v555() {
         descriptor[WH_MIRROR_V555..WH_MIRROR_V555 + 4]
             .copy_from_slice(&image.width.to_le_bytes());
         descriptor[WH_MIRROR_V555 + 4..WH_MIRROR_V555 + 8]

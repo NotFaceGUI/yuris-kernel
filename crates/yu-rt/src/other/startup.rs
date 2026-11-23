@@ -14,6 +14,10 @@ use crate::vm::{CmdWindow, ExecState, Vm};
 use yu_log::Diag;
 
 pub(crate) fn apply_script_statics(vm: &mut Vm, script_id: u32) -> Result<(), Diag> {
+    // 语义层单点门控:只有 `LoadTime` 形态才做全脚本装载期声明。
+    if vm.semantics().script_decls != crate::semantics::ScriptDeclMode::LoadTime {
+        return Ok(());
+    }
     let Some(script) = vm.tables().script(script_id) else {
         return Ok(());
     };
@@ -58,6 +62,12 @@ pub(crate) fn apply_script_statics(vm: &mut Vm, script_id: u32) -> Result<(), Di
         let Ok(lv) = vm.eval_lvalue_window(&st, &windows[0]) else {
             continue;
         };
+        // 只补"还不存在"的槽。已由其它脚本声明/赋值的共享槽不在装载期
+        // 重置——官方是否"声明即重置"未取证,重置会静默清掉先加载脚本
+        // 的状态,也会在装载期求值 `_RAND`/时间等初始化表达式。
+        if vm.store().slot(lv.var).is_some() {
+            continue;
+        }
         let dims: Vec<usize> = lv.indices.iter().map(|&d| d.max(0) as usize).collect();
         let init = match windows.get(1) {
             Some(w) if !w.payload.is_empty() => vm
