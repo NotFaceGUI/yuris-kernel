@@ -330,6 +330,13 @@ impl Vm {
     /// - 手动模式:`[state+0x36] = 1`(请求清屏);
     /// - 两种模式最后都追加 `'E'`(0x45),再置 `task+9` 让出。
     ///
+    /// **v555 变体**(REA `0x44b920`/`0x44b9e4`/`0x44b824`,三族同型):
+    /// 不追加 C/R/P,只写 `'E'`,并在写前**无条件**置清缓冲请求
+    /// `state+0x15 = 1`;释放路径 `FUN_004047c4` → `FUN_0046b32c`
+    /// 清 `_TEXT`/`_TEXT_FLAG` 与内部写位。由
+    /// [`SemanticProfile::returncode`](crate::semantics::SemanticProfile)
+    /// 精确门控,旧版行为不变。
+    ///
     /// 台账:`COV-M-02`。
     pub(super) fn op_returncode(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         use crate::text::flag as tflag;
@@ -349,19 +356,36 @@ impl Vm {
         st.text_line = i64::from(packed_line as i32);
         st.next_voice = i64::from(next_voice as i32);
 
-        if self.text.output_mode != 0 {
-            // 官方 0x44c39x:'C'/'R' 在追加前写宽/高表;'P' 与 'E' 不写。
-            if self.text.autoclick != 0 {
-                self.text.push_flag_sized(tflag::CLICK);
+        match self.semantics().returncode {
+            crate::semantics::ReturnCodeMode::Legacy => {
+                if self.text.output_mode != 0 {
+                    // 官方 0x44c39x:'C'/'R' 在追加前写宽/高表;'P' 与 'E' 不写。
+                    if self.text.autoclick != 0 {
+                        self.text.push_flag_sized(tflag::CLICK);
+                    }
+                    if self.text.autoreturn != 0 {
+                        self.text.push_flag_sized(tflag::RETURN);
+                    }
+                    if self.text.autopage != 0 {
+                        self.text.push_flag(tflag::PAGE);
+                    }
+                } else {
+                    self.text.clear_pending = true;
+                }
             }
-            if self.text.autoreturn != 0 {
-                self.text.push_flag_sized(tflag::RETURN);
+            crate::semantics::ReturnCodeMode::EndOnly => {
+                // v555(处理体 0x44b920/0x44b9e4/0x44b824,三族同型):
+                // **只**追加 'E',并在追加前无条件置清缓冲请求
+                // `state+0x15 = 1`。C/R/P 由旧代 stdlib 的
+                // `es.TX.OUTPUT.LINEEND` 在脚本侧插入,引擎不写。
+                //
+                // 该请求在文本任务下次被调度时由释放路径消费
+                // (`FUN_004047c4` → `FUN_0046b32c`:清 `_TEXT`/`_TEXT_FLAG`
+                // 与内部写位)。缺这一步会让标志流跨行累加,旧代 stdlib 的
+                // 逐字符尺寸循环按 `_TEXT_FLAG` 序号扫描时错位/越界
+                // (`テキスト内部エラー` + END)。
+                self.text.clear_pending = true;
             }
-            if self.text.autopage != 0 {
-                self.text.push_flag(tflag::PAGE);
-            }
-        } else {
-            self.text.clear_pending = true;
         }
         self.text.push_flag(tflag::END);
         self.emit(VmEvent::ReturnCode {

@@ -143,6 +143,25 @@ pub enum WindowPayloadMode {
     RecordDelimited,
 }
 
+/// `RETURNCODE` 命令的语义形态。
+///
+/// 同名命令在两代引擎里行为不同,必须按 `ysc_version` 门控:
+/// - 0.495 及更早(处理体 `0x44c390`):自动模式按 `AUTOCLICK/AUTORETURN/
+///   AUTOPAGE` 追加 `'C'/'R'/'P'`,最后恒追加 `'E'`;手动模式只置清缓冲
+///   请求 `+0x36` 再追加 `'E'`;
+/// - v555(处理体 `0x44b920`/`0x44b9e4`/`0x44b824`,三族同型):只追加
+///   `'E'`,并**无条件**置清缓冲请求 `state+0x15 = 1`,不追加 C/R/P。
+///   逐字控制由旧代 stdlib 的 `es.TX.OUTPUT.LINEEND` 在脚本侧插入。
+///
+/// 555 是独立商业分支,精确匹配;556/600 没有取证,按 legacy 形态处理。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReturnCodeMode {
+    /// 0.495 及更早。
+    Legacy,
+    /// v555:只写 `'E'` + 无条件清缓冲请求。
+    EndOnly,
+}
+
 /// 本工程已装载表的语义形态(启动时派生一次)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SemanticProfile {
@@ -157,6 +176,8 @@ pub struct SemanticProfile {
     pub text: TextMode,
     /// `TEXTINFO` 命令族形态。
     pub textinfo: TextInfoMode,
+    /// `RETURNCODE` 形态。
+    pub returncode: ReturnCodeMode,
     /// `VARINFO[SJISCODE]` 形态。
     pub varinfo_sjis: SjisCodeMode,
     /// 脚本局部声明的生效时机。
@@ -199,6 +220,11 @@ impl SemanticProfile {
             } else {
                 TextInfoMode::Query
             },
+            returncode: if v555 {
+                ReturnCodeMode::EndOnly
+            } else {
+                ReturnCodeMode::Legacy
+            },
             varinfo_sjis: if v555 {
                 SjisCodeMode::FirstChar
             } else {
@@ -239,6 +265,7 @@ mod tests {
             assert_eq!(p.window_payload, WindowPayloadMode::Exact, "{version}");
             assert_eq!(p.text, TextMode::Attributes, "{version}");
             assert_eq!(p.textinfo, TextInfoMode::Query, "{version}");
+            assert_eq!(p.returncode, ReturnCodeMode::Legacy, "{version}");
             assert_eq!(p.varinfo_sjis, SjisCodeMode::Inert, "{version}");
             assert_eq!(p.script_decls, ScriptDeclMode::Runtime, "{version}");
             assert_eq!(p.ref_int_param, RefIntParamMode::Value, "{version}");
@@ -248,6 +275,7 @@ mod tests {
         assert_eq!(p.window_payload, WindowPayloadMode::RecordDelimited);
         assert_eq!(p.text, TextMode::FileArray);
         assert_eq!(p.textinfo, TextInfoMode::Inert);
+        assert_eq!(p.returncode, ReturnCodeMode::EndOnly);
         assert_eq!(p.varinfo_sjis, SjisCodeMode::FirstChar);
         assert_eq!(p.script_decls, ScriptDeclMode::LoadTime);
         assert_eq!(p.ref_int_param, RefIntParamMode::SlotId);
@@ -259,6 +287,7 @@ mod tests {
             assert_eq!(p.window_payload, WindowPayloadMode::Exact, "{version}");
             assert_eq!(p.text, TextMode::Attributes, "{version}");
             assert_eq!(p.textinfo, TextInfoMode::Query, "{version}");
+            assert_eq!(p.returncode, ReturnCodeMode::Legacy, "{version}");
             assert_eq!(p.varinfo_sjis, SjisCodeMode::Inert, "{version}");
             assert_eq!(p.script_decls, ScriptDeclMode::Runtime, "{version}");
             assert_eq!(p.ref_int_param, RefIntParamMode::Value, "{version}");
