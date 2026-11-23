@@ -17070,3 +17070,25 @@ cargo build -p yu-cli --no-default-features --features desktop --all-targets
 
 档案：`docs/divergences/DIV-RT-069-returncode-clear-semantics.md`、
 `docs/divergences/DIV-GFX-092-webp-asset.md`。
+
+## 成果 V555-FILEINFO-WEBP (2026-11-23) · FILEINFO[CGFILE] 去掉版本门控并补 `.webp` 扩展名
+
+- **问题**:`FILEINFO[CGFILE=基名 EXIST=1 LET=@x]` 对纯 `.webp` 资产
+  返回 0;渲染端能解码同一资产,但脚本可见的存在性查询失败。
+- **取证**:
+  - 0.495 `0x44286c`:CGFILE(kind 2)置 `ebx=3`,EXIST 分支
+    `0x44298a` → `0x442c7f`,先试原路径再按
+    `.png/.bmp/.jpg/.gif/.psb` 探测(表 `0x8079ec..0x807a0c`);
+    ⇒ `yscm.version == 555` 门控没有语义依据。
+  - v555 `b02a4dc04ae 0x43eca8`:CGFILE 与 FILE/SOUNDFILE 同样走
+    `FUN_0043f770`;图像扩展名表 `0x878a00..0x878a28` 含 `.webp`。
+- **修法**:`crates/yu-rt/src/vm/handlers/file_io.rs` 删除
+  `version == 555` 门控;`cg_file_exists` 在 yscfg 扩展名序之后
+  **通用追加 `.webp`**(不按版本判断,旧语料不含该格式)。
+- **回归**:
+  - `fileinfo_cgfile_probes_webp_without_version_gate`(夹具 ysc=495;
+    纯 WebP=1、缺失=0、显式 `.webp`=1、旧 png 序=1);
+  - `cargo test -p yu-rt --test fixture`(145 passed / 7 ignored);
+  - `cargo test -p yu-rt --lib`(153 passed)。
+- **文档**:`docs/divergences/DIV-RT-070-fileinfo-cgfile-webp.md`;
+  `docs/formats/v555-semantic-census-2026-11-23.md` §2.3 标已修。

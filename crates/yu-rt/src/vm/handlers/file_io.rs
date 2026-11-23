@@ -364,11 +364,17 @@ impl Vm {
         }
         // 事件流保持与实现前一致(File 域;宿主忽略 FILEINFO 本身)。
         self.emit_domain(Domain::File, "FILEINFO", args);
-        // CGFILE(REA `0x44316c` 的图像分支;BT 按钮宏 `es_buttonque.yst`
-        // pc341 起逐后缀探测):按 `CG[FILE]` 的扩展名顺序在 VFS 内查
-        // 是否存在。官方把当前 CG 基路径(脚本已带 `cgsys/` 前缀)与
-        // 图像扩展名一起拼;这里不猜前缀,只做 exact + yscfg 扩展名序。
-        if exist && target.is_some() && self.tables().boot.yscm.version == 555 {
+        // CGFILE(0.495 `0x44286c` / v555 `0x43eca8`;BT 按钮宏
+        // `es_buttonque.yst` pc341 起逐后缀探测):按 `CG[FILE]` 的扩展名
+        // 顺序在 VFS 内查是否存在。官方把当前 CG 基路径(脚本已带
+        // `cgsys/` 前缀)与图像扩展名一起拼;这里不猜前缀,只做 exact +
+        // yscfg 扩展名序 + 通用 `.webp`。
+        //
+        // 0.495 与 v555 都读 CGFILE(0.495 `0x44286c` kind 2 → `ebx=3` →
+        // `0x442c7f` 拼扩展名),不能按版本门控;`.webp` 是 v555 扩展名表
+        // 新增项(`0x878a28`),按主人 2026-11-23 口径作为**通用扩展名能力**
+        // 追加,不做 555 判断。
+        if exist && target.is_some() {
             if let Some(bytes) = cgfile {
                 let present = self.cg_file_exists(&bytes);
                 self.report(diag::verbose(
@@ -493,7 +499,13 @@ impl Vm {
         Ok(StepOutcome::Continue)
     }
 
-    /// `FILEINFO[CGFILE EXIST]`:图像资产存在性(无扩展名时按 yscfg 顺序探测)。
+    /// `FILEINFO[CGFILE EXIST]`:图像资产存在性(原 key + yscfg 扩展名序 +
+    /// 通用 `.webp`)。
+    ///
+    /// 两代官方都读 `CGFILE`:0.495 `0x44286c`(kind 2 → `ebx=3` →
+    /// `0x442c7f`)与 v555 `0x43eca8`(kind 2 → `FUN_0043f770`)。v555 的
+    /// 图像扩展名表在 `.psb` 之后还有 `.webp`(`0x878a28`);`.webp` 按
+    /// 通用扩展名能力追加,不做版本门控。
     fn cg_file_exists(&self, bytes: &[u8]) -> bool {
         let exists = |key: &[u8]| {
             yu_vfs::LookupKey::new(key, yu_vfs::Codec::Cp932)
@@ -523,15 +535,25 @@ impl Vm {
         } else {
             order
         };
+        let mut exts: Vec<&'static [u8]> = Vec::new();
         for code in order {
-            let ext: &[u8] = match code {
+            let ext: &'static [u8] = match code {
                 1 => b"png",
                 2 => b"bmp",
                 3 => b"jpg",
                 4 => b"gif",
                 5 => b"psb",
+                // 未取证码不猜;`.webp` 在下面按通用能力补齐。
                 _ => continue,
             };
+            exts.push(ext);
+        }
+        // v555 扩展名表 `.png/.bmp/.jpg/.gif/.psb/.webp` 的最后一项。
+        // 0.495 表没有 `.webp`,但旧语料不含该格式,通用追加不改变旧行为。
+        if !exts.contains(&b"webp".as_slice()) {
+            exts.push(b"webp");
+        }
+        for ext in exts {
             let mut key = bytes.to_vec();
             key.push(b'.');
             key.extend_from_slice(ext);

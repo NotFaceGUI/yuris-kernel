@@ -125,7 +125,7 @@ argc 与槽位序列均以 E1/E2 为准;E4 §6.3 独立复核一致。
 | `GOSUB` / `RETURN` | 单组 `args`/`ret` 数组 | 三组 `args_int/flt/str`、`ret_int/flt/str`;整数引用参数可传槽号(`RefIntParamMode::SlotId`) | 参数名相同;任务书 §3.3;`other/gosub.rs`;555 `0x4428cc/0x442a40`、`0x44b418/0x44b59c` |
 | `VARINFO[SJISCODE]` | 处理体不读该槽(惰性参数) | 读 `SET` 字符串首字符;单字节=字节值,双字节=`(lead<<8)｜trail` | 0.495 `0x456050..0x456ae4` 对槽零引用;555 `0x455200` 的 `0x4554a9`、`0x455b9c` |
 | `VARINFO[STRFIRST]` | 无 | 在 `SET` 字符串数组 `[NO,NO2]` 闭区间内找字典序最小元素,写 `LET` | 555 `0x455200`;语料前后写 `$a[1]`/`$a[2]` 自证 NO2 为闭区间终点 |
-| `FILEINFO[CGFILE]` | 槽存在;**是否读取未逐条取证** | 按 `CG[FILE]` 的图像扩展名序在 VFS 内探测存在性(BT 按钮 `_off/_over/_on/_onover/_na`) | 两代表都有 `CGFILE`(E1/E2);555 `0x43eb34`;语料 `es_buttonque.yst:341` |
+| `FILEINFO[CGFILE]` | 槽存在;**已取证:真读该槽** | 按 `CG[FILE]` 的图像扩展名序在 VFS 内探测存在性(BT 按钮 `_off/_over/_on/_onover/_na`) | 两代表都有 `CGFILE`(E1/E2);0.495 `0x44286c`(kind 2 → `ebx=3`,`0x44298a` → `0x442c7f` 扩展名探测);555 `0x43eb34`/`b02a 0x43eca8`;语料 `es_buttonque.yst:341` |
 | `CGINFO[LINT2]` | 槽存在;类型码 3;旧语义 | 直接回读图层 `+0x60` 按钮号(`CG` 处理体写 `+0x58/+0x60`);类型码 1 | 555 `CGINFO 0x43b090`、`CG 0x423870`;`+0x58/+0x60` 证据见 truth §11.3;E4 §6.3 |
 | `SAVE/LOAD[MEM]` | 无 `MEM` | `MEM=n` 是内存存档槽:写/读 `DAT_008670c0[n]`、容量 `DAT_008678a0[n]`;`MEM=99999` 走 `FUN_0044d82c` 0..499 打包分支 | 555 `SAVE 0x44b6f0`/`LOAD 0x444654`;E4 §16.10;当前实现见 §5 |
 | `CG` | 槽 7/8 = `SX/SY` | 槽 7/8 = `SD/MD`;`SX/SY` 在 9/10 | E1/E2;E3 handler `0x423870` |
@@ -139,8 +139,9 @@ argc 与槽位序列均以 E1/E2 为准;E4 §6.3 独立复核一致。
 因此:
 
 - 不能再用「参数表里有没有 `CGFILE`」来判断 555;
-- 555 启用 CGFILE 探测行为、0.495 是否读取该槽,必须用处理器反汇编回答;
-- 当前内核 `crates/yu-rt/src/vm/handlers/file_io.rs:371` 仍以 `yscm.version == 555` 门控,属于审计 MOVE 待办,不是最终形态。
+- **2026-11-23 已取证**:0.495 `0x44286c` 对 `CGFILE`(kind 2)置 `ebx=3`,EXIST 分支 `0x44298a` 跳 `0x442c7f`,先试原路径再按 `.png/.bmp/.jpg/.gif/.psb` 拼扩展名探测 —— 两代都读该槽;
+- 当前内核 `crates/yu-rt/src/vm/handlers/file_io.rs:371` 的 `yscm.version == 555` 门控**没有语义依据**,属于待删除的特化;
+- v555 的扩展名表在 `.psb` 之后还有 `.webp`,当前 `cg_file_exists` 缺这一候选;详见 `docs/formats/v555-semantic-census-2026-11-23.md` §2.3。
 
 ---
 
@@ -152,7 +153,7 @@ argc 与槽位序列均以 E1/E2 为准;E4 §6.3 独立复核一致。
 | `GOSUB/RETURN` 三组帧 | `crates/yu-rt/src/other/gosub.rs` | 已实现;含任务基帧修复与 fixture |
 | `VARINFO[SJISCODE/STRFIRST/NO2]` | `crates/yu-rt/src/semantics.rs` + `vm/handlers/variables.rs` | 已实现;按语义形态门控 |
 | `CGINFO[LINT2]` | `crates/yu-gfx/src/state.rs` | LINT2 回读已实现;`SEARCH/NUM/NAME/LSET/NO` 未实现(truth 记 31,405 条 unsupported 待分类) |
-| `FILEINFO[CGFILE]` | 共享 `vm/handlers/file_io.rs:371` | 已实现探测;仍按 `yscm.version == 555` 门控,待 MOVE |
+| `FILEINFO[CGFILE]` | 共享 `vm/handlers/file_io.rs:371` | 已实现探测;已删除 `yscm.version == 555` 门控,扩展名链末尾通用追加 `.webp`(DIV-RT-070) |
 | `SAVE/LOAD[MEM]` | 共享 `vm/handlers/file_io.rs:719/984` + `yu-save` | 已实现内存槽;`MEM=99999` 仍 `Unimplemented`(过渡态) |
 | `PRODUCT` | `crates/yu-rt/src/other/handlers/product.rs` | 已实现部分 COM;`COM=21000/10201/10205` 仍 `Unimplemented` |
 | `MOVIE2/MOVIE2END/MOVIE2INFO` | — | 未路由/未实现;静态语料 0 次使用(E4 普查) |
@@ -183,7 +184,7 @@ argc 与槽位序列均以 E1/E2 为准;E4 §6.3 独立复核一致。
 - [ ] `TEXTINFO`:555 `0x452bd0/0x452d54` 参数表为 0;确认空处理体 `return 0`。
 - [ ] `GOSUB/RETURN`:555 `0x442a40/0x44b59c`;确认三组参数窗口与 `PINT/PFLT/PSTR`、`RINT/RFLT/RSTR` 的落位。
 - [ ] `VARINFO`:555 `0x455200` 的 `0x4554a9`(SJISCODE 首字符)、`0x455b9c`(`SHL 8 + trail`)、`STRFIRST`;0.495 `0x456050..0x456ae4` 对 `SJISCODE` 零引用。
-- [ ] `FILEINFO[CGFILE]`:反汇编 0.495 `0x44286c`,确认它是否读 `CGFILE` 槽;再对照 555 `0x43eb34`。**这是当前最大的证据空洞。**
+- [x] `FILEINFO[CGFILE]`:反汇编 0.495 `0x44286c`,确认它**读** `CGFILE` 槽(kind 2 → `ebx=3` → `0x442c7f` 扩展名探测);v555 同槽走 `FUN_0043f770`,扩展名表含 `.webp`。2026-11-23 闭合,见 `v555-semantic-census-2026-11-23.md` §2.3。
 - [ ] `CGINFO[LINT2]`:555 `CG` `0x423870` 写 `+0x58/+0x60`;`CGINFO 0x43b090` 回读;确认 0.495 的 `FX/FY` 删除与类型码 3→1。
 - [ ] `SAVE/LOAD[MEM]`:555 `0x44b6f0/0x444654`;确认 `DAT_008670c0[n]`/`DAT_008678a0[n]` 与 `MEM=99999` 的 `FUN_0044d82c`。
 - [ ] `CG` 槽 7/8/9/10:确认处理器按参数名取值,不存在槽号常量。
@@ -223,3 +224,4 @@ argc 与槽位序列均以 E1/E2 为准;E4 §6.3 独立复核一致。
 > 后续模型每次复查追加一条:日期 / 证据 ID / 命令 / 结果 / 是否修改结论。
 
 - 2026-11-21:首次建立。E1/E2/E3/E4 一致确认 14 条参数表变化;E5 确认 8 组同名异构;发现 `FILEINFO[CGFILE]` 旧审计理由错误,记入 §4.1/§7。
+- 2026-11-23:语义普查(见 `docs/formats/v555-semantic-census-2026-11-23.md`)。确认 §4 的 8 组不完整(缺 `RETURNCODE`,已由 DIV-RT-069 补);闭合 `FILEINFO[CGFILE]` 证据空洞(0.495 `0x44286c` 读该槽);新增 `TEXT[CLEAR]` 时机、`WORD`/`_` 逐字符表删除、`LET` 系统变量写入、`FONT NAME`、`WAIT` 边界等结论。0.495 与 v555 处理体归一化反汇编相似度:15 条命令 1.000 一致,差异集中在 text/查询/文件/任务边界。

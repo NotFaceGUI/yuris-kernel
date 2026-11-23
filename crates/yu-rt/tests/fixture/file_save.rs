@@ -99,6 +99,68 @@ fn fileinfo_exist_writes_float_target() {
     );
 }
 
+/// `FILEINFO[CGFILE]` 是两代共有语义(0.495 `0x44286c` / v555
+/// `0x43eca8`),不能按 `yscm.version` 门控;v555 的图像扩展名表在
+/// `.psb` 之后还有 `.webp`(`0x878a28`),内核按通用扩展名能力在候选链
+/// 末尾追加。
+///
+/// 本夹具的 `ysc.ybn` 头是 495:修复前 CGFILE 分支被 `version == 555`
+/// 跳过,纯 WebP 资产会被判 0。
+#[test]
+fn fileinfo_cgfile_probes_webp_without_version_gate() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = (0..4)
+        .map(|offset| VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + offset,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(-1),
+        })
+        .collect();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let cgfile = |path: &str, letv: Vec<u8>| {
+        GroupSpec::new(OP_FILEINFO)
+            .window(2, ex::s(path))
+            .window(4, ex::i8_(1))
+            .window(7, letv)
+    };
+    b.scripts = vec![vec![
+        // 纯 WebP:v555 扩展名表新增项。
+        cgfile("cg/title", ex::r#ref(0x40, sys)),
+        // 不存在:仍必须写 0,不能跳过 LET。
+        cgfile("cg/missing", ex::r#ref(0x40, sys + 1)),
+        // 已带扩展名:原 key 命中,不再拼接。
+        cgfile("cg/explicit.webp", ex::r#ref(0x40, sys + 2)),
+        // 旧扩展名序仍生效(png 优先于追加的 webp)。
+        cgfile("cg/plain", ex::r#ref(0x40, sys + 3)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot_with_files(
+        b,
+        &[
+            (b"cg/title.webp", b"RIFF"),
+            (b"cg/explicit.webp", b"RIFF"),
+            (b"cg/plain.png", b"\x89PNG"),
+        ],
+    );
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let read = |offset: u16| {
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + offset), &[])
+            .unwrap()
+    };
+    assert_eq!(read(0), Value::Int(1), "纯 WebP 资产必须判存在");
+    assert_eq!(read(1), Value::Int(0), "不存在必须写 0");
+    assert_eq!(read(2), Value::Int(1), "显式 .webp 必须命中");
+    assert_eq!(read(3), Value::Int(1), "yscfg 扩展名序仍生效");
+}
+
 /// `FILEINFO[FOLDER=...]`(手册例 2;REA `0x4433d6`):
 /// - `EXIST` 只查散盘目录(`FILE_ATTRIBUTE_DIRECTORY`),包内文件夹不可查;
 /// - `SIZE` 对 FOLDER 写 0(官方只支持 FILE);
