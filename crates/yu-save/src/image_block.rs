@@ -70,6 +70,17 @@ pub const LAYOUT_0495: Layout = Layout {
     wh_offset: 0x78,
 };
 
+/// v555 商业分支(`0x1E0` 容器)官方布局:A=1680,w/h 在 +0x88。
+///
+/// 证据:官方 `<v555-kuro>/save00001..6.sd` 的 DNO=3 原始载荷
+/// `A=1680 B=55896`,B/4=137×102;A 内 `+0x88`(以及镜像 `+0xf0`)
+/// 为 `137,102`。0.495 同容器版本仍是 A=1600/+0x78,所以不能只按
+/// 容器版本选;写侧由 `SemanticProfile` 选择本布局。
+pub const LAYOUT_V555: Layout = Layout {
+    descriptor_len: 1680,
+    wh_offset: 0x88,
+};
+
 /// 由存档容器版本选图像块布局。
 ///
 /// **唯一版本表在 [`crate::profile::profile_for`]**(图像布局与块类型 0
@@ -81,10 +92,17 @@ pub fn layout_for_container_version(version: u32) -> Option<Layout> {
     crate::profile::profile_for(version).and_then(|profile| profile.image_layout)
 }
 
-/// `0x80..0x90` 在两个官方样本里为常量(`00 01 00 01 00000000 00010000 00000100`)。
+/// `0x80..0x90` 在 0.495/0.479 官方样本里为常量
+/// (`00 01 00 01 00000000 00010000 00000100`)。
 const DESCRIPTOR_CONST: [u8; 16] = [
     0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
 ];
+
+/// v555 `A=1680` 描述符 `0x80..0x88` 常量(官方 `<v555-kuro>` 5 份存档一致)。
+const DESCRIPTOR_CONST_V555: [u8; 8] = [0x80, 0x00, 0x00, 0x00, 0x80, 0x80, 0x80, 0x00];
+
+/// v555 描述符 w/h 的镜像偏移(官方同时写 `+0x88` 与 `+0xf0`)。
+const WH_MIRROR_V555: usize = 0xF0;
 
 /// R/B 互换(自逆):磁盘 B 段是官方 BGRA8,内部表示是 RGBA8,编解码各走一次。
 fn swap_rb(pixels: &[u8]) -> Vec<u8> {
@@ -98,10 +116,22 @@ fn swap_rb(pixels: &[u8]) -> Vec<u8> {
 /// 组装图像块 raw 载荷(`[lenA][lenB][A][B]`;B 段按官方像素序落 BGRA)。
 pub fn encode(image: &CapturedImage, layout: Layout) -> Vec<u8> {
     let mut descriptor = vec![0u8; layout.descriptor_len];
+    // 先写常量区,再写 w/h:v555 的 w/h 在 +0x88,与 0x80..0x90 常量区
+    // 重叠,后写 w/h 才不会被旧 16 字节常量覆盖。
+    if layout.descriptor_len == 1680 {
+        descriptor[0x80..0x88].copy_from_slice(&DESCRIPTOR_CONST_V555);
+    } else {
+        descriptor[0x80..0x90].copy_from_slice(&DESCRIPTOR_CONST);
+    }
     let wh = layout.wh_offset;
     descriptor[wh..wh + 4].copy_from_slice(&image.width.to_le_bytes());
     descriptor[wh + 4..wh + 8].copy_from_slice(&image.height.to_le_bytes());
-    descriptor[0x80..0x90].copy_from_slice(&DESCRIPTOR_CONST);
+    if layout.descriptor_len == 1680 {
+        descriptor[WH_MIRROR_V555..WH_MIRROR_V555 + 4]
+            .copy_from_slice(&image.width.to_le_bytes());
+        descriptor[WH_MIRROR_V555 + 4..WH_MIRROR_V555 + 8]
+            .copy_from_slice(&image.height.to_le_bytes());
+    }
     let mut out = Vec::with_capacity(8 + descriptor.len() + image.rgba.len());
     out.extend_from_slice(&(descriptor.len() as u32).to_le_bytes());
     out.extend_from_slice(&(image.rgba.len() as u32).to_le_bytes());
@@ -120,10 +150,12 @@ fn wh_offsets(a_len: usize) -> &'static [usize] {
         1520 => &[LAYOUT_0466.wh_offset],
         1536 => &[LAYOUT_0479.wh_offset],
         1600 => &[LAYOUT_0495.wh_offset],
+        1680 => &[LAYOUT_V555.wh_offset],
         _ => &[
             LAYOUT_0466.wh_offset,
             LAYOUT_0479.wh_offset,
             LAYOUT_0495.wh_offset,
+            LAYOUT_V555.wh_offset,
         ],
     }
 }
@@ -225,6 +257,25 @@ mod tests {
         assert_eq!(u32::from_le_bytes(a[0x70..0x74].try_into().unwrap()), 137);
         assert_eq!(u32::from_le_bytes(a[0x74..0x78].try_into().unwrap()), 102);
         assert_eq!(decode(&raw).unwrap(), img);
+    }
+
+    /// v555 同容器版本 `0x1E0` 但描述符 A=1680/+0x88;读侧按 A 长度识别。
+    #[test]
+    fn roundtrip_v555_uses_1680_descriptor() {
+        let img = sample(137, 102);
+        let raw = encode(&img, LAYOUT_V555);
+        assert_eq!(raw.len(), 8 + 1680 + 137 * 102 * 4);
+        assert_eq!(&raw[0..4], &1680u32.to_le_bytes());
+        let a = &raw[8..8 + 1680];
+        assert_eq!(u32::from_le_bytes(a[0x88..0x8c].try_into().unwrap()), 137);
+        assert_eq!(u32::from_le_bytes(a[0x8c..0x90].try_into().unwrap()), 102);
+        assert_eq!(decode(&raw).unwrap(), img);
+
+        let body = yu_format::yssd::encode_block_body_zlib9(1, 1, 0, &raw);
+        assert_eq!(&body[12..14], &[0x78, 0xda], "v555 图像块 zlib level9");
+        let clen = u32::from_le_bytes(body[8..12].try_into().unwrap());
+        let restored = yu_format::yssd::zlib_decompress(&body[12..], clen, b"image", 3).unwrap();
+        assert_eq!(restored, raw);
     }
 
     /// 布局选择由容器版本驱动;未取证版本(如 0x0555)必须返回 `None`,

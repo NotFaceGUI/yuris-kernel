@@ -50,18 +50,26 @@ impl Vm {
                     .set_counter_code(i64::from(code), v);
                 return Ok(StepOutcome::Continue);
             }
-            // 按钮族但 ABI 表无此名(如 `_KEY_ANY`):旧路径的 `set_counter`
-            // 是空操作 —— 保留「求值 RHS 后什么也不写」的同一可观察行为。
-            let button_family = {
+            // 按钮族:按按钮名写同一张帧计数器表。官方 v555 LET
+            // `0x4441e5`(id 0x93..0x113)按映射表取下标后调用
+            // `FUN_00444750`;该函数按当前物理 down 状态钳制(与
+            // `InputState::Counter::write` / 0.495 `FUN_00447014` 同型)。
+            // ABI 表里没有的按钮族名(`_KEY_ANY` 等)仍保持求值后不写。
+            let (button_family, button_name) = {
                 let name = self
                     .sysvars()
                     .get(lval.var.id)
                     .map(|d| d.name.as_str())
                     .unwrap_or("");
-                button_family_rest(name).is_some()
+                (
+                    button_family_rest(name).is_some(),
+                    name.trim_start_matches('_').to_string(),
+                )
             };
             if button_family {
-                let _ = self.eval_window(st, &cmd.windows[1])?;
+                let rhs = self.eval_window(st, &cmd.windows[1])?;
+                let v = rhs.as_int().unwrap_or(0);
+                self.input_state_mut().set_counter(&button_name, v);
                 return Ok(StepOutcome::Continue);
             }
             // 其余分支需要完整名字串(数量少,不在热路径):
@@ -171,6 +179,155 @@ impl Vm {
                 let v = rhs.as_int().unwrap_or(0);
                 self.input_state_mut().set_pad_counter(code, v, is_num);
                 return Ok(StepOutcome::Continue);
+            }
+            // v555 商业运行面专属:`_DROPFILE_NUM` / `_INT` / `_PINT`。
+            // 这些名字只由 `other` 运行面声明;旧版走到这里仍是挂号。
+            if self.other.is_some() {
+                // 官方 `0x443988` 的 int 分支 id 0x0f:直接把 RHS 低 32 位
+                // 写进 `DAT_008724ac`(不按物理状态钳制)。
+                if name == "_DROPFILE_NUM" {
+                    let rhs = self.eval_window(st, &cmd.windows[1])?;
+                    let v = rhs.as_int().unwrap_or(0);
+                    if let Some(state) = self.other.as_mut() {
+                        state.drop_file_num = v as u32;
+                    }
+                    return Ok(StepOutcome::Continue);
+                }
+                // 官方 id 0x32:`_INT(槽号[,元素])` 是动态变量写入。
+                // 目标槽必须已声明为 int(否则 `0x1a6c6`),然后按
+                // LET 复合赋值码写变量表。
+                if name == "_INT" {
+                    let (slot, index) = match lval.indices.as_slice() {
+                        [slot] => (*slot, 0i64),
+                        [slot, index] => (*slot, *index),
+                        _ => {
+                            self.report(diag::recoverable(
+                                code::rt::SYSVAR_WRITE,
+                                Boundary::Script,
+                                format!(
+                                    "_INT 写入需要 1..2 个下标(槽号[,元素]),得到 {} 个",
+                                    lval.indices.len()
+                                ),
+                            ));
+                            return Ok(StepOutcome::Continue);
+                        }
+                    };
+                    // 官方片段只证据了目标变量类型检查(0x1a6c6);槽号
+                    // 是否有 1000 下界未取证,不做未证实的预检。只保留
+                    // ABI 宽度校验(变量 id 是 u16),其余交给变量表:
+                    // 未声明走 VAR_UNDECLARED,不静默丢写。
+                    if !(0..=i64::from(u16::MAX)).contains(&slot) {
+                        self.report(diag::recoverable(
+                            code::rt::SYSVAR_WRITE,
+                            Boundary::Script,
+                            format!("_INT 目标槽 {slot} 超出变量 id 宽度 0..={}", u16::MAX),
+                        ));
+                        return Ok(StepOutcome::Continue);
+                    }
+                    let Some(var) = self.store().find_by_id(slot as u16, VarSpace::At) else {
+                        self.report(diag::recoverable(
+                            code::rt::VAR_UNDECLARED,
+                            Boundary::Script,
+                            format!("_INT 目标变量 @{slot} 未声明(官方 0x1a6c6)"),
+                        ));
+                        return Ok(StepOutcome::Continue);
+                    };
+                    let Some(shape) = self.store().slot(var) else {
+                        self.report(diag::recoverable(
+                            code::rt::VAR_UNDECLARED,
+                            Boundary::Script,
+                            format!("_INT 目标变量 @{slot} 未声明(官方 0x1a6c6)"),
+                        ));
+                        return Ok(StepOutcome::Continue);
+                    };
+                    if shape.ty != ElemType::Int {
+                        self.report(diag::recoverable(
+                            code::rt::VAR_TYPE,
+                            Boundary::Script,
+                            format!("_INT 目标 @{slot} 不是 int(官方 0x1a6c6)"),
+                        ));
+                        return Ok(StepOutcome::Continue);
+                    }
+                    let scalar = shape.dims.is_empty();
+                    // 官方槽表把标量当 1 元素:无第二下标时元素 0 合法。
+                    let write_index: &[i64] = if scalar {
+                        if index != 0 {
+                            self.report(diag::recoverable(
+                                code::rt::VAR_SHAPE,
+                                Boundary::Script,
+                                format!("_INT 目标 @{slot} 是标量,元素下标 {index} 越界"),
+                            ));
+                            return Ok(StepOutcome::Continue);
+                        }
+                        &[]
+                    } else {
+                        core::slice::from_ref(&index)
+                    };
+                    let rhs = self.eval_window(st, &cmd.windows[1])?;
+                    let rhs = Value::Int(rhs.as_int().unwrap_or(0));
+                    let op = (cmd.windows[0].rec.slot >> 8) as u8;
+                    let cur = self.store().read(var, write_index).unwrap_or(Value::Int(0));
+                    let value = if op == 0 {
+                        rhs
+                    } else {
+                        compound(op, &cur, &rhs)?
+                    };
+                    self.store.write(var, write_index, &value)?;
+                    return Ok(StepOutcome::Continue);
+                }
+                // 官方 id 0x35:`_PINT(n) = v` 写当前 GOSUB 帧的 int 参数
+                // 数组 `+0x10 + (n-1)*8`,同样按 LET 复合赋值码。
+                if name == "_PINT" {
+                    // 官方缺参形态未取证:不默认 1,显式报可恢复诊断。
+                    let Some(&n) = lval.indices.first() else {
+                        self.report(diag::recoverable(
+                            code::rt::SYSVAR_WRITE,
+                            Boundary::Script,
+                            "_PINT 写入缺参数号(官方缺参行为未取证,不猜)",
+                        ));
+                        return Ok(StepOutcome::Continue);
+                    };
+                    if !(1..=16).contains(&n) {
+                        self.report(diag::recoverable(
+                            code::rt::SYSVAR_WRITE,
+                            Boundary::Script,
+                            format!("_PINT 参数编号 {n} 超出 1..16"),
+                        ));
+                        return Ok(StepOutcome::Continue);
+                    }
+                    let idx = (n - 1) as usize;
+                    let task = self.current_task().to_string();
+                    let frame = self
+                        .other
+                        .as_ref()
+                        .and_then(|s| s.gosub_frames.get(&task))
+                        .and_then(|f| f.last());
+                    let Some(frame) = frame else {
+                        self.report(diag::recoverable(
+                            code::rt::SYSVAR_WRITE,
+                            Boundary::Script,
+                            "_PINT 写入时不在 GOSUB 帧内(官方 0x18b1e)",
+                        ));
+                        return Ok(StepOutcome::Continue);
+                    };
+                    let cur = frame.args_int[idx].clone().unwrap_or(Value::Int(0));
+                    let rhs = self.eval_window(st, &cmd.windows[1])?;
+                    let rhs = Value::Int(rhs.as_int().unwrap_or(0));
+                    let op = (cmd.windows[0].rec.slot >> 8) as u8;
+                    let value = if op == 0 {
+                        rhs
+                    } else {
+                        compound(op, &cur, &rhs)?
+                    };
+                    if let Some(state) = self.other.as_mut() {
+                        if let Some(frame) =
+                            state.gosub_frames.get_mut(&task).and_then(|f| f.last_mut())
+                        {
+                            frame.args_int[idx] = Some(value);
+                        }
+                    }
+                    return Ok(StepOutcome::Continue);
+                }
             }
         }
         // 其它系统变量写入:语义未取证 ⇒ 挂号(DIV-RT-007)。

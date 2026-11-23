@@ -18,6 +18,8 @@ use yu_log::Diag;
 /// 独立运行面状态(只在安装后存在;旧版 `Vm.other == None`)。
 pub(crate) struct State {
     pub(crate) drop_files: Vec<Vec<u8>>,
+    /// `_DROPFILE_NUM` 的脚本可写镜像(官方 v555 `DAT_008724ac`)。
+    pub(crate) drop_file_num: u32,
     pub(crate) last_text_lines: usize,
     pub(crate) gosub_frames: std::collections::BTreeMap<String, Vec<gosub::GosubFrame>>,
     /// 已执行装载期静态声明的脚本(避免重复 reset)。
@@ -30,6 +32,7 @@ impl State {
     fn new() -> Self {
         Self {
             drop_files: Vec::new(),
+            drop_file_num: 0,
             last_text_lines: 0,
             gosub_frames: std::collections::BTreeMap::new(),
             statics_applied: std::collections::BTreeSet::new(),

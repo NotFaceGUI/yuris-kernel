@@ -229,9 +229,23 @@ pub fn zlib_decompress(
 /// 一致由 `tests/yssd_roundtrip.rs` 对全部官方产物断言)。
 #[must_use]
 pub fn zlib_compress_level1(raw: &[u8]) -> Vec<u8> {
+    zlib_compress(raw, 1)
+}
+
+/// v555 缩略图块专用的 zlib level 9(`78 da`)。
+///
+/// 证据:官方 `<v555-kuro>/save00001.sd` DNO=3 的压缩流按 zlib level 8/9
+/// 重压**逐字节一致**;同文件的变量块仍可是 Snappy,说明图像块有独立
+/// 压缩路径。
+#[must_use]
+pub fn zlib_compress_level9(raw: &[u8]) -> Vec<u8> {
+    zlib_compress(raw, 9)
+}
+
+fn zlib_compress(raw: &[u8], level: u32) -> Vec<u8> {
     let mut encoder = flate2::write::ZlibEncoder::new(
         Vec::with_capacity(raw.len() / 2 + 64),
-        flate2::Compression::new(1),
+        flate2::Compression::new(level),
     );
     // Vec 的 Write 永不失败(容量不足只会扩容)。
     let _ = encoder.write_all(raw);
@@ -519,13 +533,35 @@ pub fn encode_block_body_with(
     raw_payload: &[u8],
 ) -> Vec<u8> {
     let compressed = codec.compress(raw_payload);
+    assemble_block_body(btype, strict, var_id, raw_payload.len(), &compressed)
+}
+
+/// 同 [`encode_block_body`],压缩层固定 zlib level 9(v555 缩略图块)。
+#[must_use]
+pub fn encode_block_body_zlib9(
+    btype: u8,
+    strict: u8,
+    var_id: u16,
+    raw_payload: &[u8],
+) -> Vec<u8> {
+    let compressed = zlib_compress_level9(raw_payload);
+    assemble_block_body(btype, strict, var_id, raw_payload.len(), &compressed)
+}
+
+fn assemble_block_body(
+    btype: u8,
+    strict: u8,
+    var_id: u16,
+    raw_len: usize,
+    compressed: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + compressed.len());
     out.push(btype);
     out.push(strict);
     out.extend_from_slice(&var_id.to_le_bytes());
     out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(raw_payload.len() as u32).to_le_bytes());
-    out.extend_from_slice(&compressed);
+    out.extend_from_slice(&(raw_len as u32).to_le_bytes());
+    out.extend_from_slice(compressed);
     out
 }
 

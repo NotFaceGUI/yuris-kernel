@@ -193,12 +193,14 @@ impl Vm {
                         let n = files.len();
                         if let Some(state) = self.other.as_mut() {
                             state.drop_files = files;
+                            state.drop_file_num = n as u32;
                         }
                         n
                     }
                     None => {
                         if let Some(state) = self.other.as_mut() {
                             state.drop_files.clear();
+                            state.drop_file_num = 0;
                         }
                         0
                     }

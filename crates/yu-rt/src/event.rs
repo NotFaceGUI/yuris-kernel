@@ -746,6 +746,16 @@ pub trait SaveHost {
     /// `LOAD[FILE DNO=n]` 读一块恢复数据(容器解析归宿主;写回归 VM)。
     fn load_block(&mut self, file: &str, dno: u32) -> Result<LoadedBlock, Diag>;
 
+    /// `LOAD[FILE DNO=1024]`:读取官方 500 槽内存打包块
+    /// (v555 `0x4447c8` → `FUN_004453f4`)。该分支不写 `LET`。
+    fn load_mem_pack(&mut self, file: &str) -> Result<(), Diag> {
+        let _ = file;
+        Err(crate::diag::cmd_unimplemented(
+            "LOAD",
+            "宿主未实现 LOAD[FILE DNO=1024] 内存打包槽",
+        ))
+    }
+
     /// `SAVE[MEM=n]`:把当前预约表按与 `SAVE[FILE]` 相同的 YSSD 容器
     /// 序列化到内存槽(v555 `0x44b874` MEM 分支;槽号是脚本表达式)。
     fn save_mem(&mut self, slot: u32) -> Result<(), Diag> {
@@ -757,10 +767,11 @@ pub trait SaveHost {
     }
 
     /// `SAVE[MEM=99999]`:把 0..499 号内存槽打包成官方 `DAT_0086a03c`
-    /// 形态(555 `0x44b874` 的独立分支 → `FUN_0044d82c`)。
+    /// 形态(555 `0x44b874` 的独立分支 → `FUN_0044d7a8`)。
     ///
-    /// 脚本可见语义只有「成功返回」;打包字节由宿主保留(官方 exe 内
-    /// 没有直接消费者,`LOAD[FILE DNO=1024]` 读的是同型文件)。
+    /// 脚本可见语义只有「成功返回」;打包字节由宿主保留为下一次
+    /// `SAVE[FILE]` 的 DNO=1024 块体(官方 `FUN_0044d7a8`),`LOAD[FILE
+    /// DNO=1024]` 再按同一形态读回。
     fn pack_mem(&mut self) -> Result<(), Diag> {
         Err(crate::diag::cmd_unimplemented(
             "SAVE",

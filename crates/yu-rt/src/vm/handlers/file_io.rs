@@ -828,12 +828,12 @@ impl Vm {
         }
         self.emit_domain(Domain::Save, "SAVE", args);
         // v555 `MEM=99999` 是**参数装载后的独立分支**(REA `0x44b874:142`):
-        // 官方立即 `FUN_0044d82c(); return 0`,不处理 DNO/SET/ID/G_*,
+        // 官方立即 `FUN_0044d7a8(); return 0`,不处理 DNO/SET/ID/G_*,
         // 也不刷文件。必须放在预约块之前,避免把同条命令的 SET 误预约。
         if mem == Some(99_999) {
-            // 0..499 内存槽打包到 `DAT_0086a03c`(12 字节头 + 每槽
-            // 原始长/压缩长/压缩数据)。官方 exe 内没有该缓冲的直接消费者;
-            // 脚本可见语义只是「成功返回」。字节由宿主保存,便于取证/导出。
+            // 0..499 内存槽打包到 `DAT_0086a03c`(12 字节块头 + 每槽
+            // 原始长/压缩长/压缩数据)。脚本可见语义只是「成功返回」;
+            // 宿主把该块体留给下一次 `SAVE[FILE]` 写成 DNO=1024。
             let failure = match self.save_host.as_mut() {
                 Some(host) => host.pack_mem().err(),
                 None => None,
@@ -1140,7 +1140,7 @@ impl Vm {
             };
             if mem_slot == Some(99_999) {
                 // 官方 LOAD 处理体没有 99999 特殊分支(只有 SAVE 的
-                // `0x44b874` → `FUN_0044d82c` 打包);99999 不是合法内存槽。
+                // `0x44b874` → `FUN_0044d7a8` 打包);99999 不是合法内存槽。
                 // 不猜官方 OOB 行为:显式拒绝,不读写任何状态。
                 self.report(diag::recoverable(
                     code::rt::CMD_SLOT,
@@ -1234,6 +1234,27 @@ impl Vm {
                 "LOAD[MEM=99999]:官方 LOAD 无 99999 分支(SAVE 才有 0..499 \
                  打包);拒绝执行,不猜",
             ));
+            return Ok(StepOutcome::Continue);
+        }
+        // v555 `LOAD[FILE DNO=1024]` 是**文件分支的独立形态**:官方
+        // `0x4447c8` 读到 DNO=1024 后跳 `FUN_004453f4`,按 12 字节头 +
+        // 500 槽打包格式恢复内存槽,并忽略 `LET`。不能落到通用单块读取。
+        if mem_slot.is_none() && dno == 1024 {
+            let Some(file) = file.as_deref() else {
+                self.report(diag::recoverable(
+                    code::rt::CMD_SLOT,
+                    Boundary::Script,
+                    "LOAD[FILE DNO=1024] 缺 FILE",
+                ));
+                return Ok(StepOutcome::Continue);
+            };
+            let result = match self.save_host.as_mut() {
+                Some(host) => host.load_mem_pack(&Self::ensure_sd_ext(file)),
+                None => Ok(()),
+            };
+            if let Err(d) = result {
+                self.report(d);
+            }
             return Ok(StepOutcome::Continue);
         }
         let (dno, target) = (dno as u32, target);

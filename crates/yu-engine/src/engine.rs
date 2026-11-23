@@ -3492,12 +3492,10 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
                 .save_codec
                 .unwrap_or_else(|| detect_block_codec(project.root()));
             state.set_block_codec(codec);
-            // `SAVE[FILE]` 的 DNO=1024 历史块形态由 `SemanticProfile`
-            // 单点门控;宿主/引擎不直接比较版本号。
-            if vm.semantics().save_history
-                == yu_rt::semantics::SaveHistoryMode::AppendCore
-            {
-                state.set_history_enabled(true);
+            // v555 与 0.495 共用容器 0x1E0,但缩略图描述符是 A=1680/+0x88;
+            // 由语义层决定,不在这里比较版本号。
+            if vm.semantics().save_image == yu_rt::semantics::SaveImageMode::V555 {
+                state.set_image_layout_override(Some(yu_save::image_block::LAYOUT_V555));
             }
             // 容器版本 = **官方 exe 的 LOAD 校验常量**,不是 yscfg/引擎版本:
             // 0.495→0x1E0、0.479→0x138、0.466→0x0C0、0.481→0x1E1(REA

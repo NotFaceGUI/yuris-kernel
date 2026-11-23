@@ -97,6 +97,9 @@ pub struct SaveState {
     /// 块载荷压缩层:从盘上 `.sd` 学到的值(0.495 SDK = zlib;0.481 商业包
     /// 随包带 `YSSnp.dll` = Snappy)。`None` = 还没见过存档 ⇒ 写 zlib。
     block_codec: Option<yu_format::yssd::BlockCodec>,
+    /// 图像块布局覆盖:v555 与 0.495 共用容器 `0x1E0`,但描述符分别为
+    /// A=1680/+0x88 与 A=1600/+0x78;由引擎按 `SemanticProfile` 注入。
+    image_layout_override: Option<crate::image_block::Layout>,
     /// 未刷盘预约(DNO → 快照;同 DNO 覆盖)。
     reservations: BTreeMap<u32, ReservedFact>,
     /// `SAVE[MEM=n]` 的内存存档槽(n → 容器字节)。
@@ -107,17 +110,20 @@ pub struct SaveState {
     /// `DAT_00868860[n]`)。槽号是脚本表达式,实测覆盖 `0..=90000+`
     /// (<v555-pc> `SAVE[MEM=@base+90000]`),所以用稀疏表,不设人为上限。
     ///
-    /// `MEM=99999` 是独立分支(`FUN_0044d82c`:把 0..499 号槽打包到
+    /// `MEM=99999` 是独立分支(`FUN_0044d7a8`:把 0..499 号槽打包到
     /// `DAT_0086a03c`),不是普通槽;本状态机不把它塞进本表。
     mem_slots: BTreeMap<u32, Vec<u8>>,
     /// `SAVE[MEM=99999]` 的打包结果(官方 `DAT_0086a03c`)。
     ///
-    /// 格式(REA `0x44d82c`):12 字节头 + 500 条
-    /// `u32 原始长 | u32 压缩长 | 压缩数据`;头 = `0,1,0u16,
-    /// u32 打包总长,u32 解包总长`。官方 exe 内除本函数外没有直接消费者
-    /// (仅 `LOAD[FILE DNO=1024]` 的 `FUN_004453f4` 读同型文件);这里保留
-    /// 可取证/可宿主导出的字节,不冒充脚本可见状态。
+    /// 格式(REA `0x44d7a8`):**完整 YSSD 块体** = 12 字节头
+    /// `0,1,0u16,u32 打包总长,u32 解包总长` + 500 条
+    /// `u32 原始长 | u32 压缩长 | 压缩数据`。这 12 字节头就是外层
+    /// DNO=1024 块头,写盘时直接 `set_block(1024, 本缓冲)`;读侧
+    /// `FUN_004453f4` 先读同一 12 字节块头,再读 500 条槽记录。
     packed_mem: Option<Vec<u8>>,
+    /// `pack_mem()` 之后等待下一次 `SAVE[FILE]` 写入 DNO=1024;写盘成功后
+    /// 消费。系统存档(gsd/config/...)不调用 `MEM=99999`,因此不会带该块。
+    mem_pack_pending: bool,
     /// 诊断(容量上限 [`MAX_DIAGS`],超限丢最旧并记账)。
     diags: std::collections::VecDeque<Diag>,
     diags_dropped: u64,
@@ -150,9 +156,11 @@ impl SaveState {
             container_version: None,
             learned_version: None,
             block_codec: None,
+            image_layout_override: None,
             reservations: BTreeMap::new(),
             mem_slots: BTreeMap::new(),
             packed_mem: None,
+            mem_pack_pending: false,
             diags: std::collections::VecDeque::new(),
             diags_dropped: 0,
             save_calls: 0,
@@ -483,6 +491,14 @@ impl SaveState {
         self.block_codec = Some(codec);
     }
 
+    /// 覆盖图像块描述符布局。`None` = 继续按容器版本档案选。
+    ///
+    /// v555 与 0.495 共用容器 `0x1E0`;写侧只有语义层知道当前是 v555,
+    /// 因此由引擎在装配时注入 `LAYOUT_V555`。
+    pub fn set_image_layout_override(&mut self, layout: Option<crate::image_block::Layout>) {
+        self.image_layout_override = layout;
+    }
+
     /// `SAVE[FILE="x"]`:刷盘。按 DNO 升序流出**预约时**的快照
     /// (REA `0x44cd5a..0x44ceab`:写头/偏移表 + 逐块写;预约表不清)。
     ///
@@ -506,10 +522,23 @@ impl SaveState {
             .ok()
             .and_then(|head| container_version_of(&head));
         let mut image_layout_diags: Vec<Diag> = Vec::new();
+        let source = format!("SAVE[FILE={file}]");
+        // `SAVE[MEM=99999]` 预处理过的 500 槽内存包:紧接的文件存档把它
+        // 原样写成 DNO=1024 块体(官方 `FUN_0044d7a8` 的 12 字节块头 +
+        // 500 条槽记录)。系统存档不调用 MEM=99999,因此没有该块。
+        let mem_pack_block = if self.mem_pack_pending {
+            self.packed_mem.clone()
+        } else {
+            None
+        };
+        let had_pack = mem_pack_block.is_some();
+        let preserved = self.existing_blocks(&path);
         let bytes = self.build_container(
             target_version,
-            &format!("SAVE[FILE={file}]"),
+            &source,
             &mut image_layout_diags,
+            preserved,
+            mem_pack_block,
         )?;
         self.fs.write(&path, &bytes).map_err(|e| {
             // 诊断必须带**解析后的绝对路径**:只报 `config.sd` 时「写到哪、
@@ -520,6 +549,9 @@ impl SaveState {
                 format!("SAVE[FILE={file}] 写入失败: {e}(目标 {})", path.display()),
             )
         })?;
+        if had_pack {
+            self.mem_pack_pending = false;
+        }
         self.refresh_slots();
         for diag in image_layout_diags {
             self.push_diag(diag);
@@ -535,7 +567,14 @@ impl SaveState {
     /// 预约表同样不清(官方 `SAVEEND` 才清)。
     pub fn save_mem(&mut self, slot: u32) -> Result<(), Diag> {
         let mut diags = Vec::new();
-        let bytes = self.build_container(None, &format!("SAVE[MEM={slot}]"), &mut diags)?;
+        let preserved = BTreeMap::new();
+        let bytes = self.build_container(
+            None,
+            &format!("SAVE[MEM={slot}]"),
+            &mut diags,
+            preserved,
+            None,
+        )?;
         self.mem_slots.insert(slot, bytes);
         for diag in diags {
             self.push_diag(diag);
@@ -545,7 +584,7 @@ impl SaveState {
 
     /// `SAVE[MEM=99999]`:把 0..499 号内存槽打包成官方 `DAT_0086a03c` 形态。
     ///
-    /// 证据(REA 555 `0x44d82c`):
+    /// 证据(REA 555 `0x44d7a8`):
     /// - 12 字节头:`0` / `1` / `u16 0` / `u32 packed_total` /
     ///   `u32 unpacked_total`;
     /// - 每槽 `u32 raw_len | u32 comp_len | comp`;空槽 raw/comp 均为 0、
@@ -557,9 +596,9 @@ impl SaveState {
     ///   全量反编译只有读点、没有写点 ⇒ 当前按 zlib level 1 落包;
     ///   不跟随存档容器的 Snappy 层(`DAT_0059b6f8` 是另一路)。
     ///
-    /// 官方 exe 内除 `FUN_0044d82c` 自身外没有该缓冲的直接消费者
-    /// (`LOAD[FILE DNO=1024]` 的 `FUN_004453f4` 读的是同型**文件**);
-    /// 这里保留可取证、可宿主导出的字节,不冒充脚本可见状态。
+    /// 产物是**完整 YSSD 块体**(12 字节块头 + 500 条槽记录),下一次
+    /// `SAVE[FILE]` 把它原样写成 DNO=1024;写盘成功后清除待写标记,
+    /// 避免后续系统存档(gsd/config/...)误带内存包。
     pub fn pack_mem(&mut self) -> Result<(), Diag> {
         let mut body = Vec::new();
         let mut packed_total: u32 = 0;
@@ -607,6 +646,7 @@ impl SaveState {
         out.extend_from_slice(&unpacked_total.to_le_bytes());
         out.extend_from_slice(&body);
         self.packed_mem = Some(out);
+        self.mem_pack_pending = true;
         Ok(())
     }
 
@@ -614,6 +654,143 @@ impl SaveState {
     #[must_use]
     pub fn packed_mem(&self) -> Option<&[u8]> {
         self.packed_mem.as_deref()
+    }
+
+    /// `LOAD[FILE DNO=1024]`:读取官方 500 槽内存打包块。
+    ///
+    /// 证据(v555 `0x4447c8` → `FUN_004453f4`):
+    /// - 文件仍是 YSSD 容器;块头 12 字节 = `btype=0 strict=1 var=0
+    ///   clen packed_total ulen unpacked_total`,**块载荷**是 500 条
+    ///   `u32 raw_len | u32 comp_len | comp_len 字节 zlib`,载荷里**没有**
+    ///   第二份 12 字节头;
+    /// - `raw_len == 0` 是空槽(官方同时写 `comp_len=0`);
+    /// - 读入后填 `DAT_008670c0[0..500]`,脚本侧 `LET` 不参与。
+    ///
+    /// 当前只按 `DAT_00872164 == 0`(zlib)分支实现;该全局在 555 构建里
+    /// 是 BSS 0,未发现写点。文件或块缺失报 recoverable,由 VM 继续。
+    pub fn load_mem_pack(&mut self, file: &str) -> Result<(), Diag> {
+        self.load_calls += 1;
+        let path = self.confined_path(file)?;
+        let bytes = self.read_save_file(file, &path)?;
+        let save = yu_format::yssd::YssdSave::parse(&bytes, file.as_bytes())
+            .map_err(|d| error::recoverable(code::CONTAINER, format!("LOAD[FILE={file}] {d}")))?;
+        let Some(entry) = save.entry(1024) else {
+            return Err(error::recoverable(
+                code::FILE_MISSING,
+                format!("LOAD[FILE={file} DNO=1024] 不在容器"),
+            ));
+        };
+        if entry.btype != 0 || entry.strict != 1 || entry.var_id != 0 {
+            return Err(error::recoverable(
+                code::CONTAINER,
+                format!(
+                    "LOAD[FILE={file} DNO=1024] 块头非 0/1/0: btype={} strict={} var={}",
+                    entry.btype, entry.strict, entry.var_id
+                ),
+            ));
+        }
+        let payload = entry.compressed.as_slice();
+        let mut off = 0usize;
+        let mut packed_total = 0u64;
+        let mut unpacked_total = 0u64;
+        let mut slots = BTreeMap::new();
+        for slot in 0..500u32 {
+            let Some(head) = payload.get(off..off + 8) else {
+                return Err(error::recoverable(
+                    code::CONTAINER,
+                    format!("LOAD[FILE={file} DNO=1024] 槽 {slot} 头越界(off={off})"),
+                ));
+            };
+            let raw_len = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
+            let comp_len = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+            off += 8;
+            packed_total += 8 + u64::from(comp_len);
+            unpacked_total += 8 + u64::from(raw_len);
+            if raw_len == 0 {
+                if comp_len != 0 {
+                    return Err(error::recoverable(
+                        code::CONTAINER,
+                        format!(
+                            "LOAD[FILE={file} DNO=1024] 槽 {slot} raw_len=0 但 comp_len={comp_len}"
+                        ),
+                    ));
+                }
+                continue;
+            }
+            let comp_len = usize::try_from(comp_len).map_err(|_| {
+                error::recoverable(
+                    code::CONTAINER,
+                    format!("LOAD[FILE={file} DNO=1024] 槽 {slot} 压缩长超过 usize"),
+                )
+            })?;
+            let Some(comp) = payload.get(off..off + comp_len) else {
+                return Err(error::recoverable(
+                    code::CONTAINER,
+                    format!(
+                        "LOAD[FILE={file} DNO=1024] 槽 {slot} 压缩数据越界(off={off}, len={comp_len})"
+                    ),
+                ));
+            };
+            off += comp_len;
+            let raw = yu_format::yssd::zlib_decompress(comp, raw_len, file.as_bytes(), 1024)
+                .map_err(|d| {
+                    error::recoverable(
+                        code::CONTAINER,
+                        format!("LOAD[FILE={file} DNO=1024] 槽 {slot}: {d}"),
+                    )
+                })?;
+            slots.insert(slot, raw);
+        }
+        if off != payload.len() || packed_total != payload.len() as u64 {
+            return Err(error::recoverable(
+                code::CONTAINER,
+                format!(
+                    "LOAD[FILE={file} DNO=1024] 槽区长度不符: 消耗 {off}/{}",
+                    payload.len()
+                ),
+            ));
+        }
+        if u64::from(entry.ulen) != unpacked_total {
+            return Err(error::recoverable(
+                code::CONTAINER,
+                format!(
+                    "LOAD[FILE={file} DNO=1024] 块头 ulen={} 与槽头推算 {unpacked_total} 不符",
+                    entry.ulen
+                ),
+            ));
+        }
+        // 官方包固定覆盖 0..499;更高号稀疏槽(<v555-pc> 90000+ 族)保留。
+        self.mem_slots.retain(|slot, _| *slot >= 500);
+        self.mem_slots.extend(slots);
+        Ok(())
+    }
+
+    /// 读取目标文件已有的块体(`dno -> YSSD 块体`)。
+    ///
+    /// 官方 `SAVE[FILE]` 是**更新已有容器**:本次未预约的旧块仍然写回。
+    /// 证据:`es_textkidoku.yst` 的 `INFO.SAVE` 只预约 1001..1004,
+    /// 但官方 `kidoku.sd` 仍有 `DNO=4`(上次阅读位置);若从零重建,
+    /// 官方读档在 `es_textkidoku.yst:477` 报 `LOAD[DNO]` 不存在。
+    fn existing_blocks(&self, path: &Path) -> BTreeMap<u32, Vec<u8>> {
+        let Ok(bytes) = self.fs.read(path) else {
+            return BTreeMap::new();
+        };
+        let Ok(save) = yu_format::yssd::YssdSave::parse(&bytes, b"existing") else {
+            return BTreeMap::new();
+        };
+        save.entries
+            .iter()
+            .map(|entry| {
+                let mut body = Vec::with_capacity(12 + entry.compressed.len());
+                body.push(entry.btype);
+                body.push(entry.strict);
+                body.extend_from_slice(&entry.var_id.to_le_bytes());
+                body.extend_from_slice(&(entry.compressed.len() as u32).to_le_bytes());
+                body.extend_from_slice(&entry.ulen.to_le_bytes());
+                body.extend_from_slice(&entry.compressed);
+                (entry.dno, body)
+            })
+            .collect()
     }
 
     /// 按预约表构造 YSSD 容器(文件存档与内存槽共用同一序列化)。
@@ -629,6 +806,8 @@ impl SaveState {
         target_version: Option<u32>,
         source: &str,
         diags: &mut Vec<Diag>,
+        preserved: BTreeMap<u32, Vec<u8>>,
+        mem_pack_block: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, Diag> {
         let codec = self.block_codec.unwrap_or_default();
         let version = match self
@@ -659,8 +838,17 @@ impl SaveState {
         // 硬校验 A==0x600,写错布局的缩略图会让整份存档被拒收。
         // 未取证版本不猜:跳过图像块并挂号,变量块照常落盘。
         let save_profile = crate::profile::profile_for(version);
-        let image_layout = save_profile.and_then(|p| p.image_layout);
+        // v555 与 0.495 共用 `0x1E0`,语义层可覆盖为 A=1680/+0x88;
+        // 其余版本继续按容器版本档案(0.479=A1536,0.495/0.481=A1600)。
+        let image_layout = self
+            .image_layout_override
+            .or_else(|| save_profile.and_then(|p| p.image_layout));
         let btype0_var_id = save_profile.map(|p| p.btype0_var_id);
+        // 先放旧块,预约块随后覆盖同 DNO;这是官方 `SAVE[FILE]` 的更新语义。
+        // 旧块体按值移动,不再逐块 clone,大存档重写少一轮整块拷贝。
+        for (dno, body) in preserved {
+            writer.set_block(dno, body);
+        }
         for fact in self.reservations.values() {
             match fact.btype {
                 0 => {
@@ -717,10 +905,14 @@ impl SaveState {
                         continue;
                     };
                     let raw = crate::image_block::encode(image, layout);
-                    writer.set_block(
-                        fact.dno,
-                        yu_format::yssd::encode_block_body_with(codec, 1, 1, 0, &raw),
-                    );
+                    // v555 缩略图块固定 zlib level 9(`78 da`),与容器
+                    // 变量块的 Snappy 层相互独立;官方样本逐字节验证。
+                    let body = if layout.descriptor_len == 1680 {
+                        yu_format::yssd::encode_block_body_zlib9(1, 1, 0, &raw)
+                    } else {
+                        yu_format::yssd::encode_block_body_with(codec, 1, 1, 0, &raw)
+                    };
+                    writer.set_block(fact.dno, body);
                 }
                 other => {
                     return Err(error::recoverable(
@@ -729,6 +921,9 @@ impl SaveState {
                     ));
                 }
             }
+        }
+        if let Some(body) = mem_pack_block {
+            writer.set_block(1024, body);
         }
         Ok(writer.build())
     }
@@ -1949,7 +2144,7 @@ fn confined_path_rejects_save_root_ancestor() {
     assert_eq!(err.code, code::PATH_ESCAPE, "祖先应报 PATH_ESCAPE");
     }
 
-/// v555 `SAVE[MEM=99999]` 打包(`0x44d82c`):12 字节头
+/// v555 `SAVE[MEM=99999]` 打包(`0x44d7a8`):12 字节头
 /// `0,1,0u16,packed,unpacked` + 500 条 `raw_len|comp_len|zlib(level1)`;
 /// 空槽写 `0/0` 且不写数据。
 #[test]
@@ -2013,6 +2208,315 @@ fn mem_99999_pack_matches_official_layout() {
     assert_eq!(u64::from(packed_total), sum_packed);
     assert_eq!(u64::from(unpacked_total), sum_unpacked);
     assert!(packed_total < unpacked_total, "zlib 压缩应小于原始长度");
+}
+
+/// 官方 `SAVE[FILE]` 是更新已有容器:未预约的旧块必须保留。
+///
+/// 证据:`es_textkidoku.yst` 的 INFO.SAVE 只预约 1001..1004,官方
+/// `kidoku.sd` 仍有 DNO=4;从零重建会让官方 477 行 `LOAD[DNO]` 报缺块。
+#[test]
+fn file_flush_preserves_existing_blocks_not_reserved() {
+    let root = std::path::PathBuf::from("target/tmp/sv-preserve-blocks");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("save")).expect("create save dir");
+    let old_dno4 = yu_format::yssd::encode_block_body(0, 1, 0x0a44, b"old-line");
+    let old_dno1001 = yu_format::yssd::encode_block_body(0, 1, 0x0a45, b"old-info");
+    let mut writer = yu_format::yssd::YssdWriter::new(0x1E0);
+    writer.set_block(4, old_dno4.clone());
+    writer.set_block(1001, old_dno1001);
+    std::fs::write(root.join("save/kidoku.sd"), writer.build()).expect("seed");
+
+    let snap = VarSnapshot {
+        ty: ElemType::Int,
+        dims: Vec::new(),
+        data: vec![Value::Int(7)],
+    };
+    let mut state = SaveState::new(root.join("save"), true);
+    state.set_container_version(0x1E0);
+    state.set_block_codec(yu_format::yssd::BlockCodec::Zlib);
+    state
+        .reserve(1001, VarRef::new(VarSpace::At, 0x0a45), &snap)
+        .unwrap();
+    state.flush("kidoku.sd").expect("flush");
+
+    let bytes = std::fs::read(root.join("save/kidoku.sd")).expect("read");
+    let save = yu_format::yssd::YssdSave::parse(&bytes, b"kidoku.sd").expect("parse");
+    assert_eq!(
+        save.entry(4).expect("DNO4 preserved").compressed,
+        old_dno4[12..],
+        "未预约的 DNO=4 必须逐字节保留"
+    );
+    assert_eq!(save.entry(1001).expect("DNO1001").var_id, 0x0a45);
+    assert_ne!(
+        save.entry(1001).expect("DNO1001").compressed,
+        yu_format::yssd::encode_block_body(0, 1, 0x0a45, b"old-info")[12..],
+        "预约块必须被新快照覆盖"
+    );
+}
+
+/// `SAVE[MEM=99999]` 之后的下一次 `SAVE[FILE]` 把完整 500 槽包写成
+/// DNO=1024;系统存档不调用 MEM=99999,因此不带该块。
+#[test]
+fn mem_99999_pack_is_written_to_next_file_save_only() {
+    let root = std::path::PathBuf::from("target/tmp/sv-mem-pack-file");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create root");
+    let snap = VarSnapshot {
+        ty: ElemType::Int,
+        dims: Vec::new(),
+        data: vec![Value::Int(7)],
+    };
+    let mut state = SaveState::new(&root, true);
+    state.set_container_version(0x1E0);
+    state.set_block_codec(yu_format::yssd::BlockCodec::Zlib);
+    state
+        .reserve(1, VarRef::new(VarSpace::At, 0x0a43), &snap)
+        .unwrap();
+    state.save_mem(0).expect("save mem");
+    state.pack_mem().expect("pack");
+    let packed = state.packed_mem().expect("packed").to_vec();
+
+    state.flush("save50001.sd").expect("player flush");
+    let bytes = std::fs::read(root.join("save50001.sd")).expect("read");
+    let save = yu_format::yssd::YssdSave::parse(&bytes, b"save50001").expect("parse");
+    let entry = save.entry(1024).expect("DNO=1024");
+    assert_eq!((entry.btype, entry.strict, entry.var_id), (0, 1, 0));
+    assert_eq!(entry.compressed, packed[12..], "载荷 = 块体去掉 12 字节头");
+    assert_eq!(
+        entry.compressed.len() as u32,
+        u32::from_le_bytes(packed[4..8].try_into().unwrap()),
+        "块头 clen = 包内 packed_total"
+    );
+    assert_eq!(
+        entry.ulen,
+        u32::from_le_bytes(packed[8..12].try_into().unwrap()),
+        "块头 ulen = 包内 unpacked_total"
+    );
+
+    // 待写标记已消费:随后的系统存档不得带 DNO=1024。
+    state.flush("config.sd").expect("system flush");
+    let bytes = std::fs::read(root.join("config.sd")).expect("read");
+    let save = yu_format::yssd::YssdSave::parse(&bytes, b"config.sd").expect("parse");
+    assert!(save.entry(1024).is_none(), "系统存档不得带内存包");
+    assert_eq!(save.entries.len(), 1);
+}
+
+/// 空内存包:官方全空存档(`<v500-relirium>`/`<v555-pieces>`)的 DNO=1024 是
+/// `clen=ulen=4000` 的全零载荷;500 个空槽各占 8 字节。
+#[test]
+fn empty_mem_pack_is_4000_zero_bytes() {
+    let root = std::path::PathBuf::from("target/tmp/sv-mem-pack-empty");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create root");
+    let mut state = SaveState::new(&root, true);
+    state.set_container_version(0x1E0);
+    state.set_block_codec(yu_format::yssd::BlockCodec::Zlib);
+    state.pack_mem().expect("pack");
+    assert!(
+        state.packed_mem().expect("packed")[12..]
+            .iter()
+            .all(|&b| b == 0),
+        "空包条目区必须是 500*8 个零字节"
+    );
+    state.flush("save50001.sd").expect("flush");
+    let bytes = std::fs::read(root.join("save50001.sd")).expect("read");
+    let save = yu_format::yssd::YssdSave::parse(&bytes, b"save50001").expect("parse");
+    let entry = save.entry(1024).expect("DNO=1024");
+    assert_eq!(entry.ulen, 4000);
+    assert_eq!(entry.compressed.len(), 4000);
+    assert!(entry.compressed.iter().all(|&b| b == 0));
+}
+
+/// v555 `LOAD[FILE DNO=1024]`:块载荷 = 500×(`raw_len|comp_len|zlib`),
+/// 不含第二份 12 字节头;读回 `mem_slots`,空槽不建槽。
+#[test]
+fn load_mem_pack_reads_official_500_slot_layout() {
+    let root = std::path::PathBuf::from("target/tmp/sv-mem-pack-load");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create root");
+    let raw0 = b"slot0-container".to_vec();
+    let raw499 = b"slot499-container".to_vec();
+    let mut body = Vec::new();
+    let mut packed_total = 0u32;
+    let mut unpacked_total = 0u32;
+    for slot in 0..500u32 {
+        let raw = match slot {
+            0 => Some(raw0.as_slice()),
+            499 => Some(raw499.as_slice()),
+            _ => None,
+        };
+        let (raw_len, comp) = match raw {
+            Some(raw) => (
+                u32::try_from(raw.len()).unwrap(),
+                yu_format::yssd::zlib_compress_level1(raw),
+            ),
+            None => (0, Vec::new()),
+        };
+        let comp_len = u32::try_from(comp.len()).unwrap();
+        packed_total += 8 + comp_len;
+        unpacked_total += 8 + raw_len;
+        body.extend_from_slice(&raw_len.to_le_bytes());
+        body.extend_from_slice(&comp_len.to_le_bytes());
+        body.extend_from_slice(&comp);
+    }
+    let mut packed = vec![0u8, 1, 0, 0];
+    packed.extend_from_slice(&packed_total.to_le_bytes());
+    packed.extend_from_slice(&unpacked_total.to_le_bytes());
+    packed.extend_from_slice(&body);
+
+    // `packed` 本身就是**块体**:12 字节块头(0/1/0/clen/ulen)+ 500 条
+    // 槽记录;载荷里不再放第二份 12 字节头。
+    let mut writer = yu_format::yssd::YssdWriter::new(0x1E0);
+    writer.set_block(1024, packed);
+    std::fs::write(root.join("save70000.sd"), writer.build()).expect("write pack");
+
+    let mut state = SaveState::new(&root, false);
+    state.mem_slots.insert(90_001, b"high-slot".to_vec());
+    state.load_mem_pack("save70000.sd").expect("load pack");
+    assert_eq!(state.mem_slot(0), Some(raw0.as_slice()));
+    assert_eq!(state.mem_slot(499), Some(raw499.as_slice()));
+    assert_eq!(state.mem_slot(1), None, "空槽不得建槽");
+    assert_eq!(
+        state.mem_slot(90_001),
+        Some(b"high-slot".as_slice()),
+        "包只覆盖 0..499,高号稀疏槽保留"
+    );
+    assert_eq!(state.mem_slots_len(), 3);
+}
+
+/// 用官方玩家存档验证 500 槽读取(样本路径由环境变量显式给出,缺省跳过)。
+#[test]
+#[ignore = "设置 YURIS_OFFICIAL_SAVE=<官方玩家 .sd> 后手动运行"]
+fn official_player_save_pack_loads() {
+    let Ok(path) = std::env::var("YURIS_OFFICIAL_SAVE") else {
+        eprintln!("skip: YURIS_OFFICIAL_SAVE 未设置");
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let root = path.parent().expect("官方存档父目录").to_path_buf();
+    let file = path
+        .file_name()
+        .expect("官方存档文件名")
+        .to_string_lossy()
+        .into_owned();
+    let bytes = std::fs::read(&path).expect("read official save");
+    let save = yu_format::yssd::YssdSave::parse(&bytes, b"official").expect("parse");
+    let official = save.entry(1024).expect("DNO=1024").compressed.clone();
+    let mut state = SaveState::new(root, false);
+    state.load_mem_pack(&file).expect("官方 500 槽包");
+    let used: Vec<u32> = state
+        .mem_slots
+        .keys()
+        .copied()
+        .filter(|slot| *slot < 500)
+        .collect();
+    assert!(!used.is_empty(), "官方玩家存档应有非空内存槽");
+    for slot in used {
+        let raw = state.mem_slot(slot).expect("slot");
+        assert_eq!(&raw[..4], b"YSSD", "槽 {slot} 应是完整 YSSD 容器");
+    }
+    // 读回后再 pack,载荷必须与官方 DNO=1024 逐字节一致。
+    state.pack_mem().expect("repack");
+    let packed = state.packed_mem().expect("packed");
+    assert_eq!(
+        &packed[12..],
+        official.as_slice(),
+        "重打包载荷应与官方逐字节一致"
+    );
+    assert_eq!(&packed[..4], &[0, 1, 0, 0]);
+    assert_eq!(
+        u32::from_le_bytes(packed[4..8].try_into().unwrap()),
+        official.len() as u32,
+        "packed_total"
+    );
+}
+
+/// 官方 `SAVE[FILE]` 的更新语义(真值层级 3):把官方存档原样交给
+/// `flush`(无预约、无内存包),所有旧块必须逐字节保留。
+///
+/// 需 `YURIS_OFFICIAL_SAVE=<官方 .sd>` 手动运行:
+/// `YURIS_OFFICIAL_SAVE=... cargo test -p yu-save -- --ignored official_save_flush_preserves_all_blocks`
+#[test]
+#[ignore = "设置 YURIS_OFFICIAL_SAVE=<官方玩家 .sd> 后手动运行"]
+fn official_save_flush_preserves_all_blocks() {
+    let Ok(path) = std::env::var("YURIS_OFFICIAL_SAVE") else {
+        eprintln!("skip: YURIS_OFFICIAL_SAVE 未设置");
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let file = path
+        .file_name()
+        .expect("官方存档文件名")
+        .to_string_lossy()
+        .into_owned();
+    let bytes = std::fs::read(&path).expect("read official save");
+    let save = yu_format::yssd::YssdSave::parse(&bytes, b"official").expect("parse");
+    let tmp = std::path::PathBuf::from("target/tmp/sv-official-preserve");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create tmp");
+    std::fs::write(tmp.join(&file), &bytes).expect("seed");
+    let mut state = SaveState::new(&tmp, true);
+    state.flush(&file).expect("flush");
+    let rewritten = std::fs::read(tmp.join(&file)).expect("read rewritten");
+    let rewritten =
+        yu_format::yssd::YssdSave::parse(&rewritten, b"rewritten").expect("parse rewritten");
+    assert_eq!(
+        rewritten.entries.len(),
+        save.entries.len(),
+        "块数必须不变"
+    );
+    for entry in &save.entries {
+        let got = rewritten
+            .entry(entry.dno)
+            .unwrap_or_else(|| panic!("DNO={} 丢失", entry.dno));
+        assert_eq!(
+            (got.btype, got.strict, got.var_id),
+            (entry.btype, entry.strict, entry.var_id),
+            "DNO={} 块头必须保留",
+            entry.dno
+        );
+        assert_eq!(
+            got.compressed, entry.compressed,
+            "DNO={} 载荷必须逐字节保留",
+            entry.dno
+        );
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// v555 缩略图块 zlib level9 逐字节(真值层级 3):官方 `0x1E0` 存档
+/// DNO=3 解出的 raw 按 level9 重压,压缩流必须与原块一致。
+/// 0.495/0.481 的缩略图不是 1680 描述符,显式跳过。
+#[test]
+#[ignore = "设置 YURIS_OFFICIAL_SAVE=<官方 v555 玩家 .sd> 后手动运行"]
+fn official_v555_thumbnail_recompresses_byte_exact() {
+    let Ok(path) = std::env::var("YURIS_OFFICIAL_SAVE") else {
+        eprintln!("skip: YURIS_OFFICIAL_SAVE 未设置");
+        return;
+    };
+    let bytes = std::fs::read(&path).expect("read official save");
+    let save = yu_format::yssd::YssdSave::parse(&bytes, b"official").expect("parse");
+    let Some(entry) = save.entry(3) else {
+        eprintln!("skip: 官方存档没有 DNO=3 缩略图");
+        return;
+    };
+    let raw = entry.decompress(b"official").expect("decompress DNO=3");
+    let a_len = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
+    if a_len != crate::image_block::LAYOUT_V555.descriptor_len {
+        eprintln!("skip: DNO=3 描述符 A={a_len},不是 v555 布局");
+        return;
+    }
+    let body = yu_format::yssd::encode_block_body_zlib9(
+        entry.btype,
+        entry.strict,
+        entry.var_id,
+        &raw,
+    );
+    assert_eq!(
+        &body[12..],
+        entry.compressed.as_slice(),
+        "DNO=3 压缩流必须与官方逐字节一致"
+    );
 }
 
 /// v555 `SAVE[MEM=n]` / `LOAD[MEM=n]`:内存槽与文件存档共用同一 YSSD

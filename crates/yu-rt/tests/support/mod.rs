@@ -341,7 +341,16 @@ pub fn with_v474_extra_slot(mut b: ProjectBuilder) -> ProjectBuilder {
 pub fn default_commands() -> Vec<CommandSpec> {
     vec![
         ("CDDA", vec![]),
-        ("CG", vec![("ID", 1, 0), ("IDNO", 0, 1), ("FILE", 1, 0), ("SX", 0, 0), ("SY", 0, 0)]),
+        (
+            "CG",
+            vec![
+                ("ID", 1, 0),
+                ("IDNO", 0, 1),
+                ("FILE", 1, 0),
+                ("SX", 0, 0),
+                ("SY", 0, 0),
+            ],
+        ),
         ("CGACT", vec![]),
         ("CGEND", vec![("ID", 1, 0), ("IDNO", 0, 1)]),
         ("CGINFO", vec![]),

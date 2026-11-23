@@ -742,6 +742,8 @@ struct SaveRecorder {
     images: Vec<(u32, yu_rt::event::CapturedImage)>,
     /// `LOAD[ID]` 的图像读取请求。
     image_loads: Vec<(String, u32)>,
+    /// `LOAD[FILE DNO=1024]` 的 500 槽打包读取请求。
+    mem_pack_loads: Vec<String>,
     /// v555 `SAVE[MEM]` 的槽号与 `LOAD[MEM]` 的 (槽号, DNO)。
     mem_saves: Vec<u32>,
     /// `SAVE[MEM=99999]` 的打包次数。
@@ -763,6 +765,7 @@ impl SaveRecorder {
             loads: Vec::new(),
             images: Vec::new(),
             image_loads: Vec::new(),
+            mem_pack_loads: Vec::new(),
             mem_saves: Vec::new(),
             mem_packs: 0,
             mem_loads: Vec::new(),
@@ -821,6 +824,14 @@ impl SaveHost for SharedHost {
         self.inner.borrow_mut().loads.push((file.to_string(), dno));
         let reply = self.reply.borrow_mut().take();
         reply.ok_or_else(|| Diag::fatal("test", yu_log::Boundary::Domain))
+    }
+
+    fn load_mem_pack(&mut self, file: &str) -> Result<(), Diag> {
+        self.inner
+            .borrow_mut()
+            .mem_pack_loads
+            .push(file.to_string());
+        Ok(())
     }
     fn save_mem(&mut self, slot: u32) -> Result<(), Diag> {
         self.inner.borrow_mut().mem_saves.push(slot);
@@ -1148,6 +1159,38 @@ fn save_load_loop_records_reserve_flush_and_writes_back() {
         .find(|a| a.slot == 2)
         .expect("LET 槽在事件里");
     assert_eq!(let_ref.reference, Some(VarRef::new(VarSpace::At, sys + 1)));
+}
+
+/// `LOAD[FILE DNO=1024]`:官方文件分支的独立 500 槽打包读取,必须走
+/// `load_mem_pack` 而不是通用单块 `load_block`,且不需要 `LET`。
+#[test]
+fn load_file_dno_1024_uses_the_mem_pack_host() {
+    let mut b = ProjectBuilder::new();
+    let op_load = b.commands.iter().position(|(n, _)| *n == "LOAD").unwrap() as u8;
+    b.scripts = vec![vec![
+        GroupSpec::new(op_load)
+            .window(0, ex::s("save70000.sd"))
+            .window(1, ex::i32_(1024)),
+        GroupSpec::new(OP_END),
+    ]];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let recorder = SaveRecorder::new();
+    let mut vm = boot(b);
+    vm.set_save_host(Box::new(SharedHost {
+        inner: recorder.clone(),
+        reply: std::rc::Rc::new(std::cell::RefCell::new(None)),
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let rec = recorder.borrow();
+    assert_eq!(
+        rec.mem_pack_loads,
+        vec!["save70000.sd".to_string()],
+        "DNO=1024 必须走 500 槽打包读取"
+    );
+    assert!(rec.loads.is_empty(), "不得落到通用单块 load_block");
+    assert!(rec.mem_loads.is_empty(), "不得当作内存槽");
 }
 
 /// `SAVE[DNO SET=@x[i][j]]`:块内容 = 该下标处的**标量元素**,不是整组。
@@ -1565,7 +1608,7 @@ fn fileinfo_fs_fallback_checks_save_root() {
 }
 
 
-/// `SAVE[MEM=99999]`:官方独立分支(`0x44b874` → `FUN_0044d82c`)把
+/// `SAVE[MEM=99999]`:官方独立分支(`0x44b874` → `FUN_0044d7a8`)把
 /// 0..499 号内存槽打包到 `DAT_0086a03c`;不是普通槽 99999,也不刷文件。
 #[test]
 fn save_mem_99999_packs_memory_slots_instead_of_slot_99999() {

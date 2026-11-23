@@ -54,6 +54,36 @@ fn declare_and_let_scalar() {
     assert_eq!(vm.events().iter().filter(|e| e.kind() == "end").count(), 1);
 }
 
+/// `LET @_MOUSE_L = v`:官方 v555 `0x4441e5` → `FUN_00444750` 写同一张
+/// 帧计数器表,并按当前物理 down 状态钳制。未按住时负数保留,正数清 0;
+/// 这里用负数区分「真的写了」与旧实现的空操作。
+#[test]
+fn let_mouse_button_writes_the_input_counter() {
+    let mut b = ProjectBuilder::new();
+    let mouse_l = b
+        .sysvars
+        .iter()
+        .position(|(name, _, _)| *name == "_MOUSE_L")
+        .expect("fixture sysvar _MOUSE_L") as u16;
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, mouse_l))
+            .window(0, ex::i8_(-7)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    vm.input_state_mut().set_counter("MOUSE_L", -5);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.input().counter("MOUSE_L"),
+        -7,
+        "LET @_MOUSE_L 必须走计数器写路径(负数在未按住时保留)"
+    );
+}
+
 // ---------------------------------------------------------------- FILEINFO
 
 #[test]

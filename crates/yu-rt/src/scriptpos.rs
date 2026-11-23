@@ -688,7 +688,7 @@ mod tests {
         assert!(sp.encode().is_err());
     }
 
-    /// **官方 0.479 存档逐字节回归**(黒獣2 `save00001.sd` DNO=11):
+    /// **官方 0.479 存档逐字节回归**(`<v479-kuro>` `save00001.sd` DNO=11):
     /// u16 GOSUB 计数 + 尾部 u8 的线格式;解码字段与再编码字节必须全等。
     ///
     /// 证据:0.479 装载器 `0x449d7c`(`0x449f3d/0x449f58` 两组 2 字符计数
@@ -717,7 +717,7 @@ mod tests {
         assert_eq!(sp.encode_with_wire(WIRE_GOSUB_U16).unwrap(), BLOB);
     }
 
-    /// 官方 0.479 存档(黒獣2 `save00002.sd` DNO=11):GOSUB 栈非空
+    /// 官方 0.479 存档(`<v479-kuro>` `save00002.sd` DNO=11):GOSUB 栈非空
     /// (2 帧,u16 计数);解码与再编码全等。
     #[test]
     fn official_0479_task_blob_with_gosub_frames_roundtrips() {

@@ -95,6 +95,10 @@ impl yu_rt::event::SaveHost for SaveHost {
         self.lock().load_block(file, dno)
     }
 
+    fn load_mem_pack(&mut self, file: &str) -> Result<(), Diag> {
+        self.lock().load_mem_pack(file)
+    }
+
     fn save_mem(&mut self, slot: u32) -> Result<(), Diag> {
         self.lock().save_mem(slot)
     }

@@ -143,6 +143,22 @@ pub enum WindowPayloadMode {
     RecordDelimited,
 }
 
+/// 存档缩略图块(btype 1)的描述符布局。
+///
+/// v555 与 0.495 共用容器版本 `0x1E0`,但官方描述符不同:
+/// - 0.495 系:A=1600,w/h 在 +0x78;
+/// - v555:A=1680,w/h 在 +0x88(官方 `<v555-kuro>` 存档 DNO=3 实测
+///   `A=1680 B=55896`,B/4=137×102,A+0x88=137/102)。
+///
+/// 556/600 没有取证,继续按容器版本档案。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveImageMode {
+    /// 按容器版本档案选(0.479=A1536,0.495/0.481=A1600)。
+    ContainerProfile,
+    /// v555:A=1680,+0x88。
+    V555,
+}
+
 /// `RETURNCODE` 命令的语义形态。
 ///
 /// 同名命令在两代引擎里行为不同,必须按 `ysc_version` 门控:
@@ -190,6 +206,8 @@ pub struct SemanticProfile {
     /// (`@1177[129]` 读写语言号);官方线性化循环的 rank 取自
     /// “已收下标个数”,因此 `@1177[129]` 落在 flat=129。
     pub partial_index: bool,
+    /// 存档缩略图块描述符布局。
+    pub save_image: SaveImageMode,
 }
 
 impl SemanticProfile {
@@ -241,6 +259,11 @@ impl SemanticProfile {
                 RefIntParamMode::Value
             },
             partial_index: v555,
+            save_image: if v555 {
+                SaveImageMode::V555
+            } else {
+                SaveImageMode::ContainerProfile
+            },
         }
     }
 
@@ -269,6 +292,7 @@ mod tests {
             assert_eq!(p.varinfo_sjis, SjisCodeMode::Inert, "{version}");
             assert_eq!(p.script_decls, ScriptDeclMode::Runtime, "{version}");
             assert_eq!(p.ref_int_param, RefIntParamMode::Value, "{version}");
+            assert_eq!(p.save_image, SaveImageMode::ContainerProfile, "{version}");
         }
         let p = SemanticProfile::from_yscm_version(555);
         assert_eq!(p.ysc_version, 555);
@@ -279,6 +303,7 @@ mod tests {
         assert_eq!(p.varinfo_sjis, SjisCodeMode::FirstChar);
         assert_eq!(p.script_decls, ScriptDeclMode::LoadTime);
         assert_eq!(p.ref_int_param, RefIntParamMode::SlotId);
+        assert_eq!(p.save_image, SaveImageMode::V555);
 
         // 555 是独立分支;556/600 没有证据,不得自动继承。
         for version in [556, 600] {
@@ -291,6 +316,7 @@ mod tests {
             assert_eq!(p.varinfo_sjis, SjisCodeMode::Inert, "{version}");
             assert_eq!(p.script_decls, ScriptDeclMode::Runtime, "{version}");
             assert_eq!(p.ref_int_param, RefIntParamMode::Value, "{version}");
+            assert_eq!(p.save_image, SaveImageMode::ContainerProfile, "{version}");
         }
     }
 }

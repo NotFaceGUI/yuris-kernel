@@ -36,7 +36,7 @@ pub(crate) fn read(
             param_index(indices)
                 .map(|n| Value::Int(frames.last().map(|f| f.ret_flags[n] as i64).unwrap_or(0))),
         ),
-        "_DROPFILE_NUM" => Some(Ok(Value::Int(state.drop_files.len() as i64))),
+        "_DROPFILE_NUM" => Some(Ok(Value::Int(i64::from(state.drop_file_num)))),
         "_DROPFILE" => {
             let n = indices.first().copied().unwrap_or(0);
             if n < 0 {
@@ -188,16 +188,26 @@ fn read_int(vm: &Vm, indices: &[i64]) -> Result<Value, yu_log::Diag> {
     let Some((slot, index)) = dynamic_slot_index(indices)? else {
         return Ok(Value::Int(0));
     };
-    if slot < 1000 {
-        return Ok(Value::Int(0));
-    }
+    // 槽号下界不下结论:官方片段只证据了目标变量类型检查(0x1a6c6),
+    // <1000 是否可读未取证;交给变量表查找,未声明自然返回 0。
     let Ok(slot) = u16::try_from(slot) else {
         return Ok(Value::Int(0));
     };
     let Some(var) = vm.store().find_by_id(slot, VarSpace::At) else {
         return Ok(Value::Int(0));
     };
-    Ok(match vm.store().read(var, &[index]) {
+    // 官方槽表把标量当 1 元素:无第二下标时元素 0 合法;非 0 越界。
+    // 只借维度判标量,不做 `dims.clone()`(`_INT` 读可能落在脚本循环里)。
+    let scalar = vm.store().slot(var).map(|s| s.dims.is_empty()).unwrap_or(true);
+    let read_index: &[i64] = if scalar {
+        if index != 0 {
+            return Ok(Value::Int(0));
+        }
+        &[]
+    } else {
+        core::slice::from_ref(&index)
+    };
+    Ok(match vm.store().read(var, read_index) {
         Ok(Value::Int(v)) => Value::Int(v),
         Ok(Value::Float(f)) => Value::Int(f as i64),
         Ok(_) | Err(_) => Value::Int(0),

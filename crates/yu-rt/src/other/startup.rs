@@ -1,7 +1,13 @@
 //! 独立运行面的脚本装载期编排。
 //!
-//! 555 商业作把 `S_INT/S_FLT/S_STR` 与入口标签前的 `INT/FLT/STR` 当作
+//! 555 商业作把 `S_INT/S_FLT/S_STR` 与**全脚本**的 `INT/FLT/STR` 当作
 //! 装载期声明;共享旧版仍按执行流声明。
+//!
+//! 证据(`<v555-kuro>` `es_saveload.yst` s33):`es.SL.DRAW.BIGTHUMB`
+//! 入口 pc640 是无条件 `GO es.SL.DRAW.BIGTHUMB.LEnd`(pc850),声明
+//! `INT @2223` 在 pc644,返回 pc851 读取 `@2223`。若只预声明入口标签
+//! 之前的 `INT`,该槽永远未声明 ⇒ 官方不会出现的
+//! `rt.var.undeclared`。官方因此必须在脚本装载时初始化全脚本声明。
 
 use crate::value::ElemType;
 use crate::vm::{CmdWindow, ExecState, Vm};
@@ -11,16 +17,6 @@ pub(crate) fn apply_script_statics(vm: &mut Vm, script_id: u32) -> Result<(), Di
     let Some(script) = vm.tables().script(script_id) else {
         return Ok(());
     };
-    let first_label_pc = vm
-        .tables()
-        .boot
-        .labels
-        .labels
-        .iter()
-        .filter(|l| u32::from(l.script_id) == script_id)
-        .map(|l| l.pc)
-        .min()
-        .unwrap_or(u32::MAX);
     let mut decls: Vec<(u32, ElemType, Vec<CmdWindow>)> = Vec::new();
     for pc in 0..script.group_count() {
         let Some(group) = script.group(pc) else {
@@ -33,12 +29,9 @@ pub(crate) fn apply_script_statics(vm: &mut Vm, script_id: u32) -> Result<(), Di
             .command(group.opcode)
             .map(|c| c.name.as_str());
         let ty = match name {
-            Some("S_INT") => ElemType::Int,
-            Some("S_FLT") => ElemType::Float,
-            Some("S_STR") => ElemType::Str,
-            Some("INT") if (pc as u32) < first_label_pc => ElemType::Int,
-            Some("FLT") if (pc as u32) < first_label_pc => ElemType::Float,
-            Some("STR") if (pc as u32) < first_label_pc => ElemType::Str,
+            Some("S_INT" | "INT") => ElemType::Int,
+            Some("S_FLT" | "FLT") => ElemType::Float,
+            Some("S_STR" | "STR") => ElemType::Str,
             _ => continue,
         };
         let mut windows = Vec::new();

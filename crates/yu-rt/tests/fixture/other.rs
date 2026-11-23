@@ -538,3 +538,173 @@ fn textinfo_empty_signature_is_a_silent_noop() {
         "空签名 TEXTINFO 不应产生诊断: {diags}"
     );
 }
+
+/// v555 `LET @_DROPFILE_NUM = v`:官方 `0x443988` id 0x0f 写
+/// `DAT_008724ac`;读取同一全局。写后必须能读回。
+#[test]
+fn let_dropfile_num_writes_the_sysvar_mirror() {
+    let mut b = ProjectBuilder::new();
+    b.ysc_version = 555;
+    let drop_num = b
+        .sysvars
+        .iter()
+        .position(|(name, _, _)| *name == "_DROPFILE_NUM")
+        .expect("fixture sysvar _DROPFILE_NUM") as u16;
+    let out = push_var(&mut b, 1, Init::Int(0));
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, drop_num))
+            .window(0, ex::i8_(7)),
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, out.id))
+            .window(0, ex::get(0x40, drop_num)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    vm.install_other_runtime();
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.store().read(out, &[]).unwrap(),
+        Value::Int(7),
+        "_DROPFILE_NUM 写后读回必须是 7"
+    );
+}
+
+/// v555 `LET @_INT(槽号) = v`:官方 `0x443988` id 0x32 按目标变量类型
+/// 写变量表。目标槽必须是已声明的 int;写后读回同一值。
+#[test]
+fn let_int_writes_the_target_variable_slot() {
+    let mut b = ProjectBuilder::new();
+    b.ysc_version = 555;
+    let dyn_int = b
+        .sysvars
+        .iter()
+        .position(|(name, _, _)| *name == "_INT")
+        .expect("fixture sysvar _INT") as u16;
+    // `_INT` 只接受动态变量槽号(>=1000);夹具普通 push_var 会从
+    // 系统变量数起,必须显式造一个 1000 号变量。
+    b.vars.push(VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: 1000,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(1),
+    });
+    let target = VarRef::new(VarSpace::At, 1000);
+    let out = push_var(&mut b, 1, Init::Int(0));
+    let slot = ex::i16_(target.id as i16);
+    let as_lvalue = |head: Vec<u8>| ex::cat(&[head, slot.clone(), ex::aload()]);
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_LET)
+            .window(0, as_lvalue(ex::r#ref(0x40, dyn_int)))
+            .window(0, ex::i8_(42)),
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, out.id))
+            .window(0, as_lvalue(ex::r#ref(0x40, dyn_int))),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    vm.install_other_runtime();
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let diags = vm.take_diags();
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(vm.store().read(target, &[]).unwrap(), Value::Int(42));
+    assert_eq!(vm.store().read(out, &[]).unwrap(), Value::Int(42));
+}
+
+/// v555 `LET @_PINT(n) = v`:官方 `0x443988` id 0x35 写当前 GOSUB 帧的
+/// int 参数数组。被调方写 20 后读回,证明写进了同一帧。
+#[test]
+fn let_pint_writes_the_current_gosub_frame_arg() {
+    let mut b = ProjectBuilder::new();
+    b.ysc_version = 555;
+    let pint = b
+        .sysvars
+        .iter()
+        .position(|(name, _, _)| *name == "_PINT")
+        .expect("fixture sysvar _PINT") as u16;
+    let out = push_var(&mut b, 1, Init::Int(0));
+    let arg = |head: Vec<u8>| ex::cat(&[head, ex::i8_(1), ex::aload()]);
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("CALLEE", 0, 1, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![
+        vec![
+            GroupSpec::new(OP_GOSUB)
+                .window(0, ex::s("CALLEE"))
+                .window(1, ex::i8_(10)),
+            GroupSpec::new(OP_END),
+        ],
+        vec![
+            GroupSpec::new(OP_LET)
+                .window(0, arg(ex::r#ref(0x40, pint)))
+                .window(0, ex::i8_(20)),
+            GroupSpec::new(OP_LET)
+                .window(0, ex::r#ref(0x40, out.id))
+                .window(0, arg(ex::r#ref(0x40, pint))),
+            GroupSpec::new(OP_RETURN),
+        ],
+    ];
+    let mut vm = boot(b);
+    vm.install_other_runtime();
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.store().read(out, &[]).unwrap(),
+        Value::Int(20),
+        "_PINT(1) 写入后在同一 GOSUB 帧读回 20"
+    );
+}
+
+/// v555 装载期静态声明覆盖**整个脚本**:不可达的 `INT` 也要预声明。
+///
+/// 证据:官方 `<v555-kuro>` `es_saveload.yst` s33 的
+/// `es.SL.DRAW.BIGTHUMB` 入口 pc640 无条件 GO 到 LEnd(pc850),
+/// 声明 `INT @2223` 却在 pc644,返回 pc851 读取。这里复刻同形:
+/// 入口跳过声明、读回时必须拿到装载期初值。
+#[test]
+fn script_statics_declare_unreachable_int_at_load() {
+    let mut b = ProjectBuilder::new();
+    b.ysc_version = 555;
+    let sys = b.sysvars.len() as u16;
+    let out = VarRef::new(VarSpace::At, sys);
+    let decl = sys + 1;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(0),
+    }];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0), ("AFTER", 3, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_GO).window(0, ex::s("AFTER")),
+        GroupSpec::new(OP_INT)
+            .window(0, ex::r#ref(0x40, decl))
+            .window(0, ex::i8_(7)),
+        GroupSpec::new(OP_END),
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, out.id))
+            .window(0, ex::get(0x40, decl)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    vm.install_other_runtime();
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.store().read(out, &[]).unwrap(),
+        Value::Int(7),
+        "装载期 INT 必须已声明且初值为 7(运行路径跳过了声明)"
+    );
+}

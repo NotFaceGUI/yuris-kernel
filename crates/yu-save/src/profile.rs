@@ -88,7 +88,7 @@ pub fn profile_for(version: u32) -> Option<SaveProfile> {
             btype0_var_id: Btype0VarId::Actual,
             scriptpos: WIRE_GOSUB_U8,
         }),
-        // 0.481 商业构建(非 SDK)写 0x1E1;布局与 0x1E0 同(Erewhon
+        // 0.481 商业构建(非 SDK)写 0x1E1;布局与 0x1E0 同(`<v481-x>`
         // 官方存档 A=1600/+0x78)。
         0x01E1 => Some(SaveProfile {
             image_layout: Some(image_block::LAYOUT_0495),
