@@ -30,6 +30,9 @@ pub(crate) fn pixel_size(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() >= 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") && &bytes[12..16] == b"IHDR" {
         return Some((be32(&bytes[16..20]), be32(&bytes[20..24])));
     }
+    if let Some(size) = webp_size(bytes) {
+        return Some(size);
+    }
     if bytes.len() >= 26 && bytes.starts_with(b"BM") {
         let w = le32(&bytes[18..22]) as i32;
         let h = le32(&bytes[22..26]) as i32;
@@ -44,6 +47,44 @@ pub(crate) fn pixel_size(bytes: &[u8]) -> Option<(u32, u32)> {
         return jpeg_size(bytes);
     }
     None
+}
+
+/// WebP 头尺寸(RIFF 容器;通用扩展能力,不绑版本)。
+///
+/// 三种载荷都覆盖:
+/// - `VP8 `(有损):payload 内帧标签 3 字节 + 起始码 `9D 01 2A` + w/h(u14);
+/// - `VP8L`(无损):签名 `0x2F` + 14 位 `w-1` / 14 位 `h-1`;
+/// - `VP8X`(扩展/动画):画布 `w-1`/`h-1` 24 位 LE。
+fn webp_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 30 || !bytes.starts_with(b"RIFF") || &bytes[8..12] != b"WEBP" {
+        return None;
+    }
+    let chunk = &bytes[12..16];
+    let (w, h) = if chunk == b"VP8 " {
+        if &bytes[23..26] != [0x9d, 0x01, 0x2a] {
+            return None;
+        }
+        let w = u32::from(u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3fff);
+        let h = u32::from(u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3fff);
+        (w, h)
+    } else if chunk == b"VP8L" {
+        if bytes[20] != 0x2f {
+            return None;
+        }
+        let bits = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
+        ((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
+    } else if chunk == b"VP8X" {
+        let w = 1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]);
+        let h = 1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]);
+        (w, h)
+    } else {
+        return None;
+    };
+    if w > 0 && h > 0 && w <= yu_format::ycg::MAX_DIMENSION && h <= yu_format::ycg::MAX_DIMENSION {
+        Some((w, h))
+    } else {
+        None
+    }
 }
 
 fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -129,6 +170,41 @@ mod tests {
         b.extend_from_slice(&800u16.to_le_bytes());
         b.extend_from_slice(&600u16.to_le_bytes());
         assert_eq!(pixel_size(&b), Some((800, 600)));
+    }
+
+    #[test]
+    fn webp_headers() {
+        // VP8X(扩展):画布 w-1/h-1 24 位 LE。
+        let mut b = vec![0u8; 40];
+        b[..4].copy_from_slice(b"RIFF");
+        b[8..12].copy_from_slice(b"WEBP");
+        b[12..16].copy_from_slice(b"VP8X");
+        b[24..27].copy_from_slice(&(1280u32 - 1).to_le_bytes()[..3]);
+        b[27..30].copy_from_slice(&(720u32 - 1).to_le_bytes()[..3]);
+        assert_eq!(pixel_size(&b), Some((1280, 720)));
+
+        // VP8(有损):起始码 `9D 01 2A` + w/h u14。
+        let mut b = vec![0u8; 40];
+        b[..4].copy_from_slice(b"RIFF");
+        b[8..12].copy_from_slice(b"WEBP");
+        b[12..16].copy_from_slice(b"VP8 ");
+        b[23..26].copy_from_slice(&[0x9d, 0x01, 0x2a]);
+        b[26..28].copy_from_slice(&1280u16.to_le_bytes());
+        b[28..30].copy_from_slice(&720u16.to_le_bytes());
+        assert_eq!(pixel_size(&b), Some((1280, 720)));
+
+        // VP8L(无损):签名 0x2F + 14 位 w-1 / 14 位 h-1。
+        let mut b = vec![0u8; 40];
+        b[..4].copy_from_slice(b"RIFF");
+        b[8..12].copy_from_slice(b"WEBP");
+        b[12..16].copy_from_slice(b"VP8L");
+        b[20] = 0x2f;
+        let bits = 1279u32 | (719u32 << 14);
+        b[21..25].copy_from_slice(&bits.to_le_bytes());
+        assert_eq!(pixel_size(&b), Some((1280, 720)));
+
+        // 非 WebP / 截断:不得误判。
+        assert_eq!(pixel_size(b"RIFF\x00\x00\x00\x00WEB"), None);
     }
 
     #[test]

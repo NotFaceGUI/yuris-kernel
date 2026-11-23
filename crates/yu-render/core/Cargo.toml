@@ -6,7 +6,7 @@ license.workspace = true
 description = "两个渲染后端共享的契约与平台设施(表面/报告/纹理/字形栅格/栅格原语)"
 
 [dependencies]
-image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 log = "0.4"
 # 热 map:资产缓存/预取池等 `Vec<u8>` 键的查找,替代 BTreeMap 的逐字节比较。
 rustc-hash = "2"

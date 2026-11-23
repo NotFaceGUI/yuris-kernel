@@ -1666,6 +1666,18 @@ impl TextureStore {
             candidate.extend_from_slice(ext.as_bytes());
             out.push((candidate, Some(*format)));
         }
+        // `.webp` 是**通用扩展名能力**:官方 `yscfg` 码表因版本而异,
+        // 不能把 webp 塞进任何一版码表;这里在码表之后追加一次探测。
+        if !has_extension(key, self.codec)
+            && !self
+                .probe_order
+                .iter()
+                .any(|f| f.extension() == Some(".webp"))
+        {
+            let mut candidate = key.to_vec();
+            candidate.extend_from_slice(b".webp");
+            out.push((candidate, Some(ImageFormat::Webp)));
+        }
         if out.is_empty() {
             out.push((key.to_vec(), None));
         }
@@ -1808,6 +1820,9 @@ fn known_extension_format(key: &[u8]) -> Option<ImageFormat> {
         Some(ImageFormat::Gif)
     } else if ends_with_ascii_ci(key, b".psb") {
         Some(ImageFormat::Psb)
+    } else if ends_with_ascii_ci(key, b".webp") {
+        // v555 商业包主力格式(`image` 的 webp feature 解码)。
+        Some(ImageFormat::Webp)
     } else {
         None
     }
@@ -2397,7 +2412,8 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].key, b"nope");
         assert_eq!(issues[0].code, code::MISSING);
-        assert!(issues[0].detail.contains("已尝试 2 个候选"));
+        // 码表 2 项 + 通用追加的 `.webp` = 3 个候选。
+        assert!(issues[0].detail.contains("已尝试 3 个候选"));
     }
 
     /// 包内名字按主机 ACP(GBK)落盘、脚本字面量是 CP932 时,原始字节

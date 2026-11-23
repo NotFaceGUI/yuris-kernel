@@ -144,6 +144,8 @@ fn image_format(out: &mut String, f: ImageFormat) {
             ImageFormat::Jpg => 3,
             ImageFormat::Gif => 4,
             ImageFormat::Psb => 5,
+            // 通用扩展能力,不来自 `yscfg` 码表;诊断里用 6 与未知码区分。
+            ImageFormat::Webp => 6,
             ImageFormat::Other(c) => c,
         }
         .to_string(),

@@ -192,10 +192,13 @@ pub struct CopyId(pub u64);
 
 /// 图像格式(引擎 `yscfg` 扩展名探测码)。
 ///
-/// 证据:`FUN_0040c9b4`(`0x40c9b4`)按 `DAT_00801600` 的字节查表:
+/// 0.495 及更早:`FUN_0040c9b4`(`0x40c9b4`)按 `DAT_00801600` 的字节查表:
 /// `1→".png"`、`2→".bmp"`、`3→".jpg"`、`4→".gif"`;手册 `cg/cg.html`
 /// 给出默认顺序 `.PNG .BMP .JPG .GIF`。ERIS `yscfg` 的 8 字节为
 /// `01 02 03 04 05 00 00 00`。
+///
+/// `.webp` 不在这张码表里:它是**通用扩展名能力**,由探测链末尾追加,
+/// 不参与版本门控。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageFormat {
     Png,
@@ -204,11 +207,17 @@ pub enum ImageFormat {
     Gif,
     /// 引擎码 5:`FUN_0040c9b4` 行 383 明写 `.psb`。
     Psb,
+    /// WebP(通用扩展名能力;`image` 的 `webp` feature 解码)。
+    ///
+    /// 不参与 `yscfg` 扩展码表(码表保持各自版本形态),只作为探测链的
+    /// 通用追加项;v555 商业包主力格式即 `.webp`。
+    Webp,
     /// 表内其他未定义码(原样保留)。
     Other(u8),
 }
 
 impl ImageFormat {
+    /// 0.495 及更早的扩展码表(`1=png / 2=bmp / 3=jpg / 4=gif / 5=psb`)。
     pub fn from_code(code: u8) -> Self {
         match code {
             1 => Self::Png,
@@ -227,6 +236,7 @@ impl ImageFormat {
             Self::Jpg => Some(".jpg"),
             Self::Gif => Some(".gif"),
             Self::Psb => Some(".psb"),
+            Self::Webp => Some(".webp"),
             Self::Other(_) => None,
         }
     }
@@ -238,6 +248,7 @@ impl ImageFormat {
             Self::Jpg => "jpg",
             Self::Gif => "gif",
             Self::Psb => "psb",
+            Self::Webp => "webp",
             Self::Other(_) => "other",
         }
     }

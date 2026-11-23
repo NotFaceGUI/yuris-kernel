@@ -426,6 +426,13 @@ impl Vm {
             path.extend_from_slice(ext);
             candidates.push(path);
         }
+        // `.webp` 是通用扩展名能力,不参与 `yscfg` 码表(码表因版本而异);
+        // 无显式扩展名时在码表候选之后追加一次。
+        if !has_image_extension_with(key, self.name_text_codec()) {
+            let mut path = key.to_vec();
+            path.extend_from_slice(b".webp");
+            candidates.push(path);
+        }
         'probe: for path in candidates {
             // 先只读文件头:PNG/BMP/GIF 的尺寸都在前 26 字节内,JPEG 走段链
             // 到 SOF。整读一张按钮贴图(实测平均 359 KB)只为取宽高是纯浪费
