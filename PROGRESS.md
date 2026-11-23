@@ -17750,3 +17750,16 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   样本的 PINT/PINT2/PINT3 与 ysv 槽号对拍。
 - **验证**:`<v555-2>` desktop debug 连续 45s 不自行退出(exit 124/143),
   日志无 `PRODUCT` UNIMP;其余 workspace 测试同 PUSH-PREP-FIX 条目。
+
+## 挂账 PUSH-PREP-RESIDUALS (2026-11-24) · sysvar 强转与 v555 DNO=1024 占用待取证
+
+- **DIV-RT-077**:`_INT`/`_PINT`/`_DROPFILE_NUM` 的 RHS 浮点/字符串转换。
+  当前用 `to_int_lossy()` 与普通 LET 的 `coerce_to(Int)` 统一(浮点截断、
+  字符串解析);官方这三类写入口的实际转换规则、`DAT_008724ac` 的宽度/符号
+  均未取证。待取证:处理体 `0x443988` int 分支 + 构造脚本对拍。
+- **DIV-RT-078**:v555 普通 `SAVE[DNO=1024 SET=…]` 的官方行为未取证。
+  当前选择“显式 recoverable 拒绝”,防止与 `SAVE[MEM=99999]` 内存包静默
+  同 DNO 覆盖;0.495/0.481 的 `LOAD[DNO=1024]` 按普通块处理。待取证:
+  SAVE 处理体是否在预约阶段排除 1024、官方存档逐块解析、旧版 LOAD 分支。
+- **原则**:两处都是“内部一致性/防数据丢失”的防御性实现,不是已证实的
+  官方语义;取证后按 DIV 结论收紧或放宽,不把挂账当终态。
