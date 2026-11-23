@@ -17016,3 +17016,57 @@ cargo check -p yu-rt -p yu-engine --all-targets                  # 通过
 ```
 档案：`docs/divergences/DIV-RT-068-v555-stale-window-length.md`。
 未执行 git 写操作。
+
+## 成果 OLDSTDLIB-TEXT-GFX (2026-11-23) · 旧代 stdlib 行末清缓冲与 WebP 资产能力
+
+**样本**：`<v555-1>`、`<v555-pc>`（真名见 `AGENTS.md`）。
+
+**文本第二句越界**：
+- 根因：旧代 stdlib 的 `es.TX.OUTPUT.LINEEND` 在脚本侧自行插入
+  C/R/P/Z；引擎侧三个 0.555 构建的 `RETURNCODE`
+  (`0x44b920`/`0x44b9e4`/`0x44b824`) 只写 `'E'` 并无条件置
+  `state+0x15 = 1`，泵在任务恢复时经 `FUN_004047c4 → FUN_0046b32c`
+  清 `_TEXT`/`_TEXT_FLAG`。内核旧路径沿用 0.495 形态（自动追加 C/R/P，
+  清缓冲只在手动模式置位），标志流跨行累积，`BUFSET.SIZE` 的
+  `@5709 = len - @5606 + 1` 在后续行进入负值空转 → 弹
+  「テキスト内部エラー」+ `END`。
+- 修法：`SemanticProfile::returncode` 新增
+  `ReturnCodeMode{Legacy,EndOnly}`；精确 555 走 `EndOnly`（只写 E +
+  无条件 `clear_pending`），释放路径已有清缓冲消费。旧版默认不变。
+- 实测：交互连续推进多句无内部错误、主任务不再 END（主人确认）。
+
+**WebP 资产与精灵链**：
+- 语料自证：`<v555-1>` 的 CG 包有 29,502 个 `.webp`（0 个 bmp/jpg/gif）；
+  0.555 官方探测函数 `FUN_0043d81c` 的扩展名分支为
+  `1=.bmp / 2=.png / 3=.jpg / 4=.webp`。
+- 根因：`image` 未启用 webp feature，候选链只有
+  `.png/.bmp/.jpg/.gif/.psb`；`CG[FILE]` 资产 miss ⇒ COPY2 目标快照无
+  显示矩形 ⇒ `CGINFO[SX/SY]` 返回 0 ⇒ `es.CGACT_SIZE` 判尺寸不足，
+  把显示层写成屏外 `999999999`，SIZE/TID 链整条跳过 ⇒ 只余窗口 UI。
+- 修法（通用能力，不做版本门控）：core 打开 `image/webp`；
+  `yu-rt::image::pixel_size` 解析 VP8/VP8L/VP8X 头；
+  渲染端 `TextureStore::candidates` 与 VM `resolve_asset_size`
+  在码表候选后通用追加 `.webp`；`ImageFormat::Webp` 仅作能力名，
+  不进入任何 `yscfg` 码表。
+- 实测：进入正文背景/立绘恢复（主人确认）。
+
+**验证**：
+```bash
+cargo test -p yu-rt --lib                                  # 153 passed
+cargo test -p yu-rt --test fixture --no-default-features   # 144 passed, 7 ignored
+cargo test -p yu-rt --test corpus                          # 11 passed
+cargo test -p yu-gfx                                       # 205 passed
+cargo test -p yu-render-core --lib                         # 29 passed
+cargo build -p yu-rt -p yu-gfx -p yu-render-core \
+  -p yu-backend-soft -p yu-backend-wgpu -p yu-engine \
+  -p yu-host-desktop --all-targets                         # 通过
+cargo build -p yu-cli --no-default-features --features desktop --all-targets
+                                                           # 通过
+```
+
+**环境限制**：`cargo build --workspace --all-targets` 在本机被
+`libmimalloc-sys` 的 `cl.exe C1083` 挡住——cargo registry 位于非 ASCII
+用户目录（`C:\Users\…\.cargo`），`cl` 打不开该路径；与本次改动无关。
+
+档案：`docs/divergences/DIV-RT-069-returncode-clear-semantics.md`、
+`docs/divergences/DIV-GFX-092-webp-asset.md`。
