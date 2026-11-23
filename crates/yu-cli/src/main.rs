@@ -141,6 +141,7 @@ fn dispatch(tokens: Vec<String>) -> CliResult<()> {
         "dev" => yu_cli::dev::from_args(rest),
         "case" => yu_cli::case::from_args(rest),
         "bench" => yu_cli::bench::from_args(rest),
+        "export" => yu_cli::export::from_args(rest),
         "version" | "-V" | "--version" => {
             output::line(format!(
                 "yu-cli {} (marker {})",
@@ -152,7 +153,7 @@ fn dispatch(tokens: Vec<String>) -> CliResult<()> {
         other => Err(Failure::new(
             EXIT_FAIL,
             format!(
-                "未知子命令 `{other}`;可用: run | serve | dev | case | bench | help \
+                "未知子命令 `{other}`;可用: run | serve | dev | case | bench | export | help \
                  (逐命令细节: yu-cli help run)"
             ),
         )),
@@ -160,7 +161,10 @@ fn dispatch(tokens: Vec<String>) -> CliResult<()> {
 }
 
 fn is_known_command(command: &str) -> bool {
-    matches!(command, "run" | "serve" | "dev" | "case" | "bench")
+    matches!(
+        command,
+        "run" | "serve" | "dev" | "case" | "bench" | "export"
+    )
 }
 
 fn print_command_help(command: &str) -> CliResult<()> {
@@ -170,17 +174,20 @@ fn print_command_help(command: &str) -> CliResult<()> {
         "dev" => DEV_HELP,
         "case" => CASE_HELP,
         "bench" => BENCH_HELP,
+        "export" => EXPORT_HELP,
         other => {
             return Err(Failure::new(
                 EXIT_FAIL,
-                format!("`{other}` 没有单独的 help;可用: run | serve | dev | case | bench"),
+                format!(
+                    "`{other}` 没有单独的 help;可用: run | serve | dev | case | bench | export"
+                ),
             ))
         }
     };
     output::raw(text);
     // 运行参数段与 `HostTuning::from_args` 共用同一批旗标(所有跑引擎的
     // 子命令都接受;dev 只透传给 yu-serve)。
-    if is_known_command(command) {
+    if is_known_command(command) && command != "export" {
         output::raw(yu_cli::args::HOST_TUNING_HELP);
     }
     Ok(())
@@ -197,6 +204,7 @@ yu-cli · 桌面唯一入口(headless + --mode desktop)+ 本地服务 + 用例�
   yu-cli dev <project-root>      # HMR 监督(改码重启,改 www 刷新)
   yu-cli case <project-root> --all | --case NAME [--update]
   yu-cli bench <project-root> [--frames N]
+  yu-cli export <project-root> [out-dir]  # 导出文本/角色表(翻译用的稳定坐标表)
 
 命令:
   run     跑工程。缺省 headless(soft 后端,跑完即退,出报告/PNG/JSON);
@@ -205,6 +213,7 @@ yu-cli · 桌面唯一入口(headless + --mode desktop)+ 本地服务 + 用例�
   dev     监督 yu-serve 子进程:改 crates/**/*.rs → 重建重启;改 www/** → 刷新
   case    golden 用例执行器
   bench   帧耗时基准
+  export  导出文本 / 角色表(CSV,UTF-8 BOM;不跑引擎)
   help    本总览,或逐命令 help
 
 全局参数:
@@ -369,4 +378,42 @@ yu-cli bench · 帧耗时基准
 
 用法:
   yu-cli bench <project-root> [--frames N] [--debug-mode on|off]
+";
+
+const EXPORT_HELP: &str = "\
+yu-cli export · 导出文本 / 角色表(翻译与运行时文本 hook 的输入)
+
+用法:
+  yu-cli export <project-root> [out-dir] [--text-codec auto|cp932|gbk|big5]
+                [--format csv|translate-json] [--script-key HEX] [--data PATH]
+                [--no-literals] [--runtime-characters] [--runtime-ticks N]
+
+输出(--format csv 缺省;UTF-8 BOM,路径相对 out-dir):
+  --format translate-json  只写 translate.json:角色表 + 正文,每条带空译文槽;
+                           不产生 literals/CSV/人读副本
+  --format csv             完整 CSV(text/literals/scenario/characters + 人读副本)
+  manifest.json     工程/密钥/codec/计数/跳过与告警
+  text.csv          编译脚本 `WORD` 文本(script_id + pc)
+  literals.csv      脚本字符串常量(非 WORD 的 UI/绘制文本;--no-literals 关闭)
+  scenario.csv      555 外置剧本台词(宏/裸文本/行内文本;variant + 文件 + 行号)
+  characters.csv    角色名表(variant + table + 序号;含 characters_<variant>.csv)
+  characters_runtime.csv  运行时注册表验证(--runtime-characters)
+  text/ scenario/   人读副本(UTF-8)
+
+坐标稳定:
+  WORD       = script_id + pc
+  字符串常量 = script_id + pc + window + segment
+  外置剧本   = variant + 相对路径 + 行号
+  角色表     = variant + table(定义脚本源路径)+ 定义顺序序号
+
+说明:
+  --text-codec auto(缺省)先采样 `WORD`,没有 WORD(555 框架脚本)再采样
+  基准剧本文本,最后才用普通脚本字符串常量(只收非 ASCII 占比 >=30% 的串),
+  在 CP932/GBK 间裁决,平局或出现全角假名回退 CP932;外置剧本按目录变体固定
+  (sc_cn_ = GBK、sc_tw_ = Big5)。
+  解码失败逐字节计数写入 manifest.json 的 warnings,不静默替换。
+  缺表/缺脚本显式列出,不空跑通过。
+  --runtime-characters  boot 后跑启动链(--runtime-ticks,缺省 600 帧),按静态
+  角色名匹配运行时 STR 数组并写 characters_runtime.csv;boot 失败只 warning,
+  不影响静态导出。
 ";

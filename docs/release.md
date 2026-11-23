@@ -28,7 +28,7 @@ Android universal APK 用同款徽章，另附 ABI 瘦包与 so / 许可证链�
 | `meta` | ubuntu | 校验 tag 与 Cargo.toml 一致、跑发布工具自测、生成 `notes.md` |
 | `cli` | windows-latest | `yuris-kernel-vX.Y.Z-windows-x64.zip`（`yu-cli.exe` + `yu-serve.exe` + README/LICENSE/NOTICE + 第三方许可清单与文本） |
 | `android` | ubuntu-latest | `yuris-kernel-vX.Y.Z-android-universal.apk`、`-android-arm64-v8a.apk`、`-android-x86_64.apk`、`yuris-kernel-vX.Y.Z-android-so.zip` |
-| `publish` | ubuntu-latest | 创建/更新 Release 并上传全部产物，另生成 `yuris-kernel-vX.Y.Z-licenses.zip` |
+| `publish` | ubuntu-latest | 创建/更新 Release 并上传全部产物，另生成 `yuris-kernel-vX.Y.Z-licenses.zip`；`meta` 另打包 `yuris-kernel-vX.Y.Z-translation-skill.zip` |
 
 1. `meta`：checkout 该 tag，`fetch-depth: 0`（更新日志需要完整历史与旧 tag）；
    校验 tag 与 `Cargo.toml` 的 `[workspace.package].version` 完全一致；
@@ -55,6 +55,7 @@ Android universal APK 用同款徽章，另附 ABI 瘦包与 so / 许可证链�
 | `yuris-kernel-vX.Y.Z-android-tyranor-module-arm64-v8a.apk` | 同上，只含 `arm64-v8a` 的模块瘦包 |
 | `yuris-kernel-vX.Y.Z-android-so.zip` | `libyu_host_android.so` + `libc++_shared.so`（按 ABI 分目录） |
 | `yuris-kernel-vX.Y.Z-licenses.zip` | `LICENSE`、`NOTICE`、`THIRD-PARTY-NOTICES.md`、`licenses/`；Android 产物不内嵌这些文件，随此包分发 |
+| `yuris-kernel-vX.Y.Z-translation-skill.zip` | `.agents/skills/yuris-translation/`（SKILL.md、schema/style 参考、校验脚本）+ `translation-workflow.md`；可直接放入 AI 工具的 skills 目录 |
 
 三个普通 APK 用同一把 key 签名，`versionName` 相同；Tyranor 模块包也用
 同一把 key，但 `versionName` 追加 `-tyranor`，以便和普通包区分。`versionCode`

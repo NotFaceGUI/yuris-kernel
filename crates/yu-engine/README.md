@@ -11,6 +11,7 @@ serve —— 嵌的是**同一份装配**;平台差异只能经端口进入。
 | `project` | 按官方挂载规则发现数据入口:开发工程 `data/`、发行版根 `*.ypf` + `pac/*.ypf`;`update1..9.ypf` 增量层;散盘叠层;`data.ypf` 只是单包特例 |
 | `engine` | `Engine::new` / `tick` / `tick_realtime` / `restart` / `suspend`;每帧 VM → gfx 同步 → 后端合成,soft / wgpu 两后端 |
 | `capture` | `SAVE[ID]` / `LOAD[ID]` 图层像素通道:wgpu 命令时刻按需读回,soft 镜像快照;`LOAD` 写回合成资产叠层 |
+| `export` | 跨平台文本/角色表导出:`WORD` + 脚本字符串常量 + 555 外置剧本(`scenario/*.txt`)+ `キャラ名定義`;稳定坐标 CSV,供翻译与运行时 hook |
 | `identity` | 游戏名、YU-RIS 版本、窗口图标、内核版本;同一份事实给所有宿主 |
 | `patch` | `PatchKind`(auto / original / gbk / big5 / tunnel)+ `PatchSelection`,跨平台唯一取值 |
 | `host_paths` | `$_SYSTEM_PATH` 等路径变量:平台默认解析 + 宿主显式覆盖 |
@@ -58,6 +59,8 @@ let frame = engine.tick_realtime()?;
 cargo test -p yu-engine
 cargo run -p yu-engine --example lifecycle_probe -- <project>
 cargo run -p yu-engine --example identity_probe -- <project>
+# 文本/角色表导出(跨平台;桌面 CLI 入口是 `yu-cli export`)
+cargo test -p yu-engine --test export -- --nocapture
 ```
 
 `examples/` 另有 `analyze_game` / `list_assets` / `dump_script` /

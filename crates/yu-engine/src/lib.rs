@@ -16,6 +16,7 @@
 
 pub mod capture;
 pub mod engine;
+pub mod export;
 pub mod host_clock;
 pub mod host_paths;
 pub mod host_ui;

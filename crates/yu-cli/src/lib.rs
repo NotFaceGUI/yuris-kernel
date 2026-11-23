@@ -16,6 +16,7 @@ pub mod build_info;
 pub mod case;
 pub mod clock;
 pub mod dev;
+pub mod export;
 pub mod logging;
 pub mod run;
 pub mod server;

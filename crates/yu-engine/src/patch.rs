@@ -1004,6 +1004,14 @@ fn has_yuris_tools_signature(project: &Project) -> bool {
     false
 }
 
+/// 读取游戏根的 `sjis_ext.bin`(SJIS 隧道表);缺失返回 `None`。
+///
+/// 文本导出/诊断等只读消费者用它把隧道码回解成 Unicode;编码路线本身仍由
+/// [`PatchSelection`] 决定。
+pub fn load_tunnel(project: &Project) -> Result<Option<TunnelTable>, Failure> {
+    read_tunnel(project, None)
+}
+
 fn read_tunnel(project: &Project, path: Option<&str>) -> Result<Option<TunnelTable>, Failure> {
     let path = path.unwrap_or("sjis_ext.bin");
     let Some(bytes) = read_any(project, path.as_bytes(), path)? else {

@@ -33,6 +33,18 @@ impl ArgReader {
         None
     }
 
+    /// 下一个尚未消费的位置参数(供多位置参数命令使用)。
+    pub fn positional_next(&mut self) -> Option<String> {
+        for i in 0..self.tokens.len() {
+            if self.used[i] || self.tokens[i].starts_with("--") {
+                continue;
+            }
+            self.used[i] = true;
+            return Some(self.tokens[i].clone());
+        }
+        None
+    }
+
     /// `--name value` / `--name=value`。
     pub fn flag(&mut self, name: &str) -> Option<String> {
         let eq = format!("--{name}=");

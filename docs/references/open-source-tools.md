@@ -12,6 +12,7 @@
 | [ZQF-ReVN/RxYuris](https://github.com/ZQF-ReVN/RxYuris) | C++/GPL(见仓库) | `.ypf`/`.ybn` 工具集: YSCOM Loader(调官方编译器并保存产物)、YSCM/YSTB 解析、**YSTB_GuessXorKey** | 编译协议参考实现(已用);XOR key 猜测思路;`YSTB_Coder::Xor` 分段语义(已实证) |
 | [Aionfatedio/YU-RIS-Script-Editor](https://github.com/Aionfatedio/YU-RIS-Script-Editor) | Python/**未声明许可** | YBN 解析(V2/V5)、文本编辑/回写、YPF 读写(纯脚本封包可回封)、**自检测密钥/编码/引擎信息**、导出纯文本/翻译三行对照;**README 自述已测 Whirlpool 系及多部商业作品** | ①YSTB **V2** 支路(我们目前只实测 V5);②密钥/编码自检测策略;③**翻译=数据层嵌入**(写回 YBN 文本段、纯脚本 YPF 自动回封),**无 exe/DLL 注入**;④文本提取与三行对照格式 |
 | [fengberd/YuRISTools](https://github.com/fengberd/YuRISTools) | 见仓库 | YU-RIS 工具集 | 脚本/封包辅助对照 |
+| [alessandrocaetanob/vnforge](https://github.com/alessandrocaetanob/vnforge) | C#/**未声明许可** | 翻译工程:YSTB 文本提取/回填、说话人分隔符、VNDB 角色对照 | `ES.CHAR.NAME` 文本单元、`es.CHAR.NAME.MARK.SET` 分隔符、三种引号定界符(`"` / `` ` `` / `'`) |
 | [jyxjyx1234/YURIS_TOOLS](https://github.com/jyxjyx1234/YURIS_TOOLS) | 见仓库 | 汉化工具包 | 文本提取/回写流程、编码处理 |
 | [shimamura-sakura/yuri](https://github.com/shimamura-sakura/yuri) | Rust | Yu-Ris 反编译/编译器(并行、增量) | 命令语义与结构化反编译思路;可与我们的 yu-script/yu-rt 对照 |
 | [shimamura-sakura/yuris_decompiler](https://github.com/shimamura-sakura/yuris_decompiler) | Python/**MIT** | 0.247–0.494;V2/V5;YPF、YSCM、YSER、YSTD、YSLB、YSTL、YSVR;含官方 0.255 样本 | **V2 首选参考**:完整 decompile/recompile;`InsTyqV200/V300` 的 `$@`/`&$`/`&@` 映射按 MIT 算法级采用(出处已注明);0.255/0.488/0.494 实测 |
@@ -61,6 +62,21 @@
 | 编码自检测 | Script-Editor(自动编码检测) | 与 `docs/architecture.md` §7 的确定性裁决策略对照;我们要求可复现 |
 | 命令语义 | `yuri` 反编译器;官方手册(一手) | 手册优先;反编译结论只作待验证线索 |
 | 引擎启动/挂载 | 本仓库 `docs/sdk-eris-analysis.md` §8、`docs/formats/ypf.md` §4 | 已由官方二进制实证,不必依赖第三方说法 |
+
+### 2.6 角色名/说话人处理(2026-11-23 核对)
+
+- **vnforge** `VNForge.Engines.YuRis/Text/YstbTextExtractor.cs`:
+  - `GOSUB ES.CHAR.NAME` 的每个非空字符串字面量参数 = 一个
+    `TextUnitKind.Name`(大小写不敏感);`ES.SEL.SET` 同理提取选项。
+  - `ExpressionStrings.Read` 接受三种引号:`"…"`、反引号 `` `…` ``、`'…'`。
+  - `SpeakerMarkers.cs` 专门处理 `es.CHAR.NAME.MARK.SET` 注册的
+    `「`/`『`/`（` 等分隔符;`WORD` 消息按“名字 + 分隔符 + 台词”拆出
+    `Speaker`。
+- **RxYuris / Script-Editor / YURIS_TOOLS**:未检索到角色名专用逻辑
+  (它们以 `WORD`/选项文本为主)。
+- 本仓库对应实现:`yu-engine::export` 的 `characters.csv`(结构化
+  `es.CHAR.NAME` + 三种引号 + 可选 `sjis_ext.bin` 隧道),以及
+  `--runtime-characters` 的运行时注册表验证。
 
 ## 3. 使用纪律
 

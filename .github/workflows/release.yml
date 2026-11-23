@@ -90,6 +90,24 @@ jobs:
           path: .release/notes.md
           if-no-files-found: error
 
+      # 翻译 skill 随 Release 分发:AI 工具可直接加载,不依赖仓库 checkout。
+      - name: Package translation skill
+        run: |
+          set -euo pipefail
+          stage="dist/yuris-kernel-${RELEASE_TAG}-translation-skill"
+          mkdir -p "$stage"
+          cp -r .agents/skills/yuris-translation "$stage/"
+          cp docs/translation-workflow.md "$stage/"
+          ( cd dist && zip -qr "yuris-kernel-${RELEASE_TAG}-translation-skill.zip" "yuris-kernel-${RELEASE_TAG}-translation-skill" )
+          ls -l "dist/yuris-kernel-${RELEASE_TAG}-translation-skill.zip"
+
+      - name: Upload translation skill
+        uses: actions/upload-artifact@v4
+        with:
+          name: translation-skill
+          path: dist/*-translation-skill.zip
+          if-no-files-found: error
+
   # ── 2. Windows CLI（yu-cli.exe + yu-serve.exe）────────────────────────────
   cli:
     name: cli-windows-x64

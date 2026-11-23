@@ -156,6 +156,11 @@ target/release/yu-cli dev "<project>" --backend wgpu --port 4173
 # 用例
 target/release/yu-cli case "<project>" --all
 
+# 导出文本 / 角色表(翻译与运行时文本 hook 的输入;UTF-8 CSV,不跑引擎)
+target/release/yu-cli export "<project>" [out-dir] --text-codec auto
+# 翻译模板:只出 translate.json(角色 + 正文,带空译文槽)
+target/release/yu-cli export "<project>" [out-dir] --format translate-json
+
 # 汉化
 target/release/yu-cli run "<project>" --mode desktop --patch gbk
 target/release/yu-cli run "<project>" --mode desktop --patch big5
@@ -165,6 +170,23 @@ target/release/yu-cli run "<project>" --mode desktop --patch tunnel
 target/release/yu-cli run "<project>" --mode desktop --backend wgpu \
   --script-key 0x1A2B3C4D --save-codec snappy
 ```
+
+## 翻译流程
+
+```bash
+# 1. 导出翻译模板(只含角色 + 正文)
+yu-cli export "<project>" "<out>" --format translate-json
+
+# 2. 用仓库内翻译 skill 翻译(可随仓库分发给其它 AI 工具)
+#    .agents/skills/yuris-translation/SKILL.md
+
+# 3. 校验结构/角色统一/控制符/编码
+python .agents/skills/yuris-translation/scripts/validate_translate.py   "<out>/translate.json"
+```
+
+翻译规则(角色统一、说话人前缀、控制符、长度、codec)见
+[`docs/translation-workflow.md`](docs/translation-workflow.md) 与
+[`SKILL.md`](.agents/skills/yuris-translation/SKILL.md)。
 
 ## 文本编码
 

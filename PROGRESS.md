@@ -17071,6 +17071,128 @@ cargo build -p yu-cli --no-default-features --features desktop --all-targets
 档案：`docs/divergences/DIV-RT-069-returncode-clear-semantics.md`、
 `docs/divergences/DIV-GFX-092-webp-asset.md`。
 
+## 成果 EXPORT-TEXT (2026-11-23) · 跨平台文本/角色表导出(翻译 hook 的输入)
+
+> 背景:555 剧情正文外置(`scenario/*.txt` / `sc_cn_` / `sc_tw_`,见
+> `docs/formats/v555-commercial.md` §13),运行时 hook 需要一套稳定坐标的
+> 原文表;此前只有 `yu-format/examples/unpack_text.rs` 的取证脚本,不能作为
+> 跨平台产品入口。
+
+### 1. 落位
+
+- 库:`crates/yu-engine/src/export.rs`(`yu_engine::export`,纯 std + `yu-format`
+  / `yu-vfs`,不含桌面/Android API)。桌面、Android、serve 可调用同一份。
+- CLI:`yu-cli export <project-root> [out-dir] [--text-codec auto|cp932|gbk|big5]
+  [--script-key HEX] [--data PATH] [--no-literals]`。
+  缺省输出 `<project-root>/export-text`。
+- 测试:`crates/yu-engine/tests/export.rs`(真样本由 `YURIS_SAMPLE_ERIS_ROOT` /
+  `YURIS_SAMPLE_V555_ROOT` 提供;缺样本显式 SKIP,`YURIS_REQUIRE_SAMPLES=1`
+  时失败)。
+
+### 2. 导出内容与稳定坐标
+
+| 文件 | 来源 | 坐标 |
+|---|---|---|
+| `text.csv` | `yst%05d.ybn` 的 `WORD` 载荷 | `script_id + pc` |
+| `literals.csv` | `M` 形字符串常量(排除 `es.*`/资源路径/二进制/标签名) | `script_id + pc + window + segment` |
+| `scenario.csv` | `scenario` / `*_scenario` 下的 `.txt` 台词宏/裸文本 | `variant + 文件 + 行号 + seq` |
+| `characters.csv` | 含 `es.CHAR.NAME` 结构的定义脚本(路径只作候选收窄) | `variant + table + 定义顺序` |
+| `text/` `scenario/` | 人读副本(UTF-8) | — |
+
+- 全部 CSV 为 UTF-8 + BOM;`manifest.json` 无 BOM,含 codec 裁决分数、脚本密钥
+  来源、计数、`skipped` / `warnings`。
+- 文本域 codec:显式值优先;`auto` 先采样 `WORD`,没有 `WORD`(555 框架脚本)
+  再采样基准剧本文本 / 普通脚本字符串常量(只收非 ASCII 占比 >=30% 的串),
+  平局或出现全角假名回退 CP932(细则见 §4 的误判修正)。外置剧本按目录变体
+  固定:`sc_*cn*` = GBK、`sc_*tw*` = Big5、`scenario` = 文本域 codec。
+- 角色表:按**结构**识别(`es.CHAR.NAME` 调用且同组至少两段非方法字面量),
+  不依赖文件名;`es_charname.yst` 是框架函数(排除)。`display` / `name` 取前
+  两段字面量,`es.CHAR.NAME.MARK.SET` 单独导出 `characters_marks.csv`。
+- 输出目录里含 `manifest.json` 的目录不会被当作剧本源(避免二次运行把上次
+  的 `scenario/` 再导一遍);本次 `out-dir` 在工程内时同样跳过。
+
+### 3. 验证原始结果
+
+```bash
+cargo test -p yu-engine --test export -- --nocapture
+# running 2 tests
+# test eris_export_word_text_matches_corpus ... ok
+# test v555_export_external_scenario_and_characters ... ok
+
+cargo run -p yu-cli --no-default-features --bin yu-cli --   export <v555-2> <tmp>/export-v555
+# export: scripts=313 text=0 literals=17689(skipped 57354)
+#         scenario=18615(198 files) characters=55(3 variants) codec=cp932(auto)
+
+cargo run -p yu-cli --no-default-features --bin yu-cli --   export project-eris <tmp>/export-eris
+# export: scripts=136 text=464 literals=3520 scenario=0(0 files)
+#         characters=4(1 variants) codec=cp932(auto)   ← userdefine/jp_0002.txt
+```
+
+- `<v555-2>`:三语变体各 6,205 条台词;`text=0` 是该版本框架脚本没有 `WORD`
+  (正文外置)的预期结果,不是静默失败;角色表 11(base)+ 中文 11 + 繁中 11
+  + 其余条目共 55。
+- ERIS:`WORD=464` 与既有 `unpack_text` 交叉核对一致;角色表在
+  `userdefine/jp_0002.txt`(不是 `キャラ名定義`),结构识别解出 4 个
+  (`優理`/`枝理`/`きゅーたろー`/`恵一`);确实没有定义表时才写 warning。
+- 所有导出行抽检 `U+FFFD = 0`(含 GBK/Big5 台词与角色名)。
+
+### 4. 扩展/勘误(2026-11-23 · 第二样本 `<v555-pieces>`)
+
+- **裸文本与命令后行内文本**:该样本剧本 DSL 不是 `\LC("…")` 包裹,而是
+  `\VO(id)【名字】「…」` 或裸行;原实现只认 `L*` 宏,导致
+  `scenario_files=296` 但 `scenario_units=0`。现在 `scenario.csv` 增加
+  `kind` 列:`macro`(台词宏)/ `text`(裸文本或行内文本,`macro` 列记前导
+  命令名或 `-`)。
+- **codec auto 采样扩展(含误判修正)**:原实现只采样 `WORD`;555 框架脚本
+  没有 WORD,且首批脚本的字符串常量多为 ASCII(路径/方法名),两种 codec
+  得分都被压在 `valid_ratio` 上,把 GBK 工程误判成 CP932。现在顺序:
+  `WORD` → 基准语种剧本文本 → 普通脚本字符串常量;采样只收非 ASCII 字节
+  `>=4` 且占比 `>=30%` 的串。否则英文行里夹 `【】“”`(0x817A 被 GBK 当汉字)
+  会让 GBK 靠 han 加权险胜,把 `<v555-2>` 的英文/CP932 标点误判成 GBK。
+  另加安全网:CP932 解码全角假名占比 `>=10%` 时强制 CP932。
+  结果:`<v555-pieces>` `cp932(4.346) vs gbk(5.794)` → `gbk(auto)`;
+  `<v555-2>` `cp932(5.597) vs gbk(5.617)` → 平局回退 `cp932(auto)`;
+  ERIS `cp932(5.836) vs gbk(5.965)` → 平局回退 `cp932(auto)`。
+- **相邻引号串拆分**:`M` 载荷里可能连续存多个引号串
+  (`"名字""注释"`);原实现取第一个到最后一个引号之间的全部字节,把注释
+  并进名字。现在按引号段拆分,`characters.csv` 的 `U+FFFD` 从 25 降为 0。
+
+验证原始结果:
+
+```bash
+cargo run -p yu-cli --no-default-features --bin yu-cli --   export <v555-pieces> <tmp>/export-pieces
+# export: scripts=285 text=0 literals=20493(skipped 67080)
+#         scenario=39999(296 files) characters=247(1 variants) codec=gbk(auto)
+# characters.csv: U+FFFD=0;例 `【晃司＠ロックなおじさん】 | 摇滚大叔`
+# scenario.csv: 例 `base,scenario/0_all_000.txt,23,text,-,0_ALL_000,SJ_ALL_01,gbk,很久很久以前，在天空之上。`
+```
+
+### 5. 通用性普查(2026-11-23 · 7 个真实作品)
+
+同一份 `yu-cli export` 在既有样本上的结果(全部自动取钥成功):
+
+| 占位符 | 引擎 | 文本主路径 | `text` | `scenario` | 角色表 |
+|---|---|---:|---:|---:|---:|
+| project-eris | 0.495 | `WORD` | 464 | 0 | 4 |
+| `<v479-x>` | 0.479 | `WORD` | 33,984 | 0 | 214 |
+| `<v481-x>` | 0.481 | `WORD` | 39,625 | 0 | 139 |
+| `<v488-x>` | 0.488 | `WORD` | 6,185 | 0 | 20(`cp932+tunnel`) |
+| `<v494-x>` | 0.494 | `WORD` | 13,220 | 0 | 56 |
+| `<v500-relirium>` | 0.500 | 外置剧本 | 0 | 47,257(244 files) | 202 |
+| `<v555-pieces>` | 0.555 | 外置剧本 | 0 | 39,999(296 files) | 247 |
+| `<v555-2>` | 0.555 | 外置剧本 | 0 | 18,615(198 files) | 55(3 变体) |
+
+结论:
+
+- **编译脚本的 `WORD` 路线在 0.479–0.494 通用**;0.500/0.555 正文外置,
+  `WORD=0` 是结构事实,不是漏导。
+- **外置剧本不是 555 专属**:`<v500-relirium>` 也是 `scenario/*.txt`(244 文件)。
+- **角色表按结构识别在 7/7 个作品命中**;`<v488-x>` 的人名用反引号
+  `` `【…】` `` 定界并含 `sjis_ext.bin` 扩展字,补上“三种引号 + 隧道表”
+  后解出 20 个(详见 §6)。
+- 仍不覆盖:CSV/CSVINFO 外置文本表、UTF-8 工程、V2(200<v<300)脚本的
+  文本窗口实测、`sjis_ext.bin` 隧道码回解、非 `scenario` 命名的外置剧本目录。
+
 ## 成果 V555-FILEINFO-WEBP (2026-11-23) · FILEINFO[CGFILE] 去掉版本门控并补 `.webp` 扩展名
 
 - **问题**:`FILEINFO[CGFILE=基名 EXIST=1 LET=@x]` 对纯 `.webp` 资产
@@ -17092,6 +17214,169 @@ cargo build -p yu-cli --no-default-features --features desktop --all-targets
   - `cargo test -p yu-rt --lib`(153 passed)。
 - **文档**:`docs/divergences/DIV-RT-070-fileinfo-cgfile-webp.md`;
   `docs/formats/v555-semantic-census-2026-11-23.md` §2.3 标已修。
+
+### 6. 角色名注册:静态 + 隧道 + 运行时验证(2026-11-23)
+
+> 触发:主人指出“脚本肯定要读角色,应该会注册;能不能直接拿”。结论是
+> **可以**,而且有两条独立通道。
+
+**开源工具怎么处理**:
+
+- vnforge(`VNForge.Engines.YuRis/Text/`):把 `GOSUB ES.CHAR.NAME` 的每个
+  非空字面量参数当作一个 `Name` 文本单元;`ExpressionStrings` 接受
+  `"…"`、反引号 `` `…` ``、`'…'` 三种引号;`SpeakerMarkers` 用
+  `es.CHAR.NAME.MARK.SET` 注册的 `「『（` 拆“名字 + 台词”。
+- RxYuris / YU-RIS-Script-Editor / YURIS_TOOLS 未检索到角色名专用逻辑,
+  以 `WORD`/选项为主。
+- 事实记录见 `docs/references/open-source-tools.md` §2.6(未声明许可,
+  仅事实参考)。
+
+**`<v488-x>` 的注册表(实测)**:
+
+- 静态:`userdefine/キャラ名定義.txt`(s79)pc3–22 是
+  `GOSUB "es.CHAR.NAME"`,display/name 用**反引号**括起;字符落在
+  `sjis_ext.bin` 隧道里。补上三种引号 + 隧道表后解出 20 个名字
+  (`【夏海铃】`/`【秋岛日和】`/…),`U+FFFD=0`。
+- 运行时:boot 跑 600 帧后,`$1671` / `$1672` 是长度 21 的 STR 数组
+  (`[0]` 空,`[1..20]` = 20 个注册名);`@1670` = 20。
+  `--runtime-characters` 输出 `characters_runtime.csv`(slot/index/value/var)。
+
+**实现**:
+
+- `yu-engine::export`:三种引号定界符;CP932 路线自动加载
+  `sjis_ext.bin`(`patch::load_tunnel`)回解;`--runtime-characters`
+  (缺省 600 帧)boot 后按静态名匹配 STR 数组,写 `characters_runtime.csv`;
+  boot 失败只 warning,不影响静态导出。
+- `manifest.json` 增加 `text_tunnel` 与 `runtime_character_*` 计数。
+
+**验证原始结果**:
+
+```bash
+cargo run -p yu-cli --no-default-features --bin yu-cli --   export <v488-x> <tmp>/v488 --runtime-characters
+# export: scripts=151 text=6185 literals=27587(skipped 48519)
+#         characters=20(1 variants) codec=cp932(auto+tunnel)
+# characters_runtime.csv: slot=1671/1672, 40 行, 例 `1671,1,【夏海铃】,$1671`
+
+cargo run ... export <project-eris> <tmp>/eris --runtime-characters --runtime-ticks 300
+# characters_runtime.csv: `1650,1,優理,$1650`
+
+cargo run ... export <v555-2> <tmp>/v555 --runtime-characters --runtime-ticks 300
+# characters_runtime.csv: `1824,1,【Big Sister】,$1824`
+```
+
+### 7. `translate.json` 导出模式(2026-11-23)
+
+> 主人指定:CSV 不符合翻译规范;需要只含**角色 + 正文**的 `translate.json`,
+> 不要 `literals` 等其他字面量。
+
+**入口**:
+
+```bash
+yu-cli export <project> [out-dir] --format translate-json
+# 或库调用 ExportOptions { format: ExportFormat::TranslateJson, .. }
+```
+
+**输出**:只写 `translate.json`(UTF-8,无 BOM);不写 `text.csv` /
+`literals.csv` / `scenario.csv` / 人读副本。
+
+**结构**:
+
+```json
+{
+  "schema": "yuris-translate-1",
+  "meta": {
+    "project_root": "...", "data_root": "...",
+    "text_codec": "cp932", "text_codec_source": "auto", "text_tunnel": false,
+    "script_key": "D3 6F AC 96", "script_key_source": "rx-yuris:header",
+    "counts": { "characters": 4, "word_units": 464, "scenario_units": 0, "text": 464 }
+  },
+  "characters": [
+    { "key": "character:base:data\script\userdefine\jp_0002.txt:0",
+      "variant": "base", "table": "data\script\userdefine\jp_0002.txt",
+      "index": 0, "display": "優理", "name": "優理", "codec": "cp932",
+      "display_translation": "", "name_translation": "" }
+  ],
+  "text": [
+    { "key": "word:s123:pc0", "source": "word", "script_id": 123,
+      "script_path": "data\script\userscript\e-mote\jp_0057.txt",
+      "pc": 0, "unit": 0, "line": 1, "codec": "cp932",
+      "text": "※", "translation": "" },
+    { "key": "scenario:cn:sc_cn_scenario/saku_01_00.txt:56:0",
+      "source": "scenario", "variant": "cn", "file": "...", "line": 56, "seq": 0,
+      "kind": "macro", "macro": "LC", "scene": "saku_01_00", "label": "RP_ona001",
+      "codec": "gbk", "text": "…", "translation": "" }
+  ]
+}
+```
+
+**验证原始结果**:
+
+```bash
+cargo run ... export project-eris <tmp>/eris --format translate-json
+# export(translate-json): characters=4 text=464(word 464 + scenario 0) codec=cp932(auto)
+
+cargo run ... export <v555-2> <tmp>/v555 --format translate-json
+# export(translate-json): characters=55 text=18615(word 0 + scenario 18615) codec=cp932(auto)
+
+cargo run ... export <v488-x> <tmp>/v488 --format translate-json
+# export(translate-json): characters=20 text=6185(word 6185 + scenario 0) codec=cp932(auto+tunnel)
+```
+
+- 三类 key 均唯一(测试断言 `len(set(keys)) == len(keys)`)。
+- 角色 55 / 4 / 20 与 CSV 模式一致;正文 464 / 18,615 / 6,185。
+- `translation` / `display_translation` / `name_translation` 全为空串,供翻译回填。
+- 回归:`cargo test -p yu-engine --test export` 3 passed(新增 JSON 模式用例)。
+
+### 8. 翻译 skill(2026-11-23)
+
+> 目标:把“角色统一 + 剧情翻译 + 校验规则”固化成可随仓库分发的 AI skill,
+> 输入就是 `--format translate-json` 的产物。
+
+**位置**(项目内、可分发,未进 `.gitignore`):
+
+```text
+.agents/skills/yuris-translation/
+├── SKILL.md
+├── references/schema.md
+├── references/style-guide.md
+└── scripts/validate_translate.py
+```
+
+**规则要点**:
+
+- 先翻 `characters`,建立 `(variant, name) -> 译文名` 词汇表;正文所有
+  `【名字】` / `名字「…」` 必须用同一译名(校验脚本强制比对)。
+- 只填 `translation` / `display_translation` / `name_translation`;
+  `key`/`meta`/`codec`/坐标不可改。
+- 不合并/拆分正文条目;保留 `
+`/``/`%s`/`$VAR` 等控制符;
+  保留 `【】「」『』（）` 标记。
+- `cn` = 简体(通常 GBK),`tw` = 繁体(通常 Big5);`cp932` 条目翻中文需要
+  GBK/Big5 补丁或 CP932 载体字/隧道方案,不能静默产出不可编码文本。
+- 长度目标 ≤1.5×原文;>2× 校验 warning。
+
+**校验脚本实测**(`translate.json` 来自 ERIS demo):
+
+```bash
+python .agents/skills/yuris-translation/scripts/validate_translate.py   target/translate-eris/translate.json
+# summary: characters=4 text=464 errors=0 warnings=472   (空模板,只有 warning)
+
+# 填入 `優理 -> 优理` 并按 cp932 检查:
+# ERROR text word:s135:pc76: U+4F18 ('优') is not encodable in cp932
+# summary: errors=1
+
+--allow-unencodable  -> errors=0,warning 保留
+--codec gbk          -> errors=0
+# 故意把说话人写成 【優理】 而词汇表是 优理:
+# ERROR text word:s123:pc0: speaker '優理' != glossary '优理'
+```
+
+**分发**:
+
+- ZCode 会从项目 `.agents/skills/` 自动发现(已出现在可用 skill 列表);
+- 也可整目录复制到其它 AI 工具的 skills 目录,或复制到 `~/.agents/skills/`
+  全局使用;
+- 工作流文档:`docs/translation-workflow.md`;README 增加“翻译流程”小节。
 
 ## 成果 V555-MEM99999 (2026-11-23) · SAVE[MEM=99999] 的 0..499 内存槽打包
 
