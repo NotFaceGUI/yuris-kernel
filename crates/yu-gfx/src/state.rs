@@ -54,7 +54,7 @@ use crate::text::{
     TextDraw, TextDrawKey, TextFlagsSource, TextGlyph, TextGlyphStyle, TextLayoutFrame, TextRun,
     TextStyle, MAX_TEXT_DRAWS_PER_LAYER,
 };
-use crate::transition::TransitionDraw;
+use crate::transition::{MaskTransform, TransitionDraw};
 
 /// 已解析参数(名字/值都取自 `self.params`,先复制出来以释放不可变借用)。
 struct OwnedArg {
@@ -6838,6 +6838,8 @@ impl GfxState {
             from_layer: Some(id.clone()),
             // 组过渡的 `from` 是组离屏纹理,配对层即 TID 本身。
             to_layer: Some(tid.clone()),
+            // `to_base=None`:后端读配对层当前表面,变换已算在表面里。
+            mask_transform: MaskTransform::default(),
             layer: l,
         }))
     }
@@ -6969,19 +6971,30 @@ impl GfxState {
                 if let Some(to) = to {
                     let mut l = Arc::clone(layer);
                     Arc::make_mut(&mut l).set_texture_status(LayerStatus::Executable);
+                    // 官方 `YS_Texture2` 取配对层**基图**(`+0x21c`),
+                    // 不是 CGACT 加工表面(`+0x90`)。配对层是空壳、
+                    // 图案由 SIZE 从另一层做进表面时,基图 = 图案资产。
+                    let to_base = self.transition_mask_base(tid, cache);
+                    // 只有走基图时才需要补 mask 的显示变换;若后端回退到
+                    // 加工表面(`to_layer`),那步 REVERSE 已经算在表面里,
+                    // 再应用一次会把 mask 反回去(tests/transition_alpha
+                    // 的 RECTPAINT+REVERSE 空壳层就是这条路径)。
+                    let mask_transform = if to_base.is_some() {
+                        self.transition_mask_transform(tid)
+                    } else {
+                        MaskTransform::default()
+                    };
                     return Op::Transition(TransitionDraw {
                         from,
                         to: Some(to),
-                        // 官方 `YS_Texture2` 取配对层**基图**(`+0x21c`),
-                        // 不是 CGACT 加工表面(`+0x90`)。配对层是空壳、
-                        // 图案由 SIZE 从另一层做进表面时,基图 = 图案资产。
-                        to_base: self.transition_mask_base(tid, cache),
+                        to_base,
                         fade,
                         t: t.t,
                         ta: t.ta,
                         tid: t.tid.clone(),
                         from_layer: Some(layer.id.clone()),
                         to_layer: Some(tid.clone()),
+                        mask_transform,
                         layer: l,
                     });
                 }
@@ -7064,6 +7077,46 @@ impl GfxState {
                 _ => None,
             }
         })
+    }
+
+    /// 配对 mask 在采样前要补的显示变换(`REVERSE`/镜像)奇偶。
+    ///
+    /// v555 精灵转场(`es_sprite_cgload.yst` s148 pc160/165/166)先把
+    /// ysr mask 载入**不可见**的 `SPLTRBUF<n>`,对它做 `REVERSE=1`,再
+    /// `SIZE` 进配对层 `SPLTR<n>`。`SPLTRBUF<n>` 是 `E=0`,加工不进入
+    /// display list;而 psC 读到的 mask 已经是反色后的像素(engine frame
+    /// 762:`SPLTRBUF101=cg/tr/ysr031`,中心 R=0,官方中心透明)。
+    ///
+    /// 这里只归约能在采样时精确表达的算子;其它改像素的 op 不猜,
+    /// 保持基图交给后续专项处理。
+    fn transition_mask_transform(&self, tid: &LayerId) -> MaskTransform {
+        let mut transform = MaskTransform::default();
+        let apply = |layer: &LayerId, transform: &mut MaskTransform| {
+            for op in &self.image_log {
+                if op.target.as_ref() != Some(layer) || op.status != OpStatus::Executable {
+                    continue;
+                }
+                match op.action {
+                    ImageAction::Reverse => transform.reverse = !transform.reverse,
+                    ImageAction::Horizontal => transform.flip_h = !transform.flip_h,
+                    ImageAction::Vertical => transform.flip_v = !transform.flip_v,
+                    _ => {}
+                }
+            }
+        };
+        apply(tid, &mut transform);
+        // 配对层是空壳、mask 由 SIZE 从缓冲层做进表面时,变换来自源层。
+        if let Some(op) = self.image_log.iter().rev().find(|op| {
+            op.target.as_ref() == Some(tid)
+                && op.status == OpStatus::Executable
+                && matches!(
+                    op.action,
+                    ImageAction::SizeNearest | ImageAction::SizeBilinear
+                )
+        }) {
+            apply(&op.source, &mut transform);
+        }
+        transform
     }
 
     /// 当前域命令定位(仅诊断路径调用;构造 `DiagAt` 要两次分配)。

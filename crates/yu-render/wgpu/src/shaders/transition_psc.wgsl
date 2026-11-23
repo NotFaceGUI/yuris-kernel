@@ -56,12 +56,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let span = fade.src_max - fade.src_min;
     let safe = select(vec2<f32>(1e-6, 1e-6), span, abs(span) > vec2<f32>(1e-6, 1e-6));
     let unit = clamp((in.uv - fade.src_min) / safe, vec2<f32>(0.0), vec2<f32>(1.0));
-    let mask_uv = fade.mask_min + unit * (fade.mask_max - fade.mask_min);
+    var mask_uv = fade.mask_min + unit * (fade.mask_max - fade.mask_min);
+    // `fade.pad` = mask 显示变换位:bit0 REVERSE,bit1 HORIZONTAL,bit2 VERTICAL。
+    // 不可见 mask 缓冲层的 CGACT 不进入 display list,这里按采样坐标补。
+    let mask_flags = i32(fade.pad);
+    if (mask_flags & 2) != 0 {
+        mask_uv.x = fade.mask_min.x + fade.mask_max.x - mask_uv.x;
+    }
+    if (mask_flags & 4) != 0 {
+        mask_uv.y = fade.mask_min.y + fade.mask_max.y - mask_uv.y;
+    }
     let texel = textureSample(src_texture, src_sampler, in.uv);
     let mask = textureSample(mask_texture, mask_sampler, mask_uv);
     // 官方遮罩采样约定 `(texel + 1) / 256`(UNORM 值还原成 texel 后 +1),
     // 不是 /255;见 `j2-micro-trans8` 的 40 格 α 表(DIV-GFX-065 §6)。
-    let mask_value = (mask.r * 255.0 + 1.0) / 256.0;
+    let mask_texel = select(mask.r, 1.0 - mask.r, (mask_flags & 1) != 0);
+    let mask_value = (mask_texel * 255.0 + 1.0) / 256.0;
     let coverage = clamp((fade.fade - 0.5 * mask_value) * fade.fade2, 0.0, 1.0);
     let coverage8 = round(coverage * 255.0);
     let layer8 = round(fade.alpha * 255.0);

@@ -1756,6 +1756,7 @@ fn draw_transition(
             image: mask_ref,
             fade: transition.fade,
             fade2: f64::from(transition.ta),
+            transform: transition.mask_transform,
         }),
     );
     st.report.ops_drawn += 1;
@@ -2329,6 +2330,8 @@ struct TransitionMask<'a> {
     fade: f64,
     /// `YS_FadeVal2` = `TA`。
     fade2: f64,
+    /// mask 采样前的显示变换(REVERSE/镜像)。
+    transform: yu_gfx::MaskTransform,
 }
 
 /// 图层绘制尺寸:引擎 `FBX/FBY` 缩放 × 基础宽高。
@@ -2426,25 +2429,69 @@ fn draw_image(
             let layer_a = alpha;
             let alpha = match transition {
                 Some(mask) => {
-                    let mask_px = if integral
+                    // mask 的 `REVERSE`/镜像在取样处应用:不可见缓冲层的
+                    // CGACT 不进入 display list,但 psC 读到的是加工后的像素。
+                    let (mask_dxf, mask_dyf) =
+                        if mask.transform.flip_h || mask.transform.flip_v {
+                            if integral {
+                                (
+                                    if mask.transform.flip_h {
+                                        f64::from(dest_w_u) - 1.0 - dxf
+                                    } else {
+                                        dxf
+                                    },
+                                    if mask.transform.flip_v {
+                                        f64::from(dest_h_u) - 1.0 - dyf
+                                    } else {
+                                        dyf
+                                    },
+                                )
+                            } else {
+                                (
+                                    if mask.transform.flip_h {
+                                        dest_width - dxf
+                                    } else {
+                                        dxf
+                                    },
+                                    if mask.transform.flip_v {
+                                        dest_height - dyf
+                                    } else {
+                                        dyf
+                                    },
+                                )
+                            }
+                        } else {
+                            (dxf, dyf)
+                        };
+                    let mut mask_px = if integral
                         && dest_w_u == mask.image.width
                         && dest_h_u == mask.image.height
                     {
-                        let mx = (dxf.max(0.0) as u32).min(mask.image.width - 1);
-                        let my = (dyf.max(0.0) as u32).min(mask.image.height - 1);
+                        let mx = (mask_dxf.max(0.0) as u32).min(mask.image.width - 1);
+                        let my = (mask_dyf.max(0.0) as u32).min(mask.image.height - 1);
                         mask.image.pixel(mx, my)
                     } else if integral {
                         sample(
                             mask.image,
-                            dxf.max(0.0) as u32,
-                            dyf.max(0.0) as u32,
+                            mask_dxf.max(0.0) as u32,
+                            mask_dyf.max(0.0) as u32,
                             dest_w_u,
                             dest_h_u,
                             filter,
                         )
                     } else {
-                        sample_subpixel(mask.image, dxf, dyf, dest_width, dest_height, filter)
+                        sample_subpixel(
+                            mask.image,
+                            mask_dxf,
+                            mask_dyf,
+                            dest_width,
+                            dest_height,
+                            filter,
+                        )
                     };
+                    if mask.transform.reverse {
+                        mask_px[0] = 255 - mask_px[0];
+                    }
                     // 官方 effect Pass1(psC):
                     // `saturate((FadeVal - 0.5*tex2.r) * TA)`。
                     //

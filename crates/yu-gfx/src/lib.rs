@@ -78,4 +78,4 @@ pub use text::{
     GlyphAtlasRef, TextDraw, TextDrawKey, TextFlagsSource, TextFontRequest, TextGlyph,
     TextGlyphStyle, TextImage, TextLayoutFrame, TextRun, TextStroke, TextStyle,
 };
-pub use transition::TransitionDraw;
+pub use transition::{MaskTransform, TransitionDraw};

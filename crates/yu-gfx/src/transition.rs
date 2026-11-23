@@ -17,12 +17,35 @@
 //!   `mask` 按官方 micro 表校准为 `(texel+1)/256`。
 //! - `YS_Texture2` 取配对层**基图**(`+0x21c`),不是 `CGACT` 加工表面
 //!   (`+0x90`)。
+//!
+//! 例外(v555 精灵转场,2026-11-23):脚本先对**不可见** mask 缓冲层做
+//! `CGACT[REVERSE=1]`,再 `SIZE` 进配对层(`es_sprite_cgload.yst` s148
+//! pc165/170)。缓冲层 `E=0` 时该加工不进入 display list,但 psC 读到的
+//! 是反色后的 mask;这里把该链表达成 [`MaskTransform`],由后端在 mask
+//! 取样时应用(见 `engine frame 762` / `cg/tr/ysr031`)。
+
+
+// TODO: 这个肯定要重构：及时写表面和帧回放的机制 冲突 计划中
 
 pub use crate::layer::Transition;
 
 use std::sync::Arc;
 
 use crate::layer::{Layer, LayerId, TextureRef};
+
+/// 配对 mask 在采样前要应用的显示变换(按命令顺序归约后的奇偶)。
+///
+/// 只覆盖可以在采样时精确表达的算子:`REVERSE` 与水平/垂直镜像。
+/// 其它改像素的 `CGACT`(MEIDO/模糊等)不在此列,遇到时保持基图并挂账。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MaskTransform {
+    /// `REVERSE=1`:mask 的 R 按 `255-r` 取样。
+    pub reverse: bool,
+    /// `HORIZONTAL=1`:mask 水平镜像。
+    pub flip_h: bool,
+    /// `VERTICAL=1`:mask 垂直镜像。
+    pub flip_v: bool,
+}
 
 /// 一次双纹理过渡绘制。
 #[derive(Clone, Debug, PartialEq)]
@@ -58,6 +81,11 @@ pub struct TransitionDraw {
     pub from_layer: Option<LayerId>,
     /// `to`(mask)实际所属的图层,同上。
     pub to_layer: Option<LayerId>,
+    /// mask 在采样前的显示变换(REVERSE/镜像链的奇偶归约)。
+    ///
+    /// 由 gfx 从 `image_log` 沿 `tid` 与其 `SIZE` 源层收集;没有变换时
+    /// 为 `MaskTransform::default()`,行为与旧版一致。
+    pub mask_transform: MaskTransform,
 }
 
 impl TransitionDraw {

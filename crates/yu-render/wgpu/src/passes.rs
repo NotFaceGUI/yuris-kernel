@@ -439,11 +439,14 @@ impl Planner<'_> {
         // 普通层 SPL201 UV=1.000868/1.001389,过渡层 `from` 1152x720 原先
         // 被钳成 [0,0,1,1];钳制导致过渡期间整幅背景被拉伸 1px。
         let (draw_uv, mask_uv) = (from.3, mask.3);
+        let mask_flags = i32::from(transition.mask_transform.reverse)
+            | (i32::from(transition.mask_transform.flip_h) << 1)
+            | (i32::from(transition.mask_transform.flip_v) << 2);
         let uniform_values: Vec<f32> = vec![
             transition.fade as f32,
             f32::from(transition.ta),
             sa,
-            0.0,
+            mask_flags as f32,
             draw_uv[0],
             draw_uv[1],
             draw_uv[2],

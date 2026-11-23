@@ -370,3 +370,80 @@ fn tidno_appends_decimal_suffix_for_pairing() {
         .expect("TID 查询");
     assert_eq!(raw, yu_rt::value::Value::Str(b"B".to_vec()));
 }
+
+#[test]
+fn invisible_mask_buffer_reverse_is_carried_to_transition() {
+    // v555 精灵转场:mask 载入 E=0 的缓冲层 → REVERSE=1 → SIZE 进配对层。
+    // 缓冲层不可见,加工不进入 display list;转场走 to_base 时必须带上
+    // 反色,否则中心/边缘的覆盖率与官方相反。
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("TRBUF")),
+                arg(&table, "CG", "FILE", s("mask")),
+                arg(&table, "CG", "E", i(0)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("TRBUF")),
+                arg(&table, "CGACT", "REVERSE", i(1)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("TR")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(8)),
+                arg(&table, "CG", "SY", i(8)),
+            ],
+        ),
+        // SIZE 的 `ID` 是源、`ID2` 是目标(见 state.rs `apply_image` 注释)。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("TRBUF")),
+                arg(&table, "CGACT", "ID2", s("TR")),
+                arg(&table, "CGACT", "SIZE", i(1)),
+                arg(&table, "CGACT", "SX", i(8)),
+                arg(&table, "CGACT", "SY", i(8)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "FILE", s("a")),
+                arg(&table, "CG", "T", i(128)),
+                arg(&table, "CG", "TA", i(256)),
+                arg(&table, "CG", "TID", s("TR")),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let op = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|o| match o {
+            Op::Transition(t) => Some(t),
+            _ => None,
+        })
+        .expect("mask 链应产出过渡 op");
+    assert_eq!(op.to_base, Some(TextureRef::Asset(b"mask".to_vec())));
+    assert!(op.mask_transform.reverse, "REVERSE 应带到 mask 采样");
+    assert!(!op.mask_transform.flip_h);
+    assert!(!op.mask_transform.flip_v);
+}
