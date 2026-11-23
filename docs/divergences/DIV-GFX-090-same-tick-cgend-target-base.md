@@ -1,7 +1,7 @@
 # DIV-GFX-090 · 同 tick `CGEND` 删除目标层后,跨层图像加工仍须重放
 
 - 状态:**fixed**(2026-11-17)
-- 样本:`natsunokusari`(YU-RIS 0.481)CG 鉴赏
+- 样本:`<v481-natsu>`(YU-RIS 0.481)CG 鉴赏
 - 脚本:`data\script\eris\scene\extra\cgmode\es_cgmode.yst` s54 pc513..536
 - 关联:`DIV-GFX-053`(源层同帧删除)、`DIV-GFX-072`(冻结/烘焙/重放)、
   `DIV-GFX-077`(COPY 矩形)、`DIV-GFX-086`(MERGE 落点)

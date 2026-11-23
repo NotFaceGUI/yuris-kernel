@@ -52,7 +52,7 @@
 - `COLOR` 不走穿透(语料钉值:es_Button pc2020 期望 `0x00808080`);
 - 只对 ONMOUSE/ONMOUSE2/ONMOUSE3 生效,且仅在「隐形 + 全透明」时触发。
 
-全语料核验无回归:kotoneiro mask 全不透明、v555-2 号样本 mask 为 RGB
+全语料核验无回归:`<game-b>` mask 全不透明、v555-2 号样本 mask 为 RGB
 无 alpha(不透明),均不进入该路径。
 
 ## 残余

@@ -17392,6 +17392,9 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
     `DAT_0059b6f8`(存档容器 Snappy 层)是另一条路径。
   - 官方 exe 内除本函数外没有 `DAT_0086a03c` 的直接消费者;
     `LOAD[FILE DNO=1024]` 的 `FUN_004453f4` 读同型**文件**。
+    > **2026-11-23 勘误**:该同型文件就是玩家存档 DNO=1024 的
+    > 500 槽内存包;下一次 `SAVE[FILE]` 会写入,见文末
+    > `SAVE-MEM-PACK-DNO1024`。
   - 语料:每个 v555 作品各 1 组真实调用
     (`<v555-1>` s18 pc307、`<v555-pc>` s31 pc402、2.1MB 样本 s33 pc329)。
 - **修法**:`yu-save::SaveState::pack_mem` 生成官方格式并存入
@@ -17455,7 +17458,7 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
     → `FUN_004453f4`,读 12 字节头 + 500×(`raw_len|comp_len|zlib`),
     填 `DAT_008670c0[0..500]`,不写 `LET`;缺块报 `0x18ede` 后 `return 0`。
   - 语料实证:`<v555-1>` s70 pc410/pc502 `LET @147=3`;`es_saveload.yst`
-    (黒獣2改 s33)pc412 `LOAD FILE=$2216 DNO=1024 LET=@2218`。
+    (`<v555-kuro>` s33)pc412 `LOAD FILE=$2216 DNO=1024 LET=@2218`。
 - **修法**:
   - 按钮族 `LET` 写接 `InputState::set_counter`(`Counter::write` 钳制);
   - `other::State.drop_file_num` 镜像;`PRODUCT[COM=21/24]` 枚举同步;
@@ -17480,7 +17483,7 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   - `<v555-1>` 官方备份 `save50001.sd` 有 DNO=1024 嵌套容器块
     (`inner_len|compressed_len|zlib(inner YSSD)`);本内核写出的
     `save50001.sd` 没有该块;
-  - `黒獣2改` 的 `save70000.sd` 也没有 DNO=1024;官方 `LOAD` 缺块时
+  - `<v555-kuro>` 的 `save70000.sd` 也没有 DNO=1024;官方 `LOAD` 缺块时
     报 `0x18ede` 后继续,但依赖该块的数据无法恢复;
   - 本轮只实现官方 `FUN_004453f4` 的 500 槽打包读取,**SAVE 侧写
     DNO=1024 的调用点未定位,不猜格式**。`es_saveload pc851 @2223`
@@ -17592,3 +17595,101 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
     文本 hook 改不了;需 UI 素材替换或改按钮绘制。
   - `literals` 中内部 ID 的自动分类仍是基于 `context` 的人工规则,不是语义
     oracle;skill/validator 已约束,运行时只按显式译文替换。
+
+## 成果 SAVE-MEM-PACK-DNO1024 (2026-11-23) · DNO=1024 勘误为 SAVE[MEM=99999] 500 槽内存包并接通文件写侧
+
+- **勘误**:此前把玩家存档 DNO=1024 的重复 `raw_len|comp_len|zlib` 读成
+  “历史环/嵌套容器”。实际是 `SAVE[MEM=99999]` 的 500 槽内存包:
+  - 块体 = 12 字节块头 `0/1/0u16 + packed_total + unpacked_total`
+    + 500 条 `u32 raw_len | u32 comp_len | zlib(level1)`;
+  - 空槽写 `0/0` 但仍占 8 字节,全空包 = 4000 字节;
+  - 12 字节头就是外层 YSSD 块头,块载荷从槽 0 开始,没有第二份头。
+- **证据**:
+  - 官方 555 `0x44d7a8` 写包(调用点 `0x44ba9c`:MEM==99999 →
+    `0x44c296`)与 `0x445374` 读包(调用点 `0x444aa3`:DNO==0x400);
+  - `<v555-kuro>/save00001.sd` 块头 `clen=47044/ulen=522453`,9 个非空槽;
+  - `<v500-relirium>`/`<v555-pieces>` 全空包 `clen=ulen=4000` 全零;
+  - `<v481-natsu>` 官方 2021 存档 100 个非空槽(不是 100 段上限)。
+  - 对 `save00001`(9 槽)、`<v500-relirium>` 全空包、`<v481-natsu>`
+    100 槽包按 500 条槽表重打包,载荷与官方文件逐字节一致。
+  - Rust 读侧 `load_mem_pack` → `pack_mem` 重打包:`save00001`
+    (9 槽)与 `<v481-natsu>/save00151`(100 槽)的载荷均与官方
+    DNO=1024 **逐字节一致**(`official_player_save_pack_loads`,
+    `YURIS_OFFICIAL_SAVE=... cargo test -p yu-save -- --ignored`)。
+- **实现**:
+  - 删除 `SemanticProfile::SaveHistoryMode` 与 engine 侧历史开关;
+  - `SaveState::pack_mem` 生成完整块体并置 `mem_pack_pending`;
+  - 下一次 `SaveState::flush` 原样 `set_block(1024, body)`,写盘成功后
+    消费标记;系统存档不会误带;
+  - `SaveState::load_mem_pack` 修正为从载荷偏移 0 读 500 槽,并校验
+    块头 `0/1/0`、`clen/ulen`、空槽 `0/0`。
+- **验证**:
+  - `cargo test -p yu-save --lib` → 缺 `YURIS_SAMPLE_*` 时 35 passed / 2 条
+    显式缺环境报错;环境齐备(含 `YURIS_SAMPLE_ERIS_ROOT`)时
+    37 passed / 1 ignored
+    (`mem_99999_pack_is_written_to_next_file_save_only`、
+    `empty_mem_pack_is_4000_zero_bytes`、
+    `load_mem_pack_reads_official_500_slot_layout`);
+  - `cargo test -p yu-rt --lib` → 158 passed;
+  - `cargo test -p yu-rt --test fixture` → 155 passed / 7 ignored;
+  - `cargo test -p yu-engine --lib` → 81 passed;
+  - `cargo check --workspace --all-targets` → ok(2026-11-23 复跑;
+    改动 crate 无告警,余下为既有 example 告警)。
+- **文档**:DIV-RT-056 改为 fixed(no-manual)并勘误;DIV-RT-075 §5 更新;
+  census §4.7/§5、`v555-vs-495-command-diff`、`game-settings-ledger` 同步。
+- **残余**:
+  - 包槽 Snappy 分支(`DAT_00872164 != 0`)未实现;当前 555/481 样本
+    全部为 zlib level 1;
+  - “`MEM=99999` 后下一次 `SAVE[FILE]` 消费”采用待写标记建模,系统存档
+    实测均不带 DNO=1024。
+
+## 挂账 ENV-SAVE-LOW-IL (2026-11-23) · `<game-b>` 存档读写的 `os error 5` 是环境完整性标签
+
+- **现象**:`<game-b>` 运行时报
+  `sv.file.write @ sv@frame76 pc0: FILEACT[DELETE] 失败: … os error 5`;
+  存档时同样报 `SAVE[FILE=save00011.sd] 写入失败: 拒绝访问 (os error 5)`。
+- **判定:不是内核/写盘缺陷**:
+  - 同一 `yu-cli.exe`、同一帧,`--save-root` 指向副本目录 → DELETE/SAVE 全部成功;
+  - 目标文件无只读、无句柄占用;ACL 的 DELETE 权限检查通过;
+  - PowerShell(Medium)可直接删除同一文件,引擎进程被拒 → 进程完整性差异。
+- **根因**:`<games>` 根目录(及其下迁移过来的游戏树)带
+  `Low Mandatory Level` 标签(Codex Windows 沙箱对旧工作区树打的标记,
+  移动/复制时随安全描述符带入);Low 标签的 exe 启动后进程就是 Low,
+  只能写/删 Low 对象。`<game-b>` 的 `save/` 目录早于该标签(Medium/无标签),
+  因此只有它触发;其它游戏存档目录仍在标签树内(同为 Low),复测正常。
+- **处置(环境,不改代码)**:管理员 PowerShell
+  `icacls "<games>" /setintegritylevel "(OI)(CI)Medium" /T /C`;
+  只跑单个游戏可先改该游戏 exe 的标签。必须先改根目录,否则新拷入的
+  exe 仍会继承 Low(详见 `AGENTS.md` §2「完整性标签坑」)。
+
+## 成果 PERF-SAVE-LET (2026-11-23) · 存档旧块零拷贝 + `_INT`/`_PINT` 未取证边界收口
+
+- **性能**:
+  - `SaveState::flush → build_container` 的保留旧块改为**按值移动**,
+    去掉逐块 `body.clone()` 与 `mem_pack_block.clone()`;
+  - `_INT` 读/写与 `read_int` 不再 `dims.clone()`,只借维度判标量
+    (脚本循环里的 `_INT` 少一次分配)。
+- **按“无证据不猜”收口**:
+  - `_INT` 去掉未取证的 `槽号 >= 1000` 预检(官方 `0x1a6c6` 片段只证据
+    目标类型检查),只保留 u16 变量 id 宽度;未声明走既有 `VAR_UNDECLARED`;
+  - `_PINT` 缺参数号不再默认 1,显式 recoverable(DIV-RT-074 §2.4);
+  - 新增回归:
+    - `fixture::other::script_statics_declare_unreachable_int_at_load`
+      (复刻 `<v555-kuro>` 不可达 `INT @2223` 的装载期声明);
+    - `state::official_save_flush_preserves_all_blocks`(env-gated:
+      官方存档 flush 后旧块逐字节保留);
+    - `state::official_v555_thumbnail_recompresses_byte_exact`(env-gated:
+      v555 DNO=3 zlib level9 压缩流逐字节一致)。
+- **验证**(本机需 `CL/CFLAGS/CXXFLAGS=-utf-8`,见 `AGENTS.md` §2):
+  - `cargo check --workspace --all-targets` → ok;
+  - `cargo test -p yu-save --lib` → 37 passed / 3 ignored;设
+    `YURIS_OFFICIAL_SAVE=<v555-kuro>/save00001.sd` 后 3 条 ignored
+    **全部通过**(flush 保留旧块 / DNO=3 level9 逐字节 / 500 槽重打包);
+  - `official_save_flush_preserves_all_blocks` 另在 0.495 SDK
+    `save00001.sd` 与 `<v481-natsu>` `save00151.sd` 两份官方存档上通过
+    (0x1E0 / 0x1E1 的旧块保留语义一致);
+  - `cargo test -p yu-rt --lib` → 158 passed;
+  - `cargo test -p yu-rt --test fixture` → 156 passed / 7 ignored。
+- **残余**:`mem_pack_pending` 的消费时机仍是建模(DIV-RT-075 §5);
+  `apply_script_statics` 已有不可达声明的定向回归,但未跑全 22 样本
+  诊断对拍。

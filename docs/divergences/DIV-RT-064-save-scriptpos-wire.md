@@ -34,7 +34,7 @@
 
 存档样本逐字节验证:
 
-- 官方 0.479(黒獣2 `save00001.sd` DNO=11,98B):「u16 + 尾部 u8」精确消耗,
+- 官方 0.479(`<v479-kuro>` `save00001.sd` DNO=11,98B):「u16 + 尾部 u8」精确消耗,
   `line=12 pc=67 name_len=40 name=kuro2\script\userscript\new\00_op001.txt`;
   再编码与原字节**全等**。
 - 官方 0.479(`save00002.sd`,131B):GOSUB 栈 2 帧,同上全等。
