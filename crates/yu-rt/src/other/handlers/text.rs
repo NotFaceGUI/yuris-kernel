@@ -78,11 +78,12 @@ impl Vm {
                 }
             }
         }
-        if clear {
-            self.clear_text();
-        }
         let Some(bytes) = file else {
             // 只有 CLEAR 的合法形态;没有 FILE 就没有 LET 要做的事。
+            // 官方在 FILE 分支之外仍会执行 CLEAR(`0x452a0c:134`)。
+            if clear {
+                self.clear_text();
+            }
             self.emit(VmEvent::SystemCall {
                 frame: self.frame(),
                 name: "TEXT".to_string(),
@@ -90,7 +91,13 @@ impl Vm {
             });
             return Ok(StepOutcome::Continue);
         };
+        // 缺 LET 的形态未逐字节取证(语料 TEXT 30 组全部带 LET)。保持旧
+        // 行为(先清后报、不打开文件),避免把成功路径的 CLEAR 时机修正
+        // 扩散到这个 Unknown 形态。
         let Some(lv) = target else {
+            if clear {
+                self.clear_text();
+            }
             self.report(diag::recoverable(
                 code::rt::CMD_SLOT,
                 Boundary::Script,
@@ -104,6 +111,7 @@ impl Vm {
         let mut path = bytes;
         normalize_text_file_path(&mut path, self.script_text_codec(st.script_id));
         let Some(data) = self.open_asset(&path) else {
+            // 官方 `0x452a0c:61-64`:打开失败直接 return -1,**不执行 CLEAR**。
             self.report(diag::recoverable(
                 code::rt::TEXT_FILE,
                 Boundary::Script,
@@ -114,6 +122,11 @@ impl Vm {
             ));
             return Ok(StepOutcome::Yield);
         };
+        // 官方 `0x452a0c:134-139`:文件成功装载/切行后才判 CLEAR 并调用
+        // `FUN_00469f9c`。
+        if clear {
+            self.clear_text();
+        }
         let var = self.canonical_var(lv.var);
         let Some((ty, dims)) = self.var_shape(var) else {
             self.report(diag::recoverable(

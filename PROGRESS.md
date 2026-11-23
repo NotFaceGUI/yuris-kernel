@@ -17405,3 +17405,37 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   - `cargo test -p yu-save` 32 passed(含样本环境);
   - `cargo test -p yu-rt --test fixture` 146 passed / 7 ignored。
 - **文档**:`docs/divergences/DIV-RT-071-save-mem-pack.md`。
+
+## 成果 V555-TEXT-OUTPUT (2026-11-23) · `_`/`WORD` 输出折空格与上限、`TEXT[CLEAR]` 时机
+
+- **取证**:
+  - `_`:0.495 `0x4567c0` / v555 `0x455cd8`;非前导 `<0x20`/`>0x7E`
+    → 写 `0x20`(`0x4568c9..0x4568ea` / `0x455dd9..0x455dfc`);
+    前导字节连尾字节原样。
+  - `_` 上限:`pos+len >= 0x1FFE` → `0x18e70` 返回 -1
+    (`0x456882` / `0x455d9a`);源串 `len > 0x400` → `0x18e8e`
+    (`0x45688e` / `0x455da6`)。
+  - `WORD` 上限:`pos+len > 0x1FFE` → `0x18e70`
+    (v555 `0x45854d..0x458557`)。
+  - `TEXT[CLEAR]`:v555 `0x452a0c` 打开失败 `:61-64` 直接 return -1;
+    成功后才 `:134-139` 置 `state+0x15` + `FUN_00469f9c`。
+- **修法**:
+  - `TextState::fold_text_out_bytes` + `op_text_out` 折叠/上限,
+    `op_word` 缓冲上限;超限报 `rt.text.out.limit` 并让出。
+  - v555 `TEXT[FILE]`:打开失败不清;成功打开后执行 CLEAR;
+    无 FILE 的 CLEAR 形态仍清。
+  - `FONT` 复核:gfx 已实现 NAME/NO/BNO(8 样式槽 + `yu-font`
+    请求),本轮不改 VM 数值镜像;先前 P1 判断已勘误到 census §4.3。
+- **回归**:
+  - `text_out_fold_keeps_lead_pairs_and_spaces_controls`;
+  - `text_out_folds_control_bytes_and_preserves_lead_pairs`;
+  - `text_out_rejects_source_over_0x400_and_buffer_over_0x1ffd`;
+  - `word_rejects_buffer_over_0x1ffe`;
+  - `text_555_missing_file_does_not_clear_text_buffer`;
+  - `text_555_file_fills_let_string_array`(成功装载后 `CLEAR=1` 清 `_TEXT`);
+  - `cargo test -p yu-rt --lib` 154 passed;
+  - `cargo test -p yu-rt --test fixture` 150 passed / 7 ignored;
+  - `cargo test -p yu-rt --test corpus` 11 passed;
+  - `corpus_golden` 4 passed。
+- **文档**:`docs/divergences/DIV-RT-072-text-output-fold-limit.md`、
+  `DIV-RT-073-text-file-clear-order.md`;census §2.2/§4.2/§4.3 已更新。

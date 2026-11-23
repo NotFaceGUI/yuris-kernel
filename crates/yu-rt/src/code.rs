@@ -102,6 +102,9 @@ pub mod rt {
     pub const TEXT_FILE: &str = "rt.text.file";
     /// v555 `TEXT[FILE]` 成功装载(verbose;行数/目标变量,用于排查剧本链)。
     pub const TEXT_FILE_LINES: &str = "rt.text.file.lines";
+    /// `_`/`WORD` 文本输出超过官方 `_TEXT` 缓冲上限或 `_` 源串上限
+    /// (官方 `FUN_0046c0a0(0x18e70/0x18e8e,1)` 后返回 -1)。
+    pub const TEXT_OUT_LIMIT: &str = "rt.text.out.limit";
     /// `PRODUCT` 每次调用的参数快照(verbose 跟踪,不是未取证语义)。
     pub const PRODUCT_TRACE: &str = "rt.product.trace";
     /// GOSUB 整数参数按槽号传递的跟踪(verbose,不是未取证语义)。
@@ -153,6 +156,7 @@ pub const ALL_CODES: &[&str] = &[
     rt::TEXT_LAYER,
     rt::TEXT_FILE,
     rt::TEXT_FILE_LINES,
+    rt::TEXT_OUT_LIMIT,
     rt::PRODUCT_TRACE,
     rt::PARAM_SLOT_TRACE,
     rt::MEM_TRACE,

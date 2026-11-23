@@ -5,6 +5,93 @@
 use super::common::*;
 
 #[test]
+fn text_out_folds_control_bytes_and_preserves_lead_pairs() {
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        // `_` 的式值:0x41、控制 0x01、DEL 0x7F、CP932 0x82B1。
+        GroupSpec::new(OP_TEXT_OUT).window(0, ex::sb(b"A\x01\x7F\x82\xB1")),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.text_state().bytes,
+        vec![0x41, 0x20, 0x20, 0x82, 0xB1],
+        "非前导 <0x20/>0x7E 折空格;CP932 前导+尾原样"
+    );
+}
+
+#[test]
+fn text_out_rejects_source_over_0x400_and_buffer_over_0x1ffd() {
+    // 源串 1025 字节 > 0x400:官方 0x18e8e,返回 -1,不写入。
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_TEXT_OUT).window(0, ex::sb(&vec![b'a'; 0x401])),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let _report = vm.tick_at(0, &no_input());
+    let diags = vm.take_diags();
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code.as_ref() == "rt.text.out.limit"),
+        "{diags:?}"
+    );
+    assert!(vm.text_state().bytes.is_empty(), "超限不得追加");
+
+    // 缓冲刚好到 0x1FFE(WORD 允许),再 `_` 1 字节即 >=0x1FFE → 让出。
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_WORD).window(0, vec![b'a'; 0x1FFE]),
+        GroupSpec::new(OP_TEXT_OUT).window(0, ex::sb(b"b")),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let _report = vm.tick_at(0, &no_input());
+    let diags = vm.take_diags();
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code.as_ref() == "rt.text.out.limit"),
+        "{diags:?}"
+    );
+    assert_eq!(
+        vm.text_state().bytes.len(),
+        0x1FFE,
+        "WORD 恰写到 0x1FFE;`_` 超限不得追加"
+    );
+}
+
+#[test]
+fn word_rejects_buffer_over_0x1ffe() {
+    let mut b = ProjectBuilder::new();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_WORD).window(0, vec![b'a'; 0x1FFF]),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let _report = vm.tick_at(0, &no_input());
+    let diags = vm.take_diags();
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code.as_ref() == "rt.text.out.limit"),
+        "{diags:?}"
+    );
+    assert!(vm.text_state().bytes.is_empty(), "超限不得追加");
+}
+
+#[test]
 fn word_text_out_and_returncode_form_the_text_stream() {
     // 对齐 ERIS userscript 实测编译形态:
     //   WORD("こん") _(式) WORD("にちは") RETURNCODE(kind=7)

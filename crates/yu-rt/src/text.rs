@@ -384,6 +384,36 @@ impl TextState {
         self.append_text_with_codec(self.codec, bytes);
     }
 
+    /// `_` 文本输出的逐字节折叠(官方 0.495 `0x4568c9..0x4568ea` /
+    /// v555 `0x455dd9..`):
+    /// - 前导字节:文本原样保留双字节(尾字节不折);
+    /// - 非前导 `< 0x20` 或 `> 0x7E`:写 `0x20`(空格);
+    /// - 其余原样。
+    ///
+    /// 折叠后再交给 [`Self::append_text_with_codec`] 按字符写
+    /// `'1'/'2'` 标志,得到官方 `_TEXT`/`_TEXT_FLAG` 的同一内容。
+    #[must_use]
+    pub fn fold_text_out_bytes(codec: yu_format::Codec, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if codec.is_lead(b) {
+                out.push(b);
+                if let Some(&trail) = bytes.get(i + 1) {
+                    out.push(trail);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            } else {
+                out.push(if !(0x20..=0x7E).contains(&b) { 0x20 } else { b });
+                i += 1;
+            }
+        }
+        out
+    }
+
     /// 按指定显示 codec 追加(全局 codec 由 VM 在启动时确定)。
     pub fn append_text_with_codec(&mut self, codec: yu_format::Codec, bytes: &[u8]) {
         if bytes.is_empty() {
@@ -1112,5 +1142,23 @@ mod tests {
         t.push_flag(b'X');
         assert_eq!(t.advance_reveal(0, false, false), Some(b'X'));
         assert_eq!(t.reveal_flags, 0);
+    }
+
+    /// `_` 折叠:非前导控制字节 → 空格;前导字节连尾字节原样保留。
+    /// 证据:0.495 `0x4568c9..0x4568ea`、v555 `0x455dd9..0x455dfc`。
+    #[test]
+    fn text_out_fold_keeps_lead_pairs_and_spaces_controls() {
+        use yu_format::Codec;
+        let bytes = [0x41u8, 0x01, 0x7F, 0x82, 0xB1, 0x20, 0x7E];
+        assert_eq!(
+            TextState::fold_text_out_bytes(Codec::Cp932, &bytes),
+            vec![0x41, 0x20, 0x20, 0x82, 0xB1, 0x20, 0x7E],
+            "0x01/0x7F 折空格;CP932 0x82B1 原样;0x20/0x7E 保留"
+        );
+        // Big5 前导 0xA1 的尾字节 0x41 不能被误当 ASCII 大写折叠。
+        assert_eq!(
+            TextState::fold_text_out_bytes(Codec::Big5, &[0xA1, 0x41]),
+            vec![0xA1, 0x41]
+        );
     }
 }

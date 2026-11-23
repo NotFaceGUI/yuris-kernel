@@ -351,6 +351,7 @@ fn other_gosub_legacy_array_args_pass_slot_id_not_element() {
 
 /// v555 `TEXT[FILE, LET, CLEAR]`:读整份场景文本,按 CRLF/CR/LF 切行,
 /// 每行末尾加 `0x0D` 写入字符串数组;末尾两个空元素(REA <v555-4> `0x452a0c`)。
+/// 成功打开后 `CLEAR=1` 清 `_TEXT`(官方 `:134-139`)。
 #[test]
 fn text_555_file_fills_let_string_array() {
     let mut b = ProjectBuilder::new();
@@ -375,9 +376,11 @@ fn text_555_file_fills_let_string_array() {
         init: Init::Str(b""),
     }];
     b.scripts = vec![vec![
+        GroupSpec::new(OP_WORD).window(0, b"OLD".to_vec()),
         GroupSpec::new(op_text)
             .window(0, ex::sb(b"scn/a.txt"))
-            .window(1, ex::r#ref(0x24, sys)),
+            .window(1, ex::r#ref(0x24, sys))
+            .window(2, ex::i32_(1)),
         GroupSpec::new(OP_END),
     ]];
     b.labels = vec![("SYSTEM_START", 0, 0, 0)];
@@ -391,6 +394,10 @@ fn text_555_file_fills_let_string_array() {
     vm.install_other_runtime();
     let report = vm.tick_at(0, &no_input());
     assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(
+        vm.text_state().bytes.is_empty(),
+        "文件成功装载后 CLEAR=1 必须清掉先前 WORD 写入的 _TEXT"
+    );
     let arr = VarRef::new(VarSpace::Dollar, sys);
     let want: &[&[u8]] = &[b"#a\r", b"#b\r", b"\r", b"", b""];
     for (i, line) in want.iter().enumerate() {
@@ -460,6 +467,55 @@ fn text_555_missing_file_yields_then_advances_to_next_command() {
             .unwrap(),
         Value::Int(7),
         "TEXT 失败后必须推进到下一条 LET"
+    );
+}
+
+/// v555 `TEXT[CLEAR]` 只在文件成功装载后执行;打不开时官方
+/// `0x452a0c:61-64` 直接返回 -1,**不清** `_TEXT`。
+#[test]
+fn text_555_missing_file_does_not_clear_text_buffer() {
+    let mut b = ProjectBuilder::new();
+    b.ysc_version = 555;
+    let text = &mut b
+        .commands
+        .iter_mut()
+        .find(|(n, _)| *n == "TEXT")
+        .expect("fixture TEXT")
+        .1;
+    *text = vec![("FILE", 1, 0), ("LET", 0, 0), ("CLEAR", 0, 3)];
+    let op_text = b.commands.iter().position(|(n, _)| *n == "TEXT").unwrap() as u8;
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 3,
+        dims: vec![8],
+        init: Init::Str(b""),
+    }];
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_WORD).window(0, b"OLD".to_vec()),
+        GroupSpec::new(op_text)
+            .window(0, ex::sb(b"scn/missing.txt"))
+            .window(1, ex::r#ref(0x24, sys))
+            .window(2, ex::i32_(1)),
+        GroupSpec::new(OP_END),
+    ]];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let mut vm = boot(b);
+    vm.install_other_runtime();
+    let _report = vm.tick_at(0, &no_input());
+    let diags = vm.take_diags();
+    assert!(
+        diags.iter().any(|d| d.code.as_ref() == "rt.text.file"),
+        "打开失败必须有 TEXT_FILE 诊断: {diags:?}"
+    );
+    assert_eq!(
+        vm.text_state().bytes,
+        b"OLD",
+        "官方打开失败直接返回 -1,CLEAR 不得先清掉已有文本"
     );
 }
 

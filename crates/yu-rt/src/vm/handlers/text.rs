@@ -261,6 +261,10 @@ impl Vm {
     /// 照常求值即可。撤销 DIV-RT-008 挂账(三层已齐)。
     ///
     /// 台账:`COV-M-03`(每字符写 `'1'/'2'` 到 `_TEXT_FLAG`,REA `0x4567c0`)。
+    ///
+    /// **折叠/上限**(0.495 `0x456882/0x45688e`、v555 `0x455d9a/0x455da6`):
+    /// 非前导 `<0x20`/`>0x7E` 写空格;`pos + len >= 0x1FFE` 报
+    /// `0x18e70` 并返回 -1;源串 `len > 0x400` 报 `0x18e8e` 并返回 -1。
     pub(super) fn op_text_out(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
         for w in &cmd.windows {
             if w.rec.length == 0 {
@@ -268,11 +272,37 @@ impl Vm {
             }
             // `_` 的表达式值已是 `Str` 时直接搬字节(#81)。
             let bytes = into_str_bytes(self.eval_window(st, w)?)?;
-            self.append_text_for_script(st.script_id, &bytes);
+            // 官方先判 `_TEXT` 缓冲上限,再判源串长度(v555 `0x455d9a`
+            // → `0x455da6`);两者同时越界时先报 0x18e70。
+            if self.text.bytes.len() + bytes.len() >= 0x1FFE {
+                self.report(diag::recoverable(
+                    code::rt::TEXT_OUT_LIMIT,
+                    Boundary::Script,
+                    format!(
+                        "`_` 写入后 _TEXT 达 {} 字节 >= 0x1FFE(官方 0x18e70,返回 -1 让出)",
+                        self.text.bytes.len() + bytes.len()
+                    ),
+                ));
+                return Ok(StepOutcome::Yield);
+            }
+            if bytes.len() > 0x400 {
+                self.report(diag::recoverable(
+                    code::rt::TEXT_OUT_LIMIT,
+                    Boundary::Script,
+                    format!(
+                        "`_` 源串 {} 字节 > 0x400(官方 0x18e8e,返回 -1 让出)",
+                        bytes.len()
+                    ),
+                ));
+                return Ok(StepOutcome::Yield);
+            }
+            let codec = self.display.codec();
+            let folded = crate::text::TextState::fold_text_out_bytes(codec, &bytes);
+            self.append_text_for_script(st.script_id, &folded);
             self.emit(VmEvent::Text {
                 frame: self.frame(),
                 id: self.text.layer_id.clone(),
-                bytes,
+                bytes: folded,
             });
         }
         Ok(StepOutcome::Continue)
@@ -288,13 +318,26 @@ impl Vm {
     /// (全部 YU-RIS 5.x 商业作品实测通过)。
     ///
     /// 台账:`COV-M-03`(每字符写 `'1'/'2'` 到 `_TEXT_FLAG`,REA `0x458d44`)。
+    ///
+    /// **缓冲上限**(v555 `0x45854d..0x458557`;0.495 `0x458d44` 处理体同型):
+    /// `pos + len > 0x1FFE` 报 `0x18e70` 并返回 -1;允许刚好写到 0x1FFE。
     pub(super) fn op_word(&mut self, st: &mut ExecState, cmd: &Cmd) -> Result<StepOutcome, VmError> {
-        let _ = st;
         let Some(w) = cmd.windows.first() else {
             return Err(
                 diag::fatal(code::rt::CMD_WINDOWS, Boundary::Script, "WORD 缺文本窗口").into(),
             );
         };
+        if self.text.bytes.len() + w.payload.len() > 0x1FFE {
+            self.report(diag::recoverable(
+                code::rt::TEXT_OUT_LIMIT,
+                Boundary::Script,
+                format!(
+                    "WORD 写入后 _TEXT 达 {} 字节 > 0x1FFE(官方 0x18e70,返回 -1 让出)",
+                    self.text.bytes.len() + w.payload.len()
+                ),
+            ));
+            return Ok(StepOutcome::Yield);
+        }
         self.append_text_for_script(st.script_id, &w.payload);
         self.emit(VmEvent::Text {
             frame: self.frame(),
