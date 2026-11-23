@@ -4,8 +4,9 @@ package org.yuris.kernel;
  * 内核 so 的 JNI 绑定。
  *
  * <p>方法名与 {@code crates/yu-platform/host-android/src/lib.rs} 的导出符号
- * 一一对应（Java 方法名 = 符号名后缀）。所有方法必须在<b>同一线程</b>调用：
- * 内核侧会话状态放在 thread-local，`Engine` 内部是单线程的
+ * 一一对应（Java 方法名 = 符号名后缀）。除 {@link #nativeExportText} 是纯文件
+ * IO、可在任意后台线程调用外，其余方法必须在<b>同一线程</b>调用：内核侧
+ * 会话状态放在 thread-local，{@code Engine} 内部是单线程的
  * {@code Rc/RefCell}。
  */
 public final class NativeHost {
@@ -77,6 +78,24 @@ public final class NativeHost {
      * 壳**不得**再自己判断目录里有什么 —— 手抄规则必然与引擎漂移。
      */
     public static native String nativeProbeGameRoot(String path);
+    /**
+     * 导出文本/角色表(跨平台 {@code yu-engine::export};不启动引擎、不依赖渲染线程)。
+     *
+     * <p>纯文件 IO,可在任意后台线程调用;大工程会阻塞数秒,不要放在 UI 线程。
+     * 与 {@link #nativeInitJson(String)} 的会话无关,不需要先初始化。
+     *
+     * @param dataRoot  游戏数据目录(含 data.ypf / data/ / pac/*.ypf)
+     * @param outDir    输出目录(不存在时创建;建议 app 私有目录或外置存储)
+     * @param format    {@code translate-json}(只出 translate.json:角色 + 正文)
+     *                  或 {@code csv}(完整诊断表)
+     * @param textCodec {@code auto} / {@code cp932} / {@code gbk} / {@code big5};空 = auto
+     * @param scriptKey 显式 YSTB 密钥(8 位十六进制);空 = 自动探测
+     * @return {@code OK: <summary>} 或 {@code ERR: ...}
+     */
+    public static native String nativeExportText(
+            String dataRoot, String outDir, String format, String textCodec, String scriptKey);
+
+
 
     /**
      * 绑定 {@link android.view.Surface} 做<b>零拷贝上屏</b>:内核把渲染结果

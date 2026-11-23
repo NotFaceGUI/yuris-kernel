@@ -32,6 +32,7 @@ L3 宿主                 yu-cli(--mode desktop / headless) · host-android
 | 退出信号 | `Engine::lifecycle()` → 关窗 | 同一判据:`nativeTick()==1` ⇒ `finish()` | 同一判据(待接) |
 | 挂起/恢复 | `suspend`/`resume`(窗口最小化) | `onPause`/`onResume` → `nativeSuspend/Resume` | 页面隐藏(待接) |
 | 文本编码 | `--patch`(auto/original/gbk/**big5**/tunnel) | 配置界面选 + `run-config.json` 同键 | 同一份 `PatchKind` |
+| 文本/角色表导出 | `yu-cli export`(或 `yu_engine::export` 库调用) | `NativeHost.nativeExportText(dataRoot, outDir, format, codec, key)`(后台线程) | 同一模块(纯 std,无平台 API) |
 | `@_TIME` | 启动时注入系统本地时间 | 同(`host_clock::local_now`) | 恒确定性时钟(无本地时区 API) |
 
 ## 音频交付:为什么安卓要单独一层

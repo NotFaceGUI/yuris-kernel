@@ -56,7 +56,7 @@ pub mod present;
 pub mod sound;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use yu_backend_wgpu::GpuBackend;
@@ -2030,6 +2030,45 @@ pub fn probe_game_root(path: &str) -> String {
     }
 }
 
+/// 纯 Rust 的文本/角色表导出入口(JNI 与宿主测试共用;不启动引擎)。
+pub fn export_text_to_paths(
+    data_root: &str,
+    out_dir: &str,
+    format: &str,
+    text_codec: &str,
+    script_key: &str,
+) -> Result<String, String> {
+    use yu_engine::export::{self, ExportFormat, ExportOptions, TextCodecChoice};
+
+    let format = ExportFormat::parse(format)?;
+    let text_codec = if text_codec.trim().is_empty() {
+        TextCodecChoice::Auto
+    } else {
+        TextCodecChoice::parse(text_codec)?
+    };
+    let script_key = if script_key.trim().is_empty() {
+        None
+    } else {
+        Some(yu_engine::keys::ScriptKey::parse_hex(script_key)?)
+    };
+    let project = Project::discover(Path::new(data_root), None).map_err(|e| e.message)?;
+    let options = ExportOptions {
+        text_codec,
+        script_key,
+        include_literals: format == ExportFormat::Csv,
+        format,
+        runtime_characters: false,
+        runtime_ticks: 600,
+    };
+    let report =
+        export::export_project(&project, Path::new(out_dir), &options).map_err(|e| e.message)?;
+    Ok(if format == ExportFormat::TranslateJson {
+        export::summary_translate(&report)
+    } else {
+        export::summary(&report)
+    })
+}
+
 // ---------------------------------------------------------------- JNI exports
 //
 // 类名固定 `org.yuris.kernel.NativeHost`;返回 `OK` / `ERR: ...` 表示成败
@@ -2050,6 +2089,17 @@ mod jni_entry {
                 .new_string("")
                 .expect("allocating an empty Java string must succeed"),
         }
+    }
+
+    /// 读取一个 Java 字符串参数;失败返回中文错误(调用方转 `ERR: ...`)。
+    fn jstring_arg(
+        env: &mut JNIEnv<'_>,
+        value: &JString<'_>,
+        name: &str,
+    ) -> Result<String, String> {
+        env.get_string(value)
+            .map(Into::into)
+            .map_err(|error| format!("{name} 无法读取: {error}"))
     }
 
     #[no_mangle]
@@ -2352,6 +2402,61 @@ mod jni_entry {
         to_jstring(&mut env, probe_game_root(&text))
     }
 
+    /// 导出文本/角色表(跨平台 `yu-engine::export`;不启动引擎、不碰渲染线程)。
+    ///
+    /// - `format`:`translate-json`(只出 `translate.json`:角色 + 正文)或 `csv`;
+    /// - `text_codec`:`auto`/`cp932`/`gbk`/`big5`(空 = `auto`);
+    /// - `script_key`:显式 8 位十六进制密钥(空 = 自动探测)。
+    ///
+    /// 返回 `OK: <summary>` / `ERR: ...`。纯文件 IO,可在任意后台线程调用;
+    /// 大工程会阻塞数秒,壳侧不要放在 UI 线程。
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeExportText<'local>(
+        mut env: JNIEnv<'local>,
+        _class: JClass<'local>,
+        data_root: JString<'local>,
+        out_dir: JString<'local>,
+        format: JString<'local>,
+        text_codec: JString<'local>,
+        script_key: JString<'local>,
+    ) -> JString<'local> {
+        let data_root = match jstring_arg(&mut env, &data_root, "dataRoot") {
+            Ok(value) => value,
+            Err(message) => {
+                set_error(message.clone());
+                return to_jstring(&mut env, format!("ERR: {message}"));
+            }
+        };
+        let out_dir = match jstring_arg(&mut env, &out_dir, "outDir") {
+            Ok(value) => value,
+            Err(message) => {
+                set_error(message.clone());
+                return to_jstring(&mut env, format!("ERR: {message}"));
+            }
+        };
+        let format_text = jstring_arg(&mut env, &format, "format").unwrap_or_default();
+        let text_codec_text =
+            jstring_arg(&mut env, &text_codec, "textCodec").unwrap_or_default();
+        let script_key_text =
+            jstring_arg(&mut env, &script_key, "scriptKey").unwrap_or_default();
+        match export_text_to_paths(
+            &data_root,
+            &out_dir,
+            &format_text,
+            &text_codec_text,
+            &script_key_text,
+        ) {
+            Ok(summary) => {
+                clear_error();
+                to_jstring(&mut env, format!("OK: {summary}"))
+            }
+            Err(message) => {
+                set_error(message.clone());
+                to_jstring(&mut env, format!("ERR: {message}"))
+            }
+        }
+    }
+
     #[no_mangle]
     pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeStatus<'local>(
         mut env: JNIEnv<'local>,
@@ -2507,6 +2612,19 @@ mod jni_entry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_text_validates_arguments_before_io() {
+        let error = export_text_to_paths("nope", "out", "xml", "", "").unwrap_err();
+        assert!(error.contains("format"), "应报 format,实际: {error}");
+
+        let error = export_text_to_paths("nope", "out", "translate-json", "utf8", "").unwrap_err();
+        assert!(error.contains("text-codec"), "应报 text-codec,实际: {error}");
+
+        let error =
+            export_text_to_paths("nope", "out", "translate-json", "auto", "zz").unwrap_err();
+        assert!(error.contains("script_key"), "应报 script_key,实际: {error}");
+    }
 
     #[test]
     fn run_config_defaults_match_cli() {
