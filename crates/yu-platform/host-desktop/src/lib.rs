@@ -1014,6 +1014,13 @@ struct App {
     stepper: stepper::Stepper,
     /// `--step-to`:还要推进到的逻辑帧(`None` = 没有待办)。
     step_to: Option<u64>,
+    /// 诊断:`YU_DUMP_LAYERS_AT=<frame>` 到该逻辑帧时导出一次 SPL 层 PNG。
+    dump_layers_at: Option<u64>,
+    /// 诊断:`YU_DUMP_LAYERS_EVERY=<frames>` 实时运行时按帧周期导出 SPL 层
+    /// + `display.json`(不暂停、不干预交互)。
+    dump_layers_every: Option<u64>,
+    /// 上一次周期导出的逻辑帧(去重)。
+    last_dump_frame: u64,
     /// 上一帧立绘层的表面尺寸(`YURIS_SPL_PROBE` 判异基线)。
     spl_last_sizes: Vec<(String, u32, u32)>,
     /// 每层的退化累计次数(每 60 帧最多报一次,保留频率信息)。
@@ -1156,6 +1163,13 @@ impl App {
             frame_stamps: std::collections::VecDeque::with_capacity(240),
             stepper: step,
             step_to,
+            dump_layers_at: std::env::var("YU_DUMP_LAYERS_AT")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            dump_layers_every: std::env::var("YU_DUMP_LAYERS_EVERY")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            last_dump_frame: u64::MAX,
             spl_last_sizes: Vec::new(),
             spl_shrunk_seen: std::collections::HashMap::new(),
         })
@@ -1173,6 +1187,38 @@ impl App {
     /// 放在帧边界而不是 UI 闭包里:一次可能写几十帧 PNG/JSONL,不该卡在
     /// egui 的绘制路径中间。失败显式报错(不静默吞)。
     fn pump_capture(&mut self) {
+        // 诊断:到达指定逻辑帧时自动导出一次当前帧 SPL 层。
+        if let Some(target) = self.dump_layers_at {
+            if self.engine.frame() >= target {
+                self.stepper.request_dump_layers();
+                self.dump_layers_at = None;
+            }
+        }
+        // 诊断:实时交互时按帧周期静默导出 SPL 层 + display.json(不暂停)。
+        if let Some(every) = self.dump_layers_every {
+            let frame = self.engine.frame();
+            if every > 0 && frame >= 200 && frame % every == 0 && frame != self.last_dump_frame
+            {
+                let dir = self.stepper.dir().join(format!("f{frame:06}"));
+                // 周期导出取全部已物化层(SPL 显示层 + CGCASH 源层 + SPLBUF
+                // 缓冲层),黑屏定位需要看到「谁有像素、谁只是占位 1×1」。
+                match self.engine.dump_layers(&dir, "") {
+                    Ok(0) => {}
+                    Ok(count) => host_line!(
+                        "yu-desktop: 周期图层导出 f={frame} {count} 个 → {}",
+                        dir.display()
+                    ),
+                    Err(error) => host_error!("yu-desktop: 周期图层导出失败: {error}"),
+                }
+                if let Some(text) = self.engine.display_json() {
+                    let _ = std::fs::create_dir_all(&dir);
+                    if let Err(error) = std::fs::write(dir.join("display.json"), text) {
+                        host_error!("yu-desktop: 写 display.json 失败: {error}");
+                    }
+                }
+                self.last_dump_frame = frame;
+            }
+        }
         // 「导出图层」:把当前帧的立绘分层写成 PNG,便于肉眼定位脏块。
         if self.stepper.take_dump_layers_request() {
             let dir = self.stepper.dir().to_path_buf();

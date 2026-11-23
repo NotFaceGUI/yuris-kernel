@@ -2343,6 +2343,17 @@ impl GfxState {
             }),
             "SX" | "SY" => {
                 let value = self.query_layer_size(layer, flag == "SX")?;
+                if let Some(since) = trace_start_frame("YU_CGINFO_TRACE") {
+                    if self.frame >= since {
+                        eprintln!(
+                            "[cginfo] f={} id={} flag={} -> {}",
+                            self.frame,
+                            parsed.path.display(),
+                            flag,
+                            value
+                        );
+                    }
+                }
                 Value::Int(value)
             }
             // `TEX` = **图层种类码**(REA CGINFO `0x43d962`:
@@ -3717,28 +3728,30 @@ impl GfxState {
         };
         let mut file_diags = Vec::new();
         let mut file = take_file(&params, &mut file_diags);
-        // 临时取证(v555 正文逐字消失):`YU_CG_TRACE=1` 逐次打印每条 CG
-        // (不去重、含 FILE=""),f>=900。取证完删除。
-        if self.frame >= 900 && std::env::var_os("YU_CG_TRACE").is_some() {
-            let key = match &file {
-                Some(TextureRef::Asset(k)) => String::from_utf8_lossy(k).into_owned(),
-                Some(TextureRef::SolidBlack1x1) => "<solid1x1>".into(),
-                None => "<none>".into(),
-                _ => "<other>".into(),
-            };
-            eprintln!(
-                "[cg] f={} id=`{}` file=`{}` at={} params={:?}",
-                self.frame,
-                String::from_utf8_lossy(&id),
-                key,
-                self.cur_call
-                    .map(|(s, p)| format!("s{s}@{p}"))
-                    .unwrap_or_else(|| "?-@?".into()),
-                params
-                    .iter()
-                    .map(|(n, v, _)| format!("{n}={v:?}"))
-                    .collect::<Vec<_>>()
-            );
+        // 临时取证:`YU_CG_TRACE=<起始帧>`(值为 0/1 = 全量)逐次打印每条
+        // CG(不去重、含 FILE="")。取证完删除。
+        if let Some(since) = trace_start_frame("YU_CG_TRACE") {
+            if self.frame >= since {
+                let key = match &file {
+                    Some(TextureRef::Asset(k)) => String::from_utf8_lossy(k).into_owned(),
+                    Some(TextureRef::SolidBlack1x1) => "<solid1x1>".into(),
+                    None => "<none>".into(),
+                    _ => "<other>".into(),
+                };
+                eprintln!(
+                    "[cg] f={} id=`{}` file=`{}` at={} params={:?}",
+                    self.frame,
+                    String::from_utf8_lossy(&id),
+                    key,
+                    self.cur_call
+                        .map(|(s, p)| format!("s{s}@{p}"))
+                        .unwrap_or_else(|| "?-@?".into()),
+                    params
+                        .iter()
+                        .map(|(n, v, _)| format!("{n}={v:?}"))
+                        .collect::<Vec<_>>()
+                );
+            }
         }
         // 取证:`YU_CG_FILE_TRACE=1` 记录每条 `CG[FILE]` 的 ID/键
         // (诊断按 detail 去重;只留唯一 ID/key 组合)。
@@ -4287,19 +4300,21 @@ impl GfxState {
             return;
         };
         let dest = paths[1].clone().unwrap_or_else(|| source.clone());
-        // 取证:`CGACT` 的参数名/值。只打 f>=900(正文/演出阶段),不设条数上限;
-        // 启动期 f1..8 的 COPY2/RECTPAINT 由帧号过滤。
-        if std::env::var_os("YU_CGACT_TRACE").is_some() && self.frame >= 900 {
-            eprintln!(
-                "[cgact-args] f={} id={} id2={} params={:?}",
-                self.frame,
-                source.display(),
-                dest.display(),
-                params
-                    .iter()
-                    .map(|(n, v, _)| format!("{n}={v:?}"))
-                    .collect::<Vec<_>>()
-            );
+        // 取证:`CGACT` 的参数名/值。`YU_CGACT_TRACE=<起始帧>`(0/1 = 全量),
+        // 不设条数上限;启动期 f1..8 的 COPY2/RECTPAINT 由帧号过滤。
+        if let Some(since) = trace_start_frame("YU_CGACT_TRACE") {
+            if self.frame >= since {
+                eprintln!(
+                    "[cgact-args] f={} id={} id2={} params={:?}",
+                    self.frame,
+                    source.display(),
+                    dest.display(),
+                    params
+                        .iter()
+                        .map(|(n, v, _)| format!("{n}={v:?}"))
+                        .collect::<Vec<_>>()
+                );
+            }
         }
         // `ID/ID2/ID3/ID4` 在引擎里是**四个并列的图层引用**:命令处理器对
         // 每个存在的 ID 做「拷 ID 到缓冲 + 若有同名 `IDNO` 则 `__itoa`
@@ -7508,6 +7523,38 @@ impl GfxState {
 }
 
 // ---------------------------------------------------------------- 参数应用
+
+/// 诊断环境变量的起始帧:`None` = 未启用;值解析失败或 0/1 = 从 1 开始。
+///
+/// `YU_CG_TRACE` / `YU_CGACT_TRACE` / `YU_CGINFO_TRACE` 用:交互取证时
+/// 可直接给 `1` 抓全量,给 `600` 只抓正文阶段,避免启动期刷屏。
+///
+/// 结果**缓存一次**:`CGINFO[SX/SY]` 是单帧上万次的热路径,不能每次都
+/// 查环境。
+fn trace_start_frame(var: &str) -> Option<u64> {
+    use std::sync::OnceLock;
+    static CG: OnceLock<Option<u64>> = OnceLock::new();
+    static CGACT: OnceLock<Option<u64>> = OnceLock::new();
+    static CGINFO: OnceLock<Option<u64>> = OnceLock::new();
+    let cell = match var {
+        "YU_CG_TRACE" => &CG,
+        "YU_CGACT_TRACE" => &CGACT,
+        "YU_CGINFO_TRACE" => &CGINFO,
+        _ => return parse_trace_start(var),
+    };
+    *cell.get_or_init(|| parse_trace_start(var))
+}
+
+fn parse_trace_start(var: &str) -> Option<u64> {
+    std::env::var(var).ok().map(|v| {
+        let n: u64 = v.parse().unwrap_or(0);
+        if n <= 1 {
+            1
+        } else {
+            n
+        }
+    })
+}
 
 fn viewport_to_size(v: Viewport) -> SizeU32 {
     SizeU32 {

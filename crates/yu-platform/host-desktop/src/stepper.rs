@@ -259,7 +259,8 @@ impl Stepper {
             ring_frames: DEFAULT_RING_FRAMES,
             ring_bytes: 0,
             save_png: true,
-            include_display: false,
+            // 诊断:`YU_STEP_INCLUDE_DISPLAY=1` 时每帧 JSONL 附带合成帧 JSON。
+            include_display: std::env::var_os("YU_STEP_INCLUDE_DISPLAY").is_some(),
             halted_last: false,
             resumed: false,
             capture_requested: false,
@@ -483,6 +484,11 @@ impl Stepper {
     /// 取走「导出当前帧图层」的一次性请求。
     pub fn take_dump_layers_request(&mut self) -> bool {
         std::mem::take(&mut self.dump_layers)
+    }
+
+    /// 请求导出当前帧 SPL 层(诊断环境变量 `YU_DUMP_LAYERS_AT` 用)。
+    pub fn request_dump_layers(&mut self) {
+        self.dump_layers = true;
     }
 
     /// 上一帧是否录制了环形缓冲(退出前决定要不要补写)。
