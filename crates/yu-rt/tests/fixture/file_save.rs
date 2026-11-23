@@ -744,6 +744,8 @@ struct SaveRecorder {
     image_loads: Vec<(String, u32)>,
     /// v555 `SAVE[MEM]` 的槽号与 `LOAD[MEM]` 的 (槽号, DNO)。
     mem_saves: Vec<u32>,
+    /// `SAVE[MEM=99999]` 的打包次数。
+    mem_packs: u32,
     mem_loads: Vec<(u32, u32)>,
     mem_image_loads: Vec<(u32, u32)>,
     /// `Vm::emit` 同步喂入的 Save/File 事件与 flush 的**先后顺序**
@@ -762,6 +764,7 @@ impl SaveRecorder {
             images: Vec::new(),
             image_loads: Vec::new(),
             mem_saves: Vec::new(),
+            mem_packs: 0,
             mem_loads: Vec::new(),
             mem_image_loads: Vec::new(),
             order: Vec::new(),
@@ -821,6 +824,10 @@ impl SaveHost for SharedHost {
     }
     fn save_mem(&mut self, slot: u32) -> Result<(), Diag> {
         self.inner.borrow_mut().mem_saves.push(slot);
+        Ok(())
+    }
+    fn pack_mem(&mut self) -> Result<(), Diag> {
+        self.inner.borrow_mut().mem_packs += 1;
         Ok(())
     }
     fn load_block_mem(&mut self, slot: u32, dno: u32) -> Result<LoadedBlock, Diag> {
@@ -1557,6 +1564,63 @@ fn fileinfo_fs_fallback_checks_save_root() {
     );
 }
 
+
+/// `SAVE[MEM=99999]`:官方独立分支(`0x44b874` → `FUN_0044d82c`)把
+/// 0..499 号内存槽打包到 `DAT_0086a03c`;不是普通槽 99999,也不刷文件。
+#[test]
+fn save_mem_99999_packs_memory_slots_instead_of_slot_99999() {
+    let mut b = ProjectBuilder::new();
+    let params = &mut b
+        .commands
+        .iter_mut()
+        .find(|(n, _)| *n == "SAVE")
+        .expect("fixture command")
+        .1;
+    params.insert(1, ("MEM", 3, 0));
+    let op_save = b.commands.iter().position(|(n, _)| *n == "SAVE").unwrap() as u8;
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(42),
+    }];
+    b.scripts = vec![vec![
+        // SAVE[MEM=99999 DNO=5 SET=@x] → pack_mem();官方在此分支
+        // 立即 return 0,不处理 DNO/SET,不得产生预约。
+        GroupSpec::new(op_save)
+            .window(1, ex::i32_(99_999))
+            .window(2, ex::i8_(5))
+            .window(3, ex::r#ref(0x40, sys)),
+        // 普通内存槽仍走 save_mem
+        GroupSpec::new(op_save).window(1, ex::i32_(7)),
+        GroupSpec::new(OP_END),
+    ]];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+
+    let recorder = SaveRecorder::new();
+    let reply = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let mut vm = boot(b);
+    vm.set_save_host(Box::new(SharedHost {
+        inner: recorder.clone(),
+        reply,
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let rec = recorder.borrow();
+    assert_eq!(rec.mem_packs, 1, "MEM=99999 必须走宿主 pack_mem");
+    assert_eq!(rec.mem_saves, vec![7], "99999 不得落成普通内存槽");
+    assert!(
+        rec.reserves.is_empty(),
+        "MEM=99999 在官方处理体里先 return,不得把同条 DNO/SET 预约"
+    );
+    assert!(rec.flushes.is_empty(), "MEM 分支不得退化成文件刷盘");
+}
 
 /// v555 `SAVE[MEM]` / `LOAD[MEM]`:MEM 是内存槽号,优先于 FILE,走宿主的
 /// 内存槽契约而不是文件刷盘/读盘(REA <v555-4> `0x44b874`/`0x4447c8`)。

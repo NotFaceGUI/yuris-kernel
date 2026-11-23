@@ -17092,3 +17092,31 @@ cargo build -p yu-cli --no-default-features --features desktop --all-targets
   - `cargo test -p yu-rt --lib`(153 passed)。
 - **文档**:`docs/divergences/DIV-RT-070-fileinfo-cgfile-webp.md`;
   `docs/formats/v555-semantic-census-2026-11-23.md` §2.3 标已修。
+
+## 成果 V555-MEM99999 (2026-11-23) · SAVE[MEM=99999] 的 0..499 内存槽打包
+
+- **取证**:
+  - v555 `SAVE 0x44b874`(b02a):MEM 参数值 99999 → `FUN_0044d82c()`;
+    `return 0`,不再走 FILE/普通内存槽。
+  - `FUN_0044d82c 0x44d82c`:12 字节头
+    `0,1,0u16,packed_total,unpacked_total` + 500 条
+    `raw_len|comp_len|zlib(level1)`;空槽 0/0 不写数据。
+  - `DAT_00872164` 选压缩层(0=zlib,非 0=YSSnp);该全局在 555 构建里
+    位于 BSS(初值 0),全量反编译只有读点、没有写点 ⇒ 按 zlib。
+    `DAT_0059b6f8`(存档容器 Snappy 层)是另一条路径。
+  - 官方 exe 内除本函数外没有 `DAT_0086a03c` 的直接消费者;
+    `LOAD[FILE DNO=1024]` 的 `FUN_004453f4` 读同型**文件**。
+  - 语料:每个 v555 作品各 1 组真实调用
+    (`<v555-1>` s18 pc307、`<v555-pc>` s31 pc402、2.1MB 样本 s33 pc329)。
+- **修法**:`yu-save::SaveState::pack_mem` 生成官方格式并存入
+  `packed_mem`;`SaveHost::pack_mem` 契约;VM 的 `SAVE[MEM=99999]`
+  调宿主,不再落 Unimplemented,也不把 99999 当普通槽。
+  `LOAD[MEM=99999]` 官方无分支,保持未支持。
+- **回归**:
+  - `mem_99999_pack_matches_official_layout`(头/总长/500 条/空槽/
+    zlib 解包逐槽对拍);
+  - `save_mem_99999_packs_memory_slots_instead_of_slot_99999`
+    (pack 一次、普通槽仍走 save_mem、不刷文件);
+  - `cargo test -p yu-save` 32 passed(含样本环境);
+  - `cargo test -p yu-rt --test fixture` 146 passed / 7 ignored。
+- **文档**:`docs/divergences/DIV-RT-071-save-mem-pack.md`。

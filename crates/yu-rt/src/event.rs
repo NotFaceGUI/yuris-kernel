@@ -756,6 +756,18 @@ pub trait SaveHost {
         ))
     }
 
+    /// `SAVE[MEM=99999]`:把 0..499 号内存槽打包成官方 `DAT_0086a03c`
+    /// 形态(555 `0x44b874` 的独立分支 → `FUN_0044d82c`)。
+    ///
+    /// 脚本可见语义只有「成功返回」;打包字节由宿主保留(官方 exe 内
+    /// 没有直接消费者,`LOAD[FILE DNO=1024]` 读的是同型文件)。
+    fn pack_mem(&mut self) -> Result<(), Diag> {
+        Err(crate::diag::cmd_unimplemented(
+            "SAVE",
+            "宿主未实现 SAVE[MEM=99999] 内存槽打包",
+        ))
+    }
+
     /// `LOAD[MEM=n DNO=k]`:从内存槽读一块(v555 `0x4447c8` MEM 分支)。
     fn load_block_mem(&mut self, slot: u32, dno: u32) -> Result<LoadedBlock, Diag> {
         let _ = (slot, dno);

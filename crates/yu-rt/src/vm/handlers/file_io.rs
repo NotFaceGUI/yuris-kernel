@@ -827,6 +827,22 @@ impl Vm {
             }
         }
         self.emit_domain(Domain::Save, "SAVE", args);
+        // v555 `MEM=99999` 是**参数装载后的独立分支**(REA `0x44b874:142`):
+        // 官方立即 `FUN_0044d82c(); return 0`,不处理 DNO/SET/ID/G_*,
+        // 也不刷文件。必须放在预约块之前,避免把同条命令的 SET 误预约。
+        if mem == Some(99_999) {
+            // 0..499 内存槽打包到 `DAT_0086a03c`(12 字节头 + 每槽
+            // 原始长/压缩长/压缩数据)。官方 exe 内没有该缓冲的直接消费者;
+            // 脚本可见语义只是「成功返回」。字节由宿主保存,便于取证/导出。
+            let failure = match self.save_host.as_mut() {
+                Some(host) => host.pack_mem().err(),
+                None => None,
+            };
+            if let Some(d) = failure {
+                return Err(VmError::from(self.locate(d)));
+            }
+            return Ok(StepOutcome::Continue);
+        }
         // 预约(DNO 在场;官方 DNO 与 FILE 可同条,先预约后刷盘)。
         if let Some(dno) = dno {
             // 555 内存槽 DNO 0 基;文件存档按 0.495 手册 1..=1024。
@@ -949,23 +965,12 @@ impl Vm {
                 return Ok(StepOutcome::Continue);
             }
             let slot = slot as u32;
-            if slot == 99_999 {
-                // 独立分支 `FUN_0044d82c`:把 0..499 号槽打包到
-                // `DAT_0086a03c`(0,1,0,u32 0,u32 总长 + 每槽 原始长/
-                // 压缩长/压缩数据)。消费方尚未取证 ⇒ 显式挂账,不猜。
-                self.report_unimplemented_variant(
-                    "SAVE",
-                    "MEM=99999",
-                    "SAVE[MEM=99999] 特殊分支(FUN_0044d82c:0..499 槽打包)未实现",
-                );
-            } else {
-                let failure = match self.save_host.as_mut() {
-                    Some(host) => host.save_mem(slot).err(),
-                    None => None,
-                };
-                if let Some(d) = failure {
-                    return Err(VmError::from(self.locate(d)));
-                }
+            let failure = match self.save_host.as_mut() {
+                Some(host) => host.save_mem(slot).err(),
+                None => None,
+            };
+            if let Some(d) = failure {
+                return Err(VmError::from(self.locate(d)));
             }
             return Ok(StepOutcome::Continue);
         }
@@ -1134,11 +1139,15 @@ impl Vm {
                 None => None,
             };
             if mem_slot == Some(99_999) {
-                self.report_unimplemented_variant(
-                    "LOAD",
-                    "MEM=99999",
-                    "LOAD[MEM=99999] 特殊分支(FUN_0044d82c:0..499 槽打包)未实现",
-                );
+                // 官方 LOAD 处理体没有 99999 特殊分支(只有 SAVE 的
+                // `0x44b874` → `FUN_0044d82c` 打包);99999 不是合法内存槽。
+                // 不猜官方 OOB 行为:显式拒绝,不读写任何状态。
+                self.report(diag::recoverable(
+                    code::rt::CMD_SLOT,
+                    Boundary::Script,
+                    "LOAD[MEM=99999]:官方 LOAD 无 99999 分支(SAVE 才有 0..499 \
+                     打包);拒绝执行,不猜",
+                ));
                 return Ok(StepOutcome::Continue);
             }
             let loaded = match self.save_host.as_mut() {
@@ -1218,11 +1227,13 @@ impl Vm {
             None => None,
         };
         if mem_slot == Some(99_999) {
-            self.report_unimplemented_variant(
-                "LOAD",
-                "MEM=99999",
-                "LOAD[MEM=99999] 特殊分支(FUN_0044d82c:0..499 槽打包)未实现",
-            );
+            // 同图像分支:官方 LOAD 无 99999 分支,拒绝而不猜 OOB。
+            self.report(diag::recoverable(
+                code::rt::CMD_SLOT,
+                Boundary::Script,
+                "LOAD[MEM=99999]:官方 LOAD 无 99999 分支(SAVE 才有 0..499 \
+                 打包);拒绝执行,不猜",
+            ));
             return Ok(StepOutcome::Continue);
         }
         let (dno, target) = (dno as u32, target);

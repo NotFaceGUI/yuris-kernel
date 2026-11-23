@@ -99,6 +99,10 @@ impl yu_rt::event::SaveHost for SaveHost {
         self.lock().save_mem(slot)
     }
 
+    fn pack_mem(&mut self) -> Result<(), Diag> {
+        self.lock().pack_mem()
+    }
+
     fn load_block_mem(&mut self, slot: u32, dno: u32) -> Result<LoadedBlock, Diag> {
         self.lock().load_block_mem(slot, dno)
     }

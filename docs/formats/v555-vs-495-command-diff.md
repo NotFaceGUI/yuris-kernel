@@ -154,7 +154,7 @@ argc 与槽位序列均以 E1/E2 为准;E4 §6.3 独立复核一致。
 | `VARINFO[SJISCODE/STRFIRST/NO2]` | `crates/yu-rt/src/semantics.rs` + `vm/handlers/variables.rs` | 已实现;按语义形态门控 |
 | `CGINFO[LINT2]` | `crates/yu-gfx/src/state.rs` | LINT2 回读已实现;`SEARCH/NUM/NAME/LSET/NO` 未实现(truth 记 31,405 条 unsupported 待分类) |
 | `FILEINFO[CGFILE]` | 共享 `vm/handlers/file_io.rs:371` | 已实现探测;已删除 `yscm.version == 555` 门控,扩展名链末尾通用追加 `.webp`(DIV-RT-070) |
-| `SAVE/LOAD[MEM]` | 共享 `vm/handlers/file_io.rs:719/984` + `yu-save` | 已实现内存槽;`MEM=99999` 仍 `Unimplemented`(过渡态) |
+| `SAVE/LOAD[MEM]` | 共享 `vm/handlers/file_io.rs:719/984` + `yu-save` | 已实现内存槽;`MEM=99999` 的 0..499 打包已实现(DIV-RT-071);打包缓冲官方无直接消费者,宿主保留字节 |
 | `PRODUCT` | `crates/yu-rt/src/other/handlers/product.rs` | 已实现部分 COM;`COM=21000/10201/10205` 仍 `Unimplemented` |
 | `MOVIE2/MOVIE2END/MOVIE2INFO` | — | 未路由/未实现;静态语料 0 次使用(E4 普查) |
 | `ALIAS` | 555 共享空操作槽 | 已按 555 默认槽清单处理 |
@@ -186,7 +186,7 @@ argc 与槽位序列均以 E1/E2 为准;E4 §6.3 独立复核一致。
 - [ ] `VARINFO`:555 `0x455200` 的 `0x4554a9`(SJISCODE 首字符)、`0x455b9c`(`SHL 8 + trail`)、`STRFIRST`;0.495 `0x456050..0x456ae4` 对 `SJISCODE` 零引用。
 - [x] `FILEINFO[CGFILE]`:反汇编 0.495 `0x44286c`,确认它**读** `CGFILE` 槽(kind 2 → `ebx=3` → `0x442c7f` 扩展名探测);v555 同槽走 `FUN_0043f770`,扩展名表含 `.webp`。2026-11-23 闭合,见 `v555-semantic-census-2026-11-23.md` §2.3。
 - [ ] `CGINFO[LINT2]`:555 `CG` `0x423870` 写 `+0x58/+0x60`;`CGINFO 0x43b090` 回读;确认 0.495 的 `FX/FY` 删除与类型码 3→1。
-- [ ] `SAVE/LOAD[MEM]`:555 `0x44b6f0/0x444654`;确认 `DAT_008670c0[n]`/`DAT_008678a0[n]` 与 `MEM=99999` 的 `FUN_0044d82c`。
+- [x] `SAVE/LOAD[MEM]`:555 `0x44b6f0/0x444654`;确认 `DAT_008670c0[n]`/`DAT_008678a0[n]` 与 `MEM=99999` 的 `FUN_0044d82c`。`MEM=99999` 已按 `0x44b874` → `FUN_0044d82c` 实现(DIV-RT-071);`LOAD` 无 99999 分支。
 - [ ] `CG` 槽 7/8/9/10:确认处理器按参数名取值,不存在槽号常量。
 - [ ] `ERROR` `COM_*`:确认所有 COM 常量由 ysc 参数名/表值解析,不存在硬编码数值。
 - [ ] `MOVIE2*`:E3 地址 `0x44a6d8/0x44ad64/0x44ad88`;当前 0 静态使用,未实现可接受,但需记录为 `Unimplemented` 而非静默 no-op。

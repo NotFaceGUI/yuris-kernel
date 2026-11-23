@@ -110,6 +110,14 @@ pub struct SaveState {
     /// `MEM=99999` 是独立分支(`FUN_0044d82c`:把 0..499 号槽打包到
     /// `DAT_0086a03c`),不是普通槽;本状态机不把它塞进本表。
     mem_slots: BTreeMap<u32, Vec<u8>>,
+    /// `SAVE[MEM=99999]` 的打包结果(官方 `DAT_0086a03c`)。
+    ///
+    /// 格式(REA `0x44d82c`):12 字节头 + 500 条
+    /// `u32 原始长 | u32 压缩长 | 压缩数据`;头 = `0,1,0u16,
+    /// u32 打包总长,u32 解包总长`。官方 exe 内除本函数外没有直接消费者
+    /// (仅 `LOAD[FILE DNO=1024]` 的 `FUN_004453f4` 读同型文件);这里保留
+    /// 可取证/可宿主导出的字节,不冒充脚本可见状态。
+    packed_mem: Option<Vec<u8>>,
     /// 诊断(容量上限 [`MAX_DIAGS`],超限丢最旧并记账)。
     diags: std::collections::VecDeque<Diag>,
     diags_dropped: u64,
@@ -144,6 +152,7 @@ impl SaveState {
             block_codec: None,
             reservations: BTreeMap::new(),
             mem_slots: BTreeMap::new(),
+            packed_mem: None,
             diags: std::collections::VecDeque::new(),
             diags_dropped: 0,
             save_calls: 0,
@@ -532,6 +541,79 @@ impl SaveState {
             self.push_diag(diag);
         }
         Ok(())
+    }
+
+    /// `SAVE[MEM=99999]`:把 0..499 号内存槽打包成官方 `DAT_0086a03c` 形态。
+    ///
+    /// 证据(REA 555 `0x44d82c`):
+    /// - 12 字节头:`0` / `1` / `u16 0` / `u32 packed_total` /
+    ///   `u32 unpacked_total`;
+    /// - 每槽 `u32 raw_len | u32 comp_len | comp`;空槽 raw/comp 均为 0、
+    ///   不写数据;
+    /// - `packed_total = Σ(8 + comp_len)`,`unpacked_total = Σ(8 + raw_len)`
+    ///   (均不含 12 字节头);
+    /// - 压缩分支由 `DAT_00872164` 选:0 → `compress2(level=1)`(zlib),
+    ///   非 0 → `YSSnp_Compress`。该全局在 555 构建里位于 BSS(初始 0),
+    ///   全量反编译只有读点、没有写点 ⇒ 当前按 zlib level 1 落包;
+    ///   不跟随存档容器的 Snappy 层(`DAT_0059b6f8` 是另一路)。
+    ///
+    /// 官方 exe 内除 `FUN_0044d82c` 自身外没有该缓冲的直接消费者
+    /// (`LOAD[FILE DNO=1024]` 的 `FUN_004453f4` 读的是同型**文件**);
+    /// 这里保留可取证、可宿主导出的字节,不冒充脚本可见状态。
+    pub fn pack_mem(&mut self) -> Result<(), Diag> {
+        let mut body = Vec::new();
+        let mut packed_total: u32 = 0;
+        let mut unpacked_total: u32 = 0;
+        for slot in 0..500u32 {
+            let raw = self.mem_slots.get(&slot).map(Vec::as_slice).unwrap_or(&[]);
+            let raw_len = u32::try_from(raw.len()).map_err(|_| {
+                error::fatal(
+                    code::INTERNAL,
+                    format!("SAVE[MEM=99999]: 槽 {slot} 长度 {} 超过 u32", raw.len()),
+                )
+            })?;
+            // 空槽官方写 0/0(不调用压缩器):`sStack_1c` 在 0 长时为 0,
+            // 且只有 raw_len > 0 才写压缩数据。
+            let compressed = if raw.is_empty() {
+                Vec::new()
+            } else {
+                yu_format::yssd::zlib_compress_level1(raw)
+            };
+            let comp_len = u32::try_from(compressed.len()).map_err(|_| {
+                error::fatal(
+                    code::INTERNAL,
+                    format!("SAVE[MEM=99999]: 槽 {slot} 压缩长超过 u32"),
+                )
+            })?;
+            let add = |total: u32, n: u32| {
+                total.checked_add(8 + n).ok_or_else(|| {
+                    error::fatal(
+                        code::INTERNAL,
+                        "SAVE[MEM=99999]: 打包总长超过 u32(官方 32 位头同型)",
+                    )
+                })
+            };
+            packed_total = add(packed_total, comp_len)?;
+            unpacked_total = add(unpacked_total, raw_len)?;
+            body.extend_from_slice(&raw_len.to_le_bytes());
+            body.extend_from_slice(&comp_len.to_le_bytes());
+            body.extend_from_slice(&compressed);
+        }
+        let mut out = Vec::with_capacity(12 + body.len());
+        out.push(0);
+        out.push(1);
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&packed_total.to_le_bytes());
+        out.extend_from_slice(&unpacked_total.to_le_bytes());
+        out.extend_from_slice(&body);
+        self.packed_mem = Some(out);
+        Ok(())
+    }
+
+    /// 上次 `SAVE[MEM=99999]` 的打包缓冲(官方 `DAT_0086a03c` 形态)。
+    #[must_use]
+    pub fn packed_mem(&self) -> Option<&[u8]> {
+        self.packed_mem.as_deref()
     }
 
     /// 按预约表构造 YSSD 容器(文件存档与内存槽共用同一序列化)。
@@ -1866,6 +1948,72 @@ fn confined_path_rejects_save_root_ancestor() {
         .expect_err("save 根的祖先必须被拒绝");
     assert_eq!(err.code, code::PATH_ESCAPE, "祖先应报 PATH_ESCAPE");
     }
+
+/// v555 `SAVE[MEM=99999]` 打包(`0x44d82c`):12 字节头
+/// `0,1,0u16,packed,unpacked` + 500 条 `raw_len|comp_len|zlib(level1)`;
+/// 空槽写 `0/0` 且不写数据。
+#[test]
+fn mem_99999_pack_matches_official_layout() {
+    let root = std::path::PathBuf::from("target/tmp/sv-mem-pack-unit");
+    let _ = std::fs::remove_dir_all(&root);
+    let mut state = SaveState::new(&root, false);
+    state.set_container_version(0x1E0);
+    state.set_block_codec(yu_format::yssd::BlockCodec::Zlib);
+    let snap = |vals: &[i64], dims: &[u32]| VarSnapshot {
+        ty: ElemType::Int,
+        dims: dims.to_vec(),
+        data: vals.iter().map(|&v| Value::Int(v)).collect(),
+    };
+
+    state
+        .reserve(7, VarRef::new(VarSpace::At, 0x0a43), &snap(&[11], &[]))
+        .expect("reserve slot0");
+    state.save_mem(0).expect("save slot0");
+    state
+        .reserve(7, VarRef::new(VarSpace::At, 0x0a43), &snap(&[33, 44], &[2]))
+        .expect("reserve slot499");
+    state.save_mem(499).expect("save slot499");
+
+    state.pack_mem().expect("pack");
+    let packed = state.packed_mem().expect("packed buffer");
+    assert_eq!(&packed[0..4], &[0, 1, 0, 0], "header magic/version");
+    let packed_total = u32::from_le_bytes(packed[4..8].try_into().unwrap());
+    let unpacked_total = u32::from_le_bytes(packed[8..12].try_into().unwrap());
+    assert_eq!(
+        usize::try_from(packed_total).unwrap(),
+        packed.len() - 12,
+        "packed_total = 条目区实际长度"
+    );
+
+    let mut cursor = 12usize;
+    let mut sum_packed = 0u64;
+    let mut sum_unpacked = 0u64;
+    for slot in 0..500u32 {
+        let raw_len = u32::from_le_bytes(packed[cursor..cursor + 4].try_into().unwrap());
+        cursor += 4;
+        let comp_len = u32::from_le_bytes(packed[cursor..cursor + 4].try_into().unwrap());
+        cursor += 4;
+        sum_unpacked += 8 + u64::from(raw_len);
+        sum_packed += 8 + u64::from(comp_len);
+        if raw_len == 0 {
+            assert_eq!(comp_len, 0, "空槽 {slot} 的压缩长必须为 0");
+            continue;
+        }
+        let comp = &packed[cursor..cursor + usize::try_from(comp_len).unwrap()];
+        cursor += comp.len();
+        let raw = yu_format::yssd::zlib_decompress(comp, raw_len, b"mem-pack", slot)
+            .expect("zlib payload");
+        assert_eq!(
+            &raw,
+            state.mem_slot(slot).expect("saved slot"),
+            "槽 {slot} 解包后应等于 SAVE[MEM] 容器"
+        );
+    }
+    assert_eq!(cursor, packed.len(), "条目区必须恰好耗尽");
+    assert_eq!(u64::from(packed_total), sum_packed);
+    assert_eq!(u64::from(unpacked_total), sum_unpacked);
+    assert!(packed_total < unpacked_total, "zlib 压缩应小于原始长度");
+}
 
 /// v555 `SAVE[MEM=n]` / `LOAD[MEM=n]`:内存槽与文件存档共用同一 YSSD
 /// 容器;不落盘,槽号稀疏(实测 90000+),`SAVEEND` 不清内存槽。
