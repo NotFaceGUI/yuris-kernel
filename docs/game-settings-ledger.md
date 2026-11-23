@@ -229,8 +229,9 @@ root(空名) → S0(容器, vol=256, E=1)
 - 块格式:`YSSD v0x1E0` + 偏移表(容量取头 `+0x0C`,不写死 0x400)+ 块
   (`dno u32 + btype u8 + strict u8 + var u16 + clen u32 + ulen u32 +
   压缩载荷`);`btype 0` = 单变量(含数组),`btype 2` = 多变量组块
-  (外层裸子块流、内层子块各自压缩),`DNO=1024` = 嵌套容器
-  (`u32 inner_len | u32 len_b | zlib(内层 YSSD)`,见 DIV-RT-056)。
+  (外层裸子块流、内层子块各自压缩),`DNO=1024` = `SAVE[MEM=99999]`
+  的 500 槽内存包(12 字节块头 + 500 条 `raw_len|comp_len|zlib`,
+  空槽占 8 字节;见 DIV-RT-056)。
   压缩层两代并存:**0.495 SDK 语料 = zlib level 1(`78 01`)**,
   **0.481 商业包 = Google Snappy**(随包带 `YSSnp.dll`);读侧按实际流分流,
   写侧按引擎代号(`YSSnp.dll` 存在 ⇒ Snappy)或同目录存档学到的层。

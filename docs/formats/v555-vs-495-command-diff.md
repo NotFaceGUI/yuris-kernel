@@ -127,7 +127,7 @@ argc 与槽位序列均以 E1/E2 为准;E4 §6.3 独立复核一致。
 | `VARINFO[STRFIRST]` | 无 | 在 `SET` 字符串数组 `[NO,NO2]` 闭区间内找字典序最小元素,写 `LET` | 555 `0x455200`;语料前后写 `$a[1]`/`$a[2]` 自证 NO2 为闭区间终点 |
 | `FILEINFO[CGFILE]` | 槽存在;**已取证:真读该槽** | 按 `CG[FILE]` 的图像扩展名序在 VFS 内探测存在性(BT 按钮 `_off/_over/_on/_onover/_na`) | 两代表都有 `CGFILE`(E1/E2);0.495 `0x44286c`(kind 2 → `ebx=3`,`0x44298a` → `0x442c7f` 扩展名探测);555 `0x43eb34`/`b02a 0x43eca8`;语料 `es_buttonque.yst:341` |
 | `CGINFO[LINT2]` | 槽存在;类型码 3;旧语义 | 直接回读图层 `+0x60` 按钮号(`CG` 处理体写 `+0x58/+0x60`);类型码 1 | 555 `CGINFO 0x43b090`、`CG 0x423870`;`+0x58/+0x60` 证据见 truth §11.3;E4 §6.3 |
-| `SAVE/LOAD[MEM]` | 无 `MEM` | `MEM=n` 是内存存档槽:写/读 `DAT_008670c0[n]`、容量 `DAT_008678a0[n]`;`MEM=99999` 走 `FUN_0044d82c` 0..499 打包分支 | 555 `SAVE 0x44b6f0`/`LOAD 0x444654`;E4 §16.10;当前实现见 §5 |
+| `SAVE/LOAD[MEM]` | 无 `MEM` | `MEM=n` 是内存存档槽:写/读 `DAT_008670c0[n]`、容量 `DAT_008678a0[n]`;`MEM=99999` 走 `FUN_0044d7a8` 0..499 打包分支 | 555 本样本 `SAVE 0x44b7f0`/`LOAD 0x44474a`(旧记 `0x44b6f0/0x444654` 为别构建/内部位点);E4 §16.10;当前实现见 §5 |
 | `CG` | 槽 7/8 = `SX/SY` | 槽 7/8 = `SD/MD`;`SX/SY` 在 9/10 | E1/E2;E3 handler `0x423870` |
 | `ERROR` | `COM_CG` 从 idx 2 开始 | `COM_ALIAS` 占 idx 2,所有 `COM_*` 值后移一位 | E1/E2;E3 handler `0x469958` |
 | `EMOTE` / `EMOTEINFO` | E-mote ABI 24 参数 | 18 参数重写;`EMOTEINFO` 命令删除 | E3 `EMOTE 0x43d40c`;E4 §6.3;E-mote 仍 `deferred(master)` |
@@ -154,7 +154,7 @@ argc 与槽位序列均以 E1/E2 为准;E4 §6.3 独立复核一致。
 | `VARINFO[SJISCODE/STRFIRST/NO2]` | `crates/yu-rt/src/semantics.rs` + `vm/handlers/variables.rs` | 已实现;按语义形态门控 |
 | `CGINFO[LINT2]` | `crates/yu-gfx/src/state.rs` | LINT2 回读已实现;`SEARCH/NUM/NAME/LSET/NO` 未实现(truth 记 31,405 条 unsupported 待分类) |
 | `FILEINFO[CGFILE]` | 共享 `vm/handlers/file_io.rs:371` | 已实现探测;已删除 `yscm.version == 555` 门控,扩展名链末尾通用追加 `.webp`(DIV-RT-070) |
-| `SAVE/LOAD[MEM]` | 共享 `vm/handlers/file_io.rs:719/984` + `yu-save` | 已实现内存槽;`MEM=99999` 的 0..499 打包已实现(DIV-RT-071);打包缓冲官方无直接消费者,宿主保留字节 |
+| `SAVE/LOAD[MEM]` | 共享 `vm/handlers/file_io.rs:719/984` + `yu-save` | 已实现内存槽;`MEM=99999` 的 0..499 打包已实现(DIV-RT-071);`LOAD[FILE DNO=1024]` 的 500 槽读取(DIV-RT-075)与 `SAVE[MEM=99999]` → 下一次 `SAVE[FILE]` 写 DNO=1024(DIV-RT-056/075)均已完成 |
 | `PRODUCT` | `crates/yu-rt/src/other/handlers/product.rs` | 已实现部分 COM;`COM=21000/10201/10205` 仍 `Unimplemented` |
 | `MOVIE2/MOVIE2END/MOVIE2INFO` | — | 未路由/未实现;静态语料 0 次使用(E4 普查) |
 | `ALIAS` | 555 共享空操作槽 | 已按 555 默认槽清单处理 |
@@ -186,7 +186,7 @@ argc 与槽位序列均以 E1/E2 为准;E4 §6.3 独立复核一致。
 - [ ] `VARINFO`:555 `0x455200` 的 `0x4554a9`(SJISCODE 首字符)、`0x455b9c`(`SHL 8 + trail`)、`STRFIRST`;0.495 `0x456050..0x456ae4` 对 `SJISCODE` 零引用。
 - [x] `FILEINFO[CGFILE]`:反汇编 0.495 `0x44286c`,确认它**读** `CGFILE` 槽(kind 2 → `ebx=3` → `0x442c7f` 扩展名探测);v555 同槽走 `FUN_0043f770`,扩展名表含 `.webp`。2026-11-23 闭合,见 `v555-semantic-census-2026-11-23.md` §2.3。
 - [ ] `CGINFO[LINT2]`:555 `CG` `0x423870` 写 `+0x58/+0x60`;`CGINFO 0x43b090` 回读;确认 0.495 的 `FX/FY` 删除与类型码 3→1。
-- [x] `SAVE/LOAD[MEM]`:555 `0x44b6f0/0x444654`;确认 `DAT_008670c0[n]`/`DAT_008678a0[n]` 与 `MEM=99999` 的 `FUN_0044d82c`。`MEM=99999` 已按 `0x44b874` → `FUN_0044d82c` 实现(DIV-RT-071);`LOAD` 无 99999 分支。
+- [x] `SAVE/LOAD[MEM]`:555 `0x44b6f0/0x444654`;确认 `DAT_008670c0[n]`/`DAT_008678a0[n]` 与 `MEM=99999` 的 `FUN_0044d7a8`。`MEM=99999` 已按 `0x44b874` → `FUN_0044d7a8` 实现(DIV-RT-071);`LOAD` 无 99999 分支。
 - [ ] `CG` 槽 7/8/9/10:确认处理器按参数名取值,不存在槽号常量。
 - [ ] `ERROR` `COM_*`:确认所有 COM 常量由 ysc 参数名/表值解析,不存在硬编码数值。
 - [ ] `MOVIE2*`:E3 地址 `0x44a6d8/0x44ad64/0x44ad88`;当前 0 静态使用,未实现可接受,但需记录为 `Unimplemented` 而非静默 no-op。
@@ -226,3 +226,4 @@ argc 与槽位序列均以 E1/E2 为准;E4 §6.3 独立复核一致。
 - 2026-11-21:首次建立。E1/E2/E3/E4 一致确认 14 条参数表变化;E5 确认 8 组同名异构;发现 `FILEINFO[CGFILE]` 旧审计理由错误,记入 §4.1/§7。
 - 2026-11-23:语义普查(见 `docs/formats/v555-semantic-census-2026-11-23.md`)。确认 §4 的 8 组不完整(缺 `RETURNCODE`,已由 DIV-RT-069 补);闭合 `FILEINFO[CGFILE]` 证据空洞(0.495 `0x44286c` 读该槽);新增 `TEXT[CLEAR]` 时机、`WORD`/`_` 逐字符表删除、`LET` 系统变量写入、`FONT NAME`、`WAIT` 边界等结论。0.495 与 v555 处理体归一化反汇编相似度:15 条命令 1.000 一致,差异集中在 text/查询/文件/任务边界。
 - 2026-11-23(续):`_`/`WORD` 折空格/上限与 v555 `TEXT[CLEAR]` 时机已修(DIV-RT-072/073);`FONT` 的 NAME/NO/BNO 复核为 `yu-gfx` 已实现(8 样式槽 + `yu-font` 请求),VM 数值镜像另议。
+- 2026-11-23(续 2):`LET` 的 `_MOUSE_L`/`_DROPFILE_NUM`/`_INT`/`_PINT` 写侧已修(DIV-RT-074);`LOAD[FILE DNO=1024]` 500 槽读取已修(DIV-RT-075);DNO=1024 已勘误为 `SAVE[MEM=99999]` 500 槽内存包,写侧已接(DIV-RT-056/075)。

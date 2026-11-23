@@ -168,7 +168,7 @@
 | `DIV-007/009` YSTB v2 | 无真样本 | REA 0.495 装载器 v2 分支 + 旧 SDK/开源工具合成样本 |
 | YPF 边缘分支 | `entryCount=0`、`isCompressed>1`、`name key≠0xFF`、MurmurHash 多段续读 | 逐分支 REA |
 | YSSD | SNP 形态、btype1 配置块段 A/B、btype2 pad 0x0100 | save loader 分支 REA |
-| `DIV-RT-056` | 嵌套 DNO1024 第二段负载 | 官方存档样本 + REA |
+| `DIV-RT-056` | **已闭合**:DNO1024 是 `MEM=99999` 的 500 槽内存包,不是嵌套容器 | 官方样本 + `FUN_0044d7a8`/`FUN_004453f4` |
 
 ### 2.5 声音
 
@@ -319,9 +319,9 @@ VM 预解码/紧凑指令/变量槽 SoA、字形图集键去重、TRIM 窄带读
 ## 8. 复现命令
 
 ```bash
-export TEMP="D:/Art/ai/projects/YurisDroid/workbench/tmp"
+export TEMP="<side-repo>/workbench/tmp"
 export TMP="$TEMP"
-export YURIS_SAMPLE_ERIS_ROOT="D:/Art/ai/projects/YurisDroid/workbench/project-eris"
+export YURIS_SAMPLE_ERIS_ROOT="<side-repo>/workbench/project-eris"
 export YURIS_SAMPLE_ERIS_YSBIN="$YURIS_SAMPLE_ERIS_ROOT/data/ysbin"
 
 cargo check --workspace --all-targets

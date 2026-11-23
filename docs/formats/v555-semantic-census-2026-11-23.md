@@ -41,7 +41,7 @@
 | P1 | `_` 的控制字节折空格 + 长度上限,当前内核没有 | **已修(DIV-RT-072)** |
 | P1 | `TEXT[CLEAR]` 在 v555 里只于文件**成功装载后**执行;当前内核先清后开 | **已修(DIV-RT-073)** |
 | P1 | `FONT[NAME/BNO/NO]` 的字体名/字体栈,当前内核只应用数值槽 | **已核对:gfx 已实现**;VM 数值镜像另议 |
-| P1 | `LET` 对 `@_MOUSE_L(147)` 等系统变量的写入,当前内核挂号忽略 | **待修** |
+| P1 | `LET` 对 `@_MOUSE_L(147)` 等系统变量的写入,当前内核挂号忽略 | **已修(DIV-RT-074)** |
 | P2 | `WAIT` 的零参/零值/FRAME+TIME 优先级(0.495 与 555 相同,当前内核不同) | 待定 |
 | P2 | `TASKEND`/顶层 `RETURN` 的 `task+8` 错误分支与"结束当前任务"语义 | 待定 |
 | P2 | `WORD`/`_` 的 0x1FFE/0x400 边界错误 | **已修(DIV-RT-072)** |
@@ -335,17 +335,46 @@ v555 `LET 0x443988`(0.495 `0x4468e0` 同型)的系统变量特例:
 当前内核 `op_let`(`variables.rs:15`)已覆盖 `_MENUCODE`、
 `_WINDOW_EXEC_*`、`_INP`、`_KEYLAST`、`_MOUSELAST`、`_PAD_*`、
 `_PADNUM_*`、`_CODE_*`、`_TEXT`、`_TEXT_FLAG` 与按钮计数;
-**未覆盖** `_DROPFILE_NUM`、`_INT`、`_PINT`、`_MOUSE_L`,
-会落 `DIV-RT-007` 挂号并忽略。
-语料实证:`<v555-1>` s70 pc410 / pc502 `LET @147 = 3`
+`_DROPFILE_NUM`、`_INT`、`_PINT`、`_MOUSE_L` 已按 v555 分支实现
+(DIV-RT-074)。语料实证:<v555-1> s70 pc410 / pc502 `LET @147 = 3`
 (`@147 = _MOUSE_L`)。本次未在 s60/s61/s64/s65/s70/s104/s105/s113
 中发现 `_PINT` 在 LET 左侧的写入;不能据此认为其它脚本没有。
+
+> **已修(2026-11-23,DIV-RT-074)**:按钮族写入接 `Counter::write`
+> (`FUN_00444750` 同型钳制);`_DROPFILE_NUM` 写 `drop_file_num` 镜像;
+> `_INT`/`_PINT` 按变量表/GOSUB 帧写,带复合赋值;`_INT` 读侧补标量
+> 元素 0。`_DROPFILE_NUM`/`_INT`/`_PINT` 只在 `other` 运行面启用。
 
 ### 4.6 `TEXT` 缺 `LET` / 打开失败时的执行顺序(部分)
 
 - 正式语义见 §2.2(打开失败不执行 CLEAR)。
 - 缺 `LET` 时官方如何处理未逐字节取证(语料 `TEXT` 30 组全部带 `LET`),
   当前内核报可恢复诊断后继续;按 Unknown 保留,不猜。
+
+### 4.7 `LOAD[FILE DNO=1024]` 的 500 槽打包(确认,存档路径)
+
+v555 `LOAD 0x4447c8` 文件分支对 `DNO == 0x400` 独立处理:
+
+```text
+seek 偏移表[1024] → block_off
+if block_off == 0: error 0x18ede; return 0
+seek block_off + 4
+FUN_004453f4(): 12 字节头 + 500×(raw_len|comp_len|zlib);填内存槽
+```
+
+- 脚本实证:`es_saveload.yst` pc412
+  `LOAD FILE=$2216 DNO=1024 LET=@2218`(save7xxxx / `@2213<0` 路径)。
+- 该分支**不写 LET**;DNO=1024 缺失时官方报错但 `return 0`。
+- 12 字节头由外层 YSSD 块头承载;`FUN_004453f4` 读到的槽表从槽 0
+  的 `raw_len|comp_len` 开始,载荷里没有第二份 12 字节头。
+- 该块就是 `SAVE[MEM=99999]` 的 500 槽内存包(空槽 8 字节,全空 =
+  4000 字节),不是“嵌套 YSSD 容器”或“历史环”。
+
+> **已修(2026-11-23,DIV-RT-075/DIV-RT-056)**:`SaveHost::load_mem_pack`
+> + `SaveState::load_mem_pack` 按 500 槽表读取;写侧
+> `SaveState::pack_mem` 生成完整块体,下一次 `SAVE[FILE]` 原样写
+> DNO=1024,写盘成功后清除待写标记。系统存档不调用 `MEM=99999`,
+> 不会误带该块。
 
 ---
 
@@ -363,7 +392,9 @@ v555 `LET 0x443988`(0.495 `0x4468e0` 同型)的系统变量特例:
    未逐分支对拍。
 5. `MOVIE2/MOVIE2END/MOVIE2INFO`:v555 新增,语料 0 组,未路由。
 6. `MEM=99999` 的 0..499 打包槽:**已实现(DIV-RT-071)**;
-   `LOAD[MEM=99999]` 官方无分支,保持未支持。
+   `LOAD[FILE DNO=1024]` 的 500 槽打包读取:**已实现(DIV-RT-075)**;
+   `SAVE[MEM=99999]` → 下一次 `SAVE[FILE]` 写 DNO=1024:**已实现
+   (DIV-RT-056/075)**;`LOAD[MEM=99999]` 官方无分支,保持未支持。
 7. `EMOTE`:主人 `deferred(master)`。
 8. `FUN_0043f770` 的 6 个文件源的完整优先级未逐函数解码;
    §2.3 只确认"扩展名表含 `.webp`"与"CGFILE 走该函数"。

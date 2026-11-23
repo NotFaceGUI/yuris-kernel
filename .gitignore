@@ -5,6 +5,11 @@ AGENTS.md
 
 # 从 crates/ 工作目录运行探针/用例时的产物目录(截图、报告等)
 crates/target/
+# cargo test 以 crate 为 CWD 时单测写出的 target/tmp(save*.sd 等)
+crates/*/target/
+
+# 本地构建产物(主人自用;不修改、不删除、不入库)
+msic/
 
 # 本地预演 Release 更新日志的产物
 /.release

@@ -20,13 +20,13 @@
 
 ```text
 MEM 参数(kind 1)的值 == 99999
-  → FUN_0044d82c();
+  → FUN_0044d7a8();
   → return 0;          // 不再走 FILE / 普通内存槽 / 预约块路径
 ```
 
 0.495 无 `MEM` 参数,不存在该分支。
 
-### 2.2 `FUN_0044d82c`(`0x44d82c`,829 B)
+### 2.2 `FUN_0044d7a8`(`0x44d7a8`,829 B;旧记 `0x44d82c` 为其内部位点)
 
 遍历 0..499 号内存槽(`DAT_008670c0[i]` / 已用长 `DAT_00868080[i]`),
 把每个槽的**整个内存存档容器**再压缩,写入全局 `DAT_0086a03c`:
@@ -51,22 +51,25 @@ MEM 参数(kind 1)的值 == 99999
   4 个读点、没有写点;`DAT_0059b6f8`(存档容器压缩层,555 构建静态初值 1)
   是**另一条路径**,不参与本打包。
 - 空槽:`raw_len = 0`、`comp_len = 0`,不写数据。
-- 官方 exe 内除 `FUN_0044d82c` 自身外**没有** `DAT_0086a03c` 的直接引用;
-  `LOAD[FILE DNO=1024]` 的 `FUN_004453f4` 读的是**同型文件**,不是这个全局。
+- 官方 exe 内除 `FUN_0044d7a8` 自身外**没有** `DAT_0086a03c` 的直接引用,
+  但 SAVE 处理体在 `MEM=99999` 分支调用后保留该块体,下一次
+  `SAVE[FILE]` 会把它写成 DNO=1024(2026-11-23 由 `FUN_0044d7a8` 与
+  文件样本闭合);`LOAD[FILE DNO=1024]` 的 `FUN_004453f4` 读同一形态。
 
 ## 3. 修法
 
 - `SaveState::pack_mem()`:
   - 遍历 0..499,取 `mem_slots` 的 YSSD 容器字节;
   - 空槽写 `0/0`;非空槽 `zlib_compress_level1`;
-  - 按 §2.2 写 12 字节头 + 500 条,存入 `packed_mem`;
-  - `packed_mem()` getter 供取证/后续导出。
+  - 按 §2.2 写 12 字节块头 + 500 条,存入 `packed_mem`,并置待写标记;
+  - 下一次 `SaveState::flush` 把该块体原样写成 DNO=1024,成功后清除
+    待写标记;`packed_mem()` getter 供取证/导出。
 - `SaveHost::pack_mem()`:默认 `Unimplemented`;`yu_save::SaveHost` 转发到
   `SaveState::pack_mem`。
 - `SAVE` 处理体 `MEM=99999` 分支改为调用宿主 `pack_mem()`;
   不再把 99999 当普通槽,也不产生 Unimplemented。
 - **不实现** `LOAD[MEM=99999]`:官方 LOAD 处理体没有 99999 特殊分支
-  (只有 `LOAD[FILE DNO=1024]` 读同型文件);现有 `LOAD` 的 99999 检查
+  (`LOAD[FILE DNO=1024]` 按 500 槽表读回);现有 `LOAD` 的 99999 检查
   保持显式未支持,不猜。
 
 ## 4. 回归
@@ -80,16 +83,17 @@ MEM 参数(kind 1)的值 == 99999
   - `MEM=99999` → 宿主 `pack_mem` 一次,普通槽不出现 99999;
   - 后续 `SAVE[MEM=7]` 仍走 `save_mem`;
   - 不刷文件、无错误。
-- `cargo test -p yu-save`(32 passed,含样本环境);
-- `cargo test -p yu-rt --test fixture`(146 passed / 7 ignored)。
+- `cargo test -p yu-save`(35 passed,含样本环境);
+- `cargo test -p yu-rt --test fixture`(155 passed / 7 ignored)。
 
 ## 5. 限制
 
 1. `DAT_00872164` 的运行时写点未定位;当前按静态默认值 0 使用 zlib。
    若未来发现命令行/配置会置 1,需要在宿主侧增加 pack codec 选择,
    并补 `YSSnp_Compress` 分支。
-2. `packed_mem` 在官方 exe 内无直接消费者;本实现保留字节,
-   不把它接入任何脚本可见状态。
+2. `packed_mem` 由下一次 `SAVE[FILE]` 消费为 DNO=1024;若官方在
+   无 FILE 的命令组里保留/丢弃该缓冲的确切时序未逐分支取证,当前按
+   “待写标记 + 写盘成功后清除”建模。
 3. `LOAD[MEM=99999]` 不是官方形态,仍按未支持处理。
 4. 复合形态 `SAVE[MEM=99999 FILE=...]`:官方在判 99999 之前先做 FILE
    名称校验(`0x44b874:83-141`);当前实现先判 99999。语料里该分支

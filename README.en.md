@@ -40,7 +40,7 @@ The official engine's observable behavior is the single source of truth</p>
 - **Multi-version coverage** — official series: BETA 4 mainline (0.450–0.495),
   BETA 3 (0.276–0.292) and BETA 2 (0.255) adapting; the official commercial 5xx branch
   (v500 packs / v555 seven tables) is adapting; 27 ABI tables for 0.255–0.495
-  are catalogued, plus a v555 1000-slot measured table (on the `v555-support` branch).
+  are catalogued, plus a v555 1000-slot measured table (`docs/formats/v555-*`).
 - **Two render backends** — `soft` (CPU, deterministic reference) and `wgpu` (GPU, primary desktop / Android path).
 - **Multiple hosts** — Windows desktop, headless / local server, browser presentation (debug), Android.
 - **Text patches and saves** — four text routes `original` / `gbk` / `big5` / `tunnel`;
@@ -74,9 +74,15 @@ ABI tables for 0.450–0.493 are all catalogued (27 tables, covering 0.255–0.4
   CP932 / GBK / Big5. The kernel still relies on global `--patch gbk` for multilingual
   runs and is being reworked around per-variant codecs (optimization plan O5).
 - **Remaining**: P0-1 `_STR`, P0-2 button texture state machine, P0-3 SPL transition,
-  P0-4 background CG; `MEM=99999`, other `PRODUCT` COMs, line-by-line text comparison.
-- **Docs**: v555 survey/gap/ABI and multilingual notes live on the `v555-support` branch
-  (`docs/formats/v555-commercial.md`, `v555-gap-2026-11-19.md`), pending merge.
+  P0-4 background CG; other `PRODUCT` COMs, line-by-line text comparison, the
+  Snappy branch of memory-pack slots.
+- **Landed (2026-11-23)**: `SAVE[MEM=99999]` packing of slots 0..499,
+  `LOAD[DNO=1024]` read-back, `SAVE[FILE]` write-back of DNO=1024, inline
+  `TEXT[FILE]` translation, and `translate.json` runtime replacement for
+  `WORD`/choices/buttons.
+- **Docs**: v555 survey/gap/ABI and multilingual notes live in
+  `docs/formats/v555-commercial.md`, `v555-gap-2026-11-19.md` and the other
+  `docs/formats/v555-*` files in this repository.
 
 ### Host platforms
 

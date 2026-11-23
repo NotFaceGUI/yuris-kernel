@@ -54,8 +54,9 @@ loop 500:
     slot[raw_len] 写入 DAT_008670c0[i]
 ```
 
-- 打包块载荷是**原始**的 12 字节头 + 500 条 `raw_len|comp_len|data`,
-  不经过块级压缩;`FUN_004453f4` 在跳过块头后直接读。
+- 打包**块体** = 12 字节块头 + 500 条 `raw_len|comp_len|data`,不经过
+  块级压缩;块**载荷**(去掉 12 字节头)从槽 0 的 `raw_len|comp_len`
+  开始,没有第二份头。`FUN_004453f4` 在跳过块头后直接读记录。
 - `DAT_00872164` 在 555 构建里是 BSS 0,当前只实现 zlib 分支。
 - 该分支不读 `LET`;找不到 DNO=1024 时官方报 `0x18ede` 后 `return 0`,
   内核按 recoverable 诊断继续。
@@ -68,8 +69,9 @@ loop 500:
   - 解析 YSSD,取 DNO=1024 块载荷;
   - 校验 12 字节头、500 条边界、`raw_len/comp_len`;
   - zlib 解压并闭合 `raw_len`,写入 `mem_slots`(空槽移除);
-- `Vm::op_load` 在 `mem.is_none() && dno == 1024` 时直接调用宿主
-  `load_mem_pack`,不落通用 `load_block`,不写 `LET`。
+- `Vm::op_load` 在 `SemanticProfile::save_mem_pack`(v555)且
+  `mem.is_none() && dno == 1024` 时直接调用宿主 `load_mem_pack`,不落
+  通用 `load_block`,不写 `LET`;0.495 及更早的 1024 仍是普通块。
 
 ## 4. 回归
 
@@ -77,9 +79,9 @@ loop 500:
   合成 DNO=1024 原始打包块,槽 0/499 读回、空槽不存在;
 - `fixture::file_save::load_file_dno_1024_uses_the_mem_pack_host`:
   VM 必须走 `load_mem_pack`,不得走 `load_block`/`load_block_mem`;
-- `cargo test -p yu-save` 35 passed;
+- `cargo test -p yu-save` 37 passed / 3 ignored(2026-11-24);
 - `cargo test -p yu-rt --lib` 158 passed;
-- `cargo test -p yu-rt --test fixture` 155 passed / 7 ignored。
+- `cargo test -p yu-rt --test fixture` 156 passed / 7 ignored(2026-11-24)。
 
 ## 5. 存档互通(2026-11-23 闭合)
 

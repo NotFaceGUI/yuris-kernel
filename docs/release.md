@@ -55,7 +55,7 @@ Android universal APK 用同款徽章，另附 ABI 瘦包与 so / 许可证链�
 | `yuris-kernel-vX.Y.Z-android-tyranor-module-arm64-v8a.apk` | 同上，只含 `arm64-v8a` 的模块瘦包 |
 | `yuris-kernel-vX.Y.Z-android-so.zip` | `libyu_host_android.so` + `libc++_shared.so`（按 ABI 分目录） |
 | `yuris-kernel-vX.Y.Z-licenses.zip` | `LICENSE`、`NOTICE`、`THIRD-PARTY-NOTICES.md`、`licenses/`；Android 产物不内嵌这些文件，随此包分发 |
-| `yuris-kernel-vX.Y.Z-translation-skill.zip` | `.agents/skills/yuris-translation/`（SKILL.md、schema/style 参考、校验脚本）+ `translation-workflow.md`；可直接放入 AI 工具的 skills 目录 |
+| `yuris-kernel-vX.Y.Z-translation-skill.zip` | `.agents/skills/yuris-translation/`（SKILL.md、schema/style 参考、校验脚本）+ `translation-workflow.md`；覆盖角色/选项/UI literals/正文与全角宽度规则，可直接放入 AI 工具的 skills 目录 |
 
 三个普通 APK 用同一把 key 签名，`versionName` 相同；Tyranor 模块包也用
 同一把 key，但 `versionName` 追加 `-tyranor`，以便和普通包区分。`versionCode`

@@ -16260,7 +16260,7 @@ Tyranor-Next 模块管理:
   → `kind=original … font=target/tmp/fontpatch-proj\qiandong.ttf`
   `evidence=["hook.ini: FONTFILENAME=qiandong.ttf FONTNAME=qiandong"]`。
 - `cargo build --workspace --all-targets` → 通过。注:本机用户目录含中文
-  (`C:\Users\鬼`),mimalloc 生成的 `mimalloc-static.cc` 按 GBK 读源文件会
+  (`C:\Users\<用户名>`),mimalloc 生成的 `mimalloc-static.cc` 按 GBK 读源文件会
   把 include 路径弄坏(`c1xx C1083`,与本改动无关);构建时加
   `CFLAGS=-utf-8 CXXFLAGS=-utf-8` 即通过。
 - 待主人用实际游戏验收:`auto` 下静态 UI/正文全部使用补丁字体。
@@ -17617,7 +17617,8 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
     DNO=1024 **逐字节一致**(`official_player_save_pack_loads`,
     `YURIS_OFFICIAL_SAVE=... cargo test -p yu-save -- --ignored`)。
 - **实现**:
-  - 删除 `SemanticProfile::SaveHistoryMode` 与 engine 侧历史开关;
+  - 移除 `cc64931` 引入的悬空 `SaveHistoryMode`/`set_history_enabled` 引用
+    (该类型从未存在);改由 `SaveImageMode` / `save_mem_pack` 语义位门控;
   - `SaveState::pack_mem` 生成完整块体并置 `mem_pack_pending`;
   - 下一次 `SaveState::flush` 原样 `set_block(1024, body)`,写盘成功后
     消费标记;系统存档不会误带;
@@ -17626,12 +17627,13 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
 - **验证**:
   - `cargo test -p yu-save --lib` → 缺 `YURIS_SAMPLE_*` 时 35 passed / 2 条
     显式缺环境报错;环境齐备(含 `YURIS_SAMPLE_ERIS_ROOT`)时
-    37 passed / 1 ignored
+    37 passed / 3 ignored(2026-11-24 复跑)
     (`mem_99999_pack_is_written_to_next_file_save_only`、
     `empty_mem_pack_is_4000_zero_bytes`、
     `load_mem_pack_reads_official_500_slot_layout`);
   - `cargo test -p yu-rt --lib` → 158 passed;
-  - `cargo test -p yu-rt --test fixture` → 155 passed / 7 ignored;
+  - `cargo test -p yu-rt --test fixture` → 156 passed / 7 ignored
+    (2026-11-24 复跑);
   - `cargo test -p yu-engine --lib` → 81 passed;
   - `cargo check --workspace --all-targets` → ok(2026-11-23 复跑;
     改动 crate 无告警,余下为既有 example 告警)。
@@ -17693,3 +17695,58 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
 - **残余**:`mem_pack_pending` 的消费时机仍是建模(DIV-RT-075 §5);
   `apply_script_statics` 已有不可达声明的定向回归,但未跑全 22 样本
   诊断对拍。
+
+## 成果 PUSH-PREP-FIX (2026-11-24) · 推送前审查收口
+
+- **泄漏收口**:
+  - `docs/formats/v555-commercial.md` 的逐游戏 CRC32 密钥改为
+    `<crc-481>`/`<crc-555-*>` 占位符(真值只留本地映射表);
+  - DIV-RT-056 的样本存档路径、`profile.rs`/DIV-062 的样本名改为
+    `<v555-pieces>`/`<v49x-x>` 占位符;探针文件名/硬编码存档路径去掉样本名;
+  - **未推送历史里的两处泄漏仍需主人授权改写**(`7b0ce90` 的 CRC 密钥表、
+    `cc64931` 的样本真名),追加提交不能清除历史 blob。
+- **契约/正确性**:
+  - `LOAD[FILE DNO=1024]` 改为 `SemanticProfile::save_mem_pack`(v555)
+    门控;0.495 的 1024 仍是普通块;v555 普通 `SAVE[DNO=1024]` 预约被
+    显式拒绝,内存包不再静默覆盖;
+  - `SaveState` 预约 DNO 下界改 0..=1024(MEM 0 基),修复
+    `SAVE[MEM=n DNO=0]` 被宿主误判致命;
+  - `existing_blocks` 读/解析失败不再吞错:NotFound 才允许空表,其余
+    拒绝覆盖,避免静默丢旧块;
+  - `_INT/_PINT/_DROPFILE_NUM` 统一 `Value::to_int_lossy`(浮点截断,
+    不再静默写 0);`_DROPFILE_NUM` 改 i32 保负数;
+  - `translate.json` 先按坐标去重再编码,被覆盖条目不再打挂装载;
+  - `Lifecycle::Finished` 的 `live_tasks()==0` 仅 v555 生效;
+  - movie-ffmpeg:`checked_mul` + 8192 上限、只搜 PATH 绝对目录(或
+    `YURIS_FFMPEG`/`YURIS_FFPROBE`)、ffprobe 10s 超时、`create_new`
+    临时文件、只写系统临时目录;
+  - `PRODUCT[COM=22]` 只认有证据的 PINT2/PINT3,删除形状启发式;
+  - 裸 `yscm.version == 555` 收口到 `SemanticProfile::is_v555()`;
+  - `apply_script_statics` 只补缺失槽,不重置已存在变量。
+- **探针/守卫**:
+  - 删除生产路径全部 `eprintln!` 临时探针(含 `YU_CSEL_SKIP` 状态注入、
+    样本脚本号/pc/槽号硬编码);守卫测试改为排除文件尾 `#[cfg(test)]`
+    模块,`silent_fallback_audit` 白名单按拆分后的文件重新锁定;
+  - `.gitignore` 补 `crates/*/target/` 与 `msic/`。
+- **文档**:README/README.en 的 v555 状态与文档位置、`v555-gap` 的
+  `MEM=99999`、DIV-RT-075 §2.2/§3、DIV-056 占位符、DIV-066 过渡态说明、
+  `v555-isolation-audit` 的历史快照标注同步。
+- **验证**(`CL/CFLAGS/CXXFLAGS=-utf-8`):
+  - `cargo check --workspace --all-targets` → ok;
+  - `cargo test -p yu-cli --test logging_guards` → 3 passed(守卫全绿);
+  - `cargo test -p yu-cli --lib` → 11 passed(含 3 条 export 参数回归);
+  - `cargo test -p yu-save --lib` → 39 passed / 3 ignored;
+  - `cargo test -p yu-rt --lib` → 158 passed;
+  - `cargo test -p yu-rt --test fixture` → 157 passed / 7 ignored。
+
+## 挂账 PRODUCT-COM22-TOKEN-HEURISTIC (2026-11-24) · token 输出数组兜底待取证
+
+- **背景**:审查时按“无证据不猜”把 `PRODUCT[COM=22]` 的 PINT 兜底删成只认
+  PINT2/PINT3;`<v555-2>` 的 PINT2/PINT3 未回填,导致标签表为空、主任务
+  提前 END、桌面窗口闪退(实机复现)。
+- **处置**:恢复 PINT / `PINT±4/5` / 唯一相邻 `STR[1024]+INT[1024]` 兜底;
+  代码注释与 `DIV-RT-076` 标注“挂账待取证”,**取证前不删**。
+- **待取证**:v555 `PRODUCT COM=22` 处理体的参数/槽号语义;22 个 v555
+  样本的 PINT/PINT2/PINT3 与 ysv 槽号对拍。
+- **验证**:`<v555-2>` desktop debug 连续 45s 不自行退出(exit 124/143),
+  日志无 `PRODUCT` UNIMP;其余 workspace 测试同 PUSH-PREP-FIX 条目。

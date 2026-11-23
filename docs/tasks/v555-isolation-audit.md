@@ -1,7 +1,8 @@
 # v555 独立模块抽离 · 第一轮只读审计（2026-11-21）
 
-> **状态：只读审计。** 本文件是 untracked 文档；本轮未修改任何代码，未执行任何
-> git 写操作（无 checkout/apply/pop/drop/commit/stash/worktree add）。
+> **状态：历史审计快照（2026-11-21 现场；现已入库）。** 本轮未修改任何代码，
+> 未执行任何 git 写操作（无 checkout/apply/pop/drop/commit/stash/worktree add）。
+> 文中的工作区/stash 状态只代表当时现场，不代表当前仓库。
 >
 > 依据：`AGENTS.md`、`docs/tasks/v555-isolation-task-book.md`（下称“任务书”）、
 > `docs/tasks/v555-isolation-startup-prompt.md`。
@@ -66,7 +67,7 @@
 | tracked 改动 | 39 文件，+2683 / −94 | ✅ |
 | untracked 改动 | 68 文件 | ✅ |
 | 工作区 tracked 漂移 | 仅 `yu-emote`（`1b46604` → `a54cbd3`，不在 stash 内） | ✅ 任务书 §1 已列 |
-| 工作区 untracked 额外项 | 本审计文档、`v555-isolation-startup-prompt.md`、`v555-isolation-task-book.md`、`msic/0.4.2.exe` | 预期/不得触碰 |
+| 工作区 untracked 额外项 | 本审计文档、`v555-isolation-startup-prompt.md`、`v555-isolation-task-book.md`、本地构建产物 | 预期/不得触碰 |
 
 ### 1.2 “工作区已恢复 stash”校验
 

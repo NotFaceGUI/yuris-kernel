@@ -40,10 +40,11 @@
 - **多版本覆盖** —— 官方系列 BETA 2 / BETA 3 / BETA 4：
   BETA 4 主线（0.450–0.495），BETA 3（0.276–0.292）/ BETA 2（0.255）适配中；
   官方商业 5xx 分支（v500 封包 / v555 七表）适配中；27 张 0.255–0.495
-  系统变量 ABI 表已入册，另有 v555 1000 槽实测表（在 `v555-support` 分支）。
+  系统变量 ABI 表已入册，另有 v555 1000 槽实测表（`docs/formats/v555-*`）。
 - **双渲染后端** —— `soft`（CPU，确定性参考）与 `wgpu`（GPU，桌面 / Android 主路径）。
 - **多宿主** —— Windows 桌面、headless / 本地服务、浏览器呈现（调试）、Android。
 - **汉化与存档** —— `original` / `gbk` / `big5` / `tunnel` 四条文本路线；
+  `translate.json` 运行时替换角色/选项/UI/正文（CP932 自动扩隧道）；
   `.sd` 存档与桌面字节一致。
 - **可观测** —— `yu-trace` 录制 / 回放 / diff，用于和官方引擎逐帧对拍。
 
@@ -72,9 +73,13 @@
   实测编码分别为 CP932 / GBK / Big5。当前内核对多语言仍依赖全局 `--patch gbk`，
   正在按语言变体收口（优化计划 O5）。
 - **仍缺**：P0-1 `_STR`、P0-2 按钮纹理状态机、P0-3 SPL 过渡、P0-4 背景 CG；
-  `MEM=99999`、`PRODUCT` 其它 COM、正文逐字对拍。
-- **文档**：v555 普查/差距/ABI 与多语言调研在 `v555-support` 分支的
-  `docs/formats/v555-commercial.md`、`v555-gap-2026-11-19.md`，待合并。
+  `PRODUCT` 其它 COM、正文逐字对拍、内存包槽的 Snappy 分支。
+- **已落地（2026-11-23 补）**：`SAVE[MEM=99999]` 的 0..499 内存槽打包、
+  `LOAD[DNO=1024]` 读取、`SAVE[FILE]` 写回 DNO=1024、`TEXT[FILE]` 行内翻译、
+  `WORD`/选项/按钮 `translate.json` 运行时替换。
+- **文档**：v555 普查/差距/ABI 与多语言调研在
+  `docs/formats/v555-commercial.md`、`v555-gap-2026-11-19.md` 与其他
+  `docs/formats/v555-*`。
 
 ### 宿主平台
 
@@ -171,24 +176,60 @@ target/release/yu-cli run "<project>" --mode desktop --backend wgpu \
   --script-key 0x1A2B3C4D --save-codec snappy
 ```
 
-## 翻译流程
+## 自有翻译流程
 
-```bash
-# 1. 导出翻译模板(只含角色 + 选项 + UI 字面量 + 正文)
-yu-cli export "<project>" "<out>" --format translate-json
-
-# 2. 用仓库内翻译 skill 翻译(可随仓库分发给其它 AI 工具)
-#    .agents/skills/yuris-translation/SKILL.md
-
-# 3. 校验结构/角色/选项/控制符/编码
-python .agents/skills/yuris-translation/scripts/validate_translate.py "<out>/translate.json"
-
-# 4. 运行时替换(不改游戏数据;文件内条目全部替换,文件外保持原文)
-yu-cli run "<project>" --translate "<out>/translate.json"
-yu-cli run "<project>" --mode desktop --translate "<out>/translate.json"
+```mermaid
+flowchart LR
+    A[YU-RIS 工程] -->|yu-cli export| B[translate.json]
+    B -->|characters / choices / literals / text| C[AI 或人工翻译]
+    C -->|validate_translate.py| D{0 errors?}
+    D -- 否 --> C
+    D -- 是 --> E[yu-cli run --translate]
+    E --> F[运行时替换]
 ```
 
-翻译规则(角色统一、说话人前缀、控制符、长度、codec)见
+### 简单教程
+
+1. **导出模板**
+
+   ```bash
+   yu-cli export "<project>" "<out>" --format translate-json
+   ```
+
+   只生成一个 `<out>/translate.json`，含角色、选项、UI 字面量和正文；文件外文本不会修改。
+
+2. **先翻角色，再翻选项/UI，最后翻正文**
+
+   - `characters`：角色名，保证全篇统一；
+   - `choices`：选项文字；
+   - `literals`：按钮/菜单/对话框/提示；只填显示类，`context` 为 `CG`、`CGACT`、`es.SP.*`、`es.BT.KEY.SET`、`ES.SEL.GO` 等内部 ID 留空；
+   - `text`：正文台词与外部剧本。
+
+3. **校验**
+
+   ```bash
+   python .agents/skills/yuris-translation/scripts/validate_translate.py "<out>/translate.json"
+   ```
+
+   有 ERROR 先修；WARN 逐条判断。UI 全角标签不要混半角 `E-mote`/数字/空格，否则按钮会偏离中心。
+
+4. **运行时启动**
+
+   ```bash
+   # headless / 桌面
+   yu-cli run "<project>" --translate "<out>/translate.json"
+   yu-cli run "<project>" --mode desktop --translate "<out>/translate.json"
+   ```
+
+   翻译模式自动打开字体缺字回退；中文显示不全时再显式指定 CJK 字体，例如
+   `--font path/to/simsun.ttc --font-lock`。
+
+5. **预渲染图片按钮**
+
+   底部系统栏（`セーブ/ロード/...`）等按钮的文字烘焙在图片里，文本替换改不了，
+   需要替换 UI 素材或改按钮绘制；这是当前文本 hook 的边界。
+
+翻译规则（角色统一、说话人前缀、控制符、全角宽度、codec）见
 [`docs/translation-workflow.md`](docs/translation-workflow.md) 与
 [`SKILL.md`](.agents/skills/yuris-translation/SKILL.md)。
 
@@ -237,8 +278,10 @@ flowchart TD
     PROJ["工程根<br/>发行版:*.ypf + pac/*.ypf<br/>开发工程:data/"]
     UPD["update1..9.ypf<br/>叠加挂载"]
     PATCH["文本编码<br/>original / gbk / big5 / tunnel"]
+    TRJ["translate.json<br/>characters · choices · literals · text"]
+    TRANS["yu-engine::translation<br/>JSON → 目标编码 / SJIS 隧道扩展"]
     VFS["yu-vfs<br/>DirSource / YpfSource / Mount"]
-    FMT["yu-format<br/>ysc · ysl · ysv · yst_list · yst%05d · yscfg"]
+    FMT["yu-format<br/>ysc · ysl · ysv · yst_list · yst%05d · yscfg<br/>scenario · literal 重写器"]
     RT["yu-rt<br/>TableSet → Vm::boot_with_aux<br/>任务 / 命令 / 表达式 / 变量域"]
     GFX["yu-gfx<br/>GfxHost → GfxState"]
     SND["yu-sound<br/>SoundHost"]
@@ -256,6 +299,10 @@ flowchart TD
     PROJ --> VFS
     UPD --> VFS
     PATCH -.-> FMT
+    PATCH -.-> TRANS
+    TRJ --> TRANS
+    TRANS -->|"TranslationTable"| RT
+    TRANS -.->|"DisplayConfig.tunnel"| CORE
     VFS --> FMT --> RT
     RT -->|"命令时刻同步"| GFX
     RT -->|"命令时刻同步"| SND
@@ -270,14 +317,19 @@ flowchart TD
     WGPU --> SURF
     SURF --> HOST
     ENG -.->|"boot 装配"| RT
+    ENG -.->|"boot 前装载"| TRANS
     ENG -.->|"tick / render"| CF
     TRACE -.-> VFS
     TRACE -.-> RT
     TRACE -.-> CF
 ```
 
-启动顺序：`Project` 发现数据入口 → `Vm::boot_with_aux` 装载表与入口 →
+启动顺序：`Project` 发现数据入口 → 若给 `--translate`，先用
+`yu-engine::translation` 编码并扩展隧道 → `Vm::boot_with_aux` 装载表与入口 →
 `GfxState::from_tables` → 把 `GfxHost` / `SoundHost` / `SaveHost` 装进 VM。
+翻译命中发生在 VM 入口：`op_word` 按 `(script_id, pc)`、v555 `TEXT[FILE]`
+写 LET 前按 `(file, line, seq)`、`GOSUB` 按 `(script_id, pc, arg)`、命令缓存
+按 `(script_id, pc, window, segment)` 重写 `M` 常量；未给条目保持原文。
 每帧 `Vm::tick_at` 执行任务，域宿主在命令时刻同步更新；`GfxState::frame()`
 产出 `CompositorFrame`，后端合成 RGBA8。
 
@@ -287,14 +339,14 @@ flowchart TD
 | ------------------------------------------------- | ---------------------------------- |
 | `crates/yu-log`                                   | 诊断与日志；所有 crate 的错误出口  |
 | `crates/yu-vfs`                                   | 数据源、YPF、挂载                  |
-| `crates/yu-format`                                | ybn、YSSD、YMV、CP932/GBK/Big5     |
+| `crates/yu-format`                                | ybn、YSSD、YMV、CP932/GBK/Big5、剧本/字面量重写 |
 | `crates/yu-rt`                                    | VM、任务、命令分派、变量域、ABI 表 |
 | `crates/yu-gfx`                                   | 渲染语义与 `CompositorFrame`       |
 | `crates/yu-sound` / `crates/yu-save`              | 声音 / 存档宿主                    |
 | `crates/yu-font`                                  | 字体发现与字形栅格                 |
 | `crates/yu-render/core`                           | 两后端共享契约                     |
 | `crates/yu-render/soft` / `crates/yu-render/wgpu` | CPU 参考 / GPU 主后端              |
-| `crates/yu-engine`                                | boot / tick / render 装配          |
+| `crates/yu-engine`                                | boot / tick / render 装配、translate.json 装载 |
 | `crates/yu-cli`                                   | CLI、服务、HMR、用例               |
 | `crates/yu-platform/*`                            | 桌面、Android、浏览器呈现、输入    |
 | `crates/yu-trace`                                 | 录制 / 回放 / diff                 |
@@ -317,16 +369,23 @@ cargo test --workspace
 - 渲染：多部件层几何语义；`CGINFO[SX/SY]` 已覆盖已注入资产与 `COPY/COPY2`
   切片，未注入资产仍缺；`COLOR` 等字段、缺失目标的非 EXIST 字段未收口；
   半像素 / quad 相位与过渡覆盖度待官方截图定论。
-- 文本：官方两层模型（待显示缓冲 + 已提交表面）、`C/R/P/E`、宽度折行/禁则、
-  逐字符样式、`TEXTINFO[CX/CY]` 已按 REA 落地；残余：GDI 字迹/基线未与官方
-  截图定论（DIV-GFX-056）、文字与图像加工的命令序（DIV-GFX-076）。
+- 文本/翻译：`WORD`、v555 `TEXT[FILE]`、角色/选项、命令缓存 `M` 常量已接
+  `translate.json`；残余：UI 图片按钮（底部系统栏）需素材替换、0.500 外置
+  `TEXT[FILE]` 语义未启用、literals 的显示/ID 分类仍是 `context` 规则、
+  多语言变体只有一套目标 codec（运行时切换未接）。正文排版残余：GDI
+  字迹/基线（DIV-GFX-056）、文字与图像加工命令序（DIV-GFX-076）。
 - 字体：游戏自带「設定→フォント」已接全量目录（宿主默认字体第一 + 本机
   系统字体），游戏内切换即时生效；`--font` 改为默认字体语义，`--font-lock`
-  保留旧强制行为。残余：逐字形缺字回退、游戏硬编码默认标签（DIV-FONT-012）。
+  保留旧强制行为；翻译模式自动打开缺字回退。残余：默认模式仍不逐字形回退、
+  游戏硬编码默认标签（DIV-FONT-012）。
 - 格式：YSTB V2 缺样本；YPF 旧 NUL-XOR 方言无样本，显式拒绝。
-- 运行时：`CSVINFO` 未取证；`VAR`、`SAVEINFO` 已按官方 no-op 对齐。
-- 存档：`FILEACT` 图层导出未闭环；`FILEACT[EXEC]` 拒绝执行（宿主安全策略）。
-- 宿主：`REGINFO` 桌面已接（Windows 注册表）；Linux / macOS 桌面与真 wasm
+- 运行时：`CSVINFO` 未取证；`VAR`、`SAVEINFO` 已按官方 no-op 对齐；
+  `_STR`、v555 按钮纹理/SPL/背景 CG 仍为 P0。
+- 存档：`SAVE[MEM=99999]` 与 `LOAD[DNO=1024]` 已落地；`SAVE` 侧
+  `DNO=1024` 写回调用点未定位；`FILEACT` 图层导出未闭环、
+  `FILEACT[EXEC]` 拒绝执行（宿主安全策略）。
+- 宿主：`REGINFO` 桌面已接（Windows 注册表）；Android 已接
+  `translate.json`/`nativeStatus` 统计；Linux / macOS 桌面与真 wasm
   （内存数据源 + 浏览器存档）未验证。
 - 影片：MPEG-1 program stream 可播（视频 + MP2 音频）；MPEG-2 / AVI / FLASH
   等需新的媒体 / Flash 宿主；`MOVIE[PLAY=0]` 与音视频时钟漂移未对齐。

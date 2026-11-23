@@ -262,7 +262,7 @@
 命令：
 
 ```bash
-target/release/yu-cli.exe run "D:/Art/ai/projects/YurisDroid/workbench/games/<game-b>" \
+target/release/yu-cli.exe run "<games>/<game-b>" \
   --mode desktop --debug-ui --frames 900 \
   --save-root …/target/tmp/review/koto-save \
   --frame-stats …/koto-frames.csv --log-file …/koto.jsonl \

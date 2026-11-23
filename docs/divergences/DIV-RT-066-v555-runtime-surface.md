@@ -1,6 +1,7 @@
 # DIV-RT-066 · v555 商业分支运行期面(TEXT[FILE]/MEM/PRODUCT/词法器)
 
-- 状态:**fixed(no-manual,2026-11-20)**
+- 状态:**fixed(no-manual,2026-11-20)**;`_STR` 读侧与 `PRODUCT` 未取证 COM
+  仍为**过渡态**(非终态,见 §2 的 P0-1/COM 行)
 - 影响面:`yu-rt`(handlers/vm/sysvar/scenario)、`yu-save`、`yu-engine`/
   desktop 生命周期
 - 证据:`docs/formats/v555-commercial.md`、`docs/formats/v555-gap-2026-11-19.md`、
@@ -31,7 +32,7 @@
 | 面 | 行为 | 诊断 |
 |---|---|---|
 | `_STR(宏帧,参数号)` | 不返回空串(否则宏参数全 0 的假象);读侧返回 Unimplemented | `rt.sysvar.unimplemented`,detail 明确写 P0-1 / v555-gap §P0-1 |
-| `SAVE/LOAD[MEM=99999]` | 0..499 槽打包 `FUN_0044d82c` 消费方未定位;不写不读 | `rt.cmd.unimplemented` 变体 `MEM=99999`,每变体一次 |
+| `SAVE/LOAD[MEM=99999]` | 已实现:`SAVE` 打包 `FUN_0044d7a8` → 下一次 `SAVE[FILE]` 写 DNO=1024;`LOAD[FILE DNO=1024]` 读回。`LOAD[MEM=99999]` 官方无分支 | 见 DIV-RT-056/071/075 |
 | `PRODUCT` 已取证未实现 COM | `26/33/34/36/37/38/10201/10205/21000/21031/0x2776..79` 逐 COM no-op + 挂账 | `report_unimplemented_variant("PRODUCT","COM=…")`,每 COM 一次 |
 | `PRODUCT` 未列出的 COM | 官方处理体未知;no-op + Info 一次 | `rt.cmd.aligned_stub`,`PRODUCT.COM=…` |
 | `PRODUCT[COM=22]` 位置/长度字段 | 文本/类型码已输出;位置/长度未对拍(调用方当前不用) | `rt.cmd.aligned_stub`,`PRODUCT.COM=22.FIELDS`,只报一次 |
