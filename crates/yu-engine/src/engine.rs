@@ -3188,6 +3188,16 @@ impl TextureSampler for StoreSampler {
 
 fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     let boot_started = Instant::now();
+    // 启动进度:壳轮询 `host_ui::boot_progress_json()` 显示 spinner。
+    // Drop 保证成功/失败都会把 active 置 false。
+    struct ResetBootProgress;
+    impl Drop for ResetBootProgress {
+        fn drop(&mut self) {
+            crate::host_ui::finish_boot_progress();
+        }
+    }
+    let _boot_progress_reset = ResetBootProgress;
+    crate::host_ui::report_boot_progress("project", "读取工程数据…");
     // 存档根(P4 M-C;2026-10-24 主人令改为默认可写):缺省 = 工程根
     // `save/`(官方原版已备份至 `save-backup-20261024/`,引擎按语义正常
     // 读写);`--save-root`/用例 = 显式重定向目录。
@@ -3203,6 +3213,7 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         .map_err(|e| Failure::runtime(format!("创建 save 根 {} 失败: {e}", save_root.display())))?;
     let source = project.open_source()?;
     let aux = project.open_aux()?;
+    crate::host_ui::report_boot_progress("mount", "挂载游戏数据…");
     // 脚本密钥:显式优先,否则按 exe 扫描 → 数据自举 → 默认值解析
     // (换钥作品不再停在 `fmt.ybn.key`)。解析结果留痕,便于排查"为什么行为不同"。
     let script_key = project.resolve_script_key(opts.script_key)?;
@@ -3279,8 +3290,10 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         translation,
         ..BootConfig::default()
     };
+    crate::host_ui::report_boot_progress("tables", "装载脚本与表…");
     let mut vm = Vm::boot_with_aux(source, Some(aux), boot)
         .map_err(|d| Failure::runtime(format!("boot 失败: {d}")))?;
+    crate::host_ui::report_boot_progress("vm", "初始化虚拟机…");
     // 独立商业分支运行面:只对精确 555 安装;旧版不安装,保持 c1549eb 行为。
     if vm.semantics().is_v555() {
         vm.install_other_runtime();

@@ -61,7 +61,9 @@ use std::sync::{Arc, Mutex};
 
 use yu_backend_wgpu::GpuBackend;
 use yu_engine::engine::{Backend, BlockCodec, Engine, EngineOptions};
-use yu_engine::host_ui::{self, HostDialog, HostDialogAnswer};
+use yu_engine::host_ui::{
+    self, HostAlertQueue, HostDialog, HostDialogAnswer, HostDialogSource, HOST_DIALOG_ID_BASE,
+};
 use yu_engine::project::Project;
 use yu_log::LogLevel;
 
@@ -97,6 +99,10 @@ struct Session {
     video: bool,
     /// 发布模式(状态串最小化)。
     quiet: bool,
+    /// 内核 panic 后冻结:现场已不可信,不再推进,保留最后一帧与错误对话框。
+    frozen: bool,
+    /// 已消费的内核诊断总数(状态串用;诊断本体已进宿主消息队列)。
+    diags_total: u64,
     /// 音频抓取:已启动时的目标样本数(诊断爆音)。
     audio_capture_target: usize,
     /// 抓取结果的落盘路径(数据目录下 debug/audio-capture.wav)。
@@ -170,7 +176,46 @@ static DIALOG_SNAPSHOT: Mutex<DialogSnapshot> = Mutex::new(DialogSnapshot::new()
 /// 线程在下一帧 `tick` 里把它交给引擎。
 static DIALOG_ANSWERS: Mutex<Vec<HostDialogAnswer>> = Mutex::new(Vec::new());
 
+/// 宿主消息队列(内核诊断/脚本错误/panic/启动失败)。
+///
+/// 与脚本 DIALOG 合并进同一份 [`DIALOG_SNAPSHOT`]:官方错误路径本身就是
+/// `MessageBoxA`,壳不该为错误另写一套上屏;`source=host` + 高位置 ID 让
+/// `answer_dialog` 能区分「回答脚本」与「确认宿主消息」。
+static ALERT_SNAPSHOT: Mutex<AlertSnapshot> = Mutex::new(AlertSnapshot::new());
+
+struct AlertSnapshot {
+    queue: HostAlertQueue,
+    /// 队列映射出的 DIALOG 视图(缓存;队列变化时重建)。
+    dialogs: Vec<HostDialog>,
+    /// 最新一条非模态提示(Recoverable 诊断;壳取走即空,不阻塞游戏)。
+    hint: Option<String>,
+}
+
+impl AlertSnapshot {
+    const fn new() -> Self {
+        Self {
+            queue: HostAlertQueue::new(),
+            dialogs: Vec::new(),
+            hint: None,
+        }
+    }
+}
+
+/// 当前线程最近一次 panic 的摘要(panic hook 写入,`catch_unwind` 读走)。
+struct PanicRecord {
+    message: String,
+    location: String,
+    backtrace: String,
+}
+
+thread_local! {
+    static LAST_PANIC: RefCell<Option<PanicRecord>> = const { RefCell::new(None) };
+}
+
 struct DialogSnapshot {
+    /// 内核脚本 DIALOG(不含宿主消息)。
+    script: Vec<HostDialog>,
+    /// 合并后的呈现列表(脚本在前,宿主消息在后)。
     dialogs: Vec<HostDialog>,
     json: String,
 }
@@ -178,9 +223,22 @@ struct DialogSnapshot {
 impl DialogSnapshot {
     const fn new() -> Self {
         Self {
+            script: Vec::new(),
             dialogs: Vec::new(),
             json: String::new(),
         }
+    }
+
+    /// 用当前 `script` + 给定宿主消息重建合并列表与 JSON。
+    fn merge(&mut self, host_dialogs: Vec<HostDialog>) {
+        let mut dialogs = self.script.clone();
+        dialogs.extend(host_dialogs);
+        self.dialogs = dialogs;
+        self.json = if self.dialogs.is_empty() {
+            String::new()
+        } else {
+            host_ui::dialogs_json(&self.dialogs)
+        };
     }
 }
 
@@ -192,22 +250,24 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// 把会话里的待答 DIALOG 复制到线程安全快照(仅在集合变化时重建 JSON)。
+/// 把会话里的待答 DIALOG 与宿主消息合并进线程安全快照(仅在变化时重建)。
 fn refresh_dialog_snapshot(engine: &Engine) {
-    let pending = engine.pending_dialogs();
+    let script: Vec<HostDialog> = engine
+        .pending_dialogs()
+        .iter()
+        .map(HostDialog::from_request)
+        .collect();
+    // 先把宿主消息取出来再锁 DIALOG_SNAPSHOT:两条锁永不嵌套,避免
+    // UI 线程 answer_dialog 与本函数形成 ABBA。
+    let host_dialogs = { lock_or_recover(&ALERT_SNAPSHOT).dialogs.clone() };
+    let mut merged = script.clone();
+    merged.extend(host_dialogs.iter().cloned());
     let mut snapshot = lock_or_recover(&DIALOG_SNAPSHOT);
-    if pending.is_empty() && snapshot.dialogs.is_empty() {
+    if script == snapshot.script && merged == snapshot.dialogs {
         return;
     }
-    let dialogs: Vec<HostDialog> = pending.iter().map(HostDialog::from_request).collect();
-    if dialogs != snapshot.dialogs {
-        snapshot.json = if dialogs.is_empty() {
-            String::new()
-        } else {
-            host_ui::dialogs_json(&dialogs)
-        };
-        snapshot.dialogs = dialogs;
-    }
+    snapshot.script = script;
+    snapshot.merge(host_dialogs);
 }
 
 /// 清空快照与未应用的回答(会话启动/销毁时调用,避免旧会话的答案
@@ -215,10 +275,137 @@ fn refresh_dialog_snapshot(engine: &Engine) {
 fn clear_dialog_state() {
     {
         let mut snapshot = lock_or_recover(&DIALOG_SNAPSHOT);
+        snapshot.script.clear();
         snapshot.dialogs.clear();
         snapshot.json.clear();
     }
     lock_or_recover(&DIALOG_ANSWERS).clear();
+}
+
+/// 清空宿主消息队列(会话启动/销毁时调用)。
+fn clear_alert_state() {
+    let mut alerts = lock_or_recover(&ALERT_SNAPSHOT);
+    alerts.queue.clear();
+    alerts.dialogs.clear();
+    alerts.hint = None;
+}
+
+/// 取走最新一条非模态提示(警告);空串 = 没有。
+///
+/// 与 `nativePendingDialogs()` 分开:警告不阻塞游戏,壳用 Toast 即可。
+pub fn take_hint() -> String {
+    lock_or_recover(&ALERT_SNAPSHOT)
+        .hint
+        .take()
+        .unwrap_or_default()
+}
+
+/// 入库一条宿主消息,并立即并入 DIALOG 快照。
+///
+/// 立即合并而不是等下一次 tick:启动失败时没有下一帧,但错误仍必须
+/// 能被壳读到。返回分配的宿主消息 ID(0 = 被去重/丢弃)。
+fn push_host_alert(push: impl FnOnce(&mut HostAlertQueue) -> u64) -> u64 {
+    let (id, host_dialogs) = {
+        let mut alerts = lock_or_recover(&ALERT_SNAPSHOT);
+        let id = push(&mut alerts.queue);
+        if id > 0 {
+            alerts.dialogs = alerts.queue.dialogs();
+        }
+        (id, alerts.dialogs.clone())
+    };
+    if id == 0 {
+        return 0;
+    }
+    let mut snapshot = lock_or_recover(&DIALOG_SNAPSHOT);
+    snapshot.merge(host_dialogs);
+    id
+}
+
+/// 确认一条宿主消息并同步快照。
+fn dismiss_host_alert(id: u64) -> bool {
+    let (dismissed, host_dialogs) = {
+        let mut alerts = lock_or_recover(&ALERT_SNAPSHOT);
+        let dismissed = alerts.queue.dismiss_dialog(id);
+        if dismissed {
+            alerts.dialogs = alerts.queue.dialogs();
+        }
+        (dismissed, alerts.dialogs.clone())
+    };
+    if dismissed {
+        let mut snapshot = lock_or_recover(&DIALOG_SNAPSHOT);
+        snapshot.merge(host_dialogs);
+    }
+    dismissed
+}
+
+/// 会话已失败/panic 时丢弃脚本 DIALOG:引擎不再推进,这些框永远无法
+/// 回答;保留它们会把真正的错误对话框堵在队列后面。宿主消息不受影响。
+fn drop_script_dialogs() {
+    let host_dialogs = { lock_or_recover(&ALERT_SNAPSHOT).dialogs.clone() };
+    let mut snapshot = lock_or_recover(&DIALOG_SNAPSHOT);
+    snapshot.script.clear();
+    snapshot.merge(host_dialogs);
+}
+
+/// 把本帧内核诊断/脚本错误入库(去重与上限由队列负责)。
+fn record_engine_alerts(diags: &[yu_log::Diag], script_errors: &[String]) {
+    if diags.is_empty() && script_errors.is_empty() {
+        return;
+    }
+    let host_dialogs = {
+        let mut alerts = lock_or_recover(&ALERT_SNAPSHOT);
+        let mut changed = false;
+        for diag in diags {
+            if alerts.queue.ingest_diag(diag) > 0 {
+                changed = true;
+            }
+        }
+        // 警告只进非模态提示(壳 Toast),不参与 DIALOG 快照。
+        if let Some(hint) = alerts.queue.take_hint() {
+            alerts.hint = Some(hint);
+        }
+        for error in script_errors {
+            if alerts.queue.ingest_script_error(error) > 0 {
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        alerts.dialogs = alerts.queue.dialogs();
+        alerts.dialogs.clone()
+    };
+    let mut snapshot = lock_or_recover(&DIALOG_SNAPSHOT);
+    snapshot.merge(host_dialogs);
+}
+
+fn take_last_panic() -> PanicRecord {
+    LAST_PANIC.with(|slot| slot.borrow_mut().take()).unwrap_or_else(|| PanicRecord {
+        message: "内核 panic(没有捕获到消息)".to_string(),
+        location: "unknown".to_string(),
+        backtrace: String::new(),
+    })
+}
+
+/// 启动路径的 panic 边界:把 panic 变成一条可呈现的宿主消息 + `Err`,
+/// 而不是让 unwind 越过 JNI 边界直接 abort。
+fn guard_boot<T>(run: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(result) => result,
+        Err(_) => {
+            let record = take_last_panic();
+            push_host_alert(|queue| {
+                queue.push_panic(&record.message, &record.location, &record.backtrace)
+            });
+            log::error!(
+                target: "yu-host-android",
+                "[panic] 启动阶段: {} at {}",
+                record.message,
+                record.location
+            );
+            Err(format!("内核启动 panic: {}", record.message))
+        }
+    }
 }
 
 /// 当前待回答 DIALOG 的 JSON 契约;**空串 = 没有**。
@@ -236,6 +423,16 @@ pub fn pending_dialogs_json() -> String {
 /// 对话框打开。调用线程持有会话时立即应用,否则入队由渲染线程在下一
 /// 帧 `tick` 前应用。
 pub fn answer_dialog(id: u64, button: u8, text: Option<&str>) -> Result<(), String> {
+    // 宿主消息的确认必须先于快照查找:失败路径会 `nativeShutdown()` 清空
+    // 快照,但壳手里还握着 shutdown 前捕获的 JSON。按 ID 区间幂等关闭,
+    // 不能报“不存在/已回答”把用户卡在一个永远关不掉的对话框上。
+    if id >= HOST_DIALOG_ID_BASE {
+        if button != 1 {
+            return Err(format!("宿主 DIALOG#{id} 只有 OK 按钮(收到 {button})"));
+        }
+        let _ = dismiss_host_alert(id);
+        return Ok(());
+    }
     let dialog = {
         let snapshot = lock_or_recover(&DIALOG_SNAPSHOT);
         snapshot
@@ -250,6 +447,15 @@ pub fn answer_dialog(id: u64, button: u8, text: Option<&str>) -> Result<(), Stri
         return Err(format!(
             "DIALOG#{id} 按钮序号 {button} 越界(合法 1..={count})"
         ));
+    }
+    // 宿主消息(错误/警告/panic)与脚本 DIALOG 共用呈现器,但没有 VM
+    // 写回:确认只关闭队列项,不能送进 `answer_host_dialog`。
+    if dialog.source == HostDialogSource::Host {
+        // 幂等:失败路径可能已经 shutdown 并清空队列,但壳手里还握着刚
+        // 捕获的 JSON。用户确认这条历史消息时按成功处理,不能把人卡在
+        // 一个永远关不掉的对话框上。
+        let _ = dismiss_host_alert(id);
+        return Ok(());
     }
     let input_text = if dialog.input {
         let text = text.ok_or_else(|| format!("DIALOG#{id} 是文本输入框,回答必须带文本"))?;
@@ -294,13 +500,13 @@ pub fn answer_dialog(id: u64, button: u8, text: Option<&str>) -> Result<(), Stri
 
     // 立即从快照移除:壳回答后不应再被下一次轮询弹一次。若引擎稍后
     // 拒绝这条回答(例如任务已不在),下一次 tick 的 refresh 会把它补回来。
+    {
+        let mut snapshot = lock_or_recover(&DIALOG_SNAPSHOT);
+        snapshot.script.retain(|dialog| dialog.id != id);
+    }
+    let host_dialogs = { lock_or_recover(&ALERT_SNAPSHOT).dialogs.clone() };
     let mut snapshot = lock_or_recover(&DIALOG_SNAPSHOT);
-    snapshot.dialogs.retain(|dialog| dialog.id != id);
-    snapshot.json = if snapshot.dialogs.is_empty() {
-        String::new()
-    } else {
-        host_ui::dialogs_json(&snapshot.dialogs)
-    };
+    snapshot.merge(host_dialogs);
     Ok(())
 }
 
@@ -805,7 +1011,10 @@ pub fn init_session_with_fonts(
     };
     // 老接口同样要应用 run-config.json(与 JSON 入口同一套键)。
     apply_run_config_file(&mut config);
-    let started = start_engine(config, path_overrides)?;
+    let started = guard_boot(|| start_engine(config, path_overrides)).map_err(|error| {
+        push_host_alert(|queue| queue.push_boot_error(&error));
+        error
+    })?;
     store_session(started)
 }
 
@@ -824,8 +1033,9 @@ fn store_session(started: StartedEngine) -> Result<String, String> {
     SUSPEND_REQUEST.store(false, std::sync::atomic::Ordering::Release);
     RESUME_REQUEST.store(false, std::sync::atomic::Ordering::Release);
     // 上一轮的 DIALOG 快照/未应用回答不能落到新会话(旧 id 在新会话里
-    // 没有意义)。
+    // 没有意义);宿主消息同理。
     clear_dialog_state();
+    clear_alert_state();
     // 新会话从「未挂起」开始:上一轮若在后台被销毁,音频闸门可能留在
     // paused 状态;不清掉的话新会话会静音到第一次 onResume。
     sound::set_output_paused(false);
@@ -845,6 +1055,8 @@ fn store_session(started: StartedEngine) -> Result<String, String> {
             vm_profile_frames: 0,
             video: started.render,
             quiet: started.quiet,
+            frozen: false,
+            diags_total: 0,
             audio_capture_target: capture,
             capture_path,
         });
@@ -965,10 +1177,43 @@ fn install_panic_hook() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         std::panic::set_hook(Box::new(|info| {
+            // 先抓现场,再写日志:日志出口自己也可能 panic(磁盘满等),
+            // 但 hook 里要保证记录不丢。
+            let record = PanicRecord {
+                message: panic_payload_message(info.payload()),
+                location: info
+                    .location()
+                    .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+                    .unwrap_or_else(|| "unknown".to_string()),
+                backtrace: panic_backtrace_summary(),
+            };
+            LAST_PANIC.with(|slot| *slot.borrow_mut() = Some(record));
             log::error!(target: "yu-host-android", "[panic] {info}");
             flush_logs();
         }));
     });
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// backtrace 只留前 16 行:对话框里够定位,完整栈仍由 logcat/jsonl 保留。
+fn panic_backtrace_summary() -> String {
+    let trace = std::backtrace::Backtrace::force_capture().to_string();
+    trace
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .take(16)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 初始化文件日志(JSONL):`log_file` 指向的文件 + 门槛。
@@ -1048,7 +1293,10 @@ pub fn start_session_json(json: &str) -> Result<String, String> {
         personal_path: Some(config.data_root.clone()),
         ..Default::default()
     };
-    let started = start_engine(config, path_overrides)?;
+    let started = guard_boot(|| start_engine(config, path_overrides)).map_err(|error| {
+        push_host_alert(|queue| queue.push_boot_error(&error));
+        error
+    })?;
     store_session(started)
 }
 
@@ -1360,6 +1608,7 @@ pub fn tick() -> i32 {
         if SHUTDOWN_REQUEST.swap(false, std::sync::atomic::Ordering::AcqRel) {
             log_line("yu-host-android", "shutdown requested from another thread");
             clear_dialog_state();
+            clear_alert_state();
             drop(slot.take());
             flush_logs();
             return TICK_HOST_SHUTDOWN;
@@ -1371,9 +1620,46 @@ pub fn tick() -> i32 {
         if apply_pending_lifecycle(session) {
             return 0;
         }
-        match session.engine.tick_realtime() {
+        if session.frozen {
+            set_error("会话已因内核 panic 冻结");
+            return -2;
+        }
+        // panic 边界:unwind 越过 `extern "system"` 是 UB/abort,必须在这里
+        // 拦住;捕获后把消息投进同一份 DIALOG 快照(错误上屏不再另走一套)。
+        let tick_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.engine.tick_realtime()
+        }));
+        let tick_result = match tick_result {
+            Ok(result) => result,
+            Err(_) => {
+                let record = take_last_panic();
+                push_host_alert(|queue| {
+                    queue.push_panic(&record.message, &record.location, &record.backtrace)
+                });
+                drop_script_dialogs();
+                session.frozen = true;
+                log::error!(
+                    target: "yu-host-android",
+                    "[panic] tick 阶段: {} at {}",
+                    record.message,
+                    record.location
+                );
+                set_error(format!("内核 panic: {}", record.message));
+                return -2;
+            }
+        };
+        match tick_result {
             Ok(rendered) => {
                 session.ticks += 1;
+                // 内核诊断/脚本错误:本帧取走,升级成宿主消息后与脚本
+                // DIALOG 合并同一份快照。`take_diags` 在这里唯一消费,
+                // `status_text` 只读累计数,不再二次 drain。
+                let diags = session.engine.take_diags();
+                session.diags_total = session
+                    .diags_total
+                    .saturating_add(u64::try_from(diags.len()).unwrap_or(u64::MAX));
+                let script_errors = session.engine.script_errors();
+                record_engine_alerts(&diags, &script_errors);
                 // 快照必须在本帧结束后刷新:新挂起的 DIALOG 要让壳在
                 // `nativeTick` 返回后立刻看到。
                 refresh_dialog_snapshot(&session.engine);
@@ -1551,7 +1837,10 @@ pub fn tick() -> i32 {
                 session.engine.lifecycle().host_code()
             }
             Err(failure) => {
-                set_error(format!("tick 失败: {failure}"));
+                let message = format!("tick 失败: {failure}");
+                push_host_alert(|queue| queue.push_runtime_error(&message));
+                drop_script_dialogs();
+                set_error(message);
                 -2
             }
         }
@@ -1753,7 +2042,7 @@ pub fn status_text() -> String {
                     return;
                 }
                 let report = session.engine.last_report().clone();
-                let diags = session.engine.take_diags().len();
+                let diags = session.diags_total;
                 let dialog_count = lock_or_recover(&DIALOG_SNAPSHOT).dialogs.len();
                 let clipped = session.engine.sound_clipped_samples();
                 let rt_silence = session.engine.sound_rt_silence_samples();
@@ -2007,6 +2296,7 @@ pub fn lifecycle_code() -> i32 {
 pub fn shutdown() -> bool {
     flush_logs();
     clear_dialog_state();
+    clear_alert_state();
     SESSION.with(|slot| slot.borrow_mut().take().is_some())
 }
 
@@ -2050,13 +2340,24 @@ pub fn probe_game_root(path: &str) -> String {
         return "{\"ok\":false,\"reason\":\"路径为空\"}".to_string();
     }
     match Project::discover(std::path::Path::new(trimmed), None) {
-        Ok(project) => format!(
-            "{{\"ok\":true,\"root\":\"{}\",\"kind\":\"{}\",\"packs\":{},\"updates\":{}}}",
-            yu_engine::project::json_escape(&project.root().to_string_lossy()),
-            project.entry().kind(),
-            project.packs().base.len(),
-            project.packs().updates.len(),
-        ),
+        Ok(project) => {
+            // 引擎版本来自 `ysc.ybn` 容器头(数据自证),不是猜的。
+            // 未知版本(0)不拦;已知版本按官方 BETA 4 主线 450..=495 判定。
+            let version = project.ysc_version().unwrap_or(0);
+            // 版本未知也按「不在支持范围」处理:壳只提示,仍允许尝试启动;
+            // 静默当作支持会让用户以为 5xx 已适配。
+            let supported = yu_engine::identity::supported_engine_version(version);
+            format!(
+                "{{\"ok\":true,\"root\":\"{}\",\"kind\":\"{}\",\"packs\":{},\
+                 \"updates\":{},\"version\":{},\"supported\":{}}}",
+                yu_engine::project::json_escape(&project.root().to_string_lossy()),
+                project.entry().kind(),
+                project.packs().base.len(),
+                project.packs().updates.len(),
+                version,
+                supported,
+            )
+        }
         Err(failure) => format!(
             "{{\"ok\":false,\"reason\":\"{}\"}}",
             yu_engine::project::json_escape(&failure.to_string())
@@ -2230,6 +2531,54 @@ mod jni_entry {
         _class: JClass<'_>,
     ) -> jint {
         tick() as jint
+    }
+
+    /// 从游戏根目录的 exe 资源里取窗口图标(`RT_GROUP_ICON` / `RT_ICON`)。
+    ///
+    /// 返回 `[width, height, ARGB_8888...]`;空数组 = 没有可解图标。
+    /// 读取上限 64 MiB,且会扫根目录下所有 exe(按大小降序)—— **不要**
+    /// 在 UI 线程调用,扫描/解码放后台线程。
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeGameIcon<'local>(
+        mut env: JNIEnv<'local>,
+        _class: JClass<'local>,
+        root: JString<'local>,
+    ) -> JIntArray<'local> {
+        let Ok(root) = env.get_string(&root) else {
+            return JIntArray::default();
+        };
+        let path = PathBuf::from(root.to_string_lossy().into_owned());
+        let Some(icon) = yu_engine::identity::load_icon(&path) else {
+            return JIntArray::default();
+        };
+        let width = icon.width as usize;
+        let height = icon.height as usize;
+        let Some(count) = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_add(2))
+        else {
+            return JIntArray::default();
+        };
+        let Ok(count_i32) = jint::try_from(count) else {
+            return JIntArray::default();
+        };
+        let Ok(array) = env.new_int_array(count_i32) else {
+            return JIntArray::default();
+        };
+        let mut pixels = Vec::with_capacity(count);
+        pixels.push(icon.width as jint);
+        pixels.push(icon.height as jint);
+        for rgba in icon.rgba.chunks_exact(4) {
+            let a = u32::from(rgba[3]);
+            let r = u32::from(rgba[0]);
+            let g = u32::from(rgba[1]);
+            let b = u32::from(rgba[2]);
+            pixels.push(((a << 24) | (r << 16) | (g << 8) | b) as jint);
+        }
+        if env.set_int_array_region(&array, 0, &pixels).is_err() {
+            return JIntArray::default();
+        }
+        array
     }
 
     #[no_mangle]
@@ -2576,6 +2925,34 @@ mod jni_entry {
         _class: JClass<'_>,
     ) -> JString<'local> {
         to_jstring(&mut env, pending_dialogs_json())
+    }
+
+    /// 取走最新一条非模态提示(Recoverable 警告);`null` = 没有。
+    ///
+    /// 与 DIALOG 分开:警告不阻塞游戏,壳用 Toast/横幅提示即可。
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeTakeHint<'local>(
+        mut env: JNIEnv<'local>,
+        _class: JClass<'local>,
+    ) -> JString<'local> {
+        let hint = take_hint();
+        if hint.is_empty() {
+            // 稳态不分配 Java 字符串(每帧都会轮询)。
+            return JString::default();
+        }
+        to_jstring(&mut env, hint)
+    }
+
+    /// 启动进度 JSON(壳在 UI 线程轮询,显示 spinner)。
+    ///
+    /// 契约见 `yu_engine::host_ui::boot_progress_json`:
+    /// `{"active":true,"stage":"mount","detail":"挂载游戏数据…"}`。
+    #[no_mangle]
+    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeBootProgress<'local>(
+        mut env: JNIEnv<'local>,
+        _class: JClass<'local>,
+    ) -> JString<'local> {
+        to_jstring(&mut env, yu_engine::host_ui::boot_progress_json())
     }
 
     /// 回答一条 DIALOG(可从任意线程调用;渲染线程下一帧应用)。
@@ -2990,5 +3367,20 @@ mod tests {
             "魔数不符的 .ypf 不能当入口(旧壳手抄版会误判为真): {reply}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn host_dialog_answer_is_idempotent_after_state_clear() {
+        // tick 失败/panic 路径会先 `nativeShutdown()` 清空快照,再让壳显示
+        // shutdown 前捕获的 JSON。此时确认宿主消息必须按 ID 区间幂等成功,
+        // 不能报“不存在”把对话框卡死。
+        assert!(
+            answer_dialog(HOST_DIALOG_ID_BASE, 1, None).is_ok(),
+            "已清空的宿主消息确认必须成功"
+        );
+        assert!(
+            answer_dialog(HOST_DIALOG_ID_BASE, 2, None).is_err(),
+            "宿主消息只有 OK 按钮,序号 2 必须显式拒绝"
+        );
     }
 }

@@ -960,6 +960,7 @@ fn severity_color(severity: yu_log::Severity) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yu_engine::host_ui::HostDialogSource;
     use crate::diagnostics::{DiagRow, Diagnostics, InputCounters, StuckReport};
     use yu_log::Severity;
 
@@ -1197,6 +1198,7 @@ mod tests {
     fn yes_no_view() -> HostDialog {
         HostDialog {
             id: 7,
+            source: HostDialogSource::Script,
             task: "es_Scenario".to_string(),
             caption: "確認".to_string(),
             text: "ゲームを終了します。よろしいですか？".to_string(),
