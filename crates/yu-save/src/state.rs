@@ -16,7 +16,7 @@
 //!    `SaveHost` 同步契约(B1 裁 1-A/裁 2-A)进入本状态机,事件流里的
 //!    这三条不再重复消费(`apply_event` 只剩 FILEACT/SAVEINFO/FILEINFO)。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use yu_log::Diag;
@@ -44,7 +44,8 @@ pub struct SlotFile {
 ///
 /// 形态 = 官方预约表(`0x7fad1c`/`0x7fbe1c` 按 DNO 索引)的内核投影:
 /// 块类型 0 = 单变量(整组快照);块类型 2 = 多变量组(逐子块,顺序 =
-/// 工程变量表序)。同 DNO 重复预约 = 替换(REA `0x44c740`)。
+/// 工程变量表序)。同 DNO 重复预约:0.495/0.479 替换(REA `0x44c740`),
+/// 带 `MEM` 的表(0.481/0.494/0.500/0.555)错误返回 -1(DIV-RT-078)。
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReservedFact {
     /// `DNO` 参数(1..=1024)。
@@ -100,13 +101,27 @@ pub struct SaveState {
     /// 图像块布局覆盖:v555 与 0.495 共用容器 `0x1E0`,但描述符分别为
     /// A=1680/+0x88 与 A=1600/+0x78;由引擎按 `SemanticProfile` 注入。
     image_layout_override: Option<crate::image_block::Layout>,
-    /// DNO=1024 是否已被 `SAVE[MEM=99999]` 500 槽内存包占用(仅 v555)。
+    /// 带 `MEM` 的 SAVE 表在同一写盘窗口内重复预约 DNO 是否报错。
     ///
-    /// 置位后普通 `SAVE[DNO=1024]` 预约被拒绝;未置位(0.495 及更早)时
-    /// 1024 仍是合法普通块。由引擎按 `SemanticProfile::save_mem_pack` 注入。
-    mem_pack_reserved_dno: bool,
-    /// 未刷盘预约(DNO → 快照;同 DNO 覆盖)。
+    /// 官方 `SAVE 0x44b874:155`(v555)/`0x44dc19`(0.481)等:预约前查
+    /// `DAT_0086a13c[DNO] != 0` 即错误返回 -1,不存在“同 DNO 覆盖”;
+    /// 0.495/0.479 仍是既有替换语义。由引擎按
+    /// `SemanticProfile::save_mem_pack` 注入。
+    duplicate_dno_error: bool,
+    /// 未刷盘预约(DNO → 快照)。旧版同 DNO 覆盖;带 `MEM` 的表由
+    /// `duplicate_dno_error` 在预约入口拒绝重复(DIV-RT-078)。
     reservations: BTreeMap<u32, ReservedFact>,
+    /// 当前写盘窗口已暂存的 DNO(官方 `DAT_0086a13c` 的占用表)。
+    ///
+    /// 每次成功序列化(`SAVE[FILE]`/`SAVE[MEM]`)后清零,对应官方
+    /// `FUN_00469ac0(-1)` 释放全部块缓冲;重复预约只在同一窗口内成立。
+    /// 包含 `SAVE[MEM=99999]` 立即占用的 DNO=1024。
+    staged_dnos: BTreeSet<u32>,
+    /// 当前窗口由**普通 SAVE 预约**暂存的 DNO(不含内存包)。
+    ///
+    /// 用于区分“普通 1024 先、包后到”与已刷盘旧预约:前者包覆盖时
+    /// 需要留痕,后者只是更新盘上已有块。
+    staged_blocks: BTreeSet<u32>,
     /// `SAVE[MEM=n]` 的内存存档槽(n → 容器字节)。
     ///
     /// v555 处理体(`0x44b874`):`SAVE[MEM=n]` 把当前预约表按与
@@ -169,8 +184,10 @@ impl SaveState {
             learned_version: None,
             block_codec: None,
             image_layout_override: None,
-            mem_pack_reserved_dno: false,
+            duplicate_dno_error: false,
             reservations: BTreeMap::new(),
+            staged_dnos: BTreeSet::new(),
+            staged_blocks: BTreeSet::new(),
             mem_slots: BTreeMap::new(),
             packed_mem: None,
             mem_pack_pending: false,
@@ -380,7 +397,9 @@ impl SaveState {
     // ---------------------------------------------------- 同步契约(B1)
 
     /// `SAVE[DNO=n SET=@x]`:预约一块(块类型 0),**快照当前值**
-    /// (REA `0x44d73d`;同 DNO = 替换 `0x44c740`)。
+    /// (REA `0x44d73d`)。同 DNO 语义分代:0.495/0.479 替换(`0x44c740`),
+    /// 带 `MEM` 的表(0.481/0.494/0.500/0.555)直接错误 -1
+    /// (`0x44b874:155`,DIV-RT-078)。
     pub fn reserve(&mut self, dno: u32, var: VarRef, snap: &VarSnapshot) -> Result<(), Diag> {
         self.save_calls += 1;
         self.check_reservable_dno(dno)?;
@@ -395,6 +414,8 @@ impl SaveState {
                 image: None,
             },
         );
+        self.staged_dnos.insert(dno);
+        self.staged_blocks.insert(dno);
         Ok(())
     }
 
@@ -420,6 +441,8 @@ impl SaveState {
                 image: None,
             },
         );
+        self.staged_dnos.insert(dno);
+        self.staged_blocks.insert(dno);
         Ok(())
     }
 
@@ -456,6 +479,8 @@ impl SaveState {
                 image: Some(image.clone()),
             },
         );
+        self.staged_dnos.insert(dno);
+        self.staged_blocks.insert(dno);
         Ok(())
     }
 
@@ -497,15 +522,25 @@ impl SaveState {
         self.image_layout_override = layout;
     }
 
-    /// 声明 DNO=1024 已被 500 槽内存包占用(v555 `SemanticProfile`)。
-    pub fn set_mem_pack_reserved_dno(&mut self, reserved: bool) {
-        self.mem_pack_reserved_dno = reserved;
+    /// 声明 v555 的「同一写盘窗口重复预约 DNO = 错误」语义。
+    ///
+    /// 证据:v555 `SAVE 0x44b874:155` 在写块前查 `DAT_0086a13c[DNO]` 非零
+    /// 即 `FUN_0046c040` + 返回 -1;整个处理体没有 1024 特例。0.495 及更早
+    /// 保持既有「同 DNO 替换」(`DIV-RT-042`/`0x44c740`)。
+    pub fn set_duplicate_dno_error(&mut self, reject: bool) {
+        self.duplicate_dno_error = reject;
     }
 
     /// 预约 DNO 的统一校验。
     ///
     /// 下界交给 VM(`FILE` 1 基、`MEM` 0 基);宿主接受 0..=1024,避免
-    /// `SAVE[MEM=n DNO=0]` 被宿主误判致命。v555 的 1024 归内存包所有。
+    /// `SAVE[MEM=n DNO=0]` 被宿主误判致命。
+    ///
+    /// **1024 不是保留号**:带 `MEM` 的 SAVE 处理体对普通
+    /// `SAVE[DNO=1024 SET=…]` 与其它 DNO 同路(证据:全函数无 0x400
+    /// 比较);`SAVE[MEM=99999]` 的包由 `pack_mem()` 直接写 DNO=1024
+    /// 块缓冲。普通块重复预约由 [`Self::set_duplicate_dno_error`] 拒绝;
+    /// 包与普通 1024 相遇时包覆盖(官方不查重复)。
     fn check_reservable_dno(&self, dno: u32) -> Result<(), Diag> {
         if !(0..=1024).contains(&dno) {
             return Err(error::recoverable(
@@ -513,10 +548,13 @@ impl SaveState {
                 format!("SAVE DNO={dno} 越界(0..=1024)"),
             ));
         }
-        if self.mem_pack_reserved_dno && dno == 1024 {
+        if self.duplicate_dno_error && self.staged_dnos.contains(&dno) {
             return Err(error::recoverable(
                 code::ARG_RANGE,
-                "SAVE DNO=1024 保留给 SAVE[MEM=99999] 的 500 槽内存包".to_string(),
+                format!(
+                    "带 MEM 的 SAVE DNO={dno} 在同一写盘窗口内重复预约\
+                     (官方 SAVE 处理体的重复检查直接返回 -1,不覆盖前一块)"
+                ),
             ));
         }
         Ok(())
@@ -592,8 +630,14 @@ impl SaveState {
             )
         })?;
         if had_pack {
+            // 官方 `FUN_00469ac0(-1)` 序列化后释放块缓冲,包也不复存在。
             self.mem_pack_pending = false;
+            self.packed_mem = None;
         }
+        // 官方 `FUN_00469ac0(-1)`:写完文件后释放全部块缓冲/占用表,
+        // 下一窗口的同 DNO 预约重新从零开始。
+        self.staged_dnos.clear();
+        self.staged_blocks.clear();
         self.refresh_slots();
         for diag in image_layout_diags {
             self.push_diag(diag);
@@ -610,14 +654,32 @@ impl SaveState {
     pub fn save_mem(&mut self, slot: u32) -> Result<(), Diag> {
         let mut diags = Vec::new();
         let preserved = BTreeMap::new();
+        // 官方 MEM 分支序列化的是当前块缓冲,`SAVE[MEM=99999]` 的包
+        // 已经暂存在 DNO=1024 缓冲里,因此内存槽容器也带该块;序列化
+        // 后 `FUN_00469ac0(-1)` 清全部缓冲,包不再等下一次文件存档。
+        let mem_pack_block = if self.mem_pack_pending {
+            self.packed_mem.clone()
+        } else {
+            None
+        };
+        let had_pack = mem_pack_block.is_some();
         let bytes = self.build_container(
             None,
             &format!("SAVE[MEM={slot}]"),
             &mut diags,
             preserved,
-            None,
+            mem_pack_block,
         )?;
         self.mem_slots.insert(slot, bytes);
+        if had_pack {
+            // 官方 `FUN_00469ac0(-1)` 序列化后释放块缓冲,包也不复存在。
+            self.mem_pack_pending = false;
+            self.packed_mem = None;
+        }
+        // `SAVE[MEM=n]` 与 `SAVE[FILE]` 共用块缓冲;官方处理体返回前也调
+        // `FUN_00469ac0(-1)`(0x44b874 MEM 分支),占用表同样清零。
+        self.staged_dnos.clear();
+        self.staged_blocks.clear();
         for diag in diags {
             self.push_diag(diag);
         }
@@ -634,13 +696,14 @@ impl SaveState {
     /// - `packed_total = Σ(8 + comp_len)`,`unpacked_total = Σ(8 + raw_len)`
     ///   (均不含 12 字节头);
     /// - 压缩分支由 `DAT_00872164` 选:0 → `compress2(level=1)`(zlib),
-    ///   非 0 → `YSSnp_Compress`。该全局在 555 构建里位于 BSS(初始 0),
-    ///   全量反编译只有读点、没有写点 ⇒ 当前按 zlib level 1 落包;
-    ///   不跟随存档容器的 Snappy 层(`DAT_0059b6f8` 是另一路)。
+    ///   非 0 → `YSSnp_Compress`。555 构建全量反编译只有读点、没有写点
+    ///   (BSS 初值 0);0.481/0.500 官方存档的包槽首字节仍是 `78 01`。
+    ///   没有证据表明运行期会进入 Snappy 分支,故按 zlib level 1 对齐
+    ///   (`aligned-stub`),不跟随存档容器的 Snappy 层。
     ///
-    /// 产物是**完整 YSSD 块体**(12 字节块头 + 500 条槽记录),下一次
-    /// `SAVE[FILE]` 把它原样写成 DNO=1024;写盘成功后清除待写标记,
-    /// 避免后续系统存档(gsd/config/...)误带内存包。
+    /// 产物是**完整 YSSD 块体**(12 字节块头 + 500 条槽记录),立即作为
+    /// DNO=1024 暂存块;下一次 `SAVE[FILE]` 或 `SAVE[MEM=n]` 序列化块表
+    /// 时写出,成功后清除缓冲(官方 `FUN_00469ac0(-1)`)。
     pub fn pack_mem(&mut self) -> Result<(), Diag> {
         let mut body = Vec::new();
         let mut packed_total: u32 = 0;
@@ -689,6 +752,21 @@ impl SaveState {
         out.extend_from_slice(&body);
         self.packed_mem = Some(out);
         self.mem_pack_pending = true;
+        // 官方 `FUN_0044d82c` 把包直接写进块缓冲 `DAT_0086a03c`
+        // = 块指针数组(基址 `0x86903c`)的 DNO=1024 项(`0x86a03c`),即**立即暂存** DNO=1024;同窗口已有的
+        // 普通 1024 预约被覆盖(官方不查重复),包后普通 1024 再预约则
+        // 命中重复检查(0x44b874:155)。
+        if self.staged_blocks.remove(&1024) {
+            self.push_diag(error::verbose(
+                code::CONTAINER,
+                "SAVE[MEM=99999] 内存包覆盖同窗口预约的 DNO=1024\
+                 (官方包直接写块缓冲,不执行重复检查)"
+                    .to_string(),
+            ));
+        }
+        // 旧窗口残留的 1024 预约也一并丢弃:包会覆盖盘上该块。
+        self.reservations.remove(&1024);
+        self.staged_dnos.insert(1024);
         Ok(())
     }
 
@@ -891,12 +969,6 @@ impl SaveState {
         preserved: BTreeMap<u32, Vec<u8>>,
         mem_pack_block: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, Diag> {
-        if mem_pack_block.is_some() && self.reservations.contains_key(&1024) {
-            return Err(error::recoverable(
-                code::ARG_RANGE,
-                format!("{source}: DNO=1024 同时被预约块与 SAVE[MEM=99999] 内存包占用"),
-            ));
-        }
         let codec = self.block_codec.unwrap_or_default();
         let version = match self
             .container_version
@@ -1021,6 +1093,12 @@ impl SaveState {
     pub fn save_end(&mut self) {
         self.saveend_calls += 1;
         self.reservations.clear();
+        self.staged_dnos.clear();
+        self.staged_blocks.clear();
+        // 官方 `FUN_00469ac0(-1)` 连块缓冲一起释放:未冲刷的 500 槽包
+        // 也在这里丢弃,不能留到下一次 SAVE[FILE]。
+        self.mem_pack_pending = false;
+        self.packed_mem = None;
     }
 
     /// `LOAD[FILE DNO=n]`:读一块恢复数据(容器解析;写回归 VM)。
@@ -2313,25 +2391,35 @@ fn mem_save_accepts_dno_zero() {
         .expect("MEM 的 DNO=0 必须被接受");
 }
 
-/// v555 的文件 DNO=1024 归 `SAVE[MEM=99999]` 内存包所有,普通预约被拒绝。
+/// v555 的 DNO=1024 **不是**保留号;只有同一写盘窗口的重复预约才报错。
+///
+/// 证据:v555 `SAVE 0x44b874:155` 对 `DAT_0086a13c[DNO] != 0` 统一报错,
+/// 处理体全程没有 `0x400` 特例;普通 1024 与其它 DNO 同路。0.495 保持
+/// 既有「同 DNO 替换」(`0x44c740`)。
 #[test]
-fn mem_pack_reserves_dno_1024_only_on_v555() {
-    let root = std::path::PathBuf::from("target/tmp/sv-dno1024-reserved");
+fn dno_1024_is_ordinary_and_v555_rejects_duplicate_reservation() {
+    let root = std::path::PathBuf::from("target/tmp/sv-dno1024-ordinary");
     let snap = VarSnapshot {
         ty: ElemType::Int,
         dims: Vec::new(),
         data: vec![Value::Int(7)],
     };
+    let mut v555 = SaveState::new(&root, false);
+    v555.set_duplicate_dno_error(true);
+    v555.reserve(1024, VarRef::new(VarSpace::At, 0x0a43), &snap)
+        .expect("v555 普通 DNO=1024 必须被接受(无 0x400 特例)");
+    let err = v555
+        .reserve(1024, VarRef::new(VarSpace::At, 0x0a43), &snap)
+        .expect_err("v555 同窗口重复预约必须报错");
+    assert_eq!(err.code, code::ARG_RANGE);
+
     let mut legacy = SaveState::new(&root, false);
     legacy
         .reserve(1024, VarRef::new(VarSpace::At, 0x0a43), &snap)
-        .expect("旧版 1024 仍是普通块");
-    let mut v555 = SaveState::new(&root, false);
-    v555.set_mem_pack_reserved_dno(true);
-    let err = v555
+        .expect("旧版 1024 是普通块");
+    legacy
         .reserve(1024, VarRef::new(VarSpace::At, 0x0a43), &snap)
-        .expect_err("v555 的 1024 必须被内存包占用");
-    assert_eq!(err.code, code::ARG_RANGE);
+        .expect("旧版同 DNO 仍是替换语义");
 }
 
 /// 官方 `SAVE[FILE]` 是更新已有容器:未预约的旧块必须保留。
@@ -2423,6 +2511,112 @@ fn mem_99999_pack_is_written_to_next_file_save_only() {
     let save = yu_format::yssd::YssdSave::parse(&bytes, b"config.sd").expect("parse");
     assert!(save.entry(1024).is_none(), "系统存档不得带内存包");
     assert_eq!(save.entries.len(), 1);
+}
+
+/// 包后普通 `SAVE[DNO=1024]`:官方包已写进块缓冲(重复表非零),
+/// 后到者按 `0x44b874:155` 错误返回 -1。
+#[test]
+fn mem_pack_stages_dno_1024_and_rejects_later_reservation() {
+    let root = std::path::PathBuf::from("target/tmp/sv-mem-pack-dup");
+    let snap = VarSnapshot {
+        ty: ElemType::Int,
+        dims: Vec::new(),
+        data: vec![Value::Int(7)],
+    };
+    let mut state = SaveState::new(&root, false);
+    state.set_duplicate_dno_error(true);
+    state.pack_mem().expect("pack");
+    let err = state
+        .reserve(1024, VarRef::new(VarSpace::At, 0x0a43), &snap)
+        .expect_err("包已暂存 1024,普通 1024 必须报重复");
+    assert_eq!(err.code, code::ARG_RANGE);
+}
+
+/// 普通 1024 先预约、包后到:官方 `FUN_0044d82c` 直接覆盖块缓冲,
+/// 包赢且不报重复;内核保留普通预约后由包最后覆盖,并留 verbose 痕迹。
+#[test]
+fn mem_pack_after_ordinary_1024_overwrites_pack_block() {
+    let root = std::path::PathBuf::from("target/tmp/sv-mem-pack-overwrite");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create root");
+    let snap = VarSnapshot {
+        ty: ElemType::Int,
+        dims: Vec::new(),
+        data: vec![Value::Int(7)],
+    };
+    let mut state = SaveState::new(&root, true);
+    state.set_container_version(0x1E0);
+    state.set_block_codec(yu_format::yssd::BlockCodec::Zlib);
+    state.set_duplicate_dno_error(true);
+    state
+        .reserve(1024, VarRef::new(VarSpace::At, 0x0a43), &snap)
+        .expect("ordinary 1024 first");
+    state.pack_mem().expect("pack after");
+    let packed = state.packed_mem().expect("packed").to_vec();
+    state.flush("save00002.sd").expect("flush");
+    let bytes = std::fs::read(root.join("save00002.sd")).expect("read");
+    let save = yu_format::yssd::YssdSave::parse(&bytes, b"save00002").expect("parse");
+    let entry = save.entry(1024).expect("DNO=1024");
+    assert_eq!(
+        entry.compressed,
+        packed[12..],
+        "包后到必须覆盖普通 1024 块,不是普通快照"
+    );
+    let diags = state.take_diags();
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.detail.contains("内存包覆盖同窗口预约的 DNO=1024")),
+        "覆盖必须有痕迹(官方静默): {:?}",
+        diags
+    );
+}
+
+/// `SAVE[MEM=n]` 序列化当前块缓冲(含包),成功后包不再等下一次文件存档。
+#[test]
+fn mem_save_consumes_staged_pack() {
+    let root = std::path::PathBuf::from("target/tmp/sv-mem-pack-memsave");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create root");
+    let mut state = SaveState::new(&root, true);
+    state.set_container_version(0x1E0);
+    state.set_block_codec(yu_format::yssd::BlockCodec::Zlib);
+    state.pack_mem().expect("pack");
+    state.save_mem(5).expect("SAVE[MEM=5] consumes the staged buffer");
+    let mem_bytes = state.mem_slot(5).expect("memory slot");
+    let mem_save = yu_format::yssd::YssdSave::parse(mem_bytes, b"mem5").expect("parse mem slot");
+    assert!(
+        mem_save.entry(1024).is_some(),
+        "内存槽容器应带当前块缓冲里的 DNO=1024 包"
+    );
+    state.flush("save00003.sd").expect("flush");
+    let bytes = std::fs::read(root.join("save00003.sd")).expect("read");
+    let save = yu_format::yssd::YssdSave::parse(&bytes, b"save00003").expect("parse");
+    assert!(
+        save.entry(1024).is_none(),
+        "MEM 存档已清空块缓冲,后续文件存档不得再带包"
+    );
+}
+
+/// `SAVEEND` 丢弃未冲刷的包:官方 `0x44dc1c` 调 `FUN_00469ac0(-1)`,
+/// 连块缓冲一起释放,后续 `SAVE[FILE]` 不得再带 DNO=1024。
+#[test]
+fn save_end_discards_unflushed_pack() {
+    let root = std::path::PathBuf::from("target/tmp/sv-mem-pack-saveend");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create root");
+    let mut state = SaveState::new(&root, true);
+    state.set_container_version(0x1E0);
+    state.set_block_codec(yu_format::yssd::BlockCodec::Zlib);
+    state.pack_mem().expect("pack");
+    state.save_end();
+    state.flush("save00004.sd").expect("flush after SAVEEND");
+    let bytes = std::fs::read(root.join("save00004.sd")).expect("read");
+    let save = yu_format::yssd::YssdSave::parse(&bytes, b"save00004").expect("parse");
+    assert!(
+        save.entry(1024).is_none(),
+        "SAVEEND 已释放块缓冲,包不得留到下一次文件存档"
+    );
 }
 
 /// 空内存包:官方全空存档(`<v500-relirium>`/`<v555-pieces>`)的 DNO=1024 是
