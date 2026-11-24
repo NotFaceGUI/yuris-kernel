@@ -3231,7 +3231,20 @@ impl ApplicationHandler for App {
                 }
             }
             let pos = self.engine.current_position();
-            if bytes_len > 0 || layout_chars > 0 || draws > 0 || self.frames % 120 == 0 {
+            let slen = |id: u16| {
+                self.engine.debug_var_value(id).and_then(|v| match v {
+                    yu_rt::value::Value::Str(b) => Some(b.len()),
+                    _ => None,
+                })
+            };
+            let (s6120, s6123, s6208, s6209) = (slen(6120), slen(6123), slen(6208), slen(6209));
+            if bytes_len > 0
+                || layout_chars > 0
+                || draws > 0
+                || s6123.unwrap_or(0) > 0
+                || s6208.unwrap_or(0) > 0
+                || self.frames % 120 == 0
+            {
                 // 目标层基图来源链:文本合成只认 `layer.texture`,但一个
                 // `Asset` 键可能由 `CG[FILE]`/`CGACT[COPY2]`/`LOAD` 三条
                 // 路径之一写入。判「该层本该是空白表面还是图片」必须知道
@@ -3260,7 +3273,7 @@ impl ApplicationHandler for App {
                     }
                 }
                 host_line!(
-                    "[text-trace] host={} engine={} bytes={} flags={} layout={} layout_tgt={:?} draws={} runs={} layers={} rep(draws={} glyphs={} missing={} skipped_text={} failed_tgt={}) diags={:?} font={:?} size={}x{} origin={:?} pos={:?}{}",
+                    "[text-trace] host={} engine={} bytes={} flags={} layout={} layout_tgt={:?} draws={} runs={} layers={} rep(draws={} glyphs={} missing={} skipped_text={} failed_tgt={}) diags={:?} font={:?} size={}x{} origin={:?} v1023={:?} v6205={:?} v6240={:?} v6237={:?} v6124={:?} v6125={:?} v1150={:?} v1153={:?} s6120={:?} s6123={:?} s6208={:?} s6209={:?} pos={:?}{}",
                     self.frames,
                     self.engine.frame(),
                     bytes_len,
@@ -3280,6 +3293,18 @@ impl ApplicationHandler for App {
                     font_size.0,
                     font_size.1,
                     origin,
+                    self.engine.debug_var_int(1023),
+                    self.engine.debug_var_int(6205),
+                    self.engine.debug_var_int(6240),
+                    self.engine.debug_var_int(6237),
+                    self.engine.debug_var_int(6124),
+                    self.engine.debug_var_int(6125),
+                    self.engine.debug_var_int(1150),
+                    self.engine.debug_var_int(1153),
+                    s6120,
+                    s6123,
+                    s6208,
+                    s6209,
                     pos,
                     draw_detail
                 );
