@@ -45,6 +45,9 @@
 //!   共享 `text.rs` 不分支;其余版本保持 legacy 形态。
 //!
 //! 555 是独立商业分支,精确匹配;556/600 没有取证,按 legacy 形态处理。
+//! **0.500 归入 555 商业族**(见 [`SemanticProfile::from_yscm_version`]):
+//! 121 槽命令表与同族处理体,差异只在少数命令(如 0.500 的 `MOVIE2*`/
+//! `REGINFO` 是空桩)与缩略图块布局(0.500 尚无样本)。
 
 /// `VARINFO[SJISCODE]` 的语义形态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,8 +213,11 @@ pub struct SemanticProfile {
     pub save_image: SaveImageMode,
     /// `SAVE[MEM=99999]` / `LOAD[FILE DNO=1024]` 的 500 槽内存包形态。
     ///
-    /// 证据只覆盖 v555 文件分支(`0x4447c8` → `FUN_004453f4`);0.495 及更早
-    /// 的 `DNO=1024` 仍是普通块,不得无条件改道。
+    /// 证据覆盖四个带 `MEM` 的构建:0.481(`0x447406`)、0.494
+    /// (`0x4472c0`)、0.500(`0x474feb`)与 v555(`0x4447c8:346`)的
+    /// LOAD 文件分支都有 `DNO == 0x400`;0.495 SDK 表没有 `MEM`,其
+    /// LOAD 处理体全段无 0x400 分支,1024 仍是普通块。由
+    /// [`Self::from_boot`] 按命令表能力派生,不能只看版本号。
     pub save_mem_pack: bool,
 }
 
@@ -219,13 +225,23 @@ impl SemanticProfile {
     /// 由工程命令表版本派生。
     ///
     /// 版本阈值来自 v555 处理体的实测差异(见模块文档);0.495 与更早版本
-    /// 一律 `Inert` / `Runtime`。
+    /// 一律 `Inert` / `Runtime`。注意 [`Self::save_mem_pack`] 在无命令表时
+    /// 只能按 v555 保守置位,真实工程必须用 [`Self::from_boot`] 按 `MEM`
+    /// 参数能力覆盖(0.481/0.494/0.500 商业表也带 `MEM`)。
     #[must_use]
     pub fn from_yscm_version(version: u32) -> Self {
         // 555 是独立商业分支;556/600 没有取证,不得继承 555 形态。
         // (2026-11-21 全量反编译:6 个 555 构建的 121 槽分发表一致,
         //  但处理体语义分三族;更高版本无样本。)
-        let v555 = version == 555;
+        //
+        // 0.500 归入**同一商业族**(2026-11-24 `<v500-relirium>` 取证):
+        // - `ysc.ybn` = 121 槽、与 v555 仅版本字段与 `GRADATION` kind 不同;
+        // - 处理体 `TEXT`/`CGINFO`/`VARINFO`/`RETURNCODE`/`GOSUB`/`RETURN`/
+        //   `LET`/`VARACT`/`SAVE`/`LOAD` 归一化反编译与 v555 逐行一致;
+        // - 0.500 分发表默认体/空操作体名单与 v555 清单逐名一致。
+        // 少数差异另由分发表覆盖(`MOVIE2*`/`REGINFO` 在 0.500 是 29B
+        // 空桩);`save_image` 保守留在容器档案,理由见该字段赋值处。
+        let v555 = matches!(version, 500 | 555);
         Self {
             ysc_version: version,
             window_payload: if v555 {
@@ -264,7 +280,11 @@ impl SemanticProfile {
                 RefIntParamMode::Value
             },
             partial_index: v555,
-            save_image: if v555 {
+            // 缩略图块只对**精确 555** 取证(A=1680/+0x88)。0.500 官方
+            // 存档(`<v500-relirium>/save/*.sd`,195 块)没有 DNO=3 缩略图块,
+            // 也没有 btype=1 配置块;写侧若按 1680 描述符落盘会与官方产物
+            // 不同形 ⇒ 0.500 保持容器档案,等有 0.500 DNO=3 样本再裁决。
+            save_image: if version == 555 {
                 SaveImageMode::V555
             } else {
                 SaveImageMode::ContainerProfile
@@ -274,17 +294,42 @@ impl SemanticProfile {
     }
 
     /// 由已装载的启动表派生。
+    ///
+    /// `save_mem_pack` 不能只看版本号:0.481/0.494/0.500/0.555 商业表的
+    /// `SAVE/LOAD` 带 `MEM` 参数,0.495 SDK 表没有。四个带 `MEM` 的构建
+    /// 都已反汇编确认 `LOAD` 文件分支有 `DNO == 0x400` 的 500 槽读取、
+    /// `SAVE` 处理体在 MEM=99999 打包并检查重复 DNO;因此按**命令表能力**
+    /// 判定,不按版本字面量。
     #[must_use]
     pub fn from_boot(boot: &crate::tables::BootTables) -> Self {
-        Self::from_yscm_version(boot.yscm.version)
+        let mut profile = Self::from_yscm_version(boot.yscm.version);
+        // 真实工程 SAVE/LOAD 两表同时带 MEM;夹具/裁剪表只补一侧也认。
+        let has_mem = ["SAVE", "LOAD"].iter().any(|name| {
+            boot.yscm
+                .index_of(name)
+                .and_then(|i| boot.yscm.commands.get(i))
+                .is_some_and(|c| c.params.iter().any(|p| p.name == "MEM"))
+        });
+        profile.save_mem_pack = has_mem;
+        profile
     }
 
     /// 555 独立商业分支(字面匹配;556/600 不继承)。
     ///
-    /// 处理器/宿主统一用本方法,不再各自比较 `yscm.version == 555`。
+    /// 只用于**尚未在 0.500 取证**的 555 专属分支(如 0.500 的静态
+    /// 执行编码表);脚本语义/分发表/独立运行面请用
+    /// [`Self::is_v555_family`]。
     #[must_use]
     pub fn is_v555(&self) -> bool {
         self.ysc_version == 555
+    }
+
+    /// 555 商业族(0.500 / 0.555):121 槽命令表与同族处理体。
+    ///
+    /// 0.500 的证据与差异清单见 [`Self::from_yscm_version`]。
+    #[must_use]
+    pub fn is_v555_family(&self) -> bool {
+        matches!(self.ysc_version, 500 | 555)
     }
 }
 
@@ -320,6 +365,23 @@ mod tests {
         assert_eq!(p.ref_int_param, RefIntParamMode::SlotId);
         assert_eq!(p.save_image, SaveImageMode::V555);
         assert!(p.save_mem_pack);
+
+        // 0.500 是 555 商业族:命令表/处理体同族;缩略图块没有 0.500 样本,
+        // 保持 `ContainerProfile`(见 `from_yscm_version` 的字段注释)。
+        let p = SemanticProfile::from_yscm_version(500);
+        assert_eq!(p.ysc_version, 500);
+        assert_eq!(p.window_payload, WindowPayloadMode::RecordDelimited);
+        assert_eq!(p.text, TextMode::FileArray);
+        assert_eq!(p.textinfo, TextInfoMode::Inert);
+        assert_eq!(p.returncode, ReturnCodeMode::EndOnly);
+        assert_eq!(p.varinfo_sjis, SjisCodeMode::FirstChar);
+        assert_eq!(p.script_decls, ScriptDeclMode::LoadTime);
+        assert_eq!(p.ref_int_param, RefIntParamMode::SlotId);
+        assert!(p.partial_index);
+        assert_eq!(p.save_image, SaveImageMode::ContainerProfile);
+        assert!(p.save_mem_pack);
+        assert!(!p.is_v555(), "精确 555 判据不得吞并 0.500");
+        assert!(p.is_v555_family());
 
         // 555 是独立分支;556/600 没有证据,不得自动继承。
         for version in [556, 600] {

@@ -499,13 +499,17 @@ impl Vm {
         Ok(StepOutcome::Continue)
     }
 
-    /// `FILEINFO[CGFILE EXIST]`:图像资产存在性(原 key + yscfg 扩展名序 +
-    /// 通用 `.webp`)。
+    /// `FILEINFO[CGFILE EXIST]`:图像资产存在性(原 key + yscfg 扩展名序)。
     ///
     /// 两代官方都读 `CGFILE`:0.495 `0x44286c`(kind 2 → `ebx=3` →
-    /// `0x442c7f`)与 v555 `0x43eca8`(kind 2 → `FUN_0043f770`)。v555 的
-    /// 图像扩展名表在 `.psb` 之后还有 `.webp`(`0x878a28`);`.webp` 按
-    /// 通用扩展名能力追加,不做版本门控。
+    /// `0x442c7f`)与 v555 `0x43eca8`(kind 2 → `FUN_0043f770`)。
+    ///
+    /// 扩展名一律走 `yu_format::image_ext` 的共享码表(与 `CG[FILE]`、
+    /// `CGINFO`、`resolve_asset_size` 同源):0.495 是
+    /// `png/bmp/jpg/gif/psb`,0.500 商业族是 `bmp/png/jpg/gif/ydg/...`。
+    /// 这里曾内联 0.495 表,导致 0.500 的 `_off/_over/...` 探测全部落空,
+    /// `es_buttonque.yst` 判「ボタン画像指定が正しくありません」并 `END`,
+    /// 标题只画出显式给五个名字的那一个按钮(DIV-GFX-094 同源漏点)。
     fn cg_file_exists(&self, bytes: &[u8]) -> bool {
         let exists = |key: &[u8]| {
             yu_vfs::LookupKey::new(key, yu_vfs::Codec::Cp932)
@@ -535,28 +539,24 @@ impl Vm {
         } else {
             order
         };
-        let mut exts: Vec<&'static [u8]> = Vec::new();
+        let v500 = self.tables().boot.yscm.version == 500;
+        let mut exts: Vec<&'static str> = Vec::new();
         for code in order {
-            let ext: &'static [u8] = match code {
-                1 => b"png",
-                2 => b"bmp",
-                3 => b"jpg",
-                4 => b"gif",
-                5 => b"psb",
-                // 未取证码不猜;`.webp` 在下面按通用能力补齐。
-                _ => continue,
+            let Some(ext) = yu_format::image_ext::extension(code, v500) else {
+                continue;
             };
-            exts.push(ext);
+            // 共享表带前导点;这里拼 key 时统一自己加点,先剥掉。
+            exts.push(ext.trim_start_matches('.'));
         }
-        // v555 扩展名表 `.png/.bmp/.jpg/.gif/.psb/.webp` 的最后一项。
-        // 0.495 表没有 `.webp`,但旧语料不含该格式,通用追加不改变旧行为。
-        if !exts.contains(&b"webp".as_slice()) {
-            exts.push(b"webp");
+        // 0.495 表没有 `.webp`;旧语料不含该格式,通用追加不改变旧行为
+        // (v555 表已含 `.webp`,去重后不会重复探测)。
+        if !exts.contains(&"webp") {
+            exts.push("webp");
         }
         for ext in exts {
             let mut key = bytes.to_vec();
             key.push(b'.');
-            key.extend_from_slice(ext);
+            key.extend_from_slice(ext.as_bytes());
             if exists(&key) {
                 return true;
             }
@@ -727,7 +727,9 @@ impl Vm {
     ///   变量本身 Int[256,128];旧实现存整组导致官方 QLOAD 维数不符);
     /// - **预约即快照**:`SAVE[DNO]` 时刻 `0x44d73d` 序列化当前值(zlib 压缩
     ///   后入预约表),`SAVE[FILE]` 只写文件头/偏移表并流出预约块
-    ///   (`0x44cd5a..`);同 DNO 重复预约 = 替换(`0x44c740`);
+    ///   (`0x44cd5a..`);同 DNO 重复预约:0.495/0.479 替换(`0x44c740`),
+    ///   带 `MEM` 的表(0.481/0.494/0.500/0.555)`0x44b874:155` 直接
+    ///   错误返回 -1(DIV-RT-078);
     /// - `G_<族><组>=1`:按首个在场旗标(官方级联序 G_INT→G_INT2→G_INT3→
     ///   G_INT4→G_FLT→…)定 (类型,组),枚举全局变量表逐变量子块化
     ///   (块类型 2;`0x44ca8a..0x44cc57`);
@@ -856,16 +858,11 @@ impl Vm {
                 return Ok(StepOutcome::Continue);
             }
             let dno = dno as u32;
-            // v555 的文件 DNO=1024 归 `SAVE[MEM=99999]` 内存包所有;普通块
-            // 预约会与内存包静默同 DNO 覆盖。旧版 1024 仍是合法普通块。
-            if mem.is_none() && dno == 1024 && self.semantics().save_mem_pack {
-                self.report(diag::recoverable(
-                    code::rt::CMD_SLOT,
-                    Boundary::Script,
-                    "SAVE DNO=1024 保留给 SAVE[MEM=99999] 的 500 槽内存包;普通块预约被拒绝",
-                ));
-                return Ok(StepOutcome::Continue);
-            }
+            // v555/0.481/0.494/0.500 的 DNO=1024 **没有**预约特例:官方
+            // SAVE 处理体全程只做通用重复检查(`DAT_0086a13c[DNO] != 0`
+            // → 错误 -1),普通 `SAVE[DNO=1024 SET=…]` 与其它 DNO 同路。
+            // `SAVE[MEM=99999]` 的包由官方直接写 DNO=1024 块缓冲,
+            // 不经过本分支;无内容的 DNO 仍是“缺 SET/G_*”形态,照常挂号。
             if layer_id {
                 // `SAVE[ID IDNO]` = 图层快照(块类型 1)。官方在命令处理器里
                 // 直接读图层表面(REA `0x4477c0` 读取端);`IDNO` 在场时先把

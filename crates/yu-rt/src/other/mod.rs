@@ -1,8 +1,10 @@
-//! 独立商业分支运行面(中性目录名 `other`;只在 `SemanticProfile::is_v555()`
-//! 为真时安装)。
+//! 独立商业分支运行面(中性目录名 `other`;只在
+//! [`SemanticProfile::is_v555_family`](crate::semantics::SemanticProfile::is_v555_family)
+//! 为真时安装,即 0.500 / 0.555)。
 //!
-//! 共享 `yu-rt` 只保留通用 VM 核与旧版 handler;本模块承载 555 商业分支的
-//! 命令、系统变量、剧本/启动编排。旧版不安装,行为保持 `c1549eb`。
+//! 共享 `yu-rt` 只保留通用 VM 核与旧版 handler;本模块承载 555 商业族
+//! (0.500/0.555)的命令、系统变量、剧本/启动编排。旧版不安装,
+//! 行为保持 `c1549eb`。
 
 mod gosub;
 mod handlers;
@@ -29,6 +31,11 @@ pub(crate) struct State {
     pub(crate) statics_applied: std::collections::BTreeSet<u32>,
     /// `PRODUCT[COM=22]` 的跨行词法状态(`/* ... */` 块注释)。
     pub(crate) scenario_lex: scenario::LexState,
+    /// `_STR`/`_INT` 读侧发现的静默回退(未声明/错型/非字符串系统变量)。
+    ///
+    /// 读路径是 `&Vm`(`debug_sysvar`/表达式求值都只借不可变),不能直接
+    /// `report`;这里先入队,`Vm::step_command` 在命令结束后统一带位置发出。
+    pub(crate) read_diags: std::cell::RefCell<Vec<Diag>>,
 }
 
 impl State {
@@ -40,6 +47,7 @@ impl State {
             gosub_frames: std::collections::BTreeMap::new(),
             statics_applied: std::collections::BTreeSet::new(),
             scenario_lex: scenario::LexState::default(),
+            read_diags: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -49,9 +57,14 @@ pub(crate) fn install(vm: &mut Vm) {
 }
 
 /// 安装后补跑入口脚本的装载期声明(入口脚本在安装前已装载)。
+///
+/// 失败不能吞:装载期声明缺失会让后续 `GOSUB` 读到未声明变量(实机
+/// Fatal);诊断带上脚本/命令位置后可定位到具体声明点。
 pub(crate) fn apply_initial_script_statics(vm: &mut Vm) {
     if let Some(script_id) = vm.main_script_id() {
-        let _ = vm.other_on_script_loaded(script_id);
+        if let Some(Err(d)) = vm.other_on_script_loaded(script_id) {
+            vm.report(d);
+        }
     }
 }
 
@@ -101,5 +114,20 @@ impl Vm {
             return None;
         }
         Some(self.text_window_none() || self.text_line_complete_now())
+    }
+
+    /// 把 `_STR`/`_INT` 读侧入队的静默回退诊断带命令位置发出。
+    pub(crate) fn drain_other_read_diags(&mut self) {
+        let Some(state) = self.other.as_ref() else {
+            return;
+        };
+        // 热路径(每条命令):空队列只做一次 `borrow()` 判空,不分配 Vec。
+        if state.read_diags.borrow().is_empty() {
+            return;
+        }
+        let queued: Vec<Diag> = state.read_diags.borrow_mut().drain(..).collect();
+        for d in queued {
+            self.report(d);
+        }
     }
 }

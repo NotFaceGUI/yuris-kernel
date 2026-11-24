@@ -464,10 +464,25 @@ impl VarSlot {
     }
 }
 
+/// 浮点 → int 的官方口径(x87 `FISTP qword`)。
+///
+/// v555 LET 的 int 求值器 `0x420cf4` 置 FPU `RC=11`(向零)后
+/// `fistp qword`;超出 i64 范围或 NaN/Inf 时写整数不定值
+/// `0x8000000000000000`(= `i64::MIN`)。Rust `as i64` 会饱和到边界,
+/// 与 x87 不同;这里显式按官方不定值处理(DIV-RT-077)。
+fn trunc_f64_to_i64(f: f64) -> i64 {
+    const TWO63: f64 = 9_223_372_036_854_775_808.0;
+    if f.is_finite() && f < TWO63 && f >= -TWO63 {
+        f as i64
+    } else {
+        i64::MIN
+    }
+}
+
 fn coerce_to(ty: ElemType, v: &Value) -> Value {
     match (ty, v) {
         (ElemType::Int, Value::Int(i)) => Value::Int(*i),
-        (ElemType::Int, Value::Float(f)) => Value::Int(*f as i64),
+        (ElemType::Int, Value::Float(f)) => Value::Int(trunc_f64_to_i64(*f)),
         (ElemType::Int, Value::Str(s)) => {
             let t = String::from_utf8_lossy(s);
             Value::Int(t.trim().parse::<i64>().unwrap_or(0))
@@ -489,7 +504,7 @@ fn coerce_to(ty: ElemType, v: &Value) -> Value {
 fn coerce_to_owned(ty: ElemType, v: Value) -> Value {
     match (ty, v) {
         (ElemType::Int, Value::Int(i)) => Value::Int(i),
-        (ElemType::Int, Value::Float(f)) => Value::Int(f as i64),
+        (ElemType::Int, Value::Float(f)) => Value::Int(trunc_f64_to_i64(f)),
         (ElemType::Int, Value::Str(s)) => {
             let t = String::from_utf8_lossy(&s);
             // 缺省: 不可解析的数字串按 0(与 coerce_to 同语义)。
@@ -1227,5 +1242,33 @@ mod tests {
             Value::Int(123).cast_to_str().unwrap(),
             Value::Str(b"123".to_vec())
         );
+    }
+
+    /// v555 int 目标写入的 RHS 转换(DIV-RT-077)。
+    ///
+    /// 浮点:官方 `0x420cf4` 置 FPU `RC=11`(向零截断)后 `fistp qword`,
+    /// 与 Rust `as i64` 同为截断;字符串:十进制解析(官方分支未取证,
+    /// 写侧已留可恢复诊断)。
+    #[test]
+    fn to_int_lossy_truncates_float_toward_zero_and_parses_strings() {
+        assert_eq!(Value::Float(3.7).to_int_lossy(), 3);
+        assert_eq!(Value::Float(-3.7).to_int_lossy(), -3);
+        assert_eq!(Value::Float(0.9).to_int_lossy(), 0);
+        assert_eq!(Value::Str(b"42".to_vec()).to_int_lossy(), 42);
+        assert_eq!(Value::Str(b" 42 ".to_vec()).to_int_lossy(), 42);
+        assert_eq!(Value::Str(b"x".to_vec()).to_int_lossy(), 0);
+        assert_eq!(Value::Int(-7).to_int_lossy(), -7);
+        // 超出 i64 范围 / NaN / Inf:x87 FISTP 写整数不定值 0x8000…,
+        // 不是 Rust `as i64` 的饱和边界。
+        assert_eq!(
+            Value::Float(9_223_372_036_854_775_808.0).to_int_lossy(),
+            i64::MIN
+        );
+        assert_eq!(
+            Value::Float(-9_223_372_036_854_775_808.0).to_int_lossy(),
+            i64::MIN
+        );
+        assert_eq!(Value::Float(f64::INFINITY).to_int_lossy(), i64::MIN);
+        assert_eq!(Value::Float(f64::NAN).to_int_lossy(), i64::MIN);
     }
 }

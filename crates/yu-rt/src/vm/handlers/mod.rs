@@ -299,7 +299,10 @@ pub fn build_handler_table(
     // 555 是独立商业分支:默认槽/共享空操作清单来自 555 exe 的分发表,
     // 不能把 0.495 清单当成 555 的充分依据。556/600 没有样本,继续走
     // legacy 清单(不自动继承 555)。门控走语义层,不再比较 yscm.version。
-    let v555 = semantics.is_v555();
+    // 0.500 属同一商业族:分发表默认体/空操作体逐名一致
+    // (`<v500-relirium>` 0x492d90 初始化器,默认体 0x48c0c0,121 槽)。
+    let v555 = semantics.is_v555_family();
+    let v500 = semantics.ysc_version == 500;
     let (default_slots, noop_slots) = if v555 {
         (DEFAULT_SLOT_COMMANDS_0555, NOOP_COMMANDS_0555)
     } else {
@@ -311,7 +314,7 @@ pub fn build_handler_table(
         let name = yscm.command(i as u8).map(|c| c.name.as_str()).unwrap_or("");
         // 官方槽位判定先于域分类:`SYSTEMMODE` 虽以 SYSTEM 开头,但分发表
         // 未覆盖它 ⇒ 执行到就是脚本执行错误,不能当域事件静默放过。
-        let kind = if default_slots.contains(&name) {
+        let mut kind = if default_slots.contains(&name) {
             HandlerKind::ScriptError
         } else if noop_slots.contains(&name)
             || (v555 && GUARD_NOOP_COMMANDS_0555.contains(&name))
@@ -412,6 +415,15 @@ pub fn build_handler_table(
                 }
             }
         };
+        // 0.500 分发表实测:这四条在 0.500 是 29 字节空桩(仅调参数求值器
+        // 后 `return 0`),v555 才是真实处理体。商业族共用 v555 清单时
+        // 必须按 0.500 的分发表覆盖回来。
+        // 证据:0.500 `Relirium.exe` 分发表 0x492d90;MOVIE2/MOVIE2END/
+        // MOVIE2INFO/REGINFO = 0x47ac94/0x47acb4/0x47acd4/0x47ad14,
+        // 反编译均为 `FUN_0045688d(); return 0;`(29B)。
+        if v500 && matches!(name, "MOVIE2" | "MOVIE2END" | "MOVIE2INFO" | "REGINFO") {
+            kind = HandlerKind::NoopEval;
+        }
         table.push(kind);
     }
     table
@@ -675,6 +687,12 @@ impl Vm {
                     match cmd.name.as_str() {
                         "INPUT" => return self.op_input(st, cmd),
                         "MOUSE" => return self.op_mouse(st, cmd),
+                        // `SYSTEM[SX,SY]`:0.500/0.555 官方处理体 `0x47f2f4`
+                        // 运行期改引擎屏幕尺寸;VM 侧同步,宿主后缓冲重建
+                        // 仍走下面的通用域事件(DIV-RT-079 残余)。
+                        "SYSTEM" if self.semantics().is_v555_family() => {
+                            self.apply_system_screen(st, cmd);
+                        }
                         _ => {}
                     }
                 }

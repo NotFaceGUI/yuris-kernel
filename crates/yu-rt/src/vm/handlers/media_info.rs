@@ -408,30 +408,35 @@ impl Vm {
         }
         let mut found = None;
         let ext_order = self.tables.boot.config.image_ext_order;
+        // 0.500 换了扩展码表(1=bmp/2=png/5=ydg…),必须与渲染器
+        // `ImageFormat::from_code_v500` 同表;否则渲染器找得到 `.ydg`、
+        // 这里却探不到,`CGINFO[SX/SY]` 退化为 0(按钮命中区成点)。
+        let v500 = self.tables.boot.yscm.version == 500;
         let mut candidates: Vec<Vec<u8>> = Vec::new();
         if has_image_extension_with(key, self.name_text_codec()) {
             candidates.push(key.to_vec());
         }
         for &code in ext_order.iter() {
-            let ext: &[u8] = match code {
-                0 => break,
-                1 => b".png",
-                2 => b".bmp",
-                3 => b".jpg",
-                4 => b".gif",
-                // 5 = .psb(E-mote 专用包);本内核不解其头。
-                _ => continue,
+            if code == 0 {
+                break;
+            }
+            let Some(ext) = yu_format::image_ext::extension(code, v500) else {
+                continue;
             };
             let mut path = key.to_vec();
-            path.extend_from_slice(ext);
-            candidates.push(path);
+            path.extend_from_slice(ext.as_bytes());
+            if !candidates.contains(&path) {
+                candidates.push(path);
+            }
         }
         // `.webp` 是通用扩展名能力,不参与 `yscfg` 码表(码表因版本而异);
         // 无显式扩展名时在码表候选之后追加一次。
         if !has_image_extension_with(key, self.name_text_codec()) {
             let mut path = key.to_vec();
             path.extend_from_slice(b".webp");
-            candidates.push(path);
+            if !candidates.contains(&path) {
+                candidates.push(path);
+            }
         }
         'probe: for path in candidates {
             // 先只读文件头:PNG/BMP/GIF 的尺寸都在前 26 字节内,JPEG 走段链

@@ -1171,3 +1171,37 @@ fn inp_keylast_mouselast_writes_are_applied() {
     assert_eq!(vm.input().mouselast(), 0, "_MOUSELAST 直接写 0");
 }
 
+
+/// `SYSTEM[SX,SY]`(555 族,官方 0.500 `0x47f2f4`):运行期改引擎屏幕尺寸。
+#[test]
+fn system_sx_sy_updates_engine_screen_for_555_family() {
+    let mut b = ProjectBuilder::new();
+    b.ysc_version = 500;
+    // 夹具默认 SYSTEM 无参数;按 0.500 表补 SX/SY(槽位 2/3)。
+    let sys_op = b
+        .commands
+        .iter()
+        .position(|c| c.0 == "SYSTEM")
+        .expect("fixture SYSTEM");
+    b.commands[sys_op].1 = vec![
+        ("SCREENSAVER", 0, 0),
+        ("BACKGROUNDEXEC", 0, 0),
+        ("SX", 0, 0),
+        ("SY", 0, 0),
+        ("TIMECOUNT", 0, 0),
+    ];
+    let op = u8::try_from(sys_op).expect("opcode");
+    b.scripts = vec![vec![
+        GroupSpec::new(op)
+            .window(2, ex::i16_(1280))
+            .window(3, ex::i16_(720)),
+        GroupSpec::new(OP_END),
+    ]];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let mut vm = boot(b);
+    vm.install_other_runtime();
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(vm.screen(), (1280, 720));
+}

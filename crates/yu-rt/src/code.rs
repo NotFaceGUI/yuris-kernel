@@ -116,6 +116,8 @@ pub mod rt {
     pub const MEM_TRACE: &str = "rt.mem.trace";
     /// `FILEINFO[CGFILE]` 存在性探测跟踪(verbose,不是未取证语义)。
     pub const FILEINFO_TRACE: &str = "rt.fileinfo.trace";
+    /// `SYSTEM[SX,SY]` 运行期改屏跟踪(verbose,不是未取证语义)。
+    pub const SYSTEM_TRACE: &str = "rt.system.trace";
 }
 
 /// 全部已登记错误码(顺序稳定)。唯一性由单元测试守卫。
@@ -164,6 +166,7 @@ pub const ALL_CODES: &[&str] = &[
     rt::PARAM_SLOT_TRACE,
     rt::MEM_TRACE,
     rt::FILEINFO_TRACE,
+    rt::SYSTEM_TRACE,
 ];
 
 /// 码是否已登记。

@@ -620,6 +620,46 @@ fn let_int_writes_the_target_variable_slot() {
     assert_eq!(vm.store().read(out, &[]).unwrap(), Value::Int(42));
 }
 
+/// v555 `_INT` 读未声明槽:返回 0,但必须留下带位置的诊断
+/// (读路径只有 `&Vm`,诊断经 `State.read_diags` 入队、命令结束后发出)。
+#[test]
+fn int_read_of_undeclared_slot_reports_diag() {
+    let mut b = ProjectBuilder::new();
+    b.ysc_version = 555;
+    let dyn_int = b
+        .sysvars
+        .iter()
+        .position(|(name, _, _)| *name == "_INT")
+        .expect("fixture sysvar _INT") as u16;
+    let out = push_var(&mut b, 1, Init::Int(7));
+    let slot = ex::i16_(30_000);
+    let read = ex::cat(&[ex::r#ref(0x40, dyn_int), slot, ex::aload()]);
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, out.id))
+            .window(0, read),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    vm.install_other_runtime();
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.store().read(out, &[]).unwrap(),
+        Value::Int(0),
+        "未声明槽按 0 处理"
+    );
+    let diags = vm.take_diags();
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == "rt.var.undeclared" && d.detail.contains("30000")),
+        "未声明 _INT 读必须留诊断: {diags:?}"
+    );
+}
+
 /// v555 `LET @_PINT(n) = v`:官方 `0x443988` id 0x35 写当前 GOSUB 帧的
 /// int 参数数组。被调方写 20 后读回,证明写进了同一帧。
 #[test]

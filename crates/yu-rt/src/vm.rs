@@ -1395,15 +1395,23 @@ impl Vm {
         self.start_ms
     }
 
-    /// 只读系统变量(证据/诊断用;不执行脚本、不改状态)。
+    /// 只读系统变量(证据/诊断用;不执行脚本、不改脚本/变量状态;
+    /// 只清空读侧诊断队列,避免污染下一条命令的位置)。
     pub fn debug_sysvar(&self, id: u16, indices: &[i64]) -> Result<Value, yu_log::Diag> {
         let st = ExecState::new(0, 0);
-        crate::sysvar::read(
+        let result = crate::sysvar::read(
             self,
             &st,
             crate::value::VarRef::new(crate::value::VarSpace::At, id),
             indices,
-        )
+        );
+        // 诊断读取不在命令上下文:读侧静默回退的入队诊断若留到下一次
+        // `step_command` 会被挂到错误的 script/pc。这里读出即丢弃,
+        // 避免污染;脚本路径的诊断仍由 `step_command` 正常发出。
+        if let Some(state) = self.other.as_ref() {
+            state.read_diags.borrow_mut().clear();
+        }
+        result
     }
 
     /// 宿主注入的本地时间基准(`@_TIME`;`None` = 确定性注入时钟)。
@@ -1450,6 +1458,20 @@ impl Vm {
         self.scheduler.live_tasks()
     }
 
+    /// 有执行栈的任务快照 `(任务名, 脚本号, pc)`(诊断/取证用)。
+    ///
+    /// 只读观察:不改变调度、不推进 pc。按键名排序,保证同一状态输出稳定。
+    #[must_use]
+    pub fn task_positions(&self) -> Vec<(String, u32, u32)> {
+        let mut out: Vec<(String, u32, u32)> = self
+            .exec
+            .iter()
+            .map(|(name, state)| (name.clone(), state.script_id, state.pc))
+            .collect();
+        out.sort();
+        out
+    }
+
     /// 当前正在执行的任务 id(独立运行面按任务分栈用)。
     pub(crate) fn current_task(&self) -> &str {
         &self.cur_task
@@ -1489,6 +1511,14 @@ impl Vm {
 
     pub fn screen(&self) -> (u32, u32) {
         self.screen
+    }
+
+    /// 运行期改写引擎屏幕尺寸(`SYSTEM[SX,SY]`,官方 `0x47f2f4`)。
+    ///
+    /// 只改 VM 侧事实(`_SCREEN_SIZE_X/Y` 的读取源);渲染目标的重建由宿主
+    /// 消费域事件完成(官方同时重建后缓冲,本内核端口尚未接线)。
+    pub fn set_screen(&mut self, width: u32, height: u32) {
+        self.screen = (width, height);
     }
 
     /// 取某任务的执行位快照(诊断 / TASKINFO 用)。
@@ -3477,6 +3507,10 @@ impl Vm {
         }
         let profile_started = sample.then(Instant::now);
         let out = self.dispatch(st, task, &cmd);
+        // v555 独立运行面的 `_STR`/`_INT` 读路径只有 `&Vm`,读侧把
+        // 未声明/错型/非字符串系统变量等静默回退先入队;命令结束后
+        // 统一带 script/pc 发出(否则这些差异完全没有痕迹)。
+        self.drain_other_read_diags();
         if let Some(started) = profile_started {
             let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             if let Some(slot) = self.prof_ns.get_mut(opcode) {

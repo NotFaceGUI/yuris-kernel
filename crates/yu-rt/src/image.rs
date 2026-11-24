@@ -27,6 +27,15 @@ pub(crate) fn pixel_size(bytes: &[u8]) -> Option<(u32, u32)> {
             return Some((w, h));
         }
     }
+    if bytes.len() >= 0x24 && bytes.starts_with(b"YDG\0YU-RIS\0\0") {
+        // 0.500 商业分支 UI 容器(见 `yu_format::ydg`):画布宽/高在
+        // `+0x20/+0x22`(u16 LE),官方 `FUN_00449a08` 同址读取。
+        let w = u16::from_le_bytes([bytes[0x20], bytes[0x21]]) as u32;
+        let h = u16::from_le_bytes([bytes[0x22], bytes[0x23]]) as u32;
+        if w > 0 && h > 0 && w <= 0x2000 && h <= 0x2000 {
+            return Some((w, h));
+        }
+    }
     if bytes.len() >= 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") && &bytes[12..16] == b"IHDR" {
         return Some((be32(&bytes[16..20]), be32(&bytes[20..24])));
     }
@@ -208,6 +217,24 @@ mod tests {
 
         // 非 WebP / 截断:不得误判。
         assert_eq!(pixel_size(b"RIFF\x00\x00\x00\x00WEB"), None);
+    }
+
+    #[test]
+    fn ydg_header() {
+        // 0.500:`cgsys/title/normal/back.ydg` 画布 1920×1080,宽高在
+        // `+0x20/+0x22`;尺寸缺失会让按钮/精灵的 `CGINFO[SX/SY]` 退化成
+        // 1×1(有画面但点击无反应),见 `yu_format::ydg`。
+        let mut b = vec![0u8; 0x40];
+        b[..12].copy_from_slice(b"YDG\0YU-RIS\0\0");
+        b[0x20..0x22].copy_from_slice(&1920u16.to_le_bytes());
+        b[0x22..0x24].copy_from_slice(&1080u16.to_le_bytes());
+        assert_eq!(pixel_size(&b), Some((1920, 1080)));
+        // 截断/零尺寸/超 0x2000 不得误判。
+        assert_eq!(pixel_size(b"YDG\0YU-RIS\0\0"), None);
+        b[0x20..0x22].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(pixel_size(&b), None);
+        b[0x20..0x22].copy_from_slice(&0x2001u16.to_le_bytes());
+        assert_eq!(pixel_size(&b), None);
     }
 
     #[test]

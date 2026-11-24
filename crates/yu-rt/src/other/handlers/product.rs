@@ -115,6 +115,55 @@ impl Vm {
             ),
         ));
         match com {
+            // 0x01/0x02/0x03:**0.500 新增分支**(不是 v555 形态)。
+            // 证据:<v500-relirium> `Relirium.exe` PRODUCT 处理体
+            // `0x488b20`,以 LET 指向的数组元素为目标:
+            // - COM=1:写 `0x1F6`(INT)/`502.0`(FLT);
+            // - COM=2:走错误消息路径(`FUN_004399ec`,`&DAT_0089a9a0`);
+            // - COM=3:写 0。
+            // 越界或非数值元素走官方 `0x18b14` 错误(本内核报可恢复诊断)。
+            // 语料只有 `<v500-relirium>/es_first.yst pc1` 的 COM=3。
+            1 | 2 | 3 => {
+                let Some(target) = target else {
+                    self.report(diag::recoverable(
+                        code::rt::CMD_SLOT,
+                        Boundary::Script,
+                        format!("PRODUCT[COM={com}] 需要 LET 数组元素目标"),
+                    ));
+                    return Ok(StepOutcome::Continue);
+                };
+                if com == 2 {
+                    self.report_unimplemented_variant(
+                        "PRODUCT",
+                        "COM=2",
+                        "PRODUCT[COM=2] 走官方错误消息分支(消息文本未取证)",
+                    );
+                    return Ok(StepOutcome::Continue);
+                }
+                let value = match self.var_shape(target.var) {
+                    Some((ElemType::Int, _)) => Value::Int(if com == 1 { 0x1F6 } else { 0 }),
+                    Some((ElemType::Float, _)) => {
+                        Value::Float(if com == 1 { 502.0 } else { 0.0 })
+                    }
+                    Some((ElemType::Str, _)) => {
+                        self.report(diag::recoverable(
+                            code::rt::VAR_TYPE,
+                            Boundary::Script,
+                            "PRODUCT[COM=1/3] 目标不是数值数组元素(官方报 0x18b14)",
+                        ));
+                        return Ok(StepOutcome::Continue);
+                    }
+                    None => {
+                        self.report(diag::recoverable(
+                            code::rt::CMD_SLOT,
+                            Boundary::Script,
+                            format!("PRODUCT[COM={com}] LET 目标未声明"),
+                        ));
+                        return Ok(StepOutcome::Continue);
+                    }
+                };
+                self.write_target(st, &target, &value)?;
+            }
             // 0x1D:模式位(BSS 初值 0)写入 LET。
             29 => {
                 if let Some(target) = target {

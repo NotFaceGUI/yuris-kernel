@@ -161,6 +161,67 @@ fn fileinfo_cgfile_probes_webp_without_version_gate() {
     assert_eq!(read(3), Value::Int(1), "yscfg 扩展名序仍生效");
 }
 
+/// 0.500 商业族的 `FILEINFO[CGFILE]`:扩展名必须走 0.500 码表
+/// (`1=bmp/2=png/5=ydg/...`),不能继续用 0.495 的 `5=psb`。
+///
+/// 现场(`<v500-relirium>`):`es_buttonque.yst` 用五次 `FILEINFO[EXIST=1
+/// CGFILE=...]` 探测 `_off/_over/_on/_onover/_na`;0.500 的按钮是
+/// `.ydg`。旧内联表只认 `psb`,五个探测全 0 → 脚本弹「ボタン画像指定が
+/// 正しくありません」并 `END`,标题只剩显式给五个名字的那个按钮。
+#[test]
+fn fileinfo_cgfile_uses_v500_ydg_table() {
+    let mut b = ProjectBuilder::new();
+    b.ysc_version = 500;
+    // 0.500 实机 yscfg:`[5,1,2,6,7,8,9,3]`(.ydg 优先)。
+    b.image_ext_order = [5, 1, 2, 6, 7, 8, 9, 3];
+    let sys = b.sysvars.len() as u16;
+    b.vars = (0..3)
+        .map(|offset| VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys + offset,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(-1),
+        })
+        .collect();
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let cgfile = |path: &str, letv: Vec<u8>| {
+        GroupSpec::new(OP_FILEINFO)
+            .window(2, ex::s(path))
+            .window(4, ex::i8_(1))
+            .window(7, letv)
+    };
+    b.scripts = vec![vec![
+        // 0.500 按钮资产:`btn_start_off.ydg`。
+        cgfile("cgsys/title/normal/btn_start_off", ex::r#ref(0x40, sys)),
+        // 0.500 码 5 是 `.ydg`;`.psb` 不再是候选。
+        cgfile("cgsys/title/normal/btn_start_over", ex::r#ref(0x40, sys + 1)),
+        // 不存在的后缀仍必须写 0。
+        cgfile("cgsys/title/normal/btn_start_na", ex::r#ref(0x40, sys + 2)),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot_with_files(
+        b,
+        &[
+            (b"cgsys/title/normal/btn_start_off.ydg", b"YDG\0"),
+            (b"cgsys/title/normal/btn_start_over.psb", b"PSB\0"),
+        ],
+    );
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let read = |offset: u16| {
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys + offset), &[])
+            .unwrap()
+    };
+    assert_eq!(read(0), Value::Int(1), "0.500 的 .ydg 必须判存在");
+    assert_eq!(read(1), Value::Int(0), "0.500 不再探测 .psb");
+    assert_eq!(read(2), Value::Int(0), "不存在必须写 0");
+}
+
 /// `FILEINFO[FOLDER=...]`(手册例 2;REA `0x4433d6`):
 /// - `EXIST` 只查散盘目录(`FILE_ATTRIBUTE_DIRECTORY`),包内文件夹不可查;
 /// - `SIZE` 对 FOLDER 写 0(官方只支持 FILE);
@@ -1166,12 +1227,109 @@ fn save_load_loop_records_reserve_flush_and_writes_back() {
 #[test]
 fn load_file_dno_1024_uses_the_mem_pack_host() {
     let mut b = ProjectBuilder::new();
-    // 500 槽文件分支只对 v555 有取证;0.495 的 1024 仍是普通块。
+    // 500 槽文件分支只对带 MEM 参数的表有取证(0.481/0.555);
+    // 0.495 SDK 的 LOAD 表没有 MEM,1024 仍是普通块。
     b.ysc_version = 555;
+    // 加在表尾:不改 DNO/LET 的槽号;语义派生只看“表里有 MEM”。
+    b.commands
+        .iter_mut()
+        .find(|(n, _)| *n == "LOAD")
+        .expect("fixture command")
+        .1
+        .push(("MEM", 3, 0));
     let op_load = b.commands.iter().position(|(n, _)| *n == "LOAD").unwrap() as u8;
     b.scripts = vec![vec![
         GroupSpec::new(op_load)
             .window(0, ex::s("save70000.sd"))
+            .window(1, ex::i32_(1024)),
+        GroupSpec::new(OP_END),
+    ]];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let recorder = SaveRecorder::new();
+    let mut vm = boot(b);
+    assert!(
+        vm.semantics().save_mem_pack,
+        "带 MEM 的 LOAD 表必须派生 save_mem_pack"
+    );
+    vm.set_save_host(Box::new(SharedHost {
+        inner: recorder.clone(),
+        reply: std::rc::Rc::new(std::cell::RefCell::new(None)),
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let rec = recorder.borrow();
+    assert_eq!(
+        rec.mem_pack_loads,
+        vec!["save70000.sd".to_string()],
+        "DNO=1024 必须走 500 槽打包读取"
+    );
+    assert!(rec.loads.is_empty(), "不得落到通用单块 load_block");
+    assert!(rec.mem_loads.is_empty(), "不得当作内存槽");
+}
+
+/// v555 的 DNO=1024 不是保留号:普通 `SAVE[DNO=1024 SET=@_LC]` 照常预约
+/// (官方 `0x44b874` 全程没有 0x400 特例)。无内容的 DNO 仍是缺内容形态,
+/// 包冲刷走 `SAVE[MEM=99999]` 直接暂存,不靠这个分支。
+#[test]
+fn save_file_dno_1024_is_ordinary_on_v555() {
+    let mut b = ProjectBuilder::new();
+    b.ysc_version = 555;
+    // 带 MEM 的表才有“DNO=1024 普通块与内存包同路”语义。
+    b.commands
+        .iter_mut()
+        .find(|(n, _)| *n == "SAVE")
+        .expect("fixture command")
+        .1
+        .push(("MEM", 3, 0));
+    let lc_id = b
+        .sysvars
+        .iter()
+        .position(|(name, _, _)| *name == "_LC")
+        .expect("_LC sysvar") as u16;
+    let op_save = b.commands.iter().position(|(n, _)| *n == "SAVE").unwrap() as u8;
+    b.scripts = vec![vec![
+        GroupSpec::new(op_save)
+            .window(1, ex::i32_(1024))
+            .window(2, ex::get(0x40, lc_id)),
+        GroupSpec::new(op_save).window(0, ex::s("save07000.sd")),
+        GroupSpec::new(OP_END),
+    ]];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    let recorder = SaveRecorder::new();
+    let mut vm = boot(b);
+    vm.set_save_host(Box::new(SharedHost {
+        inner: recorder.clone(),
+        reply: std::rc::Rc::new(std::cell::RefCell::new(None)),
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let rec = recorder.borrow();
+    assert_eq!(rec.reserves.len(), 1, "{:?}", rec.reserves);
+    assert_eq!(rec.reserves[0].0, 1024, "普通 1024 必须照常预约");
+    assert_eq!(rec.flushes, vec!["save07000.sd".to_string()]);
+}
+
+/// 0.481 商业表也带 `MEM`:它的 LOAD 处理体在 `0x447406` 有
+/// `cmp esi,0x400` 专用分支,1024 必须走 500 槽内存包,不是普通块。
+///
+/// 这条锁住“按表能力而非版本号门控”的修复:修前 `version == 555`
+/// 会把 0.481 官方存档的 DNO=1024 当普通块解析。
+#[test]
+fn load_file_dno_1024_uses_mem_pack_on_0481() {
+    let mut b = ProjectBuilder::new();
+    b.ysc_version = 481;
+    b.commands
+        .iter_mut()
+        .find(|(n, _)| *n == "LOAD")
+        .expect("fixture command")
+        .1
+        .push(("MEM", 3, 0));
+    let op_load = b.commands.iter().position(|(n, _)| *n == "LOAD").unwrap() as u8;
+    b.scripts = vec![vec![
+        GroupSpec::new(op_load)
+            .window(0, ex::s("save50001.sd"))
             .window(1, ex::i32_(1024)),
         GroupSpec::new(OP_END),
     ]];
@@ -1188,11 +1346,10 @@ fn load_file_dno_1024_uses_the_mem_pack_host() {
     let rec = recorder.borrow();
     assert_eq!(
         rec.mem_pack_loads,
-        vec!["save70000.sd".to_string()],
-        "DNO=1024 必须走 500 槽打包读取"
+        vec!["save50001.sd".to_string()],
+        "0.481 带 MEM 的表必须走 500 槽读取"
     );
     assert!(rec.loads.is_empty(), "不得落到通用单块 load_block");
-    assert!(rec.mem_loads.is_empty(), "不得当作内存槽");
 }
 
 /// 0.495:`LOAD[FILE DNO=1024]` 仍是普通块,不得被 v555 内存包分支劫持。

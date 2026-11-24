@@ -189,6 +189,10 @@ impl Vm {
                 // 写进 `DAT_008724ac`(不按物理状态钳制)。
                 if name == "_DROPFILE_NUM" {
                     let rhs = self.eval_window(st, &cmd.windows[1])?;
+                    // 官方 0x443988 int 分支 id 0x0f 只写低 32 位
+                    // (`DAT_008724ac = uVar16`,32 位存储);值域按 i32 保负,
+                    // 与读侧 `i64::from(i32)` 同口径。
+                    self.note_lossy_int_rhs("_DROPFILE_NUM", &rhs);
                     let v = rhs.to_int_lossy();
                     if let Some(state) = self.other.as_mut() {
                         state.drop_file_num = v as i32;
@@ -266,6 +270,7 @@ impl Vm {
                         core::slice::from_ref(&index)
                     };
                     let rhs = self.eval_window(st, &cmd.windows[1])?;
+                    self.note_lossy_int_rhs("_INT", &rhs);
                     let rhs = Value::Int(rhs.to_int_lossy());
                     let op = (cmd.windows[0].rec.slot >> 8) as u8;
                     let cur = self.store().read(var, write_index).unwrap_or(Value::Int(0));
@@ -325,6 +330,7 @@ impl Vm {
                     };
                     let cur = frame.args_int[idx].clone().unwrap_or(Value::Int(0));
                     let rhs = self.eval_window(st, &cmd.windows[1])?;
+                    self.note_lossy_int_rhs("_PINT", &rhs);
                     let rhs = Value::Int(rhs.to_int_lossy());
                     let op = (cmd.windows[0].rec.slot >> 8) as u8;
                     let value = if op == 0 {
@@ -1143,6 +1149,28 @@ impl Vm {
         }
         self.write_target_owned(st, &target, Value::Str(out))?;
         Ok(StepOutcome::Continue)
+    }
+
+    /// `_INT`/`_PINT`/`_DROPFILE_NUM` 的 RHS 强转留痕。
+    ///
+    /// 官方 v555 LET 处理体按**目标类型**选择求值器:
+    /// - int 目标 + 浮点 RHS:`0x420cf4` 把 FPU 舍入控制字置
+    ///   `RC=11`(向零截断)后 `fistp qword`,即截断而非四舍五入
+    ///   —— 已取证,与 [`Value::to_int_lossy`] 同口径,不再另报;
+    /// - int 目标 + 字符串 RHS:求值表里没有独立的“字符串→int”入口,
+    ///   官方转换/报错/静默无写入三选一未取证(DIV-RT-077)。当前按
+    ///   十进制解析写入,显式留一条可恢复诊断,便于实机对拍时抓到。
+    fn note_lossy_int_rhs(&mut self, name: &str, rhs: &Value) {
+        if matches!(rhs, Value::Str(_)) {
+            self.report(diag::recoverable(
+                code::rt::SYSVAR_WRITE,
+                Boundary::Script,
+                format!(
+                    "{name}:字符串 RHS 按十进制解析写入 int(官方 v555 字符串→int \
+                     分支未取证,DIV-RT-077)"
+                ),
+            ));
+        }
     }
 
     pub(super) fn read_lvalue(&self, lval: &crate::expr::LValue) -> Result<Value, yu_log::Diag> {

@@ -224,6 +224,8 @@ impl Vm {
                 .as_mut()
                 .and_then(|table| table.lookup_scenario(&file, line_no));
             let Some(units) = units else {
+                // 该行没有译文,但 `scan_units` 的副作用是推进块注释状态;
+                // 返回的 span 本行不用(良性丢弃,不是错误吞掉)。
                 let _ = yu_format::scenario::scan_units(codec, &line, &mut state);
                 out.push(line);
                 continue;

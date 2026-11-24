@@ -667,4 +667,58 @@ impl Vm {
         }
         Ok(StepOutcome::Continue)
     }
+
+    /// `SYSTEM[SX,SY]`(555 商业族;官方 0.500 处理体 `0x47f2f4`)。
+    ///
+    /// 官方分支:`SX`/`SY` 同时 >0 时写引擎屏幕尺寸(`DAT_008925c4/c8`
+    /// 与显示上下文 `+0xc/+0x10`),并在窗口标志活跃时重建后缓冲。
+    /// 本内核只同步 VM 侧事实(`_SCREEN_SIZE_X/Y` 的读取源);后缓冲重建
+    /// 归宿主端口(当前未接线,见 `DIV-RT-079`)。`SCREENSAVER`/
+    /// `BACKGROUNDEXEC`/`TIMECOUNT*` 是宿主策略/计时,由通用域事件承载。
+    ///
+    /// 只挂在 `Domain::System` 的通用路径**之前**:之后仍照常发 `DomainCall`,
+    /// 事件口径不变;表达式会被求值两次(无副作用,保持改动面最小)。
+    pub(super) fn apply_system_screen(&mut self, st: &mut ExecState, cmd: &Cmd) {
+        let names: &[String] = &cmd.param_names;
+        let mut sx: Option<i64> = None;
+        let mut sy: Option<i64> = None;
+        for w in &cmd.windows {
+            if w.rec.length == 0 {
+                continue;
+            }
+            let name = names
+                .get(usize::from(w.rec.kind))
+                .map(String::as_str)
+                .unwrap_or("");
+            if name != "SX" && name != "SY" {
+                continue;
+            }
+            match self.eval_window(st, w) {
+                Ok(v) => {
+                    if name == "SX" {
+                        sx = v.as_int();
+                    } else {
+                        sy = v.as_int();
+                    }
+                }
+                Err(d) => self.report(d),
+            }
+        }
+        let (Some(sx), Some(sy)) = (sx, sy) else {
+            return;
+        };
+        if sx <= 0 || sy <= 0 {
+            return;
+        }
+        let (width, height) = (sx as u32, sy as u32);
+        if self.screen() == (width, height) {
+            return;
+        }
+        self.set_screen(width, height);
+        self.report(diag::verbose(
+            code::rt::SYSTEM_TRACE,
+            Boundary::Script,
+            format!("SYSTEM[SX={width} SY={height}]:引擎屏幕尺寸已更新(后缓冲重建归宿主)"),
+        ));
+    }
 }

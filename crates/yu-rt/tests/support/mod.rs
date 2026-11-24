@@ -191,6 +191,11 @@ pub struct ProjectBuilder {
     pub omit: Vec<&'static str>,
     /// YSCM 头里的工程版本(默认 495;v555 用例设 555,供按版本裁决的语义分支使用)。
     pub ysc_version: u32,
+    /// `yscfg` 图像扩展名优先序(默认 0.495 的 `png/bmp/jpg/gif/psb`)。
+    ///
+    /// 0.500 商业族要按 `1=bmp/2=png/5=ydg/...` 摆放;用 `.ydg` 资产做
+    /// `FILEINFO[CGFILE]` 回归时必须把它改成 0.500 顺序。
+    pub image_ext_order: [u8; 8],
 }
 
 impl ProjectBuilder {
@@ -208,6 +213,7 @@ impl ProjectBuilder {
             sysvars_abi: false,
             omit: Vec::new(),
             ysc_version: 495,
+            image_ext_order: [1, 2, 3, 4, 5, 0, 0, 0],
         }
     }
 
@@ -299,8 +305,11 @@ impl ProjectBuilder {
                 .unwrap();
         }
         if !omit("yscfg") {
-            src.insert(b"ysbin/yscfg.ybn", build_yscfg(640, 480, b"fixture"))
-                .unwrap();
+            src.insert(
+                b"ysbin/yscfg.ybn",
+                build_yscfg_with_order(640, 480, b"fixture", self.image_ext_order),
+            )
+            .unwrap();
         }
         if !omit("ycd") {
             src.insert(
@@ -1194,14 +1203,17 @@ pub fn build_ystl(script_count: usize) -> Vec<u8> {
 }
 
 pub fn build_yscfg(w: u16, h: u16, caption: &[u8]) -> Vec<u8> {
+    build_yscfg_with_order(w, h, caption, [1, 2, 3, 4, 5, 0, 0, 0])
+}
+
+/// 同 [`build_yscfg`],但显式给图像扩展名优先序(0.500 夹具用)。
+pub fn build_yscfg_with_order(w: u16, h: u16, caption: &[u8], order: [u8; 8]) -> Vec<u8> {
     let mut out = vec![0u8; 0x4E];
     out[0..4].copy_from_slice(b"YSCF");
     out[4..8].copy_from_slice(&495u32.to_le_bytes());
     out[0x10..0x12].copy_from_slice(&w.to_le_bytes());
     out[0x14..0x16].copy_from_slice(&h.to_le_bytes());
-    out[0x1C] = 1; // png
-    out[0x1D] = 2; // bmp
-    out[0x1E] = 3; // jpg
+    out[0x1C..0x24].copy_from_slice(&order);
     out[0x24] = 1; // ogg
     out[0x25] = 2; // wav
     out[0x4C..0x4E].copy_from_slice(&(caption.len() as u16).to_le_bytes());

@@ -50,8 +50,8 @@ pub(crate) fn read(
                     .unwrap_or_default(),
             )))
         }
-        "_STR" => Some(read_str(vm, st, indices)),
-        "_INT" => Some(read_int(vm, indices)),
+        "_STR" => Some(read_str(vm, state, st, indices)),
+        "_INT" => Some(read_int(vm, state, indices)),
         _ => None,
     }
 }
@@ -107,11 +107,49 @@ fn read_rint(
     out
 }
 
-fn read_str(vm: &Vm, st: &ExecState, indices: &[i64]) -> Result<Value, yu_log::Diag> {
+/// 读路径只有 `&Vm`:静默回退先入队,由 `Vm::step_command` 带命令位置发出。
+///
+/// Fatal 降为 Recoverable:调用方已经按 0/空串继续,不能同时让宿主弹
+/// 致命框;原始码/详情保留在文案里。
+fn note_read(state: &State, d: yu_log::Diag) {
+    let d = if matches!(d.severity, yu_log::Severity::Fatal) {
+        diag::recoverable(
+            code::rt::SYSVAR_UNIMPLEMENTED,
+            Boundary::Script,
+            format!("读侧已按 0/空串继续(原 {}): {}", d.code, d.detail),
+        )
+    } else {
+        d
+    };
+    state.read_diags.borrow_mut().push(d);
+}
+
+fn read_str(
+    vm: &Vm,
+    state: &State,
+    st: &ExecState,
+    indices: &[i64],
+) -> Result<Value, yu_log::Diag> {
     let Some((slot, index)) = dynamic_slot_index(indices)? else {
+        note_read(
+            state,
+            diag::verbose(
+                code::rt::VAR_TYPE,
+                Boundary::Script,
+                "_STR 缺槽号下标:返回空串(官方缺参行为未取证)",
+            ),
+        );
         return Ok(Value::Str(Vec::new()));
     };
     let Ok(slot) = u16::try_from(slot) else {
+        note_read(
+            state,
+            diag::verbose(
+                code::rt::VAR_TYPE,
+                Boundary::Script,
+                format!("_STR 槽号 {slot} 超出变量 id 宽度 0..={}:返回空串", u16::MAX),
+            ),
+        );
         return Ok(Value::Str(Vec::new()));
     };
     if slot < 1000 {
@@ -131,36 +169,123 @@ fn read_str(vm: &Vm, st: &ExecState, indices: &[i64]) -> Result<Value, yu_log::D
             "_TEXT_FLAG",
         ];
         let Some(decl) = vm.sysvars().get(slot) else {
+            note_read(
+                state,
+                diag::verbose(
+                    code::rt::VAR_UNDECLARED,
+                    Boundary::Script,
+                    format!("_STR 槽 {slot} 不是已声明系统变量:返回空串"),
+                ),
+            );
             return Ok(Value::Str(Vec::new()));
         };
         if !STRING_SYSVARS.contains(&decl.name.as_str()) {
+            note_read(
+                state,
+                diag::verbose(
+                    code::rt::VAR_TYPE,
+                    Boundary::Script,
+                    format!(
+                        "_STR 系统变量 {} 不属于字符串系统变量:返回空串",
+                        decl.name
+                    ),
+                ),
+            );
             return Ok(Value::Str(Vec::new()));
         }
         let sysvar = VarRef::new(VarSpace::At, slot);
         return match crate::sysvar::read(vm, st, sysvar, &[index]) {
             Ok(Value::Str(bytes)) => Ok(Value::Str(bytes)),
-            Ok(_) | Err(_) => Ok(Value::Str(Vec::new())),
+            Ok(other) => {
+                note_read(
+                    state,
+                    diag::recoverable(
+                        code::rt::VAR_TYPE,
+                        Boundary::Script,
+                        format!(
+                            "_STR 系统变量 {} 读回 {},按空串处理",
+                            decl.name,
+                            other.type_name()
+                        ),
+                    ),
+                );
+                Ok(Value::Str(Vec::new()))
+            }
+            Err(d) => {
+                note_read(state, d);
+                Ok(Value::Str(Vec::new()))
+            }
         };
     }
     let Some(var) = vm.store().find_by_id(slot, VarSpace::Dollar) else {
+        note_read(
+            state,
+            diag::verbose(
+                code::rt::VAR_UNDECLARED,
+                Boundary::Script,
+                format!("_STR 槽 {slot} 未声明字符串变量:返回空串"),
+            ),
+        );
         return Ok(Value::Str(Vec::new()));
     };
-    Ok(match vm.store().read(var, &[index]) {
-        Ok(Value::Str(bytes)) => Value::Str(bytes),
-        Ok(_) | Err(_) => Value::Str(Vec::new()),
-    })
+    match vm.store().read(var, &[index]) {
+        Ok(Value::Str(bytes)) => Ok(Value::Str(bytes)),
+        Ok(other) => {
+            note_read(
+                state,
+                diag::recoverable(
+                    code::rt::VAR_TYPE,
+                    Boundary::Script,
+                    format!(
+                        "_STR {} 读回 {},按空串处理",
+                        var.display(),
+                        other.type_name()
+                    ),
+                ),
+            );
+            Ok(Value::Str(Vec::new()))
+        }
+        Err(d) => {
+            note_read(state, d);
+            Ok(Value::Str(Vec::new()))
+        }
+    }
 }
 
-fn read_int(vm: &Vm, indices: &[i64]) -> Result<Value, yu_log::Diag> {
+fn read_int(vm: &Vm, state: &State, indices: &[i64]) -> Result<Value, yu_log::Diag> {
     let Some((slot, index)) = dynamic_slot_index(indices)? else {
+        note_read(
+            state,
+            diag::verbose(
+                code::rt::VAR_TYPE,
+                Boundary::Script,
+                "_INT 缺槽号下标:按 0 处理(官方缺参行为未取证)",
+            ),
+        );
         return Ok(Value::Int(0));
     };
     // 槽号下界不下结论:官方片段只证据了目标变量类型检查(0x1a6c6),
     // <1000 是否可读未取证;交给变量表查找,未声明自然返回 0。
     let Ok(slot) = u16::try_from(slot) else {
+        note_read(
+            state,
+            diag::verbose(
+                code::rt::VAR_TYPE,
+                Boundary::Script,
+                format!("_INT 槽号 {slot} 超出变量 id 宽度 0..={}:按 0 处理", u16::MAX),
+            ),
+        );
         return Ok(Value::Int(0));
     };
     let Some(var) = vm.store().find_by_id(slot, VarSpace::At) else {
+        note_read(
+            state,
+            diag::verbose(
+                code::rt::VAR_UNDECLARED,
+                Boundary::Script,
+                format!("_INT 槽 {slot} 未声明:按 0 处理"),
+            ),
+        );
         return Ok(Value::Int(0));
     };
     // 官方槽表把标量当 1 元素:无第二下标时元素 0 合法;非 0 越界。
@@ -168,17 +293,59 @@ fn read_int(vm: &Vm, indices: &[i64]) -> Result<Value, yu_log::Diag> {
     let scalar = vm.store().slot(var).map(|s| s.dims.is_empty()).unwrap_or(true);
     let read_index: &[i64] = if scalar {
         if index != 0 {
+            note_read(
+                state,
+                diag::verbose(
+                    code::rt::VAR_SHAPE,
+                    Boundary::Script,
+                    format!(
+                        "_INT {} 是标量,元素下标 {index} 越界:按 0 处理",
+                        var.display()
+                    ),
+                ),
+            );
             return Ok(Value::Int(0));
         }
         &[]
     } else {
         core::slice::from_ref(&index)
     };
-    Ok(match vm.store().read(var, read_index) {
-        Ok(Value::Int(v)) => Value::Int(v),
-        Ok(Value::Float(f)) => Value::Int(f as i64),
-        Ok(_) | Err(_) => Value::Int(0),
-    })
+    match vm.store().read(var, read_index) {
+        Ok(Value::Int(v)) => Ok(Value::Int(v)),
+        Ok(Value::Float(f)) => {
+            note_read(
+                state,
+                diag::recoverable(
+                    code::rt::VAR_TYPE,
+                    Boundary::Script,
+                    format!(
+                        "_INT {} 是浮点槽,当前按截断读 int(官方读浮点槽语义未取证)",
+                        var.display()
+                    ),
+                ),
+            );
+            Ok(Value::Int(Value::Float(f).to_int_lossy()))
+        }
+        Ok(other) => {
+            note_read(
+                state,
+                diag::recoverable(
+                    code::rt::VAR_TYPE,
+                    Boundary::Script,
+                    format!(
+                        "_INT {} 读回 {},按 0 处理",
+                        var.display(),
+                        other.type_name()
+                    ),
+                ),
+            );
+            Ok(Value::Int(0))
+        }
+        Err(d) => {
+            note_read(state, d);
+            Ok(Value::Int(0))
+        }
+    }
 }
 
 fn dynamic_slot_index(indices: &[i64]) -> Result<Option<(i64, i64)>, yu_log::Diag> {
