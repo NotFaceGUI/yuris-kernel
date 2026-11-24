@@ -5251,8 +5251,13 @@ impl GfxState {
     ///    `COPY2` 从单资产层抠小单元进小空暂存层 → 同样记为候选
     ///    (v555 预制字形页形态,见 [`Self::glyph_cell_candidate`]);
     /// 2. 候选层上的 `MEIDO` → 记 `tint`;
-    /// 3. `MERGE2` 的源是候选层、目标存在 → 向目标文本列表追加
+    /// 3. `MERGE`/`MERGE2` 的源是候选层、目标存在 → 向目标文本列表追加
     ///    [`TextDraw::image`];候选层自身状态不改(可见性由脚本 `E` 决定)。
+    ///
+    ///    `MERGE` 与 `MERGE2` 都走这条降级:0.500 商业族的 TTF/全角逐字
+    ///    路径(`es.SJISCODE.DRAW.ONE` / `es.ZENKAKU.DRAW.ONE`)最终用
+    ///    **`MERGE`**(不是 `MERGE2`)把字形层盖到正文层;只认 `MERGE2`
+    ///    会让每个字退回帧内图像加工,跨帧只剩最后一字。
     #[allow(clippy::too_many_arguments)]
     fn lower_glyph_chain(
         &mut self,
@@ -5314,7 +5319,7 @@ impl GfxState {
             }
             return false;
         }
-        if matches!(action, ImageAction::Merge2) {
+        if matches!(action, ImageAction::Merge | ImageAction::Merge2) {
             let Some(chain) = self.glyph_chains.get(source).cloned() else {
                 return false;
             };

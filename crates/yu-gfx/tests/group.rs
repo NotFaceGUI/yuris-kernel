@@ -779,6 +779,76 @@ fn executable_image_op_clears_target_texts() {
     );
 }
 
+/// 0.500 的逐字字形:COPY2 抠格 → `MERGE` 到正文层。
+///
+/// 旧实现只把 `MERGE2` 降级为 `TextDraw::image`,`MERGE` 仍走帧内图像
+/// 加工;跨帧后只剩最后一字(`es.SJISCODE.DRAW.ONE` 实机症状)。`MERGE`
+/// 与 `MERGE2` 的数据流相同,必须一起降级。
+#[test]
+fn merge_glyph_chain_accumulates_text_images() {
+    let table = table();
+    let mut gfx = state();
+    let mut events = vec![
+        frame_start(1),
+        // 单资产字形页 + 小空暂存层(显式 SX/SY,与真实脚本一致)。
+        create(&table, "GLY", "font_page", 1, 256),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("TMP")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(80)),
+                arg(&table, "CG", "SY", i(80)),
+                arg(&table, "CG", "Z", i(1)),
+                arg(&table, "CG", "A", i(256)),
+            ],
+        ),
+        // 抠一格 30×30 到暂存层(外字链候选)。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("GLY")),
+                arg(&table, "CGACT", "ID2", s("TMP")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+                arg(&table, "CGACT", "X", i(0)),
+                arg(&table, "CGACT", "Y", i(0)),
+                arg(&table, "CGACT", "X2", i(29)),
+                arg(&table, "CGACT", "Y2", i(29)),
+            ],
+        ),
+        // 正文层。
+        create(&table, "TX", "", 2, 256),
+    ];
+    // 两个字位:同一暂存层连续 MERGE,必须累加成两个图像字形。
+    for x in [10, 50] {
+        events.push(call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("TMP")),
+                arg(&table, "CGACT", "ID2", s("TX")),
+                arg(&table, "CGACT", "MERGE", i(1)),
+                arg(&table, "CGACT", "X", i(x)),
+                arg(&table, "CGACT", "Y", i(0)),
+            ],
+        ));
+    }
+    events.push(frame_end(1));
+    gfx.consume_events(&events);
+    let draws: Vec<_> = gfx
+        .frame()
+        .text_draws
+        .iter()
+        .filter(|d| d.target.display() == ":/W0/TX")
+        .cloned()
+        .collect();
+    assert_eq!(draws.len(), 2, "MERGE 字形必须逐字累积");
+    assert!(draws.iter().all(|d| d.image.is_some()), "必须是图像字形");
+    assert_eq!((draws[0].x, draws[1].x), (10, 50));
+}
+
 #[test]
 fn swap_exchanges_layer_texts() {
     let table = table();
