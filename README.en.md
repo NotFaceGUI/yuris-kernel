@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/logo.png" alt="yuris-kernel" width="112">
+
 <h1>yuris-kernel</h1>
 
 <p><b>A YU-RIS compatible runtime</b><br>
@@ -66,21 +68,37 @@ ABI tables for 0.450–0.493 are all catalogued (27 tables, covering 0.255–0.4
 
 | Category | Form / extension | Status |
 | --- | --- | --- |
-| Packages | `.ypf` (0.495 and earlier: keyed + compressed entries) | Read |
-| | `.ypf` (0.500 commercial: plain zlib + xxh32 payload hash, Meta22 layout) | Read |
+| Packages | `.ypf` (0.255–0.495: LenEncNot index, byte-inverted names, zlib entries; 0.495 name key 0xFF + MurmurHash2 index) | Read |
+| | `.ypf` (0.500 commercial: Meta22 layout, plain zlib, xxh32 payload hash) | Read |
+| | Legacy NulXor dialect (NUL-terminated names + XOR names): no real samples, explicitly rejected | Not implemented (rejected) |
 | | Loose `data/` directory (development form) | Read |
 | | `pac/*.ypf` mounted by name + `update1..9.ypf` layered; MPEG-PS disguised as `.ypf` skipped by magic | Read |
 | Tables / scripts | `ysbin/ysc.ybn` (YSCM command table, 0.255–0.555) | Read / execute |
-| | `ysbin/ysl.ybn` (YSLB global labels), `ysbin/ysv.ybn` (YSVR variables), `ysbin/yst_list.ybn` | Read |
+| | `ysbin/ysl.ybn` (YSLB global labels), `ysbin/ysv.ybn` (YSVR variables), `ysbin/yst_list.ybn` (YSTL script list) | Read |
+| | `ysbin/yse.ybn` (YSER error names), `ysbin/yst.ybn` (YSTD variable slots), `ysbin/yscfg.ybn` (YSCF resolution/extension order/title, four header layouts) | Read |
 | | `ysbin/yst%05d.ybn` (YSTB compiled scripts; V5 executes, V2 awaits real samples) | Execute |
-| | `scenario/*.txt` (5xx scenario DSL: `#labels`, `\commands`, macros) | Lex / execute |
+| | `scenario/*.txt` (5xx scenario DSL: `#labels`, `\commands`, macros; `sc_cn_/sc_tw_scenario/` native multilingual variants) | Lex / execute |
 | Images | PNG / BMP / JPG / GIF / WebP / JXL / QOI / AVIF | Decode |
+| | YCG container (`.ycg`, or `YCG\0` behind a `.png` name in 4.7x/4.8x packs): method 0 raw BGRA / method 1 two zlib segments, BGRA→RGBA | Decode |
 | | `.ydg` (0.500 container; QOI/WebP row tiles reassembled into a full image) | Decode |
 | | `.psb` (0.495 image code 5) | Recognized, no decoder (explicit `asset.unsupported`) |
 | Audio | WAV PCM / ACM WAVE (non-PCM tags go through system ACM) | Decode |
 | | OGG Vorbis / OGG Opus (0.500) | Decode |
-| Video | MPEG-1 program stream (`.mpg` / MPEG-PS disguised as `.ypf`), YMV | Play |
-| Saves | `.sd` (including DNO=1024 and 500-slot memory packs) | Read / write |
+| Video | MPEG-1 program stream (`.mpg` / MPEG-PS disguised as `.ypf`), YMV (YSMV two-plane frame sequence) | Play |
+| Saves / config | `.sd` (YSSD; 0x138/0x1E0/0x1E1 layouts, DNO=1024, 500-slot memory packs) | Read / write |
+| | `yssfs.dat` (save-path settings, 128-byte fixed record, `_SAVE_PATH_TYPE` @ +0x54) | Read |
+
+### Text and fonts
+
+| Item | Implementation |
+| --- | --- |
+| Font source | 0.495 and earlier use system fonts: at boot, enumerated by the official fallback chain `ＭＳ ゴシック` → `標準ゴシック` → `ＭＳ Ｐゴシック` → `ＭＳ 明朝` → `標準明朝` (the reference `data.ypf` has no font files); v555 official Chinese and similar builds use prebuilt glyph pages, see the next row |
+| TTF / OTF / TTC rasterization | sfnt parsing (including TTC face index) → swash outline rasterization into 8-bit coverage, matching the official GDI `CreateFontIndirectA` + `TextOutA` path; `SX/SY` 0–256 px, grayscale/binary antialiasing, synthetic bold, color/gradient; rotation/outline/shadow only under the `Reference` policy |
+| Bitmap glyphs (v555 official Chinese / multilingual) | Body text uses prebuilt glyph pages: `cgsys_cn/font/font_c20/fnt_s20_nNN` → `CGACT[COPY2]` crops a 30 px cell (X/X2 and Y/Y2 inclusive, 31×31 texels) → `MEIDO` tint → `MERGE2` onto the body/name layer; the kernel re-crops every round and lowers the chain to a persistent text image, so cross-frame glyph chains are not lost (8b58feb, `<v555-4>` evidence) |
+| Legacy bitmap fonts `.fnt/.fon` | Neither the reference project nor official artifacts contain such standalone bitmap font files; this kernel does not implement that file format and never falls back silently (explicitly unsupported) |
+| Patch fonts | `hook.ini` + ttf CP932-carrier remap patches are detected at boot and force-injected into every `FONT` request |
+| Missing-glyph fallback | Translation mode enables system-font missing-glyph fallback automatically; `--font` sets the default font and `--font-lock` forces a lock |
+
 
 ### 5xx / v555 status
 
@@ -126,8 +144,8 @@ Gaps for Linux / macOS desktop and true wasm (in-memory data source + browser sa
 | [![0.481 title screen](docs/assets/case/1_t.png)](docs/assets/case/1_t.png) | [![0.481 dialogue](docs/assets/case/1_d.png)](docs/assets/case/1_d.png) | [![0.494 dialogue](docs/assets/case/2_d.png)](docs/assets/case/2_d.png) |
 | **0.555 · Dialogue** | **0.555 · Official Chinese** | **0.474 · Title screen** |
 | [![0.555 dialogue](docs/assets/case/3_d.png)](docs/assets/case/3_d.png) | [![0.555 official Chinese](docs/assets/case/4_d.png)](docs/assets/case/4_d.png) | [![0.474 title screen](docs/assets/case/5_t.png)](docs/assets/case/5_t.png) |
-| **0.466 · Dialogue** | | |
-| [![0.466 dialogue](docs/assets/case/6_d.png)](docs/assets/case/6_d.png) | | |
+| **0.466 · Dialogue** | **0.500 · Title screen** | **0.500 · Dialogue** |
+| [![0.466 dialogue](docs/assets/case/6_d.png)](docs/assets/case/6_d.png) | [![0.500 title screen](docs/assets/case/7_t.png)](docs/assets/case/7_t.png) | [![0.500 dialogue](docs/assets/case/8_d.png)](docs/assets/case/8_d.png) |
 
 ## Download
 
@@ -200,13 +218,16 @@ target/release/yu-cli run "<project>" --mode desktop --backend wgpu \
 
 `--patch` selects the translation route; desktop, serve, and the Android configuration screen share the same values.
 
-| Patch type        | Value                       | Notes                                                                                              |
+| Patch type        | Value (aliases)             | Notes                                                                                              |
 | ----------------- | --------------------------- | -------------------------------------------------------------------------------------------------- |
-| Original Japanese | `original` (`cp932`)        | Untranslated original                                                                              |
+| Original Japanese | `original` (`off` / `none` / `cp932` / `sjis` / `shift_jis`) | Untranslated original                                                              |
 | Simplified Chinese| `gbk` (`cp936` / `gb2312`)  | Translation patch; the translated text lives in loose `ysbin/`, taking effect via "loose before pack" |
-| Traditional Chinese | `big5` (`cp950`)          | Same as above, for Hong Kong / Taiwan releases and traditional patches                             |
+| Traditional Chinese | `big5` (`cp950` / `big-5`) | Same as above, for Hong Kong / Taiwan releases and traditional patches                             |
 | SJIS tunnel       | `tunnel` (`sjis_ext`)       | Patch that keeps the original encoding and appends a codepoint table; requires `sjis_ext.bin` in the game root |
 | Auto              | `auto` (default)            | Detected via `codecs.json` → `sjis_ext.bin` → tool signatures; patch names are not recognized      |
+| Runtime translation | `--translate` + `translate.json` (CP932 tunnel auto-extended) | Replaces in-file entries only, never writes back data; target codec follows the active `--patch` |
+| Patch font        | `hook.ini` + ttf (auto-detected) | CP932-carrier glyph remap; force-injected into every `FONT` request at boot                     |
+| v555 native multilingual | `config.sd` language number → `scenario/` / `sc_cn_scenario/` / `sc_tw_scenario/` | CP932 / GBK / Big5; not the `--patch` translation route |
 | Unsupported       | —                           | exe / DLL injection patches (e.g. `setdll` loading `MyDll.dll` to swap fonts): the program is not modified, so they do not apply |
 
 > v555 native multilingual support is not the `--patch` translation route:
@@ -314,7 +335,7 @@ The repository ships no game data. Tests that need missing samples explicitly `S
 
 - Rendering: multi-part layer geometry semantics; `CGINFO[SX/SY]` already covers injected assets and `COPY/COPY2` slices, but non-injected assets are still missing; fields such as `COLOR` and non-EXIST fields for missing targets are not closed out; half-pixel / quad phase and transition coverage await final verdicts from official screenshots.
 - Text: the official two-layer model (pending display buffer + committed surface), `C/R/P/E`, width wrapping / kinsoku, and per-character styling are landed per REA; `TEXTINFO[CX/CY]` too. Remaining: GDI glyph ink/baseline not yet settled against official screenshots (DIV-GFX-056), and command ordering between text and image processing (DIV-GFX-076).
-- Fonts: the game's own "Settings → Font" screen is wired to the full catalogue (host default font first + local system fonts), and switching in-game takes effect immediately; `--font` now means the default font, `--font-lock` keeps the old forced behavior. Remaining: per-glyph missing-glyph fallback and the game's hardcoded default label (DIV-FONT-012).
+- Fonts: the game's own "Settings → Font" screen is wired to the full catalogue (host default font first + local system fonts), and switching in-game takes effect immediately; `--font` now means the default font, `--font-lock` keeps the old forced behavior. Remaining: per-glyph missing-glyph fallback and the game's hardcoded default label (DIV-FONT-012); bitmap fonts (`.fnt/.fon`) have no reference sample and stay explicitly unsupported.
 - Formats: YSTB V2 lacks samples; the legacy YPF NUL-XOR dialect has no samples and is explicitly rejected.
 - Runtime: `CSVINFO` not yet evidenced; `VAR` and `SAVEINFO` aligned with the official no-op behavior.
 - Saves: `FILEACT` layer export not closed out; `FILEACT[EXEC]` refuses to execute (host security policy).

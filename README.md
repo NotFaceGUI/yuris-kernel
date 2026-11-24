@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/logo.png" alt="yuris-kernel" width="112">
+
 <h1>yuris-kernel</h1>
 
 <p><b>YU-RIS 兼容运行时</b><br>
@@ -67,21 +69,37 @@
 
 | 类别 | 形态 / 扩展名 | 状态 |
 | --- | --- | --- |
-| 封包 | `.ypf`（0.495 及更早：换钥 + 压缩条目） | 读 |
-| | `.ypf`（0.500 商业族：明文 zlib + xxh32 载荷校验，Meta22 布局） | 读 |
+| 封包 | `.ypf`（0.255–0.495：LenEncNot 索引、逐字节取反名、zlib 条目；0.495 名字键 0xFF + MurmurHash2 索引） | 读 |
+| | `.ypf`（0.500 商业族：Meta22 布局、明文 zlib、xxh32 载荷校验） | 读 |
+| | 旧 NulXor 方言（NUL 结尾名 + XOR 名）：无真实样本，遇到即显式拒绝 | 未实现（显式拒绝） |
 | | 散盘 `data/` 目录（工程形态） | 读 |
 | | `pac/*.ypf` 按名挂载 + `update1..9.ypf` 依次叠加；伪装成 `.ypf` 的 MPEG-PS 按魔数跳过 | 读 |
 | 表 / 脚本 | `ysbin/ysc.ybn`（YSCM 命令表，0.255–0.555） | 读 / 执行 |
-| | `ysbin/ysl.ybn`（YSLB 全局标签）、`ysbin/ysv.ybn`（YSVR 变量表）、`ysbin/yst_list.ybn` | 读 |
+| | `ysbin/ysl.ybn`（YSLB 全局标签）、`ysbin/ysv.ybn`（YSVR 变量表）、`ysbin/yst_list.ybn`（YSTL 脚本清单） | 读 |
+| | `ysbin/yse.ybn`（YSER 错误名表）、`ysbin/yst.ybn`（YSTD 变量槽）、`ysbin/yscfg.ybn`（YSCF 分辨率/扩展名优先序/标题，四种头部布局） | 读 |
 | | `ysbin/yst%05d.ybn`（YSTB 编译脚本；V5 执行，V2 待真实样本） | 执行 |
-| | `scenario/*.txt`（5xx 剧本 DSL：`#标签`、`\命令`、宏） | 词法 / 执行 |
+| | `scenario/*.txt`（5xx 剧本 DSL：`#标签`、`\命令`、宏；`sc_cn_/sc_tw_scenario/` 原生多语言变体） | 词法 / 执行 |
 | 图像 | PNG / BMP / JPG / GIF / WebP / JXL / QOI / AVIF | 解码 |
+| | YCG 容器（`.ycg`，或 4.7x/4.8x 包内伪装成 `.png` 的 `YCG\0`）：method 0 裸 BGRA / method 1 两段 zlib，输出 BGRA→RGBA | 解码 |
 | | `.ydg`（0.500 容器；QOI/WebP 行瓦片，拼回整图） | 解码 |
 | | `.psb`（0.495 图像码 5） | 识别，无解码器（显式 `asset.unsupported`） |
 | 音频 | WAV PCM / ACM WAVE（非 PCM tag 走系统 ACM） | 解码 |
 | | OGG Vorbis / OGG Opus（0.500） | 解码 |
-| 影片 | MPEG-1 program stream（`.mpg` / 伪装成 `.ypf` 的 MPEG-PS）、YMV | 播放 |
-| 存档 | `.sd`（含 DNO=1024、500 槽内存包） | 读写 |
+| 影片 | MPEG-1 program stream（`.mpg` / 伪装成 `.ypf` 的 MPEG-PS）、YMV（YSMV 双平面帧序列） | 播放 |
+| 存档 / 配置 | `.sd`（YSSD；0x138/0x1E0/0x1E1 布局、DNO=1024、500 槽内存包） | 读写 |
+| | `yssfs.dat`（存档路径设置，128 字节定长记录，`_SAVE_PATH_TYPE` @ +0x54） | 读 |
+
+### 文本与字体
+
+| 项 | 实现 |
+| --- | --- |
+| 字体来源 | 0.495 及更早走系统字体：启动时按官方回退表 `ＭＳ ゴシック` → `標準ゴシック` → `ＭＳ Ｐゴシック` → `ＭＳ 明朝` → `標準明朝` 枚举（参考工程 `data.ypf` 1,407 条中没有字体文件）；v555 官方中文等版本改用预制字形页，见下一行 |
+| TTF / OTF / TTC 栅格 | sfnt 解析（含 TTC face 索引）→ swash 轮廓栅格为 8-bit coverage，对齐官方 GDI `CreateFontIndirectA` + `TextOutA` 路径；`SX/SY` 0–256 px、灰度/二值抗锯齿、合成粗体、颜色/渐变；旋转/描边/阴影仅在 `Reference` 策略下启用 |
+| 位图字形（v555 官方中文/多语言） | 正文用预制字形页：`cgsys_cn/font/font_c20/fnt_s20_nNN` → `CGACT[COPY2]` 按 30 px 字格抠格（X/X2、Y/Y2 含端点，纹理 31×31）→ `MEIDO` 着色 → `MERGE2` 盖到正文/人名层；内核逐轮重新抠格并降级为持久文本图像，避免跨帧外字链丢失（8b58feb，`<v555-4>` 取证） |
+| 传统位图字体 `.fnt/.fon` | 参考工程与官方产物都没有这类独立位图字库文件；本内核不实现该文件格式，遇到也不静默回退（显式不支持） |
+| 补丁字体 | `hook.ini` + ttf 的 CP932 载体字重映射补丁由 `yu-engine` 启动时检测并强制注入全部 `FONT` 请求 |
+| 缺字回退 | 翻译模式自动开启系统字体缺字回退；`--font` 指定默认字体，`--font-lock` 强制锁定 |
+
 
 ### 5xx / v555 现状
 
@@ -124,8 +142,9 @@ Linux / macOS 桌面与真 wasm（内存数据源 + 浏览器存档）的缺口�
 | [![0.481 标题画面](docs/assets/case/1_t.png)](docs/assets/case/1_t.png) | [![0.481 对话](docs/assets/case/1_d.png)](docs/assets/case/1_d.png) | [![0.494 对话](docs/assets/case/2_d.png)](docs/assets/case/2_d.png) |
 | **0.555 · 对话** | **0.555 · 官方中文** | **0.474 · 标题画面** |
 | [![0.555 对话](docs/assets/case/3_d.png)](docs/assets/case/3_d.png) | [![0.555 官方中文](docs/assets/case/4_d.png)](docs/assets/case/4_d.png) | [![0.474 标题画面](docs/assets/case/5_t.png)](docs/assets/case/5_t.png) |
-| **0.466 · 对话** | | |
-| [![0.466 对话](docs/assets/case/6_d.png)](docs/assets/case/6_d.png) | | |
+| **0.466 · 对话** | **0.500 · 标题画面** | **0.500 · 对话** |
+| [![0.466 对话](docs/assets/case/6_d.png)](docs/assets/case/6_d.png) | [![0.500 标题画面](docs/assets/case/7_t.png)](docs/assets/case/7_t.png) | [![0.500 对话](docs/assets/case/8_d.png)](docs/assets/case/8_d.png) |
+
 
 ## 下载
 
@@ -265,14 +284,17 @@ flowchart LR
 
 `--patch` 选汉化路线；桌面、serve、Android 配置界面用同一份取值。
 
-| 汉化类型  | 取值                        | 说明                                                                          |
-| --------- | --------------------------- | ----------------------------------------------------------------------------- |
-| 原版日文  | `original`（`cp932`）       | 未汉化的原版                                                                  |
-| 简体汉化  | `gbk`（`cp936` / `gb2312`） | 汉化补丁；译文放在散盘 `ysbin/`，靠「散盘先于封包」的读链生效                 |
-| 繁体汉化  | `big5`（`cp950`）           | 同上，港台旧作与繁中补丁                                                      |
-| SJIS 隧道 | `tunnel`（`sjis_ext`）      | 不动原编码、追加码点表的补丁；需游戏根有 `sjis_ext.bin`                       |
-| 自动      | `auto`（缺省）              | 按 `codecs.json` → `sjis_ext.bin` → 工具签名识别；不认补丁名                  |
-| 不支持    | —                           | exe / DLL 注入类补丁（如 `setdll` 挂 `MyDll.dll` 换字体）：不改程序，故不适用 |
+| 汉化类型  | 取值（含别名）                        | 说明                                                                          |
+| --------- | ------------------------------------- | ----------------------------------------------------------------------------- |
+| 原版日文  | `original`（`off` / `none` / `cp932` / `sjis` / `shift_jis`） | 未汉化的原版                                                                  |
+| 简体汉化  | `gbk`（`cp936` / `gb2312`）           | 汉化补丁；译文放在散盘 `ysbin/`，靠「散盘先于封包」的读链生效                 |
+| 繁体汉化  | `big5`（`cp950` / `big-5`）           | 同上，港台旧作与繁中补丁                                                      |
+| SJIS 隧道 | `tunnel`（`sjis_ext`）                | 不动原编码、追加码点表的补丁；需游戏根有 `sjis_ext.bin`                       |
+| 自动      | `auto`（缺省）                        | 按 `codecs.json` → `sjis_ext.bin` → 工具签名识别；不认补丁名                  |
+| 运行时翻译 | `--translate` + `translate.json`（CP932 自动扩隧道） | 只替换文件内条目，不写回数据；目标 codec 跟随当前 `--patch` |
+| 补丁字体  | `hook.ini` + ttf（自动检测）          | CP932 载体字重映射；启动时强制注入全部 `FONT` 请求                            |
+| v555 原生多语言 | `config.sd` 语言号 → `scenario/` / `sc_cn_scenario/` / `sc_tw_scenario/` | CP932 / GBK / Big5；不是 `--patch` 汉化路线 |
+| 不支持    | —                                     | exe / DLL 注入类补丁（如 `setdll` 挂 `MyDll.dll` 换字体）：不改程序，故不适用 |
 
 > v555 原生多语言不是 `--patch` 汉化路线：`scenario/`、`sc_cn_scenario/`、
 > `sc_tw_scenario/` 三份变体由 `config.sd` 的语言号选择，codec 分别为
@@ -405,7 +427,8 @@ cargo test --workspace
 - 字体：游戏自带「設定→フォント」已接全量目录（宿主默认字体第一 + 本机
   系统字体），游戏内切换即时生效；`--font` 改为默认字体语义，`--font-lock`
   保留旧强制行为；翻译模式自动打开缺字回退。残余：默认模式仍不逐字形回退、
-  游戏硬编码默认标签（DIV-FONT-012）。
+  游戏硬编码默认标签（DIV-FONT-012）；位图字体（`.fnt/.fon`）参考工程无
+  样本，保持显式不支持。
 - 格式：YSTB V2 缺样本；YPF 旧 NUL-XOR 方言无样本，显式拒绝。
 - 运行时：`CSVINFO` 未取证；`VAR`、`SAVEINFO` 已按官方 no-op 对齐；
   `_STR`、v555 按钮纹理/SPL/背景 CG 仍为 P0。
