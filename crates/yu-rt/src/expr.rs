@@ -1007,8 +1007,10 @@ pub fn decode_self_delimited(
 
 /// 在 `window + tail` 的视图里从 `start` 扫到界定符 `term`。
 ///
-/// 与字面量解码器同一套规则:反斜杠转义跳 2 字节;前导字节连尾字节
-/// 一起跳过(尾字节即使等于界定符也不算闭合)。
+/// 与字面量解码器同一套规则:反斜杠转义跳 2 字节;lead 字节**仅在下一个
+/// 字节是当前编码的合法 trail 时**才成对跳过。trail 不合法(如 v555 用
+/// Big5 静态表扫 SJIS 半角假名后紧跟的界定符 `0x22`)按单字节继续,
+/// 不能把界定符吞进「双字节」。
 fn scan_literal_term(
     window: &[u8],
     tail: &[u8],
@@ -1027,9 +1029,20 @@ fn scan_literal_term(
         if byte == term {
             return Some(index);
         }
-        if byte == b'\\' || codec.is_lead(byte) {
+        if byte == b'\\' {
             index += 2;
             continue;
+        }
+        if codec.is_lead(byte) {
+            let next = if index + 1 < window.len() {
+                Some(window[index + 1])
+            } else {
+                tail.get(index + 1 - window.len()).copied()
+            };
+            if next.is_some_and(|trail| codec.is_trail(trail)) {
+                index += 2;
+                continue;
+            }
         }
         index += 1;
     }
@@ -1202,11 +1215,15 @@ pub fn decode_string_literal_with(
             continue;
         }
         if codec.is_lead(b) {
+            // 成对消费要求尾字节合法:trail 越界/是界定符(0x22 在三种编码
+            // 里都不是合法 trail)时按单字节,保持界定符可闭合。
             if let Some(&next) = body.get(i + 1) {
-                out.push(b);
-                out.push(next);
-                i += 2;
-                continue;
+                if codec.is_trail(next) {
+                    out.push(b);
+                    out.push(next);
+                    i += 2;
+                    continue;
+                }
             }
         }
         out.push(b);
@@ -1378,6 +1395,36 @@ mod tests {
         let out =
             decode_string_literal_with(&raw, yu_format::Codec::Big5).expect("big5 literal");
         assert_eq!(out, raw[1..9].to_vec());
+    }
+
+    /// v555 黑兽2改实测(2026-11-24):exe 静态 lead 表 = Big5,系统脚本
+    /// (CP932)字面量里的 SJIS 半角假名 `0xA1..=0xDF` 在 Big5 下是 lead,
+    /// 紧跟闭合引号时旧实现盲跳 2 字节把界定符吞掉 → 「字面量未闭合」
+    /// Fatal(`es_fontcg.yst:es.IDSubTask2@358 IF`)。三种编码的合法
+    /// trail 都不含 0x22,lead 后跟界定符必须按单字节处理。
+    #[test]
+    fn lead_followed_by_term_is_single_byte_not_a_pair() {
+        let raw = [0x22, 0xde, 0x22];
+        let out = decode_string_literal_with(&raw, yu_format::Codec::Big5)
+            .expect("界定符必须闭合");
+        assert_eq!(out, vec![0xde]);
+
+        // 成对要求不破坏合法双字节:Big5 `0xC5 0x40`(trail 0x40 合法)。
+        let raw = [0x22, 0xc5, 0x40, 0x22];
+        let out =
+            decode_string_literal_with(&raw, yu_format::Codec::Big5).expect("valid pair");
+        assert_eq!(out, vec![0xc5, 0x40]);
+    }
+
+    #[test]
+    fn scan_literal_term_stops_at_quote_after_invalid_trail() {
+        let window = [0x22u8, 0xde, 0x22];
+        let found = scan_literal_term(&window, &[], 1, 0x22, window.len(), yu_format::Codec::Big5);
+        assert_eq!(found, Some(2));
+        // 合法 trail 仍成对跳过:界定符在 trail 之后才命中。
+        let window = [0x22u8, 0xc5, 0x40, 0x22];
+        let found = scan_literal_term(&window, &[], 1, 0x22, window.len(), yu_format::Codec::Big5);
+        assert_eq!(found, Some(3));
     }
 
     #[test]

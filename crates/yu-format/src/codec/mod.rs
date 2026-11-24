@@ -152,6 +152,31 @@ impl Codec {
         }
     }
 
+    /// 该编解码器下双字节字符的合法尾字节区间。
+    ///
+    /// 三种编码的合法 trail 都不含 `0x22`(界定符 `"`)与其它 ASCII 标点:
+    /// CP932 = `0x40..=0xFC` 去 `0x7F`;GBK = `0x40..=0x7E` + `0x80..=0xFE`;
+    /// Big5 = `0x40..=0x7E` + `0xA1..=0xFE`。
+    #[must_use]
+    pub const fn is_trail(self, byte: u8) -> bool {
+        match self {
+            Codec::Cp932 => matches!(byte, 0x40..=0xFC) && byte != 0x7F,
+            Codec::Gbk => matches!(byte, 0x40..=0x7E | 0x80..=0xFE),
+            Codec::Big5 => matches!(byte, 0x40..=0x7E | 0xA1..=0xFE),
+        }
+    }
+
+    /// `(lead, next)` 是否构成该编解码器下完整的双字节字符。
+    ///
+    /// 字面量/文本扫描用这个而不是只看 [`Codec::is_lead`]:lead 后跟的字节
+    /// 不是合法 trail 时按单字节处理,否则会把 ASCII 界定符吞进「双字节」
+    /// (v555 黑兽2改实测:exe 静态表 = Big5,SJIS 半角假名 `0xA1..=0xDF`
+    /// 在 Big5 下是 lead,后面紧跟闭合引号即报「字面量未闭合」)。
+    #[must_use]
+    pub const fn forms_two_byte(self, lead: u8, next: u8) -> bool {
+        self.is_lead(lead) && self.is_trail(next)
+    }
+
     /// 从 `bytes[i]` 起的字符宽度(1 或 2;末尾截断按 1)。
     #[must_use]
     pub fn char_len_at(self, bytes: &[u8], i: usize) -> usize {
