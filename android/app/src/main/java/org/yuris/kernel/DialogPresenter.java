@@ -67,9 +67,47 @@ final class DialogPresenter {
     private Spec current;
     private AlertDialog dialog;
     private boolean destroyed;
+    /** 队列清空时的一次性回调(失败屏用它等用户确认后再返回)。 */
+    private Runnable allDismissed;
+    private boolean allDismissedFired;
+    /**
+     * 是否已经见过至少一条待呈现对话框。
+     *
+     * <p>失败路径会在 `publish()` 之后立刻挂“全部确认”回调;如果只看
+     * `pending.isEmpty()` 就触发,首次快照还没到(或 JSON 为空)时会把
+     * Activity 提前 finish,用户看到的就是「错误框闪一下/退到配置页」。
+     */
+    private boolean sawPending;
 
     DialogPresenter(Activity activity) {
         this.activity = activity;
+    }
+
+    /**
+     * 注册“全部对话框已确认”回调;重复注册覆盖旧的,并可在已空时立即触发。
+     *
+     * <p>渲染线程也会调用(启动/tick 失败路径),所以统一切到 UI 线程,
+     * 与 {@link #publish(String)} 保持同一条消息队列顺序。
+     */
+    void setAllDismissedListener(Runnable callback) {
+        main.post(() -> {
+            allDismissed = callback;
+            allDismissedFired = false;
+            maybeNotifyAllDismissed();
+        });
+    }
+
+    private void maybeNotifyAllDismissed() {
+        if (destroyed || allDismissed == null || allDismissedFired || !sawPending) {
+            return;
+        }
+        if (current != null || !pending.isEmpty() || !order.isEmpty()) {
+            return;
+        }
+        allDismissedFired = true;
+        Runnable callback = allDismissed;
+        allDismissed = null;
+        main.post(callback);
     }
 
     /**
@@ -138,6 +176,11 @@ final class DialogPresenter {
 
         pending.clear();
         pending.putAll(next);
+        if (!next.isEmpty()) {
+            sawPending = true;
+            // 新一轮失败/脚本对话框到来:之前触发过的“已清空”回调重新武装。
+            allDismissedFired = false;
+        }
         // 已回答的 id 从快照消失后即可忘掉（DIALOG id 单调递增，
         // 但长会话里没必要无限累积）。
         answered.retainAll(next.keySet());
@@ -150,6 +193,7 @@ final class DialogPresenter {
         if (current == null) {
             showNext();
         }
+        maybeNotifyAllDismissed();
     }
 
     private void rebuildOrder() {
@@ -173,14 +217,18 @@ final class DialogPresenter {
             show(spec);
             return;
         }
+        maybeNotifyAllDismissed();
     }
 
     private void show(Spec spec) {
         if (activity.isFinishing() || activity.isDestroyed()) {
             return;
         }
+        // 应用本体是深色(配置页/游戏页),对话框也用深色 DeviceDefault,
+        // 避免白底弹窗在深色界面上突兀;仍然是平台对话框,不引入 Material
+        // 主题依赖(MainActivity 用的是非 AppCompat 主题)。
         AlertDialog.Builder builder = new AlertDialog.Builder(
-                activity, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert);
+                activity, android.R.style.Theme_DeviceDefault_Dialog_Alert);
         if (!spec.caption.isEmpty()) {
             builder.setTitle(spec.caption);
         }

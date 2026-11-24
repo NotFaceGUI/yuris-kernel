@@ -8,6 +8,8 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
 import android.view.MotionEvent;
@@ -20,7 +22,9 @@ import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
+import android.widget.ProgressBar;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -119,6 +123,9 @@ public final class MainActivity extends Activity
 
     private android.view.TextureView textureView;
     private TextView hudView;
+    /** 启动加载层(内核 boot 期间盖住黑屏;spinner + 阶段文案)。 */
+    private FrameLayout bootOverlay;
+    private TextView bootLabel;
     /** 左下角版本角标(初始化拿到引擎版本后才显示)。 */
     private TextView versionBadgeView;
     /** 版本角标开关(配置界面「高级设置」,默认开)。 */
@@ -190,6 +197,9 @@ public final class MainActivity extends Activity
     private volatile String statusLine = "";
     /** 已提交给浮层的文本(节流用;只由渲染线程读写)。 */
     private String hudText = "";
+    /** 非模态警告提示的最小间隔(Toast;不阻塞游戏)。 */
+    private static final long HINT_MIN_INTERVAL_MS = 3000;
+    private long lastHintAt;
     /** 状态浮层是否启用(壳侧开关;关掉后不再调 nativeStatus)。 */
     private boolean showHud;
     /** 调试日志是否启用(壳侧开关;关掉后不写 logcat、不落 JSONL)。 */
@@ -443,7 +453,36 @@ public final class MainActivity extends Activity
         badgeParams.setMargins(dp(12), 0, 0, dp(8));
         container.addView(versionBadgeView, badgeParams);
 
+        // 启动加载层:内核 boot 期间(挂 YPF/装表/初始化渲染)盖住黑屏。
+        // 进度来自 NativeHost.nativeBootProgress() 的跨平台 JSON 契约;
+        // 动画本身由壳负责(spinner),内核只给阶段文案。
+        bootOverlay = new FrameLayout(this);
+        bootOverlay.setBackgroundColor(Color.BLACK);
+        bootOverlay.setClickable(true);
+        bootOverlay.setFocusable(true);
+        ProgressBar bootSpinner = new ProgressBar(this);
+        bootSpinner.setIndeterminate(true);
+        FrameLayout.LayoutParams spinnerParams = new FrameLayout.LayoutParams(
+                dp(48), dp(48), Gravity.CENTER);
+        spinnerParams.bottomMargin = dp(32);
+        bootOverlay.addView(bootSpinner, spinnerParams);
+        bootLabel = new TextView(this);
+        bootLabel.setText("正在启动…");
+        bootLabel.setTextColor(Color.WHITE);
+        bootLabel.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14f);
+        bootLabel.setGravity(Gravity.CENTER);
+        FrameLayout.LayoutParams bootLabelParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER);
+        bootLabelParams.topMargin = dp(56);
+        bootOverlay.addView(bootLabel, bootLabelParams);
+        container.addView(bootOverlay, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+
         setContentView(container);
+        startBootProgressPolling();
         // 沉浸式要在 setContentView 之后:onCreate 早期 decorView 还没挂上,
         // `getInsetsController()` 会返回 null 并抛 NPE(实机崩溃已复现)。
         textureView.post(this::applyImmersiveFullscreen);
@@ -580,6 +619,7 @@ public final class MainActivity extends Activity
         //    的 thread_local 里。内核据此只登记一个销毁请求,由渲染线程自己
         //    在下一帧 tick 前释放引擎(旧实现在这里静默返回 -1,会话根本没释放)。
         dialogPresenter.dismissAll();
+        hideBootLoading();
         stopRenderLoop();
         NativeHost.nativeShutdown();
         super.onDestroy();
@@ -801,8 +841,19 @@ public final class MainActivity extends Activity
             }
         }
         if (init.startsWith("ERR")) {
+            hideBootLoading();
             statusLine = init;
-            drawError();
+            // 启动失败也在游戏界面（MainActivity）弹:内核已把原因放进
+            // `source=host` 的 DIALOG 快照。先 publish 再挂“全部确认”回调，
+            // 避免首帧快照未到就把 Activity 提前 finish；用户点 OK 后才回
+            // 配置页。没有可呈现原因时才退回错误屏。
+            String dialogs = NativeHost.nativePendingDialogs();
+            if (!dialogs.isEmpty()) {
+                dialogPresenter.publish(dialogs);
+                dialogPresenter.setAllDismissedListener(this::setResultAndReturn);
+            } else {
+                drawError();
+            }
             return;
         }
         sessionReady = true;
@@ -885,9 +936,10 @@ public final class MainActivity extends Activity
                 break;
             }
             if (tickResult != 0) {
+                // 内核在失败前已把原因放进同一份 DIALOG 快照(source=host);
+                // 这里**不能** dismissAll,否则错误框还没呈现就被丢掉。
                 statusLine = NativeHost.nativeStatus();
                 Log.e(TAG, "tick failed: " + statusLine);
-                dialogPresenter.dismissAll();
                 tickFailed = true;
                 break;
             }
@@ -911,6 +963,20 @@ public final class MainActivity extends Activity
                 }
                 dialogPending = pending;
                 dialogPresenter.publish(dialogJson);
+            }
+
+            // Recoverable 诊断只做非模态提示:不进 DIALOG,否则每帧资源缺失
+            // 会把游戏堵死。有错误对话框时不抢焦点,3 秒内最多提示一次。
+            if (!dialogPending) {
+                long now = SystemClock.elapsedRealtime();
+                if (now - lastHintAt >= HINT_MIN_INTERVAL_MS) {
+                    String hint = NativeHost.nativeTakeHint();
+                    if (hint != null && !hint.isEmpty()) {
+                        lastHintAt = now;
+                        runOnUiThread(() -> Toast.makeText(
+                                this, hint, Toast.LENGTH_SHORT).show());
+                    }
+                }
             }
 
             int[] size = NativeHost.nativeFrameSize();
@@ -1077,6 +1143,8 @@ public final class MainActivity extends Activity
         if (!running && !gameFinished && !tickFailed) {
             Log.i(TAG, "render loop stopped by host (session torn down)");
         }
+        // 失败对话框必须在 shutdown 之前取走:shutdown 会清空全局快照。
+        String failureDialogsJson = tickFailed ? NativeHost.nativePendingDialogs() : "";
         // 内核已经在本线程上释放过会话(TICK_HOST_SHUTDOWN)时不能再调一次:
         // 那会在已空槽的线程上再登记一个销毁请求,而没有人会消费它 ⇒
         // 下次启动的第一帧就被它销毁。
@@ -1086,7 +1154,15 @@ public final class MainActivity extends Activity
         sessionReady = false;
         Log.i(TAG, "render loop stopped");
         if (tickFailed) {
-            drawError();
+            if (!failureDialogsJson.isEmpty()) {
+                // 错误/panic 与脚本 DIALOG 走同一个呈现器:先 publish 让
+                // 快照进入队列,再挂“全部确认后回配置页”的回调。
+                dialogPresenter.publish(failureDialogsJson);
+                dialogPresenter.setAllDismissedListener(this::setResultAndReturn);
+            } else {
+                // 内核没给可呈现的原因(理论上不应发生):保留旧错误屏兜底。
+                drawError();
+            }
         }
         if (gameFinished) {
             // 回到配置界面(同一任务栈):用户可以从那里再启动或退出 app。
@@ -1102,6 +1178,60 @@ public final class MainActivity extends Activity
      * (实机截图确认)。游戏是 4:3,宽屏上左右仍会有黑边,这是正确行为;
      * 但底部那一条属于系统栏,必须让出去。
      */
+    /**
+     * 启动期间轮询内核阶段进度;动画由壳负责,内核只给 active/stage/detail。
+     *
+     * <p>初始化和渲染在渲染线程,UI 线程必须保持响应,否则黑屏期间连
+     * spinner 都不会转。轮询到 active=false / 会话就绪即隐藏。
+     */
+    private void startBootProgressPolling() {
+        Handler handler = new Handler(Looper.getMainLooper());
+        Runnable poll = new Runnable() {
+            @Override
+            public void run() {
+                if (sessionReady || bootOverlay == null) {
+                    hideBootLoading();
+                    return;
+                }
+                try {
+                    String json = NativeHost.nativeBootProgress();
+                    if (json != null && !json.isEmpty()) {
+                        org.json.JSONObject progress = new org.json.JSONObject(json);
+                        if (!progress.optBoolean("active", false)) {
+                            // boot 阶段结束但首帧/上屏还没就绪:继续转,
+                            // 避免又露出一段黑屏。
+                            if (bootLabel != null) {
+                                bootLabel.setText("正在准备画面…");
+                            }
+                        } else {
+                            String detail = progress.optString("detail", "");
+                            if (!detail.isEmpty() && bootLabel != null) {
+                                bootLabel.setText(detail);
+                            }
+                        }
+                    }
+                } catch (Throwable error) {
+                    // 进度是纯展示,解析失败不能影响启动。
+                    Log.w(TAG, "boot progress parse failed", error);
+                }
+                handler.postDelayed(this, 150);
+            }
+        };
+        handler.post(poll);
+    }
+
+    private void hideBootLoading() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread(this::hideBootLoading);
+            return;
+        }
+        if (bootOverlay != null) {
+            bootOverlay.setVisibility(View.GONE);
+            bootOverlay = null;
+            bootLabel = null;
+        }
+    }
+
     private void applyImmersiveFullscreen() {
         Window window = getWindow();
         window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);

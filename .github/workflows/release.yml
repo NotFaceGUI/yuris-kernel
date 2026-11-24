@@ -210,9 +210,11 @@ jobs:
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           echo "ANDROID_HOME=$SDK"
           echo "预装 NDK:"; ls "$SDK/ndk" 2>/dev/null || true
-          # compileSdk/targetSdk=36 对应的 platform 与 build-tools 不一定预装；
-          # 已装时 sdkmanager 是幂等的快速 no-op。
-          yes 2>/dev/null | sdkmanager --install "platforms;android-36" "build-tools;36.0.0" >/dev/null \
+          # compileSdk=37（Miuix 的 AAR 元数据要求）/ targetSdk=36 对应的
+          # platform 与 build-tools 不一定预装；已装时 sdkmanager 是幂等的
+          # 快速 no-op。android-37 在预览通道可能叫 android-37.0，两个都试。
+          yes 2>/dev/null | sdkmanager --install "platforms;android-37" "build-tools;37.0.0" >/dev/null \
+            || yes 2>/dev/null | sdkmanager --install "platforms;android-37.0" "build-tools;37.0.0" >/dev/null \
             || echo "::warning::sdkmanager 安装失败，继续使用镜像预装组件"
           ls "$SDK/platforms" 2>/dev/null || true
 

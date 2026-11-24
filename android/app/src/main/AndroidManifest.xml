@@ -23,6 +23,8 @@
          Android 10 上内核才能按 /sdcard/... 真实路径读写任意游戏目录。 -->
     <application
         android:label="${appLabel}"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:hardwareAccelerated="true"
         android:largeHeap="true"
         android:theme="@style/Theme.YuKernel"
@@ -30,15 +32,22 @@
         android:extractNativeLibs="false"
         android:requestLegacyExternalStorage="true">
 
-        <!-- 启动即选游戏目录;选中后直接在该目录运行。 -->
+        <!-- 普通启动:游戏库(Miuix 网格)。点卡片进 SetupActivity 配参数。 -->
         <activity
-            android:name=".SetupActivity"
+            android:name=".LibraryActivity"
             android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+        </activity>
+
+        <!-- 单游戏配置页;普通入口来自游戏库,Tyranor 入口仍是本 Activity。 -->
+        <activity
+            android:name=".SetupActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden">
 
             <!-- Tyranor-Next 第三方 APK 运行时模块入口。
                  宿主只按 applicationId 前缀 com.tyranor.runtime.* 发现模块,
@@ -53,6 +62,12 @@
                 android:name="com.tyranor.runtime.MANIFEST"
                 android:resource="@raw/tyranor_runtime" />
         </activity>
+
+        <!-- 参数说明(详情页右上角问号),独立 Activity 以复用系统转场动画。 -->
+        <activity
+            android:name=".HelpActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
 
         <activity
             android:name=".MainActivity"

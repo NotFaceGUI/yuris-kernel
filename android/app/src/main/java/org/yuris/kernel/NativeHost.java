@@ -78,6 +78,16 @@ public final class NativeHost {
      * 壳**不得**再自己判断目录里有什么 —— 手抄规则必然与引擎漂移。
      */
     public static native String nativeProbeGameRoot(String path);
+
+    /**
+     * 从游戏根目录的 exe 资源里取窗口图标(PE {@code RT_GROUP_ICON}/{@code RT_ICON})。
+     *
+     * <p>返回 {@code [width, height, ARGB_8888...]};空数组 = 没有可解图标
+     * (或根目录没有 exe)。与 {@link #nativeProbeGameRoot} 同源,扫描/解码
+     * 只在内核侧做一次;请放在后台线程调用(会读最大 64 MiB 的 exe)。
+     */
+    public static native int[] nativeGameIcon(String gameRoot);
+
     /**
      * 导出文本/角色表(跨平台 {@code yu-engine::export};不启动引擎、不依赖渲染线程)。
      *
@@ -225,4 +235,20 @@ public final class NativeHost {
      *         打开**（通常是字符不可映射 CP932、按钮越界或快照过期）。
      */
     public static native String nativeAnswerDialog(long id, int button, String text);
+
+    /**
+     * 取走最新一条**非模态提示**(Recoverable 警告);{@code null} = 没有。
+     *
+     * <p>警告不进 DIALOG 队列,否则每帧资源缺失会把游戏堵死。壳用
+     * Toast/横幅提示即可,不阻塞输入;**可从任意线程调用**。
+     */
+    public static native String nativeTakeHint();
+
+    /**
+     * 启动进度 JSON(壳在 UI 线程轮询,显示 spinner/阶段文案)。
+     *
+     * <p>契约:{@code {"active":true,"stage":"mount","detail":"挂载游戏数据…"}};
+     * 内核只暴露事实,动画由壳实现。可从任意线程调用。
+     */
+    public static native String nativeBootProgress();
 }

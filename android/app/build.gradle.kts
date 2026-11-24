@@ -1,5 +1,8 @@
 plugins {
     id("com.android.application")
+    // 游戏库页用 Compose + Miuix(HyperOS 风);Java 配置页/游戏页保持原样。
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 // 发布注入(全部可选,本地不传即用缺省值):
@@ -56,7 +59,9 @@ if (!hasReleaseSigning && System.getenv("GITHUB_ACTIONS") == "true") {
 
 android {
     namespace = "org.yuris.kernel"
-    compileSdk = 36
+    // Miuix 0.9.2 的 AAR 元数据要求 compileSdk >= 37(Android 17 SDK);
+    // targetSdk 仍保持 36,不引入 Android 17 的运行时行为变更。
+    compileSdk = 37
 
     defaultConfig {
         // Tyranor-Next 只按 com.tyranor.runtime.* 前缀识别第三方运行时模块;
@@ -103,6 +108,18 @@ android {
     }
 
     buildTypes {
+        debug {
+            // 真机上已有同包名但不同签名的安装时,用后缀并排装一份调试壳
+            // (不覆盖用户数据):gradle -PdebugAppIdSuffix=.newui assembleDebug
+            val debugSuffix = (project.findProperty("debugAppIdSuffix") as String?)
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+            if (debugSuffix != null) {
+                applicationIdSuffix = debugSuffix
+                versionNameSuffix = "-dev"
+                manifestPlaceholders["appLabel"] = "YU-RIS Kernel (dev)"
+            }
+        }
         release {
             isMinifyEnabled = false
             // 有 secrets ⇒ 正式签名;没有 ⇒ debug 签名(仅本机自用调试)。
@@ -119,6 +136,11 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    buildFeatures {
+        // 只有 LibraryActivity(Kotlin/Compose)用到;Java 壳不依赖。
+        compose = true
+    }
+
     // so 由 cargo 构建后落到 jniLibs;不在这里跑 cargo(保持 Gradle 离线可用)。
     sourceSets {
         getByName("main") {
@@ -132,6 +154,12 @@ android {
     }
 }
 
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
+}
+
 // 配置期打印一次签名来源,构建日志里能直接看出这个 APK 是不是正式签的。
 if (hasReleaseSigning) {
     logger.lifecycle("APK 签名: release keystore ($releaseKeystoreFile, alias=$releaseKeyAlias)")
@@ -142,36 +170,31 @@ if (hasReleaseSigning) {
 // 只用最通用的官方库:AppCompat(主题/控件/对话框)+ core(动画与兼容工具)。
 // 不引 Material Components(本机 Gradle 缓存里没有,离线构建会失败)。
 dependencies {
-    // 本机 Gradle 缓存里**依赖树完整**的一套(离线/受限网络唯一可用组合):
-    // appcompat 1.6.1 + core 1.13.1 + activity 1.8.1 + fragment 1.7.1 +
-    // lifecycle 2.7.0 + annotation-jvm 1.8.x。更高版本会拉未缓存的传递依赖。
+    // 配置页/游戏页(Java + AppCompat)。游戏画面仍走 TextureView + JNI,
+    // 不因 UI 重构而改动渲染路径。
     implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("androidx.core:core:1.13.1")
+    implementation("androidx.core:core:1.18.0")
+
+    // 游戏库页(Compose + Miuix)。Miuix 0.9.2 的 AAR 元数据要求
+    // compileSdk 37;传递依赖里的 Compose 版本与本地缓存一致(见探针)。
+    implementation("top.yukonga.miuix.kmp:miuix-ui:0.9.2")
+    implementation("androidx.activity:activity-compose:1.13.0")
+    implementation("androidx.compose.foundation:foundation:1.11.2")
+
+    // JetBrains Compose 的 lifecycle 传递依赖要求 2.9.4/2.9.6;本机缓存
+    // 只有 2.10.0,统一抬到 2.10.0(与 Compose 1.11.2 配套)。
     constraints {
-        implementation("androidx.appcompat:appcompat:1.6.1")
-        implementation("androidx.appcompat:appcompat-resources:1.6.1")
-        implementation("androidx.core:core:1.13.1")
-        implementation("androidx.activity:activity:1.8.1")
-        implementation("androidx.fragment:fragment:1.7.1")
-        implementation("androidx.lifecycle:lifecycle-common:2.7.0")
-        implementation("androidx.lifecycle:lifecycle-runtime:2.7.0")
-        implementation("androidx.lifecycle:lifecycle-viewmodel:2.7.0")
-        implementation("androidx.lifecycle:lifecycle-viewmodel-savedstate:2.7.0")
-        implementation("androidx.lifecycle:lifecycle-livedata:2.7.0")
-        implementation("androidx.lifecycle:lifecycle-livedata-core:2.7.0")
-        implementation("androidx.lifecycle:lifecycle-process:2.7.0")
-        implementation("androidx.savedstate:savedstate:1.2.1")
-        implementation("androidx.arch.core:core-common:2.2.0")
-        implementation("androidx.arch.core:core-runtime:2.2.0")
-        implementation("androidx.collection:collection:1.2.0")
-        implementation("androidx.annotation:annotation:1.8.2")
-        implementation("androidx.annotation:annotation-jvm:1.8.2")
-        implementation("androidx.annotation:annotation-experimental:1.4.1")
-        implementation("org.jetbrains.kotlin:kotlin-stdlib:1.8.22")
-        implementation("org.jetbrains.kotlin:kotlin-stdlib-common:1.8.22")
-        implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22")
-        implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.20")
-        implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
-        implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+        // AppCompat 1.6.1 默认拉 fragment 1.3.6(本机未缓存);抬到 1.8.6,
+        // 与 Compose 1.11 的 activity/savedstate 组合一起验证过。
+        implementation("androidx.fragment:fragment:1.8.6")
+        implementation("androidx.lifecycle:lifecycle-common:2.10.0")
+        implementation("androidx.lifecycle:lifecycle-runtime:2.10.0")
+        implementation("androidx.lifecycle:lifecycle-runtime-compose:2.10.0")
+        implementation("androidx.lifecycle:lifecycle-viewmodel:2.10.0")
+        implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.10.0")
+        implementation("androidx.lifecycle:lifecycle-viewmodel-savedstate:2.10.0")
+        implementation("androidx.lifecycle:lifecycle-livedata:2.10.0")
+        implementation("androidx.lifecycle:lifecycle-livedata-core:2.10.0")
+        implementation("androidx.lifecycle:lifecycle-process:2.10.0")
     }
 }
