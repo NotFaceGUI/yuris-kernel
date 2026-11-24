@@ -84,6 +84,13 @@ fn main() -> Result<(), Failure> {
             PathBuf::from(path),
         ));
     }
+    let font_bytes = take_flag(&mut args, "--font")
+        .map(|path| {
+            std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("--font 读取 {path} 失败: {e}"))
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
     let mut args = args.into_iter();
     let root = args.next().expect("project root");
     let frames: u32 = args
@@ -94,6 +101,7 @@ fn main() -> Result<(), Failure> {
     let project = Project::discover(std::path::Path::new(&root), None)?;
     let opts = EngineOptions {
         save_root,
+        font_bytes,
         // 探针只取画面证据;音频设备在无声/无设备环境会让 tick 阻塞。
         os_sound: false,
         ..EngineOptions::default()
@@ -164,6 +172,37 @@ fn main() -> Result<(), Failure> {
                         for (id, z, alpha, visible) in snap.iter().filter(|(_, z, _, _)| *z >= 150)
                         {
                             println!("  L z={z} a={alpha} vis={visible} {id}");
+                        }
+                    }
+                }
+                if std::env::var_os("YU_TEXT_TRACE").is_some() {
+                    if let Some(state) = engine.gfx_state() {
+                        let (bytes, _flags, style, _origin) = state.text_state();
+                        println!(
+                            "  T pending={:?} size=({},{}) name={:?}",
+                            String::from_utf8_lossy(bytes),
+                            style.size_x,
+                            style.size_y,
+                            style
+                                .name
+                                .as_deref()
+                                .map(|b| String::from_utf8_lossy(b).into_owned())
+                        );
+                    }
+                    if let Some(frame) = engine.last_frame() {
+                        if let Some(layout) = &frame.text_layout {
+                            println!("  T layout chars={}", layout.chars);
+                        }
+                        for draw in frame.text_draws.iter().take(8) {
+                            println!(
+                                "  T draw x={} y={} set={} bytes={:?} size=({},{})",
+                                draw.x,
+                                draw.y,
+                                draw.set,
+                                String::from_utf8_lossy(&draw.bytes),
+                                draw.style.size_x,
+                                draw.style.size_y
+                            );
                         }
                     }
                 }

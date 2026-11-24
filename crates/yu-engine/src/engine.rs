@@ -14,8 +14,8 @@ use crate::host_paths::{HostPathOverrides, PlatformHome as HostPlatformHome};
 use yu_backend_soft::{frame_has_drawable_output, SoftRenderer};
 use yu_backend_wgpu::{DeviceOptions, GpuBackend, WgpuRenderer};
 use yu_gfx::{
-    json, probe_order_from_codes, CompositorFrame, GfxConfig, GfxHost, GfxState, Op, PassTarget,
-    SizeU32, TextureRef, TextureSampler, Viewport,
+    json, probe_order_from_codes, probe_order_from_codes_v500, CompositorFrame, GfxConfig,
+    GfxHost, GfxState, Op, PassTarget, SizeU32, TextureRef, TextureSampler, Viewport,
 };
 use yu_render_core::{png, RenderPhases, RenderReport, Surface, TextureStore};
 use yu_rt::input::{InputFrame, InputTimeline};
@@ -3294,8 +3294,10 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     let mut vm = Vm::boot_with_aux(source, Some(aux), boot)
         .map_err(|d| Failure::runtime(format!("boot 失败: {d}")))?;
     crate::host_ui::report_boot_progress("vm", "初始化虚拟机…");
-    // 独立商业分支运行面:只对精确 555 安装;旧版不安装,保持 c1549eb 行为。
-    if vm.semantics().is_v555() {
+    // 独立商业分支运行面:555 商业族(0.500/0.555)安装;旧版不安装,
+    // 保持 c1549eb 行为。0.500 的 `ysc.ybn` 是 121 槽同族表,`TEXT` 等
+    // 处理体已按反编译对拍确认与 v555 同形(`<v500-relirium>`)。
+    if vm.semantics().is_v555_family() {
         vm.install_other_runtime();
     }
     // 游戏身份(窗口标题/图标/版本;宿主变量,不参与 VM 语义)。
@@ -3323,7 +3325,13 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         )));
     }
     let probe_order = {
-        let from_config = probe_order_from_codes(&vm.tables().boot.config.image_ext_order);
+        // 扩展码表按构建换代:0.500 的 1/2 互换、5 换成 `.ydg`
+        // (证据见 `yu_gfx::ImageFormat::from_code_v500`)。
+        let from_config = if vm.tables().boot.yscm.version == 500 {
+            probe_order_from_codes_v500(&vm.tables().boot.config.image_ext_order)
+        } else {
+            probe_order_from_codes(&vm.tables().boot.config.image_ext_order)
+        };
         if from_config.is_empty() {
             yu_gfx::frame::default_probe_order()
         } else {
@@ -3332,7 +3340,9 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
     };
     let mut gfx_config = GfxConfig::new(viewport)
         .with_display(display.clone())
-        .with_button_number_info(vm.semantics().is_v555());
+        // `CGINFO[LINT/LINT2]` 回读:0.500 的 CGINFO 处理体与 v555 同形
+        // (3552B、归一化反编译逐行一致),按钮脚本同一套 `es_button*.yst`。
+        .with_button_number_info(vm.semantics().is_v555_family());
     // 0.255 的 62 字节 YSCF 短头没有扩展名优先序字段(布局已判定为
     // "无该字段");此时把宿主自己的探测序**显式注入**,而不是让内核
     // 在 GfxState 里静默兜底(A5)。V5/V292 仍只认工程 yscfg。
@@ -3340,6 +3350,7 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         gfx_config = gfx_config.with_image_probe_order(probe_order.clone());
     }
     gfx_config.cg_timing = opts.tuning.cg_timing;
+    crate::host_ui::report_boot_progress("render", "初始化渲染…");
     let mut gfx_state = GfxState::from_tables(vm.tables(), gfx_config)
         .map_err(|d| Failure::runtime(format!("GfxState 构造失败: {d}")))?;
     // 引擎全局纹理过滤真值:`FUN_00460924` 读完 `yscfg.dat` 后**无条件**写
@@ -3401,7 +3412,13 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         // 官方 0.495 架构(REA `0x422ab0` → `0x422c65`):装载只读头部
         // (`ov_time_total`)并建 0.5s 环,音频按需解码;本内核同构
         // (`yu_sound::stream`),不在 tick 里整段解码。
-        let sound_state = Arc::new(Mutex::new(SoundState::new(Box::new(loader))));
+        let sound_state = Arc::new(Mutex::new({
+            let mut sound = SoundState::new(Box::new(loader));
+            // 0.500/0.555 商业族的声音扩展名表含 `.opus`(官方 exe
+            // `0x1d95e0`);旧版只有 `.ogg/.wav`。按语义档门控,不按游戏名。
+            sound.set_probe_opus(vm.semantics().is_v555_family());
+            sound
+        }));
         let yscm = vm.tables().boot.yscm.clone();
         vm.set_sound_host(Box::new(SoundHost::new(sound_state.clone(), yscm)));
         Some(sound_state)
@@ -3432,9 +3449,10 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
             if vm.semantics().save_image == yu_rt::semantics::SaveImageMode::V555 {
                 state.set_image_layout_override(Some(yu_save::image_block::LAYOUT_V555));
             }
-            // v555 的文件 DNO=1024 归 `SAVE[MEM=99999]` 内存包所有;
-            // 旧版的 1024 仍是普通块,不能一并保留。
-            state.set_mem_pack_reserved_dno(vm.semantics().save_mem_pack);
+            // 带 MEM 的商业表(0.481/0.494/0.500/0.555)在同一写盘窗口
+            // 重复预约 DNO 时直接错误返回(0.481 `0x44dc19` / 0.555
+            // `0x44b874:155`);DNO=1024 不是保留号。
+            state.set_duplicate_dno_error(vm.semantics().save_mem_pack);
             // 容器版本 = **官方 exe 的 LOAD 校验常量**,不是 yscfg/引擎版本:
             // 0.495→0x1E0、0.479→0x138、0.466→0x0C0、0.481→0x1E1(REA
             // 2026-11-15)。写错会导致官方弹 yse 108040「セーブデータの

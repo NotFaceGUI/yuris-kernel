@@ -65,7 +65,7 @@ fn main() {
         ..BootConfig::default()
     };
     let mut vm = Vm::boot_with_aux(src, Some(aux), cfg).expect("boot");
-    if vm.tables().boot.yscm.version == 555 {
+    if vm.semantics().is_v555_family() {
         vm.install_other_runtime();
     }
     let scripts = vm.tables().boot.scripts.clone();
