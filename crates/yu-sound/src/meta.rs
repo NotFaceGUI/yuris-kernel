@@ -55,6 +55,9 @@ impl AudioMeta {
 /// 探测容器头部。错误语义与 [`crate::decode::decode`] 同型(容器不可识别)。
 pub fn probe(name: &[u8], bytes: &[u8]) -> Result<AudioMeta, Diag> {
     if bytes.len() >= 4 && &bytes[0..4] == b"OggS" {
+        if ogg_is_opus(bytes) {
+            return probe_opus(name, bytes);
+        }
         return probe_ogg(name, bytes);
     }
     if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
@@ -67,6 +70,58 @@ pub fn probe(name: &[u8], bytes: &[u8]) -> Result<AudioMeta, Diag> {
             bytes.len()
         ),
     ))
+}
+
+/// Ogg 容器里是否装 Opus：首个 page 的载荷含 `OpusHead`
+/// （RFC 7845 §5.1，ident header 必须单独占第一页）。只扫头部 1 KiB。
+#[must_use]
+pub(crate) fn ogg_is_opus(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 || &bytes[0..4] != b"OggS" {
+        return false;
+    }
+    let end = bytes.len().min(1024);
+    bytes[..end].windows(8).any(|w| w == b"OpusHead")
+}
+
+/// Ogg Opus 头部：`OpusHead` 给声道/pre-skip，尾页 granule 给总样本数。
+///
+/// RFC 7845：granule 与 pre-skip 都以 48 kHz 计；可播放帧数 =
+/// `末页 granule - pre_skip`（末页 granule 已含 end-trim）。
+fn probe_opus(name: &[u8], bytes: &[u8]) -> Result<AudioMeta, Diag> {
+    let fail = |detail: String| {
+        error::recoverable(
+            code::DECODE_FAILED,
+            format!("Ogg Opus 头解析失败({}): {detail}", display(name)),
+        )
+    };
+    let page = ogg_scan(bytes).ok_or_else(|| fail("page 链不完整".to_string()))?;
+    let payload = page
+        .first_payload
+        .ok_or_else(|| fail("缺首个 page 载荷".to_string()))?;
+    // ident packet: "OpusHead"[version u8][channels u8][pre_skip u16 LE]
+    //               [input_rate u32 LE][gain i16][mapping u8]
+    if payload.len() < 19 || &payload[..8] != b"OpusHead" {
+        return Err(fail("首个包不是 OpusHead".to_string()));
+    }
+    let channels = u16::from(payload[9]);
+    let pre_skip = u64::from(u16::from_le_bytes([payload[10], payload[11]]));
+    if channels == 0 {
+        return Err(error::fatal(
+            code::DECODE_FAILED,
+            format!("Ogg Opus 头非法({}): channels=0", display(name)),
+        ));
+    }
+    Ok(AudioMeta {
+        // 容器仍是 Ogg，官方 CODEC 报 1；编码器细节不改变该字段。
+        codec: Codec::Ogg,
+        channels,
+        bits: 16,
+        // Opus 解码恒为 48 kHz（RFC 7845 §4）；头部 input_rate 仅信息性。
+        sample_rate: 48_000,
+        total_frames: page
+            .total_frames
+            .map(|granule| granule.saturating_sub(pre_skip)),
+    })
 }
 
 /// OGG Vorbis 头部:ident header + 首个逻辑流的最后 granule。
@@ -460,6 +515,7 @@ mod tests {
         ident.push(0xB8);
         let mut bytes = page(7, 0, &ident);
         bytes.extend_from_slice(&page(7, 12345, &[0u8; 4]));
+        assert!(!ogg_is_opus(&bytes), "Vorbis 不得误判为 Opus");
         let meta = probe(b"a.ogg", &bytes).expect("probe");
         assert_eq!(meta.codec, Codec::Ogg);
         assert_eq!(meta.channels, 2);
@@ -467,6 +523,45 @@ mod tests {
         assert_eq!(meta.total_frames, Some(12345));
         let expected = ((12345u128 * 1000 + 44100 / 2) / 44100) as i64;
         assert_eq!(meta.total_ms(), Some(expected));
+    }
+
+    #[test]
+    fn ogg_opus_head_and_granule_are_read() {
+        // 0.500 语料形态:OpusHead + 尾页 granule;总帧数 = granule - pre_skip。
+        fn page(serial: u32, granule: i64, payload: &[u8]) -> Vec<u8> {
+            assert!(payload.len() <= 255);
+            let mut out = Vec::new();
+            out.extend_from_slice(b"OggS");
+            out.push(0);
+            out.push(if granule < 0 { 0x00 } else { 0x04 });
+            out.extend_from_slice(&granule.to_le_bytes());
+            out.extend_from_slice(&serial.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.push(1);
+            out.push(payload.len() as u8);
+            out.extend_from_slice(payload);
+            out
+        }
+        let mut head = b"OpusHead".to_vec();
+        head.push(1); // version
+        head.push(2); // channels
+        head.extend_from_slice(&312u16.to_le_bytes()); // pre_skip
+        head.extend_from_slice(&48_000u32.to_le_bytes()); // input rate(信息性)
+        head.extend_from_slice(&0i16.to_le_bytes()); // output gain
+        head.push(0); // mapping family 0
+        let mut bytes = page(9, 0, &head);
+        // 可播放 12345 帧 ⇒ granule = 12345 + pre_skip(312)。
+        bytes.extend_from_slice(&page(9, 12_345 + 312, &[0u8; 4]));
+        assert!(ogg_is_opus(&bytes), "OpusHead 必须识别为 Opus");
+        let meta = probe(b"a.opus", &bytes).expect("probe");
+        assert_eq!(meta.codec, Codec::Ogg);
+        assert_eq!(meta.channels, 2);
+        assert_eq!(meta.bits, 16);
+        assert_eq!(meta.sample_rate, 48_000, "Opus 恒按 48 kHz 解码");
+        assert_eq!(meta.total_frames, Some(12_345));
+        assert_eq!(meta.total_ms(), Some(257));
+        assert!(meta.is_exact());
     }
 
     #[test]

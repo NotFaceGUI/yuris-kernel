@@ -1,5 +1,5 @@
-//! 解码：OGG Vorbis（lewton）、RIFF WAVE PCM（hound）与 ACM WAVE
-//! （win32 ACM 转换，`acm` 模块）。
+//! 解码：OGG Vorbis（lewton）、Ogg Opus（opus-pure）、RIFF WAVE PCM（hound）
+//! 与 ACM WAVE（win32 ACM 转换，`acm` 模块）。
 //!
 //! 证据：
 //! - 手册 `sound/sound.html`：可播放 OGG/WAVE；“特殊コーデック形式の WAVE
@@ -17,12 +17,17 @@
 //! - CODEC 取值（手册）：`0=WAVE / 1=OGG / 2=ACM WAVE`；REA 侧内部字段
 //!   `+0x107` 的写入点：OGG `0x422ab0` 写 1，PCM WAVE `0x422e04` 写 0，
 //!   ACM 分支写 2。
+//! - **0.500 的 Ogg 流可以是 Opus**：官方 exe 的 12 项扩展名表
+//!   （`0x1d95e0`）含 `.opus`，本作 `yscfg.sound_ext_order = [4,…]`、
+//!   25,307 个 `.opus` 资产。Opus 仍在 Ogg 容器内，`CODEC` 仍报 1（OGG），
+//!   只是音频编码是 Opus（RFC 6716/7845）。
 
 use std::io::Cursor;
 
 use yu_log::Diag;
 
 use crate::error::{self, code};
+
 
 /// 对外 CODEC 值（手册）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +121,9 @@ pub fn decode(name: &[u8], bytes: &[u8]) -> Result<Pcm, Diag> {
 }
 
 fn decode_ogg(name: &[u8], bytes: &[u8]) -> Result<Pcm, Diag> {
+    if crate::meta::ogg_is_opus(bytes) {
+        return decode_opus(name, bytes);
+    }
     let mut reader = lewton::inside_ogg::OggStreamReader::new(Cursor::new(bytes)).map_err(|e| {
         error::recoverable(
             code::DECODE_FAILED,
@@ -156,8 +164,75 @@ fn decode_ogg(name: &[u8], bytes: &[u8]) -> Result<Pcm, Diag> {
     })
 }
 
-fn decode_wav(name: &[u8], bytes: &[u8]) -> Result<Pcm, Diag> {
-    // 官方 WAVE 装载（`0x422e04`）：`fmt tag == 1` 走 PCM 直解；
+/// Ogg Opus 整段解码（非流式路径；流式见 `stream::Kind::Opus`）。
+///
+/// `Trim` 负责 RFC 7845 的 pre-skip 与末页 granule 的 end-trim；`decode_s16`
+/// 与 libopus 的 `opus_decode` 同型（先 soft-clip 再转 16-bit）。
+fn decode_opus(name: &[u8], bytes: &[u8]) -> Result<Pcm, Diag> {
+    let mut reader = opus_pure::OggOpusReader::new(Cursor::new(bytes)).map_err(|e| {
+        error::recoverable(
+            code::DECODE_FAILED,
+            format!("Ogg Opus 头解析失败({}): {e}", display(name)),
+        )
+    })?;
+    let head = reader.head().clone();
+    let channels = usize::from(head.channel_count);
+    if channels == 0 {
+        return Err(error::fatal(
+            code::DECODE_FAILED,
+            format!("Ogg Opus 头非法({}): channels=0", display(name)),
+        ));
+    }
+    let mut decoder = head.decoder(48_000).map_err(|e| {
+        error::recoverable(
+            code::DECODE_FAILED,
+            format!("Ogg Opus 解码器初始化失败({}): {e}", display(name)),
+        )
+    })?;
+    let mut trim = opus_pure::Trim::new(&head, 48_000, channels).map_err(|e| {
+        error::recoverable(
+            code::DECODE_FAILED,
+            format!("Ogg Opus pre-skip 解析失败({}): {e}", display(name)),
+        )
+    })?;
+    let mut packet = opus_pure::OggPacket::new(Vec::new(), -1, false);
+    let mut block = vec![0i16; opus_pure::MAX_PACKET_SAMPLES * channels];
+    let mut samples: Vec<i16> = Vec::new();
+    loop {
+        match reader.read_packet_into(&mut packet) {
+            Ok(false) => break,
+            Ok(true) => {
+                let n = decoder
+                    .decode_s16(&packet.data, opus_pure::MAX_PACKET_SAMPLES, &mut block)
+                    .map_err(|e| {
+                        error::recoverable(
+                            code::DECODE_FAILED,
+                            format!("Ogg Opus 解码失败({}): {e}", display(name)),
+                        )
+                    })?;
+                let audio = trim.keep(&packet, &block[..n * channels]);
+                samples.extend_from_slice(audio);
+            }
+            Err(e) => {
+                return Err(error::recoverable(
+                    code::DECODE_FAILED,
+                    format!("Ogg Opus 包读取失败({}): {e}", display(name)),
+                ))
+            }
+        }
+    }
+    Ok(Pcm {
+        samples,
+        channels: channels as u16,
+        bits: 16,
+        // Opus 在 Ogg 里恒以 48 kHz 计 granule（RFC 7845 §4），解码也固定 48 kHz。
+        sample_rate: 48_000,
+        // 容器是 Ogg，官方 CODEC 仍报 1（手册 0=WAVE/1=OGG/2=ACM）。
+        codec: Codec::Ogg,
+    })
+}
+
+fn decode_wav(name: &[u8], bytes: &[u8]) -> Result<Pcm, Diag> {    // 官方 WAVE 装载（`0x422e04`）：`fmt tag == 1` 走 PCM 直解；
     // **其余全部 tag（含 3=float、0xFFFE=extensible）走 ACM 转换**，
     // 转换失败 = 装载失败（层保持旧元数据，N0-8）。手册的「不支持」句过时。
     match wav_chunk(bytes, b"fmt ") {

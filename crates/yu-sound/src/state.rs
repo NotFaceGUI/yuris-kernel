@@ -535,6 +535,12 @@ pub struct SoundState {
     full_decodes: u64,
     /// 本帧落在 tick 线程的解码耗时(装载 + 预取;逐帧增量)。
     tick_decode_us: u64,
+    /// 候选名是否追加 `.opus`。
+    ///
+    /// 官方 0.500 exe 的声音扩展名表(`0x1d95e0`)是
+    /// `.wav/.ogg/.opus`;旧表(0.495 及更早)只有 `.ogg/.wav`。
+    /// 由引擎按 `SemanticProfile::is_v555_family()` 设置(不按游戏名特化)。
+    probe_opus: bool,
 }
 
 const DIAG_CAP: usize = 4096;
@@ -576,6 +582,20 @@ impl SoundState {
             movie: std::cell::RefCell::new(crate::movie::MovieAudio::new()),
             full_decodes: 0,
             tick_decode_us: 0,
+            probe_opus: false,
+        }
+    }
+
+    /// 声音候选扩展名是否含 `.opus`(0.500/0.555 商业族)。
+    ///
+    /// 必须在装载任何文件前设置;引擎在构造 `SoundState` 后立刻按
+    /// `SemanticProfile::is_v555_family()` 调用。已解析的候选缓存不受影响
+    /// (本进程里同名文件的候选集不会变,设置只发生在启动期)。
+    pub fn set_probe_opus(&mut self, on: bool) {
+        self.probe_opus = on;
+        if !on {
+            // 关闭时清掉可能带 `.opus` 的解析缓存,避免沿用错误候选。
+            self.resolve_cache.clear();
         }
     }
 
@@ -1147,7 +1167,7 @@ impl SoundState {
             None => probe = true,
         }
         if probe {
-            let candidates = load_candidates(file);
+            let candidates = load_candidates(file, self.probe_opus);
             for name in &candidates {
                 match self.loader.load(name) {
                     Ok(Some(bytes)) => {
@@ -1170,7 +1190,7 @@ impl SoundState {
             probed = Some(candidates);
         }
         let Some((resolved, bytes)) = found else {
-            let candidates = probed.unwrap_or_else(|| load_candidates(file));
+            let candidates = probed.unwrap_or_else(|| load_candidates(file, self.probe_opus));
             // 无候选文件：引擎先执行过 type 0xe（仅当 state != 0）：
             // 清 `+0x000`、Stop、释放 PCM/缓冲、清 START/RESTART、state=0；
             // **保留** `+0x105/+0x107/+0x120/+0x118/PAN/PITCH/LOOP/LOOPCOUNT`。
@@ -1901,7 +1921,10 @@ fn ends_with_ascii_ci(name: &[u8], suffix: &[u8]) -> bool {
 /// 本函数也不依赖调用方先归一）。
 pub fn probe_names(file: &[u8]) -> Vec<Vec<u8>> {
     let mut out = vec![file.to_vec()];
-    if !(ends_with_ascii_ci(file, b".ogg") || ends_with_ascii_ci(file, b".wav")) {
+    if !(ends_with_ascii_ci(file, b".ogg")
+        || ends_with_ascii_ci(file, b".wav")
+        || ends_with_ascii_ci(file, b".opus"))
+    {
         let mut ogg = file.to_vec();
         ogg.extend_from_slice(b".ogg");
         out.push(ogg);
@@ -1912,12 +1935,37 @@ pub fn probe_names(file: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+/// 0.500/0.555 商业族的候选序。
+///
+/// 官方 exe 的两张 12 项扩展名表(`0x1d95e0` / `0x1d9660`)在图像项后分别
+/// 是 `.wav .ogg .opus` 与 `.ogg .wav .opus`;0.500 用前者(新表),旧版
+/// 只有 `.ogg/.wav`。带 `.opus` 时也识别已显式写 `.opus` 的参数,不再追加。
+pub fn probe_names_opus(file: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = vec![file.to_vec()];
+    if !(ends_with_ascii_ci(file, b".ogg")
+        || ends_with_ascii_ci(file, b".wav")
+        || ends_with_ascii_ci(file, b".opus"))
+    {
+        for ext in [b".wav".as_slice(), b".ogg", b".opus"] {
+            let mut name = file.to_vec();
+            name.extend_from_slice(ext);
+            out.push(name);
+        }
+    }
+    out
+}
+
 /// `load_file` 的候选名序列:先按引擎规则归一,再按扩展名探测序展开。
 ///
 /// 命中 `resolve_cache` 时不调用本函数;未找到诊断需要重算同一序列,
 /// 保证文案里的"已尝试: …"逐字节一致。
-fn load_candidates(file: &[u8]) -> Vec<Vec<u8>> {
-    probe_names(&normalize_name(file))
+fn load_candidates(file: &[u8], opus: bool) -> Vec<Vec<u8>> {
+    let file = normalize_name(file);
+    if opus {
+        probe_names_opus(&file)
+    } else {
+        probe_names(&file)
+    }
 }
 
 /// 在单个层的流上按给定位置同步预取,返回耗时(微秒)。

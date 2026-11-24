@@ -2168,6 +2168,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "opus-pure"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2da6dcc20af557d030b6f206e75c764bcda8c28a5bd03c73935c7e8fcf5f4f4a"
+
+[[package]]
 name = "orbclient"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4426,8 +4432,10 @@ version = "0.4.2"
 dependencies = [
  "hound",
  "lewton",
+ "opus-pure",
  "yu-log",
  "yu-rt",
+ "yu-vfs",
 ]
 
 [[package]]

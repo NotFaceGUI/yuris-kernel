@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use opus_pure::{OggOpusReader, OggPacket, OpusDecoder, OpusHead, Trim};
 use yu_log::Diag;
 
 use crate::decode::{Codec, Pcm};
@@ -106,10 +107,22 @@ impl StreamCounters {
 }
 
 enum Kind {
-    /// OGG:保留原始字节,供 seek 时重建 reader(头部解析 O(1))。
+    /// OGG Vorbis:保留原始字节,供 seek 时重建 reader(头部解析 O(1))。
     Ogg {
         bytes: Arc<[u8]>,
         reader: lewton::inside_ogg::OggStreamReader<Cursor<Arc<[u8]>>>,
+    },
+    /// OGG Opus:同一容器,Opus 包解码。`rewind` 回首个音频页,
+    /// 解码器 `reset_state`,`Trim` 重建(与 Vorbis 的重开等价)。
+    Opus {
+        reader: OggOpusReader<Cursor<Arc<[u8]>>>,
+        head: OpusHead,
+        decoder: OpusDecoder,
+        trim: Trim,
+        /// 复用包缓冲(最长包过后零分配)。
+        packet: OggPacket,
+        /// 复用解码块(`MAX_PACKET_SAMPLES * channels`)。
+        block: Vec<i16>,
     },
     /// WAVE PCM / ACM:官方 mmio 直读 / 一次 ACM 转换,整段样本在手。
     Pcm(Arc<Pcm>),
@@ -158,6 +171,9 @@ impl std::fmt::Debug for Stream {
 
 impl Stream {
     /// OGG:只解析头部。失败 = 装载失败(与官方 ov_open 失败同型)。
+    ///
+    /// 同一 Ogg 容器里可能是 Vorbis,也可能是 Opus(0.500 起):按首个
+    /// page 的 `OpusHead` 分流,流式解码器不同但对外窗口语义一致。
     pub fn ogg(
         name: Vec<u8>,
         bytes: Vec<u8>,
@@ -165,13 +181,47 @@ impl Stream {
         counters: Arc<StreamCounters>,
     ) -> Result<Self, Diag> {
         let bytes: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
-        let reader = lewton::inside_ogg::OggStreamReader::new(Cursor::new(Arc::clone(&bytes)))
-            .map_err(|e| {
+        let kind = if crate::meta::ogg_is_opus(&bytes) {
+            let reader =
+                OggOpusReader::new(Cursor::new(Arc::clone(&bytes))).map_err(|e| {
+                    error::recoverable(
+                        code::DECODE_FAILED,
+                        format!("Ogg Opus 头解析失败({}): {e}", display(&name)),
+                    )
+                })?;
+            let head = reader.head().clone();
+            let channels = usize::from(head.channel_count);
+            let decoder = head.decoder(48_000).map_err(|e| {
                 error::recoverable(
                     code::DECODE_FAILED,
-                    format!("OGG 头解析失败({}): {e}", display(&name)),
+                    format!("Ogg Opus 解码器初始化失败({}): {e}", display(&name)),
                 )
             })?;
+            let trim = Trim::new(&head, 48_000, channels).map_err(|e| {
+                error::recoverable(
+                    code::DECODE_FAILED,
+                    format!("Ogg Opus pre-skip 解析失败({}): {e}", display(&name)),
+                )
+            })?;
+            Kind::Opus {
+                reader,
+                head,
+                decoder,
+                trim,
+                packet: OggPacket::new(Vec::new(), -1, false),
+                block: vec![0i16; opus_pure::MAX_PACKET_SAMPLES * channels],
+            }
+        } else {
+            let reader =
+                lewton::inside_ogg::OggStreamReader::new(Cursor::new(Arc::clone(&bytes)))
+                    .map_err(|e| {
+                        error::recoverable(
+                            code::DECODE_FAILED,
+                            format!("OGG 头解析失败({}): {e}", display(&name)),
+                        )
+                    })?;
+            Kind::Ogg { bytes, reader }
+        };
         Ok(Self {
             name,
             channels: meta.channels,
@@ -180,7 +230,7 @@ impl Stream {
             codec: meta.codec,
             total_frames: meta.total_frames.unwrap_or(0),
             total_ms: meta.total_ms().unwrap_or(0),
-            kind: Kind::Ogg { bytes, reader },
+            kind,
             window: Vec::new(),
             window_read: 0,
             window_start: 0,
@@ -334,7 +384,7 @@ impl Stream {
 
     /// 丢弃窗口内已消费的前缀(有界内存;官方环 0.5s,这里留 1s 余量)。
     pub fn discard_before(&mut self, frame: u64) {
-        if !matches!(self.kind, Kind::Ogg { .. }) || self.channels == 0 {
+        if !matches!(self.kind, Kind::Ogg { .. } | Kind::Opus { .. }) || self.channels == 0 {
             return;
         }
         let keep_from = frame.min(self.window_end());
@@ -377,8 +427,10 @@ impl Stream {
         match &self.kind {
             // WAVE/ACM:整段样本常驻,只要有这个帧就算覆盖。
             Kind::Pcm(_) => frame < self.total_frames,
-            // OGG:只看已解码窗口(窗口外需要解码,回调里不许做)。
-            Kind::Ogg { .. } => frame >= self.window_start && frame < self.window_end(),
+            // OGG Vorbis/Opus:只看已解码窗口(窗口外需要解码,回调里不许做)。
+            Kind::Ogg { .. } | Kind::Opus { .. } => {
+                frame >= self.window_start && frame < self.window_end()
+            }
         }
     }
 
@@ -407,8 +459,8 @@ impl Stream {
                 let idx = (frame as usize).checked_mul(channels)?.checked_add(ch)?;
                 pcm.samples.get(idx).copied()
             }
-            // OGG:只读已解码窗口。
-            Kind::Ogg { .. } => {
+            // OGG Vorbis/Opus:只读已解码窗口。
+            Kind::Ogg { .. } | Kind::Opus { .. } => {
                 if frame < self.window_start || frame >= self.window_end() {
                     return None;
                 }
@@ -435,7 +487,7 @@ impl Stream {
                     .checked_add(ch)?;
                 pcm.samples.get(idx).copied()
             }
-            Kind::Ogg { .. } => {
+            Kind::Ogg { .. } | Kind::Opus { .. } => {
                 if !self.ensure(frame) {
                     self.counters.add_underrun();
                     self.note_underrun(frame);
@@ -457,7 +509,7 @@ impl Stream {
 
     /// 确保窗口覆盖 `frame`(含)。
     fn ensure(&mut self, frame: u64) -> bool {
-        if !matches!(self.kind, Kind::Ogg { .. }) {
+        if !matches!(self.kind, Kind::Ogg { .. } | Kind::Opus { .. }) {
             return frame < self.total_frames;
         }
         while self.window_end() <= frame {
@@ -478,38 +530,98 @@ impl Stream {
         true
     }
 
-    /// 解码一个 OGG packet 进窗口。
+    /// 解码一个 OGG packet 进窗口(Vorbis 或 Opus)。
     fn decode_next(&mut self) -> bool {
         let channels = usize::from(self.channels);
-        let Kind::Ogg { reader, .. } = &mut self.kind else {
-            return false;
-        };
+        // 先取窗口尾与总长:进入 `&mut self.kind` 借用后不能再调 `&self` 方法。
+        let window_end = self.window_end();
+        let total_frames = self.total_frames;
         let started = Instant::now();
-        let result = reader.read_dec_packet_itl();
-        self.counters.add_us(
-            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-        );
-        match result {
-            Ok(Some(packet)) => {
-                let room = self.total_frames.saturating_sub(self.window_end()) as usize;
-                let frames = (packet.len() / channels.max(1)).min(room);
-                let take = frames * channels;
-                self.window.extend_from_slice(&packet[..take]);
-                self.counters.add_frames(frames as u64);
-                true
+        match &mut self.kind {
+            Kind::Pcm(_) => false,
+            Kind::Ogg { reader, .. } => {
+                let result = reader.read_dec_packet_itl();
+                self.counters.add_us(
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
+                match result {
+                    Ok(Some(packet)) => {
+                        let room = total_frames.saturating_sub(window_end) as usize;
+                        let frames = (packet.len() / channels.max(1)).min(room);
+                        let take = frames * channels;
+                        self.window.extend_from_slice(&packet[..take]);
+                        self.counters.add_frames(frames as u64);
+                        true
+                    }
+                    Ok(None) => {
+                        self.eof = true;
+                        false
+                    }
+                    Err(e) => {
+                        self.error = Some(error::recoverable(
+                            code::DECODE_FAILED,
+                            format!("OGG 解码失败({}): {e}", display(&self.name)),
+                        ));
+                        self.counters.add_error();
+                        self.eof = true;
+                        false
+                    }
+                }
             }
-            Ok(None) => {
-                self.eof = true;
-                false
-            }
-            Err(e) => {
-                self.error = Some(error::recoverable(
-                    code::DECODE_FAILED,
-                    format!("OGG 解码失败({}): {e}", display(&self.name)),
-                ));
-                self.counters.add_error();
-                self.eof = true;
-                false
+            Kind::Opus {
+                reader,
+                decoder,
+                trim,
+                packet,
+                block,
+                ..
+            } => {
+                let result = reader.read_packet_into(packet);
+                self.counters.add_us(
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
+                match result {
+                    Ok(false) => {
+                        self.eof = true;
+                        false
+                    }
+                    Ok(true) => {
+                        match decoder.decode_s16(
+                            &packet.data,
+                            opus_pure::MAX_PACKET_SAMPLES,
+                            block,
+                        ) {
+                            Ok(n) => {
+                                let audio = &block[trim.keep_range(packet, n * channels)];
+                                let room = total_frames.saturating_sub(window_end) as usize;
+                                let frames = (audio.len() / channels.max(1)).min(room);
+                                let mut window = std::mem::take(&mut self.window);
+                                window.extend_from_slice(&audio[..frames * channels]);
+                                self.window = window;
+                                self.counters.add_frames(frames as u64);
+                                true
+                            }
+                            Err(e) => {
+                                self.error = Some(error::recoverable(
+                                    code::DECODE_FAILED,
+                                    format!("Ogg Opus 解码失败({}): {e}", display(&self.name)),
+                                ));
+                                self.counters.add_error();
+                                self.eof = true;
+                                false
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.error = Some(error::recoverable(
+                            code::DECODE_FAILED,
+                            format!("Ogg Opus 包读取失败({}): {e}", display(&self.name)),
+                        ));
+                        self.counters.add_error();
+                        self.eof = true;
+                        false
+                    }
+                }
             }
         }
     }
@@ -541,6 +653,56 @@ impl Stream {
                 self.window_start = 0;
                 self.eof = false;
                 // 解码并丢弃到 target;target 通常 = START/RESTART(多为 0)。
+                while self.window_end() < target && !self.eof {
+                    if !self.decode_next() && self.eof {
+                        break;
+                    }
+                }
+                if target > self.window_start {
+                    let drop_frames = (target - self.window_start).min(self.window_frames());
+                    let samples = drop_frames as usize * usize::from(self.channels);
+                    self.window.drain(..samples);
+                    self.window_start += drop_frames;
+                }
+            }
+            Kind::Opus {
+                reader,
+                head,
+                decoder,
+                trim,
+                ..
+            } => {
+                if let Err(e) = reader.rewind() {
+                    self.error = Some(error::recoverable(
+                        code::DECODE_FAILED,
+                        format!("Ogg Opus 回退失败({}): {e}", display(&self.name)),
+                    ));
+                    self.counters.add_error();
+                    return;
+                }
+                if let Err(e) = decoder.reset_state() {
+                    self.error = Some(error::recoverable(
+                        code::DECODE_FAILED,
+                        format!("Ogg Opus 解码器重置失败({}): {e}", display(&self.name)),
+                    ));
+                    self.counters.add_error();
+                    return;
+                }
+                match Trim::new(head, 48_000, usize::from(head.channel_count)) {
+                    Ok(fresh) => *trim = fresh,
+                    Err(e) => {
+                        self.error = Some(error::recoverable(
+                            code::DECODE_FAILED,
+                            format!("Ogg Opus pre-skip 重建失败({}): {e}", display(&self.name)),
+                        ));
+                        self.counters.add_error();
+                        return;
+                    }
+                }
+                self.window.clear();
+                self.window_read = 0;
+                self.window_start = 0;
+                self.eof = false;
                 while self.window_end() < target && !self.eof {
                     if !self.decode_next() && self.eof {
                         break;

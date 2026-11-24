@@ -10,3 +10,8 @@ yu-rt = { path = "../yu-rt" }
 yu-log = { path = "../yu-log" }
 hound = "3"
 lewton = "0.10"
+opus-pure = { version = "0.2.5", default-features = false }
+
+[dev-dependencies]
+# 只给集成测试读 `<v500-relirium>` 的封包样本用;库本体仍不经手 ypf。
+yu-vfs = { path = "../yu-vfs" }

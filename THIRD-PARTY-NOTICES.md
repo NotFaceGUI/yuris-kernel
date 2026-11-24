@@ -2,7 +2,7 @@
 
 <!-- 本文件由 tools/release/gen_third_party_notices.py 生成，请勿手工编辑。 -->
 
-> 生成依据：`cargo metadata --locked`（`Cargo.lock` sha256 `4ed742692a0b75127ad737648d28e9cb7611dd8bea17c25b9ebb21ed35674af6`）；第三方 crate 共 **426** 个。
+> 生成依据：`cargo metadata --locked`（`Cargo.lock` sha256 `e6f33563a71c6d963fa620346e78930da86b339c94b640c162a3abd57dfa2ade`）；第三方 crate 共 **428** 个。
 >
 > 本项目自身代码以 **GPL-3.0-or-later** 发布，见 [`LICENSE`](LICENSE) 与 [`NOTICE`](NOTICE)。本文件随发行产物一并分发；许可证全文见 [`third_party/licenses/`](third_party/licenses/)。
 
@@ -152,6 +152,7 @@
 | idna | 1.1.0 | MIT OR Apache-2.0 | https://github.com/servo/rust-url/ |
 | idna_adapter | 1.2.2 | Apache-2.0 OR MIT | https://github.com/hsivonen/idna_adapter |
 | image | 0.25.10 | MIT OR Apache-2.0 | https://github.com/image-rs/image |
+| image-webp | 0.2.4 | MIT OR Apache-2.0 | https://github.com/image-rs/image-webp |
 | indexmap | 2.14.2 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/indexmap |
 | itertools | 0.13.0 | MIT OR Apache-2.0 | https://github.com/rust-itertools/itertools |
 | itertools | 0.15.0 | MIT OR Apache-2.0 | https://github.com/rust-itertools/itertools |
@@ -236,6 +237,7 @@
 | oboe-sys | 0.6.1 | Apache-2.0 | https://github.com/katyo/oboe-rs |
 | ogg | 0.8.0 | BSD-3-Clause | https://github.com/RustAudio/ogg |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 | https://github.com/matklad/once_cell |
+| opus-pure | 0.2.5 | BSD-3-Clause | https://github.com/stephenberry/opus-pure |
 | orbclient | 0.3.55 | MIT | https://gitlab.redox-os.org/redox-os/orbclient |
 | ordered-float | 5.5.0 | MIT | https://github.com/reem/rust-ordered-float |
 | os_pipe | 1.2.3 | MIT | https://github.com/oconnor663/os_pipe.rs |
@@ -581,6 +583,7 @@
 - **num_enum_derive 0.7.6** — Copyright (c) 2018, Daniel Wagner-Hall
 - **num_threads 0.1.8** — Copyright 2021 Jacob Pratt；Copyright (c) 2021 Jacob Pratt
 - **ogg 0.8.0** — Copyright (c) 2016-2017 est31 <MTest31@outlook.com> and contributors；Copyright (c) 2002-2015 Xiph.org Foundation
+- **opus-pure 0.2.5** — Copyright 2026 Stephen Berry；Copyright 2026 restsend.com；Copyright 2001-2023 Xiph.Org, Skype Limited, Octasic,
 - **orbclient 0.3.55** — Copyright (c) 2015-2019 Jeremy Soller
 - **ordered-float 5.5.0** — Copyright (c) 2015 Jonathan Reem
 - **parking_lot 0.12.5** — Copyright (c) 2016 The Rust Project Developers

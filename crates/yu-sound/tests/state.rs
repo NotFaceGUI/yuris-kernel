@@ -1440,3 +1440,96 @@ fn soundinfo_multi_field_follows_engine_order() {
         .expect("query");
     assert_eq!(v, Value::Str(Vec::new()));
 }
+
+/// 0.500/0.555 的候选序:官方 exe 表(`0x1d95e0`)是 `.wav .ogg .opus`。
+#[test]
+fn probe_order_v555_appends_opus_last() {
+    use yu_sound::state::probe_names_opus;
+    assert_eq!(
+        probe_names_opus(b"bgm/op_inst"),
+        vec![
+            b"bgm/op_inst".to_vec(),
+            b"bgm/op_inst.wav".to_vec(),
+            b"bgm/op_inst.ogg".to_vec(),
+            b"bgm/op_inst.opus".to_vec()
+        ]
+    );
+    // 显式 `.opus` 不再追加(与 `.ogg/.wav` 同规则)。
+    assert_eq!(probe_names_opus(b"x.opus"), vec![b"x.opus".to_vec()]);
+}
+
+/// 真实 0.500 Ogg Opus 样本(`<v500-relirium>` 的 `bgm/op_inst.opus`)。
+///
+/// 未设 `YURIS_SAMPLE_RELIRIUM` 时显式跳过并计数(不空跑通过):
+/// `YURIS_SAMPLE_RELIRIUM="<games>/<v500-relirium>" cargo test -p yu-sound --test state opus`
+#[test]
+fn real_v500_opus_decodes_to_pcm() {
+    let Some(root) = std::env::var_os("YURIS_SAMPLE_RELIRIUM") else {
+        eprintln!("SKIP real_v500_opus_decodes_to_pcm: 未设 YURIS_SAMPLE_RELIRIUM");
+        return;
+    };
+    let pack = std::path::PathBuf::from(root).join("pac").join("bgm.ypf");
+    let src = yu_vfs::YpfSource::open(&pack, yu_vfs::Codec::Cp932).expect("open pac/bgm.ypf");
+    use yu_vfs::DataSource as _;
+    let key = yu_vfs::LookupKey::new(b"bgm/op_inst.opus", yu_vfs::Codec::Cp932).expect("key");
+    let bytes = src.open(&key).expect("read bgm/op_inst.opus");
+    let pcm = decode(b"bgm/op_inst.opus", &bytes).expect("opus decode");
+    assert_eq!(pcm.channels, 2);
+    assert_eq!(pcm.bits, 16);
+    assert_eq!(pcm.sample_rate, 48_000);
+    assert!(pcm.frames() > 6 * 48_000, "样本时长应 > 6s");
+    assert!(pcm.samples.iter().any(|s| *s != 0), "不能整段静音");
+    let meta = yu_sound::meta::probe(b"bgm/op_inst.opus", &bytes).expect("probe");
+    let expected = meta.total_frames.expect("granule 精确");
+    let diff = (pcm.frames() as i64 - expected as i64).abs();
+    assert!(diff < 4_800, "解码帧数与 granule 差 {diff}(应 <100ms)");
+}
+
+/// 0.500 的 Ogg Opus:装载只读头部(pre-skip/granule),播放才解包。
+///
+/// 未设 `YURIS_SAMPLE_RELIRIUM` 时显式跳过。
+#[test]
+fn gated_v500_opus_loads_header_only_then_streams() {
+    let Some(root) = std::env::var_os("YURIS_SAMPLE_RELIRIUM") else {
+        eprintln!("SKIP gated_v500_opus_loads_header_only_then_streams: 未设 YURIS_SAMPLE_RELIRIUM");
+        return;
+    };
+    let pack = std::path::PathBuf::from(root).join("pac").join("bgm.ypf");
+    let src = yu_vfs::YpfSource::open(&pack, yu_vfs::Codec::Cp932).expect("open pac/bgm.ypf");
+    use yu_vfs::DataSource as _;
+    let key = yu_vfs::LookupKey::new(b"bgm/op_inst.opus", yu_vfs::Codec::Cp932).expect("key");
+    let bytes = src.open(&key).expect("read bgm/op_inst.opus");
+    let header = yu_sound::meta::probe(b"bgm/op_inst.opus", &bytes).expect("header probe");
+    assert!(header.is_exact(), "应能从 granule 得到精确总长");
+
+    let mut s = state_with(&[("bgm/op_inst.opus", bytes)]);
+    s.set_probe_opus(true);
+    let mut c = cmd("BGM");
+    // 不带扩展名:走 0.500 的 `.wav → .ogg → .opus` 候选序。
+    c.file = Some(b"bgm/op_inst".to_vec());
+    c.file_present = true;
+    c.play = Some(1);
+    c.e = Some(1);
+    c.volume = Some(256);
+    s.apply_sound(&c);
+    assert_eq!(int(&mut s, "BGM", QueryField::Play), 1);
+    assert_eq!(
+        int(&mut s, "BGM", QueryField::TotalTime),
+        header.total_ms().expect("total")
+    );
+    let stats = s.take_decode_stats();
+    assert_eq!(stats.full_decodes, 0, "Opus 装载不得整段解码");
+    // 命令时刻只预取 LEAD_MS(1.5s)窗口,不是整段。
+    assert!(
+        stats.decoded_frames < 96_000,
+        "装载只预取 ≤2s,实际 {} 帧",
+        stats.decoded_frames
+    );
+
+    // 混音 2 秒:按需解 Opus 包,输出非静音。
+    let mut buf = vec![0.0f32; 96_000 * 2];
+    s.render(&mut buf, 48_000, 2);
+    assert!(buf.iter().any(|v| v.abs() > 0.0), "Opus 流式解码后应有声音");
+    let stats = s.take_decode_stats();
+    assert!(stats.decoded_frames > 0, "播放时必须解出帧");
+}
