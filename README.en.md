@@ -58,9 +58,29 @@ Official releases are organized into BETA 2 / BETA 3 / BETA 4 mainline series; 5
 | BETA 2 | Adapting           | 0.255 (0.55): 539 system variables catalogued; YSTB V2 lacks real samples                                                                                                                    |
 | BETA 3 | Adapting           | 0.276 sample; 0.292 (0.92): 91 commands / 482 system variables                                                                                                                               |
 | BETA 4 | Available (main)   | 0.450–0.495: 0.466 / 0.479 / 0.495: 100 / 104 / 119 commands, 513 / 526 / 548 system variables; 0.450 / 0.460 / 0.470 / 0.480 / 0.490 spot-checked on real games, 0.481 / 0.486 / 0.494 / 0.495 accepted |
-| 5xx    | Adapting (v555)     | Official commercial branch: v500 packs are readable; v555 seven tables/scenario chain measured; landed `TEXT[FILE]`, `PRODUCT`, `SAVE/LOAD[MEM]`, `_DROPFILE*`, `VARINFO`; remaining P0 title screen (`_STR` / button textures / SPL / background CG) |
+| 5xx    | Adapting (v555)     | Official commercial branch: v500 packs are readable; v555 seven tables/scenario chain measured; landed `TEXT[FILE]`, `PRODUCT`, `SAVE/LOAD[MEM]`, `_DROPFILE*`, `VARINFO`; title screen (notice page / build animation / full menu / button state machine) is working |
 
 ABI tables for 0.450–0.493 are all catalogued (27 tables, covering 0.255–0.495).
+
+### File formats and packages
+
+| Category | Form / extension | Status |
+| --- | --- | --- |
+| Packages | `.ypf` (0.495 and earlier: keyed + compressed entries) | Read |
+| | `.ypf` (0.500 commercial: plain zlib + xxh32 payload hash, Meta22 layout) | Read |
+| | Loose `data/` directory (development form) | Read |
+| | `pac/*.ypf` mounted by name + `update1..9.ypf` layered; MPEG-PS disguised as `.ypf` skipped by magic | Read |
+| Tables / scripts | `ysbin/ysc.ybn` (YSCM command table, 0.255–0.555) | Read / execute |
+| | `ysbin/ysl.ybn` (YSLB global labels), `ysbin/ysv.ybn` (YSVR variables), `ysbin/yst_list.ybn` | Read |
+| | `ysbin/yst%05d.ybn` (YSTB compiled scripts; V5 executes, V2 awaits real samples) | Execute |
+| | `scenario/*.txt` (5xx scenario DSL: `#labels`, `\commands`, macros) | Lex / execute |
+| Images | PNG / BMP / JPG / GIF / WebP / JXL / QOI / AVIF | Decode |
+| | `.ydg` (0.500 container; QOI/WebP row tiles reassembled into a full image) | Decode |
+| | `.psb` (0.495 image code 5) | Recognized, no decoder (explicit `asset.unsupported`) |
+| Audio | WAV PCM / ACM WAVE (non-PCM tags go through system ACM) | Decode |
+| | OGG Vorbis / OGG Opus (0.500) | Decode |
+| Video | MPEG-1 program stream (`.mpg` / MPEG-PS disguised as `.ypf`), YMV | Play |
+| Saves | `.sd` (including DNO=1024 and 500-slot memory packs) | Read / write |
 
 ### 5xx / v555 status
 
@@ -73,9 +93,12 @@ ABI tables for 0.450–0.493 are all catalogued (27 tables, covering 0.255–0.4
   selected by the language number in `config.sd`; measured encodings are
   CP932 / GBK / Big5. The kernel still relies on global `--patch gbk` for multilingual
   runs and is being reworked around per-variant codecs (optimization plan O5).
-- **Remaining**: P0-1 `_STR`, P0-2 button texture state machine, P0-3 SPL transition,
-  P0-4 background CG; other `PRODUCT` COMs, line-by-line text comparison, the
-  Snappy branch of memory-pack slots.
+- **Title and presentation (2026-11-24)**: the notice page → title build animation →
+  full menu chain works; `FILEINFO[CGFILE]` probes
+  `_off/_over/_on/_onover/_na` with the 0.500 extension table, so buttons hover and
+  click; `.ydg`/QOI backgrounds and button art plus `.opus` BGM/voices decode.
+- **Remaining**: the `type2/` skin-directory rule, other `PRODUCT` COMs,
+  line-by-line text comparison, and the Snappy branch of memory-pack slots.
 - **Landed (2026-11-23)**: `SAVE[MEM=99999]` packing of slots 0..499,
   `LOAD[DNO=1024]` read-back, `SAVE[FILE]` write-back of DNO=1024, inline
   `TEXT[FILE]` translation, and `translate.json` runtime replacement for
@@ -101,6 +124,10 @@ Gaps for Linux / macOS desktop and true wasm (in-memory data source + browser sa
 | 0.481 · Title screen | 0.481 · Dialogue | 0.494 · Dialogue |
 | :---: | :---: | :---: |
 | [![0.481 title screen](docs/assets/case/1_t.png)](docs/assets/case/1_t.png) | [![0.481 dialogue](docs/assets/case/1_d.png)](docs/assets/case/1_d.png) | [![0.494 dialogue](docs/assets/case/2_d.png)](docs/assets/case/2_d.png) |
+| **0.555 · Dialogue** | **0.555 · Official Chinese** | **0.474 · Title screen** |
+| [![0.555 dialogue](docs/assets/case/3_d.png)](docs/assets/case/3_d.png) | [![0.555 official Chinese](docs/assets/case/4_d.png)](docs/assets/case/4_d.png) | [![0.474 title screen](docs/assets/case/5_t.png)](docs/assets/case/5_t.png) |
+| **0.466 · Dialogue** | | |
+| [![0.466 dialogue](docs/assets/case/6_d.png)](docs/assets/case/6_d.png) | | |
 
 ## Download
 

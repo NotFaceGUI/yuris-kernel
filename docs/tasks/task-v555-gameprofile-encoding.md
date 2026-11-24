@@ -150,8 +150,15 @@
 - **已完成普查**：0.500 与 555 的 `ysc.ybn` 均为 121 条、11102B，
   仅版本字段与 `GRADATION` 参数 kind 不同；系统变量 ABI `0..999`
   1000/1000 一致。
-- **仍未做**：0.500 的独立 `SemanticProfile`/handler 表
-  （不能直接把 0.500 当 555；121 槽已确认但处理体待 RE 对拍）。
+- **已完成(2026-11-24)**:0.500 归入 555 商业族
+  (`SemanticProfile::is_v555_family`)。处理体对拍:`TEXT`/`CGINFO`/
+  `VARINFO`/`RETURNCODE`/`GOSUB`/`RETURN`/`LET`/`VARACT`/`SAVE`/`LOAD`
+  与 v555 同构;0.500 的 `MOVIE2*`/`REGINFO` 是 29B 空桩,分发表覆盖为
+  `NoopEval`;`PRODUCT[COM=1/2/3]` 按 `0x488b20` 落地。
+  证据/差异见 `docs/divergences/DIV-RT-079-v500-commercial-family.md`。
+- **仍未做**:`SYSTEM[SX/SY]` 的宿主屏幕尺寸/后缓冲重建、
+  `PRODUCT[COM=24001/24002/24009]`(YSWEBM)与 `COM=56/57`、
+  `$4780[-1]` 负下标语义。
 - **仍未做**：<patch-group> 归档/重定向 + 字体 Hook。
 - 视频 / FFmpeg 外置保持现状，不扩。
 

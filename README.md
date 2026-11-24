@@ -59,9 +59,29 @@
 | BETA 2 | 适配中     | 0.255（0.55）：539 系统变量表已入册；YSTB V2 缺真实样本                                                                                                          |
 | BETA 3 | 适配中     | 0.276 样本；0.292（0.92）：91 命令 / 482 系统变量                                                                                                                |
 | BETA 4 | 可用（主线） | 0.450–0.495：0.466 / 0.479 / 0.495：100 / 104 / 119 命令，513 / 526 / 548 系统变量；0.450 / 0.460 / 0.470 / 0.480 / 0.490 抽样实机通过，0.481 / 0.486 / 0.494 / 0.495 实机验收 |
-| 5xx    | 适配中（v555） | 官方商业分支：v500 封包可读；v555 七表/剧本链已实测；已落地 `TEXT[FILE]`、`PRODUCT`、`SAVE/LOAD[MEM]`、`_DROPFILE*`、`VARINFO`；剩余 P0 标题画面（`_STR`/按钮纹理/SPL/背景 CG） |
+| 5xx    | 适配中（v555） | 官方商业分支：v500 封包可读；v555 七表/剧本链已实测；已落地 `TEXT[FILE]`、`PRODUCT`、`SAVE/LOAD[MEM]`、`_DROPFILE*`、`VARINFO`；标题画面（注意页 / build 动画 / 完整菜单 / 按钮状态机）已打通 |
 
 0.450–0.493 各版本的 ABI 表已全部入册（27 张，覆盖 0.255–0.495）。
+
+### 文件格式与封包
+
+| 类别 | 形态 / 扩展名 | 状态 |
+| --- | --- | --- |
+| 封包 | `.ypf`（0.495 及更早：换钥 + 压缩条目） | 读 |
+| | `.ypf`（0.500 商业族：明文 zlib + xxh32 载荷校验，Meta22 布局） | 读 |
+| | 散盘 `data/` 目录（工程形态） | 读 |
+| | `pac/*.ypf` 按名挂载 + `update1..9.ypf` 依次叠加；伪装成 `.ypf` 的 MPEG-PS 按魔数跳过 | 读 |
+| 表 / 脚本 | `ysbin/ysc.ybn`（YSCM 命令表，0.255–0.555） | 读 / 执行 |
+| | `ysbin/ysl.ybn`（YSLB 全局标签）、`ysbin/ysv.ybn`（YSVR 变量表）、`ysbin/yst_list.ybn` | 读 |
+| | `ysbin/yst%05d.ybn`（YSTB 编译脚本；V5 执行，V2 待真实样本） | 执行 |
+| | `scenario/*.txt`（5xx 剧本 DSL：`#标签`、`\命令`、宏） | 词法 / 执行 |
+| 图像 | PNG / BMP / JPG / GIF / WebP / JXL / QOI / AVIF | 解码 |
+| | `.ydg`（0.500 容器；QOI/WebP 行瓦片，拼回整图） | 解码 |
+| | `.psb`（0.495 图像码 5） | 识别，无解码器（显式 `asset.unsupported`） |
+| 音频 | WAV PCM / ACM WAVE（非 PCM tag 走系统 ACM） | 解码 |
+| | OGG Vorbis / OGG Opus（0.500） | 解码 |
+| 影片 | MPEG-1 program stream（`.mpg` / 伪装成 `.ypf` 的 MPEG-PS）、YMV | 播放 |
+| 存档 | `.sd`（含 DNO=1024、500 槽内存包） | 读写 |
 
 ### 5xx / v555 现状
 
@@ -72,8 +92,12 @@
   `sc_tw_scenario/`（繁中）三份变体，由 `config.sd` 里的语言号选择；
   实测编码分别为 CP932 / GBK / Big5。当前内核对多语言仍依赖全局 `--patch gbk`，
   正在按语言变体收口（优化计划 O5）。
-- **仍缺**：P0-1 `_STR`、P0-2 按钮纹理状态机、P0-3 SPL 过渡、P0-4 背景 CG；
-  `PRODUCT` 其它 COM、正文逐字对拍、内存包槽的 Snappy 分支。
+- **标题与演出（2026-11-24 补）**：`注意` 警示页 → 标题 build 动画 → 完整
+  菜单链路已打通；`FILEINFO[CGFILE]` 按 0.500 扩展名表探测
+  `_off/_over/_on/_onover/_na`，按钮 hover/点击生效；`.ydg`/QOI 背景与
+  按钮图、`.opus` BGM/语音均可解码。
+- **仍缺**：`type2/` 皮肤目录选择规则、`PRODUCT` 其它 COM、正文逐字对拍、
+  内存包槽的 Snappy 分支。
 - **已落地（2026-11-23 补）**：`SAVE[MEM=99999]` 的 0..499 内存槽打包、
   `LOAD[DNO=1024]` 读取、`SAVE[FILE]` 写回 DNO=1024、`TEXT[FILE]` 行内翻译、
   `WORD`/选项/按钮 `translate.json` 运行时替换。
@@ -98,6 +122,10 @@ Linux / macOS 桌面与真 wasm（内存数据源 + 浏览器存档）的缺口�
 | 0.481 · 标题画面 | 0.481 · 对话 | 0.494 · 对话 |
 | :---: | :---: | :---: |
 | [![0.481 标题画面](docs/assets/case/1_t.png)](docs/assets/case/1_t.png) | [![0.481 对话](docs/assets/case/1_d.png)](docs/assets/case/1_d.png) | [![0.494 对话](docs/assets/case/2_d.png)](docs/assets/case/2_d.png) |
+| **0.555 · 对话** | **0.555 · 官方中文** | **0.474 · 标题画面** |
+| [![0.555 对话](docs/assets/case/3_d.png)](docs/assets/case/3_d.png) | [![0.555 官方中文](docs/assets/case/4_d.png)](docs/assets/case/4_d.png) | [![0.474 标题画面](docs/assets/case/5_t.png)](docs/assets/case/5_t.png) |
+| **0.466 · 对话** | | |
+| [![0.466 对话](docs/assets/case/6_d.png)](docs/assets/case/6_d.png) | | |
 
 ## 下载
 
@@ -381,9 +409,11 @@ cargo test --workspace
 - 格式：YSTB V2 缺样本；YPF 旧 NUL-XOR 方言无样本，显式拒绝。
 - 运行时：`CSVINFO` 未取证；`VAR`、`SAVEINFO` 已按官方 no-op 对齐；
   `_STR`、v555 按钮纹理/SPL/背景 CG 仍为 P0。
-- 存档：`SAVE[MEM=99999]` 与 `LOAD[DNO=1024]` 已落地；`SAVE` 侧
-  `DNO=1024` 写回调用点未定位；`FILEACT` 图层导出未闭环、
-  `FILEACT[EXEC]` 拒绝执行（宿主安全策略）。
+- 存档：`SAVE[MEM=99999]`、`LOAD[DNO=1024]` 与 `SAVE[FILE]` 的 1024
+  写回已落地（DIV-RT-056/075/078）；带 `MEM` 的表（0.481/0.494/0.500/
+  0.555）按 500 槽内存包读取，1024 不是保留号，同窗口重复预约 DNO
+  报诊断；0.495 SDK 无 `MEM`，1024 仍是普通块。`FILEACT` 图层导出
+  未闭环、`FILEACT[EXEC]` 拒绝执行（宿主安全策略）。
 - 宿主：`REGINFO` 桌面已接（Windows 注册表）；Android 已接
   `translate.json`/`nativeStatus` 统计；Linux / macOS 桌面与真 wasm
   （内存数据源 + 浏览器存档）未验证。

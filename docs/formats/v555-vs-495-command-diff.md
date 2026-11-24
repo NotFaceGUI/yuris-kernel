@@ -154,7 +154,7 @@ argc 与槽位序列均以 E1/E2 为准;E4 §6.3 独立复核一致。
 | `VARINFO[SJISCODE/STRFIRST/NO2]` | `crates/yu-rt/src/semantics.rs` + `vm/handlers/variables.rs` | 已实现;按语义形态门控 |
 | `CGINFO[LINT2]` | `crates/yu-gfx/src/state.rs` | LINT2 回读已实现;`SEARCH/NUM/NAME/LSET/NO` 未实现(truth 记 31,405 条 unsupported 待分类) |
 | `FILEINFO[CGFILE]` | 共享 `vm/handlers/file_io.rs:371` | 已实现探测;已删除 `yscm.version == 555` 门控,扩展名链末尾通用追加 `.webp`(DIV-RT-070) |
-| `SAVE/LOAD[MEM]` | 共享 `vm/handlers/file_io.rs:719/984` + `yu-save` | 已实现内存槽;`MEM=99999` 的 0..499 打包已实现(DIV-RT-071);`LOAD[FILE DNO=1024]` 的 500 槽读取(DIV-RT-075)与 `SAVE[MEM=99999]` → 下一次 `SAVE[FILE]` 写 DNO=1024(DIV-RT-056/075)均已完成 |
+| `SAVE/LOAD[MEM]` | 共享 `vm/handlers/file_io.rs:719/984` + `yu-save` | 已实现内存槽;`MEM=99999` 的 0..499 打包已实现(DIV-RT-071);`LOAD[FILE DNO=1024]` 的 500 槽读取(DIV-RT-075)与 `SAVE[MEM=99999]` → 下一次 `SAVE[FILE]`/`SAVE[MEM]` 写 DNO=1024(DIV-RT-056/075/078)均已完成;门控按命令表是否带 `MEM`(0.481/0.494/0.500/0.555),1024 不是保留号,同窗口重复预约 DNO 报诊断 |
 | `PRODUCT` | `crates/yu-rt/src/other/handlers/product.rs` | 已实现部分 COM;`COM=21000/10201/10205` 仍 `Unimplemented` |
 | `MOVIE2/MOVIE2END/MOVIE2INFO` | — | 未路由/未实现;静态语料 0 次使用(E4 普查) |
 | `ALIAS` | 555 共享空操作槽 | 已按 555 默认槽清单处理 |
@@ -227,3 +227,4 @@ argc 与槽位序列均以 E1/E2 为准;E4 §6.3 独立复核一致。
 - 2026-11-23:语义普查(见 `docs/formats/v555-semantic-census-2026-11-23.md`)。确认 §4 的 8 组不完整(缺 `RETURNCODE`,已由 DIV-RT-069 补);闭合 `FILEINFO[CGFILE]` 证据空洞(0.495 `0x44286c` 读该槽);新增 `TEXT[CLEAR]` 时机、`WORD`/`_` 逐字符表删除、`LET` 系统变量写入、`FONT NAME`、`WAIT` 边界等结论。0.495 与 v555 处理体归一化反汇编相似度:15 条命令 1.000 一致,差异集中在 text/查询/文件/任务边界。
 - 2026-11-23(续):`_`/`WORD` 折空格/上限与 v555 `TEXT[CLEAR]` 时机已修(DIV-RT-072/073);`FONT` 的 NAME/NO/BNO 复核为 `yu-gfx` 已实现(8 样式槽 + `yu-font` 请求),VM 数值镜像另议。
 - 2026-11-23(续 2):`LET` 的 `_MOUSE_L`/`_DROPFILE_NUM`/`_INT`/`_PINT` 写侧已修(DIV-RT-074);`LOAD[FILE DNO=1024]` 500 槽读取已修(DIV-RT-075);DNO=1024 已勘误为 `SAVE[MEM=99999]` 500 槽内存包,写侧已接(DIV-RT-056/075)。
+- 2026-11-24:`SAVE 0x44b874` 全函数无 0x400 特例,普通 `SAVE[DNO=1024]` 与其它 DNO 同路;同窗口重复预约报错 -1(DIV-RT-078)。0.481 `LOAD 0x447406` 有 `cmp esi,0x400`、`SAVE 0x44dc19` 同型重复检查;0.495 `LOAD 0x44708c` 全段无 0x400 分支(该表无 `MEM`)。门控改为按表是否带 `MEM`。LET 浮点→int 确认为 FPU 向零截断,NaN/Inf/越界写整数不定值(DIV-RT-077)。

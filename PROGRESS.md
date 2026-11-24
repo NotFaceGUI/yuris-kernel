@@ -17753,6 +17753,9 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
 
 ## 挂账 PUSH-PREP-RESIDUALS (2026-11-24) · sysvar 强转与 v555 DNO=1024 占用待取证
 
+> **2026-11-24 更新**:本挂账的取证与实现对账见下一节
+> 「成果 V555-EVIDENCE-DNO1024-LET」;下文保留当时原文。
+
 - **DIV-RT-077**:`_INT`/`_PINT`/`_DROPFILE_NUM` 的 RHS 浮点/字符串转换。
   当前用 `to_int_lossy()` 与普通 LET 的 `coerce_to(Int)` 统一(浮点截断、
   字符串解析);官方这三类写入口的实际转换规则、`DAT_008724ac` 的宽度/符号
@@ -17763,6 +17766,77 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   SAVE 处理体是否在预约阶段排除 1024、官方存档逐块解析、旧版 LOAD 分支。
 - **原则**:两处都是“内部一致性/防数据丢失”的防御性实现,不是已证实的
   官方语义;取证后按 DIV 结论收紧或放宽,不把挂账当终态。
+
+## 成果 V555-EVIDENCE-DNO1024-LET (2026-11-24) · DNO=1024/MEM 包与 LET 强转取证,补齐静默差异诊断
+
+- **DIV-RT-078 取证闭合**(REA/Ghidra 12.1.4;0.481/0.495/v555 三构建):
+  - **门控纠错**:`MEM` 是命令表能力,不是版本号。0.481/0.494/0.500/
+    0.555 商业表的 `SAVE/LOAD` 带 `MEM`;0.479 与 0.495 SDK 表没有。
+    `SemanticProfile::from_boot` 改为按表派生 `save_mem_pack`。
+  - v555 `SAVE 0x44b874` 全函数无 `0x400` 比较;`0x44b874:153-158`
+    只有通用 `DAT_0086a13c[DNO] != 0 → FUN_0046c040 / return -1`;
+    普通 `SAVE[DNO=1024 SET=…]` 与其它 DNO 同路,1024 **不是保留号**。
+  - 0.481 `SAVE 0x44dc19` 同型重复检查;`0x44dbd8` 是 `MEM=99999` 分支。
+  - **包直接进 DNO=1024 块缓冲**:`FUN_0044d82c` 的 `DAT_0086a03c`
+    就是块指针数组(基址 `0x86903c`)的 DNO=1024 项(`0x86a03c`);
+    下一次 `SAVE[FILE]`/`SAVE[MEM=n]` 序列化块表时自然带上,`SAVEEND` 丢弃。
+    包后普通 1024 预约命中重复检查;普通 1024 先、包后时包覆盖缓冲。
+  - 0.481/0.494/0.500 的 LOAD 均有 `cmp esi,0x400; je <500 槽读取>`:
+    0.481 `0x447406`、0.494 `0x4472c0`、0.500 `0x474feb`;SAVE 重复
+    检查分别在 `0x44dc19`/`0x44cda7`/`0x47b2fe`。
+  - 0.495 `LOAD 0x44708c..0x44776c` 全段无 `0x400`/独立分支,
+    1024 按普通块(该表也没有 `MEM`)。
+- **实现对齐**:
+  - `SaveState` 删除「1024 一律拒绝」;新增
+    `set_duplicate_dno_error`(按 `save_mem_pack` 注入)、
+    `staged_dnos`(每次成功序列化清零);`pack_mem()` 立即暂存 1024,
+    包后普通 1024 报重复;包覆盖普通 1024 时留 verbose 痕迹;
+  - `SAVE[MEM=n]` 容器也带当前块表的包,序列化后清包标记;
+  - `file_io` 删除「普通 1024 一律拒绝」,无内容 DNO 仍按未知形态挂号
+    (包由 `pack_mem()` 直接暂存,不靠该分支)。
+- **DIV-RT-077 取证与对齐**(v555 `0x420cf4`):
+  - 浮点→int 为 FPU `RC=11` + `fistp qword` 向零截断;NaN/Inf/越界写
+    整数不定值 `i64::MIN`。新增 `trunc_f64_to_i64`,替换 Rust `as i64`
+    的饱和语义;
+  - `_DROPFILE_NUM` 官方写 `DAT_008724ac = uVar16`(32 位低 dword),
+    内核 i32 位型一致;
+  - 字符串→int 官方入口仍未定位(int 求值表只有 int/float 两项):
+    保持十进制解析,三个写入口新增 `rt.sysvar.write` recoverable
+    留痕(带脚本/pc),不再静默。
+- **静默差异诊断**:
+  - v555 入口脚本装载期静态声明失败此前 `let _ = …` 吞错,现经
+    `Vm::report` 挂号;取不到窗口载荷、lvalue/初始化表达式失败也挂号;
+  - `other::sysvar` 的 `_STR`/`_INT` **读侧**:未声明槽/越界/非字符串
+    系统变量/错型/标量越界/读取失败不再静默返回 0/空。读路径是
+    `&Vm`,新增 `State.read_diags` 队列,`Vm::step_command` 在命令结束
+    后统一带 script/pc 发出;
+  - LET 特殊 sysvar 的字符串 RHS、DNO 重复/覆盖均带诊断。
+- **验证**(`CL/CFLAGS/CXXFLAGS=-utf-8`,样本 env 见 AGENTS §2):
+  - `cargo check -p yu-save -p yu-rt -p yu-engine --all-targets` → ok
+    (顺带修 `probe_pieces_live` 例子的格式串少一个参数);
+  - `cargo test -p yu-save --lib` → 43 passed / 3 ignored;
+  - `cargo test -p yu-rt --lib` → 159 passed;
+  - `cargo test -p yu-rt --test fixture` → 160 passed / 7 ignored;
+  - `cargo test -p yu-cli --test logging_guards` → 3 passed;
+  - `cargo test -p yu-engine --lib` → 88 passed;
+  - env-gated 官方样本:0.481 `<v481-natsu>` `save00151.sd` 的
+    DNO=1024 包读回重打包逐字节一致(`official_player_save_pack_loads`),
+    `official_save_flush_preserves_all_blocks` 通过;
+  - 实机 60 帧: `<v555-3>` 与 `<v481-x>` 均正常结束、无 Fatal,
+    新增读侧诊断零命中(未刷屏)。
+- **新增回归**:`dno_1024_is_ordinary_and_v555_rejects_duplicate_reservation`、
+  `mem_pack_stages_dno_1024_and_rejects_later_reservation`、
+  `mem_pack_after_ordinary_1024_overwrites_pack_block`、
+  `mem_save_consumes_staged_pack`、
+  `save_end_discards_unflushed_pack`、
+  `save_file_dno_1024_is_ordinary_on_v555`、
+  `load_file_dno_1024_uses_mem_pack_on_0481`、
+  `int_read_of_undeclared_slot_reports_diag`、
+  `to_int_lossy_truncates_float_toward_zero_and_parses_strings`。
+- **残余**:本轮 555 存档/LET 语义项无未闭环。字符串→int 的官方分支证据不足,
+  内核已明确选择“十进制解析 + `rt.sysvar.write` 诊断”作为兜底
+  (DIV-RT-077),不再列为待办;包内槽 Snappy 分支无官方写点证据,按
+  `aligned-stub` 固定 zlib(DIV-RT-056 §5)。
 
 ## 成果 ANDROID-LIBRARY-MIUIX (2026-11-24) · Miuix 游戏库网格、exe 图标与内核错误统一 DIALOG
 
@@ -17830,6 +17904,29 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   - 桌面/CLI 尚未消费宿主消息(桌面有诊断面板/panic 横幅,CLI 只打印
     诊断);`wasm/serve` 同契约后续接。
 
+## 成果 README-DEMO-V555 (2026-11-24) · README 演示区补 0.55x/0.47x/0.46x 示例图并改三列换行
+
+- 新增 4 张实机图(`docs/assets/case/`):
+  - `3_d.png`:0.555 对话(2880×1663 原图 Lanczos 缩至 1728×998);
+  - `4_d.png`:0.555 官方中文对话(1920×1123 → 1728×1011);
+  - `5_t.png`:0.474 标题画面(1920×1123 → 1728×1011);
+  - `6_d.png`:0.466 对话(1200×943 原尺寸)。
+- `README.md` / `README.en.md` 演示表由 4 列改回 **3 列 + 换行**,
+  分三行:0.481 标题 / 0.481 对话 / 0.494 对话;0.555 对话 /
+  0.555 官方中文 / 0.474 标题;0.466 对话。
+- **启动/取证命令**(release,`yu-cli 0.4.2`;均 `--mode desktop --no-sound`):
+  - `yu-cli run "<game-aorio>"` → `identity: yuris=0.474`;
+  - `yu-cli run "<side-repo>/workbench/project-0466"` → `yuris=0.466`
+    (0.46x SDK 工程,123 个 ysbin;按主人要求 45x/46x 合一张图);
+  - `yu-cli run "<v555-2>" --patch big5` → `yuris=0.555`,简中正文
+    (`cgsys_cn/` 前缀 + `sc_cn_scenario`)正常显示。
+- **45x 实测**:`workbench/project-0459`(69 个 ysbin)被 A5 拒绝启动:
+  `Fatal[table.missing] ysl: 必需表不存在 ysbin/ysl.ybn`;0.459 编译器产物
+  无 `ysl.ybn`,故 45x 不单独出图,由 0.466 代表该两代。
+- **验证**:`python -I -c "from PIL import Image; ..."` 读出
+  `3_d 1728×998`、`4_d 1728×1011`、`5_t 1728×1011`、`6_d 1200×943`;
+  两份 README 演示表列数一致(3 列,3 个图片行 + 2 个标题行)。
+
 ## 成果 ANDROID-REJECT-TRANSLATE (2026-11-24) · 不支持游戏直接拒绝、翻译导入/导出、启动图标重生成
 
 - **游戏库只收支持版本**:`importGame` 先 `nativeProbeGameRoot`,不是 YU-RIS
@@ -17871,6 +17968,47 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
 - **验证**:`grep -rn "docs/assets/icon.png" README.md README.en.md` 无命中;
   `docs/assets/` 下已无该文件。
 
+## 成果 V500-FAMILY (2026-11-24) · 0.500 归入 555 商业族并按版本/表能力覆盖
+
+- **判定**:`<v500-relirium>` 是真 0.500(`ProductVersion 0,500,0,0`);
+  `ysc.ybn` 121 槽、与 v555 仅版本字段与 `GRADATION` kind 不同。
+  反编译对拍 `TEXT`(837B)/`CGINFO`(3552B)/`VARINFO`(2775B)/
+  `RETURNCODE`(78B)/`GOSUB`/`RETURN`/`LET`/`VARACT`/`SAVE`/`LOAD`
+  与 v555 同构;`MOVIE2*`/`REGINFO` 在 0.500 是 29B 空桩。
+- **语义层**:新增 `SemanticProfile::is_v555_family()`(0.500/0.555);
+  500 走 `FileArray`/`Inert`/`EndOnly`/`FirstChar`/`SlotId` 等 555 形态;
+  `save_image` 仍精确 555(0.500 官方存档无 DNO=3 缩略图块)。
+- **运行面**:引擎对 555 族安装独立运行面;`CGINFO[LINT/LINT2]` 回读
+  对 555 族开启;分发表 0.500 的 `MOVIE2*`/`REGINFO` 覆盖为 `NoopEval`;
+  `PRODUCT[COM=1/2/3]` 按 `0x488b20` 落地。
+- **格式层**:`yu-format::ydg` 解析 YDG 容器 + QOI 解码;YDG 的“帧”是
+  按行瓦片(1920×1080 背景 = 4×1920×270),渲染侧拼回整图;
+  `ImageFormat::Ydg` + `from_code_v500`(0.500 码表 1=bmp/2=png/5=ydg/
+  6=webp);`GfxState`/`TextureStore` 探测序按 `yscm.version == 500` 选表。
+- **诊断工具**:`probe_engine_dialogs`(引擎级 tick + 自动回答 DIALOG +
+  末帧 PNG/JSON/render_report)、`ydg_decode`(YDG/QOI 独立解码);
+  `dump_runtime_vars` 增加 `--codec/--answer-dialogs` 与
+  `Vm::task_positions()` 任务快照;`tools/v555/ghidra/ListXrefs.java`。
+- **改前/改后**(headless,`--frames 2`):
+  - 改前:`FATAL rt.expr.malformed @ es_scenario_load.yst pc4`、
+    `PRODUCT` 无处理器、`CGINFO[LINT2]` 2822 条 unsupported、
+    `textures: decoded=0`;
+  - 改后:无 Fatal;`TEXT[FILE] scenario\00_tr.txt 163 行`;
+    `textures: decoded=204`;按钮状态层带 `LINT2=18/999`。
+- **验证命令**:
+  - `cargo test -p yu-format --lib ydg::` → 4 passed;
+  - `cargo test -p yu-gfx --lib v500_probe_order` → 1 passed;
+  - `cargo run -p yu-format --example ydg_decode -- <back.ydg>` →
+    4×1920×270 → 1080 行,字节和 1555677937(与 PIL 拼图一致);
+  - `probe_engine_dialogs "<v500-relirium>" 900 --answer 2` →
+    启动期更新检查 DIALOG 被回答;第 900 帧截图 `title900b.png`
+    (8,296,178 B)为正确的 1920×1080 标题背景(4×1920×270 拼图)并显示
+    「前回のつづきから」,不再是清屏黑;主任务进入 `es_eris` 按钮事件循环。
+- **残余**:`SYSTEM[SX/SY]` 的 VM 侧改屏已落地(`Vm::set_screen` +
+  `apply_system_screen`,`rt.system.trace`),宿主后缓冲重建未接线;
+  YSWEBM `PRODUCT[COM=24001/24002/24009]`、`COM=56/57`、`$4780[-1]`
+  负下标;`<patch-group>` 外挂层未实现。详见 `DIV-RT-079`、`DIV-GFX-093`。
+
 ## 成果 ANDROID-HELP-FONT-GPU (2026-11-24) · 详情页问号说明页、字体必选、GPU 选择交互
 
 - 详情页顶栏:标题「游戏详情」在左、问号在右,同一行垂直居中(`YuTopBar` +
@@ -17897,3 +18035,61 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   `.agents/skills/yuris-translation/SKILL.md`。
 - **追加(v27)**:链接改为蓝色下划线文本(非按钮);「遇到问题先查这里」末尾加
   「提交 Issue(GitHub)」超链接,指向仓库 issues/new。
+
+## 成果 V500-BUTTONS (2026-11-24) · FILEINFO[CGFILE] 0.500 扩展名表,标题菜单全量恢复
+
+- **根因**:`FILEINFO[CGFILE EXIST]` 的候选扩展名仍是内联 0.495 表
+  (`1=png … 5=psb`)。`es_buttonque.yst` 创建按钮时只用 5 次
+  `FILEINFO[EXIST=1 CGFILE=…_off/_over/_on/_onover/_na]` 探测状态图;
+  0.500 的按钮是 `.ydg`,五次全 0 → 脚本 `es._mes("ボタン画像指定が
+  正しくありません")` + `END`。只有 `LLOAD` 显式给五个名字、不走探测,
+  所以标题此前只剩它一个按钮。
+- **修复**:`cg_file_exists` 改走 `yu_format::image_ext` 的共享码表
+  (按 `yscm.version == 500` 选 0.500 表,与 `CG[FILE]`/`CGINFO`/
+  `resolve_asset_size` 同源);保留 `.webp` 通用追加。
+- **夹具**:`ProjectBuilder` 新增 `image_ext_order`(及
+  `build_yscfg_with_order`);新增
+  `fileinfo_cgfile_uses_v500_ydg_table`(0.500 码 5=`.ydg` 命中,
+  `.psb` 不再命中,缺失后缀写 0)。
+- **验证**(release,`<v500-relirium>`):
+  - `cargo test -p yu-rt --test fixture fileinfo_cgfile` → 2 passed;
+  - `probe_engine_dialogs` 900 帧:f380 显示官方「注意」警示页;
+    f760 标题 build 动画(背景/角色淡入);f920 完整标题菜单
+    (はじめから/つづきから/前回のつづきから/シーンジャンプ/TIPS/
+    エクストラ/コンフィグ/終了 + マニュアル/オフィシャルサイト);
+  - hover `はじめから`(1767,470)→ 按钮高亮;点击 → 全屏淡出,
+    进入开始流程;
+  - `missing_assets` 仅剩 `btn_skip_bt4`(快捷操作隐藏分支)、
+    `tip_voicedel`、`map_back`;后者不在标题流程。
+- **残余**:`btn_skip_bt4` 的 `type2/` 皮肤目录选择规则、`.opus` 声音
+  扩展/解码器;详见 `DIV-GFX-094`。
+
+## 成果 AUDIO-OPUS (2026-11-24) · 0.500 Ogg Opus 解码、候选扩展名与许可/README
+
+- **事实**:`<v500-relirium>` 封包 25,307 个 `.opus`、859 个 `.ogg`;
+  官方 exe 扩展名表 `0x1d95e0` 为 `.bmp .png .jpg .gif .ydg .webp .jxl
+  .qoi .avif | .wav .ogg .opus`,本作 `yscfg.sound_ext_order=[4,0,0,0]`
+  ⇒ 0.500 的 `4` 对应 Opus。
+- **实现**:
+  - 依赖 `opus-pure 0.2.5`(BSD-3-Clause,RFC 6716/7845/8251);
+  - `meta::ogg_is_opus` / `probe_opus`:OpusHead 取声道/pre-skip,尾页
+    granule − pre-skip = 总帧数,采样率恒 48 kHz;`CODEC` 仍报 1(OGG);
+  - `decode::decode_opus`:Trim(pre-skip/end-trim)+ `decode_s16`;
+  - `stream::Kind::Opus`:窗口/预取/seek 与 Vorbis 同构,`rewind` +
+    `reset_state` + 重建 Trim;`discard_before` 覆盖 Opus;
+  - 候选序按语义档:0.500/0.555 为 `.wav → .ogg → .opus`,旧版保持
+    `.ogg → .wav`(`SoundState::set_probe_opus`,引擎按
+    `is_v555_family()` 设置,不按游戏名)。
+- **验证**:
+  - `cargo test -p yu-sound` → 55 passed(含 3 个 Opus 用例);
+  - `real_v500_opus_decodes_to_pcm`:10,974,546 帧 / 48 kHz / 立体声,
+    与 granule 差 <100 ms;
+  - `gated_v500_opus_loads_header_only_then_streams`:装载只预取
+    ≤2 s、`TOTALTIME` 精确、混音 2 s 非静音;
+  - 桌面 release:BGM/按钮音效出声,`snd.file.missing` 消失。
+- **许可**:`THIRD-PARTY-NOTICES.md` 重新生成(428 个第三方 crate,
+  opus-pure BSD-3 已入表,全文在 `third_party/licenses/BSD-3-Clause.txt`)。
+- **README**:中英文新增「文件格式与封包」表(封包/表与脚本/图像/音频/
+  影片/存档)并更新 5xx 现状。
+- **台账**:`DIV-SND-006`(新)、`docs/sound-ledger.md` 0-12、
+  `DIV-GFX-094` 残余改为已支持。

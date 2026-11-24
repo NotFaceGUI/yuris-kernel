@@ -69,9 +69,11 @@ loop 500:
   - 解析 YSSD,取 DNO=1024 块载荷;
   - 校验 12 字节头、500 条边界、`raw_len/comp_len`;
   - zlib 解压并闭合 `raw_len`,写入 `mem_slots`(空槽移除);
-- `Vm::op_load` 在 `SemanticProfile::save_mem_pack`(v555)且
+- `Vm::op_load` 在 `SemanticProfile::save_mem_pack` 且
   `mem.is_none() && dno == 1024` 时直接调用宿主 `load_mem_pack`,不落
-  通用 `load_block`,不写 `LET`;0.495 及更早的 1024 仍是普通块。
+  通用 `load_block`,不写 `LET`。该门控由命令表是否带 `MEM` 派生:
+  0.481/0.494/0.500/0.555 商业表启用;0.495 SDK 表没有 `MEM`,
+  其 LOAD 处理体也无 0x400 分支,1024 仍是普通块(DIV-RT-078)。
 
 ## 4. 回归
 
