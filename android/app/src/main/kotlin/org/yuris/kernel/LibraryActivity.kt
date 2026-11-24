@@ -167,17 +167,7 @@ class LibraryActivity : ComponentActivity() {
                 else -> GameGrid(
                     games = games,
                     modifier = Modifier.fillMaxSize().padding(padding),
-                            onOpen = { game ->
-                                if (!game.supported) {
-                                    Toast.makeText(
-                                        this,
-                                        "YU-RIS ${versionText(game.version)} 不支持,无法打开",
-                                        Toast.LENGTH_LONG,
-                                    ).show()
-                                } else {
-                                    openSetup(game.root)
-                                }
-                            },
+                    onOpen = { game -> openSetup(game.root) },
                 )
             }
         }
@@ -239,12 +229,6 @@ class LibraryActivity : ComponentActivity() {
             "yu-library",
             "import root=$root version=$version supported=$supported",
         )
-        if (!supported) {
-            val message = "YU-RIS ${versionText(version)} 不支持,已拒绝导入"
-            error = message
-            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
-            return
-        }
         LibraryStore.add(this, root)
         error = null
         Toast.makeText(this, "已导入", Toast.LENGTH_SHORT).show()
@@ -304,13 +288,6 @@ class LibraryActivity : ComponentActivity() {
         private const val REQUEST_STORAGE = 2001
     }
 }
-
-internal fun versionText(version: Int): String =
-    if (version > 0) {
-        String.format(java.util.Locale.ROOT, "%d.%03d", version / 1000, version % 1000)
-    } else {
-        "未知"
-    }
 
 @androidx.compose.runtime.Composable
 private fun GameGrid(

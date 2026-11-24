@@ -359,9 +359,9 @@ class SetupActivity : AppCompatActivity() {
     private var pendingGameDir: String? = null
 
     /**
-     * 只接受内核 probe 认得的 YU-RIS 游戏根(版本在支持范围)。
+     * 只接受内核 probe 认得的 YU-RIS 游戏根(不按版本号拒绝)。
      *
-     * <p>不是 YU-RIS / 版本不支持 → 直接拒绝:不动 `state.gameDir`,只弹胶囊
+     * <p>不是 YU-RIS → 直接拒绝:不动 `state.gameDir`,只弹胶囊
      * 并把原因写进状态行。probe 是同步文件 IO(`Project::discover`),放后台
      * 线程;结果只认最后一次选择,避免连点两次时旧结果覆盖新结果。
      */
@@ -370,15 +370,11 @@ class SetupActivity : AppCompatActivity() {
         Thread({
             val info = StoragePaths.probeInfo(File(path))
             val version = info?.optInt("version", 0) ?: 0
-            val supported = info?.optBoolean("supported", false) ?: false
-            Log.i(
-                TAG,
-                "probe root=$path ok=${info != null} version=$version supported=$supported",
-            )
-            val error = when {
-                info == null -> "不是 YU-RIS 游戏:未找到 data.ypf 或 ysbin 目录"
-                !supported -> "YU-RIS ${versionText(version)} 不支持,已拒绝导入"
-                else -> null
+            Log.i(TAG, "probe root=$path ok=${info != null} version=$version")
+            val error = if (info == null) {
+                "不是 YU-RIS 游戏:未找到 data.ypf 或 ysbin 目录"
+            } else {
+                null
             }
             runOnUiThread {
                 if (pendingGameDir != path) {

@@ -29,13 +29,16 @@ pub const KERNEL_NAME: &str = "yuris-kernel";
 /// 内核版本(工作区包版本)。
 pub const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 官方 BETA 4 主线可用版本带(0.450–0.495)。
+/// 壳导入/打开游戏的唯一版本判据:只挡「不是 YU-RIS」,不按版本号拒绝。
 ///
-/// 见 README「支持范围」:BETA 2/3 适配中,官方商业 5xx(如 v555)适配中。
-/// 宿主只拿这个判据着色,不自己比较版本号。
+/// probe 能解出工程(`Project::discover` 成功,有 ysbin/ysc.ybn)就是
+/// YU-RIS;版本只用于展示。BETA 2/3(255–292)、BETA 4 主线(450–495)、
+/// 官方商业 5xx(v500/v555)都放行尝试——适配中/可用的细分在运行期
+/// 由 Explicit 诊断与台账体现,不在选目录这一步被壳拒掉。
+/// 0 = 未识别(数据自证缺失),同样放行尝试。
 #[must_use]
 pub fn supported_engine_version(version: u32) -> bool {
-    (450..=495).contains(&version)
+    version == 0 || version >= 255
 }
 
 /// 已解码的窗口图标(RGBA8,逐行从上到下)。
@@ -113,11 +116,10 @@ impl Identity {
         )
     }
 
-    /// 引擎版本是否在「可用」范围内(宿主角标着色用)。
+    /// 引擎版本是否放行(壳导入/打开游戏的判据)。
     ///
-    /// 与 README「支持范围」同一口径:官方 BETA 4 主线 0.450–0.495 可用;
-    /// BETA 2/3 仍在适配,官方商业 5xx 分支适配中(v555 已推进到标题选择循环),
-    /// 均不算支持。规则只此一处,壳不自行判断版本号。
+    /// 只挡非 YU-RIS;YU-RIS 各版本带(含 5xx 商业与未识别 0)都放行,
+    /// 规则只此一处,壳不自行判断版本号。
     #[must_use]
     pub fn engine_supported(&self) -> bool {
         supported_engine_version(self.engine_version)
@@ -590,14 +592,14 @@ fn read_i32(data: &[u8], at: usize) -> Option<i32> {
 mod tests {
     use super::*;
 
-    /// 支持范围与 README「支持范围」一致:BETA 4 主线绿,其余(含 555)红。
+    /// 拦截面与壳一致:非 YU-RIS(版本 < 255 的未知老格式)拒,其余放行。
     #[test]
     fn supported_range_matches_readme() {
-        for version in [450, 466, 481, 486, 495] {
-            assert!(supported_engine_version(version), "{version} 应在支持带内");
+        for version in [0, 255, 276, 292, 450, 466, 481, 486, 495, 500, 555] {
+            assert!(supported_engine_version(version), "{version} 应放行");
         }
-        for version in [255, 276, 292, 500, 555] {
-            assert!(!supported_engine_version(version), "{version} 不在支持带内");
+        for version in [1, 100, 200, 254] {
+            assert!(!supported_engine_version(version), "{version} 应拒绝");
         }
     }
 }

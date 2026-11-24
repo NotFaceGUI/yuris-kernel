@@ -2342,10 +2342,9 @@ pub fn probe_game_root(path: &str) -> String {
     match Project::discover(std::path::Path::new(trimmed), None) {
         Ok(project) => {
             // 引擎版本来自 `ysc.ybn` 容器头(数据自证),不是猜的。
-            // 未知版本(0)不拦;已知版本按官方 BETA 4 主线 450..=495 判定。
+            // 版本只用于展示:壳只挡非 YU-RIS(见 `supported_engine_version`),
+            // 未知(0)与各版本带(含 5xx 商业)都放行尝试。
             let version = project.ysc_version().unwrap_or(0);
-            // 版本未知也按「不在支持范围」处理:壳只提示,仍允许尝试启动;
-            // 静默当作支持会让用户以为 5xx 已适配。
             let supported = yu_engine::identity::supported_engine_version(version);
             format!(
                 "{{\"ok\":true,\"root\":\"{}\",\"kind\":\"{}\",\"packs\":{},\
