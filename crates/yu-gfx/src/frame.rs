@@ -408,3 +408,56 @@ pub fn probe_order_from_codes(codes: &[u8; 8]) -> Vec<ImageFormat> {
         .map(ImageFormat::from_code)
         .collect()
 }
+
+/// 0.500 商业分支:`yscfg` 的 8 字节 → 探测顺序(码表已换代)。
+///
+/// 0.500 的码 1/2 与 0.495 相反,5 从 `.psb` 换成 `.ydg`;证据见
+/// [`ImageFormat::from_code_v500`]。
+pub fn probe_order_from_codes_v500(codes: &[u8; 8]) -> Vec<ImageFormat> {
+    codes
+        .iter()
+        .copied()
+        .take_while(|&c| c != 0)
+        .map(ImageFormat::from_code_v500)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 0.500 扩展码表换代:5=`ydg`、1/2 互换;0.495 仍 1=png/2=bmp/5=psb。
+    #[test]
+    fn v500_probe_order_maps_code_five_to_ydg() {
+        let order = probe_order_from_codes_v500(&[5, 1, 2, 6, 7, 8, 9, 3]);
+        assert_eq!(order[0], ImageFormat::Ydg);
+        assert_eq!(order[1], ImageFormat::Bmp);
+        assert_eq!(order[2], ImageFormat::Png);
+        assert_eq!(order[3], ImageFormat::Webp);
+        assert_eq!(order[7], ImageFormat::Jpg);
+        let legacy = probe_order_from_codes(&[1, 2, 5, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            legacy,
+            vec![ImageFormat::Png, ImageFormat::Bmp, ImageFormat::Psb]
+        );
+    }
+
+    /// 渲染侧码表必须与 `yu_format::image_ext`(VM 尺寸探测共用表)一致。
+    #[test]
+    fn image_format_tables_match_shared_extension_table() {
+        for code in 1..=9u8 {
+            assert_eq!(
+                ImageFormat::from_code_v500(code).extension(),
+                yu_format::image_ext::extension(code, true),
+                "v500 code {code}"
+            );
+        }
+        for code in 1..=5u8 {
+            assert_eq!(
+                ImageFormat::from_code(code).extension(),
+                yu_format::image_ext::extension(code, false),
+                "legacy code {code}"
+            );
+        }
+    }
+}

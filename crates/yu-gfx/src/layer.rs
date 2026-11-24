@@ -197,6 +197,12 @@ pub struct CopyId(pub u64);
 /// 给出默认顺序 `.PNG .BMP .JPG .GIF`。ERIS `yscfg` 的 8 字节为
 /// `01 02 03 04 05 00 00 00`。
 ///
+/// **0.500 换了码表**(2026-11-24 `<v500-relirium>` 取证):`FUN_0046fb18`
+/// (`0x46fb18`,3581B)按 `yscfg+0x1c` 的码分支,`_RDATA` 里的扩展名串
+/// (RVA `0x499640`)依次是 `.png/.bmp/.jpg/.gif/.ydg/.webp/.jxl/.qoi/.avif`,
+/// 但分支常量是 `1→.bmp`、`2→.png`、`3→.jpg`、`4→.gif`、`5→.ydg`、
+/// `6→.webp`(7/8/9 未逐条取证,保留 `Other`)。
+///
 /// `.webp` 不在这张码表里:它是**通用扩展名能力**,由探测链末尾追加,
 /// 不参与版本门控。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +218,14 @@ pub enum ImageFormat {
     /// 不参与 `yscfg` 扩展码表(码表保持各自版本形态),只作为探测链的
     /// 通用追加项;v555 商业包主力格式即 `.webp`。
     Webp,
+    /// 0.500 码 5:`.ydg`(YU-RIS Dynamic Graphic,QOI 帧容器)。
+    Ydg,
+    /// 0.500 码 7:`.jxl`(JPEG XL;无解码器时按 unsupported 显式失败)。
+    Jxl,
+    /// 0.500 码 8:`.qoi`(Quiet OK Image;复用 `yu_format::ydg` 的 QOI 解码)。
+    Qoi,
+    /// 0.500 码 9:`.avif`(AVIF;无解码器时按 unsupported 显式失败)。
+    Avif,
     /// 表内其他未定义码(原样保留)。
     Other(u8),
 }
@@ -229,6 +243,27 @@ impl ImageFormat {
         }
     }
 
+    /// 0.500 商业分支的扩展码表(`1=bmp / 2=png / 3=jpg / 4=gif /
+    /// 5=ydg / 6=webp / 7=jxl / 8=qoi / 9=avif`)。
+    ///
+    /// 证据:0.500 `Relirium.exe` `FUN_0046fb18`,分支常量 1..9 与
+    /// `_RDATA` 扩展名串逐项对应;`yscfg` 的 8 字节为
+    /// `05 01 02 06 07 08 09 03`(ydg→bmp→png→webp→jxl→qoi→avif→jpg)。
+    pub fn from_code_v500(code: u8) -> Self {
+        match code {
+            1 => Self::Bmp,
+            2 => Self::Png,
+            3 => Self::Jpg,
+            4 => Self::Gif,
+            5 => Self::Ydg,
+            6 => Self::Webp,
+            7 => Self::Jxl,
+            8 => Self::Qoi,
+            9 => Self::Avif,
+            other => Self::Other(other),
+        }
+    }
+
     pub fn extension(self) -> Option<&'static str> {
         match self {
             Self::Png => Some(".png"),
@@ -237,6 +272,10 @@ impl ImageFormat {
             Self::Gif => Some(".gif"),
             Self::Psb => Some(".psb"),
             Self::Webp => Some(".webp"),
+            Self::Ydg => Some(".ydg"),
+            Self::Jxl => Some(".jxl"),
+            Self::Qoi => Some(".qoi"),
+            Self::Avif => Some(".avif"),
             Self::Other(_) => None,
         }
     }
@@ -249,6 +288,10 @@ impl ImageFormat {
             Self::Gif => "gif",
             Self::Psb => "psb",
             Self::Webp => "webp",
+            Self::Ydg => "ydg",
+            Self::Jxl => "jxl",
+            Self::Qoi => "qoi",
+            Self::Avif => "avif",
             Self::Other(_) => "other",
         }
     }

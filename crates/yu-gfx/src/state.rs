@@ -36,8 +36,8 @@ use yu_rt::value::Value;
 
 use crate::error;
 use crate::frame::{
-    probe_order_from_codes, Clear, ColorSpace, CompositorFrame, TextureFilter, Viewport,
-    WindowState,
+    probe_order_from_codes, probe_order_from_codes_v500, Clear, ColorSpace, CompositorFrame,
+    TextureFilter, Viewport, WindowState,
 };
 use crate::layer::{
     BlendConfidence, BlendMode, CopyId, EngineValue, ImageFormat, Layer, LayerId, LayerKind,
@@ -583,7 +583,13 @@ impl GfxState {
     pub fn from_tables(tables: &TableSet, mut config: GfxConfig) -> Result<Self, Diag> {
         let params = ParamTable::from_tables(tables);
         params.validate()?;
-        let order = probe_order_from_codes(&tables.boot.config.image_ext_order);
+        // 扩展码表按构建换代:0.500 的 `FUN_0046fb18` 里 1/2 互换、
+        // 5 从 `.psb` 换成 `.ydg`(证据见 `ImageFormat::from_code_v500`)。
+        let order = if tables.boot.yscm.version == 500 {
+            probe_order_from_codes_v500(&tables.boot.config.image_ext_order)
+        } else {
+            probe_order_from_codes(&tables.boot.config.image_ext_order)
+        };
         // A5:缺表不得静默兜底。
         // - `yscfg` 给出非空序 → 用它(引擎设置优先);
         // - `yscfg` 为空、宿主显式注入了序 → 用宿主的(显式注入,不是内置表);
@@ -901,6 +907,28 @@ impl GfxState {
 
     pub fn layer(&self, id: &LayerId) -> Option<&Layer> {
         self.nodes.get(id).map(|n| n.layer.as_ref())
+    }
+
+    /// 全部图层的只读快照(`(id, z, alpha, visible)`;按 id 排序)。
+    ///
+    /// 只给诊断/探针用:演出动画缺失时用来确认「精灵层是否被创建、
+    /// 是否 alpha=0/E=0」,不参与渲染路径。
+    #[must_use]
+    pub fn layer_snapshot(&self) -> Vec<(String, i64, i16, bool)> {
+        let mut out: Vec<(String, i64, i16, bool)> = self
+            .nodes
+            .values()
+            .map(|n| {
+                (
+                    n.layer.id.display(),
+                    n.layer.z,
+                    n.layer.alpha,
+                    n.layer.visible,
+                )
+            })
+            .collect();
+        out.sort();
+        out
     }
 
     /// 本帧诊断(按 `(code, command, detail)` 升序;重复项合并为 `count`)。

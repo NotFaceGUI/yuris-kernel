@@ -1787,7 +1787,9 @@ fn split_dir_name(key: &[u8], codec: Codec) -> (&[u8], &[u8]) {
 
 /// 去掉已知图像扩展名(ASCII,大小写不敏感)。
 fn strip_image_ext(text: &str) -> &str {
-    const EXTS: [&str; 6] = [".png", ".bmp", ".jpg", ".jpeg", ".gif", ".psb"];
+    const EXTS: [&str; 10] = [
+        ".png", ".bmp", ".jpg", ".jpeg", ".gif", ".psb", ".ydg", ".jxl", ".qoi", ".avif",
+    ];
     let bytes = text.as_bytes();
     for ext in EXTS {
         if bytes.len() > ext.len()
@@ -1820,6 +1822,15 @@ fn known_extension_format(key: &[u8]) -> Option<ImageFormat> {
         Some(ImageFormat::Gif)
     } else if ends_with_ascii_ci(key, b".psb") {
         Some(ImageFormat::Psb)
+    } else if ends_with_ascii_ci(key, b".ydg") {
+        // 0.500 商业分支的 UI 容器(`YDG` + QOI 帧)。
+        Some(ImageFormat::Ydg)
+    } else if ends_with_ascii_ci(key, b".jxl") {
+        Some(ImageFormat::Jxl)
+    } else if ends_with_ascii_ci(key, b".qoi") {
+        Some(ImageFormat::Qoi)
+    } else if ends_with_ascii_ci(key, b".avif") {
+        Some(ImageFormat::Avif)
     } else if ends_with_ascii_ci(key, b".webp") {
         // v555 商业包主力格式(`image` 的 webp feature 解码)。
         Some(ImageFormat::Webp)
@@ -1855,6 +1866,70 @@ fn decode_asset(bytes: &[u8], _tuning: RenderTuning) -> Result<Texture, String> 
     // `FUN_004254e4` @0x4254e4 + `FUN_0048384c` zlib 包装)。
     if yu_format::ycg::is_ycg(bytes) {
         let image = yu_format::ycg::decode(bytes)
+            .map_err(|diag| format!("{}: {}", diag.code, diag.detail))?;
+        return Ok(Texture {
+            width: image.width,
+            height: image.height,
+            rgba: image.rgba,
+        });
+    }
+    // YDG：0.500 商业分支的 UI 主力格式(`cgsys/**` 全是 `.ydg`)。
+    // 容器里的“帧”是**按行切分的瓦片**(每片同宽、高度累加 = 画布高;
+    // 例:1920×1080 背景 = 4×1920×270),不是动画帧。官方 `FUN_00449a08`
+    // 把每片解码进同一个 `width × total_height` 缓冲的 y 偏移处;这里
+    // 按同一语义拼回整图。编码 0=QOI / 2=WebP。
+    if yu_format::ydg::is_ydg(bytes) {
+        let ydg = yu_format::ydg::parse(bytes)
+            .map_err(|diag| format!("{}: {}", diag.code, diag.detail))?;
+        let width = u32::from(ydg.width);
+        let height = u32::from(ydg.height);
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        let mut y = 0u32;
+        for (index, frame) in ydg.frames.iter().enumerate() {
+            let piece = match frame.codec {
+                yu_format::ydg::YdgCodec::Qoi => {
+                    let image = yu_format::ydg::decode_qoi(frame.bytes, (ydg.width, frame.height))
+                        .map_err(|diag| format!("{}: {}", diag.code, diag.detail))?;
+                    Texture {
+                        width: image.width,
+                        height: image.height,
+                        rgba: image.rgba,
+                    }
+                }
+                // WebP 帧交给宿主解码器(与 `.webp` 资产同一路径)。
+                yu_format::ydg::YdgCodec::WebP => decode_with_image(frame.bytes)
+                    .map_err(|e| format!("YDG 帧 {index} WebP: {e}"))?,
+                yu_format::ydg::YdgCodec::Other(code) => {
+                    return Err(format!("YDG 帧编码 {code} 未接入解码器"));
+                }
+            };
+            if piece.width != width || piece.height != u32::from(frame.height) {
+                return Err(format!(
+                    "YDG 帧 {index} 尺寸 {}x{} 与帧表 {}x{} 不一致",
+                    piece.width, piece.height, width, frame.height
+                ));
+            }
+            let copy_h = piece.height.min(height.saturating_sub(y));
+            if copy_h > 0 {
+                let dst = &mut rgba[(y * width * 4) as usize..((y + copy_h) * width * 4) as usize];
+                let src = &piece.rgba[..(copy_h * width * 4) as usize];
+                dst.copy_from_slice(src);
+            }
+            y += piece.height;
+        }
+        return Ok(Texture {
+            width,
+            height,
+            rgba,
+        });
+    }
+    // 独立 `.qoi`(0.500 扩展码 8;无 YDG 容器)复用同一 QOI 解码器。
+    if bytes.len() >= 14 && bytes.starts_with(b"qoif") {
+        let w = u16::try_from(u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
+            .map_err(|_| "QOI 宽超出 u16".to_string())?;
+        let h = u16::try_from(u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]))
+            .map_err(|_| "QOI 高超出 u16".to_string())?;
+        let image = yu_format::ydg::decode_qoi(bytes, (w, h))
             .map_err(|diag| format!("{}: {}", diag.code, diag.detail))?;
         return Ok(Texture {
             width: image.width,
@@ -2564,4 +2639,83 @@ pub fn trim_bounds_of(tex: &Texture, mask: i64) -> Option<(u32, u32, u32, u32)> 
         return None;
     }
     Some((left, top, left + new_w - 1, top + new_h - 1))
+}
+
+#[cfg(test)]
+mod ydg_assembly_tests {
+    use super::decode_asset;
+
+    /// 一条 QOI_OP_RGBA 记录 + 结束标记;`pixels` 每项 RGBA。
+    fn qoi(width: u32, height: u32, pixels: &[[u8; 4]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"qoif");
+        out.extend_from_slice(&width.to_be_bytes());
+        out.extend_from_slice(&height.to_be_bytes());
+        out.push(4);
+        out.push(0);
+        for px in pixels {
+            out.push(0xff);
+            out.extend_from_slice(px);
+        }
+        out.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+        out
+    }
+
+    /// 两片 2×1 瓦片纵向拼成 2×2 画布:第 0 片在上、第 1 片在下。
+    #[test]
+    fn ydg_vertical_tiles_are_assembled_into_one_image() {
+        let top = qoi(2, 1, &[[10, 20, 30, 40], [10, 20, 30, 40]]);
+        let bottom = qoi(2, 1, &[[50, 60, 70, 80], [50, 60, 70, 80]]);
+        let table = 0x34 + 2 * 16;
+        let mut ydg = vec![0u8; table];
+        ydg[..12].copy_from_slice(b"YDG\0YU-RIS\0\0");
+        let total = table + top.len() + bottom.len();
+        ydg[0x14..0x18].copy_from_slice(&(total as u32).to_le_bytes());
+        ydg[0x20..0x22].copy_from_slice(&2u16.to_le_bytes());
+        ydg[0x22..0x24].copy_from_slice(&2u16.to_le_bytes());
+        ydg[0x30..0x34].copy_from_slice(&2u32.to_le_bytes());
+        ydg[0x34..0x38].copy_from_slice(&(table as u32).to_le_bytes());
+        ydg[0x38..0x3c].copy_from_slice(&(top.len() as u32).to_le_bytes());
+        ydg[0x3c] = 0; // QOI
+        ydg[0x3e..0x40].copy_from_slice(&1u16.to_le_bytes());
+        let second = table + top.len();
+        ydg[0x44..0x48].copy_from_slice(&(second as u32).to_le_bytes());
+        ydg[0x48..0x4c].copy_from_slice(&(bottom.len() as u32).to_le_bytes());
+        ydg[0x4c] = 0;
+        ydg[0x4e..0x50].copy_from_slice(&1u16.to_le_bytes());
+        ydg.extend_from_slice(&top);
+        ydg.extend_from_slice(&bottom);
+
+        let texture =
+            decode_asset(&ydg, crate::RenderTuning::default()).expect("decode ydg");
+        assert_eq!((texture.width, texture.height), (2, 2));
+        assert_eq!(&texture.rgba[0..4], &[10, 20, 30, 40]);
+        assert_eq!(&texture.rgba[8..12], &[50, 60, 70, 80]);
+    }
+}
+
+#[cfg(test)]
+mod ydg_real_sample_tests {
+    use super::decode_asset;
+
+    /// 真实 `<v500-relirium>` 标题背景:4 片 1920×270 拼成 1920×1080。
+    /// 缺样本时显式跳过并打印(不“空跑通过”)。
+    #[test]
+    fn real_title_background_decodes_full_canvas() {
+        let Ok(path) = std::env::var("YURIS_SAMPLE_YDG_BACK") else {
+            eprintln!("skip: 未设置 YURIS_SAMPLE_YDG_BACK");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read ydg sample");
+        let texture = decode_asset(&bytes, crate::RenderTuning::default()).expect("decode");
+        assert_eq!((texture.width, texture.height), (1920, 1080));
+        let opaque = texture.rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(opaque > 1920 * 1080 / 2, "背景应大部分不透明: {opaque}");
+        let non_black = texture
+            .rgba
+            .chunks_exact(4)
+            .filter(|p| p[0] > 16 || p[1] > 16 || p[2] > 16)
+            .count();
+        assert!(non_black > 1920 * 1080 / 2, "背景应大部分非黑: {non_black}");
+    }
 }

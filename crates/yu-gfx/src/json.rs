@@ -146,6 +146,13 @@ fn image_format(out: &mut String, f: ImageFormat) {
             ImageFormat::Psb => 5,
             // 通用扩展能力,不来自 `yscfg` 码表;诊断里用 6 与未知码区分。
             ImageFormat::Webp => 6,
+            // 0.500 码 5 = `.ydg`(与旧表 5=psb 撞号);诊断码取 7,
+            // 以 `name` 为准。
+            ImageFormat::Ydg => 7,
+            // 0.500 码 7/8/9;诊断码顺延,仍以 `name` 为准。
+            ImageFormat::Jxl => 8,
+            ImageFormat::Qoi => 9,
+            ImageFormat::Avif => 10,
             ImageFormat::Other(c) => c,
         }
         .to_string(),

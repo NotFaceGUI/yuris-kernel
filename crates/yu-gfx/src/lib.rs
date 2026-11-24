@@ -56,8 +56,8 @@ pub mod transition;
 
 pub use error::{DiagAt, FrameDiag, MAX_FRAME_AT};
 pub use frame::{
-    probe_order_from_codes, Clear, ColorSpace, CompositorFrame, FilterMode, FilterSource,
-    MipFilter, ScreenSnapshot, TextureFilter, Viewport, WindowState,
+    probe_order_from_codes, probe_order_from_codes_v500, Clear, ColorSpace, CompositorFrame,
+    FilterMode, FilterSource, MipFilter, ScreenSnapshot, TextureFilter, Viewport, WindowState,
 };
 pub use group::GroupDraw;
 pub use host::{GfxHost, LayerCapture};
