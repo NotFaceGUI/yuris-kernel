@@ -372,10 +372,9 @@ fn tidno_appends_decimal_suffix_for_pairing() {
 }
 
 #[test]
-fn invisible_mask_buffer_reverse_is_carried_to_transition() {
-    // v555 精灵转场:mask 载入 E=0 的缓冲层 → REVERSE=1 → SIZE 进配对层。
-    // 缓冲层不可见,加工不进入 display list;转场走 to_base 时必须带上
-    // 反色,否则中心/边缘的覆盖率与官方相反。
+fn invisible_buffer_reverse_is_display_only_for_transition() {
+    // <v481-x> 形态:mask 载入 E=0 的缓冲层 → REVERSE=1 → SIZE 进空壳配对层。
+    // 官方转场看的是配对层状态,源缓冲层的反色不参与采样。
     let table = table();
     let mut gfx = state();
     gfx.consume_events(&[
@@ -443,7 +442,225 @@ fn invisible_mask_buffer_reverse_is_carried_to_transition() {
         })
         .expect("mask 链应产出过渡 op");
     assert_eq!(op.to_base, Some(TextureRef::Asset(b"mask".to_vec())));
-    assert!(op.mask_transform.reverse, "REVERSE 应带到 mask 采样");
+    assert!(!op.mask_transform.reverse, "源缓冲层 REVERSE 不参与采样");
+    assert!(!op.mask_transform.flip_h);
+    assert!(!op.mask_transform.flip_v);
+}
+
+#[test]
+fn pair_layer_reverse_is_carried_to_transition() {
+    // pieces `LOADTR.REV` 形态:配对层自身 REVERSE=1,psC 采样随之翻转。
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("M")),
+                arg(&table, "CG", "FILE", s("mask")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("M")),
+                arg(&table, "CGACT", "REVERSE", i(1)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "FILE", s("a")),
+                arg(&table, "CG", "T", i(128)),
+                arg(&table, "CG", "TA", i(256)),
+                arg(&table, "CG", "TID", s("M")),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let op = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|o| match o {
+            Op::Transition(t) => Some(t),
+            _ => None,
+        })
+        .expect("配对层应产出过渡 op");
+    assert_eq!(op.to_base, Some(TextureRef::Asset(b"mask".to_vec())));
+    assert!(op.mask_transform.reverse, "配对层自身的 REVERSE 参与采样");
+    assert!(!op.mask_transform.flip_h);
+    assert!(!op.mask_transform.flip_v);
+}
+
+#[test]
+fn pieces_pair_reverse_wins_over_buffer_double_reverse() {
+    // 2026-11-24 实测形态(pieces SPLTR101 正向):
+    // 缓冲层两次 REVERSE(净偶)+ 配对层一次 REVERSE → 采样翻。
+    // 若把源层奇偶并进来会抵掉配对层的翻,方向反而错。
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF")),
+                arg(&table, "CG", "FILE", s("mask")),
+                arg(&table, "CG", "E", i(0)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BUF")),
+                arg(&table, "CGACT", "REVERSE", i(1)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BUF")),
+                arg(&table, "CGACT", "REVERSE", i(1)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("TR")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(8)),
+                arg(&table, "CG", "SY", i(8)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BUF")),
+                arg(&table, "CGACT", "ID2", s("TR")),
+                arg(&table, "CGACT", "SIZE", i(1)),
+                arg(&table, "CGACT", "SX", i(8)),
+                arg(&table, "CGACT", "SY", i(8)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("TR")),
+                arg(&table, "CGACT", "REVERSE", i(1)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "FILE", s("a")),
+                arg(&table, "CG", "T", i(128)),
+                arg(&table, "CG", "TA", i(256)),
+                arg(&table, "CG", "TID", s("TR")),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let op = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|o| match o {
+            Op::Transition(t) => Some(t),
+            _ => None,
+        })
+        .expect("mask 链应产出过渡 op");
+    assert_eq!(op.to_base, Some(TextureRef::Asset(b"mask".to_vec())));
+    assert!(op.mask_transform.reverse, "配对层 REVERSE 决定方向");
+    assert!(!op.mask_transform.flip_h);
+    assert!(!op.mask_transform.flip_v);
+}
+
+#[test]
+fn visible_size_source_reverse_is_not_carried_to_transition() {
+    // 可见缓冲层走 REVERSE → SIZE 时,加工对官方是可见显示;
+    // 转场采基图,采样同样不翻。
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF")),
+                arg(&table, "CG", "FILE", s("mask")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BUF")),
+                arg(&table, "CGACT", "REVERSE", i(1)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("TR")),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "SX", i(8)),
+                arg(&table, "CG", "SY", i(8)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BUF")),
+                arg(&table, "CGACT", "ID2", s("TR")),
+                arg(&table, "CGACT", "SIZE", i(1)),
+                arg(&table, "CGACT", "SX", i(8)),
+                arg(&table, "CGACT", "SY", i(8)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "FILE", s("a")),
+                arg(&table, "CG", "T", i(128)),
+                arg(&table, "CG", "TA", i(256)),
+                arg(&table, "CG", "TID", s("TR")),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let op = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|o| match o {
+            Op::Transition(t) => Some(t),
+            _ => None,
+        })
+        .expect("mask 链应产出过渡 op");
+    assert_eq!(op.to_base, Some(TextureRef::Asset(b"mask".to_vec())));
+    assert!(!op.mask_transform.reverse, "可见源层的 REVERSE 不参与采样");
     assert!(!op.mask_transform.flip_h);
     assert!(!op.mask_transform.flip_v);
 }

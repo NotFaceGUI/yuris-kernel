@@ -18,11 +18,18 @@
 //! - `YS_Texture2` 取配对层**基图**(`+0x21c`),不是 `CGACT` 加工表面
 //!   (`+0x90`)。
 //!
-//! 例外(v555 精灵转场,2026-11-23):脚本先对**不可见** mask 缓冲层做
-//! `CGACT[REVERSE=1]`,再 `SIZE` 进配对层(`es_sprite_cgload.yst` s148
-//! pc165/170)。缓冲层 `E=0` 时该加工不进入 display list,但 psC 读到的
-//! 是反色后的 mask;这里把该链表达成 [`MaskTransform`],由后端在 mask
-//! 取样时应用(见 `engine frame 762` / `cg/tr/ysr031`)。
+//! 例外(v555 精灵转场,2026-11-24 定稿):`SPLTRBUF<n>` 上的 `CGACT[REVERSE]`
+//! 只改源表面/显示,**不参与**转场采样;真正影响 psC 的是**配对层自身**
+//! (`SPLTR<n>`, `TID`)的显示变换——pieces 的 `LOADTR.REV`
+//! (`es_sprite_cgload.yst` pc184/185)就是直接反配对层。这里把该状态
+//! 表达成 [`MaskTransform`],由后端在 mask 取样时应用(见 `engine frame
+//! 762` / `cg/tr/ysr031`)。
+//!
+//! 逐帧运行痕迹:pieces 正向 `pair Reverse=1 + src Reverse=2`、反向
+//! `pair=0 + src=1`;`<v481-x>` 恒 `pair=0 + src=1`。只归约配对层与两端
+//! 实机同时吻合;早期实现把源层也算进去,导致 `<v481-x>` 眨眼反向。
+//! 彻底解是分离「显示状态」与「像素加工」并按官方取样点取表面,见
+//! `GfxState::transition_mask_transform` 的 TODO。
 
 
 // TODO: 这个肯定要重构：及时写表面和帧回放的机制 冲突 计划中

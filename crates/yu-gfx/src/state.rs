@@ -6892,41 +6892,37 @@ impl GfxState {
 
     /// 配对 mask 在采样前要补的显示变换(`REVERSE`/镜像)奇偶。
     ///
-    /// v555 精灵转场(`es_sprite_cgload.yst` s148 pc160/165/166)先把
-    /// ysr mask 载入**不可见**的 `SPLTRBUF<n>`,对它做 `REVERSE=1`,再
-    /// `SIZE` 进配对层 `SPLTR<n>`。`SPLTRBUF<n>` 是 `E=0`,加工不进入
-    /// display list;而 psC 读到的 mask 已经是反色后的像素(engine frame
-    /// 762:`SPLTRBUF101=cg/tr/ysr031`,中心 R=0,官方中心透明)。
+    /// 只归约**配对层自身**(`TID` 指向的层)上的算子:psC 采样该层基图时
+    /// 随它的显示状态翻转(engine frame 762,`cg/tr/ysr031`)。`SIZE` 源层
+    /// (`SPLTRBUF<n>`)上的 `REVERSE` **不参与**——它只改源表面/显示,官方
+    /// 转场读基图时看不到。
     ///
-    /// 这里只归约能在采样时精确表达的算子;其它改像素的 op 不猜,
-    /// 保持基图交给后续专项处理。
+    /// 2026-11-24 逐帧运行取证(两作实机):
+    /// - `<v555-pieces>`:`SPLTR101` 正向 `pair Reverse=1 + src Reverse=2`,
+    ///   反向 `pair=0 + src=1`;方向差异由 `LOADTR.REV`
+    ///   (`es_sprite_cgload.yst` pc184/185)反**配对层自身**表达。
+    /// - `<v481-x>`:`SPLTR*` 恒 `pair=0 + src=1`,配对层从不反色 → 不翻。
+    ///
+    /// 早期实现把源层奇偶也并进来,`<v481-x>` 被多翻一次(眨眼反向);
+    /// 只算源层又会让 pieces 正向漏翻。与两端实机同时吻合的判据只有配对层。
+    ///
+    /// 其它改像素的 `CGACT`(MEIDO/模糊等)不在此列,不猜。
+    ///
+    /// TODO(主人 2026-11-24): 主人计划重构。正确解是把图层显示状态与像素
+    /// 加工分开建模、转场按官方取样点直接取表面,届时 `MaskTransform` 整段
+    /// 删除,不靠采样侧补偿。
     fn transition_mask_transform(&self, tid: &LayerId) -> MaskTransform {
         let mut transform = MaskTransform::default();
-        let apply = |layer: &LayerId, transform: &mut MaskTransform| {
-            for op in &self.image_log {
-                if op.target.as_ref() != Some(layer) || op.status != OpStatus::Executable {
-                    continue;
-                }
-                match op.action {
-                    ImageAction::Reverse => transform.reverse = !transform.reverse,
-                    ImageAction::Horizontal => transform.flip_h = !transform.flip_h,
-                    ImageAction::Vertical => transform.flip_v = !transform.flip_v,
-                    _ => {}
-                }
+        for op in &self.image_log {
+            if op.target.as_ref() != Some(tid) || op.status != OpStatus::Executable {
+                continue;
             }
-        };
-        // 配对层自身的 REVERSE/镜像与 SIZE 源层的算子都参与采样(3e67e11
-        // 逐帧证据);其它改像素的加工不猜。
-        apply(tid, &mut transform);
-        if let Some(op) = self.image_log.iter().rev().find(|op| {
-            op.target.as_ref() == Some(tid)
-                && op.status == OpStatus::Executable
-                && matches!(
-                    op.action,
-                    ImageAction::SizeNearest | ImageAction::SizeBilinear
-                )
-        }) {
-            apply(&op.source, &mut transform);
+            match op.action {
+                ImageAction::Reverse => transform.reverse = !transform.reverse,
+                ImageAction::Horizontal => transform.flip_h = !transform.flip_h,
+                ImageAction::Vertical => transform.flip_v = !transform.flip_v,
+                _ => {}
+            }
         }
         transform
     }
