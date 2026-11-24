@@ -190,22 +190,43 @@ Engine::answer_host_dialog(&HostDialogAnswer)    // 回答(CP932 编码在引擎
 host_ui::dialogs_json(&[HostDialog]) -> String   // 非 Rust 壳的稳定 JSON
 ```
 
-`HostDialog` 字段:`id / task / caption / text / buttons / default_button /
-icon / input / input_limit / default_input`。内核权威状态仍是
-`yu_rt::dialog::DialogRequest`(CP932 原始字节);呈现视图只做显示解码,
+`HostDialog` 字段:`id / source / task / caption / text / buttons /
+default_button / icon / input / input_limit / default_input`。内核权威状态
+仍是 `yu_rt::dialog::DialogRequest`(CP932 原始字节);呈现视图只做显示解码,
 不改变脚本语义。
+
+`source` 有两种:
+
+- `script`:脚本 `DIALOG` 命令,回答会写回 `LET/LETSTR`;
+- `host`:内核/宿主的运行期**错误**(Fatal 诊断、执行器脚本错误、启动
+  失败、tick 失败、panic)。它与脚本 DIALOG **共用同一份快照与同一个
+  呈现器**,但没有 VM 写回:壳确认后仅关闭。宿主消息 ID 从
+  `host_ui::HOST_DIALOG_ID_BASE = 1 << 40` 起分配(必须留在 f64 的精确
+  整数范围 `2^53` 以内:当前 JSON 数字用 `f64` 承载,超出会被序列化成
+  失真值,壳确认时反查不到原 ID)。
+
+错误上屏不再有第二条路径:Android 的 `DialogPresenter`、iOS 的
+`UIAlertController`、桌面的 egui 模态都只消费 `dialogs` 数组。
+
+**警告(Recoverable)不进 DIALOG**:它通过
+`HostAlertQueue::take_hint()` 取走,壳用 Toast/横幅提示;否则每帧资源
+缺失都会弹模态框,游戏没法玩。`unimplemented/info/verbose` 诊断仍只进
+诊断面板。
 
 ### JSON 契约(非 Rust 壳)
 
 ```json
 {"protocol":1,"dialogs":[{
-  "id":7,"task":"es_Scenario","caption":"名前",
+  "id":7,"source":"script","task":"es_Scenario","caption":"名前",
   "text":"名前を入力してください",
   "buttons":["ok"],"default_button":1,"icon":"none",
   "input":true,"input_limit":0,
   "default_input":"彼女のクラブはあのクラブ"
 }]}
 ```
+
+宿主消息的 `source` 是 `host`,ID 高位区间见上;`buttons` 固定 `["ok"]`,
+`input=false`。
 
 - `buttons` 按 **1 基**顺序给语义角色(`ok/cancel/yes/no`);壳自己决定
   文案与控件类型。回答回传的是序号(1..N),不是角色名。
@@ -230,9 +251,16 @@ icon / input / input_limit / default_input`。内核权威状态仍是
    契约。
 5. **一次一个**:官方 `MessageBoxA` 是模态的;多个待答请求按快照顺序
    排队,壳逐个呈现。
+6. **错误同路**:Fatal 诊断/脚本错误/启动失败/tick 失败/panic 由
+   `host_ui::HostAlertQueue` 升级成 `source=host` 的 DIALOG,与脚本
+   DIALOG 合并进同一份快照;壳确认宿主消息时**不能**调用
+   `Engine::answer_host_dialog`(它不是 VM 任务)。Android
+   `answer_dialog` 按 ID 区间/`source` 分流,宿主消息幂等关闭。
+   Recoverable 警告走 `take_hint()`(Toast),不弹模态框。
 
 当前实现:桌面 `host-desktop/src/ui.rs::dialog_modal`;Android
 `host-android` 的快照/回答队列 + `android/.../DialogPresenter.java`。
+iOS `yu_ios_pending_dialogs` 直接复用同一份快照,宿主错误零改动可见。
 serve/wasm 尚未接(契约已留好,后续按同一 JSON 接线)。
 
 ## 已收口的硬编码(见 DIV-AND-002)

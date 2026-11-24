@@ -17763,3 +17763,137 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   SAVE 处理体是否在预约阶段排除 1024、官方存档逐块解析、旧版 LOAD 分支。
 - **原则**:两处都是“内部一致性/防数据丢失”的防御性实现,不是已证实的
   官方语义;取证后按 DIV 结论收紧或放宽,不把挂账当终态。
+
+## 成果 ANDROID-LIBRARY-MIUIX (2026-11-24) · Miuix 游戏库网格、exe 图标与内核错误统一 DIALOG
+
+- **目标**:Android 壳从「单目录配置页」升级为模拟器式游戏库;错误
+  (启动失败/tick 失败/panic/Fatal 诊断/脚本错误)不再走红字错误屏或只写
+  logcat,统一进脚本 DIALOG 同一条呈现链。
+- **跨平台契约(`yu_engine::host_ui`)**:
+  - `HostDialog` 新增 `source: script | host`;宿主消息与脚本 DIALOG 共用
+    同一份快照/JSON/呈现器,但没有 VM 写回;
+  - 新增 `HostAlertQueue`:把 Fatal 诊断、执行器脚本错误、启动失败、
+    tick 失败、panic 升级成 `source=host` 的 DIALOG;
+    **Recoverable 警告不进 DIALOG**,只进 `take_hint()`(壳 Toast,不阻塞
+    游戏);`Unimplemented/Info/Verbose` 不弹(只进诊断面板);同位置诊断
+    去重,模态队列上限 32 条;
+  - 宿主 DIALOG ID 基址 `1 << 40`:必须留在 f64 精确整数范围内
+    (`2^53`),实测 `1<<62` 会被 JSON 序列化成失真值、壳确认时反查不到;
+- **Android 宿主**:
+  - `host-android` 把脚本 DIALOG 与宿主消息合并成一份
+    `nativePendingDialogs()` 快照;`answer_dialog` 按 `source` 分流,
+    宿主消息幂等关闭;
+  - tick 内 `take_diags()` 唯一消费,`status` 用累计数,不再二次 drain;
+  - `start_engine`/`tick_realtime` 加 `catch_unwind` 边界:panic 记录
+    消息/位置/16 行 backtrace,冻结会话并推一条 `source=host` 的 Fatal
+    DIALOG;会话失败时丢弃无法再回答的脚本 DIALOG;
+  - 新增 JNI `nativeGameIcon(root)`:`identity::load_icon` 的
+    `RT_GROUP_ICON`/`RT_ICON` 解析结果按 `[w,h,ARGB…]` 返回;
+- **Android 壳**:
+  - 新增 `LibraryActivity.kt`(Compose + Miuix 0.9.2):跟随系统深浅色、
+    自适应大卡片网格(图标 + 标题 + 入口类型/包数)、**点按直启/长按配置**、
+    刷新/设置入口、权限引导、空态;
+  - `SetupActivity.buildGameIntent` 从已保存的全局配置直接构造
+    `MainActivity` Intent(不经过配置页);配置页写侧的键与它一一对应;
+  - 新增 `GameLibrary.java`:常见根目录 + 上次游戏目录,廉价过滤后交
+    `nativeProbeGameRoot` 判定;图标按「根路径 + exe 最大 mtime」缓存成
+    PNG(app 私有 `files/gameicons`);
+  - `SetupActivity` 接受游戏库卡片带来的 `EXTRA_GAME_DIR`;
+    `DialogPresenter` 改深色 DeviceDefault,新增「全部确认」回调与
+    `sawPending` 防提前 finish;
+  - `MainActivity`:启动失败/tick 失败/panic 都在**游戏界面**弹 DIALOG,
+    确认后才回配置页;仅无宿主消息时退回旧错误屏;
+  - Recoverable 警告走 `nativeTakeHint()` + Toast(有对话框时让位,
+    3 秒最多一次),不进 DIALOG;
+  - 构建:Gradle 接 Kotlin 2.3.20 + Compose 插件 + Miuix;
+    `compileSdk=37`(Miuix AAR 元数据要求),`targetSdk=36` 不变;
+    `android.suppressUnsupportedCompileSdk=37`;AppCompat 1.6.1 的
+    fragment 默认版本未缓存,抬到 1.8.6。
+- **iOS**:`yu_ios_pending_dialogs` 直接复用同一份快照,`source=host`
+  错误零改动可见(UIAlertController)。
+- **验证**:
+  - `cargo test -p yu-engine --lib host_ui` → 11 passed(含
+    `recoverable_diags_become_non_modal_hints`);
+  - `cargo test -p yu-host-android` → 27 passed + `session` 2 passed;
+  - `cargo check -p yu-host-android` / `-p yu-host-desktop` → ok;
+  - `gradle :app:compileDebugKotlin :app:compileDebugJavaWithJavac` → ok;
+  - 模拟器(x86_64,`-gpu swiftshader_indirect`):库页网格显示
+    `Download/yugame` 与 exe 图标(深浅色各一张);点卡片直启
+    `MainActivity`,长按卡片进 `SetupActivity`;启动失败在游戏界面弹
+    `启动失败`(日志 `DIALOG#1099511627776 caption=启动失败`),点 OK
+    关闭、无重复弹窗;Recoverable 警告只进 Toast(单元测试覆盖)。
+- **残余/后续**:
+  - 库页标题目前取目录名;`yscfg` 真名可后续用轻量解析补;
+  - 扫描根目前是常见目录 + 上次游戏目录,尚无独立「添加扫描根」入口;
+  - 宿主错误框期间引擎仍在 tick(脚本 DIALOG 的任务本身挂起);如需
+    严格对齐官方 MessageBox 的暂停语义,再加 suspend/resume;
+  - 桌面/CLI 尚未消费宿主消息(桌面有诊断面板/panic 横幅,CLI 只打印
+    诊断);`wasm/serve` 同契约后续接。
+
+## 成果 ANDROID-REJECT-TRANSLATE (2026-11-24) · 不支持游戏直接拒绝、翻译导入/导出、启动图标重生成
+
+- **游戏库只收支持版本**:`importGame` 先 `nativeProbeGameRoot`,不是 YU-RIS
+  (`ok=false`)或版本不在支持范围(`supported=false`)一律拒绝——不写
+  `library_roots`,只弹胶囊说明原因;已有旧条目点卡片也只提示、不再进详情页。
+- **详情页选目录同门槛**:`onGameDirPicked` / `applyManualGameDir` 改走
+  `applyGameDirIfSupported`:探测通过才写 `state.gameDir`;否则保持原目录,
+  胶囊 + 状态行写明「不是 YU-RIS」或「YU-RIS x.xxx 不支持,已拒绝导入」。
+- **翻译导入/导出**(内核能力已有,本次补壳):
+  - 详情页「影片与文本」新增 `翻译文件` / `清除翻译文件` / `导出翻译文件`;
+  - 导入走 SAF 选 `translate.json`,后台校验 `schema == yuris-translate-1`,
+    绑定到导入时的游戏根(`translate_game`);换游戏不串用,缺省不加载;
+  - 导出选目标目录后调 `NativeHost.nativeExportText(root, out, "translate-json",
+    "auto", "")`,后台线程执行,结果 Toast + 状态行;
+  - `persistSettings` / `buildGameIntent` / `launchGame` 补齐
+    `translate_path`/`translate_game` 与 `MainActivity.EXTRA_TRANSLATE`。
+- **启动图标**:按主人最终版源图(994×956)重新生成 5 档
+  `mipmap-*/ic_launcher{,_round,_foreground}.png` + adaptive XML
+  (底色 `#8A264C`);删除全部旧生成物;APK 内只剩新 icon 条目。
+- **验证**:
+  - `cargo test -p yu-host-android --lib`(TEMP/TMP 指可写目录)→ 27 passed;
+  - `tools/android/build.sh arm64-v8a`(debug, versionCode 22)→ BUILD SUCCESSFUL(39M);
+  - 真机 `c1d09694` 覆盖安装 debug 包 `org.yuris.kernel.newui` → Success;
+    `dumpsys package` versionCode=22;
+  - 真机导入 KiriKiri 目录 `krkr/壁越しの嬌声`(只有 `data.xp3`):logcat
+    `yu-library: import root=.../壁越しの嬌声 not-yuris`,胶囊显示
+    「不是 YU-RIS 游戏:未找到 data.ypf 或 ysbin 目录」,目录未入列表;
+  - `aapt2 dump badging` → `application-label:'YU-RIS Kernel (dev)'`,
+    APK 仅含新 `res/mipmap-*/ic_launcher*`。
+- **残余**:翻译导入/导出只做了编译与界面接线,尚未在真机完成一次
+  「导出 → 选回」闭环(MIUI 屏蔽 adb 注入点击);翻译槽为单槽,
+  同一时间只保留一份 `translate.json`(按游戏根绑定,不会串用)。
+
+## 成果 README-ICON (2026-11-24) · README 标题图标方案撤回
+
+- 曾按主人要求把图标放到 README 标题旁(22% 圆角 PNG,`<sub>` 基线对齐);
+  实现后主人决定不要:两份 README 标题恢复纯文本 `<h1>yuris-kernel</h1>`,
+  `docs/assets/icon.png` 删除;**Android 启动图标不受影响**。
+- **验证**:`grep -rn "docs/assets/icon.png" README.md README.en.md` 无命中;
+  `docs/assets/` 下已无该文件。
+
+## 成果 ANDROID-HELP-FONT-GPU (2026-11-24) · 详情页问号说明页、字体必选、GPU 选择交互
+
+- 详情页顶栏:标题「游戏详情」在左、问号在右,同一行垂直居中(`YuTopBar` +
+  新 `ic_help` 矢量图)。
+- 问号进入独立 `HelpActivity`(系统默认进入/返回动画,与「游戏库 → 详情」一致),
+  页面为可滚动参数说明:字体(必选/等宽推荐)、渲染、文本编码、存档、
+  影片与翻译、操作方式、高级设置、排错顺序;正文用 `**…**` 极简富文本
+  (半粗体),不引入 Markdown 依赖。
+- 字体改为必选:字体弹窗移除「系统默认」;未选/未导入时开始按钮显示
+  「先选择字体」并禁用;`launchGame` 对非 Tyranor 会话做兜底拦截。
+- 渲染后端改为正常下拉:行显示 GPU / CPU,弹窗里 CPU 置灰不可选;
+  去掉「CPU 已停用」文案与 GPU 失败自动降级 soft。
+- **验证**:`tools/android/build.sh arm64-v8a`(debug, versionCode 24)→
+  BUILD SUCCESSFUL;真机 `c1d09694` 覆盖安装 v24 成功;截图确认
+  左标题 + 右问号、字体 simsun.ttc、渲染后端 GPU;
+  `aapt2 dump xmltree` 确认 `HelpActivity` 已注册(exported=false)。
+- **残余**:`HelpActivity` 非导出,adb 无法注入启动;问号页转场与 CPU
+  置灰样式需主人真机点按确认。
+- **追加(v25)**:字体推荐改为**自己导入等宽字体**;「导入字体文件」行提到「字体」行之前,
+  文案「推荐:导入自己的字体(等宽)」,字体弹窗底部入口改为「导入自己的字体」。
+- **追加(v26)**:翻译提示并入「文本编码」:加壳/注入 DLL 的汉化读不到文本、
+  进入游戏无字时,走「导出翻译文件 → 按翻译说明译好 → 导入翻译文件」;
+  段尾加蓝色下划线超链接「翻译说明(GitHub)」,链到
+  `.agents/skills/yuris-translation/SKILL.md`。
+- **追加(v27)**:链接改为蓝色下划线文本(非按钮);「遇到问题先查这里」末尾加
+  「提交 Issue(GitHub)」超链接,指向仓库 issues/new。

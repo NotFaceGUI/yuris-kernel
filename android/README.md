@@ -5,9 +5,40 @@
 
 ```text
 crates/yu-platform/host-android/     ← Rust:JNI 入口 + 会话管理(cdylib)
-android/                             ← 轻量 UI 壳(纯 Java,无 AndroidX)
+android/                             ← UI 壳:
+  app/src/main/kotlin/…/LibraryActivity.kt   Miuix(HyperOS 风)游戏库网格
+  app/src/main/java/…/GameLibrary.java       扫描 + exe 图标缓存(后台线程)
+  app/src/main/java/…/SetupActivity.java     单游戏配置(Java/AppCompat)
+  app/src/main/java/…/MainActivity.java      游戏画面(TextureView + JNI)
 tools/android/build.sh               ← so 交叉编译 + APK 打包
 ```
+
+普通启动进 `LibraryActivity`:扫描常见目录(`Download / Games / Documents /
+yu-ris / Galgame / HGAME`,外加配置页上次选的游戏目录),按
+`Project::discover` 判据识别游戏;卡片图标来自 exe 的
+`RT_GROUP_ICON`/`RT_ICON`(内核 `identity::load_icon`,JNI
+`nativeGameIcon`),按根路径 + exe mtime 缓存成 PNG。**点卡片直接进
+`MainActivity` 开玩**(沿用上次保存的全局配置);**长按卡片**或右上角
+「设置」进 `SetupActivity` 改字体/后端/帧率等参数。
+
+库页用 Compose + Miuix 0.9.2;`compileSdk` 必须是 37(Miuix 的 AAR
+元数据要求),`targetSdk` 仍是 36。Java 配置页/游戏页不依赖 Compose。
+
+## 错误统一 DIALOG
+
+内核**错误**不再只进 logcat 或画红字错误屏:启动失败、tick 失败、panic、
+Fatal 诊断与执行器脚本错误都由内核升级成 `source=host` 的 DIALOG,与脚本
+DIALOG 共用同一份 `nativePendingDialogs()` 快照和 `DialogPresenter`。
+
+- 启动失败:在 `MainActivity`(游戏界面)弹,确认后才回配置页;
+- 游戏内 Fatal/tick 失败/panic:成功 tick 后立刻弹在当前游戏画面上
+  (tick 失败/panic 保留最后一帧),确认后回配置页;
+- **警告(Recoverable)不弹模态框**:`nativeTakeHint()` 取最新一条,
+  `MainActivity` 用 Toast 提示(有对话框时让位,3 秒最多一次);
+  否则每帧资源缺失会直接把游戏堵死;
+- `unimplemented/info/verbose` 只进诊断面板,不弹给用户;
+- 宿主消息 ID 从 `host_ui::HOST_DIALOG_ID_BASE = 1 << 40` 起,
+  不能超过 f64 精确整数范围(JSON 数字用 f64 承载)。
 
 ## 渲染路径:GPU 为主
 
