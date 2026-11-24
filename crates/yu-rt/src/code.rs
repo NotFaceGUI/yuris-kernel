@@ -80,6 +80,9 @@ pub mod rt {
     pub const SYSVAR_READONLY: &str = "rt.sysvar.readonly";
     /// 可赋值系统变量(手册标 ○)的**写入语义**未取证。
     pub const SYSVAR_WRITE: &str = "rt.sysvar.write";
+    /// 汉化补丁兼容:按官方 exe 补丁形态改写系统变量返回值
+    /// (`VARINFO[SJISCODE]` → 0x824F)。
+    pub const SYSVAR_COMPAT: &str = "rt.sysvar.compat";
     /// 脚本执行错误(官方错误策略未取证时的统一出口)。
     pub const SCRIPT_ERROR: &str = "rt.script.error";
     /// 运行核内部不变量被破坏(应为不可能)。

@@ -627,6 +627,15 @@ pub struct Vm {
     text_layer_probe: Option<Box<dyn FnMut(&[u8]) -> Option<(i64, i64)>>>,
     /// 执行层全局字符串 codec(官方汉化版全局 GBK)。
     script_codec: yu_format::Codec,
+    /// `VARINFO[SJISCODE]` 的汉化补丁兼容映射。
+    ///
+    /// 部分汉化版**没有重编译剧本词法器**(脚本仍按 CP932 前导范围
+    /// `0x81..0x9F`/`0xE0..0xFC` 判词),而是在 exe 里把
+    /// `VARINFO[SJISCODE]` 的返回值改成 CP932 范围内的伪码
+    /// (实测 `<v555-pieces>` 汉化 exe VA `0x455b10`:`mov eax,0x824F`)。
+    /// 内核在启动期自检「执行 codec 非 CP932 + 词法器脚本仍是 CP932
+    /// 范围」时启用该值;正常 CP932 工程、原生 GBK 词法器工程保持 `None`。
+    sjis_lead_remap: Option<u16>,
     /// 路径/文件名 codec(通常 CP932;补丁不改文件名)。
     name_codec: yu_format::Codec,
     /// 显示层配置(逐脚本 codec/隧道;不参与执行)。
@@ -935,6 +944,7 @@ impl Vm {
             text: crate::text::TextState::with_codec(cfg.display.default),
             text_layer_probe: None,
             script_codec: cfg.codecs.script,
+            sjis_lead_remap: None,
             name_codec: cfg.codecs.name,
             display: cfg.display,
             translation: cfg.translation,
@@ -992,6 +1002,7 @@ impl Vm {
         let restore = vm.build_globals_restore();
         vm.globals_restore = restore;
         vm.apply_script_locals(script_id);
+        vm.detect_legacy_cp932_lexer();
 
         vm.exec.insert(
             MAIN_TASK_ID.to_string(),
@@ -1755,6 +1766,73 @@ impl Vm {
     /// 执行层全局 codec(字符串操作/标签/存档;不按脚本切)。
     pub(crate) fn script_text_codec(&self, _script_id: u32) -> yu_format::Codec {
         self.script_codec
+    }
+
+    /// 汉化补丁自检:执行文本不是 CP932,但剧本词法器仍按 CP932 前导
+    /// 范围编译时,启用 `VARINFO[SJISCODE]` 的伪码映射。
+    ///
+    /// 证据:`<v555-pieces>` 汉化 exe(v555)VA `0x455b10` 把
+    /// `shl eax,8 / movzx ecx,[edx+1] / add eax,ecx` 改成
+    /// `mov eax,0x824F`;对应汉化包没有重编译
+    /// `es_scenario_lexer.yst`(仍判 `0x81..0x9F`/`0xE0..0xFC`)。
+    /// 自检按**数据**而不是游戏名:词法器脚本里出现 CP932 范围常量
+    /// `129/159/224/252` 才启用;原生 GBK 词法器(如 `<v555-2>`)
+    /// 出现 `129/198/201/252`,不启用。
+    fn detect_legacy_cp932_lexer(&mut self) {
+        use crate::semantics::SjisCodeMode;
+        if self.semantics.varinfo_sjis != SjisCodeMode::FirstChar
+            || self.script_codec == yu_format::Codec::Cp932
+        {
+            return;
+        }
+        let entries: Vec<(u32, Vec<u8>)> = self
+            .tables
+            .boot
+            .scripts
+            .entries
+            .iter()
+            .map(|e| (e.index, e.path.clone()))
+            .collect();
+        let mut hit = None;
+        'outer: for pass in 0..2 {
+            for (sid, path) in &entries {
+                let lower = String::from_utf8_lossy(path).to_ascii_lowercase();
+                let wanted = if pass == 0 {
+                    lower.contains("lexer")
+                } else {
+                    lower.contains("scenario")
+                };
+                if !wanted {
+                    continue;
+                }
+                let Ok(script) = self
+                    .tables
+                    .load_script(self.src.as_ref(), *sid)
+                    .map(|s| s.clone())
+                else {
+                    continue;
+                };
+                let style = script_lead_range_style(&script, &self.tables.boot.yscm);
+                if style != LeadRangeStyle::None {
+                    hit = Some((style, self.tables.script_path(*sid)));
+                    break 'outer;
+                }
+            }
+        }
+        let Some((style, path)) = hit else { return };
+        if style == LeadRangeStyle::Cp932 {
+            self.sjis_lead_remap = Some(0x824F);
+            self.emit_diag(diag::info(
+                code::rt::SYSVAR_COMPAT,
+                Boundary::Script,
+                format!(
+                    "汉化补丁兼容:执行文本 codec={:?},剧本词法器 {path} 仍按 CP932 \
+                     前导范围编译;`VARINFO[SJISCODE]` 按官方汉化 exe 补丁返回 0x824F\
+                     (证据:VA 0x455b10 mov eax,0x824F)",
+                    self.script_codec
+                ),
+            ));
+        }
     }
 
     /// 路径/文件名 codec。
@@ -3489,6 +3567,115 @@ fn build_param_plans(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeadRangeStyle {
+    None,
+    Cp932,
+    Gbk,
+}
+
+/// 扫描一个已编译脚本,判断剧本词法器里的前导字节范围常量。
+///
+/// CP932 形态:`129..159 || 224..252`;GBK 形态:`129..198 || 201..252`。
+/// 只在**同一脚本**内同时出现 `VARINFO[SJISCODE]` 与四个范围常量才判定,
+/// 避免普通脚本里的数值误命中。
+fn script_lead_range_style(
+    script: &crate::tables::ScriptFile,
+    yscm: &crate::tables::YscmTable,
+) -> LeadRangeStyle {
+    let mut nums = Vec::new();
+    let mut has_sjis = false;
+    for pc in 0..script.group_count() {
+        if let Some(group) = script.group(pc) {
+            if let Some(cmd) = yscm.command(group.opcode) {
+                if cmd.name == "VARINFO" {
+                    for w in script.group_windows(pc) {
+                        if cmd
+                            .params
+                            .get(w.kind as usize)
+                            .is_some_and(|p| p.name == "SJISCODE")
+                        {
+                            has_sjis = true;
+                        }
+                    }
+                }
+            }
+        }
+        for w in script.group_windows(pc) {
+            let Some(payload) = script.window_payload(w) else {
+                continue;
+            };
+            let Ok(instrs) = crate::expr::decode(payload) else {
+                continue;
+            };
+            for ins in &instrs {
+                if let Some(n) = int_immediate(ins) {
+                    nums.push(n);
+                }
+            }
+        }
+    }
+    if !has_sjis {
+        return LeadRangeStyle::None;
+    }
+    lead_range_style_from_numbers(nums)
+}
+
+fn lead_range_style_from_numbers<I: IntoIterator<Item = i64>>(nums: I) -> LeadRangeStyle {
+    let mut n129 = false;
+    let mut n159 = false;
+    let mut n198 = false;
+    let mut n201 = false;
+    let mut n224 = false;
+    let mut n252 = false;
+    for n in nums {
+        match n {
+            129 => n129 = true,
+            159 => n159 = true,
+            198 => n198 = true,
+            201 => n201 = true,
+            224 => n224 = true,
+            252 => n252 = true,
+            _ => {}
+        }
+    }
+    let cp932 = n129 && n252 && n159 && n224;
+    let gbk = n129 && n252 && n198 && n201;
+    match (cp932, gbk) {
+        (true, false) => LeadRangeStyle::Cp932,
+        (false, true) => LeadRangeStyle::Gbk,
+        // 两种范围同时出现 ⇒ 词法器形态不明,不猜。
+        _ => LeadRangeStyle::None,
+    }
+}
+
+fn int_immediate(ins: &crate::expr::RawInstr) -> Option<i64> {
+    match (ins.op, ins.payload.len()) {
+        (0x42, 1) => Some(i64::from(ins.payload[0] as i8)),
+        (0x57, 2) => Some(i64::from(i16::from_le_bytes([
+            ins.payload[0],
+            ins.payload[1],
+        ]))),
+        (0x49, 4) => Some(i64::from(i32::from_le_bytes([
+            ins.payload[0],
+            ins.payload[1],
+            ins.payload[2],
+            ins.payload[3],
+        ]))),
+        (0x4c, 8) => Some(i64::from_le_bytes([
+            ins.payload[0],
+            ins.payload[1],
+            ins.payload[2],
+            ins.payload[3],
+            ins.payload[4],
+            ins.payload[5],
+            ins.payload[6],
+            ins.payload[7],
+        ])),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3510,5 +3697,47 @@ mod tests {
             (1_050..1_500).contains(&now),
             "锚点应把 50ms 墙钟加到 base_ms 上,实际 {now}"
         );
+    }
+
+    #[test]
+    fn lead_range_style_distinguishes_cp932_and_gbk_lexers() {
+        assert_eq!(
+            lead_range_style_from_numbers([129, 159, 224, 252, 7, 256]),
+            LeadRangeStyle::Cp932
+        );
+        assert_eq!(
+            lead_range_style_from_numbers([129, 198, 201, 252, 7, 256]),
+            LeadRangeStyle::Gbk
+        );
+        assert_eq!(
+            lead_range_style_from_numbers([129, 159, 198, 201, 224, 252]),
+            LeadRangeStyle::None,
+            "两套范围同时出现 = 词法器形态不明,不启用补丁兼容"
+        );
+        assert_eq!(
+            lead_range_style_from_numbers([129, 252, 159]),
+            LeadRangeStyle::None
+        );
+    }
+
+    #[test]
+    fn int_immediate_decodes_all_integer_widths() {
+        let ins = |op, payload: Vec<u8>| crate::expr::RawInstr {
+            offset: 0,
+            op,
+            payload,
+        };
+        assert_eq!(int_immediate(&ins(0x42, vec![0x7f])), Some(127));
+        assert_eq!(int_immediate(&ins(0x42, vec![0xff])), Some(-1));
+        assert_eq!(int_immediate(&ins(0x57, vec![0x81, 0x00])), Some(129));
+        assert_eq!(
+            int_immediate(&ins(0x57, vec![0xc6, 0x00])),
+            Some(198)
+        );
+        assert_eq!(
+            int_immediate(&ins(0x49, vec![0xfc, 0x00, 0x00, 0x00])),
+            Some(252)
+        );
+        assert_eq!(int_immediate(&ins(0x4d, vec![0x22])), None);
     }
 }

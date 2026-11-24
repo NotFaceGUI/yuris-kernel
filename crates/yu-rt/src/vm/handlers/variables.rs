@@ -682,9 +682,19 @@ impl Vm {
                     Value::Str(bytes) if bytes.is_empty() => Value::Int(0),
                     Value::Str(bytes) => {
                         let first = bytes[0];
-                        if self.script_text_codec(st.script_id).is_lead(first) {
-                            let trail = bytes.get(1).copied().unwrap_or(0);
-                            Value::Int((i64::from(first) << 8) | i64::from(trail))
+                        let codec = self.script_text_codec(st.script_id);
+                        if codec.is_lead(first) {
+                            // 汉化补丁兼容(启动期自检,见
+                            // `Vm::detect_legacy_cp932_lexer`):补丁 exe
+                            // 把 SJISCODE 改成 CP932 范围内伪码,让仍按
+                            // CP932 前导范围编译的剧本词法器把 GBK/Big5
+                            // 汉字当成词。
+                            if let Some(fake) = self.sjis_lead_remap {
+                                Value::Int(i64::from(fake))
+                            } else {
+                                let trail = bytes.get(1).copied().unwrap_or(0);
+                                Value::Int((i64::from(first) << 8) | i64::from(trail))
+                            }
                         } else {
                             Value::Int(i64::from(first))
                         }
