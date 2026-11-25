@@ -92,123 +92,54 @@ class SetupActivity : AppCompatActivity() {
         private const val TYRANOR_PROTOCOL_VERSION = 1
 
         /**
-         * 游戏库直启:按已保存配置构造 [MainActivity] 的 Intent。
+         * 游戏库直启:按「全局默认 + 该游戏覆盖」构造 [MainActivity] 的 Intent。
          *
-         * <p>不经过配置页;自定义存档目录只有上次配置的正是这个游戏根时
-         * 才沿用,避免 A 游戏的 save/ 串到 B 游戏。
+         * <p>不经过配置页;存档目录、字体、翻译文件都取该游戏真正生效的值,
+         * A 游戏的设置不会串到 B 游戏,也不会覆盖全局默认。
          */
         @JvmStatic
         fun buildGameIntent(context: Context, gameDir: String): Intent {
             val prefs = context.getSharedPreferences(PREFS, MODE_PRIVATE)
+            SettingsPrefs.migrateLegacy(prefs, context.applicationContext)
+            val settings = SettingsPrefs.resolve(prefs, context.applicationContext, gameDir)
             val intent = Intent(context, MainActivity::class.java)
             intent.putExtra(MainActivity.EXTRA_GAME_DIR, gameDir)
-            val configuredRoot = prefs.getString("game_dir", "")
-            val saveDir = if (gameDir == configuredRoot) {
-                prefs.getString("save_dir", null)
-            } else {
-                null
-            }
             intent.putExtra(
                 MainActivity.EXTRA_SAVE_DIR,
-                saveDir ?: File(gameDir, "save").absolutePath,
+                settings.saveDir ?: File(gameDir, "save").absolutePath,
             )
-            intent.putExtra(
-                MainActivity.EXTRA_FONT_FAMILY,
-                prefs.getString("font_family", ""),
-            )
-            prefs.getString("font_path", null)?.takeIf { it.isNotEmpty() }?.let {
+            intent.putExtra(MainActivity.EXTRA_FONT_FAMILY, settings.fontFamily)
+            settings.fontPath?.takeIf { it.isNotEmpty() }?.let {
                 intent.putExtra(MainActivity.EXTRA_FONT_PATH, it)
             }
-            val backend = prefs.getString("backend", "wgpu")
             intent.putExtra(
                 MainActivity.EXTRA_BACKEND,
-                if (backend == "soft") "soft" else "wgpu",
+                if (settings.backend == "soft") "soft" else "wgpu",
             )
-            intent.putExtra(
-                MainActivity.EXTRA_GPU_BACKEND,
-                prefs.getString("gpu_backend", "auto"),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_MOVIE_BACKEND,
-                validateMovie(prefs.getString("movie_backend", "auto")),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_MOUSE_MODE,
-                prefs.getBoolean("launch_mouse_mode", false),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_FPS,
-                validateFps(prefs.getInt("fps", 60)),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_DEBUG_LOG,
-                prefs.getBoolean("debug_log", false),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_SHOW_HUD,
-                prefs.getBoolean("show_hud", false),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_VERSION_BADGE,
-                prefs.getBoolean("version_badge", true),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_PREFETCH,
-                prefs.getBoolean("prefetch", false),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_SNAPSHOT_DEFER,
-                prefs.getBoolean("snapshot_defer", false),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_BILINEAR_SCALE,
-                prefs.getBoolean("bilinear_scale", true),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_FONT_FALLBACK,
-                prefs.getBoolean("font_fallback", false),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_VM_PROFILE,
-                prefs.getBoolean("vm_profile", false),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_ASSET_TIMING,
-                prefs.getBoolean("asset_timing", false),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_TICK_SPLIT,
-                prefs.getBoolean("tick_split", false),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_CG_TIMING,
-                prefs.getBoolean("cg_timing", false),
-            )
-            intent.putExtra(
-                MainActivity.EXTRA_PATCH,
-                prefs.getString("patch", "auto"),
-            )
-            prefs.getString("save_codec", "")?.takeIf { it.isNotEmpty() }?.let {
-                intent.putExtra(MainActivity.EXTRA_SAVE_CODEC, it)
+            intent.putExtra(MainActivity.EXTRA_GPU_BACKEND, settings.gpuBackend)
+            intent.putExtra(MainActivity.EXTRA_MOVIE_BACKEND, settings.movieBackend)
+            intent.putExtra(MainActivity.EXTRA_MOUSE_MODE, settings.mouseMode)
+            intent.putExtra(MainActivity.EXTRA_FPS, settings.fps)
+            intent.putExtra(MainActivity.EXTRA_DEBUG_LOG, settings.debugLog)
+            intent.putExtra(MainActivity.EXTRA_SHOW_HUD, settings.showHud)
+            intent.putExtra(MainActivity.EXTRA_VERSION_BADGE, settings.versionBadge)
+            intent.putExtra(MainActivity.EXTRA_PREFETCH, settings.prefetch)
+            intent.putExtra(MainActivity.EXTRA_SNAPSHOT_DEFER, settings.snapshotDefer)
+            intent.putExtra(MainActivity.EXTRA_BILINEAR_SCALE, settings.bilinearScale)
+            intent.putExtra(MainActivity.EXTRA_FONT_FALLBACK, settings.fontFallback)
+            intent.putExtra(MainActivity.EXTRA_VM_PROFILE, settings.vmProfile)
+            intent.putExtra(MainActivity.EXTRA_ASSET_TIMING, settings.assetTiming)
+            intent.putExtra(MainActivity.EXTRA_TICK_SPLIT, settings.tickSplit)
+            intent.putExtra(MainActivity.EXTRA_CG_TIMING, settings.cgTiming)
+            intent.putExtra(MainActivity.EXTRA_PATCH, settings.patch)
+            if (settings.saveCodec.isNotEmpty()) {
+                intent.putExtra(MainActivity.EXTRA_SAVE_CODEC, settings.saveCodec)
             }
-            translatePathFor(prefs, gameDir)?.let {
+            settings.translatePath?.let {
                 intent.putExtra(MainActivity.EXTRA_TRANSLATE, it)
             }
             return intent
         }
-
-        /** 翻译文件只对导入时绑定的游戏根生效(缺省 = 不加载)。 */
-        private fun translatePathFor(prefs: SharedPreferences, gameDir: String): String? {
-            val path = prefs.getString("translate_path", null) ?: return null
-            val bound = prefs.getString("translate_game", null) ?: return null
-            return path.takeIf { it.isNotEmpty() && bound == gameDir }
-        }
-
-        private fun validateFps(value: Int): Int =
-            if (value == 30 || value == 60 || value == 120) value else 60
-
-        private fun validateMovie(value: String?): String =
-            if (value == "builtin" || value == "external") value else "auto"
     }
 
     internal lateinit var state: SettingsState
@@ -224,11 +155,9 @@ class SetupActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         NativeHost.nativeInitAndroidContext(this)
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        SettingsPrefs.migrateLegacy(prefs, applicationContext)
         val incoming = intent.getStringExtra(EXTRA_GAME_DIR)
-        state = SettingsState(prefs, incoming)
-        if (!incoming.isNullOrBlank()) {
-            prefs.edit().putString("game_dir", incoming.trim()).apply()
-        }
+        state = SettingsState(prefs, applicationContext, incoming)
         state.hasStorage = StoragePaths.hasStorageAccess(this)
         dialogPresenter = DialogPresenter(this)
         setContent { YuTheme { SetupScreen(this) } }
@@ -236,9 +165,22 @@ class SetupActivity : AppCompatActivity() {
         handleExternalLaunch(intent)
     }
 
+    override fun onPause() {
+        // 切去全局设置/启动游戏都会先走到这里:单游戏覆盖在这里落盘,
+        // 未修改的项保持「跟随全局」。外部会话由宿主配置,不写覆盖。
+        if (!state.externalSession) {
+            state.saveOverrides()
+        }
+        super.onPause()
+    }
+
     override fun onResume() {
         super.onResume()
         state.hasStorage = StoragePaths.hasStorageAccess(this)
+        // 从全局设置页返回时同步新的全局默认(当前游戏的覆盖仍然优先)。
+        if (!state.externalSession && !state.pendingExternalLaunch) {
+            state.reload()
+        }
         val next = pendingStorageAction
         if (state.hasStorage && next != null) {
             pendingStorageAction = null
@@ -347,7 +289,7 @@ class SetupActivity : AppCompatActivity() {
     fun applyManualGameDir(text: String) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) {
-            state.gameDir = null
+            state.loadForGame(null)
             return
         }
         val picked = File(trimmed)
@@ -385,7 +327,8 @@ class SetupActivity : AppCompatActivity() {
                     state.status = error
                     Toast.makeText(this, error, Toast.LENGTH_LONG).show()
                 } else {
-                    state.gameDir = path
+                    // 切换到该游戏自己的覆盖(未改项继续跟随全局默认)。
+                    state.loadForGame(path)
                     state.status = ""
                 }
             }
@@ -424,7 +367,6 @@ class SetupActivity : AppCompatActivity() {
                     Toast.makeText(this, error, Toast.LENGTH_LONG).show()
                 } else {
                     state.translatePath = path
-                    state.translateGame = gameDir
                     state.status = ""
                     Toast.makeText(
                         this,
@@ -484,7 +426,8 @@ class SetupActivity : AppCompatActivity() {
             return
         }
         state.pendingExternalLaunch = false
-        persistSettings()
+        // 单游戏覆盖落盘:只存与全局不同的项,换游戏互不影响。
+        state.saveOverrides()
         val effectiveSave = state.saveDir
             ?: File(gameDir, "save").absolutePath
         val intent = Intent(this, MainActivity::class.java)
@@ -538,75 +481,16 @@ class SetupActivity : AppCompatActivity() {
         }
     }
 
-    private fun persistSettings() {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putString("game_dir", state.gameDir)
-            .putString("save_dir", state.saveDir)
-            .putString("font_family", state.fontFamily)
-            .putString("font_path", state.fontPath)
-            .putString("backend", state.backend)
-            .putString("gpu_backend", state.gpuBackend)
-            .putString("patch", state.patch)
-            .putString("save_codec", state.saveCodec)
-            .putString("translate_path", state.translatePath)
-            .putString("translate_game", state.translateGame)
-            .putString("movie_backend", state.movieBackend)
-            .putBoolean("launch_mouse_mode", state.mouseMode)
-            .putInt("fps", state.fps)
-            .putBoolean("debug_log", state.debugLog)
-            .putBoolean("show_hud", state.showHud)
-            .putBoolean("version_badge", state.versionBadge)
-            .putBoolean("prefetch", state.prefetch)
-            .putBoolean("snapshot_defer", state.snapshotDefer)
-            .putBoolean("bilinear_scale", state.bilinearScale)
-            .putBoolean("font_fallback", state.fontFallback)
-            .putBoolean("vm_profile", state.vmProfile)
-            .putBoolean("asset_timing", state.assetTiming)
-            .putBoolean("tick_split", state.tickSplit)
-            .putBoolean("cg_timing", state.cgTiming)
-            .apply()
-    }
-
-    /** 从游戏库移除当前游戏(只删导入记录,不动游戏文件)。 */
+    /** 从游戏库移除当前游戏(只删导入记录,不动游戏文件与单游戏设置)。 */
     fun removeFromLibrary() {
         val dir = state.gameDir ?: return
         LibraryStore.remove(this, dir)
         finish()
     }
 
+    /** 清除当前游戏的覆盖:全部回到全局默认(全局设置本身不动)。 */
     fun resetSettings() {
-        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-        // 库导入列表与单游戏设置共用同一个 prefs:清设置时保留导入列表。
-        val libraryRoots = prefs.getString("library_roots", null)
-        prefs.edit().clear().apply()
-        if (libraryRoots != null) {
-            prefs.edit().putString("library_roots", libraryRoots).apply()
-        }
-        state.gameDir = null
-        state.saveDir = null
-        state.fontPath = null
-        state.importedFontName = null
-        state.fontFamily = ""
-        state.mouseMode = false
-        state.fps = 60
-        state.backend = "wgpu"
-        state.gpuBackend = "auto"
-        state.patch = "auto"
-        state.saveCodec = ""
-        state.translatePath = null
-        state.translateGame = null
-        state.movieBackend = "auto"
-        state.debugLog = false
-        state.showHud = false
-        state.versionBadge = true
-        state.prefetch = false
-        state.snapshotDefer = false
-        state.bilinearScale = true
-        state.fontFallback = false
-        state.vmProfile = false
-        state.assetTiming = false
-        state.tickSplit = false
-        state.cgTiming = false
+        state.resetToGlobal()
         state.status = ""
     }
 
@@ -614,14 +498,7 @@ class SetupActivity : AppCompatActivity() {
 
     private fun loadFonts() {
         Thread({
-            val families = ArrayList<String>()
-            try {
-                NativeHost.nativeListFonts()?.split('\n')?.forEach { line ->
-                    line.trim().takeIf { it.isNotEmpty() }?.let(families::add)
-                }
-            } catch (error: Throwable) {
-                Log.w(TAG, "nativeListFonts failed", error)
-            }
+            val families = FontCatalog.load()
             runOnUiThread {
                 state.systemFonts = families
                 state.fontsLoaded = true
@@ -659,14 +536,10 @@ class SetupActivity : AppCompatActivity() {
             return
         }
         val nextGameDir = dir.absolutePath
-        if (state.gameDir != null && state.gameDir != nextGameDir) {
-            state.saveDir = null
-        }
+        // 外部会话的配置由宿主(Tyranor 模块)提供:只继承全局默认,
+        // 不载入该游戏的本地覆盖,也不把模块设置写回覆盖。
+        state.loadGlobalOnly()
         state.gameDir = nextGameDir
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putString("game_dir", nextGameDir)
-            .putString("save_dir", state.saveDir)
-            .apply()
         intent.getStringExtra(TYRANOR_EXTRA_GAME_TITLE)
             ?.takeIf { it.isNotEmpty() }
             ?.let { state.status = "来自 Tyranor: $it" }

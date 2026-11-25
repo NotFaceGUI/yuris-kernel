@@ -111,6 +111,18 @@ fun SetupScreen(activity: SetupActivity) {
                     IconButton(
                         onClick = {
                             activity.startActivity(
+                                Intent(activity, GlobalSettingsActivity::class.java),
+                            )
+                        },
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_settings),
+                            contentDescription = "全局设置",
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            activity.startActivity(
                                 Intent(activity, HelpActivity::class.java),
                             )
                         },
@@ -146,6 +158,15 @@ fun SetupScreen(activity: SetupActivity) {
             verticalArrangement = Arrangement.spacedBy(YuSpacing.section),
         ) {
             item { Hero(state) }
+            item {
+                Text(
+                    "本页设置只对当前游戏生效,未修改的项跟随全局默认;" +
+                        "全局默认在游戏库右上角齿轮里编辑。",
+                    style = MiuixTheme.textStyles.footnote1,
+                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    modifier = Modifier.padding(horizontal = YuSpacing.gapS),
+                )
+            }
             item {
                 SettingsGroup("游戏") {
                     SettingRow(
@@ -308,7 +329,6 @@ fun SetupScreen(activity: SetupActivity) {
                         label = "翻译文件",
                         value = when {
                             activeTranslate != null -> File(activeTranslate).name
-                            state.translatePath != null -> "未启用(已为其他游戏导入)"
                             else -> "未启用(内核默认不加载)"
                         },
                         onClick = {
@@ -325,7 +345,6 @@ fun SetupScreen(activity: SetupActivity) {
                             value = "只清除配置,不删除文件",
                             onClick = {
                                 state.translatePath = null
-                                state.translateGame = null
                             },
                             trailing = {
                                 Icon(
@@ -414,7 +433,8 @@ fun SetupScreen(activity: SetupActivity) {
                     }
                     SettingsGroup {
                         SettingRow(
-                            label = "清除已保存的选择",
+                            label = "恢复全局默认",
+                            value = "只清当前游戏的设置,不改全局默认",
                             onClick = { activity.resetSettings() },
                             trailing = {
                                 Icon(

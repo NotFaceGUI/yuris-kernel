@@ -71,6 +71,11 @@ class LibraryActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // 旧版全局存档/翻译键 → 对应游戏的覆盖(只跑一次)。
+        SettingsPrefs.migrateLegacy(
+            getSharedPreferences(SetupActivity.PREFS, MODE_PRIVATE),
+            applicationContext,
+        )
         needsPermission = !hasStoragePermission()
         setContent { YuTheme { LibraryScreen() } }
     }
@@ -126,6 +131,21 @@ class LibraryActivity : ComponentActivity() {
                         else -> "${games.size} 个游戏"
                     },
                     actions = {
+                        IconButton(
+                            onClick = {
+                                startActivity(
+                                    Intent(
+                                        this@LibraryActivity,
+                                        GlobalSettingsActivity::class.java,
+                                    ),
+                                )
+                            },
+                        ) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_settings),
+                                contentDescription = "全局设置",
+                            )
+                        }
                         IconButton(
                             onClick = {
                                 if (needsPermission) {

@@ -69,6 +69,13 @@
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
+        <!-- 全局默认设置(游戏库/详情页右上角齿轮):字体、渲染、文本编码等
+             对所有游戏生效;单个游戏的设置优先。 -->
+        <activity
+            android:name=".GlobalSettingsActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
         <activity
             android:name=".MainActivity"
             android:exported="false"
