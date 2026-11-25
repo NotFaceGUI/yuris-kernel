@@ -41,8 +41,9 @@ The official engine's observable behavior is the single source of truth</p>
 
 - **Multi-version coverage** — official series: BETA 4 mainline (0.450–0.495),
   BETA 3 (0.276–0.292) and BETA 2 (0.255) adapting; the official commercial 5xx branch
-  (v500 packs / v555 seven tables) is adapting; 27 ABI tables for 0.255–0.495
-  are catalogued, plus a v555 1000-slot measured table (`docs/formats/v555-*`).
+  (0.500–0.555, one command-table family) is adapting: v500 packs and v555 seven tables,
+  with 0.554 `ysc`/`yse` byte-identical to v555 except the version field; 27 ABI tables
+  for 0.255–0.495 are catalogued, plus a v555 1000-slot measured table (`docs/formats/v555-*`).
 - **Two render backends** — `soft` (CPU, deterministic reference) and `wgpu` (GPU, primary desktop / Android path).
 - **Multiple hosts** — Windows desktop, headless / local server, browser presentation (debug), Android.
 - **Text patches and saves** — four text routes `original` / `gbk` / `big5` / `tunnel`;
@@ -53,14 +54,14 @@ The official engine's observable behavior is the single source of truth</p>
 
 ### Engine versions
 
-Official releases are organized into BETA 2 / BETA 3 / BETA 4 mainline series; 5xx is an official YU-RIS commercial branch (commercial release), not part of these mainlines. Some commercial sample packages may carry repack/localization processing, but that is sample-level, not the engine itself.
+Official releases are organized into BETA 2 / BETA 3 / BETA 4 mainline series; 5xx (0.500–0.555) is an official YU-RIS commercial branch (commercial release), not part of these mainlines. Some commercial sample packages may carry repack/localization processing, but that is sample-level, not the engine itself.
 
 | Series | Status             | Notes                                                                                                                                                                                        |
 | ------ | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | BETA 2 | Adapting           | 0.255 (0.55): 539 system variables catalogued; YSTB V2 lacks real samples                                                                                                                    |
 | BETA 3 | Adapting           | 0.276 sample; 0.292 (0.92): 91 commands / 482 system variables                                                                                                                               |
 | BETA 4 | Available (main)   | 0.450–0.495: 0.466 / 0.479 / 0.495: 100 / 104 / 119 commands, 513 / 526 / 548 system variables; 0.450 / 0.460 / 0.470 / 0.480 / 0.490 spot-checked on real games, 0.481 / 0.486 / 0.494 / 0.495 accepted |
-| 5xx    | Adapting (v555)     | Official commercial branch: v500 packs are readable; v555 seven tables/scenario chain measured; landed `TEXT[FILE]`, `PRODUCT`, `SAVE/LOAD[MEM]`, `_DROPFILE*`, `VARINFO`; title screen (notice page / build animation / full menu / button state machine) is working |
+| 5xx    | Adapting (0.500–0.555) | Official commercial branch: the whole range shares one 121-slot command table; v500 packs are readable; v554 / v555 seven tables and scenario chain measured (0.554 `ysc`/`yse` byte-identical to v555); landed `TEXT[FILE]`, `PRODUCT`, `SAVE/LOAD[MEM]`, `_DROPFILE*`, `VARINFO`; title screen (notice page / build animation / full menu / button state machine) is working |
 
 ABI tables for 0.450–0.493 are all catalogued (27 tables, covering 0.255–0.495).
 
@@ -100,9 +101,11 @@ ABI tables for 0.450–0.493 are all catalogued (27 tables, covering 0.255–0.4
 | Missing-glyph fallback | Translation mode enables system-font missing-glyph fallback automatically; `--font` sets the default font and `--font-lock` forces a lock |
 
 
-### 5xx / v555 status
+### 5xx (0.500–0.555) status
 
-- **Official commercial branch**: v500 packs and all seven v555 tables
+- **Official commercial branch**: 0.500–0.555 is one version range sharing a single
+  121-slot command table (0.554 `ysc.ybn`/`yse.ybn` are byte-identical to the v555
+  samples except the version field); v500 packs and all seven v554 / v555 tables
   (YSCM/YSLB/YSVR/YSTL/YSER/YSCF/YSTD) are measured; script key = CRC32(product ID).
   Boot chain, scenario DSL lexer/macros, label table, brand movie and GAMEMain UI layers
   are working; headless reaches the title selection loop.
