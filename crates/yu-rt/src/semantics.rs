@@ -38,16 +38,17 @@
 //! # 当前消费状态
 //!
 //! - `VARINFO[SJISCODE]` 按 [`SemanticProfile::varinfo_sjis`] 门控:
-//!   `FirstChar` 只在 `ysc_version == 555` 时生效。
+//!   `FirstChar` 只在 5xx 商业族(`500..=555`)生效。
 //! - `TEXT` / `TEXTINFO` 按 [`SemanticProfile::text`] /
 //!   [`SemanticProfile::textinfo`] 门控:v555 的
 //!   `FileArray` / `Inert` 由 `crate::other::handlers::dispatch` 消费,
 //!   共享 `text.rs` 不分支;其余版本保持 legacy 形态。
 //!
-//! 555 是独立商业分支,精确匹配;556/600 没有取证,按 legacy 形态处理。
-//! **0.500 归入 555 商业族**(见 [`SemanticProfile::from_yscm_version`]):
-//! 121 槽命令表与同族处理体,差异只在少数命令(如 0.500 的 `MOVIE2*`/
-//! `REGINFO` 是空桩)与缩略图块布局(0.500 尚无样本)。
+//! **5xx 是一条版本区间(`500..=555`),不是两个点**(见
+//! [`is_v555_family_version`]):0.500 / 0.554 / 0.555 共用 121 槽命令表与
+//! 同族处理体,差异只在少数命令(如 0.500 的 `MOVIE2*`/`REGINFO` 是空桩)
+//! 与缩略图块布局(仅 0.555 有样本)。区间外的 556/600 没有取证,按 legacy
+//! 形态处理。
 
 /// `VARINFO[SJISCODE]` 的语义形态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,18 +231,26 @@ impl SemanticProfile {
     /// 参数能力覆盖(0.481/0.494/0.500 商业表也带 `MEM`)。
     #[must_use]
     pub fn from_yscm_version(version: u32) -> Self {
-        // 555 是独立商业分支;556/600 没有取证,不得继承 555 形态。
-        // (2026-11-21 全量反编译:6 个 555 构建的 121 槽分发表一致,
-        //  但处理体语义分三族;更高版本无样本。)
+        // 5xx 是一条**版本区间**,不是两个点:区间内的构建共用同一套 121 槽
+        // 命令表与同族处理体,只有缩略图块布局需要精确 555 的样本
+        // (`save_image`,见该字段赋值处)。区间外的 556/600 没有取证,
+        // 不得继承 555 形态。
         //
-        // 0.500 归入**同一商业族**(2026-11-24 `<v500-relirium>` 取证):
+        // 0.500 归入同一商业族(2026-11-24 `<v500-relirium>` 取证):
         // - `ysc.ybn` = 121 槽、与 v555 仅版本字段与 `GRADATION` kind 不同;
         // - 处理体 `TEXT`/`CGINFO`/`VARINFO`/`RETURNCODE`/`GOSUB`/`RETURN`/
         //   `LET`/`VARACT`/`SAVE`/`LOAD` 归一化反编译与 v555 逐行一致;
         // - 0.500 分发表默认体/空操作体名单与 v555 清单逐名一致。
         // 少数差异另由分发表覆盖(`MOVIE2*`/`REGINFO` 在 0.500 是 29B
-        // 空桩);`save_image` 保守留在容器档案,理由见该字段赋值处。
-        let v555 = matches!(version, 500 | 555);
+        // 空桩)。
+        //
+        // 0.554 的取证(2026-11-25 `<game-554>`):`ysc.ybn` 与 0.555 样本
+        // **逐字节相同,仅 +0x04 版本字段差 1**(11102B / 差 1 字节),
+        // `yse.ybn` 同样(6645B / 差 1 字节);`TEXT`=FILE/LET/CLEAR、
+        // `TEXTINFO` argc=0、`VARINFO` 带 `SJISCODE`/`STRFIRST`。
+        // 此前按字面量只认 {500,555},554 静默落回 legacy 形态,
+        // 表现为 `CGINFO[LINT2]` 整帧未实现刷屏(按钮号回读被门控关掉)。
+        let v555 = is_v555_family_version(version);
         Self {
             ysc_version: version,
             window_payload: if v555 {
@@ -324,13 +333,24 @@ impl SemanticProfile {
         self.ysc_version == 555
     }
 
-    /// 555 商业族(0.500 / 0.555):121 槽命令表与同族处理体。
+    /// 555 商业族(`500..=555`):121 槽命令表与同族处理体。
     ///
-    /// 0.500 的证据与差异清单见 [`Self::from_yscm_version`]。
+    /// 0.500 / 0.554 的证据与差异清单见 [`Self::from_yscm_version`]。
     #[must_use]
     pub fn is_v555_family(&self) -> bool {
-        matches!(self.ysc_version, 500 | 555)
+        is_v555_family_version(self.ysc_version)
     }
+}
+
+/// 5xx 商业族版本区间(`500..=555`,含两端)。
+///
+/// 区间内的构建共用同一套 121 槽命令表与同族处理体;版本号是构建戳,
+/// 不是语义分叉点——0.554 的 `ysc.ybn`/`yse.ybn` 与 0.555 样本逐字节
+/// 相同(仅版本字段差 1)。区间外(≤495 / ≥556)按 legacy 形态处理,
+/// 因为 556+ 无样本;精确 555 判据另见 [`SemanticProfile::is_v555`]。
+#[must_use]
+pub fn is_v555_family_version(version: u32) -> bool {
+    (500..=555).contains(&version)
 }
 
 #[cfg(test)]
@@ -383,8 +403,29 @@ mod tests {
         assert!(!p.is_v555(), "精确 555 判据不得吞并 0.500");
         assert!(p.is_v555_family());
 
+        // 0.554 是 5xx 区间里的构建:`ysc.ybn`/`yse.ybn` 与 0.555 样本逐字节
+        // 相同(仅版本字段差 1),全部走 555 家族形态;缩略图块只对精确 555
+        // 取证,554 保持 `ContainerProfile`。
+        for version in [501, 530, 554] {
+            let p = SemanticProfile::from_yscm_version(version);
+            assert_eq!(p.ysc_version, version);
+            assert_eq!(p.window_payload, WindowPayloadMode::RecordDelimited, "{version}");
+            assert_eq!(p.text, TextMode::FileArray, "{version}");
+            assert_eq!(p.textinfo, TextInfoMode::Inert, "{version}");
+            assert_eq!(p.returncode, ReturnCodeMode::EndOnly, "{version}");
+            assert_eq!(p.varinfo_sjis, SjisCodeMode::FirstChar, "{version}");
+            assert_eq!(p.script_decls, ScriptDeclMode::LoadTime, "{version}");
+            assert_eq!(p.ref_int_param, RefIntParamMode::SlotId, "{version}");
+            assert!(p.partial_index, "{version}");
+            assert_eq!(p.save_image, SaveImageMode::ContainerProfile, "{version}");
+            assert!(p.save_mem_pack, "{version}");
+            assert!(!p.is_v555(), "{version}:精确 555 判据不得吞并 554");
+            assert!(p.is_v555_family(), "{version}");
+        }
+
         // 555 是独立分支;556/600 没有证据,不得自动继承。
         for version in [556, 600] {
+            assert!(!is_v555_family_version(version), "{version}");
             let p = SemanticProfile::from_yscm_version(version);
             assert_eq!(p.ysc_version, version);
             assert_eq!(p.window_payload, WindowPayloadMode::Exact, "{version}");
