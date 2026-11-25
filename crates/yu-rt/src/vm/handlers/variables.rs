@@ -468,6 +468,13 @@ impl Vm {
         // `0x684170` 零引用),只是 ysc 表里的惰性参数:若脚本只给它,
         // 官方是什么都不做。按 `aligned-stub` 对齐并留一条 Info。
         //
+        // 但 2025 年本地化发行版(Kagura 系,0.481 定制 ysc)的
+        // `data/script/eris/全角文字表示処理.txt` **真的用它**:
+        // `VARINFO[UTF8CODE=1, SET=$char, LET=@code]` 取首字符的 UTF-8
+        // 字节(脚本拿 0xE2809C/0xEFBC81 这类"打包 UTF-8 字节"做比较,
+        // 再映射到 `cgsys/font/font_u22/fnt_s22_nNNN` 字形页)。UTF-8
+        // 路线下必须实现,否则所有字符都落到同一占位格。
+        //
         // `SJISCODE` 不同:v555 处理体 `0x455200` 的 `0x4554a9` 分支会读
         // `SET` 字符串首字符并写 `LET`(单字节 = 字节值;双字节 =
         // `(lead << 8) | trail`,`0x455b9c` 实证);555 的剧本词法器
@@ -475,6 +482,9 @@ impl Vm {
         // 不再按惰性参数吞掉。跨版本门控由 `SemanticProfile` 决定
         // (`Inert` = 0.495 及更早;`FirstChar` = v555 起)。
         let sjis_inert = self.semantics().varinfo_sjis == crate::semantics::SjisCodeMode::Inert;
+        // UTF8CODE 只在 UTF-8 执行路线启用;CP932/GBK/Big5 保持官方 0.495
+        // 的惰性 no-op,不改变既有游戏行为。
+        let utf8_active = self.script_text_codec(st.script_id) == yu_format::Codec::Utf8;
         let mut inert_stub: Option<&'static str> = None;
         // 全部数值槽(SEARCH 的针值与 `NO=` 起始下标要用)。
         let mut flags: smallvec::SmallVec<[(u8, i64); 8]> = smallvec::SmallVec::new();
@@ -495,16 +505,17 @@ impl Vm {
                         // 不按槽号区间 —— 后者的区间在版本间会位移
                         // (`17..=20` 在 v494 上是错的)。
                         let name = varinfo_names.get(usize::from(slot)).map(String::as_str);
-                        let is_helper = matches!(
-                            name,
-                            Some("INT" | "FLT" | "STR" | "NO" | "NO2" | "UTF8CODE")
-                        ) || (sjis_inert && name == Some("SJISCODE"));
+                        let is_helper = matches!(name, Some("INT" | "FLT" | "STR" | "NO" | "NO2"))
+                            || (name == Some("UTF8CODE") && !utf8_active)
+                            || (sjis_inert && name == Some("SJISCODE"));
                         if n != 0 {
                             match name {
                                 Some("SJISCODE") if sjis_inert => {
                                     inert_stub = Some("VARINFO.SJISCODE")
                                 }
-                                Some("UTF8CODE") => inert_stub = Some("VARINFO.UTF8CODE"),
+                                Some("UTF8CODE") if !utf8_active => {
+                                    inert_stub = Some("VARINFO.UTF8CODE")
+                                }
                                 // 555:`NO2` 是 `STRFIRST` 的结束下标从属参数;
                                 // 单独出现时无可查询项,按对齐 no-op(不 fatal)。
                                 Some("NO2") => inert_stub = Some("VARINFO.NO2"),
@@ -654,6 +665,43 @@ impl Vm {
                             code::rt::VAR_TYPE,
                             Boundary::Script,
                             format!("VARINFO STRTYPE 需要字符串变量,得到 {}", other.type_name()),
+                        )
+                        .into())
+                    }
+                }
+            }
+            // `UTF8CODE`:本地化发行版(2025 Kagura 系)的词法器/字体页
+            // 用它取首字符的 UTF-8 字节。语义 = 首字符的字节**大端打包**
+            // (`"你"` → 0xE4BDA0),与脚本里的 0xE2809C/0xEFBC81 比较式
+            // 一致;空串 → 0。仅 UTF-8 执行路线启用(见上方 `utf8_active`)。
+            Some("UTF8CODE") => {
+                let idx: smallvec::SmallVec<[i64; 4]> = if set.indices.is_empty() {
+                    smallvec::smallvec![0; shape.1.len()]
+                } else {
+                    set.indices.clone()
+                };
+                let v = self.read_var(st, set_var, &idx)?;
+                match v {
+                    Value::Str(bytes) if bytes.is_empty() => Value::Int(0),
+                    Value::Str(bytes) => {
+                        let width = yu_format::Codec::Utf8
+                            .next_char(&bytes, 0)
+                            .map_or(1, |(_, width)| width)
+                            .min(bytes.len());
+                        let mut code: i64 = 0;
+                        for byte in &bytes[..width] {
+                            code = (code << 8) | i64::from(*byte);
+                        }
+                        Value::Int(code)
+                    }
+                    other => {
+                        return Err(diag::fatal(
+                            code::rt::VAR_TYPE,
+                            Boundary::Script,
+                            format!(
+                                "VARINFO UTF8CODE 需要字符串变量,得到 {}",
+                                other.type_name()
+                            ),
                         )
                         .into())
                     }

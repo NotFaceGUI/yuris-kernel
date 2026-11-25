@@ -60,7 +60,7 @@ impl Score {
     }
 }
 
-/// 自动识别结论(含两个候选的证据分,进 trace / golden 头部)。
+/// 自动识别结论(含候选证据分,进 trace / golden 头部)。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Detection {
     /// 裁决结果。
@@ -69,15 +69,21 @@ pub struct Detection {
     pub cp932: Score,
     /// GBK 证据分。
     pub gbk: Score,
+    /// UTF-8 证据分。
+    pub utf8: Score,
 }
 
 /// 按架构 §7 的固定流程对采样池做编码识别。
 ///
 /// `samples` 顺序 = 证据优先级(ybn 字符串常量 → 资源名 → 配置文本),
 /// 计分按顺序累加,次序固定。
+///
+/// UTF-8 走**严格合法性**裁决而不是构成加权:整池样本全部是合法 UTF-8
+/// 且含非 ASCII 多字节序列时,直接判 UTF-8。合法 CP932/GBK 文本偶然
+/// 整体构成合法 UTF-8 多字节序列的概率极低,这比按假名/汉字加权更稳。
 #[must_use]
 pub fn detect(samples: &[&[u8]]) -> Detection {
-    let mut cp932 = Score {
+    let empty = Score {
         illegal_bytes: 0,
         total_bytes: 0,
         kana: 0,
@@ -87,14 +93,28 @@ pub fn detect(samples: &[&[u8]]) -> Detection {
         controls: 0,
         points: 0.0,
     };
-    let mut gbk = cp932;
+    let mut cp932 = empty;
+    let mut gbk = empty;
+    let mut utf8 = empty;
+    let mut utf8_valid = true;
+    let mut utf8_multibyte = false;
     for sample in samples {
         score_one(Codec::Cp932, sample, &mut cp932);
         score_one(Codec::Gbk, sample, &mut gbk);
+        score_one(Codec::Utf8, sample, &mut utf8);
+        if std::str::from_utf8(sample).is_err() {
+            utf8_valid = false;
+        }
+        if sample.iter().any(|byte| *byte >= 0x80) {
+            utf8_multibyte = true;
+        }
     }
     cp932.points = points(Codec::Cp932, &cp932);
     gbk.points = points(Codec::Gbk, &gbk);
-    let codec = if gbk.points - cp932.points >= TIE_THRESHOLD {
+    utf8.points = points(Codec::Utf8, &utf8);
+    let codec = if utf8_valid && utf8_multibyte {
+        Codec::Utf8
+    } else if gbk.points - cp932.points >= TIE_THRESHOLD {
         Codec::Gbk
     } else {
         // 差距不足或 CP932 领先:缺省 CP932(A3:平局裁决固定)
@@ -104,6 +124,7 @@ pub fn detect(samples: &[&[u8]]) -> Detection {
         codec,
         cp932,
         gbk,
+        utf8,
     }
 }
 
@@ -140,6 +161,18 @@ fn score_one(codec: Codec, bytes: &[u8], out: &mut Score) {
             Codec::Gbk => super::GBK_TABLE.step(bytes, i),
             // 不参与 `detect()` 的裁决,但保持穷尽匹配(单测直接给分时会用到)。
             Codec::Big5 => super::BIG5_TABLE.step(bytes, i),
+            Codec::Utf8 => match codec.next_char(bytes, i) {
+                Some((ch, width)) => {
+                    classify(ch, out);
+                    i += width;
+                    continue;
+                }
+                None => {
+                    out.illegal_bytes += 1;
+                    i += 1; // 固定重同步:前进 1 字节
+                    continue;
+                }
+            },
         };
         match step {
             Some((unit, width)) => {

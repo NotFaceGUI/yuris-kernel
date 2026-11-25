@@ -261,7 +261,7 @@ yu-cli run · 跑工程(缺省 headless;--mode desktop 开原生窗口)
   --save-codec zlib|snappy  强制存档块压缩层(缺省 = 盘上既有存档 →
                        引擎代号 YSSnp.dll → zlib;只影响写盘)
   --patch MODE         文本编码路线:auto(缺省,按产物识别)|
-                       original | gbk | big5 | tunnel(需 sjis_ext.bin)
+                       original | gbk | big5 | utf8 | tunnel(需 sjis_ext.bin)
   --translate PATH     运行时翻译文件(translate.json;按条目替换 WORD/
                        角色名/选项/外置剧本,文件外文本保持原样)
   --font FAMILY|PATH   宿主默认字体:family 名,或字体文件(.ttf/.otf/.ttc/
@@ -388,7 +388,7 @@ const EXPORT_HELP: &str = "\
 yu-cli export · 导出文本 / 角色表(翻译与运行时文本 hook 的输入)
 
 用法:
-  yu-cli export <project-root> [out-dir] [--text-codec auto|cp932|gbk|big5]
+  yu-cli export <project-root> [out-dir] [--text-codec auto|cp932|gbk|big5|utf8]
                 [--format csv|translate-json] [--script-key HEX] [--data PATH]
                 [--no-literals] [--runtime-characters] [--runtime-ticks N]
 
@@ -413,7 +413,8 @@ yu-cli export · 导出文本 / 角色表(翻译与运行时文本 hook 的输�
 说明:
   --text-codec auto(缺省)先采样 `WORD`,没有 WORD(555 框架脚本)再采样
   基准剧本文本,最后才用普通脚本字符串常量(只收非 ASCII 占比 >=30% 的串),
-  在 CP932/GBK 间裁决,平局或出现全角假名回退 CP932;外置剧本按目录变体固定
+  在 CP932/GBK/UTF-8 间裁决;整池严格合法 UTF-8 且含多字节时判 UTF-8,
+  否则平局或出现全角假名回退 CP932;外置剧本按目录变体固定
   (sc_cn_ = GBK、sc_tw_ = Big5)。
   解码失败逐字节计数写入 manifest.json 的 warnings,不静默替换。
   缺表/缺脚本显式列出,不空跑通过。

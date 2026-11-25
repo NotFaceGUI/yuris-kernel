@@ -56,22 +56,23 @@ const AUTO_SAMPLE_SCRIPTS: usize = 4;
 /// 文本域 codec 选择。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextCodecChoice {
-    /// 采样 `WORD` 载荷自动裁决(CP932/GBK,平局 CP932)。
+    /// 采样文本自动裁决(CP932/GBK/UTF-8;平局 CP932)。
     Auto,
     /// 显式指定。
     Fixed(yu_format::Codec),
 }
 
 impl TextCodecChoice {
-    /// 解析 CLI/宿主取值:`auto|cp932|gbk|big5`(`sjis` 视为 cp932)。
+    /// 解析 CLI/宿主取值:`auto|cp932|gbk|big5|utf8`(`sjis` 视为 cp932)。
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
             "cp932" | "sjis" | "shift_jis" | "" => Ok(Self::Fixed(yu_format::Codec::Cp932)),
             "gbk" | "cp936" => Ok(Self::Fixed(yu_format::Codec::Gbk)),
             "big5" | "cp950" => Ok(Self::Fixed(yu_format::Codec::Big5)),
+            "utf8" | "utf-8" => Ok(Self::Fixed(yu_format::Codec::Utf8)),
             other => Err(format!(
-                "text-codec 只接受 auto|cp932|gbk|big5,收到 `{other}`"
+                "text-codec 只接受 auto|cp932|gbk|big5|utf8,收到 `{other}`"
             )),
         }
     }
@@ -635,9 +636,13 @@ fn resolve_text_codec(
     let detection = auto::detect(&refs);
     let mut codec = detection.codec;
     // 安全网:CP932 解码出现可观的全角假名时,文本就是日文;GBK 靠汉字加权
-    // 险胜也只可能是标点/半角误读,不采用。
+    // 险胜也只可能是标点/半角误读,不采用。UTF-8 是严格合法性裁决,不受此
+    // 规则约束(UTF-8 日文被 CP932 误读也会冒出大量假名)。
     let kana_ratio = detection.cp932.kana as f64 / detection.cp932.total_bytes.max(1) as f64;
-    if codec != yu_format::Codec::Cp932 && kana_ratio >= 0.10 {
+    if codec != yu_format::Codec::Cp932
+        && codec != yu_format::Codec::Utf8
+        && kana_ratio >= 0.10
+    {
         codec = yu_format::Codec::Cp932;
     }
     Ok((

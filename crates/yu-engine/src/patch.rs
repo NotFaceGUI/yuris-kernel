@@ -47,6 +47,12 @@ pub enum PatchKind {
     Big5,
     /// CP932 + SJIS 隧道表(`sjis_ext.bin`)。
     Tunnel,
+    /// 全局 UTF-8(2025 年本地化发行版,如 Kagura 简中/英文版)。
+    ///
+    /// 与 [`PatchKind::Gbk`] 同构:换掉整包脚本文本的编码,路径/文件名
+    /// 仍按 CP932。**不参与 `Auto` 识别**(脚本池采样与版本门控尚未取证),
+    /// 由用户/宿主显式指定,或 `codecs.json` 的 `script: "utf8"`。
+    Utf8,
 }
 
 impl PatchKind {
@@ -58,10 +64,11 @@ impl PatchKind {
             PatchKind::Gbk => "gbk",
             PatchKind::Big5 => "big5",
             PatchKind::Tunnel => "tunnel",
+            PatchKind::Utf8 => "utf8",
         }
     }
 
-    /// 解析宿主/CLI 值。`auto|original|gbk|big5|tunnel`;`cp932` 等同
+    /// 解析宿主/CLI 值。`auto|original|gbk|big5|tunnel|utf8`;`cp932` 等同
     /// `original`。全平台唯一一份(CLI `--patch`、serve、Android
     /// `run-config.json` 的 `patch` 键共用)。
     pub fn parse(value: &str) -> Result<Self, String> {
@@ -73,8 +80,9 @@ impl PatchKind {
             "gbk" | "cp936" | "gb2312" => Ok(PatchKind::Gbk),
             "big5" | "cp950" | "big-5" => Ok(PatchKind::Big5),
             "tunnel" | "sjis_ext" => Ok(PatchKind::Tunnel),
+            "utf8" | "utf-8" => Ok(PatchKind::Utf8),
             other => Err(format!(
-                "未知补丁类型 `{other}`;可用:auto | original | gbk | big5 | tunnel"
+                "未知补丁类型 `{other}`;可用:auto | original | gbk | big5 | tunnel | utf8"
             )),
         }
     }
@@ -235,6 +243,15 @@ impl PatchSelection {
                 evidence: vec!["cli: big5".to_string()],
                 ..PatchProfile::default()
             },
+            PatchKind::Utf8 => PatchProfile {
+                kind: PatchKind::Utf8,
+                execution: Codec::Utf8,
+                text_default: Codec::Utf8,
+                name: Codec::Cp932,
+                source: PatchSource::Cli,
+                evidence: vec!["cli: utf8".to_string()],
+                ..PatchProfile::default()
+            },
             PatchKind::Tunnel => {
                 let tunnel = read_tunnel(project, None)?.ok_or_else(|| {
                     Failure::runtime(
@@ -359,6 +376,14 @@ fn detect_route(project: &Project) -> Result<PatchProfile, Failure> {
                 ..PatchProfile::default()
             },
             Codec::Cp932 => PatchProfile {
+                source: PatchSource::Heuristic,
+                ..PatchProfile::default()
+            },
+            Codec::Utf8 => PatchProfile {
+                kind: PatchKind::Utf8,
+                execution: Codec::Utf8,
+                text_default: Codec::Utf8,
+                name: Codec::Cp932,
                 source: PatchSource::Heuristic,
                 ..PatchProfile::default()
             },
@@ -703,6 +728,8 @@ fn lead_table(codec: Codec) -> [u8; 256] {
             Codec::Cp932 => matches!(byte, 0x81..=0x9F | 0xE0..=0xFC),
             Codec::Gbk => matches!(byte, 0x81..=0xFE),
             Codec::Big5 => matches!(byte, 0x81..=0x9F | 0xA1..=0xFE),
+            // UTF-8 没有「双字节前导表」;本函数只被三张双字节表的扫描调用。
+            Codec::Utf8 => false,
         });
     }
     table

@@ -619,6 +619,7 @@ impl Vm {
         let id = self.next_dialog_id;
         self.next_dialog_id = self.next_dialog_id.wrapping_add(1).max(1);
         let task = self.cur_task.clone();
+        let codec = self.script_text_codec(st.script_id);
         self.dialogs.push(crate::dialog::DialogRequest {
             id,
             task,
@@ -633,6 +634,7 @@ impl Vm {
             let_target,
             letstr_target,
             ignored_params,
+            codec,
         });
         Ok(StepOutcome::Yield)
     }

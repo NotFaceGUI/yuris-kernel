@@ -151,6 +151,10 @@ pub struct DialogRequest {
     /// 也不求值表达式(REA 0.495;0.479 `0x439cd8` 同构)。内核按官方行为
     /// 接受并忽略,只在请求里保留名字供诊断/trace 使用。
     pub ignored_params: Vec<String>,
+    /// 发起时脚本的文本 codec(`caption`/`text`/`default_input` 的字节解释)。
+    ///
+    /// 原版 = CP932;GBK/Big5/UTF-8 补丁版按各域 codec 呈现输入框文本。
+    pub codec: yu_format::Codec,
 }
 
 impl DialogRequest {
@@ -166,46 +170,49 @@ impl DialogRequest {
 
     /// `CAPTION` 的显示文本(仅宿主呈现;内核语义仍是原始字节)。
     ///
-    /// 严格 CP932 解码失败的**单个**坏字节以 U+FFFD 替换继续解码其余内容:
-    /// 呈现层不因一个坏字节顶掉整条对话框(官方 MessageBox 按 ANSI 直接
-    /// 显示,不存在"解码失败不显示"的分支)。
+    /// 严格 codec 解码失败时按该 codec 的宽容口径替换坏字节继续解码其余
+    /// 内容:呈现层不因一个坏字节顶掉整条对话框(官方 MessageBox 按 ANSI
+    /// 直接显示,不存在"解码失败不显示"的分支)。
     pub fn caption_display(&self) -> String {
-        decode_display(&self.caption)
+        decode_display(&self.caption, self.codec)
     }
 
     /// `STR` 的显示文本(呈现层;同 [`Self::caption_display`])。
     pub fn text_display(&self) -> String {
-        decode_display(&self.text)
+        decode_display(&self.text, self.codec)
     }
 
     /// `DEFSTR` 的显示文本(呈现层;同 [`Self::caption_display`])。
     pub fn default_input_display(&self) -> String {
-        decode_display(&self.default_input)
+        decode_display(&self.default_input, self.codec)
     }
 
-    /// 把宿主输入框文本编码回 CP932 原始字节([`Vm::answer_dialog`] 的
+    /// 把宿主输入框文本编码回脚本原始字节([`Vm::answer_dialog`] 的
     /// `text` 参数用;官方自绘对话框取控件文本后按 ANSI 保存)。
+    ///
+    /// 缺省 CP932(旧宿主/Android 兜底);UTF-8/GBK/Big5 路线请用
+    /// [`Self::encode_input_with`] 传对话框自己的 codec。
     pub fn encode_input(text: &str) -> Result<Vec<u8>, yu_log::Diag> {
-        yu_format::Codec::Cp932.encode(text, &[])
+        Self::encode_input_with(yu_format::Codec::Cp932, text)
+    }
+
+    /// 按对话框的文本 codec 编码输入框文本。
+    pub fn encode_input_with(
+        codec: yu_format::Codec,
+        text: &str,
+    ) -> Result<Vec<u8>, yu_log::Diag> {
+        codec.encode(text, &[])
     }
 }
 
 /// 呈现层 CP932 解码:整体严格解码失败时逐字节降级(ASCII 直通,
 /// 其余 U+FFFD),**不**改内核侧原始字节。
-fn decode_display(bytes: &[u8]) -> String {
-    if let Ok(text) = yu_format::Codec::Cp932.decode(bytes, bytes) {
-        return text;
+fn decode_display(bytes: &[u8], codec: yu_format::Codec) -> String {
+    match codec.decode(bytes, bytes) {
+        Ok(text) => text,
+        // 宽松口径:坏字节 → U+FFFD,其余能解的都保留。
+        Err(_) => codec.decode_lossy(bytes).0.into_iter().collect(),
     }
-    bytes
-        .iter()
-        .map(|&b| {
-            if b < 0x80 {
-                b as char
-            } else {
-                char::REPLACEMENT_CHARACTER
-            }
-        })
-        .collect()
 }
 
 /// `DIALOG` 状态机的内核侧错误(宿主回答越界/未知 ID)。

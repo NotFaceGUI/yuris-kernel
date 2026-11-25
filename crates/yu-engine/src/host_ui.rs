@@ -142,17 +142,24 @@ impl Engine {
             .collect()
     }
 
-    /// 回答一条 DIALOG(统一入口:CP932 编码在引擎侧完成)。
+    /// 回答一条 DIALOG(统一入口:输入框文本按对话框 codec 编码)。
     ///
     /// - `button`:1 基按钮序号;越界由内核拒绝。
-    /// - `input_text`:`INPUT=1` 时的编辑文本;编码失败(字符不在 CP932)
+    /// - `input_text`:`INPUT=1` 时的编辑文本;编码失败(字符不在该 codec)
     ///   原样返回 `Diag`,宿主应保持对话框打开让用户修改。
     ///
     /// 回答后任务在下一个逻辑帧从 `DIALOG` 的下一条继续(pc 在分派前已
     /// 前进,与官方引擎一致;见 `yu_rt/src/vm.rs::answer_dialog`)。
     pub fn answer_host_dialog(&mut self, answer: &HostDialogAnswer) -> Result<(), yu_log::Diag> {
+        // 用发起对话框时记录的 codec 编码输入文本(UTF-8 补丁版/GBK 版
+        // 的输入不能按 CP932 写回)。
+        let codec = self
+            .pending_dialogs()
+            .iter()
+            .find(|d| d.id == answer.id)
+            .map_or(yu_format::Codec::Cp932, |d| d.codec);
         let text = match &answer.input_text {
-            Some(input) => Some(DialogRequest::encode_input(input)?),
+            Some(input) => Some(DialogRequest::encode_input_with(codec, input)?),
             None => None,
         };
         self.answer_dialog(answer.id, answer.button, text.as_deref())
@@ -717,6 +724,7 @@ mod tests {
             let_target: None,
             letstr_target: None,
             ignored_params: Vec::new(),
+            codec: yu_format::Codec::Cp932,
         }
     }
 
@@ -735,6 +743,7 @@ mod tests {
             let_target: None,
             letstr_target: None,
             ignored_params: Vec::new(),
+            codec: yu_format::Codec::Cp932,
         }
     }
 
