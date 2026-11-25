@@ -33,9 +33,9 @@ DIALOG 共用同一份 `nativePendingDialogs()` 快照和 `DialogPresenter`。
 - 启动失败:在 `MainActivity`(游戏界面)弹,确认后才回配置页;
 - 游戏内 Fatal/tick 失败/panic:成功 tick 后立刻弹在当前游戏画面上
   (tick 失败/panic 保留最后一帧),确认后回配置页;
-- **警告(Recoverable)不弹模态框**:`nativeTakeHint()` 取最新一条,
-  `MainActivity` 用 Toast 提示(有对话框时让位,3 秒最多一次);
-  否则每帧资源缺失会直接把游戏堵死;
+- **警告(Recoverable)不弹任何提示**:只进 logcat/诊断日志,不阻塞
+  游戏也不弹胶囊。资源缺失/缺字形这类警告在正常游戏里可能频繁出现,
+  提示会刷屏;用户可见的只有崩溃级消息(2026-11-25 主人政策);
 - `unimplemented/info/verbose` 只进诊断面板,不弹给用户;
 - 宿主消息 ID 从 `host_ui::HOST_DIALOG_ID_BASE = 1 << 40` 起,
   不能超过 f64 精确整数范围(JSON 数字用 f64 承载)。

@@ -31,7 +31,7 @@ pub use yu_rt::dialog::{DialogButtons, DialogIcon};
 /// - [`HostDialogSource::Host`]:内核/宿主自己的运行期**错误**(Fatal 诊断、
 ///   脚本错误、启动/tick 失败、panic),和脚本 DIALOG 走**同一份快照与
 ///   同一个呈现器**,但没有 VM 写回 —— 壳确认后仅关闭。
-///   警告(Recoverable)不走这里,见 [`HostAlertQueue::take_hint`]。
+///   警告(Recoverable)不弹给用户,只进日志/诊断面板。
 ///
 /// 用同一个契约的原因:官方错误路径就是 `MessageBoxA`;Android/CLI/桌面
 /// 不应各写一套错误上屏,DIALOG 已经具备按钮、输入框、模态队列与本地化
@@ -216,8 +216,9 @@ pub fn dialogs_json(dialogs: &[HostDialog]) -> String {
 //
 // 脚本 `DIALOG` 是**脚本语义**(任务挂起等回答);本区是**运行状态**:
 // 内核 Fatal 诊断、执行器结束任务的脚本错误、宿主 panic、启动/tick 失败
-// 会进模态 DIALOG(官方 `YU-RIS Debug Info` MessageBox);Recoverable 警告
-// 只进非模态提示,不阻塞游戏。
+// 会进模态 DIALOG(官方 `YU-RIS Debug Info` MessageBox)。Recoverable 警告
+// **不弹给用户**(2026-11-25 主人政策:只有真正的崩溃才提示),只进
+// logcat / 诊断日志。
 //
 // 为什么不在 `Engine` 里持队列:panic/启动失败发生在会话之外(甚至引擎
 // 尚未建立),宿主必须能自行入库。队列放在契约层,由各宿主各持一份。
@@ -226,7 +227,7 @@ pub fn dialogs_json(dialogs: &[HostDialog]) -> String {
 ///
 /// 与 [`yu_log::Severity`] 分开:后者是**诊断挂号**级别(含 Unimplemented/
 /// Info/Verbose),前者是**用户可见**的通知级别。Fatal 诊断进模态 DIALOG;
-/// Recoverable 只进非模态提示;其余只进诊断面板。
+/// Recoverable 与其余级别只进日志/诊断面板 —— 用户可见的只有崩溃级通知。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AlertSeverity {
     Info,
@@ -257,21 +258,23 @@ impl AlertSeverity {
 
     /// 是否需要模态确认。
     ///
-    /// Error/Fatal 必须模态(官方错误 MessageBox 语义);Warning 只做非模态
-    /// 提示(Toast/横幅),不打断游戏。
+    /// Error/Fatal 必须模态(官方错误 MessageBox 语义);Warning/Info 不是
+    /// 崩溃级,不打断游戏,也不弹任何提示(只进日志/诊断面板)。
     pub const fn is_modal(self) -> bool {
         matches!(self, AlertSeverity::Error | AlertSeverity::Fatal)
     }
 
     /// 内核诊断级别 → 宿主通知级别。
     ///
-    /// `Unimplemented`/`Info`/`Verbose` 返回 `None`:它们是挂号/调试噪声,
-    /// 每帧都可能出现,不能弹给用户(桌面诊断面板仍可见)。
+    /// 只有 `Fatal` 会变成用户可见通知(模态 DIALOG)。`Recoverable` 是
+    /// 可继续的警告,可能在正常游戏中频繁出现(缺资源、缺字形等),
+    /// **不弹给用户**;`Unimplemented`/`Info`/`Verbose` 是挂号/调试噪声。
+    /// 它们都只进日志/诊断面板。
     pub const fn from_diag(severity: yu_log::Severity) -> Option<Self> {
         match severity {
             yu_log::Severity::Fatal => Some(AlertSeverity::Fatal),
-            yu_log::Severity::Recoverable => Some(AlertSeverity::Warning),
-            yu_log::Severity::Unimplemented
+            yu_log::Severity::Recoverable
+            | yu_log::Severity::Unimplemented
             | yu_log::Severity::Info
             | yu_log::Severity::Verbose => None,
         }
@@ -325,8 +328,8 @@ impl HostAlert {
 
 /// 队列最多保留的未确认**模态**消息数。
 ///
-/// 警告不进这个队列(见 `MAX_HINTS`);达到上限后新来的脚本错误等直接
-/// 丢弃(诊断面板仍能看到原始 `Diag`)。panic/启动失败总是入库。
+/// 警告不弹给用户,也不会进这个队列;达到上限后新来的脚本错误等直接
+/// 丢弃(诊断面板/日志仍能看到原始 `Diag`)。panic/启动失败总是入库。
 pub const MAX_ALERTS: usize = 32;
 
 /// 宿主消息的 DIALOG ID 基址。
@@ -340,9 +343,6 @@ pub const MAX_ALERTS: usize = 32;
 /// `i64::MAX` 处饱和。`1 << 40` 精确、且离 VM 的小整数有足够隔离带。
 pub const HOST_DIALOG_ID_BASE: u64 = 1 << 40;
 
-/// 非模态提示最多保留的条数(壳每次取最新一条,其余丢弃)。
-pub const MAX_HINTS: usize = 16;
-
 /// 宿主侧告警队列(每个宿主一份;线程安全由宿主自己包)。
 #[derive(Debug)]
 pub struct HostAlertQueue {
@@ -353,10 +353,6 @@ pub struct HostAlertQueue {
     /// 同一处诊断每帧重复产生时不重复弹窗;用内容而不是 code 做键,是为了
     /// 让“同一 code 在不同脚本位置”仍能各报一次。
     seen: BTreeSet<(String, String, String)>,
-    /// 非模态提示(Recoverable 诊断):不阻塞游戏,壳用 Toast/横幅提示。
-    hints: Vec<String>,
-    /// 提示去重(同一 `code + detail` 只提示一次)。
-    hint_seen: BTreeSet<(String, String)>,
 }
 
 impl Default for HostAlertQueue {
@@ -372,8 +368,6 @@ impl HostAlertQueue {
             next_id: 1,
             alerts: Vec::new(),
             seen: BTreeSet::new(),
-            hints: Vec::new(),
-            hint_seen: BTreeSet::new(),
         }
     }
 
@@ -396,8 +390,6 @@ impl HostAlertQueue {
     pub fn clear(&mut self) {
         self.alerts.clear();
         self.seen.clear();
-        self.hints.clear();
-        self.hint_seen.clear();
         self.next_id = 1;
     }
 
@@ -409,39 +401,17 @@ impl HostAlertQueue {
         id
     }
 
-    fn push_hint(&mut self, diag: &yu_log::Diag) {
-        let key = (diag.code.to_string(), diag.detail.clone());
-        if !self.hint_seen.insert(key) {
-            return;
-        }
-        let mut text = diag.code.to_string();
-        if !diag.detail.is_empty() {
-            text.push_str(": ");
-            text.push_str(&diag.detail);
-        }
-        if self.hints.len() >= MAX_HINTS {
-            self.hints.remove(0);
-        }
-        self.hints.push(text);
-    }
-
-    /// 取走最新一条非模态提示(其余丢弃);壳每次 tick 最多提示一次。
-    pub fn take_hint(&mut self) -> Option<String> {
-        let latest = self.hints.pop();
-        self.hints.clear();
-        latest
-    }
-
     /// 一条内核诊断入库;返回分配的消息 ID,`0` = 不需要弹窗/已去重。
     ///
-    /// Fatal 升级成模态 DIALOG;Recoverable(警告)只进**非模态提示**
-    /// (壳用 Toast/横幅),否则每帧资源缺失会把游戏堵死。
+    /// 只有 Fatal 会升级成模态 DIALOG。Recoverable(警告)**不弹给用户**:
+    /// 正常游戏中缺资源/缺字形等警告可能每帧出现,提示会刷屏;它们只进
+    /// 日志/诊断面板。
     pub fn ingest_diag(&mut self, diag: &yu_log::Diag) -> u64 {
         let Some(severity) = AlertSeverity::from_diag(diag.severity) else {
             return 0;
         };
+        debug_assert!(severity.is_modal(), "非崩溃级诊断不应进入用户可见队列");
         if !severity.is_modal() {
-            self.push_hint(diag);
             return 0;
         }
         let location = format_loc(&diag.where_);
@@ -829,7 +799,8 @@ mod tests {
         );
         assert_eq!(
             AlertSeverity::from_diag(yu_log::Severity::Recoverable),
-            Some(AlertSeverity::Warning)
+            None,
+            "警告只进日志/诊断面板,不弹给用户"
         );
         assert_eq!(
             AlertSeverity::from_diag(yu_log::Severity::Unimplemented),
@@ -946,38 +917,15 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_diags_become_non_modal_hints() {
+    fn recoverable_diags_stay_out_of_user_visible_alerts() {
         let mut queue = HostAlertQueue::new();
-        let diag = yu_log::Diag::recoverable("gfx.texture.missing", yu_log::Boundary::Domain)
-            .with_detail("layer 1");
-        assert_eq!(queue.ingest_diag(&diag), 0, "警告不能进模态队列");
-        assert!(queue.alerts().is_empty());
-        assert_eq!(
-            queue.take_hint().as_deref(),
-            Some("gfx.texture.missing: layer 1")
-        );
-        assert_eq!(queue.take_hint(), None, "取走即清空");
-
-        // 同一条警告只提示一次(否则每帧缺资源会刷屏)。
-        assert_eq!(queue.ingest_diag(&diag), 0);
-        assert_eq!(queue.take_hint(), None);
-    }
-
-    #[test]
-    fn hint_queue_keeps_latest_and_caps_flood() {
-        let mut queue = HostAlertQueue::new();
-        for index in 0..(MAX_HINTS + 4) {
+        for index in 0..(MAX_ALERTS + 4) {
             let diag = yu_log::Diag::recoverable("gfx.texture.missing", yu_log::Boundary::Domain)
                 .with_detail(format!("layer {index}"));
-            assert_eq!(queue.ingest_diag(&diag), 0);
+            assert_eq!(queue.ingest_diag(&diag), 0, "警告不能进模态队列");
         }
-        let latest = queue.take_hint().expect("至少保留最新一条");
-        assert_eq!(
-            latest,
-            format!("gfx.texture.missing: layer {}", MAX_HINTS + 3),
-            "队尾覆盖队首,壳只提示最新一条"
-        );
-        assert_eq!(queue.take_hint(), None);
+        assert!(queue.is_empty(), "警告不产生任何用户可见提示");
+        assert!(queue.dialogs().is_empty(), "警告不能出现在 DIALOG 快照里");
     }
 
     #[test]

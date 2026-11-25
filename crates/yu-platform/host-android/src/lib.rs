@@ -187,8 +187,6 @@ struct AlertSnapshot {
     queue: HostAlertQueue,
     /// 队列映射出的 DIALOG 视图(缓存;队列变化时重建)。
     dialogs: Vec<HostDialog>,
-    /// 最新一条非模态提示(Recoverable 诊断;壳取走即空,不阻塞游戏)。
-    hint: Option<String>,
 }
 
 impl AlertSnapshot {
@@ -196,7 +194,6 @@ impl AlertSnapshot {
         Self {
             queue: HostAlertQueue::new(),
             dialogs: Vec::new(),
-            hint: None,
         }
     }
 }
@@ -287,17 +284,6 @@ fn clear_alert_state() {
     let mut alerts = lock_or_recover(&ALERT_SNAPSHOT);
     alerts.queue.clear();
     alerts.dialogs.clear();
-    alerts.hint = None;
-}
-
-/// 取走最新一条非模态提示(警告);空串 = 没有。
-///
-/// 与 `nativePendingDialogs()` 分开:警告不阻塞游戏,壳用 Toast 即可。
-pub fn take_hint() -> String {
-    lock_or_recover(&ALERT_SNAPSHOT)
-        .hint
-        .take()
-        .unwrap_or_default()
 }
 
 /// 入库一条宿主消息,并立即并入 DIALOG 快照。
@@ -348,6 +334,9 @@ fn drop_script_dialogs() {
 }
 
 /// 把本帧内核诊断/脚本错误入库(去重与上限由队列负责)。
+///
+/// 只有崩溃级(Fatal/脚本错误/启动/tick 失败/panic)会进 DIALOG 快照;
+/// Recoverable 警告不弹给用户,只留在 logcat/诊断日志里。
 fn record_engine_alerts(diags: &[yu_log::Diag], script_errors: &[String]) {
     if diags.is_empty() && script_errors.is_empty() {
         return;
@@ -359,10 +348,6 @@ fn record_engine_alerts(diags: &[yu_log::Diag], script_errors: &[String]) {
             if alerts.queue.ingest_diag(diag) > 0 {
                 changed = true;
             }
-        }
-        // 警告只进非模态提示(壳 Toast),不参与 DIALOG 快照。
-        if let Some(hint) = alerts.queue.take_hint() {
-            alerts.hint = Some(hint);
         }
         for error in script_errors {
             if alerts.queue.ingest_script_error(error) > 0 {
@@ -2927,22 +2912,6 @@ mod jni_entry {
         to_jstring(&mut env, pending_dialogs_json())
     }
 
-    /// 取走最新一条非模态提示(Recoverable 警告);`null` = 没有。
-    ///
-    /// 与 DIALOG 分开:警告不阻塞游戏,壳用 Toast/横幅提示即可。
-    #[no_mangle]
-    pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeTakeHint<'local>(
-        mut env: JNIEnv<'local>,
-        _class: JClass<'local>,
-    ) -> JString<'local> {
-        let hint = take_hint();
-        if hint.is_empty() {
-            // 稳态不分配 Java 字符串(每帧都会轮询)。
-            return JString::default();
-        }
-        to_jstring(&mut env, hint)
-    }
-
     /// 启动进度 JSON(壳在 UI 线程轮询,显示 spinner)。
     ///
     /// 契约见 `yu_engine::host_ui::boot_progress_json`:
@@ -3031,7 +3000,9 @@ mod tests {
         let error = export_text_to_paths("nope", "out", "xml", "", "").unwrap_err();
         assert!(error.contains("format"), "应报 format,实际: {error}");
 
-        let error = export_text_to_paths("nope", "out", "translate-json", "utf8", "").unwrap_err();
+        // `utf8` 已是合法取值,这里用真正非法的编码验证「参数先于工程发现
+        // 校验」的顺序。
+        let error = export_text_to_paths("nope", "out", "translate-json", "utf16", "").unwrap_err();
         assert!(error.contains("text-codec"), "应报 text-codec,实际: {error}");
 
         let error =

@@ -18405,3 +18405,36 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
     label `Yu-ris Runtime`,icon 资源存在,`native-code arm64-v8a`;
   - APK 内 JSON:`settings` 19 项,`fileImports` = fonts + translate。
 - **未执行**:审查时 `adb devices` 为空,未推到真机。
+
+## 成果 HINT-SILENCE (2026-11-26) · 警告不再弹胶囊,只有崩溃级才提示
+
+- **政策**(2026-11-25 主人指令):Recoverable 警告不弹任何提示,只留
+  logcat/诊断日志;用户可见的只有真正的崩溃(启动/tick 失败、panic、
+  Fatal 诊断、执行器脚本错误)。旧实现把警告做成 3 秒节流的 Toast 胶囊,
+  正常游戏中缺资源/缺字形会反复刷屏。
+- **内核** `yu-engine::host_ui`:`AlertSeverity::from_diag` 只把 Fatal
+  映射成用户可见通知;`HostAlertQueue` 删除 `hints`/`hint_seen`/
+  `push_hint`/`take_hint`/`MAX_HINTS`,`ingest_diag` 对非模态级别直接
+  返回 0;回归测试由两条 hint 用例改为
+  `recoverable_diags_stay_out_of_user_visible_alerts`(刷 36 条警告后
+  队列与 DIALOG 快照都为空)。
+- **host-android**:删除 `AlertSnapshot.hint`、`take_hint()` 与 JNI
+  `nativeTakeHint`;`record_engine_alerts` 不再取 hint。顺带修正过期断言
+  `export_text_validates_arguments_before_io`:`utf8` 已是合法 codec,
+  改用 `utf16` 验证「参数先于工程发现校验」。
+- **安卓壳**:`MainActivity` 删除 hint 轮询块与
+  `HINT_MIN_INTERVAL_MS`/`lastHintAt`/`Toast` import;
+  `NativeHost.java` 删除 `nativeTakeHint` 声明;`DialogPresenter`
+  的脚本 DIALOG 与宿主错误弹框不变。
+- **文档**:`android/README.md` 与 `docs/cross-platform.md` 的警告条目
+  改为「只进日志,不弹提示」。
+- **验证**:
+  - `cargo test -p yu-engine --lib host_ui` → 11 passed,0 failed;
+  - `cargo test -p yu-host-android --lib` → 27 passed,0 failed;
+  - `gradle :app:compileDebugJavaWithJavac --offline --no-daemon` → EXIT=0
+    (仅 SDK XML 版本与 deprecation 提示);
+  - `cargo check --workspace --all-targets` → **被 `yu-save` 未提交 WIP
+    阻塞**(`state.rs:655` 调用了未定义的 `bytes_block_count`),与本次
+    改动无关,未动该文件。
+- **残余**:警告仍完整进 logcat 与调试日志(JSONL);需要人工查看时开
+  「调试日志」即可,不再有屏幕提示。

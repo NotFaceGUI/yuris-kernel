@@ -237,14 +237,6 @@ public final class NativeHost {
     public static native String nativeAnswerDialog(long id, int button, String text);
 
     /**
-     * 取走最新一条**非模态提示**(Recoverable 警告);{@code null} = 没有。
-     *
-     * <p>警告不进 DIALOG 队列,否则每帧资源缺失会把游戏堵死。壳用
-     * Toast/横幅提示即可,不阻塞输入;**可从任意线程调用**。
-     */
-    public static native String nativeTakeHint();
-
-    /**
      * 启动进度 JSON(壳在 UI 线程轮询,显示 spinner/阶段文案)。
      *
      * <p>契约:{@code {"active":true,"stage":"mount","detail":"挂载游戏数据…"}};

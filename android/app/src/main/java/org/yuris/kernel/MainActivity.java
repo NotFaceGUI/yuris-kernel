@@ -24,7 +24,6 @@ import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -204,9 +203,6 @@ public final class MainActivity extends Activity
     private volatile String statusLine = "";
     /** 已提交给浮层的文本(节流用;只由渲染线程读写)。 */
     private String hudText = "";
-    /** 非模态警告提示的最小间隔(Toast;不阻塞游戏)。 */
-    private static final long HINT_MIN_INTERVAL_MS = 3000;
-    private long lastHintAt;
     /** 状态浮层是否启用(壳侧开关;关掉后不再调 nativeStatus)。 */
     private boolean showHud;
     /** 调试日志是否启用(壳侧开关;关掉后不写 logcat、不落 JSONL)。 */
@@ -972,20 +968,8 @@ public final class MainActivity extends Activity
                 dialogPresenter.publish(dialogJson);
             }
 
-            // Recoverable 诊断只做非模态提示:不进 DIALOG,否则每帧资源缺失
-            // 会把游戏堵死。有错误对话框时不抢焦点,3 秒内最多提示一次。
-            if (!dialogPending) {
-                long now = SystemClock.elapsedRealtime();
-                if (now - lastHintAt >= HINT_MIN_INTERVAL_MS) {
-                    String hint = NativeHost.nativeTakeHint();
-                    if (hint != null && !hint.isEmpty()) {
-                        lastHintAt = now;
-                        runOnUiThread(() -> Toast.makeText(
-                                this, hint, Toast.LENGTH_SHORT).show());
-                    }
-                }
-            }
-
+            // Recoverable 警告不弹给用户(2026-11-25 主人政策:只有真正的
+            // 崩溃才提示);它们只留在 logcat / 诊断日志里,不抢游戏焦点。
             int[] size = NativeHost.nativeFrameSize();
             if (size.length >= 2 && (size[0] != frameW || size[1] != frameH)) {
                 frameW = size[0];

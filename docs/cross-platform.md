@@ -208,10 +208,10 @@ default_button / icon / input / input_limit / default_input`。内核权威状�
 错误上屏不再有第二条路径:Android 的 `DialogPresenter`、iOS 的
 `UIAlertController`、桌面的 egui 模态都只消费 `dialogs` 数组。
 
-**警告(Recoverable)不进 DIALOG**:它通过
-`HostAlertQueue::take_hint()` 取走,壳用 Toast/横幅提示;否则每帧资源
-缺失都会弹模态框,游戏没法玩。`unimplemented/info/verbose` 诊断仍只进
-诊断面板。
+**警告(Recoverable)不弹给用户**(2026-11-25 主人政策:只有真正的崩溃
+才提示):它只进诊断日志,不进 DIALOG、也不做 Toast/横幅。资源缺失这类
+警告在正常游戏里可能频繁出现,弹提示只会刷屏。`unimplemented/info/verbose`
+诊断同样只进诊断面板。
 
 ### JSON 契约(非 Rust 壳)
 
@@ -256,7 +256,8 @@ default_button / icon / input / input_limit / default_input`。内核权威状�
    DIALOG 合并进同一份快照;壳确认宿主消息时**不能**调用
    `Engine::answer_host_dialog`(它不是 VM 任务)。Android
    `answer_dialog` 按 ID 区间/`source` 分流,宿主消息幂等关闭。
-   Recoverable 警告走 `take_hint()`(Toast),不弹模态框。
+   Recoverable 警告不弹给用户,只进诊断日志(不弹模态框、也不做
+   Toast/横幅)。
 
 当前实现:桌面 `host-desktop/src/ui.rs::dialog_modal`;Android
 `host-android` 的快照/回答队列 + `android/.../DialogPresenter.java`。
