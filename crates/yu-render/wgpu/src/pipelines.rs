@@ -108,7 +108,12 @@ pub fn blend_state(mode: BlendMode) -> Option<wgpu::BlendState> {
 pub fn src_mode(mode: BlendMode) -> Option<u32> {
     Some(match mode {
         BlendMode::Normal | BlendMode::Add => 0,
-        BlendMode::Subtract | BlendMode::Screen | BlendMode::Lighten | BlendMode::Exclusion => 1,
+        BlendMode::Subtract | BlendMode::Lighten | BlendMode::Exclusion => 1,
+        // `スクリーン`:MODE 5 的 stage1 是 BLENDCURRENTALPHA(CURRENT,
+        // BLACKTEXBUF),源 RGB = stage0(T·A) × C.a(纹理 alpha × 层 A)。
+        // 官方光照/flare 素材是「RGB=白、alpha=形状」的面;只按层 A 归约
+        // 会把白矩形整块 screen 到屏幕上(<v500-relirium> 车窗外白块,SPL2101)。
+        BlendMode::Screen => 3,
         BlendMode::Multiply | BlendMode::Darken => 2,
         _ => return None,
     })
@@ -2020,6 +2025,7 @@ mod tests {
         assert_eq!(src_mode(BlendMode::Normal), Some(0));
         assert_eq!(src_mode(BlendMode::Add), Some(0));
         assert_eq!(src_mode(BlendMode::Subtract), Some(1));
+        assert_eq!(src_mode(BlendMode::Screen), Some(3));
         assert_eq!(src_mode(BlendMode::Lighten), Some(1));
         assert_eq!(src_mode(BlendMode::Darken), Some(2));
         assert_eq!(src_mode(BlendMode::Multiply), Some(2));

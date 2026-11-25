@@ -2666,14 +2666,14 @@ fn mul255(value: u8, alpha: u8) -> u8 {
 /// `D3DRS_SEPARATEALPHABLENDENABLE`(0xCE)写入,所以 alpha 通道与 RGB
 /// 使用同一组因子,alpha 源项是 `a²`(不是 `a`)。
 ///
-/// MODE 3/5/6/7/9 的**两阶段纹理运算**(2026-10-21 复核):
-/// stage0 的 `MOD(D,T)` 使用顶点 DIFFUSE,引擎在 `[ESP+0x2e8]` 写入
-/// `A` 灰度(`FUN_00414ba4` asm `0x414d09..0x414d21`);stage1 的
-/// `BLENDCURRENTALPHA` 配合白纹理(`DAT_00801d98`,MODE 3)/黑纹理
-/// (`DAT_00801d9c`,MODE 5)/白 TFACTOR(MODE 7)把源色归约成:
+/// MODE 2/3/5/6/7/9 的**两阶段纹理运算**(2026-11-25 复核):
+/// stage0 的 `MOD(T,D)` 使用顶点 DIFFUSE,引擎把层 alpha `A` 写进四通道
+/// (`FUN_00414ba4` asm `0x414d09..0x414d21`),所以 stage0 RGB 与 alpha
+/// 都是 `·A`;stage1 只有 MODE 3/5/7 用 `BLENDCURRENTALPHA`:
 /// - 0/1: `T`
-/// - 2/5/6/9: `T·A`
-/// - 3/7: `T·A + (1 − C.a)`
+/// - 2/6/9: `T·A`(stage1 关闭)
+/// - 5: `T·A·C.a`(stage1 arg2 = BLACKTEXBUF `DAT_00801d9c`)
+/// - 3/7: `T·A·C.a + (1 − C.a)`(arg2 = 白纹理 `DAT_00801d98` / 白 TFACTOR)
 ///
 /// 因此这里先算 stage 源色,再套 D3D9 的 blend 因子。
 ///
@@ -2706,9 +2706,11 @@ fn blend_pixel_shader(
 /// 固定管线的两阶段纹理归约(render-parity §5.2):返回 0..1 的源 RGB。
 ///
 /// - `MODE 0/1`:stage0 `SELECTARG1(T)` = `T`;
-/// - `MODE 2/5/6/9`:stage0 `MOD(D,T)` = `T·A`(顶点 DIFFUSE 的 A 灰度);
-/// - `MODE 3/7`:stage1 `BLENDCURRENTALPHA` 白/黑纹理再混一次
-///   `T·A + (1 − C.a)`;
+/// - `MODE 2/6/9`:stage0 `MOD(D,T)` = `T·A`(顶点 DIFFUSE 的 A 灰度);
+/// - `MODE 5`:stage0 同上,stage1 `BLENDCURRENTALPHA(CURRENT, 黑纹理)`
+///   再乘当前 alpha ⇒ `T·A·C.a`;
+/// - `MODE 3/7`:stage1 `BLENDCURRENTALPHA` 白纹理/TFACTOR 再混一次
+///   `T·A·C.a + (1 − C.a)`;
 /// - `shader_stage`(psC/psD)由像素着色器直接给出源色,不再归约。
 ///
 /// 单独成函数是因为交叉检查测试(`blend_pixel_matches_generic_d3d9_equation`)
@@ -2727,10 +2729,20 @@ fn stage_reduce(
     // 归约到官方固定管线实际执行的模式(4/8/10..18 官方无 case ⇒ 通常路径)。
     match mode.engine_effective() {
         BlendMode::Normal | BlendMode::Add => (tex(0), tex(1), tex(2)),
+        // `スクリーン`(MODE 5)官方链:stage0 `MOD(TEXTURE, DIFFUSE)` 且
+        // DIFFUSE 四通道都填层 alpha A ⇒ `T·A`;stage0 alpha 同为
+        // `MOD(TEXTURE, DIFFUSE)` ⇒ `T.a·A`;stage1 `BLENDCURRENTALPHA
+        // (CURRENT, BLACKTEXBUF)` 再乘当前 alpha。故源 RGB
+        // = `T·A·(T.a·A)`。少乘一个 A 会在层淡出时偏亮。
+        // 素材侧:光照/flare 面是「RGB=白、alpha=形状」,不乘 stage1 的
+        // 当前 alpha 会把整块白色矩形 screen 上屏(<v500-relirium> 车窗外
+        // 白块:SPL2101 的 `フレア_アマツチ2`)。证据:0.495
+        // `FUN_00414ba4` MODE 5 分支 + `FUN_00462e40` 的 BLACKTEXBUF。
+        BlendMode::Screen => (tex(0) * a * layer, tex(1) * a * layer, tex(2) * a * layer),
         BlendMode::Multiply | BlendMode::Darken => (
-            tex(0) * layer + (1.0 - a),
-            tex(1) * layer + (1.0 - a),
-            tex(2) * layer + (1.0 - a),
+            tex(0) * layer * a + (1.0 - a),
+            tex(1) * layer * a + (1.0 - a),
+            tex(2) * layer * a + (1.0 - a),
         ),
         _ => (tex(0) * layer, tex(1) * layer, tex(2) * layer),
     }
@@ -2928,9 +2940,35 @@ mod tests {
     }
 
     #[test]
-    fn blend_multiply_uses_stage1_white_mix_for_partial_alpha() {
-        // A=128:stage1 白混 = T·A + (1−C.a) ≈ 0.89;
-        // blend = dst·stage/255 ≈ 89(向白色中性点淡化,不是变黑)。
+    fn blend_screen_uses_stage1_current_alpha_for_source_rgb() {
+        // 官方 MODE 5:stage0 = T·A,stage1 BLENDCURRENTALPHA(CURRENT,
+        // BLACKTEXBUF) 再乘 C.a(= 纹理 alpha × 层 A)⇒ 源 RGB = T·A·C.a。
+        // 光照/flare 素材是「RGB=白、alpha=形状」的面,不乘 C.a 会把整块
+        // 白矩形刷上屏(<v500-relirium> 车窗外白块)。
+        let dst = [100, 150, 200, 255];
+        assert_eq!(
+            blend_pixel(dst, [255, 255, 255, 0], 255, 0, BlendMode::Screen),
+            dst,
+            "纹理 alpha=0 的光照面不得改变屏幕"
+        );
+        // 层 A=255、纹理 alpha=128:源 RGB = 255·1·(128/255) = 128。
+        assert_eq!(
+            blend_pixel(dst, [255, 255, 255, 128], 255, 128, BlendMode::Screen),
+            [178, 203, 228, 255]
+        );
+        // 层 A=128、纹理 alpha=255:源 RGB = 255·(128/255)·(128/255) ≈ 64,
+        // 不是只乘一次 C.a 的 128。
+        assert_eq!(
+            blend_pixel([0, 0, 0, 0], [255, 255, 255, 255], 128, 128, BlendMode::Screen),
+            [64, 64, 64, 128]
+        );
+    }
+
+    #[test]
+    fn blend_multiply_uses_stage1_current_alpha_for_white_mix() {
+        // A=128:stage0 = T·A,stage1 = stage0·C.a + 白·(1−C.a)
+        // = 200·0.502·0.502 + 0.498 ≈ 0.696;blend = dst·stage ≈ 69。
+        // 少乘 C.a 会得到 0.892(旧行为,偏亮)。
         assert_eq!(
             blend_pixel(
                 [100, 100, 100, 255],
@@ -2939,7 +2977,7 @@ mod tests {
                 128,
                 BlendMode::Multiply
             ),
-            [89, 89, 89, 128]
+            [69, 69, 69, 128]
         );
     }
 

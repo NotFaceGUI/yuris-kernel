@@ -2,9 +2,12 @@
 //
 // SRC_MODE(管线常量,见 `yu_gfx::BlendMode` 的固定管线状态表):
 //   0 = MODE 0/1:stage0 SEL1(TEXTURE) => 源色 T
-//   1 = MODE 2/5/6/9:stage0 MOD(D,T) => T*A(A = 顶点 DIFFUSE 灰度)
+//   1 = MODE 2/6/9:stage0 MOD(D,T) => T*A(A = 顶点 DIFFUSE 灰度)
 //   2 = MODE 3/7:stage1 BLENDCURRENTALPHA + 白纹理/白 TFACTOR
-//       => T*A + (1 - C.a)
+//       => T*A*C.a + (1 - C.a)
+//   3 = MODE 5 スクリーン:stage0 是 T*层A,stage1 BLENDCURRENTALPHA
+//       (CURRENT, BLACKTEXBUF) 再乘当前 alpha(纹理 alpha × 层 A)
+//       ⇒ T*(层A)^2*(纹理 alpha)。光照/flare 面用。
 //
 // alpha 链与软后端逐位一致:texel8 = round(a*255),
 // src8 = round(texel8*layer8/255)。SRC_MODE=0 时 RGB 保持未量化的采样值,
@@ -46,10 +49,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(texel.rgb, frag);
     }
     var stage8 = texel.rgb;
-    if (SRC_MODE == 1u) {
+    if (SRC_MODE == 3u) {
+        // スクリーン:stage0 = T*层A,stage1 的 BLENDCURRENTALPHA 再乘
+        // 片元 alpha(纹理 α × 层 A),故再补一个层 A 因子。
+        // 光照/flare 素材是「RGB=白、alpha=形状」,只乘一次会把整块白
+        // 矩形 screen 到屏幕。
+        stage8 = round(texel.rgb * src8 * layer8 / 255.0);
+    } else if (SRC_MODE == 1u) {
         stage8 = round(texel.rgb * layer8);
     } else {
-        stage8 = round(texel.rgb * layer8 + (1.0 - frag) * 255.0);
+        stage8 = round(texel.rgb * layer8 * src8 / 255.0 + (1.0 - frag) * 255.0);
     }
     return vec4<f32>(stage8 / 255.0, frag);
 }
