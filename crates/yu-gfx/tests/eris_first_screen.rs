@@ -176,17 +176,22 @@ fn eris_first_screen_display_list() {
     // 不可见 264 → 192。绘制 op 总数仍为 85(texture 80 = 69 copy + 11
     // image)、屏幕 pass 仍 4 op ⇒ 被删的 73 层没有任何绘制贡献,像素不变。
     // 其中唯一消失的“可见”层是零尺寸空壳,不产生 op。
+    //
+    // bb784df 追加(DIV-GFX-098):快照按命令时刻物化后,`:/W0/CGS100` 在
+    // copy1/copy3 两个命令点各产生一条 `:/W0` 组拷贝(修前只保留 1 条),
+    // texture passes 80 → 81、total ops 85 → 86、passes 82 → 83;
+    // 两条拷贝源同为 `:/W0`,像素路径不变。
     assert_eq!(f.layers.len(), 199, "layers");
     assert_eq!(f.layers.iter().filter(|l| l.visible).count(), 7, "visible");
-    assert_eq!(f.passes.len(), 82, "passes");
+    assert_eq!(f.passes.len(), 83, "passes");
     let total_ops: usize = f.passes.iter().map(|p| p.ops.len()).sum();
-    assert_eq!(total_ops, 85, "total ops");
+    assert_eq!(total_ops, 86, "total ops");
     let texture_passes = f
         .passes
         .iter()
         .filter(|p| matches!(p.target, yu_gfx::PassTarget::Texture(_)))
         .count();
-    assert_eq!(texture_passes, 80, "texture passes");
+    assert_eq!(texture_passes, 81, "texture passes");
     let ops_of = |target: &str| {
         f.passes
             .iter()
@@ -368,7 +373,8 @@ fn eris_first_screen_with_synchronous_info_queries() {
     let (layers, visible, passes, tex_passes, total_ops) = if debug_mode {
         (226, 17, 93, 90, 104)
     } else {
-        (199, 7, 82, 80, 85)
+        // bb784df DIV-GFX-098:`CGS100` 多一条命令时刻组拷贝(见 golden 注释)。
+        (199, 7, 83, 81, 86)
     };
     assert_eq!(f.layers.len(), layers, "layers");
     assert_eq!(
@@ -376,11 +382,12 @@ fn eris_first_screen_with_synchronous_info_queries() {
         visible,
         "visible"
     );
-    // 1 屏 + 组离屏 + 纹理 pass(69 copy + 11 image = false;debug 另有调试窗)。
+    // 1 屏 + 组离屏 + 纹理 pass(70 copy + 11 image = false;debug 另有调试窗)。
     //
-    // false 模式 69 条 copy = 1 条主组 `CGS100` + 68 条按钮状态快照;后者的源
-    // `BT.OFF.TMP` 在同一帧末尾被 `CGEND` 删除,靠 `CopyOp.source_texture`
-    // 在命令时刻捕获(DIV-GFX-053)。旧实现在这里丢掉了 68 条。
+    // false 模式 70 条 copy = 2 条主组 `CGS100`(copy1/copy3 两个命令时刻,
+    // DIV-GFX-098)+ 68 条按钮状态快照;后者的源 `BT.OFF.TMP` 在同一帧末尾
+    // 被 `CGEND` 删除,靠 `CopyOp.source_texture` 在命令时刻捕获(DIV-GFX-053)。
+    // 旧实现在这里丢掉了 68 条。
     assert_eq!(f.passes.len(), passes, "passes");
     let texture_passes = f
         .passes
