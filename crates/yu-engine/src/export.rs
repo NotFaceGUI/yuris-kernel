@@ -2278,6 +2278,10 @@ mod tests {
             TextCodecChoice::parse("gbk").unwrap(),
             TextCodecChoice::Fixed(yu_format::Codec::Gbk)
         );
-        assert!(TextCodecChoice::parse("utf8").is_err());
+        // 6441e43 新增 UTF-8 本地化路线后 `utf8` 是合法取值。
+        assert_eq!(
+            TextCodecChoice::parse("utf8").unwrap(),
+            TextCodecChoice::Fixed(yu_format::Codec::Utf8)
+        );
     }
 }
