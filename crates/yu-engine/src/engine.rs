@@ -3356,6 +3356,14 @@ fn boot(project: &Project, opts: &EngineOptions) -> CliResult<BootBundle> {
         // 路径类系统变量由宿主注入(手册 `basic/svariable.html`)。
         // 缺失会让 `es_First.yst` 的 `$_SAVE_PATH` 走 Unimplemented(DIV-RT-010)。
         paths: host_paths(&save_root, &opts.path_overrides),
+        // 同一组根的**真实**路径:`paths` 是它们的 CP932 投影(不可表示
+        // 字符已是 `?`),文件系统查询(FILEINFO[EXIST]/[SIZE]/[FOLDER])
+        // 必须以真实路径为准,否则含中文/韩文的根恒判不存在。
+        save_root: Some(save_root.clone()),
+        system_root: Some(crate::host_paths::resolve_system_root(
+            &save_root,
+            &opts.path_overrides,
+        )),
         // `@_SAVE_PATH_TYPE`:游戏根 `yssfs.dat` 偏移 0x54(官方 0.495
         // `FUN_00460c80` 读 `<app>\yssfs.dat`,CRT fread 明文,只接受 0..=3)。
         // 文件缺失/全零 ⇒ 0,与官方等价。

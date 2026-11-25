@@ -564,31 +564,37 @@ impl Vm {
         false
     }
 
+    /// 脚本路径 → save 根下的**真实**宿主路径。
+    ///
+    /// 前缀按**字节**比对:两边是同一份 CP932 投影(含 `?` 也一致),所以
+    /// 不能把投影解码成 `String` 再比(`from_utf8_lossy` 会把 CP932 的
+    /// 非 ASCII 换成 `U+FFFD`,前缀永不匹配)。相对部分按脚本编码解码后
+    /// 接到真实 save 根上 —— 即 `FILE=$_SAVE_PATH+名` 的唯一解释。
+    ///
+    /// `self.save_root` 未注入时退回「投影解码后直接用」:仅当投影无损
+    /// (路径全在 CP932 内)才成立;含 CP932 外字符的根必须由宿主给真实根。
+    fn save_root_path(&self, path: &[u8]) -> Option<std::path::PathBuf> {
+        let prefix = self.paths.save_path.as_deref()?;
+        let rel = path.strip_prefix(prefix)?;
+        if rel.is_empty() {
+            return None;
+        }
+        let text = self.script_codec.decode(rel, rel).ok()?;
+        if text.contains('\\') || text.split('/').any(|c| c == "..") {
+            return None;
+        }
+        let root = match self.save_root.as_deref() {
+            Some(root) => root.to_path_buf(),
+            None => std::path::PathBuf::from(self.script_codec.decode(prefix, prefix).ok()?),
+        };
+        Some(root.join(text))
+    }
+
     /// save 根文件系统存在性(FILEINFO 的散盘支):路径以注入的
     /// `$_SAVE_PATH` 为前缀时,剥出相对名做越界检查后查文件系统。
-    /// 注入值 = save 根的显示字符串(正斜杠、尾 `/`,`yu-cli::host_paths`)。
+    /// 注入值 = save 根的 CP932 投影(正斜杠、尾 `/`,`yu-engine::host_paths`)。
     pub(super) fn save_root_fs_exists(&self, path: &[u8]) -> bool {
-        let Some(root) = self
-            .paths
-            .save_path
-            .as_ref()
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-        else {
-            return false;
-        };
-        let Some(rel) = path.strip_prefix(root.as_bytes()) else {
-            return false;
-        };
-        if rel.is_empty() {
-            return false;
-        }
-        let Ok(text) = std::str::from_utf8(rel) else {
-            return false;
-        };
-        if text.contains('\\') || text.split('/').any(|c| c == "..") {
-            return false;
-        }
-        std::path::Path::new(&root).join(text).exists()
+        self.save_root_path(path).is_some_and(|p| p.exists())
     }
 
     /// 把 `FILE=` 的脚本路径解析成宿主文件系统路径(`SIZE`/`RELATION` 用)。
@@ -597,20 +603,7 @@ impl Vm {
     /// 名;其余按封包外相对路径不解析(引擎对封包内文件同样查不到大小,
     /// 手册 `file/fileinfo.html` 例 3 注)。返回 `None` = 不可解析。
     pub(super) fn resolve_file_path(&self, path: &[u8]) -> Option<std::path::PathBuf> {
-        let root = self
-            .paths
-            .save_path
-            .as_ref()
-            .map(|b| String::from_utf8_lossy(b).into_owned())?;
-        let rel = path.strip_prefix(root.as_bytes())?;
-        if rel.is_empty() {
-            return None;
-        }
-        let text = std::str::from_utf8(rel).ok()?;
-        if text.contains('\\') || text.split('/').any(|c| c == "..") {
-            return None;
-        }
-        Some(std::path::Path::new(&root).join(text))
+        self.save_root_path(path)
     }
 
     /// `FILEINFO[FOLDER EXIST]` 的散盘目录检查(REA `0x4433d6`
@@ -633,17 +626,22 @@ impl Vm {
         if candidate.is_absolute() {
             return candidate.is_dir();
         }
-        let Some(root) = self
-            .paths
-            .system_path
-            .as_ref()
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-        else {
-            return false;
+        // 相对路径 = 相对工程根(CWD)。`$_SYSTEM_PATH` 是 CP932 投影,
+        // 真实根由宿主注入;未注入时才退回「投影按脚本编码解码」
+        // (同一处 `from_utf8_lossy` 坑,见 `save_root_path`)。
+        let root = match self.system_root.as_deref() {
+            Some(root) => root.to_path_buf(),
+            None => {
+                let Some(prefix) = self.paths.system_path.as_deref() else {
+                    return false;
+                };
+                let Ok(decoded) = self.script_codec.decode(prefix, prefix) else {
+                    return false;
+                };
+                std::path::PathBuf::from(decoded)
+            }
         };
-        std::path::Path::new(&root)
-            .join(text.trim_start_matches('/'))
-            .is_dir()
+        root.join(text.trim_start_matches('/')).is_dir()
     }
 
     /// 文件关联 exe 全名(`FILEINFO[RELATION]`;REA `0x442a48`

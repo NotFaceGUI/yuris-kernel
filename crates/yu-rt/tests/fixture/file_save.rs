@@ -1798,6 +1798,93 @@ fn fileinfo_fs_fallback_checks_save_root() {
     );
 }
 
+/// `$_SAVE_PATH` 是 CP932 **投影**:根含 CP932 外字符时投影里已是 `?`。
+///
+/// 回归(2026-11-25 起):旧实现把注入字节 `from_utf8_lossy` 反解成 `String`
+/// 再当真实路径查盘 —— CP932 字节不是合法 UTF-8,反解后前缀**永不匹配**,
+/// `FILEINFO[EXIST]` 对存档恒 0(存档界面槽列表全空、槽位全 `New!`、槽号
+/// 恒默认值 ⇒ `save%05d` 恒 `save00001.sd`)。
+///
+/// 正确口径:前缀按**字节**比(两边是同一份投影,`?` 也一致),相对名按
+/// 脚本编码解码后接回宿主注入的**真实**根。
+#[test]
+fn fileinfo_fs_fallback_survives_cp932_projected_save_root() {
+    use yu_format::Codec as FmtCodec;
+    use yu_rt::vm::HostPaths;
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/tmp/fixture-fsinfo-cp932/选举");
+    std::fs::create_dir_all(&dir).expect("建目录");
+    std::fs::write(dir.join("t.sd"), b"YSSD-dummy").expect("写槽文件");
+
+    // 宿主注入值 = 真实根(正斜杠、尾 `/`)按 CP932 **宽松**编码:
+    // 不可表示字符按 Windows ANSI 口径写 `?`(`host_paths::script_text_bytes`)。
+    let real = format!("{}/", dir.to_string_lossy().replace('\\', "/"));
+    let injected = FmtCodec::Cp932.encode_lossy(&real, b"test-save-root");
+    let projected = FmtCodec::Cp932
+        .decode(&injected, b"test-save-root")
+        .expect("投影解码");
+    assert!(projected.contains('?'), "前置:根必须含 CP932 外字符");
+    assert_ne!(projected, real, "前置:投影必须与真实根不同");
+
+    // 脚本侧路径 = 注入前缀 + 名(脚本字符串就是这些字节)。
+    let mut script_path = injected.clone();
+    script_path.extend_from_slice(b"t.sd");
+
+    let boot_with = |save_root: Option<std::path::PathBuf>| {
+        let mut b = ProjectBuilder::new();
+        let sys = b.sysvars.len() as u16;
+        b.vars = vec![VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(-1),
+        }];
+        let op_fileinfo = b
+            .commands
+            .iter()
+            .position(|(n, _)| *n == "FILEINFO")
+            .unwrap() as u8;
+        b.scripts = vec![vec![
+            GroupSpec::new(op_fileinfo)
+                .window(0, ex::sb(&script_path))
+                .window(4, ex::i8_(1))
+                .window(7, ex::r#ref(0x40, sys)),
+            GroupSpec::new(OP_END),
+        ]];
+        b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+        b.entry(0, 0);
+        let cfg = BootConfig {
+            paths: HostPaths {
+                save_path: Some(injected.clone()),
+                ..HostPaths::default()
+            },
+            save_root,
+            ..BootConfig::default()
+        };
+        let mut vm = Vm::boot(Box::new(b.build()), cfg).expect("boot");
+        let report = vm.tick_at(0, &no_input());
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let value = vm
+            .store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap();
+        match value {
+            Value::Int(v) => v,
+            other => panic!("EXIST 结果应为整数,实际 {other:?}"),
+        }
+    };
+
+    // 未注入真实根:投影含 `?`,无法还原真实路径 ⇒ 判不存在
+    // (这正是宿主必须同时注入真实根的证明)。
+    assert_eq!(boot_with(None), 0, "只有投影时不可还原,应为不存在");
+    // 注入真实根:前缀字节匹配,相对名接回真实根 ⇒ 存在。
+    assert_eq!(boot_with(Some(dir.clone())), 1, "真实根注入后必须命中");
+}
+
 
 /// `SAVE[MEM=99999]`:官方独立分支(`0x44b874` → `FUN_0044d7a8`)把
 /// 0..499 号内存槽打包到 `DAT_0086a03c`;不是普通槽 99999,也不刷文件。

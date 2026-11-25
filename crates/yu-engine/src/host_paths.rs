@@ -140,6 +140,23 @@ fn script_text_bytes(text: &str) -> Vec<u8> {
     out
 }
 
+/// `$_SYSTEM_PATH` 对应的**真实**宿主目录(工程根)。
+///
+/// 与 [`resolve_host_paths`] 同一口径(宿主覆盖 > 存档根的父目录)。
+/// 脚本侧看到的是它的 CP932 投影,文件系统查询要用这个真实路径。
+pub fn resolve_system_root(save_root: &Path, overrides: &HostPathOverrides) -> PathBuf {
+    overrides
+        .system_path
+        .clone()
+        .unwrap_or_else(|| {
+            save_root
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(save_root)
+                .to_path_buf()
+        })
+}
+
 /// 构造 `host_paths` 的最终值。
 ///
 /// 优先级:宿主显式覆盖 > 平台默认 > 由存档根推导。`$_SAVE_PATH` 恒为
@@ -149,12 +166,7 @@ pub fn resolve_host_paths(
     overrides: &HostPathOverrides,
     platform: &PlatformHome,
 ) -> yu_rt::vm::HostPaths {
-    let system_root = overrides.system_path.as_deref().unwrap_or_else(|| {
-        save_root
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(save_root)
-    });
+    let system_root = resolve_system_root(save_root, overrides);
     let appdata = overrides
         .appdata_path
         .clone()
@@ -164,7 +176,7 @@ pub fn resolve_host_paths(
         .clone()
         .or_else(|| platform.documents.clone());
     yu_rt::vm::HostPaths {
-        system_path: Some(script_dir(system_root)),
+        system_path: Some(script_dir(&system_root)),
         save_path: Some(script_dir(save_root)),
         appdata_path: appdata.as_deref().map(script_dir),
         personal_path: personal.as_deref().map(script_dir),

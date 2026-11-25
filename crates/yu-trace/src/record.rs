@@ -677,6 +677,11 @@ impl BootSummary {
             // 磁盘剩余空间是宿主事实,不进 trace 头;回放按未注入处理
             // (PRODUCT[COM=34] 写 0,与“录制时宿主未提供”同型)。
             disk_free_bytes: None,
+            // 真实存档根/工程根不进 trace 头(只记它们的 CP932 投影 `paths`);
+            // 回放时 `FILEINFO` 的散盘支退回「投影解码后直接用」——仅当路径
+            // 全在 CP932 内与录制时等价,含 CP932 外字符的根无法回放该判定。
+            save_root: None,
+            system_root: None,
             rng_seed: self.host.rng_seed,
             record_events: true,
             // trace 回放固定原版编码;补丁语料需要显式携带 profile 的回放,

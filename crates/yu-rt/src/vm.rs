@@ -146,6 +146,19 @@ pub struct BootConfig {
     pub screen_color: u32,
     /// 路径类系统变量(宿主注入;None = 未注入 ⇒ `Unimplemented`)。
     pub paths: HostPaths,
+    /// 存档根的**真实**宿主路径(`paths.save_path` 是它的 CP932 投影)。
+    ///
+    /// 脚本字符串是 CP932 字节:含 CP932 外字符(如简体中文)的根在投影里
+    /// 已是 `?`,而 `from_utf8_lossy` 解 CP932 字节还会把非 ASCII 换成
+    /// `U+FFFD` —— 拿投影当真实路径查盘,`FILEINFO[EXIST]` 对存档恒 0
+    /// (存档界面槽列表全空/全部 `New!`,槽号恒默认值)。
+    ///
+    /// `None` = 宿主未给:退回「投影按脚本编码解码后直接用」(仅当投影无损,
+    /// 即路径全在 CP932 内时成立);含 CP932 外字符必须由宿主给真实根。
+    pub save_root: Option<std::path::PathBuf>,
+    /// 工程根的真实宿主路径(`paths.system_path` 的投影对应物;
+    /// `FILEINFO[FOLDER EXIST]` 的相对路径基准)。`None` 语义同 [`Self::save_root`]。
+    pub system_root: Option<std::path::PathBuf>,
     /// `@_MEDIA_READONLY`(手册:`読み込み専用メディア…起動した場合に１`)。
     ///
     /// 宿主判定:数据盘/存档盘是否可写。内核自己从不写游戏数据(A2),
@@ -221,6 +234,8 @@ impl Default for BootConfig {
             argv: Vec::new(),
             screen_color: 32,
             paths: HostPaths::default(),
+            save_root: None,
+            system_root: None,
             media_readonly: false,
             os_sound: true,
             dx_mode: 0,
@@ -587,6 +602,9 @@ pub struct Vm {
     argv: Vec<Vec<u8>>,
     screen_color: u32,
     paths: HostPaths,
+    /// 存档根 / 工程根的真实宿主路径(`paths` 是它们的脚本投影)。
+    save_root: Option<std::path::PathBuf>,
+    system_root: Option<std::path::PathBuf>,
     media_readonly: bool,
     os_sound: bool,
     dx_mode: u32,
@@ -928,6 +946,8 @@ impl Vm {
             argv: cfg.argv,
             screen_color: cfg.screen_color,
             paths: cfg.paths,
+            save_root: cfg.save_root,
+            system_root: cfg.system_root,
             media_readonly: cfg.media_readonly,
             os_sound: cfg.os_sound,
             dx_mode: cfg.dx_mode,
