@@ -116,7 +116,7 @@ impl Vm {
         ));
         match com {
             // 0x01/0x02/0x03:**0.500 新增分支**(不是 v555 形态)。
-            // 证据:<v500-relirium> `Relirium.exe` PRODUCT 处理体
+            // 证据:<v500-relirium> PRODUCT 处理体
             // `0x488b20`,以 LET 指向的数组元素为目标:
             // - COM=1:写 `0x1F6`(INT)/`502.0`(FLT);
             // - COM=2:走错误消息路径(`FUN_004399ec`,`&DAT_0089a9a0`);

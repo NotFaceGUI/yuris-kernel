@@ -199,7 +199,7 @@ mod tests {
     /// `迪ｫ蠢阪…`(UTF-8 被当 CP932),路径永远对不上 save 根。
     #[test]
     fn non_ascii_save_root_is_injected_as_cp932() {
-        let root = Path::new("D:/games/猫忍テスト/save");
+        let root = Path::new("D:/games/サンプル/save");
         let paths = resolve_host_paths(
             root,
             &HostPathOverrides::default(),
@@ -209,7 +209,7 @@ mod tests {
         let decoded = yu_format::Codec::Cp932
             .decode(&bytes, b"test")
             .expect("注入字节必须是合法 CP932");
-        assert_eq!(decoded, "D:/games/猫忍テスト/save/");
+        assert_eq!(decoded, "D:/games/サンプル/save/");
         // 不能是 UTF-8:日文部分会解成另一串字符。
         assert_ne!(bytes, decoded.as_bytes());
     }

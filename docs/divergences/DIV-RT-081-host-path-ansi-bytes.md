@@ -19,7 +19,7 @@
 ## 内核行为
 
 `host_paths::script_dir` 旧实现 `String::into_bytes()`(UTF-8)直接注入。
-含日文的存档根(例:`D:/games/猫忍テスト/save/`)的 UTF-8 字节被脚本/
+含日文的存档根(例:`D:/games/<game-c>/save/`)的 UTF-8 字节被脚本/
 存档层按 CP932 解码,得到 `迪ｫ蠢阪∴縺上☆縺ｯ繝ｼ縺ｨ…` 一类乱码,与真实
 save 根不相等,
 `sv.path.escape` 拒绝写入。

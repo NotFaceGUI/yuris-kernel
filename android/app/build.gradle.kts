@@ -162,7 +162,7 @@ kotlin {
 
 // 配置期打印一次签名来源,构建日志里能直接看出这个 APK 是不是正式签的。
 if (hasReleaseSigning) {
-    logger.lifecycle("APK 签名: release keystore ($releaseKeystoreFile, alias=$releaseKeyAlias)")
+    logger.lifecycle("APK 签名: release keystore(路径与别名不打印)")
 } else {
     logger.lifecycle("APK 签名: debug(本地调试用,不可用于分发)")
 }

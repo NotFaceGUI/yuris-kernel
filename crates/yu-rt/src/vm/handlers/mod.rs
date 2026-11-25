@@ -418,7 +418,7 @@ pub fn build_handler_table(
         // 0.500 分发表实测:这四条在 0.500 是 29 字节空桩(仅调参数求值器
         // 后 `return 0`),v555 才是真实处理体。商业族共用 v555 清单时
         // 必须按 0.500 的分发表覆盖回来。
-        // 证据:0.500 `Relirium.exe` 分发表 0x492d90;MOVIE2/MOVIE2END/
+        // 证据:0.500 `<v500-relirium>` 分发表 0x492d90;MOVIE2/MOVIE2END/
         // MOVIE2INFO/REGINFO = 0x47ac94/0x47acb4/0x47acd4/0x47ad14,
         // 反编译均为 `FUN_0045688d(); return 0;`(29B)。
         if v500 && matches!(name, "MOVIE2" | "MOVIE2END" | "MOVIE2INFO" | "REGINFO") {

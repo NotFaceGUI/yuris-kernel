@@ -11,7 +11,7 @@
 `<v500-relirium>` 启动后标题/按钮层全部 `asset.missing`(改前 190 条),
 `textures: decoded=0`。资产在 `pac/cgsys.ypf` 里实际存在,扩展名是 `.ydg`。
 
-## 2. 容器布局(0.500 `Relirium.exe` 实测)
+## 2. 容器布局(<v500-relirium> 实测)
 
 ```text
 +0x00 char[4] "YDG\0"

@@ -116,7 +116,7 @@ android {
 }
 
 if (hasReleaseSigning) {
-    logger.lifecycle("运行时模块签名: release keystore ($releaseKeystoreFile, alias=$releaseKeyAlias)")
+    logger.lifecycle("运行时模块签名: release keystore(路径与别名不打印)")
 } else {
     logger.lifecycle("运行时模块签名: debug(本地调试用,不可用于分发)")
 }

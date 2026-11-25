@@ -246,7 +246,7 @@ impl ImageFormat {
     /// 0.500 商业分支的扩展码表(`1=bmp / 2=png / 3=jpg / 4=gif /
     /// 5=ydg / 6=webp / 7=jxl / 8=qoi / 9=avif`)。
     ///
-    /// 证据:0.500 `Relirium.exe` `FUN_0046fb18`,分支常量 1..9 与
+    /// 证据:0.500 `<v500-relirium>` `FUN_0046fb18`,分支常量 1..9 与
     /// `_RDATA` 扩展名串逐项对应;`yscfg` 的 8 字节为
     /// `05 01 02 06 07 08 09 03`(ydg→bmp→png→webp→jxl→qoi→avif→jpg)。
     pub fn from_code_v500(code: u8) -> Self {

@@ -22,7 +22,7 @@ gfx.info.unsupported x2822 / gfx.info.missing x1642 (CGINFO[LINT2])
 ## 2. 为什么 0.500 归入 555 族(证据)
 
 `ysc.ybn` 两者均 121 槽、11102B;除版本字段与 `GRADATION` kind 外逐字节
-相同(2026-11-22 普查)。本轮对 0.500 `Relirium.exe`(ProductVersion
+相同(2026-11-22 普查)。本轮对 <v500-relirium>(ProductVersion
 `0,500,0,0`)做处理体对拍:
 
 | 命令 | 0.500 处理体 | 与 v555 对比 |
