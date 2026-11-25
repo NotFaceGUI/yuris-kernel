@@ -18093,3 +18093,100 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   影片/存档)并更新 5xx 现状。
 - **台账**:`DIV-SND-006`(新)、`docs/sound-ledger.md` 0-12、
   `DIV-GFX-094` 残余改为已支持。
+
+## 成果 PERF-V555-A (2026-11-25) · v555 热路径第一批零风险优化
+
+- **背景**:审计报告 `docs/perf-audit-2026-11-25.md`。v555 正文按钮宏每帧
+  25–43 万条 VM 命令,单 tick 50–93ms;菜单开关帧 `CGINFO`/`CGEND` 各
+  ~1400 次。本批只做**不改变任何外部语义**的项。
+- **改动**:
+  - `yu-render/wgpu`:`YU_OP_TRACE`(每 op)、`YU_PASS_TRACE`(每 pass/copy)
+    改为 `OnceLock`(`passes.rs::op_trace`、`plan.rs::pass_trace`)。
+  - `yu-gfx`:`YU_CG_FILE_TRACE` 改 `OnceLock`;`YU_GLYPH_TRACE` 诊断从
+    “注释说开关、代码无条件”改为真门控,并去掉 `push_text_draw` 前的
+    `draw.clone()`。
+  - `yu-gfx::frame()`:`screen_snapshots` 为空时不再每帧建 `emitted` 集合与
+    `by_id` HashMap。
+  - `yu-gfx::drop_ops_for`:`screen_snapshots` 的 `layer_ids` 并集按代次缓存
+    (`snapshot_layers_rev` + `RefCell<Rc<HashSet<LayerId>>>`),不再每次
+    `CGEND` 重建。
+  - `yu-rt::op_info`:`record_events=false` 时不再为 `CGINFO`/`FONTINFO`
+    构造 owned 事件参数、不再 `emit_domain`(桌面宿主本就丢弃该事件)。
+- **验证**:
+  - `cargo test -p yu-rt -p yu-gfx -p yu-backend-wgpu`(带
+    `YURIS_SAMPLE_ERIS_YSBIN`/`YURIS_SAMPLE_ERIS_ROOT`)→ 全部 `ok`,
+    0 failed(含 consistency/parity 用例)。
+  - `<v555-1>` 正文定时点击 1500 帧(release,`--frame-stats`):
+    | 指标 | 改前 | 改后 |
+    |---|---:|---:|
+    | avg fps | 56.0–54.5 | **57.4** |
+    | tick p50 | 1.435ms | **0.968ms** |
+    | tick p99 | 44.68ms | **27.30ms** |
+    | work ≥20ms 帧 | 34 | **20** |
+    | `--spike-log` 条数 | 39 | **23** |
+  - 逐命令采样:同帧 GOSUB 单价 0.441µs → **0.258µs**(hits=3780)。
+  - `<project-eris>` 600 帧回归:59.9fps,p50 16.62ms,p95 17.06ms,
+    与改前 59.9fps/16.68ms 持平。
+- **说明**:实测时工作树还含主人的 `YU_SP_TRACE` 取证块(本地已惰性化),
+  该块**不在本次提交范围**;推送代码不含该取证块及其查询开销,性能不劣于
+  表中数值。工作树里的 `yu-engine/src/engine.rs`、`yu-rt/src/expr.rs` 等
+  并行改动也未随本提交推送。
+- **残余**:最大长帧仍由按钮宏的 LET/IF 原始命令量主导(单 tick 25–43 万条),
+  及菜单帧 `CGINFO` 5.9µs ×1360、`CGEND` 3.5µs ×1401;列入第二批
+  (文本字形页 `Rc`、INFO/CGEND 路径深挖、StoreSampler 预算等)。
+- **说明**:工作树同时含主人并行改动(`yu-engine/src/engine.rs`、
+  `yu-rt/src/expr.rs`、`yu-format/src/codec/mod.rs` 等),本成果只覆盖上述
+  性能文件;未做任何 git 写操作。
+
+## 成果 PERF-V555-B (2026-11-25) · GOSUB/RETURN 去分配与转场 mask 缓存
+
+- **背景**:第一批后剩余热点。v555 按钮/逐字宏单帧 2.4 万对 GOSUB/RETURN,
+  每次调用有固定初始化/分配;过渡层 `transition_mask_transform` 每层全扫
+  `image_log`,而相邻 `mask_base` 已有帧内缓存。
+- **改动**(全部同语义):
+  - `yu-rt/src/other/gosub.rs`:GOSUB/RETURN 的任务名从
+    `current_task().to_string()` 改为借用 `&self.cur_task` 查 `BTreeMap`,
+    仅首次插入 clone;`other_op_return` 不再建整帧 `GosubFrame`(含 3×16 个
+    未使用参数槽),只建 `ret_int/flt/str + flags` 四个数组。
+    `cur_task` 提为 `pub(crate)` 以支持字段级分离借用。
+  - `yu-gfx/src/state.rs`:`ProbeCache` 新增 `mask_transform` 记忆,
+    `transition_mask_transform` 改为帧内一次(`mask_base` 同型)。
+  - `yu-rt/src/vm/handlers/media_info.rs`:`op_info` 的 `targets`/`query_args`
+    改内联 `SmallVec`(单 LET 目标 + ≤8 参数不落堆)。
+- **验证**:
+  - `cargo test -p yu-rt -p yu-gfx`(带样本环境变量)→ 全部 `ok`,0 failed。
+  - `<v555-1>` 正文定时点击 1500 帧(release)三轮:
+    57.4 / 57.3 / 57.3 fps,长帧 23 / 22 / 25 条,tick p50 0.915–1.823ms。
+    与第一批 57.4fps 持平(机器噪声内),无回归;p50 最低一档优于改前
+    (1.435ms)。
+  - 临时探针 `YU_CGEND_TRACE` 分段结果:菜单帧 `CGEND` 的 **gfx 侧**
+    仅 ~1.0µs/次(解析 0.05µs、幂等诊断 0.6µs;真删除全程 <500 次),
+    而 `--profile-commands` 报的 4–6µs 主要在 VM 参数求值/事件路径。
+    因此本批不做 `drop_ops_for` 批量化(收益低、风险高);临时探针已删除。
+- **残余**:`CGINFO`/`CGEND` 的 VM 侧单价、文本字形页整页深拷贝、
+  `image_log` 长会话扫描;`StoreSampler` 预算与声音锁毒化仍未做。
+
+## 成果 PERF-TEXT-RC (2026-11-25) · 图像字形页纹理共享
+
+- **改动**(像素零变化):
+  - `yu-render-core::TextComposer` 的 `images` 参数从
+    `BTreeMap<Vec<u8>, Texture>` 改为 `BTreeMap<Vec<u8>, Rc<Texture>>`;
+    `paint_image` 按 `Rc` 解引用读取,像素路径逐字不变。
+  - wgpu/soft 的 `text_images_for_draws` 改用
+    `TextureStore::resolve_shared`,不再每次文本变化把整张字形页
+    (v555/0.500 预制页可达 1024²=4MB)深拷贝一份。
+- **验证**:
+  - `cargo check -p yu-render-core -p yu-backend-wgpu -p yu-backend-soft`
+    → ok;
+  - `cargo test -p yu-render-core -p yu-backend-soft -p yu-backend-wgpu --lib`
+    → 70 / 16 / 31 passed, 0 failed(含 `image_glyph_paints_and_tints`、
+    缺图重试、合成缓存用例)。
+- **阻塞**:工作树同时被外部编辑改动 `yu-engine/src/engine.rs`(当前
+  `E0609: no field image_log on type &Engine`),全工作区 release
+  构建/整机复测暂不可用;本成果只覆盖上述渲染 crate。
+- **未完成(留档)**:`<v555-kuro>` 正文为**图像像素**(`text_draws`
+  为空、`rep(draws=0)` 但屏幕有字),`lower_glyph_chain` 未命中;
+  因此「填充白/描边灰、官方整体灰」与渲染耗时波动的根因**尚未修复**。
+  已确认:字形链取证 0 命中、正文不走 `TextDraw.image`;下一步需定位
+  文字层实际的 `COPY2/MEIDO/MERGE2` 命令序(或补 `lower_glyph_chain`
+  识别条件)。临时文本颜色取证代码已全部删除。
