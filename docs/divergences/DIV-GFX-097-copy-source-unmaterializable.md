@@ -63,3 +63,22 @@ render skipped: image target=SPLBUFb601 reason=gfx.copy.source.snapshot_missing
 - 若被跳过的目标是直接 `Op::Layer` 绘制(而非经 image op 解析),投影
   回退只改 `frame.layers`,该 op 内嵌的 `Arc<Layer>` 仍是旧纹理;本次
   立绘链走 image op,不受影响,通用化待补。
+
+## 2026-11-25 语义收口(快照不可变版本 + 活引用闭包)
+
+后续取证确认:本条的 1239–1254 与「耳朵动作只闪一帧/腮红消失」同属
+**命令时刻像素 vs 帧末回放**这一类,但根因不同,已分别按语义修复,
+本条的前置 skip/回退保留为最后一道防线:
+
+1. **快照 = 命令时刻写定的不可变像素版本**(`DIV-GFX-097` 的源头):
+   `frame()` 的 `needed_snapshots` 改为活引用闭包——活层当前持有的
+   `Snapshot`、本帧将重放的图像加工命令时刻源、屏幕快照依赖为根,
+   沿 `source_texture` 递归;发射端允许“目标层已改指但快照仍被需要”
+   的**孤儿快照**物化(`dest_holds || needed`),后端只写快照目标、
+   不发布回已改指的目标层。`snapshot_materializable` 不再要求每一级
+   `dest.texture == Snapshot(id)`。回归:
+   `crates/yu-gfx/tests/transition.rs::
+   snapshot_chain_survives_source_layer_repoint`。
+2. **中间层同帧 `CGEND` 后的 MERGE 链基面身份**:见
+   `DIV-GFX-098-command-time-base-identity.md`(腮红/眼睛切帧错位的
+   直接根因)。

@@ -110,6 +110,7 @@ fn table() -> ParamTable {
                     "BOLD",
                 ],
             ),
+            command("CGEND", &["ID", "IDNO"]),
         ],
         messages: Vec::new(),
         key_table: Box::new([0u8; 256]),
@@ -2809,4 +2810,101 @@ fn subgroup_rt_alpha_is_opaque_on_gpu_and_matches_soft() {
     let soft_out = soft.render_frame(&frame);
     assert_eq!(gpu_out.surface.rgba, soft_out.surface.rgba);
     assert_eq!(gpu_out.surface.pixel(1, 1), Some([0, 128, 0, 255]));
+}
+
+/// `MERGE` 链的**命令时刻基面身份**:中间层在本帧更晚被 `CGEND` 时,
+/// 生产者与消费者必须用同一份基面(命令时刻 `target_base` / `source_texture`),
+/// 否则消费者会把刚合好的内容清掉、退回裸基图资产。
+///
+/// 语料(`<game-c>` `es_sprite_cgl.yst` s159):
+/// `MERGE sp.tmpC→sp.tmpB` → `MERGE sp.tmpB→SPLBUF602` → `CGEND sp.tmpB`。
+/// 旧口径生产者对已删目标按 `None` 算 token(hash 5),消费者按命令时刻
+/// `Asset(_01)` 算(hash 1),`sync_base` 判基面变了 ⇒ 腮红合成被丢,
+/// 耳朵动作切到 `602/603` 时露一帧「睁眼无腮红」。
+#[test]
+fn merge_chain_keeps_command_time_base_when_intermediate_is_deleted() {
+    let table = table();
+    let entries = [
+        (b"b.png".as_slice(), png_bytes_for(8, 8, Rgba([0, 255, 0, 255]))),
+        (b"c.png".as_slice(), png_bytes_for(8, 8, Rgba([255, 0, 0, 255]))),
+        (b"d.png".as_slice(), png_bytes_for(8, 8, Rgba([0, 0, 255, 255]))),
+    ];
+    let mut gfx = state(Viewport::new(8, 8), [0, 0, 0, 255]);
+    gfx.consume_events(&[
+        VmEvent::FrameStart { frame: 1 },
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"B".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"b".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"C".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"c".to_vec())),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", Value::Str(b"D".to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(b"d".to_vec())),
+            ],
+        ),
+        // B ← MERGE(上层 C, 下层 B);随后源临时层删除。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"C".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"B".to_vec())),
+                arg(&table, "CGACT", "X", Value::Int(0)),
+                arg(&table, "CGACT", "Y", Value::Int(0)),
+                arg(&table, "CGACT", "MERGE", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "CGEND",
+            vec![arg(&table, "CGEND", "ID", Value::Str(b"C".to_vec()))],
+        ),
+        // D ← MERGE(上层 B, 下层 D);随后中间层删除。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"B".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"D".to_vec())),
+                arg(&table, "CGACT", "X", Value::Int(0)),
+                arg(&table, "CGACT", "Y", Value::Int(0)),
+                arg(&table, "CGACT", "MERGE", Value::Int(1)),
+            ],
+        ),
+        call(
+            1,
+            "CGEND",
+            vec![arg(&table, "CGEND", "ID", Value::Str(b"B".to_vec()))],
+        ),
+        VmEvent::FrameEnd { frame: 1 },
+    ]);
+    let frame = gfx.frame();
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    let gpu_out = gpu.render_frame(&frame).expect("render");
+    let mut soft = SoftRenderer::new(store(&entries));
+    let soft_out = soft.render_frame(&frame);
+    let actual = pixel(&gpu_out, 4, 4);
+    let soft_px = pixel_of_surface(&soft_out.surface, 4, 4);
+    assert!(
+        actual[0] >= 250 && actual[2] <= 5,
+        "上层合成必须保留:期望红,得到 gpu={actual:?} soft={soft_px:?};skips={:?}",
+        gpu_out.report.skipped
+    );
+    assert_close(actual, soft_px, 2, "merge-chain");
 }

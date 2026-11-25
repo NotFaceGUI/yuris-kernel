@@ -710,3 +710,134 @@ fn copy2_from_asset_source_still_repoints_destination() {
         "有像素的源必须正常执行 COPY2"
     );
 }
+
+/// 快照 = 命令时刻写定的不可变像素版本,不因源层后来改指而失效。
+///
+/// 官方 COPY/COPY2 在命令体内立即写表面(EVID-T-15 / `FUN_0042f809`);
+/// 之后 `CG[FILE]` / `INFO.INIT` 把源层换内容,不会撤销已经写进下游缓冲
+/// 的像素。内核帧末回放必须保持同一语义:活层当前持有的快照,以及它
+/// `source_texture` 记录的命令时刻源链,都必须在帧末可物化 —— 即使链上
+/// 某一环的源层已经改指。
+///
+/// 失败形态(`<game-c>` 帧 3182–3197):`SPLBUF601` 仍持有上一轮普通复制
+/// 的当前快照,但它依赖的 `SPLBUFa601` 快照因 `a` 被重填而被判死,过渡
+/// `from` 报 `gfx.copy.source.snapshot_missing`,角色每次换表情整段空白。
+#[test]
+fn snapshot_chain_survives_source_layer_repoint() {
+    let table = table();
+    let mut gfx = state();
+    // 帧 1: A(资产) → COPY2 BUF1(快照 0) → COPY2 BUF2(快照 1;
+    // 命令时刻源 = 快照 0)。
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "FILE", s("a")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![arg(&table, "CG", "ID", s("BUF1"))],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("A")),
+                arg(&table, "CGACT", "ID2", s("BUF1")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![arg(&table, "CG", "ID", s("BUF2"))],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("BUF1")),
+                arg(&table, "CGACT", "ID2", s("BUF2")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f1 = gfx.frame();
+    let buf2 = f1
+        .layers
+        .iter()
+        .find(|layer| layer.id.display() == ":/W0/BUF2")
+        .expect("BUF2 层");
+    let buf2_snapshot = match &buf2.texture {
+        TextureRef::Snapshot(id) => *id,
+        other => panic!("BUF2 应持有复制快照,得到 {other:?}"),
+    };
+
+    // 帧 2: 把 BUF1 重指到另一张资产。快照 0 不再是 BUF1 的当前纹理,
+    // 但它是 BUF2 当前表面(快照 1)的命令时刻源。
+    gfx.consume_events(&[
+        frame_start(2),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BUF1")),
+                arg(&table, "CG", "FILE", s("b")),
+            ],
+        ),
+        frame_end(2),
+    ]);
+    let f2 = gfx.frame();
+    // BUF1 已改指资产(f1 的快照 0 作废为活表面)。
+    let buf1 = f2
+        .layers
+        .iter()
+        .find(|layer| layer.id.display() == ":/W0/BUF1")
+        .expect("BUF1 层");
+    assert_eq!(buf1.texture, TextureRef::Asset(b"b".to_vec()));
+    // BUF2 的当前表面不变,且它的生产者必须仍在本帧重放计划里。
+    let buf2 = f2
+        .layers
+        .iter()
+        .find(|layer| layer.id.display() == ":/W0/BUF2")
+        .expect("BUF2 层");
+    assert_eq!(buf2.texture, TextureRef::Snapshot(buf2_snapshot));
+    let copies: Vec<&yu_gfx::CopyOp> = f2
+        .passes
+        .iter()
+        .flat_map(|pass| pass.ops.iter())
+        .filter_map(|op| match op {
+            Op::Copy(copy) => Some(copy),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        copies
+            .iter()
+            .any(|copy| copy.source == yu_gfx::CopySource::Layer(id(":/W0/BUF1"))),
+        "BUF2 表面的生产者必须仍被重放"
+    );
+    assert!(
+        copies
+            .iter()
+            .any(|copy| copy.source == yu_gfx::CopySource::Layer(id(":/W0/A"))),
+        "快照链上游(命令时刻源)即使在 BUF1 改指后也必须物化"
+    );
+    // 上游生产者只物化快照,不把旧像素发布回已改指的 BUF1 活表面;
+    // pass 的目标仍是记录口径的 BUF1,发布门控由后端 `apply_copy` 负责。
+    let upstream = copies
+        .iter()
+        .find(|copy| copy.source == yu_gfx::CopySource::Layer(id(":/W0/A")))
+        .expect("上游生产者");
+    assert_eq!(
+        upstream.dest,
+        id(":/W0/BUF1"),
+        "pass 目标按命令记录;后端判定目标已改指后只登记快照"
+    );
+}

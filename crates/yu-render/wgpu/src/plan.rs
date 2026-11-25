@@ -911,19 +911,29 @@ fn apply_image(
     if target != pass_target {
         return Err("gfx.imageop.target.mismatch".to_string());
     }
-    let token = base_token(
-        frame,
-        targets,
-        layers,
-        target,
-        // 原地加工且目标层已被 `CGEND` 删除:基面身份按命令时刻纹理算,
-        // 与重放时 `resolve_target_base` 的 fallback 保持一致。
-        if target == &image.source {
-            image.source_texture.as_ref()
-        } else {
-            None
-        },
-    );
+    // 目标基面身份:活层缺失(= 命令后已被 `CGEND`)时必须用**命令时刻**
+    // 记录的 `target_base`,不能退化成 `None`。
+    //
+    // 理由(命令时刻语义):同帧稍后的消费者 `MERGE tmpB→…` 把 `tmpB` 的
+    // 命令时刻纹理记为 `source_texture`(同一份 `target_base.texture`),
+    // 消费点 `sync` 会用这份纹理算 token。若生产者按 `None` 算,两者
+    // token 不同 ⇒ `sync_base` 把刚合成的 `contents[tmpB]` 清掉,消费者
+    // 退回裸基图资产 —— 台账症状:耳朵动作时 `SPLBUF602/603` 少了
+    // `sp.tmpC`(腮红)合成,只在切帧露一帧“睁眼无腮红”。
+    // 证据:`<game-c>` 实跑命令流 s159 pc59/pc63 + `YU_PASS_TRACE` 帧 4590;
+    // 回归 `merge_chain_keeps_command_time_base_when_intermediate_is_deleted`。
+    //
+    // 只用 `target_base` 覆盖**已删目标**(与 `resolve_target_base` 的
+    // `layer.is_none()` 同口径):活层仍存在时保持原行为,基面 token 与
+    // 活层像素来源一致,避免“token 按命令时刻、像素按活层”的新错位。
+    let target_fallback = if target == &image.source {
+        image.source_texture.as_ref()
+    } else if layers.contains_key(target) {
+        None
+    } else {
+        image.target_base.as_ref().map(|base| &base.texture)
+    };
+    let token = base_token(frame, targets, layers, target, target_fallback);
     if surfaces.sync_base(target, token) {
         contents.remove(target);
         chain_index.insert(target.clone(), 0);
@@ -2697,9 +2707,19 @@ fn apply_copy(
     };
     targets.set_snapshot(copy.id, tex.clone());
     let content = snapshot_content(copy.id, tex);
-    contents.insert(copy.dest.clone(), content.clone());
-    contents.set_base(&copy.dest, TextureRef::Snapshot(copy.id));
-    surfaces.set_content(&copy.dest, content);
+    // 目标层仍持有这条快照(或已被 `CGEND` 删除)时才发布层内容;目标已被
+    // `CG[FILE]`/新 COPY 改指时,这条复制只是被活引用闭包拉起来物化的
+    // **命令时刻像素版本**(官方已写入表面,后续改指不撤销),写回活表面
+    // 会把旧场景像素灌进新内容。快照本身仍登记,供 `source_texture`/
+    // 过渡读取。
+    let dest_holds = layers.get(&copy.dest).is_none_or(|layer| {
+        matches!(&layer.texture, TextureRef::Snapshot(sid) if *sid == copy.id)
+    });
+    if dest_holds {
+        contents.insert(copy.dest.clone(), content.clone());
+        contents.set_base(&copy.dest, TextureRef::Snapshot(copy.id));
+        surfaces.set_content(&copy.dest, content);
+    }
     Ok(())
 }
 

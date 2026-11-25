@@ -158,6 +158,52 @@ fn glyph_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("YU_GLYPH_TRACE").is_some())
 }
+
+/// `YU_GFX_CMD_TRACE` 取证开关:逐条打印 Graphics/Window 域命令
+/// (帧号、脚本 sid、pc、参数原文)。
+///
+/// 用途:核对「命令时刻」的层写入顺序——耳朵/眨眼切换显示哪几个层、
+/// 哪些源缓冲在该次表达式变更里没有被重写。默认关闭;输出走 stderr,
+/// 由桌面入口重定向到文件,不进入 frames.jsonl(不改变正常取证体积)。
+fn gfx_cmd_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("YU_GFX_CMD_TRACE").is_some())
+}
+
+fn trace_domain_call(
+    domain: Domain,
+    name: &str,
+    args: &[ArgValue],
+    frame: u64,
+    call: Option<(u32, u32)>,
+) {
+    if !gfx_cmd_trace()
+        || !matches!(
+            domain,
+            Domain::Graphics | Domain::Window | Domain::Movie
+        )
+    {
+        return;
+    }
+    let (sid, pc) = call.map_or((-1, -1), |(sid, pc)| (i64::from(sid), i64::from(pc)));
+    let mut line = String::with_capacity(64 + args.len() * 16);
+    use std::fmt::Write as _;
+    let _ = write!(line, "[gfxcmd] f={frame} s={sid} pc={pc} {name}");
+    for a in args {
+        let _ = match &a.value {
+            // 前缀窗口槽号:`CG` 的 ID/FILE/A 等按 ysc 参数表定槽,
+            // 只给值会在 `A=0`/`E=0` 之间产生歧义。
+            Value::Int(v) => write!(line, " {}:{v}", a.slot),
+            Value::Float(v) => write!(line, " {}:{v}", a.slot),
+            // 层名/资产名在脚本里是 CP932 原始字节;ASCII 原型名可读,
+            // 非 ASCII 部分按 lossy 显示不影响取证(索引而非文本才是身份)。
+            Value::Str(bytes) => {
+                write!(line, " {}:{}", a.slot, String::from_utf8_lossy(bytes))
+            }
+        };
+    }
+    eprintln!("{line}");
+}
 struct Node {
     /// 层属性。`Arc` 共享 + 写时复制:帧投影只持引用,只有真正被命令
     /// 改写的层发生一次 `Layer` 复制(`Arc::make_mut`)。
@@ -175,7 +221,7 @@ struct Node {
 /// 同一集合,重放时必须只保留一次。超限丢最旧并显式计数。
 #[derive(Clone, Debug, Default)]
 struct LayerTexts {
-    draws: Vec<TextDraw>,
+    draws: std::collections::VecDeque<TextDraw>,
     /// 去重集合:64-bit 无分配指纹 → 桶内精确键(#21)。
     /// 桶内仍用 [`TextDrawKey::matches_draw`] 逐字段确认;哈希碰撞只会
     /// 让这一条走完整键比较,不影响去重结果。
@@ -202,7 +248,10 @@ impl LayerTexts {
             return false;
         }
         if self.draws.len() >= MAX_TEXT_DRAWS_PER_LAYER {
-            let oldest = self.draws.remove(0);
+            // `VecDeque::pop_front` 是 O(1);旧 `Vec::remove(0)` 在 16k 上限
+            // 后每追加一个字都要移动整条 Vec(含每条 TextDraw 的 Vec/String),
+            // 是「长文本层越到后面越卡」的直接来源。淘汰语义仍是只丢最旧一条。
+            let oldest = self.draws.pop_front().expect("len >= cap");
             let ofp = oldest.fingerprint();
             if let Some(bucket) = self.seen.get_mut(&ofp) {
                 if let Some(pos) = bucket.iter().position(|key| key.matches_draw(&oldest)) {
@@ -218,7 +267,7 @@ impl LayerTexts {
             .entry(fp)
             .or_default()
             .push(draw.dedup_key());
-        self.draws.push(draw);
+        self.draws.push_back(draw);
         true
     }
 }
@@ -943,8 +992,8 @@ impl GfxState {
     /// 只给诊断/探针用:演出动画缺失时用来确认「精灵层是否被创建、
     /// 是否 alpha=0/E=0」,不参与渲染路径。
     #[must_use]
-    pub fn layer_snapshot(&self) -> Vec<(String, i64, i16, bool)> {
-        let mut out: Vec<(String, i64, i16, bool)> = self
+    pub fn layer_snapshot(&self) -> Vec<(String, i64, i16, bool, f64, f64)> {
+        let mut out: Vec<(String, i64, i16, bool, f64, f64)> = self
             .nodes
             .values()
             .map(|n| {
@@ -953,10 +1002,12 @@ impl GfxState {
                     n.layer.z,
                     n.layer.alpha,
                     n.layer.visible,
+                    n.layer.transform.x,
+                    n.layer.transform.y,
                 )
             })
             .collect();
-        out.sort();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
 
@@ -1169,6 +1220,7 @@ impl GfxState {
         self.cur_call = script.zip(pc);
         self.cur_call_cmd.clear();
         self.cur_call_cmd.push_str(name);
+        trace_domain_call(domain, name, args, frame, self.cur_call);
         match domain {
             Domain::Graphics => self.dispatch(name, args),
             Domain::Window => self.dispatch_window(name, args),
@@ -1198,6 +1250,11 @@ impl GfxState {
                 self.last_screen_capture = None;
                 // 复制/图像操作是**状态生产**(快照/纹理修改),不是逐帧易失;
                 // 保留日志,frame() 只输出仍被现存图层引用的项。
+                //
+                // 长会话防御:已烘焙、目标仍存活且不是转场 mask 的旧图像项
+                // 每 60 帧压缩一次。否则 image_log 单调涨到 16k,frame() 每帧
+                // 多遍扫描、每帧多发射 pass/表面(CPU 与显存一起变差)。
+                self.compact_baked_image_log();
             }
             VmEvent::FrameEnd { frame } => {
                 self.frame = *frame;
@@ -1225,6 +1282,7 @@ impl GfxState {
                 self.cur_call = script.zip(*pc);
                 self.cur_call_cmd.clear();
                 self.cur_call_cmd.push_str(name);
+                trace_domain_call(*domain, name, args, *frame, self.cur_call);
                 match domain {
                     Domain::Graphics => self.dispatch(name, args),
                     Domain::Window => self.dispatch_window(name, args),
@@ -1334,20 +1392,28 @@ impl GfxState {
         // 新增的复制会反向引用上一轮的旧复制,形成永远可达的死链:旧快照
         // 每帧被重放一次(`copy_pinned` 随读档次数增长,2026-11-03 实测
         // 23→45,基线 1ms→2–3ms)。
+        // 语义:快照 = **命令时刻写定、不可变的像素版本**(官方 COPY/COPY2
+        // 在命令体内立即执行,EVID-T-15 / `FUN_0042f809`;TRANSITION 同)。
+        // 对源层的后续改指(`CG[FILE]` / `INFO.INIT` 重填 `SPLBUFa`)不会
+        // 撤销已经写进其它表面的像素。
+        //
+        // 因此「快照还能不能物化」只能由**活引用闭包**决定,不能看目标层
+        // 现在指向谁:活层仍持有 `Snapshot(id)`,或本帧会重放的 op 把
+        // `Snapshot(id)` 记为命令时刻源,则 `id` 与它 `source_texture` 的
+        // 依赖链都必须保持可重放。旧口径要求链上每一级都满足
+        // `dest.texture == Snapshot(id)`:只要源层被重填,旧链就整条判死,
+        // 过渡 `from=SPLBUF` 报 `snapshot_missing`、每次换表情整段空白
+        // (<game-c> 帧 3182–3197 取证)。
         let pin_snap_tex = self.snapshot_texture_ids();
-        let needed_snapshots: rustc_hash::FxHashSet<CopyId> =
-            self.copy_log
-                .iter()
-                .filter(|c| {
-                    self.nodes.get(&c.dest).is_some_and(
-                        |n| matches!(n.layer.texture, TextureRef::Snapshot(id) if id == c.id),
-                    )
-                })
-                .filter_map(|c| match &c.source_texture {
-                    Some(TextureRef::Snapshot(id)) => Some(*id),
-                    _ => None,
-                })
-                .chain(self.image_log.iter().filter_map(|i| {
+        let mut needed_snapshots: rustc_hash::FxHashSet<CopyId> = self
+            .nodes
+            .values()
+            .filter_map(|n| match &n.layer.texture {
+                TextureRef::Snapshot(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        needed_snapshots.extend(self.image_log.iter().filter_map(|i| {
                     // 缺 target = 原地加工(`CGACT` 只给 ID 时源即目标)。
                     let target = i.target.as_ref().unwrap_or(&i.source); // silent-ok: 缺 target = 原地加工
                     let node = self.nodes.get(target)?;
@@ -1368,9 +1434,22 @@ impl GfxState {
                         Some(TextureRef::Snapshot(id)) => Some(*id),
                         _ => None,
                     }
-                }))
-                .chain(pin_snap_tex.iter().copied())
-                .collect();
+                }));
+        needed_snapshots.extend(pin_snap_tex);
+        // 闭包:被引用的快照还要它的生产者所捕获的命令时刻源。
+        // `copy_log` 按 `CopyId` 单调追加(裁剪保序),二分查找即可。
+        let mut pending: Vec<CopyId> = needed_snapshots.iter().copied().collect();
+        while let Some(id) = pending.pop() {
+            let Ok(index) = self.copy_log.binary_search_by_key(&id, |c| c.id) else {
+                continue;
+            };
+            let Some(TextureRef::Snapshot(parent)) = &self.copy_log[index].source_texture else {
+                continue;
+            };
+            if needed_snapshots.insert(*parent) {
+                pending.push(*parent);
+            }
+        }
         // 命令时刻屏幕快照里出现过的层:即使本帧稍后被 `CGEND` 删除,
         // 其图像加工也必须重放(否则快照里只剩基图:存档缩略图在淡出时
         // 先消失,2026-11-02 实测)。
@@ -1429,9 +1508,23 @@ impl GfxState {
                 continue;
             }
             if self.copy_source_unresolvable(c) {
-                skipped_copies.insert(c.id);
-                if let Some(prev) = &c.dest_texture_before {
-                    copy_overrides.insert(c.dest.clone(), (c.id, prev.clone()));
+                // 只有目标层**原本已有真实像素**时才回退。首次出现时目标是
+                // `None`/`SolidBlack1x1`,跳过会把“第一次显示”也跳掉,表现为
+                // 角色出现瞬间闪一帧;这类情况照常发射复制,让后端用当帧
+                // 源解析(解析不到也只是维持原空层,不会更差)。
+                let prev_has_pixels = matches!(
+                    &c.dest_texture_before,
+                    Some(
+                        TextureRef::Asset(_)
+                            | TextureRef::Snapshot(_)
+                            | TextureRef::Movie { .. }
+                    )
+                );
+                if prev_has_pixels {
+                    skipped_copies.insert(c.id);
+                    if let Some(prev) = &c.dest_texture_before {
+                        copy_overrides.insert(c.dest.clone(), (c.id, prev.clone()));
+                    }
                 }
             }
         }
@@ -1463,22 +1556,26 @@ impl GfxState {
                 ));
                 continue;
             }
-            // 复制的目标是**活层**时,只有它当前仍持有这条复制的快照
+            // 复制的目标是**活层**时,通常只有它当前仍持有这条复制的快照
             // (`dest.texture == Snapshot(c.id)`)才可以重放。目标被 `CG[FILE]`
             // 或新 COPY 重新绑定后,旧 copy 的快照属于上一个场景;再写进
             // 活表面会把旧场景像素灌进新场景缓冲(读档后背景停在上一个画面,
-            // 2026-11-03 实测)。快照消费者由 `needed_snapshots` 单独物化。
+            // 2026-11-03 实测)。
+            //
+            // 例外 = 已被活引用闭包持有的快照(`needed_snapshots`):它是
+            // 命令时刻的像素版本,必须物化给消费者(过渡的 `from`/后续复制
+            // 的 `source_texture`);后端只写快照目标,不碰已改指的目标表面。
+            let dest_holds = self
+                .nodes
+                .get(&c.dest)
+                .is_some_and(|n| matches!(n.layer.texture, TextureRef::Snapshot(id) if id == c.id));
             let dest_live = match self.nodes.get(&c.dest) {
-                Some(n) => matches!(n.layer.texture, TextureRef::Snapshot(id) if id == c.id),
+                Some(_) => dest_holds || needed_snapshots.contains(&c.id),
                 None => needed_snapshots.contains(&c.id) || snapshot_layers.contains(&c.dest),
             };
             if !dest_live {
                 continue;
             }
-            let dest_holds = self
-                .nodes
-                .get(&c.dest)
-                .is_some_and(|n| matches!(n.layer.texture, TextureRef::Snapshot(id) if id == c.id));
             // 已成功冻结且目标层仍持有该快照 ⇒ 官方命令已执行完,不再重放。
             if dest_holds && self.baked_copies.borrow().contains(&c.id) {
                 continue;
@@ -1860,6 +1957,49 @@ impl GfxState {
             f.text_layout.as_ref(),
         )));
         f
+    }
+
+    /// 压缩已烘焙的图像历史(长会话防御;只删“结果已经在常驻表面里”的项)。
+    ///
+    /// 全部满足才删:
+    /// - 目标层仍存在;
+    /// - 不是任何转场 `TID` 指向的 mask 层(`transition_mask_base/transform`
+    ///   需要它的 SIZE/REVERSE 历史);
+    /// - 目标层当前纹理/alpha 与 `baked_images` 记录一致(表面没被重建);
+    /// - 该项 `seq <=` 已烘焙 seq。
+    ///
+    /// 已删目标层的项一律保留:它们仍可能被 screen snapshot/COPY 按命令
+    /// 时刻重放。压缩是保守的“只删已烘焙前缀”,不改变当前像素。
+    fn compact_baked_image_log(&mut self) {
+        const COMPACT_MIN: usize = 4_096;
+        if self.image_log.len() < COMPACT_MIN || self.frame % 60 != 0 {
+            return;
+        }
+        let protected: rustc_hash::FxHashSet<LayerId> = self
+            .nodes
+            .values()
+            .filter_map(|n| n.layer.transition.as_ref().and_then(|t| t.tid.clone()))
+            .collect();
+        let baked: rustc_hash::FxHashMap<LayerId, (TextureRef, i16, u64)> = self
+            .baked_images
+            .borrow()
+            .iter()
+            .map(|(id, (tex, alpha, seq))| (id.clone(), (tex.clone(), *alpha, *seq)))
+            .collect();
+        let mut log = std::mem::take(&mut self.image_log);
+        log.retain(|op| {
+            let target = op.target.as_ref().unwrap_or(&op.source); // silent-ok: 缺 target = 原地加工
+            let Some(node) = self.nodes.get(target) else {
+                return true;
+            };
+            if protected.contains(target) {
+                return true;
+            }
+            !baked.get(target).is_some_and(|(tex, alpha, seq)| {
+                *tex == node.layer.texture && *alpha == node.layer.alpha && op.seq <= *seq
+            })
+        });
+        self.image_log = log;
     }
 
     /// 后端执行完本帧后提交烘焙前缀。
@@ -4562,10 +4702,14 @@ impl GfxState {
 
     /// 命令时刻快照 `id` 在当前状态下是否还能被后端物化。
     ///
-    /// 后端只对「目标层仍持有该快照」的复制项发 pass(或直接复用已烘焙
-    /// 纹理);两条都不成立时 `resolve_ref` 报 `snapshot_missing`。
-    /// `COPY2` 覆写目标前按同口径递归检查复制链:链断的快照不能用来
-    /// 重指目标,否则会把上一帧仍可见的像素换成永远建不出来的空表面。
+    /// 语义 = 官方:COPY 在命令体内已经写定像素(EVID-T-15),快照是**不可变
+    /// 像素版本**,与目标层现在指向谁无关。可物化的条件只有两条:
+    /// - 已烘焙/屏幕快照(像素已冻结),或
+    /// - 生产者复制项仍在日志里、可执行,且它自己命令时刻的源链可物化。
+    ///
+    /// 旧口径额外要求「目标层当前仍持有该快照」,等于把后续对源层的改指
+    /// 当成撤销已写像素:链上任何一环被 `INFO.INIT` 重填就整条判死,
+    /// 过渡源报 `snapshot_missing`(<game-c> 帧 3182–3197)。
     fn snapshot_materializable(&self, id: CopyId, depth: u8) -> bool {
         if self.baked_copies.borrow().contains(&id) {
             return true;
@@ -4576,13 +4720,6 @@ impl GfxState {
         let Some(copy) = self.copy_log.iter().rev().find(|c| c.id == id) else {
             return false;
         };
-        let dest_holds = self
-            .nodes
-            .get(&copy.dest)
-            .is_some_and(|n| matches!(n.layer.texture, TextureRef::Snapshot(x) if x == id));
-        if !dest_holds {
-            return false;
-        }
         if copy.status != OpStatus::Executable || depth == 0 {
             return false;
         }
@@ -4716,11 +4853,10 @@ impl GfxState {
         } else {
             self.text_draws
                 .get(source)
-                .map(|t| t.draws.clone())
+                .map(|t| t.draws.iter().cloned().collect())
                 .unwrap_or_default()
         };
         if !texture_copy {
-            self.prune_copy_log(|c| c.dest == *dest);
             self.image_log
                 .retain(|i| i.target.as_ref().is_none_or(|t| t != dest));
         }
@@ -4923,6 +5059,11 @@ impl GfxState {
                 OpStatus::Unimplemented(why) => LayerStatus::Unimplemented(why),
             });
         }
+        if !texture_copy {
+            // 目标已改指向新快照;旧快照在这里才作废(上面 `prune_copy_log`
+            // 会保留“目标仍持有”的活表面,所以必须在重指之后裁)。
+            self.prune_copy_log(|c| c.dest == *dest && c.id != copy_id);
+        }
         if status != OpStatus::Executable {
             let why = match status {
                 OpStatus::Unimplemented(why) => why,
@@ -5005,10 +5146,17 @@ impl GfxState {
             );
             return;
         }
-        let mut sources = vec![from, &to];
-        if let Some(mask) = &mask {
-            sources.push(mask);
-        }
+        // 命令时刻的两源都必须是真实表面。快照按“不可变像素版本”口径
+        // 判可物化(见 `snapshot_materializable`),不因目标层后来改指而失效;
+        // 源确实没有像素时按官方命令序号挂号,不做“换另一侧顶上”的猜测
+        // —— 那会伪造出官方此刻不存在的画面。
+        let sources = {
+            let mut sources = vec![from, &to];
+            if let Some(mask) = &mask {
+                sources.push(mask);
+            }
+            sources
+        };
         for id in &sources {
             if !self.nodes.contains_key(*id) {
                 self.push_diag(
@@ -5047,6 +5195,10 @@ impl GfxState {
                             | TextureRef::Movie { .. }
                     )
                     && n.layer.texture_status == LayerStatus::Executable
+                    && match &n.layer.texture {
+                        TextureRef::Snapshot(sid) => self.snapshot_materializable(*sid, 8),
+                        _ => true,
+                    }
             });
             if !ok {
                 let why = "gfx.imageop.copy_source.unsupported";
@@ -6554,7 +6706,15 @@ impl GfxState {
         let mut keep: Vec<bool> = (0..count)
             .map(|i| {
                 let copy = &self.copy_log[i];
+                // 目标层当前纹理正引用这条快照 ⇒ 它是**活表面**,不是历史。
+                // 官方层表面在 COPY 后持续存在;删掉生产者会让下一帧的
+                // TRANSITION/消费方拿不到像素(残留 `snapshot_missing`)。
+                let dest_holds = self
+                    .nodes
+                    .get(&copy.dest)
+                    .is_some_and(|n| matches!(n.layer.texture, TextureRef::Snapshot(id) if id == copy.id));
                 !remove(copy)
+                    || dest_holds
                     || self
                         .screen_snapshots
                         .get(&copy.id)

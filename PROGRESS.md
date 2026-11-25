@@ -18262,3 +18262,117 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
 - **残余**:`SPLBUFa` 在 1239 命令时刻为空的生命周期未对齐;
   `ScriptAction::Resize` 仍逻辑像素;忙等脚本尖峰(帧 1 319 万命令、
   切场景 65 万)未优化;更新检查持久化(COM=56/57)未实现。
+
+## 成果 ANDROID-SETTINGS-LAYER (2026-11-25) · 安卓壳全局默认 + 单游戏覆盖
+
+- **分层**:单游戏覆盖 > 全局默认 > 内置缺省。游戏详情页的修改只写
+  **当前游戏**的覆盖(与全局相同的项自动丢弃 = 回到继承),换游戏互不
+  影响;同一项两边都设置时单游戏优先。
+- **全局入口**:游戏库右上角齿轮打开 `GlobalSettingsActivity`,可配置
+  默认字体、操作方式、GPU 接口、帧率、高级开关、文本编码、影片解码、
+  存档压缩;游戏详情页右上角也有同一入口。字体只需全局配一次,不再
+  每个游戏重复导入。
+- **存储**:全局沿用 `yu_kernel` 历史键(升级零迁移);单游戏覆盖存
+  `yu_kernel_games`,键 = 游戏根,值 = 只含差异项的 JSON。旧全局
+  `save_dir`/`translate_path` 按原绑定游戏根一次性迁入覆盖(不再被所有
+  游戏继承)。
+- **持久化时机**:配置页 `onPause` 与「开始游戏」前写覆盖;从全局设置
+  返回时重读全局、当前游戏覆盖仍优先。Tyranor 外部会话只看全局默认 +
+  模块配置,不读也不写单游戏覆盖。
+- **文件**:新增 `SettingsPrefs.kt`、`GlobalSettingsActivity.kt`、
+  `FontCatalog.kt`;改 `SettingsState.kt`、`SetupActivity.kt`、
+  `SetupScreen.kt`、`LibraryActivity.kt`、`AndroidManifest.xml`、
+  `HelpScreen.kt`。
+- **验证**:
+  - `gradle :app:compileDebugKotlin --offline --no-daemon` →
+    `BUILD SUCCESSFUL in 16s`(16 actionable tasks);
+  - 仅壳内 Kotlin/清单改动,未触碰内核 crate,桌面/headless 行为不变。
+- **残余**:游戏库卡片目前仍先进入详情页再启动,`buildGameIntent`
+  直启路径已按合并口径更新但壳内尚无调用点。
+
+
+## 成果 ANDROID-TYN-LITE (2026-11-25) · Tyranor 轻量运行时模块(独立 :runtime)
+
+- **背景**:旧 Tyranor 渠道是「整套壳换 applicationId」(含游戏库/配置页/
+  Compose/Miuix),universal 28 MB、arm64 15 MB;从 Tyn 启动还要先过配置页。
+- **新模块**:`android/runtime`(`:runtime`)只含一个协议入口
+  `org.yuris.kernel.TyranorRuntimeActivity` + 复用 `:app` 的 Java 游戏页
+  (`MainActivity`/`NativeHost`/`DialogPresenter`)。不编译 Kotlin/Compose/
+  Miuix/AppCompat,不带游戏库、配置页、帮助页及其资源。
+- **入口行为**:校验 v1 协议与 `FOLDER_PATH` → 确保真实路径存储权限
+  (API 30+ 走「所有文件访问」设置页,24–29 走运行时 READ/WRITE)→ 把
+  `game_dir` / `save_dir` / SETTINGS 映射成 `MainActivity` extras 后
+  `NEW_TASK|CLEAR_TASK` 直接进游戏;入口立即 `finish()`,退出游戏回到
+  Tyn。无内容视图,权限缺失只 Toast。
+- **窗口标签**:application/入口/游戏页 `label` 均为 `Yu-ris Runtime`
+  (最近任务/窗口标题),与旧包名 `YU-RIS Kernel (Tyranor)` 区分。
+- **1.73 接口**:`res/raw/tyranor_runtime.json` 声明 scan(同旧规则)+
+  settings(10 项)+ **saves** `directory=save`(新增:轻量模块没有自定义
+  存档目录,统一交给 Tyn 导入/导出/WebDAV)+ fileImports(fonts)。
+- **体积**:`.so` 改为压缩存放(`useLegacyPackaging=true`),壳 dex 仅
+  70 KB;arm64 瘦包 **5.7 MB**(旧 15 MB),universal **12 MB**(旧 28 MB)。
+- **构建**:`tools/android/build.sh` 新增渠道 `YURIS_APK_CHANNEL=tyranor-module`
+  (`:runtime:assembleRelease`,产物
+  `target/android-apks/app-tyranor-runtime-<type>-<abi>.apk`);CI release
+  改为发布该轻量模块;旧 `tyranor` 渠道保留,供需要模块内配置页时手动构建。
+- **解耦**:`MainActivity` 不再引用 `SetupActivity.PREFS`(Kotlin/Compose),
+  改为本地 `PREFS = "yu_kernel"`;普通壳行为不变。
+- **验证**:
+  - `gradle :runtime:compileDebugJavaWithJavac` → BUILD SUCCESSFUL;
+  - `YURIS_APK_CHANNEL=tyranor-module YURIS_APK_VARIANTS=arm64-v8a
+    BUILD_TYPE=release bash tools/android/build.sh arm64-v8a` →
+    `app-tyranor-runtime-release-arm64-v8a.apk` 5.7 MB;
+  - `aapt2 dump badging` → `package=com.tyranor.runtime.yuris.kernel`
+    versionCode 500 / versionName 0.5.0, label `Yu-ris Runtime`,
+    native-code `arm64-v8a`;
+  - `aapt2 dump xmltree` → 入口 action `com.tyranor.runtime.action.LAUNCH` +
+    DEFAULT + `MANIFEST` meta-data 指向 raw 资源;游戏页 exported=false、
+    landscape、label `Yu-ris Runtime`;
+  - APK 内 `classes.dex` 70,336 B,类表只有 Entry/MainActivity/DialogPresenter/
+    NativeHost 等 44 个类,无 Compose/Miuix/AppCompat;
+  - `unzip -p ... res/9s.json` → UTF-8 合法 JSON,saves/settings/fileImports
+    均在(资源名被 AGP 收缩,按资源 ID 读取不受影响)。
+- **真机**:`c1d09694`(HyperOS 15 / arm64-v8a)安装成功(脚本默认
+  versionCode 1 / versionName 0.1.0;MIUI 需手机端确认 `adb install`);
+  `cmd package query-activities -a com.tyranor.runtime.action.LAUNCH`
+  已解析到 `com.tyranor.runtime.yuris.kernel/org.yuris.kernel.TyranorRuntimeActivity`。
+  Tyn 端「发现→启用→扫描→启动→退出」由主人点验。
+
+## 成果 SPRITE-REPLAY-SEMANTICS (2026-11-25) · 帧回放按命令时刻像素对齐
+
+- **语义口径**:官方 `CGACT` 在命令体内立即读写层表面(EVID-T-15 /
+  `FUN_0042f809`);`CGEND` 只释放对象,不撤销已写进其它层的像素。
+  内核帧末回放必须让每个 op 的输入像素与命令时刻一致,而不是「按活层
+  当前状态重算」。
+- **快照不可变版本(`DIV-GFX-097` 收口)**:`frame()` 的
+  `needed_snapshots` 改为活引用闭包(活层持有的 `Snapshot` → 其生产者
+  的 `source_texture` 递归);发射端放行「目标层已改指、快照仍被消费者
+  引用」的孤儿快照(`dest_holds || needed`),wgpu `apply_copy` 只登记
+  快照目标、不把旧像素发布回已改指的目标层;
+  `snapshot_materializable` 去掉逐级 `dest_holds` 要求。旧口径下
+  `INFO.INIT` 重填 `SPLBUFa` 会把整条旧链判死,过渡源报
+  `snapshot_missing`(`<game-c>` 帧 3182–3197)。
+- **中间层同帧 `CGEND` 的 MERGE 链(`DIV-GFX-098`)**:命令流(实机
+  `YU_GFX_CMD_TRACE`,`es_sprite_cgl.yst` s159 pc51..64)为
+  `MERGE sp.tmpC→sp.tmpB` → `MERGE sp.tmpB→SPLBUF602` →
+  `CGEND sp.tmpB`。wgpu `apply_image` 对已删目标算 token 时退化成
+  `None`(hash 5),消费端按命令时刻 `source_texture`(hash 1+名字)算,
+  `sync_base` 误判基面变化并清掉刚合好的内容 ⇒ 消费者读回裸差分资产
+  `a_tou_4a_01`(睁眼、无腮红)。修法:非原地动作的目标 token 使用
+  `ImageOp.target_base.texture`;原地动作仍用 `source_texture`。
+- **A/B 证据**(`merge_chain_keeps_command_time_base_when_intermediate_is_deleted`):
+  修前 `gpu=[0,255,0,255] soft=[255,0,0,255] skips=[]`(GPU 拿到中间层
+  裸基图,soft 正确);修后 GPU/soft 逐像素一致。
+- **取证工具**:新增 `YU_GFX_CMD_TRACE=1`(逐条 `[gfxcmd]` 命令流:
+  帧号/脚本 sid/pc/槽位参数,OnceLock 默认关闭);与既有
+  `YU_PASS_TRACE` 的 `[texop]` 组合可复现随机动作前后的完整写入顺序,
+  不再依赖 F9 抢帧。
+- **验证**:
+  - `cargo test -p yu-backend-wgpu --test wgpu` → 40 passed(含新回归);
+  - `cargo test -p yu-gfx --tests` → 全部套件绿(transition 13 passed);
+  - `cargo build --workspace --all-targets` → Finished dev profile,rc 0;
+  - `<game-c>` 桌面启动到 frame 1775 无 fatal(本轮只做启动冒烟,
+    表情/耳朵切换的目视验收待主人确认)。
+- **残余**:`ImageOp` 只有 `source_texture`;`TRANSITION` 的 `source2/
+  source3` 仍按活层解析,同帧被 `CGEND` 时需同样补命令时刻纹理,单列
+  后续。
