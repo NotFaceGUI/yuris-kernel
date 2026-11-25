@@ -18229,3 +18229,36 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
 - **台账**:`docs/divergences/DIV-GFX-096-screen-stage1-current-alpha.md`。
 - **残余**:MODE 3/7 的 `D3DRS_TEXTUREFACTOR` RGB 与 alpha 通道未逐项
   复测;`SPL2101` 的 `SIZE2` 目标矩形动画未逐帧对拍(与本白块无因果)。
+
+## 成果 RT-HOST-GFX-ALIGN (2026-11-25) · v555 LOOP 整数系 / 空串 / 宿主路径 / 窗口 / 立绘过渡
+
+- **fatal 收口**:`LOOP` 计数按官方整数路径求值(ysc 类型 3 → 求值表
+  `0x462095` → wrapper `0x426870` → `0x7b99c4=1`;f64 常量 `0x4287e8`
+  向零截断,`/` 走 i64)。`es_select.yst pc544` 的
+  `A*(B*2/16.6667)` 不再得到 FLT。`@("")` 按官方 `0x4289d4` 扫描语义
+  返回 0,不再 `rt.undetermined`。
+- **宿主路径**:`$_SAVE_PATH` 等注入改为 CP932 字节(内核脚本/存档层
+  口径);日文目录名不再 `sv.path.escape`。中文等 CP932 不可表示字符
+  仍走 `?` 兜底,单列 DIV-RT-081 残余。
+- **窗口尺寸**:v555 exe manifest `dpiAware True/PM` + `CreateWindowExA`
+  取 yscfg 物理客户区;桌面宿主 `LogicalSize` → `PhysicalSize`。
+  实测 `<game-c>` 1920×1080、`<v555-2>` 1280×720、`<game-b>` 1100×825。
+- **立绘过渡**:`CopyOp.dest_texture_before` + 帧末
+  `copy_source_unresolvable`/`snapshot_materializable`:源快照不可物化
+  时不发射复制、投影回退到覆写前纹理,并挂 Verbose
+  `gfx.copy.source.snapshot_missing`;正常源行为不变。
+- **证据锚点**:0.495/0.555 REA 地址见各文件注释;
+  `<game-c>` debug-ui frame 1238/1239/1255 的 `frames.jsonl` 层图。
+- **台账**:`DIV-RT-080`、`DIV-RT-081`、`DIV-HOST-003`、`DIV-GFX-097`。
+- **验证**:
+  - `cargo build --workspace --all-targets` → Finished dev profile, rc 0;
+  - `cargo test -p yu-gfx --tests` → 各套件全绿(transition 12 passed);
+  - `cargo test -p yu-rt --lib -- int_flavor cast_empty` → 2 passed;
+  - `cargo test -p yu-rt --test fixture loop_count_uses_official_integer_flavor`
+    → 1 passed;
+  - `cargo test -p yu-engine --lib -- host_paths` → 4 passed;
+  - 桌面冒烟: `<game-c>` / `<v555-2>` / `<game-b>` / `<v555-pieces>` /
+    `<v500-relirium>` 启动无 fatal(headless 240 帧)。
+- **残余**:`SPLBUFa` 在 1239 命令时刻为空的生命周期未对齐;
+  `ScriptAction::Resize` 仍逻辑像素;忙等脚本尖峰(帧 1 319 万命令、
+  切场景 65 万)未优化;更新检查持久化(COM=56/57)未实现。
