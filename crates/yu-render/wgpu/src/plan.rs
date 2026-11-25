@@ -40,6 +40,15 @@ use crate::pipelines::PipelineCache;
 use crate::surfaces::{Content, Contents, LayerSurfaces, TexRef};
 use crate::textures::{DeferredSnapshot, TargetSet, TextureCache, Vertex};
 
+/// `YU_PASS_TRACE` 开关(进程内只读一次)。
+///
+/// 旧实现逐纹理 op / 逐 copy / 每个屏幕 pass 都调 `std::env::var_os`
+/// (Windows `GetEnvironmentVariableW`);v555 场景 op 数上千时是纯 syscall 噪声。
+fn pass_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("YU_PASS_TRACE").is_some())
+}
+
 /// 单条图像加工超过这个时长无条件留痕(约一帧,用于移动端现场)。
 const SLOW_OP_WARN_US: u64 = 20_000;
 /// `YURIS_TICK_SPLIT` 诊断档的低阈值。
@@ -480,7 +489,7 @@ pub(crate) fn plan(
         };
         acc.passes += 1;
         for op in &pass.ops {
-            if std::env::var_os("YU_PASS_TRACE").is_some() {
+            if pass_trace() {
                 match op {
                     Op::Image(i) => eprintln!(
                         "[texop] f={} seq={} IMG {} -> {} {:?}",
@@ -813,7 +822,7 @@ pub(crate) fn plan(
     // 取证(`YU_PASS_TRACE=1`):逐 pass 记录目标/清屏色/draw 的纹理与类型。
     // `YU_OP_TRACE` 只看得到「规划了哪些 draw」,看不到它落在哪个 pass、
     // 采样的是哪张纹理;单帧闪黑必须靠 pass 级顺序与目标才能定位。
-    if std::env::var_os("YU_PASS_TRACE").is_some() {
+    if pass_trace() {
         for (i, p) in passes.iter().enumerate() {
             let tgt = match &p.target {
                 Some(PlannedTarget::Screen) => {
@@ -2562,7 +2571,7 @@ fn apply_copy(
         // 隐藏 UI → CGSSS 新屏）；无快照 = 上次呈现帧的真实 GPU 表面，
         // 首帧回退清屏色。
         CopySource::Screen(_) => {
-            if std::env::var_os("YU_PASS_TRACE").is_some() {
+            if pass_trace() {
                 let snap = frame.screen_snapshots.get(&copy.id);
                 eprintln!(
                     "[copy] f={} id={} src=Screen screen_snapshot={} snap_layers={} snap_passes={}",
@@ -3342,7 +3351,7 @@ fn read_back(ctx: &GpuContext, content: &Content) -> Result<Texture, String> {
 fn text_images_for_draws(
     textures: &mut TextureStore,
     draws: &[&yu_gfx::TextDraw],
-) -> BTreeMap<Vec<u8>, Texture> {
+) -> BTreeMap<Vec<u8>, Rc<Texture>> {
     let mut images = BTreeMap::new();
     for draw in draws {
         let Some(image) = &draw.image else {
@@ -3351,8 +3360,10 @@ fn text_images_for_draws(
         if images.contains_key(&image.asset) {
             continue;
         }
-        if let Ok(texture) = textures.resolve(&image.asset) {
-            images.insert(image.asset.clone(), texture.clone());
+        // `resolve_shared` 返回缓存内的 `Rc`,不再每次把整张字形页 RGBA
+        // 深拷贝一份(v555/0.500 预制字形页可达 1024²=4MB/次)。
+        if let Ok(texture) = textures.resolve_shared(&image.asset) {
+            images.insert(image.asset.clone(), texture);
         }
     }
     images

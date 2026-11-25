@@ -745,7 +745,9 @@ pub struct Vm {
     /// 命令名按 `(cur_script, cur_pc)` 从取指缓存惰性取,不逐条克隆 Rc。
     cur_script: u32,
     cur_pc: u32,
-    cur_task: String,
+    /// 当前任务 id。`other` 运行面按借用查 GOSUB 栈(仅首次插入才 clone),
+    /// 因此需要 crate 内可见。
+    pub(crate) cur_task: String,
     /// `cur_task` 对应的调度器序号(序号不变就不重写字符串)。
     cur_task_seq: u64,
     /// 本步可见的任务链投影(`TASKINFO` 的数据源;泵期间调度器被借出)。

@@ -33,6 +33,15 @@ use crate::pipelines::{FilterKind, PipelineCache};
 use crate::surfaces::{Contents, TexRef};
 use crate::textures::{TargetSet, TextureCache, Vertex};
 
+/// `YU_OP_TRACE` 开关(进程内只读一次)。
+///
+/// 旧实现在 `plan_op`/`trace_drawn` 里逐 op 调 `std::env::var_os`:
+/// Windows 上是 `GetEnvironmentVariableW`,随 op 数(上千/帧)线性增长。
+fn op_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("YU_OP_TRACE").is_some())
+}
+
 /// 计划中的一个 pass 目标。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PlannedTarget {
@@ -221,7 +230,7 @@ impl Planner<'_> {
     /// 转场闪黑这类"op 集合相同、像素不同"的现象,只有把成功绘制的层
     /// 逐条列出来才能对比;报告里的 `ops_drawn` 只是个总数。
     fn trace_drawn(&self, op: &Op) {
-        if std::env::var_os("YU_OP_TRACE").is_none() {
+        if !op_trace() {
             return;
         }
         let desc = match op {
@@ -281,7 +290,7 @@ impl Planner<'_> {
         // 取证(`YU_OP_TRACE=1`):用 `out.draws` 的增量判定这一 op 是否真的
         // 产出了绘制指令(被 skip 的分支不会 push)。逐帧对比绘制集合是定位
         // "同输入不同像素"类闪屏的唯一直接手段。
-        let trace = std::env::var_os("YU_OP_TRACE").is_some();
+        let trace = op_trace();
         let draws_before = out.draws.len();
         let r = self.plan_op_inner(op, out);
         if trace && out.draws.len() > draws_before {

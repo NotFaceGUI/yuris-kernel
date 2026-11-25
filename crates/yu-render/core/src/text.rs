@@ -1433,7 +1433,7 @@ impl TextComposer {
         w: u32,
         h: u32,
         draws: &[TextDraw],
-        images: &BTreeMap<Vec<u8>, Texture>,
+        images: &BTreeMap<Vec<u8>, Rc<Texture>>,
     ) -> TextPaintStats {
         let refs: Vec<&TextDraw> = draws.iter().collect();
         self.paint_draw_refs_assets(dst, w, h, &refs, images)
@@ -1457,7 +1457,7 @@ impl TextComposer {
         w: u32,
         h: u32,
         draws: &[&TextDraw],
-        images: &BTreeMap<Vec<u8>, Texture>,
+        images: &BTreeMap<Vec<u8>, Rc<Texture>>,
     ) -> TextPaintStats {
         let mut stats = TextPaintStats::default();
         if w == 0 || h == 0 || dst.len() < (w as usize) * (h as usize) * 4 {
@@ -1484,7 +1484,7 @@ impl TextComposer {
         h: u32,
         draw: &TextDraw,
         image: &yu_gfx::TextImage,
-        images: &BTreeMap<Vec<u8>, Texture>,
+        images: &BTreeMap<Vec<u8>, Rc<Texture>>,
         stats: &mut TextPaintStats,
     ) {
         stats.draws += 1;
@@ -1795,7 +1795,7 @@ impl TextComposer {
         base: &Texture,
         draws: &[TextDraw],
         layout: Option<&TextLayoutFrame>,
-        images: &BTreeMap<Vec<u8>, Texture>,
+        images: &BTreeMap<Vec<u8>, Rc<Texture>>,
     ) -> (Option<Texture>, TextPaintStats) {
         let refs: Vec<&TextDraw> = draws.iter().collect();
         self.compose_layer_refs_assets(base, &refs, layout, images)
@@ -1817,7 +1817,7 @@ impl TextComposer {
         base: &Texture,
         draws: &[&TextDraw],
         layout: Option<&TextLayoutFrame>,
-        images: &BTreeMap<Vec<u8>, Texture>,
+        images: &BTreeMap<Vec<u8>, Rc<Texture>>,
     ) -> (Option<Texture>, TextPaintStats) {
         if draws.is_empty() && layout.is_none() {
             return (None, TextPaintStats::default());
@@ -1878,7 +1878,7 @@ impl TextComposer {
         base_dims: (u32, u32),
         draws: &[&TextDraw],
         layout: Option<&TextLayoutFrame>,
-        images: &BTreeMap<Vec<u8>, Texture>,
+        images: &BTreeMap<Vec<u8>, Rc<Texture>>,
         resolve_base: impl FnOnce() -> Result<Rc<Texture>, String>,
     ) -> Result<(Option<ComposedLayer>, TextPaintStats), String> {
         if let Some(layout) = layout {
@@ -2812,7 +2812,7 @@ mod image_glyph_tests {
             rgba,
         };
         let mut assets = BTreeMap::new();
-        assets.insert(b"g".to_vec(), sheet);
+        assets.insert(b"g".to_vec(), Rc::new(sheet));
         let draw = image_draw_with(0, 0, None, Some((2, 2, 2, 2)));
         let (out, stats) = composer.compose_layer_assets(&base, &[draw], None, &assets);
         let out = out.expect("composed");
@@ -2843,7 +2843,7 @@ mod image_glyph_tests {
             rgba: vec![255; 2 * 2 * 4],
         };
         let mut assets = BTreeMap::new();
-        assets.insert(b"g".to_vec(), glyph);
+        assets.insert(b"g".to_vec(), Rc::new(glyph));
         let (out, stats) = composer.compose_layer_assets(
             &base,
             &[image_draw(2, 2, Some(0x40_4040))],
@@ -2891,11 +2891,11 @@ mod image_glyph_tests {
         let mut assets = BTreeMap::new();
         assets.insert(
             b"g".to_vec(),
-            Texture {
+            Rc::new(Texture {
                 width: 2,
                 height: 2,
                 rgba: vec![255; 2 * 2 * 4],
-            },
+            }),
         );
         let (out, stats) = composer
             .compose_layer_cached_assets(

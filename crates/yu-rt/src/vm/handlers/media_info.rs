@@ -572,9 +572,14 @@ impl Vm {
         // `String` = 单帧 35 万次堆分配(与 PERF-VM-HOTPATH 修的
         // `VARACT` 是同一个 bug)。
         let params: &[String] = &cmd.param_names;
-        let mut targets: Vec<crate::expr::LValue> = Vec::new();
-        let mut event_args: Vec<ArgValue> = Vec::new();
-        let mut query_args: Vec<ArgValue> = Vec::new();
+        // 每条 INFO 一次 `CGINFO` 在菜单帧可达 1360 次;单 LET 目标与
+        // 少量查询参数用内联 SmallVec,免掉每次两个堆分配。
+        let mut targets: smallvec::SmallVec<[crate::expr::LValue; 1]> = smallvec::SmallVec::new();
+        // 事件流只在 `record_events` 时构造:桌面/实时路径该开关为 false,
+        // INFO 域事件本来就会被 `Vm::emit` 丢弃;旧实现仍为每条 `CGINFO`
+        // 克隆全部参数(菜单帧 1360 次/帧,实测该命令 6µs/次)。
+        let mut event_args: Option<Vec<ArgValue>> = self.record_events.then(Vec::new);
+        let mut query_args: smallvec::SmallVec<[ArgValue; 8]> = smallvec::SmallVec::new();
         for w in &cmd.windows {
             if w.rec.length == 0 {
                 continue;
@@ -588,15 +593,20 @@ impl Vm {
                 // 契约(只含提问字段,LET 是答案目标);写回仍由 query 结果
                 // 经 write_target 完成。
                 let lv = self.eval_lvalue_window(st, w)?;
+                // 读取本身保持无条件(诊断/惰性初始化等副作用与旧路径一致);
+                // 只有“是否入事件”受 `record_events` 控制。
                 let var = self.canonical_var(lv.var);
-                if let Ok(v) = self.read_var(st, var, &lv.indices) {
-                    event_args.push(ArgValue::with_ref(w.rec.kind, v, var));
+                let read = self.read_var(st, var, &lv.indices);
+                if let (Some(args), Ok(v)) = (event_args.as_mut(), read) {
+                    args.push(ArgValue::with_ref(w.rec.kind, v, var));
                 }
                 targets.push(lv);
                 continue;
             }
             if let Ok(v) = self.eval_window(st, w) {
-                event_args.push(ArgValue::new(w.rec.kind, v.clone()));
+                if let Some(args) = event_args.as_mut() {
+                    args.push(ArgValue::new(w.rec.kind, v.clone()));
+                }
                 query_args.push(ArgValue::new(w.rec.kind, v));
             }
         }
@@ -607,7 +617,9 @@ impl Vm {
         } else {
             Domain::Graphics
         };
-        self.emit_domain(domain, name.to_string(), event_args);
+        if let Some(event_args) = event_args {
+            self.emit_domain(domain, name.to_string(), event_args);
+        }
         if targets.is_empty() {
             self.report(diag::recoverable(
                 code::rt::CMD_SLOT,

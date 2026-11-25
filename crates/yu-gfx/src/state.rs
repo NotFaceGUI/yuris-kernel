@@ -142,6 +142,22 @@ impl GfxConfig {
 /// 状态生产日志的硬上限。`image_log` 可能因同一层反复加工而增长;
 /// 超限时丢弃最旧项并计数,避免内存无界(行为在诊断里显式可见)。
 const MAX_OP_LOG: usize = 16_384;
+
+/// `YU_CG_FILE_TRACE` 取证开关(进程内只读一次)。
+///
+/// 逐条 `CG[FILE]` 查询环境变量在 v555 按钮/UI 脚本里是每帧上百次的
+/// `GetEnvironmentVariableW`;默认关闭时只应是一次 `OnceLock` 读取。
+fn cg_file_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("YU_CG_FILE_TRACE").is_some())
+}
+
+/// `YU_GLYPH_TRACE` 取证开关(进程内只读一次)。注释一直声称“开启才打印”,
+/// 但旧实现无条件 `format!` + 诊断;图像字形逐字路径会因此每字多一次分配。
+fn glyph_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("YU_GLYPH_TRACE").is_some())
+}
 struct Node {
     /// 层属性。`Arc` 共享 + 写时复制:帧投影只持引用,只有真正被命令
     /// 改写的层发生一次 `Layer` 复制(`Arc::make_mut`)。
@@ -397,6 +413,15 @@ pub struct GfxState {
     /// 克隆整套图层/pass 会让帧成本随场景复杂度线性增长(菜单打开越复杂
     /// 越卡)。快照内容在采集后不可变,共享句柄即可。
     screen_snapshots: BTreeMap<CopyId, std::sync::Arc<crate::frame::ScreenSnapshot>>,
+    /// `screen_snapshots` 的代次(insert/retain 时 +1)。
+    ///
+    /// `drop_ops_for` 每次 `CGEND` 都要判断「被删层是否出现在任一快照里」;
+    /// 旧实现每次重建 `全部快照 × layer_ids` 的集合。菜单解构帧 1400+ 次
+    /// `CGEND` 时这是纯重复工作,按代次缓存并集即可。
+    snapshot_layers_rev: u64,
+    /// `(代次, 快照 layer_ids 并集)` 缓存;代次不匹配才重建。
+    snapshot_layers_cache:
+        std::cell::RefCell<Option<(u64, std::rc::Rc<std::collections::HashSet<LayerId>>)>>,
     /// 上一呈现帧的屏幕契约指纹(见 [`Self::screen_contract_key`])。
     ///
     /// 主窗口截图命令到达时,若当前契约与该指纹相同,则命令时刻画面就是
@@ -534,6 +559,8 @@ struct ProbeCache {
     visible: rustc_hash::FxHashMap<LayerId, bool>,
     /// `transition_mask_base` 的 `tid` 记忆(帧内只扫一次 image_log)。
     mask_base: rustc_hash::FxHashMap<LayerId, Option<TextureRef>>,
+    /// `transition_mask_transform` 的 `tid` 记忆(帧内只扫一次 image_log)。
+    mask_transform: rustc_hash::FxHashMap<LayerId, MaskTransform>,
 }
 
 /// `CGINFO[ONMOUSE/ONMOUSE2/ONMOUSE3]` 需要的像素采样面。
@@ -685,6 +712,8 @@ impl GfxState {
             font_default_name: None,
             font_engine_families: Vec::new(),
             screen_snapshots: BTreeMap::new(),
+            snapshot_layers_rev: 0,
+            snapshot_layers_cache: std::cell::RefCell::new(None),
             last_screen_key: std::cell::Cell::new(None),
             last_screen_capture: None,
             windows_rev: 0,
@@ -1569,7 +1598,10 @@ impl GfxState {
         // 这里给采集当帧、尚未因真实目标层而发射的屏幕快照追加一条**内部
         // 合成 copy**:目标用 `__screen_snapshot_<id>`(不是真实图层),后端
         // 在命令序原位置物化 `targets.snapshot(id)`,不写任何真实层表面。
-        {
+        //
+        // 没有快照时整段跳过:旧实现仍每帧建 `emitted` 集合与 `by_id`
+        // HashMap(把整条 `copy_log` 收一遍),空快照场景是纯浪费。
+        if !self.screen_snapshots.is_empty() {
             let emitted: rustc_hash::FxHashSet<CopyId> = texture_ops
                 .iter()
                 .filter_map(|(_, op)| match op {
@@ -3695,7 +3727,7 @@ impl GfxState {
         let mut file = take_file(&params, &mut file_diags);
         // 取证:`YU_CG_FILE_TRACE=1` 记录每条 `CG[FILE]` 的 ID/键
         // (诊断按 detail 去重;只留唯一 ID/key 组合)。
-        if std::env::var_os("YU_CG_FILE_TRACE").is_some() {
+        if cg_file_trace() {
             let at = self
                 .cur_call
                 .map(|(script, pc)| format!("s{script}@{pc}"))
@@ -3748,7 +3780,7 @@ impl GfxState {
         let dir_shaped_file = matches!(&file, Some(TextureRef::Asset(k))
             if k.last().is_some_and(|b| *b == b'/' || *b == 0x5c));
         if dir_shaped_file {
-            if std::env::var_os("YU_CG_FILE_TRACE").is_some() {
+            if cg_file_trace() {
                 let at = self
                     .cur_call
                     .map(|(script, pc)| format!("s{script}@{pc}"))
@@ -4633,6 +4665,7 @@ impl GfxState {
             self.last_screen_capture =
                 Some((snapshot.contract_key, std::sync::Arc::clone(&snapshot)));
             self.screen_snapshots.insert(copy_id, snapshot);
+            self.snapshot_layers_rev = self.snapshot_layers_rev.wrapping_add(1);
         }
         if kind == CopyKind::Copy {
             let attrs = Arc::clone(&self.nodes[source].layer);
@@ -5346,29 +5379,31 @@ impl GfxState {
                     tint: chain.tint,
                 }),
             };
-            self.push_text_draw(t, draw.clone());
-            if let Some(image) = &draw.image {
-                // 临时取证(v555 字形山排查):`YU_GLYPH_TRACE=1` 逐次打印
-                // 降级绘制项(资产/单元/落点/页尺寸)。取证完删除。
-                self.push_diag(
-                    "CGACT",
-                    error::verbose(
-                        error::code::TEXT_IMAGE_GLYPH,
-                        format!(
-                            "外字链降级: {} -> {} asset={} cell={:?} {}x{} tint={:?} at ({},{})",
-                            source.display(),
-                            t.display(),
-                            String::from_utf8_lossy(&image.asset),
-                            image.cell,
-                            image.width,
-                            image.height,
-                            image.tint,
-                            draw.x,
-                            draw.y
+            if glyph_trace() {
+                if let Some(image) = &draw.image {
+                    // 临时取证(v555 字形山排查):`YU_GLYPH_TRACE=1` 逐次打印
+                    // 降级绘制项(资产/单元/落点/页尺寸)。
+                    self.push_diag(
+                        "CGACT",
+                        error::verbose(
+                            error::code::TEXT_IMAGE_GLYPH,
+                            format!(
+                                "外字链降级: {} -> {} asset={} cell={:?} {}x{} tint={:?} at ({},{})",
+                                source.display(),
+                                t.display(),
+                                String::from_utf8_lossy(&image.asset),
+                                image.cell,
+                                image.width,
+                                image.height,
+                                image.tint,
+                                draw.x,
+                                draw.y
+                            ),
                         ),
-                    ),
-                );
+                    );
+                }
             }
+            self.push_text_draw(t, draw);
             return true;
         }
         // 候选层被其它图像加工改写后,不能再按“纯资产字形”降级:去掉
@@ -6313,23 +6348,27 @@ impl GfxState {
             }
         }
         let mut keep = vec![true; self.image_log.len()];
-        // 快照成员集合**建一次**再查。
-        //
-        // 快照成员查询是 `快照数 × layer_ids 线性查找`(菜单帧
-        // 快照数十个 × 每份 1400+ 个 `LayerId`),而这里原本对 `image_log`
-        // 的每一项都调一次 —— `CGEND` 因此单次 9.4µs(813 次/帧 = 7.7ms,
-        // 是所有命令里最贵的一条)。集合内容在 `drop_ops_for` 期间不变,
-        // 提到循环外语义等价。
-        let snapshot_layers: Option<std::collections::HashSet<&LayerId>> =
+        // 快照成员集合按**代次**缓存:集合内容只在 `screen_snapshots` 变更
+        // 时变化,而菜单解构帧有 1400+ 次 `CGEND`;旧实现每次 `drop_ops_for`
+        // 都把「全部快照 × layer_ids」重新 collect 一遍。
+        let snapshot_layers: Option<std::rc::Rc<std::collections::HashSet<LayerId>>> =
             if self.screen_snapshots.is_empty() {
                 None
             } else {
-                Some(
-                    self.screen_snapshots
+                let rev = self.snapshot_layers_rev;
+                let mut cache = self.snapshot_layers_cache.borrow_mut();
+                if cache
+                    .as_ref()
+                    .is_none_or(|(cached_rev, _)| *cached_rev != rev)
+                {
+                    let set: std::collections::HashSet<LayerId> = self
+                        .screen_snapshots
                         .values()
-                        .flat_map(|snap| snap.layer_ids.iter())
-                        .collect(),
-                )
+                        .flat_map(|snap| snap.layer_ids.iter().cloned())
+                        .collect();
+                    *cache = Some((rev, std::rc::Rc::new(set)));
+                }
+                cache.as_ref().map(|(_, set)| std::rc::Rc::clone(set))
             };
         for i in (0..self.image_log.len()).rev() {
             let op = &self.image_log[i];
@@ -6462,6 +6501,7 @@ impl GfxState {
             .retain(|id| live.contains(id));
         self.screen_snapshots
             .retain(|id, snapshot| live.contains(id) || snapshot.frame == self.frame);
+        self.snapshot_layers_rev = self.snapshot_layers_rev.wrapping_add(1);
         // **快照元数据必须同一生命周期**。
         //
         // `snapshot_sizes`/`snapshot_files` 原来只插入、从不删除:
@@ -6824,7 +6864,7 @@ impl GfxState {
                     // 再应用一次会把 mask 反回去(tests/transition_alpha
                     // 的 RECTPAINT+REVERSE 空壳层就是这条路径)。
                     let mask_transform = if to_base.is_some() {
-                        self.transition_mask_transform(tid)
+                        self.transition_mask_transform(tid, cache)
                     } else {
                         MaskTransform::default()
                     };
@@ -6944,7 +6984,14 @@ impl GfxState {
     /// TODO(主人 2026-11-24): 主人计划重构。正确解是把图层显示状态与像素
     /// 加工分开建模、转场按官方取样点直接取表面,届时 `MaskTransform` 整段
     /// 删除,不靠采样侧补偿。
-    fn transition_mask_transform(&self, tid: &LayerId) -> MaskTransform {
+    fn transition_mask_transform(
+        &self,
+        tid: &LayerId,
+        cache: &mut ProbeCache,
+    ) -> MaskTransform {
+        if let Some(hit) = cache.mask_transform.get(tid) {
+            return *hit;
+        }
         let mut transform = MaskTransform::default();
         for op in &self.image_log {
             if op.target.as_ref() != Some(tid) || op.status != OpStatus::Executable {
@@ -6957,6 +7004,7 @@ impl GfxState {
                 _ => {}
             }
         }
+        cache.mask_transform.insert(tid.clone(), transform);
         transform
     }
 

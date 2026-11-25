@@ -1625,7 +1625,7 @@ fn apply_layer_text(
 fn text_images_for_draws(
     textures: &mut TextureStore,
     draws: &[&TextDraw],
-) -> std::collections::BTreeMap<Vec<u8>, Texture> {
+) -> std::collections::BTreeMap<Vec<u8>, std::rc::Rc<Texture>> {
     let mut images = std::collections::BTreeMap::new();
     for draw in draws {
         let Some(image) = &draw.image else {
@@ -1634,8 +1634,9 @@ fn text_images_for_draws(
         if images.contains_key(&image.asset) {
             continue;
         }
-        if let Ok(texture) = textures.resolve(&image.asset) {
-            images.insert(image.asset.clone(), texture.clone());
+        // 同 wgpu:共享缓存纹理,避免每次文本变化整页 RGBA 深拷贝。
+        if let Ok(texture) = textures.resolve_shared(&image.asset) {
+            images.insert(image.asset.clone(), texture);
         }
     }
     images

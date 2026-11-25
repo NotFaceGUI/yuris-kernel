@@ -93,9 +93,15 @@ impl Vm {
         shared.if_depth = st.if_stack.len();
         shared.loop_depth = st.loops.len();
         st.frames.push(shared);
-        let task = self.current_task().to_string();
+        // 任务名只借用查表:同名任务在首次 GOSUB 后键已存在,逐调用
+        // `to_string()` 是纯堆分配(v555 按钮/逐字宏单帧数万次)。
+        // 只有首次插入才 clone 一次。
+        let task = &self.cur_task;
         if let Some(state) = self.other.as_mut() {
-            let frames = state.gosub_frames.entry(task).or_default();
+            let frames = match state.gosub_frames.get_mut(task.as_str()) {
+                Some(frames) => frames,
+                None => state.gosub_frames.entry(task.clone()).or_default(),
+            };
             // 任务起始的第一次 GOSUB:清掉同 id 任务遗留的旧帧,并补一个
             // 任务基帧。共享 `st.frames` 在任务启动时就有根帧;本栈必须与
             // 其同深,否则顶层 `RETURN` 弹出被调帧后没有调用方可承接
@@ -127,7 +133,12 @@ impl Vm {
         if st.frames.len() <= 1 {
             return Ok(StepOutcome::Finish);
         }
-        let mut frame = GosubFrame::default();
+        // 只建返回值三组数组:旧实现建整帧 `GosubFrame`(含 3×16 个
+        // 未使用的参数槽,≈2KB 清零)。v555 单帧数万次 RETURN 时这是
+        // 主要的固定开销之一。
+        let mut ret_int: [Option<Value>; 16] = Default::default();
+        let mut ret_flt: [Option<Value>; 16] = Default::default();
+        let mut ret_str: [Option<Value>; 16] = Default::default();
         let mut flags = [false; 16];
         for w in &cmd.windows {
             if w.rec.length == 0 {
@@ -137,23 +148,23 @@ impl Vm {
             let idx = checked_param_index(n, cmd.opcode, w.rec.kind, self, "RETURN")?;
             let value = ty.coerce(self.eval_window(st, w)?);
             match ty {
-                ParamTy::Float => frame.ret_flt[idx] = Some(value),
-                ParamTy::Str => frame.ret_str[idx] = Some(value),
-                ParamTy::Int | ParamTy::Raw => frame.ret_int[idx] = Some(value),
+                ParamTy::Float => ret_flt[idx] = Some(value),
+                ParamTy::Str => ret_str[idx] = Some(value),
+                ParamTy::Int | ParamTy::Raw => ret_int[idx] = Some(value),
             }
             flags[idx] = true;
         }
         let shared = st.frames.pop().expect("帧数 > 1");
         st.if_stack.truncate(shared.if_depth);
         st.loops.truncate(shared.loop_depth);
-        let task = self.current_task().to_string();
+        let task = &self.cur_task;
         if let Some(state) = self.other.as_mut() {
-            if let Some(frames) = state.gosub_frames.get_mut(&task) {
+            if let Some(frames) = state.gosub_frames.get_mut(task.as_str()) {
                 frames.pop();
                 if let Some(caller) = frames.last_mut() {
-                    caller.ret_int = frame.ret_int;
-                    caller.ret_flt = frame.ret_flt;
-                    caller.ret_str = frame.ret_str;
+                    caller.ret_int = ret_int;
+                    caller.ret_flt = ret_flt;
+                    caller.ret_str = ret_str;
                     caller.ret_flags = flags;
                 }
             }
