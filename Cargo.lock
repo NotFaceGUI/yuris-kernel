@@ -4152,7 +4152,7 @@ dependencies = [
 
 [[package]]
 name = "yu-backend-soft"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "image",
  "log",
@@ -4168,7 +4168,7 @@ dependencies = [
 
 [[package]]
 name = "yu-backend-wgpu"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "bytemuck",
  "image",
@@ -4191,7 +4191,7 @@ dependencies = [
 
 [[package]]
 name = "yu-cli"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "log",
  "mimalloc",
@@ -4215,7 +4215,7 @@ dependencies = [
 
 [[package]]
 name = "yu-engine"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "log",
  "memchr",
@@ -4240,7 +4240,7 @@ dependencies = [
 
 [[package]]
 name = "yu-font"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "encoding_rs",
  "fontdb",
@@ -4255,7 +4255,7 @@ dependencies = [
 
 [[package]]
 name = "yu-format"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "flate2",
  "libz-sys",
@@ -4264,7 +4264,7 @@ dependencies = [
 
 [[package]]
 name = "yu-gfx"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "rustc-hash 2.1.3",
  "smallvec",
@@ -4276,7 +4276,7 @@ dependencies = [
 
 [[package]]
 name = "yu-host-android"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "bytemuck",
  "cpal",
@@ -4300,7 +4300,7 @@ dependencies = [
 
 [[package]]
 name = "yu-host-desktop"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "bytemuck",
  "cpal",
@@ -4327,7 +4327,7 @@ dependencies = [
 
 [[package]]
 name = "yu-host-disk"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -4335,7 +4335,7 @@ dependencies = [
 
 [[package]]
 name = "yu-host-ios"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "log",
  "yu-host-android",
@@ -4343,7 +4343,7 @@ dependencies = [
 
 [[package]]
 name = "yu-host-wasm"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -4352,14 +4352,14 @@ dependencies = [
 
 [[package]]
 name = "yu-log"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "log",
 ]
 
 [[package]]
 name = "yu-movie-android"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "log",
  "ndk-sys 0.6.0+11769913",
@@ -4369,7 +4369,7 @@ dependencies = [
 
 [[package]]
 name = "yu-movie-ffmpeg"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "yu-log",
  "yu-rt",
@@ -4377,7 +4377,7 @@ dependencies = [
 
 [[package]]
 name = "yu-movie-plmpeg"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "southstar-codecs",
  "yu-log",
@@ -4386,14 +4386,14 @@ dependencies = [
 
 [[package]]
 name = "yu-platform-input"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "yu-rt",
 ]
 
 [[package]]
 name = "yu-render-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "image",
  "libpng-sys",
@@ -4408,7 +4408,7 @@ dependencies = [
 
 [[package]]
 name = "yu-rt"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "rustc-hash 2.1.3",
  "smallvec",
@@ -4419,7 +4419,7 @@ dependencies = [
 
 [[package]]
 name = "yu-save"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "yu-format",
  "yu-log",
@@ -4428,7 +4428,7 @@ dependencies = [
 
 [[package]]
 name = "yu-sound"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "hound",
  "lewton",
@@ -4440,7 +4440,7 @@ dependencies = [
 
 [[package]]
 name = "yu-trace"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "yu-log",
  "yu-rt",
@@ -4449,7 +4449,7 @@ dependencies = [
 
 [[package]]
 name = "yu-vfs"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "flate2",
  "yu-format",
