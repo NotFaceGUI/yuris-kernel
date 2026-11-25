@@ -169,12 +169,14 @@ pub fn from_args(tokens: Vec<String>) -> CliResult<()> {
         );
     }
     yu_host_desktop::panic_guard::install();
-    // 门面桥共享同一个 Console 与 JSONL(单写者);失败 = 已被占用(进程内
-    // 重入),沿用现有 sink 但要留痕。
+    // 门面桥与 Console 共享同一个 JSONL 句柄:门面负责写 `sub:"log"` 行
+    // (带 file/line 元数据),Console 回调只写 stderr/面板。旧实现两边都写,
+    // 同一行会以「file=null」和「file/line 有值」两份连续出现(2026-11-25
+    // v555 实测)。失败 = 已被占用(进程内重入),沿用现有 sink 但要留痕。
     let facade_console = console.clone();
     if yu_log::facade::init_with(
         std::sync::Arc::new(move |level, target, message| {
-            facade_console.emit_facade(level, target, message);
+            facade_console.emit_facade_console_only(level, target, message);
         }),
         opened.as_ref().map(|(_, file)| file.clone()),
     )

@@ -181,7 +181,7 @@ impl Codec {
     ///
     /// 字面量/文本扫描用这个而不是只看 [`Codec::is_lead`]:lead 后跟的字节
     /// 不是合法 trail 时按单字节处理,否则会把 ASCII 界定符吞进「双字节」
-    /// (v555 黑兽2改实测:exe 静态表 = Big5,SJIS 半角假名 `0xA1..=0xDF`
+    /// (`<v555-kuro>` 实测:exe 静态表 = Big5,SJIS 半角假名 `0xA1..=0xDF`
     /// 在 Big5 下是 lead,后面紧跟闭合引号即报「字面量未闭合」)。
     ///
     /// UTF-8 下这是「多字节前缀」:3/4 字节字符的第 2 字节同样落在
@@ -381,6 +381,46 @@ impl Codec {
             }
         }
         Ok(out)
+    }
+
+    /// Unicode → 字节(**宽松**;不可映射字符按 Windows ANSI 口径写 `?`)。
+    ///
+    /// 只给「宿主 → 脚本」的路径注入用:官方是 Win32 ANSI 程序,
+    /// `GetModuleFileNameA` 对系统代码页不可表示的字符就写 `?`。内核的
+    /// `$_SAVE_PATH` 等路径变量必须与脚本/存档层看到同一个投影,否则
+    /// 含中文/韩文等的工程根会在 `sv.path.escape` 永远对不上
+    /// (2026-11-25 `<v555-2>` 实测:根目录的中文被写成 `?`)。
+    ///
+    /// 与 `yu-engine::host_paths::script_text_bytes` 同口径;两处改动必须
+    /// 同步(后续可收敛到本函数)。
+    #[must_use]
+    pub fn encode_lossy(self, text: &str, origin: &[u8]) -> Vec<u8> {
+        if self == Codec::Utf8 {
+            return text.as_bytes().to_vec();
+        }
+        match self.encode(text, origin) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                let map = encode_map(self);
+                let mut out = Vec::with_capacity(text.len());
+                for ch in text.chars() {
+                    let u = u32::from(ch);
+                    if u < 0x80 {
+                        out.push(u as u8);
+                        continue;
+                    }
+                    match map.get(&ch) {
+                        Some(&code_point) if code_point < 0x100 => out.push(code_point as u8),
+                        Some(&code_point) => {
+                            out.push((code_point & 0xFF) as u8);
+                            out.push((code_point >> 8) as u8);
+                        }
+                        None => out.push(b'?'),
+                    }
+                }
+                out
+            }
+        }
     }
 
     /// 生成器审计常量((双字节条目数, 编码别名数));测试与文档核对用。

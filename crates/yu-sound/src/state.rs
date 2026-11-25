@@ -1207,12 +1207,18 @@ impl SoundState {
             // 诊断必须带上**归一化后真正尝试的候选名**:脚本里的原始参数与
             // 实际查找键可能不同(小写归一/扩展名探测),只打原始参数会让
             // “名字被改写”与“文件确实不存在”看起来一模一样。
+            //
+            // 级别 = Verbose:官方 `FUN_0040c9b4()==1`(无候选文件)时
+            // SOUND 处理体直接 `return 0`,不报错、不弹窗(sound-ledger
+            // N0-8)。v555 商业包存在「脚本请求但包内确实没有」的 SE
+            // (sysse/sysse/sse02、`<v555-2>` 的 SYSSE/SSE01-06),WARN 会把官方
+            // 静默路径打成每次启动十几条;默认 info 档不再显示。
             let tried = candidates
                 .iter()
                 .map(|candidate| display(candidate))
                 .collect::<Vec<_>>()
                 .join(", ");
-            self.report(error::recoverable(
+            self.report(error::verbose(
                 code::FILE_MISSING,
                 format!("SOUND 文件未找到: {}（已尝试: {tried}）", display(file)),
             ));

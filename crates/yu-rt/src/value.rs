@@ -572,6 +572,50 @@ pub fn linear_offset(dims: &[usize], indices: &[i64]) -> Result<usize, yu_log::D
     linear_offset_for(None, dims, indices)
 }
 
+/// 数组下标越界/负值的官方错误诊断。
+///
+/// 证据(2026-11-25):
+/// - 0.495 表达式区 `0x4284ac..0x4284bb`:`mov ebp,[index]` / `mov esi,[dim]`
+///   / `dec esi` / `cmp ebp,esi` / `ja 0x42857a`。`ja` 是**无符号**比较,
+///   负下标按 32 位巨值参与比较 ⇒ 与正越界走同一错误 `0x1a202`
+///   (`0x42857a push 0x1a202`)。
+/// - `FUN_00465cdc(0x1a202,1)` → `FUN_004612b0` 弹官方错误对话框(返回后
+///   继续;DIV-RT-043 已证「报一次 + 让出 + 继续」)。
+/// - 手册错误文案:「配列に指定した要素値が、配列サイズを超えているか、
+///   負の値を指定しています。」——负值与越界是同一错误。
+///
+/// 因此这里用 `Recoverable`(不是 `Unimplemented`):官方语义已取证,只剩
+/// 「内核对空数组/64 位高位截断不复刻越界内存访问」的安全差异。
+fn array_index_bounds_error(
+    var: Option<VarRef>,
+    k: usize,
+    idx: i64,
+    dim: usize,
+    dims: &[usize],
+    negative: bool,
+) -> yu_log::Diag {
+    let who = var.map(|v| format!("{} ", v.display())).unwrap_or_default();
+    let detail = if negative && dim == 0 {
+        // 官方 `dim-1` 在 32 位下溢成 0xFFFFFFFF,`index=-1` 与它相等 ⇒
+        // `ja` 不跳,随后按 flat 越界读。内核不复刻该越界(安全边界)。
+        format!(
+            "{who}下标[{k}] 为负:{idx}(维长 {dims:?});官方 0x4284b9 的无符号比较在维长 0 时下溢放行,\
+             随后越界读;内核对空数组拒绝越界访问(DIV-RT-002)"
+        )
+    } else if negative {
+        format!(
+            "{who}下标[{k}] 为负:{idx}(维长 {dims:?});官方按无符号越界报 0x1a202\
+             (0.495 0x4284b9 cmp/ja;手册「負の値を指定」),本次访问忽略(DIV-RT-002)"
+        )
+    } else {
+        format!(
+            "{who}下标[{k}]={idx} 越界(第 {k} 维长度 {dim},全维 {dims:?});\
+             官方报 0x1a202 并走脚本错误路径,本次访问忽略(DIV-RT-002)"
+        )
+    };
+    diag::recoverable(code::rt::VAR_SHAPE, Boundary::Script, detail)
+}
+
 /// 同 [`linear_offset`],但诊断里带上变量标识。
 pub fn linear_offset_for(
     var: Option<VarRef>,
@@ -592,32 +636,14 @@ pub fn linear_offset_for(
     let mut flat: usize = 0;
     for (k, (&dim, &idx)) in dims.iter().zip(indices.iter()).enumerate() {
         if idx < 0 {
-            // 负下标的引擎行为未取证(引擎判据只写 `index > dims-1` 越界)。
-            // 商业语料实测出现 `-1`(常见于「空数组读末元素」)。
-            // 按军规:挂号 + 该次访问作废,不猜内存越界读(DIV-RT-002)。
-            let who = var.map(|v| format!("{} ", v.display())).unwrap_or_default(); // 缺省:仅错误文案前缀
-            return Err(diag::unimplemented(
-                code::rt::VAR_SHAPE,
-                Boundary::Script,
-                format!(
-                    "{who}下标[{k}] 为负:{idx}(维长 {dims:?});负下标语义未取证,本次访问忽略(DIV-RT-002)"
-                ),
-            ));
+            return Err(array_index_bounds_error(var, k, idx, dim, dims, true));
         }
         let idx = idx as usize;
         if idx >= dim {
-            // 引擎判据只写「`index > dims-1` → 报错 0x1a202」,而报错后
-            // 是否中止脚本未取证;商业语料实测存在越界访问(常见于
-            // 「先声明 1 长度数组、再按运行期长度用」)。按军规:
-            // 挂号 + 该次访问作废,不越界读写内存(DIV-RT-002)。
-            let who = var.map(|v| format!("{} ", v.display())).unwrap_or_default(); // 缺省:仅错误文案前缀
-            return Err(diag::unimplemented(
-                code::rt::VAR_SHAPE,
-                Boundary::Script,
-                format!(
-                    "{who}下标[{k}]={idx} 越界(第 {k} 维长度 {dim},全维 {dims:?});                     引擎报 0x1a202,后续行为未取证,本次访问忽略(DIV-RT-002)"
-                ),
-            ));
+            // 官方判据 `index > dims-1` → 0x1a202;越界与负值同一错误。
+            // 商业语料实测存在越界访问(常见于「先声明 1 长度数组、再按
+            // 运行期长度用」)。按 DIV-RT-043:报一次 + 该次访问作废。
+            return Err(array_index_bounds_error(var, k, idx as i64, dim, dims, false));
         }
         flat = flat * dim + idx;
     }
@@ -650,25 +676,11 @@ pub fn linear_offset_prefix_for(
     for (k, &idx) in indices.iter().enumerate() {
         let dim = dims[k];
         if idx < 0 {
-            let who = var.map(|v| format!("{} ", v.display())).unwrap_or_default();
-            return Err(diag::unimplemented(
-                code::rt::VAR_SHAPE,
-                Boundary::Script,
-                format!(
-                    "{who}下标[{k}] 为负:{idx}(维长 {dims:?});负下标语义未取证,本次访问忽略(DIV-RT-002)"
-                ),
-            ));
+            return Err(array_index_bounds_error(var, k, idx, dim, dims, true));
         }
         let idx = idx as usize;
         if idx >= dim {
-            let who = var.map(|v| format!("{} ", v.display())).unwrap_or_default();
-            return Err(diag::unimplemented(
-                code::rt::VAR_SHAPE,
-                Boundary::Script,
-                format!(
-                    "{who}下标[{k}]={idx} 越界(第 {k} 维长度 {dim},全维 {dims:?});                     引擎报 0x1a202,后续行为未取证,本次访问忽略(DIV-RT-002)"
-                ),
-            ));
+            return Err(array_index_bounds_error(var, k, idx as i64, dim, dims, false));
         }
         flat = flat * dim + idx;
     }
@@ -1238,6 +1250,22 @@ mod tests {
         store.declare(r, ElemType::Int, &[2, 2], &Value::Int(0));
         let d = store.write(r, &[2, 0], &Value::Int(1)).unwrap_err();
         assert_eq!(d.code.as_ref(), code::rt::VAR_SHAPE);
+    }
+
+    /// 负下标与正越界是官方同一错误 `0x1a202`(0.495 `0x4284b9` 无符号
+    /// `ja`;手册错误文案含「負の値を指定」),不再是「未取证」。
+    #[test]
+    fn negative_index_is_official_bounds_error() {
+        let mut store = VariableStore::new();
+        let r = VarRef::new(VarSpace::At, 1002);
+        store.declare(r, ElemType::Int, &[50], &Value::Int(0));
+        let d = store.read(r, &[-1]).unwrap_err();
+        assert_eq!(d.code.as_ref(), code::rt::VAR_SHAPE);
+        assert_eq!(d.severity, yu_log::Severity::Recoverable);
+        assert!(d.detail.contains("0x1a202"), "{d:?}");
+        // 前缀下标路径同一判定。
+        let d = linear_offset_prefix_for(None, &[50], &[-1]).unwrap_err();
+        assert_eq!(d.severity, yu_log::Severity::Recoverable);
     }
 
     #[test]

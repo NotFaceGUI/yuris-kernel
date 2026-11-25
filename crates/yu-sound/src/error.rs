@@ -82,6 +82,11 @@ pub fn info(code: &'static str, detail: impl Into<String>) -> Diag {
     Diag::new(code, Severity::Info, Boundary::Domain).with_detail(detail)
 }
 
+/// 只在使用方显式要最低档(`--log-level verbose`)时出现的事实。
+pub fn verbose(code: &'static str, detail: impl Into<String>) -> Diag {
+    Diag::new(code, Severity::Verbose, Boundary::Domain).with_detail(detail)
+}
+
 /// 给诊断补命令名/帧号（宿主只拿得到事件帧号）。
 pub fn at_command(mut diag: Diag, frame: u64, command: &str) -> Diag {
     diag.where_ = yu_log::Loc::script(

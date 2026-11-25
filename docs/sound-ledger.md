@@ -43,6 +43,12 @@
 | N0-13 | 装载/播放架构(整段 vs 流式) | **官方装载不整段解码**:`0x422ab0` 仅 `ov_open` + `ov_time_total`;`0x422c65` 写入 `+0x1b8/+0x1ba/+0x1bc/+0x1c6` 格式字段(`+0x1b4/+0x198` = `channels*rate` 字节/秒)后,只 `malloc` 一个 4KB 块与 `bytes_per_sec/2 + 0x1000`(**0.5 秒**)块并 `CreateSoundBuffer`(虚表 `+0xc`)。解码是播放期按需填充,不在 SOUND 命令里。`TOTALTIME` = `ov_time_total` = 最后 page granule/rate。**旧内核在 SOUND 命令里整段解出 `Vec<i16>`(语料 90s BGM ≈ 93–98ms)是架构偏差,已按官方改为流式(`yu-sound/src/stream.rs`:头部 O(1) + 0.5s 预取窗口 + 按需 `read_dec_packet_itl`)。granule 与 lewton 末包裁剪在 98/6966 个文件上 ≤36ms 不一致(lewton 不按 granule 裁剪的已知偏差);总长以官方 granule 为准,多出的样本截断、不足补静音,保证 TIME/END/LOOP 自洽。 | REA `procedure_pseudo_code 0x422ab0/0x422c65/0x4806c5`(2026-10-28);语料审计 `cargo run -p yu-engine --example audio_duration_audit`(koto 6966 文件 `header_drift=98 max_drift_ms=36`,ERIS 8 文件 0 漂移);单测 `gated_ogg_load_reads_header_only_then_streams_on_play` / `gated_ogg_stream_render_matches_full_decode` / `gated_ogg_loop_wrap_back_to_zero_reopens_stream` | Confirmed(静态 + 语料自证 + 逐样本对拍) |
 | N0-14 | 层路径树 / 音量继承 / SOUNDEND 语义 | **声音层是名字树,不是扁平表**:ID 先经 `FUN_004141e4` 规范化(前缀 `S0` = `.data:0x80bf54` → `[0x801718]`;字符表 `0x689b80` 运行时只有 `'.'`/`'/'`/`':'` 非零;`:/` 绝对写法、`//`/`./`/`../` 折叠、末尾 `/`;空格 ⇒ -1),`FUN_00414559` 按 `/` 逐段下行(节点 `+0x10` 父 / `+0x00` 首子 / `+0x0c` 兄弟 / `+0x30` 容器 / `+0x34` 声音对象)。有效音量 `FUN_00424dfc`:`v=(E==1)*VOLUME; v=v*parent_eff>>8`(每级截断),根层 `S0` 就是脚本的 `SOUND[ID=":/S0/"]`(主音量)。容器改音量(type 5 `0x42511c` → `FUN_004238e0`)时 `+0x30!=0` ⇒ `FUN_00424db8` 递归重写全部后代的有效音量。`SOUNDINFO[VOLUME]` 读 `+0x148`(自身字段)。`SOUNDEND 0x44f308` 不删节点:入队 type 0xe(`0x4253b8`,state==0 时 no-op),清文件名/停播/释放/清 START+RESTART、state=0,保留元数据/TOTALTIME/位置/PAN/PITCH/LOOP/LOOPCOUNT/E/VOLUME;ID 以 `/` 结尾时递归停止叶子后代(`0x44f388`→`0x44f3a4`)。 | REA `0x462566`(root malloc)/`0x462577`(root 声音对象)/`0x462592`(前缀复制)/`0x4625be`(前缀建根层)/`0x4141e4`/`0x414559`/`0x41478c`/`0x424dfc`/`0x424db8`/`0x4238e0`/`0x42511c`/`0x425164`/`0x4253b8`/`0x44f308`;运行时 ReadProcessMemory 层树(prefix=`S0`,S0→BGM→B1,15 频道容器,字符表 {'.','/',':'});脚本 `ERIS/Sound/es_Sound.yst` `es.SOUND.SETVOL`/`es.VOL.*.GET` | Confirmed(静态 + 运行时 + 语料) |
 
+> **2026-11-25 日志口径**:`snd.file.missing` 按 N0-8「官方静默 `return 0`」
+> 降为 `Verbose`(默认 info 不显示);v555 商业包的 `sysse/sysse/sse02`
+> (按钮 SE 表 `$1421` 前缀与完整路径叠加)与 `<v555-2>` 的 `SYSSE/SSE01-06`
+> (包内确实无 `sse.ypf`)不再打成启动 WARN。`--log-level verbose` 仍可
+> 看到完整候选名。
+
 ### 1.1 文件名归一化与扩展名探测（REA `0x40c9b4` / `0x45f348`）
 
 - `0x45f348`：整条文件名 ASCII 大写→小写（非 ASCII 不动）。

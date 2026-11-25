@@ -106,6 +106,17 @@ macro_rules! host_verbose {
     ($($arg:tt)*) => { host_emit(yu_log::console::HostLevel::Verbose, format!($($arg)*)) };
 }
 
+/// 退出摘要的 severity 排序(越小越先):先看要动作的,再看跟踪。
+fn severity_rank(severity: yu_log::Severity) -> u8 {
+    match severity {
+        yu_log::Severity::Fatal => 0,
+        yu_log::Severity::Unimplemented => 1,
+        yu_log::Severity::Recoverable => 2,
+        yu_log::Severity::Info => 3,
+        yu_log::Severity::Verbose => 4,
+    }
+}
+
 /// Windows 定时器粒度(实测:P1 固定节拍已改为 `next_frame += 1/fps`,
 /// 但 600 帧仍只有 ~41fps;`--fps 1000` 同样 ~42fps ⇒ 不是 work+睡眠
 /// 串行,而是 `ControlFlow::WaitUntil` 的等待被系统 15.6ms 粒度放大)。
@@ -939,7 +950,7 @@ fn install_debug_fonts(ctx: &egui::Context) {
                 .or_default()
                 .insert(0, name.clone());
         }
-        host_error!("yu-desktop: debug UI font: {path}");
+        host_line!("yu-desktop: debug UI font: {path}");
         break;
     }
     ctx.set_fonts(fonts);
@@ -2158,13 +2169,13 @@ impl App {
         if rows.is_empty() {
             return;
         }
-        host_error!(
+        host_line!(
             "[cmdprofile] host={} tick={tick_ms:.1}ms sampled_total={:.1}ms",
             self.frames,
             total_ns as f64 / 1e6
         );
         for (name, hits, ns) in rows {
-            host_error!(
+            host_line!(
                 "  {name}: {:.1}ms ({:.1}%) hits={hits} avg={:.3}us/op",
                 ns as f64 / 1e6,
                 ns as f64 * 100.0 / total_ns.max(1) as f64,
@@ -2177,7 +2188,7 @@ impl App {
                 .script_position(script, pc)
                 .map(|line| format!(" line {line}"))
                 .unwrap_or_default();
-            host_error!(
+            host_line!(
                 "  [site] {name} {} pc{pc}{line} hits={hits}",
                 self.engine.script_name(script)
             );
@@ -2279,7 +2290,7 @@ impl App {
         if rows.is_empty() {
             return;
         }
-        host_error!(
+        host_line!(
             "[profile] command time (host frame {}, engine frame {}, sampled total {:.1}ms):",
             self.frames,
             self.engine.last_report().frame,
@@ -2297,21 +2308,21 @@ impl App {
             } else {
                 0.0
             };
-            host_error!("  {name}: {ms:.1}ms ({share:.1}%) hits={hits} avg={per_op:.3}us/op");
+            host_line!("  {name}: {ms:.1}ms ({share:.1}%) hits={hits} avg={per_op:.3}us/op");
         }
         let [calls, init, ty, other, skips, rows] = self.engine.varact_stats();
-        host_error!(
+        host_line!(
             "  [varact] calls={calls} init={init} type={ty} other={other} \
              restore_skips={skips} restore_rows={rows}"
         );
         for ((script, pc), hits) in self.engine.take_varact_sites(5) {
-            host_error!(
+            host_line!(
                 "  [varact site] {} pc{pc} hits={hits}",
                 self.engine.script_name(script)
             );
         }
         let (ops, bytes) = self.engine.varact_op_stats();
-        host_error!(
+        host_line!(
             "  [varact ops] copy={} cut={} upper={} upper2={} lower={} lower2={} \
              hantozen={} zentohan={} src_bytes={bytes}",
             ops[0],
@@ -2330,7 +2341,7 @@ impl App {
                 .script_position(script, pc)
                 .map(|line| format!(" line {line}"))
                 .unwrap_or_default();
-            host_error!(
+            host_line!(
                 "  [site] {name} {} pc{pc}{line} hits={hits}",
                 self.engine.script_name(script)
             );
@@ -2563,9 +2574,32 @@ impl App {
         self.finish_timing();
         // 退出时把诊断摘要写进日志(JSONL + 控制台):即使窗口一闪而过,
         // 复盘也能看到挂号表与“为什么卡”的判定。
+        //
+        // 级别按 Diag 自身 severity 映射,**不能一律 ERROR**:Verbose 跟踪
+        // 不是错误;默认门面级别 warn 时也不该被它刷屏。排序同理——旧
+        // 实现按 last_frame 取前 12,高频 Verbose 会把真正的
+        // Unimplemented/Recoverable 挤出摘要(2026-11-25 v555 实测)。
         let snapshot = self.diagnostics.snapshot();
-        log::error!(
+        let has_actionable = snapshot.diag_rows.iter().any(|row| {
+            matches!(
+                row.severity,
+                yu_log::Severity::Fatal
+                    | yu_log::Severity::Unimplemented
+                    | yu_log::Severity::Recoverable
+            )
+        });
+        let header_level = if snapshot.stuck.last_fatal.is_some() {
+            log::Level::Error
+        } else if has_actionable {
+            // 有需要动作的挂号时,头部与明细同一档出现;纯 Info/Verbose 的
+            // 会话保持安静(默认门面级别 warn)。
+            log::Level::Warn
+        } else {
+            log::Level::Info
+        };
+        log::log!(
             target: "yu-desktop",
+            header_level,
             "exit diag: total={} engine_frame={} main_finished={} stuck=\"{}\" fatal={:?}",
             self.diagnostics.total_diags(),
             snapshot.stuck.engine_frame,
@@ -2573,9 +2607,26 @@ impl App {
             snapshot.stuck.hint(),
             snapshot.stuck.last_fatal
         );
-        for row in snapshot.diag_rows.iter().take(12) {
-            log::error!(
+        let mut rows: Vec<&crate::diagnostics::DiagRow> = snapshot.diag_rows.iter().collect();
+        rows.sort_by_key(|row| {
+            (
+                severity_rank(row.severity),
+                std::cmp::Reverse(row.count),
+                row.code.as_str(),
+            )
+        });
+        for row in rows.into_iter().take(12) {
+            let level = match row.severity {
+                yu_log::Severity::Fatal => log::Level::Error,
+                yu_log::Severity::Unimplemented | yu_log::Severity::Recoverable => {
+                    log::Level::Warn
+                }
+                yu_log::Severity::Info => log::Level::Info,
+                yu_log::Severity::Verbose => log::Level::Debug,
+            };
+            log::log!(
                 target: "yu-desktop",
+                level,
                 "diag {} severity={} count={} last_frame={} at {}",
                 row.code,
                 row.severity.as_str(),
@@ -2766,7 +2817,7 @@ impl ApplicationHandler for App {
                     }
                     CloseAction::SignalEngine => {
                         self.engine.request_window_close();
-                        host_error!("yu-desktop: close requested → @_WINDOW_EXEC_CLOSE=1");
+                        host_line!("yu-desktop: close requested → @_WINDOW_EXEC_CLOSE=1");
                     }
                 }
             }
@@ -3594,12 +3645,12 @@ impl ApplicationHandler for App {
                 );
             }
         }
-        if self.frames == 1 || self.frames == 4 {
+        if self.profile_commands && (self.frames == 1 || self.frames == 4) {
             let top = self.engine.top_commands(10);
             if !top.is_empty() {
-                host_error!("[profile] top commands (frame {}):", self.frames);
+                host_line!("[profile] top commands (frame {}):", self.frames);
                 for (name, hits) in top {
-                    host_error!("  {name}: {hits}");
+                    host_line!("  {name}: {hits}");
                 }
             }
         }

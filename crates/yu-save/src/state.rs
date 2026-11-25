@@ -163,6 +163,23 @@ pub const MAX_DIAGS: usize = 8192;
 /// 64 MiB 足够且能挡住 OOM。
 pub const MAX_MEM_SLOT_BYTES: u32 = 64 * 1024 * 1024;
 
+/// save 根的「脚本可见投影」:CP932 编码(不可表示字符→`?`)再解码回
+/// `String`。
+///
+/// 宿主把 `$_SAVE_PATH` 注入脚本时用的是 `Codec::encode_lossy`
+/// (`yu-engine::host_paths::script_text_bytes` 同口径);脚本再把这个
+/// 前缀拼上文件名交给 `FILEACT`。含中文/韩文的工程根在投影里变成 `?`,
+/// 与真实 Unicode 根不相等,必须先按投影匹配、再把相对部分接回真实根。
+fn script_visible_root(root: &Path) -> PathBuf {
+    use yu_format::Codec;
+    let text = root.to_string_lossy().replace('\\', "/");
+    let bytes = Codec::Cp932.encode_lossy(&text, b"save-root");
+    Codec::Cp932
+        .decode(&bytes, b"save-root")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(text))
+}
+
 impl SaveState {
     /// 构造。`writable = false` 时 FILEACT 的删除/复制被拒绝并挂号。
     ///
@@ -1340,10 +1357,14 @@ impl SaveState {
             ));
         }
         if exec {
+            // 宿主安全策略,不是「未实现」:官方 Win32 exe 会启动子进程,
+            // v555 更新检查就靠 FILEACT[EXEC] 拉起 updchk;内核明确拒绝
+            // 执行外部程序(docs/divergences/DIV-SV-EXEC-host-policy.md)。
+            // 用 Info 留痕:默认可见,但不再污染 Unimplemented 台账。
             self.push_diag(error::at_command(
-                error::unimplemented(
+                error::info(
                     code::EXEC_REFUSED,
-                    "FILEACT[EXEC] 拒绝:宿主不执行外部程序(无引擎语义取证 + 安全策略)".to_string(),
+                    "FILEACT[EXEC] 宿主安全策略拒绝外部程序(官方会启动子进程;本内核不执行 EXE)".to_string(),
                 ),
                 frame,
                 "FILEACT",
@@ -1564,20 +1585,36 @@ impl SaveState {
                     ));
                 }
             }
+            // 脚本里的绝对前缀来自宿主注入的 `$_SAVE_PATH`,是
+            // **CP932 投影**(不可表示字符已写成 `?`,见
+            // `Codec::encode_lossy`)。含中文的工程根因此与真实 Unicode
+            // 根不相等;先按投影匹配,再把相对部分接回真实根做实际 I/O。
+            let visible_root = script_visible_root(&self.root);
+            let (target, lexical_ok) = if raw == visible_root.as_path()
+                || raw.starts_with(&visible_root)
+            {
+                let rel = raw.strip_prefix(&visible_root).unwrap_or(Path::new(""));
+                let target = self.root.join(rel);
+                let ok = target == self.root || target.starts_with(&self.root);
+                (target, ok)
+            } else {
+                let ok = raw == self.root.as_path() || raw.starts_with(&self.root);
+                (raw.to_path_buf(), ok)
+            };
             // 目标可能尚不存在(`FILEACT[CREATE=1 FOLDER=...]` 建目录、
             // 新建存档文件),`canonicalize` 会失败 —— 此时退化为**词法**
             // 前缀校验。
             //
-            // 判据只能是 `raw` 等于 save 根、或位于其下;不能反写
+            // 判据只能是目标等于 save 根、或位于其下;不能反写
             // `root.starts_with(raw)` —— 那会放行 save 根的**祖先**
             // (`D:/.../project-eris` 之于 `.../project-eris/save`),
             // 等于允许脚本从上层目录读删。
-            let lexical_ok = raw == self.root.as_path() || raw.starts_with(&self.root);
-            let (Some(root), Some(resolved)) =
-                (self.fs.canonicalize(&self.root), self.fs.canonicalize(raw))
-            else {
+            let (Some(root), Some(resolved)) = (
+                self.fs.canonicalize(&self.root),
+                self.fs.canonicalize(&target),
+            ) else {
                 return if lexical_ok {
-                    Ok(raw.to_path_buf())
+                    Ok(target)
                 } else {
                     Err(error::recoverable(
                         code::PATH_ESCAPE,
@@ -1797,6 +1834,20 @@ fn decode_name(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `FILEACT[EXEC]` 是宿主安全策略,不是 Unimplemented:官方 Win32
+    /// 会启动子进程(v555 更新检查 updchk),内核拒绝,只留 Info。
+    #[test]
+    fn fileact_exec_is_host_policy_info() {
+        let mut state = SaveState::new("target/tmp/sv-exec-info", false);
+        let flag = Value::Int(1);
+        state.apply_fileact(7, &[("EXEC".to_string(), &flag)]);
+        let diags = state.take_diags();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code.as_ref(), code::EXEC_REFUSED);
+        assert_eq!(diags[0].severity.as_str(), "Info");
+        assert!(diags[0].detail.contains("宿主安全策略"), "{}", diags[0].detail);
+    }
 
     fn int_snapshot(vals: &[i64], dims: &[u32]) -> VarSnapshot {
         VarSnapshot {
@@ -2274,6 +2325,32 @@ mod tests {
     }
 }
 
+/// 含中文的工程根:脚本拿到的 `$_SAVE_PATH` 是 CP932 投影(`?`),
+/// save 层必须按同一投影匹配并映射回真实根,不能因 `?` 拒绝合法路径。
+///
+/// 回归点:`<v555-2>` 根目录每次启动 4 条
+/// `sv.path.escape`(`save30001/2.sd`),中文被写成 `?`。
+#[test]
+fn confined_path_accepts_cp932_projected_root() {
+    let abs = std::env::current_dir()
+        .expect("cwd")
+        .join("target/tmp/v555-2-cp932/save");
+    let state = SaveState::new(abs.clone(), false);
+    let visible = script_visible_root(&abs);
+    assert_ne!(visible, abs, "测试前置:根里的中文必须在 CP932 下不可表示");
+    let child = visible.join("save30001.sd");
+    let got = state
+        .confined_path(&child.to_string_lossy())
+        .expect("脚本可见投影前缀应放行");
+    assert_eq!(got, abs.join("save30001.sd"), "必须映射回真实根做 I/O");
+    // 祖先仍然拒绝:投影不能成为绕过前缀校验的后门。
+    let parent = visible.parent().expect("投影根有父目录");
+    assert!(
+        state.confined_path(&parent.to_string_lossy()).is_err(),
+        "投影根的父目录必须拒绝"
+    );
+}
+
 /// 路径越界防护:save 根的**祖先**绝不能被当作合法绝对路径。
 ///
 /// 回归点:`FILEACT[CREATE=1 FOLDER=$es.SAVEPATH]` 需要放行 save 根本身
@@ -2281,8 +2358,7 @@ mod tests {
 /// `D:/.../project-eris`(save 的父目录)一起放行 —— 脚本可以借此
 /// 在上层目录读删文件。
 #[test]
-fn confined_path_rejects_save_root_ancestor() {
-    // 生产路径的 save 根一定是**绝对**路径(宿主注入 `$_SAVE_PATH`);
+fn confined_path_rejects_save_root_ancestor() {    // 生产路径的 save 根一定是**绝对**路径(宿主注入 `$_SAVE_PATH`);
     // 这里必须同构构造,否则 `is_absolute()` 为 false 会走相对分支。
     let abs = std::env::current_dir()
         .expect("cwd")

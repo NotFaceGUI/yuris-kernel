@@ -160,6 +160,9 @@ fn missing_diag_lists_normalized_candidates() {
     let diags = s.diags();
     assert_eq!(diags.len(), 1);
     assert_eq!(diags[0].code, "snd.file.missing");
+    // 官方 `FUN_0040c9b4()==1` 时静默 return 0(N0-8) ⇒ 默认不显示,
+    // 只有 `--log-level verbose` 才作为跟踪出现。
+    assert_eq!(diags[0].severity.as_str(), "Verbose");
     let detail = &diags[0].detail;
     assert!(
         detail.contains(r"voice/\x83R\x83g\x83l\x83C\x83\x8d.ogg"),

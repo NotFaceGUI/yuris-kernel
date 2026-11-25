@@ -656,10 +656,15 @@ impl Console {
     }
 
     /// 一条内核诊断(`count` 来自 FrameDiag 聚合时 >1)。门槛过滤在
-    /// 格式化之前;同 key 命中只 `count += 1`。JSONL 无论门槛全落盘。
+    /// 格式化之前;同 key 命中只 `count += 1`。JSONL 与 stderr 走**同一
+    /// 门槛**:默认 `info` 不落 `Verbose`,要留全量现场用
+    /// `--log-level verbose`(否则 v555 单次启动 6–9 万条 Verbose 跟踪会
+    /// 把 JSONL 灌到 20MB/30s)。
     pub fn emit_diag(&mut self, diag: &Diag, count: u64) {
-        if let Some(file) = &self.opts.file {
-            file.write_diag(diag);
+        if self.opts.min.passes(diag.severity) {
+            if let Some(file) = &self.opts.file {
+                file.write_diag(diag);
+            }
         }
         let key = format!(
             "{}\u{1f}{}\u{1f}{}",
@@ -711,10 +716,32 @@ impl Console {
         }
     }
 
-    /// 门面桥一行(级别已由 FacadeLogger 过滤)。
+    /// 门面桥一行(级别已由 FacadeLogger 过滤)。同时落 JSONL。
     pub fn emit_facade(&mut self, level: FacadeLevel, target: &str, message: &str) {
-        if let Some(file) = &self.opts.file {
-            file.write_log_line(level.as_str(), target, message);
+        self.emit_facade_inner(level, target, message, true);
+    }
+
+    /// 门面桥一行,**只写控制台**。
+    ///
+    /// 桌面模式把同一个 [`JsonlFile`] 交给 `FacadeLogger` 后,由门面写
+    /// JSONL(带 file/line 元数据);控制台回调再写一遍会让同一行以
+    /// 「file=null」和「file/line 有值」两份连续出现(2026-11-25 v555
+    /// 实测)。这里只负责 stderr/面板,保证一个落盘路径。
+    pub fn emit_facade_console_only(&mut self, level: FacadeLevel, target: &str, message: &str) {
+        self.emit_facade_inner(level, target, message, false);
+    }
+
+    fn emit_facade_inner(
+        &mut self,
+        level: FacadeLevel,
+        target: &str,
+        message: &str,
+        write_file: bool,
+    ) {
+        if write_file {
+            if let Some(file) = &self.opts.file {
+                file.write_log_line(level.as_str(), target, message);
+            }
         }
         let body = format!("{target}: {message}");
         let line = format_line(
@@ -729,12 +756,14 @@ impl Console {
     }
 
     /// 宿主生命周期行(`[host]`/`[serve]`/`[run]`/`[dev]` 频道)。
+    /// JSONL 与 stderr 同一门槛(Verbose 只在 `--log-level verbose` 落盘;
+    /// 否则帧采样这类 60 帧一次的进度行会持续污染现场文件)。
     pub fn emit_host(&mut self, level: HostLevel, channel: &str, message: &str) {
-        if let Some(file) = &self.opts.file {
-            file.write_log_line(host_level_json(level), channel, message);
-        }
         if !level.passes(self.opts.min) {
             return;
+        }
+        if let Some(file) = &self.opts.file {
+            file.write_log_line(host_level_json(level), channel, message);
         }
         let line = format_line(
             elapsed_secs(),
@@ -850,6 +879,11 @@ impl ConsoleHandle {
 
     pub fn emit_facade(&self, level: FacadeLevel, target: &str, message: &str) {
         self.with_lock(|console| console.emit_facade(level, target, message));
+    }
+
+    /// 门面行已由 `FacadeLogger` 落 JSONL 时用:只写控制台。
+    pub fn emit_facade_console_only(&self, level: FacadeLevel, target: &str, message: &str) {
+        self.with_lock(|console| console.emit_facade_console_only(level, target, message));
     }
 
     pub fn emit_host(&self, level: HostLevel, channel: &str, message: &str) {
@@ -1089,6 +1123,57 @@ mod tests {
             log_line,
             "{\"sub\":\"log\",\"level\":\"info\",\"target\":\"host\",\"file\":null,\"line\":null,\"message\":\"data.ypf mounted\"}"
         );
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn jsonl_respects_min_level_for_verbose() {
+        // 默认 info 档:Verbose 跟踪只进内存聚合,不落 JSONL(否则 v555
+        // 单次启动 6–9 万条 PRODUCT/param 跟踪会灌满现场文件)。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!(
+            "yu-log-test-gate-{}.jsonl",
+            std::process::id()
+        ));
+        let file = JsonlFile::create(&path).unwrap();
+        let mut console = Console::new(ConsoleOptions {
+            color: false,
+            min: MinLevel::Normal,
+            live: false,
+            recent_cap: 0,
+            file: Some(file.clone()),
+        });
+        let verbose = Diag::new(
+            "rt.product.trace",
+            Severity::Verbose,
+            Boundary::Script,
+        )
+        .with_detail("PRODUCT[COM=3]");
+        console.emit_diag(&verbose, 1);
+        console.emit_host(HostLevel::Verbose, "host", "frame 60 sample");
+        // 门面行在桌面模式由 FacadeLogger 落盘;Console 回调只写控制台。
+        console.emit_facade_console_only(
+            crate::facade::FacadeLevel::Warn,
+            "fontdb",
+            "already written by facade",
+        );
+        console.flush();
+        file.flush();
+        assert!(
+            std::fs::read_to_string(&path).unwrap().is_empty(),
+            "Verbose 的 Diag/host 行都不应落 JSONL"
+        );
+        assert_eq!(console.agg_len(), 1, "聚合仍计数,verbose 档可回看");
+        let recoverable = Diag::recoverable("sv.path.escape", Boundary::Data)
+            .with_detail("outside root");
+        console.emit_diag(&recoverable, 1);
+        console.flush();
+        file.flush();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("sv.path.escape"), "{text}");
+        assert!(!text.contains("rt.product.trace"), "{text}");
         drop(file);
         let _ = std::fs::remove_file(&path);
     }
