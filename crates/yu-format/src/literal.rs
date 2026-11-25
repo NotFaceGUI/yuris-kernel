@@ -70,6 +70,14 @@ fn quoted_spans(codec: Codec, content: &[u8]) -> Result<Vec<(usize, usize)>, Rew
         let mut closed = None;
         while j < content.len() {
             if content[j] == b'\\' && j + 1 < content.len() {
+                // 收尾位(`limit - 1`)的 `\` + 界定符是官方字面量的真收尾
+                // (内容 = 一个 `\`,如 `<v555-kuro>` `es_fontcg.yst@358`
+                // 的 `22 5c 22`):界定符优先闭合。段内 `\"` 是翻译重写器
+                // 转义的引号,成对跳过。与 `yu-rt::expr` 的解码规则同一口径。
+                if j + 1 == content.len() - 1 && content[j + 1] == byte {
+                    closed = Some(j + 1);
+                    break;
+                }
                 j += 2;
                 continue;
             }
@@ -238,6 +246,26 @@ mod tests {
         assert_eq!(got, vec![(0, &b"A"[..])]);
         let payload = vec![0x42, 0x22, 0x00, 1, b'"', b'B', b'"'];
         assert!(segments(&payload, Codec::Cp932).is_empty());
+    }
+
+    #[test]
+    fn terminator_backslash_is_literal_content() {
+        // 官方字面量 `22 5c 22`(`<v555-kuro>` `es_fontcg.yst@358`):
+        // 收尾位 `\` + 界定符按字面 `\` + 闭合处理,内容 = 一个 `\`。
+        let payload = m_record(b"\"\\\"");
+        let got = segments(&payload, Codec::Cp932);
+        assert_eq!(got, vec![(0, &b"\\"[..])]);
+        let out = rewrite_payload(
+            Codec::Cp932,
+            &payload,
+            &[Replacement {
+                segment: 0,
+                bytes: b"B",
+            }],
+        )
+        .unwrap();
+        assert_eq!(out.applied, 1);
+        assert_eq!(out.payload.as_deref(), Some(m_record(b"\"B\"").as_slice()));
     }
 
     #[test]
