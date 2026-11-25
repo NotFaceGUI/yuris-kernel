@@ -102,6 +102,10 @@ public final class TyranorRuntimeActivity extends Activity {
         }
         leftForSettingsPage = false;
         if (hasStorageAccess()) {
+            if (gameDir == null || !new File(gameDir).isDirectory()) {
+                fail("Tyranor 指定的游戏目录不存在");
+                return;
+            }
             launchGame();
         } else {
             fail("需要「所有文件访问」权限才能读取游戏目录");
@@ -146,14 +150,25 @@ public final class TyranorRuntimeActivity extends Activity {
             return false;
         }
         File dir = new File(folder);
-        if (!dir.isAbsolute() || !dir.isDirectory()) {
-            fail("Tyranor 指定的游戏目录不存在: " + folder);
+        if (!dir.isAbsolute()) {
+            fail("Tyranor 指定的游戏目录不是绝对路径: " + folder);
             return false;
         }
+        // 先落目录/参数,再看存储权限:scoped storage 下未授权时
+        // `isDirectory()` 可能为 false,旧顺序会误报“目录不存在”且永远
+        // 不弹“所有文件访问”设置页。
         gameDir = dir.getAbsolutePath();
         settings = RuntimeSettings.parse(intent.getStringExtra(EXTRA_SETTINGS));
         String title = intent.getStringExtra(EXTRA_GAME_TITLE);
-        Log.i(TAG, "launch folder=" + gameDir
+        if (!hasStorageAccess()) {
+            requestStorage();
+            return false;
+        }
+        if (!dir.isDirectory()) {
+            fail("Tyranor 指定的游戏目录不存在: " + folder);
+            return false;
+        }
+        Log.i(TAG, "launch"
                 + (title == null || title.isEmpty() ? "" : " title=" + title)
                 + " protocol=" + protocol);
         return true;

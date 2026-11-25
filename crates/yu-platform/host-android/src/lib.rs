@@ -2690,7 +2690,8 @@ mod jni_entry {
     /// 通过 `ndk-context` 取 JavaVM/Context 来创建 AudioTrack;不初始化就在
     /// 打开音频设备时 panic(`android context was not initialized`,已实测)。
     ///
-    /// `activity` 传 Activity 实例即可(它的 Context 能拿到 AudioManager)。
+    /// `context` 传 `applicationContext`(进程级;Activity 销毁后指针不悬垂)。
+    /// 它的 Context 能拿到 AudioManager。
     #[cfg(target_os = "android")]
     #[no_mangle]
     pub extern "system" fn Java_org_yuris_kernel_NativeHost_nativeInitAndroidContext<'local>(

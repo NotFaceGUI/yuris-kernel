@@ -53,7 +53,7 @@ class GlobalSettingsActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        NativeHost.nativeInitAndroidContext(this)
+        NativeHost.nativeInitAndroidContext(applicationContext)
         state = GlobalSettingsState(applicationContext)
         SettingsPrefs.migrateLegacy(
             getSharedPreferences(SettingsPrefs.PREFS, MODE_PRIVATE),

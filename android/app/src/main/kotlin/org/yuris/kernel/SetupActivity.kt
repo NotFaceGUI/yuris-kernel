@@ -153,7 +153,7 @@ class SetupActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        NativeHost.nativeInitAndroidContext(this)
+        NativeHost.nativeInitAndroidContext(applicationContext)
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         SettingsPrefs.migrateLegacy(prefs, applicationContext)
         val incoming = intent.getStringExtra(EXTRA_GAME_DIR)
