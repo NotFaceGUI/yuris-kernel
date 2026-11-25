@@ -53,6 +53,13 @@ public final class MainActivity extends Activity
         implements android.view.TextureView.SurfaceTextureListener {
     static final String TAG = "yu-android";
     static final String ENTRY = "SYSTEM_START";
+    /**
+     * 壳内共享首选项文件名。
+     *
+     * <p>与 {@code SetupActivity.PREFS} 同值,但**不引用配置页的 Kotlin 类**:
+     * 轻量运行时模块只编译游戏页,不把 SetupActivity/Compose 带进 APK。
+     */
+    static final String PREFS = "yu_kernel";
     /** 配置界面传入的目录/入口/字体(缺省则回落到 app 私有目录)。 */
     static final String EXTRA_GAME_DIR = "game_dir";
     static final String EXTRA_SAVE_DIR = "save_dir";
@@ -532,7 +539,7 @@ public final class MainActivity extends Activity
     private void resolveInitialInputMode() {
         mouseMode = getIntent().hasExtra(EXTRA_MOUSE_MODE)
                 ? getIntent().getBooleanExtra(EXTRA_MOUSE_MODE, false)
-                : getSharedPreferences(SetupActivity.PREFS, MODE_PRIVATE)
+                : getSharedPreferences(PREFS, MODE_PRIVATE)
                         .getBoolean("mouse_mode", false);
     }
 

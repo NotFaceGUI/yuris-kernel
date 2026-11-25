@@ -19,3 +19,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "yu-android-shell"
 include(":app")
+// 轻量 Tyranor-Next 运行时模块:只有入口 + 游戏页,不含游戏库/配置页/Compose。
+include(":runtime")

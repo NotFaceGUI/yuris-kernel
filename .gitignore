@@ -40,6 +40,7 @@ android/app/src/main/jniLibs/
 android/.gradle/
 android/build/
 android/app/build/
+android/runtime/build/
 android/local.properties
 
 # iOS 构建产物:Xcode 工程由 xcodegen 生成,静态库由 tools/ios/build.sh 产出

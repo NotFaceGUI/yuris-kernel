@@ -18376,3 +18376,32 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
 - **残余**:`ImageOp` 只有 `source_texture`;`TRANSITION` 的 `source2/
   source3` 仍按活层解析,同帧被 `CGEND` 时需同样补命令时刻纹理,单列
   后续。
+
+## 成果 ANDROID-TYN-LITE-2 (2026-11-25) · 模块图标/识别判据/完整配置/产物改名
+
+- **图标**:`:runtime` 复用 `:app` 的 adaptive icon 与各密度 PNG,清单补
+  `android:icon/@roundIcon`;Tyn 模块管理与系统里显示 YU-RIS 图标
+  (`application-icon-160…640` 均已解析)。
+- **识别判据**:`scan` 从 `.ypf` + 三个 marker 扩到
+  `.ypf`/`.ymv` + `yscfg.dat`/`ys*.dll`/`data.ypf`/`data/*.ypf`/
+  `data/ysbin`/`ysbin`,与 Tyn 内置 YURIS 判据(`hasYpf`/`hasYscfgDat`/
+  `ys*.dll`/`hasYmv`)对齐,修复部分 YU-RIS 游戏落到 Winlator 的问题。
+- **完整配置**:settings 由 10 项扩到 19 项——新增 `save_codec`、`translate`
+  (运行时翻译)、`prefetch`、`snapshot_defer`、`version_badge`、`vm_profile`、
+  `asset_timing`、`tick_split`、`cg_timing`;`TyranorRuntimeActivity` 同步
+  映射到 `MainActivity` extras(`translate` 仅在
+  `<游戏目录>/translate.json` 存在时加载,`save_codec=auto` 不下发)。
+- **文本导入**:`fileImports` 增加 `translate.json`(`directory="."`,
+  `fileName="translate.json"`),配合 `translate` 开关;字体导入保持。
+- **产物名**:构建渠道 `tyranor-module` 的输出由
+  `app-tyranor-runtime-<type>-<abi>.apk` 改为
+  `yu-ris-runtime-<type>-<abi>.apk`;CI stage 与 `android/README.md`
+  同步;旧 `tyranor`(整套壳)渠道不变。
+- **验证**:
+  - `BUILD_TYPE=release YURIS_APK_CHANNEL=tyranor-module
+    YURIS_APK_VARIANTS=arm64-v8a … tools/android/build.sh arm64-v8a`
+    → `target/android-apks/yu-ris-runtime-release-arm64-v8a.apk` 6.4 MB;
+  - `aapt2 dump badging` → `com.tyranor.runtime.yuris.kernel` 0.5.2(502),
+    label `Yu-ris Runtime`,icon 资源存在,`native-code arm64-v8a`;
+  - APK 内 JSON:`settings` 19 项,`fileImports` = fonts + translate。
+- **未执行**:审查时 `adb devices` 为空,未推到真机。

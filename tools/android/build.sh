@@ -16,10 +16,11 @@
 #
 # 环境变量(都可选;CI 与本地共用同一份脚本):
 #   BUILD_TYPE=debug|release   打哪个构建类型(缺省 debug)
-#   YURIS_APK_CHANNEL=standard|tyranor
-#                              发布渠道(缺省 standard);tyranor =
-#                              Tyranor-Next 第三方运行时模块,applicationId
-#                              为 com.tyranor.runtime.yuris.kernel
+#   YURIS_APK_CHANNEL=standard|tyranor|tyranor-module
+#                              发布渠道(缺省 standard);
+#                              tyranor        = 整套壳换包名(含游戏库/配置页);
+#                              tyranor-module = 轻量运行时模块(:runtime,
+#                                               只有入口 + 游戏页,无 Compose/配置 UI)
 #   YURIS_SO_ONLY=1            只交叉编译 so 并落到 jniLibs,不跑 gradle
 #   GRADLE_FLAGS=...           覆盖传给 gradle 的参数
 #                              (缺省 `--offline`;CI 无缓存可传 `--no-daemon` 不带 offline)
@@ -65,13 +66,22 @@ case "$BUILD_TYPE" in
     ;;
 esac
 case "$CHANNEL" in
-  standard|tyranor) ;;
+  standard|tyranor|tyranor-module) ;;
   *)
-    echo "错误: YURIS_APK_CHANNEL 只接受 standard / tyranor,收到: $CHANNEL" >&2
+    echo "错误: YURIS_APK_CHANNEL 只接受 standard / tyranor / tyranor-module,收到: $CHANNEL" >&2
     exit 2
     ;;
 esac
-if [[ "$BUILD_TYPE" == "release" ]]; then
+if [[ "$CHANNEL" == "tyranor-module" ]]; then
+  # 轻量运行时模块是独立 Gradle 模块(:runtime),产物不在 :app 的输出目录。
+  if [[ "$BUILD_TYPE" == "release" ]]; then
+    GRADLE_TASK=":runtime:assembleRelease"
+    APK_PATH="android/runtime/build/outputs/apk/release/runtime-release.apk"
+  else
+    GRADLE_TASK=":runtime:assembleDebug"
+    APK_PATH="android/runtime/build/outputs/apk/debug/runtime-debug.apk"
+  fi
+elif [[ "$BUILD_TYPE" == "release" ]]; then
   GRADLE_TASK="assembleRelease"
   APK_PATH="android/app/build/outputs/apk/release/app-release.apk"
 else
@@ -188,7 +198,10 @@ if [[ -n "${GRADLE_PROJECT_ARGS:-}" ]]; then
   GRADLE_ARGS+=(${GRADLE_PROJECT_ARGS})
 fi
 # 渠道只由本脚本传;调用方在 GRADLE_PROJECT_ARGS 里显式给出时以调用方为准。
-if [[ ! " ${GRADLE_ARGS[*]:-} " =~ yurisChannel ]]; then
+# tyranor-module 走独立 :runtime 模块,不需要 :app 的渠道属性(:app 只接受
+# standard/tyranor,传进去会在配置期直接报错)。
+if [[ "$CHANNEL" != "tyranor-module" ]] &&
+  [[ ! " ${GRADLE_ARGS[*]:-} " =~ yurisChannel ]]; then
   GRADLE_ARGS+=("-PyurisChannel=$CHANNEL")
 fi
 if [[ ! " ${GRADLE_ARGS[*]:-} " =~ aapt2FromMavenOverride ]]; then
@@ -228,8 +241,10 @@ run_gradle() {
 # 发布分发:universal + 每个 ABI 一个瘦包。
 # 一次 cargo 交叉编译出两套 so,再用 -PabiFilter 让 AGP 分别打包;
 # 每个变体都会重新签名,产出的 APK 证书一致。
-if [[ "$CHANNEL" == "tyranor" ]]; then
-  # 模块包与普通包共用同一个构建类型输出路径(app-release.apk),靠落盘名区分。
+if [[ "$CHANNEL" == "tyranor-module" ]]; then
+  APK_BASE="yu-ris-runtime-${BUILD_TYPE}"
+elif [[ "$CHANNEL" == "tyranor" ]]; then
+  # 整套壳渠道与普通包共用同一个构建类型输出路径(app-release.apk),靠落盘名区分。
   APK_BASE="app-tyranor-${BUILD_TYPE}"
 else
   APK_BASE="$(basename "$APK_PATH" .apk)"
