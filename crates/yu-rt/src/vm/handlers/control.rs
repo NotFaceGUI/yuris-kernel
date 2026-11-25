@@ -51,16 +51,14 @@ impl Vm {
                     Some(String::from_utf8_lossy(&rest[..len]).into_owned())
                 })
                 .unwrap_or_default();
-            if true {
-                static SP_TRACE_N: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let n = SP_TRACE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 60 {
-                    eprintln!(
-                        "[sp] s{} pc{} -> {} args={:?}",
-                        st.script_id, cmd.pc, name, frame.args
-                    );
-                }
+            static SP_TRACE_N: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = SP_TRACE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 60 {
+                eprintln!(
+                    "[sp] s{} pc{} -> {} args={:?}",
+                    st.script_id, cmd.pc, name, frame.args
+                );
             }
         }
         if st.frames.len() > GOSUB_MAX_CALLS {
