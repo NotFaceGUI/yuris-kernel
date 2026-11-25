@@ -41,12 +41,13 @@ fn main() {
                 };
                 let label = pack.file_name().map(|s| s.to_string_lossy().into_owned());
                 for e in src.entries() {
-                    // 条目名是 CP932 原始字节(引擎按字节查表),诊断按 lossy 打印;
-                    // 分隔符统一成 `/`,否则 `voice/` 搜不到包内的 `voice\`。
-                    report(
-                        &String::from_utf8_lossy(&e.name).replace('\\', "/"),
-                        label.as_deref().unwrap_or("?"),
-                    );
+                    // 条目名是 CP932 原始字节。诊断按 CP932 正确解码(否则
+                    // 日文路径全是 U+FFFD,无法和脚本/资产键对照);极少数
+                    // 非 CP932 名字退回 lossy。
+                    let name = yu_format::Codec::Cp932
+                        .decode(&e.name, b"asset")
+                        .unwrap_or_else(|_| String::from_utf8_lossy(&e.name).into_owned());
+                    report(&name.replace('\\', "/"), label.as_deref().unwrap_or("?"));
                 }
             }
             for skipped in &set.skipped {
@@ -77,7 +78,10 @@ fn main() {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         for e in src.entries() {
-            report(&String::from_utf8_lossy(&e.name).replace('\\', "/"), &label);
+            let name = yu_format::Codec::Cp932
+                .decode(&e.name, b"asset")
+                .unwrap_or_else(|_| String::from_utf8_lossy(&e.name).into_owned());
+            report(&name.replace('\\', "/"), &label);
         }
     }
     println!("total={total} hits={hits}");
