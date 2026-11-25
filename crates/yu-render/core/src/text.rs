@@ -2233,16 +2233,23 @@ impl TextComposer {
         while self.compose_cache.len() > COMPOSE_CACHE_MAX_ENTRIES
             || self.cache_bytes > COMPOSE_CACHE_BUDGET_BYTES
         {
-            let Some(victim) = self
+            // 一次按 `last_use` 排序、淘汰最旧 1/8(至少 1 条),而不是
+            // 逐条 `min_by_key` 全表扫描。旧写法在 8192 条上限附近每次
+            // 淘汰都是 O(n),缓存满后逐字/逐层操作会退化成 O(n²)。
+            let mut victims: Vec<(u64, LayerId)> = self
                 .compose_cache
                 .iter()
-                .min_by_key(|(_, entry)| entry.last_use)
-                .map(|(id, _)| id.clone())
-            else {
+                .map(|(id, entry)| (entry.last_use, id.clone()))
+                .collect();
+            if victims.is_empty() {
                 break;
-            };
-            if let Some(entry) = self.compose_cache.remove(&victim) {
-                self.cache_bytes = self.cache_bytes.saturating_sub(entry.bytes);
+            }
+            victims.sort_unstable_by_key(|(last_use, _)| *last_use);
+            let drop_n = (victims.len() / 8).max(1);
+            for (_, id) in victims.into_iter().take(drop_n) {
+                if let Some(entry) = self.compose_cache.remove(&id) {
+                    self.cache_bytes = self.cache_bytes.saturating_sub(entry.bytes);
+                }
             }
         }
     }

@@ -215,8 +215,9 @@ pub struct LayerSurfaces {
     /// 只有这些纹理允许进池。资产的 `TexRef`(由 `resolve_ref` 临时包
     /// 出来)也长得一样,但绝不能入池 —— 否则池会把游戏资产当成可清写
     /// 的画布复用,直接破坏资产像素(`SIZE2` 从资产层取图时最容易踩到)。
-    /// id 进程内单调、永不复用,集合只增不减但每项 8 字节,可接受。
-    owned_textures: std::collections::BTreeSet<u64>,
+    /// id 进程内单调、永不复用;集合只增不减,但每项 8 字节、用哈希集
+    /// 保证 acquire 的成员判定是 O(1)(旧 BTreeSet 是 O(log n))。
+    owned_textures: rustc_hash::FxHashSet<u64>,
     frame: u64,
     next_revision: u64,
     pooled_bytes: usize,
@@ -240,7 +241,7 @@ impl LayerSurfaces {
             layers: BTreeMap::new(),
             pool: BTreeMap::new(),
             content_trim: BTreeMap::new(),
-            owned_textures: std::collections::BTreeSet::new(),
+            owned_textures: rustc_hash::FxHashSet::default(),
             frame: 0,
             next_revision: 1,
             pooled_bytes: 0,

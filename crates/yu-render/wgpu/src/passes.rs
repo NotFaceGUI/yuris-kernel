@@ -1409,12 +1409,18 @@ pub(crate) fn live_snapshots(
             live.insert(*id);
         }
     }
+    // `CopyId → 它引用的源快照` 边表:每帧建一次,后续不动点只走边。
+    // 旧实现在 pending 每弹一个 id 就把全部 pass/op 重扫一遍 ——
+    // 快照多时是 `|pending| × |ops|`,存档/菜单反复打开会线性变慢。
+    let mut copy_sources: rustc_hash::FxHashMap<CopyId, Vec<CopyId>> =
+        rustc_hash::FxHashMap::default();
     for pass in &frame.passes {
         for op in &pass.ops {
             let Op::Copy(copy) = op else { continue };
             live.insert(copy.id);
             if let Some(TextureRef::Snapshot(id)) = &copy.source_texture {
                 live.insert(*id);
+                copy_sources.entry(copy.id).or_default().push(*id);
             }
         }
     }
@@ -1441,16 +1447,10 @@ pub(crate) fn live_snapshots(
             }
         }
         // COPY 命令时刻源快照链(中间层被 CGEND 后仍由 source_texture 引用)。
-        for pass in &frame.passes {
-            for op in &pass.ops {
-                let Op::Copy(copy) = op else { continue };
-                if copy.id != id {
-                    continue;
-                }
-                if let Some(TextureRef::Snapshot(src)) = &copy.source_texture {
-                    if live.insert(*src) {
-                        pending.push(*src);
-                    }
+        if let Some(sources) = copy_sources.get(&id) {
+            for src in sources {
+                if live.insert(*src) {
+                    pending.push(*src);
                 }
             }
         }
