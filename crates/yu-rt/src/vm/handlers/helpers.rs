@@ -4,6 +4,16 @@
 
 use super::*;
 
+/// `YU_SP_TRACE` 取证开关(进程内只读一次)。
+///
+/// GOSUB 在 v555 按钮/逐字宏里每帧可达数万次;旧实现在每次 GOSUB 内调
+/// `std::env::var_os`(Windows 上是 `GetEnvironmentVariableW`),把一条
+/// 本应 ~100ns 的控制流命令放大到 ~0.4–0.6µs。开关语义不变。
+pub(crate) fn sp_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("YU_SP_TRACE").is_some())
+}
+
 impl Vm {
 
     /// 按 ysc 参数名求值全部窗口(空窗口跳过)。

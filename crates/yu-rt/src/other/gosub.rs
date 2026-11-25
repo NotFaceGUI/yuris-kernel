@@ -8,7 +8,7 @@ use crate::expr::ParamTy;
 use crate::semantics::RefIntParamMode;
 use crate::task::StepOutcome;
 use crate::value::{ElemType, Value};
-use crate::vm::handlers::helpers::{checked_param_index, windows_error};
+use crate::vm::handlers::helpers::{checked_param_index, sp_trace, windows_error};
 use crate::vm::handlers::GOSUB_MAX_CALLS;
 use crate::vm::{Cmd, ExecState, GosubFrame as SharedFrame, Vm, VmError};
 
@@ -83,6 +83,32 @@ impl Vm {
                 ParamTy::Int | ParamTy::Raw => frame.args_int[idx] = Some(value),
             }
             frame.arg_flags[idx] = true;
+        }
+        if sp_trace() {
+            let name = cmd
+                .windows
+                .first()
+                .and_then(|w| {
+                    let start = w.payload.iter().position(|b| *b == b'"')?;
+                    let rest = &w.payload[start + 1..];
+                    let len = rest.iter().position(|b| *b == b'"')?;
+                    Some(String::from_utf8_lossy(&rest[..len]).into_owned())
+                })
+                .unwrap_or_else(|| "<dynamic>".to_string());
+            static SP_TRACE_N: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = SP_TRACE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 30 {
+                eprintln!(
+                    "[sp] s{} pc{} -> {} int={:?} flt={:?} str={:?}",
+                    st.script_id,
+                    cmd.pc,
+                    name,
+                    frame.args_int.iter().filter(|v| v.is_some()).collect::<Vec<_>>(),
+                    frame.args_flt.iter().filter(|v| v.is_some()).collect::<Vec<_>>(),
+                    frame.args_str.iter().filter(|v| v.is_some()).collect::<Vec<_>>()
+                );
+            }
         }
         if st.frames.len() > GOSUB_MAX_CALLS {
             return Err(

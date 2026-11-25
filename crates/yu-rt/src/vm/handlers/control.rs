@@ -37,6 +37,32 @@ impl Vm {
             frame.args[idx] = Some(ty.coerce(value));
             frame.arg_flags[idx] = true;
         }
+        // `YU_SP_TRACE=1`:定点记录 0.500 精灵动画宏的入口参数。
+        // 只覆盖 `SP.SETADD.SET`/`SP.GO.SET`/`SP.SET.SET` 三个调用点,
+        // 默认零开销;用于核对 `@53`/`$55` 到队列参数的映射。
+        if sp_trace() {
+            let name = cmd
+                .windows
+                .first()
+                .and_then(|w| {
+                    let start = w.payload.iter().position(|b| *b == b'"')?;
+                    let rest = &w.payload[start + 1..];
+                    let len = rest.iter().position(|b| *b == b'"')?;
+                    Some(String::from_utf8_lossy(&rest[..len]).into_owned())
+                })
+                .unwrap_or_default();
+            if true {
+                static SP_TRACE_N: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = SP_TRACE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 60 {
+                    eprintln!(
+                        "[sp] s{} pc{} -> {} args={:?}",
+                        st.script_id, cmd.pc, name, frame.args
+                    );
+                }
+            }
+        }
         if st.frames.len() > GOSUB_MAX_CALLS {
             return Err(
                 crate::task::nesting_error("GOSUB", st.frames.len() - 1, GOSUB_MAX_CALLS).into(),
