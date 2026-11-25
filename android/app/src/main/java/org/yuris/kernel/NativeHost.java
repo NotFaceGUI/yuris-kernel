@@ -58,9 +58,9 @@ public final class NativeHost {
      * 后端)通过它取 JavaVM/Context 来建 AudioTrack;不初始化会在打开音频
      * 设备时 panic(`android context was not initialized`)。
      *
-     * @param activity 传 Activity 实例(其 Context 可拿到 AudioManager)。
+     * @param context 传 applicationContext(进程级,Activity 销毁后不悬垂)。
      */
-    public static native int nativeInitAndroidContext(android.app.Activity activity);
+    public static native int nativeInitAndroidContext(android.content.Context context);
 
     /** 本机可用字体族(换行分隔;空串 = 没有可枚举字体)。 */
     public static native String nativeListFonts();
