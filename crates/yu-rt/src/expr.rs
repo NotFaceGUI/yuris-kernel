@@ -1110,10 +1110,13 @@ pub fn decode_self_delimited(
 
 /// 在 `window + tail` 的视图里从 `start` 扫到界定符 `term`。
 ///
-/// 与字面量解码器同一套规则:反斜杠转义跳 2 字节;lead 字节**仅在下一个
-/// 字节是当前编码的合法 trail 时**才成对跳过。trail 不合法(如 v555 用
-/// Big5 静态表扫 SJIS 半角假名后紧跟的界定符 `0x22`)按单字节继续,
-/// 不能把界定符吞进「双字节」。
+/// 与字面量解码器同一套规则(此处只关心界定符落点,不解内容):
+/// 1. 界定符闭合优先;
+/// 2. `\` + 界定符:收尾位(`limit - 1`)是官方字面量的真收尾,按单字节
+///    让界定符命中;段内位置是翻译重写器转义的引号,成对跳过;
+/// 3. lead 字节仅在下一字节是当前编码的合法 trail 时成对跳过
+///    (`Codec::forms_two_byte`;三种编码的合法 trail 都不含 `0x22`,
+///    不会把界定符吞进「双字节」)。
 fn scan_literal_term(
     window: &[u8],
     tail: &[u8],
@@ -1133,7 +1136,19 @@ fn scan_literal_term(
             return Some(index);
         }
         if byte == b'\\' {
-            index += 2;
+            // 与字面量解码器同一条位置规则:`\` + 界定符在收尾位(limit-1)
+            // 是官方字面量的真收尾(`<v555-kuro>` 字体脚本),按单字节让
+            // 界定符闭合;在段内则是翻译重写器转义的引号,成对跳过。
+            let next = if index + 1 < window.len() {
+                Some(window[index + 1])
+            } else {
+                tail.get(index + 1 - window.len()).copied()
+            };
+            if next == Some(term) && index + 1 + 1 != limit {
+                index += 2;
+                continue;
+            }
+            index += 1;
             continue;
         }
         if codec.is_lead(byte) {
@@ -1296,16 +1311,18 @@ pub fn decode_string_literal_with(
     let mut i = 0usize;
     while i < body.len() {
         let b = body[i];
+        // 界定符检查先于转义。`\` + 界定符有两种产源,按位置区分:
+        // - 官方字面量的收尾引号(界定符 = payload 末字节;`<v555-kuro>`
+        //   `es_fontcg.yst@358` 的比较字面量 `22 5c 22`,内容 = `\`)→
+        //   `\` 保持字面,界定符闭合;
+        // - 翻译重写器(`yu-format::literal::escape`)转义的段内引号
+        //   `\"`(后面必有真正的收尾引号)→ 解成 `"`。
+        // `\n`/`\t` 等常规转义不受影响(`ysvr` 字符串初值 `a\nb` → a LF b)。
         if b == term {
             return Ok(out);
         }
         if b == b'\\' {
-            i += 1;
-            match body.get(i) {
-                Some(b'\\') => out.push(b'\\'),
-                Some(b'n') => out.push(0x0A),
-                Some(b't') => out.push(0x09),
-                Some(other) => out.push(*other),
+            match body.get(i + 1) {
                 None => {
                     return Err(diag::fatal(
                         code::rt::EXPR_MALFORMED,
@@ -1313,8 +1330,34 @@ pub fn decode_string_literal_with(
                         "字符串字面量以反斜杠结尾",
                     ))
                 }
+                Some(x) if *x == term => {
+                    if i + 1 == body.len() - 1 {
+                        // 收尾:界定符优先,`\` 字面;下一轮命中界定符闭合。
+                        out.push(b);
+                        i += 1;
+                    } else {
+                        // 段内:重写器转义引号,解回 `"`,连同 `\` 一起消费。
+                        out.push(*x);
+                        i += 2;
+                    }
+                }
+                Some(b'\\') => {
+                    out.push(b'\\');
+                    i += 2;
+                }
+                Some(b'n') => {
+                    out.push(0x0A);
+                    i += 2;
+                }
+                Some(b't') => {
+                    out.push(0x09);
+                    i += 2;
+                }
+                Some(other) => {
+                    out.push(*other);
+                    i += 2;
+                }
             }
-            i += 1;
             continue;
         }
         if codec.is_lead(b) {
@@ -1561,6 +1604,41 @@ mod tests {
         let window = [0x22u8, 0xc5, 0x40, 0x22];
         let found = scan_literal_term(&window, &[], 1, 0x22, window.len(), yu_format::Codec::Big5);
         assert_eq!(found, Some(3));
+        // 段内转义引号(重写器产物)不提前闭合:真收尾在最后。
+        let window = [0x22u8, 0x5c, 0x22, 0x5c, 0x22, 0x22];
+        let found = scan_literal_term(&window, &[], 1, 0x22, window.len(), yu_format::Codec::Big5);
+        assert_eq!(found, Some(5));
+    }
+
+    /// `<v555-kuro>` `es_fontcg.yst@358` 实测字节(2026-11-24):比较字面量
+    /// `22 5c 22` 的内容是单个 `\`(路径分隔符判定表)。收尾位的 `\` +
+    /// 界定符:界定符优先,`\` 字面;常规转义 `\n` 不受影响(`ysvr` 初值
+    /// `a\nb` → a LF b)。段内 `\"` 是翻译重写器的转义引号,解回 `"`。
+    #[test]
+    fn terminator_wins_over_escape_backslash() {
+        let raw = [0x22u8, 0x5c, 0x22];
+        let out =
+            decode_string_literal_with(&raw, yu_format::Codec::Big5).expect("backslash literal");
+        assert_eq!(out, vec![0x5c]);
+        let out =
+            decode_string_literal_with(&raw, yu_format::Codec::Cp932).expect("cp932 too");
+        assert_eq!(out, vec![0x5c]);
+
+        // 段内转义引号(重写器产物):`" \" "` → 内容 = 一个 `"`;
+        // `" \" \" "` → 内容 = 两个 `"`。
+        let raw = [0x22u8, 0x5c, 0x22, 0x22];
+        let out =
+            decode_string_literal_with(&raw, yu_format::Codec::Big5).expect("escaped quote");
+        assert_eq!(out, vec![0x22]);
+        let raw = [0x22u8, 0x5c, 0x22, 0x5c, 0x22, 0x22];
+        let out =
+            decode_string_literal_with(&raw, yu_format::Codec::Big5).expect("two escaped quotes");
+        assert_eq!(out, vec![0x22, 0x22]);
+
+        let raw = b"\"a\\nb\"";
+        let out =
+            decode_string_literal_with(raw, yu_format::Codec::Cp932).expect("newline escape");
+        assert_eq!(out, vec![b'a', 0x0a, b'b']);
     }
 
     #[test]
