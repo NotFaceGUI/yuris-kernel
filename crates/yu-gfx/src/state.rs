@@ -651,6 +651,17 @@ fn alias_legacy_layer_names(names: Vec<Option<std::rc::Rc<str>>>) -> Vec<Option<
         .collect()
 }
 
+/// `image_log` 压缩开关:默认关闭(见 `compact_baked_image_log` 的回归说明)。
+fn compact_image_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("YU_GFX_COMPACT_IMAGE_LOG").as_deref(),
+            Ok("1" | "true")
+        )
+    })
+}
+
 impl GfxState {
     /// 从工程表构造(命令表 = 参数名唯一来源)。
     ///
@@ -1254,7 +1265,17 @@ impl GfxState {
                 // 长会话防御:已烘焙、目标仍存活且不是转场 mask 的旧图像项
                 // 每 60 帧压缩一次。否则 image_log 单调涨到 16k,frame() 每帧
                 // 多遍扫描、每帧多发射 pass/表面(CPU 与显存一起变差)。
-                self.compact_baked_image_log();
+                //
+                // **默认关闭**(2026-11-25 审查):压缩会删掉两类仍被需要的
+                // 历史,已在 v555 实机复现"立绘消失又浮现":
+                // 1. `TextureRef::None` 的动画/过渡输出层,像素只由 image_log
+                //    产出;压缩后 `surface_producers()` 不再认它,层不上屏;
+                // 2. 目标在压缩时还活着、本帧稍后 `COPY2+CGEND` 的加工链,
+                //    复制只拿到命令时刻裸基图,丢 tint/MERGE。
+                // 性能实验用 `YU_GFX_COMPACT_IMAGE_LOG=1` 显式开启。
+                if compact_image_log_enabled() {
+                    self.compact_baked_image_log();
+                }
             }
             VmEvent::FrameEnd { frame } => {
                 self.frame = *frame;
@@ -1970,6 +1991,9 @@ impl GfxState {
     ///
     /// 已删目标层的项一律保留:它们仍可能被 screen snapshot/COPY 按命令
     /// 时刻重放。压缩是保守的“只删已烘焙前缀”,不改变当前像素。
+    ///
+    /// **默认不启用**(见 `FrameStart` 调用点的两条回归);仅
+    /// `YU_GFX_COMPACT_IMAGE_LOG=1` 时用于长会话性能实验。
     fn compact_baked_image_log(&mut self) {
         const COMPACT_MIN: usize = 4_096;
         if self.image_log.len() < COMPACT_MIN || self.frame % 60 != 0 {
