@@ -2918,6 +2918,49 @@ impl Vm {
         r
     }
 
+    /// 按官方「整数路径」求值单个参数窗口,得到计数/索引用的 i64。
+    ///
+    /// 证据(0.495 `yu-ris.exe`):ysc 参数类型 3(`ParamKind::Other(3)`,
+    /// `LOOP` 的 `SET` 即此型)在 `0x4620b8` 的求值表里映射到 `0x426870`;
+    /// 该 wrapper 置 `0x7b99c4=1`(整数系)后调表达式机。整数系中 f64
+    /// 常量由 `0x4287e8` 的 `or 0xC00 + fistp qword` **向零截断**,
+    /// `/`/`%` 走 i64 分支(`0x4294ec`/`0x4295a0`)。
+    ///
+    /// 这里与 [`Vm::eval_window`] 的差别只在求值系;常量/单变量快路径同样
+    /// 收口到 [`Value::to_int_param`],避免 FLT 变量绕过截断。
+    pub(crate) fn eval_window_int(
+        &mut self,
+        st: &ExecState,
+        w: &CmdWindow,
+    ) -> Result<i64, Diag> {
+        if let Some(value) = &w.const_value {
+            return value.to_int_param();
+        }
+        if let Some(simple) = w.simple {
+            let codec = self.script_codec;
+            let mut access = VmAccess { vm: self, st };
+            return Evaluator::with_codec(&mut access, codec)
+                .eval_simple(&simple)?
+                .to_int_param();
+        }
+        let instrs = match &w.instrs {
+            Some(instrs) => Rc::clone(instrs),
+            None => self.decoded_window(&w.payload)?,
+        };
+        if let Some(var) = crate::expr::single_value_var(&instrs) {
+            let mut access = VmAccess { vm: self, st };
+            return access.read(var, &[])?.to_int_param();
+        }
+        let mut stack = std::mem::take(&mut self.eval_scratch);
+        let mut access = VmAccess { vm: self, st };
+        let r = Evaluator::with_codec(&mut access, self.script_codec)
+            .with_int_flavor()
+            .eval_value_instrs(&instrs, &mut stack)
+            .and_then(|v| v.to_int_param());
+        self.eval_scratch = stack;
+        r
+    }
+
     /// 只读消费者的求值入口:常量窗口直接借用 `fill_cmd` 的折叠值,不再克隆。
     ///
     /// 语义与 [`Vm::eval_window`] 完全一致(常量/简单表达式/通用栈机同一条

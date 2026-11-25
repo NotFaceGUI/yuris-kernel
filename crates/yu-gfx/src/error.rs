@@ -99,6 +99,9 @@ pub mod code {
     pub const COPY_NO_BACKBUFFER: &str = "gfx.copy.source.no_backbuffer";
     /// 复制源层已删除且没有命令时刻纹理快照(DIV-GFX-053)。
     pub const COPY_SOURCE_GONE: &str = "gfx.copy.source.gone";
+    /// 复制源的命令时刻快照已不可物化(生产者被裁剪/未烘焙)。
+    /// 后端同码([`crate::error`] 之外的 render reason 也复用它)。
+    pub const COPY_SNAPSHOT_MISSING: &str = "gfx.copy.source.snapshot_missing";
 }
 
 pub fn fatal(code: &'static str, detail: impl Into<String>) -> Diag {

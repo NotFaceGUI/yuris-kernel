@@ -101,12 +101,43 @@ fn non_empty_var(name: &str) -> Option<String> {
 }
 
 /// 把路径转成脚本可见的字节形式(正斜杠、目录后缀 `/`)。
+///
+/// **必须按 CP932 字节注入**:内核里的脚本字符串一律是 CP932 原始字节
+/// (`Value::Str(Vec<u8>)`),存档层也按 CP932 解码文件名。旧实现把
+/// `String::into_bytes()`(UTF-8)直接注入 ⇒ 含日文的游戏根路径在脚本里
+/// 变成 `迪ｫ蠢阪…`(UTF-8 字节被当 CP932 解),`sv.path.escape` 拒绝
+/// `…/save/save30002.sd`(2026-11-25 <game-c> 实测)。
 fn script_dir(path: &Path) -> Vec<u8> {
     let mut text = path.to_string_lossy().replace('\\', "/");
     if !text.ends_with('/') {
         text.push('/');
     }
-    text.into_bytes()
+    script_text_bytes(&text)
+}
+
+/// 宿主文本 → 脚本可见字节(CP932;不可表示字符按 Windows ANSI 口径写 `?`)。
+///
+/// 官方是 win32 ANSI 程序,路径系统变量最终以系统代码页字节交给脚本;
+/// 这里保持同一口径,并保证输出始终是合法 CP932 字节流 —— 绝不把 UTF-8
+/// 字节伪装成 CP932(那会让存档/文件命令看到另一条不存在的路径)。
+fn script_text_bytes(text: &str) -> Vec<u8> {
+    use yu_format::Codec;
+    if let Ok(bytes) = Codec::Cp932.encode(text, b"host-path") {
+        return bytes;
+    }
+    let mut out = Vec::with_capacity(text.len());
+    for ch in text.chars() {
+        match Codec::Cp932.encode_char(ch) {
+            // `encode_char` 返回 `lead | trail << 8`(小端字节序)。
+            Some(code) if code <= 0xFF => out.push(code as u8),
+            Some(code) => {
+                out.push((code & 0xFF) as u8);
+                out.push((code >> 8) as u8);
+            }
+            None => out.push(b'?'),
+        }
+    }
+    out
 }
 
 /// 构造 `host_paths` 的最终值。
@@ -160,6 +191,27 @@ mod tests {
             Some(b"/home/u/Documents/".as_slice())
         );
         assert_eq!(paths.project_path, None, "手册无页 ⇒ 不猜");
+    }
+
+    /// 含日文的存档根必须按 CP932 注入:脚本/存档层按 CP932 解字节。
+    ///
+    /// 回归 <game-c> 的 `sv.path.escape`:UTF-8 注入会得到
+    /// `迪ｫ蠢阪…`(UTF-8 被当 CP932),路径永远对不上 save 根。
+    #[test]
+    fn non_ascii_save_root_is_injected_as_cp932() {
+        let root = Path::new("D:/games/猫忍テスト/save");
+        let paths = resolve_host_paths(
+            root,
+            &HostPathOverrides::default(),
+            &PlatformHome::default(),
+        );
+        let bytes = paths.save_path.expect("save_path");
+        let decoded = yu_format::Codec::Cp932
+            .decode(&bytes, b"test")
+            .expect("注入字节必须是合法 CP932");
+        assert_eq!(decoded, "D:/games/猫忍テスト/save/");
+        // 不能是 UTF-8:日文部分会解成另一串字符。
+        assert_ne!(bytes, decoded.as_bytes());
     }
 
     #[test]

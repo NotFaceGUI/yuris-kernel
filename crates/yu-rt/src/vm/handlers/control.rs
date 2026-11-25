@@ -354,20 +354,15 @@ impl Vm {
             return Err(crate::task::nesting_error("LOOP", st.loops.len(), NEST_LIMIT).into());
         }
         // SET 缺省(空窗口)= 无限(手册)。
+        //
+        // 计数按官方**整数路径**求值(0.495 REA:ysc 类型 3 → `0x426870`
+        // → `0x7b99c4=1`;f64 常量向零截断,`/` 走 i64 分支)。样本
+        // `es_select.yst:544` 的计数是 `A*(B*2/16.6667)`:官方算作
+        // `A*((B*2)/16)`,按浮点算会得到不同轮数(2026-11-25 取证)。
         let limit = if cmd.windows[0].payload.is_empty() {
             -1
         } else {
-            match self.eval_window(st, &cmd.windows[0])? {
-                Value::Int(n) => n,
-                other => {
-                    return Err(diag::fatal(
-                        code::rt::VAR_TYPE,
-                        Boundary::Script,
-                        format!("LOOP 计数必须是整数,得到 {}", other.type_name()),
-                    )
-                    .into())
-                }
-            }
+            self.eval_window_int(st, &cmd.windows[0])?
         };
         let end_pc = cmd.windows[1].rec.length;
         st.loops.push(LoopFrame {

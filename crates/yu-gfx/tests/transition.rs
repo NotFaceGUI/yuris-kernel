@@ -664,3 +664,49 @@ fn visible_size_source_reverse_is_not_carried_to_transition() {
     assert!(!op.mask_transform.flip_h);
     assert!(!op.mask_transform.flip_v);
 }
+
+/// 对照:有像素的源仍按官方语义把目标改指向复制快照。
+#[test]
+fn copy2_from_asset_source_still_repoints_destination() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "FILE", s("a")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("B")),
+                arg(&table, "CG", "FILE", s("b")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("A")),
+                arg(&table, "CGACT", "ID2", s("B")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let b = f
+        .layers
+        .iter()
+        .find(|layer| layer.id.display() == ":/W0/B")
+        .expect("B 层");
+    assert!(
+        matches!(b.texture, TextureRef::Snapshot(_)),
+        "有像素的源必须正常执行 COPY2"
+    );
+}

@@ -357,6 +357,20 @@ pub trait VarAccess {
 pub struct Evaluator<'a> {
     access: &'a mut dyn VarAccess,
     codec: yu_format::Codec,
+    /// 官方「整数路径」(`0x7b99c4` 为奇数)语义。
+    ///
+    /// 证据(0.495 `yu-ris.exe`):
+    /// - ysc 参数类型 3(`ParamKind::Other(3)`,如 `LOOP` 的 `SET`)在
+    ///   `0x4620b8` 的求值表里映射到 `0x426870`;该 wrapper 置
+    ///   `0x7b99c4=1`(整数模式)后调表达式机 `0x426760`;
+    /// - 整数模式下压 f64 常量走 `0x4287e8`:
+    ///   `or 0xC00; fldcw; fistp qword` —— 显式向零截断后只压 i64 槽;
+    /// - `/`、`%` 等的整数分支只读 i64 槽(`0x4294ec`、`0x4295a0`),
+    ///   与浮点分支互斥。
+    ///
+    /// 默认 `false`(按运行期值类型分派);仅官方整数参数的求值入口
+    /// (`Vm::eval_window_int`)打开。
+    int_flavor: bool,
 }
 
 impl<'a> Evaluator<'a> {
@@ -364,12 +378,23 @@ impl<'a> Evaluator<'a> {
         Self {
             access,
             codec: yu_format::Codec::Cp932,
+            int_flavor: false,
         }
     }
 
     /// 按执行层全局 codec 扫描字符串字面量。
     pub fn with_codec(access: &'a mut dyn VarAccess, codec: yu_format::Codec) -> Self {
-        Self { access, codec }
+        Self {
+            access,
+            codec,
+            int_flavor: false,
+        }
+    }
+
+    /// 切到官方整数路径(证据见 [`Self::int_flavor`])。
+    pub fn with_int_flavor(mut self) -> Self {
+        self.int_flavor = true;
+        self
     }
 
     /// 执行整个窗口,返回剩余栈。
@@ -659,9 +684,16 @@ impl<'a> Evaluator<'a> {
             0x4c if ins.payload.len() == 8 => {
                 stack.push(Slot::Val(Value::Int(read_i64(&ins.payload)?)))
             }
-            0x46 if ins.payload.len() == 8 => stack.push(Slot::Val(Value::Float(f64::from_bits(
-                read_i64(&ins.payload)? as u64,
-            )))),
+            0x46 if ins.payload.len() == 8 => {
+                let v = f64::from_bits(read_i64(&ins.payload)? as u64);
+                // 官方整数模式:0x4287e8 用 `or 0xC00 + fistp qword` 把 f64
+                // 向零截断后压入 i64 槽(证据见 `int_flavor` 文档)。
+                stack.push(Slot::Val(if self.int_flavor {
+                    Value::Int(v as i64)
+                } else {
+                    Value::Float(v)
+                }));
+            }
             0x4d => stack.push(Slot::Val(Value::Str(decode_string_literal_with(
                 &ins.payload,
                 self.codec,
@@ -670,6 +702,16 @@ impl<'a> Evaluator<'a> {
                 let r = var_of(ins).ok_or_else(|| malformed(ins, "变量引用载荷不是 3 字节"))?;
                 if ins.op == 0x48 {
                     let v = self.access.read(r, &[])?;
+                    // 整数模式只认 i64 槽:FLT 变量取值向零截断(§3.9.3 的
+                    // 整数路径由 `0x7b99c4` 锁定,不因值类型回退浮点)。
+                    let v = if self.int_flavor {
+                        match v {
+                            Value::Float(f) => Value::Int(f as i64),
+                            other => other,
+                        }
+                    } else {
+                        v
+                    };
                     stack.push(Slot::Val(v));
                 } else {
                     stack.push(Slot::Ref(r));
@@ -694,6 +736,10 @@ impl<'a> Evaluator<'a> {
                 for slot in stack.iter().skip(at + 1) {
                     match slot {
                         Slot::Val(Value::Int(v)) => indices.push(*v),
+                        // 整数模式下 FLT 下标向零截断(与整数路径同口径)。
+                        Slot::Val(Value::Float(v)) if self.int_flavor => {
+                            indices.push(*v as i64)
+                        }
                         Slot::Val(other) => {
                             return Err(diag::fatal(
                                 code::rt::VAR_TYPE,
@@ -745,12 +791,30 @@ impl<'a> Evaluator<'a> {
                         return Err(underflow(ins));
                     }
                 };
-                let v = binary(ins.op, &lhs, &rhs)?;
+                let v = if self.int_flavor {
+                    binary_int(ins.op, &lhs, &rhs)?
+                } else {
+                    binary(ins.op, &lhs, &rhs)?
+                };
                 stack.push(Slot::Val(v));
             }
             0x52 => {
                 let v = pop_val(stack, ins, self.access)?;
-                stack.push(Slot::Val(v.neg()?));
+                // 官方一元 `-`(0x428858):整数路径 `sub/sbb` 自减,
+                // 浮点路径 `fchs`;整数模式下 f64 先转 i64。
+                let v = if self.int_flavor {
+                    let n = int_of(&v).ok_or_else(|| {
+                        diag::fatal(
+                            code::rt::VAR_TYPE,
+                            Boundary::Script,
+                            format!("一元 - 需要数值,得到 {}", v.type_name()),
+                        )
+                    })?;
+                    Value::Int(n.wrapping_neg())
+                } else {
+                    v.neg()?
+                };
+                stack.push(Slot::Val(v));
             }
             0x69 => {
                 let v = pop_val(stack, ins, self.access)?;
@@ -793,6 +857,45 @@ fn pop_val(
         Some(Slot::Ref(r)) => access.read(r, &[]),
         None => Err(underflow(ins)),
     }
+}
+
+/// 整数路径的操作数取值:INT 原样,FLT 向零截断(官方 `fistp` 截断)。
+fn int_of(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int(i) => Some(*i),
+        Value::Float(f) => Some(*f as i64),
+        Value::Str(_) => None,
+    }
+}
+
+/// 官方整数路径的二元运算(`0x7b99c4` 奇数)。
+///
+/// 仅数值操作数走 i64;字符串仍交给 [`binary`](`+` 拼接/比较的已验证语义),
+/// 避免把字符串表达式误送进整数算术。除零与 `%` 的 0 结果沿用
+/// [`Value::div`]/[`Value::rem`] 的官方口径(0x4294ec/0x4295a0)。
+fn binary_int(op: u8, lhs: &Value, rhs: &Value) -> Result<Value, yu_log::Diag> {
+    let (Some(a), Some(b)) = (int_of(lhs), int_of(rhs)) else {
+        return binary(op, lhs, rhs);
+    };
+    Ok(match op {
+        0x2a => Value::Int(a.wrapping_mul(b)),
+        0x2b => Value::Int(a.wrapping_add(b)),
+        0x2d => Value::Int(a.wrapping_sub(b)),
+        0x2f => Value::Int(if b == 0 { 0 } else { a.wrapping_div(b) }),
+        0x25 => Value::Int(if b == 0 { 0 } else { a.wrapping_rem(b) }),
+        0x41 => Value::Int(a & b),
+        0x4f => Value::Int(a | b),
+        0x5e => Value::Int(a ^ b),
+        0x21 => Value::Int((a != b) as i64),
+        0x3d => Value::Int((a == b) as i64),
+        0x3c => Value::Int((a < b) as i64),
+        0x3e => Value::Int((a > b) as i64),
+        0x53 => Value::Int((a <= b) as i64),
+        0x5a => Value::Int((a >= b) as i64),
+        0x26 => Value::Int(((a != 0) && (b != 0)) as i64),
+        0x7c => Value::Int(((a != 0) || (b != 0)) as i64),
+        _ => unreachable!("binary_int() 调用点已限定 opcode"),
+    })
 }
 
 fn binary(op: u8, lhs: &Value, rhs: &Value) -> Result<Value, yu_log::Diag> {
@@ -1274,6 +1377,39 @@ mod tests {
         let mut w = vec![0x48, 3, 0, 0x40, 0x10, 0x00];
         w.extend_from_slice(&[0x42, 1, 0, 2, 0x2a, 0, 0, 0x42, 1, 0, 1, 0x2b, 0, 0]);
         assert_eq!(ev(&w).unwrap(), Value::Int(11));
+    }
+
+    /// 官方整数路径:FLT 常量向零截断后按 i64 运算。
+    ///
+    /// `8*2/16.6667` 官方 = `16/16` = 1;浮点系 = 1.0? 否,16/16.6667
+    /// ≈ 0.96。样本 `es_select.yst:544` 的计数正是这一形态。
+    #[test]
+    fn int_flavor_truncates_float_literals_and_uses_i64_division() {
+        let mut w = vec![0x42, 1, 0, 8, 0x42, 1, 0, 2, 0x2a, 0, 0];
+        w.extend_from_slice(&[0x46, 8, 0]);
+        w.extend_from_slice(&16.666666666666668f64.to_bits().to_le_bytes());
+        w.push(0x2f);
+        w.extend_from_slice(&[0, 0]);
+
+        let mut acc = Fixed {
+            scalar: Value::Int(8),
+            array: Vec::new(),
+        };
+        let int = Evaluator::new(&mut acc)
+            .with_int_flavor()
+            .eval_value(&w)
+            .expect("int flavor");
+        assert_eq!(int, Value::Int(1), "16 / trunc(16.6667) = 1");
+
+        let mut acc = Fixed {
+            scalar: Value::Int(8),
+            array: Vec::new(),
+        };
+        let float = Evaluator::new(&mut acc).eval_value(&w).expect("auto");
+        assert!(
+            matches!(float, Value::Float(v) if (v - 16.0 / 16.666666666666668).abs() < 1e-12),
+            "对照:浮点系是 0.96,不是 1;得到 {float:?}"
+        );
     }
 
     #[test]

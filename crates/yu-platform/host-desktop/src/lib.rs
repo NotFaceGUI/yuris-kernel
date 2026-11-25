@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use egui_wgpu::ScreenDescriptor;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -2642,13 +2642,20 @@ impl ApplicationHandler for App {
             return;
         }
         let (vw, vh) = self.viewport;
-        let logical = LogicalSize::new(
-            f64::from(self.opts.width.unwrap_or(vw)),
-            f64::from(self.opts.height.unwrap_or(vh)),
+        // 窗口客户区 = **物理像素**的 yscfg 分辨率,不是逻辑像素。
+        //
+        // 官方 v555 exe 的 manifest 是 `<dpiAware>True/PM</dpiAware>`,
+        // `FUN_00457788` 把 `in_ECX[3]/[4]`(= yscfg 宽高)直接交给
+        // `CreateWindowExA`;DPI-aware 进程里这就是物理像素。
+        // 旧实现用 `LogicalSize`:150% 缩放时 winit 再乘 1.5,1920×1080 的
+        // 工程变成 2880×1620 的窗口,和官方对不上(2026-11-25 取证)。
+        let physical = PhysicalSize::new(
+            self.opts.width.unwrap_or(vw),
+            self.opts.height.unwrap_or(vh),
         );
         let mut attrs = Window::default_attributes()
             .with_title(self.opts.title.clone())
-            .with_inner_size(logical)
+            .with_inner_size(physical)
             .with_min_inner_size(LogicalSize::new(320.0, 240.0));
         if let Some(icon) = self.opts.icon.as_ref().and_then(window_icon) {
             attrs = attrs.with_window_icon(Some(icon));

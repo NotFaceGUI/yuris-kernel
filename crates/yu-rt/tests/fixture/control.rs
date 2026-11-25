@@ -188,6 +188,57 @@ fn loop_counts_and_lc_is_visible() {
     );
 }
 
+/// LOOP 计数按官方整数路径求值(REA:ysc 类型 3 → `0x426870` → 整数系)。
+///
+/// 计数 `8*2/16.6667`:官方 = `16/16` = 1(FLT 常量向零截断、i64 除法);
+/// 按浮点算会是 0.96 ⇒ 0 轮。样本 `es_select.yst:544` 即此形态。
+#[test]
+fn loop_count_uses_official_integer_flavor() {
+    let mut b = ProjectBuilder::new();
+    let sys = b.sysvars.len() as u16;
+    b.vars = vec![VarSpec {
+        kind: 1,
+        group: 0,
+        script_id: 0,
+        var_id: sys,
+        value_type: 1,
+        dims: vec![],
+        init: Init::Int(0),
+    }];
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(OP_LOOP)
+            .window(
+                0,
+                ex::cat(&[
+                    ex::i8_(8),
+                    ex::i8_(2),
+                    ex::op(0x2a),
+                    ex::f64_(16.666666666666668),
+                    ex::op(0x2f),
+                ]),
+            )
+            .jump(3),
+        // LET[@n = @n + 1]
+        GroupSpec::new(OP_LET)
+            .window(0, ex::r#ref(0x40, sys))
+            .window(0, ex::cat(&[ex::get(0x40, sys), ex::i8_(1), ex::op(0x2b)])),
+        GroupSpec::new(OP_LOOPEND),
+        GroupSpec::new(OP_END),
+    ]];
+    let mut vm = boot(b);
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap(),
+        Value::Int(1),
+        "16/trunc(16.6667) = 1 轮;浮点口径会算成 0 轮"
+    );
+}
+
 /// `@_TIME` 在宿主注入本地时间后返回真实日期时间(存档菜单的现实日期;
 /// 未注入时仍走 1970 确定性注入时钟,DIV-RT-009)。
 #[test]

@@ -205,6 +205,12 @@ pub struct CopyOp {
     /// 帧末回放,那时源节点已不存在;因此必须在命令时刻把基础纹理固定下来
     /// (`DIV-GFX-053`)。
     pub source_texture: Option<TextureRef>,
+    /// 覆写**前**目标层的基础纹理(命令时刻)。
+    ///
+    /// 帧末若发现源快照已不可物化,投影层回退到这份纹理,避免把上一帧
+    /// 仍可见的像素换成永远建不出来的空表面(<game-c> 2026-11-25
+    /// `es_sprite` 过渡:帧 1239–1254 立绘消失)。
+    pub dest_texture_before: Option<TextureRef>,
     /// **命令执行时**源图层已登记的文本绘制项(`CopySource::Layer` 才冻结;
     /// 组源为空 —— 组内层文本由后端按组当前状态合成)。
     ///

@@ -1405,11 +1405,62 @@ impl GfxState {
                 .flat_map(|snap| snap.layer_ids.iter().cloned())
                 .collect()
         };
+        // 源快照在**帧末**已不可物化的 COPY2:不发射 pass,并把目标层在
+        // 投影里回退到覆写前的纹理。
+        //
+        // 命令时刻无法预知同帧后续复制会裁掉源快照的生产者(典型:
+        // `SPLBUFa` 的上一帧快照在 `INFO.INIT` 填充前被 `INFO.CHANGE` 读取)。
+        // 到 `frame()` 时状态已定,`snapshot_materializable` 能判准;若不回退,
+        // 目标层会指向永远建不出来的 `Snapshot`,后续过渡/缩放全空。
+        // 证据:<game-c> 2026-11-25 es_sprite 过渡帧 1239–1254。
+        let mut skipped_copies: rustc_hash::FxHashSet<CopyId> = rustc_hash::FxHashSet::default();
+        let mut copy_overrides: rustc_hash::FxHashMap<LayerId, (CopyId, TextureRef)> =
+            rustc_hash::FxHashMap::default();
+        for c in &self.copy_log {
+            if c.status != OpStatus::Executable || !matches!(c.kind, CopyKind::Copy | CopyKind::Copy2)
+            {
+                continue;
+            }
+            let dest_holds = self
+                .nodes
+                .get(&c.dest)
+                .is_some_and(|n| matches!(n.layer.texture, TextureRef::Snapshot(x) if x == c.id));
+            if !dest_holds {
+                continue;
+            }
+            if self.copy_source_unresolvable(c) {
+                skipped_copies.insert(c.id);
+                if let Some(prev) = &c.dest_texture_before {
+                    copy_overrides.insert(c.dest.clone(), (c.id, prev.clone()));
+                }
+            }
+        }
         let mut texture_ops: Vec<(u64, Op)> = Vec::new();
         for c in &self.copy_log {
             // `TEXCOPY`/`TEXSSCOPY` 是官方 PASTESPRITE/GETSS,不是本后端
             // 能执行的纹理 blit;只保留审计记录,不发射空快照 pass。
             if matches!(c.kind, CopyKind::TexCopy | CopyKind::TexSsCopy) {
+                continue;
+            }
+            if skipped_copies.contains(&c.id) {
+                // 不静默:逐帧挂号(Verbose),取证时能看到哪条复制被跳过、
+                // 目标层回退到了哪个纹理。
+                let source = match &c.source {
+                    CopySource::Layer(id) | CopySource::Group(id) | CopySource::Screen(id) => {
+                        id.display().to_string()
+                    }
+                };
+                f.diagnostics.push(crate::error::FrameDiag::new(
+                    error::code::COPY_SNAPSHOT_MISSING,
+                    yu_log::Severity::Verbose,
+                    "CGACT",
+                    format!(
+                        "跳过不可物化复制 #{}: `{}` ← `{}`;目标保留原像素",
+                        c.id.0,
+                        c.dest.display(),
+                        source
+                    ),
+                ));
                 continue;
             }
             // 复制的目标是**活层**时,只有它当前仍持有这条复制的快照
@@ -1726,7 +1777,17 @@ impl GfxState {
         f.layers = self
             .nodes
             .values()
-            .map(|n| Arc::clone(&n.layer))
+            .map(|n| {
+                let mut layer = Arc::clone(&n.layer);
+                // 被跳过的 COPY2:目标层仍持有那条不可物化的快照 ⇒ 投影里
+                // 回退到覆写前纹理,让过渡的 `from`/后续绘制仍有上一姿态。
+                if let Some((skip_id, prev)) = copy_overrides.get(&n.layer.id) {
+                    if matches!(&n.layer.texture, TextureRef::Snapshot(x) if x == skip_id) {
+                        Arc::make_mut(&mut layer).texture = prev.clone();
+                    }
+                }
+                layer
+            })
             .collect::<Vec<_>>();
         // 比较期不分配:直接比较借用字段。`seq` 全局唯一 ⇒ 键全序,
         // 不稳定排序与稳定排序结果逐位相同。
@@ -4474,6 +4535,68 @@ impl GfxState {
         }
     }
 
+    /// `frame()` 视角:该复制项在命令时刻要读的纹理是否已不可物化。
+    ///
+    /// 与后端 `resolve_source` 同口径:活层纹理与 `source_texture` 不一致
+    /// 时以命令时刻纹理为准,否则读活层当前纹理。
+    fn copy_source_unresolvable(&self, c: &CopyOp) -> bool {
+        let Some(layer) = (match &c.source {
+            CopySource::Layer(id) => self.nodes.get(id),
+            _ => None,
+        }) else {
+            return false;
+        };
+        if layer.layer.is_group() {
+            return false;
+        }
+        let texture = match &c.source_texture {
+            Some(t) if layer.layer.texture != *t => t,
+            _ => &layer.layer.texture,
+        };
+        match texture {
+            TextureRef::Snapshot(id) => !self.snapshot_materializable(*id, 8),
+            TextureRef::None => true,
+            _ => false,
+        }
+    }
+
+    /// 命令时刻快照 `id` 在当前状态下是否还能被后端物化。
+    ///
+    /// 后端只对「目标层仍持有该快照」的复制项发 pass(或直接复用已烘焙
+    /// 纹理);两条都不成立时 `resolve_ref` 报 `snapshot_missing`。
+    /// `COPY2` 覆写目标前按同口径递归检查复制链:链断的快照不能用来
+    /// 重指目标,否则会把上一帧仍可见的像素换成永远建不出来的空表面。
+    fn snapshot_materializable(&self, id: CopyId, depth: u8) -> bool {
+        if self.baked_copies.borrow().contains(&id) {
+            return true;
+        }
+        if self.screen_snapshots.contains_key(&id) {
+            return true;
+        }
+        let Some(copy) = self.copy_log.iter().rev().find(|c| c.id == id) else {
+            return false;
+        };
+        let dest_holds = self
+            .nodes
+            .get(&copy.dest)
+            .is_some_and(|n| matches!(n.layer.texture, TextureRef::Snapshot(x) if x == id));
+        if !dest_holds {
+            return false;
+        }
+        if copy.status != OpStatus::Executable || depth == 0 {
+            return false;
+        }
+        match &copy.source_texture {
+            Some(TextureRef::Snapshot(pid)) => self.snapshot_materializable(*pid, depth - 1),
+            Some(TextureRef::None) => false,
+            Some(_) => true,
+            None => match &copy.source {
+                CopySource::Layer(l) | CopySource::Group(l) => self.nodes.contains_key(l),
+                CopySource::Screen(_) => true,
+            },
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn cgact_copy(
         &mut self,
@@ -4622,6 +4745,8 @@ impl GfxState {
             CopyKind::TexCopy => OpStatus::Unimplemented("gfx.copy.texcopy.unsupported"),
             CopyKind::TexSsCopy => OpStatus::Unimplemented("gfx.copy.texsscopy.unsupported"),
         };
+        // 覆写前目标层纹理:源快照在帧末不可物化时回退(见 CopyOp 字段注释)。
+        let dest_texture_before = self.nodes.get(dest).map(|n| n.layer.texture.clone());
         self.push_copy_log(CopyOp {
             seq,
             id: copy_id,
@@ -4634,6 +4759,7 @@ impl GfxState {
                 CopySource::Layer(source.clone())
             },
             source_texture,
+            dest_texture_before,
             texts,
             dest: dest.clone(),
             region,

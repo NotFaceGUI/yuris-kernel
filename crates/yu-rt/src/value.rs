@@ -179,6 +179,26 @@ impl Value {
         }
     }
 
+    /// 官方「整数参数」的收口转换。
+    ///
+    /// - INT 原样;
+    /// - FLT **向零截断** —— 与官方整数路径的 `or 0xC00; fistp qword`
+    ///   (`0.495 yu-ris.exe:0x4287e8`,push f64 常量)以及浮点参数求值
+    ///   wrapper `0x4268a0` 的收尾转换逐指令对齐;
+    /// - STR 维持 `rt.var.type` 致命(此处没有「字符串当计数」的官方证据,
+    ///   不静默猜 0)。
+    pub fn to_int_param(&self) -> Result<i64, yu_log::Diag> {
+        match self {
+            Value::Int(v) => Ok(*v),
+            Value::Float(v) => Ok(*v as i64),
+            Value::Str(_) => Err(diag::fatal(
+                code::rt::VAR_TYPE,
+                Boundary::Script,
+                format!("整数参数收到 {}", self.type_name()),
+            )),
+        }
+    }
+
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Int(v) => Some(*v as f64),
@@ -385,6 +405,12 @@ impl Value {
             Value::Str(bytes) => {
                 let text = String::from_utf8_lossy(bytes);
                 let t = text.trim();
+                // 官方 0x4289d4:先扫「`.`/`-`/数字」,扫完**指针等于串尾**
+                // 才算合法;空串扫 0 字节即到尾部 ⇒ 走十进制解析,结果为 0。
+                // 语料 `es_scenario_macro.yst pc43` 每帧 `@("")` 依赖此行为。
+                if t.is_empty() {
+                    return Ok(Value::Int(0));
+                }
                 let parsed =
                     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
                         i64::from_str_radix(hex, 16).ok()
@@ -1144,6 +1170,16 @@ impl VariableStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `@()` 空串 = 0(官方 0x4289d4:扫 0 字节即到串尾,不报错)。
+    #[test]
+    fn cast_empty_string_to_int_is_zero() {
+        assert_eq!(Value::Str(Vec::new()).cast_to_int().unwrap(), Value::Int(0));
+        assert_eq!(
+            Value::Str(b"  ".to_vec()).cast_to_int().unwrap(),
+            Value::Int(0)
+        );
+    }
 
     #[test]
     fn row_major_last_dim_fastest() {
