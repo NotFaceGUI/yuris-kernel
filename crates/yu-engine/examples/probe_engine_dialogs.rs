@@ -91,6 +91,36 @@ fn main() -> Result<(), Failure> {
         })
         .into_iter()
         .collect::<Vec<_>>();
+    // `--spl-log`:逐帧跟踪 `SPL*` 精灵层状态,只在任一字段变化时打印。
+    // 用于标题 build 动画/淡出时序:alpha、xy、size、纹理一变就能定位到帧。
+    let spl_log = args.iter().any(|a| a == "--spl-log");
+    args.retain(|a| a != "--spl-log");
+    // `--no-render`:只跑 VM/gfx 命令流,跳过合成上屏。时间线取证要跑数千帧,
+    // 软后端逐帧上屏太慢;图层状态/alpha/尺寸不受渲染影响。
+    let no_render = args.iter().any(|a| a == "--no-render");
+    args.retain(|a| a != "--no-render");
+    // `--wgpu`:headless 走 wgpu 后端(与桌面同一条渲染路径)。
+    let wgpu = args.iter().any(|a| a == "--wgpu");
+    args.retain(|a| a != "--wgpu");
+    // `--flare-trace`:逐帧打印 SPL21/22 光照层新出现的图像加工项(含烘焙前)。
+    let flare_trace = args.iter().any(|a| a == "--flare-trace");
+    args.retain(|a| a != "--flare-trace");
+    // `--screen-at 775,785,...`:在指定帧打印屏幕层清单与图像加工链。
+    let screen_at: std::collections::BTreeSet<u32> = take_flag(&mut args, "--screen-at")
+        .map(|v| {
+            v.split(',')
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    // `--cgs-at 1101,...`:打印窗口表、CGS 层及其屏幕快照的成员层。
+    let cgs_at: std::collections::BTreeSet<u32> = take_flag(&mut args, "--cgs-at")
+        .map(|v| {
+            v.split(',')
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut args = args.into_iter();
     let root = args.next().expect("project root");
     let frames: u32 = args
@@ -104,10 +134,19 @@ fn main() -> Result<(), Failure> {
         font_bytes,
         // 探针只取画面证据;音频设备在无声/无设备环境会让 tick 阻塞。
         os_sound: false,
+        render: !no_render,
+        backend: if wgpu {
+            yu_engine::engine::Backend::Wgpu
+        } else {
+            yu_engine::engine::Backend::Soft
+        },
         ..EngineOptions::default()
     };
     let mut engine = Engine::new(project, opts)?;
     let mut answered = 0u32;
+    let mut spl_seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut spl_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut flare_seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     for frame in 0..frames {
         for &(click_frame, x, y) in &clicks {
             if click_frame == frame {
@@ -125,6 +164,10 @@ fn main() -> Result<(), Failure> {
                 use std::io::Write as _;
                 let _ = std::io::stdout().flush();
             }
+        }
+        if no_render {
+            // 只给 `--shot-at` 指定的帧打开渲染;其余帧复用上一呈现面。
+            engine.set_render_enabled(shot_at.iter().any(|(shot_frame, _)| *shot_frame == frame));
         }
         engine.tick()?;
         let pending: Vec<(u64, u8, String, String)> = engine
@@ -152,6 +195,189 @@ fn main() -> Result<(), Failure> {
                 .map_err(|d| Failure::runtime(format!("DIALOG#{id}: {}: {}", d.code, d.detail)))?;
             answered += 1;
         }
+        if cgs_at.contains(&frame) {
+            use std::io::Write as _;
+            if let Some(state) = engine.gfx_state() {
+                let f = state.frame();
+                println!("WINDOWS f{frame} count={}", f.windows.len());
+                for w in &f.windows {
+                    println!(
+                        "  W no={} set={:?} vis={} a={} xy=({},{})",
+                        w.number,
+                        w.layer_set.as_ref().map(|l| l.display()),
+                        w.visible,
+                        w.alpha,
+                        w.x,
+                        w.y
+                    );
+                }
+                for layer in &f.layers {
+                    let name = layer.id.display();
+                    if !name.contains("CGS") {
+                        continue;
+                    }
+                    println!(
+                        "  CGSL {name} z={} a={} vis={} tex={:?}",
+                        layer.z, layer.alpha, layer.visible, layer.texture
+                    );
+                    if let yu_gfx::TextureRef::Snapshot(id) = &layer.texture {
+                        if let Some(snap) = f.screen_snapshots.get(id) {
+                            println!(
+                                "    SNAP id={} frame={} layers={} passes={} texts={}",
+                                id.0,
+                                snap.frame,
+                                snap.layer_ids.len(),
+                                snap.passes.len(),
+                                snap.text_draws.len()
+                            );
+                            for lid in &snap.layer_ids {
+                                println!("      SL-{}", lid.display());
+                            }
+                        } else {
+                            println!("    SNAP id={} (not in frame table)", id.0);
+                        }
+                    }
+                }
+            }
+            let _ = std::io::stdout().flush();
+        }
+        if screen_at.contains(&frame) {
+            use std::io::Write as _;
+            if let Some(summary) = engine.frame_op_summary(0) {
+                println!(
+                    "SCREEN f{frame} passes={} screen_passes={} texture_passes={} \
+                     layer_ops={} image_ops={} copy_ops={}",
+                    summary.screen_passes + summary.offscreen_passes + summary.texture_passes,
+                    summary.screen_passes,
+                    summary.texture_passes,
+                    summary.layer_ops,
+                    summary.image_ops,
+                    summary.copy_ops
+                );
+                for row in &summary.screen_layers {
+                    println!("  SL {row}");
+                }
+                for row in &summary.image_chain {
+                    println!("  IM {row}");
+                }
+            }
+            // 烘焙/旧加工项不会出现在 `image_chain`(只列已发射项);这里把
+            // 图像日志里所有命中 SPL21/22 的项原样列出(含 SET/区域/状态),
+            // 用于定位光照层表面是怎么被写成「白色 RGB + alpha 形状」的。
+            if let Some(state) = engine.gfx_state() {
+                for op in state.images() {
+                    let src = op.source.display();
+                    let tgt = op
+                        .target
+                        .as_ref()
+                        .map(|t| t.display())
+                        .unwrap_or_else(|| "(in-place)".into());
+                    if !(src.contains("SPL21") || tgt.contains("SPL21")) {
+                        continue;
+                    }
+                    println!(
+                        "  IALL seq={} {}->{} action={} set={:?} set2={:?} sx={:?} sy={:?} region=({:?},{:?},{:?},{:?}) status={:?}",
+                        op.seq,
+                        src,
+                        tgt,
+                        op.action.name(),
+                        op.set.as_ref().and_then(|v| v.as_int()),
+                        op.set2.as_ref().and_then(|v| v.as_int()),
+                        op.sx,
+                        op.sy,
+                        op.x,
+                        op.y,
+                        op.x2,
+                        op.y2,
+                        op.status
+                    );
+                }
+            }
+            let _ = std::io::stdout().flush();
+        }
+        if flare_trace {
+            use std::io::Write as _;
+            if let Some(state) = engine.gfx_state() {
+                for op in state.images() {
+                    if flare_seen.contains(&op.seq) {
+                        continue;
+                    }
+                    let src = op.source.display();
+                    let tgt = op
+                        .target
+                        .as_ref()
+                        .map(|t| t.display())
+                        .unwrap_or_else(|| "(in-place)".into());
+                    if !(src.contains("SPL21") || src.contains("SPL22") || tgt.contains("SPL21") || tgt.contains("SPL22")) {
+                        continue;
+                    }
+                    flare_seen.insert(op.seq);
+                    println!(
+                        "FLARE f{frame} seq={} {}->{} {} set={:?} set2={:?} sx={:?} sy={:?} region=({:?},{:?},{:?},{:?}) status={:?}",
+                        op.seq,
+                        src,
+                        tgt,
+                        op.action.name(),
+                        op.set.as_ref().and_then(|v| v.as_int()),
+                        op.set2.as_ref().and_then(|v| v.as_int()),
+                        op.sx,
+                        op.sy,
+                        op.x,
+                        op.y,
+                        op.x2,
+                        op.y2,
+                        op.status
+                    );
+                }
+            }
+            let _ = std::io::stdout().flush();
+        }
+        if spl_log {
+            use std::io::Write as _;
+            if let Some(summary) = engine.frame_op_summary(0) {
+                let mut now_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+                for row in &summary.sprite_layers {
+                    if !row.contains(":/W0/SPL") {
+                        continue;
+                    }
+                    let name = row.split(" a=").next().unwrap_or(row);
+                    now_names.insert(name.to_string());
+                    if spl_seen.get(name) != Some(row) {
+                        println!("SPL f{frame} {row}");
+                        spl_seen.insert(name.to_string(), row.clone());
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+                if now_names != spl_names {
+                    let gone: Vec<&String> = spl_names.difference(&now_names).collect();
+                    let added: Vec<&String> = now_names.difference(&spl_names).collect();
+                    if !gone.is_empty() || !added.is_empty() {
+                        println!(
+                            "SPLSET f{frame} gone={:?} added={:?}",
+                            gone.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                            added.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+                        );
+                        let _ = std::io::stdout().flush();
+                    }
+                    spl_names = now_names;
+                }
+            }
+            // CGS 淡入淡出层与 `_tmptr` 遮罩:z 决定它们是否盖住 SPL 精灵。
+            if let Some(state) = engine.gfx_state() {
+                for (id, z, alpha, visible, x, y) in state.layer_snapshot() {
+                    if !(id.contains("CGS") || id.contains("_tmptr")) {
+                        continue;
+                    }
+                    let row = format!("{id} z={z} a={alpha} vis={visible} xy=({x:.1},{y:.1})");
+                    let key = format!("CGS:{id}");
+                    if spl_seen.get(&key) != Some(&row) {
+                        println!("CGS f{frame} {row}");
+                        spl_seen.insert(key, row);
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+            }
+        }
         if frame % 120 == 0 || frame + 1 == frames {
             println!(
                 "f{frame} lifecycle={:?} main_finished={} live_tasks={}",
@@ -169,9 +395,35 @@ fn main() -> Result<(), Failure> {
                 if std::env::var_os("YU_DUMP_LAYERS").is_some() {
                     if let Some(state) = engine.gfx_state() {
                         let snap = state.layer_snapshot();
-                        for (id, z, alpha, visible) in snap.iter().filter(|(_, z, _, _)| *z >= 150)
+                        for (id, z, alpha, visible, x, y) in
+                            snap.iter().filter(|(_, z, _, _, _, _)| *z >= 150)
                         {
-                            println!("  L z={z} a={alpha} vis={visible} {id}");
+                            println!("  L z={z} a={alpha} vis={visible} xy=({x:.2},{y:.2}) {id}");
+                        }
+                        for (name, id) in [("@5398", 5398u16), ("@5399", 5399), ("@5400", 5400)] {
+                            let mut vals = Vec::new();
+                            for idx in 0..8i64 {
+                                if let Some(Ok(v)) = engine.read_variable(
+                                    yu_rt::value::VarRef::new(yu_rt::value::VarSpace::At, id),
+                                    &[idx],
+                                ) {
+                                    vals.push(format!("{v:?}"));
+                                }
+                            }
+                            println!("  V {name}[0..8] {vals:?}");
+                        }
+                        for op in state.images().iter().rev().take(12) {
+                            println!(
+                                "  I seq={} action={} src={} target={:?} x={:?} y={:?} sx={:?} sy={:?}",
+                                op.seq,
+                                op.action.name(),
+                                op.source.display(),
+                                op.target.as_ref().map(|t| t.display()),
+                                op.x,
+                                op.y,
+                                op.sx,
+                                op.sy
+                            );
                         }
                     }
                 }

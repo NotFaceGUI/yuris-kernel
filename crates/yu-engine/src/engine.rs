@@ -494,6 +494,12 @@ pub struct FrameOpSummary {
     /// 加工链里同时存在新旧两条路径。这里逐条列出已执行的加工项,用来
     /// 区分「链上确实有两份」与「视觉叠加另有来源」。
     pub image_chain: Vec<String>,
+    /// **全部**图像加工日志(含本帧未发射的烘焙项),`动作/SET/区域/状态`。
+    ///
+    /// `image_chain` 只列本帧发射项,烘焙后脚本不再重发的加工(光照层
+    /// `RECTPAINT/MEIDO/MERGE` 往往只发一次)不会出现,无法回答「这块
+    /// 白色表面由哪条命令写成」。
+    pub image_log_all: Vec<String>,
     /// 本帧的**复制链**(`源→目标 kind` 摘要)。
     ///
     /// 与 [`Self::image_chain`] 互补:过渡的 `from` 缓冲(`SPLBUFa/b` 的无
@@ -505,6 +511,12 @@ pub struct FrameOpSummary {
     /// `solid_fill_texture` 会把它铺满整层,过渡的 from 若退化成基图就会
     /// 变成**整块纯色**,宏观表现是「画面被提亮一层」。
     pub sprite_layers: Vec<String>,
+    /// 本帧的**双纹理过渡链**(`层 from→to fade/t tid mask`)。
+    ///
+    /// 过渡层不出现在 `screen_layers`(它是 `Op::Transition`,不是
+    /// `Op::Layer`)。白色/旧姿态整块残留在屏幕上时,只有这一项能指出
+    /// 「哪一层、哪对纹理、mask 是谁、fade 走到哪」。
+    pub transition_chain: Vec<String>,
 }
 
 /// 等待中的任务(H-P1-02;`Scheduler::nodes` 的等待面投影)。
@@ -895,6 +907,14 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// 运行中开关合成上屏(诊断用;只影响 `tick` 的渲染分支,不改 VM 语义)。
+    ///
+    /// 用途:长跑取证时先以 `render=false` 快进到目标帧,再只在需要的帧
+    /// 打开渲染并落 PNG,避免软后端逐帧上屏的数十倍开销。
+    pub fn set_render_enabled(&mut self, enabled: bool) {
+        self.opts.render = enabled;
+    }
+
     pub fn new(project: Project, mut opts: EngineOptions) -> CliResult<Self> {
         let boot_started = Instant::now();
         // 翻译模式默认打开系统字体缺字回退:CP932 隧道码解出的汉字不一定
@@ -1395,11 +1415,14 @@ impl Engine {
                                 yu_gfx::TextureRef::None => "none".to_string(),
                             };
                             screen_layers.push(format!(
-                                "{}@{}[{}]{}",
+                                "{}@{}[{}]{} xy=({:.1},{:.1}) size={:?}",
                                 layer.id.display(),
                                 layer.alpha,
                                 tex,
-                                if layer.fill.is_some() { "+fill" } else { "" }
+                                if layer.fill.is_some() { "+fill" } else { "" },
+                                layer.transform.x,
+                                layer.transform.y,
+                                layer.image_size().map(|s| (s.width, s.height))
                             ));
                         }
                         layer.id.display()
@@ -1410,6 +1433,22 @@ impl Engine {
                     }
                     Op::Transition(transition) => {
                         summary.transition_ops += 1;
+                        summary.transition_chain.push(format!(
+                            "{} from={:?} to={:?} fade={:.1} t={} ta={} tid={} from_layer={:?} to_layer={:?}",
+                            transition.layer.id.display(),
+                            transition.from,
+                            transition.to,
+                            transition.fade,
+                            transition.t,
+                            transition.ta,
+                            transition
+                                .tid
+                                .as_ref()
+                                .map(|t| t.display())
+                                .unwrap_or_else(|| "<none>".into()),
+                            transition.from_layer.as_ref().map(|l| l.display()),
+                            transition.to_layer.as_ref().map(|l| l.display()),
+                        ));
                         transition.layer.id.display()
                     }
                     Op::Mask(mask) => {
@@ -1454,6 +1493,13 @@ impl Engine {
                                 (None, Some(h)) => format!(" sy={h:.0}"),
                                 (None, None) => String::new(),
                             }
+                            .to_string()
+                                + &match (image.x, image.y, image.x2, image.y2) {
+                                    (Some(x), Some(y), Some(x2), Some(y2)) => {
+                                        format!(" x={x:.1} y={y:.1} x2={x2:.1} y2={y2:.1}")
+                                    }
+                                    _ => String::new(),
+                                }
                         ));
                         image.target.as_ref().unwrap_or(&image.source).display()
                     }
@@ -1469,6 +1515,38 @@ impl Engine {
         summary.image_chain = image_chain;
         summary.copy_chain = copy_chain;
         summary.sprite_layers = sprite_layers;
+        summary.image_log_all = self
+            .state
+            .as_ref()
+            .map(|state| {
+                state
+                    .borrow()
+                    .images()
+                    .iter()
+                    .map(|op| {
+                        format!(
+                            "seq={} {}→{} {} set={:?} set2={:?} sx={:?} sy={:?} region=({:?},{:?},{:?},{:?}) status={:?}",
+                            op.seq,
+                            op.source.display(),
+                            op.target
+                                .as_ref()
+                                .map(|t| t.display())
+                                .unwrap_or_else(|| "(in-place)".into()),
+                            op.action.name(),
+                            op.set.as_ref().and_then(|v| v.as_int()),
+                            op.set2.as_ref().and_then(|v| v.as_int()),
+                            op.sx,
+                            op.sy,
+                            op.x,
+                            op.y,
+                            op.x2,
+                            op.y2,
+                            op.status
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Some(summary)
     }
 

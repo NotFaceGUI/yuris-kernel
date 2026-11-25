@@ -981,6 +981,26 @@ impl Stepper {
                         ),
                     ),
                     (
+                        "transition_chain",
+                        Value::Array(
+                            summary
+                                .transition_chain
+                                .iter()
+                                .map(|row| str_v(row.clone()))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "image_log_all",
+                        Value::Array(
+                            summary
+                                .image_log_all
+                                .iter()
+                                .map(|row| str_v(row.clone()))
+                                .collect(),
+                        ),
+                    ),
+                    (
                         "copy_chain",
                         Value::Array(
                             summary
