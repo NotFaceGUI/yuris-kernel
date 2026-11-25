@@ -18190,3 +18190,42 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   已确认:字形链取证 0 命中、正文不走 `TextDraw.image`;下一步需定位
   文字层实际的 `COPY2/MEIDO/MERGE2` 命令序(或补 `lower_glyph_chain`
   识别条件)。临时文本颜色取证代码已全部删除。
+
+## 成果 GFX-SCREEN-STAGE1 (2026-11-25) · 光照层白块收口(MODE 5/3/7 stage1 当前 alpha)
+
+- **现象**:`<v500-relirium>` 车窗外场景出现约 704..1761 × 0..608 的
+  纯白矩形;抓包 `white5/f002520`(soft)/`debugui/f003260`(wgpu)。
+- **定位**:
+  - 脚本 s304 pc286 明确 `es.SP.CG.SET "ITEM/フレア_アマツチ1"` +
+    `es.SP.BL.SET 5` ⇒ `SPL2101` 为 MODE 5(スクリーン);
+  - `SPL2101` 表面与资产 `cg/item/フレア_アマツチ2.png`(39389 字节,
+    1920×1080)**逐像素相同**:alpha=0 共 1,921,500 px(RGB 白
+    492,222 px),alpha>0 152,100 px 全白。表面未加工坏,白块来自
+    screen 归约读了透明区的白色 RGB。
+- **官方链**(0.479/0.495 反编译同构;0.500 同一函数仅地址不同):
+  - 0.495 `FUN_00414ba4` / 0.479 `FUN_0040d8f8` MODE 5:
+    stage0 `MODULATE(TEXTURE, DIFFUSE)`(DIFFUSE 四通道=层 A)、
+    stage1 `BLENDCURRENTALPHA(CURRENT, BLACKTEXBUF)`、
+    `SRCBLEND=INVDESTCOLOR/DESTBLEND=ONE/BLENDOP=ADD`;
+  - 故源 RGB = `T·A·(T.a·A)`;MODE 3/7 同族为
+    `T·A·C.a + (1−C.a)`(白纹理/白 TFACTOR,两版均显式
+    `0x3c=0xFFFFFFFF`)。
+  - `FUN_00462e40` 的 `WHITETEXBUF/BLACKTEXBUF` 确认 0.495 两张 1×1
+    纹理;0.479 的 `DAT_007de444/448` 由 blend 语义同判。
+- **改动**:
+  - `yu-render/soft/src/render.rs::stage_reduce`:
+    `Screen = T·a·layer`;`Multiply|Darken = T·layer·a + (1−a)`;
+  - `yu-render/wgpu/src/shaders/quad.wgsl`:
+    `SRC_MODE=3` 补 `layer8/255`,`SRC_MODE=2` 补 `src8/255`;
+  - 注释改为官方 stage0/stage1 链 + 0.495/0.479 证据锚点;
+  - 新增/更新单测两块(MODE 5 部分层 A、MODE 3 部分 alpha)。
+- **验证**:
+  - `cargo test -p yu-backend-soft` → 70 / 32 / 2 / 2 / 1 passed;
+  - `cargo test -p yu-backend-wgpu --lib` → 16 passed;
+  - `cargo test -p yu-backend-wgpu --test wgsl_check` → 1 passed;
+  - `cargo build --workspace --all-targets` → rc 0。
+- **版本结论**:0.479 → 0.495 → 0.500 的 MODE 5 状态序列一致,
+  修正不需要按版本门控;主人已在同一场景目视确认白块消失。
+- **台账**:`docs/divergences/DIV-GFX-096-screen-stage1-current-alpha.md`。
+- **残余**:MODE 3/7 的 `D3DRS_TEXTUREFACTOR` RGB 与 alpha 通道未逐项
+  复测;`SPL2101` 的 `SIZE2` 目标矩形动画未逐帧对拍(与本白块无因果)。
