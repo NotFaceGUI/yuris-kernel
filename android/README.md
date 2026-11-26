@@ -144,6 +144,32 @@ Windows 下 NDK 的 sh 版 `*-clang` 无法被 Rust exec,`build.sh` 会自动改
 同理,若出现 `modules-2.lock ... 拒绝访问`,说明有 IDE 正在使用同一份缓存;
 独立 home 可绕开。
 
+## 界面语言
+
+壳的菜单/设置/帮助支持多语言,**与游戏正文无关**(正文翻译走
+`translate.json`)。入口有两处:
+
+- 游戏库 / 游戏详情右上角「文A」按钮 → 弹窗;
+- 全局设置 → 显示与输入 → 界面语言(显示当前生效语言)。
+
+支持**跟随系统**(按 `Locale.getDefault()` 识别,中文按脚本/地区分简繁)、
+English、简体中文、繁體中文、日本語、한국어、Español、Français、Deutsch、
+Português (Brasil)、Русский。
+
+- 词条在 `app/src/main/assets/i18n/<tag>.json`,**键 = 中文原文**;简体中文
+  不另存表(键本身就是译文)。缺条目先回落英文、再回落中文原文,新增文案
+  即使没翻译也不会显示空白;带 `%s` / `%d` 的是格式串。
+- 实现 `I18n.java` 故意放在 Java 源集:`:runtime` 轻量 Tyranor 模块复用
+  `app/src/main/java` 但不编译 Kotlin,游戏页的启动/错误文案也要走同一份
+  语言表;两个 APK 都打包同一份 `assets`。
+- 选择持久化在 `yu_kernel` 首选项的 `ui_language`(`""` = 跟随系统),
+  切换后立即 `recreate()` 当前 Activity;语言名在弹窗里一律用母语显示。
+- 新增语言:在 `I18n.SUPPORTED` / `displayName` 注册标签,加一份
+  `assets/i18n/<tag>.json` 即可;英文底表 184 条是完整覆盖基线。
+- 验证(2026-11-26,Medium_Phone_API_36.1):系统 en-US 首次启动自动英文;
+  切简体中文、日本語立即生效,强杀重启后保持;全局设置页、游戏详情页、
+  帮助页均按所选语言显示。
+
 ## 壳侧开关(发布 / 诊断)
 
 `SetupActivity` 的两个开关都会持久化并传给游戏页:

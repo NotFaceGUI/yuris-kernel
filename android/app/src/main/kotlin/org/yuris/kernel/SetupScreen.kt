@@ -65,6 +65,7 @@ fun SetupScreen(activity: SetupActivity) {
     var showMovie by remember { mutableStateOf(false) }
     var showPatch by remember { mutableStateOf(false) }
     var showCodec by remember { mutableStateOf(false) }
+    var showLanguage by remember { mutableStateOf(false) }
     var advancedOpen by remember { mutableStateOf(false) }
 
     val gamePicker = rememberLauncherForActivityResult(
@@ -94,11 +95,11 @@ fun SetupScreen(activity: SetupActivity) {
         }
     }
     LaunchedEffect(Unit) {
-        state.movieProbeText = "正在探测设备解码器…"
+        state.movieProbeText = t("正在探测设备解码器…")
         state.movieProbeText = try {
             withContext(Dispatchers.IO) { MovieCodecProbe.summary() }
         } catch (error: Throwable) {
-            "设备解码探测失败: ${error.message}"
+            t("设备解码探测失败: %s", error.message)
         }
     }
 
@@ -106,8 +107,14 @@ fun SetupScreen(activity: SetupActivity) {
     Scaffold(
         topBar = {
             YuTopBar(
-                title = "游戏详情",
+                title = t("游戏详情"),
                 actions = {
+                    IconButton(onClick = { showLanguage = true }) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_translate),
+                            contentDescription = t("界面语言"),
+                        )
+                    }
                     IconButton(
                         onClick = {
                             activity.startActivity(
@@ -117,7 +124,7 @@ fun SetupScreen(activity: SetupActivity) {
                     ) {
                         Icon(
                             painter = painterResource(R.drawable.ic_settings),
-                            contentDescription = "全局设置",
+                            contentDescription = t("全局设置"),
                         )
                     }
                     IconButton(
@@ -129,7 +136,7 @@ fun SetupScreen(activity: SetupActivity) {
                     ) {
                         Icon(
                             painter = painterResource(R.drawable.ic_help),
-                            contentDescription = "参数说明",
+                            contentDescription = t("参数说明"),
                         )
                     }
                 },
@@ -138,9 +145,9 @@ fun SetupScreen(activity: SetupActivity) {
         bottomBar = {
             PrimaryBar(
                 text = when {
-                    state.gameDir == null -> "先选择游戏目录"
-                    !fontReady -> "先选择字体"
-                    else -> "开始游戏"
+                    state.gameDir == null -> t("先选择游戏目录")
+                    !fontReady -> t("先选择字体")
+                    else -> t("开始游戏")
                 },
                 enabled = state.gameDir != null && fontReady,
                 onClick = { activity.ensureStorageThen { activity.launchGame() } },
@@ -160,40 +167,39 @@ fun SetupScreen(activity: SetupActivity) {
             item { Hero(state) }
             item {
                 Text(
-                    "本页设置只对当前游戏生效,未修改的项跟随全局默认;" +
-                        "全局默认在游戏库右上角齿轮里编辑。",
+                    t("本页设置只对当前游戏生效,未修改的项跟随全局默认;全局默认在游戏库右上角齿轮里编辑。"),
                     style = MiuixTheme.textStyles.footnote1,
                     color = MiuixTheme.colorScheme.onBackgroundVariant,
                     modifier = Modifier.padding(horizontal = YuSpacing.gapS),
                 )
             }
             item {
-                SettingsGroup("游戏") {
+                SettingsGroup(t("游戏")) {
                     SettingRow(
-                        label = "游戏目录",
-                        value = state.gameDir ?: "尚未选择",
+                        label = t("游戏目录"),
+                        value = state.gameDir ?: t("尚未选择"),
                         onClick = { activity.ensureStorageThen { gamePicker.launch(null) } },
                         trailing = { Chevron() },
                     )
                     SettingsDivider()
                     SettingRow(
-                        label = "手动输入路径",
-                        value = "目录选择器不可用时使用",
+                        label = t("手动输入路径"),
+                        value = t("目录选择器不可用时使用"),
                         onClick = { showManualPath = true },
                         trailing = { Chevron() },
                     )
                     SettingsDivider()
                     SettingRow(
-                        label = "存档目录",
-                        value = state.saveDir ?: "游戏目录/save",
+                        label = t("存档目录"),
+                        value = state.saveDir ?: t("游戏目录/save"),
                         onClick = { activity.ensureStorageThen { savePicker.launch(null) } },
                         trailing = { Chevron() },
                     )
                     if (state.saveDir != null) {
                         SettingsDivider()
                         SettingRow(
-                            label = "恢复默认存档目录",
-                            value = "游戏目录/save",
+                            label = t("恢复默认存档目录"),
+                            value = t("游戏目录/save"),
                             onClick = { state.saveDir = null },
                             trailing = {
                                 Icon(
@@ -208,10 +214,10 @@ fun SetupScreen(activity: SetupActivity) {
                 }
             }
             item {
-                SettingsGroup("显示与输入") {
+                SettingsGroup(t("显示与输入")) {
                     SettingRow(
-                        label = "导入字体文件",
-                        value = "推荐:导入自己的字体(等宽)",
+                        label = t("导入字体文件"),
+                        value = t("推荐:导入自己的字体(等宽)"),
                         onClick = {
                             activity.ensureStorageThen { fontPicker.launch(arrayOf("*/*")) }
                         },
@@ -226,42 +232,42 @@ fun SetupScreen(activity: SetupActivity) {
                     )
                     SettingsDivider()
                     SettingRow(
-                        label = "字体",
+                        label = t("字体"),
                         value = fontLabel(state),
                         onClick = { showFont = true },
                         trailing = { Chevron() },
                     )
                     SettingsDivider()
                     DropdownRow(
-                        label = "操作方式",
-                        value = if (state.mouseMode) "虚拟光标" else "触摸",
+                        label = t("操作方式"),
+                        value = if (state.mouseMode) t("虚拟光标") else t("触摸"),
                         onClick = { showInput = true },
                     )
                 }
             }
             item {
-                SettingsGroup("运行") {
+                SettingsGroup(t("运行")) {
                     DropdownRow(
-                        label = "渲染后端",
+                        label = t("渲染后端"),
                         value = backendLabel(state.backend),
                         onClick = { showBackend = true },
                     )
                     SettingsDivider()
                     DropdownRow(
-                        label = "GPU 接口",
+                        label = t("GPU 接口"),
                         value = gpuLabel(state.gpuBackend),
                         onClick = { showGpu = true },
                     )
                     SettingsDivider()
                     DropdownRow(
-                        label = "帧率上限",
+                        label = t("帧率上限"),
                         value = "${state.fps} fps",
                         onClick = { showFps = true },
                     )
                     SettingsDivider()
                     SettingRow(
-                        label = "高级设置",
-                        value = if (advancedOpen) "诊断/实验开关" else "默认全关",
+                        label = t("高级设置"),
+                        value = if (advancedOpen) t("诊断/实验开关") else t("默认全关"),
                         onClick = { advancedOpen = !advancedOpen },
                         trailing = {
                             Icon(
@@ -276,60 +282,60 @@ fun SetupScreen(activity: SetupActivity) {
                     )
                     if (advancedOpen) {
                         SettingsDivider()
-                        SwitchRow("状态浮层", "帧率/计数", state.showHud) { state.showHud = it }
+                        SwitchRow(t("状态浮层"), t("帧率/计数"), state.showHud) { state.showHud = it }
                         SettingsDivider()
-                        SwitchRow("版本名角标", "左下角引擎版本", state.versionBadge) {
+                        SwitchRow(t("版本名角标"), t("左下角引擎版本"), state.versionBadge) {
                             state.versionBadge = it
                         }
                         SettingsDivider()
-                        SwitchRow("调试日志", "写游戏目录 debug/*.jsonl", state.debugLog) {
+                        SwitchRow(t("调试日志"), t("写游戏目录 debug/*.jsonl"), state.debugLog) {
                             state.debugLog = it
                         }
                         SettingsDivider()
-                        SwitchRow("资产预取", "后台解码", state.prefetch) { state.prefetch = it }
+                        SwitchRow(t("资产预取"), t("后台解码"), state.prefetch) { state.prefetch = it }
                         SettingsDivider()
-                        SwitchRow("快照延迟", "菜单少拷贝", state.snapshotDefer) {
+                        SwitchRow(t("快照延迟"), t("菜单少拷贝"), state.snapshotDefer) {
                             state.snapshotDefer = it
                         }
                         SettingsDivider()
-                        SwitchRow("SIZE 双线性", "手机关闭时按官方最近邻", state.bilinearScale) {
+                        SwitchRow(t("SIZE 双线性"), t("手机关闭时按官方最近邻"), state.bilinearScale) {
                             state.bilinearScale = it
                         }
                         SettingsDivider()
-                        SwitchRow("缺字补全", "其它字体补字形", state.fontFallback) {
+                        SwitchRow(t("缺字补全"), t("其它字体补字形"), state.fontFallback) {
                             state.fontFallback = it
                         }
                         SettingsDivider()
-                        SwitchRow("VM 归因", null, state.vmProfile) { state.vmProfile = it }
+                        SwitchRow(t("VM 归因"), null, state.vmProfile) { state.vmProfile = it }
                         SettingsDivider()
-                        SwitchRow("资产计时", null, state.assetTiming) { state.assetTiming = it }
+                        SwitchRow(t("资产计时"), null, state.assetTiming) { state.assetTiming = it }
                         SettingsDivider()
-                        SwitchRow("tick 分段", null, state.tickSplit) { state.tickSplit = it }
+                        SwitchRow(t("tick 分段"), null, state.tickSplit) { state.tickSplit = it }
                         SettingsDivider()
-                        SwitchRow("CG 计时", null, state.cgTiming) { state.cgTiming = it }
+                        SwitchRow(t("CG 计时"), null, state.cgTiming) { state.cgTiming = it }
                     }
                 }
             }
             item {
-                SettingsGroup("影片与文本") {
+                SettingsGroup(t("影片与文本")) {
                     DropdownRow(
-                        label = "视频解码",
+                        label = t("视频解码"),
                         value = movieLabel(state.movieBackend),
                         onClick = { showMovie = true },
                     )
                     SettingsDivider()
                     DropdownRow(
-                        label = "文本编码",
+                        label = t("文本编码"),
                         value = patchLabel(state.patch),
                         onClick = { showPatch = true },
                     )
                     SettingsDivider()
                     val activeTranslate = state.activeTranslatePath()
                     SettingRow(
-                        label = "翻译文件",
+                        label = t("翻译文件"),
                         value = when {
                             activeTranslate != null -> File(activeTranslate).name
-                            else -> "未启用(内核默认不加载)"
+                            else -> t("未启用(内核默认不加载)")
                         },
                         onClick = {
                             activity.ensureStorageThen {
@@ -341,8 +347,8 @@ fun SetupScreen(activity: SetupActivity) {
                     if (activeTranslate != null) {
                         SettingsDivider()
                         SettingRow(
-                            label = "清除翻译文件",
-                            value = "只清除配置,不删除文件",
+                            label = t("清除翻译文件"),
+                            value = t("只清除配置,不删除文件"),
                             onClick = {
                                 state.translatePath = null
                             },
@@ -358,8 +364,8 @@ fun SetupScreen(activity: SetupActivity) {
                     }
                     SettingsDivider()
                     SettingRow(
-                        label = "导出翻译文件",
-                        value = "translate.json(角色/选项/正文)",
+                        label = t("导出翻译文件"),
+                        value = t("translate.json(角色/选项/正文)"),
                         onClick = {
                             activity.ensureStorageThen { exportPicker.launch(null) }
                         },
@@ -373,7 +379,7 @@ fun SetupScreen(activity: SetupActivity) {
                         },
                     )
                     val probe = if (state.movieBackend == "builtin") {
-                        "内置:MPEG-1 program stream + MP2 音频;不依赖设备解码器。"
+                        t("内置:MPEG-1 program stream + MP2 音频;不依赖设备解码器。")
                     } else {
                         state.movieProbeText
                     }
@@ -389,15 +395,15 @@ fun SetupScreen(activity: SetupActivity) {
                 }
             }
             item {
-                SettingsGroup("存档") {
+                SettingsGroup(t("存档")) {
                     DropdownRow(
-                        label = "存档压缩",
+                        label = t("存档压缩"),
                         value = codecLabel(state.saveCodec),
                         onClick = { showCodec = true },
                     )
                     SettingsDivider()
                     Text(
-                        "只影响写盘;读侧始终按实际流分流。原版带 YSSnp.dll 的作品是 snappy。",
+                        t("只影响写盘;读侧始终按实际流分流。原版带 YSSnp.dll 的作品是 snappy。"),
                         style = MiuixTheme.textStyles.footnote1,
                         color = MiuixTheme.colorScheme.onBackgroundVariant,
                         modifier = Modifier.padding(YuSpacing.cardH),
@@ -405,10 +411,10 @@ fun SetupScreen(activity: SetupActivity) {
                 }
             }
             item {
-                SettingsGroup("库管理") {
+                SettingsGroup(t("库管理")) {
                     SettingRow(
-                        label = "从游戏库移除",
-                        value = "只删导入记录,不会删除游戏文件",
+                        label = t("从游戏库移除"),
+                        value = t("只删导入记录,不会删除游戏文件"),
                         onClick = { activity.removeFromLibrary() },
                         trailing = {
                             Icon(
@@ -433,8 +439,8 @@ fun SetupScreen(activity: SetupActivity) {
                     }
                     SettingsGroup {
                         SettingRow(
-                            label = "恢复全局默认",
-                            value = "只清当前游戏的设置,不改全局默认",
+                            label = t("恢复全局默认"),
+                            value = t("只清当前游戏的设置,不改全局默认"),
                             onClick = { activity.resetSettings() },
                             trailing = {
                                 Icon(
@@ -465,7 +471,7 @@ fun SetupScreen(activity: SetupActivity) {
             else -> ""
         }
         ChoiceDialog(
-            title = "字体",
+            title = t("字体"),
             options = options,
             selected = selected,
             onDismiss = { showFont = false },
@@ -481,7 +487,7 @@ fun SetupScreen(activity: SetupActivity) {
                     }
                 }
             },
-            footerLabel = "导入自己的字体",
+            footerLabel = t("导入自己的字体"),
             onFooter = {
                 showFont = false
                 activity.ensureStorageThen { fontPicker.launch(arrayOf("*/*")) }
@@ -500,8 +506,8 @@ fun SetupScreen(activity: SetupActivity) {
     }
     if (showInput) {
         ChoiceDialog(
-            title = "操作方式",
-            options = listOf("touch" to "触摸", "mouse" to "虚拟光标"),
+            title = t("操作方式"),
+            options = listOf("touch" to t("触摸"), "mouse" to t("虚拟光标")),
             selected = if (state.mouseMode) "mouse" else "touch",
             onDismiss = { showInput = false },
             onSelect = { state.mouseMode = it == "mouse" },
@@ -509,7 +515,7 @@ fun SetupScreen(activity: SetupActivity) {
     }
     if (showBackend) {
         ChoiceDialog(
-            title = "渲染后端",
+            title = t("渲染后端"),
             options = listOf(
                 "wgpu" to "GPU",
                 "soft" to "CPU",
@@ -522,8 +528,8 @@ fun SetupScreen(activity: SetupActivity) {
     }
     if (showGpu) {
         ChoiceDialog(
-            title = "GPU 接口",
-            options = listOf("auto" to "自动", "gles" to "GLES", "vulkan" to "Vulkan"),
+            title = t("GPU 接口"),
+            options = listOf("auto" to t("自动"), "gles" to "GLES", "vulkan" to "Vulkan"),
             selected = state.gpuBackend,
             onDismiss = { showGpu = false },
             onSelect = { state.gpuBackend = it },
@@ -531,7 +537,7 @@ fun SetupScreen(activity: SetupActivity) {
     }
     if (showFps) {
         ChoiceDialog(
-            title = "帧率上限",
+            title = t("帧率上限"),
             options = listOf("30" to "30 fps", "60" to "60 fps", "120" to "120 fps"),
             selected = state.fps.toString(),
             onDismiss = { showFps = false },
@@ -540,11 +546,11 @@ fun SetupScreen(activity: SetupActivity) {
     }
     if (showMovie) {
         ChoiceDialog(
-            title = "视频解码",
+            title = t("视频解码"),
             options = listOf(
-                "auto" to "自动(推荐)",
-                "builtin" to "内置(MPEG-1)",
-                "external" to "外置(设备 MediaCodec)",
+                "auto" to t("自动(推荐)"),
+                "builtin" to t("内置(MPEG-1)"),
+                "external" to t("外置(设备 MediaCodec)"),
             ),
             selected = state.movieBackend,
             onDismiss = { showMovie = false },
@@ -553,13 +559,13 @@ fun SetupScreen(activity: SetupActivity) {
     }
     if (showPatch) {
         ChoiceDialog(
-            title = "文本编码",
+            title = t("文本编码"),
             options = listOf(
-                "auto" to "自动(推荐)",
-                "original" to "原版(CP932)",
-                "gbk" to "简体(GBK)",
-                "big5" to "繁体(Big5)",
-                "tunnel" to "隧道(sjis_ext)",
+                "auto" to t("自动(推荐)"),
+                "original" to t("原版(CP932)"),
+                "gbk" to t("简体(GBK)"),
+                "big5" to t("繁体(Big5)"),
+                "tunnel" to t("隧道(sjis_ext)"),
             ),
             selected = state.patch,
             onDismiss = { showPatch = false },
@@ -568,18 +574,21 @@ fun SetupScreen(activity: SetupActivity) {
     }
     if (showCodec) {
         ChoiceDialog(
-            title = "存档压缩",
-            options = listOf("" to "自动判定", "zlib" to "zlib", "snappy" to "snappy"),
+            title = t("存档压缩"),
+            options = listOf("" to t("自动判定"), "zlib" to "zlib", "snappy" to "snappy"),
             selected = state.saveCodec,
             onDismiss = { showCodec = false },
             onSelect = { state.saveCodec = it },
         )
     }
+    if (showLanguage) {
+        LanguageDialog(onDismiss = { showLanguage = false })
+    }
 }
 
 @Composable
 private fun Hero(state: SettingsState) {
-    val title = state.gameDir?.let { File(it).name } ?: "尚未选择游戏"
+    val title = state.gameDir?.let { File(it).name } ?: t("尚未选择游戏")
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
@@ -611,7 +620,7 @@ private fun Hero(state: SettingsState) {
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                state.gameDir ?: "从游戏库导入或手动输入路径",
+                state.gameDir ?: t("从游戏库导入或手动输入路径"),
                 style = MiuixTheme.textStyles.footnote1,
                 color = MiuixTheme.colorScheme.onBackgroundVariant,
                 maxLines = 2,
@@ -621,7 +630,7 @@ private fun Hero(state: SettingsState) {
             Row(horizontalArrangement = Arrangement.spacedBy(YuSpacing.gapS)) {
                 MetaChip("YU-RIS")
                 if (state.gameDir != null) {
-                    MetaChip("已选择")
+                    MetaChip(t("已选择"))
                 }
             }
         }
@@ -662,19 +671,19 @@ private fun ManualPathDialog(
     Dialog(onDismissRequest = onDismiss) {
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(YuSpacing.cardH)) {
-                Text("游戏目录路径", style = MiuixTheme.textStyles.title3)
+                Text(t("游戏目录路径"), style = MiuixTheme.textStyles.title3)
                 Spacer(Modifier.height(YuSpacing.gap))
                 TextField(
                     value = text,
                     onValueChange = { text = it },
-                    label = "绝对路径",
+                    label = t("绝对路径"),
                 )
                 Spacer(Modifier.height(YuSpacing.section))
                 Button(
                     onClick = { onConfirm(text) },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColorsPrimary(),
-                ) { Text("确定") }
+                ) { Text(t("确定")) }
             }
         }
     }
@@ -711,7 +720,7 @@ private fun fontLabel(state: SettingsState): String {
     return when {
         path != null -> state.importedFontName ?: File(path).name
         state.fontFamily.isNotEmpty() -> state.fontFamily
-        else -> "未选择(必须选择或导入)"
+        else -> t("未选择(必须选择或导入)")
     }
 }
 
@@ -726,25 +735,25 @@ private fun backendLabel(value: String): String = when (value) {
 private fun gpuLabel(value: String): String = when (value) {
     "gles" -> "GLES"
     "vulkan" -> "Vulkan"
-    else -> "自动"
+    else -> t("自动")
 }
 
 private fun patchLabel(value: String): String = when (value) {
-    "original" -> "原版(CP932)"
-    "gbk" -> "简体(GBK)"
-    "big5" -> "繁体(Big5)"
-    "tunnel" -> "隧道(sjis_ext)"
-    else -> "自动(推荐)"
+    "original" -> t("原版(CP932)")
+    "gbk" -> t("简体(GBK)")
+    "big5" -> t("繁体(Big5)")
+    "tunnel" -> t("隧道(sjis_ext)")
+    else -> t("自动(推荐)")
 }
 
 private fun movieLabel(value: String): String = when (value) {
-    "builtin" -> "内置(MPEG-1)"
-    "external" -> "外置(设备 MediaCodec)"
-    else -> "自动(推荐)"
+    "builtin" -> t("内置(MPEG-1)")
+    "external" -> t("外置(设备 MediaCodec)")
+    else -> t("自动(推荐)")
 }
 
 private fun codecLabel(value: String): String = when (value) {
     "zlib" -> "zlib"
     "snappy" -> "snappy"
-    else -> "自动判定"
+    else -> t("自动判定")
 }

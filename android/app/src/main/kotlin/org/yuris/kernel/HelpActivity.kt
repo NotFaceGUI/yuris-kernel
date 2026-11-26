@@ -14,6 +14,7 @@ import androidx.appcompat.app.AppCompatActivity
 class HelpActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        I18n.init(this)
         enableEdgeToEdge()
         setContent {
             YuTheme {

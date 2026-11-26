@@ -32,7 +32,7 @@ final class MovieCodecProbe {
 
     /** 设置页用的一行摘要（可能含换行）。 */
     static String summary() {
-        return "引擎外置：" + engineSupport() + "\n设备解码器：" + deviceSupport();
+        return I18n.t("引擎外置：%s\n设备解码器：%s", engineSupport(), deviceSupport());
     }
 
     /** 引擎侧实际能创建的 MIME 列表。 */
@@ -41,7 +41,7 @@ final class MovieCodecProbe {
             JSONObject root = new JSONObject(NativeHost.nativeMovieCodecs());
             JSONArray codecs = root.optJSONArray("codecs");
             if (codecs == null) {
-                return "未返回能力清单";
+                return I18n.t("未返回能力清单");
             }
             List<String> names = new ArrayList<>();
             for (int i = 0; i < codecs.length(); i++) {
@@ -51,7 +51,7 @@ final class MovieCodecProbe {
                 }
             }
             if (names.isEmpty()) {
-                return "设备没有可用的系统视频解码器";
+                return I18n.t("设备没有可用的系统视频解码器");
             }
             // minSdk 24:String.join(Iterable) 要 API 26,手拼。
             StringBuilder out = new StringBuilder();
@@ -64,7 +64,7 @@ final class MovieCodecProbe {
             return out.toString();
         } catch (Throwable error) {
             // 探测失败不挡启动：外置不可用时 Auto 会回退内置。
-            return "探测失败（" + error.getMessage() + "）";
+            return I18n.t("探测失败（%s）", error.getMessage());
         }
     }
 
@@ -98,7 +98,7 @@ final class MovieCodecProbe {
                 }
             }
             if (byMime.isEmpty()) {
-                return "设备未报告视频解码器";
+                return I18n.t("设备未报告视频解码器");
             }
             StringBuilder out = new StringBuilder();
             int shown = 0;
@@ -112,18 +112,19 @@ final class MovieCodecProbe {
                 }
                 boolean[] flags = entry.getValue();
                 out.append(label(entry.getKey())).append('(');
-                if (flags[0]) {
-                    out.append("硬");
-                }
-                if (flags[1]) {
-                    out.append(flags[0] ? "/软" : "软");
+                if (flags[0] && flags[1]) {
+                    out.append(I18n.t("硬/软"));
+                } else if (flags[0]) {
+                    out.append(I18n.t("硬"));
+                } else if (flags[1]) {
+                    out.append(I18n.t("软"));
                 }
                 out.append(')');
                 shown++;
             }
             return out.toString();
         } catch (Throwable error) {
-            return "探测失败（" + error.getMessage() + "）";
+            return I18n.t("探测失败（%s）", error.getMessage());
         }
     }
 

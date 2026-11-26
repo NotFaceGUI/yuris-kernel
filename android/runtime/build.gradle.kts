@@ -102,6 +102,9 @@ android {
             // Kotlin(游戏库/配置页/Compose)不在这里编译;GameLibrary 等纯
             // Java 工具类会被一起编译,但不会被引用,dex 增量可忽略。
             java.srcDir("../app/src/main/java")
+            // 界面语言表与主 APK 共用一份:模块没有语言按钮,但启动/错误
+            // 文案仍按首选项或系统语言显示。
+            assets.srcDir("../app/src/main/assets")
             // so 由 tools/android/build.sh 交叉编译后落到 :app 的 jniLibs,
             // 这里只引用同一份产物,不再复制。
             jniLibs.srcDirs("../app/src/main/jniLibs")

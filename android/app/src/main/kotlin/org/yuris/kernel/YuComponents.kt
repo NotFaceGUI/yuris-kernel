@@ -22,6 +22,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -259,6 +260,30 @@ fun PrimaryBar(text: String, enabled: Boolean, onClick: () -> Unit) {
             Text(text)
         }
     }
+}
+
+/**
+ * 界面语言选择弹窗(游戏库右上角地球/全局设置共用)。
+ *
+ * <p>「跟随系统」= 清空首选项;其余按 [I18n.SUPPORTED] 顺序,语言名用母语
+ * 显示。选择后 [I18n.setLanguage] 会重建当前 Activity,弹窗随旧界面销毁。
+ */
+@Composable
+fun LanguageDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val options = buildList {
+        add(I18n.AUTO to t("跟随系统"))
+        I18n.SUPPORTED.forEach { languageTag ->
+            add(languageTag to languageDisplayName(languageTag))
+        }
+    }
+    ChoiceDialog(
+        title = t("界面语言"),
+        options = options,
+        selected = I18n.storedTag(context),
+        onDismiss = onDismiss,
+        onSelect = { I18n.setLanguage(context, it) },
+    )
 }
 
 /** 小号元信息 chip(封包/散盘/包数)。 */

@@ -53,6 +53,7 @@ class GlobalSettingsActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        I18n.init(this)
         NativeHost.nativeInitAndroidContext(applicationContext)
         state = GlobalSettingsState(applicationContext)
         SettingsPrefs.migrateLegacy(
@@ -93,7 +94,7 @@ class GlobalSettingsActivity : ComponentActivity() {
         val granted = grantResults.isNotEmpty() &&
             grantResults[0] == PackageManager.PERMISSION_GRANTED
         if (!granted) {
-            state.status = "没有存储权限:无法读取字体文件"
+            state.status = t("没有存储权限:无法读取字体文件")
             return
         }
         next?.run()
@@ -130,7 +131,7 @@ class GlobalSettingsActivity : ComponentActivity() {
     fun onFontPicked(uri: Uri) {
         val result = StoragePaths.resolveFile(this, uri)
         if (result.path == null) {
-            val message = result.error ?: "无法解析该位置的路径"
+            val message = result.error ?: t("无法解析该位置的路径")
             state.status = message
             Toast.makeText(this, message, Toast.LENGTH_LONG).show()
         } else {
@@ -202,6 +203,7 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
     var showMovie by remember { mutableStateOf(false) }
     var showPatch by remember { mutableStateOf(false) }
     var showCodec by remember { mutableStateOf(false) }
+    var showLanguage by remember { mutableStateOf(false) }
     var advancedOpen by remember { mutableStateOf(false) }
 
     val fontPicker = rememberLauncherForActivityResult(
@@ -211,13 +213,13 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
     Scaffold(
         topBar = {
             YuTopBar(
-                title = "全局设置",
-                subtitle = "对所有游戏生效;单个游戏的设置优先",
+                title = t("全局设置"),
+                subtitle = t("对所有游戏生效;单个游戏的设置优先"),
                 leading = {
                     IconButton(onClick = { activity.finish() }) {
                         Icon(
                             painter = painterResource(R.drawable.ic_arrow_back),
-                            contentDescription = "返回",
+                            contentDescription = t("返回"),
                         )
                     }
                 },
@@ -235,10 +237,10 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
             verticalArrangement = Arrangement.spacedBy(YuSpacing.section),
         ) {
             item {
-                SettingsGroup("默认字体") {
+                SettingsGroup(t("默认字体")) {
                     SettingRow(
-                        label = "导入字体文件",
-                        value = "设置一次,所有游戏默认沿用",
+                        label = t("导入字体文件"),
+                        value = t("设置一次,所有游戏默认沿用"),
                         onClick = {
                             activity.ensureStorageThen {
                                 fontPicker.launch(arrayOf("*/*"))
@@ -255,7 +257,7 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
                     )
                     SettingsDivider()
                     SettingRow(
-                        label = "字体",
+                        label = t("字体"),
                         value = globalFontLabel(state),
                         onClick = { showFont = true },
                         trailing = {
@@ -269,7 +271,7 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
                     )
                     SettingsDivider()
                     Text(
-                        "推荐导入等宽字体;单个游戏需要换字体时,在游戏详情页覆盖即可。",
+                        t("推荐导入等宽字体;单个游戏需要换字体时,在游戏详情页覆盖即可。"),
                         style = MiuixTheme.textStyles.footnote1,
                         color = MiuixTheme.colorScheme.onBackgroundVariant,
                         modifier = Modifier.padding(YuSpacing.cardH),
@@ -277,36 +279,42 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
                 }
             }
             item {
-                SettingsGroup("显示与输入") {
+                SettingsGroup(t("显示与输入")) {
                     DropdownRow(
-                        label = "操作方式",
-                        value = if (settings.mouseMode) "虚拟光标" else "触摸",
+                        label = t("操作方式"),
+                        value = if (settings.mouseMode) t("虚拟光标") else t("触摸"),
                         onClick = { showInput = true },
+                    )
+                    SettingsDivider()
+                    DropdownRow(
+                        label = t("界面语言"),
+                        value = languageSummary(activity),
+                        onClick = { showLanguage = true },
                     )
                 }
             }
             item {
-                SettingsGroup("运行") {
+                SettingsGroup(t("运行")) {
                     SettingRow(
-                        label = "渲染后端",
-                        value = "GPU(安卓壳固定;CPU 不开放)",
+                        label = t("渲染后端"),
+                        value = t("GPU(安卓壳固定;CPU 不开放)"),
                     )
                     SettingsDivider()
                     DropdownRow(
-                        label = "GPU 接口",
+                        label = t("GPU 接口"),
                         value = gpuLabel(settings.gpuBackend),
                         onClick = { showGpu = true },
                     )
                     SettingsDivider()
                     DropdownRow(
-                        label = "帧率上限",
+                        label = t("帧率上限"),
                         value = "${settings.fps} fps",
                         onClick = { showFps = true },
                     )
                     SettingsDivider()
                     SettingRow(
-                        label = "高级设置",
-                        value = if (advancedOpen) "诊断/实验开关" else "默认全关",
+                        label = t("高级设置"),
+                        value = if (advancedOpen) t("诊断/实验开关") else t("默认全关"),
                         onClick = { advancedOpen = !advancedOpen },
                         trailing = {
                             Icon(
@@ -321,81 +329,81 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
                     )
                     if (advancedOpen) {
                         SettingsDivider()
-                        SwitchRow("状态浮层", "帧率/计数", settings.showHud) {
+                        SwitchRow(t("状态浮层"), t("帧率/计数"), settings.showHud) {
                             state.update { s -> s.copy(showHud = it) }
                         }
                         SettingsDivider()
-                        SwitchRow("版本名角标", "左下角引擎版本", settings.versionBadge) {
+                        SwitchRow(t("版本名角标"), t("左下角引擎版本"), settings.versionBadge) {
                             state.update { s -> s.copy(versionBadge = it) }
                         }
                         SettingsDivider()
-                        SwitchRow("调试日志", "写游戏目录 debug/*.jsonl", settings.debugLog) {
+                        SwitchRow(t("调试日志"), t("写游戏目录 debug/*.jsonl"), settings.debugLog) {
                             state.update { s -> s.copy(debugLog = it) }
                         }
                         SettingsDivider()
-                        SwitchRow("资产预取", "后台解码", settings.prefetch) {
+                        SwitchRow(t("资产预取"), t("后台解码"), settings.prefetch) {
                             state.update { s -> s.copy(prefetch = it) }
                         }
                         SettingsDivider()
-                        SwitchRow("快照延迟", "菜单少拷贝", settings.snapshotDefer) {
+                        SwitchRow(t("快照延迟"), t("菜单少拷贝"), settings.snapshotDefer) {
                             state.update { s -> s.copy(snapshotDefer = it) }
                         }
                         SettingsDivider()
                         SwitchRow(
-                            "SIZE 双线性",
-                            "手机关闭时按官方最近邻",
+                            t("SIZE 双线性"),
+                            t("手机关闭时按官方最近邻"),
                             settings.bilinearScale,
                         ) {
                             state.update { s -> s.copy(bilinearScale = it) }
                         }
                         SettingsDivider()
-                        SwitchRow("缺字补全", "其它字体补字形", settings.fontFallback) {
+                        SwitchRow(t("缺字补全"), t("其它字体补字形"), settings.fontFallback) {
                             state.update { s -> s.copy(fontFallback = it) }
                         }
                         SettingsDivider()
-                        SwitchRow("VM 归因", null, settings.vmProfile) {
+                        SwitchRow(t("VM 归因"), null, settings.vmProfile) {
                             state.update { s -> s.copy(vmProfile = it) }
                         }
                         SettingsDivider()
-                        SwitchRow("资产计时", null, settings.assetTiming) {
+                        SwitchRow(t("资产计时"), null, settings.assetTiming) {
                             state.update { s -> s.copy(assetTiming = it) }
                         }
                         SettingsDivider()
-                        SwitchRow("tick 分段", null, settings.tickSplit) {
+                        SwitchRow(t("tick 分段"), null, settings.tickSplit) {
                             state.update { s -> s.copy(tickSplit = it) }
                         }
                         SettingsDivider()
-                        SwitchRow("CG 计时", null, settings.cgTiming) {
+                        SwitchRow(t("CG 计时"), null, settings.cgTiming) {
                             state.update { s -> s.copy(cgTiming = it) }
                         }
                     }
                 }
             }
             item {
-                SettingsGroup("影片与文本") {
+                SettingsGroup(t("影片与文本")) {
                     DropdownRow(
-                        label = "视频解码",
+                        label = t("视频解码"),
                         value = movieLabel(settings.movieBackend),
                         onClick = { showMovie = true },
                     )
                     SettingsDivider()
                     DropdownRow(
-                        label = "文本编码",
+                        label = t("文本编码"),
                         value = patchLabel(settings.patch),
                         onClick = { showPatch = true },
                     )
                 }
             }
             item {
-                SettingsGroup("存档") {
+                SettingsGroup(t("存档")) {
                     DropdownRow(
-                        label = "存档压缩",
+                        label = t("存档压缩"),
                         value = codecLabel(settings.saveCodec),
                         onClick = { showCodec = true },
                     )
                     SettingsDivider()
                     Text(
-                        "只影响写盘;读侧始终按实际流分流。原版带 YSSnp.dll 的作品是 snappy。",
+                        t("只影响写盘;读侧始终按实际流分流。原版带 YSSnp.dll 的作品是 snappy。"),
                         style = MiuixTheme.textStyles.footnote1,
                         color = MiuixTheme.colorScheme.onBackgroundVariant,
                         modifier = Modifier.padding(YuSpacing.cardH),
@@ -414,8 +422,8 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
                     }
                     SettingsGroup {
                         SettingRow(
-                            label = "恢复默认设置",
-                            value = "只清全局默认;单游戏设置保留",
+                            label = t("恢复默认设置"),
+                            value = t("只清全局默认;单游戏设置保留"),
                             onClick = { state.reset() },
                             trailing = {
                                 Icon(
@@ -446,7 +454,7 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
             else -> ""
         }
         ChoiceDialog(
-            title = "默认字体",
+            title = t("默认字体"),
             options = options,
             selected = selected,
             onDismiss = { showFont = false },
@@ -460,7 +468,7 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
                     }
                 }
             },
-            footerLabel = "导入自己的字体",
+            footerLabel = t("导入自己的字体"),
             onFooter = {
                 showFont = false
                 activity.ensureStorageThen { fontPicker.launch(arrayOf("*/*")) }
@@ -469,8 +477,8 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
     }
     if (showInput) {
         ChoiceDialog(
-            title = "操作方式",
-            options = listOf("touch" to "触摸", "mouse" to "虚拟光标"),
+            title = t("操作方式"),
+            options = listOf("touch" to t("触摸"), "mouse" to t("虚拟光标")),
             selected = if (settings.mouseMode) "mouse" else "touch",
             onDismiss = { showInput = false },
             onSelect = { state.update { s -> s.copy(mouseMode = it == "mouse") } },
@@ -478,8 +486,8 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
     }
     if (showGpu) {
         ChoiceDialog(
-            title = "GPU 接口",
-            options = listOf("auto" to "自动", "gles" to "GLES", "vulkan" to "Vulkan"),
+            title = t("GPU 接口"),
+            options = listOf("auto" to t("自动"), "gles" to "GLES", "vulkan" to "Vulkan"),
             selected = settings.gpuBackend,
             onDismiss = { showGpu = false },
             onSelect = { state.update { s -> s.copy(gpuBackend = it) } },
@@ -487,7 +495,7 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
     }
     if (showFps) {
         ChoiceDialog(
-            title = "帧率上限",
+            title = t("帧率上限"),
             options = listOf("30" to "30 fps", "60" to "60 fps", "120" to "120 fps"),
             selected = settings.fps.toString(),
             onDismiss = { showFps = false },
@@ -496,11 +504,11 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
     }
     if (showMovie) {
         ChoiceDialog(
-            title = "视频解码",
+            title = t("视频解码"),
             options = listOf(
-                "auto" to "自动(推荐)",
-                "builtin" to "内置(MPEG-1)",
-                "external" to "外置(设备 MediaCodec)",
+                "auto" to t("自动(推荐)"),
+                "builtin" to t("内置(MPEG-1)"),
+                "external" to t("外置(设备 MediaCodec)"),
             ),
             selected = settings.movieBackend,
             onDismiss = { showMovie = false },
@@ -509,13 +517,13 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
     }
     if (showPatch) {
         ChoiceDialog(
-            title = "文本编码",
+            title = t("文本编码"),
             options = listOf(
-                "auto" to "自动(推荐)",
-                "original" to "原版(CP932)",
-                "gbk" to "简体(GBK)",
-                "big5" to "繁体(Big5)",
-                "tunnel" to "隧道(sjis_ext)",
+                "auto" to t("自动(推荐)"),
+                "original" to t("原版(CP932)"),
+                "gbk" to t("简体(GBK)"),
+                "big5" to t("繁体(Big5)"),
+                "tunnel" to t("隧道(sjis_ext)"),
             ),
             selected = settings.patch,
             onDismiss = { showPatch = false },
@@ -524,12 +532,15 @@ private fun GlobalSettingsScreen(activity: GlobalSettingsActivity) {
     }
     if (showCodec) {
         ChoiceDialog(
-            title = "存档压缩",
-            options = listOf("" to "自动判定", "zlib" to "zlib", "snappy" to "snappy"),
+            title = t("存档压缩"),
+            options = listOf("" to t("自动判定"), "zlib" to "zlib", "snappy" to "snappy"),
             selected = settings.saveCodec,
             onDismiss = { showCodec = false },
             onSelect = { state.update { s -> s.copy(saveCodec = it) } },
         )
+    }
+    if (showLanguage) {
+        LanguageDialog(onDismiss = { showLanguage = false })
     }
 }
 
@@ -553,32 +564,42 @@ private fun globalFontLabel(state: GlobalSettingsState): String {
         settings.fontPath != null ->
             state.importedFontName ?: File(settings.fontPath).name
         settings.fontFamily.isNotEmpty() -> settings.fontFamily
-        else -> "未选择(游戏详情页需先选字体)"
+        else -> t("未选择(游戏详情页需先选字体)")
+    }
+}
+
+/** 「界面语言」行:跟随系统时附带识别结果,便于确认实际生效语言。 */
+private fun languageSummary(activity: GlobalSettingsActivity): String {
+    val stored = I18n.storedTag(activity)
+    return if (stored == I18n.AUTO) {
+        t("跟随系统") + " · " + languageDisplayName(I18n.currentTag())
+    } else {
+        languageDisplayName(stored)
     }
 }
 
 private fun gpuLabel(value: String): String = when (value) {
     "gles" -> "GLES"
     "vulkan" -> "Vulkan"
-    else -> "自动"
+    else -> t("自动")
 }
 
 private fun patchLabel(value: String): String = when (value) {
-    "original" -> "原版(CP932)"
-    "gbk" -> "简体(GBK)"
-    "big5" -> "繁体(Big5)"
-    "tunnel" -> "隧道(sjis_ext)"
-    else -> "自动(推荐)"
+    "original" -> t("原版(CP932)")
+    "gbk" -> t("简体(GBK)")
+    "big5" -> t("繁体(Big5)")
+    "tunnel" -> t("隧道(sjis_ext)")
+    else -> t("自动(推荐)")
 }
 
 private fun movieLabel(value: String): String = when (value) {
-    "builtin" -> "内置(MPEG-1)"
-    "external" -> "外置(设备 MediaCodec)"
-    else -> "自动(推荐)"
+    "builtin" -> t("内置(MPEG-1)")
+    "external" -> t("外置(设备 MediaCodec)")
+    else -> t("自动(推荐)")
 }
 
 private fun codecLabel(value: String): String = when (value) {
     "zlib" -> "zlib"
     "snappy" -> "snappy"
-    else -> "自动判定"
+    else -> t("自动判定")
 }

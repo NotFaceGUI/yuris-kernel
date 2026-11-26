@@ -18438,3 +18438,32 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
     改动无关,未动该文件。
 - **残余**:警告仍完整进 logcat 与调试日志(JSONL);需要人工查看时开
   「调试日志」即可,不再有屏幕提示。
+
+## 成果 UI-I18N (2026-11-26) · 安卓壳界面语言切换(跟随系统 + 10 语言)
+
+- **入口**:游戏库/游戏详情顶栏「文A」按钮 + 全局设置「显示与输入 →
+  界面语言」;弹窗含「跟随系统 / English / 简体中文 / 繁體中文 / 日本語 /
+  한국어 / Español / Français / Deutsch / Português (Brasil) / Русский」。
+- **自动识别**:首选项为空时按 `Locale.getDefault()`;中文按 script/country
+  区分简繁(`Hant` / TW / HK / MO → 繁體),其余语言按语言码映射,未知回落
+  英文。
+- **实现**:`I18n.java`(Java 源集)加载 `assets/i18n/<tag>.json`,键 = 中文
+  原文,简体中文不另存表;缺条目先回落英文、再回落键本身。未用
+  `AppCompatDelegate`;选择写 `yu_kernel/ui_language`,切换后
+  `recreate()` 当前 Activity 生效,语言名一律用母语显示。
+- **词条**:184 条,覆盖游戏库/游戏详情/全局设置/帮助页/游戏页启动与错误/
+  路径解析/视频探测。10 个语言表各 184 条,无缺项、无重复键;`%s`/`%d`
+  格式串保留。
+- **轻量模块**:`:runtime` 复用 `app/src/main/java` 但不编译 Kotlin,故 I18n
+  必须留在 Java;`runtime/build.gradle.kts` 同步把 `app/src/main/assets`
+  加进 sourceSets,模块 APK 也带语言表。
+- **验证**:
+  - `gradle --offline --no-daemon assembleDebug` → BUILD SUCCESSFUL,
+    `:app` 与 `:runtime` 均通过;
+  - 词条校验脚本:9 个 JSON 各 184 条,missing/extra/duplicate/empty 全 0
+    (中文原文键集 = 184);
+  - 模拟器 Medium_Phone_API_36.1(en-US):首次启动自动英文;切简体中文、
+    日本語即时生效;`am force-stop` 后重启仍保持;全局设置页/游戏详情页/
+    帮助页同步切换;全局设置「跟随系统 · English」回落实测通过。
+- **未执行**:未在 arm64 真机复测;Português / Русский 等长文案只做词条与
+  构建校验,未逐屏截图。

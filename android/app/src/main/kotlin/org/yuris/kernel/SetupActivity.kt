@@ -153,6 +153,7 @@ class SetupActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        I18n.init(this)
         NativeHost.nativeInitAndroidContext(applicationContext)
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         SettingsPrefs.migrateLegacy(prefs, applicationContext)
@@ -214,7 +215,7 @@ class SetupActivity : AppCompatActivity() {
             grantResults[0] == PackageManager.PERMISSION_GRANTED
         state.hasStorage = granted
         if (!granted) {
-            state.status = "没有存储权限:内核无法按真实路径读写游戏目录"
+            state.status = t("没有存储权限:内核无法按真实路径读写游戏目录")
             return
         }
         next?.run()
@@ -257,7 +258,7 @@ class SetupActivity : AppCompatActivity() {
     fun onGameDirPicked(uri: Uri) {
         val result = StoragePaths.resolveGameRoot(this, uri)
         if (result.path == null) {
-            state.status = result.error ?: "无法解析该目录的路径"
+            state.status = result.error ?: t("无法解析该目录的路径")
         } else {
             applyGameDirIfSupported(result.path)
         }
@@ -266,7 +267,7 @@ class SetupActivity : AppCompatActivity() {
     fun onSaveDirPicked(uri: Uri) {
         val result = StoragePaths.resolveDirectory(this, uri)
         if (result.path == null) {
-            state.status = result.error ?: "无法解析该目录的路径"
+            state.status = result.error ?: t("无法解析该目录的路径")
         } else {
             state.saveDir = result.path
             state.status = ""
@@ -276,7 +277,7 @@ class SetupActivity : AppCompatActivity() {
     fun onFontPicked(uri: Uri) {
         val result = StoragePaths.resolveFile(this, uri)
         if (result.path == null) {
-            state.status = result.error ?: "无法解析该位置的路径"
+            state.status = result.error ?: t("无法解析该位置的路径")
         } else {
             val file = File(result.path)
             state.fontPath = file.absolutePath
@@ -314,7 +315,7 @@ class SetupActivity : AppCompatActivity() {
             val version = info?.optInt("version", 0) ?: 0
             Log.i(TAG, "probe root=$path ok=${info != null} version=$version")
             val error = if (info == null) {
-                "不是 YU-RIS 游戏:未找到 data.ypf 或 ysbin 目录"
+                t("不是 YU-RIS 游戏:未找到 data.ypf 或 ysbin 目录")
             } else {
                 null
             }
@@ -339,12 +340,12 @@ class SetupActivity : AppCompatActivity() {
     fun onTranslatePicked(uri: Uri) {
         val gameDir = state.gameDir
         if (gameDir == null) {
-            Toast.makeText(this, "先选择游戏目录", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, t("先选择游戏目录"), Toast.LENGTH_LONG).show()
             return
         }
         val result = StoragePaths.resolveFile(this, uri)
         if (result.path == null) {
-            val message = result.error ?: "无法解析该位置的路径"
+            val message = result.error ?: t("无法解析该位置的路径")
             state.status = message
             Toast.makeText(this, message, Toast.LENGTH_LONG).show()
             return
@@ -354,12 +355,12 @@ class SetupActivity : AppCompatActivity() {
             val error = try {
                 val json = JSONObject(File(path).readText())
                 if (json.optString("schema") != "yuris-translate-1") {
-                    "不是 yuris-translate-1 翻译文件"
+                    t("不是 yuris-translate-1 翻译文件")
                 } else {
                     null
                 }
             } catch (error: Exception) {
-                "读取翻译文件失败: ${error.message}"
+                t("读取翻译文件失败: %s", error.message)
             }
             runOnUiThread {
                 if (error != null) {
@@ -370,7 +371,7 @@ class SetupActivity : AppCompatActivity() {
                     state.status = ""
                     Toast.makeText(
                         this,
-                        "已导入翻译文件: ${File(path).name}",
+                        t("已导入翻译文件: %s", File(path).name),
                         Toast.LENGTH_SHORT,
                     ).show()
                 }
@@ -382,26 +383,26 @@ class SetupActivity : AppCompatActivity() {
     fun onExportDirPicked(uri: Uri) {
         val gameDir = state.gameDir
         if (gameDir == null) {
-            Toast.makeText(this, "先选择游戏目录", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, t("先选择游戏目录"), Toast.LENGTH_LONG).show()
             return
         }
         val result = StoragePaths.resolveDirectory(this, uri)
         if (result.path == null) {
-            val message = result.error ?: "无法解析该目录的路径"
+            val message = result.error ?: t("无法解析该目录的路径")
             state.status = message
             Toast.makeText(this, message, Toast.LENGTH_LONG).show()
             return
         }
         val outDir = result.path
-        state.status = "正在导出翻译…"
-        Toast.makeText(this, "正在导出翻译,可能需要几秒…", Toast.LENGTH_SHORT).show()
+        state.status = t("正在导出翻译…")
+        Toast.makeText(this, t("正在导出翻译,可能需要几秒…"), Toast.LENGTH_SHORT).show()
         Thread({
             val reply = NativeHost.nativeExportText(gameDir, outDir, "translate-json", "auto", "")
             Log.i(TAG, "export translate root=$gameDir out=$outDir reply=$reply")
             runOnUiThread {
                 state.status = reply
                 val message = if (reply.startsWith("OK:")) {
-                    "翻译已导出到 $outDir"
+                    t("翻译已导出到 %s", outDir)
                 } else {
                     reply
                 }
@@ -420,7 +421,7 @@ class SetupActivity : AppCompatActivity() {
             state.fontPath == null &&
             state.fontFamily.isEmpty()
         ) {
-            val message = "开始游戏前必须选择或导入字体"
+            val message = t("开始游戏前必须选择或导入字体")
             state.status = message
             Toast.makeText(this, message, Toast.LENGTH_LONG).show()
             return
@@ -522,17 +523,17 @@ class SetupActivity : AppCompatActivity() {
             TYRANOR_PROTOCOL_VERSION,
         )
         if (protocol != TYRANOR_PROTOCOL_VERSION) {
-            state.status = "不支持的 Tyranor 模块协议版本: $protocol"
+            state.status = t("不支持的 Tyranor 模块协议版本: %d", protocol)
             return
         }
         val folder = intent.getStringExtra(TYRANOR_EXTRA_FOLDER_PATH)
         if (folder.isNullOrBlank()) {
-            state.status = "Tyranor 未提供游戏目录"
+            state.status = t("Tyranor 未提供游戏目录")
             return
         }
         val dir = File(folder)
         if (!dir.isAbsolute || !dir.isDirectory) {
-            state.status = "Tyranor 指定的游戏目录不存在: $folder"
+            state.status = t("Tyranor 指定的游戏目录不存在: %s", folder)
             return
         }
         val nextGameDir = dir.absolutePath
@@ -542,7 +543,7 @@ class SetupActivity : AppCompatActivity() {
         state.gameDir = nextGameDir
         intent.getStringExtra(TYRANOR_EXTRA_GAME_TITLE)
             ?.takeIf { it.isNotEmpty() }
-            ?.let { state.status = "来自 Tyranor: $it" }
+            ?.let { state.status = t("来自 Tyranor: %s", it) }
         applyTyranorSettings(intent.getStringExtra(TYRANOR_EXTRA_SETTINGS))
         state.pendingExternalLaunch = true
         state.hasStorage = StoragePaths.hasStorageAccess(this)

@@ -65,12 +65,14 @@ class LibraryActivity : ComponentActivity() {
     private var loading by mutableStateOf(false)
     private var error by mutableStateOf<String?>(null)
     private var needsPermission by mutableStateOf(false)
+    private var showLanguage by mutableStateOf(false)
     private var lastRefreshAt = 0L
     private var pendingStorageAction: Runnable? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        I18n.init(this)
         // 旧版全局存档/翻译键 → 对应游戏的覆盖(只跑一次)。
         SettingsPrefs.migrateLegacy(
             getSharedPreferences(SetupActivity.PREFS, MODE_PRIVATE),
@@ -110,7 +112,7 @@ class LibraryActivity : ComponentActivity() {
             grantResults[0] == PackageManager.PERMISSION_GRANTED
         needsPermission = !granted
         if (!granted) {
-            error = "没有存储权限:无法导入游戏目录"
+            error = t("没有存储权限:无法导入游戏目录")
             return
         }
         next?.run()
@@ -124,13 +126,19 @@ class LibraryActivity : ComponentActivity() {
         Scaffold(
             topBar = {
                 YuTopBar(
-                    title = "游戏库",
+                    title = t("游戏库"),
                     subtitle = when {
-                        needsPermission -> "需要文件权限"
-                        loading -> "载入中…"
-                        else -> "${games.size} 个游戏"
+                        needsPermission -> t("需要文件权限")
+                        loading -> t("载入中…")
+                        else -> t("%d 个游戏", games.size)
                     },
                     actions = {
+                        IconButton(onClick = { showLanguage = true }) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_translate),
+                                contentDescription = t("界面语言"),
+                            )
+                        }
                         IconButton(
                             onClick = {
                                 startActivity(
@@ -143,7 +151,7 @@ class LibraryActivity : ComponentActivity() {
                         ) {
                             Icon(
                                 painter = painterResource(R.drawable.ic_settings),
-                                contentDescription = "全局设置",
+                                contentDescription = t("全局设置"),
                             )
                         }
                         IconButton(
@@ -157,7 +165,7 @@ class LibraryActivity : ComponentActivity() {
                         ) {
                             Icon(
                                 painter = painterResource(R.drawable.ic_add),
-                                contentDescription = "导入游戏",
+                                contentDescription = t("导入游戏"),
                             )
                         }
                     },
@@ -170,7 +178,7 @@ class LibraryActivity : ComponentActivity() {
                     onGrant = { requestStorage() },
                 )
                 loading && games.isEmpty() -> CenterText(
-                    text = "正在载入游戏…",
+                    text = t("正在载入游戏…"),
                     modifier = Modifier.fillMaxSize().padding(padding),
                 )
                 games.isEmpty() -> EmptyPanel(
@@ -190,6 +198,9 @@ class LibraryActivity : ComponentActivity() {
                     onOpen = { game -> openSetup(game.root) },
                 )
             }
+        }
+        if (showLanguage) {
+            LanguageDialog(onDismiss = { showLanguage = false })
         }
     }
 
@@ -230,14 +241,14 @@ class LibraryActivity : ComponentActivity() {
         val resolved = StoragePaths.resolveGameRoot(this, uri)
         val root = resolved.path
         if (root == null) {
-            val message = resolved.error ?: "无法解析该目录的路径"
+            val message = resolved.error ?: t("无法解析该目录的路径")
             error = message
             Toast.makeText(this, message, Toast.LENGTH_LONG).show()
             return
         }
         val info = StoragePaths.probeInfo(File(root))
         if (info == null) {
-            val message = "不是 YU-RIS 游戏:未找到 data.ypf 或 ysbin 目录"
+            val message = t("不是 YU-RIS 游戏:未找到 data.ypf 或 ysbin 目录")
             error = message
             android.util.Log.i("yu-library", "import root=$root not-yuris")
             Toast.makeText(this, message, Toast.LENGTH_LONG).show()
@@ -251,7 +262,7 @@ class LibraryActivity : ComponentActivity() {
         )
         LibraryStore.add(this, root)
         error = null
-        Toast.makeText(this, "已导入", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, t("已导入"), Toast.LENGTH_SHORT).show()
         refresh(force = true)
     }
 
@@ -279,7 +290,7 @@ class LibraryActivity : ComponentActivity() {
                 games = loaded
                 loading = false
                 error = if (loaded.isEmpty()) {
-                    "导入的目录已失效或不是 YU-RIS 游戏根"
+                    t("导入的目录已失效或不是 YU-RIS 游戏根")
                 } else {
                     null
                 }
@@ -381,10 +392,10 @@ private fun PermissionPanel(modifier: Modifier = Modifier, onGrant: () -> Unit) 
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Text("需要「所有文件访问」权限才能导入游戏", style = MiuixTheme.textStyles.title3)
+        Text(t("需要「所有文件访问」权限才能导入游戏"), style = MiuixTheme.textStyles.title3)
         Spacer(Modifier.height(YuSpacing.gap))
         Text(
-            "内核按真实路径读写游戏目录,不能使用 content:// URI",
+            t("内核按真实路径读写游戏目录,不能使用 content:// URI"),
             style = MiuixTheme.textStyles.body2,
             color = MiuixTheme.colorScheme.onBackgroundVariant,
         )
@@ -392,7 +403,7 @@ private fun PermissionPanel(modifier: Modifier = Modifier, onGrant: () -> Unit) 
         Button(
             onClick = onGrant,
             colors = ButtonDefaults.buttonColorsPrimary(),
-        ) { Text("去授权") }
+        ) { Text(t("去授权")) }
     }
 }
 
@@ -407,10 +418,10 @@ private fun EmptyPanel(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Text("还没有导入游戏", style = MiuixTheme.textStyles.title2)
+        Text(t("还没有导入游戏"), style = MiuixTheme.textStyles.title2)
         Spacer(Modifier.height(YuSpacing.gap))
         Text(
-            error ?: "选择游戏根目录(含 data.ypf / ysbin 的目录)",
+            error ?: t("选择游戏根目录(含 data.ypf / ysbin 的目录)"),
             style = MiuixTheme.textStyles.body2,
             color = MiuixTheme.colorScheme.onBackgroundVariant,
         )
@@ -419,6 +430,6 @@ private fun EmptyPanel(
             onClick = onImport,
             modifier = Modifier.width(220.dp),
             colors = ButtonDefaults.buttonColorsPrimary(),
-        ) { Text("导入游戏") }
+        ) { Text(t("导入游戏")) }
     }
 }

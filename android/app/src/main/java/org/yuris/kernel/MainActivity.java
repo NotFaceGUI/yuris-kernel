@@ -265,6 +265,7 @@ public final class MainActivity extends Activity
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        I18n.init(this);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         dialogPresenter = new DialogPresenter(this);
         // 输入方式必须在建 View 之前定下来:onSurfaceTextureAvailable 会用
@@ -470,7 +471,7 @@ public final class MainActivity extends Activity
         spinnerParams.bottomMargin = dp(32);
         bootOverlay.addView(bootSpinner, spinnerParams);
         bootLabel = new TextView(this);
-        bootLabel.setText("正在启动…");
+        bootLabel.setText(I18n.t("正在启动…"));
         bootLabel.setTextColor(Color.WHITE);
         bootLabel.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14f);
         bootLabel.setGravity(Gravity.CENTER);
@@ -820,7 +821,7 @@ public final class MainActivity extends Activity
         if ("wgpu".equals(backendHint) && "vulkan".equals(gpuBackendHint)
                 && isEmulator()) {
             Log.w(TAG, "模拟器 Vulkan 驱动会在 vkQueueSubmit 崩溃,已阻止");
-            statusLine = "模拟器的 Vulkan 驱动有缺陷(会崩溃),请选 GLES 或自动";
+            statusLine = I18n.t("模拟器的 Vulkan 驱动有缺陷(会崩溃),请选 GLES 或自动");
             setResultAndReturn();
             return;
         }
@@ -1192,7 +1193,7 @@ public final class MainActivity extends Activity
                             // boot 阶段结束但首帧/上屏还没就绪:继续转,
                             // 避免又露出一段黑屏。
                             if (bootLabel != null) {
-                                bootLabel.setText("正在准备画面…");
+                                bootLabel.setText(I18n.t("正在准备画面…"));
                             }
                         } else {
                             String detail = progress.optString("detail", "");
@@ -1478,7 +1479,7 @@ public final class MainActivity extends Activity
                 reason = reason.substring(4).trim();
             }
             if (reason.isEmpty()) {
-                reason = "内核没有返回失败原因(可开调试日志查看 logcat)";
+                reason = I18n.t("内核没有返回失败原因(可开调试日志查看 logcat)");
             }
 
             Paint titlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -1498,9 +1499,9 @@ public final class MainActivity extends Activity
             hintPaint.setTextSize(dp(13));
             hintPaint.setTextAlign(Paint.Align.CENTER);
 
-            ArrayList<String> lines = wrapByWidth("原因: " + reason, bodyPaint, maxWidth);
+            ArrayList<String> lines = wrapByWidth(I18n.t("原因: %s", reason), bodyPaint, maxWidth);
             if (lines.isEmpty()) {
-                lines.add("原因: 未知");
+                lines.add(I18n.t("原因: 未知"));
             }
             // 极长错误不把提示挤出屏幕;多余部分省略。
             if (lines.size() > 8) {
@@ -1520,7 +1521,7 @@ public final class MainActivity extends Activity
                 canvas.drawText(line, centerX, y, bodyPaint);
             }
             y += gapBeforeHint + hintPaint.getTextSize();
-            canvas.drawText("返回配置界面检查游戏目录与运行设置", centerX, y, hintPaint);
+            canvas.drawText(I18n.t("返回配置界面检查游戏目录与运行设置"), centerX, y, hintPaint);
         } finally {
             textureView.unlockCanvasAndPost(canvas);
         }

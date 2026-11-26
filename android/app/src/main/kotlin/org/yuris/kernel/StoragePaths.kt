@@ -44,13 +44,13 @@ object StoragePaths {
     fun resolveGameRoot(context: Context, uri: Uri): PathResult {
         var picked = realPathOf(context, uri)?.let(::File)
         if (picked == null) {
-            return PathResult(null, "无法解析该目录的路径,请换用「手动输入路径…」")
+            return PathResult(null, t("无法解析该目录的路径,请换用「手动输入路径…」"))
         }
         if (!picked.isDirectory) {
             picked = picked.parentFile
         }
         if (picked == null) {
-            return PathResult(null, "无法解析该目录的路径,请换用「手动输入路径…」")
+            return PathResult(null, t("无法解析该目录的路径,请换用「手动输入路径…」"))
         }
         val root = findGameRoot(picked)
             ?: singleChildGameRoot(picked)?.absolutePath
@@ -61,10 +61,10 @@ object StoragePaths {
     /** 选中的目录 → 存档目录(传文件时取父目录)。 */
     fun resolveDirectory(context: Context, uri: Uri): PathResult {
         val path = realPathOf(context, uri)
-            ?: return PathResult(null, "无法解析该目录的路径")
+            ?: return PathResult(null, t("无法解析该目录的路径"))
         var picked = File(path)
         if (!picked.isDirectory) {
-            picked = picked.parentFile ?: return PathResult(null, "无法解析该目录的路径")
+            picked = picked.parentFile ?: return PathResult(null, t("无法解析该目录的路径"))
         }
         return PathResult(picked.absolutePath, null)
     }
@@ -72,7 +72,10 @@ object StoragePaths {
     /** 选中的文件 → 真实路径(导入字体)。 */
     fun resolveFile(context: Context, uri: Uri): PathResult {
         val path = realPathOf(context, uri)
-            ?: return PathResult(null, "无法解析该位置的路径,请从「内部存储 / 下载」里选")
+            ?: return PathResult(
+                null,
+                t("无法解析该位置的路径,请从「内部存储 / 下载」里选"),
+            )
         return PathResult(path, null)
     }
 

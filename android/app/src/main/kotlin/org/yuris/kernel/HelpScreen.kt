@@ -137,12 +137,12 @@ fun HelpScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             YuTopBar(
-                title = "参数说明",
+                title = t("参数说明"),
                 leading = {
                     IconButton(onClick = onBack) {
                         Icon(
                             painter = painterResource(R.drawable.ic_arrow_back),
-                            contentDescription = "返回",
+                            contentDescription = t("返回"),
                         )
                     }
                 },
@@ -161,7 +161,7 @@ fun HelpScreen(onBack: () -> Unit) {
         ) {
             item {
                 Text(
-                    richText("下面这些参数会直接影响启动、排版和存档;正文里的**加粗**是常见坑。"),
+                    richText(t("下面这些参数会直接影响启动、排版和存档;正文里的**加粗**是常见坑。")),
                     style = MiuixTheme.textStyles.body2,
                     color = MiuixTheme.colorScheme.onBackgroundVariant,
                     lineHeight = 21.sp,
@@ -173,7 +173,7 @@ fun HelpScreen(onBack: () -> Unit) {
                         modifier = Modifier.padding(YuSpacing.cardH),
                         verticalArrangement = Arrangement.spacedBy(YuSpacing.gap),
                     ) {
-                        Text(section.title, style = MiuixTheme.textStyles.title3)
+                        Text(t(section.title), style = MiuixTheme.textStyles.title3)
                         section.points.forEach { point ->
                             Row(Modifier.fillMaxWidth()) {
                                 Text(
@@ -183,7 +183,7 @@ fun HelpScreen(onBack: () -> Unit) {
                                     modifier = Modifier.padding(end = 8.dp),
                                 )
                                 Text(
-                                    richText(point),
+                                    richText(t(point)),
                                     style = MiuixTheme.textStyles.body2,
                                     color = MiuixTheme.colorScheme.onBackgroundVariant,
                                     lineHeight = 21.sp,
@@ -193,7 +193,7 @@ fun HelpScreen(onBack: () -> Unit) {
                         }
                         section.links.forEach { (label, url) ->
                             Text(
-                                label,
+                                t(label),
                                 style = MiuixTheme.textStyles.body2,
                                 color = MiuixTheme.colorScheme.primary,
                                 textDecoration = TextDecoration.Underline,
