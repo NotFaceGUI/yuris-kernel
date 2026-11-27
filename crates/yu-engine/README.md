@@ -13,7 +13,7 @@ serve —— 嵌的是**同一份装配**;平台差异只能经端口进入。
 | `capture` | `SAVE[ID]` / `LOAD[ID]` 图层像素通道:wgpu 命令时刻按需读回,soft 镜像快照;`LOAD` 写回合成资产叠层 |
 | `export` | 跨平台文本/角色表导出:`WORD` + 脚本字符串常量 + 555 外置剧本(`scenario/*.txt`)+ `キャラ名定義`;稳定坐标 CSV,供翻译与运行时 hook |
 | `identity` | 游戏名、YU-RIS 版本、窗口图标、内核版本;同一份事实给所有宿主 |
-| `patch` | `PatchKind`(auto / original / gbk / big5 / tunnel)+ `PatchSelection`,跨平台唯一取值 |
+| `patch` | `PatchKind`(auto / original / gbk / big5 / cp949 / cp1252 / utf8 / tunnel)+ `PatchSelection`,跨平台唯一取值 |
 | `host_paths` | `$_SYSTEM_PATH` 等路径变量:平台默认解析 + 宿主显式覆盖 |
 | `host_clock` / `keys` | `@_TIME` 本地时间;脚本密钥自举与显式解析 |
 | `json` / `output` / `sha` | 宿主公共件(最小 JSON 写出、终端输出、摘要);`yu-cli` 仍 re-export 保持兼容 |

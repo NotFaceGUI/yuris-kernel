@@ -44,7 +44,7 @@ yu-cli bench <project-root>
 
 完整旗标(含诊断/渲染开关)以 `yu-cli help run` 为准;上表只列常用项。
 
-`--patch` 取值 `auto|original|gbk|big5|tunnel`，与 Android 配置界面共用
+`--patch` 取值 `auto|original|gbk|big5|cp949|cp1252|utf8|tunnel`，与 Android 配置界面共用
 `yu_engine::patch::PatchKind::parse`（唯一取值表见 `docs/cross-platform.md`）。
 
 数据入口唯一约定(`AGENTS.md` §2):`<project-root>/data.ypf` 优先,
