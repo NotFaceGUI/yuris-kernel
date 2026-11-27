@@ -167,6 +167,51 @@ fn ymv_pushes_movie_metadata_and_ymvinfo_writes_let() {
         .any(|e| matches!(e, yu_rt::VmEvent::DomainCall { domain, .. } if *domain == yu_rt::event::Domain::Movie)));
 }
 
+/// `YMVEND[ID]` 只有释放语义,由图形域消费(官方 `0x459a64`):
+/// 发 Movie 域事件,但**不得**再按「域命令未接线」挂号。
+#[test]
+fn ymvend_is_consumed_by_graphics_domain() {
+    let mut b = ProjectBuilder::new();
+    let op_ymvend = {
+        let slot = b
+            .commands
+            .iter_mut()
+            .find(|c| c.0 == "YMVEND")
+            .expect("fixture command present");
+        slot.1 = vec![("ID", 1, 0), ("IDNO", 0, 0)];
+        b.commands
+            .iter()
+            .position(|c| c.0 == "YMVEND")
+            .unwrap() as u8
+    };
+    b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+    b.entry(0, 0);
+    b.scripts = vec![vec![
+        GroupSpec::new(op_ymvend).window(0, ex::s("MV")),
+        GroupSpec::new(OP_END),
+    ]];
+    let noted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut vm = boot_with_files(b, &[]);
+    vm.set_graphics_host(Box::new(MovieHost {
+        noted: noted.clone(),
+    }));
+    let report = vm.tick_at(0, &no_input());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let diags = vm.take_diags();
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.code.as_ref() == "rt.cmd.unimplemented"),
+        "YMVEND 已由图形域消费,不能再挂未实现: {diags:?}"
+    );
+    assert!(
+        vm.events()
+            .iter()
+            .any(|e| matches!(e, yu_rt::VmEvent::DomainCall { domain, .. } if *domain == yu_rt::event::Domain::Movie)),
+        "YMVEND 仍须发 Movie 域事件"
+    );
+}
+
 // ------------------------------------------------------------------ MOVIE
 
 /// 记录 `MovieHost` 调用的假后端(解码不在内核,这里只验证端口契约)。

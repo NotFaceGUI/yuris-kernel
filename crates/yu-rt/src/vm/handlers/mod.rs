@@ -741,6 +741,12 @@ impl Vm {
                     || (self.graphics_host.is_some()
                         && domain == Domain::Menu
                         && matches!(cmd.name.as_str(), "MENU" | "MENUEND"))
+                    // `YMVEND` 只有释放语义:图形域 `apply_ymvend`(官方
+                    // `0x459a64`)删影片结构、保留图层。事件在上面已经发出,
+                    // 不能再按「域命令未接线」挂号(2026-11-27 实机误报)。
+                    || (self.graphics_host.is_some()
+                        && domain == Domain::Movie
+                        && cmd.name == "YMVEND")
                     || (self.sound_host.is_some()
                         && domain == Domain::Sound
                         && matches!(cmd.name.as_str(), "SOUND" | "SOUNDEND"))
