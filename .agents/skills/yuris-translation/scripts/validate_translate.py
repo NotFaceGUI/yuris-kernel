@@ -41,7 +41,7 @@ BRACKET_PAIRS = [
     ("‘", "’"),
     ("《", "》"),
 ]
-CODECS = {"cp932", "gbk", "big5"}
+CODECS = {"cp932", "gbk", "big5", "cp949", "cp1252", "utf8"}
 # 固定布局/居中 UI:这些 context 的译文要尽量保持原标签的全角宽度类别。
 UI_CONTEXTS = {
     "es.BT.NAME.SET",

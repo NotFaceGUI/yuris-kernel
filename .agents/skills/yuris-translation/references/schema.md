@@ -28,7 +28,7 @@ this mode.
 | Field | Meaning |
 |---|---|
 | `project_root`, `data_root` | absolute paths used for the export |
-| `text_codec` | `cp932` / `gbk` / `big5` for compiled text |
+| `text_codec` | `cp932` / `gbk` / `big5` / `cp949` / `cp1252` / `utf8` for compiled text |
 | `text_codec_source` | `auto` / `cli` / `default` |
 | `text_tunnel` | `true` = `sjis_ext.bin` was loaded and used to decode extended characters |
 | `script_key`, `script_key_source` | YSTB XOR key and how it was resolved |

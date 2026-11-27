@@ -172,7 +172,7 @@ python scripts/validate_translate.py <out-dir>/translate.json
 Options:
 
 ```text
---codec cp932|gbk|big5|auto   override the per-entry codec (default: use file)
+--codec cp932|gbk|big5|cp949|cp1252|utf8|auto   override the per-entry codec (default: use file)
 --allow-unencodable           downgrade encoding failures to warnings
 --no-cp932-tunnel             require direct CP932 encoding (data-layer patch)
 --strict                      treat empty translations as errors (default: warning)
@@ -197,7 +197,7 @@ literals translated: N/M (display/message only)
 text translated: N/M (word X, scenario Y)
 glossary: N names (cn/tw)
 validator: 0 errors, K warnings (list the important ones)
-codec: gbk (cn) / big5 (tw) / cp932 (runtime tunnel)
+codec: gbk (cn) / big5 (tw) / cp949 (ko) / cp1252 (es/western) / cp932 (runtime tunnel)
 ```
 
 ## 7. Common mistakes
