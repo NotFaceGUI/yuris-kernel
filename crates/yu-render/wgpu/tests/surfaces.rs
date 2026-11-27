@@ -11,7 +11,7 @@ use yu_backend_soft::{SoftRenderer, TextureStore};
 use yu_backend_wgpu::device::code;
 use yu_backend_wgpu::WgpuRenderer;
 use yu_format::yscm::{Arg as FmtArg, Command as FmtCommand, CommandTable};
-use yu_gfx::{Clear, CompositorFrame, GfxConfig, GfxState, ImageFormat, ParamTable, Viewport};
+use yu_gfx::{Clear, CompositorFrame, GfxConfig, GfxState, ImageFormat, ParamTable, SizeU32, Viewport};
 use yu_rt::event::{ArgValue, Domain, VmEvent};
 use yu_rt::tables::YscmTable;
 use yu_rt::value::Value;
@@ -1500,8 +1500,18 @@ fn reused_copy_surface_preserves_each_merge_sources_color() {
                 }).sum::<usize>()
             };
             if frame == 2 {
-                assert!(texture_ops(&full) > 3, "full replay should include earlier stamps");
-                assert_eq!(texture_ops(&incremental), 3, "one COPY2, MEIDO, and MERGE");
+                // 同一数据流现在在 MERGE 处降级成文本图像字形(整图复制的
+                // 尺寸未知时按资产自然尺寸):纹理 pass 只剩当前链的
+                // `COPY2 + MEIDO`,更早的链在重绑时被回收。
+                assert!(
+                    texture_ops(&full) >= 2,
+                    "full replay should include the live chain"
+                );
+                assert_eq!(
+                    texture_ops(&incremental),
+                    2,
+                    "one COPY2 + MEIDO; MERGE lowered to a text image draw"
+                );
             } else if frame == 3 {
                 assert_eq!(texture_ops(&incremental), 0, "idle must not replay old stamps");
             }
@@ -1557,6 +1567,12 @@ fn scratch_file_reset_does_not_undo_finished_glyph_merges() {
         let mut soft = SoftRenderer::new(store(&entries));
         let mut gfx = state(Viewport::new(4, 2), [0, 0, 0, 255]);
         let mut live = state(Viewport::new(4, 2), [0, 0, 0, 255]);
+        // 真实引擎在 `CG[FILE]` 时注入资产尺寸;补上它,`_fnttmp` 形态的
+        // 「整图复制 → MEIDO → MERGE」才按数据流降级成文本图像字形
+        // (`derive_glyph_chain`),MERGE 不再作为独立纹理 pass 执行。
+        let ink_size = SizeU32 { width: 1, height: 1 };
+        gfx.set_asset_size(b"ink", ink_size);
+        live.set_asset_size(b"ink", ink_size);
         let ink_frames = if batch { 1 } else { stamps.len() as u64 };
         let check = |surface: &yu_backend_soft::Surface, visible_stamps| {
             for (i, &(_, x, y, _, rgba)) in stamps.iter().enumerate() {

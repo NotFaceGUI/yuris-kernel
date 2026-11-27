@@ -481,6 +481,17 @@ impl LayerSurfaces {
     pub fn set_content(&mut self, id: &LayerId, content: Content) {
         let state = self.layers.entry(id.clone()).or_default();
         state.content = Some(content);
+        // 图像加工写回层表面:文本合成结果的缓存身份随之失效。
+        //
+        // 官方文字是写进层表面的像素,后续 `MERGE`/`RECTPAINT` 作用在
+        // **含文字的表面**上;本内核的文本延迟到帧末合成,只能以这份新表面
+        // 为基面重合成。若保留旧 `text_rev/text_sig/raw_hash`,命中路径会把
+        // 刚被加工写回的原始面当成“已合成文本”的内容返回 —— 落回真实图像
+        // 加工的 `MERGE`(缺源/未降级的链)因此会把整层文字抹掉。
+        state.text_rev = 0;
+        state.text_sig = 0;
+        state.raw_hash = 0;
+        state.raw = None;
     }
 
     /// 文本阶段:内容 = 基面 + 字形;同时记住基面(冻结文本 COPY 用)。

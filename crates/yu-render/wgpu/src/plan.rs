@@ -1145,7 +1145,7 @@ fn apply_image(
     let cpu_before = surfaces.stats().cpu_fallbacks;
     let op_started = std::time::Instant::now();
     apply_image_pixels(
-        ctx, frame, textures, gpu, pipelines, targets, surfaces, contents, bases, writes,
+        ctx, frame, layers, textures, gpu, pipelines, targets, surfaces, contents, bases, writes,
         merge_patches, target, image, source, source2, source3, force_bilinear_scale, tuning,
     )?;
     let op_us = op_started.elapsed().as_micros() as u64;
@@ -1191,6 +1191,7 @@ fn apply_image(
 fn resolve_target_base(
     ctx: &GpuContext,
     frame: &CompositorFrame,
+    layers: &HashMap<&LayerId, &Layer>,
     textures: &mut TextureStore,
     gpu: &mut TextureCache,
     targets: &TargetSet,
@@ -1200,10 +1201,9 @@ fn resolve_target_base(
     recorded: Option<&ImageTargetBase>,
     solid_size: Option<(u32, u32)>,
 ) -> Result<Content, String> {
-    let layer = frame
-        .layers
-        .iter()
-        .find(|layer| &layer.id == id)
+    let layer = layers
+        .get(id)
+        .copied()
         .or_else(|| {
             // 目标层已被本帧 `CGEND` 删除,但命令时刻屏幕快照里还留着它
             // (存档缩略图的 `MERGE2` 写 `BT...THUMB`,随后 `BT.END`):
@@ -1213,6 +1213,7 @@ fn resolve_target_base(
                 .values()
                 .rev()
                 .find_map(|snapshot| snapshot.layers.iter().find(|layer| &layer.id == id))
+                .map(AsRef::as_ref)
         });
     if let Some(layer) = layer {
         if layer.is_group() {
@@ -1560,6 +1561,7 @@ fn materialize(
 fn apply_image_pixels(
     ctx: &GpuContext,
     frame: &CompositorFrame,
+    layers: &HashMap<&LayerId, &Layer>,
     textures: &mut TextureStore,
     gpu: &mut TextureCache,
     pipelines: &mut PipelineCache,
@@ -1587,15 +1589,11 @@ fn apply_image_pixels(
     // 同名层被 `CG[FILE]` 逐槽复用时,旧生命周期的内容/基面必须丢弃:
     // - 目标仍存活 ⇒ 以活层纹理为基面;contents 基面不同就是上一张图;
     // - 目标已删除 ⇒ 用命令时刻 `target_base` 重建,供 MERGE/COPY 链使用。
-    let live_texture = frame
-        .layers
-        .iter()
-        .find(|layer| &layer.id == target)
-        .map(|layer| layer.texture.clone());
+    let live_texture = layers.get(target).map(|layer| &layer.texture);
     // 原地加工旧 COPY 快照时，写入内容也必须标记为旧快照版本，供
     // 紧接着的 MERGE 读取；活层仍以帧末的最新 COPY 为准。
     let replayed_snapshot = target_fallback.filter(|t| matches!(t, TextureRef::Snapshot(_)));
-    if let Some(base) = replayed_snapshot.or(live_texture.as_ref()) {
+    if let Some(base) = replayed_snapshot.or(live_texture) {
         if !contents.base_matches(target, Some(base)) {
             contents.remove(target);
         }
@@ -1725,6 +1723,7 @@ fn apply_image_pixels(
             None => resolve_target_base(
                 ctx,
                 frame,
+                layers,
                 textures,
                 gpu,
                 targets,
@@ -1921,6 +1920,7 @@ fn apply_image_pixels(
             None => resolve_target_base(
                 ctx,
                 frame,
+                layers,
                 textures,
                 gpu,
                 targets,
@@ -2068,6 +2068,7 @@ fn apply_image_pixels(
             None => resolve_target_base(
                 ctx,
                 frame,
+                layers,
                 textures,
                 gpu,
                 targets,
@@ -2208,6 +2209,7 @@ fn apply_image_pixels(
         None => resolve_target_base(
             ctx,
             frame,
+            layers,
             textures,
             gpu,
             targets,
@@ -3387,7 +3389,7 @@ fn text_signature(
 /// `content_cpu` 读回后的缩放同式),两者都不需要同步 GPU 读回。
 fn asset_identity_base(
     ctx: &GpuContext,
-    frame: &CompositorFrame,
+    layers: &HashMap<&LayerId, &Layer>,
     textures: &mut TextureStore,
     gpu: &mut TextureCache,
     targets: &TargetSet,
@@ -3395,7 +3397,7 @@ fn asset_identity_base(
     id: &LayerId,
     raw: &Content,
 ) -> Option<Rc<Texture>> {
-    let layer = frame.layers.iter().find(|layer| &layer.id == id)?;
+    let layer = layers.get(id).copied()?;
     let TextureRef::Asset(key) = &layer.texture else {
         return None;
     };
@@ -3831,7 +3833,7 @@ fn apply_text(
         {
             Ok(hit)
         } else if let Some(asset) =
-            asset_identity_base(ctx, frame, textures, gpu, targets, bases, &id, &raw)
+            asset_identity_base(ctx, layers, textures, gpu, targets, bases, &id, &raw)
         {
             text.store_base(&id, base_key, Rc::clone(&asset));
             Ok(asset)
