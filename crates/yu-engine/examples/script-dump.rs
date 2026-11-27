@@ -9,6 +9,8 @@
 //!
 //! 表达式记录格式见 `yu_rt::expr` 模块文档:
 //! `[op:u8][payload_len:u16 LE][payload:payload_len]`。
+//!
+//! 设 `YU_RAW=1` 时额外把 `0x4D` 字面量的原始载荷打到 stderr(核对引号/长度时用)。
 
 use yu_engine::project::Project;
 use yu_format::{yscm::CommandTable, Codec};
@@ -151,6 +153,9 @@ fn disasm(payload: &[u8], codec: Codec) -> Result<String, String> {
                 ]))
             ),
             0x4d => {
+                if std::env::var_os("YU_RAW").is_some() {
+                    eprintln!("RAW4D len={} {:02X?}", body.len(), body);
+                }
                 let inner = if body.len() >= 2 && body[0] == b'"' && body[body.len() - 1] == b'"' {
                     &body[1..body.len() - 1]
                 } else {

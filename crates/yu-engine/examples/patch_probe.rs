@@ -1,6 +1,6 @@
 //! 只读探针:打印文本编码路线解析结果。
 //!
-//! 用法:`patch_probe <project-root> [auto|original|gbk|tunnel]`
+//! 用法:`patch_probe <project-root> [auto|original|gbk|big5|cp949|cp1252|tunnel|utf8]`
 
 use std::path::Path;
 
