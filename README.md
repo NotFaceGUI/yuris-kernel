@@ -46,7 +46,7 @@
   系统变量 ABI 表已入册，另有 v555 1000 槽实测表（`docs/formats/v555-*`）。
 - **双渲染后端** —— `soft`（CPU，确定性参考）与 `wgpu`（GPU，桌面 / Android 主路径）。
 - **多宿主** —— Windows 桌面、headless / 本地服务、浏览器呈现（调试）、Android。
-- **汉化与存档** —— `original` / `gbk` / `big5` / `tunnel` 四条文本路线；
+- **汉化与存档** —— `original` / `gbk` / `big5` / `cp949` / `cp1252` / `utf8` / `tunnel` 七条文本路线；
   `translate.json` 运行时替换角色/选项/UI/正文（CP932 自动扩隧道）；
   `.sd` 存档与桌面字节一致。
 - **可观测** —— `yu-trace` 录制 / 回放 / diff，用于和官方引擎逐帧对拍。
@@ -292,9 +292,12 @@ flowchart LR
 | 原版日文  | `original`（`off` / `none` / `cp932` / `sjis` / `shift_jis`） | 未汉化的原版                                                                  |
 | 简体汉化  | `gbk`（`cp936` / `gb2312`）           | 汉化补丁；译文放在散盘 `ysbin/`，靠「散盘先于封包」的读链生效                 |
 | 繁体汉化  | `big5`（`cp950` / `big-5`）           | 同上，港台旧作与繁中补丁                                                      |
+| 韩文汉化  | `cp949`（`uhc` / `euc-kr` / `kr`）     | 韩文化补丁与韩文本地化版；与 GBK 的 lead 表相同，`auto` 不猜，需显式选         |
+| 西欧本地化 | `cp1252`（`windows-1252` / `es`）     | 西班牙语等西欧单字节本地化版；`auto` 不猜，需显式选                           |
+| UTF-8 本地化 | `utf8`（`utf-8`）                  | 2025 年后本地化发行版（如 Kagura）整包文本为 UTF-8；自动识别通常可判定        |
 | SJIS 隧道 | `tunnel`（`sjis_ext`）                | 不动原编码、追加码点表的补丁；需游戏根有 `sjis_ext.bin`                       |
 | 自动      | `auto`（缺省）                        | 按 `codecs.json` → `sjis_ext.bin` → 工具签名识别；不认补丁名                  |
-| 运行时翻译 | `--translate` + `translate.json`（CP932 自动扩隧道） | 只替换文件内条目，不写回数据；目标 codec 跟随当前 `--patch` |
+| 运行时翻译 | `--translate` + `translate.json`（CP932 自动扩隧道，UTF-8 直写） | 只替换文件内条目，不写回数据；目标 codec 跟随当前 `--patch` |
 | 补丁字体  | `hook.ini` + ttf（自动检测）          | CP932 载体字重映射；启动时强制注入全部 `FONT` 请求                            |
 | v555 原生多语言 | `config.sd` 语言号 → `scenario/` / `sc_cn_scenario/` / `sc_tw_scenario/` | CP932 / GBK / Big5；不是 `--patch` 汉化路线 |
 | 不支持    | —                                     | exe / DLL 注入类补丁（如 `setdll` 挂 `MyDll.dll` 换字体）：不改程序，故不适用 |
@@ -330,7 +333,7 @@ so + 轻量 Java 壳
 flowchart TD
     PROJ["工程根<br/>发行版:*.ypf + pac/*.ypf<br/>开发工程:data/"]
     UPD["update1..9.ypf<br/>叠加挂载"]
-    PATCH["文本编码<br/>original / gbk / big5 / tunnel"]
+    PATCH["文本编码<br/>original / gbk / big5 / cp949 / cp1252 / utf8 / tunnel"]
     TRJ["translate.json<br/>characters · choices · literals · text"]
     TRANS["yu-engine::translation<br/>JSON → 目标编码 / SJIS 隧道扩展"]
     VFS["yu-vfs<br/>DirSource / YpfSource / Mount"]

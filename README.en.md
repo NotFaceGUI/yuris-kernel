@@ -46,7 +46,7 @@ The official engine's observable behavior is the single source of truth</p>
   for 0.255–0.495 are catalogued, plus a v555 1000-slot measured table (`docs/formats/v555-*`).
 - **Two render backends** — `soft` (CPU, deterministic reference) and `wgpu` (GPU, primary desktop / Android path).
 - **Multiple hosts** — Windows desktop, headless / local server, browser presentation (debug), Android.
-- **Text patches and saves** — four text routes `original` / `gbk` / `big5` / `tunnel`;
+- **Text patches and saves** — seven text routes `original` / `gbk` / `big5` / `cp949` / `cp1252` / `utf8` / `tunnel`;
   `.sd` saves are byte-identical with the desktop build.
 - **Observable** — `yu-trace` records / replays / diffs for frame-by-frame comparison against the official engine.
 
@@ -226,9 +226,12 @@ target/release/yu-cli run "<project>" --mode desktop --backend wgpu \
 | Original Japanese | `original` (`off` / `none` / `cp932` / `sjis` / `shift_jis`) | Untranslated original                                                              |
 | Simplified Chinese| `gbk` (`cp936` / `gb2312`)  | Translation patch; the translated text lives in loose `ysbin/`, taking effect via "loose before pack" |
 | Traditional Chinese | `big5` (`cp950` / `big-5`) | Same as above, for Hong Kong / Taiwan releases and traditional patches                             |
+| Korean            | `cp949` (`uhc` / `euc-kr` / `kr`) | Korean patches and localized builds; shares GBK's lead table, so `auto` never guesses — select explicitly |
+| Western European  | `cp1252` (`windows-1252` / `es`) | Spanish and other Western European single-byte localizations; `auto` never guesses — select explicitly |
+| UTF-8 localized   | `utf8` (`utf-8`)            | Localized releases (e.g. Kagura) whose whole text is UTF-8; Auto usually detects it                |
 | SJIS tunnel       | `tunnel` (`sjis_ext`)       | Patch that keeps the original encoding and appends a codepoint table; requires `sjis_ext.bin` in the game root |
 | Auto              | `auto` (default)            | Detected via `codecs.json` → `sjis_ext.bin` → tool signatures; patch names are not recognized      |
-| Runtime translation | `--translate` + `translate.json` (CP932 tunnel auto-extended) | Replaces in-file entries only, never writes back data; target codec follows the active `--patch` |
+| Runtime translation | `--translate` + `translate.json` (CP932 tunnel auto-extended, UTF-8 written directly) | Replaces in-file entries only, never writes back data; target codec follows the active `--patch` |
 | Patch font        | `hook.ini` + ttf (auto-detected) | CP932-carrier glyph remap; force-injected into every `FONT` request at boot                     |
 | v555 native multilingual | `config.sd` language number → `scenario/` / `sc_cn_scenario/` / `sc_tw_scenario/` | CP932 / GBK / Big5; not the `--patch` translation route |
 | Unsupported       | —                           | exe / DLL injection patches (e.g. `setdll` loading `MyDll.dll` to swap fonts): the program is not modified, so they do not apply |
@@ -264,7 +267,7 @@ target/release/yu-cli run "<project>" --mode desktop --backend wgpu \
 flowchart TD
     PROJ["Project root<br/>Release: *.ypf + pac/*.ypf<br/>Dev project: data/"]
     UPD["update1..9.ypf<br/>stacked mounts"]
-    PATCH["Text encoding<br/>original / gbk / big5 / tunnel"]
+    PATCH["Text encoding<br/>original / gbk / big5 / cp949 / cp1252 / utf8 / tunnel"]
     VFS["yu-vfs<br/>DirSource / YpfSource / Mount"]
     FMT["yu-format<br/>ysc · ysl · ysv · yst_list · yst%05d · yscfg"]
     RT["yu-rt<br/>TableSet → Vm::boot_with_aux<br/>tasks / commands / expressions / variable domains"]

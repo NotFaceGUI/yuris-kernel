@@ -57,7 +57,7 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py \
 
 | 参数 | 作用 |
 |---|---|
-| `--codec auto|cp932|gbk|big5|none` | 覆盖每条目的 codec;`none` 跳过编码检查 |
+| `--codec auto|cp932|gbk|big5|cp949|cp1252|utf8|none` | 覆盖每条目的 codec;`none` 跳过编码检查 |
 | `--allow-unencodable` | 编码失败降为 warning |
 | `--strict` | 空译文视为 error |
 | `--max-ratio 2.0` | 译文/原文长度比 warning 阈值 |
@@ -99,8 +99,9 @@ Android 在 `run-config.json`(或 intent extra)里给 `"translate": "<绝对路�
 
 编码:
 
-- 目标 codec = 当前补丁的显示 codec(`--patch auto|original|gbk|big5|tunnel`)。
-- GBK/Big5 直接编码;不可编码字符装载期报错。
+- 目标 codec = 当前补丁的显示 codec(`--patch auto|original|gbk|big5|cp949|cp1252|utf8|tunnel`)。
+- GBK/Big5/CP949/CP1252 直接编码;不可编码字符装载期报错。
+- UTF-8 直接写 UTF-8 字节,不需要隧道表。
 - CP932 优先直接编码,其余字符分配到 SJIS 隧道码;装载器保留游戏自带
   `sjis_ext.bin` 映射、扫描脚本体/变量初值/外置剧本里已出现的双字节对后
   追加新码,并把扩展表同时交给 VM 与渲染器。隧道码仍是脚本可按前导字节
@@ -136,6 +137,9 @@ tunnel=+… bytes=…`;`nativeStatus` 返回命中/未命中统计。
 |---|---|---|
 | `gbk` | 简体中文 | 避免繁体专用字、生僻扩展汉字 |
 | `big5` | 繁体中文 | 避免简体专用字、emoji |
+| `cp949` | 韩文 | UHC/EUC-KR 扩展;避免只能以韩文/Hanja 表示范围外的字符 |
+| `cp1252` | 西班牙语等西欧语言 | Windows-1252 单字节;0x80–0x9F 扩展区与 Latin-1 不同 |
+| `utf8` | 本地化发行版(任意语言) | 全 Unicode 可编码,不需要隧道表 |
 | `cp932` | 日文原版 | 运行时 hook 会直接用 CP932 能表示的字,其余分配新隧道码(容量约 3400 个唯一非 CP932 字符) |
 | `cp932` + `text_tunnel` | 日文原版(扩展字) | 既有映射保留,新中文继续追加;数据层补丁仍受既有表限制 |
 
