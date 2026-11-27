@@ -980,6 +980,29 @@ mod tests {
     }
 
     #[test]
+    fn long_ascii_text_draws_every_byte() {
+        let mut t = with_window(800, 600);
+        t.wait_ms = 15;
+        let text = "Los textos de prueba recorren la ventana completa sin perder ningun byte: \
+                    cada palabra, coma y punto debe aparecer una sola vez en el flujo de dibujo, \
+                    incluso cuando la linea supera el ancho visible y el motor la divide en \
+                    varios tramos consecutivos.";
+        t.append_text(text.as_bytes());
+        t.advance_reveal(1_000_000, false, true);
+        let drawn: Vec<u8> = t
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                TextStep::Glyph(glyph) => Some(glyph.bytes.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(String::from_utf8_lossy(&drawn), text);
+    }
+
+    #[test]
     fn legacy_draw_keeps_flag_width_after_pair_cursor_asymmetry() {
         let mut t = with_window(45, 600);
         t.font.sx = 11;
