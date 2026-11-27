@@ -18731,3 +18731,23 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
 - Android：`SettingsPrefs.canonicalPatch` 成为唯一词表（去空白、忽略大小写、
   与 `PatchKind::parse` 同名别名），Tyranor 入口未知值保留全局设置；
   `gradle :app:compileDebugKotlin` 通过。
+
+## 成果 RT-TYPE-COERCION / YMVEND-WIRE (2026-11-27) · 字符串排序按 0、YMVEND 不再误报
+
+- 类型比较:`0.481` 样本启动即 `rt.var.type compare STR 8192`(287 次,
+  `es_charname.yst pc53`)。官方 0.495 `FUN_0042894c`(`0x42894c`)把字符串
+  压栈时 64 位数值槽清零、标签只写字符串池索引;`<`/`>`/`<=`/`>=`
+  (`0x429244`/`0x4291a8`/`0x429374`/`0x4292dc`)只读数值槽 ⇒ 字符串参与
+  排序比较时数值为 **0**。`Value::ordering_number` 落地,`DIV-RT-002` 建档。
+- 诊断带上操作数(类型/长度/前 32 字节 ASCII 预览),取证不再回脚本重跑。
+- `YMVEND`:事件在挂号判断前已发到图形域(`apply_ymvend`,官方 `0x459a64`),
+  但域分支仍按「域命令未接线」挂 `rt.cmd.unimplemented`(`0.554` 样本实测)。
+  图形宿主存在时把 `YMVEND` 计入 handled;`YMV`/`YMVINFO` 原本已接线,同一
+  进程无诊断。
+- 回归:`value::tests::string_ordering_uses_official_numeric_zero`、
+  `fixture::media::ymvend_is_consumed_by_graphics_domain`。
+- `cargo test --locked -p yu-rt`(带语料变量):全部 `test result: ok`,
+  含 `165 passed; 7 ignored`。
+- 实机复核限制:0.481 样本在既有存档/首次启动标志之后,headless 400/2000 帧
+  不再自动走到 `es_charname` 场景;0.554 的 `es_sprite` 需要桌面交互才触发。
+  两条修复由 RE 证据 + 单测/fixture 锁定,实机路径待下一轮桌面测试确认。
