@@ -1509,6 +1509,89 @@ fn reused_copy_surface_preserves_each_merge_sources_color() {
     }
 }
 
+#[test]
+fn scratch_file_reset_does_not_undo_finished_glyph_merges() {
+    let table = table();
+    let entries = [
+        (b"base.png".as_slice(), png_bytes_for(4, 2, Rgba([0, 0, 0, 255]))),
+        (b"next.png".as_slice(), png_bytes_for(4, 2, Rgba([0, 0, 0, 255]))),
+        (b"ink.png".as_slice(), png_bytes_for(1, 1, Rgba([200, 160, 120, 255]))),
+    ];
+    let strval = |bytes: &[u8]| Value::Str(bytes.to_vec());
+    let cg = |frame, id: &[u8], file: &[u8], visible| {
+        call(frame, "CG", vec![
+            arg(&table, "CG", "ID", strval(id)),
+            arg(&table, "CG", "FILE", strval(file)),
+            arg(&table, "CG", "E", Value::Int(visible)),
+        ])
+    };
+    let action = |frame, source: &[u8], dest: Option<&[u8]>, name, mut args: Vec<ArgValue>| {
+        args.push(arg(&table, "CGACT", "ID", strval(source)));
+        if let Some(dest) = dest {
+            args.push(arg(&table, "CGACT", "ID2", strval(dest)));
+        }
+        args.push(arg(&table, "CGACT", name, Value::Int(1)));
+        call(frame, "CGACT", args)
+    };
+    let glyph = |frame, source, x, y, gain| [
+        cg(frame, b"TMP", b"", 0),
+        action(frame, source, Some(b"TMP"), "COPY2", vec![]),
+        action(frame, b"TMP", None, "MEIDO", vec![arg(&table, "CGACT", "SET", Value::Int(gain))]),
+        action(frame, b"TMP", Some(b"OUT"), "MERGE", vec![
+            arg(&table, "CGACT", "X", Value::Int(x)),
+            arg(&table, "CGACT", "Y", Value::Int(y)),
+        ]),
+    ];
+    let mut gpu = renderer_or_skip(store(&entries));
+    let stamps = [
+        (b"SRC".as_slice(), 0, 0, 0x408040, [100, 160, 60, 255]),
+        (b"SRC".as_slice(), 2, 0, 0x804080, [200, 80, 120, 255]),
+        (b"MISSING".as_slice(), 1, 1, 0x808080, [0, 0, 0, 255]),
+        (b"SRC".as_slice(), 3, 1, 0x008080, [0, 160, 120, 255]),
+    ];
+    for batch in [true, false] {
+        let mut soft = SoftRenderer::new(store(&entries));
+        let mut gfx = state(Viewport::new(4, 2), [0, 0, 0, 255]);
+        let mut live = state(Viewport::new(4, 2), [0, 0, 0, 255]);
+        let ink_frames = if batch { 1 } else { stamps.len() as u64 };
+        let check = |surface: &yu_backend_soft::Surface, visible_stamps| {
+            for (i, &(_, x, y, _, rgba)) in stamps.iter().enumerate() {
+                let expected = if i < visible_stamps { rgba } else { [0, 0, 0, 255] };
+                assert_eq!(pixel_of(surface, x as u32, y as u32), expected, "batch={batch}: glyph {i} at {x},{y}");
+            }
+        };
+        for frame in 1..=ink_frames + 2 {
+            let mut events = vec![VmEvent::FrameStart { frame }];
+            if frame == 1 {
+                events.extend([cg(frame, b"OUT", b"base", 1), cg(frame, b"SRC", b"ink", 0)]);
+            }
+            let visible_stamps = if frame <= ink_frames {
+                let (start, end) = if batch { (0, stamps.len()) } else { (frame as usize - 1, frame as usize) };
+                for &(source, x, y, gain, _) in &stamps[start..end] {
+                    events.extend(glyph(frame, source, x, y, gain));
+                }
+                end
+            } else if frame == ink_frames + 1 {
+                events.push(cg(frame, b"TMP", b"", 0));
+                stamps.len()
+            } else {
+                events.push(cg(frame, b"OUT", b"next", 1));
+                0
+            };
+            events.push(VmEvent::FrameEnd { frame });
+            gfx.consume_events(&events);
+            live.consume_events(&events);
+            check(&soft.render_frame(&gfx.frame()).surface, visible_stamps);
+            if let Some(gpu) = gpu.as_mut() {
+                let output = gpu.render_frame(&live.frame()).expect("gpu render");
+                assert!(output.report.failed_targets.is_empty(), "{:?}", output.report.failed_targets);
+                check(&output.surface, visible_stamps);
+                live.commit_baked(&output.report.failed_targets);
+            }
+        }
+    }
+}
+
 /// 60 帧多场景序列:换差分(COPY)/过渡(TRANSITION)/MERGE/缩放/文本,
 /// wgpu 与 soft **逐帧**逐像素一致;同时验证前缀复用不改变像素。
 ///

@@ -18687,3 +18687,27 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   Latin-1/ISO-8859-1 不作别名(0x80–0x9F 语义不同)。
 - **后续**:CP874(泰)、CP1251/1250/1253–1258 等单字节页可按同一
   `SingleByteTable` 形状接入,等真实样本;GB18030/UTF-16 仍不作为补丁路线。
+
+## 成果 GFX-BITMAP-FILE-RESET (2026-11-27) · 重置暂存层不再丢弃已合成字形
+
+- `<v555-pc-es>` `yst00181.ybn pc7` 为 ASCII 四行；s24 `pc1179–1182`
+  的 `CG[FILE=""] → COPY2 → MEIDO → MERGE` 与前次英文样本的清屏命令不同。
+  旧帧 2190/2625 只保留正文层的末次合并。换图重绑改为保留已有跨层读者
+  所需的旧快照加工，不更改编码或脚本坐标。见 `DIV-GFX-098`。
+- `cargo test --locked -p yu-backend-wgpu --test surfaces scratch_file_reset_does_not_undo_finished_glyph_merges -- --nocapture`:
+  修前 `batch=true: glyph 0 at 0,0`，实得 `[0, 0, 0, 255]`，期望
+  `[100, 160, 60, 255]`；修后 `1 passed; 0 failed`。
+- `cargo test --locked -p yu-backend-wgpu --test surfaces -- --nocapture`:
+  `41 passed; 0 failed; 0 ignored`。
+- `cargo test --locked --no-fail-fast -p yu-format -p yu-engine -p yu-rt -p yu-render-core -p yu-gfx`:
+  按 `AGENTS.md` 指定的可写 TEMP 和语料变量，合计 `850 passed; 0 failed; 9 ignored`。
+  首次用系统 TEMP 跑 `yu-engine --test export` 有 2 条因 `os error 5` 失败，重跑通过。
+- 隔离离屏探针未过首次配置页；随后主人确认桌面版正文缺字已修复，
+  未留既读/未读/回看的逐项 trace。
+
+## 成果 GFX-SURFACE-REPLAY-BACKLOG (2026-11-27) · 图层换图的剩余回放边界挂账
+
+- `DIV-GFX-098` 残余节区分已从源码确认的非快照合成清理边界，与只待复现的
+  后续复制、同文件重绑缓存、过渡/遮罩输入风险。触发条件为新样本可复现或收到
+  用户报告后取得证据；当前不启动 LayerEpoch。
+- 仅文档变更；`git --no-optional-locks diff --check` 无输出，未重跑运行时测试。

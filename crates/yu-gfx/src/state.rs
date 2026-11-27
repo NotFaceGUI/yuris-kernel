@@ -4191,13 +4191,13 @@ impl GfxState {
                 layer.reset_status();
             }
             let t_swap = t0.elapsed();
-            // 旧快照/图像加工随旧纹理作废。若后续 copy 仍以旧快照为
-            // `source_texture`,保留生产者(见 `prune_copy_log`)。
-            self.prune_copy_log(|c| c.dest == parsed.path);
-            let t_prune = t0.elapsed();
-            self.image_log
-                .retain(|i| i.source != parsed.path && i.target.as_ref() != Some(&parsed.path));
+            // s24 pc1179–1182（帧 2190/2625）:重置暂存层不撤销已经写到
+            // 其它表面的 MERGE。旧快照上的加工前缀仍由跨层消费者持有；
+            // 先清理图像依赖，再回收已没有读者的复制生产者(EVID-T-15)。
+            let released = self.prune_rebound_image_ops(&parsed.path, true);
             let t_img = t0.elapsed();
+            self.prune_copy_log(|c| c.dest == parsed.path || released.contains(&c.id));
+            let t_prune = t0.elapsed();
             self.baked_images.borrow_mut().remove(&parsed.path);
             // 换图 = 新表面:抠格候选(若有)随旧像素作废,后续 MERGE2
             // 不得再按旧单元降级(v555 行首 `CG[FILE=""]` 重置暂存层)。
@@ -4214,8 +4214,8 @@ impl GfxState {
                             "[cgdiff] id={} swap={}us prune={}us image={}us total={}us copy_log={} image_log={} nodes={}",
                             parsed.path.display(),
                             t_swap.as_micros(),
-                            (t_prune - t_swap).as_micros(),
-                            (t_img - t_prune).as_micros(),
+                            (t_prune - t_img).as_micros(),
+                            (t_img - t_swap).as_micros(),
                             t0.elapsed().as_micros(),
                             self.copy_log.len(),
                             self.image_log.len(),
@@ -4814,6 +4814,67 @@ impl GfxState {
                 .any(|copy| &copy.dest == dest && copy.status == OpStatus::Executable)
     }
 
+    /// 重绑当前表面不会撤销已经写到其它层的快照合成。
+    /// 只保留有跨层读者的旧快照加工前缀，不把它当作新表面的像素。
+    fn prune_rebound_image_ops(
+        &mut self,
+        dest: &LayerId,
+        file_reset: bool,
+    ) -> rustc_hash::FxHashSet<CopyId> {
+        let mut released = rustc_hash::FxHashSet::default();
+        if file_reset {
+            self.image_log.retain(|op| {
+                let target = op.target.as_ref().unwrap_or(&op.source);
+                let snapshot = match op.source_texture {
+                    Some(TextureRef::Snapshot(id)) => Some(id),
+                    _ => None,
+                };
+                if &op.source != target && target == dest {
+                    released.extend(snapshot);
+                    return false;
+                }
+                // 只放宽有独立版本身份的跨层读，未冻结的基面仍沿用换图清理。
+                &op.source != dest || target == dest || snapshot.is_some()
+            });
+        }
+        let mut reads = rustc_hash::FxHashMap::<CopyId, u64>::default();
+        for op in &self.image_log {
+            let target = op.target.as_ref().unwrap_or(&op.source);
+            if target != &op.source && op.status == OpStatus::Executable {
+                if let Some(TextureRef::Snapshot(id)) = op.source_texture {
+                    reads.insert(id, op.seq);
+                }
+            }
+        }
+        // COPY 本身也可能引用已加工的旧快照；回收时不能删掉它的输入。
+        if !released.is_empty() {
+            for copy in &self.copy_log {
+                if let Some(TextureRef::Snapshot(id)) = copy.source_texture {
+                    if released.contains(&id) && copy.status == OpStatus::Executable {
+                        let read = reads.entry(id).or_default();
+                        *read = (*read).max(copy.seq);
+                    }
+                }
+            }
+        }
+        self.image_log.retain(|op| {
+            let target = op.target.as_ref().unwrap_or(&op.source);
+            let base = op.target_base.as_ref().map(|base| &base.texture);
+            if target != dest {
+                let Some(TextureRef::Snapshot(id)) = base else {
+                    return true;
+                };
+                if target != &op.source || !released.contains(id) || reads.contains_key(id) {
+                    return true;
+                }
+                return self.nodes.get(target).is_some_and(|node| node.layer.texture == TextureRef::Snapshot(*id));
+            }
+            matches!(base, Some(TextureRef::Snapshot(id))
+                if reads.get(id).is_some_and(|&read| op.seq < read))
+        });
+        released
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn cgact_copy(
         &mut self,
@@ -4954,24 +5015,8 @@ impl GfxState {
                 .unwrap_or_default()
         };
         if !texture_copy {
-            // s26 pc658/678/680:下一次 COPY2 覆写暂存层，但先前的 MERGE
-            // 已读取旧快照上着色后的像素。只保留有读者的旧快照写前缀。
-            let mut reads = rustc_hash::FxHashMap::<CopyId, u64>::default();
-            for op in &self.image_log {
-                if op.source == *dest && op.target.as_ref().is_some_and(|t| t != dest) {
-                    if let Some(TextureRef::Snapshot(id)) = op.source_texture {
-                        reads.insert(id, op.seq);
-                    }
-                }
-            }
-            self.image_log.retain(|op| {
-                if op.target.as_ref() != Some(dest) {
-                    return true;
-                }
-                let base = op.target_base.as_ref().map(|b| &b.texture);
-                matches!(base, Some(TextureRef::Snapshot(id))
-                    if reads.get(id).is_some_and(|&read| op.seq < read))
-            });
+            // s26 pc658/678/680 同样以新 COPY2 覆写暂存层，但不撤销旧的跨层合成。
+            self.prune_rebound_image_ops(dest, false);
         }
         // EVID-T-11/T-12:COPY/COPY2 在命令执行时取源层当前状态;区域是源
         // 纹理坐标(含端点),裁剪块写到目标 (0,0),无区域 = 整图复制。
