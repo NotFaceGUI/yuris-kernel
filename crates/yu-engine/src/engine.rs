@@ -479,6 +479,14 @@ pub struct FrameOpSummary {
     pub mask_ops: usize,
     pub copy_ops: usize,
     pub image_ops: usize,
+    /// 本帧已发射图像加工按**动作名**聚合(`action → 次数`,降序)。
+    ///
+    /// 长帧定位用:同一帧里几百条加工到底压在哪个家族(`meido`/`merge2`/
+    /// `size`/`transition`…),决定是缩短单条成本还是砍掉无消费者的重放。
+    pub image_actions: Vec<(String, usize)>,
+    /// 命令时刻 `image_log` / `copy_log` 的规模(未烘焙历史也计入)。
+    pub image_log_len: usize,
+    pub copy_log_len: usize,
     /// 本帧 op 目标层(`LayerId`)按 op 数降序的前 N 项。
     pub top_targets: Vec<(String, usize)>,
     /// **Screen pass 里实际绘制的层**(`层名@alpha`,按出现顺序)。
@@ -1362,6 +1370,7 @@ impl Engine {
         let mut screen_layers: Vec<String> = Vec::new();
         let mut image_chain: Vec<String> = Vec::new();
         let mut copy_chain: Vec<String> = Vec::new();
+        let mut image_actions: BTreeMap<String, usize> = BTreeMap::new();
         // 立绘层属性:fill 是「基图退化成纯色」时的实际颜色,必须看得到。
         let mut sprite_layers: Vec<String> = Vec::new();
         for layer in &frame.layers {
@@ -1465,6 +1474,9 @@ impl Engine {
                     }
                     Op::Image(image) => {
                         summary.image_ops += 1;
+                        *image_actions
+                            .entry(image.action.name().to_string())
+                            .or_insert(0) += 1;
                         image_chain.push(format!(
                             "{}→{}{}{}{}{}",
                             image.source.display(),
@@ -1515,6 +1527,16 @@ impl Engine {
         summary.image_chain = image_chain;
         summary.copy_chain = copy_chain;
         summary.sprite_layers = sprite_layers;
+        let mut actions: Vec<(String, usize)> = image_actions
+            .into_iter()
+            .collect();
+        actions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        summary.image_actions = actions;
+        if let Some(state) = &self.state {
+            let state = state.borrow();
+            summary.image_log_len = state.images().len();
+            summary.copy_log_len = state.copies().len();
+        }
         summary.image_log_all = self
             .state
             .as_ref()

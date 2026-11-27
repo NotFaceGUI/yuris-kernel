@@ -2151,6 +2151,20 @@ impl App {
                     .collect();
                 let _ = write!(line, " top={}", targets.join(" "));
             }
+            if !summary.image_actions.is_empty() {
+                let actions: Vec<String> = summary
+                    .image_actions
+                    .iter()
+                    .take(8)
+                    .map(|(name, count)| format!("{name}:{count}"))
+                    .collect();
+                let _ = write!(line, " imgacts={}", actions.join(","));
+            }
+            let _ = write!(
+                line,
+                " logs=image:{} copy:{}",
+                summary.image_log_len, summary.copy_log_len
+            );
         }
         use std::io::Write as _;
         let writer = self.spike_writer.as_mut().expect("checked above");
