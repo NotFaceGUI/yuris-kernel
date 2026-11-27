@@ -866,3 +866,383 @@ fn v555_cell_chain_relowers_each_copy_with_fresh_cell() {
         "第二轮单元必须换成 n46(不得停在首格): {glyphs:?}"
     );
 }
+
+/// 抠格链降级后,旧 `COPY2`/`MEIDO` 必须随下一次重绑精确回收。
+///
+/// 不回收时每条链都在 `copy_log` 里留一条永久死项,日志随字数线性增长
+/// (英文逐字推进最明显),`snapshot_readers`/`prune_copy_log`/`frame()` 的
+/// O(日志) 扫描跟着变贵。回收的边界是「本链没有其它读者」:
+/// - 常规逐字重复抠格 ⇒ 日志只保留当前链一条复制;
+/// - 中间有别的层从暂存层 `COPY2`(命令时刻读了旧快照)⇒ 旧链必须保留。
+#[test]
+fn v555_glyph_chain_reclaims_dead_copies_but_keeps_readers() {
+    let t = table();
+    let mut gfx = state();
+    gfx.on_event(&frame_start(1600));
+    gfx.on_event(&call(
+        1600,
+        "CG",
+        vec![
+            arg(&t, "CG", "ID", s("MESW.TX")),
+            arg(&t, "CG", "FILE", s("")),
+            arg(&t, "CG", "SX", i(500)),
+            arg(&t, "CG", "SY", i(48)),
+        ],
+    ));
+    gfx.on_event(&call(
+        1600,
+        "CG",
+        vec![
+            arg(&t, "CG", "ID", s("TX.TMP")),
+            arg(&t, "CG", "FILE", s("")),
+            arg(&t, "CG", "SX", i(80)),
+            arg(&t, "CG", "SY", i(80)),
+        ],
+    ));
+
+    fn round(gfx: &mut yu_gfx::GfxState, t: &yu_gfx::ParamTable, sheet: &str, key: &str, at_x: i64) {
+        gfx.on_event(&call(
+            1600,
+            "CG",
+            vec![
+                arg(t, "CG", "ID", s(sheet)),
+                arg(t, "CG", "FILE", s(key)),
+            ],
+        ));
+        gfx.on_event(&call(
+            1600,
+            "CGACT",
+            vec![
+                arg(t, "CGACT", "ID", s(sheet)),
+                arg(t, "CGACT", "ID2", s("TX.TMP")),
+                arg(t, "CGACT", "X", i(395)),
+                arg(t, "CGACT", "Y", i(39)),
+                arg(t, "CGACT", "X2", i(425)),
+                arg(t, "CGACT", "Y2", i(69)),
+                arg(t, "CGACT", "COPY2", i(1)),
+            ],
+        ));
+        gfx.on_event(&call(
+            1600,
+            "CGACT",
+            vec![
+                arg(t, "CGACT", "ID", s("TX.TMP")),
+                arg(t, "CGACT", "MEIDO", i(1)),
+                arg(t, "CGACT", "SET", i(0x808080)),
+            ],
+        ));
+        gfx.on_event(&call(
+            1600,
+            "CGACT",
+            vec![
+                arg(t, "CGACT", "ID", s("TX.TMP")),
+                arg(t, "CGACT", "ID2", s("MESW.TX")),
+                arg(t, "CGACT", "MERGE2", i(1)),
+                arg(t, "CGACT", "X", i(at_x)),
+                arg(t, "CGACT", "Y", i(3)),
+            ],
+        ));
+    }
+
+    // 三轮正常逐字:每条旧链在下一轮重绑时被回收。
+    for (n, key) in [
+        "cgsys_cn/font/font_c20/fnt_s20_n41",
+        "cgsys_cn/font/font_c20/fnt_s20_n46",
+        "cgsys_cn/font/font_c20/fnt_s20_n25",
+    ]
+    .iter()
+    .enumerate()
+    {
+        round(&mut gfx, &t, &format!("TX.0.1.{n}"), key, 3 + n as i64 * 22);
+        assert_eq!(
+            gfx.copies().len(),
+            1,
+            "第 {} 轮后日志只应保留当前链: {:?}",
+            n + 1,
+            gfx.copies().iter().map(|c| c.id.0).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            gfx.frame().text_draws.iter().filter(|d| d.image.is_some()).count(),
+            n + 1,
+            "降级字形必须逐轮累积"
+        );
+    }
+
+    // 长链:日志规模必须停在当前链(1 条),不随字数线性增长。
+    for n in 0..200 {
+        round(
+            &mut gfx,
+            &t,
+            &format!("TX.1.0.{n}"),
+            "cgsys_cn/font/font_c20/fnt_s20_n41",
+            3,
+        );
+    }
+    assert_eq!(
+        gfx.copies().len(),
+        1,
+        "200 轮后 copy_log 仍只应保留当前链,实际 {:?}",
+        gfx.copies().iter().map(|c| c.id.0).collect::<Vec<_>>()
+    );
+    // 相同的 `(资产, 单元, 落点)` 由 `LayerTexts::push` 去重,这里只验证
+    // 降级绘制项仍然存在(逐字累积由上面的逐轮断言覆盖)。
+    assert!(
+        gfx.frame().text_draws.iter().filter(|d| d.image.is_some()).count() >= 3,
+        "降级字形不得在回收日志时丢失"
+    );
+
+    // 中间读者:别的层从暂存层 COPY2,命令时刻读了当前快照 ⇒ 下轮不得回收。
+    gfx.on_event(&call(
+        1600,
+        "CG",
+        vec![
+            arg(&t, "CG", "ID", s("STAMP")),
+            arg(&t, "CG", "FILE", s("")),
+        ],
+    ));
+    gfx.on_event(&call(
+        1600,
+        "CGACT",
+        vec![
+            arg(&t, "CGACT", "ID", s("TX.TMP")),
+            arg(&t, "CGACT", "ID2", s("STAMP")),
+            arg(&t, "CGACT", "COPY2", i(1)),
+        ],
+    ));
+    let before = gfx.copies().len();
+    round(
+        &mut gfx,
+        &t,
+        "TX.0.1.9",
+        "cgsys_cn/font/font_c20/fnt_s20_n1",
+        99,
+    );
+    assert_eq!(
+        gfx.copies().len(),
+        before + 1,
+        "旧链仍被 STAMP 的复制引用时必须保留: {:?}",
+        gfx.copies().iter().map(|c| c.id.0).collect::<Vec<_>>()
+    );
+}
+
+/// 抠格候选拒绝时,MERGE 处按「源层当前快照 = 单资产复制」仍能反推并降级。
+///
+/// 真机 `_fnttmp*` 可能先用一次真实换图创建(纹理非空),候选的"空暂存层"
+/// 门禁会拒;但 MERGE 读的就是复制刚写进去的快照,只要复制之后没有其它
+/// 加工,降级成图像字形与 `COPY+MEIDO+MERGE` 等价。
+#[test]
+fn glyph_chain_derives_at_merge_when_copy_candidate_misses() {
+    let t = table();
+    let mut gfx = state();
+    gfx.on_event(&frame_start(1800));
+    for (id, file) in [("TX", ""), ("SRC", "glyph_char"), ("BLANK", "blank_page"), ("TMP", "blank")] {
+        gfx.on_event(&call(
+            1800,
+            "CG",
+            vec![
+                arg(&t, "CG", "ID", s(id)),
+                arg(&t, "CG", "FILE", s(file)),
+                arg(&t, "CG", "E", i(if id == "TX" { 1 } else { 0 })),
+            ],
+        ));
+    }
+    // 真机 `_fnttmp*` 的源资产没有在 gfx 侧登记尺寸:整图形态按资产自然
+    // 尺寸(`width/height=0`)降级,候选同样在复制时刻拒绝。
+    gfx.on_event(&call(
+        1800,
+        "CGACT",
+        vec![
+            arg(&t, "CGACT", "ID", s("SRC")),
+            arg(&t, "CGACT", "ID2", s("TMP")),
+            arg(&t, "CGACT", "COPY2", i(1)),
+        ],
+    ));
+    gfx.on_event(&call(
+        1800,
+        "CGACT",
+        vec![
+            arg(&t, "CGACT", "ID", s("TMP")),
+            arg(&t, "CGACT", "MEIDO", i(1)),
+            arg(&t, "CGACT", "SET", i(0x808080)),
+        ],
+    ));
+    gfx.on_event(&call(
+        1800,
+        "CGACT",
+        vec![
+            arg(&t, "CGACT", "ID", s("TMP")),
+            arg(&t, "CGACT", "ID2", s("TX")),
+            arg(&t, "CGACT", "MERGE", i(1)),
+            arg(&t, "CGACT", "X", i(5)),
+            arg(&t, "CGACT", "Y", i(7)),
+        ],
+    ));
+    let frame = gfx.frame();
+    let draws: Vec<_> = frame
+        .text_draws
+        .iter()
+        .filter(|d| d.image.is_some() && d.target.display().contains("TX"))
+        .collect();
+    assert_eq!(draws.len(), 1, "MERGE 处必须反推并降级");
+    let image = draws[0].image.as_ref().expect("image");
+    assert_eq!(image.asset, b"glyph_char");
+    assert_eq!((draws[0].x, draws[0].y), (5, 7));
+    assert_eq!(
+        (image.width, image.height),
+        (0, 0),
+        "尺寸未知时交给合成器按资产自然尺寸绘制"
+    );
+}
+
+/// `_fnttmp*` 形态(0.481 本地化):整图 `COPY2`(不带区域、目标未声明尺寸)
+/// → `MEIDO` → `MERGE`,也必须按数据流降级成文本图像字形。
+///
+/// 这条链不满足旧抠格候选(无区域/目标尺寸未知),旧实现每字执行
+/// COPY+MEIDO+MERGE 三条独立纹理 pass(实测每帧 `meido:376 merge:376`)。
+/// 现在候选在复制时刻按资产尺寸建立;降级后旧链在下次重绑时精确回收,
+/// 日志规模不随字数增长。
+#[test]
+fn fnttmp_whole_asset_chain_lowers_and_reclaims() {
+    let t = table();
+    let mut gfx = state();
+    gfx.on_event(&frame_start(1700));
+    gfx.on_event(&call(
+        1700,
+        "CG",
+        vec![
+            arg(&t, "CG", "ID", s("TX")),
+            arg(&t, "CG", "FILE", s("")),
+            arg(&t, "CG", "SX", i(400)),
+            arg(&t, "CG", "SY", i(48)),
+        ],
+    ));
+    gfx.on_event(&call(
+        1700,
+        "CG",
+        vec![
+            arg(&t, "CG", "ID", s("SRC")),
+            arg(&t, "CG", "FILE", s("glyph_char")),
+            arg(&t, "CG", "E", i(0)),
+        ],
+    ));
+    gfx.set_asset_size(b"glyph_char", yu_gfx::SizeU32 { width: 32, height: 32 });
+    gfx.on_event(&call(
+        1700,
+        "CG",
+        vec![
+            arg(&t, "CG", "ID", s("_fnttmp1")),
+            arg(&t, "CG", "FILE", s("")),
+            arg(&t, "CG", "E", i(0)),
+        ],
+    ));
+    for n in 0..50 {
+        // 整图复制(无区域)。
+        gfx.on_event(&call(
+            1700,
+            "CGACT",
+            vec![
+                arg(&t, "CGACT", "ID", s("SRC")),
+                arg(&t, "CGACT", "ID2", s("_fnttmp1")),
+                arg(&t, "CGACT", "COPY2", i(1)),
+            ],
+        ));
+        gfx.on_event(&call(
+            1700,
+            "CGACT",
+            vec![
+                arg(&t, "CGACT", "ID", s("_fnttmp1")),
+                arg(&t, "CGACT", "MEIDO", i(1)),
+                arg(&t, "CGACT", "SET", i(0x808080)),
+            ],
+        ));
+        gfx.on_event(&call(
+            1700,
+            "CGACT",
+            vec![
+                arg(&t, "CGACT", "ID", s("_fnttmp1")),
+                arg(&t, "CGACT", "ID2", s("TX")),
+                arg(&t, "CGACT", "MERGE", i(1)),
+                arg(&t, "CGACT", "X", i(n)),
+                arg(&t, "CGACT", "Y", i(3)),
+            ],
+        ));
+    }
+    let frame = gfx.frame();
+    let draws = frame
+        .text_draws
+        .iter()
+        .filter(|d| d.image.is_some() && d.target.display().contains("TX"))
+        .count();
+    assert_eq!(draws, 50, "50 轮各一条降级字形");
+    assert_eq!(
+        gfx.copies().len(),
+        1,
+        "copy_log 只应保留当前链: {:?}",
+        gfx.copies().iter().map(|c| c.id.0).collect::<Vec<_>>()
+    );
+    assert!(
+        gfx.images().len() <= 2,
+        "image_log 不应随字数增长,实际 {}",
+        gfx.images().len()
+    );
+}
+
+/// 0.555 `FONTCG.L2.*` 形态:每个字一个**资产纹理层**,`MEIDO` 原地着色后
+/// 直接 `MERGE` 到正文层,没有中间复制。MERGE 必须降级成图像字形
+/// (资产 + tint),否则整屏重建时每字一条独立 MERGE pass。
+#[test]
+fn asset_layer_glyph_chain_lowers_per_char_tint() {
+    let t = table();
+    let mut gfx = state();
+    gfx.on_event(&frame_start(1900));
+    gfx.on_event(&call(
+        1900,
+        "CG",
+        vec![
+            arg(&t, "CG", "ID", s("TX")),
+            arg(&t, "CG", "FILE", s("")),
+            arg(&t, "CG", "E", i(1)),
+        ],
+    ));
+    gfx.on_event(&call(
+        1900,
+        "CG",
+        vec![
+            arg(&t, "CG", "ID", s("FONTCG.L2.a")),
+            arg(&t, "CG", "FILE", s("glyph_a")),
+            arg(&t, "CG", "E", i(0)),
+        ],
+    ));
+    gfx.on_event(&call(
+        1900,
+        "CGACT",
+        vec![
+            arg(&t, "CGACT", "ID", s("FONTCG.L2.a")),
+            arg(&t, "CGACT", "MEIDO", i(1)),
+            arg(&t, "CGACT", "SET", i(0x804020)),
+        ],
+    ));
+    gfx.on_event(&call(
+        1900,
+        "CGACT",
+        vec![
+            arg(&t, "CGACT", "ID", s("FONTCG.L2.a")),
+            arg(&t, "CGACT", "ID2", s("TX")),
+            arg(&t, "CGACT", "MERGE", i(1)),
+            arg(&t, "CGACT", "X", i(9)),
+            arg(&t, "CGACT", "Y", i(4)),
+        ],
+    ));
+    let frame = gfx.frame();
+    let draws: Vec<_> = frame
+        .text_draws
+        .iter()
+        .filter(|d| d.image.is_some() && d.target.display().contains("TX"))
+        .collect();
+    assert_eq!(draws.len(), 1, "MERGE 必须降级成图像字形");
+    let image = draws[0].image.as_ref().expect("image");
+    assert_eq!(image.asset, b"glyph_a");
+    assert_eq!(image.tint, Some(0x0080_4020));
+    assert_eq!((draws[0].x, draws[0].y), (9, 4));
+    assert_eq!((image.width, image.height), (0, 0), "0 = 资产自然尺寸");
+}

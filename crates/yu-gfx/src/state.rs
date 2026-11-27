@@ -294,6 +294,37 @@ struct GlyphChain {
     width: u32,
     height: u32,
     tint: Option<u32>,
+    /// 建立本链的 `COPY2`(抠格形态)。下一次重绑暂存层时按它精确回收。
+    copy_id: Option<CopyId>,
+    /// 本链的 `MEIDO` 图像项序号(与 `copy_id` 同一生命周期)。
+    meido_seq: Option<u64>,
+    /// `MERGE` 已把本链降级成 `TextDraw::image`:像素由绘制项承载,
+    /// 日志里的复制/加工只对可能存在的后续读者有意义。
+    merged: bool,
+}
+
+/// 一层最近一次图像加工的两条特征(见 `GfxState::layer_tail` 注释)。
+#[derive(Clone, Copy, Debug, Default)]
+struct LayerTail {
+    /// 最近一次**非**原地 MEIDO 的可执行加工序号(0 = 没有)。
+    last_non_meido_seq: u64,
+    /// 最近一次原地 MEIDO 的 `(序号, tint)`。
+    last_meido: Option<(u64, Option<u32>)>,
+}
+
+/// 层计数索引的递减(计数归零时删键)。批量路径由
+/// [`GfxState::rebuild_log_indices`] 重建,不走这里。
+fn decrement_layer_count(
+    counts: &mut rustc_hash::FxHashMap<LayerId, u32>,
+    id: &LayerId,
+) {
+    let Some(count) = counts.get_mut(id) else {
+        return;
+    };
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+        counts.remove(id);
+    }
 }
 
 /// 一个菜单层(`MENU[ID=…]`;手册 `menu/menu.html`)。
@@ -374,6 +405,30 @@ pub struct GfxState {
     glyph_chains: BTreeMap<LayerId, GlyphChain>,
     copy_log: Vec<CopyOp>,
     image_log: Vec<ImageOp>,
+    /// 图像/复制日志的读者与规模索引(与两份日志同步维护)。
+    ///
+    /// `snapshot_reads`:`CopyId → 有序 seq 多重集`(只计 `Executable` 且
+    /// `source_texture == Snapshot(id)` 的项)。`snapshot_readers()` 由此取
+    /// 每个快照的最新读者,不再重扫整份日志。小内联数组(单链通常 1~2 个
+    /// 读者)避免逐字建 `BTreeMap` 节点。
+    ///
+    /// `image_target_counts` / `copy_dest_counts`:`目标层 → 项数`。用于两个
+    /// 热路径的 O(1) 早退 —— 目标层根本没有加工项时,`prune_rebound_image_ops`
+    /// 不必扫日志;`CGEND` 删层时 `prune_copy_log` 不必先全扫一遍找命中。
+    ///
+    /// 批量删除(retain/drain)后统一 `rebuild_log_indices()`;单条删除
+    /// 走 `forget_*` 递减。索引只做判定,不改变命令序或 `CopyId` 约定。
+    snapshot_reads: rustc_hash::FxHashMap<CopyId, smallvec::SmallVec<[(u64, u32); 2]>>,
+    image_target_counts: rustc_hash::FxHashMap<LayerId, u32>,
+    copy_dest_counts: rustc_hash::FxHashMap<LayerId, u32>,
+    /// 每层最近一次图像加工的类别(字形链推导用,O(1))。
+    ///
+    /// `last_non_meido_seq`:`MERGE` 只允许「复制之后没有任何其它加工」的链;
+    /// `last_meido`:(seq, tint) 供推导时取 MEIDO 颜色。删除会保守地清掉
+    /// 尾项(被删的 MEIDO 不能当证据)。
+    layer_tail: rustc_hash::FxHashMap<LayerId, LayerTail>,
+    /// 字形链推导失败原因的剩余打印次数(每会话最多几条,不刷屏)。
+    chain_diag_budget: u8,
     /// 被上限丢弃的最旧操作数(审计用)。
     copy_log_dropped: u64,
     image_log_dropped: u64,
@@ -751,6 +806,11 @@ impl GfxState {
             glyph_chains: BTreeMap::new(),
             copy_log: Vec::new(),
             image_log: Vec::new(),
+            snapshot_reads: rustc_hash::FxHashMap::default(),
+            image_target_counts: rustc_hash::FxHashMap::default(),
+            copy_dest_counts: rustc_hash::FxHashMap::default(),
+            layer_tail: rustc_hash::FxHashMap::default(),
+            chain_diag_budget: 8,
             copy_log_dropped: 0,
             image_log_dropped: 0,
             diags: BTreeMap::new(),
@@ -2036,6 +2096,7 @@ impl GfxState {
             .map(|(id, (tex, alpha, seq))| (id.clone(), (tex.clone(), *alpha, *seq)))
             .collect();
         let mut log = std::mem::take(&mut self.image_log);
+        let before = log.len();
         log.retain(|op| {
             let target = op.target.as_ref().unwrap_or(&op.source); // silent-ok: 缺 target = 原地加工
             let Some(node) = self.nodes.get(target) else {
@@ -2049,6 +2110,9 @@ impl GfxState {
             })
         });
         self.image_log = log;
+        if self.image_log.len() != before {
+            self.rebuild_log_indices();
+        }
     }
 
     /// 后端执行完本帧后提交烘焙前缀。
@@ -4202,6 +4266,9 @@ impl GfxState {
             // 换图 = 新表面:抠格候选(若有)随旧像素作废,后续 MERGE2
             // 不得再按旧单元降级(v555 行首 `CG[FILE=""]` 重置暂存层)。
             self.glyph_chains.remove(&parsed.path);
+            // 换图 = 新表面:该层的“最近加工”特征随旧像素作废,否则
+            // 上一生命周期的 MEIDO tint 会被当成当前字形链的证据。
+            self.layer_tail.remove(&parsed.path);
             // 新纹理 = 干净像素面:之前 `CGACT[TEXT]` 的绘制项随之作废。
             self.clear_layer_texts(&parsed.path);
             if probe {
@@ -4821,6 +4888,42 @@ impl GfxState {
     /// 记 `u64::MAX`(整个帧内都算读,不因稍后的重置而丢失)。
     fn snapshot_readers(&self) -> rustc_hash::FxHashMap<CopyId, u64> {
         let mut reads = rustc_hash::FxHashMap::<CopyId, u64>::default();
+        // 索引:每个快照的最新读者(多重集末项)。与旧全扫描逐项等价,
+        // `debug` 构建下用全扫描做反证(oracle),发布构建只走索引。
+        for (id, seqs) in &self.snapshot_reads {
+            if let Some(&(seq, _)) = seqs.last() {
+                reads.insert(*id, seq);
+            }
+        }
+        #[cfg(debug_assertions)]
+        {
+            let oracle = self.scan_snapshot_readers();
+            debug_assert_eq!(
+                reads, oracle,
+                "snapshot_reads 索引与全扫描不一致(索引维护漏了某条日志路径)"
+            );
+        }
+        for node in self.nodes.values() {
+            if let TextureRef::Snapshot(id) = node.layer.texture {
+                reads.insert(id, u64::MAX);
+            }
+        }
+        if !self.screen_snapshots.is_empty() {
+            for (id, snapshot) in &self.screen_snapshots {
+                if snapshot.frame == self.frame {
+                    reads.insert(*id, u64::MAX);
+                }
+            }
+        }
+        reads
+    }
+
+    /// `snapshot_readers` 的**旧全扫描实现**(测试/调试构建的 oracle)。
+    ///
+    /// 只统计日志里的读者;活层与当帧屏幕快照由调用方补 `u64::MAX`。
+    #[cfg(debug_assertions)]
+    fn scan_snapshot_readers(&self) -> rustc_hash::FxHashMap<CopyId, u64> {
+        let mut reads = rustc_hash::FxHashMap::<CopyId, u64>::default();
         {
             let mut note = |id: CopyId, seq: u64| {
                 let slot = reads.entry(id).or_default();
@@ -4842,18 +4945,6 @@ impl GfxState {
                     note(id, copy.seq);
                 }
             }
-            for node in self.nodes.values() {
-                if let TextureRef::Snapshot(id) = node.layer.texture {
-                    note(id, u64::MAX);
-                }
-            }
-            if !self.screen_snapshots.is_empty() {
-                for (id, snapshot) in &self.screen_snapshots {
-                    if snapshot.frame == self.frame {
-                        note(*id, u64::MAX);
-                    }
-                }
-            }
         }
         reads
     }
@@ -4866,7 +4957,15 @@ impl GfxState {
         file_reset: bool,
     ) -> rustc_hash::FxHashSet<CopyId> {
         let mut released = rustc_hash::FxHashSet::default();
+        // O(1) 早退:该目标层根本没有任何图像加工项时,下面的读者表与两次
+        // retain 都不可能命中(读者表只保护带快照基面的项,而项必有一个
+        // 目标层)。`CGEND`/精灵 COPY2 每帧上千次走这里,绝大多数目标层
+        // 没有加工项 —— 旧实现每次都全扫一遍图像日志。
+        if !file_reset && !self.image_target_counts.contains_key(dest) {
+            return released;
+        }
         if file_reset {
+            let mut dropped: Vec<ImageOp> = Vec::new();
             self.image_log.retain(|op| {
                 let target = op.target.as_ref().unwrap_or(&op.source);
                 let snapshot = match op.source_texture {
@@ -4875,15 +4974,20 @@ impl GfxState {
                 };
                 if &op.source != target && target == dest {
                     released.extend(snapshot);
+                    dropped.push(op.clone());
                     return false;
                 }
                 // 只放宽有独立版本身份的跨层读，未冻结的基面仍沿用换图清理。
                 &op.source != dest || target == dest || snapshot.is_some()
             });
+            for op in &dropped {
+                self.index_forget_image(op);
+            }
         }
         // 读者表在删掉「写入目标层」的跨层合成之后再算：被删的读不再
         // 保护前缀，否则会留下没有生产者的悬空快照。
         let reads = self.snapshot_readers();
+        let mut dropped: Vec<ImageOp> = Vec::new();
         self.image_log.retain(|op| {
             let target = op.target.as_ref().unwrap_or(&op.source);
             let base = op.target_base.as_ref().map(|base| &base.texture);
@@ -4894,11 +4998,22 @@ impl GfxState {
                 if target != &op.source || reads.contains_key(id) {
                     return true;
                 }
-                return self.nodes.get(target).is_some_and(|node| node.layer.texture == TextureRef::Snapshot(*id));
+                let keep = self.nodes.get(target).is_some_and(|node| node.layer.texture == TextureRef::Snapshot(*id));
+                if !keep {
+                    dropped.push(op.clone());
+                }
+                return keep;
             }
-            matches!(base, Some(TextureRef::Snapshot(id))
-                if reads.get(id).is_some_and(|&read| op.seq < read))
+            let keep = matches!(base, Some(TextureRef::Snapshot(id))
+                if reads.get(id).is_some_and(|&read| op.seq < read));
+            if !keep {
+                dropped.push(op.clone());
+            }
+            keep
         });
+        for op in &dropped {
+            self.index_forget_image(op);
+        }
         // 只回收「已没有任何读者」的快照生产者；仍被图像/复制命令或活层
         // 引用的快照交给 `prune_copy_log` 的不动点保护。
         released.retain(|id| !reads.contains_key(id));
@@ -4967,10 +5082,16 @@ impl GfxState {
         // `SIZE2` 路径「仍记录这条缩放」同口径。门禁只看数据流(见
         // [`Self::glyph_cell_candidate`]),不看层名/资产路径 —— 0.495 的
         // 精灵/按钮 COPY2 目标是屏幕尺寸缓冲,单元与目标尺寸都不命中。
-        if kind == CopyKind::Copy2 {
+        //
+        // 重绑暂存层之前,先把上一条**已降级**链在日志里的生产者收掉:
+        // 像素已由 `TextDraw::image` 承载,旧 `COPY/COPY2`+`MEIDO` 没有读者
+        // 时不必再进后端。
+        if matches!(kind, CopyKind::Copy | CopyKind::Copy2) {
+            self.reclaim_glyph_chain(dest);
+            // 链在**复制时刻**建立(区域形态看单元,整图形态看资产尺寸);
+            // `MEIDO` 只更新 tint,`MERGE` 只查表 —— 不在每个字上倒扫日志。
             match self.glyph_cell_candidate(source, dest, x, y, x2, y2) {
                 Some(chain) => {
-                    // 每轮抠格替换候选(实测 每字 COPY2→MEIDO→MERGE2 严格交替)。
                     self.glyph_chains.insert(dest.clone(), chain);
                 }
                 None if self.glyph_chains.contains_key(dest) => {
@@ -4982,6 +5103,12 @@ impl GfxState {
             }
         }
         let copy_id = CopyId(self.next_copy());
+        if matches!(kind, CopyKind::Copy | CopyKind::Copy2) {
+            // 本链的生产者:下一次重绑时 `reclaim_glyph_chain` 用它精确定位。
+            if let Some(chain) = self.glyph_chains.get_mut(dest) {
+                chain.copy_id = Some(copy_id);
+            }
+        }
         // `TEXCOPY`/`TEXSSCOPY` 走官方 PASTESPRITE/GETSS,不是纹理 blit;
         // 它们不产生 `Snapshot`,也不得改写目标层纹理(见下方 REA 注释)。
         let texture_copy = matches!(kind, CopyKind::TexCopy | CopyKind::TexSsCopy);
@@ -5688,6 +5815,71 @@ impl GfxState {
         }
     }
 
+    /// 回收一条**已降级、且被下一次抠格重绑取代**的字形链。
+    ///
+    /// `MERGE` 已把链降级成 `TextDraw::image`(资产 + 单元 + tint),暂存层的
+    /// 像素不再参与任何可见结果。重绑只替换 `dest` 自己的纹理,因此旧
+    /// `COPY2` 的快照只要没有**其它**读者,就可以连同它的 `MEIDO` 一起从
+    /// 日志删除。不回收时每条链都会在 `copy_log` 里留一条永久死项:日志
+    /// 随字数增长,`snapshot_readers`/`prune_copy_log`/`frame()` 的 O(日志)
+    /// 扫描跟着线性变贵(英文逐字推进在弱机上的主因)。
+    ///
+    /// 判定与 `prune_copy_log` 的不动点同口径,只是范围收窄到本链:
+    /// - 其它可执行复制/图像项在命令时刻读过这个快照;
+    /// - 除 `dest` 外的活层持有它(重绑只换 `dest`);
+    /// - 屏幕快照把它算进纹理依赖。
+    ///
+    /// 任一成立就保持现状 —— 宁可多留,不能少留。
+    fn reclaim_glyph_chain(&mut self, dest: &LayerId) {
+        let Some(chain) = self.glyph_chains.get(dest) else {
+            return;
+        };
+        if !chain.merged {
+            return;
+        }
+        let Some(copy_id) = chain.copy_id else {
+            return;
+        };
+        let meido_seq = chain.meido_seq;
+        let snap = TextureRef::Snapshot(copy_id);
+        // 读者判定走索引(O(1)):除本链自己的 `MEIDO` 外还有任何可执行读者,
+        // 就不能回收。索引只登记 `Executable` 项,与原全扫描同口径。
+        if let Some(seqs) = self.snapshot_reads.get(&copy_id) {
+            if seqs.iter().any(|(seq, _)| Some(*seq) != meido_seq) {
+                return;
+            }
+        }
+        for (id, node) in &self.nodes {
+            if id != dest && node.layer.texture == snap {
+                return;
+            }
+        }
+        for snapshot in self.screen_snapshots.values() {
+            if snapshot.snapshot_textures.contains(&copy_id) {
+                return;
+            }
+        }
+        // 两份日志都按序号严格递增(追加式 + 保序删除),位置用二分而非
+        // 线性扫描:这条回收每个字形一次,线性查找在整屏重建时是 O(字数×日志)。
+        if let Ok(pos) = self.copy_log.binary_search_by_key(&copy_id, |c| c.id) {
+            let removed = self.copy_log.remove(pos);
+            self.index_forget_copy(&removed);
+        }
+        if let Some(seq) = meido_seq {
+            if let Ok(pos) = self.image_log.binary_search_by_key(&seq, |op| op.seq) {
+                let removed = self.image_log.remove(pos);
+                self.index_forget_image(&removed);
+            }
+        }
+        // 与 `prune_copy_log` 同一生命周期规则:快照元数据随生产者回收。
+        self.baked_copies.borrow_mut().remove(&copy_id);
+        self.snapshot_sizes.remove(&copy_id);
+        self.snapshot_origins.remove(&copy_id);
+        self.snapshot_regions.remove(&copy_id);
+        self.snapshot_files.remove(&copy_id);
+        self.snapshot_sources.remove(&copy_id);
+    }
+
     /// `COPY2` 抠格形态的外字链候选(v555 多语言字形页;取证见
     /// [`GlyphChain`] 注释)。不满足数据流条件返回 `None`:
     /// - 源 = 单资产层(整页字形图),区域四坐标齐全且为正;
@@ -5704,58 +5896,292 @@ impl GfxState {
         x2: Option<f64>,
         y2: Option<f64>,
     ) -> Option<GlyphChain> {
-        let reject = |_why: &str| None::<GlyphChain>;
         if source == dest {
-            return reject("source==dest");
+            return None;
         }
-        let (Some(x), Some(y), Some(x2), Some(y2)) = (x, y, x2, y2) else {
-            return reject("rect missing");
-        };
-        let (cx, cy) = (x.round() as i64, y.round() as i64);
-        // 区域含端点:`w = X2-X+1`(与 `snapshot_region_display` 同口径)。
-        let (cw, ch) = (x2.round() as i64 - cx + 1, y2.round() as i64 - cy + 1);
-        if cx < 0 || cy < 0 || !(1..=512).contains(&cw) || !(1..=512).contains(&ch) {
-            return reject("cell size out of 1..=512");
+        // 源必须是单资产层,且命令时刻没有已画文本(COPY 冻结的文本无法由
+        // `TextDraw::image` 承载)。
+        if self
+            .text_draws
+            .get(source)
+            .is_some_and(|texts| !texts.draws.is_empty())
+        {
+            return None;
         }
-        let asset = match self.nodes.get(source).map(|n| &n.layer.texture) {
-            Some(TextureRef::Asset(key)) => key.clone(),
-            _ => return reject("source not single asset"),
+        let region = match (x, y, x2, y2) {
+            (None, None, None, None) => None,
+            (Some(x), Some(y), Some(x2), Some(y2)) => {
+                let (cx, cy) = (x.round() as i64, y.round() as i64);
+                let (cw, ch) = (x2.round() as i64 - cx + 1, y2.round() as i64 - cy + 1);
+                if cx < 0 || cy < 0 || !(1..=512).contains(&cw) || !(1..=512).contains(&ch) {
+                    return None;
+                }
+                Some((cx as u32, cy as u32, cw as u32, ch as u32))
+            }
+            _ => return None,
         };
-        let Some(dest_node) = self.nodes.get(dest) else {
-            return reject("dest missing");
+        // 源可以是资产,也可以是**上一跳复制冻结的快照**(`_fnttmp*` 真机
+        // 形态:字形页先被复制到缓冲)。快照沿 `snapshot_files` 取回原始
+        // 资产键,用 `snapshot_origins`/显示尺寸还原采样单元;只支持整图复制
+        // (区域叠加需要复合坐标,交回 MERGE 处的推导/普通加工)。
+        let (asset, snapshot_cell, snapshot_size) = match self.nodes.get(source).map(|n| &n.layer.texture) {
+            Some(TextureRef::Asset(key)) => (key.clone(), None, None),
+            Some(TextureRef::Snapshot(parent)) if region.is_none() => {
+                let key = self.snapshot_files.get(parent)?.clone();
+                let size = self.snapshot_display_size(*parent)?;
+                let (ox, oy) = self
+                    .snapshot_origins
+                    .get(parent)
+                    .copied()
+                    .unwrap_or((0, 0));
+                if ox < 0 || oy < 0 || size.width == 0 || size.height == 0 {
+                    return None;
+                }
+                (
+                    key,
+                    Some((ox as u32, oy as u32, size.width, size.height)),
+                    Some(size),
+                )
+            }
+            _ => return None,
         };
-        // 暂存层的"小"只在**首次**识别时检查:一旦识别过,`cgact_copy` 会把
-        // 目标 `kind = Image{size: None}`(尺寸改走 `display_rect`,见其尾部
-        // 注释),`image_size()` 之后永远 None —— 若继续要求小尺寸,第二轮起
-        // 全部被拒(实测整行只剩最后一字)。
-        let known = self.glyph_chains.contains_key(dest);
-        let small = known
-            || dest_node
-                .layer
-                .image_size()
-                .is_some_and(|s| s.width <= 4096 && s.height <= 4096);
-        if !small {
-            return reject("dest size >4096 or unknown");
+        let dest_node = self.nodes.get(dest)?;
+        if dest_node.layer.is_group() {
+            return None;
         }
         // 首次识别要求暂存层是真空层(`CG[FILE=""]`/未物化)。之后的重复
         // 抠格不再看纹理:上一轮 `COPY2` 已把暂存层纹理改成继承自字形页的
         // `Asset(键)`/`Snapshot`(<v555-4> 实测;`cgact_copy` 的快照继承逻辑),
         // 若继续要求"空纹理",候选会停在第一格(屏幕上整行变成第一个字,
         // 实测「山山山」)。候选表本身即"该层是抠格暂存"的身份。
+        let known = self.glyph_chains.contains_key(dest);
         let empty = known
             || matches!(
                 dest_node.layer.texture,
                 TextureRef::SolidBlack1x1 | TextureRef::None
             );
         if !empty {
-            return reject("dest not empty & no candidate");
+            return None;
+        }
+        // 区域形态:单元尺寸自带边界,不要求目标声明过 `SX/SY`
+        // (0.481 `_fnttmp*` 实测没有声明尺寸)。
+        if let Some(cell) = region {
+            return Some(GlyphChain {
+                asset,
+                cell: Some(cell),
+                width: cell.2,
+                height: cell.3,
+                tint: None,
+                copy_id: None,
+                meido_seq: None,
+                merged: false,
+            });
+        }
+        // 整图形态:没有区域可当边界,只接受**不可见**、字形尺度
+        // (≤512²,排除全屏精灵缓冲)的暂存层(可见层的像素会直接上屏,
+        // 降级会改变它的表面)。
+        if dest_node.layer.visible {
+            return None;
+        }
+        if let (Some(cell), Some(size)) = (snapshot_cell, snapshot_size) {
+            return Some(GlyphChain {
+                asset,
+                cell: Some(cell),
+                width: size.width,
+                height: size.height,
+                tint: None,
+                copy_id: None,
+                meido_seq: None,
+                merged: false,
+            });
+        }
+        let size = self.asset_sizes.get(&asset).copied()?;
+        if size.width == 0 || size.height == 0 || size.width > 512 || size.height > 512 {
+            return None;
         }
         Some(GlyphChain {
             asset,
-            cell: Some((cx as u32, cy as u32, cw as u32, ch as u32)),
-            width: cw as u32,
-            height: ch as u32,
+            cell: None,
+            width: size.width,
+            height: size.height,
             tint: None,
+            copy_id: None,
+            meido_seq: None,
+            merged: false,
+        })
+    }
+
+    /// `MERGE` 时刻的**单资产直贴**形态:源层纹理就是资产本身(每字
+    /// `CG[FILE=字形图] → MEIDO → MERGE`,0.555 `FONTCG.L2.*` 实测),
+    /// 没有中间复制。判据只看该层最近加工:换图后没有任何其它图像加工
+    /// (`last_non_meido_seq == 0`,换图时由 `CG[FILE]` 清零),tint 取
+    /// 最近一次原地 MEIDO。像素 = 资产 + 通道增益,`TextDraw::image` 等价。
+    ///
+    /// **必须同时满足「不可见」和「有原地 MEIDO」**:普通图层合成
+    /// (`MERGE/MERGE2`,源可见、无着色)是真实画面的一部分,不能当字形
+    /// 降级 —— 它们走各自的后端混色公式,与文本合成器的 src-over 不同。
+    fn derive_chain_from_layer_asset(&self, source: &LayerId) -> Option<GlyphChain> {
+        let node = self.nodes.get(source)?;
+        if node.layer.is_group() || node.layer.visible {
+            return None;
+        }
+        let TextureRef::Asset(key) = &node.layer.texture else {
+            return None;
+        };
+        let tail = self.layer_tail.get(source);
+        if tail.is_some_and(|tail| tail.last_non_meido_seq > 0) {
+            return None;
+        }
+        let (meido_seq, tint) = match tail.and_then(|tail| tail.last_meido) {
+            Some((seq, tint)) => (Some(seq), tint),
+            // 没有原地着色时与普通 MERGE 无法区分:像素测试证明无 tint 的
+            // 直贴合成经文本合成器会改变颜色(`merge_patch_*` 全表不一致),
+            // 保持后端 MERGE 路径。
+            None => return None,
+        };
+        Some(GlyphChain {
+            asset: key.clone(),
+            cell: None,
+            // 0×0 = 资产自然尺寸(合成器按解码后的尺寸绘制)。
+            width: 0,
+            height: 0,
+            tint,
+            copy_id: None,
+            meido_seq,
+            merged: false,
+        })
+    }
+
+    /// 按 `CopyId` 二分查找复制项(日志按 id 严格递增,裁剪保序)。
+    fn lookup_copy(&self, id: CopyId) -> Option<&CopyOp> {
+        let index = self.copy_log.binary_search_by_key(&id, |c| c.id).ok()?;
+        self.copy_log.get(index)
+    }
+
+    /// `MERGE` 时刻按「源层当前快照 = 单资产复制(+ 可选原地 MEIDO)」反推
+    /// 字形链。全部是 O(1)/O(log n) 查表,**不扫日志**:
+    /// - 快照 id → `copy_log` 二分;
+    /// - 复制之后是否有其它写入 → `layer_tail.last_non_meido_seq`;
+    /// - tint/meido 序号 → `layer_tail.last_meido`(必须晚于复制)。
+    ///
+    /// 与抠格候选互补:候选要求目标"空/尺寸已知",这里以 MERGE 本身为证据
+    /// —— `MERGE` 读的就是复制刚写进去的快照,只要之后没有别的加工,降级成
+    /// `TextDraw::image` 与 `COPY+MEIDO+MERGE` 逐像素等价。
+    ///
+    /// 失败返回原因(供一次性诊断;不猜像素)。
+    fn derive_chain_from_copy(&self, dest: &LayerId) -> Result<GlyphChain, &'static str> {
+        let node = self.nodes.get(dest).ok_or("dest missing")?;
+        if node.layer.is_group() {
+            return Err("dest is group");
+        }
+        if node.layer.visible {
+            return Err("dest visible");
+        }
+        let TextureRef::Snapshot(copy_id) = node.layer.texture else {
+            return Err("dest texture not snapshot");
+        };
+        let copy = self.lookup_copy(copy_id).ok_or("producer missing")?;
+        if copy.status != OpStatus::Executable {
+            return Err("copy not executable");
+        }
+        if &copy.dest != dest {
+            return Err("copy dest mismatch");
+        }
+        if !matches!(copy.kind, CopyKind::Copy | CopyKind::Copy2) {
+            return Err("copy kind");
+        }
+        if !copy.texts.is_empty() {
+            return Err("copy froze texts");
+        }
+        if !matches!(copy.source, CopySource::Layer(_)) {
+            return Err("copy source not layer");
+        }
+        if self
+            .layer_tail
+            .get(dest)
+            .is_some_and(|tail| tail.last_non_meido_seq > copy.seq)
+        {
+            return Err("later non-meido write");
+        }
+        // 源可以是资产,也可以是「上一跳复制冻结的快照」:后者沿
+        // `snapshot_files` 取回原始资产键,用 `snapshot_origins`/显示尺寸
+        // 还原采样单元(区块被写到快照表面 `(0,0)`,与 MERGE 的落点一致)。
+        // 只支持整图复制;区域叠加需要复合坐标,交回普通加工。
+        let (asset, cell, width, height) = match (copy.source_texture.as_ref(), &copy.region) {
+            (Some(TextureRef::Asset(key)), CopyRegion::Full) => {
+                // 尺寸未知时用 `0×0` 交给文本合成器按**资产自然尺寸**绘制
+                // (`paint_draw_refs_assets`:width==0 ⇒ 取 cell 尺寸)。
+                let size = self
+                    .snapshot_sizes
+                    .get(&copy_id)
+                    .copied()
+                    .or_else(|| self.asset_sizes.get(key).copied());
+                match size {
+                    Some(size) => (key.clone(), None, size.width, size.height),
+                    None => (key.clone(), None, 0, 0),
+                }
+            }
+            (Some(TextureRef::Asset(key)), CopyRegion::Partial { x, y, x2, y2 }) => {
+                let (cx, cy) = (x.unwrap_or(0), y.unwrap_or(0));
+                let (cx2, cy2) = (x2.unwrap_or(cx), y2.unwrap_or(cy));
+                if cx < 0 || cy < 0 || cx2 < cx || cy2 < cy {
+                    return Err("region invalid");
+                }
+                let (cw, ch) = ((cx2 - cx + 1) as u32, (cy2 - cy + 1) as u32);
+                if cw == 0 || ch == 0 || cw > 4096 || ch > 4096 {
+                    return Err("region out of range");
+                }
+                (
+                    key.clone(),
+                    Some((cx as u32, cy as u32, cw, ch)),
+                    cw,
+                    ch,
+                )
+            }
+            (Some(TextureRef::Snapshot(parent)), CopyRegion::Full) => {
+                let key = self
+                    .snapshot_files
+                    .get(parent)
+                    .ok_or("snapshot source not a single asset")?
+                    .clone();
+                let size = self
+                    .snapshot_display_size(*parent)
+                    .ok_or("snapshot size unknown")?;
+                let (ox, oy) = self
+                    .snapshot_origins
+                    .get(parent)
+                    .copied()
+                    .unwrap_or((0, 0));
+                if ox < 0 || oy < 0 || size.width == 0 || size.height == 0 {
+                    return Err("snapshot region invalid");
+                }
+                (
+                    key,
+                    Some((ox as u32, oy as u32, size.width, size.height)),
+                    size.width,
+                    size.height,
+                )
+            }
+            (Some(TextureRef::Snapshot(_)), _) => return Err("snapshot source with region"),
+            _ => return Err("source texture not asset"),
+        };
+        // `0×0` 只允许出现在整图+资产形态(自然尺寸)。
+        if cell.is_some() && (width == 0 || height == 0) {
+            return Err("zero size");
+        }
+        let (meido_seq, tint) = match self.layer_tail.get(dest).and_then(|tail| tail.last_meido) {
+            Some((seq, tint)) if seq > copy.seq => (Some(seq), tint),
+            _ => (None, None),
+        };
+        Ok(GlyphChain {
+            asset,
+            cell,
+            width,
+            height,
+            tint,
+            copy_id: Some(copy_id),
+            meido_seq,
+            merged: false,
         })
     }
 
@@ -5821,6 +6247,9 @@ impl GfxState {
                     width: w.round() as u32,
                     height: h.round() as u32,
                     tint: None,
+                    copy_id: None,
+                    meido_seq: None,
+                    merged: false,
                 },
             );
             // 仍记录这条缩放:目标层像素按官方语义参与后续层绘制。
@@ -5837,13 +6266,53 @@ impl GfxState {
             return false;
         }
         if matches!(action, ImageAction::Merge | ImageAction::Merge2) {
-            let Some(chain) = self.glyph_chains.get(source).cloned() else {
-                return false;
-            };
             let Some(t) = target else { return false };
             // 目标层不存在时 MERGE2 本身无可见结果:不消费这条链,交回
             // 普通图像加工路径去报 `gfx.layer.missing`。
             if t == source || !self.nodes.contains_key(t) {
+                return false;
+            }
+            // 候选表没有这条链时,按当前数据流反推(O(1)/O(log n) 查表):
+            // 1. 源层就是资产(每字 `CG[FILE] → MEIDO → MERGE`);
+            // 2. 源层是某条复制的快照(整图/区域,含快照源)。
+            // 只有快照形态失败才打印原因(资产形态失败是普通的非字形 MERGE)。
+            if !self.glyph_chains.contains_key(source) {
+                if let Some(chain) = self.derive_chain_from_layer_asset(source) {
+                    self.glyph_chains.insert(source.clone(), chain);
+                } else if matches!(
+                    self.nodes.get(source).map(|n| &n.layer.texture),
+                    Some(TextureRef::Snapshot(_))
+                ) {
+                    match self.derive_chain_from_copy(source) {
+                        Ok(chain) => {
+                            self.glyph_chains.insert(source.clone(), chain);
+                        }
+                        Err(reason) => {
+                            if self.chain_diag_budget > 0 {
+                                self.chain_diag_budget -= 1;
+                                self.push_diag(
+                                    "CGACT",
+                                    error::recoverable(
+                                        error::code::PERF,
+                                        format!(
+                                            "字形链推导未命中 `{}`: {reason}",
+                                            source.display()
+                                        ),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let Some(chain) = self.glyph_chains.get(source).cloned() else {
+                return false;
+            };
+            // 半透明盖章的混色公式与 `MERGE` 不同(文本合成器按 src-over),
+            // 只接受不透明度 256;带 alpha 的交回普通图像加工。
+            let src_alpha = self.nodes.get(source).map(|n| n.layer.alpha).unwrap_or(256);
+            let dst_alpha = self.nodes.get(t).map(|n| n.layer.alpha).unwrap_or(256);
+            if src_alpha < 256 || dst_alpha < 256 {
                 return false;
             }
             let draw = TextDraw {
@@ -5888,6 +6357,12 @@ impl GfxState {
                 }
             }
             self.push_text_draw(t, draw);
+            // 像素已由绘制项承载:下一次抠格重绑暂存层时,本链的 COPY2/MEIDO
+            // 可以从日志里精确回收(`reclaim_glyph_chain`)。不回收时日志会
+            // 随字数线性增长(英文逐字推进最明显),所有 O(日志) 扫描跟着变贵。
+            if let Some(chain) = self.glyph_chains.get_mut(source) {
+                chain.merged = true;
+            }
             return true;
         }
         // 候选层被其它图像加工改写后,不能再按“纯资产字形”降级:去掉
@@ -6316,6 +6791,14 @@ impl GfxState {
             resize_base,
             status,
         });
+        // 字形链的 `MEIDO`:记下序号,下一次抠格重绑时随 COPY2 一起回收。
+        // 只认候选层上的原地形态(链表本身即"这是抠格暂存层"的身份)。
+        if image_action.is_meido() {
+            let t = target.as_ref().unwrap_or(&source);
+            if let Some(chain) = self.glyph_chains.get_mut(t) {
+                chain.meido_seq = Some(seq);
+            }
+        }
         if marks_alpha {
             if let Some(node) = self.nodes.get_mut(&source) {
                 Arc::make_mut(&mut node.layer).alpha_aware = true;
@@ -6746,8 +7229,9 @@ impl GfxState {
             return;
         }
         self.missing_cg_reported.remove(path);
-        // 同名层重建:旧实例的外字链候选作废。
+        // 同名层重建:旧实例的外字链候选与“最近加工”特征作废。
         self.glyph_chains.remove(path);
+        self.layer_tail.remove(path);
         // `CG` 重建同名层 = 官方新建一个层实例,旧实例的像素与加工链全部
         // 作废。除了清烘焙记录,还要把引用该层名的历史加工项从日志里丢掉:
         // 存档界面每次打开都用 `CG[ID="_TMP_OF" FILE=""]` + `CGEND` 重建
@@ -6842,6 +7326,9 @@ impl GfxState {
             }
         }
         self.glyph_chains.retain(|id, _| !removed.contains(id));
+        // 被删图层的“最近加工”特征一并回收:否则按行/字创建唯一临时层的
+        // 脚本会让这张表随会话线性增长(CPU 账本,不随 `CGEND` 收缩)。
+        self.layer_tail.retain(|id, _| !removed.contains(id));
         removed
     }
 
@@ -6849,8 +7336,13 @@ impl GfxState {
         // 快照是独立纹理:源图层被删后,已完成的复制仍需留给后端物化。
         // 目标层被删时不能无条件丢掉复制项 —— 后续 copy 可能以它的快照
         // 为 `source_texture`(sprite 的 `sp.tmpA` 中转层),依赖闭包见
-        // `prune_copy_log`。
-        self.prune_copy_log(|c| removed.contains(&c.dest));
+        // `prune_copy_log`。目的地计数为 0 时 O(1) 早退(绝大多数 CGEND)。
+        if removed
+            .iter()
+            .any(|id| self.copy_dest_counts.contains_key(id))
+        {
+            self.prune_copy_log(|c| removed.contains(&c.dest));
+        }
         if removed.is_empty() {
             return;
         }
@@ -6860,74 +7352,96 @@ impl GfxState {
         // 否则 CG 缩略图的 AKARUSA 明暗差会丢(hover 只剩底板,2026-11-01)。
         // 只做成员判定(不依赖顺序):`CGEND` 单帧上千次,哈希集比
         // `BTreeSet` 少掉每个节点的堆分配与 O(log n) 比较。
+        let no_image_ops = !removed
+            .iter()
+            .any(|id| self.image_target_counts.contains_key(id));
         let mut needed: rustc_hash::FxHashSet<LayerId> = rustc_hash::FxHashSet::default();
         // 命令时刻屏幕快照里出现过的层:其加工链决定快照像素,删除不撤销。
         // 这里按「被删目标」逐个查快照成员,不能把整份快照图层表克隆进
         // `needed`:菜单解构有 2000+ 次 `CGEND`,每次都克隆 1400+ 个
         // `LayerId` 会让关闭 tick 从 ~180ms 涨到 1.5s(2026-11-02 实测)。
         // 复制在命令时刻已取像素:源层若是被删层,它的加工前缀同样需要。
-        for copy in &self.copy_log {
-            if let CopySource::Layer(id) = &copy.source {
-                if removed.contains(id) {
-                    needed.insert(id.clone());
+        // 目标层没有任何加工项时连这份扫描也省掉(与 `no_image_ops` 同判据)。
+        if !no_image_ops {
+            for copy in &self.copy_log {
+                if let CopySource::Layer(id) = &copy.source {
+                    if removed.contains(id) {
+                        needed.insert(id.clone());
+                    }
                 }
             }
         }
         let mut keep = vec![true; self.image_log.len()];
-        // 快照成员集合按**代次**缓存:集合内容只在 `screen_snapshots` 变更
-        // 时变化,而菜单解构帧有 1400+ 次 `CGEND`;旧实现每次 `drop_ops_for`
-        // 都把「全部快照 × layer_ids」重新 collect 一遍。
-        let snapshot_layers: Option<std::rc::Rc<std::collections::HashSet<LayerId>>> =
-            if self.screen_snapshots.is_empty() {
-                None
-            } else {
-                let rev = self.snapshot_layers_rev;
-                let mut cache = self.snapshot_layers_cache.borrow_mut();
-                if cache
-                    .as_ref()
-                    .is_none_or(|(cached_rev, _)| *cached_rev != rev)
-                {
-                    let set: std::collections::HashSet<LayerId> = self
-                        .screen_snapshots
-                        .values()
-                        .flat_map(|snap| snap.layer_ids.iter().cloned())
-                        .collect();
-                    *cache = Some((rev, std::rc::Rc::new(set)));
-                }
-                cache.as_ref().map(|(_, set)| std::rc::Rc::clone(set))
-            };
-        for i in (0..self.image_log.len()).rev() {
-            let op = &self.image_log[i];
-            // 借用而不是 clone:下面是热循环,`LayerId` 是 `Vec<u8>`,
-            // 每项一次克隆在 1184 次 `CGEND` × 上千项的日志上是纯浪费。
-            // `removed` 只含被删子树的少数层,绝大多数项在这里就被跳过。
-            // 缺省: 未指定 target 时目标就是源。
-            let target = op.target.as_ref().unwrap_or(&op.source);
-            if removed.contains(target) && !needed.contains(target) {
-                let in_snapshot = snapshot_layers
-                    .as_ref()
-                    .is_some_and(|set| set.contains(target));
-                if in_snapshot {
-                    needed.insert(target.clone());
+        if !no_image_ops {
+            // 快照成员集合按**代次**缓存:集合内容只在 `screen_snapshots` 变更
+            // 时变化,而菜单解构帧有 1400+ 次 `CGEND`;旧实现每次 `drop_ops_for`
+            // 都把「全部快照 × layer_ids」重新 collect 一遍。
+            let snapshot_layers: Option<std::rc::Rc<std::collections::HashSet<LayerId>>> =
+                if self.screen_snapshots.is_empty() {
+                    None
                 } else {
-                    keep[i] = false;
-                    continue;
+                    let rev = self.snapshot_layers_rev;
+                    let mut cache = self.snapshot_layers_cache.borrow_mut();
+                    if cache
+                        .as_ref()
+                        .is_none_or(|(cached_rev, _)| *cached_rev != rev)
+                    {
+                        let set: std::collections::HashSet<LayerId> = self
+                            .screen_snapshots
+                            .values()
+                            .flat_map(|snap| snap.layer_ids.iter().cloned())
+                            .collect();
+                        *cache = Some((rev, std::rc::Rc::new(set)));
+                    }
+                    cache.as_ref().map(|(_, set)| std::rc::Rc::clone(set))
+                };
+            for i in (0..self.image_log.len()).rev() {
+                let op = &self.image_log[i];
+                // 借用而不是 clone:下面是热循环,`LayerId` 是 `Vec<u8>`,
+                // 每项一次克隆在 1184 次 `CGEND` × 上千项的日志上是纯浪费。
+                // `removed` 只含被删子树的少数层,绝大多数项在这里就被跳过。
+                // 缺省: 未指定 target 时目标就是源。
+                let target = op.target.as_ref().unwrap_or(&op.source);
+                if removed.contains(target) && !needed.contains(target) {
+                    let in_snapshot = snapshot_layers
+                        .as_ref()
+                        .is_some_and(|set| set.contains(target));
+                    if in_snapshot {
+                        needed.insert(target.clone());
+                    } else {
+                        keep[i] = false;
+                        continue;
+                    }
                 }
-            }
-            if removed.contains(&op.source) {
-                needed.insert(op.source.clone());
+                if removed.contains(&op.source) {
+                    needed.insert(op.source.clone());
+                }
             }
         }
-        let mut index = 0usize;
-        self.image_log.retain(|_| {
-            let result = keep.get(index).copied().unwrap_or(true);
-            index += 1;
-            result
-        });
+        if keep.iter().any(|keep| !*keep) {
+            let mut dropped: Vec<ImageOp> = Vec::new();
+            let mut index = 0usize;
+            self.image_log.retain(|op| {
+                let result = keep.get(index).copied().unwrap_or(true);
+                index += 1;
+                if !result {
+                    dropped.push(op.clone());
+                }
+                result
+            });
+            for op in &dropped {
+                self.index_forget_image(op);
+            }
+        }
         // 第二遍:此时 `image_log` 只剩真正会被重放的项,快照依赖闭包收紧
         // 一步 —— 第一遍可能为「随后被丢弃的加工项」保留了生产者。两遍都是
         // 保守的(只多留、不漏留),日志上限 `MAX_OP_LOG` 兜底。
-        self.prune_copy_log(|c| removed.contains(&c.dest));
+        if removed
+            .iter()
+            .any(|id| self.copy_dest_counts.contains_key(id))
+        {
+            self.prune_copy_log(|c| removed.contains(&c.dest));
+        }
     }
 
     /// 删除满足 `remove` 的复制项,但保留仍被后续复制/图像加工
@@ -7028,6 +7542,8 @@ impl GfxState {
             index += 1;
             result
         });
+        // 复制项与快照同一生命周期:批量 retain 后重建日志索引。
+        self.rebuild_log_indices();
         // 快照随复制项消亡(复制冻结后不再重放,快照数据不再被后端读取)。
         let live: rustc_hash::FxHashSet<CopyId> = self.copy_log.iter().map(|c| c.id).collect();
         self.baked_copies
@@ -7619,6 +8135,7 @@ impl GfxState {
             let drop = self.copy_log.len() / 2;
             self.copy_log.drain(..drop);
             self.copy_log_dropped += drop as u64;
+            self.rebuild_log_indices();
             self.push_diag(
                 "CGACT",
                 error::unimplemented(
@@ -7627,6 +8144,7 @@ impl GfxState {
                 ),
             );
         }
+        self.index_note_copy(&op);
         self.copy_log.push(op);
     }
 
@@ -7638,6 +8156,7 @@ impl GfxState {
             self.image_log.drain(..drop);
             self.baked_images.borrow_mut().clear();
             self.image_log_dropped += drop as u64;
+            self.rebuild_log_indices();
             self.push_diag(
                 "CGACT",
                 error::unimplemented(
@@ -7646,7 +8165,155 @@ impl GfxState {
                 ),
             );
         }
+        self.index_note_image(&op);
         self.image_log.push(op);
+    }
+
+    /// 索引:登记一条日志项(读者多重集 + 目标层计数)。
+    ///
+    /// 与 `push_copy_log`/`push_image_log` 同一入口;`OpStatus::Executable`
+    /// 才计入读者(与 `snapshot_readers` 原口径一致),目标计数则统计全部
+    /// 项(只用于“该层有没有加工项”的 O(1) 判定)。
+    fn index_note_copy(&mut self, op: &CopyOp) {
+        if op.status == OpStatus::Executable {
+            self.note_snapshot_read(op.source_texture.as_ref(), op.seq);
+        }
+        *self.copy_dest_counts.entry(op.dest.clone()).or_insert(0) += 1;
+    }
+
+    fn index_note_image(&mut self, op: &ImageOp) {
+        if op.status == OpStatus::Executable {
+            self.note_snapshot_read(op.source_texture.as_ref(), op.seq);
+        }
+        let target = op.target.as_ref().unwrap_or(&op.source);
+        *self
+            .image_target_counts
+            .entry(target.clone())
+            .or_insert(0) += 1;
+        let tail = self.layer_tail.entry(target.clone()).or_default();
+        if op.status != OpStatus::Executable || !op.action.is_meido() || target != &op.source {
+            tail.last_non_meido_seq = op.seq;
+        } else {
+            tail.last_meido = Some((
+                op.seq,
+                op.set
+                    .as_ref()
+                    .and_then(EngineValue::as_int)
+                    .map(|v| (v as u32) & 0x00FF_FFFF),
+            ));
+        }
+    }
+
+    fn index_forget_copy(&mut self, op: &CopyOp) {
+        if op.status == OpStatus::Executable {
+            self.forget_snapshot_read(op.source_texture.as_ref(), op.seq);
+        }
+        decrement_layer_count(&mut self.copy_dest_counts, &op.dest);
+    }
+
+    fn index_forget_image(&mut self, op: &ImageOp) {
+        if op.status == OpStatus::Executable {
+            self.forget_snapshot_read(op.source_texture.as_ref(), op.seq);
+        }
+        let target = op.target.as_ref().unwrap_or(&op.source);
+        decrement_layer_count(&mut self.image_target_counts, target);
+        // 被删的 MEIDO 不能再当推导证据:把它降级成“非 MEIDO 写入”,
+        // 让复制之后的链一律交给普通图像加工(宁可多算,不能少着色)。
+        if let Some(tail) = self.layer_tail.get_mut(target) {
+            if tail.last_meido.is_some_and(|(seq, _)| seq == op.seq) {
+                tail.last_meido = None;
+                tail.last_non_meido_seq = tail.last_non_meido_seq.max(op.seq);
+            } else if op.action.is_meido() && target == &op.source {
+                tail.last_non_meido_seq = tail.last_non_meido_seq.max(op.seq);
+            }
+        }
+    }
+
+    fn note_snapshot_read(&mut self, source_texture: Option<&TextureRef>, seq: u64) {
+        let Some(TextureRef::Snapshot(id)) = source_texture else {
+            return;
+        };
+        let seqs = self.snapshot_reads.entry(*id).or_default();
+        // 序号全程单调(复制/加工共用一个计数器),绝大多数是尾部追加。
+        match seqs.last_mut() {
+            Some((last, count)) if *last == seq => *count += 1,
+            Some((last, _)) if *last < seq => seqs.push((seq, 1)),
+            Some(_) => {
+                let index = seqs.partition_point(|(value, _)| *value < seq);
+                match seqs.get_mut(index) {
+                    Some((value, count)) if *value == seq => *count += 1,
+                    _ => seqs.insert(index, (seq, 1)),
+                }
+            }
+            None => seqs.push((seq, 1)),
+        }
+    }
+
+    fn forget_snapshot_read(&mut self, source_texture: Option<&TextureRef>, seq: u64) {
+        let Some(TextureRef::Snapshot(id)) = source_texture else {
+            return;
+        };
+        let Some(seqs) = self.snapshot_reads.get_mut(id) else {
+            return;
+        };
+        let index = seqs.partition_point(|(value, _)| *value < seq);
+        let Some((value, count)) = seqs.get_mut(index) else {
+            return;
+        };
+        if *value != seq {
+            return;
+        }
+        *count -= 1;
+        if *count == 0 {
+            seqs.remove(index);
+        }
+        if seqs.is_empty() {
+            self.snapshot_reads.remove(id);
+        }
+    }
+
+    /// 批量删除(retain/drain/整表回收)后重建索引。
+    ///
+    /// 这些路径本来就要 O(日志) 扫描,重建不改变量级;单条删除走
+    /// `index_forget_*`,不触发全量重建。
+    fn rebuild_log_indices(&mut self) {
+        // 先把两份日志移出 `self`,避免「迭代日志 + 写索引」的借用冲突。
+        let image_log = std::mem::take(&mut self.image_log);
+        let copy_log = std::mem::take(&mut self.copy_log);
+        self.snapshot_reads.clear();
+        self.image_target_counts.clear();
+        self.copy_dest_counts.clear();
+        self.layer_tail.clear();
+        for op in &image_log {
+            if op.status == OpStatus::Executable {
+                self.note_snapshot_read(op.source_texture.as_ref(), op.seq);
+            }
+            let target = op.target.as_ref().unwrap_or(&op.source);
+            *self
+                .image_target_counts
+                .entry(target.clone())
+                .or_insert(0) += 1;
+            let tail = self.layer_tail.entry(target.clone()).or_default();
+            if op.status != OpStatus::Executable || !op.action.is_meido() || target != &op.source {
+                tail.last_non_meido_seq = op.seq;
+            } else {
+                tail.last_meido = Some((
+                    op.seq,
+                    op.set
+                        .as_ref()
+                        .and_then(EngineValue::as_int)
+                        .map(|v| (v as u32) & 0x00FF_FFFF),
+                ));
+            }
+        }
+        for op in &copy_log {
+            if op.status == OpStatus::Executable {
+                self.note_snapshot_read(op.source_texture.as_ref(), op.seq);
+            }
+            *self.copy_dest_counts.entry(op.dest.clone()).or_insert(0) += 1;
+        }
+        self.image_log = image_log;
+        self.copy_log = copy_log;
     }
 
     /// 图层当前基面的像素尺寸(与后端 `base_texture`/`layer_surface` 同口径)。
@@ -7845,7 +8512,8 @@ impl GfxState {
         if read_later {
             return;
         }
-        self.image_log.remove(pos);
+        let removed = self.image_log.remove(pos);
+        self.index_forget_image(&removed);
         self.baked_images.borrow_mut().remove(target);
     }
 
@@ -7926,6 +8594,7 @@ impl GfxState {
             });
             if dropped > 0 {
                 self.image_log_dropped += dropped as u64;
+                self.rebuild_log_indices();
             }
         }
         let same = |old: &ImageOp| {
@@ -7951,6 +8620,7 @@ impl GfxState {
                     .map(|copy| copy.seq),
             )
             .max();
+        let before = self.image_log.len();
         match last_read {
             // 只保留“最后一次读取之前的最新一次同参填充”;读取看到的状态
             // 不变,更早的重复填充对该读取没有贡献。
@@ -7973,6 +8643,9 @@ impl GfxState {
                 });
             }
             None => self.image_log.retain(|old| !same(old)),
+        }
+        if self.image_log.len() != before {
+            self.rebuild_log_indices();
         }
         self.baked_images.borrow_mut().remove(target);
     }
