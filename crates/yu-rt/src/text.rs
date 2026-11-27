@@ -397,19 +397,22 @@ impl TextState {
         let mut out = Vec::with_capacity(bytes.len());
         let mut i = 0usize;
         while i < bytes.len() {
-            let b = bytes[i];
-            if codec.is_lead(b) {
-                out.push(b);
-                if let Some(&trail) = bytes.get(i + 1) {
-                    out.push(trail);
-                    i += 2;
-                } else {
-                    i += 1;
-                }
+            // 旧编码按前导表保留双字节,不查码表(0x4567c0;
+            // DIV-RT-072 §2.1);非法尾字节/隧道码也不能折成空格。
+            // UTF-8 按完整字符步进,避免把第 3/4 字节折成空格。
+            let width = if codec == yu_format::Codec::Utf8 {
+                codec.unit_len_at(bytes, i).max(1)
             } else {
-                out.push(if !(0x20..=0x7E).contains(&b) { 0x20 } else { b });
-                i += 1;
+                1 + usize::from(codec.is_lead(bytes[i]))
+            };
+            let end = (i + width).min(bytes.len());
+            let b = bytes[i];
+            if width > 1 {
+                out.extend_from_slice(&bytes[i..end]);
+            } else {
+                out.push(if (0x20..=0x7E).contains(&b) { b } else { 0x20 });
             }
+            i = end;
         }
         out
     }
@@ -423,8 +426,15 @@ impl TextState {
         let wait = self.wait_ms as i32;
         let mut i = 0;
         while i < bytes.len() {
-            // 官方按前导表判定;孤立前导字节也按全角标志写(不猜第二字节)。
-            let lead = codec.is_lead(bytes[i]);
+            // WORD 0x458d44 / _ 0x4567c0:旧编码只读前导表,
+            // 孤立前导及不可解码码对也写 FULL 和完整 WAIT。
+            // UTF-8 另按完整字符宽度生成一个标志,保留变长文本支持。
+            let unit_len = if codec == yu_format::Codec::Utf8 {
+                codec.unit_len_at(bytes, i).max(1)
+            } else {
+                1 + usize::from(codec.is_lead(bytes[i]))
+            };
+            let lead = unit_len > 1;
             let delay = if lead { wait } else { wait / 2 };
             self.flags.push(if lead { flag::FULL } else { flag::HALF });
             self.cells.push(TextCell {
@@ -437,7 +447,7 @@ impl TextState {
                 gradation: self.font.gradation,
                 bold: self.font.bold,
             });
-            i += usize::from(lead) + 1;
+            i += unit_len;
         }
     }
 
@@ -662,7 +672,8 @@ impl TextState {
         if end > self.bytes.len() {
             return false;
         }
-        let full = len == 2;
+        // 旧编码的 len 由标志指定;UTF-8 的 len 来自完整字符宽度。
+        let full = len > 1;
         let cell = self.cell(style_idx);
         let mut bytes = smallvec::SmallVec::new();
         bytes.extend_from_slice(&self.bytes[start..end]);
@@ -685,7 +696,14 @@ impl TextState {
 
     fn draw_current(&mut self) -> bool {
         let idx = self.reveal_flags;
-        let len = if self.flags[idx] == flag::FULL { 2 } else { 1 };
+        // FUN_00404914 按当前标志取 1/2 字节,不是重新解码当前字节。
+        // 尤其 `！？` 特例后两游标故意错位(oracle §2.1),必须仍按标志取。
+        // UTF-8 标志不表达 2/3/4 字节之别,继续使用变长字符步进。
+        let len = if self.codec == yu_format::Codec::Utf8 {
+            self.codec.unit_len_at(&self.bytes, self.reveal_bytes).max(1)
+        } else {
+            1 + usize::from(self.flags[idx] == flag::FULL)
+        };
         self.draw_span(len, idx)
     }
 
@@ -708,7 +726,13 @@ impl TextState {
             self.reveal_bytes = self.bytes.len();
             return true;
         }
-        let w = i64::from(cur.width.max(0));
+        // 0.495 FUN_00404c60 的折行边界读取完整 SX；半角只在画完后走 SX/2。
+        // UTF-8 定制文本保留其独立的字符度量路径。
+        let w = if self.codec == yu_format::Codec::Utf8 {
+            Self::advance(&cur, self.flags[idx] == flag::FULL).max(0)
+        } else {
+            i64::from(cur.width)
+        };
         if self.cursor_x + 2 + w >= win_w {
             return self.wrap_line(idx);
         }
@@ -930,6 +954,94 @@ mod tests {
     }
 
     #[test]
+    fn legacy_fold_preserves_undecodable_pairs_and_dangling_leads() {
+        // 0x4568c9:前导表裁决,不查 Unicode 码表;末尾只保留现有字节
+        // (官方还复制 NUL 的残余见 DIV-RT-072 §5)。
+        for codec in [yu_format::Codec::Cp932, yu_format::Codec::Gbk, yu_format::Codec::Big5] {
+            let bytes = b"A\x82\x01\x82\x7f\x82";
+            assert_eq!(TextState::fold_text_out_bytes(codec, bytes), bytes, "{codec:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_flags_and_delays_depend_on_leads_not_decodability() {
+        let mut t = with_window(800, 600);
+        t.wait_ms = 15;
+        t.append_text(b"\x82\x01A\x82");
+        assert_eq!(t.flags, b"212");
+        assert_eq!(t.cells.iter().map(|cell| cell.delay).collect::<Vec<_>>(), [15, 7, 15]);
+        t.advance_reveal(100, false, true);
+        let glyphs: Vec<_> = t.steps.iter().filter_map(|step| match step {
+            TextStep::Glyph(glyph) => Some((glyph.bytes.as_slice(), glyph.full)),
+            _ => None,
+        }).collect();
+        assert_eq!(glyphs, [(b"\x82\x01".as_slice(), true), (b"A".as_slice(), false)]);
+        assert_eq!((t.reveal_bytes, t.reveal_flags), (3, 2), "孤立 FULL 没有两字节可画");
+    }
+
+    #[test]
+    fn legacy_draw_keeps_flag_width_after_pair_cursor_asymmetry() {
+        let mut t = with_window(45, 600);
+        t.font.sx = 11;
+        t.wait_ms = 15;
+        t.append_text(b"\x81\x49\x81\x48\x82\xa0AB\x82\xa0C");
+        t.advance_reveal(0, false, false);
+        assert_eq!((t.reveal_bytes, t.reveal_flags), (4, 1));
+        // oracle §2.1:字节游标领先后,后续取 1/2 字节仍由标志决定。
+        t.set_window(Some((800, 600)));
+        t.advance_reveal(1000, false, false);
+        let glyphs: Vec<_> = t.steps.iter().filter_map(|step| match step {
+            TextStep::Glyph(glyph) => Some((glyph.bytes.as_slice(), glyph.full)),
+            _ => None,
+        }).collect();
+        assert_eq!(glyphs, [
+            (b"\x81\x49".as_slice(), true), (b"\x81\x48".as_slice(), true),
+            (b"\x82\xa0".as_slice(), true), (b"AB".as_slice(), true),
+            (b"\x82".as_slice(), false), (b"\xa0".as_slice(), false),
+        ]);
+        assert_eq!((t.reveal_bytes, t.reveal_flags), (10, 5));
+    }
+
+    #[test]
+    fn utf8_fold_append_and_draw_keep_two_three_four_byte_characters() {
+        let text = "Aé終😀B";
+        let bytes = TextState::fold_text_out_bytes(yu_format::Codec::Utf8, text.as_bytes());
+        assert_eq!(bytes, text.as_bytes());
+        let mut t = TextState::with_codec(yu_format::Codec::Utf8);
+        t.set_window(Some((800, 600)));
+        t.wait_ms = 15;
+        t.append_text(&bytes);
+        assert_eq!(t.flags, b"12221");
+        assert_eq!(t.cells.iter().map(|cell| cell.delay).collect::<Vec<_>>(), [7, 15, 15, 15, 7]);
+        t.advance_reveal(0, false, true);
+        let glyphs: Vec<_> = t.steps.iter().filter_map(|step| match step {
+            TextStep::Glyph(glyph) => Some((glyph.bytes.as_slice(), glyph.full, glyph.x)),
+            _ => None,
+        }).collect();
+        assert_eq!(glyphs, [
+            (b"A".as_slice(), false, 0), ("é".as_bytes(), true, 10),
+            ("終".as_bytes(), true, 30), ("😀".as_bytes(), true, 50),
+            (b"B".as_slice(), false, 70),
+        ]);
+        assert_eq!((t.reveal_bytes, t.reveal_flags), (bytes.len(), 5));
+    }
+
+    #[test]
+    fn utf8_ascii_keeps_existing_wrap_behavior() {
+        let mut t = TextState::with_codec(yu_format::Codec::Utf8);
+        t.set_window(Some((44, 600)));
+        t.font.sx = 16;
+        t.font.sy = 16;
+        t.append_text(b"ABCDE");
+        t.advance_reveal(0, false, false);
+        let positions: Vec<_> = t.steps.iter().filter_map(|step| match step {
+            TextStep::Glyph(glyph) => Some((glyph.x, glyph.y)),
+            _ => None,
+        }).collect();
+        assert_eq!(positions, [(0, 0), (8, 0), (16, 0), (24, 0), (0, 16)]);
+    }
+
+    #[test]
     fn control_flags_and_clear_keep_cursor_and_surface() {
         let mut t = TextState::default();
         t.push_flag_sized(flag::RETURN);
@@ -1039,6 +1151,25 @@ mod tests {
         // W=70:x=0、20 各画一字;第三字 40+2+20=62<70 且 40+2+40=82>=70
         // ⇒ 只剩一格分支,非禁则 ⇒ 换行到 y=20、x=0。
         assert_eq!(pos, vec![(0, 0), (20, 0), (0, 20)]);
+    }
+
+    #[test]
+    fn legacy_half_width_advances_half_but_wraps_at_full_sx() {
+        let mut t = with_window(44, 600);
+        t.font.sx = 16;
+        t.font.sy = 16;
+        t.append_text(b"ABC");
+        t.advance_reveal(0, false, false);
+        let positions: Vec<_> = t
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                TextStep::Glyph(glyph) => Some((glyph.x, glyph.y)),
+                _ => None,
+            })
+            .collect();
+        // 0x404c60:第三字 x=16,16+2+2*SX=50 >= W，走只剩一格分支。
+        assert_eq!(positions, [(0, 0), (8, 0), (0, 16)]);
     }
 
     #[test]

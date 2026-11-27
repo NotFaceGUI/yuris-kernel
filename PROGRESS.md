@@ -18467,3 +18467,223 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
     帮助页同步切换;全局设置「跟随系统 · English」回落实测通过。
 - **未执行**:未在 arm64 真机复测;Português / Русский 等长文案只做词条与
   构建校验,未逐屏截图。
+
+## 成果 GFX-GLYPH-COPY-REPLAY (2026-11-27) · 保留逐字 `COPY2` 着色后的合并像素
+
+- **实机证据**:`<game-sv>` `YU_GFX_CMD_TRACE` f177 s26 pc657..680。
+  西文沿 `COPY2(整图) → MEIDO → MERGE` 写正文;截图所示已读行每字填色
+  同为 `0x34307C`,自动布局和 `CGACT[TEXT]` 绘制项计数为 0。与官方
+  `FUN_0042f809` 即时表面语义对照,颜色不应只留在最后一次暂存层写入。
+- **改动**:暂存层重做复制时只保留被后续图像命令读取的旧快照加工前缀;
+  Soft/WGPU 用命令时刻快照身份匹配已重放像素,不回退到旧快照的未着色基图。
+  不改中文裁格字形快路径、不按作品或版本分流。另修复同层自动布局缓存漏掉
+  手动绘制项,并按 `0x404c60` 恢复传统编码自动文本的完整 `SX` 折行阈值。
+- **反证**:`cargo test --offline -p yu-backend-wgpu --test surfaces
+  reused_copy_surface_preserves_each_merge_sources_color -- --nocapture`:
+  修前 `FAILED`,首字 RGBA `[200,160,120,255]` ≠ `[100,160,60,255]`;
+  修后 `1 passed; 0 failed`,检查同帧复用、下一帧追加和重放。混合布局测试
+  修前首字 alpha `0` ≠ `128`;传统编码折行测试修前第三字 `(16,0)`
+  ≠ `(0,16)`;两项修后均通过。
+- **回归**:`cargo test --offline -p yu-gfx -p yu-render-core -p yu-backend-soft
+  -p yu-backend-wgpu -p yu-rt -p yu-engine -p yu-format -- --nocapture`
+  返回 0;62 个套件,汇总 `1031 passed; 0 failed; 10 ignored`,含 17 条显式
+  语料/不变量条件跳过记录。ERIS 封包、SDK 语料按现有夹具配置运行。
+- **台账与残余**:`DIV-GFX-098`;未读首段是否全部恢复、已读填充/描边像素及
+  语言菜单仍需 Release 实机复测;不将通用文字命令序或空格源缺失记作已对齐。
+
+## 成果 GFX-IMAGE-SURFACE-PREFIX (2026-11-27) · 逐字合并续写已确认的表面
+
+- **根因**:`s26 pc658/664 → pc665/678 → pc670/680`。桌面在每帧成功渲染
+  后调用 `commit_baked`,gfx 只发新增图像命令;WGPU 把后缀误判为完整链的
+  结构变化,清掉正文层常驻像素,导致新字出现时前字消失。复用暂存层的旧
+  `MEIDO` 同时把自己的旧快照误当作活引用,即使该字已写进正文仍会重放。
+- **修正**:帧契约显式带已确认前缀终点;WGPU 持有同一终点时从其后续写。
+  只为未执行读者保留本帧旧快照的加工;Soft 不接收仅供常驻表面的增量,
+  继续按全链回放。未改字库、字形颜色、混合公式或作品分流。
+- **反证**:`cargo test --offline -p yu-backend-wgpu --test surfaces
+  reused_copy_surface_preserves_each_merge_sources_color -- --nocapture`:
+  加入桌面 `commit_baked` 后修前首字 RGBA `[0,0,0,255]`,预期
+  `[100,160,60,255]`;修后 `1 passed; 0 failed`。新增一字只发 3 个
+  纹理操作(`COPY2/MEIDO/MERGE`),真实空闲下一帧发 0 个,像素仍相同。
+- **回归**:`cargo test --offline -p yu-gfx -p yu-backend-soft
+  -p yu-backend-wgpu -p yu-engine -- --nocapture` 返回 0;
+  39 个套件,`525 passed; 0 failed; 3 ignored`,3 条缺语料显式跳过。
+- **台账**:`DIV-GFX-098`;真实样本剩余毫秒耗时用 Release `--frame-stats`
+  定量,不把合成回归的工作量计数当作实机耗时。
+
+## 成果 GFX-BLANK-COPY2 (2026-11-27) · 已清空暂存层的缺源复制不阻塞回放确认
+
+- **实机**:`<game-sv>` trace f925 清正文一次,f926–939 追加 119 次字形且无
+  正文重置,其中 20 次引用未创建的 `.sp` 源层。`s26 pc508/509` 把空格
+  映射到 `sp`,`pc657/663` 清空暂存层,随后 `pc658/664` 整图 `COPY2`。
+  官方 `CG[FILE]` 缺资源无像素(DIV-GFX-080);`0x42f809`、`0x43b33c`
+  确认合并按命令时刻表面执行,本缺源链无独立手册页。
+- **测量**:Release 原始 `frame-stats.csv` 共 3798 帧。低 pass 组渲染
+  P50 1.028 ms;≥300 surface pass 组 461 帧,渲染 P50 11.044 ms/P95
+  18.819 ms,图像规划 P50 4.009 ms、GPU 读回 P50 5.842 ms、文字阶段
+  P50 0.001 ms。慢帧 engine 3872 纹理 pass 630 个,其中正文与暂存层
+  620 个,91 个操作跳过;`skip_top` 含 `copy:asset.missing`。
+- **改动**:明确全透明清空后,整图 `COPY2` 的未创建源/确实缺失的资产
+  形成可完成的透明快照,使后续有效合并仍可被确认。保留缺资产证据,不把
+  解码/设备/快照错误归为空白;不改裁格、手动字体或脚本分支。
+- **反证**:`cargo test --offline -p yu-backend-wgpu --test surfaces
+  reused_copy_surface_preserves_each_merge_sources_color -- --nocapture`:
+  关规则 `FAILED`,首字 `[0,0,0,255]` ≠ `[100,160,60,255]`;恢复后
+  `1 passed`。扩展夹具覆盖缺资产、未建源、跨帧追加和空闲零纹理操作。
+- **回归**:`cargo test --offline -p yu-gfx -p yu-backend-soft
+  -p yu-backend-wgpu -p yu-engine -- --nocapture`:39 个套件,
+  `525 passed; 0 failed; 3 ignored`,3 条缺语料显式跳过。
+- **台账**:`DIV-GFX-098`。主人实机确认前缀消失已修;推进时仍有单帧尖峰。
+
+## 成果 WGPU-MERGE-PATCH (2026-11-27) · 批量小矩形 MERGE 不再逐字写全幅
+
+- **基线**:缺源修复后 Release 4263 帧,渲染 P95 2.007 ms;较修前
+  3798 帧的 11.728 ms 下降。≥300 个 surface pass 的帧从 461 降到 43,
+  但推进时仍会一次提交大量实际新写入。engine f3162 有 749 个 surface
+  pass;脚本 tick 26.791 ms、渲染 32.631 ms。`readback_ms` 包含队列提交,
+  不等于 GPU 传输耗时。另有 tick 主导帧,如 f2611 tick 99.956 ms、渲染
+  4.833 ms,本项不改脚本时序。
+- **实现**:遵守 `MERGE` 求交锚点 `0x43b33c / 0x43b518`。仅在没有中途读者
+  的批量小矩形目标上,每个表面版本初次复制全幅,之后沿命令序用同一整数
+  着色器只画交集并贴回私有表面。中途 COPY/组合快照/跨层读取仍走旧路径;
+  `MERGE2` 和字形内容不改。
+- **验证**:`cargo test --offline -p yu-backend-wgpu --test surfaces
+  merge_patches_preserve_overlap_and_do_not_escape_to_a_copy -- --nocapture`
+  返回 0;半透明重叠、负坐标裁剪与 Soft 逐像素相同。两次 MERGE 着色面积
+  局部 24 vs 全幅 4096,仅一次基面复制 + 两次裁剪回贴;插入中途 COPY2
+  确认回到全幅路径。缺源与逐字追加用例仍通过。
+- **回归**:`cargo test --offline -p yu-gfx -p yu-backend-soft
+  -p yu-backend-wgpu -p yu-engine -- --nocapture`:39 个套件,
+  `526 passed; 0 failed; 3 ignored`,3 条缺语料显式跳过。
+- **边界**:面积不是实际毫秒;优化后同场景 Release 耗时仍需对拍。
+
+## 成果 REVIEW-FIX-2026-11-27 (2026-11-27) · 复核旧审查结论并修复可复现项
+
+- **已证实并修复**:
+  - 缺源 COPY2 凭空建层:源 ID 与父组被写进层表,`CGINFO[EXIST]` 由 0
+    变 1 且永不清除;实测同层清空后又写文字/又复制会被误判为空白。
+    现在缺源不建层,只在“最近一次全透明写之后无复制、无文字”的整图
+    COPY2 上冻结 `Some(TextureRef::None)` 并在 Soft/WGPU 按 1×1 透明
+    完成;其余缺源保持失败重试。
+  - 确认点重试:上一帧后缀部分失败时后端推进了表面而 gfx 仍持旧确认点,
+    下一帧清表重建会丢已确认像素。现在只为 `failed_targets` 保留一份确认
+    点纹理,成功即释放;Soft 先解析上层再取走下层,失败命令不再丢弃已合成面。
+  - 传统编码步进:复核确认 `unit_len_at`/折叠/标志/DSL 扫描按严格解码会
+    改变 CP932/GBK/Big5 的孤立/非法前导与 `！？` 错位语义;已恢复
+    前导表/标志步进,仅 UTF-8 用变长宽度。
+- **反证**:`cargo test -p yu-gfx --test copy_missing` 修前 3 项全红
+  (凭空建层、改写原目标、清空后写字仍判空白);修后 3 项全绿。
+  `cargo test -p yu-backend-wgpu --test surfaces` 修前 2 项红
+  (acknowledged prefix 丢像素、merge scratch 不复用),修后 40 项全绿。
+  `cargo test -p yu-rt --lib` 新增加固用例覆盖折叠/标志/`！？`/DSL/路径。
+- **回归**:`cargo test --offline -p yu-gfx -p yu-render-core
+  -p yu-backend-soft -p yu-backend-wgpu -p yu-rt -p yu-engine -p yu-format
+  -- --nocapture`:63 个套件,`1057 passed; 0 failed; 10 ignored`,
+  17 条缺语料/不变量条件显式跳过。
+- **保持 open(未改)**:动作型文字保留仍是显示近似(滤镜不改延迟文字、
+  合并重叠区顺序),已补 `DIV-GFX-076 §7.5` 勘误;UTF-8 字面量自证仍是
+  启发式,存在理论上跨编码歧义;缺源“无像素”仍是推断而非官方 trace。
+
+## 成果 UTF8-PARAM-SURFACE (2026-11-27) · 跨平台文本编码参数补齐 utf8
+
+- **背景**:`6441e43` 已落地 `Codec::Utf8`、`--patch utf8` 与字面量自证识别,
+  但参数面仍有缺口:Android `SettingsPrefs.validatePatch` 把 `utf8` 判非法并
+  回退 `auto`,设置/帮助页与 `run-config.json` 文档只列四条路线;
+  `--patch utf8 --translate` 还会在装载期把所有非 ASCII 译文判成不可编码
+  (`Codec::encode_char` 对 UTF-8 恒 `None`),UTF-8 路线实际无法用运行时翻译。
+- **改动**:
+  - `translation.rs`:UTF-8 目标 codec 直接写 `text.as_bytes()`,跳过隧道分配与
+    不可编码预检;错误提示补 UTF-8 路线。新增
+    `translation::tests::utf8_encoding_writes_bytes_without_tunnel`(含 4 字节
+    emoji)。
+  - Android 宿主:`validatePatch` 接受 `utf8`/`utf-8` 并归一为 `utf8`;Tyranor
+    外部会话的 `patch` 同;设置页与全局设置对话框、`patchLabel`、帮助页增加
+    「UTF-8(本地化)」;9 个 i18n 词条文件同步标签与说明。
+  - 参数文档:README 中英、`android/README.md`、`crates/yu-cli/README.md`、
+    `crates/yu-engine/README.md`、`docs/cross-platform.md`、
+    `docs/translation-workflow.md`、`docs/architecture.md`、`DIV-AND-005`
+    统一为 `auto|original|gbk|big5|utf8|tunnel`;
+    翻译校验脚本 `--codec` 词表加 `utf8`。
+- **验证**:
+  - `cargo test --offline -p yu-engine -p yu-host-android`(TMP 指到可写目录):
+    yu-engine lib `91 passed; 0 failed`,host-android lib `27 passed; 0 failed`,
+    其余集成套件全部 `ok`;新增用例与扩充后的
+    `run_config_patch_matches_cli_value_set` 均通过。
+  - `gradle :app:compileDebugKotlin --offline --no-daemon`:`BUILD SUCCESSFUL`。
+  - 9 个 `android/app/src/main/assets/i18n/*.json` 用 Python `json.load` 解析,
+    每份 186 键,新标签/帮助键齐全。
+- **边界**:未在真机跑 UTF-8 本地化游戏的运行时翻译;`Auto` 的 UTF-8 字面量
+  判定沿用 `patch.rs` 现有启发式,本项只补参数面与翻译编码。
+
+## 成果 CODEC-CP949 (2026-11-27) · 新增 CP949 韩文编码与跨平台选择
+
+- **背景**:此前文本路线只有 CP932/GBK/Big5/UTF-8;韩文化补丁或韩文本地化版
+  整包是 CP949(UHC) 时无法选择,只能按错误 codec 解码成乱码。
+- **码表**:`gen_tables.py` 增 code page 949 → `table_cp949.rs`(数据源 =
+  本机 Windows kernel32 `MultiByteToWideChar`/`WideCharToMultiByte`;单字节
+  0x80→U+0080,双字节 17,236 条,0 别名,lead `0x81..=0xFE`,
+  trail `0x41..=0x5A | 0x61..=0x7A | 0x81..=0xFE`)。
+- **接入**:`Codec::Cp949`(`ALL`/`as_str`/`from_name` 别名
+  `cp949|uhc|euc-kr|euckr|ks_c_5601-1987|kr`/decode/encode/char_len/audit);
+  `PatchKind::Cp949`(`--patch cp949`,别名 `uhc|euc-kr|euckr|kr|korean`;
+  execution/text = CP949,name = CP932);翻译装载按 CP949 直接编码。
+- **不自动识别(有意)**:CP949 与 GBK 的 256 字节 lead 表完全相同;实测部分
+  常用 GBK 中文句在 CP949 下整句合法并解出成片 Hangul,脚本统计无法可靠区分。
+  与 Big5 一样只作显式选项,`Auto` 仍只在 CP932/GBK 间裁决。
+- **宿主/UI**:Android `validatePatch`/Tyranor 接受 `cp949|uhc|euc-kr|euckr|kr`
+  并归一;设置页/全局设置/帮助页加「韩文(CP949)」;9 个 i18n 词条同步;
+  `--text-codec`/`TextCodecChoice` 接受 `cp949`。
+- **文档**:README 中英六条路线、android/README、yu-cli/yu-engine README、
+  cross-platform、translation-workflow、architecture、DIV-AND-005、
+  翻译校验脚本 `--codec` 词表。
+- **验证**:
+  - `cargo test --offline -p yu-format`:lib `83 passed` + 集成套件全 `ok`
+    (含 CP949 全表往返、韩文样本、单字节遍历、别名解析)。
+  - `cargo test --offline -p yu-engine -p yu-host-android`:yu-engine `92 passed`,
+    host-android `27 passed`(含 cp949/uhc/euc-kr 词表与
+    `patch_kind_parses_all_routes_and_aliases`)。
+  - `cargo test --offline -p yu-rt -p yu-render-core`(带 ERIS 语料 env):
+    `181 passed` 等套件全 `ok`。
+  - `gradle :app:compileDebugKotlin :app:compileDebugJavaWithJavac`:
+    `BUILD SUCCESSFUL`;9 个 i18n JSON 各 188 键,韩文标签/帮助键齐全。
+- **边界**:仓库无真实韩文游戏/补丁样本,未做进游戏验证;`Auto` 不猜 CP949;
+  码表按本机 Windows 生成并入库。
+- **后续编码评估**:官方 CRT 的 `_setmbcp` 通用路径按 `GetCPInfo` 接受任意
+  已安装 ANSI 码页(MaxCharSize 1/2),因此理论候选还有单字节页 CP874(泰)、
+  CP1250–1258(中欧/西里尔/希腊/土耳其/希伯来/阿拉伯/波罗的海/越南)与
+  CP1361 Johab;其中 CP1252 已在后续成果接入,其余因无样本暂不实现。
+  GB18030(4 字节)与 UTF-16 超出官方 1 字节 lead + 2 字节单元的文本模型,
+  不作为补丁路线;EUC-KR 已被 CP949 覆盖,EUC-JP/GB2312 分别不用于 Windows
+  YU-RIS 或已被 GBK 覆盖。
+
+## 成果 CODEC-CP1252 (2026-11-27) · 新增 CP1252 单字节编码与西欧路线
+
+- **背景**:西班牙语等西欧本地化版整包是 Windows-1252 单字节;此前只有双字节
+  路线,唯一可用的是 UTF-8(但单字节 1252 不是 UTF-8)。
+- **码表**:`gen_tables.py` 支持单字节码页(`collect` 允许无双字节矩阵,
+  新增 `render_single`);生成 `table_cp1252.rs`(kernel32 cp1252;0x80→U+20AC,
+  0x80..=0xFF 全映射 128 条,0 别名)。
+- **Codec**:新增 `SingleByteTable` 形状(无 lead/trail,`char_len_at` 恒 1);
+  `Codec::Cp1252` 接入 `ALL/as_str/from_name`(`cp1252|windows-1252|win1252`)、
+  decode/encode/audit。不把 `latin1`/`iso-8859-1` 作别名(0x80–0x9F 不同)。
+- **路线**:`PatchKind::Cp1252`(`--patch cp1252`,别名
+  `windows-1252|win1252|es|spanish`;execution/text = CP1252,name = CP932);
+  `codecs.json` script 与 `--text-codec` 同步;`Auto` 不猜(单字节重音会被
+  CP932/GBK 当双字节噪声),与 Big5/CP949 一致。
+- **宿主/UI**:Android 校验/Tyranor 接受 `cp1252|windows-1252|win1252|es|spanish`
+  并归一;设置/全局设置/帮助页加「西班牙语(CP1252)」;9 个 i18n 词条(190 键)。
+- **文档**:README 中英七条路线、android/README、yu-cli/yu-engine README、
+  cross-platform、translation-workflow、architecture、DIV-AND-005、
+  翻译校验脚本 `--codec` 词表。
+- **验证**:
+  - `cargo test --offline -p yu-format`:lib `86 passed` + 集成套件全 `ok`
+    (含 CP1252 全表、西班牙语 `¿Dónde está...? € — “cita”`、单字节遍历)。
+  - `cargo test --offline -p yu-engine --lib`:`92 passed`;
+    `-p yu-host-android --lib`:`27 passed`(含 cp1252/es 词表)。
+  - `cargo test --offline -p yu-rt -p yu-render-core`(ERIS env):全 `ok`。
+  - `gradle :app:compileDebugKotlin :app:compileDebugJavaWithJavac`:
+    `BUILD SUCCESSFUL`;9 个 i18n JSON 各 190 键。
+- **边界**:仓库无真实西班牙语游戏/补丁样本,未做进游戏验证;`Auto` 不猜;
+  Latin-1/ISO-8859-1 不作别名(0x80–0x9F 语义不同)。
+- **后续**:CP874(泰)、CP1251/1250/1253–1258 等单字节页可按同一
+  `SingleByteTable` 形状接入,等真实样本;GB18030/UTF-16 仍不作为补丁路线。

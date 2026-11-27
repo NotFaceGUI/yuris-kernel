@@ -66,6 +66,64 @@ struct PlanReads {
     layers: BTreeSet<LayerId>,
 }
 
+/// 只在本帧没有中间读取者的目标上复用私有合并表面。快照与其他图层
+/// 始终保有不可变的像素版本；终端屏幕/离屏绘制在纹理操作之后。
+#[derive(Default)]
+struct MergePatches {
+    eligible: BTreeSet<LayerId>,
+    private: BTreeMap<LayerId, u64>,
+    patches: BTreeMap<(u32, u32), Rc<TexRef>>,
+}
+
+impl MergePatches {
+    fn for_frame(frame: &CompositorFrame) -> Self {
+        let mut counts = BTreeMap::<LayerId, usize>::new();
+        let mut blocked = BTreeSet::new();
+        for pass in &frame.passes {
+            if !matches!(pass.target, PassTarget::Texture(_)) {
+                continue;
+            }
+            for op in &pass.ops {
+                if op.status() != OpStatus::Executable {
+                    continue;
+                }
+                match op {
+                    Op::Copy(copy) => {
+                        let CopySource::Layer(source) = &copy.source else {
+                            // 截屏/组复制可能读取任意成员的中间像素。
+                            return Self::default();
+                        };
+                        blocked.insert(source.clone());
+                        blocked.insert(copy.dest.clone());
+                    }
+                    Op::Image(image) => {
+                        let target = image.target.as_ref().unwrap_or(&image.source);
+                        if image.action == ImageAction::Merge && target != &image.source {
+                            *counts.entry(target.clone()).or_default() += 1;
+                        }
+                        // 原地动作在命令序中立即读取并产生新纹理，不会让
+                        // 旧内容逃逸。跨层读取则保守地保留原路径。
+                        if &image.source != target {
+                            blocked.insert(image.source.clone());
+                        } else if !matches!(image.action, ImageAction::RectPaint3) {
+                            blocked.insert(target.clone());
+                        }
+                        blocked.extend(image.source2.iter().chain(&image.source3).cloned());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Self {
+            eligible: counts
+                .into_iter()
+                .filter_map(|(id, count)| (count >= 2 && !blocked.contains(&id)).then_some(id))
+                .collect(),
+            ..Self::default()
+        }
+    }
+}
+
 /// 快照复制去重键:源纹理 + 内容版本 + 区域 + 输出尺寸。
 ///
 /// 源内容纹理不可变(不变量 1),因此相同键的复制结果逐像素相同,
@@ -386,6 +444,17 @@ pub(crate) fn plan(
             if applied == 0 {
                 continue;
             }
+            // gfx 已确认的常驻表面不会重发前缀。若上一帧只完成了
+            // 部分后缀，先恢复该确认点，再按本帧命令序重试。
+            if let Some(&prefix) = frame.image_prefixes.get(&layer) {
+                if seqs.first().is_some_and(|&seq| seq > prefix) {
+                    if let Some((len, content)) = surfaces.prepare_image_suffix(&layer, prefix) {
+                        contents.insert(layer.clone(), content);
+                        chain_index.insert(layer, len);
+                        continue;
+                    }
+                }
+            }
             let mut common = 0usize;
             while common < applied
                 && common < seqs.len()
@@ -480,6 +549,7 @@ pub(crate) fn plan(
     let dead_writes = dead_full_writes(frame);
     // 同帧同源同区域的快照去重:源内容不可变 ⇒ 结果逐像素相同,可共享纹理。
     let mut snapshot_dedup: BTreeMap<SnapshotDedupKey, Rc<TexRef>> = BTreeMap::new();
+    let mut merge_patches = MergePatches::for_frame(frame);
 
     // ---- 1. 纹理 pass:严格命令序(COPY 与图像加工交错) ----
     let mark_ops = started.elapsed();
@@ -537,6 +607,7 @@ pub(crate) fn plan(
                         &mut contents,
                         &mut bases,
                         &mut writes,
+                        &mut merge_patches,
                         &mut chain_index,
                         pass_target,
                         force_materialize.contains(pass_target),
@@ -746,7 +817,10 @@ pub(crate) fn plan(
     // 组 pass / 屏幕 pass / 屏幕级文本的耗时归入 `rest_us`。
     let t_text = mark_text_done - mark_text;
 
-    // 帧末:把不再被引用的表面纹理放回池(快照/文本持有 `Rc` ⇒ 自动钉住)。
+    // 重试只保留失败目标的确认点；临时 MERGE 小纹理的计划期引用
+    // 必须先释放，否则下面的池回收会把它们误认为仍被读者持有。
+    surfaces.retain_failed_image_prefixes(&acc.failed_targets);
+    drop(merge_patches);
     surfaces.end_frame(&live_ids);
     // 旧内容纹理回收:层当前内容之外、本帧写入过的纹理都交回池。
     let mut live_ids: BTreeSet<u64> = BTreeSet::new();
@@ -899,6 +973,7 @@ fn apply_image(
     contents: &mut Contents,
     bases: &mut BTreeMap<(LayerId, u64), Rc<TexRef>>,
     writes: &mut SurfaceWrites<'_>,
+    merge_patches: &mut MergePatches,
     chain_index: &mut BTreeMap<LayerId, usize>,
     pass_target: &LayerId,
     force_materialize: bool,
@@ -1070,8 +1145,8 @@ fn apply_image(
     let cpu_before = surfaces.stats().cpu_fallbacks;
     let op_started = std::time::Instant::now();
     apply_image_pixels(
-        ctx, frame, textures, gpu, pipelines, targets, surfaces, contents, bases, writes, target,
-        image, source, source2, source3, force_bilinear_scale, tuning,
+        ctx, frame, textures, gpu, pipelines, targets, surfaces, contents, bases, writes,
+        merge_patches, target, image, source, source2, source3, force_bilinear_scale, tuning,
     )?;
     let op_us = op_started.elapsed().as_micros() as u64;
     // ≥20ms 无条件留痕(移动端首帧/首次 TRIM/大资产解码的现场);5ms 以上
@@ -1247,7 +1322,9 @@ fn resolve_source(
         (Some(layer), Some(fallback)) => layer.texture != *fallback,
         _ => false,
     };
-    if !replaced && contents.base_matches(id, fallback) {
+    // 若旧 COPY 快照的写前缀刚重放完，活层已改指不妨碍读取这份像素。
+    let replayed_snapshot = matches!(fallback, Some(TextureRef::Snapshot(_)));
+    if (!replaced || replayed_snapshot) && contents.base_matches(id, fallback) {
         if let Some(content) = contents.get(id) {
             return Ok(content.clone());
         }
@@ -1491,6 +1568,7 @@ fn apply_image_pixels(
     contents: &mut Contents,
     bases: &mut BTreeMap<(LayerId, u64), Rc<TexRef>>,
     writes: &mut SurfaceWrites<'_>,
+    merge_patches: &mut MergePatches,
     target: &LayerId,
     image: &ImageOp,
     source: Content,
@@ -1514,11 +1592,14 @@ fn apply_image_pixels(
         .iter()
         .find(|layer| &layer.id == target)
         .map(|layer| layer.texture.clone());
-    if let Some(live) = &live_texture {
-        if !contents.base_matches(target, Some(live)) {
+    // 原地加工旧 COPY 快照时，写入内容也必须标记为旧快照版本，供
+    // 紧接着的 MERGE 读取；活层仍以帧末的最新 COPY 为准。
+    let replayed_snapshot = target_fallback.filter(|t| matches!(t, TextureRef::Snapshot(_)));
+    if let Some(base) = replayed_snapshot.or(live_texture.as_ref()) {
+        if !contents.base_matches(target, Some(base)) {
             contents.remove(target);
         }
-        contents.set_base(target, live.clone());
+        contents.set_base(target, base.clone());
     } else {
         let command_base = image
             .target_base
@@ -1872,13 +1953,49 @@ fn apply_image_pixels(
         {
             return Err("gfx.mask.size.mismatch".to_string());
         }
-        let out = surfaces.acquire(ctx, width, height, "merge surface")?;
-        // 层不透明度(`[层+0x80]`,0..256),命令时刻快照。REA 0.495:
-        // - `MERGE`  `FUN_0043b33c`:`blend(dst, src, srcLayerAlpha, span)`
-        //   ⇒ **只用上层的**;这里给下层传 256(恒等),不让它影响结果。
-        // - `MERGE2` `FUN_0043b8ec`:`blend(dst, src, dstLayerAlpha, srcLayerAlpha, span)`
-        //   ⇒ 两层都用。
+        // MERGE 只写两表面求交矩形。批量小矩形若无中途读者，仅首个
+        // 合并复制全幅到私有表面；后续经小纹理落回该表面，保持原混合公式。
         let src_la = u32::try_from(image.source_alpha.clamp(0, 256)).unwrap_or(256);
+        if image.action == ImageAction::Merge && merge_patches.eligible.contains(target) {
+            if let Some((origin, extent)) = merge_patch_rect((width, height), (upper_content.width, upper_content.height), (dx, dy)) {
+                let reuse = merge_patches.private.get(target) == Some(&lower.tex.id);
+                let out = if reuse {
+                    lower.tex.clone()
+                } else {
+                    surfaces.acquire(ctx, width, height, "merge private surface")?
+                };
+                let patch = match merge_patches.patches.get(&extent) {
+                    Some(hit) => hit.clone(),
+                    None => {
+                        let tex = surfaces.acquire(ctx, extent.0, extent.1, "merge patch")?;
+                        merge_patches.patches.insert(extent, tex.clone());
+                        tex
+                    }
+                };
+                pipelines.ensure_layer_merge_pipeline(ctx).map_err(|d| d.code.to_string())?;
+                let bind = pipelines.create_layer_merge_bind_group(
+                    ctx, &out.view, &upper_content.tex.view, src_la, 256, origin, dx, dy,
+                ).map_err(|d| d.code.to_string())?;
+                if !reuse {
+                    push_blit(writes, "merge private base", &lower.tex, &out, (0, 0), (0, 0), width, height)?;
+                    surfaces.stats_mut().blits += 1;
+                }
+                writes.fullscreen(&patch, bind, AuxPipeline::LayerMerge);
+                push_blit(writes, "merge patch", &patch, &out, (0, 0), origin, extent.0, extent.1)?;
+                let stats = surfaces.stats_mut();
+                stats.surface_passes += 1;
+                stats.blits += 1;
+                stats.merge_patch_draws += 1;
+                stats.merge_pixels += u64::from(extent.0) * u64::from(extent.1);
+                merge_patches.private.insert(target.clone(), out.id);
+                let content = finish_content(surfaces, out, width, height, lower.display, None);
+                surfaces.set_content(target, content.clone());
+                contents.insert(target.clone(), content);
+                return Ok(());
+            }
+        }
+        let out = surfaces.acquire(ctx, width, height, "merge surface")?;
+        // MERGE 只用上层不透明度；MERGE2 另用下层（0x43b33c / 0x43b8ec）。
         let dst_la = u32::try_from(image.target_alpha.clamp(0, 256)).unwrap_or(256);
         // `MERGE` 用已验证逐位一致的专用 shader(`merge.wgsl`);`MERGE2`/
         // `XOR`/`AND` 走 `composite.wgsl`(mode 0/1/2)。
@@ -1894,6 +2011,7 @@ fn apply_image_pixels(
                         &upper_content.tex.view,
                         src_la,
                         256,
+                        (0, 0),
                         dx,
                         dy,
                     )
@@ -1926,7 +2044,11 @@ fn apply_image_pixels(
             (bg, AuxPipeline::Composite)
         };
         writes.fullscreen(&out, bind, pipeline);
-        surfaces.stats_mut().surface_passes += 1;
+        let stats = surfaces.stats_mut();
+        stats.surface_passes += 1;
+        if image.action == ImageAction::Merge {
+            stats.merge_pixels += u64::from(width) * u64::from(height);
+        }
         let content = finish_content(surfaces, out, width, height, lower.display, None);
         surfaces.set_content(target, content.clone());
         contents.insert(target.clone(), content);
@@ -2392,6 +2514,25 @@ fn apply_image_pixels(
     Err("gfx.imageop.unsupported".to_string())
 }
 
+/// MERGE 的目标求交矩形；只在小块上走局部合成，以摊销全幅基面复制。
+fn merge_patch_rect(
+    lower: (u32, u32),
+    upper: (u32, u32),
+    at: (i32, i32),
+) -> Option<((u32, u32), (u32, u32))> {
+    let (x, y) = (i64::from(at.0), i64::from(at.1));
+    let (x0, y0) = (x.max(0), y.max(0));
+    let x1 = (x + i64::from(upper.0)).min(i64::from(lower.0));
+    let y1 = (y + i64::from(upper.1)).min(i64::from(lower.1));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+    let area = u64::from(lower.0) * u64::from(lower.1);
+    (u64::from(w) * u64::from(h) <= area / 8)
+        .then_some(((x0 as u32, y0 as u32), (w, h)))
+}
+
 /// 记录一次纹理区域复制;越界时显式报错(带路径标签与尺寸),不发
 /// wgpu 验证错误(那会让整条命令缓冲失效)。
 #[allow(clippy::too_many_arguments)]
@@ -2490,7 +2631,11 @@ fn apply_copy(
         // 已冻结(EVID-T-12)。
         return Ok(());
     }
-    if let CopySource::Layer(id) = &copy.source {
+    let layer_source = match &copy.source {
+        CopySource::Layer(id) if !copy.has_frozen_empty_source() => Some(id),
+        _ => None,
+    };
+    if let Some(id) = layer_source {
         // 源层已被 `CGEND` 删除,但本帧图像加工刚产出内容(典型:
         // `RECTPAINT3 → MERGE → COPY2 → CGEND` 的 CG 预览)。此时
         // `contents` 是官方命令序里 COPY 真正读到的像素,不能因为层消失
@@ -2513,8 +2658,14 @@ fn apply_copy(
     // 点击帧 alpha 247 / 淡出黑屏的根因）。
     let screen_source = copy.source.is_screen();
     let source = match &copy.source {
+        CopySource::Layer(id) if copy.has_frozen_empty_source() => {
+            let tex = resolve_ref(
+                ctx, textures, gpu, targets, id, &TextureRef::SolidBlack1x1, None, SOLID_EMPTY, bases,
+            )?;
+            Content::identity(tex, 0)
+        }
         CopySource::Layer(id) => {
-            let content = resolve_source(
+            let content = match resolve_source(
                 ctx,
                 frame,
                 layers,
@@ -2528,7 +2679,18 @@ fn apply_copy(
                 copy.source_texture.as_ref(),
                 copy.seq,
                 "gfx.copy.source.gone",
-            )?;
+            ) {
+                Err(reason) if copy.blank_if_source_missing
+                    && copy.texts.is_empty()
+                    && matches!(copy.source_texture, Some(TextureRef::Asset(_)))
+                    && reason == yu_render_core::texture::code::MISSING =>
+                {
+                    let tex = resolve_ref(ctx, textures, gpu, targets, id,
+                        &TextureRef::SolidBlack1x1, None, SOLID_EMPTY, bases)?;
+                    Content::identity(tex, 0)
+                }
+                result => result?,
+            };
             if copy.texts.is_empty() {
                 content
             } else {

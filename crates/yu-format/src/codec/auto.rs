@@ -9,12 +9,20 @@
 //! - 得分为固定次序的浮点算式,无随机、无环境依赖;
 //! - 得分差低于 [`TIE_THRESHOLD`] 或全部为零 → 缺省 [`Codec::Cp932`]。
 //!
-//! # Big5 不参与自动识别(有意)
+//! # Big5 / CP949 / CP1252 不参与自动识别(有意)
 //!
-//! [`Codec::Big5`] 是**显式选项**:cp950 与 cp936 的前导区间重叠(都含
-//! 0x81..=0xFE),字节流层面的构成统计无法可靠区分两者,强行加进评分只会
-//! 让简中/繁中互相误判。检测仍只在 CP932 与 GBK 之间裁决;要 Big5 就由
-//! 宿主/用户显式指定(`--patch big5`、`run-config.json` 的 `patch` 键)。
+//! [`Codec::Big5`]、[`Codec::Cp949`] 与 [`Codec::Cp1252`] 都是**显式选项**:
+//! - cp950 与 cp936 的前导区间重叠(都含 0x81..=0xFE),字节级构成统计无法
+//!   可靠区分简中/繁中;
+//! - CP949 与 GBK 的 256 字节 lead 表完全相同,而且部分 GBK 中文字节在 CP949
+//!   下也会整句合法、解出成片 Hangul(实测样本),Hangul 统计同样无法区分
+//!   真实韩文与“GBK 误读为 CP949”;
+//! - CP1252 是单字节码页,西欧重音文本在 CP932/GBK 下会落进前导/尾字节噪声,
+//!   自动评分只会把它误判成日文/中文。
+//!
+//! 因此加权评分只在 CP932 与 GBK 之间裁决(UTF-8 另走整池严格合法性判定);
+//! 要 Big5 / CP949 / CP1252 就由宿主/用户显式指定(`--patch big5` /
+//! `--patch cp949` / `--patch cp1252`、`run-config.json` 的 `patch` 键)。
 
 use super::Codec;
 
@@ -161,6 +169,8 @@ fn score_one(codec: Codec, bytes: &[u8], out: &mut Score) {
             Codec::Gbk => super::GBK_TABLE.step(bytes, i),
             // 不参与 `detect()` 的裁决,但保持穷尽匹配(单测直接给分时会用到)。
             Codec::Big5 => super::BIG5_TABLE.step(bytes, i),
+            Codec::Cp949 => super::CP949_TABLE.step(bytes, i),
+            Codec::Cp1252 => super::CP1252_TABLE.step(bytes, i),
             Codec::Utf8 => match codec.next_char(bytes, i) {
                 Some((ch, width)) => {
                     classify(ch, out);

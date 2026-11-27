@@ -1523,10 +1523,13 @@ impl PipelineCache {
         upper: &wgpu::TextureView,
         src_layer_alpha: u32,
         dst_layer_alpha: u32,
+        origin: (u32, u32),
         dx: i32,
         dy: i32,
     ) -> Result<wgpu::BindGroup, Diag> {
-        let uniform = [src_layer_alpha, dst_layer_alpha, dx as u32, dy as u32];
+        let uniform = [
+            src_layer_alpha, dst_layer_alpha, dx as u32, dy as u32, origin.0, origin.1, 0, 0,
+        ];
         let buffer = wgpu::util::DeviceExt::create_buffer_init(
             &ctx.device,
             &wgpu::util::BufferInitDescriptor {

@@ -1390,6 +1390,12 @@ impl GfxState {
         f.image_probe_order
             .clone_from(&self.config.image_probe_order);
         f.color_space = ColorSpace::GammaEncodedSrgb8;
+        f.image_prefixes.extend(self.baked_images.borrow().iter().filter_map(
+            |(id, (texture, alpha, seq))| {
+                let layer = &self.nodes.get(id)?.layer;
+                (&layer.texture == texture && layer.alpha == *alpha).then(|| (id.clone(), *seq))
+            },
+        ));
 
         let mut passes = Vec::new();
 
@@ -1434,7 +1440,22 @@ impl GfxState {
                 _ => None,
             })
             .collect();
+        // 已被 COPY2 换掉的原地表面不是活层，只为尚未执行的读者重放。
+        let old_copy_base = |op: &ImageOp| {
+            let target = op.target.as_ref().unwrap_or(&op.source);
+            if target != &op.source {
+                return None;
+            }
+            let Some(TextureRef::Snapshot(id)) = &op.source_texture else {
+                return None;
+            };
+            let layer = &self.nodes.get(target)?.layer;
+            (layer.texture != TextureRef::Snapshot(*id)).then_some(*id)
+        };
         needed_snapshots.extend(self.image_log.iter().filter_map(|i| {
+                    if old_copy_base(i).is_some() {
+                        return None;
+                    }
                     // 缺 target = 原地加工(`CGACT` 只给 ID 时源即目标)。
                     let target = i.target.as_ref().unwrap_or(&i.source); // silent-ok: 缺 target = 原地加工
                     let node = self.nodes.get(target)?;
@@ -1684,8 +1705,12 @@ impl GfxState {
             if baked_flags[idx] {
                 continue;
             }
-            // 缺 target = 原地加工(同上)。
-            let target = i.target.as_ref().unwrap_or(&i.source); // silent-ok: 缺 target = 原地加工
+            let target = i.target.as_ref().unwrap_or(&i.source);
+            if old_copy_base(i).is_some_and(|id| !needed_snapshots.contains(&id))
+                && !snapshot_layers.contains(target)
+            {
+                continue;
+            }
             let target_live = self.nodes.contains_key(target) || snapshot_layers.contains(target);
             let replayable = self.nodes.contains_key(&i.source) || i.source_texture.is_some();
             // 目标已删时,命令时刻记录的目标基面(纹理 + fill + 显式尺寸)
@@ -4704,6 +4729,9 @@ impl GfxState {
     /// 与后端 `resolve_source` 同口径:活层纹理与 `source_texture` 不一致
     /// 时以命令时刻纹理为准,否则读活层当前纹理。
     fn copy_source_unresolvable(&self, c: &CopyOp) -> bool {
+        if c.has_frozen_empty_source() {
+            return false;
+        }
         let Some(layer) = (match &c.source {
             CopySource::Layer(id) => self.nodes.get(id),
             _ => None,
@@ -4749,13 +4777,41 @@ impl GfxState {
         }
         match &copy.source_texture {
             Some(TextureRef::Snapshot(pid)) => self.snapshot_materializable(*pid, depth - 1),
-            Some(TextureRef::None) => false,
+            Some(TextureRef::None) => copy.has_frozen_empty_source(),
             Some(_) => true,
             None => match &copy.source {
                 CopySource::Layer(l) | CopySource::Group(l) => self.nodes.contains_key(l),
                 CopySource::Screen(_) => true,
             },
         }
+    }
+
+    /// 最近一次全透明写入之后，没有 COPY 或延迟文本再次写目标。
+    /// 用于 s26 pc657/663 → pc658/664 的缺源全复制等价处理；不是一般
+    /// “缺源就清空”规则，不能仅凭历史日志里出现过 RECTPAINT3 判定。
+    fn copy_target_is_clear(&self, dest: &LayerId) -> bool {
+        let Some(node) = self.nodes.get(dest) else {
+            return false;
+        };
+        if self.text_draws.get(dest).is_some_and(|texts| !texts.draws.is_empty())
+            || (self.text_surface.layer.as_ref() == Some(dest)
+                && !self.text_surface.glyphs.is_empty())
+        {
+            return false;
+        }
+        let Some(clear) = self.image_log.iter().rev().find(|op| {
+            op.target.as_ref().unwrap_or(&op.source) == dest
+        }) else {
+            return false;
+        };
+        clear.status == OpStatus::Executable
+            && clear.action == ImageAction::RectPaint3
+            && clear.target_base.as_ref().is_some_and(|base| base.texture == node.layer.texture)
+            && !clear.region_from_fixed
+            && clear.x.is_none() && clear.y.is_none() && clear.x2.is_none() && clear.y2.is_none()
+            && clear.set.as_ref().and_then(EngineValue::as_int) == Some(0)
+            && !self.copy_log.iter().rev().take_while(|copy| copy.seq > clear.seq)
+                .any(|copy| &copy.dest == dest && copy.status == OpStatus::Executable)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4769,17 +4825,30 @@ impl GfxState {
         x2: Option<f64>,
         y2: Option<f64>,
     ) {
-        if !self.nodes.contains_key(source) {
+        let source_missing = !self.nodes.contains_key(source);
+        let source_is_group = self.nodes.get(source).is_some_and(|n| n.layer.is_group());
+        let blank_if_source_missing = kind == CopyKind::Copy2
+            && !source_is_group
+            && source != dest
+            && x.is_none() && y.is_none() && x2.is_none() && y2.is_none()
+            && self.copy_target_is_clear(dest);
+        if source_missing {
+            if !blank_if_source_missing {
+                self.push_diag(
+                    "CGACT",
+                    error::recoverable(error::code::LAYER_MISSING,
+                        format!("复制源 `{}` 不存在", source.display())),
+                );
+                return;
+            }
+            // s26 pc657/663 已显式清空目标，缺源全 COPY2 的可见结果仍空。
+            // 仅冻结这次复制的空来源，不向层表注册源 ID 或虚构父组。
             self.push_diag(
                 "CGACT",
-                error::recoverable(
-                    error::code::LAYER_MISSING,
-                    format!("复制源 `{}` 不存在", source.display()),
-                ),
+                error::verbose(error::code::LAYER_MISSING,
+                    format!("复制源 `{}` 不存在:保留已清空目标的透明结果", source.display())),
             );
-            return;
         }
-        let source_is_group = self.nodes[source].layer.is_group();
         // 主窗口 `:/W0/` = 屏幕表面，不是离屏组：类型在这里定型，后端不再
         // 按窗口表推断（`CopySource::Screen`）。
         let source_is_screen = source_is_group && self.is_main_group(source);
@@ -4863,6 +4932,10 @@ impl GfxState {
         // 契约取像素（组=成员现绘，屏幕=上次呈现帧/命令时刻快照）。
         let source_texture = if source_is_group {
             None
+        } else if source_missing {
+            // Some(None) = 命令时刻不存在的空来源；不能在回放时读取同名
+            // 层后来创建出来的 fill/像素。仅 blank_if_source_missing 允许。
+            Some(TextureRef::None)
         } else {
             self.nodes
                 .get(source)
@@ -4881,8 +4954,24 @@ impl GfxState {
                 .unwrap_or_default()
         };
         if !texture_copy {
-            self.image_log
-                .retain(|i| i.target.as_ref().is_none_or(|t| t != dest));
+            // s26 pc658/678/680:下一次 COPY2 覆写暂存层，但先前的 MERGE
+            // 已读取旧快照上着色后的像素。只保留有读者的旧快照写前缀。
+            let mut reads = rustc_hash::FxHashMap::<CopyId, u64>::default();
+            for op in &self.image_log {
+                if op.source == *dest && op.target.as_ref().is_some_and(|t| t != dest) {
+                    if let Some(TextureRef::Snapshot(id)) = op.source_texture {
+                        reads.insert(id, op.seq);
+                    }
+                }
+            }
+            self.image_log.retain(|op| {
+                if op.target.as_ref() != Some(dest) {
+                    return true;
+                }
+                let base = op.target_base.as_ref().map(|b| &b.texture);
+                matches!(base, Some(TextureRef::Snapshot(id))
+                    if reads.get(id).is_some_and(|&read| op.seq < read))
+            });
         }
         // EVID-T-11/T-12:COPY/COPY2 在命令执行时取源层当前状态;区域是源
         // 纹理坐标(含端点),裁剪块写到目标 (0,0),无区域 = 整图复制。
@@ -4920,6 +5009,7 @@ impl GfxState {
             },
             source_texture,
             dest_texture_before,
+            blank_if_source_missing,
             texts,
             dest: dest.clone(),
             region,
@@ -5991,6 +6081,18 @@ impl GfxState {
             OpStatus::Unimplemented("gfx.imageop.unsupported")
         };
         let executable = status == OpStatus::Executable;
+        // 纯颜色滤镜只改 RGB 增益,不改变像素存在性 ⇒ 不清目标层文字
+        // (见下方 `is_color_filter` 分支的完整取证)。
+        let color_only = action.is_color_filter();
+        // 局部叠加族只贴落点矩形,落点外是下层原像素 ⇒ 已画文字必须留。
+        let keeps_text_on_composite = matches!(
+            &action,
+            ImageAction::Merge
+                | ImageAction::Merge2
+                | ImageAction::Other("xor")
+                | ImageAction::Other("and")
+                | ImageAction::Other("mask_alpha")
+        );
         let seq = self.next_texture_seq();
         let image_action = action.clone();
         // 命令时刻的源基图(见 `ImageOp::source_texture`):源层可能在同帧
@@ -6187,6 +6289,36 @@ impl GfxState {
             // `CGACT[MERGE2]` 叠外字图;保守近似会清掉前缀(实机行首
             // `」` 之前缺失)。正确修复需要按 `seq` 重放文本/图像命令序
             // (DIV-GFX-072 §9 / DIV-GFX-076),不能按动作类型例外。
+            //
+            // **例外:纯颜色滤镜不清文字**(`MEIDO`/`SAIDO`/`AKARUSA`/
+            // `MONO`/`SEPIA`)。它们只做逐通道线性变换,官方作用在含文字的
+            // 表面上时文字**只是被改色、不会消失**;内核无法事后改色(文字
+            // 延迟合成),但删掉文字比"颜色没跟上"错得更远 —— 会把逐字
+            // 绘制路径变成"每画一个字清掉前一个",屏幕上只剩最后一个字符。
+            //
+            // 真实脚本(支持语言切换的字符集构建,`es_font.yst` 正文逐字链):
+            // 每个字符是 `TEXT 到正文层` 与 `MEIDO 到正文层` 交替。
+            // 中文走 `COPY2→MEIDO→TEXT→MERGE` 降级(着色发生在**暂存层**,
+            // 不经这里)所以正常;英文/半角直接 `TEXT+MEIDO` 打正文层,
+            // 于是每字都被清成只剩最后一个。判定用动作语义(数据),
+            // 不看层名/作品/版本。
+            if color_only {
+                return;
+            }
+            // **局部叠加族也不清文字**(`MERGE`/`MERGE2`/`XOR`/`AND`/
+            // `MASK_ALPHA`):官方只把上层贴进落点矩形,矩形外是下层的原像素
+            // —— 已画的字必须留。矩形内官方确实会覆盖下层像素,但网格字形页
+            // 逐字链里落点内要画的**就是那个字本身**,保留已画文字只会在
+            // "同位置重复叠加"时偏亮,远小于"每画一个字清掉整行"的错误。
+            //
+            // 真实脚本(支持语言切换的字符集构建,`es_font.yst`/`es_fontcg.yst`
+            // 逐字链):每个字符 `COPY2 抠格 → MEIDO → TEXT×N → MERGE 到正文层`。
+            // 空格走 `.sp` 页(不发行)⇒ 抠格源为空、候选识别不了 ⇒ `MERGE`
+            // 落回真实图像加工;若这里清文字,正文层就只剩最后写的那一个字符
+            // (用户实测:"一个字一个字出现时上一个会消失")。
+            if keeps_text_on_composite {
+                return;
+            }
             if let Some(t) = target {
                 self.clear_layer_texts(&t);
             }
@@ -8480,6 +8612,7 @@ fn hash_copy_op(h: &mut impl Hasher, copy: &CopyOp) {
     copy.seq.hash(h);
     copy.id.hash(h);
     copy.kind.name().hash(h);
+    copy.blank_if_source_missing.hash(h);
     match &copy.source {
         CopySource::Layer(id) => {
             0u8.hash(h);

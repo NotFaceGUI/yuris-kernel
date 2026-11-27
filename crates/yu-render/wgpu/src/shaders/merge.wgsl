@@ -58,6 +58,7 @@ struct MergeParams {
     dst: u32,
     dx: i32,
     dy: i32,
+    origin: vec2<i32>,
 };
 @group(0) @binding(2) var<uniform> u_merge: MergeParams;
 
@@ -75,7 +76,7 @@ fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
 fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let lower_dim = vec2<i32>(textureDimensions(t_lower));
     let upper_dim = vec2<i32>(textureDimensions(t_upper));
-    let p = vec2<i32>(floor(frag.xy));
+    let p = vec2<i32>(floor(frag.xy)) + u_merge.origin;
 
     var lower = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if (p.x >= 0 && p.y >= 0 && p.x < lower_dim.x && p.y < lower_dim.y) {

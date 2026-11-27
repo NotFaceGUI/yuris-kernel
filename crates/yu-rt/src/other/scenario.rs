@@ -87,7 +87,6 @@ pub fn tokenize_stateful(
     let mut out = Vec::new();
     let mut i = 0usize;
     let n = line.len();
-    let is_lead = |b: u8| codec.is_lead(b);
     while i < n {
         // 块注释(官方状态 0x63):不产生普通 token;行内 CR 仍写 EOL
         // (0x45acc0),`*/` 后回到正常词法(0x45adb5)。
@@ -106,7 +105,7 @@ pub fn tokenize_stateful(
                     i += 2;
                     break;
                 }
-                i += if is_lead(line[i]) { 2 } else { 1 };
+                i += scan_unit_len(line, i, codec);
             }
             if state.block_comment {
                 break;
@@ -179,7 +178,7 @@ pub fn tokenize_stateful(
                 let start = i + 1;
                 let mut j = start;
                 while j < n && line[j] != b'"' && line[j] != b'\r' {
-                    j += if is_lead(line[j]) { 2 } else { 1 };
+                    j += scan_unit_len(line, j, codec);
                 }
                 out.push(Token {
                     // 官方字符串 token 类型码 = 0x1f(0x45b883 状态 0x16 分支)。
@@ -251,6 +250,17 @@ pub fn tokenize_stateful(
     out
 }
 
+/// FUN_0045a874 的扫描按 DAT_0059b0c0 前导表跳两字节,不验证
+/// 尾字节/Unicode 映射(状态 0x16/0x5b..0x60/0x63)。严格解码会把
+/// 不透明尾字节误认成引号、分隔符或注释结束;UTF-8 单独按完整字符走。
+fn scan_unit_len(line: &[u8], at: usize, codec: yu_format::Codec) -> usize {
+    if codec == yu_format::Codec::Utf8 {
+        codec.unit_len_at(line, at).max(1)
+    } else {
+        1 + usize::from(codec.is_lead(line[at]))
+    }
+}
+
 /// 词/数字扫描(官方状态 0x5b–0x60)。
 ///
 /// 字符集(0x45b6be 之后的状态机):`0-9`/`A-Z`/`a-z`/`_`/`.`/`/`/lead;
@@ -273,7 +283,7 @@ fn scan_word(line: &[u8], start: usize, codec: yu_format::Codec) -> (usize, Vec<
         {
             break;
         }
-        j += if is_lead(c) { 2 } else { 1 };
+        j += scan_unit_len(line, j, codec);
     }
     (j, line[start..j.min(n)].to_vec())
 }
@@ -289,6 +299,39 @@ mod tests {
 
     fn texts(tokens: &[Token]) -> Vec<&[u8]> {
         tokens.iter().map(|t| t.text.as_slice()).collect()
+    }
+
+    #[test]
+    fn legacy_word_and_quote_scans_keep_opaque_lead_pairs() {
+        // FUN_0045a874 的前导表步进不能被严格码表验证替代。
+        for codec in [Codec::Cp932, Codec::Gbk, Codec::Big5] {
+            let word = tokenize(b"#a\x82,b\r", codec);
+            assert_eq!(texts(&word), [b"#".as_slice(), b"a\x82,b", b"\r"], "{codec:?}");
+            let quote = tokenize(b"\"a\x82\"b\"\r", codec);
+            assert_eq!(texts(&quote), [b"a\x82\"b".as_slice(), b"\r"], "{codec:?}");
+            assert_eq!(quote[0].code, 0x1f);
+        }
+    }
+
+    #[test]
+    fn legacy_block_comment_does_not_close_on_a_trail_star() {
+        let mut state = LexState::default();
+        let first = tokenize_stateful(b"/*\x82*/ hidden\r", Codec::Cp932, &mut state);
+        assert_eq!(texts(&first), [b"\r".as_slice()]);
+        assert!(state.block_comment, "星号是前导后的不透明尾字节");
+        let second = tokenize_stateful(b"*/ visible\r", Codec::Cp932, &mut state);
+        assert_eq!(texts(&second), [b"visible".as_slice(), b"\r"]);
+        assert!(!state.block_comment);
+    }
+
+    #[test]
+    fn utf8_words_quotes_and_comments_keep_character_boundaries() {
+        let tokens = tokenize("#é終😀\r\"é終😀\"/*é終😀*/ok\r".as_bytes(), Codec::Utf8);
+        assert_eq!(texts(&tokens), [
+            b"#".as_slice(), "é終😀".as_bytes(), b"\r",
+            "é終😀".as_bytes(), b"ok", b"\r",
+        ]);
+        assert_eq!(tokens.iter().map(|token| token.code).collect::<Vec<_>>(), [0x39, 0x20, 0, 0x1f, 0x20, 0]);
     }
 
     #[test]

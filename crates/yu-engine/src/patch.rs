@@ -5,6 +5,9 @@
 //! - [`PatchKind::Original`]:原版 CP932;
 //! - [`PatchKind::Gbk`]:全局 GBK(官方 `_chs` 换首字节表同构);
 //! - [`PatchKind::Big5`]:全局 Big5 / CP950(繁中旧作与部分汉化补丁);
+//! - [`PatchKind::Cp949`]:全局 CP949 / UHC(韩文化补丁与韩文本地化版);
+//! - [`PatchKind::Cp1252`]:全局 CP1252 / Windows-1252(西班牙语等西欧本地化);
+//! - [`PatchKind::Utf8`]:全局 UTF-8(2025 年后本地化发行版);
 //! - [`PatchKind::Tunnel`]:CP932 + `sjis_ext.bin` 隧道表。
 //!
 //! 另有与编码正交的**补丁字体**路线([`PatchFont`]):部分汉化补丁把中文写成
@@ -45,13 +48,28 @@ pub enum PatchKind {
     /// CP932(官方引擎的资源命名从未随汉化改变)。**不参与 `Auto` 识别**
     /// —— cp950 与 cp936 前导区间重叠,只能由用户/宿主显式指定。
     Big5,
+    /// 全局 CP949 / UHC(韩文;韩文化补丁与韩文本地化版)。
+    ///
+    /// 与 [`PatchKind::Gbk`] 同构:换掉整包文本的编码,路径/文件名仍按
+    /// CP932。**不参与 `Auto` 识别**——CP949 与 GBK 的 256 字节 lead 表
+    /// 完全相同(都是 0x81..=0xFE),静态表无法区分;由用户/宿主显式指定,
+    /// 或 `codecs.json` 的 `script: "cp949"`。
+    Cp949,
+    /// 全局 CP1252 / Windows-1252(西班牙语等西欧本地化;单字节)。
+    ///
+    /// 与 [`PatchKind::Gbk`] 同构:换掉整包文本的编码,路径/文件名仍按
+    /// CP932。**不参与 `Auto` 识别**——单字节重音文本在 CP932/GBK 下只会
+    /// 落进前导/尾字节噪声;由用户/宿主显式指定,或 `codecs.json` 的
+    /// `script: "cp1252"`。
+    Cp1252,
     /// CP932 + SJIS 隧道表(`sjis_ext.bin`)。
     Tunnel,
     /// 全局 UTF-8(2025 年本地化发行版,如 Kagura 简中/英文版)。
     ///
     /// 与 [`PatchKind::Gbk`] 同构:换掉整包脚本文本的编码,路径/文件名
-    /// 仍按 CP932。**不参与 `Auto` 识别**(脚本池采样与版本门控尚未取证),
-    /// 由用户/宿主显式指定,或 `codecs.json` 的 `script: "utf8"`。
+    /// 仍按 CP932。`Auto` 会用脚本字面量自证判定(整池严格合法 UTF-8 且
+    /// 多字节足够);样本不足时保持 CP932,也可由用户/宿主显式指定,或
+    /// `codecs.json` 的 `script: "utf8"`。
     Utf8,
 }
 
@@ -63,14 +81,16 @@ impl PatchKind {
             PatchKind::Original => "original",
             PatchKind::Gbk => "gbk",
             PatchKind::Big5 => "big5",
+            PatchKind::Cp949 => "cp949",
+            PatchKind::Cp1252 => "cp1252",
             PatchKind::Tunnel => "tunnel",
             PatchKind::Utf8 => "utf8",
         }
     }
 
-    /// 解析宿主/CLI 值。`auto|original|gbk|big5|tunnel|utf8`;`cp932` 等同
-    /// `original`。全平台唯一一份(CLI `--patch`、serve、Android
-    /// `run-config.json` 的 `patch` 键共用)。
+    /// 解析宿主/CLI 值。`auto|original|gbk|big5|cp949|cp1252|tunnel|utf8`;
+    /// `cp932` 等同 `original`。全平台唯一一份(CLI `--patch`、serve、
+    /// Android `run-config.json` 的 `patch` 键共用)。
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(PatchKind::Auto),
@@ -79,10 +99,12 @@ impl PatchKind {
             }
             "gbk" | "cp936" | "gb2312" => Ok(PatchKind::Gbk),
             "big5" | "cp950" | "big-5" => Ok(PatchKind::Big5),
+            "cp949" | "uhc" | "euc-kr" | "euckr" | "kr" | "korean" => Ok(PatchKind::Cp949),
+            "cp1252" | "windows-1252" | "win1252" | "es" | "spanish" => Ok(PatchKind::Cp1252),
             "tunnel" | "sjis_ext" => Ok(PatchKind::Tunnel),
             "utf8" | "utf-8" => Ok(PatchKind::Utf8),
             other => Err(format!(
-                "未知补丁类型 `{other}`;可用:auto | original | gbk | big5 | tunnel | utf8"
+                "未知补丁类型 `{other}`;可用:auto | original | gbk | big5 | cp949 | cp1252 | tunnel | utf8"
             )),
         }
     }
@@ -205,14 +227,15 @@ impl PatchSelection {
         Self { kind }
     }
 
-    /// 解析宿主/CLI 值(`auto|original|gbk|tunnel`)。
+    /// 解析宿主/CLI 值(`auto|original|gbk|big5|cp949|cp1252|utf8|tunnel`)。
     pub fn parse(value: &str) -> Result<Self, String> {
         PatchKind::parse(value).map(Self::new)
     }
 
     /// 解析为最终 profile。
     ///
-    /// - 显式 `original` / `gbk` / `tunnel`:直接采用,不读产物签名;
+    /// - 显式 `original` / `gbk` / `big5` / `cp949` / `cp1252` / `utf8` /
+    ///   `tunnel`:直接采用,不读产物签名;
     /// - `auto`:`codecs.json` 优先,其次隧道,其次 YURIS_TOOLS 签名;
     /// - 什么都没有:`original` + [`PatchSource::Default`]。
     ///
@@ -241,6 +264,24 @@ impl PatchSelection {
                 name: Codec::Cp932,
                 source: PatchSource::Cli,
                 evidence: vec!["cli: big5".to_string()],
+                ..PatchProfile::default()
+            },
+            PatchKind::Cp949 => PatchProfile {
+                kind: PatchKind::Cp949,
+                execution: Codec::Cp949,
+                text_default: Codec::Cp949,
+                name: Codec::Cp932,
+                source: PatchSource::Cli,
+                evidence: vec!["cli: cp949".to_string()],
+                ..PatchProfile::default()
+            },
+            PatchKind::Cp1252 => PatchProfile {
+                kind: PatchKind::Cp1252,
+                execution: Codec::Cp1252,
+                text_default: Codec::Cp1252,
+                name: Codec::Cp932,
+                source: PatchSource::Cli,
+                evidence: vec!["cli: cp1252".to_string()],
                 ..PatchProfile::default()
             },
             PatchKind::Utf8 => PatchProfile {
@@ -375,6 +416,22 @@ fn detect_route(project: &Project) -> Result<PatchProfile, Failure> {
                 source: PatchSource::Heuristic,
                 ..PatchProfile::default()
             },
+            Codec::Cp949 => PatchProfile {
+                kind: PatchKind::Cp949,
+                execution: Codec::Cp949,
+                text_default: Codec::Cp949,
+                name: Codec::Cp932,
+                source: PatchSource::Heuristic,
+                ..PatchProfile::default()
+            },
+            Codec::Cp1252 => PatchProfile {
+                kind: PatchKind::Cp1252,
+                execution: Codec::Cp1252,
+                text_default: Codec::Cp1252,
+                name: Codec::Cp932,
+                source: PatchSource::Heuristic,
+                ..PatchProfile::default()
+            },
             Codec::Cp932 => PatchProfile {
                 source: PatchSource::Heuristic,
                 ..PatchProfile::default()
@@ -392,7 +449,161 @@ fn detect_route(project: &Project) -> Result<PatchProfile, Failure> {
         return Ok(profile);
     }
 
+    // 非 v555 的本地化定制构建(0.481/0.494 等):exe 静态表不参与探测,
+    // 旧行为是直接退回默认 CP932 —— 于是 UTF-8 构建的正文/UI 字面量按
+    // CP932 解码成乱码,`es_first` 等入口脚本的 `PRODUCT` 也取不到值。
+    //
+    // 这里用**脚本字面量自证**补上裁决:整池字面量严格合法 UTF-8 且含
+    // 足量多字节序列 ⇒ UTF-8。CP932/GBK/Big5 的字节流几乎不可能整体
+    // 构成合法 UTF-8(`0x81..` 在 UTF-8 里是非法首字节),所以不会把
+    // 日文/简中原版误判。样本不足/平局 ⇒ 保持 CP932(不猜)。
+    if let Some(evidence) = detect_utf8_by_script_literals(project) {
+        return Ok(PatchProfile {
+            kind: PatchKind::Utf8,
+            execution: Codec::Utf8,
+            text_default: Codec::Utf8,
+            name: Codec::Cp932,
+            source: PatchSource::Heuristic,
+            evidence: vec![evidence],
+            ..PatchProfile::default()
+        });
+    }
+
     Ok(PatchProfile::default())
+}
+
+/// 脚本字面量采样 → UTF-8 证据(`None` = 不是 UTF-8 或样本不足)。
+///
+/// 判据与 [`probe_codec_by_script_literals`] 同一数据源(`0x4d` 字面量记录),
+/// 但方向是**合法性**而不是候选间比较:
+///
+/// - 每个字面量体必须整体是合法 UTF-8(`std::str::from_utf8` 严格);
+/// - 非 ASCII 多字节占比要够(`MIN_NON_ASCII`),避免纯 ASCII 工程误判
+///   ——纯 ASCII 在三种 codec 下解码相同,判 UTF-8 无害但也无收益,
+///   保持 `None` 让调用方沿用默认;
+/// - 任一采样字面量非法 ⇒ 立刻放弃(UTF-8 是自校验编码,一条不合法
+///   就足以否掉整个假设)。
+///
+/// `MIN_LITERALS` 以下的样本不裁决(短样本噪声大)。
+/// 字面量记录体首字节是否为界定符(`"` / `'` / `` ` ``)。
+fn is_literal_quote(byte: u8) -> bool {
+    matches!(byte, 0x22 | 0x27 | 0x60)
+}
+
+/// 去掉字面量体尾的闭合界定符(若存在);只处理与体首同类的情形由调用方
+/// 的 `is_literal_quote` 已经保证,这里按三种界定符逐一尝试。
+fn strip_terminator(content: &[u8]) -> &[u8] {
+    for term in [0x22u8, 0x27, 0x60] {
+        if let Some(rest) = content.strip_suffix(&[term]) {
+            return rest;
+        }
+    }
+    content
+}
+
+fn detect_utf8_by_script_literals(project: &Project) -> Option<String> {
+    const MAX_SCRIPTS: usize = 512;
+    const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+    const MAX_SCRIPT_BYTES: u64 = 8 * 1024 * 1024;
+    const MAX_LITERALS: usize = 8192;
+    const PER_SCRIPT_LITERALS: usize = 64;
+    const MIN_LITERALS: u32 = 8;
+    const MIN_NON_ASCII: u64 = 64;
+
+    let key = project.resolve_script_key(None).ok()?;
+    let source = project.open_source().ok()?;
+    let dir = LookupKey::new(b"ysbin", CODEC).ok()?;
+    let mut names: Vec<(u64, Vec<u8>)> = source
+        .list(&dir)
+        .ok()?
+        .into_iter()
+        .filter(|entry| matches!(entry.kind, yu_vfs::EntryKind::File))
+        .filter_map(|entry| {
+            let size = entry.size?;
+            if size > MAX_SCRIPT_BYTES || script_id_of_name(&entry.name).is_none() {
+                return None;
+            }
+            Some((size, entry.name))
+        })
+        .collect();
+    names.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    names.truncate(MAX_SCRIPTS);
+
+    let mut literals = 0u32;
+    let mut multibyte_chars = 0u64;
+    let mut total_bytes = 0u64;
+    'scripts: for (size, name) in names {
+        if total_bytes.saturating_add(size) > MAX_TOTAL_BYTES {
+            continue;
+        }
+        let mut raw = b"ysbin/".to_vec();
+        raw.extend_from_slice(&name);
+        let Ok(path) = LookupKey::new(&raw, CODEC) else {
+            continue;
+        };
+        let Ok(data) = source.open(&path) else {
+            continue;
+        };
+        let Some(script_id) = script_id_of_name(&name) else {
+            continue;
+        };
+        let Ok(script) = yu_rt::tables::ScriptFile::parse(script_id, &data, key.bytes) else {
+            continue;
+        };
+        total_bytes += size;
+        let mut script_literals = 0usize;
+        'windows: for pc in 0..script.group_count() {
+            for rec in script.group_windows(pc) {
+                let Some(payload) = script.window_payload(rec) else {
+                    continue;
+                };
+                let mut pos = 0usize;
+                while pos + 3 <= payload.len() {
+                    let op = payload[pos];
+                    let len = u16::from_le_bytes([payload[pos + 1], payload[pos + 2]]) as usize;
+                    let Some(end) = pos.checked_add(3 + len) else {
+                        break;
+                    };
+                    if end > payload.len() {
+                        break;
+                    }
+                    if op == 0x4d {
+                        let body = &payload[pos + 3..end];
+                        // 界定符在体首(`"`/`'`/`` ` ``);体尾的界定符由
+                        // 转义规则决定,这里只校验**内容**是否为合法 UTF-8。
+                        let content = body
+                            .first()
+                            .filter(|b| is_literal_quote(**b))
+                            .map_or(body, |_| &body[1..]);
+                        let content = strip_terminator(content);
+                        if std::str::from_utf8(content).is_err() {
+                            // 一条不合法即否掉 UTF-8 假设。
+                            return None;
+                        }
+                        multibyte_chars += content
+                            .iter()
+                            .filter(|b| **b >= 0x80)
+                            .count() as u64;
+                        literals += 1;
+                        script_literals += 1;
+                        if script_literals >= PER_SCRIPT_LITERALS {
+                            break 'windows;
+                        }
+                    }
+                    pos = end;
+                }
+                if literals >= MAX_LITERALS as u32 {
+                    break 'scripts;
+                }
+            }
+        }
+    }
+    if literals < MIN_LITERALS || multibyte_chars < MIN_NON_ASCII {
+        return None;
+    }
+    Some(format!(
+        "heuristic: script literals are valid UTF-8 ({literals} literals,          {multibyte_chars} non-ASCII bytes) -> utf8"
+    ))
 }
 
 /// 非游戏本体的辅助 exe(安装器/设置器/本仓库宿主):不参与编码/存档探测。
@@ -728,7 +939,12 @@ fn lead_table(codec: Codec) -> [u8; 256] {
             Codec::Cp932 => matches!(byte, 0x81..=0x9F | 0xE0..=0xFC),
             Codec::Gbk => matches!(byte, 0x81..=0xFE),
             Codec::Big5 => matches!(byte, 0x81..=0x9F | 0xA1..=0xFE),
-            // UTF-8 没有「双字节前导表」;本函数只被三张双字节表的扫描调用。
+            // CP949 的 lead 表与 GBK 相同;本表只用于静态 exe 扫描,而
+            // `static_codec_in_bytes` 只比对 CP932/GBK/Big5 三张可区分表。
+            Codec::Cp949 => matches!(byte, 0x81..=0xFE),
+            // 单字节码页没有双字节前导。
+            Codec::Cp1252 => false,
+            // UTF-8 没有「双字节前导表」;本函数只被双字节表的扫描调用。
             Codec::Utf8 => false,
         });
     }
@@ -947,13 +1163,25 @@ fn read_manifest(project: &Project) -> Result<Option<PatchProfile>, Failure> {
         profile.text_default = cfg.text;
         profile.name = cfg.name;
     }
-    // 三域全是 CP932 = 原版声明。
+    // 三域全是 CP932 = 原版声明;其余按 execution 归到对应路线
+    // (Big5/CP949/UTF-8 的 codecs.json 也要在 summary/evidence 里如实呈现)。
     if profile.execution == Codec::Cp932
         && profile.text_default == Codec::Cp932
         && profile.name == Codec::Cp932
         && object.get("tunnel").is_none()
     {
         profile.kind = PatchKind::Original;
+    } else if object.get("tunnel").is_none() {
+        profile.kind = match profile.execution {
+            Codec::Gbk => PatchKind::Gbk,
+            Codec::Big5 => PatchKind::Big5,
+            Codec::Cp949 => PatchKind::Cp949,
+            Codec::Cp1252 => PatchKind::Cp1252,
+            Codec::Utf8 => PatchKind::Utf8,
+            // script=CP932 但 text/name 另有声明:按旧行为保留 Gbk 占位,
+            // 三域 codec 仍按 manifest 生效,不猜路线。
+            Codec::Cp932 => PatchKind::Gbk,
+        };
     }
     if let Some(tunnel) = object.get("tunnel") {
         let obj = tunnel
@@ -1348,6 +1576,32 @@ mod static_codec_scan_tests {
         cp932.score_literal(long, Codec::Cp932);
         assert_eq!(gbk.score, 0, "GBK 应闭合");
         assert!(cp932.score >= 8, "CP932 应未闭合: {}", cp932.score);
+    }
+
+    #[test]
+    fn patch_kind_parses_all_routes_and_aliases() {
+        for (value, kind) in [
+            ("auto", PatchKind::Auto),
+            ("original", PatchKind::Original),
+            ("cp932", PatchKind::Original),
+            ("gbk", PatchKind::Gbk),
+            ("big5", PatchKind::Big5),
+            ("cp950", PatchKind::Big5),
+            ("cp949", PatchKind::Cp949),
+            ("uhc", PatchKind::Cp949),
+            ("euc-kr", PatchKind::Cp949),
+            ("kr", PatchKind::Cp949),
+            ("cp1252", PatchKind::Cp1252),
+            ("windows-1252", PatchKind::Cp1252),
+            ("es", PatchKind::Cp1252),
+            ("spanish", PatchKind::Cp1252),
+            ("utf8", PatchKind::Utf8),
+            ("utf-8", PatchKind::Utf8),
+            ("tunnel", PatchKind::Tunnel),
+        ] {
+            assert_eq!(PatchKind::parse(value).unwrap(), kind, "{value}");
+        }
+        assert!(PatchKind::parse("euc-jp").is_err());
     }
 
     #[test]

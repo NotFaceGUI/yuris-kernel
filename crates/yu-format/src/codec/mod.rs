@@ -1,19 +1,23 @@
-//! 文本编解码器:CP932 / GBK / Big5 的静态码表 + decode/encode。
+//! 文本编解码器:CP932 / GBK / Big5 / CP949(双字节)与 CP1252(单字节)
+//! 的静态码表 + decode/encode。
 //!
 //! - 码表由 `crates/yu-format/gen_tables.py` 从 **Windows kernel32 码页**
-//!   (932/936/950)生成(`MultiByteToWideChar` / `WideCharToMultiByte`),
+//!   (932/936/950/949/1252)生成(`MultiByteToWideChar` / `WideCharToMultiByte`),
 //!   即引擎运行平台的系统映射;生成物入库,勿手改。
 //! - 解码严格:非法/不完整序列返回 `fmt.codec.invalid`(带字节偏移),
 //!   不做替换、不做猜测。
 //! - 编码取系统首选形态:CP932 的 NEC/IBM 别名行(398 条"多码一符")
 //!   编码时回落到系统首选码;`encode∘decode` 对别名码不保字节,但
-//!   `decode∘encode` 恒等(全表往返测试守卫)。GBK 零别名,双向全等。
+//!   `decode∘encode` 恒等(全表往返测试守卫)。GBK/CP949/CP1252 零别名,
+//!   Big5 的别名由生成器审计常量核对。
 //! - auto 评分器见 [`auto`] 与 `docs/architecture.md` §7。
 
 pub mod auto;
 
 mod table_big5;
 mod table_cp932;
+mod table_cp949;
+mod table_cp1252;
 mod table_gbk;
 
 use std::collections::HashMap;
@@ -58,6 +62,51 @@ const BIG5_TABLE: TableRef<191> = TableRef {
     lead_hi: table_big5::LEAD_HI,
     trail_lo: table_big5::TRAIL_LO,
     trail_hi: table_big5::TRAIL_HI,
+};
+
+/// CP949(UHC)的合法 trail 是 0x41..=0x5A / 0x61..=0x7A / 0x81..=0xFE,
+/// 矩阵按连续区间 0x41..=0xFE 展开,空洞格子为 0(与生成器一致)。
+const CP949_TABLE: TableRef<190> = TableRef {
+    single_high: &table_cp949::SINGLE_HIGH,
+    rows: &table_cp949::ROWS,
+    lead_lo: table_cp949::LEAD_LO,
+    lead_hi: table_cp949::LEAD_HI,
+    trail_lo: table_cp949::TRAIL_LO,
+    trail_hi: table_cp949::TRAIL_HI,
+};
+
+/// 单字节码页(CP1252):0x80..=0xFF 一一映射,没有前导/尾字节。
+struct SingleByteTable {
+    single_high: &'static [u16; 0x80],
+}
+
+impl SingleByteTable {
+    /// 从 `bytes[at]` 解一个字符;单字节码页恒消费 1 字节。
+    fn step(&self, bytes: &[u8], at: usize) -> Option<(u16, usize)> {
+        let byte = bytes[at];
+        if byte < 0x80 {
+            return Some((u16::from(byte), 1));
+        }
+        let unit = self.single_high[usize::from(byte) - 0x80];
+        (unit != 0).then_some((unit, 1))
+    }
+
+    /// 字符 → 码位反查表(单字节码页无别名,双向一一对应)。
+    fn build_map(&self) -> HashMap<char, u16> {
+        let mut map = HashMap::with_capacity(0x100);
+        for (i, &unit) in self.single_high.iter().enumerate() {
+            if unit != 0 {
+                if let Some(ch) = char::from_u32(u32::from(unit)) {
+                    map.insert(ch, 0x80 + i as u16);
+                }
+            }
+        }
+        map
+    }
+}
+
+const CP1252_TABLE: SingleByteTable = SingleByteTable {
+    single_high: &table_cp1252::SINGLE_HIGH,
 };
 
 impl<const W: usize> TableRef<W> {
@@ -125,6 +174,17 @@ pub enum Codec {
     Gbk,
     /// Windows CP950 / Big5(繁中;港台旧作与部分汉化补丁用)。
     Big5,
+    /// Windows CP949 / UHC(韩文;韩文化补丁与韩文本地化版用)。
+    ///
+    /// UHC 是 Microsoft 对 EUC-KR 的扩展(同一 949 码页):0x81..=0xFE 前导,
+    /// trail 只取 `0x41..=0x5A | 0x61..=0x7A | 0x81..=0xFE`,因此比 GBK
+    /// 严格;韩文正文用 Hangul 音节(U+AC00..=U+D7A3)作强信号。
+    Cp949,
+    /// Windows CP1252 / Western European(西班牙语等西欧本地化;单字节)。
+    ///
+    /// 0x80..=0x9F 是 Windows 扩展区(`€ “ ” – — …` 等),不能当
+    /// ISO-8859-1 处理;0xA0..=0xFF 与 Latin-1 相同。
+    Cp1252,
     /// UTF-8(变长 1..=4 字节;2025 年本地化发行版实见)。
     ///
     /// 证据:Kagura 本地化版脚本字面量是 UTF-8(如 `終了確認`、
@@ -135,7 +195,14 @@ pub enum Codec {
 
 impl Codec {
     /// 全部编解码器(顺序稳定,供 CLI 枚举)。
-    pub const ALL: [Codec; 4] = [Codec::Cp932, Codec::Gbk, Codec::Big5, Codec::Utf8];
+    pub const ALL: [Codec; 6] = [
+        Codec::Cp932,
+        Codec::Gbk,
+        Codec::Big5,
+        Codec::Cp949,
+        Codec::Cp1252,
+        Codec::Utf8,
+    ];
 
     /// 稳定名(进 trace / golden 头部)。
     #[must_use]
@@ -144,6 +211,8 @@ impl Codec {
             Codec::Cp932 => "cp932",
             Codec::Gbk => "gbk",
             Codec::Big5 => "big5",
+            Codec::Cp949 => "cp949",
+            Codec::Cp1252 => "cp1252",
             Codec::Utf8 => "utf8",
         }
     }
@@ -153,9 +222,12 @@ impl Codec {
     pub const fn is_lead(self, byte: u8) -> bool {
         match self {
             Codec::Cp932 => matches!(byte, 0x81..=0x9F | 0xE0..=0xFC),
-            // GBK 与 Big5 的前导区间相同(0x81..=0xFE);差别在合法 trail
-            // (Big5 的 0x40..=0x7E 段 GBK 也有,但码位表不同)。
-            Codec::Gbk | Codec::Big5 => matches!(byte, 0x81..=0xFE),
+            // GBK / Big5 / CP949 的前导区间都是 0x81..=0xFE;差别在合法
+            // trail 与码表(Big5 的 0x40..=0x7E 段 GBK 也有,但码位不同;
+            // CP949 的 trail 只含字母与高位段)。
+            Codec::Gbk | Codec::Big5 | Codec::Cp949 => matches!(byte, 0x81..=0xFE),
+            // 单字节码页没有多字节前导。
+            Codec::Cp1252 => false,
             // UTF-8 多字节首字节;0xC0/0xC1(overlong)与 0xF5..=0xFF 非法。
             Codec::Utf8 => matches!(byte, 0xC2..=0xF4),
         }
@@ -165,14 +237,18 @@ impl Codec {
     ///
     /// 三种双字节编码的合法 trail 都不含 `0x22`(界定符 `"`)与其它 ASCII
     /// 标点:CP932 = `0x40..=0xFC` 去 `0x7F`;GBK = `0x40..=0x7E` +
-    /// `0x80..=0xFE`;Big5 = `0x40..=0x7E` + `0xA1..=0xFE`。UTF-8 的
-    /// continuation 恒为 `0x80..=0xBF`,同样不含 `0x22`。
+    /// `0x80..=0xFE`;Big5 = `0x40..=0x7E` + `0xA1..=0xFE`;
+    /// CP949 = `0x41..=0x5A` + `0x61..=0x7A` + `0x81..=0xFE`。
+    /// UTF-8 的 continuation 恒为 `0x80..=0xBF`。
     #[must_use]
     pub const fn is_trail(self, byte: u8) -> bool {
         match self {
             Codec::Cp932 => matches!(byte, 0x40..=0xFC) && byte != 0x7F,
             Codec::Gbk => matches!(byte, 0x40..=0x7E | 0x80..=0xFE),
             Codec::Big5 => matches!(byte, 0x40..=0x7E | 0xA1..=0xFE),
+            Codec::Cp949 => matches!(byte, 0x41..=0x5A | 0x61..=0x7A | 0x81..=0xFE),
+            // 单字节码页没有尾字节。
+            Codec::Cp1252 => false,
             Codec::Utf8 => matches!(byte, 0x80..=0xBF),
         }
     }
@@ -191,14 +267,15 @@ impl Codec {
         self.is_lead(lead) && self.is_trail(next)
     }
 
-    /// 从 `bytes[i]` 起的字符宽度(CP932/GBK/Big5 = 1..=2,UTF-8 = 1..=4;
-    /// 非法/截断按 1)。
+    /// 从 `bytes[i]` 起的字符宽度(CP932/GBK/Big5/CP949 = 1..=2,
+    /// CP1252 = 1,UTF-8 = 1..=4;非法/截断按 1)。
     #[must_use]
     pub fn char_len_at(self, bytes: &[u8], i: usize) -> usize {
         let Some(&byte) = bytes.get(i) else {
             return 1;
         };
         match self {
+            Codec::Cp1252 => 1,
             Codec::Utf8 => utf8_width(byte).unwrap_or(1),
             _ => {
                 if self.is_lead(byte) && i + 1 < bytes.len() {
@@ -208,6 +285,27 @@ impl Codec {
                 }
             }
         }
+    }
+
+    /// 从 `bytes[i..]` 起**一个字符实际占用**的字节数(单一契约)。
+    ///
+    /// 与 [`Self::char_len_at`] 的区别:后者对 UTF-8 返回**首字节声明的**
+    /// 宽度(`utf8_width`),截断输入会报出超过剩余长度的值;本函数用
+    /// [`Self::next_char`] 的实际解码裁决,取不到字符时按 1 字节重同步。
+    ///
+    /// 所有"按字符前进"的扫描(词法器、字面量定界、路径规范化、文本折叠、
+    /// 逐字单元)都必须用它,不要各自写 `is_lead(b) ? 2 : 1` —— 那条假设只
+    /// 对 CP932/GBK/Big5 成立,UTF-8 的 3/4 字节字符会被拆坏并把续字节当
+    /// 独立字节处理(`DIV-RT-082` 的 `E7 B5 82 → E7 B5 20` 损坏点)。
+    ///
+    /// 越界返回 0。
+    #[must_use]
+    pub fn unit_len_at(self, bytes: &[u8], i: usize) -> usize {
+        if i >= bytes.len() {
+            return 0;
+        }
+        self.next_char(bytes, i)
+            .map_or(1, |(_, width)| width.clamp(1, 4).min(bytes.len() - i))
     }
 
     /// 解一个字符(无分配)。非法/截断返回 `None`。
@@ -226,6 +324,8 @@ impl Codec {
             Codec::Cp932 => CP932_TABLE.step(bytes, i),
             Codec::Gbk => GBK_TABLE.step(bytes, i),
             Codec::Big5 => BIG5_TABLE.step(bytes, i),
+            Codec::Cp949 => CP949_TABLE.step(bytes, i),
+            Codec::Cp1252 => CP1252_TABLE.step(bytes, i),
             Codec::Utf8 => unreachable!("UTF-8 已在上面单独处理"),
         }?;
         Some((char::from_u32(u32::from(unit))?, width))
@@ -283,6 +383,8 @@ impl Codec {
             "cp932" | "sjis" | "shift_jis" => Ok(Codec::Cp932),
             "gbk" | "cp936" | "gb2312" => Ok(Codec::Gbk),
             "big5" | "cp950" | "big-5" => Ok(Codec::Big5),
+            "cp949" | "uhc" | "euc-kr" | "euckr" | "ks_c_5601-1987" | "kr" => Ok(Codec::Cp949),
+            "cp1252" | "windows-1252" | "win1252" => Ok(Codec::Cp1252),
             "utf8" | "utf-8" => Ok(Codec::Utf8),
             other => Err(Diag::fatal(code::CODEC_NAME, Boundary::Format).with_detail(format!(
                 "未知编解码器 `{other}`;可用:{}",
@@ -326,6 +428,8 @@ impl Codec {
                 Codec::Cp932 => CP932_TABLE.step(bytes, i),
                 Codec::Gbk => GBK_TABLE.step(bytes, i),
                 Codec::Big5 => BIG5_TABLE.step(bytes, i),
+                Codec::Cp949 => CP949_TABLE.step(bytes, i),
+                Codec::Cp1252 => CP1252_TABLE.step(bytes, i),
                 Codec::Utf8 => unreachable!("UTF-8 已在函数开头处理"),
             };
             match step {
@@ -431,6 +535,8 @@ impl Codec {
             Codec::Cp932 => (table_cp932::DOUBLE_ENTRIES, table_cp932::ALIASES),
             Codec::Gbk => (table_gbk::DOUBLE_ENTRIES, table_gbk::ALIASES),
             Codec::Big5 => (table_big5::DOUBLE_ENTRIES, table_big5::ALIASES),
+            Codec::Cp949 => (table_cp949::DOUBLE_ENTRIES, table_cp949::ALIASES),
+            Codec::Cp1252 => (table_cp1252::SINGLE_ENTRIES, table_cp1252::ALIASES),
             Codec::Utf8 => (0, 0),
         }
     }
@@ -459,6 +565,8 @@ fn encode_map(codec: Codec) -> &'static HashMap<char, u16> {
     static CP932: OnceLock<HashMap<char, u16>> = OnceLock::new();
     static GBK: OnceLock<HashMap<char, u16>> = OnceLock::new();
     static BIG5: OnceLock<HashMap<char, u16>> = OnceLock::new();
+    static CP949: OnceLock<HashMap<char, u16>> = OnceLock::new();
+    static CP1252: OnceLock<HashMap<char, u16>> = OnceLock::new();
     static EMPTY: OnceLock<HashMap<char, u16>> = OnceLock::new();
     match codec {
         Codec::Cp932 => {
@@ -466,6 +574,10 @@ fn encode_map(codec: Codec) -> &'static HashMap<char, u16> {
         }
         Codec::Gbk => GBK.get_or_init(|| GBK_TABLE.build_map(&table_gbk::ALIAS_OVERRIDES)),
         Codec::Big5 => BIG5.get_or_init(|| BIG5_TABLE.build_map(&table_big5::ALIAS_OVERRIDES)),
+        Codec::Cp949 => {
+            CP949.get_or_init(|| CP949_TABLE.build_map(&table_cp949::ALIAS_OVERRIDES))
+        }
+        Codec::Cp1252 => CP1252.get_or_init(|| CP1252_TABLE.build_map()),
         // UTF-8 没有反查表;所有调用点都应提前分支。这里给空表兜底,
         // 避免新增编码时把 panic 带进生产路径。
         Codec::Utf8 => EMPTY.get_or_init(HashMap::new),
@@ -532,6 +644,69 @@ mod tests {
         roundtrip_table(Codec::Big5, &BIG5_TABLE, entries, aliases);
     }
 
+    #[test]
+    fn full_table_roundtrip_cp949() {
+        let (entries, aliases) = Codec::Cp949.table_audit();
+        roundtrip_table(Codec::Cp949, &CP949_TABLE, entries, aliases);
+    }
+
+    /// CP1252 单字节全表:0x80..=0xFF 每个映射 decode/encode 往返。
+    #[test]
+    fn full_table_roundtrip_cp1252() {
+        let (entries, _) = Codec::Cp1252.table_audit();
+        let mut checked = 0usize;
+        for (i, &unit) in CP1252_TABLE.single_high.iter().enumerate() {
+            if unit == 0 {
+                continue;
+            }
+            checked += 1;
+            let byte = 0x80 + i as u8;
+            let ch = char::from_u32(u32::from(unit)).unwrap();
+            assert_eq!(Codec::Cp1252.decode(&[byte], b"t").unwrap(), ch.to_string());
+            assert_eq!(
+                Codec::Cp1252.encode(ch.to_string().as_str(), b"t").unwrap(),
+                [byte]
+            );
+        }
+        assert_eq!(checked, entries);
+    }
+
+    /// CP1252:西班牙语正文(重音、¿¡、€、弯引号、破折号)。
+    #[test]
+    fn cp1252_spanish_roundtrip() {
+        let codec = Codec::Cp1252;
+        let text = "¿Dónde está el niño? ¡Sí! € — “cita”";
+        let bytes = codec.encode(text, b"t").unwrap();
+        assert_eq!(codec.decode(&bytes, b"t").unwrap(), text);
+        assert_eq!(bytes[0], 0xBF, "¿ = 0xBF");
+        assert_eq!(codec.char_len_at(&bytes, 0), 1);
+        assert!(!codec.is_lead(0xE9));
+        assert!(codec.encode("中文", b"t").is_err());
+    }
+
+    /// CP949:韩文正文往返 + trail 区间(UHC 不含 0x40 / 0x5B..=0x60 /
+    /// 0x7B..=0x7E,这些是 GBK 合法而 CP949 非法的 ASCII 标点)。
+    #[test]
+    fn cp949_korean_roundtrip_and_trail_ranges() {
+        let codec = Codec::Cp949;
+        let text = "게임 콘텐츠를 종료합니다. 계속하시겠습니까?";
+        let bytes = codec.encode(text, b"t").unwrap();
+        assert_eq!(codec.decode(&bytes, b"t").unwrap(), text);
+        assert!(codec.is_lead(0x81));
+        assert!(codec.is_lead(0xFE));
+        assert!(!codec.is_lead(0x80));
+        assert!(!codec.is_trail(0x40));
+        assert!(codec.is_trail(0x41));
+        assert!(codec.is_trail(0x5A));
+        assert!(!codec.is_trail(0x5B));
+        assert!(!codec.is_trail(0x60));
+        assert!(codec.is_trail(0x61));
+        assert!(codec.is_trail(0x7A));
+        assert!(!codec.is_trail(0x7B));
+        assert!(codec.is_trail(0x81));
+        assert!(codec.is_trail(0xFE));
+    }
+
     /// UTF-8:1..=4 字节步进、严格解码、变长字符宽度。
     #[test]
     fn utf8_roundtrip_and_stepping() {
@@ -581,7 +756,9 @@ mod tests {
             Codec::Cp932 => CP932_TABLE.single_high,
             Codec::Gbk => GBK_TABLE.single_high,
             Codec::Big5 => BIG5_TABLE.single_high,
-            Codec::Utf8 => panic!("UTF-8 没有单字节表;本用例只覆盖三张双字节码表"),
+            Codec::Cp949 => CP949_TABLE.single_high,
+            Codec::Cp1252 => CP1252_TABLE.single_high,
+            Codec::Utf8 => panic!("UTF-8 没有单字节表;本用例只覆盖单/双字节码表"),
         };
         for b in 0x00u16..0x100 {
             let bytes = [b as u8];
@@ -614,5 +791,15 @@ mod tests {
     #[test]
     fn single_byte_roundtrip_big5() {
         single_byte_roundtrip(Codec::Big5);
+    }
+
+    #[test]
+    fn single_byte_roundtrip_cp949() {
+        single_byte_roundtrip(Codec::Cp949);
+    }
+
+    #[test]
+    fn single_byte_roundtrip_cp1252() {
+        single_byte_roundtrip(Codec::Cp1252);
     }
 }

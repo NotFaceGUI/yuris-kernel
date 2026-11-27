@@ -274,8 +274,14 @@ fn normalize_text_file_path(path: &mut [u8], codec: yu_format::Codec) {
     while i < path.len() {
         let b = path[i];
         if codec.is_lead(b) {
-            // 双字节字符整体跳过:尾字节原样保留。
-            i += 2;
+            // FUN_00464dac 的旧编码路径只看前导表(包括非法尾字节)。
+            // UTF-8 则按完整字符走;非法序列按一字节重同步,让后继
+            // ASCII 斜杠/大写字母仍参与规范化。
+            i += if codec == yu_format::Codec::Utf8 {
+                codec.unit_len_at(path, i).max(1)
+            } else {
+                2
+            };
             continue;
         }
         if b.is_ascii_uppercase() {
@@ -332,6 +338,21 @@ fn text_file_lines(data: &[u8]) -> Vec<Vec<u8>> {
 mod text_file_tests {
     use super::{normalize_text_file_path, text_file_lines};
     use yu_format::Codec;
+
+    #[test]
+    fn utf8_invalid_lead_does_not_hide_ascii_path_bytes() {
+        // UTF-8 解码失败应按一字节重同步,不能像旧双字节编码那样吞后继。
+        let mut path = b"\xe3/A\xf0Z/\xe3\x81/A".to_vec();
+        normalize_text_file_path(&mut path, Codec::Utf8);
+        assert_eq!(path, b"\xe3\\a\xf0z\\\xe3\x81\\a");
+    }
+
+    #[test]
+    fn utf8_path_preserves_complete_multibyte_characters() {
+        let mut path = "SCENARIO/é終😀/A.TXT".as_bytes().to_vec();
+        normalize_text_file_path(&mut path, Codec::Utf8);
+        assert_eq!(path, "scenario\\é終😀\\a.txt".as_bytes());
+    }
 
     /// 555 多语言路径:前导字节跳过 2 字节,尾字节即使是 `A` 也原样保留。
     /// Big5 `A1 41` 是合法双字节字符(`A1` 前导,`41` 尾),旧版逐字节

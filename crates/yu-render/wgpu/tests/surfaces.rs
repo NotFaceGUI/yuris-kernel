@@ -83,6 +83,7 @@ fn table() -> ParamTable {
                     "SY",
                     "TRIM",
                     "RESIZE",
+                    "MEIDO",
                 ],
             ),
             command("CGEND", &["ID"]),
@@ -1229,6 +1230,283 @@ fn glyph_atlas_is_shared_across_text_layers() {
         .parse()
         .expect("atlas 命中数");
     assert!(hits >= 1, "第二层的同字形必须命中图集: {snapshot}");
+}
+
+#[test]
+fn merge_patches_preserve_overlap_and_do_not_escape_to_a_copy() {
+    let table = table();
+    let entries = [
+        (b"bg.png".as_slice(), png_bytes_for(64, 32, Rgba([15, 45, 67, 181]))),
+        (b"red.png".as_slice(), png_bytes_for(4, 4, Rgba([210, 0, 28, 137]))),
+        (b"blue.png".as_slice(), png_bytes_for(4, 4, Rgba([0, 58, 220, 151]))),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else {
+        return;
+    };
+    for read in [false, true] {
+        gpu.reset();
+        let mut soft = SoftRenderer::new(store(&entries));
+        let mut gfx = state(Viewport::new(64, 32), [0, 0, 0, 255]);
+        let strval = |bytes: &[u8]| Value::Str(bytes.to_vec());
+        let mut events = vec![VmEvent::FrameStart { frame: 1 }];
+        for (id, file, alpha, visible) in [
+            (b"OUT", b"bg".as_slice(), 256, 1),
+            (b"RED", b"red", 190, 0),
+            (b"BLU", b"blue", 256, 0),
+        ] {
+            events.push(call(1, "CG", vec![
+                arg(&table, "CG", "ID", strval(id)),
+                arg(&table, "CG", "FILE", strval(file)),
+                arg(&table, "CG", "E", Value::Int(visible)),
+                arg(&table, "CG", "A", Value::Int(alpha)),
+            ]));
+        }
+        for (id, x) in [(b"RED", -2), (b"BLU", 1)] {
+            if read && x == 1 {
+                events.push(call(1, "CGACT", vec![
+                    arg(&table, "CGACT", "ID", strval(b"OUT")),
+                    arg(&table, "CGACT", "ID2", strval(b"CAP")),
+                    arg(&table, "CGACT", "COPY2", Value::Int(1)),
+                ]));
+            }
+            events.push(call(1, "CGACT", vec![
+                arg(&table, "CGACT", "ID", strval(id)),
+                arg(&table, "CGACT", "ID2", strval(b"OUT")),
+                arg(&table, "CGACT", "MERGE", Value::Int(1)),
+                arg(&table, "CGACT", "X", Value::Int(x)),
+                arg(&table, "CGACT", "Y", Value::Int(5)),
+            ]));
+        }
+        events.push(VmEvent::FrameEnd { frame: 1 });
+        gfx.consume_events(&events);
+        let frame = gfx.frame();
+        let expected = soft.render_frame(&frame);
+        let actual = gpu.render_frame(&frame).expect("gpu render");
+        assert_eq!(actual.report.skipped_ops_total, 0);
+        assert_eq!(max_channel_diff(&actual.surface, &expected.surface), 0);
+        let stats = gpu.surface_stats();
+        if read {
+            assert_eq!(stats.merge_patch_draws, 0);
+            assert_eq!(stats.merge_pixels, 2 * 64 * 32);
+        } else {
+            assert_eq!(stats.merge_patch_draws, 2);
+            assert_eq!(stats.merge_pixels, (2 + 4) * 4);
+            assert_eq!(stats.blits, 3, "copy the full base once, then two patches");
+        }
+    }
+}
+
+/// An acknowledged prefix is absent from retry frames, even when part of the
+/// unacknowledged suffix succeeded before/after a missing source.
+#[test]
+fn acknowledged_prefix_survives_partial_suffix_failure() {
+    let table = table();
+    let entries = [
+        (b"bg.png".as_slice(), png_bytes_for(64, 32, Rgba([15, 45, 67, 255]))),
+        (b"ink.png".as_slice(), png_bytes_for(4, 4, Rgba([210, 0, 28, 137]))),
+    ];
+    for failure_at in 0..3 {
+        let Some(mut gpu) = renderer_or_skip(store(&entries)) else { return };
+        let mut gfx = state(Viewport::new(64, 32), [0, 0, 0, 255]);
+        let mut full_gfx = state(Viewport::new(64, 32), [0, 0, 0, 255]);
+        let merge = |frame, source: &[u8], x| call(frame, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(source.to_vec())),
+            arg(&table, "CGACT", "ID2", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "MERGE", Value::Int(1)),
+            arg(&table, "CGACT", "X", Value::Int(x)),
+        ]);
+        let mut events = vec![VmEvent::FrameStart { frame: 1 }];
+        for (id, file, visible) in [(b"OUT".as_slice(), b"bg".as_slice(), 1), (b"INK", b"ink", 0), (b"LATE", b"late", 0)] {
+            events.push(call(1, "CG", vec![
+                arg(&table, "CG", "ID", Value::Str(id.to_vec())),
+                arg(&table, "CG", "FILE", Value::Str(file.to_vec())),
+                arg(&table, "CG", "E", Value::Int(visible)),
+            ]));
+        }
+        events.extend([merge(1, b"INK", 0), VmEvent::FrameEnd { frame: 1 }]);
+        gfx.consume_events(&events);
+        full_gfx.consume_events(&events);
+        let first = gpu.render_frame(&gfx.frame()).expect("acknowledged frame");
+        assert!(first.report.failed_targets.is_empty());
+        gfx.commit_baked(&first.report.failed_targets);
+        let prefix = gfx.frame().image_prefixes[&yu_gfx::LayerId::new(b":/W0/OUT".to_vec())];
+        for frame_no in 2..=6 {
+            let mut events = vec![VmEvent::FrameStart { frame: frame_no }];
+            if frame_no == 2 {
+                let mut suffix = vec![merge(2, b"INK", 8), merge(2, b"INK", 9)];
+                suffix.insert(failure_at, merge(2, b"LATE", 16));
+                events.extend(suffix);
+            }
+            events.push(VmEvent::FrameEnd { frame: frame_no });
+            gfx.consume_events(&events);
+            full_gfx.consume_events(&events);
+            let mut expected = SoftRenderer::new(store(&entries));
+            if frame_no >= 5 {
+                // The same command becomes executable after the missing data arrives.
+                gpu.textures_mut().insert_rgba(b"late", 1, 1, vec![0, 255, 0, 255]);
+                expected.textures_mut().insert_rgba(b"late", 1, 1, vec![0, 255, 0, 255]);
+            }
+            let frame = gfx.frame();
+            if frame_no < 6 {
+                assert_eq!(frame.image_prefixes[&yu_gfx::LayerId::new(b":/W0/OUT".to_vec())], prefix);
+            } else {
+                assert!(frame.passes.iter().all(|p| !matches!(p.target, yu_gfx::PassTarget::Texture(_))));
+            }
+            let output = gpu.render_frame(&frame).expect("retry frame");
+            if frame_no < 5 {
+                assert_eq!(output.report.failed_targets, vec![b":/W0/OUT".to_vec()]);
+            } else {
+                assert!(output.report.failed_targets.is_empty());
+            }
+            assert_eq!(pixel_of(&output.surface, 0, 0), pixel_of(&first.surface, 0, 0),
+                "lost acknowledged pixels: failure position {failure_at}, frame {frame_no}");
+            assert_eq!(output.surface.rgba, expected.render_frame(&full_gfx.frame()).surface.rgba,
+                "suffix must execute once: failure position {failure_at}, frame {frame_no}");
+            gfx.commit_baked(&output.report.failed_targets);
+        }
+    }
+}
+
+#[test]
+fn merge_patch_scratch_returns_to_the_pool() {
+    let table = table();
+    let entries = [
+        (b"bg.png".as_slice(), png_bytes_for(64, 32, Rgba([15, 45, 67, 255]))),
+        (b"ink.png".as_slice(), png_bytes_for(4, 4, Rgba([210, 0, 28, 137]))),
+    ];
+    let Some(mut gpu) = renderer_or_skip(store(&entries)) else { return };
+    let mut gfx = state(Viewport::new(64, 32), [0, 0, 0, 255]);
+    let mut soft = SoftRenderer::new(store(&entries));
+    for frame_no in 1..=8 {
+        let mut events = vec![VmEvent::FrameStart { frame: frame_no }];
+        if frame_no == 1 {
+            for (id, file, visible) in [(b"OUT".as_slice(), b"bg".as_slice(), 1), (b"INK", b"ink", 0)] {
+                events.push(call(frame_no, "CG", vec![
+                    arg(&table, "CG", "ID", Value::Str(id.to_vec())),
+                    arg(&table, "CG", "FILE", Value::Str(file.to_vec())),
+                    arg(&table, "CG", "E", Value::Int(visible)),
+                ]));
+            }
+        }
+        events.push(call(frame_no, "CGACT", vec![
+            arg(&table, "CGACT", "ID", Value::Str(b"OUT".to_vec())),
+            arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
+            arg(&table, "CGACT", "SET", Value::Int(0xFF_112233)),
+        ]));
+        for x in [0, 1] {
+            events.push(call(frame_no, "CGACT", vec![
+                arg(&table, "CGACT", "ID", Value::Str(b"INK".to_vec())),
+                arg(&table, "CGACT", "ID2", Value::Str(b"OUT".to_vec())),
+                arg(&table, "CGACT", "MERGE", Value::Int(1)),
+                arg(&table, "CGACT", "X", Value::Int(x)),
+            ]));
+        }
+        events.push(VmEvent::FrameEnd { frame: frame_no });
+        gfx.consume_events(&events);
+        let frame = gfx.frame();
+        let output = gpu.render_frame(&frame).expect("merge frame");
+        assert!(output.report.failed_targets.is_empty());
+        assert_eq!(output.surface.rgba, soft.render_frame(&frame).surface.rgba);
+        let stats = gpu.surface_stats();
+        assert_eq!(stats.merge_patch_draws, 2);
+        if frame_no >= 3 {
+            assert!(stats.created <= 1, "scratch must be reused after warmup: {stats:?}");
+            assert!(stats.reused >= 2, "clear surface and patch must return to pool: {stats:?}");
+        }
+    }
+}
+
+/// s26 pc657..680:整图复制到可复用暂存层，按字着色再 MERGE 到正文。
+#[test]
+fn reused_copy_surface_preserves_each_merge_sources_color() {
+    let table = table();
+    let entries = [
+        (b"base.png".as_slice(), png_bytes_for(6, 2, Rgba([0, 0, 0, 255]))),
+        (b"ink.png".as_slice(), png_bytes_for(1, 1, Rgba([200, 160, 120, 255]))),
+    ];
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gpu = renderer_or_skip(store(&entries));
+    let mut gfx = state(Viewport::new(6, 2), [0, 0, 0, 255]);
+    let mut live_gfx = state(Viewport::new(6, 2), [0, 0, 0, 255]);
+    let strval = |bytes: &[u8]| Value::Str(bytes.to_vec());
+    let action = |frame, source: &[u8], dest: Option<&[u8]>, name, mut args: Vec<ArgValue>| {
+        args.push(arg(&table, "CGACT", "ID", strval(source)));
+        if let Some(dest) = dest {
+            args.push(arg(&table, "CGACT", "ID2", strval(dest)));
+        }
+        args.push(arg(&table, "CGACT", name, Value::Int(1)));
+        call(frame, "CGACT", args)
+    };
+    let mut events = vec![VmEvent::FrameStart { frame: 1 }];
+    for (id, file, visible) in [(b"OUT", b"base".as_slice(), 1), (b"SRC", b"ink", 0), (b"TMP", b"", 0), (b"ABS", b"absent", 0)] {
+        events.push(call(1, "CG", vec![
+            arg(&table, "CG", "ID", strval(id)),
+            arg(&table, "CG", "FILE", strval(file)),
+            arg(&table, "CG", "E", Value::Int(visible)),
+        ]));
+    }
+    let glyph = |frame, source, x, gain| [
+        action(frame, b"TMP", None, "RECTPAINT3", vec![arg(&table, "CGACT", "SET", Value::Int(0))]),
+        action(frame, source, Some(b"TMP"), "COPY2", vec![]),
+        action(frame, b"TMP", None, "MEIDO", vec![arg(&table, "CGACT", "SET", Value::Int(gain))]),
+        action(frame, b"TMP", Some(b"OUT"), "MERGE", vec![arg(&table, "CGACT", "X", Value::Int(x))]),
+    ];
+    events.extend(glyph(1, b"SRC", 0, 0x408040));
+    // Neither a missing asset nor an undeclared source may reuse earlier ink.
+    events.extend(glyph(1, b"ABS", 1, 0x804080));
+    events.extend(glyph(1, b"SRC", 2, 0x804080));
+    events.extend(glyph(1, b"UNDECLARED", 3, 0x804080));
+    // 命令时刻没有源；同帧后来创建并填充同名层，也不能给旧快照补像素。
+    events.push(call(1, "CG", vec![
+        arg(&table, "CG", "ID", strval(b"UNDECLARED")),
+        arg(&table, "CG", "FILE", strval(b"")),
+        arg(&table, "CG", "E", Value::Int(0)),
+    ]));
+    events.push(action(1, b"UNDECLARED", None, "RECTPAINT3", vec![
+        arg(&table, "CGACT", "SET", Value::Int(0xFF_FF0000)),
+    ]));
+    events.push(VmEvent::FrameEnd { frame: 1 });
+    gfx.consume_events(&events);
+    live_gfx.consume_events(&events);
+    let check = |output: &yu_backend_soft::Surface, last| {
+        assert_eq!(pixel_of(output, 0, 0), [100, 160, 60, 255], "first stamp lost its tint");
+        assert_eq!(pixel_of(output, 1, 0), [0, 0, 0, 255], "missing stamp must remain transparent");
+        assert_eq!(pixel_of(output, 2, 0), [200, 80, 120, 255], "second stamp lost its tint");
+        assert_eq!(pixel_of(output, 3, 0), [0, 0, 0, 255], "undeclared source must remain transparent");
+        assert_eq!(pixel_of(output, 4, 0), last);
+    };
+    for frame in 1..=3 {
+        let last = if frame == 1 { [0, 0, 0, 255] } else { [0, 160, 120, 255] };
+        if frame > 1 {
+            let mut events = vec![VmEvent::FrameStart { frame }];
+            if frame == 2 {
+                events.extend(glyph(frame, b"SRC", 4, 0x008080));
+            }
+            events.push(VmEvent::FrameEnd { frame });
+            gfx.consume_events(&events);
+            live_gfx.consume_events(&events);
+        }
+        let full = gfx.frame();
+        check(&soft.render_frame(&full).surface, last);
+        if let Some(gpu) = gpu.as_mut() {
+            let incremental = live_gfx.frame();
+            let texture_ops = |frame: &CompositorFrame| {
+                frame.passes.iter().filter_map(|p| {
+                    matches!(p.target, yu_gfx::PassTarget::Texture(_)).then_some(p.ops.len())
+                }).sum::<usize>()
+            };
+            if frame == 2 {
+                assert!(texture_ops(&full) > 3, "full replay should include earlier stamps");
+                assert_eq!(texture_ops(&incremental), 3, "one COPY2, MEIDO, and MERGE");
+            } else if frame == 3 {
+                assert_eq!(texture_ops(&incremental), 0, "idle must not replay old stamps");
+            }
+            let output = gpu.render_frame(&incremental).expect("gpu render");
+            assert!(output.report.failed_targets.is_empty(), "{:?}", output.report.failed_targets);
+            check(&output.surface, last);
+            live_gfx.commit_baked(&output.report.failed_targets);
+        }
+    }
 }
 
 /// 60 帧多场景序列:换差分(COPY)/过渡(TRANSITION)/MERGE/缩放/文本,

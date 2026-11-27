@@ -211,6 +211,10 @@ pub struct CopyOp {
     /// 仍可见的像素换成永远建不出来的空表面(<game-c> 2026-11-25
     /// `es_sprite` 过渡:帧 1239–1254 立绘消失)。
     pub dest_texture_before: Option<TextureRef>,
+    /// 整图 COPY2 前目标已由脚本明确清为透明，且未再次写入。
+    /// 此时 `source_texture = Some(TextureRef::None)` 冻结命令时刻缺失的源层；
+    /// 对资产源仅接受确实缺失，不把解码、设备或快照失败当作空白。
+    pub blank_if_source_missing: bool,
     /// **命令执行时**源图层已登记的文本绘制项(`CopySource::Layer` 才冻结;
     /// 组源为空 —— 组内层文本由后端按组当前状态合成)。
     ///
@@ -224,6 +228,14 @@ pub struct CopyOp {
     pub region: CopyRegion,
     pub timing: CopyTiming,
     pub status: OpStatus,
+}
+
+impl CopyOp {
+    /// 缺失在命令时刻已确定，不能从帧末的同名层回填。
+    #[must_use]
+    pub fn has_frozen_empty_source(&self) -> bool {
+        self.blank_if_source_missing && self.source_texture == Some(TextureRef::None)
+    }
 }
 
 /// `CGACT` 图像加工种类(像素语义属图像层;gfx 只记录事实)。
@@ -302,6 +314,27 @@ impl ImageAction {
     /// `MEIDO`:逐通道明度缩放(手册例 7)。
     pub fn is_meido(&self) -> bool {
         matches!(self, Self::Other("meido"))
+    }
+
+    /// **纯颜色**滤镜(`MEIDO`/`SAIDO`/`AKARUSA`/`MONO`/`SEPIA`)。
+    ///
+    /// 这几个动作只做逐通道线性变换(`out = in × gain/128`),**不改变像素
+    /// 的存在与否**。官方把它们作用在含文字的表面 ⇒ 文字只是被改色,位置
+    /// 与字形都在。
+    ///
+    /// 内核的文字是延迟到层末合成的,无法事后改色;但**绝不能因此删掉
+    /// 文字**——删掉会让逐字绘制路径每画一个字就清掉前一个字。
+    ///
+    /// 真实脚本(支持语言切换的字符集构建,`es_font.yst` 的正文逐字链):
+    /// 每个字是 `TEXT 到正文层` + `MEIDO 到正文层`(着色)交替;若 `MEIDO`
+    /// 清文字,屏幕上就只剩最后写的那一个字符 —— 中英皆然,而中文字形走
+    /// `COPY2→MERGE` 降级(不经 `MEIDO` 打正文层)所以看起来正常。
+    #[must_use]
+    pub fn is_color_filter(&self) -> bool {
+        matches!(
+            self,
+            Self::Other("meido" | "saido" | "akarusa" | "mono" | "sepia")
+        )
     }
 
     /// 逐层**原地滤镜**族(手册例 5..17 + 无页同族键)。

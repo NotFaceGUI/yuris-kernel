@@ -3,8 +3,8 @@
 """yu-format 编解码码表生成器(一次性工具;产物已入库,改码表须重跑本脚本)。
 
 数据源 = Windows 本体 API(kernel32):
-  - 解码表: MultiByteToWideChar(932/936/950, MB_ERR_INVALID_CHARS, ...)
-  - 编码表: WideCharToMultiByte(932/936/950, ...)
+  - 解码表: MultiByteToWideChar(932/936/950/949, MB_ERR_INVALID_CHARS, ...)
+  - 编码表: WideCharToMultiByte(932/936/950/949, ...)
 理由: YU-RIS 引擎运行在 Windows 上,文本边界走系统码页;以系统行为为真值,
 避免 Python 自带 codec 的非标准扩充(cp932 把 0xA0/0xFD-0xFF 映到 PUA)。
 
@@ -12,6 +12,8 @@
   src/codec/table_cp932.rs
   src/codec/table_gbk.rs
   src/codec/table_big5.rs
+  src/codec/table_cp949.rs
+  src/codec/table_cp1252.rs
 
 用法: python gen_tables.py   (在 crates/yu-format 目录下;仅 Windows 可用)
 """
@@ -88,9 +90,9 @@ def collect(cp: int) -> dict:
         if row:
             doubles[lead] = row
 
-    lead_lo, lead_hi = min(doubles), max(doubles)
+    lead_lo, lead_hi = (min(doubles), max(doubles)) if doubles else (0, 0)
     all_trails = [t for row in doubles.values() for t in row]
-    trail_lo, trail_hi = min(all_trails), max(all_trails)
+    trail_lo, trail_hi = (min(all_trails), max(all_trails)) if all_trails else (0, 0)
 
     # 反向表:字符 → 字节(用 WideCharToMultiByte 的裁决 = 系统首选编码)
     enc: dict[int, int] = {}
@@ -208,6 +210,33 @@ def render(name: str, cp: int, data: dict, evidence: str) -> str:
     return "\n".join(out) + "\n"
 
 
+def render_single(name: str, cp: int, data: dict, evidence: str) -> str:
+    """单字节码页(CP1252 等):只有 0x80.. 映射,没有双字节矩阵。"""
+    singles = data["singles"]
+    high = {b: singles[b] for b in range(0x80, 0x100) if b in singles}
+    out = []
+    out.append("// 生成物,勿手改 —— 由 crates/yu-format/gen_tables.py 生成。")
+    out.append("// 数据源 = Windows kernel32 码页 %d(%s)。" % (cp, evidence))
+    out.append("// 单字节码页:0x80..=0xFF 直接映射,0 = 非法。")
+    if high:
+        out.append("// 0x80.. 映射:%s" % ", ".join(
+            "%#04x→U+%04X" % (b, u) for b, u in sorted(high.items())))
+    out.append("")
+    out.append("/// 单字节 0x80.. 的解码(缺省 = 非法)。索引 = 字节 - 0x80。")
+    out.append("pub(super) static SINGLE_HIGH: [u16; 0x80] = [")
+    cells = []
+    for b in range(0x80, 0x100):
+        cells.append("0x%04X" % singles.get(b, 0))
+    for i in range(0, len(cells), 12):
+        out.append("    " + ", ".join(cells[i:i + 12]) + ",")
+    out.append("];")
+    out.append("")
+    out.append("/// 审计常量:0x80.. 非零映射数、编码别名数。")
+    out.append("pub(super) const SINGLE_ENTRIES: usize = %d;" % len(high))
+    out.append("pub(super) const ALIASES: usize = 0;")
+    return "\n".join(out) + "\n"
+
+
 def main():
     import os
     here = os.path.dirname(os.path.abspath(__file__))
@@ -216,10 +245,15 @@ def main():
         ("table_cp932.rs", 932, "Windows CP932 / Shift-JIS(NEC・IBM 选定行)"),
         ("table_gbk.rs", 936, "Windows CP936 / GBK"),
         ("table_big5.rs", 950, "Windows CP950 / Big5"),
+        ("table_cp949.rs", 949, "Windows CP949 / UHC (EUC-KR)"),
+        ("table_cp1252.rs", 1252, "Windows CP1252 / Western European"),
     ]
     for fname, cp, evidence in tables:
         data = collect(cp)
-        text = render(fname, cp, data, evidence)
+        if data["doubles"]:
+            text = render(fname, cp, data, evidence)
+        else:
+            text = render_single(fname, cp, data, evidence)
         path = os.path.join(dst, fname)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)

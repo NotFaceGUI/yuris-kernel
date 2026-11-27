@@ -849,6 +849,165 @@ fn merge_glyph_chain_accumulates_text_images() {
     assert_eq!((draws[0].x, draws[1].x), (10, 50));
 }
 
+/// 纯颜色滤镜(`MEIDO`)不得清掉目标层已画文字。
+///
+/// 真实脚本(支持语言切换的字符集构建,`es_font.yst` 正文逐字链):每个
+/// 字符是 `CGACT[TEXT]` 与 `CGACT[MEIDO]` **交替**打在正文层上 ——
+/// `TEXT` 写字、`MEIDO` 给这个字上色,然后下一个字重复。
+///
+/// 官方 `MEIDO` 是逐通道增益(`out = in × gain/128`),作用在**含文字的
+/// 表面**上 ⇒ 文字只是被改色,位置与字形都在。内核的文字延迟到层末合成,
+/// 无法事后改色,但**不能因此删文字**:删了就是"每画一个字清掉前一个",
+/// 屏幕上只剩最后一个字符(英文只显示一个,中文因走 `COPY2→MERGE` 降级
+/// 在暂存层着色所以看起来正常)。
+#[test]
+fn color_filter_keeps_accumulated_text() {
+    let table = table();
+    let mut gfx = state();
+    let mut events = vec![
+        frame_start(1),
+        create(&table, "TX", "", 1, 256),
+        call(
+            1,
+            "FONT",
+            vec![
+                arg(&table, "FONT", "SX", i(24)),
+                arg(&table, "FONT", "SY", i(24)),
+                arg(&table, "FONT", "COLOR", i(0x00FF_FFFF)),
+            ],
+        ),
+    ];
+    // 三个字符:每个都是 TEXT(写字)紧跟 MEIDO(上色)。
+    for (index, ch) in ["A", "B", "C"].iter().enumerate() {
+        events.push(call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("TX")),
+                arg(&table, "CGACT", "TEXT", i(1)),
+                arg(&table, "CGACT", "SETSTR", s(ch)),
+                arg(&table, "CGACT", "X", i(index as i64 * 24)),
+                arg(&table, "CGACT", "Y", i(0)),
+            ],
+        ));
+        events.push(call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("TX")),
+                arg(&table, "CGACT", "MEIDO", i(1)),
+                arg(&table, "CGACT", "SET", i(0x00FF_FFFF)),
+            ],
+        ));
+    }
+    events.push(frame_end(1));
+    gfx.consume_events(&events);
+
+    let frame = gfx.frame();
+    let draws: Vec<_> = frame
+        .text_draws
+        .iter()
+        .filter(|d| d.target.display() == ":/W0/TX")
+        .cloned()
+        .collect();
+    assert_eq!(
+        draws.len(),
+        3,
+        "三个字符的 TEXT 都必须保留(MEIDO 不得清文字);实际 {} 条 ——          只剩最后一个就是这个断言失败",
+        draws.len()
+    );
+    let xs: Vec<i64> = draws.iter().map(|d| d.x).collect();
+    assert_eq!(xs, vec![0, 24, 48], "三个字必须落在各自的推进位置");
+}
+
+/// 部分区域 COPY2 缺源时仍遵守原来的失败路径，不注册源，也不换掉目标。
+#[test]
+fn partial_copy2_with_missing_source_preserves_destination() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[frame_start(1), create(&table, "TMP", "previous", 1, 256)]);
+    let before = gfx.frame().layers;
+    gfx.consume_events(&[
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("ABSENT")),
+                arg(&table, "CGACT", "ID2", s("TMP")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+                arg(&table, "CGACT", "X", i(0)),
+                arg(&table, "CGACT", "Y", i(0)),
+                arg(&table, "CGACT", "X2", i(31)),
+                arg(&table, "CGACT", "Y2", i(31)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    assert_eq!(gfx.frame().layers, before);
+    assert!(gfx.copies().is_empty());
+    assert!(gfx.frame().diagnostics.iter().any(|d| d.code == "gfx.layer.missing"));
+}
+
+#[test]
+fn merge_keeps_accumulated_text_on_target() {
+    let table = table();
+    let mut gfx = state();
+    let mut events = vec![
+        frame_start(1),
+        create(&table, "TX", "", 2, 256),
+        create(&table, "UP", "", 3, 256),
+        call(
+            1,
+            "FONT",
+            vec![
+                arg(&table, "FONT", "SX", i(24)),
+                arg(&table, "FONT", "SY", i(24)),
+                arg(&table, "FONT", "COLOR", i(0x00FF_FFFF)),
+            ],
+        ),
+    ];
+    // 两个字先写在正文层上(逐字累积)。
+    for (index, ch) in ["A", "B"].iter().enumerate() {
+        events.push(call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("TX")),
+                arg(&table, "CGACT", "TEXT", i(1)),
+                arg(&table, "CGACT", "SETSTR", s(ch)),
+                arg(&table, "CGACT", "X", i(index as i64 * 24)),
+                arg(&table, "CGACT", "Y", i(0)),
+            ],
+        ));
+    }
+    // 再叠一块(非字形候选来源 ⇒ 走真实图像加工)。
+    events.push(call(
+        1,
+        "CGACT",
+        vec![
+            arg(&table, "CGACT", "ID", s("UP")),
+            arg(&table, "CGACT", "ID2", s("TX")),
+            arg(&table, "CGACT", "MERGE", i(1)),
+            arg(&table, "CGACT", "X", i(0)),
+            arg(&table, "CGACT", "Y", i(0)),
+        ],
+    ));
+    events.push(frame_end(1));
+    gfx.consume_events(&events);
+
+    let frame = gfx.frame();
+    let draws = frame
+        .text_draws
+        .iter()
+        .filter(|d| d.target.display() == ":/W0/TX")
+        .count();
+    assert_eq!(
+        draws, 2,
+        "MERGE 落点外是下层原像素,已画的两个字必须保留;实际 {draws} 条 ——          变成 0 说明 MERGE 把整行字清掉了"
+    );
+}
+
+
 #[test]
 fn swap_exchanges_layer_texts() {
     let table = table();

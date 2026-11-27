@@ -746,8 +746,15 @@ fn codec_invalid_sequences() {
     // Big5:名与别名都进来了(cp950 码表加入后的合法取值)。
     assert_eq!(Codec::from_name("big5").unwrap(), Codec::Big5);
     assert_eq!(Codec::from_name("cp950").unwrap(), Codec::Big5);
+    // CP949 / UHC / EUC-KR 都映射到韩文码页。
+    assert_eq!(Codec::from_name("cp949").unwrap(), Codec::Cp949);
+    assert_eq!(Codec::from_name("uhc").unwrap(), Codec::Cp949);
+    assert_eq!(Codec::from_name("euc-kr").unwrap(), Codec::Cp949);
+    // CP1252 / Windows-1252(西班牙语等西欧)
+    assert_eq!(Codec::from_name("cp1252").unwrap(), Codec::Cp1252);
+    assert_eq!(Codec::from_name("windows-1252").unwrap(), Codec::Cp1252);
     // 未知名
-    assert_eq!(Codec::from_name("euc-kr").unwrap_err().code, code::CODEC_NAME);
+    assert_eq!(Codec::from_name("euc-jp").unwrap_err().code, code::CODEC_NAME);
     assert_eq!(Codec::from_name("gbk").unwrap(), Codec::Gbk);
     assert_eq!(Codec::from_name("sjis").unwrap(), Codec::Cp932);
 }

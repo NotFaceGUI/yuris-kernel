@@ -30,7 +30,7 @@
 //! 4. 池只在**帧末**回收未被引用的内容纹理(快照/文本/别名持有 `Rc` ⇒
 //!    自动钉住,计数 > 1 时不入池)。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
@@ -120,6 +120,8 @@ struct LayerState {
     base: u64,
     /// 已应用的操作前缀(`(seq, 签名)`,命令序)。
     applied: Vec<(u64, u64)>,
+    /// 在后缀中有命令失败时，保留 gfx 已确认的旧表面供下一帧重试。
+    retry_prefix: Option<(u64, usize, Content)>,
     /// 当前像素;`None` = 直接采样基图(未物化)。
     content: Option<Content>,
     /// 已烘进内容的文本修订号(0 = 无文本;与 `CompositorFrame::text_revisions`
@@ -138,6 +140,7 @@ struct LayerState {
 impl LayerState {
     fn clear(&mut self) {
         self.applied.clear();
+        self.retry_prefix = None;
         self.content = None;
         self.text_rev = 0;
         self.text_sig = 0;
@@ -165,6 +168,9 @@ pub struct SurfaceStats {
     pub transitions_elided: u64,
     /// 本帧真正执行的像素 pass 数(表面写入)。
     pub surface_passes: u64,
+    /// MERGE 命令实际提交的全幅或裁剪矩形像素总数。
+    pub merge_pixels: u64,
+    pub merge_patch_draws: u64,
     /// 本帧纹理区域复制次数(COPY 快照/RESIZE/TRIM)。
     pub blits: u64,
     /// 本帧因操作前缀相同而复用的层数。
@@ -342,12 +348,46 @@ impl LayerSurfaces {
             if let Some(raw) = &state.raw {
                 out.insert(raw.tex.id);
             }
+            if let Some((_, _, saved)) = &state.retry_prefix {
+                out.insert(saved.tex.id);
+            }
         }
         // 池里的纹理仍由本表持有,下一帧 `acquire` 会直接复用;保留其
         // bind group 可以避免「复用同一张纹理却每帧重建 group」。
         // 池有 64MB 上限,随 trim/drop 淘汰后下一步自然剪掉。
         for tex in self.pool.values().flatten() {
             out.insert(tex.id);
+        }
+    }
+
+    /// 同一确认点重试时，从旧像素续写，而不是累加上次未确认的结果。
+    pub fn prepare_image_suffix(&mut self, id: &LayerId, prefix: u64) -> Option<(usize, Content)> {
+        let state = self.layers.get_mut(id)?;
+        if state.applied.last().is_some_and(|&(seq, _)| seq == prefix) {
+            let content = state.raw.as_ref().or(state.content.as_ref())?.clone();
+            let len = state.applied.len();
+            state.retry_prefix = Some((prefix, len, content.clone()));
+            return Some((len, content));
+        }
+        let (saved_prefix, len, content) = state.retry_prefix.as_ref()?;
+        if *saved_prefix != prefix || state.applied.get(len - 1)?.0 != prefix {
+            return None;
+        }
+        let (len, content) = (*len, content.clone());
+        state.applied.truncate(len);
+        state.content = Some(content.clone());
+        state.raw = None;
+        state.text_rev = 0;
+        state.text_sig = 0;
+        state.raw_hash = 0;
+        Some((len, content))
+    }
+
+    pub fn retain_failed_image_prefixes(&mut self, failed: &BTreeSet<Vec<u8>>) {
+        for (id, state) in &mut self.layers {
+            if !failed.contains(id.as_bytes()) {
+                state.retry_prefix = None;
+            }
         }
     }
 
@@ -691,8 +731,17 @@ impl LayerSurfaces {
     pub fn live_bytes(&self) -> usize {
         self.layers
             .values()
-            .filter_map(|state| state.content.as_ref())
-            .map(|content| content.tex.bytes())
+            .map(|state| {
+                let current = state.content.as_ref();
+                let retry_bytes = state.retry_prefix.as_ref().map_or(0, |(_, _, saved)| {
+                    if current.is_some_and(|c| c.tex.id == saved.tex.id) {
+                        0
+                    } else {
+                        saved.tex.bytes()
+                    }
+                });
+                current.map_or(0, |c| c.tex.bytes()) + retry_bytes
+            })
             .sum()
     }
 

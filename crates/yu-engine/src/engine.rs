@@ -1981,10 +1981,10 @@ impl Engine {
                     false,
                 )
             };
-        // 烘焙前缀只在**真实执行成功**后提交;failed_targets 对应后端 skip 的
-        // 图像/复制目标,下一帧保留重试。`--no-render` 复用旧报告,不提交本帧。
+        // 只有 WGPU 跨帧持有图像加工表面，可确认并省略已执行前缀。
+        // Soft 每帧从完整命令链重建；它自己缓存不可变的 COPY 快照。
         if let Some(state) = &self.state {
-            if rendered_now {
+            if rendered_now && matches!(&self.renderer, Renderer::Wgpu { .. }) {
                 state.borrow().commit_baked(&report.failed_targets);
             } else {
                 state.borrow().discard_baked();

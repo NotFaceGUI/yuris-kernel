@@ -534,6 +534,12 @@ impl Default for TextComposer {
     }
 }
 
+/// `YU_TEXT_TRACE=1`:逐条打印 `paint_one` 的样式/落点(运行时取证)。
+fn text_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("YU_TEXT_TRACE").is_some())
+}
+
 impl TextComposer {
     /// 懒加载:首次绘制时才枚举系统字体(标题/无文本帧零成本)。
     #[must_use]
@@ -1216,6 +1222,27 @@ impl TextComposer {
         draw: &TextDraw,
         stats: &mut TextPaintStats,
     ) {
+        // 运行时取证(`YU_TEXT_TRACE=1`):逐条打印绘制项的样式与落点。
+        // 用途 = 核对官方"同一字符画两次(描边色在下、填充色在上)"的次序
+        // 与配色是否被内核正确还原。
+        if text_trace() {
+            log::warn!(
+                target: "yu-render",
+                "[texttrace] bytes={:?} color={:06X} color2={:?} grad={} set={} mode={} anti={} sx={} sy={} bold={} at=({},{})",
+                String::from_utf8_lossy(&draw.bytes),
+                draw.style.color & 0x00FF_FFFF,
+                draw.style.color2.map(|c| c & 0x00FF_FFFF),
+                draw.style.gradation,
+                draw.set,
+                draw.style.draw_mode,
+                draw.style.antialias,
+                draw.style.size_x,
+                draw.style.size_y,
+                draw.style.bold,
+                draw.x,
+                draw.y
+            );
+        }
         if !self.ensure() {
             if let Some(why) = self.failure.clone() {
                 stats.note(&format!("text.font_unavailable: {why}"));
@@ -1757,6 +1784,37 @@ impl TextComposer {
             }
         }
         stats.draws = layout.chars;
+        // 运行时取证(`YU_TEXT_TRACE=1`):本段排版实际画了哪些字形。
+        // 西文是比例宽(脚本逐字给 X/颜色),中文是等宽;缺字/前端丢失
+        // 必须先看这份列表才知道是"字形没进列表"还是"画到框外"。
+        if text_trace() {
+            eprintln!(
+                "[layouttrace] from={} to={} chars={} drawn={} missing={} origin=({},{})",
+                from,
+                to,
+                layout.chars,
+                stats.glyphs,
+                stats.missing,
+                layout.origin.0,
+                layout.origin.1
+            );
+            for (i, g) in layout.glyphs.iter().enumerate().take(to).skip(from) {
+                eprintln!(
+                    "[glyphtrace] i={i} bytes={:?} x={} y={} fg={:06X} bg={:06X} grad={} sx={} sy={} aa={} bold={} mode={}",
+                    String::from_utf8_lossy(&g.bytes),
+                    g.x,
+                    g.y,
+                    g.style.fg & 0x00FF_FFFF,
+                    g.style.bg & 0x00FF_FFFF,
+                    g.style.gradation,
+                    g.width,
+                    g.height,
+                    g.style.antialias,
+                    g.style.bold,
+                    g.draw_mode
+                );
+            }
+        }
         Ok(stats)
     }
 
@@ -1881,6 +1939,20 @@ impl TextComposer {
         images: &BTreeMap<Vec<u8>, Rc<Texture>>,
         resolve_base: impl FnOnce() -> Result<Rc<Texture>, String>,
     ) -> Result<(Option<ComposedLayer>, TextPaintStats), String> {
+        if layout.is_some() && !draws.is_empty() {
+            // 两条流共用一个表面。布局前缀相同并不代表手动绘制项也相同，
+            // 不能在上次布局上续画；按非缓存路径重放（先 draws, 后 layout）。
+            self.forget_compose_cache(layer);
+            let base = resolve_base()?;
+            let (texture, stats) = self.compose_layer_refs_assets(&base, draws, layout, images);
+            let composed = texture.map(|texture| ComposedLayer {
+                hash: content_hash_rgba(texture.width, texture.height, &texture.rgba),
+                texture: Rc::new(texture),
+                dirty: None,
+                prev_hash: None,
+            });
+            return Ok((composed, stats));
+        }
         if let Some(layout) = layout {
             // 已提交字形是 append-only(`'P'` 换页才清);尾部增长 = 逐字
             // 吐字,只补画新增部分。
@@ -2863,6 +2935,55 @@ mod image_glyph_tests {
         assert_eq!(&out.rgba[0..4], [0, 0, 0, 0], "图像外保持透明");
         assert_eq!(stats.glyphs, 1);
         assert!(!stats.diags.iter().any(|d| d.contains("missing")));
+    }
+
+    #[test]
+    fn mixed_layout_cache_preserves_image_prefix_across_replay() {
+        let mut composer = TextComposer::new();
+        let layer = LayerId::new(b"T".to_vec());
+        let base = Rc::new(Texture {
+            width: 8,
+            height: 4,
+            rgba: vec![0; 8 * 4 * 4],
+        });
+        // 自动布局目标已经存在但尚未提交字形,手动字形不得因此消失。
+        let layout = TextLayoutFrame {
+            target: Some(layer.clone()),
+            origin: (4, 0),
+            style: TextStyle::default(),
+            glyphs: Vec::new(),
+            line_height: 2,
+            chars: 0,
+            flags_source: yu_gfx::TextFlagsSource::TextFlag,
+        };
+        let images = BTreeMap::from([(
+            b"g".to_vec(),
+            Rc::new(Texture {
+                width: 2,
+                height: 2,
+                rgba: [255, 255, 255, 128].repeat(4),
+            }),
+        )]);
+        let head = image_draw(0, 0, None);
+        let tail = image_draw(2, 0, Some(0x4080ff));
+        let first = [&head][..].to_vec();
+        let both = [&head, &tail];
+        let (reference, _) =
+            composer.compose_layer_refs_assets(&base, &both, Some(&layout), &images);
+        let reference = reference.expect("uncached mixed surface");
+        assert_eq!(reference.rgba[3], 128, "prefix fixture must have ink");
+        for (rev, draws) in [(1, first.as_slice()), (2, both.as_slice()), (2, both.as_slice())] {
+            let (actual, _) = composer
+                .compose_layer_cached_assets(&layer, rev, 1, (8, 4), draws, Some(&layout), &images, || {
+                    Ok(Rc::clone(&base))
+                })
+                .expect("mixed surface");
+            let actual = actual.expect("baked");
+            assert_eq!(actual.texture.rgba[3], 128, "prefix dropped or double-painted");
+            if rev == 2 {
+                assert_eq!(actual.texture.rgba, reference.rgba);
+            }
+        }
     }
 
     #[test]

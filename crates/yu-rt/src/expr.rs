@@ -1158,7 +1158,13 @@ fn scan_literal_term(
                 tail.get(index + 1 - window.len()).copied()
             };
             if next.is_some_and(|trail| codec.is_trail(trail)) {
-                index += 2;
+                // 合法多字节字符整体跳过:宽度取该 codec 的真实字符宽度
+                // (UTF-8 为 3/4 字节;按 2 字节跳会把续字节当独立字节)。
+                let width = codec
+                    .next_char(window, index)
+                    .map_or(2, |(_, width)| width)
+                    .max(2);
+                index += width;
                 continue;
             }
         }
@@ -1708,6 +1714,43 @@ mod self_delimited_tests {
         assert_eq!(records.len(), strict.len());
         for (a, b) in records.iter().zip(&strict) {
             assert_eq!((a.op, &a.payload), (b.op, &b.payload));
+        }
+    }
+
+    #[test]
+    fn utf8_literal_is_preserved_at_every_window_tail_split() {
+        let text = "é終😀";
+        let mut payload = vec![b'"'];
+        payload.extend_from_slice(text.as_bytes());
+        payload.extend_from_slice(b"\\\"x\\\"!\"");
+        let mut raw = vec![0x4d];
+        raw.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        raw.extend_from_slice(&payload);
+        for split in 4..=raw.len() {
+            // 覆盖首字节/续字节跨界、整个字符在 tail、引号/转义跨界。
+            let (records, consumed) = decode_self_delimited(
+                &raw[..split], &raw[split..], yu_format::Codec::Utf8,
+            ).unwrap_or_else(|| panic!("split={split}"));
+            assert_eq!(consumed, raw.len(), "split={split}");
+            assert_eq!(records.len(), 1, "split={split}");
+            assert_eq!(records[0].payload, payload, "split={split}");
+            let decoded = decode_string_literal_with(&records[0].payload, yu_format::Codec::Utf8).unwrap();
+            assert_eq!(decoded, format!("{text}\"x\"!").as_bytes(), "split={split}");
+        }
+    }
+
+    #[test]
+    fn malformed_utf8_literal_keeps_bytes_and_ascii_terminator() {
+        for bytes in [b"\xe3".as_slice(), b"\xe3\x81", b"\xf0\x9f\x98", b"\xe3A", b"\xff"] {
+            let mut payload = vec![b'"'];
+            payload.extend_from_slice(bytes);
+            payload.push(b'"');
+            assert_eq!(
+                scan_literal_term(&payload, &[], 1, b'"', payload.len(), yu_format::Codec::Utf8),
+                Some(payload.len() - 1),
+            );
+            // 字面量定界不验证正文编码,也不丢弃非法字节。
+            assert_eq!(decode_string_literal_with(&payload, yu_format::Codec::Utf8).unwrap(), bytes);
         }
     }
 

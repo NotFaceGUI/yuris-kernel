@@ -311,6 +311,9 @@ pub struct CompositorFrame {
     pub layers: Vec<Arc<Layer>>,
     /// 绘制列表(只含可见/需要执行的 op)。
     pub passes: Vec<Pass>,
+    /// 已提交到常驻图层、因而未在本帧重发的图像命令前缀终点。
+    /// 只有持有同一表面的后端能从这个命令序号之后续写。
+    pub image_prefixes: BTreeMap<LayerId, u64>,
     /// 本帧待显示文本(跨帧文本缓冲的快照;DIV-GFX-034)。
     pub text: Vec<TextRun>,
     /// 自动文本层排版结果(`_TEXT_FLAG` 逐字步进;缺失 ⇒ `None`)。
@@ -378,6 +381,7 @@ impl CompositorFrame {
             windows: Vec::new(),
             layers: Vec::new(),
             passes: Vec::new(),
+            image_prefixes: BTreeMap::new(),
             text: Vec::new(),
             text_layout: None,
             text_draws: std::sync::Arc::from(Vec::new()),

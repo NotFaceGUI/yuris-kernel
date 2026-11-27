@@ -474,13 +474,7 @@ fn apply_image_op(
     if image.action.is_layer_composite() {
         let dx = image.x.map_or(0, |v| v.round() as i64);
         let dy = image.y.map_or(0, |v| v.round() as i64);
-        // 下层 = 目标层当前表面(`st.texture_overrides` 是同帧加工结果)。
-        // 官方的合并执行体只把上层“画”进这块表面、不读它的旧像素;
-        // 清空后是否可见取决于 alpha 的混合口径(见 `apply_merge` 的注释)。
-        let mut lower = match st.texture_overrides.remove(target) {
-            Some(t) => Rc::try_unwrap(t).unwrap_or_else(|rc| (*rc).clone()),
-            None => base_texture(textures, snapshots, frame, target, target_fallback, image.target_base.as_ref(), None)?,
-        };
+        // 先解析上层；缺资产时不能取走下层已经合成的像素。
         let upper = layer_surface(
             textures,
             snapshots,
@@ -489,6 +483,10 @@ fn apply_image_op(
             st,
             image.source_texture.as_ref(),
         )?;
+        let mut lower = match st.texture_overrides.remove(target) {
+            Some(t) => Rc::try_unwrap(t).unwrap_or_else(|rc| (*rc).clone()),
+            None => base_texture(textures, snapshots, frame, target, target_fallback, image.target_base.as_ref(), None)?,
+        };
         let upper = crate::texture::Texture {
             width: upper.width,
             height: upper.height,
@@ -1021,15 +1019,25 @@ fn apply_copy_op(
             }
         }
         CopySource::Group(id) => compose_group(textures, snapshots, frame, id, st)?,
+        CopySource::Layer(_) if copy.has_frozen_empty_source() => Surface::new(1, 1, SOLID_EMPTY),
         CopySource::Layer(id) => {
-            let mut surface = layer_surface(
+            let mut surface = match layer_surface(
                 textures,
                 snapshots,
                 frame,
                 id,
                 st,
                 copy.source_texture.as_ref(),
-            )?;
+            ) {
+                Err(reason) if copy.blank_if_source_missing
+                    && copy.texts.is_empty()
+                    && matches!(copy.source_texture, Some(TextureRef::Asset(_)))
+                    && reason == yu_render_core::texture::code::MISSING =>
+                {
+                    Surface::new(1, 1, SOLID_EMPTY)
+                }
+                result => result?,
+            };
             if !copy.texts.is_empty() {
                 compose_copy_texts(textures, &mut surface, copy, st);
             }
@@ -1316,21 +1324,15 @@ fn layer_surface(
     );
     // 文本覆盖纹理不作为 COPY 源(DIV-GFX-058):快照面 = 基图(+图像加工)
     // + `copy.texts` 在命令时刻冻结的文本,不带帧末实时文本。
-    if !replaced {
+    // 旧 COPY 快照上的加工可能刚按序重放；只接受同一快照的加工结果。
+    if !replaced || matches!(fallback, Some(TextureRef::Snapshot(_))) {
         if let Some(texture) = st
             .texture_overrides
             .get(id)
             .filter(|_| !st.text_override_ids.contains(id))
         {
-            // override 必须属于**命令时刻的同一基面**。同名层被
-            // `CG[FILE]` 逐槽复用时,上一槽的 override 基面与当前
-            // `source_texture` 不同,不能拿来当 COPY 源(否则 hover/
-            // 缩略图显示上一张 CG)。
             let provenance_ok = match fallback {
-                Some(fallback) => st
-                    .override_bases
-                    .get(id)
-                    .is_none_or(|base| base == fallback),
+                Some(fallback) => st.override_bases.get(id).map_or(!replaced, |base| base == fallback),
                 None => true,
             };
             if provenance_ok {
