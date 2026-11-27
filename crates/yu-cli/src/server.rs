@@ -56,7 +56,7 @@ pub struct ServeOptions {
     pub font_arg: Option<String>,
     /// `--font` 强制锁(旧行为;默认 false = 宿主默认字体可被游戏内切换)。
     pub font_lock: bool,
-    /// 文本编码路线(`auto|original|gbk|tunnel`)。
+    /// 文本编码路线(`auto|original|gbk|big5|cp949|cp1252|utf8|tunnel`)。
     pub patch: yu_engine::patch::PatchKind,
     /// 运行时翻译文件(`translate.json`;`None` = 不装载)。
     pub translate: Option<PathBuf>,
