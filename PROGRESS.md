@@ -18764,3 +18764,178 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
 - 实机复核限制:0.481 样本在既有存档/首次启动标志之后,headless 400/2000 帧
   不再自动走到 `es_charname` 场景;0.554 的 `es_sprite` 需要桌面交互才触发。
   两条修复由 RE 证据 + 单测/fixture 锁定,实机路径待下一轮桌面测试确认。
+
+## 成果 GFX-GLYPH-CHAIN-RECLAIM (2026-11-27) · 抠格字形链降级后精确回收日志
+
+- 英文位图逐字(`COPY2` 抠格 → `MEIDO` → `MERGE`)每字在 `copy_log` 留一条
+  永久死项:下一次抠格重绑暂存层后旧快照已无人读,但日志只由 `CGEND`/
+  `CG[FILE]` 清理 ⇒ 随字数线性增长,`snapshot_readers`/`prune_copy_log`/
+  `frame()` 的 O(日志) 扫描跟着变贵;到 `MAX_OP_LOG=16384` 时
+  `drain(..half)` 还会连活场景的快照生产者一起丢。这是「英文推进到固定点
+  闪退、中文不闪」的结构性差异(中文走 TEXT/TextRun,不产生这条链)。
+- `yu-gfx`:`GlyphChain` 记录本链 `COPY2`/`MEIDO` 序号与「已降级」标记;
+  下一次抠格命中同一暂存层时,先按与 `prune_copy_log` 同口径的读者判定
+  (其它复制/图像 `source_texture`、除 `dest` 外的活层、屏幕快照纹理依赖)
+  确认无人可观察,再从日志精确删除旧 `COPY2`/`MEIDO` 并回收快照元数据。
+  有读者时保持现状(宁可多留,不能少留);不改日志上限、不改默认关闭的
+  `YU_GFX_COMPACT_IMAGE_LOG`、不消费 `MERGE` 的像素语义。证据锚点:
+  `DIV-GFX-098`(换图回放边界)、`EVID-T-15`(COPY 命令时刻立即执行)。
+- `wgpu`:`asset_identity_base` 从 `frame.layers` 线性查找改走 `layer_index`
+  哈希索引(与既有 `layer_index` 一致),文本合成不再按层数线性比较 `LayerId`。
+- 新增回归 `v555_glyph_chain_reclaims_dead_copies_but_keeps_readers`:
+  200 轮重复抠格后 `copies().len() == 1`(回收前为每条链各一条,共 201);
+  中间有别的层从暂存层 `COPY2` 时必须保留旧链。
+- `cargo test --offline -p yu-gfx --test text_pipeline`:`19 passed; 0 failed`。
+- `cargo test --offline -p yu-gfx --test group --test copy_missing`:
+  `25 passed` / `3 passed`,0 失败。
+- `cargo test --offline -p yu-backend-wgpu --test surfaces --test wgpu --test screen_surface`:
+  `44 passed` / `40 passed` / `3 passed`,0 失败(含
+  `scratch_file_reset_does_not_undo_finished_glyph_merges` 的 Soft/WGPU
+  逐像素对比,该用例本身就覆盖多轮抠格链)。
+- `cargo build --offline --workspace --all-targets`:Finished(仅 `probe_mpg`
+  示例的既有 `unused_mut` 警告)。
+- 未做:真机英文/中文 p50/p95/p99 复测(本轮无设备);`SIZE2` 整图形态链的
+  `MEIDO` 回收未纳入(无 `copy_id`,待按同一读者判定单独补)。
+
+## 成果 GFX-LOG-INDEX (2026-11-27) · 日志读者/规模索引,砍掉每命令的 O(日志) 扫描
+
+- `yu-gfx`:`snapshot_reads`(`CopyId → 有序 seq 多重集`,只计 `Executable`
+  且 `source_texture == Snapshot`)取代 `snapshot_readers()` 的整份日志重扫;
+  活层与当帧屏幕快照仍补 `u64::MAX`。`image_target_counts` /
+  `copy_dest_counts`(目标层 → 项数)给三条热路径做 O(1) 早退:
+  `prune_rebound_image_ops`(每条 `COPY2` 一次,目标层无加工项时不再扫日志)、
+  `drop_ops_for` 的两遍 `prune_copy_log` 与图像 retain(`CGEND` 每帧上千次)、
+  `reclaim_glyph_chain` 的读者判定。
+- 维护点收口:`push_copy_log`/`push_image_log` 登记;单条删除
+  (`supersede_image_op`、`reclaim_glyph_chain`)递减;批量
+  (retain/drain/compact)统一 `rebuild_log_indices()`。命令序与 `CopyId`
+  递增约定不变。
+- 旧全扫描保留为 `debug_assertions` 下的 oracle(`scan_snapshot_readers`),
+  所有 debug 测试自动逐项比对索引,防止漏维护。
+- `cargo test --offline -p yu-gfx`(debug,oracle 生效):各 test binary 全绿
+  (`text_pipeline` 19 / `group` 25 / `copy_missing` 3 / `parity_fixes` 47 …)。
+- `cargo test --offline -p yu-backend-wgpu --test surfaces`:`44 passed`。
+- `cargo build --offline --release -p yu-cli` 通过;新二进制已用于
+  SACRIFICE VILLAINS 真机复跑(带 `--debug-ui --tick-split --spike-log`)。
+- 未做:本轮未取得 Skip 复现数据,`imgacts`/`logs`/`ticksplit` 已就位待下一
+  次复现;`MergePatches` 安全区段与文本合成整层 clone 仍未动。
+
+## 成果 GFX-FNTTMP-CHAIN (2026-11-27) · `_fnttmp` 整图字形链降级,逐字不再走独立纹理 pass
+
+- 真机 spike 取证(SACRIFICE VILLAINS,0.481,`--spike-log --spike-ms 15`):
+  每帧 `imgacts=meido:376,merge:376`,`top=` 前三为
+  `BT.OFF…TIP.MESW.TX`/`_fnttmp1`/`_fnttmp2`,`logs=image:780 copy:387`,
+  `work=50~88ms tick=31~46ms render=16~29ms`。即英文逐字链
+  `COPY/COPY2(整图) → MEIDO → MERGE` **没有降级**,每字三条独立纹理 pass
+  (申请表面 + 建 bind group + blit),与中文的排版字形(一次 paint)相差一个量级。
+- `yu-gfx`:新增 `derive_glyph_chain` —— 在 MERGE 处从日志反推同一条数据流:
+  暂存层当前纹理 = 某条可执行复制的快照,复制来自单资产层、复制后只允许
+  原地 `MEIDO`;单元取复制区域(含端点),整图复制取资产尺寸。不看复制是否
+  带区域、也不要求目标声明过尺寸(`_fnttmp` 形态两条都不满足,抠格候选建不
+  起来)。只接受源/目标 alpha 均为 256 的盖章。降级后 MERGE 变成
+  `TextDraw::image`,由文本合成器一次画完。
+- 回收:重绑暂存层时先 `reclaim_glyph_chain`(现查读者索引),旧
+  `COPY+MEIDO` 无读者即精确删除;日志不再随字数增长。
+- `wgpu`:修复 `set_content` 覆盖层表面时未失效文本合成缓存 —— 图像加工
+  写回原始面后,旧 `text_rev/sig/raw_hash` 仍被当成“已合成文本”,命中路径
+  会把原始面当结果返回,整层文字被抹掉。现清零并丢弃旧 `raw`。
+- 回归:`fnttmp_whole_asset_chain_lowers_and_reclaims`(50 轮:50 条绘制项、
+  `copy_log=1`、`image_log<=2`);`scratch_file_reset_does_not_undo_finished_glyph_merges`
+  补资产尺寸后走降级路径,Soft/WGPU 逐像素仍一致(1×1 墨点 + tint + 缺源空复制)。
+- `cargo test --offline -p yu-gfx`(debug oracle 生效)全绿;
+  `cargo test --offline -p yu-backend-wgpu --test surfaces`:`44 passed`。
+- 已用新 release 重跑真机(带 `--debug-ui --tick-split --spike-log`),待下次
+  spike 复核 `imgacts` 是否从 376 降到个位数;未达到则说明该作只读层不在
+  `_fnttmp` 形态内,按新 spike 的 `top/acts` 继续。
+
+## 成果 GFX-FNTTMP-CHAIN-2 (2026-11-27) · 字形候选改复制时刻建立,MERGE 只查表
+
+- 上一版在 MERGE 处用 `derive_glyph_chain` 倒扫日志,真机 spike 仍见
+  `meido:482 merge:482`(`_fnttmp1/2`):0.481 的暂存层 `CG[FILE=""]`
+  **没有声明 `SX/SY`**,抠格候选的「目标尺寸 ≤4096 或已知」门禁把它拒了。
+- `yu-gfx`:`glyph_cell_candidate` 改在 `COPY/COPY2` 时刻建立候选:
+  - 区域形态:单元 1..=512 自带边界,不再要求目标声明尺寸;
+  - 整图形态(无区域):目标必须不可见、资产 ≤512² 且尺寸已知;
+  - 源必须是单资产层、命令时刻无已画文本;目标存在、非组、空/已知。
+  `MEIDO` 只更新 tint(与 `meido_seq`),`MERGE` 只查表并按 src/dst
+  alpha==256 放行;`derive_glyph_chain` 整体删除,逐字不再扫图像历史。
+- 半透明盖章仍走普通图像加工(文本合成器是 src-over,与 `MERGE` 的
+  混色公式不同,不塞进 `TextImage`)。
+- 测试:`text_pipeline` 20 / `group` 25 / `copy_missing` 3 全绿;
+  `surfaces` 44 全绿;`wgpu` 39 passed +1 复跑通过
+  (`diffusion_permutes...` 首跑受同机游戏进程占用 GPU 影响,单跑通过)。
+- 已重建 release 并重跑真机(`--debug-ui --tick-split --spike-log`);
+  复核指标:`imgacts` 应从每帧 482/376 降到个位数、`logs=image` 同步下降。
+
+## 成果 GFX-CHAIN-DERIVE-3 (2026-11-27) · 字形链在 MERGE 处 O(1) 反推
+
+- 真机复跑仍未降级(`imgacts=meido:482,merge:482`,`_fnttmp1/2`):复制形态
+  不满足候选门禁(暂存层可能先用真实换图创建 ⇒ 非空;或整图形态尺寸/可见性
+  不命中)。不再靠单点门禁猜:在 MERGE 处按数据流反推。
+- `yu-gfx`:新增 `layer_tail`(`每层 last_non_meido_seq` + `last_meido(seq,tint)`),
+  `push_image_log` 维护、单条删除保守清理、批量路径重建。
+  `derive_chain_from_copy(dest)`:
+  - 目标层当前纹理是 `Snapshot(c)`,`c` 在 `copy_log` 里**二分查找**;
+  - 复制可执行、`dest` 一致、`Copy/Copy2`、未冻结文本、源是单资产;
+  - `last_non_meido_seq <= copy.seq`(复制之后没有其它写入);
+  - 单元取复制区域;整图取 `snapshot_sizes`/`asset_sizes`;
+  - tint/`meido_seq` 取 `last_meido`(必须晚于复制)。
+  命中即插入链并走既有降级(alpha==256、MERGE→TextDraw::image)。
+  失败只留一条预算内的 `PERF` 诊断(每会话最多 8 条)打印拒绝原因。
+- 新增回归 `glyph_chain_derives_at_merge_when_copy_candidate_misses`:
+  暂存层先有非空纹理、抠格候选拒绝,MERGE 仍降级(绘制项 asset/x/y 正确)。
+- `cargo test --offline -p yu-gfx`:全绿(`text_pipeline` 21);`surfaces` 44 全绿。
+- 已重建 release 并重跑真机;spike5 若仍见 meido/merge 逐字,`sacrifice-live5.jsonl`
+  会直接给出拒绝原因,按原因收口。
+
+## 成果 GFX-CHAIN-NATURAL-SIZE (2026-11-27) · 整图字形按资产自然尺寸降级
+
+- 真机一次性诊断(`sacrifice-live5.jsonl`)给出拒绝原因:
+  `字形链推导未命中 :/W0/_fnttmp1: size unknown` —— 复制是**整图**,
+  源资产没有在 gfx 侧登记尺寸(`asset_sizes` 缺失),旧实现直接拒。
+- `yu-gfx`:`derive_chain_from_copy` 的整图分支在尺寸未知时改用
+  `width/height = 0`;文本合成器已约定 `0` = 按**资产解码后的自然尺寸**
+  绘制(`paint_draw_refs_assets`:width==0 ⇒ 取 cell 尺寸),不需要 gfx 猜。
+  显式区域仍要求非零。测试改为不注入资产尺寸,断言
+  `image.width/height == 0` 且降级生效。
+- `cargo test --offline -p yu-gfx --test text_pipeline`:`21 passed`(含
+  `glyph_chain_derives_at_merge_when_copy_candidate_misses`)。
+- 已重建 release 并重跑真机;复核指标同上(`imgacts`/`logs=image`)。
+
+## 成果 GFX-CHAIN-SNAPSHOT-SRC (2026-11-27) · 字形链源支持快照(上一跳复制)
+
+- 真机 `sacrifice-live6.jsonl` 剩余拒绝原因:
+  `字形链推导未命中 :/W0/_fnttmp1: source texture not asset`(4 条,预算内)。
+  即 `_fnttmp*` 的复制源本身是**上一跳快照**(字形页先被复制到缓冲)。
+- `yu-gfx`:`derive_chain_from_copy` 的源分四种:
+  资产+整图(尺寸未知用 `0×0` 自然尺寸)、资产+区域(单元)、
+  快照+整图(沿 `snapshot_files` 取回原始资产键,`snapshot_origins` +
+  `snapshot_display_size` 还原采样单元)、快照+区域(暂不支持,交回普通加工)。
+- `cargo test --offline -p yu-gfx --test text_pipeline --test group`:
+  `21 + 25 passed`。
+- 已重建 release 并重跑真机;上一版真机指标已从 `meido:482 merge:482 /
+  logs=image:1471` 降到 `meido:66 merge:64 / logs=image:155`,本轮目标是把
+  剩余 66/64 也降到个位数。
+- 真机同时暴露另一类尖峰:`tick=94.6ms render=2.1ms ops=970996`(脚本一次
+  泵入近百万条命令)—— 属 VM 吞吐/时间片,不是渲染;若后续仍卡,下一刀是
+  skip 时给 VM 设每帧时间片(需先确认官方 skip 的推进节奏)。
+
+## 成果 GFX-CHAIN-ASSET-LAYER (2026-11-27) · 0.555 `FONTCG` 单资产直贴降级
+
+- 黑兽2改(0.555)真机 spike:每帧 `imgacts=merge:149~275`,
+  源层 `:/W0/FONTCG.L2.*` 的拒绝原因 `dest texture not snapshot` ——
+  该作是「每字一个资产纹理层 → 原地 `MEIDO` → 直接 `MERGE` 正文」,
+  没有中间复制;旧识别只覆盖 COPY 形态。
+- `yu-gfx`:新增 `derive_chain_from_layer_asset`(MERGE 处 O(1)):
+  源层纹理是资产、**不可见**、`last_non_meido_seq == 0`、**有原地 MEIDO**
+  → 降级为 `TextImage { asset, cell: None, width/height: 0(自然尺寸), tint }`。
+  不看层名,不扫日志。`CG[FILE]` 换图时清 `layer_tail`,避免上一生命周期
+  的 tint 被当成证据。
+- 门禁收窄的依据:首版只按「资产 + alpha 256」放行,误伤了普通
+  `MERGE/MERGE2` 合成(5 条 surfaces/wgpu 用例失败);普通合成的混色公式是
+  后端各自的实现,不能当字形处理。现在要求「不可见 + 有 MEIDO」,
+  `merge2_matches_soft` / `merge_patches_*` / `acknowledged_prefix_*` /
+  `layer_composite_actions_write_to_id2` 全部恢复。
+- 新增回归 `asset_layer_glyph_chain_lowers_per_char_tint`(资产/tint/落点/
+  自然尺寸);`text_pipeline` 22、`group` 25、`surfaces` 44、`wgpu` 40 全绿。
+- 已重建 release 并重跑黑兽2改;spike2 复核 `merge:` 计数。
