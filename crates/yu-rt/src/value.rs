@@ -320,12 +320,24 @@ impl Value {
         Ok(!self.eq(rhs)?)
     }
 
-    /// 排序比较。仅数值;字符串排序未取证 → `VAR_TYPE`。
+    /// 排序比较用的数值槽。
+    ///
+    /// 字符串按 **0** 参与:官方 `FUN_0042894c`(`0x42894c`)把字符串压进
+    /// 表达式栈时,64 位数值槽 `0x7b41c0/0x7b41c4` 两半都清零,类型标签
+    /// `0x7b91c2` 只写字符串池索引;`<`/`>`/`<=`/`>=` 处理体
+    /// (`0x429244`/`0x4291a8`/`0x429374`/`0x4292dc`)只读数值槽、没有
+    /// 字符串分支。因此 `$name < 8192` 在官方是 `0 < 8192`。
+    fn ordering_number(&self) -> f64 {
+        match self {
+            Value::Int(v) => *v as f64,
+            Value::Float(v) => *v,
+            Value::Str(_) => 0.0,
+        }
+    }
+
+    /// 排序比较。数值口径;字符串取 [`Self::ordering_number`] 的 0。
     fn cmp(&self, rhs: &Value) -> Result<std::cmp::Ordering, yu_log::Diag> {
-        let (a, b) = match (self.as_f64(), rhs.as_f64()) {
-            (Some(a), Some(b)) => (a, b),
-            _ => return Err(type_mix("compare", self, rhs)),
-        };
+        let (a, b) = (self.ordering_number(), rhs.ordering_number());
         Ok(match a.partial_cmp(&b) {
             Some(o) => o,
             None => std::cmp::Ordering::Greater,
@@ -450,14 +462,29 @@ fn format_float(v: f64) -> String {
 }
 
 fn type_mix(op: &str, a: &Value, b: &Value) -> yu_log::Diag {
+    // 带上实际操作数:只报类型名时,字符串是数字、空串还是名字无从判断,
+    // 取证和复现都得回脚本重跑。
+    fn show(value: &Value) -> String {
+        match value {
+            Value::Int(v) => v.to_string(),
+            Value::Float(v) => format!("{v:?}"),
+            Value::Str(bytes) => {
+                let head = &bytes[..bytes.len().min(32)];
+                let text: String = head
+                    .iter()
+                    .map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '.' })
+                    .collect();
+                format!("STR(len={} \"{}\")", bytes.len(), text)
+            }
+        }
+    }
     diag::unimplemented(
         code::rt::VAR_TYPE,
         Boundary::Script,
         format!(
-            "{op} 两侧类型不支持:{} {} {}(引擎读时转换细节未取证;DIV-RT-002)",
-            a.type_name(),
-            op,
-            b.type_name()
+            "{op} 两侧类型不支持:{} {op} {}(引擎读时转换细节未取证;DIV-RT-002)",
+            show(a),
+            show(b)
         ),
     )
 }
@@ -1191,6 +1218,23 @@ mod tests {
             Value::Str(b"  ".to_vec()).cast_to_int().unwrap(),
             Value::Int(0)
         );
+    }
+
+    /// 字符串参与排序比较时按官方数值槽 0(`FUN_0042894c` `0x42894c`)。
+    #[test]
+    fn string_ordering_uses_official_numeric_zero() {
+        let name = Value::Str(b"\x83\x6c\x83\x93".to_vec());
+        assert!(name.lt(&Value::Int(8192)).unwrap());
+        assert!(!name.gt(&Value::Int(8192)).unwrap());
+        assert!(name.le(&Value::Int(8192)).unwrap());
+        assert!(!name.ge(&Value::Int(8192)).unwrap());
+        // 反向:8192 > "名前" 成立。
+        assert!(Value::Int(8192).gt(&name).unwrap());
+        // 两个字符串的数值槽都是 0:`<=`/`>=` 成立,严格序不成立。
+        let other = Value::Str(b"abc".to_vec());
+        assert!(!name.lt(&other).unwrap());
+        assert!(name.le(&other).unwrap());
+        assert!(name.ge(&other).unwrap());
     }
 
     #[test]
