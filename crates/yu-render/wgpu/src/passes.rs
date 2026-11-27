@@ -429,7 +429,7 @@ impl Planner<'_> {
         }
         let sa = shader_alpha(layer.alpha) as f32;
         // 内容自身的显示尺寸(`SIZE` 的浮点目标)与采样窗。
-        let (draw_w, draw_h) = match self.contents.get(&layer.id) {
+        let (draw_w, draw_h) = match self.contents.for_layer(&layer.id, &layer.texture) {
             Some(content) => match content.display {
                 Some((w, h)) => (w, h),
                 None => (f64::from(width), f64::from(height)),
@@ -556,7 +556,8 @@ impl Planner<'_> {
         }
 
         // 常驻内容:直接画(采样窗用 UV;显示尺寸用 `SIZE` 的浮点目标)。
-        if let Some(content) = self.contents.get(&layer.id).cloned() {
+        // 只认基面仍是该层当前纹理的内容:旧快照版本仅供命令时刻读者。
+        if let Some(content) = self.contents.for_layer(&layer.id, &layer.texture).cloned() {
             if content.width == 0 || content.height == 0 {
                 self.skip(op, "layer.size.zero");
                 return Ok(());
@@ -791,7 +792,9 @@ impl Planner<'_> {
         fallback: &TextureRef,
     ) -> Result<(u64, u32, u32, [f32; 4], wgpu::TextureView), String> {
         if let Some(id) = id {
-            if let Some(content) = self.contents.get(id).cloned() {
+            // 常驻内容必须是命令时刻纹理的版本;换图后旧内容不能被当作
+            // 过渡输入(否则淡出的是上一张图)。
+            if let Some(content) = self.contents.for_layer(id, fallback).cloned() {
                 return Ok((
                     content.tex.id,
                     content.tex.width,
@@ -800,7 +803,7 @@ impl Planner<'_> {
                     content.tex.view.clone(),
                 ));
             }
-            return match self.layer_image(id, None) {
+            return match self.layer_image(id, Some(fallback)) {
                 Ok((tex_id, width, height)) => {
                     let view = self
                         .view_of(tex_id)
@@ -844,16 +847,22 @@ impl Planner<'_> {
         id: &LayerId,
         fallback: Option<&TextureRef>,
     ) -> Result<(u64, u32, u32), String> {
-        if let Some(content) = self.contents.get(id) {
-            return Ok((content.tex.id, content.width, content.height));
+        // 命令时刻身份匹配才用常驻内容;换图后的旧内容改走纹理引用解析。
+        let identity_ok = fallback.is_none_or(|base| self.contents.base_matches(id, Some(base)));
+        if identity_ok {
+            if let Some(content) = self.contents.get(id) {
+                return Ok((content.tex.id, content.width, content.height));
+            }
         }
         let layer = self.layers.get(id).copied();
         if layer.is_some_and(|layer| layer.is_group()) {
             return self.group_image(id);
         }
-        let texture = match layer {
-            Some(layer) => &layer.texture,
-            None => fallback.ok_or_else(|| "gfx.copy.source.gone".to_string())?,
+        // 身份不符时只用命令时刻纹理:活层此时已经是换图后的新生命周期,
+        // 读它会拿到新图(过渡淡出的就不是源图了)。
+        let texture = match (identity_ok, layer) {
+            (true, Some(layer)) => &layer.texture,
+            _ => fallback.ok_or_else(|| "gfx.copy.source.gone".to_string())?,
         };
         if matches!(texture, TextureRef::None) {
             return Err("gfx.copy.source.texture_none".to_string());

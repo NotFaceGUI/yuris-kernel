@@ -4814,8 +4814,52 @@ impl GfxState {
                 .any(|copy| &copy.dest == dest && copy.status == OpStatus::Executable)
     }
 
+    /// 本帧仍会执行的命令对快照的读取(每个快照最后一次读取的 `seq`)。
+    ///
+    /// 图像命令与复制命令**同等对待**:`COPY/COPY2` 是唯一读者时,旧快照上
+    /// 的着色前缀同样必须保留到那次复制之后。活层当前纹理与本帧屏幕快照
+    /// 记 `u64::MAX`(整个帧内都算读,不因稍后的重置而丢失)。
+    fn snapshot_readers(&self) -> rustc_hash::FxHashMap<CopyId, u64> {
+        let mut reads = rustc_hash::FxHashMap::<CopyId, u64>::default();
+        {
+            let mut note = |id: CopyId, seq: u64| {
+                let slot = reads.entry(id).or_default();
+                *slot = (*slot).max(seq);
+            };
+            for op in &self.image_log {
+                if op.status != OpStatus::Executable {
+                    continue;
+                }
+                if let Some(TextureRef::Snapshot(id)) = op.source_texture {
+                    note(id, op.seq);
+                }
+            }
+            for copy in &self.copy_log {
+                if copy.status != OpStatus::Executable {
+                    continue;
+                }
+                if let Some(TextureRef::Snapshot(id)) = copy.source_texture {
+                    note(id, copy.seq);
+                }
+            }
+            for node in self.nodes.values() {
+                if let TextureRef::Snapshot(id) = node.layer.texture {
+                    note(id, u64::MAX);
+                }
+            }
+            if !self.screen_snapshots.is_empty() {
+                for (id, snapshot) in &self.screen_snapshots {
+                    if snapshot.frame == self.frame {
+                        note(*id, u64::MAX);
+                    }
+                }
+            }
+        }
+        reads
+    }
+
     /// 重绑当前表面不会撤销已经写到其它层的快照合成。
-    /// 只保留有跨层读者的旧快照加工前缀，不把它当作新表面的像素。
+    /// 只保留有读者的旧快照加工前缀，不把它当作新表面的像素。
     fn prune_rebound_image_ops(
         &mut self,
         dest: &LayerId,
@@ -4837,26 +4881,9 @@ impl GfxState {
                 &op.source != dest || target == dest || snapshot.is_some()
             });
         }
-        let mut reads = rustc_hash::FxHashMap::<CopyId, u64>::default();
-        for op in &self.image_log {
-            let target = op.target.as_ref().unwrap_or(&op.source);
-            if target != &op.source && op.status == OpStatus::Executable {
-                if let Some(TextureRef::Snapshot(id)) = op.source_texture {
-                    reads.insert(id, op.seq);
-                }
-            }
-        }
-        // COPY 本身也可能引用已加工的旧快照；回收时不能删掉它的输入。
-        if !released.is_empty() {
-            for copy in &self.copy_log {
-                if let Some(TextureRef::Snapshot(id)) = copy.source_texture {
-                    if released.contains(&id) && copy.status == OpStatus::Executable {
-                        let read = reads.entry(id).or_default();
-                        *read = (*read).max(copy.seq);
-                    }
-                }
-            }
-        }
+        // 读者表在删掉「写入目标层」的跨层合成之后再算：被删的读不再
+        // 保护前缀，否则会留下没有生产者的悬空快照。
+        let reads = self.snapshot_readers();
         self.image_log.retain(|op| {
             let target = op.target.as_ref().unwrap_or(&op.source);
             let base = op.target_base.as_ref().map(|base| &base.texture);
@@ -4864,7 +4891,7 @@ impl GfxState {
                 let Some(TextureRef::Snapshot(id)) = base else {
                     return true;
                 };
-                if target != &op.source || !released.contains(id) || reads.contains_key(id) {
+                if target != &op.source || reads.contains_key(id) {
                     return true;
                 }
                 return self.nodes.get(target).is_some_and(|node| node.layer.texture == TextureRef::Snapshot(*id));
@@ -4872,6 +4899,9 @@ impl GfxState {
             matches!(base, Some(TextureRef::Snapshot(id))
                 if reads.get(id).is_some_and(|&read| op.seq < read))
         });
+        // 只回收「已没有任何读者」的快照生产者；仍被图像/复制命令或活层
+        // 引用的快照交给 `prune_copy_log` 的不动点保护。
+        released.retain(|id| !reads.contains_key(id));
         released
     }
 
@@ -5041,6 +5071,17 @@ impl GfxState {
         };
         // 覆写前目标层纹理:源快照在帧末不可物化时回退(见 CopyOp 字段注释)。
         let dest_texture_before = self.nodes.get(dest).map(|n| n.layer.texture.clone());
+        // 缺源空替代沿用目标原有尺寸:官方 `FUN_0042f809` 会按源表面重写目标
+        // 矩形,但源不存在,不能凭空造一个 1×1 表面把目标尺寸改小。
+        let blank_size = if source_missing && blank_if_source_missing {
+            self.nodes.get(dest).and_then(|node| {
+                let width = u32::try_from(self.query_layer_size(&node.layer, true).ok()?).ok()?;
+                let height = u32::try_from(self.query_layer_size(&node.layer, false).ok()?).ok()?;
+                (width > 0 && height > 0).then_some(SizeU32 { width, height })
+            })
+        } else {
+            None
+        };
         self.push_copy_log(CopyOp {
             seq,
             id: copy_id,
@@ -5145,6 +5186,12 @@ impl GfxState {
                     })
                 }
             };
+        }
+        // 缺源空替代:源层不存在,拿不到源表面尺寸。保留目标原有矩形与
+        // 身份(透明像素不变),不让 1×1 的像素面把 `CGINFO[SX/SY]` 与后续
+        // `MERGE` 范围一起改小。见 DIV-GFX-098 的缺源复制条目。
+        if source_missing && blank_if_source_missing {
+            snap_size = blank_size;
         }
         // `COPY/COPY2` 局部区域:官方 `FUN_0042f809` 在动作执行后**无条件**
         // 把目标 `+0x78/+0x7c` 写成 `X2-X+1 / Y2-Y+1`(区域尺寸),COPY 的

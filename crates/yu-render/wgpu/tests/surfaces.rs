@@ -49,6 +49,10 @@ fn table() -> ParamTable {
                 ],
             ),
             command(
+                "CGINFO",
+                &["ID", "EXIST", "E", "A", "X", "Y", "SX", "SY", "MFILE", "NUM"],
+            ),
+            command(
                 "CGACT",
                 &[
                     "ID",
@@ -1590,6 +1594,166 @@ fn scratch_file_reset_does_not_undo_finished_glyph_merges() {
             }
         }
     }
+}
+
+/// `COPY2` 作为旧快照的**唯一**读者时,着色前缀必须留到那次复制之后。
+///
+/// 序列:`COPY2 SRC→TMP` → `MEIDO TMP` → `COPY2 TMP→OUT` → `CG[TMP FILE=""]`。
+/// 旧实现只统计跨层图像读者,`MEIDO` 被换图清掉,`OUT` 读到未着色墨水。
+#[test]
+fn copy_only_reader_keeps_tinted_prefix() {
+    let table = table();
+    let entries = [
+        (b"base.png".as_slice(), png_bytes_for(4, 2, Rgba([0, 0, 0, 255]))),
+        (b"ink.png".as_slice(), png_bytes_for(1, 1, Rgba([200, 160, 120, 255]))),
+    ];
+    let strval = |bytes: &[u8]| Value::Str(bytes.to_vec());
+    let cg = |frame, id: &[u8], file: &[u8], visible| {
+        call(frame, "CG", vec![
+            arg(&table, "CG", "ID", strval(id)),
+            arg(&table, "CG", "FILE", strval(file)),
+            arg(&table, "CG", "E", Value::Int(visible)),
+        ])
+    };
+    let action = |frame, source: &[u8], dest: Option<&[u8]>, name, mut args: Vec<ArgValue>| {
+        args.push(arg(&table, "CGACT", "ID", strval(source)));
+        if let Some(dest) = dest {
+            args.push(arg(&table, "CGACT", "ID2", strval(dest)));
+        }
+        args.push(arg(&table, "CGACT", name, Value::Int(1)));
+        call(frame, "CGACT", args)
+    };
+    let mut gpu = renderer_or_skip(store(&entries));
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(4, 2), [0, 0, 0, 255]);
+    let mut live = state(Viewport::new(4, 2), [0, 0, 0, 255]);
+    let events = [
+        VmEvent::FrameStart { frame: 1 },
+        cg(1, b"OUT", b"base", 1),
+        cg(1, b"SRC", b"ink", 0),
+        cg(1, b"TMP", b"", 0),
+        action(1, b"SRC", Some(b"TMP"), "COPY2", vec![]),
+        action(1, b"TMP", None, "MEIDO", vec![arg(&table, "CGACT", "SET", Value::Int(0x408040))]),
+        action(1, b"TMP", Some(b"OUT"), "COPY2", vec![]),
+        cg(1, b"TMP", b"", 0),
+        VmEvent::FrameEnd { frame: 1 },
+    ];
+    gfx.consume_events(&events);
+    live.consume_events(&events);
+    let expected = [100, 160, 60, 255];
+    assert_eq!(pixel_of(&soft.render_frame(&gfx.frame()).surface, 0, 0), expected, "soft");
+    if let Some(gpu) = gpu.as_mut() {
+        let output = gpu.render_frame(&live.frame()).expect("gpu render");
+        assert_eq!(pixel_of(&output.surface, 0, 0), expected, "gpu");
+    }
+}
+
+/// 暂存层在换图后**自己可见**:旧快照的着色结果只能给命令时刻读者,
+/// 不能被最终合成按层号画到屏幕上。`OUT` 保留着色,`TMP` 只显示新图。
+#[test]
+fn visible_scratch_rebind_does_not_draw_stale_merge_source() {
+    let table = table();
+    let entries = [
+        (b"base.png".as_slice(), png_bytes_for(4, 2, Rgba([0, 0, 0, 255]))),
+        (b"ink.png".as_slice(), png_bytes_for(1, 1, Rgba([200, 160, 120, 255]))),
+        (b"green.png".as_slice(), png_bytes_for(1, 1, Rgba([0, 255, 0, 255]))),
+    ];
+    let strval = |bytes: &[u8]| Value::Str(bytes.to_vec());
+    let cg = |frame, id: &[u8], file: &[u8], visible| {
+        call(frame, "CG", vec![
+            arg(&table, "CG", "ID", strval(id)),
+            arg(&table, "CG", "FILE", strval(file)),
+            arg(&table, "CG", "E", Value::Int(visible)),
+        ])
+    };
+    let action = |frame, source: &[u8], dest: Option<&[u8]>, name, mut args: Vec<ArgValue>| {
+        args.push(arg(&table, "CGACT", "ID", strval(source)));
+        if let Some(dest) = dest {
+            args.push(arg(&table, "CGACT", "ID2", strval(dest)));
+        }
+        args.push(arg(&table, "CGACT", name, Value::Int(1)));
+        call(frame, "CGACT", args)
+    };
+    let mut gpu = renderer_or_skip(store(&entries));
+    let mut soft = SoftRenderer::new(store(&entries));
+    let mut gfx = state(Viewport::new(4, 2), [0, 0, 0, 255]);
+    let mut live = state(Viewport::new(4, 2), [0, 0, 0, 255]);
+    let events = [
+        VmEvent::FrameStart { frame: 1 },
+        cg(1, b"OUT", b"base", 1),
+        cg(1, b"SRC", b"ink", 0),
+        cg(1, b"TMP", b"", 0),
+        action(1, b"SRC", Some(b"TMP"), "COPY2", vec![]),
+        action(1, b"TMP", None, "MEIDO", vec![arg(&table, "CGACT", "SET", Value::Int(0x408040))]),
+        action(1, b"TMP", Some(b"OUT"), "MERGE", vec![
+            arg(&table, "CGACT", "X", Value::Int(2)),
+            arg(&table, "CGACT", "Y", Value::Int(0)),
+        ]),
+        // 暂存层换新图并可见:旧着色不能跟着层号露出来。
+        cg(1, b"TMP", b"green", 1),
+        VmEvent::FrameEnd { frame: 1 },
+    ];
+    gfx.consume_events(&events);
+    live.consume_events(&events);
+    let tinted = [100, 160, 60, 255];
+    let green = [0, 255, 0, 255];
+    let check = |surface: &yu_backend_soft::Surface| {
+        assert_eq!(pixel_of(surface, 0, 0), green, "TMP 必须只显示新图");
+        assert_eq!(pixel_of(surface, 2, 0), tinted, "OUT 必须保留着色合并");
+    };
+    check(&soft.render_frame(&gfx.frame()).surface);
+    if let Some(gpu) = gpu.as_mut() {
+        let output = gpu.render_frame(&live.frame()).expect("gpu render");
+        assert!(output.report.failed_targets.is_empty(), "{:?}", output.report.failed_targets);
+        check(&output.surface);
+        live.commit_baked(&output.report.failed_targets);
+        // 确认后的空闲帧:命中的内容不能回退成旧快照。
+        live.consume_events(&[VmEvent::FrameStart { frame: 2 }, VmEvent::FrameEnd { frame: 2 }]);
+        let idle = gpu.render_frame(&live.frame()).expect("gpu idle render");
+        check(&idle.surface);
+    }
+}
+
+/// 缺源全图 `COPY2` 不能把已清空目标改成 1×1 表面:
+/// 透明像素不变,但矩形与后续 `MERGE` 范围必须沿用目标原有尺寸。
+#[test]
+fn missing_source_copy_keeps_destination_size() {
+    let table = table();
+    let mut gfx = state(Viewport::new(4, 2), [0, 0, 0, 255]);
+    let strval = |bytes: &[u8]| Value::Str(bytes.to_vec());
+    let events = [
+        VmEvent::FrameStart { frame: 1 },
+        call(1, "CG", vec![
+            arg(&table, "CG", "ID", strval(b"DST")),
+            arg(&table, "CG", "FILE", strval(b"base")),
+            arg(&table, "CG", "SX", Value::Int(4)),
+            arg(&table, "CG", "SY", Value::Int(2)),
+            arg(&table, "CG", "E", Value::Int(1)),
+        ]),
+        call(1, "CGACT", vec![
+            arg(&table, "CGACT", "ID", strval(b"DST")),
+            arg(&table, "CGACT", "RECTPAINT3", Value::Int(1)),
+            arg(&table, "CGACT", "SET", Value::Int(0)),
+        ]),
+        call(1, "CGACT", vec![
+            arg(&table, "CGACT", "ID", strval(b"ABSENT")),
+            arg(&table, "CGACT", "ID2", strval(b"DST")),
+            arg(&table, "CGACT", "COPY2", Value::Int(1)),
+        ]),
+        VmEvent::FrameEnd { frame: 1 },
+    ];
+    gfx.consume_events(&events);
+    let size = |flag: &str| {
+        gfx.query_info("CGINFO", &[
+            arg(&table, "CGINFO", "ID", strval(b"DST")),
+            arg(&table, "CGINFO", flag, Value::Int(1)),
+        ])
+        .expect("size query")
+        .as_int()
+        .expect("integer")
+    };
+    assert_eq!(size("SX"), 4, "缺源复制后宽度必须沿用目标原尺寸");
+    assert_eq!(size("SY"), 2, "缺源复制后高度必须沿用目标原尺寸");
 }
 
 /// 60 帧多场景序列:换差分(COPY)/过渡(TRANSITION)/MERGE/缩放/文本,

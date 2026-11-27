@@ -812,6 +812,17 @@ impl Contents {
             None => true,
         }
     }
+
+    /// 活层合成用的内容视图:基面必须就是该层**当前**纹理。
+    ///
+    /// 旧快照版本只为命令时刻读者保留(`plan.rs` 的 `replayed_snapshot`),
+    /// 不能被同名但已 `CG[FILE]` 换图的层当作当前像素画到屏幕上。
+    pub fn for_layer(&self, id: &LayerId, texture: &TextureRef) -> Option<&Content> {
+        if !self.base_matches(id, Some(texture)) {
+            return None;
+        }
+        self.map.get(id)
+    }
 }
 
 impl Deref for Contents {

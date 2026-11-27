@@ -131,7 +131,8 @@ token 不再退化成 `None`,改用 `ImageOp.target_base.texture`(命令时刻
   可复现的只有内核自身缺陷:缺源 COPY2 会把源 ID 和父组凭空写进层表
   (`CGINFO[EXIST]` 由 0 变 1),以及把“清空后又写文字/又复制”的层误当空白。
   现在缺源不再建层;仅“最近一次全透明写之后无复制、无文字”的整图 COPY2
-  才冻结 `source_texture = Some(TextureRef::None)` 并在两端按 1×1 透明完成。
+  才冻结 `source_texture = Some(TextureRef::None)`;像素仍是透明的 1×1,
+  但显示矩形沿用目标原有 `SX/SY`,不把目标改小(见 §读者表统一)。
   其它缺源保持失败重试。`crates/yu-gfx/tests/copy_missing.rs` 为反证:
   修复前三项全红,修复后全绿。部分区域缺源仍不按空白处理。
 - **勘误(2026-11-27 复核)**:确认点重试。上一帧后缀部分失败时,后端会把
@@ -159,6 +160,26 @@ token 不再退化成 `None`,改用 `ImageOp.target_base.texture`(命令时刻
   `[0,0,0,255]`，预期 `[100,160,60,255]`。修后 Soft 全量回放、WGPU
   提交后增量回放分别通过，覆盖同帧与跨帧、两行坐标、缺源和目标重置。
 
+## 2026-11-27 · 读者表统一、合成身份与缺源尺寸
+
+- 判据:`source_texture` 是命令输入的唯一依据;活层像素只由「最后一次写
+  该层的命令 + 该层当前 `TextureRef`」决定。历史快照只能被 `source_texture`
+  等于它的命令读到,不得参与按 `LayerId` 的合成。
+- `state.rs`:`snapshot_readers()` 统一统计图像命令、`COPY/COPY2`、仍持有
+  快照的活层与本帧屏幕快照。旧实现只把跨层图像命令算读者,`COPY` 作为
+  唯一读者时 `MEIDO` 前缀会被换图剪掉
+  (`COPY2 SRC→TMP → MEIDO → COPY2 TMP→OUT → CG[TMP FILE=""]` 读出未着色
+  像素)。`released` 只回收已无读者的生产者。
+- `wgpu`:`Contents::for_layer` 要求内容基面等于活层当前纹理;最终合成、
+  过渡源与文本底图都不再按层号取旧内容。换图后的可见暂存层不会再把
+  旧着色画到屏幕上。
+- 缺源空替代沿用目标原矩形(`query_layer_size`),不再用 1×1 像素面把
+  `CGINFO[SX/SY]` 与后续 `MERGE` 范围一起改小。
+- 回归:`copy_only_reader_keeps_tinted_prefix`、
+  `visible_scratch_rebind_does_not_draw_stale_merge_source`、
+  `missing_source_copy_keeps_destination_size`;三条在修复前均红(Soft 与
+  WGPU),修复后 `--test surfaces` 44 项全绿。
+
 ## 残余：待样本触发，不启动 LayerEpoch
 
 本节是后续排查索引，不是已复现故障或频率统计。收到可复现的用户报告或取得新样本后，
@@ -167,7 +188,6 @@ token 不再退化成 `None`,改用 `ImageOp.target_base.texture`(命令时刻
 | 命令形态 | 当前证据 / 可能症状 | 复现时优先检查 |
 |---|---|---|
 | 普通资产层直接 `MERGE` 到目标，帧末前对源层发 `CG[FILE]` | `yu-gfx::prune_rebound_image_ops` 源码确认：跨层 `ImageOp` 没有 `Snapshot(CopyId)` 时仍被删除。未做样本或像素复现；可能缺一笔合成。 | 两张纯色图，先合并、再换源，目标不换；核对同帧、跨帧和目标自身重置。 |
-| `COPY2 → MEIDO → COPY/COPY2` 读走加工结果，随后重置原暂存层 | 当前保留旧加工前缀主要看跨层图像命令，普通复制作为唯一读者的分支未纳入本轮回归；可能读回未着色快照。源码风险，未复现。 | 隐藏暂存层调色后复制到可见层，再重置暂存层；检查可见层是否仍保留着色。 |
 | WGPU 已确认加工结果，下一帧同名层、同一 `FILE` 和相同 `A` 再绑定，且无后续加工 | `wgpu::plan::base_token_of` 不记录换图代次；同一基图 token 可能沿用上一帧的加工像素。源码风险，未复现。 | 前一帧着色并确认，下一帧只重发相同 `CG[FILE]`，对比 Soft/WGPU 是否恢复裸基图。 |
 | 过渡的 `to` 或遮罩输入在消费命令后同帧被替换或 `CGEND` | `ImageOp` 的 `source2/source3` 未记录与 `source_texture` 同等的命令时刻纹理身份。源码风险，未复现；可能读到新图或找不到图。 | 固定过渡中点和非对称遮罩，核对是否仍使用命令到达时的输入。 |
 

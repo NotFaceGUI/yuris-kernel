@@ -3609,7 +3609,7 @@ fn apply_text(
         let revision = frame.text_revisions.get(&id).copied().unwrap_or(0);
         let mut raw = match surfaces
             .raw_content(&id)
-            .or_else(|| contents.get(&id).cloned())
+            .or_else(|| contents.for_layer(&id, &layer.texture).cloned())
         {
             Some(content) => content,
             None => match resolve_source(

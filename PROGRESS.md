@@ -18711,3 +18711,23 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   后续复制、同文件重绑缓存、过渡/遮罩输入风险。触发条件为新样本可复现或收到
   用户报告后取得证据；当前不启动 LayerEpoch。
 - 仅文档变更；`git --no-optional-locks diff --check` 无输出，未重跑运行时测试。
+
+## 成果 GFX-REBIND-IDENTITY (2026-11-27) · 换图回放按纹理身份取内容
+
+- 判据收口为一条：命令输入只看 `source_texture`；活层像素只看「最后一次写
+  该层的命令 + 该层当前 `TextureRef`」。历史快照不得参与按 `LayerId` 的合成。
+- `yu-gfx`：新增 `snapshot_readers()`，把 `COPY/COPY2`、仍持有快照的活层和
+  本帧屏幕快照与图像命令放在同一张读者表里；`released` 只回收已无读者的
+  生产者。修复「`COPY2` 是唯一读者时 `MEIDO` 前缀被换图剪掉」。
+- `wgpu`：`Contents::for_layer` 要求内容基面等于活层当前纹理；最终合成、
+  过渡源、文本底图不再按层号取旧内容。修复可见暂存层换图后画出旧着色。
+- 缺源空替代：像素仍是透明 1×1，但显示矩形沿用目标原有 `SX/SY`，不再把
+  `CGINFO[SX/SY]` 与后续 `MERGE` 范围改小。
+- `cargo test --locked -p yu-backend-wgpu --test surfaces`：修前三条新用例全红
+  （`copy_only_reader_keeps_tinted_prefix`、
+  `visible_scratch_rebind_does_not_draw_stale_merge_source`、
+  `missing_source_copy_keeps_destination_size`），修后 `44 passed; 0 failed`。
+- `cargo test --locked -p yu-gfx -p yu-backend-soft`：`70 + 32 + …` 项全绿。
+- Android：`SettingsPrefs.canonicalPatch` 成为唯一词表（去空白、忽略大小写、
+  与 `PatchKind::parse` 同名别名），Tyranor 入口未知值保留全局设置；
+  `gradle :app:compileDebugKotlin` 通过。
