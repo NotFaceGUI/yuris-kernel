@@ -585,21 +585,9 @@ class SetupActivity : AppCompatActivity() {
         if (values.opt("show_hud") is Boolean) {
             state.showHud = values.optBoolean("show_hud", state.showHud)
         }
-        optString(values, "patch")?.takeIf {
-            it == "auto" || it == "original" || it == "gbk" ||
-                it == "big5" || it == "cp949" || it == "uhc" || it == "euc-kr" ||
-                it == "euckr" || it == "kr" ||
-                it == "cp1252" || it == "windows-1252" || it == "win1252" ||
-                it == "es" || it == "spanish" ||
-                it == "tunnel" || it == "utf8" || it == "utf-8"
-        }?.let {
-            state.patch = when (it) {
-                "utf-8" -> "utf8"
-                "uhc", "euc-kr", "euckr", "kr" -> "cp949"
-                "windows-1252", "win1252", "es", "spanish" -> "cp1252"
-                else -> it
-            }
-        }
+        // 与 `SettingsPrefs` / Rust `PatchKind::parse` 同一份词表;不认识的值
+        // 保留全局设置,不静默退回 `auto`。
+        SettingsPrefs.canonicalPatch(optString(values, "patch"))?.let { state.patch = it }
         optString(values, "gpu_backend")?.takeIf {
             it == "auto" || it == "gles" || it == "vulkan"
         }?.let { state.gpuBackend = it }

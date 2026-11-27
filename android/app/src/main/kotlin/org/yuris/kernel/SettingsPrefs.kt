@@ -387,12 +387,22 @@ object SettingsPrefs {
         else -> "auto"
     }
 
-    private fun validatePatch(value: String?): String = when (value) {
-        "original", "gbk", "big5", "tunnel" -> value
-        "cp949", "uhc", "euc-kr", "euckr", "kr" -> "cp949"
+    private fun validatePatch(value: String?): String = canonicalPatch(value) ?: "auto"
+
+    /**
+     * `patch` 的唯一词表(与 Rust `PatchKind::parse` 同源):
+     * 去空白、忽略大小写,别名归一;不认识返回 `null`,由调用方保留原值。
+     */
+    fun canonicalPatch(value: String?): String? = when (value?.trim()?.lowercase()) {
+        "auto" -> "auto"
+        "original", "off", "none", "cp932", "sjis", "shift_jis" -> "original"
+        "gbk", "cp936", "gb2312" -> "gbk"
+        "big5", "cp950", "big-5" -> "big5"
+        "cp949", "uhc", "euc-kr", "euckr", "kr", "korean" -> "cp949"
         "cp1252", "windows-1252", "win1252", "es", "spanish" -> "cp1252"
+        "tunnel", "sjis_ext" -> "tunnel"
         "utf8", "utf-8" -> "utf8"
-        else -> "auto"
+        else -> null
     }
 
     private fun validateCodec(value: String?): String = when (value) {
