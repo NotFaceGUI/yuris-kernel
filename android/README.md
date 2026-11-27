@@ -249,48 +249,31 @@ adb logcat -s yu-android                    # 每帧一行 status(含 fps)
 `/sdcard/Android/data/org.yuris.kernel/files/save/`),与桌面 `save/` 语义一致,
 `.sd` 字节级同构。
 
-## Tyranor-Next 运行时模块(两种形态)
+## Tyranor-Next 运行时模块(整套壳渠道)
 
-模块是**独立 APK**,由 Tyranor-Next 按包名前缀 `com.tyranor.runtime.*` +
-action 发现,再用显式 Intent 派发:
+Tyranor-Next 按包名前缀 `com.tyranor.runtime.*` + action 发现模块,再用显式
+Intent 派发:
 
 - action `com.tyranor.runtime.action.LAUNCH`;
 - extra `com.tyranor.runtime.extra.FOLDER_PATH`(游戏根目录绝对路径);
 - 可选 `GAME_TITLE` / `PROTOCOL_VERSION`(当前 1)/ `SETTINGS`。
 
-宿主不传 SAF URI,也不代授存储权限;模块本来就按真实路径读写,首次启动
+宿主不传 SAF URI,也不代授存储权限;壳本来就按真实路径读写,首次启动
 仍需用户自己授「所有文件访问」。
 
-| 形态 | Gradle 模块 | 入口 | 适用 |
-|---|---|---|---|
-| **轻量模块**(推荐) | `:runtime` | `TyranorRuntimeActivity` → 直接进游戏 | 日常游玩:无游戏库/配置页/Compose,`.so` 压缩,arm64 瘦包约 6 MB |
-| 整套壳(旧) | `:app`(`-PyurisChannel=tyranor`) | `SetupActivity` | 需要在手机端改目录/字体/高级参数时 |
-
-轻量模块**只有协议入口 + 游戏页**:收到 `FOLDER_PATH` 后校验路径、要存储
-权限,然后把文件夹直接交给 `MainActivity`;启动后入口立即 `finish()`,正常
-退出游戏直接回 Tyranor。配置全部走 1.73 的静态声明(游戏抽屉「引擎设置」),
-不再需要模块自己的配置页。
-
-构建(不影响普通 `org.yuris.kernel` 包):
+轻量 `:runtime` 模块已删除;需要从 Tyranor 启动时用整套壳渠道构建
+(`:app` 换包名,入口 `SetupActivity`,含游戏库/配置页/Compose):
 
 ```bash
-# 轻量模块,真机(arm64-v8a,约 6 MB)
-YURIS_APK_CHANNEL=tyranor-module BUILD_TYPE=release YURIS_APK_VARIANTS=arm64-v8a \
+YURIS_APK_CHANNEL=tyranor BUILD_TYPE=release YURIS_APK_VARIANTS=arm64-v8a \
   tools/android/build.sh arm64-v8a
-
-# 轻量模块,模拟器(x86_64)
-YURIS_APK_CHANNEL=tyranor-module BUILD_TYPE=release YURIS_APK_VARIANTS=x86_64 \
-  tools/android/build.sh x86_64
-
-# universal(arm64-v8a + x86_64,约 12 MB)
-YURIS_APK_CHANNEL=tyranor-module BUILD_TYPE=release YURIS_APK_VARIANTS=universal \
-  tools/android/build.sh
 ```
 
-产物在 `target/android-apks/yu-ris-runtime-release-<abi>.apk`。安装后在
-Tyranor-Next 的「工具 → 引擎模块管理」里**手动启用**(默认禁用),再重扫
-游戏库;扫描/设置/存档/导入声明都在
-`runtime/src/main/res/raw/tyranor_runtime.json`:
+产物在 `target/android-apks/app-tyranor-release-<abi>.apk`,包名
+`com.tyranor.runtime.yuris.kernel`。安装后在 Tyranor-Next 的
+「工具 → 引擎模块管理」里**手动启用**(默认禁用),再重扫游戏库;
+扫描/设置/存档/导入声明在
+`android/app/src/main/res/raw/tyranor_runtime.json`:
 
 ```json
 {
@@ -328,18 +311,17 @@ Tyranor-Next 的「工具 → 引擎模块管理」里**手动启用**(默认禁
 `gpu_backend`、`movie_backend`、`patch`、`save_codec`、`font`、`translate`、
 `bilinear_scale`、`font_fallback`、`prefetch`、`snapshot_defer`、`debug_log`、
 `show_hud`、`version_badge`、`vm_profile`、`asset_timing`、`tick_split`、`cg_timing`。
-Tyranor 在游戏抽屉的「引擎设置」里按声明渲染;模块只能控制
+Tyranor 在游戏抽屉的「引擎设置」里按声明渲染;声明只能控制
 title/description/type/default,卡片间距与样式由宿主决定。
 
 翻译链路:
 
 - 「导入翻译文件」把 `translate.json` 复制到 `<游戏目录>/translate.json`;
-- `translate` 开关打开(默认)且文件存在时,模块把该路径传给内核;
-- 开关关闭或文件不存在时不加载;模块不读取任意外部路径。
+- `translate` 开关打开(默认)且文件存在时,壳把该路径传给内核;
+- 开关关闭或文件不存在时不加载;壳不读取任意外部路径。
 
-存档声明为 `<游戏目录>/save`:轻量模块没有自定义存档目录,内核默认也写这里,
-因此由 Tyranor 统一做导入/导出/版本与 WebDAV 同步,不再有「自定义目录与宿主
-托管冲突」的问题。旧的整套壳渠道如果仍用自定义存档目录,不要启用宿主托管。
+存档声明为 `<游戏目录>/save`:壳沿用内核默认存档目录,内核默认也写这里,
+因此由 Tyranor 统一做导入/导出/版本与 WebDAV 同步。
 
 字体链路:
 
@@ -351,25 +333,22 @@ title/description/type/default,卡片间距与样式由宿主决定。
 
 说明:
 
-- 普通 APK 的清单里也有同一个过滤器,但宿主的包名前缀检查会把它排除,
-  因此不会被误识别;两包可并存安装。
+- 普通 `org.yuris.kernel` 包的清单里也有同一个过滤器,但宿主的包名前缀
+  检查会把它排除,不会被误识别。
 - 模块卡片引擎名显示为 `Plugin`;`label` 只出现在模块管理里。
 - 改包名等于换模块身份,已有绑定不会迁移。
 
-模拟宿主派发(设备上已有游戏目录时):
+模拟宿主派发(整套壳渠道,设备上已有游戏目录时):
 
 ```bash
-adb install -r target/android-apks/yu-ris-runtime-release-x86_64.apk
+adb install -r target/android-apks/app-tyranor-release-x86_64.apk
 adb shell appops set --uid com.tyranor.runtime.yuris.kernel \
   MANAGE_EXTERNAL_STORAGE allow
 adb shell am start -a com.tyranor.runtime.action.LAUNCH \
-  -n com.tyranor.runtime.yuris.kernel/org.yuris.kernel.TyranorRuntimeActivity \
+  -n com.tyranor.runtime.yuris.kernel/org.yuris.kernel.SetupActivity \
   --ei com.tyranor.runtime.extra.PROTOCOL_VERSION 1 \
   --es com.tyranor.runtime.extra.FOLDER_PATH /sdcard/Download/yugame
 ```
-
-任务/最近任务标签固定为 `Yu-ris Runtime`(入口与游戏页的 `label`),游戏
-退出后任务栈为空,直接回到 Tyranor。
 
 ## 数据布局
 

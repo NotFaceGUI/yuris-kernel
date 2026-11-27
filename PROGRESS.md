@@ -54,6 +54,19 @@ yu-trace: vfs/vm/frame 边界录制、回放、跨 producer diff
   (`yu-vfs` 取字节 + `frame.image_probe_order` + image 解码 + 缓存)。
 - 文字链路: `yu-font` 已独立完成,尚未桥接进 `yu-gfx`/后端(DIV-GFX-012)。
 
+## 成果 REL-TY-CUT (2026-11-27) · 删除 Tyranor 轻量模块并从发布中移除
+
+- **删除**:`android/runtime` 整个独立 Gradle 模块(含 `TyranorRuntimeActivity`、
+  清单、图标与 `tyranor_runtime.json`)、`settings.gradle.kts` 的
+  `include(":runtime")`、`tools/android/build.sh` 的 `tyranor-module` 渠道;
+  `android/README.md` 同步去掉轻量模块的构建/安装说明。
+- **发布**:`release.yml` 删除 "Build Tyranor-Next runtime module APK" 步骤,
+  "Stage assets" 不再拷 `yu-ris-runtime-release-*.apk`;`docs/release.md`
+  删掉两个模块产物条目,并注明模块已删除。
+- **保留**:旧整套壳渠道(`:app` 的 `-PyurisChannel=tyranor`)与协议入口
+  (`SetupActivity`)未动。
+- **验证**:按主人指示本次不构建、不发版;只静态核对构建入口与文档。
+
 ## 成果 SND-LAYER-TREE (2026-10-29) · 游戏设置音量链对齐:声音层路径树 + 祖先音量继承
 
 ### 目标与证据

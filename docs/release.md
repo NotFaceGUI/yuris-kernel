@@ -51,17 +51,17 @@ Android universal APK 用同款徽章，另附 ABI 瘦包与 so / 许可证链�
 | `yuris-kernel-vX.Y.Z-android-universal.apk` | 正式签名通用包，arm64-v8a + x86_64 两套 so 都在包里 |
 | `yuris-kernel-vX.Y.Z-android-arm64-v8a.apk` | 正式签名瘦包，只含 arm64-v8a（绝大多数真机） |
 | `yuris-kernel-vX.Y.Z-android-x86_64.apk` | 正式签名瘦包，只含 x86_64（模拟器 / x86 Chromebook） |
-| `yuris-kernel-vX.Y.Z-android-tyranor-module.apk` | Tyranor-Next 轻量运行时模块（universal，`com.tyranor.runtime.yuris.kernel`）：只有协议入口 + 游戏页，不含游戏库/配置页/Compose；`.so` 压缩存放 |
-| `yuris-kernel-vX.Y.Z-android-tyranor-module-arm64-v8a.apk` | 同上，只含 `arm64-v8a` 的模块瘦包（约 6 MB） |
 | `yuris-kernel-vX.Y.Z-android-so.zip` | `libyu_host_android.so` + `libc++_shared.so`（按 ABI 分目录） |
 | `yuris-kernel-vX.Y.Z-licenses.zip` | `LICENSE`、`NOTICE`、`THIRD-PARTY-NOTICES.md`、`licenses/`；Android 产物不内嵌这些文件，随此包分发 |
 | `yuris-kernel-vX.Y.Z-translation-skill.zip` | `.agents/skills/yuris-translation/`（SKILL.md、schema/style 参考、校验脚本）+ `translation-workflow.md`；覆盖角色/选项/UI literals/正文与全角宽度规则，可直接放入 AI 工具的 skills 目录 |
 
-三个普通 APK 用同一把 key 签名，`versionName` 相同；Tyranor 轻量模块包
-（`:runtime`）也用同一把 key，`versionName` 与普通包一致（不再追加
-`-tyranor`，包名 `com.tyranor.runtime.yuris.kernel` 已能区分）。`versionCode`
-都取 `GITHUB_RUN_NUMBER`。用户按设备架构下瘦包以减小下载体积，不确定时下
+三个普通 APK 用同一把 key 签名，`versionName` 相同，`versionCode` 都取
+`GITHUB_RUN_NUMBER`。用户按设备架构下瘦包以减小下载体积，不确定时下
 `universal`。当前不支持 32 位 `armeabi-v7a`，所以没有 `armeabi-v7a` 瘦包。
+
+Tyranor-Next 轻量运行时模块（`:runtime`）已删除，不再随 Release 分发；
+旧的整套壳渠道（`-PyurisChannel=tyranor`）仍保留，需要时按
+`android/README.md` 自行构建。
 
 ## 第三方许可清单
 
@@ -205,13 +205,6 @@ BUILD_TYPE=release GRADLE_FLAGS="--offline" \
 # 产物落在 target/android-apks/（不要放 AGP 的 release 输出目录，
 # 下一次 assembleRelease 会把它清掉）
 YURIS_APK_VARIANTS=universal,arm64-v8a,x86_64 \
-BUILD_TYPE=release GRADLE_FLAGS="--offline" \
-  GRADLE_PROJECT_ARGS="-PreleaseVersionName=0.0.0-local -PreleaseVersionCode=1" \
-  bash tools/android/build.sh
-
-# 额外：Tyranor-Next 轻量运行时模块（独立 :runtime 模块，
-# applicationId com.tyranor.runtime.yuris.kernel，只有入口 + 游戏页）
-YURIS_APK_CHANNEL=tyranor-module YURIS_APK_VARIANTS=universal \
 BUILD_TYPE=release GRADLE_FLAGS="--offline" \
   GRADLE_PROJECT_ARGS="-PreleaseVersionName=0.0.0-local -PreleaseVersionCode=1" \
   bash tools/android/build.sh
