@@ -56,23 +56,33 @@ const AUTO_SAMPLE_SCRIPTS: usize = 4;
 /// 文本域 codec 选择。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextCodecChoice {
-    /// 采样文本自动裁决(CP932/GBK/UTF-8;平局 CP932)。
+    /// 采样文本自动裁决(CP932/GBK/UTF-8;Big5/CP949/CP1252 需显式固定;平局 CP932)。
     Auto,
     /// 显式指定。
     Fixed(yu_format::Codec),
 }
 
 impl TextCodecChoice {
-    /// 解析 CLI/宿主取值:`auto|cp932|gbk|big5|utf8`(`sjis` 视为 cp932)。
+    /// 解析 CLI/宿主取值:`auto|cp932|gbk|big5|cp949|cp1252|utf8`。
+    ///
+    /// `auto` 之外接受常用别名(`sjis`/`cp936`/`cp950`/`uhc`/`euc-kr`/
+    /// `windows-1252`/`utf-8` 等);完整别名表见 [`yu_format::Codec::from_name`],
+    /// 本表只保证 CLI 文档列出的写法。
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
             "cp932" | "sjis" | "shift_jis" | "" => Ok(Self::Fixed(yu_format::Codec::Cp932)),
             "gbk" | "cp936" => Ok(Self::Fixed(yu_format::Codec::Gbk)),
             "big5" | "cp950" => Ok(Self::Fixed(yu_format::Codec::Big5)),
+            "cp949" | "uhc" | "euc-kr" | "euckr" | "kr" => {
+                Ok(Self::Fixed(yu_format::Codec::Cp949))
+            }
+            "cp1252" | "windows-1252" | "win1252" => {
+                Ok(Self::Fixed(yu_format::Codec::Cp1252))
+            }
             "utf8" | "utf-8" => Ok(Self::Fixed(yu_format::Codec::Utf8)),
             other => Err(format!(
-                "text-codec 只接受 auto|cp932|gbk|big5|utf8,收到 `{other}`"
+                "text-codec 只接受 auto|cp932|gbk|big5|cp949|cp1252|utf8,收到 `{other}`"
             )),
         }
     }

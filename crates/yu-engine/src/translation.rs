@@ -7,8 +7,10 @@
 //!   并扩展 `sjis_ext.bin` 的既有表。隧道码是 CP932 前导 + 低位尾字节
 //!   (官方分配算法),脚本只按前导字节步进,`STRLEN`/`_strmid`/`TEXT[FILE]`
 //!   的语义不变;
-//! - GBK/Big5 工程:直接按该 codec 编码;任何不可编码字符在装载期显式报错,
-//!   不静默替换。
+//! - GBK/Big5/CP949/CP1252 工程:直接按该 codec 编码;任何不可编码字符在
+//!   装载期显式报错,不静默替换;
+//! - UTF-8 工程(本地化发行版):直接写 UTF-8 字节,不需要隧道表;UTF-8
+//!   覆盖全部 Unicode 码位,装载期不会出现不可编码字符。
 //!
 //! 隧道分配会扫描脚本体窗口载荷、`ysv` 字符串初值与外置剧本,把源码中
 //! 实际出现过的双字节对全部保留,避免译文隧道码“劫持”未翻译原文。
@@ -161,11 +163,14 @@ pub fn load(
             before - pending.len()
         ));
     }
+    // UTF-8 覆盖全部 Unicode 码位,不需要隧道分配(也没有可分配空间)。
     let mut chars: BTreeSet<char> = BTreeSet::new();
-    for entry in &pending {
-        for ch in entry.text.chars() {
-            if codec.encode_char(ch).is_none() {
-                chars.insert(ch);
+    if codec != Codec::Utf8 {
+        for entry in &pending {
+            for ch in entry.text.chars() {
+                if codec.encode_char(ch).is_none() {
+                    chars.insert(ch);
+                }
             }
         }
     }
@@ -186,7 +191,7 @@ pub fn load(
                 }
             }
             return Err(Failure::runtime(format!(
-                "翻译文本含 {} 个 {} 不可编码字符;请换 GBK/Big5 补丁或改用 CP932+隧道路线{detail}",
+                "翻译文本含 {} 个 {} 不可编码字符;请换 GBK/Big5/CP949/CP1252/UTF-8 补丁或改用 CP932+隧道路线{detail}",
                 chars.len(),
                 codec.as_str()
             )));
@@ -567,6 +572,11 @@ fn encode_text(
     origin: &str,
     report: &mut TranslationReport,
 ) -> Result<Vec<u8>, Failure> {
+    // UTF-8 没有 u16 码位表:`encode_char` 对非 ASCII 恒 `None`,必须走
+    // `as_bytes`(与 `Codec::encode` 的 UTF-8 分支同一口径)。
+    if codec == Codec::Utf8 {
+        return Ok(text.as_bytes().to_vec());
+    }
     let mut out = Vec::with_capacity(text.len());
     for ch in text.chars() {
         if let Some(unit) = codec.encode_char(ch) {
@@ -768,6 +778,17 @@ mod tests {
         let bytes = encode_text("中文", Codec::Gbk, None, "t", &mut report).unwrap();
         assert_eq!(bytes, b"\xD6\xD0\xCE\xC4");
         assert!(encode_text("\u{20000}", Codec::Gbk, None, "t", &mut report).is_err());
+    }
+
+    #[test]
+    fn utf8_encoding_writes_bytes_without_tunnel() {
+        let mut report = TranslationReport::default();
+        let bytes = encode_text("中文Aあ", Codec::Utf8, None, "t", &mut report).unwrap();
+        assert_eq!(bytes, "中文Aあ".as_bytes());
+        // 4 字节码位(emoji)同样可直接编码。
+        let emoji = encode_text("🎮", Codec::Utf8, None, "t", &mut report).unwrap();
+        assert_eq!(emoji, "🎮".as_bytes());
+        assert!(report.warnings.is_empty());
     }
 
     #[test]
