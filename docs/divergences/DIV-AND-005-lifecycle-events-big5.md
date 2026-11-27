@@ -78,7 +78,7 @@
 
 | Intent Extra | JSON 键 | 取值 |
 |---|---|---|
-| `EXTRA_PATCH` | `patch` | `auto / original / gbk / big5 / tunnel` |
+| `EXTRA_PATCH` | `patch` | `auto / original / gbk / big5 / cp949 / cp1252 / utf8 / tunnel` |
 | `EXTRA_SAVE_CODEC` | `save_codec` | `"" (自动) / zlib / snappy` |
 | `EXTRA_FPS` | `fps` | `0 = 内核缺省 60` |
 | `EXTRA_SCREEN_COLOR` | `screen_color` | `0 = 不覆盖` |

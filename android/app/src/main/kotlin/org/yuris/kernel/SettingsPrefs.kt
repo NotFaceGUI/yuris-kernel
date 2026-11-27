@@ -389,6 +389,9 @@ object SettingsPrefs {
 
     private fun validatePatch(value: String?): String = when (value) {
         "original", "gbk", "big5", "tunnel" -> value
+        "cp949", "uhc", "euc-kr", "euckr", "kr" -> "cp949"
+        "cp1252", "windows-1252", "win1252", "es", "spanish" -> "cp1252"
+        "utf8", "utf-8" -> "utf8"
         else -> "auto"
     }
 

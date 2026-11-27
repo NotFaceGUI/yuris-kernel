@@ -759,7 +759,7 @@ public final class MainActivity extends Activity
                 config.put("font_file", fontPath);
             }
             // ---- 新增参数(与 CLI 旗标一一对应;缺省不写键 = 用内核缺省) ----
-            // 文本编码路线:汉化补丁的整包编码(原版/GBK/Big5/SJIS 隧道)。
+            // 文本编码路线:汉化补丁的整包编码(原版/GBK/Big5/CP949/CP1252/UTF-8/SJIS 隧道)。
             String patch = getIntent().getStringExtra(EXTRA_PATCH);
             if (patch != null && !patch.trim().isEmpty()) {
                 config.put("patch", patch.trim());

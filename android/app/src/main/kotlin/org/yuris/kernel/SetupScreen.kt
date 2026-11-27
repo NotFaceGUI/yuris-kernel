@@ -565,6 +565,9 @@ fun SetupScreen(activity: SetupActivity) {
                 "original" to t("原版(CP932)"),
                 "gbk" to t("简体(GBK)"),
                 "big5" to t("繁体(Big5)"),
+                "cp949" to t("韩文(CP949)"),
+                "cp1252" to t("西班牙语(CP1252)"),
+                "utf8" to t("UTF-8(本地化)"),
                 "tunnel" to t("隧道(sjis_ext)"),
             ),
             selected = state.patch,
@@ -742,6 +745,9 @@ private fun patchLabel(value: String): String = when (value) {
     "original" -> t("原版(CP932)")
     "gbk" -> t("简体(GBK)")
     "big5" -> t("繁体(Big5)")
+    "cp949" -> t("韩文(CP949)")
+    "cp1252" -> t("西班牙语(CP1252)")
+    "utf8" -> t("UTF-8(本地化)")
     "tunnel" -> t("隧道(sjis_ext)")
     else -> t("自动(推荐)")
 }

@@ -411,7 +411,7 @@ mixer 停止取数并清空环形缓冲),不依赖渲染线程的下一帧 tick 
 | `backend` / `gpu_backend` | 同名 | `soft\|wgpu` / `auto\|gles\|vulkan` | 壳固定 `wgpu`；so 缺省 `soft` / auto |
 | `entry` | 同名 | 入口标签 | SYSTEM_START |
 | `font_path` / `font_family` | `font_file` / `font` | 字体文件 / family | 空 |
-| `patch` | 同名 | `auto\|original\|gbk\|big5\|tunnel` | auto |
+| `patch` | 同名 | `auto\|original\|gbk\|big5\|cp949\|cp1252\|utf8\|tunnel` | auto |
 | `translate` | 同名 | `translate.json` 绝对路径(运行时文本替换) | 空 |
 | `save_codec` | 同名 | `zlib\|snappy` | 自动判定 |
 | `movie_backend` | 同名(+`cache_dir`) | `auto\|builtin\|external`;外置=设备 MediaCodec,自动失败回退内置 | auto |

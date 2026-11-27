@@ -614,7 +614,7 @@ pub struct RunConfig {
     pub font_bytes: Vec<Vec<u8>>,
     /// 用户导入的字体文件路径(JSON 键 `font_file`;读不到显式报错)。
     pub font_file: Option<PathBuf>,
-    /// 文本编码路线(JSON 键 `patch`:`auto|original|gbk|tunnel`)。
+    /// 文本编码路线(JSON 键 `patch`:`auto|original|gbk|big5|cp949|cp1252|utf8|tunnel`)。
     ///
     /// 与 CLI `--patch` 同义;`auto` 才会读产物签名。
     pub patch: yu_engine::patch::PatchKind,
@@ -3153,10 +3153,13 @@ mod tests {
         assert!(warn.quiet, "warn 不退出发布模式");
     }
 
-    /// 文本编码路线与 CLI `--patch` 同一份词表(含本轮新增的 big5)。
+    /// 文本编码路线与 CLI `--patch` 同一份词表(含 big5 / cp949 / cp1252 / utf8 与别名)。
     #[test]
     fn run_config_patch_matches_cli_value_set() {
-        for value in ["auto", "original", "gbk", "big5", "tunnel", "cp950"] {
+        for value in [
+            "auto", "original", "gbk", "big5", "cp949", "uhc", "euc-kr", "cp1252",
+            "windows-1252", "win1252", "es", "spanish", "utf8", "utf-8", "tunnel", "cp950",
+        ] {
             let json = format!(r#"{{"patch":"{value}"}}"#);
             let config = RunConfig::from_json(&json).expect("解析应成功");
             assert_eq!(
@@ -3164,7 +3167,7 @@ mod tests {
                 yu_engine::patch::PatchKind::parse(value).expect("引擎侧同一份解析"),
             );
         }
-        assert!(RunConfig::from_json(r#"{"patch":"euc-kr"}"#).is_err());
+        assert!(RunConfig::from_json(r#"{"patch":"euc-jp"}"#).is_err());
     }
 
     /// 后端取值与 CLI 同一份解析(大小写/空白容错也一致)。
