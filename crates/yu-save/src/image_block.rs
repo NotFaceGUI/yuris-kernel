@@ -64,6 +64,22 @@ pub const LAYOUT_0479: Layout = Layout {
     wh_offset: 0x70,
 };
 
+/// 0.263–0.292 代(`0x107` 旧式容器 / `0xC0` 现代容器)的**旧代描述符**:
+/// A=0x2B0(688),w/h 在 **+0x258/+0x25C**。
+///
+/// 证据(REA,2026-11-28):0.292 SDK `yu-ris.exe` 的 LOAD 图像分支
+/// `FUN_00430400` 对解压载荷硬校验 `payload[0] == 0x2B0`,随后把 A 段
+/// 拷到 `+0x258` 为 w、`+0x25C` 为 h 的局部结构(反编译里 `iStack_d8`
+/// 紧跟 600 字节缓冲),B 段按 `w*h*4` 建面。0.290 商业存档
+/// (`<v2-290>` save50001.sd DNO=3,A=0x7E0)的 w/h 也在同一偏移
+/// (+0x260/+0x264 = A 内 +0x258/+0x25C),说明旧代描述符的 w/h 位置
+/// 稳定、A 长度随构建变化。0.263 的官方 exe 是加密壳(overlay 熵 8.0),
+/// 无法静态核对 A;先按最近的 0.292 引擎常量写,残余见 DIV-RT-083。
+pub const LAYOUT_0292: Layout = Layout {
+    descriptor_len: 0x2B0,
+    wh_offset: 0x258,
+};
+
 /// 0.479(0.14)–0.495(`0x1E0`)官方布局:A=1600,w/h 在 +0x78。
 pub const LAYOUT_0495: Layout = Layout {
     descriptor_len: 1600,
@@ -90,6 +106,13 @@ impl Layout {
     pub fn is_v555(self) -> bool {
         self.descriptor_len == LAYOUT_V555.descriptor_len
             && self.wh_offset == LAYOUT_V555.wh_offset
+    }
+
+    /// 是否为旧代描述符(0.263–0.292;A=0x2B0/+0x258)。
+    #[must_use]
+    pub fn is_legacy_0292(self) -> bool {
+        self.descriptor_len == LAYOUT_0292.descriptor_len
+            && self.wh_offset == LAYOUT_0292.wh_offset
     }
 }
 
@@ -130,9 +153,10 @@ pub fn encode(image: &CapturedImage, layout: Layout) -> Vec<u8> {
     let mut descriptor = vec![0u8; layout.descriptor_len];
     // v555 的常量区是 8 字节(0x80..0x88),w/h 紧接在 0x88..0x90;0.495
     // 的常量区是 16 字节(0x80..0x90),w/h 在 +0x78,互不重叠。
+    // 旧代 0.263–0.292 的 0x80..0x90 在官方样本里为 0,不写常量。
     if layout.is_v555() {
         descriptor[0x80..0x88].copy_from_slice(&DESCRIPTOR_CONST_V555);
-    } else {
+    } else if !layout.is_legacy_0292() {
         descriptor[0x80..0x90].copy_from_slice(&DESCRIPTOR_CONST);
     }
     let wh = layout.wh_offset;
@@ -159,17 +183,67 @@ pub fn encode(image: &CapturedImage, layout: Layout) -> Vec<u8> {
 /// 但只有 `w*h*4 == lenB` 才接受。
 fn wh_offsets(a_len: usize) -> &'static [usize] {
     match a_len {
+        // 旧代(0.263–0.292):A=0x2B0;0.290 商业样本 A=0x7E0,w/h 同偏移。
+        0x2B0 | 0x7E0 => &[LAYOUT_0292.wh_offset],
         1520 => &[LAYOUT_0466.wh_offset],
         1536 => &[LAYOUT_0479.wh_offset],
         1600 => &[LAYOUT_0495.wh_offset],
         1680 => &[LAYOUT_V555.wh_offset],
         _ => &[
+            LAYOUT_0292.wh_offset,
             LAYOUT_0466.wh_offset,
             LAYOUT_0479.wh_offset,
             LAYOUT_0495.wh_offset,
             LAYOUT_V555.wh_offset,
         ],
     }
+}
+
+/// 从图像块载荷**反推**描述符布局(A 长度 + w/h 偏移)。
+///
+/// 判据只有结构自证:`A` 段长度 + 某个候选偏移处的 `w*h*4 == B`。
+/// 用于「同目录已有官方存档 → 写盘沿用官方布局」,不按引擎版本猜。
+/// 返回 `None` = 没有任何候选闭合。
+#[must_use]
+pub fn detect_layout(raw: &[u8]) -> Option<Layout> {
+    if raw.len() < 8 {
+        return None;
+    }
+    let a_len = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+    let b_len = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
+    let a_end = 8usize.checked_add(a_len)?;
+    let b_end = a_end.checked_add(b_len)?;
+    if b_end > raw.len() {
+        return None;
+    }
+    let a = &raw[8..a_end];
+    for off in [
+        LAYOUT_0292.wh_offset,
+        LAYOUT_0466.wh_offset,
+        LAYOUT_0479.wh_offset,
+        LAYOUT_0495.wh_offset,
+        LAYOUT_V555.wh_offset,
+    ] {
+        if a.len() < off + 8 {
+            continue;
+        }
+        let w = u32::from_le_bytes([a[off], a[off + 1], a[off + 2], a[off + 3]]);
+        let h = u32::from_le_bytes([a[off + 4], a[off + 5], a[off + 6], a[off + 7]]);
+        if w == 0 || h == 0 {
+            continue;
+        }
+        if (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|n| n.checked_mul(4))
+            == Some(b_len)
+        {
+            return Some(Layout {
+                descriptor_len: a_len,
+                wh_offset: off,
+            });
+        }
+    }
+    None
 }
 
 /// 解析图像块 raw 载荷。失败返回人读原因(诊断 detail)。
@@ -255,6 +329,36 @@ mod tests {
         let a = &raw[8..8 + 1520];
         assert_eq!(u32::from_le_bytes(a[0x68..0x6c].try_into().unwrap()), 160);
         assert_eq!(u32::from_le_bytes(a[0x6c..0x70].try_into().unwrap()), 90);
+        assert_eq!(decode(&raw).unwrap(), img);
+    }
+
+    /// 从载荷反推布局:两代 A 长度/偏移不同,检测必须各自命中。
+    #[test]
+    fn detect_layout_matches_official_generations() {
+        for (layout, w, h) in [
+            (LAYOUT_0292, 100, 75),
+            (LAYOUT_0466, 160, 90),
+            (LAYOUT_0479, 137, 102),
+            (LAYOUT_0495, 100, 75),
+        ] {
+            let raw = encode(&sample(w, h), layout);
+            assert_eq!(detect_layout(&raw), Some(layout), "{layout:?}");
+        }
+        assert_eq!(detect_layout(&[0u8; 8]), None);
+    }
+
+    /// 旧代(0.263–0.292):A=0x2B0,w/h 在 +0x258;B=w*h*4 BGRA。
+    #[test]
+    fn roundtrip_0292_uses_legacy_descriptor() {
+        let img = sample(160, 90);
+        let raw = encode(&img, LAYOUT_0292);
+        assert_eq!(raw.len(), 8 + 0x2B0 + 160 * 90 * 4);
+        assert_eq!(&raw[0..4], &0x2B0u32.to_le_bytes());
+        let a = &raw[8..8 + 0x2B0];
+        assert_eq!(u32::from_le_bytes(a[0x258..0x25C].try_into().unwrap()), 160);
+        assert_eq!(u32::from_le_bytes(a[0x25C..0x260].try_into().unwrap()), 90);
+        // 旧代描述符的 0x80..0x90 官方样本为 0(不写 0.495 常量)。
+        assert!(a[0x80..0x90].iter().all(|&b| b == 0));
         assert_eq!(decode(&raw).unwrap(), img);
     }
 

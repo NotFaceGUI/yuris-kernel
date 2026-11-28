@@ -1947,14 +1947,25 @@ impl Vm {
                 )
                 .into()
             })?;
+        // 执行位里的 pc/帧位内核存**组下标**,官方 task 存 **code 段字节
+        // 偏移**:0.289 商业官方存档 `SCRIPTPOS` 的 `pc` = s110 第 61 组的
+        // `code_offset_at(61)`(1698),该组正是 DNO4 最后一行台词的 WORD;
+        // 内核旧档同字段写的是组下标 211。不换算是官方读我们的档会从中段
+        // 指令起跳(EIP=0 崩溃),我们读官方档也会落到错误位置。
+        let to_code = |script_sid: u32, pc: u32| -> u32 {
+            self.tables
+                .script(script_sid)
+                .and_then(|s| s.code_offset_at(pc as usize))
+                .unwrap_or(pc)
+        };
         let sp = scriptpos::ScriptPos {
             if_entries: exec
                 .if_stack
                 .iter()
                 .map(|f| scriptpos::IfEntry {
                     loop_depth: f.loop_depth as u8,
-                    entry_pc: f.entry_pc,
-                    end_pc: f.end_pc,
+                    entry_pc: to_code(sid, f.entry_pc),
+                    end_pc: to_code(sid, f.end_pc),
                 })
                 .collect(),
             gosub_entries: exec
@@ -1964,7 +1975,7 @@ impl Vm {
                 .map(|f| scriptpos::GosubEntry {
                     if_depth: f.if_depth as u8,
                     loop_depth: f.loop_depth as u8,
-                    return_pc: f.return_pc,
+                    return_pc: to_code(f.return_script as u32, f.return_pc),
                     return_script: f.return_script as u16,
                 })
                 .collect(),
@@ -1973,14 +1984,14 @@ impl Vm {
                 .iter()
                 .map(|f| scriptpos::LoopEntry {
                     if_depth: f.if_depth as u8,
-                    body_pc: f.body_pc,
-                    end_pc: f.end_pc,
+                    body_pc: to_code(sid, f.body_pc),
+                    end_pc: to_code(sid, f.end_pc),
                     counter: f.counter,
                     limit: f.limit,
                 })
                 .collect(),
             text_line: exec.text_line as i32 as u32,
-            pc: exec.pc,
+            pc: to_code(sid, exec.pc),
             script_name: name,
             tail_byte: 0,
         };
@@ -2025,6 +2036,7 @@ impl Vm {
                 )
                 .into());
             }
+            // 旧内核 blob 的 pc 本身就是组下标,不需要换算。
             return Ok((
                 scriptpos::ScriptPos {
                     pc,
@@ -2035,7 +2047,40 @@ impl Vm {
         }
         let sp = self.decode_scriptpos(bytes)?;
         let sid = self.script_id_by_path(&sp.script_name)?;
-        Ok((sp, Some(sid)))
+        Ok((self.scriptpos_wire_to_pc(sp, sid), Some(sid)))
+    }
+
+    /// 官方 SCRIPTPOS 线格式 → 内核执行位。
+    ///
+    /// 线上 `pc` 与 IF/GOSUB/LOOP 帧位都是 **code 段字节偏移**:0.289 商业
+    /// 官方存档的 `pc` = s110 第 61 组 `code_offset_at(61)`(1698),该组正是
+    /// DNO4 最后一行台词的 WORD;内核执行期只消耗**组下标**。不换算会让
+    /// 读官方档落到错误位置,写档则让官方从指令中段起跳(0.289 官方 exe
+    /// 实测 EIP=0 崩溃)。非 V2(无 `code_offsets`)保持原值。
+    fn scriptpos_wire_to_pc(
+        &self,
+        mut sp: scriptpos::ScriptPos,
+        sid: u32,
+    ) -> scriptpos::ScriptPos {
+        let to_pc = |script_sid: u32, offset: u32| -> u32 {
+            self.tables
+                .script(script_sid)
+                .and_then(|s| s.pc_covering_code_offset(offset))
+                .unwrap_or(offset)
+        };
+        sp.pc = to_pc(sid, sp.pc);
+        for e in &mut sp.if_entries {
+            e.entry_pc = to_pc(sid, e.entry_pc);
+            e.end_pc = to_pc(sid, e.end_pc);
+        }
+        for e in &mut sp.gosub_entries {
+            e.return_pc = to_pc(e.return_script as u32, e.return_pc);
+        }
+        for e in &mut sp.loop_entries {
+            e.body_pc = to_pc(sid, e.body_pc);
+            e.end_pc = to_pc(sid, e.end_pc);
+        }
+        sp
     }
 
     pub(super) fn script_id_by_path(&self, name: &[u8]) -> Result<u32, VmError> {
@@ -2061,6 +2106,9 @@ impl Vm {
     /// 不触碰 `next_voice`(引擎装载器不写 `task+0x10`)与 TINT/TFLT/TSTR
     /// (TASK 参数落位,SCRIPTPOS 不序列化)。
     pub(super) fn apply_scriptpos(exec: &mut ExecState, sp: scriptpos::ScriptPos, sid: u32) {
+        // 约定:进入本函数的 `ScriptPos` 已是**内核单位**(组下标);
+        // 线上 code 偏移 → 组下标的换算在 `decode_scriptpos_compat` 完成
+        // (那里能拿到表,这里只做执行位落地)。
         let base_a = sp.if_entries.len() as u8;
         exec.script_id = sid;
         exec.pc = sp.pc;

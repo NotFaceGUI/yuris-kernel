@@ -899,8 +899,50 @@ fn task_scrip_pos_restores_full_exec_state() {
         script_name: b"data\\script\\fixture0000.yst".to_vec(),
         tail_byte: 0,
     };
-    let raw = synthetic.encode().expect("encode synthetic SCRIPTPOS");
     let mut vm = boot(b);
+    // 引擎线上 pc/帧位是 code 段字节偏移(内核执行位是组下标):
+    // 用固定脚本的真实组偏移构造外部 blob。
+    let wire = {
+        let script = vm.tables().script(0).expect("fixture script 0");
+        let to_code = |pc: u32| script.code_offset_at(pc as usize).unwrap_or(pc);
+        ScriptPos {
+            if_entries: synthetic
+                .if_entries
+                .iter()
+                .map(|e| IfEntry {
+                    loop_depth: e.loop_depth,
+                    entry_pc: to_code(e.entry_pc),
+                    end_pc: to_code(e.end_pc),
+                })
+                .collect(),
+            gosub_entries: synthetic
+                .gosub_entries
+                .iter()
+                .map(|e| GosubEntry {
+                    if_depth: e.if_depth,
+                    loop_depth: e.loop_depth,
+                    return_pc: to_code(e.return_pc),
+                    return_script: e.return_script,
+                })
+                .collect(),
+            loop_entries: synthetic
+                .loop_entries
+                .iter()
+                .map(|e| LoopEntry {
+                    if_depth: e.if_depth,
+                    body_pc: to_code(e.body_pc),
+                    end_pc: to_code(e.end_pc),
+                    counter: e.counter,
+                    limit: e.limit,
+                })
+                .collect(),
+            text_line: synthetic.text_line,
+            pc: to_code(synthetic.pc),
+            script_name: synthetic.script_name.clone(),
+            tail_byte: synthetic.tail_byte,
+        }
+    };
+    let raw = wire.encode().expect("encode synthetic SCRIPTPOS");
     vm.store_mut()
         .write(blob, &[], &Value::Str(raw))
         .expect("write blob var");
@@ -915,7 +957,10 @@ fn task_scrip_pos_restores_full_exec_state() {
         panic!("SCRIPTPOS 输出必须是字符串");
     };
     let round = ScriptPos::decode(&round_raw).expect("engine format roundtrip");
-    assert_eq!(round, synthetic, "TASKINFO[SCRIPTPOS] 必须还原同一执行位");
+    assert_eq!(
+        round, wire,
+        "TASKINFO[SCRIPTPOS] 必须按 code 偏移逐字段还原执行位"
+    );
 }
 /// 旧内核存档(2026-10-26 前)的 SCRIPTPOS 是 8 字节
 /// `[script_id u32 LE][pc u32 LE]`;读档必须按兼容路径还原(无三栈),

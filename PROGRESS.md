@@ -18983,7 +18983,7 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   「抽样实机通过」列表补 0.454。
 - 启动需 `--save-root`:工程根建 `save/` 报 `os error 5`(Low 完整性标签,
   非内核问题)。
-- 验证:`./target/release/yu-cli.exe run D:/HGame/games/Test/RWA
+- 验证:`./target/release/yu-cli.exe run <games>/Test/<RWA 样本>
   --until-frame 240 --save-root target/rwa-save --shot target/rwa-shot240.png`
   → `identity: ... yuris=0.454`、frame 240 标题画面无缺资源;
   桌面模式窗口标题实测同上。
@@ -19025,3 +19025,191 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   `src_has_no_direct_terminal_macros` 在 HEAD 已红(未标注 `unwrap_or`
   47>32、`yu-rt` 两文件超白名单、`state.rs` 的 `eprintln` 是 pass_trace
   既有代码),与本次改动无关。
+
+## 成果 2XX-SUPPORT (2026-11-28) · 2xx 商业语料(0.263/0.289/0.290)启动与通用 ABI 派生
+
+- 目标:真实 2xx 商业语料(非 SDK 示例)按官方引擎行为启动;差异走结构门控,
+  不为单个 build 加特化表/分支。
+- 样本:
+  - `<0.263 商业>` = `<games>/<0.263 商业>`(`pac/bn.ypf`,12 包);
+  - `<0.289 商业>` = `<games>/<0.289 商业>`(`pac/ysbin.ypf`,5 包);
+  - `<0.290 商业>` = `<games>/<0.290 商业>`(`pac/bn.ypf`,7 包);
+  - `<0.290 重打包>` = `<games>/<0.290 重打包>`(`pac/cgsys.ypf` 可读;
+    `pac/bn.ypf` 为汉化重打包自定义加密,本轮未破解)。
+- SDK 现状:`YU-RIS_Guide` 2xx 只有 Beta 2 0.255 与 Beta 3 0.292 的
+  `YSCom.ycd`;0.276 只有源码 sample,没有 0.263/0.290 的编译器定义。
+
+### 1. 取证
+
+- 0.263 `ysbin/yscfg.ybn` 98 字节:宽/高 `+0x14/+0x18`、标题长 `+0x3C`、
+  标题 `+0x3E`,文件恰好闭合 → 新增 `YscfLayout::V263`(结构裁决,无
+  `version == 263` 分支)。
+- 0.290 `ysbin/yscfg.ybn` 110 字节:宽/高 `+0x10/+0x14`、标题 `+0x42`
+  → 既有 `YscfLayout::Old`。
+- 0.289 `ysbin/yscfg.ybn` 80 字节:V292,1024×768。
+- 系统变量 ABI:
+  - 0.289 的 `ysv` 与 0.292 表 **482/482 全等**;
+  - 0.263 的 `ysv` 前缀 475 项:对 0.255 删 32 个 `_PAD_BUTTON1..32`、
+    32 个 `_PADNUM_BUTTON1..32`,`_DROPFILE` dims `[]→[1024]`;
+  - 0.290 的 `ysv` 前缀 477 项:对 0.292 在 id 52 前插入 1 个字符串槽、
+    尾部少 6 个键名;REA 官方 0.290 `merichri.exe`(sha256 `27559ae4…`)
+    的 `FUN_00410eec` 用 **477 项**跳转表(VA `0x4a3700`),`id 53` 返回
+    `0x122`(=290),`id 52` 走 default,逐项吻合。
+- 0.290 `CGACT` 参数表新增 `LEFT/RIGHT/TOP/BOTTOM`;真实脚本
+  `CGACT[RESIZE=1 BOTTOM=n LEFT=n]`(s93 pc1619..)。
+- 0.263/0.290 标题 LOGO 用 `CGACT[ROTATION=1 ID=源 ID2=目标 SET=度]`。
+- 0.290 重打包 `cgsys.ypf` 索引块末尾有 2 字节 0 对齐填充(1940 条走完后
+  `0x1aeec`,头部声明 `0x1aeee`);名字 key 0xC0、CRC32,1940/1940 命中。
+
+### 2. 改动
+
+- `yu-format/src/yscf.rs`:新增 `V263`;候选仍按宽高/标题长/文件尾精确
+  闭合唯一裁决;单测 `v263_layout_uses_0x3c_caption`。
+- `yu-rt/src/sysvar_abi.rs`:**删除 per-build TSV**,`select_for` 第 2 级
+  改为通用结构派生:
+  - 工程前缀 = kind=1、id 从 0 连续、`ty != 0`;
+  - Needleman-Wunsch 对齐 `(type,dims)`,精确 0 / 同 type 改 dims 1 /
+    跨 type 5 / 插删 2,同代价最小位移;锚定 id 0;基线只取 `len+64`;
+  - 选族按 `(版本距离, 主代价, 位移代价)`,同分失败;派生表自校验;
+  - 新增 `source_ysv_sha256` / `derivation` 进日志。
+- `yu-gfx/src/state.rs`:
+  - 原地滤镜族统一允许显式 `ID2` 目标(读源→写目标),不再只对 ROTATION;
+  - `LEFT/RIGHT/TOP/BOTTOM` 作为 `X/X2/Y/Y2` 的通用边距别名。
+- `yu-vfs/src/ypf.rs`:索引块走满 entryCount 后允许 ≤7 字节全零对齐填充;
+  仍拒绝其它 delta。
+- 测试:`parity_fixes.rs::in_place_filter_with_id2_writes_target`;
+  `sysvar_abi` 新增 0.290 插入/0.263 块删除/单槽改型/负例;
+  `yu-vfs/tests/real_sample.rs` 新增 0.263/0.289/0.290 YSCF 与重打包零填充
+  env 门控用例(缺样本显式 skip)。
+
+### 3. 原始结果
+
+```text
+<0.263 商业> --until-frame 120(当前代码):
+  identity: game="<0.263 商业>" yuris=0.263
+  frame: 120 viewport: 800x600
+  ops: 111 total, 111 drawn, 0 skipped
+  missing assets: 0; UNIMP=0 Fatal=0
+  table.fallback: sysvar-abi-0255 (derived, matches=474 subs=1 inserts=0 deletes=64)
+  (240 帧旧基线同为 111 ops / 0 skipped)
+```
+
+```text
+<0.289 商业> --until-frame 5:
+  identity: game="<0.289 商业>" yuris=0.289
+  frame: 5 viewport: 1024x768
+  layers: 45 (visible 22), passes: 6
+  ops: 25 total, 25 drawn, 0 skipped
+  UNIMP=0 Fatal=0
+  table.fallback: sysvar-abi-0292 (exact, 482/482)
+```
+
+```text
+<0.290 商业> --until-frame 240(当前代码):
+  identity: game="<0.290 商业>" yuris=0.290
+  frame: 240 viewport: 800x600
+  ops: 130 total, 130 drawn, 0 skipped
+  UNIMP=0 Fatal=0
+  table.fallback: sysvar-abi-0292 (derived, matches=476 subs=0 inserts=1 deletes=6)
+  (60 帧带事件版 83 ops / 0 skipped,986,663 事件全部 drain)
+```
+
+```text
+YURIS_SAMPLE_V2_* 真实包门控:
+  v263_pack_yscfg_layout ok (V263/800x600)
+  v289_pack_yscfg_layout ok (V292/1024x768)
+  v290_pack_yscfg_layout ok (Old/800x600)
+  v290_repack_index_zero_padding_is_accepted ok (1940 条, 1940/1940 名字哈希)
+```
+
+```text
+cargo test -p yu-format -p yu-rt -p yu-engine -p yu-vfs -p yu-gfx:
+  yu-format 87 单测 + 各集成全绿
+  yu-rt 185 单测 + consistency 4(带 ERIS env)全绿
+  yu-gfx 48 parity + 30 info + 25 group + 22 text + 13 transition + …
+  yu-vfs 全绿(新增 4 条 env 门控真实包用例)
+  0 failed
+```
+
+### 4. 结论与未完成
+
+- 0.263/0.289/0.290 三份真实商业语料均启动到可绘制帧,启动链
+  `UNIMP=0`;0.263 的 LOGO 旋转、0.290 的 `RESIZE` 边距已按通用规则放行。
+- 过渡 `CG[T/TID/TA]`、`MOVIE` 既有实现继续生效;`FLASH`(SWF)仍无播放器,
+  只在脚本条件分支出现,记录为后续独立项。
+- `<0.290 重打包>` 的 `pac/bn.ypf` 是汉化组自定义加密容器(无 `YPF`/`YSTB`
+  明文、无直接指针),本轮未破解;`cgsys.ypf` 零填充已支持。其余 0.290
+  样本不受影响。
+- 观察:同一 0.290 样本 `--until-frame 600` 在 >240 帧后长时间无推进
+  (进程低 CPU,疑长电影/吸引模式的同步等待);240 帧验收通过,600 帧长跑
+  留作后续单独排查,不影响首帧/标题路径。
+- 未为 0.263/0.290 落盘任何 per-build ABI 表;其他小版本若结构与官方族
+  唯一对齐则同样可用,不唯一/改型过多则按 `table.version` 拒绝(A5)。
+
+### 5. 截图对齐补记(2026-11-28)
+
+- **名字窗白底**:`<0.263 商业>` 的 `cg/main/name_window.bmp` 是 174×43
+  **32bpp BI_RGB**,第 4 字节 alpha 实测 5,348 个 0 / 1,962 个 255;
+  `image` crate 对 BI_RGB 32bpp 走 `RGB32`(alpha 全 255),白底实心。
+  新增通用 BGRA 路径(`DIV-GFX-101`):BI_RGB 32bpp 按真实 alpha 解码,
+  全 0 alpha 的旧资产回退不透明;单测 + 真样本
+  `real_bmp32_sample_preserves_alpha` 通过。
+- **转场缓冲缺层**:s226 pc121/122 `CG[ID=SRCCG A=0]`/`DESTCG A=0`
+  无 FILE,旧实现按纯探测不建层 ⇒ pc299 `CGACT[SWAP]` 报两层不存在。
+  改为“无 FILE/RID 但带状态参数 ⇒ 建空白层;只给 ID 的纯探测仍不建层”
+  (`DIV-GFX-102`),新增
+  `cg_missing_layer_with_state_param_creates_blank` 并保留原探测用例。
+- 仍观察到的差异:
+  - `LOAD` 全局存档 `@1227` 目标 `INT[256,160]` vs 盘上块 `INT[255,160]`
+    (`rt.var.shape`,手册明确“尺寸不同 = 错误”,官方也会报;未改)。
+  - s225 `TX.NAMECG` 缺层:该层由名字 CG 的创建路径提供,当前样本未建;
+    与名字窗 BMP alpha 修复分开,留作后续。
+  - `FLASH`(SWF)无播放器;`<0.290 重打包>` `bn.ypf` 自定义加密未破解。
+
+### 6. 演示与手动验证(2026-11-28)
+
+- README 演示表新增 `0.263 · 对话（桌面窗口）`:
+  `docs/assets/case/0_d.png`(名字窗白底修复后的实机画面)。
+- 当前 release `yu-cli.exe`(sha256
+  `61370711c95b3e48e1ecf87f1979b17b821bd1873200eadb96896825062b9949`)
+  已复制到 `<games>/his/yu-cli.exe`,供主人手动试存档。
+- 典型帧新截图(README 演示表):`0.263 标题` `0_t.png`、`0.289 对话`
+  `10_d.png`、`0.290 对话` `11_d.png`;`0.263` 的 LOGO 旋转动画在
+  `ID2` 原地滤镜改为读**源层**像素后,中间漩涡完整(soft/wgpu 同语义)。
+
+| 样本 | 版本 | 验证路径(桌面 / wgpu) | 截图 |
+|---|---|---|---|
+| <0.263 商业> | 0.263 | 启动 → 标题画面 | `docs/assets/case/0_t.png` |
+| <0.289 商业> | 0.289 | 启动 → 标题 → 游戏内对话 | `docs/assets/case/10_d.png` |
+| <0.290 商业> | 0.290 | 启动 → 标题 → 游戏内对话 | `docs/assets/case/11_d.png` |
+
+### 7. 存档交换:`SCRIPTPOS.pc` = code 段字节偏移(2026-11-28)
+
+- 症状:0.289 官方 exe 读内核档 → 立绘恢复、无对话框、随即崩溃
+  (`0xc0000005`,`EIP=0`,faulting module `unknown` offset 0)。
+- 取证:`save00001.sd` DNO10 的 `pc=1698` 恰等于
+  `s110.code_offset_at(61)`;第 61 组正是 DNO4 末行台词的 `WORD`
+  (`line=138`),相邻 `WAIT` 在 `line=135`(=`text_line`)。内核旧档同字段
+  存的是组下标(`211`,其 code 偏移 `5210`);官方按字节偏移从指令中段
+  起跳 → 非法 opcode/函数指针 → `call [0]`。
+- 修复(结构语义,无版本号分支):
+  - `TASKINFO[SCRIPTPOS]` 编码:组下标 → `code_offset_at`;
+  - `TASK[SCRIPTPOS]` 解码:code 偏移 → `pc_covering_code_offset`
+    (非指令起点取覆盖组);
+  - IF/GOSUB/LOOP 帧位同换算,GOSUB 按帧自己的 `return_script`;
+  - 旧内核 8 字节 blob 保持组下标;非 V2(无 `code_offsets`)不变。
+- 台账:`docs/divergences/DIV-RT-084-scriptpos-pc-code-offset.md`。
+- 复测注意:存档里的 SCRIPTPOS 是变量快照(`SAVE DNO=10 SET=$050C`;
+  读档 `LOAD DNO=10 LET=$0B15` → `TASK SCRIPTPOS=$0B15` → `LET $050C=$0B15`)。
+  载入旧内核档后**立即**存档会把旧 blob(组下标)原样带走;须在场景里推进
+  一行触发 s31 `TASKINFO ... LET=$050C` 后保存,写出的才是 code 偏移。
+  运行期探针(240/1200 tick)已见 `$050C` = s68 `pc=102`
+  (`code_offset_at(5)`) / s109 `pc=108`(`code_offset_at(2)`)。
+
+```text
+cargo test -p yu-rt --test fixture task_scrip_pos   → 2 passed
+cargo test -p yu-rt --test fixture                  → 166 passed / 7 ignored
+cargo test -p yu-rt --test corpus_v2                → 3 passed
+cargo test -p yu-rt --test consistency (ERIS env)   → 4 passed
+cargo build --workspace --all-targets               → 通过
+```

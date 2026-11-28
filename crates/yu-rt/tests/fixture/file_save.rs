@@ -1885,6 +1885,73 @@ fn fileinfo_fs_fallback_survives_cp932_projected_save_root() {
     assert_eq!(boot_with(Some(dir.clone())), 1, "真实根注入后必须命中");
 }
 
+/// 0.263 `es_saveload.yst` 的槽存在判定用 **CWD 相对** `save/saveNNN.sd`
+/// (`FILE="save/save"+n+".sd"`,不带 `$_SAVE_PATH` 前缀)。FILEINFO[EXIST]
+/// 必须把 `save/` 前缀接到真实 save 根,否则读档界面恒 NO DATA、点击无反应。
+#[test]
+fn fileinfo_relative_save_prefix_resolves_to_save_root() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/tmp/fixture-fsinfo-relative");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("建目录");
+    std::fs::write(dir.join("save001.sd"), b"YSSD-dummy").expect("写槽文件");
+
+    let boot_with = |name: &str| {
+        let mut b = ProjectBuilder::new();
+        let sys = b.sysvars.len() as u16;
+        b.vars = vec![VarSpec {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: sys,
+            value_type: 1,
+            dims: vec![],
+            init: Init::Int(-1),
+        }];
+        let op_fileinfo = b
+            .commands
+            .iter()
+            .position(|(n, _)| *n == "FILEINFO")
+            .unwrap() as u8;
+        b.scripts = vec![vec![
+            GroupSpec::new(op_fileinfo)
+                .window(0, ex::s(name))
+                .window(4, ex::i8_(1))
+                .window(7, ex::r#ref(0x40, sys)),
+            GroupSpec::new(OP_END),
+        ]];
+        b.labels = vec![("SYSTEM_START", 0, 0, 0)];
+        b.entry(0, 0);
+        let cfg = BootConfig {
+            save_root: Some(dir.clone()),
+            ..BootConfig::default()
+        };
+        let mut vm = Vm::boot(Box::new(b.build()), cfg).expect("boot");
+        let report = vm.tick_at(0, &no_input());
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        vm.store()
+            .read(VarRef::new(VarSpace::At, sys), &[])
+            .unwrap()
+    };
+
+    assert_eq!(
+        boot_with("save/save001.sd"),
+        Value::Int(1),
+        "`save/` 前缀应接到真实 save 根"
+    );
+    assert_eq!(
+        boot_with("save001.sd"),
+        Value::Int(1),
+        "裸文件名(0.290 槽存在判定)也应在 save 根内命中"
+    );
+    assert_eq!(boot_with("save/save999.sd"), Value::Int(0));
+    assert_eq!(
+        boot_with("save\\\\save001.sd"),
+        Value::Int(1),
+        "反斜杠形式同样归一"
+    );
+}
+
 
 /// `SAVE[MEM=99999]`:官方独立分支(`0x44b874` → `FUN_0044d7a8`)把
 /// 0..499 号内存槽打包到 `DAT_0086a03c`;不是普通槽 99999,也不刷文件。

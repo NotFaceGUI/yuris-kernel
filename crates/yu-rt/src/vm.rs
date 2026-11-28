@@ -1051,7 +1051,7 @@ impl Vm {
                     code::table::FALLBACK,
                     Boundary::Table,
                     format!(
-                        "工程无 system/YSCom/YSCom.ycd(商业发行版常态):按工程 ysv.ybn 指纹选择系统变量 ABI 族 {} (前缀已逐项校验通过,DIV-RT-016;表来自 YU-RIS SDK 官方 ycd)。命令表/参数名来自 ysc.ybn,无版本兜底。",
+                        "工程无 system/YSCom/YSCom.ycd(商业发行版常态):按工程 ysv.ybn 指纹选择系统变量 ABI 族 {} (前缀已逐项校验通过,DIV-RT-016;表来自官方 ycd 或按工程 ysv 派生,见 profile 描述)。命令表/参数名来自 ysc.ybn,无版本兜底。",
                         vm.tables.boot.sysvars.describe()
                     ),
                 )

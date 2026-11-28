@@ -826,17 +826,41 @@ fn apply_image_op(
         return Ok(());
     }
     // (MERGE/MERGE2/XOR/AND 在函数入口已按绘制偏移处理,不会走到这里。)
-    let mut texture = match st.texture_overrides.remove(target) {
-        Some(texture) => Rc::try_unwrap(texture).unwrap_or_else(|rc| (*rc).clone()),
-        None => base_texture(
-            textures,
-            snapshots,
-            frame,
-            target,
-            target_fallback,
-            image.target_base.as_ref(),
-            image.resize_base,
-        )?,
+    //
+    // `ID2` 原地滤镜(源 != 目标):官方读**源层**像素、写目标层。旧实现
+    // 一律从目标基面开始 ⇒ 0.290 标题 logo 的
+    // `ROTATION ID=LOGO.BUF ID2=LOGO.1` 旋转的是空白目标,中间的漩涡丢失。
+    let filter_from_source = image
+        .target
+        .as_ref()
+        .is_some_and(|t| t != &image.source)
+        && image.action.is_in_place_filter();
+    let mut texture = if filter_from_source {
+        match st.texture_overrides.get(&image.source) {
+            Some(texture) => (**texture).clone(),
+            None => base_texture(
+                textures,
+                snapshots,
+                frame,
+                &image.source,
+                image.source_texture.as_ref(),
+                None,
+                image.resize_base,
+            )?,
+        }
+    } else {
+        match st.texture_overrides.remove(target) {
+            Some(texture) => Rc::try_unwrap(texture).unwrap_or_else(|rc| (*rc).clone()),
+            None => base_texture(
+                textures,
+                snapshots,
+                frame,
+                target,
+                target_fallback,
+                image.target_base.as_ref(),
+                image.resize_base,
+            )?,
+        }
     };
     match image.action {
         ImageAction::RectPaint | ImageAction::RectPaint2 | ImageAction::RectPaint3 => {

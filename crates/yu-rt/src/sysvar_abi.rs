@@ -80,6 +80,11 @@ pub struct SysVarTable {
     pub source: SysVarSource,
     /// 该表覆盖的引擎版本区间(来自表头 `# covers`;空 = 未标注)。
     pub covers: String,
+    /// 派生表的来源:工程 `ysv` 系统变量前缀的规范化 SHA-256 指纹
+    /// (官方 ycd 表为 `None`)。
+    pub source_ysv_sha256: Option<String>,
+    /// 派生说明(基线族 + 对齐统计;官方 ycd 表为 `None`)。
+    pub derivation: Option<String>,
 }
 
 const ABI_TSV_0255: &str = include_str!("../data/sysvar-abi-0255-81a05c0c.tsv");
@@ -110,6 +115,151 @@ const ABI_TSV_0481: &str = include_str!("../data/sysvar-abi-0481-0493-f7380aba.t
 const ABI_TSV_0494: &str = include_str!("../data/sysvar-abi-0494-185f14aa.tsv");
 const ABI_TSV_0495: &str = include_str!("../data/sysvar-abi-0495-a626e40a.tsv");
 
+/// 结构对齐统计(派生 ABI 表用;进日志/诊断)。
+#[derive(Clone, Copy, Debug, Default)]
+struct AlignStats {
+    matches: usize,
+    substitutions: usize,
+    insertions: usize,
+    deletions: usize,
+    cost: u32,
+    shift: u64,
+}
+
+impl AlignStats {
+    fn summary(self) -> String {
+        format!(
+            "matches={} subs={} inserts={} deletes={} cost={} shift={}",
+            self.matches, self.substitutions, self.insertions, self.deletions, self.cost, self.shift
+        )
+    }
+}
+
+/// 工程 `ysv` 的系统变量前缀:从 id 0 起连续存在且 `ty != 0` 的 kind=1
+/// 记录。编译器把系统变量排在用户全局变量之前;第一个 `ty == 0`(仅声明
+/// 无初值)是用户变量区起点,不参与 ABI 对齐。
+fn project_prefix(vars: &VarImage) -> Vec<(u8, Vec<u32>)> {
+    let mut by_id: std::collections::BTreeMap<u16, (u8, Vec<u32>)> = std::collections::BTreeMap::new();
+    for rec in vars.records.iter().filter(|r| r.kind == 1) {
+        by_id
+            .entry(rec.var_id)
+            .or_insert_with(|| (rec.value_type, rec.dims.clone()));
+    }
+    let mut out = Vec::new();
+    for id in 0u32.. {
+        let Ok(id16) = u16::try_from(id) else { break };
+        let Some((ty, dims)) = by_id.get(&id16) else { break };
+        if *ty == 0 {
+            break;
+        }
+        out.push((*ty, dims.clone()));
+    }
+    out
+}
+
+/// Needleman-Wunsch 对齐 `(type,dims)` 序列。
+///
+/// 代价:精确匹配 0、同 type 改 dims 1、跨 type 5、插入/删除 2;
+/// 同代价时优先总位移最小
+/// (`|i-j|` 之和),从而把 0.263 这类"删除 32 个按钮数组但保留方向槽"
+/// 的块变化对齐到方向槽,而不是块尾的按钮槽。
+fn align_sysvars(
+    seq: &[(u8, Vec<u32>)],
+    base: &[SysVarDecl],
+) -> (Vec<Option<usize>>, AlignStats) {
+    const GAP: u32 = 2;
+    const SUB: u32 = 1;
+    const INF_COST: u32 = u32::MAX / 4;
+    const INF_SHIFT: u64 = u64::MAX / 4;
+    let n = seq.len();
+    let m = base.len();
+    let width = m + 1;
+    let idx = |i: usize, j: usize| i * width + j;
+    let mut dp = vec![(INF_COST, INF_SHIFT); (n + 1) * width];
+    let mut bt = vec![0u8; (n + 1) * width];
+    dp[idx(0, 0)] = (0, 0);
+    for i in 1..=n {
+        dp[idx(i, 0)] = (i as u32 * GAP, 0);
+        bt[idx(i, 0)] = 1;
+    }
+    // 系统变量表从 id 0 开始:不允许"跳过基线开头"的对齐,否则
+    // 局部改型会把整段前缀平移到后面的同型槽位。工程侧在开头多一个
+    // 新槽仍可通过 `dp[i][0]` 的插入路径表达。
+    for j in 1..=m {
+        dp[idx(0, j)] = (INF_COST, INF_SHIFT);
+        bt[idx(0, j)] = 2;
+    }
+    for i in 1..=n {
+        let (ty, dims) = &seq[i - 1];
+        for j in 1..=m {
+            let decl = &base[j - 1];
+            let exact = *ty == decl.value_type && *dims == decl.dims;
+            // 同槽改型:同 type 不同 dims(如 `_DROPFILE`)代价 1;跨 type
+            // 更可能是"新槽插入 + 后续后移"。插入本身 2,还会让固定基线
+            // 前缀多一个删除(+2),所以跨 type 同槽代价取 5,让插入优先。
+            let change = if exact {
+                0
+            } else if *ty == decl.value_type {
+                SUB
+            } else {
+                5
+            };
+            let prev = dp[idx(i - 1, j - 1)];
+            let mut best = (
+                prev.0.saturating_add(change),
+                prev.1.saturating_add((i as i64 - j as i64).unsigned_abs()),
+            );
+            let mut op = 0u8;
+            let skip_seq = dp[idx(i - 1, j)];
+            let cand = (skip_seq.0.saturating_add(GAP), skip_seq.1);
+            if cand < best {
+                best = cand;
+                op = 1;
+            }
+            let skip_base = dp[idx(i, j - 1)];
+            let cand = (skip_base.0.saturating_add(GAP), skip_base.1);
+            if cand < best {
+                best = cand;
+                op = 2;
+            }
+            dp[idx(i, j)] = best;
+            bt[idx(i, j)] = op;
+        }
+    }
+    let mut mapping = vec![None; n];
+    let mut stats = AlignStats {
+        cost: dp[idx(n, m)].0,
+        shift: dp[idx(n, m)].1,
+        ..AlignStats::default()
+    };
+    let (mut i, mut j) = (n, m);
+    while i > 0 || j > 0 {
+        match bt[idx(i, j)] {
+            0 => {
+                let (ty, dims) = &seq[i - 1];
+                let decl = &base[j - 1];
+                mapping[i - 1] = Some(j - 1);
+                if *ty == decl.value_type && *dims == decl.dims {
+                    stats.matches += 1;
+                } else {
+                    stats.substitutions += 1;
+                }
+                i -= 1;
+                j -= 1;
+            }
+            1 => {
+                stats.insertions += 1;
+                i -= 1;
+            }
+            _ => {
+                stats.deletions += 1;
+                j -= 1;
+            }
+        }
+    }
+    (mapping, stats)
+}
+
 impl SysVarTable {
     /// 从工程 `YSCom.ycd` 的解析结果构造。
     pub fn from_ycd(
@@ -132,6 +282,8 @@ impl SysVarTable {
                 sha256: sha256.into(),
             },
             covers: String::new(),
+            source_ysv_sha256: None,
+            derivation: None,
         }
     }
 
@@ -145,8 +297,10 @@ impl SysVarTable {
     ///
     /// 新表在前:若某 5xx 构建只在 548 前缀之后追加变量,其指纹会同时
     /// 通过 0495 族(只看 `var_id < 表长` 的镜像),应当归入 0495。
-    /// 已知 ABI 族(新→旧)。表由 `data/sysvar-abi-<ver>[-<sha8>].tsv` 提供,
-    /// 来源是 `YU-RIS_Guide` 全量 SDK 的 `YSCom.ycd`(见各表头 sha256)。
+    /// 表由 `data/sysvar-abi-<ver>[-<sha8>].tsv` 提供,全部来自
+    /// `YU-RIS_Guide` 全量 SDK 的 `YSCom.ycd`。没有官方 ycd 的商业构建
+    /// **不另建表**:`select_for` 用工程 `ysv` 与这些官方族做结构对齐,
+    /// 派生 names/type/dims,见 [`Self::select_for`] 与 DIV-RT-017 §6。
     pub fn known_profiles() -> Vec<Self> {
         vec![
             Self::from_tsv(ABI_TSV_0495, "sysvar-abi-0495-a626e40a.tsv"),
@@ -179,50 +333,87 @@ impl SysVarTable {
         ]
     }
 
-    /// **按游戏自带 `ysv.ybn` 的指纹选族**(数据驱动,不看版本号)。
+    /// **按游戏自带 `ysv.ybn` 的指纹选族**(数据驱动,不特化版本)。
     ///
     /// 三级裁决:
     ///
-    /// 1. 前缀完全匹配的族 → 直接采用(可能带尾部追加项);
-    /// 2. 无完全匹配,但存在**唯一**一个"前缀缺项最少"的族 → 采用并给出警告;
-    /// 3. 完全无法收敛 → `table.version` Fatal,列出各族失配原因。
+    /// 1. 已有 ABI 族前缀逐项全等 → 直接采用(可能带尾部追加项);
+    /// 2. 没有全等表时,把工程 `ysv` 的系统变量前缀与每个已知 ABI 族做
+    ///    **结构对齐**(匹配 `(type,dims)`,允许插入/删除/同槽改型),
+    ///    取"版本距离最近且结构成立"的唯一候选,派生出该构建的表;
+    /// 3. 结构对齐不成立 → `table.version` Fatal,列出逐族原因。
     ///
-    /// 第 2 级只用于明确可判的情形(缺项数相同则视为不唯一,拒绝)。
+    /// 第 2 级是通用回退:商业构建的 ABI 可能在同一系列内插入/删除少量
+    /// 系统变量(实测 0.263/0.290),不要求逐项全等,但要求对齐结果唯一、
+    /// 同槽改型数不超过 4 个;名字继承最近官方族的语义槽位,新增槽位用
+    /// `_SYSVAR_<id>`,不猜语义。见 DIV-RT-017 §6。
     pub fn select_for(vars: &VarImage) -> Result<Self, yu_log::Diag> {
+        let profiles = Self::known_profiles();
+        let prefix_len = project_prefix(vars).len();
         let mut failures = Vec::new();
-        let mut partial: Vec<(usize, Self)> = Vec::new();
-        // 多张表内容可能完全相同(如 0494/0495 的 548 项),此时用游戏
-        // `ysv` 自报的版本号挑最贴切的一张,避免日志显示错版本。
-        let mut exact: Vec<Self> = Vec::new();
-        for table in Self::known_profiles() {
+
+        // 1. 前缀全等。
+        let mut exact = Vec::new();
+        for table in &profiles {
             match table.verify_against_ysvr(vars) {
                 Ok(()) => {
                     if table.covers_version(vars.version) {
-                        return Ok(table);
+                        return Ok(table.clone());
                     }
-                    exact.push(table);
-                    continue;
+                    exact.push(table.clone());
                 }
-                Err(d) => {
-                    // 只有"类型/维数全对、仅缺少量 id"的表才可作候选。
-                    // 只要有一条类型不符,该表就是错版本,绝不降级采用。
-                    let (wrong, missing) = table.diff_counts(vars);
-                    if wrong == 0 && missing > 0 {
-                        partial.push((missing, table.clone()));
-                    }
-                    failures.push(format!(
-                        "{}: {}",
-                        table.source_name(),
-                        d.detail.trim_start_matches("系统变量 ABI 校验失败:")
-                    ));
-                }
+                Err(d) => failures.push(format!(
+                    "{}: {}",
+                    table.source_name(),
+                    d.detail.trim_start_matches("系统变量 ABI 校验失败:")
+                )),
             }
         }
         if let Some(table) = exact.into_iter().next() {
             return Ok(table);
         }
-        // 第 2 级只接受"极少数缺项"且唯一最接近的表:缺项数相同视为
-        // 不可判定;缺项过多则视为未知构建,不猜。
+
+        // 2. 结构对齐派生。评分 = (版本距离, 主代价, 位移代价);距离相同
+        // 且代价相同视为不唯一,拒绝。
+        let mut derived: Vec<(u32, u32, u64, usize, Self)> = Vec::new();
+        for (idx, base) in profiles.iter().enumerate() {
+            match Self::derive_from(base, vars) {
+                Some((table, stats)) => {
+                    let distance = base.version_distance(vars.version);
+                    derived.push((distance, stats.cost, stats.shift, idx, table));
+                }
+                None => failures.push(format!(
+                    "{}: 结构对齐不成立(前缀 {prefix_len} 项)",
+                    base.source_name()
+                )),
+            }
+        }
+        derived.sort_by_key(|(d, c, s, idx, _)| (*d, *c, *s, *idx));
+        if let Some((d, c, sh, _, table)) = derived.first() {
+            let first = (*d, *c, *sh);
+            let unique = derived
+                .get(1)
+                .is_none_or(|(d2, c2, s2, _, _)| (*d2, *c2, *s2) != first);
+            if unique {
+                return Ok(table.clone());
+            }
+            failures.push(format!(
+                "结构对齐有多个同分候选({} 个),拒绝猜测",
+                derived
+                    .iter()
+                    .filter(|(d2, c2, s2, _, _)| (*d2, *c2, *s2) == first)
+                    .count()
+            ));
+        }
+
+        // 3. 旧版"极少数缺项"兜底(仅 wrong==0 且唯一最接近)。
+        let mut partial: Vec<(usize, Self)> = Vec::new();
+        for table in &profiles {
+            let (wrong, missing) = table.diff_counts(vars);
+            if wrong == 0 && missing > 0 {
+                partial.push((missing, table.clone()));
+            }
+        }
         const MAX_TOLERATED_MISSING: usize = 2;
         partial.sort_by_key(|(missing, _)| *missing);
         if let Some((missing, table)) = partial.first() {
@@ -231,15 +422,115 @@ impl SysVarTable {
                 return Ok(table.clone());
             }
         }
+
+        // 4. 失败闭合。
         Err(diag::fatal(
             code::table::VERSION,
             Boundary::Table,
             format!(
-                "工程 ysv.ybn 的系统变量指纹与所有已知 ABI 表都不符,且无可唯一判定的候选;                 需要该构建的 ABI 表(自带 YSCom.ycd 或从其引擎 exe 提取)。逐族失配:{}(A5:不猜)",
+                "工程 ysv.ybn 的系统变量指纹与所有已知 ABI 族都不符,且结构对齐无可唯一判定的候选;需要该构建的 ABI 表(自带 YSCom.ycd 或从其引擎 exe 提取)。逐族失配:{}(A5:不猜)",
                 failures.join(" | ")
             ),
         )
         .at_table("ysv.ybn"))
+    }
+
+    /// 给“`_PROJECT_PATH` 与 `_SYSTEM_VERSION` 之间的插入槽”按官方槽位命名。
+    ///
+    /// 证据:官方 0.450/0.455/0.460 全系在这两个锚点之间按
+    /// `_SAVE_PATH → _APPDATA_PATH → _PERSONAL_PATH` 顺序排列;0.290
+    /// 商业构建在这两个锚点之间插入了 1 个 STR,存档脚本直接读它
+    /// (`es_saveload.yst` 的 `Scene_SAVE` / `Scene_QLOAD`)。按
+    /// **锚点 + 类型 + 数量**继承官方名字,不做版本号判断;形状不符
+    /// (中间还有已映射槽、非 STR、超过 3 个)就不命名,保留占位符。
+    fn name_path_insertions(decls: &mut [SysVarDecl]) {
+        let Some(project) = decls.iter().position(|d| d.name == "_PROJECT_PATH") else {
+            return;
+        };
+        let Some(version) = decls
+            .iter()
+            .skip(project + 1)
+            .position(|d| d.name == "_SYSTEM_VERSION")
+            .map(|k| project + 1 + k)
+        else {
+            return;
+        };
+        if version <= project + 1 {
+            return;
+        }
+        let inserted: Vec<usize> = (project + 1..version)
+            .filter(|&i| decls[i].name.starts_with("_SYSVAR_"))
+            .collect();
+        // 中间必须全部是占位插入槽;有任何继承名说明不是连续插入块。
+        if inserted.len() != version - project - 1 || inserted.len() > 3 {
+            return;
+        }
+        if inserted.iter().any(|&i| decls[i].value_type != 3) {
+            return;
+        }
+        for (k, &id) in inserted.iter().enumerate() {
+            decls[id].name = ["_SAVE_PATH", "_APPDATA_PATH", "_PERSONAL_PATH"][k].to_string();
+        }
+    }
+
+    /// 把工程 `ysv` 的系统变量前缀与一个官方 ABI 族做结构对齐,派生该
+    /// 构建的表。
+    ///
+    /// 前缀 = 从 id 0 起连续存在且 `ty != 0` 的 `kind=1` 记录;第一个
+    /// `ty == 0` 是用户全局变量区的起点(编译器把系统变量排在前面)。
+    fn derive_from(base: &Self, vars: &VarImage) -> Option<(Self, AlignStats)> {
+        let seq = project_prefix(vars);
+        if seq.is_empty() {
+            return None;
+        }
+        // 只对齐工程前缀附近的基线前缀:基线尾部未在工程声明,不是
+        // "删除";保留 +64 余量给少量尾部插入。
+        let limit = (seq.len() + 64).min(base.decls.len());
+        let (mapping, stats) = align_sysvars(&seq, &base.decls[..limit]);
+        // 同槽改型只允许极少数(如 `_DROPFILE` 维数变化);超过 4 个说明
+        // 对齐到了错误的族。
+        // 同槽改型只允许极少数(如 `_DROPFILE` 维数变化);插入/删除
+        // 是块级差异(32 个按钮数组、尾部未声明),不按比例拒绝。
+        if stats.substitutions > 4 {
+            return None;
+        }
+        let mut decls = Vec::with_capacity(seq.len());
+        for (id, (ty, dims)) in seq.iter().enumerate() {
+            let name = match mapping.get(id).copied().flatten() {
+                Some(j) => base.decls[j].name.clone(),
+                None => format!("_SYSVAR_{id:04}"),
+            };
+            decls.push(SysVarDecl {
+                name,
+                value_type: *ty,
+                dims: dims.clone(),
+            });
+        }
+        Self::name_path_insertions(&mut decls);
+        let mut fingerprint = Vec::new();
+        for (ty, dims) in &seq {
+            fingerprint.push(*ty);
+            fingerprint.push(dims.len() as u8);
+            for d in dims {
+                fingerprint.extend_from_slice(&d.to_le_bytes());
+            }
+        }
+        let table = Self {
+            decls,
+            source: base.source.clone(),
+            covers: format!("{:04}", vars.version),
+            source_ysv_sha256: Some(sha256_hex(&fingerprint)),
+            derivation: Some(format!(
+                "structurally aligned to {} ({})",
+                base.source_name(),
+                stats.summary()
+            )),
+        };
+        // 派生表必须自洽:用它自己的 ysv 前缀再验一次。
+        if table.verify_against_ysvr(vars).is_err() {
+            return None;
+        }
+        Some((table, stats))
     }
 
     /// 该表声明的覆盖区间是否包含给定引擎版本(`# covers` 形如 `0481-0493`)。
@@ -252,6 +543,29 @@ impl SysVarTable {
         match (lo.trim().parse::<u32>(), hi.trim().parse::<u32>()) {
             (Ok(lo), Ok(hi)) => (lo..=hi).contains(&version),
             _ => false,
+        }
+    }
+
+    /// 工程版本到本表覆盖区间的距离(0 = 区间内;区间外取最近端点距离)。
+    fn version_distance(&self, version: u32) -> u32 {
+        if self.covers.is_empty() {
+            return u32::MAX / 4;
+        }
+        if let Some((lo, hi)) = self.covers.split_once('-') {
+            let (Ok(lo), Ok(hi)) = (lo.trim().parse::<u32>(), hi.trim().parse::<u32>()) else {
+                return u32::MAX / 4;
+            };
+            if (lo..=hi).contains(&version) {
+                0
+            } else {
+                version.saturating_sub(hi).max(lo.saturating_sub(version))
+            }
+        } else {
+            self.covers
+                .trim()
+                .parse::<u32>()
+                .map(|v| v.abs_diff(version))
+                .unwrap_or(u32::MAX / 4)
         }
     }
 
@@ -292,11 +606,24 @@ impl SysVarTable {
     /// 面向日志的描述:表名 + 覆盖区间 + 实际校验结果。
     #[must_use]
     pub fn describe(&self) -> String {
-        let base = self.source.describe();
-        if self.covers.is_empty() {
+        let base = if let Some(ysv_sha) = &self.source_ysv_sha256 {
+            match &self.source {
+                SysVarSource::AbiProfile { name, .. } => format!(
+                    "engine ABI profile {name} (derived from project ysv fingerprint {ysv_sha})"
+                ),
+                other => other.describe(),
+            }
+        } else {
+            self.source.describe()
+        };
+        let base = if self.covers.is_empty() {
             base
         } else {
             format!("{base} covers={}", self.covers)
+        };
+        match &self.derivation {
+            Some(extra) => format!("{base} [{extra}]"),
+            None => base,
         }
     }
 
@@ -318,9 +645,14 @@ impl SysVarTable {
         let mut decls = Vec::new();
         let mut sha = String::new();
         let mut covers = String::new();
+        let mut source_ysv_sha256 = None;
         for line in text.lines() {
             if let Some(rest) = line.strip_prefix("# source_ycd_sha256\t") {
                 sha = rest.trim().to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("# source_ysv_sha256\t") {
+                source_ysv_sha256 = Some(rest.trim().to_string());
                 continue;
             }
             if let Some(rest) = line.strip_prefix("# covers\t") {
@@ -360,6 +692,8 @@ impl SysVarTable {
             decls,
             source: SysVarSource::AbiProfile { name, sha256: sha },
             covers,
+            source_ysv_sha256,
+            derivation: None,
         }
     }
 
@@ -592,7 +926,10 @@ mod tests {
     #[test]
     fn fingerprint_rejects_unknown_and_lists_reasons() {
         let mut vars = image_from(&SysVarTable::builtin_abi());
-        vars.records[10].dims = vec![99];
+        // 同槽改型 1 项可派生;10 项以上说明不是同一族,必须拒绝。
+        for rec in vars.records.iter_mut().take(10) {
+            rec.dims = vec![99];
+        }
         let e = SysVarTable::select_for(&vars).expect_err("失配必须拒绝");
         assert_eq!(e.code, "table.version");
         for name in ["0292", "0466", "0479", "0495"] {
@@ -617,18 +954,89 @@ mod tests {
         assert_eq!(sel.source_name(), "sysvar-abi-0495-a626e40a.tsv");
     }
 
-    /// 类型不符的表**不得**被"缺项最少"降级采用(v486 曾因此误配 0495)。
+    /// 单槽改型(如 `_DROPFILE` 维数变化)走结构派生:保留同槽名字,
+    /// 类型/维数以工程 ysv 为准;不把整表判错。
     #[test]
-    fn type_mismatch_table_is_never_a_fallback_candidate() {
+    fn single_slot_shape_change_is_derived() {
         let base = SysVarTable::builtin_abi();
         let mut vars = image_from(&base);
-        // 所有 id 都在,但改掉一个维数 = "形状像、语义不是"。
         vars.records[50].dims = Vec::new();
-        let (_wrong, missing) = base.diff_counts(&vars);
-        assert_eq!(missing, 0, "全部 id 都在");
-        assert_eq!(_wrong, 1, "应记 1 项类型不符");
-        // 没有完全匹配的表时,必须报错而不是降级。
-        assert!(SysVarTable::select_for(&vars).is_err(), "类型不符必须拒绝");
+        let sel = SysVarTable::select_for(&vars).expect("单槽改型应派生");
+        assert_eq!(sel.get(50).unwrap().name, base.get(50).unwrap().name);
+        assert!(sel.get(50).unwrap().dims.is_empty());
+        assert!(sel.derivation.is_some(), "派生表必须记录基线/统计");
+    }
+
+    /// 0.290 商业构建:Beta 3 的 0.292 表在 id 52 前多一个普通字符串槽,
+    /// 后续系统变量整体后移。结构对齐必须把 `_SYSTEM_VERSION` 放到 53,
+    /// 新增槽位用 `_SYSVAR_0052`,不按版本号硬编码。
+    #[test]
+    fn beta3_commercial_insertion_is_derived() {
+        let base = SysVarTable::from_tsv(ABI_TSV_0292, "sysvar-abi-0292-e7016b1e.tsv");
+        let mut records = Vec::new();
+        for id in 0..52usize {
+            let d = &base.decls[id];
+            records.push(rec(id as u16, d.value_type, d.dims.clone()));
+        }
+        records.push(rec(52, 3, Vec::new()));
+        for id in 52..60usize {
+            let d = &base.decls[id];
+            records.push(rec((id + 1) as u16, d.value_type, d.dims.clone()));
+        }
+        let vars = VarImage { version: 290, records };
+        let sel = SysVarTable::select_for(&vars).expect("0.290 变体应派生");
+        assert_eq!(sel.covers, "0290");
+        assert_eq!(
+            sel.get(52).unwrap().name,
+            "_SAVE_PATH",
+            "`_PROJECT_PATH` 后的 STR 插入槽按官方槽位命名"
+        );
+        assert_eq!(sel.get(53).unwrap().name, "_SYSTEM_VERSION");
+        assert_eq!(sel.get(54).unwrap().name, "_SCREEN_COLOR");
+        assert!(sel.derivation.as_deref().is_some_and(|d| d.contains("0292")));
+    }
+
+    /// 0.263 商业构建:Beta 2 的 0.255 表删掉 32 个 `_PAD_BUTTONn` 与
+    /// 32 个 `_PADNUM_BUTTONn`,保留方向槽 + 合并槽。对齐必须落在方向槽
+    /// (`_PAD_UP..RIGHT`),而不是块尾的 `_PAD_BUTTON29..32`。
+    #[test]
+    fn beta2_commercial_block_removal_is_derived() {
+        let base = SysVarTable::from_tsv(ABI_TSV_0255, "sysvar-abi-0255-81a05c0c.tsv");
+        let mut records = Vec::new();
+        let mut next = 0u16;
+        for (id, d) in base.decls.iter().enumerate() {
+            if (211..=242).contains(&id) || (375..=406).contains(&id) {
+                continue;
+            }
+            let mut dims = d.dims.clone();
+            if id == 14 {
+                dims = vec![1024];
+            }
+            records.push(rec(next, d.value_type, dims));
+            next += 1;
+        }
+        let vars = VarImage { version: 263, records };
+        let sel = SysVarTable::select_for(&vars).expect("0.263 变体应派生");
+        assert_eq!(sel.covers, "0263");
+        assert_eq!(sel.get(210).unwrap().name, "_PAD_RIGHT");
+        assert_eq!(sel.get(211).unwrap().name, "_PAD_BUTTON");
+        assert_eq!(sel.get(212).unwrap().name, "_MOUSENUM_L");
+        assert_eq!(sel.get(339).unwrap().name, "_PADNUM_UP");
+        assert_eq!(sel.get(343).unwrap().name, "_PADNUM_BUTTON");
+        assert_eq!(sel.get(14).unwrap().name, "_DROPFILE");
+        assert_eq!(sel.get(14).unwrap().dims, vec![1024]);
+    }
+
+    fn rec(id: u16, ty: u8, dims: Vec<u32>) -> crate::tables::VarRecord {
+        crate::tables::VarRecord {
+            kind: 1,
+            group: 0,
+            script_id: 0,
+            var_id: id,
+            value_type: ty,
+            dims,
+            init: crate::tables::VarInit::None,
+        }
     }
 
     /// v555 形态(Likely):548 前缀 + 尾部追加项 ⇒ 仍归 0495 族

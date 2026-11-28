@@ -735,6 +735,19 @@ impl ScriptFile {
     pub fn code_offset_at(&self, pc: usize) -> Option<u32> {
         self.code_offsets.get(pc).copied()
     }
+
+    /// V2:code 段字节偏移 → 组下标,偏移不在指令起点时取覆盖它的组。
+    ///
+    /// 官方执行位(SCRIPTPOS 的 `pc` 与 IF/GOSUB/LOOP 帧)存的是 code
+    /// 字节偏移;内核执行期只消费组下标,读档/`TASK` 恢复走本映射。
+    #[must_use]
+    pub fn pc_covering_code_offset(&self, offset: u32) -> Option<u32> {
+        match self.code_offsets.binary_search(&offset) {
+            Ok(pc) => u32::try_from(pc).ok(),
+            Err(0) => None,
+            Err(next) => u32::try_from(next - 1).ok(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 装配

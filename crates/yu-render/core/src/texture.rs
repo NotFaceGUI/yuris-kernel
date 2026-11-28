@@ -1937,6 +1937,15 @@ fn decode_asset(bytes: &[u8], _tuning: RenderTuning) -> Result<Texture, String> 
             rgba: image.rgba,
         });
     }
+    // 32bpp BI_RGB BMP:官方手册 `cg/cg.html` 明确「BMP は 32bitBMP
+    // (24bit画像＋α画像)に対応」。`image` crate 对 BI_RGB 32bpp 走
+    // `RGB32`(第 4 字节不参与解码,输出 alpha=255),会把带白底/透明洞的
+    // 老 UI 资产画成实心。这里在通用解码前补一条 BGRA 路径:
+    // - 任意 alpha 字节非 0 ⇒ 按真实 alpha;
+    // - 全 0 ⇒ 旧式"第 4 字节未使用"资产,回退不透明(避免整层消失)。
+    if let Some(result) = decode_bmp32_bgra(bytes) {
+        return result;
+    }
     #[cfg(target_os = "android")]
     if is_png(bytes) && _tuning.png_backend == PngBackend::Libpng {
         // 后端选择来自宿主参数(`EngineOptions.tuning.png_backend`;Android
@@ -1974,6 +1983,75 @@ fn decode_asset(bytes: &[u8], _tuning: RenderTuning) -> Result<Texture, String> 
     }
     decode_with_image(bytes)
 }
+/// 32bpp BI_RGB BMP → RGBA。返回 `None` = 不是该格式,交给后续解码器。
+///
+/// 只接管 `compression == 0` 的 32bpp;`BI_BITFIELDS` 仍由 `image` 处理。
+fn decode_bmp32_bgra(bytes: &[u8]) -> Option<Result<Texture, String>> {
+    if bytes.len() < 54 || &bytes[0..2] != b"BM" {
+        return None;
+    }
+    let u16_at = |off: usize| u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+    let u32_at = |off: usize| {
+        u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+    };
+    let i32_at = |off: usize| {
+        i32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+    };
+    let data_off = u32_at(10) as usize;
+    let dib = u32_at(14);
+    if dib < 40 {
+        return None;
+    }
+    let width = i32_at(18);
+    let height = i32_at(22);
+    let bpp = u16_at(28);
+    let compression = u32_at(30);
+    if width <= 0 || height == 0 || bpp != 32 || compression != 0 {
+        return None;
+    }
+    let w = width as usize;
+    let h = height.unsigned_abs() as usize;
+    let stride = w.saturating_mul(4);
+    let Some(end) = data_off.checked_add(stride.saturating_mul(h)) else {
+        return Some(Err("BMP32 像素区偏移溢出".to_string()));
+    };
+    if end > bytes.len() {
+        return Some(Err(format!(
+            "BMP32 像素区截断: need {end}, got {}",
+            bytes.len()
+        )));
+    }
+    let top_down = height < 0;
+    let mut rgba = vec![0u8; w.saturating_mul(h).saturating_mul(4)];
+    let mut any_alpha = false;
+    for y in 0..h {
+        let src_y = if top_down { y } else { h - 1 - y };
+        let row = &bytes[data_off + src_y * stride..data_off + (src_y + 1) * stride];
+        let dst = &mut rgba[y * stride..(y + 1) * stride];
+        for x in 0..w {
+            let b = row[x * 4];
+            let g = row[x * 4 + 1];
+            let r = row[x * 4 + 2];
+            let a = row[x * 4 + 3];
+            any_alpha |= a != 0;
+            dst[x * 4] = r;
+            dst[x * 4 + 1] = g;
+            dst[x * 4 + 2] = b;
+            dst[x * 4 + 3] = a;
+        }
+    }
+    if !any_alpha {
+        for px in rgba.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+    }
+    Some(Ok(Texture {
+        width: w as u32,
+        height: h as u32,
+        rgba,
+    }))
+}
+
 /// `image` crate 解码(非 Android 的主路径,以及 Android 上 libpng 的回落)。
 ///
 /// 在 Android 上把耗时打进 logcat(`[png]` 行):这是「立绘差分切换卡」
@@ -2696,9 +2774,64 @@ mod ydg_assembly_tests {
 
 #[cfg(test)]
 mod ydg_real_sample_tests {
-    use super::decode_asset;
+    use super::{decode_asset, decode_bmp32_bgra};
+
+    /// 真实 32bpp BI_RGB BMP 样本:必须保留透明与不透明像素(不能全 255)。
+    #[test]
+    fn real_bmp32_sample_preserves_alpha() {
+        let Ok(path) = std::env::var("YURIS_SAMPLE_BMP32") else {
+            eprintln!("skip: 未设置 YURIS_SAMPLE_BMP32");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read bmp32 sample");
+        let t = decode_asset(&bytes, crate::RenderTuning::default()).expect("decode bmp32");
+        let transparent = t.rgba.chunks_exact(4).filter(|p| p[3] == 0).count();
+        let opaque = t.rgba.chunks_exact(4).filter(|p| p[3] == 255).count();
+        assert!(transparent > 0, "样本应含透明像素: {transparent}");
+        assert!(opaque > 0, "样本应含不透明像素: {opaque}");
+    }
 
     /// 真实 `<v500-relirium>` 标题背景:4 片 1920×270 拼成 1920×1080。
+    fn bmp32(w: i32, h: i32, pixels: &[[u8; 4]]) -> Vec<u8> {
+        let mut out = vec![0u8; 54];
+        out[0..2].copy_from_slice(b"BM");
+        let file_len = 54 + pixels.len() * 4;
+        out[2..6].copy_from_slice(&(file_len as u32).to_le_bytes());
+        out[10..14].copy_from_slice(&54u32.to_le_bytes());
+        out[14..18].copy_from_slice(&40u32.to_le_bytes());
+        out[18..22].copy_from_slice(&w.to_le_bytes());
+        out[22..26].copy_from_slice(&h.to_le_bytes());
+        out[26..28].copy_from_slice(&1u16.to_le_bytes());
+        out[28..30].copy_from_slice(&32u16.to_le_bytes());
+        for px in pixels {
+            out.extend_from_slice(px);
+        }
+        out
+    }
+
+    /// 32bpp BI_RGB BMP 的第 4 字节按 α 读取;全 0 α 回退不透明。
+    #[test]
+    fn bmp32_bi_rgb_uses_alpha_channel() {
+        // 2×2,正高度 = 自下而上;像素为 BGRA。
+        let pixels = [
+            [10, 20, 30, 0],
+            [40, 50, 60, 128],
+            [70, 80, 90, 255],
+            [100, 110, 120, 255],
+        ];
+        let t = decode_bmp32_bgra(&bmp32(2, 2, &pixels)).unwrap().unwrap();
+        assert_eq!((t.width, t.height), (2, 2));
+        assert_eq!(&t.rgba[0..4], &[90, 80, 70, 255]);
+        assert_eq!(&t.rgba[4..8], &[120, 110, 100, 255]);
+        assert_eq!(&t.rgba[8..12], &[30, 20, 10, 0]);
+        assert_eq!(&t.rgba[12..16], &[60, 50, 40, 128]);
+
+        let opaque = decode_bmp32_bgra(&bmp32(1, 1, &[[1, 2, 3, 0]]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(&opaque.rgba[..], &[3, 2, 1, 255]);
+    }
+
     /// 缺样本时显式跳过并打印(不“空跑通过”)。
     #[test]
     fn real_title_background_decodes_full_canvas() {

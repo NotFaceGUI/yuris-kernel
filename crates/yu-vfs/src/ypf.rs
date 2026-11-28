@@ -716,6 +716,13 @@ pub struct YpfSource {
     /// `HashMap`(与 `DirSource.files` 同口径)。`LookupKey` 实现
     /// `Borrow<[u8]>`,按原始字节查也行。
     lookup: HashMap<LookupKey, usize>,
+    /// ASCII 大小写不敏感回退表(值 `None` = 同小写名有多个条目,拒绝猜)。
+    ///
+    /// 证据:0.290 `<merichri>` 的 productlib 脚本请求
+    /// `cgsys/logo/logo_R`,而 `cgsys.ypf` 里只有 `logo_r.png`;官方
+    /// Windows 引擎按大小写不敏感命中(标题中间的漩涡可见),内核旧实现
+    /// 精确比较 ⇒ 该层空、logo 中间缺一块。
+    lookup_ci: HashMap<Vec<u8>, Option<usize>>,
     tree: DirTree,
     file: Mutex<File>,
     warnings: Vec<Diag>,
@@ -847,6 +854,18 @@ impl YpfSource {
             }
             tree.insert_file(&info.normalized, info.uncompressed_size as u64)?;
         }
+        // 大小写不敏感回退:官方 Windows 引擎的文件名比较不区分大小写。
+        // 同小写名出现多条时置 `None`,查找拒绝猜(仍可用精确名命中)。
+        let mut lookup_ci: HashMap<Vec<u8>, Option<usize>> = HashMap::new();
+        for (idx, info) in entries.iter().enumerate() {
+            let key = info.normalized.as_bytes().to_ascii_lowercase();
+            match lookup_ci.get_mut(&key) {
+                Some(slot) => *slot = None,
+                None => {
+                    lookup_ci.insert(key, Some(idx));
+                }
+            }
+        }
 
         Ok(Self {
             path,
@@ -864,6 +883,7 @@ impl YpfSource {
             stats,
             entries,
             lookup,
+            lookup_ci,
             tree,
             file: Mutex::new(file),
             warnings,
@@ -872,6 +892,16 @@ impl YpfSource {
 
     pub fn header(&self) -> &YpfHeader {
         &self.header
+    }
+
+    /// 精确名优先;未命中时按 ASCII 大小写不敏感回退(官方 Windows 语义)。
+    fn entry_index(&self, path: &LookupKey) -> Option<usize> {
+        self.lookup.get(path).copied().or_else(|| {
+            self.lookup_ci
+                .get(&path.as_bytes().to_ascii_lowercase())
+                .copied()
+                .flatten()
+        })
     }
 
     /// 封包在文件内的起点(独立 `.ypf` = 0;EXE 内嵌 = YPF 魔数偏移)。
@@ -995,7 +1025,7 @@ impl DataSource for YpfSource {
     /// 前者需要 zlib 从头部完整解码,后者本来就等于整读。两种情况都保留
     /// `verify_payload_hash` 的完整校验语义,不会「假装校验过」。
     fn open_prefix(&self, path: &LookupKey, max: usize) -> Result<Vec<u8>, Diag> {
-        let Some(&idx) = self.lookup.get(path) else {
+        let Some(idx) = self.entry_index(path) else {
             return Err(missing(path, self.source_name()));
         };
         let entry = &self.entries[idx];
@@ -1032,7 +1062,7 @@ impl DataSource for YpfSource {
     }
 
     fn open(&self, path: &LookupKey) -> Result<Vec<u8>, Diag> {
-        let Some(&idx) = self.lookup.get(path) else {
+        let Some(idx) = self.entry_index(path) else {
             return Err(missing(path, self.source_name()));
         };
         let entry = &self.entries[idx];
@@ -1060,7 +1090,7 @@ impl DataSource for YpfSource {
     }
 
     fn exists(&self, path: &LookupKey) -> bool {
-        self.lookup.contains_key(path)
+        self.entry_index(path).is_some()
     }
 
     fn list(&self, path: &LookupKey) -> Result<Vec<Entry>, Diag> {
@@ -1121,7 +1151,11 @@ impl Candidate {
     fn reject_detail(&self) -> String {
         match &self.reject {
             Some((at, reason)) => format!("{reason} (at {at:#x})"),
-            None => "index closed but candidate is not usable".to_string(),
+            None => format!(
+                "index closed but candidate is not usable (name hashes {}/{})",
+                self.name_hash_matches,
+                self.entries.len()
+            ),
         }
     }
 }
@@ -1430,6 +1464,7 @@ fn parse_index(
     let mut type_counts: BTreeMap<u8, usize> = BTreeMap::new();
     let mut bad_compression = None;
     let mut reject: Option<(usize, String)> = None;
+    let mut zero_padded = false;
 
     for i in 0..entry_count as usize {
         let Some(head) = pos.checked_add(5) else {
@@ -1547,14 +1582,28 @@ fn parse_index(
     }
 
     if reject.is_none() && pos != block.len() {
-        reject = Some((
-            pos,
-            format!(
-                "index walk ended at {pos:#x}, expected {:#x} (delta {})",
-                block.len(),
-                block.len() as i64 - pos as i64
-            ),
-        ));
+        // 0.290 商业重打包样本(`<game-290b>/pac/cgsys.ypf`)的索引块
+        // 末尾有 2 字节 0 对齐填充:1940 条全部走完后 `pos = 0x1aeec`,
+        // 头部声明的索引长度是 `0x1aeee`,余下 2 字节全 0,紧随其后
+        // 就是 PNG 负载(`89 50 4e 47`)。条目数已经走满,零填充不
+        // 构成伪条目;只允许 <=7 字节的全零尾巴,其它 delta 仍拒绝。
+        let tail = &block[pos..];
+        let zero_padding = entries.len() == entry_count as usize
+            && !tail.is_empty()
+            && tail.len() <= 7
+            && tail.iter().all(|&b| b == 0);
+        if zero_padding {
+            zero_padded = true;
+        } else {
+            reject = Some((
+                pos,
+                format!(
+                    "index walk ended at {pos:#x}, expected {:#x} (delta {})",
+                    block.len(),
+                    block.len() as i64 - pos as i64
+                ),
+            ));
+        }
     }
 
     // 名字解码与哈希校验:即便字段被拒,已解析条目的哈希命中仍是
@@ -1587,7 +1636,7 @@ fn parse_index(
         index_len: block.len(),
         entries,
         consumed: pos.saturating_sub(skip),
-        closed: pos == block.len() && reject.is_none(),
+        closed: (pos == block.len() || zero_padded) && reject.is_none(),
         name_hash_matches,
         name_key,
         type_counts: type_counts.into_iter().collect(),

@@ -87,6 +87,10 @@ impl yu_rt::event::SaveHost for SaveHost {
         self.lock().flush(file)
     }
 
+    fn dno_limit(&self) -> u32 {
+        self.lock().dno_limit()
+    }
+
     fn save_end(&mut self) {
         self.lock().save_end();
     }

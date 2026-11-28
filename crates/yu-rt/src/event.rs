@@ -740,6 +740,15 @@ pub trait SaveHost {
     /// `SAVE[FILE="x"]` 刷盘(写文件头 + 偏移表 + 全部预约块)。
     fn flush(&mut self, file: &str) -> Result<(), Diag>;
 
+    /// 当前写盘布局允许的 `SAVE/LOAD` DNO 上限。
+    ///
+    /// 现代块表按 0.495 手册 `1..=1024`;旧式记录容器(0.263)没有偏移表,
+    /// 官方存档界面实际使用 1301..1307 / 2010 号元数据块,宿主返回更高
+    /// 上限。缺省保持 1024,未知布局不放宽。
+    fn dno_limit(&self) -> u32 {
+        1024
+    }
+
     /// `SAVEEND[]` 丢弃全部未刷盘预约。
     fn save_end(&mut self);
 

@@ -67,6 +67,16 @@ pub fn profile_for(version: u32) -> Option<SaveProfile> {
             btype0_var_id: Btype0VarId::Actual,
             scriptpos: WIRE_GOSUB_U16,
         }),
+        // 0.263 旧式记录容器(0x107,头 +0x0C=0;见
+        // `yssd::YssdLayout::Legacy`)。图像块布局取最近的 0.292 SDK
+        // 引擎证据(A=0x2B0,w/h@+0x258;REA `FUN_00430400`),0.290
+        // 商业存档的 w/h 同偏移。0.263 官方 exe 带加密壳(overlay 熵
+        // 8.0),常量未能独立核对 —— DIV-RT-083 记录该残余。
+        0x0107 => Some(SaveProfile {
+            image_layout: Some(image_block::LAYOUT_0292),
+            btype0_var_id: Btype0VarId::Zero,
+            scriptpos: WIRE_GOSUB_U16,
+        }),
         // 0.470–0.479(0.13):官方 LOAD 版本常量 0x138、A=0x600、
         // w/h 在 +0x70(0.479 `FUN_00440490` 0x440894;0.47x 全系
         // exe 同一常量)。官方 save00001 DNO2 为标量、btype0 var_id=0。
@@ -116,7 +126,7 @@ pub fn profile_for(version: u32) -> Option<SaveProfile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image_block::{LAYOUT_0466, LAYOUT_0479, LAYOUT_0495};
+    use crate::image_block::{LAYOUT_0292, LAYOUT_0466, LAYOUT_0479, LAYOUT_0495};
 
     /// 这张表是写盘版本策略的唯一来源:每个已取证版本都必须显式断言,
     /// 防止后续改动把某一代悄悄写错(加到新版本时在这里补一行)。
@@ -127,6 +137,12 @@ mod tests {
                 0x00C0,
                 Some(LAYOUT_0466),
                 Btype0VarId::Actual,
+                WIRE_GOSUB_U16,
+            ),
+            (
+                0x0107,
+                Some(LAYOUT_0292),
+                Btype0VarId::Zero,
                 WIRE_GOSUB_U16,
             ),
             (0x0138, Some(LAYOUT_0479), Btype0VarId::Zero, WIRE_GOSUB_U16),
@@ -182,7 +198,9 @@ mod tests {
     /// 图像布局的公开查询走同一张表(避免两处各写一份 match)。
     #[test]
     fn image_layout_query_delegates_to_profile() {
-        for version in [0x00C0, 0x0138, 0x01DA, 0x01E0, 0x01E1, 0x01E6, 0x01EF] {
+        for version in [
+            0x00C0, 0x0107, 0x0138, 0x01DA, 0x01E0, 0x01E1, 0x01E6, 0x01EF,
+        ] {
             assert_eq!(
                 image_block::layout_for_container_version(version),
                 profile_for(version).and_then(|p| p.image_layout),

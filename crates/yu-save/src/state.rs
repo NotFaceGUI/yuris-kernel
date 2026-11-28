@@ -62,6 +62,19 @@ pub struct ReservedFact {
     pub image: Option<yu_rt::event::CapturedImage>,
 }
 
+/// 从旧容器保留、写回时原样重放的一块。
+enum PreservedBlock {
+    /// 现代布局:`12 字节块头 + 压缩载荷` 原样字节。
+    Modern(Vec<u8>),
+    /// 旧式布局:`btype/strict/var` + 未压缩载荷。
+    Legacy {
+        btype: u8,
+        strict: u8,
+        var_id: u16,
+        raw: Vec<u8>,
+    },
+}
+
 /// 槽位表的确定性快照(诊断/用例摘要用;不含时间戳等易变事实)。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SaveSnapshot {
@@ -95,6 +108,20 @@ pub struct SaveState {
     container_version: Option<u32>,
     /// 从未刷新的盘上槽文件学到的容器版本(无官方 exe 可探测时的证据)。
     learned_version: Option<u32>,
+    /// 盘上学到的容器布局(结构裁决;0.263 系统存档 = Legacy 记录表)。
+    /// 写盘必须沿用同一布局:0.263 官方 LOAD 不认识现代 0x400 偏移表,
+    /// 内核也不该把系统的 gsd/kidoku/seld 改写成另一种结构。
+    learned_layout: Option<yu_format::yssd::YssdLayout>,
+    /// 宿主显式注入的布局覆盖(无盘上样本时使用)。
+    container_layout: Option<yu_format::yssd::YssdLayout>,
+    /// 从同目录**官方存档**的图像块学到的描述符布局(A + w/h 偏移)。
+    ///
+    /// 容器版本 0xC0 横跨 0.2xx 与 0.45x 两代,图像布局并不随容器版本
+    /// 唯一确定(0.289 官方 = A=0x2B0/+0x258;0.466 = A=0x5F0/+0x68)。
+    /// 因此以盘上官方产物为准,学习优先于 `profile_for` 的静态表。
+    learned_image_layout: Option<crate::image_block::Layout>,
+    /// 从同目录存档学到的 btype 0 `var_id` 策略(官方 0.289/0.290 = 0)。
+    learned_btype0_var_id: Option<crate::profile::Btype0VarId>,
     /// 块载荷压缩层:从盘上 `.sd` 学到的值(0.495 SDK = zlib;0.481 商业包
     /// 随包带 `YSSnp.dll` = Snappy)。`None` = 还没见过存档 ⇒ 写 zlib。
     block_codec: Option<yu_format::yssd::BlockCodec>,
@@ -199,6 +226,10 @@ impl SaveState {
             slots: BTreeMap::new(),
             container_version: None,
             learned_version: None,
+            learned_layout: None,
+            container_layout: None,
+            learned_image_layout: None,
+            learned_btype0_var_id: None,
             block_codec: None,
             image_layout_override: None,
             duplicate_dno_error: false,
@@ -296,6 +327,11 @@ impl SaveState {
         };
         // 盘上容器版本样本(名字 + 版本);循环后统一选举,见 `elect_version`。
         let mut versions: Vec<(String, u32)> = Vec::new();
+        // 盘上布局:同目录只该有一种;若混入了本引擎早先写错的现代容器,
+        // 以旧式(Legacy)为准 —— 能写出 Legacy 的目录说明官方引擎是旧式,
+        // 现代文件反而是本引擎的旧产物。
+        let mut saw_legacy = false;
+        let mut saw_modern = false;
         for entry in entries {
             // 与旧 `path.extension() == Some("sd")` 同口径（大小写敏感）。
             if entry.is_dir || !entry.name.ends_with(".sd") {
@@ -313,6 +349,10 @@ impl SaveState {
             match yu_format::yssd::YssdSave::parse(&bytes, name.as_bytes()) {
                 Ok(save) => {
                     versions.push((name.clone(), save.version));
+                    match save.layout {
+                        yu_format::yssd::YssdLayout::Legacy => saw_legacy = true,
+                        yu_format::yssd::YssdLayout::Modern => saw_modern = true,
+                    }
                     // 压缩层同样只学一次:取**第一条能判定**的单层块
                     // (`btype 2` 的外层裸流与 `DNO=1024` 嵌套槽判不了,跳过)。
                     if self.block_codec.is_none() {
@@ -322,10 +362,37 @@ impl SaveState {
                             .find_map(yu_format::yssd::BlockCodec::detect);
                     }
                     let mut dnos = BTreeMap::new();
+                    let mut saw_btype0 = false;
+                    let mut nonzero_var = false;
                     for entry in &save.entries {
                         // 配置/多变量块没有单一目标变量 ⇒ 记 0。
                         let var = if entry.btype == 0 { entry.var_id } else { 0 };
                         dnos.insert(entry.dno, var);
+                        if entry.btype == 0 {
+                            saw_btype0 = true;
+                            nonzero_var |= entry.var_id != 0;
+                        }
+                        // 图像块布局从**官方产物**学:容器 0xC0 横跨两代,
+                        // 静态表不足以唯一确定(0.289 = A0x2B0,0.466 = A0x5F0)。
+                        if entry.btype == 1 && self.learned_image_layout.is_none() {
+                            if let Ok(raw) = entry.decompress(name.as_bytes()) {
+                                if let Some(layout) = crate::image_block::detect_layout(&raw) {
+                                    self.learned_image_layout = Some(layout);
+                                    let detail = format!(
+                                        "图像块布局从 {name} 学到 A={} w/h@+{:#x}",
+                                        layout.descriptor_len, layout.wh_offset
+                                    );
+                                    self.push_diag(error::info(code::CONTAINER, detail));
+                                }
+                            }
+                        }
+                    }
+                    if saw_btype0 {
+                        self.learned_btype0_var_id = Some(if nonzero_var {
+                            crate::profile::Btype0VarId::Actual
+                        } else {
+                            crate::profile::Btype0VarId::Zero
+                        });
                     }
                     self.slots.insert(
                         name.to_string(),
@@ -350,6 +417,11 @@ impl SaveState {
         // 见 [`elect_version`])。
         if !versions.is_empty() {
             self.learned_version = elect_version(&versions);
+        }
+        if saw_legacy {
+            self.learned_layout = Some(yu_format::yssd::YssdLayout::Legacy);
+        } else if saw_modern {
+            self.learned_layout = Some(yu_format::yssd::YssdLayout::Modern);
         }
     }
 
@@ -507,6 +579,44 @@ impl SaveState {
         self.container_version.or(self.learned_version)
     }
 
+    /// 当前写盘将采用的容器布局(宿主注入优先,其次盘上学到的;缺省现代)。
+    #[must_use]
+    pub fn container_layout(&self) -> yu_format::yssd::YssdLayout {
+        self.container_layout
+            .or(self.learned_layout)
+            .unwrap_or(yu_format::yssd::YssdLayout::Modern)
+    }
+
+    /// 当前布局允许的 `SAVE/LOAD` DNO 上限。
+    ///
+    /// 现代块表是 `1..=1024`(0.495 手册值域);旧式记录表没有偏移表,
+    /// 官方 0.263 的存档界面实际使用 1301..1307 / 2010 号元数据块
+    /// (`es_select.yst` / `es_saveload.yst` 实测),因此不设人为上限。
+    #[must_use]
+    pub fn dno_limit(&self) -> u32 {
+        match self.container_layout() {
+            yu_format::yssd::YssdLayout::Modern => 1024,
+            yu_format::yssd::YssdLayout::Legacy => u32::MAX,
+        }
+    }
+
+    /// 宿主显式指定容器布局(无盘上样本时的兜底;有样本时以盘上为准)。
+    pub fn set_container_layout(&mut self, layout: yu_format::yssd::YssdLayout) {
+        self.container_layout = Some(layout);
+    }
+
+    /// 本次写盘采用的图像块描述符布局。
+    ///
+    /// 优先级:宿主显式覆盖(v555 语义)→ 同目录官方存档学到的布局 →
+    /// `profile_for(容器版本)` 静态表。容器版本 0xC0 横跨 0.2xx/0.45x
+    /// 两代图像布局,静态表只能兜底,盘上官方产物才是事实。
+    #[must_use]
+    pub fn effective_image_layout(&self, version: u32) -> Option<crate::image_block::Layout> {
+        self.image_layout_override
+            .or(self.learned_image_layout)
+            .or_else(|| crate::image_block::layout_for_container_version(version))
+    }
+
     /// 宿主注入**官方引擎的写盘容器版本**(官方 exe LOAD 校验常量)。
     ///
     /// 这是写盘器常量,不是工程 yscfg/引擎版本(0.495 工程 yscfg 是
@@ -559,10 +669,11 @@ impl SaveState {
     /// 块缓冲。普通块重复预约由 [`Self::set_duplicate_dno_error`] 拒绝;
     /// 包与普通 1024 相遇时包覆盖(官方不查重复)。
     fn check_reservable_dno(&self, dno: u32) -> Result<(), Diag> {
-        if !(0..=1024).contains(&dno) {
+        let limit = self.dno_limit();
+        if dno > limit {
             return Err(error::recoverable(
                 code::ARG_RANGE,
-                format!("SAVE DNO={dno} 越界(0..=1024)"),
+                format!("SAVE DNO={dno} 越界(0..={limit})"),
             ));
         }
         if self.duplicate_dno_error && self.staged_dnos.contains(&dno) {
@@ -623,14 +734,15 @@ impl SaveState {
         }
         // 旧容器读/解析失败只挂号并走“从零重建”(保持既有可玩性);
         // 只有 NotFound 才是真正的空表。
-        let preserved = match self.existing_blocks(&path) {
+        let (target_layout, preserved) = match self.existing_blocks(&path) {
             Ok(preserved) => preserved,
             Err(d) => {
                 image_layout_diags.push(d);
-                BTreeMap::new()
+                (None, BTreeMap::new())
             }
         };
         let bytes = self.build_container(
+            target_layout,
             target_version,
             &source,
             &mut image_layout_diags,
@@ -670,7 +782,7 @@ impl SaveState {
     /// 预约表同样不清(官方 `SAVEEND` 才清)。
     pub fn save_mem(&mut self, slot: u32) -> Result<(), Diag> {
         let mut diags = Vec::new();
-        let preserved = BTreeMap::new();
+        let (target_layout, preserved) = (None, BTreeMap::new());
         // 官方 MEM 分支序列化的是当前块缓冲,`SAVE[MEM=99999]` 的包
         // 已经暂存在 DNO=1024 缓冲里,因此内存槽容器也带该块;序列化
         // 后 `FUN_00469ac0(-1)` 清全部缓冲,包不再等下一次文件存档。
@@ -681,6 +793,7 @@ impl SaveState {
         };
         let had_pack = mem_pack_block.is_some();
         let bytes = self.build_container(
+            target_layout,
             None,
             &format!("SAVE[MEM={slot}]"),
             &mut diags,
@@ -911,7 +1024,7 @@ impl SaveState {
         Ok(())
     }
 
-    /// 读取目标文件已有的块体(`dno -> YSSD 块体`)。
+    /// 读取目标文件已有的块体(`dno -> 保留块`),并带回容器布局。
     ///
     /// 官方 `SAVE[FILE]` 是**更新已有容器**:本次未预约的旧块仍然写回。
     /// 证据:`es_textkidoku.yst` 的 `INFO.SAVE` 只预约 1001..1004,
@@ -921,10 +1034,15 @@ impl SaveState {
     /// 只有目标文件**不存在**才静默返回空表;读/解析失败返回诊断,由调用方
     /// 挂号后走“从零重建”。不把失败升级成 SAVE 失败——旧档格式不合时
     /// 让游戏继续能存(代价是旧块不保留),可玩性优先。
-    fn existing_blocks(&self, path: &Path) -> Result<BTreeMap<u32, Vec<u8>>, Diag> {
+    fn existing_blocks(
+        &self,
+        path: &Path,
+    ) -> Result<(Option<yu_format::yssd::YssdLayout>, BTreeMap<u32, PreservedBlock>), Diag> {
         let bytes = match self.fs.read(path) {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((None, BTreeMap::new()))
+            }
             Err(e) => {
                 return Err(error::recoverable(
                     code::FILE_READ,
@@ -944,24 +1062,37 @@ impl SaveState {
                 ),
             )
         })?;
-        Ok(save
+        let blocks = save
             .entries
             .iter()
             .map(|entry| {
-                let mut body = Vec::with_capacity(12 + entry.compressed.len());
-                body.push(entry.btype);
-                body.push(entry.strict);
-                body.extend_from_slice(&entry.var_id.to_le_bytes());
-                body.extend_from_slice(
-                    &u32::try_from(entry.compressed.len())
-                        .unwrap_or(u32::MAX)
-                        .to_le_bytes(),
-                );
-                body.extend_from_slice(&entry.ulen.to_le_bytes());
-                body.extend_from_slice(&entry.compressed);
-                (entry.dno, body)
+                let block = match &entry.raw {
+                    // 旧式记录:载荷未压缩,原样保留(btype/strict/var 也照抄)。
+                    Some(raw) => PreservedBlock::Legacy {
+                        btype: entry.btype,
+                        strict: entry.strict,
+                        var_id: entry.var_id,
+                        raw: raw.clone(),
+                    },
+                    None => {
+                        let mut body = Vec::with_capacity(12 + entry.compressed.len());
+                        body.push(entry.btype);
+                        body.push(entry.strict);
+                        body.extend_from_slice(&entry.var_id.to_le_bytes());
+                        body.extend_from_slice(
+                            &u32::try_from(entry.compressed.len())
+                                .unwrap_or(u32::MAX)
+                                .to_le_bytes(),
+                        );
+                        body.extend_from_slice(&entry.ulen.to_le_bytes());
+                        body.extend_from_slice(&entry.compressed);
+                        PreservedBlock::Modern(body)
+                    }
+                };
+                (entry.dno, block)
             })
-            .collect())
+            .collect();
+        Ok((Some(save.layout), blocks))
     }
 
     /// 玩家存档文件名(`save*.sd`)判定,只用于 `MEM=99999` 消费时机留痕。
@@ -980,10 +1111,11 @@ impl SaveState {
     /// 调用方在目标落定后统一 `push_diag`,保持与旧 `flush` 相同的时序。
     fn build_container(
         &mut self,
+        target_layout: Option<yu_format::yssd::YssdLayout>,
         target_version: Option<u32>,
         source: &str,
         diags: &mut Vec<Diag>,
-        preserved: BTreeMap<u32, Vec<u8>>,
+        preserved: BTreeMap<u32, PreservedBlock>,
         mem_pack_block: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, Diag> {
         let codec = self.block_codec.unwrap_or_default();
@@ -1006,6 +1138,20 @@ impl SaveState {
                 version
             }
         };
+        let layout = self
+            .container_layout
+            .or(target_layout)
+            .or(self.learned_layout)
+            .unwrap_or(yu_format::yssd::YssdLayout::Modern);
+        if layout == yu_format::yssd::YssdLayout::Legacy {
+            return self.build_legacy_container(
+                version,
+                source,
+                diags,
+                preserved,
+                mem_pack_block,
+            );
+        }
         let mut writer = yu_format::yssd::YssdWriter::new(version);
         // 压缩层沿用同目录存档(0.495 = zlib;0.481 商业包 = Snappy);
         // 还没见过任何存档时用 zlib,与 0.495 官方产物逐字节一致。
@@ -1019,12 +1165,23 @@ impl SaveState {
         // 其余版本继续按容器版本档案(0.479=A1536,0.495/0.481=A1600)。
         let image_layout = self
             .image_layout_override
+            .or(self.learned_image_layout)
             .or_else(|| save_profile.and_then(|p| p.image_layout));
-        let btype0_var_id = save_profile.map(|p| p.btype0_var_id);
+        let btype0_var_id = self
+            .learned_btype0_var_id
+            .or_else(|| save_profile.map(|p| p.btype0_var_id));
         // 先放旧块,预约块随后覆盖同 DNO;这是官方 `SAVE[FILE]` 的更新语义。
         // 旧块体按值移动,不再逐块 clone,大存档重写少一轮整块拷贝。
-        for (dno, body) in preserved {
-            writer.set_block(dno, body);
+        for (dno, block) in preserved {
+            match block {
+                PreservedBlock::Modern(body) => writer.set_block(dno, body),
+                PreservedBlock::Legacy { .. } => diags.push(error::verbose(
+                    code::CONTAINER,
+                    format!(
+                        "{source} DNO={dno}: 旧文件是旧式记录容器而本次按现代块表写,跳过该块"
+                    ),
+                )),
+            }
         }
         for fact in self.reservations.values() {
             match fact.btype {
@@ -1101,6 +1258,91 @@ impl SaveState {
         }
         if let Some(body) = mem_pack_block {
             writer.set_block(1024, body);
+        }
+        Ok(writer.build())
+    }
+
+    /// 旧式记录容器(0.263 布局)的写盘路径。
+    ///
+    /// 保留块原样重放;预约的变量块写成 `id + 0/0/0 + YssdValue`(官方
+    /// 三份系统存档的 btype/strict/var 全为 0)。图像块与多变量块在
+    /// 0.263 的载荷布局未取证(手上没有官方玩家存档),跳过并挂号;
+    /// 变量块照常落盘,先保证存/读档闭环不静默丢数据。
+    fn build_legacy_container(
+        &mut self,
+        version: u32,
+        source: &str,
+        diags: &mut Vec<Diag>,
+        preserved: BTreeMap<u32, PreservedBlock>,
+        mem_pack_block: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, Diag> {
+        let mut writer = yu_format::yssd::YssdLegacyWriter::new(version);
+        for (dno, block) in preserved {
+            match block {
+                PreservedBlock::Legacy {
+                    btype,
+                    strict,
+                    var_id,
+                    raw,
+                } => writer.set_block(dno, btype, strict, var_id, raw),
+                PreservedBlock::Modern(_) => diags.push(error::verbose(
+                    code::CONTAINER,
+                    format!(
+                        "{source} DNO={dno}: 旧文件是现代块表而本次按旧式记录写,跳过该块"
+                    ),
+                )),
+            }
+        }
+        for fact in self.reservations.values() {
+            match fact.btype {
+                0 => {
+                    let Some(snap) = &fact.snap else { continue };
+                    let payload = snapshot_payload(snap)?;
+                    writer.set_block(fact.dno, 0, 0, 0, payload.to_bytes());
+                }
+                1 => {
+                    let Some(image) = &fact.image else { continue };
+                    let Some(layout) = self.effective_image_layout(version) else {
+                        diags.push(error::recoverable(
+                            code::IMAGE_LAYOUT,
+                            format!(
+                                "{source} DNO={}: 旧式容器(0.263)容器版本 {version:#x} \
+                                 的图像块布局未取证,跳过该缩略图块(变量块照常写盘)",
+                                fact.dno
+                            ),
+                        ));
+                        continue;
+                    };
+                    // 旧式记录载荷不压缩:直接把 `[A][B][描述符][BGRA]` 写进记录。
+                    writer.set_block(
+                        fact.dno,
+                        1,
+                        0,
+                        0,
+                        crate::image_block::encode(image, layout),
+                    );
+                }
+                2 => diags.push(error::recoverable(
+                    code::CONTAINER,
+                    format!(
+                        "{source} DNO={}: 旧式容器(0.263)的多变量块(btype 2)布局未取证,\
+                         跳过该块",
+                        fact.dno
+                    ),
+                )),
+                other => {
+                    return Err(error::recoverable(
+                        code::INTERNAL,
+                        format!("未知预约块类型 {other}"),
+                    ));
+                }
+            }
+        }
+        if mem_pack_block.is_some() {
+            diags.push(error::verbose(
+                code::CONTAINER,
+                format!("{source}: 旧式容器(0.263)无 SAVE[MEM=99999] 内存包,忽略该块"),
+            ));
         }
         Ok(writer.build())
     }
@@ -1631,23 +1873,26 @@ impl SaveState {
                 ))
             };
         }
-        if name.contains('\\') {
+        // 相对形式:官方 CWD = 工程根。0.263 读档脚本实测用
+        // `save/saveNNN.sd`(不带 `$_SAVE_PATH` 前缀);系统存档用裸文件名
+        // (`gsd.sd`/`kidoku.sd`)。两种都接到**真实 save 根**:
+        // `save/` 前缀去掉(它只是工程根下的官方目录名,`--save-root`
+        // 重定向后真实根可能在别处),其余相对名直接落根。
+        let normalized = name.replace('\\', "/");
+        let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+        let rel = normalized.strip_prefix("save/").unwrap_or(normalized);
+        if rel.is_empty() {
+            return Err(error::recoverable(code::ARG_MISSING, "路径名为空"));
+        }
+        if rel.split('/').any(|c| c == "..") {
             return Err(error::recoverable(
                 code::PATH_ESCAPE,
-                format!("路径非 save 根内相对形式: {name}"),
+                format!("路径含 `..`: {name}"),
             ));
         }
-        let joined = self.root.join(raw);
+        let joined = self.root.join(rel);
         let Some(resolved) = self.fs.canonicalize(&joined) else {
             // 目标不存在时退化为词法归一化(仍拒绝 `..` 分量)。
-            for comp in raw.components() {
-                if matches!(comp, std::path::Component::ParentDir) {
-                    return Err(error::recoverable(
-                        code::PATH_ESCAPE,
-                        format!("路径含 `..`: {name}"),
-                    ));
-                }
-            }
             return Ok(joined);
         };
         let Some(root) = self.fs.canonicalize(&self.root) else {
@@ -1993,6 +2238,142 @@ mod tests {
         assert!((0..=2001).contains(&sel), "seld[1]={sel} 越出选项号域");
     }
 
+    /// 旧式记录容器(0.263):布局从盘上 `.sd` 学到;>1024 的 DNO
+    /// (存档界面元数据 1301..1307 / 2010)不被拒;系统存档改写真逐字节一致。
+    #[test]
+    fn legacy_layout_learned_from_disk_allows_high_dno_and_rewrites_exactly() {
+        let root = temp_root("sv-unit-legacy");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let initial = {
+            let mut data = Vec::new();
+            data.extend_from_slice(&3i64.to_le_bytes());
+            data.extend_from_slice(&4i64.to_le_bytes());
+            let value = yu_format::yssd::YssdValue {
+                ty: yu_format::yssd::YssdValueType::Int,
+                dims: vec![2],
+                data,
+            };
+            let mut writer = yu_format::yssd::YssdLegacyWriter::new(0x107);
+            writer.set_block(1, 0, 0, 0, value.to_bytes());
+            writer.build()
+        };
+        std::fs::write(root.join("gsd.sd"), &initial).unwrap();
+
+        let mut state = SaveState::new(&root, true);
+        state.refresh_slots();
+        assert_eq!(
+            state.container_layout(),
+            yu_format::yssd::YssdLayout::Legacy
+        );
+        assert_eq!(state.dno_limit(), u32::MAX);
+
+        // 无预约的改写真:旧块原样重放,逐字节一致。
+        state.flush("gsd.sd").expect("rewrite gsd");
+        assert_eq!(std::fs::read(root.join("gsd.sd")).unwrap(), initial);
+
+        // 0.263 存档界面的高位元数据块号(>1024)必须能预约/写/读;
+        // 缩略图块(btype 1)按旧代布局 A=0x2B0/+0x258 写,读回同像素。
+        state
+            .reserve(
+                2010,
+                VarRef::new(VarSpace::Dollar, 1112),
+                &int_snapshot(&[7, 8], &[2]),
+            )
+            .expect("reserve dno 2010");
+        let image = yu_rt::event::CapturedImage {
+            width: 4,
+            height: 3,
+            rgba: (0..48).map(|i| (i * 5) as u8).collect(),
+        };
+        state.reserve_image(2, &image).expect("reserve thumb");
+        state.flush("save002.sd").expect("flush legacy save");
+        let bytes = std::fs::read(root.join("save002.sd")).unwrap();
+        assert_eq!(&bytes[0x0c..0x10], &[0, 0, 0, 0], "旧式头 +0x0C = 0");
+        let save = yu_format::yssd::YssdSave::parse(&bytes, b"save002.sd").unwrap();
+        assert_eq!(save.layout, yu_format::yssd::YssdLayout::Legacy);
+        assert!(save.entry(2010).is_some(), "高位 DNO 未写入");
+        assert_eq!(save.entry(2).expect("thumb").btype, 1, "缩略图块类型");
+        let block = state.load_block("save002.sd", 2010).expect("load 2010");
+        assert_eq!(block.vars[0].snap.dims, vec![2]);
+        assert_eq!(
+            block.vars[0].snap.data,
+            vec![Value::Int(7), Value::Int(8)]
+        );
+        assert_eq!(
+            state.load_image("save002.sd", 2).expect("load thumb"),
+            image
+        );
+    }
+
+    /// 0.289 官方存档(容器 0xC0)的静态特征:图像块 A=0x2B0/+0x258、
+    /// btype 0 的 var_id 全 0。内核必须从**盘上官方产物**学到这两点,
+    /// 不能按容器版本表猜(0xC0 同时横跨 0.466 的 A=0x5F0 布局)。
+    #[test]
+    fn official_style_save_teaches_image_layout_and_var_id() {
+        let root = temp_root("sv-unit-learn-layout");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let image = yu_rt::event::CapturedImage {
+            width: 2,
+            height: 2,
+            rgba: vec![0x40; 16],
+        };
+        let value = yu_format::yssd::YssdValue {
+            ty: yu_format::yssd::YssdValueType::Int,
+            dims: Vec::new(),
+            data: 5i64.to_le_bytes().to_vec(),
+        };
+        let mut writer = yu_format::yssd::YssdWriter::new(0x00C0);
+        writer.set_block(
+            1,
+            yu_format::yssd::encode_block_body(0, 1, 0, &value.to_bytes()),
+        );
+        writer.set_block(
+            3,
+            yu_format::yssd::encode_block_body(
+                1,
+                1,
+                0,
+                &crate::image_block::encode(&image, crate::image_block::LAYOUT_0292),
+            ),
+        );
+        std::fs::write(root.join("save00001.sd"), writer.build()).unwrap();
+
+        let mut state = SaveState::new(&root, true);
+        state.refresh_slots();
+        assert_eq!(
+            state.effective_image_layout(0x00C0),
+            Some(crate::image_block::LAYOUT_0292),
+            "镜像布局应从官方存档学到,而不是用 0xC0 静态表(0x5F0)"
+        );
+        assert_eq!(
+            state.learned_btype0_var_id,
+            Some(crate::profile::Btype0VarId::Zero),
+            "官方 0.289 btype0 var_id 全 0"
+        );
+
+        // 新写一块:布局与 var_id 都必须沿用官方样本。
+        state
+            .reserve(
+                1,
+                VarRef::new(VarSpace::Dollar, 1112),
+                &int_snapshot(&[1], &[]),
+            )
+            .unwrap();
+        state.reserve_image(3, &image).unwrap();
+        state.flush("save00002.sd").unwrap();
+        let bytes = std::fs::read(root.join("save00002.sd")).unwrap();
+        let save = yu_format::yssd::YssdSave::parse(&bytes, b"save00002.sd").unwrap();
+        assert_eq!(save.entry(1).expect("dno1").var_id, 0, "var_id 策略");
+        let raw = save.entry(3).expect("dno3").decompress(b"x").unwrap();
+        assert_eq!(
+            u32::from_le_bytes(raw[0..4].try_into().unwrap()),
+            0x2B0,
+            "图像 A 段必须与官方样本一致"
+        );
+    }
+
     #[test]
     fn refresh_slots_reads_container_facts() {
         // 用 yu-format 的写路径造一个最小官方形态容器(合成,不依赖语料)。
@@ -2145,6 +2526,32 @@ mod tests {
             code::PATH_ESCAPE
         );
         assert_eq!(state.confined_path("").unwrap_err().code, code::ARG_MISSING);
+    }
+
+    /// 0.263 读档脚本传 **CWD 相对** `save/saveNNN.sd`(`es_saveload.yst`
+    /// 实测,不带 `$_SAVE_PATH` 前缀):必须落到 save 根下 `saveNNN.sd`。
+    /// 旧实现直接 `root.join(name)` 会变成 `<save>/save/saveNNN.sd`,
+    /// LOAD 恒缺档、读档界面点击无反应。
+    #[test]
+    fn confined_path_maps_relative_save_prefix_into_root() {
+        let root = temp_root("sv-unit-rel");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = SaveState::new(&root, false);
+        assert_eq!(
+            state.confined_path("save/save001.sd").unwrap(),
+            root.join("save001.sd")
+        );
+        assert_eq!(
+            state.confined_path("save\\save001.sd").unwrap(),
+            root.join("save001.sd")
+        );
+        // 裸文件名仍是 save 根下(系统存档 gsd.sd 的既有约定)。
+        assert_eq!(state.confined_path("gsd.sd").unwrap(), root.join("gsd.sd"));
+        // `save/../x` 仍拒绝。
+        assert_eq!(
+            state.confined_path("save/../x.sd").unwrap_err().code,
+            code::PATH_ESCAPE
+        );
     }
 
     /// `SAVE[DNO ID=图层]` → 容器 → `LOAD[ID]` 闭环:块必须是 btype 1,

@@ -2213,23 +2213,50 @@ fn apply_image_pixels(
     }
 
     // ---------------- 其余:需要整块像素的原地动作 ----------------
-    let current = match contents.get(target).cloned() {
-        Some(content) => content,
-        None => resolve_target_base(
-            ctx,
-            frame,
-            layers,
-            textures,
-            gpu,
-            targets,
-            target,
-            bases,
-            target_fallback,
-            image.target_base.as_ref(),
-            // 只有 `RESIZE` 会填 `resize_base`;其余动作传 `None`,与
-            // soft 的 `base_texture(..., solid_size)` 同一口径。
-            image.resize_base,
-        )?,
+    // `ID2` 原地滤镜(源 != 目标):官方读**源层**像素、写目标层。若从
+    // 目标基面起始,0.290 标题 logo 的
+    // `ROTATION ID=LOGO.BUF ID2=LOGO.1` 旋转的就是空白目标,中间的漩涡丢失。
+    let filter_from_source = image
+        .target
+        .as_ref()
+        .is_some_and(|t| t != &image.source)
+        && image.action.is_in_place_filter();
+    let current = if filter_from_source {
+        match contents.get(&image.source).cloned() {
+            Some(content) => content,
+            None => resolve_target_base(
+                ctx,
+                frame,
+                layers,
+                textures,
+                gpu,
+                targets,
+                &image.source,
+                bases,
+                image.source_texture.as_ref(),
+                None,
+                image.resize_base,
+            )?,
+        }
+    } else {
+        match contents.get(target).cloned() {
+            Some(content) => content,
+            None => resolve_target_base(
+                ctx,
+                frame,
+                layers,
+                textures,
+                gpu,
+                targets,
+                target,
+                bases,
+                target_fallback,
+                image.target_base.as_ref(),
+                // 只有 `RESIZE` 会填 `resize_base`;其余动作传 `None`,与
+                // soft 的 `base_texture(..., solid_size)` 同一口径。
+                image.resize_base,
+            )?,
+        }
     };
     // `DIFFUSION` 的 `SET/2 <= 0` 在官方只做一次整面 memcpy ⇒ 恒等;
     // 提前返回,连基面都不必物化。

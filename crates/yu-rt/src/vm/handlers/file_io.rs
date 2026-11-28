@@ -574,18 +574,48 @@ impl Vm {
     /// `self.save_root` 未注入时退回「投影解码后直接用」:仅当投影无损
     /// (路径全在 CP932 内)才成立;含 CP932 外字符的根必须由宿主给真实根。
     fn save_root_path(&self, path: &[u8]) -> Option<std::path::PathBuf> {
-        let prefix = self.paths.save_path.as_deref()?;
-        let rel = path.strip_prefix(prefix)?;
+        // 三种脚本写法都要接(手册 `file/save.html`:存档固定 `save` 目录):
+        // 1. 注入的 `$_SAVE_PATH` 前缀(CP932 投影、正斜杠;0.555 系);
+        // 2. **CWD 相对** `save/saveNNN.sd`(0.263 `es_saveload.yst`
+        //    实测:FILEINFO/LOAD 都直接拼 `save/` + 名,不经
+        //    `$_SAVE_PATH`)。`save/` 是官方工程根下的存档目录名;
+        // 3. **裸文件名** `save00001.sd` / `gsd.sd`(0.290 的 SAVE[FILE]
+        //    与读档槽存在判定实测;`SAVE[FILE]` 侧一直按 save 根解析,
+        //    FILEINFO 侧旧实现直接拒绝 ⇒ 读档界面全 NO DATA)。
+        // 三种都落到**真实** save 根(`--save-root` 重定向同样生效)。
+        let rel: &[u8] = match self.paths.save_path.as_deref() {
+            Some(prefix) if path.starts_with(prefix) => &path[prefix.len()..],
+            _ => {
+                if let Some(rest) = path
+                    .strip_prefix(b"save/")
+                    .or_else(|| path.strip_prefix(b"save\\"))
+                {
+                    rest
+                } else if !path.is_empty()
+                    && !path.contains(&b'/')
+                    && !path.contains(&b'\\')
+                {
+                    // 裸文件名(无目录分量):官方 `save` 目录内相对名。
+                    path
+                } else {
+                    return None;
+                }
+            }
+        };
         if rel.is_empty() {
             return None;
         }
         let text = self.script_codec.decode(rel, rel).ok()?;
-        if text.contains('\\') || text.split('/').any(|c| c == "..") {
+        let text = text.replace('\\', "/");
+        if text.split('/').any(|c| c == "..") {
             return None;
         }
         let root = match self.save_root.as_deref() {
             Some(root) => root.to_path_buf(),
-            None => std::path::PathBuf::from(self.script_codec.decode(prefix, prefix).ok()?),
+            None => {
+                let prefix = self.paths.save_path.as_deref()?;
+                std::path::PathBuf::from(self.script_codec.decode(prefix, prefix).ok()?)
+            }
         };
         Some(root.join(text))
     }
@@ -737,6 +767,15 @@ impl Vm {
         // 参数名表随调用点缓存一次(`fill_cmd` 已存进 `cmd.param_names`);
         // 旧写法每次执行都重建整张 `Vec<String>`(与 `CGINFO` 同一个 bug)。
         let names: &[String] = &cmd.param_names;
+        // 0.4xx 表把图层号参数叫 `NO`(0.495 改名 `IDNO`);与 gfx
+        // `normalize_cg_param_names` 同口径:表里没有 IDNO 时,`NO`
+        // 就是图层号,必须参与 `ID.N` 合成(否则 SAVE/LOAD 落到
+        // 无后缀层,缩略图永远对不上)。
+        let idno_name = if names.iter().any(|n| n == "IDNO") {
+            "IDNO"
+        } else {
+            "NO"
+        };
         let mut file: Option<String> = None;
         // v555 `SAVE[MEM=n]`:n 是内存存档槽号(不是文件名),与 FILE 互斥
         // (5 个可读样本的 LOAD 计数 FILE+MEM 恰好等于总数)。处理体
@@ -802,7 +841,7 @@ impl Vm {
                         args.push(ArgValue::new(w.rec.kind, v));
                     }
                 }
-                "IDNO" => {
+                n if n == idno_name => {
                     if let Ok(v) = self.eval_window(st, w) {
                         layer_idno = v.as_int();
                         args.push(ArgValue::new(w.rec.kind, v));
@@ -846,12 +885,15 @@ impl Vm {
         // 预约(DNO 在场;官方 DNO 与 FILE 可同条,先预约后刷盘)。
         if let Some(dno) = dno {
             // 555 内存槽 DNO 0 基;文件存档按 0.495 手册 1..=1024。
+            // 旧式记录容器(0.263)的槽位元数据用 1301..1307 / 2010,
+            // 上限由宿主的容器布局给出。
             let dno_min = if mem.is_some() { 0 } else { 1 };
-            if !(dno_min..=1024).contains(&dno) {
+            let dno_max = i64::from(self.save_host.as_ref().map_or(1024, |h| h.dno_limit()));
+            if !(dno_min..=dno_max).contains(&dno) {
                 self.report(diag::recoverable(
                     code::rt::CMD_SLOT,
                     Boundary::Script,
-                    format!("SAVE DNO={dno} 越界({dno_min}..=1024)"),
+                    format!("SAVE DNO={dno} 越界({dno_min}..={dno_max})"),
                 ));
                 return Ok(StepOutcome::Continue);
             }
@@ -1012,6 +1054,14 @@ impl Vm {
         // 参数名表随调用点缓存一次(`fill_cmd` 已存进 `cmd.param_names`);
         // 旧写法每次执行都重建整张 `Vec<String>`(与 `CGINFO` 同一个 bug)。
         let names: &[String] = &cmd.param_names;
+        // 0.4xx 表把图层号参数叫 `NO`(0.495 改名 `IDNO`);与 gfx
+        // `normalize_cg_param_names` 同口径:表里没有 IDNO 时,`NO`
+        // 就是图层号,必须参与 `ID.N` 合成(读档缩略图目标层因此对齐)。
+        let idno_name = if names.iter().any(|n| n == "IDNO") {
+            "IDNO"
+        } else {
+            "NO"
+        };
         let mut file: Option<String> = None;
         // v555 `LOAD[MEM=n]`:n 是内存存档槽号,与 FILE 互斥;MEM 在场时
         // 官方 `0x4447c8` 只走内存来源(文件参数不求值也不打开)。
@@ -1074,7 +1124,7 @@ impl Vm {
                         args.push(ArgValue::new(w.rec.kind, v));
                     }
                 }
-                "IDNO" => {
+                n if n == idno_name => {
                     if let Ok(v) = self.eval_window(st, w) {
                         layer_idno = v.as_int();
                         args.push(ArgValue::new(w.rec.kind, v));
@@ -1120,13 +1170,15 @@ impl Vm {
                 return Ok(StepOutcome::Continue);
             };
             // 555 内存槽的 DNO 是 0 基(实测 `DNO=@base+0`;处理体只判
-            // `>0x400`),文件存档仍按 0.495 手册的 1..=1024。
+            // `>0x400`),文件存档仍按 0.495 手册的 1..=1024;旧式记录
+            // 容器(0.263)由宿主放宽上限。
             let dno_min = if mem.is_some() { 0 } else { 1 };
-            if !(dno_min..=1024).contains(&dno) {
+            let dno_max = i64::from(self.save_host.as_ref().map_or(1024, |h| h.dno_limit()));
+            if !(dno_min..=dno_max).contains(&dno) {
                 self.report(diag::recoverable(
                     code::rt::CMD_SLOT,
                     Boundary::Script,
-                    format!("LOAD DNO={dno} 越界({dno_min}..=1024)"),
+                    format!("LOAD DNO={dno} 越界({dno_min}..={dno_max})"),
                 ));
                 return Ok(StepOutcome::Continue);
             }
@@ -1208,13 +1260,15 @@ impl Vm {
             ));
             return Ok(StepOutcome::Continue);
         };
-        // 555 内存槽 DNO 0 基;文件存档按 0.495 手册 1..=1024。
+        // 555 内存槽 DNO 0 基;文件存档按 0.495 手册 1..=1024;旧式记录
+        // 容器(0.263)由宿主放宽上限。
         let dno_min = if mem.is_some() { 0 } else { 1 };
-        if !(dno_min..=1024).contains(&dno) {
+        let dno_max = i64::from(self.save_host.as_ref().map_or(1024, |h| h.dno_limit()));
+        if !(dno_min..=dno_max).contains(&dno) {
             self.report(diag::recoverable(
                 code::rt::CMD_SLOT,
                 Boundary::Script,
-                format!("LOAD DNO={dno} 越界({dno_min}..=1024)"),
+                format!("LOAD DNO={dno} 越界({dno_min}..={dno_max})"),
             ));
             return Ok(StepOutcome::Continue);
         }

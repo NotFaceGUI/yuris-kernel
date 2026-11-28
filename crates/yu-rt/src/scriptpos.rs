@@ -132,6 +132,14 @@ pub const WIRE_GOSUB_U8: ScriptPosWire = ScriptPosWire {
 };
 
 /// 一个任务的完整执行位快照。
+///
+/// **pc 语义(2026-11-28 官方存档定案)**:`pc` 与 IF/GOSUB/LOOP 帧里的
+/// pc 字段都是 **code 段字节偏移**,不是组下标。0.289 商业官方存档
+/// (`<0.289 商业>` save00001)的 `pc=1698` 恰等于 s110 第 61 组的
+/// `code_offset_at(61)`(该组是 DNO4 末行台词的 `WORD`);内核执行期
+/// 只消耗组下标,编码/解码必须经 `ScriptFile::code_offset_at` /
+/// `pc_covering_code_offset` 换算(`yu-rt` 的 `TASKINFO[SCRIPTPOS]` /
+/// `TASK SCRIPTPOS` 边界)。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScriptPos {
     pub if_entries: Vec<IfEntry>,
@@ -139,7 +147,7 @@ pub struct ScriptPos {
     pub loop_entries: Vec<LoopEntry>,
     /// 引擎 `task+0xc`(RETURNCODE 写入的打包文本行)。
     pub text_line: u32,
-    /// 引擎 `task+0x20`(下一条 pc)。
+    /// 引擎 `task+0x20`(下一条 pc;**code 段字节偏移**)。
     pub pc: u32,
     /// 引擎 `0x801850[task+0x3c]` 的脚本路径原始字节(CP932)。
     pub script_name: Vec<u8>,

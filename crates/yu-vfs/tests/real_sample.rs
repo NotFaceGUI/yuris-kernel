@@ -476,3 +476,116 @@ fn v255_pack_walks_and_closes() {
         }
     }
 }
+
+/// 0.290 商业重打包包的索引块末尾有 2 字节 0 对齐填充(1940 条走完后
+/// `pos = 0x1aeec`,头部声明 `0x1aeee`)。零填充不构成伪条目,必须接受。
+#[test]
+fn v290_repack_index_zero_padding_is_accepted() {
+    let Some(path) = std::env::var_os("YURIS_SAMPLE_V2_290B_CGSYS") else {
+        skip("YURIS_SAMPLE_V2_290B_CGSYS is not set (0.290 repack cgsys.ypf)");
+        return;
+    };
+    let path = PathBuf::from(path);
+    if !path.is_file() {
+        skip(&format!(
+            "YURIS_SAMPLE_V2_290B_CGSYS={} does not exist",
+            path.display()
+        ));
+        return;
+    }
+    let source = YpfSource::open(&path, Codec::Cp932).expect("open 0.290 repack pack");
+    let header = source.header();
+    let stats = source.stats();
+    assert_eq!(
+        stats.parsed_entries, header.entry_count as usize,
+        "条目数必须走满"
+    );
+    assert!(
+        source.entries().iter().all(|e| e.name_hash_ok),
+        "零填充不得影响名字哈希校验"
+    );
+    assert!(!source.entries().is_empty());
+}
+
+fn sample_pack(env: &str, what: &str) -> Option<PathBuf> {
+    let Some(path) = std::env::var_os(env) else {
+        skip(&format!("{env} is not set ({what})"));
+        return None;
+    };
+    let path = PathBuf::from(path);
+    if path.is_file() {
+        Some(path)
+    } else {
+        skip(&format!("{env}={} does not exist", path.display()));
+        None
+    }
+}
+
+/// 0.263 商业包:YSCF 是 `V263`(标题长 +0x3C,标题 +0x3E,98 字节)。
+#[test]
+fn v263_pack_yscfg_layout() {
+    let Some(path) = sample_pack("YURIS_SAMPLE_V2_263_PACK", "0.263 pac/bn.ypf") else {
+        return;
+    };
+    let source = YpfSource::open(&path, Codec::Cp932).expect("open 0.263 pack");
+    let bytes = source
+        .open(&key(b"ysbin/yscfg.ybn"))
+        .expect("ysbin/yscfg.ybn");
+    let cfg = yu_format::yscf::Yscf::parse(&bytes, b"0.263/yscfg.ybn").expect("parse");
+    assert_eq!(cfg.layout, yu_format::yscf::YscfLayout::V263);
+    assert_eq!((cfg.width, cfg.height), (800, 600));
+    assert_eq!(cfg.title.len(), 36, "title={:02x?}", cfg.title);
+}
+
+/// 0.289 商业包:YSCF 是 `V292`(标题 +0x42),1024x768。
+#[test]
+fn v289_pack_yscfg_layout() {
+    let Some(path) = sample_pack("YURIS_SAMPLE_V2_289_PACK", "0.289 pac/ysbin.ypf") else {
+        return;
+    };
+    let source = YpfSource::open(&path, Codec::Cp932).expect("open 0.289 pack");
+    let bytes = source
+        .open(&key(b"ysbin/yscfg.ybn"))
+        .expect("ysbin/yscfg.ybn");
+    let cfg = yu_format::yscf::Yscf::parse(&bytes, b"0.289/yscfg.ybn").expect("parse");
+    assert_eq!(cfg.layout, yu_format::yscf::YscfLayout::V292);
+    assert_eq!((cfg.width, cfg.height), (1024, 768));
+}
+
+/// 0.290 商业包:YSCF 是 `Old`(宽 +0x10/高 +0x14,标题 +0x42)。
+#[test]
+fn v290_pack_yscfg_layout() {
+    let Some(path) = sample_pack("YURIS_SAMPLE_V2_290_PACK", "0.290 pac/bn.ypf") else {
+        return;
+    };
+    let source = YpfSource::open(&path, Codec::Cp932).expect("open 0.290 pack");
+    let bytes = source
+        .open(&key(b"ysbin/yscfg.ybn"))
+        .expect("ysbin/yscfg.ybn");
+    let cfg = yu_format::yscf::Yscf::parse(&bytes, b"0.290/yscfg.ybn").expect("parse");
+    assert_eq!(cfg.layout, yu_format::yscf::YscfLayout::Old);
+    assert_eq!((cfg.width, cfg.height), (800, 600));
+}
+
+/// 0.290 `<merichri>`:`productlib` 脚本请求 `cgsys/logo/logo_R`(大写 R),
+/// 而 `cgsys.ypf` 里只有 `logo_r.png`。官方 Windows 引擎大小写不敏感命中;
+/// 内核旧实现精确比较 ⇒ LOGO.BUF 空、标题 logo 中间缺一块(2026-11-28 实机)。
+#[test]
+fn v290_logo_assets_resolve_case_insensitively() {
+    let Some(path) = sample_pack("YURIS_SAMPLE_V2_290_CGSYS", "0.290 pac/cgsys.ypf") else {
+        return;
+    };
+    let source = YpfSource::open(&path, Codec::Cp932).expect("open 0.290 cgsys.ypf");
+    let lower = LookupKey::new(b"cgsys/logo/logo_r.png", Codec::Cp932).expect("lower key");
+    assert!(source.exists(&lower), "包内小写名应存在");
+    let upper = LookupKey::new(b"cgsys/logo/logo_R.png", Codec::Cp932).expect("upper key");
+    assert!(
+        source.exists(&upper),
+        "官方 Windows 语义:文件名大小写不敏感,logo_R 必须命中 logo_r"
+    );
+    assert_eq!(
+        source.open_prefix(&upper, 8).expect("read prefix").len(),
+        8,
+        "大小写回退必须能真正读出负载"
+    );
+}

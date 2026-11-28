@@ -14,6 +14,12 @@
 //!   (sha256 `72628dfa…`)装载器 `FUN_0043f3a4` 逐字段读取 +0x14/+0x18/
 //!   +0x1C(8 字节扩展名序)/+0x24(4 字节音频序)/+0x28(thread)/
 //!   +0x2C、+0x30、+0x34、+0x38(四个 dword)/+0x40(u16 标题长)/+0x42(标题)。
+//! - `V263`(0.263 商业样本 `<0.263 商业>`,98 字节):宽 `+0x14`/高 `+0x18`,
+//!   `+0x3C u16 titleLen`,`+0x3E` 标题。文件恰好 0x3E+标题长闭合;
+//!   `+0x1C` 图像序、`+0x24` 音频序、`+0x28` thread 与 V292 同型,
+//!   `+0x2C..+0x3C` 为四个 dword(最后一个在 V292 是 filePriorityRelease,
+//!   本布局下该区只剩三个,`+0x3C` 已是标题长)。证据:真实 `yscfg.ybn`
+//!   逐字节闭合(98 = 62 + 36,标题长度字段即 +0x3C),见 DIV-010。
 //! - `V255`(官方 0.255 示例 62 字节):宽 `+0x14`/高 `+0x18`,
 //!   `+0x30 u16 titleLen`,`+0x32` 标题。固定区更短,扩展名序一类字段
 //!   在本布局下不存在(按 0/默认值,`has_image_ext_order() == false`)。
@@ -61,6 +67,8 @@ pub enum YscfLayout {
     Old,
     /// 官方 0.292:宽 +0x14/高 +0x18,titleLen @ 0x40。
     V292,
+    /// 0.263 商业样本:宽 +0x14/高 +0x18,titleLen @ 0x3C。
+    V263,
     /// 官方 0.255:宽 +0x14/高 +0x18,titleLen @ 0x30。
     V255,
     /// v500 商业包:宽 +0x10/高 +0x14,titleLen @ 0x58,title @ 0x5A。
@@ -73,10 +81,11 @@ pub enum YscfLayout {
 
 impl YscfLayout {
     /// 布局候选(固定顺序;只影响诊断文案,不影响裁决的唯一性)。
-    const ALL: [YscfLayout; 5] = [
+    const ALL: [YscfLayout; 6] = [
         YscfLayout::New,
         YscfLayout::Old,
         YscfLayout::V292,
+        YscfLayout::V263,
         YscfLayout::V255,
         YscfLayout::V500,
     ];
@@ -84,7 +93,7 @@ impl YscfLayout {
     fn width_off(self) -> usize {
         match self {
             YscfLayout::New | YscfLayout::Old | YscfLayout::V500 => 0x10,
-            YscfLayout::V292 | YscfLayout::V255 => 0x14,
+            YscfLayout::V292 | YscfLayout::V263 | YscfLayout::V255 => 0x14,
         }
     }
 
@@ -96,6 +105,7 @@ impl YscfLayout {
         match self {
             YscfLayout::New => 0x4C,
             YscfLayout::Old | YscfLayout::V292 => 0x40,
+            YscfLayout::V263 => 0x3C,
             YscfLayout::V255 => 0x30,
             YscfLayout::V500 => 0x58,
         }
@@ -119,6 +129,7 @@ impl YscfLayout {
             YscfLayout::New => "new",
             YscfLayout::Old => "old",
             YscfLayout::V292 => "v292",
+            YscfLayout::V263 => "v263",
             YscfLayout::V255 => "v255",
             YscfLayout::V500 => "v500",
         }
@@ -291,7 +302,7 @@ fn parse_with_layout(
             unknown[..0x0C].copy_from_slice(&buf[0x34..0x40]);
             ([0u32; 7], [0u8; 8], unknown, 0, u32_at(buf, 0x18))
         }
-        YscfLayout::V292 => (
+        YscfLayout::V292 | YscfLayout::V263 => (
             [
                 u32_at(buf, 0x2C),
                 u32_at(buf, 0x30),
@@ -440,6 +451,29 @@ mod tests {
         assert_eq!(cfg.image_ext_order, [1, 2, 3, 4, 5, 0, 0, 0]);
         assert_eq!(cfg.sound_ext_order, [1, 2, 0, 0]);
         assert_eq!(cfg.file_priority_raw[0], 1);
+        assert_eq!(cfg.title, title);
+    }
+
+    /// 0.263 商业样本头(98 字节):宽 +0x14/高 +0x18,标题 +0x3E。
+    #[test]
+    fn v263_layout_uses_0x3c_caption() {
+        let title = b"TestGame";
+        let mut buf = vec![0u8; 0x3E + title.len()];
+        buf[..4].copy_from_slice(b"YSCF");
+        buf[4..8].copy_from_slice(&263u32.to_le_bytes());
+        buf[0x14..0x18].copy_from_slice(&800u32.to_le_bytes());
+        buf[0x18..0x1C].copy_from_slice(&600u32.to_le_bytes());
+        buf[0x1C..0x24].copy_from_slice(&[1, 2, 3, 4, 5, 0, 0, 0]);
+        buf[0x24..0x28].copy_from_slice(&[1, 2, 0, 0]);
+        buf[0x30..0x34].copy_from_slice(&1u32.to_le_bytes());
+        buf[0x3C..0x3E].copy_from_slice(&(title.len() as u16).to_le_bytes());
+        buf[0x3E..].copy_from_slice(title);
+
+        let cfg = Yscf::parse(&buf, b"v263/yscfg.ybn").unwrap();
+        assert_eq!(cfg.layout, YscfLayout::V263);
+        assert_eq!((cfg.width, cfg.height), (800, 600));
+        assert_eq!(cfg.image_ext_order, [1, 2, 3, 4, 5, 0, 0, 0]);
+        assert_eq!(cfg.sound_ext_order, [1, 2, 0, 0]);
         assert_eq!(cfg.title, title);
     }
 

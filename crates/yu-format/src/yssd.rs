@@ -47,28 +47,48 @@ pub const DEFAULT_OFFSET_TABLE_LEN: u32 = 0x400;
 /// 默认「头 + 偏移表」字节数(数据区起点;官方产物首个块偏移即此值)。
 pub const DEFAULT_TABLE_END: usize = 0x10 + DEFAULT_OFFSET_TABLE_LEN as usize * 4;
 
-/// 一个 YSSD 块(压缩形态;载荷不在此解压)。
+/// 存档容器布局(结构裁决,**不看版本号**)。
+///
+/// - [`YssdLayout::Modern`]:头 `+0x0C` = 偏移表容量(官方 0x400),随后
+///   是容量 × u32 偏移表,块体带 `clen/ulen` + 压缩层;
+/// - [`YssdLayout::Legacy`]:头 `+0x0C` = 0,`+0x08` = 记录数,记录从
+///   `+0x10` 起:`id u32 + btype u8 + strict u8 + var u16 + 自描述载荷`,
+///   载荷**不压缩**。0.263 官方 `save/{gsd,kidoku,seld}.sd` 三份文件自证
+///   (逐条解析恰好到文件尾;见 `tests/yssd_legacy.rs`)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YssdLayout {
+    Modern,
+    Legacy,
+}
+
+/// 一个 YSSD 块。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct YssdEntry {
-    /// 块号(= 脚本 `SAVE/LOAD` 的 `DNO`,1 基)。
+    /// 块号(= 脚本 `SAVE/LOAD` 的 `DNO`,1 基;Legacy 为记录 id)。
     pub dno: u32,
     /// 块类型(0 = 单变量;1 = 配置块;2 = 多变量块)。
     pub btype: u8,
-    /// 严格维数标志(官方产物恒 1)。
+    /// 严格维数标志(现代官方产物恒 1;Legacy 文件实测 0)。
     pub strict: u8,
     /// 目标变量 id(容器内记录;`DomainCall` 事件层拿不到,DIV-RT-042)。
     pub var_id: u16,
     /// 未压长(与解压输出闭合)。
     pub ulen: u32,
-    /// zlib level 1 压缩载荷(原样字节)。
+    /// 压缩载荷(现代布局;Legacy 为空)。
     pub compressed: Vec<u8>,
+    /// 未压缩载荷(Legacy 布局;现代为 `None`)。
+    pub raw: Option<Vec<u8>>,
 }
 
 impl YssdEntry {
     /// 解压载荷。两代压缩层并存:0.495 SDK 语料 = zlib level 1(块首
     /// `78 01`);商业包(0.481,随包带 `YSSnp.dll`)= Google Snappy。
     /// 先按 zlib 解,失败再按 Snappy 解;两者都不成立才报 `fmt.yssd.codec`。
+    /// Legacy 记录载荷本就未压缩,直接返回。
     pub fn decompress(&self, origin: &[u8]) -> Result<Vec<u8>, Diag> {
+        if let Some(raw) = &self.raw {
+            return Ok(raw.clone());
+        }
         decompress_payload(&self.compressed, self.ulen, origin, self.dno)
     }
 }
@@ -76,12 +96,14 @@ impl YssdEntry {
 /// 已解析的存档容器。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct YssdSave {
-    /// 容器版本(只记录,不参与校验;实测 0x138/0x1E0/0x1E1 布局同构)。
+    /// 容器版本(只记录,不参与布局校验;0.263 = 0x107)。
     pub version: u32,
+    /// 结构裁决出的布局。
+    pub layout: YssdLayout,
     /// 块(按文件出现顺序;官方产物 = DNO 升序)。
     pub entries: Vec<YssdEntry>,
-    /// DNO → `entries` 下标(偏移表展开;空槽为 `None`)。
-    index: Vec<Option<u16>>,
+    /// DNO → `entries` 下标(现代偏移表展开 / Legacy 记录 id)。
+    index: std::collections::BTreeMap<u32, u16>,
 }
 
 impl YssdSave {
@@ -93,9 +115,9 @@ impl YssdSave {
         // 布局同构,真正的合法性由下面的结构自检决定。
         let capacity = header.word0c as usize;
         if capacity == 0 {
-            return Err(Diag::fatal(code::LIMIT, Boundary::Format)
-                .at_data(origin, 0x0C)
-                .with_detail("YSSD 偏移表容量为 0(块表无处寻址)"));
+            // 结构裁决:没有偏移表 ⇒ 旧式记录容器。0.263 官方系统存档
+            // 三份文件逐条解析恰好到文件尾(见 `parse_legacy`)。
+            return Self::parse_legacy(&header, buf, origin);
         }
         // 块号槽是 u16(DNO 1..=capacity);容量超过 u16 上限无法建索引。
         if capacity > usize::from(u16::MAX) + 1 {
@@ -117,7 +139,7 @@ impl YssdSave {
             return Err(truncated(origin, table_end, buf.len(), "YSSD 头+偏移表"));
         }
         let mut entries = Vec::new();
-        let mut index: Vec<Option<u16>> = vec![None; capacity];
+        let mut index: std::collections::BTreeMap<u32, u16> = Default::default();
         // 块区按文件顺序连续落盘(官方产物如此);块数来自头部 `+0x08`。
         // **不遍历整张偏移表**:v474 写盘器只回填真实 DNO 的槽位,未使用
         // 槽位保留未初始化垃圾(同一进程写出的多个 .sd 甚至字节相同)。
@@ -142,7 +164,7 @@ impl YssdSave {
                         .at_data(origin, at as u64)
                         .with_detail(format!("YSSD 块 {i} 的 DNO={dno} 不在 1..={capacity}"))
                 })?;
-            if index[slot].is_some() {
+            if index.contains_key(&dno) {
                 return Err(Diag::fatal(code::COUNT, Boundary::Format)
                     .at_data(origin, at as u64)
                     .with_detail(format!("YSSD 块 {i}: DNO={dno} 重复")));
@@ -164,7 +186,7 @@ impl YssdSave {
             if end > buf.len() {
                 return Err(truncated(origin, end, buf.len(), "YSSD 块载荷"));
             }
-            index[slot] = Some(entries.len() as u16);
+            index.insert(dno, entries.len() as u16);
             entries.push(YssdEntry {
                 dno,
                 btype: buf[at + 4],
@@ -172,6 +194,7 @@ impl YssdSave {
                 var_id: u16_at(buf, at + 6),
                 ulen: u32_at(buf, at + 12),
                 compressed: buf[payload_at..end].to_vec(),
+                raw: None,
             });
             at = end;
         }
@@ -186,21 +209,138 @@ impl YssdSave {
         }
         Ok(Self {
             version: header.version,
+            layout: YssdLayout::Modern,
             entries,
             index,
         })
     }
 
-    /// 按 DNO 取块(DNO 0 或超出表容量 = `None`)。
+    /// 旧式记录容器(`+0x0C == 0`)。
+    ///
+    /// 布局(0.263 官方 `gsd/kidoku/seld.sd` 三份产物自证):
+    /// `magic + 版本 0x107 + 记录数 + 0`,随后逐条:
+    /// `id u32 + btype u8 + strict u8 + var u16 + 未压缩载荷`。
+    /// `btype 0` 的载荷与 [`YssdValue`] 同构(自描述长度),因此记录
+    /// 无需 `clen/ulen`;解析按值头长度推进,必须恰好走到文件尾。
+    fn parse_legacy(
+        header: &crate::container::Header,
+        buf: &[u8],
+        origin: &[u8],
+    ) -> Result<Self, Diag> {
+        let count = header.word08 as usize;
+        let mut entries = Vec::with_capacity(count);
+        let mut index: std::collections::BTreeMap<u32, u16> = Default::default();
+        let mut at = 0x10usize;
+        let mut prev_dno = 0u32;
+        for i in 0..count {
+            let head_end = at
+                .checked_add(8)
+                .ok_or_else(|| limit(origin, at as u64, "YSSD 旧式记录头"))?;
+            if head_end > buf.len() {
+                return Err(truncated(origin, head_end, buf.len(), "YSSD 旧式记录头"));
+            }
+            let dno = u32_at(buf, at);
+            // 官方记录按 id 升序(gsd = 1,2,3,4,11,12,13);0/倒序说明
+            // 布局判断错了,不能当成“空槽”放行。
+            if dno == 0 || dno <= prev_dno {
+                return Err(Diag::fatal(code::COUNT, Boundary::Format)
+                    .at_data(origin, at as u64)
+                    .with_detail(format!(
+                        "YSSD 旧式记录 {i}: id={dno} 非升序(前一条 {prev_dno})"
+                    )));
+            }
+            prev_dno = dno;
+            let btype = buf[at + 4];
+            let strict = buf[at + 5];
+            let var_id = u16_at(buf, at + 6);
+            let payload_at = at + 8;
+            // btype 0 = YssdValue(自描述长度);btype 1 = 图像块
+            // `[u32 A][u32 B][A][B]`(0.263 旧式记录不压缩)。其它类型
+            // 未取证 ⇒ 显式拒绝,不猜偏移(会静默读错后续记录)。
+            let raw_end = match btype {
+                0 => legacy_value_end(buf, payload_at, origin, dno)?,
+                1 => legacy_image_end(buf, payload_at, origin, dno)?,
+                other => {
+                    return Err(Diag::fatal(code::LIMIT, Boundary::Format)
+                        .at_data(origin, payload_at as u64)
+                        .with_detail(format!(
+                            "YSSD 旧式记录 DNO={dno}: btype={other} 载荷长度规则未取证"
+                        )));
+                }
+            };
+            let raw = buf[payload_at..raw_end].to_vec();
+            // 结构自检:值载荷必须闭合(type/dims/dlen 与元素数一致)。
+            if btype == 0 {
+                YssdValue::parse(&raw, origin, dno)?;
+            }
+            index.insert(dno, entries.len() as u16);
+            entries.push(YssdEntry {
+                dno,
+                btype,
+                strict,
+                var_id,
+                ulen: raw.len() as u32,
+                compressed: Vec::new(),
+                raw: Some(raw),
+            });
+            at = raw_end;
+        }
+        // 旧式产物记录区连续到文件尾;允许零填充(防御性,目前语料无尾随)。
+        if buf[at..].iter().any(|&b| b != 0) {
+            return Err(Diag::fatal(code::COUNT, Boundary::Format)
+                .at_data(origin, at as u64)
+                .with_detail(format!(
+                    "YSSD 旧式记录区之后仍有 {} 字节非零尾随(记录数 {count})",
+                    buf.len() - at
+                )));
+        }
+        Ok(Self {
+            version: header.version,
+            layout: YssdLayout::Legacy,
+            entries,
+            index,
+        })
+    }
+
+    /// 按 DNO 取块(DNO 0 或不在容器 = `None`)。
     #[must_use]
     pub fn entry(&self, dno: u32) -> Option<&YssdEntry> {
-        let slot = usize::try_from(dno).ok()?.checked_sub(1)?;
         self.index
-            .get(slot)
+            .get(&dno)
             .copied()
-            .flatten()
             .and_then(|i| self.entries.get(usize::from(i)))
     }
+}
+
+/// 计算旧式记录里 `YssdValue` 载荷的结束偏移(只读头,不解数据)。
+fn legacy_value_end(buf: &[u8], at: usize, origin: &[u8], dno: u32) -> Result<usize, Diag> {
+    if at + 8 > buf.len() {
+        return Err(truncated(origin, at + 8, buf.len(), "YSSD 旧式值头"));
+    }
+    let ty = u32_at(buf, at);
+    if !matches!(ty, 1..=3) {
+        return Err(Diag::fatal(code::COUNT, Boundary::Format)
+            .at_data(origin, at as u64)
+            .with_detail(format!("YSSD 旧式记录 DNO={dno}: 值类型 {ty} 不在 1..=3")));
+    }
+    let dim = u32_at(buf, at + 4) as usize;
+    if dim > 8 {
+        return Err(Diag::fatal(code::LIMIT, Boundary::Format)
+            .at_data(origin, (at + 4) as u64)
+            .with_detail(format!("YSSD 旧式记录 DNO={dno}: 维数 {dim} > 8")));
+    }
+    let head = at + 8 + dim * 4 + 4;
+    if head > buf.len() {
+        return Err(truncated(origin, head, buf.len(), "YSSD 旧式值边界"));
+    }
+    let dlen = u32_at(buf, at + 8 + dim * 4) as usize;
+    let end = head
+        .checked_add(dlen)
+        .ok_or_else(|| limit(origin, head as u64, "YSSD 旧式值载荷"))?;
+    if end > buf.len() {
+        return Err(truncated(origin, end, buf.len(), "YSSD 旧式值载荷"));
+    }
+    Ok(end)
 }
 
 /// zlib(RFC1950)解压,校验未压长闭合。
@@ -493,7 +633,7 @@ impl BlockCodec {
     /// 那会把 zlib 存档误判成 Snappy。这两种形态返回 `None`。
     #[must_use]
     pub fn detect(entry: &YssdEntry) -> Option<Self> {
-        if entry.dno == MEM_PACK_DNO || entry.btype > 1 {
+        if entry.raw.is_some() || entry.dno == MEM_PACK_DNO || entry.btype > 1 {
             return None;
         }
         Some(if looks_like_zlib(&entry.compressed) {
@@ -628,6 +768,88 @@ impl YssdWriter {
         }
         out
     }
+}
+
+/// 旧式记录容器写出器(0.263 布局;与 [`YssdWriter`] 的现代块表不同)。
+///
+/// 记录 = `id u32 + btype u8 + strict u8 + var u16 + 未压缩载荷`,按 id
+/// 升序;头 = `magic + 版本 + 记录数 + 0`。没有偏移表,id 也不受
+/// 现代 `1..=1024` 手册值域限制(0.263 官方的存档界面用 1301..1307 /
+/// 2010 作为槽位元数据块号,见 `es_select.yst` / `es_saveload.yst`)。
+#[derive(Debug)]
+pub struct YssdLegacyWriter {
+    version: u32,
+    blocks: std::collections::BTreeMap<u32, (u8, u8, u16, Vec<u8>)>,
+}
+
+impl YssdLegacyWriter {
+    #[must_use]
+    pub fn new(version: u32) -> Self {
+        Self {
+            version,
+            blocks: Default::default(),
+        }
+    }
+
+    /// 登记一条记录;同 id 后登记者覆盖。
+    pub fn set_block(&mut self, dno: u32, btype: u8, strict: u8, var_id: u16, raw: Vec<u8>) {
+        self.blocks.insert(dno, (btype, strict, var_id, raw));
+    }
+
+    #[must_use]
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    #[must_use]
+    pub fn build(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(0x10 + self.blocks.len() * 16);
+        out.extend_from_slice(&MAGIC);
+        out.extend_from_slice(&self.version.to_le_bytes());
+        out.extend_from_slice(&(self.blocks.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for (dno, (btype, strict, var_id, raw)) in self.blocks {
+            out.extend_from_slice(&dno.to_le_bytes());
+            out.push(btype);
+            out.push(strict);
+            out.extend_from_slice(&var_id.to_le_bytes());
+            out.extend_from_slice(&raw);
+        }
+        out
+    }
+}
+
+/// 旧式图像记录(`btype 1`)载荷结束偏移:`[u32 A][u32 B][A 段][B 段]`。
+///
+/// A 是描述符长度(0.263–0.292 代 = 0x2B0),B 是像素段长度
+/// (`w*h*4`);两者都是自描述长度,旧式记录因此不需要 `clen/ulen`。
+fn legacy_image_end(buf: &[u8], at: usize, origin: &[u8], dno: u32) -> Result<usize, Diag> {
+    if at + 8 > buf.len() {
+        return Err(truncated(origin, at + 8, buf.len(), "YSSD 旧式图像头"));
+    }
+    let a_len = u32_at(buf, at) as usize;
+    let b_len = u32_at(buf, at + 4) as usize;
+    if a_len == 0 || a_len > 0x1_0000 {
+        return Err(Diag::fatal(code::LIMIT, Boundary::Format)
+            .at_data(origin, at as u64)
+            .with_detail(format!(
+                "YSSD 旧式记录 DNO={dno}: 图像 A 段长度 {a_len} 不在 1..=0x10000"
+            )));
+    }
+    if b_len == 0 {
+        return Err(Diag::fatal(code::LIMIT, Boundary::Format)
+            .at_data(origin, (at + 4) as u64)
+            .with_detail(format!("YSSD 旧式记录 DNO={dno}: 图像 B 段长度为 0")));
+    }
+    let end = at
+        .checked_add(8)
+        .and_then(|n| n.checked_add(a_len))
+        .and_then(|n| n.checked_add(b_len))
+        .ok_or_else(|| limit(origin, at as u64, "YSSD 旧式图像载荷"))?;
+    if end > buf.len() {
+        return Err(truncated(origin, end, buf.len(), "YSSD 旧式图像载荷"));
+    }
+    Ok(end)
 }
 
 /// 块类型 1:配置块载荷(`u32 段A长 + u32 段B长 + 段A + 段B`;引擎
@@ -917,15 +1139,24 @@ mod tests {
             assert!(save.entries.is_empty());
         }
 
-        // 容量为 0 ⇒ LIMIT(块表无处寻址)。
+        // 容量为 0 且记录数为 0 ⇒ 合法的空旧式记录容器(0.263 形态)。
         let mut zero = Vec::new();
         zero.extend_from_slice(b"YSSD");
         zero.extend_from_slice(&0x1234u32.to_le_bytes());
         zero.extend_from_slice(&0u32.to_le_bytes());
         zero.extend_from_slice(&0u32.to_le_bytes());
+        let empty = YssdSave::parse(&zero, b"t").expect("空旧式容器");
+        assert_eq!(empty.layout, YssdLayout::Legacy);
+        assert!(empty.entries.is_empty());
+
+        // 容量为 0 但记录数 > 0 且没有记录体 ⇒ 截断(不是静默空表)。
+        let mut zero_with_count = zero.clone();
+        zero_with_count[8..12].copy_from_slice(&1u32.to_le_bytes());
         assert_eq!(
-            YssdSave::parse(&zero, b"t").expect_err("capacity").code,
-            code::LIMIT
+            YssdSave::parse(&zero_with_count, b"t")
+                .expect_err("truncated legacy")
+                .code,
+            code::TRUNCATED
         );
     }
 
@@ -991,5 +1222,103 @@ mod tests {
         let bytes = writer.build();
         let save = YssdSave::parse(&bytes, b"t").expect("parse");
         assert_eq!(save.version, 0x1E1);
+    }
+
+    #[test]
+    fn legacy_writer_roundtrips_and_parses_by_structure() {
+        // 两条记录(含 >1024 的 id:0.263 存档界面用 1301../2010 元数据块)。
+        let first = YssdValue {
+            ty: YssdValueType::Int,
+            dims: vec![2],
+            data: vec![1u8; 16],
+        };
+        let second = YssdValue {
+            ty: YssdValueType::Str,
+            dims: Vec::new(),
+            data: {
+                let mut out = Vec::new();
+                out.extend_from_slice(&3u32.to_le_bytes());
+                out.extend_from_slice(b"abc");
+                out
+            },
+        };
+        let mut writer = YssdLegacyWriter::new(0x107);
+        writer.set_block(2010, 0, 0, 0, second.to_bytes());
+        writer.set_block(1, 0, 0, 0, first.to_bytes());
+        let bytes = writer.build();
+        // 头:magic + 版本 + 记录数 + 0,记录从 0x10 起。
+        assert_eq!(&bytes[..4], b"YSSD");
+        assert_eq!(u32_at(&bytes, 4), 0x107);
+        assert_eq!(u32_at(&bytes, 8), 2);
+        assert_eq!(u32_at(&bytes, 0x0C), 0);
+        let save = YssdSave::parse(&bytes, b"t").expect("parse legacy");
+        assert_eq!(save.layout, YssdLayout::Legacy);
+        assert_eq!(
+            save.entries.iter().map(|e| e.dno).collect::<Vec<_>>(),
+            vec![1, 2010],
+            "记录按 id 升序"
+        );
+        assert_eq!(
+            save.entry(2010).expect("dno 2010").decompress(b"t").unwrap(),
+            second.to_bytes()
+        );
+        // 重建逐字节一致。
+        let mut again = YssdLegacyWriter::new(save.version);
+        for entry in &save.entries {
+            again.set_block(
+                entry.dno,
+                entry.btype,
+                entry.strict,
+                entry.var_id,
+                entry.decompress(b"t").unwrap(),
+            );
+        }
+        assert_eq!(again.build(), bytes);
+        // 非升序 id 必须拒绝(否则会把记录区当值载荷读错)。
+        let mut bad = bytes.clone();
+        let mut at = 0x10 + 8 + first.to_bytes().len();
+        // 第二条记录头改 id=1(与第一条重复/倒序)。
+        bad[at..at + 4].copy_from_slice(&1u32.to_le_bytes());
+        assert!(YssdSave::parse(&bad, b"t").is_err());
+    }
+
+    #[test]
+    fn legacy_record_with_unknown_btype_is_rejected() {
+        // btype 2 的载荷长度规则未取证:必须显式失败,不能猜偏移。
+        let payload = YssdValue {
+            ty: YssdValueType::Int,
+            dims: Vec::new(),
+            data: 7i64.to_le_bytes().to_vec(),
+        };
+        let mut writer = YssdLegacyWriter::new(0x107);
+        writer.set_block(1, 2, 0, 0, payload.to_bytes());
+        let bytes = writer.build();
+        let err = YssdSave::parse(&bytes, b"t").expect_err("btype 2 长度未知");
+        assert!(err.detail.contains("btype=2"), "{}", err.detail);
+    }
+
+    #[test]
+    fn legacy_image_record_is_length_closed() {
+        // btype 1 = [A][B][A 段][B 段],解析按自描述长度推进到文件尾。
+        let a = vec![0xAAu8; 0x2B0];
+        let b = vec![0xBBu8; 4 * 3 * 4];
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&(a.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&a);
+        raw.extend_from_slice(&b);
+        let mut writer = YssdLegacyWriter::new(0x107);
+        let scalar = YssdValue {
+            ty: YssdValueType::Int,
+            dims: Vec::new(),
+            data: 5i64.to_le_bytes().to_vec(),
+        };
+        writer.set_block(1, 0, 0, 0, scalar.to_bytes());
+        writer.set_block(2, 1, 0, 0, raw.clone());
+        let bytes = writer.build();
+        let save = YssdSave::parse(&bytes, b"t").expect("legacy image record");
+        assert_eq!(save.entries.len(), 2);
+        assert_eq!(save.entry(2).expect("dno2").btype, 1);
+        assert_eq!(save.entry(2).expect("dno2").decompress(b"t").unwrap(), raw);
     }
 }

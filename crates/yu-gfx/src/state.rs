@@ -1014,12 +1014,43 @@ impl GfxState {
     pub fn set_layer_asset(&mut self, id: &LayerId, key: Vec<u8>, size: SizeU32) -> bool {
         self.invalidate_frame();
         self.asset_sizes.insert(key.clone(), size);
+        // 官方 `LOAD[ID]` 在目标层不存在时**直接建层**(0.292
+        // `FUN_00430400` 图像分支:`FUN_00440c6c` 查 id 失败后
+        // `FUN_00403d7c(0x38)` 新分配对象)。读档界面首帧没有先 `CG`
+        // 建 `SLTHUMBTEMP`,旧实现直接返回 false ⇒ 缩略图永远不显示。
+        let mut created = false;
+        if !self.nodes.contains_key(id) {
+            self.create_image(id, TextureRef::Asset(key.clone()), Some(size));
+            created = true;
+            // 隐式建的层按官方默认**可见、alpha=256**:读档脚本在
+            // `LOAD[ID]` 后紧跟 `CG[ID X Y Z]` 定位(0.289
+            // `es_saveload.yst` pc798→800),同 tick 内完成,不会上屏到
+            // 原点;若置 alpha=0,脚本不会再写 A,缩略图永远不可见。
+        }
+        self.push_diag(
+            "LOAD",
+            error::verbose(
+                error::code::TEXTURE_MISSING,
+                format!(
+                    "LOAD[ID] 图层 `{}` 装图 {}x{}(created={created})",
+                    id.display(),
+                    size.width,
+                    size.height
+                ),
+            ),
+        );
         let Some(node) = self.nodes.get_mut(id) else {
             return false;
         };
         let layer = Arc::make_mut(&mut node.layer);
         layer.texture = TextureRef::Asset(key);
         layer.fill = None;
+        // 官方 `LOAD[ID]` 把图装回后该层**立即可见**:读档脚本先用
+        // `CG[FILE="" A=0]` 预建缩略图/文字层(0.289 `es_saveload.yst`
+        // pc789),LOAD 之后只写 X/Y/Z(不写 A)。若沿用预建的 A=0,
+        // 图像永远不显示(实测 100×75 已解码、位置正确但 alpha=0)。
+        layer.alpha = 256;
+        layer.visible = true;
         layer.reset_status();
         true
     }
@@ -4375,7 +4406,36 @@ impl GfxState {
                              官方会经资源树建层;本内核不建鬼层",
                         ),
                     );
-                } else {
+                    return;
+                }
+                // 无 FILE/RID 但带**状态参数**(A/E/Z/X/Y/SX/SY/MODE/T/…)
+                // 是“在空白层上设属性”,不是存在性探测。2xx 转场脚本用
+                // `CG[ID=SRCCG A=0]` 创建转场缓冲;不建层会让后续
+                // `CGACT[SWAP]` 找不到源/目标。只给 ID 的纯探测仍不建层。
+                let has_state_param = params.iter().any(|(name, _, _)| {
+                    matches!(
+                        &**name,
+                        "A" | "E"
+                            | "Z"
+                            | "X"
+                            | "Y"
+                            | "SX"
+                            | "SY"
+                            | "MODE"
+                            | "T"
+                            | "TA"
+                            | "TID"
+                            | "TNO"
+                            | "MID"
+                            | "MNO"
+                            | "MFILE"
+                            | "CASH"
+                            | "FRAME"
+                            | "TEX"
+                            | "TRIM"
+                    )
+                });
+                if !has_state_param {
                     // 脚本把 `CG[ID=…]` 当存在性探测逐帧轮询;官方静默
                     // 返回 -1。按层只留一条 Verbose,避免把正常轮询变成
                     // WARN 洪峰(`<game-b>` 开场单帧 2 万次)。
@@ -4390,11 +4450,13 @@ impl GfxState {
                             ),
                         );
                     }
+                    return;
                 }
-                return;
+                self.create_image(&parsed.path, TextureRef::SolidBlack1x1, None);
+            } else {
+                let texture = file.clone().expect("file checked above");
+                self.create_image(&parsed.path, texture, None);
             }
-            let texture = file.clone().expect("file checked above");
-            self.create_image(&parsed.path, texture, None);
         } else if let Some(texture) = file {
             // **立绘差分切换的路径**:`CG[FILE=…]` 对已存在的层换图。
             // 手册:FILE 替换只换图,不重置 A/位置等属性;尺寸由官方装载
@@ -4500,6 +4562,30 @@ impl GfxState {
             }
         }
         self.record_mask_op(&parsed.path, &params);
+        // 取证:`YU_CG_FILE_TRACE=1` 时记录 CG 后该层的可见状态(位置/
+        // alpha/Z/尺寸),用于缩略图层“装了图但不显示”的定位。
+        if cg_file_trace() {
+            if let Some(node) = self.nodes.get(&parsed.path) {
+                let l = &node.layer;
+                let size = l.image_size();
+                self.push_diag(
+                    "CG",
+                    error::verbose(
+                        error::code::PERF,
+                        format!(
+                            "[cg-state] `{}` a={} vis={} z={} pos=({},{}) size={:?}",
+                            parsed.path.display(),
+                            l.alpha,
+                            l.visible,
+                            l.z,
+                            l.transform.x,
+                            l.transform.y,
+                            size
+                        ),
+                    ),
+                );
+            }
+        }
     }
 
     /// `CG[MID]` 的官方语义(REA `0x42a801..0x42a8a4`):
@@ -4829,10 +4915,15 @@ impl GfxState {
         let px = |name_int: &str, name_fixed: &str| -> Option<f64> {
             find_f64(&params, name_int).or_else(|| fixed_px(name_fixed))
         };
-        let x = px("X", "FX");
-        let y = px("Y", "FY");
-        let x2 = px("X2", "FX2");
-        let y2 = px("Y2", "FY2");
+        // 0.290 的 CGACT 参数表在 `X/Y/X2/Y2` 之外新增了
+        // `LEFT/RIGHT/TOP/BOTTOM`;真实脚本只用后者做 `RESIZE` 的四边
+        // 扩缩量(0.290 s93 pc1619..`CGACT[RESIZE=1 BOTTOM=n LEFT=n]`)。
+        // 语义按 RESIZE 已知公式 `newW = srcW + 左 + 右`,
+        // `newH = srcH + 上 + 下` 映射到同名边;X/Y/X2/Y2 仍优先。
+        let x = px("X", "FX").or_else(|| find_f64(&params, "LEFT"));
+        let y = px("Y", "FY").or_else(|| find_f64(&params, "TOP"));
+        let x2 = px("X2", "FX2").or_else(|| find_f64(&params, "RIGHT"));
+        let y2 = px("Y2", "FY2").or_else(|| find_f64(&params, "BOTTOM"));
         // SIZE/SIZE2 的目标尺寸(手册 cg/cgact.html 例 3/4)。
         //
         // **必须按浮点读**:`es_Sprite.yst` 的 `es.CGACT_SIZE` 传进来的
@@ -6789,8 +6880,16 @@ impl GfxState {
             } else {
                 None
             };
-            if explicit_target && target.as_ref() != Some(source) {
-                // 手册例 5..17 全部是原地动作,没有 ID2 形态。
+            if explicit_target
+                && target.as_ref() != Some(source)
+                && !action.is_in_place_filter()
+            {
+                // 原地滤镜的统一语义是「读源层像素 → 写目标层」;`ID2`
+                // 只是把目标从源层换成另一层,后端单层滤镜路径已按此
+                // 实现(读 source、写 target override)。手册示例只列
+                // `target == source` 的写法,商业脚本用 `ID2` 写另一层
+                // (0.263 `CGACT[ROTATION=1 ID="LOGO.BUF" ID2="LOGO.1"]`
+                // 等)。非原地动作(合成/缩放等)的 `ID2` 语义仍显式未实现。
                 OpStatus::Unimplemented("gfx.imageop.id2.unsupported")
             } else if action.is_trim() && set.is_some() && trim_mask.is_none() {
                 // `SET` 在 ysc 里是整数槽;给了非整数无法按官方 dword 掩码解释。

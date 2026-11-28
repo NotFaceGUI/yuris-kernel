@@ -125,6 +125,56 @@ fn copy2_from_fileless_solid_layer_reports_1x1_snapshot() {
 }
 
 #[test]
+fn in_place_filter_with_id2_writes_target() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("B")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        // 原地滤镜的通用 ID2 形态:读 A 的像素、加工后写 B。
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("A")),
+                arg(&table, "CGACT", "ID2", s("B")),
+                arg(&table, "CGACT", "ROTATION", i(1)),
+                arg(&table, "CGACT", "SET", i(90)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let op = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .find_map(|op| match op {
+            Op::Image(image) if image.action == ImageAction::Rotation => Some(image),
+            _ => None,
+        })
+        .expect("ROTATION op");
+    assert_eq!(op.source.display(), ":/W0/A");
+    assert_eq!(op.target.as_ref().map(|t| t.display()), Some(":/W0/B".to_string()));
+    assert_eq!(op.status, OpStatus::Executable);
+}
+
+#[test]
 fn resize_updates_layer_rect_for_cginfo() {
     let table = table();
     let mut gfx = state();
@@ -2256,6 +2306,29 @@ fn cginfo_multi_field_uses_official_priority() {
     assert_eq!(q(&["X", "T"]), yu_rt::value::Value::Int(200));
 }
 
+#[test]
+fn cg_missing_layer_with_state_param_creates_blank() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        // 2xx 转场缓冲:`CG[ID=SRCCG A=0]` 在空白层上设属性 ⇒ 建层。
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SRCCG")),
+                arg(&table, "CG", "A", i(0)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let l = layer(&f, ":/W0/SRCCG");
+    assert_eq!(l.alpha, 0);
+    assert!(matches!(l.kind, LayerKind::Image { .. }));
+}
+
 /// `CG[ID=…]` 无 FILE/RID 且层不存在:官方返回 -1,脚本会逐帧轮询。
 /// 诊断按层生命周期只留一条 Verbose;层真正创建后再删除,下一次探测
 /// 才重新留痕。避免把正常轮询变成 WARN 洪峰(<game-b> 开场单帧 2 万次)。
@@ -2578,4 +2651,62 @@ fn merge_into_target_deleted_same_tick_is_replayed_for_copy2() {
             .any(|op| matches!(op, Op::Copy(copy) if copy.dest.display() == ":/W0/DST")),
         "COPY2 必须仍把合并结果写到 DST"
     );
+}
+
+/// 读档界面首帧直接 `LOAD[FILE DNO ID=SLTHUMBTEMP]`,没有先 `CG` 建层。
+/// 官方 0.292 `FUN_00430400` 在 id 查不到时新分配层对象;内核同样在
+/// `set_layer_asset` 缺层时建 Image 层,否则缩略图永远不显示。
+#[test]
+fn load_layer_asset_creates_missing_layer_like_official() {
+    let mut gfx = state();
+    let parsed = yu_gfx::path::normalize(b"SLTHUMBTEMP", None, false);
+    assert!(gfx.layer(&parsed.path).is_none(), "前置:层不存在");
+    let size = yu_gfx::SizeU32 {
+        width: 120,
+        height: 90,
+    };
+    assert!(
+        gfx.set_layer_asset(&parsed.path, b"synthetic-thumb".to_vec(), size),
+        "缺层时必须建层并接受像素"
+    );
+    let layer = gfx.layer(&parsed.path).expect("层已创建");
+    assert!(matches!(layer.texture, TextureRef::Asset(_)));
+    assert_eq!(layer.kind, LayerKind::Image { size: Some(size) });
+    assert_eq!(layer.alpha, 256, "官方默认 alpha=256,脚本不再写 A");
+    assert!(layer.visible, "可见,由随后的 CG[X/Y] 定位");
+}
+
+/// 读档脚本先用 `CG[FILE="" A=0]` 预建缩略图层,再 `LOAD[ID]` 装图,
+/// 之后只写 X/Y/Z。官方 LOAD 后立即可见;内核必须把预建的 A=0 提回 256,
+/// 否则图像已解码、位置正确但 alpha=0(0.289 实测)。
+#[test]
+fn load_layer_asset_restores_alpha_after_precreated_blank_layer() {
+    let table = table();
+    let mut gfx = state();
+    let parsed = yu_gfx::path::normalize(b"SLTHUMBTEMP", Some(3), false);
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("SLTHUMBTEMP")),
+                arg(&table, "CG", "IDNO", i(3)),
+                arg(&table, "CG", "FILE", s("")),
+                arg(&table, "CG", "A", i(0)),
+            ],
+        ),
+    ]);
+    assert_eq!(
+        gfx.layer(&parsed.path).expect("预建层").alpha,
+        0,
+        "前置:脚本以 A=0 预建"
+    );
+    assert!(
+        gfx.set_layer_asset(&parsed.path, b"synthetic-thumb".to_vec(), yu_gfx::SizeU32 { width: 100, height: 75 }),
+        "装图必须命中预建层"
+    );
+    let layer = gfx.layer(&parsed.path).expect("层仍存在");
+    assert_eq!(layer.alpha, 256, "官方 LOAD 后立即可见");
+    assert!(layer.visible);
 }
