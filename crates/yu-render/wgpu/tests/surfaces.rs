@@ -1501,16 +1501,18 @@ fn reused_copy_surface_preserves_each_merge_sources_color() {
             };
             if frame == 2 {
                 // 同一数据流现在在 MERGE 处降级成文本图像字形(整图复制的
-                // 尺寸未知时按资产自然尺寸):纹理 pass 只剩当前链的
-                // `COPY2 + MEIDO`,更早的链在重绑时被回收。
+                // 尺寸未知时按资产自然尺寸):链上的 `MEIDO` 着色已经写进
+                // `TextDraw::image.tint`,不再作为独立纹理 pass 重放;待执行
+                // 的只剩 `COPY2`(快照源),更早的链在重绑时被回收。
+                // 像素由下面的逐点断言校验(含这条链的 tint)。
                 assert!(
                     texture_ops(&full) >= 2,
                     "full replay should include the live chain"
                 );
                 assert_eq!(
                     texture_ops(&incremental),
-                    2,
-                    "one COPY2 + MEIDO; MERGE lowered to a text image draw"
+                    1,
+                    "one COPY2; MEIDO folded into the text image tint"
                 );
             } else if frame == 3 {
                 assert_eq!(texture_ops(&incremental), 0, "idle must not replay old stamps");

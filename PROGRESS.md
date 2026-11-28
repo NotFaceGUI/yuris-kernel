@@ -18988,3 +18988,40 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   → `identity: ... yuris=0.454`、frame 240 标题画面无缺资源;
   桌面模式窗口标题实测同上。
 
+## 成果 GFX-ACTIVE-LAYERS (2026-11-28) · 按读者闭包裁剪逐层规划,修复读档后 4ms 不回落
+
+- 根因(0.555 存档/读档界面):
+  - 读档会实例化存档 UI 的上千个控件层;关闭界面后游戏不 `CGEND` 它们
+    (重开回到同一高水位 2170/2178,不是每次存档新增),但 `frame()` 把
+    `nodes` 全量投影、后端对每层跑 `base_token/sync_base`,常驻不可见层
+    每帧付 O(层数):1435 层时 frame_build 1.1ms、plan 2.4–2.6ms。
+  - 其中被 CGS 屏幕快照捕获的层被 `snapshot_layers` **永久**当成读者:
+    快照冻结后仍逐帧重放捕获层的加工链(实测 `imgacts=merge:92`),
+    `active` 也被拉回全量。
+- 修复:
+  - `CompositorFrame.active_layers`:本帧绘制树 + 实际发射复制的源 +
+    被读组的可见内容 + 过渡配对/遮罩 + 文本目标 + 祖先。`layers` 仍是
+    完整状态表(存活剪枝、快照保活、组尺寸、诊断口径不变),wgpu 只为
+    active 建索引并跑逐层同步。
+  - 图像惰性门禁改用**有效可见性**(父组 `E=0` 时子层不再物化);读者只
+    从**实际发射的复制**出发,已烘焙复制不再永久钉住源层加工链。
+  - 已烘焙的屏幕快照不再展开内部图层;快照 `layer_ids` 只记实际参与该次
+    屏幕合成的层(pass op 引用 + 文本目标),不再记整张节点表。
+  - 组离屏 pass 契约保持不变(隐藏组仍生成,COPY/过渡可读它的表面)。
+- 观测(0.555 西班牙语样本,desktop/wgpu,`--spike-ms 10`,读档后稳定态):
+  - 0.5.4+lazy 基线:layers=1435–1438 active=全量 render=3.7–4.2ms
+    (frame_build 1.1、plan 2.4–2.6、passes=13–276、`imgacts=merge:92`);
+  - 本次:layers=1435 **active=53** passes=13 frame_build=0.8
+    plan≈1.5–1.8 render≈2.0–2.2ms `imgacts=merge:0` copies=0;
+    与 402 层基线(render 1.4–1.9ms)基本持平,余下主要是文本合成
+    `text≈1.0–1.3ms`。
+- 回归:`cargo test -p yu-gfx`(含 text_pipeline 22、group 25)、
+  `-p yu-backend-wgpu --test surfaces`(44)/`--test wgpu`(40)/
+  `--test screen_surface`(3)、`-p yu-backend-soft`、`-p yu-engine` 全绿;
+  新增 3 条用例(隐藏组子层惰性、复制读取隐藏源、组变可见补放)。
+  `reused_copy_surface_preserves_each_merge_sources_color` 的纹理 pass
+  计数 2→1(`MEIDO` tint 已折进 `TextDraw::image`,逐点像素断言不变)。
+- 备注:`yu-cli` `logging_guards` 的 `silent_fallback_audit` /
+  `src_has_no_direct_terminal_macros` 在 HEAD 已红(未标注 `unwrap_or`
+  47>32、`yu-rt` 两文件超白名单、`state.rs` 的 `eprintln` 是 pass_trace
+  既有代码),与本次改动无关。

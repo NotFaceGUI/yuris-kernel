@@ -309,6 +309,16 @@ pub struct CompositorFrame {
     /// `Arc`:同一层在一帧里还出现在 `passes` 的 op 中;共享句柄让
     /// 「整帧快照 + 绘制列表」只持引用,不再每条命令克隆一份层。
     pub layers: Vec<Arc<Layer>>,
+    /// 本帧**需要参与逐层规划/同步**的层子集(绘制树 + 被读层及其祖先)。
+    ///
+    /// `layers` 仍是完整状态表:后端用它做存活剪枝、快照保活、组尺寸查找
+    /// 与诊断,所以常驻 UI 缓存层的表面/烘焙前缀不会因本帧不可见被丢弃。
+    /// `active_layers` 只决定「哪些层要建索引、跑 `base_token`/`sync_base`/
+    /// 内容同步」——不可见且无人读的层对输出没有贡献,不必逐帧付 O(层数)。
+    ///
+    /// `None` = 全量(手工构造的帧、屏幕快照重放帧);`Some` 保证覆盖本帧
+    /// 所有 pass/图像/复制/文本引用到的层(含祖先),后端可直接据此建索引。
+    pub active_layers: Option<Vec<Arc<Layer>>>,
     /// 绘制列表(只含可见/需要执行的 op)。
     pub passes: Vec<Pass>,
     /// 已提交到常驻图层、因而未在本帧重发的图像命令前缀终点。
@@ -380,6 +390,7 @@ impl CompositorFrame {
             image_probe_order: default_probe_order(),
             windows: Vec::new(),
             layers: Vec::new(),
+            active_layers: None,
             passes: Vec::new(),
             image_prefixes: BTreeMap::new(),
             text: Vec::new(),

@@ -1537,7 +1537,7 @@ impl GfxState {
                         _ => None,
                     }
                 }));
-        needed_snapshots.extend(pin_snap_tex);
+        needed_snapshots.extend(pin_snap_tex.iter().copied());
         // 闭包:被引用的快照还要它的生产者所捕获的命令时刻源。
         // `copy_log` 按 `CopyId` 单调追加(裁剪保序),二分查找即可。
         let mut pending: Vec<CopyId> = needed_snapshots.iter().copied().collect();
@@ -1560,11 +1560,23 @@ impl GfxState {
         // 复制项的 `source_texture`。不能把所有历史快照的图层并进来 ——
         // 长会话里旧菜单快照会保留,每帧重放它们的图像加工会让
         // `surface_passes`/render 单调上涨。
+        //
+        // **已烘焙的屏幕快照不再展开内部图层**:它的最终屏幕纹理已经冻结,
+        // 后端 `live_snapshots` 只保留这张纹理(快照内部的复制链也随之
+        // 释放)。旧口径只看“CGS 层还活着”,于是 0.555 存档界面关闭后,
+        // 快照捕获的 ~1000 个 UI 层仍被逐帧当成读者物化(4ms 平台与
+        // merge:92 重放的根因)。尚未烘焙(采集当帧、或物化失败待重试)
+        // 的快照仍完整展开。
+        let baked_copies = self.baked_copies.borrow();
         let mut consumed_snapshots: rustc_hash::FxHashSet<CopyId> = self
             .nodes
             .values()
             .filter_map(|node| match &node.layer.texture {
-                TextureRef::Snapshot(id) if self.screen_snapshots.contains_key(id) => Some(*id),
+                TextureRef::Snapshot(id)
+                    if self.screen_snapshots.contains_key(id) && !baked_copies.contains(id) =>
+                {
+                    Some(*id)
+                }
                 _ => None,
             })
             .collect();
@@ -1572,6 +1584,7 @@ impl GfxState {
             if let Some(TextureRef::Snapshot(id)) = &copy.source_texture {
                 if (self.nodes.contains_key(&copy.dest) || needed_snapshots.contains(&copy.id))
                     && self.screen_snapshots.contains_key(id)
+                    && !baked_copies.contains(id)
                 {
                     consumed_snapshots.insert(*id);
                 }
@@ -1630,6 +1643,10 @@ impl GfxState {
                 }
             }
         }
+        // 本帧**实际发射**的复制所读取的源层。只有它们(加上绘制树/过渡/
+        // 遮罩/文本目标)的像素需要在本帧物化;已烘焙复制不再把源层永久
+        // 算成读者 —— 否则隐藏菜单里每个槽位的加工链会逐帧重放。
+        let mut copy_reads: rustc_hash::FxHashSet<LayerId> = rustc_hash::FxHashSet::default();
         let mut texture_ops: Vec<(u64, Op)> = Vec::new();
         for c in &self.copy_log {
             // `TEXCOPY`/`TEXSSCOPY` 是官方 PASTESPRITE/GETSS,不是本后端
@@ -1695,6 +1712,14 @@ impl GfxState {
                     .borrow_mut()
                     .insert(c.id, c.dest.clone());
             }
+            // 本帧确实要重放这条复制 ⇒ 它的源层像素是观察依赖。已烘焙、
+            // 被跳过或目标已改指的复制不进来(源层加工链无需逐帧重放)。
+            match &c.source {
+                CopySource::Layer(id) | CopySource::Group(id) => {
+                    copy_reads.insert(id.clone());
+                }
+                CopySource::Screen(_) => {}
+            }
             texture_ops.push((c.seq, Op::Copy(c.clone())));
         }
         // 图像加工的发射计划:已删临时层的加工链只在**本帧仍有未烘焙消费者**
@@ -1706,33 +1731,114 @@ impl GfxState {
         //
         // 反向扫描:先看消费者(序号更大)是否需要该源;被需要才置发射位,
         // 并把自己的源继续往前传(链式依赖)。
-        let mut needed_sources: rustc_hash::FxHashSet<LayerId> = rustc_hash::FxHashSet::default();
-        // `DIV-GFX-072 §1-8`:源层在本帧被 `CGEND` 删除,但同帧 COPY 已经
-        // 在命令时刻读过它的像素。后端回放 COPY 时只剩 `source_texture`
-        // (基图);必须把该层的图像加工链也标为“本帧需要”,让加工 pass
-        // 先写进 `texture_overrides`,COPY 才能取到官方看到的加工后像素。
+        // 复制源只来自**本帧发射**的复制(见上)。已烘焙复制不再把源层
+        // 永久算成读者;同帧被 `CGEND` 删除但 COPY 已读过像素的情况
+        // (`DIV-GFX-072 §1-8`)也由 `copy_reads` 覆盖 —— 发射判定看的是
+        // copy.id,与源层是否仍存在无关,后端按 `source_texture`/加工链重放。
+        let mut needed_sources: rustc_hash::FxHashSet<LayerId> = copy_reads.clone();
+        // 文本投影只取一次(下面读者闭包与 `f.text_*` 共用)。
+        let text_layout_now = self.text_layout_now();
+        let text_draws_now = self.text_draws_now();
+        // ---- 本帧读者闭包 ----
+        //
+        // 只有“会被看到/被读到”的层像素需要本帧物化:
+        // - 绘制树(各可见窗口的图层集,组隐藏 ⇒ 子树不合成);
+        // - 本帧实际发射复制的源层;
+        // - 被读组(复制组源/图像组源/屏幕快照层)里的可见内容;
+        // - 过渡配对层 `TID`、遮罩层(绘制 op 的跨层读取);
+        // - 文本目标(文本合成读基面);
+        // - 当帧屏幕快照捕获过的层。
+        //
+        // 这里的集合驱动图像惰性门禁,并决定哪些层进入 `active_layers`
+        // 做逐层同步;组离屏 pass 仍按既有契约全树构建(隐藏组也保留,
+        // COPY/过渡可以读它的表面)。
+        let mut read_groups: rustc_hash::FxHashSet<LayerId> = rustc_hash::FxHashSet::default();
         for copy in &self.copy_log {
-            if !matches!(copy.kind, CopyKind::Copy | CopyKind::Copy2) {
+            if copy.status != OpStatus::Executable {
                 continue;
             }
-            let dest_live = match self.nodes.get(&copy.dest) {
-                Some(n) => {
-                    matches!(n.layer.texture, TextureRef::Snapshot(id) if id == copy.id)
+            if let CopySource::Group(id) = &copy.source {
+                if self.nodes.get(id).is_some_and(|n| n.layer.is_group()) {
+                    read_groups.insert(id.clone());
                 }
-                None => needed_snapshots.contains(&copy.id) || snapshot_layers.contains(&copy.dest),
+            }
+        }
+        for op in &self.image_log {
+            if op.status != OpStatus::Executable {
+                continue;
+            }
+            for source in std::iter::once(&op.source)
+                .chain(op.source2.iter())
+                .chain(op.source3.iter())
+            {
+                if self.nodes.get(source).is_some_and(|n| n.layer.is_group()) {
+                    read_groups.insert(source.clone());
+                }
+            }
+        }
+        for id in &snapshot_layers {
+            if self.nodes.get(id).is_some_and(|n| n.layer.is_group()) {
+                read_groups.insert(id.clone());
+            }
+        }
+        // 窗口图层集:主窗口缺省用 `main_layer_set`(与屏幕 pass 一致);
+        // 子窗口可见时其图层集也参与合成。
+        let mut window_roots: Vec<LayerId> = Vec::new();
+        if self.windows.get(&0).is_none_or(|w| w.visible) {
+            let main = self
+                .windows
+                .get(&0)
+                .and_then(|w| w.layer_set.clone())
+                .unwrap_or_else(|| self.config.main_layer_set.clone());
+            window_roots.push(main);
+        }
+        for (no, window) in &self.windows {
+            if *no == 0 || !window.visible {
+                continue;
+            }
+            if let Some(set) = &window.layer_set {
+                window_roots.push(set.clone());
+            }
+        }
+        let mut readers = self.collect_composited(&window_roots);
+        readers.extend(copy_reads.iter().cloned());
+        readers.extend(snapshot_layers.iter().cloned());
+        for id in self.text_draws.keys() {
+            readers.insert(id.clone());
+        }
+        if let Some(target) = text_layout_now.as_ref().and_then(|l| l.target.clone()) {
+            readers.insert(target);
+        }
+        {
+            let roots: Vec<LayerId> = read_groups.iter().cloned().collect();
+            readers.extend(self.collect_composited(&roots));
+        }
+        // 配对层/遮罩是绘制 op 的跨层读取;被读组新增的可见子层继续展开。
+        // 固定点迭代,链长通常 0–1 轮。
+        let mut queue: Vec<LayerId> = readers.iter().cloned().collect();
+        while let Some(id) = queue.pop() {
+            let Some(node) = self.nodes.get(&id) else {
+                continue;
             };
-            if !dest_live {
-                continue;
+            let mut cross: Vec<LayerId> = Vec::new();
+            if let Some(tid) = node.layer.transition.as_ref().and_then(|t| t.tid.as_ref()) {
+                cross.push(tid.clone());
             }
-            let dest_holds = self.nodes.get(&copy.dest).is_some_and(
-                |n| matches!(n.layer.texture, TextureRef::Snapshot(id) if id == copy.id),
-            );
-            if dest_holds && self.baked_copies.borrow().contains(&copy.id) {
-                continue;
+            if let Some(mask) = &node.layer.mask {
+                cross.push(mask.clone());
             }
-            if let CopySource::Layer(id) = &copy.source {
-                if !self.nodes.contains_key(id) {
-                    needed_sources.insert(id.clone());
+            for other in cross {
+                let is_group = self.nodes.get(&other).is_some_and(|n| n.layer.is_group());
+                if readers.insert(other.clone()) {
+                    queue.push(other.clone());
+                }
+                if is_group && read_groups.insert(other.clone()) {
+                    let more = self.collect_composited(std::slice::from_ref(&other));
+                    for id in more {
+                        if readers.insert(id.clone()) {
+                            queue.push(id);
+                        }
+                    }
                 }
             }
         }
@@ -1771,7 +1877,13 @@ impl GfxState {
             {
                 continue;
             }
-            let target_live = self.nodes.contains_key(target) || snapshot_layers.contains(target);
+            // 惰性物化:只有本帧真正会被看到/读到的目标层才发射加工链。
+            // 隐藏组的子层按**有效可见性**排除(不是只看自身 E 位);变可见
+            // 或被复制/过渡/遮罩/文本读取时按命令序补放,像素与官方立即
+            // 执行一致(日志未删、烘焙前缀未提交)。
+            let target_live = snapshot_layers.contains(target)
+                || readers.contains(target)
+                || needed_sources.contains(target);
             let replayable = self.nodes.contains_key(&i.source) || i.source_texture.is_some();
             // 目标已删时,命令时刻记录的目标基面(纹理 + fill + 显式尺寸)
             // 仍能重建“下层”。官方 `CGACT` 在命令体内已完成像素运算,
@@ -1964,6 +2076,40 @@ impl GfxState {
         });
 
         f.passes = passes;
+        // ---- 本帧活跃层(后端逐层规划/同步范围) ----
+        //
+        // 覆盖所有 pass/复制/图像/文本引用到的层与它们的祖先;`f.layers` 仍是
+        // 完整状态表,后端只对 active 建索引并跑逐层 `base_token`/`sync_base`,
+        // 常驻但不可见的 UI 缓存层因此不再每帧付 O(层数) 成本,其表面与
+        // 烘焙前缀也仍由完整表保活。
+        let mut active_ids = readers;
+        for pass in &f.passes {
+            if let PassTarget::Offscreen(id) = &pass.target {
+                active_ids.insert(id.clone());
+            }
+            for op in &pass.ops {
+                Self::for_each_op_layer(op, |id| {
+                    active_ids.insert(id);
+                });
+            }
+        }
+        for draw in text_draws_now.iter() {
+            active_ids.insert(draw.target.clone());
+        }
+        if let Some(target) = text_layout_now.as_ref().and_then(|l| l.target.clone()) {
+            active_ids.insert(target);
+        }
+        active_ids.insert(self.current_text.clone());
+        // 祖先链:后端按层索引取组尺寸/变换时需要整条父链在表内。
+        let mut pending: Vec<LayerId> = active_ids.iter().cloned().collect();
+        while let Some(id) = pending.pop() {
+            let Some(parent) = self.nodes.get(&id).and_then(|n| n.parent.clone()) else {
+                continue;
+            };
+            if active_ids.insert(parent.clone()) {
+                pending.push(parent);
+            }
+        }
         // 窗口/诊断都是低频变化的投影:按代次重建缓存,避免每帧重扫。
         {
             let mut cache = self.windows_cache.borrow_mut();
@@ -1996,6 +2142,13 @@ impl GfxState {
         // 不稳定排序与稳定排序结果逐位相同。
         f.layers
             .sort_unstable_by(|a, b| (a.z, a.seq, &a.id).cmp(&(b.z, b.seq, &b.id)));
+        f.active_layers = Some(
+            f.layers
+                .iter()
+                .filter(|layer| active_ids.contains(&layer.id))
+                .cloned()
+                .collect(),
+        );
         f.text = self
             .text_pending
             .as_ref()
@@ -2012,8 +2165,8 @@ impl GfxState {
                 }]
             })
             .unwrap_or_default(); // silent-ok: 无待显示缓冲 = 空列表
-        f.text_layout = self.text_layout_now();
-        f.text_draws = self.text_draws_now();
+        f.text_layout = text_layout_now;
+        f.text_draws = text_draws_now;
         f.text_revisions = self.text_revisions_now();
         // 诊断按代次复用已排序投影;只有追加文本图像诊断后才需要再排一次。
         {
@@ -2317,7 +2470,28 @@ impl GfxState {
                 }
             }
         }
-        let layer_ids = layers.iter().map(|layer| layer.id.clone()).collect();
+        // 快照内部图层集只取**实际参与这次屏幕合成**的层(pass op 引用 +
+        // 文本目标),不是整张节点表。旧实现把全部存活层都记进来,于是
+        // 每次 `COPY2 ID=:/W0/` 采集帧都把常驻 UI 的 ~1000 个隐藏层拉回
+        // 读者集合(`active` 尖峰 / 加工链重放);快照只冻结屏幕,隐藏层
+        // 不在其中。
+        let mut layer_ids: BTreeSet<LayerId> = BTreeSet::new();
+        for pass in &passes {
+            if let PassTarget::Offscreen(id) = &pass.target {
+                layer_ids.insert(id.clone());
+            }
+            for op in &pass.ops {
+                Self::for_each_op_layer(op, |id| {
+                    layer_ids.insert(id);
+                });
+            }
+        }
+        for draw in text_draws.iter() {
+            layer_ids.insert(draw.target.clone());
+        }
+        if let Some(target) = text_layout.as_ref().and_then(|l| l.target.clone()) {
+            layer_ids.insert(target);
+        }
         Some(std::sync::Arc::new(crate::frame::ScreenSnapshot {
             layers,
             passes,
@@ -7682,6 +7856,12 @@ impl GfxState {
             if node.layer.is_group() {
                 stack.push((id.clone(), true));
             }
+            // 叶子层没有子表:跳过 `sorted_children`(每次一次小分配 +
+            // 排序 + 缓存插入)。常驻 UI 树里绝大多数是叶子,这一条能把
+            // 全树遍历的固定成本降回接近可见层规模。
+            if node.children.is_empty() {
+                continue;
+            }
             for child in self.sorted_children(Some(&id), cache).iter().rev() {
                 stack.push((child.clone(), false));
             }
@@ -7788,6 +7968,100 @@ impl GfxState {
     ) {
         for child in self.sorted_children(Some(parent), cache).iter() {
             self.emit_node_ops(child, out, emitted, produced, cache);
+        }
+    }
+
+    /// 按绘制语义收集会被合成的层/组:
+    /// - 组隐藏 ⇒ 整棵子树不参与合成(`emit_node_ops` 直接 return);
+    /// - 图像层隐藏只影响自身,子层仍按各自 E 位绘制;
+    /// - 根(窗口图层集/被读组)自身 E 位不限制入口,与屏幕/离屏 pass 一致。
+    fn collect_composited(&self, roots: &[LayerId]) -> rustc_hash::FxHashSet<LayerId> {
+        let mut out = rustc_hash::FxHashSet::default();
+        let mut stack: Vec<(LayerId, bool)> =
+            roots.iter().cloned().map(|id| (id, true)).collect();
+        while let Some((id, is_root)) = stack.pop() {
+            let Some(node) = self.nodes.get(&id) else {
+                continue;
+            };
+            if node.layer.is_group() {
+                if !is_root && !node.layer.visible {
+                    continue;
+                }
+                out.insert(id);
+                for child in &node.children {
+                    stack.push((child.clone(), false));
+                }
+            } else {
+                if node.layer.visible {
+                    out.insert(id.clone());
+                }
+                for child in &node.children {
+                    stack.push((child.clone(), false));
+                }
+            }
+        }
+        out
+    }
+
+    /// 收集一个 op 引用到的全部图层 id(含掩码/过渡配对/复制源/图像源)。
+    ///
+    /// 帧投影的 `active_layers` 与屏幕快照的 `layer_ids` 共用这一份口径:
+    /// 任何被 op 引用的层都必须进入后端层索引,否则规划期查找会退化成
+    /// “层不存在”。两处手写 match 容易漂移,集中在这里。
+    fn for_each_op_layer(op: &Op, mut f: impl FnMut(LayerId)) {
+        match op {
+            Op::Layer(layer) => {
+                f(layer.id.clone());
+                if let Some(mask) = &layer.mask {
+                    f(mask.clone());
+                }
+            }
+            Op::Group(group) => {
+                f(group.layer.id.clone());
+                f(group.offscreen.clone());
+                if let Some(mask) = &group.layer.mask {
+                    f(mask.clone());
+                }
+            }
+            Op::Transition(t) => {
+                f(t.layer.id.clone());
+                if let Some(id) = &t.from_layer {
+                    f(id.clone());
+                }
+                if let Some(id) = t.tid.as_ref() {
+                    f(id.clone());
+                }
+                if let Some(id) = &t.to_layer {
+                    f(id.clone());
+                }
+                if let Some(mask) = &t.layer.mask {
+                    f(mask.clone());
+                }
+            }
+            Op::Mask(m) => {
+                f(m.layer.id.clone());
+                f(m.mask.clone());
+            }
+            Op::Copy(c) => {
+                f(c.dest.clone());
+                match &c.source {
+                    CopySource::Layer(id)
+                    | CopySource::Group(id)
+                    | CopySource::Screen(id) => f(id.clone()),
+                }
+            }
+            Op::Image(i) => {
+                f(i.source.clone());
+                if let Some(id) = &i.source2 {
+                    f(id.clone());
+                }
+                if let Some(id) = &i.source3 {
+                    f(id.clone());
+                }
+                if let Some(target) = &i.target {
+                    f(target.clone());
+                }
+            }
         }
     }
 

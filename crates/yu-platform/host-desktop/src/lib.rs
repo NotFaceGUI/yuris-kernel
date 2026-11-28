@@ -2005,7 +2005,7 @@ impl App {
              capture={capture_ms:.1}ms frame_build={frame_build_ms:.1}ms preload={:.1}ms/{} preload_err={} \
              sdecode={:.1}ms sstream={:.1}ms sdecodes={} sframes={} sunder={} sseeks={} sslow={} \
              clock={}ms lag={}ms \
-             ops={total_ops} layers={} visible={} passes={} drawn={} skipped={}",
+             ops={total_ops} layers={} active={} visible={} passes={} drawn={} skipped={}",
             self.frames,
             report.frame,
             self.engine.preload_ms(),
@@ -2021,6 +2021,7 @@ impl App {
             report.clock_ms,
             report.lag_ms,
             report.layers,
+            report.active_layers,
             report.visible,
             report.passes,
             report.executed,
@@ -3636,6 +3637,7 @@ impl ApplicationHandler for App {
                 (
                     report.ops_drawn,
                     report.layers,
+                    report.active_layers,
                     report.passes,
                     report.skipped_text,
                     report.missing_assets.len(),
@@ -3648,10 +3650,10 @@ impl ApplicationHandler for App {
                         .collect::<Vec<_>>(),
                 )
             });
-            if let Some((ops, layers, passes, text, missing, text_diags, skips)) = detail {
+            if let Some((ops, layers, active, passes, text, missing, text_diags, skips)) = detail {
                 host_error!(
                     "[render spike] frame {} render={render_ms:.1}ms ops={ops} layers={layers} \
-                     passes={passes} text_runs={text} missing_assets={missing} \
+                     active={active} passes={passes} text_runs={text} missing_assets={missing} \
                      skip_top={} text_diags={:?}",
                     self.frames,
                     skips.join(" | "),

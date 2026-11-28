@@ -1109,6 +1109,7 @@ pub(crate) struct Accum {
     pub(crate) viewport_width: u32,
     pub(crate) viewport_height: u32,
     pub(crate) layers: usize,
+    pub(crate) active_layers: usize,
     pub(crate) visible_layers: usize,
     pub(crate) passes: usize,
     pub(crate) offscreen_passes: usize,
@@ -1137,6 +1138,10 @@ impl Accum {
             viewport_width: frame.viewport.width,
             viewport_height: frame.viewport.height,
             layers: frame.layers.len(),
+            active_layers: frame
+                .active_layers
+                .as_ref()
+                .map_or(frame.layers.len(), Vec::len),
             visible_layers: frame.layers.iter().filter(|l| l.visible).count(),
             passes: 0,
             offscreen_passes: 0,
@@ -1178,6 +1183,7 @@ impl Accum {
             viewport_width: self.viewport_width,
             viewport_height: self.viewport_height,
             layers: self.layers,
+            active_layers: self.active_layers,
             visible_layers: self.visible_layers,
             passes: self.passes,
             offscreen_passes: self.offscreen_passes,

@@ -1288,6 +1288,7 @@ mod tests {
             executed: 3,
             passes: 4,
             layers: 9,
+            active_layers: 9,
             visible: 6,
             tick_ms: 1.0,
             render_ms: 2.0,

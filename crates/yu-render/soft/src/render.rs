@@ -2121,6 +2121,8 @@ impl<'a> RenderState<'a> {
                 viewport_width: frame.viewport.width,
                 viewport_height: frame.viewport.height,
                 layers: frame.layers.len(),
+                // soft 逐层扫描全表(不消费 `active_layers`),按实际口径上报。
+                active_layers: frame.layers.len(),
                 visible_layers,
                 passes: 0,
                 offscreen_passes: 0,

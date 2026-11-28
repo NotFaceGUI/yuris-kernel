@@ -128,6 +128,9 @@ pub struct RenderReport {
     pub viewport_height: u32,
     /// `CompositorFrame.layers` 数量(含不可见层)。
     pub layers: usize,
+    /// 后端本帧逐层规划/同步的层数(wgpu 按 `CompositorFrame.active_layers`
+    /// 子集;soft 逐层扫描全表,上报 `layers`)。
+    pub active_layers: usize,
     pub visible_layers: usize,
     /// pass 总数(含空 pass)。
     pub passes: usize,

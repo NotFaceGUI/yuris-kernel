@@ -3,7 +3,7 @@
 mod support;
 
 use support::*;
-use yu_gfx::{json, LayerId, Op, PassTarget};
+use yu_gfx::{json, GfxState, LayerId, Op, PassTarget};
 
 fn cg(
     table: &yu_gfx::ParamTable,
@@ -350,4 +350,149 @@ fn text_model_keeps_style_and_bytes() {
     assert_eq!(f.text[0].style.size_x, 22);
     assert!(f.text[0].style.bold);
     assert_eq!(f.text[0].bytes, b"\x82\xa0");
+}
+
+/// 惰性物化:隐藏组里的子层即使自身 `E=1` 也不合成 ⇒ 本帧不物化它的
+/// 加工链;组变可见后按命令序补放(像素与官方立即执行一致)。
+#[test]
+fn hidden_group_child_ops_are_lazy_until_group_is_visible() {
+    let table = table();
+    let mut gfx = state();
+    let paint = |id: &str| {
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s(id)),
+                arg(&table, "CGACT", "RECTPAINT3", i(1)),
+                arg(&table, "CGACT", "SET", i(0x00FF0000)),
+            ],
+        )
+    };
+    let texture_targets = |gfx: &GfxState| -> Vec<String> {
+        gfx.frame()
+            .passes
+            .iter()
+            .filter_map(|p| match &p.target {
+                PassTarget::Texture(id) => Some(id.display()),
+                _ => None,
+            })
+            .collect()
+    };
+    gfx.consume_events(&[
+        frame_start(1),
+        cg(&table, "G/", 1, 256, 0, None),
+        cg(&table, "G/C", 2, 256, 1, Some("c")),
+        paint(":/W0/G/C"),
+        frame_end(1),
+    ]);
+    assert!(
+        !texture_targets(&gfx).iter().any(|id| id == ":/W0/G/C"),
+        "父组隐藏时子层加工不得进入本帧计划"
+    );
+
+    gfx.consume_events(&[
+        frame_start(2),
+        cg(&table, "G/", 1, 256, 1, None),
+        frame_end(2),
+    ]);
+    assert!(
+        texture_targets(&gfx).iter().any(|id| id == ":/W0/G/C"),
+        "组变可见后必须补放未烘焙的加工链"
+    );
+}
+
+/// 复制读者把隐藏源层拉回本帧计划:目标层持有的快照需要命令时刻像素,
+/// 源层的加工链不能因为没有可见性而被跳过。
+#[test]
+fn hidden_source_ops_replay_when_a_copy_reads_them() {
+    let table = table();
+    let mut gfx = state();
+    let paint = call(
+        1,
+        "CGACT",
+        vec![
+            arg(&table, "CGACT", "ID", s("SRC")),
+            arg(&table, "CGACT", "RECTPAINT3", i(1)),
+            arg(&table, "CGACT", "SET", i(0x0000FF00)),
+        ],
+    );
+    let copy = call(
+        1,
+        "CGACT",
+        vec![
+            arg(&table, "CGACT", "ID", s("SRC")),
+            arg(&table, "CGACT", "ID2", s("DST")),
+            arg(&table, "CGACT", "COPY2", i(1)),
+        ],
+    );
+    gfx.consume_events(&[
+        frame_start(1),
+        cg(&table, "SRC", 1, 256, 0, Some("src")),
+        cg(&table, "DST", 2, 256, 0, None),
+        paint,
+        frame_end(1),
+    ]);
+    let src_ops = |gfx: &GfxState| {
+        gfx.frame()
+            .passes
+            .iter()
+            .flat_map(|p| p.ops.iter())
+            .filter(|op| matches!(op, Op::Image(image) if image.source.display() == ":/W0/SRC"))
+            .count()
+    };
+    assert_eq!(src_ops(&gfx), 0, "隐藏且无人读的源层不发射加工链");
+
+    gfx.consume_events(&[frame_start(2), copy, frame_end(2)]);
+    assert!(
+        src_ops(&gfx) > 0,
+        "复制读取隐藏源层时,源层加工链必须按命令序补放"
+    );
+    assert!(
+        gfx.frame()
+            .active_layers
+            .as_ref()
+            .expect("active")
+            .iter()
+            .any(|layer| layer.id.display() == ":/W0/SRC"),
+        "被复制读取的隐藏源层必须在 active 表内"
+    );
+}
+
+/// 屏幕快照的依赖图层集只取实际参与该次屏幕合成的层:隐藏层不在快照里,
+/// 不能被 `layer_ids` 拉回读者集合(0.555 存档界面关闭后 4ms 平台的根因)。
+#[test]
+fn screen_snapshot_layer_ids_exclude_hidden_layers() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        cg(&table, "BG", 1, 256, 1, Some("bg")),
+        cg(&table, "HID", 2, 256, 0, Some("hid")),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s(":/W0/")),
+                arg(&table, "CGACT", "ID2", s("CGS100")),
+                arg(&table, "CGACT", "COPY2", i(1)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let snap = f
+        .screen_snapshots
+        .values()
+        .max_by_key(|snap| snap.layer_ids.len())
+        .expect("屏幕快照");
+    let ids: Vec<String> = snap.layer_ids.iter().map(|id| id.display()).collect();
+    assert!(
+        ids.iter().any(|id| id == ":/W0/BG"),
+        "可见层必须出现在快照依赖集: {ids:?}"
+    );
+    assert!(
+        !ids.iter().any(|id| id == ":/W0/HID"),
+        "隐藏层不属于快照画面,不得进入依赖集: {ids:?}"
+    );
 }

@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use yu_gfx::{
     Clear, CompositorFrame, CopyId, CopyOp, CopySource, ImageAction, ImageOp, ImageTargetBase,
@@ -323,6 +324,14 @@ pub(crate) fn plan(
     surfaces.begin_frame(frame.frame);
     let materialized = targets.materialized_ids();
     targets.prune_snapshots(&live_snapshots(frame, &materialized), pipelines);
+    // 逐层规划/同步只覆盖本帧活跃层(绘制树 + 被读层及祖先)。`frame.layers`
+    // 仍是完整状态表:上面的快照保活、下面的存活剪枝/组尺寸查找都继续用它,
+    // 常驻但不可见的 UI 缓存层不会因此丢表面或烘焙前缀。
+    // `None` = 手工构造/快照重放帧,按全量处理(与旧行为一致)。
+    let plan_layers: &[Arc<Layer>] = frame
+        .active_layers
+        .as_deref()
+        .unwrap_or(frame.layers.as_slice());
     // #74:存活层集合只建一次(借用 ID,零克隆),三处消费共用。
     let live_ids: rustc_hash::FxHashSet<&LayerId> =
         frame.layers.iter().map(|layer| &layer.id).collect();
@@ -368,7 +377,7 @@ pub(crate) fn plan(
     // 结果)必须作废 —— 否则被 `COPY` 读取/直接绘制时仍会拿到上一帧的
     // 像素(ERIS 底部按钮栏每个按钮都渲染成同一段旧文字的根因;同一机制
     // 还会让区域拷贝越界:旧内容的逻辑网格与新纹理尺寸不符)。
-    for layer in &frame.layers {
+    for layer in plan_layers {
         // 免查找:这里已经持有 `&Layer`,再让 `base_token` 去 `frame.layers`
         // 里线性搜同一个 id 就是 O(层数²)。
         let token = base_token_of(frame, targets, &layer.id, Some(layer), None);
@@ -489,7 +498,7 @@ pub(crate) fn plan(
     //
     // 用 `&Layer` 而不是 clone:`frame` 在 `plan()` 期间只读。
     let layer_index: HashMap<&LayerId, &Layer> =
-        frame.layers.iter().map(|layer| (&layer.id, layer.as_ref())).collect();
+        plan_layers.iter().map(|layer| (&layer.id, layer.as_ref())).collect();
 
     // ---- 0.5 延迟物化补账 ----
     //
