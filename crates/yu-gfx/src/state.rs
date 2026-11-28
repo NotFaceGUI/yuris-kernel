@@ -1044,6 +1044,15 @@ impl GfxState {
         };
         let layer = Arc::make_mut(&mut node.layer);
         layer.texture = TextureRef::Asset(key);
+        // 装载分支按**新图头**重写图层矩形(与 `CG[FILE]` 的换图路径同一条
+        // 官方规则:空串 1×1、资产按新图尺寸)。读档脚本的固定套路是先
+        // `CG[FILE="" A=0]` 预建占位层、再 `CGACT[SIZE]` 摆框、最后
+        // `LOAD[ID]` 装图;这里不重写的话,图会被拉伸进占位阶段的旧矩形,
+        // `CGINFO[SX/SY]` 也继续报旧值(实测 256×160 缩略图被摆成 544×306)。
+        layer.display_rect = None;
+        layer.kind = LayerKind::Image {
+            size: Some(size),
+        };
         layer.fill = None;
         // 官方 `LOAD[ID]` 把图装回后该层**立即可见**:读档脚本先用
         // `CG[FILE="" A=0]` 预建缩略图/文字层(0.289 `es_saveload.yst`
