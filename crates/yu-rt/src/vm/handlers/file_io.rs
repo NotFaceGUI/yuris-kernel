@@ -583,6 +583,14 @@ impl Vm {
         //    与读档槽存在判定实测;`SAVE[FILE]` 侧一直按 save 根解析,
         //    FILEINFO 侧旧实现直接拒绝 ⇒ 读档界面全 NO DATA)。
         // 三种都落到**真实** save 根(`--save-root` 重定向同样生效)。
+        let prefixed = self
+            .paths
+            .save_path
+            .as_deref()
+            .is_some_and(|prefix| path.starts_with(prefix));
+        // `save/` / `save\` 前缀把路径锚在 save 目录;**锚定后**剩余部分
+        // 多出的前导分隔符(`save//x`)按 Windows 语义折叠,不是绝对路径。
+        let save_prefixed = path.starts_with(b"save/") || path.starts_with(b"save\\");
         let rel: &[u8] = match self.paths.save_path.as_deref() {
             Some(prefix) if path.starts_with(prefix) => &path[prefix.len()..],
             _ => {
@@ -606,8 +614,23 @@ impl Vm {
             return None;
         }
         let text = self.script_codec.decode(rel, rel).ok()?;
-        let text = text.replace('\\', "/");
+        // 重复分隔符按 Windows 语义折叠(`save//x` = `save/x`);前缀分支
+        // 里残留的前导 `/` 是「`$_SAVE_PATH` 自带尾斜杠 + 名自带前斜杠」,
+        // 官方路径同样可解析,必须容忍。
+        let mut text = text.replace('\\', "/");
+        while text.contains("//") {
+            text = text.replace("//", "/");
+        }
+        if prefixed || save_prefixed {
+            text = text.trim_start_matches('/').to_string();
+        }
         if text.split('/').any(|c| c == "..") {
+            return None;
+        }
+        // 根相对/盘符/UNC 会在 `join` 时替换 save 根(读档存在判定、
+        // SAVE[FILE] 共用本解析),必须拒绝。`:` 只在 Windows 上是盘符
+        // 语法;Unix 文件名可以合法含 `:`。
+        if text.starts_with('/') || (cfg!(windows) && text.contains(':')) {
             return None;
         }
         let root = match self.save_root.as_deref() {

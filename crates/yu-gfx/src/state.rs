@@ -4408,34 +4408,16 @@ impl GfxState {
                     );
                     return;
                 }
-                // 无 FILE/RID 但带**状态参数**(A/E/Z/X/Y/SX/SY/MODE/T/…)
-                // 是“在空白层上设属性”,不是存在性探测。2xx 转场脚本用
-                // `CG[ID=SRCCG A=0]` 创建转场缓冲;不建层会让后续
-                // `CGACT[SWAP]` 找不到源/目标。只给 ID 的纯探测仍不建层。
-                let has_state_param = params.iter().any(|(name, _, _)| {
-                    matches!(
-                        &**name,
-                        "A" | "E"
-                            | "Z"
-                            | "X"
-                            | "Y"
-                            | "SX"
-                            | "SY"
-                            | "MODE"
-                            | "T"
-                            | "TA"
-                            | "TID"
-                            | "TNO"
-                            | "MID"
-                            | "MNO"
-                            | "MFILE"
-                            | "CASH"
-                            | "FRAME"
-                            | "TEX"
-                            | "TRIM"
-                    )
-                });
-                if !has_state_param {
+                // 无 FILE/RID 但带 **A(alpha)** 是“新建透明缓冲并设属性”,
+                // 不是存在性探测:2xx 转场脚本用 `CG[ID=SRCCG A=0]` 建转场
+                // 缓冲;不建层会让后续 `CGACT[SWAP]` 找不到源/目标。
+                //
+                // **不能扩大到全部状态参数**:0.495 ERIS 首屏有 483 条
+                // `CG[ID E=0 X Y MODE=0]` 的禁用按钮探测,官方对缺层一律
+                // 返回 -1、不建节点(REA `0x42a63d..0x42bbef`;golden 199 层
+                // 按此钉)。它们都没有 A;只有 A 才触发建层。
+                let has_alpha = params.iter().any(|(name, _, _)| &**name == "A");
+                if !has_alpha {
                     // 脚本把 `CG[ID=…]` 当存在性探测逐帧轮询;官方静默
                     // 返回 -1。按层只留一条 Verbose,避免把正常轮询变成
                     // WARN 洪峰(`<game-b>` 开场单帧 2 万次)。
@@ -4920,10 +4902,18 @@ impl GfxState {
         // 扩缩量(0.290 s93 pc1619..`CGACT[RESIZE=1 BOTTOM=n LEFT=n]`)。
         // 语义按 RESIZE 已知公式 `newW = srcW + 左 + 右`,
         // `newH = srcH + 上 + 下` 映射到同名边;X/Y/X2/Y2 仍优先。
-        let x = px("X", "FX").or_else(|| find_f64(&params, "LEFT"));
-        let y = px("Y", "FY").or_else(|| find_f64(&params, "TOP"));
-        let x2 = px("X2", "FX2").or_else(|| find_f64(&params, "RIGHT"));
-        let y2 = px("Y2", "FY2").or_else(|| find_f64(&params, "BOTTOM"));
+        // 别名只在 RESIZE 上生效:其它动作的同名键没有取证,不能猜。
+        let edge_px = |name: &str| -> Option<f64> {
+            if first_image_action(&params).is_some_and(|(_, action)| action.is_resize()) {
+                find_f64(&params, name)
+            } else {
+                None
+            }
+        };
+        let x = px("X", "FX").or_else(|| edge_px("LEFT"));
+        let y = px("Y", "FY").or_else(|| edge_px("TOP"));
+        let x2 = px("X2", "FX2").or_else(|| edge_px("RIGHT"));
+        let y2 = px("Y2", "FY2").or_else(|| edge_px("BOTTOM"));
         // SIZE/SIZE2 的目标尺寸(手册 cg/cgact.html 例 3/4)。
         //
         // **必须按浮点读**:`es_Sprite.yst` 的 `es.CGACT_SIZE` 传进来的

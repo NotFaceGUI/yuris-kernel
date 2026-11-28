@@ -25,13 +25,16 @@ CGACT[ID=… RESIZE=1 BOTTOM=n LEFT=n]     (0.290 s93 pc1619..)
 
 ## 决策
 
-把 `LEFT/RIGHT/TOP/BOTTOM` 作为 `X/X2/Y/Y2` 的**通用别名**接入参数解析
-(`X/Y/X2/Y2` 优先);不按版本号分支。没有这四个键的工程表不会产生任何
-参数,行为不变。
+把 `LEFT/RIGHT/TOP/BOTTOM` 作为 `X/X2/Y/Y2` 的别名接入参数解析
+(`X/Y/X2/Y2` 优先),但**只在 `action.is_resize()` 时生效**:这四个键
+的语义证据仅来自 RESIZE,其它动作的同名键没有取证,不能猜。
+没有这四个键的工程表不会产生任何参数,行为不变。
 
 ## 验证
 
 - `<0.290 商业>` 静态普查:`CGACT[LEFT]=8`、`[RIGHT]=3`、`[BOTTOM]=23`、
   `[RESIZE]=23`,首次位置 `s93 pc1619`;首帧启动无 `UNIMP`;
+- `cgact_margin_aliases_are_resize_only`(LEFT→X / BOTTOM→Y2 只在
+  RESIZE;ROTATION 不读 LEFT);
 - 0.495/0.466 语料回归:参数表无这些键,`RESIZE` 仍走原 `X/Y/X2/Y2`
   (`resize_updates_layer_rect_for_cginfo` 等测试全绿)。

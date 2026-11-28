@@ -1950,6 +1950,28 @@ fn fileinfo_relative_save_prefix_resolves_to_save_root() {
         Value::Int(1),
         "反斜杠形式同样归一"
     );
+    assert_eq!(
+        boot_with("save//save001.sd"),
+        Value::Int(1),
+        "重复分隔符按 Windows 语义折叠"
+    );
+    // 绝对/盘符/UNC 路径不得逃出 save 根(`Path::join` 会替换根)。
+    // 根外放一个真实文件:没有越界拒绝时它会命中(返回 1)。
+    let outside = dir
+        .parent()
+        .expect("parent")
+        .join("fixture-fsinfo-outside.sd");
+    std::fs::write(&outside, b"YSSD-outside").expect("写根外文件");
+    let outside_str = outside.to_string_lossy().replace('\\', "/");
+    assert_eq!(
+        boot_with(&outside_str),
+        Value::Int(0),
+        "绝对路径必须判不存在: {outside_str}"
+    );
+    let _ = std::fs::remove_file(&outside);
+    for escape in ["C:/Windows/win.ini", "/etc/passwd", "//server/share/x.sd"] {
+        assert_eq!(boot_with(escape), Value::Int(0), "越界路径必须判不存在: {escape}");
+    }
 }
 
 

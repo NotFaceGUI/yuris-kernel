@@ -2321,12 +2321,29 @@ fn cg_missing_layer_with_state_param_creates_blank() {
                 arg(&table, "CG", "A", i(0)),
             ],
         ),
+        // 0.495 ERIS 首屏的禁用按钮探测:`CG[ID E=0 X Y MODE]` 缺层时
+        // 官方返回 -1、不建节点;不能因为“带状态参数”就建鬼层。
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("BT.PROBE")),
+                arg(&table, "CG", "E", i(0)),
+                arg(&table, "CG", "X", i(10)),
+                arg(&table, "CG", "Y", i(20)),
+                arg(&table, "CG", "MODE", i(0)),
+            ],
+        ),
         frame_end(1),
     ]);
     let f = gfx.frame();
     let l = layer(&f, ":/W0/SRCCG");
     assert_eq!(l.alpha, 0);
     assert!(matches!(l.kind, LayerKind::Image { .. }));
+    assert!(
+        !f.layers.iter().any(|l| l.id.display() == ":/W0/BT.PROBE"),
+        "E/X/Y/MODE 探测不得建层"
+    );
 }
 
 /// `CG[ID=…]` 无 FILE/RID 且层不存在:官方返回 -1,脚本会逐帧轮询。
@@ -2709,4 +2726,66 @@ fn load_layer_asset_restores_alpha_after_precreated_blank_layer() {
     let layer = gfx.layer(&parsed.path).expect("层仍存在");
     assert_eq!(layer.alpha, 256, "官方 LOAD 后立即可见");
     assert!(layer.visible);
+}
+
+/// `LEFT/RIGHT/TOP/BOTTOM` 只作为 `RESIZE` 的四边扩缩别名生效;
+/// 其它动作的同名键没有取证,不能当 X/X2/Y/Y2 读。
+#[test]
+fn cgact_margin_aliases_are_resize_only() {
+    let table = table();
+    let mut gfx = state();
+    gfx.consume_events(&[
+        frame_start(1),
+        call(
+            1,
+            "CG",
+            vec![
+                arg(&table, "CG", "ID", s("A")),
+                arg(&table, "CG", "FILE", s("")),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("A")),
+                arg(&table, "CGACT", "RESIZE", i(1)),
+                arg(&table, "CGACT", "LEFT", i(10)),
+                arg(&table, "CGACT", "BOTTOM", i(20)),
+            ],
+        ),
+        call(
+            1,
+            "CGACT",
+            vec![
+                arg(&table, "CGACT", "ID", s("A")),
+                arg(&table, "CGACT", "ROTATION", i(1)),
+                arg(&table, "CGACT", "SET", i(90)),
+                arg(&table, "CGACT", "LEFT", i(10)),
+            ],
+        ),
+        frame_end(1),
+    ]);
+    let f = gfx.frame();
+    let images: Vec<&yu_gfx::ImageOp> = f
+        .passes
+        .iter()
+        .flat_map(|p| p.ops.iter())
+        .filter_map(|op| match op {
+            Op::Image(image) => Some(image),
+            _ => None,
+        })
+        .collect();
+    let resize = images
+        .iter()
+        .find(|image| image.action == ImageAction::Resize)
+        .expect("RESIZE op");
+    assert_eq!(resize.x, Some(10.0), "LEFT → X");
+    assert_eq!(resize.y2, Some(20.0), "BOTTOM → Y2");
+    assert_eq!(resize.y, None);
+    let rotation = images
+        .iter()
+        .find(|image| image.action == ImageAction::Rotation)
+        .expect("ROTATION op");
+    assert_eq!(rotation.x, None, "非 RESIZE 不读 LEFT");
 }

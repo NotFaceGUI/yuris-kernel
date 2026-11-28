@@ -154,6 +154,12 @@ fn command_list() -> Vec<FmtCommand> {
                 "SWAP2",
                 "TEXCOPY",
                 "TEXSSCOPY",
+                // 0.290 商业表在 SIZE 前多出的四边扩缩槽;0.495 表没有。
+                // 追加在末尾不影响既有名字→槽号映射。
+                "LEFT",
+                "RIGHT",
+                "TOP",
+                "BOTTOM",
             ],
         ),
         string_cmd("CGEND", &["ID", "IDNO"]),

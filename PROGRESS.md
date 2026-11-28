@@ -19213,3 +19213,29 @@ cargo test -p yu-rt --test corpus_v2                → 3 passed
 cargo test -p yu-rt --test consistency (ERIS env)   → 4 passed
 cargo build --workspace --all-targets               → 通过
 ```
+
+## 成果 REVIEW-FIX (2026-11-28) · 提交审查快修:路径越界、边距门控与文档收口
+
+- 路径 confinement:`confined_path` / `save_root_path` 拒绝绝对/盘符/UNC
+  形式(`Path::join` 遇到绝对路径会替换 save 根;目标不存在时
+  canonicalize 兜底不执行,SAVE 会在根外建文件)。补了“根外真实文件
+  必须判不存在”的回归用例。
+- `CGACT` 的 `LEFT/RIGHT/TOP/BOTTOM` 别名只在 `RESIZE` 生效(证据仅来自
+  RESIZE);`cgact_margin_aliases_are_resize_only` 覆盖。
+- 图像描述符优先级收口到 `effective_image_layout` 一处
+  (`build_container` 不再内联第二份)。
+- 文档:`DIV-RT-083-packed-0263-exe.md` 建档(0.263 加壳残余);
+  DIV-GFX-099 更正“后端读源层”事实;DIV-GFX-100 补 RESIZE-only 门控;
+  DIV-RT-017 删占位空行;V263 注释改为“四个 dword + +0x3C 标题长”。
+- 测试环境脆弱:`confined_path_accepts_cp932_projected_root` 原来用纯
+  ASCII 目录名,前提(中文不可表示)不成立;改用含汉字的目录名。
+- 挂账:A2/A3/B1/B3/B4/B5/C3/C4/D3(像素级)/D6/E2/E3,见
+  `docs/tasks/open-findings-2026-11-28.md`。
+
+```text
+cargo test -p yu-save --lib(带 ERIS/SDK0495 env) → 50 passed / 3 ignored
+cargo test -p yu-rt --test fixture                  → 166 passed / 7 ignored
+cargo test -p yu-gfx                                → 51 parity + 文档测试全绿
+cargo build --workspace --all-targets               → 通过
+```
+

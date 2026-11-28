@@ -1163,10 +1163,8 @@ impl SaveState {
         let save_profile = crate::profile::profile_for(version);
         // v555 与 0.495 共用 `0x1E0`,语义层可覆盖为 A=1680/+0x88;
         // 其余版本继续按容器版本档案(0.479=A1536,0.495/0.481=A1600)。
-        let image_layout = self
-            .image_layout_override
-            .or(self.learned_image_layout)
-            .or_else(|| save_profile.and_then(|p| p.image_layout));
+        // 优先级只维护在 `effective_image_layout` 一处。
+        let image_layout = self.effective_image_layout(version);
         let btype0_var_id = self
             .learned_btype0_var_id
             .or_else(|| save_profile.map(|p| p.btype0_var_id));
@@ -1878,7 +1876,13 @@ impl SaveState {
         // (`gsd.sd`/`kidoku.sd`)。两种都接到**真实 save 根**:
         // `save/` 前缀去掉(它只是工程根下的官方目录名,`--save-root`
         // 重定向后真实根可能在别处),其余相对名直接落根。
-        let normalized = name.replace('\\', "/");
+        let mut normalized = name.replace('\\', "/");
+        // 重复分隔符按 Windows 语义折叠(`save//x` = `save/x`),脚本拼接
+        // 多一个分隔符不应被判越界;前导 `//`(UNC)折叠后仍是 `/x`,会被
+        // 下面的根相对检查拒绝。
+        while normalized.contains("//") {
+            normalized = normalized.replace("//", "/");
+        }
         let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
         let rel = normalized.strip_prefix("save/").unwrap_or(normalized);
         if rel.is_empty() {
@@ -1888,6 +1892,17 @@ impl SaveState {
             return Err(error::recoverable(
                 code::PATH_ESCAPE,
                 format!("路径含 `..`: {name}"),
+            ));
+        }
+        // `Path::join` 遇到绝对路径会**替换**根:盘符(`C:/x`)、根相对
+        // (`/x`)、UNC(`//server/share`)都能逃出 save 根;目标不存在时
+        // 下面的 canonicalize 兜底也不会执行。写盘(SAVE)会在根外建文件,
+        // 必须在这里拒绝。`:` 只在 Windows 上是盘符语法;Unix 文件名
+        // 可以合法含 `:`。
+        if rel.starts_with('/') || (cfg!(windows) && rel.contains(':')) {
+            return Err(error::recoverable(
+                code::PATH_ESCAPE,
+                format!("路径是绝对/带盘符形式,拒绝: {name}"),
             ));
         }
         let joined = self.root.join(rel);
@@ -2545,6 +2560,11 @@ mod tests {
             state.confined_path("save\\save001.sd").unwrap(),
             root.join("save001.sd")
         );
+        // 重复分隔符按 Windows 语义折叠(脚本拼接多一个 `/` 不应判越界)。
+        assert_eq!(
+            state.confined_path("save//save001.sd").unwrap(),
+            root.join("save001.sd")
+        );
         // 裸文件名仍是 save 根下(系统存档 gsd.sd 的既有约定)。
         assert_eq!(state.confined_path("gsd.sd").unwrap(), root.join("gsd.sd"));
         // `save/../x` 仍拒绝。
@@ -2552,6 +2572,15 @@ mod tests {
             state.confined_path("save/../x.sd").unwrap_err().code,
             code::PATH_ESCAPE
         );
+        // 绝对/盘符/UNC 形式会在 `join` 时替换 save 根,必须拒绝
+        // (目标不存在时 canonicalize 兜底不执行,写盘会落到根外)。
+        for escape in ["C:/Windows/x.sd", "/etc/passwd", "//server/share/x.sd"] {
+            assert_eq!(
+                state.confined_path(escape).unwrap_err().code,
+                code::PATH_ESCAPE,
+                "绝对形式必须拒绝: {escape}"
+            );
+        }
     }
 
     /// `SAVE[DNO ID=图层]` → 容器 → `LOAD[ID]` 闭环:块必须是 btype 1,
@@ -2741,7 +2770,9 @@ mod tests {
 fn confined_path_accepts_cp932_projected_root() {
     let abs = std::env::current_dir()
         .expect("cwd")
-        .join("target/tmp/v555-2-cp932/save");
+        // 目录名故意含 CP932 不可表示的汉字,才走“投影 ≠ 真实根”分支;
+        // 用 `v555-2-cp932` 之类纯 ASCII 名会让本用例失去意义。
+        .join("target/tmp/v555-2-测试/save");
     let state = SaveState::new(abs.clone(), false);
     let visible = script_visible_root(&abs);
     assert_ne!(visible, abs, "测试前置:根里的中文必须在 CP932 下不可表示");
