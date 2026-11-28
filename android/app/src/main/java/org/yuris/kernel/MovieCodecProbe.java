@@ -32,7 +32,9 @@ final class MovieCodecProbe {
 
     /** 设置页用的一行摘要（可能含换行）。 */
     static String summary() {
-        return I18n.t("引擎外置：%s\n设备解码器：%s", engineSupport(), deviceSupport());
+        return I18n.t("引擎外置：%s\n设备解码器：%s", engineSupport(), deviceSupport())
+                + "\n"
+                + I18n.t("内置 FFmpeg 软解：ASF/WMV(VC-1)、AVI、FLV、MPEG-PS/TS 等系统不支持的格式");
     }
 
     /** 引擎侧实际能创建的 MIME 列表。 */

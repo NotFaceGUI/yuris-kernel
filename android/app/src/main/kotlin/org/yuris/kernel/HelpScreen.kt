@@ -98,7 +98,7 @@ private val HELP_SECTIONS = listOf(
     HelpSection(
         "影片与文本 / 翻译",
         listOf(
-            "「视频解码」:自动(推荐);内置只支持 MPEG-1 + MP2,设备解码器异常时可用;外置走 MediaCodec,编码兼容更广但受机型影响。",
+            "「视频解码」:自动(推荐);内置只支持 MPEG-1 + MP2,设备解码器异常时可用;外置优先设备 MediaCodec(硬解 H.264/H.265/VP9 等),系统不认的格式(ASF/WMV/VC-1、AVI 等)自动用内置 FFmpeg 软解。",
             "「翻译文件」:导入 **translate.json** 才启用运行时替换,默认不加载;文件按游戏根绑定,换游戏不会串用。",
             "「导出翻译文件」生成带空译文槽的 translate.json(角色 / 选项 / 正文);翻译完从同一入口导入即可。",
         ),

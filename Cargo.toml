@@ -20,6 +20,7 @@ members = [
     "crates/yu-platform/host-ios",
     "crates/yu-platform/movie-plmpeg",
     "crates/yu-platform/movie-android",
+    "crates/yu-platform/movie-libav",
     "crates/yu-platform/movie-ffmpeg",
     "crates/yu-platform/input",
     "crates/yu-render/core",

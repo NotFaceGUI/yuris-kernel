@@ -1,0 +1,18 @@
+[package]
+name = "yu-movie-libav"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Movie host backed by FFmpeg libav* software decode (ASF/VC-1/WMA and other formats Android's media stack cannot play)"
+
+[lib]
+name = "yu_movie_libav"
+path = "src/lib.rs"
+
+[dependencies]
+log = "0.4"
+yu-log = { path = "../../yu-log" }
+yu-rt = { path = "../../yu-rt" }
+
+[build-dependencies]
+cc = "1"

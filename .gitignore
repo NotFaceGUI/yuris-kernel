@@ -35,6 +35,10 @@ www/node_modules/
 
 .VsCodeCounter/
 
+# FFmpeg 源码与 Android 静态库:由 tools/android/build-ffmpeg.sh 现场构建,不入库
+third_party/ffmpeg/src/
+third_party/ffmpeg/android/
+
 # Android 构建产物:K2 的 so 与 Gradle 输出不入库(so 由 cargo 现场构建)
 android/app/src/main/jniLibs/
 android/.gradle/

@@ -18939,3 +18939,35 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
 - 新增回归 `asset_layer_glyph_chain_lowers_per_char_tint`(资产/tint/落点/
   自然尺寸);`text_pipeline` 22、`group` 25、`surfaces` 44、`wgpu` 40 全绿。
 - 已重建 release 并重跑黑兽2改;spike2 复核 `merge:` 计数。
+
+## 成果 MOVIE-LIBAV-ANDROID (2026-11-28) · Android 影片接入 FFmpeg 软解
+
+- 根因:YU-RIS 5xx(SV、黑兽2改、はじめるセカイ等)的 OP/ED 是
+  **ASF(WMV)容器 + VC-1 Advanced + WMA**,扩展名却是 `.ypf`
+  (`pac/op.ypf`、`SV_*_ED_*.ypf`)。Android 官方支持格式表不含 WMV/VC-1,
+  MediaExtractor/MediaCodec 打不开;`auto` 回退内置 pl_mpeg(只解
+  MPEG-1)也失败,脚本 `MOVIEINFO[PLAY]` 读 0 直接跳过影片。桌面能播是
+  因为桌面注入的是 `yu-movie-ffmpeg`(系统 ffmpeg 子进程)。
+- 新增 `crates/yu-platform/movie-libav`:静态链入 FFmpeg
+  (libavformat/libavcodec/swscale/swresample),`src/shim.c` 用 C ABI
+  隔离 `AVFrame/AVPacket` 布局;Rust 侧实现 `MovieHost`(open/frame/
+  take_audio/暂停与结束语义与 Android 后端一致)。
+  FFmpeg 配置见 `tools/android/build-ffmpeg.sh`:ASF/AVI/MPEG-PS/TS/
+  MP4/MOV/MKV/WebM/FLV/OGG/RM 容器;VC-1、WMV1-3、MPEG-1/2/4、
+  H.263/H.264/HEVC、AV1、VP6/8/9、RealVideo、MJPEG、Theora、Cinepak、
+  Indeo、SVQ、HuffYUV 等视频;WMA/MP2/3、AAC、AC-3/E-AC-3、DTS、
+  FLAC、Vorbis、Opus、RealAudio、ADPCM、PCM 等音频。仅 LGPL 组件。
+- 宿主组合后端 `host-android/src/movie.rs`(`AndroidMovieHosts`):
+  MP4/MKV/WebM/TS 先试设备 MediaCodec;ASF/AVI/MPEG-PS 等先走 FFmpeg;
+  一条失败自动换另一条。设置页文案/帮助/能力探测补 FFmpeg 说明。
+- 构建:`tools/android/build.sh` 增加 FFmpeg 静态库预检;
+  `third_party/ffmpeg/{src,android}` 不入库;`movie-libav/build.rs`
+  盯住 `.a` 变化,组件表变更会触发重链。
+- 验证:`cargo build -p yu-host-android --release --target
+  x86_64-linux-android` 通过;`tools/android/build.sh arm64-v8a x86_64`
+  产出 release APK:arm64-v8a 30,188,801 字节(≈28.8 MiB)、
+  x86_64 33,231,736 字节(≈31.7 MiB);so 由 12.0/14.2 MiB 增至
+  19.8/22.9 MiB(每 ABI +7~8 MiB)。`cargo build --workspace
+  --all-targets` 与 `yu-host-android` 27 项测试通过。未做真机解码验证
+  (主人要求),真机首测建议用 SV 的 `pac/op.ypf` 看
+  `[movie] libav … 解码` 日志。

@@ -4292,6 +4292,7 @@ dependencies = [
  "yu-font",
  "yu-log",
  "yu-movie-android",
+ "yu-movie-libav",
  "yu-render-core",
  "yu-rt",
  "yu-save",
@@ -4371,6 +4372,16 @@ dependencies = [
 name = "yu-movie-ffmpeg"
 version = "0.5.4"
 dependencies = [
+ "yu-log",
+ "yu-rt",
+]
+
+[[package]]
+name = "yu-movie-libav"
+version = "0.5.4"
+dependencies = [
+ "cc",
+ "log",
  "yu-log",
  "yu-rt",
 ]

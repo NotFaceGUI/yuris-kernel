@@ -52,6 +52,10 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod logging;
+// 外置影片后端组合(MediaCodec 优先 + FFmpeg 软解兜底);只有 Android
+// 目标链接 libav* 静态库。
+#[cfg(target_os = "android")]
+mod movie;
 pub mod present;
 pub mod sound;
 
@@ -1456,12 +1460,13 @@ pub fn start_engine(
         movie_backend,
         ..EngineOptions::default()
     };
-    // Android 注入外置后端工厂:每次 boot/restart 创建一个新的 MediaCodec
-    // 会话(Auto 模式下由引擎先试它,失败回退内置 pl_mpeg)。
+    // Android 注入外置后端工厂:每次 boot/restart 创建一个新的
+    // MediaCodec + FFmpeg 组合会话(Auto 模式下由引擎先试它,失败回退
+    // 内置 pl_mpeg)。ASF/VC-1/WMA 这类系统栈不认的影片由 FFmpeg 软解。
     #[cfg(target_os = "android")]
     {
         options.movie_external_factory = Some(yu_engine::engine::MovieHostFactory::new(move || {
-            Box::new(yu_movie_android::AndroidMovieHost::new(movie_temp_dir.clone()))
+            Box::new(crate::movie::AndroidMovieHosts::new(movie_temp_dir.clone()))
         }));
     }
     #[cfg(not(target_os = "android"))]

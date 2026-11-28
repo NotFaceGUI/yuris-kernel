@@ -9,6 +9,8 @@
 #   - Rust 目标已装: rustup target add aarch64-linux-android x86_64-linux-android
 #   - ANDROID_HOME / ANDROID_NDK_HOME 指向 SDK / NDK(r27 起)
 #   - JDK 17+ 在 JAVA_HOME(AGP 8.13 要求)
+#   - FFmpeg 静态库已生成:在 Linux/WSL 里跑 tools/android/build-ffmpeg.sh
+#     (Windows 的 NDK 缺 make,不能本机构建;库目录不入库)
 #
 # 产物:
 #   debug   → android/app/build/outputs/apk/debug/app-debug.apk
@@ -121,6 +123,19 @@ CC_SUFFIX=""
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) CC_SUFFIX=".cmd" ;;
 esac
+
+# 影片软解:FFmpeg 静态库不进仓库,构建 so 前必须已由
+# tools/android/build-ffmpeg.sh 生成(在 Linux/WSL 里跑;Windows 的
+# NDK 只有 clang,没有 make/nasm)。
+FFMPEG_ANDROID_ROOT="${YURIS_FFMPEG_ANDROID_DIR:-$REPO_ROOT/third_party/ffmpeg/android}"
+for abi in "${ABIS[@]}"; do
+  if [[ ! -f "$FFMPEG_ANDROID_ROOT/$abi/lib/libavcodec.a" ]]; then
+    echo "错误: 缺少 $abi 的 FFmpeg 静态库: $FFMPEG_ANDROID_ROOT/$abi/lib/libavcodec.a" >&2
+    echo "      先在 Linux/WSL 里跑: tools/android/build-ffmpeg.sh $abi" >&2
+    echo "      (或设 YURIS_FFMPEG_ANDROID_DIR 指向已构建的根目录)" >&2
+    exit 2
+  fi
+done
 
 # 缺少 rust 目标时给一句人话,而不是让 cargo 抛 "can't find crate for `core`"。
 if command -v rustup >/dev/null 2>&1; then

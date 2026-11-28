@@ -550,7 +550,7 @@ fun SetupScreen(activity: SetupActivity) {
             options = listOf(
                 "auto" to t("自动(推荐)"),
                 "builtin" to t("内置(MPEG-1)"),
-                "external" to t("外置(设备 MediaCodec)"),
+                "external" to t("外置(设备 + FFmpeg)"),
             ),
             selected = state.movieBackend,
             onDismiss = { showMovie = false },
@@ -754,7 +754,7 @@ private fun patchLabel(value: String): String = when (value) {
 
 private fun movieLabel(value: String): String = when (value) {
     "builtin" -> t("内置(MPEG-1)")
-    "external" -> t("外置(设备 MediaCodec)")
+    "external" -> t("外置(设备 + FFmpeg)")
     else -> t("自动(推荐)")
 }
 

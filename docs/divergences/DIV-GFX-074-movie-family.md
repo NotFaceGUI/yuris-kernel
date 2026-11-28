@@ -134,6 +134,17 @@ SMPEG/libmpeg2、pl_mpeg),而不是 10–80MB 的 FFmpeg;官方 `CODEC` 探测�
 外置工厂,显式 `external` 会得到可恢复诊断。`MOVIEINFO[CODEC]` 的官方
 0/1/2/255 语义不变(MP4/AVI 仍报 0xFF,与官方一致)。
 
+**2026-11-28 扩展(Android 全格式兜底)**:Android 壳新增**静态链入的
+FFmpeg 软解后端** `crates/yu-platform/movie-libav`(libavformat/libavcodec/
+swscale/swresample;C 封装 `shim.c` 隔离 FFmpeg 结构体布局)。宿主用组合
+后端 `host-android/src/movie.rs` 的 `AndroidMovieHosts`:MP4/MKV/WebM/TS
+先试设备 MediaCodec,ASF/AVI/MPEG-PS 等系统栈不认的容器先走 FFmpeg;
+一条失败自动换另一条。触发背景:YU-RIS 5xx(SV、黑兽2改、はじめるセカイ
+等)的 OP/ED 是 **ASF + VC-1 Advanced + WMA**,Android 官方支持格式表
+不含 WMV/VC-1,系统栈必然打不开(桌面能播是因为调系统 ffmpeg)。库由
+`tools/android/build-ffmpeg.sh` 在 Linux/WSL 交叉编译(仅 LGPL 组件,
+组件表见脚本),每个 ABI 增加约 7~8 MiB,不入库。
+
 ## 5. 限制(显式)
 
 - **内置**后端只解 **MPEG-1 program stream**;`MOVIEINFO[CODEC]` 为
@@ -141,6 +152,12 @@ SMPEG/libmpeg2、pl_mpeg),而不是 10–80MB 的 FFmpeg;官方 `CODEC` 探测�
   容器/编码支持取决于设备的 MediaExtractor/MediaCodec(官方保证格式表
   不含 MPEG-PS;AVI 不保证);不支持时 `auto` 回退内置,`external` 报
   `movie.decode` 诊断。
+- **Android FFmpeg 后端**(2026-11-28)兜住系统栈不认的格式:ASF/WMV
+  (VC-1、WMV1-3)、AVI、FLV、RM/RMVB、MPEG-PS/TS、MP4/MKV/WebM 等容器,
+  以及 MPEG-1/2/4、H.263/H.264/HEVC、VP6/8/9、AV1(软解)、RealVideo、
+  MJPEG、Theora 等视频与 WMA/MP2/3、AAC、AC-3/E-AC-3、DTS、FLAC、
+  Vorbis、Opus、RealAudio、ADPCM、PCM 等音频。仍不支持 H.266/VVC、AVS
+  与 DRM/私有封装;AV1 软解较慢,MP4/MKV 会先走 MediaCodec。
 - 音频已接(B16):内置后端解 MP2;外置后端解设备支持的音轨并降混为
   立体声 i16。音频解码失败只降级为无音频,不阻断视频。
 - 影片模式下「遮住所有图层」由 `GfxState::set_movie_overlay` 实现(整帧只
