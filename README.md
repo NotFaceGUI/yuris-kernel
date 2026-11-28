@@ -12,9 +12,9 @@
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
 <a href="https://github.com/NotFaceGUI/yuris-kernel/releases"><img src="https://img.shields.io/github/v/release/NotFaceGUI/yuris-kernel?label=release&color=blue" alt="Release"></a>
 <img src="https://img.shields.io/badge/YU--RIS%20BETA%204-0.450--0.495-2ea44f" alt="YU-RIS BETA 4">
-<img src="https://img.shields.io/badge/YU--RIS%20BETA%203-0.276--0.292-dfb317" alt="YU-RIS BETA 3">
+<img src="https://img.shields.io/badge/YU--RIS%20BETA%203-0.276--0.292-2ea44f" alt="YU-RIS BETA 3">
 <img src="https://img.shields.io/badge/YU--RIS%20BETA%202-0.255-dfb317" alt="YU-RIS BETA 2">
-<img src="https://img.shields.io/badge/YU--RIS%205xx-official--commercial-lightgrey" alt="YU-RIS 5xx（官方商业）">
+<img src="https://img.shields.io/badge/YU--RIS%205xx-official--commercial-2ea44f" alt="YU-RIS 5xx（官方商业）">
 <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Android%20%7C%20headless-8250df" alt="Platforms">
 <img src="https://img.shields.io/badge/rust-2021%20edition-orange?logo=rust" alt="Rust">
 </p>
@@ -35,14 +35,16 @@
 
 </div>
 
+> **支持的补丁形式**：散盘 `ysbin/` 数据补丁（`--patch original|gbk|big5|cp949|cp1252|utf8|tunnel`）、运行时 `translate.json`、`hook.ini` + ttf 补丁字体、v555 `config.sd` 原生多语言；不支持 exe/DLL 注入与自动打包（回写 YPF 封包），详见[文本编码](#文本编码)。
+
 ## 简介
 
 `yuris-kernel` 是 YU-RIS 引擎的兼容运行时，仓库不包含官方引擎代码、游戏数据或存档。
 
 - **多版本覆盖** —— 官方系列 BETA 2 / BETA 3 / BETA 4：
-  BETA 4 主线（0.450–0.495），BETA 3（0.276–0.292）/ BETA 2（0.255）适配中；
-  官方商业 5xx 分支（0.500–0.555，同一命令表族）适配中：v500 封包、v555 七表，
-  0.554 的 `ysc`/`yse` 与 v555 逐字节相同（仅版本字段差 1）；27 张 0.255–0.495
+  BETA 4 主线（0.450–0.495）、BETA 3（0.276–0.292）与官方商业 5xx 分支
+  （0.500–0.555，同一命令表族）可用，BETA 2（0.255）适配中。v500 封包、v555 七表
+  可读，0.554 的 `ysc`/`yse` 与 v555 逐字节相同（仅版本字段差 1）；27 张 0.255–0.495
   系统变量 ABI 表已入册，另有 v555 1000 槽实测表（`docs/formats/v555-*`）。
 - **双渲染后端** —— `soft`（CPU，确定性参考）与 `wgpu`（GPU，桌面 / Android 主路径）。
 - **多宿主** —— Windows 桌面、headless / 本地服务、浏览器呈现（调试）、Android。
@@ -53,25 +55,40 @@
 
 ## 支持范围
 
-### 引擎版本
+<table>
+<tr>
+<td valign="top">
+<h3>支持的平台</h3>
+<table>
+<tr><th>平台</th><th>状态</th></tr>
+<tr><td>Windows 桌面</td><td>可用</td></tr>
+<tr><td>headless / 本地服务</td><td>可用</td></tr>
+<tr><td>浏览器呈现端</td><td>仅调试</td></tr>
+<tr><td>Android</td><td>可用</td></tr>
+<tr><td>Linux / macOS 桌面</td><td>未验证</td></tr>
+</table>
+</td>
+<td valign="top">
+<h3>支持的版本</h3>
+<table>
+<tr><th>版本范围</th><th>是否支持</th></tr>
+<tr><td>BETA 4（0.450–0.495）</td><td>支持</td></tr>
+<tr><td>BETA 3（0.276–0.292）</td><td>支持</td></tr>
+<tr><td>BETA 2（0.255）</td><td>适配中</td></tr>
+<tr><td>5xx（0.500–0.555）</td><td>支持</td></tr>
+</table>
+</td>
+</tr>
+</table>
 
-官方版本分为 BETA 2 / BETA 3 / BETA 4 三个主线系列；5xx（0.500–0.555）是 YU-RIS 官方商业分支（商业发行版），不属于这三条主线。个别商业样本的发行包可能带重打包/汉化处理，但那是样本层面的处理，不是引擎本身。
-
-| 系列 | 状态         | 说明                                                                                                                                                            |
-| ---- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| BETA 2 | 适配中     | 0.255（0.55）：539 系统变量表已入册；0.263 商业样本（V2 / 32bpp BMP 老 UI）实机跑到对话                                                                          |
-| BETA 3 | 适配中     | 0.276 样本；0.292（0.92）：91 命令 / 482 系统变量；0.289 / 0.290 商业样本实机跑到对话（ABI 按 ysv 结构对齐派生）                                                  |
-| BETA 4 | 可用（主线） | 0.450–0.495：0.466 / 0.479 / 0.495：100 / 104 / 119 命令，513 / 526 / 548 系统变量；0.450 / 0.454 / 0.460 / 0.470 / 0.480 / 0.490 抽样实机通过，0.481 / 0.486 / 0.494 / 0.495 实机验收 |
-| 5xx    | 适配中（0.500–0.555） | 官方商业分支，区间内共用同一套 121 槽命令表：v500 封包可读；v554 / v555 七表与剧本链已实测（v554 的 `ysc`/`yse` 与 v555 逐字节相同）；已落地 `TEXT[FILE]`、`PRODUCT`、`SAVE/LOAD[MEM]`、`_DROPFILE*`、`VARINFO`；标题画面（注意页 / build 动画 / 完整菜单 / 按钮状态机）已打通 |
-
-0.450–0.493 各版本的 ABI 表已全部入册（27 张，覆盖 0.255–0.495）。
+Linux / macOS 桌面与真 wasm（内存数据源 + 浏览器存档）的缺口见[待办](#待办)。
 
 ### 文件格式与封包
 
 | 类别 | 形态 / 扩展名 | 状态 |
 | --- | --- | --- |
-| 封包 | `.ypf`（0.255–0.495：LenEncNot 索引、逐字节取反名、zlib 条目；0.495 名字键 0xFF + MurmurHash2 索引） | 读 |
-| | `.ypf`（0.500 商业族：Meta22 布局、明文 zlib、xxh32 载荷校验） | 读 |
+| 封包 | `.ypf`（0.255–0.495：LenEncNot 索引、逐字节取反名、zlib 条目；0.495 名字键 0xFF + MurmurHash2 索引） | 读（不回写） |
+| | `.ypf`（0.500 商业族：Meta22 布局、明文 zlib、xxh32 载荷校验） | 读（不回写） |
 | | 旧 NulXor 方言（NUL 结尾名 + XOR 名）：无真实样本，遇到即显式拒绝 | 未实现（显式拒绝） |
 | | 散盘 `data/` 目录（工程形态） | 读 |
 | | `pac/*.ypf` 按名挂载 + `update1..9.ypf` 依次叠加；伪装成 `.ypf` 的 MPEG-PS 按魔数跳过 | 读 |
@@ -101,42 +118,6 @@
 | 补丁字体 | `hook.ini` + ttf 的 CP932 载体字重映射补丁由 `yu-engine` 启动时检测并强制注入全部 `FONT` 请求 |
 | 缺字回退 | 翻译模式自动开启系统字体缺字回退；`--font` 指定默认字体，`--font-lock` 强制锁定 |
 
-
-### 5xx（0.500–0.555）现状
-
-- **官方商业分支**：0.500–0.555 是一条版本区间，区间内共用同一套 121 槽命令表
-  （0.554 的 `ysc.ybn`/`yse.ybn` 与 0.555 样本逐字节相同，仅版本字段差 1）；
-  v500 封包、v554 / v555 七表（YSCM/YSLB/YSVR/YSTL/YSER/YSCF/YSTD）均已实测；
-  剧本密钥 = CRC32(作品 ID)，启动链、剧本 DSL 词法/宏、标签表、品牌影片、
-  GAMEMain UI 图层已打通，headless 已到标题选择循环。
-- **原生多语言**：v555 剧情文本外置为 `scenario/`（基准）、`sc_cn_scenario/`（简中）、
-  `sc_tw_scenario/`（繁中）三份变体，由 `config.sd` 里的语言号选择；
-  实测编码分别为 CP932 / GBK / Big5。当前内核对多语言仍依赖全局 `--patch gbk`，
-  正在按语言变体收口（优化计划 O5）。
-- **标题与演出（2026-11-24 补）**：`注意` 警示页 → 标题 build 动画 → 完整
-  菜单链路已打通；`FILEINFO[CGFILE]` 按 0.500 扩展名表探测
-  `_off/_over/_on/_onover/_na`，按钮 hover/点击生效；`.ydg`/QOI 背景与
-  按钮图、`.opus` BGM/语音均可解码。
-- **仍缺**：`type2/` 皮肤目录选择规则、`PRODUCT` 其它 COM、正文逐字对拍、
-  内存包槽的 Snappy 分支。
-- **已落地（2026-11-23 补）**：`SAVE[MEM=99999]` 的 0..499 内存槽打包、
-  `LOAD[DNO=1024]` 读取、`SAVE[FILE]` 写回 DNO=1024、`TEXT[FILE]` 行内翻译、
-  `WORD`/选项/按钮 `translate.json` 运行时替换。
-- **文档**：v555 普查/差距/ABI 与多语言调研在
-  `docs/formats/v555-commercial.md`、`v555-gap-2026-11-19.md` 与其他
-  `docs/formats/v555-*`。
-
-### 宿主平台
-
-| 平台                | 状态   |
-| ------------------- | ------ |
-| Windows 桌面        | 可用   |
-| headless / 本地服务 | 可用   |
-| 浏览器呈现端        | 仅调试 |
-| Android             | 可用   |
-| Linux / macOS 桌面  | 未验证 |
-
-Linux / macOS 桌面与真 wasm（内存数据源 + 浏览器存档）的缺口见[待办](#待办)。
 
 ## 演示
 
@@ -304,7 +285,7 @@ flowchart LR
 | 运行时翻译 | `--translate` + `translate.json`（CP932 自动扩隧道，UTF-8 直写） | 只替换文件内条目，不写回数据；目标 codec 跟随当前 `--patch` |
 | 补丁字体  | `hook.ini` + ttf（自动检测）          | CP932 载体字重映射；启动时强制注入全部 `FONT` 请求                            |
 | v555 原生多语言 | `config.sd` 语言号 → `scenario/` / `sc_cn_scenario/` / `sc_tw_scenario/` | CP932 / GBK / Big5；不是 `--patch` 汉化路线 |
-| 不支持    | —                                     | exe / DLL 注入类补丁（如 `setdll` 挂 `MyDll.dll` 换字体）：不改程序，故不适用 |
+| 不支持    | —                                     | exe / DLL 注入类补丁（如 `setdll` 挂 `MyDll.dll` 换字体）；自动打包（回写 YPF 封包）——本内核只读封包，补丁走散盘 `ysbin/` 或运行时 `translate.json` |
 
 > v555 原生多语言不是 `--patch` 汉化路线：`scenario/`、`sc_cn_scenario/`、
 > `sc_tw_scenario/` 三份变体由 `config.sd` 的语言号选择，codec 分别为

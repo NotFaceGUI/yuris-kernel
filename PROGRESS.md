@@ -19239,3 +19239,27 @@ cargo test -p yu-gfx                                → 51 parity + 文档测试
 cargo build --workspace --all-targets               → 通过
 ```
 
+## 成果 README-DOCS (2026-11-28) · 版本状态、补丁形式与支持表收口
+
+- 版本:BETA 3 / 5xx 标为可用,BETA 2 保持适配中;对应徽章改绿。
+  发布描述生成器 `tools/release/release_notes.py` 的 `SUPPORTED_VERSIONS`
+  同步(5xx / BETA 3 可用、`2ea44f`)。
+- 首屏一句「支持的补丁形式」:散盘 `ysbin/`、`translate.json`、
+  `hook.ini`+ttf、v555 原生多语言;明确不支持 exe/DLL 注入与自动打包
+  (回写 YPF),`.ypf` 状态标为「读(不回写)」。
+- 「支持范围」改为「支持的平台」/「支持的版本」两表同行;版本表只留
+  「版本范围 / 是否支持」;删除 `5xx（0.500–0.555）现状` 节。
+- 演示段与 `docs/assets/case` 保持 HEAD 原样(`9_d`;`9_t` 不入库)。
+- 验证:演示段 `diff` 无差异;`git status docs/assets/case` 为空;
+  两份 README 表格结构与版本行一致。
+
+## 成果 RELEASE-FFMPEG (2026-11-28) · 发布 Android job 补 FFmpeg 静态库构建
+
+- `.github/workflows/release.yml` 的 `android` job 在打包前新增
+  `Cache FFmpeg`(`third_party/ffmpeg/{src,android}` + `~/.cache/yuris-ffmpeg`,
+  key 取 `tools/android/build-ffmpeg.sh` 哈希)与 `Build FFmpeg static libs`
+  (取 `$ANDROID_HOME/ndk` 最高版本,导出 `ANDROID_NDK_HOME`;两个 ABI 的库
+  都在时跳过,否则跑 `tools/android/build-ffmpeg.sh arm64-v8a x86_64`)。
+  修复此前 `build.sh` 因缺少 `libavcodec.a` 预检而必然失败的问题。
+- 验证:`python yaml.safe_load(release.yml)` → YAML OK;android job 13 步,
+  顺序为 … → Cache FFmpeg → Build FFmpeg static libs → Check signing secrets。

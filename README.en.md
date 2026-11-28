@@ -12,9 +12,9 @@ The official engine's observable behavior is the single source of truth</p>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
 <a href="https://github.com/NotFaceGUI/yuris-kernel/releases"><img src="https://img.shields.io/github/v/release/NotFaceGUI/yuris-kernel?label=release&color=blue" alt="Release"></a>
 <img src="https://img.shields.io/badge/YU--RIS%20BETA%204-0.450--0.495-2ea44f" alt="YU-RIS BETA 4">
-<img src="https://img.shields.io/badge/YU--RIS%20BETA%203-0.276--0.292-dfb317" alt="YU-RIS BETA 3">
+<img src="https://img.shields.io/badge/YU--RIS%20BETA%203-0.276--0.292-2ea44f" alt="YU-RIS BETA 3">
 <img src="https://img.shields.io/badge/YU--RIS%20BETA%202-0.255-dfb317" alt="YU-RIS BETA 2">
-<img src="https://img.shields.io/badge/YU--RIS%205xx-official--commercial-lightgrey" alt="YU-RIS 5xx (official commercial)">
+<img src="https://img.shields.io/badge/YU--RIS%205xx-official--commercial-2ea44f" alt="YU-RIS 5xx (official commercial)">
 <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Android%20%7C%20headless-8250df" alt="Platforms">
 <img src="https://img.shields.io/badge/rust-2021%20edition-orange?logo=rust" alt="Rust">
 </p>
@@ -35,15 +35,18 @@ The official engine's observable behavior is the single source of truth</p>
 
 </div>
 
+> **Supported patch forms**: loose-file `ysbin/` data patches (`--patch original|gbk|big5|cp949|cp1252|utf8|tunnel`), runtime `translate.json`, `hook.ini` + ttf patch fonts, and v555 native multilingual (`config.sd`); exe/DLL injection and automatic repacking (writing back into YPF) are unsupported; see [Text encoding](#text-encoding).
+
 ## Overview
 
 `yuris-kernel` is a compatible runtime for the YU-RIS engine. The repository contains no official engine code, game data, or save files.
 
 - **Multi-version coverage** — official series: BETA 4 mainline (0.450–0.495),
-  BETA 3 (0.276–0.292) and BETA 2 (0.255) adapting; the official commercial 5xx branch
-  (0.500–0.555, one command-table family) is adapting: v500 packs and v555 seven tables,
-  with 0.554 `ysc`/`yse` byte-identical to v555 except the version field; 27 ABI tables
-  for 0.255–0.495 are catalogued, plus a v555 1000-slot measured table (`docs/formats/v555-*`).
+  BETA 3 (0.276–0.292) and the official commercial 5xx branch (0.500–0.555, one
+  command-table family) are available; BETA 2 (0.255) is still adapting. v500 packs
+  and v555 seven tables are readable, with 0.554 `ysc`/`yse` byte-identical to v555
+  except the version field; 27 ABI tables for 0.255–0.495 are catalogued, plus a
+  v555 1000-slot measured table (`docs/formats/v555-*`).
 - **Two render backends** — `soft` (CPU, deterministic reference) and `wgpu` (GPU, primary desktop / Android path).
 - **Multiple hosts** — Windows desktop, headless / local server, browser presentation (debug), Android.
 - **Text patches and saves** — seven text routes `original` / `gbk` / `big5` / `cp949` / `cp1252` / `utf8` / `tunnel`;
@@ -52,25 +55,40 @@ The official engine's observable behavior is the single source of truth</p>
 
 ## Support
 
-### Engine versions
+<table>
+<tr>
+<td valign="top">
+<h3>Supported platforms</h3>
+<table>
+<tr><th>Platform</th><th>Status</th></tr>
+<tr><td>Windows desktop</td><td>Available</td></tr>
+<tr><td>headless / local server</td><td>Available</td></tr>
+<tr><td>Browser presentation</td><td>Debug only</td></tr>
+<tr><td>Android</td><td>Available</td></tr>
+<tr><td>Linux / macOS desktop</td><td>Unverified</td></tr>
+</table>
+</td>
+<td valign="top">
+<h3>Supported versions</h3>
+<table>
+<tr><th>Version range</th><th>Supported</th></tr>
+<tr><td>BETA 4 (0.450–0.495)</td><td>Yes</td></tr>
+<tr><td>BETA 3 (0.276–0.292)</td><td>Yes</td></tr>
+<tr><td>BETA 2 (0.255)</td><td>Adapting</td></tr>
+<tr><td>5xx (0.500–0.555)</td><td>Yes</td></tr>
+</table>
+</td>
+</tr>
+</table>
 
-Official releases are organized into BETA 2 / BETA 3 / BETA 4 mainline series; 5xx (0.500–0.555) is an official YU-RIS commercial branch (commercial release), not part of these mainlines. Some commercial sample packages may carry repack/localization processing, but that is sample-level, not the engine itself.
-
-| Series | Status             | Notes                                                                                                                                                                                        |
-| ------ | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| BETA 2 | Adapting           | 0.255 (0.55): 539 system variables catalogued; YSTB V2 lacks real samples                                                                                                                    |
-| BETA 3 | Adapting           | 0.276 sample; 0.292 (0.92): 91 commands / 482 system variables                                                                                                                               |
-| BETA 4 | Available (main)   | 0.450–0.495: 0.466 / 0.479 / 0.495: 100 / 104 / 119 commands, 513 / 526 / 548 system variables; 0.450 / 0.454 / 0.460 / 0.470 / 0.480 / 0.490 spot-checked on real games, 0.481 / 0.486 / 0.494 / 0.495 accepted |
-| 5xx    | Adapting (0.500–0.555) | Official commercial branch: the whole range shares one 121-slot command table; v500 packs are readable; v554 / v555 seven tables and scenario chain measured (0.554 `ysc`/`yse` byte-identical to v555); landed `TEXT[FILE]`, `PRODUCT`, `SAVE/LOAD[MEM]`, `_DROPFILE*`, `VARINFO`; title screen (notice page / build animation / full menu / button state machine) is working |
-
-ABI tables for 0.450–0.493 are all catalogued (27 tables, covering 0.255–0.495).
+Gaps for Linux / macOS desktop and true wasm (in-memory data source + browser saves) are tracked in [Todo](#todo).
 
 ### File formats and packages
 
 | Category | Form / extension | Status |
 | --- | --- | --- |
-| Packages | `.ypf` (0.255–0.495: LenEncNot index, byte-inverted names, zlib entries; 0.495 name key 0xFF + MurmurHash2 index) | Read |
-| | `.ypf` (0.500 commercial: Meta22 layout, plain zlib, xxh32 payload hash) | Read |
+| Packages | `.ypf` (0.255–0.495: LenEncNot index, byte-inverted names, zlib entries; 0.495 name key 0xFF + MurmurHash2 index) | Read (no write-back) |
+| | `.ypf` (0.500 commercial: Meta22 layout, plain zlib, xxh32 payload hash) | Read (no write-back) |
 | | Legacy NulXor dialect (NUL-terminated names + XOR names): no real samples, explicitly rejected | Not implemented (rejected) |
 | | Loose `data/` directory (development form) | Read |
 | | `pac/*.ypf` mounted by name + `update1..9.ypf` layered; MPEG-PS disguised as `.ypf` skipped by magic | Read |
@@ -100,45 +118,6 @@ ABI tables for 0.450–0.493 are all catalogued (27 tables, covering 0.255–0.4
 | Patch fonts | `hook.ini` + ttf CP932-carrier remap patches are detected at boot and force-injected into every `FONT` request |
 | Missing-glyph fallback | Translation mode enables system-font missing-glyph fallback automatically; `--font` sets the default font and `--font-lock` forces a lock |
 
-
-### 5xx (0.500–0.555) status
-
-- **Official commercial branch**: 0.500–0.555 is one version range sharing a single
-  121-slot command table (0.554 `ysc.ybn`/`yse.ybn` are byte-identical to the v555
-  samples except the version field); v500 packs and all seven v554 / v555 tables
-  (YSCM/YSLB/YSVR/YSTL/YSER/YSCF/YSTD) are measured; script key = CRC32(product ID).
-  Boot chain, scenario DSL lexer/macros, label table, brand movie and GAMEMain UI layers
-  are working; headless reaches the title selection loop.
-- **Native multilingual**: v555 story text is externalized as `scenario/` (base),
-  `sc_cn_scenario/` (Simplified Chinese) and `sc_tw_scenario/` (Traditional Chinese),
-  selected by the language number in `config.sd`; measured encodings are
-  CP932 / GBK / Big5. The kernel still relies on global `--patch gbk` for multilingual
-  runs and is being reworked around per-variant codecs (optimization plan O5).
-- **Title and presentation (2026-11-24)**: the notice page → title build animation →
-  full menu chain works; `FILEINFO[CGFILE]` probes
-  `_off/_over/_on/_onover/_na` with the 0.500 extension table, so buttons hover and
-  click; `.ydg`/QOI backgrounds and button art plus `.opus` BGM/voices decode.
-- **Remaining**: the `type2/` skin-directory rule, other `PRODUCT` COMs,
-  line-by-line text comparison, and the Snappy branch of memory-pack slots.
-- **Landed (2026-11-23)**: `SAVE[MEM=99999]` packing of slots 0..499,
-  `LOAD[DNO=1024]` read-back, `SAVE[FILE]` write-back of DNO=1024, inline
-  `TEXT[FILE]` translation, and `translate.json` runtime replacement for
-  `WORD`/choices/buttons.
-- **Docs**: v555 survey/gap/ABI and multilingual notes live in
-  `docs/formats/v555-commercial.md`, `v555-gap-2026-11-19.md` and the other
-  `docs/formats/v555-*` files in this repository.
-
-### Host platforms
-
-| Platform                  | Status             |
-| ------------------------- | ------------------ |
-| Windows desktop           | Available          |
-| headless / local server   | Available          |
-| Browser presentation      | Debug only         |
-| Android                   | Available          |
-| Linux / macOS desktop     | Unverified         |
-
-Gaps for Linux / macOS desktop and true wasm (in-memory data source + browser saves) are tracked in [Todo](#todo).
 
 ## Demo
 
@@ -236,7 +215,7 @@ target/release/yu-cli run "<project>" --mode desktop --backend wgpu \
 | Runtime translation | `--translate` + `translate.json` (CP932 tunnel auto-extended, UTF-8 written directly) | Replaces in-file entries only, never writes back data; target codec follows the active `--patch` |
 | Patch font        | `hook.ini` + ttf (auto-detected) | CP932-carrier glyph remap; force-injected into every `FONT` request at boot                     |
 | v555 native multilingual | `config.sd` language number → `scenario/` / `sc_cn_scenario/` / `sc_tw_scenario/` | CP932 / GBK / Big5; not the `--patch` translation route |
-| Unsupported       | —                           | exe / DLL injection patches (e.g. `setdll` loading `MyDll.dll` to swap fonts): the program is not modified, so they do not apply |
+| Unsupported       | —                           | exe / DLL injection patches (e.g. `setdll` loading `MyDll.dll` to swap fonts); automatic repacking (writing back into YPF) — the kernel only reads packs, so patches go through loose `ysbin/` or runtime `translate.json` |
 
 > v555 native multilingual support is not the `--patch` translation route:
 > `scenario/`, `sc_cn_scenario/` and `sc_tw_scenario/` variants are selected by

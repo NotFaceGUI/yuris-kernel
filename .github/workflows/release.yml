@@ -218,6 +218,38 @@ jobs:
             || echo "::warning::sdkmanager 安装失败，继续使用镜像预装组件"
           ls "$SDK/platforms" 2>/dev/null || true
 
+      - name: Cache FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/ffmpeg/src
+            third_party/ffmpeg/android
+            ~/.cache/yuris-ffmpeg
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('tools/android/build-ffmpeg.sh') }}
+
+      - name: Build FFmpeg static libs
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          NDK="$(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V | tail -1 || true)"
+          if [[ -z "$NDK" || ! -d "$NDK" ]]; then
+            echo "::error::找不到 NDK（$SDK/ndk）"
+            exit 1
+          fi
+          export ANDROID_NDK_HOME="$NDK"
+          export ANDROID_NDK_ROOT="$NDK"
+          # 缓存命中且两个 ABI 的库都在时跳过构建；脚本变化会换 cache key。
+          need=0
+          for abi in arm64-v8a x86_64; do
+            [[ -f "third_party/ffmpeg/android/$abi/lib/libavcodec.a" ]] || need=1
+          done
+          if [[ "$need" == 0 ]]; then
+            echo "FFmpeg 静态库已缓存，跳过构建"
+            exit 0
+          fi
+          bash tools/android/build-ffmpeg.sh arm64-v8a x86_64
+
       - name: Check signing secrets
         shell: bash
         env:
