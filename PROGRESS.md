@@ -18971,3 +18971,20 @@ python .agents/skills/yuris-translation/scripts/validate_translate.py   target/t
   --all-targets` 与 `yu-host-android` 27 项测试通过。未做真机解码验证
   (主人要求),真机首测建议用 SV 的 `pac/op.ypf` 看
   `[movie] libav … 解码` 日志。
+
+## 成果 DOC-DEMO-0454 (2026-11-28) · README 补 0.454 桌面演示图
+
+- 样本:RWA 目录(`saikyo.exe`),自识别 `yuris=0.454`,包头 `0x1C6`、
+  exe 产品版本 `0,454` 三方一致。
+- 新增 `docs/assets/case/9_d.png`:桌面窗口模式(`--mode desktop`,
+  backend=wgpu)跑进正文对话的画面,标题栏自带
+  `YU-RIS 0.454 · yuris-kernel 0.5.4`,可当版本证据用。
+- `README.md` / `README.en.md` 演示段在九宫格后加该图;BETA 4 行
+  「抽样实机通过」列表补 0.454。
+- 启动需 `--save-root`:工程根建 `save/` 报 `os error 5`(Low 完整性标签,
+  非内核问题)。
+- 验证:`./target/release/yu-cli.exe run D:/HGame/games/Test/RWA
+  --until-frame 240 --save-root target/rwa-save --shot target/rwa-shot240.png`
+  → `identity: ... yuris=0.454`、frame 240 标题画面无缺资源;
+  桌面模式窗口标题实测同上。
+

@@ -61,7 +61,7 @@
 | ---- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | BETA 2 | 适配中     | 0.255（0.55）：539 系统变量表已入册；YSTB V2 缺真实样本                                                                                                          |
 | BETA 3 | 适配中     | 0.276 样本；0.292（0.92）：91 命令 / 482 系统变量                                                                                                                |
-| BETA 4 | 可用（主线） | 0.450–0.495：0.466 / 0.479 / 0.495：100 / 104 / 119 命令，513 / 526 / 548 系统变量；0.450 / 0.460 / 0.470 / 0.480 / 0.490 抽样实机通过，0.481 / 0.486 / 0.494 / 0.495 实机验收 |
+| BETA 4 | 可用（主线） | 0.450–0.495：0.466 / 0.479 / 0.495：100 / 104 / 119 命令，513 / 526 / 548 系统变量；0.450 / 0.454 / 0.460 / 0.470 / 0.480 / 0.490 抽样实机通过，0.481 / 0.486 / 0.494 / 0.495 实机验收 |
 | 5xx    | 适配中（0.500–0.555） | 官方商业分支，区间内共用同一套 121 槽命令表：v500 封包可读；v554 / v555 七表与剧本链已实测（v554 的 `ysc`/`yse` 与 v555 逐字节相同）；已落地 `TEXT[FILE]`、`PRODUCT`、`SAVE/LOAD[MEM]`、`_DROPFILE*`、`VARINFO`；标题画面（注意页 / build 动画 / 完整菜单 / 按钮状态机）已打通 |
 
 0.450–0.493 各版本的 ABI 表已全部入册（27 张，覆盖 0.255–0.495）。
@@ -140,13 +140,15 @@ Linux / macOS 桌面与真 wasm（内存数据源 + 浏览器存档）的缺口�
 
 ## 演示
 
-| 0.481 · 标题画面 | 0.481 · 对话 | 0.494 · 对话 |
+| 0.454 · 对话（桌面窗口） | 0.466 · 对话 | 0.474 · 标题画面 |
 | :---: | :---: | :---: |
-| [![0.481 标题画面](docs/assets/case/1_t.png)](docs/assets/case/1_t.png) | [![0.481 对话](docs/assets/case/1_d.png)](docs/assets/case/1_d.png) | [![0.494 对话](docs/assets/case/2_d.png)](docs/assets/case/2_d.png) |
-| **0.555 · 对话** | **0.555 · 官方中文** | **0.474 · 标题画面** |
-| [![0.555 对话](docs/assets/case/3_d.png)](docs/assets/case/3_d.png) | [![0.555 官方中文](docs/assets/case/4_d.png)](docs/assets/case/4_d.png) | [![0.474 标题画面](docs/assets/case/5_t.png)](docs/assets/case/5_t.png) |
-| **0.466 · 对话** | **0.500 · 标题画面** | **0.500 · 对话** |
-| [![0.466 对话](docs/assets/case/6_d.png)](docs/assets/case/6_d.png) | [![0.500 标题画面](docs/assets/case/7_t.png)](docs/assets/case/7_t.png) | [![0.500 对话](docs/assets/case/8_d.png)](docs/assets/case/8_d.png) |
+| <a href="docs/assets/case/9_d.png"><img src="docs/assets/case/9_d.png" alt="0.454 对话" height="150"></a> | <a href="docs/assets/case/6_d.png"><img src="docs/assets/case/6_d.png" alt="0.466 对话" height="150"></a> | <a href="docs/assets/case/5_t.png"><img src="docs/assets/case/5_t.png" alt="0.474 标题画面" height="150"></a> |
+| **0.481 · 标题画面** | **0.481 · 对话** | **0.494 · 对话** |
+| <a href="docs/assets/case/1_t.png"><img src="docs/assets/case/1_t.png" alt="0.481 标题画面" height="150"></a> | <a href="docs/assets/case/1_d.png"><img src="docs/assets/case/1_d.png" alt="0.481 对话" height="150"></a> | <a href="docs/assets/case/2_d.png"><img src="docs/assets/case/2_d.png" alt="0.494 对话" height="150"></a> |
+| **0.500 · 标题画面** | **0.500 · 对话** | **0.555 · 对话** |
+| <a href="docs/assets/case/7_t.png"><img src="docs/assets/case/7_t.png" alt="0.500 标题画面" height="150"></a> | <a href="docs/assets/case/8_d.png"><img src="docs/assets/case/8_d.png" alt="0.500 对话" height="150"></a> | <a href="docs/assets/case/3_d.png"><img src="docs/assets/case/3_d.png" alt="0.555 对话" height="150"></a> |
+| **0.555 · 官方中文** | | |
+| <a href="docs/assets/case/4_d.png"><img src="docs/assets/case/4_d.png" alt="0.555 官方中文" height="150"></a> | | |
 
 
 ## 下载

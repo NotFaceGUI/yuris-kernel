@@ -60,7 +60,7 @@ Official releases are organized into BETA 2 / BETA 3 / BETA 4 mainline series; 5
 | ------ | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | BETA 2 | Adapting           | 0.255 (0.55): 539 system variables catalogued; YSTB V2 lacks real samples                                                                                                                    |
 | BETA 3 | Adapting           | 0.276 sample; 0.292 (0.92): 91 commands / 482 system variables                                                                                                                               |
-| BETA 4 | Available (main)   | 0.450–0.495: 0.466 / 0.479 / 0.495: 100 / 104 / 119 commands, 513 / 526 / 548 system variables; 0.450 / 0.460 / 0.470 / 0.480 / 0.490 spot-checked on real games, 0.481 / 0.486 / 0.494 / 0.495 accepted |
+| BETA 4 | Available (main)   | 0.450–0.495: 0.466 / 0.479 / 0.495: 100 / 104 / 119 commands, 513 / 526 / 548 system variables; 0.450 / 0.454 / 0.460 / 0.470 / 0.480 / 0.490 spot-checked on real games, 0.481 / 0.486 / 0.494 / 0.495 accepted |
 | 5xx    | Adapting (0.500–0.555) | Official commercial branch: the whole range shares one 121-slot command table; v500 packs are readable; v554 / v555 seven tables and scenario chain measured (0.554 `ysc`/`yse` byte-identical to v555); landed `TEXT[FILE]`, `PRODUCT`, `SAVE/LOAD[MEM]`, `_DROPFILE*`, `VARINFO`; title screen (notice page / build animation / full menu / button state machine) is working |
 
 ABI tables for 0.450–0.493 are all catalogued (27 tables, covering 0.255–0.495).
@@ -142,13 +142,15 @@ Gaps for Linux / macOS desktop and true wasm (in-memory data source + browser sa
 
 ## Demo
 
-| 0.481 · Title screen | 0.481 · Dialogue | 0.494 · Dialogue |
+| 0.454 · Dialogue (desktop window) | 0.466 · Dialogue | 0.474 · Title screen |
 | :---: | :---: | :---: |
-| [![0.481 title screen](docs/assets/case/1_t.png)](docs/assets/case/1_t.png) | [![0.481 dialogue](docs/assets/case/1_d.png)](docs/assets/case/1_d.png) | [![0.494 dialogue](docs/assets/case/2_d.png)](docs/assets/case/2_d.png) |
-| **0.555 · Dialogue** | **0.555 · Official Chinese** | **0.474 · Title screen** |
-| [![0.555 dialogue](docs/assets/case/3_d.png)](docs/assets/case/3_d.png) | [![0.555 official Chinese](docs/assets/case/4_d.png)](docs/assets/case/4_d.png) | [![0.474 title screen](docs/assets/case/5_t.png)](docs/assets/case/5_t.png) |
-| **0.466 · Dialogue** | **0.500 · Title screen** | **0.500 · Dialogue** |
-| [![0.466 dialogue](docs/assets/case/6_d.png)](docs/assets/case/6_d.png) | [![0.500 title screen](docs/assets/case/7_t.png)](docs/assets/case/7_t.png) | [![0.500 dialogue](docs/assets/case/8_d.png)](docs/assets/case/8_d.png) |
+| <a href="docs/assets/case/9_d.png"><img src="docs/assets/case/9_d.png" alt="0.454 dialogue" height="150"></a> | <a href="docs/assets/case/6_d.png"><img src="docs/assets/case/6_d.png" alt="0.466 dialogue" height="150"></a> | <a href="docs/assets/case/5_t.png"><img src="docs/assets/case/5_t.png" alt="0.474 title screen" height="150"></a> |
+| **0.481 · Title screen** | **0.481 · Dialogue** | **0.494 · Dialogue** |
+| <a href="docs/assets/case/1_t.png"><img src="docs/assets/case/1_t.png" alt="0.481 title screen" height="150"></a> | <a href="docs/assets/case/1_d.png"><img src="docs/assets/case/1_d.png" alt="0.481 dialogue" height="150"></a> | <a href="docs/assets/case/2_d.png"><img src="docs/assets/case/2_d.png" alt="0.494 dialogue" height="150"></a> |
+| **0.500 · Title screen** | **0.500 · Dialogue** | **0.555 · Dialogue** |
+| <a href="docs/assets/case/7_t.png"><img src="docs/assets/case/7_t.png" alt="0.500 title screen" height="150"></a> | <a href="docs/assets/case/8_d.png"><img src="docs/assets/case/8_d.png" alt="0.500 dialogue" height="150"></a> | <a href="docs/assets/case/3_d.png"><img src="docs/assets/case/3_d.png" alt="0.555 dialogue" height="150"></a> |
+| **0.555 · Official Chinese** | | |
+| <a href="docs/assets/case/4_d.png"><img src="docs/assets/case/4_d.png" alt="0.555 official Chinese" height="150"></a> | | |
 
 ## Download
 
